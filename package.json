@@ -1,0 +1,36 @@
+{
+  "name": "openclaude",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/protocol",
+    "packages/storage",
+    "packages/plugin-sdk",
+    "packages/gateway",
+    "packages/mcp-memory",
+    "packages/web",
+    "packages/cli",
+    "packages/channels/webchat",
+    "packages/channels/telegram",
+    "packages/channels/wechat",
+    "packages/channels/feishu"
+  ],
+  "scripts": {
+    "onboard": "tsx packages/cli/src/index.ts onboard",
+    "gateway": "tsx packages/cli/src/index.ts gateway",
+    "doctor": "tsx packages/cli/src/index.ts doctor",
+    "agents": "tsx packages/cli/src/index.ts agents",
+    "lint": "biome check packages",
+    "format": "biome format --write packages",
+    "test": "npx tsx --test packages/gateway/src/__tests__/*.test.ts",
+    "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/storage/tsconfig.json",
+    "check": "npm run lint && npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

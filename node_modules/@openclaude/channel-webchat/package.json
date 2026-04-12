@@ -1,0 +1,11 @@
+{
+  "name": "@openclaude/channel-webchat",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@openclaude/plugin-sdk": "*",
+    "@openclaude/protocol": "*"
+  }
+}
