@@ -47,7 +47,7 @@ async function ensureSchema(): Promise<void> {
 }
 
 function genId(): string {
-  return 'arc-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
+  return `arc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
 export interface ArchivalEntry {
@@ -74,9 +74,12 @@ export async function archivalAdd(
   await ensureSchema()
   const db = await getSessionsDb()
   const id = genId()
-  db.prepare(
-    'INSERT INTO archival (id, agent_id, content, tags) VALUES (?, ?, ?, ?)',
-  ).run(id, agentId, content, tags ?? '')
+  db.prepare('INSERT INTO archival (id, agent_id, content, tags) VALUES (?, ?, ?, ?)').run(
+    id,
+    agentId,
+    content,
+    tags ?? '',
+  )
   return id
 }
 
@@ -96,19 +99,19 @@ export async function archivalSearch(
        ORDER BY score
        LIMIT ?`,
     )
-    .all(query, agentId, limit) as Array<{ id: string; content: string; tags: string; score: number }>
+    .all(query, agentId, limit) as Array<{
+    id: string
+    content: string
+    tags: string
+    score: number
+  }>
   return rows
 }
 
-export async function archivalDelete(
-  agentId: string,
-  id: string,
-): Promise<boolean> {
+export async function archivalDelete(agentId: string, id: string): Promise<boolean> {
   await ensureSchema()
   const db = await getSessionsDb()
-  const result = db
-    .prepare('DELETE FROM archival WHERE id = ? AND agent_id = ?')
-    .run(id, agentId)
+  const result = db.prepare('DELETE FROM archival WHERE id = ? AND agent_id = ?').run(id, agentId)
   return result.changes > 0
 }
 

@@ -28,7 +28,7 @@ export async function pairingTelegramRemove() {
     console.error('未找到配置。')
     process.exit(1)
   }
-  delete (cfg.channels as any).telegram
+  ;(cfg.channels as any).telegram = undefined
   await writeConfig(cfg)
   console.log('✓ 已移除 Telegram')
 }

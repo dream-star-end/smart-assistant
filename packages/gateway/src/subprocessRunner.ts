@@ -1,9 +1,11 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { MemoryStore, SkillStore, paths, readAgentsConfig, type OpenClaudeConfig, type McpServerConfig } from '@openclaude/storage'
+import { dirname, isAbsolute, resolve } from 'node:path'
+import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
+import { buildPromptContext } from './promptSlots.js'
+import { type TerminalBackend, createBackend } from './terminalBackend.js'
 
 // ───────────────────────────────────────────────
 // SubprocessRunner
@@ -33,8 +35,10 @@ export interface SubprocessRunnerOpts {
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
   // Per-agent overrides
-  agentProvider?: string  // 覆盖 config.provider
+  agentProvider?: string // 覆盖 config.provider
   agentMcpServers?: McpServerConfig[] // agent 专属 MCP servers
+  agentToolsets?: string[] // resolved toolsets for this agent (filters MCP servers)
+  delegationDepth?: number // current delegation recursion depth (0 = top-level)
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -44,7 +48,14 @@ export interface SdkMessage {
   session_id?: string
   message?: {
     role?: string
-    content?: Array<{ type: string; text?: string; name?: string; input?: unknown; tool_use_id?: string; is_error?: boolean }>
+    content?: Array<{
+      type: string
+      text?: string
+      name?: string
+      input?: unknown
+      tool_use_id?: string
+      is_error?: boolean
+    }>
     stop_reason?: string
     usage?: { input_tokens?: number; output_tokens?: number }
   }
@@ -79,7 +90,9 @@ export class SubprocessRunner extends EventEmitter {
     const { config } = this.opts
     const ccbDir = resolve(config.auth.claudeCodePath)
     if (!existsSync(ccbDir)) {
-      throw new Error(`Claude Code path not found: ${ccbDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`)
+      throw new Error(
+        `Claude Code path not found: ${ccbDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
+      )
     }
     const entry = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
     const runtime = config.auth.claudeCodeRuntime ?? 'bun'
@@ -109,8 +122,7 @@ export class SubprocessRunner extends EventEmitter {
     if (learningContext.extraPromptFile)
       args.push('--append-system-prompt-file', learningContext.extraPromptFile)
     // Wire up MCP memory/skills/search server
-    if (learningContext.mcpConfigFile)
-      args.push('--mcp-config', learningContext.mcpConfigFile)
+    if (learningContext.mcpConfigFile) args.push('--mcp-config', learningContext.mcpConfigFile)
     if (this.opts.cwd) args.push('--add-dir', this.opts.cwd)
     if (this.currentSessionId) args.push('--resume', this.currentSessionId)
 
@@ -120,24 +132,55 @@ export class SubprocessRunner extends EventEmitter {
     // Determine pending dir for guard.py relay.
     // Cron sessions have no live user — skip the relay and let guard directly deny.
     const isCron = this.opts.sessionKey.includes(':cron:')
-    const pendingDir = isCron
-      ? ''
-      : resolve(tmpdir(), 'openclaude-pending', this.opts.agentId)
+    const pendingDir = isCron ? '' : resolve(tmpdir(), 'openclaude-pending', this.opts.agentId)
     if (pendingDir) {
-      try { mkdirSync(pendingDir, { recursive: true }) } catch {}
+      try {
+        mkdirSync(pendingDir, { recursive: true })
+      } catch {}
     }
 
-    // Inject Claude OAuth token if subscription mode is active
-    const oauthEnv: Record<string, string> = {}
-    if (this.opts.config.auth.mode === 'subscription' && this.opts.config.auth.claudeOAuth?.accessToken) {
-      oauthEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
+    // ── Provider-aware auth injection ──
+    // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
+    // We must inject the right env vars per provider so CCB routes to the correct API.
+    const providerEnv: Record<string, string> = {}
+    const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
+
+    if (effectiveProvider === 'claude-subscription') {
+      // Claude subscription: inject OAuth token, clear any MiniMax/third-party env
+      // CLAUDE_CODE_OAUTH_TOKEN tells CCB to use Anthropic OAuth (api.anthropic.com)
+      if (this.opts.config.auth.claudeOAuth?.accessToken) {
+        providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
+      }
+      // Clear settings.json overrides so CCB uses its native Anthropic endpoint
+      providerEnv.ANTHROPIC_BASE_URL = ''
+      providerEnv.ANTHROPIC_AUTH_TOKEN = ''
+      providerEnv.ANTHROPIC_MODEL = ''
+    } else if (effectiveProvider === 'codex' || effectiveProvider === 'openai') {
+      // OpenAI/Codex: use Codex OAuth token via OpenAI-compatible endpoint
+      // CCB doesn't natively support OpenAI, but OpenAI provides an Anthropic-compatible
+      // proxy at https://api.openai.com/anthropic/ (or use a local proxy like LiteLLM)
+      if (this.opts.config.auth.codexOAuth?.accessToken) {
+        providerEnv.ANTHROPIC_AUTH_TOKEN = this.opts.config.auth.codexOAuth.accessToken
+        // Note: OpenAI doesn't have an Anthropic-compatible endpoint by default.
+        // Users need to configure a proxy (LiteLLM/OneAPI) or this won't work.
+        // Leave ANTHROPIC_BASE_URL unset to let settings.json or env provide it.
+      }
+      // Don't inject Claude OAuth — that would override the Codex token
+    } else {
+      // MiniMax / DeepSeek / custom provider: DON'T inject any OAuth token.
+      // Let CCB fall through to settings.json (which has ANTHROPIC_BASE_URL +
+      // ANTHROPIC_AUTH_TOKEN pointing to the provider's Anthropic-compatible endpoint).
+      // This is the "default" path — settings.json controls routing.
     }
 
-    const proc = spawn(runtime, args, {
+    const backend: TerminalBackend = createBackend(this.opts.config.terminal)
+    const proc = backend.spawn({
+      command: runtime,
+      args,
       cwd: ccbDir,
       env: {
         ...process.env,
-        ...oauthEnv,
+        ...providerEnv,
         OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
         OPENCLAUDE_AGENT_ID: this.opts.agentId,
         OPENCLAUDE_PENDING_DIR: pendingDir,
@@ -210,7 +253,9 @@ export class SubprocessRunner extends EventEmitter {
         content,
       },
     }
-    try { this.proc.stdin.write(`${JSON.stringify(userMsg)}\n`) } catch (err: any) {
+    try {
+      this.proc.stdin.write(`${JSON.stringify(userMsg)}\n`)
+    } catch (err: any) {
       console.warn('[subprocessRunner] stdin write failed:', err.message)
     }
   }
@@ -219,199 +264,27 @@ export class SubprocessRunner extends EventEmitter {
   // Writes temp files under /tmp/openclaude-<sessionKey>/:
   //   extra-prompt.md   — USER.md content + skill metadata digest
   //   mcp-config.json   — MCP server pointing at @openclaude/mcp-memory
-  private async buildLearningContext(): Promise<{ extraPromptFile?: string; mcpConfigFile?: string }> {
+  private async buildLearningContext(): Promise<{
+    extraPromptFile?: string
+    mcpConfigFile?: string
+  }> {
     const out: { extraPromptFile?: string; mcpConfigFile?: string } = {}
     const sessionDir = resolve(tmpdir(), `openclaude-${this.opts.agentId}`)
     try {
       mkdirSync(sessionDir, { recursive: true })
     } catch {}
 
-    // Build the merged extra system prompt.
-    // Layered for cache-friendliness: static/identity first, dynamic last.
-    //
-    // Layer 1 (STATIC - rarely changes, identity core):
-    //   - Agent persona (CLAUDE.md)
-    //   - User identity (USER.md)
-    //
-    // Layer 2 (SEMI-STATIC - changes when config/skills change):
-    //   - Platform capabilities
-    //   - Skills list summary
-    //   - Provider-specific MCP tips
-    //
-    // Layer 3 (DYNAMIC - changes per session):
-    //   - Memory notes (MEMORY.md)
-    //   - Tool usage hints
+    // Build merged extra system prompt via structured prompt slots
     try {
-      const memStore = new MemoryStore(this.opts.agentId)
-      await memStore.load()
-      const skillStore = new SkillStore(this.opts.agentId)
-      const skillList = await skillStore.list()
-
-      const parts: string[] = []
-
-      // ═══════════ LAYER 1: IDENTITY (static, most important) ═══════════
-
-      // Agent persona (CLAUDE.md) — WHO AM I
-      let personaBlock = ''
-      if (this.opts.persona && existsSync(this.opts.persona)) {
-        const raw = readFileSync(this.opts.persona, 'utf-8').trim()
-        if (raw) personaBlock = `# WHO I AM (Agent Persona)\n\n${raw}`
-      }
-      if (personaBlock) parts.push(personaBlock)
-
-      // User identity (USER.md) — WHO IS THE USER
-      const userBlock = memStore.formatForSystemPrompt('user')
-      if (userBlock) parts.push(userBlock)
-
-      // ═══════════ LAYER 2: CAPABILITIES (semi-static) ═══════════
-
-      // Platform capabilities + sub-agent guidance
-      parts.push([
-        '# Platform capabilities',
-        '',
-        '你是 OpenClaude 平台上的 AI 助手,用户通过 Web 浏览器与你交互。',
-        '你运行在服务器本机上(不需要 SSH 连接自己,直接执行 Bash 命令即可)。',
-        '',
-        '**文件分享**: 回复中写文件的绝对路径即可,前端自动渲染为内联媒体。不要建议 SCP/wget。',
-        '**多媒体生成**: MCP 工具返回的 URL 或路径直接告诉用户,前端自动内联展示。',
-        '',
-        '## 内联富内容',
-        '',
-        '你的回复支持特殊代码块,前端会自动渲染为可视化内容:',
-        '',
-        '- **```chart** — Chart.js 图表(柱状图/折线图/饼图),写 JSON 配置即可',
-        '- **```mermaid** — 流程图/时序图/甘特图/类图等',
-        '- **```htmlpreview** — **完整 HTML+CSS+JS 沙盒**,支持 Canvas 动画、交互式 UI、游戏等',
-        '',
-        '当用户要求可视化内容时,**优先使用这些内联代码块**而不是写文件。',
-        '示例: 用户说"画一个粒子动画" → 用 ```htmlpreview 写完整 HTML(含 <canvas> + JS),直接在聊天中渲染。',
-        '示例: 用户说"画个柱状图" → 用 ```chart 写 Chart.js JSON 配置。',
-        '**不要**把 HTML 写成文件再用浏览器打开,直接用 htmlpreview 代码块。',
-        '',
-        '## 子 Agent 与并行处理',
-        '',
-        '你可以使用 Agent 工具 spawn 子 agent 来并行处理独立的子任务。主动使用此能力:',
-        '- **独立研究任务**: 搜索文件、分析代码结构、调研 → 用子 agent',
-        '- **多文件并行操作**: 同时修改多个不相关文件 → 启动多个子 agent',
-        '- **耗时操作**: 大规模搜索、批量处理 → 用子 agent 在后台执行',
-        '- **保持响应**: 当任务可能超过 30 秒时,考虑用子 agent 异步处理',
-        '',
-        '子 agent 会继承你的全部工具和上下文。用户在 UI 中能看到子任务的进度卡片。',
-        '',
-        '## 浏览器操作',
-        '',
-        '你有内置 Playwright 浏览器工具,可以自主浏览和操作任何网页:',
-        '',
-        '1. `browser_navigate(url)` → 打开网页',
-        '2. `browser_snapshot()` → 获取页面 accessibility tree + 元素 ref 编号',
-        '3. `browser_click(ref="XX")` / `browser_type(ref="XX", text="...")` → 用 ref 操作',
-        '4. 重复 2-3 直到完成',
-        '',
-        '常用场景: 搜索信息、填表单、登录网站、抓取数据。',
-        '优先用 snapshot(文本,省token),只在需要视觉确认时用 screenshot。',
-        '详细操作指南见 skill `browser-automation`。',
-      ].join('\n'))
-
-      // Skills summary (truncated to top 15 for budget)
-      if (skillList.length > 0) {
-        const top = skillList.slice(0, 15)
-        const lines = [
-          '# Skills (' + skillList.length + ')',
-          '',
-          '可用 `skill_view(name)` 加载完整指令:',
-        ]
-        for (const s of top) lines.push(`- **${s.name}** — ${s.description}`)
-        if (skillList.length > 15) lines.push(`- ... 还有 ${skillList.length - 15} 个 (用 skill_list() 查看全部)`)
-        parts.push(lines.join('\n'))
-      }
-
-      // Provider-specific MCP tips
-      const provider = this.opts.agentProvider ?? this.opts.config.provider
-      if (provider === 'minimax') {
-        parts.push([
-          '# MiniMax MCP 参数提示',
-          '',
-          '**text_to_audio**: 必须传 `model="speech-2.8-hd"` + `emotion="neutral"` (MCP 默认 speech-2.6-hd 不可用)',
-          '**text_to_image**: 默认 image-01 可用,传 `aspect_ratio` 控制比例',
-          '**understand_image**: 传 `image_file="绝对路径"` 或 `image_url="https://..."` (主模型不支持多模态)',
-        ].join('\n'))
-      }
-
-      // ═══════════ LAYER 3: DYNAMIC (changes frequently) ═══════════
-
-      // Memory notes (MEMORY.md)
-      const memoryBlock = memStore.formatForSystemPrompt('memory')
-      if (memoryBlock) parts.push(memoryBlock)
-
-      // Tool usage hints — tiered memory + skill auto-generation
-      parts.push([
-        '# 学习系统',
-        '',
-        '## 三层记忆',
-        '',
-        '| 层级 | 工具 | 容量 | 何时用 |',
-        '|------|------|------|--------|',
-        '| Core | `memory(add/read, "user"/"memory")` | 2K+4K chars | 高频事实、用户身份,每次对话自动可见 |',
-        '| Recall | `session_search(query)` | 无限 | 回忆过去对话内容 |',
-        '| Archival | `archival_add/search/delete` | 无限 | 详细知识、文档、代码模式(需搜索才可见) |',
-        '',
-        '**原则**: 高频→Core, 详细→Archival, Core满了→迁移到Archival',
-        '',
-        '## 定时提醒',
-        '',
-        '用户说"X分钟后提醒我..."或"每天N点..."时,用 `create_reminder` 工具:',
-        '用户要求定时提醒时,使用 `create_reminder` 工具(不要用其他定时工具):',
-        '- `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)`',
-        '- 时间用用户本地时区的 crontab 格式',
-        '- 示例: 5分钟后 → 计算当前时间+5分钟 → `"M H D Mon *"`',
-        '',
-        '## 多 Agent 协作',
-        '',
-      ].join('\n'))
-
-      // Dynamically inject available agents list
-      try {
-        const agentsCfg = await readAgentsConfig()
-        const otherAgents = agentsCfg.agents.filter(a => a.id !== this.opts.agentId)
-        if (otherAgents.length > 0) {
-          const agentLines = ['你当前是 `' + this.opts.agentId + '`。系统中还有以下 agent 可以协作:', '']
-          for (const a of otherAgents) {
-            const name = a.displayName || a.id
-            const model = a.model ? `${a.model}` : '默认模型'
-            const provider = a.provider || '继承全局'
-            // Read first meaningful line of persona as capability description
-            let capability = ''
-            try {
-              const personaPath = a.persona || paths.agentClaudeMd(a.id)
-              if (existsSync(personaPath)) {
-                const raw = readFileSync(personaPath, 'utf-8')
-                const lines = raw.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'))
-                if (lines[0]) capability = ' — ' + lines[0].slice(0, 80)
-              }
-            } catch {}
-            agentLines.push(`- **${name}** (\`${a.id}\`) [${model}, ${provider}]${capability}`)
-          }
-          agentLines.push('')
-          agentLines.push('使用 `send_to_agent(agentId, message)` 向它们发送消息,结果异步推送给用户。')
-          agentLines.push('选择 agent 时考虑其模型和能力特长。')
-          parts.push(agentLines.join('\n'))
-        }
-      } catch {}
-
-      parts.push([
-        '## 技能自生成',
-        '',
-        '完成 3+ 工具调用的复杂任务后,**立即**评估:',
-        '1. `skill_list()` 检查是否已有类似 skill',
-        '2. 如果没有且模式可复用 → `skill_save(name, desc, body)`',
-        '3. 好的 skill = 步骤 + 注意事项 + 命令模板',
-        '',
-        '你是一个持久化、自进化的 agent。主动使用这些工具让自己越来越好。',
-      ].join('\n'))
-
-      if (parts.length > 0) {
+      const promptContent = await buildPromptContext({
+        agentId: this.opts.agentId,
+        persona: this.opts.persona,
+        provider: this.opts.agentProvider ?? this.opts.config.provider,
+        model: this.opts.model,
+      })
+      if (promptContent) {
         const path = resolve(sessionDir, 'extra-prompt.md')
-        writeFileSync(path, parts.join('\n\n---\n\n'))
+        writeFileSync(path, promptContent)
         out.extraPromptFile = path
       }
     } catch (err) {
@@ -431,7 +304,11 @@ export class SubprocessRunner extends EventEmitter {
       const candidates = [
         mcpServerEntry,
         resolve(process.cwd(), 'packages/mcp-memory/src/index.ts'),
-        resolve(this.opts.config.auth.claudeCodePath, '..', 'openclaude/packages/mcp-memory/src/index.ts'),
+        resolve(
+          this.opts.config.auth.claudeCodePath,
+          '..',
+          'openclaude/packages/mcp-memory/src/index.ts',
+        ),
       ]
       const mcpEntry = candidates.find((p) => existsSync(p))
       if (mcpEntry) {
@@ -444,22 +321,40 @@ export class SubprocessRunner extends EventEmitter {
             OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME ?? '',
             OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
             OPENCLAUDE_GATEWAY_TOKEN: this.opts.config.gateway.accessToken,
+            OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0),
           },
         }
       } else {
         console.warn('[subprocessRunner] mcp-memory entry not found, skipping built-in MCP')
       }
 
-      // ── MCP servers: three-layer merge ──
+      // ── MCP servers: three-layer merge + toolset filtering ──
       // Layer 1: System shared tools (no provider field) — always included
       // Layer 2: Global provider-scoped MCPs (filtered by effectiveProvider)
       // Layer 3: Agent-specific MCPs (override same-id globals)
+      // Toolset filter: if agent has toolsets configured, only include MCPs
+      // whose id appears in at least one of the agent's toolset definitions.
       const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
+
+      // Resolve toolset → allowed MCP server IDs
+      const toolsetDefs = this.opts.config.toolsets
+      const agentToolsets = this.opts.agentToolsets
+      let allowedMcpIds: Set<string> | null = null // null = no filtering (all allowed)
+      if (agentToolsets && agentToolsets.length > 0 && toolsetDefs) {
+        allowedMcpIds = new Set<string>()
+        for (const ts of agentToolsets) {
+          const ids = toolsetDefs[ts]
+          if (ids) for (const id of ids) allowedMcpIds.add(id)
+        }
+        // Built-in 'openclaude-memory' is always allowed regardless of toolset
+        allowedMcpIds.add('openclaude-memory')
+      }
 
       // Layer 1 + 2: Global MCPs
       for (const srv of this.opts.config.mcpServers ?? []) {
         if (srv.enabled === false) continue
         if (srv.provider && srv.provider !== effectiveProvider) continue
+        if (allowedMcpIds && !allowedMcpIds.has(srv.id)) continue
         mcpServers[srv.id] = {
           type: 'stdio',
           command: srv.command,
@@ -468,7 +363,7 @@ export class SubprocessRunner extends EventEmitter {
         }
       }
 
-      // Layer 3: Agent-specific MCPs (override same id)
+      // Layer 3: Agent-specific MCPs (override same id, bypass toolset filter)
       for (const srv of this.opts.agentMcpServers ?? []) {
         if (srv.enabled === false) continue
         mcpServers[srv.id] = {
@@ -520,7 +415,9 @@ export class SubprocessRunner extends EventEmitter {
         try {
           if (pid) process.kill(-pid, 'SIGKILL') // negative pid = process group
         } catch {
-          try { proc.kill('SIGKILL') } catch {}
+          try {
+            proc.kill('SIGKILL')
+          } catch {}
         }
         res()
       }, 3000)

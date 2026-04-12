@@ -19,11 +19,11 @@
 //     <reqId>.req.json        ← guard writes
 //     <reqId>.resp.json       ← relay writes after user decides
 
-import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
-import { tmpdir } from 'node:os'
 import { EventEmitter } from 'node:events'
+import { existsSync } from 'node:fs'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 
 export const PENDING_ROOT = resolve(tmpdir(), 'openclaude-pending')
 

@@ -2,7 +2,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Gateway } from '@openclaude/gateway'
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
-import { readAgentsConfig, readConfig, type OpenClaudeConfig } from '@openclaude/storage'
+import { type OpenClaudeConfig, readAgentsConfig, readConfig } from '@openclaude/storage'
 
 export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   const config = await readConfig()

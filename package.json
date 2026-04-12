@@ -24,7 +24,7 @@
     "lint": "biome check packages",
     "format": "biome format --write packages",
     "test": "npx tsx --test packages/gateway/src/__tests__/*.test.ts",
-    "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/storage/tsconfig.json",
+    "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/storage/tsconfig.json && tsc --noEmit -p packages/gateway/tsconfig.json && tsc --noEmit -p packages/mcp-memory/tsconfig.json && tsc --noEmit -p packages/cli/tsconfig.json",
     "check": "npm run lint && npm run typecheck && npm run test"
   },
   "devDependencies": {

@@ -1,33 +1,34 @@
-import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
+import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { extname, join, relative, resolve, dirname } from 'node:path'
-import { WebSocketServer, type WebSocket } from 'ws'
+import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
+import { basename, dirname, extname, join, relative, resolve } from 'node:path'
+import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
+import type { InboundFrame, InboundMessage, OutboundMessage } from '@openclaude/protocol'
 import {
   type AgentDef,
   type AgentsConfig,
-  type OpenClaudeConfig,
   MemoryStore,
+  type OpenClaudeConfig,
   SkillStore,
-  searchSessions,
+  TaskStore,
   paths,
   readAgentsConfig,
   readConfig,
-  writeConfig,
+  searchSessions,
   writeAgentsConfig,
+  writeConfig,
 } from '@openclaude/storage'
-import {
-  type InboundFrame,
-  type InboundMessage,
-  type OutboundMessage,
-} from '@openclaude/protocol'
-import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
-import { Router } from './router.js'
-import { SessionManager } from './sessionManager.js'
+import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken } from './auth.js'
 import { CronScheduler } from './cron.js'
+import { eventBus } from './eventBus.js'
+import { handleOpenAIRequest } from './openaiCompat.js'
 import { PermissionRelay, type PermissionRequest } from './permissionRelay.js'
+import { Router } from './router.js'
+import { RunLog } from './runLog.js'
+import { SessionManager } from './sessionManager.js'
+import { WebhookRouter } from './webhooks.js'
 
 export interface GatewayDeps {
   config: OpenClaudeConfig
@@ -42,13 +43,19 @@ export class Gateway {
   private router: Router
   private sessions: SessionManager
   private cron: CronScheduler | null = null
+  private webhookRouter: WebhookRouter | null = null
+  private _taskStore = new TaskStore()
+  private _runLog = new RunLog()
   private permissions: PermissionRelay | null = null
   private channels = new Map<string, ChannelAdapter>()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
   // Per-agent last active channel tracking (for proactive push)
   // Track last active channel + session for proactive push (reminders, heartbeat, etc.)
-  private lastActiveChannel = new Map<string, { channel: string; peerId: string; sessionKey: string; at: number }>()
+  private lastActiveChannel = new Map<
+    string,
+    { channel: string; peerId: string; sessionKey: string; at: number }
+  >()
 
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
@@ -64,8 +71,11 @@ export class Gateway {
     // WS keepalive: ping every 25s, terminate if no pong in 35s
     setInterval(() => {
       for (const ws of this.wss.clients) {
-        if ((ws as any)._isAlive === false) { ws.terminate(); continue }
-        (ws as any)._isAlive = false
+        if ((ws as any)._isAlive === false) {
+          ws.terminate()
+          continue
+        }
+        ;(ws as any)._isAlive = false
         ws.ping()
       }
     }, 25_000)
@@ -109,7 +119,14 @@ export class Gateway {
     this.cron = new CronScheduler(config, this.sessions, (text, job) => {
       const agentId = job.agent
       const lastActive = this.lastActiveChannel.get(agentId)
-      const icon = job.id === 'heartbeat' ? '💓' : job.id.includes('skill') ? '🛠' : job.id.startsWith('remind') ? '⏰' : '🪞'
+      const icon =
+        job.id === 'heartbeat'
+          ? '💓'
+          : job.id.includes('skill')
+            ? '🛠'
+            : job.id.startsWith('remind')
+              ? '⏰'
+              : '🪞'
 
       // Build outbound message — use last active session if available
       const buildOut = (peerId: string, sessionKey?: string): OutboundMessage => ({
@@ -131,7 +148,11 @@ export class Gateway {
           if (set && set.size > 0) {
             // Use the last active session so message appears in the right conversation
             const data = JSON.stringify(buildOut(lastActive.peerId, lastActive.sessionKey))
-            for (const ws of set) { try { ws.send(data) } catch {} }
+            for (const ws of set) {
+              try {
+                ws.send(data)
+              } catch {}
+            }
             delivered = true
           }
         }
@@ -158,11 +179,146 @@ export class Gateway {
       if (!delivered) {
         const data = JSON.stringify(buildOut('__reflection__'))
         for (const set of this.clientsByPeer.values()) {
-          for (const ws of set) { try { ws.send(data) } catch {} }
+          for (const ws of set) {
+            try {
+              ws.send(data)
+            } catch {}
+          }
         }
       }
     })
     this.cron.start().catch((err) => console.error('[cron] start failed:', err))
+
+    // EventBus: bridge CCB CronCreate/CronDelete to gateway CronScheduler
+    eventBus.on('task.created', (ev) => {
+      if (!this.cron || ev.source !== 'cron-bridge') return
+      // Use taskId directly — sessionManager already generates unique ccb-xxx IDs
+      this.cron
+        .addJob({
+          id: ev.taskId,
+          schedule: ev.schedule || '* * * * *',
+          agent: ev.agentId,
+          prompt: ev.prompt,
+          deliver: 'webchat',
+          enabled: true,
+          oneshot: ev.oneshot ?? true,
+          label: ev.prompt.slice(0, 50),
+        })
+        .then(() => console.log(`[eventBus] task.created → gateway job ${ev.taskId}`))
+        .catch((err) => console.warn('[eventBus] task.created failed:', err))
+    })
+    eventBus.on('task.deleted', (ev) => {
+      if (!this.cron) return
+      this.cron
+        .removeJob(ev.taskId)
+        .then((ok) =>
+          console.log(`[eventBus] task.deleted → ${ok ? 'removed' : 'not found'} ${ev.taskId}`),
+        )
+        .catch((err) => console.warn('[eventBus] task.deleted failed:', err))
+    })
+
+    // Start webhook router
+    this.webhookRouter = new WebhookRouter()
+    await this.webhookRouter.load()
+    console.log(`[webhooks] loaded ${this.webhookRouter.list().length} webhook(s)`)
+
+    // EventBus: route webhook.received → agent execution + delivery
+    eventBus.on('webhook.received', (ev) => {
+      const { webhookId, agentId, payload } = ev
+      const { resolvedPrompt } = payload as any
+      ;(async () => {
+        const cfg = await readAgentsConfig()
+        const agent = cfg.agents.find((a) => a.id === agentId)
+        if (!agent) return console.warn(`[webhook] agent "${agentId}" not found`)
+        const sessionKey = `agent:${agentId}:webhook:${webhookId}:${Date.now()}`
+        const session = await this.sessions.getOrCreate({
+          sessionKey,
+          agent,
+          channel: 'webhook',
+          peerId: webhookId,
+          title: `[webhook] ${webhookId}`,
+        })
+        const _whRun = this._runLog.start({ agentId, sessionKey, taskType: 'webhook' })
+        let output = ''
+        let _whError = ''
+        try {
+          await this.sessions.submit(session, resolvedPrompt, (e) => {
+            if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
+            if (e.kind === 'error') _whError = e.error
+          })
+          this._runLog.complete(_whRun, {
+            status: _whError ? 'failed' : 'completed',
+            error: _whError || undefined,
+          })
+        } catch (err: any) {
+          _whError = _whError || String(err)
+          this._runLog.complete(_whRun, { status: 'failed', error: _whError })
+        }
+        // Deliver to last active webchat
+        if (output.trim()) {
+          const lastActive =
+            this.lastActiveChannel.get(agentId) || this.lastActiveChannel.get('main')
+          if (lastActive) {
+            const out = {
+              type: 'outbound.message' as const,
+              sessionKey: lastActive.sessionKey,
+              channel: 'webchat' as const,
+              peer: { id: lastActive.peerId, kind: 'dm' as const },
+              blocks: [
+                { kind: 'text' as const, text: `🔔 **Webhook ${webhookId}**\n\n${output.trim()}` },
+              ],
+              isFinal: true,
+            }
+            const set = this.clientsByPeer.get(`webchat:${lastActive.peerId}`)
+            if (set) {
+              const data = JSON.stringify(out)
+              for (const ws of set) {
+                try {
+                  ws.send(data)
+                } catch {}
+              }
+            }
+          }
+        }
+      })().catch((err) => console.error(`[webhook] ${webhookId} execution failed:`, err))
+    })
+
+    // TaskStore: schedule-triggered tasks run alongside cron (check every 60s)
+    setInterval(() => {
+      this._tickScheduledTasks().catch((err) => console.error('[task-scheduler] tick failed:', err))
+    }, 60_000)
+
+    // EventBus: webhook.received can also trigger webhook-type tasks
+    eventBus.on('webhook.received', (ev) => {
+      this._taskStore
+        .list()
+        .then((tasks) => {
+          for (const t of tasks) {
+            if (
+              t.trigger === 'webhook' &&
+              t.webhookId === ev.webhookId &&
+              t.status !== 'disabled'
+            ) {
+              this._triggerTask(t.id).catch(() => {})
+            }
+          }
+        })
+        .catch(() => {})
+    })
+
+    // EventBus: catch-all listener for event-triggered tasks
+    eventBus.on('*', (ev) => {
+      this._taskStore
+        .list()
+        .then((tasks) => {
+          for (const t of tasks) {
+            if (t.trigger === 'event' && t.eventType === ev.type && t.status !== 'disabled') {
+              this._triggerTask(t.id).catch(() => {})
+            }
+          }
+        })
+        .catch(() => {})
+    })
 
     // Start OAuth token auto-refresh (every 30 min)
     setInterval(() => this.refreshClaudeOAuthIfNeeded().catch(() => {}), 30 * 60_000)
@@ -172,9 +328,7 @@ export class Gateway {
     await new Promise<void>((res) => {
       this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
     })
-    console.log(
-      `[gateway] http://${config.gateway.bind}:${config.gateway.port}  (token: *****)`,
-    )
+    console.log(`[gateway] http://${config.gateway.bind}:${config.gateway.port}  (token: *****)`)
   }
 
   private async shutdown(stopEviction: () => void): Promise<void> {
@@ -196,12 +350,31 @@ export class Gateway {
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
 
     // Routes that need auth
-    // All /api/* endpoints require auth except healthz
+    // All /api/* and /v1/* endpoints require auth except healthz
     const needsAuth =
-      url.pathname.startsWith('/api/') && url.pathname !== '/api/healthz'
+      (url.pathname.startsWith('/api/') && url.pathname !== '/api/healthz') ||
+      url.pathname.startsWith('/v1/')
     if (needsAuth && !this.checkHttpAuth(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
+      return
+    }
+
+    // OpenAI-compatible API: /v1/chat/completions, /v1/models
+    if (url.pathname.startsWith('/v1/')) {
+      handleOpenAIRequest(req, res, url, {
+        config: this.deps.config,
+        agentsConfig: this.deps.agentsConfig,
+        sessions: this.sessions,
+        runLog: this._runLog,
+        readBody: (r) => this.readBody(r),
+        sendJson: (r, c, b) => this.sendJson(r, c, b),
+        sendError: (r, c, m) => this.sendError(r, c, m),
+      })
+        .then((handled) => {
+          if (!handled) this.sendError(res, 404, 'unknown v1 endpoint')
+        })
+        .catch((err) => this.sendError(res, 500, String(err)))
       return
     }
 
@@ -209,9 +382,18 @@ export class Gateway {
     // (so img/audio/video elements can access /api/file and /api/media without JS headers)
     if (url.pathname === '/api/auth/session' && req.method === 'POST') {
       if (!this.checkHttpAuth(req)) {
-        res.writeHead(401); res.end('unauthorized'); return
+        res.writeHead(401)
+        res.end('unauthorized')
+        return
       }
       this.setSessionCookie(res)
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+
+    // Logout: expire the HttpOnly session cookie
+    if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
+      res.setHeader('Set-Cookie', 'oc_session=; HttpOnly; SameSite=Strict; Path=/api/; Max-Age=0')
       this.sendJson(res, 200, { ok: true })
       return
     }
@@ -221,6 +403,25 @@ export class Gateway {
       res.end(JSON.stringify({ ok: true, sessions: this.sessions.list().length }))
       return
     }
+    if (url.pathname === '/api/doctor') {
+      const summary = this._runLog.summary()
+      const recentRuns = this._runLog.recent(20)
+      const sessions = this.sessions.list()
+      const webhooks = this.webhookRouter?.list().length ?? 0
+      this.sendJson(res, 200, {
+        uptime: process.uptime(),
+        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        activeSessions: sessions.length,
+        webhooks,
+        runLog: summary,
+        recentRuns,
+      })
+      return
+    }
+    if (url.pathname === '/api/runs' && req.method === 'GET') {
+      this.sendJson(res, 200, { runs: this._runLog.recent(50) })
+      return
+    }
     if (url.pathname === '/api/sessions') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ sessions: this.sessions.list() }))
@@ -228,7 +429,8 @@ export class Gateway {
     }
     if (url.pathname === '/api/config') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> = []
+      const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> =
+        []
       const activeProvider = this.deps.config.provider
       for (const srv of this.deps.config.mcpServers ?? []) {
         if (srv.enabled === false) continue
@@ -237,10 +439,16 @@ export class Gateway {
       }
       const authInfo: Record<string, any> = { mode: this.deps.config.auth.mode }
       if (this.deps.config.auth.claudeOAuth?.accessToken) {
-        authInfo.claudeOAuth = { active: true, expiresAt: this.deps.config.auth.claudeOAuth.expiresAt }
+        authInfo.claudeOAuth = {
+          active: true,
+          expiresAt: this.deps.config.auth.claudeOAuth.expiresAt,
+        }
       }
       if (this.deps.config.auth.codexOAuth?.accessToken) {
-        authInfo.codexOAuth = { active: true, expiresAt: this.deps.config.auth.codexOAuth.expiresAt }
+        authInfo.codexOAuth = {
+          active: true,
+          expiresAt: this.deps.config.auth.codexOAuth.expiresAt,
+        }
       }
       res.end(
         JSON.stringify({
@@ -272,10 +480,12 @@ export class Gateway {
       )
       return
     }
-    const memoryMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/(memory|user)$/)
+    const memoryMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/(memory|user)$/,
+    )
     if (memoryMatch) {
-      this.handleMemory(req, res, memoryMatch[1], memoryMatch[2] as 'memory' | 'user').catch((err) =>
-        this.sendError(res, 500, String(err)),
+      this.handleMemory(req, res, memoryMatch[1], memoryMatch[2] as 'memory' | 'user').catch(
+        (err) => this.sendError(res, 500, String(err)),
       )
       return
     }
@@ -286,7 +496,9 @@ export class Gateway {
       )
       return
     }
-    const skillViewMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/skills\/([a-z0-9-]+)$/)
+    const skillViewMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/skills\/([a-z0-9-]+)$/,
+    )
     if (skillViewMatch) {
       this.handleSkillItem(req, res, skillViewMatch[1], skillViewMatch[2]).catch((err) =>
         this.sendError(res, 500, String(err)),
@@ -296,7 +508,17 @@ export class Gateway {
     // ── Inter-agent messaging ──
     const agentMsgMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/message$/)
     if (agentMsgMatch) {
-      this.handleAgentMessage(req, res, agentMsgMatch[1]).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleAgentMessage(req, res, agentMsgMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    // ── Synchronous task delegation ──
+    const delegateMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/delegate$/)
+    if (delegateMatch) {
+      this.handleDelegateTask(req, res, delegateMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
       return
     }
     if (url.pathname === '/api/search') {
@@ -308,11 +530,47 @@ export class Gateway {
       this.handleCronApi(req, res).catch((err) => this.sendError(res, 500, String(err)))
       return
     }
-    const cronDeleteMatch = url.pathname.match(/^\/api\/cron\/([a-zA-Z0-9_-]+)$/)
-    if (cronDeleteMatch) {
-      this.handleCronDelete(req, res, cronDeleteMatch[1]).catch((err) => this.sendError(res, 500, String(err)))
+    const cronItemMatch = url.pathname.match(/^\/api\/cron\/([a-zA-Z0-9_-]+)$/)
+    if (cronItemMatch) {
+      this.handleCronItem(req, res, cronItemMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
       return
     }
+    // ── Tasks REST API ──
+    if (url.pathname === '/api/tasks') {
+      this._handleTasksApi(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    const taskItemMatch = url.pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_-]+)$/)
+    if (taskItemMatch) {
+      this._handleTaskItem(req, res, taskItemMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    if (url.pathname === '/api/tasks-executions' && req.method === 'GET') {
+      this._taskStore
+        .recentExecutions()
+        .then((execs) => this.sendJson(res, 200, { executions: execs }))
+        .catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+
+    // ── Webhook REST API ──
+    if (url.pathname === '/api/webhooks' && req.method === 'GET') {
+      const list = this.webhookRouter?.list() ?? []
+      this.sendJson(res, 200, { webhooks: list })
+      return
+    }
+    const webhookMatch = url.pathname.match(/^\/api\/webhooks\/([a-zA-Z0-9_-]+)$/)
+    if (webhookMatch) {
+      this._handleWebhook(req, res, webhookMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+
     // ── Claude.ai OAuth ──
     if (url.pathname === '/api/auth/claude/start') {
       this.handleOAuthStart(req, res).catch((err) => this.sendError(res, 500, String(err)))
@@ -339,7 +597,9 @@ export class Gateway {
       const filename = decodeURIComponent(mediaMatch[1])
       // Reject path traversal attempts (../ or absolute paths)
       if (filename.includes('..') || filename.startsWith('/') || filename.startsWith('\\')) {
-        res.writeHead(400); res.end('bad request'); return
+        res.writeHead(400)
+        res.end('bad request')
+        return
       }
       // Search in uploads first, then generated
       const dirs = [paths.uploadsDir, paths.generatedDir]
@@ -349,10 +609,15 @@ export class Gateway {
         // Security: ensure resolved path stays inside the allowed directory
         if (!candidate.startsWith(resolve(dir))) continue
         if (existsSync(candidate) && statSync(candidate).isFile()) {
-          found = candidate; break
+          found = candidate
+          break
         }
       }
-      if (!found) { res.writeHead(404); res.end('not found'); return }
+      if (!found) {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
       const stat = statSync(found)
       res.writeHead(200, {
         'Content-Type': mimeFor(found),
@@ -366,43 +631,39 @@ export class Gateway {
     // ── File serving by absolute path (whitelist-restricted) ──
     if (url.pathname === '/api/file') {
       const filePath = url.searchParams.get('path')
-      if (!filePath) { res.writeHead(400); res.end('missing ?path='); return }
+      if (!filePath) {
+        res.writeHead(400)
+        res.end('missing ?path=')
+        return
+      }
       // Accept both POSIX (/path) and Windows (C:\path) absolute paths
       const isAbsolute = filePath.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(filePath)
       if (filePath.includes('..') || !isAbsolute) {
-        res.writeHead(400); res.end('bad path'); return
+        res.writeHead(400)
+        res.end('bad path')
+        return
       }
       // Security: blacklist sensitive files, allow everything else.
       // Personal deployment model: agent needs access to its own work products
       // (screenshots, reports, build artifacts, test results, etc.)
       const resolved = resolve(filePath)
-      const blockedPatterns = [
-        /openclaude\.json$/,      // gateway config with tokens
-        /\.env$/,                  // environment secrets
-        /credentials/,            // credential directory
-        /\.ssh/,                   // SSH keys
-        /\.key$/,                  // private keys
-        /\.pem$/,                  // certificates
-        /id_rsa/,                  // SSH private key
-        /id_ed25519/,              // SSH private key
-        /\.gnupg/,                 // GPG keys
-        /\.password/,              // password files
-        /shadow$/,                 // /etc/shadow
-        /auth.*token/i,            // token files
-      ]
-      if (blockedPatterns.some(p => p.test(resolved))) {
+      if (isFileBlocked(resolved)) {
         console.warn(`[api/file] blocked sensitive: ${resolved}`)
-        res.writeHead(403); res.end('access denied'); return
+        res.writeHead(403)
+        res.end('access denied')
+        return
       }
       if (!existsSync(resolved) || !statSync(resolved).isFile()) {
-        res.writeHead(404); res.end('not found'); return
+        res.writeHead(404)
+        res.end('not found')
+        return
       }
       const stat = statSync(resolved)
       res.writeHead(200, {
         'Content-Type': mimeFor(resolved),
         'Content-Length': stat.size,
         'Cache-Control': 'public, max-age=3600',
-        'Content-Disposition': `inline; filename="${encodeURIComponent(resolved.split('/').pop() ?? 'file')}"`,
+        'Content-Disposition': `inline; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
       })
       createReadStream(resolved).pipe(res)
       return
@@ -412,17 +673,25 @@ export class Gateway {
     if (this.deps.webRoot) {
       const safePath = url.pathname === '/' ? '/index.html' : url.pathname
       const filePath = resolve(this.deps.webRoot, `.${safePath}`)
-      if (filePath.startsWith(resolve(this.deps.webRoot)) && existsSync(filePath) && statSync(filePath).isFile()) {
+      if (
+        filePath.startsWith(resolve(this.deps.webRoot)) &&
+        existsSync(filePath) &&
+        statSync(filePath).isFile()
+      ) {
         res.writeHead(200, { 'Content-Type': mimeFor(filePath) })
         res.end(readFileSync(filePath))
         return
       }
-      // SPA fallback
-      const indexPath = resolve(this.deps.webRoot, 'index.html')
-      if (existsSync(indexPath)) {
-        res.writeHead(200, { 'Content-Type': 'text/html' })
-        res.end(readFileSync(indexPath))
-        return
+      // SPA fallback — only for navigation requests (no file extension)
+      // Static assets (.js/.css/.map/.min.js etc.) should 404, not serve index.html
+      const hasExtension = /\.\w+$/.test(url.pathname)
+      if (!hasExtension) {
+        const indexPath = resolve(this.deps.webRoot, 'index.html')
+        if (existsSync(indexPath)) {
+          res.writeHead(200, { 'Content-Type': 'text/html' })
+          res.end(readFileSync(indexPath))
+          return
+        }
       }
     }
     res.writeHead(404)
@@ -431,17 +700,21 @@ export class Gateway {
 
   private checkHttpAuth(req: IncomingMessage): boolean {
     // 1. Authorization: Bearer header (fetch API calls)
-    const authHeader = req.headers['authorization']?.replace(/^Bearer\s+/, '') ?? ''
+    const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, '') ?? ''
     // 2. Sec-WebSocket-Protocol subprotocol (WebSocket)
-    const protocols = (req.headers['sec-websocket-protocol'] || '').split(',').map(s => s.trim())
-    const protoToken = protocols.includes('bearer') && protocols.length >= 2 ? protocols[protocols.length - 1] : ''
+    const protocols = (req.headers['sec-websocket-protocol'] || '').split(',').map((s) => s.trim())
+    const protoToken =
+      protocols.includes('bearer') && protocols.length >= 2 ? protocols[protocols.length - 1] : ''
     // 3. HttpOnly cookie (for img/audio/video/a elements that can't set headers)
-    const cookies = (req.headers['cookie'] || '').split(';').reduce((acc, c) => {
-      const [k, ...v] = c.trim().split('=')
-      if (k) acc[k] = v.join('=')
-      return acc
-    }, {} as Record<string, string>)
-    const cookieToken = cookies['oc_session'] || ''
+    const cookies = (req.headers.cookie || '').split(';').reduce(
+      (acc, c) => {
+        const [k, ...v] = c.trim().split('=')
+        if (k) acc[k] = v.join('=')
+        return acc
+      },
+      {} as Record<string, string>,
+    )
+    const cookieToken = cookies.oc_session || ''
     const t = authHeader || protoToken || cookieToken
     return checkToken(t, this.deps.config.gateway.accessToken)
   }
@@ -449,7 +722,10 @@ export class Gateway {
   /** Set HttpOnly session cookie on response */
   private setSessionCookie(res: ServerResponse): void {
     const token = this.deps.config.gateway.accessToken
-    res.setHeader('Set-Cookie', `oc_session=${token}; HttpOnly; SameSite=Strict; Path=/api/; Max-Age=31536000`)
+    res.setHeader(
+      'Set-Cookie',
+      `oc_session=${token}; HttpOnly; SameSite=Strict; Path=/api/; Max-Age=31536000`,
+    )
   }
 
   private sendJson(res: ServerResponse, code: number, body: unknown): void {
@@ -490,14 +766,18 @@ export class Gateway {
         return
       }
       // Inherit provider/permissionMode/cwd from request or sensible defaults
-      const defaultAgent = cfg.agents.find(a => a.id === cfg.default)
+      const defaultAgent = cfg.agents.find((a) => a.id === cfg.default)
       const agent: AgentDef = {
         id: body.id,
         model: body.model ?? this.deps.config.defaults.model,
         persona: paths.agentClaudeMd(body.id),
-        permissionMode: body.permissionMode ?? defaultAgent?.permissionMode ?? this.deps.config.defaults.permissionMode,
+        permissionMode:
+          body.permissionMode ??
+          defaultAgent?.permissionMode ??
+          this.deps.config.defaults.permissionMode,
         provider: body.provider ?? defaultAgent?.provider,
         cwd: body.cwd ?? defaultAgent?.cwd,
+        toolsets: body.toolsets,
       }
       cfg.agents.push(agent)
       await writeAgentsConfig(cfg)
@@ -540,6 +820,7 @@ export class Gateway {
       if (body.avatarEmoji !== undefined) agent.avatarEmoji = body.avatarEmoji
       if (body.greeting !== undefined) agent.greeting = body.greeting
       if (body.provider !== undefined) agent.provider = body.provider
+      if (body.toolsets !== undefined) agent.toolsets = body.toolsets
       if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
       cfg.agents[idx] = agent
       await writeAgentsConfig(cfg)
@@ -647,7 +928,11 @@ export class Gateway {
       return
     }
     if (req.method === 'PUT') {
-      const body = await this.readJsonBody<{ description?: string; body?: string; tags?: string[] }>(req)
+      const body = await this.readJsonBody<{
+        description?: string
+        body?: string
+        tags?: string[]
+      }>(req)
       const r = await store.save(
         { name: skillName, description: body.description ?? '', tags: body.tags },
         body.body ?? '',
@@ -667,16 +952,25 @@ export class Gateway {
 
   // GET /api/search?q=... → full-text search past sessions
   // ── Inter-agent messaging ──
-  private async handleAgentMessage(req: IncomingMessage, res: ServerResponse, targetAgentId: string): Promise<void> {
+  private async handleAgentMessage(
+    req: IncomingMessage,
+    res: ServerResponse,
+    targetAgentId: string,
+  ): Promise<void> {
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const body = await this.readBody(req)
-    let parsed: any; try { parsed = JSON.parse(body) } catch { return this.sendError(res, 400, 'invalid JSON') }
+    let parsed: any
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
     const { message, sourceAgent } = parsed
     if (!message) return this.sendError(res, 400, 'message required')
 
     // Find target agent
     const cfg = await readAgentsConfig()
-    const targetAgent = cfg.agents.find(a => a.id === targetAgentId)
+    const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
     if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
 
     const sessionKey = `agent:${targetAgentId}:inter:dm:${sourceAgent || 'system'}`
@@ -693,37 +987,304 @@ export class Gateway {
 
     // Submit message and collect output
     let output = ''
-    await this.sessions.submit(session, `[来自 agent "${sourceAgent}" 的消息]\n\n${message}`, (e) => {
-      if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
-    })
+    await this.sessions.submit(
+      session,
+      `[来自 agent "${sourceAgent}" 的消息]\n\n${message}`,
+      (e) => {
+        if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
+      },
+    )
 
     // Push result to user's active channel
-    const lastActive = this.lastActiveChannel.get('main') || this.lastActiveChannel.values().next().value
+    const lastActive =
+      this.lastActiveChannel.get('main') || this.lastActiveChannel.values().next().value
     if (lastActive && output.trim()) {
       const out = {
         type: 'outbound.message' as const,
         sessionKey: lastActive.sessionKey || `agent:${targetAgentId}:inter:dm:${sourceAgent}`,
         channel: 'webchat' as const,
         peer: { id: lastActive.peerId, kind: 'dm' as const },
-        blocks: [{ kind: 'text' as const, text: `📨 **${targetAgentId}** 回复:\n\n${output.trim()}` }],
+        blocks: [
+          { kind: 'text' as const, text: `📨 **${targetAgentId}** 回复:\n\n${output.trim()}` },
+        ],
         isFinal: true,
       }
       const peerKey = `webchat:${lastActive.peerId}`
       const set = this.clientsByPeer.get(peerKey)
       if (set) {
         const data = JSON.stringify(out)
-        for (const ws of set) { try { ws.send(data) } catch {} }
+        for (const ws of set) {
+          try {
+            ws.send(data)
+          } catch {}
+        }
       }
     }
 
     this.sendJson(res, 200, { ok: true, agentId: targetAgentId, outputLength: output.length })
   }
 
-  private async handleSearch(
+  /** Active delegation count for recursion/concurrency limits */
+  private _activeDelegations = 0
+  private static MAX_CONCURRENT_DELEGATIONS = 5
+
+  private async handleDelegateTask(
     req: IncomingMessage,
     res: ServerResponse,
-    url: URL,
+    targetAgentId: string,
   ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: any
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const { goal, context, sourceAgent, toolsets } = parsed
+    if (!goal) return this.sendError(res, 400, 'goal required')
+
+    // Concurrency guard
+    if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) {
+      return this.sendError(
+        res,
+        429,
+        `too many concurrent delegations (max ${Gateway.MAX_CONCURRENT_DELEGATIONS})`,
+      )
+    }
+
+    // Recursion guard: check delegation depth via header
+    const depthHeader = req.headers['x-delegation-depth']
+    const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
+    if (depth >= 3) {
+      return this.sendError(res, 400, 'delegation depth limit exceeded (max 3)')
+    }
+
+    // Find target agent
+    const cfg = await readAgentsConfig()
+    const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
+    if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
+
+    // Apply toolset restriction if specified
+    const delegatedAgent = toolsets ? { ...targetAgent, toolsets } : targetAgent
+
+    const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
+    console.log(
+      `[delegate] ${sourceAgent} → ${targetAgentId}: "${goal.slice(0, 60)}" (depth=${depth})`,
+    )
+
+    const session = await this.sessions.getOrCreate({
+      sessionKey,
+      agent: delegatedAgent,
+      channel: 'delegate',
+      peerId: sourceAgent || 'system',
+      title: `[delegate] ${goal.slice(0, 40)}`,
+      delegationDepth: depth + 1,
+    })
+
+    // Build prompt with context
+    const prompt = context
+      ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
+      : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`
+
+    this._activeDelegations++
+    const _dlgRun = this._runLog.start({ agentId: targetAgentId, sessionKey, taskType: 'delegate' })
+    let output = ''
+    let error = ''
+    try {
+      await this.sessions.submit(session, prompt, (e) => {
+        if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
+        if (e.kind === 'error') error = e.error
+      })
+      this._runLog.complete(_dlgRun, {
+        status: error ? 'failed' : 'completed',
+        error: error || undefined,
+      })
+    } catch (err: any) {
+      error = error || String(err)
+      this._runLog.complete(_dlgRun, { status: 'failed', error })
+    } finally {
+      this._activeDelegations--
+    }
+
+    eventBus.emit('agent.completed', {
+      type: 'agent.completed',
+      agentId: targetAgentId,
+      sessionKey,
+      output: output.trim(),
+      error: error || undefined,
+    })
+
+    this.sendJson(res, 200, {
+      ok: !error,
+      agentId: targetAgentId,
+      output: output.trim(),
+      error: error || undefined,
+    })
+  }
+
+  private async _handleWebhook(
+    req: IncomingMessage,
+    res: ServerResponse,
+    whId: string,
+  ): Promise<void> {
+    if (req.method === 'POST') {
+      const wh = this.webhookRouter?.find(whId)
+      if (!wh) {
+        this.sendError(res, 404, 'webhook not found')
+        return
+      }
+      const body = await this.readBody(req)
+      const sig = (req.headers['x-hub-signature-256'] || req.headers['x-signature'] || '') as string
+      const result = await this.webhookRouter!.process(wh, body, sig)
+      this.sendJson(res, result.ok ? 200 : 403, result)
+      return
+    }
+    if (req.method === 'DELETE') {
+      const removed = await this.webhookRouter?.remove(whId)
+      this.sendJson(res, removed ? 200 : 404, { ok: !!removed })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  private async _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method === 'GET') {
+      const tasks = await this._taskStore.list()
+      this.sendJson(res, 200, { tasks })
+      return
+    }
+    if (req.method === 'POST') {
+      const body = await this.readBody(req)
+      let parsed: any
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        return this.sendError(res, 400, 'invalid JSON')
+      }
+      const { id, title, agent, prompt, trigger, schedule, webhookId, eventType, maxRuns } = parsed
+      if (!title || !prompt) return this.sendError(res, 400, 'title and prompt required')
+      const task = await this._taskStore.create({
+        id: id || `task-${Date.now().toString(36)}`,
+        title,
+        agent: agent || 'main',
+        prompt,
+        trigger: trigger || 'manual',
+        schedule,
+        webhookId,
+        eventType,
+        maxRuns,
+      })
+      this.sendJson(res, 201, { ok: true, task })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  private async _handleTaskItem(
+    req: IncomingMessage,
+    res: ServerResponse,
+    taskId: string,
+  ): Promise<void> {
+    if (req.method === 'GET') {
+      const task = await this._taskStore.get(taskId)
+      if (!task) return this.sendError(res, 404, 'task not found')
+      this.sendJson(res, 200, { task })
+      return
+    }
+    if (req.method === 'PUT') {
+      const body = await this.readBody(req)
+      let parsed: any
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        return this.sendError(res, 400, 'invalid JSON')
+      }
+      const ok = await this._taskStore.update(taskId, parsed)
+      this.sendJson(res, ok ? 200 : 404, { ok })
+      return
+    }
+    if (req.method === 'DELETE') {
+      const ok = await this._taskStore.remove(taskId)
+      this.sendJson(res, ok ? 200 : 404, { ok })
+      return
+    }
+    // POST → manually trigger the task (uses shared _triggerTask with RunLog)
+    if (req.method === 'POST') {
+      const task = await this._taskStore.get(taskId)
+      if (!task) return this.sendError(res, 404, 'task not found')
+      if (task.status === 'disabled')
+        return this.sendError(res, 409, 'task is disabled (maxRuns reached)')
+      this._triggerTask(taskId).catch((err) =>
+        console.error(`[task] ${taskId} manual trigger failed:`, err),
+      )
+      this.sendJson(res, 202, { ok: true, message: 'task triggered' })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  /** Check schedule-triggered tasks and fire if cron matches */
+  private async _tickScheduledTasks(): Promise<void> {
+    const tasks = await this._taskStore.list()
+    const now = new Date()
+    for (const t of tasks) {
+      if (t.trigger !== 'schedule' || !t.schedule || t.status === 'disabled') continue
+      // Simple minute-level dedup: skip if ran in this minute
+      const minuteKey = Math.floor(now.getTime() / 60_000)
+      if (t.lastRunAt && Math.floor(t.lastRunAt / 60_000) === minuteKey) continue
+      // Import cronMatches from cron.ts is complex — use a simple check
+      // Delegate to CronScheduler's cronMatches by re-importing
+      try {
+        const { cronMatches } = await import('./cron.js')
+        if (cronMatches(t.schedule, now)) {
+          this._triggerTask(t.id).catch(() => {})
+        }
+      } catch {}
+    }
+  }
+
+  /** Trigger a task by ID (shared by schedule tick, webhook, and manual API) */
+  private async _triggerTask(taskId: string): Promise<void> {
+    const task = await this._taskStore.get(taskId)
+    if (!task || task.status === 'disabled') return
+    const cfg = await readAgentsConfig()
+    const agent = cfg.agents.find((a) => a.id === task.agent)
+    if (!agent) return
+    const sessionKey = `agent:${task.agent}:task:${taskId}:${Date.now()}`
+    const session = await this.sessions.getOrCreate({
+      sessionKey,
+      agent,
+      channel: 'task',
+      peerId: taskId,
+      title: `[task] ${task.title}`,
+    })
+    const runEntry = this._runLog.start({ agentId: task.agent, sessionKey, taskType: 'task' })
+    let output = ''
+    let error = ''
+    try {
+      await this.sessions.submit(session, task.prompt, (e) => {
+        if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
+        if (e.kind === 'error') error = e.error
+      })
+    } catch (err: any) {
+      error = String(err)
+    }
+    this._runLog.complete(runEntry, {
+      status: error ? 'failed' : 'completed',
+      error: error || undefined,
+    })
+    await this._taskStore.recordExecution({
+      taskId,
+      startedAt: runEntry.startedAt,
+      completedAt: Date.now(),
+      status: error ? 'failed' : 'completed',
+      output: output.slice(0, 2000),
+      error: error || undefined,
+    })
+  }
+
+  private async handleSearch(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
     const q = url.searchParams.get('q') ?? ''
     const limit = Number(url.searchParams.get('limit') ?? '10')
@@ -743,16 +1304,21 @@ export class Gateway {
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'GET') {
-      const jobs = await this.cron.listJobs()
+      const jobs = await this.cron.listJobsWithMeta()
       this.sendJson(res, 200, { jobs })
       return
     }
     if (req.method === 'POST') {
       const body = await this.readBody(req)
-      let parsed: any; try { parsed = JSON.parse(body) } catch { return this.sendError(res, 400, 'invalid JSON') }
+      let parsed: any
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        return this.sendError(res, 400, 'invalid JSON')
+      }
       const { schedule, prompt, deliver, oneshot, label, agent } = parsed
       if (!schedule || !prompt) return this.sendError(res, 400, 'schedule and prompt required')
-      const id = 'remind-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
+      const id = `remind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
       const job = {
         id,
         schedule,
@@ -770,18 +1336,50 @@ export class Gateway {
     this.sendError(res, 405, 'method not allowed')
   }
 
-  private async handleCronDelete(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+  private async handleCronItem(
+    req: IncomingMessage,
+    res: ServerResponse,
+    id: string,
+  ): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
-    if (req.method !== 'DELETE') return this.sendError(res, 405, 'method not allowed')
-    const removed = await this.cron.removeJob(id)
-    this.sendJson(res, removed ? 200 : 404, { ok: removed })
+    if (req.method === 'DELETE') {
+      const removed = await this.cron.removeJob(id)
+      this.sendJson(res, removed ? 200 : 404, { ok: removed })
+      return
+    }
+    if (req.method === 'PUT') {
+      const body = await this.readBody(req)
+      let parsed: any
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        return this.sendError(res, 400, 'invalid JSON')
+      }
+      const updated = await this.cron.updateJob(id, parsed)
+      this.sendJson(res, updated ? 200 : 404, { ok: updated })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
   }
 
   // ── Claude.ai OAuth PKCE Flow ──
-  private oauthPending = new Map<string, { codeVerifier: string; createdAt: number; provider: string }>()
+  private oauthPending = new Map<
+    string,
+    { codeVerifier: string; createdAt: number; provider: string }
+  >()
 
   // Multi-provider OAuth configs
-  private readonly OAUTH_PROVIDERS: Record<string, { clientId: string; authUrl: string; tokenUrl: string; redirect: string; scopes: string; extraParams?: Record<string, string> }> = {
+  private readonly OAUTH_PROVIDERS: Record<
+    string,
+    {
+      clientId: string
+      authUrl: string
+      tokenUrl: string
+      redirect: string
+      scopes: string
+      extraParams?: Record<string, string>
+    }
+  > = {
     claude: {
       clientId: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
       authUrl: 'https://claude.com/cai/oauth/authorize',
@@ -795,7 +1393,11 @@ export class Gateway {
       tokenUrl: 'https://auth.openai.com/oauth/token',
       redirect: 'http://localhost:1455/auth/callback',
       scopes: 'openid profile email offline_access',
-      extraParams: { id_token_add_organizations: 'true', codex_cli_simplified_flow: 'true', originator: 'codex_vscode' },
+      extraParams: {
+        id_token_add_organizations: 'true',
+        codex_cli_simplified_flow: 'true',
+        originator: 'codex_vscode',
+      },
     },
   }
 
@@ -805,7 +1407,7 @@ export class Gateway {
     const { provider: oauthProvider } = JSON.parse(body || '{}')
     const providerKey = oauthProvider || 'claude'
     const prov = this.OAUTH_PROVIDERS[providerKey]
-    if (!prov) return this.sendError(res, 400, 'unknown oauth provider: ' + providerKey)
+    if (!prov) return this.sendError(res, 400, `unknown oauth provider: ${providerKey}`)
 
     const codeVerifier = randomBytes(32).toString('base64url')
     const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url')
@@ -840,7 +1442,12 @@ export class Gateway {
   private async handleOAuthCallback(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const body = await this.readBody(req)
-    let parsed: any; try { parsed = JSON.parse(body) } catch { return this.sendError(res, 400, 'invalid JSON') }
+    let parsed: any
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
     const { code, state } = parsed
     if (!code || !state) return this.sendError(res, 400, 'code and state required')
     const cleanCode = code.includes('#') ? code.split('#')[0] : code
@@ -873,7 +1480,7 @@ export class Gateway {
         return this.sendError(res, 502, `token exchange failed: ${tokenRes.status}`)
       }
 
-      const tokens = await tokenRes.json() as {
+      const tokens = (await tokenRes.json()) as {
         access_token: string
         refresh_token?: string
         expires_in?: number
@@ -927,7 +1534,10 @@ export class Gateway {
     }
   }
 
-  private async _refreshToken(providerKey: string, oauth: { refreshToken: string; scope: string; expiresAt: number }): Promise<void> {
+  private async _refreshToken(
+    providerKey: string,
+    oauth: { refreshToken: string; scope: string; expiresAt: number },
+  ): Promise<void> {
     const prov = this.OAUTH_PROVIDERS[providerKey]
     if (!prov) return
 
@@ -948,7 +1558,7 @@ export class Gateway {
         return
       }
 
-      const tokens = await tokenRes.json() as any
+      const tokens = (await tokenRes.json()) as any
       const config = await readConfig()
       if (config) {
         const refreshed = {
@@ -958,7 +1568,7 @@ export class Gateway {
           scope: tokens.scope ?? oauth.scope,
         }
         if (providerKey === 'claude') config.auth.claudeOAuth = refreshed
-        else (config.auth as any)[providerKey + 'OAuth'] = refreshed
+        else (config.auth as any)[`${providerKey}OAuth`] = refreshed
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
@@ -975,7 +1585,11 @@ export class Gateway {
       let size = 0
       req.on('data', (c: Buffer) => {
         size += c.length
-        if (size > maxBytes) { req.destroy(); reject(new Error('body too large')); return }
+        if (size > maxBytes) {
+          req.destroy()
+          reject(new Error('body too large'))
+          return
+        }
         chunks.push(c)
       })
       req.on('end', () => resolve(Buffer.concat(chunks).toString()))
@@ -1009,7 +1623,9 @@ export class Gateway {
     }
     const data = JSON.stringify(out)
     for (const ws of this.wsClients) {
-      try { ws.send(data) } catch {}
+      try {
+        ws.send(data)
+      } catch {}
     }
   }
 
@@ -1021,7 +1637,9 @@ export class Gateway {
     }
     // Keepalive pong tracking
     ;(ws as any)._isAlive = true
-    ws.on('pong', () => { (ws as any)._isAlive = true })
+    ws.on('pong', () => {
+      ;(ws as any)._isAlive = true
+    })
 
     this.wsClients.add(ws)
     ws.once('close', () => this.wsClients.delete(ws))
@@ -1043,7 +1661,8 @@ export class Gateway {
       if (frame.type === 'inbound.permission_response') {
         if (!this.permissions) return
         const decision = frame.decision
-        const mapped = decision === 'allow_always' ? 'allow_always' : decision === 'allow' ? 'allow' : 'deny'
+        const mapped =
+          decision === 'allow_always' ? 'allow_always' : decision === 'allow' ? 'allow' : 'deny'
         const ok = await this.permissions.respond(frame.requestId, mapped as any)
         console.log(`[permission-relay] response ${frame.requestId} → ${mapped} (ok=${ok})`)
         return
@@ -1069,19 +1688,43 @@ export class Gateway {
         const sessionKey = (frame as any).sessionKey
         if (!sessionKey) return
         const session = this.sessions.getByKey(sessionKey)
-        if (!session) { ws.send(JSON.stringify({ type: 'error', error: 'session not found' })); return }
+        if (!session) {
+          ws.send(JSON.stringify({ type: 'error', error: 'session not found' }))
+          return
+        }
         console.log(`[compact] compacting session ${sessionKey}`)
         try {
-          await this.sessions.submit(session, '/compact — 请压缩当前对话上下文,保留关键信息,删除冗余细节。', (e) => {
-            if (e.kind === 'block') {
-              const out = { type: 'outbound.message', sessionKey, channel: 'webchat', peer: { id: sessionKey.split(':')[4] || '__compact__', kind: 'dm' }, blocks: [e.block], isFinal: false }
-              ws.send(JSON.stringify(out))
-            } else if (e.kind === 'final') {
-              ws.send(JSON.stringify({ type: 'outbound.message', sessionKey, channel: 'webchat', peer: { id: '__compact__', kind: 'dm' }, blocks: [{ kind: 'text', text: '✅ 上下文压缩完成' }], isFinal: true, meta: e.meta }))
-            }
-          })
+          await this.sessions.submit(
+            session,
+            '/compact — 请压缩当前对话上下文,保留关键信息,删除冗余细节。',
+            (e) => {
+              if (e.kind === 'block') {
+                const out = {
+                  type: 'outbound.message',
+                  sessionKey,
+                  channel: 'webchat',
+                  peer: { id: sessionKey.split(':')[4] || '__compact__', kind: 'dm' },
+                  blocks: [e.block],
+                  isFinal: false,
+                }
+                ws.send(JSON.stringify(out))
+              } else if (e.kind === 'final') {
+                ws.send(
+                  JSON.stringify({
+                    type: 'outbound.message',
+                    sessionKey,
+                    channel: 'webchat',
+                    peer: { id: '__compact__', kind: 'dm' },
+                    blocks: [{ kind: 'text', text: '✅ 上下文压缩完成' }],
+                    isFinal: true,
+                    meta: e.meta,
+                  }),
+                )
+              }
+            },
+          )
         } catch (err: any) {
-          ws.send(JSON.stringify({ type: 'error', error: 'compact failed: ' + err?.message }))
+          ws.send(JSON.stringify({ type: 'error', error: `compact failed: ${err?.message}` }))
         }
       }
     })
@@ -1134,7 +1777,12 @@ export class Gateway {
       agent = routed.agent
     }
     // Track last active channel for proactive push
-    this.lastActiveChannel.set(agent.id, { channel: frame.channel, peerId: frame.peer.id, sessionKey, at: Date.now() })
+    this.lastActiveChannel.set(agent.id, {
+      channel: frame.channel,
+      peerId: frame.peer.id,
+      sessionKey,
+      at: Date.now(),
+    })
 
     const session = await this.sessions.getOrCreate({
       sessionKey,
@@ -1164,7 +1812,7 @@ export class Gateway {
 
     // Server-side upload validation
     const MAX_SINGLE_FILE = 25 * 1024 * 1024 // 25MB
-    const MAX_TOTAL_MEDIA = 50 * 1024 * 1024  // 50MB total
+    const MAX_TOTAL_MEDIA = 50 * 1024 * 1024 // 50MB total
     const ALLOWED_MIME_PREFIXES = ['image/', 'audio/', 'video/', 'application/pdf', 'text/']
     let totalMediaSize = 0
     for (const m of media) {
@@ -1174,32 +1822,76 @@ export class Gateway {
       if (byteLen > MAX_SINGLE_FILE) {
         const errMsg = `附件超过 ${MAX_SINGLE_FILE / 1024 / 1024}MB 限制 (${(byteLen / 1024 / 1024).toFixed(1)}MB)`
         console.warn(`[upload] rejected: ${errMsg}`)
-        this.deliver({ type: 'outbound.message', sessionKey: sessionKey!, channel: frame.channel, peer: frame.peer,
-          blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }], isFinal: true }, adapter)
+        this.deliver(
+          {
+            type: 'outbound.message',
+            sessionKey: sessionKey!,
+            channel: frame.channel,
+            peer: frame.peer,
+            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
+            isFinal: true,
+          },
+          adapter,
+        )
         return
       }
       totalMediaSize += byteLen
       if (totalMediaSize > MAX_TOTAL_MEDIA) {
         const errMsg = `总附件超过 ${MAX_TOTAL_MEDIA / 1024 / 1024}MB 限制`
         console.warn(`[upload] rejected: ${errMsg}`)
-        this.deliver({ type: 'outbound.message', sessionKey: sessionKey!, channel: frame.channel, peer: frame.peer,
-          blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }], isFinal: true }, adapter)
+        this.deliver(
+          {
+            type: 'outbound.message',
+            sessionKey: sessionKey!,
+            channel: frame.channel,
+            peer: frame.peer,
+            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
+            isFinal: true,
+          },
+          adapter,
+        )
         return
       }
       const mime = m.mimeType || ''
-      if (mime && !ALLOWED_MIME_PREFIXES.some(p => mime.startsWith(p)) && mime !== 'application/octet-stream') {
+      if (
+        mime &&
+        !ALLOWED_MIME_PREFIXES.some((p) => mime.startsWith(p)) &&
+        mime !== 'application/octet-stream'
+      ) {
+        const errMsg = `不支持的文件类型: ${mime}`
         console.warn(`[upload] rejected: disallowed MIME ${mime}`)
-        continue // skip this file but process others
+        this.deliver(
+          {
+            type: 'outbound.message',
+            sessionKey: sessionKey!,
+            channel: frame.channel,
+            peer: frame.peer,
+            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
+            isFinal: true,
+          },
+          adapter,
+        )
+        return
       }
     }
 
     // MIME → extension lookup (expanded to cover all media types)
     const mimeToExt: Record<string, string> = {
-      'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif',
-      'image/webp': 'webp', 'image/bmp': 'bmp', 'image/svg+xml': 'svg',
-      'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/ogg': 'ogg',
-      'audio/aac': 'aac', 'audio/flac': 'flac', 'audio/mp4': 'm4a',
-      'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov',
+      'image/jpeg': 'jpg',
+      'image/png': 'png',
+      'image/gif': 'gif',
+      'image/webp': 'webp',
+      'image/bmp': 'bmp',
+      'image/svg+xml': 'svg',
+      'audio/mpeg': 'mp3',
+      'audio/wav': 'wav',
+      'audio/ogg': 'ogg',
+      'audio/aac': 'aac',
+      'audio/flac': 'flac',
+      'audio/mp4': 'm4a',
+      'video/mp4': 'mp4',
+      'video/webm': 'webm',
+      'video/quicktime': 'mov',
       'application/pdf': 'pdf',
       'application/msword': 'doc',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
@@ -1207,16 +1899,30 @@ export class Gateway {
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
     }
 
-    type SavedMedia = { kind: string; path: string; name: string; mimeType: string; sizeHint: string }
+    type SavedMedia = {
+      kind: string
+      path: string
+      name: string
+      mimeType: string
+      sizeHint: string
+    }
     const savedMedia: SavedMedia[] = []
     for (const m of media) {
       let base64 = m.base64 ?? ''
       if (!base64 && m.url) continue // external URL — don't save, just reference
       const prefixMatch = base64.match(/^data:([^;]+);base64,(.*)$/)
-      const mimeType = prefixMatch ? prefixMatch[1] : m.mimeType ?? 'application/octet-stream'
+      const mimeType = prefixMatch ? prefixMatch[1] : (m.mimeType ?? 'application/octet-stream')
       if (prefixMatch) base64 = prefixMatch[2]
-      const ext = mimeToExt[mimeType] ?? mimeType.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
-      const defaultName = m.kind === 'image' ? 'image' : m.kind === 'audio' ? 'audio' : m.kind === 'video' ? 'video' : 'file'
+      const ext =
+        mimeToExt[mimeType] ?? mimeType.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
+      const defaultName =
+        m.kind === 'image'
+          ? 'image'
+          : m.kind === 'audio'
+            ? 'audio'
+            : m.kind === 'video'
+              ? 'video'
+              : 'file'
       const safeBase = (m.filename ?? defaultName).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 40)
       const fname = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeBase}.${ext}`
       const fpath = join(paths.uploadsDir, fname)
@@ -1224,7 +1930,13 @@ export class Gateway {
         await mkdir(paths.uploadsDir, { recursive: true })
         await writeFile(fpath, Buffer.from(base64, 'base64'))
         const sizeKb = (Buffer.byteLength(base64, 'base64') / 1024).toFixed(1)
-        savedMedia.push({ kind: m.kind, path: fpath, name: m.filename ?? fname, mimeType, sizeHint: `${sizeKb}KB` })
+        savedMedia.push({
+          kind: m.kind,
+          path: fpath,
+          name: m.filename ?? fname,
+          mimeType,
+          sizeHint: `${sizeKb}KB`,
+        })
       } catch (err) {
         console.warn(`[dispatchInbound] failed to save uploaded ${m.kind}:`, err)
       }
@@ -1241,10 +1953,10 @@ export class Gateway {
       }
       const hasUnderstandImage = activeMcpTools.includes('understand_image')
 
-      const images = savedMedia.filter(m => m.kind === 'image')
-      const audios = savedMedia.filter(m => m.kind === 'audio')
-      const videos = savedMedia.filter(m => m.kind === 'video')
-      const files  = savedMedia.filter(m => m.kind === 'file')
+      const images = savedMedia.filter((m) => m.kind === 'image')
+      const audios = savedMedia.filter((m) => m.kind === 'audio')
+      const videos = savedMedia.filter((m) => m.kind === 'video')
+      const files = savedMedia.filter((m) => m.kind === 'file')
 
       const lines = [text]
 
@@ -1257,7 +1969,9 @@ export class Gateway {
         lines.push('如果需要看图片内容,按以下顺序尝试:')
         let step = 1
         if (hasUnderstandImage) {
-          lines.push(`${step}. 优先调用 \`understand_image\` MCP 工具,传图片的**本地文件路径**作为 \`image_source\` 参数。`)
+          lines.push(
+            `${step}. 优先调用 \`understand_image\` MCP 工具,传图片的**本地文件路径**作为 \`image_source\` 参数。`,
+          )
           step++
         }
         lines.push(`${step}. 用 Read 工具读图片路径(原生多模态 provider 会直接看到图像)。`)
@@ -1270,7 +1984,10 @@ export class Gateway {
         for (const a of audios) {
           lines.push(`- \`${a.path}\` (${a.mimeType}, ${a.sizeHint}, 原名: ${a.name})`)
         }
-        lines.push('', '如果有 STT (语音转文字) 工具可用,请帮用户转录音频内容;否则告知用户音频文件已保存。')
+        lines.push(
+          '',
+          '如果有 STT (语音转文字) 工具可用,请帮用户转录音频内容;否则告知用户音频文件已保存。',
+        )
       }
 
       if (videos.length > 0) {
@@ -1293,6 +2010,14 @@ export class Gateway {
     }
     // Pass as plain text. No image content blocks — safer for non-multimodal providers.
     const payload: string = finalText
+    const taskType = sessionKey.includes(':cron:')
+      ? ('cron' as const)
+      : sessionKey.includes(':delegate:')
+        ? ('delegate' as const)
+        : sessionKey.includes(':inter:')
+          ? ('inter-agent' as const)
+          : ('chat' as const)
+    const _run = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
     await this.sessions.submit(session, payload, (e) => {
       if (e.kind === 'block') {
         if (adapter) {
@@ -1311,15 +2036,20 @@ export class Gateway {
           this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
         }
       } else if (e.kind === 'final') {
+        this._runLog.complete(_run, {
+          status: 'completed',
+          cost: e.meta?.cost,
+          inputTokens: e.meta?.inputTokens,
+          outputTokens: e.meta?.outputTokens,
+          turn: e.meta?.turn,
+        })
         if (adapter) {
-          this.deliver(
-            { ...out, blocks: aggregatedBlocks, isFinal: true, meta: e.meta },
-            adapter,
-          )
+          this.deliver({ ...out, blocks: aggregatedBlocks, isFinal: true, meta: e.meta }, adapter)
         } else {
           this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
         }
       } else if (e.kind === 'error') {
+        this._runLog.complete(_run, { status: 'failed', error: e.error })
         this.deliver(
           {
             ...out,
@@ -1334,7 +2064,7 @@ export class Gateway {
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {
     if (adapter) {
-      adapter.send(out).catch((err) => console.error(`[gateway] adapter send failed:`, err))
+      adapter.send(out).catch((err) => console.error('[gateway] adapter send failed:', err))
       return
     }
     // WebChat:广播给所有同 (channel, peer) 的 ws client
@@ -1350,6 +2080,48 @@ export class Gateway {
   }
 }
 
+// ── Exported security helpers (tested in security.test.ts) ──
+
+export const FILE_BLOCKED_PATTERNS = [
+  /openclaude\.json$/, // gateway config with tokens
+  /\.env($|\.)/, // .env, .env.local, .env.production, .env.development, etc.
+  /credentials/, // credential directory
+  /\.ssh/, // SSH keys
+  /\.key$/, // private keys
+  /\.pem$/, // certificates
+  /id_rsa/, // SSH private key
+  /id_ed25519/, // SSH private key
+  /\.gnupg/, // GPG keys
+  /\.password/, // password files
+  /shadow$/, // /etc/shadow
+  /auth.*token/i, // token files
+  /MEMORY\.md$/, // agent long-term memory
+  /USER\.md$/, // user identity / core memory
+  /CLAUDE\.md$/, // agent persona / system instructions
+  /resume-map\.json$/, // session checkpoint data
+  /\.npmrc$/, // npm registry tokens
+  /\.pypirc$/, // PyPI credentials
+  /\.netrc$/, // FTP/HTTP credentials
+  /\.aws\//, // AWS credentials & config directory
+  /\.kube\//, // Kubernetes config directory
+  /\.docker\/config\.json$/, // Docker registry credentials
+]
+
+/** Returns true if the resolved path matches any sensitive-file pattern. */
+export function isFileBlocked(resolvedPath: string): boolean {
+  return FILE_BLOCKED_PATTERNS.some((p) => p.test(resolvedPath))
+}
+
+export const UPLOAD_MIME_PREFIXES = ['image/', 'audio/', 'video/', 'application/pdf', 'text/']
+export const MAX_UPLOAD_SINGLE = 25 * 1024 * 1024
+export const MAX_UPLOAD_TOTAL = 50 * 1024 * 1024
+
+/** Returns true if the MIME type is allowed for upload. */
+export function isUploadMimeAllowed(mime: string): boolean {
+  if (!mime) return true
+  return UPLOAD_MIME_PREFIXES.some((p) => mime.startsWith(p)) || mime === 'application/octet-stream'
+}
+
 const MIME_MAP: Record<string, string> = {
   // web
   '.html': 'text/html; charset=utf-8',
@@ -1358,18 +2130,26 @@ const MIME_MAP: Record<string, string> = {
   '.json': 'application/json',
   '.svg': 'image/svg+xml',
   // images
-  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-  '.png': 'image/png', '.gif': 'image/gif',
-  '.webp': 'image/webp', '.bmp': 'image/bmp',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
   '.ico': 'image/x-icon',
   // audio
-  '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg', '.aac': 'audio/aac',
-  '.flac': 'audio/flac', '.m4a': 'audio/mp4',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.aac': 'audio/aac',
+  '.flac': 'audio/flac',
+  '.m4a': 'audio/mp4',
   '.wma': 'audio/x-ms-wma',
   // video
-  '.mp4': 'video/mp4', '.webm': 'video/webm',
-  '.mov': 'video/quicktime', '.avi': 'video/x-msvideo',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo',
   '.mkv': 'video/x-matroska',
   // documents
   '.pdf': 'application/pdf',

@@ -20,7 +20,9 @@ export interface WeChatConfig {
 export function wechatChannelFactory(_cfg: WeChatConfig): ChannelAdapter {
   let ctx: ChannelContext | null = null
   return {
+    id: 'wechat',
     name: 'wechat',
+    type: 'channel' as const,
     async init(c) {
       ctx = c
       c.log.info('wechat channel stub initialized (TODO: implement)')

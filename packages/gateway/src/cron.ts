@@ -18,17 +18,12 @@
 // Job output: run_id + timestamp written to ~/.openclaude/cron/outputs/<id>-<ts>.md.
 // If the agent's final text starts with [SILENT], output is archived but not delivered.
 
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { type AgentDef, type OpenClaudeConfig, paths, readAgentsConfig } from '@openclaude/storage'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
-import {
-  type AgentDef,
-  type OpenClaudeConfig,
-  paths,
-  readAgentsConfig,
-} from '@openclaude/storage'
-import { SessionManager } from './sessionManager.js'
+import type { SessionManager } from './sessionManager.js'
 
 const LAST_RUN_FILE = join(paths.home, 'cron', 'last-run.json')
 
@@ -41,7 +36,7 @@ export interface CronJob {
   deliverTarget?: { channel?: string; peerId?: string }
   enabled?: boolean
   oneshot?: boolean // fire once then auto-disable
-  label?: string   // human-readable label (for reminders)
+  label?: string // human-readable label (for reminders)
 }
 
 export interface CronFile {
@@ -163,7 +158,13 @@ export function cronMatches(expr: string, d?: Date): boolean {
   const local = d ?? getLocalDate()
   const fields = expr.trim().split(/\s+/)
   if (fields.length !== 5) return false
-  const vals = [local.getMinutes(), local.getHours(), local.getDate(), local.getMonth() + 1, local.getDay()]
+  const vals = [
+    local.getMinutes(),
+    local.getHours(),
+    local.getDate(),
+    local.getMonth() + 1,
+    local.getDay(),
+  ]
   for (let i = 0; i < 5; i++) {
     if (!fieldMatches(fields[i], vals[i])) return false
   }
@@ -185,14 +186,16 @@ function matchPart(part: string, val: number): boolean {
     if (base === '*') return val % step === 0
     const range = base.split('-')
     if (range.length === 2) {
-      const start = Number(range[0]), end = Number(range[1])
+      const start = Number(range[0])
+      const end = Number(range[1])
       return val >= start && val <= end && (val - start) % step === 0
     }
     return false
   }
   const rangeMatch = part.match(/^(\d+)-(\d+)$/)
   if (rangeMatch) {
-    const start = Number(rangeMatch[1]), end = Number(rangeMatch[2])
+    const start = Number(rangeMatch[1])
+    const end = Number(rangeMatch[2])
     return val >= start && val <= end
   }
   const n = Number(part)
@@ -236,7 +239,7 @@ export class CronScheduler {
 
       // Cleanup: remove completed oneshot jobs from yaml
       const before = file.jobs.length
-      file.jobs = file.jobs.filter(j => !(j.oneshot && j.enabled === false))
+      file.jobs = file.jobs.filter((j) => !(j.oneshot && j.enabled === false))
       if (file.jobs.length < before) {
         await writeFile(paths.cronYaml, stringifyYaml(file))
       }
@@ -291,7 +294,9 @@ export class CronScheduler {
       console.log(`[cron] job ${job.id} silent, not delivering`)
       return
     }
-    console.log(`[cron] job ${job.id} completed (${trimmed.length} chars), deliver=${job.deliver ?? 'local'}`)
+    console.log(
+      `[cron] job ${job.id} completed (${trimmed.length} chars), deliver=${job.deliver ?? 'local'}`,
+    )
     if ((job.deliver ?? 'local') === 'local') {
       // local = just log, don't push to any channel
     } else {
@@ -312,7 +317,7 @@ export class CronScheduler {
   async addJob(job: CronJob): Promise<void> {
     const file = await ensureCronFile()
     // Replace if same ID exists
-    file.jobs = file.jobs.filter(j => j.id !== job.id)
+    file.jobs = file.jobs.filter((j) => j.id !== job.id)
     file.jobs.push(job)
     await writeFile(paths.cronYaml, stringifyYaml(file))
     console.log(`[cron] added job ${job.id}`)
@@ -321,16 +326,45 @@ export class CronScheduler {
   async removeJob(id: string): Promise<boolean> {
     const file = await ensureCronFile()
     const before = file.jobs.length
-    file.jobs = file.jobs.filter(j => j.id !== id)
+    file.jobs = file.jobs.filter((j) => j.id !== id)
     if (file.jobs.length === before) return false
     await writeFile(paths.cronYaml, stringifyYaml(file))
     console.log(`[cron] removed job ${id}`)
     return true
   }
 
+  async updateJob(
+    id: string,
+    updates: Partial<Pick<CronJob, 'enabled' | 'schedule' | 'prompt' | 'label'>>,
+  ): Promise<boolean> {
+    const file = await ensureCronFile()
+    const job = file.jobs.find((j) => j.id === id)
+    if (!job) return false
+    if (updates.enabled !== undefined) job.enabled = updates.enabled
+    if (updates.schedule) job.schedule = updates.schedule
+    if (updates.prompt) job.prompt = updates.prompt
+    if (updates.label) job.label = updates.label
+    await writeFile(paths.cronYaml, stringifyYaml(file))
+    console.log(`[cron] updated job ${id}`)
+    return true
+  }
+
   async listJobs(): Promise<CronJob[]> {
     const file = await ensureCronFile()
     return file.jobs ?? []
+  }
+
+  /** List jobs with computed next-run time for UI display */
+  async listJobsWithMeta(): Promise<Array<CronJob & { nextRunAt?: string; lastRunAt?: string }>> {
+    const file = await ensureCronFile()
+    const lastRun = await loadLastRun()
+    const now = new Date()
+    return (file.jobs ?? []).map((job) => {
+      const lastMinKey = lastRun[job.id]
+      const lastRunAt = lastMinKey ? new Date(lastMinKey * 60_000).toISOString() : undefined
+      const nextRunAt = job.enabled !== false ? computeNextRun(job.schedule, now) : undefined
+      return { ...job, nextRunAt, lastRunAt }
+    })
   }
 
   // Delete output files older than 7 days
@@ -353,7 +387,19 @@ export class CronScheduler {
 
 // Helper to update a single job in the cron file (used by oneshot disable)
 async function saveCronFile(file: CronFile, updatedJob: CronJob): Promise<void> {
-  const idx = file.jobs.findIndex(j => j.id === updatedJob.id)
+  const idx = file.jobs.findIndex((j) => j.id === updatedJob.id)
   if (idx >= 0) file.jobs[idx] = updatedJob
   await writeFile(paths.cronYaml, stringifyYaml(file))
+}
+
+/** Brute-force scan the next 1440 minutes (24h) to find the next matching time */
+function computeNextRun(schedule: string, from: Date): string | undefined {
+  const d = new Date(from.getTime())
+  d.setSeconds(0, 0)
+  d.setMinutes(d.getMinutes() + 1) // start from next minute
+  for (let i = 0; i < 1440; i++) {
+    if (cronMatches(schedule, d)) return d.toISOString()
+    d.setMinutes(d.getMinutes() + 1)
+  }
+  return undefined
 }

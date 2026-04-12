@@ -1,4 +1,4 @@
-import { Type, type Static } from '@sinclair/typebox'
+import { type Static, Type } from '@sinclair/typebox'
 
 // ───────────────────────────────────────────────
 // Common
@@ -46,11 +46,7 @@ export type InboundMessage = Static<typeof InboundMessage>
 export const PermissionResponse = Type.Object({
   type: Type.Literal('inbound.permission_response'),
   requestId: Type.String(),
-  decision: Type.Union([
-    Type.Literal('allow'),
-    Type.Literal('deny'),
-    Type.Literal('allow_always'),
-  ]),
+  decision: Type.Union([Type.Literal('allow'), Type.Literal('deny'), Type.Literal('allow_always')]),
 })
 export type PermissionResponse = Static<typeof PermissionResponse>
 
@@ -140,5 +136,10 @@ export type ControlFrame = Static<typeof ControlFrame>
 // ───────────────────────────────────────────────
 // Top-level frame
 // ───────────────────────────────────────────────
-export const AnyFrame = Type.Union([InboundMessage, PermissionResponse, OutboundMessage, ControlFrame])
+export const AnyFrame = Type.Union([
+  InboundMessage,
+  PermissionResponse,
+  OutboundMessage,
+  ControlFrame,
+])
 export type AnyFrame = Static<typeof AnyFrame>

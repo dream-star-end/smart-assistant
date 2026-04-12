@@ -7,8 +7,9 @@ import {
   paths,
   upsertSessionMeta,
 } from '@openclaude/storage'
-import type { OutboundContentBlock } from '@openclaude/protocol'
-import { SubprocessRunner, type SdkMessage } from './subprocessRunner.js'
+import { CcbMessageParser, type SessionStreamEvent } from './ccbMessageParser.js'
+import { eventBus } from './eventBus.js'
+import { SubprocessRunner } from './subprocessRunner.js'
 
 // 一个 sessionKey 对应一个 SubprocessRunner + 一把 Mutex(同 session 串行)。
 // 跨 session 完全并行。
@@ -35,28 +36,30 @@ export interface AgentSession {
   // 当前 turn 的文本累积器(用于 FTS5 索引)
   currentUserText?: string
   currentAssistantBuf?: string
+  // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
+  _cronBridgeMap?: Map<string, string>
 }
 
-export type SessionStreamEvent =
-  | { kind: 'block'; block: OutboundContentBlock }
-  | {
-      kind: 'final'
-      meta?: {
-        cost?: number
-        inputTokens?: number
-        outputTokens?: number
-        cacheReadTokens?: number
-        cacheCreationTokens?: number
-        totalCost?: number
-        turn?: number
-      }
-    }
-  | { kind: 'permission_request'; id: string; tool: string; summary: string }
-  | { kind: 'error'; error: string }
+// Re-export from ccbMessageParser so existing imports keep working
+export type { SessionStreamEvent } from './ccbMessageParser.js'
+
+export interface CronBridgeEvent {
+  action: 'create' | 'delete' | 'list'
+  agentId: string
+  // CronCreate params
+  cron?: string
+  prompt?: string
+  recurring?: boolean
+  durable?: boolean
+  // CronDelete params
+  id?: string
+}
 
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
   private maxIdleMs = 30 * 60 * 1000
+  /** @deprecated Use eventBus 'task.created'/'task.deleted' instead. Kept for backward compat. */
+  public onCronBridge?: (event: CronBridgeEvent) => Promise<void>
 
   private resumeMapPath = join(paths.home, 'resume-map.json')
 
@@ -65,7 +68,9 @@ export class SessionManager {
   }
 
   /** Update config reference (e.g. after OAuth token refresh) */
-  updateConfig(config: OpenClaudeConfig): void { this.config = config }
+  updateConfig(config: OpenClaudeConfig): void {
+    this.config = config
+  }
 
   // Resume map: sessionKey → ccbSessionId (survives gateway restart)
   private _resumeMap = new Map<string, string>()
@@ -84,7 +89,9 @@ export class SessionManager {
     for (const [key, sess] of this.sessions) {
       if (sess.ccbSessionId) obj[key] = sess.ccbSessionId
     }
-    try { writeFileSync(this.resumeMapPath, JSON.stringify(obj, null, 2)) } catch {}
+    try {
+      writeFileSync(this.resumeMapPath, JSON.stringify(obj, null, 2))
+    } catch {}
   }
 
   async getOrCreate(opts: {
@@ -93,11 +100,13 @@ export class SessionManager {
     channel?: string
     peerId?: string
     title?: string
+    delegationDepth?: number
   }): Promise<AgentSession> {
     const existing = this.sessions.get(opts.sessionKey)
     if (existing) {
       existing.lastUsedAt = Date.now()
-      if (opts.title && (!existing.title || existing.title === 'New conversation')) existing.title = opts.title
+      if (opts.title && (!existing.title || existing.title === 'New conversation'))
+        existing.title = opts.title
       return existing
     }
     const cwd = opts.agent.cwd ?? process.cwd()
@@ -112,6 +121,8 @@ export class SessionManager {
       permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
       agentProvider: opts.agent.provider,
       agentMcpServers: opts.agent.mcpServers,
+      agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
+      delegationDepth: opts.delegationDepth,
       resumeSessionId: this._resumeMap.get(opts.sessionKey),
     })
     const now = Date.now()
@@ -171,7 +182,7 @@ export class SessionManager {
       // Liveness-based timeout: kill only if NO stdout activity for 3 minutes
       // (replaces fixed 10-min timeout — long tasks that produce output stay alive)
       const IDLE_TIMEOUT = 3 * 60_000 // 3 minutes of zero output = stuck
-      const CHECK_INTERVAL = 30_000   // check every 30s
+      const CHECK_INTERVAL = 30_000 // check every 30s
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
@@ -191,7 +202,10 @@ export class SessionManager {
       }
     } catch (err: any) {
       if (err?.message?.includes('idle timeout')) {
-        onEvent({ kind: 'error', error: '子进程无响应超过 3 分钟,已自动停止。如果任务仍在执行,请重试。' })
+        onEvent({
+          kind: 'error',
+          error: '子进程无响应超过 3 分钟,已自动停止。如果任务仍在执行,请重试。',
+        })
         console.error(`[session:${session.sessionKey}] idle timeout: ${err.message}`)
       } else {
         throw err
@@ -217,10 +231,18 @@ export class SessionManager {
         // Only retry on transient errors (rate limit, server error, network)
         const isTransient = /529|503|502|504|ECONNRESET|ETIMEDOUT|rate.limit|overloaded/i.test(msg)
         if (!isTransient || attempt >= MAX_RETRIES) throw err
-        const delay = BASE_DELAY * Math.pow(2, attempt) + Math.random() * 1000
-        console.warn(`[session:${session.sessionKey}] transient error (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${Math.round(delay / 1000)}s: ${msg}`)
-        onEvent({ kind: 'block', block: { kind: 'text', text: `\n\n⚠️ 遇到临时错误,${Math.round(delay / 1000)}秒后自动重试 (${attempt + 1}/${MAX_RETRIES})...\n` } })
-        await new Promise(r => setTimeout(r, delay))
+        const delay = BASE_DELAY * 2 ** attempt + Math.random() * 1000
+        console.warn(
+          `[session:${session.sessionKey}] transient error (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${Math.round(delay / 1000)}s: ${msg}`,
+        )
+        onEvent({
+          kind: 'block',
+          block: {
+            kind: 'text',
+            text: `\n\n⚠️ 遇到临时错误,${Math.round(delay / 1000)}秒后自动重试 (${attempt + 1}/${MAX_RETRIES})...\n`,
+          },
+        })
+        await new Promise((r) => setTimeout(r, delay))
       }
     }
   }
@@ -232,213 +254,85 @@ export class SessionManager {
   ): Promise<void> {
     const { runner } = session
     await new Promise<void>((resolve) => {
-      let finalized = false
-      // 本轮内所有 tool_use 的流式状态:key = tool_use id
-      const streamingToolUses = new Map<
-        string,
-        { name: string; partialJson: string; done: boolean }
-      >()
-      // content_block index → tool_use id (用于 input_json_delta 的路由)
-      const indexToToolId = new Map<number, string>()
-      // 一轮内去重已 emit 过的 tool_result(user snapshot 也可能重复)
-      const emittedToolResultIds = new Set<string>()
-
       const timer = setTimeout(
         () => {
-          if (!finalized) {
+          if (!parser.finalized) {
             onEvent({ kind: 'error', error: 'timeout waiting for result' })
-            finish()
+            cleanup()
           }
         },
         10 * 60 * 1000,
       )
 
-      type FinalMeta = {
-        cost?: number
-        inputTokens?: number
-        outputTokens?: number
-        cacheReadTokens?: number
-        cacheCreationTokens?: number
-        totalCost?: number
-        turn?: number
-      }
-      const finish = (meta?: FinalMeta) => {
-        if (finalized) return
-        finalized = true
+      const cleanup = () => {
         clearTimeout(timer)
-        onEvent({ kind: 'final', meta })
+        parser.finish()
         runner.off('message', handleMessage)
         runner.off('error', handleError)
         resolve()
       }
 
-      const handleMessage = (msg: SdkMessage) => {
-        try {
-          // ── system:init ────────────────────────────────
-          if (msg.type === 'system') {
-            // session_id 已经由 subprocessRunner 抓取并 emit 'session_id' 事件
-            return
+      const parser = new CcbMessageParser({
+        toolUseIdToName: session.toolUseIdToName,
+        onEvent,
+        onToolUse: (tool) => {
+          // Bridge CCB CronCreate/CronDelete via EventBus
+          if (tool.name === 'CronCreate') {
+            const gatewayJobId = `ccb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+            // Stage 1: store tool_use_id → gatewayJobId.
+            // Stage 2 (onToolResult): when CronCreate result arrives, extract CCB's
+            // returned job ID from the text and store ccbJobId → gatewayJobId.
+            if (!session._cronBridgeMap) session._cronBridgeMap = new Map()
+            session._cronBridgeMap.set(`_pending:${tool.id}`, gatewayJobId)
+            eventBus.emit('task.created', {
+              type: 'task.created',
+              taskId: gatewayJobId,
+              agentId: session.agentId,
+              schedule: tool.input.cron,
+              prompt: tool.input.prompt,
+              oneshot: tool.input.recurring === false,
+              source: 'cron-bridge',
+            })
+          } else if (tool.name === 'CronDelete') {
+            // Look up the gateway job ID from our ccbJobId → gatewayJobId map
+            const ccbId = tool.input.id
+            const gatewayId = session._cronBridgeMap?.get(ccbId) ?? ccbId
+            eventBus.emit('task.deleted', {
+              type: 'task.deleted',
+              taskId: gatewayId,
+              agentId: session.agentId,
+            })
           }
-
-          // ── stream_event: 流式 partial deltas ──────────
-          if (msg.type === 'stream_event') {
-            const ev = (msg as any).event
-            if (!ev || typeof ev !== 'object') return
-
-            if (ev.type === 'content_block_start') {
-              const cb = ev.content_block
-              if (cb?.type === 'tool_use' && cb.id && cb.name) {
-                session.toolUseIdToName.set(cb.id, cb.name)
-                streamingToolUses.set(cb.id, {
-                  name: cb.name,
-                  partialJson: '',
-                  done: false,
-                })
-                if (typeof ev.index === 'number') indexToToolId.set(ev.index, cb.id)
-                // 立即 emit 一个 partial tool_use block(preview 空),web UI 据此挂载一条待更新
-                onEvent({
-                  kind: 'block',
-                  block: {
-                    kind: 'tool_use',
-                    blockId: cb.id,
-                    toolName: cb.name,
-                    inputPreview: '',
-                    partial: true,
-                  },
-                })
+        },
+        onToolResult: (tr) => {
+          // Stage 2 of CronCreate bridge: extract CCB's returned job ID from result text
+          // and establish ccbJobId → gatewayJobId mapping for future CronDelete.
+          // CCB CronCreate result format: "Scheduled recurring job XXXXXXXX (...)"
+          if (tr.toolName === 'CronCreate' && !tr.isError && session._cronBridgeMap) {
+            const pendingKey = `_pending:${tr.toolUseId}`
+            const gatewayJobId = session._cronBridgeMap.get(pendingKey)
+            if (gatewayJobId) {
+              session._cronBridgeMap.delete(pendingKey)
+              // Extract CCB job ID from result text (8-char hex)
+              const match = /job\s+([0-9a-f]{6,12})/i.exec(tr.preview)
+              if (match) {
+                session._cronBridgeMap.set(match[1], gatewayJobId)
               }
-              return
             }
-
-            if (ev.type === 'content_block_delta') {
-              const delta = ev.delta
-              if (!delta) return
-              if (delta.type === 'text_delta' && delta.text) {
-                session.currentAssistantBuf = (session.currentAssistantBuf ?? '') + delta.text
-                onEvent({ kind: 'block', block: { kind: 'text', text: delta.text } })
-              } else if (delta.type === 'thinking_delta' && delta.thinking) {
-                onEvent({ kind: 'block', block: { kind: 'thinking', text: delta.thinking } })
-              } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
-                const toolId = indexToToolId.get(ev.index as number)
-                const tool = toolId ? streamingToolUses.get(toolId) : undefined
-                if (tool) {
-                  tool.partialJson += delta.partial_json
-                  onEvent({
-                    kind: 'block',
-                    block: {
-                      kind: 'tool_use',
-                      blockId: toolId!,
-                      toolName: tool.name,
-                      inputPreview: tool.partialJson.slice(0, 400),
-                      partial: true,
-                    },
-                  })
-                }
-              }
-              return
-            }
-
-            if (ev.type === 'content_block_stop') {
-              // 如果是 tool_use 的 block,标记 done(但最终完整 input 要等 assistant snapshot)
-              const toolId = indexToToolId.get(ev.index as number)
-              if (toolId) {
-                const tool = streamingToolUses.get(toolId)
-                if (tool) tool.done = true
-              }
-              return
-            }
-
-            // message_start / message_delta / message_stop:忽略
-            return
           }
-
-          // ── assistant snapshot: finalize tool_use with complete input ──
-          if (msg.type === 'assistant') {
-            const content = (msg as any).message?.content
-            if (!Array.isArray(content)) return
-            for (const c of content) {
-              if (c?.type === 'tool_use' && c.id) {
-                session.toolUseIdToName.set(c.id, c.name ?? 'unknown')
-                const inputPreview =
-                  typeof c.input === 'string'
-                    ? c.input
-                    : JSON.stringify(c.input ?? {}).slice(0, 400)
-                const streamed = streamingToolUses.get(c.id)
-                // 如果之前根本没从 stream_event 拿到 start(很少见,兜底),现在 emit 一次
-                // 如果已经 stream 过,也发最终版 — web UI 会按 blockId 更新,设 partial: false
-                onEvent({
-                  kind: 'block',
-                  block: {
-                    kind: 'tool_use',
-                    blockId: c.id,
-                    toolName: c.name ?? 'unknown',
-                    inputPreview,
-                    partial: false,
-                  },
-                })
-                if (streamed) streamed.done = true
-              }
-              // text / thinking 跳过(已从 stream_event 流式 emit 过)
-            }
-            return
-          }
-
-          // ── user snapshot: 处理 tool_result ────────────
-          if (msg.type === 'user') {
-            const content = (msg as any).message?.content
-            if (!Array.isArray(content)) return
-            for (const c of content) {
-              if (c?.type === 'tool_result') {
-                const useId = c.tool_use_id
-                if (useId && emittedToolResultIds.has(useId)) continue
-                if (useId) emittedToolResultIds.add(useId)
-                const toolName = useId
-                  ? (session.toolUseIdToName.get(useId) ?? 'unknown')
-                  : 'unknown'
-                const previewRaw = c.content
-                let preview: string
-                if (typeof previewRaw === 'string') {
-                  preview = previewRaw
-                } else if (Array.isArray(previewRaw)) {
-                  preview = previewRaw
-                    .map((b: any) => {
-                      if (b?.type === 'text' && typeof b.text === 'string') return b.text
-                      return JSON.stringify(b)
-                    })
-                    .join('\n')
-                } else {
-                  preview = JSON.stringify(previewRaw ?? '')
-                }
-                if (preview.length > 500) preview = `${preview.slice(0, 500)}…`
-                onEvent({
-                  kind: 'block',
-                  block: {
-                    kind: 'tool_result',
-                    blockId: useId ? useId + ':result' : undefined,
-                    toolName,
-                    isError: !!c.is_error,
-                    preview,
-                  },
-                })
-              }
-            }
-            return
-          }
-
-          // ── result: 本轮结束 ───────────────────────────
-          if (msg.type === 'result') {
-            const usage = (msg as any).usage ?? {}
-            const turnCost = (msg as any).total_cost_usd ?? 0
-            session.totalCostUSD += turnCost
-            session.totalInputTokens += usage.input_tokens ?? 0
-            session.totalOutputTokens += usage.output_tokens ?? 0
-            session.totalCacheReadTokens += usage.cache_read_input_tokens ?? 0
-            session.totalCacheCreationTokens += usage.cache_creation_input_tokens ?? 0
-            session.turns += 1
-            // ── L2: persist to FTS5 for session_search ──
-            const turnIdx = session.turns
-            const userText = session.currentUserText ?? ''
-            const assistantText = session.currentAssistantBuf ?? ''
+        },
+        onFinish: (result) => {
+          clearTimeout(timer)
+          runner.off('message', handleMessage)
+          runner.off('error', handleError)
+          // Update session accumulators from turn result
+          if (result) {
+            session.totalInputTokens += result.inputTokens
+            session.totalOutputTokens += result.outputTokens
+            session.totalCacheReadTokens += result.cacheReadTokens
+            session.totalCacheCreationTokens += result.cacheCreationTokens
+            session.currentAssistantBuf = result.assistantText
+            // L2: persist to FTS5 for session_search
             const sessId = session.ccbSessionId ?? session.sessionKey
             Promise.all([
               upsertSessionMeta({
@@ -452,30 +346,18 @@ export class SessionManager {
                 turnCount: session.turns,
                 totalCostUSD: session.totalCostUSD,
               }),
-              indexTurn(sessId, turnIdx, userText, assistantText),
+              indexTurn(sessId, session.turns, session.currentUserText ?? '', result.assistantText),
             ]).catch((err) => console.error('[sessionManager] FTS5 index failed:', err))
-            // ── end L2 ──
-            finish({
-              cost: turnCost,
-              inputTokens: usage.input_tokens,
-              outputTokens: usage.output_tokens,
-              cacheReadTokens: usage.cache_read_input_tokens,
-              cacheCreationTokens: usage.cache_creation_input_tokens,
-              totalCost: session.totalCostUSD,
-              turn: session.turns,
-            })
-            return
           }
+          resolve()
+        },
+        sessionTotals: session, // parser reads/writes totalCostUSD and turns directly
+      })
 
-          // ── assistant_error / status / tool_progress / 其他:忽略 ──
-        } catch (err) {
-          onEvent({ kind: 'error', error: String(err) })
-        }
-      }
-
+      const handleMessage = (msg: any) => parser.parse(msg)
       const handleError = (err: Error) => {
         onEvent({ kind: 'error', error: err.message })
-        finish()
+        cleanup()
       }
 
       runner.on('message', handleMessage)
@@ -483,7 +365,7 @@ export class SessionManager {
 
       runner.submit(userTextOrBlocks).catch((err) => {
         onEvent({ kind: 'error', error: String(err) })
-        finish()
+        cleanup()
       })
     })
   }

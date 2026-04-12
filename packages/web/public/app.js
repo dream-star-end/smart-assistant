@@ -1,22 +1,28 @@
-(function () {
-  'use strict'
+;(() => {
   const $ = (id) => document.getElementById(id)
   const _isMac = /Mac|iPhone|iPad/.test(navigator.platform)
   const _mod = _isMac ? '⌘' : 'Ctrl+'
-  const htmlSafeEscape = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+  const htmlSafeEscape = (s) =>
+    String(s).replace(
+      /[&<>"']/g,
+      (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+    )
 
   // ═══════════════ THEME ═══════════════
   const THEME_KEY = 'openclaude_theme'
   function effectiveTheme() {
     const saved = localStorage.getItem(THEME_KEY) || 'system'
-    if (saved === 'system') return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+    if (saved === 'system')
+      return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
     return saved
   }
   function applyTheme() {
     const theme = effectiveTheme()
     document.documentElement.dataset.theme = theme
     // Swap hljs stylesheet
-    const hljsSheet = document.querySelector('link[href*="highlightjs"]')
+    const hljsSheet = document.querySelector(
+      'link[href*="github-dark.min.css"], link[href*="github.min.css"]',
+    )
     if (hljsSheet) {
       const dark = '/vendor/github-dark.min.css'
       const light = '/vendor/github.min.css'
@@ -27,13 +33,24 @@
     const curr = localStorage.getItem(THEME_KEY) || 'system'
     const iconEl = $('theme-icon')
     if (iconEl) {
-      if (curr === 'dark') iconEl.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>'
-      else if (curr === 'light') iconEl.innerHTML = '<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>'
-      else iconEl.innerHTML = '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/><path d="M12 6a6 6 0 0 0 0 12" fill="currentColor" opacity="0.3"/>'
+      if (curr === 'dark')
+        iconEl.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>'
+      else if (curr === 'light')
+        iconEl.innerHTML =
+          '<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>'
+      else
+        iconEl.innerHTML =
+          '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/><path d="M12 6a6 6 0 0 0 0 12" fill="currentColor" opacity="0.3"/>'
     }
     // Re-init mermaid for theme
     if (window.mermaid) {
-      try { mermaid.initialize({ startOnLoad: false, theme: theme === 'light' ? 'default' : 'dark', securityLevel: 'strict' }) } catch {}
+      try {
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: theme === 'light' ? 'default' : 'dark',
+          securityLevel: 'strict',
+        })
+      } catch {}
     }
   }
   function cycleTheme() {
@@ -41,7 +58,7 @@
     const next = curr === 'dark' ? 'light' : curr === 'light' ? 'system' : 'dark'
     localStorage.setItem(THEME_KEY, next)
     applyTheme()
-    toast('主题: ' + (next === 'system' ? '跟随系统' : next === 'dark' ? '暗色' : '亮色'))
+    toast(`主题: ${next === 'system' ? '跟随系统' : next === 'dark' ? '暗色' : '亮色'}`)
   }
   applyTheme()
   window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
@@ -50,7 +67,13 @@
 
   // ═══════════════ MARKDOWN + HIGHLIGHT + MERMAID ═══════════════
   if (window.mermaid) {
-    try { mermaid.initialize({ startOnLoad: false, theme: effectiveTheme() === 'light' ? 'default' : 'dark', securityLevel: 'strict' }) } catch {}
+    try {
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: effectiveTheme() === 'light' ? 'default' : 'dark',
+        securityLevel: 'strict',
+      })
+    } catch {}
   }
   const pendingMermaid = []
   const pendingHtmlPreviews = []
@@ -60,22 +83,22 @@
   if (window.marked) {
     marked.setOptions({ breaks: true, gfm: true })
     const renderer = new marked.Renderer()
-    renderer.code = function (code, infostring) {
+    renderer.code = (code, infostring) => {
       const lang = (infostring || '').match(/\S*/)?.[0] || ''
       if (lang === 'mermaid') {
-        const id = 'mmd-' + Math.random().toString(36).slice(2, 10)
+        const id = `mmd-${Math.random().toString(36).slice(2, 10)}`
         pendingMermaid.push({ id, code })
-        return '<div class="mermaid-block" id="' + id + '">...</div>'
+        return `<div class="mermaid-block" id="${id}">...</div>`
       }
       if (lang === 'chart') {
-        const id = 'chart-' + Math.random().toString(36).slice(2, 10)
+        const id = `chart-${Math.random().toString(36).slice(2, 10)}`
         pendingCharts.push({ id, code })
-        return '<div class="chart-block" id="' + id + '"><canvas></canvas></div>'
+        return `<div class="chart-block" id="${id}"><canvas></canvas></div>`
       }
       if (lang === 'htmlpreview' || lang === 'preview') {
-        const id = 'htmlpv-' + Math.random().toString(36).slice(2, 10)
+        const id = `htmlpv-${Math.random().toString(36).slice(2, 10)}`
         pendingHtmlPreviews.push({ id, code })
-        return '<div class="html-preview-wrap" id="' + id + '"></div>'
+        return `<div class="html-preview-wrap" id="${id}"></div>`
       }
       let highlighted
       try {
@@ -89,17 +112,11 @@
       } catch {
         highlighted = htmlSafeEscape(code)
       }
-      const langLabel = lang ? '<span class="code-lang">' + lang + '</span>' : ''
-      return (
-        '<pre class="code-block">' + langLabel +
-        '<button class="code-copy" type="button" data-copy>复制</button>' +
-        '<code class="hljs language-' + lang + '">' + highlighted + '</code></pre>'
-      )
+      const langLabel = lang ? `<span class="code-lang">${lang}</span>` : ''
+      return `<pre class="code-block">${langLabel}<button class="code-copy" type="button" data-copy>复制</button><code class="hljs language-${lang}">${highlighted}</code></pre>`
     }
     // Override image renderer so markdown ![alt](url) also produces inline-img with actions
-    renderer.image = function (href, title, text) {
-      return _imgHtml(href, title || text || '')
-    }
+    renderer.image = (href, title, text) => _imgHtml(href, title || text || '')
     marked.setOptions({ renderer })
   }
 
@@ -111,110 +128,127 @@
 
   // Convert a local absolute path to a gateway-served URL
   function localPathToUrl(absPath) {
-    return '/api/file?path=' + encodeURIComponent(absPath)
+    return `/api/file?path=${encodeURIComponent(absPath)}`
   }
 
   function _imgHtml(url, title) {
-    const svgCopy = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
-    const svgDl = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
-    const svgOpen = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>'
-    const t = title ? ' title="' + htmlSafeEscape(title) + '"' : ''
-    return '<div class="media-wrap">' +
-      '<img class="inline-img" src="' + url + '" loading="lazy"' + t + '>' +
-      '<div class="img-actions">' +
-        '<button data-img-action="copy" data-img-src="' + url + '" title="复制图片">' + svgCopy + '</button>' +
-        '<button data-img-action="download" data-img-src="' + url + '" title="下载">' + svgDl + '</button>' +
-        '<button data-img-action="open" data-img-src="' + url + '" title="新标签页打开">' + svgOpen + '</button>' +
-      '</div></div>'
+    const svgCopy =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+    const svgDl =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
+    const svgOpen =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>'
+    const t = title ? ` title="${htmlSafeEscape(title)}"` : ''
+    return `<div class="media-wrap"><img class="inline-img" src="${url}" loading="lazy"${t}><div class="img-actions"><button data-img-action="copy" data-img-src="${url}" title="复制图片">${svgCopy}</button><button data-img-action="download" data-img-src="${url}" title="下载">${svgDl}</button><button data-img-action="open" data-img-src="${url}" title="新标签页打开">${svgOpen}</button></div></div>`
+  }
+
+  function _basename(p) {
+    // Handle both Unix / and Windows \ separators
+    const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
+    return i >= 0 ? p.slice(i + 1) : p
   }
 
   function _renderLocalMedia(filePath) {
     const url = localPathToUrl(filePath)
-    const name = filePath.split('/').pop() || 'file'
+    const name = _basename(filePath) || 'file'
     if (_IMG_EXTS.test(filePath)) {
       return _imgHtml(url, name)
     }
     if (_AUD_EXTS.test(filePath)) {
-      return '<div class="media-wrap"><audio controls preload="none" src="' + url + '"></audio>' +
-             '<div class="media-filename">' + htmlSafeEscape(name) + '</div></div>'
+      return `<div class="media-wrap"><audio controls preload="none" src="${url}"></audio><div class="media-filename">${htmlSafeEscape(name)}</div></div>`
     }
     if (_VID_EXTS.test(filePath)) {
-      return '<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="' + url + '"></video>' +
-             '<div class="media-filename">' + htmlSafeEscape(name) + '</div></div>'
+      return `<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="${url}"></video><div class="media-filename">${htmlSafeEscape(name)}</div></div>`
     }
     if (_PDF_EXTS.test(filePath)) {
-      return '<a class="doc-card" href="' + url + '" target="_blank" rel="noopener">' +
-             '<span class="doc-card-icon">📄</span><span class="doc-card-name">' + htmlSafeEscape(name) + '</span></a>'
+      return `<a class="doc-card" href="${url}" target="_blank" rel="noopener"><span class="doc-card-icon">📄</span><span class="doc-card-name">${htmlSafeEscape(name)}</span></a>`
     }
-    return '<a class="doc-card" href="' + url + '" target="_blank" rel="noopener" download="' + htmlSafeEscape(name) + '">' +
-           '<span class="doc-card-icon">📎</span><span class="doc-card-name">' + htmlSafeEscape(name) + '</span></a>'
+    return `<a class="doc-card" href="${url}" target="_blank" rel="noopener" download="${htmlSafeEscape(name)}"><span class="doc-card-icon">📎</span><span class="doc-card-name">${htmlSafeEscape(name)}</span></a>`
   }
 
   function embedMediaUrls(html) {
     // Step 0: Protect <pre> code blocks — replace with placeholders so paths inside
     // code blocks are not turned into media embeds
     const codeBlockPlaceholders = []
-    html = html.replace(/<pre[\s\S]*?<\/pre>/gi, function (m) {
+    html = html.replace(/<pre[\s\S]*?<\/pre>/gi, (m) => {
       const idx = codeBlockPlaceholders.length
       codeBlockPlaceholders.push(m)
-      return '<!--CODE_BLOCK_' + idx + '-->'
+      return `<!--CODE_BLOCK_${idx}-->`
     })
 
     // Step 1: Detect local file paths — both inline <code>/path/file.mp4</code> and bare /path/file.mp4
     // We need to handle HTML entities: marked converts `/` inside code to `<code>...</code>`
     // and may entity-encode chars. First handle <code>-wrapped paths, then bare paths.
-    const _MEDIA_EXTS = 'jpg|jpeg|png|gif|webp|bmp|svg|mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|avi|mkv|pdf'
+    const _MEDIA_EXTS =
+      'jpg|jpeg|png|gif|webp|bmp|svg|mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|avi|mkv|pdf'
 
     // Match <code>/path.ext</code> or <code>C:\path.ext</code> — handles both POSIX and Windows paths
-    html = html.replace(new RegExp('<code>((?:(?:/|[A-Za-z]:\\\\?)[^<]*?)\\.(?:' + _MEDIA_EXTS + '))</code>', 'gi'), function (match, rawPath) {
-      const filePath = rawPath.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
-      return _renderLocalMedia(filePath)
-    })
+    html = html.replace(
+      new RegExp(`<code>((?:(?:/|[A-Za-z]:\\\\?)[^<]*?)\\.(?:${_MEDIA_EXTS}))</code>`, 'gi'),
+      (match, rawPath) => {
+        const filePath = rawPath
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&#39;/g, "'")
+          .replace(/&quot;/g, '"')
+        return _renderLocalMedia(filePath)
+      },
+    )
 
     // Match bare absolute paths (not inside tags)
     // Match bare absolute paths: /path/file.ext or C:\path\file.ext
-    html = html.replace(new RegExp('((?:^|[\\s>])((?:(?:/|[A-Za-z]:[\\\\\\\\])[^\\s<"\'`>]+?\\.(?:' + _MEDIA_EXTS + '))))', 'gi'), function (match, full, filePath, offset) {
-      const before = html.substring(Math.max(0, offset - 10), offset)
-      if (/(?:src|href|poster)\s*=\s*["']?\s*$/i.test(before)) return match
-      // Don't replace if already inside an anchor or media tag
-      if (/<(?:a|img|video|audio)[^>]*$/i.test(html.substring(Math.max(0, offset - 100), offset))) return match
-      const prefix = full.charAt(0) !== '/' ? full.charAt(0) : ''
-      return prefix + _renderLocalMedia(filePath)
-    })
+    html = html.replace(
+      new RegExp(
+        `((?:^|[\\s>])((?:(?:/|[A-Za-z]:[\\\\\\\\])[^\\s<"\'\`>]+?\\.(?:${_MEDIA_EXTS}))))`,
+        'gi',
+      ),
+      (match, full, filePath, offset) => {
+        const before = html.substring(Math.max(0, offset - 10), offset)
+        if (/(?:src|href|poster)\s*=\s*["']?\s*$/i.test(before)) return match
+        // Don't replace if already inside an anchor or media tag
+        if (/<(?:a|img|video|audio)[^>]*$/i.test(html.substring(Math.max(0, offset - 100), offset)))
+          return match
+        const prefix = full.charAt(0) !== '/' ? full.charAt(0) : ''
+        return prefix + _renderLocalMedia(filePath)
+      },
+    )
 
     // Step 2: Detect HTTP URLs and /api/ paths
     const URL_RE = /((?:https?:\/\/[^\s"'<>)]+|\/api\/(?:media|file)[^\s"'<>)]+))/g
 
-    html = html.replace(URL_RE, function (match, url, offset) {
+    html = html.replace(URL_RE, (match, url, offset) => {
       const before = html.substring(Math.max(0, offset - 10), offset)
       if (/(?:src|href|poster)\s*=\s*["']?\s*$/i.test(before)) return match
-      if (before.endsWith('>') && /src=/.test(html.substring(Math.max(0, offset - 80), offset))) return match
+      if (before.endsWith('>') && /src=/.test(html.substring(Math.max(0, offset - 80), offset)))
+        return match
 
       let decodedForExt = url
-      try { decodedForExt = decodeURIComponent(url.split('?')[0]) } catch {}
+      try {
+        decodedForExt = decodeURIComponent(url.split('?')[0])
+      } catch {}
 
       if (_IMG_EXTS.test(decodedForExt)) {
         return _imgHtml(url, decodedForExt.split('/').pop() || '')
       }
       if (_AUD_EXTS.test(decodedForExt)) {
-        return '<div class="media-wrap"><audio controls preload="none" src="' + url + '"></audio></div>'
+        return `<div class="media-wrap"><audio controls preload="none" src="${url}"></audio></div>`
       }
       if (_VID_EXTS.test(decodedForExt)) {
-        return '<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="' + url + '"></video></div>'
+        return `<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="${url}"></video></div>`
       }
       if (_PDF_EXTS.test(decodedForExt)) {
         const name = decodedForExt.split('/').pop() || 'document.pdf'
-        return '<a class="doc-card" href="' + url + '" target="_blank" rel="noopener">' +
-               '<span class="doc-card-icon">📄</span>' +
-               '<span class="doc-card-name">' + htmlSafeEscape(name) + '</span></a>'
+        return `<a class="doc-card" href="${url}" target="_blank" rel="noopener"><span class="doc-card-icon">📄</span><span class="doc-card-name">${htmlSafeEscape(name)}</span></a>`
       }
       return match
     })
 
     // Step 3: Restore code block placeholders
-    html = html.replace(/<!--CODE_BLOCK_(\d+)-->/g, function (_, idx) {
-      return codeBlockPlaceholders[parseInt(idx)] || ''
-    })
+    html = html.replace(
+      /<!--CODE_BLOCK_(\d+)-->/g,
+      (_, idx) => codeBlockPlaceholders[Number.parseInt(idx)] || '',
+    )
 
     return html
   }
@@ -228,7 +262,19 @@
         // DOMPurify is a security-critical dependency — refuse to render unsanitized HTML
         return '<p style="color:var(--danger)">[安全组件加载失败,无法渲染富文本。请刷新页面。]</p>'
       }
-      const sanitized = DOMPurify.sanitize(html, { ADD_TAGS: ['iframe'], ADD_ATTR: ['sandbox', 'srcdoc', 'loading', 'controls', 'preload', 'autoplay', 'data-img-action', 'data-img-src'] })
+      const sanitized = DOMPurify.sanitize(html, {
+        ADD_TAGS: ['iframe'],
+        ADD_ATTR: [
+          'sandbox',
+          'srcdoc',
+          'loading',
+          'controls',
+          'preload',
+          'autoplay',
+          'data-img-action',
+          'data-img-src',
+        ],
+      })
       return embedMediaUrls(sanitized)
     } catch {
       return htmlSafeEscape(text)
@@ -241,11 +287,13 @@
       const el = document.getElementById(id)
       if (!el || !window.mermaid) continue
       try {
-        const { svg } = await mermaid.render(id + '-svg', code)
-        el.innerHTML = window.DOMPurify ? DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } }) : svg
+        const { svg } = await mermaid.render(`${id}-svg`, code)
+        el.innerHTML = window.DOMPurify
+          ? DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } })
+          : svg
       } catch (err) {
         el.className = 'mermaid-error'
-        el.textContent = 'Mermaid error: ' + (err?.message || String(err))
+        el.textContent = `Mermaid error: ${err?.message || String(err)}`
       }
     }
     while (pendingCharts.length > 0) {
@@ -264,43 +312,49 @@
         if (!config.options.plugins) config.options.plugins = {}
         if (!config.options.plugins.legend) config.options.plugins.legend = {}
         if (!config.options.plugins.legend.labels) config.options.plugins.legend.labels = {}
-        config.options.plugins.legend.labels.color = config.options.plugins.legend.labels.color || textColor
+        config.options.plugins.legend.labels.color =
+          config.options.plugins.legend.labels.color || textColor
         if (!config.options.scales) config.options.scales = {}
         for (const axis of ['x', 'y']) {
           if (!config.options.scales[axis]) config.options.scales[axis] = {}
           if (!config.options.scales[axis].ticks) config.options.scales[axis].ticks = {}
-          config.options.scales[axis].ticks.color = config.options.scales[axis].ticks.color || textColor
+          config.options.scales[axis].ticks.color =
+            config.options.scales[axis].ticks.color || textColor
           if (!config.options.scales[axis].grid) config.options.scales[axis].grid = {}
-          config.options.scales[axis].grid.color = config.options.scales[axis].grid.color || gridColor
+          config.options.scales[axis].grid.color =
+            config.options.scales[axis].grid.color || gridColor
         }
         config.options.responsive = true
         config.options.maintainAspectRatio = true
         // Destroy previous instance if re-rendering
-        if (_chartInstances.has(id)) { _chartInstances.get(id).destroy(); _chartInstances.delete(id) }
+        if (_chartInstances.has(id)) {
+          _chartInstances.get(id).destroy()
+          _chartInstances.delete(id)
+        }
         _chartInstances.set(id, new Chart(canvas, config))
       } catch (err) {
         el.className = 'chart-error'
-        el.textContent = 'Chart error: ' + (err?.message || String(err))
+        el.textContent = `Chart error: ${err?.message || String(err)}`
       }
     }
     while (pendingHtmlPreviews.length > 0) {
       const { id, code } = pendingHtmlPreviews.shift()
       const el = document.getElementById(id)
       if (!el) continue
-      const iframeId = id + '-iframe'
-      el.innerHTML =
-        '<div class="html-preview-head"><span>HTML preview (sandboxed)</span>' +
-        '<button type="button" data-view-source="' + iframeId + '">view source</button></div>' +
-        '<iframe id="' + iframeId + '" class="html-preview-iframe" sandbox="allow-scripts"></iframe>'
+      const iframeId = `${id}-iframe`
+      el.innerHTML = `<div class="html-preview-head"><span>HTML preview (sandboxed)</span><button type="button" data-view-source="${iframeId}">view source</button></div><iframe id="${iframeId}" class="html-preview-iframe" sandbox="allow-scripts"></iframe>`
       const iframe = document.getElementById(iframeId)
       if (iframe) {
         // Inject auto-resize script into the HTML content
-        const resizeScript = '<script>new ResizeObserver(()=>{' +
-          'parent.postMessage({type:"iframe-resize",id:"' + iframeId + '",h:document.documentElement.scrollHeight},"*")' +
-          '}).observe(document.documentElement)<\/script>'
-        const fullCode = code.includes('</body>') ? code.replace('</body>', resizeScript + '</body>') : code + resizeScript
-        try { iframe.srcdoc = fullCode } catch {
-          iframe.contentWindow?.document?.write(fullCode); iframe.contentWindow?.document?.close()
+        const resizeScript = `<script>new ResizeObserver(()=>{parent.postMessage({type:"iframe-resize",id:"${iframeId}",h:document.documentElement.scrollHeight},"*")}).observe(document.documentElement)<\/script>`
+        const fullCode = code.includes('</body>')
+          ? code.replace('</body>', `${resizeScript}</body>`)
+          : code + resizeScript
+        try {
+          iframe.srcdoc = fullCode
+        } catch {
+          iframe.contentWindow?.document?.write(fullCode)
+          iframe.contentWindow?.document?.close()
         }
         iframe.dataset.source = code
       }
@@ -309,7 +363,7 @@
 
   // Global click for copy + view source
   document.addEventListener('click', (e) => {
-    const srcBtn = e.target.closest && e.target.closest('[data-view-source]')
+    const srcBtn = e.target.closest?.('[data-view-source]')
     if (srcBtn) {
       const id = srcBtn.dataset.viewSource
       const iframe = document.getElementById(id)
@@ -326,7 +380,8 @@
         iframe.style.display = 'none'
         const pre = document.createElement('pre')
         pre.className = 'src-view'
-        pre.style.cssText = 'background:var(--code-bg);color:var(--fg);padding:14px 16px;margin:0;max-height:400px;overflow:auto;font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;word-break:break-all'
+        pre.style.cssText =
+          'background:var(--code-bg);color:var(--fg);padding:14px 16px;margin:0;max-height:400px;overflow:auto;font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;word-break:break-all'
         pre.textContent = iframe.dataset.source || ''
         wrap.appendChild(pre)
         wrap.dataset.showingSource = '1'
@@ -334,20 +389,32 @@
       }
       return
     }
-    const btn = e.target.closest && e.target.closest('[data-copy]')
+    const btn = e.target.closest?.('[data-copy]')
     if (!btn) return
     const pre = btn.closest('pre')
-    const code = pre && pre.querySelector('code')
+    const code = pre?.querySelector('code')
     if (!code) return
     const text = code.innerText
     const done = () => {
       btn.textContent = '已复制'
       btn.classList.add('copied')
-      setTimeout(() => { btn.textContent = '复制'; btn.classList.remove('copied') }, 1500)
+      setTimeout(() => {
+        btn.textContent = '复制'
+        btn.classList.remove('copied')
+      }, 1500)
     }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(() => { fallbackCopy(text); done() })
-    } else { fallbackCopy(text); done() }
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard
+        .writeText(text)
+        .then(done)
+        .catch(() => {
+          fallbackCopy(text)
+          done()
+        })
+    } else {
+      fallbackCopy(text)
+      done()
+    }
   })
   function fallbackCopy(text) {
     const ta = document.createElement('textarea')
@@ -355,7 +422,9 @@
     ta.style.cssText = 'position:fixed;opacity:0'
     document.body.appendChild(ta)
     ta.select()
-    try { document.execCommand('copy') } catch {}
+    try {
+      document.execCommand('copy')
+    } catch {}
     document.body.removeChild(ta)
   }
 
@@ -373,19 +442,19 @@
   }
 
   // ═══════════════ UTILITIES ═══════════════
-  const uuid = () => 'web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
-  const msgId = () => 'm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
+  const uuid = () => `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  const msgId = () => `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
   function formatSize(n) {
-    if (n < 1024) return n + ' B'
-    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB'
-    return (n / 1048576).toFixed(1) + ' MB'
+    if (n < 1024) return `${n} B`
+    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
+    return `${(n / 1048576).toFixed(1)} MB`
   }
   function shortTime(ts) {
     const diff = (Date.now() - ts) / 1000
     if (diff < 60) return '刚刚'
-    if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前'
-    if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前'
-    if (diff < 604800) return Math.floor(diff / 86400) + ' 天前'
+    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
+    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
+    if (diff < 604800) return `${Math.floor(diff / 86400)} 天前`
     return new Date(ts).toLocaleDateString('zh-CN')
   }
   function sessionGroup(ts) {
@@ -412,9 +481,13 @@
       const req = indexedDB.open(DB_NAME, DB_VERSION)
       req.onupgradeneeded = () => {
         const db = req.result
-        if (!db.objectStoreNames.contains('sessions')) db.createObjectStore('sessions', { keyPath: 'id' })
+        if (!db.objectStoreNames.contains('sessions'))
+          db.createObjectStore('sessions', { keyPath: 'id' })
       }
-      req.onsuccess = () => { _db = req.result; res(_db) }
+      req.onsuccess = () => {
+        _db = req.result
+        res(_db)
+      }
       req.onerror = () => rej(req.error)
     })
   }
@@ -463,24 +536,30 @@
     windowFocused: document.hasFocus(),
     offlineQueue: [], // messages queued while disconnected
   }
-  document.addEventListener('visibilitychange', () => { state.windowFocused = !document.hidden })
-  window.addEventListener('focus', () => { state.windowFocused = true })
+  document.addEventListener('visibilitychange', () => {
+    state.windowFocused = !document.hidden
+  })
+  window.addEventListener('focus', () => {
+    state.windowFocused = true
+  })
   // Auto-resize htmlpreview iframes based on content height
   window.addEventListener('message', (e) => {
     if (e.data?.type === 'iframe-resize' && e.data.id && e.data.h) {
       const iframe = document.getElementById(e.data.id)
-      if (iframe) iframe.style.height = Math.min(Math.max(e.data.h + 10, 200), 800) + 'px'
+      if (iframe) iframe.style.height = `${Math.min(Math.max(e.data.h + 10, 200), 800)}px`
     }
   })
-  window.addEventListener('blur', () => { state.windowFocused = false })
+  window.addEventListener('blur', () => {
+    state.windowFocused = false
+  })
 
   // ═══════════════ API ═══════════════
   function authHeaders(extra) {
-    return { Authorization: 'Bearer ' + state.token, ...(extra || {}) }
+    return { Authorization: `Bearer ${state.token}`, ...(extra || {}) }
   }
   async function apiGet(path) {
     const res = await fetch(path, { headers: authHeaders() })
-    if (!res.ok) throw new Error('GET ' + path + ' failed: ' + res.status)
+    if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`)
     return res.json()
   }
   async function apiJson(method, path, body) {
@@ -490,7 +569,7 @@
       body: body ? JSON.stringify(body) : undefined,
     })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) throw new Error((data && data.error) || method + ' ' + path + ' failed')
+    if (!res.ok) throw new Error(data?.error || `${method} ${path} failed`)
     return data
   }
 
@@ -498,12 +577,15 @@
   let _toastTimer = null
   function toast(msg, kind) {
     const el = $('toast')
-    el.innerHTML = htmlSafeEscape(msg) + ' <button onclick="this.parentElement.classList.remove(\'show\')" style="margin-left:8px;background:none;border:none;color:inherit;cursor:pointer;opacity:0.7;font-size:14px">&times;</button>'
-    el.className = 'toast show' + (kind ? ' ' + kind : '')
+    el.innerHTML = `${htmlSafeEscape(msg)} <button onclick="this.parentElement.classList.remove(\'show\')" style="margin-left:8px;background:none;border:none;color:inherit;cursor:pointer;opacity:0.7;font-size:14px">&times;</button>`
+    el.className = `toast show${kind ? ` ${kind}` : ''}`
     el.style.pointerEvents = 'auto'
     if (_toastTimer) clearTimeout(_toastTimer)
     const duration = kind === 'error' ? 5000 : 2500
-    _toastTimer = setTimeout(() => { el.classList.remove('show'); el.style.pointerEvents = '' }, duration)
+    _toastTimer = setTimeout(() => {
+      el.classList.remove('show')
+      el.style.pointerEvents = ''
+    }, duration)
   }
   let _modalFocusReturn = null
   function openModal(id) {
@@ -518,10 +600,15 @@
   }
   function closeModal(id) {
     $(id).classList.remove('open')
-    if (_modalFocusReturn) { try { _modalFocusReturn.focus() } catch {} _modalFocusReturn = null }
+    if (_modalFocusReturn) {
+      try {
+        _modalFocusReturn.focus()
+      } catch {}
+      _modalFocusReturn = null
+    }
   }
   document.addEventListener('click', (e) => {
-    const btn = e.target.closest && e.target.closest('[data-close-modal]')
+    const btn = e.target.closest?.('[data-close-modal]')
     if (btn) closeModal(btn.dataset.closeModal)
     // close modal on backdrop click
     const backdrop = e.target.classList?.contains('modal-backdrop') ? e.target : null
@@ -529,7 +616,9 @@
   })
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-      document.querySelectorAll('.modal-backdrop.open, .palette-backdrop.open').forEach((el) => el.classList.remove('open'))
+      document
+        .querySelectorAll('.modal-backdrop.open, .palette-backdrop.open')
+        .forEach((el) => el.classList.remove('open'))
     }
   })
 
@@ -557,45 +646,70 @@
     const lb = $('lightbox')
     lb.hidden = true
     const vid = lb.querySelector('video')
-    if (vid) { vid.pause(); vid.src = '' }
+    if (vid) {
+      vid.pause()
+      vid.src = ''
+    }
     lb.querySelector('.lightbox-body').innerHTML = ''
     document.body.style.overflow = ''
   }
   document.addEventListener('click', (e) => {
-    const img = e.target.closest && e.target.closest('.inline-img')
-    if (img) { e.preventDefault(); openLightbox(img); return }
-    const vid = e.target.closest && e.target.closest('.inline-video')
-    if (vid && !e.target.closest('.lightbox-body')) { e.preventDefault(); openLightbox(vid); return }
-    if (e.target.closest && e.target.closest('.lightbox-close')) { closeLightbox(); return }
-    if (e.target.id === 'lightbox' || e.target.classList?.contains('lightbox-backdrop')) { closeLightbox(); return }
+    const img = e.target.closest?.('.inline-img')
+    if (img) {
+      e.preventDefault()
+      openLightbox(img)
+      return
+    }
+    const vid = e.target.closest?.('.inline-video')
+    if (vid && !e.target.closest('.lightbox-body')) {
+      e.preventDefault()
+      openLightbox(vid)
+      return
+    }
+    if (e.target.closest?.('.lightbox-close')) {
+      closeLightbox()
+      return
+    }
+    if (e.target.id === 'lightbox' || e.target.classList?.contains('lightbox-backdrop')) {
+      closeLightbox()
+      return
+    }
   })
   // ── Image action buttons (copy/download/open) ──
   document.addEventListener('click', (e) => {
-    const btn = e.target.closest && e.target.closest('[data-img-action]')
+    const btn = e.target.closest?.('[data-img-action]')
     if (!btn) return
-    e.preventDefault(); e.stopPropagation()
+    e.preventDefault()
+    e.stopPropagation()
     const action = btn.dataset.imgAction
     const src = btn.dataset.imgSrc
     if (!src) return
 
     if (action === 'copy') {
-      fallbackCopy(src); toast('已复制图片链接')
+      fallbackCopy(src)
+      toast('已复制图片链接')
     } else if (action === 'download') {
       const a = document.createElement('a')
-      a.href = src; a.download = src.split('/').pop()?.split('?')[0] || 'image.jpg'
-      a.target = '_blank'; a.click()
+      a.href = src
+      a.download = src.split('/').pop()?.split('?')[0] || 'image.jpg'
+      a.target = '_blank'
+      a.click()
     } else if (action === 'open') {
       window.open(src, '_blank')
     }
   })
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('lightbox').hidden) { closeLightbox(); e.stopPropagation() }
+    if (e.key === 'Escape' && !$('lightbox').hidden) {
+      closeLightbox()
+      e.stopPropagation()
+    }
   })
 
   // ═══════════════ ATTACHMENTS ═══════════════
-  const MAX_FILE_SIZE_SMALL = 5 * 1024 * 1024   // 5MB for images/text
-  const MAX_FILE_SIZE_LARGE = 25 * 1024 * 1024  // 25MB for audio/video/docs
+  const MAX_FILE_SIZE_SMALL = 5 * 1024 * 1024 // 5MB for images/text
+  const MAX_FILE_SIZE_LARGE = 25 * 1024 * 1024 // 25MB for audio/video/docs
+  const MAX_TOTAL_SIZE = 50 * 1024 * 1024 // 50MB total (matches server limit)
   const MAX_FILES = 5
 
   function fileToDataURL(file) {
@@ -622,8 +736,14 @@
     if (t.startsWith('video/')) return 'video'
     // Binary document types → 'file' kind (sent as base64)
     const binExts = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z)$/i
-    if (binExts.test(file.name) || t === 'application/pdf' ||
-        t.includes('officedocument') || t.includes('msword') || t.includes('ms-excel') || t.includes('ms-powerpoint')) {
+    if (
+      binExts.test(file.name) ||
+      t === 'application/pdf' ||
+      t.includes('officedocument') ||
+      t.includes('msword') ||
+      t.includes('ms-excel') ||
+      t.includes('ms-powerpoint')
+    ) {
       return 'file'
     }
     return 'text' // fallback: treat as text
@@ -631,10 +751,25 @@
 
   async function addFiles(fileList) {
     for (const f of fileList) {
-      if (state.attachments.length >= MAX_FILES) { toast('最多 ' + MAX_FILES + ' 个附件', 'error'); break }
+      if (state.attachments.length >= MAX_FILES) {
+        toast(`最多 ${MAX_FILES} 个附件`, 'error')
+        break
+      }
       const kind = classifyFile(f)
-      const maxSize = (kind === 'audio' || kind === 'video' || kind === 'file') ? MAX_FILE_SIZE_LARGE : MAX_FILE_SIZE_SMALL
-      if (f.size > maxSize) { toast(f.name + ' 超过 ' + (maxSize / 1024 / 1024) + 'MB', 'error'); continue }
+      const maxSize =
+        kind === 'audio' || kind === 'video' || kind === 'file'
+          ? MAX_FILE_SIZE_LARGE
+          : MAX_FILE_SIZE_SMALL
+      if (f.size > maxSize) {
+        toast(`${f.name} 超过 ${maxSize / 1024 / 1024}MB`, 'error')
+        continue
+      }
+      // Check total budget before reading file into memory
+      const currentTotal = state.attachments.reduce((sum, a) => sum + (a.size || 0), 0)
+      if (currentTotal + f.size > MAX_TOTAL_SIZE) {
+        toast(`总附件大小超过 ${MAX_TOTAL_SIZE / 1024 / 1024}MB 限制`, 'error')
+        break
+      }
       try {
         const att = { name: f.name, size: f.size, type: f.type || 'application/octet-stream', kind }
         if (kind === 'text') {
@@ -643,7 +778,9 @@
           att.dataUrl = await fileToDataURL(f)
         }
         state.attachments.push(att)
-      } catch (err) { toast('读取 ' + f.name + ' 失败: ' + err, 'error') }
+      } catch (err) {
+        toast(`读取 ${f.name} 失败: ${err}`, 'error')
+      }
     }
     renderAttachments()
   }
@@ -654,7 +791,11 @@
   function renderAttachments() {
     const wrap = $('attachments')
     if (!wrap) return
-    if (state.attachments.length === 0) { wrap.hidden = true; wrap.innerHTML = ''; return }
+    if (state.attachments.length === 0) {
+      wrap.hidden = true
+      wrap.innerHTML = ''
+      return
+    }
     wrap.hidden = false
     wrap.innerHTML = ''
     state.attachments.forEach((a, i) => {
@@ -662,14 +803,28 @@
       item.className = 'attach-item'
       if (a.kind === 'image' && a.dataUrl) {
         const img = document.createElement('img')
-        img.className = 'attach-thumb'; img.src = a.dataUrl; item.appendChild(img)
+        img.className = 'attach-thumb'
+        img.src = a.dataUrl
+        item.appendChild(img)
       } else {
         const icons = { audio: '🎵', video: '🎬', file: '📄', text: '📝' }
-        item.insertAdjacentHTML('beforeend', '<span style="font-size:16px">' + (icons[a.kind] || '📎') + '</span>')
+        item.insertAdjacentHTML(
+          'beforeend',
+          `<span style="font-size:16px">${icons[a.kind] || '📎'}</span>`,
+        )
       }
-      const name = document.createElement('span'); name.className = 'attach-name'; name.textContent = a.name; item.appendChild(name)
-      const size = document.createElement('span'); size.className = 'attach-size'; size.textContent = formatSize(a.size); item.appendChild(size)
-      const rm = document.createElement('button'); rm.className = 'attach-remove'; rm.textContent = '×'; rm.title = '移除'
+      const name = document.createElement('span')
+      name.className = 'attach-name'
+      name.textContent = a.name
+      item.appendChild(name)
+      const size = document.createElement('span')
+      size.className = 'attach-size'
+      size.textContent = formatSize(a.size)
+      item.appendChild(size)
+      const rm = document.createElement('button')
+      rm.className = 'attach-remove'
+      rm.textContent = '×'
+      rm.title = '移除'
       rm.onclick = () => removeAttachment(i)
       item.appendChild(rm)
       wrap.appendChild(item)
@@ -681,7 +836,9 @@
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!SR) return null
     const rec = new SR()
-    rec.lang = 'zh-CN'; rec.continuous = true; rec.interimResults = true
+    rec.lang = 'zh-CN'
+    rec.continuous = true
+    rec.interimResults = true
     let finalText = ''
     rec.onstart = () => {
       state.recognizing = true
@@ -699,15 +856,26 @@
       $('input').value = finalText + interim
       autoResize()
     }
-    rec.onerror = (ev) => { toast('语音识别出错: ' + ev.error, 'error') }
-    rec.onend = () => { state.recognizing = false; $('voice-btn').classList.remove('recording') }
+    rec.onerror = (ev) => {
+      toast(`语音识别出错: ${ev.error}`, 'error')
+    }
+    rec.onend = () => {
+      state.recognizing = false
+      $('voice-btn').classList.remove('recording')
+    }
     return rec
   }
   function toggleVoice() {
     if (!state.recognition) state.recognition = initSpeech()
-    if (!state.recognition) { toast('浏览器不支持语音识别 (建议 Chrome/Edge)', 'error'); return }
+    if (!state.recognition) {
+      toast('浏览器不支持语音识别 (建议 Chrome/Edge)', 'error')
+      return
+    }
     if (state.recognizing) state.recognition.stop()
-    else try { state.recognition.start() } catch {}
+    else
+      try {
+        state.recognition.start()
+      } catch {}
   }
 
   // ═══════════════ NOTIFICATIONS ═══════════════
@@ -719,13 +887,18 @@
       return () => {
         const osc = ctx.createOscillator()
         const gain = ctx.createGain()
-        osc.connect(gain); gain.connect(ctx.destination)
-        osc.type = 'sine'; osc.frequency.value = 880
+        osc.connect(gain)
+        gain.connect(ctx.destination)
+        osc.type = 'sine'
+        osc.frequency.value = 880
         gain.gain.setValueAtTime(0.15, ctx.currentTime)
         gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3)
-        osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.3)
+        osc.start(ctx.currentTime)
+        osc.stop(ctx.currentTime + 0.3)
       }
-    } catch { return () => {} }
+    } catch {
+      return () => {}
+    }
   })()
 
   // ── Title bar status ──
@@ -735,7 +908,7 @@
       document.title = '⏳ 思考中... — OpenClaude'
     } else {
       const sess = getSession()
-      document.title = sess?.title ? sess.title + ' — OpenClaude' : _originalTitle
+      document.title = sess?.title ? `${sess.title} — OpenClaude` : _originalTitle
     }
   }
 
@@ -745,17 +918,31 @@
     if (state.windowFocused) return
     if (!('Notification' in window)) return
     // Request permission on first background notification (not on login)
-    if (Notification.permission === 'default') { requestNotifyPermission(); return }
+    if (Notification.permission === 'default') {
+      requestNotifyPermission()
+      return
+    }
     if (Notification.permission !== 'granted') return
     try {
-      const n = new Notification(title, { body: body ? body.slice(0, 200) : '', icon: '/icon.svg', badge: '/icon.svg', tag: 'openclaude', silent: false })
-      n.onclick = () => { window.focus(); n.close() }
+      const n = new Notification(title, {
+        body: body ? body.slice(0, 200) : '',
+        icon: '/icon.svg',
+        badge: '/icon.svg',
+        tag: 'openclaude',
+        silent: false,
+      })
+      n.onclick = () => {
+        window.focus()
+        n.close()
+      }
     } catch {}
   }
   async function requestNotifyPermission() {
     if (!('Notification' in window)) return
     if (Notification.permission === 'default') {
-      try { await Notification.requestPermission() } catch {}
+      try {
+        await Notification.requestPermission()
+      } catch {}
     }
   }
 
@@ -827,7 +1014,7 @@
       const oauthProvider = $('oauth-provider').value
       const r = await fetch('/api/auth/claude/start', {
         method: 'POST',
-        headers: { Authorization: 'Bearer ' + state.token, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${state.token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: oauthProvider }),
       })
       const data = await r.json()
@@ -842,18 +1029,30 @@
           $('oauth-code-input').placeholder = '粘贴授权代码或完整回调 URL...'
         }
       } else {
-        $('oauth-error').textContent = '生成授权链接失败'; $('oauth-error').hidden = false
+        $('oauth-error').textContent = '生成授权链接失败'
+        $('oauth-error').hidden = false
       }
-    } catch (e) { $('oauth-error').textContent = '请求失败: ' + e; $('oauth-error').hidden = false }
+    } catch (e) {
+      $('oauth-error').textContent = `请求失败: ${e}`
+      $('oauth-error').hidden = false
+    }
   }
   $('oauth-submit-btn').onclick = async () => {
     let code = $('oauth-code-input').value.trim()
-    if (!code) { $('oauth-error').textContent = '请粘贴授权代码或回调 URL'; $('oauth-error').hidden = false; return }
-    if (!_oauthState) { $('oauth-error').textContent = '请先点击"打开授权页面"'; $('oauth-error').hidden = false; return }
+    if (!code) {
+      $('oauth-error').textContent = '请粘贴授权代码或回调 URL'
+      $('oauth-error').hidden = false
+      return
+    }
+    if (!_oauthState) {
+      $('oauth-error').textContent = '请先点击"打开授权页面"'
+      $('oauth-error').hidden = false
+      return
+    }
     // Auto-parse: if user pasted the full callback URL, extract code from it
     if (code.includes('code=')) {
       try {
-        const u = new URL(code.startsWith('http') ? code : 'http://x?' + code)
+        const u = new URL(code.startsWith('http') ? code : `http://x?${code}`)
         code = u.searchParams.get('code') || code
       } catch {}
     }
@@ -863,7 +1062,7 @@
     try {
       const r = await fetch('/api/auth/claude/callback', {
         method: 'POST',
-        headers: { Authorization: 'Bearer ' + state.token, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${state.token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ code, state: _oauthState }),
       })
       const data = await r.json()
@@ -871,14 +1070,17 @@
         $('oauth-step1').hidden = true
         $('oauth-step2').hidden = false
         const provName = $('oauth-provider').value === 'codex' ? 'OpenAI Codex' : 'Claude.ai'
-        $('oauth-result-text').textContent = '已连接 ' + provName + ' · Token 有效期 ' + Math.round((data.expiresIn || 3600) / 60) + ' 分钟'
-        toast(provName + ' 登录成功!', 'success')
+        $('oauth-result-text').textContent =
+          `已连接 ${provName} · Token 有效期 ${Math.round((data.expiresIn || 3600) / 60)} 分钟`
+        toast(`${provName} 登录成功!`, 'success')
         setTimeout(() => closeModal('oauth-modal'), 2000)
       } else {
-        $('oauth-error').textContent = data.error || '登录失败'; $('oauth-error').hidden = false
+        $('oauth-error').textContent = data.error || '登录失败'
+        $('oauth-error').hidden = false
       }
     } catch (e) {
-      $('oauth-error').textContent = '请求失败: ' + e; $('oauth-error').hidden = false
+      $('oauth-error').textContent = `请求失败: ${e}`
+      $('oauth-error').hidden = false
     } finally {
       $('oauth-submit-btn').disabled = false
       $('oauth-submit-btn').textContent = '完成登录'
@@ -889,7 +1091,7 @@
     const id = agentId || (getSession()?.agentId ?? state.defaultAgentId)
     _memoryTab = 'memory'
     const title = $('memory-modal-title')
-    title.textContent = 'Memory — ' + id
+    title.textContent = `Memory — ${id}`
     title.dataset.agentId = id
     await loadMemoryTab('memory', id)
     $('memory-tab-memory').className = 'btn btn-secondary'
@@ -900,22 +1102,25 @@
     _memoryTab = target
     const id = agentId || $('memory-modal-title').dataset.agentId
     try {
-      const data = await apiGet('/api/agents/' + encodeURIComponent(id) + '/memory/' + target)
+      const data = await apiGet(`/api/agents/${encodeURIComponent(id)}/memory/${target}`)
       $('memory-text').value = data.text || ''
       $('memory-label').innerHTML =
-        (target === 'memory' ? 'MEMORY.md (我的观察)' : 'USER.md (用户画像)') +
-        ' — <span id="memory-count">' + (data.charCount ?? 0) + '</span> chars'
-    } catch (err) { toast(String(err), 'error') }
+        `${target === 'memory' ? 'MEMORY.md (我的观察)' : 'USER.md (用户画像)'} — <span id="memory-count">${data.charCount ?? 0}</span> chars`
+    } catch (err) {
+      toast(String(err), 'error')
+    }
   }
   async function saveMemory() {
     const id = $('memory-modal-title').dataset.agentId
     try {
-      await apiJson('PUT', '/api/agents/' + encodeURIComponent(id) + '/memory/' + _memoryTab, {
+      await apiJson('PUT', `/api/agents/${encodeURIComponent(id)}/memory/${_memoryTab}`, {
         text: $('memory-text').value,
       })
       toast('已保存', 'success')
       closeModal('memory-modal')
-    } catch (err) { toast(String(err), 'error') }
+    } catch (err) {
+      toast(String(err), 'error')
+    }
   }
   async function openSkillsModal(agentId) {
     const id = agentId || (getSession()?.agentId ?? state.defaultAgentId)
@@ -923,9 +1128,10 @@
     wrap.innerHTML = '<p style="color:var(--fg-muted);font-size:var(--text-sm)">加载中...</p>'
     openModal('skills-modal')
     try {
-      const data = await apiGet('/api/agents/' + encodeURIComponent(id) + '/skills')
+      const data = await apiGet(`/api/agents/${encodeURIComponent(id)}/skills`)
       if (!data.skills || data.skills.length === 0) {
-        wrap.innerHTML = '<p style="color:var(--fg-muted);font-size:var(--text-sm);margin:0">还没有任何 skill。让 agent 完成一个复杂任务后,它会通过 <code>skill_save</code> MCP 工具自动积累 skill。</p>'
+        wrap.innerHTML =
+          '<p style="color:var(--fg-muted);font-size:var(--text-sm);margin:0">还没有任何 skill。让 agent 完成一个复杂任务后,它会通过 <code>skill_save</code> MCP 工具自动积累 skill。</p>'
         return
       }
       wrap.innerHTML = ''
@@ -961,21 +1167,272 @@
         delBtn.style.fontSize = 'var(--text-sm)'
         delBtn.textContent = '删除'
         delBtn.onclick = async () => {
-          if (!confirm('删除 skill "' + s.name + '"?')) return
+          if (!confirm(`删除 skill "${s.name}"?`)) return
           try {
-            await apiJson('DELETE', '/api/agents/' + encodeURIComponent(id) + '/skills/' + encodeURIComponent(s.name))
+            await apiJson(
+              'DELETE',
+              `/api/agents/${encodeURIComponent(id)}/skills/${encodeURIComponent(s.name)}`,
+            )
             toast('已删除')
             await openSkillsModal(id)
-          } catch (err) { toast(String(err), 'error') }
+          } catch (err) {
+            toast(String(err), 'error')
+          }
         }
         row.appendChild(info)
         row.appendChild(delBtn)
         wrap.appendChild(row)
       }
     } catch (err) {
-      wrap.innerHTML = '<p style="color:var(--danger)">加载失败: ' + htmlSafeEscape(String(err)) + '</p>'
+      wrap.innerHTML = `<p style="color:var(--danger)">加载失败: ${htmlSafeEscape(String(err))}</p>`
     }
   }
+
+  // ═══════════════ SCHEDULED TASKS ═══════════════
+  function _cronHuman(cron) {
+    const p = (cron || '').split(/\s+/)
+    if (p.length < 5) return cron
+    const [min, hr, dom, mon, dow] = p
+    const dayNames = ['日', '一', '二', '三', '四', '五', '六']
+    let s = ''
+    if (dom !== '*' && mon !== '*') s += `${mon}月${dom}日 `
+    else if (dow !== '*') {
+      const days = dow.split(',').map((d) => dayNames[+d] || d)
+      s += `每周${days.join(',')} `
+    } else if (dom !== '*') s += `每月${dom}日 `
+    else s += '每天 '
+    if (hr !== '*' && min !== '*') s += `${hr.padStart(2, '0')}:${min.padStart(2, '0')}`
+    else if (hr !== '*') s += `${hr}:00`
+    else if (min !== '*') s += `每小时第${min}分`
+    else s += '每分钟'
+    return s
+  }
+
+  async function openTasksModal() {
+    const list = $('tasks-list')
+    const empty = $('tasks-empty')
+    list.innerHTML = ''
+    empty.style.display = 'block'
+    openModal('tasks-modal')
+    try {
+      const data = await apiGet('/api/cron')
+      const jobs = data.jobs || []
+      if (jobs.length === 0) {
+        empty.style.display = 'block'
+        return
+      }
+      empty.style.display = 'none'
+      for (const job of jobs) {
+        const row = document.createElement('div')
+        row.className = 'agent-row'
+        row.style.gap = '8px'
+        const info = document.createElement('div')
+        info.className = 'agent-row-info'
+        info.style.flex = '1'
+        const title = document.createElement('div')
+        title.className = 'agent-row-title'
+        title.style.fontSize = '13px'
+        title.textContent = job.label || job.id
+        if (job.oneshot) {
+          const badge = document.createElement('span')
+          badge.className = 'badge'
+          badge.textContent = '一次性'
+          badge.style.marginLeft = '6px'
+          title.appendChild(badge)
+        }
+        const sub = document.createElement('div')
+        sub.className = 'agent-row-sub'
+        sub.style.fontSize = '12px'
+        const schedText = _cronHuman(job.schedule)
+        const nextText = job.nextRunAt ? ` · 下次: ${new Date(job.nextRunAt).toLocaleString()}` : ''
+        sub.textContent = `${schedText}${nextText} · agent: ${job.agent}`
+        info.appendChild(title)
+        info.appendChild(sub)
+        // Enable/disable toggle
+        const toggle = document.createElement('button')
+        toggle.className = 'btn btn-ghost'
+        toggle.style.cssText = 'padding:4px 10px;min-height:28px;font-size:12px'
+        toggle.textContent = job.enabled !== false ? '暂停' : '启用'
+        toggle.onclick = async () => {
+          try {
+            await apiJson('PUT', `/api/cron/${encodeURIComponent(job.id)}`, {
+              enabled: job.enabled === false,
+            })
+            await openTasksModal()
+          } catch (err) {
+            toast(String(err), 'error')
+          }
+        }
+        // Delete button
+        const del = document.createElement('button')
+        del.className = 'btn btn-ghost'
+        del.style.cssText = 'padding:4px 10px;min-height:28px;font-size:12px;color:var(--danger)'
+        del.textContent = '删除'
+        del.onclick = async () => {
+          if (!confirm(`删除任务 "${job.label || job.id}"?`)) return
+          try {
+            await apiJson('DELETE', `/api/cron/${encodeURIComponent(job.id)}`)
+            toast('已删除')
+            await openTasksModal()
+          } catch (err) {
+            toast(String(err), 'error')
+          }
+        }
+        row.appendChild(info)
+        row.appendChild(toggle)
+        row.appendChild(del)
+        list.appendChild(row)
+      }
+    } catch (err) {
+      list.innerHTML = `<p style="color:var(--danger)">加载失败: ${htmlSafeEscape(String(err))}</p>`
+    }
+  }
+
+  // Tab switching for tasks modal
+  let _currentTasksTab = 'cron'
+  function switchTasksTab(tab) {
+    _currentTasksTab = tab
+    for (const t of ['cron', 'bg', 'log']) {
+      const panel = $(`tasks-panel-${t}`)
+      const btn = $(`tasks-tab-${t}`)
+      if (panel) panel.hidden = t !== tab
+      if (btn) btn.className = t === tab ? 'btn btn-secondary' : 'btn btn-ghost'
+    }
+    if (tab === 'bg') loadBgTasks()
+    if (tab === 'log') loadExecLog()
+  }
+  for (const btn of document.querySelectorAll('[data-tasks-tab]')) {
+    btn.addEventListener('click', () => switchTasksTab(btn.dataset.tasksTab))
+  }
+
+  async function loadBgTasks() {
+    const list = $('bg-tasks-list')
+    const empty = $('bg-tasks-empty')
+    if (!list) return
+    list.innerHTML = ''
+    try {
+      const data = await apiGet('/api/tasks')
+      const tasks = data.tasks || []
+      empty.style.display = tasks.length === 0 ? 'block' : 'none'
+      for (const t of tasks) {
+        const row = document.createElement('div')
+        row.className = 'agent-row'
+        row.style.gap = '8px'
+        const info = document.createElement('div')
+        info.className = 'agent-row-info'
+        info.style.flex = '1'
+        const title = document.createElement('div')
+        title.className = 'agent-row-title'
+        title.style.fontSize = '13px'
+        title.textContent = t.title || t.id
+        const statusBadge = document.createElement('span')
+        statusBadge.className = 'badge'
+        statusBadge.style.marginLeft = '6px'
+        statusBadge.textContent = t.status
+        title.appendChild(statusBadge)
+        const sub = document.createElement('div')
+        sub.className = 'agent-row-sub'
+        sub.style.fontSize = '12px'
+        const parts = [`${t.trigger} · agent: ${t.agent} · runs: ${t.runCount}`]
+        if (t.lastRunAt) parts.push(`last: ${new Date(t.lastRunAt).toLocaleString()}`)
+        sub.textContent = parts.join(' · ')
+        info.appendChild(title)
+        info.appendChild(sub)
+        const runBtn = document.createElement('button')
+        runBtn.className = 'btn btn-ghost'
+        runBtn.style.cssText = 'padding:4px 10px;min-height:28px;font-size:12px'
+        runBtn.textContent = '执行'
+        runBtn.onclick = async () => {
+          try {
+            await apiJson('POST', `/api/tasks/${encodeURIComponent(t.id)}`)
+            toast('任务已触发')
+          } catch (err) {
+            toast(String(err), 'error')
+          }
+        }
+        const del = document.createElement('button')
+        del.className = 'btn btn-ghost'
+        del.style.cssText = 'padding:4px 10px;min-height:28px;font-size:12px;color:var(--danger)'
+        del.textContent = '删除'
+        del.onclick = async () => {
+          if (!confirm(`删除任务 "${t.title}"?`)) return
+          try {
+            await apiJson('DELETE', `/api/tasks/${encodeURIComponent(t.id)}`)
+            toast('已删除')
+            await loadBgTasks()
+          } catch (err) {
+            toast(String(err), 'error')
+          }
+        }
+        row.appendChild(info)
+        row.appendChild(runBtn)
+        row.appendChild(del)
+        list.appendChild(row)
+      }
+    } catch (err) {
+      list.innerHTML = `<p style="color:var(--danger)">加载失败: ${htmlSafeEscape(String(err))}</p>`
+    }
+  }
+
+  async function loadExecLog() {
+    const list = $('exec-log-list')
+    const empty = $('exec-log-empty')
+    if (!list) return
+    list.innerHTML = ''
+    try {
+      const data = await apiGet('/api/tasks-executions')
+      const execs = (data.executions || []).reverse() // newest first
+      empty.style.display = execs.length === 0 ? 'block' : 'none'
+      for (const ex of execs.slice(0, 30)) {
+        const row = document.createElement('div')
+        row.style.cssText =
+          'display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px'
+        const statusIcon = ex.status === 'completed' ? '✅' : ex.status === 'failed' ? '❌' : '⏳'
+        const time = new Date(ex.startedAt).toLocaleString()
+        const duration = ex.completedAt
+          ? `${((ex.completedAt - ex.startedAt) / 1000).toFixed(1)}s`
+          : '...'
+        row.innerHTML = `<span>${statusIcon}</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${htmlSafeEscape(ex.taskId)}</span><span style="color:var(--text-secondary)">${time} · ${duration}</span>`
+        if (ex.error) {
+          row.title = `Error: ${ex.error}`
+          row.style.color = 'var(--danger)'
+        }
+        list.appendChild(row)
+      }
+    } catch (err) {
+      list.innerHTML = `<p style="color:var(--danger)">加载失败: ${htmlSafeEscape(String(err))}</p>`
+    }
+  }
+
+  // Wire up add-task modal
+  $('tasks-add-btn')?.addEventListener('click', () => {
+    $('task-message').value = ''
+    $('task-cron').value = ''
+    $('task-oneshot').checked = true
+    openModal('add-task-modal')
+  })
+  $('task-save-btn')?.addEventListener('click', async () => {
+    const message = $('task-message').value.trim()
+    const cron = $('task-cron').value.trim()
+    if (!message || !cron) {
+      toast('请填写提醒内容和 cron 表达式', 'error')
+      return
+    }
+    try {
+      await apiJson('POST', '/api/cron', {
+        schedule: cron,
+        prompt: `请直接输出以下提醒内容,不要添加任何额外文字:\n\n⏰ 提醒: ${message}`,
+        deliver: 'webchat',
+        oneshot: $('task-oneshot').checked,
+        label: message,
+      })
+      toast('提醒已创建', 'success')
+      closeModal('add-task-modal')
+      await openTasksModal()
+    } catch (err) {
+      toast(String(err), 'error')
+    }
+  })
 
   // ═══════════════ AGENTS ═══════════════
   async function reloadAgents() {
@@ -985,7 +1442,9 @@
       state.defaultAgentId = data.default || 'main'
       renderAgentDropdown()
       renderAgentsManagementList()
-    } catch (err) { console.warn('load agents failed:', err) }
+    } catch (err) {
+      console.warn('load agents failed:', err)
+    }
   }
   function renderAgentDropdown() {
     const sel = $('agent-select')
@@ -1005,36 +1464,48 @@
     if (!wrap) return
     wrap.innerHTML = ''
     if (state.agentsList.length === 0) {
-      wrap.innerHTML = '<p style="color:var(--fg-muted);font-size:var(--text-sm);margin:0">没有 agents</p>'
+      wrap.innerHTML =
+        '<p style="color:var(--fg-muted);font-size:var(--text-sm);margin:0">没有 agents</p>'
       return
     }
     for (const a of state.agentsList) {
-      const row = document.createElement('div'); row.className = 'agent-row'
-      const info = document.createElement('div'); info.className = 'agent-row-info'
-      const title = document.createElement('div'); title.className = 'agent-row-title'
-      title.textContent = (a.avatarEmoji ? a.avatarEmoji + ' ' : '') + (a.displayName || a.id)
+      const row = document.createElement('div')
+      row.className = 'agent-row'
+      const info = document.createElement('div')
+      info.className = 'agent-row-info'
+      const title = document.createElement('div')
+      title.className = 'agent-row-title'
+      title.textContent = (a.avatarEmoji ? `${a.avatarEmoji} ` : '') + (a.displayName || a.id)
       if (a.id === state.defaultAgentId) {
-        const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = 'default'
+        const badge = document.createElement('span')
+        badge.className = 'badge'
+        badge.textContent = 'default'
         title.appendChild(badge)
       }
-      const sub = document.createElement('div'); sub.className = 'agent-row-sub'
+      const sub = document.createElement('div')
+      sub.className = 'agent-row-sub'
       sub.textContent = a.model || '—'
-      info.appendChild(title); info.appendChild(sub)
-      const editBtn = document.createElement('button'); editBtn.className = 'btn btn-secondary'
-      editBtn.style.padding = '8px 16px'; editBtn.style.minHeight = '38px'; editBtn.style.fontSize = 'var(--text-sm)'
+      info.appendChild(title)
+      info.appendChild(sub)
+      const editBtn = document.createElement('button')
+      editBtn.className = 'btn btn-secondary'
+      editBtn.style.padding = '8px 16px'
+      editBtn.style.minHeight = '38px'
+      editBtn.style.fontSize = 'var(--text-sm)'
       editBtn.textContent = '编辑'
       editBtn.onclick = () => openPersonaEditor(a.id)
-      row.appendChild(info); row.appendChild(editBtn)
+      row.appendChild(info)
+      row.appendChild(editBtn)
       wrap.appendChild(row)
     }
   }
   async function openPersonaEditor(agentId) {
     try {
       const [info, persona] = await Promise.all([
-        apiGet('/api/agents/' + encodeURIComponent(agentId)),
-        apiGet('/api/agents/' + encodeURIComponent(agentId) + '/persona'),
+        apiGet(`/api/agents/${encodeURIComponent(agentId)}`),
+        apiGet(`/api/agents/${encodeURIComponent(agentId)}/persona`),
       ])
-      $('persona-modal-title').textContent = '编辑: ' + (info.agent.displayName || agentId)
+      $('persona-modal-title').textContent = `编辑: ${info.agent.displayName || agentId}`
       $('persona-display-name').value = info.agent.displayName || ''
       $('persona-avatar-emoji').value = info.agent.avatarEmoji || ''
       $('persona-greeting').value = info.agent.greeting || ''
@@ -1042,47 +1513,73 @@
       // Sync preset dropdown
       const preset = $('persona-model-preset')
       const modelVal = info.agent.model || ''
-      preset.value = [...preset.options].some(o => o.value === modelVal) ? modelVal : ''
+      preset.value = [...preset.options].some((o) => o.value === modelVal) ? modelVal : ''
       $('persona-provider').value = info.agent.provider || ''
       $('persona-permission').value = info.agent.permissionMode || 'default'
+      $('persona-cwd').value = info.agent.cwd || ''
+      $('persona-toolsets').value = (info.agent.toolsets || []).join(', ')
       $('persona-text').value = persona.text || ''
       const delBtn = $('delete-agent-btn')
       delBtn.disabled = agentId === state.defaultAgentId
       delBtn.style.display = agentId === state.defaultAgentId ? 'none' : ''
       delBtn.onclick = async () => {
-        if (!confirm('删除 agent "' + agentId + '"?')) return
+        if (!confirm(`删除 agent "${agentId}"?`)) return
         try {
-          await apiJson('DELETE', '/api/agents/' + encodeURIComponent(agentId))
+          await apiJson('DELETE', `/api/agents/${encodeURIComponent(agentId)}`)
           toast('agent 已删除', 'success')
           closeModal('persona-modal')
           await reloadAgents()
-        } catch (err) { toast(String(err), 'error') }
+        } catch (err) {
+          toast(String(err), 'error')
+        }
       }
       $('save-persona-btn').onclick = async () => {
         try {
-          await apiJson('PUT', '/api/agents/' + encodeURIComponent(agentId), {
+          await apiJson('PUT', `/api/agents/${encodeURIComponent(agentId)}`, {
             model: $('persona-model').value.trim(),
             permissionMode: $('persona-permission').value,
             provider: $('persona-provider').value || undefined,
             displayName: $('persona-display-name').value.trim() || undefined,
             avatarEmoji: $('persona-avatar-emoji').value.trim() || undefined,
             greeting: $('persona-greeting').value.trim() || undefined,
+            cwd: $('persona-cwd').value.trim() || undefined,
+            toolsets: $('persona-toolsets').value.trim()
+              ? $('persona-toolsets')
+                  .value.split(',')
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              : undefined,
           })
-          await apiJson('PUT', '/api/agents/' + encodeURIComponent(agentId) + '/persona', { text: $('persona-text').value })
+          await apiJson('PUT', `/api/agents/${encodeURIComponent(agentId)}/persona`, {
+            text: $('persona-text').value,
+          })
           toast('已保存', 'success')
           closeModal('persona-modal')
           await reloadAgents()
-        } catch (err) { toast(String(err), 'error') }
+        } catch (err) {
+          toast(String(err), 'error')
+        }
       }
       openModal('persona-modal')
-    } catch (err) { toast(String(err), 'error') }
+    } catch (err) {
+      toast(String(err), 'error')
+    }
   }
 
   // ═══════════════ SESSIONS ═══════════════
-  function getSession(id) { return state.sessions.get(id || state.currentSessionId) }
+  function getSession(id) {
+    return state.sessions.get(id || state.currentSessionId)
+  }
   function createSession(agentId) {
     const id = uuid()
-    const s = { id, title: '新会话', createdAt: Date.now(), lastAt: Date.now(), messages: [], agentId: agentId || state.defaultAgentId }
+    const s = {
+      id,
+      title: '新会话',
+      createdAt: Date.now(),
+      lastAt: Date.now(),
+      messages: [],
+      agentId: agentId || state.defaultAgentId,
+    }
     state.sessions.set(id, s)
     state.currentSessionId = id
     scheduleSave(s)
@@ -1097,14 +1594,19 @@
     const newSess = getSession()
     state.sendingInFlight = newSess?._sendingInFlight || false
     updateSendEnabled()
-    if (state.sendingInFlight) showTypingIndicator(); else hideTypingIndicator()
-    renderSidebar(); renderMessages(); renderAgentDropdown()
+    if (state.sendingInFlight) showTypingIndicator()
+    else hideTypingIndicator()
+    renderSidebar()
+    renderMessages()
+    renderAgentDropdown()
     $('sidebar').classList.remove('open')
     $('sidebar-backdrop').classList.remove('open')
   }
   async function deleteSession(id) {
     state.sessions.delete(id)
-    try { await dbDelete(id) } catch {}
+    try {
+      await dbDelete(id)
+    } catch {}
     if (state.currentSessionId === id) {
       const arr = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
       if (arr.length > 0) state.currentSessionId = arr[0].id
@@ -1114,15 +1616,44 @@
     renderSidebar()
   }
   const _saveTimers = new Map()
+  // Search index: build a single lowercase string per session covering message text.
+  // Fills from newest messages first so recent topics are always searchable,
+  // then appends older messages until the 50K char budget is exhausted.
+  const _SEARCH_INDEX_CAP = 50000
+  function _rebuildSearchIndex(sess) {
+    if (!sess) return
+    const title = (sess.title || '').toLowerCase()
+    let len = title.length
+    const msgs = sess.messages || []
+    const parts = []
+    // Pass 1: newest → oldest (guarantees recent content is indexed)
+    for (let i = msgs.length - 1; i >= 0 && len < _SEARCH_INDEX_CAP; i--) {
+      const m = msgs[i]
+      if (m.role !== 'user' && m.role !== 'assistant') continue
+      const t = (m.text || '').toLowerCase()
+      const remaining = _SEARCH_INDEX_CAP - len
+      parts.push(remaining >= t.length ? t : t.slice(0, remaining))
+      len += Math.min(t.length, remaining)
+    }
+    // Reverse so the concatenated string is still chronological (nice-to-have, not critical)
+    parts.reverse()
+    sess._searchText = `${title} ${parts.join(' ')}`
+  }
+
   function scheduleSave(s) {
     const sess = s || getSession()
     if (!sess) return
+    _rebuildSearchIndex(sess)
     const prev = _saveTimers.get(sess.id)
     if (prev) clearTimeout(prev)
     const t = setTimeout(async () => {
       _saveTimers.delete(sess.id)
       const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, ...persist } = sess
-      try { await dbPut(persist) } catch (e) { console.warn('dbPut', e) }
+      try {
+        await dbPut(persist)
+      } catch (e) {
+        console.warn('dbPut', e)
+      }
     }, 400)
     _saveTimers.set(sess.id, t)
   }
@@ -1147,14 +1678,16 @@
   }
   function _buildMessageEl(msg) {
     const el = document.createElement('div')
-    el.className = 'msg ' + msg.role
+    el.className = `msg ${msg.role}`
     if (msg.error) el.classList.add('error')
     el.dataset.msgId = msg.id
     if (msg.role === 'assistant') {
       const avatar = document.createElement('div')
       avatar.className = 'avatar'
       // Use agent persona emoji if available, fallback to 'O'
-      const agentInfo = state.agentsList.find(a => a.id === (getSession()?.agentId || state.defaultAgentId))
+      const agentInfo = state.agentsList.find(
+        (a) => a.id === (getSession()?.agentId || state.defaultAgentId),
+      )
       avatar.textContent = agentInfo?.avatarEmoji || 'O'
       el.appendChild(avatar)
       const body = document.createElement('div')
@@ -1175,41 +1708,70 @@
         const action = btn.dataset.action
         const sess = getSession()
         if (!sess) return
-        const _svgCopy = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
-        const _svgCheck = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
-        const _svgVol = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>'
-        const _svgStop = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>'
+        const _svgCopy =
+          '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+        const _svgCheck =
+          '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+        const _svgVol =
+          '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>'
+        const _svgStop =
+          '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>'
         if (action === 'copy') {
           const _doCopied = () => {
-            btn.classList.add('copied'); btn.innerHTML = _svgCheck
-            setTimeout(() => { btn.classList.remove('copied'); btn.innerHTML = _svgCopy }, 1500)
+            btn.classList.add('copied')
+            btn.innerHTML = _svgCheck
+            setTimeout(() => {
+              btn.classList.remove('copied')
+              btn.innerHTML = _svgCopy
+            }, 1500)
           }
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(msg.text || '').then(_doCopied).catch(() => { fallbackCopy(msg.text || ''); _doCopied() })
-          } else { fallbackCopy(msg.text || ''); _doCopied() }
+          if (navigator.clipboard?.writeText) {
+            navigator.clipboard
+              .writeText(msg.text || '')
+              .then(_doCopied)
+              .catch(() => {
+                fallbackCopy(msg.text || '')
+                _doCopied()
+              })
+          } else {
+            fallbackCopy(msg.text || '')
+            _doCopied()
+          }
         } else if (action === 'regen') {
           // Find the last user message before this assistant message
           const idx = sess.messages.indexOf(msg)
           if (idx < 0) return
           let lastUserMsg = null
           for (let i = idx - 1; i >= 0; i--) {
-            if (sess.messages[i].role === 'user') { lastUserMsg = sess.messages[i]; break }
+            if (sess.messages[i].role === 'user') {
+              lastUserMsg = sess.messages[i]
+              break
+            }
           }
-          if (!lastUserMsg) { toast('没有找到可重发的用户消息', 'error'); return }
+          if (!lastUserMsg) {
+            toast('没有找到可重发的用户消息', 'error')
+            return
+          }
           // Remove messages from this one onwards
           sess.messages.splice(idx)
           renderMessages()
           // Re-send the user message
-          state.sendingInFlight = true; updateSendEnabled(); showTypingIndicator()
-          state.ws.send(JSON.stringify({
-            type: 'inbound.message',
-            idempotencyKey: 'regen-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
-            channel: 'webchat',
-            peer: { id: sess.id, kind: 'dm' },
-            agentId: sess.agentId || state.defaultAgentId,
-            content: { text: lastUserMsg.text || '' },
-            ts: Date.now(),
-          }))
+          sess._sendingInFlight = true
+          state.sendingInFlight = true
+          updateSendEnabled()
+          showTypingIndicator()
+          setTitleBusy(true)
+          state.ws.send(
+            JSON.stringify({
+              type: 'inbound.message',
+              idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              channel: 'webchat',
+              peer: { id: sess.id, kind: 'dm' },
+              agentId: sess.agentId || state.defaultAgentId,
+              content: { text: lastUserMsg.text || '' },
+              ts: Date.now(),
+            }),
+          )
           scheduleSave(sess)
         } else if (action === 'tts') {
           // Use Web Speech API for quick read-aloud
@@ -1221,10 +1783,20 @@
             utter.lang = 'zh-CN'
             utter.rate = 1.1
             window.speechSynthesis.speak(utter)
-            btn.innerHTML = _svgStop; btn.title = '停止朗读'
-            utter.onend = () => { btn.innerHTML = _svgVol; btn.title = '朗读' }
-            btn.onclick = () => { window.speechSynthesis.cancel(); btn.innerHTML = _svgVol; btn.title = '朗读' }
-          } else { toast('浏览器不支持语音合成', 'error') }
+            btn.innerHTML = _svgStop
+            btn.title = '停止朗读'
+            utter.onend = () => {
+              btn.innerHTML = _svgVol
+              btn.title = '朗读'
+            }
+            btn.onclick = () => {
+              window.speechSynthesis.cancel()
+              btn.innerHTML = _svgVol
+              btn.title = '朗读'
+            }
+          } else {
+            toast('浏览器不支持语音合成', 'error')
+          }
         } else if (action === 'del') {
           const idx = sess.messages.indexOf(msg)
           if (idx < 0) return
@@ -1233,31 +1805,47 @@
           el.style.display = 'none'
           const undoToast = document.createElement('div')
           undoToast.className = 'toast show'
-          undoToast.innerHTML = '消息已删除 <button class="undo-btn" style="margin-left:12px;color:var(--accent);background:none;border:none;cursor:pointer;font-weight:600;text-decoration:underline">撤销</button>'
+          undoToast.innerHTML =
+            '消息已删除 <button class="undo-btn" style="margin-left:12px;color:var(--accent);background:none;border:none;cursor:pointer;font-weight:600;text-decoration:underline">撤销</button>'
           document.body.appendChild(undoToast)
           let undone = false
           undoToast.querySelector('.undo-btn').onclick = () => {
-            undone = true; sess.messages.splice(idx, 0, msg); el.style.display = ''; undoToast.remove(); scheduleSave(sess)
+            undone = true
+            sess.messages.splice(idx, 0, msg)
+            el.style.display = ''
+            undoToast.remove()
+            scheduleSave(sess)
           }
-          setTimeout(() => { if (!undone) { el.remove(); scheduleSave(sess) } undoToast.remove() }, 4000)
+          setTimeout(() => {
+            if (!undone) {
+              el.remove()
+              scheduleSave(sess)
+            }
+            undoToast.remove()
+          }, 4000)
         }
       })
       el.appendChild(actions)
       if (msg.metaText) {
-        const meta = document.createElement('div'); meta.className = 'msg-meta'
+        const meta = document.createElement('div')
+        meta.className = 'msg-meta'
         renderMetaInto(meta, msg.metaText)
         el.appendChild(meta)
       }
     } else if (msg.role === 'agent-group') {
       el.className = 'agent-group'
-      const svgBot = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
-      const svgChevron = '<svg class="agent-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
+      const svgBot =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
+      const svgChevron =
+        '<svg class="agent-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
       const statusText = msg._completed
-        ? (msg._isError ? '<span class="agent-group-status" style="color:var(--danger)">失败</span>' : '<span class="agent-group-status" style="color:var(--success)">完成 (' + ((msg._duration / 1000).toFixed(1)) + 's)</span>')
+        ? msg._isError
+          ? '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
+          : `<span class="agent-group-status" style="color:var(--success)">完成 (${(msg._duration / 1000).toFixed(1)}s)</span>`
         : '<span class="agent-group-status">运行中...</span>'
       const header = document.createElement('div')
       header.className = 'agent-group-header'
-      header.innerHTML = svgBot + '<span>子任务: ' + htmlSafeEscape(msg.text || '') + '</span>' + statusText + svgChevron
+      header.innerHTML = `${svgBot}<span>子任务: ${htmlSafeEscape(msg.text || '')}</span>${statusText}${svgChevron}`
       header.onclick = () => el.classList.toggle('collapsed')
       el.appendChild(header)
       const body = document.createElement('div')
@@ -1266,14 +1854,19 @@
         const preview = document.createElement('div')
         preview.className = 'msg tool'
         preview.style.cssText = 'padding:6px 10px;border:none;background:transparent;font-size:12px'
-        preview.innerHTML = '<span class="tool-icon">' + (msg._isError ? '⚠️' : '✓') + '</span><div class="tool-body">' + htmlSafeEscape(msg._resultPreview) + '</div>'
+        preview.innerHTML = `<span class="tool-icon">${msg._isError ? '⚠️' : '✓'}</span><div class="tool-body">${htmlSafeEscape(msg._resultPreview)}</div>`
         body.appendChild(preview)
       }
       el.appendChild(body)
     } else if (msg.role === 'tool') {
-      const icon = document.createElement('span'); icon.className = 'tool-icon'; icon.textContent = msg.toolIcon || '🔧'
-      const body = document.createElement('div'); body.className = 'tool-body'; body.textContent = msg.text || ''
-      el.appendChild(icon); el.appendChild(body)
+      const icon = document.createElement('span')
+      icon.className = 'tool-icon'
+      icon.textContent = msg.toolIcon || '🔧'
+      const body = document.createElement('div')
+      body.className = 'tool-body'
+      body.textContent = msg.text || ''
+      el.appendChild(icon)
+      el.appendChild(body)
     } else {
       // User messages: render with media URL embedding but XSS-safe
       const body = document.createElement('div')
@@ -1284,8 +1877,8 @@
       // Status indicator for user messages
       if (msg.status) {
         const statusEl = document.createElement('div')
-        statusEl.className = 'msg-status ' + msg.status
-        statusEl.innerHTML = (_STATUS_SVG[msg.status] || '') + '<span>' + (_STATUS_LABEL[msg.status] || '') + '</span>'
+        statusEl.className = `msg-status ${msg.status}`
+        statusEl.innerHTML = `${_STATUS_SVG[msg.status] || ''}<span>${_STATUS_LABEL[msg.status] || ''}</span>`
         el.appendChild(statusEl)
       }
     }
@@ -1297,16 +1890,26 @@
     main.appendChild(el)
     processRichBlocks()
   }
-  function updateMessageEl(msg) {
-    const el = document.querySelector('[data-msg-id="' + msg.id + '"]')
+  function updateMessageEl(msg, streaming) {
+    const el = document.querySelector(`[data-msg-id="${msg.id}"]`)
     if (!el) return
     if (msg.role === 'assistant') {
       const body = el.querySelector('.msg-body')
-      if (body) body.innerHTML = renderMarkdown(msg.text || '')
+      if (body) {
+        if (streaming) {
+          // Streaming: lightweight escape + newline → <br>, skip heavy Markdown/Mermaid/Chart
+          body.textContent = msg.text || ''
+          body.style.whiteSpace = 'pre-wrap'
+        } else {
+          body.style.whiteSpace = ''
+          body.innerHTML = renderMarkdown(msg.text || '')
+        }
+      }
       if (msg.metaText) {
         let meta = el.querySelector('.msg-meta')
         if (!meta) {
-          meta = document.createElement('div'); meta.className = 'msg-meta'
+          meta = document.createElement('div')
+          meta.className = 'msg-meta'
           el.appendChild(meta)
         }
         renderMetaInto(meta, msg.metaText)
@@ -1315,14 +1918,18 @@
       // Re-render the whole card (simpler than partial updates)
       el.innerHTML = ''
       el.className = 'agent-group'
-      const svgBot = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
-      const svgChevron = '<svg class="agent-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
+      const svgBot =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
+      const svgChevron =
+        '<svg class="agent-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
       const statusText = msg._completed
-        ? (msg._isError ? '<span class="agent-group-status" style="color:var(--danger)">失败</span>' : '<span class="agent-group-status" style="color:var(--success)">完成 (' + ((msg._duration / 1000).toFixed(1)) + 's)</span>')
+        ? msg._isError
+          ? '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
+          : `<span class="agent-group-status" style="color:var(--success)">完成 (${(msg._duration / 1000).toFixed(1)}s)</span>`
         : '<span class="agent-group-status">运行中...</span>'
       const header = document.createElement('div')
       header.className = 'agent-group-header'
-      header.innerHTML = svgBot + '<span>子任务: ' + htmlSafeEscape(msg.text || '') + '</span>' + statusText + svgChevron
+      header.innerHTML = `${svgBot}<span>子任务: ${htmlSafeEscape(msg.text || '')}</span>${statusText}${svgChevron}`
       header.onclick = () => el.classList.toggle('collapsed')
       el.appendChild(header)
       if (msg._resultPreview) {
@@ -1331,7 +1938,7 @@
         const preview = document.createElement('div')
         preview.className = 'msg tool'
         preview.style.cssText = 'padding:6px 10px;border:none;background:transparent;font-size:12px'
-        preview.innerHTML = '<span class="tool-icon">' + (msg._isError ? '⚠️' : '✓') + '</span><div class="tool-body">' + htmlSafeEscape(msg._resultPreview) + '</div>'
+        preview.innerHTML = `<span class="tool-icon">${msg._isError ? '⚠️' : '✓'}</span><div class="tool-body">${htmlSafeEscape(msg._resultPreview)}</div>`
         body.appendChild(preview)
         el.appendChild(body)
       }
@@ -1353,59 +1960,86 @@
     const parts = (metaText || '').split(' · ')
     for (const p of parts) {
       if (!p) continue
-      const span = document.createElement('span'); span.className = 'msg-meta-item'; span.textContent = p
+      const span = document.createElement('span')
+      span.className = 'msg-meta-item'
+      span.textContent = p
       container.appendChild(span)
     }
   }
   function renderMessages() {
     // Cleanup Chart.js instances before DOM wipe
-    for (const [id, chart] of _chartInstances) { try { chart.destroy() } catch {} }
+    for (const [id, chart] of _chartInstances) {
+      try {
+        chart.destroy()
+      } catch {}
+    }
     _chartInstances.clear()
     const main = $('messages')
     main.innerHTML = ''
     const s = getSession()
-    if (!s) { $('session-title').textContent = '无会话'; $('session-sub').textContent = ''; return }
+    if (!s) {
+      $('session-title').textContent = '无会话'
+      $('session-sub').textContent = ''
+      return
+    }
     $('session-title').textContent = s.title
     updateSessionSub(s)
     if (s.messages.length === 0) {
-      const empty = document.createElement('div'); empty.className = 'empty-state'
-      const _ai = state.agentsList.find(a => a.id === (s.agentId || state.defaultAgentId))
+      const empty = document.createElement('div')
+      empty.className = 'empty-state'
+      const _ai = state.agentsList.find((a) => a.id === (s.agentId || state.defaultAgentId))
       const _name = _ai?.displayName || 'OpenClaude'
       const _av = _ai?.avatarEmoji || 'O'
-      empty.innerHTML =
-        '<div class="empty-brand">' + _av + '</div>' +
-        '<h1>' + htmlSafeEscape(_name) + '</h1>' +
-        '<p>你的个人 AI 助理，随时待命</p>' +
-        '<div class="hint-kbd">按 <kbd>' + _mod + 'K</kbd> 打开命令面板 · 输入 <kbd>/</kbd> 查看命令</div>'
+      empty.innerHTML = `<div class="empty-brand">${_av}</div><h1>${htmlSafeEscape(_name)}</h1><p>你的个人 AI 助理，随时待命</p><div class="hint-kbd">按 <kbd>${_mod}K</kbd> 打开命令面板 · 输入 <kbd>/</kbd> 查看命令</div>`
       main.appendChild(empty)
       return
     }
-    const inner = document.createElement('div'); inner.className = 'messages-inner'
+    const inner = document.createElement('div')
+    inner.className = 'messages-inner'
     main.appendChild(inner)
     // Performance: only render last 100 messages; show "load more" for older ones
     const MAX_INITIAL = 100
     const msgs = s.messages
     if (msgs.length > MAX_INITIAL) {
+      const LOAD_BATCH = 50
+      let _loadedUpTo = msgs.length - MAX_INITIAL // index: messages before this are not yet rendered
       const loadMore = document.createElement('button')
       loadMore.className = 'load-more-btn'
-      loadMore.textContent = '加载更早的 ' + (msgs.length - MAX_INITIAL) + ' 条消息'
+      loadMore.textContent = `加载更早的 ${_loadedUpTo} 条消息`
       const _doLoadMore = () => {
+        const batchStart = Math.max(0, _loadedUpTo - LOAD_BATCH)
+        const batchEnd = _loadedUpTo
+        if (batchStart >= batchEnd) return
         const scrollBefore = main.scrollHeight
         const frag = document.createDocumentFragment()
-        for (let i = 0; i < msgs.length - MAX_INITIAL; i++) {
+        for (let i = batchStart; i < batchEnd; i++) {
           const el = _buildMessageEl(msgs[i])
           frag.appendChild(el)
         }
-        loadMore.replaceWith(frag)
+        _loadedUpTo = batchStart
+        if (_loadedUpTo > 0) {
+          // Still more to load — update button text and keep it
+          loadMore.textContent = `加载更早的 ${_loadedUpTo} 条消息`
+          loadMore.after(frag)
+        } else {
+          // All loaded — remove button
+          loadMore.replaceWith(frag)
+        }
         processRichBlocks()
-        main.scrollTop += (main.scrollHeight - scrollBefore)
+        main.scrollTop += main.scrollHeight - scrollBefore
       }
       loadMore.onclick = _doLoadMore
       // Auto-load when scrolled to top (IntersectionObserver)
       if (window.IntersectionObserver) {
-        const obs = new IntersectionObserver(([entry]) => {
-          if (entry.isIntersecting) { obs.disconnect(); _doLoadMore() }
-        }, { root: main })
+        const obs = new IntersectionObserver(
+          ([entry]) => {
+            if (entry.isIntersecting) {
+              obs.disconnect()
+              _doLoadMore()
+            }
+          },
+          { root: main },
+        )
         obs.observe(loadMore)
       }
       inner.appendChild(loadMore)
@@ -1417,9 +2051,12 @@
   }
   function updateSessionSub(s) {
     const el = $('session-sub')
-    if (!s) { el.textContent = ''; return }
+    if (!s) {
+      el.textContent = ''
+      return
+    }
     const n = s.messages.filter((m) => m.role === 'user').length
-    el.textContent = (n > 0 ? n + ' 轮 · ' : '') + shortTime(s.lastAt)
+    el.textContent = (n > 0 ? `${n} 轮 · ` : '') + shortTime(s.lastAt)
   }
   // ── Context menu ──
   let _ctxMenu = null
@@ -1428,11 +2065,17 @@
     const menu = document.createElement('div')
     menu.className = 'ctx-menu'
     for (const it of items) {
-      if (it.divider) { menu.insertAdjacentHTML('beforeend', '<div class="ctx-divider"></div>'); continue }
+      if (it.divider) {
+        menu.insertAdjacentHTML('beforeend', '<div class="ctx-divider"></div>')
+        continue
+      }
       const btn = document.createElement('button')
-      btn.className = 'ctx-item' + (it.danger ? ' danger' : '')
+      btn.className = `ctx-item${it.danger ? ' danger' : ''}`
       btn.textContent = it.label
-      btn.onclick = () => { hideContextMenu(); it.run() }
+      btn.onclick = () => {
+        hideContextMenu()
+        it.run()
+      }
       menu.appendChild(btn)
     }
     document.body.appendChild(menu)
@@ -1440,27 +2083,35 @@
     const rect = menu.getBoundingClientRect()
     if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 8
     if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 8
-    menu.style.left = Math.max(4, x) + 'px'
-    menu.style.top = Math.max(4, y) + 'px'
+    menu.style.left = `${Math.max(4, x)}px`
+    menu.style.top = `${Math.max(4, y)}px`
     _ctxMenu = menu
     setTimeout(() => document.addEventListener('click', hideContextMenu, { once: true }), 10)
   }
   function hideContextMenu() {
-    if (_ctxMenu) { _ctxMenu.remove(); _ctxMenu = null }
+    if (_ctxMenu) {
+      _ctxMenu.remove()
+      _ctxMenu = null
+    }
   }
 
   // ── Export session as markdown ──
   function exportSessionMd(sess) {
-    const lines = ['# ' + sess.title, '', '> Exported from OpenClaude · ' + new Date().toLocaleString(), '']
+    const lines = [
+      `# ${sess.title}`,
+      '',
+      `> Exported from OpenClaude · ${new Date().toLocaleString()}`,
+      '',
+    ]
     for (const m of sess.messages) {
       if (m.role === 'user') lines.push('## 👤 User', '', m.text || '', '')
       else if (m.role === 'assistant') lines.push('## 🤖 Assistant', '', m.text || '', '')
-      else if (m.role === 'tool') lines.push('> 🔧 ' + (m.text || ''), '')
+      else if (m.role === 'tool') lines.push(`> 🔧 ${m.text || ''}`, '')
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/markdown; charset=utf-8' })
     const a = document.createElement('a')
     a.href = URL.createObjectURL(blob)
-    a.download = (sess.title || 'session').replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]/g, '_') + '.md'
+    a.download = `${(sess.title || 'session').replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]/g, '_')}.md`
     a.click()
     URL.revokeObjectURL(a.href)
     toast('已导出')
@@ -1482,32 +2133,42 @@
       renderSidebar()
     }
     input.onblur = finish
-    input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur() } else if (e.key === 'Escape') { input.value = sess.title; input.blur() } }
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        input.blur()
+      } else if (e.key === 'Escape') {
+        input.value = sess.title
+        input.blur()
+      }
+    }
     titleEl.replaceWith(input)
     input.focus()
     input.select()
   }
 
   function renderSidebar() {
-    const body = $('sessions-body'); body.innerHTML = ''
+    const body = $('sessions-body')
+    body.innerHTML = ''
     const searchQuery = ($('sidebar-search')?.value || '').trim().toLowerCase()
     const allSessions = [...state.sessions.values()].sort((a, b) => {
       if (a.pinned && !b.pinned) return -1
       if (!a.pinned && b.pinned) return 1
       return b.lastAt - a.lastAt
     })
-    // Filter by search query
+    // Filter by search query — uses pre-built _searchText index (title + last 10 msgs)
     const sessions = searchQuery
-      ? allSessions.filter(s => s.title.toLowerCase().includes(searchQuery) ||
-          s.messages?.some(m => m.text?.toLowerCase().includes(searchQuery)))
+      ? allSessions.filter((s) => (s._searchText || s.title.toLowerCase()).includes(searchQuery))
       : allSessions
 
     // Pinned group
-    const pinned = sessions.filter(s => s.pinned)
-    const unpinned = sessions.filter(s => !s.pinned)
+    const pinned = sessions.filter((s) => s.pinned)
+    const unpinned = sessions.filter((s) => !s.pinned)
 
     if (pinned.length > 0) {
-      const label = document.createElement('div'); label.className = 'sessions-group-label'; label.textContent = '⭐ 置顶'
+      const label = document.createElement('div')
+      label.className = 'sessions-group-label'
+      label.textContent = '⭐ 置顶'
       body.appendChild(label)
       for (const s of pinned) body.appendChild(_buildSessionItem(s))
     }
@@ -1522,7 +2183,9 @@
     for (const groupName of GROUP_ORDER) {
       const items = groups.get(groupName)
       if (!items || items.length === 0) continue
-      const label = document.createElement('div'); label.className = 'sessions-group-label'; label.textContent = groupName
+      const label = document.createElement('div')
+      label.className = 'sessions-group-label'
+      label.textContent = groupName
       body.appendChild(label)
       for (const s of items) body.appendChild(_buildSessionItem(s))
     }
@@ -1530,28 +2193,73 @@
 
   function _buildSessionItem(s) {
     const item = document.createElement('div')
-    item.className = 'session-item' + (s.id === state.currentSessionId ? ' active' : '') + (s.pinned ? ' pinned' : '')
-    const title = document.createElement('div'); title.className = 'session-item-title'
+    item.className = `session-item${s.id === state.currentSessionId ? ' active' : ''}${s.pinned ? ' pinned' : ''}`
+    item.setAttribute('role', 'option')
+    item.setAttribute('aria-selected', s.id === state.currentSessionId ? 'true' : 'false')
+    item.setAttribute('tabindex', '0')
+    item.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        switchSession(s.id)
+      }
+    }
+    const title = document.createElement('div')
+    title.className = 'session-item-title'
     title.textContent = (s.pinned ? '⭐ ' : '') + s.title
     // Double-click to rename
-    title.ondblclick = (e) => { e.stopPropagation(); startInlineRename(title, s) }
+    title.ondblclick = (e) => {
+      e.stopPropagation()
+      startInlineRename(title, s)
+    }
 
-    const del = document.createElement('button'); del.className = 'session-item-delete'; del.title = '删除'
-    del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>'
-    del.onclick = async (e) => { e.stopPropagation(); if (!confirm('删除会话 "' + s.title + '"?')) return; await deleteSession(s.id) }
+    const del = document.createElement('button')
+    del.className = 'session-item-delete'
+    del.title = '删除'
+    del.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>'
+    del.onclick = async (e) => {
+      e.stopPropagation()
+      if (!confirm(`删除会话 "${s.title}"?`)) return
+      await deleteSession(s.id)
+    }
 
-    item.appendChild(title); item.appendChild(del)
+    item.appendChild(title)
+    item.appendChild(del)
     item.onclick = () => switchSession(s.id)
 
     // Right-click context menu
     item.oncontextmenu = (e) => {
-      e.preventDefault(); e.stopPropagation()
+      e.preventDefault()
+      e.stopPropagation()
       showContextMenu(e.clientX, e.clientY, [
-        { label: '重命名', run: () => { switchSession(s.id); setTimeout(() => { const t = body.querySelector('.session-item.active .session-item-title'); if (t) startInlineRename(t, s) }, 50) } },
-        { label: s.pinned ? '取消置顶' : '置顶', run: () => { s.pinned = !s.pinned; scheduleSave(s); renderSidebar() } },
+        {
+          label: '重命名',
+          run: () => {
+            switchSession(s.id)
+            setTimeout(() => {
+              const t = body.querySelector('.session-item.active .session-item-title')
+              if (t) startInlineRename(t, s)
+            }, 50)
+          },
+        },
+        {
+          label: s.pinned ? '取消置顶' : '置顶',
+          run: () => {
+            s.pinned = !s.pinned
+            scheduleSave(s)
+            renderSidebar()
+          },
+        },
         { label: '导出 Markdown', run: () => exportSessionMd(s) },
         { divider: true },
-        { label: '删除', danger: true, run: async () => { if (!confirm('删除会话 "' + s.title + '"?')) return; await deleteSession(s.id) } },
+        {
+          label: '删除',
+          danger: true,
+          run: async () => {
+            if (!confirm(`删除会话 "${s.title}"?`)) return
+            await deleteSession(s.id)
+          },
+        },
       ])
     }
 
@@ -1562,10 +2270,24 @@
         const touch = e.touches[0]
         showContextMenu(touch.clientX, touch.clientY, [
           { label: '重命名', run: () => startInlineRename(title, s) },
-          { label: s.pinned ? '取消置顶' : '置顶', run: () => { s.pinned = !s.pinned; scheduleSave(s); renderSidebar() } },
+          {
+            label: s.pinned ? '取消置顶' : '置顶',
+            run: () => {
+              s.pinned = !s.pinned
+              scheduleSave(s)
+              renderSidebar()
+            },
+          },
           { label: '导出 Markdown', run: () => exportSessionMd(s) },
           { divider: true },
-          { label: '删除', danger: true, run: async () => { if (!confirm('删除?')) return; await deleteSession(s.id) } },
+          {
+            label: '删除',
+            danger: true,
+            run: async () => {
+              if (!confirm('删除?')) return
+              await deleteSession(s.id)
+            },
+          },
         ])
       }, 600)
     }
@@ -1583,16 +2305,16 @@
     el.className = 'typing-indicator'
     el.id = '__typing'
     const sess = getSession()
-    const agentInfo = state.agentsList.find(a => a.id === (sess?.agentId || state.defaultAgentId))
+    const agentInfo = state.agentsList.find((a) => a.id === (sess?.agentId || state.defaultAgentId))
     const av = agentInfo?.avatarEmoji || 'O'
     const name = agentInfo?.displayName || sess?.agentId || 'AI'
-    el.innerHTML = '<div class="avatar">' + av + '</div><div class="typing-dots"><span></span><span></span><span></span></div><span class="typing-label">' + htmlSafeEscape(name) + ' 思考中</span>'
+    el.innerHTML = `<div class="avatar">${av}</div><div class="typing-dots"><span></span><span></span><span></span></div><span class="typing-label">${htmlSafeEscape(name)} 思考中</span>`
     el._startTime = Date.now()
     // Show elapsed time after 5s
     el._timer = setInterval(() => {
       const secs = Math.round((Date.now() - el._startTime) / 1000)
       const label = el.querySelector('.typing-label')
-      if (label && secs >= 5) label.textContent = name + ' 思考中 (' + secs + 's)'
+      if (label && secs >= 5) label.textContent = `${name} 思考中 (${secs}s)`
     }, 1000)
     inner.appendChild(el)
     scrollBottom(true)
@@ -1622,9 +2344,12 @@
     }
     return msg
   }
-  function updateMessage(sess, msg, newText) {
+  function updateMessage(sess, msg, newText, streaming) {
     msg.text = newText
-    if (sess.id === state.currentSessionId) { updateMessageEl(msg); scrollBottom() }
+    if (sess.id === state.currentSessionId) {
+      updateMessageEl(msg, streaming)
+      scrollBottom()
+    }
   }
   function setMeta(sess, msg, metaText) {
     msg.metaText = metaText
@@ -1633,17 +2358,26 @@
 
   // ── Message status rendering ──
   const _STATUS_SVG = {
-    sending: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10" stroke-dasharray="20" stroke-dashoffset="10"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/></circle></svg>',
-    queued: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+    sending:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10" stroke-dasharray="20" stroke-dashoffset="10"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/></circle></svg>',
+    queued:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
     sent: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>',
     read: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 6 7 17 2 12"/><polyline points="22 6 11 17 8 14"/></svg>',
-    replied: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 6 7 17 2 12"/><polyline points="22 6 11 17 8 14"/></svg>',
+    replied:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 6 7 17 2 12"/><polyline points="22 6 11 17 8 14"/></svg>',
   }
-  const _STATUS_LABEL = { sending: '发送中', queued: '排队中', sent: '已发送', read: '已读', replied: '已回复' }
+  const _STATUS_LABEL = {
+    sending: '发送中',
+    queued: '排队中',
+    sent: '已发送',
+    read: '已读',
+    replied: '已回复',
+  }
 
   function updateMsgStatus(msg) {
     if (msg.role !== 'user' || !msg.status) return
-    const el = document.querySelector('[data-msg-id="' + msg.id + '"]')
+    const el = document.querySelector(`[data-msg-id="${msg.id}"]`)
     if (!el) return
     let statusEl = el.querySelector('.msg-status')
     if (!statusEl) {
@@ -1651,8 +2385,8 @@
       statusEl.className = 'msg-status'
       el.appendChild(statusEl)
     }
-    statusEl.className = 'msg-status ' + (msg.status || '')
-    statusEl.innerHTML = (_STATUS_SVG[msg.status] || '') + '<span>' + (_STATUS_LABEL[msg.status] || '') + '</span>'
+    statusEl.className = `msg-status ${msg.status || ''}`
+    statusEl.innerHTML = `${_STATUS_SVG[msg.status] || ''}<span>${_STATUS_LABEL[msg.status] || ''}</span>`
   }
 
   // ═══════════════ WEBSOCKET ═══════════════
@@ -1660,7 +2394,7 @@
     state.wsStatus = klass
     const el = $('status')
     if (!el) return
-    el.className = 'status-pill ' + klass
+    el.className = `status-pill ${klass}`
     $('status-text').textContent = label
     updateSendEnabled()
   }
@@ -1670,7 +2404,8 @@
     if (state.wsStatus !== 'connected') {
       btn.disabled = true
       btn.classList.remove('stopping')
-      if (svg) svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
+      if (svg)
+        svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
       return
     }
     if (state.sendingInFlight) {
@@ -1680,7 +2415,8 @@
     } else {
       btn.disabled = false
       btn.classList.remove('stopping')
-      if (svg) svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
+      if (svg)
+        svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
     }
   }
   function stopCurrentTurn() {
@@ -1688,18 +2424,21 @@
     if (!state.ws || state.ws.readyState !== 1) return
     const sess = getSession()
     if (!sess) return
-    state.ws.send(JSON.stringify({
-      type: 'inbound.control.stop', channel: 'webchat',
-      peer: { id: sess.id, kind: 'dm' },
-      agentId: sess.agentId || state.defaultAgentId,
-    }))
+    state.ws.send(
+      JSON.stringify({
+        type: 'inbound.control.stop',
+        channel: 'webchat',
+        peer: { id: sess.id, kind: 'dm' },
+        agentId: sess.agentId || state.defaultAgentId,
+      }),
+    )
     toast('已发送停止指令')
   }
   function connect() {
     if (state.ws && state.ws.readyState < 2) return
     setStatus('connecting…', 'connecting')
     // Use Sec-WebSocket-Protocol for auth instead of query string (avoids token in URL/logs)
-    const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'
+    const url = `${(location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host}/ws`
     const ws = new WebSocket(url, ['bearer', state.token])
     state.ws = ws
     ws.onopen = () => {
@@ -1716,8 +2455,11 @@
             ws.send(JSON.stringify(item.payload))
             const sess = state.sessions.get(item.sessId)
             if (sess) {
-              const msg = sess.messages.find(m => m.id === item.msgId)
-              if (msg) { msg.status = 'sent'; updateMsgStatus(msg) }
+              const msg = sess.messages.find((m) => m.id === item.msgId)
+              if (msg) {
+                msg.status = 'sent'
+                updateMsgStatus(msg)
+              }
             }
           } catch {}
           // Queue the next message to send after current response finishes (isFinal)
@@ -1738,29 +2480,42 @@
         }
         sendNext()
         if (queue.length >= 0) {
-          toast(queue.length + ' 条离线消息已发送')
-          state.sendingInFlight = true
-          updateSendEnabled()
-          showTypingIndicator()
-          setTitleBusy(true)
+          toast(`${queue.length} 条离线消息已发送`)
+          // Mark the first queued item's session as sending
+          const firstItem = queue[0] || item
+          const qSess = firstItem ? state.sessions.get(firstItem.sessId) : null
+          if (qSess) qSess._sendingInFlight = true
+          // Only update global UI if queued session is currently visible
+          if (qSess && qSess.id === state.currentSessionId) {
+            state.sendingInFlight = true
+            updateSendEnabled()
+            showTypingIndicator()
+            setTitleBusy(true)
+          }
         }
       }
     }
     // Client-side keepalive: prevent mobile browser from killing WS during long tasks
-    let _wsKeepAlive = setInterval(() => {
-      if (ws.readyState === 1) try { ws.send('{"type":"ping"}') } catch {}
+    const _wsKeepAlive = setInterval(() => {
+      if (ws.readyState === 1)
+        try {
+          ws.send('{"type":"ping"}')
+        } catch {}
     }, 30000)
 
     ws.onclose = (e) => {
       clearInterval(_wsKeepAlive)
       setStatus('disconnected', 'disconnected')
+      // Clear all sessions' sending state on disconnect
+      for (const [, s] of state.sessions) s._sendingInFlight = false
       state.sendingInFlight = false
       updateSendEnabled()
       hideTypingIndicator()
       if (e.code === 1008) {
         localStorage.removeItem('openclaude_token')
         state.token = ''
-        showLogin(); return
+        showLogin()
+        return
       }
       if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
       state.reconnectTimer = setTimeout(connect, 2000)
@@ -1776,20 +2531,21 @@
   function formatMeta(m) {
     if (!m) return ''
     const parts = []
-    if (typeof m.cost === 'number') parts.push('$' + m.cost.toFixed(4))
-    if (typeof m.totalCost === 'number' && m.totalCost !== m.cost) parts.push('total $' + m.totalCost.toFixed(4))
-    if (typeof m.inputTokens === 'number') parts.push('in ' + m.inputTokens)
-    if (typeof m.outputTokens === 'number') parts.push('out ' + m.outputTokens)
-    if (m.cacheReadTokens > 0) parts.push('cache-r ' + m.cacheReadTokens)
-    if (m.cacheCreationTokens > 0) parts.push('cache-w ' + m.cacheCreationTokens)
-    if (typeof m.turn === 'number') parts.push('T' + m.turn)
+    if (typeof m.cost === 'number') parts.push(`$${m.cost.toFixed(4)}`)
+    if (typeof m.totalCost === 'number' && m.totalCost !== m.cost)
+      parts.push(`total $${m.totalCost.toFixed(4)}`)
+    if (typeof m.inputTokens === 'number') parts.push(`in ${m.inputTokens}`)
+    if (typeof m.outputTokens === 'number') parts.push(`out ${m.outputTokens}`)
+    if (m.cacheReadTokens > 0) parts.push(`cache-r ${m.cacheReadTokens}`)
+    if (m.cacheCreationTokens > 0) parts.push(`cache-w ${m.cacheCreationTokens}`)
+    if (typeof m.turn === 'number') parts.push(`T${m.turn}`)
     return parts.join(' · ')
   }
   function buildToolUseLabel(block) {
     const name = block.toolName || 'unknown'
     const preview = (block.inputPreview || '').trim()
     const ellipsis = block.partial && preview ? ' …' : ''
-    const body = preview ? '  ' + preview + ellipsis : block.partial ? '  …' : ''
+    const body = preview ? `  ${preview}${ellipsis}` : block.partial ? '  …' : ''
     return name + body
   }
   function handleOutbound(frame) {
@@ -1799,7 +2555,7 @@
       enqueuePermission(frame)
       return
     }
-    const peerId = frame.peer && frame.peer.id
+    const peerId = frame.peer?.id
     let sess = state.sessions.get(peerId)
     // If session not found (e.g. proactive push from cron/reminder), show in current active session
     if (!sess) {
@@ -1807,12 +2563,19 @@
       if (!sess) return
     }
     if (!sess._blockIdToMsgId) sess._blockIdToMsgId = new Map()
-    // Any output → hide typing indicator
-    if ((frame.blocks?.length || 0) > 0 || frame.isFinal) hideTypingIndicator()
+    // Any output → hide typing indicator ONLY if this is the currently viewed session
+    if (((frame.blocks?.length || 0) > 0 || frame.isFinal) && sess.id === state.currentSessionId)
+      hideTypingIndicator()
     // Update last user message status: first block = "read", isFinal = "replied"
-    const _lastUserMsg = [...sess.messages].reverse().find(m => m.role === 'user' && m.status && m.status !== 'replied')
+    const _lastUserMsg = [...sess.messages]
+      .reverse()
+      .find((m) => m.role === 'user' && m.status && m.status !== 'replied')
     if (_lastUserMsg) {
-      if (frame.blocks?.length > 0 && _lastUserMsg.status !== 'read' && _lastUserMsg.status !== 'replied') {
+      if (
+        frame.blocks?.length > 0 &&
+        _lastUserMsg.status !== 'read' &&
+        _lastUserMsg.status !== 'replied'
+      ) {
         _lastUserMsg.status = 'read'
         updateMsgStatus(_lastUserMsg)
       }
@@ -1833,7 +2596,7 @@
           requestAnimationFrame(() => {
             sess._streamRafPending = false
             if (sess._streamingAssistant) {
-              updateMessage(sess, sess._streamingAssistant, sess._streamingAssistant.text)
+              updateMessage(sess, sess._streamingAssistant, sess._streamingAssistant.text, true)
               scrollBottom()
             }
           })
@@ -1846,7 +2609,7 @@
           requestAnimationFrame(() => {
             sess._thinkRafPending = false
             if (sess._streamingThinking) {
-              updateMessage(sess, sess._streamingThinking, sess._streamingThinking.text)
+              updateMessage(sess, sess._streamingThinking, sess._streamingThinking.text, true)
               scrollBottom()
             }
           })
@@ -1862,16 +2625,28 @@
           if (!sess._agentGroups) sess._agentGroups = new Map()
           if (block.blockId && !sess._agentGroups.has(block.blockId)) {
             const desc = (block.inputPreview || '').replace(/[{}"]/g, '').slice(0, 80) || '子任务'
-            const groupMsg = addMessage(sess, 'agent-group', desc, { blockId: block.blockId, toolName: 'Agent', startTime: Date.now(), childBlocks: [] })
+            const groupMsg = addMessage(sess, 'agent-group', desc, {
+              blockId: block.blockId,
+              toolName: 'Agent',
+              startTime: Date.now(),
+              childBlocks: [],
+            })
             sess._agentGroups.set(block.blockId, groupMsg.id)
             if (block.blockId) sess._blockIdToMsgId.set(block.blockId, groupMsg.id)
           }
         } else if (block.blockId && sess._blockIdToMsgId.has(block.blockId)) {
           const mid = sess._blockIdToMsgId.get(block.blockId)
           const existing = sess.messages.find((m) => m.id === mid)
-          if (existing) { existing.text = label; if (sess.id === state.currentSessionId) updateMessageEl(existing) }
+          if (existing) {
+            existing.text = label
+            if (sess.id === state.currentSessionId) updateMessageEl(existing)
+          }
         } else {
-          const m = addMessage(sess, 'tool', label, { toolIcon: '🔧', toolName: block.toolName, blockId: block.blockId })
+          const m = addMessage(sess, 'tool', label, {
+            toolIcon: '🔧',
+            toolName: block.toolName,
+            blockId: block.blockId,
+          })
           if (block.blockId) sess._blockIdToMsgId.set(block.blockId, m.id)
         }
       } else if (block.kind === 'tool_result') {
@@ -1882,7 +2657,7 @@
         const isAgentResult = /^Agent$/i.test(block.toolName || '')
         if (isAgentResult && block.blockId && sess._agentGroups?.has(block.blockId)) {
           const groupMsgId = sess._agentGroups.get(block.blockId)
-          const groupMsg = sess.messages.find(m => m.id === groupMsgId)
+          const groupMsg = sess.messages.find((m) => m.id === groupMsgId)
           if (groupMsg) {
             groupMsg._completed = true
             groupMsg._duration = Date.now() - (groupMsg.startTime || Date.now())
@@ -1894,7 +2669,7 @@
         }
 
         if (!block.preview) continue
-        const label = (block.toolName ? block.toolName + ': ' : '') + block.preview
+        const label = (block.toolName ? `${block.toolName}: ` : '') + block.preview
         if (block.blockId && sess._blockIdToMsgId.has(block.blockId)) {
           const mid = sess._blockIdToMsgId.get(block.blockId)
           const existing = sess.messages.find((m) => m.id === mid)
@@ -1905,7 +2680,12 @@
             continue
           }
         }
-        const m = addMessage(sess, 'tool', label, { toolIcon: block.isError ? '⚠️' : '↳', toolName: block.toolName, blockId: block.blockId, error: !!block.isError })
+        const m = addMessage(sess, 'tool', label, {
+          toolIcon: block.isError ? '⚠️' : '↳',
+          toolName: block.toolName,
+          blockId: block.blockId,
+          error: !!block.isError,
+        })
         if (block.blockId) sess._blockIdToMsgId.set(block.blockId, m.id)
       }
     }
@@ -1913,9 +2693,17 @@
     if (frame.isFinal) {
       const metaText = formatMeta(frame.meta)
       if (metaText && sess._streamingAssistant) setMeta(sess, sess._streamingAssistant, metaText)
+      // Final rich render: re-render all streaming messages with full Markdown/Mermaid/Chart
+      if (sess._streamingAssistant && sess.id === state.currentSessionId) {
+        updateMessageEl(sess._streamingAssistant, false)
+        processRichBlocks()
+      }
+      if (sess._streamingThinking && sess.id === state.currentSessionId) {
+        updateMessageEl(sess._streamingThinking, false)
+      }
       const lastAssistant = [...sess.messages].reverse().find((m) => m.role === 'assistant')
       const preview = lastAssistant?.text?.replace(/[`*_#>]/g, '').trim() || ''
-      if (preview) maybeNotify('OpenClaude · ' + sess.title, preview)
+      if (preview) maybeNotify(`OpenClaude · ${sess.title}`, preview)
       sess._streamingAssistant = null
       sess._streamingThinking = null
       sess._sendingInFlight = false
@@ -1927,7 +2715,7 @@
         setTitleBusy(false)
       }
       // Complete any bg tasks linked to this session's last user message
-      const lastUser = [...sess.messages].reverse().find(m => m.role === 'user')
+      const lastUser = [...sess.messages].reverse().find((m) => m.role === 'user')
       if (lastUser?.text?.startsWith('🔄 [后台]')) {
         // Find bg task by matching the idempotencyKey pattern
         for (const [id, t] of _bgTasks) {
@@ -1963,11 +2751,11 @@
     // Notify if tab not focused
     if (!state.windowFocused) {
       _notifSound()
-      toast((status === 'done' ? '✓' : '✗') + ' 后台任务完成: ' + t.desc)
+      toast(`${status === 'done' ? '✓' : '✗'} 后台任务完成: ${t.desc}`)
     }
   }
   function _updateTasksBadge() {
-    const running = [..._bgTasks.values()].filter(t => t.status === 'running').length
+    const running = [..._bgTasks.values()].filter((t) => t.status === 'running').length
     const btn = $('tasks-btn')
     const badge = $('tasks-badge')
     if (!btn) return
@@ -1997,15 +2785,10 @@
     for (const [id, t] of sorted) {
       const iconCls = t.status === 'running' ? 'running' : t.status === 'done' ? 'done' : 'failed'
       const iconChar = t.status === 'running' ? '⟳' : t.status === 'done' ? '✓' : '✗'
-      const dur = t.duration ? ' · ' + (t.duration / 1000).toFixed(1) + 's' : ''
+      const dur = t.duration ? ` · ${(t.duration / 1000).toFixed(1)}s` : ''
       const item = document.createElement('div')
       item.className = 'tasks-panel-item'
-      item.innerHTML =
-        '<span class="tasks-panel-icon ' + iconCls + '">' + iconChar + '</span>' +
-        '<div class="tasks-panel-info">' +
-          '<div class="tasks-panel-desc">' + htmlSafeEscape(t.desc) + '</div>' +
-          '<div class="tasks-panel-meta">' + t.status + dur + '</div>' +
-        '</div>'
+      item.innerHTML = `<span class="tasks-panel-icon ${iconCls}">${iconChar}</span><div class="tasks-panel-info"><div class="tasks-panel-desc">${htmlSafeEscape(t.desc)}</div><div class="tasks-panel-meta">${t.status}${dur}</div></div>`
       panel.appendChild(item)
     }
     return panel
@@ -2032,44 +2815,110 @@
   }
 
   const slashCommands = [
-    { cmd: '/help', desc: '显示所有可用命令', run() {
-      const lines = ['**可用命令:**', '']
-      for (const c of slashCommands) lines.push('`' + c.cmd + '` — ' + c.desc)
-      lines.push('', '也可以用 `' + _mod + 'K` 打开命令面板')
-      addSystemMessage(lines.join('\n'))
-    }},
-    { cmd: '/new', desc: '新建会话', run() { createNewChat() } },
-    { cmd: '/clear', desc: '清空当前会话消息', run() {
-      const sess = getSession()
-      if (!sess) return
-      sess.messages = []; renderMessages(); scheduleSave(sess)
-      toast('会话已清空')
-    }},
-    { cmd: '/stop', desc: '停止当前生成', run() {
-      const sess = getSession()
-      if (!sess || !state.ws) return
-      state.ws.send(JSON.stringify({
-        type: 'inbound.control.stop',
-        channel: 'webchat',
-        peer: { id: sess.id, kind: 'dm' },
-        agentId: sess.agentId || state.defaultAgentId,
-      }))
-      state.sendingInFlight = false; updateSendEnabled(); hideTypingIndicator()
-      toast('已发送停止信号')
-    }},
-    { cmd: '/memory', desc: '打开记忆管理', run() { openMemoryModal() } },
-    { cmd: '/skills', desc: '打开技能管理', run() { openSkillsModal() } },
-    { cmd: '/persona', desc: '编辑 agent 人格', run() { const sess = getSession(); openPersonaEditor(sess?.agentId || state.defaultAgentId) } },
-    { cmd: '/theme', desc: '切换主题', run() { cycleTheme() } },
-    { cmd: '/config', desc: '查看当前配置 (调试)', async run() {
-      (async () => {
-        try {
-          const r = await fetch('/api/config', { headers: { Authorization: 'Bearer ' + state.token } })
-          const cfg = await r.json()
-          addSystemMessage('**当前配置:**\n```json\n' + JSON.stringify(cfg, null, 2) + '\n```')
-        } catch { toast('获取配置失败', 'error') }
-      })()
-    }},
+    {
+      cmd: '/help',
+      desc: '显示所有可用命令',
+      run() {
+        const lines = ['**可用命令:**', '']
+        for (const c of slashCommands) lines.push(`\`${c.cmd}\` — ${c.desc}`)
+        lines.push('', `也可以用 \`${_mod}K\` 打开命令面板`)
+        addSystemMessage(lines.join('\n'))
+      },
+    },
+    {
+      cmd: '/new',
+      desc: '新建会话',
+      run() {
+        createNewChat()
+      },
+    },
+    {
+      cmd: '/clear',
+      desc: '清空当前会话消息',
+      run() {
+        const sess = getSession()
+        if (!sess) return
+        sess.messages = []
+        renderMessages()
+        scheduleSave(sess)
+        toast('会话已清空')
+      },
+    },
+    {
+      cmd: '/stop',
+      desc: '停止当前生成',
+      run() {
+        const sess = getSession()
+        if (!sess || !state.ws) return
+        state.ws.send(
+          JSON.stringify({
+            type: 'inbound.control.stop',
+            channel: 'webchat',
+            peer: { id: sess.id, kind: 'dm' },
+            agentId: sess.agentId || state.defaultAgentId,
+          }),
+        )
+        sess._sendingInFlight = false
+        state.sendingInFlight = false
+        updateSendEnabled()
+        hideTypingIndicator()
+        setTitleBusy(false)
+        toast('已发送停止信号')
+      },
+    },
+    {
+      cmd: '/memory',
+      desc: '打开记忆管理',
+      run() {
+        openMemoryModal()
+      },
+    },
+    {
+      cmd: '/skills',
+      desc: '打开技能管理',
+      run() {
+        openSkillsModal()
+      },
+    },
+    {
+      cmd: '/persona',
+      desc: '编辑 agent 人格',
+      run() {
+        const sess = getSession()
+        openPersonaEditor(sess?.agentId || state.defaultAgentId)
+      },
+    },
+    {
+      cmd: '/tasks',
+      desc: '管理定时任务',
+      run() {
+        openTasksModal()
+      },
+    },
+    {
+      cmd: '/theme',
+      desc: '切换主题',
+      run() {
+        cycleTheme()
+      },
+    },
+    {
+      cmd: '/config',
+      desc: '查看当前配置 (调试)',
+      async run() {
+        ;(async () => {
+          try {
+            const r = await fetch('/api/config', {
+              headers: { Authorization: `Bearer ${state.token}` },
+            })
+            const cfg = await r.json()
+            addSystemMessage(`**当前配置:**\n\`\`\`json\n${JSON.stringify(cfg, null, 2)}\n\`\`\``)
+          } catch {
+            toast('获取配置失败', 'error')
+          }
+        })()
+      },
+    },
   ]
 
   function handleSlashCommand(text) {
@@ -2077,9 +2926,9 @@
     if (!parts) return false
     const cmdName = parts[1].toLowerCase()
     const args = parts[2] || ''
-    const cmd = slashCommands.find(c => c.cmd === cmdName)
+    const cmd = slashCommands.find((c) => c.cmd === cmdName)
     if (!cmd) {
-      addSystemMessage('未知命令: `' + cmdName + '`。输入 `/help` 查看可用命令。')
+      addSystemMessage(`未知命令: \`${cmdName}\`。输入 \`/help\` 查看可用命令。`)
       return true
     }
     cmd.run(args)
@@ -2101,8 +2950,13 @@
       document.querySelector('.composer').appendChild(popup)
     }
     const q = filter.toLowerCase().slice(1) // remove leading /
-    _slashMatches = slashCommands.filter(c => !q || c.cmd.slice(1).includes(q) || c.desc.includes(q))
-    if (_slashMatches.length === 0) { hideSlashPopup(); return }
+    _slashMatches = slashCommands.filter(
+      (c) => !q || c.cmd.slice(1).includes(q) || c.desc.includes(q),
+    )
+    if (_slashMatches.length === 0) {
+      hideSlashPopup()
+      return
+    }
     _slashSelected = 0
     _renderSlashPopup(popup)
     popup.hidden = false
@@ -2113,18 +2967,17 @@
     popup.innerHTML = '<div class="slash-popup-header">命令</div>'
     _slashMatches.forEach((c, i) => {
       const item = document.createElement('div')
-      item.className = 'slash-popup-item' + (i === _slashSelected ? ' active' : '')
-      item.innerHTML =
-        '<div class="slash-item-left">' +
-          '<span class="slash-cmd">' + c.cmd + '</span>' +
-        '</div>' +
-        '<span class="slash-desc">' + c.desc + '</span>'
+      item.className = `slash-popup-item${i === _slashSelected ? ' active' : ''}`
+      item.innerHTML = `<div class="slash-item-left"><span class="slash-cmd">${c.cmd}</span></div><span class="slash-desc">${c.desc}</span>`
       item.onmouseenter = () => {
         _slashSelected = i
-        popup.querySelectorAll('.slash-popup-item').forEach((el, j) => el.classList.toggle('active', j === i))
+        popup
+          .querySelectorAll('.slash-popup-item')
+          .forEach((el, j) => el.classList.toggle('active', j === i))
       }
       item.onclick = (e) => {
-        e.preventDefault(); e.stopPropagation()
+        e.preventDefault()
+        e.stopPropagation()
         _selectSlashItem(c)
       }
       popup.appendChild(item)
@@ -2134,13 +2987,24 @@
   function _selectSlashItem(c) {
     // For commands that take args, put cursor after the space
     // For commands that don't, execute immediately
-    const noArgCmds = ['/help', '/new', '/clear', '/stop', '/memory', '/skills', '/persona', '/theme', '/config']
+    const noArgCmds = [
+      '/help',
+      '/new',
+      '/clear',
+      '/stop',
+      '/memory',
+      '/skills',
+      '/persona',
+      '/tasks',
+      '/theme',
+      '/config',
+    ]
     if (noArgCmds.includes(c.cmd)) {
       $('input').value = c.cmd
       hideSlashPopup()
       send()
     } else {
-      $('input').value = c.cmd + ' '
+      $('input').value = `${c.cmd} `
       $('input').focus()
       hideSlashPopup()
     }
@@ -2159,34 +3023,68 @@
     if (!m) return ''
     const ext = m[1].toLowerCase()
     const map = {
-      js: 'javascript', ts: 'typescript', tsx: 'typescript', py: 'python',
-      go: 'go', rs: 'rust', java: 'java', c: 'c', cpp: 'cpp', h: 'c',
-      md: 'markdown', json: 'json', yml: 'yaml', yaml: 'yaml',
-      sh: 'bash', bash: 'bash', html: 'html', css: 'css', sql: 'sql',
-      xml: 'xml', toml: 'ini', ini: 'ini',
+      js: 'javascript',
+      ts: 'typescript',
+      tsx: 'typescript',
+      py: 'python',
+      go: 'go',
+      rs: 'rust',
+      java: 'java',
+      c: 'c',
+      cpp: 'cpp',
+      h: 'c',
+      md: 'markdown',
+      json: 'json',
+      yml: 'yaml',
+      yaml: 'yaml',
+      sh: 'bash',
+      bash: 'bash',
+      html: 'html',
+      css: 'css',
+      sql: 'sql',
+      xml: 'xml',
+      toml: 'ini',
+      ini: 'ini',
     }
     return map[ext] || ''
   }
+  const MAX_INLINE_TEXT_CHARS = 30000 // ~30K chars inline, larger files get truncated
+
   function buildMessageText(userText, attachments) {
     if (!attachments || attachments.length === 0) return userText
     const parts = [userText]
     const textFiles = attachments.filter((a) => a.kind === 'text')
     if (textFiles.length > 0) {
-      parts.push(''); parts.push('---'); parts.push('Attached files:')
+      parts.push('')
+      parts.push('---')
+      parts.push('Attached files:')
       for (const a of textFiles) {
         const lang = inferLangFromExt(a.name)
+        const content = a.text || ''
+        const truncated = content.length > MAX_INLINE_TEXT_CHARS
         parts.push('')
-        parts.push('### ' + a.name + '  _(' + formatSize(a.size) + ')_')
-        parts.push('```' + lang)
-        parts.push(a.text || '')
+        parts.push(`### ${a.name}  _(${formatSize(a.size)})_`)
+        parts.push(`\`\`\`${lang}`)
+        parts.push(truncated ? content.slice(0, MAX_INLINE_TEXT_CHARS) : content)
         parts.push('```')
+        if (truncated) {
+          parts.push(
+            `_(truncated: showing first ${MAX_INLINE_TEXT_CHARS} of ${content.length} chars)_`,
+          )
+        }
       }
     }
     const imageFiles = attachments.filter((a) => a.kind === 'image')
     if (imageFiles.length > 0) {
-      parts.push(''); parts.push('---'); parts.push('Attached images (' + imageFiles.length + '):')
-      for (const im of imageFiles) parts.push('- ' + im.name + '  _(' + im.type + ', ' + formatSize(im.size) + ')_')
-      parts.push(''); parts.push('_(note: if you cannot see the image contents directly, tell the user so they can describe it)_')
+      parts.push('')
+      parts.push('---')
+      parts.push(`Attached images (${imageFiles.length}):`)
+      for (const im of imageFiles)
+        parts.push(`- ${im.name}  _(${im.type}, ${formatSize(im.size)})_`)
+      parts.push('')
+      parts.push(
+        '_(note: if you cannot see the image contents directly, tell the user so they can describe it)_',
+      )
     }
     return parts.join('\n')
   }
@@ -2204,14 +3102,23 @@
     }
     const sess = getSession()
     if (!sess) return
-    const displayText = (text || '(file upload)') + (state.attachments.length > 0 ? '\n\n📎 ' + state.attachments.map((a) => a.name).join(', ') : '')
+    const displayText =
+      (text || '(file upload)') +
+      (state.attachments.length > 0
+        ? `\n\n📎 ${state.attachments.map((a) => a.name).join(', ')}`
+        : '')
     const modelText = buildMessageText(text, state.attachments)
-    const media = state.attachments.filter((a) => a.kind !== 'text').map((a) => ({
-      kind: a.kind, base64: a.dataUrl, mimeType: a.type, filename: a.name,
-    }))
+    const media = state.attachments
+      .filter((a) => a.kind !== 'text')
+      .map((a) => ({
+        kind: a.kind,
+        base64: a.dataUrl,
+        mimeType: a.type,
+        filename: a.name,
+      }))
     const wsPayload = {
       type: 'inbound.message',
-      idempotencyKey: 'web-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+      idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       channel: 'webchat',
       peer: { id: sess.id, kind: 'dm' },
       agentId: sess.agentId || state.defaultAgentId,
@@ -2248,28 +3155,108 @@
   function autoResize() {
     const el = $('input')
     el.style.height = 'auto'
-    el.style.height = Math.min(window.innerHeight * 0.35, el.scrollHeight) + 'px'
+    el.style.height = `${Math.min(window.innerHeight * 0.35, el.scrollHeight)}px`
   }
 
   // ═══════════════ COMMAND PALETTE ═══════════════
   const paletteActions = [
-    { id: 'new-chat', label: '新建会话', kbd: _mod + 'N', section: '动作', icon: 'plus', run: () => { createNewChat(); closePalette() } },
-    { id: 'toggle-sidebar', label: '切换侧栏', kbd: _mod + 'B', section: '动作', icon: 'menu', run: () => { $('sidebar').classList.toggle('open'); $('sidebar-backdrop').classList.toggle('open'); closePalette() } },
-    { id: 'open-memory', label: '查看 / 编辑 Memory', kbd: _mod + 'M', section: '学习循环', icon: 'brain', run: () => { closePalette(); openMemoryModal() } },
-    { id: 'open-skills', label: '查看 / 管理 Skills', section: '学习循环', icon: 'bot', run: () => { closePalette(); openSkillsModal() } },
-    { id: 'manage-agents', label: '管理 Agents', section: '动作', icon: 'settings', run: () => { closePalette(); openModal('agents-modal') } },
-    { id: 'theme-cycle', label: '切换主题', section: '设置', icon: 'sun', run: () => { cycleTheme(); closePalette() } },
-    { id: 'logout', label: '退出登录', section: '设置', icon: 'logout', run: () => { $('logout-btn').click(); closePalette() } },
+    {
+      id: 'new-chat',
+      label: '新建会话',
+      kbd: `${_mod}N`,
+      section: '动作',
+      icon: 'plus',
+      run: () => {
+        createNewChat()
+        closePalette()
+      },
+    },
+    {
+      id: 'toggle-sidebar',
+      label: '切换侧栏',
+      kbd: `${_mod}B`,
+      section: '动作',
+      icon: 'menu',
+      run: () => {
+        $('sidebar').classList.toggle('open')
+        $('sidebar-backdrop').classList.toggle('open')
+        closePalette()
+      },
+    },
+    {
+      id: 'open-memory',
+      label: '查看 / 编辑 Memory',
+      kbd: `${_mod}M`,
+      section: '学习循环',
+      icon: 'brain',
+      run: () => {
+        closePalette()
+        openMemoryModal()
+      },
+    },
+    {
+      id: 'open-skills',
+      label: '查看 / 管理 Skills',
+      section: '学习循环',
+      icon: 'bot',
+      run: () => {
+        closePalette()
+        openSkillsModal()
+      },
+    },
+    {
+      id: 'open-tasks',
+      label: '定时任务 / 提醒',
+      section: '学习循环',
+      icon: 'clock',
+      run: () => {
+        closePalette()
+        openTasksModal()
+      },
+    },
+    {
+      id: 'manage-agents',
+      label: '管理 Agents',
+      section: '动作',
+      icon: 'settings',
+      run: () => {
+        closePalette()
+        openModal('agents-modal')
+      },
+    },
+    {
+      id: 'theme-cycle',
+      label: '切换主题',
+      section: '设置',
+      icon: 'sun',
+      run: () => {
+        cycleTheme()
+        closePalette()
+      },
+    },
+    {
+      id: 'logout',
+      label: '退出登录',
+      section: '设置',
+      icon: 'logout',
+      run: () => {
+        $('logout-btn').click()
+        closePalette()
+      },
+    },
   ]
   const ICON_SVG = {
     plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>',
     menu: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>',
-    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4"/></svg>',
+    settings:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4"/></svg>',
     sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/></svg>',
-    logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
+    logout:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
     bot: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>',
     chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
-    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg>',
+    brain:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg>',
   }
   let paletteItems = []
   let paletteSelected = 0
@@ -2284,13 +3271,21 @@
     }
     // Agents
     for (const a of state.agentsList) {
-      const label = '切换 agent → ' + a.id
+      const label = `切换 agent → ${a.id}`
       if (!q || label.toLowerCase().includes(q) || a.id.toLowerCase().includes(q)) {
         items.push({
-          id: 'switch-agent-' + a.id, label, section: 'Agents', icon: 'bot',
+          id: `switch-agent-${a.id}`,
+          label,
+          section: 'Agents',
+          icon: 'bot',
           run: () => {
             const sess = getSession()
-            if (sess) { sess.agentId = a.id; scheduleSave(sess); renderAgentDropdown(); toast('已切换到 ' + a.id) }
+            if (sess) {
+              sess.agentId = a.id
+              scheduleSave(sess)
+              renderAgentDropdown()
+              toast(`已切换到 ${a.id}`)
+            }
             closePalette()
           },
         })
@@ -2301,8 +3296,15 @@
     for (const s of sessions) {
       if (!q || s.title.toLowerCase().includes(q)) {
         items.push({
-          id: 'switch-session-' + s.id, label: s.title, hint: shortTime(s.lastAt),
-          section: '会话', icon: 'chat', run: () => { switchSession(s.id); closePalette() },
+          id: `switch-session-${s.id}`,
+          label: s.title,
+          hint: shortTime(s.lastAt),
+          section: '会话',
+          icon: 'chat',
+          run: () => {
+            switchSession(s.id)
+            closePalette()
+          },
         })
       }
     }
@@ -2318,21 +3320,22 @@
     let lastSection = null
     paletteItems.forEach((item, idx) => {
       if (item.section !== lastSection) {
-        const label = document.createElement('div'); label.className = 'palette-section-label'; label.textContent = item.section
-        list.appendChild(label); lastSection = item.section
+        const label = document.createElement('div')
+        label.className = 'palette-section-label'
+        label.textContent = item.section
+        list.appendChild(label)
+        lastSection = item.section
       }
       const btn = document.createElement('button')
-      btn.className = 'palette-item' + (idx === paletteSelected ? ' active' : '')
+      btn.className = `palette-item${idx === paletteSelected ? ' active' : ''}`
       btn.type = 'button'
-      btn.innerHTML =
-        (ICON_SVG[item.icon] || '') +
-        '<span class="palette-item-label">' + htmlSafeEscape(item.label) + '</span>' +
-        (item.hint ? '<span class="palette-item-hint">' + htmlSafeEscape(item.hint) + '</span>' : '') +
-        (item.kbd ? '<span class="palette-item-hint">' + item.kbd + '</span>' : '')
+      btn.innerHTML = `${ICON_SVG[item.icon] || ''}<span class="palette-item-label">${htmlSafeEscape(item.label)}</span>${item.hint ? `<span class="palette-item-hint">${htmlSafeEscape(item.hint)}</span>` : ''}${item.kbd ? `<span class="palette-item-hint">${item.kbd}</span>` : ''}`
       btn.onclick = () => item.run()
       btn.onmouseenter = () => {
         paletteSelected = idx
-        document.querySelectorAll('.palette-item').forEach((e, i) => e.classList.toggle('active', i === idx))
+        document
+          .querySelectorAll('.palette-item')
+          .forEach((e, i) => e.classList.toggle('active', i === idx))
       }
       list.appendChild(btn)
     })
@@ -2362,14 +3365,19 @@
     fetch('/api/auth/session', { method: 'POST', headers: authHeaders() }).catch(() => {})
   }
   function createNewChat() {
-    createSession(state.defaultAgentId)
-    renderSidebar(); renderMessages(); renderAgentDropdown()
+    // Inherit current session's agent, fallback to default
+    const currentSess = getSession()
+    const agentId = currentSess?.agentId || state.defaultAgentId
+    createSession(agentId)
+    renderSidebar()
+    renderMessages()
+    renderAgentDropdown()
     // Close sidebar on mobile
     $('sidebar').classList.remove('open')
     $('sidebar-backdrop').classList.remove('open')
     // Show agent greeting if configured
     const sess = getSession()
-    const agentInfo = state.agentsList.find(a => a.id === (sess?.agentId || state.defaultAgentId))
+    const agentInfo = state.agentsList.find((a) => a.id === (sess?.agentId || state.defaultAgentId))
     if (agentInfo?.greeting && sess) {
       addMessage(sess, 'assistant', agentInfo.greeting, { system: true })
       scheduleSave(sess)
@@ -2386,7 +3394,18 @@
       e.stopPropagation()
       const panel = _renderTasksPanel()
       panel.hidden = !panel.hidden
-      if (!panel.hidden) setTimeout(() => document.addEventListener('click', () => { panel.hidden = true }, { once: true }), 10)
+      if (!panel.hidden)
+        setTimeout(
+          () =>
+            document.addEventListener(
+              'click',
+              () => {
+                panel.hidden = true
+              },
+              { once: true },
+            ),
+          10,
+        )
     }
     $('sidebar-search').addEventListener('input', () => {
       clearTimeout(_searchDebounce)
@@ -2394,21 +3413,31 @@
     })
     // Replace hardcoded ⌘ in HTML with platform-appropriate modifier
     if (!_isMac) {
-      document.querySelectorAll('.kbd, kbd').forEach(el => {
+      document.querySelectorAll('.kbd, kbd').forEach((el) => {
         el.textContent = el.textContent.replace(/⌘/g, 'Ctrl+')
       })
       $('new-chat-btn')?.setAttribute('title', '新建会话 (Ctrl+N)')
     }
     $('new-chat-btn').onclick = createNewChat
-    $('logout-btn').onclick = () => {
+    $('logout-btn').onclick = async () => {
+      // Expire the HttpOnly oc_session cookie on server
+      try {
+        await fetch('/api/auth/logout', { method: 'POST' })
+      } catch {}
       localStorage.removeItem('openclaude_token')
       state.token = ''
       if (state.ws) state.ws.close(1000)
       showLogin()
     }
     $('theme-btn').onclick = cycleTheme
-    $('toggle-sidebar').onclick = () => { $('sidebar').classList.toggle('open'); $('sidebar-backdrop').classList.toggle('open') }
-    $('sidebar-backdrop').onclick = () => { $('sidebar').classList.remove('open'); $('sidebar-backdrop').classList.remove('open') }
+    $('toggle-sidebar').onclick = () => {
+      $('sidebar').classList.toggle('open')
+      $('sidebar-backdrop').classList.toggle('open')
+    }
+    $('sidebar-backdrop').onclick = () => {
+      $('sidebar').classList.remove('open')
+      $('sidebar-backdrop').classList.remove('open')
+    }
     $('agent-select').onchange = (e) => {
       const sess = getSession()
       if (!sess) return
@@ -2416,12 +3445,13 @@
       // Reset streaming state to prevent cross-agent message contamination
       sess._streamingAssistant = null
       sess._streamingThinking = null
+      sess._sendingInFlight = false
       state.sendingInFlight = false
       hideTypingIndicator()
       updateSendEnabled()
       setTitleBusy(false)
       scheduleSave(sess)
-      toast('已切换到 ' + sess.agentId)
+      toast(`已切换到 ${sess.agentId}`)
     }
     // Settings dropdown
     $('manage-agents-btn').onclick = (e) => {
@@ -2429,29 +3459,45 @@
       const dd = $('settings-dropdown')
       dd.hidden = !dd.hidden
       if (!dd.hidden) {
-        setTimeout(() => document.addEventListener('click', () => { dd.hidden = true }, { once: true }), 10)
+        setTimeout(
+          () =>
+            document.addEventListener(
+              'click',
+              () => {
+                dd.hidden = true
+              },
+              { once: true },
+            ),
+          10,
+        )
       }
     }
     document.addEventListener('click', (e) => {
-      const btn = e.target.closest && e.target.closest('[data-settings]')
+      const btn = e.target.closest?.('[data-settings]')
       if (!btn) return
       const action = btn.dataset.settings
       $('settings-dropdown').hidden = true
-      if (action === 'persona') { const sess = getSession(); openPersonaEditor(sess?.agentId || state.defaultAgentId) }
-      else if (action === 'agents') openModal('agents-modal')
+      if (action === 'persona') {
+        const sess = getSession()
+        openPersonaEditor(sess?.agentId || state.defaultAgentId)
+      } else if (action === 'agents') openModal('agents-modal')
       else if (action === 'memory') openMemoryModal()
       else if (action === 'skills') openSkillsModal()
+      else if (action === 'tasks') openTasksModal()
       else if (action === 'theme') cycleTheme()
       else if (action === 'config') {
-        (async () => {
+        ;(async () => {
           try {
-            const r = await fetch('/api/config', { headers: { Authorization: 'Bearer ' + state.token } })
+            const r = await fetch('/api/config', {
+              headers: { Authorization: `Bearer ${state.token}` },
+            })
             const cfg = await r.json()
-            addSystemMessage('**当前配置:**\n```json\n' + JSON.stringify(cfg, null, 2) + '\n```')
-          } catch { toast('获取配置失败', 'error') }
+            addSystemMessage(`**当前配置:**\n\`\`\`json\n${JSON.stringify(cfg, null, 2)}\n\`\`\``)
+          } catch {
+            toast('获取配置失败', 'error')
+          }
         })()
-      }
-      else if (action === 'claude-oauth') openOAuthModal()
+      } else if (action === 'claude-oauth') openOAuthModal()
       else if (action === 'logout') $('logout-btn').click()
     })
     // Memory modal events
@@ -2477,10 +3523,16 @@
     })
     // Drag-drop
     const dropZone = $('messages')
-    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.outline = '2px dashed var(--accent)' })
-    dropZone.addEventListener('dragleave', () => { dropZone.style.outline = '' })
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault()
+      dropZone.style.outline = '2px dashed var(--accent)'
+    })
+    dropZone.addEventListener('dragleave', () => {
+      dropZone.style.outline = ''
+    })
     dropZone.addEventListener('drop', (e) => {
-      e.preventDefault(); dropZone.style.outline = ''
+      e.preventDefault()
+      dropZone.style.outline = ''
       if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files)
     })
     // Input events — single keydown handler for both slash popup and send
@@ -2491,14 +3543,20 @@
           e.preventDefault()
           _slashSelected = Math.min(_slashSelected + 1, _slashMatches.length - 1)
           const popup = $('slash-popup')
-          if (popup) popup.querySelectorAll('.slash-popup-item').forEach((el, i) => el.classList.toggle('active', i === _slashSelected))
+          if (popup)
+            popup
+              .querySelectorAll('.slash-popup-item')
+              .forEach((el, i) => el.classList.toggle('active', i === _slashSelected))
           return
         }
         if (e.key === 'ArrowUp') {
           e.preventDefault()
           _slashSelected = Math.max(_slashSelected - 1, 0)
           const popup = $('slash-popup')
-          if (popup) popup.querySelectorAll('.slash-popup-item').forEach((el, i) => el.classList.toggle('active', i === _slashSelected))
+          if (popup)
+            popup
+              .querySelectorAll('.slash-popup-item')
+              .forEach((el, i) => el.classList.toggle('active', i === _slashSelected))
           return
         }
         if (e.key === 'Tab' || (e.key === 'Enter' && _slashMatches.length > 0)) {
@@ -2528,19 +3586,29 @@
         hideSlashPopup()
       }
     })
-    $('input').addEventListener('blur', () => { setTimeout(hideSlashPopup, 200) })
-    $('send').onclick = () => { if (state.sendingInFlight) stopCurrentTurn(); else send() }
+    $('input').addEventListener('blur', () => {
+      setTimeout(hideSlashPopup, 200)
+    })
+    $('send').onclick = () => {
+      if (state.sendingInFlight) stopCurrentTurn()
+      else send()
+    }
     // Agents modal
     $('create-agent-btn').onclick = async () => {
       const id = $('new-agent-id').value.trim()
       if (!id) return
-      if (!/^[a-zA-Z0-9_-]+$/.test(id)) { toast('非法 id', 'error'); return }
+      if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+        toast('非法 id', 'error')
+        return
+      }
       try {
         await apiJson('POST', '/api/agents', { id })
         $('new-agent-id').value = ''
-        toast('已创建 ' + id, 'success')
+        toast(`已创建 ${id}`, 'success')
         await reloadAgents()
-      } catch (err) { toast(String(err), 'error') }
+      } catch (err) {
+        toast(String(err), 'error')
+      }
     }
     // Login
     $('login-btn').onclick = () => {
@@ -2548,10 +3616,16 @@
       if (!t) return
       state.token = t
       localStorage.setItem('openclaude_token', t)
-      showApp(); renderSidebar(); renderMessages(); connect(); reloadAgents()
+      showApp()
+      renderSidebar()
+      renderMessages()
+      connect()
+      reloadAgents()
       // Don't request notification permission on login — wait until first background notification
     }
-    $('token').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('login-btn').click() })
+    $('token').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') $('login-btn').click()
+    })
     // Palette input
     $('palette-input').addEventListener('input', (e) => {
       paletteItems = buildPaletteItems(e.target.value)
@@ -2559,17 +3633,36 @@
       renderPalette()
     })
     $('palette-input').addEventListener('keydown', (e) => {
-      if (e.key === 'ArrowDown') { e.preventDefault(); if (paletteItems.length) { paletteSelected = (paletteSelected + 1) % paletteItems.length; renderPalette() } }
-      else if (e.key === 'ArrowUp') { e.preventDefault(); if (paletteItems.length) { paletteSelected = (paletteSelected - 1 + paletteItems.length) % paletteItems.length; renderPalette() } }
-      else if (e.key === 'Enter') { e.preventDefault(); paletteItems[paletteSelected]?.run() }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        if (paletteItems.length) {
+          paletteSelected = (paletteSelected + 1) % paletteItems.length
+          renderPalette()
+        }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        if (paletteItems.length) {
+          paletteSelected = (paletteSelected - 1 + paletteItems.length) % paletteItems.length
+          renderPalette()
+        }
+      } else if (e.key === 'Enter') {
+        e.preventDefault()
+        paletteItems[paletteSelected]?.run()
+      }
     })
     // Global shortcuts
     document.addEventListener('keydown', (e) => {
       const mod = e.metaKey || e.ctrlKey
-      if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette() }
-      else if (mod && e.key.toLowerCase() === 'n') { e.preventDefault(); createNewChat() }
-      else if (mod && e.key.toLowerCase() === 'm') { e.preventDefault(); openMemoryModal() }
-      else if (mod && e.key.toLowerCase() === 'b') {
+      if (mod && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        openPalette()
+      } else if (mod && e.key.toLowerCase() === 'n') {
+        e.preventDefault()
+        createNewChat()
+      } else if (mod && e.key.toLowerCase() === 'm') {
+        e.preventDefault()
+        openMemoryModal()
+      } else if (mod && e.key.toLowerCase() === 'b') {
         e.preventDefault()
         $('sidebar').classList.toggle('open')
         $('sidebar-backdrop').classList.toggle('open')
@@ -2579,15 +3672,23 @@
     // Load sessions
     try {
       const all = await dbGetAll()
-      for (const s of all) state.sessions.set(s.id, s)
-    } catch (e) { console.warn('IDB load failed', e) }
+      for (const s of all) {
+        _rebuildSearchIndex(s)
+        state.sessions.set(s.id, s)
+      }
+    } catch (e) {
+      console.warn('IDB load failed', e)
+    }
     const arr = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
     if (arr.length > 0) state.currentSessionId = arr[0].id
     else createSession()
 
     if (state.token) {
       showApp()
-      renderSidebar(); renderMessages(); connect(); reloadAgents()
+      renderSidebar()
+      renderMessages()
+      connect()
+      reloadAgents()
       // Don't request notification permission on login — wait until first background notification
     } else {
       showLogin()
@@ -2606,7 +3707,7 @@
       const s = getSession()
       if (s) updateSessionSub(s)
       // Only update time hints in sidebar, not full rebuild
-      document.querySelectorAll('.session-item .session-time-hint').forEach(el => {
+      document.querySelectorAll('.session-item .session-time-hint').forEach((el) => {
         if (el.dataset.ts) el.textContent = shortTime(Number(el.dataset.ts))
       })
     }, 30000)
@@ -2615,9 +3716,10 @@
   // Debug helper for Mermaid/HTML preview tests
   window.__oc_render = (text) => {
     const inner = ensureInner()
-    const wrap = document.createElement('div'); wrap.className = 'msg assistant'
-    wrap.dataset.msgId = '__oc_debug_' + Date.now()
-    wrap.innerHTML = '<div class="avatar">O</div><div class="msg-body">' + renderMarkdown(text) + '</div>'
+    const wrap = document.createElement('div')
+    wrap.className = 'msg assistant'
+    wrap.dataset.msgId = `__oc_debug_${Date.now()}`
+    wrap.innerHTML = `<div class="avatar">O</div><div class="msg-body">${renderMarkdown(text)}</div>`
     inner.appendChild(wrap)
     processRichBlocks()
   }

@@ -18,7 +18,9 @@ export interface FeishuConfig {
 export function feishuChannelFactory(_cfg: FeishuConfig): ChannelAdapter {
   let ctx: ChannelContext | null = null
   return {
+    id: 'feishu',
     name: 'feishu',
+    type: 'channel' as const,
     async init(c) {
       ctx = c
       c.log.info('feishu channel stub initialized (TODO: implement)')

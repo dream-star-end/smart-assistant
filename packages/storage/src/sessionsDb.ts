@@ -10,9 +10,9 @@
 // assistant_text) for the turn into sessions_fts. Queries use MATCH and
 // group hits by session_id to return top-N unique sessions.
 
-import Database from 'better-sqlite3'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import Database from 'better-sqlite3'
 import { paths } from './paths.js'
 
 let _db: Database.Database | null = null
@@ -47,10 +47,14 @@ export async function getSessionsDb(): Promise<Database.Database> {
   `)
   // Periodic WAL checkpoint to prevent unbounded WAL growth
   setInterval(() => {
-    try { db.pragma('wal_checkpoint(TRUNCATE)') } catch {}
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)')
+    } catch {}
   }, 30 * 60_000) // every 30 min
   // Run one immediately
-  try { db.pragma('wal_checkpoint(TRUNCATE)') } catch {}
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)')
+  } catch {}
 
   _db = db
   return db
@@ -88,7 +92,9 @@ export async function indexTurn(
   assistantText: string,
 ): Promise<void> {
   const db = await getSessionsDb()
-  const stmt = db.prepare(`INSERT INTO sessions_fts (session_id, turn_idx, role, content) VALUES (?, ?, ?, ?)`)
+  const stmt = db.prepare(
+    'INSERT INTO sessions_fts (session_id, turn_idx, role, content) VALUES (?, ?, ?, ?)',
+  )
   if (userText) stmt.run(sessionId, turnIdx, 'user', userText)
   if (assistantText) stmt.run(sessionId, turnIdx, 'assistant', assistantText)
 }
@@ -105,12 +111,17 @@ export interface SearchHit {
 }
 
 // Returns top-N unique sessions with a snippet of the best-matching turn.
-export async function searchSessions(query: string, limit = 5): Promise<SearchHit[]> {
+export async function searchSessions(
+  query: string,
+  limit = 5,
+  agentId?: string,
+): Promise<SearchHit[]> {
   const db = await getSessionsDb()
-  // Escape FTS5 special chars
   const cleanQuery = query.replace(/["()*]/g, ' ').trim()
   if (!cleanQuery) return []
-  // FTS5 bm25 score (lower is better), snippet with 10 word window
+  // If agentId provided, filter at SQL level for correctness
+  const agentFilter = agentId ? 'AND m.agent_id = ?' : ''
+  const params = agentId ? [cleanQuery, agentId, limit * 4] : [cleanQuery, limit * 4]
   const rows = db
     .prepare(
       `
@@ -127,21 +138,22 @@ export async function searchSessions(query: string, limit = 5): Promise<SearchHi
     FROM sessions_fts f
     LEFT JOIN sessions_meta m ON m.id = f.session_id
     WHERE sessions_fts MATCH ?
+    ${agentFilter}
     ORDER BY score
     LIMIT ?
   `,
     )
-    .all(cleanQuery, limit * 4) as Array<{
-      session_id: string
-      turn_idx: number
-      snippet: string
-      score: number
-      agent_id: string | null
-      channel: string | null
-      peer_id: string | null
-      title: string | null
-      last_at: number | null
-    }>
+    .all(...params) as Array<{
+    session_id: string
+    turn_idx: number
+    snippet: string
+    score: number
+    agent_id: string | null
+    channel: string | null
+    peer_id: string | null
+    title: string | null
+    last_at: number | null
+  }>
 
   // Dedupe to top-N unique sessions
   const seen = new Set<string>()
@@ -165,10 +177,14 @@ export async function searchSessions(query: string, limit = 5): Promise<SearchHi
 }
 
 // Load all turns of a given session ordered by turn_idx (for second-pass summarization)
-export async function loadSessionTurns(sessionId: string): Promise<Array<{ role: string; content: string; turnIdx: number }>> {
+export async function loadSessionTurns(
+  sessionId: string,
+): Promise<Array<{ role: string; content: string; turnIdx: number }>> {
   const db = await getSessionsDb()
   const rows = db
-    .prepare(`SELECT turn_idx, role, content FROM sessions_fts WHERE session_id = ? ORDER BY turn_idx, rowid`)
+    .prepare(
+      'SELECT turn_idx, role, content FROM sessions_fts WHERE session_id = ? ORDER BY turn_idx, rowid',
+    )
     .all(sessionId) as Array<{ turn_idx: number; role: string; content: string }>
   return rows.map((r) => ({ turnIdx: r.turn_idx, role: r.role, content: r.content }))
 }

@@ -1,11 +1,29 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v3'
-const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/manifest.json', '/icon.svg']
+const VERSION = 'openclaude-v4'
+const SHELL = [
+  '/',
+  '/index.html',
+  '/style.css',
+  '/app.js',
+  '/manifest.json',
+  '/icon.svg',
+  // Vendored dependencies
+  '/vendor/marked.min.js',
+  '/vendor/highlight.min.js',
+  '/vendor/mermaid.min.js',
+  '/vendor/purify.min.js',
+  '/vendor/chart.umd.min.js',
+  '/vendor/github-dark.min.css',
+  '/vendor/github.min.css',
+]
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(VERSION).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()),
+    caches
+      .open(VERSION)
+      .then((cache) => cache.addAll(SHELL))
+      .then(() => self.skipWaiting()),
   )
 })
 
@@ -26,7 +44,11 @@ self.addEventListener('fetch', (event) => {
 
   // Never cache same-origin dynamic endpoints
   if (url.origin === self.location.origin) {
-    if (url.pathname.startsWith('/ws') || url.pathname.startsWith('/api/') || url.pathname === '/healthz') {
+    if (
+      url.pathname.startsWith('/ws') ||
+      url.pathname.startsWith('/api/') ||
+      url.pathname === '/healthz'
+    ) {
       return
     }
   }
@@ -34,28 +56,42 @@ self.addEventListener('fetch', (event) => {
   // Only handle same-origin GETs. Let CDN / cross-origin pass through.
   if (url.origin !== self.location.origin) return
 
+  // Normalize: strip query string for cache matching (e.g. /app.js?v=3 → /app.js)
+  const cacheKey = new Request(url.pathname, { headers: req.headers })
+
   // Network-first for HTML shell so updates are picked up quickly.
-  if (req.destination === 'document' || req.mode === 'navigate' || url.pathname === '/' || url.pathname.endsWith('.html')) {
+  if (
+    req.destination === 'document' ||
+    req.mode === 'navigate' ||
+    url.pathname === '/' ||
+    url.pathname.endsWith('.html')
+  ) {
     event.respondWith(
       fetch(req)
         .then((res) => {
           const copy = res.clone()
-          caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {})
+          caches
+            .open(VERSION)
+            .then((c) => c.put(cacheKey, copy))
+            .catch(() => {})
           return res
         })
-        .catch(() => caches.match(req).then((m) => m || caches.match('/index.html'))),
+        .catch(() => caches.match(cacheKey).then((m) => m || caches.match('/index.html'))),
     )
     return
   }
 
-  // Cache-first for other same-origin static assets
+  // Cache-first for other same-origin static assets (JS/CSS/vendor/*)
   event.respondWith(
-    caches.match(req).then((cached) => {
+    caches.match(cacheKey).then((cached) => {
       if (cached) return cached
       return fetch(req).then((res) => {
         if (res.status === 200) {
           const copy = res.clone()
-          caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {})
+          caches
+            .open(VERSION)
+            .then((c) => c.put(cacheKey, copy))
+            .catch(() => {})
         }
         return res
       })

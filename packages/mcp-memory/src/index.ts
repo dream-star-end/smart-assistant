@@ -21,21 +21,18 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js'
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
   MemoryStore,
   SkillStore,
-  indexTurn,
-  searchSessions,
-  loadSessionTurns,
-  upsertSessionMeta,
   archivalAdd,
-  archivalSearch,
-  archivalDelete,
   archivalCount,
+  archivalDelete,
+  archivalSearch,
+  indexTurn,
+  loadSessionTurns,
+  searchSessions,
+  upsertSessionMeta,
 } from '@openclaude/storage'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
@@ -86,7 +83,7 @@ const TOOLS = [
     name: 'session_search',
     description: [
       'Full-text search across past sessions. By default searches your own sessions.',
-      'Set agentId to search another agent\'s sessions (cross-agent memory access).',
+      "Set agentId to search another agent's sessions (cross-agent memory access).",
       '',
       'Returns up to `limit` (default 5) top sessions with snippet + metadata.',
     ].join('\n'),
@@ -96,7 +93,11 @@ const TOOLS = [
         query: { type: 'string', description: 'FTS5 search terms' },
         limit: { type: 'number', default: 5 },
         agentId: { type: 'string', description: '搜索指定 agent 的会话(默认搜索自己的)' },
-        summarize: { type: 'boolean', default: false, description: 'Return LLM-summarized transcripts' },
+        summarize: {
+          type: 'boolean',
+          default: false,
+          description: 'Return LLM-summarized transcripts',
+        },
       },
       required: ['query'],
     },
@@ -120,7 +121,10 @@ const TOOLS = [
       type: 'object',
       properties: {
         name: { type: 'string' },
-        subfile: { type: 'string', description: 'Optional path inside the skill dir, e.g. references/api.md' },
+        subfile: {
+          type: 'string',
+          description: 'Optional path inside the skill dir, e.g. references/api.md',
+        },
       },
       required: ['name'],
     },
@@ -152,7 +156,8 @@ const TOOLS = [
   },
   {
     name: 'skill_delete',
-    description: 'Delete a skill by name. Use sparingly — only when the skill is clearly wrong or obsolete.',
+    description:
+      'Delete a skill by name. Use sparingly — only when the skill is clearly wrong or obsolete.',
     inputSchema: {
       type: 'object',
       properties: { name: { type: 'string' } },
@@ -171,8 +176,15 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        content: { type: 'string', description: 'The knowledge to store. Be specific and include keywords for future retrieval.' },
-        tags: { type: 'string', description: 'Comma-separated tags for categorization, e.g. "api,minimax,tts"' },
+        content: {
+          type: 'string',
+          description:
+            'The knowledge to store. Be specific and include keywords for future retrieval.',
+        },
+        tags: {
+          type: 'string',
+          description: 'Comma-separated tags for categorization, e.g. "api,minimax,tts"',
+        },
       },
       required: ['content'],
     },
@@ -181,7 +193,7 @@ const TOOLS = [
     name: 'archival_search',
     description: [
       'Search archival memory using FTS5 full-text search. Returns top matches ranked by BM25.',
-      'Use when you need detailed knowledge that\'s too large for Core Memory.',
+      "Use when you need detailed knowledge that's too large for Core Memory.",
       'Tip: use specific keywords, not natural language questions.',
     ].join('\n'),
     inputSchema: {
@@ -198,7 +210,9 @@ const TOOLS = [
     description: 'Delete an archival entry by ID. Use when knowledge is outdated or wrong.',
     inputSchema: {
       type: 'object',
-      properties: { id: { type: 'string', description: 'Entry ID (from archival_search results)' } },
+      properties: {
+        id: { type: 'string', description: 'Entry ID (from archival_search results)' },
+      },
       required: ['id'],
     },
   },
@@ -245,6 +259,34 @@ const TOOLS = [
       required: ['agentId', 'message'],
     },
   },
+  // ── Synchronous task delegation ──
+  {
+    name: 'delegate_task',
+    description: [
+      '将任务委派给另一个 agent 并等待结果返回。与 send_to_agent 不同,这是同步操作 — 你会直接收到子 agent 的执行结果。',
+      '',
+      '适用场景:',
+      '- 需要专业 agent 处理后你还要继续用结果的场景',
+      '- 并行分发多个研究/分析任务',
+      '- 需要隔离上下文的子任务',
+      '',
+      '限制: 最大递归深度 3 层,最大并发 5 个。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agentId: { type: 'string', description: '目标 agent ID (可选,不填则自动选择)' },
+        goal: { type: 'string', description: '委派任务的目标描述' },
+        context: { type: 'string', description: '传递给子 agent 的上下文信息 (可选)' },
+        toolsets: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '限制子 agent 可用的工具集 (可选,如 ["research","browser"])',
+        },
+      },
+      required: ['goal'],
+    },
+  },
 ]
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
@@ -278,6 +320,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleCreateReminder(args as any)
       case 'send_to_agent':
         return await handleSendToAgent(args as any)
+      case 'delegate_task':
+        return await handleDelegateTask(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -289,7 +333,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 })
 
-async function handleMemory(args: { action: string; target: 'memory' | 'user'; content?: string; needle?: string }) {
+async function handleMemory(args: {
+  action: string
+  target: 'memory' | 'user'
+  content?: string
+  needle?: string
+}) {
   await memory.load() // refresh from disk every call (in case user edited via UI)
   const target = args.target
   switch (args.action) {
@@ -329,21 +378,26 @@ async function handleMemory(args: { action: string; target: 'memory' | 'user'; c
   }
 }
 
-async function handleSessionSearch(args: { query: string; limit?: number; agentId?: string; summarize?: boolean }) {
-  // Support cross-agent search: if agentId specified, search that agent's sessions
-  const searchAgentId = args.agentId || AGENT_ID
-  const hits = await searchSessions(args.query, args.limit ?? 5)
-  // Filter to target agent's sessions if cross-agent search
-  const filtered = args.agentId
-    ? hits.filter(h => h.sessionKey?.includes(`agent:${searchAgentId}:`))
-    : hits
-  if (filtered.length === 0) {
+async function handleSessionSearch(args: {
+  query: string
+  limit?: number
+  agentId?: string
+  summarize?: boolean
+}) {
+  // Default: search only THIS agent's sessions. Pass agentId to search another agent.
+  const searchAgentId = args.agentId ?? AGENT_ID
+  // Filter at SQL level via the agentId parameter (uses sessions_meta.agent_id)
+  const hits = await searchSessions(args.query, args.limit ?? 5, searchAgentId)
+  if (hits.length === 0) {
     const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
     return { content: [{ type: 'text', text: `No past sessions match "${args.query}"${scope}.` }] }
   }
   const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
-  const lines: string[] = [`Found ${filtered.length} past sessions matching "${args.query}"${scope}:`, '']
-  for (const h of filtered) {
+  const lines: string[] = [
+    `Found ${hits.length} past sessions matching "${args.query}"${scope}:`,
+    '',
+  ]
+  for (const h of hits) {
     const when = new Date(h.lastAt).toISOString().slice(0, 19).replace('T', ' ')
     lines.push(`• ${h.title} — ${when} [${h.channel}] (score ${h.score.toFixed(2)})`)
     // strip HTML marks for terminal display but keep readable
@@ -358,7 +412,10 @@ async function handleSessionSearch(args: { query: string; limit?: number; agentI
     lines.push('')
     for (const h of hits.slice(0, 3)) {
       const turns = await loadSessionTurns(h.sessionId)
-      const text = turns.map((t) => `[${t.role}] ${t.content}`).join('\n').slice(0, 4000)
+      const text = turns
+        .map((t) => `[${t.role}] ${t.content}`)
+        .join('\n')
+        .slice(0, 4000)
       lines.push(`### ${h.title}`)
       lines.push(text)
       lines.push('')
@@ -374,8 +431,7 @@ async function handleSkillList() {
       content: [
         {
           type: 'text',
-          text:
-            'No skills yet. Use `skill_save` to distill successful task resolutions into reusable skills.',
+          text: 'No skills yet. Use `skill_save` to distill successful task resolutions into reusable skills.',
         },
       ],
     }
@@ -398,7 +454,12 @@ async function handleSkillView(args: { name: string; subfile?: string }) {
   return { content: [{ type: 'text', text: v.rawContent }] }
 }
 
-async function handleSkillSave(args: { name: string; description: string; body: string; tags?: string[] }) {
+async function handleSkillSave(args: {
+  name: string
+  description: string
+  body: string
+  tags?: string[]
+}) {
   const r = await skills.save(
     {
       name: args.name,
@@ -426,16 +487,18 @@ async function handleArchivalAdd(args: { content: string; tags?: string }) {
 
 async function handleArchivalSearch(args: { query: string; limit?: number }) {
   const results = await archivalSearch(AGENT_ID, args.query, args.limit ?? 5)
-  if (results.length === 0) return toolOk('No archival entries match "' + args.query + '".')
-  const lines = results.map((r, i) =>
-    `[${i + 1}] id=${r.id} tags=${r.tags || '(none)'}\n${r.content}`
+  if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`)
+  const lines = results.map(
+    (r, i) => `[${i + 1}] id=${r.id} tags=${r.tags || '(none)'}\n${r.content}`,
   )
   return toolOk(`Found ${results.length} archival entries:\n\n${lines.join('\n\n---\n\n')}`)
 }
 
 async function handleArchivalDelete(args: { id: string }) {
   const ok = await archivalDelete(AGENT_ID, args.id)
-  return ok ? toolOk(`Deleted archival entry ${args.id}.`) : toolError(`Entry ${args.id} not found.`)
+  return ok
+    ? toolOk(`Deleted archival entry ${args.id}.`)
+    : toolError(`Entry ${args.id} not found.`)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -444,29 +507,82 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
   const gatewayToken = process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
   try {
-    const res = await fetch(`http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(args.agentId)}/message`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${gatewayToken}`,
+    const res = await fetch(
+      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(args.agentId)}/message`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${gatewayToken}`,
+        },
+        body: JSON.stringify({
+          message: args.message,
+          sourceAgent,
+        }),
       },
-      body: JSON.stringify({
-        message: args.message,
-        sourceAgent,
-      }),
-    })
+    )
     if (!res.ok) {
       const err = await res.text()
-      return toolError('发送失败: ' + err)
+      return toolError(`发送失败: ${err}`)
     }
-    const data = await res.json() as any
-    return toolOk(`✅ 已发送给 agent "${args.agentId}": "${args.message.slice(0, 50)}${args.message.length > 50 ? '...' : ''}"\n目标 agent 将在后台处理,结果会推送给用户。`)
+    const data = (await res.json()) as any
+    return toolOk(
+      `✅ 已发送给 agent "${args.agentId}": "${args.message.slice(0, 50)}${args.message.length > 50 ? '...' : ''}"\n目标 agent 将在后台处理,结果会推送给用户。`,
+    )
   } catch (err: any) {
-    return toolError('发送失败: ' + (err?.message ?? String(err)))
+    return toolError(`发送失败: ${err?.message ?? String(err)}`)
   }
 }
 
-async function handleCreateReminder(args: { schedule: string; message: string; oneshot?: boolean }) {
+async function handleDelegateTask(args: {
+  agentId?: string
+  goal: string
+  context?: string
+  toolsets?: string[]
+}) {
+  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
+  const gatewayToken = process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
+  const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
+  const targetAgent = args.agentId || 'main'
+  try {
+    // Pass delegation depth so gateway can enforce recursion limit
+    const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
+    const res = await fetch(
+      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(targetAgent)}/delegate`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${gatewayToken}`,
+          'x-delegation-depth': String(currentDepth),
+        },
+        body: JSON.stringify({
+          goal: args.goal,
+          context: args.context,
+          sourceAgent,
+          toolsets: args.toolsets,
+        }),
+      },
+    )
+    if (!res.ok) {
+      const err = await res.text()
+      return toolError(`委派失败: ${err}`)
+    }
+    const data = (await res.json()) as any
+    if (data.error) {
+      return toolError(`子 agent 执行出错: ${data.error}`)
+    }
+    return toolOk(`✅ 委派完成 (agent: ${targetAgent})\n\n${data.output || '(无输出)'}`)
+  } catch (err: any) {
+    return toolError(`委派失败: ${err?.message ?? String(err)}`)
+  }
+}
+
+async function handleCreateReminder(args: {
+  schedule: string
+  message: string
+  oneshot?: boolean
+}) {
   // Call the gateway's /api/cron endpoint to create the reminder
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
   const gatewayToken = process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
@@ -475,7 +591,7 @@ async function handleCreateReminder(args: { schedule: string; message: string; o
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${gatewayToken}`,
+        Authorization: `Bearer ${gatewayToken}`,
       },
       body: JSON.stringify({
         schedule: args.schedule,
@@ -487,12 +603,14 @@ async function handleCreateReminder(args: { schedule: string; message: string; o
     })
     if (!res.ok) {
       const err = await res.text()
-      return toolError('创建提醒失败: ' + err)
+      return toolError(`创建提醒失败: ${err}`)
     }
-    const data = await res.json() as any
-    return toolOk(`✅ 提醒已创建: "${args.message}"\n⏰ 计划: \`${args.schedule}\`\nID: \`${data.job?.id ?? '?'}\`${args.oneshot !== false ? ' (一次性)' : ' (重复)'}`)
+    const data = (await res.json()) as any
+    return toolOk(
+      `✅ 提醒已创建: "${args.message}"\n⏰ 计划: \`${args.schedule}\`\nID: \`${data.job?.id ?? '?'}\`${args.oneshot !== false ? ' (一次性)' : ' (重复)'}`,
+    )
   } catch (err: any) {
-    return toolError('创建提醒失败: ' + (err?.message ?? String(err)))
+    return toolError(`创建提醒失败: ${err?.message ?? String(err)}`)
   }
 }
 

@@ -11,8 +11,8 @@
 // injection and exfiltration patterns before being persisted, since these files
 // get injected into the system prompt.
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { paths } from './paths.js'
 
@@ -38,7 +38,10 @@ const THREAT_PATTERNS: Array<[RegExp, string]> = [
   [/do\s+not\s+tell\s+the\s+user/i, 'deception_hide'],
   [/system\s+prompt\s+override/i, 'sys_prompt_override'],
   [/disregard\s+(your|all|any)\s+(instructions|rules|guidelines)/i, 'disregard_rules'],
-  [/act\s+as\s+(if|though)\s+you\s+(have\s+no|don['’]t\s+have)\s+(restrictions|limits|rules)/i, 'bypass_restrictions'],
+  [
+    /act\s+as\s+(if|though)\s+you\s+(have\s+no|don['’]t\s+have)\s+(restrictions|limits|rules)/i,
+    'bypass_restrictions',
+  ],
   [/curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)/i, 'exfil_curl'],
   [/wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)/i, 'exfil_wget'],
   [/cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)/i, 'read_secrets'],
@@ -46,8 +49,16 @@ const THREAT_PATTERNS: Array<[RegExp, string]> = [
 ]
 
 const INVISIBLE_CHARS = [
-  '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
-  '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+  '\u200b',
+  '\u200c',
+  '\u200d',
+  '\u2060',
+  '\ufeff',
+  '\u202a',
+  '\u202b',
+  '\u202c',
+  '\u202d',
+  '\u202e',
 ]
 
 export interface ScanResult {
@@ -165,9 +176,7 @@ export class MemoryStore {
     const scan = scanMemoryContent(replacement)
     if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
     const entries = this.entriesFor(target)
-    const matches = entries
-      .map((e, i) => ({ e, i }))
-      .filter(({ e }) => e.includes(needle))
+    const matches = entries.map((e, i) => ({ e, i })).filter(({ e }) => e.includes(needle))
     if (matches.length === 0) return { ok: false, error: 'needle not found' }
     if (matches.length > 1) return { ok: false, error: `ambiguous: ${matches.length} matches` }
     const newEntries = [...entries]
@@ -200,7 +209,10 @@ export class MemoryStore {
   }
 
   // Overwrite the whole target. Used by the Web UI editor.
-  async overwrite(target: MemoryTarget, fullContent: string): Promise<{ ok: boolean; error?: string }> {
+  async overwrite(
+    target: MemoryTarget,
+    fullContent: string,
+  ): Promise<{ ok: boolean; error?: string }> {
     const scan = scanMemoryContent(fullContent)
     if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
     const entries = fullContent

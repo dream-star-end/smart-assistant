@@ -21,7 +21,9 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
   let bot: any = null
   let ctx: ChannelContext | null = null
   return {
+    id: 'telegram',
     name: 'telegram',
+    type: 'channel' as const,
     async init(c) {
       ctx = c
       try {
@@ -76,7 +78,7 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
         if (b.kind === 'text' && b.text) textParts.push(b.text)
         else if (b.kind === 'thinking' && b.text) thinkingParts.push(b.text)
         else if (b.kind === 'tool_use' && !b.partial) {
-          let preview = b.inputPreview ? ` ${truncate(b.inputPreview, 200)}` : ''
+          const preview = b.inputPreview ? ` ${truncate(b.inputPreview, 200)}` : ''
           toolLines.push(`🔧 ${b.toolName}${preview}`)
         } else if (b.kind === 'tool_result' && b.preview) {
           const prefix = b.isError ? '⚠️' : '↳'
@@ -87,7 +89,7 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
       // Skip thinking unless explicitly enabled. Skip empty intermediate sends.
       const segments: string[] = []
       if (showThinking && thinkingParts.length > 0) {
-        segments.push('💭 ' + thinkingParts.join(' '))
+        segments.push(`💭 ${thinkingParts.join(' ')}`)
       }
       if (toolLines.length > 0) segments.push(toolLines.join('\n'))
       if (textParts.length > 0) {
@@ -125,7 +127,7 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s
-  return s.slice(0, max) + '…'
+  return `${s.slice(0, max)}…`
 }
 
 function splitText(text: string, max: number): string[] {

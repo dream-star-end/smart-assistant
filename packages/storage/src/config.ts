@@ -27,6 +27,14 @@ export interface McpServerConfig {
   provider?: string
 }
 
+/** Predefined tool groups that can be assigned to agents or routes */
+export type ToolsetName = 'assistant' | 'research' | 'coding' | 'browser' | string
+
+/** Map toolset name → list of MCP server IDs included in that toolset */
+export interface ToolsetDefs {
+  [name: string]: string[] // e.g. { research: ['browser'], coding: ['openclaude-memory'] }
+}
+
 export interface OpenClaudeConfig {
   version: 1
   gateway: {
@@ -47,7 +55,7 @@ export interface OpenClaudeConfig {
     claudeOAuth?: {
       accessToken: string
       refreshToken: string
-      expiresAt: number   // unix ms
+      expiresAt: number // unix ms
       scope: string
     }
     // OpenAI Codex OAuth tokens
@@ -61,7 +69,12 @@ export interface OpenClaudeConfig {
   defaults: {
     model: string // claude-opus-4-6 等
     permissionMode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'dontAsk' | 'plan'
+    toolsets?: ToolsetName[] // default toolsets for all agents (if not overridden)
   }
+  // Named toolset definitions: group MCP servers by purpose
+  // e.g. { research: ['browser'], coding: ['openclaude-memory'], browser: ['browser'] }
+  // If undefined, all MCP servers are available to all agents (current behavior)
+  toolsets?: ToolsetDefs
   // Which provider ecosystem this install is wired to. Used to scope
   // provider-specific MCP servers (e.g. minimax-vision only loads when
   // provider="minimax"). Free-form string — common values: "minimax",
@@ -75,6 +88,20 @@ export interface OpenClaudeConfig {
   }
   // Multi-provider MCP server registry — auto-merged into every CCB subprocess
   mcpServers?: McpServerConfig[]
+  // Terminal backend for CCB subprocess execution
+  terminal?: {
+    type: 'local' | 'docker' // future: 'ssh' | 'remote'
+    // Remote host (future extension point)
+    host?: string
+    port?: number
+    user?: string
+    keyPath?: string
+    // Docker-specific options
+    image?: string
+    volumes?: string[]
+    envAllowlist?: string[]
+    timeoutMs?: number
+  }
 }
 
 export async function readConfig(): Promise<OpenClaudeConfig | null> {
@@ -100,14 +127,16 @@ export interface AgentDef {
   persona?: string // 文件路径
   cwd?: string // agent 工作目录
   permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'dontAsk' | 'plan'
-  // toolWhitelist/toolBlacklist: reserved for future use
+  // Toolsets: which named tool groups this agent has access to.
+  // If undefined → inherits defaults.toolsets; if defaults.toolsets also undefined → all tools.
+  toolsets?: ToolsetName[]
   // Persona display
-  displayName?: string   // 显示名称,如 "小克"
-  avatarEmoji?: string   // 头像 emoji,如 "🐱"
-  greeting?: string      // 新会话问候语
+  displayName?: string // 显示名称,如 "小克"
+  avatarEmoji?: string // 头像 emoji,如 "🐱"
+  greeting?: string // 新会话问候语
   // Per-agent provider & MCP overrides
-  provider?: string      // 覆盖全局 config.provider (如 "minimax", "anthropic", "deepseek")
-  mcpServers?: McpServerConfig[]  // agent 专属 MCP servers (合并到系统共享工具之上)
+  provider?: string // 覆盖全局 config.provider (如 "minimax", "anthropic", "deepseek")
+  mcpServers?: McpServerConfig[] // agent 专属 MCP servers (合并到系统共享工具之上)
 }
 
 export interface RouteRule {

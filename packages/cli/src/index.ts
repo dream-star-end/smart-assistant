@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 import { Command } from 'commander'
-import { onboard } from './commands/onboard.js'
-import { gatewayCmd } from './commands/gateway.js'
-import { doctor } from './commands/doctor.js'
 import { agentsAdd, agentsList } from './commands/agents.js'
+import { doctor } from './commands/doctor.js'
+import { gatewayCmd } from './commands/gateway.js'
+import { onboard } from './commands/onboard.js'
 import { pairingList, pairingTelegramAdd, pairingTelegramRemove } from './commands/pairing.js'
 
 const program = new Command()

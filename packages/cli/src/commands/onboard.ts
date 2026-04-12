@@ -1,16 +1,16 @@
 import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { createInterface } from 'node:readline/promises'
 import { stdin, stdout } from 'node:process'
+import { createInterface } from 'node:readline/promises'
+import { generateAccessToken } from '@openclaude/gateway'
 import {
   type OpenClaudeConfig,
   paths,
   readConfig,
-  writeConfig,
   writeAgentsConfig,
+  writeConfig,
 } from '@openclaude/storage'
-import { generateAccessToken } from '@openclaude/gateway'
 
 interface OnboardOpts {
   nonInteractive?: boolean
@@ -29,9 +29,7 @@ export async function onboard(opts: OnboardOpts): Promise<void> {
     console.log('Re-running will overwrite gateway settings but keep credentials.\n')
   }
 
-  const rl = opts.nonInteractive
-    ? null
-    : createInterface({ input: stdin, output: stdout })
+  const rl = opts.nonInteractive ? null : createInterface({ input: stdin, output: stdout })
   const ask = async (q: string, def?: string): Promise<string> => {
     if (!rl) return def ?? ''
     const a = (await rl.question(`${q}${def ? ` [${def}]` : ''}: `)).trim()
@@ -68,7 +66,9 @@ export async function onboard(opts: OnboardOpts): Promise<void> {
   console.log('\n→ 接下来请在 Claude Code Best 里完成登录:')
   console.log(`  cd ${claudeCodePath} && bun run dev`)
   console.log('  然后输入 /login,选择对应方式完成授权')
-  console.log('  完成后 token 会被 CCB 存到它自己的 keychain/settings,后续 OpenClaude spawn 它时自动复用\n')
+  console.log(
+    '  完成后 token 会被 CCB 存到它自己的 keychain/settings,后续 OpenClaude spawn 它时自动复用\n',
+  )
 
   // 3. Gateway 端口
   const port = opts.port ?? Number((await ask('Gateway 端口', '18789')) || '18789')
@@ -95,7 +95,7 @@ export async function onboard(opts: OnboardOpts): Promise<void> {
     },
     defaults: {
       model,
-      permissionMode: 'default',
+      permissionMode: 'acceptEdits',
     },
     channels: {
       webchat: { enabled: true },

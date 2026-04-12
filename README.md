@@ -46,16 +46,30 @@
 - Snapshot-driven 操作:accessibility tree + ref 编号
 
 ### 🤝 多 Agent 协作
-- 每个 Agent 独立配置:model / provider / memory / skills / persona
+- 每个 Agent 独立配置:model / provider / memory / skills / persona / toolsets
 - `send_to_agent` MCP 工具:Agent 间异步消息传递
+- `delegate_task` MCP 工具:同步子 Agent 委派(等待结果返回)
 - `session_search(agentId)` 跨 Agent 会话搜索
 - 动态注入 Agent 列表 + 能力描述到 system prompt
 
 ### ⏰ 定时任务 & 提醒
-- `create_reminder` MCP 工具:自然语言创建提醒
+- `create_reminder` / `CronCreate` 均可创建(自动桥接到统一调度)
 - Cron YAML 配置,本地时区 (Asia/Shanghai)
+- 后台任务系统(TaskStore):持久化任务定义 + 执行记录
+- Web UI 任务中心:定时任务 / 后台任务 / 执行记录三 tab
 - Heartbeat 每 4 小时主动检查待办事项
 - 一次性 (oneshot) 任务自动清理
+
+### 🔔 Webhook 自动化
+- YAML 配置 webhook 路由 (`~/.openclaude/webhooks.yaml`)
+- HMAC-SHA256 签名验证 (GitHub 兼容)
+- 模板变量 `{{dot.path}}` 注入 prompt
+- 通过 EventBus 驱动 agent 执行
+
+### 🔌 OpenAI 兼容 API
+- `POST /v1/chat/completions` (SSE 流式 + 非流式)
+- `GET /v1/models` (列出所有 agent 作为 model)
+- 可直接对接 Open WebUI / LobeChat / 其他 OpenAI 兼容客户端
 
 ### 🔒 安全
 - DOMPurify 清洗所有 HTML 输出

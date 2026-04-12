@@ -1,10 +1,23 @@
 {
   "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
-  "files": { "ignore": ["**/dist/**", "**/node_modules/**"] },
+  "files": { "ignore": ["**/dist/**", "**/node_modules/**", "packages/web/public/vendor/**"] },
   "formatter": { "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
   "linter": {
     "enabled": true,
-    "rules": { "recommended": true, "style": { "noNonNullAssertion": "off" }, "suspicious": { "noExplicitAny": "off" } }
+    "rules": {
+      "recommended": true,
+      "style": {
+        "noNonNullAssertion": "off",
+        "noParameterAssign": "off"
+      },
+      "suspicious": {
+        "noExplicitAny": "off",
+        "noAssignInExpressions": "off"
+      },
+      "complexity": {
+        "noForEach": "off"
+      }
+    }
   },
   "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } }
 }

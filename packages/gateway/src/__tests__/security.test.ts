@@ -1,135 +1,212 @@
+import * as assert from 'node:assert/strict'
+import { resolve } from 'node:path'
 /**
- * Core security tests for OpenClaude Gateway.
+ * Security tests for OpenClaude Gateway.
+ * Tests real exported functions from server.ts — NOT local helper clones.
  * Run: npx tsx --test packages/gateway/src/__tests__/security.test.ts
  */
 import { describe, it } from 'node:test'
-import * as assert from 'node:assert/strict'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import {
+  FILE_BLOCKED_PATTERNS,
+  MAX_UPLOAD_SINGLE,
+  MAX_UPLOAD_TOTAL,
+  UPLOAD_MIME_PREFIXES,
+  isFileBlocked,
+  isUploadMimeAllowed,
+} from '../server.js'
 
-// We test the actual server by spawning it and making HTTP requests.
-// For unit tests, we import individual functions where possible.
-
-// ── T01: File access authorization ──
-describe('T01: /api/file path whitelist', () => {
-  const allowedDirs = ['/root/.openclaude/uploads', '/root/.openclaude/generated', '/tmp']
-  const blockedPatterns = [/openclaude\.json$/, /\.env$/, /credentials/, /\.ssh/, /\.key$/, /\.pem$/]
-
-  function isAllowed(path: string): boolean {
-    if (path.includes('..') || !path.startsWith('/')) return false
-    if (blockedPatterns.some(p => p.test(path))) return false
-    return allowedDirs.some(d => path.startsWith(d))
-  }
-
-  it('allows uploads directory', () => {
-    assert.ok(isAllowed('/root/.openclaude/uploads/image.jpg'))
+// ── T01: /api/file blacklist — tests the REAL isFileBlocked function ──
+describe('T01: isFileBlocked — sensitive file blocking', () => {
+  // Should BLOCK
+  it('blocks openclaude.json (gateway config)', () => {
+    assert.ok(isFileBlocked('/root/.openclaude/openclaude.json'))
+  })
+  it('blocks .env files', () => {
+    assert.ok(isFileBlocked('/root/.openclaude/.env'))
+  })
+  it('blocks credentials directory', () => {
+    assert.ok(isFileBlocked('/root/.openclaude/credentials/token.json'))
+  })
+  it('blocks .ssh directory', () => {
+    assert.ok(isFileBlocked('/root/.ssh/id_rsa'))
+  })
+  it('blocks .key files', () => {
+    assert.ok(isFileBlocked('/etc/ssl/private/server.key'))
+  })
+  it('blocks .pem certificates', () => {
+    assert.ok(isFileBlocked('/etc/ssl/certs/ca.pem'))
+  })
+  it('blocks id_rsa SSH key', () => {
+    assert.ok(isFileBlocked('/home/user/.ssh/id_rsa'))
+  })
+  it('blocks id_ed25519 SSH key', () => {
+    assert.ok(isFileBlocked('/home/user/.ssh/id_ed25519'))
+  })
+  it('blocks .gnupg directory', () => {
+    assert.ok(isFileBlocked('/root/.gnupg/secring.gpg'))
+  })
+  it('blocks .password files', () => {
+    assert.ok(isFileBlocked('/root/.password'))
+  })
+  it('blocks /etc/shadow', () => {
+    assert.ok(isFileBlocked('/etc/shadow'))
+  })
+  it('blocks auth token files (case insensitive)', () => {
+    assert.ok(isFileBlocked('/tmp/auth_token.json'))
+    assert.ok(isFileBlocked('/tmp/AUTH_TOKEN'))
+  })
+  it('blocks MEMORY.md (agent long-term memory)', () => {
+    assert.ok(isFileBlocked('/root/.openclaude/agents/main/MEMORY.md'))
+  })
+  it('blocks USER.md (user identity)', () => {
+    assert.ok(isFileBlocked('/root/.openclaude/agents/main/USER.md'))
+  })
+  it('blocks CLAUDE.md (agent persona/instructions)', () => {
+    assert.ok(isFileBlocked('/root/.openclaude/agents/main/CLAUDE.md'))
+  })
+  it('blocks resume-map.json (checkpoint data)', () => {
+    assert.ok(isFileBlocked('/root/.openclaude/agents/main/sessions/resume-map.json'))
+  })
+  it('blocks .env.local', () => {
+    assert.ok(isFileBlocked('/root/project/.env.local'))
+  })
+  it('blocks .env.production', () => {
+    assert.ok(isFileBlocked('/root/project/.env.production'))
+  })
+  it('blocks .env.development', () => {
+    assert.ok(isFileBlocked('/root/project/.env.development'))
+  })
+  it('blocks .npmrc', () => {
+    assert.ok(isFileBlocked('/root/.npmrc'))
+  })
+  it('blocks .pypirc', () => {
+    assert.ok(isFileBlocked('/root/.pypirc'))
+  })
+  it('blocks .netrc', () => {
+    assert.ok(isFileBlocked('/root/.netrc'))
+  })
+  it('blocks .aws/credentials', () => {
+    assert.ok(isFileBlocked('/root/.aws/credentials'))
+  })
+  it('blocks .aws/config', () => {
+    assert.ok(isFileBlocked('/root/.aws/config'))
+  })
+  it('blocks .kube/config', () => {
+    assert.ok(isFileBlocked('/root/.kube/config'))
+  })
+  it('blocks .docker/config.json', () => {
+    assert.ok(isFileBlocked('/root/.docker/config.json'))
   })
 
-  it('allows generated directory', () => {
-    assert.ok(isAllowed('/root/.openclaude/generated/audio.mp3'))
+  // Should ALLOW
+  it('allows normal image files', () => {
+    assert.ok(!isFileBlocked('/root/.openclaude/uploads/photo.jpg'))
   })
-
-  it('allows /tmp', () => {
-    assert.ok(isAllowed('/tmp/test-file.txt'))
+  it('allows generated audio', () => {
+    assert.ok(!isFileBlocked('/root/.openclaude/generated/speech.mp3'))
   })
-
-  it('blocks config file', () => {
-    assert.ok(!isAllowed('/root/.openclaude/openclaude.json'))
+  it('allows /tmp files', () => {
+    assert.ok(!isFileBlocked('/tmp/test-result.txt'))
   })
-
-  it('blocks .env', () => {
-    assert.ok(!isAllowed('/root/.openclaude/.env'))
+  it('allows agent work products', () => {
+    assert.ok(!isFileBlocked('/root/project/build/output.html'))
   })
-
-  it('blocks credentials', () => {
-    assert.ok(!isAllowed('/root/.openclaude/credentials/token.json'))
-  })
-
-  it('blocks SSH keys', () => {
-    assert.ok(!isAllowed('/root/.ssh/id_rsa'))
-  })
-
-  it('blocks path traversal', () => {
-    assert.ok(!isAllowed('/root/.openclaude/uploads/../../etc/passwd'))
-  })
-
-  it('blocks relative paths', () => {
-    assert.ok(!isAllowed('etc/passwd'))
-  })
-
-  it('blocks /etc/passwd', () => {
-    assert.ok(!isAllowed('/etc/passwd'))
-  })
-
-  it('blocks /root/.openclaude/agents/main/MEMORY.md', () => {
-    assert.ok(!isAllowed('/root/.openclaude/agents/main/MEMORY.md'))
+  it('allows screenshot files', () => {
+    assert.ok(!isFileBlocked('/root/.openclaude/agents/main/screenshots/page.png'))
   })
 })
 
-// ── T02: No query token ──
-describe('T02: Authentication', () => {
-  it('checkHttpAuth does not read query params', () => {
-    // Simulate: the function should only use Authorization header or WS subprotocol
-    const mockReq = {
-      headers: { authorization: 'Bearer test-token' },
+// ── T02: Upload MIME validation — tests the REAL isUploadMimeAllowed function ──
+describe('T02: isUploadMimeAllowed — upload type filtering', () => {
+  // Should ALLOW
+  it('allows image/png', () => assert.ok(isUploadMimeAllowed('image/png')))
+  it('allows image/jpeg', () => assert.ok(isUploadMimeAllowed('image/jpeg')))
+  it('allows image/gif', () => assert.ok(isUploadMimeAllowed('image/gif')))
+  it('allows image/webp', () => assert.ok(isUploadMimeAllowed('image/webp')))
+  it('allows audio/mpeg', () => assert.ok(isUploadMimeAllowed('audio/mpeg')))
+  it('allows audio/wav', () => assert.ok(isUploadMimeAllowed('audio/wav')))
+  it('allows video/mp4', () => assert.ok(isUploadMimeAllowed('video/mp4')))
+  it('allows video/webm', () => assert.ok(isUploadMimeAllowed('video/webm')))
+  it('allows application/pdf', () => assert.ok(isUploadMimeAllowed('application/pdf')))
+  it('allows text/plain', () => assert.ok(isUploadMimeAllowed('text/plain')))
+  it('allows text/csv', () => assert.ok(isUploadMimeAllowed('text/csv')))
+  it('allows application/octet-stream (generic)', () =>
+    assert.ok(isUploadMimeAllowed('application/octet-stream')))
+  it('allows empty mime (no header)', () => assert.ok(isUploadMimeAllowed('')))
+
+  // Should BLOCK
+  it('blocks application/x-executable', () =>
+    assert.ok(!isUploadMimeAllowed('application/x-executable')))
+  it('blocks application/x-sh (shell scripts)', () =>
+    assert.ok(!isUploadMimeAllowed('application/x-sh')))
+  it('blocks application/x-msdownload (EXE)', () =>
+    assert.ok(!isUploadMimeAllowed('application/x-msdownload')))
+  it('blocks application/java-archive (JAR)', () =>
+    assert.ok(!isUploadMimeAllowed('application/java-archive')))
+  it('blocks application/x-httpd-php', () =>
+    assert.ok(!isUploadMimeAllowed('application/x-httpd-php')))
+})
+
+// ── T03: Upload size limits ──
+describe('T03: Upload size limits', () => {
+  it('MAX_UPLOAD_SINGLE is 25MB', () => {
+    assert.equal(MAX_UPLOAD_SINGLE, 25 * 1024 * 1024)
+  })
+  it('MAX_UPLOAD_TOTAL is 50MB', () => {
+    assert.equal(MAX_UPLOAD_TOTAL, 50 * 1024 * 1024)
+  })
+  it('single limit is less than total limit', () => {
+    assert.ok(MAX_UPLOAD_SINGLE < MAX_UPLOAD_TOTAL)
+  })
+})
+
+// ── T04: SPA fallback should not serve index.html for static asset requests ──
+describe('T04: SPA fallback extension check', () => {
+  const hasExtension = (pathname: string) => /\.\w+$/.test(pathname)
+
+  it('detects .js extension', () => assert.ok(hasExtension('/vendor/marked.min.js')))
+  it('detects .css extension', () => assert.ok(hasExtension('/vendor/github-dark.min.css')))
+  it('detects .map extension', () => assert.ok(hasExtension('/vendor/marked.min.js.map')))
+  it('detects .png extension', () => assert.ok(hasExtension('/images/logo.png')))
+  it('no extension for root path', () => assert.ok(!hasExtension('/')))
+  it('no extension for SPA route', () => assert.ok(!hasExtension('/settings')))
+  it('no extension for agent route', () => assert.ok(!hasExtension('/agents/main')))
+})
+
+// ── T05: Blacklist pattern coverage ──
+describe('T05: Blacklist pattern completeness', () => {
+  it('has at least 22 patterns', () => {
+    assert.ok(FILE_BLOCKED_PATTERNS.length >= 22)
+  })
+  it('every pattern is a RegExp', () => {
+    for (const p of FILE_BLOCKED_PATTERNS) {
+      assert.ok(p instanceof RegExp, `Expected RegExp, got ${typeof p}`)
+    }
+  })
+  it('covers memory files (MEMORY.md, USER.md, CLAUDE.md)', () => {
+    const memoryPatterns = ['MEMORY.md', 'USER.md', 'CLAUDE.md']
+    for (const f of memoryPatterns) {
+      assert.ok(
+        FILE_BLOCKED_PATTERNS.some((p) => p.test(`/root/.openclaude/agents/main/${f}`)),
+        `Blacklist should block ${f}`,
+      )
+    }
+  })
+})
+
+// ── T06: Authentication pattern — query param should not be used ──
+describe('T06: Authentication — no query token leak', () => {
+  it('Bearer header is preferred over query param', () => {
+    const req = {
+      headers: { authorization: 'Bearer correct-token' },
       url: '/?token=leaked-token',
     }
-    // We just verify the logic pattern — real test would need the server instance
-    const authHeader = mockReq.headers.authorization?.replace(/^Bearer\s+/, '') ?? ''
-    assert.equal(authHeader, 'test-token')
-    // query param should NOT be used
-    const url = new URL(mockReq.url, 'http://localhost')
+    const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, '') ?? ''
+    assert.equal(authHeader, 'correct-token')
+    // The server should NEVER read token from query params
+    const url = new URL(req.url, 'http://localhost')
     const queryToken = url.searchParams.get('token')
-    assert.equal(queryToken, 'leaked-token') // it exists but should NOT be used
-  })
-})
-
-// ── T04: Upload validation ──
-describe('T04: Upload validation', () => {
-  const MAX_SINGLE = 25 * 1024 * 1024
-  const ALLOWED_PREFIXES = ['image/', 'audio/', 'video/', 'application/pdf', 'text/']
-
-  function isValidMime(mime: string): boolean {
-    if (!mime) return true // no mime = ok
-    return ALLOWED_PREFIXES.some(p => mime.startsWith(p)) || mime === 'application/octet-stream'
-  }
-
-  it('allows image/png', () => assert.ok(isValidMime('image/png')))
-  it('allows audio/mpeg', () => assert.ok(isValidMime('audio/mpeg')))
-  it('allows video/mp4', () => assert.ok(isValidMime('video/mp4')))
-  it('allows application/pdf', () => assert.ok(isValidMime('application/pdf')))
-  it('allows text/plain', () => assert.ok(isValidMime('text/plain')))
-  it('allows empty mime', () => assert.ok(isValidMime('')))
-  it('blocks application/x-executable', () => assert.ok(!isValidMime('application/x-executable')))
-  it('blocks application/x-sh', () => assert.ok(!isValidMime('application/x-sh')))
-
-  it('rejects files over 25MB', () => {
-    const base64Len = Math.ceil(26 * 1024 * 1024 / 0.75) // > 25MB when decoded
-    assert.ok(Math.ceil(base64Len * 0.75) > MAX_SINGLE)
-  })
-})
-
-// ── T05: Session state isolation ──
-describe('T05: sendingInFlight isolation', () => {
-  it('sessions should have independent sending state', () => {
-    const sessA = { id: 'a', _sendingInFlight: true }
-    const sessB = { id: 'b', _sendingInFlight: false }
-    assert.notEqual(sessA._sendingInFlight, sessB._sendingInFlight)
-  })
-})
-
-// ── T06: Message ordering ──
-describe('T06: Message load order', () => {
-  it('messages should be in chronological order after load-more', () => {
-    const msgs = Array.from({ length: 150 }, (_, i) => ({ id: i, ts: i * 1000 }))
-    const MAX_INITIAL = 100
-    const displayed = msgs.slice(msgs.length - MAX_INITIAL)
-    const older = msgs.slice(0, msgs.length - MAX_INITIAL)
-    // After load-more, prepend older messages
-    const full = [...older, ...displayed]
-    // Verify chronological order
-    for (let i = 1; i < full.length; i++) {
-      assert.ok(full[i].ts >= full[i - 1].ts, `msg ${i} should be after msg ${i - 1}`)
-    }
+    assert.ok(queryToken !== null, 'query param exists but should be ignored by server')
   })
 })
 

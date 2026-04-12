@@ -24,10 +24,8 @@ export async function agentsAdd(id: string, opts: { model?: string }): Promise<v
   cfg.agents.push({ id, model: opts.model, persona: paths.agentClaudeMd(id) })
   await writeAgentsConfig(cfg)
   await mkdir(paths.agentSessionsDir(id), { recursive: true })
-  await writeFile(
-    paths.agentClaudeMd(id),
-    `# Agent: ${id}\n\nYou are a helpful assistant.\n`,
-    { flag: 'wx' },
-  ).catch(() => {})
+  await writeFile(paths.agentClaudeMd(id), `# Agent: ${id}\n\nYou are a helpful assistant.\n`, {
+    flag: 'wx',
+  }).catch(() => {})
   console.log(`✓ added agent ${id}`)
 }
