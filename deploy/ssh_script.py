@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """Run a local shell script on the VPS via SSH stdin."""
+import os
 import sys
 import io
+from pathlib import Path
+
+# Auto-load .env
+_env_file = Path(__file__).parent / '.env'
+if _env_file.exists():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
 import paramiko
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")

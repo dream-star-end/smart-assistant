@@ -2,6 +2,16 @@
 """Deploy seed skills to the VPS."""
 import os
 import sys
+from pathlib import Path
+
+_env_file = Path(__file__).parent / '.env'
+if _env_file.exists():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
 import paramiko
 
 HOST = os.environ.get("DEPLOY_HOST", "127.0.0.1")
