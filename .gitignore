@@ -4,3 +4,5 @@ dist/
 .DS_Store
 *.swp
 *.swo
+claude-code-best/node_modules/
+claude-code-best/dist/
