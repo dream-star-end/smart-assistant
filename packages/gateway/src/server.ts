@@ -129,13 +129,15 @@ export class Gateway {
               : '🪞'
 
       // Build outbound message — use last active session if available
-      const buildOut = (peerId: string, sessionKey?: string): OutboundMessage => ({
-        type: 'outbound.message',
+      // Include cronJob metadata so frontend can visually distinguish system pushes
+      const buildOut = (peerId: string, sessionKey?: string) => ({
+        type: 'outbound.message' as const,
         sessionKey: sessionKey || `agent:${agentId}:cron:dm:${job.id}`,
-        channel: 'webchat',
-        peer: { id: peerId, kind: 'dm' },
-        blocks: [{ kind: 'text', text: `${icon} ${job.label || job.id}\n\n${text}` }],
+        channel: 'webchat' as const,
+        peer: { id: peerId, kind: 'dm' as const },
+        blocks: [{ kind: 'text' as const, text: `${icon} ${job.label || job.id}\n\n${text}` }],
         isFinal: true,
+        cronJob: { id: job.id, heartbeat: !!job.heartbeat, label: job.label || job.id },
       })
 
       let delivered = false
@@ -187,6 +189,7 @@ export class Gateway {
         }
       }
     })
+    this.cron.lastActiveChannel = this.lastActiveChannel
     this.cron.start().catch((err) => console.error('[cron] start failed:', err))
 
     // EventBus: bridge CCB CronCreate/CronDelete to gateway CronScheduler
@@ -1683,6 +1686,25 @@ export class Gateway {
         await this.dispatchInbound(frame)
       } else if (frame.type === 'inbound.control.stop') {
         await this.handleStop(frame)
+      } else if ((frame as any).type === 'inbound.control.reset') {
+        // Reset: kill the CCB subprocess AND remove session from manager,
+        // so next message creates an entirely fresh session with no history
+        const f = frame as any
+        const agentId =
+          f.agentId ||
+          this.router.route({
+            type: 'inbound.message',
+            idempotencyKey: '',
+            channel: f.channel,
+            peer: f.peer,
+            content: { text: '' },
+            ts: Date.now(),
+          }).agent.id
+        const sessionKey = `agent:${agentId}:${f.channel}:${f.peer.kind}:${f.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+        await this.sessions.destroySession(sessionKey)
+        console.log(
+          `[reset] destroyed session ${sessionKey} — next message will create fresh context`,
+        )
       } else if ((frame as any).type === 'control.session.compact') {
         // Compact: send a compaction request to the agent as a user message
         const sessionKey = (frame as any).sessionKey

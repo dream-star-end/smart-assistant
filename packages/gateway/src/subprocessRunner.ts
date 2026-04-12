@@ -146,12 +146,16 @@ export class SubprocessRunner extends EventEmitter {
     const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
 
     if (effectiveProvider === 'claude-subscription') {
-      // Claude subscription: inject OAuth token, clear any MiniMax/third-party env
-      // CLAUDE_CODE_OAUTH_TOKEN tells CCB to use Anthropic OAuth (api.anthropic.com)
+      // Claude subscription: inject OAuth token, route to Anthropic API
       if (this.opts.config.auth.claudeOAuth?.accessToken) {
         providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
       }
-      // Clear settings.json overrides so CCB uses its native Anthropic endpoint
+      // CRITICAL: Tell CCB that the host owns provider routing.
+      // Without this, CCB's managedEnv.ts will Object.assign settings.json env
+      // (ANTHROPIC_BASE_URL=minimax, ANTHROPIC_AUTH_TOKEN=minimax_key) OVER our
+      // spawn env, routing Claude requests to MiniMax instead of Anthropic.
+      // With this flag, CCB strips provider vars from settings.json during load.
+      providerEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
       providerEnv.ANTHROPIC_BASE_URL = ''
       providerEnv.ANTHROPIC_AUTH_TOKEN = ''
       providerEnv.ANTHROPIC_MODEL = ''
@@ -371,6 +375,17 @@ export class SubprocessRunner extends EventEmitter {
           command: srv.command,
           args: srv.args ?? [],
           env: srv.env ?? {},
+        }
+      }
+
+      // Per-agent browser isolation: give each agent its own Chrome profile
+      // to prevent "Browser is already in use" conflicts between agents.
+      if (mcpServers.browser) {
+        const browserArgs = [...(mcpServers.browser.args || [])]
+        const hasUserDataDir = browserArgs.some((a: string) => a.startsWith('--user-data-dir'))
+        if (!hasUserDataDir) {
+          browserArgs.push('--user-data-dir', `/tmp/openclaude-browser-${this.opts.agentId}`)
+          mcpServers.browser.args = browserArgs
         }
       }
 

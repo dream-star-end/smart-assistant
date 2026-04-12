@@ -244,6 +244,57 @@
       return match
     })
 
+    // Step 2.5: Fix ALL Markdown-rendered <img> that aren't proper HTTP URLs.
+    // Agents may produce: ![alt](/path.png), ![alt](../path.png), ![alt](file?path=...),
+    // ![alt](filename.png). None of these work as raw browser requests.
+    // Rewrite anything that looks like a media file to use /api/file.
+    const _MEDIA_IMG_EXTS_RE = /\.(?:jpg|jpeg|png|gif|webp|bmp|svg)(?:\?.*)?$/i
+    const _MEDIA_AV_EXTS_RE = /\.(?:mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|pdf)(?:\?.*)?$/i
+    html = html.replace(
+      /<img\s+([^>]*)src=["']([^"']+)["']([^>]*)>/gi,
+      (match, before, src, after) => {
+        // Skip if already a proper URL (http/https/data/blob) or already /api/
+        if (/^(?:https?:|data:|blob:|\/api\/)/i.test(src)) return match
+        // Extract the path — handle relative paths, file?path=..., and absolute paths
+        let absPath = src
+        if (src.startsWith('file?path=')) {
+          // file?path=%2Froot%2F... → decode to /root/...
+          try {
+            absPath = decodeURIComponent(src.replace('file?path=', ''))
+          } catch {
+            absPath = src.replace('file?path=', '')
+          }
+        } else if (src.includes('/') && !src.startsWith('/')) {
+          // Relative path like ../../../root/.openclaude/generated/foo.png
+          // Try to extract the absolute part after the last ../
+          const parts = src.split('/')
+          const rootIdx = parts.findIndex(
+            (p) => p === 'root' || p === 'home' || p === 'tmp' || p === 'opt',
+          )
+          if (rootIdx >= 0) absPath = '/' + parts.slice(rootIdx).join('/')
+        }
+        if (_MEDIA_IMG_EXTS_RE.test(absPath)) return _renderLocalMedia(absPath)
+        return match
+      },
+    )
+    // Same for <a href="local-media-path"> (audio/video/pdf links from Markdown)
+    html = html.replace(
+      /<a\s+[^>]*href=["']([^"']+\.(?:mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|pdf))["'][^>]*>.*?<\/a>/gi,
+      (match, src) => {
+        if (/^(?:https?:|data:|blob:|\/api\/)/i.test(src)) return match
+        let absPath = src
+        if (src.includes('/') && !src.startsWith('/')) {
+          const parts = src.split('/')
+          const rootIdx = parts.findIndex(
+            (p) => p === 'root' || p === 'home' || p === 'tmp' || p === 'opt',
+          )
+          if (rootIdx >= 0) absPath = '/' + parts.slice(rootIdx).join('/')
+        }
+        if (_MEDIA_AV_EXTS_RE.test(absPath)) return _renderLocalMedia(absPath)
+        return match
+      },
+    )
+
     // Step 3: Restore code block placeholders
     html = html.replace(
       /<!--CODE_BLOCK_(\d+)-->/g,
@@ -1672,9 +1723,26 @@
     const m = $('messages')
     return m.scrollHeight - m.scrollTop - m.clientHeight < 120
   }
+  // Track whether user has manually scrolled up during streaming — if so, don't auto-scroll
+  let _userScrolledUp = false
+  let _scrollDebounce = null
+  $('messages')?.addEventListener('wheel', () => {
+    if (state.sendingInFlight) {
+      _userScrolledUp = !isAtBottom()
+      // Reset after 3s of no manual scroll — user probably wants to follow again
+      clearTimeout(_scrollDebounce)
+      _scrollDebounce = setTimeout(() => {
+        _userScrolledUp = false
+      }, 3000)
+    }
+  })
+
   function scrollBottom(force) {
     const m = $('messages')
-    if (force || isAtBottom()) m.scrollTop = m.scrollHeight
+    // During streaming: always scroll unless user explicitly scrolled up
+    if (force || (state.sendingInFlight && !_userScrolledUp) || isAtBottom()) {
+      m.scrollTop = m.scrollHeight
+    }
   }
   function _buildMessageEl(msg) {
     const el = document.createElement('div')
@@ -1682,6 +1750,9 @@
     if (msg.error) el.classList.add('error')
     el.dataset.msgId = msg.id
     if (msg.role === 'assistant') {
+      if (msg.cronPush) {
+        el.classList.add('cron-push')
+      }
       const avatar = document.createElement('div')
       avatar.className = 'avatar'
       // Use agent persona emoji if available, fallback to 'O'
@@ -1690,6 +1761,13 @@
       )
       avatar.textContent = agentInfo?.avatarEmoji || 'O'
       el.appendChild(avatar)
+      // Cron push badge — visually marks system-generated messages
+      if (msg.cronPush) {
+        const badge = document.createElement('div')
+        badge.className = 'cron-push-badge'
+        badge.textContent = `📋 ${msg.cronLabel || '定时任务'}`
+        el.appendChild(badge)
+      }
       const body = document.createElement('div')
       body.className = 'msg-body'
       body.innerHTML = renderMarkdown(msg.text || '')
@@ -2584,10 +2662,20 @@
         updateMsgStatus(_lastUserMsg)
       }
     }
+    // Detect non-heartbeat cron/task push — mark as system notification
+    const isCronPush = frame.cronJob && !frame.cronJob.heartbeat
+
     for (const block of frame.blocks || []) {
       if (block.kind === 'text') {
         sess._streamingThinking = null
-        if (!sess._streamingAssistant) sess._streamingAssistant = addMessage(sess, 'assistant', '')
+        if (!sess._streamingAssistant) {
+          sess._streamingAssistant = addMessage(
+            sess,
+            'assistant',
+            '',
+            isCronPush ? { cronPush: true, cronLabel: frame.cronJob?.label } : {},
+          )
+        }
         sess._streamingAssistant.text += block.text
         _checkTaskNotifications(block.text)
         // Throttled render: batch streaming updates via rAF instead of per-delta
@@ -2834,14 +2922,28 @@
     },
     {
       cmd: '/clear',
-      desc: '清空当前会话消息',
+      desc: '清空当前会话消息和上下文',
       run() {
         const sess = getSession()
         if (!sess) return
         sess.messages = []
+        sess._streamingAssistant = null
+        sess._streamingThinking = null
         renderMessages()
         scheduleSave(sess)
-        toast('会话已清空')
+        // Notify gateway to kill the CCB subprocess so context is truly reset
+        // Next message will spawn a fresh process with no history
+        if (state.ws && state.ws.readyState === 1) {
+          state.ws.send(
+            JSON.stringify({
+              type: 'inbound.control.reset',
+              channel: 'webchat',
+              peer: { id: sess.id, kind: 'dm' },
+              agentId: sess.agentId || state.defaultAgentId,
+            }),
+          )
+        }
+        toast('会话已清空，上下文已重置')
       },
     },
     {

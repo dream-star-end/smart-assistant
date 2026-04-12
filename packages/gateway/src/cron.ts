@@ -37,6 +37,7 @@ export interface CronJob {
   enabled?: boolean
   oneshot?: boolean // fire once then auto-disable
   label?: string // human-readable label (for reminders)
+  heartbeat?: boolean // if true, runs in user's main session (shared context)
 }
 
 export interface CronFile {
@@ -103,14 +104,15 @@ const DEFAULT_JOBS: CronJob[] = [
     agent: 'main',
     enabled: true,
     deliver: 'webchat',
-    prompt: `Periodic heartbeat check (every 4 hours). You are proactively checking on things for the user.
+    heartbeat: true, // runs in user's main session (shared context)
+    prompt: `Periodic heartbeat check. You are running in the user's main session with full conversation context.
 
 1. \`memory(action=read, target=memory)\` — scan for any time-sensitive items, deadlines, or follow-ups.
 2. \`archival_search("pending OR reminder OR TODO OR deadline")\` — check for stored reminders/tasks.
-3. \`session_search\` with recent date — any conversations where user said "later", "tomorrow", "remind me"?
-4. If you find something actionable (missed deadline, pending follow-up, stale reminder), compose a SHORT proactive update for the user.
-5. If everything is normal and nothing to report, reply with exactly "[SILENT]".
-6. DO NOT report that you checked and found nothing — that's what [SILENT] is for.`,
+3. Review recent conversation context — any unfinished tasks, pending follow-ups, or things the user said "later" about?
+4. If you find something actionable, compose a SHORT proactive update.
+5. If nothing needs attention, reply with exactly "HEARTBEAT_OK".
+6. DO NOT report that you checked and found nothing — that's what HEARTBEAT_OK is for.`,
   },
 ]
 
@@ -206,6 +208,12 @@ function matchPart(part: string, val: number): boolean {
 export class CronScheduler {
   private timer: NodeJS.Timeout | null = null
   private running = false
+  /** Reference to last-active-channel map for heartbeat session routing */
+  public lastActiveChannel?: Map<
+    string,
+    { channel: string; peerId: string; sessionKey: string; at: number }
+  >
+
   constructor(
     private config: OpenClaudeConfig,
     private sessions: SessionManager,
@@ -268,19 +276,34 @@ export class CronScheduler {
   }
 
   private async runJob(job: CronJob, agent: AgentDef): Promise<void> {
-    console.log(`[cron] running job ${job.id}`)
-    const sessionKey = `agent:${agent.id}:cron:dm:${job.id}`
+    console.log(`[cron] running job ${job.id} (heartbeat=${!!job.heartbeat})`)
+
+    let sessionKey: string
+    if (job.heartbeat) {
+      // Heartbeat: run in user's main session (shared context)
+      const lastActive = this.lastActiveChannel?.get(agent.id)
+      sessionKey = lastActive?.sessionKey || `agent:${agent.id}:webchat:dm:__heartbeat__`
+    } else {
+      // Regular task: isolated session per execution (no history accumulation)
+      sessionKey = `agent:${agent.id}:cron:dm:${job.id}:${Date.now()}`
+    }
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
-      channel: 'cron',
-      peerId: job.id,
-      title: `[cron] ${job.id}`,
+      channel: job.heartbeat ? 'webchat' : 'cron',
+      peerId: job.heartbeat ? sessionKey.split(':')[4] || job.id : job.id,
+      title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
     })
     let output = ''
     await this.sessions.submit(session, job.prompt, (e) => {
       if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
     })
+
+    // Isolated sessions (non-heartbeat): destroy after execution to free resources
+    if (!job.heartbeat) {
+      await this.sessions.destroySession(sessionKey)
+    }
     // Persist output
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)
@@ -288,10 +311,10 @@ export class CronScheduler {
       await mkdir(dirname(outPath), { recursive: true })
       await writeFile(outPath, output)
     } catch {}
-    // Deliver if not [SILENT]
+    // Deliver if not [SILENT] or HEARTBEAT_OK
     const trimmed = output.trim()
-    if (trimmed.startsWith('[SILENT]')) {
-      console.log(`[cron] job ${job.id} silent, not delivering`)
+    if (trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
+      console.log(`[cron] job ${job.id} silent/ok, not delivering`)
       return
     }
     console.log(

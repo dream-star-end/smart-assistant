@@ -380,6 +380,16 @@ export class SessionManager {
     return this.sessions.get(sessionKey)
   }
 
+  /** Destroy a single session: kill subprocess + remove from map + clear resume mapping */
+  async destroySession(sessionKey: string): Promise<void> {
+    const s = this.sessions.get(sessionKey)
+    if (!s) return
+    await s.runner.shutdown()
+    this.sessions.delete(sessionKey)
+    this._resumeMap.delete(sessionKey)
+    this._saveResumeMap()
+  }
+
   async shutdownAll(): Promise<void> {
     await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
     this.sessions.clear()

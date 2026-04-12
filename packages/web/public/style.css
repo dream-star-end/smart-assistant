@@ -1001,6 +1001,21 @@ a:hover {
   word-break: break-word;
   overflow-wrap: break-word;
 }
+/* Cron/task push messages — visually distinct from regular AI replies */
+.msg.assistant.cron-push {
+  border-left: 3px solid var(--accent);
+  background: var(--bg-raised);
+  border-radius: var(--radius);
+  padding-left: var(--space-3);
+}
+.cron-push-badge {
+  grid-column: 2;
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 2px;
+  letter-spacing: 0.3px;
+}
 .msg.assistant .msg-meta {
   grid-column: 2;
   grid-row: 2;

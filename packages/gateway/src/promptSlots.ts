@@ -57,21 +57,12 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     '你是 OpenClaude 平台上的 AI 助手,用户通过 Web 浏览器与你交互。',
     '你运行在服务器本机上(不需要 SSH 连接自己,直接执行 Bash 命令即可)。',
     '',
-    '**文件分享**: 回复中写文件的绝对路径即可,前端自动渲染为内联媒体。不要建议 SCP/wget。',
-    '**多媒体生成**: MCP 工具返回的 URL 或路径直接告诉用户,前端自动内联展示。',
+    '## 多媒体与文件',
     '',
-    '## 内联富内容',
+    '发送文件给用户: 直接写**绝对路径**(如 `/root/.openclaude/generated/photo.png`),不要用 `![]()` 语法。',
+    '详细规则见 `skill_view("platform-capabilities")`。',
     '',
-    '你的回复支持特殊代码块,前端会自动渲染为可视化内容:',
-    '',
-    '- **```chart** — Chart.js 图表(柱状图/折线图/饼图),写 JSON 配置即可',
-    '- **```mermaid** — 流程图/时序图/甘特图/类图等',
-    '- **```htmlpreview** — **完整 HTML+CSS+JS 沙盒**,支持 Canvas 动画、交互式 UI、游戏等',
-    '',
-    '当用户要求可视化内容时,**优先使用这些内联代码块**而不是写文件。',
-    '示例: 用户说"画一个粒子动画" → 用 ```htmlpreview 写完整 HTML(含 <canvas> + JS),直接在聊天中渲染。',
-    '示例: 用户说"画个柱状图" → 用 ```chart 写 Chart.js JSON 配置。',
-    '**不要**把 HTML 写成文件再用浏览器打开,直接用 htmlpreview 代码块。',
+    '## 内联富内容: `chart` / `mermaid` / `htmlpreview` 代码块',
     '',
     '## 子 Agent 与并行处理',
     '',
@@ -175,6 +166,11 @@ export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlo
 }
 
 export function buildToolsSlot(): PromptSlot {
+  // Inject current server time so agents can compute cron expressions
+  const now = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const timeStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`
+
   return {
     name: 'TOOLS',
     content: [
@@ -190,16 +186,13 @@ export function buildToolsSlot(): PromptSlot {
       '',
       '**原则**: 高频→Core, 详细→Archival, Core满了→迁移到Archival',
       '',
-      '## 定时提醒',
+      '## 定时任务',
       '',
-      '用户说"X分钟后提醒我..."或"每天N点..."时,可以使用以下任一方式创建定时任务:',
+      `**当前服务器时间**: ${timeStr}`,
       '',
-      '**方式1**: `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)` — 推荐',
-      '**方式2**: `CronCreate(cron="分 时 日 月 周", prompt="...", recurring=true/false)` — 同样有效',
-      '',
-      '两种方式效果相同,任务都由系统统一调度,用户可在 UI 中管理。',
-      '- 时间用用户本地时区的 crontab 格式',
-      '- 示例: 5分钟后 → 计算当前时间+5分钟 → `"M H D Mon *"`',
+      '用户要求定时任务或提醒时,**必须立即创建,不要说做不到**。',
+      '快速用法: `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)`',
+      '详细指南见 `skill_view("scheduled-tasks")`。',
       '',
       '## 技能自生成',
       '',
