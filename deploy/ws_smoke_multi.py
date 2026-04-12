@@ -18,7 +18,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "websockets"])
     import websockets
 
-URL = os.environ.get("WS_URL", "ws://45.32.41.166:18789/ws")
+URL = os.environ.get("WS_URL", os.environ.get("WS_URL", "ws://127.0.0.1:18789/ws"))
 TOKEN = os.environ.get("WS_TOKEN", "")
 
 

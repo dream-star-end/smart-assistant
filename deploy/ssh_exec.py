@@ -3,10 +3,10 @@
 import sys
 import paramiko
 
-HOST = "45.32.41.166"
-PORT = 2222
+HOST = os.environ.get("DEPLOY_HOST", "127.0.0.1")
+PORT = int(os.environ.get("DEPLOY_PORT", "2222"))
 USER = "root"
-PASSWORD = "w,A6%[pWNu3c2[7]"
+PASSWORD = os.environ["DEPLOY_PASSWORD"]
 
 
 def main():

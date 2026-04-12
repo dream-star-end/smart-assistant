@@ -1,1 +1,1 @@
-{"text":"用户名字是 Alice。\n§\n用户在浏览器和 Telegram 上都与我交互,他们偏好简洁的中文回答。\n§\n用户的个人 AI 助理项目叫 OpenClaude,部署在 45.32.41.166,用 cloudflared 暴露 HTTPS。"}
+{"text":"用户名字是 Alice。\n§\n用户在浏览器和 Telegram 上都与我交互,他们偏好简洁的中文回答。\n§\n用户的个人 AI 助理项目叫 OpenClaude,部署在 YOUR_SERVER_IP,用 cloudflared 暴露 HTTPS。"}

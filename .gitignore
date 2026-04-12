@@ -4,5 +4,7 @@ dist/
 .DS_Store
 *.swp
 *.swo
+.env
+deploy/.env
 claude-code-best/node_modules/
 claude-code-best/dist/

@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """E2E: verify minimax-media MCP tools work for image gen + TTS."""
 import asyncio
@@ -16,7 +17,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "websockets"])
     import websockets
 
-URL = "ws://45.32.41.166:18789/ws"
+URL = os.environ.get("WS_URL", "ws://127.0.0.1:18789/ws")
 TOKEN = "43efa4d9ad09122a16820c7ff4039269600e2a000224c2d5b272d84114343d52"
 
 
