@@ -1,0 +1,16 @@
+{"type":"system","subtype":"init","session_id":"sess-xyz","cwd":"/tmp","tools":["Bash","Read"],"model":"MiniMax-M2.7","permissionMode":"default","claude_code_version":"2.1.888"}
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":100,"output_tokens":0}}},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I'll list the files."}},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_abc123","name":"Bash","input":{}}},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls /opt\"}"}},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_stop","index":1},"session_id":"sess-xyz"}
+{"type":"assistant","message":{"id":"msg1","type":"message","role":"assistant","content":[{"type":"text","text":"I'll list the files."},{"type":"tool_use","id":"toolu_abc123","name":"Bash","input":{"command":"ls /opt"}}],"usage":{"input_tokens":100,"output_tokens":20}},"session_id":"sess-xyz"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc123","content":"openclaude\nclaude-code-best","is_error":false}]},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg2","type":"message","role":"assistant","content":[],"usage":{"input_tokens":150,"output_tokens":0}}},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Found 2 dirs: openclaude and claude-code-best."}},"session_id":"sess-xyz"}
+{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"sess-xyz"}
+{"type":"assistant","message":{"id":"msg2","type":"message","role":"assistant","content":[{"type":"text","text":"Found 2 dirs: openclaude and claude-code-best."}],"usage":{"input_tokens":150,"output_tokens":15}},"session_id":"sess-xyz"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":8000,"num_turns":1,"result":"Found 2 dirs: openclaude and claude-code-best.","session_id":"sess-xyz","total_cost_usd":0.005,"usage":{"input_tokens":250,"output_tokens":35,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}

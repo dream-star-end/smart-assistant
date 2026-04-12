@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenClaude Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openclaude/openclaude
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="OPENCLAUDE_HOME=/root/.openclaude"
+ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/openclaude.log
+StandardError=append:/var/log/openclaude.log
+
+[Install]
+WantedBy=multi-user.target
