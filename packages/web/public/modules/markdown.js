@@ -23,8 +23,19 @@ const _chartInstances = new Map() // id -> Chart instance, for cleanup
 if (window.marked) {
   marked.setOptions({ breaks: true, gfm: true })
   const renderer = new marked.Renderer()
-  renderer.code = (code, infostring) => {
-    const lang = (infostring || '').match(/\S*/)?.[0] || ''
+  // marked v12+ changed renderer signatures: callbacks receive a single object parameter
+  // instead of positional args. We handle both for safety.
+  renderer.code = (codeOrObj, infostring) => {
+    let code, lang
+    if (typeof codeOrObj === 'object' && codeOrObj !== null) {
+      // marked v12+: { text, lang, escaped }
+      code = codeOrObj.text || ''
+      lang = (codeOrObj.lang || '').match(/\S*/)?.[0] || ''
+    } else {
+      // marked v4/v5: (code, infostring, escaped)
+      code = codeOrObj || ''
+      lang = (infostring || '').match(/\S*/)?.[0] || ''
+    }
     if (lang === 'mermaid') {
       const id = `mmd-${Math.random().toString(36).slice(2, 10)}`
       pendingMermaid.push({ id, code })
@@ -55,8 +66,13 @@ if (window.marked) {
     const langLabel = lang ? `<span class="code-lang">${lang}</span>` : ''
     return `<pre class="code-block">${langLabel}<button class="code-copy" type="button" data-copy>复制</button><code class="hljs language-${lang}">${highlighted}</code></pre>`
   }
-  // Override image renderer so markdown ![alt](url) also produces inline-img with actions
-  renderer.image = (href, title, text) => _imgHtml(href, title || text || '')
+  // marked v12+: image receives { href, title, text } object
+  renderer.image = (hrefOrObj, title, text) => {
+    if (typeof hrefOrObj === 'object' && hrefOrObj !== null) {
+      return _imgHtml(hrefOrObj.href || '', hrefOrObj.title || hrefOrObj.text || '')
+    }
+    return _imgHtml(hrefOrObj || '', title || text || '')
+  }
   marked.setOptions({ renderer })
 }
 
