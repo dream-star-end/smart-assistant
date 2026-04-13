@@ -1,13 +1,34 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v5'
+const VERSION = 'openclaude-v6'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/app.js',
   '/manifest.json',
   '/icon.svg',
+  // ES modules
+  '/modules/main.js',
+  '/modules/dom.js',
+  '/modules/util.js',
+  '/modules/state.js',
+  '/modules/api.js',
+  '/modules/db.js',
+  '/modules/theme.js',
+  '/modules/markdown.js',
+  '/modules/ui.js',
+  '/modules/attachments.js',
+  '/modules/speech.js',
+  '/modules/notifications.js',
+  '/modules/permissions.js',
+  '/modules/oauth.js',
+  '/modules/memory.js',
+  '/modules/tasks.js',
+  '/modules/agents.js',
+  '/modules/sessions.js',
+  '/modules/messages.js',
+  '/modules/websocket.js',
+  '/modules/commands.js',
   // Vendored dependencies
   '/vendor/marked.min.js',
   '/vendor/highlight.min.js',

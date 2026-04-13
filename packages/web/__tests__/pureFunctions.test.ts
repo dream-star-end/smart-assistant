@@ -1,19 +1,29 @@
 import * as assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 /**
  * Pure Function Unit Tests for OpenClaude Frontend.
  *
- * Since all functions are trapped inside the IIFE in app.js,
- * we extract function source via regex and create callables via new Function().
- * After the module refactor (Phase 2), these will switch to direct imports.
+ * Extracts function source via regex and creates callables via new Function().
+ * Works with both the pre-refactor app.js IIFE and the post-refactor modules/ directory.
  *
  * Run: npx tsx --test packages/web/__tests__/pureFunctions.test.ts
  */
 import { describe, it } from 'node:test'
 
 const PUBLIC = resolve(import.meta.dirname, '..', 'public')
-const appJs = readFileSync(resolve(PUBLIC, 'app.js'), 'utf-8')
+const modulesDir = resolve(PUBLIC, 'modules')
+
+// Load JS source: modules/ (post-refactor) or app.js (pre-refactor)
+let appJs: string
+if (existsSync(modulesDir)) {
+  appJs = readdirSync(modulesDir)
+    .filter((f) => f.endsWith('.js'))
+    .map((f) => readFileSync(resolve(modulesDir, f), 'utf-8'))
+    .join('\n')
+} else {
+  appJs = readFileSync(resolve(PUBLIC, 'app.js'), 'utf-8')
+}
 
 // ── Function extractor ──
 
@@ -51,7 +61,11 @@ function extractFunction(source: string, name: string): string {
     if (closingPattern.test(lines[endLineIdx])) break
   }
 
-  return lines.slice(fnLineIdx, endLineIdx + 1).join('\n')
+  // Strip 'export' keyword so the source can be used with new Function()
+  return lines
+    .slice(fnLineIdx, endLineIdx + 1)
+    .join('\n')
+    .replace(/^export\s+/, '')
 }
 
 /**

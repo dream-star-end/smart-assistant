@@ -1,5 +1,5 @@
 import * as assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 /**
  * DOM Integrity Tests for OpenClaude Frontend.
@@ -71,7 +71,19 @@ const TEMPLATE_DYNAMIC_PREFIXES = ['tasks-panel-', 'tasks-tab-']
 
 // ── Load files once ──
 const html = readPublicFile('index.html')
-const js = readPublicFile('app.js')
+
+// Load JS source: either modules/ directory (post-refactor) or app.js (pre-refactor)
+const modulesDir = resolve(PUBLIC, 'modules')
+let js: string
+if (existsSync(modulesDir)) {
+  // Post-refactor: scan all .js files in modules/
+  js = readdirSync(modulesDir)
+    .filter((f) => f.endsWith('.js'))
+    .map((f) => readFileSync(resolve(modulesDir, f), 'utf-8'))
+    .join('\n')
+} else {
+  js = readPublicFile('app.js')
+}
 
 const htmlIds = extractHtmlIds(html)
 const htmlIdSet = new Set(htmlIds)
@@ -191,11 +203,11 @@ describe('T05: Parser sanity checks', () => {
     assert.ok(unique.size >= 30, `Only found ${unique.size} unique $() refs (expected ≥30)`)
   })
 
-  it('$ helper is defined in app.js', () => {
+  it('$ helper is defined in JS source', () => {
     assert.ok(
       js.includes('const $ = (id) => document.getElementById(id)') ||
-        js.includes('const $ = (id) => document.getElementById(id)'),
-      '$ helper not found in app.js',
+        js.includes('export const $ = (id) => document.getElementById(id)'),
+      '$ helper not found in JS source',
     )
   })
 })

@@ -28,15 +28,18 @@ git push origin master
 - `provider: minimax` 或无 → 不注入 token, CCB fallback 到 settings.json (MiniMax API)
 - 每个 agent 有独立的 Chrome profile (`/tmp/openclaude-browser-<agentId>`)
 
-## 前端注意事项
+## 前端架构
 
-- app.js ~3500 行 vanilla JS, index.html ~475 行, style.css ~1900 行
+- **ES Modules**: 21 个模块文件在 `packages/web/public/modules/`，入口 `main.js`
+- **依赖层级**: dom/util/state (L0) → api/db/theme/markdown (L1) → ui/attachments/speech/notifications/permissions (L2) → oauth/memory/tasks/agents/sessions (L3) → messages/websocket/commands (L4) → main (L5)
+- **循环依赖处理**: 使用 `setXxxDeps()` late-binding 模式
+- index.html 使用 `<script type="module" src="/modules/main.js?v=5">`
+- SW 版本号在 sw.js 第 3 行 (`openclaude-v6`)
 - 关键 DOM 元素: `#toast`, `#lightbox`, `#messages`, 各种 modal
-- **修改 HTML 后务必检查所有被 $() 引用的 id 元素是否存在**
-- SW 版本号在 sw.js 第 3 行, app.js 缓存版本在 index.html 最后的 script 标签
+- **修改 HTML 后务必运行 `npm run test:web` 检查 DOM 完整性**
 
-## 下次待做
+## 前端测试
 
-- 前端测试用例（DOM 元素完整性、关键函数）
-- 前端代码拆分重构（保持 vanilla，用 ES module 或注释分区）
-- VPS 上 git pull 部署已就绪
+- `npm run test:web` 运行前端测试（DOM 完整性 + 纯函数）
+- DOM 完整性测试自动扫描 modules/ 中所有 $() 引用，交叉检查 index.html 中的 id
+- 纯函数测试覆盖 _basename, formatSize, shortTime, sessionGroup, _cronHuman, localPathToUrl, htmlSafeEscape, formatMeta, buildToolUseLabel
