@@ -294,7 +294,6 @@ export function _buildMessageEl(msg) {
     el.appendChild(header)
     const body = document.createElement('div')
     body.className = 'msg-body thinking-body'
-    body.style.whiteSpace = 'pre-wrap'
     body.textContent = msg.text || ''
     el.appendChild(body)
   } else if (msg.role === 'tool') {
@@ -385,15 +384,12 @@ export function updateMessageEl(msg, streaming) {
     }
   } else if (msg.role === 'thinking') {
     const body = el.querySelector('.thinking-body') || el.querySelector('.msg-body')
-    if (body) {
-      body.textContent = msg.text || ''
-      body.style.whiteSpace = 'pre-wrap'
-    }
-    // Update header: show "思考完成" when streaming ends
-    if (!streaming) {
-      const label = el.querySelector('.thinking-label')
-      if (label) label.textContent = '💭 思考过程'
-    }
+    if (body) body.textContent = msg.text || ''
+    // Update header: streaming → "思考中…", done → "思考过程"
+    const label = el.querySelector('.thinking-label')
+    if (label) label.textContent = streaming ? '💭 思考中…' : '💭 思考过程'
+    // Auto-collapse when streaming ends
+    if (!streaming) el.classList.add('collapsed')
   } else if (msg.role === 'tool') {
     const body = el.querySelector('.tool-body')
     if (body) body.textContent = msg.text || ''

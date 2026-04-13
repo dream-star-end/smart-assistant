@@ -1270,25 +1270,56 @@ a:hover {
   font-weight: normal;
 }
 
+/* ── Thinking block ── */
 .msg.thinking {
   display: flex;
-  gap: var(--space-3);
-  align-items: flex-start;
-  padding: 4px 0 4px 14px;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
   border-left: 2px solid var(--thinking);
-  color: var(--thinking);
-  opacity: 0.85;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--thinking) 6%, transparent);
+  max-width: 100%;
+  overflow: hidden;
+}
+.msg.thinking::before { content: none; }
+.thinking-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px 12px;
+  cursor: pointer;
+  user-select: none;
   font-size: var(--text-sm);
+  color: var(--thinking);
+  font-weight: 500;
+}
+.thinking-header:hover { background: color-mix(in srgb, var(--thinking) 10%, transparent); }
+.thinking-label { display: flex; align-items: center; gap: 6px; }
+.thinking-body {
+  padding: 4px 14px 10px;
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
   font-style: italic;
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: break-word;
-  max-width: 100%;
+  max-height: 300px;
+  overflow-y: auto;
+  line-height: 1.6;
 }
-.msg.thinking::before {
-  content: "💭";
-  flex-shrink: 0;
-  font-style: normal;
+.msg.thinking.collapsed .thinking-body { display: none; }
+.msg.thinking.collapsed .thinking-header::after {
+  content: "▸";
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.msg.thinking:not(.collapsed) .thinking-header::after {
+  content: "▾";
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--fg-dim);
 }
 
 /* Typing indicator */
