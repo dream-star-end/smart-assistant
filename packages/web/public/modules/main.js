@@ -687,10 +687,17 @@ function showApp() {
 }
 
 function createNewChat() {
+  // Save old session's sending state before switching
+  const oldSess = getSession()
+  if (oldSess) oldSess._sendingInFlight = state.sendingInFlight
   // Inherit current session's agent, fallback to default
-  const currentSess = getSession()
-  const agentId = currentSess?.agentId || state.defaultAgentId
+  const agentId = oldSess?.agentId || state.defaultAgentId
   createSession(agentId)
+  // New session is never sending — reset UI state
+  state.sendingInFlight = false
+  hideTypingIndicator()
+  updateSendEnabled()
+  setTitleBusy(false)
   renderSidebar()
   renderMessages()
   renderAgentDropdown()

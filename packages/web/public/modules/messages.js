@@ -266,6 +266,17 @@ export function _buildMessageEl(msg) {
       body.appendChild(preview)
     }
     el.appendChild(body)
+  } else if (msg.role === 'thinking') {
+    const header = document.createElement('div')
+    header.className = 'thinking-header'
+    header.innerHTML = '<span class="thinking-label">💭 思考中…</span>'
+    header.onclick = () => el.classList.toggle('collapsed')
+    el.appendChild(header)
+    const body = document.createElement('div')
+    body.className = 'msg-body thinking-body'
+    body.style.whiteSpace = 'pre-wrap'
+    body.textContent = msg.text || ''
+    el.appendChild(body)
   } else if (msg.role === 'tool') {
     const icon = document.createElement('span')
     icon.className = 'tool-icon'
@@ -351,6 +362,17 @@ export function updateMessageEl(msg, streaming) {
       preview.innerHTML = `<span class="tool-icon">${msg._isError ? '⚠️' : '✓'}</span><div class="tool-body">${htmlSafeEscape(msg._resultPreview)}</div>`
       body.appendChild(preview)
       el.appendChild(body)
+    }
+  } else if (msg.role === 'thinking') {
+    const body = el.querySelector('.thinking-body') || el.querySelector('.msg-body')
+    if (body) {
+      body.textContent = msg.text || ''
+      body.style.whiteSpace = 'pre-wrap'
+    }
+    // Update header: show "思考完成" when streaming ends
+    if (!streaming) {
+      const label = el.querySelector('.thinking-label')
+      if (label) label.textContent = '💭 思考过程'
     }
   } else if (msg.role === 'tool') {
     const body = el.querySelector('.tool-body')

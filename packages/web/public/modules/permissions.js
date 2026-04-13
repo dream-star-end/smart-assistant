@@ -13,13 +13,13 @@ export function enqueuePermission(frame) {
   // Dedupe: if we've already got this reqId, skip
   if (permCurrent && permCurrent.id === req.id) return
   if (permQueue.some((p) => p.id === req.id)) return
-  // Extract reason + detail from the block text body
-  const blockText = (frame.blocks || []).map((b) => b.text || '').join('\n')
   const enriched = {
     id: req.id,
     tool: req.tool,
-    summary: req.summary,
-    rawText: blockText,
+    reason: req.reason || '',
+    detail: req.detail || '',
+    summary: req.summary || '',
+    toolInput: req.toolInput || null,
   }
   permQueue.push(enriched)
   if (!permCurrent) showNextPermission()
@@ -29,9 +29,16 @@ export function showNextPermission() {
   permCurrent = permQueue.shift()
   if (!permCurrent) return
   $('perm-tool').value = permCurrent.tool || ''
-  const m = /规则:\s*([^\n]+)/.exec(permCurrent.rawText || '')
-  $('perm-reason').value = m ? m[1].trim() : '(unknown)'
-  $('perm-detail').value = permCurrent.summary || ''
+  $('perm-reason').value = permCurrent.reason || permCurrent.summary || '(unknown)'
+  // Show tool input as detail so user knows exactly what the tool will do
+  let detailText = permCurrent.detail || permCurrent.summary || ''
+  if (permCurrent.toolInput) {
+    try {
+      const inputStr = JSON.stringify(permCurrent.toolInput, null, 2)
+      if (inputStr.length < 2000) detailText = `${detailText}\n\n--- 工具参数 ---\n${inputStr}`
+    } catch {}
+  }
+  $('perm-detail').value = detailText
   const pendingMsg = permQueue.length > 0 ? `(后面还有 ${permQueue.length} 个待审批)` : ''
   $('perm-pending-count').textContent = pendingMsg
   openModal('permission-modal')

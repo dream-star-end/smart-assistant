@@ -1620,7 +1620,10 @@ export class Gateway {
       permissionRequest: {
         id: req.reqId,
         tool: req.toolName,
+        reason: req.reason,
+        detail: req.detail,
         summary: req.summary,
+        toolInput: req.toolInput,
         options: ['allow', 'deny'],
       },
     }

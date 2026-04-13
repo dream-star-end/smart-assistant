@@ -57,7 +57,8 @@ export interface CronBridgeEvent {
 
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
-  private maxIdleMs = 30 * 60 * 1000
+  private maxIdleMsCron = 30 * 60 * 1000 // 30 min for cron/task sessions
+  private maxIdleMsChat = 7 * 24 * 60 * 60 * 1000 // 7 days for webchat sessions
   /** @deprecated Use eventBus 'task.created'/'task.deleted' instead. Kept for backward compat. */
   public onCronBridge?: (event: CronBridgeEvent) => Promise<void>
 
@@ -413,12 +414,16 @@ export class SessionManager {
     }))
   }
 
-  // 周期性 LRU 驱逐
+  // 周期性 LRU 驱逐 — webchat sessions survive much longer than cron/task sessions
   startEvictionLoop(intervalMs = 60_000): () => void {
     const t = setInterval(() => {
       const now = Date.now()
       for (const [key, s] of this.sessions) {
-        if (now - s.lastUsedAt > this.maxIdleMs) {
+        // Cron/task sessions (contain ':cron:' or ':task:') use short idle timeout
+        // Webchat/user sessions use long idle timeout (7 days)
+        const isTempSession = key.includes(':cron:') || key.includes(':task:')
+        const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
+        if (now - s.lastUsedAt > maxIdle) {
           s.runner.shutdown().catch(() => {})
           this.sessions.delete(key)
         }
