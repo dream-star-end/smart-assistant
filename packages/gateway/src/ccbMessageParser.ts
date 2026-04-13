@@ -175,10 +175,14 @@ export class CcbMessageParser {
       const delta = ev.delta
       if (!delta) return
       if (delta.type === 'text_delta' && delta.text) {
-        this.assistantBuf += delta.text
-        this.onEvent({ kind: 'block', block: { kind: 'text', text: delta.text } })
+        // Defensive: ensure text is always a string (CCB may send nested objects)
+        const textStr = typeof delta.text === 'string' ? delta.text : JSON.stringify(delta.text)
+        this.assistantBuf += textStr
+        this.onEvent({ kind: 'block', block: { kind: 'text', text: textStr } })
       } else if (delta.type === 'thinking_delta' && delta.thinking) {
-        this.onEvent({ kind: 'block', block: { kind: 'thinking', text: delta.thinking } })
+        const thinkStr =
+          typeof delta.thinking === 'string' ? delta.thinking : JSON.stringify(delta.thinking)
+        this.onEvent({ kind: 'block', block: { kind: 'thinking', text: thinkStr } })
       } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
         const toolId = this.indexToToolId.get(ev.index as number)
         const tool = toolId ? this.streamingToolUses.get(toolId) : undefined

@@ -327,6 +327,14 @@ export function handleOutbound(frame) {
   const isCronPush = frame.cronJob && !frame.cronJob.heartbeat
 
   for (const block of frame.blocks || []) {
+    // Defensive: coerce block.text to string to prevent [object Object] rendering
+    const blockText =
+      typeof block.text === 'string'
+        ? block.text
+        : block.text != null
+          ? JSON.stringify(block.text)
+          : ''
+
     if (block.kind === 'text') {
       sess._streamingThinking = null
       if (!sess._streamingAssistant) {
@@ -337,7 +345,7 @@ export function handleOutbound(frame) {
           isCronPush ? { cronPush: true, cronLabel: frame.cronJob?.label } : {},
         )
       }
-      sess._streamingAssistant.text += block.text
+      sess._streamingAssistant.text += blockText
       _checkTaskNotifications(block.text)
       // Throttled render: batch streaming updates via rAF instead of per-delta
       if (!sess._streamRafPending) {
@@ -352,7 +360,7 @@ export function handleOutbound(frame) {
       }
     } else if (block.kind === 'thinking') {
       if (!sess._streamingThinking) sess._streamingThinking = addMessage(sess, 'thinking', '')
-      sess._streamingThinking.text += block.text
+      sess._streamingThinking.text += blockText
       if (!sess._thinkRafPending) {
         sess._thinkRafPending = true
         requestAnimationFrame(() => {
