@@ -23,7 +23,9 @@
     "agents": "tsx packages/cli/src/index.ts agents",
     "lint": "biome check packages",
     "format": "biome format --write packages",
-    "test": "npx tsx --test packages/gateway/src/__tests__/*.test.ts",
+    "test:gateway": "npx tsx --test packages/gateway/src/__tests__/*.test.ts",
+    "test:web": "npx tsx --test packages/web/__tests__/*.test.ts",
+    "test": "npm run test:gateway && npm run test:web",
     "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/storage/tsconfig.json && tsc --noEmit -p packages/gateway/tsconfig.json && tsc --noEmit -p packages/mcp-memory/tsconfig.json && tsc --noEmit -p packages/cli/tsconfig.json",
     "check": "npm run lint && npm run typecheck && npm run test"
   },
