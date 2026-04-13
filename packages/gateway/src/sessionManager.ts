@@ -180,9 +180,13 @@ export class SessionManager {
         const title = session.currentUserText.slice(0, 50).replace(/\s+/g, ' ').trim()
         if (title) session.title = title
       }
-      // Liveness-based timeout: kill only if NO stdout activity for 3 minutes
-      // (replaces fixed 10-min timeout — long tasks that produce output stay alive)
-      const IDLE_TIMEOUT = 3 * 60_000 // 3 minutes of zero output = stuck
+      // Liveness-based timeout: kill only if NO stdout/stderr activity for a while.
+      // Delegate/cron tasks get longer timeout since tools (Browser, Bash) can take time.
+      const isLongRunning =
+        session.sessionKey.includes(':delegate:') ||
+        session.sessionKey.includes(':cron:') ||
+        session.sessionKey.includes(':task:')
+      const IDLE_TIMEOUT = isLongRunning ? 10 * 60_000 : 5 * 60_000 // 10min for tasks, 5min for chat
       const CHECK_INTERVAL = 30_000 // check every 30s
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {

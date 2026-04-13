@@ -203,6 +203,7 @@ export class SubprocessRunner extends EventEmitter {
 
     proc.stderr.setEncoding('utf-8')
     proc.stderr.on('data', (chunk: string) => {
+      this.lastActivityAt = Date.now() // stderr activity also counts as "alive"
       this.emit('stderr', chunk)
     })
 
