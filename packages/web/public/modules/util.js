@@ -1,5 +1,6 @@
 // OpenClaude — Utility helpers
-export const uuid = () => `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+export const uuid = () =>
+  `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 export const msgId = () => `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 
 export function formatSize(n) {

@@ -28,10 +28,11 @@ export interface TerminalBackendConfig {
 export interface SpawnOpts {
   command: string
   args: string[]
-  cwd: string
+  cwd: string // CCB install path (used as container entrypoint cwd)
   env: Record<string, string>
   stdio: ['pipe', 'pipe', 'pipe']
   detached?: boolean
+  agentCwd?: string // agent working directory (the real project dir)
 }
 
 export interface TerminalBackend {
@@ -59,15 +60,17 @@ export class DockerBackend implements TerminalBackend {
   spawn(opts: SpawnOpts): ChildProcessWithoutNullStreams {
     const dockerArgs = ['run', '--rm', '-i']
 
-    // Working directory
+    // Working directory: mount CCB install path so the binary can run
+    dockerArgs.push('-v', `${opts.cwd}:/opt/ccb`)
+    // Mount agent working directory as /workspace (the real project dir)
+    const agentDir = opts.agentCwd || opts.cwd
+    dockerArgs.push('-v', `${agentDir}:/workspace`)
     dockerArgs.push('-w', '/workspace')
 
-    // Volumes
+    // Extra volumes from config
     if (this.config.volumes) {
       for (const v of this.config.volumes) dockerArgs.push('-v', v)
     }
-    // Always mount cwd as /workspace
-    dockerArgs.push('-v', `${opts.cwd}:/workspace`)
 
     // Environment variables
     const allowlist = new Set(this.config.envAllowlist ?? [])

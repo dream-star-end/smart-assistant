@@ -1,12 +1,20 @@
 // OpenClaude — Message rendering and display
-import { $, htmlSafeEscape, fallbackCopy, _mod } from './dom.js'
-import { shortTime } from './util.js'
-import { state, getSession } from './state.js'
-import { renderMarkdown, embedMediaUrls, processRichBlocks, clearChartInstances } from './markdown.js'
+import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
+import {
+  clearChartInstances,
+  embedMediaUrls,
+  processRichBlocks,
+  renderMarkdown,
+} from './markdown.js'
+import { getSession, state } from './state.js'
 import { toast } from './ui.js'
+import { shortTime } from './util.js'
 
 // Late-bound references set by main.js to break circular deps
-let _updateSendEnabled, _showTypingIndicator, _setTitleBusy, _scheduleSave
+let _updateSendEnabled
+let _showTypingIndicator
+let _setTitleBusy
+let _scheduleSave
 export function setMessageDeps(deps) {
   _updateSendEnabled = deps.updateSendEnabled
   _showTypingIndicator = deps.showTypingIndicator
@@ -163,23 +171,35 @@ export function _buildMessageEl(msg) {
         // Remove messages from this one onwards
         sess.messages.splice(idx)
         renderMessages()
-        // Re-send the user message
-        sess._sendingInFlight = true
-        state.sendingInFlight = true
-        _updateSendEnabled()
-        _showTypingIndicator()
-        _setTitleBusy(true)
-        state.ws.send(
-          JSON.stringify({
-            type: 'inbound.message',
-            idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            channel: 'webchat',
-            peer: { id: sess.id, kind: 'dm' },
-            agentId: sess.agentId || state.defaultAgentId,
-            content: { text: lastUserMsg.text || '' },
-            ts: Date.now(),
-          }),
-        )
+        // Re-send via proper path: build payload with original media if present
+        const wsPayload = {
+          type: 'inbound.message',
+          idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          channel: 'webchat',
+          peer: { id: sess.id, kind: 'dm' },
+          agentId: sess.agentId || state.defaultAgentId,
+          content: {
+            text: lastUserMsg.text || '',
+            media: lastUserMsg._media || undefined,
+          },
+          ts: Date.now(),
+        }
+        if (state.ws && state.ws.readyState === 1) {
+          state.ws.send(JSON.stringify(wsPayload))
+          sess._sendingInFlight = true
+          state.sendingInFlight = true
+          _updateSendEnabled()
+          _showTypingIndicator()
+          _setTitleBusy(true)
+        } else {
+          // Offline: queue for replay after reconnect
+          state.offlineQueue.push({
+            sessId: sess.id,
+            payload: wsPayload,
+            msgId: lastUserMsg.id,
+          })
+          toast('离线排队中，重连后自动重新生成')
+        }
         _scheduleSave(sess)
       } else if (action === 'tts') {
         // Use Web Speech API for quick read-aloud
@@ -304,11 +324,11 @@ export function _buildMessageEl(msg) {
   return el
 }
 
-export function renderMessage(msg) {
+export function renderMessage(msg, skipRichBlocks = false) {
   const main = ensureInner()
   const el = _buildMessageEl(msg)
   main.appendChild(el)
-  processRichBlocks()
+  if (!skipRichBlocks) processRichBlocks()
 }
 
 export function updateMessageEl(msg, streaming) {
@@ -472,10 +492,12 @@ export function renderMessages() {
       obs.observe(loadMore)
     }
     inner.appendChild(loadMore)
-    for (let i = msgs.length - MAX_INITIAL; i < msgs.length; i++) renderMessage(msgs[i])
+    for (let i = msgs.length - MAX_INITIAL; i < msgs.length; i++) renderMessage(msgs[i], true)
   } else {
-    for (const m of msgs) renderMessage(m)
+    for (const m of msgs) renderMessage(m, true)
   }
+  // Batch process all rich blocks once instead of per-message
+  processRichBlocks()
   scrollBottom(true)
 }
 

@@ -1,7 +1,7 @@
 // OpenClaude — OAuth
 import { $ } from './dom.js'
 import { state } from './state.js'
-import { openModal, closeModal, toast } from './ui.js'
+import { closeModal, openModal, toast } from './ui.js'
 
 let _oauthState = null
 

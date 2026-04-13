@@ -1,12 +1,15 @@
+import { dbDelete, dbPut } from './db.js'
 // OpenClaude — Session management, sidebar, context menu
 import { $, htmlSafeEscape } from './dom.js'
-import { uuid, shortTime, sessionGroup, GROUP_ORDER } from './util.js'
-import { state, getSession } from './state.js'
-import { dbPut, dbDelete } from './db.js'
+import { getSession, state } from './state.js'
 import { toast } from './ui.js'
+import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
 
 // Late-bound references set by main.js
-let _renderMessages, _updateSendEnabled, _updateSessionSub, _scrollBottom
+let _renderMessages
+let _updateSendEnabled
+let _updateSessionSub
+let _scrollBottom
 export function setSessionDeps(deps) {
   _renderMessages = deps.renderMessages
   _updateSendEnabled = deps.updateSendEnabled
@@ -15,7 +18,9 @@ export function setSessionDeps(deps) {
 }
 
 // Late-bound references for functions that live in app.js (typing indicator, agent dropdown)
-let _showTypingIndicator, _hideTypingIndicator, _renderAgentDropdown
+let _showTypingIndicator
+let _hideTypingIndicator
+let _renderAgentDropdown
 export function setSessionUIDeps(deps) {
   _showTypingIndicator = deps.showTypingIndicator
   _hideTypingIndicator = deps.hideTypingIndicator

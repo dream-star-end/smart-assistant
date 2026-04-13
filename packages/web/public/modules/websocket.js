@@ -1,13 +1,15 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
 import { $, htmlSafeEscape } from './dom.js'
-import { state, getSession } from './state.js'
-import { toast } from './ui.js'
-import { setTitleBusy, maybeNotify } from './notifications.js'
+import { maybeNotify, setTitleBusy } from './notifications.js'
 import { enqueuePermission } from './permissions.js'
+import { getSession, state } from './state.js'
+import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
-export function setWsDeps(deps) { _deps = deps }
+export function setWsDeps(deps) {
+  _deps = deps
+}
 
 // ── Module-private state ──
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
@@ -214,12 +216,13 @@ export function connect() {
           ws.onmessage = _waitFinal
         }
       }
+      // Remember the first item BEFORE sendNext() shifts it out
+      const firstQueued = queue[0]
       sendNext()
-      if (queue.length >= 0) {
-        toast(`${queue.length} 条离线消息已发送`)
+      if (firstQueued) {
+        toast(`${queue.length + 1} 条离线消息开始发送`)
         // Mark the first queued item's session as sending
-        const firstItem = queue[0] || item
-        const qSess = firstItem ? state.sessions.get(firstItem.sessId) : null
+        const qSess = state.sessions.get(firstQueued.sessId)
         if (qSess) qSess._sendingInFlight = true
         // Only update global UI if queued session is currently visible
         if (qSess && qSess.id === state.currentSessionId) {
@@ -509,7 +512,7 @@ function _updateTasksBadge() {
   const svg = btn.querySelector('svg')
   if (svg) svg.style.animation = running > 0 ? '' : 'none'
 }
-function _renderTasksPanel() {
+export function _renderTasksPanel() {
   let panel = $('tasks-panel')
   if (!panel) {
     panel = document.createElement('div')

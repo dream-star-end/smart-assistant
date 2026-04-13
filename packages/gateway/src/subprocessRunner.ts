@@ -182,6 +182,7 @@ export class SubprocessRunner extends EventEmitter {
       command: runtime,
       args,
       cwd: ccbDir,
+      agentCwd: this.opts.cwd, // agent's real working directory (for Docker volume mount)
       env: {
         ...process.env,
         ...providerEnv,
@@ -273,7 +274,10 @@ export class SubprocessRunner extends EventEmitter {
     mcpConfigFile?: string
   }> {
     const out: { extraPromptFile?: string; mcpConfigFile?: string } = {}
-    const sessionDir = resolve(tmpdir(), `openclaude-${this.opts.agentId}`)
+    // Use sessionKey (not agentId) so concurrent sessions of the same agent
+    // don't share/overwrite each other's temp files (extra-prompt.md, mcp-config.json).
+    const safeDirName = this.opts.sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_')
+    const sessionDir = resolve(tmpdir(), `openclaude-${safeDirName}`)
     try {
       mkdirSync(sessionDir, { recursive: true })
     } catch {}

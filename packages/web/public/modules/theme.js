@@ -2,7 +2,9 @@
 import { $ } from './dom.js'
 
 let _toast = () => {} // late-bound, set by main.js after ui.js loads
-export function setToastFn(fn) { _toast = fn }
+export function setToastFn(fn) {
+  _toast = fn
+}
 
 const THEME_KEY = 'openclaude_theme'
 

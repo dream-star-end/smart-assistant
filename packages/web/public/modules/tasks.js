@@ -1,8 +1,8 @@
+import { apiGet, apiJson } from './api.js'
 // OpenClaude — Scheduled Tasks
 import { $, htmlSafeEscape } from './dom.js'
+import { closeModal, openModal, toast } from './ui.js'
 import { _cronHuman, shortTime } from './util.js'
-import { apiGet, apiJson } from './api.js'
-import { openModal, closeModal, toast } from './ui.js'
 
 let _currentTasksTab = 'cron'
 
@@ -148,7 +148,7 @@ export async function loadBgTasks() {
       del.style.cssText = 'padding:4px 10px;min-height:28px;font-size:12px;color:var(--danger)'
       del.textContent = '删除'
       del.onclick = async () => {
-        if (!confirm(`删除任务 "${t.title}"?`) ) return
+        if (!confirm(`删除任务 "${t.title}"?`)) return
         try {
           await apiJson('DELETE', `/api/tasks/${encodeURIComponent(t.id)}`)
           toast('已删除')

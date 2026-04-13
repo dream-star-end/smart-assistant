@@ -3,86 +3,153 @@
 // This file exports nothing; it IS the application.
 
 // ── DOM utilities ──
-import { $, _isMac, _mod, htmlSafeEscape, fallbackCopy } from './dom.js'
+import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
 
 // ── Pure utilities ──
-import { uuid, msgId, formatSize, shortTime, sessionGroup, GROUP_ORDER, _basename, _cronHuman } from './util.js'
+import {
+  GROUP_ORDER,
+  _basename,
+  _cronHuman,
+  formatSize,
+  msgId,
+  sessionGroup,
+  shortTime,
+  uuid,
+} from './util.js'
 
 // ── App state ──
-import { state, getSession, isSending, setSending } from './state.js'
+import { getSession, isSending, setSending, state } from './state.js'
 
 // ── API layer ──
-import { authHeaders, apiGet, apiJson } from './api.js'
+import { apiGet, apiJson, authHeaders } from './api.js'
 
 // ── IndexedDB ──
-import { openDB, dbGetAll, dbPut, dbDelete } from './db.js'
+import { dbDelete, dbGetAll, dbPut, openDB } from './db.js'
 
 // ── Theme ──
-import { setToastFn, effectiveTheme, applyTheme, cycleTheme } from './theme.js'
+import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
 
 // ── Markdown / rich rendering ──
 import {
-  localPathToUrl, _imgHtml, embedMediaUrls, renderMarkdown,
-  processRichBlocks, _renderLocalMedia,
+  _imgHtml,
+  _renderLocalMedia,
+  embedMediaUrls,
+  localPathToUrl,
+  processRichBlocks,
+  renderMarkdown,
 } from './markdown.js'
 
 // ── UI helpers ──
-import { toast, openModal, closeModal, openLightbox, closeLightbox } from './ui.js'
+import { closeLightbox, closeModal, openLightbox, openModal, toast } from './ui.js'
 
 // ── Attachments ──
-import { fileToDataURL, fileToText, classifyFile, addFiles, removeAttachment, renderAttachments } from './attachments.js'
+import {
+  addFiles,
+  classifyFile,
+  fileToDataURL,
+  fileToText,
+  removeAttachment,
+  renderAttachments,
+} from './attachments.js'
 
 // ── Speech recognition ──
-import { initSpeech, toggleVoice, setAutoResize } from './speech.js'
+import { initSpeech, setAutoResize, toggleVoice } from './speech.js'
 
 // ── Notifications ──
-import { setTitleBusy, maybeNotify, requestNotifyPermission } from './notifications.js'
+import { maybeNotify, requestNotifyPermission, setTitleBusy } from './notifications.js'
 
 // ── Permission requests ──
-import { enqueuePermission, showNextPermission, respondPermission } from './permissions.js'
+import { enqueuePermission, respondPermission, showNextPermission } from './permissions.js'
 
 // ── OAuth ──
-import { openOAuthModal, initOAuthListeners } from './oauth.js'
+import { initOAuthListeners, openOAuthModal } from './oauth.js'
 
 // ── Memory & Skills ──
-import { openMemoryModal, loadMemoryTab, saveMemory, openSkillsModal } from './memory.js'
+import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js'
 
 // ── Scheduled tasks ──
-import { openTasksModal, switchTasksTab, loadBgTasks, loadExecLog, initTasksListeners } from './tasks.js'
+import {
+  initTasksListeners,
+  loadBgTasks,
+  loadExecLog,
+  openTasksModal,
+  switchTasksTab,
+} from './tasks.js'
 
 // ── Agents ──
-import { reloadAgents, renderAgentDropdown, renderAgentsManagementList, openPersonaEditor } from './agents.js'
+import {
+  openPersonaEditor,
+  reloadAgents,
+  renderAgentDropdown,
+  renderAgentsManagementList,
+} from './agents.js'
 
 // ── Sessions ──
 import {
-  setSessionDeps, setSessionUIDeps,
-  createSession, switchSession, deleteSession, _rebuildSearchIndex,
-  scheduleSave, renderSidebar, _buildSessionItem, startInlineRename,
-  exportSessionMd, showContextMenu, hideContextMenu,
+  _buildSessionItem,
+  _rebuildSearchIndex,
+  createSession,
+  deleteSession,
+  exportSessionMd,
+  hideContextMenu,
+  renderSidebar,
+  scheduleSave,
+  setSessionDeps,
+  setSessionUIDeps,
+  showContextMenu,
+  startInlineRename,
+  switchSession,
 } from './sessions.js'
 
 // ── Messages ──
 import {
-  setMessageDeps, ensureInner, isAtBottom, scrollBottom,
-  _buildMessageEl, renderMessage, updateMessageEl, renderMetaInto,
-  renderMessages, updateSessionSub, initMessagesListeners,
+  _buildMessageEl,
+  ensureInner,
+  initMessagesListeners,
+  isAtBottom,
+  renderMessage,
+  renderMessages,
+  renderMetaInto,
+  scrollBottom,
+  setMessageDeps,
+  updateMessageEl,
+  updateSessionSub,
 } from './messages.js'
 
 // ── WebSocket ──
 import {
-  setWsDeps, showTypingIndicator, hideTypingIndicator,
-  addMessage, updateMessage, setMeta, setStatus,
-  updateSendEnabled, stopCurrentTurn, connect,
-  formatMeta, buildToolUseLabel, handleOutbound,
-  addBgTask, completeBgTask, addSystemMessage, updateMsgStatus,
+  _renderTasksPanel,
+  addBgTask,
+  addMessage,
+  addSystemMessage,
+  buildToolUseLabel,
+  completeBgTask,
+  connect,
+  formatMeta,
+  handleOutbound,
+  hideTypingIndicator,
+  setMeta,
+  setStatus,
+  setWsDeps,
+  showTypingIndicator,
+  stopCurrentTurn,
+  updateMessage,
+  updateMsgStatus,
+  updateSendEnabled,
 } from './websocket.js'
 
 // ── Slash commands ──
 import {
-  setCommandDeps, handleSlashCommand, showSlashPopup, hideSlashPopup,
-  selectSlashItem, slashPopupVisible, getSlashSelected, setSlashSelected, getSlashMatches,
+  getSlashMatches,
+  getSlashSelected,
+  handleSlashCommand,
+  hideSlashPopup,
+  selectSlashItem,
+  setCommandDeps,
+  setSlashSelected,
+  showSlashPopup,
+  slashPopupVisible,
 } from './commands.js'
-
 
 // ═══════════════════════════════════════════════════════════
 // 1. Wire late-bound dependencies
@@ -138,7 +205,6 @@ setCommandDeps({
 
 // Inject autoResize into speech module so voice input can resize the textarea
 setAutoResize(() => autoResize())
-
 
 // ═══════════════════════════════════════════════════════════
 // 2. Side effects from modules
@@ -316,7 +382,6 @@ initTasksListeners()
 // ── OAuth: button click listeners ──
 initOAuthListeners()
 
-
 // ═══════════════════════════════════════════════════════════
 // 3. Functions defined in main.js
 // ═══════════════════════════════════════════════════════════
@@ -385,8 +450,7 @@ function buildMessageText(userText, attachments) {
     parts.push('')
     parts.push('---')
     parts.push(`Attached images (${imageFiles.length}):`)
-    for (const im of imageFiles)
-      parts.push(`- ${im.name}  _(${im.type}, ${formatSize(im.size)})_`)
+    for (const im of imageFiles) parts.push(`- ${im.name}  _(${im.type}, ${formatSize(im.size)})_`)
     parts.push('')
     parts.push(
       '_(note: if you cannot see the image contents directly, tell the user so they can describe it)_',
@@ -714,35 +778,7 @@ function createNewChat() {
   $('input').focus()
 }
 
-
-// ═══════════════════════════════════════════════════════════
-// 4. Background-tasks panel (inline helper used by init)
-// ═══════════════════════════════════════════════════════════
-
-function _renderTasksPanel() {
-  let panel = $('tasks-panel')
-  if (!panel) {
-    panel = document.createElement('div')
-    panel.id = 'tasks-panel'
-    panel.className = 'tasks-panel'
-    panel.hidden = true
-    $('tasks-btn').parentElement.style.position = 'relative'
-    $('tasks-btn').parentElement.insertBefore(panel, $('tasks-btn').nextSibling)
-  }
-  panel.innerHTML = '<div class="tasks-panel-header">后台任务</div>'
-  // Access _bgTasks via the websocket module -- we use the addBgTask/completeBgTask API,
-  // but the panel render needs the tasks. We'll read them from the DOM badge instead.
-  // Actually, the panel is re-rendered via _renderTasksPanel which reads from the map in ws module.
-  // Since _bgTasks is private in websocket.js, we keep a simple panel placeholder here.
-  // The full bg task panel was rendered inline in app.js reading from _bgTasks Map.
-  // For the module version, the panel simply shows a placeholder since bg tasks are tracked
-  // inside websocket.js. If no panel entries exist, show empty message.
-  if (!panel.querySelector('.tasks-panel-item')) {
-    panel.innerHTML += '<div class="tasks-panel-empty">暂无后台任务</div>'
-  }
-  return panel
-}
-
+// _renderTasksPanel is imported from websocket.js (has access to _bgTasks)
 
 // ═══════════════════════════════════════════════════════════
 // 5. init() -- THE application bootstrap
@@ -923,7 +959,8 @@ async function init() {
       }
       if (e.key === 'Tab' || (e.key === 'Enter' && getSlashMatches().length > 0)) {
         e.preventDefault()
-        if (getSlashMatches()[getSlashSelected()]) selectSlashItem(getSlashMatches()[getSlashSelected()])
+        if (getSlashMatches()[getSlashSelected()])
+          selectSlashItem(getSlashMatches()[getSlashSelected()])
         return
       }
       if (e.key === 'Escape') {
@@ -1075,7 +1112,6 @@ async function init() {
   }, 30000)
 }
 
-
 // ═══════════════════════════════════════════════════════════
 // 6. Debug helper
 // ═══════════════════════════════════════════════════════════
@@ -1089,7 +1125,6 @@ window.__oc_render = (text) => {
   inner.appendChild(wrap)
   processRichBlocks()
 }
-
 
 // ═══════════════════════════════════════════════════════════
 // START

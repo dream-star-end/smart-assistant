@@ -5,7 +5,9 @@ import { toast } from './ui.js'
 
 // autoResize lives in app.js (not yet extracted); injected via setAutoResize()
 let autoResize = () => {}
-export function setAutoResize(fn) { autoResize = fn }
+export function setAutoResize(fn) {
+  autoResize = fn
+}
 
 export function initSpeech() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition

@@ -1,13 +1,15 @@
 // OpenClaude — Slash Commands
 import { $, _mod } from './dom.js'
-import { state, getSession } from './state.js'
-import { toast } from './ui.js'
-import { addSystemMessage, updateSendEnabled, hideTypingIndicator } from './websocket.js'
 import { setTitleBusy } from './notifications.js'
+import { getSession, state } from './state.js'
+import { toast } from './ui.js'
+import { addSystemMessage, hideTypingIndicator, updateSendEnabled } from './websocket.js'
 
 // ── Late-binding for circular deps ──
 let _deps = {}
-export function setCommandDeps(deps) { _deps = deps }
+export function setCommandDeps(deps) {
+  _deps = deps
+}
 
 // ── Module-private state ──
 export let slashPopupVisible = false
@@ -15,9 +17,15 @@ let _slashSelected = 0
 let _slashMatches = []
 
 // Expose getters for main app keydown handler
-export function getSlashSelected() { return _slashSelected }
-export function setSlashSelected(v) { _slashSelected = v }
-export function getSlashMatches() { return _slashMatches }
+export function getSlashSelected() {
+  return _slashSelected
+}
+export function setSlashSelected(v) {
+  _slashSelected = v
+}
+export function getSlashMatches() {
+  return _slashMatches
+}
 
 const slashCommands = [
   {

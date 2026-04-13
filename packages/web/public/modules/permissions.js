@@ -1,10 +1,10 @@
 // OpenClaude — Permission Requests
 import { $ } from './dom.js'
 import { state } from './state.js'
-import { openModal, closeModal, toast } from './ui.js'
+import { closeModal, openModal, toast } from './ui.js'
 
 // Queue pending permission requests; show modal for the head of the queue.
-let permQueue = []
+const permQueue = []
 let permCurrent = null
 
 export function enqueuePermission(frame) {

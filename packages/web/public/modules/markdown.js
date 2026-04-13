@@ -1,7 +1,7 @@
 // OpenClaude — Markdown rendering, media embedding, rich blocks
 import { htmlSafeEscape } from './dom.js'
-import { _basename } from './util.js'
 import { effectiveTheme } from './theme.js'
+import { _basename } from './util.js'
 
 // ── Mermaid init ──
 if (window.mermaid) {
@@ -204,7 +204,7 @@ export function embedMediaUrls(html) {
         const rootIdx = parts.findIndex(
           (p) => p === 'root' || p === 'home' || p === 'tmp' || p === 'opt',
         )
-        if (rootIdx >= 0) absPath = '/' + parts.slice(rootIdx).join('/')
+        if (rootIdx >= 0) absPath = `/${parts.slice(rootIdx).join('/')}`
       }
       if (_MEDIA_IMG_EXTS_RE.test(absPath)) return _renderLocalMedia(absPath)
       return match
@@ -221,7 +221,7 @@ export function embedMediaUrls(html) {
         const rootIdx = parts.findIndex(
           (p) => p === 'root' || p === 'home' || p === 'tmp' || p === 'opt',
         )
-        if (rootIdx >= 0) absPath = '/' + parts.slice(rootIdx).join('/')
+        if (rootIdx >= 0) absPath = `/${parts.slice(rootIdx).join('/')}`
       }
       if (_MEDIA_AV_EXTS_RE.test(absPath)) return _renderLocalMedia(absPath)
       return match
@@ -314,8 +314,7 @@ export async function processRichBlocks() {
         config.options.scales[axis].ticks.color =
           config.options.scales[axis].ticks.color || textColor
         if (!config.options.scales[axis].grid) config.options.scales[axis].grid = {}
-        config.options.scales[axis].grid.color =
-          config.options.scales[axis].grid.color || gridColor
+        config.options.scales[axis].grid.color = config.options.scales[axis].grid.color || gridColor
       }
       config.options.responsive = true
       config.options.maintainAspectRatio = true
