@@ -173,6 +173,7 @@ setSessionUIDeps({
 setMessageDeps({
   updateSendEnabled,
   showTypingIndicator,
+  hideTypingIndicator,
   setTitleBusy,
   scheduleSave,
 })
@@ -229,8 +230,13 @@ window.addEventListener('blur', () => {
 // Auto-resize htmlpreview iframes based on content height
 window.addEventListener('message', (e) => {
   if (e.data?.type === 'iframe-resize' && e.data.id && e.data.h) {
+    // Only accept resize from our own managed iframes (id starts with htmlpv-)
+    if (typeof e.data.id !== 'string' || !e.data.id.startsWith('htmlpv-')) return
     const iframe = document.getElementById(e.data.id)
-    if (iframe) iframe.style.height = `${Math.min(Math.max(e.data.h + 10, 200), 800)}px`
+    // Validate that the message source matches the iframe's contentWindow
+    if (iframe && iframe.tagName === 'IFRAME' && e.source === iframe.contentWindow) {
+      iframe.style.height = `${Math.min(Math.max(e.data.h + 10, 200), 800)}px`
+    }
   }
 })
 
@@ -298,7 +304,15 @@ document.addEventListener('click', (e) => {
   if (btn) closeModal(btn.dataset.closeModal)
   // close modal on backdrop click
   const backdrop = e.target.classList?.contains('modal-backdrop') ? e.target : null
-  if (backdrop) backdrop.classList.remove('open')
+  if (backdrop) {
+    // Permission modal: deny instead of just closing (prevents permCurrent deadlock)
+    if (backdrop.id === 'permission-modal') {
+      respondPermission('deny')
+      return
+    }
+    // Use closeModal to properly clean up focus trap
+    closeModal(backdrop.id)
+  }
 })
 
 // ── Lightbox: click on inline images/videos, close on backdrop ──
@@ -309,12 +323,8 @@ document.addEventListener('click', (e) => {
     openLightbox(img)
     return
   }
-  const vid = e.target.closest?.('.inline-video')
-  if (vid && !e.target.closest('.lightbox-body')) {
-    e.preventDefault()
-    openLightbox(vid)
-    return
-  }
+  // Inline videos: don't hijack single clicks (let native controls work)
+  // Lightbox is triggered by double-click instead (see dblclick listener below)
   if (e.target.closest?.('.lightbox-close')) {
     closeLightbox()
     return
@@ -322,6 +332,15 @@ document.addEventListener('click', (e) => {
   if (e.target.id === 'lightbox' || e.target.classList?.contains('lightbox-backdrop')) {
     closeLightbox()
     return
+  }
+})
+
+// ── Video double-click to lightbox ──
+document.addEventListener('dblclick', (e) => {
+  const vid = e.target.closest?.('.inline-video')
+  if (vid && !e.target.closest('.lightbox-body')) {
+    e.preventDefault()
+    openLightbox(vid)
   }
 })
 
@@ -345,7 +364,7 @@ document.addEventListener('click', (e) => {
     a.target = '_blank'
     a.click()
   } else if (action === 'open') {
-    window.open(src, '_blank')
+    window.open(src, '_blank', 'noopener,noreferrer')
   }
 })
 
@@ -358,10 +377,16 @@ document.addEventListener('keydown', (e) => {
       e.stopPropagation()
       return
     }
-    // Close any open modal or palette
-    document
-      .querySelectorAll('.modal-backdrop.open, .palette-backdrop.open')
-      .forEach((el) => el.classList.remove('open'))
+    // Permission modal: deny instead of just closing (prevents permCurrent deadlock)
+    const permModal = $('permission-modal')
+    if (permModal?.classList.contains('open')) {
+      respondPermission('deny')
+      e.stopPropagation()
+      return
+    }
+    // Close any open modal via closeModal (handles focus trap cleanup)
+    document.querySelectorAll('.modal-backdrop.open').forEach((el) => closeModal(el.id))
+    document.querySelectorAll('.palette-backdrop.open').forEach((el) => el.classList.remove('open'))
   }
 })
 
@@ -475,7 +500,7 @@ function send() {
   const sess = getSession()
   if (!sess) return
   const displayText =
-    (text || '(file upload)') +
+    (text || '(文件上传)') +
     (state.attachments.length > 0
       ? `\n\n📎 ${state.attachments.map((a) => a.name).join(', ')}`
       : '')
@@ -497,12 +522,22 @@ function send() {
     content: { text: modelText, media: media.length > 0 ? media : undefined },
     ts: Date.now(),
   }
-  // Add user message with status tracking
-  const userMsg = addMessage(sess, 'user', displayText, { status: 'sending' })
+  // Add user message with status tracking + persist media & full text for regen
+  const userMsg = addMessage(sess, 'user', displayText, {
+    status: 'sending',
+    _media: media.length > 0 ? media : undefined,
+    _modelText: modelText !== text ? modelText : undefined,  // Full text with attachments for replay
+  })
   sess._streamingAssistant = null
   sess._streamingThinking = null
   sess._blockIdToMsgId = new Map()
-  if (state.ws && state.ws.readyState === 1) {
+  sess._agentSwitchedAt = null  // Clear switch guard — new send is intentional
+  // If offline queue is draining or pending for this session, route through queue
+  // to prevent message reordering (new msg arriving before old queued ones)
+  const _hasQueuedForSess = (state.offlineQueue?.some(i => i.sessId === sess.id)) ||
+    (state._offlineQueuePending?.some(i => i.sessId === sess.id)) ||
+    (state._offlineDrainingCurrent?.sessId === sess.id)
+  if (state.ws && state.ws.readyState === 1 && !_hasQueuedForSess) {
     state.ws.send(JSON.stringify(wsPayload))
     userMsg.status = 'sent'
     updateMsgStatus(userMsg)
@@ -511,11 +546,13 @@ function send() {
     showTypingIndicator()
     setTitleBusy(true)
   } else {
-    // Offline: queue for later
+    // Offline or has pending queue items: queue to maintain order
     state.offlineQueue.push({ sessId: sess.id, payload: wsPayload, msgId: userMsg.id })
     userMsg.status = 'queued'
     updateMsgStatus(userMsg)
-    toast('离线排队中，重连后自动发送')
+    if (!state.ws || state.ws.readyState !== 1) {
+      toast('离线排队中，重连后自动发送')
+    }
   }
   $('input').value = ''
   state.attachments = []
@@ -661,7 +698,17 @@ function buildPaletteItems(query) {
         run: () => {
           const sess = getSession()
           if (sess) {
+            // Stop in-flight request before switching agent
+            if (state.sendingInFlight) stopCurrentTurn()
             sess.agentId = a.id
+            sess._agentSwitchedAt = Date.now()
+            sess._streamingAssistant = null
+            sess._streamingThinking = null
+            sess._sendingInFlight = false
+            state.sendingInFlight = false
+            hideTypingIndicator()
+            updateSendEnabled()
+            setTitleBusy(false)
             scheduleSave(sess)
             renderAgentDropdown()
             toast(`已切换到 ${a.id}`)
@@ -823,7 +870,19 @@ async function init() {
       await fetch('/api/auth/logout', { method: 'POST' })
     } catch {}
     localStorage.removeItem('openclaude_token')
-    state.token = ''
+    state.token = ''  // Clear token BEFORE close so onclose handler won't auto-reconnect
+    if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+    // Clear all in-memory session data and offline queues to prevent cross-identity leakage
+    state.sessions.clear()
+    state.currentSessionId = null
+    state.offlineQueue = []
+    state._offlineQueuePending = []
+    state._offlineDrainingCurrent = null
+    state._offlineQueueDraining = false
+    state.sendingInFlight = false
+    state.attachments = []
+    renderAttachments()
+    hideTypingIndicator()
     if (state.ws) state.ws.close(1000)
     showLogin()
   }
@@ -839,7 +898,11 @@ async function init() {
   $('agent-select').onchange = (e) => {
     const sess = getSession()
     if (!sess) return
+    // Stop in-flight request before switching to prevent late tokens from old agent
+    if (state.sendingInFlight) stopCurrentTurn()
     sess.agentId = e.target.value
+    // Mark switch time — handleOutbound will ignore frames arriving before this
+    sess._agentSwitchedAt = Date.now()
     // Reset streaming state to prevent cross-agent message contamination
     sess._streamingAssistant = null
     sess._streamingThinking = null
@@ -969,8 +1032,8 @@ async function init() {
         return
       }
     }
-    // Normal Enter -> send
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Normal Enter -> send (skip during IME composition to avoid CJK input issues)
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault()
       if (state.sendingInFlight) stopCurrentTurn()
       else send()
@@ -1026,7 +1089,7 @@ async function init() {
     reloadAgents()
   }
   $('token').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') $('login-btn').click()
+    if (e.key === 'Enter' && !e.isComposing) $('login-btn').click()
   })
   // Palette input
   $('palette-input').addEventListener('input', (e) => {
@@ -1052,19 +1115,28 @@ async function init() {
       paletteItems[paletteSelected]?.run()
     }
   })
-  // Global shortcuts
+  // Global shortcuts — skip when focus is inside form fields (except Cmd/Ctrl+K which is universal)
   document.addEventListener('keydown', (e) => {
     const mod = e.metaKey || e.ctrlKey
-    if (mod && e.key.toLowerCase() === 'k') {
+    if (!mod) return
+    const key = e.key.toLowerCase()
+    // Cmd/Ctrl+K: always open palette (even from input)
+    if (key === 'k') {
       e.preventDefault()
       openPalette()
-    } else if (mod && e.key.toLowerCase() === 'n') {
+      return
+    }
+    // Other shortcuts: skip when typing in input/textarea/contenteditable
+    const tag = document.activeElement?.tagName
+    const editable = document.activeElement?.isContentEditable
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || editable) return
+    if (key === 'n') {
       e.preventDefault()
       createNewChat()
-    } else if (mod && e.key.toLowerCase() === 'm') {
+    } else if (key === 'm') {
       e.preventDefault()
       openMemoryModal()
-    } else if (mod && e.key.toLowerCase() === 'b') {
+    } else if (key === 'b') {
       e.preventDefault()
       $('sidebar').classList.toggle('open')
       $('sidebar-backdrop').classList.toggle('open')

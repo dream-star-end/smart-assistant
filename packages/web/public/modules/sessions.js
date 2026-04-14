@@ -1,9 +1,11 @@
 import { dbDelete, dbPut } from './db.js'
 // OpenClaude — Session management, sidebar, context menu
 import { $, htmlSafeEscape } from './dom.js'
+import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
+import { nudgeDrain } from './websocket.js'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -53,16 +55,43 @@ export function switchSession(id) {
   const newSess = getSession()
   state.sendingInFlight = newSess?._sendingInFlight || false
   _updateSendEnabled()
-  if (state.sendingInFlight) _showTypingIndicator()
-  else _hideTypingIndicator()
+  // Hide first to clear old timer, then renderMessages wipes DOM, then show if needed
+  _hideTypingIndicator()
+  setTitleBusy(false)
   renderSidebar()
   _renderMessages()
   _renderAgentDropdown()
+  // After DOM rebuild, show typing indicator + title busy for the new session if in-flight
+  if (state.sendingInFlight) {
+    _showTypingIndicator()
+    setTitleBusy(true)
+  }
   $('sidebar').classList.remove('open')
   $('sidebar-backdrop').classList.remove('open')
 }
 
 export async function deleteSession(id) {
+  // If deleting the active session while it's in-flight, clear sending state to prevent wedged UI
+  if (id === state.currentSessionId && state.sendingInFlight) {
+    state.sendingInFlight = false
+    _hideTypingIndicator()
+    _updateSendEnabled()
+    setTitleBusy(false)
+  }
+  // Cancel any pending scheduleSave timer to prevent resurrecting deleted session in IDB
+  const pendingTimer = _saveTimers.get(id)
+  if (pendingTimer) { clearTimeout(pendingTimer); _saveTimers.delete(id) }
+  // Purge offline queue items for this session to prevent sending after delete
+  if (state.offlineQueue?.length > 0) {
+    state.offlineQueue = state.offlineQueue.filter(item => item.sessId !== id)
+  }
+  if (state._offlineQueuePending?.length > 0) {
+    state._offlineQueuePending = state._offlineQueuePending.filter(item => item.sessId !== id)
+  }
+  if (state._offlineDrainingCurrent?.sessId === id) {
+    state._offlineDrainingCurrent = null
+    nudgeDrain()  // Advance drain to next item since we killed the current one
+  }
   state.sessions.delete(id)
   try {
     await dbDelete(id)
@@ -109,7 +138,9 @@ export function scheduleSave(s) {
   if (prev) clearTimeout(prev)
   const t = setTimeout(async () => {
     _saveTimers.delete(sess.id)
-    const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, ...persist } = sess
+    // Guard: don't write back if session was deleted between scheduling and execution
+    if (!state.sessions.has(sess.id)) return
+    const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, ...persist } = sess
     try {
       await dbPut(persist)
     } catch (e) {
@@ -133,6 +164,15 @@ export function renderSidebar() {
   const sessions = searchQuery
     ? allSessions.filter((s) => (s._searchText || s.title.toLowerCase()).includes(searchQuery))
     : allSessions
+
+  if (searchQuery && sessions.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'sessions-empty'
+    empty.textContent = '没有匹配的会话'
+    empty.style.cssText = 'padding:24px 16px;text-align:center;color:var(--fg-muted);font-size:13px'
+    body.appendChild(empty)
+    return
+  }
 
   // Pinned group
   const pinned = sessions.filter((s) => s.pinned)

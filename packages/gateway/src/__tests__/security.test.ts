@@ -7,10 +7,12 @@ import { resolve } from 'node:path'
  */
 import { describe, it } from 'node:test'
 import {
+  FILE_ALLOWED_DIRS,
   FILE_BLOCKED_PATTERNS,
   MAX_UPLOAD_SINGLE,
   MAX_UPLOAD_TOTAL,
   UPLOAD_MIME_PREFIXES,
+  isFileAllowed,
   isFileBlocked,
   isUploadMimeAllowed,
 } from '../server.js'
@@ -113,6 +115,60 @@ describe('T01: isFileBlocked — sensitive file blocking', () => {
   })
   it('allows screenshot files', () => {
     assert.ok(!isFileBlocked('/root/.openclaude/agents/main/screenshots/page.png'))
+  })
+})
+
+// ── T01b: isFileAllowed — allowlist directory check ──
+describe('T01b: isFileAllowed — allowlist directory check', () => {
+  // Should ALLOW — static allowed dirs
+  it('allows files in generated dir', () => {
+    assert.ok(isFileAllowed(resolve('/root/.openclaude/generated/speech.mp3')))
+  })
+  it('allows files in uploads dir', () => {
+    assert.ok(isFileAllowed(resolve('/root/.openclaude/uploads/photo.jpg')))
+  })
+  // Should ALLOW — temp files matching /tmp/openclaude-*
+  it('allows /tmp/openclaude-* temp files', () => {
+    assert.ok(isFileAllowed(resolve('/tmp/openclaude-abc123/output.png')))
+  })
+  // Should ALLOW — known project roots
+  it('allows files under /opt/openclaude/openclaude', () => {
+    assert.ok(isFileAllowed(resolve('/opt/openclaude/openclaude/packages/gateway/src/server.ts')))
+  })
+  it('allows files under /opt/openclaude/claude-code-best', () => {
+    assert.ok(isFileAllowed(resolve('/opt/openclaude/claude-code-best/src/main.tsx')))
+  })
+  // Should ALLOW — dynamic agent cwds
+  it('allows files under a dynamic agent cwd', () => {
+    assert.ok(isFileAllowed(resolve('/home/user/project/build/result.html'), ['/home/user/project']))
+  })
+
+  // Should DENY — outside all allowed dirs
+  it('denies /etc/passwd', () => {
+    assert.ok(!isFileAllowed(resolve('/etc/passwd')))
+  })
+  it('denies /etc/shadow', () => {
+    assert.ok(!isFileAllowed(resolve('/etc/shadow')))
+  })
+  it('denies /root/.ssh/id_rsa', () => {
+    assert.ok(!isFileAllowed(resolve('/root/.ssh/id_rsa')))
+  })
+  it('denies /root/.aws/credentials', () => {
+    assert.ok(!isFileAllowed(resolve('/root/.aws/credentials')))
+  })
+  it('denies random /home path without agent cwd', () => {
+    assert.ok(!isFileAllowed(resolve('/home/user/secrets/token.json')))
+  })
+  it('denies /tmp files that do not match openclaude- prefix', () => {
+    assert.ok(!isFileAllowed(resolve('/tmp/random-file.txt')))
+  })
+  it('denies /root/.openclaude/openclaude.json (config)', () => {
+    assert.ok(!isFileAllowed(resolve('/root/.openclaude/openclaude.json')))
+  })
+  // Prefix attack: /tmp/openclaude- should not match /tmp/openclaude (exact dir)
+  it('denies dir name that is a prefix of allowed but not child', () => {
+    // e.g. /root/.openclaude/generatedEVIL/file should NOT match generatedDir
+    assert.ok(!isFileAllowed(resolve('/root/.openclaude/generatedEVIL/file.txt')))
   })
 })
 

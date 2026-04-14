@@ -5,6 +5,15 @@ import type { ChannelAdapter } from '@openclaude/plugin-sdk'
 import { type OpenClaudeConfig, readAgentsConfig, readConfig } from '@openclaude/storage'
 
 export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
+  // Ensure crashes are always logged before exit
+  process.on('uncaughtException', (err) => {
+    console.error(`[FATAL] uncaughtException:`, err)
+    process.exit(1)
+  })
+  process.on('unhandledRejection', (reason) => {
+    console.error(`[FATAL] unhandledRejection:`, reason)
+  })
+
   const config = await readConfig()
   if (!config) {
     console.error('未找到配置。请先运行 `openclaude onboard`')

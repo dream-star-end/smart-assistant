@@ -45,19 +45,28 @@ export function showNextPermission() {
 }
 export function respondPermission(decision) {
   if (!permCurrent) return
-  if (!state.ws || state.ws.readyState !== 1) {
-    toast('未连接,无法响应', 'error')
-    return
+  // If connected, send response to server
+  if (state.ws && state.ws.readyState === 1) {
+    state.ws.send(
+      JSON.stringify({
+        type: 'inbound.permission_response',
+        requestId: permCurrent.id,
+        decision,
+      }),
+    )
+    toast(decision === 'allow' ? '已批准' : '已拒绝', decision === 'allow' ? 'success' : 'error')
+  } else {
+    // Disconnected: just close the modal, can't send response
+    toast('连接断开，已自动拒绝', 'error')
   }
-  state.ws.send(
-    JSON.stringify({
-      type: 'inbound.permission_response',
-      requestId: permCurrent.id,
-      decision,
-    }),
-  )
-  toast(decision === 'allow' ? '已批准' : '已拒绝', decision === 'allow' ? 'success' : 'error')
   permCurrent = null
   closeModal('permission-modal')
   setTimeout(showNextPermission, 150)
+}
+
+// Force-clear all pending permissions (called on disconnect)
+export function clearAllPermissions() {
+  permCurrent = null
+  permQueue.length = 0
+  closeModal('permission-modal')
 }

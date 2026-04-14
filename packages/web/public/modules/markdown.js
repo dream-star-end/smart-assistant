@@ -87,7 +87,18 @@ export function localPathToUrl(absPath) {
   return `/api/file?path=${encodeURIComponent(absPath)}`
 }
 
+// Validate URL scheme — only allow safe protocols for media action buttons
+function _safeMediaUrl(url) {
+  if (!url) return ''
+  const trimmed = url.trim()
+  if (/^(?:https?:|data:|blob:|\/)/i.test(trimmed)) return trimmed
+  // Block javascript:, vbscript:, etc.
+  return ''
+}
+
 export function _imgHtml(url, title) {
+  const safeUrl = _safeMediaUrl(url)
+  if (!safeUrl) return `<span>[blocked image: unsafe URL]</span>`
   const svgCopy =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
   const svgDl =
@@ -95,7 +106,7 @@ export function _imgHtml(url, title) {
   const svgOpen =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>'
   const t = title ? ` title="${htmlSafeEscape(title)}"` : ''
-  return `<div class="media-wrap"><img class="inline-img" src="${url}" loading="lazy"${t}><div class="img-actions"><button data-img-action="copy" data-img-src="${url}" title="复制图片">${svgCopy}</button><button data-img-action="download" data-img-src="${url}" title="下载">${svgDl}</button><button data-img-action="open" data-img-src="${url}" title="新标签页打开">${svgOpen}</button></div></div>`
+  return `<div class="media-wrap"><img class="inline-img" src="${safeUrl}" loading="lazy"${t}><div class="img-actions"><button data-img-action="copy" data-img-src="${safeUrl}" title="复制图片">${svgCopy}</button><button data-img-action="download" data-img-src="${safeUrl}" title="下载">${svgDl}</button><button data-img-action="open" data-img-src="${safeUrl}" title="新标签页打开">${svgOpen}</button></div></div>`
 }
 
 export function _renderLocalMedia(filePath) {
@@ -263,10 +274,9 @@ export function renderMarkdown(text) {
       return '<p style="color:var(--danger)">[安全组件加载失败,无法渲染富文本。请刷新页面。]</p>'
     }
     const sanitized = DOMPurify.sanitize(html, {
-      ADD_TAGS: ['iframe'],
+      // NOTE: iframe/srcdoc/sandbox NOT allowed here — htmlpreview iframes are created
+      // separately in processRichBlocks() with fixed sandbox="allow-scripts"
       ADD_ATTR: [
-        'sandbox',
-        'srcdoc',
         'loading',
         'controls',
         'preload',
@@ -278,6 +288,64 @@ export function renderMarkdown(text) {
     return embedMediaUrls(sanitized)
   } catch {
     return htmlSafeEscape(text)
+  }
+}
+
+// ── Streaming-safe Markdown renderer ──
+// Pure function: no side effects on pendingMermaid/Charts/HtmlPreviews queues.
+// Skips syntax highlighting (expensive). Renders mermaid/chart/htmlpreview fences
+// as plain code blocks. No media URL embedding (deferred to final render).
+let _streamingRenderer = null
+function _getStreamingRenderer() {
+  if (_streamingRenderer) return _streamingRenderer
+  if (!window.marked) return null
+  _streamingRenderer = new marked.Renderer()
+  _streamingRenderer.code = (codeOrObj, infostring) => {
+    let code, lang
+    if (typeof codeOrObj === 'object' && codeOrObj !== null) {
+      code = codeOrObj.text || ''
+      lang = (codeOrObj.lang || '').match(/\S*/)?.[0] || ''
+    } else {
+      code = codeOrObj || ''
+      lang = (infostring || '').match(/\S*/)?.[0] || ''
+    }
+    // Rich blocks: render as plain code placeholder (no side effects)
+    if (lang === 'mermaid') {
+      return `<pre class="code-block"><span class="code-lang">mermaid</span><code>${htmlSafeEscape(code)}</code></pre>`
+    }
+    if (lang === 'chart') {
+      return `<pre class="code-block"><span class="code-lang">chart</span><code>${htmlSafeEscape(code)}</code></pre>`
+    }
+    if (lang === 'htmlpreview' || lang === 'preview') {
+      return `<pre class="code-block"><span class="code-lang">preview</span><code>${htmlSafeEscape(code)}</code></pre>`
+    }
+    // Regular code: simple escape, no hljs (too expensive for streaming)
+    const langLabel = lang ? `<span class="code-lang">${lang}</span>` : ''
+    return `<pre class="code-block">${langLabel}<code>${htmlSafeEscape(code)}</code></pre>`
+  }
+  // Images: render as text placeholder during streaming to avoid broken 404 requests
+  // (embedMediaUrls rewrites local paths, but is only called on final render)
+  _streamingRenderer.image = (hrefOrObj, title, text) => {
+    const alt = typeof hrefOrObj === 'object' ? (hrefOrObj.text || hrefOrObj.title || '') : (title || text || '')
+    return `<span class="streaming-img-placeholder">[图片: ${htmlSafeEscape(alt || '...')}]</span>`
+  }
+  return _streamingRenderer
+}
+
+export function renderStreamingMarkdown(text) {
+  if (!text) return ''
+  const renderer = _getStreamingRenderer()
+  if (!renderer || !window.marked) return htmlSafeEscape(text).replace(/\n/g, '<br>')
+  try {
+    const html = marked.parse(text, { renderer })
+    if (!window.DOMPurify) return htmlSafeEscape(text).replace(/\n/g, '<br>')
+    return DOMPurify.sanitize(html, {
+      // During streaming: forbid media tags to prevent broken 404 requests
+      // (embedMediaUrls rewrites paths only on final render)
+      FORBID_TAGS: ['img', 'video', 'audio', 'iframe'],
+    })
+  } catch {
+    return htmlSafeEscape(text).replace(/\n/g, '<br>')
   }
 }
 

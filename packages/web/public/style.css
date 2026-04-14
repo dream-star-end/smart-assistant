@@ -1027,6 +1027,30 @@ a:hover {
 .msg.assistant .msg-body > *:last-child {
   margin-bottom: 0;
 }
+/* Streaming caret: blinking cursor appended inside the last text block */
+.streaming-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  background: var(--accent);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: caret-blink 0.8s steps(2) infinite;
+}
+/* Streaming image placeholder */
+.streaming-img-placeholder {
+  display: inline-block;
+  padding: 4px 10px;
+  background: var(--bg-raised);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
 .msg.assistant p {
   margin: 0.7em 0;
 }

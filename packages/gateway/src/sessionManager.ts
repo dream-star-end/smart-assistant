@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   type AgentDef,
@@ -75,6 +76,8 @@ export class SessionManager {
 
   // Resume map: sessionKey → ccbSessionId (survives gateway restart)
   private _resumeMap = new Map<string, string>()
+  // Serialized write queue to prevent concurrent writeFile race conditions
+  private _resumeMapWrite: Promise<void> = Promise.resolve()
 
   private _loadResumeMap(): void {
     try {
@@ -90,9 +93,16 @@ export class SessionManager {
     for (const [key, sess] of this.sessions) {
       if (sess.ccbSessionId) obj[key] = sess.ccbSessionId
     }
-    try {
-      writeFileSync(this.resumeMapPath, JSON.stringify(obj, null, 2))
-    } catch {}
+    const data = JSON.stringify(obj, null, 2)
+    this._resumeMapWrite = this._resumeMapWrite
+      .then(() => writeFile(this.resumeMapPath, data))
+      .catch((err) => console.error('[sessionManager] resume-map write failed:', err))
+  }
+
+  /** Check which sessionKeys in the resume map match a given pattern (e.g., containing a peerId) */
+  getResumableKeys(filter?: (key: string) => boolean): string[] {
+    const keys = [...this._resumeMap.keys()]
+    return filter ? keys.filter(filter) : keys
   }
 
   async getOrCreate(opts: {
@@ -166,6 +176,8 @@ export class SessionManager {
     try {
       await prev
       session.lastUsedAt = Date.now()
+      // Clear tool use mappings from previous turn to prevent unbounded growth
+      session.toolUseIdToName.clear()
       // Reset per-turn accumulators for FTS5 indexing
       session.currentUserText =
         typeof userTextOrBlocks === 'string'
@@ -180,13 +192,8 @@ export class SessionManager {
         const title = session.currentUserText.slice(0, 50).replace(/\s+/g, ' ').trim()
         if (title) session.title = title
       }
-      // Liveness-based timeout: kill only if NO stdout/stderr activity for a while.
-      // Delegate/cron tasks get longer timeout since tools (Browser, Bash) can take time.
-      const isLongRunning =
-        session.sessionKey.includes(':delegate:') ||
-        session.sessionKey.includes(':cron:') ||
-        session.sessionKey.includes(':task:')
-      const IDLE_TIMEOUT = isLongRunning ? 10 * 60_000 : 5 * 60_000 // 10min for tasks, 5min for chat
+      // Liveness-based timeout: interrupt if NO stdout/stderr activity for 1 hour
+      const IDLE_TIMEOUT = 60 * 60_000 // 1 hour
       const CHECK_INTERVAL = 30_000 // check every 30s
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {
@@ -207,11 +214,13 @@ export class SessionManager {
       }
     } catch (err: any) {
       if (err?.message?.includes('idle timeout')) {
+        // Actually interrupt the runner so the subprocess stops
+        try { session.runner.interrupt() } catch {}
         onEvent({
           kind: 'error',
-          error: '子进程无响应超过 3 分钟,已自动停止。如果任务仍在执行,请重试。',
+          error: '子进程无响应超过 1 小时,已中断。请重试。',
         })
-        console.error(`[session:${session.sessionKey}] idle timeout: ${err.message}`)
+        console.error(`[session:${session.sessionKey}] idle timeout, interrupted: ${err.message}`)
       } else {
         throw err
       }
@@ -262,11 +271,12 @@ export class SessionManager {
       const timer = setTimeout(
         () => {
           if (!parser.finalized) {
-            onEvent({ kind: 'error', error: 'timeout waiting for result' })
+            try { runner.interrupt() } catch {}
+            onEvent({ kind: 'error', error: 'timeout waiting for result (1h), interrupted' })
             cleanup()
           }
         },
-        10 * 60 * 1000,
+        60 * 60 * 1000, // 1 hour absolute timeout
       )
 
       const cleanup = () => {

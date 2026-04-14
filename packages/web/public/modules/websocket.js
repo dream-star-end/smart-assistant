@@ -1,7 +1,7 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
-import { enqueuePermission } from './permissions.js'
+import { clearAllPermissions, enqueuePermission } from './permissions.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 
@@ -12,6 +12,7 @@ export function setWsDeps(deps) {
 }
 
 // ── Module-private state ──
+let _reconnectAttempts = 0
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
 
 // Notification sound (local copy — avoids exporting private from notifications.js)
@@ -44,7 +45,7 @@ export function showTypingIndicator() {
   el.id = '__typing'
   const sess = getSession()
   const agentInfo = state.agentsList.find((a) => a.id === (sess?.agentId || state.defaultAgentId))
-  const av = agentInfo?.avatarEmoji || 'O'
+  const av = htmlSafeEscape(agentInfo?.avatarEmoji || 'O')
   const name = agentInfo?.displayName || sess?.agentId || 'AI'
   el.innerHTML = `<div class="avatar">${av}</div><div class="typing-dots"><span></span><span></span><span></span></div><span class="typing-label">${htmlSafeEscape(name)} 思考中</span>`
   el._startTime = Date.now()
@@ -127,6 +128,123 @@ export function updateMsgStatus(msg) {
   statusEl.innerHTML = `${_STATUS_SVG[msg.status] || ''}<span>${_STATUS_LABEL[msg.status] || ''}</span>`
 }
 
+// ── Offline queue draining (race-safe, no ws.onmessage monkey-patching) ──
+// Generation counter: incremented on each new drain cycle. Stale retry callbacks
+// check this to avoid re-entering after disconnect/reconnect started a new drain.
+let _drainGeneration = 0
+
+// Exported: called by /clear and deleteSession after clearing _offlineDrainingCurrent
+// to advance the drain to the next item if there are pending items remaining.
+export function nudgeDrain() {
+  if (state._drainTimeout) { clearTimeout(state._drainTimeout); state._drainTimeout = null }
+  if (state._offlineDrainingCurrent) return  // Still has an active item, don't interfere
+  if (state._offlineQueuePending?.length > 0) {
+    setTimeout(_drainNextOfflineItem, 500)
+  } else {
+    state._offlineQueueDraining = false
+  }
+}
+
+function _drainNextOfflineItem() {
+  const gen = _drainGeneration
+  const queue = state._offlineQueuePending
+  if (!queue || queue.length === 0) {
+    state._offlineQueueDraining = false
+    state._offlineDrainingCurrent = null
+    return
+  }
+  const item = queue[0]  // Peek first, don't shift yet
+  // If the target session has a resumed turn still in flight, wait for it to finish
+  const targetSess = state.sessions.get(item.sessId)
+  if (targetSess?._sendingInFlight) {
+    if (!item._retryCount) item._retryCount = 0
+    item._retryCount++
+    if (item._retryCount > 60) {
+      // Timeout after 60s — move this item to the back and try the next one.
+      // Don't force-clear _sendingInFlight as the resumed turn may still be legitimately running.
+      queue.shift()
+      queue.push(item)
+      item._retryCount = 0
+      console.warn('[ws] Drain: session', item.sessId, 'still busy after 60s, deferring')
+      // If ALL items are for busy sessions, stop draining to avoid infinite loop
+      const allBusy = queue.every(q => {
+        const s = state.sessions.get(q.sessId)
+        return s?._sendingInFlight
+      })
+      if (allBusy) {
+        // Wait 5s then retry — check generation to prevent stale callback
+        setTimeout(() => { if (_drainGeneration === gen) _drainNextOfflineItem() }, 5000)
+        return
+      }
+      _drainNextOfflineItem()
+      return
+    }
+    // Wait 1s then retry — check generation to prevent stale callback
+    setTimeout(() => { if (_drainGeneration === gen) _drainNextOfflineItem() }, 1000)
+    return
+  }
+  queue.shift()
+  state._offlineDrainingCurrent = item
+  const ws = state.ws
+  if (!ws || ws.readyState !== 1) {
+    // Connection lost while draining — push current + remaining back to offline queue
+    state.offlineQueue.unshift(item, ...queue)
+    state._offlineQueuePending = []
+    state._offlineQueueDraining = false
+    state._offlineDrainingCurrent = null
+    return
+  }
+  try {
+    ws.send(JSON.stringify(item.payload))
+    const sess = state.sessions.get(item.sessId)
+    if (sess) {
+      const msg = sess.messages.find((m) => m.id === item.msgId)
+      if (msg) {
+        msg.status = 'sent'
+        updateMsgStatus(msg)
+      }
+      sess._sendingInFlight = true
+      if (sess.id === state.currentSessionId) {
+        state.sendingInFlight = true
+        updateSendEnabled()
+        showTypingIndicator()
+        setTitleBusy(true)
+      }
+    }
+  } catch {
+    // Send failed — re-queue current + remaining
+    state.offlineQueue.unshift(item, ...queue)
+    state._offlineQueuePending = []
+    state._offlineQueueDraining = false
+    state._offlineDrainingCurrent = null
+  }
+  // Safety timeout: if no isFinal arrives in 120s, advance the drain to prevent wedge
+  state._drainTimeout = setTimeout(() => {
+    if (state._offlineDrainingCurrent === item) {
+      console.warn('[ws] Drain isFinal timeout for session', item.sessId)
+      // Clear stale sending state for this session
+      const stuckSess = state.sessions.get(item.sessId)
+      if (stuckSess) {
+        stuckSess._sendingInFlight = false
+        if (stuckSess.id === state.currentSessionId) {
+          state.sendingInFlight = false
+          updateSendEnabled()
+          hideTypingIndicator()
+          setTitleBusy(false)
+        }
+      }
+      state._offlineDrainingCurrent = null
+      if (state._offlineQueuePending?.length > 0) {
+        _drainNextOfflineItem()
+      } else {
+        state._offlineQueueDraining = false
+      }
+    }
+  }, 120000)
+  // If no more items, we're done after this response (handleOutbound will clear the flag)
+  if (queue.length === 0) state._offlineQueueDraining = false
+}
+
 // ═══════════════ WEBSOCKET ═══════════════
 export function setStatus(label, klass) {
   state.wsStatus = klass
@@ -139,8 +257,10 @@ export function setStatus(label, klass) {
 export function updateSendEnabled() {
   const btn = $('send')
   const svg = btn.querySelector('svg')
-  if (state.wsStatus !== 'connected') {
-    btn.disabled = true
+  // Allow sending even when disconnected — messages will be queued offline
+  // (matching Enter-key behavior which already queues)
+  if (state.wsStatus !== 'connected' && !state.sendingInFlight) {
+    btn.disabled = false
     btn.classList.remove('stopping')
     if (svg)
       svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
@@ -173,6 +293,7 @@ export function stopCurrentTurn() {
   toast('已发送停止指令')
 }
 export function connect() {
+  if (!state.token) return  // No token (logged out) — don't connect
   if (state.ws && state.ws.readyState < 2) return
   setStatus('connecting…', 'connecting')
   // Use Sec-WebSocket-Protocol for auth instead of query string (avoids token in URL/logs)
@@ -180,58 +301,40 @@ export function connect() {
   const ws = new WebSocket(url, ['bearer', state.token])
   state.ws = ws
   ws.onopen = () => {
+    _reconnectAttempts = 0
     setStatus('connected', 'connected')
-    // Flush offline queue — send one at a time to avoid interleaving responses
+    // Restore UI state for the current session if it was mid-turn before disconnect
+    const _currentSess = getSession()
+    if (_currentSess?._sendingInFlight) {
+      state.sendingInFlight = true
+      updateSendEnabled()
+      showTypingIndicator()
+      setTitleBusy(true)
+    }
+    // Send hello with all active session peer IDs so gateway can auto-resume
+    try {
+      const peers = []
+      for (const [id, s] of state.sessions) {
+        peers.push({ peerId: id, agentId: s.agentId || state.defaultAgentId })
+      }
+      ws.send(JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
+    } catch {}
+    // Flush offline queue — delay drain start to let hello/resume isFinals arrive first.
+    // This prevents a resumed turn's isFinal from being mistaken for a drain response.
+    if (state._offlineDrainTimer) clearTimeout(state._offlineDrainTimer)
     if (state.offlineQueue.length > 0) {
-      const queue = [...state.offlineQueue]
-      state.offlineQueue = []
-      // Send only the first queued message now; rest will be sent after each response completes
-      const sendNext = () => {
-        if (queue.length === 0) return
-        const item = queue.shift()
-        try {
-          ws.send(JSON.stringify(item.payload))
-          const sess = state.sessions.get(item.sessId)
-          if (sess) {
-            const msg = sess.messages.find((m) => m.id === item.msgId)
-            if (msg) {
-              msg.status = 'sent'
-              updateMsgStatus(msg)
-            }
-          }
-        } catch {}
-        // Queue the next message to send after current response finishes (isFinal)
-        if (queue.length > 0) {
-          const _origHandler = ws.onmessage
-          const _waitFinal = (ev) => {
-            try {
-              const f = JSON.parse(ev.data)
-              if (f.type === 'outbound.message' && f.isFinal) {
-                ws.onmessage = _origHandler
-                setTimeout(sendNext, 500)
-              }
-            } catch {}
-            if (_origHandler) _origHandler(ev)
-          }
-          ws.onmessage = _waitFinal
-        }
-      }
-      // Remember the first item BEFORE sendNext() shifts it out
-      const firstQueued = queue[0]
-      sendNext()
-      if (firstQueued) {
-        toast(`${queue.length + 1} 条离线消息开始发送`)
-        // Mark the first queued item's session as sending
-        const qSess = state.sessions.get(firstQueued.sessId)
-        if (qSess) qSess._sendingInFlight = true
-        // Only update global UI if queued session is currently visible
-        if (qSess && qSess.id === state.currentSessionId) {
-          state.sendingInFlight = true
-          updateSendEnabled()
-          showTypingIndicator()
-          setTitleBusy(true)
-        }
-      }
+      const totalCount = state.offlineQueue.length
+      state._offlineDrainTimer = setTimeout(() => {
+        state._offlineDrainTimer = null
+        if (!state.ws || state.ws.readyState !== 1) return  // Disconnected before timer fired
+        if (state.offlineQueue.length === 0) return
+        state._offlineQueuePending = [...state.offlineQueue]
+        state.offlineQueue = []
+        state._offlineQueueDraining = true
+        _drainGeneration++  // Invalidate any stale retry callbacks from previous drain cycle
+        _drainNextOfflineItem()
+        toast(`${totalCount} 条离线消息开始发送`)
+      }, 3000)
     }
   }
   // Client-side keepalive: prevent mobile browser from killing WS during long tasks
@@ -244,26 +347,65 @@ export function connect() {
 
   ws.onclose = (e) => {
     clearInterval(_wsKeepAlive)
+    // Guard: ignore close events from stale sockets (a newer connect() may have replaced state.ws)
+    if (state.ws !== ws) return
+    if (state._offlineDrainTimer) { clearTimeout(state._offlineDrainTimer); state._offlineDrainTimer = null }
+    if (state._drainTimeout) { clearTimeout(state._drainTimeout); state._drainTimeout = null }
     setStatus('disconnected', 'disconnected')
-    // Clear all sessions' sending state on disconnect
-    for (const [, s] of state.sessions) s._sendingInFlight = false
+    // Only clear global UI sending state — keep per-session _sendingInFlight
+    // so that after reconnect + hello/resume, sessions can restore their loading state
     state.sendingInFlight = false
+    // Re-queue all pending drain items + the in-flight one.
+    // The gateway auto-resume + idempotencyKey dedup ensures no duplicate turns.
+    {
+      const requeue = []
+      if (state._offlineDrainingCurrent) requeue.push(state._offlineDrainingCurrent)
+      if (state._offlineQueuePending?.length > 0) requeue.push(...state._offlineQueuePending)
+      if (requeue.length > 0) state.offlineQueue.unshift(...requeue)
+      state._offlineDrainingCurrent = null
+      state._offlineQueuePending = []
+    }
+    state._offlineQueueDraining = false
     updateSendEnabled()
     hideTypingIndicator()
+    clearAllPermissions()  // Close any open permission prompts on disconnect
     if (e.code === 1008) {
       localStorage.removeItem('openclaude_token')
       state.token = ''
+      toast('Token 无效或已过期，请重新登录', 'error')
       _deps.showLogin()
       return
     }
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
-    state.reconnectTimer = setTimeout(connect, 2000)
+    // Don't auto-reconnect if logged out (no token)
+    if (!state.token) return
+    const delay = Math.min(2000 * Math.pow(2, _reconnectAttempts), 30000) + Math.random() * 1000
+    _reconnectAttempts++
+    if (delay >= 4000) {
+      let remaining = Math.ceil(delay / 1000)
+      setStatus(`reconnecting in ${remaining}s…`, 'disconnected')
+      const countdown = setInterval(() => {
+        remaining--
+        if (remaining > 0) setStatus(`reconnecting in ${remaining}s…`, 'disconnected')
+        else clearInterval(countdown)
+      }, 1000)
+    }
+    state.reconnectTimer = setTimeout(connect, delay)
   }
   ws.onerror = () => {}
   ws.onmessage = (ev) => {
+    // Guard: ignore messages from stale sockets
+    if (state.ws !== ws) return
     try {
       const f = JSON.parse(ev.data)
       if (f.type === 'outbound.message') handleOutbound(f)
+      else if (f.type === 'outbound.ack' && f.deduplicated) {
+        // Server already processed this message; clear drain state so queue continues
+        if (state._offlineDrainingCurrent) {
+          state._offlineDrainingCurrent = null
+          nudgeDrain()
+        }
+      }
     } catch {}
   }
 }
@@ -295,36 +437,63 @@ export function handleOutbound(frame) {
     return
   }
   const peerId = frame.peer?.id
-  let sess = state.sessions.get(peerId)
-  // If session not found (e.g. proactive push from cron/reminder), show in current active session
+  let sess = peerId ? state.sessions.get(peerId) : null
   if (!sess) {
-    sess = getSession()
-    if (!sess) return
+    if (frame.cronJob) {
+      // Cron/task push for unknown peer: show in current session with cron badge
+      // (creating a new session would be disruptive; the cronPush flag marks it visually)
+      sess = getSession()
+      if (!sess) return
+    } else if (!peerId) {
+      // Broadcast (no peer): show in current session
+      sess = getSession()
+      if (!sess) return
+    } else {
+      // Unknown peerId: silently ignore
+      console.warn('[ws] Ignoring frame for unknown peer:', peerId)
+      return
+    }
   }
   if (!sess._blockIdToMsgId) sess._blockIdToMsgId = new Map()
+  // Ignore late frames from before an agent switch — prevents cross-agent contamination
+  if (sess._agentSwitchedAt && frame.ts && frame.ts < sess._agentSwitchedAt) return
+  // Also ignore non-final frames if they arrive within 2s of an agent switch and we're not sending
+  if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) return
   // Any output -> hide typing indicator ONLY if this is the currently viewed session
   if (((frame.blocks?.length || 0) > 0 || frame.isFinal) && sess.id === state.currentSessionId)
     hideTypingIndicator()
-  // Update last user message status: first block = "read", isFinal = "replied"
-  const _lastUserMsg = [...sess.messages]
-    .reverse()
-    .find((m) => m.role === 'user' && m.status && m.status !== 'replied')
-  if (_lastUserMsg) {
+  // Update user message status: find the most recent user msg in THIS session
+  // that is still pending (sent/read but not replied). Only update one msg per turn.
+  if (!sess._replyingToMsgId) {
+    // Only match sent/read messages — skip 'queued' (not yet sent, shouldn't be marked read/replied)
+    const pending = [...sess.messages].reverse().find(
+      (m) => m.role === 'user' && m.status && m.status !== 'replied' && m.status !== 'queued'
+    )
+    if (pending) sess._replyingToMsgId = pending.id
+  }
+  const _targetMsg = sess._replyingToMsgId
+    ? sess.messages.find((m) => m.id === sess._replyingToMsgId)
+    : null
+  if (_targetMsg) {
     if (
       frame.blocks?.length > 0 &&
-      _lastUserMsg.status !== 'read' &&
-      _lastUserMsg.status !== 'replied'
+      _targetMsg.status !== 'read' &&
+      _targetMsg.status !== 'replied'
     ) {
-      _lastUserMsg.status = 'read'
-      updateMsgStatus(_lastUserMsg)
+      _targetMsg.status = 'read'
+      updateMsgStatus(_targetMsg)
     }
     if (frame.isFinal) {
-      _lastUserMsg.status = 'replied'
-      updateMsgStatus(_lastUserMsg)
+      _targetMsg.status = 'replied'
+      updateMsgStatus(_targetMsg)
+      sess._replyingToMsgId = null  // Clear for next turn
     }
   }
   // Detect non-heartbeat cron/task push — mark as system notification
   const isCronPush = frame.cronJob && !frame.cronJob.heartbeat
+
+  // Skip drain advancement for cron/heartbeat pushes (not real turn completions)
+  const _isCronOrHeartbeat = !!frame.cronJob
 
   for (const block of frame.blocks || []) {
     // Defensive: coerce block.text to string to prevent [object Object] rendering
@@ -347,16 +516,24 @@ export function handleOutbound(frame) {
       }
       sess._streamingAssistant.text += blockText
       _checkTaskNotifications(block.text)
-      // Throttled render: batch streaming updates via rAF instead of per-delta
+      // Throttled render: use coarser interval (~120ms) for streaming markdown
+      // to avoid re-parsing on every delta. Short texts use rAF for responsiveness.
+      const _textLen = (sess._streamingAssistant.text || '').length
+      const _throttleMs = _textLen < 500 ? 0 : _textLen < 3000 ? 80 : 120
       if (!sess._streamRafPending) {
         sess._streamRafPending = true
-        requestAnimationFrame(() => {
+        const _doRender = () => {
           sess._streamRafPending = false
           if (sess._streamingAssistant) {
             updateMessage(sess, sess._streamingAssistant, sess._streamingAssistant.text, true)
             _deps.scrollBottom()
           }
-        })
+        }
+        if (_throttleMs === 0) {
+          requestAnimationFrame(_doRender)
+        } else {
+          setTimeout(_doRender, _throttleMs)
+        }
       }
     } else if (block.kind === 'thinking') {
       if (!sess._streamingThinking) sess._streamingThinking = addMessage(sess, 'thinking', '')
@@ -372,13 +549,20 @@ export function handleOutbound(frame) {
         })
       }
     } else if (block.kind === 'tool_use') {
+      // Flush pending text render before clearing (rAF might not have fired yet)
+      if (sess._streamingAssistant?.text) {
+        updateMessage(sess, sess._streamingAssistant, sess._streamingAssistant.text, false)
+      }
+      if (sess._streamingThinking?.text) {
+        updateMessage(sess, sess._streamingThinking, sess._streamingThinking.text, false)
+      }
       sess._streamingAssistant = null
       sess._streamingThinking = null
       const isAgent = /^Agent$/i.test(block.toolName || '')
       const label = buildToolUseLabel(block)
 
       if (isAgent) {
-        // Sub-agent: create a collapsible group card
+        // Sub-agent: create a collapsible group card + register as bg task
         if (!sess._agentGroups) sess._agentGroups = new Map()
         if (block.blockId && !sess._agentGroups.has(block.blockId)) {
           const desc = (block.inputPreview || '').replace(/[{}"]/g, '').slice(0, 80) || '子任务'
@@ -390,6 +574,8 @@ export function handleOutbound(frame) {
           })
           sess._agentGroups.set(block.blockId, groupMsg.id)
           if (block.blockId) sess._blockIdToMsgId.set(block.blockId, groupMsg.id)
+          // Track in bg tasks panel so user can see running sub-agents
+          addBgTask(block.blockId, desc)
         }
       } else if (block.blockId && sess._blockIdToMsgId.has(block.blockId)) {
         const mid = sess._blockIdToMsgId.get(block.blockId)
@@ -407,6 +593,10 @@ export function handleOutbound(frame) {
         if (block.blockId) sess._blockIdToMsgId.set(block.blockId, m.id)
       }
     } else if (block.kind === 'tool_result') {
+      // Flush pending text render before clearing
+      if (sess._streamingAssistant?.text) {
+        updateMessage(sess, sess._streamingAssistant, sess._streamingAssistant.text, false)
+      }
       sess._streamingAssistant = null
       sess._streamingThinking = null
 
@@ -421,6 +611,10 @@ export function handleOutbound(frame) {
           groupMsg._resultPreview = (block.preview || '').slice(0, 200)
           groupMsg._isError = !!block.isError
           if (sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
+          // Update bg task panel
+          completeBgTask(block.blockId, block.isError ? 'failed' : 'done', {
+            preview: (block.preview || '').slice(0, 100),
+          })
         }
         continue
       }
@@ -470,6 +664,20 @@ export function handleOutbound(frame) {
       updateSendEnabled()
       hideTypingIndicator()
       setTitleBusy(false)
+    }
+    // If draining offline queue, advance when the drained session's turn completes.
+    // Skip cron/heartbeat pushes — they're not real turn completions.
+    // The 3s delay after reconnect + _sendingInFlight guard in _drainNextOfflineItem
+    // ensures resumed turns complete before drain starts, so this isFinal is ours.
+    const _drainCurrent = state._offlineDrainingCurrent
+    if (_drainCurrent && _drainCurrent.sessId === sess.id && !_isCronOrHeartbeat) {
+      if (state._drainTimeout) { clearTimeout(state._drainTimeout); state._drainTimeout = null }
+      state._offlineDrainingCurrent = null
+      if (state._offlineQueuePending?.length > 0) {
+        setTimeout(_drainNextOfflineItem, 500)
+      } else {
+        state._offlineQueueDraining = false
+      }
     }
     // Complete any bg tasks linked to this session's last user message
     const lastUser = [...sess.messages].reverse().find((m) => m.role === 'user')

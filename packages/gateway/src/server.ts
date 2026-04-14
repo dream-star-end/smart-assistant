@@ -48,6 +48,77 @@ export class Gateway {
   private _runLog = new RunLog()
   private permissions: PermissionRelay | null = null
   private channels = new Map<string, ChannelAdapter>()
+
+  // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
+  private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
+  private static readonly IDEMPOTENCY_MAX_KEYS = 1000
+  private static readonly IDEMPOTENCY_TTL_MS = 5 * 60_000 // 5 minutes
+
+  /**
+   * Check whether an idempotency key has already been processed.
+   * Returns true if the key is a duplicate (i.e. should be skipped).
+   */
+  private _checkIdempotencyKey(key: string): boolean {
+    if (!key) return false // empty key = no dedup
+    const now = Date.now()
+
+    // Evict expired entries on every check to keep Map bounded by TTL
+    if (this._seenIdempotencyKeys.size > 100) {
+      for (const [k, ts] of this._seenIdempotencyKeys) {
+        if (now - ts > Gateway.IDEMPOTENCY_TTL_MS) {
+          this._seenIdempotencyKeys.delete(k)
+        }
+      }
+    }
+
+    if (this._seenIdempotencyKeys.has(key)) {
+      const ts = this._seenIdempotencyKeys.get(key)!
+      if (now - ts < Gateway.IDEMPOTENCY_TTL_MS) {
+        return true // duplicate
+      }
+      // Expired — allow re-processing, will be re-added below
+    }
+
+    this._seenIdempotencyKeys.set(key, now)
+    return false
+  }
+
+  // ── Cached task list for high-frequency eventBus lookups ──
+  private _cachedTasks: Awaited<ReturnType<TaskStore['list']>> | null = null
+  private async _getCachedTasks() {
+    if (!this._cachedTasks) {
+      this._cachedTasks = await this._taskStore.list()
+    }
+    return this._cachedTasks
+  }
+  private _invalidateTaskCache() {
+    this._cachedTasks = null
+  }
+
+  // ── Cached agents config (avoid re-reading YAML on every request) ──
+  private _agentsConfigCache: AgentsConfig | null = null
+  private _agentsConfigMtime: number = 0
+
+  private async _getAgentsConfig(): Promise<AgentsConfig> {
+    try {
+      const st = statSync(paths.agentsYaml)
+      const mtime = st.mtimeMs
+      if (this._agentsConfigCache && mtime === this._agentsConfigMtime) {
+        return this._agentsConfigCache
+      }
+      this._agentsConfigCache = await readAgentsConfig()
+      this._agentsConfigMtime = mtime
+      return this._agentsConfigCache
+    } catch {
+      // File doesn't exist or stat failed — fall through to fresh read
+      this._agentsConfigCache = await readAgentsConfig()
+      this._agentsConfigMtime = 0
+      return this._agentsConfigCache
+    }
+  }
+
+  // ── In-memory cache for static web UI files ──
+  private _staticFileCache = new Map<string, { content: Buffer; mime: string }>()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
   // Per-agent last active channel tracking (for proactive push)
@@ -230,7 +301,7 @@ export class Gateway {
       const { webhookId, agentId, payload } = ev
       const { resolvedPrompt } = payload as any
       ;(async () => {
-        const cfg = await readAgentsConfig()
+        const cfg = await this._getAgentsConfig()
         const agent = cfg.agents.find((a) => a.id === agentId)
         if (!agent) return console.warn(`[webhook] agent "${agentId}" not found`)
         const sessionKey = `agent:${agentId}:webhook:${webhookId}:${Date.now()}`
@@ -291,10 +362,13 @@ export class Gateway {
       this._tickScheduledTasks().catch((err) => console.error('[task-scheduler] tick failed:', err))
     }, 60_000)
 
+    // Invalidate task cache when tasks are created or deleted
+    eventBus.on('task.created', () => this._invalidateTaskCache())
+    eventBus.on('task.deleted', () => this._invalidateTaskCache())
+
     // EventBus: webhook.received can also trigger webhook-type tasks
     eventBus.on('webhook.received', (ev) => {
-      this._taskStore
-        .list()
+      this._getCachedTasks()
         .then((tasks) => {
           for (const t of tasks) {
             if (
@@ -309,10 +383,9 @@ export class Gateway {
         .catch(() => {})
     })
 
-    // EventBus: catch-all listener for event-triggered tasks
+    // EventBus: catch-all listener for event-triggered tasks (uses cached task list)
     eventBus.on('*', (ev) => {
-      this._taskStore
-        .list()
+      this._getCachedTasks()
         .then((tasks) => {
           for (const t of tasks) {
             if (t.trigger === 'event' && t.eventType === ev.type && t.status !== 'disabled') {
@@ -332,6 +405,9 @@ export class Gateway {
       this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
     })
     console.log(`[gateway] http://${config.gateway.bind}:${config.gateway.port}  (token: *****)`)
+
+    // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
+    this.bootAutoResume().catch((err) => console.error('[auto-resume] boot failed:', err))
   }
 
   private async shutdown(stopEviction: () => void): Promise<void> {
@@ -389,14 +465,15 @@ export class Gateway {
         res.end('unauthorized')
         return
       }
-      this.setSessionCookie(res)
+      this.setSessionCookie(res, req)
       this.sendJson(res, 200, { ok: true })
       return
     }
 
     // Logout: expire the HttpOnly session cookie
     if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
-      res.setHeader('Set-Cookie', 'oc_session=; HttpOnly; SameSite=Strict; Path=/api/; Max-Age=0')
+      const secure = this.isHttps(req) ? '; Secure' : ''
+      res.setHeader('Set-Cookie', `oc_session=; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=0`)
       this.sendJson(res, 200, { ok: true })
       return
     }
@@ -607,24 +684,28 @@ export class Gateway {
       // Search in uploads first, then generated
       const dirs = [paths.uploadsDir, paths.generatedDir]
       let found: string | null = null
+      let mediaStat: ReturnType<typeof statSync> | null = null
       for (const dir of dirs) {
         const candidate = resolve(dir, filename)
         // Security: ensure resolved path stays inside the allowed directory
         if (!candidate.startsWith(resolve(dir))) continue
-        if (existsSync(candidate) && statSync(candidate).isFile()) {
-          found = candidate
-          break
-        }
+        try {
+          const s = statSync(candidate)
+          if (s.isFile()) {
+            found = candidate
+            mediaStat = s
+            break
+          }
+        } catch {}
       }
-      if (!found) {
+      if (!found || !mediaStat) {
         res.writeHead(404)
         res.end('not found')
         return
       }
-      const stat = statSync(found)
       res.writeHead(200, {
         'Content-Type': mimeFor(found),
-        'Content-Length': stat.size,
+        'Content-Length': mediaStat.size,
         'Cache-Control': 'public, max-age=86400',
       })
       createReadStream(found).pipe(res)
@@ -646,25 +727,39 @@ export class Gateway {
         res.end('bad path')
         return
       }
-      // Security: blacklist sensitive files, allow everything else.
-      // Personal deployment model: agent needs access to its own work products
-      // (screenshots, reports, build artifacts, test results, etc.)
+      // Security: allowlist directories first, then blocklist as secondary defense.
       const resolved = resolve(filePath)
+      const agentCwds = this.deps.agentsConfig.agents
+        .map((a) => a.cwd)
+        .filter((c): c is string => !!c)
+      if (!isFileAllowed(resolved, agentCwds)) {
+        console.warn(`[api/file] denied (not in allowlist): ${resolved}`)
+        res.writeHead(403)
+        res.end('access denied')
+        return
+      }
       if (isFileBlocked(resolved)) {
         console.warn(`[api/file] blocked sensitive: ${resolved}`)
         res.writeHead(403)
         res.end('access denied')
         return
       }
-      if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+      let fileStat: ReturnType<typeof statSync>
+      try {
+        fileStat = statSync(resolved)
+      } catch {
         res.writeHead(404)
         res.end('not found')
         return
       }
-      const stat = statSync(resolved)
+      if (!fileStat.isFile()) {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
       res.writeHead(200, {
         'Content-Type': mimeFor(resolved),
-        'Content-Length': stat.size,
+        'Content-Length': fileStat.size,
         'Cache-Control': 'public, max-age=3600',
         'Content-Disposition': `inline; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
       })
@@ -672,29 +767,50 @@ export class Gateway {
       return
     }
 
-    // 静态 web UI
+    // 静态 web UI (with in-memory cache)
     if (this.deps.webRoot) {
       const safePath = url.pathname === '/' ? '/index.html' : url.pathname
       const filePath = resolve(this.deps.webRoot, `.${safePath}`)
-      if (
-        filePath.startsWith(resolve(this.deps.webRoot)) &&
-        existsSync(filePath) &&
-        statSync(filePath).isFile()
-      ) {
-        res.writeHead(200, { 'Content-Type': mimeFor(filePath) })
-        res.end(readFileSync(filePath))
-        return
+      if (filePath.startsWith(resolve(this.deps.webRoot))) {
+        const cached = this._staticFileCache.get(filePath)
+        if (cached) {
+          res.writeHead(200, { 'Content-Type': cached.mime })
+          res.end(cached.content)
+          return
+        }
+        try {
+          const s = statSync(filePath)
+          if (s.isFile()) {
+            const content = readFileSync(filePath)
+            const mime = mimeFor(filePath)
+            this._staticFileCache.set(filePath, { content, mime })
+            res.writeHead(200, { 'Content-Type': mime })
+            res.end(content)
+            return
+          }
+        } catch {}
       }
       // SPA fallback — only for navigation requests (no file extension)
       // Static assets (.js/.css/.map/.min.js etc.) should 404, not serve index.html
       const hasExtension = /\.\w+$/.test(url.pathname)
       if (!hasExtension) {
         const indexPath = resolve(this.deps.webRoot, 'index.html')
-        if (existsSync(indexPath)) {
+        const cachedIndex = this._staticFileCache.get(indexPath)
+        if (cachedIndex) {
           res.writeHead(200, { 'Content-Type': 'text/html' })
-          res.end(readFileSync(indexPath))
+          res.end(cachedIndex.content)
           return
         }
+        try {
+          const s = statSync(indexPath)
+          if (s.isFile()) {
+            const content = readFileSync(indexPath)
+            this._staticFileCache.set(indexPath, { content, mime: 'text/html' })
+            res.writeHead(200, { 'Content-Type': 'text/html' })
+            res.end(content)
+            return
+          }
+        } catch {}
       }
     }
     res.writeHead(404)
@@ -722,12 +838,21 @@ export class Gateway {
     return checkToken(t, this.deps.config.gateway.accessToken)
   }
 
+  /** Check if the request arrived over HTTPS (direct TLS or behind a trusted reverse proxy like cloudflared) */
+  private isHttps(req: IncomingMessage): boolean {
+    return (
+      (req.socket as any).encrypted === true ||
+      req.headers['x-forwarded-proto'] === 'https'
+    )
+  }
+
   /** Set HttpOnly session cookie on response */
-  private setSessionCookie(res: ServerResponse): void {
+  private setSessionCookie(res: ServerResponse, req: IncomingMessage): void {
     const token = this.deps.config.gateway.accessToken
+    const secure = this.isHttps(req) ? '; Secure' : ''
     res.setHeader(
       'Set-Cookie',
-      `oc_session=${token}; HttpOnly; SameSite=Strict; Path=/api/; Max-Age=31536000`,
+      `oc_session=${token}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=31536000`,
     )
   }
 
@@ -784,6 +909,7 @@ export class Gateway {
       }
       cfg.agents.push(agent)
       await writeAgentsConfig(cfg)
+      this.deps.agentsConfig = cfg
       await mkdir(paths.agentSessionsDir(body.id), { recursive: true })
       // Seed an empty persona file if missing
       try {
@@ -827,6 +953,7 @@ export class Gateway {
       if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
       cfg.agents[idx] = agent
       await writeAgentsConfig(cfg)
+      this.deps.agentsConfig = cfg
       this.router.reload(cfg)
       this.sendJson(res, 200, { agent })
       return
@@ -838,6 +965,7 @@ export class Gateway {
       }
       cfg.agents.splice(idx, 1)
       await writeAgentsConfig(cfg)
+      this.deps.agentsConfig = cfg
       this.router.reload(cfg)
       this.sendJson(res, 200, { ok: true })
       return
@@ -972,7 +1100,7 @@ export class Gateway {
     if (!message) return this.sendError(res, 400, 'message required')
 
     // Find target agent
-    const cfg = await readAgentsConfig()
+    const cfg = await this._getAgentsConfig()
     const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
     if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
 
@@ -1064,7 +1192,7 @@ export class Gateway {
     }
 
     // Find target agent
-    const cfg = await readAgentsConfig()
+    const cfg = await this._getAgentsConfig()
     const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
     if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
 
@@ -1178,6 +1306,7 @@ export class Gateway {
         eventType,
         maxRuns,
       })
+      this._invalidateTaskCache()
       this.sendJson(res, 201, { ok: true, task })
       return
     }
@@ -1204,11 +1333,13 @@ export class Gateway {
         return this.sendError(res, 400, 'invalid JSON')
       }
       const ok = await this._taskStore.update(taskId, parsed)
+      if (ok) this._invalidateTaskCache()
       this.sendJson(res, ok ? 200 : 404, { ok })
       return
     }
     if (req.method === 'DELETE') {
       const ok = await this._taskStore.remove(taskId)
+      if (ok) this._invalidateTaskCache()
       this.sendJson(res, ok ? 200 : 404, { ok })
       return
     }
@@ -1251,7 +1382,7 @@ export class Gateway {
   private async _triggerTask(taskId: string): Promise<void> {
     const task = await this._taskStore.get(taskId)
     if (!task || task.status === 'disabled') return
-    const cfg = await readAgentsConfig()
+    const cfg = await this._getAgentsConfig()
     const agent = cfg.agents.find((a) => a.id === task.agent)
     if (!agent) return
     const sessionKey = `agent:${task.agent}:task:${taskId}:${Date.now()}`
@@ -1542,7 +1673,11 @@ export class Gateway {
     oauth: { refreshToken: string; scope: string; expiresAt: number },
   ): Promise<void> {
     const prov = this.OAUTH_PROVIDERS[providerKey]
-    if (!prov) return
+    if (!prov || !prov.tokenUrl) {
+      if (!prov) console.warn(`[oauth:${providerKey}] skipping refresh: unknown provider`)
+      else console.warn(`[oauth:${providerKey}] skipping refresh: no tokenUrl configured`)
+      return
+    }
 
     try {
       const tokenRes = await fetch(prov.tokenUrl, {
@@ -1578,7 +1713,7 @@ export class Gateway {
         console.log(`[oauth:${providerKey}] token refreshed, expires in`, tokens.expires_in, 's')
       }
     } catch (err) {
-      console.error('[oauth] refresh error:', err)
+      console.error(`[oauth:${providerKey}] refresh error:`, err)
     }
   }
 
@@ -1656,6 +1791,7 @@ export class Gateway {
       }
     }
     ws.on('message', async (raw) => {
+      try {
       let frame: InboundFrame
       try {
         frame = JSON.parse(raw.toString()) as InboundFrame
@@ -1676,6 +1812,19 @@ export class Gateway {
       // Client-side keepalive ping — just ignore
       if ((frame as any).type === 'ping') return
 
+      // Hello frame: client identifies its sessions so we can auto-resume.
+      // We register the WS into clientsByPeer only for peers that have an
+      // active session in the session manager (validated server-side).
+      if ((frame as any).type === 'inbound.hello') {
+        const hello = frame as any
+        const peers: Array<{ peerId: string; agentId: string }> = hello.peers || []
+        // Auto-resume: check if any peer has a resumable session that is NOT already active
+        this.autoResumeFromHello(peers, ws).catch((err) =>
+          console.error('[auto-resume] failed:', err),
+        )
+        return
+      }
+
       if (frame.type === 'inbound.message') {
         // 把 ws client 关联到这个 (channel, peer)
         const peerKey = `${frame.channel}:${frame.peer.id}`
@@ -1684,8 +1833,15 @@ export class Gateway {
           set = new Set()
           this.clientsByPeer.set(peerKey, set)
         }
-        set.add(ws)
-        ws.once('close', () => set?.delete(ws))
+        if (!set.has(ws)) {
+          set.add(ws)
+          ws.once('close', () => {
+            set?.delete(ws)
+            if (set?.size === 0) {
+              this.clientsByPeer.delete(peerKey)
+            }
+          })
+        }
         await this.dispatchInbound(frame)
       } else if (frame.type === 'inbound.control.stop') {
         await this.handleStop(frame)
@@ -1752,6 +1908,12 @@ export class Gateway {
           ws.send(JSON.stringify({ type: 'error', error: `compact failed: ${err?.message}` }))
         }
       }
+      } catch (err: any) {
+        console.error('[ws-message] unhandled error in message handler:', err)
+        try {
+          ws.send(JSON.stringify({ type: 'error', error: `internal error: ${err?.message}` }))
+        } catch { /* ws may already be closed */ }
+      }
     })
   }
 
@@ -1782,16 +1944,145 @@ export class Gateway {
     console.log(`[gateway] interrupt ${sessionKey} → ${ok}`)
   }
 
+  /** Pre-warm webchat sessions on boot so they respond instantly to the first user message */
+  private async bootAutoResume(): Promise<void> {
+    const resumableKeys = this.sessions.getResumableKeys((k) => k.includes(':webchat:'))
+    if (resumableKeys.length === 0) return
+
+    for (const sessionKey of resumableKeys) {
+      if (this.sessions.getByKey(sessionKey)) continue
+
+      const parts = sessionKey.split(':')
+      const agentId = parts[1]
+      const peerId = parts.slice(4).join(':')
+
+      console.log(`[auto-resume] pre-warming ${sessionKey}`)
+      const cfg = await this._getAgentsConfig()
+      const agent = cfg.agents.find((a) => a.id === agentId) ?? ({ id: agentId } as AgentDef)
+      await this.sessions.getOrCreate({
+        sessionKey,
+        agent,
+        channel: 'webchat',
+        peerId,
+      })
+      this.lastActiveChannel.set(agentId, {
+        channel: 'webchat',
+        peerId,
+        sessionKey,
+        at: Date.now(),
+      })
+      console.log(`[auto-resume] pre-warmed ${sessionKey}`)
+    }
+  }
+
+  private async autoResumeFromHello(
+    peers: Array<{ peerId: string; agentId: string }>,
+    ws: WebSocket,
+  ): Promise<void> {
+    // Register the reconnected WS client for each peer that has an active/resumable session.
+    // Security note: the same trust model applies as inbound.message — the gateway
+    // access token is the auth boundary; we validate that a session actually exists
+    // (active or in resume-map) before registering.
+    const registeredPeerKeys: string[] = []
+
+    for (const { peerId, agentId } of peers) {
+      const aid = agentId || 'main'
+      const safeId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
+      const sessionKey = `agent:${aid}:webchat:dm:${safeId}`
+
+      // Check active session first
+      let session = this.sessions.getByKey(sessionKey)
+
+      // If not active yet, check resume-map and trigger pre-warm (handles boot race)
+      if (!session) {
+        const resumableKeys = this.sessions.getResumableKeys((k) => k === sessionKey)
+        if (resumableKeys.length > 0) {
+          try {
+            const cfg = await this._getAgentsConfig()
+            const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as any)
+            session = await this.sessions.getOrCreate({
+              sessionKey,
+              agent,
+              channel: 'webchat',
+              peerId,
+            })
+            this.lastActiveChannel.set(aid, {
+              channel: 'webchat',
+              peerId,
+              sessionKey,
+              at: Date.now(),
+            })
+            console.log(`[auto-resume] on-demand pre-warmed ${sessionKey}`)
+          } catch (err) {
+            console.error(`[auto-resume] failed to pre-warm ${sessionKey}:`, err)
+            continue
+          }
+        } else {
+          continue // Not in resume-map either — skip
+        }
+      }
+
+      const peerKey = `webchat:${peerId}`
+      let set = this.clientsByPeer.get(peerKey)
+      if (!set) {
+        set = new Set()
+        this.clientsByPeer.set(peerKey, set)
+      }
+      if (!set.has(ws)) {
+        set.add(ws)
+        registeredPeerKeys.push(peerKey)
+      }
+      console.log(`[auto-resume] re-registered WS for ${peerKey} (session ${sessionKey})`)
+    }
+
+    // Single close handler for all peers registered via this hello (avoids listener accumulation)
+    if (registeredPeerKeys.length > 0) {
+      ws.once('close', () => {
+        for (const peerKey of registeredPeerKeys) {
+          const set = this.clientsByPeer.get(peerKey)
+          if (set) {
+            set.delete(ws)
+            if (set.size === 0) this.clientsByPeer.delete(peerKey)
+          }
+        }
+      })
+    }
+  }
+
   private async dispatchInbound(frame: InboundFrame, adapter?: ChannelAdapter): Promise<void> {
     if (frame.type !== 'inbound.message') {
       // TODO: 权限响应处理
       return
     }
+
+    // ── Idempotency dedup: skip already-processed messages (reconnect replay protection) ──
+    if (frame.idempotencyKey && this._checkIdempotencyKey(frame.idempotencyKey)) {
+      console.log(
+        `[dispatchInbound] duplicate idempotencyKey "${frame.idempotencyKey}" — skipping`,
+      )
+      // Notify connected WS clients for this peer so the client knows the message was deduped
+      const peerKey = `${frame.channel}:${frame.peer.id}`
+      const clients = this.clientsByPeer.get(peerKey)
+      if (clients) {
+        const ack = JSON.stringify({
+          type: 'outbound.ack',
+          idempotencyKey: frame.idempotencyKey,
+          deduplicated: true,
+        })
+        for (const ws of clients) {
+          try {
+            ws.send(ack)
+          } catch {}
+        }
+      }
+      return
+    }
+
     // Explicit agentId override (web UI per-session selection)
     let sessionKey: string
     let agent: AgentDef
     if (frame.agentId) {
-      const cfg = await readAgentsConfig()
+      const cfg = await this._getAgentsConfig()
       const ag = cfg.agents.find((a) => a.id === frame.agentId) ?? { id: frame.agentId }
       agent = ag
       // Include agentId in sessionKey so different agents get isolated subprocesses
@@ -2106,6 +2397,52 @@ export class Gateway {
 }
 
 // ── Exported security helpers (tested in security.test.ts) ──
+
+/**
+ * Allowlist of directory prefixes from which /api/file may serve files.
+ * Static entries cover well-known locations; dynamic entries (agent cwds)
+ * are checked separately via `isFileAllowed()`.
+ */
+export const FILE_ALLOWED_DIRS: string[] = [
+  resolve(paths.generatedDir), // /root/.openclaude/generated/
+  resolve(paths.uploadsDir), // /root/.openclaude/uploads/
+]
+
+/** Temp-file prefix pattern: /tmp/openclaude-* */
+const TEMP_PREFIX = resolve('/tmp/openclaude-')
+
+/** Known project roots that agents may work in */
+const AGENT_CWD_ROOTS: string[] = [
+  resolve('/opt/openclaude/openclaude'),
+  resolve('/opt/openclaude/claude-code-best'),
+]
+
+/**
+ * Returns true if the resolved absolute path falls within the allowlist.
+ * Checked BEFORE the blocklist — if this returns false, the file is denied
+ * regardless of blocklist status.
+ */
+export function isFileAllowed(resolvedPath: string, agentCwds?: string[]): boolean {
+  // 1. Static allowed directories
+  for (const dir of FILE_ALLOWED_DIRS) {
+    if (resolvedPath.startsWith(dir + '/') || resolvedPath === dir) return true
+  }
+  // 2. Temp files matching /tmp/openclaude-*
+  if (resolvedPath.startsWith(TEMP_PREFIX)) return true
+  // 3. Known project roots
+  for (const cwd of AGENT_CWD_ROOTS) {
+    if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) return true
+  }
+  // 4. Dynamic agent cwds (if provided)
+  if (agentCwds) {
+    for (const raw of agentCwds) {
+      if (!raw) continue
+      const cwd = resolve(raw)
+      if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) return true
+    }
+  }
+  return false
+}
 
 export const FILE_BLOCKED_PATTERNS = [
   /openclaude\.json$/, // gateway config with tokens

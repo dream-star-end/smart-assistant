@@ -3,7 +3,7 @@ import { $, _mod } from './dom.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
-import { addSystemMessage, hideTypingIndicator, updateSendEnabled } from './websocket.js'
+import { addSystemMessage, hideTypingIndicator, nudgeDrain, updateSendEnabled } from './websocket.js'
 
 // ── Late-binding for circular deps ──
 let _deps = {}
@@ -54,6 +54,17 @@ const slashCommands = [
       sess.messages = []
       sess._streamingAssistant = null
       sess._streamingThinking = null
+      // Purge any offline queued messages for this session to prevent stale sends
+      if (state.offlineQueue?.length > 0) {
+        state.offlineQueue = state.offlineQueue.filter(item => item.sessId !== sess.id)
+      }
+      if (state._offlineQueuePending?.length > 0) {
+        state._offlineQueuePending = state._offlineQueuePending.filter(item => item.sessId !== sess.id)
+      }
+      if (state._offlineDrainingCurrent?.sessId === sess.id) {
+        state._offlineDrainingCurrent = null
+        nudgeDrain()  // Advance drain to next item since we killed the current one
+      }
       _deps.renderMessages()
       _deps.scheduleSave(sess)
       // Notify gateway to kill the CCB subprocess so context is truly reset

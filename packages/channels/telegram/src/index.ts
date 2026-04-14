@@ -15,6 +15,8 @@ export interface TelegramConfig {
   mentionRequired?: boolean
   // 是否在 Telegram 消息里显示 thinking 块(默认不显示,只有调试需要)
   showThinking?: boolean
+  // 重启时是否丢弃离线期间积压的消息(默认 false,保留所有待处理更新)
+  dropPendingUpdates?: boolean
 }
 
 export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
@@ -37,6 +39,12 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
           return
         }
         bot = new Bot(cfg.botToken)
+
+        // Catch Grammy errors to prevent unhandled rejections crashing the process
+        bot.catch((err: any) => {
+          c.log.error('grammy error (caught)', err?.message ?? String(err))
+        })
+
         bot.on('message', async (botCtx: any) => {
           const text = botCtx.message?.text
           if (!text) return
@@ -47,7 +55,7 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
           }
           ctx?.dispatch({
             type: 'inbound.message',
-            idempotencyKey: `tg:${botCtx.message.message_id}`,
+            idempotencyKey: `tg:${botCtx.chat.id}:${botCtx.message.message_id}`,
             channel: 'telegram',
             peer: {
               id: String(botCtx.chat.id),
@@ -58,7 +66,28 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
             ts: Date.now(),
           })
         })
-        bot.start()
+
+        // Clear old polling sessions before starting
+        try {
+          await bot.api.deleteWebhook({ drop_pending_updates: !!cfg.dropPendingUpdates })
+        } catch {}
+
+        // Start polling with error handling — retry on 409 conflict
+        const startPolling = (attempt = 1) => {
+          bot.start({
+            onStart: () => c.log.info('telegram bot polling started'),
+          }).catch((err: any) => {
+            const is409 = err?.error_code === 409 || String(err).includes('409')
+            if (is409 && attempt <= 5) {
+              const delay = attempt * 3000
+              c.log.info(`telegram 409 conflict, retry #${attempt} in ${delay}ms...`)
+              setTimeout(() => startPolling(attempt + 1), delay)
+            } else {
+              c.log.error('telegram polling failed permanently', err?.message ?? String(err))
+            }
+          })
+        }
+        startPolling()
         c.log.info('telegram bot started')
       } catch (err) {
         c.log.error('telegram init failed (grammy not installed?)', err)

@@ -5,6 +5,7 @@ import {
   embedMediaUrls,
   processRichBlocks,
   renderMarkdown,
+  renderStreamingMarkdown,
 } from './markdown.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
@@ -13,11 +14,13 @@ import { shortTime } from './util.js'
 // Late-bound references set by main.js to break circular deps
 let _updateSendEnabled
 let _showTypingIndicator
+let _hideTypingIndicator
 let _setTitleBusy
 let _scheduleSave
 export function setMessageDeps(deps) {
   _updateSendEnabled = deps.updateSendEnabled
   _showTypingIndicator = deps.showTypingIndicator
+  _hideTypingIndicator = deps.hideTypingIndicator
   _setTitleBusy = deps.setTitleBusy
   _scheduleSave = deps.scheduleSave
 }
@@ -62,23 +65,33 @@ let _userScrolledUp = false
 let _scrollDebounce = null
 
 export function initMessagesListeners() {
-  $('messages')?.addEventListener('wheel', () => {
+  const _handleUserScroll = () => {
     if (state.sendingInFlight) {
       _userScrolledUp = !isAtBottom()
-      // Reset after 3s of no manual scroll -- user probably wants to follow again
       clearTimeout(_scrollDebounce)
       _scrollDebounce = setTimeout(() => {
         _userScrolledUp = false
       }, 3000)
     }
-  })
+  }
+  const msgEl = $('messages')
+  if (!msgEl) return
+  // Listen to wheel (desktop), touchmove (mobile), and generic scroll (scrollbar drag, keyboard)
+  msgEl.addEventListener('wheel', _handleUserScroll)
+  msgEl.addEventListener('touchmove', _handleUserScroll)
+  msgEl.addEventListener('scroll', _handleUserScroll, { passive: true })
 }
 
 export function scrollBottom(force) {
   const m = $('messages')
   // During streaming: always scroll unless user explicitly scrolled up
   if (force || (state.sendingInFlight && !_userScrolledUp) || isAtBottom()) {
-    m.scrollTop = m.scrollHeight
+    // Use instant scroll during streaming to avoid fighting with CSS smooth-scroll
+    if (state.sendingInFlight) {
+      m.scrollTo({ top: m.scrollHeight, behavior: 'instant' })
+    } else {
+      m.scrollTop = m.scrollHeight
+    }
   }
 }
 
@@ -154,6 +167,24 @@ export function _buildMessageEl(msg) {
           _doCopied()
         }
       } else if (action === 'regen') {
+        // Stop any in-flight turn before regenerating to avoid concurrent requests
+        if (state.sendingInFlight) {
+          // Import stopCurrentTurn via late-bound deps isn't available here,
+          // so send the stop command directly
+          if (state.ws && state.ws.readyState === 1) {
+            state.ws.send(JSON.stringify({
+              type: 'inbound.control.stop',
+              channel: 'webchat',
+              peer: { id: sess.id, kind: 'dm' },
+              agentId: sess.agentId || state.defaultAgentId,
+            }))
+          }
+          sess._sendingInFlight = false
+          state.sendingInFlight = false
+          _hideTypingIndicator()
+          _updateSendEnabled()
+          _setTitleBusy(false)
+        }
         // Find the last user message before this assistant message
         const idx = sess.messages.indexOf(msg)
         if (idx < 0) return
@@ -179,12 +210,16 @@ export function _buildMessageEl(msg) {
           peer: { id: sess.id, kind: 'dm' },
           agentId: sess.agentId || state.defaultAgentId,
           content: {
-            text: lastUserMsg.text || '',
+            text: lastUserMsg._modelText || lastUserMsg.text || '',
             media: lastUserMsg._media || undefined,
           },
           ts: Date.now(),
         }
-        if (state.ws && state.ws.readyState === 1) {
+        // Check if there are pending offline items for this session to prevent reordering
+        const _hasQueued = (state.offlineQueue?.some(i => i.sessId === sess.id)) ||
+          (state._offlineQueuePending?.some(i => i.sessId === sess.id)) ||
+          (state._offlineDrainingCurrent?.sessId === sess.id)
+        if (state.ws && state.ws.readyState === 1 && !_hasQueued) {
           state.ws.send(JSON.stringify(wsPayload))
           sess._sendingInFlight = true
           state.sendingInFlight = true
@@ -192,15 +227,23 @@ export function _buildMessageEl(msg) {
           _showTypingIndicator()
           _setTitleBusy(true)
         } else {
-          // Offline: queue for replay after reconnect
+          // Offline or has pending queue items: queue to maintain order
           state.offlineQueue.push({
             sessId: sess.id,
             payload: wsPayload,
             msgId: lastUserMsg.id,
           })
-          toast('离线排队中，重连后自动重新生成')
+          if (!state.ws || state.ws.readyState !== 1) {
+            toast('离线排队中，重连后自动重新生成')
+          }
         }
         _scheduleSave(sess)
+      } else if (action === 'tts-stop') {
+        // Stop ongoing TTS playback
+        if (window.speechSynthesis) window.speechSynthesis.cancel()
+        btn.innerHTML = _svgVol
+        btn.title = '朗读'
+        btn.dataset.action = 'tts'
       } else if (action === 'tts') {
         // Use Web Speech API for quick read-aloud
         const text = (msg.text || '').replace(/[#*`>_~\[\]()]/g, '').slice(0, 2000)
@@ -213,14 +256,11 @@ export function _buildMessageEl(msg) {
           window.speechSynthesis.speak(utter)
           btn.innerHTML = _svgStop
           btn.title = '停止朗读'
+          btn.dataset.action = 'tts-stop'  // Change action to prevent re-entry from delegated handler
           utter.onend = () => {
             btn.innerHTML = _svgVol
             btn.title = '朗读'
-          }
-          btn.onclick = () => {
-            window.speechSynthesis.cancel()
-            btn.innerHTML = _svgVol
-            btn.title = '朗读'
+            btn.dataset.action = 'tts'
           }
         } else {
           toast('浏览器不支持语音合成', 'error')
@@ -337,12 +377,30 @@ export function updateMessageEl(msg, streaming) {
     const body = el.querySelector('.msg-body')
     if (body) {
       if (streaming) {
-        // Streaming: lightweight escape + newline -> <br>, skip heavy Markdown/Mermaid/Chart
-        body.textContent = msg.text || ''
-        body.style.whiteSpace = 'pre-wrap'
-      } else {
+        // Streaming: lightweight Markdown (no hljs, no rich-block side effects)
+        body.innerHTML = renderStreamingMarkdown(msg.text || '')
         body.style.whiteSpace = ''
+        // Append blinking caret inside the deepest last block element
+        // so it appears at the actual text cursor position
+        let _caretTarget = body
+        while (_caretTarget.lastElementChild &&
+               !_caretTarget.lastElementChild.classList?.contains('code-block') &&
+               _caretTarget.lastElementChild.tagName !== 'PRE') {
+          const last = _caretTarget.lastElementChild
+          // Only descend into block-level elements that contain text
+          const tag = last.tagName
+          if (['P','LI','TD','TH','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','DIV','OL','UL'].includes(tag)) {
+            _caretTarget = last
+          } else {
+            break
+          }
+        }
+        const caret = document.createElement('span')
+        caret.className = 'streaming-caret'
+        _caretTarget.appendChild(caret)
+      } else {
         body.innerHTML = renderMarkdown(msg.text || '')
+        body.style.whiteSpace = ''
       }
     }
     if (msg.metaText) {
@@ -434,7 +492,7 @@ export function renderMessages() {
     empty.className = 'empty-state'
     const _ai = state.agentsList.find((a) => a.id === (s.agentId || state.defaultAgentId))
     const _name = _ai?.displayName || 'OpenClaude'
-    const _av = _ai?.avatarEmoji || 'O'
+    const _av = htmlSafeEscape(_ai?.avatarEmoji || 'O')
     empty.innerHTML = `<div class="empty-brand">${_av}</div><h1>${htmlSafeEscape(_name)}</h1><p>你的个人 AI 助理，随时待命</p><div class="hint-kbd">按 <kbd>${_mod}K</kbd> 打开命令面板 · 输入 <kbd>/</kbd> 查看命令</div>`
     main.appendChild(empty)
     return

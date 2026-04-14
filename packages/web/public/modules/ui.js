@@ -16,19 +16,53 @@ export function toast(msg, kind) {
 }
 
 let _modalFocusReturn = null
+let _activeFocusTrap = null
+const _focusTrapStack = []  // Stack for nested modals
+
+function _getFocusable(container) {
+  return container.querySelectorAll(
+    'input:not([disabled]),textarea:not([disabled]),select:not([disabled]),button:not([disabled]),[tabindex]:not([tabindex="-1"])'
+  )
+}
+
 export function openModal(id) {
   _modalFocusReturn = document.activeElement
   $(id).classList.add('open')
-  // Focus trap: focus first focusable element inside modal
   const modal = $(id).querySelector('.modal')
   if (modal) {
-    const focusable = modal.querySelector('input,textarea,select,button:not([disabled])')
-    if (focusable) setTimeout(() => focusable.focus(), 50)
+    // Focus first actionable button (skip readonly fields like in permission modal)
+    const actionBtn = modal.querySelector('button:not([disabled]):not([data-close-modal])')
+    const fallback = modal.querySelector('input:not([readonly]),textarea:not([readonly]),select,button:not([disabled])')
+    const target = actionBtn || fallback
+    if (target) setTimeout(() => target.focus(), 50)
+    // Focus trap: Tab cycles within the modal. Stacked for nested modals.
+    if (_activeFocusTrap) _focusTrapStack.push(_activeFocusTrap)
+    _activeFocusTrap = (e) => {
+      if (e.key !== 'Tab') return
+      const focusable = _getFocusable(modal)
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (e.shiftKey) {
+        if (document.activeElement === first) { e.preventDefault(); last.focus() }
+      } else {
+        if (document.activeElement === last) { e.preventDefault(); first.focus() }
+      }
+    }
+    document.addEventListener('keydown', _activeFocusTrap)
   }
 }
 
 export function closeModal(id) {
-  $(id).classList.remove('open')
+  const el = $(id)
+  if (!el?.classList.contains('open')) return  // Already closed, don't tear down traps
+  el.classList.remove('open')
+  if (_activeFocusTrap) {
+    document.removeEventListener('keydown', _activeFocusTrap)
+    _activeFocusTrap = _focusTrapStack.pop() || null
+    // Re-attach parent trap if nested
+    if (_activeFocusTrap) document.addEventListener('keydown', _activeFocusTrap)
+  }
   if (_modalFocusReturn) {
     try {
       _modalFocusReturn.focus()
