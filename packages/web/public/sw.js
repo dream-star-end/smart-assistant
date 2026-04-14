@@ -20,7 +20,6 @@ const SHELL = [
   '/modules/attachments.js',
   '/modules/speech.js',
   '/modules/notifications.js',
-  '/modules/permissions.js',
   '/modules/oauth.js',
   '/modules/memory.js',
   '/modules/tasks.js',

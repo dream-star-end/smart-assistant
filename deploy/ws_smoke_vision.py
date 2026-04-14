@@ -75,20 +75,6 @@ async def main():
             if m.get("type") != "outbound.message":
                 continue
 
-            # Auto-approve any permission request that pops
-            if m.get("permissionRequest"):
-                pr = m["permissionRequest"]
-                print(f"🔒 auto-allowing: {pr.get('tool')} {pr.get('summary')[:80]}", flush=True)
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "inbound.permission_response",
-                            "requestId": pr["id"],
-                            "decision": "allow",
-                        }
-                    )
-                )
-                continue
 
             for b in m.get("blocks", []):
                 k = b.get("kind")

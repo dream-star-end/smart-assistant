@@ -53,18 +53,6 @@ async def main():
             m = json.loads(raw)
             if m.get("type") != "outbound.message":
                 continue
-            if m.get("permissionRequest"):
-                pr = m["permissionRequest"]
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "inbound.permission_response",
-                            "requestId": pr["id"],
-                            "decision": "allow",
-                        }
-                    )
-                )
-                continue
             for b in m.get("blocks", []):
                 k = b.get("kind")
                 if k == "text":

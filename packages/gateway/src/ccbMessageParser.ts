@@ -22,7 +22,6 @@ export type SessionStreamEvent =
         turn?: number
       }
     }
-  | { kind: 'permission_request'; id: string; tool: string; summary: string }
   | { kind: 'error'; error: string }
 
 /** Detected tool_use that may need bridging (CronCreate, CronDelete, etc.) */

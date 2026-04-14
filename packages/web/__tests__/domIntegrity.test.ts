@@ -177,7 +177,6 @@ describe('T04: Critical IDs always present', () => {
     // Modals
     'agents-modal',
     'persona-modal',
-    'permission-modal',
     'memory-modal',
     'skills-modal',
     'tasks-modal',

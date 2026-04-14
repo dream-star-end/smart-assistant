@@ -271,38 +271,6 @@
   </div>
 </div>
 
-<!-- Permission request modal (popped when agent tries something risky) -->
-<div id="permission-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal" style="max-width:560px">
-    <div class="modal-head">
-      <h3>🔒 授权请求</h3>
-    </div>
-    <div class="modal-body">
-      <p style="color:var(--fg-muted);margin:0 0 var(--space-3)">
-        Agent 想执行一个<strong style="color:var(--warning)">高风险操作</strong>,被 openclaude-guard 拦截。你要批准吗?
-      </p>
-      <div class="form-row">
-        <label>工具</label>
-        <input id="perm-tool" readonly />
-      </div>
-      <div class="form-row">
-        <label>触发规则</label>
-        <input id="perm-reason" readonly />
-      </div>
-      <div class="form-row">
-        <label>详情</label>
-        <textarea id="perm-detail" readonly style="min-height:120px;font-family:var(--font-mono);font-size:var(--text-sm)"></textarea>
-      </div>
-      <p id="perm-pending-count" style="font-size:var(--text-xs);color:var(--fg-dim);margin:0"></p>
-    </div>
-    <div class="modal-foot">
-      <button id="perm-deny-btn" class="btn btn-danger">拒绝</button>
-      <div style="flex:1"></div>
-      <button id="perm-allow-btn" class="btn btn-primary">批准本次</button>
-    </div>
-  </div>
-</div>
-
 <!-- Memory modal -->
 <div id="memory-modal" class="modal-backdrop" role="dialog" aria-modal="true">
   <div class="modal">

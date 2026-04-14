@@ -24,7 +24,6 @@ import { checkToken } from './auth.js'
 import { CronScheduler } from './cron.js'
 import { eventBus } from './eventBus.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
-import { PermissionRelay, type PermissionRequest } from './permissionRelay.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
@@ -46,7 +45,6 @@ export class Gateway {
   private webhookRouter: WebhookRouter | null = null
   private _taskStore = new TaskStore()
   private _runLog = new RunLog()
-  private permissions: PermissionRelay | null = null
   private channels = new Map<string, ChannelAdapter>()
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
@@ -177,13 +175,6 @@ export class Gateway {
     process.once('SIGINT', () => this.shutdown(stopEviction))
     process.once('SIGTERM', () => this.shutdown(stopEviction))
 
-    // Permission relay for PreToolUse hook guard
-    this.permissions = new PermissionRelay()
-    this.permissions.on('request', (req: PermissionRequest) => this.broadcastPermissionRequest(req))
-    this.permissions.on('expired', (req: PermissionRequest) => {
-      console.log('[permission-relay] expired', req.reqId, req.reason)
-    })
-    this.permissions.start().catch((err) => console.error('[permission-relay] start failed:', err))
 
     // Start cron scheduler for reflection jobs (L3)
     // Smart delivery: push to last active channel, fallback to all webchat clients
@@ -1735,40 +1726,7 @@ export class Gateway {
     })
   }
 
-  // Broadcast a permission_request to every connected WS client (and every
-  // adapter that supports it — telegram in the future).
   private wsClients = new Set<WebSocket>()
-
-  private broadcastPermissionRequest(req: PermissionRequest): void {
-    const out: OutboundMessage = {
-      type: 'outbound.message',
-      sessionKey: req.sessionKey || `agent:${req.agentId}:permission:dm:${req.reqId}`,
-      channel: 'permission',
-      peer: { id: '__permission__', kind: 'dm' },
-      blocks: [
-        {
-          kind: 'text',
-          text: `🔒 agent 想执行一个高风险操作:\n\n工具: ${req.toolName}\n规则: ${req.reason}\n\n${req.summary}`,
-        },
-      ],
-      isFinal: true,
-      permissionRequest: {
-        id: req.reqId,
-        tool: req.toolName,
-        reason: req.reason,
-        detail: req.detail,
-        summary: req.summary,
-        toolInput: req.toolInput,
-        options: ['allow', 'deny'],
-      },
-    }
-    const data = JSON.stringify(out)
-    for (const ws of this.wsClients) {
-      try {
-        ws.send(data)
-      } catch {}
-    }
-  }
 
   // ───────── WS ─────────
   private handleWsConnection(ws: WebSocket, req: IncomingMessage): void {
@@ -1784,12 +1742,6 @@ export class Gateway {
 
     this.wsClients.add(ws)
     ws.once('close', () => this.wsClients.delete(ws))
-    // When a new client connects, replay any currently-pending permission requests
-    if (this.permissions) {
-      for (const req of this.permissions.getPending()) {
-        this.broadcastPermissionRequest(req)
-      }
-    }
     ws.on('message', async (raw) => {
       try {
       let frame: InboundFrame
@@ -1797,16 +1749,6 @@ export class Gateway {
         frame = JSON.parse(raw.toString()) as InboundFrame
       } catch {
         ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }))
-        return
-      }
-      // Permission response from the frontend
-      if (frame.type === 'inbound.permission_response') {
-        if (!this.permissions) return
-        const decision = frame.decision
-        const mapped =
-          decision === 'allow_always' ? 'allow_always' : decision === 'allow' ? 'allow' : 'deny'
-        const ok = await this.permissions.respond(frame.requestId, mapped as any)
-        console.log(`[permission-relay] response ${frame.requestId} → ${mapped} (ok=${ok})`)
         return
       }
       // Client-side keepalive ping — just ignore

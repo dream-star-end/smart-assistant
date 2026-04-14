@@ -10,18 +10,5 @@
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "MiniMax-M2.7",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "MiniMax-M2.7"
   },
-  "hasCompletedOnboarding": true,
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash|Write|Edit|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /root/.openclaude/guard.py"
-          }
-        ]
-      }
-    ]
-  }
+  "hasCompletedOnboarding": true
 }

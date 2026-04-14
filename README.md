@@ -174,7 +174,6 @@ smart-assistant/
 ├── deploy/                    # 部署脚本 + systemd 配置 + 种子 skills
 │   ├── .env.example           # 环境变量模板
 │   ├── deploy_runner.py       # SSH 部署工具
-│   ├── guard.py               # PreToolUse 安全钩子
 │   ├── browser-stealth.js     # Playwright 反检测脚本
 │   └── seeds/skills/          # 7 个预置系统 skills
 └── AUDIT_REMEDIATION_TASKS_2026-04-11.md  # 安全审计整改清单

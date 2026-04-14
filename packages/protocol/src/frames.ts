@@ -43,13 +43,6 @@ export const InboundMessage = Type.Object({
 })
 export type InboundMessage = Static<typeof InboundMessage>
 
-export const PermissionResponse = Type.Object({
-  type: Type.Literal('inbound.permission_response'),
-  requestId: Type.String(),
-  decision: Type.Union([Type.Literal('allow'), Type.Literal('deny'), Type.Literal('allow_always')]),
-})
-export type PermissionResponse = Static<typeof PermissionResponse>
-
 export const InboundControlStop = Type.Object({
   type: Type.Literal('inbound.control.stop'),
   sessionKey: Type.Optional(Type.String()),
@@ -59,7 +52,7 @@ export const InboundControlStop = Type.Object({
 })
 export type InboundControlStop = Static<typeof InboundControlStop>
 
-export const InboundFrame = Type.Union([InboundMessage, PermissionResponse, InboundControlStop])
+export const InboundFrame = Type.Union([InboundMessage, InboundControlStop])
 export type InboundFrame = Static<typeof InboundFrame>
 
 // ───────────────────────────────────────────────
@@ -97,17 +90,6 @@ export const OutboundMessage = Type.Object({
   peer: Peer,
   blocks: Type.Array(OutboundContentBlock),
   isFinal: Type.Boolean(),
-  permissionRequest: Type.Optional(
-    Type.Object({
-      id: Type.String(),
-      tool: Type.String(),
-      summary: Type.String(),
-      reason: Type.Optional(Type.String()),
-      detail: Type.Optional(Type.String()),
-      toolInput: Type.Optional(Type.Unknown()),
-      options: Type.Array(Type.String()),
-    }),
-  ),
   meta: Type.Optional(
     Type.Object({
       cost: Type.Optional(Type.Number()),
@@ -141,7 +123,6 @@ export type ControlFrame = Static<typeof ControlFrame>
 // ───────────────────────────────────────────────
 export const AnyFrame = Type.Union([
   InboundMessage,
-  PermissionResponse,
   OutboundMessage,
   ControlFrame,
 ])

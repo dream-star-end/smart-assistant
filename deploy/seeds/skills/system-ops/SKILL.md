@@ -35,7 +35,6 @@ journalctl -u openclaude -f     # 实时跟踪日志
 | `/root/.openclaude/uploads/` | 用户上传的文件 |
 | `/root/.openclaude/generated/` | MCP 生成的媒体文件 |
 | `/root/.openclaude/sessions.db` | 会话搜索索引(SQLite FTS5) |
-| `/root/.openclaude/guard.py` | PreToolUse 安全钩子 |
 | `/root/.openclaude/cron.yaml` | 定时任务配置 |
 
 ## 配置修改
@@ -57,12 +56,10 @@ journalctl -u openclaude -f     # 实时跟踪日志
 
 1. **服务不响应**: 查日志 `journalctl -u openclaude -n 100`
 2. **MCP 工具报错**: 检查 `openclaude.json` 中的 API key 和 MCP 配置
-3. **权限弹窗不出现**: 检查 `guard.py` 是否存在且可执行
 4. **会话搜索无结果**: 检查 `sessions.db` 是否存在且有数据
 5. **磁盘空间**: `df -h` + `du -sh /root/.openclaude/`
 
 ## 安全
 
-- `guard.py` 作为 PreToolUse hook 拦截危险操作
 - 所有危险操作弹窗让用户决定,不自动拒绝
 - `/api/*` 端点需 accessToken 认证(media/file 端点除外)

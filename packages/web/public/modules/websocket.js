@@ -1,7 +1,6 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
-import { clearAllPermissions, enqueuePermission } from './permissions.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 
@@ -368,7 +367,6 @@ export function connect() {
     state._offlineQueueDraining = false
     updateSendEnabled()
     hideTypingIndicator()
-    clearAllPermissions()  // Close any open permission prompts on disconnect
     if (e.code === 1008) {
       localStorage.removeItem('openclaude_token')
       state.token = ''
@@ -430,12 +428,6 @@ export function buildToolUseLabel(block) {
   return name + body
 }
 export function handleOutbound(frame) {
-  // Permission requests are a special channel — they don't belong to any
-  // chat session, they pop a modal for the user to answer.
-  if (frame.permissionRequest) {
-    enqueuePermission(frame)
-    return
-  }
   const peerId = frame.peer?.id
   let sess = peerId ? state.sessions.get(peerId) : null
   if (!sess) {

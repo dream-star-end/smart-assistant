@@ -58,9 +58,6 @@ import { initSpeech, setAutoResize, toggleVoice } from './speech.js'
 // ── Notifications ──
 import { maybeNotify, requestNotifyPermission, setTitleBusy } from './notifications.js'
 
-// ── Permission requests ──
-import { enqueuePermission, respondPermission, showNextPermission } from './permissions.js'
-
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 
@@ -305,11 +302,6 @@ document.addEventListener('click', (e) => {
   // close modal on backdrop click
   const backdrop = e.target.classList?.contains('modal-backdrop') ? e.target : null
   if (backdrop) {
-    // Permission modal: deny instead of just closing (prevents permCurrent deadlock)
-    if (backdrop.id === 'permission-modal') {
-      respondPermission('deny')
-      return
-    }
     // Use closeModal to properly clean up focus trap
     closeModal(backdrop.id)
   }
@@ -374,13 +366,6 @@ document.addEventListener('keydown', (e) => {
     // Lightbox takes priority
     if (!$('lightbox').hidden) {
       closeLightbox()
-      e.stopPropagation()
-      return
-    }
-    // Permission modal: deny instead of just closing (prevents permCurrent deadlock)
-    const permModal = $('permission-modal')
-    if (permModal?.classList.contains('open')) {
-      respondPermission('deny')
       e.stopPropagation()
       return
     }
@@ -973,9 +958,6 @@ async function init() {
     await loadMemoryTab('user')
   }
   $('save-memory-btn').onclick = saveMemory
-  // Permission modal buttons
-  $('perm-allow-btn').onclick = () => respondPermission('allow')
-  $('perm-deny-btn').onclick = () => respondPermission('deny')
   $('voice-btn').onclick = toggleVoice
   $('upload-btn').onclick = () => $('file-input').click()
   $('file-input').addEventListener('change', (e) => {

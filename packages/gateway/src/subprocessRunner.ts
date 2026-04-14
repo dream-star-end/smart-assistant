@@ -129,16 +129,6 @@ export class SubprocessRunner extends EventEmitter {
     // 必须给一个 prompt placeholder,CCB stream-json 会从 stdin 接管
     args.push('')
 
-    // Determine pending dir for guard.py relay.
-    // Cron sessions have no live user — skip the relay and let guard directly deny.
-    const isCron = this.opts.sessionKey.includes(':cron:')
-    const pendingDir = isCron ? '' : resolve(tmpdir(), 'openclaude-pending', this.opts.agentId)
-    if (pendingDir) {
-      try {
-        mkdirSync(pendingDir, { recursive: true })
-      } catch {}
-    }
-
     // ── Provider-aware auth injection ──
     // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
     // We must inject the right env vars per provider so CCB routes to the correct API.
@@ -188,7 +178,6 @@ export class SubprocessRunner extends EventEmitter {
         ...providerEnv,
         OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
         OPENCLAUDE_AGENT_ID: this.opts.agentId,
-        OPENCLAUDE_PENDING_DIR: pendingDir,
         IS_SANDBOX: '1',
       },
       stdio: ['pipe', 'pipe', 'pipe'],
