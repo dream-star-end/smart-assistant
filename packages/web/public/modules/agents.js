@@ -23,7 +23,9 @@ export function renderAgentDropdown() {
   for (const a of state.agentsList) {
     const opt = document.createElement('option')
     opt.value = a.id
-    opt.textContent = a.id + (a.id === state.defaultAgentId ? ' (default)' : '')
+    const name = a.displayName ? `${a.displayName} (${a.id})` : a.id
+    const label = (a.avatarEmoji ? `${a.avatarEmoji} ` : '') + name
+    opt.textContent = label + (a.id === state.defaultAgentId ? ' (default)' : '')
     sel.appendChild(opt)
   }
   const sess = getSession()

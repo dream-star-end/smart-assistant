@@ -26,6 +26,9 @@ import { apiGet, apiJson, authHeaders } from './api.js'
 // ── IndexedDB ──
 import { dbDelete, dbGetAll, dbPut, openDB } from './db.js'
 
+// ── Cross-device sync ──
+import { syncSessionsFromServer } from './sync.js'
+
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
 
@@ -125,6 +128,7 @@ import {
   formatMeta,
   handleOutbound,
   hideTypingIndicator,
+  resetThinkingSafety,
   setMeta,
   setStatus,
   setWsDeps,
@@ -392,6 +396,14 @@ initTasksListeners()
 // ── OAuth: button click listeners ──
 initOAuthListeners()
 
+// ── Feedback: submit wiring ──
+$('feedback-submit-btn').onclick = submitFeedback
+$('feedback-desc').addEventListener('input', () => {
+  if ($('feedback-desc').value.trim().length >= FEEDBACK_MIN_CHARS) {
+    $('feedback-clarify').hidden = true
+  }
+})
+
 // ═══════════════════════════════════════════════════════════
 // 3. Functions defined in main.js
 // ═══════════════════════════════════════════════════════════
@@ -527,6 +539,7 @@ function send() {
     userMsg.status = 'sent'
     updateMsgStatus(userMsg)
     setSending(true)
+    resetThinkingSafety(sess.id)
     updateSendEnabled()
     showTypingIndicator()
     setTitleBusy(true)
@@ -622,6 +635,26 @@ const paletteActions = [
     },
   },
   {
+    id: 'open-changelog',
+    label: '更新日志',
+    section: '信息',
+    icon: 'doc',
+    run: () => {
+      closePalette()
+      openChangelog()
+    },
+  },
+  {
+    id: 'send-feedback',
+    label: '发送反馈',
+    section: '信息',
+    icon: 'chat',
+    run: () => {
+      closePalette()
+      openFeedbackModal()
+    },
+  },
+  {
     id: 'theme-cycle',
     label: '切换主题',
     section: '设置',
@@ -657,6 +690,7 @@ const ICON_SVG = {
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg>',
   clock:
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  doc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
 }
 
 let paletteItems = []
@@ -772,7 +806,25 @@ function closePalette() {
 function showLogin() {
   $('login-view').hidden = false
   $('app-view').hidden = true
-  setTimeout(() => $('token').focus(), 50)
+  $('login-error').style.display = 'none'
+  $('username').value = ''
+  $('token').value = ''
+  // Clear all in-memory state to prevent cross-identity leakage on auth-expiry re-login
+  state.sessions.clear()
+  state.currentSessionId = null
+  state.offlineQueue = []
+  state._offlineQueuePending = []
+  state._offlineDrainingCurrent = null
+  state._offlineQueueDraining = false
+  state.sendingInFlight = false
+  state.attachments = []
+  renderAttachments()
+  hideTypingIndicator()
+  setTitleBusy(false)
+  // Clear composer draft
+  const composer = $('input')
+  if (composer) composer.value = ''
+  setTimeout(() => $('username').focus(), 50)
 }
 
 function showApp() {
@@ -811,6 +863,198 @@ function createNewChat() {
 }
 
 // _renderTasksPanel is imported from websocket.js (has access to _bgTasks)
+
+// ═══════════════ SESSION MIGRATION ═══════════════
+
+async function checkUnclaimedSessions() {
+  try {
+    const resp = await apiGet('/api/sessions/unclaimed')
+    const unclaimed = resp?.sessions || []
+    if (unclaimed.length === 0) return
+    showMigrateModal(unclaimed)
+  } catch {}
+}
+
+function showMigrateModal(sessions) {
+  const list = $('migrate-list')
+  list.innerHTML = ''
+  const selected = new Set()
+
+  for (const s of sessions) {
+    const item = document.createElement('label')
+    item.className = 'migrate-item'
+    item.style.cssText = 'display:flex;gap:var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--border);cursor:pointer;align-items:flex-start'
+    const date = new Date(s.lastAt).toLocaleString('zh-CN', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
+    item.innerHTML = `
+      <input type="checkbox" data-sid="${htmlSafeEscape(s.id)}" style="margin-top:3px;flex-shrink:0">
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${htmlSafeEscape(s.title)}</div>
+        <div style="font-size:var(--text-xs);color:var(--fg-muted);margin-top:2px">${htmlSafeEscape(s.summary || '(无消息)')}</div>
+        <div style="font-size:var(--text-xs);color:var(--fg-muted);margin-top:2px">${date} · ${s.messageCount} 条消息 · ${htmlSafeEscape(s.agentId)}</div>
+      </div>
+    `
+    const cb = item.querySelector('input')
+    cb.onchange = () => {
+      if (cb.checked) selected.add(s.id)
+      else selected.delete(s.id)
+      $('migrate-count').textContent = String(selected.size)
+      $('migrate-btn').disabled = selected.size === 0
+    }
+    list.appendChild(item)
+  }
+
+  $('migrate-count').textContent = '0'
+  $('migrate-btn').disabled = true
+
+  $('migrate-skip-btn').onclick = () => closeModal('migrate-modal')
+  $('migrate-btn').onclick = async () => {
+    if (selected.size === 0) return
+    $('migrate-btn').disabled = true
+    $('migrate-btn').innerHTML = '迁移中…'
+    try {
+      const resp = await apiJson('POST', '/api/sessions/claim', { sessionIds: [...selected] })
+      const claimed = Object.values(resp?.results || {}).filter(Boolean).length
+      toast(`已迁移 ${claimed} 个会话`, 'success')
+      closeModal('migrate-modal')
+      // Re-sync to pull claimed sessions into local state
+      await syncSessionsFromServer()
+      const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+      if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+        state.currentSessionId = updated[0]?.id || null
+        if (!state.currentSessionId) createSession()
+        renderMessages()
+      }
+      renderSidebar()
+    } catch {
+      toast('迁移失败', 'error')
+    } finally {
+      $('migrate-btn').disabled = false
+      $('migrate-btn').innerHTML = `迁移选中 (<span id="migrate-count">${selected.size}</span>)`
+    }
+  }
+
+  openModal('migrate-modal')
+}
+
+// ═══════════════ CHANGELOG & VERSION ═══════════════
+
+let _changelogData = null
+
+async function loadChangelog() {
+  try {
+    const resp = await fetch('/api/changelog', { headers: authHeaders() })
+    _changelogData = await resp.json()
+    // Show version in sidebar
+    if (_changelogData.currentVersion) {
+      const vEl = $('app-version')
+      if (vEl) vEl.textContent = `v${_changelogData.currentVersion}`
+    }
+    // Check if user has seen this version (scoped by token to avoid cross-user collision)
+    const _userKey = `openclaude_changelog_seen_${(state.token || '').slice(-8)}`
+    const lastSeen = localStorage.getItem(_userKey)
+    if (lastSeen !== _changelogData.currentVersion && _changelogData.releases?.length > 0) {
+      const badge = $('changelog-badge')
+      if (badge) {
+        badge.hidden = false
+        badge.textContent = 'NEW'
+      }
+    }
+  } catch {}
+}
+
+function openChangelog() {
+  const content = $('changelog-content')
+  const versionEl = $('changelog-version')
+  if (!_changelogData || !_changelogData.releases?.length) {
+    content.innerHTML = '<p style="color:var(--fg-muted);text-align:center">暂无更新记录</p>'
+  } else {
+    content.innerHTML = _changelogData.releases.map((r, i) => `
+      <div class="changelog-entry${i === 0 ? ' latest' : ''}">
+        <div class="changelog-entry-head">
+          <span class="changelog-version-tag">v${htmlSafeEscape(r.version)}</span>
+          <span class="changelog-date">${htmlSafeEscape(r.date)}</span>
+        </div>
+        <h4 class="changelog-title">${htmlSafeEscape(r.title)}</h4>
+        <ul class="changelog-list">
+          ${r.highlights.map(h => `<li>${htmlSafeEscape(h)}</li>`).join('')}
+        </ul>
+      </div>
+    `).join('')
+    versionEl.textContent = `当前版本 v${_changelogData.currentVersion}`
+  }
+  // Mark as seen (scoped by user token)
+  if (_changelogData?.currentVersion) {
+    const _userKey = `openclaude_changelog_seen_${(state.token || '').slice(-8)}`
+    localStorage.setItem(_userKey, _changelogData.currentVersion)
+    const badge = $('changelog-badge')
+    if (badge) badge.hidden = true
+  }
+  openModal('changelog-modal')
+}
+
+// ═══════════════ FEEDBACK ═══════════════
+
+const FEEDBACK_MIN_CHARS = 15
+const FEEDBACK_CLARIFY_MESSAGES = [
+  '描述太简短了，能否补充更多细节？比如：发生了什么、你期望什么、如何复现。',
+  '为了更好地处理你的反馈，请提供更详细的描述 — 例如具体步骤、错误信息或截图。',
+  '好的反馈需要足够的上下文。请至少说明：问题是什么、何时发生、影响是什么。',
+]
+
+function openFeedbackModal() {
+  $('feedback-desc').value = ''
+  $('feedback-category').value = 'bug'
+  $('feedback-clarify').hidden = true
+  $('feedback-success').hidden = true
+  $('feedback-foot').style.display = ''
+  $('feedback-desc').parentElement.style.display = ''
+  $('feedback-category').parentElement.style.display = ''
+  openModal('feedback-modal')
+  setTimeout(() => $('feedback-desc').focus(), 50)
+}
+
+async function submitFeedback() {
+  const desc = $('feedback-desc').value.trim()
+  const category = $('feedback-category').value
+  // Clarification check
+  if (desc.length < FEEDBACK_MIN_CHARS) {
+    const clarifyEl = $('feedback-clarify')
+    const textEl = $('feedback-clarify-text')
+    const msg = FEEDBACK_CLARIFY_MESSAGES[Math.floor(Math.random() * FEEDBACK_CLARIFY_MESSAGES.length)]
+    textEl.textContent = msg
+    clarifyEl.hidden = false
+    $('feedback-desc').focus()
+    return
+  }
+  $('feedback-clarify').hidden = true
+  const btn = $('feedback-submit-btn')
+  btn.disabled = true
+  btn.textContent = '提交中…'
+  try {
+    const sess = getSession()
+    const resp = await apiJson('POST', '/api/feedback', {
+      category,
+      description: desc,
+      sessionId: sess?.id || null,
+      userAgent: navigator.userAgent,
+    })
+    if (resp.ok) {
+      // Show success state
+      $('feedback-success').hidden = false
+      $('feedback-foot').style.display = 'none'
+      $('feedback-desc').parentElement.style.display = 'none'
+      $('feedback-category').parentElement.style.display = 'none'
+      setTimeout(() => closeModal('feedback-modal'), 2000)
+    } else {
+      toast(resp.error || '提交失败', 'error')
+    }
+  } catch (err) {
+    toast('提交失败: ' + String(err), 'error')
+  } finally {
+    btn.disabled = false
+    btn.textContent = '提交反馈'
+  }
+}
 
 // ═══════════════════════════════════════════════════════════
 // 5. init() -- THE application bootstrap
@@ -857,6 +1101,7 @@ async function init() {
     localStorage.removeItem('openclaude_token')
     state.token = ''  // Clear token BEFORE close so onclose handler won't auto-reconnect
     if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+    if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
     // Clear all in-memory session data and offline queues to prevent cross-identity leakage
     state.sessions.clear()
     state.currentSessionId = null
@@ -868,6 +1113,11 @@ async function init() {
     state.attachments = []
     renderAttachments()
     hideTypingIndicator()
+    // Clear IndexedDB to prevent cross-user data leakage on shared browsers
+    try {
+      const all = await dbGetAll()
+      for (const s of all) await dbDelete(s.id)
+    } catch {}
     if (state.ws) state.ws.close(1000)
     showLogin()
   }
@@ -892,6 +1142,7 @@ async function init() {
     sess._streamingAssistant = null
     sess._streamingThinking = null
     sess._sendingInFlight = false
+    if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
     state.sendingInFlight = false
     hideTypingIndicator()
     updateSendEnabled()
@@ -943,7 +1194,9 @@ async function init() {
           toast('获取配置失败', 'error')
         }
       })()
-    } else if (action === 'claude-oauth') openOAuthModal()
+    } else if (action === 'changelog') openChangelog()
+    else if (action === 'feedback') openFeedbackModal()
+    else if (action === 'claude-oauth') openOAuthModal()
     else if (action === 'logout') $('logout-btn').click()
   })
   // Memory modal events
@@ -977,6 +1230,14 @@ async function init() {
     e.preventDefault()
     dropZone.style.outline = ''
     if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files)
+  })
+  // Paste images from clipboard
+  $('input').addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files || [])]
+    if (files.length > 0) {
+      e.preventDefault()
+      addFiles(files)
+    }
   })
   // Input events -- single keydown handler for both slash popup and send
   $('input').addEventListener('keydown', (e) => {
@@ -1058,20 +1319,64 @@ async function init() {
   $('persona-model-preset')?.addEventListener('change', (e) => {
     if (e.target.value) $('persona-model').value = e.target.value
   })
-  // Login
-  $('login-btn').onclick = () => {
-    const t = $('token').value.trim()
-    if (!t) return
-    state.token = t
-    localStorage.setItem('openclaude_token', t)
-    showApp()
-    renderSidebar()
-    renderMessages()
-    connect()
-    reloadAgents()
+  // Login (username + password → JWT)
+  $('login-btn').onclick = async () => {
+    const username = $('username').value.trim()
+    const password = $('token').value.trim()
+    if (!password) return
+    $('login-error').style.display = 'none'
+    $('login-btn').disabled = true
+    $('login-btn').textContent = '登录中…'
+    try {
+      const resp = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username || '', password }),
+      })
+      const data = await resp.json()
+      if (!resp.ok) {
+        $('login-error').textContent = data.error || '登录失败'
+        $('login-error').style.display = 'block'
+        return
+      }
+      state.token = data.token
+      localStorage.setItem('openclaude_token', data.token)
+      // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage
+      try {
+        const stale = await dbGetAll()
+        for (const s of stale) await dbDelete(s.id)
+      } catch {}
+      showApp()
+      renderSidebar()
+      renderMessages()
+      connect()
+      reloadAgents()
+      loadChangelog()
+      // Pull sessions from server for this user (cross-device sync)
+      syncSessionsFromServer().then(() => {
+        const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+        if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+          state.currentSessionId = updated[0]?.id || null
+          if (!state.currentSessionId) createSession()
+          renderMessages()
+        }
+        renderSidebar()
+      }).catch(() => {})
+      // Check for unclaimed sessions to migrate
+      checkUnclaimedSessions()
+    } catch {
+      $('login-error').textContent = '网络错误，请重试'
+      $('login-error').style.display = 'block'
+    } finally {
+      $('login-btn').disabled = false
+      $('login-btn').textContent = '登录'
+    }
   }
   $('token').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.isComposing) $('login-btn').click()
+  })
+  $('username').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.isComposing) $('token').focus()
   })
   // Palette input
   $('palette-input').addEventListener('input', (e) => {
@@ -1145,6 +1450,18 @@ async function init() {
     renderMessages()
     connect()
     reloadAgents()
+    loadChangelog()
+    // Cross-device sync: pull sessions from server in background
+    syncSessionsFromServer().then(() => {
+      // Re-render if sessions changed (added or removed)
+      const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+      if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+        state.currentSessionId = updated[0]?.id || null
+        if (!state.currentSessionId) createSession()
+        renderMessages()
+      }
+      renderSidebar()
+    }).catch(() => {})
   } else {
     showLogin()
   }

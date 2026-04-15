@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
@@ -18,11 +18,23 @@ import {
   searchSessions,
   writeAgentsConfig,
   writeConfig,
+  getUsageSummary,
+  queryEvents,
+  listClientSessions,
+  getClientSession,
+  upsertClientSession,
+  deleteClientSession,
+  listUnclaimedSessions,
+  claimSession,
 } from '@openclaude/storage'
 import { type WebSocket, WebSocketServer } from 'ws'
-import { checkToken } from './auth.js'
+import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import { CronScheduler } from './cron.js'
-import { eventBus } from './eventBus.js'
+import { eventBus, createEvent } from './eventBus.js'
+import { startEventPersistence } from './eventPersist.js'
+import { createLogger } from './logger.js'
+import { startMetricsCollection, serializeMetrics, httpRequestsTotal, httpRequestDuration, wsConnectionsTotal, sessionsActive } from './metrics.js'
+import { RateLimiter } from './rateLimit.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
@@ -46,6 +58,9 @@ export class Gateway {
   private _taskStore = new TaskStore()
   private _runLog = new RunLog()
   private channels = new Map<string, ChannelAdapter>()
+  private log = createLogger({ module: 'gateway' })
+  private rateLimiter = new RateLimiter()
+  private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
   private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
@@ -53,14 +68,14 @@ export class Gateway {
   private static readonly IDEMPOTENCY_TTL_MS = 5 * 60_000 // 5 minutes
 
   /**
-   * Check whether an idempotency key has already been processed.
+   * Check whether an idempotency key has already been processed (read-only).
    * Returns true if the key is a duplicate (i.e. should be skipped).
    */
-  private _checkIdempotencyKey(key: string): boolean {
-    if (!key) return false // empty key = no dedup
+  private _isIdempotencyDuplicate(key: string): boolean {
+    if (!key) return false
     const now = Date.now()
 
-    // Evict expired entries on every check to keep Map bounded by TTL
+    // Evict expired entries periodically
     if (this._seenIdempotencyKeys.size > 100) {
       for (const [k, ts] of this._seenIdempotencyKeys) {
         if (now - ts > Gateway.IDEMPOTENCY_TTL_MS) {
@@ -69,16 +84,13 @@ export class Gateway {
       }
     }
 
-    if (this._seenIdempotencyKeys.has(key)) {
-      const ts = this._seenIdempotencyKeys.get(key)!
-      if (now - ts < Gateway.IDEMPOTENCY_TTL_MS) {
-        return true // duplicate
-      }
-      // Expired — allow re-processing, will be re-added below
-    }
+    const ts = this._seenIdempotencyKeys.get(key)
+    return ts !== undefined && now - ts < Gateway.IDEMPOTENCY_TTL_MS
+  }
 
-    this._seenIdempotencyKeys.set(key, now)
-    return false
+  /** Record an idempotency key as processed. */
+  private _markIdempotencyKey(key: string): void {
+    if (key) this._seenIdempotencyKeys.set(key, Date.now())
   }
 
   // ── Cached task list for high-frequency eventBus lookups ──
@@ -116,7 +128,7 @@ export class Gateway {
   }
 
   // ── In-memory cache for static web UI files ──
-  private _staticFileCache = new Map<string, { content: Buffer; mime: string }>()
+  private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string }>()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
   // Per-agent last active channel tracking (for proactive push)
@@ -129,6 +141,8 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
+    // Wire up auth error handler: force-refresh token when 401 detected (bypass expiry check)
+    this.sessions.onAuthError = () => this.refreshClaudeOAuthIfNeeded(true)
   }
 
   async start(): Promise<void> {
@@ -138,7 +152,7 @@ export class Gateway {
     this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' })
 
     // WS keepalive: ping every 25s, terminate if no pong in 35s
-    setInterval(() => {
+    this._wsKeepaliveTimer = setInterval(() => {
       for (const ws of this.wss.clients) {
         if ((ws as any)._isAlive === false) {
           ws.terminate()
@@ -253,6 +267,15 @@ export class Gateway {
     })
     this.cron.lastActiveChannel = this.lastActiveChannel
     this.cron.start().catch((err) => console.error('[cron] start failed:', err))
+
+    // Start event persistence (writes all events to SQLite event_log)
+    startEventPersistence()
+
+    // Start metrics collection (eventBus → prometheus counters)
+    startMetricsCollection()
+
+    // Start rate limiter cleanup
+    this.rateLimiter.startCleanup()
 
     // EventBus: bridge CCB CronCreate/CronDelete to gateway CronScheduler
     eventBus.on('task.created', (ev) => {
@@ -387,29 +410,67 @@ export class Gateway {
         .catch(() => {})
     })
 
-    // Start OAuth token auto-refresh (every 30 min)
-    setInterval(() => this.refreshClaudeOAuthIfNeeded().catch(() => {}), 30 * 60_000)
+    // Handle subprocess crashes: push a system message to the client so they know
+    // the session will auto-recover on the next message they send
+    eventBus.on('session.crashed', (ev) => {
+      const peerKey = `webchat:${ev.peerId}`
+      const clients = this.clientsByPeer.get(peerKey)
+      if (clients) {
+        const frame = JSON.stringify({
+          type: 'outbound.message',
+          sessionKey: ev.sessionKey,
+          channel: 'webchat',
+          peer: { id: ev.peerId, kind: 'dm' },
+          agentId: ev.agentId,
+          blocks: [
+            {
+              kind: 'text',
+              text: '⚠️ AI 进程异常退出，下一条消息将自动恢复上下文。',
+            },
+          ],
+          isFinal: true,
+        })
+        for (const ws of clients) {
+          try {
+            ws.send(frame)
+          } catch {}
+        }
+      }
+      console.log(`[gateway] pushed crash notification to ${ev.peerId}`)
+    })
+
+    // Periodic OAuth token refresh (every 10 min). Running subprocesses keep
+    // the old token until restarted; 401 detection in sessionManager handles
+    // the restart + retry when the old token expires mid-conversation.
+    setInterval(() => this.refreshClaudeOAuthIfNeeded().catch(() => {}), 10 * 60_000)
     // Check immediately on boot
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
     await new Promise<void>((res) => {
       this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
     })
-    console.log(`[gateway] http://${config.gateway.bind}:${config.gateway.port}  (token: *****)`)
+    this.log.info('server started', { bind: config.gateway.bind, port: config.gateway.port })
 
     // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
     this.bootAutoResume().catch((err) => console.error('[auto-resume] boot failed:', err))
   }
 
   private async shutdown(stopEviction: () => void): Promise<void> {
-    console.log('\n[gateway] shutting down...')
+    this.log.info('shutting down')
     stopEviction()
+    if (this._wsKeepaliveTimer !== null) {
+      clearInterval(this._wsKeepaliveTimer)
+      this._wsKeepaliveTimer = null
+    }
     for (const ch of this.channels.values()) {
       try {
         await ch.shutdown()
       } catch {}
     }
     await this.sessions.shutdownAll()
+    // shutdownAll() already flushes resume map, but add a safety await in case
+    // of concurrent writes queued between shutdownAll and here
+    await this.sessions.awaitResumeMapFlush()
     this.wss.close()
     this.httpServer.close()
     process.exit(0)
@@ -417,13 +478,86 @@ export class Gateway {
 
   // ───────── HTTP ─────────
   private handleHttp(req: IncomingMessage, res: ServerResponse): void {
+    const reqStart = Date.now()
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
+    const method = req.method ?? 'GET'
+    const path = url.pathname
+
+    // M1: Security headers on every response
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('X-Frame-Options', 'DENY')
+    res.setHeader('Referrer-Policy', 'no-referrer')
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+
+    // Instrument response — record metrics after response finishes
+    res.on('finish', () => {
+      const duration = Date.now() - reqStart
+      const status = String(res.statusCode)
+      httpRequestsTotal.inc({ method, path: normalizePath(path), status })
+      httpRequestDuration.observe(duration, { method, path: normalizePath(path) })
+      // Log non-static requests (skip static assets to reduce noise)
+      if (path.startsWith('/api/') || path.startsWith('/v1/') || path === '/healthz' || path === '/metrics') {
+        this.log.info('http', { method, path, status: res.statusCode, durationMs: duration })
+      }
+    })
+
+    // ── Multi-user login (no auth required, rate-limited) ──
+    if (url.pathname === '/api/auth/login' && req.method === 'POST') {
+      // Use socket address only — X-Forwarded-For is client-spoofable; cloudflared connects locally
+      const clientIp = req.socket.remoteAddress || 'unknown'
+      if (!this.rateLimiter.check(clientIp, 'login')) {
+        this.sendJson(res, 429, { error: 'too many login attempts, try again later' })
+        return
+      }
+      this.readBody(req).then((body) => {
+        let parsed: any
+        try {
+          parsed = JSON.parse(body)
+        } catch {
+          this.sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        if (typeof parsed !== 'object' || parsed === null) {
+          this.sendJson(res, 400, { error: 'body must be a JSON object' })
+          return
+        }
+        const { username, password } = parsed
+        const users = this.deps.config.gateway.users
+        if (!users?.length) {
+          // Legacy mode: accept raw accessToken as password — username not required
+          if (typeof password !== 'string') {
+            this.sendJson(res, 400, { error: 'password must be a string' })
+            return
+          }
+          if (checkToken(password, this.deps.config.gateway.accessToken)) {
+            const token = signJwt({ userId: 'default', exp: Math.floor(Date.now() / 1000) + 30 * 86400 }, this.deps.config.gateway.accessToken)
+            this.sendJson(res, 200, { token, userId: 'default', name: 'Default' })
+          } else {
+            this.sendJson(res, 401, { error: 'invalid credentials' })
+          }
+          return
+        }
+        if (typeof username !== 'string' || typeof password !== 'string') {
+          this.sendJson(res, 400, { error: 'username and password must be strings' })
+          return
+        }
+        const user = users.find((u) => u.id === username)
+        if (!user || !verifyPassword(password, user.passwordHash)) {
+          this.sendJson(res, 401, { error: 'invalid credentials' })
+          return
+        }
+        const token = signJwt({ userId: user.id, exp: Math.floor(Date.now() / 1000) + 30 * 86400 }, this.deps.config.gateway.accessToken)
+        this.sendJson(res, 200, { token, userId: user.id, name: user.name })
+      }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+      return
+    }
 
     // Routes that need auth
-    // All /api/* and /v1/* endpoints require auth except healthz
+    // All /api/*, /v1/*, and /metrics endpoints require auth except healthz
     const needsAuth =
       (url.pathname.startsWith('/api/') && url.pathname !== '/api/healthz') ||
-      url.pathname.startsWith('/v1/')
+      url.pathname.startsWith('/v1/') ||
+      url.pathname === '/metrics'
     if (needsAuth && !this.checkHttpAuth(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
@@ -471,7 +605,13 @@ export class Gateway {
 
     if (url.pathname === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, sessions: this.sessions.list().length }))
+      res.end(JSON.stringify({ ok: true }))
+      return
+    }
+    if (path === '/metrics') {
+      sessionsActive.value = this.sessions.list().length
+      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' })
+      res.end(serializeMetrics())
       return
     }
     if (url.pathname === '/api/doctor') {
@@ -489,14 +629,131 @@ export class Gateway {
       })
       return
     }
+    if (url.pathname === '/api/usage' && req.method === 'GET') {
+      const agentId = url.searchParams.get('agentId') ?? undefined
+      const sessionId = url.searchParams.get('sessionId') ?? undefined
+      const sinceRaw = url.searchParams.get('since')
+      const since = sinceRaw ? Number(sinceRaw) : undefined
+      if (since !== undefined && !Number.isFinite(since)) {
+        this.sendJson(res, 400, { error: 'since must be a valid number' }); return
+      }
+      Promise.all([
+        getUsageSummary({ agentId, sessionId, since }),
+        queryEvents({ type: 'cost.recorded', agentId, sessionKey: sessionId, since, limit: 50 }),
+      ]).then(([summary, events]) => {
+        this.sendJson(res, 200, { summary, recentCostEvents: events })
+      }).catch(() => this.sendJson(res, 500, { error: 'usage query failed' }))
+      return
+    }
+    if (url.pathname === '/api/usage/events' && req.method === 'GET') {
+      const type = url.searchParams.get('type') ?? undefined
+      const agentId = url.searchParams.get('agentId') ?? undefined
+      const sessionKey = url.searchParams.get('sessionKey') ?? undefined
+      const sinceRaw = url.searchParams.get('since')
+      const since = sinceRaw ? Number(sinceRaw) : undefined
+      const limitRaw = url.searchParams.get('limit')
+      const limitNum = limitRaw ? Number(limitRaw) : 100
+      const limit = Number.isFinite(limitNum) ? Math.min(Math.max(limitNum, 1), 1000) : 100
+      if (since !== undefined && !Number.isFinite(since)) {
+        this.sendJson(res, 400, { error: 'since must be a valid number' }); return
+      }
+      queryEvents({ type, agentId, sessionKey, since, limit })
+        .then((events) => this.sendJson(res, 200, { events }))
+        .catch(() => this.sendJson(res, 500, { error: 'event query failed' }))
+      return
+    }
     if (url.pathname === '/api/runs' && req.method === 'GET') {
       this.sendJson(res, 200, { runs: this._runLog.recent(50) })
       return
     }
     if (url.pathname === '/api/sessions') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ sessions: this.sessions.list() }))
+      // Filter live sessions to those belonging to the authenticated user.
+      // Session keys contain the peerId (which is the client session ID);
+      // we match against client_sessions owned by this userId.
+      const userId = this.getUserId(req)
+      const allLive = this.sessions.list()
+      // For multi-user: only show sessions whose peerId belongs to this user
+      listClientSessions(userId).then((owned) => {
+        const ownedIds = new Set(owned.map((s) => s.id))
+        // Also include sessions with no matching client session (cron/task sessions) only for default user
+        const filtered = allLive.filter((s) => {
+          const peerId = s.sessionKey.split(':')[4] || ''
+          return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
+        })
+        this.sendJson(res, 200, { sessions: filtered })
+      }).catch(() => this.sendJson(res, 200, { sessions: [] }))
       return
+    }
+    // ── Client session sync (cross-device, multi-user) ──
+    if (url.pathname === '/api/sessions/list' && req.method === 'GET') {
+      const userId = this.getUserId(req)
+      listClientSessions(userId)
+        .then((list) => this.sendJson(res, 200, { sessions: list }))
+        .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+      return
+    }
+    // ── Session migration (must be before clientSessMatch regex which would capture "unclaimed"/"claim") ──
+    if (url.pathname === '/api/sessions/unclaimed' && req.method === 'GET') {
+      listUnclaimedSessions()
+        .then((list) => this.sendJson(res, 200, { sessions: list }))
+        .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+      return
+    }
+    if (url.pathname === '/api/sessions/claim' && req.method === 'POST') {
+      const userId = this.getUserId(req)
+      this.readBody(req).then(async (body) => {
+        const { sessionIds } = JSON.parse(body) as { sessionIds: string[] }
+        if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+          this.sendJson(res, 400, { error: 'sessionIds required' })
+          return
+        }
+        const results: Record<string, boolean> = {}
+        for (const sid of sessionIds) {
+          results[sid] = await claimSession(sid, userId)
+        }
+        this.sendJson(res, 200, { ok: true, results })
+      }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+      return
+    }
+    const clientSessMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})$/)
+    if (clientSessMatch) {
+      const sessId = clientSessMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method === 'GET') {
+        getClientSession(sessId, userId)
+          .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
+          .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
+        return
+      }
+      if (req.method === 'PUT') {
+        this.readBody(req).then(async (body) => {
+          const data = JSON.parse(body)
+          const updatedAt = Date.now()
+          const applied = await upsertClientSession({
+            id: sessId,
+            userId,
+            agentId: data.agentId || 'main',
+            title: data.title || '新会话',
+            pinned: !!data.pinned,
+            createdAt: data.createdAt || Date.now(),
+            lastAt: data.lastAt || Date.now(),
+            messages: data.messages || [],
+            updatedAt,
+          }, data._baseSyncedAt || 0)
+          if (!applied) {
+            this.sendJson(res, 409, { error: 'conflict' })
+          } else {
+            this.sendJson(res, 200, { ok: true, applied: true, updatedAt })
+          }
+        }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+        return
+      }
+      if (req.method === 'DELETE') {
+        deleteClientSession(sessId, userId)
+          .then(() => this.sendJson(res, 200, { ok: true }))
+          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
+        return
+      }
     }
     if (url.pathname === '/api/config') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -592,6 +849,69 @@ export class Gateway {
       )
       return
     }
+    // ── Changelog / Release Notes ──
+    if (url.pathname === '/api/changelog' && req.method === 'GET') {
+      const changelogPath = join(paths.home, 'changelog.json')
+      try {
+        const raw = readFileSync(changelogPath, 'utf-8')
+        const data = JSON.parse(raw)
+        this.sendJson(res, 200, data)
+      } catch {
+        this.sendJson(res, 200, { currentVersion: '0.0.0', releases: [] })
+      }
+      return
+    }
+
+    // ── User Feedback ──
+    if (url.pathname === '/api/feedback' && req.method === 'POST') {
+      this.readBody(req).then(async (body) => {
+        try {
+          const { category, description, sessionId, userAgent } = JSON.parse(body)
+          if (!description || typeof description !== 'string' || description.trim().length < 15) {
+            this.sendJson(res, 400, { error: '反馈描述至少需要 15 个字符' }); return
+          }
+          const feedbackDir = join(paths.home, 'feedback')
+          await mkdir(feedbackDir, { recursive: true })
+          const entry = {
+            id: `fb-${Date.now()}-${randomBytes(4).toString('hex')}`,
+            category: category || 'general',
+            description,
+            sessionId: sessionId || null,
+            userAgent: userAgent || null,
+            userId: this.getUserId(req),
+            createdAt: new Date().toISOString(),
+          }
+          const filePath = join(feedbackDir, `${entry.id}.json`)
+          await writeFile(filePath, JSON.stringify(entry, null, 2))
+          this.sendJson(res, 200, { ok: true, id: entry.id })
+        } catch (err) {
+          this.sendJson(res, 400, { error: String(err) })
+        }
+      }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+      return
+    }
+    if (url.pathname === '/api/feedback' && req.method === 'GET') {
+      const feedbackDir = join(paths.home, 'feedback')
+      const userId = this.getUserId(req)
+      try {
+        const files = existsSync(feedbackDir)
+          ? readdirSync(feedbackDir).filter(f => f.endsWith('.json')).sort().reverse()
+          : []
+        const items: unknown[] = []
+        for (const f of files) {
+          if (items.length >= 50) break
+          try {
+            const entry = JSON.parse(readFileSync(join(feedbackDir, f), 'utf-8'))
+            if (entry && entry.userId === userId) items.push(entry)
+          } catch { /* skip corrupt files */ }
+        }
+        this.sendJson(res, 200, { feedback: items })
+      } catch {
+        this.sendJson(res, 200, { feedback: [] })
+      }
+      return
+    }
+
     if (url.pathname === '/api/search') {
       this.handleSearch(req, res, url).catch((err) => this.sendError(res, 500, String(err)))
       return
@@ -694,11 +1014,17 @@ export class Gateway {
         res.end('not found')
         return
       }
-      res.writeHead(200, {
-        'Content-Type': mimeFor(found),
+      const mediaContentType = mimeFor(found)
+      // C3: Force download for active content types to prevent same-origin script execution
+      const mediaHeaders: Record<string, string | number> = {
+        'Content-Type': mediaContentType,
         'Content-Length': mediaStat.size,
-        'Cache-Control': 'public, max-age=86400',
-      })
+        'Cache-Control': 'private, max-age=3600',
+      }
+      if (isActiveContentType(mediaContentType)) {
+        mediaHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(found) || 'file')}"`
+      }
+      res.writeHead(200, mediaHeaders)
       createReadStream(found).pipe(res)
       return
     }
@@ -748,11 +1074,14 @@ export class Gateway {
         res.end('not found')
         return
       }
+      const fileContentType = mimeFor(resolved)
+      // C3: Force download for active content types to prevent same-origin script execution
+      const fileDispositionMode = isActiveContentType(fileContentType) ? 'attachment' : 'inline'
       res.writeHead(200, {
-        'Content-Type': mimeFor(resolved),
+        'Content-Type': fileContentType,
         'Content-Length': fileStat.size,
-        'Cache-Control': 'public, max-age=3600',
-        'Content-Disposition': `inline; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
+        'Cache-Control': 'private, max-age=3600',
+        'Content-Disposition': `${fileDispositionMode}; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
       })
       createReadStream(resolved).pipe(res)
       return
@@ -765,7 +1094,12 @@ export class Gateway {
       if (filePath.startsWith(resolve(this.deps.webRoot))) {
         const cached = this._staticFileCache.get(filePath)
         if (cached) {
-          res.writeHead(200, { 'Content-Type': cached.mime })
+          if (req.headers['if-none-match'] === cached.etag) {
+            res.writeHead(304)
+            res.end()
+            return
+          }
+          res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': 'public, max-age=3600' })
           res.end(cached.content)
           return
         }
@@ -774,8 +1108,18 @@ export class Gateway {
           if (s.isFile()) {
             const content = readFileSync(filePath)
             const mime = mimeFor(filePath)
-            this._staticFileCache.set(filePath, { content, mime })
-            res.writeHead(200, { 'Content-Type': mime })
+            const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
+            if (this._staticFileCache.size >= 200) {
+              const firstKey = this._staticFileCache.keys().next().value
+              if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
+            }
+            this._staticFileCache.set(filePath, { content, mime, etag })
+            if (req.headers['if-none-match'] === etag) {
+              res.writeHead(304)
+              res.end()
+              return
+            }
+            res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': 'public, max-age=3600' })
             res.end(content)
             return
           }
@@ -788,7 +1132,12 @@ export class Gateway {
         const indexPath = resolve(this.deps.webRoot, 'index.html')
         const cachedIndex = this._staticFileCache.get(indexPath)
         if (cachedIndex) {
-          res.writeHead(200, { 'Content-Type': 'text/html' })
+          if (req.headers['if-none-match'] === cachedIndex.etag) {
+            res.writeHead(304)
+            res.end()
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'text/html', 'ETag': cachedIndex.etag, 'Cache-Control': 'no-cache' })
           res.end(cachedIndex.content)
           return
         }
@@ -796,8 +1145,18 @@ export class Gateway {
           const s = statSync(indexPath)
           if (s.isFile()) {
             const content = readFileSync(indexPath)
-            this._staticFileCache.set(indexPath, { content, mime: 'text/html' })
-            res.writeHead(200, { 'Content-Type': 'text/html' })
+            const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
+            if (this._staticFileCache.size >= 200) {
+              const firstKey = this._staticFileCache.keys().next().value
+              if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
+            }
+            this._staticFileCache.set(indexPath, { content, mime: 'text/html', etag })
+            if (req.headers['if-none-match'] === etag) {
+              res.writeHead(304)
+              res.end()
+              return
+            }
+            res.writeHead(200, { 'Content-Type': 'text/html', 'ETag': etag, 'Cache-Control': 'no-cache' })
             res.end(content)
             return
           }
@@ -808,14 +1167,12 @@ export class Gateway {
     res.end('not found')
   }
 
-  private checkHttpAuth(req: IncomingMessage): boolean {
-    // 1. Authorization: Bearer header (fetch API calls)
+  /** Extract bearer token from request (header, WS protocol, or cookie). */
+  private extractToken(req: IncomingMessage): string {
     const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, '') ?? ''
-    // 2. Sec-WebSocket-Protocol subprotocol (WebSocket)
     const protocols = (req.headers['sec-websocket-protocol'] || '').split(',').map((s) => s.trim())
     const protoToken =
       protocols.includes('bearer') && protocols.length >= 2 ? protocols[protocols.length - 1] : ''
-    // 3. HttpOnly cookie (for img/audio/video/a elements that can't set headers)
     const cookies = (req.headers.cookie || '').split(';').reduce(
       (acc, c) => {
         const [k, ...v] = c.trim().split('=')
@@ -825,25 +1182,47 @@ export class Gateway {
       {} as Record<string, string>,
     )
     const cookieToken = cookies.oc_session || ''
-    const t = authHeader || protoToken || cookieToken
+    return authHeader || protoToken || cookieToken
+  }
+
+  private checkHttpAuth(req: IncomingMessage): boolean {
+    const t = this.extractToken(req)
+    // Try JWT first (multi-user mode)
+    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
+    if (jwt) return true
+    // Fall back to legacy single token
     return checkToken(t, this.deps.config.gateway.accessToken)
   }
 
-  /** Check if the request arrived over HTTPS (direct TLS or behind a trusted reverse proxy like cloudflared) */
-  private isHttps(req: IncomingMessage): boolean {
-    return (
-      (req.socket as any).encrypted === true ||
-      req.headers['x-forwarded-proto'] === 'https'
-    )
+  /** Get authenticated userId from request. Returns 'default' for legacy token auth. */
+  private getUserId(req: IncomingMessage): string {
+    const t = this.extractToken(req)
+    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
+    return jwt?.userId ?? 'default'
   }
 
-  /** Set HttpOnly session cookie on response */
+  /** Check if the request arrived over HTTPS (direct TLS or behind a trusted reverse proxy like cloudflared).
+   * X-Forwarded-Proto is only trusted when the connection originates from a loopback address (127.0.0.1 / ::1),
+   * i.e. a local reverse proxy. External connections must use direct TLS.
+   */
+  private isHttps(req: IncomingMessage): boolean {
+    if ((req.socket as any).encrypted === true) return true
+    const remoteAddr = req.socket.remoteAddress ?? ''
+    // Trust X-Forwarded-Proto only from loopback (127.x.x.x, ::1, IPv4-mapped ::ffff:127.x.x.x)
+    const isLoopback = remoteAddr === '::1' || remoteAddr.startsWith('127.') || remoteAddr.startsWith('::ffff:127.')
+    return isLoopback && req.headers['x-forwarded-proto'] === 'https'
+  }
+
+  /** Set HttpOnly session cookie on response — stores the JWT (not raw token) for user-scoped auth */
   private setSessionCookie(res: ServerResponse, req: IncomingMessage): void {
-    const token = this.deps.config.gateway.accessToken
+    const t = this.extractToken(req)
+    // Prefer the JWT the client already sent (preserves userId); fall back to raw token for legacy
+    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
+    const cookieValue = jwt ? t : this.deps.config.gateway.accessToken
     const secure = this.isHttps(req) ? '; Secure' : ''
     res.setHeader(
       'Set-Cookie',
-      `oc_session=${token}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=31536000`,
+      `oc_session=${cookieValue}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=31536000`,
     )
   }
 
@@ -1229,13 +1608,11 @@ export class Gateway {
       this._activeDelegations--
     }
 
-    eventBus.emit('agent.completed', {
-      type: 'agent.completed',
-      agentId: targetAgentId,
+    eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {
       sessionKey,
       output: output.trim(),
       error: error || undefined,
-    })
+    }))
 
     this.sendJson(res, 200, {
       ok: !error,
@@ -1645,16 +2022,38 @@ export class Gateway {
     }
   }
 
-  // Token auto-refresh (called periodically)
-  private async refreshClaudeOAuthIfNeeded(): Promise<void> {
+  // Token auto-refresh (called periodically and on-demand after 401).
+  // Dedup: concurrent calls share one in-flight refresh to avoid stampede.
+  // If a non-forced refresh is in-flight and a forced one is requested,
+  // we chain the forced refresh after the current one completes.
+  private _refreshPromise: Promise<void> | null = null
+  private _refreshForced = false
+
+  private refreshClaudeOAuthIfNeeded(force = false): Promise<void> {
+    if (this._refreshPromise) {
+      if (force && !this._refreshForced) {
+        // Upgrade: chain a forced refresh after the in-flight non-forced one
+        this._refreshForced = true
+        this._refreshPromise = this._refreshPromise
+          .then(() => this._refreshClaudeOAuthImpl(true))
+      }
+      return this._refreshPromise
+    }
+    this._refreshForced = force
+    this._refreshPromise = this._refreshClaudeOAuthImpl(force)
+      .finally(() => { this._refreshPromise = null; this._refreshForced = false })
+    return this._refreshPromise
+  }
+
+  private async _refreshClaudeOAuthImpl(force: boolean): Promise<void> {
     // Try refreshing Claude OAuth
     const claudeOAuth = this.deps.config.auth.claudeOAuth
-    if (claudeOAuth?.refreshToken && Date.now() >= claudeOAuth.expiresAt - 5 * 60_000) {
+    if (claudeOAuth?.refreshToken && (force || Date.now() >= claudeOAuth.expiresAt - 5 * 60_000)) {
       await this._refreshToken('claude', claudeOAuth)
     }
     // Try refreshing Codex OAuth
     const codexOAuth = this.deps.config.auth.codexOAuth
-    if (codexOAuth?.refreshToken && Date.now() >= codexOAuth.expiresAt - 5 * 60_000) {
+    if (codexOAuth?.refreshToken && (force || Date.now() >= codexOAuth.expiresAt - 5 * 60_000)) {
       await this._refreshToken('codex', codexOAuth)
     }
   }
@@ -1734,6 +2133,10 @@ export class Gateway {
       ws.close(1008, 'unauthorized')
       return
     }
+    wsConnectionsTotal.inc()
+    this.log.info('ws.connect')
+    ws.once('close', () => this.log.debug('ws.disconnect'))
+
     // Keepalive pong tracking
     ;(ws as any)._isAlive = true
     ws.on('pong', () => {
@@ -1918,7 +2321,7 @@ export class Gateway {
   }
 
   private async autoResumeFromHello(
-    peers: Array<{ peerId: string; agentId: string }>,
+    peers: Array<{ peerId: string; agentId: string; inFlight?: boolean }>,
     ws: WebSocket,
   ): Promise<void> {
     // Register the reconnected WS client for each peer that has an active/resumable session.
@@ -1975,6 +2378,33 @@ export class Gateway {
         registeredPeerKeys.push(peerKey)
       }
       console.log(`[auto-resume] re-registered WS for ${peerKey} (session ${sessionKey})`)
+
+      // Push a synthetic isFinal to the reconnected client for sessions that the client
+      // reports as in-flight (had _sendingInFlight=true) but whose subprocess is not
+      // currently running. This clears the client's stuck _sendingInFlight state from
+      // the interrupted turn. Without this, the client shows a permanent typing indicator
+      // and the resumed subprocess sits idle — neither side moves first.
+      const peerInFlight = peers.find(p => p.peerId === peerId)?.inFlight
+      if (peerInFlight && session && !session.runner.isRunning) {
+        try {
+          const interruptFrame = JSON.stringify({
+            type: 'outbound.message',
+            sessionKey,
+            channel: 'webchat',
+            peer: { id: peerId, kind: 'dm' },
+            agentId: aid,
+            blocks: [
+              {
+                kind: 'text',
+                text: '\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。',
+              },
+            ],
+            isFinal: true,
+          })
+          ws.send(interruptFrame)
+          console.log(`[auto-resume] pushed turn-interrupted isFinal for ${sessionKey}`)
+        } catch {}
+      }
     }
 
     // Single close handler for all peers registered via this hello (avoids listener accumulation)
@@ -1997,12 +2427,10 @@ export class Gateway {
       return
     }
 
-    // ── Idempotency dedup: skip already-processed messages (reconnect replay protection) ──
-    if (frame.idempotencyKey && this._checkIdempotencyKey(frame.idempotencyKey)) {
-      console.log(
-        `[dispatchInbound] duplicate idempotencyKey "${frame.idempotencyKey}" — skipping`,
-      )
-      // Notify connected WS clients for this peer so the client knows the message was deduped
+    // ── Idempotency dedup (read-only check): skip already-processed messages ──
+    // Checked first so duplicates don't consume rate-limit budget
+    if (frame.idempotencyKey && this._isIdempotencyDuplicate(frame.idempotencyKey)) {
+      this.log.debug('duplicate idempotencyKey', { key: frame.idempotencyKey })
       const peerKey = `${frame.channel}:${frame.peer.id}`
       const clients = this.clientsByPeer.get(peerKey)
       if (clients) {
@@ -2012,13 +2440,46 @@ export class Gateway {
           deduplicated: true,
         })
         for (const ws of clients) {
-          try {
-            ws.send(ack)
-          } catch {}
+          try { ws.send(ack) } catch {}
         }
       }
       return
     }
+
+    // ── Rate limiting: per-peer sliding window ──
+    // Only non-duplicate messages consume rate-limit budget
+    if (!this.rateLimiter.check(frame.peer.id, frame.channel)) {
+      const peerKey = `${frame.channel}:${frame.peer.id}`
+      const clients = this.clientsByPeer.get(peerKey)
+      if (clients) {
+        const msg = JSON.stringify({
+          type: 'outbound.message',
+          sessionKey: '',
+          channel: frame.channel,
+          peer: frame.peer,
+          blocks: [{ kind: 'text', text: '请求过于频繁，请稍后再试。' }],
+          isFinal: true,
+        })
+        for (const ws of clients) {
+          try { ws.send(msg) } catch {}
+        }
+      }
+      if (adapter) {
+        adapter.send({
+          type: 'outbound.message',
+          sessionKey: '',
+          channel: frame.channel,
+          peer: frame.peer,
+          blocks: [{ kind: 'text', text: '请求过于频繁，请稍后再试。' }],
+          isFinal: true,
+        }).catch(() => {})
+      }
+      return
+    }
+
+    // Mark idempotency key eagerly so concurrent/reconnect replays are dropped during processing.
+    // If processing fails the key is deleted, allowing the client to retry.
+    if (frame.idempotencyKey) this._markIdempotencyKey(frame.idempotencyKey)
 
     // Explicit agentId override (web UI per-session selection)
     let sessionKey: string
@@ -2071,7 +2532,15 @@ export class Gateway {
     // Server-side upload validation
     const MAX_SINGLE_FILE = 25 * 1024 * 1024 // 25MB
     const MAX_TOTAL_MEDIA = 50 * 1024 * 1024 // 50MB total
-    const ALLOWED_MIME_PREFIXES = ['image/', 'audio/', 'video/', 'application/pdf', 'text/']
+    const ALLOWED_MIME_PREFIXES = [
+      'image/', 'audio/', 'video/', 'application/pdf', 'text/',
+      'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
+      'application/vnd.ms-',                            // doc, xls, ppt
+      'application/msword',                             // .doc
+      'application/zip', 'application/x-zip',           // zip archives
+      'application/json',                               // json files
+      'application/xml',                                // xml files
+    ]
     let totalMediaSize = 0
     for (const m of media) {
       if (!m.base64) continue
@@ -2308,6 +2777,8 @@ export class Gateway {
         }
       } else if (e.kind === 'error') {
         this._runLog.complete(_run, { status: 'failed', error: e.error })
+        // Remove idempotency key on failure to allow client retry
+        if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
         this.deliver(
           {
             ...out,
@@ -2346,18 +2817,23 @@ export class Gateway {
  * are checked separately via `isFileAllowed()`.
  */
 export const FILE_ALLOWED_DIRS: string[] = [
-  resolve(paths.generatedDir), // /root/.openclaude/generated/
-  resolve(paths.uploadsDir), // /root/.openclaude/uploads/
+  resolve(paths.generatedDir),  // /root/.openclaude/generated/
+  resolve(paths.uploadsDir),    // /root/.openclaude/uploads/
 ]
 
 /** Temp-file prefix pattern: /tmp/openclaude-* */
 const TEMP_PREFIX = resolve('/tmp/openclaude-')
 
-/** Known project roots that agents may work in */
-const AGENT_CWD_ROOTS: string[] = [
-  resolve('/opt/openclaude/openclaude'),
-  resolve('/opt/openclaude/claude-code-best'),
-]
+/** Known project roots that agents may work in (intentionally empty — broad source dirs removed) */
+const AGENT_CWD_ROOTS: string[] = []
+
+/** Non-executable media extensions safe to serve from agent CWDs */
+const MEDIA_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.bmp', '.ico',
+  '.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac',
+  '.mp4', '.webm', '.mov',
+  '.pdf', '.txt', '.md', '.csv', '.json', '.log',
+])
 
 /**
  * Returns true if the resolved absolute path falls within the allowlist.
@@ -2365,22 +2841,26 @@ const AGENT_CWD_ROOTS: string[] = [
  * regardless of blocklist status.
  */
 export function isFileAllowed(resolvedPath: string, agentCwds?: string[]): boolean {
-  // 1. Static allowed directories
+  // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
   for (const dir of FILE_ALLOWED_DIRS) {
     if (resolvedPath.startsWith(dir + '/') || resolvedPath === dir) return true
   }
   // 2. Temp files matching /tmp/openclaude-*
   if (resolvedPath.startsWith(TEMP_PREFIX)) return true
-  // 3. Known project roots
-  for (const cwd of AGENT_CWD_ROOTS) {
-    if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) return true
-  }
-  // 4. Dynamic agent cwds (if provided)
+  // 3. Dynamic agent cwds (if provided) — allow media files and generated/uploads subdirs
   if (agentCwds) {
     for (const raw of agentCwds) {
       if (!raw) continue
       const cwd = resolve(raw)
-      if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) return true
+      if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) {
+        // Allow generated/ and uploads/ subdirs unconditionally
+        const genSub = cwd + '/generated'
+        const upSub = cwd + '/uploads'
+        if (resolvedPath.startsWith(genSub + '/') || resolvedPath.startsWith(upSub + '/')) return true
+        // Allow non-executable media file extensions anywhere in CWD
+        const ext = extname(resolvedPath).toLowerCase()
+        if (MEDIA_EXTENSIONS.has(ext)) return true
+      }
     }
   }
   return false
@@ -2472,6 +2952,57 @@ const MIME_MAP: Record<string, string> = {
 
 function mimeFor(p: string): string {
   return MIME_MAP[extname(p).toLowerCase()] ?? 'application/octet-stream'
+}
+
+/** MIME types that can execute scripts in the browser and must be force-downloaded. */
+const ACTIVE_CONTENT_TYPES = new Set([
+  'text/html',
+  'image/svg+xml',
+  'text/xml',
+  'application/xml',
+  'application/xhtml+xml',
+  // JavaScript is also browser-executable and must not be served inline
+  'application/javascript',
+  'text/javascript',
+])
+
+/**
+ * Returns true if the MIME type can execute scripts when rendered inline by the browser.
+ * Stripping charset suffix before matching (e.g. "text/html; charset=utf-8" → "text/html").
+ */
+function isActiveContentType(mime: string): boolean {
+  const base = mime.split(';')[0].trim().toLowerCase()
+  return ACTIVE_CONTENT_TYPES.has(base)
+}
+
+/** Known route prefixes for metrics normalization (avoids high-cardinality labels). */
+const KNOWN_ROUTES = [
+  '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
+  '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
+  '/api/cron', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
+  '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
+  '/api/auth/claude/callback', '/api/auth/claude/status',
+  '/api/file', '/healthz', '/metrics',
+]
+
+/** Normalize URL paths for metrics labels (replace dynamic IDs with :id to avoid high cardinality). */
+function normalizePath(p: string): string {
+  // Exact match for known routes
+  if (KNOWN_ROUTES.includes(p)) return p
+  // Dynamic API routes — normalize IDs
+  const normalized = p
+    .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')
+    .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
+    .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
+    .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
+    .replace(/\/api\/tasks\/[a-zA-Z0-9_-]+/, '/api/tasks/:id')
+    .replace(/\/api\/webhooks\/[a-zA-Z0-9_-]+/, '/api/webhooks/:id')
+    .replace(/\/api\/media\/.+/, '/api/media/:file')
+  if (normalized !== p) return normalized
+  // OpenAI compat
+  if (p.startsWith('/v1/')) return '/v1/:endpoint'
+  // Static files and unknown paths — collapse to prevent cardinality explosion
+  return '/__other__'
 }
 
 // 便捷工厂

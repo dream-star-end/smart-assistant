@@ -3,15 +3,42 @@ import { htmlSafeEscape } from './dom.js'
 import { effectiveTheme } from './theme.js'
 import { _basename } from './util.js'
 
-// ── Mermaid init ──
-if (window.mermaid) {
-  try {
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: effectiveTheme() === 'light' ? 'default' : 'dark',
-      securityLevel: 'strict',
-    })
-  } catch {}
+// ── Mermaid lazy loader ──
+// A single shared promise prevents concurrent callers from each injecting a <script>.
+// _mermaidInitialized tracks whether initialize() completed — distinct from window.mermaid
+// being truthy (the script may load but initialize() may still throw).
+let _mermaidLoadPromise = null
+let _mermaidInitialized = false
+async function ensureMermaid() {
+  if (_mermaidInitialized) return
+  if (_mermaidLoadPromise) return _mermaidLoadPromise
+  _mermaidLoadPromise = new Promise((resolve, reject) => {
+    const _doInit = () => {
+      try {
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: effectiveTheme() === 'light' ? 'default' : 'dark',
+          securityLevel: 'strict',
+        })
+        _mermaidInitialized = true
+        resolve()
+      } catch (err) {
+        _mermaidLoadPromise = null
+        reject(err)
+      }
+    }
+    if (window.mermaid) {
+      // Script already present externally — just initialize
+      _doInit()
+    } else {
+      const s = document.createElement('script')
+      s.src = '/vendor/mermaid.min.js'
+      s.onload = _doInit
+      s.onerror = (err) => { _mermaidLoadPromise = null; reject(err) }
+      document.head.appendChild(s)
+    }
+  })
+  return _mermaidLoadPromise
 }
 
 const pendingMermaid = []
@@ -359,6 +386,9 @@ export function clearChartInstances() {
 }
 
 export async function processRichBlocks() {
+  if (pendingMermaid.length > 0) {
+    try { await ensureMermaid() } catch {}
+  }
   while (pendingMermaid.length > 0) {
     const { id, code } = pendingMermaid.shift()
     const el = document.getElementById(id)

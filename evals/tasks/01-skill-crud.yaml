@@ -1,0 +1,238 @@
+# Skill CRUD operations — 10 tasks
+---
+id: skill-001
+category: skill
+difficulty: easy
+description: Create a new skill and verify ok response
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+action: skill_save
+args:
+  agentId: eval-agent
+  name: test-skill
+  description: A test skill for evaluation
+  body: |
+    # Test Skill
+    This is a test skill body.
+assertions:
+  - type: contains
+    value: '"ok":true'
+tags: [skill, crud, create]
+---
+id: skill-002
+category: skill
+difficulty: easy
+description: List skills after creation
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: alpha-skill
+      description: Alpha skill
+      body: "Alpha body"
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: beta-skill
+      description: Beta skill
+      body: "Beta body"
+action: skill_list
+args:
+  agentId: eval-agent
+assertions:
+  - type: contains
+    value: ["alpha-skill", "beta-skill"]
+tags: [skill, crud, list]
+---
+id: skill-003
+category: skill
+difficulty: easy
+description: View a specific skill content
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: view-test
+      description: Skill for viewing
+      body: "Unique marker XYZZY"
+action: skill_view
+args:
+  agentId: eval-agent
+  name: view-test
+assertions:
+  - type: contains
+    value: ["XYZZY", "Skill for viewing"]
+tags: [skill, crud, view]
+---
+id: skill-004
+category: skill
+difficulty: easy
+description: Delete a skill
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: to-delete
+      description: Will be deleted
+      body: "Delete me"
+action: skill_delete
+args:
+  agentId: eval-agent
+  name: to-delete
+assertions:
+  - type: contains
+    value: '"ok":true'
+tags: [skill, crud, delete]
+---
+id: skill-005
+category: skill
+difficulty: easy
+description: View returns null for nonexistent skill
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+action: skill_view
+args:
+  agentId: eval-agent
+  name: nonexistent
+assertions:
+  - type: exact
+    value: "null"
+tags: [skill, crud, view, negative]
+---
+id: skill-006
+category: skill
+difficulty: medium
+description: Save creates version 1.0.0 for new skill
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: versioned
+      description: Version test
+      body: "v1 content"
+action: skill_view
+args:
+  agentId: eval-agent
+  name: versioned
+assertions:
+  - type: contains
+    value: "1.0.0"
+tags: [skill, version]
+---
+id: skill-007
+category: skill
+difficulty: medium
+description: Update bumps patch version to 1.0.1
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: bump-test
+      description: Bump test
+      body: "v1"
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: bump-test
+      description: Bump test updated
+      body: "v2"
+action: skill_view
+args:
+  agentId: eval-agent
+  name: bump-test
+assertions:
+  - type: contains
+    value: "1.0.1"
+  - type: contains
+    value: "v2"
+tags: [skill, version, bump]
+---
+id: skill-008
+category: skill
+difficulty: medium
+description: History lists previous versions
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: hist-test
+      description: History test
+      body: "v1"
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: hist-test
+      description: History test v2
+      body: "v2"
+action: skill_history
+args:
+  agentId: eval-agent
+  name: hist-test
+assertions:
+  - type: contains
+    value: "1.0.0"
+tags: [skill, version, history]
+---
+id: skill-009
+category: skill
+difficulty: hard
+description: Restore brings back old version content and auto-bumps
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: restore-test
+      description: Restore test
+      body: "ORIGINAL_CONTENT"
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: restore-test
+      description: Restore test updated
+      body: "UPDATED_CONTENT"
+  - action: skill_restore
+    args:
+      agentId: eval-agent
+      name: restore-test
+      version: "1.0.0"
+action: skill_view
+args:
+  agentId: eval-agent
+  name: restore-test
+assertions:
+  - type: contains
+    value: "ORIGINAL_CONTENT"
+  - type: contains
+    value: "1.0.2"
+  - type: not_contains
+    value: "UPDATED_CONTENT"
+tags: [skill, version, restore]
+---
+id: skill-010
+category: skill
+difficulty: easy
+description: Delete nonexistent skill returns error
+action: skill_delete
+args:
+  agentId: eval-agent
+  name: never-existed
+assertions:
+  - type: contains
+    value: '"ok":false'
+tags: [skill, crud, delete, negative]

@@ -15,7 +15,7 @@
 <link rel="icon" type="image/svg+xml" href="/icon.svg" />
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
-<link rel="stylesheet" href="/style.css?v=4" />
+<link rel="stylesheet" href="/style.css?v=5" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -31,17 +31,29 @@
       <div style="color:var(--fg-muted);font-size:var(--text-sm)">个人 AI 助理</div>
     </div>
   </div>
-  <p class="hint">输入 gateway access token 连接到你的 AI 助理</p>
-  <input id="token" type="password" placeholder="access token" autocomplete="off" />
-  <button id="login-btn" class="btn btn-primary btn-full">连接</button>
-  <details style="margin-top:var(--space-4);font-size:var(--text-sm);color:var(--fg-muted)">
-    <summary style="cursor:pointer;user-select:none">如何获取 token？</summary>
-    <div style="margin-top:var(--space-2);line-height:1.6">
-      <p>Token 在服务器配置文件中：</p>
-      <code style="display:block;padding:8px;background:var(--bg-raised);border-radius:var(--radius-sm);margin:var(--space-2) 0;word-break:break-all">cat ~/.openclaude/openclaude.json | grep accessToken</code>
-      <p>首次部署？参考项目 README 了解如何安装 OpenClaude。</p>
+  <p class="hint" id="login-hint">登录你的 AI 助理</p>
+  <div id="login-error" style="display:none;color:var(--error);font-size:var(--text-sm);margin-bottom:var(--space-2)"></div>
+  <input id="username" type="text" placeholder="用户名" autocomplete="username" style="margin-bottom:var(--space-2)" />
+  <input id="token" type="password" placeholder="密码" autocomplete="current-password" />
+  <button id="login-btn" class="btn btn-primary btn-full">登录</button>
+</div>
+
+<!-- ═══════════════ SESSION MIGRATION MODAL ═══════════════ -->
+<div id="migrate-modal" class="modal-backdrop" role="dialog" aria-label="会话迁移">
+  <div class="modal" style="max-width:560px;max-height:80vh;display:flex;flex-direction:column">
+    <div class="modal-header">
+      <h3>迁移历史会话</h3>
+      <button class="btn btn-ghost btn-sm" data-close-modal="migrate-modal">&times;</button>
     </div>
-  </details>
+    <p style="padding:0 var(--space-4);color:var(--fg-muted);font-size:var(--text-sm);margin:0">
+      以下会话尚未归属任何用户，选择要迁移到你账号下的会话：
+    </p>
+    <div id="migrate-list" style="flex:1;overflow-y:auto;padding:var(--space-3) var(--space-4)"></div>
+    <div style="padding:var(--space-3) var(--space-4);display:flex;gap:var(--space-2);justify-content:flex-end;border-top:1px solid var(--border)">
+      <button id="migrate-skip-btn" class="btn btn-ghost">跳过</button>
+      <button id="migrate-btn" class="btn btn-primary">迁移选中 (<span id="migrate-count">0</span>)</button>
+    </div>
+  </div>
 </div>
 
 <!-- ═══════════════ APP VIEW ═══════════════ -->
@@ -69,8 +81,9 @@
     <div class="sidebar-foot">
       <div id="status" class="status-pill connecting">
         <span class="status-dot"></span>
-        <span id="status-text">connecting…</span>
+        <span id="status-text">连接中…</span>
       </div>
+      <span id="app-version" class="app-version" title="当前版本"></span>
       <button id="theme-btn" class="icon-btn" title="切换主题" aria-label="切换主题">
         <svg id="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
       </button>
@@ -90,6 +103,10 @@
         <h3 id="session-title">新会话</h3>
         <span id="session-sub" class="session-sub"></span>
       </div>
+      <div id="token-usage" class="token-usage" title="当前会话 token 消耗">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px;opacity:0.6"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+        <span id="token-usage-text">0 tokens</span>
+      </div>
       <div class="head-actions">
         <button id="tasks-btn" class="icon-btn tasks-btn" title="后台任务" aria-label="后台任务" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
@@ -108,6 +125,9 @@
             <button class="settings-item" data-settings="memory"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg>记忆管理</button>
             <button class="settings-item" data-settings="skills"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>技能管理</button>
             <button class="settings-item" data-settings="tasks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>定时任务</button>
+            <div class="settings-section-label">信息</div>
+            <button class="settings-item" data-settings="changelog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>更新日志<span id="changelog-badge" class="changelog-badge" hidden></span></button>
+            <button class="settings-item" data-settings="feedback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>发送反馈</button>
             <div class="settings-section-label">系统</div>
             <button class="settings-item" data-settings="theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>切换主题</button>
             <button class="settings-item" data-settings="config"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>查看配置</button>
@@ -411,6 +431,62 @@
   </div>
 </div>
 
+<!-- Changelog / Release Notes modal -->
+<div id="changelog-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+  <div class="modal" style="max-width:560px">
+    <div class="modal-head">
+      <h3>&#128227; 更新日志</h3>
+      <button class="modal-close" data-close-modal="changelog-modal" aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body" style="max-height:60vh;overflow-y:auto">
+      <div id="changelog-content"></div>
+    </div>
+    <div class="modal-foot">
+      <span id="changelog-version" style="color:var(--fg-muted);font-size:var(--text-sm)"></span>
+      <div style="flex:1"></div>
+      <button class="btn btn-ghost" data-close-modal="changelog-modal">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- Feedback modal -->
+<div id="feedback-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+  <div class="modal" style="max-width:480px">
+    <div class="modal-head">
+      <h3>&#128172; 反馈</h3>
+      <button class="modal-close" data-close-modal="feedback-modal" aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label>类别</label>
+        <select id="feedback-category">
+          <option value="bug">Bug 报告</option>
+          <option value="feature">功能建议</option>
+          <option value="ux">体验问题</option>
+          <option value="other">其他</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>描述</label>
+        <textarea id="feedback-desc" placeholder="请详细描述你遇到的问题或建议&#10;&#10;好的反馈包含：&#10;- 发生了什么 / 期望什么&#10;- 复现步骤&#10;- 相关截图或上下文" style="min-height:140px"></textarea>
+      </div>
+      <div id="feedback-clarify" class="feedback-clarify" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        <span id="feedback-clarify-text"></span>
+      </div>
+      <div id="feedback-success" hidden style="text-align:center;padding:var(--space-4) 0">
+        <div style="font-size:32px;margin-bottom:var(--space-2)">&#10003;</div>
+        <p style="font-weight:600;margin:0">感谢反馈!</p>
+        <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-1) 0 0">我们会认真查看每一条反馈</p>
+      </div>
+    </div>
+    <div class="modal-foot" id="feedback-foot">
+      <button class="btn btn-ghost" data-close-modal="feedback-modal">取消</button>
+      <button id="feedback-submit-btn" class="btn btn-primary">提交反馈</button>
+    </div>
+  </div>
+</div>
+
 <!-- Lightbox for image/video zoom -->
 <div id="lightbox" class="lightbox-backdrop" hidden>
   <button class="lightbox-close" aria-label="关闭">&times;</button>
@@ -433,13 +509,29 @@
 </div>
 
 
+<!-- Force SW cache refresh (one-time, remove after all clients updated) -->
+<script>
+(function(){
+  var V='sw-flush-v11';
+  if(localStorage.getItem(V))return;
+  if('serviceWorker' in navigator){
+    navigator.serviceWorker.getRegistrations().then(function(regs){
+      var p=regs.map(function(r){return r.unregister()});
+      p.push(caches.keys().then(function(ks){return Promise.all(ks.map(function(k){return caches.delete(k)}))}));
+      Promise.all(p).then(function(){
+        localStorage.setItem(V,'1');
+        location.reload();
+      });
+    });
+  }else{localStorage.setItem(V,'1')}
+})();
+</script>
 <!-- VENDOR SCRIPTS (local, no CDN dependency) -->
 <script src="/vendor/marked.min.js"></script>
 <script src="/vendor/highlight.min.js" async></script>
-<script src="/vendor/mermaid.min.js"></script>
 <script src="/vendor/purify.min.js"></script>
 <script src="/vendor/chart.umd.min.js" async></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=5"></script>
+<script type="module" src="/modules/main.js?v=6"></script>
 </body>
 </html>

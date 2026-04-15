@@ -3,6 +3,7 @@ import { dbDelete, dbPut } from './db.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
+import { pushSessionToServer, deleteSessionFromServer } from './sync.js'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
 import { nudgeDrain } from './websocket.js'
@@ -96,6 +97,7 @@ export async function deleteSession(id) {
   try {
     await dbDelete(id)
   } catch {}
+  deleteSessionFromServer(id)
   if (state.currentSessionId === id) {
     const arr = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
     if (arr.length > 0) state.currentSessionId = arr[0].id
@@ -133,6 +135,8 @@ export function _rebuildSearchIndex(sess) {
 export function scheduleSave(s) {
   const sess = s || getSession()
   if (!sess) return
+  sess.lastAt = Date.now()
+  sess._dirty = true // mark as having unsaved local changes
   _rebuildSearchIndex(sess)
   const prev = _saveTimers.get(sess.id)
   if (prev) clearTimeout(prev)
@@ -146,6 +150,8 @@ export function scheduleSave(s) {
     } catch (e) {
       console.warn('dbPut', e)
     }
+    // Sync to server for cross-device access (best-effort)
+    pushSessionToServer(sess)
   }, 400)
   _saveTimers.set(sess.id, t)
 }
@@ -210,6 +216,7 @@ export function _buildSessionItem(s) {
   item.setAttribute('role', 'option')
   item.setAttribute('aria-selected', s.id === state.currentSessionId ? 'true' : 'false')
   item.setAttribute('tabindex', '0')
+  item.title = s.id
   item.onkeydown = (e) => {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault()

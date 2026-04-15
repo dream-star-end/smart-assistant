@@ -28,11 +28,21 @@ import {
   archivalAdd,
   archivalCount,
   archivalDelete,
-  archivalSearch,
   indexTurn,
   loadSessionTurns,
   searchSessions,
   upsertSessionMeta,
+  // P1: Hybrid search (BM25 + Vector + RRF)
+  hybridArchivalSearch,
+  hybridSessionSearch,
+  recordAccess,
+  initVectorStore,
+  upsertArchivalVector,
+  deleteArchivalVector,
+  isEmbeddingAvailable,
+  getEmbeddingProvider,
+  getSessionsDb,
+  type EmbeddingProvider,
 } from '@openclaude/storage'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
@@ -40,6 +50,29 @@ const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 const memory = new MemoryStore(AGENT_ID)
 await memory.load()
 const skills = new SkillStore(AGENT_ID)
+
+// Track in-flight embedding tasks to prevent add/delete race conditions
+const pendingEmbeds = new Map<string, Promise<void>>()
+
+// ── P1: Initialize archival schema + embedding + vector store ─
+// archivalCount triggers ensureSchema() which creates archival + archival_fts tables.
+// Must run before hybridArchivalSearch which queries archival_fts directly.
+await archivalCount(AGENT_ID)
+
+let embeddingProvider: EmbeddingProvider | null = null
+
+if (isEmbeddingAvailable()) {
+  try {
+    embeddingProvider = getEmbeddingProvider()
+    await initVectorStore(embeddingProvider.dimensions)
+    process.stderr.write(
+      `[mcp-memory] embedding enabled: ${embeddingProvider.providerId}/${embeddingProvider.modelId} (${embeddingProvider.dimensions}d)\n`,
+    )
+  } catch (err: any) {
+    process.stderr.write(`[mcp-memory] embedding init failed (falling back to BM25-only): ${err?.message}\n`)
+    embeddingProvider = null
+  }
+}
 
 const server = new Server(
   { name: 'openclaude-memory', version: '0.1.0' },
@@ -82,7 +115,7 @@ const TOOLS = [
   {
     name: 'session_search',
     description: [
-      'Full-text search across past sessions. By default searches your own sessions.',
+      'Hybrid search across past sessions (BM25 full-text + vector similarity when available).',
       "Set agentId to search another agent's sessions (cross-agent memory access).",
       '',
       'Returns up to `limit` (default 5) top sessions with snippet + metadata.',
@@ -90,7 +123,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'FTS5 search terms' },
+        query: { type: 'string', description: 'Search query (keywords or natural language)' },
         limit: { type: 'number', default: 5 },
         agentId: { type: 'string', description: '搜索指定 agent 的会话(默认搜索自己的)' },
         summarize: {
@@ -192,14 +225,14 @@ const TOOLS = [
   {
     name: 'archival_search',
     description: [
-      'Search archival memory using FTS5 full-text search. Returns top matches ranked by BM25.',
+      'Search archival memory using hybrid search (BM25 full-text + vector similarity + RRF fusion).',
       "Use when you need detailed knowledge that's too large for Core Memory.",
-      'Tip: use specific keywords, not natural language questions.',
+      'Supports both keyword queries and natural language questions.',
     ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'FTS5 search terms (AND/OR/NOT supported)' },
+        query: { type: 'string', description: 'Search query (keywords or natural language)' },
         limit: { type: 'number', default: 5, description: 'Max results to return' },
       },
       required: ['query'],
@@ -386,21 +419,28 @@ async function handleSessionSearch(args: {
 }) {
   // Default: search only THIS agent's sessions. Pass agentId to search another agent.
   const searchAgentId = args.agentId ?? AGENT_ID
-  // Filter at SQL level via the agentId parameter (uses sessions_meta.agent_id)
-  const hits = await searchSessions(args.query, args.limit ?? 5, searchAgentId)
+  const limit = args.limit ?? 5
+
+  // Use hybrid search (BM25 + vector) when embedding is available, else BM25-only
+  const hits = embeddingProvider
+    ? await hybridSessionSearch(args.query, embeddingProvider, limit, searchAgentId)
+    : (await searchSessions(args.query, limit, searchAgentId)).map(h => ({
+        ...h, bm25Rank: null as number | null, vecRank: null as number | null,
+      }))
+
   if (hits.length === 0) {
     const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
     return { content: [{ type: 'text', text: `No past sessions match "${args.query}"${scope}.` }] }
   }
   const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
+  const mode = embeddingProvider ? 'hybrid' : 'BM25'
   const lines: string[] = [
-    `Found ${hits.length} past sessions matching "${args.query}"${scope}:`,
+    `Found ${hits.length} past sessions matching "${args.query}"${scope} (${mode}):`,
     '',
   ]
   for (const h of hits) {
     const when = new Date(h.lastAt).toISOString().slice(0, 19).replace('T', ' ')
     lines.push(`• ${h.title} — ${when} [${h.channel}] (score ${h.score.toFixed(2)})`)
-    // strip HTML marks for terminal display but keep readable
     const cleanSnippet = h.snippet.replace(/<\/?mark>/g, '**').slice(0, 300)
     lines.push(`  ${cleanSnippet}`)
     lines.push('')
@@ -481,24 +521,73 @@ async function handleSkillDelete(args: { name: string }) {
 // ── Archival Memory handlers ──
 async function handleArchivalAdd(args: { content: string; tags?: string }) {
   const id = await archivalAdd(AGENT_ID, args.content, args.tags)
+
+  // P1: Generate embedding and store vector (fire-and-forget to avoid blocking response)
+  // Tracked in pendingEmbeds so archival_delete can await before cleanup.
+  if (embeddingProvider) {
+    const provider = embeddingProvider
+    const task = (async () => {
+      try {
+        const [vec] = await provider.embed([args.content], 'document')
+        // Verify the archival row still exists before inserting vector
+        // (a concurrent delete may have removed it during embedding)
+        const db = await getSessionsDb()
+        const row = db.prepare('SELECT 1 FROM archival WHERE id = ?').get(id)
+        if (row) await upsertArchivalVector(id, vec)
+      } catch (err: any) {
+        process.stderr.write(`[mcp-memory] embedding failed for archival ${id}: ${err?.message}\n`)
+      } finally {
+        pendingEmbeds.delete(id)
+      }
+    })()
+    // embed() is async — task always suspends at first await before finally runs,
+    // so set() always registers before delete() fires.
+    pendingEmbeds.set(id, task)
+  }
+
   const count = await archivalCount(AGENT_ID)
   return toolOk(`Stored in archival memory (id=${id}). Total entries: ${count}`)
 }
 
 async function handleArchivalSearch(args: { query: string; limit?: number }) {
-  const results = await archivalSearch(AGENT_ID, args.query, args.limit ?? 5)
+  const limit = args.limit ?? 5
+  const results = await hybridArchivalSearch(AGENT_ID, args.query, embeddingProvider, limit)
   if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`)
-  const lines = results.map(
-    (r, i) => `[${i + 1}] id=${r.id} tags=${r.tags || '(none)'}\n${r.content}`,
+
+  // Track access for lifecycle (non-blocking)
+  recordAccess(results.map(r => r.id)).catch(() => {})
+
+  const mode = embeddingProvider ? 'hybrid (BM25+vector)' : 'BM25-only'
+  const lines = results.map((r, i) => {
+    const ranks: string[] = []
+    if (r.bm25Rank != null) ranks.push(`bm25:#${r.bm25Rank}`)
+    if (r.vecRank != null) ranks.push(`vec:#${r.vecRank}`)
+    const rankInfo = ranks.length > 0 ? ` [${ranks.join(', ')}]` : ''
+    return `[${i + 1}] id=${r.id} tags=${r.tags || '(none)'}${rankInfo}\n${r.content}`
+  })
+  return toolOk(
+    `Found ${results.length} archival entries (${mode}):\n\n${lines.join('\n\n---\n\n')}`,
   )
-  return toolOk(`Found ${results.length} archival entries:\n\n${lines.join('\n\n---\n\n')}`)
 }
 
 async function handleArchivalDelete(args: { id: string }) {
   const ok = await archivalDelete(AGENT_ID, args.id)
-  return ok
-    ? toolOk(`Deleted archival entry ${args.id}.`)
-    : toolError(`Entry ${args.id} not found.`)
+  if (!ok) return toolError(`Entry ${args.id} not found.`)
+
+  // P1: Await any in-flight embedding before deleting vector (prevents add/delete race)
+  const pending = pendingEmbeds.get(args.id)
+  if (pending) await pending
+
+  if (embeddingProvider) {
+    try {
+      await deleteArchivalVector(args.id)
+    } catch (err: any) {
+      // deleteArchivalVector does not throw on missing rows —
+      // any error here is a real DB/vec issue, so log it.
+      process.stderr.write(`[mcp-memory] vector delete failed for ${args.id}: ${err?.message}\n`)
+    }
+  }
+  return toolOk(`Deleted archival entry ${args.id}.`)
 }
 
 // ─────────────────────────────────────────────────────────────

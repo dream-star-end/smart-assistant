@@ -1,14 +1,16 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v8'
+const VERSION = 'openclaude-v11'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
+  '/style.css?v=5',  // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
+  '/modules/main.js?v=6',  // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -25,13 +27,13 @@ const SHELL = [
   '/modules/tasks.js',
   '/modules/agents.js',
   '/modules/sessions.js',
+  '/modules/sync.js',
   '/modules/messages.js',
   '/modules/websocket.js',
   '/modules/commands.js',
   // Vendored dependencies
   '/vendor/marked.min.js',
   '/vendor/highlight.min.js',
-  '/vendor/mermaid.min.js',
   '/vendor/purify.min.js',
   '/vendor/chart.umd.min.js',
   '/vendor/github-dark.min.css',
@@ -76,42 +78,57 @@ self.addEventListener('fetch', (event) => {
   // Only handle same-origin GETs. Let CDN / cross-origin pass through.
   if (url.origin !== self.location.origin) return
 
-  // Normalize: strip query string for cache matching (e.g. /app.js?v=3 → /app.js)
-  const cacheKey = new Request(url.pathname, { headers: req.headers })
-
   // Network-first for HTML shell so updates are picked up quickly.
+  // Use pathname-only key for documents to avoid cache proliferation from query params.
   if (
     req.destination === 'document' ||
     req.mode === 'navigate' ||
     url.pathname === '/' ||
     url.pathname.endsWith('.html')
   ) {
+    const docKey = new Request(url.pathname, { headers: req.headers })
     event.respondWith(
       fetch(req)
         .then((res) => {
           const copy = res.clone()
           caches
             .open(VERSION)
-            .then((c) => c.put(cacheKey, copy))
+            .then((c) => c.put(docKey, copy))
             .catch(() => {})
           return res
         })
-        .catch(() => caches.match(cacheKey).then((m) => m || caches.match('/index.html'))),
+        .catch(() => caches.match(docKey).then((m) => m || caches.match('/index.html'))),
     )
     return
   }
 
-  // Cache-first for other same-origin static assets (JS/CSS/vendor/*)
+  // App modules (/modules/*.js) use network-first so code updates take effect immediately.
+  // Vendor libs and CSS use cache-first since they rarely change.
+  const isAppModule = url.pathname.startsWith('/modules/') && url.pathname.endsWith('.js')
+
+  if (isAppModule) {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          if (res.status === 200) {
+            const copy = res.clone()
+            caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {})
+          }
+          return res
+        })
+        .catch(() => caches.match(req)),
+    )
+    return
+  }
+
+  // Cache-first for vendor assets (JS/CSS libs that rarely change)
   event.respondWith(
-    caches.match(cacheKey).then((cached) => {
+    caches.match(req).then((cached) => {
       if (cached) return cached
       return fetch(req).then((res) => {
         if (res.status === 200) {
           const copy = res.clone()
-          caches
-            .open(VERSION)
-            .then((c) => c.put(cacheKey, copy))
-            .catch(() => {})
+          caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {})
         }
         return res
       })

@@ -47,6 +47,8 @@ export interface TurnResult {
   cacheReadTokens: number
   cacheCreationTokens: number
   assistantText: string
+  /** True if CCB marked the result as an error (e.g. API failure) */
+  isError: boolean
 }
 
 /**
@@ -65,6 +67,8 @@ export class CcbMessageParser {
   private indexToToolId = new Map<number, string>()
   /** De-duplicate emitted tool_results within a turn */
   private emittedToolResultIds = new Set<string>()
+  /** Count of tool_use blocks sent but not yet matched by a tool_result */
+  public pendingToolCalls = 0
   /** Assistant text accumulated in this turn */
   public assistantBuf = ''
   /** Whether this turn has been finalized */
@@ -219,14 +223,27 @@ export class CcbMessageParser {
     for (const c of content) {
       if (c?.type === 'tool_use' && c.id) {
         this.toolUseIdToName.set(c.id, c.name ?? 'unknown')
-        const inputPreview =
-          typeof c.input === 'string' ? c.input : JSON.stringify(c.input ?? {}).slice(0, 400)
+        const inputRaw = c.input ?? {}
+        const inputStr = typeof c.input === 'string' ? c.input : JSON.stringify(inputRaw)
+        const inputPreview = inputStr.slice(0, 400)
 
         // Notify about detected tool_use for bridging
         if (this.onToolUse && c.name) {
-          this.onToolUse({ name: c.name, id: c.id, input: (c.input ?? {}) as Record<string, any> })
+          this.onToolUse({ name: c.name, id: c.id, input: inputRaw as Record<string, any> })
         }
 
+        // Cap inputJson to avoid sending excessively large payloads to the frontend.
+        // For tools with large content fields (Write, Edit), truncate string values.
+        let inputJson: unknown = inputRaw
+        if (inputStr.length > 8000) {
+          const capped: Record<string, unknown> = {}
+          for (const [k, v] of Object.entries(inputRaw as Record<string, unknown>)) {
+            capped[k] = typeof v === 'string' && v.length > 3000 ? v.slice(0, 3000) + '…' : v
+          }
+          inputJson = capped
+        }
+
+        this.pendingToolCalls++
         const streamed = this.streamingToolUses.get(c.id)
         this.onEvent({
           kind: 'block',
@@ -235,6 +252,7 @@ export class CcbMessageParser {
             blockId: c.id,
             toolName: c.name ?? 'unknown',
             inputPreview,
+            inputJson,
             partial: false,
           },
         })
@@ -252,6 +270,7 @@ export class CcbMessageParser {
         const useId = c.tool_use_id
         if (useId && this.emittedToolResultIds.has(useId)) continue
         if (useId) this.emittedToolResultIds.add(useId)
+        if (this.pendingToolCalls > 0) this.pendingToolCalls--
         const toolName = useId ? (this.toolUseIdToName.get(useId) ?? 'unknown') : 'unknown'
         const previewRaw = c.content
         let preview: string
@@ -267,12 +286,13 @@ export class CcbMessageParser {
         } else {
           preview = JSON.stringify(previewRaw ?? '')
         }
-        if (preview.length > 500) preview = `${preview.slice(0, 500)}…`
+        if (preview.length > 3000) preview = `${preview.slice(0, 3000)}…`
         this.onEvent({
           kind: 'block',
           block: {
             kind: 'tool_result',
             blockId: useId ? `${useId}:result` : undefined,
+            toolUseBlockId: useId || undefined,
             toolName,
             isError: !!c.is_error,
             preview,
@@ -299,6 +319,7 @@ export class CcbMessageParser {
       cacheReadTokens: usage.cache_read_input_tokens ?? 0,
       cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
       assistantText: this.assistantBuf,
+      isError: !!(msg as any).is_error,
     }
 
     this.finalized = true

@@ -35,12 +35,19 @@ export interface ToolsetDefs {
   [name: string]: string[] // e.g. { research: ['browser'], coding: ['openclaude-memory'] }
 }
 
+export interface UserEntry {
+  id: string       // e.g. "boss"
+  name: string     // display name
+  passwordHash: string // scrypt hash
+}
+
 export interface OpenClaudeConfig {
   version: 1
   gateway: {
     bind: string // e.g. "127.0.0.1"
     port: number // 18789
     accessToken: string
+    users?: UserEntry[] // multi-user: login with username+password
   }
   // 接入方式三选一(实际 token 由 CCB 自己存,这里只记录类型)
   auth: {
@@ -123,6 +130,7 @@ export async function writeConfig(cfg: OpenClaudeConfig): Promise<void> {
 
 export interface AgentDef {
   id: string
+  version?: string // Template version for tracking/attribution (auto-bumped on config change)
   model?: string
   persona?: string // 文件路径
   cwd?: string // agent 工作目录
@@ -137,6 +145,7 @@ export interface AgentDef {
   // Per-agent provider & MCP overrides
   provider?: string // 覆盖全局 config.provider (如 "minimax", "anthropic", "deepseek")
   mcpServers?: McpServerConfig[] // agent 专属 MCP servers (合并到系统共享工具之上)
+  updatedAt?: string // ISO timestamp of last config change
 }
 
 export interface RouteRule {

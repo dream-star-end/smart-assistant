@@ -14,6 +14,54 @@ export function setWsDeps(deps) {
 let _reconnectAttempts = 0
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
 
+// ── Per-session thinking safety timer ──
+// Clears stuck _sendingInFlight if no outbound frame arrives within 10 minutes.
+// Must be longer than backend's idle timeout (5min default, 15min for tool calls)
+// so it only fires as a last resort when backend fails to send isFinal.
+// Reset on every handleOutbound frame; cleared on isFinal.
+const THINKING_SAFETY_MS = 10 * 60_000
+const _thinkingTimers = new Map() // sessId -> timeoutId
+
+function _resetThinkingSafety(sessId) {
+  if (_thinkingTimers.has(sessId)) clearTimeout(_thinkingTimers.get(sessId))
+  const tid = setTimeout(() => {
+    _thinkingTimers.delete(sessId)
+    const s = state.sessions.get(sessId)
+    if (s && s._sendingInFlight) {
+      console.warn('[ws] Thinking safety timeout for session', sessId)
+      // Send stop to backend so the turn is actually interrupted,
+      // preventing late frames from being misattributed to a future turn.
+      try {
+        if (state.ws && state.ws.readyState === 1) {
+          state.ws.send(JSON.stringify({
+            type: 'inbound.control.stop',
+            channel: 'webchat',
+            peer: { id: sessId, kind: 'dm' },
+            agentId: s.agentId || state.defaultAgentId,
+          }))
+        }
+      } catch {}
+      s._sendingInFlight = false
+      if (s.id === state.currentSessionId) {
+        state.sendingInFlight = false
+        updateSendEnabled()
+        hideTypingIndicator()
+        setTitleBusy(false)
+      }
+    }
+  }, THINKING_SAFETY_MS)
+  _thinkingTimers.set(sessId, tid)
+}
+
+export function resetThinkingSafety(sessId) { _resetThinkingSafety(sessId) }
+
+function _clearThinkingSafety(sessId) {
+  if (_thinkingTimers.has(sessId)) {
+    clearTimeout(_thinkingTimers.get(sessId))
+    _thinkingTimers.delete(sessId)
+  }
+}
+
 // Notification sound (local copy — avoids exporting private from notifications.js)
 const _notifSound = (() => {
   try {
@@ -203,6 +251,7 @@ function _drainNextOfflineItem() {
         updateMsgStatus(msg)
       }
       sess._sendingInFlight = true
+      _resetThinkingSafety(sess.id)
       if (sess.id === state.currentSessionId) {
         state.sendingInFlight = true
         updateSendEnabled()
@@ -294,14 +343,15 @@ export function stopCurrentTurn() {
 export function connect() {
   if (!state.token) return  // No token (logged out) — don't connect
   if (state.ws && state.ws.readyState < 2) return
-  setStatus('connecting…', 'connecting')
+  setStatus('连接中…', 'connecting')
   // Use Sec-WebSocket-Protocol for auth instead of query string (avoids token in URL/logs)
   const url = `${(location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host}/ws`
   const ws = new WebSocket(url, ['bearer', state.token])
   state.ws = ws
   ws.onopen = () => {
     _reconnectAttempts = 0
-    setStatus('connected', 'connected')
+    if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+    setStatus('已连接', 'connected')
     // Restore UI state for the current session if it was mid-turn before disconnect
     const _currentSess = getSession()
     if (_currentSess?._sendingInFlight) {
@@ -310,11 +360,44 @@ export function connect() {
       showTypingIndicator()
       setTitleBusy(true)
     }
-    // Send hello with all active session peer IDs so gateway can auto-resume
+    // Safety timeout: if sessions that were in-flight BEFORE this reconnect still
+    // have _sendingInFlight after 30s, auto-clear them. The snapshot Set is stored
+    // in state so that isFinal handlers can remove resolved sessions — preventing
+    // the timer from accidentally clearing a NEW turn started after reconnect.
+    if (state._reconnectInFlightTimer) clearTimeout(state._reconnectInFlightTimer)
+    state._reconnectInFlightSet = new Set()
+    for (const [id, s] of state.sessions) {
+      if (s._sendingInFlight) state._reconnectInFlightSet.add(id)
+    }
+    if (state._reconnectInFlightSet.size > 0) {
+      state._reconnectInFlightTimer = setTimeout(() => {
+        state._reconnectInFlightTimer = null
+        const snapped = state._reconnectInFlightSet
+        state._reconnectInFlightSet = null
+        if (!snapped) return
+        for (const sessId of snapped) {
+          const s = state.sessions.get(sessId)
+          if (s && s._sendingInFlight) {
+            console.warn('[ws] Clearing stuck _sendingInFlight for session', s.id)
+            s._sendingInFlight = false
+            if (s.id === state.currentSessionId) {
+              state.sendingInFlight = false
+              updateSendEnabled()
+              hideTypingIndicator()
+              setTitleBusy(false)
+            }
+          }
+        }
+      }, 30000)
+    } else {
+      state._reconnectInFlightSet = null
+    }
+    // Send hello with all active session peer IDs so gateway can auto-resume.
+    // Include inFlight flag so gateway only pushes turn-interrupted for stuck sessions.
     try {
       const peers = []
       for (const [id, s] of state.sessions) {
-        peers.push({ peerId: id, agentId: s.agentId || state.defaultAgentId })
+        peers.push({ peerId: id, agentId: s.agentId || state.defaultAgentId, inFlight: !!s._sendingInFlight })
       }
       ws.send(JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
     } catch {}
@@ -350,7 +433,8 @@ export function connect() {
     if (state.ws !== ws) return
     if (state._offlineDrainTimer) { clearTimeout(state._offlineDrainTimer); state._offlineDrainTimer = null }
     if (state._drainTimeout) { clearTimeout(state._drainTimeout); state._drainTimeout = null }
-    setStatus('disconnected', 'disconnected')
+    if (state._reconnectInFlightTimer) { clearTimeout(state._reconnectInFlightTimer); state._reconnectInFlightTimer = null; state._reconnectInFlightSet = null }
+    setStatus('已断线', 'disconnected')
     // Only clear global UI sending state — keep per-session _sendingInFlight
     // so that after reconnect + hello/resume, sessions can restore their loading state
     state.sendingInFlight = false
@@ -375,17 +459,22 @@ export function connect() {
       return
     }
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
+    if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
     // Don't auto-reconnect if logged out (no token)
     if (!state.token) return
     const delay = Math.min(2000 * Math.pow(2, _reconnectAttempts), 30000) + Math.random() * 1000
     _reconnectAttempts++
     if (delay >= 4000) {
       let remaining = Math.ceil(delay / 1000)
-      setStatus(`reconnecting in ${remaining}s…`, 'disconnected')
-      const countdown = setInterval(() => {
+      setStatus(`${remaining} 秒后重连…`, 'disconnected')
+      state.reconnectCountdown = setInterval(() => {
         remaining--
-        if (remaining > 0) setStatus(`reconnecting in ${remaining}s…`, 'disconnected')
-        else clearInterval(countdown)
+        if (remaining > 0) {
+          setStatus(`${remaining} 秒后重连…`, 'disconnected')
+        } else {
+          clearInterval(state.reconnectCountdown)
+          state.reconnectCountdown = null
+        }
       }, 1000)
     }
     state.reconnectTimer = setTimeout(connect, delay)
@@ -446,11 +535,26 @@ export function handleOutbound(frame) {
       return
     }
   }
-  if (!sess._blockIdToMsgId) sess._blockIdToMsgId = new Map()
+  if (!sess._blockIdToMsgId) {
+    // Rebuild blockId→msgId and agentGroups mappings from restored messages (after page refresh)
+    sess._blockIdToMsgId = new Map()
+    if (!sess._agentGroups) sess._agentGroups = new Map()
+    for (const m of sess.messages) {
+      if (m.blockId) sess._blockIdToMsgId.set(m.blockId, m.id)
+      if (m.role === 'agent-group' && m.blockId) sess._agentGroups.set(m.blockId, m.id)
+    }
+  }
+  // Reset thinking safety timer on every incoming frame (proves backend is alive)
+  if (sess._sendingInFlight && !frame.isFinal) _resetThinkingSafety(sess.id)
+  if (frame.isFinal) _clearThinkingSafety(sess.id)
   // Ignore late frames from before an agent switch — prevents cross-agent contamination
   if (sess._agentSwitchedAt && frame.ts && frame.ts < sess._agentSwitchedAt) return
   // Also ignore non-final frames if they arrive within 2s of an agent switch and we're not sending
   if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) return
+  // Any streaming output proves this turn is alive — remove from reconnect safety set
+  if (state._reconnectInFlightSet && (frame.blocks?.length > 0 || frame.isFinal)) {
+    state._reconnectInFlightSet.delete(sess.id)
+  }
   // Any output -> hide typing indicator ONLY if this is the currently viewed session
   if (((frame.blocks?.length || 0) > 0 || frame.isFinal) && sess.id === state.currentSessionId)
     hideTypingIndicator()
@@ -551,7 +655,6 @@ export function handleOutbound(frame) {
       sess._streamingAssistant = null
       sess._streamingThinking = null
       const isAgent = /^Agent$/i.test(block.toolName || '')
-      const label = buildToolUseLabel(block)
 
       if (isAgent) {
         // Sub-agent: create a collapsible group card + register as bg task
@@ -566,21 +669,39 @@ export function handleOutbound(frame) {
           })
           sess._agentGroups.set(block.blockId, groupMsg.id)
           if (block.blockId) sess._blockIdToMsgId.set(block.blockId, groupMsg.id)
-          // Track in bg tasks panel so user can see running sub-agents
           addBgTask(block.blockId, desc)
         }
       } else if (block.blockId && sess._blockIdToMsgId.has(block.blockId)) {
+        // Update existing tool card (streaming partial → final)
         const mid = sess._blockIdToMsgId.get(block.blockId)
         const existing = sess.messages.find((m) => m.id === mid)
         if (existing) {
-          existing.text = label
-          if (sess.id === state.currentSessionId) _deps.updateMessageEl(existing)
+          existing.inputPreview = block.inputPreview || existing.inputPreview
+          if (block.inputJson) existing.inputJson = block.inputJson
+          existing._partial = !!block.partial
+          if (sess.id === state.currentSessionId) {
+            if (block.partial) {
+              // Partial streaming: lightweight summary-only update (avoid full DOM rebuild)
+              const el = document.querySelector(`[data-msg-id="${existing.id}"]`)
+              const sumEl = el?.querySelector('.tool-card-summary')
+              if (sumEl) sumEl.textContent = buildToolUseLabel(block).slice(block.toolName?.length || 0)
+            } else {
+              // Final: full re-render with complete inputJson
+              _deps.updateMessageEl(existing)
+            }
+          }
         }
       } else {
-        const m = addMessage(sess, 'tool', label, {
-          toolIcon: '🔧',
+        // Create new tool card with structured data
+        const m = addMessage(sess, 'tool', block.toolName || 'unknown', {
           toolName: block.toolName,
           blockId: block.blockId,
+          inputPreview: block.inputPreview || '',
+          inputJson: block.inputJson || null,
+          _partial: !!block.partial,
+          _completed: false,
+          output: null,
+          error: false,
         })
         if (block.blockId) sess._blockIdToMsgId.set(block.blockId, m.id)
       }
@@ -603,7 +724,6 @@ export function handleOutbound(frame) {
           groupMsg._resultPreview = (block.preview || '').slice(0, 200)
           groupMsg._isError = !!block.isError
           if (sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
-          // Update bg task panel
           completeBgTask(block.blockId, block.isError ? 'failed' : 'done', {
             preview: (block.preview || '').slice(0, 100),
           })
@@ -611,23 +731,32 @@ export function handleOutbound(frame) {
         continue
       }
 
-      if (!block.preview) continue
-      const label = (block.toolName ? `${block.toolName}: ` : '') + block.preview
-      if (block.blockId && sess._blockIdToMsgId.has(block.blockId)) {
-        const mid = sess._blockIdToMsgId.get(block.blockId)
+      // Try to merge result into existing tool_use card
+      const toolUseId = block.toolUseBlockId || (block.blockId ? block.blockId.replace(/:result$/, '') : null)
+      if (toolUseId && sess._blockIdToMsgId.has(toolUseId)) {
+        const mid = sess._blockIdToMsgId.get(toolUseId)
         const existing = sess.messages.find((m) => m.id === mid)
         if (existing) {
-          existing.text = label
+          existing._completed = true
+          existing.output = block.preview || ''
           existing.error = !!block.isError
+          existing._partial = false
           if (sess.id === state.currentSessionId) _deps.updateMessageEl(existing)
           continue
         }
       }
-      const m = addMessage(sess, 'tool', label, {
-        toolIcon: block.isError ? '⚠️' : '↳',
+
+      // Fallback: create standalone result card
+      if (!block.preview) continue
+      const m = addMessage(sess, 'tool', block.toolName || 'unknown', {
         toolName: block.toolName,
         blockId: block.blockId,
+        _completed: true,
+        output: block.preview || '',
         error: !!block.isError,
+        inputJson: null,
+        inputPreview: '',
+        _partial: false,
       })
       if (block.blockId) sess._blockIdToMsgId.set(block.blockId, m.id)
     }
@@ -636,6 +765,15 @@ export function handleOutbound(frame) {
   if (frame.isFinal) {
     const metaText = formatMeta(frame.meta)
     if (metaText && sess._streamingAssistant) setMeta(sess, sess._streamingAssistant, metaText)
+    // Accumulate token usage for session-level tracking
+    if (frame.meta) {
+      if (!sess._tokenUsage) sess._tokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+      if (typeof frame.meta.inputTokens === 'number') sess._tokenUsage.input += frame.meta.inputTokens
+      if (typeof frame.meta.outputTokens === 'number') sess._tokenUsage.output += frame.meta.outputTokens
+      if (typeof frame.meta.cacheReadTokens === 'number') sess._tokenUsage.cacheRead += frame.meta.cacheReadTokens
+      if (typeof frame.meta.cacheCreationTokens === 'number') sess._tokenUsage.cacheWrite += frame.meta.cacheCreationTokens
+      if (typeof frame.meta.cost === 'number') sess._tokenUsage.cost += frame.meta.cost
+    }
     // Final rich render: re-render all streaming messages with full Markdown/Mermaid/Chart
     if (sess._streamingAssistant && sess.id === state.currentSessionId) {
       _deps.updateMessageEl(sess._streamingAssistant, false)
@@ -647,9 +785,30 @@ export function handleOutbound(frame) {
     const lastAssistant = [...sess.messages].reverse().find((m) => m.role === 'assistant')
     const preview = lastAssistant?.text?.replace(/[`*_#>]/g, '').trim() || ''
     if (preview) maybeNotify(`OpenClaude · ${sess.title}`, preview)
+    // Finalize any new-format tool cards still in "running" state (e.g. after page refresh).
+    // Skip legacy messages (no boolean _completed) to avoid upgrading them.
+    for (const m of sess.messages) {
+      if (m.role === 'tool' && typeof m._completed === 'boolean' && !m._completed && !m.error) {
+        m._completed = true
+        if (sess.id === state.currentSessionId) _deps.updateMessageEl(m)
+      }
+    }
     sess._streamingAssistant = null
     sess._streamingThinking = null
     sess._sendingInFlight = false
+    // Clear regen safety timer if present
+    if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
+    // Remove this session from the reconnect snapshot so the safety timer won't
+    // clear a new turn started after this isFinal on the same session.
+    if (state._reconnectInFlightSet) {
+      state._reconnectInFlightSet.delete(sess.id)
+      // If all snapped sessions resolved, cancel the timer entirely
+      if (state._reconnectInFlightSet.size === 0 && state._reconnectInFlightTimer) {
+        clearTimeout(state._reconnectInFlightTimer)
+        state._reconnectInFlightTimer = null
+        state._reconnectInFlightSet = null
+      }
+    }
     // Only update global UI state if this is the currently viewed session
     if (sess.id === state.currentSessionId) {
       state.sendingInFlight = false

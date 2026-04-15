@@ -1,0 +1,120 @@
+# Skill validation & security — 8 tasks
+---
+id: skill-val-001
+category: security
+difficulty: easy
+description: Reject skill name with uppercase
+action: skill_validate_name
+args:
+  name: BadName
+assertions:
+  - type: contains
+    value: '"ok":false'
+tags: [skill, validation, security]
+---
+id: skill-val-002
+category: security
+difficulty: easy
+description: Reject skill name with spaces
+action: skill_validate_name
+args:
+  name: "bad name"
+assertions:
+  - type: contains
+    value: '"ok":false'
+tags: [skill, validation, security]
+---
+id: skill-val-003
+category: security
+difficulty: easy
+description: Reject empty skill name
+action: skill_validate_name
+args:
+  name: ""
+assertions:
+  - type: contains
+    value: '"ok":false'
+tags: [skill, validation, security]
+---
+id: skill-val-004
+category: security
+difficulty: medium
+description: Reject skill name exceeding 64 chars
+action: skill_validate_name
+args:
+  name: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+assertions:
+  - type: contains
+    value: '"ok":false'
+  - type: contains
+    value: "too long"
+tags: [skill, validation, security]
+---
+id: skill-val-005
+category: security
+difficulty: easy
+description: Accept valid skill name
+action: skill_validate_name
+args:
+  name: "my-cool-skill-2"
+assertions:
+  - type: contains
+    value: '"ok":true'
+tags: [skill, validation]
+---
+id: skill-val-006
+category: security
+difficulty: medium
+description: Reject invalid agentId in SkillStore constructor
+action: skill_store_construct
+args:
+  agentId: "../escape"
+assertions:
+  - type: contains
+    value: '"ok":false'
+  - type: contains
+    value: "invalid agentId"
+tags: [skill, security, path-traversal]
+---
+id: skill-val-007
+category: security
+difficulty: medium
+description: Reject save with invalid version format
+action: skill_save
+args:
+  agentId: eval-agent
+  name: bad-version
+  description: Bad version test
+  version: "../1.0"
+  body: "test"
+assertions:
+  - type: contains
+    value: '"ok":false'
+  - type: contains
+    value: "invalid version"
+tags: [skill, security, version]
+---
+id: skill-val-008
+category: security
+difficulty: medium
+description: Reject restore with invalid version format
+setup:
+  - action: cleanup
+    args: { agentId: eval-agent }
+  - action: skill_save
+    args:
+      agentId: eval-agent
+      name: restore-sec
+      description: Restore security test
+      body: "test"
+action: skill_restore
+args:
+  agentId: eval-agent
+  name: restore-sec
+  version: "../../../etc/passwd"
+assertions:
+  - type: contains
+    value: '"ok":false'
+  - type: contains
+    value: "invalid version"
+tags: [skill, security, path-traversal]

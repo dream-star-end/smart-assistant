@@ -97,6 +97,7 @@ const slashCommands = [
         }),
       )
       sess._sendingInFlight = false
+      if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
       state.sendingInFlight = false
       updateSendEnabled()
       hideTypingIndicator()

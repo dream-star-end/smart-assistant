@@ -15,14 +15,16 @@
 // Ported from NousResearch/hermes-agent tools/skills_tool.py.
 
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { dirname, join, resolve, sep } from 'node:path'
 import { paths } from './paths.js'
 
 export const MAX_SKILL_NAME_LENGTH = 64
 export const MAX_SKILL_DESCRIPTION_LENGTH = 1024
 
 const VALID_SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]*$/
+const VALID_VERSION_RE = /^\d+\.\d+\.\d+$/
+const VALID_AGENT_ID_RE = /^[a-zA-Z0-9_-]+$/
 
 export interface SkillFrontmatter {
   name: string
@@ -125,8 +127,38 @@ function stripQuotes(s: string): string {
   return s
 }
 
+/** Bump the patch segment of a semver-like version string. */
+function bumpPatch(version: string): string {
+  const parts = version.split('.')
+  if (parts.length === 3) {
+    const patch = parseInt(parts[2], 10)
+    return `${parts[0]}.${parts[1]}.${Number.isNaN(patch) ? 1 : patch + 1}`
+  }
+  return `${version}.1`
+}
+
+/** Returns true if version matches strict N.N.N numeric format. */
+function isValidVersion(version: string): boolean {
+  return VALID_VERSION_RE.test(version)
+}
+
+/** Compare two N.N.N version strings numerically. Returns negative if a < b, positive if a > b. */
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map(Number)
+  const pb = b.split('.').map(Number)
+  for (let i = 0; i < 3; i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (diff !== 0) return diff
+  }
+  return 0
+}
+
 export class SkillStore {
-  constructor(private agentId: string) {}
+  constructor(private agentId: string) {
+    if (!agentId || !VALID_AGENT_ID_RE.test(agentId)) {
+      throw new Error(`invalid agentId: ${agentId}`)
+    }
+  }
 
   async list(): Promise<SkillMetadata[]> {
     const dir = paths.agentSkillsDir(this.agentId)
@@ -139,7 +171,8 @@ export class SkillStore {
       const skillMd = paths.agentSkillMd(this.agentId, entry.name)
       if (!existsSync(skillMd)) continue
       try {
-        const raw = await readFile(skillMd, 'utf-8')
+        const raw = await this.safeReadFile(skillMd)
+        if (!raw) continue
         const { meta } = parseFrontmatter(raw)
         if (!meta.name || !meta.description) continue
         result.push({
@@ -157,19 +190,29 @@ export class SkillStore {
     return result.sort((a, b) => a.name.localeCompare(b.name))
   }
 
+  /** Resolve a path and verify it is a regular file contained within the skills root. */
+  private async safeReadFile(filePath: string): Promise<string | null> {
+    if (!existsSync(filePath)) return null
+    const fileStat = await lstat(filePath)
+    if (!fileStat.isFile()) return null
+    const realFile = await realpath(filePath)
+    const realRoot = await realpath(paths.agentSkillsDir(this.agentId))
+    if (!realFile.startsWith(realRoot + sep)) return null
+    return await readFile(realFile, 'utf-8')
+  }
+
   async view(name: string, subfile?: string): Promise<SkillContent | string | null> {
     const v = validateSkillName(name)
     if (!v.ok) return null
     if (subfile) {
-      const safePath = resolve(paths.agentSkillDir(this.agentId, name), subfile)
       const base = resolve(paths.agentSkillDir(this.agentId, name))
-      if (!safePath.startsWith(base)) return null // path traversal guard
-      if (!existsSync(safePath)) return null
-      return await readFile(safePath, 'utf-8')
+      const lexicalPath = resolve(base, subfile)
+      if (!lexicalPath.startsWith(base + sep)) return null // path traversal guard
+      return await this.safeReadFile(lexicalPath)
     }
     const skillMd = paths.agentSkillMd(this.agentId, name)
-    if (!existsSync(skillMd)) return null
-    const raw = await readFile(skillMd, 'utf-8')
+    const raw = await this.safeReadFile(skillMd)
+    if (!raw) return null
     const { meta, body } = parseFrontmatter(raw)
     if (!meta.name || !meta.description) return null
     return {
@@ -192,20 +235,105 @@ export class SkillStore {
     if (!meta.description || meta.description.length > MAX_SKILL_DESCRIPTION_LENGTH) {
       return { ok: false, error: `description required, max ${MAX_SKILL_DESCRIPTION_LENGTH} chars` }
     }
+    if (meta.version && !isValidVersion(meta.version)) {
+      return { ok: false, error: 'invalid version format (expected N.N.N)' }
+    }
     const skillDir = paths.agentSkillDir(this.agentId, meta.name)
     const skillMd = paths.agentSkillMd(this.agentId, meta.name)
     const now = new Date().toISOString()
     const isNew = !existsSync(skillMd)
+
+    // Snapshot old version before overwriting
+    let prevVersion = '1.0.0'
+    if (!isNew) {
+      const oldRaw = await this.safeReadFile(skillMd)
+      if (!oldRaw) return { ok: false, error: 'failed to read existing skill for snapshot' }
+      const { meta: oldMeta } = parseFrontmatter(oldRaw)
+      prevVersion = oldMeta.version && isValidVersion(oldMeta.version) ? oldMeta.version : '1.0.0'
+      // Save snapshot to history/<version>.md — write via resolved path
+      const historyDir = join(skillDir, 'history')
+      await mkdir(historyDir, { recursive: true })
+      const realHistoryDir = await realpath(historyDir)
+      const realRoot0 = await realpath(paths.agentSkillsDir(this.agentId))
+      if (!realHistoryDir.startsWith(realRoot0 + sep)) {
+        return { ok: false, error: 'history directory resolves outside skills root' }
+      }
+      const snapshotPath = join(realHistoryDir, `${prevVersion}.md`)
+      // Reject if snapshot target already exists as symlink
+      if (existsSync(snapshotPath)) {
+        const snStat = await lstat(snapshotPath)
+        if (snStat.isSymbolicLink()) {
+          return { ok: false, error: 'snapshot target is a symlink' }
+        }
+      }
+      await writeFile(snapshotPath, oldRaw)
+    }
+
+    // Auto-bump patch version if caller didn't specify
+    const nextVersion = meta.version ?? (isNew ? '1.0.0' : bumpPatch(prevVersion))
+
     const mergedMeta: SkillFrontmatter = {
       ...meta,
-      version: meta.version ?? '1.0.0',
+      version: nextVersion,
       created_at: meta.created_at ?? (isNew ? now : undefined),
       updated_at: now,
     }
     await mkdir(skillDir, { recursive: true })
+    // Verify write target resolves within skills root (guards against symlinked skill dirs)
+    const realTarget = await realpath(skillDir)
+    const realRoot = await realpath(paths.agentSkillsDir(this.agentId))
+    if (!realTarget.startsWith(realRoot + sep)) {
+      return { ok: false, error: 'skill directory resolves outside skills root' }
+    }
+    // Write to resolved path; reject symlinked SKILL.md
+    const realSkillMd = join(realTarget, 'SKILL.md')
+    if (existsSync(realSkillMd)) {
+      const mdStat = await lstat(realSkillMd)
+      if (mdStat.isSymbolicLink()) {
+        return { ok: false, error: 'SKILL.md is a symlink' }
+      }
+    }
     const content = `${formatFrontmatter(mergedMeta)}\n\n${body.trim()}\n`
-    await writeFile(skillMd, content)
+    await writeFile(realSkillMd, content)
     return { ok: true }
+  }
+
+  /** List version history for a skill. */
+  async history(name: string): Promise<Array<{ version: string; timestamp: string }>> {
+    const v = validateSkillName(name)
+    if (!v.ok) return []
+    const historyDir = join(paths.agentSkillDir(this.agentId, name), 'history')
+    if (!existsSync(historyDir)) return []
+    const realHistory = await realpath(historyDir)
+    const realRoot = await realpath(paths.agentSkillsDir(this.agentId))
+    if (!realHistory.startsWith(realRoot + sep)) return []
+    const entries = await readdir(historyDir)
+    const result: Array<{ version: string; timestamp: string }> = []
+    for (const entry of entries) {
+      if (!entry.endsWith('.md')) continue
+      const version = entry.slice(0, -3)
+      if (!isValidVersion(version)) continue
+      try {
+        const s = await stat(join(historyDir, entry))
+        result.push({ version, timestamp: s.mtime.toISOString() })
+      } catch { continue }
+    }
+    return result.sort((a, b) => compareSemver(b.version, a.version))
+  }
+
+  /** Restore a specific version from history. Creates a new version, does not reuse old number. */
+  async restore(name: string, version: string): Promise<{ ok: boolean; error?: string }> {
+    const v = validateSkillName(name)
+    if (!v.ok) return { ok: false, error: v.error }
+    if (!isValidVersion(version)) return { ok: false, error: 'invalid version format (expected N.N.N)' }
+    const historyFile = join(paths.agentSkillDir(this.agentId, name), 'history', `${version}.md`)
+    const raw = await this.safeReadFile(historyFile)
+    if (!raw) return { ok: false, error: `version ${version} not found` }
+    const { meta, body } = parseFrontmatter(raw)
+    if (!meta.name || !meta.description) return { ok: false, error: 'invalid skill content' }
+    // Strip version so save() will auto-bump from current version
+    const { version: _discarded, ...metaWithoutVersion } = meta as SkillFrontmatter & { version?: string }
+    return this.save(metaWithoutVersion as SkillFrontmatter, body)
   }
 
   async delete(name: string): Promise<{ ok: boolean; error?: string }> {
@@ -213,7 +341,12 @@ export class SkillStore {
     if (!v.ok) return { ok: false, error: v.error }
     const dir = paths.agentSkillDir(this.agentId, name)
     if (!existsSync(dir)) return { ok: false, error: 'skill not found' }
-    await rm(dir, { recursive: true, force: true })
+    const realDir = await realpath(dir)
+    const realRoot = await realpath(paths.agentSkillsDir(this.agentId))
+    if (!realDir.startsWith(realRoot + sep)) {
+      return { ok: false, error: 'skill directory resolves outside skills root' }
+    }
+    await rm(realDir, { recursive: true, force: true })
     return { ok: true }
   }
 }

@@ -66,12 +66,16 @@ export const OutboundContentBlock = Type.Union([
     toolName: Type.String(),
     summary: Type.Optional(Type.String()),
     inputPreview: Type.Optional(Type.String()),
+    /** Parsed tool input object (available when partial=false) */
+    inputJson: Type.Optional(Type.Unknown()),
     // streaming: false | true — if true, a follow-up update with final input is coming
     partial: Type.Optional(Type.Boolean()),
   }),
   Type.Object({
     kind: Type.Literal('tool_result'),
     blockId: Type.Optional(Type.String()),
+    /** The original tool_use blockId this result corresponds to */
+    toolUseBlockId: Type.Optional(Type.String()),
     toolName: Type.String(),
     isError: Type.Boolean(),
     preview: Type.Optional(Type.String()),

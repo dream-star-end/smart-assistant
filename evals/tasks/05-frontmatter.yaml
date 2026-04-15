@@ -1,0 +1,112 @@
+# Frontmatter parsing — 6 tasks
+---
+id: fm-001
+category: skill
+difficulty: easy
+description: Parse basic frontmatter with name and description
+action: skill_parse_frontmatter
+args:
+  raw: |
+    ---
+    name: test-skill
+    description: "A test skill"
+    version: 1.0.0
+    ---
+
+    Body content here
+assertions:
+  - type: contains
+    value: ["test-skill", "A test skill", "1.0.0"]
+tags: [skill, frontmatter, parse]
+---
+id: fm-002
+category: skill
+difficulty: medium
+description: Parse frontmatter with inline array tags
+action: skill_parse_frontmatter
+args:
+  raw: |
+    ---
+    name: tagged
+    description: "Tagged skill"
+    tags: [code, python, automation]
+    ---
+
+    Body
+assertions:
+  - type: contains
+    value: ["code", "python", "automation"]
+tags: [skill, frontmatter, array]
+---
+id: fm-003
+category: skill
+difficulty: medium
+description: Parse frontmatter with block array tags
+action: skill_parse_frontmatter
+args:
+  raw: |
+    ---
+    name: block-tags
+    description: "Block tags"
+    tags:
+      - alpha
+      - beta
+      - gamma
+    ---
+
+    Body
+assertions:
+  - type: contains
+    value: ["alpha", "beta", "gamma"]
+tags: [skill, frontmatter, block-array]
+---
+id: fm-004
+category: skill
+difficulty: easy
+description: Parse content without frontmatter returns empty meta
+action: skill_parse_frontmatter
+args:
+  raw: "Just plain text without frontmatter"
+assertions:
+  - type: contains
+    value: '"meta":{}'
+  - type: contains
+    value: "Just plain text"
+tags: [skill, frontmatter, no-frontmatter]
+---
+id: fm-005
+category: skill
+difficulty: medium
+description: Parse frontmatter with quoted strings
+action: skill_parse_frontmatter
+args:
+  raw: |
+    ---
+    name: quoted
+    description: "Description with 'single quotes' inside"
+    ---
+
+    Body
+assertions:
+  - type: contains
+    value: "Description with 'single quotes' inside"
+tags: [skill, frontmatter, quotes]
+---
+id: fm-006
+category: skill
+difficulty: medium
+description: Parse frontmatter with related_skills
+action: skill_parse_frontmatter
+args:
+  raw: |
+    ---
+    name: related
+    description: "Has related skills"
+    related_skills: [browser-automation, media-generation]
+    ---
+
+    Body
+assertions:
+  - type: contains
+    value: ["browser-automation", "media-generation"]
+tags: [skill, frontmatter, related]

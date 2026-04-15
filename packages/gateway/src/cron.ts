@@ -19,11 +19,14 @@
 // If the agent's final text starts with [SILENT], output is archived but not delivered.
 
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { type AgentDef, type OpenClaudeConfig, paths, readAgentsConfig } from '@openclaude/storage'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
+import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
+
+const logger = createLogger({ module: 'cron' })
 
 const LAST_RUN_FILE = join(paths.home, 'cron', 'last-run.json')
 
@@ -120,7 +123,7 @@ export async function ensureCronFile(): Promise<CronFile> {
   const path = paths.cronYaml
   if (!existsSync(path)) {
     await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, stringifyYaml({ jobs: DEFAULT_JOBS }))
+    await atomicWriteYaml(path, { jobs: DEFAULT_JOBS })
     return { jobs: DEFAULT_JOBS }
   }
   try {
@@ -139,9 +142,19 @@ async function loadLastRun(): Promise<Record<string, number>> {
     return {}
   }
 }
+let _writeCounter = 0
 async function saveLastRun(map: Record<string, number>): Promise<void> {
   await mkdir(dirname(LAST_RUN_FILE), { recursive: true })
-  await writeFile(LAST_RUN_FILE, JSON.stringify(map, null, 2))
+  const tmp = LAST_RUN_FILE + `.${process.pid}.${++_writeCounter}.tmp`
+  await writeFile(tmp, JSON.stringify(map, null, 2))
+  await rename(tmp, LAST_RUN_FILE)
+}
+
+/** Atomically write a YAML file by writing to a unique .tmp then renaming. */
+async function atomicWriteYaml(filePath: string, data: unknown): Promise<void> {
+  const tmp = filePath + `.${process.pid}.${++_writeCounter}.tmp`
+  await writeFile(tmp, stringifyYaml(data))
+  await rename(tmp, filePath)
 }
 
 // Minimal crontab matcher: 5 fields, supports *, */N, N, N,M, N-M
@@ -224,11 +237,11 @@ export class CronScheduler {
     await ensureCronFile()
     // Tick once per minute
     this.timer = setInterval(() => {
-      if (!this.running) this.tick().catch((err) => console.error('[cron] tick failed:', err))
+      if (!this.running) this.tick().catch((err) => logger.error('tick failed', {}, err))
     }, 60_000)
     // Fire an initial tick 10s after boot (not immediate, to avoid startup race)
     setTimeout(() => this.tick().catch(() => {}), 10_000)
-    console.log('[cron] scheduler started')
+    logger.info('scheduler started')
   }
 
   stop(): void {
@@ -240,6 +253,9 @@ export class CronScheduler {
     this.running = true
     try {
       const file = await ensureCronFile()
+      // Load lastRun once at the start of the tick — all updates accumulate in
+      // memory and are flushed in a single write at the end, eliminating the
+      // concurrent read-modify-write race condition.
       const lastRun = await loadLastRun()
       const now = new Date()
       const localNow = getLocalDate()
@@ -249,26 +265,35 @@ export class CronScheduler {
       const before = file.jobs.length
       file.jobs = file.jobs.filter((j) => !(j.oneshot && j.enabled === false))
       if (file.jobs.length < before) {
-        await writeFile(paths.cronYaml, stringifyYaml(file))
+        await atomicWriteYaml(paths.cronYaml, file)
       }
 
       // Cleanup: delete output files older than 7 days
       this._cleanupOldOutputs().catch(() => {})
 
-      for (const job of file.jobs ?? []) {
-        if (job.enabled === false) continue
-        if (!cronMatches(job.schedule, localNow)) continue
-        // Dedupe: don't run twice in the same minute
-        const minuteKey = Math.floor(now.getTime() / 60_000)
-        if (lastRun[job.id] === minuteKey) continue
-        const agent = agentsConfig.agents.find((a) => a.id === job.agent)
-        if (!agent) {
-          console.warn(`[cron] job ${job.id}: agent ${job.agent} not found`)
-          continue
+      const minuteKey = Math.floor(now.getTime() / 60_000)
+      let lastRunDirty = false
+      try {
+        for (const job of file.jobs ?? []) {
+          if (job.enabled === false) continue
+          if (!cronMatches(job.schedule, localNow)) continue
+          // Dedupe: don't run twice in the same minute
+          if (lastRun[job.id] === minuteKey) continue
+          const agent = agentsConfig.agents.find((a) => a.id === job.agent)
+          if (!agent) {
+            logger.warn(`job ${job.id}: agent ${job.agent} not found`, { jobId: job.id, agent: job.agent })
+            continue
+          }
+          await this.runJob(job, agent)
+          lastRun[job.id] = minuteKey
+          lastRunDirty = true
         }
-        await this.runJob(job, agent)
-        lastRun[job.id] = minuteKey
-        await saveLastRun(lastRun)
+      } finally {
+        // Always flush completed job timestamps so a later failure doesn't replay
+        // already-run jobs on the next tick.
+        if (lastRunDirty) {
+          await saveLastRun(lastRun)
+        }
       }
     } finally {
       this.running = false
@@ -276,7 +301,7 @@ export class CronScheduler {
   }
 
   private async runJob(job: CronJob, agent: AgentDef): Promise<void> {
-    console.log(`[cron] running job ${job.id} (heartbeat=${!!job.heartbeat})`)
+    logger.info(`running job ${job.id}`, { jobId: job.id, heartbeat: !!job.heartbeat })
 
     let sessionKey: string
     if (job.heartbeat) {
@@ -311,39 +336,44 @@ export class CronScheduler {
       await mkdir(dirname(outPath), { recursive: true })
       await writeFile(outPath, output)
     } catch {}
+    // One-shot jobs: disable after first run, regardless of delivery outcome
+    if (job.oneshot) {
+      logger.info(`job ${job.id} is one-shot, disabling`, { jobId: job.id })
+      job.enabled = false
+      await saveCronFile(await ensureCronFile(), job)
+    }
+
     // Deliver if not [SILENT] or HEARTBEAT_OK
     const trimmed = output.trim()
     if (trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
-      console.log(`[cron] job ${job.id} silent/ok, not delivering`)
+      logger.info(`job ${job.id} silent/ok, not delivering`, { jobId: job.id })
       return
     }
-    console.log(
-      `[cron] job ${job.id} completed (${trimmed.length} chars), deliver=${job.deliver ?? 'local'}`,
-    )
+    logger.info(`job ${job.id} completed`, { jobId: job.id, chars: trimmed.length, deliver: job.deliver ?? 'local' })
     if ((job.deliver ?? 'local') === 'local') {
       // local = just log, don't push to any channel
     } else {
-      console.log(`[cron] delivering job ${job.id} to ${job.deliver}`)
+      logger.info(`delivering job ${job.id} to ${job.deliver}`, { jobId: job.id, deliver: job.deliver })
       this.onDeliver(trimmed, job)
-    }
-
-    // One-shot jobs: disable after first run
-    if (job.oneshot) {
-      console.log(`[cron] job ${job.id} is one-shot, disabling`)
-      job.enabled = false
-      await saveCronFile(await ensureCronFile(), job)
     }
   }
 
   // ── Runtime job management (called by /api/cron) ──
 
   async addJob(job: CronJob): Promise<void> {
+    // M6: Validate cron schedule before persisting
+    const schedFields = job.schedule.trim().split(/\s+/)
+    if (schedFields.length !== 5 || !schedFields.every((f) => /^[\d*/,\-]+$/.test(f))) {
+      throw new Error(
+        `Invalid cron schedule "${job.schedule}": must be a 5-field expression (minute hour dom month dow)`,
+      )
+    }
     const file = await ensureCronFile()
     // Replace if same ID exists
     file.jobs = file.jobs.filter((j) => j.id !== job.id)
     file.jobs.push(job)
-    await writeFile(paths.cronYaml, stringifyYaml(file))
-    console.log(`[cron] added job ${job.id}`)
+    await atomicWriteYaml(paths.cronYaml, file)
+    logger.info(`added job ${job.id}`, { jobId: job.id, schedule: job.schedule })
   }
 
   async removeJob(id: string): Promise<boolean> {
@@ -351,8 +381,8 @@ export class CronScheduler {
     const before = file.jobs.length
     file.jobs = file.jobs.filter((j) => j.id !== id)
     if (file.jobs.length === before) return false
-    await writeFile(paths.cronYaml, stringifyYaml(file))
-    console.log(`[cron] removed job ${id}`)
+    await atomicWriteYaml(paths.cronYaml, file)
+    logger.info(`removed job ${id}`, { jobId: id })
     return true
   }
 
@@ -364,11 +394,20 @@ export class CronScheduler {
     const job = file.jobs.find((j) => j.id === id)
     if (!job) return false
     if (updates.enabled !== undefined) job.enabled = updates.enabled
-    if (updates.schedule) job.schedule = updates.schedule
+    if (updates.schedule) {
+      // Validate new schedule before applying
+      const schedFields = updates.schedule.trim().split(/\s+/)
+      if (schedFields.length !== 5 || !schedFields.every((f) => /^[\d*/,\-]+$/.test(f))) {
+        throw new Error(
+          `Invalid cron schedule "${updates.schedule}": must be a 5-field expression (minute hour dom month dow)`,
+        )
+      }
+      job.schedule = updates.schedule
+    }
     if (updates.prompt) job.prompt = updates.prompt
     if (updates.label) job.label = updates.label
-    await writeFile(paths.cronYaml, stringifyYaml(file))
-    console.log(`[cron] updated job ${id}`)
+    await atomicWriteYaml(paths.cronYaml, file)
+    logger.info(`updated job ${id}`, { jobId: id })
     return true
   }
 
@@ -412,7 +451,7 @@ export class CronScheduler {
 async function saveCronFile(file: CronFile, updatedJob: CronJob): Promise<void> {
   const idx = file.jobs.findIndex((j) => j.id === updatedJob.id)
   if (idx >= 0) file.jobs[idx] = updatedJob
-  await writeFile(paths.cronYaml, stringifyYaml(file))
+  await atomicWriteYaml(paths.cronYaml, file)
 }
 
 /** Brute-force scan the next 1440 minutes (24h) to find the next matching time */

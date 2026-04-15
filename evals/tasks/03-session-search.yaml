@@ -1,0 +1,186 @@
+# Session indexing & search — 8 tasks
+---
+id: session-001
+category: session
+difficulty: easy
+description: Upsert session metadata
+action: session_upsert
+args:
+  id: eval-session-001
+  agentId: eval-agent
+  channel: eval
+  peerId: eval-user
+  title: Test session
+  turnCount: 5
+  totalCostUSD: 0.05
+assertions:
+  - type: contains
+    value: '"ok":true'
+tags: [session, upsert]
+---
+id: session-002
+category: session
+difficulty: easy
+description: Index a conversation turn
+action: session_index_turn
+args:
+  sessionId: eval-session-002
+  turnIdx: 0
+  userText: "What is the capital of France?"
+  assistantText: "The capital of France is Paris."
+assertions:
+  - type: contains
+    value: '"ok":true'
+tags: [session, index]
+---
+id: session-003
+category: session
+difficulty: medium
+description: Search finds indexed turn by keyword
+setup:
+  - action: session_upsert
+    args:
+      id: eval-search-003
+      agentId: eval-agent
+      channel: eval
+      peerId: eval-user
+      title: Geography quiz
+      turnCount: 1
+  - action: session_index_turn
+    args:
+      sessionId: eval-search-003
+      turnIdx: 0
+      userText: "Tell me about the Eiffel Tower in Paris"
+      assistantText: "The Eiffel Tower is a wrought-iron lattice tower in Paris"
+action: session_search
+args:
+  query: "Eiffel Tower"
+  limit: 5
+assertions:
+  - type: contains
+    value: "eval-search-003"
+tags: [session, search, fts5]
+---
+id: session-004
+category: session
+difficulty: medium
+description: Search with agent filter
+setup:
+  - action: session_upsert
+    args:
+      id: eval-agent-filter-a
+      agentId: agent-alpha
+      channel: eval
+      peerId: eval-user
+      title: Alpha session
+  - action: session_index_turn
+    args:
+      sessionId: eval-agent-filter-a
+      turnIdx: 0
+      userText: "unique marker ZQXWP"
+      assistantText: "Response to ZQXWP"
+  - action: session_upsert
+    args:
+      id: eval-agent-filter-b
+      agentId: agent-beta
+      channel: eval
+      peerId: eval-user
+      title: Beta session
+  - action: session_index_turn
+    args:
+      sessionId: eval-agent-filter-b
+      turnIdx: 0
+      userText: "unique marker ZQXWP from beta"
+      assistantText: "Beta response to ZQXWP"
+action: session_search
+args:
+  query: "ZQXWP"
+  agentId: agent-alpha
+  limit: 10
+assertions:
+  - type: contains
+    value: "eval-agent-filter-a"
+  - type: not_contains
+    value: "eval-agent-filter-b"
+tags: [session, search, filter]
+---
+id: session-005
+category: session
+difficulty: easy
+description: Search returns empty for no match
+action: session_search
+args:
+  query: "xyzzy_nonexistent_keyword_93847"
+  limit: 5
+assertions:
+  - type: exact
+    value: "[]"
+tags: [session, search, negative]
+---
+id: session-006
+category: session
+difficulty: medium
+description: Search returns snippet with match context
+setup:
+  - action: session_upsert
+    args:
+      id: eval-snippet-006
+      agentId: eval-agent
+      channel: eval
+      peerId: eval-user
+      title: Snippet test
+  - action: session_index_turn
+    args:
+      sessionId: eval-snippet-006
+      turnIdx: 0
+      userText: ""
+      assistantText: "The quick brown fox jumped over the lazy dog near SNIPPET_MARKER"
+action: session_search
+args:
+  query: "SNIPPET_MARKER"
+  limit: 1
+assertions:
+  - type: contains
+    value: "snippet"
+tags: [session, search, snippet]
+---
+id: session-007
+category: session
+difficulty: hard
+description: "Chinese text search (KNOWN LIMITATION: unicode61 tokenizer lacks CJK segmentation)"
+expected_failure: true
+setup:
+  - action: session_upsert
+    args:
+      id: eval-chinese-007
+      agentId: eval-agent
+      channel: eval
+      peerId: eval-user
+      title: 中文搜索测试
+  - action: session_index_turn
+    args:
+      sessionId: eval-chinese-007
+      turnIdx: 0
+      userText: "杭州今天天气怎么样"
+      assistantText: "杭州今天晴天，气温25度"
+action: session_search
+args:
+  query: "杭州"
+  limit: 5
+assertions:
+  - type: contains
+    value: "eval-chinese-007"
+tags: [session, search, chinese, i18n]
+---
+id: session-008
+category: session
+difficulty: easy
+description: Search with empty query returns empty
+action: session_search
+args:
+  query: ""
+  limit: 5
+assertions:
+  - type: exact
+    value: "[]"
+tags: [session, search, edge-case]

@@ -92,6 +92,11 @@ export class DockerBackend implements TerminalBackend {
       dockerArgs.push('--stop-timeout', String(Math.ceil(this.config.timeoutMs / 1000)))
     }
 
+    // Resource limits
+    dockerArgs.push('--memory', '2g')
+    dockerArgs.push('--cpus', '1.0')
+    dockerArgs.push('--pids-limit', '512')
+
     // Image
     dockerArgs.push(this.config.image || 'node:20-slim')
 

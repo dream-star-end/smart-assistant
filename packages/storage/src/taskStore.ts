@@ -59,6 +59,9 @@ interface TaskFile {
 const TASK_FILE = `${paths.home}/tasks.json`
 const MAX_EXECUTIONS = 50 // keep last 50 execution records
 
+// Serialize all writes through a promise chain to prevent read-modify-write races
+let _writeChain = Promise.resolve()
+
 async function loadTaskFile(): Promise<TaskFile> {
   try {
     if (existsSync(TASK_FILE)) {
@@ -70,12 +73,22 @@ async function loadTaskFile(): Promise<TaskFile> {
 }
 
 async function saveTaskFile(file: TaskFile): Promise<void> {
-  await mkdir(dirname(TASK_FILE), { recursive: true })
-  // Trim execution history
-  if (file.executions.length > MAX_EXECUTIONS) {
-    file.executions = file.executions.slice(-MAX_EXECUTIONS)
-  }
-  await writeFile(TASK_FILE, JSON.stringify(file, null, 2))
+  const p = _writeChain.then(async () => {
+    await mkdir(dirname(TASK_FILE), { recursive: true })
+    // Trim execution history
+    if (file.executions.length > MAX_EXECUTIONS) {
+      file.executions = file.executions.slice(-MAX_EXECUTIONS)
+    }
+    // Atomic write: temp file + rename
+    const tmp = TASK_FILE + '.tmp'
+    await writeFile(tmp, JSON.stringify(file, null, 2))
+    const { rename } = await import('node:fs/promises')
+    await rename(tmp, TASK_FILE)
+  })
+  // Chain serialization: each write waits for the previous one (never rejects to keep chain alive)
+  _writeChain = p.catch(() => {})
+  // But the returned promise propagates errors to callers
+  return p
 }
 
 export class TaskStore {

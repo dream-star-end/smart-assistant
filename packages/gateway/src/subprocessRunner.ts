@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
@@ -71,6 +71,8 @@ export class SubprocessRunner extends EventEmitter {
   private currentSessionId: string | null = null
   private starting = false
   private closed = false
+  private shuttingDown = false
+  private sessionDir: string | null = null
   /** Timestamp of last stdout activity — used for liveness detection */
   public lastActivityAt: number = Date.now()
 
@@ -83,13 +85,31 @@ export class SubprocessRunner extends EventEmitter {
     return this.currentSessionId
   }
 
+  /** Update config (e.g. after OAuth token refresh). Takes effect on next start(). */
+  updateConfig(config: OpenClaudeConfig): void {
+    this.opts.config = config
+  }
+
+  /** True if the subprocess is currently alive or being started */
+  get isRunning(): boolean {
+    return (this.proc !== null && !this.closed) || this.starting
+  }
+
   async start(): Promise<void> {
     if (this.proc || this.starting) return
     this.starting = true
+    this.closed = false
 
     const { config } = this.opts
-    const ccbDir = resolve(config.auth.claudeCodePath)
+    let ccbDir: string
+    try {
+      ccbDir = resolve(config.auth.claudeCodePath)
+    } catch (err) {
+      this.starting = false
+      throw err
+    }
     if (!existsSync(ccbDir)) {
+      this.starting = false
       throw new Error(
         `Claude Code path not found: ${ccbDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
       )
@@ -98,7 +118,13 @@ export class SubprocessRunner extends EventEmitter {
     const runtime = config.auth.claudeCodeRuntime ?? 'bun'
 
     // ─── L1/L2/L3: prepare learning-loop context for the subprocess ───
-    const learningContext = await this.buildLearningContext()
+    let learningContext: Awaited<ReturnType<typeof this.buildLearningContext>>
+    try {
+      learningContext = await this.buildLearningContext()
+    } catch (err) {
+      this.starting = false
+      throw err
+    }
 
     const args = [
       runtime === 'bun' ? 'run' : '--experimental-strip-types',
@@ -167,22 +193,30 @@ export class SubprocessRunner extends EventEmitter {
       // This is the "default" path — settings.json controls routing.
     }
 
-    const backend: TerminalBackend = createBackend(this.opts.config.terminal)
-    const proc = backend.spawn({
-      command: runtime,
-      args,
-      cwd: ccbDir,
-      agentCwd: this.opts.cwd, // agent's real working directory (for Docker volume mount)
-      env: {
-        ...process.env,
-        ...providerEnv,
-        OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
-        OPENCLAUDE_AGENT_ID: this.opts.agentId,
-        IS_SANDBOX: '1',
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      detached: true, // create process group so shutdown() can kill all children
-    })
+    let proc: ReturnType<TerminalBackend['spawn']>
+    try {
+      const backend: TerminalBackend = createBackend(this.opts.config.terminal)
+      proc = backend.spawn({
+        command: runtime,
+        args,
+        cwd: ccbDir,
+        agentCwd: this.opts.cwd, // agent's real working directory (for Docker volume mount)
+        env: {
+          ...process.env,
+          ...providerEnv,
+          OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
+          OPENCLAUDE_AGENT_ID: this.opts.agentId,
+          CLAUDE_CODE_EFFORT_LEVEL: 'max',
+          IS_SANDBOX: '1',
+          FEATURE_VERIFICATION_AGENT: '1',
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: true, // create process group so shutdown() can kill all children
+      })
+    } catch (err) {
+      this.starting = false
+      throw err
+    }
 
     this.proc = proc as unknown as ChildProcessWithoutNullStreams
 
@@ -197,9 +231,15 @@ export class SubprocessRunner extends EventEmitter {
     })
 
     proc.on('exit', (code, signal) => {
-      this.emit('exit', { code, signal })
       this.proc = null
       this.closed = true
+      // Use explicit shuttingDown flag (set by shutdown()) to distinguish
+      // graceful shutdown from crash. Exit code alone is unreliable:
+      // - SIGSEGV/SIGKILL → code=null but NOT graceful
+      // - CCB may exit with non-0 code on normal termination
+      const crashed = !this.shuttingDown
+      this.shuttingDown = false
+      this.emit('exit', { code, signal, crashed })
     })
 
     proc.on('error', (err) => {
@@ -219,7 +259,8 @@ export class SubprocessRunner extends EventEmitter {
       if (!line) continue
       try {
         const msg = JSON.parse(line) as SdkMessage
-        if (msg.session_id && !this.currentSessionId) {
+        // Always update session ID (CCB may report a new one after --resume)
+        if (msg.session_id && msg.session_id !== this.currentSessionId) {
           this.currentSessionId = msg.session_id
           this.emit('session_id', this.currentSessionId)
         }
@@ -256,7 +297,7 @@ export class SubprocessRunner extends EventEmitter {
   }
 
   // ─── Build per-session learning-loop context files ───
-  // Writes temp files under /tmp/openclaude-<sessionKey>/:
+  // Writes temp files under /tmp/openclaude-<sessionKey>-XXXXXX/:
   //   extra-prompt.md   — USER.md content + skill metadata digest
   //   mcp-config.json   — MCP server pointing at @openclaude/mcp-memory
   private async buildLearningContext(): Promise<{
@@ -264,13 +305,14 @@ export class SubprocessRunner extends EventEmitter {
     mcpConfigFile?: string
   }> {
     const out: { extraPromptFile?: string; mcpConfigFile?: string } = {}
-    // Use sessionKey (not agentId) so concurrent sessions of the same agent
-    // don't share/overwrite each other's temp files (extra-prompt.md, mcp-config.json).
+    // Use mkdtempSync for a unique per-run directory: prevents a restarted runner
+    // for the same sessionKey from racing with the old runner's shutdown cleanup.
+    // Clean up any previous session directory before creating a new one
+    // (guards against crash/retry scenarios where start() is called again).
+    this.cleanupSessionDir()
     const safeDirName = this.opts.sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_')
-    const sessionDir = resolve(tmpdir(), `openclaude-${safeDirName}`)
-    try {
-      mkdirSync(sessionDir, { recursive: true })
-    } catch {}
+    const sessionDir = mkdtempSync(resolve(tmpdir(), `openclaude-${safeDirName}-`))
+    this.sessionDir = sessionDir
 
     // Build merged extra system prompt via structured prompt slots
     try {
@@ -411,8 +453,22 @@ export class SubprocessRunner extends EventEmitter {
     }
   }
 
+  /** Remove the session's temp directory (extra-prompt.md, mcp-config.json, …). */
+  private cleanupSessionDir(): void {
+    if (this.sessionDir) {
+      try { rmSync(this.sessionDir, { recursive: true, force: true }) } catch {}
+      this.sessionDir = null
+    }
+  }
+
   async shutdown(): Promise<void> {
-    if (!this.proc) return
+    // Always clean up the session directory, even if there is no live process
+    // (failed starts, already-exited runners, crash paths).
+    if (!this.proc) {
+      this.cleanupSessionDir()
+      return
+    }
+    this.shuttingDown = true
     try {
       this.proc.stdin.end()
     } catch {}
@@ -437,5 +493,6 @@ export class SubprocessRunner extends EventEmitter {
     })
     this.proc = null
     this.closed = true
+    this.cleanupSessionDir()
   }
 }

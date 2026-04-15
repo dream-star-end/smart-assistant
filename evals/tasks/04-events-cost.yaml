@@ -1,0 +1,338 @@
+# Event log & cost tracking — 10 tasks
+---
+id: event-001
+category: event
+difficulty: easy
+description: Insert an event into event_log
+action: event_insert
+args:
+  id: eval-event-001
+  type: turn.completed
+  timestamp: 1700000000000
+  agentId: eval-agent
+  sessionKey: eval-session
+  schemaVersion: 1
+  payload: '{"type":"turn.completed","turnIndex":0}'
+assertions:
+  - type: contains
+    value: '"ok":true'
+tags: [event, insert]
+---
+id: event-002
+category: event
+difficulty: easy
+description: Query events by type
+setup:
+  - action: event_insert
+    args:
+      id: eval-event-002a
+      type: task.created
+      timestamp: 1700000001000
+      agentId: eval-agent
+      sessionKey: ""
+      schemaVersion: 1
+      payload: '{"type":"task.created","taskId":"t1"}'
+  - action: event_insert
+    args:
+      id: eval-event-002b
+      type: task.deleted
+      timestamp: 1700000002000
+      agentId: eval-agent
+      sessionKey: ""
+      schemaVersion: 1
+      payload: '{"type":"task.deleted","taskId":"t1"}'
+action: event_query
+args:
+  type: task.created
+  agentId: eval-agent
+assertions:
+  - type: contains
+    value: "eval-event-002a"
+  - type: not_contains
+    value: "eval-event-002b"
+tags: [event, query, filter]
+---
+id: event-003
+category: event
+difficulty: medium
+description: Query events with since filter
+setup:
+  - action: event_insert
+    args:
+      id: eval-event-003old
+      type: turn.completed
+      timestamp: 1600000000000
+      agentId: eval-agent
+      sessionKey: ""
+      schemaVersion: 1
+      payload: '{"type":"turn.completed","old":true}'
+  - action: event_insert
+    args:
+      id: eval-event-003new
+      type: turn.completed
+      timestamp: 1800000000000
+      agentId: eval-agent
+      sessionKey: ""
+      schemaVersion: 1
+      payload: '{"type":"turn.completed","old":false}'
+action: event_query
+args:
+  type: turn.completed
+  since: 1700000000000
+  agentId: eval-agent
+assertions:
+  - type: contains
+    value: "eval-event-003new"
+  - type: not_contains
+    value: "eval-event-003old"
+tags: [event, query, since]
+---
+id: event-004
+category: event
+difficulty: easy
+description: Query events with limit returns at most N results
+setup:
+  - action: event_insert
+    args:
+      id: eval-event-004a
+      type: turn.completed
+      timestamp: 1700000010000
+      agentId: limit-agent
+      sessionKey: ""
+      schemaVersion: 1
+      payload: '{"type":"turn.completed","n":1}'
+  - action: event_insert
+    args:
+      id: eval-event-004b
+      type: turn.completed
+      timestamp: 1700000020000
+      agentId: limit-agent
+      sessionKey: ""
+      schemaVersion: 1
+      payload: '{"type":"turn.completed","n":2}'
+  - action: event_insert
+    args:
+      id: eval-event-004c
+      type: turn.completed
+      timestamp: 1700000030000
+      agentId: limit-agent
+      sessionKey: ""
+      schemaVersion: 1
+      payload: '{"type":"turn.completed","n":3}'
+action: event_query
+args:
+  type: turn.completed
+  agentId: limit-agent
+  limit: 2
+assertions:
+  - type: contains
+    value: "eval-event-004c"
+  - type: contains
+    value: "eval-event-004b"
+  - type: not_contains
+    value: "eval-event-004a"
+tags: [event, query, limit]
+---
+id: cost-001
+category: cost
+difficulty: easy
+description: Insert usage log entry
+action: usage_insert
+args:
+  id: eval-usage-001
+  sessionId: eval-cost-session
+  agentId: eval-agent
+  turnIndex: 0
+  model: claude-opus-4-6
+  inputTokens: 1000
+  outputTokens: 500
+  cacheReadTokens: 200
+  cacheCreationTokens: 100
+  costUsd: 0.05
+  durationMs: 3000
+  toolCalls: 2
+  timestamp: 1700000000000
+assertions:
+  - type: contains
+    value: '"ok":true'
+tags: [cost, insert]
+---
+id: cost-002
+category: cost
+difficulty: medium
+description: Usage summary aggregates correctly
+setup:
+  - action: usage_insert
+    args:
+      id: eval-usage-002a
+      sessionId: eval-cost-002
+      agentId: cost-test-agent
+      turnIndex: 0
+      model: claude-opus-4-6
+      inputTokens: 1000
+      outputTokens: 500
+      cacheReadTokens: 0
+      cacheCreationTokens: 0
+      costUsd: 0.03
+      durationMs: 2000
+      toolCalls: 1
+      timestamp: 1700000000000
+  - action: usage_insert
+    args:
+      id: eval-usage-002b
+      sessionId: eval-cost-002
+      agentId: cost-test-agent
+      turnIndex: 1
+      model: claude-opus-4-6
+      inputTokens: 2000
+      outputTokens: 1000
+      cacheReadTokens: 0
+      cacheCreationTokens: 0
+      costUsd: 0.07
+      durationMs: 4000
+      toolCalls: 3
+      timestamp: 1700000001000
+action: usage_summary
+args:
+  agentId: cost-test-agent
+assertions:
+  - type: contains
+    value: "3000"
+  - type: contains
+    value: "1500"
+  - type: contains
+    value: "0.1"
+tags: [cost, summary, aggregate]
+---
+id: cost-003
+category: cost
+difficulty: medium
+description: Usage summary filters by sessionId
+setup:
+  - action: usage_insert
+    args:
+      id: eval-usage-003a
+      sessionId: cost-session-A
+      agentId: cost-agent-003
+      turnIndex: 0
+      model: eval-model
+      inputTokens: 500
+      outputTokens: 250
+      cacheReadTokens: 0
+      cacheCreationTokens: 0
+      costUsd: 0.02
+      durationMs: 1000
+      toolCalls: 0
+      timestamp: 1700000000000
+  - action: usage_insert
+    args:
+      id: eval-usage-003b
+      sessionId: cost-session-B
+      agentId: cost-agent-003
+      turnIndex: 0
+      model: eval-model
+      inputTokens: 10000
+      outputTokens: 5000
+      cacheReadTokens: 0
+      cacheCreationTokens: 0
+      costUsd: 1.50
+      durationMs: 10000
+      toolCalls: 5
+      timestamp: 1700000000000
+action: usage_summary
+args:
+  sessionId: cost-session-A
+assertions:
+  - type: contains
+    value: "500"
+  - type: not_contains
+    value: "10000"
+tags: [cost, summary, filter]
+---
+id: cost-004
+category: cost
+difficulty: easy
+description: Usage summary returns zeros for unknown agent
+action: usage_summary
+args:
+  agentId: nonexistent-agent-xyz
+assertions:
+  - type: contains
+    value: '"totalCostUsd":0'
+  - type: contains
+    value: '"totalTurns":0'
+tags: [cost, summary, negative]
+---
+id: event-005
+category: event
+difficulty: easy
+description: Duplicate event insert is idempotent (OR IGNORE)
+setup:
+  - action: event_insert
+    args:
+      id: eval-event-005-dup
+      type: turn.completed
+      timestamp: 1700000000000
+      agentId: eval-agent
+      sessionKey: ""
+      schemaVersion: 1
+      payload: '{"first":true}'
+action: event_insert
+args:
+  id: eval-event-005-dup
+  type: turn.completed
+  timestamp: 1700000000000
+  agentId: eval-agent
+  sessionKey: ""
+  schemaVersion: 1
+  payload: '{"first":false}'
+assertions:
+  - type: contains
+    value: '"ok":true'
+tags: [event, idempotent]
+---
+id: cost-005
+category: cost
+difficulty: medium
+description: Usage summary with since filter
+setup:
+  - action: usage_insert
+    args:
+      id: eval-usage-005old
+      sessionId: since-test
+      agentId: since-agent
+      turnIndex: 0
+      model: eval-model
+      inputTokens: 100
+      outputTokens: 50
+      cacheReadTokens: 0
+      cacheCreationTokens: 0
+      costUsd: 0.001
+      durationMs: 500
+      toolCalls: 0
+      timestamp: 1600000000000
+  - action: usage_insert
+    args:
+      id: eval-usage-005new
+      sessionId: since-test
+      agentId: since-agent
+      turnIndex: 1
+      model: eval-model
+      inputTokens: 9999
+      outputTokens: 4444
+      cacheReadTokens: 0
+      cacheCreationTokens: 0
+      costUsd: 0.999
+      durationMs: 8000
+      toolCalls: 3
+      timestamp: 1800000000000
+action: usage_summary
+args:
+  agentId: since-agent
+  since: 1700000000000
+assertions:
+  - type: contains
+    value: "9999"
+  - type: not_contains
+    value: '"totalInputTokens":100'
+tags: [cost, summary, since]
