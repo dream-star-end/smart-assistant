@@ -11,6 +11,7 @@
     "packages/mcp-memory",
     "packages/web",
     "packages/cli",
+    "packages/commercial",
     "packages/channels/webchat",
     "packages/channels/telegram",
     "packages/channels/wechat",
@@ -25,9 +26,13 @@
     "format": "biome format --write packages",
     "test:gateway": "npx tsx --test packages/gateway/src/__tests__/*.test.ts",
     "test:web": "npx tsx --test packages/web/__tests__/*.test.ts",
+    "test:commercial:unit": "npx tsx --test 'packages/commercial/src/**/__tests__/*.test.ts'",
+    "test:commercial:integ": "npx tsx --test 'packages/commercial/src/**/__tests__/*.integ.test.ts'",
+    "test:commercial": "npm run test:commercial:unit && npm run test:commercial:integ",
     "test:evals": "npx tsx --test --test-force-exit evals/run.test.ts",
-    "test": "npm run test:gateway && npm run test:web",
-    "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/storage/tsconfig.json && tsc --noEmit -p packages/gateway/tsconfig.json && tsc --noEmit -p packages/mcp-memory/tsconfig.json && tsc --noEmit -p packages/cli/tsconfig.json",
+    "test": "npm run test:gateway && npm run test:web && npm run test:commercial:unit",
+    "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
+    "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/storage/tsconfig.json && tsc --noEmit -p packages/gateway/tsconfig.json && tsc --noEmit -p packages/mcp-memory/tsconfig.json && tsc --noEmit -p packages/cli/tsconfig.json && tsc --noEmit -p packages/commercial/tsconfig.json",
     "check": "npm run lint && npm run typecheck && npm run test"
   },
   "devDependencies": {
