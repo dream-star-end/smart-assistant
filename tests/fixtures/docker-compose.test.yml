@@ -1,0 +1,35 @@
+# 商业化集成测试用 pg + redis 容器。
+# 端口故意避开常用端口,防止和 45.32 上个人版/其他服务冲突。
+#
+# 用法:
+#   cd tests/fixtures && docker compose -f docker-compose.test.yml up -d
+#   cd tests/fixtures && docker compose -f docker-compose.test.yml down -v   # 含数据清理
+
+name: openclaude-commercial-test
+
+services:
+  pg:
+    image: postgres:15
+    container_name: openclaude-commercial-test-pg
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: openclaude_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d openclaude_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: openclaude-commercial-test-redis
+    ports:
+      - "127.0.0.1:56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

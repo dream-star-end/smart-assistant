@@ -58,11 +58,37 @@
 - [ ] `src/config.ts`:env 解析(用 zod schema 校验)
 
 **Acceptance**:
-- [ ] 单元:`config.test.ts` 验证 env 缺失/非法时抛异常
-- [ ] 集成:起 pg test 容器,连接成功,`SELECT 1` 返回 `{?column?: 1}`
-- [ ] `query` 强制参数化(字符串拼接被 lint/review 禁止,手写 review 确认)
+- [x] 单元:`config.test.ts` 验证 env 缺失/非法时抛异常(8 tests,全绿)
+- [x] 集成:起 pg test 容器,连接成功,`SELECT 1` 返回 `{?column?: 1}`(6 tests,全绿)
+- [x] `query` 强制参数化(`queries.ts` 不暴露任何接受动态表名/列名的 API;`truncateAll` 白名单校验)
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- dep: `pg@^8.20.0`, `zod@^4.3.6`;dev-dep: `@types/pg@^8.20.0`
+- `src/config.ts`:
+  * URL 字段走协议白名单 — `DATABASE_URL` 只接受 `postgres://|postgresql://`,`REDIS_URL` 只接受 `redis://|rediss://`,拒 http/ftp/file/mysql 等
+  * `COMMERCIAL_ENABLED` 严格用 `z.enum(["0","1"]).optional()`,任何其他值(true/yes/01/"" 等)直接 ConfigError,避免部署错误被静默掩盖
+  * `ConfigError` 携带 `issues[]`,error 消息不回显原始 env 值(防 secret 泄漏)
+- `src/db/index.ts`:
+  * `createPool/getPool/setPoolOverride/resetPool/closePool`,max=50,idle 30s,connect 5s
+  * `statement_timeout=30s` 走 pg `PoolConfig.statement_timeout` (startup parameter,握手期下发,无竞态)
+  * `positiveInt()` 对所有整数选项做运行时正整数校验
+  * `setPoolOverride` 拒绝覆盖已存在的不同 pool(抛错要求先 closePool)
+  * `resetPool` 改成 async,等价于 closePool(不再"只丢引用"伪装安全 API)
+- `src/db/queries.ts`:`query(sql, params)` 单条参数化 + `tx(fn)` 事务(rollback 失败不遮蔽原错误);**不提供**任何破坏性 helper(TRUNCATE/DROP 都不在生产模块)
+- `src/__tests__/helpers/db.ts`(新建 test-only helper):`truncateAllForTest` 用两层防护 — (a) 运行时 `SELECT current_database()` 库名必须 `/_test$/`,(b) 表名白名单 `/^[a-z_][a-z0-9_]*$/`
+- `tests/fixtures/docker-compose.test.yml`:pg:15 在 55432、redis:7 在 56379(127.0.0.1 绑定、非标端口防冲突);两容器 healthcheck
+- `src/__tests__/config.test.ts`(13 tests):env 解析/默认值/缺失/非法 URL/错误协议/`postgresql://` 变体/`rediss://` 变体/`COMMERCIAL_ENABLED` 严格模式/`ConfigError.issues` 结构/error 消息不泄露 secret
+- `src/__tests__/db.integ.test.ts`(8 tests):pool 连通、参数化抗 SQL 注入、tx commit、tx rollback、`truncateAllForTest` 拒坏表名、拒非 `_test` 库(stub runner 测)、`statement_timeout` 下发、`setPoolOverride` 拒重复覆盖
+- 集成测试:`probe()` 未启动 pg 时本地 skip,CI (`CI=true` 或 `REQUIRE_TEST_DB=1`) 时 fail fast
+- 根 `package.json` 的 `test` 聚合改为 `test:commercial`(同时跑 unit+integ);`test:commercial:*` 脚本改用 `find ... -name '*.test.ts' ! -name '*.integ.test.ts'` 和 `-name '*.integ.test.ts'` 拆分,规避 `**` 在 shell 下不展开
+- Codex 双审:经 3 轮迭代
+  * Round 1 (1 BLOCKER + 4 MAJOR + 1 MINOR):truncateAll 移 helper / statement_timeout 改原生字段 / URL 协议白名单 / pool override 收紧 / integ fail-fast / 枚举严格
+  * Round 2 (1 MAJOR + 1 MINOR):根 `test` 聚合纳入 integ / stub runner 改显式 `QueryRunner`
+  * Round 3:PASS
+- typecheck: commercial 包 0 错误
+- 测试:`npm run test:commercial` unit 13/13 + integ 8/8 全绿;`npm test` 整体 123 tests,commercial 全绿;有 4 个 pre-existing failure 在 gateway `ccbMessageParser`/`security.test.ts`(stash 后同样失败,v2 baseline 历史问题,另行处理)
 
 ---
 
