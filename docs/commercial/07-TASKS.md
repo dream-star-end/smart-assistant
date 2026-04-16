@@ -107,11 +107,40 @@
 - [ ] 启动时自动执行(可通过 env `COMMERCIAL_AUTO_MIGRATE=0` 关闭)
 
 **Acceptance**:
-- [ ] 集成:空库 → migrate → 期望表都存在,`schema_migrations` 有 2 条
-- [ ] 集成:再跑一次 migrate → 幂等,不重复插入
-- [ ] 集成:人为改坏 0002 SQL → migrate 失败 → 表结构回到 0001 状态
+- [x] 集成:空库 → migrate → 期望表都存在(users/email_verifications/refresh_tokens/model_pricing/credit_ledger/usage_records/schema_migrations),`schema_migrations` 有 2 条
+- [x] 集成:再跑一次 migrate → 幂等,不重复插入(applied=0, skipped=2)
+- [x] 集成:人为改坏 0002(INSERT 不存在表)→ migrate 抛 nonexistent_table → 表结构回到 0001 状态(good_one 留下,bad_two 被 rollback)
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明(经 Codex 5 轮 review 迭代):
+- `src/db/migrate.ts`:
+  * 目录默认指向 `migrate.ts` 同级 `migrations/`(相对 import.meta.url,不受 cwd 影响)
+  * `SCHEMA_MIGRATIONS_DDL` 用 `IF NOT EXISTS` 启动幂等
+  * 并发策略:migrate 期间借一个独立 client 持有 session-level `pg_advisory_lock(0x0cbe1e5a01n)`,**在同一个持锁 client 上直接 BEGIN/COMMIT**(round 1 fix:不再借第二个 client 跑 tx —— 避免 pool.max=1 时双 client 死锁边界)
+  * 每个迁移单独事务:`BEGIN → 执行 SQL → INSERT schema_migrations → COMMIT`,失败 ROLLBACK;不自动回滚已 applied
+  * 完整性校验 `verifyIntegrity()`(round 1 fix):(a) 已 applied 的 version 必须在 dir 有 `.sql`(防止历史迁移被删造成静默漂移);(b) 新增 unapplied 的版本必须严格 > max(applied)(防止回填低号 out-of-order),违反抛 `MigrationIntegrityError`
+  * unlock 错误处理(round 2/3 fix):内层 finally 用 try/catch 吞掉 `pg_advisory_unlock` 自身错误并仅 log,同时把 unlock error 传给外层 `client.release(err)`,**让 pg 销毁这个 client 而不是还回池** —— 防止未清理的 session lock 跟着连接复用卡死后续 migrate;同时保证原始 migration error 不被 unlock 异常遮蔽
+  * 只扫 `*.sql`,`README.md`/`.bak` 等忽略
+  * CLI 入口:`fileURLToPath(import.meta.url) === argv[1]` → 走 main → closePool → exit code
+- `src/db/migrations/0001_init_users_auth.sql`:users(含 CHECK role/status + 部分索引)/email_verifications/refresh_tokens 及其索引,严格按 03-DATA-MODEL
+- `src/db/migrations/0002_init_billing.sql`:model_pricing/credit_ledger(含 RULE 拦 UPDATE/DELETE)/usage_records;usage_records.account_id 先建成 BIGINT NULL 不加 FK,0004 会 ALTER ADD FK(避免跨迁移依赖锁死)
+- `src/index.ts`:`registerCommercial(app)` 启动时自动 runMigrations;新增 `shouldAutoMigrate(env, warn?)` 旋钮三段语义(round 1 fix):未设/空串/"1" → true;"0" → false;其他值(如 "true"/"false"/"yes")仍然返回 true **但打 warning** 提示该值未被识别,避免"以为自己关了但其实没关"的脚枪(区别于 COMMERCIAL_ENABLED 的严格枚举)
+- CLI 验证:`DATABASE_URL=... REDIS_URL=... npm run migrate:commercial` 两次运行 → 第一次 applied=2 skipped=0,第二次 applied=0 skipped=2
+- `src/__tests__/migrate.integ.test.ts`(9 tests):
+  * 空库 → 建表 + schema_migrations 准确
+  * 二次运行幂等
+  * 坏 SQL 回滚(0001_good 存活 + 0002_bad 回滚)
+  * 文件名 lexical 顺序
+  * 非 `*.sql` 文件过滤
+  * 0001 关键列回归
+  * credit_ledger RULE 拦住 UPDATE/DELETE
+  * 完整性:已 applied 的文件被删除 → MigrationIntegrityError
+  * 完整性:回填低号版本(out-of-order)→ MigrationIntegrityError
+- `src/__tests__/auto_migrate_flag.test.ts`(6 tests):toggle 三段语义 + 默认 console.warn 劫持验证(round 2 fix:用 `mock.method(console, "warn")` 真正拦截并断言调用次数/内容)
+- `src/__tests__/migrate_unlock_failure.test.ts`(3 tests,round 3/4 新增):unlock 失败 client 销毁、happy path release 无参、migration+unlock 同时失败时原始 migration error 仍向外传播
+- 测试汇总:unit 22/22 + integ 17/17 = 39 全绿;typecheck 干净
+- Codex review:round 1 发现 2 MAJOR + 1 MINOR → 修复;round 2 发现 1 MAJOR + 1 MINOR → 修复;round 3 发现 1 MAJOR → 修复;round 4 发现 1 MINOR → 修复;round 5 PASS
 
 ---
 
