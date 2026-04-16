@@ -332,6 +332,14 @@ function _shortPath(p) {
 }
 
 function _buildPermissionCard(el, msg) {
+  // AskUserQuestion is rendered as an interview summary (one line per
+  // question→answer) instead of the generic Permission Request chip. Feeds
+  // off msg._answers which websocket.js stores on allow-submit.
+  if (msg.toolName === 'AskUserQuestion' && msg.inputJson && Array.isArray(msg.inputJson.questions)) {
+    _buildAskUserQuestionCard(el, msg)
+    return
+  }
+
   const toolName = htmlSafeEscape(msg.toolName || 'unknown')
   const resolved = msg._resolved
   const behavior = msg._behavior
@@ -348,6 +356,52 @@ function _buildPermissionCard(el, msg) {
     `<span style="color:var(--fg-muted);margin-left:auto;font-size:12px">${statusText}</span>` +
     `</div>` +
     (msg.inputPreview ? `<div style="font-size:12px;color:var(--fg-muted);margin-top:4px;word-break:break-all">${htmlSafeEscape(msg.inputPreview.slice(0, 200))}</div>` : '')
+  el.appendChild(body)
+}
+
+function _buildAskUserQuestionCard(el, msg) {
+  const resolved = msg._resolved
+  const behavior = msg._behavior
+  const answers = msg._answers || {}
+  const questions = msg.inputJson.questions
+  const statusIcon = !resolved ? '⏳' : behavior === 'allow' ? '✓' : '✗'
+  const statusText = !resolved
+    ? '等待回答…'
+    : behavior === 'allow'
+      ? '已提交'
+      : '已跳过'
+  const statusClass = !resolved ? '' : behavior === 'allow' ? 'resolved-allow' : 'resolved-deny'
+
+  const body = document.createElement('div')
+  body.className = `msg-body aq-card ${statusClass}`
+
+  const headerEl = document.createElement('div')
+  headerEl.className = 'aq-card-header'
+  headerEl.innerHTML =
+    `<span class="aq-card-icon">${statusIcon}</span>` +
+    `<span class="aq-card-title">用户问答</span>` +
+    `<span class="aq-card-status">${htmlSafeEscape(statusText)}</span>`
+  body.appendChild(headerEl)
+
+  const list = document.createElement('div')
+  list.className = 'aq-card-list'
+  for (const q of questions) {
+    const row = document.createElement('div')
+    row.className = 'aq-card-row'
+    const qtext = document.createElement('div')
+    qtext.className = 'aq-card-q'
+    qtext.textContent = q.question
+    row.appendChild(qtext)
+    if (resolved && behavior === 'allow') {
+      const ans = answers[q.question]
+      const ansEl = document.createElement('div')
+      ansEl.className = 'aq-card-a'
+      ansEl.textContent = ans ? `→ ${ans}` : '→ (未回答)'
+      row.appendChild(ansEl)
+    }
+    list.appendChild(row)
+  }
+  body.appendChild(list)
   el.appendChild(body)
 }
 

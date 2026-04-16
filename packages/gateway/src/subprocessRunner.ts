@@ -73,6 +73,84 @@ export type PermissionResponse =
   | { behavior: 'allow'; updatedInput: Record<string, unknown>; toolUseID?: string }
   | { behavior: 'deny'; message: string; toolUseID?: string }
 
+/**
+ * Inputs for `buildCcbCliArgs`. Everything that influences the subprocess's
+ * CLI argv lives here so the argv construction is a pure function — trivially
+ * unit-testable, no side effects, no file I/O.
+ */
+export interface CcbCliArgsInput {
+  /** e.g. 'bun' or 'node' (maps to `run` vs `--experimental-strip-types`) */
+  runtime: string
+  /** Entry file path, e.g. src/entrypoints/cli.tsx */
+  entry: string
+  model?: string
+  permissionMode?: string
+  extraPromptFile?: string
+  mcpConfigFile?: string
+  addDir?: string
+  resumeSessionId?: string | null
+}
+
+/**
+ * Build the argv array that we pass to the CCB subprocess.
+ *
+ * IMPORTANT invariant: `--permission-prompt-tool stdio` is always present,
+ * regardless of `permissionMode`. CCB's permissions.ts step 1e keeps
+ * `requiresUserInteraction()` tools (AskUserQuestion, ExitPlanMode, …)
+ * bypass-immune — they still return `behavior:'ask'` even in
+ * bypassPermissions mode. Without a permission-prompt-tool, that ask falls
+ * through `getCanUseToolFn`'s fallback branch in CCB's print.ts and
+ * toolExecution.ts then treats the unresolved ask as a deny, surfacing the
+ * tool's raw ask-message (e.g. "Answer questions?") as the tool error.
+ *
+ * Non-interactive tools are unaffected — step 2a's bypass-allow in
+ * permissions.ts fires before any ask result is ever produced for them.
+ */
+export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
+  const {
+    runtime,
+    entry,
+    model,
+    permissionMode,
+    extraPromptFile,
+    mcpConfigFile,
+    addDir,
+    resumeSessionId,
+  } = input
+  const args: string[] = [
+    runtime === 'bun' ? 'run' : '--experimental-strip-types',
+    entry,
+    '-p',
+    '--input-format=stream-json',
+    '--output-format=stream-json',
+    '--include-partial-messages',
+    '--verbose',
+  ]
+  if (model) args.push('--model', model)
+  if (permissionMode) {
+    args.push('--permission-mode', permissionMode)
+    // bypassPermissions 需要配合 --dangerously-skip-permissions 才真正放行所有工具
+    if (permissionMode === 'bypassPermissions') {
+      args.push('--dangerously-skip-permissions')
+    }
+  }
+  // See function JSDoc: stdio prompting must be enabled in ALL modes so CCB
+  // emits `can_use_tool` control_requests on stdout that the gateway bridges
+  // to the web frontend. Required even under bypassPermissions for
+  // interactive tools like AskUserQuestion.
+  args.push('--permission-prompt-tool', 'stdio')
+  // Single merged prompt file: persona + identity + platform + skills + memory
+  // (Cannot pass --append-system-prompt-file twice; Commander takes last value only)
+  if (extraPromptFile) args.push('--append-system-prompt-file', extraPromptFile)
+  // Wire up MCP memory/skills/search server
+  if (mcpConfigFile) args.push('--mcp-config', mcpConfigFile)
+  if (addDir) args.push('--add-dir', addDir)
+  if (resumeSessionId) args.push('--resume', resumeSessionId)
+  // 必须给一个 prompt placeholder,CCB stream-json 会从 stdin 接管
+  args.push('')
+  return args
+}
+
 // Cap for in-memory stdout/stderr accumulation per runner. If CCB ever emits
 // a chunk without newline (malformed output, corrupt base64, wedged write),
 // the buffer can grow unboundedly and eat gigabytes of RSS. When we cross
@@ -198,40 +276,16 @@ export class SubprocessRunner extends EventEmitter {
       throw err
     }
 
-    const args = [
-      runtime === 'bun' ? 'run' : '--experimental-strip-types',
+    const args = buildCcbCliArgs({
+      runtime,
       entry,
-      '-p',
-      '--input-format=stream-json',
-      '--output-format=stream-json',
-      '--include-partial-messages',
-      '--verbose',
-    ]
-    if (this.opts.model) args.push('--model', this.opts.model)
-    if (this.opts.permissionMode) {
-      args.push('--permission-mode', this.opts.permissionMode)
-      // bypassPermissions 需要配合 --dangerously-skip-permissions 才真正 放行所有工具
-      if (this.opts.permissionMode === 'bypassPermissions') {
-        args.push('--dangerously-skip-permissions')
-      } else {
-        // Non-bypass modes: use stdio permission prompting so CCB emits
-        // control_request on stdout instead of trying to show Ink UI (which
-        // doesn't work in pipe mode). The gateway will bridge these requests
-        // to the web frontend for user approval.
-        args.push('--permission-prompt-tool', 'stdio')
-      }
-    }
-    // Single merged prompt file: persona + identity + platform + skills + memory
-    // (Cannot pass --append-system-prompt-file twice; Commander takes last value only)
-    if (learningContext.extraPromptFile)
-      args.push('--append-system-prompt-file', learningContext.extraPromptFile)
-    // Wire up MCP memory/skills/search server
-    if (learningContext.mcpConfigFile) args.push('--mcp-config', learningContext.mcpConfigFile)
-    if (this.opts.cwd) args.push('--add-dir', this.opts.cwd)
-    if (this.currentSessionId) args.push('--resume', this.currentSessionId)
-
-    // 必须给一个 prompt placeholder,CCB stream-json 会从 stdin 接管
-    args.push('')
+      model: this.opts.model,
+      permissionMode: this.opts.permissionMode,
+      extraPromptFile: learningContext.extraPromptFile,
+      mcpConfigFile: learningContext.mcpConfigFile,
+      addDir: this.opts.cwd,
+      resumeSessionId: this.currentSessionId,
+    })
 
     // ── Provider-aware auth injection ──
     // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
