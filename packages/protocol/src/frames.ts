@@ -61,6 +61,14 @@ export const InboundPermissionResponse = Type.Object({
   behavior: Type.Union([Type.Literal('allow'), Type.Literal('deny')]),
   /** Optional deny reason from user */
   message: Type.Optional(Type.String()),
+  /** Optional client-supplied tool input override. Currently used only by
+   *  the AskUserQuestion tool to carry `{ answers, annotations }` merged
+   *  on top of the original pending input. The gateway runs
+   *  `sanitizeAskUserQuestionUpdatedInput` (whitelist) before forwarding to
+   *  CCB — any unknown top-level keys, unknown question texts, non-string
+   *  answers, forged `annotations.preview` values, etc. are dropped.
+   *  If nothing survives sanitization the gateway downgrades allow → deny. */
+  updatedInput: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 })
 export type InboundPermissionResponse = Static<typeof InboundPermissionResponse>
 
@@ -168,6 +176,13 @@ export const OutboundPermissionSettled = Type.Object({
       Type.Literal('crashed'),
     ]),
   ),
+  /** Present only for AskUserQuestion allow settlements. Carries the
+   *  sanitized `{ questionText: answer }` map so tabs that didn't submit
+   *  the answer themselves (or arrive late via already_settled replay)
+   *  can populate the resolved permission card without making the user
+   *  re-enter anything. The gateway never forwards arbitrary client
+   *  fields here — values are whitelisted by sanitizeAskUserQuestionUpdatedInput. */
+  answers: Type.Optional(Type.Record(Type.String(), Type.String())),
 })
 export type OutboundPermissionSettled = Static<typeof OutboundPermissionSettled>
 

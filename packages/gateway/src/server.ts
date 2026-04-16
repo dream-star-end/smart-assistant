@@ -137,12 +137,15 @@ export class Gateway {
   private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string }>()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
-  // Pending permission requests: requestId → { sessionKey, input, toolUseId, peerKey, channel, peer }
+  // Pending permission requests: requestId → { sessionKey, toolName, input, toolUseId, peerKey, channel, peer }
   // Used for single-settlement, original-input passthrough, and disconnect auto-deny.
   // `channel` and `peer` are preserved from the original request so disconnect
   // auto-deny broadcasts with the correct (unspoofable) peer kind.
+  // `toolName` lets handlePermissionResponse apply tool-specific handling
+  // (e.g. AskUserQuestion merges user-supplied `answers` into updatedInput).
   private _pendingPermissions = new Map<string, {
     sessionKey: string
+    toolName: string
     input: Record<string, unknown>
     toolUseId?: string
     peerKey: string
@@ -172,6 +175,9 @@ export class Gateway {
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
       sessionKey: string
+      // Present only for AskUserQuestion allow settlements — replayed to
+      // late-joining tabs so they can fill in the answers column of the card.
+      answers?: Record<string, string>
       ts: number
     }
   >()
@@ -2568,9 +2574,15 @@ export class Gateway {
     requestId: string
     behavior: 'allow' | 'deny'
     message?: string
+    /** Optional client-supplied tool input override (currently only used by
+     *  AskUserQuestion to carry user-selected `answers` + `annotations`).
+     *  Sanitized via `sanitizeAskUserQuestionUpdatedInput` before being
+     *  forwarded to CCB; untrusted client fields are dropped. */
+    updatedInput?: Record<string, unknown>
   }): Promise<void> {
-    const peerKey = `${frame.channel}:${frame.peer.id}`
-    // Single-settlement: consume the pending request (reject duplicates)
+    // Consume pending first so we can use its authoritative channel/peer/sessionKey
+    // instead of trusting the client-supplied frame fields. For the not-found /
+    // dead-session branches we fall back to frame.* because we have nothing else.
     const pending = this._pendingPermissions.get(frame.requestId)
     if (!pending) {
       // Race: another tab (or our own /stop / timeout path) settled this
@@ -2586,15 +2598,22 @@ export class Gateway {
         lateBehavior: frame.behavior,
       })
       if (prior) {
-        this._broadcastPermissionSettled(peerKey, {
+        // Route the rebroadcast using prior.* (server-trusted) so a late
+        // duplicate can't steer the settlement to a peerKey of its choosing.
+        const priorPeerKey = `${prior.channel}:${prior.peer.id}`
+        this._broadcastPermissionSettled(priorPeerKey, {
           sessionKey: prior.sessionKey,
           channel: prior.channel,
           peer: prior.peer,
           requestId: frame.requestId,
           behavior: prior.behavior,
           reason: 'already_settled',
+          ...(prior.answers ? { answers: prior.answers } : {}),
         })
       } else {
+        // No server-side record survives — fall back to frame.* because
+        // that's the only signal we have for where to route the settlement.
+        const peerKey = `${frame.channel}:${frame.peer.id}`
         this._broadcastPermissionSettled(peerKey, {
           sessionKey: '',
           channel: frame.channel,
@@ -2613,56 +2632,124 @@ export class Gateway {
       this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
       // Session is gone, but tabs still hold the modal — clear them.
       // Record the authoritative deny so any late duplicate rebroadcasts deny.
+      // Use pending.* (server-trusted) instead of frame.* (client-supplied).
       this._recordSettlement(frame.requestId, {
         behavior: 'deny',
-        channel: frame.channel,
-        peer: frame.peer,
+        channel: pending.channel,
+        peer: pending.peer,
         sessionKey: pending.sessionKey,
       })
-      this._broadcastPermissionSettled(peerKey, {
+      this._broadcastPermissionSettled(pending.peerKey, {
         sessionKey: pending.sessionKey,
-        channel: frame.channel,
-        peer: frame.peer,
+        channel: pending.channel,
+        peer: pending.peer,
         requestId: frame.requestId,
         behavior: 'deny',
         reason: 'disconnect',
       })
       return
     }
-    // Allow: pass original input so CCB doesn't receive an empty object
-    const response = frame.behavior === 'allow'
-      ? { behavior: 'allow' as const, updatedInput: pending.input, toolUseID: pending.toolUseId }
-      : { behavior: 'deny' as const, message: frame.message || 'User denied', toolUseID: pending.toolUseId }
+    // Build the updatedInput that will be passed to CCB.
+    // Default: preserve original input so CCB doesn't receive an empty object.
+    // Tool-specific exception: AskUserQuestion lets the client merge in
+    // `answers` / `annotations` — we validate & whitelist them first so a
+    // compromised client can't inject arbitrary keys into the tool payload.
+    //
+    // `effectiveBehavior` starts at frame.behavior but can be downgraded to
+    // 'deny' if the AskUserQuestion sanitizer finds nothing usable in the
+    // client-supplied updatedInput. Silently allowing an empty-answers
+    // AskUserQuestion turn would pass the tool call through with zero
+    // answers and leave the model wondering what the user said — far
+    // harder to diagnose than an explicit deny.
+    let forwardedInput: Record<string, unknown> = pending.input
+    let effectiveBehavior: 'allow' | 'deny' = frame.behavior
+    let effectiveMessage = frame.message
+    // AskUserQuestion allow *requires* valid client-supplied answers. If the
+    // client forgot to send updatedInput (buggy tab), sent a non-object, or
+    // sent one whose fields all fail whitelist, we must downgrade to deny —
+    // otherwise CCB receives an empty-answers AskUserQuestion turn and the
+    // model has no idea why the user didn't answer. We run this branch
+    // *unconditionally* when the tool is AskUserQuestion + behavior=allow;
+    // the sanitizer itself handles every shape of bad input.
+    if (frame.behavior === 'allow' && pending.toolName === 'AskUserQuestion') {
+      const rawCandidate =
+        frame.updatedInput && typeof frame.updatedInput === 'object' && !Array.isArray(frame.updatedInput)
+          ? frame.updatedInput
+          : {}
+      const sanitized = sanitizeAskUserQuestionUpdatedInput(pending.input, rawCandidate)
+      if (sanitized === null) {
+        this.log.warn('AskUserQuestion allow without valid answers — denying', {
+          requestId: frame.requestId,
+          receivedUpdatedInput: typeof frame.updatedInput,
+        })
+        effectiveBehavior = 'deny'
+        effectiveMessage = 'No valid answers supplied'
+      } else {
+        forwardedInput = sanitized
+      }
+    }
+    const response = effectiveBehavior === 'allow'
+      ? { behavior: 'allow' as const, updatedInput: forwardedInput, toolUseID: pending.toolUseId }
+      : { behavior: 'deny' as const, message: effectiveMessage || 'User denied', toolUseID: pending.toolUseId }
     const ok = session.runner.sendPermissionResponse(frame.requestId, response)
     this.log.info('permission response', {
       requestId: frame.requestId,
-      behavior: frame.behavior,
+      behavior: effectiveBehavior,
+      clientBehavior: frame.behavior,
       ok,
+      toolName: pending.toolName,
+      askUserQuestionMerged:
+        pending.toolName === 'AskUserQuestion' && forwardedInput !== pending.input,
     })
     // Record the authoritative result BEFORE broadcasting so any late
     // duplicate response that arrives between here and the broadcast round
-    // will see the correct behavior.
+    // will see the correct behavior. Use pending.* so late duplicates replay
+    // the server-trusted peer identity, not whatever the current client sent.
+    // effectiveBehavior may differ from frame.behavior when the AskUserQuestion
+    // sanitizer downgraded a malformed allow to deny — record the downgrade
+    // so other tabs see the truth.
+    //
+    // For AskUserQuestion allow we also record + broadcast the sanitized
+    // answers so other tabs can fill in their permission card correctly
+    // (without having the user re-enter anything) and the sender tab can
+    // reconcile its optimistic state if the gateway-visible answers ever
+    // differ from what the tab cached locally.
+    const settledAnswers =
+      effectiveBehavior === 'allow' &&
+      pending.toolName === 'AskUserQuestion' &&
+      forwardedInput !== pending.input &&
+      (forwardedInput as { answers?: unknown }).answers &&
+      typeof (forwardedInput as { answers?: unknown }).answers === 'object'
+        ? ((forwardedInput as { answers: Record<string, string> }).answers)
+        : undefined
     this._recordSettlement(frame.requestId, {
-      behavior: frame.behavior,
-      channel: frame.channel,
-      peer: frame.peer,
+      behavior: effectiveBehavior,
+      channel: pending.channel,
+      peer: pending.peer,
       sessionKey: pending.sessionKey,
+      ...(settledAnswers ? { answers: settledAnswers } : {}),
     })
     // Tell every tab attached to this peer (including the sender) that the
-    // request is resolved. The sender hitting its own settled frame is a
-    // no-op: it already cleared the modal locally. Other tabs dismiss their
-    // stuck prompt with the actual behavior.
-    this._broadcastPermissionSettled(peerKey, {
+    // request is resolved. Other tabs dismiss their stuck prompt with the
+    // actual behavior. The sender tab previously treated this as a no-op,
+    // but now uses the broadcast to reconcile optimistic state (especially
+    // important when the gateway downgraded allow→deny).
+    this._broadcastPermissionSettled(pending.peerKey, {
       sessionKey: pending.sessionKey,
-      channel: frame.channel,
-      peer: frame.peer,
+      channel: pending.channel,
+      peer: pending.peer,
       requestId: frame.requestId,
-      behavior: frame.behavior,
+      behavior: effectiveBehavior,
       reason: 'remote',
+      ...(settledAnswers ? { answers: settledAnswers } : {}),
     })
   }
 
-  /** Broadcast a settlement event to all WS clients at a peerKey. */
+  /** Broadcast a settlement event to all WS clients at a peerKey.
+   *  `answers` is only set for AskUserQuestion allow settlements — lets
+   *  other tabs render the collected answers in the permission card, and
+   *  lets the sender tab keep its optimistic state in sync if we later
+   *  switch semantics (e.g. if answers get server-side post-processing). */
   private _broadcastPermissionSettled(
     peerKey: string,
     payload: {
@@ -2672,6 +2759,7 @@ export class Gateway {
       requestId: string
       behavior: 'allow' | 'deny'
       reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+      answers?: Record<string, string>
     },
   ): void {
     const clients = this.clientsByPeer.get(peerKey)
@@ -2685,7 +2773,9 @@ export class Gateway {
     }
   }
 
-  /** Record an authoritative settlement for later replay to late duplicates. */
+  /** Record an authoritative settlement for later replay to late duplicates.
+   *  `answers` is carried so that a 3rd tab hitting the already-settled
+   *  replay path still sees the collected AskUserQuestion answers. */
   private _recordSettlement(
     requestId: string,
     entry: {
@@ -2693,6 +2783,7 @@ export class Gateway {
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
       sessionKey: string
+      answers?: Record<string, string>
     },
   ): void {
     // FIFO evict (Map preserves insertion order) to cap memory under burst load.
@@ -2710,6 +2801,7 @@ export class Gateway {
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
     sessionKey: string
+    answers?: Record<string, string>
   } | null {
     const e = this._recentSettlements.get(requestId)
     if (!e) return null
@@ -2717,7 +2809,13 @@ export class Gateway {
       this._recentSettlements.delete(requestId)
       return null
     }
-    return { behavior: e.behavior, channel: e.channel, peer: e.peer, sessionKey: e.sessionKey }
+    return {
+      behavior: e.behavior,
+      channel: e.channel,
+      peer: e.peer,
+      sessionKey: e.sessionKey,
+      answers: e.answers,
+    }
   }
 
   /** Shared auto-deny + settle + broadcast for one pending permission entry.
@@ -3317,6 +3415,7 @@ export class Gateway {
             // Register pending request for single-settlement + disconnect auto-deny
             this._pendingPermissions.set(e.request.requestId, {
               sessionKey,
+              toolName: e.request.toolName,
               input: e.request.input,
               toolUseId: e.request.toolUseId,
               peerKey,
@@ -3374,6 +3473,124 @@ export class Gateway {
         ws.send(data)
       } catch {}
     }
+  }
+}
+
+// ── AskUserQuestion updatedInput sanitizer ──
+
+/**
+ * Hard cap on individual answer / notes / preview string length. Matches the
+ * rough upper bound of a reasonable user reply; anything larger is almost
+ * certainly abuse / a hostile client trying to blow up the forwarded payload.
+ */
+const ASK_USER_QUESTION_STRING_MAX_LEN = 8192
+
+/**
+ * Sanitize a client-supplied `updatedInput` for the AskUserQuestion tool.
+ *
+ * The frontend sends `{ answers: { [questionText]: string }, annotations?: {
+ * [questionText]: { preview?: string, notes?: string } } }` merged into a
+ * copy of the original input. We must not forward arbitrary client data to
+ * CCB: an attacker that compromises the websocket could otherwise smuggle
+ * tool-schema extras through this path.
+ *
+ * Rules enforced here (matches the LLM-visible shape of the original CCB
+ * `AskUserQuestion` schema):
+ *   - Ignore every top-level key in `raw` that is not `answers` or
+ *     `annotations`; the rest of the payload is inherited verbatim from the
+ *     server-trusted `pending.input`.
+ *   - `answers` keys must equal the exact `question` text of one of the
+ *     pending questions (CCB uses the question string as the map key).
+ *   - `answers` values must be strings, ≤ `ASK_USER_QUESTION_STRING_MAX_LEN`.
+ *   - `annotations` keys must also be valid question texts.
+ *   - `annotations[q].preview` must equal one of that question's
+ *     `options[].preview` — the client is not allowed to invent preview text.
+ *   - `annotations[q].notes` must be a short string if provided.
+ *
+ * Returns `null` when no valid `answers` or `annotations` entries survive
+ * sanitization — the caller should treat this as a client error and deny
+ * the permission request. (Silently forwarding `pending.input` with empty
+ * answers would leave the model unable to tell why the user didn't answer.)
+ */
+export function sanitizeAskUserQuestionUpdatedInput(
+  pendingInput: Record<string, unknown>,
+  raw: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const questions = Array.isArray((pendingInput as { questions?: unknown }).questions)
+    ? ((pendingInput as { questions: unknown[] }).questions as unknown[])
+    : []
+  // Map question text → allowed preview strings for that question.
+  const previewsByQuestion = new Map<string, Set<string>>()
+  const validQuestionTexts = new Set<string>()
+  for (const q of questions) {
+    if (!q || typeof q !== 'object') continue
+    const questionText = (q as { question?: unknown }).question
+    if (typeof questionText !== 'string' || questionText.length === 0) continue
+    validQuestionTexts.add(questionText)
+    const previews = new Set<string>()
+    const options = (q as { options?: unknown }).options
+    if (Array.isArray(options)) {
+      for (const opt of options) {
+        if (!opt || typeof opt !== 'object') continue
+        const preview = (opt as { preview?: unknown }).preview
+        if (typeof preview === 'string' && preview.length > 0) previews.add(preview)
+      }
+    }
+    previewsByQuestion.set(questionText, previews)
+  }
+
+  // answers
+  const sanitizedAnswers: Record<string, string> = {}
+  const rawAnswers = (raw as { answers?: unknown }).answers
+  if (rawAnswers && typeof rawAnswers === 'object' && !Array.isArray(rawAnswers)) {
+    for (const [k, v] of Object.entries(rawAnswers as Record<string, unknown>)) {
+      if (!validQuestionTexts.has(k)) continue
+      if (typeof v !== 'string') continue
+      if (v.length > ASK_USER_QUESTION_STRING_MAX_LEN) continue
+      // Reject blank answers: a whitespace-only string is indistinguishable
+      // from "user didn't answer this" for the model, so we treat both as
+      // absent. This matches CCB native `AskUserQuestionPermissionRequest`
+      // which requires a non-empty selection before enabling submit.
+      if (v.trim().length === 0) continue
+      sanitizedAnswers[k] = v
+    }
+  }
+
+  // annotations
+  const sanitizedAnnotations: Record<string, { preview?: string; notes?: string }> = {}
+  const rawAnnotations = (raw as { annotations?: unknown }).annotations
+  if (rawAnnotations && typeof rawAnnotations === 'object' && !Array.isArray(rawAnnotations)) {
+    for (const [k, v] of Object.entries(rawAnnotations as Record<string, unknown>)) {
+      if (!validQuestionTexts.has(k)) continue
+      if (!v || typeof v !== 'object' || Array.isArray(v)) continue
+      const out: { preview?: string; notes?: string } = {}
+      const preview = (v as { preview?: unknown }).preview
+      if (typeof preview === 'string' && preview.length <= ASK_USER_QUESTION_STRING_MAX_LEN) {
+        const allowed = previewsByQuestion.get(k)
+        if (allowed && allowed.has(preview)) out.preview = preview
+      }
+      const notes = (v as { notes?: unknown }).notes
+      if (typeof notes === 'string' && notes.length > 0 && notes.length <= ASK_USER_QUESTION_STRING_MAX_LEN) {
+        out.notes = notes
+      }
+      if (out.preview !== undefined || out.notes !== undefined) {
+        sanitizedAnnotations[k] = out
+      }
+    }
+  }
+
+  const hasAnswers = Object.keys(sanitizedAnswers).length > 0
+  const hasAnnotations = Object.keys(sanitizedAnnotations).length > 0
+  // Require at least one real answer — annotations alone are not a valid
+  // submission (the model needs answers, annotations are auxiliary). A
+  // client that sent only annotations (or nothing valid) is either buggy
+  // or hostile; silently falling back to pending.input would forward an
+  // empty-answer AskUserQuestion turn.
+  if (!hasAnswers) return null
+  return {
+    ...pendingInput,
+    answers: sanitizedAnswers,
+    ...(hasAnnotations ? { annotations: sanitizedAnnotations } : {}),
   }
 }
 

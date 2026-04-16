@@ -12,12 +12,44 @@ export function setWsDeps(deps) {
 
 // ── Module-private state ──
 let _reconnectAttempts = 0
-// Tracks `navigator.onLine`. When false, we short-circuit reconnect scheduling
-// (both in connect() and ws.onclose) so a lid-closed laptop or unplugged
-// ethernet doesn't double the backoff delay on every failed attempt. When it
-// flips back to true the browser fires `online`, which calls
-// notifyNetworkOnline() to reset attempts and reconnect immediately.
-let _isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false
+// Tracks whether the browser believes it has network. When false, we
+// short-circuit reconnect scheduling (both in connect() and ws.onclose) so a
+// lid-closed laptop or unplugged ethernet doesn't double the backoff delay
+// on every failed attempt. When it flips back to true the browser fires
+// `online`, which calls notifyNetworkOnline() to reset attempts and
+// reconnect immediately.
+//
+// IMPORTANT: initialized optimistically to `true`, NOT from `navigator.onLine`.
+// Chrome (especially with enterprise policies, VPN/proxy extensions, or
+// virtual NICs) can report `navigator.onLine === false` at page load even
+// though the machine can clearly reach the server — we observed this on a
+// user's Chrome where all other browsers on the same machine connected fine.
+// If we trusted that initial false, `connect()` would short-circuit before
+// attempting a WebSocket, `ws.onopen` would never fire to correct the flag,
+// and the UI would be permanently stuck at '离线'. Trust `navigator.onLine`
+// only via the `offline`/`online` *events* (which fire on actual transitions
+// and are more reliable than the initial property read). The worst case of
+// this optimism — machine has zero network at page load — gracefully
+// degrades into the normal reconnect-backoff path (capped at 30s + jitter)
+// instead of the static '离线' UI, which is an acceptable trade.
+let _isBrowserOnline = true
+// Latch for `offline` events that arrive while the WebSocket is still OPEN.
+// Stored as the timestamp (ms) of the most recent deferred offline signal;
+// 0 means no latch. `navigator.onLine` misfires on mobile/VPN/background,
+// so notifyNetworkOffline refuses to flip the UI to '离线' when WS is live.
+// If a real disconnect is happening, ws.onclose fires within a short window
+// after the `offline` event; only closes within OFFLINE_LATCH_GRACE_MS of
+// the latched offline commit it into `_isBrowserOnline = false`. Later,
+// unrelated closes (server restart, proxy flap, backgrounded socket invalidated
+// after a tab resumes) MUST NOT be retroactively treated as "the offline was
+// real" — they clear the latch without promoting it. Cleared by ws.onopen
+// and notifyNetworkOnline (both confirm connectivity).
+let _pendingBrowserOfflineAt = 0
+// Window during which a ws.onclose can confirm a deferred `offline` event.
+// Chosen well above the 30s client keepalive interval + TCP teardown jitter,
+// but short enough that a long-lived socket closed hours later for unrelated
+// reasons doesn't inherit an ancient offline signal.
+const OFFLINE_LATCH_GRACE_MS = 60_000
 // Debounce for visibility-triggered immediate reconnects — mobile focus flips
 // can fire visibilitychange rapidly and we don't want to spam connect().
 let _lastVisibilityReconnectAt = 0
@@ -454,6 +486,21 @@ export function stopCurrentTurn() {
 // notifyNetworkOnline() will reconnect immediately.
 export function notifyNetworkOffline() {
   if (!_isBrowserOnline) return
+  // If WS is currently OPEN, treat the `offline` signal as provisional —
+  // `navigator.onLine` misfires on mobile/VPN/background and a live WS is
+  // stronger evidence. Latch the signal instead of acting on it now:
+  //   - Don't flip UI to '离线' (avoids the stuck-'离线'-while-chatting bug).
+  //   - Don't set _isBrowserOnline = false (avoids cancelling a legitimate
+  //     reconnect in-flight).
+  //   - Don't close WS.
+  // If the disconnect was real, ws.onclose will fire shortly and will
+  // commit the latch into _isBrowserOnline, correctly pausing backoff.
+  // If it was a spurious offline, ws.onopen (still OPEN, no close) or a
+  // later `online` event will clear the latch harmlessly.
+  if (state.ws && state.ws.readyState === 1) {
+    _pendingBrowserOfflineAt = Date.now()
+    return
+  }
   _isBrowserOnline = false
   if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
   if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
@@ -464,7 +511,22 @@ export function notifyNetworkOffline() {
 // counter so a fresh network window gets a fresh backoff budget, then
 // reconnect immediately if we're not already connected.
 export function notifyNetworkOnline() {
-  if (_isBrowserOnline) return // guard against duplicate events
+  // A fresh `online` event invalidates any latched offline signal: even if
+  // we short-circuited the UI flip earlier (WS was OPEN), the browser is
+  // now re-affirming network availability, so a later WS close should NOT
+  // be treated as a real-offline case.
+  _pendingBrowserOfflineAt = 0
+  // NOTE: Previously this function had `if (_isBrowserOnline) return` as a
+  // duplicate-event guard. That guard became a bug once we switched to the
+  // optimistic `_isBrowserOnline = true` initialization: when the machine
+  // boots with no network, `connect()` attempts anyway, fails, and enters
+  // backoff without anything ever flipping `_isBrowserOnline` to false
+  // (the browser may not fire `offline` for "already offline at load").
+  // The `online` event that later signals real recovery would then be
+  // swallowed, leaving the user stuck waiting out the current backoff
+  // timer (up to 30s) instead of reconnecting immediately. Dedupe is now
+  // handled by the `state.ws.readyState < 2` guard below, which is
+  // idempotent for truly duplicate events.
   _isBrowserOnline = true
   if (!state.token) return
   _reconnectAttempts = 0
@@ -509,6 +571,15 @@ export function connect() {
   state.ws = ws
   ws.onopen = () => {
     _reconnectAttempts = 0
+    // A successful WebSocket handshake is proof the network is reachable,
+    // so clear any stale `_isBrowserOnline = false` left by a spurious
+    // `offline` event (mobile network hand-offs, VPN/proxy flaps, and some
+    // Chromium backgrounding paths can fire `offline` without a matching
+    // `online`, leaving the UI stuck on '离线' even though the WS is alive).
+    // Also drop any latched offline signal — onopen proves the prior
+    // offline event was spurious (network is clearly up).
+    _isBrowserOnline = true
+    _pendingBrowserOfflineAt = 0
     if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
     setStatus('已连接', 'connected')
     // Restore UI state for the current session if it was mid-turn before disconnect
@@ -627,6 +698,25 @@ export function connect() {
     if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
     // Don't auto-reconnect if logged out (no token)
     if (!state.token) return
+    // A `offline` event that arrived while WS was still OPEN is only
+    // "confirmed real" if this close happens within a short grace window
+    // after it, OR the browser still reports navigator.onLine === false
+    // right now. The latter rescues the "system/tab was suspended for
+    // minutes, so Date.now() elapsed ≫ grace, but the machine is still
+    // disconnected" case — without it we'd drop a real-offline latch and
+    // burn exponential backoff against no network. Stale latches where
+    // the browser is back online (unrelated later closes: server restart,
+    // proxy flap, backgrounded socket invalidated on resume) are still
+    // discarded. A promoted latch flips `_isBrowserOnline = false`, which
+    // the reconnect-gate below honors to pause backoff until `online`.
+    if (_pendingBrowserOfflineAt > 0) {
+      const elapsed = Date.now() - _pendingBrowserOfflineAt
+      const browserStillOffline = typeof navigator !== 'undefined' && navigator.onLine === false
+      _pendingBrowserOfflineAt = 0
+      if (browserStillOffline || elapsed <= OFFLINE_LATCH_GRACE_MS) {
+        _isBrowserOnline = false
+      }
+    }
     // Don't auto-reconnect while browser reports offline — wait for `online`
     // event (notifyNetworkOnline) to trigger reconnect. Otherwise we'd burn
     // reconnect attempts (each doubling the backoff) against no network.
@@ -1157,8 +1247,21 @@ function handlePermissionRequest(frame) {
     _resolved: false,
   })
 
-  // Build and show modal overlay
-  _showPermissionModal(frame, sess, msg)
+  // AskUserQuestion needs a dedicated answer-collection UI; the generic
+  // Allow/Deny dialog can't convey the question list and options. We pass
+  // selected answers back through the same `inbound.permission_response`
+  // channel via `updatedInput` — gateway applies sanitizeAskUserQuestionUpdatedInput
+  // before forwarding to CCB.
+  if (
+    frame.toolName === 'AskUserQuestion' &&
+    Array.isArray(frame.inputJson?.questions) &&
+    frame.inputJson.questions.length > 0
+  ) {
+    _showAskUserQuestionModal(frame, sess, msg)
+  } else {
+    // Build and show modal overlay
+    _showPermissionModal(frame, sess, msg)
+  }
 
   // Play notification sound
   _notifSound()
@@ -1167,41 +1270,7 @@ function handlePermissionRequest(frame) {
 function _showPermissionModal(frame, sess, msg) {
   // If another permission modal is already showing, deny the OLD one first
   // (only one modal can be visible at a time in the UI)
-  const existing = document.getElementById('permission-modal')
-  if (existing) {
-    const oldRequestId = existing.dataset.requestId
-    if (oldRequestId && _pendingPermissions.has(oldRequestId)) {
-      const old = _pendingPermissions.get(oldRequestId)
-      if (old.timer) clearInterval(old.timer)
-      // Auto-deny the displaced prompt — use the OLD frame's peer/agent
-      if (state.ws && state.ws.readyState === 1 && old.frame) {
-        const oldPeerId = old.frame.peer?.id
-        const oldSess = oldPeerId ? state.sessions.get(oldPeerId) : null
-        try {
-          state.ws.send(JSON.stringify({
-            type: 'inbound.permission_response',
-            channel: old.frame.channel || 'webchat',
-            peer: old.frame.peer,
-            agentId: oldSess?.agentId || state.defaultAgentId,
-            requestId: oldRequestId,
-            behavior: 'deny',
-            message: 'Displaced by newer permission prompt',
-          }))
-        } catch {}
-        // Update the old permission card in its own session
-        if (oldSess) {
-          const oldMsg = oldSess.messages.find(m => m.requestId === oldRequestId)
-          if (oldMsg) {
-            oldMsg._resolved = true
-            oldMsg._behavior = 'deny'
-            if (oldSess.id === state.currentSessionId) _deps.updateMessageEl(oldMsg)
-          }
-        }
-      }
-      _pendingPermissions.delete(oldRequestId)
-    }
-    existing.remove()
-  }
+  _displaceExistingPermissionModal()
 
   const toolName = htmlSafeEscape(frame.toolName || 'unknown')
   const preview = htmlSafeEscape((frame.inputPreview || '').slice(0, 300))
@@ -1266,10 +1335,12 @@ function _showPermissionModal(frame, sess, msg) {
   _pendingPermissions.set(frame.requestId, { frame, el: overlay, timer: countdown })
 }
 
-function _resolvePermission(frame, behavior, message, sess, msg, overlay) {
-  // Send response via WebSocket
+function _resolvePermission(frame, behavior, message, sess, msg, overlay, extras) {
+  // Send response via WebSocket. `extras` is only passed by AskUserQuestion
+  // (carries `updatedInput` + cached `answers` for local card replay) and is
+  // otherwise ignored for the generic Allow/Deny flow.
   if (state.ws && state.ws.readyState === 1) {
-    state.ws.send(JSON.stringify({
+    const payload = {
       type: 'inbound.permission_response',
       channel: frame.channel || 'webchat',
       peer: frame.peer,
@@ -1277,19 +1348,369 @@ function _resolvePermission(frame, behavior, message, sess, msg, overlay) {
       requestId: frame.requestId,
       behavior,
       message: message || undefined,
-    }))
+    }
+    if (extras && extras.updatedInput && behavior === 'allow') {
+      payload.updatedInput = extras.updatedInput
+    }
+    state.ws.send(JSON.stringify(payload))
   }
 
   // Update message in chat
   if (msg) {
     msg._resolved = true
     msg._behavior = behavior
+    if (extras && extras.answers && behavior === 'allow') {
+      msg._answers = extras.answers
+    }
     if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
   }
 
   // Remove modal
   if (overlay) overlay.remove()
   _pendingPermissions.delete(frame.requestId)
+}
+
+// ═══════════════ AskUserQuestion MODAL ═══════════════
+// Rendered instead of the generic Allow/Deny modal when CCB asks the user
+// a multiple-choice question. Mirrors the native CCB UX (`QuestionView` /
+// `SubmitQuestionsView`) with three question shapes:
+//
+//   1. preview question  — non-multiSelect + any option has `preview`:
+//      option click shows `option.preview` in a side pane. No "Other" option.
+//   2. multi-select     — `multiSelect === true`: checkbox-style toggles,
+//      answer = selected labels joined by ", ". No "Other" option.
+//   3. plain single     — otherwise: radio-style, with a trailing "Other"
+//      choice that expands a free-text input.
+//
+// Submit builds `{ answers, annotations }` and sends it as `updatedInput`
+// merged onto the original input. Gateway's sanitizeAskUserQuestionUpdatedInput
+// drops any keys not in the original question set and rejects preview values
+// that don't match an option's preview. Answers are comma-joined for
+// multi-select, matching CCB's `label.join(", ")` contract.
+function _showAskUserQuestionModal(frame, sess, msg) {
+  // Displace any existing modal (permission or AskUserQuestion) so only one
+  // is visible at a time — reuses the same displacement logic the generic
+  // modal does, with a deny for the pre-existing prompt.
+  _displaceExistingPermissionModal()
+
+  // Filter out malformed questions (missing question text) so state_q keys
+  // stay well-defined. The route dispatch already asserts the array is
+  // non-empty, but CCB per-question shape isn't enforced upstream.
+  const questions = frame.inputJson.questions.filter(
+    (q) => q && typeof q.question === 'string' && q.question.length > 0,
+  )
+  if (questions.length === 0) {
+    // No usable questions — fall back to the generic permission modal so
+    // the user still has an allow/deny choice rather than a silent stall.
+    _showPermissionModal(frame, sess, msg)
+    return
+  }
+  // Per-question UI state, keyed by question text (CCB's canonical key).
+  // { selectedLabels: Set<string>, otherText: string }
+  const state_q = new Map()
+  for (const q of questions) {
+    state_q.set(q.question, { selectedLabels: new Set(), otherText: '' })
+  }
+  // Which question is focused (drives the preview pane for preview questions).
+  let activeIdx = 0
+
+  const overlay = document.createElement('div')
+  overlay.id = 'permission-modal'
+  overlay.dataset.requestId = frame.requestId
+  overlay.className = 'permission-modal-overlay'
+
+  const modal = document.createElement('div')
+  modal.className = 'permission-modal aq-modal'
+  overlay.appendChild(modal)
+
+  const header = document.createElement('div')
+  header.className = 'aq-header'
+  header.innerHTML =
+    `<div class="aq-header-icon">` +
+    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 100 20 10 10 0 000-20zM10 8a2 2 0 114 0c0 1-1 1.5-1.5 2s-.5 1-.5 1.5"/><circle cx="12" cy="17" r="0.6" fill="currentColor"/></svg>` +
+    `</div>` +
+    `<div class="aq-header-title">用户问答</div>` +
+    `<div class="aq-header-sub">${questions.length > 1 ? `共 ${questions.length} 题` : '请回答以下问题'}</div>`
+  modal.appendChild(header)
+
+  const body = document.createElement('div')
+  body.className = 'aq-body'
+  modal.appendChild(body)
+
+  // Build one section per question. Defensive: treat a missing / non-array
+  // `options` as an empty list rather than letting `.some/.filter/.find`
+  // throw. CCB's schema guarantees an array, but a corrupted tool payload
+  // (or a gateway that ever relaxes its forwarder) shouldn't brick the UI.
+  questions.forEach((q, idx) => {
+    const optionsArray = Array.isArray(q.options) ? q.options : []
+    const hasPreview = !q.multiSelect && optionsArray.some((o) => o && typeof o.preview === 'string' && o.preview.length > 0)
+    const section = document.createElement('section')
+    section.className = 'aq-question'
+    if (hasPreview) section.classList.add('aq-has-preview')
+    if (q.multiSelect) section.classList.add('aq-multi')
+    section.dataset.qIdx = String(idx)
+    section.addEventListener('focusin', () => {
+      activeIdx = idx
+    })
+
+    const chip = document.createElement('div')
+    chip.className = 'aq-chip'
+    chip.textContent = q.header || ''
+    section.appendChild(chip)
+
+    const title = document.createElement('div')
+    title.className = 'aq-qtext'
+    title.textContent = q.question
+    section.appendChild(title)
+
+    const grid = document.createElement('div')
+    grid.className = 'aq-options'
+    section.appendChild(grid)
+
+    // Optional preview pane (only for preview questions)
+    let previewPane = null
+    if (hasPreview) {
+      previewPane = document.createElement('pre')
+      previewPane.className = 'aq-preview-pane'
+      previewPane.textContent = ''
+      section.appendChild(previewPane)
+    }
+
+    const qState = state_q.get(q.question)
+    // Filter out any option whose label collides with our internal "Other"
+    // sentinel. CCB's tool prompt forbids the model from generating "Other"
+    // itself, but we still defend against a model that violates the prompt
+    // so the sentinel stays unambiguous on submit. Uses `optionsArray` so
+    // a non-array `options` yields [] instead of throwing.
+    const safeOptions = optionsArray.filter((o) => o && o.label !== '__other__')
+    const renderOptionButtons = () => {
+      grid.innerHTML = ''
+      safeOptions.forEach((opt) => {
+        const btn = document.createElement('button')
+        btn.type = 'button'
+        btn.className = 'aq-option'
+        const isSelected = qState.selectedLabels.has(opt.label)
+        if (isSelected) btn.classList.add('selected')
+        if (q.multiSelect) btn.classList.add('multi')
+        btn.innerHTML =
+          `<span class="aq-option-marker"></span>` +
+          `<span class="aq-option-body">` +
+          `<span class="aq-option-label">${htmlSafeEscape(opt.label || '')}</span>` +
+          (opt.description ? `<span class="aq-option-desc">${htmlSafeEscape(opt.description)}</span>` : '') +
+          `</span>`
+        btn.addEventListener('click', () => {
+          activeIdx = idx
+          if (q.multiSelect) {
+            if (qState.selectedLabels.has(opt.label)) qState.selectedLabels.delete(opt.label)
+            else qState.selectedLabels.add(opt.label)
+          } else {
+            qState.selectedLabels.clear()
+            qState.selectedLabels.add(opt.label)
+            qState.otherText = ''
+            if (otherInput) otherInput.value = ''
+          }
+          if (previewPane) {
+            previewPane.textContent = typeof opt.preview === 'string' ? opt.preview : ''
+          }
+          renderOptionButtons()
+          updateOtherVisibility()
+        })
+        grid.appendChild(btn)
+      })
+    }
+    renderOptionButtons()
+
+    // Trailing "Other" for plain single-choice (non-preview, non-multiSelect).
+    // Matches CCB native behavior: preview questions and multi-select don't get Other.
+    let otherBtn = null
+    let otherInput = null
+    const updateOtherVisibility = () => {
+      if (!otherBtn) return
+      const isOtherSelected = qState.selectedLabels.has('__other__')
+      otherBtn.classList.toggle('selected', isOtherSelected)
+      if (otherInput) otherInput.classList.toggle('aq-hidden', !isOtherSelected)
+    }
+    if (!hasPreview && !q.multiSelect) {
+      otherBtn = document.createElement('button')
+      otherBtn.type = 'button'
+      otherBtn.className = 'aq-option aq-option-other'
+      otherBtn.innerHTML =
+        `<span class="aq-option-marker"></span>` +
+        `<span class="aq-option-body">` +
+        `<span class="aq-option-label">其他</span>` +
+        `<span class="aq-option-desc">自行输入答案</span>` +
+        `</span>`
+      otherBtn.addEventListener('click', () => {
+        activeIdx = idx
+        qState.selectedLabels.clear()
+        qState.selectedLabels.add('__other__')
+        renderOptionButtons()
+        updateOtherVisibility()
+        if (otherInput) otherInput.focus()
+      })
+      grid.appendChild(otherBtn)
+
+      otherInput = document.createElement('input')
+      otherInput.type = 'text'
+      otherInput.className = 'aq-other-input aq-hidden'
+      otherInput.placeholder = '输入你的答案…'
+      otherInput.maxLength = 2000
+      otherInput.addEventListener('input', () => {
+        qState.otherText = otherInput.value
+      })
+      section.appendChild(otherInput)
+    }
+
+    body.appendChild(section)
+  })
+
+  const footer = document.createElement('div')
+  footer.className = 'aq-footer'
+  footer.innerHTML =
+    `<div class="aq-footer-timer" aria-hidden="true"></div>` +
+    `<div class="aq-footer-actions">` +
+    `<button type="button" class="permission-btn permission-btn-deny aq-btn-skip">跳过</button>` +
+    `<button type="button" class="permission-btn permission-btn-allow aq-btn-submit">提交</button>` +
+    `</div>`
+  modal.appendChild(footer)
+
+  document.body.appendChild(overlay)
+
+  // Auto-deny after 180s if no response (slightly longer than the generic
+  // modal's 120s because a multi-question interview takes longer to read).
+  const timerEl = footer.querySelector('.aq-footer-timer')
+  let remaining = 180
+  timerEl.textContent = `${remaining}s`
+  const countdown = setInterval(() => {
+    remaining--
+    timerEl.textContent = `${remaining}s`
+    if (remaining <= 0) {
+      clearInterval(countdown)
+      _resolvePermission(frame, 'deny', 'Timed out', sess, msg, overlay)
+    }
+  }, 1000)
+
+  footer.querySelector('.aq-btn-skip').addEventListener('click', () => {
+    clearInterval(countdown)
+    _resolvePermission(frame, 'deny', 'User skipped', sess, msg, overlay)
+  })
+
+  footer.querySelector('.aq-btn-submit').addEventListener('click', () => {
+    const result = _aqCollectAnswers(questions, state_q)
+    if (!result.ok) {
+      // Flash the first unanswered question section
+      const missingSection = body.querySelector(`[data-q-idx="${result.missingIdx}"]`)
+      if (missingSection) {
+        missingSection.classList.add('aq-flash')
+        setTimeout(() => missingSection.classList.remove('aq-flash'), 600)
+        missingSection.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+      return
+    }
+    clearInterval(countdown)
+    const updatedInput = {
+      ...frame.inputJson,
+      answers: result.answers,
+      ...(Object.keys(result.annotations).length > 0 ? { annotations: result.annotations } : {}),
+    }
+    _resolvePermission(frame, 'allow', null, sess, msg, overlay, {
+      updatedInput,
+      answers: result.answers,
+    })
+  })
+
+  _pendingPermissions.set(frame.requestId, { frame, el: overlay, timer: countdown })
+}
+
+/**
+ * Collect `{ answers, annotations }` from modal UI state for all questions.
+ * Returns { ok: false, missingIdx } when any question has no selection,
+ * otherwise { ok: true, answers, annotations }.
+ *
+ * Shape invariants (must match CCB's native submit in
+ * AskUserQuestionPermissionRequest.tsx:381):
+ *   - answers[question] is always a string.
+ *   - multi-select join separator is ", " (comma + space).
+ *   - "Other" label "__other__" is replaced by the user's free text.
+ *   - annotations[question].preview is copied verbatim from the selected
+ *     option's original `preview` field (gateway rejects any value not
+ *     matching an option).
+ */
+function _aqCollectAnswers(questions, state_q) {
+  const answers = {}
+  const annotations = {}
+  for (let idx = 0; idx < questions.length; idx++) {
+    const q = questions[idx]
+    const qs = state_q.get(q.question)
+    const selected = Array.from(qs.selectedLabels)
+    if (selected.length === 0) return { ok: false, missingIdx: idx }
+
+    if (q.multiSelect) {
+      // Multi-select: join by ", ". No "Other" label — CCB native doesn't
+      // offer it here, and we disable it in the UI.
+      answers[q.question] = selected.join(', ')
+    } else {
+      const only = selected[0]
+      if (only === '__other__') {
+        const text = (qs.otherText || '').trim()
+        if (!text) return { ok: false, missingIdx: idx }
+        answers[q.question] = text
+      } else {
+        answers[q.question] = only
+        // Copy the option's preview verbatim; gateway verifies it. Ignore
+        // any option whose label collides with our "Other" sentinel — the
+        // modal filters those out at render time, but belt-and-braces keep
+        // this collector honest if the model defies the prompt contract.
+        // Defensive: treat non-array options as empty to match the UI render path.
+        const opts = Array.isArray(q.options) ? q.options : []
+        const opt = opts.find((o) => o && o.label !== '__other__' && o.label === only)
+        if (opt && typeof opt.preview === 'string' && opt.preview.length > 0) {
+          annotations[q.question] = { preview: opt.preview }
+        }
+      }
+    }
+  }
+  return { ok: true, answers, annotations }
+}
+
+/**
+ * Displace any currently-visible permission modal (generic or AskUserQuestion)
+ * by auto-denying the old request and removing its overlay. Extracted so both
+ * modal openers share identical displacement semantics.
+ */
+function _displaceExistingPermissionModal() {
+  const existing = document.getElementById('permission-modal')
+  if (!existing) return
+  const oldRequestId = existing.dataset.requestId
+  if (oldRequestId && _pendingPermissions.has(oldRequestId)) {
+    const old = _pendingPermissions.get(oldRequestId)
+    if (old.timer) clearInterval(old.timer)
+    if (state.ws && state.ws.readyState === 1 && old.frame) {
+      const oldPeerId = old.frame.peer?.id
+      const oldSess = oldPeerId ? state.sessions.get(oldPeerId) : null
+      try {
+        state.ws.send(JSON.stringify({
+          type: 'inbound.permission_response',
+          channel: old.frame.channel || 'webchat',
+          peer: old.frame.peer,
+          agentId: oldSess?.agentId || state.defaultAgentId,
+          requestId: oldRequestId,
+          behavior: 'deny',
+          message: 'Displaced by newer permission prompt',
+        }))
+      } catch {}
+      if (oldSess) {
+        const oldMsg = oldSess.messages.find((m) => m.requestId === oldRequestId)
+        if (oldMsg) {
+          oldMsg._resolved = true
+          oldMsg._behavior = 'deny'
+          if (oldSess.id === state.currentSessionId) _deps.updateMessageEl(oldMsg)
+        }
+      }
+    }
+    _pendingPermissions.delete(oldRequestId)
+  }
+  existing.remove()
 }
 
 // Broadcast from gateway: a permission request was settled elsewhere (another tab,
@@ -1307,24 +1728,41 @@ function _resolvePermission(frame, behavior, message, sess, msg, overlay) {
 // is sent here — server-side is already resolved; replying would produce a stale
 // response that the "unknown/already-settled request" branch would just rebroadcast.
 // Unknown future reason values are forwarded to the UI verbatim (no enum check).
+//
+// Note: we apply the authoritative settled state EVEN when `_pendingPermissions`
+// is already empty for this request (i.e. when we were the sender and
+// `_resolvePermission` already deleted the entry). That lets the gateway override
+// our optimistic `_behavior` value in two cases:
+//   1. AskUserQuestion allow gets downgraded to deny by the sanitizer.
+//   2. Dead-session path forces a deny.
+// For AskUserQuestion allow, `frame.answers` carries the authoritative answers
+// map so other tabs (who never saw the local submit) can fill in the card.
 function handlePermissionSettled(frame) {
   const p = _pendingPermissions.get(frame.requestId)
-  if (!p) return // already cleared locally (e.g. we were the sender, or a prior broadcast cleared it)
-  if (p.timer) clearInterval(p.timer)
-  // Update the permission card in the session that owns this request (not necessarily the current view)
-  const peerId = p.frame?.peer?.id
-  const sess = peerId ? state.sessions.get(peerId) : null
-  if (sess) {
-    const msg = sess.messages.find((m) => m.requestId === frame.requestId)
-    if (msg) {
-      msg._resolved = true
-      msg._behavior = frame.behavior
-      msg._settledReason = frame.reason || null
-      if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
-    }
+  if (p) {
+    if (p.timer) clearInterval(p.timer)
+    if (p.el) p.el.remove()
+    _pendingPermissions.delete(frame.requestId)
   }
-  if (p.el) p.el.remove()
-  _pendingPermissions.delete(frame.requestId)
+  // Locate the message by peer (frame.peer is server-trusted). Even if local
+  // pending was already cleared by _resolvePermission, the permission card
+  // still lives in the session and may need its optimistic state corrected.
+  const peerId = frame.peer?.id
+  const sess = peerId ? state.sessions.get(peerId) : null
+  if (!sess) return
+  const msg = sess.messages.find((m) => m.requestId === frame.requestId)
+  if (!msg) return
+  msg._resolved = true
+  msg._behavior = frame.behavior
+  msg._settledReason = frame.reason || null
+  // Prefer server-provided answers. Only overwrite locally cached answers
+  // when the frame actually includes them — otherwise preserve what the
+  // sender tab cached (other tabs' frames won't include answers for
+  // non-AskUserQuestion tools).
+  if (frame.answers && typeof frame.answers === 'object') {
+    msg._answers = frame.answers
+  }
+  if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
 }
 
 // Clean up permission modals. If sessId is provided, only clear that session's prompts.
