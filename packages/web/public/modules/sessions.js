@@ -1,6 +1,7 @@
 import { dbDelete, dbPut } from './db.js'
 // OpenClaude — Session management, sidebar, context menu
 import { $, htmlSafeEscape } from './dom.js'
+import { exportSessionDocx } from './export-docx.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
 import { pushSessionToServer, deleteSessionFromServer } from './sync.js'
@@ -141,8 +142,16 @@ export function _rebuildSearchIndex(sess) {
   sess._searchText = `${title} ${parts.join(' ')}`
 }
 
-// Track in-flight save promises per session to serialize writes and allow flush to wait
-const _saveInFlight = new Map() // sessId -> Promise
+// Two-phase save tracking:
+// - _saveInFlight: resolves when the LOCAL dbPut finishes. deleteSession()
+//   awaits this to guarantee its dbDelete() isn't clobbered by a late dbPut().
+//   Must NOT include the network PUT, otherwise deleting a session while a
+//   PUT is slow/hung would stall the delete flow for up to apiFetch's 30s timeout.
+// - _chainTail: full _doSave promise (dbPut + server PUT). _enqueueSave chains
+//   on this so the next _doSave starts only after the previous PUT's response
+//   has updated sess._syncedAt, preventing the 409 storm during streaming.
+const _saveInFlight = new Map() // sessId -> Promise<void> (resolves when dbPut settles)
+const _chainTail = new Map()    // sessId -> Promise<void> (resolves when _doSave fully completes)
 // Sessions that have been deleted — prevents in-flight saves from resurrecting them
 const _deletedIds = new Set()
 
@@ -187,16 +196,19 @@ export function scheduleSaveFromUserEdit(s, immediate) {
 
 function _enqueueSave(sess) {
   if (_deletedIds.has(sess.id)) return
-  // Chain onto any in-flight save for this session to serialize writes.
+  // Chain onto any in-flight save for this session to serialize both the
+  // local dbPut AND the server PUT. Serializing the PUT is what prevents the
+  // 409 storm: the next _doSave starts only after the prior PUT's response
+  // has updated sess._syncedAt, so its own _baseSyncedAt is fresh.
   // Swallow rejections on the previous link so one failed save never
   // poisons the chain — otherwise every subsequent scheduleSave() for this
   // session would silently short-circuit.
-  const prev = _saveInFlight.get(sess.id) || Promise.resolve()
+  const prev = _chainTail.get(sess.id) || Promise.resolve()
   const next = prev.catch(() => {}).then(() => _doSave(sess))
-  _saveInFlight.set(sess.id, next)
+  _chainTail.set(sess.id, next)
   next.finally(() => {
     // Only clear if we're still the latest in the chain
-    if (_saveInFlight.get(sess.id) === next) _saveInFlight.delete(sess.id)
+    if (_chainTail.get(sess.id) === next) _chainTail.delete(sess.id)
   })
 }
 
@@ -261,6 +273,12 @@ async function _doSave(sess) {
   // refresh can restore the in-flight UI and correctly signal inFlight=true
   // in the next hello frame. Staleness is handled at load time.
   const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, ...persist } = sess
+  // Expose a dbPut-only checkpoint promise to deleteSession(). Registered
+  // BEFORE awaiting dbPut so a concurrent deleteSession() synchronously sees
+  // an in-flight local write and can await it before calling dbDelete().
+  let resolveDbDone
+  const dbDone = new Promise((r) => { resolveDbDone = r })
+  _saveInFlight.set(sess.id, dbDone)
   let putError = null
   try {
     await dbPut(persist)
@@ -268,6 +286,8 @@ async function _doSave(sess) {
     putError = e
     console.warn('dbPut', e)
   }
+  resolveDbDone()
+  if (_saveInFlight.get(sess.id) === dbDone) _saveInFlight.delete(sess.id)
   // Re-check after async dbPut: session may have been deleted while we were writing
   if (_deletedIds.has(sess.id)) {
     _clearSaveRetry(sess.id)
@@ -287,8 +307,15 @@ async function _doSave(sess) {
   }
   // Success — clear retry bookkeeping for this session
   _clearSaveRetry(sess.id)
-  // Sync to server for cross-device access (best-effort)
-  pushSessionToServer(sess)
+  // Sync to server for cross-device access (best-effort).
+  //
+  // MUST await: _enqueueSave chains on _chainTail so the next _doSave starts
+  // only after this PUT completes. Without the await, PUTs run in parallel
+  // against a stale `sess._syncedAt`, triggering a 409 storm during streaming.
+  // deleteSession() no longer awaits this promise — it awaits _saveInFlight
+  // (the dbPut-only checkpoint above) — so a slow PUT can't stall delete.
+  // pushSessionToServer swallows its own errors, so awaiting can't reject.
+  await pushSessionToServer(sess)
 }
 
 /**
@@ -348,6 +375,7 @@ export function sanitizeLoadedTurnState(sess) {
 export function cancelSavesForSession(id) {
   _deletedIds.add(id)
   _saveInFlight.delete(id)
+  _chainTail.delete(id)
   const timer = _saveTimers.get(id)
   if (timer) { clearTimeout(timer); _saveTimers.delete(id) }
   // Also drop any outstanding retry bookkeeping for this session
@@ -504,6 +532,7 @@ export function _buildSessionItem(s) {
         },
       },
       { label: '导出 Markdown', run: () => exportSessionMd(s) },
+      { label: '导出 Word (.docx)', run: () => exportSessionDocx(s) },
       { divider: true },
       {
         label: '删除',
@@ -532,6 +561,7 @@ export function _buildSessionItem(s) {
           },
         },
         { label: '导出 Markdown', run: () => exportSessionMd(s) },
+        { label: '导出 Word (.docx)', run: () => exportSessionDocx(s) },
         { divider: true },
         {
           label: '删除',
