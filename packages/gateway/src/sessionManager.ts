@@ -462,6 +462,19 @@ export class SessionManager {
               }
             }
           }
+          // Emit tool.called for metrics / observability.
+          // turnIndex is 1-indexed to match turn.completed semantics:
+          // session.turns is still pre-increment during tool processing
+          // (incremented inside parser._handleResult after this path runs).
+          eventBus.emit('tool.called', createEvent('tool.called', session.agentId, {
+            sessionKey: session.sessionKey,
+            turnIndex: session.turns + 1,
+            toolName: tr.toolName,
+            durationMs: tr.durationMs,
+            isError: tr.isError,
+            inputPreview: tr.inputPreview,
+            outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
+          }))
         },
         onFinish: (result) => {
           detach()

@@ -61,6 +61,12 @@ export class Gateway {
   private log = createLogger({ module: 'gateway' })
   private rateLimiter = new RateLimiter()
   private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
+  private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
+  private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
+  private _pendingPermissionSweepTimer: ReturnType<typeof setInterval> | null = null
+  private _stopEviction: (() => void) | null = null
+  private _shuttingDown = false
+  private _shutdownPromise: Promise<void> | null = null
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
   private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
@@ -131,6 +137,46 @@ export class Gateway {
   private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string }>()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
+  // Pending permission requests: requestId → { sessionKey, input, toolUseId, peerKey, channel, peer }
+  // Used for single-settlement, original-input passthrough, and disconnect auto-deny.
+  // `channel` and `peer` are preserved from the original request so disconnect
+  // auto-deny broadcasts with the correct (unspoofable) peer kind.
+  private _pendingPermissions = new Map<string, {
+    sessionKey: string
+    input: Record<string, unknown>
+    toolUseId?: string
+    peerKey: string
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+    /** Monotonic timestamp (Date.now) at which this request should be auto-denied
+     *  by the janitor even if no disconnect or crash occurred. Prevents orphan
+     *  pending entries when a user leaves the tab open across days. */
+    expiresAt: number
+  }>()
+  /** Max wait for a permission response before the janitor auto-denies.
+   *  Matched to the outer CCB turn timeout (30 min) so we don't pre-empt
+   *  a slow user while a turn is still live. */
+  private static readonly PENDING_PERMISSION_TTL_MS = 30 * 60_000
+  /** How often the janitor scans _pendingPermissions. */
+  private static readonly PENDING_PERMISSION_SWEEP_MS = 60_000
+  // Recently-settled permission requests: requestId → authoritative result.
+  // Used to replay the true `behavior` when a duplicate/late response arrives
+  // after the first responder already won the race. Without this, the
+  // already_settled branch would rebroadcast the LATE responder's behavior,
+  // which could mislabel cards on a 3rd tab that missed the first broadcast.
+  // Bounded by RECENT_SETTLEMENT_MAX (FIFO evict) and RECENT_SETTLEMENT_TTL_MS.
+  private _recentSettlements = new Map<
+    string,
+    {
+      behavior: 'allow' | 'deny'
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+      sessionKey: string
+      ts: number
+    }
+  >()
+  private static readonly RECENT_SETTLEMENT_MAX = 1000
+  private static readonly RECENT_SETTLEMENT_TTL_MS = 5 * 60_000
   // Per-agent last active channel tracking (for proactive push)
   // Track last active channel + session for proactive push (reminders, heartbeat, etc.)
   private lastActiveChannel = new Map<
@@ -171,23 +217,28 @@ export class Gateway {
       const ctx: ChannelContext = {
         dispatch: (frame) => this.dispatchInbound(frame, adapter),
         log: {
-          info: (m, meta) => console.log(`[ch:${adapter.name}] ${m}`, meta ?? ''),
-          error: (m, meta) => console.error(`[ch:${adapter.name}] ${m}`, meta ?? ''),
+          // Channel name last so adapter-supplied meta.channel can't spoof it.
+          info: (m, meta) => this.log.info(m, { ...(meta ?? {}), channel: adapter.name }),
+          error: (m, meta) => this.log.error(m, { ...(meta ?? {}), channel: adapter.name }),
         },
         config: (config.channels as any)[adapter.name] ?? {},
       }
       try {
         await adapter.init(ctx)
         this.channels.set(adapter.name, adapter)
-        console.log(`[gateway] channel "${adapter.name}" ready`)
+        this.log.info('channel ready', { channel: adapter.name })
       } catch (err) {
-        console.error(`[gateway] channel "${adapter.name}" failed to init:`, err)
+        this.log.error('channel failed to init', { channel: adapter.name }, err)
       }
     }
 
-    const stopEviction = this.sessions.startEvictionLoop()
-    process.once('SIGINT', () => this.shutdown(stopEviction))
-    process.once('SIGTERM', () => this.shutdown(stopEviction))
+    this._stopEviction = this.sessions.startEvictionLoop()
+    process.once('SIGINT', () => {
+      this.shutdown().catch((err) => this.log.error('shutdown error (SIGINT)', undefined, err))
+    })
+    process.once('SIGTERM', () => {
+      this.shutdown().catch((err) => this.log.error('shutdown error (SIGTERM)', undefined, err))
+    })
 
 
     // Start cron scheduler for reflection jobs (L3)
@@ -266,7 +317,7 @@ export class Gateway {
       }
     })
     this.cron.lastActiveChannel = this.lastActiveChannel
-    this.cron.start().catch((err) => console.error('[cron] start failed:', err))
+    this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
 
     // Start event persistence (writes all events to SQLite event_log)
     startEventPersistence()
@@ -292,23 +343,32 @@ export class Gateway {
           oneshot: ev.oneshot ?? true,
           label: ev.prompt.slice(0, 50),
         })
-        .then(() => console.log(`[eventBus] task.created → gateway job ${ev.taskId}`))
-        .catch((err) => console.warn('[eventBus] task.created failed:', err))
+        .then(() =>
+          this.log.info('eventBus task.created → gateway job', { taskId: ev.taskId }),
+        )
+        .catch((err) =>
+          this.log.warn('eventBus task.created failed', { taskId: ev.taskId }, err),
+        )
     })
     eventBus.on('task.deleted', (ev) => {
       if (!this.cron) return
       this.cron
         .removeJob(ev.taskId)
         .then((ok) =>
-          console.log(`[eventBus] task.deleted → ${ok ? 'removed' : 'not found'} ${ev.taskId}`),
+          this.log.info('eventBus task.deleted', {
+            taskId: ev.taskId,
+            result: ok ? 'removed' : 'not found',
+          }),
         )
-        .catch((err) => console.warn('[eventBus] task.deleted failed:', err))
+        .catch((err) =>
+          this.log.warn('eventBus task.deleted failed', { taskId: ev.taskId }, err),
+        )
     })
 
     // Start webhook router
     this.webhookRouter = new WebhookRouter()
     await this.webhookRouter.load()
-    console.log(`[webhooks] loaded ${this.webhookRouter.list().length} webhook(s)`)
+    this.log.info('webhooks loaded', { count: this.webhookRouter.list().length })
 
     // EventBus: route webhook.received → agent execution + delivery
     eventBus.on('webhook.received', (ev) => {
@@ -317,7 +377,10 @@ export class Gateway {
       ;(async () => {
         const cfg = await this._getAgentsConfig()
         const agent = cfg.agents.find((a) => a.id === agentId)
-        if (!agent) return console.warn(`[webhook] agent "${agentId}" not found`)
+        if (!agent) {
+          this.log.warn('webhook agent not found', { agentId, webhookId })
+          return
+        }
         const sessionKey = `agent:${agentId}:webhook:${webhookId}:${Date.now()}`
         const session = await this.sessions.getOrCreate({
           sessionKey,
@@ -368,12 +431,16 @@ export class Gateway {
             }
           }
         }
-      })().catch((err) => console.error(`[webhook] ${webhookId} execution failed:`, err))
+      })().catch((err) =>
+        this.log.error('webhook execution failed', { webhookId, agentId }, err),
+      )
     })
 
     // TaskStore: schedule-triggered tasks run alongside cron (check every 60s)
-    setInterval(() => {
-      this._tickScheduledTasks().catch((err) => console.error('[task-scheduler] tick failed:', err))
+    this._taskSchedulerTimer = setInterval(() => {
+      this._tickScheduledTasks().catch((err) =>
+        this.log.error('task-scheduler tick failed', undefined, err),
+      )
     }, 60_000)
 
     // Invalidate task cache when tasks are created or deleted
@@ -436,13 +503,33 @@ export class Gateway {
           } catch {}
         }
       }
-      console.log(`[gateway] pushed crash notification to ${ev.peerId}`)
+      this.log.info('pushed crash notification', { peerId: ev.peerId })
+
+      // Any pending permission requests that belonged to the crashed session
+      // will never be answered (subprocess is gone). Clean them up so the
+      // map doesn't leak and any connected tabs dismiss their stuck modal.
+      const pendingToReap: string[] = []
+      for (const [requestId, pending] of this._pendingPermissions) {
+        if (pending.sessionKey === ev.sessionKey) pendingToReap.push(requestId)
+      }
+      for (const requestId of pendingToReap) {
+        this._forceDenyPendingPermission(requestId, 'crashed', 'Session crashed')
+      }
     })
 
     // Periodic OAuth token refresh (every 10 min). Running subprocesses keep
     // the old token until restarted; 401 detection in sessionManager handles
     // the restart + retry when the old token expires mid-conversation.
-    setInterval(() => this.refreshClaudeOAuthIfNeeded().catch(() => {}), 10 * 60_000)
+    this._oauthRefreshTimer = setInterval(() => this.refreshClaudeOAuthIfNeeded().catch(() => {}), 10 * 60_000)
+    // Periodic pending-permission janitor: TTL-based auto-deny + orphan cleanup.
+    this._pendingPermissionSweepTimer = setInterval(
+      () => {
+        try { this._sweepStalePendingPermissions() } catch (err) {
+          this.log.warn('pending permission sweep failed', undefined, err)
+        }
+      },
+      Gateway.PENDING_PERMISSION_SWEEP_MS,
+    )
     // Check immediately on boot
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
@@ -452,32 +539,154 @@ export class Gateway {
     this.log.info('server started', { bind: config.gateway.bind, port: config.gateway.port })
 
     // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
-    this.bootAutoResume().catch((err) => console.error('[auto-resume] boot failed:', err))
+    this.bootAutoResume().catch((err) =>
+      this.log.error('auto-resume boot failed', undefined, err),
+    )
   }
 
-  private async shutdown(stopEviction: () => void): Promise<void> {
+  /**
+   * Public, idempotent shutdown. Safe to call from signal handlers, fatal
+   * error handlers, or external orchestration. Concurrent calls share the
+   * same in-flight shutdown promise.
+   *
+   * Pass `exit=false` to skip the terminal `process.exit(0)` — the caller
+   * is then responsible for exiting (used by emergency exit handlers that
+   * want to exit with code 1 after graceful flush).
+   */
+  public shutdown(exit = true): Promise<void> {
+    if (this._shutdownPromise) return this._shutdownPromise
+    // Set ingress guard FIRST so handlers reject new requests immediately
+    this._shuttingDown = true
+    this._shutdownPromise = this._doShutdown(exit).catch((err) => {
+      try {
+        this.log.error('shutdown failed', undefined, err)
+      } catch {}
+      if (exit) process.exit(1)
+    })
+    return this._shutdownPromise
+  }
+
+  /** True once shutdown has begun; handlers use this to reject new ingress. */
+  public get isShuttingDown(): boolean {
+    return this._shuttingDown
+  }
+
+  private async _doShutdown(exit: boolean): Promise<void> {
     this.log.info('shutting down')
-    stopEviction()
+
+    // ── Stage 1: stop accepting new traffic ──
+    // `httpServer.close()` stops accepting new HTTP connections but lets
+    // in-flight requests finish. WS upgrade happens via the HTTP server so
+    // new WS connections are also refused. Existing handlers additionally
+    // check `_shuttingDown` to short-circuit.
+    // We capture the close-completion Promise here and await it in Stage 5
+    // so the full close lifecycle is awaited before exit.
+    let httpCloseDone: Promise<void> = Promise.resolve()
+    if (this.httpServer) {
+      httpCloseDone = new Promise<void>((resolveClose) => {
+        try {
+          this.httpServer.close((err) => {
+            if (err) this.log.warn('httpServer.close error', undefined, err)
+            resolveClose()
+          })
+        } catch (err) {
+          this.log.warn('httpServer.close threw', undefined, err)
+          resolveClose()
+        }
+      })
+    }
+
+    // ── Stage 2: stop all background timers ──
+    try {
+      this._stopEviction?.()
+    } catch {}
+    this._stopEviction = null
     if (this._wsKeepaliveTimer !== null) {
       clearInterval(this._wsKeepaliveTimer)
       this._wsKeepaliveTimer = null
     }
+    if (this._taskSchedulerTimer !== null) {
+      clearInterval(this._taskSchedulerTimer)
+      this._taskSchedulerTimer = null
+    }
+    if (this._oauthRefreshTimer !== null) {
+      clearInterval(this._oauthRefreshTimer)
+      this._oauthRefreshTimer = null
+    }
+    if (this._pendingPermissionSweepTimer !== null) {
+      clearInterval(this._pendingPermissionSweepTimer)
+      this._pendingPermissionSweepTimer = null
+    }
+    try {
+      this.cron?.stop()
+    } catch (err) {
+      this.log.warn('cron stop error', undefined, err)
+    }
+
+    // ── Stage 3: drain channel adapters (Telegram etc.) ──
     for (const ch of this.channels.values()) {
       try {
         await ch.shutdown()
-      } catch {}
+      } catch (err) {
+        this.log.warn('channel shutdown error', { channel: ch.name }, err)
+      }
     }
-    await this.sessions.shutdownAll()
-    // shutdownAll() already flushes resume map, but add a safety await in case
-    // of concurrent writes queued between shutdownAll and here
-    await this.sessions.awaitResumeMapFlush()
-    this.wss.close()
-    this.httpServer.close()
-    process.exit(0)
+
+    // ── Stage 4: drain sessions (kill CCB subprocesses, flush resume map) ──
+    try {
+      await this.sessions.shutdownAll()
+    } catch (err) {
+      this.log.warn('sessions shutdownAll error', undefined, err)
+    }
+    try {
+      await this.sessions.awaitResumeMapFlush()
+    } catch (err) {
+      this.log.warn('resume map flush error', undefined, err)
+    }
+
+    // ── Stage 5: force-close remaining sockets ──
+    // WS: terminate remaining clients so `wss.close()` callback fires promptly.
+    // HTTP: `closeAllConnections()` destroys active sockets (e.g. SSE streams)
+    //       that would otherwise block the Stage 1 `close()` callback.
+    if (this.httpServer) {
+      try {
+        const closeAll = (this.httpServer as any).closeAllConnections
+        if (typeof closeAll === 'function') closeAll.call(this.httpServer)
+      } catch (err) {
+        this.log.warn('closeAllConnections error', undefined, err)
+      }
+    }
+    const wssCloseDone = new Promise<void>((resolveClose) => {
+      if (!this.wss) return resolveClose()
+      try {
+        for (const ws of this.wss.clients) {
+          try { ws.terminate() } catch {}
+        }
+        this.wss.close((err) => {
+          if (err) this.log.warn('wss.close error', undefined, err)
+          resolveClose()
+        })
+      } catch (err) {
+        this.log.warn('wss.close threw', undefined, err)
+        resolveClose()
+      }
+    })
+    await Promise.allSettled([httpCloseDone, wssCloseDone])
+    this.log.info('shutdown complete')
+    if (exit) process.exit(0)
   }
 
   // ───────── HTTP ─────────
   private handleHttp(req: IncomingMessage, res: ServerResponse): void {
+    // Ingress guard: refuse new work once shutdown has begun
+    if (this._shuttingDown) {
+      res.statusCode = 503
+      res.setHeader('Connection', 'close')
+      res.setHeader('Content-Type', 'text/plain')
+      res.end('shutting down')
+      return
+    }
+
     const reqStart = Date.now()
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
     const method = req.method ?? 'GET'
@@ -530,7 +739,7 @@ export class Gateway {
             return
           }
           if (checkToken(password, this.deps.config.gateway.accessToken)) {
-            const token = signJwt({ userId: 'default', exp: Math.floor(Date.now() / 1000) + 30 * 86400 }, this.deps.config.gateway.accessToken)
+            const token = signJwt({ userId: 'default', exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS }, this.deps.config.gateway.accessToken)
             this.sendJson(res, 200, { token, userId: 'default', name: 'Default' })
           } else {
             this.sendJson(res, 401, { error: 'invalid credentials' })
@@ -546,7 +755,7 @@ export class Gateway {
           this.sendJson(res, 401, { error: 'invalid credentials' })
           return
         }
-        const token = signJwt({ userId: user.id, exp: Math.floor(Date.now() / 1000) + 30 * 86400 }, this.deps.config.gateway.accessToken)
+        const token = signJwt({ userId: user.id, exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS }, this.deps.config.gateway.accessToken)
         this.sendJson(res, 200, { token, userId: user.id, name: user.name })
       }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
       return
@@ -590,7 +799,13 @@ export class Gateway {
         res.end('unauthorized')
         return
       }
-      this.setSessionCookie(res, req)
+      // setSessionCookie re-verifies the token; if JWT just raced into expiry,
+      // return 401 rather than silently downgrading to 'default' identity.
+      if (!this.setSessionCookie(res, req)) {
+        res.writeHead(401)
+        res.end('unauthorized')
+        return
+      }
       this.sendJson(res, 200, { ok: true })
       return
     }
@@ -1050,13 +1265,13 @@ export class Gateway {
         .map((a) => a.cwd)
         .filter((c): c is string => !!c)
       if (!isFileAllowed(resolved, agentCwds)) {
-        console.warn(`[api/file] denied (not in allowlist): ${resolved}`)
+        this.log.warn('api/file denied (not in allowlist)', { path: resolved })
         res.writeHead(403)
         res.end('access denied')
         return
       }
       if (isFileBlocked(resolved)) {
-        console.warn(`[api/file] blocked sensitive: ${resolved}`)
+        this.log.warn('api/file blocked sensitive', { path: resolved })
         res.writeHead(403)
         res.end('access denied')
         return
@@ -1213,17 +1428,55 @@ export class Gateway {
     return isLoopback && req.headers['x-forwarded-proto'] === 'https'
   }
 
-  /** Set HttpOnly session cookie on response — stores the JWT (not raw token) for user-scoped auth */
-  private setSessionCookie(res: ServerResponse, req: IncomingMessage): void {
+  /** Session token lifetime — used for JWT issuance and legacy-mode cookie cap.
+   *  Kept in one place so JWT TTL and cookie Max-Age can't drift. */
+  private static readonly JWT_TTL_SECONDS = 30 * 86400 // 30 days
+
+  /** Set HttpOnly session cookie on response — stores the verified auth token so
+   *  <img src="/api/file/...">, <audio>, <video> can access protected media on
+   *  the same origin without JS-supplied headers.
+   *
+   *  Rules:
+   *   - JWT mode: store the JWT verbatim (preserves userId); Max-Age tracks the
+   *     JWT's remaining exp so the cookie can never outlive its token, avoiding
+   *     silent 401 storms on subresource requests. Floored at 60s to avoid
+   *     setting an already-dead cookie on the same response that just authed.
+   *   - Legacy raw-token mode: store the raw accessToken; Max-Age capped at
+   *     JWT_TTL_SECONDS since the raw token has no server-side revocation.
+   *   - Otherwise (e.g. JWT just expired in the microsecond race between
+   *     checkHttpAuth and here): refuse. We do NOT silently downgrade a JWT
+   *     user's identity into the shared 'default' raw-token principal; caller
+   *     sees `false` and returns 401 so the client can re-login cleanly.
+   *
+   *  Returns true if a cookie was set; false if the caller should 401. */
+  private setSessionCookie(res: ServerResponse, req: IncomingMessage): boolean {
     const t = this.extractToken(req)
-    // Prefer the JWT the client already sent (preserves userId); fall back to raw token for legacy
-    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
-    const cookieValue = jwt ? t : this.deps.config.gateway.accessToken
     const secure = this.isHttps(req) ? '; Secure' : ''
-    res.setHeader(
-      'Set-Cookie',
-      `oc_session=${cookieValue}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=31536000`,
-    )
+
+    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
+    if (jwt && typeof jwt.exp === 'number') {
+      // Clamp remaining seconds to [60, JWT_TTL_SECONDS]. Max-Age=0 semantically
+      // means "delete cookie"; a positive floor keeps the cookie alive long
+      // enough for the client to renew or get a clean 401 on the next request.
+      const remaining = jwt.exp - Math.floor(Date.now() / 1000)
+      const maxAge = Math.max(60, Math.min(remaining, Gateway.JWT_TTL_SECONDS))
+      res.setHeader(
+        'Set-Cookie',
+        `oc_session=${t}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=${maxAge}`,
+      )
+      return true
+    }
+    if (checkToken(t, this.deps.config.gateway.accessToken)) {
+      // Legacy raw-token auth. `t` is constant-time equal to the configured
+      // accessToken (which came from trusted config), so it's safe to echo
+      // into Set-Cookie without further sanitization.
+      res.setHeader(
+        'Set-Cookie',
+        `oc_session=${t}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=${Gateway.JWT_TTL_SECONDS}`,
+      )
+      return true
+    }
+    return false
   }
 
   private sendJson(res: ServerResponse, code: number, body: unknown): void {
@@ -1475,7 +1728,11 @@ export class Gateway {
     if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
 
     const sessionKey = `agent:${targetAgentId}:inter:dm:${sourceAgent || 'system'}`
-    console.log(`[inter-agent] ${sourceAgent} → ${targetAgentId}: "${message.slice(0, 60)}"`)
+    this.log.info('inter-agent message', {
+      sourceAgent,
+      targetAgentId,
+      preview: message.slice(0, 60),
+    })
 
     // Create/reuse session for the target agent
     const session = await this.sessions.getOrCreate({
@@ -1570,9 +1827,12 @@ export class Gateway {
     const delegatedAgent = toolsets ? { ...targetAgent, toolsets } : targetAgent
 
     const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
-    console.log(
-      `[delegate] ${sourceAgent} → ${targetAgentId}: "${goal.slice(0, 60)}" (depth=${depth})`,
-    )
+    this.log.info('delegate', {
+      sourceAgent,
+      targetAgentId,
+      goalPreview: goal.slice(0, 60),
+      depth,
+    })
 
     const session = await this.sessions.getOrCreate({
       sessionKey,
@@ -1718,7 +1978,7 @@ export class Gateway {
       if (task.status === 'disabled')
         return this.sendError(res, 409, 'task is disabled (maxRuns reached)')
       this._triggerTask(taskId).catch((err) =>
-        console.error(`[task] ${taskId} manual trigger failed:`, err),
+        this.log.error('task manual trigger failed', { taskId }, err),
       )
       this.sendJson(res, 202, { ok: true, message: 'task triggered' })
       return
@@ -1960,7 +2220,7 @@ export class Gateway {
     const providerKey = (pending as any).provider || 'claude'
     const prov = this.OAUTH_PROVIDERS[providerKey]
     if (!prov) return this.sendError(res, 400, 'unknown provider')
-    console.log(`[oauth:${providerKey}] exchanging code (len=${cleanCode.length})...`)
+    this.log.info('oauth exchanging code', { provider: providerKey, codeLen: cleanCode.length })
 
     try {
       const tokenRes = await fetch(prov.tokenUrl, {
@@ -1978,7 +2238,11 @@ export class Gateway {
 
       if (!tokenRes.ok) {
         const errText = await tokenRes.text()
-        console.error('[oauth] token exchange failed:', tokenRes.status, errText)
+        this.log.error('oauth token exchange failed', {
+          provider: providerKey,
+          status: tokenRes.status,
+          body: errText,
+        })
         return this.sendError(res, 502, `token exchange failed: ${tokenRes.status}`)
       }
 
@@ -2008,7 +2272,7 @@ export class Gateway {
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
-        console.log(`[oauth:${providerKey}] tokens saved`)
+        this.log.info('oauth tokens saved', { provider: providerKey })
       }
 
       this.sendJson(res, 200, {
@@ -2017,7 +2281,7 @@ export class Gateway {
         scope: tokens.scope,
       })
     } catch (err: any) {
-      console.error('[oauth] exchange error:', err)
+      this.log.error('oauth exchange error', { provider: providerKey }, err)
       this.sendError(res, 500, err?.message ?? 'token exchange failed')
     }
   }
@@ -2064,8 +2328,10 @@ export class Gateway {
   ): Promise<void> {
     const prov = this.OAUTH_PROVIDERS[providerKey]
     if (!prov || !prov.tokenUrl) {
-      if (!prov) console.warn(`[oauth:${providerKey}] skipping refresh: unknown provider`)
-      else console.warn(`[oauth:${providerKey}] skipping refresh: no tokenUrl configured`)
+      this.log.warn('oauth skipping refresh', {
+        provider: providerKey,
+        reason: !prov ? 'unknown provider' : 'no tokenUrl configured',
+      })
       return
     }
 
@@ -2082,7 +2348,7 @@ export class Gateway {
       })
 
       if (!tokenRes.ok) {
-        console.error(`[oauth:${providerKey}] refresh failed:`, tokenRes.status)
+        this.log.error('oauth refresh failed', { provider: providerKey, status: tokenRes.status })
         return
       }
 
@@ -2100,10 +2366,13 @@ export class Gateway {
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
-        console.log(`[oauth:${providerKey}] token refreshed, expires in`, tokens.expires_in, 's')
+        this.log.info('oauth token refreshed', {
+          provider: providerKey,
+          expiresInSec: tokens.expires_in,
+        })
       }
     } catch (err) {
-      console.error(`[oauth:${providerKey}] refresh error:`, err)
+      this.log.error('oauth refresh error', { provider: providerKey }, err)
     }
   }
 
@@ -2129,6 +2398,10 @@ export class Gateway {
 
   // ───────── WS ─────────
   private handleWsConnection(ws: WebSocket, req: IncomingMessage): void {
+    if (this._shuttingDown) {
+      try { ws.close(1001, 'shutting down') } catch {}
+      return
+    }
     if (!this.checkHttpAuth(req)) {
       ws.close(1008, 'unauthorized')
       return
@@ -2165,7 +2438,7 @@ export class Gateway {
         const peers: Array<{ peerId: string; agentId: string }> = hello.peers || []
         // Auto-resume: check if any peer has a resumable session that is NOT already active
         this.autoResumeFromHello(peers, ws).catch((err) =>
-          console.error('[auto-resume] failed:', err),
+          this.log.error('auto-resume failed', undefined, err),
         )
         return
       }
@@ -2184,12 +2457,17 @@ export class Gateway {
             set?.delete(ws)
             if (set?.size === 0) {
               this.clientsByPeer.delete(peerKey)
+              // Auto-deny all pending permission requests for this peer
+              // since no client is available to respond.
+              this._autoDenyPendingPermissions(peerKey)
             }
           })
         }
         await this.dispatchInbound(frame)
       } else if (frame.type === 'inbound.control.stop') {
         await this.handleStop(frame)
+      } else if ((frame as any).type === 'inbound.permission_response') {
+        await this.handlePermissionResponse(frame as any)
       } else if ((frame as any).type === 'inbound.control.reset') {
         // Reset: kill the CCB subprocess AND remove session from manager,
         // so next message creates an entirely fresh session with no history
@@ -2206,9 +2484,7 @@ export class Gateway {
           }).agent.id
         const sessionKey = `agent:${agentId}:${f.channel}:${f.peer.kind}:${f.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
         await this.sessions.destroySession(sessionKey)
-        console.log(
-          `[reset] destroyed session ${sessionKey} — next message will create fresh context`,
-        )
+        this.log.info('reset destroyed session', { sessionKey })
       } else if ((frame as any).type === 'control.session.compact') {
         // Compact: send a compaction request to the agent as a user message
         const sessionKey = (frame as any).sessionKey
@@ -2218,7 +2494,7 @@ export class Gateway {
           ws.send(JSON.stringify({ type: 'error', error: 'session not found' }))
           return
         }
-        console.log(`[compact] compacting session ${sessionKey}`)
+        this.log.info('compact session', { sessionKey })
         try {
           await this.sessions.submit(
             session,
@@ -2254,7 +2530,7 @@ export class Gateway {
         }
       }
       } catch (err: any) {
-        console.error('[ws-message] unhandled error in message handler:', err)
+        this.log.error('ws-message unhandled error', undefined, err)
         try {
           ws.send(JSON.stringify({ type: 'error', error: `internal error: ${err?.message}` }))
         } catch { /* ws may already be closed */ }
@@ -2286,7 +2562,255 @@ export class Gateway {
       }
     }
     const ok = this.sessions.interrupt(sessionKey)
-    console.log(`[gateway] interrupt ${sessionKey} → ${ok}`)
+    this.log.info('interrupt', { sessionKey, ok })
+  }
+
+  /** Handle permission approval/denial from the web frontend */
+  private async handlePermissionResponse(frame: {
+    type: 'inbound.permission_response'
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+    agentId?: string
+    requestId: string
+    behavior: 'allow' | 'deny'
+    message?: string
+  }): Promise<void> {
+    const peerKey = `${frame.channel}:${frame.peer.id}`
+    // Single-settlement: consume the pending request (reject duplicates)
+    const pending = this._pendingPermissions.get(frame.requestId)
+    if (!pending) {
+      // Race: another tab (or our own /stop / timeout path) settled this
+      // requestId first. Replay the authoritative behavior from the recent-
+      // settlements map so a 3rd tab that missed the first broadcast doesn't
+      // end up labeled with the LATE responder's behavior (which may differ).
+      // If we have no record at all (expired / server restarted), fall back
+      // to the late responder's own behavior — the only signal we have.
+      const prior = this._lookupSettlement(frame.requestId)
+      this.log.warn('permission response for unknown/already-settled request', {
+        requestId: frame.requestId,
+        hasPrior: !!prior,
+        lateBehavior: frame.behavior,
+      })
+      if (prior) {
+        this._broadcastPermissionSettled(peerKey, {
+          sessionKey: prior.sessionKey,
+          channel: prior.channel,
+          peer: prior.peer,
+          requestId: frame.requestId,
+          behavior: prior.behavior,
+          reason: 'already_settled',
+        })
+      } else {
+        this._broadcastPermissionSettled(peerKey, {
+          sessionKey: '',
+          channel: frame.channel,
+          peer: frame.peer,
+          requestId: frame.requestId,
+          behavior: frame.behavior,
+          reason: 'already_settled',
+        })
+      }
+      return
+    }
+    this._pendingPermissions.delete(frame.requestId)
+
+    const session = this.sessions.getByKey(pending.sessionKey)
+    if (!session) {
+      this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
+      // Session is gone, but tabs still hold the modal — clear them.
+      // Record the authoritative deny so any late duplicate rebroadcasts deny.
+      this._recordSettlement(frame.requestId, {
+        behavior: 'deny',
+        channel: frame.channel,
+        peer: frame.peer,
+        sessionKey: pending.sessionKey,
+      })
+      this._broadcastPermissionSettled(peerKey, {
+        sessionKey: pending.sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        requestId: frame.requestId,
+        behavior: 'deny',
+        reason: 'disconnect',
+      })
+      return
+    }
+    // Allow: pass original input so CCB doesn't receive an empty object
+    const response = frame.behavior === 'allow'
+      ? { behavior: 'allow' as const, updatedInput: pending.input, toolUseID: pending.toolUseId }
+      : { behavior: 'deny' as const, message: frame.message || 'User denied', toolUseID: pending.toolUseId }
+    const ok = session.runner.sendPermissionResponse(frame.requestId, response)
+    this.log.info('permission response', {
+      requestId: frame.requestId,
+      behavior: frame.behavior,
+      ok,
+    })
+    // Record the authoritative result BEFORE broadcasting so any late
+    // duplicate response that arrives between here and the broadcast round
+    // will see the correct behavior.
+    this._recordSettlement(frame.requestId, {
+      behavior: frame.behavior,
+      channel: frame.channel,
+      peer: frame.peer,
+      sessionKey: pending.sessionKey,
+    })
+    // Tell every tab attached to this peer (including the sender) that the
+    // request is resolved. The sender hitting its own settled frame is a
+    // no-op: it already cleared the modal locally. Other tabs dismiss their
+    // stuck prompt with the actual behavior.
+    this._broadcastPermissionSettled(peerKey, {
+      sessionKey: pending.sessionKey,
+      channel: frame.channel,
+      peer: frame.peer,
+      requestId: frame.requestId,
+      behavior: frame.behavior,
+      reason: 'remote',
+    })
+  }
+
+  /** Broadcast a settlement event to all WS clients at a peerKey. */
+  private _broadcastPermissionSettled(
+    peerKey: string,
+    payload: {
+      sessionKey: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+      requestId: string
+      behavior: 'allow' | 'deny'
+      reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+    },
+  ): void {
+    const clients = this.clientsByPeer.get(peerKey)
+    if (!clients || clients.size === 0) return
+    const frame = JSON.stringify({
+      type: 'outbound.permission_settled',
+      ...payload,
+    })
+    for (const ws of clients) {
+      try { ws.send(frame) } catch {}
+    }
+  }
+
+  /** Record an authoritative settlement for later replay to late duplicates. */
+  private _recordSettlement(
+    requestId: string,
+    entry: {
+      behavior: 'allow' | 'deny'
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+      sessionKey: string
+    },
+  ): void {
+    // FIFO evict (Map preserves insertion order) to cap memory under burst load.
+    while (this._recentSettlements.size >= Gateway.RECENT_SETTLEMENT_MAX) {
+      const oldestKey = this._recentSettlements.keys().next().value
+      if (oldestKey === undefined) break
+      this._recentSettlements.delete(oldestKey)
+    }
+    this._recentSettlements.set(requestId, { ...entry, ts: Date.now() })
+  }
+
+  /** Look up a recent settlement, honoring TTL (returns null if expired). */
+  private _lookupSettlement(requestId: string): {
+    behavior: 'allow' | 'deny'
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+    sessionKey: string
+  } | null {
+    const e = this._recentSettlements.get(requestId)
+    if (!e) return null
+    if (Date.now() - e.ts > Gateway.RECENT_SETTLEMENT_TTL_MS) {
+      this._recentSettlements.delete(requestId)
+      return null
+    }
+    return { behavior: e.behavior, channel: e.channel, peer: e.peer, sessionKey: e.sessionKey }
+  }
+
+  /** Shared auto-deny + settle + broadcast for one pending permission entry.
+   *  Used by disconnect / timeout / session-crash paths. Safe to call on
+   *  sessions that no longer exist — the runner-response step silently
+   *  skips in that case (the subprocess is already gone). */
+  private _forceDenyPendingPermission(
+    requestId: string,
+    reason: 'disconnect' | 'timeout' | 'crashed',
+    denyMessage: string,
+  ): boolean {
+    const pending = this._pendingPermissions.get(requestId)
+    if (!pending) return false
+    this._pendingPermissions.delete(requestId)
+    const session = this.sessions.getByKey(pending.sessionKey)
+    if (session) {
+      // sendPermissionResponse swallows its own errors and returns false if
+      // the subprocess is gone — `false` is expected on crash/exit paths.
+      const ok = session.runner.sendPermissionResponse(requestId, {
+        behavior: 'deny',
+        message: denyMessage,
+        toolUseID: pending.toolUseId,
+      })
+      this.log.info('auto-denied pending permission', {
+        requestId,
+        reason,
+        runnerAccepted: ok,
+      })
+    }
+    // Record authoritative 'deny' so a late duplicate response (from a
+    // reconnecting tab or a redelivered frame) replays the correct result
+    // instead of whatever the late responder happens to have sent.
+    this._recordSettlement(requestId, {
+      behavior: 'deny',
+      channel: pending.channel,
+      peer: pending.peer,
+      sessionKey: pending.sessionKey,
+    })
+    // Broadcast so any still-connected tab dismisses its modal immediately.
+    // No-op when no clients remain (e.g. disconnect path).
+    this._broadcastPermissionSettled(pending.peerKey, {
+      sessionKey: pending.sessionKey,
+      channel: pending.channel,
+      peer: pending.peer,
+      requestId,
+      behavior: 'deny',
+      reason,
+    })
+    return true
+  }
+
+  /** Auto-deny all pending permission requests associated with a peerKey (on disconnect) */
+  private _autoDenyPendingPermissions(peerKey: string): void {
+    // Snapshot requestIds first — the helper mutates _pendingPermissions.
+    const requestIds: string[] = []
+    for (const [requestId, pending] of this._pendingPermissions) {
+      if (pending.peerKey === peerKey) requestIds.push(requestId)
+    }
+    for (const requestId of requestIds) {
+      this._forceDenyPendingPermission(requestId, 'disconnect', 'Client disconnected')
+    }
+  }
+
+  /** Periodic janitor: auto-deny permissions whose wait has exceeded the TTL.
+   *  Also cleans up entries whose session no longer exists (subprocess was
+   *  evicted or destroyed without going through the crash event path). */
+  private _sweepStalePendingPermissions(): void {
+    const now = Date.now()
+    const toExpire: Array<{ requestId: string; reason: 'timeout' | 'crashed' }> = []
+    for (const [requestId, pending] of this._pendingPermissions) {
+      if (now >= pending.expiresAt) {
+        toExpire.push({ requestId, reason: 'timeout' })
+      } else if (!this.sessions.getByKey(pending.sessionKey)) {
+        // Orphan: session was evicted/ended without the crash event firing.
+        // Treat as "crashed" for the UI — the underlying subprocess is gone.
+        toExpire.push({ requestId, reason: 'crashed' })
+      }
+    }
+    if (toExpire.length === 0) return
+    for (const { requestId, reason } of toExpire) {
+      const msg = reason === 'timeout' ? 'Permission request timed out' : 'Session ended'
+      this._forceDenyPendingPermission(requestId, reason, msg)
+    }
+    this.log.info('pending permission sweep', {
+      expired: toExpire.length,
+      remaining: this._pendingPermissions.size,
+    })
   }
 
   /** Pre-warm webchat sessions on boot so they respond instantly to the first user message */
@@ -2301,7 +2825,7 @@ export class Gateway {
       const agentId = parts[1]
       const peerId = parts.slice(4).join(':')
 
-      console.log(`[auto-resume] pre-warming ${sessionKey}`)
+      this.log.info('auto-resume pre-warming', { sessionKey })
       const cfg = await this._getAgentsConfig()
       const agent = cfg.agents.find((a) => a.id === agentId) ?? ({ id: agentId } as AgentDef)
       await this.sessions.getOrCreate({
@@ -2316,7 +2840,7 @@ export class Gateway {
         sessionKey,
         at: Date.now(),
       })
-      console.log(`[auto-resume] pre-warmed ${sessionKey}`)
+      this.log.info('auto-resume pre-warmed', { sessionKey })
     }
   }
 
@@ -2357,9 +2881,9 @@ export class Gateway {
               sessionKey,
               at: Date.now(),
             })
-            console.log(`[auto-resume] on-demand pre-warmed ${sessionKey}`)
+            this.log.info('auto-resume on-demand pre-warmed', { sessionKey })
           } catch (err) {
-            console.error(`[auto-resume] failed to pre-warm ${sessionKey}:`, err)
+            this.log.error('auto-resume failed to pre-warm', { sessionKey }, err)
             continue
           }
         } else {
@@ -2377,7 +2901,7 @@ export class Gateway {
         set.add(ws)
         registeredPeerKeys.push(peerKey)
       }
-      console.log(`[auto-resume] re-registered WS for ${peerKey} (session ${sessionKey})`)
+      this.log.info('auto-resume re-registered WS', { peerKey, sessionKey })
 
       // Push a synthetic isFinal to the reconnected client for sessions that the client
       // reports as in-flight (had _sendingInFlight=true) but whose subprocess is not
@@ -2402,7 +2926,7 @@ export class Gateway {
             isFinal: true,
           })
           ws.send(interruptFrame)
-          console.log(`[auto-resume] pushed turn-interrupted isFinal for ${sessionKey}`)
+          this.log.info('auto-resume pushed turn-interrupted isFinal', { sessionKey })
         } catch {}
       }
     }
@@ -2422,6 +2946,9 @@ export class Gateway {
   }
 
   private async dispatchInbound(frame: InboundFrame, adapter?: ChannelAdapter): Promise<void> {
+    // Ingress guard: drop new messages once shutdown begins so we don't spin
+    // up work that `shutdownAll()` then has to tear back down.
+    if (this._shuttingDown) return
     if (frame.type !== 'inbound.message') {
       // TODO: 权限响应处理
       return
@@ -2548,7 +3075,7 @@ export class Gateway {
       const byteLen = Math.ceil(rawLen * 0.75) // base64 → bytes approx
       if (byteLen > MAX_SINGLE_FILE) {
         const errMsg = `附件超过 ${MAX_SINGLE_FILE / 1024 / 1024}MB 限制 (${(byteLen / 1024 / 1024).toFixed(1)}MB)`
-        console.warn(`[upload] rejected: ${errMsg}`)
+        this.log.warn('upload rejected', { reason: errMsg, byteLen, sessionKey })
         this.deliver(
           {
             type: 'outbound.message',
@@ -2565,7 +3092,7 @@ export class Gateway {
       totalMediaSize += byteLen
       if (totalMediaSize > MAX_TOTAL_MEDIA) {
         const errMsg = `总附件超过 ${MAX_TOTAL_MEDIA / 1024 / 1024}MB 限制`
-        console.warn(`[upload] rejected: ${errMsg}`)
+        this.log.warn('upload rejected', { reason: errMsg, totalMediaSize, sessionKey })
         this.deliver(
           {
             type: 'outbound.message',
@@ -2586,7 +3113,7 @@ export class Gateway {
         mime !== 'application/octet-stream'
       ) {
         const errMsg = `不支持的文件类型: ${mime}`
-        console.warn(`[upload] rejected: disallowed MIME ${mime}`)
+        this.log.warn('upload rejected: disallowed MIME', { mime, sessionKey })
         this.deliver(
           {
             type: 'outbound.message',
@@ -2665,7 +3192,7 @@ export class Gateway {
           sizeHint: `${sizeKb}KB`,
         })
       } catch (err) {
-        console.warn(`[dispatchInbound] failed to save uploaded ${m.kind}:`, err)
+        this.log.warn('dispatchInbound failed to save upload', { kind: m.kind }, err)
       }
     }
 
@@ -2775,6 +3302,54 @@ export class Gateway {
         } else {
           this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
         }
+      } else if (e.kind === 'permission_request') {
+        // Forward permission prompt to WebSocket clients for user approval
+        const peerKey = `${frame.channel}:${frame.peer.id}`
+        const permFrame = {
+          type: 'outbound.permission_request' as const,
+          sessionKey,
+          channel: frame.channel,
+          peer: frame.peer,
+          requestId: e.request.requestId,
+          toolName: e.request.toolName,
+          toolUseId: e.request.toolUseId,
+          inputPreview: JSON.stringify(e.request.input).slice(0, 400),
+          inputJson: e.request.input,
+        }
+        // Permission requests only make sense for interactive clients (WebChat)
+        // Non-interactive adapters auto-deny.
+        if (adapter) {
+          session.runner.sendPermissionResponse(e.request.requestId, {
+            behavior: 'deny',
+            message: 'Permission prompts not supported on this channel',
+            toolUseID: e.request.toolUseId,
+          })
+        } else {
+          const clients = this.clientsByPeer.get(peerKey)
+          if (clients && clients.size > 0) {
+            // Register pending request for single-settlement + disconnect auto-deny
+            this._pendingPermissions.set(e.request.requestId, {
+              sessionKey,
+              input: e.request.input,
+              toolUseId: e.request.toolUseId,
+              peerKey,
+              channel: frame.channel,
+              peer: frame.peer,
+              expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
+            })
+            const data = JSON.stringify(permFrame)
+            for (const ws of clients) {
+              try { ws.send(data) } catch {}
+            }
+          } else {
+            // No connected client — auto-deny
+            session.runner.sendPermissionResponse(e.request.requestId, {
+              behavior: 'deny',
+              message: 'No connected client to approve',
+              toolUseID: e.request.toolUseId,
+            })
+          }
+        }
       } else if (e.kind === 'error') {
         this._runLog.complete(_run, { status: 'failed', error: e.error })
         // Remove idempotency key on failure to allow client retry
@@ -2793,7 +3368,9 @@ export class Gateway {
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {
     if (adapter) {
-      adapter.send(out).catch((err) => console.error('[gateway] adapter send failed:', err))
+      adapter.send(out).catch((err) =>
+        this.log.error('adapter send failed', { channel: adapter.name }, err),
+      )
       return
     }
     // WebChat:广播给所有同 (channel, peer) 的 ws client

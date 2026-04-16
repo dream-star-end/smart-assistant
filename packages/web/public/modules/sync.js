@@ -2,10 +2,19 @@
 // Syncs frontend sessions (IndexedDB) with server-side storage (SQLite).
 // Server is source of truth for session list; local IDB is cache + offline fallback.
 
-import { apiGet, apiJson, authHeaders } from './api.js'
+import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbGetAll, dbPut, dbDelete } from './db.js'
-import { _rebuildSearchIndex } from './sessions.js'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js'
 import { state } from './state.js'
+
+// Dep-injected callback: fired when a push hits a 409 conflict and we pull
+// the server version in place of the local one. The UI layer should
+// re-render both the messages (if the affected session is current) and
+// the sidebar (title/lastAt may have changed on the server).
+let _onConflictResolved = null
+export function setSyncDeps({ onConflictResolved }) {
+  _onConflictResolved = onConflictResolved
+}
 
 /**
  * Pull session list from server, merge with local IndexedDB.
@@ -67,7 +76,9 @@ export async function syncSessionsFromServer() {
   }
 
   // Merge fetched sessions into local state + IDB (skip dirty local sessions)
+  let currentSessionUpdated = false
   for (const remote of fetched) {
+    if (isDeletePending(remote.id)) continue // locally deleted, pending server confirmation
     const existingLocal = state.sessions.get(remote.id)
     if (existingLocal?._dirty) continue // local has unsynced edits, don't overwrite
     const sess = {
@@ -80,8 +91,20 @@ export async function syncSessionsFromServer() {
       pinned: remote.pinned || false,
       _syncedAt: remote.updatedAt,
     }
+    // Preserve local turn-state across the server-merge — the server
+    // deliberately strips _sendingInFlight / _turnStartedAt / _lastFrameAt
+    // on push (see pushSessionToServer strip list below), so a naive replace
+    // would wipe out the in-flight marker for a non-current session the
+    // user has mid-turn. Keeping these locally-owned fields lets the hello
+    // handshake keep reporting inFlight=true and lets sanitizeLoadedTurnState
+    // continue to govern staleness.
+    if (existingLocal?._sendingInFlight) sess._sendingInFlight = true
+    if (existingLocal?._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
+    if (existingLocal?._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
     _rebuildSearchIndex(sess)
+    clearDeleteTombstone(sess.id) // Allow saving if session was previously deleted locally
     state.sessions.set(sess.id, sess)
+    if (sess.id === state.currentSessionId) currentSessionUpdated = true
     try { await dbPut({ ...sess, _syncedAt: remote.updatedAt }) } catch {}
   }
 
@@ -112,6 +135,14 @@ export async function syncSessionsFromServer() {
       pushSessionToServer(local).catch(() => {})
     }
   }
+
+  // Clean up tombstones for sessions confirmed deleted on server
+  // (serverIds doesn't contain them → delete was successful → tombstone no longer needed)
+  for (const id of [...localMap.keys()]) {
+    if (!serverIds.has(id) && isDeletePending(id)) clearDeleteTombstone(id)
+  }
+
+  return { needsRenderMessages: currentSessionUpdated || removedCurrent }
 }
 
 /**
@@ -123,9 +154,9 @@ export function pushSessionToServer(sess) {
   // Include baseSyncedAt for optimistic concurrency — server rejects if row is newer
   clean._baseSyncedAt = _syncedAt || 0
   const preFlightLastAt = sess.lastAt // snapshot BEFORE PUT for 409 conflict detection
-  return fetch(`/api/sessions/${sess.id}`, {
+  return apiFetch(`/api/sessions/${sess.id}`, {
     method: 'PUT',
-    headers: { Authorization: `Bearer ${state.token}`, 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(clean),
   }).then(async (res) => {
     if (res.ok) {
@@ -153,6 +184,11 @@ export function pushSessionToServer(sess) {
           sess._agentGroups = null
           _rebuildSearchIndex(sess)
           try { await dbPut({ ...sess, _syncedAt: server.updatedAt }) } catch {}
+          // Notify the UI layer so the user actually sees the new messages /
+          // title instead of a stale view. Without this callback the session
+          // object is updated but the DOM stays on the old snapshot until a
+          // full sync fires (which could be minutes away).
+          try { _onConflictResolved?.(sess.id) } catch {}
         }
       } catch {}
     }

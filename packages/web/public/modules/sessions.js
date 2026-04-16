@@ -49,9 +49,14 @@ export function createSession(agentId) {
 
 export function switchSession(id) {
   if (!state.sessions.has(id)) return
-  // Save sending state on old session, restore from new
-  const oldSess = getSession()
-  if (oldSess) oldSess._sendingInFlight = state.sendingInFlight
+  // Restore UI from new session's persisted turn-state. Do NOT write global
+  // `state.sendingInFlight` back onto `oldSess._sendingInFlight` — the session
+  // flag is the source of truth (mutated by send/isFinal/safety-timer in
+  // websocket.js), while the global is only a UI mirror of the current
+  // session. A transient global=false (e.g. during ws reconnect, see
+  // websocket.js:505) would otherwise clobber an A-session turn that is
+  // still legitimately in-flight, suppressing the hello handshake's
+  // inFlight=true signal and the server's synthetic isFinal.
   state.currentSessionId = id
   const newSess = getSession()
   state.sendingInFlight = newSess?._sendingInFlight || false
@@ -79,9 +84,10 @@ export async function deleteSession(id) {
     _updateSendEnabled()
     setTitleBusy(false)
   }
-  // Cancel any pending scheduleSave timer to prevent resurrecting deleted session in IDB
-  const pendingTimer = _saveTimers.get(id)
-  if (pendingTimer) { clearTimeout(pendingTimer); _saveTimers.delete(id) }
+  // Capture in-flight save promise BEFORE canceling, so we can await it
+  const inFlightSave = _saveInFlight.get(id)
+  // Cancel all pending and in-flight saves to prevent resurrecting deleted session
+  cancelSavesForSession(id)
   // Purge offline queue items for this session to prevent sending after delete
   if (state.offlineQueue?.length > 0) {
     state.offlineQueue = state.offlineQueue.filter(item => item.sessId !== id)
@@ -94,6 +100,9 @@ export async function deleteSession(id) {
     nudgeDrain()  // Advance drain to next item since we killed the current one
   }
   state.sessions.delete(id)
+  // Wait for any in-flight save to finish before deleting from IDB,
+  // so our dbDelete() is the final write and won't be overwritten by a late dbPut()
+  if (inFlightSave) await inFlightSave.catch(() => {})
   try {
     await dbDelete(id)
   } catch {}
@@ -132,7 +141,12 @@ export function _rebuildSearchIndex(sess) {
   sess._searchText = `${title} ${parts.join(' ')}`
 }
 
-export function scheduleSave(s) {
+// Track in-flight save promises per session to serialize writes and allow flush to wait
+const _saveInFlight = new Map() // sessId -> Promise
+// Sessions that have been deleted — prevents in-flight saves from resurrecting them
+const _deletedIds = new Set()
+
+export function scheduleSave(s, immediate) {
   const sess = s || getSession()
   if (!sess) return
   sess.lastAt = Date.now()
@@ -140,20 +154,239 @@ export function scheduleSave(s) {
   _rebuildSearchIndex(sess)
   const prev = _saveTimers.get(sess.id)
   if (prev) clearTimeout(prev)
-  const t = setTimeout(async () => {
+  if (immediate) {
     _saveTimers.delete(sess.id)
-    // Guard: don't write back if session was deleted between scheduling and execution
-    if (!state.sessions.has(sess.id)) return
-    const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, ...persist } = sess
-    try {
-      await dbPut(persist)
-    } catch (e) {
-      console.warn('dbPut', e)
-    }
-    // Sync to server for cross-device access (best-effort)
-    pushSessionToServer(sess)
+    _enqueueSave(sess)
+    return
+  }
+  const t = setTimeout(() => {
+    _saveTimers.delete(sess.id)
+    _enqueueSave(sess)
   }, 400)
   _saveTimers.set(sess.id, t)
+}
+
+/**
+ * User-driven save wrapper: explicitly replenishes the dbPut retry budget
+ * before scheduling the save. Use this from user-edit code paths (typing a
+ * message, renaming, pin/unpin, deleting a message, switching agent, etc.)
+ * so a session that previously exhausted SAVE_MAX_RETRIES can recover on
+ * the next user action.
+ *
+ * Internal / automatic save callers (streaming frames, system greetings,
+ * cross-device sync) must keep calling `scheduleSave` directly — those
+ * paths fire at arbitrarily high rates and MUST NOT reset the retry budget,
+ * otherwise a persistently failing session would loop forever.
+ */
+export function scheduleSaveFromUserEdit(s, immediate) {
+  const sess = s || getSession()
+  if (!sess) return
+  _clearSaveRetry(sess.id)
+  scheduleSave(sess, immediate)
+}
+
+function _enqueueSave(sess) {
+  if (_deletedIds.has(sess.id)) return
+  // Chain onto any in-flight save for this session to serialize writes.
+  // Swallow rejections on the previous link so one failed save never
+  // poisons the chain — otherwise every subsequent scheduleSave() for this
+  // session would silently short-circuit.
+  const prev = _saveInFlight.get(sess.id) || Promise.resolve()
+  const next = prev.catch(() => {}).then(() => _doSave(sess))
+  _saveInFlight.set(sess.id, next)
+  next.finally(() => {
+    // Only clear if we're still the latest in the chain
+    if (_saveInFlight.get(sess.id) === next) _saveInFlight.delete(sess.id)
+  })
+}
+
+// Per-session dbPut retry state. A save that throws on the first attempt is
+// rescheduled with exponential backoff up to SAVE_MAX_RETRIES total attempts;
+// after that we surface a single toast and stop retrying that session. The
+// budget is reset only on two legitimate re-entry paths:
+//   - `scheduleSaveFromUserEdit()` — a fresh user action explicitly clears
+//     retry state before scheduling the save.
+//   - `_doSave()` success — a subsequent attempt finally persisted.
+// Internal save paths (streaming frames, retry timers, flushPendingSaves,
+// system-greeting additions) never reset the counter, so a persistently
+// failing session can't loop infinitely.
+const _saveRetryTimers = new Map()        // sessId -> timer handle
+const _saveRetryCount = new Map()          // sessId -> attempt count
+const _saveFatalReported = new Set()        // sessIds already toasted for quota
+const SAVE_MAX_RETRIES = 3
+const SAVE_RETRY_BASE_MS = 800
+
+function _isQuotaError(e) {
+  if (!e) return false
+  const name = e.name || ''
+  return name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED'
+}
+
+function _scheduleSaveRetry(sess) {
+  const id = sess.id
+  if (_saveRetryTimers.has(id)) return  // already pending
+  const attempt = (_saveRetryCount.get(id) || 0) + 1
+  _saveRetryCount.set(id, attempt)
+  if (attempt > SAVE_MAX_RETRIES) {
+    if (!_saveFatalReported.has(id)) {
+      _saveFatalReported.add(id)
+      toast('会话持久化失败，请尝试刷新或清理浏览器存储')
+    }
+    return
+  }
+  const delay = SAVE_RETRY_BASE_MS * 2 ** (attempt - 1)
+  const t = setTimeout(() => {
+    _saveRetryTimers.delete(id)
+    // Session may have been deleted or GC'd while waiting
+    const live = state.sessions.get(id)
+    if (!live || _deletedIds.has(id)) return
+    _enqueueSave(live)
+  }, delay)
+  _saveRetryTimers.set(id, t)
+}
+
+function _clearSaveRetry(id) {
+  const t = _saveRetryTimers.get(id)
+  if (t) clearTimeout(t)
+  _saveRetryTimers.delete(id)
+  _saveRetryCount.delete(id)
+  _saveFatalReported.delete(id)
+}
+
+async function _doSave(sess) {
+  // Guard: don't write back if session was deleted between scheduling and execution
+  if (!state.sessions.has(sess.id) || _deletedIds.has(sess.id)) return
+  // Strip ephemeral runtime-only fields. Turn-state (_sendingInFlight,
+  // _turnStartedAt, _lastFrameAt) is intentionally PRESERVED so a page
+  // refresh can restore the in-flight UI and correctly signal inFlight=true
+  // in the next hello frame. Staleness is handled at load time.
+  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, ...persist } = sess
+  let putError = null
+  try {
+    await dbPut(persist)
+  } catch (e) {
+    putError = e
+    console.warn('dbPut', e)
+  }
+  // Re-check after async dbPut: session may have been deleted while we were writing
+  if (_deletedIds.has(sess.id)) {
+    _clearSaveRetry(sess.id)
+    return
+  }
+  if (putError) {
+    if (_isQuotaError(putError)) {
+      // Quota is a user-actionable condition — don't retry, surface once.
+      if (!_saveFatalReported.has(sess.id)) {
+        _saveFatalReported.add(sess.id)
+        toast('浏览器存储已满，请清理旧会话后重试')
+      }
+      return
+    }
+    _scheduleSaveRetry(sess)
+    return
+  }
+  // Success — clear retry bookkeeping for this session
+  _clearSaveRetry(sess.id)
+  // Sync to server for cross-device access (best-effort)
+  pushSessionToServer(sess)
+}
+
+/**
+ * Sync the global UI (typing indicator, title-busy marker, input enabled)
+ * to the current session's persisted `_sendingInFlight`. Call whenever
+ * `state.currentSessionId` may point at a session whose in-flight flag
+ * was populated from IDB / server sync but the UI hasn't caught up.
+ *
+ * This mirrors the restore path in `switchSession()` (lines 60-69) and is
+ * the single source of UI restoration used by main.js on initial boot and
+ * after `syncSessionsFromServer()` resolves.
+ */
+export function restoreCurrentSessionInFlightUI() {
+  const sess = getSession()
+  const inFlight = !!sess?._sendingInFlight
+  state.sendingInFlight = inFlight
+  _updateSendEnabled?.()
+  if (inFlight) {
+    _showTypingIndicator?.()
+    setTitleBusy(true)
+  } else {
+    _hideTypingIndicator?.()
+    setTitleBusy(false)
+  }
+}
+
+/**
+ * Sanitize turn-state loaded from IndexedDB.
+ *
+ * A persisted `_sendingInFlight=true` is only trustworthy if the turn was
+ * recently active. Otherwise it's a stale flag from a turn that was killed
+ * by a browser crash / force-quit before the final frame arrived, and
+ * restoring it would wedge the UI in a permanent typing state with no
+ * corresponding server-side subprocess.
+ *
+ * Rule: if `_turnStartedAt` is older than STALE_TURN_THRESHOLD_MS (default
+ * 10 min), clear the in-flight flag and related timing. Otherwise leave it
+ * — the reconnect handshake + 30s safety timer will settle ownership.
+ */
+const STALE_TURN_THRESHOLD_MS = 10 * 60_000
+export function sanitizeLoadedTurnState(sess) {
+  if (!sess || !sess._sendingInFlight) return
+  const startedAt = sess._turnStartedAt || 0
+  const lastFrameAt = sess._lastFrameAt || 0
+  const newest = Math.max(startedAt, lastFrameAt)
+  if (!newest || Date.now() - newest > STALE_TURN_THRESHOLD_MS) {
+    sess._sendingInFlight = false
+    sess._turnStartedAt = null
+    sess._lastFrameAt = null
+  }
+}
+
+/**
+ * Cancel all pending and in-flight saves for a deleted session.
+ * Must be called from deleteSession() before dbDelete().
+ */
+export function cancelSavesForSession(id) {
+  _deletedIds.add(id)
+  _saveInFlight.delete(id)
+  const timer = _saveTimers.get(id)
+  if (timer) { clearTimeout(timer); _saveTimers.delete(id) }
+  // Also drop any outstanding retry bookkeeping for this session
+  _clearSaveRetry(id)
+}
+
+/**
+ * Check if a session has a pending delete tombstone.
+ */
+export function isDeletePending(id) {
+  return _deletedIds.has(id)
+}
+
+/**
+ * Clear delete tombstone for a session (e.g. when sync re-fetches it from server).
+ */
+export function clearDeleteTombstone(id) {
+  _deletedIds.delete(id)
+}
+
+/**
+ * Flush all pending debounced saves immediately.
+ * Called on beforeunload/visibilitychange to prevent data loss on refresh.
+ */
+export function flushPendingSaves() {
+  const flushed = new Set()
+  // 1. Fire all pending debounced saves
+  for (const [sessId, timer] of _saveTimers) {
+    clearTimeout(timer)
+    const sess = state.sessions.get(sessId)
+    if (sess) { _enqueueSave(sess); flushed.add(sessId) }
+  }
+  _saveTimers.clear()
+  // 2. Also save any dirty session not already covered above
+  for (const [id, sess] of state.sessions) {
+    if (sess._dirty && !flushed.has(id)) {
+      _enqueueSave(sess)
+    }
+  }
 }
 
 // ═══════════════ SIDEBAR ═══════════════
@@ -266,7 +499,7 @@ export function _buildSessionItem(s) {
         label: s.pinned ? '取消置顶' : '置顶',
         run: () => {
           s.pinned = !s.pinned
-          scheduleSave(s)
+          scheduleSaveFromUserEdit(s)
           renderSidebar()
         },
       },
@@ -294,7 +527,7 @@ export function _buildSessionItem(s) {
           label: s.pinned ? '取消置顶' : '置顶',
           run: () => {
             s.pinned = !s.pinned
-            scheduleSave(s)
+            scheduleSaveFromUserEdit(s)
             renderSidebar()
           },
         },
@@ -327,7 +560,7 @@ export function startInlineRename(titleEl, sess) {
     const v = input.value.trim()
     if (v && v !== sess.title) {
       sess.title = v
-      scheduleSave(sess)
+      scheduleSaveFromUserEdit(sess)
       if (sess.id === state.currentSessionId) $('session-title').textContent = v
     }
     renderSidebar()

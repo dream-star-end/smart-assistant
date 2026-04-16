@@ -1,6 +1,6 @@
 // OpenClaude — OAuth
+import { apiJson } from './api.js'
 import { $ } from './dom.js'
-import { state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
 
 let _oauthState = null
@@ -17,12 +17,7 @@ export function initOAuthListeners() {
   $('oauth-start-btn').onclick = async () => {
     try {
       const oauthProvider = $('oauth-provider').value
-      const r = await fetch('/api/auth/claude/start', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${state.token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: oauthProvider }),
-      })
-      const data = await r.json()
+      const data = await apiJson('POST', '/api/auth/claude/start', { provider: oauthProvider })
       if (data.authUrl) {
         _oauthState = data.state
         window.open(data.authUrl, '_blank')
@@ -65,12 +60,7 @@ export function initOAuthListeners() {
     $('oauth-submit-btn').textContent = '验证中...'
     $('oauth-error').hidden = true
     try {
-      const r = await fetch('/api/auth/claude/callback', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${state.token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, state: _oauthState }),
-      })
-      const data = await r.json()
+      const data = await apiJson('POST', '/api/auth/claude/callback', { code, state: _oauthState })
       if (data.ok) {
         $('oauth-step1').hidden = true
         $('oauth-step2').hidden = false

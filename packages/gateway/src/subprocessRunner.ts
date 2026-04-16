@@ -4,8 +4,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
+import { createLogger } from './logger.js'
 import { buildPromptContext } from './promptSlots.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
+
+const runnerLog = createLogger({ module: 'subprocessRunner' })
 
 // ───────────────────────────────────────────────
 // SubprocessRunner
@@ -65,13 +68,59 @@ export interface SdkMessage {
   is_error?: boolean
 }
 
+/** Permission response from the user (sent back to CCB as control_response) */
+export type PermissionResponse =
+  | { behavior: 'allow'; updatedInput: Record<string, unknown>; toolUseID?: string }
+  | { behavior: 'deny'; message: string; toolUseID?: string }
+
+// Cap for in-memory stdout/stderr accumulation per runner. If CCB ever emits
+// a chunk without newline (malformed output, corrupt base64, wedged write),
+// the buffer can grow unboundedly and eat gigabytes of RSS. When we cross
+// the limit we kill the subprocess and log "ccb.overflow".
+//
+// Configurable via OPENCLAUDE_CCB_MAX_STDOUT_BUF_BYTES (default 8 MiB,
+// clamped to [1 MiB, 256 MiB]).
+function readStdoutBufCap(): number {
+  const raw = Number(process.env.OPENCLAUDE_CCB_MAX_STDOUT_BUF_BYTES)
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.min(Math.max(raw, 1 << 20), 256 << 20)
+  }
+  return 8 << 20
+}
+const MAX_STDOUT_BUF_BYTES = readStdoutBufCap()
+const MAX_STDERR_BUF_BYTES = MAX_STDOUT_BUF_BYTES // same cap applies to stderr
+
 export class SubprocessRunner extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null
   private stdoutBuf = ''
+  /**
+   * Cached UTF-8 byte count of `stdoutBuf`. Updated incrementally on append
+   * and line-flush so per-chunk cap checks are O(1) instead of O(len).
+   */
+  private stdoutBufBytes = 0
+  /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
+  private stderrBufBytes = 0
   private currentSessionId: string | null = null
   private starting = false
   private closed = false
   private shuttingDown = false
+  // ── Crash-loop supervision (exponential backoff) ──
+  // Every time the subprocess exits unexpectedly (or start() throws before a
+  // successful spawn) we increment _consecutiveCrashes and push _backoffUntil
+  // forward. Subsequent start() calls refuse until the backoff window expires,
+  // protecting the host from runaway fork/spawn storms when a config is broken
+  // or CCB immediately segfaults. The counter resets to 0 when the process
+  // either shuts down cleanly OR stayed up long enough to be considered stable
+  // (STABLE_UPTIME_MS), so isolated crashes after a long run don't immediately
+  // trigger seconds-long backoffs.
+  private _consecutiveCrashes = 0
+  private _backoffUntil = 0
+  private _lastStartAt = 0
+  private static BACKOFF_BASE_MS = 500
+  private static BACKOFF_MAX_MS = 30_000
+  private static STABLE_UPTIME_MS = 5 * 60_000
+  /** True once we force-killed due to buffer overflow; prevents double-kill. */
+  private overflowKilled = false
   private sessionDir: string | null = null
   /** Timestamp of last stdout activity — used for liveness detection */
   public lastActivityAt: number = Date.now()
@@ -97,9 +146,32 @@ export class SubprocessRunner extends EventEmitter {
 
   async start(): Promise<void> {
     if (this.proc || this.starting) return
+    // ── Crash-loop gate ──
+    // If the previous crash(es) pushed _backoffUntil into the future, refuse to
+    // spawn until the window passes. This prevents fork storms when CCB is
+    // wedged on a broken config / immediate segfault. The window only exists
+    // after _recordCrash() has set it, so normal startup is unaffected.
+    const gateNow = Date.now()
+    if (gateNow < this._backoffUntil) {
+      const waitSeconds = Math.ceil((this._backoffUntil - gateNow) / 1000)
+      throw new Error(
+        `CCB subprocess is crash-looping; please wait ${waitSeconds}s before retrying (${this._consecutiveCrashes} consecutive crashes)`,
+      )
+    }
+
     this.starting = true
     this.closed = false
+    this.overflowKilled = false
+    this.stdoutBuf = ''
+    this.stdoutBufBytes = 0
+    this.stderrBufBytes = 0
 
+    // Wrap the entire setup in try/catch so ANY pre-spawn failure (config
+    // resolution, buildLearningContext, backend.spawn, …) records a crash and
+    // triggers backoff. Without this, a start() that throws before `this.proc`
+    // is assigned would never bump _consecutiveCrashes, and the caller could
+    // retry immediately and re-throw, burning CPU.
+    try {
     const { config } = this.opts
     let ccbDir: string
     try {
@@ -141,6 +213,12 @@ export class SubprocessRunner extends EventEmitter {
       // bypassPermissions 需要配合 --dangerously-skip-permissions 才真正 放行所有工具
       if (this.opts.permissionMode === 'bypassPermissions') {
         args.push('--dangerously-skip-permissions')
+      } else {
+        // Non-bypass modes: use stdio permission prompting so CCB emits
+        // control_request on stdout instead of trying to show Ink UI (which
+        // doesn't work in pipe mode). The gateway will bridge these requests
+        // to the web frontend for user approval.
+        args.push('--permission-prompt-tool', 'stdio')
       }
     }
     // Single merged prompt file: persona + identity + platform + skills + memory
@@ -220,13 +298,26 @@ export class SubprocessRunner extends EventEmitter {
 
     this.proc = proc as unknown as ChildProcessWithoutNullStreams
 
-    proc.stdin.on('error', (err) => console.warn('[subprocessRunner] stdin error:', err.message))
+    proc.stdin.on('error', (err) =>
+      runnerLog.warn('stdin error', { sessionKey: this.opts.sessionKey }, err),
+    )
     proc.stdout.setEncoding('utf-8')
     proc.stdout.on('data', (chunk: string) => this.handleStdout(chunk))
 
     proc.stderr.setEncoding('utf-8')
+    this.stderrBufBytes = 0
     proc.stderr.on('data', (chunk: string) => {
       this.lastActivityAt = Date.now() // stderr activity also counts as "alive"
+      this.stderrBufBytes += Buffer.byteLength(chunk, 'utf8')
+      // If stderr goes pathological (single burst > cap), kill to avoid RSS
+      // blow-up from downstream listeners that might buffer all of it.
+      if (this.stderrBufBytes > MAX_STDERR_BUF_BYTES) {
+        this.handleBufferOverflow('stderr', this.stderrBufBytes)
+        this.stderrBufBytes = 0
+        return
+      }
+      // Reset counter on newline — stderr is usually line-oriented log output.
+      if (chunk.includes('\n')) this.stderrBufBytes = 0
       this.emit('stderr', chunk)
     })
 
@@ -239,6 +330,17 @@ export class SubprocessRunner extends EventEmitter {
       // - CCB may exit with non-0 code on normal termination
       const crashed = !this.shuttingDown
       this.shuttingDown = false
+      if (crashed) {
+        this._recordCrash()
+      } else {
+        // Graceful shutdown wipes any accumulated backoff — the operator is
+        // in control, not a crash-loop, so the next start() should not be gated.
+        // Also zero _lastStartAt so a post-restart crash can't consult a stale
+        // "stable uptime" timestamp from this now-dead subprocess.
+        this._consecutiveCrashes = 0
+        this._backoffUntil = 0
+        this._lastStartAt = 0
+      }
       this.emit('exit', { code, signal, crashed })
     })
 
@@ -246,28 +348,151 @@ export class SubprocessRunner extends EventEmitter {
       this.emit('error', err)
     })
 
+    // Spawn succeeded — record timestamp for STABLE_UPTIME_MS check. A crash
+    // more than STABLE_UPTIME_MS after this point is treated as a fresh failure
+    // (counter resets) rather than compounding on past crashes.
+    this._lastStartAt = Date.now()
     this.starting = false
+    } catch (err) {
+      // Any failure between backoff-gate-pass and spawn-succeeded is a "start
+      // failed" crash. Record it so the gate fires on the next call.
+      this.starting = false
+      this._recordCrash()
+      throw err
+    }
+  }
+
+  /**
+   * Bump the crash counter and compute the next backoff window.
+   * Called from the exit handler (crashed=true) and the start() catch block.
+   *
+   * Backoff = BASE * 2^(n-1), clamped to MAX. First crash → 500ms, second →
+   * 1s, third → 2s, … up to 30s. Counters reset on graceful shutdown (see
+   * exit handler) or when the previous run was stable for STABLE_UPTIME_MS.
+   */
+  private _recordCrash(): void {
+    const now = Date.now()
+    // If we had a long-lived stable run before this crash, don't punish it —
+    // reset the counter so an isolated crash after hours of uptime starts
+    // fresh at 500ms instead of compounding on a counter from yesterday.
+    if (
+      this._lastStartAt > 0 &&
+      now - this._lastStartAt >= SubprocessRunner.STABLE_UPTIME_MS
+    ) {
+      this._consecutiveCrashes = 0
+    }
+    this._consecutiveCrashes++
+    const expBackoff =
+      SubprocessRunner.BACKOFF_BASE_MS * 2 ** (this._consecutiveCrashes - 1)
+    const backoff = Math.min(expBackoff, SubprocessRunner.BACKOFF_MAX_MS)
+    this._backoffUntil = now + backoff
+    // Consume the stable-uptime window: _lastStartAt is only meaningful for
+    // one "this crash happened after a long stable run" check. If we kept it
+    // after recording the crash, repeated pre-spawn failures would all see
+    // the same old timestamp, reset the counter each time, and the exponential
+    // backoff would never escalate past 500ms. Only a successful spawn should
+    // re-arm the window.
+    this._lastStartAt = 0
+    runnerLog.warn('ccb.crash — scheduling exponential backoff', {
+      sessionKey: this.opts.sessionKey,
+      consecutiveCrashes: this._consecutiveCrashes,
+      backoffMs: backoff,
+    })
   }
 
   private handleStdout(chunk: string): void {
     this.lastActivityAt = Date.now()
-    this.stdoutBuf += chunk
-    let nl: number
-    while ((nl = this.stdoutBuf.indexOf('\n')) >= 0) {
-      const line = this.stdoutBuf.slice(0, nl).trim()
-      this.stdoutBuf = this.stdoutBuf.slice(nl + 1)
-      if (!line) continue
-      try {
-        const msg = JSON.parse(line) as SdkMessage
-        // Always update session ID (CCB may report a new one after --resume)
-        if (msg.session_id && msg.session_id !== this.currentSessionId) {
-          this.currentSessionId = msg.session_id
-          this.emit('session_id', this.currentSessionId)
-        }
-        this.emit('message', msg)
-      } catch (err) {
-        this.emit('parse_error', { line, err })
+
+    // We scan `chunk` in place WITHOUT doing `stdoutBuf += chunk` first.
+    // For each complete line formed by `stdoutBuf + chunk[0..nl]` (first line)
+    // or `chunk[prev..nl]` (subsequent lines), we check the byte length
+    // BEFORE materializing the full line. Only the trailing partial (no
+    // newline) is appended to `stdoutBuf`. This guarantees the in-memory
+    // working set never exceeds MAX_STDOUT_BUF_BYTES even if the chunk itself
+    // contains multiple oversized lines.
+    let offset = 0
+    let firstLineConsumesBuf = this.stdoutBufBytes > 0
+    while (true) {
+      const nlIdx = chunk.indexOf('\n', offset)
+      if (nlIdx < 0) break
+
+      const tail = chunk.slice(offset, nlIdx)
+      const tailBytes = Buffer.byteLength(tail, 'utf8')
+      const lineBytes =
+        (firstLineConsumesBuf ? this.stdoutBufBytes : 0) + tailBytes
+      if (lineBytes > MAX_STDOUT_BUF_BYTES) {
+        this.handleBufferOverflow('stdout', lineBytes)
+        this.stdoutBuf = ''
+        this.stdoutBufBytes = 0
+        return
       }
+
+      // Materialize the full line (≤ cap bytes), emit parsed message
+      let fullLine: string
+      if (firstLineConsumesBuf) {
+        fullLine = this.stdoutBuf + tail
+        this.stdoutBuf = ''
+        this.stdoutBufBytes = 0
+        firstLineConsumesBuf = false
+      } else {
+        fullLine = tail
+      }
+      const trimmed = fullLine.trim()
+      if (trimmed) {
+        try {
+          const msg = JSON.parse(trimmed) as SdkMessage
+          // Always update session ID (CCB may report a new one after --resume)
+          if (msg.session_id && msg.session_id !== this.currentSessionId) {
+            this.currentSessionId = msg.session_id
+            this.emit('session_id', this.currentSessionId)
+          }
+          this.emit('message', msg)
+        } catch (err) {
+          this.emit('parse_error', { line: trimmed, err })
+        }
+      }
+
+      offset = nlIdx + 1
+    }
+
+    // Trailing partial (no newline) — append to stdoutBuf after cap check.
+    if (offset < chunk.length) {
+      const trailing = offset === 0 ? chunk : chunk.slice(offset)
+      const trailingBytes = Buffer.byteLength(trailing, 'utf8')
+      const projected = this.stdoutBufBytes + trailingBytes
+      if (projected > MAX_STDOUT_BUF_BYTES) {
+        this.handleBufferOverflow('stdout', projected)
+        this.stdoutBuf = ''
+        this.stdoutBufBytes = 0
+        return
+      }
+      this.stdoutBuf += trailing
+      this.stdoutBufBytes += trailingBytes
+    }
+  }
+
+  /**
+   * Called when stdout or stderr accumulates beyond the buffer cap.
+   * Emits an `overflow` event with details and kills the subprocess group.
+   * Idempotent — a second trigger during the same kill window is a no-op.
+   */
+  private handleBufferOverflow(stream: 'stdout' | 'stderr', size: number): void {
+    if (this.overflowKilled || this.closed) return
+    this.overflowKilled = true
+    const proc = this.proc
+    const pid = proc?.pid
+    const info = { stream, size, cap: MAX_STDOUT_BUF_BYTES, pid, sessionKey: this.opts.sessionKey }
+    runnerLog.error('ccb.overflow — force-killing subprocess', info)
+    this.emit('overflow', info)
+    // Trigger an exit path: force-kill the process group so MCP children die too.
+    try {
+      if (pid) {
+        try { process.kill(-pid, 'SIGKILL') } catch { proc?.kill('SIGKILL') }
+      } else {
+        proc?.kill('SIGKILL')
+      }
+    } catch (err) {
+      runnerLog.warn('overflow kill failed', { sessionKey: this.opts.sessionKey }, err)
     }
   }
 
@@ -292,7 +517,7 @@ export class SubprocessRunner extends EventEmitter {
     try {
       this.proc.stdin.write(`${JSON.stringify(userMsg)}\n`)
     } catch (err: any) {
-      console.warn('[subprocessRunner] stdin write failed:', err.message)
+      runnerLog.warn('stdin write failed', { sessionKey: this.opts.sessionKey }, err)
     }
   }
 
@@ -328,7 +553,11 @@ export class SubprocessRunner extends EventEmitter {
         out.extraPromptFile = path
       }
     } catch (err) {
-      console.warn('[subprocessRunner] failed to build extra prompt:', err)
+      runnerLog.warn(
+        'failed to build extra prompt',
+        { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
+        err,
+      )
     }
 
     // Write MCP config pointing at the mcp-memory stdio server
@@ -365,7 +594,9 @@ export class SubprocessRunner extends EventEmitter {
           },
         }
       } else {
-        console.warn('[subprocessRunner] mcp-memory entry not found, skipping built-in MCP')
+        runnerLog.warn('mcp-memory entry not found, skipping built-in MCP', {
+          sessionKey: this.opts.sessionKey,
+        })
       }
 
       // ── MCP servers: three-layer merge + toolset filtering ──
@@ -431,10 +662,33 @@ export class SubprocessRunner extends EventEmitter {
         out.mcpConfigFile = mcpPath
       }
     } catch (err) {
-      console.warn('[subprocessRunner] failed to write mcp config:', err)
+      runnerLog.warn(
+        'failed to write mcp config',
+        { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
+        err,
+      )
     }
 
     return out
+  }
+
+  // 发送权限审批响应 — CCB 在 stdio 模式下等待 control_response
+  sendPermissionResponse(requestId: string, response: PermissionResponse): boolean {
+    if (!this.proc) return false
+    try {
+      const msg = {
+        type: 'control_response',
+        response: {
+          request_id: requestId,
+          subtype: 'success',
+          response,
+        },
+      }
+      this.proc.stdin.write(`${JSON.stringify(msg)}\n`)
+      return true
+    } catch {
+      return false
+    }
   }
 
   // 发送 interrupt control request — CCB 会中止当前 turn

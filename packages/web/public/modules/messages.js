@@ -94,13 +94,15 @@ let _updateSendEnabled
 let _showTypingIndicator
 let _hideTypingIndicator
 let _setTitleBusy
-let _scheduleSave
+let _scheduleSaveFromUserEdit
+let _clearTurnTiming
 export function setMessageDeps(deps) {
   _updateSendEnabled = deps.updateSendEnabled
   _showTypingIndicator = deps.showTypingIndicator
   _hideTypingIndicator = deps.hideTypingIndicator
   _setTitleBusy = deps.setTitleBusy
-  _scheduleSave = deps.scheduleSave
+  _scheduleSaveFromUserEdit = deps.scheduleSaveFromUserEdit
+  _clearTurnTiming = deps.clearTurnTiming
 }
 
 // ── Message status rendering ──
@@ -206,6 +208,26 @@ function _shortPath(p) {
   // Show last 2-3 path segments
   const parts = p.replace(/\\/g, '/').split('/')
   return parts.length > 3 ? '…/' + parts.slice(-3).join('/') : p
+}
+
+function _buildPermissionCard(el, msg) {
+  const toolName = htmlSafeEscape(msg.toolName || 'unknown')
+  const resolved = msg._resolved
+  const behavior = msg._behavior
+  const statusIcon = !resolved ? '⏳' : behavior === 'allow' ? '✓' : '✗'
+  const statusText = !resolved ? 'Waiting for approval...' : behavior === 'allow' ? 'Allowed' : 'Denied'
+  const statusClass = !resolved ? '' : behavior === 'allow' ? 'resolved-allow' : 'resolved-deny'
+
+  const body = document.createElement('div')
+  body.className = `msg-body ${statusClass}`
+  body.innerHTML = `<div style="display:flex;align-items:center;gap:8px">` +
+    `<span style="font-size:16px">${statusIcon}</span>` +
+    `<span style="font-weight:600">Permission: </span>` +
+    `<code>${toolName}</code>` +
+    `<span style="color:var(--fg-muted);margin-left:auto;font-size:12px">${statusText}</span>` +
+    `</div>` +
+    (msg.inputPreview ? `<div style="font-size:12px;color:var(--fg-muted);margin-top:4px;word-break:break-all">${htmlSafeEscape(msg.inputPreview.slice(0, 200))}</div>` : '')
+  el.appendChild(body)
 }
 
 function _buildToolCard(el, msg) {
@@ -622,6 +644,7 @@ export function _buildMessageEl(msg) {
             }))
           }
           sess._sendingInFlight = false
+          _clearTurnTiming?.(sess)
           state.sendingInFlight = false
           _hideTypingIndicator()
           _updateSendEnabled()
@@ -682,6 +705,7 @@ export function _buildMessageEl(msg) {
                 }
               } catch {}
               sess._sendingInFlight = false
+              _clearTurnTiming?.(sess)
               if (sess.id === state.currentSessionId) {
                 state.sendingInFlight = false
                 _updateSendEnabled()
@@ -705,7 +729,7 @@ export function _buildMessageEl(msg) {
             toast('离线排队中，重连后自动重新生成')
           }
         }
-        _scheduleSave(sess)
+        _scheduleSaveFromUserEdit(sess)
       } else if (action === 'tts-stop') {
         // Stop ongoing TTS playback
         if (window.speechSynthesis) window.speechSynthesis.cancel()
@@ -750,12 +774,12 @@ export function _buildMessageEl(msg) {
           sess.messages.splice(idx, 0, msg)
           el.style.display = ''
           undoToast.remove()
-          _scheduleSave(sess)
+          _scheduleSaveFromUserEdit(sess)
         }
         setTimeout(() => {
           if (!undone) {
             el.remove()
-            _scheduleSave(sess)
+            _scheduleSaveFromUserEdit(sess)
           }
           undoToast.remove()
         }, 4000)
@@ -804,6 +828,8 @@ export function _buildMessageEl(msg) {
     body.className = 'msg-body thinking-body'
     body.textContent = msg.text || ''
     el.appendChild(body)
+  } else if (msg.role === 'permission') {
+    _buildPermissionCard(el, msg)
   } else if (msg.role === 'tool') {
     // Detect legacy tool messages: old format stored toolName+text but no _completed flag.
     // New format always sets _completed to a boolean (false initially, true on result).
@@ -841,7 +867,11 @@ export function _buildMessageEl(msg) {
 export function renderMessage(msg, skipRichBlocks = false) {
   const main = ensureInner()
   const el = _buildMessageEl(msg)
-  main.appendChild(el)
+  // Keep the typing indicator pinned at the bottom — if it is currently visible,
+  // insert new messages above it instead of appending after it.
+  const typing = main.querySelector('.typing-indicator')
+  if (typing) main.insertBefore(el, typing)
+  else main.appendChild(el)
   if (!skipRichBlocks) processRichBlocks()
 }
 
@@ -923,6 +953,11 @@ export function updateMessageEl(msg, streaming) {
     if (label) label.textContent = streaming ? '💭 思考中…' : '💭 思考过程'
     // Auto-collapse when streaming ends
     if (!streaming) el.classList.add('collapsed')
+  } else if (msg.role === 'permission') {
+    el.innerHTML = ''
+    el.className = 'msg permission'
+    el.dataset.msgId = msg.id
+    _buildPermissionCard(el, msg)
   } else if (msg.role === 'tool') {
     // Legacy tool messages don't need rich re-render
     if (typeof msg._completed !== 'boolean') {

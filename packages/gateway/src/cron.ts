@@ -220,6 +220,8 @@ function matchPart(part: string, val: number): boolean {
 
 export class CronScheduler {
   private timer: NodeJS.Timeout | null = null
+  private bootTickTimer: NodeJS.Timeout | null = null
+  private stopped = false
   private running = false
   /** Reference to last-active-channel map for heartbeat session routing */
   public lastActiveChannel?: Map<
@@ -237,16 +239,25 @@ export class CronScheduler {
     await ensureCronFile()
     // Tick once per minute
     this.timer = setInterval(() => {
+      if (this.stopped) return
       if (!this.running) this.tick().catch((err) => logger.error('tick failed', {}, err))
     }, 60_000)
-    // Fire an initial tick 10s after boot (not immediate, to avoid startup race)
-    setTimeout(() => this.tick().catch(() => {}), 10_000)
+    // Fire an initial tick 10s after boot (not immediate, to avoid startup race).
+    // Track the handle so stop() can cancel it during shutdown.
+    this.bootTickTimer = setTimeout(() => {
+      this.bootTickTimer = null
+      if (this.stopped) return
+      this.tick().catch(() => {})
+    }, 10_000)
     logger.info('scheduler started')
   }
 
   stop(): void {
+    this.stopped = true
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    if (this.bootTickTimer) clearTimeout(this.bootTickTimer)
+    this.bootTickTimer = null
   }
 
   private async tick(): Promise<void> {

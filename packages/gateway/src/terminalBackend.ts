@@ -8,6 +8,9 @@
  * Future backends (ssh, remote node) can implement the same interface.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import { createLogger } from './logger.js'
+
+const backendLog = createLogger({ module: 'terminalBackend' })
 
 export interface TerminalBackendConfig {
   type: string // 'local' | 'docker' | future: 'ssh', 'remote'
@@ -117,6 +120,6 @@ export class DockerBackend implements TerminalBackend {
 export function createBackend(config?: TerminalBackendConfig): TerminalBackend {
   if (!config || config.type === 'local') return new LocalBackend()
   if (config.type === 'docker') return new DockerBackend(config)
-  console.warn(`[terminal] unknown backend type "${config.type}", falling back to local`)
+  backendLog.warn('unknown backend type, falling back to local', { type: config.type })
   return new LocalBackend()
 }

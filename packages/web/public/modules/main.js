@@ -21,13 +21,13 @@ import {
 import { getSession, isSending, setSending, state } from './state.js'
 
 // ── API layer ──
-import { apiGet, apiJson, authHeaders } from './api.js'
+import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired } from './api.js'
 
 // ── IndexedDB ──
-import { dbDelete, dbGetAll, dbPut, openDB } from './db.js'
+import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { syncSessionsFromServer } from './sync.js'
+import { setSyncDeps, syncSessionsFromServer } from './sync.js'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
@@ -91,9 +91,13 @@ import {
   createSession,
   deleteSession,
   exportSessionMd,
+  flushPendingSaves,
   hideContextMenu,
   renderSidebar,
+  restoreCurrentSessionInFlightUI,
+  sanitizeLoadedTurnState,
   scheduleSave,
+  scheduleSaveFromUserEdit,
   setSessionDeps,
   setSessionUIDeps,
   showContextMenu,
@@ -124,10 +128,14 @@ import {
   addSystemMessage,
   buildToolUseLabel,
   completeBgTask,
+  clearTurnTiming,
   connect,
   formatMeta,
   handleOutbound,
   hideTypingIndicator,
+  notifyNetworkOffline,
+  notifyNetworkOnline,
+  notifyTabVisible,
   resetThinkingSafety,
   setMeta,
   setStatus,
@@ -177,6 +185,8 @@ setMessageDeps({
   hideTypingIndicator,
   setTitleBusy,
   scheduleSave,
+  scheduleSaveFromUserEdit,
+  clearTurnTiming,
 })
 
 setWsDeps({
@@ -197,6 +207,7 @@ setCommandDeps({
   createNewChat: () => createNewChat(),
   renderMessages,
   scheduleSave,
+  scheduleSaveFromUserEdit,
   openMemoryModal,
   openSkillsModal,
   openPersonaEditor,
@@ -228,6 +239,109 @@ window.addEventListener('focus', () => {
 window.addEventListener('blur', () => {
   state.windowFocused = false
 })
+// Flush pending saves before page unload to prevent data loss on refresh.
+// iOS Safari + modern Chromium bfcache don't fire beforeunload reliably,
+// so we also hook pagehide (which IS fired under bfcache) and
+// visibilitychange (app switch / tab hide on mobile). All three are
+// best-effort: the browser may kill async IDB transactions mid-write, but
+// the retry-on-rehydrate path in _doSave + scheduleSave on next edit
+// will eventually catch up.
+window.addEventListener('beforeunload', () => {
+  flushPendingSaves()
+})
+window.addEventListener('pagehide', () => {
+  flushPendingSaves()
+})
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) flushPendingSaves()
+})
+// ── Progressive reconnect safety ──
+// `online`/`offline`: browser-reported network status. Pausing reconnect
+// attempts while offline prevents the exponential backoff from ratcheting
+// up against no network at all (e.g. laptop lid closed for an hour).
+// `visibilitychange` (tab shown): kick off an immediate reconnect attempt
+// instead of waiting out the scheduled backoff, since mobile/desktop can
+// pause JS timers while hidden.
+window.addEventListener('online', () => notifyNetworkOnline())
+window.addEventListener('offline', () => notifyNetworkOffline())
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) notifyTabVisible()
+})
+// ── Global error handlers ──
+// Last-resort UI feedback for any uncaught exception or unhandled promise
+// rejection that escapes module-level try/catch. Without this the user
+// silently loses information (console is hidden), and a noisy loop of the
+// same error can still spam the UI, so we rate-limit by signature.
+//
+// Denylist: errors known to be benign or impossible to act on in-browser:
+//   • AbortError — user cancelled a fetch (stop button, navigation).
+//   • TimeoutError — apiFetch's own timeout guard (see api.js _composeSignal);
+//     already surfaces through the affected feature.
+//   • "ResizeObserver loop …" — Chromium warning, never actionable.
+//   • "Script error." — cross-origin script without CORS; no details anyway.
+//   • "Load failed" / TypeError from aborted fetch on Safari.
+const _errorToastHistory = new Map() // signature → last shown ts
+const ERROR_TOAST_COOLDOWN_MS = 10000
+// Error names we always suppress — these are either user-initiated (fetch
+// cancellation), our own timeout (apiFetch aborts with TimeoutError), or
+// non-actionable browser warnings.
+const _SUPPRESSED_ERROR_NAMES = new Set(['AbortError', 'TimeoutError'])
+
+function _shouldSuppressError(errLike, msg) {
+  // Primary: inspect the actual Error/DOMException object — this correctly
+  // catches apiFetch's DOMException('…', 'TimeoutError') even though the
+  // message itself contains no "AbortError" substring.
+  const name = errLike?.name
+  if (name && _SUPPRESSED_ERROR_NAMES.has(name)) return true
+  if (!msg) return true
+  const s = String(msg)
+  // Fallback for events that only expose a string message (cross-origin,
+  // older browsers, or rejections thrown as plain strings).
+  if (s.includes('AbortError') || s === 'AbortError') return true
+  if (s.includes('TimeoutError')) return true
+  if (s.includes('Request timeout')) return true
+  if (s.includes('ResizeObserver loop')) return true
+  if (s === 'Script error.' || s.startsWith('Script error')) return true
+  if (s === 'Load failed') return true
+  return false
+}
+
+function _showErrorToastOnce(errLike, msg) {
+  if (_shouldSuppressError(errLike, msg)) return
+  const sig = String(msg || errLike?.message || 'error').slice(0, 120)
+  const now = Date.now()
+  const last = _errorToastHistory.get(sig) || 0
+  if (now - last < ERROR_TOAST_COOLDOWN_MS) return
+  _errorToastHistory.set(sig, now)
+  // Light cap on map size so long-running tabs don't grow it unbounded.
+  if (_errorToastHistory.size > 64) {
+    const oldest = [...(_errorToastHistory.entries())].sort((a, b) => a[1] - b[1])[0]
+    if (oldest) _errorToastHistory.delete(oldest[0])
+  }
+  toast(`出错了: ${sig}`, 'error')
+}
+
+window.addEventListener('error', (ev) => {
+  // ev.error is the raw Error for scripts we own; ev.message is the display
+  // string the browser already computed. Prefer ev.error.message when available.
+  const msg = ev.error?.message || ev.message || '未知脚本错误'
+  // Full details to console for debugging — NOT muted by the toast guard.
+  console.error('[global error]', ev.error || ev)
+  _showErrorToastOnce(ev.error, msg)
+})
+
+window.addEventListener('unhandledrejection', (ev) => {
+  const reason = ev.reason
+  // Prefer Error.message, fall back to String(reason). Some code rejects with
+  // a plain object {error: "..."} — dig a level.
+  const msg = reason?.message
+    || reason?.error
+    || (typeof reason === 'string' ? reason : null)
+    || '未处理的异步错误'
+  console.error('[unhandled rejection]', reason)
+  _showErrorToastOnce(reason, msg)
+})
+
 // Auto-resize htmlpreview iframes based on content height
 window.addEventListener('message', (e) => {
   if (e.data?.type === 'iframe-resize' && e.data.id && e.data.h) {
@@ -556,7 +670,7 @@ function send() {
   state.attachments = []
   renderAttachments()
   autoResize()
-  scheduleSave(sess)
+  scheduleSaveFromUserEdit(sess)
   renderSidebar()
 }
 
@@ -724,11 +838,12 @@ function buildPaletteItems(query) {
             sess._streamingAssistant = null
             sess._streamingThinking = null
             sess._sendingInFlight = false
+            clearTurnTiming(sess)
             state.sendingInFlight = false
             hideTypingIndicator()
             updateSendEnabled()
             setTitleBusy(false)
-            scheduleSave(sess)
+            scheduleSaveFromUserEdit(sess)
             renderAgentDropdown()
             toast(`已切换到 ${a.id}`)
           }
@@ -803,6 +918,53 @@ function closePalette() {
 
 // ── Views ──
 
+// Tear down all authenticated client state and return to login.
+// serverLogout=true: fire-and-forget POST /api/auth/logout to expire the
+// HttpOnly session cookie. Not awaited — the UI should never block on the
+// network here; a stalled server must not prevent the user from reaching
+// the login screen. Skipped entirely when triggered by 401 auth-expired —
+// the cookie is already invalid server-side and another round-trip would
+// just 401 again (and funnel back through this handler).
+async function _forceLogout({ serverLogout } = {}) {
+  if (serverLogout) {
+    // suppressAuthRedirect=true: a 401 on this call would be meaningless
+    // (we're already tearing down), and we don't want to recursively fire
+    // the auth-expired handler. 5s timeout — if the server is slow the
+    // local teardown continues regardless.
+    apiFetch('/api/auth/logout', {
+      method: 'POST',
+      timeout: 5000,
+      suppressAuthRedirect: true,
+    }).catch(() => {})
+  }
+  localStorage.removeItem('openclaude_token')
+  state.token = ''  // Clear token BEFORE close so onclose handler won't auto-reconnect
+  // Rearm the auth-expired one-shot so a future session expiry can trigger
+  // the logout flow again. login success also does this, but doing it here
+  // too keeps the semantics symmetric across both teardown paths.
+  resetAuthExpired()
+  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  // Clear all in-memory session data and offline queues to prevent cross-identity leakage
+  state.sessions.clear()
+  state.currentSessionId = null
+  state.offlineQueue = []
+  state._offlineQueuePending = []
+  state._offlineDrainingCurrent = null
+  state._offlineQueueDraining = false
+  state.sendingInFlight = false
+  state.attachments = []
+  renderAttachments()
+  hideTypingIndicator()
+  // Clear IndexedDB to prevent cross-user data leakage on shared browsers
+  try {
+    const all = await dbGetAll()
+    for (const s of all) await dbDelete(s.id)
+  } catch {}
+  if (state.ws) state.ws.close(1000)
+  showLogin()
+}
+
 function showLogin() {
   $('login-view').hidden = false
   $('app-view').hidden = true
@@ -827,18 +989,100 @@ function showLogin() {
   setTimeout(() => $('username').focus(), 50)
 }
 
-function showApp() {
+// Session-cookie handshake for media preview.
+// HTML5 <img>/<audio>/<video> can't attach an Authorization header, so the
+// gateway issues an HttpOnly cookie via POST /api/auth/session. We have to
+// await this before rendering messages — otherwise the first batch of
+// media elements fire requests with no credential and 401. The request is
+// timeboxed to MEDIA_COOKIE_TIMEOUT_MS: if the gateway is slow/unreachable,
+// the UI still loads, and the delegated media-error retry (see
+// _installMediaErrorRetry) will re-attempt once the cookie eventually lands.
+const MEDIA_COOKIE_TIMEOUT_MS = 3000
+let _cookieInflight = null
+async function _ensureSessionCookie() {
+  if (!state.token) return false
+  if (_cookieInflight) return _cookieInflight
+  // suppressAuthRedirect: if this specific call 401s we do NOT want to force
+  // logout — caller is about to render messages and the delegated media-error
+  // retry will re-attempt. If the token is genuinely expired, the *next* API
+  // call (sync/etc.) will hit 401 and trigger the logout properly.
+  _cookieInflight = (async () => {
+    try {
+      const r = await apiFetch('/api/auth/session', {
+        method: 'POST',
+        headers: authHeaders(),
+        timeout: MEDIA_COOKIE_TIMEOUT_MS,
+        suppressAuthRedirect: true,
+      })
+      return r.ok
+    } catch {
+      return false
+    }
+  })().finally(() => {
+    _cookieInflight = null
+  })
+  return _cookieInflight
+}
+
+async function showApp() {
   $('login-view').hidden = true
   $('app-view').hidden = false
-  // Set HttpOnly session cookie for media preview (img/audio/video can't send Bearer headers)
-  fetch('/api/auth/session', { method: 'POST', headers: authHeaders() }).catch(() => {})
+  await _ensureSessionCookie()
+}
+
+// Delegated media-error retry. `error` events on <img>/<audio>/<video> don't
+// bubble, so we listen in the capture phase from the document root. A load
+// failure on an /api/media or /api/file URL most often means the session
+// cookie wasn't in place when the element's src first resolved. We try
+// once to (re-)set the cookie and cache-bust the src. The retry is guarded
+// by a WeakSet to prevent infinite loops if the URL is genuinely broken.
+const _mediaRetried = new WeakSet()
+const _API_MEDIA_PATH_RE = /^\/api\/(?:media|file)(?:\/|$)/
+function _shouldRetryMediaSrc(src) {
+  if (!src) return false
+  try {
+    const u = new URL(src, location.href)
+    if (u.origin !== location.origin) return false
+    return _API_MEDIA_PATH_RE.test(u.pathname)
+  } catch {
+    return false
+  }
+}
+function _installMediaErrorRetry() {
+  document.addEventListener(
+    'error',
+    async (e) => {
+      const el = e.target
+      if (!el || _mediaRetried.has(el)) return
+      const tag = el.tagName
+      if (tag !== 'IMG' && tag !== 'AUDIO' && tag !== 'VIDEO') return
+      const src = el.getAttribute('src') || el.src || ''
+      if (!_shouldRetryMediaSrc(src)) return
+      _mediaRetried.add(el)
+      const ok = await _ensureSessionCookie()
+      if (!ok) return
+      // Cache-bust: force the browser to reissue the request (now with cookie).
+      try {
+        const u = new URL(src, location.href)
+        u.searchParams.set('_retry', Date.now().toString())
+        el.src = u.toString()
+      } catch {
+        // Relative/malformed URL fallback — just append the query string.
+        const sep = src.includes('?') ? '&' : '?'
+        el.src = `${src}${sep}_retry=${Date.now()}`
+      }
+    },
+    true,
+  )
 }
 
 function createNewChat() {
-  // Save old session's sending state before switching
+  // Inherit current session's agent, fallback to default. Do NOT write the
+  // global `state.sendingInFlight` back onto `oldSess._sendingInFlight` —
+  // the session flag is the source of truth (see rationale in
+  // sessions.switchSession). The new session is never in-flight, so we
+  // only clear the global UI state below.
   const oldSess = getSession()
-  if (oldSess) oldSess._sendingInFlight = state.sendingInFlight
-  // Inherit current session's agent, fallback to default
   const agentId = oldSess?.agentId || state.defaultAgentId
   createSession(agentId)
   // New session is never sending — reset UI state
@@ -942,8 +1186,7 @@ let _changelogData = null
 
 async function loadChangelog() {
   try {
-    const resp = await fetch('/api/changelog', { headers: authHeaders() })
-    _changelogData = await resp.json()
+    _changelogData = await apiGet('/api/changelog')
     // Show version in sidebar
     if (_changelogData.currentVersion) {
       const vEl = $('app-version')
@@ -1061,6 +1304,36 @@ async function submitFeedback() {
 // ═══════════════════════════════════════════════════════════
 
 async function init() {
+  // Global retry-once for <img>/<audio>/<video> that 401 before the session
+  // cookie handshake lands (e.g. the cookie fetch was slow on first boot).
+  _installMediaErrorRetry()
+  // Central auth-expired handler: any API call that returns 401 funnels here,
+  // we tear down local state and show the login screen. Idempotent — only
+  // fires once per expiry (see api.js). Skip if we're already on the login
+  // view (e.g. login endpoint itself responded 401 with wrong credentials).
+  onAuthExpired(() => {
+    if (!$('login-view').hidden) return
+    toast('登录已过期，请重新登录', 'error')
+    _forceLogout()
+  })
+  // Fired once per tab if IndexedDB is unavailable (private browsing, blocked
+  // by another tab during an upgrade, corrupted profile). Sessions still
+  // work for the lifetime of this tab via the in-memory fallback in db.js,
+  // but the user should know their chat history won't persist across refresh.
+  onIdbUnavailable(() => {
+    toast('本地存储不可用，当前会话不会保存到本地', 'error')
+  })
+  // Cross-device sync conflict resolution: when pushSessionToServer hits a
+  // 409 and pulls the server version, the in-memory session has been rewritten
+  // but the DOM is still rendering the old snapshot. Re-render so the user
+  // sees the winning server state immediately instead of after the next full
+  // sync tick.
+  setSyncDeps({
+    onConflictResolved: (sessId) => {
+      if (sessId === state.currentSessionId) renderMessages()
+      renderSidebar() // title / lastAt may have changed either way
+    },
+  })
   // Sidebar search
   let _searchDebounce = null
   // Tasks panel toggle
@@ -1093,34 +1366,7 @@ async function init() {
     $('new-chat-btn')?.setAttribute('title', '新建会话 (Ctrl+N)')
   }
   $('new-chat-btn').onclick = createNewChat
-  $('logout-btn').onclick = async () => {
-    // Expire the HttpOnly oc_session cookie on server
-    try {
-      await fetch('/api/auth/logout', { method: 'POST' })
-    } catch {}
-    localStorage.removeItem('openclaude_token')
-    state.token = ''  // Clear token BEFORE close so onclose handler won't auto-reconnect
-    if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
-    if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
-    // Clear all in-memory session data and offline queues to prevent cross-identity leakage
-    state.sessions.clear()
-    state.currentSessionId = null
-    state.offlineQueue = []
-    state._offlineQueuePending = []
-    state._offlineDrainingCurrent = null
-    state._offlineQueueDraining = false
-    state.sendingInFlight = false
-    state.attachments = []
-    renderAttachments()
-    hideTypingIndicator()
-    // Clear IndexedDB to prevent cross-user data leakage on shared browsers
-    try {
-      const all = await dbGetAll()
-      for (const s of all) await dbDelete(s.id)
-    } catch {}
-    if (state.ws) state.ws.close(1000)
-    showLogin()
-  }
+  $('logout-btn').onclick = () => _forceLogout({ serverLogout: true })
   $('theme-btn').onclick = cycleTheme
   $('toggle-sidebar').onclick = () => {
     $('sidebar').classList.toggle('open')
@@ -1142,12 +1388,13 @@ async function init() {
     sess._streamingAssistant = null
     sess._streamingThinking = null
     sess._sendingInFlight = false
+    clearTurnTiming(sess)
     if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
     state.sendingInFlight = false
     hideTypingIndicator()
     updateSendEnabled()
     setTitleBusy(false)
-    scheduleSave(sess)
+    scheduleSaveFromUserEdit(sess)
     toast(`已切换到 ${sess.agentId}`)
   }
   // Settings dropdown
@@ -1185,10 +1432,7 @@ async function init() {
     else if (action === 'config') {
       ;(async () => {
         try {
-          const r = await fetch('/api/config', {
-            headers: { Authorization: `Bearer ${state.token}` },
-          })
-          const cfg = await r.json()
+          const cfg = await apiGet('/api/config')
           addSystemMessage(`**当前配置:**\n\`\`\`json\n${JSON.stringify(cfg, null, 2)}\n\`\`\``)
         } catch {
           toast('获取配置失败', 'error')
@@ -1328,12 +1572,13 @@ async function init() {
     $('login-btn').disabled = true
     $('login-btn').textContent = '登录中…'
     try {
-      const resp = await fetch('/api/auth/login', {
+      const resp = await apiFetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: username || '', password }),
+        suppressAuthRedirect: true, // bad credentials → we render inline error, not logout flow
       })
-      const data = await resp.json()
+      const data = await resp.json().catch(() => ({}))
       if (!resp.ok) {
         $('login-error').textContent = data.error || '登录失败'
         $('login-error').style.display = 'block'
@@ -1341,23 +1586,30 @@ async function init() {
       }
       state.token = data.token
       localStorage.setItem('openclaude_token', data.token)
+      // A fresh login re-arms the auth-expired handler so the *next* token
+      // expiry can trigger logout again (it's a one-shot guard per session).
+      resetAuthExpired()
       // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage
       try {
         const stale = await dbGetAll()
         for (const s of stale) await dbDelete(s.id)
       } catch {}
-      showApp()
+      // Await so the HttpOnly session cookie is in place before any
+      // <img>/<audio>/<video> tags get their src set by renderMessages.
+      await showApp()
       renderSidebar()
       renderMessages()
       connect()
       reloadAgents()
       loadChangelog()
       // Pull sessions from server for this user (cross-device sync)
-      syncSessionsFromServer().then(() => {
+      syncSessionsFromServer().then((result) => {
         const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
         if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
           state.currentSessionId = updated[0]?.id || null
           if (!state.currentSessionId) createSession()
+          renderMessages()
+        } else if (result?.needsRenderMessages) {
           renderMessages()
         }
         renderSidebar()
@@ -1434,6 +1686,10 @@ async function init() {
   try {
     const all = await dbGetAll()
     for (const s of all) {
+      // Stale turn-state detection: a persisted _sendingInFlight from a
+      // long-ago session is dropped; recent ones are kept so UI can restore
+      // and the reconnect handshake can settle ownership.
+      sanitizeLoadedTurnState(s)
       _rebuildSearchIndex(s)
       state.sessions.set(s.id, s)
     }
@@ -1445,20 +1701,40 @@ async function init() {
   else createSession()
 
   if (state.token) {
-    showApp()
+    // Await so the HttpOnly session cookie is in place before any
+    // <img>/<audio>/<video> tags get their src set by renderMessages.
+    await showApp()
     renderSidebar()
     renderMessages()
+    // Restore in-flight UI for the selected session before ws connects.
+    // sanitizeLoadedTurnState() above already cleared stale flags; anything
+    // surviving here is a turn interrupted within the freshness window.
+    // Without this, users would see a blank window until ws.onopen fires
+    // (websocket.js:423 only restores state for the then-current session).
+    restoreCurrentSessionInFlightUI()
     connect()
     reloadAgents()
     loadChangelog()
     // Cross-device sync: pull sessions from server in background
-    syncSessionsFromServer().then(() => {
-      // Re-render if sessions changed (added or removed)
+    syncSessionsFromServer().then((result) => {
+      // Re-render if sessions changed (added or removed) or current session was updated
       const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+      let currentChanged = false
       if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
         state.currentSessionId = updated[0]?.id || null
         if (!state.currentSessionId) createSession()
+        currentChanged = true
         renderMessages()
+      } else if (result?.needsRenderMessages) {
+        renderMessages()
+      }
+      // Sync the typing indicator / title-busy state if the current session
+      // was swapped or re-fetched (sync may have replaced the session object
+      // with a fresh one whose persisted turn-state differs from what the
+      // UI is showing). This is the sync-path counterpart to the initial
+      // boot-time restore above.
+      if (currentChanged || result?.needsRenderMessages) {
+        restoreCurrentSessionInFlightUI()
       }
       renderSidebar()
     }).catch(() => {})

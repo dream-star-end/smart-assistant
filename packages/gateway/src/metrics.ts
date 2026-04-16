@@ -95,6 +95,7 @@ export const turnDuration = new Histogram([500, 1000, 2500, 5000, 10000, 30000, 
 export const turnTokens = new Counter()
 
 export const toolCallsTotal = new Counter()
+export const toolCallDuration = new Histogram([10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000])
 export const costTotal = new Counter()
 
 export const sessionsActive = { value: 0 }
@@ -118,8 +119,15 @@ export function startMetricsCollection(): void {
     if (ev.usage.cacheReadTokens) turnTokens.inc({ agent: ev.agentId, direction: 'cache_read' }, ev.usage.cacheReadTokens)
   })
 
-  // NOTE: tool.called events are not yet emitted by sessionManager.
-  // toolCallsTotal will be wired when tool-level event emission is added.
+  eventBus.on('tool.called', (ev) => {
+    const labels = {
+      agent: ev.agentId,
+      tool: ev.toolName,
+      error: ev.isError ? '1' : '0',
+    }
+    toolCallsTotal.inc(labels)
+    toolCallDuration.observe(ev.durationMs, { agent: ev.agentId, tool: ev.toolName })
+  })
 
   eventBus.on('cost.recorded', (ev) => {
     costTotal.inc({ agent: ev.agentId, model: ev.usage.model ?? 'unknown' }, ev.usage.costUsd ?? 0)
@@ -142,6 +150,7 @@ export function serializeMetrics(): string {
     turnDuration.serialize('oc_turn_duration_ms', 'AI turn duration in ms'),
     turnTokens.serialize('oc_turn_tokens_total', 'Total tokens by direction'),
     toolCallsTotal.serialize('oc_tool_calls_total', 'Total tool calls by tool name'),
+    toolCallDuration.serialize('oc_tool_call_duration_ms', 'Tool call duration in ms'),
     costTotal.serialize('oc_cost_usd_total', 'Total cost in USD'),
     sessionCrashesTotal.serialize('oc_session_crashes_total', 'Total session crashes'),
     wsConnectionsTotal.serialize('oc_ws_connections_total', 'Total WebSocket connections'),

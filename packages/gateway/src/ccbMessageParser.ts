@@ -5,8 +5,19 @@
  * Extracted from SessionManager._runOneTurn to separate CCB-specific
  * message parsing from session orchestration concerns.
  */
+import { performance } from 'node:perf_hooks'
 import type { OutboundContentBlock } from '@openclaude/protocol'
 import type { SdkMessage } from './subprocessRunner.js'
+
+/** Permission request from CCB (via stdio control_request protocol) */
+export interface PermissionRequest {
+  requestId: string
+  toolName: string
+  toolUseId?: string
+  input: Record<string, unknown>
+  /** Suggested permission rules the user can adopt */
+  permissionSuggestions?: unknown[]
+}
 
 export type SessionStreamEvent =
   | { kind: 'block'; block: OutboundContentBlock }
@@ -23,6 +34,7 @@ export type SessionStreamEvent =
       }
     }
   | { kind: 'error'; error: string }
+  | { kind: 'permission_request'; request: PermissionRequest }
 
 /** Detected tool_use that may need bridging (CronCreate, CronDelete, etc.) */
 export interface DetectedToolUse {
@@ -37,6 +49,11 @@ export interface DetectedToolResult {
   toolName: string
   preview: string
   isError: boolean
+  /** ms between tool_use finalization and tool_result arrival.
+   *  0 if the tool_use was not observed in this parser (e.g. stale result). */
+  durationMs: number
+  /** Truncated preview of tool input at finalization (<=500 chars). */
+  inputPreview?: string
 }
 
 /** Accumulated turn result stats */
@@ -65,6 +82,8 @@ export class CcbMessageParser {
   >()
   /** content_block index → tool_use id (for routing input_json_delta) */
   private indexToToolId = new Map<number, string>()
+  /** tool_use id → timing/preview captured at finalization (for tool.called metrics) */
+  private toolUseMeta = new Map<string, { startAt: number; inputPreview?: string }>()
   /** De-duplicate emitted tool_results within a turn */
   private emittedToolResultIds = new Set<string>()
   /** Count of tool_use blocks sent but not yet matched by a tool_result */
@@ -147,7 +166,30 @@ export class CcbMessageParser {
       this._handleResult(msg)
       return
     }
+
+    // ── control_request: permission prompt from CCB stdio protocol ──
+    if (msg.type === 'control_request') {
+      this._handleControlRequest(msg)
+      return
+    }
     // assistant_error / status / tool_progress / etc: ignore
+  }
+
+  private _handleControlRequest(msg: SdkMessage): void {
+    const raw = msg as any
+    const request = raw.request
+    if (!request || request.subtype !== 'can_use_tool') return
+
+    this.onEvent({
+      kind: 'permission_request',
+      request: {
+        requestId: raw.request_id,
+        toolName: request.tool_name ?? 'unknown',
+        toolUseId: request.tool_use_id,
+        input: request.input ?? {},
+        permissionSuggestions: request.permission_suggestions,
+      },
+    })
   }
 
   private _handleStreamEvent(msg: SdkMessage): void {
@@ -244,6 +286,16 @@ export class CcbMessageParser {
         }
 
         this.pendingToolCalls++
+        // Record finalization time + preview for tool.called metrics.
+        // Use monotonic clock (performance.now) to avoid wall-clock jumps.
+        // Guard against double-record if the same tool_use id appears twice
+        // in one turn (shouldn't happen, but keep first observation authoritative).
+        if (!this.toolUseMeta.has(c.id)) {
+          this.toolUseMeta.set(c.id, {
+            startAt: performance.now(),
+            inputPreview: inputStr.slice(0, 500),
+          })
+        }
         const streamed = this.streamingToolUses.get(c.id)
         this.onEvent({
           kind: 'block',
@@ -298,9 +350,21 @@ export class CcbMessageParser {
             preview,
           },
         })
-        // Notify about completed tool results for bridging
+        // Notify about completed tool results for bridging + metrics.
         if (this.onToolResult && useId) {
-          this.onToolResult({ toolUseId: useId, toolName, preview, isError: !!c.is_error })
+          const meta = this.toolUseMeta.get(useId)
+          // Monotonic-clock diff; round to int ms for clean histogram buckets.
+          // 0 when meta is missing (stale result / cross-turn tool_use unseen by this parser).
+          const durationMs = meta ? Math.max(0, Math.round(performance.now() - meta.startAt)) : 0
+          if (meta) this.toolUseMeta.delete(useId)
+          this.onToolResult({
+            toolUseId: useId,
+            toolName,
+            preview,
+            isError: !!c.is_error,
+            durationMs,
+            inputPreview: meta?.inputPreview,
+          })
         }
       }
     }

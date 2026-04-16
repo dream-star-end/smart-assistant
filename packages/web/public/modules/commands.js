@@ -1,9 +1,9 @@
 // OpenClaude — Slash Commands
+import { apiGet } from './api.js'
 import { $, _mod } from './dom.js'
-import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
-import { addSystemMessage, hideTypingIndicator, nudgeDrain, updateSendEnabled } from './websocket.js'
+import { addSystemMessage, localStopTeardown, nudgeDrain } from './websocket.js'
 
 // ── Late-binding for circular deps ──
 let _deps = {}
@@ -66,7 +66,7 @@ const slashCommands = [
         nudgeDrain()  // Advance drain to next item since we killed the current one
       }
       _deps.renderMessages()
-      _deps.scheduleSave(sess)
+      _deps.scheduleSaveFromUserEdit(sess)
       // Notify gateway to kill the CCB subprocess so context is truly reset
       // Next message will spawn a fresh process with no history
       if (state.ws && state.ws.readyState === 1) {
@@ -96,12 +96,7 @@ const slashCommands = [
           agentId: sess.agentId || state.defaultAgentId,
         }),
       )
-      sess._sendingInFlight = false
-      if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
-      state.sendingInFlight = false
-      updateSendEnabled()
-      hideTypingIndicator()
-      setTitleBusy(false)
+      localStopTeardown(sess)
       toast('已发送停止信号')
     },
   },
@@ -147,10 +142,7 @@ const slashCommands = [
     async run() {
       ;(async () => {
         try {
-          const r = await fetch('/api/config', {
-            headers: { Authorization: `Bearer ${state.token}` },
-          })
-          const cfg = await r.json()
+          const cfg = await apiGet('/api/config')
           addSystemMessage(`**当前配置:**\n\`\`\`json\n${JSON.stringify(cfg, null, 2)}\n\`\`\``)
         } catch {
           toast('获取配置失败', 'error')

@@ -12,6 +12,16 @@ export function setWsDeps(deps) {
 
 // ── Module-private state ──
 let _reconnectAttempts = 0
+// Tracks `navigator.onLine`. When false, we short-circuit reconnect scheduling
+// (both in connect() and ws.onclose) so a lid-closed laptop or unplugged
+// ethernet doesn't double the backoff delay on every failed attempt. When it
+// flips back to true the browser fires `online`, which calls
+// notifyNetworkOnline() to reset attempts and reconnect immediately.
+let _isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false
+// Debounce for visibility-triggered immediate reconnects — mobile focus flips
+// can fire visibilitychange rapidly and we don't want to spam connect().
+let _lastVisibilityReconnectAt = 0
+const VISIBILITY_RECONNECT_COOLDOWN_MS = 2000
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
 
 // ── Per-session thinking safety timer ──
@@ -42,6 +52,7 @@ function _resetThinkingSafety(sessId) {
         }
       } catch {}
       s._sendingInFlight = false
+      clearTurnTiming(s)
       if (s.id === state.currentSessionId) {
         state.sendingInFlight = false
         updateSendEnabled()
@@ -84,6 +95,23 @@ const _notifSound = (() => {
 })()
 
 // ═══════════════ TYPING INDICATOR ═══════════════
+const STALE_WARN_MS = 60_000   // Show warning after 60s without any frame
+const STALE_DANGER_MS = 180_000 // Show "likely stuck" after 3 min
+
+// Per-session frame tracking (stored on sess object: sess._lastFrameAt, sess._turnStartedAt)
+export function markFrameReceived(sess) {
+  if (sess) sess._lastFrameAt = Date.now()
+}
+
+// Clear turn-timing fields on a session when the turn actually ends (isFinal / stop / stuck).
+// Kept separate from hideTypingIndicator so session switches (which merely hide DOM) do not
+// reset timing for a session whose turn is still alive.
+export function clearTurnTiming(sess) {
+  if (!sess) return
+  sess._turnStartedAt = null
+  sess._lastFrameAt = null
+}
+
 export function showTypingIndicator() {
   const inner = _deps.ensureInner()
   if (inner.querySelector('.typing-indicator')) return
@@ -95,16 +123,39 @@ export function showTypingIndicator() {
   const av = htmlSafeEscape(agentInfo?.avatarEmoji || 'O')
   const name = agentInfo?.displayName || sess?.agentId || 'AI'
   el.innerHTML = `<div class="avatar">${av}</div><div class="typing-dots"><span></span><span></span><span></span></div><span class="typing-label">${htmlSafeEscape(name)} 思考中</span>`
-  el._startTime = Date.now()
-  // Show elapsed time after 5s
+  // Bind to the session that owned the current view when the indicator was created,
+  // so the timer keeps reading the correct session even if the user switches tabs.
+  const boundSessId = sess?.id || null
+  // Use session-level timestamps; only initialize if not already set (preserves timing on session switch)
+  if (sess && !sess._turnStartedAt) sess._turnStartedAt = Date.now()
+  if (sess && !sess._lastFrameAt) sess._lastFrameAt = Date.now()
+  // Show elapsed time after 5s, with staleness warning
   el._timer = setInterval(() => {
-    const secs = Math.round((Date.now() - el._startTime) / 1000)
+    const _sess = boundSessId ? state.sessions.get(boundSessId) : getSession()
+    const startedAt = _sess?._turnStartedAt || Date.now()
+    const lastFrame = _sess?._lastFrameAt || Date.now()
+    const secs = Math.round((Date.now() - startedAt) / 1000)
     const label = el.querySelector('.typing-label')
-    if (label && secs >= 5) label.textContent = `${name} 思考中 (${secs}s)`
+    if (!label) return
+    const silenceMs = Date.now() - lastFrame
+    if (silenceMs >= STALE_DANGER_MS) {
+      label.textContent = `${name} 可能已卡住 (${secs}s · 已 ${Math.round(silenceMs / 1000)}s 无响应)`
+      el.classList.add('stale-danger')
+      el.classList.remove('stale-warn')
+    } else if (silenceMs >= STALE_WARN_MS) {
+      label.textContent = `${name} 思考中 (${secs}s · ${Math.round(silenceMs / 1000)}s 无新数据)`
+      el.classList.add('stale-warn')
+      el.classList.remove('stale-danger')
+    } else if (secs >= 5) {
+      label.textContent = `${name} 思考中 (${secs}s)`
+      el.classList.remove('stale-warn', 'stale-danger')
+    }
   }, 1000)
   inner.appendChild(el)
   _deps.scrollBottom(true)
 }
+// DOM-only: removes the typing indicator element + its interval. Does NOT touch session
+// timing (use clearTurnTiming for that). Safe to call from session-switch / hide paths.
 export function hideTypingIndicator() {
   const el = document.getElementById('__typing')
   if (el?._timer) clearInterval(el._timer)
@@ -274,6 +325,7 @@ function _drainNextOfflineItem() {
       const stuckSess = state.sessions.get(item.sessId)
       if (stuckSess) {
         stuckSess._sendingInFlight = false
+        clearTurnTiming(stuckSess)
         if (stuckSess.id === state.currentSessionId) {
           state.sendingInFlight = false
           updateSendEnabled()
@@ -325,6 +377,26 @@ export function updateSendEnabled() {
       svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
   }
 }
+// Shared local teardown for "user stopped this turn" — keep parity between the stop button
+// (stopCurrentTurn) and the /stop slash command so both paths immediately clear UI state
+// instead of waiting for the backend's isFinal / safety timers. Callers are responsible for
+// sending the WS `inbound.control.stop` frame; this helper only handles local state.
+export function localStopTeardown(sess) {
+  if (!sess) return
+  sess._sendingInFlight = false
+  clearTurnTiming(sess)
+  if (sess._regenSafetyTimer) {
+    clearTimeout(sess._regenSafetyTimer)
+    sess._regenSafetyTimer = null
+  }
+  if (sess.id === state.currentSessionId) {
+    state.sendingInFlight = false
+    updateSendEnabled()
+    hideTypingIndicator()
+    setTitleBusy(false)
+  }
+}
+
 export function stopCurrentTurn() {
   if (!state.sendingInFlight) return
   if (!state.ws || state.ws.readyState !== 1) return
@@ -338,11 +410,66 @@ export function stopCurrentTurn() {
       agentId: sess.agentId || state.defaultAgentId,
     }),
   )
+  // Immediately tear down local UI state so typing indicator / stop button / title spinner
+  // clear without waiting for the backend's isFinal (which can take seconds to minutes,
+  // or never arrive if the backend is truly stuck).
+  localStopTeardown(sess)
   toast('已发送停止指令')
 }
+// Network transition: browser reports we've gone offline. Cancel any pending
+// backoff timer and show an offline status. We do NOT schedule a new timer —
+// the browser will fire `online` when connectivity is back and
+// notifyNetworkOnline() will reconnect immediately.
+export function notifyNetworkOffline() {
+  if (!_isBrowserOnline) return
+  _isBrowserOnline = false
+  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  setStatus('离线', 'disconnected')
+}
+
+// Network transition: browser reports we're back online. Reset the attempts
+// counter so a fresh network window gets a fresh backoff budget, then
+// reconnect immediately if we're not already connected.
+export function notifyNetworkOnline() {
+  if (_isBrowserOnline) return // guard against duplicate events
+  _isBrowserOnline = true
+  if (!state.token) return
+  _reconnectAttempts = 0
+  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  // If already connected or connecting, leave it alone.
+  if (state.ws && state.ws.readyState < 2) return
+  connect()
+}
+
+// Visibility transition: tab just became visible. Mobile/desktop can pause
+// the JS event loop when a tab is hidden, which lets a pending reconnect
+// timer stretch well beyond its nominal delay. Hitting the backend now
+// avoids the user waiting out residual backoff on return. We preserve
+// `_reconnectAttempts` so subsequent failures continue the current backoff
+// ladder rather than hammering the server.
+export function notifyTabVisible() {
+  if (!state.token) return
+  if (!_isBrowserOnline) return
+  if (state.ws && state.ws.readyState < 2) return
+  const now = Date.now()
+  if (now - _lastVisibilityReconnectAt < VISIBILITY_RECONNECT_COOLDOWN_MS) return
+  _lastVisibilityReconnectAt = now
+  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  connect()
+}
+
 export function connect() {
   if (!state.token) return  // No token (logged out) — don't connect
   if (state.ws && state.ws.readyState < 2) return
+  // If the browser reports offline, don't attempt — the `online` handler
+  // (notifyNetworkOnline) will call connect() when network comes back.
+  if (!_isBrowserOnline) {
+    setStatus('离线', 'disconnected')
+    return
+  }
   setStatus('连接中…', 'connecting')
   // Use Sec-WebSocket-Protocol for auth instead of query string (avoids token in URL/logs)
   const url = `${(location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host}/ws`
@@ -380,6 +507,7 @@ export function connect() {
           if (s && s._sendingInFlight) {
             console.warn('[ws] Clearing stuck _sendingInFlight for session', s.id)
             s._sendingInFlight = false
+            clearTurnTiming(s)
             if (s.id === state.currentSessionId) {
               state.sendingInFlight = false
               updateSendEnabled()
@@ -462,6 +590,13 @@ export function connect() {
     if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
     // Don't auto-reconnect if logged out (no token)
     if (!state.token) return
+    // Don't auto-reconnect while browser reports offline — wait for `online`
+    // event (notifyNetworkOnline) to trigger reconnect. Otherwise we'd burn
+    // reconnect attempts (each doubling the backoff) against no network.
+    if (!_isBrowserOnline) {
+      setStatus('离线', 'disconnected')
+      return
+    }
     const delay = Math.min(2000 * Math.pow(2, _reconnectAttempts), 30000) + Math.random() * 1000
     _reconnectAttempts++
     if (delay >= 4000) {
@@ -486,6 +621,8 @@ export function connect() {
     try {
       const f = JSON.parse(ev.data)
       if (f.type === 'outbound.message') handleOutbound(f)
+      else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
+      else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
       else if (f.type === 'outbound.ack' && f.deduplicated) {
         // Server already processed this message; clear drain state so queue continues
         if (state._offlineDrainingCurrent) {
@@ -551,13 +688,16 @@ export function handleOutbound(frame) {
   if (sess._agentSwitchedAt && frame.ts && frame.ts < sess._agentSwitchedAt) return
   // Also ignore non-final frames if they arrive within 2s of an agent switch and we're not sending
   if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) return
+  // Track last frame time for staleness detection (AFTER agent-switch filtering)
+  if (frame.blocks?.length > 0 || frame.isFinal) markFrameReceived(sess)
   // Any streaming output proves this turn is alive — remove from reconnect safety set
   if (state._reconnectInFlightSet && (frame.blocks?.length > 0 || frame.isFinal)) {
     state._reconnectInFlightSet.delete(sess.id)
   }
-  // Any output -> hide typing indicator ONLY if this is the currently viewed session
-  if (((frame.blocks?.length || 0) > 0 || frame.isFinal) && sess.id === state.currentSessionId)
-    hideTypingIndicator()
+  // NOTE: typing indicator stays visible throughout the whole turn (only hidden on isFinal
+  // below). This lets staleness detection kick in during mid-stream stalls — e.g. when the
+  // model emits an initial thinking/tool_use/text block and then goes silent for minutes,
+  // the indicator shows a "N秒无新数据" warning instead of the UI appearing to be working.
   // Update user message status: find the most recent user msg in THIS session
   // that is still pending (sent/read but not replied). Only update one msg per turn.
   if (!sess._replyingToMsgId) {
@@ -796,6 +936,11 @@ export function handleOutbound(frame) {
     sess._streamingAssistant = null
     sess._streamingThinking = null
     sess._sendingInFlight = false
+    // Turn has ended — clear timing so the next turn starts fresh (regardless of whether
+    // this session is currently viewed; otherwise a later switch would reuse stale timing).
+    clearTurnTiming(sess)
+    // Clear pending permission modals for THIS session only (turn completed)
+    clearPendingPermissions(sess.id)
     // Clear regen safety timer if present
     if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
     // Remove this session from the reconnect snapshot so the safety timer won't
@@ -843,9 +988,233 @@ export function handleOutbound(frame) {
     }
   }
   if (sess.id === state.currentSessionId) _deps.updateSessionSub(sess)
-  _deps.scheduleSave(sess)
+  // Save immediately on isFinal to prevent data loss on refresh; debounce during streaming
+  _deps.scheduleSave(sess, !!frame.isFinal)
   // Only rebuild sidebar on final message (not every streaming delta)
   if (frame.isFinal) _deps.renderSidebar()
+}
+
+// ═══════════════ PERMISSION PROMPTS ═══════════════
+const _pendingPermissions = new Map() // requestId -> { frame, el, timer }
+
+function handlePermissionRequest(frame) {
+  const sess = frame.peer?.id ? state.sessions.get(frame.peer.id) : null
+  if (!sess) return
+
+  // Add a permission card to the chat
+  const msg = addMessage(sess, 'permission', frame.toolName, {
+    requestId: frame.requestId,
+    toolName: frame.toolName,
+    inputPreview: frame.inputPreview || '',
+    inputJson: frame.inputJson || null,
+    _resolved: false,
+  })
+
+  // Build and show modal overlay
+  _showPermissionModal(frame, sess, msg)
+
+  // Play notification sound
+  _notifSound()
+}
+
+function _showPermissionModal(frame, sess, msg) {
+  // If another permission modal is already showing, deny the OLD one first
+  // (only one modal can be visible at a time in the UI)
+  const existing = document.getElementById('permission-modal')
+  if (existing) {
+    const oldRequestId = existing.dataset.requestId
+    if (oldRequestId && _pendingPermissions.has(oldRequestId)) {
+      const old = _pendingPermissions.get(oldRequestId)
+      if (old.timer) clearInterval(old.timer)
+      // Auto-deny the displaced prompt — use the OLD frame's peer/agent
+      if (state.ws && state.ws.readyState === 1 && old.frame) {
+        const oldPeerId = old.frame.peer?.id
+        const oldSess = oldPeerId ? state.sessions.get(oldPeerId) : null
+        try {
+          state.ws.send(JSON.stringify({
+            type: 'inbound.permission_response',
+            channel: old.frame.channel || 'webchat',
+            peer: old.frame.peer,
+            agentId: oldSess?.agentId || state.defaultAgentId,
+            requestId: oldRequestId,
+            behavior: 'deny',
+            message: 'Displaced by newer permission prompt',
+          }))
+        } catch {}
+        // Update the old permission card in its own session
+        if (oldSess) {
+          const oldMsg = oldSess.messages.find(m => m.requestId === oldRequestId)
+          if (oldMsg) {
+            oldMsg._resolved = true
+            oldMsg._behavior = 'deny'
+            if (oldSess.id === state.currentSessionId) _deps.updateMessageEl(oldMsg)
+          }
+        }
+      }
+      _pendingPermissions.delete(oldRequestId)
+    }
+    existing.remove()
+  }
+
+  const toolName = htmlSafeEscape(frame.toolName || 'unknown')
+  const preview = htmlSafeEscape((frame.inputPreview || '').slice(0, 300))
+
+  // Build a human-readable description of what the tool wants to do
+  let desc = ''
+  if (frame.inputJson) {
+    const input = frame.inputJson
+    if (input.file_path) desc = `File: ${htmlSafeEscape(String(input.file_path))}`
+    else if (input.command) desc = `Command: ${htmlSafeEscape(String(input.command).slice(0, 200))}`
+    else if (input.pattern) desc = `Pattern: ${htmlSafeEscape(String(input.pattern))}`
+  }
+
+  const overlay = document.createElement('div')
+  overlay.id = 'permission-modal'
+  overlay.dataset.requestId = frame.requestId
+  overlay.className = 'permission-modal-overlay'
+  overlay.innerHTML = `
+    <div class="permission-modal">
+      <div class="permission-modal-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        </svg>
+      </div>
+      <div class="permission-modal-title">Tool Permission Request</div>
+      <div class="permission-modal-tool">${toolName}</div>
+      ${desc ? `<div class="permission-modal-desc">${desc}</div>` : ''}
+      ${preview ? `<details class="permission-modal-details"><summary>Details</summary><pre>${preview}</pre></details>` : ''}
+      <div class="permission-modal-actions">
+        <button class="permission-btn permission-btn-deny" data-action="deny">Deny</button>
+        <button class="permission-btn permission-btn-allow" data-action="allow">Allow</button>
+      </div>
+      <div class="permission-modal-timer"></div>
+    </div>
+  `
+  document.body.appendChild(overlay)
+
+  // Auto-deny after 120s if no response
+  const timerEl = overlay.querySelector('.permission-modal-timer')
+  let remaining = 120
+  timerEl.textContent = `${remaining}s`
+  const countdown = setInterval(() => {
+    remaining--
+    timerEl.textContent = `${remaining}s`
+    if (remaining <= 0) {
+      clearInterval(countdown)
+      _resolvePermission(frame, 'deny', 'Timed out', sess, msg, overlay)
+    }
+  }, 1000)
+
+  // Button handlers
+  overlay.querySelector('[data-action="allow"]').addEventListener('click', () => {
+    clearInterval(countdown)
+    _resolvePermission(frame, 'allow', null, sess, msg, overlay)
+  })
+  overlay.querySelector('[data-action="deny"]').addEventListener('click', () => {
+    clearInterval(countdown)
+    _resolvePermission(frame, 'deny', 'User denied', sess, msg, overlay)
+  })
+
+  // Store reference for cleanup
+  _pendingPermissions.set(frame.requestId, { frame, el: overlay, timer: countdown })
+}
+
+function _resolvePermission(frame, behavior, message, sess, msg, overlay) {
+  // Send response via WebSocket
+  if (state.ws && state.ws.readyState === 1) {
+    state.ws.send(JSON.stringify({
+      type: 'inbound.permission_response',
+      channel: frame.channel || 'webchat',
+      peer: frame.peer,
+      agentId: sess.agentId || state.defaultAgentId,
+      requestId: frame.requestId,
+      behavior,
+      message: message || undefined,
+    }))
+  }
+
+  // Update message in chat
+  if (msg) {
+    msg._resolved = true
+    msg._behavior = behavior
+    if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
+  }
+
+  // Remove modal
+  if (overlay) overlay.remove()
+  _pendingPermissions.delete(frame.requestId)
+}
+
+// Broadcast from gateway: a permission request was settled elsewhere (another tab,
+// auto-deny on timeout/displacement, or session death). Clear local modal state so
+// this tab isn't stuck showing a prompt for a request the server already consumed.
+//
+// reason:
+//   'remote'           — another tab clicked Allow/Deny on the same account
+//   'already_settled'  — our response arrived after another client's won the race
+//   'disconnect'       — server auto-denied because all of this peer's WS clients dropped
+//   'timeout'          — server-side janitor auto-denied after exceeding max wait
+//   'crashed'          — server auto-denied because the CCB subprocess died
+//
+// We always clear local state regardless of reason. No inbound.permission_response
+// is sent here — server-side is already resolved; replying would produce a stale
+// response that the "unknown/already-settled request" branch would just rebroadcast.
+// Unknown future reason values are forwarded to the UI verbatim (no enum check).
+function handlePermissionSettled(frame) {
+  const p = _pendingPermissions.get(frame.requestId)
+  if (!p) return // already cleared locally (e.g. we were the sender, or a prior broadcast cleared it)
+  if (p.timer) clearInterval(p.timer)
+  // Update the permission card in the session that owns this request (not necessarily the current view)
+  const peerId = p.frame?.peer?.id
+  const sess = peerId ? state.sessions.get(peerId) : null
+  if (sess) {
+    const msg = sess.messages.find((m) => m.requestId === frame.requestId)
+    if (msg) {
+      msg._resolved = true
+      msg._behavior = frame.behavior
+      msg._settledReason = frame.reason || null
+      if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
+    }
+  }
+  if (p.el) p.el.remove()
+  _pendingPermissions.delete(frame.requestId)
+}
+
+// Clean up permission modals. If sessId is provided, only clear that session's prompts.
+// Sends deny for any unanswered prompts so the server can unblock CCB.
+export function clearPendingPermissions(sessId) {
+  for (const [id, p] of _pendingPermissions) {
+    const peerId = p.frame?.peer?.id
+    // If scoped to a session, skip prompts from other sessions
+    if (sessId && peerId !== sessId) continue
+    if (p.timer) clearInterval(p.timer)
+    // Send deny for unanswered prompts so server doesn't wait forever
+    const targetSess = peerId ? state.sessions.get(peerId) : null
+    if (state.ws && state.ws.readyState === 1 && p.frame) {
+      try {
+        state.ws.send(JSON.stringify({
+          type: 'inbound.permission_response',
+          channel: p.frame.channel || 'webchat',
+          peer: p.frame.peer,
+          agentId: targetSess?.agentId || state.defaultAgentId,
+          requestId: p.frame.requestId,
+          behavior: 'deny',
+          message: 'Turn completed or session ended',
+        }))
+      } catch {}
+    }
+    // Update permission card in chat to show "Denied"
+    if (targetSess) {
+      const msg = targetSess.messages.find(m => m.requestId === id)
+      if (msg) {
+        msg._resolved = true
+        msg._behavior = 'deny'
+        if (targetSess.id === state.currentSessionId) _deps.updateMessageEl(msg)
+      }
+    }
+    if (p.el) p.el.remove()
+    _pendingPermissions.delete(id)
+  }
 }
 
 // ═══════════════ BACKGROUND TASKS ═══════════════
