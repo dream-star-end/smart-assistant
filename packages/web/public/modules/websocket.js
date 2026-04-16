@@ -53,6 +53,10 @@ function _resetThinkingSafety(sessId) {
       } catch {}
       s._sendingInFlight = false
       clearTurnTiming(s)
+      // Abandon the reply tracker — the turn is being torn down by timeout,
+      // so any belated isFinal must NOT retroactively flag this message as
+      // an empty turn (or attach to whatever message comes next).
+      resetReplyTracker(s)
       if (s.id === state.currentSessionId) {
         state.sendingInFlight = false
         updateSendEnabled()
@@ -326,6 +330,10 @@ function _drainNextOfflineItem() {
       if (stuckSess) {
         stuckSess._sendingInFlight = false
         clearTurnTiming(stuckSess)
+        // Drain timeout is abandoning this turn; drop the reply tracker so a
+        // belated isFinal can't flag the user message as empty or attach to
+        // the next turn that the user kicks off.
+        resetReplyTracker(stuckSess)
         if (stuckSess.id === state.currentSessionId) {
           state.sendingInFlight = false
           updateSendEnabled()
@@ -377,6 +385,27 @@ export function updateSendEnabled() {
       svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
   }
 }
+// Clears per-turn reply tracker state so the next incoming frame re-binds fresh.
+// Must be called from any path that abandons an in-flight turn locally (/clear,
+// stop button, agent switch) as well as at isFinal — otherwise the tracker
+// dangles and the empty-turn detector plus status-updates mis-attribute to a
+// stale or removed user message.
+//
+// Also stamps `_trackerResetAt` so the stale-final guard in handleOutbound can
+// catch late finals that arrive AFTER the reset but BEFORE the next user
+// message binds a new target. Without this we'd have a blind window where
+// `sess._replyingToMsgId === null` makes the primary guard no-op, and the
+// late final would run full isFinal teardown against whatever turn happens
+// to bind next. This timestamp is in client time (Date.now) and compared
+// against server-stamped `frame.ts` — best effort under normal clock skew;
+// see handleOutbound for the caveat.
+export function resetReplyTracker(sess) {
+  if (!sess) return
+  sess._replyingToMsgId = null
+  sess._currentTurnBlockCount = 0
+  sess._trackerResetAt = Date.now()
+}
+
 // Shared local teardown for "user stopped this turn" — keep parity between the stop button
 // (stopCurrentTurn) and the /stop slash command so both paths immediately clear UI state
 // instead of waiting for the backend's isFinal / safety timers. Callers are responsible for
@@ -389,6 +418,9 @@ export function localStopTeardown(sess) {
     clearTimeout(sess._regenSafetyTimer)
     sess._regenSafetyTimer = null
   }
+  // Drop reply tracker — any isFinal arriving for the stopped turn should not
+  // retroactively flag it as an "empty turn" since the user intentionally cut it.
+  resetReplyTracker(sess)
   if (sess.id === state.currentSessionId) {
     state.sendingInFlight = false
     updateSendEnabled()
@@ -508,6 +540,11 @@ export function connect() {
             console.warn('[ws] Clearing stuck _sendingInFlight for session', s.id)
             s._sendingInFlight = false
             clearTurnTiming(s)
+            // Reconnect safety cleared the turn locally — drop the reply
+            // tracker so any isFinal the gateway eventually delivers cannot
+            // retroactively flag the abandoned turn as empty or mis-attach
+            // to a later user message.
+            resetReplyTracker(s)
             if (s.id === state.currentSessionId) {
               state.sendingInFlight = false
               updateSendEnabled()
@@ -681,6 +718,44 @@ export function handleOutbound(frame) {
       if (m.role === 'agent-group' && m.blockId) sess._agentGroups.set(m.blockId, m.id)
     }
   }
+  // Early stale-final guard (best effort): drop late isFinal frames from a
+  // turn the user already abandoned locally (stop / agent switch / timeout).
+  // Two cases — both require `frame.ts` (server-stamped) to be present:
+  //   1. Tracker is still bound to a user msg. If `frame.ts` predates that
+  //      user msg, this final belongs to an older turn.
+  //   2. Tracker was reset by stop/switch/timeout but the fresh turn hasn't
+  //      bound yet. If `frame.ts` predates `_trackerResetAt` (the moment the
+  //      local abandon happened), this final must be from the turn we just
+  //      cut — drop it rather than let it bind to the upcoming turn.
+  // Caveat: these comparisons cross clock domains (server ts vs client
+  // Date.now). Under normal clock skew (<5s), both halves work. If the user's
+  // device clock runs significantly ahead of the server, a fresh final could
+  // be misclassified as stale and dropped — a known residual risk tracked
+  // for a future protocol upgrade (server-stamped turnId/ack).
+  if (frame.isFinal && typeof frame.ts === 'number') {
+    if (sess._replyingToMsgId) {
+      const boundMsg = sess.messages.find((m) => m.id === sess._replyingToMsgId)
+      if (boundMsg && typeof boundMsg.ts === 'number' && frame.ts < boundMsg.ts) {
+        console.warn('[ws] dropping stale isFinal (predates bound user msg)', {
+          sessionId: sess.id,
+          targetMsgId: boundMsg.id,
+          frameTs: frame.ts,
+          targetTs: boundMsg.ts,
+        })
+        return
+      }
+    } else if (
+      typeof sess._trackerResetAt === 'number' &&
+      frame.ts < sess._trackerResetAt
+    ) {
+      console.warn('[ws] dropping stale isFinal (predates tracker reset)', {
+        sessionId: sess.id,
+        frameTs: frame.ts,
+        trackerResetAt: sess._trackerResetAt,
+      })
+      return
+    }
+  }
   // Reset thinking safety timer on every incoming frame (proves backend is alive)
   if (sess._sendingInFlight && !frame.isFinal) _resetThinkingSafety(sess.id)
   if (frame.isFinal) _clearThinkingSafety(sess.id)
@@ -700,16 +775,41 @@ export function handleOutbound(frame) {
   // the indicator shows a "N秒无新数据" warning instead of the UI appearing to be working.
   // Update user message status: find the most recent user msg in THIS session
   // that is still pending (sent/read but not replied). Only update one msg per turn.
+  // Also track a per-turn content-block counter so we can detect "empty turn"
+  // (isFinal arrives without any preceding text/thinking/tool block) — that state
+  // otherwise leaves the user message marked "已回复" with nothing to show.
   if (!sess._replyingToMsgId) {
     // Only match sent/read messages — skip 'queued' (not yet sent, shouldn't be marked read/replied)
     const pending = [...sess.messages].reverse().find(
       (m) => m.role === 'user' && m.status && m.status !== 'replied' && m.status !== 'queued'
     )
-    if (pending) sess._replyingToMsgId = pending.id
+    if (pending) {
+      sess._replyingToMsgId = pending.id
+      sess._currentTurnBlockCount = 0
+    }
   }
   const _targetMsg = sess._replyingToMsgId
     ? sess.messages.find((m) => m.id === sess._replyingToMsgId)
     : null
+  // If tracker points at a stale/removed message (e.g. after /clear mid-turn),
+  // recover by dropping the tracker so the next frame re-binds fresh.
+  if (sess._replyingToMsgId && !_targetMsg) {
+    resetReplyTracker(sess)
+  }
+  // Count content blocks for this turn (before isFinal processing). Count blocks
+  // from BOTH streaming and final frames — the gateway has several final-with-content
+  // paths (rate-limit rejection, upload rejection, run-error, webhook delivery, etc.)
+  // where isFinal:true arrives carrying the only text block of the turn. Ignoring
+  // final-frame blocks here would cause those legitimate responses to be flagged as
+  // empty and trigger a spurious "本轮响应为空" warning BEFORE the real block is
+  // rendered (addMessage/block-apply happens later in this function).
+  if (
+    _targetMsg &&
+    Array.isArray(frame.blocks) &&
+    frame.blocks.length > 0
+  ) {
+    sess._currentTurnBlockCount = (sess._currentTurnBlockCount || 0) + frame.blocks.length
+  }
   if (_targetMsg) {
     if (
       frame.blocks?.length > 0 &&
@@ -720,9 +820,56 @@ export function handleOutbound(frame) {
       updateMsgStatus(_targetMsg)
     }
     if (frame.isFinal) {
+      // Stale-final frames were already dropped at the top of handleOutbound
+      // via an early return, so by the time we get here the frame is known
+      // to be current. Run the empty-turn detector and close the tracker.
+      // Detect empty-turn by directly inspecting the message array: did any
+      // content-bearing message get added AFTER the target user message?
+      // This is more robust than relying on transient streaming pointers.
+      // Roles considered content: assistant, thinking, tool, agent-group,
+      // and permission (permission prompts are visible cards that count as
+      // real turn output).
+      let producedContent = false
+      const targetIdx = sess.messages.findIndex((m) => m.id === _targetMsg.id)
+      if (targetIdx >= 0) {
+        for (let i = targetIdx + 1; i < sess.messages.length; i++) {
+          const r = sess.messages[i].role
+          if (
+            r === 'assistant' ||
+            r === 'thinking' ||
+            r === 'tool' ||
+            r === 'agent-group' ||
+            r === 'permission'
+          ) {
+            producedContent = true
+            break
+          }
+        }
+      }
+      if (
+        !producedContent &&
+        !sess._currentTurnBlockCount &&
+        !sess._streamingAssistant &&
+        !sess._streamingThinking
+      ) {
+        // Avoid double-insertion on rare re-entrant cases: skip if the last
+        // message is already an empty-turn warning for this target.
+        const last = sess.messages[sess.messages.length - 1]
+        const alreadyWarned = last && last._emptyTurn
+        if (!alreadyWarned) {
+          console.warn('[ws] empty-turn: isFinal with zero blocks', {
+            sessionId: sess.id,
+            targetMsgId: _targetMsg.id,
+          })
+          addMessage(sess, 'assistant', '⚠️ 本轮响应为空 — 服务端标记已完成,但没有生成任何内容。请重试或检查服务状态。', {
+            error: true,
+            _emptyTurn: true,
+          })
+        }
+      }
       _targetMsg.status = 'replied'
       updateMsgStatus(_targetMsg)
-      sess._replyingToMsgId = null  // Clear for next turn
+      resetReplyTracker(sess)
     }
   }
   // Detect non-heartbeat cron/task push — mark as system notification

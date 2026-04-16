@@ -44,7 +44,13 @@ async function ensureMermaid() {
 const pendingMermaid = []
 const pendingHtmlPreviews = []
 const pendingCharts = []
+const pendingMath = [] // { id, tex, display }
 const _chartInstances = new Map() // id -> Chart instance, for cleanup
+
+// Streaming flag — when true, math extensions render to plain text instead of
+// pushing to pendingMath, so incomplete `$...$` during streaming doesn't
+// leave orphaned placeholders.
+let _isStreamingParse = false
 
 // ── marked renderer setup ──
 if (window.marked) {
@@ -101,6 +107,114 @@ if (window.marked) {
     return _imgHtml(hrefOrObj || '', title || text || '')
   }
   marked.setOptions({ renderer })
+
+  // ── LaTeX math extensions ──
+  // Block math: "$$...$$" beginning at line start, closed at end-of-line / EOF.
+  // Inline math: "$...$" with strict boundaries:
+  //   - Opening $ must be at start-of-src OR preceded by a non-word / non-$ / non-\ char
+  //   - Opening $ must NOT be followed by whitespace / digit / $
+  //   - Closing $ must NOT be preceded by whitespace / $ / \
+  //   - Closing $ must NOT be followed by a word character (letter/digit)
+  //   - Backslash escapes (e.g. \$) inside are skipped
+  // No regex lookbehind is used, for Safari <16.4 compatibility.
+  marked.use({
+    extensions: [
+      {
+        name: 'mathBlock',
+        level: 'block',
+        // Only hint positions that are at a line start, to avoid splitting
+        // paragraphs like "text $$x$$ more" into broken block tokens.
+        start(src) {
+          const m = /(?:^|\n)\$\$/.exec(src)
+          if (!m) return undefined
+          return src[m.index] === '$' ? m.index : m.index + 1
+        },
+        tokenizer(src) {
+          const m = /^\$\$([\s\S]+?)\$\$(?=\n|$)/.exec(src)
+          if (!m) return
+          const tex = m[1].trim()
+          if (!tex) return
+          return { type: 'mathBlock', raw: m[0], text: tex }
+        },
+        renderer(token) {
+          if (_isStreamingParse) {
+            return `<p>${htmlSafeEscape(`$$${token.text}$$`)}</p>`
+          }
+          const id = `math-${Math.random().toString(36).slice(2, 10)}`
+          pendingMath.push({ id, tex: token.text, display: true })
+          return `<div class="math-block" id="${id}"></div>`
+        },
+      },
+      {
+        name: 'mathInline',
+        level: 'inline',
+        // Scan for the earliest $ that satisfies the strict opening boundary.
+        // Skips over $ preceded by word-char/$/backslash (e.g. a$b, $$, \$)
+        // or followed by whitespace/digit/$ (e.g. $ x, $5, $$).
+        start(src) {
+          const n = src.length
+          let i = 0
+          while (i < n) {
+            const idx = src.indexOf('$', i)
+            if (idx < 0) return undefined
+            const prev = idx > 0 ? src[idx - 1] : ''
+            const next = src[idx + 1] || ''
+            const leftOK = !prev || !/[A-Za-z0-9_$\\]/.test(prev)
+            const rightOK = next && !/[\s$\d]/.test(next)
+            if (leftOK && rightOK) return idx
+            i = idx + 1
+          }
+          return undefined
+        },
+        tokenizer(src) {
+          // IMPORTANT: marked calls tokenizer with the full remaining src on the
+          // first try; only after returning undefined does it advance to the
+          // position hinted by start(). So we MUST guard that src begins with
+          // a valid opening $ — otherwise the prefix text would be swallowed.
+          if (src[0] !== '$' || src[1] === '$') return
+          const next = src[1] || ''
+          if (!next || /[\s$\d]/.test(next)) return
+          // Scan forward for a valid closing $ on the same line.
+          const n = src.length
+          let j = 1
+          while (j < n) {
+            const c = src[j]
+            if (c === '\n') return
+            if (c === '\\' && j + 1 < n) {
+              j += 2
+              continue
+            }
+            if (c === '$') {
+              const bef = src[j - 1]
+              const aft = src[j + 1] || ''
+              // Closing $ must not be preceded by space/$/backslash
+              if (/[\s$\\]/.test(bef)) {
+                j++
+                continue
+              }
+              // Closing $ must not be followed by a word character
+              if (/[A-Za-z0-9]/.test(aft)) {
+                j++
+                continue
+              }
+              const tex = src.slice(1, j)
+              if (!tex) return
+              return { type: 'mathInline', raw: src.slice(0, j + 1), text: tex }
+            }
+            j++
+          }
+        },
+        renderer(token) {
+          if (_isStreamingParse) {
+            return htmlSafeEscape(`$${token.text}$`)
+          }
+          const id = `math-${Math.random().toString(36).slice(2, 10)}`
+          pendingMath.push({ id, tex: token.text, display: false })
+          return `<span class="math-inline" id="${id}"></span>`
+        },
+      },
+    ],
+  })
 }
 
 // ── Media URL auto-detection and inline embedding ──
@@ -363,6 +477,7 @@ export function renderStreamingMarkdown(text) {
   if (!text) return ''
   const renderer = _getStreamingRenderer()
   if (!renderer || !window.marked) return htmlSafeEscape(text).replace(/\n/g, '<br>')
+  _isStreamingParse = true
   try {
     const html = marked.parse(text, { renderer })
     if (!window.DOMPurify) return htmlSafeEscape(text).replace(/\n/g, '<br>')
@@ -373,6 +488,8 @@ export function renderStreamingMarkdown(text) {
     })
   } catch {
     return htmlSafeEscape(text).replace(/\n/g, '<br>')
+  } finally {
+    _isStreamingParse = false
   }
 }
 
@@ -441,6 +558,29 @@ export async function processRichBlocks() {
     } catch (err) {
       el.className = 'chart-error'
       el.textContent = `Chart error: ${err?.message || String(err)}`
+    }
+  }
+  while (pendingMath.length > 0) {
+    const { id, tex, display } = pendingMath.shift()
+    const el = document.getElementById(id)
+    if (!el) continue
+    if (!window.katex) {
+      // KaTeX didn't load — show raw TeX in monospace as graceful degradation
+      el.className = display ? 'math-block math-fallback' : 'math-inline math-fallback'
+      el.textContent = display ? `$$${tex}$$` : `$${tex}$`
+      continue
+    }
+    try {
+      window.katex.render(tex, el, {
+        displayMode: display,
+        throwOnError: false,
+        output: 'html',
+        strict: 'ignore',
+        trust: false,
+      })
+    } catch (err) {
+      el.className = display ? 'math-block math-error' : 'math-inline math-error'
+      el.textContent = `KaTeX error: ${err?.message || String(err)}`
     }
   }
   while (pendingHtmlPreviews.length > 0) {

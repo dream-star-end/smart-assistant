@@ -136,6 +136,7 @@ import {
   notifyNetworkOffline,
   notifyNetworkOnline,
   notifyTabVisible,
+  resetReplyTracker,
   resetThinkingSafety,
   setMeta,
   setStatus,
@@ -187,6 +188,7 @@ setMessageDeps({
   scheduleSave,
   scheduleSaveFromUserEdit,
   clearTurnTiming,
+  resetReplyTracker,
 })
 
 setWsDeps({
@@ -839,6 +841,10 @@ function buildPaletteItems(query) {
             sess._streamingThinking = null
             sess._sendingInFlight = false
             clearTurnTiming(sess)
+            // Drop reply tracker so any stray isFinal from the old agent's
+            // aborted turn can't mis-attribute to a fresh turn after switch
+            // (parity with the agent-select dropdown handler).
+            resetReplyTracker(sess)
             state.sendingInFlight = false
             hideTypingIndicator()
             updateSendEnabled()
@@ -1388,6 +1394,9 @@ async function init() {
     sess._streamingAssistant = null
     sess._streamingThinking = null
     sess._sendingInFlight = false
+    // Drop reply tracker so a late isFinal from the old agent doesn't bind to
+    // a new user message on the switched-to agent.
+    resetReplyTracker(sess)
     clearTurnTiming(sess)
     if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
     state.sendingInFlight = false

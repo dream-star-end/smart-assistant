@@ -275,13 +275,14 @@ export class Gateway {
           const peerKey = `webchat:${lastActive.peerId}`
           const set = this.clientsByPeer.get(peerKey)
           if (set && set.size > 0) {
-            // Use the last active session so message appears in the right conversation
-            const data = JSON.stringify(buildOut(lastActive.peerId, lastActive.sessionKey))
-            for (const ws of set) {
-              try {
-                ws.send(data)
-              } catch {}
-            }
+            // Route through deliver() to preserve the "all WebChat
+            // outbound.message frames carry ts" invariant the client-side
+            // stale-final guard relies on. buildOut includes a `cronJob`
+            // marker field that OutboundMessage schema doesn't declare,
+            // hence the cast — the wire format tolerates extra keys.
+            this.deliver(
+              buildOut(lastActive.peerId, lastActive.sessionKey) as OutboundMessage,
+            )
             delivered = true
           }
         }
@@ -304,9 +305,15 @@ export class Gateway {
         }
       }
 
-      // 3. Fallback: broadcast to all connected webchat clients
+      // 3. Fallback: broadcast to all connected webchat clients.
+      // This path can't use deliver() (which is scoped to a single peerKey) —
+      // inline the ts stamp so the client's stale-final/ts-guard invariant
+      // stays intact here too.
       if (!delivered) {
-        const data = JSON.stringify(buildOut('__reflection__'))
+        const data = JSON.stringify({
+          ...buildOut('__reflection__'),
+          ts: Date.now(),
+        })
         for (const set of this.clientsByPeer.values()) {
           for (const ws of set) {
             try {
@@ -410,7 +417,10 @@ export class Gateway {
           const lastActive =
             this.lastActiveChannel.get(agentId) || this.lastActiveChannel.get('main')
           if (lastActive) {
-            const out = {
+            // Route through deliver() so the server-assigned ts gets stamped —
+            // otherwise the web client's stale-final guard has nothing to compare
+            // against and every webhook-delivered isFinal bypasses the guard.
+            this.deliver({
               type: 'outbound.message' as const,
               sessionKey: lastActive.sessionKey,
               channel: 'webchat' as const,
@@ -419,16 +429,7 @@ export class Gateway {
                 { kind: 'text' as const, text: `🔔 **Webhook ${webhookId}**\n\n${output.trim()}` },
               ],
               isFinal: true,
-            }
-            const set = this.clientsByPeer.get(`webchat:${lastActive.peerId}`)
-            if (set) {
-              const data = JSON.stringify(out)
-              for (const ws of set) {
-                try {
-                  ws.send(data)
-                } catch {}
-              }
-            }
+            })
           }
         }
       })().catch((err) =>
@@ -480,29 +481,26 @@ export class Gateway {
     // Handle subprocess crashes: push a system message to the client so they know
     // the session will auto-recover on the next message they send
     eventBus.on('session.crashed', (ev) => {
-      const peerKey = `webchat:${ev.peerId}`
-      const clients = this.clientsByPeer.get(peerKey)
-      if (clients) {
-        const frame = JSON.stringify({
-          type: 'outbound.message',
-          sessionKey: ev.sessionKey,
-          channel: 'webchat',
-          peer: { id: ev.peerId, kind: 'dm' },
-          agentId: ev.agentId,
-          blocks: [
-            {
-              kind: 'text',
-              text: '⚠️ AI 进程异常退出，下一条消息将自动恢复上下文。',
-            },
-          ],
-          isFinal: true,
-        })
-        for (const ws of clients) {
-          try {
-            ws.send(frame)
-          } catch {}
-        }
-      }
+      // Route through deliver() so the ts-stamp path is the single source of truth
+      // for stale-final ordering. Preserves original semantics (no-op if no
+      // clients are connected — deliver() bails early on empty peer set).
+      // Cast keeps the legacy `agentId` field the crash notification has always
+      // carried; OutboundMessage schema doesn't define it but the client reads
+      // it, and the wire format tolerates extra keys.
+      this.deliver({
+        type: 'outbound.message',
+        sessionKey: ev.sessionKey,
+        channel: 'webchat',
+        peer: { id: ev.peerId, kind: 'dm' },
+        agentId: ev.agentId,
+        blocks: [
+          {
+            kind: 'text',
+            text: '⚠️ AI 进程异常退出，下一条消息将自动恢复上下文。',
+          },
+        ],
+        isFinal: true,
+      } as OutboundMessage)
       this.log.info('pushed crash notification', { peerId: ev.peerId })
 
       // Any pending permission requests that belonged to the crashed session
@@ -1757,7 +1755,9 @@ export class Gateway {
     const lastActive =
       this.lastActiveChannel.get('main') || this.lastActiveChannel.values().next().value
     if (lastActive && output.trim()) {
-      const out = {
+      // Route through deliver() so the ts-stamp happens centrally — bypass here
+      // would let inter-agent replies slip past the web client's stale-final guard.
+      this.deliver({
         type: 'outbound.message' as const,
         sessionKey: lastActive.sessionKey || `agent:${targetAgentId}:inter:dm:${sourceAgent}`,
         channel: 'webchat' as const,
@@ -1766,17 +1766,7 @@ export class Gateway {
           { kind: 'text' as const, text: `📨 **${targetAgentId}** 回复:\n\n${output.trim()}` },
         ],
         isFinal: true,
-      }
-      const peerKey = `webchat:${lastActive.peerId}`
-      const set = this.clientsByPeer.get(peerKey)
-      if (set) {
-        const data = JSON.stringify(out)
-        for (const ws of set) {
-          try {
-            ws.send(data)
-          } catch {}
-        }
-      }
+      })
     }
 
     this.sendJson(res, 200, { ok: true, agentId: targetAgentId, outputLength: output.length })
@@ -2509,7 +2499,10 @@ export class Gateway {
                   blocks: [e.block],
                   isFinal: false,
                 }
-                ws.send(JSON.stringify(out))
+                // Single-ws send (compact progress goes only to the requester),
+                // so deliver() isn't appropriate here — stamp ts inline instead
+                // so the client's stale-final guard has a monotonic timestamp.
+                ws.send(JSON.stringify({ ...out, ts: Date.now() }))
               } else if (e.kind === 'final') {
                 ws.send(
                   JSON.stringify({
@@ -2520,6 +2513,7 @@ export class Gateway {
                     blocks: [{ kind: 'text', text: '✅ 上下文压缩完成' }],
                     isFinal: true,
                     meta: e.meta,
+                    ts: Date.now(),
                   }),
                 )
               }
@@ -2911,6 +2905,8 @@ export class Gateway {
       const peerInFlight = peers.find(p => p.peerId === peerId)?.inFlight
       if (peerInFlight && session && !session.runner.isRunning) {
         try {
+          // Single-ws send (only the hello-ing client should see this notice),
+          // so deliver() isn't appropriate here — stamp ts inline.
           const interruptFrame = JSON.stringify({
             type: 'outbound.message',
             sessionKey,
@@ -2924,6 +2920,7 @@ export class Gateway {
               },
             ],
             isFinal: true,
+            ts: Date.now(),
           })
           ws.send(interruptFrame)
           this.log.info('auto-resume pushed turn-interrupted isFinal', { sessionKey })
@@ -2976,30 +2973,20 @@ export class Gateway {
     // ── Rate limiting: per-peer sliding window ──
     // Only non-duplicate messages consume rate-limit budget
     if (!this.rateLimiter.check(frame.peer.id, frame.channel)) {
-      const peerKey = `${frame.channel}:${frame.peer.id}`
-      const clients = this.clientsByPeer.get(peerKey)
-      if (clients) {
-        const msg = JSON.stringify({
-          type: 'outbound.message',
-          sessionKey: '',
-          channel: frame.channel,
-          peer: frame.peer,
-          blocks: [{ kind: 'text', text: '请求过于频繁，请稍后再试。' }],
-          isFinal: true,
-        })
-        for (const ws of clients) {
-          try { ws.send(msg) } catch {}
-        }
+      const rateLimitOut = {
+        type: 'outbound.message' as const,
+        sessionKey: '',
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [{ kind: 'text' as const, text: '请求过于频繁，请稍后再试。' }],
+        isFinal: true,
       }
+      // Route WebSocket broadcast through deliver() so ts-stamp is consistent
+      // with regular turn finals; keep the adapter path separate for non-ws
+      // channels (Telegram etc.) — adapter.send expects a plain OutboundMessage.
+      this.deliver(rateLimitOut)
       if (adapter) {
-        adapter.send({
-          type: 'outbound.message',
-          sessionKey: '',
-          channel: frame.channel,
-          peer: frame.peer,
-          blocks: [{ kind: 'text', text: '请求过于频繁，请稍后再试。' }],
-          isFinal: true,
-        }).catch(() => {})
+        adapter.send(rateLimitOut).catch(() => {})
       }
       return
     }
@@ -3377,7 +3364,11 @@ export class Gateway {
     const peerKey = `${out.channel}:${out.peer.id}`
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
-    const data = JSON.stringify(out)
+    // Stamp a server-assigned monotonic timestamp on every outbound frame so the
+    // web client can reject stale / out-of-order frames after reconnect or agent
+    // switches. Schema keeps `ts` unvalidated (extra field is tolerated), so no
+    // protocol version bump is required.
+    const data = JSON.stringify({ ...out, ts: Date.now() })
     for (const ws of set) {
       try {
         ws.send(data)

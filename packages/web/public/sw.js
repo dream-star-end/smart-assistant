@@ -1,16 +1,16 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v11'
+const VERSION = 'openclaude-v13'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=5',  // versioned URL used in index.html
+  '/style.css?v=7',  // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=6',  // versioned URL used in index.html
+  '/modules/main.js?v=7',  // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -38,6 +38,8 @@ const SHELL = [
   '/vendor/chart.umd.min.js',
   '/vendor/github-dark.min.css',
   '/vendor/github.min.css',
+  '/vendor/katex/katex.min.js',
+  '/vendor/katex/katex.min.css',
 ]
 
 self.addEventListener('install', (event) => {

@@ -1435,6 +1435,99 @@ a:hover {
   padding: 2px 0 4px;
 }
 
+/* Key-value list (generic + MCP fallback) */
+.tool-kv-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 12px;
+  row-gap: 4px;
+  padding: 6px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+/* `display: contents` lets each item's key/value spans participate
+   directly in the parent grid as two columns. */
+.tool-kv-item { display: contents; }
+.tool-kv-key {
+  color: var(--fg-dim);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.tool-kv-val {
+  color: var(--fg-muted);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* Highlighted prompt block (media/vision) */
+.tool-prompt {
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin: 4px 0 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* URL card (browser_navigate) */
+.tool-url-card {
+  display: inline-block;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 4px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--info);
+  text-decoration: none;
+  word-break: break-all;
+  max-width: 100%;
+}
+.tool-url-card:hover { background: var(--bg-hover); }
+
+/* Code preview (browser_evaluate / browser_run_code) — reuse inline-code palette */
+.tool-code-block {
+  background: var(--code-bg);
+  color: var(--fg);
+  border: 1px solid var(--code-border);
+}
+
+/* TodoWrite: checklist */
+.tool-todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+}
+.tool-todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-family: var(--font-sans, inherit);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.tool-todo-mark {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+.tool-todo-text { word-break: break-word; }
+.tool-todo-completed .tool-todo-mark { color: var(--success); }
+.tool-todo-completed .tool-todo-text { color: var(--fg-dim); text-decoration: line-through; }
+.tool-todo-in_progress .tool-todo-mark { color: var(--accent); }
+.tool-todo-in_progress .tool-todo-text { color: var(--fg); font-weight: 600; }
+.tool-todo-pending .tool-todo-mark { color: var(--fg-dim); }
+.tool-todo-pending .tool-todo-text { color: var(--fg-muted); }
+
 /* Legacy tool messages (old sessions without toolName) */
 .msg.tool:has(.tool-icon-legacy) {
   display: flex;
@@ -2218,6 +2311,35 @@ a:hover {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   margin: 0.8em 0;
+}
+.math-block {
+  margin: 0.8em 0;
+  padding: 4px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-align: center;
+}
+.math-block .katex-display {
+  margin: 0;
+}
+.math-inline {
+  display: inline-block;
+  vertical-align: baseline;
+}
+.math-fallback {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+}
+.math-error {
+  background: rgba(224, 108, 108, 0.06);
+  border: 1px solid rgba(224, 108, 108, 0.3);
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
 }
 .html-preview-wrap {
   margin: 0.8em 0;

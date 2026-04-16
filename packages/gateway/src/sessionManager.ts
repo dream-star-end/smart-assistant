@@ -272,11 +272,15 @@ export class SessionManager {
         const title = session.currentUserText.slice(0, 50).replace(/\s+/g, ' ').trim()
         if (title) session.title = title
       }
-      // Liveness-based timeout with state-aware thresholds:
-      //   - Tool call in progress (MCP/Bash): 15 min (tools legitimately take time)
-      //   - No tool call pending (API streaming / idle): 5 min
-      const IDLE_TIMEOUT_TOOL = 15 * 60_000 // 15 min — tool executing
-      const IDLE_TIMEOUT_DEFAULT = 5 * 60_000 // 5 min — API stream / general idle
+      // Liveness-based timeout with state-aware thresholds.
+      // Thresholds are intentionally generous to avoid killing legitimately long
+      // active work (large sub-agent runs, multi-round Codex review loops, big
+      // builds). _runOneTurn has a separate 30-min idle timer as a tighter
+      // turn-level backstop that resets on every stdout message.
+      //   - Tool call in progress (MCP/Bash/sub-agent): 60 min
+      //   - No tool call pending (API streaming / idle): 30 min
+      const IDLE_TIMEOUT_TOOL = 60 * 60_000 // 60 min — tool executing
+      const IDLE_TIMEOUT_DEFAULT = 30 * 60_000 // 30 min — API stream / general idle
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {
@@ -303,9 +307,15 @@ export class SessionManager {
       if (err?.message?.includes('idle timeout')) {
         // Actually interrupt the runner so the subprocess stops
         try { session.runner.interrupt() } catch {}
+        // Extract idle seconds from the inner error so the user-facing
+        // message reflects the actual silence duration (avoids confusing
+        // mismatch with the inner 30-min idle timer's fixed wording).
+        const m = /\((\d+)s/.exec(String(err?.message))
+        const minutes = m ? Math.round(Number(m[1]) / 60) : null
+        const detail = minutes ? `约 ${minutes} 分钟无输出` : '长时间无输出'
         onEvent({
           kind: 'error',
-          error: '子进程长时间无响应,已中断。请重试。',
+          error: `子进程${detail},已中断。请重试。`,
         })
         log.error('idle timeout, interrupted', { sessionKey: session.sessionKey }, err)
       } else {
@@ -394,16 +404,20 @@ export class SessionManager {
       let settled = false
       const settle = (fn: () => void) => { if (!settled) { settled = true; fn() } }
 
+      // Idle timeout — refreshed on every runner message (see handleMessage below).
+      // A turn is only killed if the agent produces no output for this long, so long
+      // active tasks keep running while genuinely stuck turns still get interrupted.
+      const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
       const timer = setTimeout(
         () => {
           if (!parser.finalized) {
             try { runner.interrupt() } catch {}
-            onEvent({ kind: 'error', error: '单轮对话超时 (30min),已中断。请重试。' })
+            onEvent({ kind: 'error', error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。' })
             detach()
             settle(() => resolve())
           }
         },
-        30 * 60 * 1000, // 30 min absolute timeout
+        IDLE_TIMEOUT_MS,
       )
 
       // Buffer 'final' event — only forward to client after auth check passes
@@ -576,7 +590,11 @@ export class SessionManager {
       // Expose parser to outer idle-timeout checker
       session._currentParser = parser
 
-      const handleMessage = (msg: any) => parser.parse(msg)
+      const handleMessage = (msg: any) => {
+        // Any message from runner means the agent is still active — reset idle timer.
+        timer.refresh()
+        parser.parse(msg)
+      }
       const handleError = (err: Error) => {
         onEvent({ kind: 'error', error: err.message })
         detach()

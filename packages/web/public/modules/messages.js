@@ -1,5 +1,6 @@
 // OpenClaude — Message rendering and display
 import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
+import { exportMessageDocx } from './export-docx.js'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -65,15 +66,6 @@ function _exportMd(text) {
   _dlBlob(new Blob([text], { type: 'text/markdown;charset=utf-8' }), `openclaude-${_exportTs()}.md`)
 }
 
-function _exportDoc(text) {
-  const html = _renderCleanHtml(text)
-  const doc =
-    '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">' +
-    `<head><meta charset="utf-8"><style>${_EXPORT_CSS}</style></head>` +
-    `<body>${html}</body></html>`
-  _dlBlob(new Blob(['\ufeff' + doc], { type: 'application/msword' }), `openclaude-${_exportTs()}.doc`)
-}
-
 function _exportPdf(text) {
   const html = _renderCleanHtml(text)
   const w = window.open('', '_blank')
@@ -96,6 +88,7 @@ let _hideTypingIndicator
 let _setTitleBusy
 let _scheduleSaveFromUserEdit
 let _clearTurnTiming
+let _resetReplyTracker
 export function setMessageDeps(deps) {
   _updateSendEnabled = deps.updateSendEnabled
   _showTypingIndicator = deps.showTypingIndicator
@@ -103,6 +96,7 @@ export function setMessageDeps(deps) {
   _setTitleBusy = deps.setTitleBusy
   _scheduleSaveFromUserEdit = deps.scheduleSaveFromUserEdit
   _clearTurnTiming = deps.clearTurnTiming
+  _resetReplyTracker = deps.resetReplyTracker
 }
 
 // ── Message status rendering ──
@@ -176,23 +170,150 @@ export function scrollBottom(force) {
 }
 
 // ── Tool card SVG icons ──
+const _ICON_TERMINAL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
+const _ICON_FILE_TEXT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>'
+const _ICON_PEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>'
+const _ICON_FILE_PLUS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>'
+const _ICON_SEARCH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>'
+const _ICON_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>'
+const _ICON_GLOBE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>'
+const _ICON_CHECK_LIST = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>'
+const _ICON_BROWSER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><circle cx="6.5" cy="6.5" r="0.6"/></svg>'
+const _ICON_CAMERA = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>'
+const _ICON_CURSOR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7 18 2-8 8-2z"/></svg>'
+const _ICON_KEYBOARD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="10" x2="6" y2="10"/><line x1="10" y1="10" x2="10" y2="10"/><line x1="14" y1="10" x2="14" y2="10"/><line x1="18" y1="10" x2="18" y2="10"/><line x1="7" y1="15" x2="17" y2="15"/></svg>'
+const _ICON_FORM = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="17" y2="13"/><line x1="7" y1="17" x2="13" y2="17"/></svg>'
+const _ICON_IMAGE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>'
+const _ICON_VIDEO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>'
+const _ICON_MUSIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'
+const _ICON_MIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10a7 7 0 0 1-14 0"/><line x1="12" y1="17" x2="12" y2="22"/></svg>'
+const _ICON_BRAIN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3a3 3 0 0 0-3 3 3 3 0 0 0-3 3 3 3 0 0 0 1.5 2.6A3 3 0 0 0 6 18a3 3 0 0 0 3 3"/><path d="M15 3a3 3 0 0 1 3 3 3 3 0 0 1 3 3 3 3 0 0 1-1.5 2.6A3 3 0 0 1 18 18a3 3 0 0 1-3 3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>'
+const _ICON_ARCHIVE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>'
+const _ICON_CLOCK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
+const _ICON_BOT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
+const _ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>'
+const _ICON_SPARKLE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 5.4L19 10l-5.2 1.6L12 17l-1.8-5.4L5 10l5.2-1.6z"/><path d="M19 17l1 3 3 1-3 1-1 3-1-3-3-1 3-1z"/></svg>'
+const _ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>'
+const _ICON_CHART = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>'
+const _ICON_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>'
+const _ICON_NOTEBOOK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>'
+
 const _TOOL_ICONS = {
-  Bash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
-  Read: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
-  Edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>',
-  Write: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>',
-  Grep: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
-  Glob: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
-  WebFetch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
-  WebSearch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
-  TodoWrite: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
-  _default: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+  Bash: _ICON_TERMINAL,
+  Read: _ICON_FILE_TEXT,
+  Edit: _ICON_PEN,
+  Write: _ICON_FILE_PLUS,
+  Grep: _ICON_SEARCH,
+  Glob: _ICON_FOLDER,
+  WebFetch: _ICON_GLOBE,
+  WebSearch: _ICON_GLOBE,
+  TodoWrite: _ICON_CHECK_LIST,
+  NotebookEdit: _ICON_NOTEBOOK,
+  Task: _ICON_BOT,
+  Agent: _ICON_BOT,
+  _default: _ICON_GEAR,
 }
 
 const _TOOL_LABELS = {
   Bash: '终端', Read: '读取文件', Edit: '编辑文件', Write: '写入文件',
   Grep: '搜索内容', Glob: '搜索文件', WebFetch: '网页抓取', WebSearch: '网页搜索',
-  TodoWrite: '任务列表', NotebookEdit: '笔记本',
+  TodoWrite: '任务列表', NotebookEdit: '笔记本', Task: '子任务', Agent: '子任务',
+}
+
+// ── MCP server prefix → friendly meta (icon + base label) ──
+// Tools are named `mcp__<server>__<op>`. We classify by server, then by op.
+const _MCP_SERVER_META = {
+  browser: { icon: _ICON_BROWSER, label: '浏览器' },
+  'minimax-media': { icon: _ICON_SPARKLE, label: '媒体生成' },
+  'minimax-vision': { icon: _ICON_EYE, label: '视觉理解' },
+  'openclaude-memory': { icon: _ICON_BRAIN, label: '记忆' },
+  codex: { icon: _ICON_BOT, label: 'Codex' },
+  'quant-system': { icon: _ICON_CHART, label: '量化' },
+}
+
+// Per-op overrides for richer icons (server-scoped).
+const _MCP_OP_META = {
+  // browser
+  'browser:browser_navigate': { icon: _ICON_GLOBE, label: '打开网页' },
+  'browser:browser_navigate_back': { icon: _ICON_GLOBE, label: '后退' },
+  'browser:browser_take_screenshot': { icon: _ICON_CAMERA, label: '截图' },
+  'browser:browser_snapshot': { icon: _ICON_BROWSER, label: '页面快照' },
+  'browser:browser_click': { icon: _ICON_CURSOR, label: '点击' },
+  'browser:browser_type': { icon: _ICON_KEYBOARD, label: '输入文本' },
+  'browser:browser_fill_form': { icon: _ICON_FORM, label: '填写表单' },
+  'browser:browser_press_key': { icon: _ICON_KEYBOARD, label: '按键' },
+  'browser:browser_select_option': { icon: _ICON_FORM, label: '选择选项' },
+  'browser:browser_evaluate': { icon: _ICON_TERMINAL, label: '执行脚本' },
+  'browser:browser_run_code': { icon: _ICON_TERMINAL, label: '执行代码' },
+  'browser:browser_wait_for': { icon: _ICON_CLOCK, label: '等待' },
+  'browser:browser_close': { icon: _ICON_BROWSER, label: '关闭浏览器' },
+  'browser:browser_tabs': { icon: _ICON_BROWSER, label: '标签页' },
+  'browser:browser_console_messages': { icon: _ICON_TERMINAL, label: '控制台' },
+  'browser:browser_network_requests': { icon: _ICON_GLOBE, label: '网络请求' },
+  'browser:browser_pdf_save': { icon: _ICON_FILE_TEXT, label: '保存 PDF' },
+  'browser:browser_resize': { icon: _ICON_BROWSER, label: '调整窗口' },
+  'browser:browser_hover': { icon: _ICON_CURSOR, label: '悬停' },
+  'browser:browser_drag': { icon: _ICON_CURSOR, label: '拖拽' },
+  'browser:browser_file_upload': { icon: _ICON_FILE_PLUS, label: '上传文件' },
+  'browser:browser_handle_dialog': { icon: _ICON_BROWSER, label: '处理弹窗' },
+  // minimax-media
+  'minimax-media:text_to_image': { icon: _ICON_IMAGE, label: '生成图片' },
+  'minimax-media:generate_video': { icon: _ICON_VIDEO, label: '生成视频' },
+  'minimax-media:query_video_generation': { icon: _ICON_VIDEO, label: '查询视频' },
+  'minimax-media:music_generation': { icon: _ICON_MUSIC, label: '生成音乐' },
+  'minimax-media:text_to_audio': { icon: _ICON_MIC, label: '语音合成' },
+  'minimax-media:voice_clone': { icon: _ICON_MIC, label: '克隆音色' },
+  'minimax-media:voice_design': { icon: _ICON_MIC, label: '设计音色' },
+  'minimax-media:list_voices': { icon: _ICON_MIC, label: '音色列表' },
+  'minimax-media:play_audio': { icon: _ICON_MUSIC, label: '播放音频' },
+  // vision
+  'minimax-vision:understand_image': { icon: _ICON_EYE, label: '图片理解' },
+  'minimax-vision:web_search': { icon: _ICON_GLOBE, label: '联网搜索' },
+  // memory
+  'openclaude-memory:memory': { icon: _ICON_BRAIN, label: '核心记忆' },
+  'openclaude-memory:archival_add': { icon: _ICON_ARCHIVE, label: '归档写入' },
+  'openclaude-memory:archival_search': { icon: _ICON_ARCHIVE, label: '归档检索' },
+  'openclaude-memory:archival_delete': { icon: _ICON_ARCHIVE, label: '归档删除' },
+  'openclaude-memory:session_search': { icon: _ICON_SEARCH, label: '历史检索' },
+  'openclaude-memory:create_reminder': { icon: _ICON_CLOCK, label: '创建提醒' },
+  'openclaude-memory:delegate_task': { icon: _ICON_BOT, label: '委托子任务' },
+  'openclaude-memory:send_to_agent': { icon: _ICON_SEND, label: '发送给子 Agent' },
+  'openclaude-memory:skill_list': { icon: _ICON_SPARKLE, label: '技能列表' },
+  'openclaude-memory:skill_view': { icon: _ICON_SPARKLE, label: '查看技能' },
+  'openclaude-memory:skill_save': { icon: _ICON_SPARKLE, label: '保存技能' },
+  'openclaude-memory:skill_delete': { icon: _ICON_SPARKLE, label: '删除技能' },
+  // codex
+  'codex:codex': { icon: _ICON_BOT, label: 'Codex 审查' },
+  'codex:codex-reply': { icon: _ICON_BOT, label: 'Codex 回复' },
+}
+
+// Parse `mcp__<server>__<op>` → { server, op } or null for non-MCP names.
+function _parseMcpName(name) {
+  if (typeof name !== 'string' || !name.startsWith('mcp__')) return null
+  const rest = name.slice(5)
+  const idx = rest.indexOf('__')
+  if (idx < 0) return { server: rest, op: '' }
+  return { server: rest.slice(0, idx), op: rest.slice(idx + 2) }
+}
+
+// Convert snake_case op name into a friendlier label (`browser_navigate` → `browser navigate`).
+function _humanizeOp(op) {
+  return (op || '').replace(/_/g, ' ').trim()
+}
+
+// Resolve icon + label for a tool name (handles MCP names).
+function _toolMeta(name) {
+  if (_TOOL_ICONS[name]) return { icon: _TOOL_ICONS[name], label: _TOOL_LABELS[name] || name }
+  const mcp = _parseMcpName(name)
+  if (mcp) {
+    const opMeta = _MCP_OP_META[`${mcp.server}:${mcp.op}`]
+    if (opMeta) return opMeta
+    const srvMeta = _MCP_SERVER_META[mcp.server]
+    const opLabel = _humanizeOp(mcp.op) || mcp.server
+    if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}` }
+    return { icon: _ICON_GEAR, label: opLabel }
+  }
+  return { icon: _ICON_GEAR, label: name }
 }
 
 function _safeInput(msg) {
@@ -232,8 +353,7 @@ function _buildPermissionCard(el, msg) {
 
 function _buildToolCard(el, msg) {
   const name = msg.toolName || 'unknown'
-  const icon = _TOOL_ICONS[name] || _TOOL_ICONS._default
-  const label = _TOOL_LABELS[name] || name
+  const meta = _toolMeta(name)
   const input = _safeInput(msg)
   const completed = msg._completed
   const isError = msg.error
@@ -249,7 +369,7 @@ function _buildToolCard(el, msg) {
   header.className = 'tool-card-header'
   const headerLeft = document.createElement('div')
   headerLeft.className = 'tool-card-header-left'
-  headerLeft.innerHTML = `<span class="tool-card-icon">${icon}</span><span class="tool-card-label">${htmlSafeEscape(label)}</span>`
+  headerLeft.innerHTML = `<span class="tool-card-icon">${meta.icon}</span><span class="tool-card-label">${htmlSafeEscape(meta.label)}</span>`
 
   // Summary info in header (file path, command preview, etc.)
   const summary = _toolSummary(name, input, msg)
@@ -280,18 +400,30 @@ function _buildToolCard(el, msg) {
   // ── Body (collapsible) ──
   const body = document.createElement('div')
   body.className = 'tool-card-body'
-
-  // Per-tool-type content
-  switch (name) {
-    case 'Bash': _renderBash(body, input, msg); break
-    case 'Edit': _renderEdit(body, input, msg); break
-    case 'Read': _renderRead(body, input, msg); break
-    case 'Write': _renderWrite(body, input, msg); break
-    case 'Grep': _renderGrep(body, input, msg); break
-    case 'Glob': _renderGlob(body, input, msg); break
-    default: _renderGeneric(body, input, msg); break
-  }
+  _renderToolBody(body, name, input, msg)
   el.appendChild(body)
+}
+
+function _renderToolBody(body, name, input, msg) {
+  switch (name) {
+    case 'Bash': return _renderBash(body, input, msg)
+    case 'Edit': return _renderEdit(body, input, msg)
+    case 'Read': return _renderRead(body, input, msg)
+    case 'Write': return _renderWrite(body, input, msg)
+    case 'Grep': return _renderGrep(body, input, msg)
+    case 'Glob': return _renderGlob(body, input, msg)
+    case 'TodoWrite': return _renderTodoWrite(body, input, msg)
+    case 'WebFetch': return _renderWebFetch(body, input, msg)
+    case 'WebSearch': return _renderWebSearch(body, input, msg)
+  }
+  const mcp = _parseMcpName(name)
+  if (mcp) {
+    if (mcp.server === 'browser') return _renderBrowser(body, mcp.op, input, msg)
+    if (mcp.server === 'minimax-media') return _renderMedia(body, mcp.op, input, msg)
+    if (mcp.server === 'minimax-vision') return _renderVision(body, mcp.op, input, msg)
+    if (mcp.server === 'openclaude-memory') return _renderMemory(body, mcp.op, input, msg)
+  }
+  return _renderGeneric(body, input, msg)
 }
 
 function _toolSummary(name, input, msg) {
@@ -305,8 +437,61 @@ function _toolSummary(name, input, msg) {
     case 'Glob': return input.pattern || ''
     case 'WebFetch': return (input.url || '').slice(0, 60)
     case 'WebSearch': return (input.query || '').slice(0, 60)
-    default: return ''
+    case 'TodoWrite': {
+      const todos = Array.isArray(input.todos) ? input.todos : []
+      const done = todos.filter((t) => t && t.status === 'completed').length
+      return todos.length ? `${done}/${todos.length}` : ''
+    }
+    case 'NotebookEdit': return _shortPath(input.notebook_path)
+    case 'Task': case 'Agent': return (input.description || input.prompt || '').slice(0, 60)
   }
+  // MCP fallback summaries
+  const mcp = _parseMcpName(name)
+  if (!mcp) return ''
+  return _mcpSummary(mcp.server, mcp.op, input).slice(0, 80)
+}
+
+function _mcpSummary(server, op, input) {
+  if (!input) return ''
+  if (server === 'browser') {
+    if (op === 'browser_navigate' || op === 'browser_navigate_back') return input.url || ''
+    if (op === 'browser_click' || op === 'browser_hover') return input.element || input.ref || ''
+    if (op === 'browser_type' || op === 'browser_press_key') return input.text || input.key || ''
+    if (op === 'browser_take_screenshot') return input.filename || ''
+    if (op === 'browser_evaluate' || op === 'browser_run_code') return (input.code || input.function || '').replace(/\s+/g, ' ').slice(0, 60)
+    if (op === 'browser_wait_for') return input.text || `${input.time || 0}s`
+    return op
+  }
+  if (server === 'minimax-media') {
+    if (op === 'text_to_image' || op === 'generate_video' || op === 'music_generation' || op === 'text_to_audio') {
+      return (input.prompt || input.text || input.lyrics || '').slice(0, 60)
+    }
+    if (op === 'query_video_generation') return input.task_id || ''
+    return op
+  }
+  if (server === 'minimax-vision') {
+    if (op === 'understand_image') return (input.prompt || input.question || '').slice(0, 60)
+    if (op === 'web_search') return input.query || ''
+    return op
+  }
+  if (server === 'openclaude-memory') {
+    if (op === 'memory') return `${input.op || 'read'} ${input.section || ''}`.trim()
+    if (op === 'archival_add' || op === 'archival_search' || op === 'archival_delete') {
+      return input.query || input.id || (input.text || '').slice(0, 50)
+    }
+    if (op === 'session_search') return input.query || ''
+    if (op === 'create_reminder') return input.message || input.label || input.schedule || ''
+    if (op === 'delegate_task' || op === 'send_to_agent') {
+      const tgt = input.agentId ? `→ ${input.agentId} ` : ''
+      return `${tgt}${(input.goal || input.message || input.prompt || '').slice(0, 60)}`
+    }
+    if (op === 'skill_view' || op === 'skill_delete' || op === 'skill_save') return input.name || ''
+    return op
+  }
+  if (server === 'codex') {
+    return (input.prompt || input.message || '').slice(0, 60)
+  }
+  return ''
 }
 
 // ── Bash: terminal-like card ──
@@ -455,21 +640,215 @@ function _renderGlob(body, input, msg) {
   }
 }
 
-// ── Generic fallback ──
-function _renderGeneric(body, input, msg) {
+// ── Shared helpers ──
+function _isSafeHttpUrl(s) {
+  return typeof s === 'string' && /^https?:\/\//i.test(s)
+}
+
+// Format a value for compact display. Arrays/objects are summarised
+// rather than fully serialised to avoid quadratic stringify cost on
+// streaming tool blocks that may rebuild many times.
+function _formatValue(v) {
+  if (v == null) return '—'
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  if (Array.isArray(v)) {
+    if (v.length === 0) return '[]'
+    if (v.length <= 3 && v.every((x) => x == null || typeof x !== 'object')) {
+      try { return JSON.stringify(v) } catch { return `Array(${v.length})` }
+    }
+    return `Array(${v.length})`
+  }
+  if (typeof v === 'object') {
+    const keys = Object.keys(v)
+    if (keys.length === 0) return '{}'
+    if (keys.length <= 3 && keys.every((k) => v[k] == null || typeof v[k] !== 'object')) {
+      try { return JSON.stringify(v) } catch { return `{${keys.length} 字段}` }
+    }
+    const head = keys.slice(0, 3).join(', ')
+    return keys.length > 3 ? `{${head}, …+${keys.length - 3}}` : `{${head}}`
+  }
+  return String(v)
+}
+
+// Render an object as a key-value list. Long values get clamped + monospace.
+function _renderKvList(parent, obj, opts) {
+  const keys = Object.keys(obj || {})
+  if (keys.length === 0) return
+  const list = document.createElement('div')
+  list.className = 'tool-kv-list'
+  const skip = new Set((opts && opts.skip) || [])
+  const maxValueLen = (opts && opts.maxValueLen) || 240
+  for (const k of keys) {
+    if (skip.has(k)) continue
+    const v = obj[k]
+    if (v == null || v === '') continue
+    const item = document.createElement('div')
+    item.className = 'tool-kv-item'
+    const keyEl = document.createElement('span')
+    keyEl.className = 'tool-kv-key'
+    keyEl.textContent = k
+    const valEl = document.createElement('span')
+    valEl.className = 'tool-kv-val'
+    let str = _formatValue(v)
+    if (str.length > maxValueLen) str = str.slice(0, maxValueLen) + '…'
+    valEl.textContent = str
+    item.appendChild(keyEl)
+    item.appendChild(valEl)
+    list.appendChild(item)
+  }
+  if (list.children.length) parent.appendChild(list)
+}
+
+// Render output as text. If JSON, pretty-print; if URL, embed.
+function _renderOutput(body, output, opts) {
+  if (!output) return
+  const max = (opts && opts.max) || 1500
+  let text = String(output)
+  // Try JSON pretty-print
+  if (text.length < 4000 && /^\s*[\[{]/.test(text)) {
+    try {
+      const obj = JSON.parse(text)
+      text = JSON.stringify(obj, null, 2)
+    } catch {}
+  }
+  const pre = document.createElement('pre')
+  pre.className = 'tool-output'
+  if (text.length > max) {
+    pre.textContent = text.slice(0, max) + '\n…'
+  } else {
+    pre.textContent = text
+  }
+  body.appendChild(pre)
+}
+
+// ── TodoWrite: checklist ──
+function _renderTodoWrite(body, input, msg) {
+  const todos = Array.isArray(input?.todos) ? input.todos : null
+  if (!todos || todos.length === 0) {
+    if (msg.output) _renderOutput(body, msg.output)
+    return
+  }
+  const list = document.createElement('div')
+  list.className = 'tool-todo-list'
+  for (const t of todos) {
+    if (!t || typeof t !== 'object') continue
+    const row = document.createElement('div')
+    const status = t.status || 'pending'
+    row.className = `tool-todo-item tool-todo-${status}`
+    const mark = document.createElement('span')
+    mark.className = 'tool-todo-mark'
+    mark.textContent = status === 'completed' ? '✓' : status === 'in_progress' ? '◐' : '○'
+    const text = document.createElement('span')
+    text.className = 'tool-todo-text'
+    text.textContent = (status === 'in_progress' && t.activeForm) ? t.activeForm : (t.content || '')
+    row.appendChild(mark)
+    row.appendChild(text)
+    list.appendChild(row)
+  }
+  body.appendChild(list)
+}
+
+// ── WebFetch: URL + prompt ──
+function _renderWebFetch(body, input, msg) {
+  if (input) _renderKvList(body, { url: input.url, prompt: input.prompt })
+  _renderOutput(body, msg.output)
+}
+
+// ── WebSearch: query + results ──
+function _renderWebSearch(body, input, msg) {
+  if (input) _renderKvList(body, { query: input.query, allowed_domains: input.allowed_domains, blocked_domains: input.blocked_domains })
+  _renderOutput(body, msg.output)
+}
+
+// ── MCP browser: per-op visualisation ──
+function _renderBrowser(body, op, input, msg) {
+  if (op === 'browser_navigate' && input?.url) {
+    const url = String(input.url)
+    let card
+    if (_isSafeHttpUrl(url)) {
+      card = document.createElement('a')
+      card.href = url
+      card.target = '_blank'
+      card.rel = 'noopener noreferrer'
+    } else {
+      // Reject non-http(s) URLs (e.g. javascript:) — render as plain text only.
+      card = document.createElement('div')
+    }
+    card.className = 'tool-url-card'
+    card.textContent = url
+    body.appendChild(card)
+  } else if (op === 'browser_evaluate' || op === 'browser_run_code') {
+    const code = input?.code || input?.function || ''
+    if (code) {
+      const block = document.createElement('pre')
+      block.className = 'tool-output tool-code-block'
+      block.textContent = String(code).slice(0, 1500)
+      body.appendChild(block)
+    }
+  } else if (input) {
+    _renderKvList(body, input, { skip: ['_meta'] })
+  }
+  _renderOutput(body, msg.output)
+}
+
+// ── MCP minimax-media: prompt + parameters ──
+function _renderMedia(body, op, input, msg) {
   if (input) {
-    const pre = document.createElement('pre')
-    pre.className = 'tool-output tool-generic-input'
-    pre.textContent = JSON.stringify(input, null, 2).slice(0, 500)
-    body.appendChild(pre)
+    const promptKeys = ['prompt', 'text', 'lyrics', 'first_frame_image', 'last_frame_image', 'subject_reference']
+    const promptVal = promptKeys.map((k) => input[k]).find((v) => typeof v === 'string' && v)
+    if (promptVal) {
+      const p = document.createElement('div')
+      p.className = 'tool-prompt'
+      p.textContent = promptVal
+      body.appendChild(p)
+    }
+    _renderKvList(body, input, { skip: ['prompt', 'text', 'lyrics', 'output_directory'] })
   }
-  if (msg.output) {
-    const pre = document.createElement('pre')
-    pre.className = 'tool-output'
-    pre.textContent = msg.output.slice(0, 1500)
-    if (msg.output.length > 1500) pre.textContent += '\n…'
-    body.appendChild(pre)
+  _renderOutput(body, msg.output)
+}
+
+// ── MCP minimax-vision: prompt + image ──
+function _renderVision(body, op, input, msg) {
+  if (input) {
+    const promptVal = input.prompt || input.question || input.query || ''
+    if (promptVal) {
+      const p = document.createElement('div')
+      p.className = 'tool-prompt'
+      p.textContent = promptVal
+      body.appendChild(p)
+    }
+    _renderKvList(body, input, { skip: ['prompt', 'question', 'query'] })
   }
+  _renderOutput(body, msg.output)
+}
+
+// ── MCP openclaude-memory: per-op formatting ──
+function _renderMemory(body, op, input, msg) {
+  if (input) {
+    if (op === 'memory') {
+      _renderKvList(body, { op: input.op, section: input.section, content: input.content })
+    } else if (op === 'create_reminder') {
+      _renderKvList(body, { schedule: input.schedule, message: input.message, label: input.label, oneshot: input.oneshot, deliver: input.deliver })
+    } else if (op === 'delegate_task' || op === 'send_to_agent') {
+      _renderKvList(body, {
+        agent: input.agentId,
+        goal: input.goal,
+        message: input.message,
+        prompt: input.prompt,
+        context: input.context,
+      })
+    } else {
+      _renderKvList(body, input)
+    }
+  }
+  _renderOutput(body, msg.output)
+}
+
+// ── Generic fallback: key-value list (no raw JSON dump) ──
+function _renderGeneric(body, input, msg) {
+  if (input && typeof input === 'object') _renderKvList(body, input)
+  _renderOutput(body, msg.output)
 }
 
 export function _buildMessageEl(msg) {
@@ -589,7 +968,7 @@ export function _buildMessageEl(msg) {
         menu.className = 'msg-save-menu'
         menu.innerHTML =
           '<button data-save="md"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> Markdown (.md)</button>' +
-          '<button data-save="doc"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> Word 兼容 (.doc)</button>' +
+          '<button data-save="docx"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> Word 文档 (.docx)</button>' +
           '<button data-save="pdf"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="15" x2="15" y2="15"/></svg> 打印为 PDF</button>'
         wrap.appendChild(menu)
         const _menuAc = new AbortController()
@@ -603,7 +982,7 @@ export function _buildMessageEl(msg) {
             const fmt = savBtn.dataset.save
             const raw = msg.text || ''
             if (fmt === 'md') _exportMd(raw)
-            else if (fmt === 'doc') _exportDoc(raw)
+            else if (fmt === 'docx') exportMessageDocx(msg, { title: getSession()?.title || 'openclaude' })
             else if (fmt === 'pdf') _exportPdf(raw)
             menu.remove()
             actions.classList.remove('menu-open')
@@ -631,10 +1010,8 @@ export function _buildMessageEl(msg) {
           )
         }, 0)
       } else if (action === 'regen') {
-        // Stop any in-flight turn before regenerating to avoid concurrent requests
+        // Stop any in-flight turn before regenerating to avoid concurrent requests.
         if (state.sendingInFlight) {
-          // Import stopCurrentTurn via late-bound deps isn't available here,
-          // so send the stop command directly
           if (state.ws && state.ws.readyState === 1) {
             state.ws.send(JSON.stringify({
               type: 'inbound.control.stop',
@@ -645,6 +1022,15 @@ export function _buildMessageEl(msg) {
           }
           sess._sendingInFlight = false
           _clearTurnTiming?.(sess)
+          // Reset reply tracker BEFORE we re-post the same user message below.
+          // Regen special case: since it reuses the same boundMsg, the primary
+          // stale-final guard (frame.ts < boundMsg.ts) can't distinguish the
+          // aborted prior turn's late isFinal from the fresh regen turn —
+          // both share the same boundMsg.ts. The fallback guard uses
+          // `_trackerResetAt` set by this helper, so we must call it here;
+          // otherwise a late final from the stopped turn would slip through
+          // once the regen frame rebinds the tracker.
+          _resetReplyTracker?.(sess)
           state.sendingInFlight = false
           _hideTypingIndicator()
           _updateSendEnabled()
@@ -706,6 +1092,10 @@ export function _buildMessageEl(msg) {
               } catch {}
               sess._sendingInFlight = false
               _clearTurnTiming?.(sess)
+              // Abandon the reply tracker so any belated isFinal arriving for
+              // this timed-out regen can't retroactively flag the user message
+              // as empty or attach to the next fresh turn.
+              _resetReplyTracker?.(sess)
               if (sess.id === state.currentSessionId) {
                 state.sendingInFlight = false
                 _updateSendEnabled()

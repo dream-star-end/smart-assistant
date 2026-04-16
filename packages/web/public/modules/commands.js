@@ -3,7 +3,12 @@ import { apiGet } from './api.js'
 import { $, _mod } from './dom.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
-import { addSystemMessage, localStopTeardown, nudgeDrain } from './websocket.js'
+import {
+  addSystemMessage,
+  localStopTeardown,
+  nudgeDrain,
+  resetReplyTracker,
+} from './websocket.js'
 
 // ── Late-binding for circular deps ──
 let _deps = {}
@@ -54,6 +59,9 @@ const slashCommands = [
       sess.messages = []
       sess._streamingAssistant = null
       sess._streamingThinking = null
+      // Drop reply tracker so a late isFinal from the cleared turn doesn't
+      // spuriously attach to (or warn about) subsequent fresh turns.
+      resetReplyTracker(sess)
       // Purge any offline queued messages for this session to prevent stale sends
       if (state.offlineQueue?.length > 0) {
         state.offlineQueue = state.offlineQueue.filter(item => item.sessId !== sess.id)
