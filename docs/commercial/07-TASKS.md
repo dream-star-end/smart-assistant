@@ -482,23 +482,34 @@
 **文档**: 01-SPEC F-2, 03-DATA-MODEL §1/§5
 
 **内容**:
-- [ ] `src/billing/ledger.ts`:
-  - `debit(user_id, amount, reason, ref)` → 事务
-    - `SELECT credits FROM users WHERE id=$1 FOR UPDATE`
-    - 余额 < amount → 抛 `ERR_INSUFFICIENT_CREDITS`
-    - `UPDATE users SET credits = credits - amount`
-    - `INSERT credit_ledger (..., balance_after=new_credits)`
-    - 返回 `{ledger_id, balance_after}`
-  - `credit(user_id, amount, reason, ref)` → 同结构,正数
-  - `adminAdjust(user_id, delta, memo, admin_id)` → 调整 + 写 admin_audit
+- [x] `src/billing/ledger.ts`:
+  - `debit(userId, amount, reason, ref?, memo?)` → `{ledger_id, balance_after}`
+    - `tx()` 包裹:`SELECT credits FROM users WHERE id=$1 FOR UPDATE` → 校验 → `UPDATE users SET credits = new` → `INSERT credit_ledger`
+    - amount 必须 > 0;余额不足抛 `InsufficientCreditsError` (code=`ERR_INSUFFICIENT_CREDITS`,带 balance/required/shortfall)
+  - `credit(userId, amount, reason, ref?, memo?)` → 同结构,delta 正数
+  - `adminAdjust(userId, delta, memo, adminId, ref?, ip?, ua?)` → 同事务内:
+    - UPDATE users.credits + INSERT credit_ledger(reason=`admin_adjust`) + INSERT admin_audit(action=`credits.adjust`, before/after JSONB)
+    - delta 必须 ≠ 0;memo 必传非空;余额会被打成负值 → 抛 `InsufficientCreditsError` 整事务回滚
+  - 读路径辅助:`getBalance(userId)` / `listLedger(userId, {limit,before})`
+  - BIGINT / bigint 贯穿:pg `::text AS col` → `BigInt(...)` 在边界,中间不经 Number
+  - `LEDGER_REASONS` 枚举与 0002 的 CHECK 白名单 1:1(含 topup/chat/agent_chat/agent_subscription/refund/admin_adjust/promotion 共 7 个)
+- [x] `listLedger` 排序用 `ORDER BY id DESC` —— `created_at = transaction_timestamp()` 在并发时不稳定(先 BEGIN 后拿锁的 tx 时间戳会更早),BIGSERIAL id 在 FOR UPDATE 串行化前提下严格对齐 commit 顺序
+- [x] `src/index.ts`:导出 debit/credit/adminAdjust/getBalance/listLedger/InsufficientCreditsError/LEDGER_REASONS + 类型
 
 **Acceptance**:
-- [ ] 集成:正常扣费 → users.credits 减 + ledger 有记录
-- [ ] 集成:余额不足 → 抛 + users.credits 未变
-- [ ] 集成:并发 10 个 debit(只够扣 5 次)→ 严格 5 成功 5 失败
-- [ ] 集成:ledger UPDATE/DELETE 被 RULE 拦住
+- [x] 集成:正常 debit → users.credits 减 + credit_ledger 新增(delta<0,balance_after 与 users.credits 一致,ref_type/ref_id/memo 落地)
+- [x] 集成:余额不足 → 抛 InsufficientCreditsError(shortfall 字段正确),users.credits 未变,ledger 无新增
+- [x] 集成:并发 10 个 debit(余额 500 每次 100)→ 严格 5 成功 5 失败;剩余余额 0;5 行 ledger 的 balance_after 单调(400→300→200→100→0)
+- [x] 集成:credit_ledger UPDATE/DELETE 被 0002 RULE 拦住,实际行不变(回归)
+- [x] 集成:adminAdjust 正向 → ledger + admin_audit 各出一行,before.credits / after.credits / delta / ledger_id 齐全,ip/ua 落地
+- [x] 集成:adminAdjust 负向合法(余额够);会把余额打成负值 → InsufficientCreditsError,ledger + audit 都未写(事务原子回滚)
+- [x] 集成:user 不存在 → TypeError
+- [x] 集成:listLedger limit 参数生效,按 id DESC 倒序
+- [x] 单元:InsufficientCreditsError 结构(code/balance/required/shortfall);入参校验(amount≤0 / reason 非法 / user_id 非正整数 / delta=0 / memo 空)
 
-**Status**: `[ ] todo`
+**测试**: +10 unit case + 12 integ case 新增,242 tests 全绿(132 unit + 110 integ)
+
+**Status**: `[x] done`
 
 ---
 

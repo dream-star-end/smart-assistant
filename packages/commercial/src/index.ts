@@ -169,3 +169,19 @@ export { PricingCache, perKtokCredits } from "./billing/pricing.js";
 export type { ModelPricing, PublicModel } from "./billing/pricing.js";
 export { computeCost } from "./billing/calculator.js";
 export type { TokenUsage, PriceSnapshot, CostResult } from "./billing/calculator.js";
+export {
+  debit,
+  credit,
+  adminAdjust,
+  getBalance,
+  listLedger,
+  InsufficientCreditsError,
+  LEDGER_REASONS,
+} from "./billing/ledger.js";
+export type {
+  LedgerReason,
+  LedgerRef,
+  DebitResult,
+  AdminAdjustResult,
+  LedgerRow,
+} from "./billing/ledger.js";
