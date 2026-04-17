@@ -39,6 +39,12 @@ import {
   type RequestContext,
 } from "./handlers.js";
 import { handleChat } from "./chat.js";
+import {
+  handleListPlans,
+  handleCreateHupi,
+  handleHupiCallback,
+  handleGetOrder,
+} from "./payment.js";
 
 export type CommercialHandler = (
   req: IncomingMessage,
@@ -54,7 +60,16 @@ type RouteHandler = (
 
 interface Route {
   method: string;
-  path: string;
+  /**
+   * 精确路径。动态参数路由(如 `/api/payment/orders/:order_no`)用 `pathPrefix` 字段,
+   * 不在这里出现。
+   */
+  path?: string;
+  /**
+   * 前缀匹配:path 以 `pathPrefix` 开头的请求都会命中。Handler 自己从 url 中抽参数。
+   * 用于少数带路径变量的 GET 接口。同一 method 多个 prefix 顺序即优先级。
+   */
+  pathPrefix?: string;
   handler: RouteHandler;
 }
 
@@ -70,9 +85,19 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     { method: "GET", path: "/api/me", handler: handleMe },
     { method: "GET", path: "/api/public/models", handler: handleListPublicModels },
     { method: "POST", path: "/api/chat", handler: handleChat },
+    { method: "GET", path: "/api/payment/plans", handler: handleListPlans },
+    { method: "POST", path: "/api/payment/hupi/create", handler: handleCreateHupi },
+    { method: "POST", path: "/api/payment/hupi/callback", handler: handleHupiCallback },
+    { method: "GET", pathPrefix: "/api/payment/orders/", handler: handleGetOrder },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
-  const prefixes = ["/api/auth/", "/api/me", "/api/public/", "/api/chat"];
+  const prefixes = [
+    "/api/auth/",
+    "/api/me",
+    "/api/public/",
+    "/api/chat",
+    "/api/payment/",
+  ];
 
   return async function commercialHandler(req, res): Promise<boolean> {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
@@ -92,12 +117,19 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
       userAgent: userAgentOf(req),
     };
 
-    const route = routes.find((r) => r.path === path);
+    // 1) 精确匹配
+    const exact = routes.find((r) => r.path !== undefined && r.path === path);
+    // 2) 前缀匹配(只在精确不中时尝试)
+    const prefix = exact ? undefined : routes.find(
+      (r) => r.pathPrefix !== undefined && path.startsWith(r.pathPrefix),
+    );
+    const route = exact ?? prefix;
     try {
       if (!route) {
         throw new HttpError(404, "NOT_FOUND", "endpoint not found");
       }
       if (route.method !== method) {
+        // method mismatch:若同路径下有其他 method 可接受,返 Allow 头(多 method 情况 MVP 不出现)
         throw new HttpError(405, "METHOD_NOT_ALLOWED", `method ${method} not allowed`, {
           extraHeaders: { Allow: route.method },
         });

@@ -23,6 +23,7 @@ import type { Mailer } from "../auth/mail.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { ChatLLM } from "./chat.js";
+import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -46,11 +47,22 @@ export interface CommercialHttpDeps {
   preCheckRedis?: PreCheckRedis;
   /** T-23: LLM 执行器,默认 stub(固定 1000 in / 500 out);T-40 接真 Claude 时替换 */
   chatLLM?: ChatLLM;
+  /**
+   * T-24: 虎皮椒 HTTP 客户端。未注入时 POST /api/payment/hupi/create 返 503。
+   * 测试时注入返回固定 qrcode 的 mock,避免打外网。
+   */
+  hupijiao?: HupijiaoClient;
+  /**
+   * T-24: 虎皮椒回调校签所需配置(至少 appSecret)。
+   * 分开 deps.hupijiao 是为了允许 "callback 能 verify,但 create 暂未开"。
+   */
+  hupijiaoConfig?: Pick<HupijiaoConfig, "appSecret" | "appId">;
   /** 限流配置覆盖(测试用) */
   rateLimits?: Partial<{
     register: RateLimitConfig;
     login: RateLimitConfig;
     requestReset: RateLimitConfig;
+    hupiCreate: RateLimitConfig;
   }>;
 }
 
@@ -64,12 +76,15 @@ export const DEFAULT_RATE_LIMITS = {
   register: { scope: "register", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
   login: { scope: "login", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
   requestReset: { scope: "request_reset", windowSeconds: 60, max: 3 } satisfies RateLimitConfig,
+  // 04-API §8:同用户 10 次 / 1h
+  hupiCreate: { scope: "hupi_create", windowSeconds: 3600, max: 10 } satisfies RateLimitConfig,
 };
 
 /**
  * 限流帮助:超限抛 HttpError(429),并写一行 rate_limit_events。
+ * 导出给 payment / chat 等路由复用。
  */
-async function enforceRateLimit(
+export async function enforceRateLimit(
   deps: CommercialHttpDeps,
   cfg: RateLimitConfig,
   identifier: string,

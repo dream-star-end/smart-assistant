@@ -60,13 +60,50 @@ const turnstileSecret = z.string().trim().min(1).optional();
 
 const turnstileBypass = z.enum(["0", "1"]).optional().transform((v) => v === "1");
 
-export const commercialConfigSchema = z.object({
-  DATABASE_URL: databaseUrl,
-  REDIS_URL: redisUrl,
-  COMMERCIAL_ENABLED: enabledFlag,
-  TURNSTILE_SECRET: turnstileSecret,
-  TURNSTILE_TEST_BYPASS: turnstileBypass,
-});
+/**
+ * 虎皮椒支付相关(T-24)。所有字段 **optional** —— 商业化可以先不开支付功能,
+ * 路由层在 deps 缺失时返 503。生产上线前必须配好,否则 /api/payment/hupi/* 全报错。
+ */
+const hupiAppId = z.string().trim().min(1).max(128).optional();
+const hupiAppSecret = z.string().trim().min(1).max(256).optional();
+const hupiCallbackUrl = urlStringWithProtocols(["http:", "https:"], "HUPIJIAO_CALLBACK_URL").optional();
+const hupiReturnUrl = urlStringWithProtocols(["http:", "https:"], "HUPIJIAO_RETURN_URL").optional();
+const hupiEndpoint = urlStringWithProtocols(["http:", "https:"], "HUPIJIAO_ENDPOINT").optional();
+
+export const commercialConfigSchema = z
+  .object({
+    DATABASE_URL: databaseUrl,
+    REDIS_URL: redisUrl,
+    COMMERCIAL_ENABLED: enabledFlag,
+    TURNSTILE_SECRET: turnstileSecret,
+    TURNSTILE_TEST_BYPASS: turnstileBypass,
+    HUPIJIAO_APP_ID: hupiAppId,
+    HUPIJIAO_APP_SECRET: hupiAppSecret,
+    HUPIJIAO_CALLBACK_URL: hupiCallbackUrl,
+    HUPIJIAO_RETURN_URL: hupiReturnUrl,
+    HUPIJIAO_ENDPOINT: hupiEndpoint,
+  })
+  .superRefine((cfg, ctx) => {
+    // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。
+    // 避免 "半配置" 导致运维以为开了支付但实际不通。
+    const hupiTriplet: ReadonlyArray<[string, unknown]> = [
+      ["HUPIJIAO_APP_ID", cfg.HUPIJIAO_APP_ID],
+      ["HUPIJIAO_APP_SECRET", cfg.HUPIJIAO_APP_SECRET],
+      ["HUPIJIAO_CALLBACK_URL", cfg.HUPIJIAO_CALLBACK_URL],
+    ];
+    const set = hupiTriplet.filter(([, v]) => v !== undefined).length;
+    if (set > 0 && set < hupiTriplet.length) {
+      for (const [key, v] of hupiTriplet) {
+        if (v === undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [key],
+            message: `${key} required when other HUPIJIAO_* fields are set`,
+          });
+        }
+      }
+    }
+  });
 
 export type CommercialConfig = z.infer<typeof commercialConfigSchema>;
 

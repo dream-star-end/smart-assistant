@@ -558,31 +558,31 @@
 **文档**: 01-SPEC F-3, 04-API §4, 05-SEC §11
 
 **内容**:
-- [ ] `src/payment/hupijiao/sign.ts`:MD5 签名(按虎皮椒规范)
-- [ ] `src/payment/hupijiao/client.ts`:`createQr(order)` 调虎皮椒 API
-- [ ] `src/payment/orders.ts`:订单状态机
-- [ ] `POST /api/payment/hupi/create`:
-  - 校验 plan_code 存在且 enabled
-  - 生成 order_no(ULID),INSERT orders status=pending, expires_at=now+15min
-  - 调虎皮椒 → 拿 qrcode_url
-  - 返回
-- [ ] `POST /api/payment/hupi/callback`:
-  - 解析 form-urlencoded
-  - 校验签名(错 → 400)
-  - 查 orders by order_no,已 paid → 返回 success(幂等)
-  - 事务:status=paid + credit(user, plan.credits, 'topup', order_id) + UPDATE ledger_id
-  - 返回 text "success"
-- [ ] `GET /api/payment/orders/:order_no`
-- [ ] 定时任务:扫 pending 且 expires_at < now → status=expired(每 5min)
+- [x] `src/payment/hupijiao/sign.ts`:MD5 签名(按虎皮椒规范)—— 字典序 + 跳 hash / 空值 + `&<APP_SECRET>` + md5 小写;`verifyHupijiao` 用 timingSafeEqual 大小写归一
+- [x] `src/payment/hupijiao/client.ts`:`createQr(order)` 调虎皮椒 API(`createHttpHupijiaoClient(cfg, fetchImpl?)`),errcode≠0 → HupijiaoError("UPSTREAM_<code>"),missing qrcode → UPSTREAM_NO_QRCODE
+- [x] `src/payment/orders.ts`:订单状态机(`createPendingOrder` / `markOrderPaid` 事务内 SELECT FOR UPDATE → credit+ledger+update / `expirePendingOrders` / `getOrderByNo`)
+- [x] `GET /api/payment/plans`:公开,返回 enabled 档(按 sort_order DESC)
+- [x] `POST /api/payment/hupi/create`:
+  - requireAuth + 10 次/1h 限流(04-API §8)
+  - 校验 plan_code → `createPendingOrder`(expires_at=now+15min)→ mock/prod 虎皮椒拿 qrcode
+  - 502 UPSTREAM_\* 时订单留 pending(后续 expire 扫到)
+- [x] `POST /api/payment/hupi/callback`:
+  - 解析 form-urlencoded(新增 `readFormBody` / `sendText` util)
+  - 校验签名(错 → 400 SIGNATURE_INVALID)
+  - `status != "OD"` → 回 `success` 但不推进状态(避免虎皮椒一直重试)
+  - `markOrderPaid` 幂等:已 paid 直接返 `success`;pending → paid + credit(topup) + ledger + 回写 callback_payload;expired/refunded/canceled → warn log + `success`(记运维看得到)
+- [x] `GET /api/payment/orders/:order_no`:requireAuth + user-scoped(非属主 404);`extractOrderNoFromUrl` 白名单字符 + 长度限制
+- [x] `expirePendingOrders()`:已实现,部署期间挂 cron(工具期在 T-80 集成)
 
 **Acceptance**:
-- [ ] 单元:sign 输入已知 payload → 已知 md5(用虎皮椒文档示例)
-- [ ] 集成:create → 本地 orders 状态 pending;过期 15min → 自动 expired
-- [ ] 集成:callback 签名错 → 400
-- [ ] 集成:callback 正确 → status=paid + 积分到账 + ledger 记录
-- [ ] 集成:callback 重复 → 仍返回 success + 积分只加一次
+- [x] 单元:`hupijiaoSign.test.ts` — 16 case(字典序 / 跳空 / bigint/bool 归一 / verify 篡改字段/hash/secret / 大小写 hash)
+- [x] 单元:`orders.test.ts` — generateOrderNo 格式与唯一性 / extractOrderNoFromUrl 非法输入
+- [x] 集成:`orders.integ.test.ts` — listPlans 种子、createPendingOrder、disabled plan → PlanNotFoundError、首次 markPaid、幂等回放、expired → InvalidOrderStateError、并发同单只加一次、expirePendingOrders
+- [x] 集成:`payment.integ.test.ts` — GET plans 公开、create 全路径、callback 签名错 → 400、正确回调 → paid + 积分到账、status=PN → 不推进、重复回调只加一次、非属主 GET → 404、非法 order_no 字符 → 400
 
-**Status**: `[ ] todo`
+**测试**: +2 unit 文件(22 case) + 2 integ 文件(23 case),共 **162 unit + 140 integ = 302 全绿**
+
+**Status**: `[x] done`
 
 ---
 

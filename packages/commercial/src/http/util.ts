@@ -33,8 +33,8 @@ export function userAgentOf(req: IncomingMessage): string | null {
   return typeof ua === "string" ? ua.slice(0, 512) : null;
 }
 
-/** 安全 JSON body 读取,带大小上限。 */
-export async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+/** 读 raw body(含大小上限)。JSON / form 两个 helper 共用。 */
+async function readRawBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -45,13 +45,56 @@ export async function readJsonBody(req: IncomingMessage): Promise<unknown> {
     }
     chunks.push(buf);
   }
-  if (total === 0) return undefined;
-  const text = Buffer.concat(chunks).toString("utf8");
+  return total === 0 ? "" : Buffer.concat(chunks).toString("utf8");
+}
+
+/** 安全 JSON body 读取,带大小上限。 */
+export async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const text = await readRawBody(req);
+  if (text.length === 0) return undefined;
   try {
     return JSON.parse(text);
   } catch {
     throw new HttpError(400, "INVALID_JSON", "request body is not valid JSON");
   }
+}
+
+/**
+ * 读 `application/x-www-form-urlencoded` body → 扁平 `{k: string}`。
+ *
+ * 用于第三方回调(虎皮椒)等非 JSON 场景。同键多值只保留第一个(URLSearchParams 自然行为:
+ * `.get()` 取首个;我们这里遍历 `.entries()` 的首次出现)。
+ */
+export async function readFormBody(req: IncomingMessage): Promise<Record<string, string>> {
+  const text = await readRawBody(req);
+  const out: Record<string, string> = {};
+  if (text.length === 0) return out;
+  const sp = new URLSearchParams(text);
+  for (const [k, v] of sp.entries()) {
+    if (!(k in out)) out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * 写纯文本响应(虎皮椒回调要求返回 text "success")。
+ * 不走 JSON,不走 no-store cache(POST 幂等回调 ok 即可)。
+ */
+export function sendText(
+  res: ServerResponse,
+  status: number,
+  body: string,
+  extraHeaders?: Record<string, string | number>,
+): void {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  if (extraHeaders) {
+    for (const [k, v] of Object.entries(extraHeaders)) {
+      res.setHeader(k, String(v));
+    }
+  }
+  res.end(body);
 }
 
 /** 写 JSON 响应 + 标准头。 */

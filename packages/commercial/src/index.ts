@@ -20,6 +20,7 @@ import { createCommercialHandler, type CommercialHandler } from "./http/router.j
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { PricingCache } from "./billing/pricing.js";
 import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
+import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -138,6 +139,21 @@ export async function registerCommercial(
     console.error("[commercial] pricing LISTEN setup failed:", err);
   }
 
+  // T-24 虎皮椒:三件套齐全 → 生产 client;否则 undefined(handler 会 503)
+  let hupijiao: HupijiaoClient | undefined;
+  let hupijiaoConfig: Pick<HupijiaoConfig, "appId" | "appSecret"> | undefined;
+  if (cfg.HUPIJIAO_APP_ID && cfg.HUPIJIAO_APP_SECRET && cfg.HUPIJIAO_CALLBACK_URL) {
+    const fullCfg: HupijiaoConfig = {
+      appId: cfg.HUPIJIAO_APP_ID,
+      appSecret: cfg.HUPIJIAO_APP_SECRET,
+      notifyUrl: cfg.HUPIJIAO_CALLBACK_URL,
+      returnUrl: cfg.HUPIJIAO_RETURN_URL,
+      endpoint: cfg.HUPIJIAO_ENDPOINT,
+    };
+    hupijiao = createHttpHupijiaoClient(fullCfg);
+    hupijiaoConfig = { appId: fullCfg.appId, appSecret: fullCfg.appSecret };
+  }
+
   const handler = createCommercialHandler({
     jwtSecret,
     mailer: stubMailer,
@@ -149,6 +165,8 @@ export async function registerCommercial(
     pricing,
     // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
     preCheckRedis: wrapIoredisForPreCheck(redis),
+    hupijiao,
+    hupijiaoConfig,
   });
 
   return {
@@ -203,3 +221,40 @@ export type {
 } from "./billing/preCheck.js";
 export { stubChatLLM } from "./http/chat.js";
 export type { ChatLLM, ChatBody } from "./http/chat.js";
+export {
+  signHupijiao,
+  verifyHupijiao,
+  buildSignBase,
+} from "./payment/hupijiao/sign.js";
+export type { SignParams } from "./payment/hupijiao/sign.js";
+export {
+  createHttpHupijiaoClient,
+  HupijiaoError,
+} from "./payment/hupijiao/client.js";
+export type {
+  HupijiaoClient,
+  HupijiaoConfig,
+  CreateQrInput,
+  CreateQrResult,
+} from "./payment/hupijiao/client.js";
+export {
+  listPlans,
+  getPlanByCode,
+  generateOrderNo,
+  createPendingOrder,
+  getOrderByNo,
+  markOrderPaid,
+  expirePendingOrders,
+  ORDER_STATUSES,
+  PlanNotFoundError,
+  OrderNotFoundError,
+  InvalidOrderStateError,
+} from "./payment/orders.js";
+export type {
+  TopupPlan,
+  OrderRow,
+  OrderStatus,
+  CreatePendingOrderInput,
+  MarkOrderPaidInput,
+  MarkOrderPaidResult,
+} from "./payment/orders.js";
