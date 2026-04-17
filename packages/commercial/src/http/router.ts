@@ -50,6 +50,7 @@ import {
   handleAgentStatus,
   handleAgentCancel,
 } from "./agent.js";
+import { handleAdminAgentAudit } from "./adminAudit.js";
 
 export type CommercialHandler = (
   req: IncomingMessage,
@@ -98,6 +99,8 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     { method: "POST", path: "/api/agent/open", handler: handleAgentOpen },
     { method: "GET", path: "/api/agent/status", handler: handleAgentStatus },
     { method: "POST", path: "/api/agent/cancel", handler: handleAgentCancel },
+    // T-54 Agent 审计(超管)
+    { method: "GET", path: "/api/admin/agent-audit", handler: handleAdminAgentAudit },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [
@@ -107,6 +110,7 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     "/api/chat",
     "/api/payment/",
     "/api/agent/",
+    "/api/admin/",
   ];
 
   return async function commercialHandler(req, res): Promise<boolean> {
