@@ -167,3 +167,5 @@ export type { CommercialHandler } from "./http/router.js";
 export type { CommercialHttpDeps } from "./http/handlers.js";
 export { PricingCache, perKtokCredits } from "./billing/pricing.js";
 export type { ModelPricing, PublicModel } from "./billing/pricing.js";
+export { computeCost } from "./billing/calculator.js";
+export type { TokenUsage, PriceSnapshot, CostResult } from "./billing/calculator.js";

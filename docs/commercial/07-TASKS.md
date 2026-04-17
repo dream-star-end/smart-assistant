@@ -443,7 +443,7 @@
 
 **测试**: 10 + 4 unit case + 9 integ case 新增(全部 pass)
 
-**Status**: `[x] done` (commit <pending>)
+**Status**: `[x] done` (commit 6681cac)
 
 ---
 
@@ -452,18 +452,28 @@
 **文档**: 01-SPEC F-2, 03-DATA-MODEL §4/§6
 
 **内容**:
-- [ ] `src/billing/calculator.ts`:
-  - `computeCost(usage, pricing)` → `{cost_credits, snapshot}`
-  - 4 维 token 分别算:`(tok/1_000_000) * per_mtok_price * multiplier`
-  - 所有算术用 BigInt,最后向上取整到分
-  - snapshot 包含当时所有价格字段(可审计)
+- [x] `src/billing/calculator.ts`:
+  - `computeCost(usage, pricing, capturedAt?)` → `{cost_credits, snapshot}`
+  - 4 维 token(input/output/cache_read/cache_write)统一公式:`Σ tokens_i × per_mtok_i × multiplier / 10^9`
+  - BigInt 贯穿:pg 的 `::text` → `BigInt` 在 pricing 边界,multiplier 用 `"2.000"`→`2000n` 整数放大形式参与,中间计算不经 Number
+  - **ceiling 在总和层做一次**(不在每维 ceiling 累加,避免双重舍入系统性高估)
+  - 全零 usage → 精确 0,其他 → 至少 1 分
+  - 负 token / 负 multiplier → `TypeError`(调用方 bug,不吞)
+  - snapshot 所有数字字段序列化为 string(BigInt 不能直接 `JSON.stringify`),`captured_at` ISO 字符串
+- [x] `src/index.ts`:导出 `computeCost` + `TokenUsage` / `PriceSnapshot` / `CostResult` 供 T-22/T-23 使用
 
 **Acceptance**:
-- [ ] 单元:已知 usage + pricing → 已知 cost(若干 case)
-- [ ] 单元:极大 token 不溢出(BigInt 保证)
-- [ ] 单元:极小 usage 不为 0(向上取整保证至少 1 分)
+- [x] 单元:已知 usage + pricing → 已知 cost — sonnet 1M input=600 分,opus 1M input=3000 分,opus 混合 4 维=4718 分,multiplier 1.5=450 分
+- [x] 单元:极大 token 不溢出 — 10^12 tok * 300 分 * 2.0 = 6×10^8 分精确;bigint 入参 10^15 tok 跑通(Number.MAX_SAFE_INTEGER ≈ 9×10^15)
+- [x] 单元:极小 usage 不为 0 — 1 tok 在 input/cache_read 维均 → 1 分;每维各 1 tok 合起来仍 → 1 分(验证不是每维各 ceiling)
+- [x] 单元:全零 usage → 精确 0,不被 ceiling 抬高
+- [x] 单元:负 input_tokens / 负 output_tokens(bigint)/ 负 multiplier → TypeError
+- [x] 单元:number + bigint 混用入参跑通
+- [x] 单元:snapshot 字段完整、全 string,可 JSON 往返;captured_at 未传时默认 now
 
-**Status**: `[ ] todo`
+**测试**: 15 unit case 新增,122 unit/98 integ 全部 pass
+
+**Status**: `[x] done`
 
 ---
 
