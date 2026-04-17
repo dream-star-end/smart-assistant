@@ -61,7 +61,7 @@ RUN apt-get update \
 # BUN_VERSION 锁死到一个我们已验证的版本;升级时改这一行并重建镜像。
 # 不走 `curl -fsSL install.sh | bash` —— 那个脚本本身从网络拉二进制,层层间接
 # 在离线/代理 env 里会踩坑,不如直接下 release zip。
-ARG BUN_VERSION=1.1.34
+ARG BUN_VERSION=1.3.11
 
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
@@ -101,7 +101,14 @@ RUN set -eux; \
     # 也行,但 T-51 保持干净(只有 owner/perm),让 volume 内容由首次启动的
     # agent 进程初始化。
     chown -R agent:agent /root; \
-    chmod 750 /root
+    chmod 750 /root; \
+    # T-52:RPC socket 挂载点。T-52 supervisor 层会 bind-mount 真实 host 目录
+    # 到这里;但预先建好目录 + 给 agent 的 ownership,可以让容器在"没带 bind
+    # mount"的场景(build smoke / dev)下 RPC server 也能正常起来,socket 落到
+    # 容器内 tmpfs 而非 EROFS。
+    mkdir -p /var/run/agent-rpc; \
+    chown agent:agent /var/run/agent-rpc; \
+    chmod 0700 /var/run/agent-rpc
 
 # ------------------------------------------------------------
 # Agent supervisor script
@@ -111,6 +118,15 @@ RUN set -eux; \
 #   2. 捕获 SIGTERM 清理
 COPY --chown=root:root supervisor.sh /usr/local/bin/supervisor.sh
 RUN chmod 0755 /usr/local/bin/supervisor.sh
+
+# ------------------------------------------------------------
+# T-52 Agent RPC server
+# ------------------------------------------------------------
+# 由 supervisor.sh 里 `exec bun run /usr/local/agent-rpc/server.ts` 启动。
+# 脚本本身非 executable(靠 `bun run <path>` 调起),所以 0644 即可;owner=root
+# 确保 agent 不会 accidentally 改写它。
+COPY --chown=root:root agent-rpc.ts /usr/local/agent-rpc/server.ts
+RUN chmod 0644 /usr/local/agent-rpc/server.ts
 
 # ------------------------------------------------------------
 # 运行时配置

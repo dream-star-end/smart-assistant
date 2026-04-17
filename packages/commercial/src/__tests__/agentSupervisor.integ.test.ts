@@ -1,7 +1,9 @@
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import Docker from "dockerode";
-import { statSync } from "node:fs";
+import { statSync, mkdtempSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createContainer,
   stopContainer,
@@ -60,8 +62,12 @@ async function pullImage(d: Docker, image: string): Promise<void> {
 }
 
 let testUid: number;
+let rpcRoot: string;
 
 before(async () => {
+  // T-52:每个 createContainer 都需要一个 host 目录容纳 RPC socket。integ 跑在
+  // 普通用户权限下也要能 mkdir;tmp 目录已被当前进程拥有,chown 即便失败也无妨。
+  rpcRoot = mkdtempSync(join(tmpdir(), "agent-rpc-integ-"));
   if (!socketExists()) return;
   try {
     docker = new Docker();
@@ -110,10 +116,14 @@ async function cleanupNetwork(): Promise<void> {
 }
 
 after(async () => {
-  if (!dockerAvailable) return;
-  await cleanupContainer(testUid);
-  // 额外清理过去可能遗留的 test uid(本测试如果中途崩)
-  await cleanupNetwork();
+  if (dockerAvailable) {
+    await cleanupContainer(testUid);
+    // 额外清理过去可能遗留的 test uid(本测试如果中途崩)
+    await cleanupNetwork();
+  }
+  if (rpcRoot && existsSync(rpcRoot)) {
+    try { rmSync(rpcRoot, { recursive: true, force: true }); } catch { /* */ }
+  }
 });
 
 describe("agent supervisor integ", () => {
@@ -141,9 +151,12 @@ describe("agent supervisor integ", () => {
       extraEnv: { FOO: "bar" },
       proxyUrl: "http://proxy:3128",
       seccompProfileJson: seccompProfile,
+      rpcSocketHostDir: rpcRoot,
       // alpine 镜像默认 CMD 是 ["/bin/sh"],没有 stdin 会立刻退出 —— 我们
       // 只看 inspect 里 supervisor 下发的参数,不看容器是否持续 Running。
     });
+    // T-52:rpcSocketPath 指向 tmp 下的 u{uid}/agent.sock
+    assert.equal(res.rpcSocketPath, join(rpcRoot, `u${uid}`, "agent.sock"));
     assert.equal(res.name, `agent-u${uid}`);
     assert.equal(res.limits.memoryBytes, 64 * 1024 * 1024);
     assert.equal(res.limits.pidsLimit, 50);
@@ -176,6 +189,11 @@ describe("agent supervisor integ", () => {
     assert.ok(binds.some((b: string) => b.startsWith(`${vols.workspace}:/workspace`)));
     // home volume 挂到 /root,不是 /home/agent
     assert.ok(binds.some((b: string) => b.startsWith(`${vols.home}:/root`)));
+    // T-52:host/u{uid} 挂到 /var/run/agent-rpc
+    assert.ok(
+      binds.some((b: string) => b.endsWith(":/var/run/agent-rpc:rw")),
+      "Bind for RPC socket dir must be present",
+    );
 
     // Env FOO=bar 已注入
     assert.ok((info.Config.Env ?? []).includes("FOO=bar"));
@@ -203,6 +221,7 @@ describe("agent supervisor integ", () => {
           network: n,
           proxyUrl: "http://proxy:3128",
           seccompProfileJson: seccompProfile,
+          rpcSocketHostDir: rpcRoot,
         }),
         (err: Error & { code?: string }) => err.name === "SupervisorError" && err.code === "InvalidArgument",
       );
@@ -264,6 +283,7 @@ describe("agent supervisor integ", () => {
           defaultAction: "SCMP_ACT_ALLOW",
           syscalls: [{ names: ["reboot"], action: "SCMP_ACT_ERRNO" }],
         }),
+        rpcSocketHostDir: rpcRoot,
       }),
       (err: Error & { code?: string }) => err.name === "SupervisorError" && err.code === "ImageNotFound",
     );

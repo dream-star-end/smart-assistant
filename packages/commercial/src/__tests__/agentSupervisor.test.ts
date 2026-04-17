@@ -1,5 +1,8 @@
-import { describe, test } from "node:test";
+import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, existsSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   containerNameFor,
   createContainer,
@@ -11,6 +14,18 @@ import {
   SupervisorError,
 } from "../agent-sandbox/index.js";
 import type Docker from "dockerode";
+
+// T-52:每个 createContainer 调用会 mkdir `${rpcSocketHostDir}/u{uid}`。
+// 所有用例共用一个 tmp root,after 统一清理。
+let rpcRoot: string;
+before(() => {
+  rpcRoot = mkdtempSync(join(tmpdir(), "agent-rpc-ut-"));
+});
+after(() => {
+  if (rpcRoot && existsSync(rpcRoot)) {
+    try { rmSync(rpcRoot, { recursive: true, force: true }); } catch { /* */ }
+  }
+});
 
 /**
  * Supervisor 单测:用一个极简的 Docker mock,捕获 createContainer 传给 docker
@@ -151,6 +166,7 @@ function baseOpts(overrides: Record<string, unknown> = {}) {
     network: "agent-net",
     proxyUrl: DEFAULT_PROXY_URL,
     seccompProfileJson: DEFAULT_SECCOMP,
+    rpcSocketHostDir: rpcRoot,
     ...overrides,
   } as Parameters<typeof createContainer>[2];
 }
@@ -193,6 +209,11 @@ describe("createContainer", () => {
 
     assert.equal(result.name, "agent-u42");
     assert.equal(result.id, "abc123");
+    // T-52:rpcSocketPath 应指向 `${rpcRoot}/u42/agent.sock`
+    assert.equal(result.rpcSocketPath, join(rpcRoot, "u42", "agent.sock"));
+    // 而且 host 子目录应已被 mkdir 出来(chown 可能 best-effort 失败,忽略 mode)
+    assert.ok(existsSync(join(rpcRoot, "u42")), "u42 host dir should exist");
+    assert.ok(statSync(join(rpcRoot, "u42")).isDirectory());
     // 默认值对齐 01-SPEC F-5.2 / 05-SEC §13
     assert.equal(result.limits.memoryBytes, 384 * 1024 * 1024);
     assert.equal(result.limits.nanoCpus, 200_000_000);
@@ -242,9 +263,20 @@ describe("createContainer", () => {
     assert.match(tmp, /noexec/);
     assert.match(tmp, /size=67108864/);
     // Binds:workspace → /workspace, home → /root(01-SPEC F-5.4 + 05-SEC §13)
+    //  + T-52 新增:host/u42 → /var/run/agent-rpc(RPC socket)
+    const binds = (hc.Binds ?? []).slice().sort();
     assert.deepEqual(
-      (hc.Binds ?? []).sort(),
-      ["agent-u42-home:/root:rw", "agent-u42-workspace:/workspace:rw"],
+      binds,
+      [
+        "agent-u42-home:/root:rw",
+        "agent-u42-workspace:/workspace:rw",
+        `${join(rpcRoot, "u42")}:/var/run/agent-rpc:rw`,
+      ].sort(),
+    );
+    // 断一下字符串格式有 `:/var/run/agent-rpc:rw` 这一段(回归保护:别改成 ro)
+    assert.ok(
+      (hc.Binds ?? []).some((b) => b.endsWith(":/var/run/agent-rpc:rw")),
+      "Binds must include RPC socket dir bind-mounted rw at /var/run/agent-rpc",
     );
     // 网络
     assert.equal(hc.NetworkMode, "agent-net");
@@ -301,6 +333,26 @@ describe("createContainer", () => {
       createContainer(docker, 1, baseOpts({ seccompProfileJson: undefined })),
       (err: Error) => err instanceof SupervisorError && err.code === "InvalidArgument",
     );
+  });
+
+  test("rpcSocketHostDir rejects empty / undefined / relative / root / '..'", async () => {
+    const { docker } = makeDocker();
+    for (const bad of [undefined, "", "  ", "relative/dir", "./x", "../x", "/",
+                       "/etc/../root", "/foo/../bar"]) {
+      await assert.rejects(
+        createContainer(docker, 1, baseOpts({ rpcSocketHostDir: bad })),
+        (err: Error) => err instanceof SupervisorError && err.code === "InvalidArgument",
+        `expected rejection for rpcSocketHostDir=${JSON.stringify(bad)}`,
+      );
+    }
+  });
+
+  test("rpcSocketPath points to per-uid subdir", async () => {
+    const { docker } = makeDocker();
+    const r = await createContainer(docker, 77, baseOpts());
+    assert.equal(r.rpcSocketPath, join(rpcRoot, "u77", "agent.sock"));
+    // u77 子目录已建,agent.sock 还没(容器内 RPC server 起来后才出现)
+    assert.ok(existsSync(join(rpcRoot, "u77")));
   });
 
   test("proxyUrl required (fail closed per 05-SEC §13)", async () => {

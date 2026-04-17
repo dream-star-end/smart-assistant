@@ -1,4 +1,6 @@
 import type Docker from "dockerode";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { ensureAgentNetwork } from "./network.js";
 import { ensureUserVolumes, volumeNamesFor } from "./volumes.js";
 import {
@@ -215,6 +217,73 @@ function sanitizeExtraEnv(env: Record<string, string> | undefined): string[] {
   return out;
 }
 
+/**
+ * T-52 —— RPC socket host 目录校验 + 每用户子目录准备。
+ *
+ * fail closed:非绝对路径 / 空 / `/` / 含 `..` 一律拒绝。不是为了防攻击者(这个值
+ * 来自 Gateway 配置,非用户输入),而是防 lifecycle 层一个粗心就把整个 `/` bind
+ * 进容器。
+ *
+ * 返回容器内 bind mount 的 host 路径 `${rpcSocketHostDir}/u{uid}`,以及 socket 文件
+ * 的完整路径(caller 用来 createConnection)。
+ *
+ * 目录创建失败(EACCES 等) → InvalidArgument,把错误往上抛;chown 失败只 warn
+ * 不拒,允许测试在非 root 下跑(tmp 目录已被当前进程拥有)。
+ */
+function prepareRpcSocketDir(rpcSocketHostDir: string, uid: number): {
+  hostPath: string;
+  socketFile: string;
+} {
+  if (typeof rpcSocketHostDir !== "string" || rpcSocketHostDir.trim() === "") {
+    throw new SupervisorError(
+      "InvalidArgument",
+      "rpcSocketHostDir is required (non-empty string)",
+    );
+  }
+  if (!path.isAbsolute(rpcSocketHostDir)) {
+    throw new SupervisorError(
+      "InvalidArgument",
+      `rpcSocketHostDir must be absolute path, got ${rpcSocketHostDir}`,
+    );
+  }
+  if (rpcSocketHostDir === "/") {
+    throw new SupervisorError(
+      "InvalidArgument",
+      "rpcSocketHostDir='/' is refused (would mount entire filesystem root)",
+    );
+  }
+  // 防御:路径中含 `..` 容易造成父目录逃逸
+  if (rpcSocketHostDir.split(path.sep).some((seg) => seg === "..")) {
+    throw new SupervisorError(
+      "InvalidArgument",
+      `rpcSocketHostDir must not contain '..' segments, got ${rpcSocketHostDir}`,
+    );
+  }
+
+  const hostPath = path.join(rpcSocketHostDir, `u${uid}`);
+  try {
+    fs.mkdirSync(hostPath, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    throw new SupervisorError(
+      "InvalidArgument",
+      `failed to mkdir ${hostPath}: ${(err as Error).message}`,
+    );
+  }
+  // 容器内 agent 以 1000:1000 跑,需要写该目录才能创建 agent.sock。
+  // chown 可能失败(非 root;或 tmpfs 拒绝),失败只吞掉 —— 落地环境下 gateway
+  // 进程以 root 运行,这里一定能 chown。
+  try {
+    fs.chownSync(hostPath, 1000, 1000);
+  } catch {
+    /* best-effort;测试场景下 caller 通常已经拥有此目录 */
+  }
+
+  return {
+    hostPath,
+    socketFile: path.join(hostPath, "agent.sock"),
+  };
+}
+
 // ------------------------------------------------------------
 //  核心 API
 // ------------------------------------------------------------
@@ -257,6 +326,8 @@ export async function createContainer(
   const tmpfsTmpMb = sanitizePositiveInt(opts.tmpfsTmpMb, DEFAULT_TMPFS_TMP_MB, 1024, "tmpfsTmpMb");
   const extraEnv = sanitizeExtraEnv(opts.extraEnv);
   const seccompOpt = normalizeSeccompOption(opts.seccompProfileJson);
+  // T-52:校验 rpcSocketHostDir + 建立 host 子目录 + chown 到 agent uid
+  const rpcSocket = prepareRpcSocketDir(opts.rpcSocketHostDir, uid);
 
   const memoryBytes = memoryMb * MIB;
   const nanoCpus = Math.floor(cpus * NANO_CPU_PER_CPU);
@@ -339,6 +410,9 @@ export async function createContainer(
         Binds: [
           `${volNames.workspace}:/workspace:rw`,
           `${volNames.home}:/root:rw`,
+          // T-52:把 host 上的 per-user 子目录挂进容器,里边的 agent.sock
+          // 是 Gateway /ws/agent 与容器内 RPC server 的桥梁。
+          `${rpcSocket.hostPath}:/var/run/agent-rpc:rw`,
         ],
         // 网络 —— 强制走 agent-net,不继承 host,不用默认 bridge
         NetworkMode: opts.network,
@@ -378,6 +452,7 @@ export async function createContainer(
         pidsLimit,
         tmpfsTmpBytes,
       },
+      rpcSocketPath: rpcSocket.socketFile,
     };
   } catch (err) {
     if (err instanceof SupervisorError) throw err;

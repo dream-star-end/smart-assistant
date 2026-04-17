@@ -49,6 +49,20 @@ export type ProvisionOptions = {
    * T-53 的 lifecycle.provision 负责读取并传入。
    */
   seccompProfileJson: string;
+  /**
+   * T-52 —— RPC unix socket 在 host 上的**父目录**(绝对路径),内部按 `u{uid}/`
+   * 分出每个用户的子目录。supervisor 会:
+   *   1. 确保 `${rpcSocketHostDir}/u{uid}/` 存在,权限 0700,owner 1000:1000(如能 chown)
+   *   2. bind-mount 该子目录到容器内 `/var/run/agent-rpc/`(rw)
+   *   3. 返回 `ProvisionResult.rpcSocketPath = ${rpcSocketHostDir}/u{uid}/agent.sock`
+   * Gateway 侧的 `/ws/agent` 再用该 path 通过 `net.createConnection` 直连容器内
+   * 的 RPC server —— 不共享 docker.sock,不过 HTTP,直连 unix domain socket。
+   *
+   * 必填 + 严格校验(fail closed):
+   *   - 必须绝对路径、非空、不能是 `/`、不能含 `..`
+   *   - 这不是"防攻击者",而是防调用方不小心传相对路径/空串导致挂到进程 cwd 或根
+   */
+  rpcSocketHostDir: string;
 };
 
 /**
@@ -89,6 +103,13 @@ export type ProvisionResult = {
     pidsLimit: number;
     tmpfsTmpBytes: number;
   };
+  /**
+   * T-52 —— host 上 RPC unix socket 的完整路径(`${rpcSocketHostDir}/u{uid}/agent.sock`)。
+   * Gateway 侧 `/ws/agent` 直接 `net.createConnection({path: rpcSocketPath})` 连进去。
+   * 返回时 socket 文件未必已经存在(容器内 RPC server 启动需要时间),调用方
+   * 可以重试或拿到后等 retry-on-ENOENT。
+   */
+  rpcSocketPath: string;
 };
 
 /**

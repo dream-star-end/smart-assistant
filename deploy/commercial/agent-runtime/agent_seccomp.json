@@ -134,12 +134,12 @@
       "errnoRet": 1
     },
     {
-      "_note_clone3": "clone3 takes flags inside a struct clone_args *, which seccomp cannot dereference. Deny it outright; glibc falls back to `clone` for all paths agent needs (pthread_create, popen, git-child-process).",
+      "_note_clone3": "clone3 takes flags inside a struct clone_args *, which seccomp cannot dereference. Deny it outright with ENOSYS(38) — NOT EPERM(1) — so glibc >= 2.34 detects 'kernel lacks clone3' and falls back to the `clone` path (pthread_create / popen / git-child-process). Returning EPERM here breaks pthread_create on debian bookworm / node:22-slim because glibc only triggers the fallback on ENOSYS.",
       "names": [
         "clone3"
       ],
       "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1
+      "errnoRet": 38
     },
     {
       "_note_clone_newuser": "clone(CLONE_NEWUSER=0x10000000) — user namespace creation is the primary escape vector paired with setuid binaries. One rule per CLONE_NEW* bit because SCMP_CMP_MASKED_EQ matches (arg & value) == valueTwo exactly; deny-any-bit-set is expressed as N rules OR'd via the libseccomp ruleset semantics.",
