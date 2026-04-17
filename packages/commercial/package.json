@@ -10,12 +10,14 @@
   },
   "dependencies": {
     "argon2": "^0.44.0",
+    "dockerode": "^4.0.10",
     "ioredis": "^5.10.1",
     "jose": "^6.2.2",
     "pg": "^8.20.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/dockerode": "^3.3.47",
     "@types/pg": "^8.20.0"
   }
 }

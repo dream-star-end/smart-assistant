@@ -70,6 +70,67 @@ const hupiCallbackUrl = urlStringWithProtocols(["http:", "https:"], "HUPIJIAO_CA
 const hupiReturnUrl = urlStringWithProtocols(["http:", "https:"], "HUPIJIAO_RETURN_URL").optional();
 const hupiEndpoint = urlStringWithProtocols(["http:", "https:"], "HUPIJIAO_ENDPOINT").optional();
 
+/**
+ * Agent 沙箱配置(T-50)。
+ *
+ * - `AGENT_IMAGE`:容器镜像名(T-51 构建 `openclaude/agent-runtime:latest`)
+ * - `AGENT_NETWORK`:Gateway 会自动创建一个独立 bridge 网络,隔离 host,默认 `agent-net`
+ * - `AGENT_DOCKER_SOCKET`:默认走 dockerode 的默认路径(`/var/run/docker.sock`),
+ *   测试环境可以指向 rootless / DinD socket。
+ * - `AGENT_MEMORY_MB` / `AGENT_CPUS` / `AGENT_PIDS_LIMIT`:资源上限,给小值避免
+ *   一个异常容器压垮宿主。缺省对齐 05-SEC §13。
+ *
+ * 所有字段都 optional,只在真正 provision 容器的路径要求非空 —— chat 路径
+ * 不需要 agent sandbox,也就不应该因为这些 env 没配而启动失败。
+ */
+const agentImage = z.string().trim().min(1).max(256).optional();
+/**
+ * AGENT_NETWORK:
+ * - 必须是合法 docker network 名
+ * - **禁止** `bridge` / `host` / `none` / `default` —— 这些是 docker 内建网络,
+ *   挂上去就破坏了沙箱隔离(05-SEC §13)
+ */
+const AGENT_NETWORK_RESERVED = new Set(["bridge", "host", "none", "default"]);
+const agentNetwork = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, "AGENT_NETWORK must be a valid docker network name")
+  .refine(
+    (v) => !AGENT_NETWORK_RESERVED.has(v),
+    "AGENT_NETWORK cannot be a docker built-in network (bridge/host/none/default)",
+  )
+  .optional();
+const agentDockerSocket = z.string().trim().min(1).max(512).optional();
+/**
+ * 资源上限字段。zod 解析 env 时先走 string,再 coerce 成 int,拒绝负数/0/非整数。
+ * 上限故意设得保守(单机共跑 20 容器 × 512MB = 10GB,已经接近 38.55 的上限)。
+ */
+const positiveInt = (max: number) =>
+  z
+    .string()
+    .regex(/^\d+$/, "must be a positive integer")
+    .transform((v) => Number.parseInt(v, 10))
+    .refine((n) => n > 0 && n <= max, `must be in (0, ${max}]`)
+    .optional();
+const agentMemoryMb = positiveInt(4096); // 最多 4GB/容器
+const agentPidsLimit = positiveInt(4096);
+const agentCpus = z
+  .string()
+  .regex(/^\d+(\.\d+)?$/, "AGENT_CPUS must be a positive number")
+  .transform((v) => Number.parseFloat(v))
+  .refine((n) => n > 0 && n <= 8, "AGENT_CPUS must be in (0, 8]")
+  .optional();
+
+/**
+ * `AGENT_PROXY_URL`:T-50 supervisor 要求 fail-closed 的透明代理 URL(05-SEC §13 /
+ * 01-SPEC F-5.2)。配在 env 里由 T-53 lifecycle 读出来透传给 supervisor,
+ * 本 schema 负责格式校验(必须是 http/https URL)。保持 optional:chat 路径不开 agent
+ * 时不应因缺此项启动失败;但 T-53 `provision` 会在未配时返 503。
+ */
+const agentProxyUrl = urlStringWithProtocols(["http:", "https:"], "AGENT_PROXY_URL").optional();
+
 export const commercialConfigSchema = z
   .object({
     DATABASE_URL: databaseUrl,
@@ -82,6 +143,13 @@ export const commercialConfigSchema = z
     HUPIJIAO_CALLBACK_URL: hupiCallbackUrl,
     HUPIJIAO_RETURN_URL: hupiReturnUrl,
     HUPIJIAO_ENDPOINT: hupiEndpoint,
+    AGENT_IMAGE: agentImage,
+    AGENT_NETWORK: agentNetwork,
+    AGENT_DOCKER_SOCKET: agentDockerSocket,
+    AGENT_MEMORY_MB: agentMemoryMb,
+    AGENT_CPUS: agentCpus,
+    AGENT_PIDS_LIMIT: agentPidsLimit,
+    AGENT_PROXY_URL: agentProxyUrl,
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。
