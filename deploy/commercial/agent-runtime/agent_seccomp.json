@@ -1,0 +1,282 @@
+{
+  "_comment_": [
+    "Agent sandbox seccomp profile (05-SEC §13).",
+    "",
+    "Strategy: default=ALLOW, explicit deny for a curated list of dangerous syscalls.",
+    "",
+    "Why not default=ERRNO + full whitelist?",
+    "  - Docker's own default.json whitelists ~300+ syscalls to let a generic Linux",
+    "    userspace process run; keeping that list in sync with kernel/libc updates",
+    "    has non-trivial maintenance cost.",
+    "  - The container already runs as uid=1000, with CapDrop=ALL and",
+    "    no-new-privileges; several of the ALLOW-by-default syscalls below require",
+    "    capabilities we don't grant, so they would EPERM at kernel level anyway.",
+    "  - Our supervisor validates profiles at create time: a defaultAction=ALLOW",
+    "    profile with zero deny rules is refused (see normalizeSeccompOption).",
+    "",
+    "What the deny list covers (high-impact categories):",
+    "  - Kernel module load/unload: init_module / finit_module / delete_module /",
+    "    create_module / query_module",
+    "  - Kernel live-patch / reboot: reboot, kexec_load, kexec_file_load",
+    "  - Time manipulation: adjtimex, clock_adjtime, clock_settime, settimeofday,",
+    "    stime  (prevents container from subtly shifting host clock)",
+    "  - Mount / pivot / chroot: mount, umount, umount2, pivot_root, chroot,",
+    "    move_mount, mount_setattr, open_tree, fsopen, fsmount, fsconfig, fspick",
+    "    (chroot also needs CAP_SYS_CHROOT — doubly blocked)",
+    "  - Namespaces: unshare, setns, clone3, clone(CLONE_NEW*)  (creating",
+    "    new namespaces is an escape vector; clone3 takes flags via struct",
+    "    pointer which seccomp can't dereference, so it's denied wholesale)",
+    "  - Tracing / eBPF: ptrace, bpf, perf_event_open, process_vm_readv,",
+    "    process_vm_writev, kcmp  (block cross-process inspection)",
+    "  - Swap / quota: swapon, swapoff, quotactl, quotactl_fd",
+    "  - System accounting: acct",
+    "  - Execution domain: personality  (flipping personality allows exploiting",
+    "    different ABI handling)",
+    "  - I/O port: iopl, ioperm  (direct hardware access, needs CAP_SYS_RAWIO anyway)",
+    "  - Legacy kernel APIs: nfsservctl, lookup_dcookie, vmsplice, bdflush,",
+    "    ustat, sysfs, _sysctl",
+    "  - IPC namespace / key mgmt: add_key, request_key, keyctl  (blocks",
+    "    keyring-based credential stashing)",
+    "  - Deprecated shared library loader: uselib",
+    "",
+    "What we deliberately do NOT deny despite being listed in some hardening guides:",
+    "  - capset: runc/containerd uses it during container init to drop the",
+    "    capability bounding set (CapDrop=ALL is implemented via capset). Denying",
+    "    it makes the container fail with \"can't apply capabilities\".",
+    "  - clone (without CLONE_NEW* bits): pthread_create, popen, subprocess",
+    "    spawning — universal userspace needs.",
+    "",
+    "What we deliberately keep allowed:",
+    "  - fork/clone/clone3/execve/execveat: required by bun, git subprocess",
+    "  - mmap/mprotect/mremap/madvise: required by Node/Bun runtime",
+    "  - socket/connect/bind: agent needs to reach transparent proxy",
+    "  - ioctl (general): a ton of legitimate uses; rely on cap drop + readonly fs",
+    "",
+    "This profile passes openclaude/agent-sandbox supervisor validation:",
+    "  - defaultAction is SCMP_ACT_ALLOW (explicit)",
+    "  - syscalls list is non-empty AND contains SCMP_ACT_ERRNO entries",
+    "",
+    "Upgrade path: once the agent's syscall needs have been profiled over a few",
+    "weeks of production traffic, we can flip to default=ERRNO + whitelist and",
+    "drop this explicit deny list."
+  ],
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_X32",
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "_note": "Kernel module lifecycle — agent has zero legitimate need to touch modules",
+      "names": [
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "create_module",
+        "query_module",
+        "get_kernel_syms"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "System lifecycle / kexec (crash-kernel load) — absolutely not from a container",
+      "names": [
+        "reboot",
+        "kexec_load",
+        "kexec_file_load"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "Time manipulation — container must not shift host clock",
+      "names": [
+        "adjtimex",
+        "clock_adjtime",
+        "clock_adjtime64",
+        "clock_settime",
+        "clock_settime64",
+        "settimeofday",
+        "stime"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "Mount / fsopen family — do not allow remount or new mount points",
+      "names": [
+        "mount",
+        "umount",
+        "umount2",
+        "pivot_root",
+        "chroot",
+        "move_mount",
+        "mount_setattr",
+        "open_tree",
+        "fsopen",
+        "fsmount",
+        "fsconfig",
+        "fspick"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "Namespace manipulation — blocks setup of a secondary sandbox inside ours",
+      "names": [
+        "unshare",
+        "setns"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note_clone3": "clone3 takes flags inside a struct clone_args *, which seccomp cannot dereference. Deny it outright; glibc falls back to `clone` for all paths agent needs (pthread_create, popen, git-child-process).",
+      "names": [
+        "clone3"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note_clone_newuser": "clone(CLONE_NEWUSER=0x10000000) — user namespace creation is the primary escape vector paired with setuid binaries. One rule per CLONE_NEW* bit because SCMP_CMP_MASKED_EQ matches (arg & value) == valueTwo exactly; deny-any-bit-set is expressed as N rules OR'd via the libseccomp ruleset semantics.",
+      "names": ["clone"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        { "index": 0, "value": 268435456, "valueTwo": 268435456, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "_note_clone_newns": "clone(CLONE_NEWNS=0x20000) — mount namespace",
+      "names": ["clone"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        { "index": 0, "value": 131072, "valueTwo": 131072, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "_note_clone_newpid": "clone(CLONE_NEWPID=0x20000000) — PID namespace",
+      "names": ["clone"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        { "index": 0, "value": 536870912, "valueTwo": 536870912, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "_note_clone_newnet": "clone(CLONE_NEWNET=0x40000000) — network namespace",
+      "names": ["clone"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        { "index": 0, "value": 1073741824, "valueTwo": 1073741824, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "_note_clone_newuts": "clone(CLONE_NEWUTS=0x04000000) — UTS (hostname) namespace",
+      "names": ["clone"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        { "index": 0, "value": 67108864, "valueTwo": 67108864, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "_note_clone_newipc": "clone(CLONE_NEWIPC=0x08000000) — SysV/POSIX IPC namespace",
+      "names": ["clone"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        { "index": 0, "value": 134217728, "valueTwo": 134217728, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "_note_clone_newcgroup": "clone(CLONE_NEWCGROUP=0x02000000) — cgroup namespace",
+      "names": ["clone"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        { "index": 0, "value": 33554432, "valueTwo": 33554432, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "_note": "Tracing / eBPF / cross-process memory inspection",
+      "names": [
+        "ptrace",
+        "bpf",
+        "perf_event_open",
+        "process_vm_readv",
+        "process_vm_writev",
+        "kcmp"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "Swap / quota / accounting — host-level resource ops",
+      "names": [
+        "swapon",
+        "swapoff",
+        "quotactl",
+        "quotactl_fd",
+        "acct"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "Execution domain flip — exploit facilitator",
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "Direct hardware I/O — needs CAP_SYS_RAWIO which we drop anyway",
+      "names": [
+        "iopl",
+        "ioperm"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "Legacy / deprecated kernel APIs with known bad surface",
+      "names": [
+        "nfsservctl",
+        "lookup_dcookie",
+        "vmsplice",
+        "bdflush",
+        "ustat",
+        "sysfs",
+        "_sysctl"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "Kernel keyring — prevent credential stashing outside process mem",
+      "names": [
+        "add_key",
+        "request_key",
+        "keyctl"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_note": "clone3 denied above — this is a second explicit deny for `kcmp` alias if any. No-op rule kept as a placeholder so the syscalls list always has at least one entry after editing; supervisor's normalizeSeccompOption requires the list to be non-empty AND contain a deny rule. Safe to remove once other deny entries are guaranteed stable.",
+      "names": [
+        "uselib"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}
