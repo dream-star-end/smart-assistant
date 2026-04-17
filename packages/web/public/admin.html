@@ -1,0 +1,686 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenClaude Admin</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --panel: #161b22;
+    --line: #30363d;
+    --accent: #2f81f7;
+    --err: #f85149;
+    --ok: #3fb950;
+    --muted: #8b949e;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); min-height: 100vh; font-size: 14px; }
+  header { background: var(--panel); border-bottom: 1px solid var(--line); padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 500; }
+  header .grow { flex: 1; }
+  header .who { color: var(--muted); font-size: 12px; }
+  header button { background: transparent; border: 1px solid var(--line); color: var(--fg); padding: 4px 10px; cursor: pointer; border-radius: 4px; }
+  header button:hover { border-color: var(--accent); }
+  nav { background: var(--panel); border-bottom: 1px solid var(--line); padding: 0 20px; display: flex; gap: 0; }
+  nav button { background: transparent; border: 0; color: var(--muted); padding: 12px 16px; cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
+  nav button.on { color: var(--fg); border-bottom-color: var(--accent); }
+  nav button:hover { color: var(--fg); }
+  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+  .toolbar input, .toolbar select, .toolbar button {
+    background: var(--panel); border: 1px solid var(--line); color: var(--fg);
+    padding: 6px 10px; border-radius: 4px; font-size: 13px;
+  }
+  .toolbar button { cursor: pointer; }
+  .toolbar button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .toolbar button:hover { border-color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); font-size: 13px; vertical-align: top; }
+  th { background: #0e1116; color: var(--muted); font-weight: 500; }
+  tr:last-child td { border-bottom: 0; }
+  tr.banned, tr.disabled, tr.deleted { opacity: 0.5; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #21262d; color: var(--fg); }
+  .badge.active, .badge.running { background: rgba(63,185,80,.15); color: var(--ok); }
+  .badge.banned, .badge.error { background: rgba(248,81,73,.15); color: var(--err); }
+  .badge.cooldown, .badge.stopped, .badge.disabled { background: rgba(255,166,0,.15); color: #ffa600; }
+  .actions button { background: transparent; border: 1px solid var(--line); color: var(--muted); padding: 2px 8px; font-size: 12px; cursor: pointer; margin-right: 4px; border-radius: 3px; }
+  .actions button:hover { color: var(--fg); border-color: var(--accent); }
+  .actions button.danger:hover { color: var(--err); border-color: var(--err); }
+  pre.json { background: #0a0d13; color: var(--muted); padding: 8px; border-radius: 4px; font-size: 11px; max-width: 400px; white-space: pre-wrap; word-break: break-all; margin: 0; }
+  .login { max-width: 320px; margin: 80px auto; background: var(--panel); padding: 24px; border-radius: 8px; border: 1px solid var(--line); }
+  .login h2 { margin: 0 0 16px; font-size: 16px; font-weight: 500; }
+  .login input { display: block; width: 100%; margin-bottom: 12px; padding: 8px 12px; background: var(--bg); border: 1px solid var(--line); color: var(--fg); border-radius: 4px; }
+  .login button { width: 100%; padding: 8px; background: var(--accent); border: 0; color: #fff; border-radius: 4px; cursor: pointer; font-size: 14px; }
+  .login .err { color: var(--err); font-size: 12px; margin-bottom: 8px; min-height: 16px; }
+  .hidden { display: none !important; }
+  .muted { color: var(--muted); }
+  .err { color: var(--err); }
+  .ok { color: var(--ok); }
+  .dialog { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; z-index: 100; }
+  .dialog.on { display: flex; }
+  .dialog-body { background: var(--panel); padding: 20px; border-radius: 8px; min-width: 360px; max-width: 90vw; border: 1px solid var(--line); }
+  .dialog-body h3 { margin: 0 0 12px; font-size: 14px; font-weight: 500; }
+  .dialog-body label { display: block; margin-bottom: 4px; font-size: 12px; color: var(--muted); }
+  .dialog-body input, .dialog-body select, .dialog-body textarea {
+    width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--line); color: var(--fg); border-radius: 4px; margin-bottom: 12px; font-family: inherit;
+  }
+  .dialog-body textarea { min-height: 60px; }
+  .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .dialog-actions button { padding: 6px 14px; border-radius: 4px; cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--fg); }
+  .dialog-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .status-msg { padding: 8px 12px; background: rgba(63,185,80,.1); color: var(--ok); border-radius: 4px; margin-bottom: 12px; }
+  .status-msg.err { background: rgba(248,81,73,.1); color: var(--err); }
+</style>
+</head>
+<body>
+
+<!-- Login -->
+<div id="login-view" class="login">
+  <h2>超管登录</h2>
+  <div id="login-err" class="err"></div>
+  <input id="login-email" type="email" placeholder="邮箱" autocomplete="email" />
+  <input id="login-password" type="password" placeholder="密码" autocomplete="current-password" />
+  <button id="login-btn">登录</button>
+</div>
+
+<!-- Main app -->
+<div id="app-view" class="hidden">
+  <header>
+    <h1>OpenClaude Admin</h1>
+    <span class="grow"></span>
+    <span class="who" id="who"></span>
+    <button id="logout-btn">退出</button>
+  </header>
+  <nav>
+    <button data-tab="users" class="on">用户</button>
+    <button data-tab="accounts">账号池</button>
+    <button data-tab="pricing">定价</button>
+    <button data-tab="plans">充值套餐</button>
+    <button data-tab="containers">Agent 容器</button>
+    <button data-tab="ledger">积分流水</button>
+    <button data-tab="audit">审计</button>
+  </nav>
+  <main id="tab-container">
+    <div id="status" class="hidden"></div>
+    <div id="tab-body"></div>
+  </main>
+</div>
+
+<!-- Modal dialog -->
+<div id="dialog" class="dialog"><div class="dialog-body">
+  <h3 id="dialog-title"></h3>
+  <div id="dialog-form"></div>
+  <div class="dialog-actions">
+    <button id="dialog-cancel">取消</button>
+    <button id="dialog-ok" class="primary">确定</button>
+  </div>
+</div></div>
+
+<script type="module">
+/**
+ * OpenClaude 超管后台 — 单页 vanilla JS。
+ *
+ * 架构:
+ *   - JWT 保存在 localStorage.openclaude_admin_token;刷新页会自动续用
+ *   - 所有 /api/admin/* 请求携带 Authorization: Bearer <token>
+ *   - tab 切换 → 只是 render() 不同组件;不走路由,刷新停在用户页
+ *
+ * 为什么不用框架:docs/07-TASKS T-61 明确 vanilla JS。
+ * 页面轻量,刷新性能无所谓。
+ */
+
+const TOKEN_KEY = "openclaude_admin_token";
+const USER_KEY = "openclaude_admin_user";
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, children = []) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") n.className = v;
+    else if (k === "html") n.innerHTML = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (v !== null && v !== undefined) n.setAttribute(k, v);
+  }
+  for (const c of [].concat(children)) {
+    if (c === null || c === undefined || c === false) continue;
+    n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+  }
+  return n;
+};
+
+async function api(path, { method = "GET", body = null, auth = true } = {}) {
+  const headers = { "content-type": "application/json" };
+  if (auth) {
+    const tok = localStorage.getItem(TOKEN_KEY);
+    if (!tok) throw new Error("NOT_AUTHENTICATED");
+    headers["Authorization"] = `Bearer ${tok}`;
+  }
+  const res = await fetch(path, { method, headers, body: body === null ? null : JSON.stringify(body) });
+  let data = null;
+  if (res.status !== 204) {
+    try { data = await res.json(); } catch { data = null; }
+  }
+  if (!res.ok) {
+    const err = new Error(data?.message || `HTTP ${res.status}`);
+    err.status = res.status;
+    err.code = data?.code;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+function fmtDate(s) { return s ? new Date(s).toLocaleString("zh-CN", { hour12: false }) : ""; }
+function showStatus(msg, isErr = false) {
+  const s = $("status");
+  s.textContent = msg;
+  s.className = "status-msg" + (isErr ? " err" : "");
+  s.classList.remove("hidden");
+  setTimeout(() => s.classList.add("hidden"), 3000);
+}
+
+// ─── Login ────────────────────────────────────────────────────────
+
+async function doLogin() {
+  const email = $("login-email").value.trim();
+  const password = $("login-password").value;
+  const errEl = $("login-err");
+  errEl.textContent = "";
+  if (!email || !password) { errEl.textContent = "邮箱 / 密码必填"; return; }
+  try {
+    const r = await api("/api/auth/login", { method: "POST", body: { email, password }, auth: false });
+    if (r.user?.role !== "admin") {
+      errEl.textContent = "不是超管账户"; return;
+    }
+    localStorage.setItem(TOKEN_KEY, r.access_token);
+    localStorage.setItem(USER_KEY, JSON.stringify(r.user));
+    enterApp();
+  } catch (e) {
+    errEl.textContent = e.message || "登录失败";
+  }
+}
+
+function enterApp() {
+  $("login-view").classList.add("hidden");
+  $("app-view").classList.remove("hidden");
+  const u = JSON.parse(localStorage.getItem(USER_KEY) || "{}");
+  $("who").textContent = u.email ? `${u.email} (admin)` : "admin";
+  switchTab("users");
+}
+
+function doLogout() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  $("app-view").classList.add("hidden");
+  $("login-view").classList.remove("hidden");
+}
+
+// ─── Tabs ─────────────────────────────────────────────────────────
+
+const TABS = {};
+let currentTab = "users";
+
+function switchTab(name) {
+  currentTab = name;
+  for (const b of document.querySelectorAll("nav button")) {
+    b.classList.toggle("on", b.dataset.tab === name);
+  }
+  $("tab-body").innerHTML = "";
+  $("status").classList.add("hidden");
+  (TABS[name] || (() => {}))();
+}
+
+// ─── Modal dialog ─────────────────────────────────────────────────
+
+function openDialog(title, fields, onSubmit) {
+  $("dialog-title").textContent = title;
+  const form = $("dialog-form");
+  form.innerHTML = "";
+  const inputs = {};
+  for (const f of fields) {
+    form.appendChild(el("label", {}, f.label));
+    let input;
+    if (f.type === "select") {
+      input = el("select", { name: f.name });
+      for (const o of f.options) {
+        const opt = el("option", { value: o }, o);
+        if (f.value === o) opt.selected = true;
+        input.appendChild(opt);
+      }
+    } else if (f.type === "textarea") {
+      input = el("textarea", { name: f.name }, f.value ?? "");
+    } else {
+      input = el("input", { name: f.name, type: f.type || "text", value: f.value ?? "" });
+      if (f.placeholder) input.setAttribute("placeholder", f.placeholder);
+    }
+    form.appendChild(input);
+    inputs[f.name] = input;
+  }
+  const d = $("dialog");
+  d.classList.add("on");
+  const ok = $("dialog-ok");
+  const cancel = $("dialog-cancel");
+  const close = () => { d.classList.remove("on"); ok.onclick = null; cancel.onclick = null; };
+  cancel.onclick = close;
+  ok.onclick = async () => {
+    const values = {};
+    for (const [k, v] of Object.entries(inputs)) values[k] = v.value;
+    try { await onSubmit(values); close(); } catch (e) { alert(e.message || "提交失败"); }
+  };
+}
+
+// ─── Table helper ─────────────────────────────────────────────────
+
+function renderTable(body, cols, rows, opts = {}) {
+  const table = el("table");
+  const thead = el("thead");
+  thead.appendChild(el("tr", {}, cols.map((c) => el("th", {}, c.h))));
+  table.appendChild(thead);
+  const tbody = el("tbody");
+  if (rows.length === 0) {
+    tbody.appendChild(el("tr", {}, el("td", { colspan: String(cols.length), class: "muted" }, "(空)")));
+  }
+  for (const row of rows) {
+    const tr = el("tr", { class: opts.rowClass ? opts.rowClass(row) : "" });
+    for (const c of cols) {
+      const val = c.render ? c.render(row) : (row[c.k] ?? "");
+      if (val instanceof Node) tr.appendChild(el("td", {}, val));
+      else tr.appendChild(el("td", {}, String(val ?? "")));
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  body.appendChild(table);
+}
+
+// ─── Tab: users ───────────────────────────────────────────────────
+
+TABS.users = async () => {
+  const body = $("tab-body");
+  const state = { q: "", status: "", limit: 50, offset: 0 };
+  const refresh = async () => {
+    body.innerHTML = "";
+    const tools = el("div", { class: "toolbar" });
+    tools.appendChild(el("input", { placeholder: "邮箱搜索", value: state.q, oninput: (e) => { state.q = e.target.value; } }));
+    const sel = el("select");
+    for (const o of ["", "active", "banned", "deleting", "deleted"]) {
+      const opt = el("option", { value: o }, o || "(全部状态)");
+      if (state.status === o) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.onchange = (e) => { state.status = e.target.value; };
+    tools.appendChild(sel);
+    tools.appendChild(el("button", { class: "primary", onclick: () => { state.offset = 0; refresh(); } }, "查询"));
+    tools.appendChild(el("button", { onclick: () => { if (state.offset > 0) { state.offset = Math.max(0, state.offset - state.limit); refresh(); } } }, "上一页"));
+    tools.appendChild(el("button", { onclick: () => { state.offset += state.limit; refresh(); } }, "下一页"));
+    tools.appendChild(el("span", { class: "muted" }, `offset=${state.offset}`));
+    body.appendChild(tools);
+    try {
+      const params = new URLSearchParams();
+      if (state.q) params.set("q", state.q);
+      if (state.status) params.set("status", state.status);
+      params.set("limit", String(state.limit));
+      params.set("offset", String(state.offset));
+      const r = await api(`/api/admin/users?${params}`);
+      renderTable(body, [
+        { h: "ID", k: "id" },
+        { h: "邮箱", render: (u) => u.email + (u.email_verified ? " ✓" : "") },
+        { h: "角色", render: (u) => el("span", { class: "badge" }, u.role) },
+        { h: "状态", render: (u) => el("span", { class: `badge ${u.status}` }, u.status) },
+        { h: "积分", render: (u) => u.credits },
+        { h: "创建", render: (u) => fmtDate(u.created_at) },
+        {
+          h: "操作", render: (u) => {
+            const d = el("div", { class: "actions" });
+            d.appendChild(el("button", { onclick: () => editUser(u, refresh) }, "编辑"));
+            d.appendChild(el("button", { onclick: () => adjustCredits(u, refresh) }, "改积分"));
+            return d;
+          },
+        },
+      ], r.rows, { rowClass: (u) => u.status });
+    } catch (e) { showStatus(e.message, true); }
+  };
+  refresh();
+};
+
+function editUser(u, onDone) {
+  openDialog(`编辑用户 #${u.id}`, [
+    { name: "status", label: "status", type: "select", options: ["active", "banned", "deleting", "deleted"], value: u.status },
+    { name: "role", label: "role", type: "select", options: ["user", "admin"], value: u.role },
+    { name: "email_verified", label: "email_verified", type: "select", options: ["(不变)", "true", "false"], value: "(不变)" },
+  ], async (v) => {
+    const patch = {};
+    if (v.status !== u.status) patch.status = v.status;
+    if (v.role !== u.role) patch.role = v.role;
+    if (v.email_verified !== "(不变)") patch.email_verified = v.email_verified === "true";
+    await api(`/api/admin/users/${u.id}`, { method: "PATCH", body: patch });
+    showStatus(`用户 #${u.id} 已更新`);
+    onDone();
+  });
+}
+
+function adjustCredits(u, onDone) {
+  openDialog(`调整 #${u.id} 积分(当前 ${u.credits})`, [
+    { name: "delta", label: "delta(正数充 / 负数扣)", placeholder: "例如 500 或 -200" },
+    { name: "memo", label: "备注(必填)", type: "textarea", placeholder: "例如:客服补偿" },
+  ], async (v) => {
+    const delta = v.delta.trim();
+    const memo = v.memo.trim();
+    if (!delta || !memo) throw new Error("delta / memo 必填");
+    await api(`/api/admin/users/${u.id}/credits`, { method: "POST", body: { delta, memo } });
+    showStatus("积分已调整");
+    onDone();
+  });
+}
+
+// ─── Tab: accounts ────────────────────────────────────────────────
+
+TABS.accounts = async () => {
+  const body = $("tab-body");
+  const refresh = async () => {
+    body.innerHTML = "";
+    const tools = el("div", { class: "toolbar" });
+    tools.appendChild(el("button", { class: "primary", onclick: () => newAccount(refresh) }, "+ 新增账号"));
+    tools.appendChild(el("button", { onclick: refresh }, "刷新"));
+    body.appendChild(tools);
+    try {
+      const r = await api("/api/admin/accounts");
+      renderTable(body, [
+        { h: "ID", k: "id" },
+        { h: "label", k: "label" },
+        { h: "plan", render: (a) => el("span", { class: "badge" }, a.plan) },
+        { h: "状态", render: (a) => el("span", { class: `badge ${a.status}` }, a.status) },
+        { h: "health", k: "health_score" },
+        { h: "success", k: "success_count" },
+        { h: "fail", k: "fail_count" },
+        { h: "last_used", render: (a) => fmtDate(a.last_used_at) },
+        {
+          h: "操作", render: (a) => {
+            const d = el("div", { class: "actions" });
+            d.appendChild(el("button", { onclick: () => editAccount(a, refresh) }, "编辑"));
+            d.appendChild(el("button", { onclick: () => rotateToken(a, refresh) }, "换 token"));
+            d.appendChild(el("button", { class: "danger", onclick: () => deleteAccount(a, refresh) }, "删除"));
+            return d;
+          },
+        },
+      ], r.rows, { rowClass: (a) => a.status });
+    } catch (e) { showStatus(e.message, true); }
+  };
+  refresh();
+};
+
+function newAccount(onDone) {
+  openDialog("新增账号", [
+    { name: "label", label: "label(便于识别)", placeholder: "例如 pro-1" },
+    { name: "plan", label: "plan", type: "select", options: ["pro", "max", "team"] },
+    { name: "oauth_token", label: "access token(明文,加密入库后永不返回)" },
+    { name: "oauth_refresh_token", label: "refresh token(可选)" },
+    { name: "oauth_expires_at", label: "expires_at (ISO,可选)", placeholder: "2026-12-31T00:00:00Z" },
+  ], async (v) => {
+    const body = { label: v.label, plan: v.plan, oauth_token: v.oauth_token };
+    if (v.oauth_refresh_token) body.oauth_refresh_token = v.oauth_refresh_token;
+    if (v.oauth_expires_at) body.oauth_expires_at = v.oauth_expires_at;
+    await api("/api/admin/accounts", { method: "POST", body });
+    showStatus("账号已新增");
+    onDone();
+  });
+}
+function editAccount(a, onDone) {
+  openDialog(`编辑账号 #${a.id}`, [
+    { name: "label", label: "label", value: a.label },
+    { name: "status", label: "status", type: "select", options: ["active", "cooldown", "disabled", "banned"], value: a.status },
+    { name: "health_score", label: "health_score (0-100)", value: String(a.health_score) },
+  ], async (v) => {
+    const patch = {};
+    if (v.label && v.label !== a.label) patch.label = v.label;
+    if (v.status !== a.status) patch.status = v.status;
+    const hs = Number(v.health_score);
+    if (Number.isInteger(hs) && hs !== a.health_score) patch.health_score = hs;
+    await api(`/api/admin/accounts/${a.id}`, { method: "PATCH", body: patch });
+    showStatus("已更新"); onDone();
+  });
+}
+function rotateToken(a, onDone) {
+  openDialog(`替换 #${a.id} 的 token`, [
+    { name: "oauth_token", label: "新 access token", type: "textarea" },
+    { name: "oauth_refresh_token", label: "新 refresh token(留空=不改,填 __clear__ 清除)" },
+  ], async (v) => {
+    if (!v.oauth_token) throw new Error("oauth_token 必填");
+    const patch = { oauth_token: v.oauth_token };
+    if (v.oauth_refresh_token === "__clear__") patch.oauth_refresh_token = null;
+    else if (v.oauth_refresh_token) patch.oauth_refresh_token = v.oauth_refresh_token;
+    await api(`/api/admin/accounts/${a.id}`, { method: "PATCH", body: patch });
+    showStatus("已轮换"); onDone();
+  });
+}
+async function deleteAccount(a, onDone) {
+  if (!confirm(`确认删除账号 #${a.id} (${a.label})?若有 usage_records 引用会失败。`)) return;
+  try {
+    await api(`/api/admin/accounts/${a.id}`, { method: "DELETE" });
+    showStatus("已删除"); onDone();
+  } catch (e) { showStatus(e.message, true); }
+}
+
+// ─── Tab: pricing ─────────────────────────────────────────────────
+
+TABS.pricing = async () => {
+  const body = $("tab-body");
+  body.innerHTML = "";
+  const tools = el("div", { class: "toolbar" });
+  tools.appendChild(el("span", { class: "muted" }, "改动后 model_pricing NOTIFY 会触发 PricingCache 自动重载。"));
+  body.appendChild(tools);
+  try {
+    const r = await api("/api/admin/pricing");
+    renderTable(body, [
+      { h: "model_id", k: "model_id" },
+      { h: "name", k: "display_name" },
+      { h: "in/mtok", k: "input_per_mtok" },
+      { h: "out/mtok", k: "output_per_mtok" },
+      { h: "cache_read", k: "cache_read_per_mtok" },
+      { h: "cache_write", k: "cache_write_per_mtok" },
+      { h: "multiplier", render: (p) => el("strong", {}, p.multiplier) },
+      { h: "enabled", render: (p) => el("span", { class: `badge ${p.enabled ? "active" : "disabled"}` }, String(p.enabled)) },
+      {
+        h: "操作", render: (p) => el("div", { class: "actions" },
+          el("button", { onclick: () => editPricing(p, TABS.pricing) }, "改倍率/启用")),
+      },
+    ], r.rows);
+  } catch (e) { showStatus(e.message, true); }
+};
+
+function editPricing(p, reload) {
+  openDialog(`${p.model_id} — 倍率 / 启用`, [
+    { name: "multiplier", label: "multiplier (0.001 - 999.999)", value: p.multiplier },
+    { name: "enabled", label: "enabled", type: "select", options: ["true", "false"], value: String(p.enabled) },
+  ], async (v) => {
+    const patch = {};
+    if (v.multiplier !== p.multiplier) patch.multiplier = v.multiplier;
+    if ((v.enabled === "true") !== p.enabled) patch.enabled = v.enabled === "true";
+    if (Object.keys(patch).length === 0) return;
+    await api(`/api/admin/pricing/${p.model_id}`, { method: "PATCH", body: patch });
+    showStatus(`${p.model_id} 已更新,PricingCache 即将重载`);
+    reload();
+  });
+}
+
+// ─── Tab: plans ───────────────────────────────────────────────────
+
+TABS.plans = async () => {
+  const body = $("tab-body");
+  body.innerHTML = "";
+  try {
+    const r = await api("/api/admin/plans");
+    renderTable(body, [
+      { h: "code", k: "code" },
+      { h: "label", k: "label" },
+      { h: "amount_cents", k: "amount_cents" },
+      { h: "credits", k: "credits" },
+      { h: "sort", k: "sort_order" },
+      { h: "enabled", render: (p) => el("span", { class: `badge ${p.enabled ? "active" : "disabled"}` }, String(p.enabled)) },
+      {
+        h: "操作", render: (p) => el("div", { class: "actions" },
+          el("button", { onclick: () => editPlan(p, TABS.plans) }, "编辑")),
+      },
+    ], r.rows);
+  } catch (e) { showStatus(e.message, true); }
+};
+
+function editPlan(p, reload) {
+  openDialog(`充值套餐 ${p.code}`, [
+    { name: "label", label: "label", value: p.label },
+    { name: "amount_cents", label: "amount_cents (≥0)", value: p.amount_cents },
+    { name: "credits", label: "credits (≥0)", value: p.credits },
+    { name: "sort_order", label: "sort_order", value: String(p.sort_order) },
+    { name: "enabled", label: "enabled", type: "select", options: ["true", "false"], value: String(p.enabled) },
+  ], async (v) => {
+    const patch = {
+      label: v.label,
+      amount_cents: v.amount_cents,
+      credits: v.credits,
+      sort_order: Number(v.sort_order),
+      enabled: v.enabled === "true",
+    };
+    await api(`/api/admin/plans/${p.code}`, { method: "PATCH", body: patch });
+    showStatus("已更新");
+    reload();
+  });
+}
+
+// ─── Tab: agent containers ───────────────────────────────────────
+
+TABS.containers = async () => {
+  const body = $("tab-body");
+  body.innerHTML = "";
+  const tools = el("div", { class: "toolbar" },
+    el("button", { onclick: () => TABS.containers() }, "刷新"));
+  body.appendChild(tools);
+  try {
+    const r = await api("/api/admin/agent-containers");
+    renderTable(body, [
+      { h: "ID", k: "id" },
+      { h: "user", render: (c) => `${c.user_email ?? "?"} (#${c.user_id})` },
+      { h: "sub", render: (c) => `${c.subscription_status ?? ""} → ${fmtDate(c.subscription_end_at)}` },
+      { h: "docker", k: "docker_name" },
+      { h: "status", render: (c) => el("span", { class: `badge ${c.status}` }, c.status) },
+      { h: "start/stop", render: (c) => `${fmtDate(c.last_started_at)} / ${fmtDate(c.last_stopped_at)}` },
+      { h: "volume_gc", render: (c) => fmtDate(c.volume_gc_at) },
+      {
+        h: "操作", render: (c) => {
+          const d = el("div", { class: "actions" });
+          d.appendChild(el("button", { onclick: () => containerAction(c, "restart") }, "重启"));
+          d.appendChild(el("button", { onclick: () => containerAction(c, "stop") }, "停止"));
+          d.appendChild(el("button", { class: "danger", onclick: () => containerAction(c, "remove") }, "销毁"));
+          return d;
+        },
+      },
+    ], r.rows, { rowClass: (c) => c.status });
+  } catch (e) { showStatus(e.message, true); }
+};
+
+async function containerAction(c, action) {
+  if (!confirm(`对容器 #${c.id} 执行 ${action}?`)) return;
+  try {
+    await api(`/api/admin/agent-containers/${c.id}/${action}`, { method: "POST" });
+    showStatus(`${action} 已执行`);
+    TABS.containers();
+  } catch (e) { showStatus(e.message, true); }
+}
+
+// ─── Tab: ledger ──────────────────────────────────────────────────
+
+TABS.ledger = async () => {
+  const body = $("tab-body");
+  const state = { user_id: "", reason: "", before: "", limit: 50 };
+  const refresh = async () => {
+    body.innerHTML = "";
+    const tools = el("div", { class: "toolbar" });
+    tools.appendChild(el("input", { placeholder: "user_id", value: state.user_id, oninput: (e) => { state.user_id = e.target.value; } }));
+    const sel = el("select");
+    for (const o of ["", "topup", "chat", "agent_chat", "agent_subscription", "refund", "admin_adjust", "promotion"]) {
+      const opt = el("option", { value: o }, o || "(全部 reason)");
+      if (state.reason === o) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.onchange = (e) => { state.reason = e.target.value; };
+    tools.appendChild(sel);
+    tools.appendChild(el("button", { class: "primary", onclick: () => { state.before = ""; refresh(); } }, "查询"));
+    body.appendChild(tools);
+    try {
+      const params = new URLSearchParams();
+      if (state.user_id) params.set("user_id", state.user_id);
+      if (state.reason) params.set("reason", state.reason);
+      if (state.before) params.set("before", state.before);
+      params.set("limit", String(state.limit));
+      const r = await api(`/api/admin/ledger?${params}`);
+      renderTable(body, [
+        { h: "id", k: "id" },
+        { h: "user", k: "user_id" },
+        { h: "reason", render: (x) => el("span", { class: "badge" }, x.reason) },
+        { h: "delta", render: (x) => el("span", { class: Number(x.delta) >= 0 ? "ok" : "err" }, x.delta) },
+        { h: "balance_after", k: "balance_after" },
+        { h: "memo", k: "memo" },
+        { h: "created", render: (x) => fmtDate(x.created_at) },
+      ], r.rows);
+      if (r.next_before) {
+        body.appendChild(el("div", { class: "toolbar" },
+          el("button", { onclick: () => { state.before = r.next_before; refresh(); } }, "下一页")));
+      }
+    } catch (e) { showStatus(e.message, true); }
+  };
+  refresh();
+};
+
+// ─── Tab: audit ───────────────────────────────────────────────────
+
+TABS.audit = async () => {
+  const body = $("tab-body");
+  const state = { admin_id: "", action: "", before: "", limit: 50 };
+  const refresh = async () => {
+    body.innerHTML = "";
+    const tools = el("div", { class: "toolbar" });
+    tools.appendChild(el("input", { placeholder: "admin_id", value: state.admin_id, oninput: (e) => { state.admin_id = e.target.value; } }));
+    tools.appendChild(el("input", { placeholder: "action 如 user.patch", value: state.action, oninput: (e) => { state.action = e.target.value; } }));
+    tools.appendChild(el("button", { class: "primary", onclick: () => { state.before = ""; refresh(); } }, "查询"));
+    body.appendChild(tools);
+    try {
+      const params = new URLSearchParams();
+      if (state.admin_id) params.set("admin_id", state.admin_id);
+      if (state.action) params.set("action", state.action);
+      if (state.before) params.set("before", state.before);
+      params.set("limit", String(state.limit));
+      const r = await api(`/api/admin/audit?${params}`);
+      renderTable(body, [
+        { h: "id", k: "id" },
+        { h: "admin", k: "admin_id" },
+        { h: "action", render: (x) => el("span", { class: "badge" }, x.action) },
+        { h: "target", k: "target" },
+        { h: "before → after", render: (x) => el("pre", { class: "json" }, JSON.stringify({ before: x.before, after: x.after }, null, 2)) },
+        { h: "ip", k: "ip" },
+        { h: "created", render: (x) => fmtDate(x.created_at) },
+      ], r.rows);
+      if (r.next_before) {
+        body.appendChild(el("div", { class: "toolbar" },
+          el("button", { onclick: () => { state.before = r.next_before; refresh(); } }, "下一页")));
+      }
+    } catch (e) { showStatus(e.message, true); }
+  };
+  refresh();
+};
+
+// ─── init ─────────────────────────────────────────────────────────
+
+document.addEventListener("DOMContentLoaded", () => {
+  $("login-btn").onclick = doLogin;
+  $("login-password").onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
+  $("logout-btn").onclick = doLogout;
+  for (const b of document.querySelectorAll("nav button")) {
+    b.onclick = () => switchTab(b.dataset.tab);
+  }
+  if (localStorage.getItem(TOKEN_KEY)) enterApp();
+});
+</script>
+</body>
+</html>
