@@ -279,3 +279,20 @@ export type {
   UpdateAccountPatch,
   ListAccountsOptions,
 } from "./account-pool/store.js";
+// T-31 账号池 health
+export {
+  AccountHealthTracker,
+  InMemoryHealthRedis,
+  wrapIoredisForHealth,
+  healthKey,
+  failKey,
+  DEFAULT_FAIL_THRESHOLD,
+  DEFAULT_COOLDOWN_MS,
+  DEFAULT_HEALTH_TTL_SEC,
+  DEFAULT_FAIL_WINDOW_SEC,
+} from "./account-pool/health.js";
+export type {
+  AccountHealth,
+  HealthRedis,
+  HealthDeps,
+} from "./account-pool/health.js";

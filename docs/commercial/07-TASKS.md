@@ -641,11 +641,28 @@
 - [ ] Redis 缓存最近 health 分数(减 DB 压力)
 
 **Acceptance**:
-- [ ] 单元:3 次失败触发熔断,cooldown_until 设对
-- [ ] 单元:halfOpen 恢复 cooldown 过期账号
-- [ ] 集成:DB 行和 Redis 一致
+- [x] 单元:3 次失败触发熔断,cooldown_until 设对
+- [x] 单元:halfOpen 恢复 cooldown 过期账号
+- [x] 集成:DB 行和 Redis 一致
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- 新 `src/account-pool/health.ts`:`AccountHealthTracker` 类封装 onSuccess / onFailure / halfOpen / manualDisable / manualEnable / getHealthScore / peekFailCount。
+- **熔断触发语义**:onFailure 用 Redis `acct:fail:<id>` 独立维护连续失败计数(INCR + 首次 EXPIRE 600s),当计数 ≥ 3 **且** 当前 `status='active'` 时,二次 UPDATE WHERE status='active' 切 cooldown + cooldown_until = now + 10min(由 `now()` 注入,测试可冻结时钟),并清空 Redis 计数 —— 下一轮 halfOpen 恢复后从 0 开始累积。onSuccess 总是先 `DEL failKey`,哪怕还没到阈值也能把计数打回零,避免"熔断前夜"残留状态。
+- **halfOpen 语义**:单条 UPDATE `WHERE status='cooldown' AND cooldown_until < NOW()`,RETURNING 所有 recover 行,逐一回写 Redis `health=50` + DEL fail counter。无候选返 []。再调幂等(因为第一次调用已把 cooldown 迁 active)。
+- **Redis 缓存**:`acct:health:<id>` TTL 60s 存当前 health_score;所有写入类 API(除 manualDisable)都在 DB UPDATE 后 SET Redis —— 保证 scheduler(T-32)读 Redis 不拿到过期数据。manualDisable 则 DEL 两个 key(不留脏缓存)。`getHealthScore` read-through:Redis 命中返 cached(数值校验),miss 回 DB 并回填。
+- **floor/cap**:UPDATE 里 `LEAST(100, health_score + 10)` 和 `GREATEST(0, health_score - 20)`,保证 [0,100] 硬边界,不依赖应用层计算。
+- **不存在账号**:所有写入 API RETURNING 空行 → 返 null + 清 Redis(healthKey/failKey),防 ghost 脏计数残留。
+- **InMemoryHealthRedis**:测试用内存实现,带简化 TTL(get 时检查过期),拿 `ttlMs(key)` / `snapshot()` 方便断言。
+- **wrapIoredisForHealth**:适配 ioredis 签名(`set(k,v,'EX',sec)`),已 typed;暴露给 `index.ts` 供 `registerCommercial` 接入(本 task 不改 index 注册流程,等 T-32 一并接)。
+- 更新 `src/index.ts` 导出 AccountHealthTracker / InMemoryHealthRedis / wrapIoredisForHealth / 常量 / 类型。
+
+**测试**: +1 unit 文件(11 case)+ 1 integ 文件(15 case)。
+- accountHealth.test.ts:healthKey/failKey 命名、DEFAULT 常量、InMemoryHealthRedis(get/set/incr/expire/del + TTL + snapshot)、wrapIoredisForHealth(set 带 EX 参数签名、get/incr/expire/del 透传)。
+- accountHealth.integ.test.ts:onSuccess 清 fail 计数 + success_count++ + health cap 100 + last_used_at 更新 + Redis 缓存;onFailure 1 次 health-20 + fail_count++ + last_error + Redis fail=1 + health=80;连续 3 次失败触发 cooldown + cooldown_until 精确 now+10min + fail counter 清;2 次 + 成功后 fail 清 + 再 3 次才熔断;已 cooldown 账号的 onFailure 只累计数不改状态;health 到 0 后继续失败不为负;cap 不超 100;halfOpen 恢复到期账号(只动目标,其他账号不变)+ Redis 一致;无候选返 [];幂等;manualDisable 清两 key;manualEnable reset 到 100 + cooldown_until=null + last_error=null;getHealthScore miss 回 DB + 回填;Redis 脏值 non-number 回 DB;不存在 id 全部返 null 且清 Redis。
+
+**总计**: 185 unit + 180 integ = 365 全绿(较 T-30 完成时 339 新增 +11 unit + 15 integ = +26)。
 
 ---
 
