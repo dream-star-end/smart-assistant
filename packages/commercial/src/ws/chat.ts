@@ -434,7 +434,8 @@ export function createChatWsHandler(deps: ChatWsDeps): ChatWsHandler {
     }
 
     // 0) 请求级幂等前置检查 —— 见 http/chat.ts 同名注释。
-    //    replay-success: 发 meta/usage/debit/done 四帧(顺序与正常流程对齐,前端无需特判)+ 关闭。
+    //    replay-success: 发 usage/debit/done 三帧(usage + debit 都带 replayed:true,顺序
+    //      与正常流程的尾部对齐;缺省 meta/delta 因为 replay 不重新打上游、也不持久化 text)+ 关闭。
     //    replay-exhausted: 发 error(ERR_REQUEST_ID_EXHAUSTED)+ 关闭。
     const replay = await checkRequestIdReplay(userId, requestId);
     if (replay.kind === "replay-exhausted") {

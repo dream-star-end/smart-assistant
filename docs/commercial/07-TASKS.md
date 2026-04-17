@@ -806,6 +806,16 @@ Commits:
 
 **Commits**:
 - 52f6a99 `task(T-41)(commercial): POST /api/chat 走 runClaudeChat 真编排`
+- 1d384ea `fix(T-41)(commercial): Codex Phase 4 F1-F4 — 幂等/billing_failed/错误分类/AEAD quarantine`
+- 65c952d `fix(T-41)(commercial): Codex Phase 4 第二轮 — 请求级幂等 + billing_failed 全覆盖 + reason 映射`
+- d671c37 `fix(T-41)(commercial): Codex 第二轮 F1/S1/Nit — 跨用户 request_id 隔离 + ledger_missing 统一 + ChatServerFrame replayed 契约`
+- (注释 nit) 最终注释对齐 ws replay 三帧实现
+
+**Codex Phase 4 审查**:
+- threadId: `019d9980-402c-76e2-a265-898a474289ff`
+- 第一轮 PARTIAL(4 Findings)→ 1d384ea 修复
+- 第二轮 PARTIAL(2 new Findings + 2 Suggestions + 1 Nit)→ 65c952d + d671c37 修复
+- 第三轮 **PASS**(仅一个注释对齐 nit,无 Finding/Suggestion)
 
 ---
 
