@@ -312,3 +312,31 @@ export type {
   ReleaseResult,
   SchedulerDeps,
 } from "./account-pool/scheduler.js";
+// T-33 账号池 refresh + proxy
+export {
+  refreshAccountToken,
+  shouldRefresh,
+  defaultHttp,
+  RefreshError,
+  DEFAULT_REFRESH_SKEW_MS,
+  DEFAULT_OAUTH_ENDPOINT,
+  DEFAULT_FALLBACK_EXPIRES_MS,
+} from "./account-pool/refresh.js";
+export type {
+  RefreshErrorCode,
+  RefreshHttpClient,
+  RefreshDeps,
+  RefreshedTokens,
+} from "./account-pool/refresh.js";
+export {
+  streamClaude,
+  ProxyError,
+  ProxyAuthError,
+  DEFAULT_CLAUDE_ENDPOINT,
+  DEFAULT_ANTHROPIC_VERSION,
+} from "./account-pool/proxy.js";
+export type {
+  ProxyEvent,
+  ProxyDeps,
+  StreamClaudeInput,
+} from "./account-pool/proxy.js";

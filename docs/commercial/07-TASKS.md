@@ -710,21 +710,45 @@
 **文档**: 01-SPEC F-6.7
 
 **内容**:
-- [ ] `src/account-pool/refresh.ts`:
+- [x] `src/account-pool/refresh.ts`:
   - 检测 token 即将过期(< 5min) → 调 Anthropic OAuth refresh endpoint
   - 成功 → 更新加密 token + expires_at
   - 失败 → 账号 status=disabled + 告警
-- [ ] `src/account-pool/proxy.ts`:
+- [x] `src/account-pool/proxy.ts`:
   - `streamClaude({account, body}) → AsyncIterable<event>`
   - 用 `fetch` + ReadableStream 读 SSE
   - 透传到调用方
 
 **Acceptance**:
-- [ ] 集成:mock Anthropic API → 正常流式
-- [ ] 集成:token 过期 mock → 调 refresh → 拿新 token → 重试
-- [ ] 集成:refresh 失败 → account disabled + 抛
+- [x] 集成:mock Anthropic API → 正常流式
+- [x] 集成:token 过期 mock → 调 refresh → 拿新 token → 重试
+- [x] 集成:refresh 失败 → account disabled + 抛
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- `refresh.ts`:
+  - `shouldRefresh(expiresAt, now, skewMs)` 纯判断;`expiresAt===null` 视为永不过期
+  - `refreshAccountToken(id, deps)`:getTokenForUse 读 refresh_token 明文(用完 `.fill(0)`)→ form-urlencode POST OAuth endpoint → 解析 JSON → updateAccount 加密写回
+  - 失败分类 `RefreshError.code`: `account_not_found` / `no_refresh_token` / `http_error`(带 status)/ `bad_response`
+  - 失败时 `disableOnFailure`:有 `deps.health` 走 `manualDisable`(同时清 Redis 缓存);否则降级直接 UPDATE status='disabled'
+  - 兼容 `expires_in`(秒)/ `expires_at`(epoch seconds 或 ms,>1e12 视为 ms);都缺则 fallback 1h
+  - refresh_token 轮换语义:服务器返新就更新,不返就保留原值(`patch.refresh=undefined`)
+  - `RefreshHttpClient` 抽象 `{post(url, headers, body) => {status, body}}` 便于测试注入;生产用 `defaultHttp`(基于 fetch)
+- `proxy.ts`:
+  - `streamClaude({account, body}, deps)` AsyncGenerator;强制 `stream=true` 不管调用方 body 怎么写
+  - 手写 SSE 解析:按空行(`\n\n` / `\r\n\r\n`)分事件;`event:` 默认 "message";以 `:` 开头的行视为 keep-alive 注释忽略;data 若 JSON 可 parse 则填 `.data`,否则 === `.raw`
+  - `data: [DONE]` → 正常 return;stream 关闭前的 trailing buffer 也尝试解析
+  - HTTP 错误分类:401 → `ProxyAuthError`(上层据此 refresh);其他非 2xx → `ProxyError`(普通错,不重试)
+  - 不清零 token Buffer —— 调用方可能要重试,生命周期由调用方管
+  - 所有依赖(fetch / endpoint / anthropic-version / anthropic-beta)可注入,测试走 mock fetch + ReadableStream
+- 测试:
+  - `accountRefresh.test.ts` 单元 11 条:`shouldRefresh` 边界 5 条、常量默认值 2 条、RefreshError 属性 3 条
+  - `accountRefresh.integ.test.ts` 集成 14 条:expires_in / expires_at(ms, s)/ 缺失 fallback、refresh 轮换、form payload 构造、last_error 清空;失败路径 6 条覆盖 4 个 code + health 注入 + 并发删除
+  - `accountProxy.test.ts` 单元 13 条:单/多事件流、跨 chunk 拼接、SSE 注释 / CRLF / 非 JSON data / `[DONE]` 终止 / trailing buffer、401 / 500 / 403 映射、Authorization / anthropic-version / endpoint 覆盖
+  - `accountProxy.integ.test.ts` 端到端 3 条:正常流 + Bearer 头检查、401 → refresh → 重试(验证 fetchCalls 两次 Auth 头)、refresh 失败 → disabled
+- 非职责:不做自动 refresh-and-retry 编排(留给 T-40 ws/chat.ts);本 task 只保证两组件各自正确且组合可用(端到端测试用手写 try/catch 验证组合路径)
+- 累计 typecheck ok,测试 222 unit / 211 integ = 433 全绿(T-32 基线 391,本 task 新增 24 unit + 18 integ)
 
 ---
 
