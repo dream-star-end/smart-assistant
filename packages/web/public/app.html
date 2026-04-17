@@ -195,23 +195,37 @@ async function maybeRefresh() {
   const expSec = Number(expRaw);
   if (!Number.isFinite(expSec) || expSec <= 0) return;
   if (expSec * 1000 - Date.now() > REFRESH_SKEW_SEC * 1000) return;
+  let res;
   try {
-    const res = await fetch("/api/auth/refresh", {
+    res = await fetch("/api/auth/refresh", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ refresh_token: refresh }),
     });
-    if (!res.ok) throw new Error(`refresh HTTP ${res.status}`);
-    const body = await res.json();
-    const data = unwrapSuccess(body);
-    if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
-    if (data?.access_exp) localStorage.setItem(ACCESS_EXP_KEY, String(data.access_exp));
   } catch {
+    // 网络抖动 / 离线 —— 不清会话,后续请求若拿 401 再清。
+    return;
+  }
+  if (res.ok) {
+    try {
+      const body = await res.json();
+      const data = unwrapSuccess(body);
+      if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+      if (data?.access_exp) localStorage.setItem(ACCESS_EXP_KEY, String(data.access_exp));
+    } catch { /* body 损坏不清会话 */ }
+    return;
+  }
+  // 只有明确的 400/401/404(refresh 无效)才清 session
+  if (res.status === 401 || res.status === 400 || res.status === 404) {
     clearSessionAndRedirect();
   }
+  // 5xx/429 保留会话
 }
 
 function clearSessionAndRedirect() {
+  // 清本地态前先停掉所有定时器,避免孤儿 fetch 401 回来又触发一次清会话
+  try { stopPolling(); } catch { /* ignore */ }
+  try { if (chatState.ws) chatState.ws.close(1000); } catch { /* ignore */ }
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(REFRESH_KEY);
   localStorage.removeItem(ACCESS_EXP_KEY);
@@ -342,6 +356,9 @@ async function refreshMe() {
 }
 
 function switchTab(name) {
+  // 切 tab 前务必停掉充值轮询 —— 用户离开 topup 页就没必要继续刷
+  // (现在离开 topup 页 order-status DOM 已不存在,轮询只会白耗网络)
+  stopPolling();
   for (const b of document.querySelectorAll(".tabs button")) {
     b.classList.toggle("on", b.dataset.tab === name);
   }
@@ -387,7 +404,9 @@ async function renderChat(root) {
 
   // 加载模型列表
   try {
-    const r = await fetch("/api/public/models").then((r) => r.json());
+    const res = await fetch("/api/public/models");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const r = await res.json();
     const models = unwrapSuccess(r)?.models ?? r.models ?? [];
     chatState.models = models;
     if (models.length === 0) {
@@ -676,6 +695,27 @@ document.addEventListener("DOMContentLoaded", () => {
     b.onclick = () => switchTab(b.dataset.tab);
   }
   if (localStorage.getItem(TOKEN_KEY)) enterApp();
+});
+
+// 跨 tab 同步:另一 tab 登出 → 本 tab 也回到未登录态
+window.addEventListener("storage", (ev) => {
+  if (ev.key !== TOKEN_KEY) return;
+  if (!ev.newValue) {
+    // 其他 tab 已清空 token
+    try { stopPolling(); } catch { /* ignore */ }
+    try { if (chatState.ws) chatState.ws.close(1000); } catch { /* ignore */ }
+    $("app-view").classList.add("hidden");
+    $("auth-view").classList.remove("hidden");
+  } else if (ev.newValue && !ev.oldValue) {
+    // 其他 tab 新登录了 → 本 tab 进入 app
+    enterApp();
+  }
+});
+
+// 关页/刷新前停轮询,避免 unload 过程再打一次请求
+window.addEventListener("beforeunload", () => {
+  try { stopPolling(); } catch { /* ignore */ }
+  try { if (chatState.ws) chatState.ws.close(1000); } catch { /* ignore */ }
 });
 </script>
 </body>

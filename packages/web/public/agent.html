@@ -102,6 +102,12 @@ const ACCESS_EXP_KEY  = "openclaude_app_access_exp";
 const USER_KEY        = "openclaude_app_user";
 const REFRESH_SKEW_SEC = 60;
 
+// ─── Agent 会话历史持久化(T-71 验收:关闭 24h 后历史仍在)──────────
+// 存 localStorage,按用户 ID 分桶,>24h 自动 drop。
+const AGENT_LINES_KEY_PREFIX = "openclaude_agent_lines_";   // + uid
+const AGENT_LINES_TTL_MS = 24 * 60 * 60 * 1000;
+const AGENT_LINES_MAX = 2000;                                // 软上限,防止爆 quota
+
 const $ = (id) => document.getElementById(id);
 
 function el(tag, props, children) {
@@ -146,25 +152,39 @@ async function maybeRefresh() {
   const expSec = Number(expRaw);
   if (!Number.isFinite(expSec) || expSec <= 0) return;
   if (expSec * 1000 - Date.now() > REFRESH_SKEW_SEC * 1000) return;
+  let res;
   try {
-    const res = await fetch("/api/auth/refresh", {
+    res = await fetch("/api/auth/refresh", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ refresh_token: refresh }),
     });
-    if (!res.ok) throw new Error(`refresh HTTP ${res.status}`);
-    const data = unwrapSuccess(await res.json());
-    if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
-    if (data?.access_exp) localStorage.setItem(ACCESS_EXP_KEY, String(data.access_exp));
   } catch {
+    // 网络抖动 / 离线 —— 不强行清会话,后续请求若拿到 401 再清。
+    return;
+  }
+  if (res.ok) {
+    try {
+      const data = unwrapSuccess(await res.json());
+      if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+      if (data?.access_exp) localStorage.setItem(ACCESS_EXP_KEY, String(data.access_exp));
+    } catch { /* body 损坏也不清会话 */ }
+    return;
+  }
+  // 只有明确的 401/400(refresh 无效/不存在)才清 session
+  if (res.status === 401 || res.status === 400 || res.status === 404) {
     clearSessionAndRedirect();
   }
+  // 5xx/429 等:保留会话,等下次请求再试
 }
 
 function clearSessionAndRedirect() {
+  // 登出:清同账号下会话历史(未登录态下保留也无意义,且下一位用户登入会复用 key)
+  try { clearAgentLines(); } catch { /* ignore */ }
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(REFRESH_KEY);
   localStorage.removeItem(ACCESS_EXP_KEY);
   localStorage.removeItem(USER_KEY);
+  stopPoll();
   // 未登录态 → 回主 app 页让用户登录
   location.href = "/app.html";
 }
@@ -368,6 +388,54 @@ function stopPoll() {
 
 let agentWs = null;
 let agentLines = []; // {kind:"in"|"frame"|"sys"|"err", text}
+let agentLinesLoaded = false;
+
+function agentLinesKey() {
+  // 以当前用户 email 作 uid 标识(没有 user.id 字段时 USER_KEY 里也够稳);没登录就回退 "guest"。
+  try {
+    const u = JSON.parse(localStorage.getItem(USER_KEY) || "null");
+    const tag = u?.email || u?.id || "guest";
+    return AGENT_LINES_KEY_PREFIX + tag;
+  } catch { return AGENT_LINES_KEY_PREFIX + "guest"; }
+}
+
+function loadAgentLines() {
+  if (agentLinesLoaded) return;
+  agentLinesLoaded = true;
+  try {
+    const raw = localStorage.getItem(agentLinesKey());
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object" || !Array.isArray(obj.lines)) return;
+    const savedAt = Number(obj.saved_at) || 0;
+    if (Date.now() - savedAt > AGENT_LINES_TTL_MS) {
+      localStorage.removeItem(agentLinesKey());
+      return;
+    }
+    agentLines = obj.lines.filter((l) =>
+      l && typeof l.kind === "string" && typeof l.text === "string").slice(-AGENT_LINES_MAX);
+  } catch { /* ignore 损坏 */ }
+}
+
+let _persistTimer = null;
+function persistAgentLines() {
+  // debounce:连帧时避免每帧都 JSON.stringify 全量历史
+  if (_persistTimer) return;
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null;
+    try {
+      localStorage.setItem(agentLinesKey(), JSON.stringify({
+        saved_at: Date.now(),
+        lines: agentLines,
+      }));
+    } catch { /* quota exceeded 就算了,内存里的还在 */ }
+  }, 400);
+}
+
+function clearAgentLines() {
+  agentLines = [];
+  try { localStorage.removeItem(agentLinesKey()); } catch { /* ignore */ }
+}
 
 function startAgentChat() {
   stopPoll();
@@ -395,8 +463,10 @@ function startAgentChat() {
 
   content.appendChild(wrap);
 
-  // restore 历史
-  for (const l of agentLines) appendLine(l.kind, l.text);
+  // restore 历史 —— 只渲染快照,不回写 state。
+  // Why: 原来直接 `for (const l of agentLines) appendLine(...)`,而 appendLine 内又 push
+  // 到 agentLines → 数组边迭代边生长 → 第二次进入会话窗无限扩张把页面冻死。
+  for (const l of agentLines.slice()) renderLine(l.kind, l.text);
 
   ta.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); sendAgentFrame(); }
@@ -405,13 +475,23 @@ function startAgentChat() {
   openAgentWs();
 }
 
-function appendLine(kind, text) {
-  agentLines.push({ kind, text });
+/** 只画到 DOM,不动 state。*/
+function renderLine(kind, text) {
   const term = $("agent-term");
   if (!term) return;
   const prefix = kind === "in" ? "› " : kind === "frame" ? "  " : kind === "err" ? "! " : "# ";
   term.appendChild(el("div", { class: `ln ${kind}` }, prefix + text));
   term.scrollTop = term.scrollHeight;
+}
+
+/** 实时新帧:推入 state + 渲染 + 落盘。*/
+function appendLine(kind, text) {
+  agentLines.push({ kind, text });
+  if (agentLines.length > AGENT_LINES_MAX) {
+    agentLines.splice(0, agentLines.length - AGENT_LINES_MAX);
+  }
+  renderLine(kind, text);
+  persistAgentLines();
 }
 
 function setWsStatus(text, kind) {
@@ -500,10 +580,35 @@ document.addEventListener("DOMContentLoaded", async () => {
     return;
   }
   await refreshMe();
+  loadAgentLines();        // 恢复 24h 内的会话历史
   await loadStatus();
 });
 
-window.addEventListener("beforeunload", () => closeAgentWs());
+// 跨 tab 同步:其他 tab 登出/登录 → 这里同步变化
+window.addEventListener("storage", (ev) => {
+  if (ev.key === TOKEN_KEY) {
+    if (!ev.newValue) {
+      // 其他 tab 已登出
+      closeAgentWs();
+      stopPoll();
+      location.href = "/app.html";
+    }
+  }
+});
+
+window.addEventListener("beforeunload", () => {
+  closeAgentWs();
+  stopPoll();
+  // 离开页面前 flush 一次,避免 debounce 丢最后 400ms
+  if (_persistTimer) {
+    clearTimeout(_persistTimer); _persistTimer = null;
+    try {
+      localStorage.setItem(agentLinesKey(), JSON.stringify({
+        saved_at: Date.now(), lines: agentLines,
+      }));
+    } catch { /* ignore */ }
+  }
+});
 </script>
 </body>
 </html>
