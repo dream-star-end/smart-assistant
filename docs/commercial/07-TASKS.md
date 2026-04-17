@@ -805,7 +805,7 @@ Commits:
 **Status**: `[x] done`
 
 **Commits**:
-- (pending)
+- 52f6a99 `task(T-41)(commercial): POST /api/chat 走 runClaudeChat 真编排`
 
 ---
 
