@@ -332,22 +332,33 @@
 **文档**: 04-API §1, 05-SEC §2/§3
 
 **内容**:
-- [ ] `login({email,password,turnstileToken,userAgent,ip})` → `{access,refresh,user}`
-  - 校验密码
-  - 未验证邮箱:允许登录但 user 对象标记 `email_verified=false`(前端提示验证)
-  - 签发 access + refresh,refresh 入库 sha256 hash
-- [ ] `refresh({refresh_token})` → 新 access
-  - 查 refresh_tokens(revoked_at IS NULL AND expires_at > now())
-- [ ] `logout({refresh_token})`:置 revoked_at
-- [ ] 限流:在集成测试中用 Redis 实现(见 T-15)
+- [x] `login({email,password,turnstile_token}, deps)` → `{user, access_token, refresh_token, ...}`
+  - zod 校验 + Turnstile + 密码 verify(argon2)
+  - 即使 email 不存在也跑一次假 verify(`getDummyHash`),抹平时序侧信道
+  - `INVALID_CREDENTIALS` 一律不区分原因(密码错/不存在/被封)
+  - 未验证邮箱:允许登录,user 对象 `email_verified=false`
+  - 签 access JWT + opaque refresh,refresh 入 `refresh_tokens(token_hash, ip, user_agent, expires_at)`
+- [x] `refresh(rawRefresh, deps)` → `{access_token, access_exp}`
+  - 查表(token_hash + revoked_at IS NULL + expires_at > now)+ 用户必须 active
+  - 失败统一 INVALID_REFRESH;MVP 不轮换 refresh
+- [x] `logout(rawRefresh)`:置 revoked_at,幂等(已 revoked / 不存在 → revoked=false)
+- [x] LoginError codes:VALIDATION / TURNSTILE_FAILED / INVALID_CREDENTIALS
+- [x] RefreshError codes:VALIDATION / INVALID_REFRESH
+- (限流由 T-15 单独承担)
 
 **Acceptance**:
-- [ ] 集成:正确密码登录 → 返回 token + DB 有 refresh 记录
-- [ ] 集成:错误密码 → UNAUTHORIZED 不泄露原因
-- [ ] 集成:refresh 正常 → 新 access
-- [ ] 集成:logout 后 refresh 失效
+- [x] 集成:正确密码登录 → 返回 access+refresh + refresh_tokens 入库;access JWT 可被 verifyAccess 解
+- [x] 集成:错误密码 / 不存在 email / banned 用户 → INVALID_CREDENTIALS(同一码,不泄露原因)
+- [x] 集成:refresh 正常 → 新 access;过期/已 revoke/banned 用户 → INVALID_REFRESH
+- [x] 集成:logout 后 refresh 失效;二次 logout 幂等不报错
 
-**Status**: `[ ] todo`
+**实施记录**:
+- 测试覆盖:login integ 8 + refresh integ 7 + logout integ 4 = 19
+- 时序公平:`warmupLoginDummyHash()` 模块预热;dummy hash 模块级缓存
+- IP 字段用 pg INET,SELECT 时 `host(ip)` 文本化
+- 测试汇总:unit 78 + integ 67 全绿;typecheck 干净
+
+**Status**: `[x] done`
 
 ---
 
