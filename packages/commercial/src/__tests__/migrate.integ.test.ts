@@ -26,11 +26,20 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 
-/** 本套件关心的商业化表 + schema_migrations,按依赖逆序 DROP。 */
+/** 所有商业化表 + schema_migrations。用 DROP ... CASCADE,顺序无所谓,
+ *  但仍列全,方便未来新增迁移时保持清理同步。 */
 const COMMERCIAL_TABLES = [
+  "rate_limit_events",
+  "admin_audit",
+  "agent_audit",
+  "agent_containers",
+  "agent_subscriptions",
+  "orders",
+  "topup_plans",
   "usage_records",
   "credit_ledger",
   "model_pricing",
+  "claude_accounts",
   "refresh_tokens",
   "email_verifications",
   "users",

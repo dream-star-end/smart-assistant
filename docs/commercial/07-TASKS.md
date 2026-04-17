@@ -156,10 +156,23 @@
 - [ ] `0007_seed_pricing.sql` (model_pricing + topup_plans 种子)
 
 **Acceptance**:
-- [ ] 集成:全部迁移应用后,所有表存在,`SELECT COUNT(*) FROM model_pricing` = 2, `topup_plans` = 4
-- [ ] 集成:`INSERT INTO credit_ledger ...; UPDATE credit_ledger SET ...; SELECT * FROM credit_ledger` → 行未被 UPDATE(RULE 拦住)
+- [x] 集成:全部迁移应用后,所有表存在,`SELECT COUNT(*) FROM model_pricing` = 2, `topup_plans` = 4
+- [x] 集成:credit_ledger/admin_audit 的 append-only RULE 生效(UPDATE/DELETE 无效)
+- [x] 集成:usage_records.account_id → claude_accounts.id 的 FK 在 0004 后挂上
+- [x] 集成:0007 seed 可重放(ON CONFLICT DO NOTHING,删掉 schema_migrations 重跑不炸、不复制行)
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- 5 个迁移文件严格按 03-DATA-MODEL §7-§14 的 DDL 落盘
+- 0004 负责补 `usage_records.account_id` → `claude_accounts.id` 的 FK(ON DELETE RESTRICT,延续全局约定)
+- 0005 `agent_subscriptions` 的 "每用户最多 1 个 active" 用 **partial unique index** `WHERE status='active'`,canceled 后允许再插
+- 0006 `admin_audit` 复用 credit_ledger 的 append-only 套路:`CREATE RULE ... DO INSTEAD NOTHING` 拦 UPDATE/DELETE
+- 0007 种子用 `ON CONFLICT DO NOTHING`:保证 migrate 幂等,同时不会把管理员通过 admin UI 改过的价格覆盖回默认值
+- 新增 `migrate_full.integ.test.ts` 8 个用例,对关键种子值(sonnet input=300、multiplier=2.000、plan-1000 金额/积分)做回归断言
+- 扩 `migrate.integ.test.ts` 的 `COMMERCIAL_TABLES` 清单到全部新表,否则 beforeEach 遗漏 DROP 会让 "relation already exists"
+- `package.json` 的 `test:commercial:integ` 加 `--test-concurrency=1`:两个 integ 文件默认并行会共用 `openclaude_test` 库互踩,串行稳
+- 测试汇总:unit 22/22 + integ 25/25 = **47 全绿**;typecheck 干净
 
 ---
 
