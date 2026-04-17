@@ -219,10 +219,19 @@
 - [ ] 参数固定:`memory=64MiB, iters=3, parallelism=1, type=argon2id`
 
 **Acceptance**:
-- [ ] 单元:roundtrip、wrong password 返回 false、hash 前缀 `$argon2id$`
-- [ ] 单元:两次 hash 同密码结果不同(salt 随机)
+- [x] 单元:roundtrip、wrong password 返回 false、hash 前缀 `$argon2id$`
+- [x] 单元:两次 hash 同密码结果不同(salt 随机)
+- [x] 单元:malformed hash 返回 false 不抛(防侧信道)
+- [x] 单元:超长密码不会被静默截断匹配
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- dep `argon2@^0.44.0`(workspace `packages/commercial`)
+- `src/auth/passwords.ts`:`hashPassword(p)` 返回 PHC string;`verifyPassword(p, hash)` 任何错误统一返回 false 不抛
+- 参数固化在 `PASSWORD_HASH_PARAMS`:argon2id / mem 64 MiB / iters 3 / parallelism 1 / hashLength 32(05-SEC §1)
+- 测试 9 个用例:PHC 格式、roundtrip、wrong/empty pwd、malformed hash、随机 salt、非 string 边界、长密码不截断
+- 测试汇总:unit 51/51 全绿
 
 ---
 
