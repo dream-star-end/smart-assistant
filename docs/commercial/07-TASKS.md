@@ -752,6 +752,16 @@
 
 ---
 
+**Phase 3 Codex 批量审查 (2026-04-17)**: `PASS`(threadId 019d9941)
+- Finding 1 修复 (refresh.ts): 新增 `persist_error` 错误码;远端 refresh 2xx 后本地 `updateAccount()` 抛错 → `disableOnFailure` + 抛 `RefreshError("persist_error")`,防止"账号仍 active 但本地存旧 token"失控
+- Finding 2 修复 (proxy.ts): 加 `DEFAULT_MAX_SSE_BUFFER=1MB` + `ProxyDeps.maxBufferBytes`;buffer 超限 → `reader.cancel()` + 抛 `ProxyError(status=0)`,防恶意对端 OOM
+- Finding 3 修复 (scheduler.ts): `pick()` 改循环 —— 选中账号 `getTokenForUse()===null` 时剔除该 id 从剩余候选再选,直到池空才抛 503;避免"池里还有账号但误报不可用"假阳性
+- Suggestions: proxy 尾部 flush 改 `/\S/.test(buf)`;refresh 网络错误 message 脱敏不拼 `err.message`;`onFailure` 同步 `SET last_used_at = NOW()` 统一语义
+
+Commit: 29bc47a `task(T-33)(commercial): 修 Phase 3 Codex 审查 3 个 Finding + 3 个 Suggestion`
+
+---
+
 ## Phase 4 - Chat 主流程(共 ~2 task)
 
 ### T-40 Chat WebSocket
