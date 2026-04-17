@@ -22,7 +22,8 @@ import { createHash } from "node:crypto";
 import type { QueryResultRow } from "pg";
 import { query } from "../db/queries.js";
 import { loadKmsKey } from "../crypto/keys.js";
-import { getTokenForUse, type AccountPlan } from "./store.js";
+import { AeadError } from "../crypto/aead.js";
+import { getTokenForUse, updateAccount, type AccountPlan } from "./store.js";
 import type { AccountHealthTracker } from "./health.js";
 
 export const ERR_ACCOUNT_POOL_UNAVAILABLE = "ERR_ACCOUNT_POOL_UNAVAILABLE";
@@ -166,12 +167,11 @@ export class AccountScheduler {
    * (`getTokenForUse` 返 null),从候选池剔除该 id 重新选,直到池空才抛 503。
    * 这避免了"池里还有可用账号但本次 pick 误报不可用"的假阳性。
    *
-   * 注:AEAD 解密失败(密文损坏)走 AeadError 原样抛 —— 那是"账号真的坏了",
-   * 不属于 TOCTOU,上层应 disable 而不是重选。
+   * AEAD 解密失败(密文损坏)→ 内部 quarantine 该账号(status='disabled' + last_error),
+   * 然后从候选里剔除,继续挑下一个。避免坏账号长期留在 active 池里持续制造随机失败。
    *
    * @throws `AccountPoolUnavailableError` 当无 active 账号 / 全部候选都失效
    * @throws `TypeError` 当 `mode=agent` 缺 sessionId
-   * @throws `AeadError` 当选中账号密文损坏(上层应手动禁用)
    */
   async pick(input: PickInput): Promise<PickResult> {
     if (input.mode === "agent") {
@@ -201,18 +201,31 @@ export class AccountScheduler {
         input.mode === "agent"
           ? pickSticky(pool, input.sessionId!, this.hash)
           : pickWeighted(pool, this.random);
-      const tok = await getTokenForUse(chosen.id, this.keyFn);
-      if (tok) {
-        return {
-          account_id: BigInt(chosen.id),
-          plan: tok.plan,
-          token: tok.token,
-          refresh: tok.refresh,
-          expires_at: tok.expires_at,
-        };
+      try {
+        const tok = await getTokenForUse(chosen.id, this.keyFn);
+        if (tok) {
+          return {
+            account_id: BigInt(chosen.id),
+            plan: tok.plan,
+            token: tok.token,
+            refresh: tok.refresh,
+            expires_at: tok.expires_at,
+          };
+        }
+        // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选
+        pool = pool.filter((c) => c.id !== chosen.id);
+      } catch (err) {
+        if (err instanceof AeadError) {
+          // 密文坏 —— 隔离这个账号(异步 disable 不阻塞 pick 路径),从候选剔除继续选
+          void updateAccount(chosen.id, {
+            status: "disabled",
+            last_error: `AEAD decryption failed at pick(): ${err.message}`.slice(0, 500),
+          }, this.keyFn).catch(() => { /* best-effort;下一轮 pick 的 SELECT status='active' 也会自然排除 */ });
+          pool = pool.filter((c) => c.id !== chosen.id);
+          continue;
+        }
+        throw err;
       }
-      // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选
-      pool = pool.filter((c) => c.id !== chosen.id);
     }
     throw new AccountPoolUnavailableError(
       "all candidate accounts vanished between pick and readToken",

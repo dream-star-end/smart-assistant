@@ -289,7 +289,17 @@ export async function* runClaudeChat(
   }
 
   // 2) 可选 refresh(即将过期)
-  const release = async (kind: "success" | "failure", errMsg?: string): Promise<void> => {
+  //
+  // release kind 说明:
+  //   - "success": 账号正常服务了本次请求 → health onSuccess(重置失败计数)
+  //   - "failure": 账号确实出问题(401 两次、refresh 失败、429 rate-limit)→ onFailure(升级计数)
+  //   - "neutral": 错误不归因到此账号(上游 5xx、网络断、客户端 abort、bad request)→ 什么都不做,
+  //                保持原有 health 状态。avoids 把"客户端主动断" 误算成账号故障
+  const release = async (
+    kind: "success" | "failure" | "neutral",
+    errMsg?: string,
+  ): Promise<void> => {
+    if (kind === "neutral") return;
     try {
       await deps.scheduler.release({
         account_id: handle.account_id,
@@ -299,6 +309,33 @@ export async function* runClaudeChat(
       logger?.warn("chat.release.failed", { error: String(err), account_id: String(handle.account_id) });
     }
   };
+
+  /**
+   * 错误是否归咎到当前账号。保守策略:只有"显式 account-scoped 信号"才算 failure,
+   * 其他一律 neutral(保持 health 不动)。
+   *   - AbortError / signal.aborted → neutral
+   *   - ProxyError 5xx / 网络 → neutral(Claude 全局问题或链路抖动)
+   *   - ProxyError 429 → account-scoped rate-limit,failure
+   *   - ProxyError 4xx(非 401/429)→ neutral(请求构造问题,与账号无关)
+   *   - ProxyAuthError 第一次 → 由调用方决定 refresh(不经过这里);二次 401 → failure
+   *   - RefreshError / AeadError → failure(已显式标示 token 坏)
+   *   - 其他非 ProxyError 异常 → neutral(避免把 bug 当账号问题)
+   */
+  function classifyError(err: unknown, signal?: AbortSignal): "failure" | "neutral" {
+    if (signal?.aborted) return "neutral";
+    if (err instanceof Error && (err.name === "AbortError" || err.name === "DOMException" && err.message.includes("aborted"))) {
+      return "neutral";
+    }
+    if (err instanceof ProxyAuthError) return "failure"; // 401 after refresh
+    if (err instanceof ProxyError) {
+      if (err.status === 429) return "failure";
+      return "neutral";
+    }
+    if (err instanceof AeadError) return "failure";
+    if (err instanceof RefreshError) return "failure";
+    return "neutral";
+  }
+  void classifyError; // 预留给后面的错误路径使用
   const cleanupBuffers = (): void => {
     try { handle.token.fill(0); } catch { /* */ }
     if (refreshBuffer) {
@@ -351,7 +388,7 @@ export async function* runClaudeChat(
         gotAuthError = true;
       } else if (err instanceof ProxyError) {
         const msg = err.message.length > 0 ? err.message : "upstream error";
-        await release("failure", `upstream ${err.status}`);
+        await release(classifyError(err, input.signal), `upstream ${err.status}`);
         cleanupBuffers();
         yield {
           type: "error",
@@ -361,8 +398,8 @@ export async function* runClaudeChat(
         };
         return;
       } else {
-        // 网络/abort/其他:按 failure 释放
-        await release("failure", "stream runtime error");
+        // 网络/abort/其他:按 classifyError 决定。client abort / 链路抖不归账号。
+        await release(classifyError(err, input.signal), "stream runtime error");
         cleanupBuffers();
         yield { type: "error", code: ERR_INTERNAL, message: `stream error: ${String(err)}` };
         return;
@@ -411,7 +448,7 @@ export async function* runClaudeChat(
           return;
         }
         if (err instanceof ProxyError) {
-          await release("failure", `upstream ${err.status}`);
+          await release(classifyError(err, input.signal), `upstream ${err.status}`);
           cleanupBuffers();
           yield {
             type: "error",
@@ -421,7 +458,7 @@ export async function* runClaudeChat(
           };
           return;
         }
-        await release("failure", "stream runtime error after refresh");
+        await release(classifyError(err, input.signal), "stream runtime error after refresh");
         cleanupBuffers();
         yield { type: "error", code: ERR_INTERNAL, message: `stream error: ${String(err)}` };
         return;

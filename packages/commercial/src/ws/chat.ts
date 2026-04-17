@@ -50,6 +50,8 @@ import {
   recordChatError,
   InsufficientCreditsAfterPreCheckError,
   UserGoneError,
+  RequestRetryWithDifferentResultError,
+  DuplicateRequestError,
 } from "../chat/debit.js";
 import { ConnectionRegistry, DEFAULT_MAX_PER_USER, type Conn } from "./connections.js";
 
@@ -549,8 +551,42 @@ export function createChatWsHandler(deps: ChatWsDeps): ChatWsHandler {
           sendJson(ws, { type: "error", code: "ERR_INSUFFICIENT_CREDITS", message: err.message });
         } else if (err instanceof UserGoneError) {
           sendJson(ws, { type: "error", code: "UNAUTHORIZED", message: "user not found" });
+        } else if (err instanceof RequestRetryWithDifferentResultError) {
+          sendJson(ws, { type: "error", code: "ERR_REQUEST_ID_EXHAUSTED", message: err.message });
+        } else if (err instanceof DuplicateRequestError) {
+          sendJson(ws, { type: "error", code: "ERR_DUPLICATE_REQUEST", message: err.message });
         } else {
           sendJson(ws, { type: "error", code: "ERR_DEBIT", message: "debit failed" });
+          // LLM 已消耗但本地结算失败:补写 billing_failed 审计记录。
+          // 只在"真正的 debit 运行期异常(DB 抖、连接断)"路径做 —— 上面几个
+          // 业务错误(余额不足、用户没了、request_id 冲突)要么 usage 已存在,
+          // 要么 usage 不该存在,都不应补 billing_failed。
+          try {
+            await recordChatError({
+              userId,
+              requestId,
+              mode: "chat",
+              accountId,
+              model: frame.model,
+              priceSnapshot: {
+                model_id: modelPricing.model_id,
+                display_name: modelPricing.display_name,
+                input_per_mtok: modelPricing.input_per_mtok.toString(),
+                output_per_mtok: modelPricing.output_per_mtok.toString(),
+                cache_read_per_mtok: modelPricing.cache_read_per_mtok.toString(),
+                cache_write_per_mtok: modelPricing.cache_write_per_mtok.toString(),
+                multiplier: modelPricing.multiplier,
+                captured_at: new Date().toISOString(),
+              },
+              errorMessage: err instanceof Error ? err.message : String(err),
+              status: "billing_failed",
+              usage: usageCaptured,
+              costCredits: computeCost(usageCaptured, modelPricing).cost_credits,
+            });
+          } catch (auditErr) {
+            log.error("ws chat: billing_failed record write threw",
+              { userId, requestId, err: String(auditErr) });
+          }
         }
         try { ws.close(CLOSE_INTERNAL, "debit failed"); } catch { /* */ }
       }

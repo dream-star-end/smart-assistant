@@ -163,10 +163,19 @@ function sseResponse(status: number, chunks: string[], headers: Record<string, s
   return new Response(stream, { status, headers });
 }
 
-async function postChat(body: unknown, token: string): Promise<{ status: number; json: Record<string, unknown>; reqId: string }> {
+async function postChat(
+  body: unknown,
+  token: string,
+  requestId?: string,
+): Promise<{ status: number; json: Record<string, unknown>; reqId: string }> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  };
+  if (requestId) headers["x-request-id"] = requestId;
   const resp = await fetch(`${baseUrl}/api/chat`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    headers,
     body: JSON.stringify(body),
   });
   let json: Record<string, unknown> = {};
@@ -239,6 +248,107 @@ describe("POST /api/chat with runClaudeChat (T-41)", () => {
     assert.equal(rows.rows.length, 1);
     assert.equal(rows.rows[0].status, "error");
     assert.equal(rows.rows[0].cost_credits, "0");
+    assert.equal(Object.keys(preCheckRedis.snapshot()).length, 0);
+  });
+
+  /**
+   * 幂等(0009_chat_idempotency):同一 x-request-id 重放成功请求 → 返回相同 ledger_id /
+   * usage_record_id,不二次扣费,DB 行数不增。覆盖 debit.ts 顶部的"existing usage_records
+   * 命中直接返回"路径。
+   */
+  test("重放同一 x-request-id(上次成功)→ 幂等返回,不二次扣费", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const { id: uid, token } = await createUser("rest-replay-ok@example.com", 10_000n);
+    await createAccount({ label: "replay-ok", plan: "pro", token: "TOK-REPLAY" }, keyFn);
+    const rid = "fixed-rid-replay-ok-1";
+    const successMock = (async () => sseResponse(200, [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ])) as unknown as typeof fetch;
+
+    currentMockFetch = successMock;
+    const r1 = await postChat(
+      { model: "claude-sonnet-4-6", max_tokens: 500, messages: [{ role: "user", content: "hi" }] },
+      token,
+      rid,
+    );
+    assert.equal(r1.status, 200, JSON.stringify(r1.json));
+    assert.equal(r1.reqId, rid);
+    assert.equal(r1.json.balance_after, "9999");
+    const firstLedger = r1.json.ledger_id as string;
+    const firstUsage = r1.json.usage_record_id as string;
+
+    // 第二次用同 request_id;即便换个返回不一样的 mock,debitChatSuccess 里
+    // "existing usage_records 命中"分支会跳过 LLM 级别的差异校验,直接按首条记录返回。
+    // 这里依然注入成功 mock,保证不会因 LLM 差异污染断言。
+    currentMockFetch = successMock;
+    const r2 = await postChat(
+      { model: "claude-sonnet-4-6", max_tokens: 500, messages: [{ role: "user", content: "hi" }] },
+      token,
+      rid,
+    );
+    assert.equal(r2.status, 200, JSON.stringify(r2.json));
+    assert.equal(r2.reqId, rid);
+    assert.equal(r2.json.ledger_id, firstLedger, "same ledger_id on replay");
+    assert.equal(r2.json.usage_record_id, firstUsage, "same usage_record_id on replay");
+    assert.equal(r2.json.balance_after, "9999", "balance unchanged on replay");
+
+    const u = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [uid]);
+    assert.equal(u.rows[0].credits, "9999", "user credits must match single debit");
+    const ledger = await query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id=$1", [uid]);
+    assert.equal(ledger.rows[0].cnt, "1", "credit_ledger must have exactly 1 row after replay");
+    const usage = await query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM usage_records WHERE user_id=$1", [uid]);
+    assert.equal(usage.rows[0].cnt, "1", "usage_records must have exactly 1 row after replay");
+    assert.equal(Object.keys(preCheckRedis.snapshot()).length, 0);
+  });
+
+  /**
+   * 重放上次 error 的 request_id → 409 ERR_REQUEST_ID_EXHAUSTED(debit.ts 的
+   * RequestRetryWithDifferentResultError)。客户端必须换 request_id 重试,不能复用
+   * 已经 "烧掉" 的那个。
+   */
+  test("重放同一 x-request-id(上次 error)→ 409 ERR_REQUEST_ID_EXHAUSTED", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const { id: uid, token } = await createUser("rest-replay-err@example.com", 7_000n);
+    await createAccount({ label: "replay-err", plan: "pro", token: "TOK-REPLAY-ERR" }, keyFn);
+    const rid = "fixed-rid-replay-err-1";
+
+    // 第一次:上游 500 → usage_records 写 status='error'
+    currentMockFetch = (async () => new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    const r1 = await postChat(
+      { model: "claude-sonnet-4-6", max_tokens: 100, messages: [{ role: "user", content: "x" }] },
+      token,
+      rid,
+    );
+    assert.equal(r1.status, 502, JSON.stringify(r1.json));
+
+    // 第二次:LLM 本身成功,但 debitChatSuccess 里 SELECT usage_records 命中 status!='success'
+    // → RequestRetryWithDifferentResultError → 409
+    currentMockFetch = (async () => sseResponse(200, [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ])) as unknown as typeof fetch;
+    const r2 = await postChat(
+      { model: "claude-sonnet-4-6", max_tokens: 100, messages: [{ role: "user", content: "x" }] },
+      token,
+      rid,
+    );
+    assert.equal(r2.status, 409, JSON.stringify(r2.json));
+    const err = r2.json.error as Record<string, unknown>;
+    assert.equal(err.code, "ERR_REQUEST_ID_EXHAUSTED");
+
+    // 余额不动;usage_records 仍然只有一行(status='error');不落 credit_ledger
+    const u = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [uid]);
+    assert.equal(u.rows[0].credits, "7000");
+    const ledger = await query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id=$1", [uid]);
+    assert.equal(ledger.rows[0].cnt, "0");
+    const rows = await query<{ status: string }>("SELECT status FROM usage_records WHERE user_id=$1", [uid]);
+    assert.equal(rows.rows.length, 1);
+    assert.equal(rows.rows[0].status, "error");
     assert.equal(Object.keys(preCheckRedis.snapshot()).length, 0);
   });
 });

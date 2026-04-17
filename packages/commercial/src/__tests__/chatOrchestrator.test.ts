@@ -378,7 +378,7 @@ describe("runClaudeChat — refresh 路径", () => {
 });
 
 describe("runClaudeChat — 错误映射", () => {
-  test("ProxyError 非 401 → error code=ERR_UPSTREAM + upstreamStatus", async () => {
+  test("ProxyError 5xx → error code=ERR_UPSTREAM + upstreamStatus + 不归咎账号(无 release)", async () => {
     const { scheduler, releases } = mkScheduler();
     const { fn } = mkStreamFnSequence([
       { events: [], throwAfter: new ProxyError(500, "server err", "upstream 500") },
@@ -387,6 +387,20 @@ describe("runClaudeChat — 错误映射", () => {
     const err = events.find((e) => e.type === "error") as { code: string; upstreamStatus?: number };
     assert.equal(err.code, ERR_UPSTREAM);
     assert.equal(err.upstreamStatus, 500);
+    // 5xx → classifyError='neutral' → release 不调用 scheduler.release(跳过 health 更新)
+    assert.equal(releases.length, 0, "5xx must not be blamed on the account");
+  });
+
+  test("ProxyError 429 → error code=ERR_UPSTREAM + release failure(账号 rate-limit)", async () => {
+    const { scheduler, releases } = mkScheduler();
+    const { fn } = mkStreamFnSequence([
+      { events: [], throwAfter: new ProxyError(429, "rate_limit", "rate_limit_error") },
+    ]);
+    const events = await collect(runClaudeChat(baseInput, { scheduler, streamFn: fn }));
+    const err = events.find((e) => e.type === "error") as { code: string; upstreamStatus?: number };
+    assert.equal(err.code, ERR_UPSTREAM);
+    assert.equal(err.upstreamStatus, 429);
+    assert.equal(releases.length, 1);
     assert.equal(releases[0].kind, "failure");
   });
 

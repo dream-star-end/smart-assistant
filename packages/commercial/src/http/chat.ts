@@ -36,6 +36,8 @@ import {
   recordChatError,
   InsufficientCreditsAfterPreCheckError,
   UserGoneError,
+  RequestRetryWithDifferentResultError,
+  DuplicateRequestError,
 } from "../chat/debit.js";
 import { runClaudeChat, type RunChatDeps } from "../chat/orchestrator.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
@@ -285,18 +287,50 @@ export async function handleChat(
 
     // 3) 成功 → 事务内 debit + 写 usage_records(复用 chat/debit.ts)
     const cost = computeCost(llmResp.usage, modelPricing);
-    const result = await tx(async (client) =>
-      debitChatSuccess(client, {
-        userId: user.id,
-        requestId: ctx.requestId,
-        sessionId: null,
-        mode: "chat",
-        accountId: llmResp.accountId ?? null,
-        model: body.model,
-        usage: llmResp.usage,
-        cost,
-      }),
-    );
+    let result;
+    try {
+      result = await tx(async (client) =>
+        debitChatSuccess(client, {
+          userId: user.id,
+          requestId: ctx.requestId,
+          sessionId: null,
+          mode: "chat",
+          accountId: llmResp.accountId ?? null,
+          model: body.model,
+          usage: llmResp.usage,
+          cost,
+        }),
+      );
+    } catch (err) {
+      // LLM 已消耗但本地结算失败 —— 审计链断点。补一条 billing_failed 的 usage_records,
+      // 让 reconcile 脚本能发现"上游已扣但本地没扣" 的异常。
+      // 注意幂等:status='billing_failed' 是第一条也是唯一一条(uniq_ur_request 拦截 retry)。
+      // RequestRetryWithDifferentResultError / DuplicateRequestError 本身就意味着
+      // 之前已写过 usage_records —— 重复写只会再撞 23505,recordChatError 内会 swallow。
+      if (
+        !(err instanceof UserGoneError) &&
+        !(err instanceof InsufficientCreditsAfterPreCheckError) &&
+        !(err instanceof RequestRetryWithDifferentResultError) &&
+        !(err instanceof DuplicateRequestError)
+      ) {
+        try {
+          await recordChatError({
+            userId: user.id,
+            requestId: ctx.requestId,
+            sessionId: null,
+            mode: "chat",
+            accountId: llmResp.accountId ?? null,
+            model: body.model,
+            priceSnapshot: cost.snapshot,
+            errorMessage: err instanceof Error ? err.message : String(err),
+            status: "billing_failed",
+            usage: llmResp.usage,
+            costCredits: cost.cost_credits,
+          });
+        } catch { /* best-effort,别盖掉原始 err */ }
+      }
+      throw err;
+    }
 
     sendJson(res, 200, {
       ok: true,
@@ -320,6 +354,14 @@ export async function handleChat(
     }
     if (err instanceof UserGoneError) {
       throw new HttpError(401, "UNAUTHORIZED", "user not found");
+    }
+    // 客户端用同一个 request_id 重试了一个先前失败的请求:按 04-API 错误
+    // 合同映射到 409 CONFLICT,让客户端知道需换 request_id
+    if (err instanceof RequestRetryWithDifferentResultError) {
+      throw new HttpError(409, "ERR_REQUEST_ID_EXHAUSTED", err.message);
+    }
+    if (err instanceof DuplicateRequestError) {
+      throw new HttpError(409, "ERR_DUPLICATE_REQUEST", err.message);
     }
     throw err;
   } finally {

@@ -316,7 +316,7 @@ describe("orchestrator e2e - 401 重试后仍 401", () => {
 /* ----- 500 → ERR_UPSTREAM ------------------------------------------------ */
 
 describe("orchestrator e2e - 上游非 401 错误", () => {
-  test("500 → ERR_UPSTREAM + upstreamStatus=500 + fail_count++", async (t) => {
+  test("500 → ERR_UPSTREAM + upstreamStatus=500 + 不归咎账号(fail_count 不变)", async (t) => {
     if (skipIfNoDb(t)) return;
     const acct = await createAccount({ label: "e2e-500", plan: "pro", token: "T" }, keyFn);
     const mockFetch = (async () =>
@@ -327,8 +327,24 @@ describe("orchestrator e2e - 上游非 401 错误", () => {
     const err = events.find((e) => e.type === "error") as { code: string; upstreamStatus?: number };
     assert.equal(err.code, ERR_UPSTREAM);
     assert.equal(err.upstreamStatus, 500);
+    // 5xx 是"上游大范围故障"信号,不应归因到单账号 —— classifyError='neutral',health 不动
     const row = await getAccount(acct.id);
-    assert.equal(row!.fail_count, 1n);
+    assert.equal(row!.fail_count, 0n, "5xx must not blame the account");
+  });
+
+  test("429 → ERR_UPSTREAM + fail_count++(账号被 rate-limit,属 account-scoped)", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const acct = await createAccount({ label: "e2e-429", plan: "pro", token: "T" }, keyFn);
+    const mockFetch = (async () =>
+      new Response('{"err":"rate_limit"}', { status: 429 })
+    ) as unknown as typeof fetch;
+    const deps = mkDeps(mockFetch);
+    const events = await collect(runClaudeChat(baseInput, deps));
+    const err = events.find((e) => e.type === "error") as { code: string; upstreamStatus?: number };
+    assert.equal(err.code, ERR_UPSTREAM);
+    assert.equal(err.upstreamStatus, 429);
+    const row = await getAccount(acct.id);
+    assert.equal(row!.fail_count, 1n, "429 is account-specific — must increment fail_count");
   });
 });
 
