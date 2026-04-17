@@ -51,6 +51,13 @@ import {
   handleAgentCancel,
 } from "./agent.js";
 import { handleAdminAgentAudit } from "./adminAudit.js";
+import {
+  handleAdminListUsers,
+  handleAdminGetUser,
+  handleAdminPatchUser,
+  handleAdminAdjustCredits,
+  handleAdminListAudit,
+} from "./admin.js";
 
 export type CommercialHandler = (
   req: IncomingMessage,
@@ -101,6 +108,15 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     { method: "POST", path: "/api/agent/cancel", handler: handleAgentCancel },
     // T-54 Agent 审计(超管)
     { method: "GET", path: "/api/admin/agent-audit", handler: handleAdminAgentAudit },
+    // T-60 超管 API —— 用户管理
+    { method: "GET",   path: "/api/admin/users",       handler: handleAdminListUsers },
+    // 动态路径用 pathPrefix。/api/admin/users/:id/credits 优先匹配,
+    // 后退到 /api/admin/users/:id(GET/PATCH)。Handler 自己区分。
+    { method: "POST",  pathPrefix: "/api/admin/users/", handler: handleAdminAdjustCredits },
+    { method: "GET",   pathPrefix: "/api/admin/users/", handler: handleAdminGetUser },
+    { method: "PATCH", pathPrefix: "/api/admin/users/", handler: handleAdminPatchUser },
+    // T-60 超管审计记录
+    { method: "GET",   path: "/api/admin/audit",       handler: handleAdminListAudit },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [
@@ -131,21 +147,24 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
       userAgent: userAgentOf(req),
     };
 
-    // 1) 精确匹配
-    const exact = routes.find((r) => r.path !== undefined && r.path === path);
-    // 2) 前缀匹配(只在精确不中时尝试)
-    const prefix = exact ? undefined : routes.find(
-      (r) => r.pathPrefix !== undefined && path.startsWith(r.pathPrefix),
-    );
-    const route = exact ?? prefix;
+    // 1) 精确匹配 —— 同一 path 下可能有多个 method(例:PATCH + GET /api/admin/users/:id)
+    const exactCandidates = routes.filter((r) => r.path !== undefined && r.path === path);
+    // 2) 前缀匹配(仅在精确不中时尝试)。T-60 同 prefix 下 GET/PATCH/POST 并存,必须
+    //    在 candidates 里挑 method 匹配项;否则拿到首个(可能是 POST)就抛 405。
+    const prefixCandidates = exactCandidates.length === 0
+      ? routes.filter((r) => r.pathPrefix !== undefined && path.startsWith(r.pathPrefix))
+      : [];
+    const candidates = exactCandidates.length > 0 ? exactCandidates : prefixCandidates;
+    const route = candidates.find((r) => r.method === method);
     try {
-      if (!route) {
+      if (candidates.length === 0) {
         throw new HttpError(404, "NOT_FOUND", "endpoint not found");
       }
-      if (route.method !== method) {
-        // method mismatch:若同路径下有其他 method 可接受,返 Allow 头(多 method 情况 MVP 不出现)
+      if (!route) {
+        // method mismatch:返合并后的 Allow 头(该 path 下所有已定义 method)
+        const allowed = [...new Set(candidates.map((r) => r.method))].join(", ");
         throw new HttpError(405, "METHOD_NOT_ALLOWED", `method ${method} not allowed`, {
-          extraHeaders: { Allow: route.method },
+          extraHeaders: { Allow: allowed },
         });
       }
       await route.handler(req, res, ctx, deps);
