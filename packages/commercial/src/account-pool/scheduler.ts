@@ -22,11 +22,7 @@ import { createHash } from "node:crypto";
 import type { QueryResultRow } from "pg";
 import { query } from "../db/queries.js";
 import { loadKmsKey } from "../crypto/keys.js";
-import {
-  getTokenForUse,
-  type AccountPlan,
-  type AccountToken,
-} from "./store.js";
+import { getTokenForUse, type AccountPlan } from "./store.js";
 import type { AccountHealthTracker } from "./health.js";
 
 export const ERR_ACCOUNT_POOL_UNAVAILABLE = "ERR_ACCOUNT_POOL_UNAVAILABLE";
@@ -166,8 +162,16 @@ export class AccountScheduler {
   /**
    * 选一个账号并返回 token。
    *
-   * @throws `AccountPoolUnavailableError` 当无 active 账号 / 选中账号已被删除
+   * TOCTOU 保护:如果选中的账号在 SELECT 和 getTokenForUse 之间被删
+   * (`getTokenForUse` 返 null),从候选池剔除该 id 重新选,直到池空才抛 503。
+   * 这避免了"池里还有可用账号但本次 pick 误报不可用"的假阳性。
+   *
+   * 注:AEAD 解密失败(密文损坏)走 AeadError 原样抛 —— 那是"账号真的坏了",
+   * 不属于 TOCTOU,上层应 disable 而不是重选。
+   *
+   * @throws `AccountPoolUnavailableError` 当无 active 账号 / 全部候选都失效
    * @throws `TypeError` 当 `mode=agent` 缺 sessionId
+   * @throws `AeadError` 当选中账号密文损坏(上层应手动禁用)
    */
   async pick(input: PickInput): Promise<PickResult> {
     if (input.mode === "agent") {
@@ -184,24 +188,35 @@ export class AccountScheduler {
        WHERE status = 'active'
        ORDER BY id`,
     );
-    const candidates = res.rows;
-    if (candidates.length === 0) {
+    let pool = res.rows;
+    if (pool.length === 0) {
       throw new AccountPoolUnavailableError("no active accounts");
     }
 
-    const chosen =
-      input.mode === "agent"
-        ? pickSticky(candidates, input.sessionId!, this.hash)
-        : pickWeighted(candidates, this.random);
-
-    const tok = await this.readToken(chosen.id);
-    return {
-      account_id: BigInt(chosen.id),
-      plan: tok.plan,
-      token: tok.token,
-      refresh: tok.refresh,
-      expires_at: tok.expires_at,
-    };
+    // 最多重选 N 轮(N = 候选数)。每次选中账号若解密时发现已不存在,
+    // 剔除后从剩余候选再选一次 —— sticky 的 rendezvous-hash 对剩余集
+    // 仍是稳定的,只是换到次优选择。
+    while (pool.length > 0) {
+      const chosen =
+        input.mode === "agent"
+          ? pickSticky(pool, input.sessionId!, this.hash)
+          : pickWeighted(pool, this.random);
+      const tok = await getTokenForUse(chosen.id, this.keyFn);
+      if (tok) {
+        return {
+          account_id: BigInt(chosen.id),
+          plan: tok.plan,
+          token: tok.token,
+          refresh: tok.refresh,
+          expires_at: tok.expires_at,
+        };
+      }
+      // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选
+      pool = pool.filter((c) => c.id !== chosen.id);
+    }
+    throw new AccountPoolUnavailableError(
+      "all candidate accounts vanished between pick and readToken",
+    );
   }
 
   /**
@@ -233,16 +248,5 @@ export class AccountScheduler {
         input.result.error ?? null,
       );
     }
-  }
-
-  /** 读并解密 token;失败 → AccountPoolUnavailableError(通常是账号在 pick 和 read 之间被删)。 */
-  private async readToken(accountId: string): Promise<AccountToken> {
-    const tok = await getTokenForUse(accountId, this.keyFn);
-    if (!tok) {
-      throw new AccountPoolUnavailableError(
-        `account vanished between pick and readToken: ${accountId}`,
-      );
-    }
-    return tok;
   }
 }

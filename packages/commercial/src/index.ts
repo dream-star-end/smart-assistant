@@ -334,6 +334,7 @@ export {
   ProxyAuthError,
   DEFAULT_CLAUDE_ENDPOINT,
   DEFAULT_ANTHROPIC_VERSION,
+  DEFAULT_MAX_SSE_BUFFER,
 } from "./account-pool/proxy.js";
 export type {
   ProxyEvent,

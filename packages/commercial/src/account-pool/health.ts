@@ -5,7 +5,8 @@
  *   - onSuccess:清连续失败计数器 + success_count++ + health += 10 (cap 100)
  *                + last_used_at = NOW() + last_error = NULL
  *   - onFailure:连续失败计数器 INCR + fail_count++ + health -= 20 (floor 0)
- *                + last_error = msg。**连续** 3 次失败(状态从 active 切换时)
+ *                + last_error = msg + last_used_at = NOW()(表示"最后一次尝试使用
+ *                的时间",包括失败)。**连续** 3 次失败(状态从 active 切换时)
  *                → status=cooldown + cooldown_until = now + 10min
  *   - halfOpen:周期性扫 cooldown_until < NOW() 的账号 → status=active + health=50
  *   - manualDisable / manualEnable:超管手工干预
@@ -164,6 +165,7 @@ export class AccountHealthTracker {
        SET fail_count = fail_count + 1,
            health_score = GREATEST(0, health_score - 20),
            last_error = COALESCE($2, last_error),
+           last_used_at = NOW(),
            updated_at = NOW()
        WHERE id = $1
        RETURNING id::text AS id, status, health_score, cooldown_until`,

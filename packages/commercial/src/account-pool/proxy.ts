@@ -24,6 +24,14 @@ import type { AccountPlan } from "./store.js";
 
 export const DEFAULT_CLAUDE_ENDPOINT = "https://api.anthropic.com/v1/messages";
 export const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
+/**
+ * 单次 SSE 解析 buffer 字符上限。超过 → cancel reader + 抛 ProxyError。
+ *
+ * 设这个上限是为了防恶意/异常上游一直不发空行、或单事件大得离谱
+ * 把 gateway 的内存慢慢啃光。1MB 字符对正常 Claude 事件(一般几 KB)
+ * 绰绰有余,足以容纳最长 message_delta。
+ */
+export const DEFAULT_MAX_SSE_BUFFER = 1024 * 1024;
 
 /** 响应错误:非 2xx HTTP 状态触发。 */
 export class ProxyError extends Error {
@@ -84,6 +92,8 @@ export interface ProxyDeps {
   anthropicVersion?: string;
   /** anthropic-beta header(可不给) */
   anthropicBeta?: string;
+  /** SSE 解析 buffer 字符上限;默认 1MB。超限 → cancel + ProxyError */
+  maxBufferBytes?: number;
 }
 
 /**
@@ -187,13 +197,15 @@ export async function* streamClaude(
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
+  const maxBuf = deps.maxBufferBytes ?? DEFAULT_MAX_SSE_BUFFER;
   let buf = "";
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
-      // 循环提取完整事件
+      // 循环提取完整事件(buffer cap 在提取之后再检查:如果一整块 chunk
+      // 里含完整事件,即便超 cap 也能先 yield 出去再判)
       while (true) {
         const b = findEventBoundary(buf);
         if (!b) break;
@@ -204,11 +216,24 @@ export async function* streamClaude(
         if (ev.data === "[DONE]") return;
         yield toProxyEvent(ev);
       }
+      // 剩余 buffer 超上限 → 取消 + 抛。避免对端一直不发空行把内存啃空。
+      if (buf.length > maxBuf) {
+        try {
+          await reader.cancel();
+        } catch {
+          /* reader 可能已释放 */
+        }
+        throw new ProxyError(
+          0,
+          buf.slice(0, 200),
+          `SSE buffer exceeded ${maxBuf} chars without event boundary`,
+        );
+      }
     }
     // flush trailing buffer —— 大多数实现都以空行收尾,但保险起见处理遗留片段
-    const trailing = buf.trim();
-    if (trailing.length > 0) {
-      const ev = parseSseEvent(trailing);
+    // 用 `/\S/` 判空而非 buf.trim(),避免破坏原始 data 文本
+    if (/\S/.test(buf)) {
+      const ev = parseSseEvent(buf);
       if (ev !== null && ev.data !== "[DONE]") {
         yield toProxyEvent(ev);
       }

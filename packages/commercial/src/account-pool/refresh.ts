@@ -14,6 +14,8 @@
  *   - `no_refresh_token` — DB 里没 refresh_token,无法自救
  *   - `http_error` — 网络错 / 非 2xx(含 status 字段)
  *   - `bad_response` — 2xx 但 JSON 解析失败 / 缺 access_token
+ *   - `persist_error` — 远端 refresh 成功了,但本地 updateAccount 抛了;
+ *     为避免"本地仍是旧 token 但账号还 active"的失控场面,一律禁用并抛
  *
  * 安全规约:
  *   - 明文 refresh_token 仅短暂生存在 JS 字符串内(为 form-urlencode),encode 后立即失去引用
@@ -38,7 +40,8 @@ export type RefreshErrorCode =
   | "account_not_found"
   | "no_refresh_token"
   | "http_error"
-  | "bad_response";
+  | "bad_response"
+  | "persist_error";
 
 export class RefreshError extends Error {
   readonly code: RefreshErrorCode;
@@ -214,9 +217,11 @@ export async function refreshAccountToken(
     );
   } catch (err) {
     await disableOnFailure(deps, accountId, "refresh_network_error");
+    // 不把底层 err.message 拼进 message:未来如果 endpoint 可带凭据,
+    // 上游 fetch 错误的 url 片段可能泄露;完整异常走 cause 链。
     throw new RefreshError(
       "http_error",
-      `refresh network call failed: ${String((err as Error).message ?? err)}`,
+      "refresh network call failed",
       { cause: err },
     );
   }
@@ -266,9 +271,22 @@ export async function refreshAccountToken(
   if (newRefreshToken !== null) {
     patch.refresh = newRefreshToken;
   }
-  const updated = await updateAccount(accountId, patch, keyFn);
+  // 持久化失败是特殊分类:远端 token 已轮换,本地却没存下,账号若仍 active
+  // 会继续发旧 token,场面失控。按"失败一律禁用"的规约走 disableOnFailure。
+  // 唯一例外:updateAccount 返 null 说明账号并发删了(不抛也无法禁用,
+  // 就按 account_not_found 抛,不算 persist 错)。
+  let updated: Awaited<ReturnType<typeof updateAccount>>;
+  try {
+    updated = await updateAccount(accountId, patch, keyFn);
+  } catch (err) {
+    await disableOnFailure(deps, accountId, "refresh_persist_error");
+    throw new RefreshError(
+      "persist_error",
+      "failed to persist refreshed token to DB",
+      { cause: err },
+    );
+  }
   if (!updated) {
-    // 并发删除场景:refresh 成功了但账号已不在 —— 不必禁用(已消失),只抛
     throw new RefreshError(
       "account_not_found",
       `account ${String(accountId)} vanished after successful refresh`,
