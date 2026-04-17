@@ -229,6 +229,9 @@ async function refreshMe() {
     const u = r.user ?? r;
     $("me-email").textContent = u.email ?? "";
     $("bal-credits").textContent = u.credits ?? "?";
+    // 同步写入 USER_KEY —— agentLinesKey() 依赖它做分桶,否则登录后
+    // /api/me 尚未回写 USER_KEY 时会退化到 guest 桶,串历史给下一用户。
+    try { localStorage.setItem(USER_KEY, JSON.stringify(u)); } catch { /* ignore */ }
   } catch (e) {
     if (e.code !== "NOT_AUTHENTICATED") toast("加载个人资料失败: " + e.message, "err");
   }
@@ -390,26 +393,30 @@ let agentWs = null;
 let agentLines = []; // {kind:"in"|"frame"|"sys"|"err", text}
 let agentLinesLoaded = false;
 
+/** 返回当前用户的历史 key;拿不到稳定 uid 就返 null(不落盘,不读盘),
+ *  避免多个账号共用 "guest" 桶把历史串给下一个登录用户。 */
 function agentLinesKey() {
-  // 以当前用户 email 作 uid 标识(没有 user.id 字段时 USER_KEY 里也够稳);没登录就回退 "guest"。
-  try {
-    const u = JSON.parse(localStorage.getItem(USER_KEY) || "null");
-    const tag = u?.email || u?.id || "guest";
-    return AGENT_LINES_KEY_PREFIX + tag;
-  } catch { return AGENT_LINES_KEY_PREFIX + "guest"; }
+  let u;
+  try { u = JSON.parse(localStorage.getItem(USER_KEY) || "null"); }
+  catch { return null; }
+  const tag = u?.id ?? u?.email;
+  if (!tag || typeof tag !== "string" && typeof tag !== "number") return null;
+  return AGENT_LINES_KEY_PREFIX + String(tag);
 }
 
 function loadAgentLines() {
   if (agentLinesLoaded) return;
   agentLinesLoaded = true;
+  const key = agentLinesKey();
+  if (!key) return;
   try {
-    const raw = localStorage.getItem(agentLinesKey());
+    const raw = localStorage.getItem(key);
     if (!raw) return;
     const obj = JSON.parse(raw);
     if (!obj || typeof obj !== "object" || !Array.isArray(obj.lines)) return;
     const savedAt = Number(obj.saved_at) || 0;
     if (Date.now() - savedAt > AGENT_LINES_TTL_MS) {
-      localStorage.removeItem(agentLinesKey());
+      localStorage.removeItem(key);
       return;
     }
     agentLines = obj.lines.filter((l) =>
@@ -419,12 +426,13 @@ function loadAgentLines() {
 
 let _persistTimer = null;
 function persistAgentLines() {
-  // debounce:连帧时避免每帧都 JSON.stringify 全量历史
   if (_persistTimer) return;
   _persistTimer = setTimeout(() => {
     _persistTimer = null;
+    const key = agentLinesKey();
+    if (!key) return; // 没稳定 uid → 本会话不落盘,宁可丢也不串号
     try {
-      localStorage.setItem(agentLinesKey(), JSON.stringify({
+      localStorage.setItem(key, JSON.stringify({
         saved_at: Date.now(),
         lines: agentLines,
       }));
@@ -434,7 +442,9 @@ function persistAgentLines() {
 
 function clearAgentLines() {
   agentLines = [];
-  try { localStorage.removeItem(agentLinesKey()); } catch { /* ignore */ }
+  const key = agentLinesKey();
+  if (!key) return;
+  try { localStorage.removeItem(key); } catch { /* ignore */ }
 }
 
 function startAgentChat() {
@@ -602,8 +612,10 @@ window.addEventListener("beforeunload", () => {
   // 离开页面前 flush 一次,避免 debounce 丢最后 400ms
   if (_persistTimer) {
     clearTimeout(_persistTimer); _persistTimer = null;
+    const key = agentLinesKey();
+    if (!key) return;
     try {
-      localStorage.setItem(agentLinesKey(), JSON.stringify({
+      localStorage.setItem(key, JSON.stringify({
         saved_at: Date.now(), lines: agentLines,
       }));
     } catch { /* ignore */ }
