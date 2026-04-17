@@ -18,6 +18,7 @@ import { stubMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
+import { PricingCache } from "./billing/pricing.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -117,6 +118,25 @@ export async function registerCommercial(
   // 预热 dummy hash:第一次登录无影响
   await warmupLoginDummyHash();
 
+  // T-20: 初始化定价缓存。启动时 load,并开启 LISTEN pricing_changed
+  // 以便 admin UI 改价时自动 reload。两步失败都不阻塞启动,让 gateway
+  // 继续上线;HTTP handler 在 cache 空时会返 503 PRICING_NOT_READY,
+  // 而 pricing 热路径(T-21 计费)会直接得到 "unknown model" —— 比把
+  // 整个服务卡死更好。
+  const pricing = new PricingCache();
+  try {
+    await pricing.load();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[commercial] pricing initial load failed:", err);
+  }
+  try {
+    await pricing.startListener(cfg.DATABASE_URL);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[commercial] pricing LISTEN setup failed:", err);
+  }
+
   const handler = createCommercialHandler({
     jwtSecret,
     mailer: stubMailer,
@@ -125,11 +145,13 @@ export async function registerCommercial(
     turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,
     verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
     resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
+    pricing,
   });
 
   return {
     handle: handler,
     shutdown: async () => {
+      try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closePool();
     },
@@ -143,3 +165,5 @@ export { shouldAutoMigrate };
 export { createCommercialHandler } from "./http/router.js";
 export type { CommercialHandler } from "./http/router.js";
 export type { CommercialHttpDeps } from "./http/handlers.js";
+export { PricingCache, perKtokCredits } from "./billing/pricing.js";
+export type { ModelPricing, PublicModel } from "./billing/pricing.js";

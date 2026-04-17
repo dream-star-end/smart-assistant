@@ -412,7 +412,7 @@
 
 **测试**: 15 个新 HTTP 集成 + 2 个 gateway fall-through smoke = 17 个 case(全部 pass,作为 commercial 套件的一部分跑)
 
-**Status**: `[x] done` (commit <pending>)
+**Status**: `[x] done` (commit e180114)
 
 ---
 
@@ -423,16 +423,27 @@
 **文档**: 03-DATA-MODEL §4, 04-API §8
 
 **内容**:
-- [ ] `src/billing/pricing.ts`:`getPricing(modelId)` → `{input, output, cache_read, cache_write, multiplier}`
-- [ ] 启动加载全表到内存 Map
-- [ ] 监听 Postgres `LISTEN pricing_changed`(`NOTIFY` 由 admin 改价时触发)→ 重新加载
-- [ ] `GET /api/public/models`:返回启用模型列表(带预估价格字段)
+- [x] `src/billing/pricing.ts`:
+  - `class PricingCache`:`load()` 一次性把 model_pricing 全表读入内存 Map;`get(modelId)` O(1) 无 I/O;`listPublic()` 过滤 enabled + 按 sort_order 升序 + 计算 `*_per_ktok_credits`
+  - `startListener(connString)` 开一个独占 `pg.Client`,`LISTEN pricing_changed`;收到通知 → scheduleReload(合并并发:in-flight 时后来的通知不再新开 load)
+  - reload 失败用 `onError` 钩子 + 保留旧缓存(绝不清空,避免热路径瞬间全部 miss)
+  - 数值字段 BIGINT 经 pg 返 string,边界一次性 `BigInt(...)`;multiplier NUMERIC(6,3) 保留字符串(`perKtokCredits` helper 用 BigInt 精确算,不过 JS float)
+- [x] `src/db/migrations/0008_pricing_notify.sql`:在 model_pricing 挂 AFTER INSERT/UPDATE/DELETE trigger → `pg_notify('pricing_changed','')`。payload 为空,PricingCache 只要收到信号就全表 reload(简单 + 幂等)
+- [x] `src/http/handlers.ts` + `router.ts`:`GET /api/public/models` → `{ models: [{id, display_name, input/output/cache_read/cache_write_per_ktok_credits, multiplier}] }`。`CommercialHttpDeps.pricing` 为 optional;未注入时 503 PRICING_NOT_READY
+- [x] `src/index.ts` `registerCommercial`:启动时 `new PricingCache()` + `load()` + `startListener(DATABASE_URL)`,任一失败只 log 不阻塞启动;shutdown 负责关 listener
+- [x] 更新 migrate_full.integ.test 中 "seed 幂等" 测试,避免新增 0008 后触发 out-of-order 检查(改为 `DELETE WHERE version >= '0007_seed_pricing'`)
 
 **Acceptance**:
-- [ ] 单元:已知 modelId → 返回正确价格
-- [ ] 集成:UPDATE model_pricing → NOTIFY → 内存更新(测试用 sleep 100ms)
+- [x] 单元:`perKtokCredits` 多组公式(sonnet/opus/自定义 multiplier/极小值/零值) — `pricing.test.ts`(10 case)
+- [x] 单元:`PricingCache.get/listPublic/shutdown` 行为对(`_setForTests` 注入,无 DB)— `pricing.test.ts`
+- [x] 集成:真 PG + trigger + LISTEN/NOTIFY,UPDATE multiplier → waitFor cache 反映新值(timeout 2s,轮询 25ms)
+- [x] 集成:INSERT 新模型 → cache 里能 get 到;DELETE → get 返 null
+- [x] 集成:disabled 模型不在 listPublic 里,但 get() 仍能查到
+- [x] 集成:`/api/public/models` 端到端返 JSON + sort_order 正确 + per-ktok 字段格式 `\d+\.\d{6}`;POST → 405 Allow:GET;未注入 pricing → 503 PRICING_NOT_READY
 
-**Status**: `[ ] todo`
+**测试**: 10 + 4 unit case + 9 integ case 新增(全部 pass)
+
+**Status**: `[x] done` (commit <pending>)
 
 ---
 

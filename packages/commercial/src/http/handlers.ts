@@ -20,6 +20,7 @@ import { requireAuth } from "./auth.js";
 import { query } from "../db/queries.js";
 import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLimitRedis } from "../middleware/rateLimit.js";
 import type { Mailer } from "../auth/mail.js";
+import type { PricingCache } from "../billing/pricing.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -31,6 +32,11 @@ export interface CommercialHttpDeps {
   fetchImpl?: typeof fetch;
   verifyEmailUrlBase?: string;
   resetPasswordUrlBase?: string;
+  /**
+   * T-20: 定价缓存。未注入时 `/api/public/models` 返回 503
+   * (表示模块尚未加载完毕),便于 gateway 在 start 阶段早期也能挂上路由。
+   */
+  pricing?: PricingCache;
   /** 限流配置覆盖(测试用) */
   rateLimits?: Partial<{
     register: RateLimitConfig;
@@ -308,6 +314,21 @@ export async function handleMe(
       credits: u.credits,
     },
   });
+}
+
+// ─── GET /api/public/models ─────────────────────────────────────────
+// 公开路径,不限流、不需要登录;返回启用模型的公开视图(含 per-ktok 积分估价)。
+
+export async function handleListPublicModels(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  if (!deps.pricing) {
+    throw new HttpError(503, "PRICING_NOT_READY", "pricing cache not initialized");
+  }
+  sendJson(res, 200, { models: deps.pricing.listPublic() });
 }
 
 // helper for tests / 其他 module

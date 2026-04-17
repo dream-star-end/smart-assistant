@@ -174,10 +174,11 @@ describe("full migration suite 0001-0007", () => {
     if (skipIfNoPg(t)) return;
     // 第一次:完整 migrate
     await runMigrations();
-    // 手动把 0007_seed_pricing 从 schema_migrations 删掉,模拟需要 seed 重跑的场景。
-    // 若 0007 没写 ON CONFLICT DO NOTHING,再跑就会抛 unique_violation;
-    // 这里用来钉住 seed 可重放的规约(防 DDL 和 seed 混写时意外破坏幂等)。
-    await query("DELETE FROM schema_migrations WHERE version = $1", [
+    // 要测 0007_seed_pricing 的 ON CONFLICT DO NOTHING 是否幂等,得让 migrate
+    // 框架愿意再跑它。直接删单条会被 out-of-order 检查拦(如果已有版本号更大
+    // 的迁移已 applied),所以把 0007 及之后的所有 schema_migrations 条目一并
+    // 删掉,恢复到 "0007 及后续待应用" 的状态。
+    await query("DELETE FROM schema_migrations WHERE version >= $1", [
       "0007_seed_pricing",
     ]);
     await runMigrations();

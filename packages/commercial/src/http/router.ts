@@ -34,6 +34,7 @@ import {
   handleRequestPasswordReset,
   handleConfirmPasswordReset,
   handleMe,
+  handleListPublicModels,
   type CommercialHttpDeps,
   type RequestContext,
 } from "./handlers.js";
@@ -66,9 +67,10 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     { method: "POST", path: "/api/auth/request-password-reset", handler: handleRequestPasswordReset },
     { method: "POST", path: "/api/auth/confirm-password-reset", handler: (req, res) => handleConfirmPasswordReset(req, res) },
     { method: "GET", path: "/api/me", handler: handleMe },
+    { method: "GET", path: "/api/public/models", handler: handleListPublicModels },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
-  const prefixes = ["/api/auth/", "/api/me"];
+  const prefixes = ["/api/auth/", "/api/me", "/api/public/"];
 
   return async function commercialHandler(req, res): Promise<boolean> {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
