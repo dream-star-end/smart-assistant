@@ -273,14 +273,37 @@ export function createChatWsHandler(deps: ChatWsDeps): ChatWsHandler {
     // 因此:统一先接受 upgrade,再在 WS 帧里发 error,然后 close(1008/1011)。
     // 鉴权失败对应 close code 1008(policy violation)。
     wss.handleUpgrade(req, socket, head, (ws) => {
+      // 抢在 authFromQuery 的 await 之前 *同步* 挂 message 监听 —— 否则客户端
+      // 在 'open' 后立即发的 start 帧会在 EventEmitter 里丢掉(ws 不会 buffer
+      // 没有 listener 的事件)。这里只把早到的 message/close 记下来,等 auth 完
+      // 成后把它们 replay 给真正的业务 handler。
+      const pendingMessages: Array<{ data: Buffer | string | ArrayBuffer | Buffer[]; isBinary: boolean }> = [];
+      let closedEarly: { code: number; reason: Buffer } | null = null;
+      const earlyMessage = (data: Buffer | string | ArrayBuffer | Buffer[], isBinary: boolean): void => {
+        pendingMessages.push({ data, isBinary });
+      };
+      const earlyClose = (code: number, reason: Buffer): void => {
+        closedEarly = { code, reason };
+      };
+      ws.on("message", earlyMessage);
+      ws.on("close", earlyClose);
+
       authFromQuery(url).then((r) => {
+        ws.off("message", earlyMessage);
+        ws.off("close", earlyClose);
         if ("error" in r) {
           sendJson(ws, { type: "error", code: "UNAUTHORIZED", message: r.error });
           try { ws.close(CLOSE_POLICY, "unauthorized"); } catch { /* */ }
           return;
         }
+        // 鉴权期间客户端已经断开 —— 无事可做
+        if (closedEarly !== null) return;
         onConnection(ws, req, r);
+        // replay 期间收到的帧,交给 onConnection 新挂的 'message' listener
+        for (const m of pendingMessages) ws.emit("message", m.data, m.isBinary);
       }, (err: unknown) => {
+        ws.off("message", earlyMessage);
+        ws.off("close", earlyClose);
         log.error("ws auth threw", { err: String(err) });
         sendJson(ws, { type: "error", code: "ERR_INTERNAL", message: "auth failure" });
         try { ws.close(CLOSE_INTERNAL, "auth error"); } catch { /* */ }

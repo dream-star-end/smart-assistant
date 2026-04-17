@@ -793,12 +793,19 @@ Commits:
 **依赖**: T-40
 
 **内容**:
-- [ ] `POST /api/chat`:非流式,内部聚合所有 delta 返回一次
+- [x] `POST /api/chat`:非流式,内部聚合所有 delta 返回一次
+- [x] `createChatLLMFromRunChat`:把 orchestrator 适配成既有 `ChatLLM` 接口,复用 http/chat 路由层(预检/扣费)
+- [x] `registerCommercial` 把 scheduler/health 上移,ws + rest 共用同一份 chatDeps
+- [x] WS handshake 抢在 auth await 前同步挂 message listener,避免客户端 open 后立即发 start 帧时事件丢失(跨文件测试暴露的 race)
 
 **Acceptance**:
-- [ ] 集成:请求 → 单次 JSON 响应,含 content + usage + cost_credits
+- [x] 集成:SSE 5 事件 → 200 + text 拼接 + usage + 扣费落库 + preCheck 释放
+- [x] 集成:上游 500 → 502 ERR_UPSTREAM + 余额未动 + usage_records.status='error' + preCheck 释放
 
-**Status**: `[ ] todo`
+**Status**: `[x] done`
+
+**Commits**:
+- (pending)
 
 ---
 

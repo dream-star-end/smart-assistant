@@ -1,28 +1,29 @@
 /**
- * T-23 — POST /api/chat 骨架。
+ * T-23 骨架 → T-41 接真 Claude。
  *
- * 关键点:**这里不接真 Claude**。真实上游走 Gateway 的 `/v1/messages`(bedrock/anthropic/etc),
- * 由 T-40/T-41 去接。本路由只做:
+ * POST /api/chat — 非流式:内部跑完整个 SSE stream,把 delta 聚合成一段文本,再一次性返回。
+ *
+ * 流程:
  *   1. requireAuth → user
- *   2. 读 body: { model, max_tokens, messages }(messages 仅透传验证结构,本 stub 不真正调 LLM)
+ *   2. 读 body: { model, max_tokens, messages }
  *   3. preCheck → Redis 预扣 + 余额校验(余额不足 → 402)
- *   4. 调 deps.chatLLM(mockable):返回 `{ usage: TokenUsage, status: 'success'|'error', error? }`
- *   5. success → computeCost + tx 内 debit + INSERT usage_records(ledger_id 挂上)
- *      非 success → 只 INSERT usage_records(status='error', cost_credits=0,不扣费)
+ *   4. 调 deps.chatLLM(默认 stub;生产注入 `createChatLLMFromRunChat(chatDeps)` 走真 Claude)
+ *   5. success → tx 内 debitChatSuccess(users ↓ + credit_ledger + usage_records 原子落库)
+ *      非 success → recordChatError 只写一行 usage_records(status='error', 不扣费)
  *   6. finally:释放 Redis 预扣
  *
- * 为什么 usage_records 在扣费事务内一起写:
+ * 为什么 usage_records 在扣费事务内一起写(见 chat/debit.ts 注释):
  *   - `usage_records.ledger_id` 需要刚 INSERT 的 credit_ledger.id
  *   - 两边一起写保证"有 ledger 的 usage 必能追回,反之 usage.status=error 绝不扣费"
- *   - 失败的 LLM 也要写 usage_records(审计用),但不进事务:即使 debit 失败(不发生),
- *     usage 行也要落地
+ *   - 失败的 LLM 也要写 usage_records(审计用),但不进事务
+ *
+ * T-41 对比 T-40 WS 的差异:仅响应形态,业务语义(preCheck/扣费/错误审计)完全一致。
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { HttpError, readJsonBody, sendJson } from "./util.js";
 import { requireAuth } from "./auth.js";
-import { query, tx } from "../db/queries.js";
-import { debit, InsufficientCreditsError as LedgerInsufficientError } from "../billing/ledger.js";
+import { tx } from "../db/queries.js";
 import { computeCost, type TokenUsage } from "../billing/calculator.js";
 import {
   preCheck,
@@ -30,6 +31,13 @@ import {
   InsufficientCreditsError as PreCheckInsufficientError,
   type PreCheckRedis,
 } from "../billing/preCheck.js";
+import {
+  debitChatSuccess,
+  recordChatError,
+  InsufficientCreditsAfterPreCheckError,
+  UserGoneError,
+} from "../chat/debit.js";
+import { runClaudeChat, type RunChatDeps } from "../chat/orchestrator.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
 
 export interface ChatBody {
@@ -63,7 +71,7 @@ export interface ChatLLM {
 
 /**
  * stub LLM:固定返回 1000 in / 500 out token,便于集成测试验证扣费正确。
- * 生产请注入真 LLM(T-40 接 Claude)。
+ * 生产请注入真 LLM(`createChatLLMFromRunChat(chatDeps)`)。
  */
 export const stubChatLLM: ChatLLM = {
   async complete({ maxTokens }) {
@@ -81,6 +89,102 @@ export const stubChatLLM: ChatLLM = {
     };
   },
 };
+
+/**
+ * T-41 — 把 `runClaudeChat`(AsyncGenerator)包装成 `ChatLLM.complete` 签名。
+ *
+ * 非流式语义:消费整条事件流,把 delta 累加成一段 text,取最后 `usage` 事件,
+ * 成功/失败映射到 `status`。`error` 事件的 code/message 原样透传给 http 层,
+ * 便于前端区分 `ERR_UPSTREAM` / `ERR_ACCOUNT_POOL_UNAVAILABLE` 等。
+ *
+ * 与 ws/chat.ts 的差异:WS 逐帧转发 delta,REST 累加后一次返回。两者共用
+ * 同一个 orchestrator + 同一个 `debitChatSuccess`,避免双入口语义漂移。
+ */
+export function createChatLLMFromRunChat(deps: RunChatDeps): ChatLLM {
+  return {
+    async complete({ userId, requestId, model, maxTokens, messages }) {
+      let text = "";
+      let usage: TokenUsage | null = null;
+      let accountId: bigint | null = null;
+      let errorFrame: { code: string; message: string } | null = null;
+      try {
+        for await (const ev of runClaudeChat(
+          {
+            userId,
+            mode: "chat",
+            model,
+            messages,
+            max_tokens: maxTokens,
+          },
+          deps,
+        )) {
+          switch (ev.type) {
+            case "meta": {
+              accountId = ev.account_id;
+              break;
+            }
+            case "delta": {
+              text += ev.text;
+              break;
+            }
+            case "usage": {
+              usage = {
+                input_tokens: BigInt(ev.usage.input_tokens),
+                output_tokens: BigInt(ev.usage.output_tokens),
+                cache_read_tokens: BigInt(ev.usage.cache_read_tokens),
+                cache_write_tokens: BigInt(ev.usage.cache_write_tokens),
+              };
+              break;
+            }
+            case "error": {
+              errorFrame = { code: ev.code, message: ev.message };
+              break;
+            }
+            case "done":
+              break;
+          }
+        }
+      } catch (err) {
+        errorFrame = {
+          code: "ERR_INTERNAL",
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+
+      // 先看错误:orchestrator 不会同时 yield usage+error(error 之后就 return)
+      if (errorFrame) {
+        return {
+          usage: zeroUsage(),
+          status: "error",
+          error: errorFrame,
+          accountId,
+          text,
+        };
+      }
+      if (!usage) {
+        // 理论上不该:orchestrator 的 done 前必 yield usage。但 orchestrator 的 done 也
+        // 可能因调用方取消而没跑到 → 记成 error 防止 REST 把 0 usage 当 success 扣 0 费。
+        return {
+          usage: zeroUsage(),
+          status: "error",
+          error: { code: "ERR_INTERNAL", message: "usage event missing before stream end" },
+          accountId,
+          text,
+        };
+      }
+      return { usage, status: "success", accountId, text };
+    },
+  };
+}
+
+function zeroUsage(): TokenUsage {
+  return {
+    input_tokens: 0n,
+    output_tokens: 0n,
+    cache_read_tokens: 0n,
+    cache_write_tokens: 0n,
+  };
+}
 
 function parseChatBody(b: unknown): ChatBody {
   if (!b || typeof b !== "object") {
@@ -154,91 +258,45 @@ export async function handleChat(
     });
 
     if (llmResp.status === "error") {
-      // 不扣费:只写 usage_records(审计);cost_credits=0,ledger_id=null
-      await query(
-        `INSERT INTO usage_records
-          (user_id, session_id, mode, account_id, model,
-           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-           price_snapshot, cost_credits, ledger_id, request_id, status, error_msg)
-         VALUES ($1, NULL, 'chat', $2, $3, 0, 0, 0, 0, $4::jsonb, 0, NULL, $5, 'error', $6)`,
-        [
-          user.id,
-          llmResp.accountId ?? null,
-          body.model,
-          JSON.stringify({
-            model_id: modelPricing.model_id,
-            display_name: modelPricing.display_name,
-            input_per_mtok: modelPricing.input_per_mtok.toString(),
-            output_per_mtok: modelPricing.output_per_mtok.toString(),
-            cache_read_per_mtok: modelPricing.cache_read_per_mtok.toString(),
-            cache_write_per_mtok: modelPricing.cache_write_per_mtok.toString(),
-            multiplier: modelPricing.multiplier,
-            captured_at: new Date().toISOString(),
-          }),
-          ctx.requestId,
-          llmResp.error?.message ?? "unknown",
-        ],
-      );
+      // 不扣费:只写 usage_records(审计)。共用 recordChatError 保证和 WS 结构一致
+      await recordChatError({
+        userId: user.id,
+        requestId: ctx.requestId,
+        sessionId: null,
+        mode: "chat",
+        accountId: llmResp.accountId ?? null,
+        model: body.model,
+        priceSnapshot: {
+          model_id: modelPricing.model_id,
+          display_name: modelPricing.display_name,
+          input_per_mtok: modelPricing.input_per_mtok.toString(),
+          output_per_mtok: modelPricing.output_per_mtok.toString(),
+          cache_read_per_mtok: modelPricing.cache_read_per_mtok.toString(),
+          cache_write_per_mtok: modelPricing.cache_write_per_mtok.toString(),
+          multiplier: modelPricing.multiplier,
+          captured_at: new Date().toISOString(),
+        },
+        errorMessage: llmResp.error?.message ?? "unknown",
+      });
       // 映射到上游:LLM 错一般 502,除非是认证相关(这里 stub 固定 502)
       throw new HttpError(502, llmResp.error?.code ?? "UPSTREAM_ERROR",
         llmResp.error?.message ?? "upstream LLM error");
     }
 
-    // 3) 成功 → 事务内 debit + 写 usage_records
+    // 3) 成功 → 事务内 debit + 写 usage_records(复用 chat/debit.ts)
     const cost = computeCost(llmResp.usage, modelPricing);
-    const result = await tx(async (client) => {
-      // 手动 SELECT FOR UPDATE + INSERT(和 debit() 逻辑一致,但要把 usage_records 塞进来)
-      const balRow = await client.query<{ credits: string }>(
-        "SELECT credits::text AS credits FROM users WHERE id = $1 FOR UPDATE",
-        [user.id],
-      );
-      if (balRow.rows.length === 0) throw new HttpError(401, "UNAUTHORIZED", "user gone");
-      const balance = BigInt(balRow.rows[0].credits);
-      if (balance < cost.cost_credits) {
-        // 超卖(极少见:预检后 admin_adjust 扣走,或并发预检 < TTL)
-        throw new HttpError(402, "ERR_INSUFFICIENT_CREDITS",
-          `insufficient credits after precheck: balance=${balance} cost=${cost.cost_credits}`);
-      }
-      const newBalance = balance - cost.cost_credits;
-      await client.query(
-        "UPDATE users SET credits = $1 WHERE id = $2",
-        [newBalance.toString(), user.id],
-      );
-      const ledgerRow = await client.query<{ id: string }>(
-        `INSERT INTO credit_ledger
-          (user_id, delta, balance_after, reason, ref_type, ref_id, memo)
-         VALUES ($1, $2, $3, 'chat', 'request', $4, NULL)
-         RETURNING id::text AS id`,
-        [user.id, (-cost.cost_credits).toString(), newBalance.toString(), ctx.requestId],
-      );
-      const ledgerId = ledgerRow.rows[0].id;
-      const usageRow = await client.query<{ id: string }>(
-        `INSERT INTO usage_records
-          (user_id, session_id, mode, account_id, model,
-           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-           price_snapshot, cost_credits, ledger_id, request_id, status)
-         VALUES ($1, NULL, 'chat', $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, 'success')
-         RETURNING id::text AS id`,
-        [
-          user.id,
-          llmResp.accountId ?? null,
-          body.model,
-          BigInt(llmResp.usage.input_tokens).toString(),
-          BigInt(llmResp.usage.output_tokens).toString(),
-          BigInt(llmResp.usage.cache_read_tokens).toString(),
-          BigInt(llmResp.usage.cache_write_tokens).toString(),
-          JSON.stringify(cost.snapshot),
-          cost.cost_credits.toString(),
-          ledgerId,
-          ctx.requestId,
-        ],
-      );
-      return {
-        balance_after: newBalance,
-        ledger_id: ledgerId,
-        usage_record_id: usageRow.rows[0].id,
-      };
-    });
+    const result = await tx(async (client) =>
+      debitChatSuccess(client, {
+        userId: user.id,
+        requestId: ctx.requestId,
+        sessionId: null,
+        mode: "chat",
+        accountId: llmResp.accountId ?? null,
+        model: body.model,
+        usage: llmResp.usage,
+        cost,
+      }),
+    );
 
     sendJson(res, 200, {
       ok: true,
@@ -256,9 +314,12 @@ export async function handleChat(
       text: llmResp.text ?? "",
     });
   } catch (err) {
-    // 保险:事务内的 ledger debit 余额不足(和 preCheck 不一致的极端情况)
-    if (err instanceof LedgerInsufficientError) {
+    // 事务内 debit 余额不足(和 preCheck 不一致的极端情况 - admin_adjust 把预扣之后的余额扣穿)
+    if (err instanceof InsufficientCreditsAfterPreCheckError) {
       throw new HttpError(402, "ERR_INSUFFICIENT_CREDITS", err.message);
+    }
+    if (err instanceof UserGoneError) {
+      throw new HttpError(401, "UNAUTHORIZED", "user not found");
     }
     throw err;
   } finally {

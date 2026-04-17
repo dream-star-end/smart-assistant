@@ -26,6 +26,7 @@ import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } fr
 import { AccountScheduler } from "./account-pool/scheduler.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
 import { createChatWsHandler, type ChatWsHandler } from "./ws/chat.js";
+import { createChatLLMFromRunChat } from "./http/chat.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -167,6 +168,17 @@ export async function registerCommercial(
 
   const preCheckRedis = wrapIoredisForPreCheck(redis);
 
+  // T-40/T-41 共用的编排依赖:scheduler + health。ws/chat 与 http/chat 走同一套,
+  // 两个入口的 debit 与 account-pool 语义才不会漂移。
+  const healthRedis = wrapIoredisForHealth(
+    redis as unknown as Parameters<typeof wrapIoredisForHealth>[0],
+  );
+  const healthTracker = new AccountHealthTracker({ redis: healthRedis });
+  const scheduler = new AccountScheduler({ health: healthTracker });
+  const chatDeps = { scheduler };
+  // T-41 REST /api/chat:把 orchestrator 包成 ChatLLM 接口喂给既有 http handler。
+  const realChatLLM = createChatLLMFromRunChat(chatDeps);
+
   const handler = createCommercialHandler({
     jwtSecret,
     mailer: stubMailer,
@@ -178,22 +190,17 @@ export async function registerCommercial(
     pricing,
     // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
     preCheckRedis,
+    chatLLM: realChatLLM,
     hupijiao,
     hupijiaoConfig,
   });
 
-  // T-40 /ws/chat:scheduler + health + chat WS handler。
-  // scheduler/health 是"跑着的资源"(Redis 里的健康 key + DB 查询),gateway 重启时顺带清。
-  const healthRedis = wrapIoredisForHealth(
-    redis as unknown as Parameters<typeof wrapIoredisForHealth>[0],
-  );
-  const healthTracker = new AccountHealthTracker({ redis: healthRedis });
-  const scheduler = new AccountScheduler({ health: healthTracker });
+  // T-40 /ws/chat:handler 注入同一份 chatDeps
   const wsHandler: ChatWsHandler = createChatWsHandler({
     jwtSecret,
     pricing,
     preCheckRedis,
-    chatDeps: { scheduler },
+    chatDeps,
   });
 
   return {
@@ -419,3 +426,5 @@ export type {
   Conn,
   RegisterResult,
 } from "./ws/connections.js";
+// T-41: POST /api/chat 的 LLM 适配器 —— runClaudeChat → ChatLLM
+export { createChatLLMFromRunChat } from "./http/chat.js";
