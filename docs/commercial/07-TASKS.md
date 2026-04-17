@@ -307,16 +307,23 @@
 **依赖**: T-12
 
 **内容**:
-- [ ] `verifyEmail(token)`:按 token_hash 查、未过期、未使用 → UPDATE users.email_verified=true + UPDATE used_at
-- [ ] `requestPasswordReset(email)`:生成 token、发邮件、不管 email 是否存在都返回相同响应(防枚举)
-- [ ] `confirmPasswordReset(token, newPassword)`:校验 token → 更新密码 → 标记 used + 吊销所有 refresh token
+- [x] `verifyEmail(rawToken)`:hash → 单事务 SELECT FOR UPDATE → mark used_at + users.email_verified
+- [x] `requestPasswordReset(email)`:防枚举(总返回 accepted=true);存在用户才写 reset 行 + 发邮件
+- [x] `confirmPasswordReset(rawToken, newPassword)`:argon2 重 hash + mark used + 吊销所有未 revoke 的 refresh token
+- [x] `src/auth/verify.ts`:`VerifyError` codes VALIDATION/INVALID_TOKEN/WEAK_PASSWORD
+- [x] `RESET_PASSWORD_TTL_SECONDS = 3600`(短于 verify_email 的 24h)
 
 **Acceptance**:
-- [ ] 集成:正确 token verify 成功、token 复用失败、过期 token 失败
-- [ ] 集成:不存在邮箱的重置请求返回 200 且无 DB 行变化(除限流)
-- [ ] 集成:重置成功后,原有 refresh token 全部被吊销
+- [x] 集成:正确 token verify 成功、token 复用 → INVALID_TOKEN、过期 → INVALID_TOKEN
+- [x] 集成:不存在邮箱的重置请求返回 accepted=true 且 email_verifications 不长行
+- [x] 集成:confirmPasswordReset 后所有 active refresh_tokens 被 revoke,old revoked 时间戳不被覆盖
 
-**Status**: `[ ] todo`
+**实施记录**:
+- 测试覆盖:verify integ 16(verifyEmail 5 + requestPasswordReset 4 + confirmPasswordReset 6 + 1 跨 purpose)
+- 防误用:verify_email token 走 confirmPasswordReset 也只返 INVALID_TOKEN(purpose 隔离)
+- 测试汇总:unit 78 + integ 48 全绿;typecheck 干净
+
+**Status**: `[x] done`
 
 ---
 
