@@ -10,6 +10,8 @@
  *   - 实例化 HTTP 路由处理器,通过 result.handle 暴露给 gateway
  */
 
+import type { IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
 import IORedis from "ioredis";
 import { runMigrations } from "./db/migrate.js";
 import { closePool } from "./db/index.js";
@@ -21,6 +23,9 @@ import { warmupLoginDummyHash } from "./auth/login.js";
 import { PricingCache } from "./billing/pricing.js";
 import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
+import { AccountScheduler } from "./account-pool/scheduler.js";
+import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
+import { createChatWsHandler, type ChatWsHandler } from "./ws/chat.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -57,7 +62,13 @@ export interface RegisterCommercialResult {
    * 返回 true 表示已处理完毕,gateway 不再继续路由。
    */
   handle: CommercialHandler;
-  /** 关闭所有商业化资源(pool / redis)。 */
+  /**
+   * WebSocket upgrade 处理器:gateway 在 HTTP server 的 `upgrade` 事件里调用。
+   * 返回 true → commercial 已处理(可能是鉴权失败 + destroy,也可能是成功 upgrade);
+   * 返回 false → 非 commercial 路由(如 `/ws`),gateway 自行处理。
+   */
+  handleWsUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => boolean;
+  /** 关闭所有商业化资源(pool / redis / ws)。 */
   shutdown: () => Promise<void>;
 }
 
@@ -154,6 +165,8 @@ export async function registerCommercial(
     hupijiaoConfig = { appId: fullCfg.appId, appSecret: fullCfg.appSecret };
   }
 
+  const preCheckRedis = wrapIoredisForPreCheck(redis);
+
   const handler = createCommercialHandler({
     jwtSecret,
     mailer: stubMailer,
@@ -164,14 +177,30 @@ export async function registerCommercial(
     resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
     pricing,
     // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
-    preCheckRedis: wrapIoredisForPreCheck(redis),
+    preCheckRedis,
     hupijiao,
     hupijiaoConfig,
   });
 
+  // T-40 /ws/chat:scheduler + health + chat WS handler。
+  // scheduler/health 是"跑着的资源"(Redis 里的健康 key + DB 查询),gateway 重启时顺带清。
+  const healthRedis = wrapIoredisForHealth(
+    redis as unknown as Parameters<typeof wrapIoredisForHealth>[0],
+  );
+  const healthTracker = new AccountHealthTracker({ redis: healthRedis });
+  const scheduler = new AccountScheduler({ health: healthTracker });
+  const wsHandler: ChatWsHandler = createChatWsHandler({
+    jwtSecret,
+    pricing,
+    preCheckRedis,
+    chatDeps: { scheduler },
+  });
+
   return {
     handle: handler,
+    handleWsUpgrade: (req, socket, head) => wsHandler.handleUpgrade(req, socket, head),
     shutdown: async () => {
+      try { await wsHandler.shutdown(); } catch { /* ignore */ }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closePool();
@@ -357,3 +386,36 @@ export type {
   RunChatInput,
   RunChatDeps,
 } from "./chat/orchestrator.js";
+// T-40: 扣费 / usage_records 写入工具(ws/chat 与 http/chat 共享)
+export {
+  debitChatSuccess,
+  recordChatError,
+  InsufficientCreditsAfterPreCheckError,
+  UserGoneError,
+} from "./chat/debit.js";
+export type {
+  DebitChatSuccessInput,
+  DebitChatSuccessResult,
+  RecordChatErrorInput,
+} from "./chat/debit.js";
+// T-40b: /ws/chat WebSocket handler
+export {
+  createChatWsHandler,
+  DEFAULT_MAX_FRAME_BYTES,
+  DEFAULT_START_TIMEOUT_MS,
+} from "./ws/chat.js";
+export type {
+  ChatWsHandler,
+  ChatWsDeps,
+  ChatWsLogger,
+  ChatStartFrame,
+  ChatServerFrame,
+} from "./ws/chat.js";
+export {
+  ConnectionRegistry,
+  DEFAULT_MAX_PER_USER,
+} from "./ws/connections.js";
+export type {
+  Conn,
+  RegisterResult,
+} from "./ws/connections.js";

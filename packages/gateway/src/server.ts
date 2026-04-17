@@ -73,6 +73,7 @@ export class Gateway {
   // and short-circuits the request if it returns true. Lets @openclaude/commercial
   // own /api/auth/* + /api/me without touching the personal-version gateway routes.
   private commercialHandle: ((req: IncomingMessage, res: ServerResponse) => Promise<boolean>) | null = null
+  private commercialWsUpgrade: ((req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => boolean) | null = null
   private commercialShutdown: (() => Promise<void>) | null = null
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
@@ -213,6 +214,7 @@ export class Gateway {
       const { registerCommercial } = await import('@openclaude/commercial')
       const commercial = await registerCommercial(this)
       this.commercialHandle = commercial.handle
+      this.commercialWsUpgrade = commercial.handleWsUpgrade
       this.commercialShutdown = commercial.shutdown
       this.log.info('commercial module enabled')
     }
@@ -239,6 +241,21 @@ export class Gateway {
       this.handleHttp(req, res)
     })
     this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' })
+
+    // Commercial /ws/chat upgrade routing: adds a second listener on httpServer 'upgrade'.
+    // Node emits upgrade to ALL listeners; WebSocketServer with {path:'/ws'} internally
+    // no-ops for non-matching paths, so the two coexist safely (no double-accept).
+    if (this.commercialWsUpgrade) {
+      const commercialWsUpgrade = this.commercialWsUpgrade
+      this.httpServer.on('upgrade', (req, socket, head) => {
+        try {
+          commercialWsUpgrade(req, socket, head)
+        } catch (err) {
+          this.log.error('commercial ws upgrade threw', undefined, err)
+          try { socket.destroy() } catch { /* ignore */ }
+        }
+      })
+    }
 
     // WS keepalive: ping every 25s, terminate if no pong in 35s
     this._wsKeepaliveTimer = setInterval(() => {
@@ -723,6 +740,7 @@ export class Gateway {
       }
       this.commercialShutdown = null
       this.commercialHandle = null
+      this.commercialWsUpgrade = null
     }
 
     this.log.info('shutdown complete')

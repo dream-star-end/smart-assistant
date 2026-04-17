@@ -769,17 +769,21 @@ Commit: 29bc47a `task(T-33)(commercial): 修 Phase 3 Codex 审查 3 个 Finding 
 **文档**: 04-API §5
 
 **内容**:
-- [ ] `ws /ws/chat`:在 gateway 里新增 ws 路由
-- [ ] 握手时 `?token=` 校验
-- [ ] 前端 send `start` frame → 服务端走完整链:preCheck → scheduler.pick → proxy.streamClaude → 转发 delta → debit → done
-- [ ] 同用户 >3 连接 → 最老的那个被 kick
+- [x] `ws /ws/chat`:在 gateway 里新增 ws 路由(gateway HTTP server `upgrade` 事件多监听器并存 —— 原 `/ws` 的 WSS 不动,commercial 新增路径路由 `/ws/chat` 的 handler,非匹配路径 noop 回落)
+- [x] 握手时 `?token=` 校验(失败先 accept upgrade,再发 `{type:'error'}` 帧并 close(1008) —— 浏览器 WS API 拿不到握手失败的响应体,统一走帧内报错)
+- [x] 前端 send `start` frame → 服务端走完整链:preCheck → scheduler(在 orchestrator 内) → proxy.streamClaude → 转发 delta → debit → done
+- [x] 同用户 >3 连接 → 最老的那个被 kick(`ConnectionRegistry` 维护 user_id → `Conn[]`,FIFO 按 `opened_at` 踢老)
+- [x] 拆分 `chat/debit.ts` 给 T-41 REST 共用(InsufficientCreditsAfterPreCheckError / UserGoneError,保证两个入口扣费语义一致)
 
 **Acceptance**:
-- [ ] 集成(用 ws client 模拟):stream 正常、usage frame、debit frame、done frame
-- [ ] 集成:断开连接时释放预锁
-- [ ] 集成:账号池 503 → error frame
+- [x] 集成(用 ws client 模拟):stream 正常、usage frame、debit frame、done frame —— `wsChat.integ.test.ts` 正常流用例
+- [x] 集成:断开连接时释放预锁 —— 所有失败路径用例都断言 `preCheckRedis.snapshot()` 为空
+- [x] 集成:账号池 /上游 500 → error frame + close 1011 + usage_records.status='error' + 余额未动
+- [x] 单元:`ConnectionRegistry` 13 tests(kick-oldest、user 隔离、idempotent、closeAll、边界值)
 
-**Status**: `[ ] todo`
+**Status**: `[x] done`
+
+Commit: `<pending>` task(T-40b)(commercial): WS chat handler + connection registry + shared debit helper + gateway 路由
 
 ---
 
