@@ -367,6 +367,75 @@ describe("POST /api/chat with runClaudeChat (T-41)", () => {
    * RequestRetryWithDifferentResultError)。客户端必须换 request_id 重试,不能复用
    * 已经 "烧掉" 的那个。
    */
+  /**
+   * 跨用户隔离:用户 A 和用户 B 即便"撞"同一 x-request-id(恶意或 UUID 冲突),
+   * 他们的 replay / debit 也必须完全隔离 —— 不能把 A 的 ledger_id/balance 返给 B,也不能
+   * 让 A 的 request 把 B 的 usage 记录当成自己的(Codex 第二轮 F1)。
+   * 验证手段:约束和查询都要带 user_id。
+   */
+  test("不同用户复用同一 x-request-id 不会串账", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const a = await createUser("cross-a@example.com", 10_000n);
+    const b = await createUser("cross-b@example.com", 5_000n);
+    await createAccount({ label: "cross", plan: "pro", token: "TXS" }, keyFn);
+    const sharedRid = "fixed-rid-shared";
+
+    const mkSuccess = (outTok: number, inTok: number) =>
+      (async () => sseResponse(200, [
+        `event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":${inTok},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n`,
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n',
+        `event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":${outTok}}}\n\n`,
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ])) as unknown as typeof fetch;
+
+    // A 发请求 → 成功扣费
+    currentMockFetch = mkSuccess(10, 20);
+    const rA = await postChat(
+      { model: "claude-sonnet-4-6", max_tokens: 500, messages: [{ role: "user", content: "a" }] },
+      a.token,
+      sharedRid,
+    );
+    assert.equal(rA.status, 200, JSON.stringify(rA.json));
+    const aLedger = rA.json.ledger_id as string;
+    const aUsage = rA.json.usage_record_id as string;
+
+    // B 用同一 x-request-id 发独立请求 → 应该是全新扣费,不被 A 影响
+    currentMockFetch = mkSuccess(20, 40);
+    const rB = await postChat(
+      { model: "claude-sonnet-4-6", max_tokens: 500, messages: [{ role: "user", content: "b" }] },
+      b.token,
+      sharedRid,
+    );
+    assert.equal(rB.status, 200, JSON.stringify(rB.json));
+    assert.notEqual(rB.json.ledger_id, aLedger, "B must get a fresh ledger_id (not A's)");
+    assert.notEqual(rB.json.usage_record_id, aUsage, "B must get a fresh usage_record_id (not A's)");
+
+    // 账实对账:A 和 B 各自的余额、ledger、usage 都是独立的
+    const ua = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [a.id]);
+    const ub = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [b.id]);
+    assert.equal(ua.rows[0].credits, "9999", "A debited once");
+    assert.ok(BigInt(ub.rows[0].credits) < 5_000n, "B debited once (credits went down)");
+    assert.ok(BigInt(ub.rows[0].credits) > 0n, "B debited reasonably (not drained)");
+
+    const cntA = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM usage_records WHERE user_id=$1 AND request_id=$2",
+      [a.id, sharedRid],
+    );
+    const cntB = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM usage_records WHERE user_id=$1 AND request_id=$2",
+      [b.id, sharedRid],
+    );
+    assert.equal(cntA.rows[0].cnt, "1", "exactly one usage_records row for A");
+    assert.equal(cntB.rows[0].cnt, "1", "exactly one usage_records row for B");
+
+    // 最关键:(user_id, request_id) 组合唯一约束允许两个用户复用 request_id
+    const totalCnt = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM usage_records WHERE request_id=$1",
+      [sharedRid],
+    );
+    assert.equal(totalCnt.rows[0].cnt, "2", "both users have their own row under same request_id");
+  });
+
   test("重放同一 x-request-id(上次 error)→ 409 ERR_REQUEST_ID_EXHAUSTED + 不再调 LLM", async (t) => {
     if (skipIfNoDb(t)) return;
     const { id: uid, token } = await createUser("rest-replay-err@example.com", 7_000n);

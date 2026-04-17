@@ -67,7 +67,13 @@ export interface ChatStartFrame {
   extra?: Record<string, unknown>;
 }
 
-/** 服务器 → 客户端 WS 帧类型(04-API §5)。 */
+/**
+ * 服务器 → 客户端 WS 帧类型(04-API §5)。
+ *
+ * `replayed?: true` 出现在 usage / debit 帧表示本次是请求级幂等重放(见 checkRequestIdReplay):
+ * 前端应当识别此标记,不再把 delta/text 补进消息流(本轮没有新 delta),只用它刷新
+ * 计费状态 / 确认 ledger 行;done 帧随后关闭。
+ */
 export type ChatServerFrame =
   | { type: "delta"; text: string }
   | {
@@ -77,6 +83,7 @@ export type ChatServerFrame =
       cache_read_tokens: number;
       cache_write_tokens: number;
       stop_reason: string | null;
+      replayed?: true;
     }
   | {
       type: "debit";
@@ -84,6 +91,7 @@ export type ChatServerFrame =
       balance_after: string;
       ledger_id: string;
       usage_record_id: string;
+      replayed?: true;
     }
   | { type: "done" }
   | { type: "error"; code: string; message: string };

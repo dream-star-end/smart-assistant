@@ -143,9 +143,11 @@ export async function checkRequestIdReplay(
     [row.ledger_id],
   );
   if (lg.rows.length === 0) {
-    // usage.ledger_id 指向不存在的 ledger —— 数据异常,fallback 当 fresh;
-    // 下游 INSERT 再撞 UNIQUE 约束会走 race-protection 路径。
-    return { kind: "fresh" };
+    // usage.ledger_id 指向不存在的 ledger —— 数据异常。
+    // 与 `debitChatSuccess` 的 existing 分支策略保持一致:返回 replay-exhausted
+    // 让客户端换 request_id。回 `fresh` 会让下游重跑 LLM + debit,但我们无法
+    // 确定"原 ledger 是真没写还是被误删",fresh 路径存在误差补扣风险。
+    return { kind: "replay-exhausted", previousStatus: "ledger_missing" };
   }
   return {
     kind: "replay-success",
@@ -182,15 +184,17 @@ export async function debitChatSuccess(
   client: PoolClient,
   input: DebitChatSuccessInput,
 ): Promise<DebitChatSuccessResult> {
-  // 幂等检查:如果这个 request_id 已有 usage_records,按它的结果返回。
-  // 这里不 FOR UPDATE —— uniq_ur_request 约束保证插入互斥,只读足够。
+  // 幂等检查:如果这个 (user_id, request_id) 已有 usage_records,按它的结果返回。
+  // 关键:必须同时过滤 user_id —— `uniq_ur_user_request` 约束是 (user_id, request_id) 复合唯一,
+  // 不同用户可复用同一 request_id;只按 request_id 查会把别人的记录当 replay 返回(信息泄露 + 串账)。
+  // 这里不 FOR UPDATE —— 复合 UNIQUE 约束保证插入互斥,只读足够。
   const existing = await client.query<{
     id: string;
     status: string;
     ledger_id: string | null;
   }>(
-    "SELECT id::text AS id, status, ledger_id::text AS ledger_id FROM usage_records WHERE request_id = $1",
-    [input.requestId],
+    "SELECT id::text AS id, status, ledger_id::text AS ledger_id FROM usage_records WHERE user_id = $1 AND request_id = $2",
+    [input.userId, input.requestId],
   );
   if (existing.rows.length > 0) {
     const row = existing.rows[0];

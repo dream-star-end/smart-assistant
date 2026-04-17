@@ -19,10 +19,15 @@ CREATE UNIQUE INDEX uniq_cl_request_chat
   ON credit_ledger(user_id, ref_type, ref_id)
   WHERE reason IN ('chat', 'agent_chat') AND ref_type = 'request' AND ref_id IS NOT NULL;
 
--- 2) usage_records: 全局 request_id 唯一(success / billing_failed / error 任何状态都只能有一条)
-ALTER TABLE usage_records ADD CONSTRAINT uniq_ur_request UNIQUE (request_id);
+-- 2) usage_records: 在 (user_id, request_id) 维度唯一。
+--    为什么不做全局 UNIQUE(request_id):不同用户可能同时用同一 x-request-id
+--    (客户端 UUID 冲突概率极低,但恶意客户端可以用对方的 request_id 试探)。
+--    如果做全局唯一,一个用户的 replay 检查会用到另一个用户的记录 —— 要么撞约束
+--    报错(体验差),要么漏查(debit.ts 的 existing 分支只按 request_id 查时会误返
+--    别人的 ledger_id/balance_after 给当前用户,这是 Codex F1 指出的信息泄露)。
+--    所有幂等/replay 查询路径都必须同时传 user_id 和 request_id。
+ALTER TABLE usage_records ADD CONSTRAINT uniq_ur_user_request UNIQUE (user_id, request_id);
 
--- 注意:现存重复数据会让 ADD CONSTRAINT 失败。生产首次部署前需清理 —— 但 v2 是
--- 新部署,没有历史数据,直接加约束即可。如果部署到含数据的环境,需要先 dedup:
+-- 注意:现存重复数据会让 ADD CONSTRAINT 失败。v2 是新部署无历史数据。若部署到含数据的环境:
 --   DELETE FROM usage_records a USING usage_records b
---    WHERE a.id > b.id AND a.request_id = b.request_id;
+--    WHERE a.id > b.id AND a.user_id = b.user_id AND a.request_id = b.request_id;
