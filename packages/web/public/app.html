@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark light" />
+<title>OpenClaude</title>
+<style>
+/* T-70 商用版用户前端 — vanilla JS 单文件,4 个视图:login / register / chat / topup。 */
+:root{
+  --bg:#0d1117;--bg-raised:#161b22;--bg-elev:#1c2230;
+  --fg:#e6edf3;--fg-muted:#8b949e;--border:#30363d;
+  --accent:#4493f8;--ok:#3fb950;--err:#f85149;--warn:#d29922;
+  --radius:8px;--radius-sm:4px;
+  --font-sans:system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:var(--font-sans);font-size:14px;line-height:1.5;height:100%}
+button{font:inherit;color:inherit;background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 14px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--accent)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover:not(:disabled){filter:brightness(1.1)}
+button.link{background:transparent;border:0;color:var(--accent);padding:0;text-decoration:underline;cursor:pointer}
+input,textarea,select{font:inherit;color:var(--fg);background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;width:100%}
+input:focus,textarea:focus,select:focus{outline:0;border-color:var(--accent)}
+label{display:block;color:var(--fg-muted);font-size:12px;margin-bottom:4px}
+.hidden{display:none!important}
+.muted{color:var(--fg-muted)}
+.err{color:var(--err)}
+.ok{color:var(--ok)}
+.row{display:flex;gap:12px;align-items:center}
+.stack{display:flex;flex-direction:column;gap:14px}
+
+/* ── auth 卡片 ─────────────────────────── */
+.auth-page{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.auth-card{width:100%;max-width:380px;background:var(--bg-raised);border:1px solid var(--border);border-radius:var(--radius);padding:28px}
+.auth-card h1{margin:0 0 4px;font-size:22px}
+.auth-card .sub{color:var(--fg-muted);font-size:13px;margin-bottom:20px}
+
+/* ── 主 app ─────────────────────────── */
+.app-shell{display:flex;flex-direction:column;height:100vh}
+.topbar{display:flex;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--bg-raised)}
+.topbar .brand{font-weight:600}
+.topbar .tabs{display:flex;gap:6px}
+.topbar .tabs button{background:transparent;border:0;padding:5px 12px;border-radius:var(--radius-sm)}
+.topbar .tabs button.on{background:var(--bg-elev);color:var(--fg)}
+.topbar .grow{flex:1}
+.topbar .bal{font-family:var(--font-mono);font-size:13px;color:var(--fg-muted)}
+.topbar .bal strong{color:var(--ok);font-weight:600;font-size:14px}
+.main{flex:1;overflow:auto}
+
+/* ── chat 视图 ─────────────────────────── */
+.chat-wrap{display:flex;flex-direction:column;height:100%;max-width:920px;margin:0 auto}
+.chat-ctl{display:flex;gap:10px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border)}
+.chat-ctl select{max-width:280px}
+.chat-log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:85%;padding:10px 14px;border-radius:var(--radius);white-space:pre-wrap;word-break:break-word}
+.msg.user{background:var(--accent);color:#fff;align-self:flex-end}
+.msg.assistant{background:var(--bg-raised);border:1px solid var(--border);align-self:flex-start}
+.msg.sys{background:transparent;border:0;color:var(--fg-muted);font-size:12px;font-style:italic;align-self:center;padding:4px 0}
+.msg-foot{display:flex;gap:10px;margin-top:6px;font-size:11px;opacity:.75}
+.compose{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);background:var(--bg-raised)}
+.compose textarea{resize:none;min-height:42px;max-height:160px}
+
+/* ── topup 视图 ─────────────────────────── */
+.topup-wrap{max-width:760px;margin:0 auto;padding:24px 16px}
+.plans{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-top:12px}
+.plan{background:var(--bg-raised);border:1px solid var(--border);border-radius:var(--radius);padding:16px;cursor:pointer;transition:.15s}
+.plan:hover{border-color:var(--accent)}
+.plan .p-amt{font-size:22px;font-weight:600;margin-bottom:4px}
+.plan .p-credits{color:var(--ok);font-size:13px}
+.plan .p-label{color:var(--fg-muted);font-size:12px;margin-top:6px}
+.qr-card{background:var(--bg-raised);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-top:16px;text-align:center}
+.qr-card img{max-width:240px;border-radius:var(--radius-sm);background:#fff;padding:8px}
+.qr-card .qr-meta{color:var(--fg-muted);font-size:12px;margin-top:10px;font-family:var(--font-mono)}
+
+/* ── toast ─────────────────────────── */
+.toast{position:fixed;top:16px;right:16px;background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;max-width:360px;font-size:13px;opacity:0;transform:translateY(-8px);transition:.18s}
+.toast.on{opacity:1;transform:none}
+.toast.err{border-color:var(--err);color:var(--err)}
+.toast.ok{border-color:var(--ok);color:var(--ok)}
+</style>
+</head>
+<body>
+
+<!-- ═════ AUTH (login + register 共用) ═════ -->
+<div id="auth-view" class="auth-page">
+  <div class="auth-card stack">
+    <div>
+      <h1 id="auth-title">登录 OpenClaude</h1>
+      <div class="sub" id="auth-sub">还没有账号?<button class="link" id="auth-switch">注册</button></div>
+    </div>
+    <div>
+      <label for="auth-email">邮箱</label>
+      <input id="auth-email" type="email" autocomplete="email" placeholder="you@example.com" />
+    </div>
+    <div>
+      <label for="auth-pass">密码</label>
+      <input id="auth-pass" type="password" autocomplete="current-password" placeholder="至少 8 位" />
+    </div>
+    <div id="auth-err" class="err hidden"></div>
+    <button id="auth-submit" class="primary">登录</button>
+    <div class="muted" style="font-size:12px">
+      注册 / 登录需通过 Cloudflare Turnstile 风控。当前为最简前端,服务端开启
+      <code>TURNSTILE_TEST_BYPASS=1</code> 时可直通。
+    </div>
+  </div>
+</div>
+
+<!-- ═════ APP (已登录) ═════ -->
+<div id="app-view" class="app-shell hidden">
+  <header class="topbar">
+    <div class="brand">OpenClaude</div>
+    <div class="tabs">
+      <button data-tab="chat" class="on">对话</button>
+      <button data-tab="topup">充值</button>
+    </div>
+    <div class="grow"></div>
+    <div class="bal">余额 <strong id="bal-credits">—</strong> 积分</div>
+    <div class="muted" id="me-email" style="font-size:12px"></div>
+    <button id="logout-btn">登出</button>
+  </header>
+  <main class="main" id="tab-body"></main>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+"use strict";
+
+// ═════════════════════════════════════════════════════════════════
+// 存储键 + 常量
+// ═════════════════════════════════════════════════════════════════
+
+const TOKEN_KEY       = "openclaude_app_token";
+const REFRESH_KEY     = "openclaude_app_refresh";
+const ACCESS_EXP_KEY  = "openclaude_app_access_exp";
+const USER_KEY        = "openclaude_app_user";
+const REFRESH_SKEW_SEC = 60;
+
+// ═════════════════════════════════════════════════════════════════
+// 小工具
+// ═════════════════════════════════════════════════════════════════
+
+const $ = (id) => document.getElementById(id);
+
+/** 创建 DOM 元素;child 里的字符串一律走 createTextNode,不做 innerHTML,XSS 面最小化。 */
+function el(tag, props, children) {
+  const n = document.createElement(tag);
+  if (props) {
+    for (const [k, v] of Object.entries(props)) {
+      if (v === null || v === undefined || v === false) continue;
+      if (k === "class") n.className = v;
+      else if (k.startsWith("on")) n.addEventListener(k.slice(2).toLowerCase(), v);
+      else n.setAttribute(k, v);
+    }
+  }
+  for (const c of [].concat(children ?? [])) {
+    if (c === null || c === undefined || c === false) continue;
+    n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+  }
+  return n;
+}
+
+function toast(msg, kind) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast on" + (kind ? " " + kind : "");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.className = "toast", 3200);
+}
+
+/** 解析服务端响应:success 可能是 flat `{...}` 也可能是 `{ok:true,data:{...}}`,
+ *  error 统一是 `{error:{code,message,request_id}}`。Codex 真审过 admin.html 同款逻辑。 */
+function unwrapSuccess(body) {
+  if (body && typeof body === "object" && body.ok === true && "data" in body) return body.data;
+  return body;
+}
+function extractError(body, status) {
+  if (body && typeof body === "object" && body.error && typeof body.error === "object") {
+    return { code: body.error.code || `HTTP_${status}`, message: body.error.message || `HTTP ${status}` };
+  }
+  return { code: `HTTP_${status}`, message: `HTTP ${status}` };
+}
+
+/** access_exp 是 Unix 秒 number;localStorage.setItem 会 toString → 读回必须 Number()+*1000。
+ *  历史踩坑:admin.html 曾用 Date.parse(expRaw) → 永远 NaN → 自动续期从不触发。 */
+async function maybeRefresh() {
+  const expRaw = localStorage.getItem(ACCESS_EXP_KEY);
+  const refresh = localStorage.getItem(REFRESH_KEY);
+  if (!expRaw || !refresh) return;
+  const expSec = Number(expRaw);
+  if (!Number.isFinite(expSec) || expSec <= 0) return;
+  if (expSec * 1000 - Date.now() > REFRESH_SKEW_SEC * 1000) return;
+  try {
+    const res = await fetch("/api/auth/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: refresh }),
+    });
+    if (!res.ok) throw new Error(`refresh HTTP ${res.status}`);
+    const body = await res.json();
+    const data = unwrapSuccess(body);
+    if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+    if (data?.access_exp) localStorage.setItem(ACCESS_EXP_KEY, String(data.access_exp));
+  } catch {
+    clearSessionAndRedirect();
+  }
+}
+
+function clearSessionAndRedirect() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+  localStorage.removeItem(ACCESS_EXP_KEY);
+  localStorage.removeItem(USER_KEY);
+  $("app-view").classList.add("hidden");
+  $("auth-view").classList.remove("hidden");
+  $("auth-err").textContent = "登录态已失效,请重新登录";
+  $("auth-err").classList.remove("hidden");
+}
+
+async function api(path, opts = {}) {
+  const { method = "GET", body = null, auth = true } = opts;
+  if (auth) await maybeRefresh();
+  const headers = {};
+  if (body !== null) headers["content-type"] = "application/json";
+  if (auth) {
+    const tok = localStorage.getItem(TOKEN_KEY);
+    if (!tok) { clearSessionAndRedirect(); throw new Error("NOT_AUTHENTICATED"); }
+    headers["authorization"] = `Bearer ${tok}`;
+  }
+  const res = await fetch(path, { method, headers, body: body === null ? null : JSON.stringify(body) });
+  let data = null;
+  if (res.status !== 204) {
+    try { data = await res.json(); } catch { data = null; }
+  }
+  if (!res.ok) {
+    if (auth && res.status === 401) clearSessionAndRedirect();
+    const e = extractError(data, res.status);
+    const err = new Error(e.message);
+    err.code = e.code;
+    err.status = res.status;
+    throw err;
+  }
+  return unwrapSuccess(data);
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Auth (login + register)
+// ═════════════════════════════════════════════════════════════════
+
+let authMode = "login"; // "login" | "register"
+
+function renderAuth() {
+  $("auth-title").textContent = authMode === "login" ? "登录 OpenClaude" : "注册 OpenClaude";
+  $("auth-sub").innerHTML = "";
+  $("auth-sub").appendChild(document.createTextNode(
+    authMode === "login" ? "还没有账号?" : "已有账号?"
+  ));
+  const btn = el("button", { class: "link", onclick: () => { authMode = authMode === "login" ? "register" : "login"; renderAuth(); } },
+    authMode === "login" ? "注册" : "去登录");
+  $("auth-sub").appendChild(btn);
+  $("auth-submit").textContent = authMode === "login" ? "登录" : "注册";
+  $("auth-err").classList.add("hidden");
+  $("auth-pass").autocomplete = authMode === "login" ? "current-password" : "new-password";
+}
+
+async function doAuth() {
+  const email = $("auth-email").value.trim();
+  const password = $("auth-pass").value;
+  const errEl = $("auth-err");
+  errEl.classList.add("hidden");
+  if (!email || !password) { errEl.textContent = "邮箱 / 密码必填"; errEl.classList.remove("hidden"); return; }
+  $("auth-submit").disabled = true;
+  try {
+    if (authMode === "register") {
+      // 04-API §1 注册不返回 token,需验证邮箱;开发模式 email_verified 视配置默认开。
+      await api("/api/auth/register", {
+        method: "POST", auth: false,
+        body: { email, password, turnstile_token: "bypass" },
+      });
+      toast("注册成功,请前往邮箱完成验证后再登录。", "ok");
+      authMode = "login";
+      renderAuth();
+    } else {
+      const data = await api("/api/auth/login", {
+        method: "POST", auth: false,
+        body: { email, password, turnstile_token: "bypass" },
+      });
+      localStorage.setItem(TOKEN_KEY, data.access_token);
+      if (data.refresh_token) localStorage.setItem(REFRESH_KEY, data.refresh_token);
+      if (data.access_exp) localStorage.setItem(ACCESS_EXP_KEY, String(data.access_exp));
+      if (data.user) localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+      await enterApp();
+    }
+  } catch (e) {
+    errEl.textContent = e.message || "请求失败";
+    errEl.classList.remove("hidden");
+  } finally {
+    $("auth-submit").disabled = false;
+  }
+}
+
+async function doLogout() {
+  const refresh = localStorage.getItem(REFRESH_KEY);
+  if (refresh) {
+    try {
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ refresh_token: refresh }),
+      });
+    } catch { /* ignore */ }
+  }
+  clearSessionAndRedirect();
+}
+
+// ═════════════════════════════════════════════════════════════════
+// App shell + tabs
+// ═════════════════════════════════════════════════════════════════
+
+async function enterApp() {
+  $("auth-view").classList.add("hidden");
+  $("app-view").classList.remove("hidden");
+  await refreshMe();
+  switchTab("chat");
+}
+
+async function refreshMe() {
+  try {
+    const r = await api("/api/me");
+    const u = r.user ?? r; // 容错两种 shape
+    $("me-email").textContent = u.email ?? "";
+    $("bal-credits").textContent = u.credits ?? "?";
+    localStorage.setItem(USER_KEY, JSON.stringify(u));
+  } catch (e) {
+    if (e.code !== "NOT_AUTHENTICATED") toast("加载个人资料失败: " + e.message, "err");
+  }
+}
+
+function switchTab(name) {
+  for (const b of document.querySelectorAll(".tabs button")) {
+    b.classList.toggle("on", b.dataset.tab === name);
+  }
+  const body = $("tab-body");
+  body.innerHTML = "";
+  if (name === "chat") renderChat(body);
+  else if (name === "topup") renderTopup(body);
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Tab: chat (WS /ws/chat)
+// ═════════════════════════════════════════════════════════════════
+
+const chatState = {
+  models: [],
+  currentModel: null,
+  messages: [], // { role: "user" | "assistant", content: string }
+  ws: null,
+  streamingEl: null,   // 当前助手气泡 DOM,用于流式 append delta
+  streamingText: "",
+  currentRequestId: null,
+};
+
+async function renderChat(root) {
+  const wrap = el("div", { class: "chat-wrap" });
+  const ctl = el("div", { class: "chat-ctl" });
+  const modelSel = el("select", { id: "chat-model" });
+  ctl.appendChild(el("span", { class: "muted" }, "模型"));
+  ctl.appendChild(modelSel);
+  ctl.appendChild(el("span", { class: "muted", style: "font-size:12px" }, "· 流式计费,发送后实时扣费"));
+  wrap.appendChild(ctl);
+
+  const log = el("div", { class: "chat-log", id: "chat-log" });
+  wrap.appendChild(log);
+
+  const compose = el("div", { class: "compose" });
+  const ta = el("textarea", { id: "chat-input", placeholder: "说点什么…  (Enter 发送 / Shift+Enter 换行)", rows: "2" });
+  const send = el("button", { class: "primary", id: "chat-send" }, "发送");
+  compose.appendChild(ta);
+  compose.appendChild(send);
+  wrap.appendChild(compose);
+  root.appendChild(wrap);
+
+  // 加载模型列表
+  try {
+    const r = await fetch("/api/public/models").then((r) => r.json());
+    const models = unwrapSuccess(r)?.models ?? r.models ?? [];
+    chatState.models = models;
+    if (models.length === 0) {
+      modelSel.appendChild(el("option", { value: "" }, "(无可用模型,请联系管理员)"));
+    } else {
+      for (const m of models) {
+        modelSel.appendChild(el("option", { value: m.id },
+          `${m.display_name} — in ${m.input_per_ktok_credits}/k · out ${m.output_per_ktok_credits}/k`));
+      }
+      chatState.currentModel = models[0].id;
+      modelSel.value = chatState.currentModel;
+    }
+  } catch (e) {
+    modelSel.appendChild(el("option", { value: "" }, "(模型列表加载失败)"));
+    toast("模型列表加载失败: " + e.message, "err");
+  }
+  modelSel.onchange = (e) => { chatState.currentModel = e.target.value; };
+
+  // 回放现存消息
+  for (const m of chatState.messages) log.appendChild(renderBubble(m.role, m.content));
+  scrollLog();
+
+  // Enter 发送
+  ta.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); sendChat(); }
+  });
+  send.onclick = sendChat;
+}
+
+function renderBubble(role, text, meta) {
+  const b = el("div", { class: `msg ${role}` }, [text]);
+  if (meta) {
+    const foot = el("div", { class: "msg-foot muted" });
+    if (meta.usage) foot.appendChild(el("span", {}, `in ${meta.usage.input_tokens} / out ${meta.usage.output_tokens}`));
+    if (meta.debit) foot.appendChild(el("span", {}, `扣费 ${meta.debit.cost_credits} 积分`));
+    b.appendChild(foot);
+  }
+  return b;
+}
+
+function scrollLog() {
+  const log = $("chat-log");
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+function sendChat() {
+  const ta = $("chat-input");
+  const text = ta.value.trim();
+  if (!text) return;
+  if (!chatState.currentModel) { toast("请先选择模型", "err"); return; }
+  if (chatState.ws && chatState.ws.readyState === WebSocket.OPEN) {
+    toast("上一条消息仍在处理中", "err"); return;
+  }
+
+  chatState.messages.push({ role: "user", content: text });
+  const log = $("chat-log");
+  log.appendChild(renderBubble("user", text));
+  ta.value = "";
+  scrollLog();
+
+  // 建 WS
+  const tok = localStorage.getItem(TOKEN_KEY);
+  if (!tok) { clearSessionAndRedirect(); return; }
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${proto}//${location.host}/ws/chat?token=${encodeURIComponent(tok)}`;
+
+  const ws = new WebSocket(url);
+  chatState.ws = ws;
+  chatState.streamingText = "";
+  chatState.streamingEl = renderBubble("assistant", "…");
+  log.appendChild(chatState.streamingEl);
+  scrollLog();
+  chatState.currentRequestId = crypto.randomUUID?.() ?? String(Date.now());
+
+  // 按历史全量发:简版实现,不做截断
+  const msgs = chatState.messages.map((m) => ({
+    role: m.role, content: [{ type: "text", text: m.content }],
+  }));
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      type: "start",
+      model: chatState.currentModel,
+      messages: msgs,
+      max_tokens: 2048,
+      request_id: chatState.currentRequestId,
+    }));
+  };
+  ws.onmessage = (ev) => handleWsFrame(ev.data);
+  ws.onerror = () => {
+    if (chatState.streamingEl) {
+      chatState.streamingEl.textContent = "(WebSocket 异常)";
+      chatState.streamingEl.classList.add("err");
+    }
+  };
+  ws.onclose = () => {
+    chatState.ws = null;
+    if (chatState.streamingEl && chatState.streamingText === "") {
+      chatState.streamingEl.textContent = "(未收到任何内容,连接已关闭)";
+    }
+    chatState.streamingEl = null;
+  };
+}
+
+function handleWsFrame(raw) {
+  let frame;
+  try { frame = JSON.parse(raw); } catch { return; }
+  if (frame.type === "delta") {
+    chatState.streamingText += frame.text || "";
+    if (chatState.streamingEl) chatState.streamingEl.firstChild.data = chatState.streamingText;
+    scrollLog();
+  } else if (frame.type === "usage") {
+    // 把 usage 行挂到气泡脚注
+    if (chatState.streamingEl) {
+      let foot = chatState.streamingEl.querySelector(".msg-foot");
+      if (!foot) {
+        foot = el("div", { class: "msg-foot muted" });
+        chatState.streamingEl.appendChild(foot);
+      }
+      foot.appendChild(el("span", {}, `in ${frame.input_tokens} · out ${frame.output_tokens}`));
+    }
+  } else if (frame.type === "debit") {
+    $("bal-credits").textContent = frame.balance_after;
+    if (chatState.streamingEl) {
+      let foot = chatState.streamingEl.querySelector(".msg-foot");
+      if (!foot) {
+        foot = el("div", { class: "msg-foot muted" });
+        chatState.streamingEl.appendChild(foot);
+      }
+      foot.appendChild(el("span", { class: "ok" }, `-${frame.cost_credits} 积分`));
+    }
+  } else if (frame.type === "done") {
+    // 收尾:把完整文本存入 chatState.messages
+    if (chatState.streamingText) {
+      chatState.messages.push({ role: "assistant", content: chatState.streamingText });
+    }
+    try { chatState.ws?.close(1000); } catch { /* ignore */ }
+  } else if (frame.type === "error") {
+    if (chatState.streamingEl) {
+      chatState.streamingEl.classList.add("err");
+      chatState.streamingEl.firstChild.data = `[${frame.code}] ${frame.message}`;
+    }
+    if (frame.code === "ERR_INSUFFICIENT_CREDITS") {
+      toast("积分不足,请先充值", "err");
+    } else {
+      toast(`${frame.code}: ${frame.message}`, "err");
+    }
+    try { chatState.ws?.close(); } catch { /* ignore */ }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Tab: topup  (/api/payment/*)
+// ═════════════════════════════════════════════════════════════════
+
+const topupState = {
+  plans: [],
+  currentOrder: null,
+  pollTimer: null,
+};
+
+async function renderTopup(root) {
+  const wrap = el("div", { class: "topup-wrap stack" });
+  wrap.appendChild(el("h2", { style: "margin:0" }, "充值"));
+  wrap.appendChild(el("div", { class: "muted" }, "选择一档充值。扫码付款后,订单 15 分钟内自动更新,积分到账即可对话。"));
+
+  const plansDiv = el("div", { class: "plans", id: "plans" });
+  wrap.appendChild(plansDiv);
+
+  const orderSlot = el("div", { id: "order-slot" });
+  wrap.appendChild(orderSlot);
+
+  root.appendChild(wrap);
+
+  try {
+    const data = await api("/api/payment/plans", { auth: false });
+    topupState.plans = data?.plans ?? [];
+    if (topupState.plans.length === 0) {
+      plansDiv.appendChild(el("div", { class: "muted" }, "(暂无可用充值档,请稍后再试)"));
+      return;
+    }
+    for (const p of topupState.plans) {
+      const amountYuan = (Number(p.amount_cents) / 100).toFixed(2);
+      plansDiv.appendChild(el("div", { class: "plan", onclick: () => createOrder(p) }, [
+        el("div", { class: "p-amt" }, `¥${amountYuan}`),
+        el("div", { class: "p-credits" }, `+${p.credits} 积分`),
+        el("div", { class: "p-label" }, p.label || ""),
+      ]));
+    }
+  } catch (e) {
+    plansDiv.appendChild(el("div", { class: "err" }, `加载套餐失败: ${e.message}`));
+  }
+}
+
+async function createOrder(plan) {
+  stopPolling();
+  const slot = $("order-slot");
+  slot.innerHTML = "";
+  slot.appendChild(el("div", { class: "muted" }, "生成订单中…"));
+  try {
+    const data = await api("/api/payment/hupi/create", {
+      method: "POST",
+      body: { plan_code: plan.code },
+    });
+    topupState.currentOrder = data;
+    renderOrderQr(slot, data);
+    startPolling(data.order_no);
+  } catch (e) {
+    slot.innerHTML = "";
+    slot.appendChild(el("div", { class: "err" }, `下单失败: [${e.code || "?"}] ${e.message}`));
+  }
+}
+
+function renderOrderQr(slot, order) {
+  slot.innerHTML = "";
+  const amount = (Number(order.amount_cents) / 100).toFixed(2);
+  const card = el("div", { class: "qr-card" }, [
+    el("div", { style: "font-size:18px;font-weight:600;margin-bottom:8px" },
+      `支付 ¥${amount} → +${order.credits} 积分`),
+    el("img", { src: qrDataUrl(order.qrcode_url), alt: "支付二维码" }),
+    el("div", { class: "qr-meta" }, `订单号: ${order.order_no}`),
+    el("div", { class: "muted", style: "font-size:12px;margin-top:8px" },
+      order.qrcode_url?.startsWith("http") ? "若无法识别,请复制下方链接到手机打开:" : ""),
+    order.qrcode_url?.startsWith("http") ? el("div", { class: "qr-meta" }, order.qrcode_url) : null,
+    el("div", { class: "muted", style: "font-size:12px;margin-top:10px" }, "正在轮询订单状态…"),
+    el("div", { id: "order-status", class: "muted", style: "font-size:12px" }, "pending"),
+  ]);
+  slot.appendChild(card);
+}
+
+/** 外部 qrcode_url 可能直接是 image 也可能是跳转链接。本前端一律走公共二维码渲染服务做展示。 */
+function qrDataUrl(raw) {
+  if (!raw) return "";
+  // 若 qrcode_url 本身就是图片(常见于虎皮椒的 code_img_url),直接用
+  if (/\.(png|jpe?g|gif|svg)(\?|$)/i.test(raw)) return raw;
+  // 否则让浏览器用第三方渲染(保持 T-70 最简,不内置二维码库)
+  return `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(raw)}`;
+}
+
+function startPolling(orderNo) {
+  stopPolling();
+  let tries = 0;
+  const maxTries = 90; // 3min @ 2s
+  topupState.pollTimer = setInterval(async () => {
+    tries++;
+    if (tries > maxTries) { stopPolling(); return; }
+    try {
+      const data = await api(`/api/payment/orders/${encodeURIComponent(orderNo)}`);
+      const status = data?.status || data?.order?.status || "";
+      const st = $("order-status");
+      if (st) st.textContent = status;
+      if (status === "paid") {
+        stopPolling();
+        if (st) { st.textContent = "已到账"; st.className = "ok"; }
+        toast("充值到账!", "ok");
+        await refreshMe();
+      } else if (status === "expired" || status === "canceled" || status === "refunded") {
+        stopPolling();
+        if (st) { st.textContent = `订单 ${status},请重新发起`; st.className = "err"; }
+      }
+    } catch (e) {
+      // 网络错不算失败,继续轮询;但 404 直接停
+      if (e.status === 404) { stopPolling(); return; }
+    }
+  }, 2000);
+}
+
+function stopPolling() {
+  if (topupState.pollTimer) {
+    clearInterval(topupState.pollTimer);
+    topupState.pollTimer = null;
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// 入口
+// ═════════════════════════════════════════════════════════════════
+
+document.addEventListener("DOMContentLoaded", () => {
+  renderAuth();
+  $("auth-switch").onclick = () => { authMode = authMode === "login" ? "register" : "login"; renderAuth(); };
+  $("auth-submit").onclick = doAuth;
+  $("auth-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") doAuth(); });
+  $("logout-btn").onclick = doLogout;
+  for (const b of document.querySelectorAll(".tabs button")) {
+    b.onclick = () => switchTab(b.dataset.tab);
+  }
+  if (localStorage.getItem(TOKEN_KEY)) enterApp();
+});
+</script>
+</body>
+</html>
