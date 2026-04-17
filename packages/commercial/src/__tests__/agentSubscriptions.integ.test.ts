@@ -31,7 +31,9 @@ import {
   markExpiredSubscriptions,
   markContainerStoppedAfterExpiry,
   listVolumeGcCandidates,
+  restoreVolumeGcAfterFailure,
   markContainerRemoved,
+  checkAgentAccess,
   AgentAlreadyActiveError,
   AgentInsufficientCreditsError,
   AgentNotSubscribedError,
@@ -518,5 +520,135 @@ describe("re-subscribe after expiry", () => {
     assert.equal(r.rows[0].volume_gc_at, null);
     assert.equal(r.rows[0].last_error, null);
     assert.equal(r.rows[0].subscription_id, second.subscription_id.toString());
+  });
+});
+
+// ============================================================
+//  checkAgentAccess (T-52 Codex F2)
+// ============================================================
+
+describe("checkAgentAccess", () => {
+  test("用户无订阅 → NO_SUBSCRIPTION", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("acc-none@x.com");
+    const r = await checkAgentAccess(uid);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.equal(r.code, "NO_SUBSCRIPTION");
+  });
+
+  test("订阅 active + 容器 provisioning → ok", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("acc-ok@x.com", 5000n);
+    await openAgentSubscription({ userId: uid, image: IMAGE });
+    const r = await checkAgentAccess(uid);
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal(r.container_status, "provisioning");
+  });
+
+  test("订阅 active + 容器 running → ok", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("acc-running@x.com", 5000n);
+    await openAgentSubscription({ userId: uid, image: IMAGE });
+    await markContainerRunning(uid, "dck-1");
+    const r = await checkAgentAccess(uid);
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal(r.container_status, "running");
+  });
+
+  test("容器 error → CONTAINER_NOT_RUNNABLE", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("acc-err@x.com", 5000n);
+    await openAgentSubscription({ userId: uid, image: IMAGE });
+    await markContainerError(uid, "boom");
+    const r = await checkAgentAccess(uid);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.equal(r.code, "CONTAINER_NOT_RUNNABLE");
+  });
+
+  test("订阅 end_at 过期但 status 仍 active → SUBSCRIPTION_EXPIRED", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("acc-expired@x.com", 5000n);
+    const open = await openAgentSubscription({ userId: uid, image: IMAGE });
+    // 手工把 end_at 拉到过去,status 保留 active(兜底路径)
+    await query(
+      "UPDATE agent_subscriptions SET end_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+      [open.subscription_id.toString()],
+    );
+    const r = await checkAgentAccess(uid);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.equal(r.code, "SUBSCRIPTION_EXPIRED");
+  });
+
+  test("订阅 status=canceled → NO_SUBSCRIPTION(没 active)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("acc-canceled@x.com", 5000n);
+    const open = await openAgentSubscription({ userId: uid, image: IMAGE });
+    await query(
+      "UPDATE agent_subscriptions SET status = 'canceled' WHERE id = $1",
+      [open.subscription_id.toString()],
+    );
+    const r = await checkAgentAccess(uid);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.equal(r.code, "NO_SUBSCRIPTION");
+  });
+});
+
+// ============================================================
+//  listVolumeGcCandidates 并发 + restoreVolumeGcAfterFailure (T-53 Codex P3)
+// ============================================================
+
+describe("listVolumeGcCandidates + restoreVolumeGcAfterFailure", () => {
+  async function seedGcReady(uid: bigint): Promise<void> {
+    await openAgentSubscription({ userId: uid, image: IMAGE });
+    await query(
+      `UPDATE agent_containers
+          SET status = 'stopped',
+              volume_gc_at = NOW() - INTERVAL '1 second'
+        WHERE user_id = $1`,
+      [uid.toString()],
+    );
+  }
+
+  test("认领成功 → volume_gc_at 置 NULL,返回行包含 user_id", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("gc-claim@x.com", 5000n);
+    await seedGcReady(uid);
+    const r = await listVolumeGcCandidates(10);
+    assert.equal(r.length, 1);
+    assert.equal(r[0].user_id, uid);
+    const after = await query<{ gc: Date | null }>(
+      "SELECT volume_gc_at AS gc FROM agent_containers WHERE user_id = $1",
+      [uid.toString()],
+    );
+    assert.equal(after.rows[0].gc, null);
+  });
+
+  test("两次调用 → 第一次认领后,第二次拿不到该行(防 double-GC)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("gc-serial@x.com", 5000n);
+    await seedGcReady(uid);
+    const r1 = await listVolumeGcCandidates(10);
+    assert.equal(r1.length, 1);
+    const r2 = await listVolumeGcCandidates(10);
+    assert.equal(r2.length, 0);
+  });
+
+  test("restoreVolumeGcAfterFailure → volume_gc_at 重回未来时间,下次可重试", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("gc-retry@x.com", 5000n);
+    await seedGcReady(uid);
+    await listVolumeGcCandidates(10); // 认领
+    await restoreVolumeGcAfterFailure(uid, 3600);
+    const after = await query<{ gc: Date | null }>(
+      "SELECT volume_gc_at AS gc FROM agent_containers WHERE user_id = $1",
+      [uid.toString()],
+    );
+    assert.ok(after.rows[0].gc !== null);
+    const diff = after.rows[0].gc!.getTime() - Date.now();
+    // 3600s 预期,允许 ±30s 时钟漂移
+    assert.ok(diff > 3570_000 && diff < 3630_000, `diff=${diff}ms`);
+    // 此时还未到点,listVolumeGcCandidates 扫不到
+    const r = await listVolumeGcCandidates(10);
+    assert.equal(r.length, 0);
   });
 });

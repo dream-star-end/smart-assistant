@@ -388,6 +388,85 @@ export async function getAgentStatus(
 }
 
 // ============================================================
+// 读:WS 连接 / RPC 访问前校验(T-54 Codex Finding F2)
+// ============================================================
+
+/**
+ * 校验用户当前是否有资格连接自己的 agent 容器。
+ *
+ * 判定(全部满足 → ok=true):
+ *   1. 用户有一条 status='active' 且 end_at > NOW() 的订阅
+ *   2. 用户有一行 agent_containers,status ∈ {provisioning, running}
+ *
+ * 其余情况一律拒绝,避免:
+ *   - 取消订阅但容器暂时还在 → 仍可连容器造成审计归属错乱
+ *   - 容器处于 stopped/removed/error 状态 → 连上去也没用
+ *
+ * 失败返回 `{ok:false, code, message}`。code 用于 HTTP/WS 层映射(403/409)。
+ */
+export type AgentAccessDenyCode =
+  | "NO_SUBSCRIPTION"
+  | "SUBSCRIPTION_EXPIRED"
+  | "NO_CONTAINER"
+  | "CONTAINER_NOT_RUNNABLE";
+
+export interface AgentAccessOk {
+  ok: true;
+  subscription_id: string;
+  container_id: string;
+  container_status: AgentContainerStatus;
+  end_at: Date;
+}
+export interface AgentAccessDenied {
+  ok: false;
+  code: AgentAccessDenyCode;
+  message: string;
+}
+
+export async function checkAgentAccess(
+  userId: bigint | number | string,
+): Promise<AgentAccessOk | AgentAccessDenied> {
+  const uidStr = normUid(userId);
+  const subR = await query<{ id: string; end_at: Date }>(
+    `SELECT id::text AS id, end_at
+       FROM agent_subscriptions
+      WHERE user_id = $1 AND status = 'active'
+      LIMIT 1`,
+    [uidStr],
+  );
+  if (subR.rows.length === 0) {
+    return { ok: false, code: "NO_SUBSCRIPTION", message: "user has no active agent subscription" };
+  }
+  if (subR.rows[0].end_at.getTime() <= Date.now()) {
+    // 理论上 lifecycle 会 flip 到 expired;此处是兜底(比如刚过点但 sweep 还没跑)
+    return { ok: false, code: "SUBSCRIPTION_EXPIRED", message: "subscription end_at is in the past" };
+  }
+
+  const conR = await query<{ id: string; status: string }>(
+    "SELECT id::text AS id, status FROM agent_containers WHERE user_id = $1 LIMIT 1",
+    [uidStr],
+  );
+  if (conR.rows.length === 0) {
+    return { ok: false, code: "NO_CONTAINER", message: "no agent container row for user" };
+  }
+  const st = conR.rows[0].status as AgentContainerStatus;
+  if (st !== "provisioning" && st !== "running") {
+    return {
+      ok: false,
+      code: "CONTAINER_NOT_RUNNABLE",
+      message: `container status is ${st}, not connectable`,
+    };
+  }
+  return {
+    ok: true,
+    subscription_id: subR.rows[0].id,
+    container_id: conR.rows[0].id,
+    container_status: st,
+    end_at: subR.rows[0].end_at,
+  };
+}
+
+// ============================================================
 // 写:取消(本期仍有效,auto_renew=false)
 // ============================================================
 
@@ -546,13 +625,20 @@ export interface GcCandidateRow {
 }
 
 /**
- * 取一批 volume_gc_at < NOW() 且 status='stopped' 的容器,准备 GC volume。
+ * 原子"认领"一批 volume_gc_at < NOW() 且 status='stopped' 的容器,准备 GC。
  *
- * 这里 **不** 在同一查询里把 status 改成 removed —— 因为真正的 volume 删除在 docker 层,
- * 若 docker 删除失败我们不应该让 DB 误以为已删。lifecycle 先用本查询拿列表 → 对每条
- * 去 docker removeContainer + removeVolumes → 成功后再调用 `markContainerRemoved`。
+ * 并发安全:走 `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`,
+ * 与 markExpiredSubscriptions 同构。多个 lifecycle tick 并发跑时,每一行只会被一个
+ * tick 认领,不会 double-GC。
  *
- * FOR UPDATE SKIP LOCKED:多个 lifecycle tick 不会抢同一行。
+ * 认领方式:把 `volume_gc_at` 置为 NULL —— 等价于"已被某 tick 拿走处理"。
+ *   - 若 tick 后续 docker removeContainer / removeUserVolumes / markContainerRemoved
+ *     全部成功,则 status 变 removed,本行再也不会出现在候选中。
+ *   - 若 docker 层失败,lifecycle 会 **自动重置** volume_gc_at 回 NOW+gcRetryHours,
+ *     见 lifecycle.ts 的 restoreVolumeGcAfterFailure。
+ *
+ * 为什么不直接在查询里一步 `status='removed'`:volume 是在 docker 层删,若删不掉而
+ * DB 标成 removed,实际 volume 会永久泄漏且 CLI 也看不到(查询只扫 stopped)。
  */
 export async function listVolumeGcCandidates(
   limit = 100,
@@ -565,14 +651,22 @@ export async function listVolumeGcCandidates(
     workspace_volume: string; home_volume: string;
     volume_gc_at: Date;
   }>(
-    `SELECT id::text AS id, user_id::text AS user_id,
-            workspace_volume, home_volume, volume_gc_at
-       FROM agent_containers
-      WHERE status = 'stopped'
-        AND volume_gc_at IS NOT NULL
-        AND volume_gc_at < NOW()
-      ORDER BY volume_gc_at ASC
-      LIMIT $1`,
+    `UPDATE agent_containers
+        SET volume_gc_at = NULL, updated_at = NOW()
+      WHERE id IN (
+        SELECT id FROM agent_containers
+         WHERE status = 'stopped'
+           AND volume_gc_at IS NOT NULL
+           AND volume_gc_at < NOW()
+         ORDER BY volume_gc_at ASC
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+      )
+    RETURNING id::text       AS id,
+              user_id::text  AS user_id,
+              workspace_volume,
+              home_volume,
+              (updated_at - INTERVAL '0 second') AS volume_gc_at`,
     [limit],
   );
   return r.rows.map((row) => ({
@@ -582,6 +676,27 @@ export async function listVolumeGcCandidates(
     home_volume: row.home_volume,
     volume_gc_at: row.volume_gc_at,
   }));
+}
+
+/**
+ * docker GC 失败时,把 volume_gc_at 恢复到一个将来的点,等下一轮再试。
+ * 如果不做这件事,行就永远停在 `volume_gc_at IS NULL`(已认领)状态,被遗忘。
+ */
+export async function restoreVolumeGcAfterFailure(
+  userId: bigint | number | string,
+  retryAfterSeconds: number,
+): Promise<void> {
+  const uidStr = normUid(userId);
+  if (!Number.isInteger(retryAfterSeconds) || retryAfterSeconds <= 0) {
+    throw new TypeError(`retryAfterSeconds must be > 0, got ${retryAfterSeconds}`);
+  }
+  await query(
+    `UPDATE agent_containers
+        SET volume_gc_at = NOW() + ($2::int || ' seconds')::interval,
+            updated_at = NOW()
+      WHERE user_id = $1 AND status = 'stopped' AND volume_gc_at IS NULL`,
+    [uidStr, retryAfterSeconds],
+  );
 }
 
 /** GC 成功后把 status=removed 固化。 */

@@ -70,12 +70,25 @@ export interface AgentWsLogger {
   error(msg: string, extra?: Record<string, unknown>): void;
 }
 
+/**
+ * T-52 连接前 DB 校验 hook。
+ * 返 `{ok:true}` 放行;返 `{ok:false, code, message}` → WS 立刻发 error 帧并 close(1008),
+ * 不建容器 socket。产线接 `checkAgentAccess`(订阅 + 容器双校验);测试下可省略。
+ */
+export interface AgentWsPreCheckResult {
+  ok: boolean;
+  code?: string;
+  message?: string;
+}
+
 export interface AgentWsDeps {
   jwtSecret: string | Uint8Array;
   /** 产线注入真正的 pg Pool;unit 测试下可用 writeAudit 拦截,pool 可给 undefined。 */
   pool?: Pool;
   /** uid → host 上的 agent.sock 完整路径。产线:`path.join(config.RPC_SOCKET_DIR, 'u'+uid, 'agent.sock')`。 */
   resolveSocketPath: (uid: bigint | number) => string;
+  /** 可选:连接前的 DB 校验(订阅 + 容器存在性)。产线必传;测试可省 → 直接放行。 */
+  preCheck?: (uid: bigint | number) => Promise<AgentWsPreCheckResult>;
   /** 可选:覆盖 audit 写入。默认走 pool + writeAgentAudit。 */
   writeAudit?: (row: AgentAuditRow) => Promise<void>;
   /** 可选:最大并发 per user(默认 1)。 */
@@ -216,14 +229,36 @@ export function createAgentWsHandler(deps: AgentWsDeps): AgentWsHandler {
       ws.on("message", earlyMessage);
       ws.on("close", earlyClose);
 
-      authFromQuery(url).then((r) => {
-        ws.off("message", earlyMessage);
-        ws.off("close", earlyClose);
+      (async () => {
+        const r = await authFromQuery(url);
         if ("error" in r) {
           sendJson(ws, { type: "error", code: "UNAUTHORIZED", message: r.error });
           try { ws.close(CLOSE_POLICY, "unauthorized"); } catch { /* */ }
           return;
         }
+        // T-52 Codex F2:鉴权成功后,DB 校验订阅 + 容器存在。
+        // 未传 preCheck 视为放行(单测场景)。
+        if (deps.preCheck) {
+          try {
+            const check = await deps.preCheck(uidFromClaims(r));
+            if (!check.ok) {
+              const code = check.code ?? "ERR_AGENT_FORBIDDEN";
+              sendJson(ws, { type: "error", code, message: check.message ?? "forbidden" });
+              try { ws.close(CLOSE_POLICY, "forbidden"); } catch { /* */ }
+              return;
+            }
+          } catch (err) {
+            log.error("ws agent: preCheck threw", { err: String(err) });
+            sendJson(ws, { type: "error", code: "ERR_INTERNAL", message: "pre-check failed" });
+            try { ws.close(CLOSE_INTERNAL, "precheck error"); } catch { /* */ }
+            return;
+          }
+        }
+        return r;
+      })().then((r) => {
+        ws.off("message", earlyMessage);
+        ws.off("close", earlyClose);
+        if (!r) return; // 失败路径已自己 close
         if (closedEarly !== null) return;
         onConnection(ws, r);
         for (const m of pendingMessages) ws.emit("message", m.data, m.isBinary);
@@ -237,6 +272,15 @@ export function createAgentWsHandler(deps: AgentWsDeps): AgentWsHandler {
     });
 
     return true;
+  }
+
+  /** 把 jwt claims.sub 转成 resolveSocketPath / preCheck 能接受的数值 uid。 */
+  function uidFromClaims(claims: AccessClaims): bigint {
+    // claims.sub 是字符串;signAccess 里强制数字,但防御性再检一遍
+    if (!/^[1-9][0-9]{0,19}$/.test(claims.sub)) {
+      throw new TypeError(`bad uid in claims.sub: ${claims.sub}`);
+    }
+    return BigInt(claims.sub);
   }
 
   function onConnection(ws: WebSocket, claims: AccessClaims): void {

@@ -11,7 +11,9 @@ export {
   markExpiredSubscriptions,
   markContainerStoppedAfterExpiry,
   listVolumeGcCandidates,
+  restoreVolumeGcAfterFailure,
   markContainerRemoved,
+  checkAgentAccess,
   AgentInsufficientCreditsError,
   AgentAlreadyActiveError,
   AgentNotSubscribedError,
@@ -30,6 +32,9 @@ export type {
   CancelAgentSubscriptionResult,
   ExpiredSubscriptionRow,
   GcCandidateRow,
+  AgentAccessDenyCode,
+  AgentAccessOk,
+  AgentAccessDenied,
 } from "./subscriptions.js";
 
 export {

@@ -173,7 +173,10 @@ export async function handleAgentStatus(
   const user = await requireAuth(req, deps.jwtSecret);
   // agent_runtime 未配置也允许查状态 —— 前端要能显示"未订阅"态。
   const view = await getAgentStatus(user.id);
+  // `runtime_ready`:前端据此区分"用户没订阅"(ready=true + sub=null)vs
+  // "系统没开 agent"(ready=false)。否则空数据前端根本无法提示。
   sendJson(res, 200, {
+    runtime_ready: Boolean(deps.agentRuntime),
     subscription: view.subscription
       ? {
           id: view.subscription.id,

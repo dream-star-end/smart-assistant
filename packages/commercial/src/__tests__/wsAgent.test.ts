@@ -86,7 +86,11 @@ interface Fixture {
   resetSocketMap: () => void;
 }
 
-async function startGateway(opts: { maxPerUser?: number } = {}): Promise<Fixture> {
+async function startGateway(opts: {
+  maxPerUser?: number;
+  preCheck?: (uid: bigint | number) => Promise<{ ok: boolean; code?: string; message?: string }>;
+  onResolveSocket?: (uid: bigint | number) => void;
+} = {}): Promise<Fixture> {
   const auditCalls: AgentAuditRow[] = [];
   const sockMap = new Map<string, string>();
   const setSocketPath = (uid: bigint | number, p: string) => sockMap.set(String(uid), p);
@@ -95,10 +99,12 @@ async function startGateway(opts: { maxPerUser?: number } = {}): Promise<Fixture
   const handler = createAgentWsHandler({
     jwtSecret: JWT_SECRET,
     resolveSocketPath: (uid) => {
+      opts.onResolveSocket?.(uid);
       const p = sockMap.get(String(uid));
       if (!p) return join(tmpdir(), "nonexistent-socket-for-user-" + uid); // ENOENT path
       return p;
     },
+    preCheck: opts.preCheck,
     writeAudit: async (row) => { auditCalls.push(row); },
     maxPerUser: opts.maxPerUser ?? 1,
   });
@@ -450,5 +456,95 @@ describe("ws agent handler", () => {
 
     c2.ws.close();
     await waitClose(c2.ws).catch(() => { /* */ });
+  });
+
+  test("preCheck deny: error frame + close(1008); resolveSocketPath never called", async () => {
+    let resolveCalled = 0;
+    fixture = await startGateway({
+      preCheck: async (_uid) => ({
+        ok: false,
+        code: "SUBSCRIPTION_EXPIRED",
+        message: "subscription expired",
+      }),
+      onResolveSocket: () => { resolveCalled++; },
+    });
+
+    const token = await issueToken("42");
+    const { ws, recvJson } = await wsOpen(`${fixture.baseUrl}/ws/agent?token=${encodeURIComponent(token)}`);
+    const frame = await recvJson();
+    assert.equal(frame.type, "error");
+    assert.equal(frame.code, "SUBSCRIPTION_EXPIRED");
+    assert.equal(frame.message, "subscription expired");
+    const { code } = await waitClose(ws);
+    assert.equal(code, 1008);
+    // 关键:preCheck 拒绝时不应建容器 socket
+    assert.equal(resolveCalled, 0, "resolveSocketPath must not be invoked after preCheck denied");
+  });
+
+  test("preCheck deny with default code: ERR_AGENT_FORBIDDEN + close(1008)", async () => {
+    fixture = await startGateway({
+      preCheck: async (_uid) => ({ ok: false }), // 不给 code/message → 走默认
+    });
+
+    const token = await issueToken("42");
+    const { ws, recvJson } = await wsOpen(`${fixture.baseUrl}/ws/agent?token=${encodeURIComponent(token)}`);
+    const frame = await recvJson();
+    assert.equal(frame.type, "error");
+    assert.equal(frame.code, "ERR_AGENT_FORBIDDEN");
+    const { code } = await waitClose(ws);
+    assert.equal(code, 1008);
+  });
+
+  test("preCheck allow: normal open frame + container pipe continues", async () => {
+    const preCheckCalls: Array<bigint | number> = [];
+    fixture = await startGateway({
+      preCheck: async (uid) => {
+        preCheckCalls.push(uid);
+        return { ok: true };
+      },
+    });
+    const fake = await startFakeAgent(rootDir, "-precheck-ok");
+    fakeServers.push(fake);
+    fixture.setSocketPath(77, fake.socketPath);
+
+    const token = await issueToken("77");
+    const { ws, recvJson } = await wsOpen(`${fixture.baseUrl}/ws/agent?token=${encodeURIComponent(token)}`);
+    const openFrame = await recvJson();
+    assert.equal(openFrame.type, "open");
+    // preCheck 收到 bigint(77)
+    assert.equal(preCheckCalls.length, 1);
+    assert.equal(preCheckCalls[0], 77n);
+
+    ws.close();
+    await waitClose(ws).catch(() => { /* */ });
+  });
+
+  test("preCheck throws: ERR_INTERNAL + close(1011)", async () => {
+    fixture = await startGateway({
+      preCheck: async (_uid) => { throw new Error("db down"); },
+    });
+
+    const token = await issueToken("42");
+    const { ws, recvJson } = await wsOpen(`${fixture.baseUrl}/ws/agent?token=${encodeURIComponent(token)}`);
+    const frame = await recvJson();
+    assert.equal(frame.type, "error");
+    assert.equal(frame.code, "ERR_INTERNAL");
+    const { code } = await waitClose(ws);
+    assert.equal(code, 1011);
+  });
+
+  test("preCheck happens AFTER jwt auth: bad token still hits UNAUTHORIZED, not preCheck", async () => {
+    let preCheckCalls = 0;
+    fixture = await startGateway({
+      preCheck: async (_uid) => { preCheckCalls++; return { ok: true }; },
+    });
+
+    const { ws, recvJson } = await wsOpen(`${fixture.baseUrl}/ws/agent?token=garbage`);
+    const frame = await recvJson();
+    assert.equal(frame.type, "error");
+    assert.equal(frame.code, "UNAUTHORIZED");
+    const { code } = await waitClose(ws);
+    assert.equal(code, 1008);
+    assert.equal(preCheckCalls, 0, "preCheck must run only after successful auth");
   });
 });

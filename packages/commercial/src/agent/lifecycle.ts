@@ -31,6 +31,7 @@ import {
   markExpiredSubscriptions,
   markContainerStoppedAfterExpiry,
   listVolumeGcCandidates,
+  restoreVolumeGcAfterFailure,
   markContainerRemoved,
   DEFAULT_AGENT_VOLUME_GC_DAYS,
   type ExpiredSubscriptionRow,
@@ -158,6 +159,8 @@ export interface LifecycleTickOptions {
   expireBatchSize?: number;
   /** 单次 tick 最多扫多少条 GC 候选,默认 100 */
   gcBatchSize?: number;
+  /** GC 失败后 volume_gc_at 重新排入多少秒后重试,默认 3600(1h) */
+  gcRetrySeconds?: number;
   logger?: LifecycleLogger;
 }
 
@@ -183,6 +186,7 @@ export async function runLifecycleTick(
   const gcDays = opts.volumeGcDays ?? DEFAULT_AGENT_VOLUME_GC_DAYS;
   const expireBatch = opts.expireBatchSize ?? 100;
   const gcBatch = opts.gcBatchSize ?? 100;
+  const gcRetrySeconds = opts.gcRetrySeconds ?? 3600;
 
   const result: LifecycleTickResult = {
     expired: 0,
@@ -256,8 +260,18 @@ export async function runLifecycleTick(
         uid,
         error: (err as Error).message,
       });
-      // 不置 removed —— 下次 tick 再试。agent_containers 保留 stopped 状态直到
-      // docker 层真正清干净。
+      // 恢复 volume_gc_at 以便下一轮重试 —— listVolumeGcCandidates 是"认领式"查询,
+      // 本行的 volume_gc_at 已被置 NULL;若不 restore 会永久停在 claimed 状态,
+      // 被 GC 流程遗忘,volume 永远不会被清。
+      try {
+        await restoreVolumeGcAfterFailure(row.user_id, gcRetrySeconds);
+      } catch (restoreErr) {
+        // 连 restore 都失败:无能为力,打日志以便人工介入
+        logger.error("[agent/lifecycle] restore volume_gc_at failed", {
+          uid,
+          error: (restoreErr as Error).message,
+        });
+      }
     }
   }
 
@@ -298,6 +312,8 @@ export interface StartLifecycleSchedulerOptions extends LifecycleTickOptions {
   intervalMs?: number;
   /** 启动时是否立刻跑一次。默认 false —— gateway 启动完再跑更稳妥 */
   runOnStart?: boolean;
+  /** 每次 tick 完成时的回调(metrics/observability 接入点,T-62 用) */
+  onTick?: (r: LifecycleTickResult) => void;
 }
 
 export function startLifecycleScheduler(
@@ -312,9 +328,25 @@ export function startLifecycleScheduler(
 
   async function tickLoop(): Promise<void> {
     if (stopped) return;
+    const startedAt = Date.now();
     try {
       inflight = runLifecycleTick(docker, opts);
-      await inflight;
+      const r = await inflight;
+      // 总结日志:T-62 metrics 上线前,日志就是唯一观测口。
+      // 有任何一项 errors>0 或实际处理了行 → info;全零 → debug(通过 info 也行,
+      // 数量少,可读性优先)
+      logger.info("[agent/lifecycle] tick done", {
+        expired: r.expired,
+        expire_errors: r.expire_errors,
+        gc: r.gc,
+        gc_errors: r.gc_errors,
+        duration_ms: Date.now() - startedAt,
+      });
+      if (opts.onTick) {
+        try { opts.onTick(r); } catch (cbErr) {
+          logger.warn("[agent/lifecycle] onTick callback threw", { error: (cbErr as Error).message });
+        }
+      }
     } catch (err) {
       // runLifecycleTick 不应该 throw(内部已吞),但万一:
       logger.error("[agent/lifecycle] tick threw", { error: (err as Error).message });

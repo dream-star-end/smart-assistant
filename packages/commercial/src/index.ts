@@ -13,10 +13,11 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
-import { closePool } from "./db/index.js";
+import { closePool, getPool } from "./db/index.js";
 import { loadConfig } from "./config.js";
 import { stubMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
@@ -28,9 +29,11 @@ import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } fr
 import { AccountScheduler } from "./account-pool/scheduler.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
 import { createChatWsHandler, type ChatWsHandler } from "./ws/chat.js";
+import { createAgentWsHandler, type AgentWsHandler } from "./ws/agent.js";
 import { createChatLLMFromRunChat } from "./http/chat.js";
 import {
   startLifecycleScheduler,
+  checkAgentAccess,
   type LifecycleScheduler,
   type LifecycleLogger,
 } from "./agent/index.js";
@@ -180,12 +183,14 @@ export async function registerCommercial(
   // 任一必要字段缺失 → agentRuntime 置 undefined;/api/agent/open 返 503,/status 仍然可读。
   let agentRuntime: AgentHttpDeps | undefined;
   let lifecycleScheduler: LifecycleScheduler | undefined;
-  const agentReady =
-    !!cfg.AGENT_IMAGE &&
-    !!cfg.AGENT_NETWORK &&
-    !!cfg.AGENT_PROXY_URL &&
-    !!cfg.AGENT_SECCOMP_PATH &&
-    !!cfg.AGENT_RPC_SOCKET_DIR;
+  const agentEnvStatus: Record<string, boolean> = {
+    AGENT_IMAGE: !!cfg.AGENT_IMAGE,
+    AGENT_NETWORK: !!cfg.AGENT_NETWORK,
+    AGENT_PROXY_URL: !!cfg.AGENT_PROXY_URL,
+    AGENT_SECCOMP_PATH: !!cfg.AGENT_SECCOMP_PATH,
+    AGENT_RPC_SOCKET_DIR: !!cfg.AGENT_RPC_SOCKET_DIR,
+  };
+  const agentReady = Object.values(agentEnvStatus).every(Boolean);
   if (agentReady) {
     try {
       // Docker:走默认 socketPath 或 AGENT_DOCKER_SOCKET 覆盖
@@ -252,8 +257,13 @@ export async function registerCommercial(
       lifecycleScheduler = undefined;
     }
   } else {
+    const missing = Object.entries(agentEnvStatus)
+      .filter(([, v]) => !v)
+      .map(([k]) => k);
     // eslint-disable-next-line no-console
-    console.log("[commercial] agent runtime not configured (AGENT_IMAGE/NETWORK/PROXY_URL/SECCOMP_PATH/RPC_SOCKET_DIR required)");
+    console.log(
+      `[commercial] agent runtime disabled; missing env: ${missing.join(", ")}`,
+    );
   }
 
   // T-40/T-41 共用的编排依赖:scheduler + health。ws/chat 与 http/chat 走同一套,
@@ -292,11 +302,34 @@ export async function registerCommercial(
     chatDeps,
   });
 
+  // T-52 /ws/agent:仅在 agent runtime 就绪时启用。
+  // 校验:token 合法 + checkAgentAccess 返 ok(active 订阅 + container 可连接)。
+  let agentWsHandler: AgentWsHandler | undefined;
+  if (agentRuntime) {
+    const rpcDir = cfg.AGENT_RPC_SOCKET_DIR!;
+    agentWsHandler = createAgentWsHandler({
+      jwtSecret,
+      pool: getPool(),
+      resolveSocketPath: (uid) =>
+        path.join(rpcDir, `u${uid.toString()}`, "agent.sock"),
+      // 连接前 DB 校验:订阅 + 容器。失败 → 发 error 帧 + close,不建 socket。
+      preCheck: async (uid) => await checkAgentAccess(uid as bigint | number),
+    });
+  }
+
   return {
     handle: handler,
-    handleWsUpgrade: (req, socket, head) => wsHandler.handleUpgrade(req, socket, head),
+    handleWsUpgrade: (req, socket, head) => {
+      // 先试 /ws/chat;返 false 表示不是该路径,再试 /ws/agent;都 false → gateway 自处理
+      if (wsHandler.handleUpgrade(req, socket, head)) return true;
+      if (agentWsHandler && agentWsHandler.handleUpgrade(req, socket, head)) return true;
+      return false;
+    },
     shutdown: async () => {
       try { await wsHandler.shutdown(); } catch { /* ignore */ }
+      if (agentWsHandler) {
+        try { await agentWsHandler.shutdown(); } catch { /* ignore */ }
+      }
       if (lifecycleScheduler) {
         try { await lifecycleScheduler.stop(); } catch { /* ignore */ }
       }
