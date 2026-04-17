@@ -189,12 +189,21 @@
   - 解密后把中间 Buffer `.fill(0)`
 
 **Acceptance**:
-- [ ] 单元:roundtrip encrypt → decrypt 得回原文
-- [ ] 单元:篡改 ciphertext 1 byte → decrypt 抛 `ERR_OSSL_EVP_BAD_DECRYPT` / auth tag mismatch
-- [ ] 单元:nonce 唯一性(连续 1000 次生成无重复)
-- [ ] 单元:错误 env(无 key / 长度不对)→ 抛
+- [x] 单元:roundtrip encrypt → decrypt 得回原文(含 AAD 场景)
+- [x] 单元:篡改 ciphertext 1 byte / truncate tag / 换 nonce / 换 key / 错 AAD → decrypt 抛 AeadError
+- [x] 单元:nonce 唯一性(连续 1000 次生成无重复)
+- [x] 单元:错误 env(无 key / 空 / base64 长度不对 16/48)→ 抛 KmsKeyError,消息不回显原 secret
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- `src/crypto/keys.ts`:`loadKmsKey(env)` 从 `OPENCLAUDE_KMS_KEY` base64 解码,严格校验 32 字节;`KmsKeyError` 不回显原始 env 值;`zeroBuffer(b)` 原地清零
+- `src/crypto/aead.ts`:`encrypt(plaintext, key, aad?)` / `decrypt(ct, nonce, key, aad?)`,AES-256-GCM,nonce=12B,tag=16B 拼接在 ciphertext 末尾
+  * decrypt tag/AAD 不匹配抛 `AeadError`,原始错误仅作为 cause,message 不暴露 OSSL 细节
+  * decrypt 内部明文 Buffer 在 toString 后 fill(0) 清零
+  * 不提供"确定性 nonce"接口(GCM 下 nonce 重用会彻底破坏 IND-CPA)
+- 测试 18 个 crypto 用例(crypto.test.ts):key 加载四种失败路径、roundtrip、篡改/nonce/key/AAD/truncation 五类 detect、nonce 1000 次唯一性、ciphertext 不泄漏明文长度模式
+- 测试汇总:unit 42/42 全绿;typecheck 干净
 
 ---
 
