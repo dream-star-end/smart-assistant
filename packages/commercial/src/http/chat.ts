@@ -42,6 +42,10 @@ import {
 } from "../chat/debit.js";
 import { runClaudeChat, type RunChatDeps } from "../chat/orchestrator.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
+import {
+  incrBillingDebit,
+  incrClaudeApi,
+} from "../admin/metrics.js";
 
 export interface ChatBody {
   model: string;
@@ -293,6 +297,9 @@ export async function handleChat(
       messages: body.messages,
     });
 
+    // T-62 metrics:无论 success/error 都埋一次 claude_api_requests_total
+    incrClaudeApi(llmResp.accountId ?? null, llmResp.status === "error" ? "error" : "success");
+
     if (llmResp.status === "error") {
       // 不扣费:只写 usage_records(审计)。共用 recordChatError 保证和 WS 结构一致
       await recordChatError({
@@ -335,7 +342,11 @@ export async function handleChat(
           cost,
         }),
       );
+      // T-62 metrics:扣费成功
+      incrBillingDebit("success");
     } catch (err) {
+      // T-62 metrics:insufficient 单独归档(运营常看),其他归 error
+      incrBillingDebit(err instanceof InsufficientCreditsAfterPreCheckError ? "insufficient" : "error");
       // LLM 已消耗但本地结算失败 —— 审计链断点。补一条 billing_failed 的 usage_records,
       // 让 reconcile 脚本能发现"上游已扣但本地没扣"的异常。
       //

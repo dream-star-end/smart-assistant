@@ -38,6 +38,7 @@ import {
   type LifecycleLogger,
 } from "./agent/index.js";
 import type { AgentHttpDeps } from "./http/agent.js";
+import { startAlertScheduler, type AlertScheduler } from "./admin/alerts.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -317,6 +318,15 @@ export async function registerCommercial(
     });
   }
 
+  // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
+  let alertScheduler: AlertScheduler | undefined;
+  if (process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
+    alertScheduler = startAlertScheduler({
+      intervalMs: Number(process.env.COMMERCIAL_ALERT_TICK_MS ?? 60_000),
+      runOnStart: false,
+    });
+  }
+
   return {
     handle: handler,
     handleWsUpgrade: (req, socket, head) => {
@@ -332,6 +342,9 @@ export async function registerCommercial(
       }
       if (lifecycleScheduler) {
         try { await lifecycleScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (alertScheduler) {
+        try { await alertScheduler.stop(); } catch { /* ignore */ }
       }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
@@ -593,3 +606,27 @@ export type {
   StartLifecycleSchedulerOptions,
 } from "./agent/index.js";
 export type { AgentHttpDeps } from "./http/agent.js";
+// T-62 metrics + alerts
+export {
+  renderPrometheus,
+  incrGatewayRequest,
+  incrBillingDebit,
+  incrClaudeApi,
+  resetMetricsForTest,
+  normalizeRoute,
+  snapshotForAlerts,
+} from "./admin/metrics.js";
+export {
+  startAlertScheduler,
+  createTelegramSender,
+  defaultRules,
+  ruleAccountPoolAllDown,
+  ruleNoAccountsConfigured,
+} from "./admin/alerts.js";
+export type {
+  AlertScheduler,
+  AlertSchedulerOptions,
+  AlertRule,
+  AlertSender,
+  Snapshot,
+} from "./admin/alerts.js";

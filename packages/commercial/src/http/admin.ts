@@ -69,6 +69,7 @@ import {
 } from "../admin/ledger.js";
 import { AccountNotFoundError, type AccountRow } from "../account-pool/store.js";
 import { adminAdjust, InsufficientCreditsError } from "../billing/ledger.js";
+import { renderPrometheus } from "../admin/metrics.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
 
 // ─── shared helpers ──────────────────────────────────────────────────
@@ -864,4 +865,27 @@ export async function handleAdminListLedger(
       next_before: r.next_before,
     });
   } catch (err) { translateRangeError(err); }
+}
+
+// ─── metrics(T-62)──────────────────────────────────────────────────
+
+/**
+ * GET /api/admin/metrics → Prometheus text exposition。
+ *
+ * 仍走 requireAdmin:按 02-ARCH §7.2 "超管后台拉取展示",不希望无 auth 暴露
+ * 账号池健康分(能间接反推哪些 account 可用,对外是信息泄露)。
+ * Prometheus scraper 侧用 bearer_token 配置携带超管 JWT 即可。
+ */
+export async function handleAdminMetrics(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const body = await renderPrometheus();
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.end(body);
 }

@@ -69,7 +69,9 @@ import {
   handleAdminListAgentContainers,
   handleAdminAgentContainerAction,
   handleAdminListLedger,
+  handleAdminMetrics,
 } from "./admin.js";
+import { incrGatewayRequest } from "../admin/metrics.js";
 
 export type CommercialHandler = (
   req: IncomingMessage,
@@ -146,6 +148,8 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     { method: "POST", pathPrefix: "/api/admin/agent-containers/", handler: handleAdminAgentContainerAction },
     // T-60 超管积分流水
     { method: "GET", path: "/api/admin/ledger", handler: handleAdminListLedger },
+    // T-62 Prometheus 指标
+    { method: "GET", path: "/api/admin/metrics", handler: handleAdminMetrics },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [
@@ -200,6 +204,11 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     } catch (err) {
       handleError(err, res, requestId);
     }
+    // T-62 metrics:按"声明的 path/pathPrefix"折叠 route label(跟踪 spec'd 端点;
+    //   未命中 route 走 normalizeRoute(path) 兜底,它对未知路径原样返回)。
+    //   status 直接拿响应对象实际写出的码,对齐真实 401/403/402/5xx。
+    const labelRoute = route?.path ?? route?.pathPrefix ?? path;
+    incrGatewayRequest(labelRoute, method, res.statusCode);
     return true;
   };
 }
