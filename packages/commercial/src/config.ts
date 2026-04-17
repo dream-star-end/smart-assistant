@@ -49,10 +49,23 @@ const enabledFlag = z
   .optional()
   .transform((v) => v === "1");
 
+/**
+ * Turnstile secret(Cloudflare 的 server-side key)。
+ * - 生产:必填,真实 secret
+ * - 测试/开发:`TURNSTILE_TEST_BYPASS=1` 时允许该字段为空,跳过远程校验
+ *
+ * 这里只校验"如果给了,必须非空 trim 后";具体 bypass 逻辑由 turnstile 模块判断。
+ */
+const turnstileSecret = z.string().trim().min(1).optional();
+
+const turnstileBypass = z.enum(["0", "1"]).optional().transform((v) => v === "1");
+
 export const commercialConfigSchema = z.object({
   DATABASE_URL: databaseUrl,
   REDIS_URL: redisUrl,
   COMMERCIAL_ENABLED: enabledFlag,
+  TURNSTILE_SECRET: turnstileSecret,
+  TURNSTILE_TEST_BYPASS: turnstileBypass,
 });
 
 export type CommercialConfig = z.infer<typeof commercialConfigSchema>;

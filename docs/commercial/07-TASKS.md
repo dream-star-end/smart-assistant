@@ -277,22 +277,29 @@
 **文档**: 04-API §1, 05-SEC §1/§7/§15
 
 **内容**:
-- [ ] `src/auth/register.ts`:`register({email,password,turnstileToken})`
-  - 入参 zod 校验
-  - Turnstile 远程校验(测试用 dummy key 跳过)
-  - email unique 检查
-  - argon2 hash
-  - INSERT users
-  - 生成 email verification token → INSERT email_verifications
-  - 发邮件(接口:`sendMail(to, subject, body)`,MVP 先 stub 打 log)
-- [ ] `src/auth/middleware.ts` 暂不挂路由,先纯函数
+- [x] `src/auth/register.ts`:`register({email,password,turnstile_token}, deps)`
+  - 入参 zod 校验(email RFC 简化 + 长度上限 254;password 8-72)
+  - Turnstile 远程校验(`turnstileBypass=true` 测试跳过)
+  - email unique:DB 唯一索引 + 23505 → CONFLICT
+  - argon2id hash(复用 T-10)
+  - 事务内 INSERT users + email_verifications(purpose=verify_email, 24h TTL)
+  - mailer.send(接口 `Mailer.send`,MVP `stubMailer` 打 stdout)
+  - mail 失败不回滚 user,返回 `verify_email_sent=false`
+- [x] `src/auth/turnstile.ts`:`verifyTurnstile(token, secret, opts)` + `TurnstileError`
+- [x] `src/auth/mail.ts`:`Mailer` 接口 + `stubMailer`
+- [x] `src/config.ts`:扩 `TURNSTILE_SECRET` + `TURNSTILE_TEST_BYPASS`
+- (路由挂载延后到 T-14+,本 task 只要纯函数)
 
 **Acceptance**:
-- [ ] 集成:正常注册 → users 有一条 + email_verifications 有一条 + log 显示邮件发出
-- [ ] 集成:重复 email → 抛 CONFLICT
-- [ ] 集成:弱密码(< 8)→ VALIDATION
+- [x] 集成:正常注册 → users + email_verifications 各一行,mailer 收到含 verify URL 的邮件
+- [x] 集成:重复 email → RegisterError code=CONFLICT,无第二行 user
+- [x] 集成:弱密码(<8)→ RegisterError code=VALIDATION,无 DB 写入
 
-**Status**: `[ ] todo`
+**实施记录**:
+- 测试覆盖:turnstile 单测 8 / mail 单测 1 / register integ 8(含 email 归一化、turnstile 失败、mailer 失败非致命)
+- 测试汇总:unit 78/78 + integ 33/33 全绿;typecheck 干净
+
+**Status**: `[x] done`
 
 ---
 
