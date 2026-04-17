@@ -70,6 +70,99 @@ export interface DebitChatSuccessResult {
 }
 
 /**
+ * 把 chat mode 映射成 credit_ledger.reason:
+ *   mode='chat' → reason='chat'
+ *   mode='agent' → reason='agent_chat'
+ *
+ * 背景:credit_ledger.reason 的 CHECK 是 ('topup','chat','agent_chat',...),没有 'agent';
+ * 0009 的 `uniq_cl_request_chat` 索引 WHERE 也只认 `reason IN ('chat','agent_chat')`。
+ * 如果直接写 input.mode,agent 分支既撞 CHECK 也逃出索引覆盖。
+ */
+function ledgerReasonOf(mode: "chat" | "agent"): "chat" | "agent_chat" {
+  return mode === "agent" ? "agent_chat" : "chat";
+}
+
+/**
+ * 请求级幂等前置检查 —— 在调用 LLM 之前先看 `(user_id, request_id)` 是否已存在 usage_records:
+ *   - 命中 `status='success'` 且 ledger_id 非空 → 返回 `replay-success` + 原始 credit_ledger.balance_after
+ *     (而非当前 users.credits —— admin_adjust 可能改变余额,幂等返回要稳定重放)
+ *   - 命中其它 status(error / billing_failed)→ 返回 `replay-exhausted` + previousStatus,
+ *     调用方据此映射 409 ERR_REQUEST_ID_EXHAUSTED,**不**再调 LLM(避免浪费上游 token)
+ *   - 无记录 → `fresh`,按正常流程走
+ *
+ * 为什么前移到 LLM 前:
+ *   - Codex Phase 4 Finding:只做"扣费幂等"时,重放请求仍会打上游;若第二次 LLM 失败会直接 502,
+ *     和第一次的成功结果不一致。前移到 LLM 前实现"请求级幂等"。
+ *   - text 字段不持久化,replay 返回 text="" —— 这是有意妥协:前端通常本地已有结果,
+ *     replay 主要用来确认扣费状态;持久化响应体会膨胀 usage_records 且涉及 PII。
+ *
+ * 注意:此函数不在事务内,和 debit 之间存在 race 窗口(两个并发请求同 request_id)。
+ * `debitChatSuccess` 内的 existing 检查 + INSERT 的 UNIQUE 约束捕 23505 是这个 race 的兜底。
+ */
+export type RequestReplayResult =
+  | { kind: "fresh" }
+  | {
+      kind: "replay-success";
+      balance_after: bigint;
+      ledger_id: string;
+      usage_record_id: string;
+      usage: TokenUsage;
+      cost_credits: bigint;
+    }
+  | { kind: "replay-exhausted"; previousStatus: string };
+
+export async function checkRequestIdReplay(
+  userId: string | bigint,
+  requestId: string,
+): Promise<RequestReplayResult> {
+  const r = await query<{
+    id: string;
+    status: string;
+    ledger_id: string | null;
+    input_tokens: string;
+    output_tokens: string;
+    cache_read_tokens: string;
+    cache_write_tokens: string;
+    cost_credits: string;
+  }>(
+    `SELECT id::text AS id, status, ledger_id::text AS ledger_id,
+            input_tokens::text AS input_tokens, output_tokens::text AS output_tokens,
+            cache_read_tokens::text AS cache_read_tokens, cache_write_tokens::text AS cache_write_tokens,
+            cost_credits::text AS cost_credits
+     FROM usage_records
+     WHERE request_id = $1 AND user_id = $2`,
+    [requestId, userId],
+  );
+  if (r.rows.length === 0) return { kind: "fresh" };
+  const row = r.rows[0];
+  if (row.status !== "success" || row.ledger_id === null) {
+    return { kind: "replay-exhausted", previousStatus: row.status };
+  }
+  const lg = await query<{ balance_after: string }>(
+    "SELECT balance_after::text AS balance_after FROM credit_ledger WHERE id = $1",
+    [row.ledger_id],
+  );
+  if (lg.rows.length === 0) {
+    // usage.ledger_id 指向不存在的 ledger —— 数据异常,fallback 当 fresh;
+    // 下游 INSERT 再撞 UNIQUE 约束会走 race-protection 路径。
+    return { kind: "fresh" };
+  }
+  return {
+    kind: "replay-success",
+    balance_after: BigInt(lg.rows[0].balance_after),
+    ledger_id: row.ledger_id,
+    usage_record_id: row.id,
+    usage: {
+      input_tokens: BigInt(row.input_tokens),
+      output_tokens: BigInt(row.output_tokens),
+      cache_read_tokens: BigInt(row.cache_read_tokens),
+      cache_write_tokens: BigInt(row.cache_write_tokens),
+    },
+    cost_credits: BigInt(row.cost_credits),
+  };
+}
+
+/**
  * 成功场景:事务内 debit + INSERT usage_records。调用方需在 tx(client => debitChatSuccess(client, ...)) 内调用。
  *
  * 并发语义:SELECT FOR UPDATE 锁 users 行,阻塞其他同用户事务直到本事务结束。
@@ -106,14 +199,18 @@ export async function debitChatSuccess(
       // 否则无法区分"重试成功"与"客户端 buggy 地重用失败的 id"。
       throw new RequestRetryWithDifferentResultError(row.status);
     }
-    // 成功路径:拿用户当前余额返回(balance_after 对调用方已不关键,但 API 合同不能变)
-    const cur = await client.query<{ credits: string }>(
-      "SELECT credits::text AS credits FROM users WHERE id = $1",
-      [input.userId],
+    // 成功路径:读原始 credit_ledger.balance_after(稳定幂等值);当前 users.credits
+    // 可能被 admin_adjust 改过,用它会让同一 request_id 在不同时间拿到不同 balance_after。
+    const lg = await client.query<{ balance_after: string }>(
+      "SELECT balance_after::text AS balance_after FROM credit_ledger WHERE id = $1",
+      [row.ledger_id],
     );
-    if (cur.rows.length === 0) throw new UserGoneError();
+    if (lg.rows.length === 0) {
+      // usage.ledger_id 指向不存在的 ledger —— 数据异常。直接抛 retry 让上游换 request_id。
+      throw new RequestRetryWithDifferentResultError("ledger_missing");
+    }
     return {
-      balance_after: BigInt(cur.rows[0].credits),
+      balance_after: BigInt(lg.rows[0].balance_after),
       ledger_id: row.ledger_id,
       usage_record_id: row.id,
     };
@@ -146,7 +243,7 @@ export async function debitChatSuccess(
         input.userId,
         (-input.cost.cost_credits).toString(),
         newBalance.toString(),
-        input.mode,
+        ledgerReasonOf(input.mode),
         input.requestId,
       ],
     );

@@ -256,17 +256,21 @@ describe("POST /api/chat with runClaudeChat (T-41)", () => {
    * usage_record_id,不二次扣费,DB 行数不增。覆盖 debit.ts 顶部的"existing usage_records
    * 命中直接返回"路径。
    */
-  test("重放同一 x-request-id(上次成功)→ 幂等返回,不二次扣费", async (t) => {
+  test("重放同一 x-request-id(上次成功)→ 幂等返回,不二次扣费,不再打 LLM", async (t) => {
     if (skipIfNoDb(t)) return;
     const { id: uid, token } = await createUser("rest-replay-ok@example.com", 10_000n);
     await createAccount({ label: "replay-ok", plan: "pro", token: "TOK-REPLAY" }, keyFn);
     const rid = "fixed-rid-replay-ok-1";
-    const successMock = (async () => sseResponse(200, [
-      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n',
-      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ])) as unknown as typeof fetch;
+    let fetchCalls = 0;
+    const successMock = (async () => {
+      fetchCalls += 1;
+      return sseResponse(200, [
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ]);
+    }) as unknown as typeof fetch;
 
     currentMockFetch = successMock;
     const r1 = await postChat(
@@ -277,12 +281,12 @@ describe("POST /api/chat with runClaudeChat (T-41)", () => {
     assert.equal(r1.status, 200, JSON.stringify(r1.json));
     assert.equal(r1.reqId, rid);
     assert.equal(r1.json.balance_after, "9999");
+    assert.equal(fetchCalls, 1, "first call hits LLM once");
     const firstLedger = r1.json.ledger_id as string;
     const firstUsage = r1.json.usage_record_id as string;
 
-    // 第二次用同 request_id;即便换个返回不一样的 mock,debitChatSuccess 里
-    // "existing usage_records 命中"分支会跳过 LLM 级别的差异校验,直接按首条记录返回。
-    // 这里依然注入成功 mock,保证不会因 LLM 差异污染断言。
+    // 第二次用同 request_id。replay-success 应该由 handleChat 顶部直接短路返回,
+    // 不该再调 LLM。mock 仍保持 successMock 以便一旦被打就能观测到 fetchCalls+1。
     currentMockFetch = successMock;
     const r2 = await postChat(
       { model: "claude-sonnet-4-6", max_tokens: 500, messages: [{ role: "user", content: "hi" }] },
@@ -294,6 +298,8 @@ describe("POST /api/chat with runClaudeChat (T-41)", () => {
     assert.equal(r2.json.ledger_id, firstLedger, "same ledger_id on replay");
     assert.equal(r2.json.usage_record_id, firstUsage, "same usage_record_id on replay");
     assert.equal(r2.json.balance_after, "9999", "balance unchanged on replay");
+    assert.equal(r2.json.replayed, true, "response flagged as replayed");
+    assert.equal(fetchCalls, 1, "replay must NOT hit LLM (Codex F1 request-level idempotency)");
 
     const u = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [uid]);
     assert.equal(u.rows[0].credits, "9999", "user credits must match single debit");
@@ -305,33 +311,95 @@ describe("POST /api/chat with runClaudeChat (T-41)", () => {
   });
 
   /**
+   * 预检后余额被扣穿(admin_adjust / 并发请求)→ LLM 已产出 usage,但本地 debit
+   * 事务 SELECT FOR UPDATE 发现 balance < cost → InsufficientCreditsAfterPreCheckError
+   * → 402 + usage_records(status='billing_failed')审计。Codex F2 Finding 的回归。
+   *
+   * 手法:mock fetch 里在 SSE 响应返回前把 users.credits 清零,模拟
+   * "preCheck 之后到 debit 之前"的余额被扣穿窗口。
+   */
+  test("预检后余额被扣穿 → 402 + usage_records.status='billing_failed' + 不扣费", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const { id: uid, token } = await createUser("rest-bf@example.com", 10_000n);
+    await createAccount({ label: "bf", plan: "pro", token: "TBF" }, keyFn);
+
+    currentMockFetch = (async () => {
+      // 在 LLM 响应落地之前把余额清零 —— 模拟 admin_adjust / 并发请求吃掉余额
+      await query("UPDATE users SET credits = 0 WHERE id = $1", [uid]);
+      return sseResponse(200, [
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bf"}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ]);
+    }) as unknown as typeof fetch;
+
+    const r = await postChat(
+      { model: "claude-sonnet-4-6", max_tokens: 500, messages: [{ role: "user", content: "hi" }] },
+      token,
+    );
+    assert.equal(r.status, 402, JSON.stringify(r.json));
+    const err = r.json.error as Record<string, unknown>;
+    assert.equal(err.code, "ERR_INSUFFICIENT_CREDITS");
+
+    // 余额仍是 0(admin_adjust 后),debit 事务回滚 —— 没进一步动
+    const u = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [uid]);
+    assert.equal(u.rows[0].credits, "0");
+    const ledger = await query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id=$1", [uid]);
+    assert.equal(ledger.rows[0].cnt, "0", "no credit_ledger row because debit rolled back");
+
+    // 关键:usage_records 有一条 billing_failed(审计链关键证据)
+    const rows = await query<{ status: string; cost_credits: string; input_tokens: string; output_tokens: string }>(
+      "SELECT status, cost_credits::text AS cost_credits, input_tokens::text AS input_tokens, output_tokens::text AS output_tokens FROM usage_records WHERE user_id=$1",
+      [uid],
+    );
+    assert.equal(rows.rows.length, 1, "must have exactly one billing_failed audit row");
+    assert.equal(rows.rows[0].status, "billing_failed");
+    assert.equal(rows.rows[0].input_tokens, "20", "usage tokens preserved for reconcile");
+    assert.equal(rows.rows[0].output_tokens, "10");
+    // cost 被记 — 审计需要知道本应扣多少(reconcile 脚本据此对账上游)
+    assert.ok(BigInt(rows.rows[0].cost_credits) > 0n, `cost_credits must be > 0, got ${rows.rows[0].cost_credits}`);
+    assert.equal(Object.keys(preCheckRedis.snapshot()).length, 0);
+  });
+
+  /**
    * 重放上次 error 的 request_id → 409 ERR_REQUEST_ID_EXHAUSTED(debit.ts 的
    * RequestRetryWithDifferentResultError)。客户端必须换 request_id 重试,不能复用
    * 已经 "烧掉" 的那个。
    */
-  test("重放同一 x-request-id(上次 error)→ 409 ERR_REQUEST_ID_EXHAUSTED", async (t) => {
+  test("重放同一 x-request-id(上次 error)→ 409 ERR_REQUEST_ID_EXHAUSTED + 不再调 LLM", async (t) => {
     if (skipIfNoDb(t)) return;
     const { id: uid, token } = await createUser("rest-replay-err@example.com", 7_000n);
     await createAccount({ label: "replay-err", plan: "pro", token: "TOK-REPLAY-ERR" }, keyFn);
     const rid = "fixed-rid-replay-err-1";
 
+    // 用计数器验证 F1 的核心改进:replay-exhausted 前置命中时不应再打上游。
+    let fetchCalls = 0;
+
     // 第一次:上游 500 → usage_records 写 status='error'
-    currentMockFetch = (async () => new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    currentMockFetch = (async () => {
+      fetchCalls += 1;
+      return new Response("boom", { status: 500 });
+    }) as unknown as typeof fetch;
     const r1 = await postChat(
       { model: "claude-sonnet-4-6", max_tokens: 100, messages: [{ role: "user", content: "x" }] },
       token,
       rid,
     );
     assert.equal(r1.status, 502, JSON.stringify(r1.json));
+    assert.equal(fetchCalls, 1, "first call hits LLM once");
 
-    // 第二次:LLM 本身成功,但 debitChatSuccess 里 SELECT usage_records 命中 status!='success'
-    // → RequestRetryWithDifferentResultError → 409
-    currentMockFetch = (async () => sseResponse(200, [
-      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n',
-      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ])) as unknown as typeof fetch;
+    // 第二次:即便 mock 返回 success 也不能被命中 —— handleChat 顶部的 checkRequestIdReplay
+    // 应直接返 409 并短路。
+    currentMockFetch = (async () => {
+      fetchCalls += 1;
+      return sseResponse(200, [
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ]);
+    }) as unknown as typeof fetch;
     const r2 = await postChat(
       { model: "claude-sonnet-4-6", max_tokens: 100, messages: [{ role: "user", content: "x" }] },
       token,
@@ -340,6 +408,7 @@ describe("POST /api/chat with runClaudeChat (T-41)", () => {
     assert.equal(r2.status, 409, JSON.stringify(r2.json));
     const err = r2.json.error as Record<string, unknown>;
     assert.equal(err.code, "ERR_REQUEST_ID_EXHAUSTED");
+    assert.equal(fetchCalls, 1, "replay must NOT hit LLM (Codex F1 request-level idempotency)");
 
     // 余额不动;usage_records 仍然只有一行(status='error');不落 credit_ledger
     const u = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [uid]);

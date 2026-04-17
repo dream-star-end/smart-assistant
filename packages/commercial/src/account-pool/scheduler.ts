@@ -196,6 +196,8 @@ export class AccountScheduler {
     // 最多重选 N 轮(N = 候选数)。每次选中账号若解密时发现已不存在,
     // 剔除后从剩余候选再选一次 —— sticky 的 rendezvous-hash 对剩余集
     // 仍是稳定的,只是换到次优选择。
+    let vanished = 0;
+    let quarantined = 0;
     while (pool.length > 0) {
       const chosen =
         input.mode === "agent"
@@ -213,6 +215,7 @@ export class AccountScheduler {
           };
         }
         // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选
+        vanished += 1;
         pool = pool.filter((c) => c.id !== chosen.id);
       } catch (err) {
         if (err instanceof AeadError) {
@@ -221,6 +224,7 @@ export class AccountScheduler {
             status: "disabled",
             last_error: `AEAD decryption failed at pick(): ${err.message}`.slice(0, 500),
           }, this.keyFn).catch(() => { /* best-effort;下一轮 pick 的 SELECT status='active' 也会自然排除 */ });
+          quarantined += 1;
           pool = pool.filter((c) => c.id !== chosen.id);
           continue;
         }
@@ -228,7 +232,8 @@ export class AccountScheduler {
       }
     }
     throw new AccountPoolUnavailableError(
-      "all candidate accounts vanished between pick and readToken",
+      `candidate pool drained while pick()ing: vanished=${vanished} (deleted between SELECT and readToken), ` +
+        `aead_quarantined=${quarantined} (decryption failed → auto-disabled)`,
     );
   }
 

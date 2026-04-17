@@ -48,6 +48,7 @@ import {
 import {
   debitChatSuccess,
   recordChatError,
+  checkRequestIdReplay,
   InsufficientCreditsAfterPreCheckError,
   UserGoneError,
   RequestRetryWithDifferentResultError,
@@ -424,6 +425,42 @@ export function createChatWsHandler(deps: ChatWsDeps): ChatWsHandler {
       return;
     }
 
+    // 0) 请求级幂等前置检查 —— 见 http/chat.ts 同名注释。
+    //    replay-success: 发 meta/usage/debit/done 四帧(顺序与正常流程对齐,前端无需特判)+ 关闭。
+    //    replay-exhausted: 发 error(ERR_REQUEST_ID_EXHAUSTED)+ 关闭。
+    const replay = await checkRequestIdReplay(userId, requestId);
+    if (replay.kind === "replay-exhausted") {
+      sendJson(ws, {
+        type: "error",
+        code: "ERR_REQUEST_ID_EXHAUSTED",
+        message: `request_id already used by a previous attempt with status=${replay.previousStatus}; use a new request_id to retry`,
+      });
+      try { ws.close(CLOSE_POLICY, "request_id exhausted"); } catch { /* */ }
+      return;
+    }
+    if (replay.kind === "replay-success") {
+      sendJson(ws, {
+        type: "usage",
+        replayed: true,
+        input_tokens: Number(replay.usage.input_tokens),
+        output_tokens: Number(replay.usage.output_tokens),
+        cache_read_tokens: Number(replay.usage.cache_read_tokens),
+        cache_write_tokens: Number(replay.usage.cache_write_tokens),
+        stop_reason: null,
+      });
+      sendJson(ws, {
+        type: "debit",
+        replayed: true,
+        cost_credits: replay.cost_credits.toString(),
+        balance_after: replay.balance_after.toString(),
+        ledger_id: replay.ledger_id,
+        usage_record_id: replay.usage_record_id,
+      });
+      sendJson(ws, { type: "done" });
+      try { ws.close(CLOSE_NORMAL, "replayed"); } catch { /* */ }
+      return;
+    }
+
     // 1) preCheck
     let lockKeyLocal: string;
     try {
@@ -547,20 +584,24 @@ export function createChatWsHandler(deps: ChatWsDeps): ChatWsHandler {
         try { ws.close(CLOSE_NORMAL, "done"); } catch { /* */ }
       } catch (err) {
         log.error("ws chat: debit threw", { userId, requestId, err: String(err) });
-        if (err instanceof InsufficientCreditsAfterPreCheckError) {
-          sendJson(ws, { type: "error", code: "ERR_INSUFFICIENT_CREDITS", message: err.message });
-        } else if (err instanceof UserGoneError) {
+        if (err instanceof UserGoneError) {
           sendJson(ws, { type: "error", code: "UNAUTHORIZED", message: "user not found" });
         } else if (err instanceof RequestRetryWithDifferentResultError) {
           sendJson(ws, { type: "error", code: "ERR_REQUEST_ID_EXHAUSTED", message: err.message });
         } else if (err instanceof DuplicateRequestError) {
           sendJson(ws, { type: "error", code: "ERR_DUPLICATE_REQUEST", message: err.message });
         } else {
-          sendJson(ws, { type: "error", code: "ERR_DEBIT", message: "debit failed" });
-          // LLM 已消耗但本地结算失败:补写 billing_failed 审计记录。
-          // 只在"真正的 debit 运行期异常(DB 抖、连接断)"路径做 —— 上面几个
-          // 业务错误(余额不足、用户没了、request_id 冲突)要么 usage 已存在,
+          // 走到这里的都是 "LLM 已产出 usage 但本地结算失败" —— 必须补 billing_failed 审计。
+          // 包括:
+          //   - InsufficientCreditsAfterPreCheckError(预检后余额被扣穿:admin_adjust / 并发请求)
+          //   - 其它 debit 运行期异常(DB 抖、连接断)
+          // 排除列表(UserGoneError / RequestRetry / Duplicate)要么 usage 已存在,
           // 要么 usage 不该存在,都不应补 billing_failed。
+          if (err instanceof InsufficientCreditsAfterPreCheckError) {
+            sendJson(ws, { type: "error", code: "ERR_INSUFFICIENT_CREDITS", message: err.message });
+          } else {
+            sendJson(ws, { type: "error", code: "ERR_DEBIT", message: "debit failed" });
+          }
           try {
             await recordChatError({
               userId,

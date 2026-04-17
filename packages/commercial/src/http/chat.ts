@@ -34,6 +34,7 @@ import {
 import {
   debitChatSuccess,
   recordChatError,
+  checkRequestIdReplay,
   InsufficientCreditsAfterPreCheckError,
   UserGoneError,
   RequestRetryWithDifferentResultError,
@@ -228,6 +229,39 @@ export async function handleChat(
     throw new HttpError(400, "UNKNOWN_MODEL", `model not available: ${body.model}`);
   }
 
+  // 0) 请求级幂等前置检查 —— 在 LLM 调用前就判断该 (user_id, request_id) 是否已处理过。
+  //    放在 preCheck 之前是因为:命中 replay-* 时不需要消耗预检 lockKey,能省 Redis 操作。
+  //    命中 replay-success → 用原始 ledger.balance_after 稳定幂等返回(不再打上游 LLM)。
+  //    命中 replay-exhausted → 409,客户端必须换 request_id 重试。
+  //    与 debit.ts 内 existing 检查的关系:此处是 "请求级" 去重(含 LLM),那边是 "扣费级"
+  //    去重 + 并发 race 兜底(两个请求同 request_id 几乎同时进 debit 事务)。
+  const replay = await checkRequestIdReplay(user.id, ctx.requestId);
+  if (replay.kind === "replay-exhausted") {
+    throw new HttpError(409, "ERR_REQUEST_ID_EXHAUSTED",
+      `request_id already used by a previous attempt with status=${replay.previousStatus}; use a new request_id to retry`);
+  }
+  if (replay.kind === "replay-success") {
+    sendJson(res, 200, {
+      ok: true,
+      request_id: ctx.requestId,
+      replayed: true,
+      // 响应体(text)不持久化,返回空字符串,由客户端本地结果兜底展示。
+      // usage / cost / balance_after / ledger_id / usage_record_id 全部按原始记录回放。
+      text: "",
+      usage: {
+        input_tokens: Number(replay.usage.input_tokens),
+        output_tokens: Number(replay.usage.output_tokens),
+        cache_read_tokens: Number(replay.usage.cache_read_tokens),
+        cache_write_tokens: Number(replay.usage.cache_write_tokens),
+      },
+      cost_credits: replay.cost_credits.toString(),
+      balance_after: replay.balance_after.toString(),
+      ledger_id: replay.ledger_id,
+      usage_record_id: replay.usage_record_id,
+    });
+    return;
+  }
+
   // 1) 预检
   let lockKey: string;
   try {
@@ -303,13 +337,17 @@ export async function handleChat(
       );
     } catch (err) {
       // LLM 已消耗但本地结算失败 —— 审计链断点。补一条 billing_failed 的 usage_records,
-      // 让 reconcile 脚本能发现"上游已扣但本地没扣" 的异常。
-      // 注意幂等:status='billing_failed' 是第一条也是唯一一条(uniq_ur_request 拦截 retry)。
-      // RequestRetryWithDifferentResultError / DuplicateRequestError 本身就意味着
-      // 之前已写过 usage_records —— 重复写只会再撞 23505,recordChatError 内会 swallow。
+      // 让 reconcile 脚本能发现"上游已扣但本地没扣"的异常。
+      //
+      // 排除列表说明:
+      //   - UserGoneError: 用户被删/禁,不存在"已消耗要对账"(上游会直接 401),不补
+      //   - RequestRetryWithDifferentResultError / DuplicateRequestError:
+      //     之前已写过 usage_records(约束兜底),再写只会撞 23505 → recordChatError
+      //     内部 swallow,但没意义,直接跳过
+      // InsufficientCreditsAfterPreCheckError 不在排除列表 —— 预检后余额被扣穿
+      // (admin_adjust / 并发请求吃掉)时 LLM 已产出 usage 但本地没扣成,必须审计。
       if (
         !(err instanceof UserGoneError) &&
-        !(err instanceof InsufficientCreditsAfterPreCheckError) &&
         !(err instanceof RequestRetryWithDifferentResultError) &&
         !(err instanceof DuplicateRequestError)
       ) {
