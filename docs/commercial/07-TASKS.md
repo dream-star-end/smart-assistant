@@ -783,7 +783,9 @@ Commit: 29bc47a `task(T-33)(commercial): 修 Phase 3 Codex 审查 3 个 Finding 
 
 **Status**: `[x] done`
 
-Commit: `<pending>` task(T-40b)(commercial): WS chat handler + connection registry + shared debit helper + gateway 路由
+Commits:
+- 17bcf9a `task(T-40a)(commercial): chat/orchestrator — scheduler + refresh + proxy 三件套编排`
+- 68c6021 `task(T-40b)(commercial): /ws/chat WebSocket + 连接注册表 + 共享 debit helper + gateway 路由`
 
 ---
 
