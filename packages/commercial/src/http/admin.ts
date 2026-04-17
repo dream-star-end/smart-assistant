@@ -870,11 +870,25 @@ export async function handleAdminListLedger(
 // ─── metrics(T-62)──────────────────────────────────────────────────
 
 /**
+ * 常时比较:常数时间判等,防 timing 攻击(token 长度泄漏除外)。
+ */
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/**
  * GET /api/admin/metrics → Prometheus text exposition。
  *
- * 仍走 requireAdmin:按 02-ARCH §7.2 "超管后台拉取展示",不希望无 auth 暴露
- * 账号池健康分(能间接反推哪些 account 可用,对外是信息泄露)。
- * Prometheus scraper 侧用 bearer_token 配置携带超管 JWT 即可。
+ * 认证两选一:
+ *   1. `COMMERCIAL_METRICS_BEARER` env 设了 → Authorization: Bearer <该 token>
+ *      长寿命 machine credential,给 Prometheus scraper 用。长度必须 ≥ 32。
+ *   2. 否则回落到 admin JWT(短 TTL,15min 内手工 curl 调试用)
+ *
+ * 为什么不开 /metrics 无 auth:account_pool_health 会泄漏 Claude 账号池哪些
+ * 活/哪些挂,对外是有价值的侦察情报(02-ARCH §7.2 "超管后台拉取展示")。
  */
 export async function handleAdminMetrics(
   req: IncomingMessage,
@@ -882,7 +896,19 @@ export async function handleAdminMetrics(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  await requireAdmin(req, deps.jwtSecret);
+  const scrapeBearer = process.env.COMMERCIAL_METRICS_BEARER ?? "";
+  let authorized = false;
+  if (scrapeBearer.length >= 32) {
+    const h = req.headers["authorization"];
+    if (typeof h === "string" && h.startsWith("Bearer ")) {
+      const token = h.slice("Bearer ".length).trim();
+      if (constantTimeEqual(token, scrapeBearer)) authorized = true;
+    }
+  }
+  if (!authorized) {
+    // 回落 admin JWT:失败会抛 HttpError(401/403),由 router 统一翻译
+    await requireAdmin(req, deps.jwtSecret);
+  }
   const body = await renderPrometheus();
   res.statusCode = 200;
   res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");

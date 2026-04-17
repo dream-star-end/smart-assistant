@@ -28,6 +28,7 @@ import {
 } from "../agent-sandbox/supervisor.js";
 import { writeAdminAudit } from "./audit.js";
 import type { AdminAuditCtx } from "./accounts.js";
+import { incrAdminAuditWriteFailure } from "./metrics.js";
 
 export interface AdminContainerRowView {
   id: string;
@@ -150,6 +151,8 @@ async function auditBestEffort(
       userAgent: ctx.userAgent ?? null,
     });
   } catch (err) {
+    // 同 accounts.bestEffortAudit:Prometheus counter + onAuditError(或 stderr)双报
+    incrAdminAuditWriteFailure(action);
     (ctx.onAuditError ?? ((e) => {
       // eslint-disable-next-line no-console
       console.error("[admin/containers] admin_audit write failed:", e);

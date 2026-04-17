@@ -200,16 +200,28 @@ export function startAlertScheduler(opts: AlertSchedulerOptions = {}): AlertSche
     }
   }
 
+  /**
+   * 串行化 tick:统一跑一条 "pending tick" 队列:
+   *   - 正在跑 → 把新请求合并到 pending(tickNow/interval 来几次都算一次 pending)
+   *   - 不在跑 → 立刻启动
+   * 这样 setInterval 和 tickNow 共享 lane,绝不并跑,resolve/fire state 不会错乱。
+   */
+  function scheduleTick(): Promise<void> {
+    if (inflight) return inflight;
+    inflight = runOneTick().finally(() => { inflight = null; });
+    return inflight;
+  }
+
   const timer = setInterval(() => {
     if (stopped) return;
-    if (inflight) return; // 上一 tick 还没跑完,跳过这一轮
-    inflight = runOneTick().finally(() => { inflight = null; });
+    // 不 await:interval 只负责踢,不背压。scheduleTick 自己会去重。
+    void scheduleTick();
   }, interval);
   // 不阻塞进程退出
   if (typeof timer.unref === "function") timer.unref();
 
   if (opts.runOnStart) {
-    inflight = runOneTick().finally(() => { inflight = null; });
+    void scheduleTick();
   }
 
   return {
@@ -221,11 +233,12 @@ export function startAlertScheduler(opts: AlertSchedulerOptions = {}): AlertSche
       }
     },
     async tickNow() {
-      // 如果当前 inflight 正在跑,等它跑完再跑一次,保证调用方观察到的是最新状态
+      // 若当前已有 tick 在跑 → 等它,再跑一次保证观察最新状态。
+      // 若无 → 直接启一次。两路都走 scheduleTick,和 interval 共享 lane。
       if (inflight) {
         try { await inflight; } catch { /* */ }
       }
-      await runOneTick();
+      await scheduleTick();
     },
     firingRules() {
       return new Set(firing);

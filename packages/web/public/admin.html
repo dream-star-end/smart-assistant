@@ -133,14 +133,20 @@
  */
 
 const TOKEN_KEY = "openclaude_admin_token";
+const REFRESH_KEY = "openclaude_admin_refresh";
+const ACCESS_EXP_KEY = "openclaude_admin_access_exp";
 const USER_KEY = "openclaude_admin_user";
+
+/** access token 剩余 < 此秒数时主动刷新一次,避免半路 401。 */
+const REFRESH_SKEW_SEC = 60;
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, children = []) => {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
     if (k === "class") n.className = v;
-    else if (k === "html") n.innerHTML = v;
+    // 故意不提供 "html" / innerHTML 写入:唯一的字符串 child 必须走 createTextNode,
+    // 任何用户/DB 数据都不会被当 HTML 解释 —— XSS 表面最小化。
     else if (k.startsWith("on")) n.addEventListener(k.slice(2).toLowerCase(), v);
     else if (v !== null && v !== undefined) n.setAttribute(k, v);
   }
@@ -151,11 +157,50 @@ const el = (tag, props = {}, children = []) => {
   return n;
 };
 
+/** 如果 access token 剩不到 REFRESH_SKEW_SEC,调 /api/auth/refresh 续期;失败 → 清 session。 */
+async function maybeRefresh() {
+  const expRaw = localStorage.getItem(ACCESS_EXP_KEY);
+  const refresh = localStorage.getItem(REFRESH_KEY);
+  if (!expRaw || !refresh) return;
+  const expMs = Date.parse(expRaw);
+  if (!Number.isFinite(expMs)) return;
+  if (expMs - Date.now() > REFRESH_SKEW_SEC * 1000) return;
+  try {
+    const res = await fetch("/api/auth/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: refresh }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    localStorage.setItem(TOKEN_KEY, data.access_token);
+    if (data.refresh_token) localStorage.setItem(REFRESH_KEY, data.refresh_token);
+    if (data.access_exp) localStorage.setItem(ACCESS_EXP_KEY, data.access_exp);
+  } catch {
+    // refresh 失败,丢弃 session 交回登录页
+    clearSessionAndRedirect();
+  }
+}
+
+function clearSessionAndRedirect() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+  localStorage.removeItem(ACCESS_EXP_KEY);
+  localStorage.removeItem(USER_KEY);
+  const app = $("app-view");
+  const login = $("login-view");
+  if (app) app.classList.add("hidden");
+  if (login) login.classList.remove("hidden");
+  const errEl = $("login-err");
+  if (errEl) errEl.textContent = "登录态已失效,请重新登录";
+}
+
 async function api(path, { method = "GET", body = null, auth = true } = {}) {
+  if (auth) await maybeRefresh();
   const headers = { "content-type": "application/json" };
   if (auth) {
     const tok = localStorage.getItem(TOKEN_KEY);
-    if (!tok) throw new Error("NOT_AUTHENTICATED");
+    if (!tok) { clearSessionAndRedirect(); throw new Error("NOT_AUTHENTICATED"); }
     headers["Authorization"] = `Bearer ${tok}`;
   }
   const res = await fetch(path, { method, headers, body: body === null ? null : JSON.stringify(body) });
@@ -164,6 +209,11 @@ async function api(path, { method = "GET", body = null, auth = true } = {}) {
     try { data = await res.json(); } catch { data = null; }
   }
   if (!res.ok) {
+    // 401 on auth'd 请求 → 立即清 session 回登录页。
+    //   不再"看起来已登录、其实全失败"。login 路径本身 auth=false,不走这里。
+    if (auth && res.status === 401) {
+      clearSessionAndRedirect();
+    }
     const err = new Error(data?.message || `HTTP ${res.status}`);
     err.status = res.status;
     err.code = data?.code;
@@ -196,6 +246,8 @@ async function doLogin() {
       errEl.textContent = "不是超管账户"; return;
     }
     localStorage.setItem(TOKEN_KEY, r.access_token);
+    if (r.refresh_token) localStorage.setItem(REFRESH_KEY, r.refresh_token);
+    if (r.access_exp) localStorage.setItem(ACCESS_EXP_KEY, r.access_exp);
     localStorage.setItem(USER_KEY, JSON.stringify(r.user));
     enterApp();
   } catch (e) {
@@ -212,7 +264,18 @@ function enterApp() {
 }
 
 function doLogout() {
+  // 后端不在意前端是否调 /api/auth/logout,但调一下更合规(revoke refresh 记录)
+  const rt = localStorage.getItem(REFRESH_KEY);
+  if (rt) {
+    fetch("/api/auth/logout", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: rt }),
+    }).catch(() => { /* best-effort,退出不阻塞 */ });
+  }
   localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+  localStorage.removeItem(ACCESS_EXP_KEY);
   localStorage.removeItem(USER_KEY);
   $("app-view").classList.add("hidden");
   $("login-view").classList.remove("hidden");
@@ -380,14 +443,16 @@ function adjustCredits(u, onDone) {
 
 TABS.accounts = async () => {
   const body = $("tab-body");
+  const state = { limit: 50, offset: 0 };
   const refresh = async () => {
     body.innerHTML = "";
     const tools = el("div", { class: "toolbar" });
     tools.appendChild(el("button", { class: "primary", onclick: () => newAccount(refresh) }, "+ 新增账号"));
-    tools.appendChild(el("button", { onclick: refresh }, "刷新"));
+    tools.appendChild(el("button", { onclick: () => { state.offset = 0; refresh(); } }, "刷新"));
+    tools.appendChild(el("span", { class: "muted" }, `offset=${state.offset} limit=${state.limit}`));
     body.appendChild(tools);
     try {
-      const r = await api("/api/admin/accounts");
+      const r = await api(`/api/admin/accounts?limit=${state.limit}&offset=${state.offset}`);
       renderTable(body, [
         { h: "ID", k: "id" },
         { h: "label", k: "label" },
@@ -407,6 +472,20 @@ TABS.accounts = async () => {
           },
         },
       ], r.rows, { rowClass: (a) => a.status });
+      const pager = el("div", { class: "toolbar" });
+      pager.appendChild(el("button", {
+        disabled: state.offset === 0 ? "disabled" : undefined,
+        onclick: () => { state.offset = Math.max(0, state.offset - state.limit); refresh(); },
+      }, "← 上一页"));
+      const truncated = r.rows.length === state.limit;
+      pager.appendChild(el("button", {
+        disabled: truncated ? undefined : "disabled",
+        onclick: () => { state.offset += state.limit; refresh(); },
+      }, "下一页 →"));
+      if (truncated) {
+        pager.appendChild(el("span", { class: "muted" }, "结果已截断,可能还有更多"));
+      }
+      body.appendChild(pager);
     } catch (e) { showStatus(e.message, true); }
   };
   refresh();
@@ -551,14 +630,17 @@ function editPlan(p, reload) {
 
 // ─── Tab: agent containers ───────────────────────────────────────
 
+const containersState = { limit: 50, offset: 0 };
+
 TABS.containers = async () => {
   const body = $("tab-body");
   body.innerHTML = "";
-  const tools = el("div", { class: "toolbar" },
-    el("button", { onclick: () => TABS.containers() }, "刷新"));
+  const tools = el("div", { class: "toolbar" });
+  tools.appendChild(el("button", { onclick: () => { containersState.offset = 0; TABS.containers(); } }, "刷新"));
+  tools.appendChild(el("span", { class: "muted" }, `offset=${containersState.offset} limit=${containersState.limit}`));
   body.appendChild(tools);
   try {
-    const r = await api("/api/admin/agent-containers");
+    const r = await api(`/api/admin/agent-containers?limit=${containersState.limit}&offset=${containersState.offset}`);
     renderTable(body, [
       { h: "ID", k: "id" },
       { h: "user", render: (c) => `${c.user_email ?? "?"} (#${c.user_id})` },
@@ -577,6 +659,20 @@ TABS.containers = async () => {
         },
       },
     ], r.rows, { rowClass: (c) => c.status });
+    const pager = el("div", { class: "toolbar" });
+    pager.appendChild(el("button", {
+      disabled: containersState.offset === 0 ? "disabled" : undefined,
+      onclick: () => { containersState.offset = Math.max(0, containersState.offset - containersState.limit); TABS.containers(); },
+    }, "← 上一页"));
+    const truncated = r.rows.length === containersState.limit;
+    pager.appendChild(el("button", {
+      disabled: truncated ? undefined : "disabled",
+      onclick: () => { containersState.offset += containersState.limit; TABS.containers(); },
+    }, "下一页 →"));
+    if (truncated) {
+      pager.appendChild(el("span", { class: "muted" }, "结果已截断,可能还有更多"));
+    }
+    body.appendChild(pager);
   } catch (e) { showStatus(e.message, true); }
 };
 

@@ -11,10 +11,11 @@
  *   1. 调 store.createAccount / updateAccount / deleteAccount
  *   2. 成功后调 writeAdminAudit(pool)
  *
- * 若 (2) 失败(极少见 — 审计表写入报错),admin 已完成的账号变更不会回滚,
- * 但会在 onAuditError 回调里上报;这是可以接受的折中:
+ * 若 (2) 失败(极少见 — 审计表写入报错),admin 已完成的账号变更不会回滚:
  *   - 主要数据变更不能因为审计表抖动而回退(admin 期望行为已完成)
- *   - 审计失败仍应被监控到(生产 alerting 挂在 onAuditError 上)
+ *   - 审计失败会走两路上报:
+ *     (a) `admin_audit_write_failures_total{action=...}` counter → Prometheus 告警
+ *     (b) `ctx.onAuditError`(HTTP 未传 → stderr 兜底)→ 详细错误内容
  *
  * ### 审计内容
  * before/after 只保留 "admin 显式提交的字段"。原因:
@@ -42,6 +43,7 @@ import {
   type UpdateAccountPatch,
 } from "../account-pool/store.js";
 import { writeAdminAudit } from "./audit.js";
+import { incrAdminAuditWriteFailure } from "./metrics.js";
 
 export interface AdminAuditCtx {
   adminId: bigint | number | string;
@@ -77,6 +79,10 @@ async function bestEffortAudit(
       userAgent: ctx.userAgent ?? null,
     });
   } catch (err) {
+    // 两路上报,保证不管 HTTP 层有没有传 onAuditError,运维都能看到:
+    //   1) Prometheus counter(admin_audit_write_failures_total{action=...})→ 告警
+    //   2) ctx.onAuditError(或 stderr)→ 详细错误
+    incrAdminAuditWriteFailure(action);
     (ctx.onAuditError ?? defaultAuditErrorLog)(err);
   }
 }

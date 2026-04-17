@@ -204,10 +204,16 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     } catch (err) {
       handleError(err, res, requestId);
     }
-    // T-62 metrics:按"声明的 path/pathPrefix"折叠 route label(跟踪 spec'd 端点;
-    //   未命中 route 走 normalizeRoute(path) 兜底,它对未知路径原样返回)。
+    // T-62 metrics:route label 严格用 "声明的 path/pathPrefix"。
+    //   - 405 (method mismatch):仍有 candidates → 取首个的声明 label,Prometheus
+    //     能区分 "path X 的 405" vs "path Y 的 405"。
+    //   - 404 (无 candidates):落到固定 `__unmatched__`,**不要**把原始 path 刷
+    //     进 label —— `/api/admin/foo-<uuid>` 之类会让 label 基数爆掉。
     //   status 直接拿响应对象实际写出的码,对齐真实 401/403/402/5xx。
-    const labelRoute = route?.path ?? route?.pathPrefix ?? path;
+    const labelRoute =
+      route?.path ?? route?.pathPrefix ??
+      candidates[0]?.path ?? candidates[0]?.pathPrefix ??
+      "__unmatched__";
     incrGatewayRequest(labelRoute, method, res.statusCode);
     return true;
   };

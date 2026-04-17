@@ -164,6 +164,16 @@ export const claudeApiRequests = new Counter({
   labelNames: ["account_id", "status"], // status: success | error
 });
 
+/**
+ * 合规相关:accounts/containers 的 audit 写入是 best-effort(非 tx),
+ * 这条 counter 专门累计 "主操作成功但 audit 写失败" 的 case,运维 alert 可以挂。
+ */
+export const adminAuditWriteFailures = new Counter({
+  name: "admin_audit_write_failures_total",
+  help: "Failed admin_audit writes in best-effort (non-tx) paths",
+  labelNames: ["action"],
+});
+
 /** 便捷 incr helper —— 把 labels 去 undefined。 */
 export function incrGatewayRequest(route: string, method: string, status: number | string): void {
   gatewayRequests.inc({ route: normalizeRoute(route), method, status: String(status) });
@@ -179,6 +189,10 @@ export function incrClaudeApi(accountId: bigint | number | string | null, status
     account_id: accountId === null ? "" : String(accountId),
     status,
   });
+}
+
+export function incrAdminAuditWriteFailure(action: string): void {
+  adminAuditWriteFailures.inc({ action });
 }
 
 // ─── gauges 由 scrape 时 collector 填 ─────────────────────────────────
@@ -267,6 +281,7 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   gatewayRequests.render(out);
   billingDebits.render(out);
   claudeApiRequests.render(out);
+  adminAuditWriteFailures.render(out);
   accountPoolHealth.render(out);
   agentRunning.render(out);
   out.push(""); // 结尾必须带换行
@@ -279,6 +294,7 @@ export function resetMetricsForTest(): void {
   gatewayRequests.reset();
   billingDebits.reset();
   claudeApiRequests.reset();
+  adminAuditWriteFailures.reset();
 }
 
 /** 给 alerts.ts 读取 account health / agent running 的 snapshot(避免双查)。 */

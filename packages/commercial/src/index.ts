@@ -321,8 +321,11 @@ export async function registerCommercial(
   // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
   let alertScheduler: AlertScheduler | undefined;
   if (process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
+    // 非法 / 空 / NaN → 60s;下限 1s(防 typo 写成 "50" ms 把 DB 打穿)
+    const raw = Number(process.env.COMMERCIAL_ALERT_TICK_MS);
+    const tickMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
     alertScheduler = startAlertScheduler({
-      intervalMs: Number(process.env.COMMERCIAL_ALERT_TICK_MS ?? 60_000),
+      intervalMs: tickMs,
       runOnStart: false,
     });
   }
