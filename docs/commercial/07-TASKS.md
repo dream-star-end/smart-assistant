@@ -248,12 +248,27 @@
 - [ ] 常量:15min / 30d
 
 **Acceptance**:
-- [ ] 单元:签发 → 校验通过
-- [ ] 单元:算法混淆攻击(alg=none)被拒
-- [ ] 单元:过期 token 校验失败(用 mock timers 快进 16min)
-- [ ] 单元:secret 变化后旧 token 失效
+- [x] 单元:签发 → 校验通过
+- [x] 单元:算法混淆攻击(alg=none / HS512)被拒(algorithms 白名单)
+- [x] 单元:过期 token 校验失败(用注入 now 快进 16min)
+- [x] 单元:secret 变化后旧 token 失效
+- [x] 单元:tampered payload(改 role)签名失效
+- [x] 单元:refresh token sha256 哈希基于 raw bytes 不是 base64 字符串
+- [x] 单元:refresh token 1000 次唯一性
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- dep `jose@^5.x`(workspace `packages/commercial`)
+- `src/auth/jwt.ts`:
+  * `signAccess(payload, secret, opts)` HS256,15min,jti = 16 bytes hex,sub 必须字符串
+  * `verifyAccess(token, secret, opts)` jose `algorithms: ['HS256']` 白名单 + 业务字段二次断言(sub/role/iat/exp/jti)
+  * `JwtError` 统一错误,分类细分 expired / alg_not_allowed / generic 但消息保持精简,不暴露内部
+  * `secretToKey()` 强制 secret ≥ 32 bytes(HS256 安全下限),太短直接抛
+  * `issueRefresh()` 32 bytes randomBytes → base64url + sha256 hex,30 day TTL
+  * `refreshTokenHash(raw)` 服务端比对入口,**对 raw bytes 做 sha256**(不是对 base64 字符串)
+- 16 个单测覆盖签发/过期/算法混淆/篡改/role 缺失/refresh 唯一性/hash 算法正确性
+- 测试汇总:unit 69/69 全绿;typecheck 干净
 
 ---
 
