@@ -341,3 +341,19 @@ export type {
   ProxyDeps,
   StreamClaudeInput,
 } from "./account-pool/proxy.js";
+// T-40: Chat orchestrator(pick + refresh + stream 三件套组合)
+export {
+  runClaudeChat,
+  ERR_ACCOUNT_POOL_UNAVAILABLE as CHAT_ERR_ACCOUNT_POOL_UNAVAILABLE,
+  ERR_REFRESH_FAILED,
+  ERR_UPSTREAM,
+  ERR_UPSTREAM_AUTH,
+  ERR_ACCOUNT_BROKEN,
+  ERR_INTERNAL as CHAT_ERR_INTERNAL,
+} from "./chat/orchestrator.js";
+export type {
+  ChatEvent,
+  ChatLogger,
+  RunChatInput,
+  RunChatDeps,
+} from "./chat/orchestrator.js";
