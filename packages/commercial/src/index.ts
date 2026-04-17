@@ -12,7 +12,9 @@
 
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
+import * as fs from "node:fs";
 import IORedis from "ioredis";
+import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { closePool } from "./db/index.js";
 import { loadConfig } from "./config.js";
@@ -27,6 +29,12 @@ import { AccountScheduler } from "./account-pool/scheduler.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
 import { createChatWsHandler, type ChatWsHandler } from "./ws/chat.js";
 import { createChatLLMFromRunChat } from "./http/chat.js";
+import {
+  startLifecycleScheduler,
+  type LifecycleScheduler,
+  type LifecycleLogger,
+} from "./agent/index.js";
+import type { AgentHttpDeps } from "./http/agent.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -168,6 +176,86 @@ export async function registerCommercial(
 
   const preCheckRedis = wrapIoredisForPreCheck(redis);
 
+  // T-53: 装配 agent 运行时(image + seccomp + rpc dir + lifecycle scheduler)。
+  // 任一必要字段缺失 → agentRuntime 置 undefined;/api/agent/open 返 503,/status 仍然可读。
+  let agentRuntime: AgentHttpDeps | undefined;
+  let lifecycleScheduler: LifecycleScheduler | undefined;
+  const agentReady =
+    !!cfg.AGENT_IMAGE &&
+    !!cfg.AGENT_NETWORK &&
+    !!cfg.AGENT_PROXY_URL &&
+    !!cfg.AGENT_SECCOMP_PATH &&
+    !!cfg.AGENT_RPC_SOCKET_DIR;
+  if (agentReady) {
+    try {
+      // Docker:走默认 socketPath 或 AGENT_DOCKER_SOCKET 覆盖
+      const docker = cfg.AGENT_DOCKER_SOCKET
+        ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
+        : new Docker();
+      // Seccomp profile 一次性读成字符串,后续 provision 直接用
+      const seccompProfileJson = fs.readFileSync(cfg.AGENT_SECCOMP_PATH!, "utf8");
+      // RPC socket 父目录启动时自愈:mkdir -p + 0700
+      fs.mkdirSync(cfg.AGENT_RPC_SOCKET_DIR!, { recursive: true, mode: 0o700 });
+
+      const agentLogger: LifecycleLogger = {
+        info: (m, meta) => {
+          // eslint-disable-next-line no-console
+          console.log(m, meta ?? {});
+        },
+        warn: (m, meta) => {
+          // eslint-disable-next-line no-console
+          console.warn(m, meta ?? {});
+        },
+        error: (m, meta) => {
+          // eslint-disable-next-line no-console
+          console.error(m, meta ?? {});
+        },
+      };
+
+      agentRuntime = {
+        docker,
+        image: cfg.AGENT_IMAGE!,
+        network: cfg.AGENT_NETWORK!,
+        proxyUrl: cfg.AGENT_PROXY_URL!,
+        seccompProfileJson,
+        rpcSocketHostDir: cfg.AGENT_RPC_SOCKET_DIR!,
+        limits: {
+          memoryMb: cfg.AGENT_MEMORY_MB,
+          cpus: cfg.AGENT_CPUS,
+          pidsLimit: cfg.AGENT_PIDS_LIMIT,
+        },
+        priceCredits: cfg.AGENT_PLAN_PRICE_CREDITS,
+        durationDays: cfg.AGENT_PLAN_DURATION_DAYS,
+        logger: agentLogger,
+      };
+
+      // Lifecycle scheduler:默认 1h tick,不在启动时跑
+      lifecycleScheduler = startLifecycleScheduler(docker, {
+        intervalMs: cfg.AGENT_LIFECYCLE_TICK_MS,
+        volumeGcDays: cfg.AGENT_VOLUME_GC_DAYS,
+        logger: agentLogger,
+        runOnStart: false,
+      });
+      // eslint-disable-next-line no-console
+      console.log("[commercial] agent runtime ready", {
+        image: cfg.AGENT_IMAGE,
+        network: cfg.AGENT_NETWORK,
+        rpc_dir: cfg.AGENT_RPC_SOCKET_DIR,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[commercial] agent runtime init failed, disabling:", err);
+      agentRuntime = undefined;
+      if (lifecycleScheduler) {
+        try { await lifecycleScheduler.stop(); } catch { /* */ }
+      }
+      lifecycleScheduler = undefined;
+    }
+  } else {
+    // eslint-disable-next-line no-console
+    console.log("[commercial] agent runtime not configured (AGENT_IMAGE/NETWORK/PROXY_URL/SECCOMP_PATH/RPC_SOCKET_DIR required)");
+  }
+
   // T-40/T-41 共用的编排依赖:scheduler + health。ws/chat 与 http/chat 走同一套,
   // 两个入口的 debit 与 account-pool 语义才不会漂移。
   const healthRedis = wrapIoredisForHealth(
@@ -193,6 +281,7 @@ export async function registerCommercial(
     chatLLM: realChatLLM,
     hupijiao,
     hupijiaoConfig,
+    agentRuntime,
   });
 
   // T-40 /ws/chat:handler 注入同一份 chatDeps
@@ -208,6 +297,9 @@ export async function registerCommercial(
     handleWsUpgrade: (req, socket, head) => wsHandler.handleUpgrade(req, socket, head),
     shutdown: async () => {
       try { await wsHandler.shutdown(); } catch { /* ignore */ }
+      if (lifecycleScheduler) {
+        try { await lifecycleScheduler.stop(); } catch { /* ignore */ }
+      }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closePool();
@@ -428,3 +520,43 @@ export type {
 } from "./ws/connections.js";
 // T-41: POST /api/chat 的 LLM 适配器 —— runClaudeChat → ChatLLM
 export { createChatLLMFromRunChat } from "./http/chat.js";
+// T-53: Agent 订阅 + 生命周期
+export {
+  openAgentSubscription,
+  getAgentStatus,
+  cancelAgentSubscription,
+  markContainerRunning,
+  markContainerError,
+  markExpiredSubscriptions,
+  markContainerStoppedAfterExpiry,
+  listVolumeGcCandidates,
+  markContainerRemoved,
+  AgentInsufficientCreditsError,
+  AgentAlreadyActiveError,
+  AgentNotSubscribedError,
+  AGENT_PLAN_BASIC,
+  DEFAULT_AGENT_PLAN_PRICE_CREDITS,
+  DEFAULT_AGENT_PLAN_DURATION_DAYS,
+  DEFAULT_AGENT_VOLUME_GC_DAYS,
+  provisionContainer,
+  runLifecycleTick,
+  startLifecycleScheduler,
+} from "./agent/index.js";
+export type {
+  AgentPlan,
+  AgentSubscriptionStatus,
+  AgentContainerStatus,
+  OpenAgentSubscriptionInput,
+  OpenAgentSubscriptionResult,
+  AgentStatusView,
+  CancelAgentSubscriptionResult,
+  ExpiredSubscriptionRow,
+  GcCandidateRow,
+  ProvisionContainerOptions,
+  LifecycleTickOptions,
+  LifecycleTickResult,
+  LifecycleLogger,
+  LifecycleScheduler,
+  StartLifecycleSchedulerOptions,
+} from "./agent/index.js";
+export type { AgentHttpDeps } from "./http/agent.js";

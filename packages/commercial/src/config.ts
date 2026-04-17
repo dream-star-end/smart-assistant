@@ -131,6 +131,48 @@ const agentCpus = z
  */
 const agentProxyUrl = urlStringWithProtocols(["http:", "https:"], "AGENT_PROXY_URL").optional();
 
+/**
+ * T-53:
+ * - `AGENT_SECCOMP_PATH`:agent_seccomp.json 的绝对路径;启动时 readFile 拿 JSON 内容
+ *   传给 supervisor。未配 → 无法 open agent(/api/agent/open 返 503)。
+ * - `AGENT_RPC_SOCKET_DIR`:RPC unix socket 在 host 上的父目录(T-52 bind mount
+ *   `${dir}/u{uid}/agent.sock`);启动时 mkdir 递归建;未配 → 503。
+ * - `AGENT_PLAN_PRICE_CREDITS`:订阅价格(单位:分),默认 2900(¥29)。
+ *   CHECK 白名单 [1, 1_000_000_000] —— 允许压测场景改便宜,不允许 0 或负
+ *   (以及荒唐地大)。
+ * - `AGENT_PLAN_DURATION_DAYS`:订阅周期,默认 30。范围 [1, 365]。
+ * - `AGENT_VOLUME_GC_DAYS`:订阅到期后 volume 保留多少天,默认 30。范围 [1, 365]。
+ * - `AGENT_LIFECYCLE_TICK_MS`:lifecycle 扫描间隔,默认 3_600_000(1 小时)。
+ *   范围 [60_000, 86_400_000] — 至少 1 分钟,至多 1 天。
+ */
+const absolutePath = (field: string) =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .max(1024)
+    .refine((v) => v.startsWith("/"), `${field} must be absolute (start with /)`)
+    .refine((v) => !v.split("/").some((seg) => seg === ".."), `${field} must not contain '..'`)
+    .optional();
+
+const agentSeccompPath = absolutePath("AGENT_SECCOMP_PATH");
+const agentRpcSocketDir = absolutePath("AGENT_RPC_SOCKET_DIR");
+
+const agentPlanPriceCredits = z
+  .string()
+  .regex(/^\d+$/, "AGENT_PLAN_PRICE_CREDITS must be a non-negative integer")
+  .transform((v) => BigInt(v))
+  .refine((n) => n > 0n && n <= 1_000_000_000n, "AGENT_PLAN_PRICE_CREDITS must be in (0, 1_000_000_000]")
+  .optional();
+const agentPlanDurationDays = positiveInt(365);
+const agentVolumeGcDays = positiveInt(365);
+const agentLifecycleTickMs = z
+  .string()
+  .regex(/^\d+$/, "AGENT_LIFECYCLE_TICK_MS must be a positive integer")
+  .transform((v) => Number.parseInt(v, 10))
+  .refine((n) => n >= 60_000 && n <= 86_400_000, "AGENT_LIFECYCLE_TICK_MS must be in [60_000, 86_400_000]")
+  .optional();
+
 export const commercialConfigSchema = z
   .object({
     DATABASE_URL: databaseUrl,
@@ -150,6 +192,12 @@ export const commercialConfigSchema = z
     AGENT_CPUS: agentCpus,
     AGENT_PIDS_LIMIT: agentPidsLimit,
     AGENT_PROXY_URL: agentProxyUrl,
+    AGENT_SECCOMP_PATH: agentSeccompPath,
+    AGENT_RPC_SOCKET_DIR: agentRpcSocketDir,
+    AGENT_PLAN_PRICE_CREDITS: agentPlanPriceCredits,
+    AGENT_PLAN_DURATION_DAYS: agentPlanDurationDays,
+    AGENT_VOLUME_GC_DAYS: agentVolumeGcDays,
+    AGENT_LIFECYCLE_TICK_MS: agentLifecycleTickMs,
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。

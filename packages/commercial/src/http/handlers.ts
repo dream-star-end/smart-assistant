@@ -24,6 +24,7 @@ import type { PricingCache } from "../billing/pricing.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { ChatLLM } from "./chat.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
+import type { AgentHttpDeps } from "./agent.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -64,6 +65,11 @@ export interface CommercialHttpDeps {
     requestReset: RateLimitConfig;
     hupiCreate: RateLimitConfig;
   }>;
+  /**
+   * T-53: Agent 运行时(docker + image + network + seccomp + proxy + rpc dir)。
+   * 未注入时 `/api/agent/open` 返 503(仍允许 /status 查看过去订阅)。
+   */
+  agentRuntime?: AgentHttpDeps;
 }
 
 export interface RequestContext {
