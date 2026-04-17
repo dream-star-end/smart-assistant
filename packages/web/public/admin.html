@@ -157,13 +157,21 @@ const el = (tag, props = {}, children = []) => {
   return n;
 };
 
-/** 如果 access token 剩不到 REFRESH_SKEW_SEC,调 /api/auth/refresh 续期;失败 → 清 session。 */
+/**
+ * 如果 access token 剩不到 REFRESH_SKEW_SEC 秒就续期;刷新失败 → 清 session。
+ *
+ * access_exp 由后端返回,格式是 Unix 秒(number)。localStorage 写入时会被
+ * 强制 toString,所以这里读回来必须显式 Number() + *1000。历史上曾经用
+ * `Date.parse(expRaw)` 解析 → 永远 NaN → 自动续期从不触发,直到 15 分钟
+ * access_token 过期才靠 401 兜底清 session。
+ */
 async function maybeRefresh() {
   const expRaw = localStorage.getItem(ACCESS_EXP_KEY);
   const refresh = localStorage.getItem(REFRESH_KEY);
   if (!expRaw || !refresh) return;
-  const expMs = Date.parse(expRaw);
-  if (!Number.isFinite(expMs)) return;
+  const expSec = Number(expRaw);
+  if (!Number.isFinite(expSec) || expSec <= 0) return;
+  const expMs = expSec * 1000;
   if (expMs - Date.now() > REFRESH_SKEW_SEC * 1000) return;
   try {
     const res = await fetch("/api/auth/refresh", {
