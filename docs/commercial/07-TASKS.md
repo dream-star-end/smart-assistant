@@ -679,12 +679,29 @@
 - [ ] `release({account_id, result})` 触发 health 更新
 
 **Acceptance**:
-- [ ] 单元:sticky 对同 session_id 稳定
-- [ ] 单元:sticky 账号不可用时 fallback 到其他账号
-- [ ] 单元:chat 模式加权分布大致符合(大量采样统计)
-- [ ] 单元:全部 cooldown → 抛 503
+- [x] 单元:sticky 对同 session_id 稳定
+- [x] 单元:sticky 账号不可用时 fallback 到其他账号
+- [x] 单元:chat 模式加权分布大致符合(大量采样统计)
+- [x] 单元:全部 cooldown → 抛 503
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- 新 `src/account-pool/scheduler.ts`:`AccountScheduler` 类 + `pickSticky` / `pickWeighted` / `defaultHash` 纯函数 + `AccountPoolUnavailableError`(`code = ERR_ACCOUNT_POOL_UNAVAILABLE`,用于上层映射 503)。
+- **Sticky 哈希**:用 Rendezvous(HRW / highest-random-weight)哈希 —— 对每个候选 `hash(sessionId + ':' + account_id)` 取最大。比朴素 `hash(sessionId) % N` 稳 —— 账号加入/退出只影响 O(1/N) 的 session,满足 prompt cache。哈希用 SHA-256 前 8 byte 作 BigInt,跨进程一致。测试可注入 hash fn。
+- **Weighted**:权重 = `max(1, health_score)`。即便所有 active 账号 health=0,每个 weight=1 退化为均匀随机,保证总有账号被挑出 → 让 health tracker 有机会在请求回来之后恢复它,避免死锁。`random` 可注入 PRNG。
+- **候选集**:`SELECT ... WHERE status='active' ORDER BY id`。disabled/cooldown/banned 全部不参与。候选为空 → 立刻 `AccountPoolUnavailableError`。注:不用 Redis 缓存 health,直接走 DB,让 health tracker 单向负责缓存一致性;scheduler 读 health 时走 T-31 的 `getHealthScore`(本 task 未用,留待性能优化时启用)。
+- **pick 结果**:返 `account_id` + `plan` + 解密后的 `token: Buffer` + 可选 `refresh: Buffer`。**调用方必须 `.fill(0)`**(所有 integ test 都演示了用后清零模式)。
+- **中间失踪**:若在 pick SELECT 和 `getTokenForUse` 之间账号被删(比如超管并发删除),`readToken` 拿到 null → 抛 `AccountPoolUnavailableError("account vanished")`,让上层重试或 503。
+- **release**:`{kind: "success" | "failure", error?}` → 直接转交 `health.onSuccess` / `health.onFailure`。文档注释里给上游标准 try/finally 模版(捕 success/failure + 清 token buffer)。
+- **mode 校验**:`mode=agent` 必须带 sessionId(含非空检查),`mode` 非 'agent'|'chat' → TypeError,尽早 fail 在 DB 调用前。
+- 更新 `src/index.ts` 导出 AccountScheduler / AccountPoolUnavailableError / pickSticky / pickWeighted / defaultHash / 类型。
+
+**测试**: +1 unit 文件(13 case)+ 1 integ 文件(13 case)。
+- accountScheduler.test.ts:defaultHash 确定性/不同输入大概率不同/值域 [0, 2^64);pickSticky 同 session 稳定/不同 session 4 账号分布均匀 ±15%/5 账号缩为 4 账号仅 ~1/5 的 session 迁移/注入 hash 可重现选择/空候选抛错;pickWeighted 单候选唯一/random=0 选首/random=0.999 选尾/100 vs 10 health 比例 ~10× (7~14)/ 全 0 health 均匀分布 ±5%/空候选抛错。
+- accountScheduler.integ.test.ts:无 active 账号抛 code=ERR_ACCOUNT_POOL_UNAVAILABLE/全部 cooldown 抛错/disabled+banned 排除在候选外;mode=agent 同 sessionId 多次返同账号/首选切 cooldown 后 fallback 到另一账号/缺 sessionId TypeError(含空字符串);mode=chat 注入 random=0/0.5/0.999 精确选到 a/b/c 账号/mode 非法 TypeError;pick 返 token 还原为明文 access+refresh;release(success) → success_count++ + Redis health 100/release(failure, error) → fail_count++ + last_error 写入 + health 80/release(failure) 无 error 不覆盖前次 last_error(COALESCE);pick 后删唯一账号 → 再 pick 抛错。
+
+**总计**: 198 unit + 193 integ = 391 全绿(较 T-31 的 365 +26)。
 
 ---
 

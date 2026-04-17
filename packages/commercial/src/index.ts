@@ -296,3 +296,19 @@ export type {
   HealthRedis,
   HealthDeps,
 } from "./account-pool/health.js";
+// T-32 账号池 scheduler
+export {
+  AccountScheduler,
+  AccountPoolUnavailableError,
+  ERR_ACCOUNT_POOL_UNAVAILABLE,
+  pickSticky,
+  pickWeighted,
+  defaultHash,
+} from "./account-pool/scheduler.js";
+export type {
+  PickInput,
+  PickResult,
+  ReleaseInput,
+  ReleaseResult,
+  SchedulerDeps,
+} from "./account-pool/scheduler.js";
