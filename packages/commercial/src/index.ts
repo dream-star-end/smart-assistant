@@ -5,10 +5,19 @@
  * 然后在 gateway/src/server.ts 中条件挂载(见 docs/commercial/02-ARCHITECTURE §8)。
  *
  * T-02 起,本文件在挂载时会自动跑 schema migration(除非 COMMERCIAL_AUTO_MIGRATE=0)。
+ * T-16 起,registerCommercial 还会:
+ *   - 装配 redis 客户端(REDIS_URL,用于限流)
+ *   - 实例化 HTTP 路由处理器,通过 result.handle 暴露给 gateway
  */
 
+import IORedis from "ioredis";
 import { runMigrations } from "./db/migrate.js";
 import { closePool } from "./db/index.js";
+import { loadConfig } from "./config.js";
+import { stubMailer } from "./auth/mail.js";
+import { wrapIoredis } from "./middleware/rateLimit.js";
+import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
+import { warmupLoginDummyHash } from "./auth/login.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -39,19 +48,38 @@ function shouldAutoMigrate(
   return true;
 }
 
+export interface RegisterCommercialResult {
+  /**
+   * HTTP 处理器:gateway 在自身 handleHttp 入口前调用,
+   * 返回 true 表示已处理完毕,gateway 不再继续路由。
+   */
+  handle: CommercialHandler;
+  /** 关闭所有商业化资源(pool / redis)。 */
+  shutdown: () => Promise<void>;
+}
+
 /**
- * 注册商业化模块的所有路由和中间件到 Gateway。
+ * 注册商业化模块。
  *
- * 挂载步骤(T-02 阶段):
- *   1. 执行 schema migrations(可通过 COMMERCIAL_AUTO_MIGRATE=0 跳过,例如外部已 migrate)
- *   2. (TODO T-16)挂载 /api/auth/*
- *   3. 返回 unregister 回调 —— 目前只关 pool
+ * 1. 校验 env(loadConfig)— 缺失/非法直接抛 ConfigError
+ * 2. 自动跑 schema migrations(除非 COMMERCIAL_AUTO_MIGRATE=0)
+ * 3. 装配 ioredis 客户端 + HTTP 处理器
+ * 4. warmupLoginDummyHash 提前算 dummy argon2 hash(否则首个错登录请求要等 ~80ms)
+ * 5. 返回 { handle, shutdown }
  *
- * @param app — Gateway 应用对象(具体类型在 T-16 确定)
- * @returns 注销函数(shutdown 时调用)
+ * @param app — gateway 应用对象;预留参数,目前未直接使用,以便后续 hook
+ * @returns 包含 handle 和 shutdown 的对象
  */
-export async function registerCommercial(app: unknown): Promise<() => Promise<void>> {
+export async function registerCommercial(
+  app: unknown,
+  options: {
+    /** 测试可注入 jwt secret 而非从 env 读 */
+    jwtSecret?: string | Uint8Array;
+  } = {},
+): Promise<RegisterCommercialResult> {
   void app;
+
+  const cfg = loadConfig();
 
   if (shouldAutoMigrate()) {
     // eslint-disable-next-line no-console
@@ -69,8 +97,42 @@ export async function registerCommercial(app: unknown): Promise<() => Promise<vo
     console.log("[commercial] auto-migrate disabled (COMMERCIAL_AUTO_MIGRATE=0)");
   }
 
-  return async () => {
-    await closePool();
+  const jwtSecret =
+    options.jwtSecret ??
+    process.env.COMMERCIAL_JWT_SECRET ??
+    process.env.JWT_SECRET ??
+    "";
+  if (typeof jwtSecret === "string" && jwtSecret.length === 0) {
+    throw new Error(
+      "[commercial] COMMERCIAL_JWT_SECRET (or JWT_SECRET) must be set when COMMERCIAL_ENABLED=1",
+    );
+  }
+
+  const redis = new IORedis(cfg.REDIS_URL, {
+    lazyConnect: false,
+    maxRetriesPerRequest: 3,
+    enableReadyCheck: true,
+  });
+
+  // 预热 dummy hash:第一次登录无影响
+  await warmupLoginDummyHash();
+
+  const handler = createCommercialHandler({
+    jwtSecret,
+    mailer: stubMailer,
+    redis: wrapIoredis(redis),
+    turnstileSecret: cfg.TURNSTILE_SECRET,
+    turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,
+    verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
+    resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
+  });
+
+  return {
+    handle: handler,
+    shutdown: async () => {
+      try { await redis.quit(); } catch { /* ignore */ }
+      await closePool();
+    },
   };
 }
 
@@ -78,3 +140,6 @@ export const COMMERCIAL_VERSION = "0.1.0";
 // 便于 gateway / 测试单独访问
 export { runMigrations } from "./db/migrate.js";
 export { shouldAutoMigrate };
+export { createCommercialHandler } from "./http/router.js";
+export type { CommercialHandler } from "./http/router.js";
+export type { CommercialHttpDeps } from "./http/handlers.js";

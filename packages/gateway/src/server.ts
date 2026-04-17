@@ -68,6 +68,13 @@ export class Gateway {
   private _shuttingDown = false
   private _shutdownPromise: Promise<void> | null = null
 
+  // ── Commercial module (optional, gated by COMMERCIAL_ENABLED=1) ──
+  // When mounted, `commercialHandle(req, res)` runs BEFORE this.handleHttp
+  // and short-circuits the request if it returns true. Lets @openclaude/commercial
+  // own /api/auth/* + /api/me without touching the personal-version gateway routes.
+  private commercialHandle: ((req: IncomingMessage, res: ServerResponse) => Promise<boolean>) | null = null
+  private commercialShutdown: (() => Promise<void>) | null = null
+
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
   private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
   private static readonly IDEMPOTENCY_MAX_KEYS = 1000
@@ -200,7 +207,37 @@ export class Gateway {
   async start(): Promise<void> {
     const { config } = this.deps
 
-    this.httpServer = createServer((req, res) => this.handleHttp(req, res))
+    // Optional commercial module (T-16). Loaded via dynamic import so when
+    // COMMERCIAL_ENABLED!=1 the gateway doesn't pull in pg/redis/argon2 etc.
+    if (process.env.COMMERCIAL_ENABLED === '1') {
+      const { registerCommercial } = await import('@openclaude/commercial')
+      const commercial = await registerCommercial(this)
+      this.commercialHandle = commercial.handle
+      this.commercialShutdown = commercial.shutdown
+      this.log.info('commercial module enabled')
+    }
+
+    this.httpServer = createServer(async (req, res) => {
+      // Let commercial take over /api/auth/* + /api/me when mounted.
+      // Returns true → request fully handled; false → fall through to gateway.
+      if (this.commercialHandle) {
+        try {
+          const handled = await this.commercialHandle(req, res)
+          if (handled) return
+        } catch (err) {
+          this.log.error('commercial handler threw', undefined, err)
+          if (!res.headersSent) {
+            res.statusCode = 500
+            res.setHeader('Content-Type', 'application/json')
+            res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'internal error' } }))
+          } else {
+            res.destroy()
+          }
+          return
+        }
+      }
+      this.handleHttp(req, res)
+    })
     this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' })
 
     // WS keepalive: ping every 25s, terminate if no pong in 35s
@@ -676,6 +713,18 @@ export class Gateway {
       }
     })
     await Promise.allSettled([httpCloseDone, wssCloseDone])
+
+    // ── Stage 6: shut down commercial (pg pool / redis) if it was mounted ──
+    if (this.commercialShutdown) {
+      try {
+        await this.commercialShutdown()
+      } catch (err) {
+        this.log.warn('commercial shutdown error', undefined, err)
+      }
+      this.commercialShutdown = null
+      this.commercialHandle = null
+    }
+
     this.log.info('shutdown complete')
     if (exit) process.exit(0)
   }

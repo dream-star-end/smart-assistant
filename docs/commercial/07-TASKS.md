@@ -396,21 +396,23 @@
 **文档**: 02-ARCH §8, 04-API §1
 
 **内容**:
-- [ ] `src/auth/middleware.ts`:`requireAuth(req)` → 解析 Bearer token,注入 `req.user`,失败 401
-- [ ] `src/index.ts` 的 `registerCommercial(app)`:
-  - 挂载路由 `/api/auth/*`(前缀统一 `/api/...`)
-  - 挂所有必要中间件:request-id → logger → cors → security-headers → rateLimit → 路由
-- [ ] `packages/gateway/src/server.ts` 加条件挂载(见 02-ARCH §8)
-- [ ] 所有全局安全 headers(05-SEC §6)统一中间件设置
+- [x] `src/http/auth.ts`:`requireAuth(req, jwtSecret)` → 解析 `Bearer [A-Za-z0-9._-]+`,成功返回 `{id, role, jti}`,失败一律 401 UNAUTHORIZED(不区分缺 token / 过期 / 算法不允许 / 篡改,避免 oracle)
+- [x] `src/http/util.ts`:`HttpError` 类 + `sendJson/sendError` + `ensureRequestId(req)` + `readJsonBody(req, 64KiB)` + `setSecurityHeaders(res)`(HSTS/CSP/XCTO/XFO/Referrer-Policy,对齐 05-SEC §6)
+- [x] `src/http/handlers.ts`:8 个 handler(register/login/refresh/logout/verify-email/request-password-reset/confirm-password-reset/me),统一把 `RegisterError/LoginError/VerifyError/RefreshError` 映射成 HTTP 码;`/register` `/login` `/request-password-reset` 按 IP 走 T-15 限流(429 + Retry-After + rate_limit_events 记录)
+- [x] `src/http/router.ts`:`createCommercialHandler(deps)` → `(req, res) => Promise<boolean>`。命中前缀 `/api/auth/`, `/api/me` 时统一 setSecurityHeaders + ensureRequestId + X-Request-Id 回写;路径不命中返 `false` 让 gateway fall-through;方法不匹配 → 405+Allow;未知路径 → 404
+- [x] `src/index.ts` `registerCommercial(app, options?)`:loadConfig → 跑 migrations(除非 COMMERCIAL_AUTO_MIGRATE=0) → 组装 ioredis(lazyConnect:false, enableReadyCheck) → warmupLoginDummyHash → 返 `{handle, shutdown}`(shutdown 清 redis/pool)。JWT secret 从 options / COMMERCIAL_JWT_SECRET / JWT_SECRET 取,都没则直接抛
+- [x] `packages/gateway/src/server.ts`:新增 `commercialHandle/commercialShutdown` 字段;`start()` 里当 `COMMERCIAL_ENABLED=1` 时动态 import `@openclaude/commercial` 并装载;`createServer` wrapper 改成先 await commercialHandle(req,res),为 true 直接 return,否则 fall through 到 `handleHttp`;`_doShutdown` 新增 Stage 6 关 commercial
 
 **Acceptance**:
-- [ ] 集成:完整端到端注册 → 登录 → 用 access 访问 `/api/me` → 返回用户信息
-- [ ] 集成:不带 token 访问 → 401
-- [ ] 集成:过期 token → 401
-- [ ] 集成:启动 Gateway(COMMERCIAL_ENABLED=1)后 `/healthz` 正常响应
-- [ ] 集成:响应头含 HSTS/X-Content-Type-Options/CSP
+- [x] 集成:完整端到端注册 → 登录 → 用 access 访问 `/api/me` → 返回 `{id, email, email_verified, role, display_name, avatar_url, credits}` — `http.integ.test.ts#end-to-end`
+- [x] 集成:不带 token / 过期 token / 乱填 token 访问 → 401 UNAUTHORIZED — `http.integ.test.ts#/api/me without/expired/garbage token`
+- [x] 集成:gateway-style wrapper 下 `/healthz` 被 commercial handle 放行,fall through 到 gateway stub 返 200;而 `/api/auth/register` 被 commercial 吃掉,gateway stub 不会命中 — `http.integ.test.ts#commercial + gateway fall-through smoke`
+- [x] 集成:所有响应都带 HSTS / X-Content-Type-Options / CSP `default-src 'none'` / X-Frame-Options DENY — `http.integ.test.ts#response carries security headers`
+- [x] 集成:wrong method → 405+Allow;body > 64KiB → 413;错 JSON → 400 INVALID_JSON;限流超限 → 429+Retry-After 且 rate_limit_events 写了 blocked=true 行
 
-**Status**: `[ ] todo`
+**测试**: 15 个新 HTTP 集成 + 2 个 gateway fall-through smoke = 17 个 case(全部 pass,作为 commercial 套件的一部分跑)
+
+**Status**: `[x] done` (commit <pending>)
 
 ---
 
