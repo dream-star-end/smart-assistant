@@ -43,6 +43,31 @@ import {
   type TopupPlanRowView,
   type PatchPlanInput,
 } from "../admin/plans.js";
+import {
+  adminListAccounts,
+  adminGetAccount,
+  adminCreateAccount,
+  adminPatchAccount,
+  adminDeleteAccount,
+  type AdminCreateAccountInput,
+  type AdminPatchAccountInput,
+} from "../admin/accounts.js";
+import {
+  listContainers,
+  adminRestartContainer,
+  adminStopContainer,
+  adminRemoveContainer,
+  ContainerNotFoundError,
+  type AdminContainerRowView,
+} from "../admin/containers.js";
+import {
+  listLedger,
+  LEDGER_MAX_LIMIT,
+  LEDGER_REASONS,
+  type LedgerRowView,
+  type LedgerReason,
+} from "../admin/ledger.js";
+import { AccountNotFoundError, type AccountRow } from "../account-pool/store.js";
 import { adminAdjust, InsufficientCreditsError } from "../billing/ledger.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
 
@@ -508,4 +533,335 @@ export async function handleAdminPatchPlan(
     if (err instanceof RangeError) translateRangeError(err);
     throw err;
   }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// T-60(3/3): accounts / agent-containers / ledger
+// ════════════════════════════════════════════════════════════════════
+
+function serializeAccount(a: AccountRow): Record<string, unknown> {
+  return {
+    id: a.id.toString(),
+    label: a.label,
+    plan: a.plan,
+    status: a.status,
+    health_score: a.health_score,
+    cooldown_until: a.cooldown_until?.toISOString() ?? null,
+    oauth_expires_at: a.oauth_expires_at?.toISOString() ?? null,
+    last_used_at: a.last_used_at?.toISOString() ?? null,
+    last_error: a.last_error,
+    success_count: a.success_count.toString(),
+    fail_count: a.fail_count.toString(),
+    quota_remaining: a.quota_remaining,
+    created_at: a.created_at.toISOString(),
+    updated_at: a.updated_at.toISOString(),
+  };
+}
+
+function serializeContainer(r: AdminContainerRowView): Record<string, unknown> {
+  return {
+    id: r.id,
+    user_id: r.user_id,
+    user_email: r.user_email,
+    subscription_id: r.subscription_id,
+    subscription_status: r.subscription_status,
+    subscription_end_at: r.subscription_end_at?.toISOString() ?? null,
+    docker_id: r.docker_id,
+    docker_name: r.docker_name,
+    workspace_volume: r.workspace_volume,
+    home_volume: r.home_volume,
+    image: r.image,
+    status: r.status,
+    last_started_at: r.last_started_at?.toISOString() ?? null,
+    last_stopped_at: r.last_stopped_at?.toISOString() ?? null,
+    volume_gc_at: r.volume_gc_at?.toISOString() ?? null,
+    last_error: r.last_error,
+    created_at: r.created_at.toISOString(),
+    updated_at: r.updated_at.toISOString(),
+  };
+}
+
+function serializeLedger(r: LedgerRowView): Record<string, unknown> {
+  return {
+    id: r.id,
+    user_id: r.user_id,
+    delta: r.delta,
+    balance_after: r.balance_after,
+    reason: r.reason,
+    ref_type: r.ref_type,
+    ref_id: r.ref_id,
+    memo: r.memo,
+    created_at: r.created_at.toISOString(),
+  };
+}
+
+// ─── accounts ──────────────────────────────────────────────────────
+
+export async function handleAdminListAccounts(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+  const status = sp.get("status") ?? undefined;
+  const limit = parsePositiveInt(sp.get("limit"), "limit", 500);
+  const offset = parseNonNegativeInt(sp.get("offset"), "offset");
+  try {
+    const rows = await adminListAccounts({
+      status: status === undefined || status === "" ? undefined : (status as never),
+      limit,
+      offset,
+    });
+    sendJson(res, 200, { rows: rows.map(serializeAccount) });
+  } catch (err) { translateRangeError(err); }
+}
+
+export async function handleAdminGetAccount(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const id = extractTailId(url, "/api/admin/accounts/");
+  const a = await adminGetAccount(id);
+  if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
+  sendJson(res, 200, { account: serializeAccount(a) });
+}
+
+export async function handleAdminCreateAccount(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdmin(req, deps.jwtSecret);
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.label !== "string") throw new HttpError(400, "VALIDATION", "label is required");
+  if (typeof b.plan !== "string") throw new HttpError(400, "VALIDATION", "plan is required");
+  if (typeof b.oauth_token !== "string" || b.oauth_token.length === 0) {
+    throw new HttpError(400, "VALIDATION", "oauth_token is required");
+  }
+  const input: AdminCreateAccountInput = {
+    label: b.label,
+    plan: b.plan as AdminCreateAccountInput["plan"],
+    oauth_token: b.oauth_token,
+  };
+  if (b.oauth_refresh_token !== undefined) {
+    if (b.oauth_refresh_token !== null && typeof b.oauth_refresh_token !== "string") {
+      throw new HttpError(400, "VALIDATION", "oauth_refresh_token must be string or null");
+    }
+    input.oauth_refresh_token = b.oauth_refresh_token;
+  }
+  if (b.oauth_expires_at !== undefined) {
+    if (b.oauth_expires_at !== null && typeof b.oauth_expires_at !== "string") {
+      throw new HttpError(400, "VALIDATION", "oauth_expires_at must be ISO string or null");
+    }
+    input.oauth_expires_at = b.oauth_expires_at as string | null;
+  }
+
+  try {
+    const a = await adminCreateAccount(input, {
+      adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
+    });
+    sendJson(res, 201, { account: serializeAccount(a) });
+  } catch (err) {
+    if (err instanceof RangeError) translateRangeError(err);
+    throw err;
+  }
+}
+
+export async function handleAdminPatchAccount(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const id = extractTailId(url, "/api/admin/accounts/");
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  const patch: AdminPatchAccountInput = {};
+  if (b.label !== undefined) {
+    if (typeof b.label !== "string") throw new HttpError(400, "VALIDATION", "label must be string");
+    patch.label = b.label;
+  }
+  if (b.plan !== undefined) {
+    if (typeof b.plan !== "string") throw new HttpError(400, "VALIDATION", "plan must be string");
+    patch.plan = b.plan as AdminPatchAccountInput["plan"];
+  }
+  if (b.status !== undefined) {
+    if (typeof b.status !== "string") throw new HttpError(400, "VALIDATION", "status must be string");
+    patch.status = b.status as AdminPatchAccountInput["status"];
+  }
+  if (b.health_score !== undefined) {
+    if (typeof b.health_score !== "number") throw new HttpError(400, "VALIDATION", "health_score must be number");
+    patch.health_score = b.health_score;
+  }
+  if (b.oauth_token !== undefined) {
+    if (typeof b.oauth_token !== "string") throw new HttpError(400, "VALIDATION", "oauth_token must be string");
+    patch.oauth_token = b.oauth_token;
+  }
+  if (b.oauth_refresh_token !== undefined) {
+    if (b.oauth_refresh_token !== null && typeof b.oauth_refresh_token !== "string") {
+      throw new HttpError(400, "VALIDATION", "oauth_refresh_token must be string or null");
+    }
+    patch.oauth_refresh_token = b.oauth_refresh_token;
+  }
+  if (b.oauth_expires_at !== undefined) {
+    if (b.oauth_expires_at !== null && typeof b.oauth_expires_at !== "string") {
+      throw new HttpError(400, "VALIDATION", "oauth_expires_at must be ISO string or null");
+    }
+    patch.oauth_expires_at = b.oauth_expires_at as string | null;
+  }
+
+  try {
+    const a = await adminPatchAccount(id, patch, {
+      adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, { account: serializeAccount(a) });
+  } catch (err) {
+    if (err instanceof AccountNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
+    if (err instanceof RangeError) translateRangeError(err);
+    throw err;
+  }
+}
+
+export async function handleAdminDeleteAccount(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const id = extractTailId(url, "/api/admin/accounts/");
+  const ok = await adminDeleteAccount(id, {
+    adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
+  });
+  if (!ok) throw new HttpError(404, "NOT_FOUND", "account not found");
+  sendJson(res, 200, { deleted: true });
+}
+
+// ─── agent containers ──────────────────────────────────────────────
+
+export async function handleAdminListAgentContainers(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+  const status = sp.get("status") ?? undefined;
+  const limit = parsePositiveInt(sp.get("limit"), "limit", 500);
+  const offset = parseNonNegativeInt(sp.get("offset"), "offset");
+  try {
+    const rows = await listContainers({
+      status: status === undefined || status === "" ? undefined : status,
+      limit,
+      offset,
+    });
+    sendJson(res, 200, { rows: rows.map(serializeContainer) });
+  } catch (err) { translateRangeError(err); }
+}
+
+type ContainerAction = "restart" | "stop" | "remove";
+
+function parseContainerActionUrl(url: URL): { id: string; action: ContainerAction } {
+  const prefix = "/api/admin/agent-containers/";
+  if (!url.pathname.startsWith(prefix)) {
+    throw new HttpError(404, "NOT_FOUND", "route not found");
+  }
+  const tail = url.pathname.slice(prefix.length);
+  const parts = tail.split("/");
+  if (parts.length !== 2) {
+    throw new HttpError(404, "NOT_FOUND", "expected /:id/{restart,stop,remove}");
+  }
+  const [id, action] = parts;
+  if (!/^[1-9][0-9]{0,19}$/.test(id)) {
+    throw new HttpError(400, "VALIDATION", "invalid id in URL");
+  }
+  if (action !== "restart" && action !== "stop" && action !== "remove") {
+    throw new HttpError(404, "NOT_FOUND", `unknown action: ${action}`);
+  }
+  return { id, action };
+}
+
+export async function handleAdminAgentContainerAction(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const { id, action } = parseContainerActionUrl(url);
+  const agent = deps.agentRuntime;
+  if (!agent) {
+    throw new HttpError(503, "AGENT_NOT_READY", "agent runtime is not configured");
+  }
+  const auditCtx = { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent };
+  try {
+    if (action === "restart") await adminRestartContainer(id, agent.docker, auditCtx);
+    else if (action === "stop") await adminStopContainer(id, agent.docker, auditCtx);
+    else await adminRemoveContainer(id, agent.docker, auditCtx);
+  } catch (err) {
+    if (err instanceof ContainerNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
+    throw err;
+  }
+  sendJson(res, 200, { ok: true, action });
+}
+
+// ─── ledger ────────────────────────────────────────────────────────
+
+export async function handleAdminListLedger(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+  const userIdRaw = sp.get("user_id");
+  const reasonRaw = sp.get("reason");
+  const beforeRaw = sp.get("before");
+  const limit = parsePositiveInt(sp.get("limit"), "limit", LEDGER_MAX_LIMIT);
+
+  let reason: LedgerReason | undefined;
+  if (reasonRaw !== null && reasonRaw !== "") {
+    if (!(LEDGER_REASONS as readonly string[]).includes(reasonRaw)) {
+      throw new HttpError(400, "VALIDATION", "invalid reason", {
+        issues: [{ path: "reason", message: reasonRaw }],
+      });
+    }
+    reason = reasonRaw as LedgerReason;
+  }
+
+  try {
+    const r = await listLedger({
+      userId: userIdRaw === null || userIdRaw === "" ? undefined : userIdRaw,
+      reason,
+      before: beforeRaw === null || beforeRaw === "" ? undefined : beforeRaw,
+      limit,
+    });
+    sendJson(res, 200, {
+      rows: r.rows.map(serializeLedger),
+      next_before: r.next_before,
+    });
+  } catch (err) { translateRangeError(err); }
 }

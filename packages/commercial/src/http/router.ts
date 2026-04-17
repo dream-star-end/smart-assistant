@@ -61,6 +61,14 @@ import {
   handleAdminPatchPricing,
   handleAdminListPlans,
   handleAdminPatchPlan,
+  handleAdminListAccounts,
+  handleAdminGetAccount,
+  handleAdminCreateAccount,
+  handleAdminPatchAccount,
+  handleAdminDeleteAccount,
+  handleAdminListAgentContainers,
+  handleAdminAgentContainerAction,
+  handleAdminListLedger,
 } from "./admin.js";
 
 export type CommercialHandler = (
@@ -127,6 +135,17 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     // T-60 超管充值套餐
     { method: "GET",   path: "/api/admin/plans",          handler: handleAdminListPlans },
     { method: "PATCH", pathPrefix: "/api/admin/plans/",   handler: handleAdminPatchPlan },
+    // T-60 超管账号池
+    { method: "GET",    path: "/api/admin/accounts",         handler: handleAdminListAccounts },
+    { method: "POST",   path: "/api/admin/accounts",         handler: handleAdminCreateAccount },
+    { method: "GET",    pathPrefix: "/api/admin/accounts/",  handler: handleAdminGetAccount },
+    { method: "PATCH",  pathPrefix: "/api/admin/accounts/",  handler: handleAdminPatchAccount },
+    { method: "DELETE", pathPrefix: "/api/admin/accounts/",  handler: handleAdminDeleteAccount },
+    // T-60 超管 Agent 容器
+    { method: "GET",  path: "/api/admin/agent-containers",        handler: handleAdminListAgentContainers },
+    { method: "POST", pathPrefix: "/api/admin/agent-containers/", handler: handleAdminAgentContainerAction },
+    // T-60 超管积分流水
+    { method: "GET", path: "/api/admin/ledger", handler: handleAdminListLedger },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [
