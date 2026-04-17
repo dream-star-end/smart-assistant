@@ -601,11 +601,30 @@
   - `deleteAccount(id)`
 
 **Acceptance**:
-- [ ] 集成:create 后 DB 里 oauth_token_enc 是密文(非原文)
-- [ ] 集成:getTokenForUse 解密还原
-- [ ] 集成:篡改密文 1 byte → 解密失败
+- [x] 集成:create 后 DB 里 oauth_token_enc 是密文(非原文)
+- [x] 集成:getTokenForUse 解密还原
+- [x] 集成:篡改密文 1 byte → 解密失败
 
-**Status**: `[ ] todo`
+**Status**: `[x] done` — 2026-04-17
+
+完成说明:
+- 新 `src/account-pool/store.ts`:`createAccount` / `getAccount` / `listAccounts` / `getTokenForUse` / `updateAccount` / `deleteAccount` + `ACCOUNT_PLANS` / `ACCOUNT_STATUSES` 常量、`AccountRow` / `AccountToken` / `CreateAccountInput` / `UpdateAccountPatch` / `ListAccountsOptions` 类型。
+- AEAD:
+  * `createAccount` 用 `encrypt(token, key)` + `encrypt(refresh, key)`(可选),每次独立 12B nonce;access 和 refresh 密文/nonce 分两对列存。
+  * `getTokenForUse` 新增 `decryptToBuffer`(aead.ts),返回明文 Buffer 给上游;成功路径 Buffer 不清零(交给调用方 .fill(0));抛错路径就地 zero,不泄漏。
+  * `updateAccount(patch)` 显式区分 `token = string` / `refresh = string | null | undefined` 三种语义:string 重加密换 nonce,null 清空,undefined 保持。
+  * 密钥:默认 `loadKmsKey()`,每次函数结束 `zeroBuffer(key)`,不做进程级缓存;测试可注入 `keyFn`。
+- 查询白名单:`listAccounts` / `getAccount` / `updateAccount.RETURNING` 只走 `META_COLUMNS` 常量,**永不**选 `oauth_*_enc` / `oauth_*_nonce` → 防未来同事改 SQL 时回退把密文打进 log。测试里断言返回对象 key 集合不含密文列。
+- 参数化 + 白名单校验:plan / status 入库前 `ACCOUNT_PLANS.includes` / `ACCOUNT_STATUSES.includes`,health_score 强制 [0,100],token/refresh 空串直接 TypeError → 单元级反馈快,DB CHECK 约束作为二道防线。
+- `listAccounts` 支持 `status?: AccountStatus | AccountStatus[]`,`limit` 在 [1, 500] 之间 clamp(防无界扫描)。
+- `deleteAccount` 不阻断 FK — 让 `usage_records.account_id ON DELETE RESTRICT` 抛错透传;运维应先 `status='disabled'` 保留历史(测试里断言 FK 违反会 reject + 账号仍在)。
+- 更新 `src/index.ts` 导出全部公共 API + 类型,供后续 T-31/T-32 直接引用。
+
+**测试**: +1 unit 文件(12 case) + 1 integ 文件(25 case)。
+- accountStore.test.ts:ACCOUNT_PLANS/STATUSES 枚举、create 的非法 plan/空 token/非字符串 token/空 refresh、update 的非法 plan/非法 status/health_score 越界/空 token/空 refresh,共 12 case,都在 DB 调用前就拒绝。
+- accountStore.integ.test.ts:createAccount DB 真的是密文(含 16B tag / nonce 12B / 密文不包含明文片段)、含 refresh 时两对密文不冲突、listAccounts 列白名单断言、status 过滤(单值+数组)、id DESC、limit clamp、getAccount 命中/null、getTokenForUse 还原 access+refresh+expires_at、没 refresh 返 null、篡改密文 1 byte → AeadError、错 key → AeadError、update 普通字段时密文不动、update token 时两列都换、refresh=null 清空、refresh=string 重加密、空 patch → 不发 SQL 返现状(updated_at 不变)、update 不存在 id → null、health_score 越界 RangeError、非法 status TypeError、deleteAccount 成功/不存在、有 usage_records 引用时 FK RESTRICT 拒绝。
+
+**总计**: 174 unit + 165 integ = 339 全绿(较 T-24 完成时 302 新增 +12 unit + 25 integ = +37)。
 
 ---
 

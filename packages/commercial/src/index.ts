@@ -258,3 +258,24 @@ export type {
   MarkOrderPaidInput,
   MarkOrderPaidResult,
 } from "./payment/orders.js";
+// T-30 账号池 store
+export {
+  createAccount,
+  getAccount,
+  listAccounts,
+  getTokenForUse,
+  updateAccount,
+  deleteAccount,
+  ACCOUNT_PLANS,
+  ACCOUNT_STATUSES,
+  AccountNotFoundError,
+} from "./account-pool/store.js";
+export type {
+  AccountPlan,
+  AccountStatus,
+  AccountRow,
+  AccountToken,
+  CreateAccountInput,
+  UpdateAccountPatch,
+  ListAccountsOptions,
+} from "./account-pool/store.js";

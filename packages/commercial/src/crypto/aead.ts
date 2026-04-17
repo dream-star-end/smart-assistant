@@ -66,16 +66,20 @@ export function encrypt(
 }
 
 /**
- * 解密密文 + tag。
- * @returns UTF-8 字符串(MVP 用 token 都是 string;如需 Buffer 再加一条 API)
+ * 解密密文 + tag,返回 Buffer。
+ *
+ * 相比 `decrypt()` 返回 string,本函数返回 Buffer,调用方可以持有明文
+ * 直到真正不再需要时再 `.fill(0)` 清零 —— 对长期驻内存的 OAuth token
+ * 比 V8 string 常驻更可控。
+ *
  * @throws AeadError 当 tag/aad/ciphertext 被篡改,或 nonce/key 不匹配
  */
-export function decrypt(
+export function decryptToBuffer(
   ciphertextWithTag: Buffer,
   nonce: Buffer,
   key: Buffer,
   aad?: Buffer,
-): string {
+): Buffer {
   assertKey(key);
   if (nonce.length !== NONCE_BYTES) {
     throw new AeadError(`nonce must be ${NONCE_BYTES} bytes, got ${nonce.length}`);
@@ -88,9 +92,8 @@ export function decrypt(
   const decipher = createDecipheriv("aes-256-gcm", key, nonce);
   decipher.setAuthTag(tag);
   if (aad !== undefined) decipher.setAAD(aad);
-  let pt: Buffer;
   try {
-    pt = Buffer.concat([decipher.update(ct), decipher.final()]);
+    return Buffer.concat([decipher.update(ct), decipher.final()]);
   } catch (err) {
     // decipher.final() 在 tag 不对时抛 Error("Unsupported state or unable to
     // authenticate data"),统一包成 AeadError,不带原始 message 防侧信道。
@@ -98,6 +101,20 @@ export function decrypt(
       cause: err,
     });
   }
+}
+
+/**
+ * 解密密文 + tag。
+ * @returns UTF-8 字符串(MVP 用 token 都是 string;如需 Buffer 参见 `decryptToBuffer`)
+ * @throws AeadError 当 tag/aad/ciphertext 被篡改,或 nonce/key 不匹配
+ */
+export function decrypt(
+  ciphertextWithTag: Buffer,
+  nonce: Buffer,
+  key: Buffer,
+  aad?: Buffer,
+): string {
+  const pt = decryptToBuffer(ciphertextWithTag, nonce, key, aad);
   try {
     return pt.toString("utf8");
   } finally {
