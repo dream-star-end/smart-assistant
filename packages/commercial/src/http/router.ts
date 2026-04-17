@@ -38,6 +38,7 @@ import {
   type CommercialHttpDeps,
   type RequestContext,
 } from "./handlers.js";
+import { handleChat } from "./chat.js";
 
 export type CommercialHandler = (
   req: IncomingMessage,
@@ -68,9 +69,10 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     { method: "POST", path: "/api/auth/confirm-password-reset", handler: (req, res) => handleConfirmPasswordReset(req, res) },
     { method: "GET", path: "/api/me", handler: handleMe },
     { method: "GET", path: "/api/public/models", handler: handleListPublicModels },
+    { method: "POST", path: "/api/chat", handler: handleChat },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
-  const prefixes = ["/api/auth/", "/api/me", "/api/public/"];
+  const prefixes = ["/api/auth/", "/api/me", "/api/public/", "/api/chat"];
 
   return async function commercialHandler(req, res): Promise<boolean> {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);

@@ -19,6 +19,7 @@ import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { PricingCache } from "./billing/pricing.js";
+import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -146,6 +147,8 @@ export async function registerCommercial(
     verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
     resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
     pricing,
+    // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
+    preCheckRedis: wrapIoredisForPreCheck(redis),
   });
 
   return {
@@ -185,3 +188,18 @@ export type {
   AdminAdjustResult,
   LedgerRow,
 } from "./billing/ledger.js";
+export {
+  preCheck,
+  releasePreCheck,
+  estimateMaxCost,
+  InsufficientCreditsError as PreCheckInsufficientCreditsError,
+  InMemoryPreCheckRedis,
+  wrapIoredisForPreCheck,
+} from "./billing/preCheck.js";
+export type {
+  PreCheckRedis,
+  PreCheckInput,
+  PreCheckResult,
+} from "./billing/preCheck.js";
+export { stubChatLLM } from "./http/chat.js";
+export type { ChatLLM, ChatBody } from "./http/chat.js";

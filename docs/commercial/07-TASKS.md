@@ -518,20 +518,38 @@
 **文档**: 04-API §5, 05-SEC §15
 
 **内容**:
-- [ ] `src/billing/preCheck.ts`:
-  - 根据 req.body 的 `model` + `max_tokens` 估算 `max_cost`
-  - Redis 预锁 `precheck:user:<id>:<req_id>` TTL 5min
-  - 余额 < max_cost → 403 `ERR_INSUFFICIENT_CREDITS`
-- [ ] `POST /api/chat` 骨架(**不接真 Claude**,先 mock 返回固定 usage):
-  - 经过预检 → mock LLM → 按 usage 扣费 → 返回
-- [ ] 释放预锁
+- [x] `src/billing/preCheck.ts`:
+  - `estimateMaxCost(maxTokens, pricing)` — **按 output 维度保守估**(通常是 input 单价的 5x,最悲观,不会低估),向上取整到 1 分
+  - `preCheck(redis, {userId, requestId, model, maxTokens, pricing})`:
+    - Redis key `precheck:user:<id>:<req_id>`,TTL 5min
+    - 聚合当前用户所有 `precheck:user:<id>:*` 已预扣总和,加上本次 `maxCost`
+    - 与 `users.credits` 比对 → 不足抛 `PreCheckInsufficientError`(含 balance/required/shortfall)
+  - `releasePreCheck(redis, lockKey)` 幂等删除
+  - `wrapIoredisForPreCheck` 对 ioredis 的 SCAN+MGET 适配;`InMemoryPreCheckRedis` 测试用内存实现(支持 TTL swap)
+- [x] `POST /api/chat` 骨架(**不接真 Claude**,注入 `stubChatLLM` 返回固定 1000 in / 500 out):
+  - requireAuth → parseChatBody(model / max_tokens / messages 校验)
+  - preCheck → 不足 402 `ERR_INSUFFICIENT_CREDITS`
+  - `deps.chatLLM.complete(...)` → success 走事务内 FOR UPDATE debit + INSERT usage_records(status=success, ledger_id 挂上);error 只 INSERT usage_records(status=error, cost_credits=0)
+  - 模型未知/未启用 → 400 `UNKNOWN_MODEL`
+  - max_tokens 非法(≤0 / >1M / 非整数)→ 400 VALIDATION
+  - finally 释放预扣(best-effort,崩溃时 TTL 兜底)
+- [x] 路由:`router.ts` 加 `POST /api/chat` + 前缀 `/api/chat` 入白名单(POST 否则 405)
+- [x] `src/index.ts`:导出 preCheck 全家 + ChatLLM / stubChatLLM;`registerCommercial()` 注入 `wrapIoredisForPreCheck(redis)` 到 handler deps
 
 **Acceptance**:
-- [ ] 集成:余额足够 → 200 + 扣费正确
-- [ ] 集成:余额不足 → 402 + 未扣费
-- [ ] 集成:mock LLM 异常 → 不扣费(预锁过期释放)
+- [x] 单元:`estimateMaxCost` 已知 case(1M tok sonnet=3000分 / 1 tok ceil→1 / 0→0 / 不同 multiplier),非法入参 TypeError
+- [x] 单元:`InMemoryPreCheckRedis` set/get/del/sumByPrefix,TTL 过期自动清,脏数据(非 BigInt)被忽略不 throw
+- [x] 集成:余额足够 → 200 + cost_credits/balance_after 正确 + credit_ledger(reason=chat, ref_id=request_id)+ usage_records(status=success, ledger_id 挂上)+ 预扣已释放
+- [x] 集成:余额不足 → 402 ERR_INSUFFICIENT_CREDITS + users.credits 未变 + 无 ledger + 无 usage_records + Redis 锁未写(preCheck 抛错前)
+- [x] 集成:mock LLM 异常 → 502 + 未扣费 + usage_records.status='error' + cost_credits=0 + 预扣已释放
+- [x] 集成:未知/disabled 模型 → 400 UNKNOWN_MODEL(预检前拦截)
+- [x] 集成:max_tokens 非法 → 400 VALIDATION(0 / 负 / > 1M)
+- [x] 集成:未携带 Authorization → 401 UNAUTHORIZED
+- [x] 集成:同用户并发锁叠加 → 先锁 3500 分,再请求最多估 3000 分,余额 ≈ 6000 → 第 2 个请求 402(locked + needNew > balance)
 
-**Status**: `[ ] todo`
+**测试**: +9 unit case + 7 integ case 新增,258 tests 全绿(141 unit + 117 integ)
+
+**Status**: `[x] done`
 
 ---
 

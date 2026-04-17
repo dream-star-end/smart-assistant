@@ -21,6 +21,8 @@ import { query } from "../db/queries.js";
 import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLimitRedis } from "../middleware/rateLimit.js";
 import type { Mailer } from "../auth/mail.js";
 import type { PricingCache } from "../billing/pricing.js";
+import type { PreCheckRedis } from "../billing/preCheck.js";
+import type { ChatLLM } from "./chat.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -37,6 +39,13 @@ export interface CommercialHttpDeps {
    * (表示模块尚未加载完毕),便于 gateway 在 start 阶段早期也能挂上路由。
    */
   pricing?: PricingCache;
+  /**
+   * T-23: chat 预检用 Redis。未注入时 /api/chat 返 503。
+   * 测试可注入 `InMemoryPreCheckRedis` 跳过真 Redis。
+   */
+  preCheckRedis?: PreCheckRedis;
+  /** T-23: LLM 执行器,默认 stub(固定 1000 in / 500 out);T-40 接真 Claude 时替换 */
+  chatLLM?: ChatLLM;
   /** 限流配置覆盖(测试用) */
   rateLimits?: Partial<{
     register: RateLimitConfig;
