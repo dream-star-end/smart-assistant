@@ -367,16 +367,27 @@
 **文档**: 05-SEC §3, 04-API 末尾
 
 **内容**:
-- [ ] dep: `ioredis`
-- [ ] `src/middleware/rateLimit.ts`:`rateLimit({scope, keyBy, window, max})` 中间件工厂
-- [ ] 实现滑动窗口(固定窗口近似已足够 MVP):Redis INCR + EXPIRE
-- [ ] 超限:返回 429 + `Retry-After`,写 `rate_limit_events`
+- [x] dep: `ioredis@^5`(已加入 packages/commercial/package.json)
+- [x] `src/middleware/rateLimit.ts`:核心是框架无关的 `checkRateLimit(redis, cfg, identifier)` 函数
+  - 算法:固定窗口近似(`floor(now/window)*window` 作为窗口起点)
+  - 流程:INCR → 首次 EXPIRE → 决策(count <= max)
+  - EXPIRE 失败容忍(下个窗口仍能正常 expire,不致命)
+  - 返回 `{allowed, count, limit, retryAfterSeconds, key}`,T-16 据此返 429+Retry-After
+- [x] `recordRateLimitEvent(scope, identifier, blocked)`:写 rate_limit_events,失败仅 console.error
+- [x] `wrapIoredis(client)`:把 ioredis 客户端包成 `RateLimitRedis` 接口,便于 mock
+- (HTTP 中间件 wrapping 留给 T-16)
 
 **Acceptance**:
-- [ ] 单元:在 mock redis 上验证计数 + 过期
-- [ ] 集成:连续 6 次 login 触发 429(配 5/min)
+- [x] 单元:mock Redis 上 5+1 次连续请求(max=5)→ 第 6 次拒;窗口滚动后重置;不同 identifier/scope 隔离;EXPIRE 失败不抛
+- [x] 集成:真 Redis(127.0.0.1:56379)+ 真 PG;6/min 触发拒;TTL 通过 redis TTL 命令验证
 
-**Status**: `[ ] todo`
+**实施记录**:
+- 单测 12(覆盖快慢路径 / 窗口滚动 / 隔离 / EXPIRE 失败 / 入参校验)
+- integ 4(真 Redis 限流 + recordRateLimitEvent 写表 + TTL 校验 + 多 key 隔离)
+- rate_limit_events 表 schema 是 `(scope, key, blocked, created_at)` — recordRateLimitEvent 已对齐
+- 测试汇总:unit 90 + integ 71 全绿;typecheck 干净
+
+**Status**: `[x] done`
 
 ---
 
