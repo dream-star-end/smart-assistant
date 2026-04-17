@@ -57,6 +57,10 @@ import {
   handleAdminPatchUser,
   handleAdminAdjustCredits,
   handleAdminListAudit,
+  handleAdminListPricing,
+  handleAdminPatchPricing,
+  handleAdminListPlans,
+  handleAdminPatchPlan,
 } from "./admin.js";
 
 export type CommercialHandler = (
@@ -117,6 +121,12 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     { method: "PATCH", pathPrefix: "/api/admin/users/", handler: handleAdminPatchUser },
     // T-60 超管审计记录
     { method: "GET",   path: "/api/admin/audit",       handler: handleAdminListAudit },
+    // T-60 超管定价
+    { method: "GET",   path: "/api/admin/pricing",        handler: handleAdminListPricing },
+    { method: "PATCH", pathPrefix: "/api/admin/pricing/", handler: handleAdminPatchPricing },
+    // T-60 超管充值套餐
+    { method: "GET",   path: "/api/admin/plans",          handler: handleAdminListPlans },
+    { method: "PATCH", pathPrefix: "/api/admin/plans/",   handler: handleAdminPatchPlan },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [

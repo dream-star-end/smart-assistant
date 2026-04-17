@@ -29,6 +29,20 @@ import {
   ADMIN_AUDIT_MAX_LIMIT,
   type AdminAuditRowView,
 } from "../admin/audit.js";
+import {
+  listPricing,
+  patchPricing,
+  PricingNotFoundError,
+  type ModelPricingRowView,
+  type PatchPricingInput,
+} from "../admin/pricing.js";
+import {
+  listPlans,
+  patchPlan,
+  PlanNotFoundError,
+  type TopupPlanRowView,
+  type PatchPlanInput,
+} from "../admin/plans.js";
 import { adminAdjust, InsufficientCreditsError } from "../billing/ledger.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
 
@@ -313,4 +327,185 @@ export async function handleAdminListAudit(
       next_before: r.next_before,
     });
   } catch (err) { translateRangeError(err); }
+}
+
+// ─── pricing / plans serializers ────────────────────────────────────
+
+function serializePricing(r: ModelPricingRowView): Record<string, unknown> {
+  return {
+    model_id: r.model_id,
+    display_name: r.display_name,
+    input_per_mtok: r.input_per_mtok,
+    output_per_mtok: r.output_per_mtok,
+    cache_read_per_mtok: r.cache_read_per_mtok,
+    cache_write_per_mtok: r.cache_write_per_mtok,
+    multiplier: r.multiplier,
+    enabled: r.enabled,
+    sort_order: r.sort_order,
+    updated_at: r.updated_at.toISOString(),
+    updated_by: r.updated_by,
+  };
+}
+
+function serializePlan(r: TopupPlanRowView): Record<string, unknown> {
+  return {
+    id: r.id,
+    code: r.code,
+    label: r.label,
+    amount_cents: r.amount_cents,
+    credits: r.credits,
+    sort_order: r.sort_order,
+    enabled: r.enabled,
+    created_at: r.created_at.toISOString(),
+    updated_at: r.updated_at.toISOString(),
+  };
+}
+
+/** 从 `/api/admin/{pricing,plans}/<slug>` 抽 slug,用配套的正则验。 */
+function extractTailSlug(url: URL, prefix: string, re: RegExp): string {
+  const tail = url.pathname.slice(prefix.length);
+  if (!re.test(tail)) {
+    throw new HttpError(400, "VALIDATION", "invalid slug in URL", {
+      issues: [{ path: "slug", message: tail }],
+    });
+  }
+  return tail;
+}
+
+// ─── GET /api/admin/pricing ────────────────────────────────────────
+
+export async function handleAdminListPricing(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const rows = await listPricing();
+  sendJson(res, 200, { rows: rows.map(serializePricing) });
+}
+
+// ─── PATCH /api/admin/pricing/:model_id ─────────────────────────────
+
+export async function handleAdminPatchPricing(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const modelId = extractTailSlug(url, "/api/admin/pricing/", /^[A-Za-z0-9._-]{1,64}$/);
+
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  const patch: PatchPricingInput = {};
+  if (b.multiplier !== undefined) {
+    if (typeof b.multiplier !== "string" && typeof b.multiplier !== "number") {
+      throw new HttpError(400, "VALIDATION", "multiplier must be string or number", {
+        issues: [{ path: "multiplier", message: String(b.multiplier) }],
+      });
+    }
+    patch.multiplier = b.multiplier;
+  }
+  if (b.enabled !== undefined) {
+    if (typeof b.enabled !== "boolean") {
+      throw new HttpError(400, "VALIDATION", "enabled must be boolean");
+    }
+    patch.enabled = b.enabled;
+  }
+
+  try {
+    const r = await patchPricing(modelId, patch, {
+      adminId: admin.id,
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, { pricing: serializePricing(r) });
+  } catch (err) {
+    if (err instanceof PricingNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
+    if (err instanceof RangeError) translateRangeError(err);
+    throw err;
+  }
+}
+
+// ─── GET /api/admin/plans ──────────────────────────────────────────
+
+export async function handleAdminListPlans(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const rows = await listPlans();
+  sendJson(res, 200, { rows: rows.map(serializePlan) });
+}
+
+// ─── PATCH /api/admin/plans/:code ──────────────────────────────────
+
+export async function handleAdminPatchPlan(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const code = extractTailSlug(url, "/api/admin/plans/", /^[A-Za-z0-9_-]{1,64}$/);
+
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  const patch: PatchPlanInput = {};
+  if (b.label !== undefined) {
+    if (typeof b.label !== "string") {
+      throw new HttpError(400, "VALIDATION", "label must be string", {
+        issues: [{ path: "label", message: String(b.label) }],
+      });
+    }
+    patch.label = b.label;
+  }
+  if (b.amount_cents !== undefined) {
+    if (typeof b.amount_cents !== "string" && typeof b.amount_cents !== "number") {
+      throw new HttpError(400, "VALIDATION", "amount_cents must be string or number");
+    }
+    patch.amount_cents = b.amount_cents;
+  }
+  if (b.credits !== undefined) {
+    if (typeof b.credits !== "string" && typeof b.credits !== "number") {
+      throw new HttpError(400, "VALIDATION", "credits must be string or number");
+    }
+    patch.credits = b.credits;
+  }
+  if (b.sort_order !== undefined) {
+    if (typeof b.sort_order !== "number" || !Number.isInteger(b.sort_order)) {
+      throw new HttpError(400, "VALIDATION", "sort_order must be integer");
+    }
+    patch.sort_order = b.sort_order;
+  }
+  if (b.enabled !== undefined) {
+    if (typeof b.enabled !== "boolean") {
+      throw new HttpError(400, "VALIDATION", "enabled must be boolean");
+    }
+    patch.enabled = b.enabled;
+  }
+
+  try {
+    const r = await patchPlan(code, patch, {
+      adminId: admin.id,
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, { plan: serializePlan(r) });
+  } catch (err) {
+    if (err instanceof PlanNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
+    if (err instanceof RangeError) translateRangeError(err);
+    throw err;
+  }
 }
