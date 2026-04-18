@@ -34,6 +34,23 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
   let reconcileTimer: ReturnType<typeof setInterval> | null = null
   let shuttingDown = false
 
+  // Dedup set for tool_use announcements. A streaming assistant turn may emit
+  // the same tool_use block several times (partial=true then partial=false,
+  // or a re-delivered OutboundMessage). Keys are
+  // `${userId}:${senderId}:${blockId}`. Bounded to keep the set from growing
+  // unbounded over long-lived sessions.
+  const announcedTools = new Set<string>()
+  const ANNOUNCED_TOOLS_CAP = 2000
+  function announcedToolsGc(): void {
+    if (announcedTools.size <= ANNOUNCED_TOOLS_CAP) return
+    const overflow = announcedTools.size - ANNOUNCED_TOOLS_CAP
+    let i = 0
+    for (const k of announcedTools) {
+      if (i++ >= overflow) break
+      announcedTools.delete(k)
+    }
+  }
+
   async function startWorkerFor(binding: WechatBinding): Promise<void> {
     if (!ctx) return
     const w = new WechatWorker({
@@ -169,24 +186,38 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
         return
       }
 
-      // WeChat users want the final answer, not the tool-call trace. Hide
-      // tool_use / tool_result / thinking blocks entirely — only emit text.
-      // Empty assistant turns (pure tool loop) get suppressed; the next turn
-      // that produces text is what reaches the user. If the whole response is
-      // tool-only and never lands text, we stay silent rather than pushing
-      // JSON noise into the conversation.
-      const textParts: string[] = []
+      // Stream-friendly flattening: walk blocks in order, pushing *live*
+      // notifications so the user feels the bot working instead of waiting
+      // in silence for the final answer. Strategy:
+      //   - text  → accumulate into a buffer
+      //   - tool_use (finalized, partial=false) → flush accumulated text
+      //     first (preserving narrative order), then emit a one-line
+      //     friendly tool notice. We do NOT echo the tool input JSON or
+      //     the raw result; those are noise for WeChat users.
+      //   - tool_result / thinking → dropped (next turn's text carries the
+      //     conclusion).
+      // Deduped per (binding.userId + sender + blockId) so a streaming
+      // partial→final re-emit of the same tool_use doesn't announce twice.
+      const flushText = async (buf: string[]): Promise<void> => {
+        const clean = sanitizeForWechat(buf.join('')).trim()
+        buf.length = 0
+        if (!clean) return
+        for (const c of splitText(clean, 1800)) await w.sendText(senderId, c)
+      }
+      const textBuf: string[] = []
       for (const b of out.blocks || []) {
-        if (b.kind === 'text' && b.text) textParts.push(b.text)
+        if (b.kind === 'text' && b.text) {
+          textBuf.push(b.text)
+        } else if (b.kind === 'tool_use' && !b.partial) {
+          const dedupeKey = `${userId}:${senderId}:${b.blockId ?? `${b.toolName}:${textBuf.length}`}`
+          if (announcedTools.has(dedupeKey)) continue
+          announcedTools.add(dedupeKey)
+          announcedToolsGc()
+          await flushText(textBuf)
+          await w.sendText(senderId, `🔧 ${friendlyToolName(b.toolName)}`)
+        }
       }
-      const text = sanitizeForWechat(textParts.join('')).trim()
-      if (!text) return
-
-      // WeChat text caps at ~600 chars per message in practice; split.
-      const chunks = splitText(text, 1800)
-      for (const c of chunks) {
-        await w.sendText(senderId, c)
-      }
+      await flushText(textBuf)
     },
 
     async shutdown() {
@@ -196,6 +227,47 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
       workers.clear()
     },
   }
+}
+
+/**
+ * Map raw tool names to a short Chinese label WeChat users can read at a
+ * glance. Unknown tools (custom MCPs, Agents spawned, etc.) fall back to the
+ * last segment of the tool name so we don't leak implementation detail like
+ * `mcp__foo-bar-baz__do_thing` into the chat.
+ */
+function friendlyToolName(raw: string): string {
+  const n = raw.trim()
+  const map: Record<string, string> = {
+    Read: '读取文件',
+    Write: '写入文件',
+    Edit: '编辑文件',
+    Bash: '执行命令',
+    Glob: '查找文件',
+    Grep: '搜索内容',
+    WebSearch: '联网搜索',
+    WebFetch: '抓取网页',
+    Task: '调用子助手',
+    TodoWrite: '规划任务',
+    AskUserQuestion: '向你提问',
+    NotebookEdit: '编辑 notebook',
+  }
+  if (map[n]) return map[n]
+  // MCP tools: mcp__server-name__action → try to detect common categories
+  if (/minimax-vision.*web_search/i.test(n)) return '联网搜索'
+  if (/minimax-vision.*understand_image/i.test(n)) return '识别图片'
+  if (/minimax.*text_to_image/i.test(n)) return '生成图片'
+  if (/minimax.*text_to_audio/i.test(n)) return '生成语音'
+  if (/minimax.*(generate_video|music)/i.test(n)) return '生成媒体'
+  if (/browser_/i.test(n)) return '操作浏览器'
+  if (/(memory|archival)/i.test(n)) return '访问记忆'
+  if (/(session_search)/i.test(n)) return '搜索历史会话'
+  if (/(skill_(view|save|list|delete))/i.test(n)) return '查看/保存技能'
+  if (/create_reminder|cron/i.test(n)) return '设置定时任务'
+  if (/delegate_task|send_to_agent/i.test(n)) return '协作 agent'
+  if (/ToolSearch/i.test(n)) return '查询工具'
+  // Fallback: strip mcp__ prefix + server name, keep last action segment
+  const m = n.match(/^mcp__[^_]+__(.+)$/)
+  return m ? m[1] : n
 }
 
 /**
