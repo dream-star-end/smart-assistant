@@ -686,14 +686,15 @@ function stopPolling() {
 // ═════════════════════════════════════════════════════════════════
 
 document.addEventListener("DOMContentLoaded", () => {
-  renderAuth();
-  $("auth-switch").onclick = () => { authMode = authMode === "login" ? "register" : "login"; renderAuth(); };
+  // 静态 DOM 元素绑定先跑 —— renderAuth() 会重建 #auth-sub 里的 switch 按钮
+  // (新元素自带 onclick),不要再去查 "#auth-switch",它已经不在了。
   $("auth-submit").onclick = doAuth;
   $("auth-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") doAuth(); });
   $("logout-btn").onclick = doLogout;
   for (const b of document.querySelectorAll(".tabs button")) {
     b.onclick = () => switchTab(b.dataset.tab);
   }
+  renderAuth();
   if (localStorage.getItem(TOKEN_KEY)) enterApp();
 });
 
