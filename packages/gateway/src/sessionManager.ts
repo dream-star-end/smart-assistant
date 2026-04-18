@@ -16,6 +16,7 @@ import {
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { SubprocessRunner } from './subprocessRunner.js'
+import { CodexRunner } from './codexRunner.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -97,8 +98,47 @@ export class SessionManager {
 
   // Resume map: sessionKey → ccbSessionId (survives gateway restart)
   private _resumeMap = new Map<string, string>()
+  // Parallel map: sessionKey → runner provider that produced the id.
+  // Needed to keep codex thread_ids and CCB session_ids from being cross-fed
+  // when the same sessionKey is later served by a different provider.
+  // Legacy entries without explicit provider are treated as 'ccb' on load.
+  private _resumeMapProvider = new Map<string, string>()
   // Serialized write queue to prevent concurrent writeFile race conditions
   private _resumeMapWrite: Promise<void> = Promise.resolve()
+
+  /** Provider name for CCB-backed runners (default). Used as the fallback
+   *  tag when an on-disk resume-map entry omits `provider` (legacy format). */
+  private static CCB_PROVIDER_TAG = 'ccb'
+
+  /** Return the resumable id for this session iff the persisted entry was
+   *  produced by `wantProvider`. Cross-provider mismatches return undefined
+   *  so we never feed a CCB session_id to codex (or vice versa). */
+  private _resumeIdFor(sessionKey: string, wantProvider: string): string | undefined {
+    const id = this._resumeMap.get(sessionKey)
+    if (!id) return undefined
+    const tag = this._resumeMapProvider.get(sessionKey) ?? SessionManager.CCB_PROVIDER_TAG
+    return tag === wantProvider ? id : undefined
+  }
+
+  /** Return the persisted cost-delta baseline iff the entry was produced by
+   *  `wantProvider`. Cost baseline is tied to the *same subprocess* that
+   *  wrote it — feeding a CCB-era cumulative into a freshly-spawned codex
+   *  runner (or vice-versa) would poison `totalCostUSD` on the first
+   *  `result`, showing an inflated sessionTotal / cost.recorded value that
+   *  isn't tied to real API usage. Mismatch → undefined (caller seeds 0). */
+  private _lastCostFor(sessionKey: string, wantProvider: string): number | undefined {
+    const cost = this._resumeMapLastCost.get(sessionKey)
+    if (cost === undefined) return undefined
+    const tag = this._resumeMapProvider.get(sessionKey) ?? SessionManager.CCB_PROVIDER_TAG
+    return tag === wantProvider ? cost : undefined
+  }
+
+  /** Normalised provider tag for a runner: ccb-family providers collapse to
+   *  'ccb', codex-native stays distinct. Extend here when new providers land. */
+  private static providerTag(agentProvider: string | undefined): string {
+    if (agentProvider === 'codex-native') return 'codex-native'
+    return SessionManager.CCB_PROVIDER_TAG
+  }
 
   private _loadResumeMap(): void {
     // Try primary file first, fall back to backup if corrupted (atomic-write safety net)
@@ -107,11 +147,14 @@ export class SessionManager {
         if (!existsSync(path)) continue
         const data = JSON.parse(readFileSync(path, 'utf-8'))
         // Support both legacy format {key: sessionId} and new format
-        // {key: {id, ts, lastCost?}}
+        // {key: {id, ts, lastCost?, provider?}}
+        // Missing `provider` → treated as CCB (the only provider before
+        // codex-native landed), matching _resumeIdFor's fallback.
         for (const [key, val] of Object.entries(data)) {
           if (typeof val === 'string') {
             this._resumeMap.set(key, val)
             this._resumeMapTimestamps.set(key, Date.now()) // legacy: assume "now" as baseline
+            this._resumeMapProvider.set(key, SessionManager.CCB_PROVIDER_TAG)
           } else if (val && typeof val === 'object' && 'id' in (val as any)) {
             this._resumeMap.set(key, (val as any).id)
             this._resumeMapTimestamps.set(key, (val as any).ts ?? Date.now())
@@ -123,6 +166,11 @@ export class SessionManager {
             if (typeof lastCost === 'number' && Number.isFinite(lastCost) && lastCost >= 0) {
               this._resumeMapLastCost.set(key, lastCost)
             }
+            const prov = (val as any).provider
+            this._resumeMapProvider.set(
+              key,
+              typeof prov === 'string' && prov ? prov : SessionManager.CCB_PROVIDER_TAG,
+            )
           }
         }
         return // Successfully parsed (even if empty — empty means all sessions were destroyed)
@@ -135,24 +183,32 @@ export class SessionManager {
   private _saveResumeMap(): void {
     // Merge: start from the loaded resume-map (includes sessions not yet re-activated),
     // then overlay with live sessions (which may have updated ccbSessionIds after resume).
-    const obj: Record<string, { id: string; ts: number; lastCost?: number }> = {}
+    type ResumeEntry = { id: string; ts: number; lastCost?: number; provider?: string }
+    const obj: Record<string, ResumeEntry> = {}
     const now = Date.now()
     for (const [key, val] of this._resumeMap) {
-      const entry: { id: string; ts: number; lastCost?: number } = {
+      const entry: ResumeEntry = {
         id: val,
         ts: this._resumeMapTimestamps.get(key) ?? now,
       }
       const cached = this._resumeMapLastCost.get(key)
       if (cached !== undefined && cached > 0) entry.lastCost = cached
+      // Only serialize provider when it differs from the implicit 'ccb' default
+      // so legacy tooling that reads this file sees no unexpected new fields
+      // for CCB sessions.
+      const prov = this._resumeMapProvider.get(key)
+      if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
       obj[key] = entry
     }
     for (const [key, sess] of this.sessions) {
       if (sess.ccbSessionId) {
-        const entry: { id: string; ts: number; lastCost?: number } = {
+        const entry: ResumeEntry = {
           id: sess.ccbSessionId,
           ts: now,
         }
         if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
+        const prov = this._resumeMapProvider.get(key)
+        if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
         obj[key] = entry
         // Keep in-memory maps in sync
         this._resumeMap.set(key, sess.ccbSessionId)
@@ -222,21 +278,38 @@ export class SessionManager {
     }
     const cwd = opts.agent.cwd ?? process.cwd()
     const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
-    const runner = new SubprocessRunner({
-      sessionKey: opts.sessionKey,
-      agentId: opts.agent.id,
-      cwd,
-      config: this.config,
-      persona,
-      model: opts.agent.model ?? this.config.defaults.model,
-      permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
-      agentProvider: opts.agent.provider,
-      agentMcpServers: opts.agent.mcpServers,
-      agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
-      delegationDepth: opts.delegationDepth,
-      resumeSessionId: this._resumeMap.get(opts.sessionKey),
-      effortLevel: initialEffort,
-    })
+    // provider=codex-native routes to `codex` CLI instead of CCB; runner shape
+    // (EventEmitter with start/submit/shutdown + same events) is compatible,
+    // so upstream session bookkeeping works unchanged.
+    const providerTag = SessionManager.providerTag(opts.agent.provider)
+    const runner: SubprocessRunner =
+      opts.agent.provider === 'codex-native'
+        ? (new CodexRunner({
+            sessionKey: opts.sessionKey,
+            agentId: opts.agent.id,
+            cwd,
+            // Only resume if the persisted id was produced by a codex-native
+            // runner — feeding a CCB session_id to `codex exec resume` would
+            // make codex reject the arg or attach to a nonexistent thread.
+            resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
+            model: opts.agent.model ?? this.config.defaults.model,
+          }) as unknown as SubprocessRunner)
+        : new SubprocessRunner({
+            sessionKey: opts.sessionKey,
+            agentId: opts.agent.id,
+            cwd,
+            config: this.config,
+            persona,
+            model: opts.agent.model ?? this.config.defaults.model,
+            permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
+            agentProvider: opts.agent.provider,
+            agentMcpServers: opts.agent.mcpServers,
+            agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
+            delegationDepth: opts.delegationDepth,
+            // Symmetrically: only resume CCB from a CCB-tagged id.
+            resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
+            effortLevel: initialEffort,
+          })
     const now = Date.now()
     const session: AgentSession = {
       sessionKey: opts.sessionKey,
@@ -255,21 +328,28 @@ export class SessionManager {
       // post-resume per-turn delta correct; the session-total keeps aggregate
       // cost events (final.meta.totalCost, cost.recorded.sessionTotalCostUsd)
       // continuous across gateway restarts. For fresh sessions both are 0.
+      // Provider-gated: if the persisted entry came from a different provider
+      // (e.g. CCB → codex-native switch on the same sessionKey), we drop to
+      // 0 so codex doesn't inherit CCB's historical cost as its own baseline.
       // NOTE: token counts are NOT persisted across gateway restarts — they
       // will start at 0 after a resume. This is a known limitation; fixing it
       // requires persisting per-token totals which we do not currently do.
-      totalCostUSD: this._resumeMapLastCost.get(opts.sessionKey) ?? 0,
+      totalCostUSD: this._lastCostFor(opts.sessionKey, providerTag) ?? 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,
       totalCacheReadTokens: 0,
       totalCacheCreationTokens: 0,
       turns: 0,
-      _lastCcbCumulativeCost: this._resumeMapLastCost.get(opts.sessionKey) ?? 0,
+      _lastCcbCumulativeCost: this._lastCostFor(opts.sessionKey, providerTag) ?? 0,
       model: opts.agent.model ?? this.config.defaults.model,
       toolUseIdToName: new Map(),
     }
     runner.on('session_id', (id: string) => {
       session.ccbSessionId = id
+      // Remember which provider produced this id — the next getOrCreate on
+      // this sessionKey (possibly after a gateway restart switching providers)
+      // uses the tag to decide whether to pass the id through as --resume.
+      this._resumeMapProvider.set(opts.sessionKey, providerTag)
       // Persist session→ccbSessionId mapping for resume after gateway restart
       this._saveResumeMap()
     })
@@ -958,6 +1038,7 @@ export class SessionManager {
       this._resumeMap.delete(sessionKey)
       this._resumeMapTimestamps.delete(sessionKey)
       this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapProvider.delete(sessionKey)
       this._saveResumeMap()
     }
   }
@@ -1017,6 +1098,7 @@ export class SessionManager {
           this._resumeMap.delete(key)
           this._resumeMapTimestamps.delete(key)
           this._resumeMapLastCost.delete(key)
+          this._resumeMapProvider.delete(key)
         }
         // (webchat entries stay in _resumeMap intentionally for cross-restart recovery)
       }
@@ -1048,6 +1130,7 @@ export class SessionManager {
         this._resumeMap.delete(key)
         this._resumeMapTimestamps.delete(key)
         this._resumeMapLastCost.delete(key)
+        this._resumeMapProvider.delete(key)
         pruned = true
         log.info('pruned stale resume-map entry', { sessionKey: key })
       }
