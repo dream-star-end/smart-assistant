@@ -391,14 +391,19 @@ export class SessionManager {
         if (title) session.title = title
       }
       // Liveness-based timeout with state-aware thresholds.
-      // Thresholds are intentionally generous to avoid killing legitimately long
-      // active work (large sub-agent runs, multi-round Codex review loops, big
-      // builds). _runOneTurn has a separate 30-min idle timer as a tighter
+      // `lastActivityAt` is refreshed on EVERY stdout chunk (subprocessRunner
+      // handleStdout:505) — this includes CCB's _oc_telemetry side-channel
+      // events (tool.preUse fires just before each tool.call, turn.apiResponse
+      // after each stream, etc.), so a live subprocess keeps refreshing even
+      // during long tools that produce no content blocks.
+      // Thresholds tuned for "process active but deadlocked" detection speed
+      // (was 30/60min pre-2026-04-19):
+      //   - Tool call in progress (MCP/Bash/sub-agent): 15 min
+      //   - No tool call pending (API streaming / idle): 5 min
+      // _runOneTurn has a separate 30-min idle timer as a tighter
       // turn-level backstop that resets on every stdout message.
-      //   - Tool call in progress (MCP/Bash/sub-agent): 60 min
-      //   - No tool call pending (API streaming / idle): 30 min
-      const IDLE_TIMEOUT_TOOL = 60 * 60_000 // 60 min — tool executing
-      const IDLE_TIMEOUT_DEFAULT = 30 * 60_000 // 30 min — API stream / general idle
+      const IDLE_TIMEOUT_TOOL = 15 * 60_000 // 15 min — tool executing
+      const IDLE_TIMEOUT_DEFAULT = 5 * 60_000 // 5 min — API stream / general idle
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {
@@ -744,9 +749,20 @@ export class SessionManager {
                 turnPermissionCount === 0
               ) {
                 telemetry.noteIncomplete()
+                // Correlate with turn.apiResponse (if received) to distinguish
+                // "stream ended mid-flight" from "stream never finished" —
+                // apiResponse fires only after stream loop completes, so its
+                // absence here means CCB's stream completed without producing
+                // an assistant message.
+                const apiResp = telemetry.getTurnApiResponse()
+                const lastTool = telemetry.getLastToolPreUse()
                 log.warn('telemetry: willCallApi fired but no stop_reason and no blocks', {
                   sessionKey: session.sessionKey,
                   incompleteCount: telemetry.getIncompleteCount(),
+                  hadApiResponse: !!apiResp,
+                  apiRespStopReason: apiResp?.data.stopReason,
+                  lastToolPreUse: lastTool?.data.toolName,
+                  toolErrorCount: telemetry.getToolErrors().length,
                 })
               }
               break

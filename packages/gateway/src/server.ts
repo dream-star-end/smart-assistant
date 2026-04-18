@@ -149,6 +149,11 @@ export class Gateway {
     input: Record<string, unknown>
     toolUseId?: string
     peerKey: string
+    /** Authenticated userId that owns this pending request — carried so that
+     *  _recordSettlement can stamp the settlement with the owner, and
+     *  reconstructed peerKeys on late-duplicate replay paths match the
+     *  original broadcast scope. */
+    userId: string
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
     /** Monotonic timestamp (Date.now) at which this request should be auto-denied
@@ -175,6 +180,9 @@ export class Gateway {
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
       sessionKey: string
+      /** Authenticated userId from the originating request — needed to
+       *  reconstruct the per-user peerKey on already-settled replay. */
+      userId: string
       // Present only for AskUserQuestion allow settlements — replayed to
       // late-joining tabs so they can fill in the answers column of the card.
       answers?: Record<string, string>
@@ -187,7 +195,7 @@ export class Gateway {
   // Track last active channel + session for proactive push (reminders, heartbeat, etc.)
   private lastActiveChannel = new Map<
     string,
-    { channel: string; peerId: string; sessionKey: string; at: number }
+    { channel: string; peerId: string; sessionKey: string; at: number; userId: string }
   >()
 
   constructor(private deps: GatewayDeps) {
@@ -294,7 +302,7 @@ export class Gateway {
       // 1. Push to last active channel + session (within 24h)
       if (lastActive && Date.now() - lastActive.at < 24 * 3600_000) {
         if (lastActive.channel === 'webchat') {
-          const peerKey = `webchat:${lastActive.peerId}`
+          const peerKey = Gateway.makePeerKey(lastActive.userId, 'webchat', lastActive.peerId)
           const set = this.clientsByPeer.get(peerKey)
           if (set && set.size > 0) {
             // Route through deliver() to preserve the "all WebChat
@@ -302,9 +310,12 @@ export class Gateway {
             // stale-final guard relies on. buildOut includes a `cronJob`
             // marker field that OutboundMessage schema doesn't declare,
             // hence the cast — the wire format tolerates extra keys.
-            this.deliver(
-              buildOut(lastActive.peerId, lastActive.sessionKey) as OutboundMessage,
-            )
+            // Stamp userId so deliver() routes to the correct per-user peerKey.
+            const cronOut = {
+              ...buildOut(lastActive.peerId, lastActive.sessionKey),
+              _userId: lastActive.userId,
+            }
+            this.deliver(cronOut as OutboundMessage)
             delivered = true
           }
         }
@@ -451,7 +462,8 @@ export class Gateway {
                 { kind: 'text' as const, text: `🔔 **Webhook ${webhookId}**\n\n${output.trim()}` },
               ],
               isFinal: true,
-            })
+              _userId: lastActive.userId,
+            } as OutboundMessage)
           }
         }
       })().catch((err) =>
@@ -1450,6 +1462,22 @@ export class Gateway {
     return jwt?.userId ?? 'default'
   }
 
+  /** Get userId stashed on a WS at handshake time. Falls back to 'default' if
+   *  the WS was created before this field existed (hot-reload / legacy client). */
+  private getWsUserId(ws: WebSocket): string {
+    const uid = (ws as any)._userId
+    return typeof uid === 'string' && uid.length > 0 ? uid : 'default'
+  }
+
+  /** Build a broadcast routing key. Historically `${channel}:${peerId}` only;
+   *  userId dimension added 2026-04-19 so two users sharing a (client-generated,
+   *  non-unique) peerId cannot receive each other's broadcasts. Individual
+   *  clients are already scoped by userId via SQLite `client_sessions`, but
+   *  WS-layer `clientsByPeer` wasn't — this closes that gap. */
+  private static makePeerKey(userId: string, channel: string, peerId: string): string {
+    return `${userId}:${channel}:${peerId}`
+  }
+
   /** Check if the request arrived over HTTPS (direct TLS or behind a trusted reverse proxy like cloudflared).
    * X-Forwarded-Proto is only trusted when the connection originates from a loopback address (127.0.0.1 / ::1),
    * i.e. a local reverse proxy. External connections must use direct TLS.
@@ -1802,7 +1830,8 @@ export class Gateway {
           { kind: 'text' as const, text: `📨 **${targetAgentId}** 回复:\n\n${output.trim()}` },
         ],
         isFinal: true,
-      })
+        _userId: lastActive.userId,
+      } as OutboundMessage)
     }
 
     this.sendJson(res, 200, { ok: true, agentId: targetAgentId, outputLength: output.length })
@@ -2551,6 +2580,11 @@ export class Gateway {
       ws.close(1008, 'unauthorized')
       return
     }
+    // Stash authenticated userId on the WS so every subsequent broadcast lookup
+    // can scope peerKey by user, preventing cross-account delivery when two
+    // users happen to share the same client-generated peerId (see makePeerKey
+    // helper). Legacy-token auth returns 'default'.
+    ;(ws as any)._userId = this.getUserId(req)
     wsConnectionsTotal.inc()
     this.log.info('ws.connect')
     ws.once('close', () => this.log.debug('ws.disconnect'))
@@ -2589,8 +2623,12 @@ export class Gateway {
       }
 
       if (frame.type === 'inbound.message') {
+        // Stash userId on the frame so downstream dispatchInbound/deliver
+        // paths that don't have the WS in scope can still build the correct
+        // per-user peerKey. Private field (leading _), never sent over wire.
+        ;(frame as any)._userId = this.getWsUserId(ws)
         // 把 ws client 关联到这个 (channel, peer)
-        const peerKey = `${frame.channel}:${frame.peer.id}`
+        const peerKey = Gateway.makePeerKey(this.getWsUserId(ws), frame.channel, frame.peer.id)
         let set = this.clientsByPeer.get(peerKey)
         if (!set) {
           set = new Set()
@@ -2612,6 +2650,10 @@ export class Gateway {
       } else if (frame.type === 'inbound.control.stop') {
         await this.handleStop(frame)
       } else if ((frame as any).type === 'inbound.permission_response') {
+        // Stash userId so handlePermissionResponse can rebuild per-user
+        // peerKey on the late-duplicate no-pending-entry fallback path
+        // (the only path where we have no server-trusted user identity).
+        ;(frame as any)._userId = this.getWsUserId(ws)
         await this.handlePermissionResponse(frame as any)
       } else if ((frame as any).type === 'inbound.control.reset') {
         // Reset: kill the CCB subprocess AND remove session from manager,
@@ -2749,7 +2791,7 @@ export class Gateway {
       if (prior) {
         // Route the rebroadcast using prior.* (server-trusted) so a late
         // duplicate can't steer the settlement to a peerKey of its choosing.
-        const priorPeerKey = `${prior.channel}:${prior.peer.id}`
+        const priorPeerKey = Gateway.makePeerKey(prior.userId, prior.channel, prior.peer.id)
         this._broadcastPermissionSettled(priorPeerKey, {
           sessionKey: prior.sessionKey,
           channel: prior.channel,
@@ -2762,7 +2804,11 @@ export class Gateway {
       } else {
         // No server-side record survives — fall back to frame.* because
         // that's the only signal we have for where to route the settlement.
-        const peerKey = `${frame.channel}:${frame.peer.id}`
+        // Use the ws-stashed userId (set by the inbound handler) so we don't
+        // have to trust a client-supplied userId field.
+        const fallbackUserId: string =
+          typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+        const peerKey = Gateway.makePeerKey(fallbackUserId, frame.channel, frame.peer.id)
         this._broadcastPermissionSettled(peerKey, {
           sessionKey: '',
           channel: frame.channel,
@@ -2787,6 +2833,7 @@ export class Gateway {
         channel: pending.channel,
         peer: pending.peer,
         sessionKey: pending.sessionKey,
+        userId: pending.userId,
       })
       this._broadcastPermissionSettled(pending.peerKey, {
         sessionKey: pending.sessionKey,
@@ -2876,6 +2923,7 @@ export class Gateway {
       channel: pending.channel,
       peer: pending.peer,
       sessionKey: pending.sessionKey,
+      userId: pending.userId,
       ...(settledAnswers ? { answers: settledAnswers } : {}),
     })
     // Tell every tab attached to this peer (including the sender) that the
@@ -2932,6 +2980,7 @@ export class Gateway {
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
       sessionKey: string
+      userId: string
       answers?: Record<string, string>
     },
   ): void {
@@ -2950,6 +2999,7 @@ export class Gateway {
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
     sessionKey: string
+    userId: string
     answers?: Record<string, string>
   } | null {
     const e = this._recentSettlements.get(requestId)
@@ -2963,6 +3013,7 @@ export class Gateway {
       channel: e.channel,
       peer: e.peer,
       sessionKey: e.sessionKey,
+      userId: e.userId,
       answers: e.answers,
     }
   }
@@ -3002,6 +3053,7 @@ export class Gateway {
       channel: pending.channel,
       peer: pending.peer,
       sessionKey: pending.sessionKey,
+      userId: pending.userId,
     })
     // Broadcast so any still-connected tab dismisses its modal immediately.
     // No-op when no clients remain (e.g. disconnect path).
@@ -3079,6 +3131,7 @@ export class Gateway {
         channel: 'webchat',
         peerId,
         sessionKey,
+        userId: 'default',
         at: Date.now(),
       })
       this.log.info('auto-resume pre-warmed', { sessionKey })
@@ -3094,6 +3147,7 @@ export class Gateway {
     // access token is the auth boundary; we validate that a session actually exists
     // (active or in resume-map) before registering.
     const registeredPeerKeys: string[] = []
+    const helloUserId = this.getWsUserId(ws)
 
     for (const { peerId, agentId } of peers) {
       const aid = agentId || 'main'
@@ -3120,6 +3174,7 @@ export class Gateway {
               channel: 'webchat',
               peerId,
               sessionKey,
+              userId: helloUserId,
               at: Date.now(),
             })
             this.log.info('auto-resume on-demand pre-warmed', { sessionKey })
@@ -3132,7 +3187,7 @@ export class Gateway {
         }
       }
 
-      const peerKey = `webchat:${peerId}`
+      const peerKey = Gateway.makePeerKey(helloUserId, 'webchat', peerId)
       let set = this.clientsByPeer.get(peerKey)
       if (!set) {
         set = new Set()
@@ -3202,7 +3257,9 @@ export class Gateway {
     // Checked first so duplicates don't consume rate-limit budget
     if (frame.idempotencyKey && this._isIdempotencyDuplicate(frame.idempotencyKey)) {
       this.log.debug('duplicate idempotencyKey', { key: frame.idempotencyKey })
-      const peerKey = `${frame.channel}:${frame.peer.id}`
+      const dupUserId: string =
+        typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+      const peerKey = Gateway.makePeerKey(dupUserId, frame.channel, frame.peer.id)
       const clients = this.clientsByPeer.get(peerKey)
       if (clients) {
         const ack = JSON.stringify({
@@ -3220,6 +3277,8 @@ export class Gateway {
     // ── Rate limiting: per-peer sliding window ──
     // Only non-duplicate messages consume rate-limit budget
     if (!this.rateLimiter.check(frame.peer.id, frame.channel)) {
+      const rlUserId: string =
+        typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
       const rateLimitOut = {
         type: 'outbound.message' as const,
         sessionKey: '',
@@ -3227,13 +3286,17 @@ export class Gateway {
         peer: frame.peer,
         blocks: [{ kind: 'text' as const, text: '请求过于频繁，请稍后再试。' }],
         isFinal: true,
+        _userId: rlUserId,
       }
       // Route WebSocket broadcast through deliver() so ts-stamp is consistent
       // with regular turn finals; keep the adapter path separate for non-ws
       // channels (Telegram etc.) — adapter.send expects a plain OutboundMessage.
       this.deliver(rateLimitOut)
       if (adapter) {
-        adapter.send(rateLimitOut).catch(() => {})
+        // Strip the private `_userId` stamp before handing to non-ws adapters —
+        // they have their own wire format and shouldn't see gateway internals.
+        const { _userId: _strip, ...adapterOut } = rateLimitOut
+        adapter.send(adapterOut).catch(() => {})
       }
       return
     }
@@ -3257,10 +3320,13 @@ export class Gateway {
       agent = routed.agent
     }
     // Track last active channel for proactive push
+    const activeUserId: string =
+      typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
     this.lastActiveChannel.set(agent.id, {
       channel: frame.channel,
       peerId: frame.peer.id,
       sessionKey,
+      userId: activeUserId,
       at: Date.now(),
     })
 
@@ -3299,6 +3365,9 @@ export class Gateway {
       blocks: [],
       isFinal: false,
     }
+    // Private userId stamp for deliver() — must be stripped before sending.
+    // Fixed in deliver() via destructure so this never reaches the wire.
+    ;(out as any)._userId = activeUserId
     // Adapters (Telegram/WeChat/Feishu) can't take 30 small messages per second.
     // Accumulate all blocks and send a single message at final.
     // WebChat (no adapter) keeps streaming via WS broadcast.
@@ -3557,8 +3626,13 @@ export class Gateway {
           this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
         }
       } else if (e.kind === 'permission_request') {
-        // Forward permission prompt to WebSocket clients for user approval
-        const peerKey = `${frame.channel}:${frame.peer.id}`
+        // Forward permission prompt to WebSocket clients for user approval.
+        // userId is stashed on the frame by the WS handler (see handleWsConnection)
+        // so adapter-dispatched frames fall back to 'default'. On personal-edition
+        // (single-user) this is always 'default' in practice.
+        const dispatchUserId: string =
+          typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+        const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
         const permFrame = {
           type: 'outbound.permission_request' as const,
           sessionKey,
@@ -3588,6 +3662,7 @@ export class Gateway {
               input: e.request.input,
               toolUseId: e.request.toolUseId,
               peerKey,
+              userId: dispatchUserId,
               channel: frame.channel,
               peer: frame.peer,
               expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
@@ -3622,21 +3697,36 @@ export class Gateway {
   }
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {
+    // Strip the private `_userId` stamp up-front so BOTH adapter and WS
+    // branches only ever see the clean wire shape. Keeping the stripped
+    // value locally lets the WS branch still route per-user. Stripping
+    // here (rather than only just before ws.send) prevents future adapters
+    // / debug logs from accidentally leaking internal routing fields.
+    const { _userId: stampedUserId, ...wire } = out as OutboundMessage & {
+      _userId?: string
+    }
     if (adapter) {
-      adapter.send(out).catch((err) =>
+      adapter.send(wire as OutboundMessage).catch((err) =>
         this.log.error('adapter send failed', { channel: adapter.name }, err),
       )
       return
     }
-    // WebChat:广播给所有同 (channel, peer) 的 ws client
-    const peerKey = `${out.channel}:${out.peer.id}`
+    // WebChat: broadcast to all ws clients at the same (userId, channel, peer).
+    // userId is read from the `_userId` stamp that callers put on the out
+    // frame when they know it. If absent (legacy cron / shutdown paths),
+    // fall back to 'default' — personal edition is single-user, so every
+    // connected ws registers under userId='default' anyway. On v2 cherry-pick
+    // all non-stamped call sites will need updating to route correctly.
+    const deliverUserId: string =
+      typeof stampedUserId === 'string' ? stampedUserId : 'default'
+    const peerKey = Gateway.makePeerKey(deliverUserId, wire.channel, wire.peer.id)
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
-    // Stamp a server-assigned monotonic timestamp on every outbound frame so the
-    // web client can reject stale / out-of-order frames after reconnect or agent
-    // switches. Schema keeps `ts` unvalidated (extra field is tolerated), so no
-    // protocol version bump is required.
-    const data = JSON.stringify({ ...out, ts: Date.now() })
+    // Stamp a server-assigned monotonic timestamp on every outbound frame so
+    // the web client can reject stale / out-of-order frames after reconnect
+    // or agent switches. Schema keeps `ts` unvalidated (extra field is
+    // tolerated), so no protocol version bump is required.
+    const data = JSON.stringify({ ...wire, ts: Date.now() })
     for (const ws of set) {
       try {
         ws.send(data)

@@ -42,6 +42,12 @@ export interface SubprocessRunnerOpts {
   agentMcpServers?: McpServerConfig[] // agent 专属 MCP servers
   agentToolsets?: string[] // resolved toolsets for this agent (filters MCP servers)
   delegationDepth?: number // current delegation recursion depth (0 = top-level)
+  // Optional CCB effort level passed via env (CLAUDE_CODE_EFFORT_LEVEL).
+  // When undefined, no env var is set and CCB falls back to its model-default
+  // effort (typically "high" on Opus 4.7 per Anthropic API). Only set values
+  // CCB recognises in EFFORT_LEVELS — currently 'low'|'medium'|'high'|'xhigh'|'max'.
+  // Source-of-truth lives in claude-code-best/src/utils/effort.ts.
+  effortLevel?: string
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -179,6 +185,13 @@ export class SubprocessRunner extends EventEmitter {
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
   private stderrBufBytes = 0
   private currentSessionId: string | null = null
+  /**
+   * Count of `_oc_telemetry` lines silently dropped because their `session_id`
+   * field was missing or empty. Design rule: telemetry session_id is runtime
+   * expected but implementation tolerates absence (drop + count, don't error).
+   * See docs/ccb-telemetry-refactor-plan.md §3.1 + §5.1.
+   */
+  private missingSessionIdCount = 0
   private starting = false
   private closed = false
   private shuttingDown = false
@@ -215,6 +228,19 @@ export class SubprocessRunner extends EventEmitter {
   /** Update config (e.g. after OAuth token refresh). Takes effect on next start(). */
   updateConfig(config: OpenClaudeConfig): void {
     this.opts.config = config
+  }
+
+  /** Current effort level (used by sessionManager.getOrCreate to detect changes
+   *  before deciding whether to recycle the subprocess). */
+  get effortLevel(): string | undefined {
+    return this.opts.effortLevel
+  }
+
+  /** Update effort level. Caller is responsible for restarting the subprocess
+   *  (via shutdown(); next submit() auto-restarts) for the new value to take
+   *  effect — env vars are only read at process startup. */
+  setEffortLevel(level: string | undefined): void {
+    this.opts.effortLevel = level
   }
 
   /** True if the subprocess is currently alive or being started */
@@ -338,7 +364,19 @@ export class SubprocessRunner extends EventEmitter {
           ...providerEnv,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
-          CLAUDE_CODE_EFFORT_LEVEL: 'max',
+          // Per-session effort level (xhigh / max from chat-mode pills, or
+          // undefined to let CCB use its model-default — Opus 4.7 → high).
+          // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
+          // gateway-process env doesn't bleed into spawned CCBs.
+          CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
+          // Force all subagents/Bash runs to foreground so their execution
+          // is visible inline in the web UI. Opus 4.7 was aggressively
+          // choosing run_in_background=true for long tasks, which hid the
+          // subagent's progress behind a single "Noted, continuing to wait"
+          // message. This env var makes CCB strip run_in_background from the
+          // Agent/Bash/PowerShell tool schemas at module load, so the model
+          // can never select background mode.
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
           IS_SANDBOX: '1',
           FEATURE_VERIFICATION_AGENT: '1',
         },
@@ -351,6 +389,15 @@ export class SubprocessRunner extends EventEmitter {
     }
 
     this.proc = proc as unknown as ChildProcessWithoutNullStreams
+    // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
+    // manager's per-CCB cost-tracker reset) run strictly before any 'message'
+    // or 'session_id' event of the new process can arrive.
+    //
+    // `resumed` tells consumers whether CCB will restore historical state on
+    // start. When --resume is passed CCB calls restoreCostStateForSession
+    // which sets STATE.totalCostUSD back to the persisted cumulative — so the
+    // gateway's per-session cost-delta baseline must NOT be reset to 0.
+    this.emit('spawn', { resumed: !!this.currentSessionId })
 
     proc.stdin.on('error', (err) =>
       runnerLog.warn('stdin error', { sessionKey: this.opts.sessionKey }, err),
@@ -495,12 +542,39 @@ export class SubprocessRunner extends EventEmitter {
       if (trimmed) {
         try {
           const msg = JSON.parse(trimmed) as SdkMessage
-          // Always update session ID (CCB may report a new one after --resume)
-          if (msg.session_id && msg.session_id !== this.currentSessionId) {
-            this.currentSessionId = msg.session_id
-            this.emit('session_id', this.currentSessionId)
+          // OpenClaude telemetry side-channel: `_oc_telemetry` lines are
+          // observability events, not SDK messages. Route them to the
+          // dedicated 'telemetry' listener and skip the normal pipeline:
+          //   - NEVER update currentSessionId from a telemetry line
+          //     (Gateway session tracking must stay driven by real SDK
+          //     messages only)
+          //   - NEVER emit 'message' (parser would crash on unknown type)
+          //
+          // session_id on telemetry is required-but-tolerated: if missing
+          // we silently drop and bump missingSessionIdCount so anomalies
+          // show up in diagnostics instead of crashing.
+          // Design doc: ccb-telemetry-refactor-plan.md §3.1 + §5.1.
+          if ((msg as { type?: string }).type === '_oc_telemetry') {
+            const telemetryMsg = msg as SdkMessage & {
+              type: '_oc_telemetry'
+              session_id?: string
+            }
+            if (
+              typeof telemetryMsg.session_id !== 'string' ||
+              telemetryMsg.session_id.length === 0
+            ) {
+              this.missingSessionIdCount++
+            } else {
+              this.emit('telemetry', telemetryMsg)
+            }
+          } else {
+            // Always update session ID (CCB may report a new one after --resume)
+            if (msg.session_id && msg.session_id !== this.currentSessionId) {
+              this.currentSessionId = msg.session_id
+              this.emit('session_id', this.currentSessionId)
+            }
+            this.emit('message', msg)
           }
-          this.emit('message', msg)
         } catch (err) {
           this.emit('parse_error', { line: trimmed, err })
         }
@@ -743,6 +817,11 @@ export class SubprocessRunner extends EventEmitter {
     } catch {
       return false
     }
+  }
+
+  /** Read-only snapshot of telemetry drop diagnostics. */
+  getTelemetryDiagnostics(): { missingSessionIdCount: number } {
+    return { missingSessionIdCount: this.missingSessionIdCount }
   }
 
   // 发送 interrupt control request — CCB 会中止当前 turn

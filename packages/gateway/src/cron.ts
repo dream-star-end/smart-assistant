@@ -40,7 +40,10 @@ export interface CronJob {
   enabled?: boolean
   oneshot?: boolean // fire once then auto-disable
   label?: string // human-readable label (for reminders)
-  heartbeat?: boolean // if true, runs in user's main session (shared context)
+  // Marks the job as a proactive "heartbeat check" — purely a UI/delivery
+  // hint (frontend uses it to style the push and skip the "system cron"
+  // badge). Execution uses an isolated session just like any other cron job.
+  heartbeat?: boolean
 }
 
 export interface CronFile {
@@ -107,14 +110,14 @@ const DEFAULT_JOBS: CronJob[] = [
     agent: 'main',
     enabled: true,
     deliver: 'webchat',
-    heartbeat: true, // runs in user's main session (shared context)
-    prompt: `Periodic heartbeat check. You are running in the user's main session with full conversation context.
+    heartbeat: true, // UI hint only — execution is isolated like other cron jobs
+    prompt: `Periodic heartbeat check (every 4 hours). You are proactively checking on the user's standing items.
 
 1. \`memory(action=read, target=memory)\` — scan for any time-sensitive items, deadlines, or follow-ups.
 2. \`archival_search("pending OR reminder OR TODO OR deadline")\` — check for stored reminders/tasks.
-3. Review recent conversation context — any unfinished tasks, pending follow-ups, or things the user said "later" about?
-4. If you find something actionable, compose a SHORT proactive update.
-5. If nothing needs attention, reply with exactly "HEARTBEAT_OK".
+3. \`session_search\` with the current date or recent keywords — look for conversations where the user said "later", "tomorrow", or "remind me".
+4. If you find something actionable (missed deadline, pending follow-up, stale reminder), compose a SHORT proactive update for the user.
+5. If everything is normal and nothing to report, reply with exactly "HEARTBEAT_OK".
 6. DO NOT report that you checked and found nothing — that's what HEARTBEAT_OK is for.`,
   },
 ]
@@ -223,10 +226,18 @@ export class CronScheduler {
   private bootTickTimer: NodeJS.Timeout | null = null
   private stopped = false
   private running = false
-  /** Reference to last-active-channel map for heartbeat session routing */
+  /** Reference to last-active-channel map for heartbeat session routing.
+   *  Shape must stay in sync with Gateway's `lastActiveChannel` — the
+   *  `userId` field was added so gateway can route heartbeats per-user. */
   public lastActiveChannel?: Map<
     string,
-    { channel: string; peerId: string; sessionKey: string; at: number }
+    {
+      channel: string
+      peerId: string
+      sessionKey: string
+      userId: string
+      at: number
+    }
   >
 
   constructor(
@@ -314,31 +325,33 @@ export class CronScheduler {
   private async runJob(job: CronJob, agent: AgentDef): Promise<void> {
     logger.info(`running job ${job.id}`, { jobId: job.id, heartbeat: !!job.heartbeat })
 
-    let sessionKey: string
-    if (job.heartbeat) {
-      // Heartbeat: run in user's main session (shared context)
-      const lastActive = this.lastActiveChannel?.get(agent.id)
-      sessionKey = lastActive?.sessionKey || `agent:${agent.id}:webchat:dm:__heartbeat__`
-    } else {
-      // Regular task: isolated session per execution (no history accumulation)
-      sessionKey = `agent:${agent.id}:cron:dm:${job.id}:${Date.now()}`
-    }
+    // Isolated session per execution for ALL jobs (heartbeat included).
+    // Sharing the user's main session polluted conversation history and, when
+    // the heartbeat turn crashed mid-execution, left a broken trailing turn
+    // that caused the user's follow-up messages to return "本轮响应为空".
+    // Delivery still targets the user's last-active channel via server.ts
+    // (see onDeliver), which reads lastActiveChannel independently.
+    const sessionKey = `agent:${agent.id}:cron:dm:${job.id}:${Date.now()}`
 
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
-      channel: job.heartbeat ? 'webchat' : 'cron',
-      peerId: job.heartbeat ? sessionKey.split(':')[4] || job.id : job.id,
+      channel: 'cron',
+      peerId: job.id,
       title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
     })
     let output = ''
-    await this.sessions.submit(session, job.prompt, (e) => {
-      if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
-    })
-
-    // Isolated sessions (non-heartbeat): destroy after execution to free resources
-    if (!job.heartbeat) {
-      await this.sessions.destroySession(sessionKey)
+    try {
+      await this.sessions.submit(session, job.prompt, (e) => {
+        if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
+      })
+    } finally {
+      // All jobs use isolated sessions — always destroy, even if submit()
+      // threw, otherwise the subprocess + resume-map entry would leak until
+      // the eviction loop catches it on the next sweep.
+      await this.sessions.destroySession(sessionKey).catch((err) =>
+        logger.warn(`destroySession failed for ${job.id}`, { jobId: job.id }, err as Error),
+      )
     }
     // Persist output
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
@@ -354,10 +367,15 @@ export class CronScheduler {
       await saveCronFile(await ensureCronFile(), job)
     }
 
-    // Deliver if not [SILENT] or HEARTBEAT_OK
+    // Skip delivery for silence markers AND genuinely empty output. The empty
+    // case covers subprocess crashes / API failures mid-turn: without this
+    // guard, the user sees an orphan "💓 heartbeat" card with no content.
     const trimmed = output.trim()
-    if (trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
-      logger.info(`job ${job.id} silent/ok, not delivering`, { jobId: job.id })
+    if (!trimmed || trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
+      logger.info(`job ${job.id} silent/empty, not delivering`, {
+        jobId: job.id,
+        reason: !trimmed ? 'empty' : trimmed.startsWith('[SILENT]') ? 'silent' : 'heartbeat_ok',
+      })
       return
     }
     logger.info(`job ${job.id} completed`, { jobId: job.id, chars: trimmed.length, deliver: job.deliver ?? 'local' })
