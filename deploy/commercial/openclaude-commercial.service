@@ -1,0 +1,28 @@
+[Unit]
+Description=OpenClaude Commercial (v2) Gateway
+Documentation=file:///opt/openclaude/openclaude/docs/commercial/
+After=network-online.target postgresql.service redis-server.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openclaude/openclaude
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/openclaude/commercial.env
+ExecStart=/usr/bin/node \
+  --max-old-space-size=2048 \
+  --require /opt/openclaude/openclaude/node_modules/tsx/dist/preflight.cjs \
+  --import file:///opt/openclaude/openclaude/node_modules/tsx/dist/loader.mjs \
+  packages/cli/src/index.ts gateway
+Restart=on-failure
+RestartSec=3
+# gateway 启动时会自动 migrate(COMMERCIAL_AUTO_MIGRATE=0 可关)
+# stdout/stderr 交给 journald
+StandardOutput=journal
+StandardError=journal
+# 给充足关闭时间,让 commercial.shutdown 走完(agent containers、pg pool、redis)
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

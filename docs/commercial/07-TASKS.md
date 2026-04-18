@@ -1007,14 +1007,16 @@ Commits:
 **依赖**: 所有 Phase 0-7
 
 **内容**:
-- [ ] `deploy/commercial/openclaude-commercial.service`(或复用 openclaude.service,但加 EnvironmentFile)
-- [ ] `deploy/commercial/commercial.env.example`
-- [ ] `deploy/commercial/install.sh`:本地部署脚本(生成密钥、拷贝 env、systemd enable)
+- [x] `deploy/commercial/openclaude-commercial.service`(EnvironmentFile=/etc/openclaude/commercial.env)
+- [x] `deploy/commercial/commercial.env.example`(列全必填/可选 env;注明 schema 拒绝空串的坑)
+- [x] `deploy/commercial/install.sh`:幂等一键部署(建 PG role+DB、生成 JWT/KMS、创 agent-net/seccomp/RPC 目录、装 unit、smoke)
 
 **Acceptance**:
-- [ ] 手动:在 38.55 跑 install.sh → 服务起来 → /healthz OK
+- [x] 手动:在 38.55.134.227 跑 install.sh → gateway 起 → /healthz 200 → /api/public/models 200(返回 seed 定价)→ /api/payment/plans 200
+- [x] 外网 `https://claudeai.chat/api/auth/register` 返回 `{user_id:1, verify_email_sent:true}` —— DB 写入 + 邮件 stub 链路通
+- [x] `commercial module enabled` 日志出现
 
-**Status**: `[ ] todo`
+**Status**: `[x] done`(2026-04-18)
 
 ---
 
