@@ -1,5 +1,5 @@
 #!/bin/bash
-# 一键部署: 本地 push v2 → 远程 38.55.134.168 pull + 重启 openclaude.service
+# 一键部署: 本地 push v2 → 远程 38.55.134.227 pull + 重启 openclaude.service
 #
 # 用法: ./deploy-to-remote.sh
 #
@@ -10,7 +10,7 @@
 
 set -e
 
-REMOTE_HOST="38.55.134.168"
+REMOTE_HOST="38.55.134.227"
 REMOTE_USER="root"
 REMOTE_PASS="auejRWHA6997"
 REMOTE_REPO="/opt/openclaude/openclaude"   # v2 线上部署目录(38.55 上不变)

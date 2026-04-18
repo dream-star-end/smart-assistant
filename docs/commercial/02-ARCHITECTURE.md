@@ -12,7 +12,7 @@
                  │ HTTPS (claudeai.chat)
                  ▼
   ┌──────────────────────────────────────────┐
-  │  Caddy (reverse proxy, 38.55.134.168)    │
+  │  Caddy (reverse proxy, 38.55.134.227)    │
   └──────────────┬───────────────────────────┘
                  │ HTTP :18789
                  ▼
@@ -158,7 +158,7 @@ packages/commercial/
 - Gateway WebSocket 代理用户和容器的通信
 
 ### 4.3 部署形态
-单机(38.55.134.168):
+单机(38.55.134.227):
 - systemd unit `openclaude.service` 跑 Gateway
 - Docker daemon 本机 socket(`/var/run/docker.sock`,仅 root 可访问,Gateway 以 root 运行或 docker group)
 - Postgres + Redis 本机容器(或系统包,选其一,MVP 用容器)
