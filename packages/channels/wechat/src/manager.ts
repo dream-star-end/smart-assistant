@@ -169,24 +169,17 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
         return
       }
 
-      // Flatten OutboundMessage blocks the same way telegram does: text only
-      // (thinking hidden; tool_use shown as one-liner previews).
+      // WeChat users want the final answer, not the tool-call trace. Hide
+      // tool_use / tool_result / thinking blocks entirely — only emit text.
+      // Empty assistant turns (pure tool loop) get suppressed; the next turn
+      // that produces text is what reaches the user. If the whole response is
+      // tool-only and never lands text, we stay silent rather than pushing
+      // JSON noise into the conversation.
       const textParts: string[] = []
-      const toolLines: string[] = []
       for (const b of out.blocks || []) {
         if (b.kind === 'text' && b.text) textParts.push(b.text)
-        else if (b.kind === 'tool_use' && !b.partial) {
-          const preview = b.inputPreview ? ` ${truncate(b.inputPreview, 120)}` : ''
-          toolLines.push(`🔧 ${b.toolName}${preview}`)
-        } else if (b.kind === 'tool_result' && b.preview) {
-          const prefix = b.isError ? '⚠️' : '↳'
-          toolLines.push(`${prefix} ${truncate(b.preview, 120)}`)
-        }
       }
-      const segments: string[] = []
-      if (toolLines.length) segments.push(toolLines.join('\n'))
-      if (textParts.length) segments.push(textParts.join(''))
-      const text = segments.filter(Boolean).join('\n\n').trim()
+      const text = sanitizeForWechat(textParts.join('')).trim()
       if (!text) return
 
       // WeChat text caps at ~600 chars per message in practice; split.
@@ -205,9 +198,37 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
   }
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s
-  return `${s.slice(0, max)}…`
+/**
+ * Strip the markdown syntax that would otherwise render as literal characters
+ * in WeChat's plain-text message view (bold stars, headings, inline code
+ * backticks, etc.). We intentionally KEEP link URLs visible — WeChat makes
+ * bare `https://` URLs tappable — and keep newlines/bullets intact.
+ *
+ * This is a best-effort cleanup, not a full markdown parser. Fenced code
+ * blocks and pre-formatted content come through stripped of their ``` fences
+ * but the inner text is preserved verbatim so code/commands stay copy-able.
+ */
+function sanitizeForWechat(s: string): string {
+  if (!s) return ''
+  let out = s
+  // Fenced code blocks: drop the opening ```lang and the closing ```
+  out = out.replace(/```[a-zA-Z0-9_+-]*\n?/g, '').replace(/```/g, '')
+  // Inline code `…`
+  out = out.replace(/`([^`\n]+)`/g, '$1')
+  // Bold / italic: **x**, __x__, *x*, _x_
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, '$1')
+  out = out.replace(/__([^_\n]+)__/g, '$1')
+  out = out.replace(/(?<![A-Za-z0-9_])\*([^*\n]+)\*(?![A-Za-z0-9_])/g, '$1')
+  out = out.replace(/(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])/g, '$1')
+  // Links: [text](url)  →  text (url) — keep URL so user can tap it
+  out = out.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, '$1 ($2)')
+  // Headings: leading # ## ### on their own line → drop the hashes
+  out = out.replace(/^\s{0,3}#{1,6}\s+/gm, '')
+  // Blockquote markers
+  out = out.replace(/^\s*>\s?/gm, '')
+  // Horizontal rules like ---
+  out = out.replace(/^\s*[-*_]{3,}\s*$/gm, '')
+  return out
 }
 
 function splitText(text: string, max: number): string[] {
