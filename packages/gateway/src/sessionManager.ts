@@ -9,6 +9,10 @@ import {
   upsertSessionMeta,
 } from '@openclaude/storage'
 import { CcbMessageParser, type SessionStreamEvent } from './ccbMessageParser.js'
+import {
+  TelemetryChannel,
+  type OcTelemetryEvent,
+} from './telemetryChannel.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { SubprocessRunner } from './subprocessRunner.js'
@@ -35,6 +39,11 @@ export interface AgentSession {
   totalCacheReadTokens: number
   totalCacheCreationTokens: number
   turns: number
+  // CCB 报告的进程累计 cost（getTotalCost()）的上一次取值。
+  // _handleResult 里用来算 per-turn cost = cumulative - _lastCcbCumulativeCost。
+  // CCB 子进程重启时会被重置为 0,parser 通过 cumulative<prev 检测到,
+  // 把新的 cumulative 直接当作本轮 cost。
+  _lastCcbCumulativeCost: number
   // 跨 turn 的 tool_use id → name 映射(用于 tool_result 关联)
   toolUseIdToName: Map<string, string>
   // 当前 turn 的文本累积器(用于 FTS5 索引)
@@ -97,7 +106,8 @@ export class SessionManager {
       try {
         if (!existsSync(path)) continue
         const data = JSON.parse(readFileSync(path, 'utf-8'))
-        // Support both legacy format {key: sessionId} and new format {key: {id, ts}}
+        // Support both legacy format {key: sessionId} and new format
+        // {key: {id, ts, lastCost?}}
         for (const [key, val] of Object.entries(data)) {
           if (typeof val === 'string') {
             this._resumeMap.set(key, val)
@@ -105,6 +115,14 @@ export class SessionManager {
           } else if (val && typeof val === 'object' && 'id' in (val as any)) {
             this._resumeMap.set(key, (val as any).id)
             this._resumeMapTimestamps.set(key, (val as any).ts ?? Date.now())
+            // Optional cost-delta baseline for the resumed CCB. If present,
+            // CCB will restore STATE.totalCostUSD to this value and the
+            // gateway needs the same baseline to compute correct per-turn
+            // deltas on the first post-resume `result`.
+            const lastCost = (val as any).lastCost
+            if (typeof lastCost === 'number' && Number.isFinite(lastCost) && lastCost >= 0) {
+              this._resumeMapLastCost.set(key, lastCost)
+            }
           }
         }
         return // Successfully parsed (even if empty — empty means all sessions were destroyed)
@@ -117,17 +135,29 @@ export class SessionManager {
   private _saveResumeMap(): void {
     // Merge: start from the loaded resume-map (includes sessions not yet re-activated),
     // then overlay with live sessions (which may have updated ccbSessionIds after resume).
-    const obj: Record<string, { id: string; ts: number }> = {}
+    const obj: Record<string, { id: string; ts: number; lastCost?: number }> = {}
     const now = Date.now()
     for (const [key, val] of this._resumeMap) {
-      obj[key] = { id: val, ts: this._resumeMapTimestamps.get(key) ?? now }
+      const entry: { id: string; ts: number; lastCost?: number } = {
+        id: val,
+        ts: this._resumeMapTimestamps.get(key) ?? now,
+      }
+      const cached = this._resumeMapLastCost.get(key)
+      if (cached !== undefined && cached > 0) entry.lastCost = cached
+      obj[key] = entry
     }
     for (const [key, sess] of this.sessions) {
       if (sess.ccbSessionId) {
-        obj[key] = { id: sess.ccbSessionId, ts: now }
+        const entry: { id: string; ts: number; lastCost?: number } = {
+          id: sess.ccbSessionId,
+          ts: now,
+        }
+        if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
+        obj[key] = entry
         // Keep in-memory maps in sync
         this._resumeMap.set(key, sess.ccbSessionId)
         this._resumeMapTimestamps.set(key, now)
+        this._resumeMapLastCost.set(key, sess._lastCcbCumulativeCost)
       }
     }
     const data = JSON.stringify(obj, null, 2)
@@ -171,7 +201,18 @@ export class SessionManager {
     peerId?: string
     title?: string
     delegationDepth?: number
+    /** 仅用于**新建** runner 时初始化 CLAUDE_CODE_EFFORT_LEVEL:
+     *    - string         : 用作初始值
+     *    - null/undefined : 让 CCB 用模型默认 effort
+     *
+     *  既存 session 的 effort 切换走 submit(effortLevel) — 在那里和 turn 入队
+     *  原子串行,避免 getOrCreate→submit 之间的窗口期被另一条并发消息覆盖。 */
+    effortLevel?: string | null
   }): Promise<AgentSession> {
+    // 新建时 null 等同 undefined(都让 CCB 用模型默认)
+    const initialEffort: string | undefined =
+      opts.effortLevel === null ? undefined : opts.effortLevel
+
     const existing = this.sessions.get(opts.sessionKey)
     if (existing) {
       existing.lastUsedAt = Date.now()
@@ -194,6 +235,7 @@ export class SessionManager {
       agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
       delegationDepth: opts.delegationDepth,
       resumeSessionId: this._resumeMap.get(opts.sessionKey),
+      effortLevel: initialEffort,
     })
     const now = Date.now()
     const session: AgentSession = {
@@ -207,12 +249,22 @@ export class SessionManager {
       ccbSessionId: null,
       lock: Promise.resolve(),
       lastUsedAt: now,
-      totalCostUSD: 0,
+      // If we are about to --resume a CCB whose historical cumulative was
+      // persisted in the resume-map, seed both the session-total AND the
+      // delta-baseline with the same value. The delta-baseline keeps the first
+      // post-resume per-turn delta correct; the session-total keeps aggregate
+      // cost events (final.meta.totalCost, cost.recorded.sessionTotalCostUsd)
+      // continuous across gateway restarts. For fresh sessions both are 0.
+      // NOTE: token counts are NOT persisted across gateway restarts — they
+      // will start at 0 after a resume. This is a known limitation; fixing it
+      // requires persisting per-token totals which we do not currently do.
+      totalCostUSD: this._resumeMapLastCost.get(opts.sessionKey) ?? 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,
       totalCacheReadTokens: 0,
       totalCacheCreationTokens: 0,
       turns: 0,
+      _lastCcbCumulativeCost: this._resumeMapLastCost.get(opts.sessionKey) ?? 0,
       model: opts.agent.model ?? this.config.defaults.model,
       toolUseIdToName: new Map(),
     }
@@ -220,6 +272,39 @@ export class SessionManager {
       session.ccbSessionId = id
       // Persist session→ccbSessionId mapping for resume after gateway restart
       this._saveResumeMap()
+    })
+    // Reset per-process cost-delta baseline in lock-step with subprocess
+    // lifecycle. The emit is synchronous and happens before any stdout listener
+    // is attached on the runner, so this listener runs strictly before any
+    // parser message of the new CCB — no race with a queued next turn.
+    //
+    // Fresh CCB:   getTotalCost() starts at 0 → reset baseline to 0.
+    // Resumed CCB: CCB's restoreCostStateForSession sets STATE.totalCostUSD
+    //              to the persisted historical cumulative, so the next
+    //              `result` will report (historical + new). To compute the
+    //              correct per-turn delta we keep our baseline equal to that
+    //              historical value.
+    //
+    // Baseline equality guarantees:
+    //   - AUTH/PHANTOM/effort-change (graceful shutdown): onFinish rollback
+    //     restores baseline to the last successful turn's cumulative, and
+    //     CCB's costHook (process.on('exit')) persists STATE.totalCostUSD at
+    //     the same point → values match.
+    //   - gateway-restart: _resumeMapLastCost is written after every
+    //     successful turn (see _saveResumeMap call in onFinish success path),
+    //     matching CCB's per-exit persistence.
+    //   - CRASH: CCB may die before its exit hook runs, in which case its
+    //     persisted cumulative may lag behind the gateway's baseline by 1+
+    //     turns. The parser's `< 0` fallback (treats newCumulative as full
+    //     delta when newCumulative < baseline) recovers accuracy for the
+    //     specific respawned turn, but the historical lag is unrecoverable
+    //     from gateway's side. This is accepted as best-effort behaviour;
+    //     a stricter fix would require CCB to persist STATE.totalCostUSD on
+    //     every turn, not only at exit.
+    runner.on('spawn', (info: { resumed: boolean }) => {
+      if (!info.resumed) {
+        session._lastCcbCumulativeCost = 0
+      }
     })
     // Monitor subprocess crashes — emit event so gateway can notify connected clients
     runner.on('exit', (info: { code: number | null; signal: string | null; crashed: boolean }) => {
@@ -247,12 +332,45 @@ export class SessionManager {
     session: AgentSession,
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     onEvent: (e: SessionStreamEvent) => void,
+    /** 来自 InboundMessage.effortLevel,用于本条消息开始执行**之前**调整 runner 的
+     *  CLAUDE_CODE_EFFORT_LEVEL(env 仅在 CCB 启动时读,所以"切档"= shutdown 触发
+     *  下一次 submit 重启子进程):
+     *    - string         : 设成该值
+     *    - null           : 显式清除(回到模型默认 effort)
+     *    - undefined      : caller 没指定,不动
+     *
+     *  effort 应用、prev await、本 turn 的 _runOneTurn 全部串在同一个新 lock 里;
+     *  闭包捕获 desiredEffort 后,后到的 submit() 不会污染本 turn 的 effort。 */
+    effortLevel?: string | null,
   ): Promise<void> {
+    // 闭包捕获:即便后面再有 submit 也不会改这个常量
+    const desiredEffort: string | undefined =
+      effortLevel === null ? undefined : effortLevel
+    const callerSpecifiedEffort = effortLevel !== undefined
+
     const prev = session.lock
     let release!: () => void
     session.lock = new Promise<void>((r) => (release = r))
     try {
       await prev
+      // effort 应用必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
+      //   - prev 之前:可能中断别人的 in-flight turn
+      //   - 本 turn 之后:env 已被 CCB 启动时读完,改也无效
+      // 同时受 lock chain 保护,后到的 submit 想 set 别的 effort 也得排在我们后面。
+      if (callerSpecifiedEffort && session.runner.effortLevel !== desiredEffort) {
+        try {
+          session.runner.setEffortLevel(desiredEffort)
+          await session.runner.shutdown()
+          // Delta tracker reset happens automatically on the next 'spawn' event
+          // when SubprocessRunner auto-respawns on the next submit().
+        } catch (err) {
+          log.warn(
+            'effort-change shutdown failed',
+            { sessionKey: session.sessionKey },
+            err,
+          )
+        }
+      }
       session.lastUsedAt = Date.now()
       // Clear tool use mappings from previous turn to prevent unbounded growth
       session.toolUseIdToName.clear()
@@ -333,12 +451,51 @@ export class SessionManager {
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
+    // PHANTOM_TURN 用独立计数器,不和 transient 共用 attempt budget。
+    // 第 0 次 phantom → 重启子进程 + retry 1 次;第 1 次还是 phantom → 终态 error,不再重试。
+    let phantomRetryUsed = false
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         await this._runOneTurn(session, userTextOrBlocks, onEvent)
         return // success
       } catch (err: any) {
         const msg = err?.message ?? String(err)
+
+        // Phantom turn: CCB 返回了不调模型的空 result(usage/cost/blocks 全为 0)。
+        // 通常是 CCB 子进程长闲置后内部状态卡死,重启子进程能恢复。
+        if (/PHANTOM_TURN/i.test(msg)) {
+          log.warn('phantom turn detected, restarting subprocess', {
+            sessionKey: session.sessionKey,
+            phantomRetryUsed,
+          })
+          // shutdown → 下次 submit() 会自动 respawn 一个干净的 CCB 进程。
+          // 子进程重启时 runner 的 'spawn' 事件会自动把 _lastCcbCumulativeCost 归零。
+          await session.runner.shutdown()
+          if (phantomRetryUsed) {
+            // 重启过一次还是 phantom,不再循环。emit 终态 error(走和 idle_timeout 一样的路径,
+            // server.ts 会把 kind:'error' 转成 isFinal:true 的可见错误帧)。
+            onEvent({
+              kind: 'error',
+              error:
+                'CCB 子进程持续返回空响应,已重启子进程。请重新发送消息或检查 gateway 日志。',
+            })
+            return
+          }
+          phantomRetryUsed = true
+          onEvent({
+            kind: 'block',
+            block: {
+              kind: 'text',
+              text: '\n\n🔄 CCB 子进程返回空响应(未调模型),已重启子进程并自动重试...\n',
+            },
+          })
+          // Don't consume transient-retry budget on a phantom retry. The for-loop's
+          // `attempt++` would otherwise eat one slot from MAX_RETRIES (originally
+          // intended for 529/503/rate-limit), which would silently shorten the
+          // retry budget for any subsequent transient error in this turn.
+          attempt--
+          continue
+        }
 
         // Auth error (401): refresh credentials and restart subprocess
         if (/AUTH_ERROR/i.test(msg)) {
@@ -351,7 +508,8 @@ export class SessionManager {
               log.error('onAuthError callback failed', { sessionKey: session.sessionKey }, e as Error)
             }
           }
-          // Shutdown subprocess — next submit() auto-restarts with fresh config
+          // Shutdown subprocess — next submit() auto-restarts with fresh config.
+          // Runner 'spawn' listener resets _lastCcbCumulativeCost automatically.
           await session.runner.shutdown()
           if (attempt >= MAX_RETRIES) throw err
           onEvent({
@@ -382,7 +540,18 @@ export class SessionManager {
   }
 
   // Auth error keywords — only matched when result.isError is true, so safe to be broad.
-  private static AUTH_KEYWORDS_RE = /authenticat|credentials|401|unauthorized/i
+  // Covers CCB's auth-related error strings from src/services/api/errors.ts:
+  //   INVALID_API_KEY_ERROR_MESSAGE           = 'Not logged in · Please run /login'
+  //   INVALID_API_KEY_ERROR_MESSAGE_EXTERNAL  = 'Invalid API key · Fix external API key'
+  //   TOKEN_REVOKED_ERROR_MESSAGE             = 'OAuth token revoked · Please run /login'
+  //   OAUTH_ORG_NOT_ALLOWED_ERROR_MESSAGE     = 'Your account does not have access to Claude Code. Please run /login.'
+  //   Generic 401/403 handler                 = 'Please run /login · API Error: ...' / 'Failed to authenticate. ...'
+  //   ORG_DISABLED_ERROR_MESSAGE_ENV_KEY(_WITH_OAUTH) = 'Your ANTHROPIC_API_KEY belongs to a disabled organization · ...'
+  // The `run /login` substring is the common signal across all CCB login-required
+  // paths; the rest catch status-code / revoke / org-disabled phrasings that
+  // don't necessarily include a /login prompt.
+  private static AUTH_KEYWORDS_RE =
+    /authenticat|credentials|401|unauthorized|run \/login|token (?:has been )?revoked|invalid api key|organization has been disabled/i
   // CCB's exact error prefix when API auth fails — safe to match even without isError flag.
   private static AUTH_ERROR_PREFIX_RE = /^Failed to authenticate\b/
 
@@ -394,11 +563,14 @@ export class SessionManager {
     const { runner } = session
     const turnStartTime = Date.now()
     let turnToolCallCount = 0
+    let turnBlockCount = 0
+    let turnPermissionCount = 0
 
-    // Snapshot session totals so we can roll back on auth error
+    // Snapshot session totals so we can roll back on auth error / phantom turn
     // (parser mutates these directly via sessionTotals reference)
     const prevCostUSD = session.totalCostUSD
     const prevTurns = session.turns
+    const prevLastCcbCost = session._lastCcbCumulativeCost
 
     await new Promise<void>((resolve, reject) => {
       let settled = false
@@ -423,8 +595,31 @@ export class SessionManager {
       // Buffer 'final' event — only forward to client after auth check passes
       let pendingFinal: SessionStreamEvent | null = null
       const wrappedOnEvent = (e: SessionStreamEvent) => {
+        // Track all observable output for phantom-turn detection.
+        // permission_request counts as real output too (visible permission card),
+        // so it must NOT be flagged as phantom even if usage is 0.
+        if (e.kind === 'block') turnBlockCount++
+        else if (e.kind === 'permission_request') turnPermissionCount++
         if (e.kind === 'final') { pendingFinal = e; return }
         onEvent(e)
+      }
+
+      // Per-turn OpenClaude telemetry sink. Consumes `_oc_telemetry` lines
+      // routed by subprocessRunner (see docs/ccb-telemetry-refactor-plan.md).
+      // Lifecycle: constructed per turn, dropped by `detach()` on every exit
+      // path (normal finish / error / exit / idle timeout / submit catch).
+      const telemetry = new TelemetryChannel()
+      const handleTelemetry = (ev: OcTelemetryEvent) => telemetry.ingest(ev)
+      // Per-turn parse_error listener (previously only installed at runner
+      // construction). Must be detached with the rest to avoid per-turn
+      // listener accumulation (R9).
+      const handleParseError = (payload: { line: string; err: unknown }) => {
+        const err = payload.err as Error | undefined
+        log.warn('ccb stdout parse_error', {
+          sessionKey: session.sessionKey,
+          msg: err?.message,
+          sample: payload.line?.slice(0, 200),
+        })
       }
 
       const detach = () => {
@@ -437,6 +632,8 @@ export class SessionManager {
         runner.off('message', handleMessage)
         runner.off('error', handleError)
         runner.off('exit', handleExit)
+        runner.off('telemetry', handleTelemetry)
+        runner.off('parse_error', handleParseError)
       }
 
       const parser = new CcbMessageParser({
@@ -502,7 +699,87 @@ export class SessionManager {
           if (isAuthError) {
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
+            session._lastCcbCumulativeCost = prevLastCcbCost
             settle(() => reject(new Error('AUTH_ERROR: Token expired or invalid')))
+            return
+          }
+
+          // Phantom-turn detection — three-state logic (v3):
+          //   - apiState='skipped'  → CCB explicitly said no API call
+          //                           (slash command path). Normal completion,
+          //                           zero cost is expected, NOT phantom.
+          //   - apiState='called'   → CCB explicitly fired willCallApi.
+          //                           Cannot be phantom. If the result row is
+          //                           missing stop_reason AND no blocks came
+          //                           out, note `incomplete` for diagnostics
+          //                           but don't roll back.
+          //   - apiState='unknown'  → No telemetry arrived (e.g. old CCB,
+          //                           disabled kill switch, emit swallowed an
+          //                           error). Fall back to the legacy 9-AND
+          //                           heuristic so behavior is strictly ≤
+          //                           pre-refactor (R7: never fail closed).
+          // See docs/ccb-telemetry-refactor-plan.md §5.4.
+          const userInputStr =
+            typeof userTextOrBlocks === 'string' ? userTextOrBlocks : null
+          const isStringInput = userInputStr !== null
+          const isSlashCommand =
+            isStringInput && userInputStr!.trimStart().startsWith('/')
+
+          const signals = telemetry.getTurnSignals()
+          let isPhantomTurn = false
+          switch (signals.apiState) {
+            case 'skipped':
+              log.info('turn.skipped (telemetry)', {
+                sessionKey: session.sessionKey,
+                reason: signals.skipReason,
+              })
+              isPhantomTurn = false
+              break
+            case 'called':
+              isPhantomTurn = false
+              if (
+                result &&
+                !result.stopReason &&
+                turnBlockCount === 0 &&
+                turnPermissionCount === 0
+              ) {
+                telemetry.noteIncomplete()
+                log.warn('telemetry: willCallApi fired but no stop_reason and no blocks', {
+                  sessionKey: session.sessionKey,
+                  incompleteCount: telemetry.getIncompleteCount(),
+                })
+              }
+              break
+            case 'unknown':
+              // Legacy 9-AND heuristic (unchanged from pre-refactor)
+              isPhantomTurn =
+                !!result &&
+                isStringInput &&
+                !isSlashCommand &&
+                !result.isError &&
+                result.inputTokens === 0 &&
+                result.outputTokens === 0 &&
+                result.cacheReadTokens === 0 &&
+                result.cacheCreationTokens === 0 &&
+                result.cost === 0 &&
+                turnToolCallCount === 0 &&
+                turnBlockCount === 0 &&
+                turnPermissionCount === 0
+              break
+          }
+
+          if (isPhantomTurn) {
+            // Roll back parser-mutated counters (parser already incremented
+            // turns and may have touched cost/cumulative even if delta was 0).
+            session.totalCostUSD = prevCostUSD
+            session.turns = prevTurns
+            session._lastCcbCumulativeCost = prevLastCcbCost
+            log.warn('phantom turn — CCB returned empty result without invoking model', {
+              sessionKey: session.sessionKey,
+              turnIndex: session.turns + 1,
+              durationMs: Date.now() - turnStartTime,
+            })
+            settle(() => reject(new Error('PHANTOM_TURN: CCB returned empty result')))
             return
           }
 
@@ -516,6 +793,13 @@ export class SessionManager {
             session.totalCacheReadTokens += result.cacheReadTokens
             session.totalCacheCreationTokens += result.cacheCreationTokens
             session.currentAssistantBuf = result.assistantText
+            // Persist cost-delta baseline after every successful turn so that
+            // a gateway crash + restart can re-seed the correct baseline for
+            // the resumed CCB (whose restoreCostStateForSession will target
+            // the same cumulative). Without this, `lastCost` in resume-map
+            // would only get updated when session_id changes, which lags
+            // behind real turn completion by many turns.
+            this._saveResumeMap()
             // L2: persist to FTS5 for session_search
             const sessId = session.ccbSessionId ?? session.sessionKey
             Promise.all([
@@ -615,12 +899,17 @@ export class SessionManager {
             detach()
             settle(() => resolve())
           }
+          // Cost-tracker reset is handled by the `spawn` listener installed in
+          // createSession — it fires synchronously when the next submit() spawns
+          // a fresh CCB, with no timer-vs-new-process race.
         }, 150)
       }
 
       runner.on('message', handleMessage)
       runner.on('error', handleError)
       runner.on('exit', handleExit)
+      runner.on('telemetry', handleTelemetry)
+      runner.on('parse_error', handleParseError)
 
       runner.submit(userTextOrBlocks).catch((err) => {
         onEvent({ kind: 'error', error: String(err) })
@@ -652,6 +941,7 @@ export class SessionManager {
     if (this._resumeMap.has(sessionKey)) {
       this._resumeMap.delete(sessionKey)
       this._resumeMapTimestamps.delete(sessionKey)
+      this._resumeMapLastCost.delete(sessionKey)
       this._saveResumeMap()
     }
   }
@@ -710,6 +1000,7 @@ export class SessionManager {
         if (!key.includes(':webchat:')) {
           this._resumeMap.delete(key)
           this._resumeMapTimestamps.delete(key)
+          this._resumeMapLastCost.delete(key)
         }
         // (webchat entries stay in _resumeMap intentionally for cross-restart recovery)
       }
@@ -723,6 +1014,12 @@ export class SessionManager {
 
   // Resume-map TTL: track when each entry was last updated
   private _resumeMapTimestamps = new Map<string, number>()
+  // Persisted cost-delta baseline for resumed CCB sessions. CCB's
+  // restoreCostStateForSession sets STATE.totalCostUSD to this value on start,
+  // so the gateway must seed the matching baseline before the first post-resume
+  // `result` arrives (otherwise the parser would compute delta against 0 and
+  // re-attribute the entire historical cumulative as this turn's cost).
+  private _resumeMapLastCost = new Map<string, number>()
   private static RESUME_MAP_TTL = 30 * 24 * 60 * 60 * 1000 // 30 days
 
   private _pruneResumeMap(): void {
@@ -734,6 +1031,7 @@ export class SessionManager {
       if (ts > 0 && now - ts > SessionManager.RESUME_MAP_TTL) {
         this._resumeMap.delete(key)
         this._resumeMapTimestamps.delete(key)
+        this._resumeMapLastCost.delete(key)
         pruned = true
         log.info('pruned stale resume-map entry', { sessionKey: key })
       }
