@@ -4,7 +4,7 @@
 //   1. User clicks "微信绑定" → openWechatModal()
 //   2. Load current binding (GET /api/wechat/binding)
 //      - if null → unbound state (show Start button)
-//      - if present → bound state (show account/whitelist)
+//      - if present → bound state (show account + status)
 //   3. Click Start → POST /api/wechat/pair/start → render qrcodeImgContent as QR
 //   4. Begin poll loop (POST /api/wechat/pair/poll) until status != waiting/scanned
 //   5. On confirmed → reload binding, switch to bound state
@@ -54,7 +54,6 @@ async function loadBinding() {
       : 'var(--fg-muted)'
     $('wechat-status').innerHTML = `<span style="color:${statusColor}">${binding.status}</span>` +
       (binding.lastEventAt ? ` · 最近消息 ${new Date(binding.lastEventAt).toLocaleString()}` : '')
-    $('wechat-whitelist').value = (binding.whitelist || []).join('\n')
     showState('bound')
     return binding
   } catch (e) {
@@ -139,24 +138,11 @@ async function pollLoop(qrcode) {
   }
 }
 
-async function saveWhitelist() {
-  const raw = $('wechat-whitelist').value || ''
-  const whitelist = raw.split('\n').map((s) => s.trim()).filter(Boolean)
-  try {
-    await apiJson('PUT', '/api/wechat/binding/whitelist', { whitelist })
-    toast('白名单已保存', 'success')
-    await loadBinding()
-  } catch (e) {
-    setError(`保存失败: ${e?.message || e}`)
-  }
-}
-
 async function unbind() {
   if (!confirm('确定解绑?该微信号将无法再与此 OC 用户对话。')) return
   try {
     await apiJson('DELETE', '/api/wechat/binding')
     toast('已解绑', 'success')
-    $('wechat-whitelist').value = ''
     showState('unbound')
   } catch (e) {
     setError(`解绑失败: ${e?.message || e}`)
@@ -172,7 +158,6 @@ export function openWechatModal() {
 
 export function initWechatListeners() {
   $('wechat-start-btn').onclick = startPairing
-  $('wechat-save-whitelist-btn').onclick = saveWhitelist
   $('wechat-refresh-btn').onclick = loadBinding
   $('wechat-unbind-btn').onclick = unbind
 

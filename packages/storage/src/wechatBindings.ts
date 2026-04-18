@@ -167,19 +167,6 @@ export async function updateWechatBindingStatus(
   )
 }
 
-export async function updateWechatBindingWhitelist(
-  userId: string,
-  whitelist: string[],
-): Promise<void> {
-  const db = await getSessionsDb()
-  const now = Date.now()
-  db.prepare('UPDATE wechat_bindings SET whitelist = ?, updated_at = ? WHERE user_id = ?').run(
-    JSON.stringify(whitelist),
-    now,
-    userId,
-  )
-}
-
 export async function deleteWechatBinding(userId: string): Promise<void> {
   const db = await getSessionsDb()
   db.prepare('DELETE FROM wechat_bindings WHERE user_id = ?').run(userId)

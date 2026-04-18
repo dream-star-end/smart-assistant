@@ -103,14 +103,16 @@ export async function resumePairing(userId: string, qrcode: string): Promise<Pai
     return { status: 'waiting' }
   }
 
-  // Persist binding. login_user_id auto-added to whitelist so the bound WeChat
-  // account can immediately message its own bot.
+  // Persist binding. Whitelist is intentionally empty — we no longer gate
+  // senders at the manager layer (any WeChat account that can reach the bot
+  // can talk to it). The column is retained for backward compatibility /
+  // future use but carries no runtime meaning.
   await upsertWechatBinding({
     userId,
     accountId: confirmed.account_id,
     loginUserId: confirmed.login_user_id,
     botToken: confirmed.bot_token,
-    whitelist: confirmed.login_user_id ? [confirmed.login_user_id] : [],
+    whitelist: [],
     status: 'active',
   })
   PENDING.delete(qrcode)

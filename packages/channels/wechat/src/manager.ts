@@ -3,7 +3,8 @@
 // At gateway startup the manager:
 //   1. Queries wechat_bindings for status='active' rows
 //   2. Spawns one WechatWorker per row (each runs its own long-poll loop)
-//   3. Routes inbound events → gateway.dispatch after whitelist check
+//   3. Routes inbound events → gateway.dispatch (no gating — any sender that
+//      can reach the bound bot is trusted)
 //   4. Routes OutboundMessage back to the right worker by decoding peer.id
 //
 // peer.id encoding: "${bindingUserId}:${wxSenderId}" so that two different
@@ -16,16 +17,12 @@
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import type { OutboundMessage } from '@openclaude/protocol'
 import type { WechatBinding } from '@openclaude/storage'
-import {
-  getWechatBindingByUserId,
-  listActiveWechatBindings,
-  updateWechatBindingWhitelist,
-} from '@openclaude/storage'
+import { listActiveWechatBindings } from '@openclaude/storage'
 import { WechatWorker, type InboundEvent } from './worker.js'
 
 export interface WechatChannelConfig {
   // Interval (ms) between DB reconciliation passes. Picks up newly added
-  // bindings and applies whitelist updates without restarting the gateway.
+  // bindings and applies token/status updates without restarting the gateway.
   reconcileIntervalMs?: number
 }
 
@@ -36,32 +33,6 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
   const workers = new Map<string, WechatWorker>() // key = userId (OC user)
   let reconcileTimer: ReturnType<typeof setInterval> | null = null
   let shuttingDown = false
-
-  // Rate-limit the soft-bounce reply to unknown senders.
-  // Key: `${bindingUserId}:${senderId}`. Value: last-replied ts (ms).
-  // Prevents reply storms when a bot is spammed by a stranger.
-  // Bounded by BOUNCE_MAX_ENTRIES + TTL eviction so a spammer cycling senders
-  // cannot grow this map without bound (leak risk).
-  const bounceCache = new Map<string, number>()
-  const BOUNCE_COOLDOWN_MS = 30 * 60_000
-  const BOUNCE_MAX_ENTRIES = 1000
-
-  function bounceCacheSweep(): void {
-    const now = Date.now()
-    for (const [k, v] of bounceCache) {
-      if (now - v > BOUNCE_COOLDOWN_MS) bounceCache.delete(k)
-    }
-    // Hard cap: if still over-sized after TTL sweep, drop oldest entries.
-    // Map iteration order is insertion order, so the first N are the oldest.
-    if (bounceCache.size > BOUNCE_MAX_ENTRIES) {
-      const overflow = bounceCache.size - BOUNCE_MAX_ENTRIES
-      let i = 0
-      for (const k of bounceCache.keys()) {
-        if (i++ >= overflow) break
-        bounceCache.delete(k)
-      }
-    }
-  }
 
   async function startWorkerFor(binding: WechatBinding): Promise<void> {
     if (!ctx) return
@@ -78,39 +49,9 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
     if (!ctx) return
     const { binding, senderId, text, messageId } = evt
 
-    // Whitelist gate: only login_user_id + explicitly bound senders can talk.
-    // Others get a guidance reply once (the /bind handshake) — Stage 4 wires this.
-    const allowed = new Set<string>([
-      ...(binding.whitelist || []),
-      ...(binding.loginUserId ? [binding.loginUserId] : []),
-    ])
-    const isAllowed = allowed.has(senderId)
-
-    if (!isAllowed) {
-      // Soft-bounce: tell the stranger their user_id so the OC owner can
-      // add them via the Settings panel, or via `/bind <user_id>` from a
-      // whitelisted account. Rate-limited to avoid reply storms.
-      ctx.log.info(
-        `[wechat:${binding.userId}] drop unauthorized sender=${senderId} text="${text.slice(0, 60)}"`,
-      )
-      const bounceKey = `${binding.userId}:${senderId}`
-      const last = bounceCache.get(bounceKey) || 0
-      if (Date.now() - last > BOUNCE_COOLDOWN_MS) {
-        bounceCache.set(bounceKey, Date.now())
-        bounceCacheSweep()
-        const w = workers.get(binding.userId)
-        if (w) {
-          const hint =
-            `你未被授权访问此 OpenClaude bot。\n` +
-            `请让管理员把你的 user_id 加到白名单:\n${senderId}\n\n` +
-            `(管理员可在 OC 的"微信绑定"里添加,或在本 bot 里发送 "/bind ${senderId}")`
-          // sendText requires we have a context_token; at this point the
-          // worker just recorded one, so this will work.
-          w.sendText(senderId, hint).catch(() => {})
-        }
-      }
-      return
-    }
+    // No sender gating — anyone who can reach the bound bot is trusted. The
+    // OC owner wants the bot fully open; access control is the WeChat-side
+    // friend relationship, not something we replicate here.
 
     // ── /status — report current binding state to the WeChat user ──
     if (/^\s*\/status\s*$/.test(text)) {
@@ -122,7 +63,6 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
         `OC bot status\n` +
         `account: ${binding.accountId}\n` +
         `status: ${binding.status}\n` +
-        `whitelist: ${(binding.whitelist || []).length} 位\n` +
         `最近事件: ${lastEvt}\n` +
         `活跃 worker: ${workers.size}`
       if (w) w.sendText(senderId, msg).catch(() => {})
@@ -139,34 +79,6 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
       } catch (err: any) {
         const w = workers.get(binding.userId)
         if (w) w.sendText(senderId, `/new 失败: ${err?.message || err}`).catch(() => {})
-      }
-      return
-    }
-
-    // ── /bind <wx_user_id> — whitelisted user adds another sender ──
-    const bindMatch = /^\s*\/bind\s+([A-Za-z0-9_@.\-]+)\s*$/.exec(text)
-    if (bindMatch) {
-      const target = bindMatch[1]
-      const current = new Set<string>(binding.whitelist || [])
-      if (binding.loginUserId) current.add(binding.loginUserId)
-      if (current.has(target)) {
-        const w = workers.get(binding.userId)
-        if (w) w.sendText(senderId, `${target} 已在白名单`).catch(() => {})
-        return
-      }
-      current.add(target)
-      const nextList = Array.from(current)
-      try {
-        await updateWechatBindingWhitelist(binding.userId, nextList)
-        // Refresh in-memory snapshot so the next message from <target> is accepted
-        const refreshed = await getWechatBindingByUserId(binding.userId)
-        if (refreshed) workers.get(binding.userId)?.updateBinding(refreshed)
-        const w = workers.get(binding.userId)
-        if (w) w.sendText(senderId, `已添加 ${target} 到白名单`).catch(() => {})
-      } catch (err: any) {
-        ctx.log.error(`[wechat:${binding.userId}] /bind failed: ${err?.message || err}`)
-        const w = workers.get(binding.userId)
-        if (w) w.sendText(senderId, `/bind 失败: ${err?.message || err}`).catch(() => {})
       }
       return
     }
@@ -207,7 +119,7 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
         ctx.log.info(`[wechat] starting worker for user=${b.userId} account=${b.accountId}`)
         await startWorkerFor(b)
       } else {
-        // Refresh in-memory snapshot (whitelist/token updates)
+        // Refresh in-memory snapshot (status / context_token catch-up)
         workers.get(b.userId)!.updateBinding(b)
       }
     }
@@ -291,16 +203,6 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
       workers.clear()
     },
   }
-}
-
-// ─── bind-management hook (used by the Web Settings panel) ────────────
-// Mutating whitelist via DB then calling reconcile() (on a timer) is fine,
-// but we export a helper so callers can push updates without waiting.
-export async function updateWechatBindingWhitelistAndRefresh(
-  userId: string,
-  whitelist: string[],
-): Promise<void> {
-  await updateWechatBindingWhitelist(userId, whitelist)
 }
 
 function truncate(s: string, max: number): string {

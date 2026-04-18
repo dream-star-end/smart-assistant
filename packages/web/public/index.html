@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=12" />
+<link rel="stylesheet" href="/style.css?v=13" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -482,7 +482,7 @@
         </div>
       </div>
 
-      <!-- Bound state: show account + whitelist editor + unbind -->
+      <!-- Bound state: show account + status + unbind (no gating) -->
       <div id="wechat-state-bound" hidden>
         <div class="form-row">
           <label>绑定账号</label>
@@ -492,13 +492,10 @@
           <label>状态</label>
           <div id="wechat-status" style="font-size:var(--text-sm)"></div>
         </div>
-        <div class="form-row">
-          <label>白名单 (允许与 bot 对话的微信 user_id,每行一个)</label>
-          <textarea id="wechat-whitelist" rows="4" style="width:100%;padding:8px 10px;background:var(--bg-raised);border:1px solid var(--border);border-radius:var(--radius-md);color:var(--fg);font-family:var(--font-mono);font-size:var(--text-sm)" placeholder="wx_u_xxx&#10;wx_u_yyy"></textarea>
-          <p style="margin:var(--space-1) 0 0;color:var(--fg-muted);font-size:var(--text-xs)">未加入白名单的发送者会被静默丢弃,不进入 OC 会话。</p>
-        </div>
+        <p style="margin:var(--space-2) 0 0;color:var(--fg-muted);font-size:var(--text-xs)">
+          任何能联系到本 bot 的微信账号都可直接对话(无白名单限制)。访问控制由微信好友关系本身决定。
+        </p>
         <div style="display:flex;gap:var(--space-2);margin-top:var(--space-3)">
-          <button id="wechat-save-whitelist-btn" class="btn btn-secondary">保存白名单</button>
           <button id="wechat-refresh-btn" class="btn btn-ghost">刷新</button>
           <button id="wechat-unbind-btn" class="btn btn-ghost" style="margin-left:auto;color:var(--danger)">解绑</button>
         </div>
@@ -615,6 +612,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=12"></script>
+<script type="module" src="/modules/main.js?v=13"></script>
 </body>
 </html>

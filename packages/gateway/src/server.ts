@@ -1203,7 +1203,7 @@ export class Gateway {
     //   POST   /api/wechat/pair/poll  {qrcode}   → { status, accountId?, loginUserId? }
     //   GET    /api/wechat/binding               → { binding: {...} | null }
     //   DELETE /api/wechat/binding               → { ok: true }
-    //   PUT    /api/wechat/binding/whitelist     → { ok, whitelist }
+    //   PUT    /api/wechat/binding/status        → { ok, status }
     if (url.pathname.startsWith('/api/wechat/')) {
       this._handleWechat(req, res, url.pathname).catch((err) =>
         this.sendError(res, 500, String(err)),
@@ -1957,7 +1957,6 @@ export class Gateway {
     const {
       getWechatBindingByUserId,
       deleteWechatBinding,
-      updateWechatBindingWhitelist,
       updateWechatBindingStatus,
     } = await import('@openclaude/storage')
 
@@ -2017,7 +2016,6 @@ export class Gateway {
         binding: {
           accountId: b.accountId,
           loginUserId: b.loginUserId,
-          whitelist: b.whitelist,
           status: b.status,
           createdAt: b.createdAt,
           updatedAt: b.updatedAt,
@@ -2031,23 +2029,6 @@ export class Gateway {
     if (pathname === '/api/wechat/binding' && req.method === 'DELETE') {
       await deleteWechatBinding(userId)
       this.sendJson(res, 200, { ok: true })
-      return
-    }
-
-    // ── PUT /api/wechat/binding/whitelist { whitelist: string[] } ──
-    if (pathname === '/api/wechat/binding/whitelist' && req.method === 'PUT') {
-      try {
-        const body = await this.readBody(req)
-        const { whitelist } = JSON.parse(body || '{}') as { whitelist?: string[] }
-        if (!Array.isArray(whitelist)) {
-          this.sendError(res, 400, 'whitelist must be array')
-          return
-        }
-        await updateWechatBindingWhitelist(userId, whitelist.map(String))
-        this.sendJson(res, 200, { ok: true, whitelist })
-      } catch (err: any) {
-        this.sendError(res, 500, String(err?.message || err))
-      }
       return
     }
 
@@ -3954,7 +3935,7 @@ const KNOWN_ROUTES = [
   '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
   '/api/cron', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
   '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
-  '/api/wechat/binding', '/api/wechat/binding/whitelist', '/api/wechat/binding/status',
+  '/api/wechat/binding', '/api/wechat/binding/status',
   '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
   '/api/auth/claude/callback', '/api/auth/claude/status',
   '/api/file', '/healthz', '/metrics',
