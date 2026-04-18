@@ -6,6 +6,7 @@
   "exports": { ".": "./src/index.ts" },
   "dependencies": {
     "@openclaude/plugin-sdk": "*",
-    "@openclaude/protocol": "*"
+    "@openclaude/protocol": "*",
+    "@openclaude/storage": "*"
   }
 }

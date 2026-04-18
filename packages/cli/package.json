@@ -13,6 +13,7 @@
     "@openclaude/protocol": "*",
     "@openclaude/plugin-sdk": "*",
     "@openclaude/channel-telegram": "*",
+    "@openclaude/channel-wechat": "*",
     "commander": "^12.1.0",
     "grammy": "^1.30.0"
   }

@@ -183,6 +183,33 @@ export async function getSessionsDb(): Promise<Database.Database> {
     }
   } catch { /* table just created with column already */ }
 
+  // ── WeChat iLink per-user bindings (multi-tenant) ──
+  //   Each OpenClaude user can bind exactly one WeChat bot account via
+  //   ilinkai.weixin.qq.com. The row stores the bot_token + long-poll cursor
+  //   + whitelist of wx sender IDs that are allowed to talk to the bot.
+  //
+  //   PRIMARY KEY = (user_id)           — one binding per OC user (MVP)
+  //   UNIQUE(account_id)                — server-side bot can only be bound once
+  //
+  //   status values: "active" | "disabled" | "expired"
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wechat_bindings (
+      user_id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      login_user_id TEXT NOT NULL DEFAULT '',
+      bot_token TEXT NOT NULL,
+      get_updates_buf TEXT NOT NULL DEFAULT '',
+      context_tokens TEXT NOT NULL DEFAULT '{}',
+      whitelist TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      last_event_at INTEGER DEFAULT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_wechat_bindings_account ON wechat_bindings(account_id);
+    CREATE INDEX IF NOT EXISTS idx_wechat_bindings_status ON wechat_bindings(status);
+  `)
+
   _db = db
   return db
 }

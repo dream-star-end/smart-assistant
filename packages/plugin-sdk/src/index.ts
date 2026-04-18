@@ -22,6 +22,12 @@ export interface PluginContext {
   log: { info: (msg: string, meta?: unknown) => void; error: (msg: string, meta?: unknown) => void }
   /** Configuration from ~/.openclaude/openclaude.json */
   config: Record<string, unknown>
+  /**
+   * Reset the agent session keyed by (channel, peer). Next inbound message
+   * from this peer spawns a fresh subprocess with no resumed state.
+   * No-op if no session is live. Used by channel /new slash commands.
+   */
+  resetSession?(channel: string, peerId: string, peerKind: 'dm' | 'group'): Promise<void>
 }
 
 // ══════════════════════════════════════════════════════

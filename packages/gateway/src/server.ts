@@ -228,6 +228,22 @@ export class Gateway {
           error: (m, meta) => this.log.error(m, { ...(meta ?? {}), channel: adapter.name }),
         },
         config: (config.channels as any)[adapter.name] ?? {},
+        // Reset session keyed by (channel, peer). Used by channel /new handlers.
+        // Destroys every session the router could route this (channel, peer) to.
+        resetSession: async (channel, peerId, peerKind) => {
+          const safePeer = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
+          const prefix = `agent:`
+          const suffix = `:${channel}:${peerKind}:${safePeer}`
+          const keys: string[] = []
+          for (const s of this.sessions.list()) {
+            if (s.sessionKey.startsWith(prefix) && s.sessionKey.endsWith(suffix)) {
+              keys.push(s.sessionKey)
+            }
+          }
+          for (const k of keys) {
+            try { await this.sessions.destroySession(k) } catch {}
+          }
+        },
       }
       try {
         await adapter.init(ctx)
@@ -1181,6 +1197,20 @@ export class Gateway {
       return
     }
 
+    // ── WeChat (iLink) bot binding ──
+    // Multi-tenant: each OC user can bind their own WeChat bot via QR scan.
+    //   POST   /api/wechat/pair/start            → { qrcode, qrcodeImgContent }
+    //   POST   /api/wechat/pair/poll  {qrcode}   → { status, accountId?, loginUserId? }
+    //   GET    /api/wechat/binding               → { binding: {...} | null }
+    //   DELETE /api/wechat/binding               → { ok: true }
+    //   PUT    /api/wechat/binding/whitelist     → { ok, whitelist }
+    if (url.pathname.startsWith('/api/wechat/')) {
+      this._handleWechat(req, res, url.pathname).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+
     // ── Claude.ai OAuth ──
     if (url.pathname === '/api/auth/claude/start') {
       this.handleOAuthStart(req, res).catch((err) => this.sendError(res, 500, String(err)))
@@ -1901,6 +1931,144 @@ export class Gateway {
       return
     }
     this.sendError(res, 405, 'method not allowed')
+  }
+
+  private async _handleWechat(
+    req: IncomingMessage,
+    res: ServerResponse,
+    pathname: string,
+  ): Promise<void> {
+    // Lazy import so the gateway doesn't pull in qrcode/iLink deps unless the
+    // WeChat channel is wired up. Importing a workspace package is ~free in
+    // Bun — this is purely to avoid hard-coupling the gateway to it.
+    let pairing: any
+    try {
+      pairing = await import('@openclaude/channel-wechat' as any)
+    } catch (err) {
+      this.sendError(res, 503, '@openclaude/channel-wechat not available: ' + String(err))
+      return
+    }
+    const {
+      startPairing,
+      resumePairing,
+      cancelPairing,
+    } = pairing as typeof import('@openclaude/channel-wechat')
+
+    const {
+      getWechatBindingByUserId,
+      deleteWechatBinding,
+      updateWechatBindingWhitelist,
+      updateWechatBindingStatus,
+    } = await import('@openclaude/storage')
+
+    const userId = this.getUserId(req)
+
+    // ── POST /api/wechat/pair/start ──
+    if (pathname === '/api/wechat/pair/start' && req.method === 'POST') {
+      try {
+        const { qrcode, qrcodeImgContent } = await startPairing(userId)
+        this.sendJson(res, 200, { qrcode, qrcodeImgContent })
+      } catch (err: any) {
+        this.sendError(res, 502, `QR fetch failed: ${err?.message || err}`)
+      }
+      return
+    }
+
+    // ── POST /api/wechat/pair/poll {qrcode} ──
+    // Long-poll shim: wechat server itself long-polls ~35s; we just relay.
+    if (pathname === '/api/wechat/pair/poll' && req.method === 'POST') {
+      try {
+        const body = await this.readBody(req)
+        const { qrcode } = JSON.parse(body || '{}') as { qrcode?: string }
+        if (!qrcode) {
+          this.sendError(res, 400, 'qrcode required')
+          return
+        }
+        const status = await resumePairing(userId, qrcode)
+        this.sendJson(res, 200, status)
+      } catch (err: any) {
+        this.sendError(res, 500, `poll failed: ${err?.message || err}`)
+      }
+      return
+    }
+
+    // ── POST /api/wechat/pair/cancel {qrcode} ──
+    if (pathname === '/api/wechat/pair/cancel' && req.method === 'POST') {
+      try {
+        const body = await this.readBody(req)
+        const { qrcode } = JSON.parse(body || '{}') as { qrcode?: string }
+        if (qrcode) cancelPairing(qrcode)
+        this.sendJson(res, 200, { ok: true })
+      } catch {
+        this.sendJson(res, 200, { ok: true })
+      }
+      return
+    }
+
+    // ── GET /api/wechat/binding ──
+    if (pathname === '/api/wechat/binding' && req.method === 'GET') {
+      const b = await getWechatBindingByUserId(userId)
+      if (!b) {
+        this.sendJson(res, 200, { binding: null })
+        return
+      }
+      // Redact bot_token from client view
+      this.sendJson(res, 200, {
+        binding: {
+          accountId: b.accountId,
+          loginUserId: b.loginUserId,
+          whitelist: b.whitelist,
+          status: b.status,
+          createdAt: b.createdAt,
+          updatedAt: b.updatedAt,
+          lastEventAt: b.lastEventAt,
+        },
+      })
+      return
+    }
+
+    // ── DELETE /api/wechat/binding ──
+    if (pathname === '/api/wechat/binding' && req.method === 'DELETE') {
+      await deleteWechatBinding(userId)
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+
+    // ── PUT /api/wechat/binding/whitelist { whitelist: string[] } ──
+    if (pathname === '/api/wechat/binding/whitelist' && req.method === 'PUT') {
+      try {
+        const body = await this.readBody(req)
+        const { whitelist } = JSON.parse(body || '{}') as { whitelist?: string[] }
+        if (!Array.isArray(whitelist)) {
+          this.sendError(res, 400, 'whitelist must be array')
+          return
+        }
+        await updateWechatBindingWhitelist(userId, whitelist.map(String))
+        this.sendJson(res, 200, { ok: true, whitelist })
+      } catch (err: any) {
+        this.sendError(res, 500, String(err?.message || err))
+      }
+      return
+    }
+
+    // ── PUT /api/wechat/binding/status {status} ──
+    if (pathname === '/api/wechat/binding/status' && req.method === 'PUT') {
+      try {
+        const body = await this.readBody(req)
+        const { status } = JSON.parse(body || '{}') as { status?: string }
+        if (status !== 'active' && status !== 'disabled') {
+          this.sendError(res, 400, 'status must be active or disabled')
+          return
+        }
+        await updateWechatBindingStatus(userId, status)
+        this.sendJson(res, 200, { ok: true, status })
+      } catch (err: any) {
+        this.sendError(res, 500, String(err?.message || err))
+      }
+      return
+    }
+
+    this.sendError(res, 404, 'wechat route not found')
   }
 
   private async _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -3115,12 +3283,32 @@ export class Gateway {
       at: Date.now(),
     })
 
+    // Defensive sanitize: WS frames are JSON-cast (no typebox runtime check),
+    // so an attacker could put arbitrary strings in effortLevel. Whitelist
+    // mirrors protocol/frames.ts InboundMessage.effortLevel + CCB EFFORT_LEVELS.
+    //   - 合法 string → 透传
+    //   - null      → 透传(显式清除已有 effort,让 runner 回到模型默认)
+    //   - 其它(包括字段缺省) → 不传给 sessionManager,保持现有 runner 不动
+    const _effortAllow = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+    const _frameEffort = (frame as any).effortLevel
+    let safeEffortLevel: string | null | undefined
+    if (_frameEffort === null) {
+      safeEffortLevel = null
+    } else if (typeof _frameEffort === 'string' && _effortAllow.has(_frameEffort)) {
+      safeEffortLevel = _frameEffort
+    } else {
+      safeEffortLevel = undefined
+    }
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
       channel: frame.channel,
       peerId: frame.peer.id,
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
+      // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
+      // (在那里和 turn 入队原子串行,避免并发 submit 之间互相覆盖)。
+      effortLevel: safeEffortLevel,
     })
     const out: OutboundMessage = {
       type: 'outbound.message',
@@ -3449,7 +3637,7 @@ export class Gateway {
           adapter,
         )
       }
-    })
+    }, safeEffortLevel)
   }
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {
@@ -3765,6 +3953,8 @@ const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
   '/api/cron', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
+  '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
+  '/api/wechat/binding', '/api/wechat/binding/whitelist', '/api/wechat/binding/status',
   '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
   '/api/auth/claude/callback', '/api/auth/claude/status',
   '/api/file', '/healthz', '/metrics',

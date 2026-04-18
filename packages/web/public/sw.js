@@ -1,16 +1,16 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v15'
+const VERSION = 'openclaude-v20'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=9',  // versioned URL used in index.html
+  '/style.css?v=12',  // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=9',  // versioned URL used in index.html
+  '/modules/main.js?v=12',  // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -26,15 +26,18 @@ const SHELL = [
   '/modules/memory.js',
   '/modules/tasks.js',
   '/modules/agents.js',
+  '/modules/effortMode.js',
   '/modules/sessions.js',
   '/modules/sync.js',
   '/modules/messages.js',
   '/modules/websocket.js',
   '/modules/commands.js',
+  '/modules/wechat.js',
   // Vendored dependencies
   '/vendor/marked.min.js',
   '/vendor/highlight.min.js',
   '/vendor/purify.min.js',
+  '/vendor/qrcode.min.js',
   '/vendor/chart.umd.min.js',
   '/vendor/github-dark.min.css',
   '/vendor/github.min.css',

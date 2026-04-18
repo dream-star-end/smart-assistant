@@ -27,7 +27,7 @@ import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { setSyncDeps, syncSessionsFromServer } from './sync.js'
+import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
@@ -63,6 +63,7 @@ import { maybeNotify, requestNotifyPermission, setTitleBusy } from './notificati
 
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
+import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
 import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js'
@@ -160,6 +161,7 @@ import {
   showSlashPopup,
   slashPopupVisible,
 } from './commands.js'
+import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
 
 // ═══════════════════════════════════════════════════════════
 // 1. Wire late-bound dependencies
@@ -267,8 +269,60 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('online', () => notifyNetworkOnline())
 window.addEventListener('offline', () => notifyNetworkOffline())
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) notifyTabVisible()
+  if (!document.hidden) {
+    notifyTabVisible()
+    // Pull fresh session list from server. Mobile browsers pause JS when the
+    // tab is hidden, so sessions created/updated on another device won't
+    // appear until the next full-page init unless we pull here. Throttled
+    // inside maybeSyncNow to avoid storms on rapid focus flaps.
+    maybeSyncNow({ onResult: _applySyncResult })
+  }
 })
+// Window focus on desktop (covers alt-tab / click-back-to-window without a
+// hidden→visible transition). Same pull semantics.
+window.addEventListener('focus', () => {
+  maybeSyncNow({ onResult: _applySyncResult })
+})
+// Network recovery: force a pull regardless of throttle — we want the latest
+// list as soon as connectivity is back, even if the last sync was recent
+// (it likely failed because we were offline).
+window.addEventListener('online', () => {
+  maybeSyncNow({ force: true, onResult: _applySyncResult })
+})
+
+// Post-sync re-render for the background triggers (visibilitychange / focus /
+// online). Invoked only when maybeSyncNow actually ran a sync:
+//   - throttle-skipped calls resolve with null WITHOUT dispatching onResult,
+//     so this helper never sees that case
+//   - list-fetch failures surface here as `undefined` (syncSessionsFromServer's
+//     network-error branch returns nothing) — we short-circuit because we have
+//     no fresh server state to apply; the UI stays on whatever the last
+//     successful sync left behind rather than flashing a stale re-render
+//   - a truthy result means server data was merged into state.sessions; we
+//     always repaint the sidebar in that case (even if needsRenderMessages is
+//     false) since meta-only changes — lastAt ordering, pin state, new remote
+//     sessions — still affect the sidebar rendering
+// Narrower than the inline versions in init() and the login submit handler:
+// those run on first paint and need to repaint unconditionally. Keep in
+// sync with init() at main.js:~1740 when its inline logic changes (not
+// unified yet to avoid altering boot-path ordering guarantees).
+function _applySyncResult(result) {
+  if (!result) return
+  const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+  let currentChanged = false
+  if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+    state.currentSessionId = updated[0]?.id || null
+    if (!state.currentSessionId) createSession()
+    currentChanged = true
+    renderMessages()
+  } else if (result.needsRenderMessages) {
+    renderMessages()
+  }
+  if (currentChanged || result.needsRenderMessages) {
+    restoreCurrentSessionInFlightUI()
+  }
+  renderSidebar()
+}
 // ── Global error handlers ──
 // Last-resort UI feedback for any uncaught exception or unhandled promise
 // rejection that escapes module-level try/catch. Without this the user
@@ -511,6 +565,12 @@ initTasksListeners()
 
 // ── OAuth: button click listeners ──
 initOAuthListeners()
+initWechatListeners()
+
+// ── Effort pills (编码模式 / 科研模式): bind once + render initial visibility ──
+// 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
+// 再触发一次;这里只是绑定点击事件并把初始隐藏态打上去。
+initModePills()
 
 // ── Feedback: submit wiring ──
 $('feedback-submit-btn').onclick = submitFeedback
@@ -626,6 +686,7 @@ function send() {
       mimeType: a.type,
       filename: a.name,
     }))
+  const effortLevel = getEffortForSubmit()
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -633,6 +694,9 @@ function send() {
     peer: { id: sess.id, kind: 'dm' },
     agentId: sess.agentId || state.defaultAgentId,
     content: { text: modelText, media: media.length > 0 ? media : undefined },
+    // string='xhigh'/'max' → 切到该 effort;null → 显式清除回模型默认;
+    // undefined → 不参与 effort 协商(非 Opus 4.7 agent 走这条)。
+    ...(effortLevel !== undefined ? { effortLevel } : {}),
     ts: Date.now(),
   }
   // Add user message with status tracking + persist media & full text for regen
@@ -1388,6 +1452,8 @@ async function init() {
     // Stop in-flight request before switching to prevent late tokens from old agent
     if (state.sendingInFlight) stopCurrentTurn()
     sess.agentId = e.target.value
+    // Pill 跟着新 agent 的 model 走 — 切到非 Opus 4.7 自动隐藏,选中态按新 agent 的存储读。
+    renderModePills()
     // Mark switch time — handleOutbound will ignore frames arriving before this
     sess._agentSwitchedAt = Date.now()
     // Reset streaming state to prevent cross-agent message contamination
@@ -1450,6 +1516,7 @@ async function init() {
     } else if (action === 'changelog') openChangelog()
     else if (action === 'feedback') openFeedbackModal()
     else if (action === 'claude-oauth') openOAuthModal()
+    else if (action === 'wechat') openWechatModal()
     else if (action === 'logout') $('logout-btn').click()
   })
   // Memory modal events

@@ -81,6 +81,20 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
 
   const channelFactories: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter> = []
 
+  // WeChat (iLink): enabled when channels.wechat.enabled = true.
+  // Bindings are per-user and live in the wechat_bindings table — no static
+  // config token. The manager picks them up on init() + reconcile interval.
+  const wxCfg = (config.channels as any).wechat
+  if (wxCfg?.enabled) {
+    try {
+      const mod = await import('@openclaude/channel-wechat')
+      channelFactories.push(() => mod.wechatChannelFactory({}))
+      console.log('[cli] wechat (iLink) channel wired up')
+    } catch (err) {
+      console.error('[cli] failed to load @openclaude/channel-wechat:', err)
+    }
+  }
+
   // Telegram (optional): enabled when channels.telegram.enabled = true AND token is provided
   const tgCfg = (config.channels as any).telegram
   if (tgCfg?.enabled) {

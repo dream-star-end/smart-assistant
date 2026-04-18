@@ -47,6 +47,7 @@
       "dependencies": {
         "@openclaude/plugin-sdk": "*",
         "@openclaude/protocol": "*",
+        "@openclaude/storage": "*",
       },
     },
     "packages/cli": {
@@ -57,6 +58,7 @@
       },
       "dependencies": {
         "@openclaude/channel-telegram": "*",
+        "@openclaude/channel-wechat": "*",
         "@openclaude/gateway": "*",
         "@openclaude/plugin-sdk": "*",
         "@openclaude/protocol": "*",
