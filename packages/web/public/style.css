@@ -3581,3 +3581,84 @@ a:hover {
   color: var(--fg-primary, #e0e0e0);
   font-weight: 500;
 }
+
+/* ── Browser live-preview panel (Steel) ── */
+.browser-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(640px, 45vw);
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.22);
+  display: flex;
+  flex-direction: column;
+  z-index: 150;
+}
+.browser-panel[hidden] {
+  display: none;
+}
+.browser-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary, var(--bg));
+}
+.browser-panel-title {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-primary, var(--fg));
+}
+.browser-panel-hint {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--fg-secondary, #888);
+}
+.browser-panel-head .icon-btn {
+  width: 28px;
+  height: 28px;
+}
+.browser-panel-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #111;
+}
+.browser-panel-status {
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--fg-secondary, #aaa);
+  background: var(--bg-secondary, var(--bg));
+  border-bottom: 1px solid var(--border);
+}
+.browser-panel-status[hidden] {
+  display: none;
+}
+.browser-panel-status[data-kind='error'] {
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.08);
+}
+.browser-panel-iframe {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+.browser-panel-iframe[hidden] {
+  display: none;
+}
+body.has-browser-panel {
+  /* Nothing reflows today — panel overlays the chat. Reserve hook for future. */
+}
+@media (max-width: 900px) {
+  .browser-panel {
+    width: 100vw;
+    border-left: 0;
+  }
+}
