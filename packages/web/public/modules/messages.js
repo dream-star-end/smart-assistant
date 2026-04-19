@@ -1072,11 +1072,21 @@ function _applyTruncatedBanner(el, msg) {
     if (!ta || !sendBtn) return
     // 续写文案保持中性、不绑定特定话题,避免触发模型重新做总结。
     const prompt = '请接着上一条回复被截断的位置继续完成,不要重复已写过的内容,直接续写。'
-    const existing = ta.value.trim()
-    ta.value = existing ? `${existing}\n\n${prompt}` : prompt
+    const existingDraft = ta.value.trim()
+    const hasAttachments =
+      Array.isArray(state.attachments) && state.attachments.length > 0
+    if (existingDraft || hasAttachments) {
+      // 用户已有草稿 / 已选附件:不能直接 send 把它们和"续写"混在一起 ——
+      // 把 prompt 追加到末尾,光标置末,等用户 review 后自己按 Enter。
+      ta.value = existingDraft ? `${existingDraft}\n\n${prompt}` : prompt
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+      ta.focus()
+      ta.setSelectionRange(ta.value.length, ta.value.length)
+      return
+    }
+    // textarea 空、无附件 — 一键续写,直接发送,不打扰用户。
+    ta.value = prompt
     ta.dispatchEvent(new Event('input', { bubbles: true }))
-    ta.focus()
-    ta.setSelectionRange(ta.value.length, ta.value.length)
     sendBtn.click()
   })
   banner.appendChild(note)

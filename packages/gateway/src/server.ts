@@ -3580,19 +3580,27 @@ export class Gateway {
         // 对 .docx / .pdf 在 gateway 端预解析为 markdown 直接塞进 prompt;
         // 失败/不支持的格式回退到原来的"路径告知 + Read"。alice 的痛点是上传
         // .doc 失败被迫粘 60KB,即便上传成功 agent 也读不了二进制 —— 这里先解析。
-        const parsedDocs: Array<{
+        //
+        // 并发上限 3:多 PDF 串行会让首字延迟到 ~30s × N。完全 Promise.all 又
+        // 会同时开 N 个 pdfjs worker 撑爆内存(科研用户偶尔丢 5+ 篇论文)。
+        // 折中:每批 3 个并行,顺序保留(parsedDocs/unparsedFiles 按 files 顺序排)。
+        const PARSE_CONCURRENCY = 3
+        type ParsedDoc = {
           file: SavedMedia
           markdown: string
           truncated: boolean
           parser: string
-        }> = []
+        }
+        const parsedDocs: ParsedDoc[] = []
         const unparsedFiles: SavedMedia[] = []
-        for (const f of files) {
-          const result = await parseDocument(f.path, f.mimeType)
-          if (result) {
-            parsedDocs.push({ file: f, ...result })
-          } else {
-            unparsedFiles.push(f)
+        for (let i = 0; i < files.length; i += PARSE_CONCURRENCY) {
+          const batch = files.slice(i, i + PARSE_CONCURRENCY)
+          const results = await Promise.all(
+            batch.map(async (f) => ({ file: f, result: await parseDocument(f.path, f.mimeType) })),
+          )
+          for (const { file: f, result } of results) {
+            if (result) parsedDocs.push({ file: f, ...result })
+            else unparsedFiles.push(f)
           }
         }
 
@@ -3613,14 +3621,16 @@ export class Gateway {
           lines.push(
             '',
             '---',
-            '用户还附带了以下文档(已保存到服务器本地,但 gateway 暂未预解析):',
+            '用户还附带了以下文档(已保存到服务器本地,gateway 没能预解析 ——',
+            '可能因为格式不支持、解析失败或解析超时):',
           )
           for (const f of unparsedFiles) {
             lines.push(`- \`${f.path}\` (${f.mimeType}, ${f.sizeHint}, 原名: ${f.name})`)
           }
           lines.push(
             '',
-            '可以用 Read 工具读取文档内容(对纯文本、CSV、源码等有效)。',
+            '可以用 Read 工具读取文档内容(对纯文本、CSV、源码、PDF 等都有效',
+            '—— 大 PDF 即便预解析超时,Read 也可能能拿到部分文本)。',
             '若是 .doc 老格式 Word 二进制,Read 会看到乱码 —— 礼貌地请用户转存为 .docx 重传。',
           )
         }
