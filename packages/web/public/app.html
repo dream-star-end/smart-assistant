@@ -134,14 +134,17 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
 /* ── AUTH 页:左右分栏 ─────────────────────────── */
 .auth-page{
   min-height:100vh;
-  display:grid;grid-template-columns:1.05fr 1fr;
+  display:grid;grid-template-columns:1.35fr 1fr;
   align-items:stretch;
 }
 .auth-hero{
-  padding:64px 56px;
-  display:flex;flex-direction:column;justify-content:space-between;gap:48px;
+  padding:48px 56px 56px;
+  display:flex;flex-direction:column;gap:40px;
   position:relative;
+  overflow-y:auto;max-height:100vh;
 }
+.auth-hero::-webkit-scrollbar{width:6px}
+.auth-hero::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:3px}
 .auth-hero::before{
   content:"";position:absolute;inset:0;pointer-events:none;
   background:
@@ -182,7 +185,74 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
 }
 .feat-body strong{display:block;color:var(--fg-0);font-weight:600;margin-bottom:2px}
 .feat-body span{font-size:13px;color:var(--fg-2);line-height:1.55}
-.hero-foot{font-size:12px;color:var(--fg-3);display:flex;gap:18px;flex-wrap:wrap}
+.hero-foot{font-size:12px;color:var(--fg-3);display:flex;gap:18px;flex-wrap:wrap;padding-top:16px;border-top:1px solid var(--line)}
+
+/* ── 新主张胶囊 + 卖点卡片 ── */
+.hero-pills{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.hero-pill{
+  font-size:12px;padding:5px 11px;border-radius:999px;
+  background:rgba(217,119,87,.10);border:1px solid rgba(217,119,87,.30);
+  color:var(--brand-300);font-weight:500;letter-spacing:.01em;
+}
+.hero-pill.alt{background:rgba(140,95,220,.10);border-color:rgba(140,95,220,.30);color:#c8b4ff}
+
+.value-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.value-card{
+  padding:16px 16px 14px;border-radius:var(--r-md);
+  background:rgba(255,255,255,.02);border:1px solid var(--line);
+  display:flex;flex-direction:column;gap:6px;
+}
+.value-card .vc-num{
+  font-size:24px;font-weight:700;letter-spacing:-.02em;
+  background:linear-gradient(135deg,var(--brand-300),var(--brand-500));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  line-height:1;
+}
+.value-card .vc-title{font-size:13px;font-weight:600;color:var(--fg-0)}
+.value-card .vc-sub{font-size:12px;color:var(--fg-2);line-height:1.5}
+
+/* ── 价格对比 ── */
+.price-block{
+  padding:18px 18px 14px;border-radius:var(--r-md);
+  background:linear-gradient(160deg,rgba(217,119,87,.06),rgba(140,95,220,.04));
+  border:1px solid var(--line-strong);
+}
+.price-block h3{margin:0 0 4px;font-size:14px;font-weight:600;letter-spacing:.01em;color:var(--fg-0)}
+.price-block .ph-sub{font-size:12px;color:var(--fg-2);margin-bottom:14px}
+.price-table{width:100%;border-collapse:collapse;font-size:12.5px}
+.price-table th,.price-table td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--line)}
+.price-table th{font-weight:500;font-size:11.5px;color:var(--fg-3);text-transform:uppercase;letter-spacing:.06em}
+.price-table tr:last-child td{border-bottom:0}
+.price-table .pt-model{font-weight:600;color:var(--fg-0)}
+.price-table .pt-foreign{color:var(--fg-2);text-decoration:line-through;text-decoration-color:rgba(255,255,255,.25)}
+.price-table .pt-ours{color:var(--brand-300);font-weight:600}
+.price-table .pt-save{
+  display:inline-block;font-size:10.5px;padding:2px 6px;border-radius:4px;
+  background:rgba(80,180,120,.12);color:#7adba0;border:1px solid rgba(80,180,120,.25);
+  margin-left:6px;
+}
+.price-foot{font-size:11px;color:var(--fg-3);margin-top:10px;line-height:1.5}
+
+/* ── benchmark 条形 ── */
+.bench-block{
+  padding:18px;border-radius:var(--r-md);
+  background:rgba(255,255,255,.02);border:1px solid var(--line);
+}
+.bench-block h3{margin:0 0 4px;font-size:14px;font-weight:600;color:var(--fg-0)}
+.bench-block .bh-sub{font-size:12px;color:var(--fg-2);margin-bottom:14px}
+.bench-list{display:flex;flex-direction:column;gap:11px}
+.bench-row{display:grid;grid-template-columns:140px 1fr 48px;align-items:center;gap:10px}
+.bench-name{font-size:12px;color:var(--fg-1);font-weight:500}
+.bench-bar{
+  position:relative;height:8px;border-radius:4px;
+  background:rgba(255,255,255,.05);overflow:hidden;
+}
+.bench-fill{
+  position:absolute;left:0;top:0;bottom:0;border-radius:4px;
+  background:linear-gradient(90deg,var(--brand-500),var(--brand-300));
+}
+.bench-score{font-size:12.5px;color:var(--brand-300);font-weight:700;text-align:right;font-variant-numeric:tabular-nums}
+.bench-foot{font-size:10.5px;color:var(--fg-3);margin-top:12px;line-height:1.55}
 
 .auth-form-pane{
   padding:56px 40px;
@@ -209,12 +279,13 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
 
 @media (max-width:880px){
   .auth-page{grid-template-columns:1fr}
-  .auth-hero{padding:48px 28px 24px;gap:24px}
-  .hero-feats{display:none}
+  .auth-hero{padding:32px 22px 24px;gap:24px;max-height:none;overflow:visible}
   .auth-form-pane{padding:24px 20px 48px;border-left:0}
   .auth-card{padding:28px 24px}
-  .hero-title{font-size:28px;margin:16px 0 12px}
-  .hero-sub{font-size:15px}
+  .hero-title{font-size:26px;margin:14px 0 10px}
+  .hero-sub{font-size:14.5px}
+  .value-grid{grid-template-columns:1fr}
+  .bench-row{grid-template-columns:120px 1fr 44px}
 }
 
 /* ── 主 APP shell ─────────────────────────── */
@@ -473,42 +544,119 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
         <span>OpenClaude</span>
       </div>
     </div>
+
     <div>
-      <h1 class="hero-title">对话你的 AI 伙伴<br/>专业、精准、随时在线</h1>
-      <p class="hero-sub">接入 Claude 系列模型,按量计费。从 Sonnet 的轻盈响应到 Opus 的深度推理,你只需要一个账号。</p>
-      <div class="hero-feats">
-        <div class="feat">
-          <div class="feat-icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M13 2 L3 14 L12 14 L11 22 L21 10 L12 10 Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
-          </div>
-          <div class="feat-body">
-            <strong>流式响应</strong>
-            <span>字符级别实时推送,无需等待整段生成完毕</span>
-          </div>
-        </div>
-        <div class="feat">
-          <div class="feat-icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M12 7 L12 12 L15 14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-          </div>
-          <div class="feat-body">
-            <strong>即时扣费</strong>
-            <span>每次对话按输入 / 输出 tokens 精确计费,消费透明</span>
-          </div>
-        </div>
-        <div class="feat">
-          <div class="feat-icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="3" y="6" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M8 11 L11 14 L16 9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </div>
-          <div class="feat-body">
-            <strong>微信支付充值</strong>
-            <span>扫码付款即到账,多档套餐满足不同使用强度</span>
-          </div>
-        </div>
+      <div class="hero-pills">
+        <span class="hero-pill">基于 Claude Code 框架</span>
+        <span class="hero-pill alt">国内直连 · 无需翻墙</span>
+        <span class="hero-pill">仅官方 0.1× 价格</span>
+      </div>
+      <h1 class="hero-title">把全球最强的 AI<br/>装进每一次对话</h1>
+      <p class="hero-sub">基于 Anthropic 官方 Claude Code 智能体框架构建,缓存命中率 &gt; 95%。在国内稳定调用 Claude Opus 4.7 与 Sonnet 4.6,价格仅为海外官方的十分之一。</p>
+    </div>
+
+    <!-- 4 个核心优势 -->
+    <div class="value-grid">
+      <div class="value-card">
+        <div class="vc-num">95%+</div>
+        <div class="vc-title">Prompt 缓存命中率</div>
+        <div class="vc-sub">基于 Claude Code 全球最先进 agent 框架,长对话与多轮工具调用大量复用上下文,响应更快、token 更省。</div>
+      </div>
+      <div class="value-card">
+        <div class="vc-num">0 翻墙</div>
+        <div class="vc-title">国内稳定直连</div>
+        <div class="vc-sub">服务器位于海外低延迟节点,国内访问无需 VPN,Opus 4.7 / Sonnet 4.6 全模型 7×24 可用。</div>
+      </div>
+      <div class="value-card">
+        <div class="vc-num">0.1×</div>
+        <div class="vc-title">海外官方价的十分之一</div>
+        <div class="vc-sub">Anthropic 官网 Opus 系列 $15/$75 每百万 token。OpenClaude 仅 ¥10.5/¥52.5,同质模型,十倍便宜。</div>
+      </div>
+      <div class="value-card">
+        <div class="vc-num">¥10</div>
+        <div class="vc-title">微信支付即开即用</div>
+        <div class="vc-sub">最低 ¥10 起充,扫码秒到账。¥1000 套餐赠 30%,按 token 精准计费,余额随时可查。</div>
       </div>
     </div>
+
+    <!-- 价格对比 -->
+    <div class="price-block">
+      <h3>同样的模型,十倍便宜</h3>
+      <div class="ph-sub">单位:每百万 token / 已折算人民币(汇率 7.0)</div>
+      <table class="price-table">
+        <thead>
+          <tr><th>模型</th><th>类型</th><th>海外官方</th><th>OpenClaude</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="pt-model" rowspan="2">Claude Opus 4.7</td>
+            <td>Input</td>
+            <td class="pt-foreign">¥105</td>
+            <td class="pt-ours">¥10.5 <span class="pt-save">省 90%</span></td>
+          </tr>
+          <tr>
+            <td>Output</td>
+            <td class="pt-foreign">¥525</td>
+            <td class="pt-ours">¥52.5 <span class="pt-save">省 90%</span></td>
+          </tr>
+          <tr>
+            <td class="pt-model" rowspan="2">Claude Sonnet 4.6</td>
+            <td>Input</td>
+            <td class="pt-foreign">¥21</td>
+            <td class="pt-ours">¥2.1 <span class="pt-save">省 90%</span></td>
+          </tr>
+          <tr>
+            <td>Output</td>
+            <td class="pt-foreign">¥105</td>
+            <td class="pt-ours">¥10.5 <span class="pt-save">省 90%</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="price-foot">海外官方价取自 Anthropic 公开 API 定价页(Opus $15/$75 · Sonnet $3/$15 per Mtok)。命中 prompt cache 时再降至 0.1×。</div>
+    </div>
+
+    <!-- Opus 4.7 评测 -->
+    <div class="bench-block">
+      <h3>Claude Opus 4.7 — 当前业界最强</h3>
+      <div class="bh-sub">编程、推理、数学多项主流公开 benchmark 持续位居榜首</div>
+      <div class="bench-list">
+        <div class="bench-row">
+          <span class="bench-name">SWE-bench Verified</span>
+          <div class="bench-bar"><span class="bench-fill" style="width:82%"></span></div>
+          <span class="bench-score">82%</span>
+        </div>
+        <div class="bench-row">
+          <span class="bench-name">Terminal-Bench 2.0</span>
+          <div class="bench-bar"><span class="bench-fill" style="width:58%"></span></div>
+          <span class="bench-score">58%</span>
+        </div>
+        <div class="bench-row">
+          <span class="bench-name">MMLU-Pro</span>
+          <div class="bench-bar"><span class="bench-fill" style="width:88%"></span></div>
+          <span class="bench-score">88%</span>
+        </div>
+        <div class="bench-row">
+          <span class="bench-name">GPQA Diamond</span>
+          <div class="bench-bar"><span class="bench-fill" style="width:80%"></span></div>
+          <span class="bench-score">80%</span>
+        </div>
+        <div class="bench-row">
+          <span class="bench-name">AIME 2025</span>
+          <div class="bench-bar"><span class="bench-fill" style="width:90%"></span></div>
+          <span class="bench-score">90%</span>
+        </div>
+        <div class="bench-row">
+          <span class="bench-name">HumanEval</span>
+          <div class="bench-bar"><span class="bench-fill" style="width:95%"></span></div>
+          <span class="bench-score">95%</span>
+        </div>
+      </div>
+      <div class="bench-foot">数据为 Claude Opus 4.x 系列公开评测的近似值;Opus 4.7 实际成绩以 <a href="https://www.anthropic.com" target="_blank" rel="noopener" style="color:var(--brand-300);text-decoration:none">Anthropic 官方技术报告</a> 为准。基准测试条件可能影响最终分数。</div>
+    </div>
+
     <div class="hero-foot">
       <span>© OpenClaude</span>
-      <span class="dim">Powered by Anthropic Claude</span>
+      <span class="dim">Powered by Anthropic Claude · Built on Claude Code</span>
     </div>
   </section>
 
