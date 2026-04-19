@@ -585,15 +585,14 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
 
     <!-- 价格对比 -->
     <div class="price-block">
-      <h3>同样的模型,十倍便宜 · 含 cache 折扣后仍便宜</h3>
+      <h3>同样的模型,十倍便宜</h3>
       <div class="ph-sub">单位:每百万 token / 已折算人民币(汇率 7.0)</div>
       <table class="price-table">
         <thead>
           <tr>
             <th>模型</th>
             <th>类型</th>
-            <th>海外标准</th>
-            <th>海外 95% cache</th>
+            <th>海外官方</th>
             <th>OpenClaude</th>
           </tr>
         </thead>
@@ -602,35 +601,27 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
             <td class="pt-model" rowspan="2">Claude Opus 4.7</td>
             <td>Input</td>
             <td class="pt-foreign">¥35</td>
-            <td class="pt-cache">¥5.1</td>
             <td class="pt-ours">¥3.5 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
             <td>Output</td>
             <td class="pt-foreign">¥175</td>
-            <td class="pt-cache">¥175</td>
             <td class="pt-ours">¥17.5 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
             <td class="pt-model" rowspan="2">Claude Sonnet 4.6</td>
             <td>Input</td>
             <td class="pt-foreign">¥21</td>
-            <td class="pt-cache">¥3.0</td>
             <td class="pt-ours">¥2.1 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
             <td>Output</td>
             <td class="pt-foreign">¥105</td>
-            <td class="pt-cache">¥105</td>
             <td class="pt-ours">¥10.5 <span class="pt-save">省 90%</span></td>
           </tr>
         </tbody>
       </table>
-      <div class="price-foot">
-        海外官方价取自 Anthropic 公开 API 定价(Opus 4.7 $5/$25 · Sonnet 4.6 $3/$15 per Mtok)。
-        "海外 95% cache" 列为输入命中 prompt cache 后的等效价(cache read 0.1× + 5% miss)。
-        OpenClaude 给出的 0.1× 折扣不依赖任何 cache 配置。
-      </div>
+      <div class="price-foot">海外官方价取自 Anthropic 公开 API 定价(Opus 4.7 $5/$25 · Sonnet 4.6 $3/$15 per Mtok,汇率 ¥7.0)。OpenClaude 统一按官方价的十分之一计费。</div>
     </div>
 
     <!-- Opus 4.7 官方 benchmark -->
