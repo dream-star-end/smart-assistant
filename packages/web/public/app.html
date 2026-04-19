@@ -1336,7 +1336,7 @@ function handleWsFrame(raw) {
       chatState.streamingMsg.firstChild.data = `[${frame.code}] ${frame.message}`;
     }
     if (frame.code === "ERR_INSUFFICIENT_CREDITS") {
-      toast("积分不足,请先充值", "err");
+      toast("余额不足,请先充值", "err");
     } else {
       toast(`${frame.code}: ${frame.message}`, "err");
     }
@@ -1376,11 +1376,13 @@ async function renderTopup(root) {
     }
     for (const p of topupState.plans) {
       const amountYuan = (Number(p.amount_cents) / 100).toFixed(2);
+      // p.credits 单位 = 分(1 积分 = 100 分 = ¥1)。展示成 "到账 ¥XX"。
+      const creditYuan = (Number(p.credits) / 100).toFixed(2);
       plansDiv.appendChild(el("div", { class: "plan", onclick: () => createOrder(p) }, [
         el("div", { class: "p-amt" }, `¥${amountYuan}`),
         el("div", { class: "p-credits" }, [
           icon('<path d="M12 2 L2 12 L12 22 L22 12 Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>', 11),
-          " +" + p.credits + " 积分",
+          ` 到账 ¥${creditYuan}`,
         ]),
         el("div", { class: "p-label" }, p.label || ""),
       ]));
@@ -1415,7 +1417,7 @@ function renderOrderQr(slot, order) {
   slot.innerHTML = "";
   const amount = (Number(order.amount_cents) / 100).toFixed(2);
   const card = el("div", { class: "qr-card" }, [
-    el("div", { class: "qr-title" }, `支付 ¥${amount} → +${order.credits} 积分`),
+    el("div", { class: "qr-title" }, `支付 ¥${amount} → 到账 ¥${(Number(order.credits)/100).toFixed(2)}`),
     el("img", { src: qrDataUrl(order.qrcode_url), alt: "支付二维码" }),
     el("div", { class: "qr-meta" }, `订单号:${order.order_no}`),
     order.qrcode_url?.startsWith("http")
