@@ -282,3 +282,87 @@ describe("streamClaude — 请求构造", () => {
     assert.equal(captured, "https://test.example/v1/messages");
   });
 });
+
+/**
+ * Codex 8ec407b 复审跟进:验证 finally 真的会 cancel 上游 ReadableStream。
+ *
+ * 不 cancel 时, ProxyAgent.close() 会等死(socket 还在 keep-alive)。
+ * 测法: 自定义 ReadableStream 暴露 cancel 调用计数,模拟"调用方提前 break"
+ * (`break` 出 for-await 会触发 generator return → 触发 finally),
+ * 然后断言 cancel 至少被调用了一次。
+ */
+function mockFetchInfinite(opts: {
+  onCancel: () => void;
+  primer?: string; // 先丢一段已成事件的内容,让 generator 至少 yield 一次
+}): typeof fetch {
+  return async () => {
+    const enc = new TextEncoder();
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(ctrl): void {
+        // 第一次 pull 给出预置完整事件;之后只 enqueue 一些数据,永不 close。
+        pulls += 1;
+        if (pulls === 1 && opts.primer) {
+          ctrl.enqueue(enc.encode(opts.primer));
+          return;
+        }
+        ctrl.enqueue(enc.encode(": keepalive\n"));
+      },
+      cancel(): void {
+        opts.onCancel();
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  };
+}
+
+describe("streamClaude — finally 取消上游(Codex 8ec407b 复审跟进)", () => {
+  test("调用方提前 break → 触发 reader.cancel() 让上游 socket 不再 keep-alive", async () => {
+    let cancelCount = 0;
+    const f = mockFetchInfinite({
+      onCancel: () => { cancelCount += 1; },
+      primer: 'event: message_start\ndata: {"type":"message_start"}\n\n',
+    });
+    const gen = streamClaude(
+      { account: { token: tokenBuf("tk") }, body: { model: "m" } },
+      { fetch: f },
+    );
+    let firstEv: unknown = null;
+    for await (const ev of gen) {
+      firstEv = ev;
+      break; // 模拟调用方拿到第一个事件后立即 break
+    }
+    // generator return 触发 finally,await 一下让 microtask 跑完
+    await Promise.resolve();
+    assert.ok(firstEv, "第一个事件应已 yield");
+    assert.equal(cancelCount, 1, "finally 必须 cancel 上游 ReadableStream 一次");
+  });
+
+  test("正常自然结束(收到 [DONE])→ finally 也 cancel(no-op 不报错)", async () => {
+    // [DONE] 路径走 return,也会进 finally,对已 closed 的流 cancel 应是 no-op
+    let cancelCount = 0;
+    const enc = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(ctrl): void {
+        ctrl.enqueue(enc.encode('event: message_start\ndata: {"type":"message_start"}\n\n'));
+        ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+        ctrl.close();
+      },
+      cancel(): void { cancelCount += 1; },
+    });
+    const f: typeof fetch = async () =>
+      new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    const events = await collect(
+      streamClaude({ account: { token: tokenBuf("tk") }, body: {} }, { fetch: f }),
+    );
+    await Promise.resolve();
+    assert.equal(events.length, 1);
+    // 流自然 close 后 cancel 不应被底层调用(spec: cancel on closed stream resolves immediately,
+    // 不调 underlying source 的 cancel),所以 cancelCount === 0 是正确预期。
+    // 关键是:这个测试**不 hang**,证明 finally 的 cancel 对 closed stream 是安全的。
+    assert.equal(cancelCount, 0);
+  });
+});

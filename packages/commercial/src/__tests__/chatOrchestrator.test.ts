@@ -559,19 +559,9 @@ describe("runClaudeChat — egress_proxy 注入(Codex 8ec407b 复审跟进)", ()
     assert.equal(typeof pd.dispatcher, "object");
   });
 
-  test("有 dispatcher + 正常完成路径不会 hang(整个测试在 timeout 内 resolve)", async () => {
-    const { scheduler } = mkScheduler({
-      pickResult: {
-        account_id: 9n,
-        plan: "pro",
-        token: Buffer.from("tok-happy", "utf8"),
-        refresh: null,
-        expires_at: new Date(Date.now() + 3600_000),
-        egress_proxy: "http://127.0.0.1:1",
-      },
-    });
-    const { fn } = mkStreamFn([evMessageStart(1), evMessageDelta(1), evMessageStop()]);
-    const events = await collect(runClaudeChat(baseInput, { scheduler, streamFn: fn } as RunChatDeps));
-    assert.equal(events[events.length - 1].type, "done");
-  });
+  // 注:dispatcher 的 hang/cancel 真路径在 accountProxy.test.ts 里的
+  // "streamClaude — finally 取消上游" 那个 describe 单测覆盖
+  // (mock fetch 返回真 ReadableStream,断言 cancel 被调到)。
+  // 这里 streamFn 是 mock,不会进 res.body.getReader() 路径,加 happy-path 测
+  // 等于没测——Codex 1bacae8 复审已点出该问题,故此处不放冗余测试。
 });

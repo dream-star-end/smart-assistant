@@ -7,15 +7,20 @@
  *       1. 读 refresh_token(解密明文 Buffer,用完清零)
  *       2. 调 OAuth refresh endpoint(form-urlencoded grant_type=refresh_token)
  *       3. 2xx + 返回含 access_token → 重新加密写回 DB,返回新 token Buffer
- *       4. 失败(任意)→ manualDisable 账号 + throw RefreshError(code 不同)
+ *       4. 失败 → throw RefreshError(code 不同),账号是否禁用看错误类型
  *
- * 失败都通过 `RefreshError` 抛,调用方据 `code` 分类:
- *   - `account_not_found` — 读账号返 null(也许被并发删了)
- *   - `no_refresh_token` — DB 里没 refresh_token,无法自救
- *   - `http_error` — 网络错 / 非 2xx(含 status 字段)
- *   - `bad_response` — 2xx 但 JSON 解析失败 / 缺 access_token
+ * 失败都通过 `RefreshError` 抛,调用方据 `code` 分类。
+ * **禁用策略**(Codex review 1bacae8 收紧):
+ *   - `account_not_found` — 读账号返 null(也许被并发删了),不禁(无可禁)
+ *   - `no_refresh_token` — DB 里没 refresh_token,**禁用**(永久无法自救)
+ *   - `http_error` — fetch 抛(底层网络/DNS/TLS/代理不通)→ **不禁用**;
+ *     按账号 egress_proxy 后,代理一抖等于全池烧光,代价过大;
+ *     上层 orchestrator 把 RefreshError 当 release(failure)走健康度扣分,
+ *     连续失败仍会进 cooldown,不会"无事发生"
+ *   - `http_error` — 上游返 4xx/5xx → **禁用**(显式服务端拒绝,通常是 token 真坏)
+ *   - `bad_response` — 2xx 但 JSON 解析失败 / 缺 access_token,**禁用**
  *   - `persist_error` — 远端 refresh 成功了,但本地 updateAccount 抛了;
- *     为避免"本地仍是旧 token 但账号还 active"的失控场面,一律禁用并抛
+ *     为避免"本地仍是旧 token 但账号还 active"的失控场面,**一律禁用**并抛
  *
  * 安全规约:
  *   - 明文 refresh_token 仅短暂生存在 JS 字符串内(为 form-urlencode),encode 后立即失去引用
@@ -181,7 +186,8 @@ async function disableOnFailure(
 }
 
 /**
- * 刷新账号 token,成功 → 写回 DB + 返新 token;失败 → 禁用账号 + throw。
+ * 刷新账号 token。成功 → 写回 DB + 返新 token;失败 → throw RefreshError。
+ * 是否禁用账号取决于错误类型,见文件头部"禁用策略"章节。
  *
  * @throws {@link RefreshError}
  */
