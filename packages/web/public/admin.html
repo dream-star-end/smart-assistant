@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>OpenClaude Admin</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 <style>
   :root {
     --bg: #0d1117;
@@ -83,6 +84,7 @@
   <div id="login-err" class="err"></div>
   <input id="login-email" type="email" placeholder="邮箱" autocomplete="email" />
   <input id="login-password" type="password" placeholder="密码" autocomplete="current-password" />
+  <div id="login-turnstile" class="cf-turnstile" data-sitekey="0x4AAAAAAC_tqogBU_n10fiD" data-theme="auto" data-size="flexible" style="margin-bottom:12px"></div>
   <button id="login-btn">登录</button>
 </div>
 
@@ -248,10 +250,15 @@ async function doLogin() {
   const errEl = $("login-err");
   errEl.textContent = "";
   if (!email || !password) { errEl.textContent = "邮箱 / 密码必填"; return; }
+  const tsEl = document.querySelector('#login-turnstile [name="cf-turnstile-response"]');
+  const turnstileToken = tsEl && tsEl.value ? tsEl.value : "";
+  if (!turnstileToken) { errEl.textContent = "请先完成人机验证"; return; }
   try {
-    const r = await api("/api/auth/login", { method: "POST", body: { email, password, turnstile_token: "bypass" }, auth: false });
+    const r = await api("/api/auth/login", { method: "POST", body: { email, password, turnstile_token: turnstileToken }, auth: false });
     if (r.user?.role !== "admin") {
-      errEl.textContent = "不是超管账户"; return;
+      errEl.textContent = "不是超管账户";
+      try { window.turnstile && window.turnstile.reset("#login-turnstile"); } catch {}
+      return;
     }
     localStorage.setItem(TOKEN_KEY, r.access_token);
     if (r.refresh_token) localStorage.setItem(REFRESH_KEY, r.refresh_token);
@@ -260,6 +267,7 @@ async function doLogin() {
     enterApp();
   } catch (e) {
     errEl.textContent = e.message || "登录失败";
+    try { window.turnstile && window.turnstile.reset("#login-turnstile"); } catch {}
   }
 }
 
