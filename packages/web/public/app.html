@@ -224,34 +224,36 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
 .price-table th{font-weight:500;font-size:11.5px;color:var(--fg-3);text-transform:uppercase;letter-spacing:.06em}
 .price-table tr:last-child td{border-bottom:0}
 .price-table .pt-model{font-weight:600;color:var(--fg-0)}
-.price-table .pt-foreign{color:var(--fg-2);text-decoration:line-through;text-decoration-color:rgba(255,255,255,.25)}
-.price-table .pt-ours{color:var(--brand-300);font-weight:600}
+.price-table .pt-foreign{color:var(--fg-2);text-decoration:line-through;text-decoration-color:rgba(255,255,255,.25);font-variant-numeric:tabular-nums}
+.price-table .pt-cache{color:var(--fg-1);font-variant-numeric:tabular-nums}
+.price-table .pt-ours{color:var(--brand-300);font-weight:700;font-variant-numeric:tabular-nums}
 .price-table .pt-save{
-  display:inline-block;font-size:10.5px;padding:2px 6px;border-radius:4px;
+  display:inline-block;font-size:10px;padding:1px 5px;border-radius:4px;
   background:rgba(80,180,120,.12);color:#7adba0;border:1px solid rgba(80,180,120,.25);
-  margin-left:6px;
+  margin-left:5px;font-variant-numeric:tabular-nums;
 }
-.price-foot{font-size:11px;color:var(--fg-3);margin-top:10px;line-height:1.5}
+.price-foot{font-size:11px;color:var(--fg-3);margin-top:10px;line-height:1.55}
 
-/* ── benchmark 条形 ── */
+/* ── benchmark 对照表 ── */
 .bench-block{
   padding:18px;border-radius:var(--r-md);
   background:rgba(255,255,255,.02);border:1px solid var(--line);
 }
 .bench-block h3{margin:0 0 4px;font-size:14px;font-weight:600;color:var(--fg-0)}
 .bench-block .bh-sub{font-size:12px;color:var(--fg-2);margin-bottom:14px}
-.bench-list{display:flex;flex-direction:column;gap:11px}
-.bench-row{display:grid;grid-template-columns:140px 1fr 48px;align-items:center;gap:10px}
-.bench-name{font-size:12px;color:var(--fg-1);font-weight:500}
-.bench-bar{
-  position:relative;height:8px;border-radius:4px;
-  background:rgba(255,255,255,.05);overflow:hidden;
+.bench-table{width:100%;border-collapse:collapse;font-size:12.5px}
+.bench-table th,.bench-table td{padding:9px 8px;text-align:right;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+.bench-table th{font-weight:500;font-size:11px;color:var(--fg-3);text-transform:uppercase;letter-spacing:.05em;text-align:right}
+.bench-table th:first-child,.bench-table td:first-child{text-align:left}
+.bench-table tr:last-child td{border-bottom:0}
+.bench-table .bt-bench{color:var(--fg-1);font-weight:500}
+.bench-table .bt-bench small{display:block;color:var(--fg-3);font-weight:400;font-size:10.5px;margin-top:1px}
+.bench-table .bt-other{color:var(--fg-2)}
+.bench-table .bt-ours{color:var(--brand-300);font-weight:700}
+.bench-table .bt-ours.win::before{
+  content:"";display:inline-block;width:6px;height:6px;border-radius:50%;
+  background:var(--brand-400);margin-right:5px;vertical-align:middle;
 }
-.bench-fill{
-  position:absolute;left:0;top:0;bottom:0;border-radius:4px;
-  background:linear-gradient(90deg,var(--brand-500),var(--brand-300));
-}
-.bench-score{font-size:12.5px;color:var(--brand-300);font-weight:700;text-align:right;font-variant-numeric:tabular-nums}
 .bench-foot{font-size:10.5px;color:var(--fg-3);margin-top:12px;line-height:1.55}
 
 .auth-form-pane{
@@ -285,7 +287,9 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
   .hero-title{font-size:26px;margin:14px 0 10px}
   .hero-sub{font-size:14.5px}
   .value-grid{grid-template-columns:1fr}
-  .bench-row{grid-template-columns:120px 1fr 44px}
+  .price-table,.bench-table{font-size:11.5px}
+  .price-table th,.price-table td,.bench-table th,.bench-table td{padding:7px 5px}
+  .bench-table .bt-bench small{font-size:9.5px}
 }
 
 /* ── 主 APP shell ─────────────────────────── */
@@ -570,7 +574,7 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
       <div class="value-card">
         <div class="vc-num">0.1×</div>
         <div class="vc-title">海外官方价的十分之一</div>
-        <div class="vc-sub">Anthropic 官网 Opus 系列 $15/$75 每百万 token。OpenClaude 仅 ¥10.5/¥52.5,同质模型,十倍便宜。</div>
+        <div class="vc-sub">Anthropic 官网 Opus 4.7 $5/$25 每百万 token。OpenClaude 仅 ¥3.5/¥17.5,同质模型,十倍便宜。</div>
       </div>
       <div class="value-card">
         <div class="vc-num">¥10</div>
@@ -581,77 +585,122 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
 
     <!-- 价格对比 -->
     <div class="price-block">
-      <h3>同样的模型,十倍便宜</h3>
+      <h3>同样的模型,十倍便宜 · 含 cache 折扣后仍便宜</h3>
       <div class="ph-sub">单位:每百万 token / 已折算人民币(汇率 7.0)</div>
       <table class="price-table">
         <thead>
-          <tr><th>模型</th><th>类型</th><th>海外官方</th><th>OpenClaude</th></tr>
+          <tr>
+            <th>模型</th>
+            <th>类型</th>
+            <th>海外标准</th>
+            <th>海外 95% cache</th>
+            <th>OpenClaude</th>
+          </tr>
         </thead>
         <tbody>
           <tr>
             <td class="pt-model" rowspan="2">Claude Opus 4.7</td>
             <td>Input</td>
-            <td class="pt-foreign">¥105</td>
-            <td class="pt-ours">¥10.5 <span class="pt-save">省 90%</span></td>
+            <td class="pt-foreign">¥35</td>
+            <td class="pt-cache">¥5.1</td>
+            <td class="pt-ours">¥3.5 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
             <td>Output</td>
-            <td class="pt-foreign">¥525</td>
-            <td class="pt-ours">¥52.5 <span class="pt-save">省 90%</span></td>
+            <td class="pt-foreign">¥175</td>
+            <td class="pt-cache">¥175</td>
+            <td class="pt-ours">¥17.5 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
             <td class="pt-model" rowspan="2">Claude Sonnet 4.6</td>
             <td>Input</td>
             <td class="pt-foreign">¥21</td>
+            <td class="pt-cache">¥3.0</td>
             <td class="pt-ours">¥2.1 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
             <td>Output</td>
             <td class="pt-foreign">¥105</td>
+            <td class="pt-cache">¥105</td>
             <td class="pt-ours">¥10.5 <span class="pt-save">省 90%</span></td>
           </tr>
         </tbody>
       </table>
-      <div class="price-foot">海外官方价取自 Anthropic 公开 API 定价页(Opus $15/$75 · Sonnet $3/$15 per Mtok)。命中 prompt cache 时再降至 0.1×。</div>
+      <div class="price-foot">
+        海外官方价取自 Anthropic 公开 API 定价(Opus 4.7 $5/$25 · Sonnet 4.6 $3/$15 per Mtok)。
+        "海外 95% cache" 列为输入命中 prompt cache 后的等效价(cache read 0.1× + 5% miss)。
+        OpenClaude 给出的 0.1× 折扣不依赖任何 cache 配置。
+      </div>
     </div>
 
-    <!-- Opus 4.7 评测 -->
+    <!-- Opus 4.7 官方 benchmark -->
     <div class="bench-block">
-      <h3>Claude Opus 4.7 — 当前业界最强</h3>
-      <div class="bh-sub">编程、推理、数学多项主流公开 benchmark 持续位居榜首</div>
-      <div class="bench-list">
-        <div class="bench-row">
-          <span class="bench-name">SWE-bench Verified</span>
-          <div class="bench-bar"><span class="bench-fill" style="width:82%"></span></div>
-          <span class="bench-score">82%</span>
-        </div>
-        <div class="bench-row">
-          <span class="bench-name">Terminal-Bench 2.0</span>
-          <div class="bench-bar"><span class="bench-fill" style="width:58%"></span></div>
-          <span class="bench-score">58%</span>
-        </div>
-        <div class="bench-row">
-          <span class="bench-name">MMLU-Pro</span>
-          <div class="bench-bar"><span class="bench-fill" style="width:88%"></span></div>
-          <span class="bench-score">88%</span>
-        </div>
-        <div class="bench-row">
-          <span class="bench-name">GPQA Diamond</span>
-          <div class="bench-bar"><span class="bench-fill" style="width:80%"></span></div>
-          <span class="bench-score">80%</span>
-        </div>
-        <div class="bench-row">
-          <span class="bench-name">AIME 2025</span>
-          <div class="bench-bar"><span class="bench-fill" style="width:90%"></span></div>
-          <span class="bench-score">90%</span>
-        </div>
-        <div class="bench-row">
-          <span class="bench-name">HumanEval</span>
-          <div class="bench-bar"><span class="bench-fill" style="width:95%"></span></div>
-          <span class="bench-score">95%</span>
-        </div>
+      <h3>Claude Opus 4.7 — 当前业界最强 agent 模型</h3>
+      <div class="bh-sub">下列均为 Anthropic 官方发布的对照成绩(2026-04 Opus 4.7 launch table)</div>
+      <table class="bench-table">
+        <thead>
+          <tr>
+            <th>Benchmark</th>
+            <th>Opus 4.7</th>
+            <th>GPT-5.4</th>
+            <th>Gemini 3.1 Pro</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="bt-bench">SWE-bench Verified<small>Agentic coding</small></td>
+            <td class="bt-ours win">87.6%</td>
+            <td class="bt-other">—</td>
+            <td class="bt-other">80.6%</td>
+          </tr>
+          <tr>
+            <td class="bt-bench">SWE-bench Pro<small>Agentic coding</small></td>
+            <td class="bt-ours win">64.3%</td>
+            <td class="bt-other">57.7%</td>
+            <td class="bt-other">54.2%</td>
+          </tr>
+          <tr>
+            <td class="bt-bench">MCP-Atlas<small>Scaled tool use</small></td>
+            <td class="bt-ours win">77.3%</td>
+            <td class="bt-other">68.1%</td>
+            <td class="bt-other">73.9%</td>
+          </tr>
+          <tr>
+            <td class="bt-bench">OSWorld-Verified<small>Agentic computer use</small></td>
+            <td class="bt-ours win">78.0%</td>
+            <td class="bt-other">75.0%</td>
+            <td class="bt-other">—</td>
+          </tr>
+          <tr>
+            <td class="bt-bench">Finance Agent v1.1<small>Agentic financial analysis</small></td>
+            <td class="bt-ours win">64.4%</td>
+            <td class="bt-other">61.5%</td>
+            <td class="bt-other">59.7%</td>
+          </tr>
+          <tr>
+            <td class="bt-bench">GPQA Diamond<small>Graduate-level reasoning</small></td>
+            <td class="bt-ours">94.2%</td>
+            <td class="bt-other">94.4%</td>
+            <td class="bt-other">94.3%</td>
+          </tr>
+          <tr>
+            <td class="bt-bench">CharXiv (with tools)<small>Visual reasoning</small></td>
+            <td class="bt-ours win">91.0%</td>
+            <td class="bt-other">—</td>
+            <td class="bt-other">—</td>
+          </tr>
+          <tr>
+            <td class="bt-bench">MMMLU<small>Multilingual Q&amp;A</small></td>
+            <td class="bt-ours">91.5%</td>
+            <td class="bt-other">—</td>
+            <td class="bt-other">92.6%</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="bench-foot">
+        ● 表示 Opus 4.7 在该项 benchmark 领先。完整对照(含 Mythos Preview / 其它 9 项)见
+        <a href="https://www.anthropic.com/news/claude-opus-4-7" target="_blank" rel="noopener" style="color:var(--brand-300);text-decoration:none">Anthropic 官方公告</a>。
       </div>
-      <div class="bench-foot">数据为 Claude Opus 4.x 系列公开评测的近似值;Opus 4.7 实际成绩以 <a href="https://www.anthropic.com" target="_blank" rel="noopener" style="color:var(--brand-300);text-decoration:none">Anthropic 官方技术报告</a> 为准。基准测试条件可能影响最终分数。</div>
     </div>
 
     <div class="hero-foot">
