@@ -836,12 +836,16 @@ const REFRESH_SKEW_SEC = 60;
 
 const $ = (id) => document.getElementById(id);
 
-/** 后端 credits 单位 = 分(1 积分 = 100 分 = ¥1)。统一渲染为 "¥X.XX"。 */
-function fmtYuan(credits) {
+/**
+ * 后端 credits 字段就是"积分"数。换算关系:1 元 = 100 积分。
+ * 展示一律 "X 积分"(整数,千分位逗号分隔),不再显示现金。
+ * 历史小数 credits(老订单可能落了 .5)会向下取整。
+ */
+function fmtCredits(credits) {
   if (credits === null || credits === undefined) return "—";
   const n = Number(credits);
   if (!Number.isFinite(n)) return "—";
-  return "¥" + (n / 100).toFixed(2);
+  return Math.floor(n).toLocaleString("en-US") + " 积分";
 }
 
 /** 创建 DOM 元素;child 里的字符串一律走 createTextNode,不做 innerHTML,XSS 面最小化。 */
@@ -1092,7 +1096,7 @@ async function refreshMe() {
     const r = await api("/api/me");
     const u = r.user ?? r; // 容错两种 shape
     $("me-email").textContent = u.email ?? "";
-    $("bal-credits").textContent = fmtYuan(u.credits);
+    $("bal-credits").textContent = fmtCredits(u.credits);
     localStorage.setItem(USER_KEY, JSON.stringify(u));
   } catch (e) {
     if (e.code !== "NOT_AUTHENTICATED") toast("加载个人资料失败: " + e.message, "err");
@@ -1228,7 +1232,7 @@ function renderBubble(role, text, meta) {
   if (meta) {
     const foot = el("div", { class: "msg-foot" });
     if (meta.usage) foot.appendChild(el("span", {}, `in ${meta.usage.input_tokens} · out ${meta.usage.output_tokens}`));
-    if (meta.debit) foot.appendChild(el("span", {}, `扣费 ${fmtYuan(meta.debit.cost_credits)}`));
+    if (meta.debit) foot.appendChild(el("span", {}, `扣费 ${fmtCredits(meta.debit.cost_credits)}`));
     b.appendChild(foot);
   }
   row.appendChild(avatar);
@@ -1327,14 +1331,14 @@ function handleWsFrame(raw) {
       foot.appendChild(el("span", {}, `in ${frame.input_tokens} · out ${frame.output_tokens}`));
     }
   } else if (frame.type === "debit") {
-    $("bal-credits").textContent = fmtYuan(frame.balance_after);
+    $("bal-credits").textContent = fmtCredits(frame.balance_after);
     if (chatState.streamingMsg) {
       let foot = chatState.streamingMsg.querySelector(".msg-foot");
       if (!foot) {
         foot = el("div", { class: "msg-foot" });
         chatState.streamingMsg.appendChild(foot);
       }
-      foot.appendChild(el("span", { class: "ok" }, `-${fmtYuan(frame.cost_credits)}`));
+      foot.appendChild(el("span", { class: "ok" }, `-${fmtCredits(frame.cost_credits)}`));
     }
   } else if (frame.type === "done") {
     if (chatState.streamingText) {
@@ -1347,7 +1351,7 @@ function handleWsFrame(raw) {
       chatState.streamingMsg.firstChild.data = `[${frame.code}] ${frame.message}`;
     }
     if (frame.code === "ERR_INSUFFICIENT_CREDITS") {
-      toast("余额不足,请先充值", "err");
+      toast("积分不足,请先充值", "err");
     } else {
       toast(`${frame.code}: ${frame.message}`, "err");
     }
@@ -1387,13 +1391,13 @@ async function renderTopup(root) {
     }
     for (const p of topupState.plans) {
       const amountYuan = (Number(p.amount_cents) / 100).toFixed(2);
-      // p.credits 单位 = 分(1 积分 = 100 分 = ¥1)。展示成 "到账 ¥XX"。
-      const creditYuan = (Number(p.credits) / 100).toFixed(2);
+      // 1 元 = 100 积分。p.credits 字段值就是积分数,直接展示。
+      const creditsLabel = fmtCredits(p.credits);
       plansDiv.appendChild(el("div", { class: "plan", onclick: () => createOrder(p) }, [
         el("div", { class: "p-amt" }, `¥${amountYuan}`),
         el("div", { class: "p-credits" }, [
           icon('<path d="M12 2 L2 12 L12 22 L22 12 Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>', 11),
-          ` 到账 ¥${creditYuan}`,
+          ` 到账 ${creditsLabel}`,
         ]),
         el("div", { class: "p-label" }, p.label || ""),
       ]));
@@ -1436,7 +1440,7 @@ function renderOrderQr(slot, order) {
   // PC:虎皮椒 `url_qrcode` 本身就是 QR 图片(里面编码了 weixin:// 协议),
   // 千万别再客户端 QR 化 —— 否则微信扫到 https URL,打开后又是 QR,被迫扫两次。
   const card = el("div", { class: "qr-card" }, [
-    el("div", { class: "qr-title" }, `支付 ¥${amount} → 到账 ¥${(Number(order.credits)/100).toFixed(2)}`),
+    el("div", { class: "qr-title" }, `支付 ¥${amount} → 到账 ${fmtCredits(order.credits)}`),
     el("img", { src: order.qrcode_url, alt: "微信支付二维码", style: "width:240px;height:240px;object-fit:contain;background:#fff;padding:8px;border-radius:8px" }),
     el("div", { class: "qr-meta" }, "请使用微信扫码支付"),
     el("div", { class: "qr-meta dim" }, `订单号:${order.order_no}`),
