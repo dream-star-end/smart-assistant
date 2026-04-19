@@ -598,10 +598,20 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
         </thead>
         <tbody>
           <tr>
-            <td class="pt-model" rowspan="2">Claude Opus 4.7</td>
+            <td class="pt-model" rowspan="4">Claude Opus 4.7</td>
             <td>Input</td>
             <td class="pt-foreign">¥35</td>
             <td class="pt-ours">¥3.5 <span class="pt-save">省 90%</span></td>
+          </tr>
+          <tr>
+            <td>Input (cache read)</td>
+            <td class="pt-foreign">¥3.5</td>
+            <td class="pt-ours">¥0.35 <span class="pt-save">省 90%</span></td>
+          </tr>
+          <tr>
+            <td>Input (cache write 5m)</td>
+            <td class="pt-foreign">¥43.75</td>
+            <td class="pt-ours">¥4.375 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
             <td>Output</td>
@@ -609,10 +619,20 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
             <td class="pt-ours">¥17.5 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
-            <td class="pt-model" rowspan="2">Claude Sonnet 4.6</td>
+            <td class="pt-model" rowspan="4">Claude Sonnet 4.6</td>
             <td>Input</td>
             <td class="pt-foreign">¥21</td>
             <td class="pt-ours">¥2.1 <span class="pt-save">省 90%</span></td>
+          </tr>
+          <tr>
+            <td>Input (cache read)</td>
+            <td class="pt-foreign">¥2.1</td>
+            <td class="pt-ours">¥0.21 <span class="pt-save">省 90%</span></td>
+          </tr>
+          <tr>
+            <td>Input (cache write 5m)</td>
+            <td class="pt-foreign">¥26.25</td>
+            <td class="pt-ours">¥2.625 <span class="pt-save">省 90%</span></td>
           </tr>
           <tr>
             <td>Output</td>
@@ -621,11 +641,7 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
           </tr>
         </tbody>
       </table>
-      <div class="price-foot">
-        海外官方价取自 Anthropic 公开 API 定价(Opus 4.7 $5/$25 · Sonnet 4.6 $3/$15 per Mtok,汇率 ¥7.0)。<br>
-        Anthropic 输入还有独立计价:cache read 0.1× input、5min cache write 1.25× input、1h cache write 2× input,但需要主动配置 prompt cache 才生效。<br>
-        OpenClaude 直接按官方标准价的十分之一统一计费,无需任何 cache 配置。
-      </div>
+      <div class="price-foot">海外官方价取自 Anthropic 公开 API 定价(Opus 4.7 $5/$25 · Sonnet 4.6 $3/$15 per Mtok · cache read 0.1× / 5min cache write 1.25×,汇率 ¥7.0)。OpenClaude 各档统一按官方价的十分之一计费。</div>
     </div>
 
     <!-- Opus 4.7 官方 benchmark -->
