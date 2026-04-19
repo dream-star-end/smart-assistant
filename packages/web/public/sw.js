@@ -10,7 +10,7 @@ const SHELL = [
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=19',  // versioned URL used in index.html
+  '/modules/main.js?v=20',  // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
