@@ -621,7 +621,11 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
           </tr>
         </tbody>
       </table>
-      <div class="price-foot">海外官方价取自 Anthropic 公开 API 定价(Opus 4.7 $5/$25 · Sonnet 4.6 $3/$15 per Mtok,汇率 ¥7.0)。OpenClaude 统一按官方价的十分之一计费。</div>
+      <div class="price-foot">
+        海外官方价取自 Anthropic 公开 API 定价(Opus 4.7 $5/$25 · Sonnet 4.6 $3/$15 per Mtok,汇率 ¥7.0)。<br>
+        Anthropic 输入还有独立计价:cache read 0.1× input、5min cache write 1.25× input、1h cache write 2× input,但需要主动配置 prompt cache 才生效。<br>
+        OpenClaude 直接按官方标准价的十分之一统一计费,无需任何 cache 配置。
+      </div>
     </div>
 
     <!-- Opus 4.7 官方 benchmark -->
