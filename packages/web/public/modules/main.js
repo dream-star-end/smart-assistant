@@ -91,6 +91,7 @@ import {
   _rebuildSearchIndex,
   createSession,
   deleteSession,
+  enqueueSaveForRetry,
   exportSessionMd,
   flushPendingSaves,
   hideContextMenu,
@@ -1403,6 +1404,11 @@ async function init() {
       if (sessId === state.currentSessionId) renderMessages()
       renderSidebar() // title / lastAt may have changed either way
     },
+    // 409 local-dominates path requests a follow-up PUT carrying the
+    // refreshed _baseSyncedAt pulled during the conflict resolution.
+    // enqueueSaveForRetry chains one extra _doSave without touching
+    // lastAt or retry budget (retry is not a user edit).
+    onRequestRetryPush: (sessId) => enqueueSaveForRetry(sessId),
   })
   // Sidebar search
   let _searchDebounce = null

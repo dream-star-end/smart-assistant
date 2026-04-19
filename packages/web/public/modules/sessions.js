@@ -191,7 +191,25 @@ export function scheduleSaveFromUserEdit(s, immediate) {
   const sess = s || getSession()
   if (!sess) return
   _clearSaveRetry(sess.id)
+  sess._conflictRetryCount = 0  // reset 409 local-dominates auto-retry cap
   scheduleSave(sess, immediate)
+}
+
+/**
+ * Internal retry helper used by sync.js 409 handler when local-dominates
+ * resolution preserves local messages. Unlike scheduleSave(), this:
+ *   - Does NOT bump lastAt (retry is not a user edit — preserves sidebar
+ *     "recent" ordering)
+ *   - Does NOT reset the dbPut retry budget
+ *   - Does NOT mark _dirty (caller has already done so)
+ * It simply chains one fresh _doSave onto the existing _chainTail so the
+ * next PUT carries the refreshed _baseSyncedAt pulled during the 409.
+ */
+export function enqueueSaveForRetry(sessId) {
+  if (!sessId) return
+  const sess = state.sessions.get(sessId)
+  if (!sess || _deletedIds.has(sessId)) return
+  _enqueueSave(sess)
 }
 
 function _enqueueSave(sess) {
