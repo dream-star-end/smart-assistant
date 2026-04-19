@@ -262,23 +262,13 @@ function currentModelSupportsResearch() {
 export function renderResearchTools() {
   const wrap = $('research-tools')
   if (!wrap) return
-  const visible = currentModelSupportsResearch() && getCurrentEffort() === 'max'
-  wrap.hidden = !visible
-  if (!visible) {
-    // 工具条隐藏时,顺手把 textarea 里可能残留的 audience tag 清掉 —— 防止
-    // "在 A 会话的 max 模式下加了 tag,切到 B 会话非 max 或非 4.7 agent"后,
-    // 发送时把 tag 和正文一起发出去。只动独占末尾行的 tag,不碰正文。
-    syncAudienceInTextarea('')
-    return
-  }
-  const cur = readAudience()
-  for (const btn of wrap.querySelectorAll('.audience-pill')) {
-    const v = btn.dataset.audience
-    btn.setAttribute('aria-pressed', v === cur ? 'true' : 'false')
-  }
-  // 把 textarea 里的 tag 同步到当前 session 的 audience 选择。
-  // 注:syncAudienceInTextarea 是幂等的 —— tag 已对则无改动,不对才替换。
-  syncAudienceInTextarea(cur)
+  // 2026-04-19 boss feedback: "选项太多了，不好用，点开科研模式按钮后，用户不
+  // 需要再点任何按钮了"。整条工具条永久隐藏,科研严格度全部交给 buildResearchSlot
+  // 的守则去约束 agent。子按钮(受众/浓缩/矩阵/校验)的 markup/事件保留但不显示,
+  // 方便日后改主意时一行翻回来。textarea 里的旧 audience tag 也顺手清掉,避免
+  // 历史会话残留 `[受众: ...]` 误导本轮发送。
+  wrap.hidden = true
+  syncAudienceInTextarea('')
 }
 
 /** 一次性绑定科研工具条的事件(受众 pill toggle + 浓缩按钮 click)。 */
