@@ -19,7 +19,7 @@ import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { closePool, getPool } from "./db/index.js";
 import { loadConfig } from "./config.js";
-import { stubMailer } from "./auth/mail.js";
+import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
@@ -278,9 +278,21 @@ export async function registerCommercial(
   // T-41 REST /api/chat:把 orchestrator 包成 ChatLLM 接口喂给既有 http handler。
   const realChatLLM = createChatLLMFromRunChat(chatDeps);
 
+  // T-12+ 真实 mailer:env 配 RESEND_API_KEY 后切到 Resend,否则保留 stub(dev/测试)。
+  const resendKey = process.env.RESEND_API_KEY?.trim();
+  const mailFrom = process.env.MAIL_FROM?.trim() || "auth@claudeai.chat";
+  const mailer = resendKey
+    ? createResendMailer({ apiKey: resendKey, from: mailFrom })
+    : stubMailer;
+  if (resendKey) {
+    console.log(`[commercial] mailer = resend (from=${mailFrom})`);
+  } else {
+    console.log("[commercial] mailer = stub (RESEND_API_KEY 未设置, 验证邮件只打日志)");
+  }
+
   const handler = createCommercialHandler({
     jwtSecret,
-    mailer: stubMailer,
+    mailer,
     redis: wrapIoredis(redis),
     turnstileSecret: cfg.TURNSTILE_SECRET,
     turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,

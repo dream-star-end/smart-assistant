@@ -1203,6 +1203,23 @@ function stopPolling() {
 // 入口
 // ═════════════════════════════════════════════════════════════════
 
+// 邮箱验证回调:用户从邮件链接 /verify-email?token=xxx 进来时(Caddy 已 rewrite 到 /app.html,
+// 浏览器 URL 仍是 /verify-email),自动 POST verify endpoint 并 toast 结果。
+async function handleVerifyEmailCallback() {
+  if (window.location.pathname !== "/verify-email") return;
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token");
+  // 清掉 URL 里的 token 痕迹(防止刷新重发 + 防止泄漏到 referer)
+  try { window.history.replaceState({}, "", "/"); } catch { /* ignore */ }
+  if (!token) { toast("邮箱验证链接无效", "err"); return; }
+  try {
+    await api("/api/auth/verify-email", { method: "POST", auth: false, body: { token } });
+    toast("邮箱已验证 ✓ 现在可以登录", "ok");
+  } catch (e) {
+    toast(`验证失败: ${e.message || "链接已过期"}`, "err");
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   // 静态 DOM 元素绑定先跑 —— renderAuth() 会重建 #auth-sub 里的 switch 按钮
   // (新元素自带 onclick),不要再去查 "#auth-switch",它已经不在了。
@@ -1214,6 +1231,8 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   renderAuth();
   if (localStorage.getItem(TOKEN_KEY)) enterApp();
+  // 必须在 enterApp 之后跑(toast 容器要存在)
+  handleVerifyEmailCallback();
 });
 
 // 跨 tab 同步:另一 tab 登出 → 本 tab 也回到未登录态

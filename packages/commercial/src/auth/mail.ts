@@ -38,3 +38,63 @@ export const stubMailer: Mailer = {
     process.stdout.write(`[mail-stub] ${line}\n`);
   },
 };
+
+/**
+ * Resend mailer:走 https://api.resend.com/emails 的 REST API,直接 fetch,
+ * 不引第三方 SDK。
+ *
+ * 失败时抛 Error,register/forgot-password 流程会捕获并把 verify_email_sent 置 false,
+ * 用户可走 resend-verification 重发。
+ */
+export interface ResendMailerOptions {
+  apiKey: string;
+  /** 发信地址,如 "OpenClaude <auth@claudeai.chat>" 或 "auth@claudeai.chat" */
+  from: string;
+  /** 测试可注入 fetch */
+  fetchImpl?: typeof fetch;
+  /** 请求超时 ms,默认 8000 */
+  timeoutMs?: number;
+}
+
+export function createResendMailer(opts: ResendMailerOptions): Mailer {
+  const fetchFn = opts.fetchImpl ?? fetch;
+  const timeout = opts.timeoutMs ?? 8000;
+  return {
+    async send(msg: MailMessage): Promise<void> {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeout);
+      try {
+        const res = await fetchFn("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${opts.apiKey}`,
+          },
+          body: JSON.stringify({
+            from: opts.from,
+            to: [msg.to],
+            subject: msg.subject,
+            text: msg.text,
+          }),
+          signal: ctrl.signal,
+        });
+        if (!res.ok) {
+          let body = "";
+          try { body = await res.text(); } catch { /* ignore */ }
+          throw new Error(`resend send failed: ${res.status} ${body.slice(0, 300)}`);
+        }
+        // 成功: 也打一行日志方便排查(只记 to/subject/id,不记正文 token)
+        let id = "";
+        try {
+          const j = await res.clone().json() as { id?: string };
+          if (j && typeof j.id === "string") id = j.id;
+        } catch { /* ignore */ }
+        process.stdout.write(
+          `[mail-resend] ${JSON.stringify({ _kind: "mail-resend", to: msg.to, subject: msg.subject, id, ts: new Date().toISOString() })}\n`,
+        );
+      } finally {
+        clearTimeout(t);
+      }
+    },
+  };
+}
