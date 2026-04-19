@@ -522,6 +522,17 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
   padding:6px 14px;border-radius:var(--r-full);
   background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.2);
 }
+.qr-card a.qr-meta{display:block;text-decoration:none}
+.qr-card a.qr-meta:hover{text-decoration:underline}
+.qr-card .qr-pending-row{display:flex;justify-content:center;margin-top:16px}
+.qr-card.paid{opacity:.85;transition:opacity .3s var(--ease)}
+.qr-card .qr-success{
+  display:inline-flex;align-items:center;gap:8px;
+  margin-top:16px;font-size:14px;font-weight:500;color:#4ade80;
+  padding:8px 18px;border-radius:var(--r-full);
+  background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.3);
+}
+.qr-card .qr-success::before{content:"✓";font-weight:700}
 .qr-card .qr-pending .pulse{
   width:8px;height:8px;border-radius:50%;background:var(--warn);
   animation:pulse 1.6s ease-in-out infinite;
@@ -1432,9 +1443,11 @@ function renderOrderQr(slot, order) {
     order.mobile_url
       ? el("a", { href: order.mobile_url, target: "_blank", rel: "noopener", class: "qr-meta", style: "color:#4ea1ff" }, "手机端点这里直接付款 →")
       : null,
-    el("div", { class: "qr-pending" }, [
-      el("span", { class: "pulse" }),
-      el("span", { id: "order-status" }, "等待支付…"),
+    el("div", { class: "qr-pending-row" }, [
+      el("div", { class: "qr-pending", id: "order-pending" }, [
+        el("span", { class: "pulse" }),
+        el("span", { id: "order-status" }, "等待支付…"),
+      ]),
     ]),
   ]);
   slot.appendChild(card);
@@ -1454,9 +1467,22 @@ function startPolling(orderNo) {
       if (st) st.textContent = status === "pending" ? "等待支付…" : status;
       if (status === "paid") {
         stopPolling();
-        if (st) { st.textContent = "已到账!"; st.parentElement.style.background = "rgba(74,222,128,.1)"; st.parentElement.style.borderColor = "rgba(74,222,128,.3)"; st.className = "ok"; }
+        // 把"等待支付"的黄色 pill 替换成绿色"已到账 ¥X"
+        const pending = document.getElementById("order-pending");
+        if (pending) {
+          const success = el("div", { class: "qr-success" }, "已到账,3 秒后关闭");
+          pending.replaceWith(success);
+        }
+        // QR 卡淡出,但留住"已到账"提示
+        const card = document.querySelector(".qr-card");
+        if (card) card.classList.add("paid");
         toast("充值到账!", "ok");
         await refreshMe();
+        // 3 秒后关闭 QR;套餐列表始终在,无需重渲染
+        setTimeout(() => {
+          const slot = $("order-slot");
+          if (slot) slot.innerHTML = "";
+        }, 3000);
       } else if (status === "expired" || status === "canceled" || status === "refunded") {
         stopPolling();
         if (st) { st.textContent = `订单 ${status},请重新发起`; st.className = "err"; }
