@@ -2,6 +2,7 @@ import { dbDelete, dbPut } from './db.js'
 // OpenClaude — Session management, sidebar, context menu
 import { $, htmlSafeEscape } from './dom.js'
 import { exportSessionDocx } from './export-docx.js'
+import { exportSessionTex } from './export-tex.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
 import { pushSessionToServer, deleteSessionFromServer } from './sync.js'
@@ -551,6 +552,7 @@ export function _buildSessionItem(s) {
       },
       { label: '导出 Markdown', run: () => exportSessionMd(s) },
       { label: '导出 Word (.docx)', run: () => exportSessionDocx(s) },
+      { label: '导出 LaTeX (.tex)', run: () => exportSessionTex(s) },
       { divider: true },
       {
         label: '删除',
@@ -580,6 +582,7 @@ export function _buildSessionItem(s) {
         },
         { label: '导出 Markdown', run: () => exportSessionMd(s) },
         { label: '导出 Word (.docx)', run: () => exportSessionDocx(s) },
+        { label: '导出 LaTeX (.tex)', run: () => exportSessionTex(s) },
         { divider: true },
         {
           label: '删除',
