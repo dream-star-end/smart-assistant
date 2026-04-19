@@ -1024,6 +1024,65 @@ function _renderGeneric(body, input, msg) {
   _renderOutput(body, msg.output)
 }
 
+// ── Truncated assistant message banner ──
+//
+// Show a "继续" affordance when the model stopped mid-answer (max_tokens /
+// pause_turn). websocket.js stamps `msg._truncated = '<reason>'` on the
+// streaming assistant before final render. This helper is idempotent: it
+// adds, refreshes, or removes the banner so it stays in sync if the message
+// state changes (e.g. on regen the new reply may not be truncated).
+//
+// Click handler programmatically drives the existing send pipeline by
+// stuffing a canned "续写" prompt into #input and clicking #send. We don't
+// import send() from main.js — the textarea/button fire path keeps state
+// (effort pill, attachments, autosize) consistent with a normal user send.
+function _applyTruncatedBanner(el, msg) {
+  const reason = msg && msg._truncated
+  let banner = el.querySelector(':scope > .msg-truncated-banner')
+  if (!reason) {
+    if (banner) banner.remove()
+    return
+  }
+  if (!banner) {
+    banner = document.createElement('div')
+    banner.className = 'msg-truncated-banner'
+    // Insert AFTER msg-body so it sits between body and actions/meta.
+    const body = el.querySelector(':scope > .msg-body')
+    if (body && body.nextSibling) el.insertBefore(banner, body.nextSibling)
+    else el.appendChild(banner)
+  }
+  const reasonText =
+    reason === 'max_tokens'
+      ? '本轮输出达到 token 上限,内容可能不完整。'
+      : reason === 'pause_turn'
+        ? '模型暂停了本轮(通常因长任务超时),可让它继续。'
+        : '本轮输出未完成。'
+  banner.innerHTML = ''
+  const note = document.createElement('span')
+  note.className = 'msg-truncated-note'
+  note.textContent = reasonText
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'msg-continue-btn'
+  btn.textContent = '继续'
+  btn.title = '让模型从上面被截断的位置接着写'
+  btn.addEventListener('click', () => {
+    const ta = /** @type {HTMLTextAreaElement|null} */ (document.getElementById('input'))
+    const sendBtn = /** @type {HTMLButtonElement|null} */ (document.getElementById('send'))
+    if (!ta || !sendBtn) return
+    // 续写文案保持中性、不绑定特定话题,避免触发模型重新做总结。
+    const prompt = '请接着上一条回复被截断的位置继续完成,不要重复已写过的内容,直接续写。'
+    const existing = ta.value.trim()
+    ta.value = existing ? `${existing}\n\n${prompt}` : prompt
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+    ta.focus()
+    ta.setSelectionRange(ta.value.length, ta.value.length)
+    sendBtn.click()
+  })
+  banner.appendChild(note)
+  banner.appendChild(btn)
+}
+
 export function _buildMessageEl(msg) {
   const el = document.createElement('div')
   el.className = `msg ${msg.role}`
@@ -1352,6 +1411,7 @@ export function _buildMessageEl(msg) {
       }
     })
     el.appendChild(actions)
+    _applyTruncatedBanner(el, msg)
     if (msg.metaText) {
       const meta = document.createElement('div')
       meta.className = 'msg-meta'
@@ -1496,6 +1556,7 @@ export function updateMessageEl(msg, streaming) {
         body.style.whiteSpace = ''
       }
     }
+    _applyTruncatedBanner(el, msg)
     if (msg.metaText) {
       let meta = el.querySelector('.msg-meta')
       if (!meta) {

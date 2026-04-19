@@ -1075,6 +1075,43 @@ a:hover {
   grid-row: 2;
   min-width: 0;
 }
+/* Truncated-answer banner — max_tokens / pause_turn. Sits between body and
+   actions; visually low-key but with an actionable "继续" button. */
+.msg-truncated-banner {
+  grid-column: 2;
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg-soft, rgba(127, 127, 127, 0.06));
+  font-size: 12.5px;
+  color: var(--fg-muted);
+}
+.msg-truncated-banner .msg-truncated-note {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.msg-truncated-banner .msg-continue-btn {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1.2;
+}
+.msg-truncated-banner .msg-continue-btn:hover {
+  background: var(--accent);
+  color: var(--bg);
+}
 /* Per-message absolute timestamp. Appended by _appendMsgTime in messages.js
    so users can see exactly when each message was created / completed — most
    useful for long-running assistant turns where the user switched tabs and

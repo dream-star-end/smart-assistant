@@ -1394,6 +1394,19 @@ export function handleOutbound(frame) {
     // token" to the actual turn-ended wall-clock.
     if (sess._streamingAssistant) sess._streamingAssistant.completedAt = Date.now()
     if (sess._streamingThinking) sess._streamingThinking.completedAt = Date.now()
+    // Mark assistant message as truncated when CCB report stop_reason indicates
+    // the model didn't get to finish (max_tokens, pause_turn). messages.js
+    // shows a "继续" button on truncated messages so user can resume without
+    // having to manually craft a "继续上文" prompt — alice 的 4-08 长回答被
+    // max_tokens 截断后只能手抄 paragraph 提问的痛点。
+    // 注:仅当本轮真的产生了文本(_streamingAssistant.text 非空)才标;空 turn
+    // 走下方 producedContent 分支的 noticeText 路径,那里已有相应文案。
+    const _stopReason = frame.meta?.stopReason
+    const _truncatedReason =
+      _stopReason === 'max_tokens' || _stopReason === 'pause_turn' ? _stopReason : null
+    if (_truncatedReason && sess._streamingAssistant?.text) {
+      sess._streamingAssistant._truncated = _truncatedReason
+    }
     // Final rich render: re-render all streaming messages with full Markdown/Mermaid/Chart
     if (sess._streamingAssistant && sess.id === state.currentSessionId) {
       _deps.updateMessageEl(sess._streamingAssistant, false)
