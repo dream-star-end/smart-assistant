@@ -311,7 +311,7 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
 .tabs button,.tabs a{
   background:transparent;border:0;padding:6px 14px;border-radius:7px;
   color:var(--fg-2);font-size:13.5px;font-weight:500;text-decoration:none;
-  display:inline-flex;align-items:center;gap:6px;
+  display:inline-flex;align-items:center;gap:6px;cursor:pointer;
   transition:color var(--dur) var(--ease),background var(--dur) var(--ease);
 }
 .tabs button:hover,.tabs a:hover{color:var(--fg-0);background:rgba(255,255,255,.04)}
@@ -325,19 +325,43 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
   padding:6px 14px;border-radius:var(--r-full);
   background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.22);
   font-family:var(--font-mono);font-size:12.5px;color:var(--fg-1);
+  cursor:pointer;text-decoration:none;font-weight:inherit;
+  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease);
 }
+.bal-pill span{color:var(--fg-2);font-size:12px}
+.bal-pill:hover{background:rgba(74,222,128,.16);border-color:rgba(74,222,128,.35)}
 .bal-pill strong{color:var(--ok);font-weight:700;font-size:13.5px}
 .bal-pill::before{
   content:"";width:7px;height:7px;border-radius:50%;
   background:var(--ok);box-shadow:0 0 8px var(--ok);
 }
+/* 充值按钮 — 比 tabs 小,贴近余额胶囊 */
+.topup-btn{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:6px 12px;border-radius:var(--r-full);
+  background:linear-gradient(135deg,rgba(217,119,87,.18),rgba(217,119,87,.08));
+  border:1px solid rgba(217,119,87,.28);
+  color:var(--brand-300);font-size:12.5px;font-weight:600;
+  cursor:pointer;text-decoration:none;
+  transition:background var(--dur) var(--ease),transform var(--dur) var(--ease);
+}
+.topup-btn:hover{
+  background:linear-gradient(135deg,rgba(217,119,87,.28),rgba(217,119,87,.12));
+  transform:translateY(-1px);
+}
+.topup-btn.on{
+  background:linear-gradient(135deg,rgba(217,119,87,.32),rgba(217,119,87,.18));
+  box-shadow:inset 0 0 0 1px rgba(217,119,87,.5);
+}
 .me-email{font-size:12.5px;color:var(--fg-2);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .main{flex:1;overflow:auto}
 
 @media (max-width:640px){
-  .topbar{padding:10px 12px;gap:10px;flex-wrap:wrap}
+  .topbar{padding:10px 12px;gap:8px;flex-wrap:wrap}
   .me-email{display:none}
   .tabs button,.tabs a{padding:6px 10px;font-size:12.5px}
+  .topup-btn{padding:6px 10px;font-size:12px}
+  .bal-pill{padding:6px 10px;font-size:12px}
 }
 
 /* ── Chat 视图 ─────────────────────────── */
@@ -761,19 +785,19 @@ code{font-family:var(--font-mono);font-size:.88em;background:rgba(255,255,255,.0
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M4 5 L20 5 L20 17 L13 17 L8 21 L8 17 L4 17 Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
         对话
       </button>
-      <button data-tab="topup">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M3 10 L21 10 M5 6 L19 6 A2 2 0 0 1 21 8 L21 18 A2 2 0 0 1 19 20 L5 20 A2 2 0 0 1 3 18 L3 8 A2 2 0 0 1 5 6 Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
-        充值
-      </button>
       <a href="/agent.html">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M7 9 L10 12 L7 15 M13 16 L17 16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
         Agent
       </a>
     </div>
     <div class="grow"></div>
-    <div class="bal-pill" title="可用积分余额">
-      <span>余额</span><strong id="bal-credits">—</strong><span>积分</span>
-    </div>
+    <button class="bal-pill" id="bal-pill" title="点击前往充值">
+      <span>余额</span><strong id="bal-credits">—</strong>
+    </button>
+    <button class="topup-btn" id="topup-btn" title="充值">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 5 L12 19 M5 12 L19 12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+      充值
+    </button>
     <div class="me-email" id="me-email"></div>
     <button id="logout-btn" class="ghost" title="登出">登出</button>
   </header>
@@ -800,6 +824,14 @@ const REFRESH_SKEW_SEC = 60;
 // ═════════════════════════════════════════════════════════════════
 
 const $ = (id) => document.getElementById(id);
+
+/** 后端 credits 单位 = 分(1 积分 = 100 分 = ¥1)。统一渲染为 "¥X.XX"。 */
+function fmtYuan(credits) {
+  if (credits === null || credits === undefined) return "—";
+  const n = Number(credits);
+  if (!Number.isFinite(n)) return "—";
+  return "¥" + (n / 100).toFixed(2);
+}
 
 /** 创建 DOM 元素;child 里的字符串一律走 createTextNode,不做 innerHTML,XSS 面最小化。 */
 function el(tag, props, children) {
@@ -1049,7 +1081,7 @@ async function refreshMe() {
     const r = await api("/api/me");
     const u = r.user ?? r; // 容错两种 shape
     $("me-email").textContent = u.email ?? "";
-    $("bal-credits").textContent = u.credits ?? "?";
+    $("bal-credits").textContent = fmtYuan(u.credits);
     localStorage.setItem(USER_KEY, JSON.stringify(u));
   } catch (e) {
     if (e.code !== "NOT_AUTHENTICATED") toast("加载个人资料失败: " + e.message, "err");
@@ -1063,6 +1095,9 @@ function switchTab(name) {
   for (const b of document.querySelectorAll(".tabs button")) {
     b.classList.toggle("on", b.dataset.tab === name);
   }
+  // 充值按钮独立于 .tabs,topup 激活时高亮
+  const topupBtn = $("topup-btn");
+  if (topupBtn) topupBtn.classList.toggle("on", name === "topup");
   const body = $("tab-body");
   body.innerHTML = "";
   if (name === "chat") renderChat(body);
@@ -1182,7 +1217,7 @@ function renderBubble(role, text, meta) {
   if (meta) {
     const foot = el("div", { class: "msg-foot" });
     if (meta.usage) foot.appendChild(el("span", {}, `in ${meta.usage.input_tokens} · out ${meta.usage.output_tokens}`));
-    if (meta.debit) foot.appendChild(el("span", {}, `扣费 ${meta.debit.cost_credits} 积分`));
+    if (meta.debit) foot.appendChild(el("span", {}, `扣费 ${fmtYuan(meta.debit.cost_credits)}`));
     b.appendChild(foot);
   }
   row.appendChild(avatar);
@@ -1281,14 +1316,14 @@ function handleWsFrame(raw) {
       foot.appendChild(el("span", {}, `in ${frame.input_tokens} · out ${frame.output_tokens}`));
     }
   } else if (frame.type === "debit") {
-    $("bal-credits").textContent = frame.balance_after;
+    $("bal-credits").textContent = fmtYuan(frame.balance_after);
     if (chatState.streamingMsg) {
       let foot = chatState.streamingMsg.querySelector(".msg-foot");
       if (!foot) {
         foot = el("div", { class: "msg-foot" });
         chatState.streamingMsg.appendChild(foot);
       }
-      foot.appendChild(el("span", { class: "ok" }, `-${frame.cost_credits} 积分`));
+      foot.appendChild(el("span", { class: "ok" }, `-${fmtYuan(frame.cost_credits)}`));
     }
   } else if (frame.type === "done") {
     if (chatState.streamingText) {
@@ -1469,6 +1504,9 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const b of document.querySelectorAll(".tabs button")) {
     b.onclick = () => switchTab(b.dataset.tab);
   }
+  // 充值入口:右上角按钮 + 余额胶囊点击,都跳到 topup tab
+  $("topup-btn").onclick = () => switchTab("topup");
+  $("bal-pill").onclick = () => switchTab("topup");
   renderAuth();
   if (localStorage.getItem(TOKEN_KEY)) enterApp();
   // 必须在 enterApp 之后跑(toast 容器要存在)
