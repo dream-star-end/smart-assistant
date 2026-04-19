@@ -39,7 +39,8 @@ export type LoginInput = z.infer<typeof loginInputSchema>;
 export type LoginErrorCode =
   | "VALIDATION"
   | "TURNSTILE_FAILED"
-  | "INVALID_CREDENTIALS";
+  | "INVALID_CREDENTIALS"
+  | "EMAIL_NOT_VERIFIED";
 
 export class LoginError extends Error {
   readonly code: LoginErrorCode;
@@ -104,6 +105,12 @@ export interface LoginDeps {
   /** 测试可注入 access TTL */
   accessTtlSeconds?: number;
   refreshTtlSeconds?: number;
+  /**
+   * T-12.1:开启后,email_verified=false 的用户不允许 login,
+   * 会抛 EMAIL_NOT_VERIFIED。默认 false(向后兼容现有测试,
+   * 测试普遍 register 后立即 login 不验证邮箱)。生产 env REQUIRE_EMAIL_VERIFIED=1 打开。
+   */
+  requireEmailVerified?: boolean;
 }
 
 /**
@@ -188,6 +195,13 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
   }
 
   const user = userRow.rows[0];
+
+  // 4.5) email_verified gate(opt-in,生产 env REQUIRE_EMAIL_VERIFIED=1)
+  // 故意放在 password 校验**之后**,避免暴露 "邮箱存在 + 密码对" 给攻击者
+  // (没密码进不来,所以不算枚举泄漏)。
+  if (deps.requireEmailVerified === true && !user.email_verified) {
+    throw new LoginError("EMAIL_NOT_VERIFIED", "email not verified");
+  }
 
   // 5) 签发 access + refresh
   const issueNow = nowSec(deps);

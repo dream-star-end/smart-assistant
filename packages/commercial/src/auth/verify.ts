@@ -24,7 +24,7 @@ import { z } from "zod";
 import { createHash } from "node:crypto";
 import { tx, query } from "../db/queries.js";
 import { hashPassword } from "./passwords.js";
-import { newVerifyToken } from "./register.js";
+import { newVerifyToken, VERIFY_EMAIL_TTL_SECONDS } from "./register.js";
 import type { Mailer } from "./mail.js";
 
 /** 密码重置 token TTL:1 小时(短于 verify_email)05-SEC §15 */
@@ -194,6 +194,74 @@ export async function requestPasswordReset(
     });
   } catch {
     // 邮件失败不影响 accepted 语义 —— 用户可重新申请
+  }
+
+  return { accepted: true };
+}
+
+// ─── resendVerification ───────────────────────────────────────────────
+
+export interface ResendVerifyDeps extends CommonDeps {
+  mailer: Mailer;
+  /** 邮件中验证链接的 base url(部署时 https://claudeai.chat) */
+  verifyEmailUrlBase?: string;
+}
+
+export interface ResendVerifyResult {
+  /** 总是 true:防枚举,接口语义上一律视为"已受理" */
+  accepted: true;
+}
+
+/**
+ * 重发邮箱验证邮件。
+ *
+ * 防枚举(05-SEC §15):
+ *   - email 格式错 → accepted=true
+ *   - 用户不存在 / 已 deleted → accepted=true(不发邮件)
+ *   - 用户已验证 → accepted=true(不发邮件,避免被滥用骚扰已验证用户)
+ *   - 仅当用户存在且未验证时才真的写新 token + 发邮件
+ *
+ * 不消费旧 token —— 旧 token 若仍有效用户也能用(简化重发幂等性)。
+ * 速率限制由调用方(handler)套 IP/email 维度。
+ */
+export async function resendVerification(
+  rawEmail: string,
+  deps: ResendVerifyDeps,
+): Promise<ResendVerifyResult> {
+  const parsed = emailSchema.safeParse(rawEmail);
+  if (!parsed.success) return { accepted: true };
+  const email = parsed.data;
+
+  const userRow = await query<{ id: string; email_verified: boolean }>(
+    "SELECT id::text AS id, email_verified FROM users WHERE email = $1 AND status != 'deleted'",
+    [email],
+  );
+  if (userRow.rows.length === 0 || userRow.rows[0].email_verified) {
+    return { accepted: true };
+  }
+  const userId = userRow.rows[0].id;
+
+  const verify = newVerifyToken();
+  const ts = nowSec(deps);
+  const expiresIso = new Date((ts + VERIFY_EMAIL_TTL_SECONDS) * 1000).toISOString();
+
+  await query(
+    `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
+     VALUES ($1, $2, 'verify_email', $3)`,
+    [userId, verify.hash, expiresIso],
+  );
+
+  const url = `${(deps.verifyEmailUrlBase ?? "").replace(/\/$/, "")}/verify-email?token=${verify.raw}`;
+  try {
+    await deps.mailer.send({
+      to: email,
+      subject: "[OpenClaude] 验证你的邮箱(重发)",
+      text:
+        `Hi,\n\n请点击以下链接完成邮箱验证(24 小时内有效):\n\n${url}\n\n` +
+        `如果这不是你本人操作,忽略此邮件即可。`,
+    });
+  } catch {
+    // 邮件失败不影响 accepted 语义 —— 用户可重试
   }
 
   return { accepted: true };

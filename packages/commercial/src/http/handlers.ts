@@ -14,7 +14,7 @@ import {
   userAgentOf,
 } from "./util.js";
 import { register, RegisterError } from "../auth/register.js";
-import { verifyEmail, requestPasswordReset, confirmPasswordReset, VerifyError } from "../auth/verify.js";
+import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
 import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.js";
 import { requireAuth } from "./auth.js";
 import { query } from "../db/queries.js";
@@ -63,8 +63,11 @@ export interface CommercialHttpDeps {
     register: RateLimitConfig;
     login: RateLimitConfig;
     requestReset: RateLimitConfig;
+    resendVerify: RateLimitConfig;
     hupiCreate: RateLimitConfig;
   }>;
+  /** T-12.1:开启后,login 强制要求 email_verified=true */
+  requireEmailVerified?: boolean;
   /**
    * T-53: Agent 运行时(docker + image + network + seccomp + proxy + rpc dir)。
    * 未注入时 `/api/agent/open` 返 503(仍允许 /status 查看过去订阅)。
@@ -82,6 +85,7 @@ export const DEFAULT_RATE_LIMITS = {
   register: { scope: "register", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
   login: { scope: "login", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
   requestReset: { scope: "request_reset", windowSeconds: 60, max: 3 } satisfies RateLimitConfig,
+  resendVerify: { scope: "resend_verify", windowSeconds: 60, max: 3 } satisfies RateLimitConfig,
   // 04-API §8:同用户 10 次 / 1h
   hupiCreate: { scope: "hupi_create", windowSeconds: 3600, max: 10 } satisfies RateLimitConfig,
 };
@@ -164,6 +168,7 @@ export async function handleLogin(
       fetchImpl: deps.fetchImpl,
       remoteIp: ctx.clientIp,
       userAgent: ctx.userAgent ?? undefined,
+      requireEmailVerified: deps.requireEmailVerified,
     });
     sendJson(res, 200, {
       user: result.user,
@@ -178,12 +183,36 @@ export async function handleLogin(
         VALIDATION: { status: 400 },
         TURNSTILE_FAILED: { status: 400 },
         INVALID_CREDENTIALS: { status: 401 },
+        EMAIL_NOT_VERIFIED: { status: 403 },
       };
       const m = map[err.code];
       throw new HttpError(m.status, err.code, err.message, { issues: err.issues });
     }
     throw err;
   }
+}
+
+// ─── POST /api/auth/resend-verification ─────────────────────────────
+
+export async function handleResendVerification(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const cfg = deps.rateLimits?.resendVerify ?? DEFAULT_RATE_LIMITS.resendVerify;
+  await enforceRateLimit(deps, cfg, ctx.clientIp);
+
+  const body = (await readJsonBody(req)) as { email?: unknown } | undefined;
+  const email = body && typeof (body as Record<string, unknown>).email === "string"
+    ? (body as { email: string }).email
+    : "";
+  // 防枚举:即使 email 缺失也走 resendVerification(它会 accept=true)
+  const r = await resendVerification(email, {
+    mailer: deps.mailer,
+    verifyEmailUrlBase: deps.verifyEmailUrlBase,
+  });
+  sendJson(res, 200, { accepted: r.accepted });
 }
 
 // ─── POST /api/auth/refresh ─────────────────────────────────────────

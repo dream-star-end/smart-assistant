@@ -180,6 +180,8 @@ export const commercialConfigSchema = z
     COMMERCIAL_ENABLED: enabledFlag,
     TURNSTILE_SECRET: turnstileSecret,
     TURNSTILE_TEST_BYPASS: turnstileBypass,
+    /** 1 → 强制 email_verified=true 才能登录 */
+    REQUIRE_EMAIL_VERIFIED: z.enum(["0", "1"]).optional().transform((v) => v === "1"),
     HUPIJIAO_APP_ID: hupiAppId,
     HUPIJIAO_APP_SECRET: hupiAppSecret,
     HUPIJIAO_CALLBACK_URL: hupiCallbackUrl,
