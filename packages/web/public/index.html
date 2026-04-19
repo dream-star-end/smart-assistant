@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=20" />
+<link rel="stylesheet" href="/style.css?v=21" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -202,8 +202,17 @@
             <button type="button" class="mode-pill matrix-btn" data-matrix="sweep" title="插入参数扫描表模板,让 agent 在不同参数取值下重算并填表">
               <span>参数扫描</span>
             </button>
-            <button type="button" class="mode-pill matrix-btn" data-matrix="check" title="请求 agent 对上一个回答里的公式与数字做一遍自检(量纲、范围、单位)">
+            <button type="button" class="mode-pill matrix-btn" data-matrix="check" title="【公式层自检】对上一回答里的公式做量纲/极限/来源四项核对,输出「已检查,无误」或修正后版本。聚焦推导正确性。">
               <span>公式自检</span>
+            </button>
+          </div>
+          <div class="research-tools-row">
+            <span class="research-tools-label">校验</span>
+            <button type="button" class="mode-pill check-btn" data-check="cite" title="【引用清单核查】列出上一回答里的所有引用/数字/事实性断言,标注 DOI/arXiv/年份和「已核实/待核实/凭印象」三档可信度。聚焦来源可靠性。">
+              <span>引用核查</span>
+            </button>
+            <button type="button" class="mode-pill check-btn" data-check="units" title="【全文单位扫查】对上一回答里的每个数字逐条列表核查单位、量级、混用、换算。聚焦单位一致性(比公式自检更细,不做推导)。">
+              <span>单位扫查</span>
             </button>
           </div>
         </div>
@@ -650,6 +659,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=20"></script>
+<script type="module" src="/modules/main.js?v=21"></script>
 </body>
 </html>

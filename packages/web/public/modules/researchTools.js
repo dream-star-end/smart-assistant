@@ -159,6 +159,56 @@ function insertMatrixTemplate(kind) {
   ta.setSelectionRange(ta.value.length, ta.value.length)
 }
 
+// ── 校验模板文案 ──
+//
+// 校验类模板的共性:针对**上一个回答**做一次事后扫查,让 agent 逐条核对,
+// 把可能遗漏的地方(引用来源、单位)补齐。与「公式自检」不同,校验不做
+// 数值推导,只做"清单 + 判定",便于用户把结果直接复制进论文或报告。
+const CHECK_TEMPLATES = {
+  cite: [
+    '请对你上一个回答里出现的**所有引用、数字、事实性断言**,做一次引用核查,',
+    '按下表列出,不要合并同类项(宁可重复,也别漏):',
+    '',
+    '| # | 断言/数字 | 出处 | DOI/arXiv/URL | 年份 | 可信度 |',
+    '| --- | --- | --- | --- | --- | --- |',
+    '|  |  |  |  |  |  |',
+    '',
+    '**可信度**取三档:',
+    '- **已核实**:原文献名/DOI/arXiv ID 都能对上,且数字与原文一致',
+    '- **待核实**:大致来源方向清楚(某团队/某期刊/某综述),但具体文献没记准',
+    '- **凭印象**:属于业内常识性估算或未标明来源,需要用户自己查证',
+    '',
+    '核查后如果发现**某个具体数字与文献对不上**,直接在表下指出并给出更可靠的数值区间。',
+  ].join('\n'),
+  units: [
+    '请对你上一个回答里出现的**每一个数字**做一次单位扫查,按下表列出:',
+    '',
+    '| # | 数字及上下文 | 当前单位 | 合理范围/量级 | 是否一致 |',
+    '| --- | --- | --- | --- | --- |',
+    '|  |  |  |  |  |',
+    '',
+    '重点检查:',
+    '1. **是否带单位**:纯数字而上下文又是物理/工程量的,补上单位(或标"[无量纲]")',
+    '2. **混用**:同类物理量在一段里是否混用了 ps/ns、mm/μm、° /rad、km/m 等',
+    '3. **量级**:数值与单位相乘得到的物理量级是否落在合理区间;不合理时指出并给修正',
+    '4. **换算一致**:若同一量在不同地方以不同单位出现,换算是否自洽',
+    '',
+    '如果某个数字漏单位或单位错,直接给出修正后的写法。',
+  ].join('\n'),
+}
+
+function insertCheckTemplate(kind) {
+  const text = CHECK_TEMPLATES[kind]
+  if (!text) return
+  const ta = /** @type {HTMLTextAreaElement|null} */ ($('input'))
+  if (!ta) return
+  const existing = ta.value.trim()
+  ta.value = existing ? `${existing}\n\n${text}` : text
+  ta.focus()
+  ta.dispatchEvent(new Event('input', { bubbles: true }))
+  ta.setSelectionRange(ta.value.length, ta.value.length)
+}
+
 // ── 浓缩模板文案 ──
 const CONDENSE_TEMPLATES = {
   onepage: [
@@ -258,6 +308,12 @@ export function initResearchTools() {
     if (matrixBtn && wrap.contains(matrixBtn)) {
       const kind = matrixBtn.dataset.matrix ?? ''
       insertMatrixTemplate(kind)
+      return
+    }
+    const checkBtn = target.closest('.check-btn')
+    if (checkBtn && wrap.contains(checkBtn)) {
+      const kind = checkBtn.dataset.check ?? ''
+      insertCheckTemplate(kind)
     }
   })
   // effort pill 被点击后 effortMode.setCurrentEffort 会调 renderModePills,
