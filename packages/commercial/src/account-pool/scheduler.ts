@@ -52,6 +52,8 @@ export interface PickResult {
   /** 解密后的 refresh token(可能为 null)—— **调用方用完必须 .fill(0)** */
   refresh: Buffer | null;
   expires_at: Date | null;
+  /** 该账号专属出口代理(明文 URL,内含密码);null 表示走本机出口 */
+  egress_proxy: string | null;
 }
 
 export type ReleaseResult =
@@ -212,6 +214,7 @@ export class AccountScheduler {
             token: tok.token,
             refresh: tok.refresh,
             expires_at: tok.expires_at,
+            egress_proxy: tok.egress_proxy,
           };
         }
         // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选

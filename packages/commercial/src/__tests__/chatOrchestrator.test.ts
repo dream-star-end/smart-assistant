@@ -55,6 +55,7 @@ function mkScheduler(
       token: Buffer;
       refresh: Buffer | null;
       expires_at: Date | null;
+      egress_proxy?: string | null;
     };
     pickError: Error;
   }> = {},
@@ -65,13 +66,16 @@ function mkScheduler(
     async pick(input) {
       picks.push(input);
       if (overrides.pickError) throw overrides.pickError;
-      if (overrides.pickResult) return overrides.pickResult;
+      if (overrides.pickResult) {
+        return { egress_proxy: null, ...overrides.pickResult };
+      }
       return {
         account_id: 42n,
         plan: "pro",
         token: Buffer.from("tok-abc", "utf8"),
         refresh: Buffer.from("ref-xyz", "utf8"),
         expires_at: new Date(Date.now() + 60 * 60 * 1000), // 1h future → 不触发 refresh
+        egress_proxy: null,
       };
     },
     async release(input) {

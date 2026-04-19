@@ -67,6 +67,11 @@ export interface RefreshHttpClient {
     url: string,
     headers: Record<string, string>,
     body: string,
+    /**
+     * 可选 undici Dispatcher(常为 ProxyAgent),按账号粒度指定出口。
+     * 默认实现透传给 fetch 的 dispatcher 字段(undici 实现 / Node 18+)。
+     */
+    dispatcher?: unknown,
   ): Promise<{ status: number; body: string }>;
 }
 
@@ -92,6 +97,11 @@ export interface RefreshDeps {
    * 否则降级为直接 UPDATE status='disabled'(避开 health 依赖)。
    */
   health?: AccountHealthTracker;
+  /**
+   * 出口 dispatcher(undici ProxyAgent 等)。给则刷 token 也走该代理,
+   * 否则走默认出口。chat orchestrator 应该按账号 egress_proxy 构造后透传进来。
+   */
+  dispatcher?: unknown;
 }
 
 /**
@@ -113,8 +123,14 @@ export function shouldRefresh(
 
 /** 基于全局 fetch 的默认实现。生产走 globalThis.fetch。 */
 export const defaultHttp: RefreshHttpClient = {
-  async post(url, headers, body) {
-    const res = await fetch(url, { method: "POST", headers, body });
+  async post(url, headers, body, dispatcher) {
+    const init: RequestInit & { dispatcher?: unknown } = {
+      method: "POST",
+      headers,
+      body,
+    };
+    if (dispatcher) init.dispatcher = dispatcher;
+    const res = await fetch(url, init);
     const text = await res.text();
     return { status: res.status, body: text };
   },
@@ -214,6 +230,7 @@ export async function refreshAccountToken(
         Accept: "application/json",
       },
       form.toString(),
+      deps.dispatcher,
     );
   } catch (err) {
     await disableOnFailure(deps, accountId, "refresh_network_error");

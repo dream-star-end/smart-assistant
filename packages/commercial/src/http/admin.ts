@@ -49,6 +49,7 @@ import {
   adminCreateAccount,
   adminPatchAccount,
   adminDeleteAccount,
+  maskEgressProxy,
   type AdminCreateAccountInput,
   type AdminPatchAccountInput,
 } from "../admin/accounts.js";
@@ -554,6 +555,9 @@ function serializeAccount(a: AccountRow): Record<string, unknown> {
     success_count: a.success_count.toString(),
     fail_count: a.fail_count.toString(),
     quota_remaining: a.quota_remaining,
+    /** 已 mask 密码,UI 安全显示;明文绝不出库 */
+    egress_proxy: maskEgressProxy(a.egress_proxy),
+    has_egress_proxy: a.egress_proxy !== null,
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };
@@ -668,6 +672,16 @@ export async function handleAdminCreateAccount(
     }
     input.oauth_expires_at = b.oauth_expires_at as string | null;
   }
+  if (b.egress_proxy !== undefined) {
+    if (b.egress_proxy !== null && typeof b.egress_proxy !== "string") {
+      throw new HttpError(400, "VALIDATION", "egress_proxy must be string or null");
+    }
+    // 空串视作 null(便于前端表单清空)
+    input.egress_proxy =
+      typeof b.egress_proxy === "string" && b.egress_proxy.trim().length === 0
+        ? null
+        : (b.egress_proxy as string | null);
+  }
 
   try {
     const a = await adminCreateAccount(input, {
@@ -726,6 +740,15 @@ export async function handleAdminPatchAccount(
       throw new HttpError(400, "VALIDATION", "oauth_expires_at must be ISO string or null");
     }
     patch.oauth_expires_at = b.oauth_expires_at as string | null;
+  }
+  if (b.egress_proxy !== undefined) {
+    if (b.egress_proxy !== null && typeof b.egress_proxy !== "string") {
+      throw new HttpError(400, "VALIDATION", "egress_proxy must be string or null");
+    }
+    patch.egress_proxy =
+      typeof b.egress_proxy === "string" && b.egress_proxy.trim().length === 0
+        ? null
+        : (b.egress_proxy as string | null);
   }
 
   try {

@@ -58,6 +58,7 @@ import {
 import type { AccountPlan } from "../account-pool/store.js";
 import type { TokenUsage } from "../billing/calculator.js";
 import { AeadError } from "../crypto/aead.js";
+import { ProxyAgent } from "undici";
 
 export const ERR_ACCOUNT_POOL_UNAVAILABLE = "ERR_ACCOUNT_POOL_UNAVAILABLE";
 export const ERR_REFRESH_FAILED = "ERR_REFRESH_FAILED";
@@ -129,6 +130,22 @@ interface AccountHandle {
   account_id: bigint;
   plan: AccountPlan;
   token: Buffer;
+  /** 该账号专属出口代理 URL(明文,内含密码);null = 走本机出口 */
+  egress_proxy: string | null;
+}
+
+/**
+ * 按 egress_proxy URL 构造 undici ProxyAgent。null 输入返 null —— 调用方据此
+ * 决定是否给 fetchInit 加 dispatcher 字段(给了 null 也会被 undici 当成"取消默认 dispatcher"
+ * 而失败,所以宁可不加字段)。
+ *
+ * 每次 chat 调用单独 new + finally close —— 避免长寿 socket 被多账号串用,
+ * 也避免一个账号的代理凭据轮换后,旧 dispatcher 仍在 keep-alive 池里复用旧 IP。
+ * 高频场景下未来可改为按 (proxyUrl) 缓存,目前个位数账号无需。
+ */
+function buildDispatcher(egressProxy: string | null): ProxyAgent | null {
+  if (!egressProxy) return null;
+  return new ProxyAgent(egressProxy);
 }
 
 /**
@@ -263,6 +280,7 @@ export async function* runClaudeChat(
       account_id: picked.account_id,
       plan: picked.plan,
       token: picked.token,
+      egress_proxy: picked.egress_proxy,
     };
     refreshBuffer = picked.refresh;
     expiresAt = picked.expires_at;
@@ -270,6 +288,7 @@ export async function* runClaudeChat(
       userId: String(input.userId),
       account_id: String(picked.account_id),
       plan: picked.plan,
+      egress_proxied: picked.egress_proxy !== null,
     });
   } catch (err) {
     if (err instanceof AccountPoolUnavailableError) {
@@ -344,13 +363,27 @@ export async function* runClaudeChat(
     }
   };
 
+  // 构造该账号的出口 dispatcher(如配)。proxy/refresh 共用同一个,finally 统一关。
+  const dispatcher = buildDispatcher(handle.egress_proxy);
+  const proxyDepsForCall: ProxyDeps = dispatcher
+    ? { ...(deps.proxyDeps ?? {}), dispatcher }
+    : (deps.proxyDeps ?? {});
+  const refreshDepsForCall: Omit<RefreshDeps, "health"> = dispatcher
+    ? { ...(deps.refreshDeps ?? {}), dispatcher }
+    : (deps.refreshDeps ?? {});
+  const closeDispatcher = async (): Promise<void> => {
+    if (!dispatcher) return;
+    try { await dispatcher.close(); }
+    catch (err) { logger?.warn("chat.dispatcher.close_failed", { error: String(err) }); }
+  };
+
   try {
     if (shouldRefresh(expiresAt, now(), skew)) {
       logger?.info("chat.refresh.preemptive", {
         account_id: String(handle.account_id),
         expires_at: expiresAt?.toISOString() ?? null,
       });
-      const rfOk = await tryRefresh(handle, refreshFn, deps.refreshDeps);
+      const rfOk = await tryRefresh(handle, refreshFn, refreshDepsForCall);
       if (!rfOk.ok) {
         // refresh 失败:refreshAccountToken 内部已 disable 账号,这里只需报错 + release
         await release("failure", `refresh failed: ${rfOk.code}`);
@@ -368,7 +401,7 @@ export async function* runClaudeChat(
     yield { type: "meta", account_id: handle.account_id, plan: handle.plan };
 
     // 3) stream(含 401 重试一次)
-    const stream1 = streamAttempt(streamFn, handle.token, claudeBody, deps.proxyDeps, input.signal);
+    const stream1 = streamAttempt(streamFn, handle.token, claudeBody, proxyDepsForCall, input.signal);
     let usage = emptyUsage();
     let stopReason: string | null = null;
     let gotAuthError = false;
@@ -409,7 +442,7 @@ export async function* runClaudeChat(
     if (gotAuthError) {
       // 401 → refresh + retry 一次
       logger?.info("chat.auth_error.refresh_retry", { account_id: String(handle.account_id) });
-      const rfOk = await tryRefresh(handle, refreshFn, deps.refreshDeps);
+      const rfOk = await tryRefresh(handle, refreshFn, refreshDepsForCall);
       if (!rfOk.ok) {
         await release("failure", `refresh_after_401: ${rfOk.code}`);
         cleanupBuffers();
@@ -423,7 +456,7 @@ export async function* runClaudeChat(
 
       usage = emptyUsage();
       stopReason = null;
-      const stream2 = streamAttempt(streamFn, handle.token, claudeBody, deps.proxyDeps, input.signal);
+      const stream2 = streamAttempt(streamFn, handle.token, claudeBody, proxyDepsForCall, input.signal);
       try {
         for await (const ev of stream2) {
           const text = extractDeltaText(ev);
@@ -470,6 +503,7 @@ export async function* runClaudeChat(
     await release("success");
   } finally {
     cleanupBuffers();
+    await closeDispatcher();
   }
 }
 

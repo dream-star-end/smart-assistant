@@ -477,6 +477,7 @@ TABS.accounts = async () => {
         { h: "health", k: "health_score" },
         { h: "success", k: "success_count" },
         { h: "fail", k: "fail_count" },
+        { h: "出口代理", render: (a) => el("span", { class: a.has_egress_proxy ? "badge" : "muted" }, a.has_egress_proxy ? a.egress_proxy : "本机") },
         { h: "last_used", render: (a) => fmtDate(a.last_used_at) },
         {
           h: "操作", render: (a) => {
@@ -514,10 +515,12 @@ function newAccount(onDone) {
     { name: "oauth_token", label: "access token(明文,加密入库后永不返回)" },
     { name: "oauth_refresh_token", label: "refresh token(可选)" },
     { name: "oauth_expires_at", label: "expires_at (ISO,可选)", placeholder: "2026-12-31T00:00:00Z" },
+    { name: "egress_proxy", label: "出口代理(可选,http://user:pass@host:port)", placeholder: "http://user:pass@1.2.3.4:8080" },
   ], async (v) => {
     const body = { label: v.label, plan: v.plan, oauth_token: v.oauth_token };
     if (v.oauth_refresh_token) body.oauth_refresh_token = v.oauth_refresh_token;
     if (v.oauth_expires_at) body.oauth_expires_at = v.oauth_expires_at;
+    if (v.egress_proxy) body.egress_proxy = v.egress_proxy;
     await api("/api/admin/accounts", { method: "POST", body });
     showStatus("账号已新增");
     onDone();
@@ -528,12 +531,19 @@ function editAccount(a, onDone) {
     { name: "label", label: "label", value: a.label },
     { name: "status", label: "status", type: "select", options: ["active", "cooldown", "disabled", "banned"], value: a.status },
     { name: "health_score", label: "health_score (0-100)", value: String(a.health_score) },
+    {
+      name: "egress_proxy",
+      label: "出口代理(留空=不改;填 __clear__ 清除走本机出口;否则覆盖)",
+      placeholder: a.egress_proxy || "(未设置)",
+    },
   ], async (v) => {
     const patch = {};
     if (v.label && v.label !== a.label) patch.label = v.label;
     if (v.status !== a.status) patch.status = v.status;
     const hs = Number(v.health_score);
     if (Number.isInteger(hs) && hs !== a.health_score) patch.health_score = hs;
+    if (v.egress_proxy === "__clear__") patch.egress_proxy = null;
+    else if (v.egress_proxy && v.egress_proxy !== a.egress_proxy) patch.egress_proxy = v.egress_proxy;
     await api(`/api/admin/accounts/${a.id}`, { method: "PATCH", body: patch });
     showStatus("已更新"); onDone();
   });

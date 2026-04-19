@@ -94,6 +94,12 @@ export interface ProxyDeps {
   anthropicBeta?: string;
   /** SSE 解析 buffer 字符上限;默认 1MB。超限 → cancel + ProxyError */
   maxBufferBytes?: number;
+  /**
+   * undici Dispatcher(常见为 ProxyAgent),按账号粒度路由出站请求。
+   * 不给 → 走默认 dispatcher(本机出口)。fetch 的 RequestInit 接受 dispatcher
+   * 字段(undici fetch 实现 / Node 18+),不在标准 lib.dom 类型里,这里 any 透传。
+   */
+  dispatcher?: unknown;
 }
 
 /**
@@ -174,12 +180,14 @@ export async function* streamClaude(
   if (deps.anthropicBeta) headers["anthropic-beta"] = deps.anthropicBeta;
 
   const reqBody = JSON.stringify({ ...input.body, stream: true });
-  const res = await fetchFn(endpoint, {
+  const fetchInit: RequestInit & { dispatcher?: unknown } = {
     method: "POST",
     headers,
     body: reqBody,
     signal: input.signal,
-  });
+  };
+  if (deps.dispatcher) fetchInit.dispatcher = deps.dispatcher;
+  const res = await fetchFn(endpoint, fetchInit);
 
   if (res.status === 401) {
     throw new ProxyAuthError(await safeReadText(res));

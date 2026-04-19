@@ -49,6 +49,12 @@ export interface AccountRow {
   success_count: bigint;
   fail_count: bigint;
   quota_remaining: number | null;
+  /**
+   * 出口代理 URL,形如 `http://user:pass@host:port`。
+   * NULL = 走本机出口(默认/旧账号兼容)。
+   * 由 chat orchestrator 构造 undici ProxyAgent 注入到 fetch dispatcher。
+   */
+  egress_proxy: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -68,6 +74,8 @@ export interface AccountToken {
   token: Buffer;
   refresh: Buffer | null;
   expires_at: Date | null;
+  /** 出口代理(明文 URL,内含密码) —— 仅在调用 fetch 时构造 dispatcher 用。 */
+  egress_proxy: string | null;
 }
 
 export interface CreateAccountInput {
@@ -76,6 +84,7 @@ export interface CreateAccountInput {
   token: string;
   refresh?: string | null;
   expires_at?: Date | null;
+  egress_proxy?: string | null;
 }
 
 /**
@@ -102,6 +111,10 @@ export interface UpdateAccountPatch {
   oauth_expires_at?: Date | null;
   token?: string;
   refresh?: string | null;
+  /**
+   * undefined = 不变;null = 清空(走本机出口);string = 设/换代理 URL。
+   */
+  egress_proxy?: string | null;
 }
 
 export class AccountNotFoundError extends Error {
@@ -128,6 +141,7 @@ const META_COLUMNS = `
   success_count::text AS success_count,
   fail_count::text AS fail_count,
   quota_remaining,
+  egress_proxy,
   created_at,
   updated_at
 `;
@@ -145,6 +159,7 @@ interface RawMetaRow extends QueryResultRow {
   success_count: string;
   fail_count: string;
   quota_remaining: number | null;
+  egress_proxy: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -157,6 +172,7 @@ interface RawSecretRow extends QueryResultRow {
   oauth_refresh_enc: Buffer | null;
   oauth_refresh_nonce: Buffer | null;
   oauth_expires_at: Date | null;
+  egress_proxy: string | null;
 }
 
 function parseMetaRow(row: RawMetaRow): AccountRow {
@@ -173,9 +189,29 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     success_count: BigInt(row.success_count),
     fail_count: BigInt(row.fail_count),
     quota_remaining: row.quota_remaining,
+    egress_proxy: row.egress_proxy,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
+}
+
+/**
+ * 校验 egress_proxy URL 形态。允许 http(s) scheme,主机非空,端口可选(默认 80/443)。
+ * 不做联通性测试 —— 那是 admin 创建后人工/自动 health 检查的事。
+ */
+function validateEgressProxy(raw: string): void {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new TypeError(`egress_proxy is not a valid URL: ${raw}`);
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new TypeError(`egress_proxy must be http(s):// scheme, got ${u.protocol}`);
+  }
+  if (!u.hostname) {
+    throw new TypeError("egress_proxy missing host");
+  }
 }
 
 /**
@@ -208,14 +244,24 @@ export async function createAccount(
       refNonce = r.nonce;
     }
 
+    let egressProxy: string | null = null;
+    if (input.egress_proxy !== undefined && input.egress_proxy !== null) {
+      if (typeof input.egress_proxy !== "string" || input.egress_proxy.length === 0) {
+        throw new TypeError("egress_proxy must be non-empty string or null/undefined");
+      }
+      validateEgressProxy(input.egress_proxy);
+      egressProxy = input.egress_proxy;
+    }
+
     const res = await query<RawMetaRow>(
       `INSERT INTO claude_accounts(
          label, plan,
          oauth_token_enc, oauth_nonce,
          oauth_refresh_enc, oauth_refresh_nonce,
-         oauth_expires_at
+         oauth_expires_at,
+         egress_proxy
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING ${META_COLUMNS}`,
       [
         input.label,
@@ -225,6 +271,7 @@ export async function createAccount(
         refEnc,
         refNonce,
         input.expires_at ?? null,
+        egressProxy,
       ],
     );
     return parseMetaRow(res.rows[0]);
@@ -301,7 +348,8 @@ export async function getTokenForUse(
     `SELECT id::text AS id, plan,
        oauth_token_enc, oauth_nonce,
        oauth_refresh_enc, oauth_refresh_nonce,
-       oauth_expires_at
+       oauth_expires_at,
+       egress_proxy
      FROM claude_accounts WHERE id = $1`,
     [String(id)],
   );
@@ -322,6 +370,7 @@ export async function getTokenForUse(
       token,
       refresh,
       expires_at: row.oauth_expires_at,
+      egress_proxy: row.egress_proxy,
     };
     // 成功路径:token/refresh 交给调用方,不在 finally 清零
     token = null;
@@ -381,6 +430,17 @@ export async function updateAccount(
     push("health_score", patch.health_score);
   }
   if (patch.oauth_expires_at !== undefined) push("oauth_expires_at", patch.oauth_expires_at);
+  if (patch.egress_proxy !== undefined) {
+    if (patch.egress_proxy === null) {
+      push("egress_proxy", null);
+    } else {
+      if (typeof patch.egress_proxy !== "string" || patch.egress_proxy.length === 0) {
+        throw new TypeError("egress_proxy must be non-empty string or null");
+      }
+      validateEgressProxy(patch.egress_proxy);
+      push("egress_proxy", patch.egress_proxy);
+    }
+  }
 
   let key: Buffer | null = null;
   try {

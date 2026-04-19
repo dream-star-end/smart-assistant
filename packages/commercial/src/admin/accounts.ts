@@ -87,6 +87,24 @@ async function bestEffortAudit(
   }
 }
 
+/**
+ * 给 audit/UI 使用的代理 URL 脱敏:`http://user:****@host:port`。
+ * 完整密码绝不进 audit 表(legal/合规)。
+ */
+export function maskEgressProxy(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    const userInfo = u.username
+      ? `${u.username}${u.password ? ":****" : ""}@`
+      : "";
+    const port = u.port ? `:${u.port}` : "";
+    return `${u.protocol}//${userInfo}${u.hostname}${port}`;
+  } catch {
+    return "<invalid>";
+  }
+}
+
 /** AccountRow 序列化到 audit 安全子集:固定字段,永远不含密文/nonce。 */
 function snapshotForAudit(r: AccountRow): Record<string, unknown> {
   return {
@@ -95,6 +113,7 @@ function snapshotForAudit(r: AccountRow): Record<string, unknown> {
     plan: r.plan,
     status: r.status,
     health_score: r.health_score,
+    egress_proxy: maskEgressProxy(r.egress_proxy),
   };
 }
 
@@ -116,6 +135,16 @@ export interface AdminCreateAccountInput {
   oauth_token: string;
   oauth_refresh_token?: string | null;
   oauth_expires_at?: Date | string | null;
+  /** 出口代理 URL,如 `http://user:pass@host:port`。null/省略 = 走本机出口 */
+  egress_proxy?: string | null;
+}
+
+/** http(s)://[user:pass@]host[:port][/path] —— store.ts 的 validateEgressProxy 同样规则,这里前置 fail-fast */
+function validateEgressProxyOrThrow(raw: string): void {
+  let u: URL;
+  try { u = new URL(raw); } catch { throw new RangeError("invalid_egress_proxy"); }
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new RangeError("invalid_egress_proxy");
+  if (!u.hostname) throw new RangeError("invalid_egress_proxy");
 }
 
 export async function adminCreateAccount(
@@ -144,6 +173,14 @@ export async function adminCreateAccount(
   if (refresh !== null && (typeof refresh !== "string" || refresh.length === 0)) {
     throw new RangeError("invalid_oauth_refresh_token");
   }
+  let egressProxy: string | null = null;
+  if (input.egress_proxy !== undefined && input.egress_proxy !== null) {
+    if (typeof input.egress_proxy !== "string" || input.egress_proxy.length === 0) {
+      throw new RangeError("invalid_egress_proxy");
+    }
+    validateEgressProxyOrThrow(input.egress_proxy);
+    egressProxy = input.egress_proxy;
+  }
 
   const createInput: CreateAccountInput = {
     label: input.label.trim(),
@@ -151,6 +188,7 @@ export async function adminCreateAccount(
     token: input.oauth_token,
     refresh,
     expires_at: expiresAt,
+    egress_proxy: egressProxy,
   };
   const row = await storeCreate(createInput);
 
@@ -162,7 +200,7 @@ export async function adminCreateAccount(
     {
       ...snapshotForAudit(row),
       has_refresh_token: refresh !== null,
-      // 不记明文 token
+      // 不记明文 token / proxy 密码 —— snapshotForAudit 已 mask
     },
   );
   return row;
@@ -178,6 +216,8 @@ export interface AdminPatchAccountInput {
   oauth_token?: string;
   oauth_refresh_token?: string | null;
   oauth_expires_at?: Date | string | null;
+  /** undefined = 不动;null = 清空(走本机出口);string = 设/换代理 URL。 */
+  egress_proxy?: string | null;
 }
 
 export async function adminPatchAccount(
@@ -212,6 +252,12 @@ export async function adminPatchAccount(
       throw new RangeError("invalid_oauth_refresh_token");
     }
   }
+  if (patch.egress_proxy !== undefined && patch.egress_proxy !== null) {
+    if (typeof patch.egress_proxy !== "string" || patch.egress_proxy.length === 0) {
+      throw new RangeError("invalid_egress_proxy");
+    }
+    validateEgressProxyOrThrow(patch.egress_proxy);
+  }
   let expiresAt: Date | null | undefined = undefined;
   if (patch.oauth_expires_at !== undefined) {
     if (patch.oauth_expires_at === null) {
@@ -232,6 +278,7 @@ export async function adminPatchAccount(
     patch.health_score !== undefined ||
     patch.oauth_token !== undefined ||
     patch.oauth_refresh_token !== undefined ||
+    patch.egress_proxy !== undefined ||
     expiresAt !== undefined;
   if (!touched) {
     const cur = await storeGet(id);
@@ -249,6 +296,7 @@ export async function adminPatchAccount(
   if (patch.health_score !== undefined) storePatch.health_score = patch.health_score;
   if (patch.oauth_token !== undefined) storePatch.token = patch.oauth_token;
   if (patch.oauth_refresh_token !== undefined) storePatch.refresh = patch.oauth_refresh_token;
+  if (patch.egress_proxy !== undefined) storePatch.egress_proxy = patch.egress_proxy;
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;
 
   const after = await storeUpdate(id, storePatch);
@@ -275,6 +323,10 @@ export async function adminPatchAccount(
   if (expiresAt !== undefined) {
     changedBefore.oauth_expires_at = before.oauth_expires_at?.toISOString() ?? null;
     changedAfter.oauth_expires_at = after.oauth_expires_at?.toISOString() ?? null;
+  }
+  if (patch.egress_proxy !== undefined) {
+    changedBefore.egress_proxy = maskEgressProxy(before.egress_proxy);
+    changedAfter.egress_proxy = maskEgressProxy(after.egress_proxy);
   }
 
   await bestEffortAudit(ctx, "account.patch", `account:${String(id)}`, changedBefore, changedAfter);
