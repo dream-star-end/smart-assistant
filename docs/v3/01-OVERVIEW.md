@@ -64,8 +64,22 @@ Per-user docker container "agent-u<uid>":
 | 充值 | `packages/commercial/src/payment/hupijiao/` | 同 | 虎皮椒微信扫码 |
 | Per-user docker | `packages/commercial/src/agent-sandbox/supervisor.ts` | 同 | docker container 调度 + 健康检查 + 资源限额 |
 | Agent 订阅 | `packages/commercial/src/agent/index.ts` | 同 | 月费订阅,unique active per user |
-| 管理后台 | `packages/web/public/admin.html` + `commercial/src/admin/*` | 同 | 用户/容器/积分/审计 |
-| 充值 UI | `packages/web/public/app.html` | 同 | 套餐选择 + 二维码扫码 + 余额显示 |
+| 管理后台 | `packages/web/public/admin.html` + `commercial/src/admin/*` | **重做**(融入个人版 UI) | 用户/容器/积分/审计 |
+| 充值 UI | `packages/web/public/app.html` | **重做**(融入个人版 UI) | 套餐选择 + 二维码扫码 + 余额显示 |
+
+## UI 决策(boss 2026-04-20 拍板)
+
+> **整体 UI 基于个人版构建,不沿用 v2 那套"独立 admin/app/agent 三页"的设计。**
+
+具体落地:
+- 单页 `index.html` 仍是入口,沿用个人版 `style.css` + `modules/*.js` 的设计体系
+- 商业化功能作为新视图/模态/模块融入,而不是另开 HTML 页面
+- 视觉上跟个人版一致(暗色卡片 + 侧边栏 + 主内容区),保持品牌连贯
+- 待加的新模块(phase 2/4 落地):
+  - `modules/auth.js` — 注册 / 登录 / 邮箱校验回调 / 密码找回
+  - `modules/billing.js` — 充值面板(套餐+二维码) / 余额显示 / 流水
+  - `modules/admin.js` — 管理面板(只在用户角色 = admin 时挂载)
+- 不要 v2 那套独立的 `app.html` / `admin.html` / `agent.html`(已删)
 
 ## 从 v2 弃用 / 待清理
 
