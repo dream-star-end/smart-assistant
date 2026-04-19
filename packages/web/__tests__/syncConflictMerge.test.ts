@@ -426,11 +426,19 @@ type PushDeps = {
   dbPut: (row: any) => Promise<void>
   _rebuildSearchIndex: (sess: any) => void
   state: { token: string; sessions: Map<string, any> }
-  _onConflictResolved: ((id: string) => void) | null
+  _onConflictResolved: ((id: string, mode?: 'local-dominates' | 'server-wins') => void) | null
   _onRequestRetryPush: ((id: string) => void) | null
 }
 
-function makePush(deps: PushDeps) {
+// Parse the production CONFLICT_RETRY_MAX value out of sync.js. The harness
+// keeps its integration-test cap small (3) for short loops, but this lets
+// tests also assert the CURRENT production value — so a stealth regression
+// (someone halves the cap) breaks tests instead of degrading quietly at
+// runtime.
+const _capMatch = /const CONFLICT_RETRY_MAX = (\d+)/.exec(SYNC_SRC)
+const PROD_CONFLICT_RETRY_MAX = _capMatch ? Number(_capMatch[1]) : NaN
+
+function makePush(deps: PushDeps, retryMax = 3) {
   const factory = new Function(
     'apiFetch', 'apiGet', 'authHeaders', 'dbPut', '_rebuildSearchIndex',
     'state', '_onConflictResolved', '_onRequestRetryPush', 'CONFLICT_RETRY_MAX',
@@ -439,7 +447,7 @@ function makePush(deps: PushDeps) {
   return factory(
     deps.apiFetch, deps.apiGet, deps.authHeaders, deps.dbPut,
     deps._rebuildSearchIndex, deps.state,
-    deps._onConflictResolved, deps._onRequestRetryPush, 3,
+    deps._onConflictResolved, deps._onRequestRetryPush, retryMax,
   ) as (sess: any) => Promise<any>
 }
 
@@ -452,14 +460,14 @@ function baseDeps(overrides: Partial<PushDeps> = {}): PushDeps & {
   getCalls: string[]
   dbCalls: any[]
   rebuildCalls: any[]
-  conflictCb: string[]
+  conflictCb: Array<{ id: string; mode?: string }>
   retryCb: string[]
 } {
   const putCalls: any[] = []
   const getCalls: string[] = []
   const dbCalls: any[] = []
   const rebuildCalls: any[] = []
-  const conflictCb: string[] = []
+  const conflictCb: Array<{ id: string; mode?: string }> = []
   const retryCb: string[] = []
 
   const deps: any = {
@@ -477,7 +485,7 @@ function baseDeps(overrides: Partial<PushDeps> = {}): PushDeps & {
     dbPut: async (row: any) => { dbCalls.push(row) },
     _rebuildSearchIndex: (sess: any) => { rebuildCalls.push(sess.id) },
     state: { token: 'tok', sessions: new Map() },
-    _onConflictResolved: (id: string) => { conflictCb.push(id) },
+    _onConflictResolved: (id: string, mode?: string) => { conflictCb.push({ id, mode }) },
     _onRequestRetryPush: (id: string) => { retryCb.push(id) },
     ...overrides,
   }
@@ -531,6 +539,12 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     assert.equal(sess._syncedAt, 2000)
     // Callbacks
     assert.equal(deps.conflictCb.length, 1)
+    // local-dominates tag tells the UI to SKIP renderMessages() — local
+    // messages are preserved in this branch (the whole point of the fix),
+    // so only sidebar re-render is needed. Regressing this tag repaints
+    // the whole messages pane on every 409 and flickers the UI during
+    // long streaming turns that legitimately hit multiple 409s in a row.
+    assert.equal(deps.conflictCb[0].mode, 'local-dominates')
     assert.equal(deps.retryCb.length, 1)
     assert.equal(deps.retryCb[0], sessId)
     // dbPut persisted
@@ -703,6 +717,9 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     // Search index rebuilt & conflict callback fired
     assert.equal(deps.rebuildCalls.length, 1)
     assert.equal(deps.conflictCb.length, 1)
+    // server-wins tag tells the UI to renderMessages() — messages were just
+    // overwritten by Object.assign and the DOM must catch up.
+    assert.equal(deps.conflictCb[0].mode, 'server-wins')
   })
 
   it('rebinds _streamingAssistant to the fresh object when same id still present', async () => {
@@ -979,5 +996,60 @@ describe('pushSessionToServer — successful PUT', () => {
 
     assert.equal(sess._conflictRetryCount, 0)
     assert.equal(sess._dirty, false)
+  })
+})
+
+describe('pushSessionToServer — CONFLICT_RETRY_MAX', () => {
+  // The production cap was raised 3→10 in fix/sync-409-flicker to absorb
+  // legitimate 409 bursts on long streaming sessions (>500KB). Guard the
+  // current production value so a stealth revert breaks tests rather than
+  // spamming "409 auto-retry cap reached" in console at runtime.
+  it('production value matches expected', () => {
+    assert.equal(PROD_CONFLICT_RETRY_MAX, 10)
+  })
+
+  it('cap gates retry callback: below cap fires retry, at/above cap stops', async () => {
+    // Minimal local-dominates setup: local is superset of server (empty).
+    const build = (count: number) => {
+      const sessId = 'sess-cap'
+      const localMsg = { id: 'u1', role: 'user', text: 'hi' }
+      const sess: any = {
+        id: sessId,
+        title: 'local', messages: [localMsg], lastAt: 1000,
+        pinned: false, agentId: 'a',
+        _dirty: true, _syncedAt: 500,
+        _conflictRetryCount: count,
+      }
+      const deps = baseDeps({
+        apiFetch: async () => conflict(),
+        apiGet: async () => ({
+          id: sessId, title: 'remote', messages: [], lastAt: 900,
+          pinned: false, agentId: 'a', updatedAt: 2000,
+        }),
+      })
+      deps.state.sessions.set(sessId, sess)
+      return { sess, deps }
+    }
+
+    // Use a small cap so the test completes in bounded time. The point is the
+    // cap SEMANTICS — that `<=` lets the Nth retry still fire and `> cap`
+    // stops — not the specific 10.
+    const CAP = 2
+
+    // Pre-count 0, 1: retry fires (count becomes 1, 2 respectively)
+    for (const preCount of [0, 1]) {
+      const { sess, deps } = build(preCount)
+      await makePush(deps, CAP)(sess)
+      assert.equal(sess._conflictRetryCount, preCount + 1, `preCount ${preCount}: count should bump`)
+      assert.equal(deps.retryCb.length, 1, `preCount ${preCount}: retry should fire while count <= cap`)
+    }
+
+    // Pre-count 2 (== cap): after +1 = 3 (> cap), retry MUST NOT fire
+    const { sess: sessCap, deps: depsCap } = build(CAP)
+    await makePush(depsCap, CAP)(sessCap)
+    assert.equal(sessCap._conflictRetryCount, CAP + 1)
+    assert.equal(depsCap.retryCb.length, 0, 'retry must not fire when count exceeds cap')
+    // Dirty flag must still be set so the next user action can retry manually.
+    assert.equal(sessCap._dirty, true)
   })
 })

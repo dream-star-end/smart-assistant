@@ -25,13 +25,26 @@ const _notifSound = (() => {
 
 // ── Title bar status ──
 const _originalTitle = document.title
+const _BUSY_TITLE = '⏳ 思考中... — OpenClaude'
 export function setTitleBusy(busy) {
   if (busy) {
-    document.title = '⏳ 思考中... — OpenClaude'
+    document.title = _BUSY_TITLE
   } else {
     const sess = getSession()
     document.title = sess?.title ? `${sess.title} — OpenClaude` : _originalTitle
   }
+}
+
+// Refresh the browser tab title from the current session's title WITHOUT
+// clobbering the "思考中..." busy indicator. Used when session metadata is
+// adopted from the server (409 local-dominates) — we need the tab title to
+// track `sess.title`, but the streaming indicator must survive. Setting
+// `setTitleBusy(false)` would incorrectly clear the indicator during a
+// turn-in-flight conflict.
+export function refreshDocumentTitle() {
+  if (document.title === _BUSY_TITLE) return
+  const sess = getSession()
+  document.title = sess?.title ? `${sess.title} — OpenClaude` : _originalTitle
 }
 
 export function maybeNotify(title, body) {

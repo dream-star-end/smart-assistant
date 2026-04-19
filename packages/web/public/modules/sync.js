@@ -27,7 +27,14 @@ export function setSyncDeps({ onConflictResolved, onRequestRetryPush }) {
 // (schema mismatch, auth drift, server bug). Cleared on any successful PUT,
 // on server-wins adopt, and on any scheduleSaveFromUserEdit — user action
 // is ground truth.
-const CONFLICT_RETRY_MAX = 3
+//
+// Why 10 (not 3): on long streaming sessions (>500KB messages), a single
+// turn can legitimately trigger several 409s in the brief window after
+// `_sendingInFlight` flips false and the queued save batch drains against
+// cross-device updated_at drift. Each legitimate local-dominates resolution
+// advances _syncedAt, so a handful of retries is normal — capping at 3
+// bounced real saves into "leaving dirty" and the warning spammed console.
+const CONFLICT_RETRY_MAX = 10
 
 /**
  * Stable JSON serialization with sorted keys — used to compare two
@@ -370,7 +377,12 @@ export function pushSessionToServer(sess) {
           if (titleChanged) _rebuildSearchIndex(target)
 
           try { await dbPut({ ...target }) } catch {}
-          try { _onConflictResolved?.(target.id) } catch {}
+          // Pass 'local-dominates' so the UI can skip renderMessages() — local
+          // messages are preserved in this branch, only sidebar metadata may
+          // have shifted. Without this tag, every 409 in a long streaming
+          // session redrew the whole messages pane (innerHTML='' + 100-row
+          // rebuild) and the user saw a flicker per 409.
+          try { _onConflictResolved?.(target.id, 'local-dominates') } catch {}
 
           if (target._conflictRetryCount <= CONFLICT_RETRY_MAX && _onRequestRetryPush) {
             try { _onRequestRetryPush(target.id) } catch {}
@@ -410,7 +422,9 @@ export function pushSessionToServer(sess) {
         // Notify UI so the user sees the new messages / title instead of
         // a stale view. Without this, the session object is updated but
         // the DOM stays on the old snapshot until the next full sync.
-        try { _onConflictResolved?.(target.id) } catch {}
+        // 'server-wins' tag tells the UI to fully re-render messages because
+        // sess.messages was just overwritten.
+        try { _onConflictResolved?.(target.id, 'server-wins') } catch {}
       } catch {}
     }
   }).catch(() => {})
