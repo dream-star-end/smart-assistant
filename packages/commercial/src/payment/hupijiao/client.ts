@@ -47,8 +47,15 @@ export interface CreateQrInput {
 }
 
 export interface CreateQrResult {
-  /** 扫码链接(weixin://wxpay/bizpayurl?... 或 https://...) */
+  /**
+   * PC 扫码用图片 URL。虎皮椒返回的 `url_qrcode` 本身就是一张 QR PNG —— 这张 QR
+   * 编码的才是真正的 `weixin://wxpay/bizpayurl?...`。前端直接 `<img src=...>` 即可。
+   * 如果客户端再把这个 URL 字符串二维码化,微信扫到的将是 url 链接而非 weixin 协议,
+   * 用户被迫扫两次(2026-04-19 实测复现)。
+   */
   qrcodeUrl: string;
+  /** 移动端直接拉起微信支付的 H5 链接(虎皮椒返回的 `url`),手机端可 location.href 过去 */
+  mobileUrl: string | null;
   /** 虎皮椒平台订单号(provider_order),便于跨系统对账 */
   providerOrder?: string | null;
   /** 原始响应 JSON,测试 / 审计 / 告警用 */
@@ -144,8 +151,9 @@ export function createHttpHupijiaoClient(
         throw new HupijiaoError("UPSTREAM_NO_QRCODE",
           "hupijiao response missing url_qrcode/url", json);
       }
+      const mobileUrl = typeof json.url === "string" && json.url.length > 0 ? json.url : null;
       const providerOrder = typeof json.open_order_id === "string" ? json.open_order_id : null;
-      return { qrcodeUrl, providerOrder, raw: json };
+      return { qrcodeUrl, mobileUrl, providerOrder, raw: json };
     },
   };
 }

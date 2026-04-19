@@ -67,7 +67,7 @@ const mockHupi: HupijiaoClient = {
     const next = mockNextCreate ?? { kind: "ok" as const, qrcode: "weixin://wxpay/bizpayurl?pr=MOCK" };
     mockNextCreate = null;
     if (next.kind === "err") throw new HupijiaoError(next.code, next.message);
-    return { qrcodeUrl: next.qrcode, providerOrder: next.providerOrder ?? "MOCK_PX", raw: {} };
+    return { qrcodeUrl: next.qrcode, mobileUrl: null, providerOrder: next.providerOrder ?? "MOCK_PX", raw: {} };
   },
 };
 

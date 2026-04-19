@@ -1416,29 +1416,28 @@ async function createOrder(plan) {
 function renderOrderQr(slot, order) {
   slot.innerHTML = "";
   const amount = (Number(order.amount_cents) / 100).toFixed(2);
+  // 移动端:虎皮椒 `url` 字段是 H5 直接拉起微信支付的链接,直接跳过去最丝滑
+  const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "");
+  if (isMobile && order.mobile_url) {
+    window.location.href = order.mobile_url;
+    return;
+  }
+  // PC:虎皮椒 `url_qrcode` 本身就是 QR 图片(里面编码了 weixin:// 协议),
+  // 千万别再客户端 QR 化 —— 否则微信扫到 https URL,打开后又是 QR,被迫扫两次。
   const card = el("div", { class: "qr-card" }, [
     el("div", { class: "qr-title" }, `支付 ¥${amount} → 到账 ¥${(Number(order.credits)/100).toFixed(2)}`),
-    el("img", { src: qrDataUrl(order.qrcode_url), alt: "支付二维码" }),
-    el("div", { class: "qr-meta" }, `订单号:${order.order_no}`),
-    order.qrcode_url?.startsWith("http")
-      ? el("div", { class: "dim", style: "font-size:12px;margin-top:6px" }, "若无法识别,请复制下方链接到手机打开:")
+    el("img", { src: order.qrcode_url, alt: "微信支付二维码", style: "width:240px;height:240px;object-fit:contain;background:#fff;padding:8px;border-radius:8px" }),
+    el("div", { class: "qr-meta" }, "请使用微信扫码支付"),
+    el("div", { class: "qr-meta dim" }, `订单号:${order.order_no}`),
+    order.mobile_url
+      ? el("a", { href: order.mobile_url, target: "_blank", rel: "noopener", class: "qr-meta", style: "color:#4ea1ff" }, "手机端点这里直接付款 →")
       : null,
-    order.qrcode_url?.startsWith("http") ? el("div", { class: "qr-meta" }, order.qrcode_url) : null,
     el("div", { class: "qr-pending" }, [
       el("span", { class: "pulse" }),
       el("span", { id: "order-status" }, "等待支付…"),
     ]),
   ]);
   slot.appendChild(card);
-}
-
-/** 外部 qrcode_url 可能直接是 image 也可能是跳转链接。本前端一律走公共二维码渲染服务做展示。 */
-function qrDataUrl(raw) {
-  if (!raw) return "";
-  // 若 qrcode_url 本身就是图片(常见于虎皮椒的 code_img_url),直接用
-  if (/\.(png|jpe?g|gif|svg)(\?|$)/i.test(raw)) return raw;
-  // 否则让浏览器用第三方渲染(保持 T-70 最简,不内置二维码库)
-  return `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(raw)}`;
 }
 
 function startPolling(orderNo) {

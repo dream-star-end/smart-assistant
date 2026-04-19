@@ -123,7 +123,7 @@ export async function handleCreateHupi(
   const { order, plan } = created;
 
   // 调虎皮椒拿 qrcode_url。失败时订单留 pending —— 15min 后 expire 扫掉
-  let qr: { qrcodeUrl: string; providerOrder?: string | null };
+  let qr: { qrcodeUrl: string; mobileUrl: string | null; providerOrder?: string | null };
   try {
     qr = await deps.hupijiao.createQr({
       orderNo: order.order_no,
@@ -143,6 +143,7 @@ export async function handleCreateHupi(
     data: {
       order_no: order.order_no,
       qrcode_url: qr.qrcodeUrl,
+      mobile_url: qr.mobileUrl,
       amount_cents: order.amount_cents.toString(),
       credits: order.credits.toString(),
       expires_at: order.expires_at.toISOString(),
