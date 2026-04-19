@@ -274,7 +274,13 @@ export async function registerCommercial(
   );
   const healthTracker = new AccountHealthTracker({ redis: healthRedis });
   const scheduler = new AccountScheduler({ health: healthTracker });
-  const chatDeps = { scheduler };
+  // OAuth token 必须带 oauth-2025-04-20 beta header 才能调 /v1/messages,
+  // 否则 Anthropic 直接返 401 "OAuth authentication is currently not supported"。
+  // claude-code-20250219 是 Claude Code 的标识 beta,业务侧权益(plan/限额)按它路由。
+  const chatDeps = {
+    scheduler,
+    proxyDeps: { anthropicBeta: "oauth-2025-04-20,claude-code-20250219" },
+  };
   // T-41 REST /api/chat:把 orchestrator 包成 ChatLLM 接口喂给既有 http handler。
   const realChatLLM = createChatLLMFromRunChat(chatDeps);
 

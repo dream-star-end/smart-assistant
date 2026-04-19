@@ -35,8 +35,13 @@ import type { AccountHealthTracker } from "./health.js";
 /** token 过期时间与当前时间差小于此值 → 应 refresh。5 分钟。 */
 export const DEFAULT_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
-/** 默认 OAuth refresh endpoint。生产部署可通过 deps.endpoint 覆盖。 */
-export const DEFAULT_OAUTH_ENDPOINT = "https://console.anthropic.com/v1/oauth/token";
+/** 默认 OAuth refresh endpoint。生产部署可通过 deps.endpoint 覆盖。
+ *  与 Claude Code prod TOKEN_URL 对齐(constants/oauth.ts)。 */
+export const DEFAULT_OAUTH_ENDPOINT = "https://platform.claude.com/v1/oauth/token";
+
+/** Claude Code 公共 OAuth client_id(constants/oauth.ts PROD_OAUTH_CONFIG.CLIENT_ID)。
+ *  这个 client_id 是 Anthropic 给 Claude Code CLI 的固定 ID,所有 OAuth refresh 都得带。 */
+export const DEFAULT_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /** refresh 成功但服务器没给 expires_in/expires_at 时的保底:1 小时。 */
 export const DEFAULT_FALLBACK_EXPIRES_MS = 60 * 60 * 1000;
@@ -225,7 +230,8 @@ export async function refreshAccountToken(
     grant_type: "refresh_token",
     refresh_token: refreshStr,
   });
-  if (deps.clientId) form.set("client_id", deps.clientId);
+  // client_id 必须有,默认用 Claude Code 公共 client_id
+  form.set("client_id", deps.clientId ?? DEFAULT_OAUTH_CLIENT_ID);
 
   let result: { status: number; body: string };
   try {
