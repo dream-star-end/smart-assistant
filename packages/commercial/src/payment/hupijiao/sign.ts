@@ -7,7 +7,7 @@
  *      - `hash` 字段本身(它是签名结果)
  *      - 值为空字符串 / undefined / null 的字段
  *   3. 拼成 `key1=value1&key2=value2&...&keyN=valueN`(标准 query 格式,但**不做 URL 编码**)
- *   4. 末尾直接追加 `&<APP_SECRET>`(整个 APP_SECRET 字符串,不带 "key=" 前缀)
+ *   4. 末尾**直接拼接** `<APP_SECRET>`(无分隔符,不是 `&secret`!官方 PHP SDK 是 `md5($arg.$hashkey)`)
  *   5. MD5 整个字符串 → 取 **小写 16 进制**(32 字符)即为 `hash`
  *
  * 为什么 MD5 小写:虎皮椒官方示例与大部分社区实现均要求小写;如果收到的 hash 是大写,
@@ -73,7 +73,9 @@ export function signHupijiao(params: SignParams, appSecret: string): string {
     throw new TypeError("signHupijiao: appSecret must be non-empty string");
   }
   const base = buildSignBase(params);
-  const input = `${base}&${appSecret}`;
+  // 官方 PHP SDK: `md5($arg.$hashkey)` —— secret 直接拼接,**不要**前置 `&`!
+  // 早期文档曾误写成 `&<APP_SECRET>`,实测 40029 错误的签名,见 2026-04-19 修复。
+  const input = `${base}${appSecret}`;
   return createHash("md5").update(input, "utf8").digest("hex").toLowerCase();
 }
 

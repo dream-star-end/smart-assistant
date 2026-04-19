@@ -54,7 +54,7 @@ describe("buildSignBase", () => {
 });
 
 describe("signHupijiao", () => {
-  test("与独立 md5(base + & + secret) 一致", () => {
+  test("与独立 md5(base + secret) 一致(secret 直接拼接,无 &)", () => {
     const params = {
       version: "1.1",
       appid: "APP_1",
@@ -64,7 +64,8 @@ describe("signHupijiao", () => {
       time: "1800000000",
     };
     const expectedBase = "appid=APP_1&nonce_str=nonce&time=1800000000&total_fee=10.00&trade_order_id=20260417-xyz&version=1.1";
-    const expected = md5Hex(`${expectedBase}&${SECRET}`);
+    // 官方 PHP SDK: md5($arg.$hashkey) —— secret 与 base 直接拼接,**不要** `&`!
+    const expected = md5Hex(`${expectedBase}${SECRET}`);
     assert.equal(signHupijiao(params, SECRET), expected);
     assert.equal(signHupijiao(params, SECRET).length, 32);
     assert.match(signHupijiao(params, SECRET), /^[0-9a-f]{32}$/);
