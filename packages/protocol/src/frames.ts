@@ -39,6 +39,22 @@ export const InboundMessage = Type.Object({
     media: Type.Optional(Type.Array(MediaRef)),
   }),
   replyToId: Type.Optional(Type.String()),
+  // CCB effort level override for this session (一般来自 Web 前端的"编码模式/科研模式" pill)。
+  //   - 字符串 ∈ EFFORT_LEVELS:把 CLAUDE_CODE_EFFORT_LEVEL 设成该值
+  //   - null:**显式清除** — 让 gateway 把已有 runner 的 effort env 复位到模型默认
+  //   - 字段缺省 (undefined):什么也不做 (其他 channel 默认行为)
+  // 区分 null 与缺省是为了让 Web pill 的"取消选中"能反向取消之前的 xhigh/max,
+  // 否则一旦升过档就回不去模型默认了。
+  effortLevel: Type.Optional(
+    Type.Union([
+      Type.Null(),
+      Type.Literal('low'),
+      Type.Literal('medium'),
+      Type.Literal('high'),
+      Type.Literal('xhigh'),
+      Type.Literal('max'),
+    ]),
+  ),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>
@@ -78,8 +94,19 @@ export type InboundFrame = Static<typeof InboundFrame>
 // ───────────────────────────────────────────────
 // Outbound (gateway → channel)
 // ───────────────────────────────────────────────
+// `parentToolUseId` is the CCB Agent-tool `tool_use.id` that spawned the
+// subagent this block came from. null / undefined → main-agent content;
+// non-null → content produced by a subagent and must be routed into the
+// corresponding Agent card's child list (not the main message stream).
+// CCB emits this on every SDK message (see parent_tool_use_id in the CCB
+// core schemas). Supports nesting naturally — grand-child subagents carry
+// their direct parent's tool_use_id.
 export const OutboundContentBlock = Type.Union([
-  Type.Object({ kind: Type.Literal('text'), text: Type.String() }),
+  Type.Object({
+    kind: Type.Literal('text'),
+    text: Type.String(),
+    parentToolUseId: Type.Optional(Type.String()),
+  }),
   Type.Object({
     kind: Type.Literal('tool_use'),
     blockId: Type.Optional(Type.String()),
@@ -90,6 +117,7 @@ export const OutboundContentBlock = Type.Union([
     inputJson: Type.Optional(Type.Unknown()),
     // streaming: false | true — if true, a follow-up update with final input is coming
     partial: Type.Optional(Type.Boolean()),
+    parentToolUseId: Type.Optional(Type.String()),
   }),
   Type.Object({
     kind: Type.Literal('tool_result'),
@@ -99,10 +127,12 @@ export const OutboundContentBlock = Type.Union([
     toolName: Type.String(),
     isError: Type.Boolean(),
     preview: Type.Optional(Type.String()),
+    parentToolUseId: Type.Optional(Type.String()),
   }),
   Type.Object({
     kind: Type.Literal('thinking'),
     text: Type.String(),
+    parentToolUseId: Type.Optional(Type.String()),
   }),
 ])
 export type OutboundContentBlock = Static<typeof OutboundContentBlock>
@@ -123,6 +153,10 @@ export const OutboundMessage = Type.Object({
       cacheCreationTokens: Type.Optional(Type.Number()),
       totalCost: Type.Optional(Type.Number()),
       turn: Type.Optional(Type.Number()),
+      // Anthropic stop_reason, extracted from CCB result row. Used by the
+      // frontend to pick a precise empty-turn notice instead of the old
+      // generic "模型本轮未输出新内容" fallback.
+      stopReason: Type.Optional(Type.String()),
     }),
   ),
 })

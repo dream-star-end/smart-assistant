@@ -1,5 +1,6 @@
 // OpenClaude — Message rendering and display
 import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
+import { getEffortForSubmit } from './effortMode.js'
 import { exportMessageDocx } from './export-docx.js'
 import {
   clearChartInstances,
@@ -10,7 +11,7 @@ import {
 } from './markdown.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
-import { shortTime } from './util.js'
+import { msgTimeLabel, shortTime } from './util.js'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
@@ -403,6 +404,124 @@ function _buildAskUserQuestionCard(el, msg) {
   }
   body.appendChild(list)
   el.appendChild(body)
+}
+
+// ── Agent group card (subagent container) ──
+//
+// Renders the Agent tool_use as a collapsible parent card whose body shows
+// every child block produced by the subagent (routed in websocket.js via
+// parentToolUseId). Rules:
+//   - Expand/collapse is manual via clicking the header. Default:
+//       * running  → expanded   (so the user sees live progress)
+//       * completed → collapsed (auto-folds to a single-line summary)
+//     Once the user clicks the header, msg._userCollapsed locks the choice;
+//     later re-renders (streaming updates, updateMessageEl) respect it
+//     rather than snapping back to the auto default.
+//   - Nested Agent tools (a subagent spawning its own subagent) render as
+//     a single tool card inside the child list — their grand-child output
+//     is flattened into the same top-level group by websocket.js so the
+//     UI never exceeds two visual levels ("再深就都算子 agent").
+const _SVG_BOT_AGENT =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
+const _SVG_CHEVRON_AGENT =
+  '<svg class="agent-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
+
+function _resolveAgentGroupCollapsed(msg) {
+  // User explicitly toggled → honor their choice forever.
+  if (typeof msg._userCollapsed === 'boolean') return msg._userCollapsed
+  // Auto: collapsed after completion, expanded while running.
+  return !!msg._completed
+}
+
+function _appendAgentChildBlock(body, child) {
+  if (!child || typeof child !== 'object') return
+  if (child.kind === 'text') {
+    if (!child.text) return
+    const p = document.createElement('div')
+    p.className = 'agent-group-child-text'
+    p.textContent = child.text
+    body.appendChild(p)
+  } else if (child.kind === 'thinking') {
+    if (!child.text) return
+    const p = document.createElement('div')
+    p.className = 'agent-group-child-thinking'
+    p.textContent = child.text
+    body.appendChild(p)
+  } else if (child.kind === 'tool_use') {
+    const card = document.createElement('div')
+    card.className = 'msg tool agent-group-child-tool'
+    // Mark nested Agent calls (subagent spawning a grand-child subagent)
+    // so CSS can add a subtle indent/accent — grand-child output is
+    // flattened into this same group (see websocket.js), so a data
+    // attribute is the only remaining visual cue.
+    if (/^Agent$/i.test(child.toolName || '')) {
+      card.dataset.nestedAgent = '1'
+    }
+    // _buildToolCard expects a msg-like object; child carries the same
+    // field names (toolName, inputPreview, inputJson, _completed, output,
+    // error, _partial) so it can be passed through directly.
+    _buildToolCard(card, child)
+    body.appendChild(card)
+  }
+}
+
+function _renderAgentGroup(el, msg) {
+  el.innerHTML = ''
+  el.className = 'agent-group'
+  const collapsed = _resolveAgentGroupCollapsed(msg)
+  if (collapsed) el.classList.add('collapsed')
+
+  let statusHtml
+  if (msg._completed) {
+    if (msg._isError) {
+      statusHtml = '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
+    } else {
+      const dur = typeof msg._duration === 'number' ? ` (${(msg._duration / 1000).toFixed(1)}s)` : ''
+      statusHtml = `<span class="agent-group-status" style="color:var(--success)">完成${dur}</span>`
+    }
+  } else {
+    statusHtml = '<span class="agent-group-status">运行中…</span>'
+  }
+
+  const header = document.createElement('div')
+  header.className = 'agent-group-header'
+  header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title">子任务: ${htmlSafeEscape(msg.text || '')}</span>${statusHtml}${_SVG_CHEVRON_AGENT}`
+  header.onclick = () => {
+    msg._userCollapsed = !el.classList.contains('collapsed')
+    el.classList.toggle('collapsed', msg._userCollapsed)
+  }
+  el.appendChild(header)
+
+  const body = document.createElement('div')
+  body.className = 'agent-group-body'
+
+  // Child blocks: streamed subagent output (text / thinking / tool_use+result).
+  const children = Array.isArray(msg.childBlocks) ? msg.childBlocks : []
+  for (const ch of children) _appendAgentChildBlock(body, ch)
+
+  // Final result preview (the wrapped agent's return value). Render as a
+  // summary row so it's always visible even when the card is collapsed —
+  // the body is display:none'd when collapsed, but we emit a second
+  // single-line summary directly on the element so the header area stays
+  // informative. CSS hides the body's summary copy when expanded to avoid
+  // duplication.
+  if (msg._resultPreview) {
+    const preview = document.createElement('div')
+    preview.className = 'agent-group-result'
+    preview.innerHTML = `<span class="tool-icon">${msg._isError ? '⚠️' : '✓'}</span><div class="tool-body">${htmlSafeEscape(msg._resultPreview)}</div>`
+    body.appendChild(preview)
+  }
+
+  el.appendChild(body)
+
+  // Collapsed summary line (shown only when .collapsed): lets the user see
+  // the final output without expanding the full child log.
+  if (msg._resultPreview) {
+    const collapsedSummary = document.createElement('div')
+    collapsedSummary.className = 'agent-group-collapsed-summary'
+    collapsedSummary.textContent = msg._resultPreview.slice(0, 200)
+    el.appendChild(collapsedSummary)
+  }
 }
 
 function _buildToolCard(el, msg) {
@@ -1108,6 +1227,7 @@ export function _buildMessageEl(msg) {
         sess.messages.splice(idx)
         renderMessages()
         // Re-send via proper path: build payload with original media if present
+        const _regenEffort = getEffortForSubmit()
         const wsPayload = {
           type: 'inbound.message',
           idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1118,6 +1238,8 @@ export function _buildMessageEl(msg) {
             text: lastUserMsg._modelText || lastUserMsg.text || '',
             media: lastUserMsg._media || undefined,
           },
+          // 与 main.js send() 同语义:string=切档 / null=清除 / undefined=不参与
+          ...(_regenEffort !== undefined ? { effortLevel: _regenEffort } : {}),
           ts: Date.now(),
         }
         // Check if there are pending offline items for this session to prevent reordering
@@ -1236,32 +1358,14 @@ export function _buildMessageEl(msg) {
       renderMetaInto(meta, msg.metaText)
       el.appendChild(meta)
     }
+    // Absolute timestamp. For assistant messages we prefer `completedAt`
+    // (set on final frame / when streaming hands off to a tool) so the
+    // stamp reflects when the reply actually finished, not when the first
+    // token arrived. Falls back to `ts` (creation) while streaming, and for
+    // legacy messages that predate the completedAt field.
+    _appendMsgTime(el, msg.completedAt || msg.ts)
   } else if (msg.role === 'agent-group') {
-    el.className = 'agent-group'
-    const svgBot =
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
-    const svgChevron =
-      '<svg class="agent-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
-    const statusText = msg._completed
-      ? msg._isError
-        ? '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
-        : `<span class="agent-group-status" style="color:var(--success)">完成 (${(msg._duration / 1000).toFixed(1)}s)</span>`
-      : '<span class="agent-group-status">运行中...</span>'
-    const header = document.createElement('div')
-    header.className = 'agent-group-header'
-    header.innerHTML = `${svgBot}<span>子任务: ${htmlSafeEscape(msg.text || '')}</span>${statusText}${svgChevron}`
-    header.onclick = () => el.classList.toggle('collapsed')
-    el.appendChild(header)
-    const body = document.createElement('div')
-    body.className = 'agent-group-body'
-    if (msg._resultPreview) {
-      const preview = document.createElement('div')
-      preview.className = 'msg tool'
-      preview.style.cssText = 'padding:6px 10px;border:none;background:transparent;font-size:12px'
-      preview.innerHTML = `<span class="tool-icon">${msg._isError ? '⚠️' : '✓'}</span><div class="tool-body">${htmlSafeEscape(msg._resultPreview)}</div>`
-      body.appendChild(preview)
-    }
-    el.appendChild(body)
+    _renderAgentGroup(el, msg)
   } else if (msg.role === 'thinking') {
     const header = document.createElement('div')
     header.className = 'thinking-header'
@@ -1304,8 +1408,48 @@ export function _buildMessageEl(msg) {
       statusEl.innerHTML = `${_STATUS_SVG[msg.status] || ''}<span>${_STATUS_LABEL[msg.status] || ''}</span>`
       el.appendChild(statusEl)
     }
+    _appendMsgTime(el, msg.ts)
   }
   return el
+}
+
+// Shared timestamp append helper. Uses textContent + title for safety and
+// no-ops on falsy/invalid ts (legacy messages without a ts field render
+// without this row rather than showing a blank badge). `data-ts` carries
+// the exact ms epoch so _refreshMsgTime can detect same-minute updates
+// (label precision is minute-level; tooltip precision is second-level).
+function _appendMsgTime(el, ts) {
+  const label = msgTimeLabel(ts)
+  if (!label) return
+  const timeEl = document.createElement('div')
+  timeEl.className = 'msg-time'
+  timeEl.textContent = label
+  timeEl.dataset.ts = String(ts)
+  // Full timestamp in title for hover inspection
+  try { timeEl.title = new Date(ts).toLocaleString('zh-CN') } catch {}
+  el.appendChild(timeEl)
+}
+
+// Keep the rendered msg-time in sync with the effective timestamp
+// (completedAt once set, else ts). Called from updateMessageEl on every
+// re-render so isFinal / tool-handoff completion flips the label from
+// "first-token time" to "turn-ended time" without rebuilding the whole node.
+// Uses data-ts (exact ms) rather than textContent comparison — the label
+// is minute-precision, so streaming deltas within the same minute would
+// otherwise leave a stale `title` tooltip pointing at the first-token time.
+function _refreshMsgTime(el, msg) {
+  const effectiveTs = msg.completedAt || msg.ts
+  if (!effectiveTs) return
+  const existing = el.querySelector(':scope > .msg-time')
+  if (!existing) {
+    _appendMsgTime(el, effectiveTs)
+    return
+  }
+  if (Number(existing.dataset.ts) === effectiveTs) return
+  existing.dataset.ts = String(effectiveTs)
+  const label = msgTimeLabel(effectiveTs)
+  if (label) existing.textContent = label
+  try { existing.title = new Date(effectiveTs).toLocaleString('zh-CN') } catch {}
 }
 
 export function renderMessage(msg, skipRichBlocks = false) {
@@ -1361,34 +1505,12 @@ export function updateMessageEl(msg, streaming) {
       }
       renderMetaInto(meta, msg.metaText)
     }
+    // Refresh msg-time when completedAt has been set (isFinal / tool handoff).
+    // The initial _buildMessageEl append shows ts (first token) while streaming;
+    // once the turn completes we want the actual completion wall-clock instead.
+    _refreshMsgTime(el, msg)
   } else if (msg.role === 'agent-group') {
-    // Re-render the whole card (simpler than partial updates)
-    el.innerHTML = ''
-    el.className = 'agent-group'
-    const svgBot =
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
-    const svgChevron =
-      '<svg class="agent-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
-    const statusText = msg._completed
-      ? msg._isError
-        ? '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
-        : `<span class="agent-group-status" style="color:var(--success)">完成 (${(msg._duration / 1000).toFixed(1)}s)</span>`
-      : '<span class="agent-group-status">运行中...</span>'
-    const header = document.createElement('div')
-    header.className = 'agent-group-header'
-    header.innerHTML = `${svgBot}<span>子任务: ${htmlSafeEscape(msg.text || '')}</span>${statusText}${svgChevron}`
-    header.onclick = () => el.classList.toggle('collapsed')
-    el.appendChild(header)
-    if (msg._resultPreview) {
-      const body = document.createElement('div')
-      body.className = 'agent-group-body'
-      const preview = document.createElement('div')
-      preview.className = 'msg tool'
-      preview.style.cssText = 'padding:6px 10px;border:none;background:transparent;font-size:12px'
-      preview.innerHTML = `<span class="tool-icon">${msg._isError ? '⚠️' : '✓'}</span><div class="tool-body">${htmlSafeEscape(msg._resultPreview)}</div>`
-      body.appendChild(preview)
-      el.appendChild(body)
-    }
+    _renderAgentGroup(el, msg)
   } else if (msg.role === 'thinking') {
     const body = el.querySelector('.thinking-body') || el.querySelector('.msg-body')
     if (body) body.textContent = msg.text || ''

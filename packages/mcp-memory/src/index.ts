@@ -520,6 +520,16 @@ async function handleSkillDelete(args: { name: string }) {
 
 // ── Archival Memory handlers ──
 async function handleArchivalAdd(args: { content: string; tags?: string }) {
+  // Guard against missing/empty content — the archival table's `content` column
+  // is NOT NULL, so reaching the INSERT with undefined surfaces a cryptic
+  // "constraint failed" SQL error. Callers sometimes pass `title`/other
+  // unsupported fields (schema only accepts `content` and `tags`, unknown
+  // props are silently dropped by MCP), leaving `args.content` undefined.
+  if (typeof args.content !== 'string' || args.content.trim() === '') {
+    return toolError(
+      'archival_add requires a non-empty `content` string (schema only accepts `content` and optional `tags` — any `title` or other fields are dropped by MCP)',
+    )
+  }
   const id = await archivalAdd(AGENT_ID, args.content, args.tags)
 
   // P1: Generate embedding and store vector (fire-and-forget to avoid blocking response)
@@ -550,6 +560,9 @@ async function handleArchivalAdd(args: { content: string; tags?: string }) {
 }
 
 async function handleArchivalSearch(args: { query: string; limit?: number }) {
+  if (typeof args.query !== 'string' || args.query.trim() === '') {
+    return toolError('archival_search requires a non-empty `query` string')
+  }
   const limit = args.limit ?? 5
   const results = await hybridArchivalSearch(AGENT_ID, args.query, embeddingProvider, limit)
   if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`)
@@ -571,6 +584,9 @@ async function handleArchivalSearch(args: { query: string; limit?: number }) {
 }
 
 async function handleArchivalDelete(args: { id: string }) {
+  if (typeof args.id !== 'string' || args.id.trim() === '') {
+    return toolError('archival_delete requires a non-empty `id` string (from archival_search results)')
+  }
   const ok = await archivalDelete(AGENT_ID, args.id)
   if (!ok) return toolError(`Entry ${args.id} not found.`)
 

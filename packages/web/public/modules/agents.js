@@ -1,6 +1,7 @@
 import { apiGet, apiJson } from './api.js'
 // OpenClaude — Agents
 import { $, htmlSafeEscape } from './dom.js'
+import { renderModePills } from './effortMode.js'
 import { getSession, state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
 
@@ -30,6 +31,8 @@ export function renderAgentDropdown() {
   }
   const sess = getSession()
   if (sess) sel.value = sess.agentId || state.defaultAgentId
+  // Pill 可见性依赖当前 agent 的 model — 任何 agent 列表/会话切换后都要刷新一次。
+  renderModePills()
 }
 
 export function renderAgentsManagementList() {

@@ -433,3 +433,60 @@ export function deleteSessionFromServer(id) {
 
 // Pending deletes that failed — retried on next syncSessionsFromServer()
 const _pendingDeletes = new Set()
+
+/**
+ * Throttled wrapper for syncSessionsFromServer().
+ *
+ * Called from event triggers that can fire rapidly (visibilitychange fires
+ * twice on each mobile foreground/background cycle, `focus` flaps with
+ * dev-tools inspect, `online` can fire in bursts on flaky networks). Without
+ * throttling, every trigger would re-hit `/api/sessions/list` + possibly
+ * fan out to N `/api/sessions/:id` GETs.
+ *
+ * Behaviour:
+ * - If a sync is already in flight, the returned promise is reused so
+ *   concurrent triggers coalesce onto a single network round-trip.
+ * - Otherwise, if the last *successful* sync was within `minIntervalMs`,
+ *   skip and resolve as a no-op — unless `force: true` is passed (used by
+ *   `online` recovery where we really want a fresh pull).
+ * - Only a successful pull (syncSessionsFromServer returns a non-undefined
+ *   result) advances `_lastSyncAt`. A failed list-fetch returns `undefined`
+ *   (see `catch { return }` above); treating that as "synced" would let the
+ *   throttle window swallow every real retry for the next 15s — exactly
+ *   what a user hitting a transient offline blip hits on foreground resume.
+ * - `onResult(result)` is invoked on non-skipped completion. It is NOT
+ *   wrapped in try/catch: UI/DOM errors must propagate so the module-level
+ *   `unhandledrejection` handler in main.js can surface them rather than
+ *   silently leaving the page stale after a hidden render failure.
+ *
+ * Accepted edge cases:
+ * - `force: true` does not upgrade a sync already in flight; an `online`
+ *   event arriving mid-request will coalesce with the running request
+ *   instead of scheduling a tail pull. Acceptable because the running
+ *   request either already predates the network flap (fine, fresh result)
+ *   or is about to fail (fine, the next visibilitychange/focus will retry
+ *   without being throttled since _lastSyncAt stays at its old value).
+ * - `_lastSyncAt` is updated BEFORE `onResult` runs, so "sync succeeded on
+ *   the wire but UI render threw" still counts against the throttle window.
+ *   Acceptable because such a throw reaches the global unhandledrejection
+ *   handler, making it visible; the user hits reload and the next boot
+ *   sync re-applies the latest server state.
+ */
+let _syncInFlight = null
+let _lastSyncAt = 0
+export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult } = {}) {
+  if (_syncInFlight) return _syncInFlight
+  if (!force && Date.now() - _lastSyncAt < minIntervalMs) return Promise.resolve(null)
+  _syncInFlight = syncSessionsFromServer()
+    // Defensive: syncSessionsFromServer catches its own network errors and
+    // returns `undefined`, but we still guard against an unexpected throw
+    // so the in-flight slot below always clears.
+    .catch(() => undefined)
+    .then((result) => {
+      if (result !== undefined) _lastSyncAt = Date.now()
+      if (onResult) onResult(result)  // may throw — intentionally unprotected
+      return result
+    })
+    .finally(() => { _syncInFlight = null })
+  return _syncInFlight
+}

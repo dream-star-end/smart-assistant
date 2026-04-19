@@ -9,6 +9,33 @@ export function formatSize(n) {
   return `${(n / 1048576).toFixed(1)} MB`
 }
 
+// Absolute timestamp label for a single chat message. Unlike shortTime()
+// (which renders relative labels like "5 分钟前" for session lists), this
+// always shows a precise clock time so users can correlate tool executions
+// / long-running tasks with when they actually completed.
+// Format rules:
+//   • same calendar day → HH:MM            (e.g. 14:23)
+//   • same calendar year → MM-DD HH:MM     (e.g. 04-17 14:23)
+//   • otherwise → YYYY-MM-DD HH:MM         (e.g. 2025-12-31 23:58)
+// Returns '' for falsy/invalid ts so caller can skip rendering without
+// showing a placeholder.
+export function msgTimeLabel(ts) {
+  if (!ts || typeof ts !== 'number' || !Number.isFinite(ts)) return ''
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  if (sameDay) return hm
+  const sameYear = d.getFullYear() === now.getFullYear()
+  if (sameYear) return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`
+}
+
 export function shortTime(ts) {
   const diff = (Date.now() - ts) / 1000
   if (diff < 60) return '刚刚'

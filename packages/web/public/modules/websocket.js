@@ -224,6 +224,106 @@ export function updateMessage(sess, msg, newText, streaming) {
     _deps.scrollBottom()
   }
 }
+
+// Append/merge a subagent-produced block into its owning Agent card's
+// childBlocks list. Mutates groupMsg.childBlocks in place. Caller is
+// responsible for calling _deps.updateMessageEl(groupMsg) afterward.
+//
+// Merge rules:
+//   - text/thinking: coalesce with trailing child of the same kind
+//     (streaming deltas arrive in small chunks and would otherwise
+//     spawn hundreds of empty one-line children).
+//   - tool_use: keyed by blockId — partial→final updates the same child.
+//   - tool_result: merged onto the matching tool_use child (flips
+//     _completed=true, fills output/error). Falls back to a synthetic
+//     completed child when no matching tool_use exists (shouldn't
+//     happen in practice but guards against dropped frames).
+//
+// Nested Agent tools: when a subagent itself invokes the Agent tool,
+// register that new tool_use id in sess._agentGroups pointing at the
+// SAME top-level groupMsg.id. Grand-child subagent blocks whose
+// parentToolUseId points at the nested Agent tool_use thus still route
+// here, flattening the display to a max of two visual levels per the
+// product spec ("再深就都算子 agent").
+function _appendSubagentBlock(sess, groupMsg, block, blockText) {
+  if (!Array.isArray(groupMsg.childBlocks)) groupMsg.childBlocks = []
+  const children = groupMsg.childBlocks
+
+  if (block.kind === 'text') {
+    if (!blockText) return
+    const last = children[children.length - 1]
+    if (last && last.kind === 'text') {
+      last.text = (last.text || '') + blockText
+    } else {
+      children.push({ kind: 'text', text: blockText })
+    }
+  } else if (block.kind === 'thinking') {
+    if (!blockText) return
+    const last = children[children.length - 1]
+    if (last && last.kind === 'thinking') {
+      last.text = (last.text || '') + blockText
+    } else {
+      children.push({ kind: 'thinking', text: blockText })
+    }
+  } else if (block.kind === 'tool_use') {
+    const existing = block.blockId
+      ? children.find((c) => c.kind === 'tool_use' && c.blockId === block.blockId)
+      : null
+    if (existing) {
+      existing.inputPreview = block.inputPreview || existing.inputPreview
+      if (block.inputJson !== undefined && block.inputJson !== null) {
+        existing.inputJson = block.inputJson
+      }
+      existing._partial = !!block.partial
+      if (block.toolName) existing.toolName = block.toolName
+    } else {
+      children.push({
+        kind: 'tool_use',
+        blockId: block.blockId,
+        toolName: block.toolName || 'unknown',
+        inputPreview: block.inputPreview || '',
+        inputJson: block.inputJson != null ? block.inputJson : null,
+        _partial: !!block.partial,
+        _completed: false,
+        output: null,
+        error: false,
+      })
+      if (block.blockId && /^Agent$/i.test(block.toolName || '')) {
+        if (!sess._agentGroups) sess._agentGroups = new Map()
+        // Point nested Agent tool_use id at the same top-level group, so
+        // grand-child subagent output flattens into this card.
+        sess._agentGroups.set(block.blockId, groupMsg.id)
+      }
+    }
+  } else if (block.kind === 'tool_result') {
+    const toolUseId =
+      block.toolUseBlockId ||
+      (block.blockId ? String(block.blockId).replace(/:result$/, '') : null)
+    const target = toolUseId
+      ? children.find((c) => c.kind === 'tool_use' && c.blockId === toolUseId)
+      : null
+    if (target) {
+      target._completed = true
+      target.output = block.preview || ''
+      target.error = !!block.isError
+      target._partial = false
+    } else {
+      // Orphan result (rare): keep it visible as a standalone completed card.
+      children.push({
+        kind: 'tool_use',
+        blockId: block.blockId,
+        toolName: block.toolName || 'unknown',
+        inputPreview: '',
+        inputJson: null,
+        _partial: false,
+        _completed: true,
+        output: block.preview || '',
+        error: !!block.isError,
+      })
+    }
+  }
+}
+
 export function setMeta(sess, msg, metaText) {
   msg.metaText = metaText
   if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
@@ -805,7 +905,25 @@ export function handleOutbound(frame) {
     if (!sess._agentGroups) sess._agentGroups = new Map()
     for (const m of sess.messages) {
       if (m.blockId) sess._blockIdToMsgId.set(m.blockId, m.id)
-      if (m.role === 'agent-group' && m.blockId) sess._agentGroups.set(m.blockId, m.id)
+      if (m.role === 'agent-group' && m.blockId) {
+        sess._agentGroups.set(m.blockId, m.id)
+        // Nested Agent tool_use ids (recorded in childBlocks) must also
+        // be re-registered after a refresh — otherwise a subagent that
+        // spawned a grand-child before the user refreshed would have
+        // the grand-child's live output fall back to the main stream.
+        if (Array.isArray(m.childBlocks)) {
+          for (const ch of m.childBlocks) {
+            if (
+              ch &&
+              ch.kind === 'tool_use' &&
+              ch.blockId &&
+              /^Agent$/i.test(ch.toolName || '')
+            ) {
+              sess._agentGroups.set(ch.blockId, m.id)
+            }
+          }
+        }
+      }
     }
   }
   // Early stale-final guard (best effort): drop late isFinal frames from a
@@ -942,18 +1060,99 @@ export function handleOutbound(frame) {
         !sess._streamingAssistant &&
         !sess._streamingThinking
       ) {
+        // Empty turn (isFinal with zero content blocks) has two very
+        // different root causes:
+        //
+        //   (1) Model preference — Opus 4.7 (and other newer Claudes)
+        //       routinely end_turn without any text block after a tool
+        //       call completes, or when the user's follow-up is a meta
+        //       question it judges needs no answer. The session is healthy.
+        //
+        //   (2) Real backend fault — rate-limit swallowed upstream, gateway
+        //       returning isFinal on a dead subprocess, etc.
+        //
+        // Classifying these two reliably from frontend state is risky (see
+        // history: a prior "prior turn had content → silent" heuristic
+        // would mask case 2 any time it followed a successful case 1).
+        // Instead we always show a single non-alarmist notice and let the
+        // *wording* differentiate: if the previous turn produced content,
+        // we say "模型本轮未输出新内容"; otherwise "未收到回复". Either
+        // way it's an info-level notice, not a red error, so users don't
+        // distrust the UI — but real faults remain visible.
+        //
+        // Walk backwards from target user msg until we hit another user
+        // msg (= previous turn boundary) or the start of the array. If the
+        // previous turn contains any content-bearing block, treat as the
+        // "likely model preference" variant. Role set here mirrors the
+        // producedContent check above (including 'permission') so the two
+        // classifiers agree on what counts as "content".
+        let priorTurnHadContent = false
+        for (let i = targetIdx - 1; i >= 0; i--) {
+          const r = sess.messages[i].role
+          if (r === 'user') break
+          if (
+            r === 'assistant' ||
+            r === 'thinking' ||
+            r === 'tool' ||
+            r === 'agent-group' ||
+            r === 'permission'
+          ) {
+            priorTurnHadContent = true
+            break
+          }
+        }
         // Avoid double-insertion on rare re-entrant cases: skip if the last
-        // message is already an empty-turn warning for this target.
+        // message is already an empty-turn notice for this target.
         const last = sess.messages[sess.messages.length - 1]
         const alreadyWarned = last && last._emptyTurn
         if (!alreadyWarned) {
+          // Prefer `frame.meta.stopReason` (extracted from CCB's result row
+          // by ccbMessageParser._handleResult) over the old prior-turn
+          // heuristic. When present, use Anthropic's own termination code
+          // to pick a precise notice. When absent (older CCB, telemetry
+          // drop, etc.), fall back to the priorTurnHadContent wording.
+          // See docs/ccb-telemetry-refactor-plan.md §5.6.
+          const stopReason = frame.meta?.stopReason
           console.warn('[ws] empty-turn: isFinal with zero blocks', {
             sessionId: sess.id,
             targetMsgId: _targetMsg.id,
+            priorTurnHadContent,
+            stopReason: stopReason ?? null,
           })
-          addMessage(sess, 'assistant', '⚠️ 本轮响应为空 — 服务端标记已完成,但没有生成任何内容。请重试或检查服务状态。', {
-            error: true,
+          let noticeText
+          switch (stopReason) {
+            case 'end_turn':
+              noticeText = '模型本轮主动结束(通常表示它判断不需要再回复或上下文已表达完整)。可继续追问。'
+              break
+            case 'pause_turn':
+              noticeText = '模型暂停了本轮(通常因长任务超时),可直接重新发送让它继续。'
+              break
+            case 'max_tokens':
+              noticeText = '本轮输出达到 token 上限,内容可能不完整。可让它"继续"。'
+              break
+            case 'refusal':
+              noticeText = '模型拒绝回复本轮内容。'
+              break
+            case 'tool_use':
+              // stop_reason=tool_use but 0 blocks → tool_use stream was cut
+              noticeText = '工具调用流意外中断,请重试。'
+              break
+            case 'stop_sequence':
+              noticeText = '模型命中停止序列结束本轮。'
+              break
+            default:
+              if (stopReason) {
+                noticeText = `模型本轮无内容输出 (stop_reason=${stopReason})。可重试或继续追问。`
+              } else if (priorTurnHadContent) {
+                noticeText = '模型本轮未输出新内容,可继续追问或重新提问。'
+              } else {
+                noticeText = '未收到回复 — 服务端标记已完成,但没有生成任何内容。请重试。'
+              }
+          }
+          addMessage(sess, 'assistant', noticeText, {
             _emptyTurn: true,
+            _emptyTurnSoft: priorTurnHadContent || !!stopReason,
+            _emptyTurnStopReason: stopReason ?? null,
           })
         }
       }
@@ -977,6 +1176,26 @@ export function handleOutbound(frame) {
           ? JSON.stringify(block.text)
           : ''
 
+    // ── Subagent block routing ──
+    // Blocks carrying parentToolUseId were produced inside a subagent
+    // spawned by the main agent's Agent tool. Instead of polluting the
+    // main message stream, we push them into the owning Agent card's
+    // childBlocks list so the UI can show the subagent's progress inside
+    // the card (and auto-collapse when the agent finishes).
+    //
+    // Fallback: if the Agent group isn't registered yet (e.g. out-of-order
+    // arrival, or the user cleared history), the block falls through to the
+    // main stream below — better to see it than to silently drop it.
+    if (block.parentToolUseId && sess._agentGroups?.has(block.parentToolUseId)) {
+      const groupMsgId = sess._agentGroups.get(block.parentToolUseId)
+      const groupMsg = sess.messages.find((m) => m.id === groupMsgId)
+      if (groupMsg) {
+        _appendSubagentBlock(sess, groupMsg, block, blockText)
+        if (sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
+        continue
+      }
+    }
+
     if (block.kind === 'text') {
       sess._streamingThinking = null
       if (!sess._streamingAssistant) {
@@ -988,6 +1207,15 @@ export function handleOutbound(frame) {
         )
       }
       sess._streamingAssistant.text += blockText
+      // Track "latest content arrived" as completion time. Kept in sync on
+      // every delta so abnormal teardowns (stopCurrentTurn, thinking safety
+      // timeout, offline drain timeout, reconnect safety, agent switch)
+      // leave behind a meaningful completion wall-clock without each
+      // teardown site needing its own assignment. The explicit writes in
+      // tool_use/tool_result/isFinal below are still kept — they pin the
+      // value at exactly the segment boundary (slightly more accurate when
+      // a delta and the segment-end arrive in the same frame batch).
+      sess._streamingAssistant.completedAt = Date.now()
       _checkTaskNotifications(block.text)
       // Throttled render: use coarser interval (~120ms) for streaming markdown
       // to avoid re-parsing on every delta. Short texts use rAF for responsiveness.
@@ -1011,6 +1239,7 @@ export function handleOutbound(frame) {
     } else if (block.kind === 'thinking') {
       if (!sess._streamingThinking) sess._streamingThinking = addMessage(sess, 'thinking', '')
       sess._streamingThinking.text += blockText
+      sess._streamingThinking.completedAt = Date.now()  // see assistant branch rationale
       if (!sess._thinkRafPending) {
         sess._thinkRafPending = true
         requestAnimationFrame(() => {
@@ -1022,6 +1251,12 @@ export function handleOutbound(frame) {
         })
       }
     } else if (block.kind === 'tool_use') {
+      // The assistant text (and thinking) segment just ended — next turn
+      // content will go into a new message. Stamp completion time BEFORE
+      // the final flush so updateMessageEl re-renders the msg-time label
+      // from "first token arrived" to "segment finished".
+      if (sess._streamingAssistant) sess._streamingAssistant.completedAt = Date.now()
+      if (sess._streamingThinking) sess._streamingThinking.completedAt = Date.now()
       // Flush pending text render before clearing (rAF might not have fired yet)
       if (sess._streamingAssistant?.text) {
         updateMessage(sess, sess._streamingAssistant, sess._streamingAssistant.text, false)
@@ -1083,6 +1318,9 @@ export function handleOutbound(frame) {
         if (block.blockId) sess._blockIdToMsgId.set(block.blockId, m.id)
       }
     } else if (block.kind === 'tool_result') {
+      // Same completion-stamp rationale as the tool_use branch above.
+      if (sess._streamingAssistant) sess._streamingAssistant.completedAt = Date.now()
+      if (sess._streamingThinking) sess._streamingThinking.completedAt = Date.now()
       // Flush pending text render before clearing
       if (sess._streamingAssistant?.text) {
         updateMessage(sess, sess._streamingAssistant, sess._streamingAssistant.text, false)
@@ -1151,6 +1389,11 @@ export function handleOutbound(frame) {
       if (typeof frame.meta.cacheCreationTokens === 'number') sess._tokenUsage.cacheWrite += frame.meta.cacheCreationTokens
       if (typeof frame.meta.cost === 'number') sess._tokenUsage.cost += frame.meta.cost
     }
+    // Stamp completion time on the final streaming segment BEFORE the final
+    // rich render, so the msg-time label in the DOM can swap from "first
+    // token" to the actual turn-ended wall-clock.
+    if (sess._streamingAssistant) sess._streamingAssistant.completedAt = Date.now()
+    if (sess._streamingThinking) sess._streamingThinking.completedAt = Date.now()
     // Final rich render: re-render all streaming messages with full Markdown/Mermaid/Chart
     if (sess._streamingAssistant && sess.id === state.currentSessionId) {
       _deps.updateMessageEl(sess._streamingAssistant, false)

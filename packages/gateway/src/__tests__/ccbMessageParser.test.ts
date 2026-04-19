@@ -21,7 +21,7 @@ function createParser(opts?: { onToolUse?: (t: any) => void }) {
       finished = true
       finishResult = result
     },
-    sessionTotals: { totalCostUSD: 0, turns: 0 },
+    sessionTotals: { totalCostUSD: 0, turns: 0, _lastCcbCumulativeCost: 0 },
   })
 
   return {
@@ -245,6 +245,73 @@ describe('CcbMessageParser: result', () => {
     } as any)
 
     assert.equal(events.length, countAfterResult, 'should not emit after finalization')
+  })
+
+  it('computes per-turn cost as delta of CCB cumulative total_cost_usd', () => {
+    // Shared sessionTotals (mimics gateway holding per-session reference)
+    const sessionTotals = { totalCostUSD: 0, turns: 0, _lastCcbCumulativeCost: 0 }
+    const mkParser = () => {
+      let result: any = null
+      const parser = new CcbMessageParser({
+        toolUseIdToName: new Map(),
+        onEvent: () => {},
+        onFinish: (r) => { result = r },
+        sessionTotals,
+      })
+      return { parser, getResult: () => result }
+    }
+
+    // Turn 1: CCB reports cumulative 0.05 → delta = 0.05
+    const t1 = mkParser()
+    t1.parser.parse({ type: 'result', total_cost_usd: 0.05, usage: {} } as any)
+    assert.equal(t1.getResult().cost, 0.05)
+    assert.equal(sessionTotals.totalCostUSD, 0.05)
+    assert.equal(sessionTotals._lastCcbCumulativeCost, 0.05)
+
+    // Turn 2: CCB reports cumulative 0.12 → delta = 0.07 (NOT 0.12)
+    const t2 = mkParser()
+    t2.parser.parse({ type: 'result', total_cost_usd: 0.12, usage: {} } as any)
+    assert.ok(Math.abs(t2.getResult().cost - 0.07) < 1e-9)
+    assert.ok(Math.abs(sessionTotals.totalCostUSD - 0.12) < 1e-9)
+
+    // Turn 3 (phantom-style): cumulative unchanged → delta = 0
+    const t3 = mkParser()
+    t3.parser.parse({ type: 'result', total_cost_usd: 0.12, usage: {} } as any)
+    assert.equal(t3.getResult().cost, 0)
+    assert.ok(Math.abs(sessionTotals.totalCostUSD - 0.12) < 1e-9)
+
+    // Turn 4: CCB process restarted (cumulative drops to 0.03) → delta = 0.03
+    const t4 = mkParser()
+    t4.parser.parse({ type: 'result', total_cost_usd: 0.03, usage: {} } as any)
+    assert.equal(t4.getResult().cost, 0.03)
+    assert.ok(Math.abs(sessionTotals.totalCostUSD - 0.15) < 1e-9)
+    assert.equal(sessionTotals._lastCcbCumulativeCost, 0.03)
+  })
+
+  it('attributes full cost after gateway-initiated CCB restart (cumulative ≥ old prev)', () => {
+    // Simulates gateway flow: after AUTH_ERROR / PHANTOM_TURN / effort-change
+    // the gateway shuts down CCB and resets _lastCcbCumulativeCost to 0 before
+    // the next turn. Without that reset, a new CCB whose first turn costs more
+    // than the old process's final cumulative would be UNDER-counted.
+    const sessionTotals = { totalCostUSD: 0.01, turns: 1, _lastCcbCumulativeCost: 0.01 }
+    // Gateway respawns CCB and explicitly resets the tracker:
+    sessionTotals._lastCcbCumulativeCost = 0
+
+    // First turn on the fresh CCB reports cumulative 0.03 (real per-turn cost).
+    let result: any = null
+    const parser = new CcbMessageParser({
+      toolUseIdToName: new Map(),
+      onEvent: () => {},
+      onFinish: (r) => { result = r },
+      sessionTotals,
+    })
+    parser.parse({ type: 'result', total_cost_usd: 0.03, usage: {} } as any)
+
+    // With the reset, delta = 0.03 - 0 = 0.03 (correct). Without it, delta
+    // would be 0.03 - 0.01 = 0.02 (0.01 of real charges would vanish).
+    assert.equal(result.cost, 0.03)
+    assert.ok(Math.abs(sessionTotals.totalCostUSD - 0.04) < 1e-9)
+    assert.equal(sessionTotals._lastCcbCumulativeCost, 0.03)
   })
 })
 

@@ -77,6 +77,19 @@ async function _runInit(): Promise<void> {
         INSERT INTO archival_fts(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
       END;
     `)
+
+    // Self-heal orphan FTS rows. Root cause observed 2026-04-17: an old
+    // archival row was deleted via a path that bypassed the AFTER DELETE
+    // trigger (e.g. an earlier code version or manual SQL), leaving a
+    // rowid in archival_fts with no matching base row. SQLite's autoincrement
+    // logic assigns the next INSERT that same orphaned rowid, which then
+    // collides inside the archival_ai trigger when it tries to re-insert
+    // into archival_fts — surfacing as a cryptic "constraint failed" with
+    // no further detail. Deleting orphans at startup restores write health.
+    db.exec(`
+      DELETE FROM archival_fts
+       WHERE rowid NOT IN (SELECT rowid FROM archival);
+    `)
   })()
 }
 
