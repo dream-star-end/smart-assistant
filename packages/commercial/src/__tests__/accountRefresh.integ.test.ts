@@ -12,7 +12,7 @@
  *   6. HTTP 5xx → 禁用 + 抛 http_error(status=502)
  *   7. HTTP 返非 JSON → 禁用 + 抛 bad_response
  *   8. HTTP 返 JSON 但缺 access_token → 禁用 + 抛 bad_response
- *   9. network throw → 禁用 + 抛 http_error
+ *   9. network throw → 抛 http_error 但 **不**禁用账号(网络/代理抖动可恢复)
  *  10. health.manualDisable 注入时走 health 路径而非 updateAccount
  */
 
@@ -374,7 +374,7 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
     assert.equal(row!.status, "disabled");
   });
 
-  test("network 抛 → http_error + 禁用", async (t) => {
+  test("network 抛 → http_error,但 **不** 禁用账号(代理/网络抖动可恢复)", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
       { label: "net", plan: "pro", token: "T", refresh: "R" },
@@ -391,8 +391,11 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
         (err as RefreshError).code === "http_error" &&
         (err as RefreshError).status === undefined,
     );
+    // 政策更新(2026-04-19,Codex 8ec407b 复审):网络层异常无法区分是 anthropic 挂
+    // 还是出口代理抖,不再 disable 账号 —— 否则代理供应商抖一次就把所有挂代理的
+    // 账号烧掉。orchestrator 会照常 yield error,下次 pick 再重试。
     const row = await getAccount(a.id);
-    assert.equal(row!.status, "disabled");
+    assert.equal(row!.status, "active");
   });
 
   test("health.manualDisable 注入时走 health 路径;Redis 计数器也被清", async (t) => {

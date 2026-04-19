@@ -233,7 +233,10 @@ export async function refreshAccountToken(
       deps.dispatcher,
     );
   } catch (err) {
-    await disableOnFailure(deps, accountId, "refresh_network_error");
+    // 不 disable —— 网络层异常(DNS / TCP / TLS / proxy 不通)无法区分是 anthropic
+    // 挂了还是出口代理基础设施抖动。把健康账号 disable 等于代理一抖就把账号烧了。
+    // 更上层(orchestrator.classifyError)对 RefreshError 当前算 "failure"(健康分扣
+    // 一格),那是合理的;但状态机层面账号仍 active,下次 pick 还能尝试。
     // 不把底层 err.message 拼进 message:未来如果 endpoint 可带凭据,
     // 上游 fetch 错误的 url 片段可能泄露;完整异常走 cause 链。
     throw new RefreshError(

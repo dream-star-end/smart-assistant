@@ -247,6 +247,15 @@ export async function* streamClaude(
       }
     }
   } finally {
+    // 始终先 cancel 再 releaseLock。已 done 的流 cancel() 会立即 resolve(no-op);
+    // 调用方提前 break/return/throw 退出 for-await 时,reader 仍持有未读完的 body,
+    // 不 cancel 就会让上游 fetch 的 socket 一直 keep-alive,导致 orchestrator 的
+    // ProxyAgent.close() 等死(Codex review 8ec407b 指出的 dispatcher hang)。
+    try {
+      await reader.cancel();
+    } catch {
+      /* 已 closed/errored 时 cancel 可能抛,忽略 */
+    }
     try {
       reader.releaseLock();
     } catch {

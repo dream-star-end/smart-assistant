@@ -93,6 +93,8 @@ interface StreamCallSnapshot {
   /** token 在调用瞬间的 utf8 快照(orchestrator 之后会 fill(0),所以必须抓快照) */
   tokenText: string;
   body: Record<string, unknown>;
+  /** proxyDeps 在调用瞬间的引用 —— 用于断言 dispatcher 是否注入 */
+  proxyDeps?: unknown;
 }
 
 /** 构造一个 streamFn mock:按预设的 ProxyEvent 序列 yield。 */
@@ -100,15 +102,16 @@ function mkStreamFn(
   events: ProxyEvent[],
   opts: { throwAt?: number; throwError?: Error } = {},
 ): {
-  fn: (input: StreamClaudeInput) => AsyncGenerator<ProxyEvent, void, void>;
+  fn: (input: StreamClaudeInput, deps?: unknown) => AsyncGenerator<ProxyEvent, void, void>;
   calls: StreamCallSnapshot[];
 } {
   const calls: StreamCallSnapshot[] = [];
   const { throwAt, throwError } = opts;
-  async function* gen(input: StreamClaudeInput): AsyncGenerator<ProxyEvent, void, void> {
+  async function* gen(input: StreamClaudeInput, deps?: unknown): AsyncGenerator<ProxyEvent, void, void> {
     calls.push({
       tokenText: input.account.token.toString("utf8"),
       body: input.body as Record<string, unknown>,
+      proxyDeps: deps,
     });
     for (let i = 0; i < events.length; i += 1) {
       if (throwAt !== undefined && i === throwAt && throwError) throw throwError;
@@ -499,5 +502,76 @@ describe("runClaudeChat — body 透传", () => {
     assert.equal(body.stream, undefined);
     // orchestrator 不会让 extra.messages 覆盖真 messages
     assert.deepEqual(body.messages, baseInput.messages);
+  });
+});
+
+describe("runClaudeChat — egress_proxy 注入(Codex 8ec407b 复审跟进)", () => {
+  test("egress_proxy=null → streamFn 收到的 proxyDeps 不含 dispatcher 字段", async () => {
+    const { scheduler } = mkScheduler({
+      pickResult: {
+        account_id: 7n,
+        plan: "pro",
+        token: Buffer.from("tok-no-proxy", "utf8"),
+        refresh: null,
+        expires_at: new Date(Date.now() + 3600_000),
+        egress_proxy: null,
+      },
+    });
+    const { fn, calls } = mkStreamFn([
+      evMessageStart(1),
+      evMessageDelta(1),
+      evMessageStop(),
+    ]);
+    await collect(runClaudeChat(baseInput, { scheduler, streamFn: fn } as RunChatDeps));
+    assert.equal(calls.length, 1);
+    const pd = calls[0].proxyDeps as Record<string, unknown>;
+    assert.ok(pd, "proxyDeps must exist");
+    assert.equal(
+      "dispatcher" in pd,
+      false,
+      "无代理时不应给 fetchInit 注入 dispatcher 字段(避免被 undici 误解为 'cancel default')",
+    );
+  });
+
+  test("egress_proxy=有值 → streamFn 收到 dispatcher 实例(undici ProxyAgent)", async () => {
+    const { scheduler } = mkScheduler({
+      pickResult: {
+        account_id: 8n,
+        plan: "pro",
+        token: Buffer.from("tok-proxy", "utf8"),
+        refresh: null,
+        expires_at: new Date(Date.now() + 3600_000),
+        egress_proxy: "http://u:p@127.0.0.1:1",
+      },
+    });
+    const { fn, calls } = mkStreamFn([
+      evMessageStart(1),
+      evMessageDelta(1),
+      evMessageStop(),
+    ]);
+    await collect(runClaudeChat(baseInput, { scheduler, streamFn: fn } as RunChatDeps));
+    assert.equal(calls.length, 1);
+    const pd = calls[0].proxyDeps as Record<string, unknown>;
+    assert.ok(pd && pd.dispatcher, "有代理时 proxyDeps.dispatcher 必须被注入");
+    // 只检 dispatcher 是个对象。ProxyAgent.close 在 Node 上是 DispatcherBase 继承,
+    // 但 Bun 内置 undici 替换没暴露,所以测试不强检方法名,避免 runtime 耦合。
+    // finally 里 closeDispatcher 已用 try/catch 包裹了,真没有 .close 也只 warn。
+    assert.equal(typeof pd.dispatcher, "object");
+  });
+
+  test("有 dispatcher + 正常完成路径不会 hang(整个测试在 timeout 内 resolve)", async () => {
+    const { scheduler } = mkScheduler({
+      pickResult: {
+        account_id: 9n,
+        plan: "pro",
+        token: Buffer.from("tok-happy", "utf8"),
+        refresh: null,
+        expires_at: new Date(Date.now() + 3600_000),
+        egress_proxy: "http://127.0.0.1:1",
+      },
+    });
+    const { fn } = mkStreamFn([evMessageStart(1), evMessageDelta(1), evMessageStop()]);
+    const events = await collect(runClaudeChat(baseInput, { scheduler, streamFn: fn } as RunChatDeps));
+    assert.equal(events[events.length - 1].type, "done");
   });
 });
