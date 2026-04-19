@@ -235,13 +235,15 @@ export class CodexRunner extends EventEmitter {
   private buildArgs(): string[] {
     // approval_policy=never prevents codex from ever asking for approval
     // (we have no UI path to answer — sendPermissionResponse is a no-op).
-    // Combined with sandbox=workspace-write this gives "do anything in cwd,
-    // refuse anything outside". Model comes from agents.yaml.
+    // --full-auto is codex's alias for `--sandbox workspace-write` AND is
+    // the only sandbox-setting flag accepted by both `codex exec` and
+    // `codex exec resume` (resume rejects `--sandbox` outright, which
+    // silently broke every multi-turn codex conversation with code=2).
+    // Model comes from agents.yaml.
     const base = [
       '--json',
       '--skip-git-repo-check',
-      '--sandbox',
-      'workspace-write',
+      '--full-auto',
       '-c',
       'approval_policy="never"',
     ]
