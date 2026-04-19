@@ -861,30 +861,6 @@ export class Gateway {
       res.end(serializeMetrics())
       return
     }
-    // Steel browser iframe URL — returns the current cloudflared quick-tunnel URL
-    // that points to the self-hosted Steel UI (basic-auth protected).
-    // Reads /root/.openclaude/steel-tunnel-url, which is maintained by
-    // /usr/local/bin/steel-tunnel-run under the steel-tunnel.service systemd unit.
-    // URL changes on every tunnel restart, so frontend must refetch (no caching).
-    if (url.pathname === '/api/browser/iframe-url' && req.method === 'GET') {
-      // Tunnel URL rotates on every cloudflared restart — must not be cached by
-      // browsers or intermediaries, otherwise a stale {ok:true,url} will point
-      // the iframe at a dead domain (or a stale {ok:false,reason:'not_ready'}
-      // will permanently hide a tunnel that has since come up).
-      res.setHeader('Cache-Control', 'no-store')
-      const urlFile = '/root/.openclaude/steel-tunnel-url'
-      try {
-        const raw = readFileSync(urlFile, 'utf8').trim()
-        if (!raw || !/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(raw)) {
-          this.sendJson(res, 200, { ok: false, reason: 'not_ready' })
-          return
-        }
-        this.sendJson(res, 200, { ok: true, url: raw, authHint: 'basic-auth' })
-      } catch {
-        this.sendJson(res, 200, { ok: false, reason: 'not_configured' })
-      }
-      return
-    }
     if (url.pathname === '/api/doctor') {
       const summary = this._runLog.summary()
       const recentRuns = this._runLog.recent(20)

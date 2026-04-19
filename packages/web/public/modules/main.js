@@ -64,7 +64,6 @@ import { maybeNotify, requestNotifyPermission, setTitleBusy } from './notificati
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 import { initWechatListeners, openWechatModal } from './wechat.js'
-import { initBrowserPanel } from './browserPanel.js'
 
 // ── Memory & Skills ──
 import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js'
@@ -568,9 +567,6 @@ initTasksListeners()
 // ── OAuth: button click listeners ──
 initOAuthListeners()
 initWechatListeners()
-
-// ── Browser live-preview panel (Steel via cloudflared) ──
-initBrowserPanel()
 
 // ── Effort pills (编码模式 / 科研模式): bind once + render initial visibility ──
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
