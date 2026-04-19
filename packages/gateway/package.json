@@ -4,11 +4,15 @@
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "dependencies": {
+    "@openclaude/plugin-sdk": "*",
     "@openclaude/protocol": "*",
     "@openclaude/storage": "*",
-    "@openclaude/plugin-sdk": "*",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
     "ws": "^8.18.0",
     "yaml": "^2.6.0"
   },

@@ -108,6 +108,57 @@ function syncAudienceInTextarea(newKey) {
   ta.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
+// ── 矩阵模板文案 ──
+//
+// 这些模板的目的是降低 alice 类用户的"心智摩擦":同一类问题(对照不同方案、
+// 扫描不同参数、自检公式)在每个对话里反复手抄表头很累,先吐一份骨架让用户
+// 直接填空,既统一了表格结构,也给 agent 明确提示"请按表格行列计算"。
+const MATRIX_TEMPLATES = {
+  compare: [
+    '请按下表对比这几个方案。**先把缺失的单元格补全**,数字给出来源(论文/估算公式/经验值),不确定就标范围或假设;再在表格下方写 3~5 条结论:',
+    '',
+    '| 方案 | 关键参数 1 | 关键参数 2 | 关键参数 3 | 优势 | 风险/局限 |',
+    '| --- | --- | --- | --- | --- | --- |',
+    '| 方案 A |  |  |  |  |  |',
+    '| 方案 B |  |  |  |  |  |',
+    '| 方案 C |  |  |  |  |  |',
+    '',
+    '(我会在表头里把"关键参数 1/2/3"改成具体指标。)',
+  ].join('\n'),
+  sweep: [
+    '请帮我做参数扫描。**对下面每一行的输入参数,按相同公式/相同流程算一次输出**,把结果填进表格,并在表下用 3 句话总结趋势(单调/拐点/最优区间):',
+    '',
+    '| 参数取值 | 输出 1 | 输出 2 | 备注 |',
+    '| --- | --- | --- | --- |',
+    '|  |  |  |  |',
+    '|  |  |  |  |',
+    '|  |  |  |  |',
+    '',
+    '(我会先把第一列的取值填好,你按行计算。)',
+  ].join('\n'),
+  check: [
+    '请对你上一个回答里出现的**所有公式和数字**做一次自检,按以下顺序逐条核:',
+    '1. **量纲一致性**:左右两侧单位是否一致;每个常数的单位是否给了',
+    '2. **数量级合理性**:数值是否落在物理/工程合理区间(给出参考量级)',
+    '3. **极限行为**:取极端值(如 → 0 / → ∞)时表达式是否退化成已知简单情况',
+    '4. **来源**:数字/常数来自经验估算还是引文?如果是引文,给文献(无法核对就明示"来源待查")',
+    '',
+    '如果发现错误,直接给出修正后的版本;无错也要明确说"已检查,无误"。',
+  ].join('\n'),
+}
+
+function insertMatrixTemplate(kind) {
+  const text = MATRIX_TEMPLATES[kind]
+  if (!text) return
+  const ta = /** @type {HTMLTextAreaElement|null} */ ($('input'))
+  if (!ta) return
+  const existing = ta.value.trim()
+  ta.value = existing ? `${existing}\n\n${text}` : text
+  ta.focus()
+  ta.dispatchEvent(new Event('input', { bubbles: true }))
+  ta.setSelectionRange(ta.value.length, ta.value.length)
+}
+
 // ── 浓缩模板文案 ──
 const CONDENSE_TEMPLATES = {
   onepage: [
@@ -201,6 +252,12 @@ export function initResearchTools() {
     if (condenseBtn && wrap.contains(condenseBtn)) {
       const kind = condenseBtn.dataset.condense ?? ''
       insertCondenseTemplate(kind)
+      return
+    }
+    const matrixBtn = target.closest('.matrix-btn')
+    if (matrixBtn && wrap.contains(matrixBtn)) {
+      const kind = matrixBtn.dataset.matrix ?? ''
+      insertMatrixTemplate(kind)
     }
   })
   // effort pill 被点击后 effortMode.setCurrentEffort 会调 renderModePills,
