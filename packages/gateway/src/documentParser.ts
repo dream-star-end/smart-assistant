@@ -102,22 +102,23 @@ async function parseDocx(filePath: string): Promise<ParseResult | null> {
  */
 async function parsePdf(filePath: string): Promise<ParseResult | null> {
   let parser: {
-    getText: (params?: { last?: number }) => Promise<{ text?: string }>
+    getText: (params?: { first?: number; last?: number }) => Promise<{ text?: string }>
     destroy: () => Promise<void> | void
   } | null = null
   try {
     const { PDFParse } = (await import('pdf-parse')) as {
       PDFParse: new (opts: { data: Uint8Array }) => {
-        getText: (params?: { last?: number }) => Promise<{ text?: string }>
+        getText: (params?: { first?: number; last?: number }) => Promise<{ text?: string }>
         destroy: () => Promise<void> | void
       }
     }
     const buffer = await readFile(filePath)
     parser = new PDFParse({ data: new Uint8Array(buffer) })
-    // last=PDF_MAX_PAGES 让 PDFParse.shouldParse 在 [1, PDF_MAX_PAGES] 范围
-    // 内才解析;对几百页的书自动只取前 60 页。这是限工作量、不是限取消的闸。
+    // pdf-parse v2 shouldParse 语义:`first: N` 单独使用 → 解析第 1..N 页(我们要的);
+    // `last: N` 单独使用 → 解析"最后 N 页"(摘要会被丢、留下索引/参考文献,
+    // 跟科研用例完全相反)。所以这里务必用 first 而不是 last。
     const result = await withTimeout(
-      parser.getText({ last: PDF_MAX_PAGES }),
+      parser.getText({ first: PDF_MAX_PAGES }),
       PDF_TIMEOUT_MS,
       'pdf-parse.getText',
     )
