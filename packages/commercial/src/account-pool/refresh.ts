@@ -297,8 +297,8 @@ export async function refreshAccountToken(
   if (newRefreshToken !== null) {
     patch.refresh = newRefreshToken;
   }
-  // 持久化失败是特殊分类:远端 token 已轮换,本地却没存下,账号若仍 active
-  // 会继续发旧 token,场面失控。按"失败一律禁用"的规约走 disableOnFailure。
+  // 持久化失败属于"必禁"档(见文件头规约):远端 token 已轮换,本地没存下,
+  // 账号若仍 active 会继续发旧 token,场面失控,所以无条件 disableOnFailure。
   // 唯一例外:updateAccount 返 null 说明账号并发删了(不抛也无法禁用,
   // 就按 account_not_found 抛,不算 persist 错)。
   let updated: Awaited<ReturnType<typeof updateAccount>>;
