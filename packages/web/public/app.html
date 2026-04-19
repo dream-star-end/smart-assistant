@@ -1122,9 +1122,17 @@ async function renderChat(root) {
     if (models.length === 0) {
       modelSel.appendChild(el("option", { value: "" }, "(无可用模型,请联系管理员)"));
     } else {
+      // 价格友好化:credits/ktok × 1000 = ¥/百万 tok。去末尾 0,小数位最多保留 4 位。
+      const fmtPrice = (perKtok) => {
+        const perMtok = Number(perKtok) * 1000;
+        if (!Number.isFinite(perMtok)) return "—";
+        return `¥${perMtok.toFixed(4).replace(/\.?0+$/, "")}`;
+      };
       for (const m of models) {
+        const inP  = fmtPrice(m.input_per_ktok_credits);
+        const outP = fmtPrice(m.output_per_ktok_credits);
         modelSel.appendChild(el("option", { value: m.id },
-          `${m.display_name} — in ${m.input_per_ktok_credits}/k · out ${m.output_per_ktok_credits}/k`));
+          `${m.display_name} · 输入 ${inP} · 输出 ${outP} / 百万 tok`));
       }
       chatState.currentModel = models[0].id;
       modelSel.value = chatState.currentModel;
