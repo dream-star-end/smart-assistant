@@ -163,6 +163,7 @@ import {
   slashPopupVisible,
 } from './commands.js'
 import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
+import { initResearchTools, renderResearchTools } from './researchTools.js'
 
 // ═══════════════════════════════════════════════════════════
 // 1. Wire late-bound dependencies
@@ -572,6 +573,8 @@ initWechatListeners()
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
 // 再触发一次;这里只是绑定点击事件并把初始隐藏态打上去。
 initModePills()
+// 科研模式工具条 — 仅在用户选中 effort=max 时显示,提供受众切换 + 浓缩模板。
+initResearchTools()
 
 // ── Feedback: submit wiring ──
 $('feedback-submit-btn').onclick = submitFeedback
@@ -1460,6 +1463,7 @@ async function init() {
     sess.agentId = e.target.value
     // Pill 跟着新 agent 的 model 走 — 切到非 Opus 4.7 自动隐藏,选中态按新 agent 的存储读。
     renderModePills()
+    renderResearchTools()
     // Mark switch time — handleOutbound will ignore frames arriving before this
     sess._agentSwitchedAt = Date.now()
     // Reset streaming state to prevent cross-agent message contamination

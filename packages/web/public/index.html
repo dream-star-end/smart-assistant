@@ -169,6 +169,32 @@
             <span>科研模式</span>
           </button>
         </div>
+        <div id="research-tools" class="research-tools" hidden role="group" aria-label="科研模式工具条">
+          <div class="research-tools-row">
+            <span class="research-tools-label">受众</span>
+            <button type="button" class="mode-pill audience-pill" data-audience="peer" aria-pressed="false" title="同行视角:可保留专业缩写与公式表述">
+              <span>同行</span>
+            </button>
+            <button type="button" class="mode-pill audience-pill" data-audience="cross" aria-pressed="false" title="跨领域视角:展开缩写并加一句人话解释">
+              <span>跨领域</span>
+            </button>
+            <button type="button" class="mode-pill audience-pill" data-audience="exec" aria-pressed="false" title="决策层视角:去推导,保留结论与数字,不超过半页">
+              <span>决策层</span>
+            </button>
+          </div>
+          <div class="research-tools-row">
+            <span class="research-tools-label">浓缩</span>
+            <button type="button" class="mode-pill condense-btn" data-condense="onepage" title="请求 agent 把上一个回答压成一页纸(背景/问题/数据/结论四段式)">
+              <span>一页纸</span>
+            </button>
+            <button type="button" class="mode-pill condense-btn" data-condense="halfpage" title="请求半页纸压缩(~300 字)">
+              <span>半页纸</span>
+            </button>
+            <button type="button" class="mode-pill condense-btn" data-condense="tldr" title="请求 TL;DR(一段话,不超过 80 字)">
+              <span>TL;DR</span>
+            </button>
+          </div>
+        </div>
         <div class="composer-input-row">
           <textarea id="input" placeholder="发消息给 agent…" rows="1" aria-label="输入消息"></textarea>
           <div class="composer-actions">

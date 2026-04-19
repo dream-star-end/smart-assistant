@@ -20,6 +20,9 @@ export interface PromptSlotContext {
   persona?: string // path to CLAUDE.md / SOUL.md
   provider?: string
   model?: string
+  /** CCB effort level — 'xhigh' / 'max' 触发科研守则 slot,其它值(含 undefined)不触发。
+   *  仅在 Opus 4.7 + 用户选了"科研模式"pill 时会是 xhigh/max。 */
+  effortLevel?: string
 }
 
 export interface PromptSlot {
@@ -206,6 +209,80 @@ export function buildToolsSlot(): PromptSlot {
   }
 }
 
+// ── 科研模式 slot ──
+// 仅在 effortLevel = 'xhigh' / 'max' 时注入,驱动 agent 在涉及数值/公式/跨领域
+// 表达时更严谨。这不是对话 preamble(不注入 user text),而是 extra-prompt 里
+// 一条常驻守则,下一次 CCB 启动(effort 切换本来就会 recycle runner)自动生效。
+//
+// 设计原则:只写 agent 能直接执行的行为规则,不写空泛倡导。alice(科研用户)
+// 历史对话里暴露的 6 类问题是这条 slot 的直接动机 —— 参见 memory
+// `feedback_scientific_numbers` 及 alice 5 条会话的真实痛点。
+//
+// 触发条件**仅** effortLevel === 'max'(UI 上叫"科研模式")。xhigh 是"编码模式",
+// 它也需要高 effort 但语义不同,不应继承这套科学严谨度守则(否则用户在
+// 编码模式下也会被"数值保守 / 公式前提 / 误差分类"污染)。
+// 未来如果要把"模式"和"effort"解耦,应在 PromptSlotContext 里新增
+// conversationMode 字段,不复用 effortLevel。
+const RESEARCH_EFFORT_LEVELS = new Set(['max'])
+
+export function buildResearchSlot(ctx: PromptSlotContext): PromptSlot | null {
+  if (!ctx.effortLevel || !RESEARCH_EFFORT_LEVELS.has(ctx.effortLevel)) return null
+  return {
+    name: 'RESEARCH',
+    content: [
+      '# 科研模式守则',
+      '',
+      '当前会话已由用户切到高思考档位,按**科研严谨度**标准作答。以下守则对本会话的',
+      '所有数值结论、公式推导、跨领域表达生效。不要在回答里复述这段守则,只执行。',
+      '',
+      '## 1. 数值结论默认保守',
+      '',
+      '- 给出范围或 1σ 不确定度,而不是单点乐观值。',
+      '- 若问题性质允许,按**保守 / 中位 / 乐观**三档列出,并明示取用哪档的前提。',
+      '- 关键数字(设备指标、精度、传播参数等)若来自经验估算而非已核实文献,',
+      '  在数字后用 `[需核查]` 标记,方便用户回查。',
+      '',
+      '## 2. 误差传播必须分类',
+      '',
+      '- 明确区分**随机误差**(按 √N 衰减,N 为独立观测量)与**系统误差**(与 N 无关)。',
+      '- 禁止对系统性误差套用 √N 缩减。禁止把"观测量减少 k 倍 → 精度退化 √k 倍"',
+      '  当作普适结论:它只在纯热噪声主导时成立。',
+      '- 涉及多项误差合成时,默认按平方和开方(RSS),并注明是否考虑相关性。',
+      '',
+      '## 3. 公式/关系用完后自检前提',
+      '',
+      '- 引用 $\\sigma \\propto 1/\\sqrt{N}$、$N(N-1)/2$、GDOP、Fisher 矩阵等关系时,',
+      '  一行注明前提("假设独立、同方差、线性化后 ..."),若该前提在问题中不成立,',
+      '  显式指出并给出修正量级。',
+      '- 避免"按比例外推"式推理(例如时间缩短 12 倍 → 精度退化 √12 倍)未经',
+      '  几何/耦合分析的单独使用 —— 几何(GDOP)和大气-高程相关耦合应单独计入。',
+      '',
+      '## 4. 专业缩写首次出现给全称',
+      '',
+      '- GDOP / EOP / VLBI / ZWD / WVR / SEFD / ICRF 等缩写在**每条回答内的首次**',
+      '  出现后,用括号给中文或英文全称一次,后续可省略。',
+      '- 用户若要求"给其它领域人看",全部缩写展开并加一句人话解释。',
+      '',
+      '## 5. 单位与符号一致',
+      '',
+      '- 同一条回答里不要混用 ps/ns、mm/mrad、度/°、km/m。统一到最适合量级的那个,',
+      '  换算一次即可。',
+      '- LaTeX 公式里的变量与正文叙述里的符号保持一致,避免同一量用两种记号。',
+      '',
+      '## 6. 多轮参数方案对照',
+      '',
+      '- 用户连续改参数(观测时长、站数、频带、基线)迭代方案时,在合适的回合',
+      '  维护一张**方案对照表**,一行一个方案,列出与本轮相关的 5~8 个关键列,',
+      '  差分高亮"本轮改了哪些"。避免每次重画完整表格。',
+      '',
+      '## 7. 浓缩请求的结构模板',
+      '',
+      '用户要求"一页纸"/"半页纸"/"摘要"时,统一按以下四段结构:',
+      '**背景 → 核心问题 → 关键数据(1 张小表) → 结论**。不要保留详细推导。',
+    ].join('\n'),
+  }
+}
+
 // ── Unified builder ──
 
 const SEPARATOR = '\n\n---\n\n'
@@ -237,6 +314,11 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<string
 
   const tools = buildToolsSlot()
   slots.push(tools)
+
+  // Layer 4: 用户显式选中的模式(科研模式等)。放最后,离 user 消息最近,
+  // 提升 agent 对"本会话约束"的遵循度。不选就不注入。
+  const research = buildResearchSlot(ctx)
+  if (research) slots.push(research)
 
   return slots.map((s) => s.content).join(SEPARATOR)
 }
