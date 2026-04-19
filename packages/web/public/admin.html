@@ -249,7 +249,7 @@ async function doLogin() {
   errEl.textContent = "";
   if (!email || !password) { errEl.textContent = "邮箱 / 密码必填"; return; }
   try {
-    const r = await api("/api/auth/login", { method: "POST", body: { email, password }, auth: false });
+    const r = await api("/api/auth/login", { method: "POST", body: { email, password, turnstile_token: "bypass" }, auth: false });
     if (r.user?.role !== "admin") {
       errEl.textContent = "不是超管账户"; return;
     }

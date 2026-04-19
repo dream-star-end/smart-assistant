@@ -1,26 +1,25 @@
 #!/bin/bash
-# 一键部署: 本地 push v2 → 远程 38.55.134.227 pull + 重启 openclaude.service
+# 一键部署: 本地 commercial 仓库 → rsync 到 45.76.214.99(Vultr Tokyo)→ 重启 openclaude.service
 #
 # 用法: ./deploy-to-remote.sh
 #
-# 前置条件:
-#   - 本地已通过 git 提交所有改动(脚本会检查 working tree 是否干净)
-#   - 本地对 GitHub 仓库有 push 权限(SSH key 已配置)
-#   - sshpass 已安装(apt-get install -y sshpass)
+# 历史:
+#   - 2026-04-18 之前: 38.55.134.227 / git pull 路径(其实跑不通,因为 38.55 出站不通,实际走 rsync)
+#   - 2026-04-19: 整套迁到 Vultr Tokyo 45.76.214.99,新机器出站通,SSH 走 ed25519 key 免密。
+#                改用 rsync 路径作为唯一真理,远端不再维护 git 仓库。
 
 set -e
 
-REMOTE_HOST="38.55.134.227"
+REMOTE_HOST="45.76.214.99"
 REMOTE_USER="root"
-REMOTE_PASS="auejRWHA6997"
-REMOTE_REPO="/opt/openclaude/openclaude"   # v2 线上部署目录(38.55 上不变)
+REMOTE_REPO="/opt/openclaude/openclaude"
 BRANCH="v2"
 SERVICE="openclaude.service"
 HEALTH_URL="http://127.0.0.1:18789/healthz"
 
-# ---- 校验 ----
-
 cd "$(dirname "$0")"
+
+# ---- 校验 ----
 
 CUR_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 if [ "$CUR_BRANCH" != "$BRANCH" ]; then
@@ -34,49 +33,38 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-if ! command -v sshpass >/dev/null 2>&1; then
-  echo "[ABORT] 缺少 sshpass, 请先: apt-get install -y sshpass"
-  exit 1
-fi
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 
-# ---- 本地 push ----
+# ---- 本地 push (备份到 GitHub) ----
 
-echo "=== [1/3] Push $BRANCH to origin ==="
+echo "=== [1/4] Push $BRANCH to origin (备份) ==="
 git push origin "$BRANCH"
 LOCAL_HEAD=$(git rev-parse HEAD)
 echo "Local HEAD: $LOCAL_HEAD"
 
-# ---- 远程部署 ----
+# ---- rsync 代码 (含 node_modules,排除 .git/dist/log) ----
 
 echo ""
-echo "=== [2/3] Remote deploy on $REMOTE_HOST ==="
+echo "=== [2/4] rsync to $REMOTE_HOST:$REMOTE_REPO/ ==="
+rsync -a --delete \
+  --exclude='.git' \
+  --exclude='*.log' \
+  --exclude='/dist' \
+  --exclude='/data' \
+  --exclude='.env' \
+  -e "ssh $SSH_OPTS" \
+  ./ "$REMOTE_USER@$REMOTE_HOST:$REMOTE_REPO/"
+echo "rsync done"
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+# ---- 远程 restart ----
 
-sshpass -p "$REMOTE_PASS" ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" bash -s <<REMOTE_SCRIPT
+echo ""
+echo "=== [3/4] Restart $SERVICE ==="
+ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" bash -s <<REMOTE_SCRIPT
 set -e
-cd "$REMOTE_REPO"
-
-echo "--- Pull $BRANCH ---"
-git fetch origin "$BRANCH"
-BEFORE=\$(git rev-parse HEAD)
-git reset --hard origin/$BRANCH
-AFTER=\$(git rev-parse HEAD)
-
-if [ "\$BEFORE" = "\$AFTER" ]; then
-  echo "Already up to date: \$AFTER"
-else
-  echo "Updated: \$BEFORE -> \$AFTER"
-  git log --oneline "\$BEFORE..\$AFTER"
-fi
-
-echo ""
-echo "--- Restart $SERVICE ---"
-pkill -9 -f claude-code-best 2>/dev/null || true
-sleep 1
+echo "--- restart $SERVICE ---"
 systemctl restart "$SERVICE"
-sleep 3
-
+sleep 4
 if systemctl is-active "$SERVICE" > /dev/null 2>&1; then
   echo "Service active"
 else
@@ -89,17 +77,20 @@ REMOTE_SCRIPT
 # ---- 健康检查 ----
 
 echo ""
-echo "=== [3/3] Health check ==="
-HEALTH=$(sshpass -p "$REMOTE_PASS" ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "curl -s -m 5 $HEALTH_URL || true")
-echo "Health: $HEALTH"
+echo "=== [4/4] Health check ==="
+HEALTH=$(ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "curl -s -m 5 $HEALTH_URL || true")
+echo "Local healthz: $HEALTH"
 
-if [ -n "$HEALTH" ]; then
+PUBLIC=$(curl -sS -m 10 -o /dev/null -w "%{http_code}" https://claudeai.chat/healthz || echo "fail")
+echo "Public https://claudeai.chat/healthz: HTTP $PUBLIC"
+
+if [ -n "$HEALTH" ] && [ "$PUBLIC" = "200" ]; then
   echo ""
   echo "=== Deploy OK ==="
   echo "Branch:  $BRANCH @ $LOCAL_HEAD"
   echo "Remote:  $REMOTE_USER@$REMOTE_HOST:$REMOTE_REPO"
   echo "Service: $SERVICE"
 else
-  echo "[FAIL] Health check empty"
+  echo "[FAIL] Health check failed"
   exit 1
 fi
