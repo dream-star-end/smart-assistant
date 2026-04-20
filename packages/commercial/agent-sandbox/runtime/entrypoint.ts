@@ -91,6 +91,15 @@ try {
         claudeCodeEntry: "dist/cli.js",
         claudeCodeRuntime: "node",
       },
+      // 必填:个人版 SessionManager.getOrCreate (sessionManager.ts:303) 在 spawn ccb 时
+      // 会读 `this.config.defaults.model / .permissionMode / .toolsets`。defaults 缺失
+      // 直接 NPE → ws-message unhandled error → 前端"thinking 0s 无新数据"卡死。
+      // 历史 incident 2026-04-21:漏写本字段,boss 在 claudeai.chat 发消息容器接到
+      // 但永远不回包。
+      defaults: {
+        model: "claude-opus-4-7",
+        permissionMode: "acceptEdits",
+      },
       // 必填占位:个人版 gateway.ts 在启动时直接读 config.channels.wechat / .telegram
       // 不存在会 TypeError。容器场景下我们不开任何外部 channel —— webchat 由商用版
       // userChatBridge 走 docker bridge 直连容器 18789(WS upgrade),无需 channel adapter。
@@ -102,9 +111,34 @@ try {
     writeFileSync(ocConfigPath, JSON.stringify(minimalConfig, null, 2), { mode: 0o600 });
     console.error(`[entrypoint] bootstrapped minimal openclaude.json at ${ocConfigPath}`);
   }
+
+  // 个人版 SessionManager 也需要 agents.yaml 才能解析 opts.agent。volume 是空时
+  // 同步 bootstrap 一份单 agent 配置(default=main, model=opus-4-7,
+  // permissionMode=bypassPermissions —— v3 容器是 sandbox,内部不再做权限交互)。
+  const agentsPath = join(ocConfigDir, "agents.yaml");
+  if (!existsSync(agentsPath)) {
+    const personaDir = join(ocConfigDir, "agents", "main");
+    const personaPath = join(personaDir, "CLAUDE.md");
+    mkdirSync(personaDir, { recursive: true });
+    if (!existsSync(personaPath)) {
+      writeFileSync(personaPath, "你是 OpenClaude 上的助手,简洁中文回答。\n", { mode: 0o644 });
+    }
+    const agentsYaml =
+      "agents:\n" +
+      "  - id: main\n" +
+      "    model: claude-opus-4-7\n" +
+      `    persona: ${personaPath}\n` +
+      "    permissionMode: bypassPermissions\n" +
+      "    provider: claude-subscription\n" +
+      "    displayName: main\n" +
+      "routes: []\n" +
+      "default: main\n";
+    writeFileSync(agentsPath, agentsYaml, { mode: 0o644 });
+    console.error(`[entrypoint] bootstrapped agents.yaml at ${agentsPath}`);
+  }
 } catch (err) {
   // 不致命: 如果 volume 没挂(本地 build smoke)或 perm 异常,gateway 自己会 onboard 流程报错
-  console.error(`[entrypoint] WARN: 写 openclaude.json 失败: ${(err as Error).message}`);
+  console.error(`[entrypoint] WARN: 写 openclaude.json/agents.yaml 失败: ${(err as Error).message}`);
 }
 
 // ───────────────────────────────────────────────
