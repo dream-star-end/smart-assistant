@@ -35,7 +35,7 @@
 | **2I-1** | RequestId middleware + 结构化 log schema(自写无 pino dep;贯穿 bridge/proxy/preCheck/finalize/Anthropic call,全 log 必带 requestId+uid+containerId,**禁止落 prompt body**) | 2A | ✅ | 73bf28c |
 | **2C** | `commercial/src/auth/containerIdentity.ts` 双因子校验(socket IP 反查 + secret hash timing-safe compare)+ 测试 | 2.0, 2B, 2I-1 | ✅ | bf1d805 |
 | **2D** | `commercial/src/http/anthropicProxy.ts` central proxy(**仅 monolith 拓扑**,绑 `172.30.0.1:18791`):zod strict body schema + 字段字节预算 + 双侧 cost 估算 + header 值 allowlist + per-uid rate limit + concurrency cap + preCheck + 上游 fetch + 双向 abort + single-shot finalizer + `pipeStreamWithUsageCapture`。**MVP 跳过 split 拓扑、跳过 edge sidecar 子进程** | 2C, 2I-1 | ✅ | 95ea08a |
-| **2E** | `commercial/src/ws/userChatBridge.ts` 用户 WS ↔ 容器 WS 桥 + 测试 | 2I-1 | ⏳ | — |
+| **2E** | `commercial/src/ws/userChatBridge.ts` 用户 WS ↔ 容器 WS 桥 + 测试 | 2I-1 | ✅ | 19a9807 |
 | **2F** | `commercial/src/http/models.ts` GET `/api/models`(从 model_pricing 过滤 enabled) | — | ⏳ | — |
 | **2G** | `commercial/src/user/preferences.ts` GET/PATCH `/api/me/preferences` | 2B | ⏳ | — |
 | **2H** | gateway `server.ts` 接入 commercialHandle + WS upgrade 路由 + `/healthz` 包含 commercial 状态 | 2A-2G | ⏳ | — |
