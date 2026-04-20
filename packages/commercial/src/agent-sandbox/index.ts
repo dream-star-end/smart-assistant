@@ -73,3 +73,19 @@ export {
   type StartIdleSweepSchedulerOptions,
   type IdleSweepScheduler,
 } from "./v3idleSweep.js";
+
+// V3 Phase 3G — volume GC(banned 7d / no-login 90d)
+export {
+  startVolumeGcScheduler,
+  runVolumeGcTick,
+  DEFAULT_VOLUME_GC_INTERVAL_MS,
+  DEFAULT_BANNED_RETAIN_DAYS,
+  DEFAULT_NO_LOGIN_RETAIN_DAYS,
+  DEFAULT_VOLUME_GC_BATCH_LIMIT,
+  type VolumeGcLogger,
+  type VolumeGcReason,
+  type VolumeGcTickOptions,
+  type VolumeGcTickResult,
+  type StartVolumeGcSchedulerOptions,
+  type VolumeGcScheduler,
+} from "./v3volumeGc.js";

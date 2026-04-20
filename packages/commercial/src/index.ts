@@ -53,8 +53,10 @@ import {
 import {
   makeV3EnsureRunning,
   startIdleSweepScheduler,
+  startVolumeGcScheduler,
   type IdleSweepScheduler,
   type V3SupervisorDeps,
+  type VolumeGcScheduler,
 } from "./agent-sandbox/index.js";
 import {
   observeWsBridgeBuffered,
@@ -484,6 +486,24 @@ export async function registerCommercial(
     // eslint-disable-next-line no-console
     console.log("[commercial] v3 idle sweep scheduler started (60s tick, 30min cutoff)");
   }
+
+  // V3 Phase 3G:volume GC(banned 7d / no-login 90d)。1h 一跑,删孤立 volume。
+  // cfg.OC_VOLUME_GC_DISABLED=1 可手动关掉(运维灾备 / 数据回滚演练时用)。
+  let volumeGcScheduler: VolumeGcScheduler | undefined;
+  if (v3Deps && process.env.OC_VOLUME_GC_DISABLED !== "1") {
+    volumeGcScheduler = startVolumeGcScheduler(v3Deps, {
+      logger: {
+        debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
+        info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
+        warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
+        error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
+      },
+      runOnStart: false,
+    });
+    // eslint-disable-next-line no-console
+    console.log("[commercial] v3 volume gc scheduler started (1h tick, banned 7d / no-login 90d)");
+  }
+
   const resolveContainerEndpoint: ResolveContainerEndpoint =
     options.resolveContainerEndpoint
     ?? (v3Deps
@@ -533,6 +553,9 @@ export async function registerCommercial(
       }
       if (idleSweepScheduler) {
         try { await idleSweepScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (volumeGcScheduler) {
+        try { await volumeGcScheduler.stop(); } catch { /* ignore */ }
       }
       if (alertScheduler) {
         try { await alertScheduler.stop(); } catch { /* ignore */ }
