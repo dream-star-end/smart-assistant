@@ -63,11 +63,25 @@ const DYNAMIC_IDS = new Set([
   '__typing', // showTypingIndicator() creates div#__typing
   'tasks-panel', // _renderTasksPanel() creates div#tasks-panel
   'slash-popup', // showSlashPopup() creates div#slash-popup
+  // websocket.js 在 showPermissionRequest 时 overlay.id='permission-modal'
+  // 后续用 document.getElementById('permission-modal') 查;index.html 没有
+  // 静态 stub。
+  'permission-modal',
 ])
 
-// ── Template-literal dynamic IDs: $(`tasks-panel-${t}`) / $(`tasks-tab-${t}`) ──
-// These have known expansions: cron, bg, log — which ARE in the HTML
-const TEMPLATE_DYNAMIC_PREFIXES = ['tasks-panel-', 'tasks-tab-']
+// ── Template-literal dynamic IDs: $(`prefix-${var}`) ──
+// Each entry: prefix → known suffixes (must all exist in index.html)
+const TEMPLATE_DYNAMIC_EXPANSIONS: Record<string, readonly string[]> = {
+  'tasks-panel-': ['cron', 'bg', 'log'],
+  'tasks-tab-': ['cron', 'bg', 'log'],
+  // V3 Phase 4A 多模态认证: $(`auth-mode-${m}`) / $(`auth-tab-${m}`)
+  'auth-mode-': ['login', 'register', 'forgot', 'reset', 'verify'],
+  'auth-tab-': ['login', 'register', 'forgot'],
+  // V3 Phase 4B 充值 + 微信:三段式 stage / 三态 wechat-state
+  'topup-stage-': ['plans', 'qr', 'done'],
+  'wechat-state-': ['unbound', 'pairing', 'bound'],
+}
+const TEMPLATE_DYNAMIC_PREFIXES = Object.keys(TEMPLATE_DYNAMIC_EXPANSIONS)
 
 // ── Load files once ──
 const html = readPublicFile('index.html')
@@ -146,11 +160,9 @@ describe('T02: No duplicate IDs in HTML', () => {
 
 // ── T03: Template-literal dynamic IDs resolve ──
 describe('T03: Template-literal dynamic $() IDs resolve', () => {
-  // Known expansions for tasks-panel-${t} and tasks-tab-${t}
-  const knownSuffixes = ['cron', 'bg', 'log']
-
-  for (const prefix of TEMPLATE_DYNAMIC_PREFIXES) {
-    for (const suffix of knownSuffixes) {
+  // 每个 prefix 自己有一组合法 suffix 要求(参见 TEMPLATE_DYNAMIC_EXPANSIONS)
+  for (const [prefix, suffixes] of Object.entries(TEMPLATE_DYNAMIC_EXPANSIONS)) {
+    for (const suffix of suffixes) {
       const fullId = `${prefix}${suffix}`
       it(`$(\`${prefix}\${t}\`) with t="${suffix}" → id="${fullId}" exists`, () => {
         assert.ok(htmlIdSet.has(fullId), `Dynamic ID "${fullId}" not found in index.html`)
@@ -164,8 +176,13 @@ describe('T04: Critical IDs always present', () => {
   const CRITICAL_IDS = [
     'login-view',
     'app-view',
-    'token',
-    'login-btn',
+    // V3 Phase 4A: 旧 #token / #login-btn 已被多模态认证替代,
+    // 检查新登录表单元素就够覆盖"登录页面没炸"
+    'auth-login-email',
+    'auth-login-password',
+    'auth-login-btn',
+    'auth-tab-login',
+    'auth-tab-register',
     'sidebar',
     'messages',
     'input',

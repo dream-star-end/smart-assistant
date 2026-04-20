@@ -967,9 +967,20 @@ function serializeSetting(row: SystemSettingRow): Record<string, unknown> {
 }
 
 function extractTailKey(url: URL, prefix: string): SystemSettingKey {
-  const tail = url.pathname.slice(prefix.length);
+  // 路径段可能被前端编码,先 decode 再过 allowlist;decodeURIComponent 在
+  // malformed % 序列时会抛 URIError → 当 400 处理。
+  const rawTail = url.pathname.slice(prefix.length);
+  let tail: string;
+  try {
+    tail = decodeURIComponent(rawTail);
+  } catch {
+    throw new HttpError(400, "VALIDATION", `malformed setting key: ${rawTail || "<empty>"}`);
+  }
   if (!(ALLOWED_KEYS as readonly string[]).includes(tail)) {
-    throw new HttpError(404, "NOT_FOUND", `unknown setting key: ${tail || "<empty>"}`);
+    // 未知 key 当输入校验失败处理,与 systemSettings.ts 模块文档一致("一律 400")。
+    throw new HttpError(400, "VALIDATION", `unknown setting key: ${tail || "<empty>"}`, {
+      issues: [{ path: "key", message: "not_in_allowlist" }],
+    });
   }
   return tail as SystemSettingKey;
 }
@@ -1004,7 +1015,10 @@ export async function handleAdminGetSetting(
     sendJson(res, 200, { setting: serializeSetting(row) });
   } catch (err) {
     if (err instanceof SystemSettingNotFoundError) {
-      throw new HttpError(404, "NOT_FOUND", err.message);
+      // 理论上 extractTailKey 已挡住未知 key,这里兜底:与 allowlist 失败一致 400。
+      throw new HttpError(400, "VALIDATION", err.message, {
+        issues: [{ path: "key", message: "not_in_allowlist" }],
+      });
     }
     throw err;
   }
@@ -1053,7 +1067,10 @@ export async function handleAdminPutSetting(
     sendJson(res, 200, { setting: serializeSetting(row) });
   } catch (err) {
     if (err instanceof SystemSettingNotFoundError) {
-      throw new HttpError(404, "NOT_FOUND", err.message);
+      // 理论上 extractTailKey 已挡住未知 key,这里兜底:与 allowlist 失败一致 400。
+      throw new HttpError(400, "VALIDATION", err.message, {
+        issues: [{ path: "key", message: "not_in_allowlist" }],
+      });
     }
     if (err instanceof SystemSettingValidationError) {
       throw new HttpError(400, "VALIDATION", err.message, {

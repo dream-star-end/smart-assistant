@@ -963,10 +963,17 @@ function _parsePromLine(line) {
   if (!Number.isFinite(value)) return null
   const labels = {}
   if (labelStr) {
-    // 支持转义 \" 但我们的 metrics 里 label 不会有 " — 用简单分割就够
+    // Prom exposition 规则: label value 转义 \\, \", \n。这里一并反转义,
+    // 否则两条仅在转义形式上不同的 series 会被算成不同 key。
     const re = /([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"/g
     let lm
-    while ((lm = re.exec(labelStr))) labels[lm[1]] = lm[2]
+    while ((lm = re.exec(labelStr))) {
+      labels[lm[1]] = lm[2]
+        .replace(/\\\\/g, '\u0001')   // 占位避免 \\\" 被先吃 \"
+        .replace(/\\"/g, '"')
+        .replace(/\\n/g, '\n')
+        .replace(/\u0001/g, '\\')
+    }
   }
   return { name, labels, value }
 }

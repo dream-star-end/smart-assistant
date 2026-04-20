@@ -1,4 +1,4 @@
--- 0017_system_settings.sql
+-- 0016_system_settings.sql
 -- 运维侧可调的运行时设置(distinct from user_preferences / model_pricing)。
 --
 -- 用法:

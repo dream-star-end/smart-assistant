@@ -200,7 +200,7 @@ export interface SetSystemSettingCtx {
 /**
  * UPSERT 单个 key。同事务写 admin_audit('system_settings.set')。
  *
- * - key 不在 allowlist → 抛 `SystemSettingNotFoundError`(handler 翻译为 404)
+ * - key 不在 allowlist → 抛 `SystemSettingNotFoundError`(handler 翻译为 400)
  * - value 不通过 zod → 抛 `SystemSettingValidationError`(handler 翻译为 400)
  * - 没变化(value 与现行值 deep-equal)→ 跳过 UPSERT 与审计,直接返当前 row(幂等)
  */
