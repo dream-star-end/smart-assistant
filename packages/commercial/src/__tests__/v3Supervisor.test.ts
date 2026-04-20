@@ -179,6 +179,11 @@ class FakePool {
           log.push("ROLLBACK");
           return { rowCount: 0, rows: [] };
         }
+        // codex round 1 FAIL #2/#3 修复 — provision 在 BEGIN 后立刻拿
+        // user-lifecycle 锁 + host-cap 锁,FakePool 不模拟真锁语义,直接 noop。
+        if (/^SELECT pg_advisory_xact_lock/i.test(trimmed)) {
+          return { rowCount: 0, rows: [] };
+        }
         if (/INSERT INTO agent_containers/i.test(trimmed)) {
           const idx = self.insertCount++;
           if (self.forceUniqConflictOnInserts.has(idx)) {
@@ -668,7 +673,7 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
     assert.equal(pool.rows.filter((x) => x.state === "active").length, 3);
   });
 
-  test("active = cap → 抛 SupervisorError('HostFull') + 不进事务 + 不动 docker", async () => {
+  test("active = cap → 抛 SupervisorError('HostFull') 在事务内 + 不动 docker", async () => {
     const { docker, captured } = makeDocker();
     seedActiveRows(3);
     await assert.rejects(
@@ -685,11 +690,12 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
       ),
       (err: Error) => err instanceof SupervisorError && err.code === "HostFull",
     );
-    // cap 拒绝必须发生在 BEGIN/createContainer/createVolume 之前
-    assert.deepEqual(pool.clientLog, []);
+    // codex round 1 FAIL #2 修复 — cap 检查现在在事务内,与 host-cap 锁串行,
+    // 撞 cap 时 BEGIN 已经发生但走 ROLLBACK,docker 一字未动
+    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
     assert.equal(captured.containersCreated.length, 0);
     assert.equal(captured.volumesCreated.length, 0);
-    // 行数不变
+    // 行数不变(事务回滚)
     assert.equal(pool.rows.length, 3);
   });
 

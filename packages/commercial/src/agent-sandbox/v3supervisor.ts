@@ -106,6 +106,78 @@ function readMaxRunningContainersFromEnv(): number {
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// V3 advisory lock keys —— Codex round 1 FAIL #2/#3 修复
+//
+// Postgres advisory lock 二元 (int4, int4) 形式:
+//   - per-uid lifecycle lock(NS=USER_LIFECYCLE_LOCK_NS, key=uid):
+//     互斥同一 uid 的 provision / volumeGc(防 GC 删 volume 时正在 provision 的
+//     race;同时也防同 uid 并发 provision 在 PG uniq+docker name 双层冲突前撞)
+//   - host-cap admission lock(NS=HOST_CAP_LOCK_NS, key=HOST_CAP_LOCK_SUBKEY):
+//     全局串行所有 provision 的 cap 检查,确保 MAX_RUNNING_CONTAINERS 在并发下硬限不破
+//
+// 锁是 xact-scoped(`pg_advisory_xact_lock`),COMMIT/ROLLBACK 自动释放,
+// 不需要手动 unlock,避免连接池借出后 lock 残留卡死后续事务。
+//
+// 选 magic key:固定 32-bit 常量,与项目其它 advisory lock 不撞;migrate.ts 用的是
+// 0x0c_be_1e_5a_01n single-int8,不在二元 (int4,int4) 命名空间冲突。
+// ───────────────────────────────────────────────────────────────────────
+
+/** 二元 advisory lock 命名空间 —— 同 uid 的 lifecycle 操作互斥 */
+export const USER_LIFECYCLE_LOCK_NS = 0x0c_b3_d0_01;
+
+/** 二元 advisory lock 命名空间 —— host cap admission control */
+export const HOST_CAP_LOCK_NS = 0x0c_b3_ca_70;
+
+/** HOST_CAP_LOCK_NS 下的子 key(全局唯一,选 0 简单)*/
+export const HOST_CAP_LOCK_SUBKEY = 0;
+
+/**
+ * uid → int4 (PG advisory lock 接受的 32-bit signed 整数)。
+ * MVP 单库 < 2^31 = 21 亿用户,实际 ≪ 1k,直接截即可;真撞了 2^31 P1 加 host_id
+ * 再做 hash。`uid|0` 截顶 32 位 signed,负数也合法(PG 接受 negative int4)。
+ */
+function uidToLockKey(uid: number): number {
+  // (uid | 0) 走 ToInt32 抽象,行为定义清楚(超过 2^31-1 会 wrap 成负数,仍合法 lock key)
+  return uid | 0;
+}
+
+/**
+ * 在事务内 acquire per-uid lifecycle lock。COMMIT/ROLLBACK 自动 release。
+ *
+ * caller 必须已经 `BEGIN`(否则 advisory_xact_lock 在 autocommit 下立即释放,无效)。
+ *
+ * 用途:
+ *   - provisionV3Container 事务的第一步
+ *   - runVolumeGcTick 单 uid 处理事务的第一步
+ * 两边持同一 (NS, uid) 锁 → PG 串行,GC 与 provision 不会撞 docker volume
+ * remove vs container create 的 race。
+ */
+export async function acquireUserLifecycleLock(
+  client: PoolClient,
+  uid: number,
+): Promise<void> {
+  await client.query(
+    "SELECT pg_advisory_xact_lock($1::int4, $2::int4)",
+    [USER_LIFECYCLE_LOCK_NS, uidToLockKey(uid)],
+  );
+}
+
+/**
+ * 在事务内 acquire 全局 host-cap admission lock。COMMIT/ROLLBACK 自动 release。
+ *
+ * 单机 MVP 整个 host 共享一把锁 → 全部 provision 通过 cap 检查时串行;cap=50,
+ * 串行通过率影响小(每次 cap query+INSERT < 5ms,百级并发也只是 200ms 排队)。
+ *
+ * P1 多机加 host_id 列时,可改 (HOST_CAP_LOCK_NS, host_id) 二元锁解开串行。
+ */
+export async function acquireHostCapLock(client: PoolClient): Promise<void> {
+  await client.query(
+    "SELECT pg_advisory_xact_lock($1::int4, $2::int4)",
+    [HOST_CAP_LOCK_NS, HOST_CAP_LOCK_SUBKEY],
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // 公共类型
 // ───────────────────────────────────────────────────────────────────────
 
@@ -362,17 +434,25 @@ async function allocateBoundIpAndInsertRow(
  * Provision 一个 v3 容器并启动。同 uid 已有 active 行 → 抛 NameConflict
  * (caller 自己决定要不要先 stopAndRemove,本函数不替你做)。
  *
- * 流程:
- *   1. 确保 named volume(幂等;label 守护)
- *   2. 在事务内 INSERT agent_containers 占 bound_ip(uniq 冲突重试换 IP)
- *      → 拿到 row id + bound_ip
- *   3. 用 row id + secret 拼 token,用 bound_ip 走 docker create --ip
+ * 流程(Codex round 1 FAIL #2/#3 修复后):
+ *   1. BEGIN
+ *   2. acquire per-uid lifecycle advisory lock  ← 与 volumeGc 互斥
+ *   3. acquire global host-cap admission lock   ← cap admission 原子化
+ *   4. cap query → 满了 → ROLLBACK + throw HostFull(锁随事务释放)
+ *   5. 确保 named volume(幂等;label 守护)
+ *   6. INSERT agent_containers 占 bound_ip(uniq 冲突重试换 IP)→ 拿到 row id + bound_ip
+ *   7. 用 row id + secret 拼 token,bound_ip 走 docker create --ip
  *      注入 4 个 anthropic env + cap-drop NET_RAW NET_ADMIN + tmpfs
  *      /run/oc/claude-config + 单 volume + label
- *   4. start 容器 → UPDATE agent_containers SET container_internal_id = <id>
- *      → COMMIT
- *   5. 若任何 docker 步骤失败 → ROLLBACK + 尝试 docker rm -f(best-effort);
- *      不抛 wrapped 错(让 caller 看到根因)
+ *   8. start 容器 → UPDATE agent_containers SET container_internal_id = <id>
+ *   9. COMMIT(advisory lock 自动释放)
+ *  10. 任何 docker 步骤失败 → ROLLBACK + best-effort docker rm -f;不 wrap 让 caller 看根因
+ *
+ * 为什么 ensureV3Volume 改在事务内:
+ *   - GC 在持有 per-uid lock 期间删 volume;provision 也必须在持锁期间 ensureV3Volume,
+ *     否则 ensureV3Volume 在事务外跑 → GC 拿锁删 volume → provision INSERT → docker
+ *     create 用一个空 volume,数据被 GC 静默丢弃。
+ *   - docker createVolume 失败 → 整事务 ROLLBACK,row 不留痕,最终一致。
  */
 export async function provisionV3Container(
   deps: V3SupervisorDeps,
@@ -389,46 +469,52 @@ export async function provisionV3Container(
   const pickIp = deps.randomIp ?? defaultPickRandomIp;
   const mintSecret = deps.randomSecret ?? defaultRandomSecret;
 
-  // V3 Phase 3I — 实例级 active 容器硬限。在 volume / IP 分配之前先卡。
-  // 优先 deps 注入(测试 / 多机),回落 env / 默认。
+  // V3 Phase 3I — 实例级 active 容器硬限。优先 deps 注入(测试 / 多机),回落 env / 默认。
   const cap =
     typeof deps.maxRunningContainers === "number"
       && Number.isInteger(deps.maxRunningContainers)
       && deps.maxRunningContainers > 0
       ? deps.maxRunningContainers
       : readMaxRunningContainersFromEnv();
-  // R6.7 reader 显式 state filter — 只数 active(vanished 不占容量)。
-  // 单机 monolith MVP,不带 host_id;P1 多机加 `AND host_id=$current_host`。
-  const capQ = await deps.pool.query<{ active: string }>(
-    `SELECT COUNT(*)::text AS active
-       FROM agent_containers
-      WHERE state = 'active'`,
-  );
-  const active = Number.parseInt(capQ.rows[0]?.active ?? "0", 10);
-  if (active >= cap) {
-    throw new SupervisorError(
-      "HostFull",
-      `host at MAX_RUNNING_CONTAINERS cap (${active}/${cap})`,
-      { message: `active=${active} cap=${cap}` },
-    );
-  }
 
-  // 1) volume(幂等)
-  let volumeName: string;
-  try {
-    volumeName = await ensureV3Volume(deps.docker, uid);
-  } catch (err) {
-    throw wrapDockerError(err);
-  }
-
-  // 2) 事务里 INSERT 占 IP
   const client = await deps.pool.connect();
   let row: { id: number; boundIp: string };
   let secret: string;
   let secretHash: Buffer;
+  let volumeName: string;
   let createdDockerId = "";
   try {
     await client.query("BEGIN");
+
+    // Codex FAIL #3 fix: acquire per-uid lifecycle lock —— 与 volumeGc 互斥
+    await acquireUserLifecycleLock(client, uid);
+
+    // Codex FAIL #2 fix: acquire global host-cap lock —— admission control 原子化
+    await acquireHostCapLock(client);
+
+    // R6.7 reader 显式 state filter — 只数 active(vanished 不占容量)。
+    // 单机 monolith MVP,不带 host_id;P1 多机加 `AND host_id=$current_host` + 拆 host 级锁。
+    // 持 host-cap lock 期间查 → 串行通过 admission,并发不会超 cap。
+    const capQ = await client.query<{ active: string }>(
+      `SELECT COUNT(*)::text AS active
+         FROM agent_containers
+        WHERE state = 'active'`,
+    );
+    const active = Number.parseInt(capQ.rows[0]?.active ?? "0", 10);
+    if (active >= cap) {
+      throw new SupervisorError(
+        "HostFull",
+        `host at MAX_RUNNING_CONTAINERS cap (${active}/${cap})`,
+        { message: `active=${active} cap=${cap}` },
+      );
+    }
+
+    // ensureV3Volume 必须在持 per-uid lock 期间调,防 GC race(见函数 doc)
+    try {
+      volumeName = await ensureV3Volume(deps.docker, uid);
+    } catch (err) {
+      throw wrapDockerError(err);
+    }
 
     secret = mintSecret();
     if (!/^[0-9a-f]{64}$/.test(secret)) {

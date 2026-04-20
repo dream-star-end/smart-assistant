@@ -63,6 +63,18 @@ const RETRY_AFTER_STOPPED_SEC = 3;
 const RETRY_AFTER_HOST_FULL_SEC = 10;
 
 /**
+ * Codex round 1 FAIL #4 修复 —— ImageNotFound 是配置/部署级故障,不是临时性
+ * "再试 5s 就好了"的状态,容器 image tag 不存在时所有重试都会撞同一面墙。
+ *
+ * 选 300s(5min):足够长,前端会切到"系统配置异常,请联系管理员"叙事;同时
+ * 不锁死,运维 docker pull 修好后 5min 内自动恢复。比"零重试 close 4500"温和,
+ * 也比 5s 风暴友好得多。
+ *
+ * reason='image_missing' 让前端展示 distinct UX(不与一般 'provisioning' 重叠)。
+ */
+const RETRY_AFTER_IMAGE_MISSING_SEC = 300;
+
+/**
  * ensureRunning 注入项 — 测试可以覆盖 readiness 探活实现。
  *
  * 字段沿用 3D 命名(向后兼容),但语义已改为 §3E 的 readiness:HTTP /healthz +
@@ -180,7 +192,11 @@ export function makeV3EnsureRunning(
       if (err instanceof SupervisorError && err.code === "HostFull") {
         throw new ContainerUnreadyError(RETRY_AFTER_HOST_FULL_SEC, "host_full");
       }
-      // NameConflict(同 uid 并发 provision)/ ImagePull / IP 池满 都让前端短重试
+      // Codex round 1 FAIL #4 fix:ImageNotFound 是部署级故障 — 5s 重试只会风暴
+      if (err instanceof SupervisorError && err.code === "ImageNotFound") {
+        throw new ContainerUnreadyError(RETRY_AFTER_IMAGE_MISSING_SEC, "image_missing");
+      }
+      // NameConflict(同 uid 并发 provision)/ IP 池满 都让前端短重试
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }
 
@@ -205,5 +221,6 @@ export const ENSURE_RUNNING_DEFAULTS = Object.freeze({
   RETRY_AFTER_PROVISIONING_SEC,
   RETRY_AFTER_STOPPED_SEC,
   RETRY_AFTER_HOST_FULL_SEC,
+  RETRY_AFTER_IMAGE_MISSING_SEC,
   CONTAINER_PORT: V3_CONTAINER_PORT,
 });

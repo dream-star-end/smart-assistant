@@ -40,7 +40,11 @@
 
 import type { Pool } from "pg";
 
-import { removeV3Volume, v3VolumeNameFor } from "./v3supervisor.js";
+import {
+  acquireUserLifecycleLock,
+  removeV3Volume,
+  v3VolumeNameFor,
+} from "./v3supervisor.js";
 import type { V3SupervisorDeps } from "./v3supervisor.js";
 
 // ───────────────────────────────────────────────────────────────────────
@@ -183,13 +187,16 @@ async function selectNoLoginCandidates(
 }
 
 /**
- * 检查 uid 是否还有 active agent_containers 行。有 → 跳过(等 idle sweep 清完)。
+ * 在已持 per-uid lock 的事务里检查 uid 是否还有 active agent_containers 行。
  *
  * R6.11 reader 二选一:本文件在 RECONCILER_WHITELIST 内(§9 3M),trivial 满足
  * — MVP 没 agent_migrations 表,无 open migration 概念。
  */
-async function hasActiveContainer(pool: Pool, uid: number): Promise<boolean> {
-  const r = await pool.query<{ exists: boolean }>(
+async function hasActiveContainerLocked(
+  client: import("pg").PoolClient,
+  uid: number,
+): Promise<boolean> {
+  const r = await client.query<{ exists: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM agent_containers
         WHERE user_id = $1::bigint
@@ -198,6 +205,72 @@ async function hasActiveContainer(pool: Pool, uid: number): Promise<boolean> {
     [String(uid)],
   );
   return r.rows[0]?.exists === true;
+}
+
+/**
+ * Codex round 1 FAIL #3 修复:GC 单 uid 处理事务化。
+ *
+ * 流程:
+ *   1. BEGIN
+ *   2. acquire per-uid lifecycle lock(USER_LIFECYCLE_LOCK_NS, uid)
+ *      → 与 provisionV3Container 互斥,串行化同一 uid 的 lifecycle
+ *   3. SELECT EXISTS active container
+ *      - 有 → COMMIT, return 'skipped'(等 idle sweep / orphan reconcile 清掉容器)
+ *      - 无 → removeV3Volume (docker call,在持锁期间执行)
+ *   4. COMMIT(锁随事务释放)
+ *
+ * 为什么 docker call 也放事务里:
+ *   持锁期间 docker rm volume,确保任何并发 provision 必须等本 GC 释放锁后才能
+ *   ensureV3Volume(provision 同样在持 per-uid lock 期间 ensureV3Volume,见
+ *   v3supervisor.ts:provisionV3Container)。否则 GC 删 volume vs provision create
+ *   container 用旧 volume name 的 race 仍存在。
+ *
+ * docker call 失败:不 ROLLBACK(PG 没动,事务只是 lock holder),返回 'failed' +
+ * error string。caller 把它聚合到 errors[]。
+ *
+ * 返回:
+ *   - 'removed' = 真删了 volume
+ *   - 'skipped' = 有 active 容器 skip
+ *   - 'failed'  = removeV3Volume 抛错
+ */
+type GcUidOutcome =
+  | { kind: "removed" }
+  | { kind: "skipped" }
+  | { kind: "failed"; error: string };
+
+async function gcSingleUidLocked(
+  deps: V3SupervisorDeps,
+  uid: number,
+): Promise<GcUidOutcome> {
+  const client = await deps.pool.connect();
+  try {
+    await client.query("BEGIN");
+    try {
+      await acquireUserLifecycleLock(client, uid);
+      const active = await hasActiveContainerLocked(client, uid);
+      if (active) {
+        await client.query("COMMIT");
+        return { kind: "skipped" };
+      }
+      try {
+        await removeV3Volume(deps.docker, uid);
+      } catch (err) {
+        // docker 失败 — PG 没动,直接 COMMIT 释放 lock,把错往上抛聚合
+        await client.query("COMMIT");
+        return {
+          kind: "failed",
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      await client.query("COMMIT");
+      return { kind: "removed" };
+    } catch (err) {
+      try { await client.query("ROLLBACK"); } catch { /* swallow */ }
+      throw err;
+    }
+  } finally {
+    client.release();
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -252,27 +325,31 @@ export async function runVolumeGcTick(
 
   for (const cand of candidates) {
     try {
-      // active 容器存在 → 跳过(等 idle sweep / orphan reconcile 清完)
-      const active = await hasActiveContainer(deps.pool, cand.uid);
-      if (active) {
+      const outcome = await gcSingleUidLocked(deps, cand.uid);
+      if (outcome.kind === "skipped") {
         skippedActiveContainer++;
         log?.debug?.("[v3/volumeGc] skip uid (active container)", {
           uid: cand.uid,
           reason: cand.reason,
         });
-        continue;
+      } else if (outcome.kind === "removed") {
+        removed++;
+        log?.info?.("[v3/volumeGc] removed volume", {
+          uid: cand.uid,
+          reason: cand.reason,
+          volume: v3VolumeNameFor(cand.uid),
+        });
+      } else {
+        errors.push({ uid: cand.uid, reason: cand.reason, error: outcome.error });
+        log?.warn?.("[v3/volumeGc] removeV3Volume failed", {
+          uid: cand.uid, reason: cand.reason, err: outcome.error,
+        });
       }
-      await removeV3Volume(deps.docker, cand.uid);
-      removed++;
-      log?.info?.("[v3/volumeGc] removed volume", {
-        uid: cand.uid,
-        reason: cand.reason,
-        volume: v3VolumeNameFor(cand.uid),
-      });
     } catch (err) {
+      // gcSingleUidLocked throw 仅在 PG 错(BEGIN / advisory_lock / EXISTS / COMMIT 失败)
       const msg = err instanceof Error ? err.message : String(err);
       errors.push({ uid: cand.uid, reason: cand.reason, error: msg });
-      log?.warn?.("[v3/volumeGc] removeV3Volume failed", {
+      log?.warn?.("[v3/volumeGc] gc transaction failed", {
         uid: cand.uid, reason: cand.reason, err: msg,
       });
     }

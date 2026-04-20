@@ -26,9 +26,11 @@
 --   - state 部分索引:tickIdleSweep / orphan reconcile 高频按 state 扫描
 --   - host_id 索引:P1 multi-host 时按 host 聚合;MVP 单值无所谓但留着不浪费
 
+-- secret_hash 起初按 TEXT 落地(早期 staging 已应用此版本);0013 会把它 ALTER 成 BYTEA,
+-- 与 supervisor 的 Buffer 约束对齐。已 applied 此 migration 的环境通过 0013 自动转换。
 ALTER TABLE agent_containers
   ADD COLUMN bound_ip              INET,
-  ADD COLUMN secret_hash           BYTEA,
+  ADD COLUMN secret_hash           TEXT,
   ADD COLUMN state                 TEXT NOT NULL DEFAULT 'active'
                                    CHECK (state IN ('active', 'vanished')),
   ADD COLUMN host_id               BIGINT,
@@ -61,8 +63,8 @@ COMMENT ON COLUMN agent_containers.bound_ip IS
 
 COMMENT ON COLUMN agent_containers.secret_hash IS
   'V3 §3.2: SHA-256(secret_bytes) of the per-container long-lived secret (identity factor B). '
-  '32-byte BYTEA. Plain secret only ever lives in container env (ANTHROPIC_AUTH_TOKEN=oc-v3.<cid>.<secret>) '
-  'and is timing-safe-compared by edge proxy.';
+  'Initially TEXT here; 0013 promotes the column to 32-byte BYTEA. Plain secret only ever lives in '
+  'container env (ANTHROPIC_AUTH_TOKEN=oc-v3.<cid>.<secret>) and is timing-safe-compared by edge proxy.';
 
 COMMENT ON COLUMN agent_containers.state IS
   'V3 reader visibility set (MVP single-track): '

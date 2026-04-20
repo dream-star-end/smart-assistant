@@ -118,6 +118,13 @@ class FakePool {
   async query(sql: string, params?: unknown[]): Promise<unknown> {
     const trimmed = String(sql).trim();
 
+    // codex round 1 FAIL #3 修复 — gcSingleUidLocked 用事务 + advisory lock 包裹
+    // 单 uid 处理。FakePool 不真模拟锁语义,BEGIN/COMMIT/ROLLBACK/lock 都 noop。
+    if (/^BEGIN/i.test(trimmed)) return { rowCount: 0, rows: [] };
+    if (/^COMMIT/i.test(trimmed)) return { rowCount: 0, rows: [] };
+    if (/^ROLLBACK/i.test(trimmed)) return { rowCount: 0, rows: [] };
+    if (/^SELECT pg_advisory_xact_lock/i.test(trimmed)) return { rowCount: 0, rows: [] };
+
     // SELECT banned candidates
     if (
       /^SELECT id FROM users\s+WHERE status = 'banned'/i.test(trimmed)

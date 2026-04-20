@@ -107,6 +107,8 @@ class FakePool {
     if (/^BEGIN/i.test(trimmed)) return { rowCount: 0, rows: [] };
     if (/^COMMIT/i.test(trimmed)) return { rowCount: 0, rows: [] };
     if (/^ROLLBACK/i.test(trimmed)) return { rowCount: 0, rows: [] };
+    // codex round 1 FAIL #2/#3 修复 — provision 在 BEGIN 后取双锁
+    if (/^SELECT pg_advisory_xact_lock/i.test(trimmed)) return { rowCount: 0, rows: [] };
     if (/INSERT INTO agent_containers/i.test(trimmed)) {
       const idx = this.insertCount++;
       if (this.forceUniqConflictOnInserts.has(idx)) {
@@ -384,7 +386,9 @@ describe("makeV3EnsureRunning", () => {
     assert.strictEqual(pool.rows[0]!.container_internal_id, "dockerid-new-1");
   });
 
-  test("provision 失败 → ContainerUnreadyError('provisioning')", async () => {
+  test("provision 失败(image missing)→ ContainerUnreadyError('image_missing', 300s)", async () => {
+    // codex round 1 FAIL #4 修复 — ImageNotFound 是部署级故障(镜像没拉/打错 tag),
+    // 5s 重试只会风暴,翻译成 retryAfter=300s + reason='image_missing' 给前端长退避。
     const pool = new FakePool();
     const { docker } = makeDocker({
       createContainerThrow: httpError(404, "No such image: openclaude/openclaude-runtime:test"),
@@ -398,7 +402,29 @@ describe("makeV3EnsureRunning", () => {
 
     await assert.rejects(ensureRunning(12n), (err) => {
       assert.ok(err instanceof ContainerUnreadyError);
+      assert.strictEqual(err.reason, "image_missing");
+      assert.strictEqual(err.retryAfterSec, 300);
+      return true;
+    });
+  });
+
+  test("provision 失败(其他错)→ ContainerUnreadyError('provisioning', 5s)", async () => {
+    // 非 ImageNotFound 类型故障(docker daemon timeout / network) 仍走 5s 短退避。
+    const pool = new FakePool();
+    const { docker } = makeDocker({
+      createContainerThrow: httpError(500, "docker daemon timeout"),
+    });
+    const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+      probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
+      sleep: noSleep,
+      now: fixedNow,
+    });
+
+    await assert.rejects(ensureRunning(112n), (err) => {
+      assert.ok(err instanceof ContainerUnreadyError);
       assert.strictEqual(err.reason, "provisioning");
+      assert.strictEqual(err.retryAfterSec, 5);
       return true;
     });
   });
