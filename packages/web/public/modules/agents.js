@@ -79,22 +79,49 @@ export function renderAgentsManagementList() {
   }
 }
 
+// 商用版预设来自 /api/models(管理后台 model_pricing 表)。
+// 缓存到模块级,modal 反复打开时不重复 fetch;失败 → 空数组(只剩"自定义")。
+let _modelsCache = null
+async function loadAdminModels() {
+  if (_modelsCache) return _modelsCache
+  try {
+    const r = await apiGet('/api/models')
+    _modelsCache = Array.isArray(r?.models) ? r.models : []
+  } catch {
+    _modelsCache = []
+  }
+  return _modelsCache
+}
+
 export async function openPersonaEditor(agentId) {
   try {
-    const [info, persona] = await Promise.all([
+    const [info, persona, models] = await Promise.all([
       apiGet(`/api/agents/${encodeURIComponent(agentId)}`),
       apiGet(`/api/agents/${encodeURIComponent(agentId)}/persona`),
+      loadAdminModels(),
     ])
     $('persona-modal-title').textContent = `编辑: ${info.agent.displayName || agentId}`
     $('persona-display-name').value = info.agent.displayName || ''
     $('persona-avatar-emoji').value = info.agent.avatarEmoji || ''
     $('persona-greeting').value = info.agent.greeting || ''
     $('persona-model').value = info.agent.model || ''
-    // Sync preset dropdown
+    // 用 /api/models 重建预设下拉(管理后台启用的模型)
     const preset = $('persona-model-preset')
-    const modelVal = info.agent.model || ''
-    preset.value = [...preset.options].some((o) => o.value === modelVal) ? modelVal : ''
-    $('persona-provider').value = info.agent.provider || ''
+    if (preset) {
+      preset.innerHTML = ''
+      const blank = document.createElement('option')
+      blank.value = ''
+      blank.textContent = '自定义'
+      preset.appendChild(blank)
+      for (const m of models) {
+        const opt = document.createElement('option')
+        opt.value = m.id
+        opt.textContent = m.display_name || m.id
+        preset.appendChild(opt)
+      }
+      const modelVal = info.agent.model || ''
+      preset.value = [...preset.options].some((o) => o.value === modelVal) ? modelVal : ''
+    }
     $('persona-permission').value = info.agent.permissionMode || 'default'
     $('persona-cwd').value = info.agent.cwd || ''
     $('persona-toolsets').value = (info.agent.toolsets || []).join(', ')
@@ -118,7 +145,7 @@ export async function openPersonaEditor(agentId) {
         await apiJson('PUT', `/api/agents/${encodeURIComponent(agentId)}`, {
           model: $('persona-model').value.trim(),
           permissionMode: $('persona-permission').value,
-          provider: $('persona-provider').value || undefined,
+          // 商用版不暴露 provider,服务端继承全局配置
           displayName: $('persona-display-name').value.trim() || undefined,
           avatarEmoji: $('persona-avatar-emoji').value.trim() || undefined,
           greeting: $('persona-greeting').value.trim() || undefined,

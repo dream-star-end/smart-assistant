@@ -636,31 +636,20 @@
       </div>
       <!-- Model & Provider -->
       <div class="persona-section-label">模型</div>
+      <!-- 商用版: 模型列表来自管理后台 model_pricing 表(/api/models),
+           agents.js openPersonaEditor 打开时动态填充 #persona-model-preset。
+           Provider 选项已移除 — 商用环境后端统一走管理员配置的 anthropic 通道。 -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
         <div class="form-row" style="margin:0">
           <label>预设</label>
-          <select id="persona-model-preset" onchange="if(this.value){document.getElementById('persona-model').value=this.value;var p=document.getElementById('persona-provider');if(p)p.value='claude-subscription'}">
-            <option value="">自定义</option>
-            <optgroup label="Claude">
-              <option value="claude-opus-4-7">Opus 4.7</option>
-              <option value="claude-opus-4-6">Opus 4.6</option>
-              <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-              <option value="claude-haiku-4-5">Haiku 4.5</option>
-            </optgroup>
+          <select id="persona-model-preset" onchange="if(this.value){document.getElementById('persona-model').value=this.value}">
+            <option value="">加载中…</option>
           </select>
         </div>
         <div class="form-row" style="margin:0">
           <label>Model ID</label>
           <input id="persona-model" placeholder="自定义模型" />
         </div>
-      </div>
-      <div class="form-row">
-        <label>Provider</label>
-        <select id="persona-provider">
-          <option value="">继承全局</option>
-          <option value="claude-subscription">Claude.ai 订阅 (OAuth)</option>
-          <option value="anthropic">Anthropic (API Key)</option>
-        </select>
       </div>
       <!-- Behavior -->
       <div class="persona-section-label">行为</div>
