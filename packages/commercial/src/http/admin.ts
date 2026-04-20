@@ -974,7 +974,9 @@ function extractTailKey(url: URL, prefix: string): SystemSettingKey {
   try {
     tail = decodeURIComponent(rawTail);
   } catch {
-    throw new HttpError(400, "VALIDATION", `malformed setting key: ${rawTail || "<empty>"}`);
+    throw new HttpError(400, "VALIDATION", `malformed setting key: ${rawTail || "<empty>"}`, {
+      issues: [{ path: "key", message: "malformed_uri_component" }],
+    });
   }
   if (!(ALLOWED_KEYS as readonly string[]).includes(tail)) {
     // 未知 key 当输入校验失败处理,与 systemSettings.ts 模块文档一致("一律 400")。
