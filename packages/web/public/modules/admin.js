@@ -588,19 +588,115 @@ function openEditPlanModal(d) {
   })
 }
 
-// ─── Tab: Settings(占位 — 4I 实装)─────────────────────────────────
+// ─── Tab: Settings(4I)─────────────────────────────────────────────
+//
+// 渲染 GET /api/admin/settings 全 key 表单。每行独立 form,改完点 "保存"
+// → PUT /api/admin/settings/:key,成功 toast + 局部刷新该行的 updated_at。
+// 不做"批量保存" —— 单 key UPSERT 是 4H 设计,失败回滚也是单 key,简单清晰。
+//
+// 表单类型由 server 返的 meta.kind 决定:boolean / number / enum。
+// description 字段(运营自由文本)单独一栏,所有 kind 共用。
 
 async function renderSettingsTab() {
+  const data = await apiGet('/api/admin/settings')
+  const rows = data?.rows ?? []
   view().innerHTML = `
     <div class="panel">
-      <h2>系统设置 <small>4H 后端已就绪;UI 在 Phase 4I 接入</small></h2>
-      <div class="placeholder">
-        Phase 4I 将渲染 GET /api/admin/settings + 每个 key 的编辑表单<br/>
-        当前可用 key:<code>idle_sweep_min / allow_registration / default_effort /
-        rate_limit_chat_per_min / maintenance_mode</code>
+      <h2>系统设置 <small>共 ${rows.length} 项 · 改完逐项 "保存" 立即生效</small></h2>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:12px">
+        ⚠ 当前未生效 key(默认值)显示
+        <span class="badge muted">默认</span>;改动一次后会持久化到 system_settings 表。
+        所有改动会同事务写 admin_audit。
       </div>
+      <table class="data">
+        <thead>
+          <tr><th>key</th><th>类型/范围</th><th>当前值</th><th>说明 description</th>
+              <th>更新时间</th><th class="actions">操作</th></tr>
+        </thead>
+        <tbody>
+          ${rows.map(_renderSettingRow).join('')}
+        </tbody>
+      </table>
     </div>
   `
+  for (const btn of view().querySelectorAll('button[data-act="save-setting"]')) {
+    btn.addEventListener('click', () => saveSetting(btn.dataset.key))
+  }
+}
+
+function _renderSettingRow(r) {
+  // 用 ${key} 而非 ${r.key} 与 saveSetting 里的 $(`set-${key}-value`) 对齐,
+  // 让静态 DOM 完整性测试能匹配模板字符串里的 id 与 $() 引用。
+  const key = r.key
+  const meta = r.meta || {}
+  const isDefault = r.is_default ? '<span class="badge muted">默认</span>' : ''
+  let valueEditor
+  if (meta.kind === 'boolean') {
+    valueEditor = `
+      <select id="set-${key}-value">
+        <option value="true" ${r.value === true ? 'selected' : ''}>true</option>
+        <option value="false" ${r.value === false ? 'selected' : ''}>false</option>
+      </select>`
+  } else if (meta.kind === 'enum') {
+    valueEditor = `
+      <select id="set-${key}-value">
+        ${(meta.enumValues || []).map((v) =>
+          `<option value="${escapeHtml(v)}" ${r.value === v ? 'selected' : ''}>${escapeHtml(v)}</option>`,
+        ).join('')}
+      </select>`
+  } else {
+    // number — 用 type=text 让用户自己看出范围,client 只做基本校验,server 二次校验
+    valueEditor = `
+      <input type="number" id="set-${key}-value"
+             min="${meta.min ?? ''}" max="${meta.max ?? ''}" step="1"
+             value="${escapeHtml(String(r.value))}" style="width:120px" />`
+  }
+  const range = meta.kind === 'number' ? `${meta.min}..${meta.max}`
+              : meta.kind === 'enum' ? (meta.enumValues || []).join('/')
+              : 'true/false'
+  return `
+    <tr>
+      <td class="mono"><strong>${escapeHtml(key)}</strong></td>
+      <td><span class="badge muted">${escapeHtml(meta.kind || '?')}</span>
+          <small style="color:var(--muted)">${escapeHtml(range)}</small></td>
+      <td>${valueEditor} ${isDefault}</td>
+      <td><input type="text" id="set-${key}-desc"
+                 value="${escapeHtml(r.description || meta.description || '')}"
+                 style="width:100%" /></td>
+      <td class="mono">${r.is_default ? '—' : fmtDate(r.updated_at)}</td>
+      <td class="actions">
+        <button data-act="save-setting" data-key="${escapeHtml(key)}">保存</button>
+      </td>
+    </tr>
+  `
+}
+
+async function saveSetting(key) {
+  const valEl = $(`set-${key}-value`)
+  const descEl = $(`set-${key}-desc`)
+  if (!valEl) { toast(`找不到 ${key} 输入框`, 'danger'); return }
+  let value
+  // server 已做严格 zod;这里仅把 string→正确 JS 类型即可
+  if (valEl.tagName === 'SELECT' && (valEl.value === 'true' || valEl.value === 'false')) {
+    value = valEl.value === 'true'
+  } else if (valEl.type === 'number') {
+    if (valEl.value === '') { toast(`${key}: 不能为空`, 'danger'); return }
+    const n = Number(valEl.value)
+    if (!Number.isFinite(n)) { toast(`${key}: 不是有效数字`, 'danger'); return }
+    value = n
+  } else {
+    value = valEl.value
+  }
+  try {
+    await apiJson('PUT', `/api/admin/settings/${encodeURIComponent(key)}`, {
+      value,
+      description: descEl?.value ?? null,
+    })
+    toast(`${key} 已保存`)
+    applyHash()
+  } catch (e) {
+    toast(`${key} 保存失败: ${e.message}`, 'danger')
+  }
 }
 
 // ─── Tab: Audit ────────────────────────────────────────────────────
