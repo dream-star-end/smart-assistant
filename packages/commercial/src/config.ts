@@ -206,6 +206,21 @@ const internalProxyPort = z
   .refine((n) => n > 0 && n < 65536, "INTERNAL_PROXY_PORT must be in (0, 65535]")
   .optional();
 
+/**
+ * V3 Phase 3D — per-user openclaude-runtime 镜像名(含 tag)。
+ *
+ * 例:`openclaude/openclaude-runtime:abc123def456`(由 build-image.sh 输出 git sha12)。
+ *
+ * **为什么独立字段、不复用 AGENT_IMAGE**:
+ *   - AGENT_IMAGE 是 v2 路线的 claude-code agent 镜像(ReadonlyRootfs + tinyproxy 那套);
+ *     v3 完全独立的 openclaude-runtime,字段语义不同,放一起会让运维误以为可以共用。
+ *   - 两套镜像并行存在期间,allow 任意一个独立配 / 禁,互不影响。
+ *
+ * 缺失 / 空时:v3 supervisor 不装配,bridge 仍按 stub `supervisor_not_wired` 返 4503。
+ * 部署清单(Phase 5)会显式注入这个 env 才能跑 v3 容器。
+ */
+const ocRuntimeImage = z.string().trim().min(1).max(256).optional();
+
 export const commercialConfigSchema = z
   .object({
     DATABASE_URL: databaseUrl,
@@ -235,6 +250,7 @@ export const commercialConfigSchema = z
     AGENT_LIFECYCLE_TICK_MS: agentLifecycleTickMs,
     INTERNAL_PROXY_BIND: internalProxyBind,
     INTERNAL_PROXY_PORT: internalProxyPort,
+    OC_RUNTIME_IMAGE: ocRuntimeImage,
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。

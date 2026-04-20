@@ -51,6 +51,10 @@ import {
   type BridgeMetricSink,
 } from "./ws/userChatBridge.js";
 import {
+  makeV3EnsureRunning,
+  type V3SupervisorDeps,
+} from "./agent-sandbox/index.js";
+import {
   observeWsBridgeBuffered,
   observeWsBridgeSessionDuration,
 } from "./admin/metrics.js";
@@ -429,13 +433,44 @@ export async function registerCommercial(
     });
   }
 
-  // V3 Phase 2 Task 2H:用户 WS ↔ 容器 WS 桥接(/ws/user-chat-bridge)。
-  // Phase 2 注入 stub resolveContainerEndpoint,Phase 3D 由 supervisor 替换。
+  // V3 Phase 2 Task 2H + Phase 3D:用户 WS ↔ 容器 WS 桥接(/ws/user-chat-bridge)。
+  //
+  // resolveContainerEndpoint 的解析顺序(高优先 → 低优先):
+  //   1. options.resolveContainerEndpoint(测试 / 显式覆盖)
+  //   2. v3 supervisor(env 完备 → makeV3EnsureRunning)
+  //   3. stub `supervisor_not_wired`(Phase 2 行为,/healthz 仍报 commercial up)
+  //
+  // 为什么 v3 supervisor 走 OC_RUNTIME_IMAGE 而不是 AGENT_IMAGE:
+  //   - v2 (`AGENT_IMAGE`) 是另一条独立路线的 claude-code agent 镜像;
+  //     v3 (`OC_RUNTIME_IMAGE`) 是 per-user openclaude-runtime,字段语义不同。
+  //   - 两条路线可独立配 / 禁,部署文档(Phase 5)显式注入 OC_RUNTIME_IMAGE。
+  let v3Deps: V3SupervisorDeps | undefined;
+  if (cfg.OC_RUNTIME_IMAGE) {
+    // 复用 agentRuntime 路径的 docker socket / 默认逻辑,避免 v2/v3 端再各开一个 docker client
+    // (一个进程开多个 dockerode 也无副作用,但同一 socket 没必要)
+    const v3Docker = cfg.AGENT_DOCKER_SOCKET
+      ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
+      : new Docker();
+    v3Deps = {
+      docker: v3Docker,
+      pool: getPool(),
+      image: cfg.OC_RUNTIME_IMAGE,
+    };
+    // eslint-disable-next-line no-console
+    console.log("[commercial] v3 supervisor wired", { image: cfg.OC_RUNTIME_IMAGE });
+  } else {
+    // eslint-disable-next-line no-console
+    console.log(
+      "[commercial] v3 supervisor disabled; missing env: OC_RUNTIME_IMAGE",
+    );
+  }
   const resolveContainerEndpoint: ResolveContainerEndpoint =
     options.resolveContainerEndpoint
-    ?? (async (_uid: bigint): Promise<{ host: string; port: number }> => {
-      throw new ContainerUnreadyError(5, "supervisor_not_wired");
-    });
+    ?? (v3Deps
+      ? makeV3EnsureRunning(v3Deps)
+      : async (_uid: bigint): Promise<{ host: string; port: number }> => {
+        throw new ContainerUnreadyError(5, "supervisor_not_wired");
+      });
   // V3 2I-2:把 buffered_bytes / session_duration 接到 prometheus histogram。
   // 单帧 / per-uid 字节数不进 metrics —— 标签基数太大。
   const bridgeMetrics: BridgeMetricSink = {

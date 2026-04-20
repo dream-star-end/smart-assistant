@@ -39,3 +39,10 @@ export {
   type ProvisionedV3Container,
   type V3ContainerStatus,
 } from "./v3supervisor.js";
+
+// V3 Phase 3D — bridge(/ws/user-chat-bridge)resolveContainerEndpoint 实现
+export {
+  makeV3EnsureRunning,
+  ENSURE_RUNNING_DEFAULTS,
+  type EnsureRunningOptions,
+} from "./v3ensureRunning.js";
