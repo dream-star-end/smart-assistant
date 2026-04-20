@@ -10,7 +10,7 @@
 #
 # 退出码:
 #   0  通过
-#   1  发现禁用路径(打印行号 + 上下文)
+#   1  发现禁用路径(打印行号 + 匹配行)
 #   2  参数错误 / 文件不存在
 
 set -e
@@ -27,13 +27,14 @@ if [ ! -f "$FILE" ]; then
 fi
 
 # 禁用模式 (扩展正则):
-#   - handle    /v1/...        | handle    /internal/...
-#   - handle_path /v1/...      | handle_path /internal/...
-#   - route     /v1/...        | route     /internal/...
-#   - 任何裸出现 /v1/messages 或 /internal/ 的 site-config 行
+#   - handle    /v1/...   | handle    /internal/...
+#   - handle_path /v1/... | handle_path /internal/...
+#   - route     /v1/...   | route     /internal/...
+#   - reverse_proxy /v1/... | rewrite /v1/... | redir /v1/... 等指令直接带 /v1//internal/ 路径
+#   - quoted token: handle "/v1/messages" 是合法 Caddyfile 写法,正则用 "?  允许首位引号
 #
 # 注释 (# 开头) 不算违规,允许 boss 留 "禁止暴露 /internal/" 之类说明。
-DENY_PATTERN='^[[:space:]]*(handle|handle_path|route|reverse_proxy|rewrite|redir)[[:space:]]+/(v1|internal)/'
+DENY_PATTERN='^[[:space:]]*(handle|handle_path|route|reverse_proxy|rewrite|redir)[[:space:]]+"?/(v1|internal)/'
 
 violations=$(grep -nE "$DENY_PATTERN" "$FILE" || true)
 

@@ -480,12 +480,20 @@ export interface PipeStreamResult {
   bytesOut: number;
   /** 第一字节 ms(performance.now / Date.now 相对值);未收到任何 chunk → null。 */
   firstByteAtMs: number | null;
+  /**
+   * 中断/异常原因。null 表示流正常结束(EOF)。非 null 表示上游/下游中途断开,
+   * 但 observation 仍然反映"已看到的部分 usage",caller 据此区分 partial vs aborted。
+   */
+  error: unknown;
 }
 
 /**
  * 把上游 ReadableStream 的 chunk 字节完整透传给 res,同时旁路 UsageObserver。
  *
- * 任意 res.write 失败(下游已断)→ throw,由 caller 走 finalize.fail(observed=partial)。
+ * **永远 resolve,不 throw** —— 失败信息通过 `result.error` 暴露,observation 始终是 caller
+ * 视角下"最后看到的状态"(可能是 partial)。这样 caller 才能区分 "中途断流但拿到部分 usage"
+ * (settle=partial)与"压根没拿到"(settle=aborted),不会把 partial 误归到 aborted。
+ *
  * upstream reader 永远在 finally 里 cancel,避免上游 socket keep-alive hang。
  */
 export async function pipeStreamWithUsageCapture(
@@ -498,48 +506,53 @@ export async function pipeStreamWithUsageCapture(
   const observer = new UsageObserver();
   let bytesOut = 0;
   let firstByteAtMs: number | null = null;
+  let error: unknown = null;
   try {
-    while (true) {
-      if (signal.aborted) {
-        throw new ProxyAbortError("aborted before next chunk");
+    try {
+      while (true) {
+        if (signal.aborted) {
+          throw new ProxyAbortError("aborted before next chunk");
+        }
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value || value.length === 0) continue;
+        if (firstByteAtMs === null) firstByteAtMs = Date.now();
+        // 1) 字节透传 — write 失败 → 抛进外层 catch(下游已关连接)
+        const wrote = res.write(value);
+        bytesOut += value.length;
+        if (!wrote) {
+          // backpressure;等 drain 或 close。close 会让 signal abort 进而下次循环退出。
+          await new Promise<void>((resolve, reject) => {
+            const onDrain = () => {
+              res.off("drain", onDrain);
+              res.off("error", onErr);
+              resolve();
+            };
+            const onErr = (e: unknown) => {
+              res.off("drain", onDrain);
+              res.off("error", onErr);
+              reject(e);
+            };
+            res.on("drain", onDrain);
+            res.on("error", onErr);
+          });
+        }
+        // 2) 旁路 usage 提取(失败/异常都不影响 stream)
+        try {
+          observer.push(decoder.decode(value, { stream: true }));
+        } catch {
+          // observer 内部解析失败不该传染主路径
+        }
       }
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (!value || value.length === 0) continue;
-      if (firstByteAtMs === null) firstByteAtMs = Date.now();
-      // 1) 字节透传 — write 失败 → throw(下游已关连接)
-      const wrote = res.write(value);
-      bytesOut += value.length;
-      if (!wrote) {
-        // backpressure;等 drain 或 close。close 会让 signal abort 进而下次循环退出。
-        await new Promise<void>((resolve, reject) => {
-          const onDrain = () => {
-            res.off("drain", onDrain);
-            res.off("error", onErr);
-            resolve();
-          };
-          const onErr = (e: unknown) => {
-            res.off("drain", onDrain);
-            res.off("error", onErr);
-            reject(e);
-          };
-          res.on("drain", onDrain);
-          res.on("error", onErr);
-        });
-      }
-      // 2) 旁路 usage 提取(失败/异常都不影响 stream)
-      try {
-        observer.push(decoder.decode(value, { stream: true }));
-      } catch {
-        // observer 内部解析失败不该传染主路径
-      }
+    } catch (err) {
+      error = err;
     }
     try {
       observer.flush();
     } catch {
       /* ignore */
     }
-    return { observation: observer.result(), bytesOut, firstByteAtMs };
+    return { observation: observer.result(), bytesOut, firstByteAtMs, error };
   } finally {
     try {
       await reader.cancel();
@@ -679,12 +692,15 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
         finalCredits: cost_credits.toString(),
         kind: obs.kind,
         usage: usageToLog(usage),
+        clamped: settled.clamped,
       });
-      // 2I-2: billing_debit 三态。status='success' 时余额够;'billing_failed' = 余额被夹到 0(欠费,前端按 402 提示)
-      if (cost_credits > 0n) {
-        incrBillingDebit(status === "success" ? "success" : "insufficient");
-      } else {
-        // cost_credits === 0:不算 debit,不计数(observed.kind === 'none' 时已经走了 abort 路径,这里不会出现)
+      // 2I-2: billing_debit 三态语义重新对齐(Codex 审核结论):
+      //   * success      = obs.kind='final' + cost>0 + 余额 >= cost (足额扣款)
+      //   * insufficient = obs.kind='final' + cost>0 + 余额 < cost (debit 被夹到 0,欠费)
+      //   * (不计数)    = obs.kind='partial' (status='billing_failed' 路径不走 ledger debit,settle 计 partial)
+      //   * error        = settle 写库失败 (catch 块)
+      if (status === "success" && cost_credits > 0n) {
+        incrBillingDebit(settled.clamped ? "insufficient" : "success");
       }
       return { finalCredits: cost_credits, state: "committed", requestId: ctx.requestId };
     } catch (err) {
@@ -764,6 +780,12 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
 interface SettleResult {
   usageId: bigint;
   ledgerId: bigint | null;
+  /**
+   * true 表示 debit 被夹到余额(`debit < costCredits`),用户余额已扣到 0 但还欠 cost - balance。
+   * 此时 metrics 应记 `billing_debit_total{result="insufficient"}` 而非 "success"。
+   * 仅在 `args.status === 'success'` 且 `costCredits > 0n` 路径才可能为 true。
+   */
+  clamped: boolean;
 }
 
 /**
@@ -790,6 +812,7 @@ async function settleUsageAndLedger(
     await client.query("BEGIN");
     let usageId: bigint;
     let ledgerId: bigint | null = null;
+    let clamped = false;
     try {
       const ins = await client.query<{ id: string }>(
         `INSERT INTO usage_records
@@ -824,9 +847,13 @@ async function settleUsageAndLedger(
         if (sel.rowCount === 0) throw err;
         const r = sel.rows[0]!;
         await client.query("COMMIT");
+        // 重试时无法重新算 clamp(原始 balance 已变),保守标 false。
+        // metric 只对首次 settle 路径完整反映 — 重复 settle 是边界场景,
+        // 由 inflight 兜底,clamp 状态以原 ledger memo 为准(非 metric 来源)。
         return {
           usageId: BigInt(r.id),
           ledgerId: r.ledger_id === null ? null : BigInt(r.ledger_id),
+          clamped: false,
         };
       }
       throw err;
@@ -842,6 +869,7 @@ async function settleUsageAndLedger(
       // 余额 < cost:不再回滚 stream(已发字节回不来),设 status='billing_failed'
       // 并把扣费金额夹到余额,balance_after = 0
       const debit = balance < args.costCredits ? balance : args.costCredits;
+      clamped = debit < args.costCredits;
       const newBalance = balance - debit;
       await client.query(
         "UPDATE users SET credits=$1 WHERE id=$2",
@@ -869,7 +897,7 @@ async function settleUsageAndLedger(
       );
     }
     await client.query("COMMIT");
-    return { usageId, ledgerId };
+    return { usageId, ledgerId, clamped };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -1328,11 +1356,17 @@ export function makeAnthropicProxyHandler(
         } catch {
           /* ignore */
         }
-        await finalize.commit(observed);
-        // settle 三态:
-        //   final  = stream 结束 + 拿到 message_stop usage(理想)
-        //   partial= stream 结束但只拿到 message_delta(stop_reason 缺,usage 不全)
-        //   aborted= 进 finalize.fail 路径(发上游 4xx/5xx / 上游 throw / 客户端中断)
+        // 中途断流(result.error != null)走 fail,但 observation 已捕获 partial 状态
+        if (result.error !== null) {
+          await finalize.fail(observed, result.error);
+        } else {
+          await finalize.commit(observed);
+        }
+        // settle 三态(2I-2 codex 审核结论:partial 必须基于 observed.kind 判断,
+        // 不能因 pipeStream 抛错就直接归 aborted —— observation 捕获了部分 usage):
+        //   final   = stream 正常结束 + message_stop event 给齐 usage
+        //   partial = stream 中途断 / 仅看到 message_delta,有部分 usage
+        //   aborted = stream 没看到任何 usage(最早期就断)
         if (observed.kind === "final") incrAnthropicProxySettle("final");
         else if (observed.kind === "partial") incrAnthropicProxySettle("partial");
         else incrAnthropicProxySettle("aborted");

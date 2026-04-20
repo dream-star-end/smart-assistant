@@ -310,7 +310,9 @@ const WS_SESSION_DURATION_BUCKETS = [1, 5, 30, 60, 300, 900, 1800, 3600, 7200] a
 export const anthropicProxyTtft = new Histogram(
   {
     name: "anthropic_proxy_ttft_seconds",
-    help: "Time-to-first-byte from upstream after fetch resolved (seconds), per model",
+    // 起点 = fetch() 调用瞬间;终点 = 首个非空 SSE chunk。
+    // 包含 DNS/TLS/请求发送/上游排队/上游模型首字节。不是 Anthropic 模型 first-token 的纯 TTFT。
+    help: "Time from fetch() call to first non-empty SSE chunk (seconds), per model. Includes DNS/TLS/request send/upstream queueing.",
     labelNames: ["model"],
   },
   TTFT_BUCKETS,

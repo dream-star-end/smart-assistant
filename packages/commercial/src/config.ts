@@ -178,9 +178,12 @@ const agentLifecycleTickMs = z
  *
  * 拓扑:容器内 OpenClaude → POST http://${INTERNAL_PROXY_BIND}:${INTERNAL_PROXY_PORT}/v1/messages
  *
- * 默认 `172.30.0.1` = docker bridge 网关地址(2J-1 由 ufw 兜底,只允许该桥网段命中 18791)。
- * 端口默认 18791。两者 optional —— 单机 dev 可换成 127.0.0.1 端口探活;
- * 不监听时(env 缺失)代理静默不启动,/api/admin/anthropic-proxy/* 才会暴露状态。
+ * 推荐生产值: `INTERNAL_PROXY_BIND=172.30.0.1` `INTERNAL_PROXY_PORT=18791`
+ *   ↑ docker bridge `openclaude-v3-net` 的网关地址(2J-1 ufw 已兜底:仅 172.30.0.0/16 入向)
+ *
+ * **没有代码 default**(both fields `.optional()`)—— env 缺失则代理静默不启动,
+ * 仅 `/api/admin/anthropic-proxy/*` 报状态。Ops/部署脚本必须显式注入。
+ * 单机 dev 可换 `127.0.0.1` 端口探活,但绝不允许 wildcard。
  *
  * **绝不允许 0.0.0.0 / ::** —— 那等于把内部代理裸暴公网,配合 verifyContainerIdentity
  * 的 peerIp 因子被任意伪造。如果检测到 wildcard bind 直接抛 ConfigError。

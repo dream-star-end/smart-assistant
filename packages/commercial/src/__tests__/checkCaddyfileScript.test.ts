@@ -7,7 +7,8 @@
  * 我们把 fixture Caddyfile 写到临时目录,跑 bash 脚本,断言退出码 + stderr/stdout。
  */
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { after, before, describe, test } from "node:test";
+import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,11 +18,11 @@ const SCRIPT = join(__dirname, "..", "..", "scripts", "check-caddyfile.sh");
 
 let workDir: string;
 
-beforeAll(() => {
+before(() => {
   workDir = mkdtempSync(join(tmpdir(), "ocv3-caddy-"));
 });
 
-afterAll(() => {
+after(() => {
   if (workDir) rmSync(workDir, { recursive: true, force: true });
 });
 
@@ -35,6 +36,15 @@ function runChecker(content: string): { code: number; stdout: string; stderr: st
     stderr: res.stderr ?? "",
   };
 }
+
+const expect = (actual: unknown) => ({
+  toBe: (expected: unknown) => assert.strictEqual(actual, expected),
+  toContain: (substr: string) => assert.ok(String(actual).includes(substr), `expected to contain ${JSON.stringify(substr)}, got ${JSON.stringify(actual)}`),
+  toMatch: (pattern: RegExp) => assert.match(String(actual), pattern),
+  not: {
+    toMatch: (pattern: RegExp) => assert.doesNotMatch(String(actual), pattern),
+  },
+});
 
 describe("check-caddyfile.sh", () => {
   test("missing argument → exit 2", () => {
@@ -191,5 +201,30 @@ claudeai.chat {
 }
 `);
     expect(res.code).toBe(0);
+  });
+
+  // Codex 2026-04-20 audit: quoted token 是 Caddyfile 合法语法,旧正则会漏。
+  test('quoted: handle "/v1/messages" → exit 1', () => {
+    const res = runChecker(`
+claudeai.chat {
+    handle "/v1/messages" {
+        reverse_proxy 172.30.0.1:18791
+    }
+}
+`);
+    expect(res.code).toBe(1);
+    expect(res.stdout).toMatch(/handle "\/v1\/messages"/);
+  });
+
+  test('quoted: handle_path "/internal/admin" → exit 1', () => {
+    const res = runChecker(`
+example.com {
+    handle_path "/internal/admin" {
+        respond "ok"
+    }
+}
+`);
+    expect(res.code).toBe(1);
+    expect(res.stdout).toMatch(/handle_path "\/internal\/admin"/);
   });
 });

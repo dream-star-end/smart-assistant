@@ -2,14 +2,21 @@
 # 2J-1: host 侧网络隔离 — idempotent
 #
 # 作用:
-#   1. 创建 docker bridge 网络 openclaude-v3-net (subnet 172.30.0.0/16, gateway 172.30.0.1, IPv6=false)
+#   1. 创建 docker bridge 网络 openclaude-v3-net (subnet 172.30.0.0/16, gateway 172.30.0.1,
+#      IPv6=false, ICC=false 防容器横向)
 #   2. 添加 ufw 规则: 仅 172.30.0.0/16 可访问 172.30.0.1:18791 (内部代理 edge listener)
 #
 # 使用:  sudo bash setup-host-net.sh
 #
-# 幂等: 重复执行无副作用。docker network 已存在则只校验配置是否吻合;ufw 规则已存在则跳过。
+# 幂等: 重复执行无副作用。docker network 已存在则校验 subnet/gateway/ipv6/icc 全吻合;
+#       ufw 规则走自身幂等 ("Skipping adding existing rule") + 解析 stderr 决定 [OK]/[ADDED]
+#
+# locale: 强制 LANG=C 确保 ufw / docker 输出英文 (codex 审计:Skipping/Rule added 是英文串,
+#         非英文 locale 下 grep 会漂)。
 
 set -e
+export LANG=C
+export LC_ALL=C
 
 NET_NAME="openclaude-v3-net"
 SUBNET="172.30.0.0/16"
@@ -32,18 +39,22 @@ require_cmd() {
 
 ensure_network() {
   if docker network inspect "$NET_NAME" >/dev/null 2>&1; then
-    local actual_subnet actual_gw actual_ipv6
+    local actual_subnet actual_gw actual_ipv6 actual_icc
     actual_subnet=$(docker network inspect "$NET_NAME" -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
     actual_gw=$(docker network inspect "$NET_NAME" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')
     actual_ipv6=$(docker network inspect "$NET_NAME" -f '{{.EnableIPv6}}')
-    if [ "$actual_subnet" != "$SUBNET" ] || [ "$actual_gw" != "$GATEWAY" ] || [ "$actual_ipv6" != "false" ]; then
+    # icc opt 缺失时 docker 默认开启 → 视为 "true"。我们必须显式 false。
+    actual_icc=$(docker network inspect "$NET_NAME" -f '{{index .Options "com.docker.network.bridge.enable_icc"}}')
+    if [ -z "$actual_icc" ]; then actual_icc="true"; fi
+    if [ "$actual_subnet" != "$SUBNET" ] || [ "$actual_gw" != "$GATEWAY" ] \
+       || [ "$actual_ipv6" != "false" ] || [ "$actual_icc" != "false" ]; then
       echo "[ABORT] $NET_NAME 已存在但配置不符:"
-      echo "  expect: subnet=$SUBNET gateway=$GATEWAY ipv6=false"
-      echo "  actual: subnet=$actual_subnet gateway=$actual_gw ipv6=$actual_ipv6"
+      echo "  expect: subnet=$SUBNET gateway=$GATEWAY ipv6=false icc=false"
+      echo "  actual: subnet=$actual_subnet gateway=$actual_gw ipv6=$actual_ipv6 icc=$actual_icc"
       echo "  → 需要手动 docker network rm $NET_NAME 后重跑"
       exit 1
     fi
-    echo "[OK] $NET_NAME 已存在 (subnet=$SUBNET gateway=$GATEWAY ipv6=false)"
+    echo "[OK] $NET_NAME 已存在 (subnet=$SUBNET gateway=$GATEWAY ipv6=false icc=false)"
   else
     docker network create \
       --driver bridge \
