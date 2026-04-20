@@ -55,7 +55,7 @@
 | **3G** | volume GC(banned 7d / no-login 90d)— 1h tick,有 active 容器跳过 | 3F | ✅ | 2e40f8c |
 | **3H** | gateway 启动时 reconcile + 每 1h 跑 orphan 清理:比对 docker `ps -a` 与 `agent_containers` 表,孤儿容器 stop+rm,数据库孤儿标 vanished | 3F | ✅ | 8aea6cd |
 | **3I** | `MAX_RUNNING_CONTAINERS=N`(默认 50)硬限 + 启动时 `docker pull` 预热 | 3F | ✅ | f0c9724 |
-| **3J** | 容器侧网络隔离 e2e:`cap-drop NET_RAW/NET_ADMIN` 校验 + 容器内 spoof 别 IP 调内部代理必须 401 + `/internal/*` 公网无法访问 | 3C, 3E, 2J-1 | ✅ | (next) |
+| **3J** | 容器侧网络隔离 e2e:`cap-drop NET_RAW/NET_ADMIN` 校验 + 容器内 spoof 别 IP 调内部代理必须 401 + `/internal/*` 公网无法访问 | 3C, 3E, 2J-1 | ✅ | fcedc06 |
 | **3M** | `agent_containers` reader audit:**只保 R6.7 (a) 显式 state filter 一条 lint 规则**,删 R6.11 (b)/(c)/(d) 二选一 + RECONCILER_WHITELIST + 负例 fixture(都是为 multi-host 服务的) | 3F | ⏳ | — |
 
 ## Phase 4 — UI / admin 后台(P0 必备)
