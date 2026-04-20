@@ -36,6 +36,8 @@ const COMMERCIAL_TABLES = [
   "agent_audit",
   "agent_containers",
   "agent_subscriptions",
+  "user_preferences",
+  "request_finalize_journal",
   "orders",
   "topup_plans",
   "usage_records",
@@ -330,6 +332,20 @@ describe("/api/public/models (http integ)", () => {
     assert.equal(j.models[0].multiplier, "2.000");
     assert.equal(j.models[1].id, "claude-sonnet-4-6");
     assert.equal(j.models[1].input_per_ktok_credits, "0.006000");
+  });
+
+  test("/api/models alias returns same payload (V3 2F)", async (t) => {
+    if (skipIfNoPg(t) || !redis || !server) {
+      t.skip("fixtures not ready");
+      return;
+    }
+    const a = await fetch(`${baseUrl}/api/public/models`);
+    const b = await fetch(`${baseUrl}/api/models`);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    const ja = (await a.json()) as unknown;
+    const jb = (await b.json()) as unknown;
+    assert.deepEqual(jb, ja);
   });
 
   test("GET is the only allowed method (POST → 405)", async (t) => {

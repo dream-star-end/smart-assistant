@@ -36,6 +36,8 @@ import {
   handleConfirmPasswordReset,
   handleMe,
   handleListPublicModels,
+  handleGetMyPreferences,
+  handlePatchMyPreferences,
   type CommercialHttpDeps,
   type RequestContext,
 } from "./handlers.js";
@@ -119,7 +121,12 @@ export function createCommercialHandler(
     { method: "POST", path: "/api/auth/request-password-reset", handler: handleRequestPasswordReset },
     { method: "POST", path: "/api/auth/confirm-password-reset", handler: (req, res) => handleConfirmPasswordReset(req, res) },
     { method: "GET", path: "/api/me", handler: handleMe },
+    // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
+    { method: "GET",   path: "/api/me/preferences", handler: handleGetMyPreferences },
+    { method: "PATCH", path: "/api/me/preferences", handler: handlePatchMyPreferences },
     { method: "GET", path: "/api/public/models", handler: handleListPublicModels },
+    // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler
+    { method: "GET", path: "/api/models", handler: handleListPublicModels },
     { method: "GET", path: "/api/payment/plans", handler: handleListPlans },
     { method: "POST", path: "/api/payment/hupi/create", handler: handleCreateHupi },
     { method: "POST", path: "/api/payment/hupi/callback", handler: handleHupiCallback },
@@ -164,6 +171,7 @@ export function createCommercialHandler(
     "/api/auth/",
     "/api/me",
     "/api/public/",
+    "/api/models", // V3 2F: alias of /api/public/models, GET only
     "/api/payment/",
     "/api/agent/",
     "/api/admin/",

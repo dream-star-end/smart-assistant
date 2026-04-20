@@ -398,5 +398,49 @@ export async function handleListPublicModels(
   sendJson(res, 200, { models: deps.pricing.listPublic() });
 }
 
+// ─── GET / PATCH /api/me/preferences (V3 Phase 2 Task 2G) ──────────────
+//
+// 鉴权:Bearer access JWT(同 /api/me)。
+// GET:不存在记录 → 默认空对象 + 当前时间戳;不写 DB(避免 read-write 副作用)。
+// PATCH:body 必须是 object(strict allowlist 字段);返回新快照。
+
+export async function handleGetMyPreferences(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const { getPreferences } = await import("../user/preferences.js");
+  const snap = await getPreferences(user.id);
+  sendJson(res, 200, snap);
+}
+
+export async function handlePatchMyPreferences(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const body = await readJsonBody(req);
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
+  }
+  const { patchPreferences, PreferencesError } = await import("../user/preferences.js");
+  try {
+    const snap = await patchPreferences(user.id, body);
+    sendJson(res, 200, snap);
+  } catch (err) {
+    if (err instanceof PreferencesError) {
+      if (err.code === "VALIDATION") {
+        throw new HttpError(400, "INVALID_PREFERENCES", err.message);
+      }
+      throw new HttpError(500, "PREFERENCES_INTERNAL", "preferences update failed");
+    }
+    throw err;
+  }
+}
+
 // helper for tests / 其他 module
 export { clientIpOf, userAgentOf };

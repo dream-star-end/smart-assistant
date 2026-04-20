@@ -36,8 +36,8 @@
 | **2C** | `commercial/src/auth/containerIdentity.ts` 双因子校验(socket IP 反查 + secret hash timing-safe compare)+ 测试 | 2.0, 2B, 2I-1 | ✅ | bf1d805 |
 | **2D** | `commercial/src/http/anthropicProxy.ts` central proxy(**仅 monolith 拓扑**,绑 `172.30.0.1:18791`):zod strict body schema + 字段字节预算 + 双侧 cost 估算 + header 值 allowlist + per-uid rate limit + concurrency cap + preCheck + 上游 fetch + 双向 abort + single-shot finalizer + `pipeStreamWithUsageCapture`。**MVP 跳过 split 拓扑、跳过 edge sidecar 子进程** | 2C, 2I-1 | ✅ | 95ea08a |
 | **2E** | `commercial/src/ws/userChatBridge.ts` 用户 WS ↔ 容器 WS 桥 + 测试 | 2I-1 | ✅ | 19a9807 |
-| **2F** | `commercial/src/http/models.ts` GET `/api/models`(从 model_pricing 过滤 enabled) | — | ⏳ | — |
-| **2G** | `commercial/src/user/preferences.ts` GET/PATCH `/api/me/preferences` | 2B | ⏳ | — |
+| **2F** | `commercial/src/http/models.ts` GET `/api/models`(从 model_pricing 过滤 enabled) | — | ✅ | (复用 `/api/public/models` handler 加 alias 路由) |
+| **2G** | `commercial/src/user/preferences.ts` GET/PATCH `/api/me/preferences` | 2B | ✅ | (zod strict + JSONB shallow merge / null delete + 27 tests) |
 | **2H** | gateway `server.ts` 接入 commercialHandle + WS upgrade 路由 + `/healthz` 包含 commercial 状态 | 2A-2G | ⏳ | — |
 | **2I-2** | prom-client `/metrics`:TTFT、stream duration、settle 三态分布、preCheck reject、billing_debit_failures_total、ws_bridge_buffered_bytes | 2H | ⏳ | — |
 | **2J-1** | host 侧网络隔离:ufw 规则 + Caddyfile grep CI(`/internal/` 不能出现在 site config)+ `openclaude-v3-net` 子网创建 + IPv6 显式禁用 | 2D | ⏳ | — |

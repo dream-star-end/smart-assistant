@@ -35,6 +35,8 @@ const COMMERCIAL_TABLES = [
   "agent_audit",
   "agent_containers",
   "agent_subscriptions",
+  "user_preferences",
+  "request_finalize_journal",
   "orders",
   "topup_plans",
   "usage_records",

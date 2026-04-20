@@ -1,5 +1,8 @@
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
@@ -31,6 +34,8 @@ const COMMERCIAL_TABLES = [
   "agent_audit",
   "agent_containers",
   "agent_subscriptions",
+  "user_preferences",
+  "request_finalize_journal",
   "orders",
   "topup_plans",
   "usage_records",
@@ -174,14 +179,15 @@ describe("full migration suite 0001-0007", () => {
     if (skipIfNoPg(t)) return;
     // 第一次:完整 migrate
     await runMigrations();
-    // 要测 0007_seed_pricing 的 ON CONFLICT DO NOTHING 是否幂等,得让 migrate
-    // 框架愿意再跑它。直接删单条会被 out-of-order 检查拦(如果已有版本号更大
-    // 的迁移已 applied),所以把 0007 及之后的所有 schema_migrations 条目一并
-    // 删掉,恢复到 "0007 及后续待应用" 的状态。
-    await query("DELETE FROM schema_migrations WHERE version >= $1", [
-      "0007_seed_pricing",
-    ]);
-    await runMigrations();
+    // 要测 0007_seed_pricing 的 ON CONFLICT DO NOTHING 是否幂等。
+    // 直接走 runMigrations 二次 apply 0007 不可行:框架按 version 顺序记账,
+    // 0008+ 已 applied,删 0007 会触发 out-of-order 守卫;不删 0007 又不会重跑。
+    // 所以这里**直接** 读 0007 的 SQL body,在新事务里再执行一次 —— 这正是
+    // 该 SQL 必须幂等的真实场景(运维误手 / 部署回滚 / 跨环境复制)。
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const seedSqlPath = path.resolve(here, "../db/migrations/0007_seed_pricing.sql");
+    const seedSql = await readFile(seedSqlPath, "utf8");
+    await query(seedSql);
 
     const mp = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM model_pricing",

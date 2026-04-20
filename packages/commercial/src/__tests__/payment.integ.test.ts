@@ -40,7 +40,8 @@ const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB
 
 const COMMERCIAL_TABLES = [
   "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
-  "agent_subscriptions", "orders", "topup_plans", "usage_records",
+  "agent_subscriptions", "user_preferences", "request_finalize_journal",
+  "orders", "topup_plans", "usage_records",
   "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
   "email_verifications", "users", "schema_migrations",
 ];
