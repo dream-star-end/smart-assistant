@@ -645,7 +645,12 @@
         <div class="form-row" style="margin:0">
           <label>预设</label>
           <select id="persona-model-preset" onchange="if(this.value){document.getElementById('persona-model').value=this.value}">
-            <option value="">加载中…</option>
+            <option value="">自定义</option>
+            <!-- 静态兜底: 缓存了旧 agents.js 的客户端不会调 /api/models,
+                 没这些 option 的话下拉会一直停在"加载中"。新 agents.js
+                 会 innerHTML='' 然后按管理后台 model_pricing 重建。 -->
+            <option value="claude-opus-4-7">Claude Opus 4.7</option>
+            <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
           </select>
         </div>
         <div class="form-row" style="margin:0">

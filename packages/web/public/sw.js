@@ -1,6 +1,6 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v45'
+const VERSION = 'openclaude-v46'
 const SHELL = [
   '/',
   '/index.html',
