@@ -442,6 +442,16 @@ function _readAccountForm(isCreate) {
 function openCreateAccountModal() {
   openModal(`
     <h3>新建账号</h3>
+    <div class="form-row">
+      <button class="btn-primary" id="acc-oauth" type="button">
+        🔐 用 Claude 订阅授权 (OAuth)
+      </button>
+      <small style="display:block;margin-top:6px;color:var(--muted)">
+        点击后弹出 Claude 授权页;授权完成后把回调 URL 里的 code 粘回来,
+        access/refresh/expires 三栏会自动填好。
+      </small>
+    </div>
+    <hr style="margin:14px 0;border:0;border-top:1px solid var(--border, #ddd)" />
     ${_accountFormFields(null)}
     <div class="form-actions">
       <button id="acc-cancel">取消</button>
@@ -449,6 +459,7 @@ function openCreateAccountModal() {
     </div>
   `)
   $('acc-cancel').addEventListener('click', closeModal)
+  $('acc-oauth').addEventListener('click', () => runAdminClaudeOAuthFlow())
   $('acc-ok').addEventListener('click', async () => {
     let body
     try { body = _readAccountForm(true) }
@@ -462,6 +473,67 @@ function openCreateAccountModal() {
       toast(`创建失败: ${e.message}`, 'danger')
     }
   })
+}
+
+// Claude OAuth 引导(管理员"新建账号"用):
+//   1. POST /api/admin/accounts/oauth/start → { authUrl, state }
+//   2. window.open(authUrl) — 用户在新窗口里授权
+//   3. prompt("粘 code 或回调 URL") → 自动从 URL 抽 code= 参数
+//   4. POST /api/admin/accounts/oauth/exchange { code, state }
+//      → { access_token, refresh_token, expires_at }
+//   5. 把三个值填进表单,管理员点 "创建" 走标准入库
+async function runAdminClaudeOAuthFlow() {
+  let started
+  try {
+    started = await apiJson('POST', '/api/admin/accounts/oauth/start', {})
+  } catch (e) {
+    toast(`OAuth 启动失败: ${e.message}`, 'danger')
+    return
+  }
+  const { authUrl, state: oauthState } = started || {}
+  if (!authUrl || !oauthState) {
+    toast('OAuth 启动返回不完整', 'danger')
+    return
+  }
+  // 弹新窗口去授权;部分浏览器拦截 → fall back 到当前窗口提示用户手动打开
+  const w = window.open(authUrl, '_blank', 'width=720,height=860')
+  if (!w) {
+    if (!confirm('弹窗被拦截。点击确定在当前窗口打开授权页(完成后请回到本页粘 code)')) return
+    window.location.href = authUrl
+    return
+  }
+  // 用户在新窗口里授权,完成后页面会跳到 platform.claude.com 并展示一个 code。
+  // 让 admin 把整段回调 URL 或 code 复制回来。
+  const raw = prompt('授权完成后,把回调地址里的 code(或整个 URL)粘到这里:')
+  if (!raw) return
+  let code = raw.trim()
+  // 自动从 URL 里抽 code= 参数
+  try {
+    if (code.startsWith('http')) {
+      const u = new URL(code)
+      code = u.searchParams.get('code') || code
+    }
+  } catch { /* 不是 URL,按 code 处理 */ }
+  // claude 回调 code 后面常带 #...,server 会再清一次 hash,这里也兜底
+  if (code.includes('#')) code = code.split('#')[0]
+
+  let exchanged
+  try {
+    exchanged = await apiJson('POST', '/api/admin/accounts/oauth/exchange', {
+      code, state: oauthState,
+    })
+  } catch (e) {
+    toast(`Token 交换失败: ${e.message}`, 'danger')
+    return
+  }
+  // 自动填表单
+  const tokenEl = $('acc-token')
+  const refreshEl = $('acc-refresh')
+  const expiresEl = $('acc-expires')
+  if (tokenEl) tokenEl.value = exchanged.access_token || ''
+  if (refreshEl) refreshEl.value = exchanged.refresh_token || ''
+  if (expiresEl) expiresEl.value = exchanged.expires_at || ''
+  toast('已拿到 token,核对 label/plan 后点"创建"', 'success')
 }
 
 async function openEditAccountModal(id) {

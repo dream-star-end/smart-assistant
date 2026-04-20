@@ -70,6 +70,8 @@ import {
   handleAdminCreateAccount,
   handleAdminPatchAccount,
   handleAdminDeleteAccount,
+  handleAdminOAuthStart,
+  handleAdminOAuthExchange,
   handleAdminListAgentContainers,
   handleAdminAgentContainerAction,
   handleAdminListLedger,
@@ -162,6 +164,9 @@ export function createCommercialHandler(
     // T-60 超管账号池
     { method: "GET",    path: "/api/admin/accounts",         handler: handleAdminListAccounts },
     { method: "POST",   path: "/api/admin/accounts",         handler: handleAdminCreateAccount },
+    // OAuth 引导:exact path 必须排在 prefix 之前(prefix 才能 fall through)
+    { method: "POST",   path: "/api/admin/accounts/oauth/start",    handler: handleAdminOAuthStart },
+    { method: "POST",   path: "/api/admin/accounts/oauth/exchange", handler: handleAdminOAuthExchange },
     { method: "GET",    pathPrefix: "/api/admin/accounts/",  handler: handleAdminGetAccount },
     { method: "PATCH",  pathPrefix: "/api/admin/accounts/",  handler: handleAdminPatchAccount },
     { method: "DELETE", pathPrefix: "/api/admin/accounts/",  handler: handleAdminDeleteAccount },

@@ -54,6 +54,11 @@ import {
   type AdminPatchAccountInput,
 } from "../admin/accounts.js";
 import {
+  startClaudeOAuth,
+  exchangeClaudeOAuth,
+  OAuthExchangeError,
+} from "../admin/oauth.js";
+import {
   listContainers,
   adminRestartContainer,
   adminStopContainer,
@@ -788,6 +793,57 @@ export async function handleAdminDeleteAccount(
   });
   if (!ok) throw new HttpError(404, "NOT_FOUND", "account not found");
   sendJson(res, 200, { deleted: true });
+}
+
+// ─── account-pool OAuth(管理员"新建账号"流程)──────────────────────
+//
+// 流程:
+//   1. POST /api/admin/accounts/oauth/start     → { authUrl, state }
+//   2. admin 浏览器打开 authUrl,授权后从回调 URL 复制 code
+//   3. POST /api/admin/accounts/oauth/exchange  body: { code, state }
+//                                               → { access_token, refresh_token, expires_at, scope }
+//   4. 前端把 token 自动填进"新建账号"表单,POST /api/admin/accounts 走标准入库
+//
+// 这两个接口不写库 —— 落库由后续的 adminCreateAccount 完成,审计自然落在那里。
+
+export async function handleAdminOAuthStart(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const r = startClaudeOAuth();
+  sendJson(res, 200, r);
+}
+
+export async function handleAdminOAuthExchange(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.code !== "string" || !b.code) {
+    throw new HttpError(400, "VALIDATION", "code is required");
+  }
+  if (typeof b.state !== "string" || !b.state) {
+    throw new HttpError(400, "VALIDATION", "state is required");
+  }
+  try {
+    const r = await exchangeClaudeOAuth(b.code, b.state);
+    sendJson(res, 200, r);
+  } catch (err) {
+    if (err instanceof OAuthExchangeError) {
+      throw new HttpError(err.status, "OAUTH_FAILED", err.message);
+    }
+    throw err;
+  }
 }
 
 // ─── agent containers ──────────────────────────────────────────────
