@@ -281,6 +281,7 @@ describe("makeV3EnsureRunning", () => {
     const { docker } = makeDocker({ inspectState: "running" });
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
       probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
       sleep: noSleep,
       now: fixedNow,
     });
@@ -296,6 +297,7 @@ describe("makeV3EnsureRunning", () => {
     let nowVal = 1_000_000;
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
       probeHealthz: async () => false,
+      probeWsUpgrade: async () => false,
       sleep: async (ms) => { nowVal += ms; },
       now: () => nowVal,
       healthzTimeoutMs: 1000,
@@ -337,6 +339,7 @@ describe("makeV3EnsureRunning", () => {
     const { docker, captured } = makeDocker({ inspectState: "missing" });
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
       probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
       sleep: noSleep,
       now: fixedNow,
     });
@@ -362,6 +365,7 @@ describe("makeV3EnsureRunning", () => {
     const { docker, captured } = makeDocker();
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
       probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
       sleep: noSleep,
       now: fixedNow,
     });
@@ -382,6 +386,7 @@ describe("makeV3EnsureRunning", () => {
     });
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
       probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
       sleep: noSleep,
       now: fixedNow,
     });
@@ -399,6 +404,7 @@ describe("makeV3EnsureRunning", () => {
     let nowVal = 1_000_000;
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
       probeHealthz: async () => false,
+      probeWsUpgrade: async () => false,
       sleep: async (ms) => { nowVal += ms; },
       now: () => nowVal,
       healthzTimeoutMs: 500,
@@ -429,6 +435,7 @@ describe("makeV3EnsureRunning", () => {
     const { docker } = makeDocker();
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, brokenPool), {
       probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
       sleep: noSleep,
       now: fixedNow,
     });
@@ -465,8 +472,9 @@ describe("makeV3EnsureRunning", () => {
     });
   });
 
-  test("默认 probeHealthz 命中真 HTTP 200 → ready", async () => {
-    // 起一个本机 server,默认 probeHealthz 走 http.request 探它
+  test("默认 HTTP probe 命中真 200(WS probe stub 返 true)→ ready", async () => {
+    // 起一个本机 server,默认 probeHealthz 走 http.request 探它;WS probe 用 stub
+    // (3E 已经独立测过 WS upgrade probe 实现,这里只验证 HTTP 默认实现接到 ensureRunning)
     const server: Server = createServer((req, res) => {
       if (req.url === "/healthz") {
         res.statusCode = 200;
@@ -481,16 +489,13 @@ describe("makeV3EnsureRunning", () => {
 
     const pool = new FakePool();
     pool.preInsertActive(15, "127.0.0.1", "dockerid-pre-15");
-    // 让真 supervisor 走 PG path,docker inspect 返 running
     const { docker } = makeDocker({ inspectState: "running" });
-    // 关键:不注入 probeHealthz,走默认 http.request
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+      probeWsUpgrade: async () => true,
       sleep: noSleep,
       now: fixedNow,
     });
 
-    // 我们 preInsertActive 是 127.0.0.1 + V3_CONTAINER_PORT,但 supervisor 返的是 row.port,
-    // 而 row.port 已经是 V3_CONTAINER_PORT。我们 hack 覆盖 row.port → 我们的 server port
     pool.rows[0]!.port = port;
     try {
       const ep = await ensureRunning(15n);
@@ -500,7 +505,7 @@ describe("makeV3EnsureRunning", () => {
     }
   });
 
-  test("默认 probeHealthz 命中真 HTTP 500 → 不 ready,继续轮询直到 timeout", async () => {
+  test("默认 HTTP probe 命中真 500 → 不 ready,继续轮询直到 timeout", async () => {
     const server: Server = createServer((_req, res) => {
       res.statusCode = 500;
       res.end("nope");
@@ -513,6 +518,7 @@ describe("makeV3EnsureRunning", () => {
     const { docker } = makeDocker({ inspectState: "running" });
     let nowVal = 1_000_000;
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+      probeWsUpgrade: async () => true,  // WS 即使 ok 也救不了 HTTP 500
       sleep: async (ms) => { nowVal += ms; },
       now: () => nowVal,
       healthzTimeoutMs: 300,
@@ -530,5 +536,26 @@ describe("makeV3EnsureRunning", () => {
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }
+  });
+
+  test("HTTP ok 但 WS upgrade 一直失败 → 不 ready (3E 双过语义)", async () => {
+    const pool = new FakePool();
+    pool.preInsertActive(17, "172.30.1.7", "dockerid-pre-17");
+    const { docker } = makeDocker({ inspectState: "running" });
+    let nowVal = 1_000_000;
+    const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+      probeHealthz: async () => true,
+      probeWsUpgrade: async () => false,
+      sleep: async (ms) => { nowVal += ms; },
+      now: () => nowVal,
+      healthzTimeoutMs: 500,
+      healthzIntervalMs: 100,
+    });
+
+    await assert.rejects(ensureRunning(17n), (err) => {
+      assert.ok(err instanceof ContainerUnreadyError);
+      assert.strictEqual(err.reason, "starting");
+      return true;
+    });
   });
 });

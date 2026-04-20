@@ -46,3 +46,15 @@ export {
   ENSURE_RUNNING_DEFAULTS,
   type EnsureRunningOptions,
 } from "./v3ensureRunning.js";
+
+// V3 Phase 3E — readiness probe(HTTP /healthz + WS upgrade)
+export {
+  waitContainerReady,
+  probeHealthzHttp,
+  probeWsUpgrade,
+  DEFAULT_READINESS_TIMEOUT_MS,
+  DEFAULT_READINESS_INTERVAL_MS,
+  DEFAULT_HTTP_PROBE_MS,
+  DEFAULT_WS_PROBE_MS,
+  type WaitContainerReadyOptions,
+} from "./v3readiness.js";

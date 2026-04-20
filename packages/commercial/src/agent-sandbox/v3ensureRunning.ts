@@ -29,7 +29,6 @@
  * MVP 单库 < 2^53 个用户(实际 ≪ 1k),Number(uid) 不会丢精度;但仍然显式 guard。
  */
 
-import { request as httpRequest } from "node:http";
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import {
   getV3ContainerStatus,
@@ -39,15 +38,14 @@ import {
   type V3SupervisorDeps,
   type V3ContainerStatus,
 } from "./v3supervisor.js";
-
-/** /healthz 探活默认超时(ms)。容器从 docker start 到 npm run gateway 监听一般 3-5s,留 10s 余量。 */
-const DEFAULT_HEALTHZ_TIMEOUT_MS = 10_000;
-
-/** /healthz 探活轮询间隔(ms)。200ms 抓得到瞬态 ready 又不打满 docker 桥接。 */
-const DEFAULT_HEALTHZ_INTERVAL_MS = 200;
-
-/** 单次 /healthz HTTP 请求超时(ms)。容器内 OpenClaude 卡住时不能拖死 supervisor 调度。 */
-const DEFAULT_HEALTHZ_PROBE_MS = 1_000;
+import {
+  waitContainerReady,
+  DEFAULT_READINESS_TIMEOUT_MS,
+  DEFAULT_READINESS_INTERVAL_MS,
+  DEFAULT_HTTP_PROBE_MS,
+  DEFAULT_WS_PROBE_MS,
+  type WaitContainerReadyOptions,
+} from "./v3readiness.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
@@ -55,76 +53,43 @@ const RETRY_AFTER_PROVISIONING_SEC = 5;
 /** 前端 retry-after 提示秒数(stopped — 等 3F 清理)。短一点,避免用户等久。 */
 const RETRY_AFTER_STOPPED_SEC = 3;
 
-/** ensureRunning 注入项 — 测试可以覆盖 healthz 探活实现。 */
+/**
+ * ensureRunning 注入项 — 测试可以覆盖 readiness 探活实现。
+ *
+ * 字段沿用 3D 命名(向后兼容),但语义已改为 §3E 的 readiness:HTTP /healthz +
+ * WS upgrade probe 双过 才算 ready。
+ */
 export interface EnsureRunningOptions {
-  /** /healthz 探活超时,默认 10s */
+  /** readiness 总超时,默认 10s(对应 §9.3 task 3E) */
   healthzTimeoutMs?: number;
-  /** /healthz 探活轮询间隔,默认 200ms */
+  /** 轮询间隔,默认 200ms */
   healthzIntervalMs?: number;
-  /** 单次 HTTP 请求超时,默认 1s */
+  /** 单次 HTTP /healthz probe 超时,默认 1s */
   healthzProbeMs?: number;
-  /** 测试钩子:覆盖 /healthz 探活;返 true = ready */
+  /** 单次 WS upgrade probe 超时,默认 1.5s(3E 新增) */
+  wsProbeMs?: number;
+  /** 测试钩子:覆盖 HTTP /healthz 探活 */
   probeHealthz?: (host: string, port: number) => Promise<boolean>;
+  /** 测试钩子:覆盖 WS upgrade 探活(3E 新增) */
+  probeWsUpgrade?: (host: string, port: number) => Promise<boolean>;
   /** 测试钩子:覆盖 setTimeout(主要给 fake-timer/排测试) */
   sleep?: (ms: number) => Promise<void>;
   /** 测试钩子:可注入"现在是几号"用于 timeout 计算 */
   now?: () => number;
 }
 
-/**
- * 默认 /healthz 探活:HTTP GET http://host:port/healthz,2xx → ready。
- *
- * 失败行为:任何 ECONNREFUSED / 超时 / 非 2xx → false(不抛)。
- */
-async function defaultProbeHealthz(host: string, port: number, probeMs: number): Promise<boolean> {
-  return await new Promise<boolean>((resolve) => {
-    const req = httpRequest(
-      {
-        host,
-        port,
-        path: "/healthz",
-        method: "GET",
-        timeout: probeMs,
-      },
-      (res) => {
-        const ok = !!res.statusCode && res.statusCode >= 200 && res.statusCode < 300;
-        // 必须 resume + drain,否则 socket 不归还到 keepalive 池(影响下次 probe)
-        res.resume();
-        res.on("end", () => resolve(ok));
-        res.on("error", () => resolve(false));
-      },
-    );
-    req.on("timeout", () => {
-      try { req.destroy(); } catch { /* */ }
-      resolve(false);
-    });
-    req.on("error", () => resolve(false));
-    req.end();
-  });
-}
-
-/**
- * 轮询 waitHealthz 直到 ready 或超时。
- *
- * 不会抛 — 超时返 false,caller 决定怎么处理。
- */
-async function waitHealthz(
-  host: string,
-  port: number,
-  opts: Required<Pick<EnsureRunningOptions, "healthzTimeoutMs" | "healthzIntervalMs" | "healthzProbeMs">> & {
-    probeHealthz: (host: string, port: number) => Promise<boolean>;
-    sleep: (ms: number) => Promise<void>;
-    now: () => number;
-  },
-): Promise<boolean> {
-  const deadline = opts.now() + opts.healthzTimeoutMs;
-  // 第一次立即试一次(容器可能已经热的)
-  if (await opts.probeHealthz(host, port)) return true;
-  while (opts.now() < deadline) {
-    await opts.sleep(opts.healthzIntervalMs);
-    if (await opts.probeHealthz(host, port)) return true;
-  }
-  return false;
+function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerReadyOptions {
+  const out: WaitContainerReadyOptions = {
+    timeoutMs: opts.healthzTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS,
+    intervalMs: opts.healthzIntervalMs ?? DEFAULT_READINESS_INTERVAL_MS,
+    httpProbeMs: opts.healthzProbeMs ?? DEFAULT_HTTP_PROBE_MS,
+    wsProbeMs: opts.wsProbeMs ?? DEFAULT_WS_PROBE_MS,
+  };
+  if (opts.probeHealthz) out.probeHttp = opts.probeHealthz;
+  if (opts.probeWsUpgrade) out.probeWs = opts.probeWsUpgrade;
+  if (opts.sleep) out.sleep = opts.sleep;
+  if (opts.now) out.now = opts.now;
+  return out;
 }
 
 /**
@@ -150,20 +115,7 @@ export function makeV3EnsureRunning(
   deps: V3SupervisorDeps,
   options: EnsureRunningOptions = {},
 ): (uid: bigint) => Promise<{ host: string; port: number }> {
-  const probeMs = options.healthzProbeMs ?? DEFAULT_HEALTHZ_PROBE_MS;
-  const probeHealthz =
-    options.probeHealthz ?? ((h, p) => defaultProbeHealthz(h, p, probeMs));
-  const sleep =
-    options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
-  const now = options.now ?? Date.now;
-  const probeOpts = {
-    healthzTimeoutMs: options.healthzTimeoutMs ?? DEFAULT_HEALTHZ_TIMEOUT_MS,
-    healthzIntervalMs: options.healthzIntervalMs ?? DEFAULT_HEALTHZ_INTERVAL_MS,
-    healthzProbeMs: probeMs,
-    probeHealthz,
-    sleep,
-    now,
-  };
+  const readinessOpts = buildReadinessOpts(options);
 
   return async function ensureRunning(uidBig: bigint): Promise<{ host: string; port: number }> {
     // bigint → number,显式 guard(>2^53 不会发生,MVP 用户量 < 1k,但守住)
@@ -181,9 +133,9 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "supervisor_error");
     }
 
-    // 2a) running 直接进 healthz 探活
+    // 2a) running 直接进 readiness 探活(HTTP /healthz + WS upgrade)
     if (status && status.state === "running") {
-      const ready = await waitHealthz(status.boundIp, status.port, probeOpts);
+      const ready = await waitContainerReady(status.boundIp, status.port, readinessOpts);
       if (!ready) throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "starting");
       return { host: status.boundIp, port: status.port };
     }
@@ -216,11 +168,11 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }
 
-    // 4) waitHealthz —— 容器内 OpenClaude 起来需要 3-8s
-    const ready = await waitHealthz(provisioned.boundIp, provisioned.port, probeOpts);
+    // 4) waitContainerReady —— 容器内 OpenClaude 起来需要 3-8s,HTTP+WS 双过才算 ready
+    const ready = await waitContainerReady(provisioned.boundIp, provisioned.port, readinessOpts);
     if (!ready) {
-      // 起来了但 healthz 没通 — 前端按 retryAfter 重连(下次再调本 ensureRunning,
-      // 那时 status='running',probeHealthz 可能已经 ok)
+      // 起来了但 readiness 没通 — 前端按 retryAfter 重连(下次再调本 ensureRunning,
+      // 那时 status='running',probe 可能已经 ok)
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "starting");
     }
 
@@ -230,9 +182,10 @@ export function makeV3EnsureRunning(
 
 // 给测试用的 default constants(也作为 wrapper 默认值的 SSOT,改这里要同步)
 export const ENSURE_RUNNING_DEFAULTS = Object.freeze({
-  HEALTHZ_TIMEOUT_MS: DEFAULT_HEALTHZ_TIMEOUT_MS,
-  HEALTHZ_INTERVAL_MS: DEFAULT_HEALTHZ_INTERVAL_MS,
-  HEALTHZ_PROBE_MS: DEFAULT_HEALTHZ_PROBE_MS,
+  HEALTHZ_TIMEOUT_MS: DEFAULT_READINESS_TIMEOUT_MS,
+  HEALTHZ_INTERVAL_MS: DEFAULT_READINESS_INTERVAL_MS,
+  HEALTHZ_PROBE_MS: DEFAULT_HTTP_PROBE_MS,
+  WS_PROBE_MS: DEFAULT_WS_PROBE_MS,
   RETRY_AFTER_PROVISIONING_SEC,
   RETRY_AFTER_STOPPED_SEC,
   CONTAINER_PORT: V3_CONTAINER_PORT,
