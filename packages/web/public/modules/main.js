@@ -1054,6 +1054,8 @@ async function _forceLogout({ serverLogout } = {}) {
 function showLogin() {
   $('login-view').hidden = false
   $('app-view').hidden = true
+  if ($('landing-view')) $('landing-view').hidden = true
+  document.body.classList.remove('body-landing')
   if ($('login-error')) $('login-error').style.display = 'none'
   // Clear v3 commercial auth-mode form fields if present
   for (const id of [
@@ -1136,7 +1138,149 @@ async function _ensureSessionCookie() {
 async function showApp() {
   $('login-view').hidden = true
   $('app-view').hidden = false
+  if ($('landing-view')) $('landing-view').hidden = true
+  document.body.classList.remove('body-landing')
   await _ensureSessionCookie()
+}
+
+// ───────── Landing page (cold-visitor marketing surface) ─────────
+let _landingDataLoaded = false
+function _ktokToYuanPretty(creditsPerKtok) {
+  // creditsPerKtok comes from /api/public/models as a string in raw "credits"
+  // unit. Per claudeai.chat convention: 1 积分 = ¥1 (the raw string from
+  // /api/public/models is already the user-facing 积分/¥ figure for those
+  // *_per_ktok_credits fields — confirmed by Opus 4.7 input being "0.030000"
+  // → ¥0.03 / 千 token). Just trim trailing zeros for display.
+  const n = Number(creditsPerKtok)
+  if (!Number.isFinite(n)) return '—'
+  if (n === 0) return '¥0'
+  // Up to 4 significant decimals
+  const s = n.toFixed(4).replace(/\.?0+$/, '')
+  return `¥${s}`
+}
+function _modelTagFor(id) {
+  if (/opus/i.test(id)) return '旗舰推理'
+  if (/sonnet/i.test(id)) return '日常对话'
+  if (/haiku/i.test(id)) return '极速响应'
+  return '通用'
+}
+async function _loadLandingData() {
+  if (_landingDataLoaded) return
+  _landingDataLoaded = true
+  // Models
+  ;(async () => {
+    const wrap = $('landing-models')
+    if (!wrap) return
+    try {
+      const r = await apiFetch('/api/public/models', { suppressAuthRedirect: true })
+      const j = await r.json().catch(() => ({}))
+      const models = Array.isArray(j?.models) ? j.models : []
+      if (models.length === 0) {
+        wrap.innerHTML = '<div class="landing-models-loading">暂无可用模型</div>'
+        return
+      }
+      wrap.innerHTML = models.map((m) => {
+        const name = htmlSafeEscape(m.display_name || m.id || '')
+        const id = htmlSafeEscape(m.id || '')
+        const tag = htmlSafeEscape(_modelTagFor(m.id || ''))
+        const inP = _ktokToYuanPretty(m.input_per_ktok_credits)
+        const outP = _ktokToYuanPretty(m.output_per_ktok_credits)
+        const cacheR = _ktokToYuanPretty(m.cache_read_per_ktok_credits)
+        const cacheW = _ktokToYuanPretty(m.cache_write_per_ktok_credits)
+        return `
+          <div class="landing-model">
+            <div class="landing-model-head">
+              <div>
+                <div class="landing-model-name">${name}</div>
+                <div class="landing-model-id">${id}</div>
+              </div>
+              <span class="landing-model-tag">${tag}</span>
+            </div>
+            <div class="landing-model-prices">
+              <div class="landing-model-price">
+                <span class="landing-model-price-label">输入</span>
+                <span class="landing-model-price-val">${inP}<span class="unit">/ 1K tok</span></span>
+              </div>
+              <div class="landing-model-price">
+                <span class="landing-model-price-label">输出</span>
+                <span class="landing-model-price-val">${outP}<span class="unit">/ 1K tok</span></span>
+              </div>
+              <div class="landing-model-price">
+                <span class="landing-model-price-label">缓存读</span>
+                <span class="landing-model-price-val">${cacheR}<span class="unit">/ 1K tok</span></span>
+              </div>
+              <div class="landing-model-price">
+                <span class="landing-model-price-label">缓存写</span>
+                <span class="landing-model-price-val">${cacheW}<span class="unit">/ 1K tok</span></span>
+              </div>
+            </div>
+          </div>
+        `
+      }).join('')
+    } catch {
+      wrap.innerHTML = '<div class="landing-models-loading">加载失败,请刷新重试</div>'
+    }
+  })()
+  // Plans
+  ;(async () => {
+    const wrap = $('landing-plans')
+    if (!wrap) return
+    try {
+      const r = await apiFetch('/api/payment/plans', { suppressAuthRedirect: true })
+      const j = await r.json().catch(() => ({}))
+      const plans = Array.isArray(j?.data?.plans) ? j.data.plans : []
+      if (plans.length === 0) {
+        wrap.innerHTML = '<div class="landing-models-loading">暂无充值方案</div>'
+        return
+      }
+      // Featured = "plan-200" (best ratio of bonus + accessible price)
+      const featuredCode = 'plan-200'
+      wrap.innerHTML = plans.map((p) => {
+        const yuan = Math.round(Number(p.amount_cents) / 100)
+        const credits = Math.round(Number(p.credits) / 100) // 1 积分 = 100 raw cents
+        const baseCredits = yuan
+        const bonus = credits - baseCredits
+        const bonusPct = baseCredits > 0 ? Math.round((bonus / baseCredits) * 100) : 0
+        const featured = p.code === featuredCode
+        return `
+          <div class="landing-plan${featured ? ' landing-plan-featured' : ''}">
+            <div class="landing-plan-amount"><span class="yuan">¥</span>${yuan}</div>
+            <div class="landing-plan-credits">${credits} 积分</div>
+            <div class="landing-plan-bonus">${bonus > 0 ? `赠 ${bonus} 积分 (+${bonusPct}%)` : '基础档'}</div>
+          </div>
+        `
+      }).join('')
+    } catch {
+      wrap.innerHTML = '<div class="landing-models-loading">加载失败,请刷新重试</div>'
+    }
+  })()
+}
+function showLanding() {
+  if (!$('landing-view')) { showLogin(); return }
+  $('landing-view').hidden = false
+  $('login-view').hidden = true
+  $('app-view').hidden = true
+  // Body baseline is overflow:hidden + height:100dvh for the chat SPA;
+  // landing needs auto height + scrollable body to expose all sections.
+  document.body.classList.add('body-landing')
+  _loadLandingData()
+  // Smooth scroll to top so cross-page anchor returns to hero
+  try { window.scrollTo({ top: 0, behavior: 'instant' }) } catch { window.scrollTo(0, 0) }
+}
+function _wireLandingButtons() {
+  const lv = $('landing-view')
+  if (!lv) return
+  const goRegister = () => { showLogin(); try { setAuthMode('register') } catch {} }
+  const goLogin = () => { showLogin(); try { setAuthMode('login') } catch {} }
+  ;['landing-register-btn', 'landing-hero-register-btn', 'landing-foot-register-btn'].forEach((id) => {
+    $(id)?.addEventListener('click', goRegister)
+  })
+  ;['landing-login-btn', 'landing-hero-login-btn'].forEach((id) => {
+    $(id)?.addEventListener('click', goLogin)
+  })
+  $('landing-theme-btn')?.addEventListener('click', () => {
+    try { cycleTheme() } catch {}
+  })
 }
 
 // Delegated media-error retry. `error` events on <img>/<audio>/<video> don't
@@ -1767,6 +1911,7 @@ async function init() {
   initAuth()
   initBilling()
   initUserPrefs()
+  _wireLandingButtons()
   // Palette input
   $('palette-input').addEventListener('input', (e) => {
     paletteItems = buildPaletteItems(e.target.value)
@@ -1877,7 +2022,20 @@ async function init() {
       renderSidebar()
     }).catch(() => {})
   } else {
-    showLogin()
+    // Cold visitor (no token):
+    //  - URL-driven flows (?verify_email / ?reset_password / explicit ?login=1)
+    //    skip landing and jump straight into the auth view.
+    //  - Otherwise show the marketing landing page; user clicks CTA → login-view.
+    const sp = new URLSearchParams(window.location.search)
+    const goStraightToAuth =
+      sp.has('verify_email') || sp.has('reset_password') ||
+      sp.has('login') || sp.has('register') || sp.has('signin') || sp.has('signup')
+    if (goStraightToAuth) {
+      showLogin()
+      if (sp.has('register') || sp.has('signup')) { try { setAuthMode('register') } catch {} }
+    } else {
+      showLanding()
+    }
   }
 
   // Service worker

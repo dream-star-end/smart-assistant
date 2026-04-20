@@ -86,6 +86,18 @@ function _loadTurnstileScript() {
   return _turnstileScriptInflight
 }
 
+// Wait until the container is actually painted (non-zero dimensions).
+// Cloudflare Turnstile silently fails to draw the iframe when rendered into a
+// hidden / 0×0 parent — the hidden cf-turnstile-response input gets created but
+// the visible challenge never appears, leaving the user staring at blank space.
+async function _waitForVisible(container, maxFrames = 30) {
+  for (let i = 0; i < maxFrames; i++) {
+    if (container.offsetWidth > 0 && container.offsetHeight > 0) return true
+    await new Promise((r) => requestAnimationFrame(r))
+  }
+  return container.offsetWidth > 0 && container.offsetHeight > 0
+}
+
 // Ensures a widget exists in the given container; returns getResponseFn.
 async function _mountWidget(container) {
   const cfg = await loadPublicConfig()
@@ -102,6 +114,8 @@ async function _mountWidget(container) {
       try { return window.turnstile?.getResponse(existing) || '' } catch { return '' }
     }
   }
+  // Don't try to render into an invisible container — Turnstile bails silently.
+  await _waitForVisible(container)
   container.innerHTML = ''
   const widgetId = window.turnstile.render(container, {
     sitekey: cfg.turnstile_site_key,

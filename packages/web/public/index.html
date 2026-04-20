@@ -16,12 +16,220 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=25" />
+<link rel="stylesheet" href="/style.css?v=28" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
 
 <body>
+
+<!-- ═══════════════ LANDING VIEW (cold visitor) ═══════════════ -->
+<div id="landing-view" class="landing" hidden>
+  <header class="landing-nav">
+    <a class="landing-brand" href="#top">
+      <span class="landing-brand-mark">O</span>
+      <span class="landing-brand-text">OpenClaude</span>
+    </a>
+    <nav class="landing-nav-links">
+      <a href="#features">特性</a>
+      <a href="#models">模型</a>
+      <a href="#pricing">价格</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <div class="landing-nav-actions">
+      <button type="button" id="landing-theme-btn" class="landing-icon-btn" title="切换主题" aria-label="切换主题">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      </button>
+      <button type="button" id="landing-login-btn" class="btn btn-ghost landing-btn-sm">登录</button>
+      <button type="button" id="landing-register-btn" class="btn btn-primary landing-btn-sm">免费注册</button>
+    </div>
+  </header>
+
+  <section id="top" class="landing-hero">
+    <div class="landing-hero-inner">
+      <div class="landing-hero-eyebrow">
+        <span class="landing-dot"></span>
+        Powered by Claude Opus 4.7 &middot; Sonnet 4.6
+      </div>
+      <h1 class="landing-hero-title">
+        你的 AI 工作站<br/>
+        <span class="landing-hero-accent">一个账号,所有 Claude 能力</span>
+      </h1>
+      <p class="landing-hero-sub">
+        对话、Agent、媒体生成、浏览器自动化、定时任务、长期记忆 ——
+        把日常工作交给一个不会下班的助手。
+      </p>
+      <div class="landing-hero-ctas">
+        <button type="button" id="landing-hero-register-btn" class="btn btn-primary landing-btn-lg">
+          免费开始使用
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+        </button>
+        <button type="button" id="landing-hero-login-btn" class="btn btn-ghost landing-btn-lg">已有账号 → 登录</button>
+      </div>
+      <div class="landing-hero-meta">
+        <span>邮箱注册 · 无需信用卡</span>
+        <span class="landing-meta-sep">·</span>
+        <span>充值 ¥10 起</span>
+        <span class="landing-meta-sep">·</span>
+        <span>按 token 精确计费</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="features" class="landing-section">
+    <div class="landing-section-head">
+      <span class="landing-section-tag">为什么选 OpenClaude</span>
+      <h2 class="landing-section-title">一个工作台,把 AI 能力全部装进来</h2>
+    </div>
+    <div class="landing-feature-grid">
+      <div class="landing-card">
+        <div class="landing-card-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        </div>
+        <h3>对话 + 思考强度可调</h3>
+        <p>同时挂载 Opus 4.7 与 Sonnet 4.6,一键切换"编码模式 / 科研模式 / 普通对话",按需要让模型多想或快答。</p>
+      </div>
+      <div class="landing-card">
+        <div class="landing-card-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/></svg>
+        </div>
+        <h3>独立 Agent 工作空间</h3>
+        <p>每位用户一个隔离的 Docker 容器,长期记忆与技能持久落盘,跨会话延续。Agent 帮你写代码、跑命令、改文件。</p>
+      </div>
+      <div class="landing-card">
+        <div class="landing-card-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v12M9 9h4.5a2.5 2.5 0 0 1 0 5H9"/></svg>
+        </div>
+        <h3>按 token 计费,不订阅不浪费</h3>
+        <p>充值后按实际 input/output token 扣费,精确到 ¥0.01。账户余额随时可见,用多少花多少。</p>
+      </div>
+      <div class="landing-card">
+        <div class="landing-card-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l3 7h7l-5.5 4 2 7-6.5-4.5L5.5 20l2-7L2 9h7z"/></svg>
+        </div>
+        <h3>多模态生成内置</h3>
+        <p>文生图、文生视频、TTS 语音、图像理解 —— MiniMax 全套生成模型已接入,一句中文直接出片。</p>
+      </div>
+      <div class="landing-card">
+        <div class="landing-card-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </div>
+        <h3>浏览器自动化 + 定时任务</h3>
+        <p>Playwright 浏览器内嵌、cron 定时调度,让 Agent 自己上网填表、抓数据、按时跑流程。</p>
+      </div>
+      <div class="landing-card">
+        <div class="landing-card-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg>
+        </div>
+        <h3>长期记忆 + 技能自进化</h3>
+        <p>用户偏好、项目背景、操作习惯都能记下来。Agent 完成复杂任务后会主动沉淀可复用技能。</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="models" class="landing-section landing-section-alt">
+    <div class="landing-section-head">
+      <span class="landing-section-tag">模型矩阵</span>
+      <h2 class="landing-section-title">全系 Claude 模型,定价透明到 token</h2>
+      <p class="landing-section-sub">输入 / 输出 / 缓存读写 全部分项标价,1 积分 = ¥1。</p>
+    </div>
+    <div id="landing-models" class="landing-models">
+      <div class="landing-models-loading">加载中…</div>
+    </div>
+  </section>
+
+  <section id="pricing" class="landing-section">
+    <div class="landing-section-head">
+      <span class="landing-section-tag">充值方案</span>
+      <h2 class="landing-section-title">充得越多,送得越多</h2>
+      <p class="landing-section-sub">余额永不过期,可按 token 用于任意模型。</p>
+    </div>
+    <div id="landing-plans" class="landing-plans">
+      <div class="landing-models-loading">加载中…</div>
+    </div>
+    <div class="landing-pricing-foot">
+      <span>支持微信支付 · 充值即时到账</span>
+    </div>
+  </section>
+
+  <section class="landing-section landing-section-alt">
+    <div class="landing-section-head">
+      <span class="landing-section-tag">能力一览</span>
+      <h2 class="landing-section-title">不止聊天 —— 一个 Agent 能干的事</h2>
+    </div>
+    <div class="landing-capabilities">
+      <div class="landing-cap"><span class="landing-cap-emoji">🖼️</span><span>文生图 / 图像理解</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">🎬</span><span>文生视频 / 短片合成</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">🔊</span><span>TTS 语音 / 语音克隆</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">🌐</span><span>浏览器自动化</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">⏰</span><span>cron 定时调度</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">🧠</span><span>长期记忆系统</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">🛠️</span><span>技能自动沉淀</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">📨</span><span>子 Agent 协作</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">📎</span><span>文件上传 / 解析</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">📊</span><span>图表 / Mermaid 渲染</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">📝</span><span>Markdown / LaTeX</span></div>
+      <div class="landing-cap"><span class="landing-cap-emoji">📄</span><span>导出 docx / TeX</span></div>
+    </div>
+  </section>
+
+  <section id="faq" class="landing-section">
+    <div class="landing-section-head">
+      <span class="landing-section-tag">常见问题</span>
+      <h2 class="landing-section-title">还有什么想问的</h2>
+    </div>
+    <div class="landing-faq">
+      <details class="landing-faq-item">
+        <summary>OpenClaude 和官方 Claude.ai 有什么区别?</summary>
+        <p>OpenClaude 是构建在 Claude API 之上的 AI 工作站。除了对话能力之外,还提供独立 Agent 容器、长期记忆、媒体生成、浏览器自动化、定时任务等官方网页版没有的工程化能力,适合把 AI 真正用到日常工作流里。</p>
+      </details>
+      <details class="landing-faq-item">
+        <summary>计费方式是按月订阅还是按量?</summary>
+        <p>按量计费。充值后按实际 input / output token 扣账户余额,1 积分 = ¥1,精确到分。不用就不扣,余额永不过期。</p>
+      </details>
+      <details class="landing-faq-item">
+        <summary>Agent 模式跑在哪里?数据安全吗?</summary>
+        <p>每位用户一个独立的 Docker 容器,文件系统、记忆、技能完全隔离。容器之间互不可见。所有数据仅用于服务你本人的 AI 助理,不会用于训练或对外分享。</p>
+      </details>
+      <details class="landing-faq-item">
+        <summary>支持哪些支付方式?</summary>
+        <p>当前支持微信支付,通过虎皮椒聚合通道完成扫码支付。充值即时到账,可在账户中查看明细。</p>
+      </details>
+      <details class="landing-faq-item">
+        <summary>充错了 / 不想用了能退款吗?</summary>
+        <p>未消费的余额可以申请退回原支付渠道,扣除支付通道手续费后退款。已消费的 token 不可退。</p>
+      </details>
+      <details class="landing-faq-item">
+        <summary>有手机 / 移动端吗?</summary>
+        <p>Web 版完全响应式,在手机浏览器上即可使用全部功能,也可以"添加到主屏幕"作为 PWA 启动。</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="landing-cta-band">
+    <div class="landing-cta-inner">
+      <h2>准备好让 AI 替你干活了吗?</h2>
+      <p>邮箱注册即可开始,无需信用卡。第一次充值 ¥10 起。</p>
+      <button type="button" id="landing-foot-register-btn" class="btn btn-primary landing-btn-lg">立即开始 →</button>
+    </div>
+  </section>
+
+  <footer class="landing-footer">
+    <div class="landing-footer-inner">
+      <div class="landing-footer-brand">
+        <span class="landing-brand-mark">O</span>
+        <span>OpenClaude</span>
+      </div>
+      <div class="landing-footer-meta">
+        <span>© 2026 OpenClaude</span>
+        <span class="landing-meta-sep">·</span>
+        <a href="#faq">FAQ</a>
+        <span class="landing-meta-sep">·</span>
+        <a href="mailto:auth@claudeai.chat">联系我们</a>
+      </div>
+    </div>
+  </footer>
+</div>
 
 <!-- ═══════════════ LOGIN VIEW (multi-mode auth) ═══════════════ -->
 <div id="login-view" class="login-view" hidden>
@@ -815,6 +1023,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=26"></script>
+<script type="module" src="/modules/main.js?v=29"></script>
 </body>
 </html>

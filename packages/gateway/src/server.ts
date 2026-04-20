@@ -817,7 +817,21 @@ export class Gateway {
     res.setHeader('X-Content-Type-Options', 'nosniff')
     res.setHeader('X-Frame-Options', 'DENY')
     res.setHeader('Referrer-Policy', 'no-referrer')
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+    // Cloudflare Turnstile widget iframe (challenges.cloudflare.com) needs a
+    // handful of sensor/attestation features delegated to it; default deny
+    // policy makes the widget hang at "before-interactive" and never produce a
+    // token (silent failure — user sees blank widget area). See:
+    // https://developers.cloudflare.com/turnstile/troubleshooting/permissions-policy
+    res.setHeader('Permissions-Policy', [
+      'camera=()', 'microphone=()', 'geolocation=()',
+      'accelerometer=(self "https://challenges.cloudflare.com")',
+      'gyroscope=(self "https://challenges.cloudflare.com")',
+      'magnetometer=(self "https://challenges.cloudflare.com")',
+      'xr-spatial-tracking=(self "https://challenges.cloudflare.com")',
+      'attribution-reporting=(self "https://challenges.cloudflare.com")',
+      'private-state-token-issuance=(self "https://challenges.cloudflare.com")',
+      'private-state-token-redemption=(self "https://challenges.cloudflare.com")',
+    ].join(', '))
 
     // Instrument response — record metrics after response finishes
     res.on('finish', () => {
@@ -1453,6 +1467,11 @@ export class Gateway {
     // 静态 web UI (with in-memory cache)
     if (this.deps.webRoot) {
       const safePath = url.pathname === '/' ? '/index.html' : url.pathname
+      // sw.js must never be edge-cached: SW versioning depends on browser
+      // re-fetching the new file on every page load. CF defaults to a 4h TTL
+      // which strands users on stale SW for hours. (See feedback memory
+      // v3_static_cache_trap.md.)
+      const cacheHeader = safePath === '/sw.js' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
       const filePath = resolve(this.deps.webRoot, `.${safePath}`)
       if (filePath.startsWith(resolve(this.deps.webRoot))) {
         const cached = this._staticFileCache.get(filePath)
@@ -1462,7 +1481,7 @@ export class Gateway {
             res.end()
             return
           }
-          res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': 'public, max-age=3600' })
+          res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': cacheHeader })
           res.end(cached.content)
           return
         }
@@ -1482,7 +1501,7 @@ export class Gateway {
               res.end()
               return
             }
-            res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': 'public, max-age=3600' })
+            res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': cacheHeader })
             res.end(content)
             return
           }
