@@ -2577,7 +2577,18 @@ export class Gateway {
       try { ws.close(1001, 'shutting down') } catch {}
       return
     }
-    if (!this.checkHttpAuth(req)) {
+    // v3 commercial 容器内信任 docker bridge gateway IP 直连。commercial 侧 userChatBridge
+    // 经 docker bridge 网络转发的 ws → /ws 不带 bearer(容器随机生成的 accessToken supervisor
+    // 没回传)。仅当容器 entrypoint.sh 显式注入 OPENCLAUDE_TRUST_BRIDGE_IP=172.30.0.1 时生效;
+    // 个人版 / 任何未配置该 env 的场景下 process.env.OPENCLAUDE_TRUST_BRIDGE_IP 为空,
+    // 旁路恒为 false,checkHttpAuth 行为完全不变。
+    const remoteIp = req.socket.remoteAddress || ''
+    const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
+    const isFromBridge = !!TRUST_BRIDGE_IP && (
+      remoteIp === TRUST_BRIDGE_IP ||
+      remoteIp === `::ffff:${TRUST_BRIDGE_IP}`
+    )
+    if (!isFromBridge && !this.checkHttpAuth(req)) {
       ws.close(1008, 'unauthorized')
       return
     }
