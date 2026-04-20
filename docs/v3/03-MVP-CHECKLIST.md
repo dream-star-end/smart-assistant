@@ -50,7 +50,7 @@
 | **3B** | 镜像 build 脚本(本地 build,docker save/load,无私有 registry) | 3A | ✅ | 6223b50 |
 | **3C** | supervisor.provisionContainer:`--ip` 强制分配 IP + 注入 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN=oc-v3.<cid>.<secret>` + `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` + `CLAUDE_CONFIG_DIR=/run/oc/claude-config` + `--cap-drop=NET_RAW --cap-drop=NET_ADMIN`,落 `agent_containers.bound_ip` + `secret_hash`。**MVP 全部容器走 mode='ephemeral'** | 2C, 3A | ✅ | a34cce2 |
 | **3D** | userChatBridge 接入 supervisor.ensureRunning(单 host 单进程,**不需要 ACK 屏障**) | 2E, 3C, 3E | ✅ | ee3df4f |
-| **3E** | 容器 `/healthz` + WS upgrade probe + 启动 readiness 等待(supervisor poll 直至就绪或超时) | 3A | ✅ | (本次提交) |
+| **3E** | 容器 `/healthz` + WS upgrade probe + 启动 readiness 等待(supervisor poll 直至就绪或超时) | 3A | ✅ | b402ef0 |
 | **3F** | tickIdleSweep(idle 30min stop+remove,**单轨只回收 ephemeral,删 mode 字段**) | 3C, 3E | ⏳ | — |
 | **3H** | gateway 启动时 reconcile + 每 1h 跑 orphan 清理:比对 docker `ps -a` 与 `agent_containers` 表,孤儿容器 stop+rm,数据库孤儿标 vanished | 3F | ⏳ | — |
 | **3I** | `MAX_RUNNING_CONTAINERS=N`(默认 50)硬限 + 启动时 `docker pull` 预热 | 3F | ⏳ | — |
