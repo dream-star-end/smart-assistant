@@ -287,22 +287,47 @@ function openAdjustCreditsModal(userId) {
   })
 }
 
-// ─── Tab: Accounts(read-only,4J 加 CRUD)──────────────────────────
+// ─── Tab: Accounts(CRUD)───────────────────────────────────────────
+//
+// 4J 实装:状态过滤 + 新建/编辑/删除。
+// 后端字段: label / plan(pro|max|team) / status(active|cooldown|disabled|banned)
+// / oauth_token / oauth_refresh_token / oauth_expires_at / egress_proxy
+// (后端会 mask egress_proxy 里的密码,前端表单输入新值才会写库)
+
+const ACCOUNT_PLANS = ['pro', 'max', 'team']
+const ACCOUNT_STATUSES = ['active', 'cooldown', 'disabled', 'banned']
 
 async function renderAccountsTab() {
-  const data = await apiGet('/api/admin/accounts?limit=200')
+  const filterStatus = sessionStorage.getItem('admin_acc_status') || ''
+  const sp = new URLSearchParams({ limit: '200' })
+  if (filterStatus) sp.set('status', filterStatus)
+  const data = await apiGet(`/api/admin/accounts?${sp.toString()}`)
   const rows = data?.rows ?? []
   view().innerHTML = `
     <div class="panel">
-      <h2>账号池 <small>共 ${rows.length} 条 · 完整 CRUD 在 4J 实装</small></h2>
+      <h2>账号池 <small>共 ${rows.length} 条</small></h2>
+      <div class="toolbar">
+        <label>状态:
+          <select id="acc-status">
+            <option value="">全部</option>
+            ${ACCOUNT_STATUSES.map((s) =>
+              `<option value="${s}" ${s === filterStatus ? 'selected' : ''}>${s}</option>`,
+            ).join('')}
+          </select>
+        </label>
+        <button class="btn" id="acc-refresh">刷新</button>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="acc-new">+ 新建账号</button>
+      </div>
       ${rows.length === 0
-        ? '<div class="empty">账号池为空</div>'
+        ? '<div class="empty">无匹配账号</div>'
         : `
         <table class="data">
           <thead>
             <tr><th>id</th><th>label</th><th>plan</th><th>状态</th>
                 <th>health</th><th>quota</th><th>egress</th>
-                <th>oauth_exp</th><th>last_used</th></tr>
+                <th>oauth_exp</th><th>last_used</th>
+                <th class="actions">操作</th></tr>
           </thead>
           <tbody>
             ${rows.map((a) => `
@@ -313,14 +338,174 @@ async function renderAccountsTab() {
                 <td>${statusBadge(a.status)}</td>
                 <td class="num">${a.health_score ?? '—'}</td>
                 <td class="num">${a.quota_remaining ?? '—'}</td>
-                <td class="mono">${escapeHtml(a.egress_proxy || '—')}</td>
+                <td class="mono" title="${escapeHtml(a.egress_proxy || '')}">${escapeHtml(a.egress_proxy || '—')}</td>
                 <td class="mono">${fmtDate(a.oauth_expires_at)}</td>
                 <td class="mono">${fmtDate(a.last_used_at)}</td>
+                <td class="actions">
+                  <button data-act="edit-acc" data-id="${escapeHtml(a.id)}">编辑</button>
+                  <button data-act="del-acc" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}">删除</button>
+                </td>
               </tr>`).join('')}
           </tbody>
         </table>`}
     </div>
   `
+  $('acc-status').addEventListener('change', (e) => {
+    sessionStorage.setItem('admin_acc_status', e.target.value)
+    applyHash()
+  })
+  $('acc-refresh').addEventListener('click', applyHash)
+  $('acc-new').addEventListener('click', openCreateAccountModal)
+  for (const b of view().querySelectorAll('button[data-act="edit-acc"]')) {
+    b.addEventListener('click', () => openEditAccountModal(b.dataset.id))
+  }
+  for (const b of view().querySelectorAll('button[data-act="del-acc"]')) {
+    b.addEventListener('click', () => deleteAccount(b.dataset.id, b.dataset.label))
+  }
+}
+
+function _accountFormFields(prefill) {
+  // prefill = null → 新建;否则 = 现有 account 对象。
+  // oauth_token 在 PATCH 模式下必须用户主动输入才发送(避免误覆盖)。
+  const isCreate = !prefill
+  const a = prefill || {}
+  return `
+    <div class="form-row">
+      <label>label(账号标签,必填)</label>
+      <input type="text" id="acc-label" maxlength="120" value="${escapeHtml(a.label || '')}" />
+    </div>
+    <div class="form-row">
+      <label>plan</label>
+      <select id="acc-plan">
+        ${ACCOUNT_PLANS.map((p) => `<option value="${p}" ${p === (a.plan || 'pro') ? 'selected' : ''}>${p}</option>`).join('')}
+      </select>
+    </div>
+    ${isCreate ? '' : `
+    <div class="form-row">
+      <label>status</label>
+      <select id="acc-status-edit">
+        ${ACCOUNT_STATUSES.map((s) => `<option value="${s}" ${s === a.status ? 'selected' : ''}>${s}</option>`).join('')}
+      </select>
+    </div>`}
+    <div class="form-row">
+      <label>oauth_token ${isCreate ? '(必填)' : '(留空则不修改)'}</label>
+      <textarea id="acc-token" placeholder="${isCreate ? '粘贴 OAuth access token' : '不动 → 留空'}"></textarea>
+    </div>
+    <div class="form-row">
+      <label>oauth_refresh_token ${isCreate ? '(可选)' : '(留空则不修改;输入 NULL 清空)'}</label>
+      <input type="text" id="acc-refresh" placeholder="可选" />
+    </div>
+    <div class="form-row">
+      <label>oauth_expires_at ${isCreate ? '(可选 ISO 时间)' : '(留空不动;输入 NULL 清空)'}</label>
+      <input type="text" id="acc-expires" placeholder="如 2026-12-31T00:00:00Z 或 NULL"
+             value="${escapeHtml(a.oauth_expires_at || '')}" />
+    </div>
+    <div class="form-row">
+      <label>egress_proxy ${isCreate ? '(可选 http(s)://[user:pass@]host:port)' : '(留空不动;输入 NULL 清空;输入新 URL 覆盖)'}</label>
+      <input type="text" id="acc-egress" placeholder="可选;留空走本机"
+             value="${isCreate ? '' : ''}" />
+      ${!isCreate && a.has_egress_proxy ? `<small style="color:var(--muted)">当前(已 mask): ${escapeHtml(a.egress_proxy || '')}</small>` : ''}
+    </div>
+  `
+}
+
+// 把 form 字段读成 PATCH/CREATE body。空 string 在 PATCH 模式下表示 "不动",
+// 字符串 "NULL"(大小写不敏感)表示显式置空。
+function _readAccountForm(isCreate) {
+  const label = $('acc-label').value.trim()
+  const plan = $('acc-plan').value
+  const tokenRaw = $('acc-token').value.trim()
+  const refreshRaw = $('acc-refresh').value.trim()
+  const expiresRaw = $('acc-expires').value.trim()
+  const egressRaw = $('acc-egress').value.trim()
+  const isNull = (v) => v.toUpperCase() === 'NULL'
+
+  if (!label) throw new Error('label 必填')
+  const body = { label, plan }
+
+  if (isCreate) {
+    if (!tokenRaw) throw new Error('oauth_token 必填')
+    body.oauth_token = tokenRaw
+    if (refreshRaw) body.oauth_refresh_token = isNull(refreshRaw) ? null : refreshRaw
+    if (expiresRaw) body.oauth_expires_at = isNull(expiresRaw) ? null : expiresRaw
+    if (egressRaw) body.egress_proxy = isNull(egressRaw) ? null : egressRaw
+  } else {
+    body.status = $('acc-status-edit').value
+    if (tokenRaw) body.oauth_token = tokenRaw
+    if (refreshRaw) body.oauth_refresh_token = isNull(refreshRaw) ? null : refreshRaw
+    if (expiresRaw) body.oauth_expires_at = isNull(expiresRaw) ? null : expiresRaw
+    if (egressRaw) body.egress_proxy = isNull(egressRaw) ? null : egressRaw
+  }
+  return body
+}
+
+function openCreateAccountModal() {
+  openModal(`
+    <h3>新建账号</h3>
+    ${_accountFormFields(null)}
+    <div class="form-actions">
+      <button id="acc-cancel">取消</button>
+      <button class="btn-primary" id="acc-ok">创建</button>
+    </div>
+  `)
+  $('acc-cancel').addEventListener('click', closeModal)
+  $('acc-ok').addEventListener('click', async () => {
+    let body
+    try { body = _readAccountForm(true) }
+    catch (e) { toast(e.message, 'danger'); return }
+    try {
+      const r = await apiJson('POST', '/api/admin/accounts', body)
+      toast(`已创建账号 ${r?.account?.id || ''}`)
+      closeModal()
+      applyHash()
+    } catch (e) {
+      toast(`创建失败: ${e.message}`, 'danger')
+    }
+  })
+}
+
+async function openEditAccountModal(id) {
+  let account
+  try {
+    const r = await apiGet(`/api/admin/accounts/${encodeURIComponent(id)}`)
+    account = r?.account
+    if (!account) throw new Error('未找到账号')
+  } catch (e) {
+    toast(`读取失败: ${e.message}`, 'danger'); return
+  }
+  openModal(`
+    <h3>编辑账号 #${escapeHtml(account.id)}</h3>
+    ${_accountFormFields(account)}
+    <div class="form-actions">
+      <button id="acc-cancel">取消</button>
+      <button class="btn-primary" id="acc-ok">保存</button>
+    </div>
+  `)
+  $('acc-cancel').addEventListener('click', closeModal)
+  $('acc-ok').addEventListener('click', async () => {
+    let body
+    try { body = _readAccountForm(false) }
+    catch (e) { toast(e.message, 'danger'); return }
+    try {
+      await apiJson('PATCH', `/api/admin/accounts/${encodeURIComponent(account.id)}`, body)
+      toast(`#${account.id} 已保存`)
+      closeModal()
+      applyHash()
+    } catch (e) {
+      toast(`保存失败: ${e.message}`, 'danger')
+    }
+  })
+}
+
+async function deleteAccount(id, label) {
+  if (!confirm(`确认删除账号 #${id} (${label})?\n此操作不可恢复;若有运行中容器仍在用此账号会失败。`)) return
+  try {
+    await apiJson('DELETE', `/api/admin/accounts/${encodeURIComponent(id)}`)
+    toast(`#${id} 已删除`)
+    applyHash()
+  } catch (e) {
+    toast(`删除失败: ${e.message}`, 'danger')
+  }
 }
 
 // ─── Tab: Containers ───────────────────────────────────────────────
