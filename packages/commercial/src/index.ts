@@ -585,6 +585,20 @@ export type {
   FinalizeContext,
   FinalizeOutcome,
 } from "./http/anthropicProxy.js";
+// V3 Phase 2 Task 2E: 用户 WS ↔ 容器 WS 桥接
+export {
+  createUserChatBridge,
+  ContainerUnreadyError,
+  CLOSE_BRIDGE,
+  BRIDGE_WS_PATH,
+} from "./ws/userChatBridge.js";
+export type {
+  UserChatBridgeDeps,
+  UserChatBridgeHandler,
+  ResolveContainerEndpoint,
+  BridgeMetricSink,
+  BridgeCloseCause,
+} from "./ws/userChatBridge.js";
 // T-53: Agent 订阅 + 生命周期
 export {
   openAgentSubscription,
