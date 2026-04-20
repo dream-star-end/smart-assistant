@@ -344,6 +344,7 @@ describe("V3 2H — RegisterCommercialResult 形状 = CommercialHook 形状", ()
       handleWsUpgrade: () => false,
       shutdown: async () => { /* */ },
       internalProxyAddress: { host: "h", port: 1 },
+      jwtSecret: new Uint8Array(32),
     };
     assert.equal(typeof stub.handle, "function");
     assert.equal(typeof stub.handleWsUpgrade, "function");

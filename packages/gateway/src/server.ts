@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
 import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
@@ -59,6 +59,12 @@ export interface CommercialHook {
   handleWsUpgrade: (req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => boolean
   shutdown: () => Promise<void>
   internalProxyAddress?: { host: string; port: number }
+  /**
+   * 商业化模块的 JWT HMAC 密钥(HS256)。注入后,gateway 的 personal-version 路由
+   * 会同时尝试用这个 secret 验证 access token,使商业化用户也能命中
+   * /api/agents、/api/sessions/* 等 personal-version 端点。
+   */
+  jwtSecret?: Uint8Array
 }
 
 export interface GatewayDeps {
@@ -1572,6 +1578,11 @@ export class Gateway {
     // Try JWT first (multi-user mode)
     const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
     if (jwt) return true
+    // V3 commercial: accept JWTs signed by commercial module's jwtSecret too,
+    // otherwise paths that fall through to gateway (e.g. /api/agents,
+    // /api/sessions/*, /api/changelog) would 401 right after a successful
+    // commercial login and trigger a token-expired redirect storm.
+    if (this.verifyCommercialJwt(t) !== null) return true
     // Fall back to legacy single token
     return checkToken(t, this.deps.config.gateway.accessToken)
   }
@@ -1580,7 +1591,45 @@ export class Gateway {
   private getUserId(req: IncomingMessage): string {
     const t = this.extractToken(req)
     const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
-    return jwt?.userId ?? 'default'
+    if (jwt?.userId) return jwt.userId
+    // Commercial JWT: prefix sub (BIGINT user_id as string) so it cannot
+    // collide with personal-version userIds (which are arbitrary usernames).
+    // Used as partition key for SQLite client_sessions etc.
+    const cm = this.verifyCommercialJwt(t)
+    if (cm) return `c:${cm.sub}`
+    return 'default'
+  }
+
+  /**
+   * Verify an HS256 JWT signed by the commercial module's jwtSecret.
+   * Synchronous (uses node:crypto) so we don't have to make checkHttpAuth /
+   * getUserId async — those are called from many spots in this file and
+   * propagating async would balloon the diff.
+   *
+   * Accepts payload shape: { sub: string, role: 'user'|'admin', iat, exp, jti }.
+   * Returns null on any verification failure (bad alg, bad sig, expired,
+   * malformed payload, or commercial module not loaded).
+   */
+  private verifyCommercialJwt(token: string): { sub: string; role: 'user' | 'admin'; exp: number } | null {
+    if (!token || !this.deps.commercial?.jwtSecret) return null
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const [headerB64, payloadB64, sigB64] = parts
+    let header: any
+    try { header = JSON.parse(Buffer.from(headerB64, 'base64url').toString()) } catch { return null }
+    if (header?.alg !== 'HS256') return null
+    let actualSig: Buffer
+    try { actualSig = Buffer.from(sigB64, 'base64url') } catch { return null }
+    const expectedSig = createHmac('sha256', this.deps.commercial.jwtSecret).update(`${headerB64}.${payloadB64}`).digest()
+    if (expectedSig.length !== actualSig.length) return null
+    if (!timingSafeEqual(expectedSig, actualSig)) return null
+    let payload: any
+    try { payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString()) } catch { return null }
+    const now = Math.floor(Date.now() / 1000)
+    if (typeof payload?.exp !== 'number' || payload.exp <= now) return null
+    if (typeof payload?.sub !== 'string' || payload.sub.length === 0) return null
+    if (payload.role !== 'user' && payload.role !== 'admin') return null
+    return { sub: payload.sub, role: payload.role, exp: payload.exp }
   }
 
   /** Get userId stashed on a WS at handshake time. Falls back to 'default' if
@@ -1656,6 +1705,17 @@ export class Gateway {
       res.setHeader(
         'Set-Cookie',
         `oc_session=${t}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=${Gateway.JWT_TTL_SECONDS}`,
+      )
+      return true
+    }
+    // V3 commercial JWT — same Max-Age clamping logic as personal-version JWT.
+    const cm = this.verifyCommercialJwt(t)
+    if (cm) {
+      const remaining = cm.exp - Math.floor(Date.now() / 1000)
+      const maxAge = Math.max(60, Math.min(remaining, Gateway.JWT_TTL_SECONDS))
+      res.setHeader(
+        'Set-Cookie',
+        `oc_session=${t}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=${maxAge}`,
       )
       return true
     }

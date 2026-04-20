@@ -24,6 +24,7 @@ import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
+import { secretToKey } from "./auth/jwt.js";
 import { PricingCache } from "./billing/pricing.js";
 import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
@@ -117,6 +118,19 @@ export interface RegisterCommercialResult {
    * 未启用(env 缺失 / skipInternalProxy / 监听失败)时为 undefined。
    */
   internalProxyAddress?: { host: string; port: number };
+  /**
+   * Commercial access JWT 的 HMAC 密钥(已规范化为 ≥32 byte Uint8Array)。
+   *
+   * 暴露给 gateway,使其在 checkHttpAuth / getUserId 时能识别 commercial
+   * 模块签发的 JWT —— 否则商用版用户登录后调 personal-version 沿用的
+   * `/api/agents` `/api/sessions/*` 等路由会一律 401(因为 personal 版
+   * checkHttpAuth 用 `gateway.accessToken` 当 HMAC,而 commercial JWT
+   * 用 JWT_SECRET,两个 secret 完全不同)。
+   *
+   * gateway 用同步 HS256 验签(node:crypto.createHmac),不引入 jose 依赖,
+   * 也不需要把 checkHttpAuth 链路改 async(改动面太大)。
+   */
+  jwtSecret: Uint8Array;
 }
 
 /**
@@ -614,6 +628,8 @@ export async function registerCommercial(
     },
     /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */
     internalProxyAddress,
+    // 已规范化为 ≥32 byte Uint8Array,gateway 可直接喂 createHmac
+    jwtSecret: secretToKey(jwtSecret),
   };
 }
 

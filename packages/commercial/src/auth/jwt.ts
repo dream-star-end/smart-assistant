@@ -60,7 +60,7 @@ export class JwtError extends Error {
   }
 }
 
-function secretToKey(secret: string | Uint8Array): Uint8Array {
+export function secretToKey(secret: string | Uint8Array): Uint8Array {
   if (secret instanceof Uint8Array) {
     if (secret.length < 32) {
       throw new JwtError("JWT secret must be at least 32 bytes for HS256");
