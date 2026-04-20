@@ -13,9 +13,12 @@
 
 import { createHash, randomBytes } from "node:crypto";
 
+// authUrl 用最终域 claude.ai(claude.com 是 307 跳板;部分梯子 only-claude.ai
+// 的策略下,跳板域被掐 → ERR_CONNECTION_CLOSED)。
+// tokenUrl 由后端调用,走服务器出网,域名维持 platform.claude.com 即可。
 const CLAUDE_OAUTH = {
   clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-  authUrl: "https://claude.com/cai/oauth/authorize",
+  authUrl: "https://claude.ai/oauth/authorize",
   tokenUrl: "https://platform.claude.com/v1/oauth/token",
   redirect: "https://platform.claude.com/oauth/code/callback",
   scopes: "user:profile user:inference user:sessions:claude_code user:mcp_servers",
