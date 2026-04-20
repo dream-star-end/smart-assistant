@@ -89,3 +89,17 @@ export {
   type StartVolumeGcSchedulerOptions,
   type VolumeGcScheduler,
 } from "./v3volumeGc.js";
+
+// V3 Phase 3H — orphan reconcile(gateway 启动 + 1h tick,docker↔DB 双向)
+export {
+  startOrphanReconcileScheduler,
+  runOrphanReconcileTick,
+  DEFAULT_ORPHAN_RECONCILE_INTERVAL_MS,
+  DEFAULT_RECONCILE_BATCH_LIMIT,
+  SAFETY_RACE_WINDOW_SEC,
+  type OrphanReconcileLogger,
+  type OrphanReconcileTickOptions,
+  type OrphanReconcileTickResult,
+  type StartOrphanReconcileSchedulerOptions,
+  type OrphanReconcileScheduler,
+} from "./v3orphanReconcile.js";

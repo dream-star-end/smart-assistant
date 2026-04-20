@@ -53,8 +53,10 @@ import {
 import {
   makeV3EnsureRunning,
   startIdleSweepScheduler,
+  startOrphanReconcileScheduler,
   startVolumeGcScheduler,
   type IdleSweepScheduler,
+  type OrphanReconcileScheduler,
   type V3SupervisorDeps,
   type VolumeGcScheduler,
 } from "./agent-sandbox/index.js";
@@ -504,6 +506,23 @@ export async function registerCommercial(
     console.log("[commercial] v3 volume gc scheduler started (1h tick, banned 7d / no-login 90d)");
   }
 
+  // V3 Phase 3H:orphan reconcile(gateway 启动立刻 + 1h tick)。docker↔DB 双向对账。
+  // cfg.OC_ORPHAN_RECONCILE_DISABLED=1 可关闭(运维灾备 / 数据冷恢复时用)。
+  let orphanReconcileScheduler: OrphanReconcileScheduler | undefined;
+  if (v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
+    orphanReconcileScheduler = startOrphanReconcileScheduler(v3Deps, {
+      logger: {
+        debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
+        info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
+        warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
+        error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
+      },
+      // 默认 runOnStart=true(§3H 明确"gateway 启动 reconcile")
+    });
+    // eslint-disable-next-line no-console
+    console.log("[commercial] v3 orphan reconcile scheduler started (1h tick, runs on start)");
+  }
+
   const resolveContainerEndpoint: ResolveContainerEndpoint =
     options.resolveContainerEndpoint
     ?? (v3Deps
@@ -556,6 +575,9 @@ export async function registerCommercial(
       }
       if (volumeGcScheduler) {
         try { await volumeGcScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (orphanReconcileScheduler) {
+        try { await orphanReconcileScheduler.stop(); } catch { /* ignore */ }
       }
       if (alertScheduler) {
         try { await alertScheduler.stop(); } catch { /* ignore */ }
