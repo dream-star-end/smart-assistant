@@ -17,7 +17,7 @@
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
 import { state } from './state.js'
-import { apiGet, apiJson, onAuthExpired } from './api.js'
+import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired } from './api.js'
 
 // ─── DOM helpers ────────────────────────────────────────────────────
 
@@ -937,17 +937,262 @@ async function renderAuditTab() {
   })
 }
 
-// ─── Tab: Health(占位 — 4L 实装)──────────────────────────────────
+// ─── Tab: Health(4L)──────────────────────────────────────────────
+//
+// 直接拉 /api/admin/metrics 的 Prometheus 文本(text/plain),前端解析成 series
+// → cards。不引 chart.js,卡片 + 表足够看趋势对比;后续要长时段图再接外部
+// Prometheus/Grafana。
+//
+// 说明: /api/admin/metrics 优先认 COMMERCIAL_METRICS_BEARER(scrape token),
+// 没设时回落到 admin JWT —— 我们登录态本身就带 admin token,所以直接 GET 即可。
+
+/**
+ * 解析一行 Prometheus exposition,如:
+ *   gateway_http_requests_total{route="/api/me",method="GET",status="200"} 42
+ *   anthropic_proxy_ttft_seconds_bucket{model="sonnet",le="0.5"} 12
+ * 返回 {name, labels, value} 或 null(注释/空行/HELP/TYPE)。
+ */
+function _parsePromLine(line) {
+  if (!line || line.startsWith('#')) return null
+  const m = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{([^}]*)\})?\s+(.+?)$/)
+  if (!m) return null
+  const name = m[1]
+  const labelStr = m[3] || ''
+  const valStr = m[4].trim().split(/\s+/)[0] // 末尾可能跟 timestamp,只取数字
+  const value = Number(valStr)
+  if (!Number.isFinite(value)) return null
+  const labels = {}
+  if (labelStr) {
+    // 支持转义 \" 但我们的 metrics 里 label 不会有 " — 用简单分割就够
+    const re = /([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"/g
+    let lm
+    while ((lm = re.exec(labelStr))) labels[lm[1]] = lm[2]
+  }
+  return { name, labels, value }
+}
+
+/** 解析整段 text,按 metric name 分桶。返回 Map<name, Array<{labels, value}>> */
+function _parsePromText(text) {
+  const out = new Map()
+  for (const line of text.split('\n')) {
+    const r = _parsePromLine(line)
+    if (!r) continue
+    if (!out.has(r.name)) out.set(r.name, [])
+    out.get(r.name).push({ labels: r.labels, value: r.value })
+  }
+  return out
+}
+
+function _sumSeries(samples) {
+  if (!samples) return 0
+  return samples.reduce((s, x) => s + x.value, 0)
+}
+
+/** 返回 {[label_value]: sum_value} 按指定 label 聚合。 */
+function _groupByLabel(samples, labelName) {
+  const out = {}
+  if (!samples) return out
+  for (const s of samples) {
+    const k = s.labels[labelName] ?? '?'
+    out[k] = (out[k] || 0) + s.value
+  }
+  return out
+}
+
+/**
+ * Histogram 平均(sum/count),用 _bucket/_sum/_count 三件套。
+ * model label 按 shortModel 已在 server 折叠过,前端不再聚合,直接返回每 model 的 (count, sum, avg)。
+ */
+function _histogramByLabel(metrics, baseName, labelName) {
+  const sumSamples = metrics.get(`${baseName}_sum`) || []
+  const countSamples = metrics.get(`${baseName}_count`) || []
+  const sums = {}
+  const counts = {}
+  for (const s of sumSamples) {
+    const k = s.labels[labelName] ?? '?'
+    sums[k] = (sums[k] || 0) + s.value
+  }
+  for (const s of countSamples) {
+    const k = s.labels[labelName] ?? '?'
+    counts[k] = (counts[k] || 0) + s.value
+  }
+  const out = []
+  for (const k of Object.keys(counts)) {
+    const c = counts[k]
+    const sum = sums[k] || 0
+    out.push({ key: k, count: c, sum, avg: c > 0 ? sum / c : 0 })
+  }
+  return out
+}
 
 async function renderHealthTab() {
+  view().innerHTML = `<div class="loading">正在抓取 /api/admin/metrics …</div>`
+  let text
+  try {
+    const res = await apiFetch('/api/admin/metrics', { headers: authHeaders() })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    text = await res.text()
+  } catch (e) {
+    showError(`拉取 metrics 失败: ${e.message}`)
+    return
+  }
+  const metrics = _parsePromText(text)
+
+  // 总览数字
+  const reqTotal = _sumSeries(metrics.get('gateway_http_requests_total'))
+  const reqByStatus = _groupByLabel(metrics.get('gateway_http_requests_total'), 'status')
+  const debitByResult = _groupByLabel(metrics.get('billing_debit_total'), 'result')
+  const claudeByStatus = _groupByLabel(metrics.get('claude_api_requests_total'), 'status')
+  const settleByKind = _groupByLabel(metrics.get('anthropic_proxy_settle_total'), 'kind')
+  const rejectByReason = _groupByLabel(metrics.get('anthropic_proxy_reject_total'), 'reason')
+  const auditFailByAction = _groupByLabel(metrics.get('admin_audit_write_failures_total'), 'action')
+  const containersRunning = _sumSeries(metrics.get('agent_containers_running'))
+
+  // 账号池健康(每条一行)
+  const acctSamples = metrics.get('account_pool_health') || []
+  const acctRows = acctSamples
+    .map((s) => ({
+      account_id: s.labels.account_id || '?',
+      status: s.labels.status || '?',
+      health: s.value,
+    }))
+    .sort((a, b) => a.health - b.health)
+
+  // 代理延迟(直方图 — 按 model 平均)
+  const ttftHist = _histogramByLabel(metrics, 'anthropic_proxy_ttft_seconds', 'model')
+  const streamHist = _histogramByLabel(metrics, 'anthropic_proxy_stream_duration_seconds', 'model')
+
+  // 桥指标
+  const bridgeBufferedHist = _histogramByLabel(metrics, 'ws_bridge_buffered_bytes', 'side')
+  const bridgeSessionHist = _histogramByLabel(metrics, 'ws_bridge_session_duration_seconds', 'cause')
+
+  const okStatusSum =
+    (reqByStatus['200'] || 0) + (reqByStatus['201'] || 0) + (reqByStatus['204'] || 0)
+  const errStatusSum = Object.entries(reqByStatus)
+    .filter(([k]) => /^5/.test(k))
+    .reduce((s, [, v]) => s + v, 0)
+
+  const fmtN = (n) => Number(n).toLocaleString('en-US', { maximumFractionDigits: 0 })
+  const fmtMs = (sec) => sec > 0 ? `${(sec * 1000).toFixed(0)} ms` : '—'
+  const fmtKB = (bytes) => bytes > 0 ? `${(bytes / 1024).toFixed(1)} KB` : '—'
+
   view().innerHTML = `
     <div class="panel">
-      <h2>健康面板 <small>Phase 4L 实装</small></h2>
-      <div class="placeholder">
-        将聚合 /api/admin/metrics(Prometheus 文本)成图表卡片:<br/>
-        gateway 请求 / 账号池健康 / 容器状态 / Anthropic 代理延迟 等
+      <h2>健康面板 <small>聚合自 /api/admin/metrics · 实时快照,刷新看变化</small></h2>
+      <div class="toolbar">
+        <button class="btn" id="h-refresh">刷新</button>
+        <span class="spacer"></span>
+        <a href="/api/admin/metrics" target="_blank" rel="noopener">查看原始 metrics →</a>
+      </div>
+
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin-bottom:16px;">
+        ${_kpiCard('总请求', fmtN(reqTotal), `OK ${fmtN(okStatusSum)} · 5xx ${fmtN(errStatusSum)}`)}
+        ${_kpiCard('运行中容器', fmtN(containersRunning), `agent_containers_running`)}
+        ${_kpiCard('计费 success', fmtN(debitByResult.success || 0),
+            `insufficient ${fmtN(debitByResult.insufficient || 0)} · error ${fmtN(debitByResult.error || 0)}`)}
+        ${_kpiCard('Claude 调用 success', fmtN(claudeByStatus.success || 0),
+            `error ${fmtN(claudeByStatus.error || 0)}`)}
       </div>
     </div>
+
+    <div class="panel">
+      <h2>HTTP 请求按状态码</h2>
+      ${_renderKvTable(reqByStatus, ['status', 'count'])}
+    </div>
+
+    <div class="panel">
+      <h2>Anthropic 代理 settle / reject</h2>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+        <div><h3 style="font-size:13px; color:var(--muted);">settle (成功收尾种类)</h3>
+          ${_renderKvTable(settleByKind, ['kind', 'count'])}</div>
+        <div><h3 style="font-size:13px; color:var(--muted);">reject (拒绝原因)</h3>
+          ${_renderKvTable(rejectByReason, ['reason', 'count'])}</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>账号池健康 <small>共 ${acctRows.length} 个账号</small></h2>
+      ${acctRows.length === 0 ? '<div class="empty">无数据</div>' : `
+      <table class="data">
+        <thead><tr><th>account_id</th><th>status</th><th class="num">health_score</th></tr></thead>
+        <tbody>
+          ${acctRows.map((r) => `
+            <tr>
+              <td class="mono">${escapeHtml(r.account_id)}</td>
+              <td>${statusBadge(r.status)}</td>
+              <td class="num">${r.health.toFixed(0)}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`}
+    </div>
+
+    <div class="panel">
+      <h2>代理延迟(按模型 / 平均)</h2>
+      ${_renderHistTable(ttftHist, '模型', '请求数', 'TTFT 平均', (h) => fmtMs(h.avg))}
+      <h3 style="margin-top:12px; font-size:13px; color:var(--muted);">流式总时长</h3>
+      ${_renderHistTable(streamHist, '模型', '请求数', '总时长平均', (h) => fmtMs(h.avg))}
+    </div>
+
+    <div class="panel">
+      <h2>WS Bridge</h2>
+      <h3 style="font-size:13px; color:var(--muted);">缓冲字节(按方向)</h3>
+      ${_renderHistTable(bridgeBufferedHist, '方向', '采样数', '平均', (h) => fmtKB(h.avg))}
+      <h3 style="margin-top:12px; font-size:13px; color:var(--muted);">会话时长(按结束原因)</h3>
+      ${_renderHistTable(bridgeSessionHist, '原因', '会话数', '平均时长', (h) => h.avg > 0 ? `${h.avg.toFixed(1)} s` : '—')}
+    </div>
+
+    ${Object.keys(auditFailByAction).length > 0 ? `
+    <div class="panel">
+      <h2 style="color:var(--warn);">⚠️ admin_audit 写失败</h2>
+      ${_renderKvTable(auditFailByAction, ['action', 'count'])}
+    </div>` : ''}
+  `
+  $('h-refresh').addEventListener('click', applyHash)
+}
+
+function _kpiCard(title, value, sub) {
+  return `
+    <div style="background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:12px;">
+      <div style="color:var(--muted); font-size:12px;">${escapeHtml(title)}</div>
+      <div style="font-size:24px; font-variant-numeric:tabular-nums; margin:4px 0;">${escapeHtml(value)}</div>
+      <div style="color:var(--muted); font-size:12px;">${escapeHtml(sub)}</div>
+    </div>
+  `
+}
+
+function _renderKvTable(obj, headers) {
+  const entries = Object.entries(obj).sort((a, b) => b[1] - a[1])
+  if (entries.length === 0) return '<div class="empty">无数据</div>'
+  return `
+    <table class="data">
+      <thead><tr><th>${escapeHtml(headers[0])}</th><th class="num">${escapeHtml(headers[1])}</th></tr></thead>
+      <tbody>
+        ${entries.map(([k, v]) => `
+          <tr>
+            <td class="mono">${escapeHtml(k)}</td>
+            <td class="num">${Number(v).toLocaleString()}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  `
+}
+
+function _renderHistTable(histRows, keyHdr, countHdr, avgHdr, avgFmt) {
+  if (!histRows || histRows.length === 0) return '<div class="empty">无数据</div>'
+  const sorted = [...histRows].sort((a, b) => b.count - a.count)
+  return `
+    <table class="data">
+      <thead><tr><th>${escapeHtml(keyHdr)}</th><th class="num">${escapeHtml(countHdr)}</th>
+        <th class="num">${escapeHtml(avgHdr)}</th></tr></thead>
+      <tbody>
+        ${sorted.map((h) => `
+          <tr>
+            <td class="mono">${escapeHtml(h.key)}</td>
+            <td class="num">${Number(h.count).toLocaleString()}</td>
+            <td class="num">${escapeHtml(avgFmt(h))}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
   `
 }
 
