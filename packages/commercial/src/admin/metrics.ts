@@ -1,22 +1,35 @@
 /**
- * T-62 — Prometheus 指标(最小实现)。
+ * T-62 / V3 2I-2 — Prometheus 指标(最小实现)。
  *
- * ### 范围(02-ARCH §7.2)
- *   - gateway_http_requests_total{route, status}   counter
- *   - billing_debit_total{result}                  counter  (success/insufficient/error)
- *   - claude_api_requests_total{account_id, status} counter (success/error)
- *   - account_pool_health{account_id}              gauge   (从 DB 抽)
- *   - agent_containers_running                     gauge   (从 DB 抽)
+ * ### 范围(02-ARCH §7.2 + V3 03-MVP-CHECKLIST 2I-2)
+ *
+ * v1(T-62 已上):
+ *   - gateway_http_requests_total{route, method, status}  counter
+ *   - billing_debit_total{result}                          counter  (success/insufficient/error)
+ *   - claude_api_requests_total{account_id, status}        counter (success/error)
+ *   - admin_audit_write_failures_total{action}             counter
+ *   - account_pool_health{account_id, status}              gauge   (从 DB 抽)
+ *   - agent_containers_running                             gauge   (从 DB 抽)
+ *
+ * v3 2I-2 新增(V3 anthropicProxy + userChatBridge):
+ *   - anthropic_proxy_ttft_seconds{model}                  histogram (response 起到第一字节)
+ *   - anthropic_proxy_stream_duration_seconds{model}       histogram (fetch 到 stream end)
+ *   - anthropic_proxy_settle_total{kind}                   counter (final/partial/aborted)
+ *   - anthropic_proxy_reject_total{reason}                 counter
+ *       (insufficient/rate_limited/concurrency/account_pool/unknown_model/bad_body/too_large/identity)
+ *   - ws_bridge_buffered_bytes{side}                       histogram
+ *   - ws_bridge_session_duration_seconds{cause}            histogram
  *
  * ### 设计取舍
- *   - 不引 `prom-client`:依赖小 + 我们只要 5 个系列,手搓 < 100 行可控
+ *   - 不引 `prom-client`:依赖小 + 我们只要十几个系列,手搓可控(2I-2 加 Histogram 类)
  *   - 计数器是进程级 module-level Map(单实例 gateway 进程内聚合,符合当前部署)
- *   - 2 个 gauge 在 scrape 时才查 DB —— 指标永远反映"当前真相",而不是上次 tick
+ *   - 2 个 DB gauge 在 scrape 时才查 DB —— 指标永远反映"当前真相",而不是上次 tick
  *   - route label 归一化:动态段(数字 id / model_id)折叠成 `:id` / `:slug`,
  *     否则 label 基数会爆(每个 user_id 一条 series)
  *
  * ### 使用
  *   - `metricsInc(counter, labels)` 在调用点++
+ *   - `observe*(seriesHelper, value)` 给 histogram 加观察样本
  *   - `renderPrometheus(deps)` 在 /api/admin/metrics 调用,返回 text/plain
  *   - `resetMetricsForTest()` 测试用,不对外 export 到 index.ts
  */
@@ -132,6 +145,89 @@ class GaugeStream {
   }
 }
 
+/**
+ * 简易 Prometheus histogram。固定 bucket 上界(升序),每次 observe 把样本累计到所有
+ * `<= upper` 的 bucket 里。`render` 输出 `_bucket{le="X"}` / `_sum` / `_count`,
+ * 兼容 prom client / Grafana 的 `histogram_quantile()`。
+ *
+ * 不实现 prom-client 的 exemplars / native histogram —— 我们只要 p50/p99 用。
+ */
+class Histogram {
+  readonly def: SeriesDef;
+  /** 升序 bucket 上界。`+Inf` 自动追加,无需外部传。 */
+  readonly buckets: readonly number[];
+  private readonly series = new Map<
+    string,
+    { labels: LabelValues; counts: number[]; sum: number; total: number }
+  >();
+
+  constructor(def: SeriesDef, buckets: readonly number[]) {
+    this.def = def;
+    // 防御:运维写错 bucket 次序会让 histogram_quantile 输出乱
+    for (let i = 1; i < buckets.length; i++) {
+      if (buckets[i]! <= buckets[i - 1]!) {
+        throw new Error(
+          `Histogram ${def.name} buckets must be strictly ascending (got ${buckets[i - 1]} >= ${buckets[i]})`,
+        );
+      }
+    }
+    this.buckets = buckets;
+  }
+
+  observe(labels: LabelValues, value: number): void {
+    if (!Number.isFinite(value) || value < 0) return; // 负数/NaN 静默丢
+    const key = serializeLabels(this.def.labelNames, labels);
+    let entry = this.series.get(key);
+    if (!entry) {
+      const norm: Record<string, string | number> = {};
+      for (const name of this.def.labelNames) norm[name] = labels[name] ?? "";
+      entry = {
+        labels: norm,
+        counts: new Array(this.buckets.length).fill(0),
+        sum: 0,
+        total: 0,
+      };
+      this.series.set(key, entry);
+    }
+    for (let i = 0; i < this.buckets.length; i++) {
+      if (value <= this.buckets[i]!) entry.counts[i]!++;
+    }
+    entry.sum += value;
+    entry.total++;
+  }
+
+  reset(): void {
+    this.series.clear();
+  }
+
+  render(out: string[]): void {
+    out.push(`# HELP ${this.def.name} ${this.def.help}`);
+    out.push(`# TYPE ${this.def.name} histogram`);
+    const keys = [...this.series.keys()].sort();
+    for (const k of keys) {
+      const e = this.series.get(k)!;
+      for (let i = 0; i < this.buckets.length; i++) {
+        const b = this.buckets[i]!;
+        const labelsWithLe: LabelValues = {
+          ...e.labels,
+          le: bucketLabel(b),
+        };
+        out.push(`${this.def.name}_bucket${renderLabels(labelsWithLe)} ${e.counts[i]}`);
+      }
+      const labelsInf: LabelValues = { ...e.labels, le: "+Inf" };
+      out.push(`${this.def.name}_bucket${renderLabels(labelsInf)} ${e.total}`);
+      out.push(`${this.def.name}_sum${renderLabels(e.labels)} ${e.sum}`);
+      out.push(`${this.def.name}_count${renderLabels(e.labels)} ${e.total}`);
+    }
+  }
+}
+
+function bucketLabel(v: number): string {
+  // Prometheus 习惯:整数 bucket 输出整数,小数 bucket 用通用格式。NaN 不会出现(构造期已禁)
+  if (Number.isInteger(v)) return v.toString();
+  return v.toString();
+}
+
 function serializeLabels(names: readonly string[], v: LabelValues): string {
   return names.map((n) => `${n}=${String(v[n] ?? "")}`).join("|");
 }
@@ -193,6 +289,140 @@ export function incrClaudeApi(accountId: bigint | number | string | null, status
 
 export function incrAdminAuditWriteFailure(action: string): void {
   adminAuditWriteFailures.inc({ action });
+}
+
+// ─── V3 2I-2:anthropicProxy + userChatBridge 系列 ────────────────────
+
+/**
+ * Bucket 设计原则:覆盖 99% 的预期分布,头尾留余地。
+ *   - TTFT:Anthropic 的 chat 通常 0.3-2s,流量大时偶尔 5-10s
+ *   - 总 stream 时长:几秒到几十秒;tool 用户极端可上 5min
+ *   - buffered bytes:1KB-4MB(maxBufferedBytes 默认 4MB)
+ *   - ws 会话时长:秒到 1h+
+ */
+const TTFT_BUCKETS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30] as const;
+const STREAM_DURATION_BUCKETS = [0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300] as const;
+const BUFFERED_BYTES_BUCKETS = [
+  1024, 4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024,
+] as const;
+const WS_SESSION_DURATION_BUCKETS = [1, 5, 30, 60, 300, 900, 1800, 3600, 7200] as const;
+
+export const anthropicProxyTtft = new Histogram(
+  {
+    name: "anthropic_proxy_ttft_seconds",
+    help: "Time-to-first-byte from upstream after fetch resolved (seconds), per model",
+    labelNames: ["model"],
+  },
+  TTFT_BUCKETS,
+);
+
+export const anthropicProxyStreamDuration = new Histogram(
+  {
+    name: "anthropic_proxy_stream_duration_seconds",
+    help: "Total upstream stream duration from fetch start to last byte (seconds), per model",
+    labelNames: ["model"],
+  },
+  STREAM_DURATION_BUCKETS,
+);
+
+/**
+ * settle 三态:final = stream 正常完成 + 提取到 usage;partial = 中断 + 部分 usage;
+ * aborted = finalize.fail 路径(无 usage 写入,不扣费)。运维盯 partial+aborted 占比。
+ */
+export const anthropicProxySettle = new Counter({
+  name: "anthropic_proxy_settle_total",
+  help: "Anthropic proxy stream settle outcome (final/partial/aborted)",
+  labelNames: ["kind"], // final | partial | aborted
+});
+
+/**
+ * 早期拒绝原因。reason 是闭集合(代码白名单),避免 cardinality 爆。
+ *   - insufficient    余额不足(preCheck)
+ *   - rate_limited    per-uid 滑窗
+ *   - concurrency     per-uid 并发上限
+ *   - account_pool    池空 / 全 down
+ *   - unknown_model   定价表缺
+ *   - bad_body        zod parse 失败
+ *   - too_large       413
+ *   - identity        容器双因子失败
+ *   - bad_path        非 POST /v1/messages
+ *   - bad_headers     header allowlist 失败
+ *   - upstream_auth   refresh token 失败
+ */
+export const anthropicProxyReject = new Counter({
+  name: "anthropic_proxy_reject_total",
+  help: "Anthropic proxy rejected requests, by reason",
+  labelNames: ["reason"],
+});
+
+export const wsBridgeBufferedBytes = new Histogram(
+  {
+    name: "ws_bridge_buffered_bytes",
+    help: "Per-side buffered bytes observed in user-chat-bridge",
+    labelNames: ["side"], // user_to_container | container_to_user
+  },
+  BUFFERED_BYTES_BUCKETS,
+);
+
+export const wsBridgeSessionDuration = new Histogram(
+  {
+    name: "ws_bridge_session_duration_seconds",
+    help: "user-chat-bridge session duration (seconds), labeled by close cause",
+    labelNames: ["cause"],
+  },
+  WS_SESSION_DURATION_BUCKETS,
+);
+
+// ─── 便捷 incr / observe helpers ────────────────────────────────────
+
+export function observeAnthropicProxyTtft(model: string, seconds: number): void {
+  anthropicProxyTtft.observe({ model: shortModel(model) }, seconds);
+}
+
+export function observeAnthropicProxyStreamDuration(model: string, seconds: number): void {
+  anthropicProxyStreamDuration.observe({ model: shortModel(model) }, seconds);
+}
+
+export type SettleKind = "final" | "partial" | "aborted";
+export function incrAnthropicProxySettle(kind: SettleKind): void {
+  anthropicProxySettle.inc({ kind });
+}
+
+export type ProxyRejectReason =
+  | "insufficient"
+  | "rate_limited"
+  | "concurrency"
+  | "account_pool"
+  | "unknown_model"
+  | "bad_body"
+  | "too_large"
+  | "identity"
+  | "bad_path"
+  | "bad_headers"
+  | "upstream_auth";
+export function incrAnthropicProxyReject(reason: ProxyRejectReason): void {
+  anthropicProxyReject.inc({ reason });
+}
+
+export type BridgeSide = "user_to_container" | "container_to_user";
+export function observeWsBridgeBuffered(side: BridgeSide, bytes: number): void {
+  wsBridgeBufferedBytes.observe({ side }, bytes);
+}
+
+export function observeWsBridgeSessionDuration(cause: string, seconds: number): void {
+  wsBridgeSessionDuration.observe({ cause }, seconds);
+}
+
+/**
+ * Model label 折叠:把 vendor + 主版本号留下,丢日期 / 后缀。
+ * 例:claude-sonnet-4-6-20250101 → claude-sonnet-4-6
+ *
+ * 这个函数对 cardinality 防爆很关键 —— 我们 model 名形如 claude-sonnet-4-6 已是稳定 ID,
+ * 但如果运维写错放进去 my-experimental-2026-01-23-v123 这种,会爆。strip 末尾 8 位日期。
+ */
+function shortModel(m: string): string {
+  // 8 位日期后缀(可带前导 -)→ 删掉
+  return m.replace(/-\d{8}$/, "").slice(0, 64);
 }
 
 // ─── gauges 由 scrape 时 collector 填 ─────────────────────────────────
@@ -282,6 +512,14 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   billingDebits.render(out);
   claudeApiRequests.render(out);
   adminAuditWriteFailures.render(out);
+  // V3 2I-2 新增系列
+  anthropicProxyTtft.render(out);
+  anthropicProxyStreamDuration.render(out);
+  anthropicProxySettle.render(out);
+  anthropicProxyReject.render(out);
+  wsBridgeBufferedBytes.render(out);
+  wsBridgeSessionDuration.render(out);
+  // gauges 走 collector
   accountPoolHealth.render(out);
   agentRunning.render(out);
   out.push(""); // 结尾必须带换行
@@ -295,6 +533,13 @@ export function resetMetricsForTest(): void {
   billingDebits.reset();
   claudeApiRequests.reset();
   adminAuditWriteFailures.reset();
+  // V3 2I-2
+  anthropicProxyTtft.reset();
+  anthropicProxyStreamDuration.reset();
+  anthropicProxySettle.reset();
+  anthropicProxyReject.reset();
+  wsBridgeBufferedBytes.reset();
+  wsBridgeSessionDuration.reset();
 }
 
 /** 给 alerts.ts 读取 account health / agent running 的 snapshot(避免双查)。 */

@@ -75,6 +75,14 @@ import {
   DEFAULT_REFRESH_SKEW_MS,
   type RefreshDeps,
 } from "../account-pool/refresh.js";
+import {
+  observeAnthropicProxyTtft,
+  observeAnthropicProxyStreamDuration,
+  incrAnthropicProxySettle,
+  incrAnthropicProxyReject,
+  incrBillingDebit,
+  type ProxyRejectReason,
+} from "../admin/metrics.js";
 
 // ─── 常量 ──────────────────────────────────────────────────────────────────
 
@@ -470,6 +478,8 @@ export interface PipeStreamResult {
   observation: UsageObservation;
   /** 写入下游字节数(只统计 res.write 成功的字节)。 */
   bytesOut: number;
+  /** 第一字节 ms(performance.now / Date.now 相对值);未收到任何 chunk → null。 */
+  firstByteAtMs: number | null;
 }
 
 /**
@@ -487,6 +497,7 @@ export async function pipeStreamWithUsageCapture(
   const decoder = new TextDecoder("utf-8");
   const observer = new UsageObserver();
   let bytesOut = 0;
+  let firstByteAtMs: number | null = null;
   try {
     while (true) {
       if (signal.aborted) {
@@ -495,6 +506,7 @@ export async function pipeStreamWithUsageCapture(
       const { value, done } = await reader.read();
       if (done) break;
       if (!value || value.length === 0) continue;
+      if (firstByteAtMs === null) firstByteAtMs = Date.now();
       // 1) 字节透传 — write 失败 → throw(下游已关连接)
       const wrote = res.write(value);
       bytesOut += value.length;
@@ -527,7 +539,7 @@ export async function pipeStreamWithUsageCapture(
     } catch {
       /* ignore */
     }
-    return { observation: observer.result(), bytesOut };
+    return { observation: observer.result(), bytesOut, firstByteAtMs };
   } finally {
     try {
       await reader.cancel();
@@ -668,12 +680,20 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
         kind: obs.kind,
         usage: usageToLog(usage),
       });
+      // 2I-2: billing_debit 三态。status='success' 时余额够;'billing_failed' = 余额被夹到 0(欠费,前端按 402 提示)
+      if (cost_credits > 0n) {
+        incrBillingDebit(status === "success" ? "success" : "insufficient");
+      } else {
+        // cost_credits === 0:不算 debit,不计数(observed.kind === 'none' 时已经走了 abort 路径,这里不会出现)
+      }
       return { finalCredits: cost_credits, state: "committed", requestId: ctx.requestId };
     } catch (err) {
       ctx.log.error("proxy_finalize_commit_db_failed", {
         err: errSummary(err),
         precheckCredits: ctx.precheckCredits.toString(),
       });
+      // settle 写库失败 = billing_debit_failures_total{result="error"}
+      incrBillingDebit("error");
       // 走 abort 路径,确保 journal/redis/scheduler 状态一致
       return runAbort(obs, err);
     }
@@ -887,6 +907,12 @@ function errMessageShort(err: unknown): string {
   return String(err).slice(0, 500);
 }
 
+/** 把 readBoundedJson / enforceFieldByteBudgets 抛的 HttpError 折射到 reject 标签。 */
+function httpErrToReject(err: HttpError): ProxyRejectReason {
+  if (err.status === 413) return "too_large";
+  return "bad_body";
+}
+
 // ─── handler 工厂 ─────────────────────────────────────────────────────────
 
 export interface AnthropicProxyDeps {
@@ -950,6 +976,7 @@ export function makeAnthropicProxyHandler(
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
     if (req.method !== "POST" || url.pathname !== "/v1/messages") {
       reqLog.warn("proxy_bad_path", { method: req.method, path: url.pathname });
+      incrAnthropicProxyReject("bad_path");
       sendJsonError(res, 404, "NOT_FOUND", "endpoint not found", requestId);
       return;
     }
@@ -966,6 +993,7 @@ export function makeAnthropicProxyHandler(
       if (err instanceof ContainerIdentityError) {
         // errcode 进 server log,不外泄
         reqLog.warn("proxy_identity_failed", { errcode: err.code });
+        incrAnthropicProxyReject("identity");
         sendJsonError(
           res,
           401,
@@ -990,6 +1018,7 @@ export function makeAnthropicProxyHandler(
       );
       if (!decision.allowed) {
         userLog.warn("proxy_rate_limited", { count: decision.count });
+        incrAnthropicProxyReject("rate_limited");
         sendJsonError(
           res,
           429,
@@ -1009,6 +1038,7 @@ export function makeAnthropicProxyHandler(
     const releaseSlot = concurrency.acquire(`uid:${uid.toString()}`);
     if (!releaseSlot) {
       userLog.warn("proxy_concurrency_full", { max: deps.maxConcurrentPerUid ?? DEFAULT_MAX_CONCURRENT_PER_UID });
+      incrAnthropicProxyReject("concurrency");
       sendJsonError(res, 429, "CONCURRENT_LIMIT", "too many concurrent requests", requestId);
       return;
     }
@@ -1021,6 +1051,7 @@ export function makeAnthropicProxyHandler(
         const parsed = proxyBodySchema.safeParse(raw);
         if (!parsed.success) {
           userLog.warn("proxy_body_schema_failed", { issues: parsed.error.issues });
+          incrAnthropicProxyReject("bad_body");
           sendJsonError(res, 400, "BAD_BODY", "invalid request body", requestId);
           return;
         }
@@ -1029,6 +1060,7 @@ export function makeAnthropicProxyHandler(
       } catch (err) {
         if (err instanceof HttpError) {
           userLog.warn("proxy_body_rejected", { status: err.status, code: err.code });
+          incrAnthropicProxyReject(httpErrToReject(err));
           sendJsonError(res, err.status, err.code, err.message, requestId);
           return;
         }
@@ -1039,6 +1071,7 @@ export function makeAnthropicProxyHandler(
       const pricing = deps.pricing.get(body.model);
       if (!pricing || !pricing.enabled) {
         userLog.warn("proxy_unknown_model", { model: body.model });
+        incrAnthropicProxyReject("unknown_model");
         sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${body.model}' not enabled`, requestId);
         return;
       }
@@ -1064,6 +1097,7 @@ export function makeAnthropicProxyHandler(
             balance: err.balance.toString(),
             required: err.required.toString(),
           });
+          incrAnthropicProxyReject("insufficient");
           sendJsonError(
             res,
             402,
@@ -1088,6 +1122,7 @@ export function makeAnthropicProxyHandler(
         await releasePreCheck(deps.preCheckRedis, pre.lockKey).catch(() => {});
         if (err instanceof AccountPoolUnavailableError) {
           userLog.warn("proxy_account_pool_unavailable", { msg: err.message });
+          incrAnthropicProxyReject("account_pool");
           sendJsonError(res, 503, "ACCOUNT_POOL_UNAVAILABLE", "account pool unavailable, try again", requestId);
           return;
         }
@@ -1137,6 +1172,7 @@ export function makeAnthropicProxyHandler(
               })
               .catch(() => {});
             await releasePreCheck(deps.preCheckRedis, pre.lockKey).catch(() => {});
+            incrAnthropicProxyReject("upstream_auth");
             sendJsonError(res, 502, "UPSTREAM_AUTH_REFRESH_FAILED", "failed to refresh upstream token", requestId);
             return;
           }
@@ -1220,6 +1256,7 @@ export function makeAnthropicProxyHandler(
           safeHeaders = buildSafeUpstreamHeaders(req.headers);
         } catch (err) {
           if (err instanceof HttpError) {
+            incrAnthropicProxyReject("bad_headers");
             await finalize.fail(observed, err);
             sendJsonError(res, err.status, err.code, err.message, requestId);
             return;
@@ -1241,6 +1278,7 @@ export function makeAnthropicProxyHandler(
         // MVP 单 host 不强制 — refreshDeps 给的 ProxyAgent 在 refresh 路径已用,
         // chat 这里走默认 dispatcher。Phase 3 supervisor 集成时再补。
 
+        const fetchStartMs = Date.now();
         const upstream = await fetchFn(endpoint, fetchInit);
         if (upstream.status < 200 || upstream.status >= 300) {
           // 上游 4xx/5xx — 读 body preview 写 log,直接转译成 502
@@ -1254,12 +1292,14 @@ export function makeAnthropicProxyHandler(
             `upstream returned ${upstream.status}: ${preview}`,
           );
           await finalize.fail(observed, err);
+          incrAnthropicProxySettle("aborted");
           sendJsonError(res, 502, "UPSTREAM_ERROR", `upstream returned ${upstream.status}`, requestId);
           return;
         }
         if (!upstream.body) {
           const err = new Error(`upstream ${upstream.status} but no body`);
           await finalize.fail(observed, err);
+          incrAnthropicProxySettle("aborted");
           sendJsonError(res, 502, "UPSTREAM_NO_BODY", "upstream returned no body", requestId);
           return;
         }
@@ -1276,14 +1316,29 @@ export function makeAnthropicProxyHandler(
           ac.signal,
         );
         observed = result.observation;
+        const streamEndMs = Date.now();
+        // 2I-2 metrics:TTFT 是 fetch 起到第一字节;stream duration 是 fetch 起到最后一字节。
+        // 任意一项 < 0 / NaN 由 metrics observe 自动丢弃,无需在这里防御。
+        if (result.firstByteAtMs !== null) {
+          observeAnthropicProxyTtft(body.model, (result.firstByteAtMs - fetchStartMs) / 1000);
+        }
+        observeAnthropicProxyStreamDuration(body.model, (streamEndMs - fetchStartMs) / 1000);
         try {
           res.end();
         } catch {
           /* ignore */
         }
         await finalize.commit(observed);
+        // settle 三态:
+        //   final  = stream 结束 + 拿到 message_stop usage(理想)
+        //   partial= stream 结束但只拿到 message_delta(stop_reason 缺,usage 不全)
+        //   aborted= 进 finalize.fail 路径(发上游 4xx/5xx / 上游 throw / 客户端中断)
+        if (observed.kind === "final") incrAnthropicProxySettle("final");
+        else if (observed.kind === "partial") incrAnthropicProxySettle("partial");
+        else incrAnthropicProxySettle("aborted");
       } catch (err) {
         await finalize.fail(observed, err);
+        incrAnthropicProxySettle("aborted");
         // 字节是否已 flush 决定怎么发错误
         if (!res.headersSent) {
           sendJsonError(res, 500, "INTERNAL", "internal error", requestId);

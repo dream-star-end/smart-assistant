@@ -48,7 +48,12 @@ import {
   ContainerUnreadyError,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
+  type BridgeMetricSink,
 } from "./ws/userChatBridge.js";
+import {
+  observeWsBridgeBuffered,
+  observeWsBridgeSessionDuration,
+} from "./admin/metrics.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -431,9 +436,16 @@ export async function registerCommercial(
     ?? (async (_uid: bigint): Promise<{ host: string; port: number }> => {
       throw new ContainerUnreadyError(5, "supervisor_not_wired");
     });
+  // V3 2I-2:把 buffered_bytes / session_duration 接到 prometheus histogram。
+  // 单帧 / per-uid 字节数不进 metrics —— 标签基数太大。
+  const bridgeMetrics: BridgeMetricSink = {
+    onBufferedBytes: (_uid, side, bytes) => observeWsBridgeBuffered(side, bytes),
+    onClose: (stats) => observeWsBridgeSessionDuration(stats.cause, stats.durationMs / 1000),
+  };
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     resolveContainerEndpoint,
+    metrics: bridgeMetrics,
   });
 
   // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
