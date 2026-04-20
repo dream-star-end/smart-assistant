@@ -1600,6 +1600,11 @@ async function init() {
     else if (action === 'claude-oauth') openOAuthModal()
     else if (action === 'wechat') openWechatModal()
     else if (action === 'prefs') openPrefsModal()
+    else if (action === 'admin') {
+      // V3 Phase 4E:打开超管控制台。新窗口避免覆盖正在进行的对话。
+      // 后端 /api/admin/* + 前端 admin.js 都会再校验一次 role,这里只是入口。
+      window.open('/admin.html', '_blank', 'noopener,noreferrer')
+    }
     else if (action === 'logout') $('logout-btn').click()
   })
   // Memory modal events

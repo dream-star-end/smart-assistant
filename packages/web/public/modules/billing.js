@@ -85,21 +85,37 @@ function _showPill(visible) {
  * 拉 /api/me,更新 balance pill。
  * 失败(包括 404 = 个人版未启用 commercial)→ 静默隐藏 pill。
  * 成功 → 缓存 _commercialMode=true,以后 click 才会打开模态。
+ *
+ * V3 Phase 4E:同一个 /api/me 响应里也带 role,顺手切换设置菜单里的
+ * "超管控制台" 入口可见性 —— role=admin 显示,其它一律隐藏。这样:
+ *   1) 不增加额外 round-trip;refreshBalance 是唯一的 /api/me 入口。
+ *   2) 用户不是 admin 时菜单不出现这一条,降低误点 + UI 噪声。
+ *   3) 失败路径(404 个人版 / 401 已退出)走 _hideAdminLink,保持菜单干净。
  */
 export async function refreshBalance() {
   try {
     const data = await apiGet('/api/me')
-    const credits = data?.user?.credits ?? '0'
+    const user = data?.user || {}
+    const credits = user.credits ?? '0'
     _setPillText(formatYuan(credits))
     _showPill(true)
     _commercialMode = true
-    return { shown: true, credits: String(credits) }
+    _setAdminLinkVisible(user.role === 'admin')
+    return { shown: true, credits: String(credits), role: user.role || null }
   } catch (err) {
     // 个人版无此接口;商用版 401 已被 api.js 处理,此处其它失败一律静默。
     _showPill(false)
+    _setAdminLinkVisible(false)
     if (_commercialMode === null) _commercialMode = false
-    return { shown: false, credits: null }
+    return { shown: false, credits: null, role: null }
   }
+}
+
+function _setAdminLinkVisible(visible) {
+  const el = $('admin-console-link')
+  if (!el) return
+  if (visible) el.removeAttribute('hidden')
+  else el.setAttribute('hidden', '')
 }
 
 // ── Stage 切换 ──────────────────────────────────────────────────────
