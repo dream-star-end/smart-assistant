@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1200" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>OpenClaude · 超管控制台</title>
+    <link rel="icon" href="/icon.svg" />
+    <style>
+      /* —— 极简超管控制台,与用户端 SPA 完全分离 —— */
+      :root {
+        --bg: #0f1115;
+        --panel: #161a22;
+        --panel-2: #1d2230;
+        --border: #2a3142;
+        --text: #e6e9ef;
+        --muted: #8b93a7;
+        --accent: #6ea8ff;
+        --accent-2: #4f8aff;
+        --danger: #ff6b6b;
+        --warn: #f5a623;
+        --ok: #4ec9b0;
+        --row-hover: rgba(110, 168, 255, 0.08);
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+              "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      button, select, input { font: inherit; color: inherit; }
+      header.app {
+        display: flex; align-items: center; gap: 16px;
+        padding: 12px 20px; border-bottom: 1px solid var(--border);
+        background: var(--panel);
+      }
+      header.app .brand { font-weight: 600; letter-spacing: 0.5px; }
+      header.app .brand small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+      header.app .spacer { flex: 1; }
+      header.app .who { color: var(--muted); }
+      header.app .who strong { color: var(--text); }
+      header.app .btn-logout {
+        padding: 6px 12px; border: 1px solid var(--border); background: transparent;
+        color: var(--text); border-radius: 6px; cursor: pointer;
+      }
+      header.app .btn-logout:hover { background: var(--panel-2); border-color: var(--accent); }
+      .tabs {
+        display: flex; gap: 4px; padding: 8px 20px;
+        background: var(--panel); border-bottom: 1px solid var(--border);
+        overflow-x: auto;
+      }
+      .tabs button {
+        padding: 6px 14px; border: 1px solid transparent; background: transparent;
+        color: var(--muted); border-radius: 999px; cursor: pointer; white-space: nowrap;
+      }
+      .tabs button:hover { color: var(--text); }
+      .tabs button.active {
+        background: var(--panel-2); color: var(--text); border-color: var(--border);
+      }
+      main.content { padding: 20px; max-width: 1400px; margin: 0 auto; }
+      .panel {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+        padding: 16px; margin-bottom: 16px;
+      }
+      .panel h2 { margin: 0 0 12px; font-size: 16px; font-weight: 600; }
+      .panel h2 small { color: var(--muted); font-weight: 400; margin-left: 8px; font-size: 12px; }
+      .toolbar {
+        display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px;
+      }
+      .toolbar input[type="text"], .toolbar select {
+        padding: 6px 10px; border: 1px solid var(--border); background: var(--panel-2);
+        border-radius: 6px;
+      }
+      .toolbar input[type="text"] { min-width: 220px; }
+      .toolbar .btn {
+        padding: 6px 14px; border: 1px solid var(--border); background: var(--panel-2);
+        color: var(--text); border-radius: 6px; cursor: pointer;
+      }
+      .toolbar .btn:hover { border-color: var(--accent); }
+      .toolbar .btn-primary { background: var(--accent-2); color: white; border-color: var(--accent-2); }
+      .toolbar .btn-primary:hover { background: var(--accent); border-color: var(--accent); }
+      .toolbar .spacer { flex: 1; }
+      table.data {
+        width: 100%; border-collapse: collapse; font-size: 13px;
+      }
+      table.data th, table.data td {
+        padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border);
+        vertical-align: top;
+      }
+      table.data th {
+        font-weight: 500; color: var(--muted); background: var(--panel-2);
+        position: sticky; top: 0;
+      }
+      table.data tr:hover td { background: var(--row-hover); }
+      table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      table.data td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px; color: var(--muted); }
+      table.data td.actions { white-space: nowrap; text-align: right; }
+      table.data td.actions button {
+        padding: 4px 10px; margin-left: 4px;
+        border: 1px solid var(--border); background: transparent;
+        color: var(--text); border-radius: 4px; cursor: pointer; font-size: 12px;
+      }
+      table.data td.actions button:hover { border-color: var(--accent); color: var(--accent); }
+      .badge {
+        display: inline-block; padding: 1px 8px; border-radius: 999px;
+        font-size: 11px; line-height: 1.4; border: 1px solid var(--border);
+      }
+      .badge.ok { color: var(--ok); border-color: var(--ok); }
+      .badge.warn { color: var(--warn); border-color: var(--warn); }
+      .badge.danger { color: var(--danger); border-color: var(--danger); }
+      .badge.muted { color: var(--muted); }
+      .empty { color: var(--muted); padding: 24px; text-align: center; }
+      .loading { color: var(--muted); padding: 24px; text-align: center; }
+      .error { color: var(--danger); padding: 12px; background: rgba(255,107,107,0.06);
+        border: 1px solid rgba(255,107,107,0.4); border-radius: 6px; margin-bottom: 12px; }
+      .pagination {
+        display: flex; gap: 8px; align-items: center; margin-top: 12px;
+        color: var(--muted); font-size: 13px;
+      }
+      .pagination button {
+        padding: 4px 10px; border: 1px solid var(--border); background: var(--panel-2);
+        color: var(--text); border-radius: 4px; cursor: pointer;
+      }
+      .pagination button:hover:not(:disabled) { border-color: var(--accent); }
+      .pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+      .toast-wrap {
+        position: fixed; right: 20px; top: 70px; display: flex; flex-direction: column;
+        gap: 8px; z-index: 100; pointer-events: none;
+      }
+      .toast {
+        padding: 8px 14px; border-radius: 6px; background: var(--panel-2);
+        border: 1px solid var(--border); box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+        pointer-events: auto;
+      }
+      .toast.ok { border-color: var(--ok); }
+      .toast.danger { border-color: var(--danger); }
+      .modal-bg {
+        position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+        display: flex; align-items: center; justify-content: center; z-index: 90;
+      }
+      .modal-bg[hidden] { display: none; }
+      .modal {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+        padding: 20px; min-width: 360px; max-width: 560px; width: 100%;
+      }
+      .modal h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+      .modal .form-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+      .modal .form-row label { color: var(--muted); font-size: 12px; }
+      .modal .form-row input, .modal .form-row select, .modal .form-row textarea {
+        padding: 6px 10px; border: 1px solid var(--border); background: var(--panel-2);
+        border-radius: 6px;
+      }
+      .modal .form-row textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px; min-height: 80px; }
+      .modal .form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+      .modal .form-actions button {
+        padding: 6px 14px; border: 1px solid var(--border); background: transparent;
+        color: var(--text); border-radius: 6px; cursor: pointer;
+      }
+      .modal .form-actions .btn-primary { background: var(--accent-2); color: white;
+        border-color: var(--accent-2); }
+      .login-gate {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        height: 100vh; gap: 12px;
+      }
+      .login-gate .icon { font-size: 32px; opacity: 0.5; }
+      .login-gate a { padding: 8px 20px; border: 1px solid var(--accent); border-radius: 6px;
+        color: var(--accent); }
+      .placeholder {
+        background: var(--panel-2); border: 1px dashed var(--border);
+        padding: 32px; border-radius: 8px; text-align: center; color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <header class="app">
+      <span class="brand">OpenClaude<small>超管控制台</small></span>
+      <span class="spacer"></span>
+      <span class="who" id="who">—</span>
+      <button class="btn-logout" id="logout">退出</button>
+    </header>
+    <nav class="tabs" id="tabs" role="tablist">
+      <button data-tab="users" class="active">用户</button>
+      <button data-tab="accounts">账号池</button>
+      <button data-tab="containers">容器</button>
+      <button data-tab="ledger">积分流水</button>
+      <button data-tab="pricing">定价</button>
+      <button data-tab="plans">充值套餐</button>
+      <button data-tab="settings">系统设置</button>
+      <button data-tab="audit">审计日志</button>
+      <button data-tab="health">健康面板</button>
+    </nav>
+    <main class="content" id="view">
+      <div class="loading">加载中…</div>
+    </main>
+    <div class="toast-wrap" id="toasts"></div>
+    <div class="modal-bg" id="modal-bg" hidden>
+      <div class="modal" id="modal-body"></div>
+    </div>
+    <script type="module" src="/modules/admin.js?v=1"></script>
+  </body>
+</html>

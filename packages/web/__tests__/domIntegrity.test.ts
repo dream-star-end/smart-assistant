@@ -72,13 +72,19 @@ const TEMPLATE_DYNAMIC_PREFIXES = ['tasks-panel-', 'tasks-tab-']
 // ── Load files once ──
 const html = readPublicFile('index.html')
 
+// V3 Phase 4D: admin.html + modules/admin.js 是独立的超管控制台,与 SPA 的
+// index.html 共享 modules/state.js + modules/api.js,但 DOM/ID 命名空间完
+// 全独立。集成测试要把这一对当成 sibling pair,scan modules/ 时排除
+// admin.js,避免 admin 的 $('view') 等 ID 被错算到 index.html 名下。
+const ADMIN_MODULES = new Set(['admin.js'])
+
 // Load JS source: either modules/ directory (post-refactor) or app.js (pre-refactor)
 const modulesDir = resolve(PUBLIC, 'modules')
 let js: string
 if (existsSync(modulesDir)) {
-  // Post-refactor: scan all .js files in modules/
+  // Post-refactor: scan all .js files in modules/(排除 admin.js — 那是 admin.html 用的)
   js = readdirSync(modulesDir)
-    .filter((f) => f.endsWith('.js'))
+    .filter((f) => f.endsWith('.js') && !ADMIN_MODULES.has(f))
     .map((f) => readFileSync(resolve(modulesDir, f), 'utf-8'))
     .join('\n')
 } else {
@@ -187,6 +193,51 @@ describe('T04: Critical IDs always present', () => {
   for (const id of CRITICAL_IDS) {
     it(`critical element #${id} exists in HTML`, () => {
       assert.ok(htmlIdSet.has(id), `Critical element #${id} is missing from index.html!`)
+    })
+  }
+})
+
+// ── T-ADMIN: admin.html ↔ modules/admin.js cross-check ──
+//
+// V3 Phase 4D — admin 控制台是独立 SPA(同源,共享 token);它的 $() 调用
+// 必须解析到 admin.html 的 ID,而不是 index.html。
+describe('T-ADMIN: admin.html / modules/admin.js DOM integrity', () => {
+  const adminHtmlPath = resolve(PUBLIC, 'admin.html')
+  const adminJsPath = resolve(PUBLIC, 'modules/admin.js')
+  const exists = existsSync(adminHtmlPath) && existsSync(adminJsPath)
+
+  it('admin.html + modules/admin.js both exist (Phase 4D shipped)', () => {
+    assert.ok(exists, 'expected admin.html and modules/admin.js')
+  })
+  if (!exists) return
+
+  const adminHtml = readFileSync(adminHtmlPath, 'utf-8')
+  const adminJs = readFileSync(adminJsPath, 'utf-8')
+  // 可用 ID 集 = admin.html 静态 ID ∪ admin.js 模板字符串里 id="..." 的 ID。
+  // admin.js 用 `view().innerHTML = \`...\`` 渲染各 tab,内含的表单/按钮 id
+  // 在运行时被注入 DOM,后续 $() 查询能命中。把模板里出现过的 id 视作有效。
+  const adminIds = new Set([
+    ...extractHtmlIds(adminHtml),
+    ...extractHtmlIds(adminJs),
+  ])
+  const refs = [
+    ...extractDollarRefs(adminJs),
+    ...extractGetElementByIdRefs(adminJs),
+  ]
+  const uniqueRefs = [...new Set(refs)]
+  it('every $()/getElementById ref in admin.js resolves (static or template-injected)', () => {
+    const missing = uniqueRefs.filter((id) => !adminIds.has(id))
+    if (missing.length > 0) {
+      assert.fail(
+        `${missing.length} admin.js ref(s) missing in admin.html and template strings:\n${missing.map((id) => `  - ${id}`).join('\n')}`,
+      )
+    }
+  })
+  // 关键骨架 ID 必须在(admin.html 删了它们 admin.js 直接崩)。
+  const ADMIN_CRITICAL_IDS = ['view', 'tabs', 'who', 'logout', 'toasts', 'modal-bg', 'modal-body']
+  for (const id of ADMIN_CRITICAL_IDS) {
+    it(`admin critical element #${id} exists`, () => {
+      assert.ok(adminIds.has(id), `admin critical #${id} missing in admin.html`)
     })
   }
 })
