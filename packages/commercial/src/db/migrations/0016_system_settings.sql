@@ -15,10 +15,7 @@ CREATE TABLE system_settings (
   updated_by   BIGINT REFERENCES users(id) ON DELETE SET NULL
 );
 
-COMMENT ON TABLE system_settings IS
-  'Operational runtime settings tunable by admin without code change. ' ||
-  'Distinct from user_preferences (per-user) and model_pricing (model price-list). ' ||
-  'Allowed keys + value shapes enforced in src/admin/systemSettings.ts.';
+COMMENT ON TABLE system_settings IS 'Operational runtime settings tunable by admin without code change. Distinct from user_preferences (per-user) and model_pricing (model price-list). Allowed keys + value shapes enforced in src/admin/systemSettings.ts.';
 COMMENT ON COLUMN system_settings.value IS
   'JSONB payload; shape validated by zod schema keyed on column key.';
 COMMENT ON COLUMN system_settings.updated_by IS
