@@ -528,6 +528,18 @@ export type {
   Conn,
   RegisterResult,
 } from "./ws/connections.js";
+// V3 Phase 2 Task 2I-1: 结构化 logger
+export {
+  createLogger,
+  rootLogger,
+  parseLevel,
+  SENSITIVE_KEYS,
+} from "./logging/logger.js";
+export type {
+  Logger,
+  LogLevel,
+  LoggerOptions,
+} from "./logging/logger.js";
 // T-53: Agent 订阅 + 生命周期
 export {
   openAgentSubscription,

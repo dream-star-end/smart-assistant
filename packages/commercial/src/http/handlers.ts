@@ -22,6 +22,7 @@ import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLi
 import type { Mailer } from "../auth/mail.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
+import type { Logger } from "../logging/logger.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import type { AgentHttpDeps } from "./agent.js";
 
@@ -76,6 +77,16 @@ export interface RequestContext {
   requestId: string;
   clientIp: string;
   userAgent: string | null;
+  /**
+   * V3 Phase 2 Task 2I-1:per-request 结构化 logger。
+   * 由 router 在分发前 child({ requestId, route, method }) 派生,
+   * handler 内部派生更多 binding(uid / containerId / phase 等)。
+   *
+   * 任何 chat 路径(2D anthropicProxy / 2E userChatBridge / 2C
+   * containerIdentity / preCheck / finalize)的 log 都必须经过 ctx.log
+   * 而不是 console.*,以确保 requestId 贯穿。
+   */
+  log: Logger;
 }
 
 export const DEFAULT_RATE_LIMITS = {

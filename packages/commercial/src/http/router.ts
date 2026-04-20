@@ -72,6 +72,7 @@ import {
   handleAdminMetrics,
 } from "./admin.js";
 import { incrGatewayRequest } from "../admin/metrics.js";
+import { rootLogger, type Logger } from "../logging/logger.js";
 
 export type CommercialHandler = (
   req: IncomingMessage,
@@ -100,7 +101,14 @@ interface Route {
   handler: RouteHandler;
 }
 
-export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHandler {
+export function createCommercialHandler(
+  deps: CommercialHttpDeps,
+  options: {
+    /** 测试可注入特定 logger;默认走 rootLogger.child({ subsys: "commercial" }) */
+    logger?: Logger;
+  } = {},
+): CommercialHandler {
+  const httpLogger = options.logger ?? rootLogger.child({ subsys: "commercial" });
   const routes: Route[] = [
     { method: "POST", path: "/api/auth/register", handler: handleRegister },
     { method: "POST", path: "/api/auth/login", handler: handleLogin },
@@ -173,12 +181,6 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     const requestId = ensureRequestId(req);
     res.setHeader(REQUEST_ID_HEADER, requestId);
 
-    const ctx: RequestContext = {
-      requestId,
-      clientIp: clientIpOf(req),
-      userAgent: userAgentOf(req),
-    };
-
     // 1) 精确匹配 —— 同一 path 下可能有多个 method(例:PATCH + GET /api/admin/users/:id)
     const exactCandidates = routes.filter((r) => r.path !== undefined && r.path === path);
     // 2) 前缀匹配(仅在精确不中时尝试)。T-60 同 prefix 下 GET/PATCH/POST 并存,必须
@@ -188,6 +190,30 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
       : [];
     const candidates = exactCandidates.length > 0 ? exactCandidates : prefixCandidates;
     const route = candidates.find((r) => r.method === method);
+    // route label —— 同时给 metrics 与 access log 使用
+    const labelRoute =
+      route?.path ?? route?.pathPrefix ??
+      candidates[0]?.path ?? candidates[0]?.pathPrefix ??
+      "__unmatched__";
+
+    // V3 2I-1:在 dispatch 前派生 per-request logger,挂进 ctx;
+    // 任何下游 handler / preCheck / proxy / finalize 都通过 ctx.log 派生子 logger,
+    // requestId 自然贯穿,且基底 binding(route/method/clientIp)一次性写明
+    const reqLog: Logger = httpLogger.child({
+      requestId,
+      route: labelRoute,
+      method,
+      clientIp: clientIpOf(req),
+    });
+
+    const ctx: RequestContext = {
+      requestId,
+      clientIp: clientIpOf(req),
+      userAgent: userAgentOf(req),
+      log: reqLog,
+    };
+
+    const startedAt = Date.now();
     try {
       if (candidates.length === 0) {
         throw new HttpError(404, "NOT_FOUND", "endpoint not found");
@@ -201,7 +227,7 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
       }
       await route.handler(req, res, ctx, deps);
     } catch (err) {
-      handleError(err, res, requestId);
+      handleError(err, res, requestId, reqLog);
     }
     // T-62 metrics:route label 严格用 "声明的 path/pathPrefix"。
     //   - 405 (method mismatch):仍有 candidates → 取首个的声明 label,Prometheus
@@ -209,26 +235,41 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     //   - 404 (无 candidates):落到固定 `__unmatched__`,**不要**把原始 path 刷
     //     进 label —— `/api/admin/foo-<uuid>` 之类会让 label 基数爆掉。
     //   status 直接拿响应对象实际写出的码,对齐真实 401/403/402/5xx。
-    const labelRoute =
-      route?.path ?? route?.pathPrefix ??
-      candidates[0]?.path ?? candidates[0]?.pathPrefix ??
-      "__unmatched__";
     incrGatewayRequest(labelRoute, method, res.statusCode);
+    // V3 2I-1:access log 一行,含 status / 耗时。错误已经在 handleError 内
+    // 用 error 级别详记过(含异常)。这条统一收尾。
+    const durationMs = Date.now() - startedAt;
+    reqLog.info("http_request", { status: res.statusCode, durationMs });
     return true;
   };
 }
 
-function handleError(err: unknown, res: ServerResponse, requestId: string): void {
+function handleError(
+  err: unknown,
+  res: ServerResponse,
+  requestId: string,
+  log: Logger,
+): void {
   if (res.headersSent) {
     // 响应已发出,无能为力 — 关连接
+    log.warn("http_response_after_headers_sent", { err: errorSummary(err) });
     res.destroy();
     return;
   }
   if (err instanceof HttpError) {
+    // 预期内的业务错(401/403/404/4xx 大多在这里):记 warn,不拉警报
+    log.warn("http_error", { status: err.status, code: err.code, message: err.message });
     sendError(res, err.status, err.code, err.message, requestId, err.issues, err.extraHeaders);
     return;
   }
-  // eslint-disable-next-line no-console
-  console.error(`[commercial/http] unhandled error in request ${requestId}:`, err);
+  // 未捕获 → 500;记 error 级别,带 stack
+  log.error("http_unhandled_error", { err: errorSummary(err) });
   sendError(res, 500, "INTERNAL", "internal server error", requestId);
+}
+
+function errorSummary(err: unknown): Record<string, unknown> {
+  if (err instanceof Error) {
+    return { name: err.name, message: err.message, stack: err.stack };
+  }
+  return { value: String(err) };
 }
