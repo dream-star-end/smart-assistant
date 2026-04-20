@@ -30,6 +30,7 @@
  */
 
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
+import { SupervisorError } from "./types.js";
 import {
   getV3ContainerStatus,
   markV3ContainerActivity,
@@ -53,6 +54,13 @@ const RETRY_AFTER_PROVISIONING_SEC = 5;
 
 /** 前端 retry-after 提示秒数(stopped — 等 3F 清理)。短一点,避免用户等久。 */
 const RETRY_AFTER_STOPPED_SEC = 3;
+
+/**
+ * V3 Phase 3I — host 容器达 MAX_RUNNING_CONTAINERS 的前端重试秒数。
+ * 比 provision 慢,因为得等其他用户 idle sweep / GC 释放;但太长 UX 差。
+ * 10s 与冷启动峰值一档,前端可平滑显示"系统繁忙"。
+ */
+const RETRY_AFTER_HOST_FULL_SEC = 10;
 
 /**
  * ensureRunning 注入项 — 测试可以覆盖 readiness 探活实现。
@@ -167,7 +175,11 @@ export function makeV3EnsureRunning(
     let provisioned;
     try {
       provisioned = await provisionV3Container(deps, uid);
-    } catch {
+    } catch (err) {
+      // V3 Phase 3I — host 满 cap 走专用 reason + 长 retryAfter,前端显示"系统繁忙"
+      if (err instanceof SupervisorError && err.code === "HostFull") {
+        throw new ContainerUnreadyError(RETRY_AFTER_HOST_FULL_SEC, "host_full");
+      }
       // NameConflict(同 uid 并发 provision)/ ImagePull / IP 池满 都让前端短重试
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }
@@ -192,5 +204,6 @@ export const ENSURE_RUNNING_DEFAULTS = Object.freeze({
   WS_PROBE_MS: DEFAULT_WS_PROBE_MS,
   RETRY_AFTER_PROVISIONING_SEC,
   RETRY_AFTER_STOPPED_SEC,
+  RETRY_AFTER_HOST_FULL_SEC,
   CONTAINER_PORT: V3_CONTAINER_PORT,
 });

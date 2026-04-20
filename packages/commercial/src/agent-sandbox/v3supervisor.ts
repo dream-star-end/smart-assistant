@@ -80,6 +80,31 @@ const V3_IP_OCTET_MAX = 250;
 /** 在 172.30.0/16 内随机选,失败重试上限(uniq 冲突时 INSERT 重试) */
 const V3_IP_ALLOC_MAX_ATTEMPTS = 30;
 
+/**
+ * V3 Phase 3I — 实例级 active 容器硬限。
+ *
+ * 默认 50,经验值(单 host 32GB / 50 容器 ≈ 每容器 600MB working set 余量)。
+ * env `OC_MAX_RUNNING_CONTAINERS` 整数覆盖;V3SupervisorDeps.maxRunningContainers
+ * 优先级更高(测试 / 多机分配)。打到 cap → SupervisorError("HostFull"),
+ * v3ensureRunning 翻成 ContainerUnreadyError(10, "host_full"),前端按 retryAfter
+ * 长重试(冷启等其他用户 idle sweep / GC 释放)。
+ *
+ * 算空位时只数 state='active'(不数 vanished;3F idle sweep / 3H reconcile
+ * 会及时把死容器翻 vanished)。
+ */
+export const DEFAULT_MAX_RUNNING_CONTAINERS = 50;
+
+/** 读 env `OC_MAX_RUNNING_CONTAINERS`;非法值 → 落回默认 50 */
+function readMaxRunningContainersFromEnv(): number {
+  const raw = process.env.OC_MAX_RUNNING_CONTAINERS;
+  if (raw == null || raw.trim() === "") return DEFAULT_MAX_RUNNING_CONTAINERS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    return DEFAULT_MAX_RUNNING_CONTAINERS;
+  }
+  return n;
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // 公共类型
 // ───────────────────────────────────────────────────────────────────────
@@ -102,6 +127,12 @@ export interface V3SupervisorDeps {
   randomIp?: () => string;
   /** 测试钩子:覆盖 secret 生成。生产留空走默认。 */
   randomSecret?: () => string;
+  /**
+   * V3 Phase 3I — 实例级 active 容器硬限。覆盖 env `OC_MAX_RUNNING_CONTAINERS`,
+   * env 不设则走 `DEFAULT_MAX_RUNNING_CONTAINERS=50`。≤0 / 非整数 / 非数字
+   * 都会被忽略走默认。
+   */
+  maxRunningContainers?: number;
 }
 
 /** provision 成功后返回。3D ensureRunning 拿来注入到 userChatBridge */
@@ -357,6 +388,30 @@ export async function provisionV3Container(
   const containerName = v3ContainerNameFor(uid);
   const pickIp = deps.randomIp ?? defaultPickRandomIp;
   const mintSecret = deps.randomSecret ?? defaultRandomSecret;
+
+  // V3 Phase 3I — 实例级 active 容器硬限。在 volume / IP 分配之前先卡。
+  // 优先 deps 注入(测试 / 多机),回落 env / 默认。
+  const cap =
+    typeof deps.maxRunningContainers === "number"
+      && Number.isInteger(deps.maxRunningContainers)
+      && deps.maxRunningContainers > 0
+      ? deps.maxRunningContainers
+      : readMaxRunningContainersFromEnv();
+  // R6.7 reader 显式 state filter — 只数 active(vanished 不占容量)。
+  // 单机 monolith MVP,不带 host_id;P1 多机加 `AND host_id=$current_host`。
+  const capQ = await deps.pool.query<{ active: string }>(
+    `SELECT COUNT(*)::text AS active
+       FROM agent_containers
+      WHERE state = 'active'`,
+  );
+  const active = Number.parseInt(capQ.rows[0]?.active ?? "0", 10);
+  if (active >= cap) {
+    throw new SupervisorError(
+      "HostFull",
+      `host at MAX_RUNNING_CONTAINERS cap (${active}/${cap})`,
+      { message: `active=${active} cap=${cap}` },
+    );
+  }
 
   // 1) volume(幂等)
   let volumeName: string;
@@ -626,4 +681,85 @@ export async function getV3ContainerStatus(
     dockerContainerId: row.container_internal_id,
     state,
   };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// V3 Phase 3I — 镜像预热(gateway 启动时 fire-and-forget)
+// ───────────────────────────────────────────────────────────────────────
+
+/** preheatV3Image 单次结果 — 主要给测试 / log 用,生产路径不需要看 */
+export interface V3ImagePreheatResult {
+  /** 镜像 tag(传入即返回,方便日志) */
+  image: string;
+  /** "already" = 本地已有,docker pull 仍然跑过(NO-OP);"pulled" = 真拉了 */
+  outcome: "already" | "pulled" | "error";
+  /** error 文案(outcome='error' 才有) */
+  error?: string;
+  /** 全过程毫秒 */
+  durationMs: number;
+}
+
+/**
+ * 异步预热 v3 镜像(gateway 启动时 fire-and-forget 调用)。
+ *
+ * 为什么需要:Phase 3B 用 `docker save / docker load` 一次性载入镜像后,
+ * 一般本地都已存在,首次 provision 不需要拉。但部署节奏不可控(运维忘了 load /
+ * 升级途中老镜像被 GC),首次用户冷启会因为 docker pull 卡 30-60s,体验崩。
+ * 启动时主动 pull 一次(本地已有 → noop),把这次延迟摊到启动时。
+ *
+ * 设计取舍:
+ *   - **不阻塞启动** —— gateway 不能等镜像 pull 才接 ws,callsite 必须 .catch(...)
+ *   - **不抛错** —— 镜像不可达(私有 registry 网络抖动 / 删了)只是首次 provision
+ *     变慢,gateway 仍然能跑,3I 这里 best-effort
+ *   - 测试可注入 `image()` 调度返回(ReadableStream from dockerode pull)便于断言
+ *     调用次数;实际生产不需要 mock
+ *   - 默认在 inspect 走通后跳过 pull(镜像已在本地,90% 路径秒返回)。这条路径
+ *     比裸 docker.pull 快得多(避开 manifest 拉取)
+ */
+export async function preheatV3Image(
+  docker: Docker,
+  image: string,
+  logger?: { info?: (m: string, meta?: unknown) => void; warn?: (m: string, meta?: unknown) => void },
+): Promise<V3ImagePreheatResult> {
+  const startedAt = Date.now();
+  if (typeof image !== "string" || image.trim() === "") {
+    return { image, outcome: "error", error: "image is empty", durationMs: 0 };
+  }
+  // 路径 A:inspect 命中(本地已有)→ 直接 noop 返回
+  try {
+    await docker.getImage(image).inspect();
+    const durationMs = Date.now() - startedAt;
+    logger?.info?.("[v3 preheat] image already present locally", { image, durationMs });
+    return { image, outcome: "already", durationMs };
+  } catch (err) {
+    if (!isNotFound(err)) {
+      // inspect 抛非 404(daemon 不可达 / 权限)→ 不强行 pull,返回 error
+      const durationMs = Date.now() - startedAt;
+      const message = (err as Error)?.message ?? String(err);
+      logger?.warn?.("[v3 preheat] image inspect failed; skipping pull", { image, error: message });
+      return { image, outcome: "error", error: message, durationMs };
+    }
+  }
+  // 路径 B:本地没有 → docker pull(stream API,followProgress 直到结束)
+  try {
+    await new Promise<void>((resolve, reject) => {
+      // dockerode v3 typings 把 callback 标得严,unknown 兜
+      const dAny = docker as unknown as {
+        pull: (img: string, cb: (err: Error | null, stream: NodeJS.ReadableStream) => void) => void;
+        modem: { followProgress: (s: NodeJS.ReadableStream, cb: (err: Error | null) => void) => void };
+      };
+      dAny.pull(image, (err, stream) => {
+        if (err) return reject(err);
+        dAny.modem.followProgress(stream, (err2) => (err2 ? reject(err2) : resolve()));
+      });
+    });
+    const durationMs = Date.now() - startedAt;
+    logger?.info?.("[v3 preheat] image pulled", { image, durationMs });
+    return { image, outcome: "pulled", durationMs };
+  } catch (err) {
+    const durationMs = Date.now() - startedAt;
+    const message = (err as Error)?.message ?? String(err);
+    logger?.warn?.("[v3 preheat] image pull failed; first provision will pay latency", { image, error: message });
+    return { image, outcome: "error", error: message, durationMs };
+  }
 }

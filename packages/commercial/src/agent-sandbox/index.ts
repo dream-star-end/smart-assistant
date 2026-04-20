@@ -36,9 +36,13 @@ export {
   V3_CONTAINER_PORT,
   V3_CONFIG_TMPFS_PATH,
   V3_VOLUME_MOUNT,
+  // V3 Phase 3I — instance cap + image preheat
+  DEFAULT_MAX_RUNNING_CONTAINERS,
+  preheatV3Image,
   type V3SupervisorDeps,
   type ProvisionedV3Container,
   type V3ContainerStatus,
+  type V3ImagePreheatResult,
 } from "./v3supervisor.js";
 
 // V3 Phase 3D — bridge(/ws/user-chat-bridge)resolveContainerEndpoint 实现

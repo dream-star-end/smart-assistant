@@ -252,6 +252,11 @@ class FakePool {
             }],
           };
         }
+        // V3 Phase 3I — provisionV3Container 在事务前查 active count 做 cap 检查
+        if (/SELECT COUNT\(\*\)::text AS active/i.test(trimmed) && /state = 'active'/i.test(trimmed)) {
+          const active = self.rows.filter((x) => x.state === "active").length;
+          return { rowCount: 1, rows: [{ active: String(active) }] };
+        }
         throw new Error(`FakePool: unhandled SQL: ${trimmed.slice(0, 200)}`);
       },
       release() {
@@ -611,5 +616,351 @@ describe("getV3ContainerStatus", () => {
     assert.ok(r);
     assert.equal(r!.state, "stopped");
     assert.equal(r!.dockerContainerId, "");
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  V3 Phase 3I — MAX_RUNNING_CONTAINERS cap
+// ───────────────────────────────────────────────────────────────────────
+
+describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
+  let pool: FakePool;
+  beforeEach(() => {
+    pool = new FakePool();
+  });
+
+  /** 塞 N 个 active 行进 FakePool,模拟 host 已经满负荷 */
+  function seedActiveRows(n: number): void {
+    for (let i = 0; i < n; i++) {
+      const now = new Date();
+      pool.rows.push({
+        id: pool.nextId++,
+        user_id: 1000 + i,
+        bound_ip: `172.30.100.${i + 1}`,
+        secret_hash: Buffer.alloc(32),
+        state: "active",
+        port: V3_CONTAINER_PORT,
+        container_internal_id: `seed-${i}`,
+        last_ws_activity: now,
+        created_at: now,
+        updated_at: now,
+      });
+    }
+  }
+
+  test("active < cap → 正常 provision(deps.maxRunningContainers 注入 = 3,2 active)", async () => {
+    const { docker } = makeDocker();
+    seedActiveRows(2);
+    const r = await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        randomIp: () => "172.30.50.1",
+        randomSecret: fixedSecret("0".repeat(64)),
+        maxRunningContainers: 3,
+      },
+      777,
+    );
+    assert.ok(r.containerId > 0);
+    assert.equal(r.boundIp, "172.30.50.1");
+    // 第三行成功落了
+    assert.equal(pool.rows.filter((x) => x.state === "active").length, 3);
+  });
+
+  test("active = cap → 抛 SupervisorError('HostFull') + 不进事务 + 不动 docker", async () => {
+    const { docker, captured } = makeDocker();
+    seedActiveRows(3);
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          randomIp: () => "172.30.50.99",
+          randomSecret: fixedSecret("1".repeat(64)),
+          maxRunningContainers: 3,
+        },
+        9001,
+      ),
+      (err: Error) => err instanceof SupervisorError && err.code === "HostFull",
+    );
+    // cap 拒绝必须发生在 BEGIN/createContainer/createVolume 之前
+    assert.deepEqual(pool.clientLog, []);
+    assert.equal(captured.containersCreated.length, 0);
+    assert.equal(captured.volumesCreated.length, 0);
+    // 行数不变
+    assert.equal(pool.rows.length, 3);
+  });
+
+  test("active > cap(运维手动塞了多)→ 仍然 HostFull,不会绕过", async () => {
+    const { docker } = makeDocker();
+    seedActiveRows(5);
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          randomIp: () => "172.30.51.1",
+          randomSecret: fixedSecret("2".repeat(64)),
+          maxRunningContainers: 3,
+        },
+        9002,
+      ),
+      (err: Error) => err instanceof SupervisorError && err.code === "HostFull",
+    );
+  });
+
+  test("vanished 行不计入 cap(已死容器不占容量)", async () => {
+    const { docker } = makeDocker();
+    seedActiveRows(2);
+    // 再塞 5 个 vanished 行,模拟 idle sweep / orphan reconcile 已经清掉
+    for (let i = 0; i < 5; i++) {
+      const now = new Date();
+      pool.rows.push({
+        id: pool.nextId++,
+        user_id: 8000 + i,
+        bound_ip: `172.30.200.${i + 1}`,
+        secret_hash: Buffer.alloc(32),
+        state: "vanished",
+        port: V3_CONTAINER_PORT,
+        container_internal_id: `dead-${i}`,
+        last_ws_activity: now,
+        created_at: now,
+        updated_at: now,
+      });
+    }
+    // cap=3,active=2(vanished 不算),应该过
+    const r = await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        randomIp: () => "172.30.50.55",
+        randomSecret: fixedSecret("3".repeat(64)),
+        maxRunningContainers: 3,
+      },
+      9003,
+    );
+    assert.ok(r.containerId > 0);
+  });
+
+  test("env OC_MAX_RUNNING_CONTAINERS 兜底 + deps.maxRunningContainers 优先级更高", async () => {
+    const { docker } = makeDocker();
+    seedActiveRows(2);
+    const original = process.env.OC_MAX_RUNNING_CONTAINERS;
+    try {
+      // env 设的 cap 低,但 deps 注入更高 → deps 赢
+      process.env.OC_MAX_RUNNING_CONTAINERS = "1";
+      const r = await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          randomIp: () => "172.30.52.1",
+          randomSecret: fixedSecret("4".repeat(64)),
+          maxRunningContainers: 5,
+        },
+        9004,
+      );
+      assert.ok(r.containerId > 0);
+    } finally {
+      if (original === undefined) delete process.env.OC_MAX_RUNNING_CONTAINERS;
+      else process.env.OC_MAX_RUNNING_CONTAINERS = original;
+    }
+  });
+
+  test("env OC_MAX_RUNNING_CONTAINERS 生效(deps 不注入时回落到 env)", async () => {
+    const { docker, captured } = makeDocker();
+    seedActiveRows(2);
+    const original = process.env.OC_MAX_RUNNING_CONTAINERS;
+    try {
+      process.env.OC_MAX_RUNNING_CONTAINERS = "2";
+      await assert.rejects(
+        provisionV3Container(
+          {
+            docker,
+            pool: pool as unknown as Pool,
+            image: TEST_IMAGE,
+            randomIp: () => "172.30.52.99",
+            randomSecret: fixedSecret("5".repeat(64)),
+            // 故意不注入 maxRunningContainers,让代码走 readMaxRunningContainersFromEnv
+          },
+          9005,
+        ),
+        (err: Error) => err instanceof SupervisorError && err.code === "HostFull",
+      );
+      assert.equal(captured.containersCreated.length, 0);
+    } finally {
+      if (original === undefined) delete process.env.OC_MAX_RUNNING_CONTAINERS;
+      else process.env.OC_MAX_RUNNING_CONTAINERS = original;
+    }
+  });
+
+  test("env OC_MAX_RUNNING_CONTAINERS=非法值 → 回落默认 50(2 active 不挡)", async () => {
+    const { docker } = makeDocker();
+    seedActiveRows(2);
+    const original = process.env.OC_MAX_RUNNING_CONTAINERS;
+    try {
+      // "abc" / "0" / "-5" / "1.5" / "" 全都视为非法 → DEFAULT_MAX_RUNNING_CONTAINERS=50,
+      // 2 active < 50 → 直接放行;只跑一次 provision 验证就行(多次会 IP 撞)。
+      process.env.OC_MAX_RUNNING_CONTAINERS = "abc";
+      const r = await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          randomIp: () => "172.30.53.50",
+          randomSecret: fixedSecret("6".repeat(64)),
+          // 故意不注入 deps cap → 走 env → 非法 → 50 默认
+        },
+        9100,
+      );
+      assert.ok(r.containerId > 0);
+      assert.equal(pool.rows.filter((x) => x.state === "active").length, 3);
+    } finally {
+      if (original === undefined) delete process.env.OC_MAX_RUNNING_CONTAINERS;
+      else process.env.OC_MAX_RUNNING_CONTAINERS = original;
+    }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  V3 Phase 3I — preheatV3Image
+// ───────────────────────────────────────────────────────────────────────
+
+describe("preheatV3Image (3I)", () => {
+  test("镜像已在本地 → outcome='already' 且不调 docker.pull", async () => {
+    let pulled = 0;
+    let inspected = 0;
+    const docker = {
+      getImage: (_name: string) => ({
+        inspect: async () => {
+          inspected++;
+          return { Id: "sha256:abc" } as unknown;
+        },
+      }),
+      pull: (_img: string, cb: (err: Error | null, s: NodeJS.ReadableStream) => void) => {
+        pulled++;
+        cb(new Error("should not be called"), null as unknown as NodeJS.ReadableStream);
+      },
+      modem: { followProgress: (_s: NodeJS.ReadableStream, cb: (e: Error | null) => void) => cb(null) },
+    } as unknown as Docker;
+
+    const { preheatV3Image } = await import("../agent-sandbox/index.js");
+    const res = await preheatV3Image(docker, "openclaude/runtime:test");
+    assert.equal(res.outcome, "already");
+    assert.equal(res.image, "openclaude/runtime:test");
+    assert.equal(inspected, 1);
+    assert.equal(pulled, 0);
+  });
+
+  test("镜像不在本地 → outcome='pulled' 且 docker.pull + followProgress 都调过", async () => {
+    let pulled = 0;
+    let progressed = 0;
+    const docker = {
+      getImage: (_name: string) => ({
+        inspect: async () => { throw httpError(404, "no such image"); },
+      }),
+      pull: (img: string, cb: (err: Error | null, s: NodeJS.ReadableStream) => void) => {
+        pulled++;
+        assert.equal(img, "openclaude/runtime:test");
+        // 喂个空 stream
+        cb(null, { } as NodeJS.ReadableStream);
+      },
+      modem: {
+        followProgress: (_s: NodeJS.ReadableStream, cb: (e: Error | null) => void) => {
+          progressed++;
+          // 异步 resolve,模拟 dockerode 真实行为
+          setImmediate(() => cb(null));
+        },
+      },
+    } as unknown as Docker;
+
+    const { preheatV3Image } = await import("../agent-sandbox/index.js");
+    const res = await preheatV3Image(docker, "openclaude/runtime:test");
+    assert.equal(res.outcome, "pulled");
+    assert.equal(pulled, 1);
+    assert.equal(progressed, 1);
+  });
+
+  test("docker.pull 抛错 → outcome='error' 不冒泡(gateway 启动不被阻断)", async () => {
+    const docker = {
+      getImage: (_name: string) => ({
+        inspect: async () => { throw httpError(404, "no such image"); },
+      }),
+      pull: (_img: string, cb: (err: Error | null, s: NodeJS.ReadableStream) => void) => {
+        cb(new Error("registry unreachable"), null as unknown as NodeJS.ReadableStream);
+      },
+      modem: { followProgress: (_s: NodeJS.ReadableStream, cb: (e: Error | null) => void) => cb(null) },
+    } as unknown as Docker;
+
+    const { preheatV3Image } = await import("../agent-sandbox/index.js");
+    const res = await preheatV3Image(docker, "openclaude/runtime:test");
+    assert.equal(res.outcome, "error");
+    assert.match(res.error ?? "", /registry unreachable/);
+  });
+
+  test("inspect 抛非 404(daemon 不可达)→ outcome='error' 直接返回不 pull", async () => {
+    let pulled = 0;
+    const docker = {
+      getImage: (_name: string) => ({
+        inspect: async () => { throw httpError(500, "docker daemon down"); },
+      }),
+      pull: (_img: string, cb: (err: Error | null, s: NodeJS.ReadableStream) => void) => {
+        pulled++;
+        cb(null, {} as NodeJS.ReadableStream);
+      },
+      modem: { followProgress: (_s: NodeJS.ReadableStream, cb: (e: Error | null) => void) => cb(null) },
+    } as unknown as Docker;
+
+    const { preheatV3Image } = await import("../agent-sandbox/index.js");
+    const res = await preheatV3Image(docker, "openclaude/runtime:test");
+    assert.equal(res.outcome, "error");
+    assert.match(res.error ?? "", /daemon down/);
+    assert.equal(pulled, 0); // inspect 错的不是 404 就不 fallback 到 pull
+  });
+
+  test("空 image string → outcome='error' early return,不碰 docker", async () => {
+    let touched = 0;
+    const docker = {
+      getImage: () => { touched++; return { inspect: async () => ({}) } as unknown as ReturnType<Docker["getImage"]>; },
+      pull: () => { touched++; },
+      modem: { followProgress: () => { touched++; } },
+    } as unknown as Docker;
+
+    const { preheatV3Image } = await import("../agent-sandbox/index.js");
+    const res = await preheatV3Image(docker, "");
+    assert.equal(res.outcome, "error");
+    assert.equal(touched, 0);
+  });
+
+  test("logger 被回调:本地有 → info('image already present');pull 失败 → warn", async () => {
+    const events: Array<{ lvl: string; msg: string }> = [];
+    const logger = {
+      info: (msg: string) => events.push({ lvl: "info", msg }),
+      warn: (msg: string) => events.push({ lvl: "warn", msg }),
+    };
+
+    const dockerHit = {
+      getImage: () => ({ inspect: async () => ({}) }),
+      pull: () => { /* noop */ },
+      modem: { followProgress: () => { /* noop */ } },
+    } as unknown as Docker;
+    const dockerFail = {
+      getImage: () => ({ inspect: async () => { throw httpError(404, "missing"); } }),
+      pull: (_img: string, cb: (err: Error | null, s: NodeJS.ReadableStream) => void) => {
+        cb(new Error("net down"), null as unknown as NodeJS.ReadableStream);
+      },
+      modem: { followProgress: (_s: NodeJS.ReadableStream, cb: (e: Error | null) => void) => cb(null) },
+    } as unknown as Docker;
+
+    const { preheatV3Image } = await import("../agent-sandbox/index.js");
+    await preheatV3Image(dockerHit, "img:1", logger);
+    await preheatV3Image(dockerFail, "img:1", logger);
+
+    assert.ok(events.find((e) => e.lvl === "info" && /already present/.test(e.msg)), "expected info log for already-present");
+    assert.ok(events.find((e) => e.lvl === "warn" && /pull failed/.test(e.msg)), "expected warn log for pull failure");
   });
 });

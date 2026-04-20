@@ -52,6 +52,7 @@ import {
 } from "./ws/userChatBridge.js";
 import {
   makeV3EnsureRunning,
+  preheatV3Image,
   startIdleSweepScheduler,
   startOrphanReconcileScheduler,
   startVolumeGcScheduler,
@@ -464,6 +465,20 @@ export async function registerCommercial(
     };
     // eslint-disable-next-line no-console
     console.log("[commercial] v3 supervisor wired", { image: cfg.OC_RUNTIME_IMAGE });
+
+    // V3 Phase 3I — 启动时镜像预热(fire-and-forget):本地已有 → noop;
+    // 没有 → docker pull,把首次 provision 30-60s 拉镜像延迟摊到启动时。
+    // OC_PREHEAT_DISABLED=1 关闭(测试 / 网络受限 / CI)。失败不影响 gateway。
+    if (process.env.OC_PREHEAT_DISABLED !== "1") {
+      void preheatV3Image(v3Docker, cfg.OC_RUNTIME_IMAGE, {
+        info: (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
+        warn: (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
+      }).catch((err: unknown) => {
+        // preheatV3Image 内部已经吞了所有错;到这里只是兜底防 unhandledRejection
+        // eslint-disable-next-line no-console
+        console.warn("[commercial] v3 preheat unexpectedly threw", { error: (err as Error)?.message ?? String(err) });
+      });
+    }
   } else {
     // eslint-disable-next-line no-console
     console.log(

@@ -137,4 +137,5 @@ export type SupervisorErrorCode =
   | "NotFound"
   | "DockerUnavailable"
   | "InvalidArgument"
+  | "HostFull"
   | "Unknown";

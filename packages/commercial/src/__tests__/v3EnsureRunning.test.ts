@@ -175,6 +175,11 @@ class FakePool {
         }],
       };
     }
+    // V3 Phase 3I — provision 内部 active count cap query
+    if (/SELECT COUNT\(\*\)::text AS active/i.test(trimmed) && /state = 'active'/i.test(trimmed)) {
+      const active = this.rows.filter((x) => x.state === "active").length;
+      return { rowCount: 1, rows: [{ active: String(active) }] };
+    }
     throw new Error(`FakePool: unhandled SQL: ${trimmed.slice(0, 200)}`);
   }
 }
@@ -557,5 +562,34 @@ describe("makeV3EnsureRunning", () => {
       assert.strictEqual(err.reason, "starting");
       return true;
     });
+  });
+
+  // V3 Phase 3I: provision 撞 cap → SupervisorError("HostFull") 必须翻成
+  // ContainerUnreadyError("host_full", retryAfter=10),前端按 retryAfter 提示"系统繁忙"。
+  test("provision 时 host 满 cap → ContainerUnreadyError('host_full', retryAfter=10)", async () => {
+    const pool = new FakePool();
+    // 塞满 maxRunningContainers=2,uid=18 没有 active 行 → 走 provision → cap 拒
+    pool.preInsertActive(101, "172.30.1.101", "dockerid-101");
+    pool.preInsertActive(102, "172.30.1.102", "dockerid-102");
+    const { docker, captured } = makeDocker();
+    const deps = makeDeps(docker, pool as unknown as Pool, {
+      maxRunningContainers: 2,
+    });
+    const ensureRunning = makeV3EnsureRunning(deps, {
+      probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
+      sleep: noSleep,
+      now: fixedNow,
+    });
+
+    await assert.rejects(ensureRunning(18n), (err) => {
+      assert.ok(err instanceof ContainerUnreadyError);
+      assert.strictEqual(err.reason, "host_full");
+      assert.strictEqual(err.retryAfterSec, ENSURE_RUNNING_DEFAULTS.RETRY_AFTER_HOST_FULL_SEC);
+      return true;
+    });
+    // cap 在事务前直接拒 → 不 createContainer / 不 start
+    assert.strictEqual(captured.containersCreated, 0);
+    assert.strictEqual(captured.started, 0);
   });
 });
