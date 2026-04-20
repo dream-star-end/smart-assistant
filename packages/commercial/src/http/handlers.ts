@@ -22,7 +22,6 @@ import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLi
 import type { Mailer } from "../auth/mail.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
-import type { ChatLLM } from "./chat.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import type { AgentHttpDeps } from "./agent.js";
 
@@ -46,8 +45,6 @@ export interface CommercialHttpDeps {
    * 测试可注入 `InMemoryPreCheckRedis` 跳过真 Redis。
    */
   preCheckRedis?: PreCheckRedis;
-  /** T-23: LLM 执行器,默认 stub(固定 1000 in / 500 out);T-40 接真 Claude 时替换 */
-  chatLLM?: ChatLLM;
   /**
    * T-24: 虎皮椒 HTTP 客户端。未注入时 POST /api/payment/hupi/create 返 503。
    * 测试时注入返回固定 qrcode 的 mock,避免打外网。

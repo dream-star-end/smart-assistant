@@ -39,7 +39,6 @@ import {
   type CommercialHttpDeps,
   type RequestContext,
 } from "./handlers.js";
-import { handleChat } from "./chat.js";
 import {
   handleListPlans,
   handleCreateHupi,
@@ -113,7 +112,6 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     { method: "POST", path: "/api/auth/confirm-password-reset", handler: (req, res) => handleConfirmPasswordReset(req, res) },
     { method: "GET", path: "/api/me", handler: handleMe },
     { method: "GET", path: "/api/public/models", handler: handleListPublicModels },
-    { method: "POST", path: "/api/chat", handler: handleChat },
     { method: "GET", path: "/api/payment/plans", handler: handleListPlans },
     { method: "POST", path: "/api/payment/hupi/create", handler: handleCreateHupi },
     { method: "POST", path: "/api/payment/hupi/callback", handler: handleHupiCallback },
@@ -158,7 +156,6 @@ export function createCommercialHandler(deps: CommercialHttpDeps): CommercialHan
     "/api/auth/",
     "/api/me",
     "/api/public/",
-    "/api/chat",
     "/api/payment/",
     "/api/agent/",
     "/api/admin/",

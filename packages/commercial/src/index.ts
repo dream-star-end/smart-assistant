@@ -28,9 +28,7 @@ import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
 import { AccountScheduler } from "./account-pool/scheduler.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
-import { createChatWsHandler, type ChatWsHandler } from "./ws/chat.js";
 import { createAgentWsHandler, type AgentWsHandler } from "./ws/agent.js";
-import { createChatLLMFromRunChat } from "./http/chat.js";
 import {
   startLifecycleScheduler,
   checkAgentAccess,
@@ -267,22 +265,16 @@ export async function registerCommercial(
     );
   }
 
-  // T-40/T-41 共用的编排依赖:scheduler + health。ws/chat 与 http/chat 走同一套,
-  // 两个入口的 debit 与 account-pool 语义才不会漂移。
+  // V3: account-pool 仍然装配(供 admin 列表/T-30 store + agent 容器内部 chat 走 anthropic
+  // 中央代理时使用),但 v2 的 chat orchestrator(ws/chat + http/chat)已删除 —
+  // v3 chat 不在 commercial 进程出口,而是在每个用户的 docker 容器里跑个人版,通过
+  // anthropicProxy(2D)统一调上游。
   const healthRedis = wrapIoredisForHealth(
     redis as unknown as Parameters<typeof wrapIoredisForHealth>[0],
   );
   const healthTracker = new AccountHealthTracker({ redis: healthRedis });
   const scheduler = new AccountScheduler({ health: healthTracker });
-  // OAuth token 必须带 oauth-2025-04-20 beta header 才能调 /v1/messages,
-  // 否则 Anthropic 直接返 401 "OAuth authentication is currently not supported"。
-  // claude-code-20250219 是 Claude Code 的标识 beta,业务侧权益(plan/限额)按它路由。
-  const chatDeps = {
-    scheduler,
-    proxyDeps: { anthropicBeta: "oauth-2025-04-20,claude-code-20250219" },
-  };
-  // T-41 REST /api/chat:把 orchestrator 包成 ChatLLM 接口喂给既有 http handler。
-  const realChatLLM = createChatLLMFromRunChat(chatDeps);
+  void scheduler; // TODO 2D: 注入 anthropicProxy
 
   // T-12+ 真实 mailer:env 配 RESEND_API_KEY 后切到 Resend,否则保留 stub(dev/测试)。
   const resendKey = process.env.RESEND_API_KEY?.trim();
@@ -308,18 +300,9 @@ export async function registerCommercial(
     pricing,
     // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
     preCheckRedis,
-    chatLLM: realChatLLM,
     hupijiao,
     hupijiaoConfig,
     agentRuntime,
-  });
-
-  // T-40 /ws/chat:handler 注入同一份 chatDeps
-  const wsHandler: ChatWsHandler = createChatWsHandler({
-    jwtSecret,
-    pricing,
-    preCheckRedis,
-    chatDeps,
   });
 
   // T-52 /ws/agent:仅在 agent runtime 就绪时启用。
@@ -352,13 +335,11 @@ export async function registerCommercial(
   return {
     handle: handler,
     handleWsUpgrade: (req, socket, head) => {
-      // 先试 /ws/chat;返 false 表示不是该路径,再试 /ws/agent;都 false → gateway 自处理
-      if (wsHandler.handleUpgrade(req, socket, head)) return true;
+      // V3: v2 /ws/chat 已删除;只剩 /ws/agent(legacy)和 P2-2E 的 /ws/user-chat-bridge(待加)。
       if (agentWsHandler && agentWsHandler.handleUpgrade(req, socket, head)) return true;
       return false;
     },
     shutdown: async () => {
-      try { await wsHandler.shutdown(); } catch { /* ignore */ }
       if (agentWsHandler) {
         try { await agentWsHandler.shutdown(); } catch { /* ignore */ }
       }
@@ -415,8 +396,6 @@ export type {
   PreCheckInput,
   PreCheckResult,
 } from "./billing/preCheck.js";
-export { stubChatLLM } from "./http/chat.js";
-export type { ChatLLM, ChatBody } from "./http/chat.js";
 export {
   signHupijiao,
   verifyHupijiao,
@@ -537,47 +516,10 @@ export type {
   ProxyDeps,
   StreamClaudeInput,
 } from "./account-pool/proxy.js";
-// T-40: Chat orchestrator(pick + refresh + stream 三件套组合)
-export {
-  runClaudeChat,
-  ERR_ACCOUNT_POOL_UNAVAILABLE as CHAT_ERR_ACCOUNT_POOL_UNAVAILABLE,
-  ERR_REFRESH_FAILED,
-  ERR_UPSTREAM,
-  ERR_UPSTREAM_AUTH,
-  ERR_ACCOUNT_BROKEN,
-  ERR_INTERNAL as CHAT_ERR_INTERNAL,
-} from "./chat/orchestrator.js";
-export type {
-  ChatEvent,
-  ChatLogger,
-  RunChatInput,
-  RunChatDeps,
-} from "./chat/orchestrator.js";
-// T-40: 扣费 / usage_records 写入工具(ws/chat 与 http/chat 共享)
-export {
-  debitChatSuccess,
-  recordChatError,
-  InsufficientCreditsAfterPreCheckError,
-  UserGoneError,
-} from "./chat/debit.js";
-export type {
-  DebitChatSuccessInput,
-  DebitChatSuccessResult,
-  RecordChatErrorInput,
-} from "./chat/debit.js";
-// T-40b: /ws/chat WebSocket handler
-export {
-  createChatWsHandler,
-  DEFAULT_MAX_FRAME_BYTES,
-  DEFAULT_START_TIMEOUT_MS,
-} from "./ws/chat.js";
-export type {
-  ChatWsHandler,
-  ChatWsDeps,
-  ChatWsLogger,
-  ChatStartFrame,
-  ChatServerFrame,
-} from "./ws/chat.js";
+// V3 Phase 2: T-40/T-40b/T-41 v2 chat orchestrator(chat/orchestrator.ts、chat/debit.ts、
+// ws/chat.ts、http/chat.ts)已删除 — v3 chat 不再走 commercial 进程出口,改由用户的
+// docker 容器跑个人版 → 经 anthropicProxy(2D 待加)统一访问上游。
+// 仍然保留 ws/connections.ts(legacy /ws/agent 用)。
 export {
   ConnectionRegistry,
   DEFAULT_MAX_PER_USER,
@@ -586,8 +528,6 @@ export type {
   Conn,
   RegisterResult,
 } from "./ws/connections.js";
-// T-41: POST /api/chat 的 LLM 适配器 —— runClaudeChat → ChatLLM
-export { createChatLLMFromRunChat } from "./http/chat.js";
 // T-53: Agent 订阅 + 生命周期
 export {
   openAgentSubscription,
