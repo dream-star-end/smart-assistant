@@ -866,8 +866,10 @@ async function settleUsageAndLedger(
       );
       if (before.rowCount === 0) throw new Error(`user ${args.userId} not found`);
       const balance = BigInt(before.rows[0]!.credits);
-      // 余额 < cost:不再回滚 stream(已发字节回不来),设 status='billing_failed'
-      // 并把扣费金额夹到余额,balance_after = 0
+      // 余额 < cost:不再回滚 stream(已发字节回不来),把扣费金额 clamp 到余额。
+      // status 仍是 'success' (业务上已交付完整流), ledger memo 标 'clamped' 并把
+      // billing_debit_total{result="insufficient"} +1 (由 runCommit 根据 settled.clamped 上报)。
+      // balance_after = 0,用户回到 0 再充值。
       const debit = balance < args.costCredits ? balance : args.costCredits;
       clamped = debit < args.costCredits;
       const newBalance = balance - debit;
