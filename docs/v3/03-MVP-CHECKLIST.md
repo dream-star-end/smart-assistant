@@ -39,7 +39,7 @@
 | **2F** | `commercial/src/http/models.ts` GET `/api/models`(从 model_pricing 过滤 enabled) | — | ✅ | (复用 `/api/public/models` handler 加 alias 路由) |
 | **2G** | `commercial/src/user/preferences.ts` GET/PATCH `/api/me/preferences` | 2B | ✅ | (zod strict + JSONB shallow merge / null delete + 27 tests) |
 | **2H** | gateway `server.ts` 接入 commercialHandle + WS upgrade 路由 + `/healthz` 包含 commercial 状态 | 2A-2G | ✅ | (anthropic proxy listener on `INTERNAL_PROXY_BIND:PORT` + userChatBridge stub + Gateway 接入 + 7 integ tests) |
-| **2I-2** | prom-client `/metrics`:TTFT、stream duration、settle 三态分布、preCheck reject、billing_debit_failures_total、ws_bridge_buffered_bytes | 2H | ✅ | (扩 hand-rolled 暴露,新增 6 个系列 + 12 个 unit test) |
+| **2I-2** | prom-client `/metrics`:TTFT、stream duration、settle 三态分布、preCheck reject、billing_debit_failures_total、ws_bridge_buffered_bytes | 2H | ✅ | df02aec |
 | **2J-1** | host 侧网络隔离:ufw 规则 + Caddyfile grep CI(`/internal/` 不能出现在 site config)+ `openclaude-v3-net` 子网创建 + IPv6 显式禁用 | 2D | ⏳ | — |
 
 ## Phase 3 — 容器调度(P0 必备,**单轨 ephemeral**)
