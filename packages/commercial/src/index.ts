@@ -540,6 +540,19 @@ export type {
   LogLevel,
   LoggerOptions,
 } from "./logging/logger.js";
+// V3 Phase 2 Task 2C: 容器身份双因子校验
+export {
+  verifyContainerIdentity,
+  parseContainerToken,
+  hashSecret,
+  compareHash,
+  createPgIdentityRepo,
+  ContainerIdentityError,
+} from "./auth/containerIdentity.js";
+export type {
+  ContainerIdentity,
+  ContainerIdentityRepo,
+} from "./auth/containerIdentity.js";
 // T-53: Agent 订阅 + 生命周期
 export {
   openAgentSubscription,
