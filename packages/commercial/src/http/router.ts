@@ -73,6 +73,9 @@ import {
   handleAdminAgentContainerAction,
   handleAdminListLedger,
   handleAdminMetrics,
+  handleAdminListSettings,
+  handleAdminGetSetting,
+  handleAdminPutSetting,
 } from "./admin.js";
 import { incrGatewayRequest } from "../admin/metrics.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
@@ -167,6 +170,10 @@ export function createCommercialHandler(
     { method: "GET", path: "/api/admin/ledger", handler: handleAdminListLedger },
     // T-62 Prometheus 指标
     { method: "GET", path: "/api/admin/metrics", handler: handleAdminMetrics },
+    // V3 Phase 4H 超管运行时设置(allowlist + per-key zod)
+    { method: "GET", path: "/api/admin/settings",         handler: handleAdminListSettings },
+    { method: "GET", pathPrefix: "/api/admin/settings/",  handler: handleAdminGetSetting },
+    { method: "PUT", pathPrefix: "/api/admin/settings/",  handler: handleAdminPutSetting },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [

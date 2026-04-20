@@ -71,6 +71,17 @@ import {
 import { AccountNotFoundError, type AccountRow } from "../account-pool/store.js";
 import { adminAdjust, InsufficientCreditsError } from "../billing/ledger.js";
 import { renderPrometheus } from "../admin/metrics.js";
+import {
+  listSystemSettings,
+  getSystemSetting,
+  setSystemSetting,
+  ALLOWED_KEYS,
+  KEY_META,
+  SystemSettingNotFoundError,
+  SystemSettingValidationError,
+  type SystemSettingKey,
+  type SystemSettingRow,
+} from "../admin/systemSettings.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
 
 // ─── shared helpers ──────────────────────────────────────────────────
@@ -937,4 +948,118 @@ export async function handleAdminMetrics(
   res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
   res.end(body);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// V3 Phase 4H — system_settings(超管运行时开关)
+// ════════════════════════════════════════════════════════════════════
+
+function serializeSetting(row: SystemSettingRow): Record<string, unknown> {
+  return {
+    key: row.key,
+    value: row.value,
+    description: row.description,
+    updated_at: row.updated_at,
+    updated_by: row.updated_by,
+    is_default: row.is_default,
+    meta: KEY_META[row.key],
+  };
+}
+
+function extractTailKey(url: URL, prefix: string): SystemSettingKey {
+  const tail = url.pathname.slice(prefix.length);
+  if (!(ALLOWED_KEYS as readonly string[]).includes(tail)) {
+    throw new HttpError(404, "NOT_FOUND", `unknown setting key: ${tail || "<empty>"}`);
+  }
+  return tail as SystemSettingKey;
+}
+
+// ─── GET /api/admin/settings ──────────────────────────────────────
+//
+// 列全部 allowlist key 的当前值(行不存在 → DEFAULTS,is_default=true)。
+export async function handleAdminListSettings(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const rows = await listSystemSettings();
+  sendJson(res, 200, { rows: rows.map(serializeSetting) });
+}
+
+// ─── GET /api/admin/settings/:key ─────────────────────────────────
+
+export async function handleAdminGetSetting(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const key = extractTailKey(url, "/api/admin/settings/");
+  try {
+    const row = await getSystemSetting(key);
+    sendJson(res, 200, { setting: serializeSetting(row) });
+  } catch (err) {
+    if (err instanceof SystemSettingNotFoundError) {
+      throw new HttpError(404, "NOT_FOUND", err.message);
+    }
+    throw err;
+  }
+}
+
+// ─── PUT /api/admin/settings/:key ─────────────────────────────────
+//
+// body: { value: <type-by-key>, description?: string | null }
+export async function handleAdminPutSetting(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const key = extractTailKey(url, "/api/admin/settings/");
+
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  if (!("value" in b)) {
+    throw new HttpError(400, "VALIDATION", "value is required", {
+      issues: [{ path: "value", message: "missing" }],
+    });
+  }
+  let description: string | null | undefined;
+  if (b.description !== undefined) {
+    if (b.description !== null && typeof b.description !== "string") {
+      throw new HttpError(400, "VALIDATION", "description must be string or null", {
+        issues: [{ path: "description", message: String(b.description) }],
+      });
+    }
+    description = b.description;
+  }
+
+  try {
+    const row = await setSystemSetting(key, b.value, {
+      adminId: admin.id,
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+      description,
+    });
+    sendJson(res, 200, { setting: serializeSetting(row) });
+  } catch (err) {
+    if (err instanceof SystemSettingNotFoundError) {
+      throw new HttpError(404, "NOT_FOUND", err.message);
+    }
+    if (err instanceof SystemSettingValidationError) {
+      throw new HttpError(400, "VALIDATION", err.message, {
+        issues: err.issues.map((m) => ({ path: "value", message: m })),
+      });
+    }
+    throw err;
+  }
 }
