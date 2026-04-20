@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=30" />
+<link rel="stylesheet" href="/style.css?v=31" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -327,6 +327,11 @@
       <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">
         我们已向 <span id="auth-register-success-email" style="color:var(--fg)"></span> 发送验证邮件,请查收并点击链接完成验证。
       </p>
+      <div id="auth-register-waiting" style="margin-top:var(--space-3);display:flex;align-items:center;justify-content:center;gap:var(--space-2);color:var(--fg-muted);font-size:var(--text-xs)">
+        <span class="auth-spinner" aria-hidden="true"></span>
+        <span>正在等待邮箱验证 — 在任意设备点击邮件链接后,本页会自动跳转登录</span>
+      </div>
+      <button id="auth-register-back-btn" type="button" class="btn btn-ghost" style="margin-top:var(--space-3);font-size:13px">返回登录</button>
     </div>
   </div>
 
@@ -1078,6 +1083,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=29"></script>
+<script type="module" src="/modules/main.js?v=30"></script>
 </body>
 </html>

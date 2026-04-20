@@ -135,10 +135,20 @@ let _resetToken = ''
 let _verifyToken = ''
 const _getTokenFns = {} // mode → fn returning turnstile response
 
+// Cross-device verification poll state (started after register success).
+// Cleared on mode switch / page hide / verified=true.
+let _verifyPollTimer = null
+let _verifyPollEmail = ''
+let _verifyPollStartedAt = 0
+const VERIFY_POLL_INTERVAL_MS = 4000
+const VERIFY_POLL_MAX_MS = 10 * 60 * 1000 // 10 min
+
 export function getCurrentMode() { return _currentMode }
 
 export function setMode(mode) {
   if (!MODES.includes(mode)) mode = 'login'
+  // Switching away from register kills any verify-pending poll
+  if (mode !== 'register') _stopVerifyPoll()
   _currentMode = mode
   _clearError()
   for (const m of MODES) {
@@ -204,6 +214,28 @@ export async function initAuth() {
   $('auth-reset-btn')?.addEventListener('click', _doConfirmReset)
   $('auth-resend-verify-btn')?.addEventListener('click', _doResendVerification)
   $('auth-verify-back-btn')?.addEventListener('click', () => setMode('login'))
+  $('auth-register-back-btn')?.addEventListener('click', () => {
+    // Reset register sub-view back to the form for next time
+    const form = $('auth-register-form')
+    const ok = $('auth-register-success')
+    if (form) form.hidden = false
+    if (ok) ok.hidden = true
+    setMode('login')
+  })
+
+  // Pause polling while tab is hidden — saves bandwidth + dodges throttling
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (_verifyPollTimer) {
+        clearTimeout(_verifyPollTimer)
+        _verifyPollTimer = null
+      }
+    } else if (_verifyPollEmail && !_verifyPollTimer && _currentMode === 'register') {
+      // Resume + check immediately on tab focus (catches verifications that
+      // happened while we were backgrounded)
+      _scheduleVerifyPoll(0)
+    }
+  })
 
   // Enter key submits
   for (const [inputId, btnId] of [
@@ -300,7 +332,90 @@ async function _doRegister() {
     $('auth-register-form').hidden = true
     $('auth-register-success').hidden = false
     $('auth-register-success-email').textContent = email
+    // Kick off cross-device verification polling
+    _startVerifyPoll(email)
   })
+}
+
+// ───────── Cross-device email-verify polling ─────────
+// After register success we don't know which device the user will open the
+// verification mail on. Poll the backend every 4s; when verified=true,
+// switch to login mode with email pre-filled.
+function _startVerifyPoll(email) {
+  _stopVerifyPoll()
+  _verifyPollEmail = email
+  _verifyPollStartedAt = Date.now()
+  _scheduleVerifyPoll(VERIFY_POLL_INTERVAL_MS)
+}
+
+function _stopVerifyPoll() {
+  if (_verifyPollTimer) {
+    clearTimeout(_verifyPollTimer)
+    _verifyPollTimer = null
+  }
+  _verifyPollEmail = ''
+  _verifyPollStartedAt = 0
+}
+
+function _scheduleVerifyPoll(delayMs) {
+  if (_verifyPollTimer) clearTimeout(_verifyPollTimer)
+  _verifyPollTimer = setTimeout(_pollVerifyOnce, delayMs)
+}
+
+async function _pollVerifyOnce() {
+  _verifyPollTimer = null
+  if (!_verifyPollEmail) return
+  // Time-bound the loop so we don't poll forever if the user wandered off
+  if (Date.now() - _verifyPollStartedAt > VERIFY_POLL_MAX_MS) {
+    const w = $('auth-register-waiting')
+    if (w) w.innerHTML = '<span style="color:var(--fg-muted)">已停止自动检查 — 请手动返回登录</span>'
+    _stopVerifyPoll()
+    return
+  }
+  const email = _verifyPollEmail
+  try {
+    const r = await apiFetch(
+      '/api/auth/check-verification?email=' + encodeURIComponent(email),
+      { method: 'GET', suppressAuthRedirect: true },
+    )
+    const data = await r.json().catch(() => ({}))
+    if (r.ok && data?.verified === true) {
+      // Verified! switch to login with email pre-filled
+      _stopVerifyPoll()
+      // Reset register sub-view so re-entering shows the form
+      const form = $('auth-register-form')
+      const ok = $('auth-register-success')
+      if (form) form.hidden = false
+      if (ok) ok.hidden = true
+      setMode('login')
+      const loginEmail = $('auth-login-email')
+      if (loginEmail) loginEmail.value = email
+      // Pre-fill + show a one-shot confirmation banner above the form
+      _showError('') // clear
+      const banner = $('login-error')
+      if (banner) {
+        banner.style.display = 'block'
+        banner.style.color = 'var(--success, #2da44e)'
+        banner.textContent = '✓ 邮箱验证成功 — 现在可以登录了'
+        // Restore color on next error
+        setTimeout(() => {
+          if (banner.textContent && banner.textContent.startsWith('✓')) {
+            banner.style.color = ''
+            banner.style.display = 'none'
+            banner.textContent = ''
+          }
+        }, 6000)
+      }
+      $('auth-login-password')?.focus()
+      return
+    }
+  } catch {
+    // network blip — fall through and reschedule
+  }
+  // Not verified yet — reschedule, but only if user is still on register tab
+  if (_currentMode === 'register' && _verifyPollEmail && !document.hidden) {
+    _scheduleVerifyPoll(VERIFY_POLL_INTERVAL_MS)
+  }
 }
 
 async function _doRequestReset() {

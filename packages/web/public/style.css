@@ -585,6 +585,18 @@ a:hover {
   color: var(--fg);
 }
 
+/* ── Tiny inline spinner used in register-success "waiting for verify" row ── */
+.auth-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+  flex: 0 0 auto;
+}
+
 /* ── Light theme tweaks for aside ── */
 :root[data-theme="light"] .login-aside-bg {
   background:

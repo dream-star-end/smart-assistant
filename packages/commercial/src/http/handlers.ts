@@ -229,6 +229,43 @@ export async function handleResendVerification(
   sendJson(res, 200, { accepted: r.accepted });
 }
 
+// ─── GET /api/auth/check-verification?email=xxx ─────────────────────
+// 跨设备邮箱验证状态查询。前端注册成功后轮询此端点 —— 当用户在另一台
+// 设备(如手机)点开验证邮件后,原桌面端注册页能自动检测并跳转到登录。
+//
+// 反枚举:无论 email 是否存在、是否拼写有效,一律 200 + verified=false。
+// 真正命中且已验证才返 verified=true。
+//
+// 调用频率:前端 4s 一次 / 最多 10 分钟,所以默认限流给到 30/分钟,
+// 既能支撑单用户正常轮询,又能挡住按 email 撞库枚举的滥用。
+
+export async function handleCheckVerification(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const cfg: RateLimitConfig = { scope: "check_verification", windowSeconds: 60, max: 30 };
+  await enforceRateLimit(deps, cfg, ctx.clientIp);
+
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const emailRaw = url.searchParams.get("email") ?? "";
+  const email = emailRaw.trim().toLowerCase();
+
+  // 反枚举:无效格式直接返 false,而不是 400
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    sendJson(res, 200, { verified: false });
+    return;
+  }
+
+  const result = await query<{ email_verified: boolean }>(
+    `SELECT email_verified FROM users WHERE email = $1`,
+    [email],
+  );
+  const verified = result.rows.length > 0 && result.rows[0].email_verified === true;
+  sendJson(res, 200, { verified });
+}
+
 // ─── POST /api/auth/refresh ─────────────────────────────────────────
 
 export async function handleRefresh(
