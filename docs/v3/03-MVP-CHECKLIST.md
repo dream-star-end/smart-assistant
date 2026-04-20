@@ -38,7 +38,7 @@
 | **2E** | `commercial/src/ws/userChatBridge.ts` 用户 WS ↔ 容器 WS 桥 + 测试 | 2I-1 | ✅ | 19a9807 |
 | **2F** | `commercial/src/http/models.ts` GET `/api/models`(从 model_pricing 过滤 enabled) | — | ✅ | (复用 `/api/public/models` handler 加 alias 路由) |
 | **2G** | `commercial/src/user/preferences.ts` GET/PATCH `/api/me/preferences` | 2B | ✅ | (zod strict + JSONB shallow merge / null delete + 27 tests) |
-| **2H** | gateway `server.ts` 接入 commercialHandle + WS upgrade 路由 + `/healthz` 包含 commercial 状态 | 2A-2G | ⏳ | — |
+| **2H** | gateway `server.ts` 接入 commercialHandle + WS upgrade 路由 + `/healthz` 包含 commercial 状态 | 2A-2G | ✅ | (anthropic proxy listener on `INTERNAL_PROXY_BIND:PORT` + userChatBridge stub + Gateway 接入 + 7 integ tests) |
 | **2I-2** | prom-client `/metrics`:TTFT、stream duration、settle 三态分布、preCheck reject、billing_debit_failures_total、ws_bridge_buffered_bytes | 2H | ⏳ | — |
 | **2J-1** | host 侧网络隔离:ufw 规则 + Caddyfile grep CI(`/internal/` 不能出现在 site config)+ `openclaude-v3-net` 子网创建 + IPv6 显式禁用 | 2D | ⏳ | — |
 
@@ -97,3 +97,4 @@
 - **2026-04-20** 创建本文件,基于 02-DEVELOPMENT-PLAN.md R6.11.y(codex 第二十四轮 APPROVE)。剪枝结论 boss 已授权"按你想法搞,直到部署上线"。开始 Phase 2 实施。
 - **2026-04-20** Task 2B 完成(45f26ac):0011_user_preferences / 0012_agent_containers_v3(双因子 + state 单轨)/ 0015_request_finalize_journal 三张迁移;0013-0014 跳号说明已写在 migrate.ts 整数序列校验中。dry-run 干净。
 - **2026-04-20** Task 2A 完成(de87712):4 个 v2 chat 源文件 + 5 个测试 + 11 处 index.ts/router.ts/handlers.ts 引用全部清理。tsc 0 error,bun test pass 数量减少完全归因于 5 个删除的测试文件(523 vs 543 = -20 chat 测试)。account-pool 全套保留(2D anthropicProxy 复用)。下一步:2I-1 requestId middleware + pino schema。
+- **2026-04-20** Task 2H 完成:registerCommercial 现在会 spawn anthropicProxy listener(`INTERNAL_PROXY_BIND:INTERNAL_PROXY_PORT`,默认未配置则跳过) + 挂 userChatBridge(默认 stub `resolveContainerEndpoint` 抛 `ContainerUnreadyError(5,"supervisor_not_wired")` → ws 4503,等 3D 替成真 supervisor)。Gateway 引入鸭子类型 `CommercialHook`(零 commercial 编译依赖) + WS upgrade 改 `noServer:true` 手动 dispatch(commercial 优先 → 自身 `/ws` 兜底)+ `/healthz` 暴露 `commercial.internalProxy` + Stage 3.5 调用 `commercial.shutdown()`。CLI 仅在 `COMMERCIAL_ENABLED=1` 时 `await import('@openclaude/commercial')` 注入。新增 7 个 integ 测试(`registerCommercialV3_2H.integ.test.ts`),405 unit + 342 integ 全绿,commercial/gateway/cli 三包 typecheck 干净。4 个 gateway 老测试失败为 pre-existing(git stash 验证过非本任务引入)。下一步:2I-2 prom-client `/metrics`。

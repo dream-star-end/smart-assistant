@@ -1,6 +1,6 @@
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Gateway, log } from '@openclaude/gateway'
+import { Gateway, log, type CommercialHook } from '@openclaude/gateway'
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
 import { type OpenClaudeConfig, readAgentsConfig, readConfig } from '@openclaude/storage'
 
@@ -119,6 +119,20 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     }
   }
 
-  gw = new Gateway({ config, agentsConfig, webRoot, channelFactories })
+  // V3 Phase 2 Task 2H: 仅当 COMMERCIAL_ENABLED=1 时挂商业化模块。
+  // dynamic-import 是为了让 personal 部署不背负 commercial 包的副作用 import(pg/redis/dockerode)。
+  let commercial: CommercialHook | undefined
+  if (process.env.COMMERCIAL_ENABLED === '1') {
+    try {
+      const mod = await import('@openclaude/commercial')
+      commercial = await mod.registerCommercial(null)
+      console.log('[cli] commercial module registered (v3 mode)')
+    } catch (err) {
+      console.error('[cli] COMMERCIAL_ENABLED=1 但 registerCommercial 失败:', err)
+      process.exit(1)
+    }
+  }
+
+  gw = new Gateway({ config, agentsConfig, webRoot, channelFactories, commercial })
   await gw.start()
 }

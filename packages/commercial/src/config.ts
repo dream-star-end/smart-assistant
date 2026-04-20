@@ -173,6 +173,36 @@ const agentLifecycleTickMs = z
   .refine((n) => n >= 60_000 && n <= 86_400_000, "AGENT_LIFECYCLE_TICK_MS must be in [60_000, 86_400_000]")
   .optional();
 
+/**
+ * V3 Phase 2 Task 2H: Anthropic 中央代理(2D)的内部监听地址。
+ *
+ * 拓扑:容器内 OpenClaude → POST http://${INTERNAL_PROXY_BIND}:${INTERNAL_PROXY_PORT}/v1/messages
+ *
+ * 默认 `172.30.0.1` = docker bridge 网关地址(2J-1 由 ufw 兜底,只允许该桥网段命中 18791)。
+ * 端口默认 18791。两者 optional —— 单机 dev 可换成 127.0.0.1 端口探活;
+ * 不监听时(env 缺失)代理静默不启动,/api/admin/anthropic-proxy/* 才会暴露状态。
+ *
+ * **绝不允许 0.0.0.0 / ::** —— 那等于把内部代理裸暴公网,配合 verifyContainerIdentity
+ * 的 peerIp 因子被任意伪造。如果检测到 wildcard bind 直接抛 ConfigError。
+ */
+const INTERNAL_BIND_FORBIDDEN = new Set(["0.0.0.0", "::", "*"]);
+const internalProxyBind = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .refine(
+    (v) => !INTERNAL_BIND_FORBIDDEN.has(v),
+    "INTERNAL_PROXY_BIND must not be 0.0.0.0/::; bind to docker bridge IP only",
+  )
+  .optional();
+const internalProxyPort = z
+  .string()
+  .regex(/^\d+$/, "INTERNAL_PROXY_PORT must be a positive integer")
+  .transform((v) => Number.parseInt(v, 10))
+  .refine((n) => n > 0 && n < 65536, "INTERNAL_PROXY_PORT must be in (0, 65535]")
+  .optional();
+
 export const commercialConfigSchema = z
   .object({
     DATABASE_URL: databaseUrl,
@@ -200,6 +230,8 @@ export const commercialConfigSchema = z
     AGENT_PLAN_DURATION_DAYS: agentPlanDurationDays,
     AGENT_VOLUME_GC_DAYS: agentVolumeGcDays,
     AGENT_LIFECYCLE_TICK_MS: agentLifecycleTickMs,
+    INTERNAL_PROXY_BIND: internalProxyBind,
+    INTERNAL_PROXY_PORT: internalProxyPort,
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。

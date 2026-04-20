@@ -11,6 +11,7 @@
  */
 
 import type { IncomingMessage } from "node:http";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import type { Duplex } from "node:stream";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -37,6 +38,17 @@ import {
 } from "./agent/index.js";
 import type { AgentHttpDeps } from "./http/agent.js";
 import { startAlertScheduler, type AlertScheduler } from "./admin/alerts.js";
+import {
+  makeAnthropicProxyHandler,
+  type AnthropicProxyHandler,
+} from "./http/anthropicProxy.js";
+import { createPgIdentityRepo } from "./auth/containerIdentity.js";
+import {
+  createUserChatBridge,
+  ContainerUnreadyError,
+  type ResolveContainerEndpoint,
+  type UserChatBridgeHandler,
+} from "./ws/userChatBridge.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -81,6 +93,14 @@ export interface RegisterCommercialResult {
   handleWsUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => boolean;
   /** 关闭所有商业化资源(pool / redis / ws)。 */
   shutdown: () => Promise<void>;
+  /**
+   * V3 2H:内部 anthropic 代理监听地址(`{host, port}`),用于:
+   *   - /healthz 反映启用状态
+   *   - 测试断言代理已上线
+   *   - dev 工具按地址探活
+   * 未启用(env 缺失 / skipInternalProxy / 监听失败)时为 undefined。
+   */
+  internalProxyAddress?: { host: string; port: number };
 }
 
 /**
@@ -100,6 +120,20 @@ export async function registerCommercial(
   options: {
     /** 测试可注入 jwt secret 而非从 env 读 */
     jwtSecret?: string | Uint8Array;
+    /**
+     * V3 Phase 2 Task 2H:用户 WS 桥接的容器端点解析器。
+     *
+     * 默认实现:始终 throw `ContainerUnreadyError(retryAfterSec=5, "supervisor_not_wired")`,
+     * 使前端按 4503 重试。Phase 3D 的 supervisor.ensureRunning 应注入实现替换。
+     *
+     * 测试可注入 stub 直接返回 host/port。
+     */
+    resolveContainerEndpoint?: ResolveContainerEndpoint;
+    /**
+     * V3 Phase 2 Task 2H:跳过启动内部 anthropic 代理 listener(测试默认 true 避免抢端口)。
+     * 生产侧由 cli launcher 显式置 false 让代理上线;dev/CI 不需要。
+     */
+    skipInternalProxy?: boolean;
   } = {},
 ): Promise<RegisterCommercialResult> {
   void app;
@@ -274,7 +308,77 @@ export async function registerCommercial(
   );
   const healthTracker = new AccountHealthTracker({ redis: healthRedis });
   const scheduler = new AccountScheduler({ health: healthTracker });
-  void scheduler; // TODO 2D: 注入 anthropicProxy
+
+  // V3 Phase 2 Task 2H:启动内部 Anthropic 代理监听(供容器内 OpenClaude 出站调用)。
+  //
+  // 非启用条件(任一即跳过,只 log warn 不阻塞主流程):
+  //   - options.skipInternalProxy(测试用)
+  //   - 缺 INTERNAL_PROXY_BIND / INTERNAL_PROXY_PORT
+  //   - 任何监听异常 → 仅 log + 跳过(/healthz 会反映 internalProxy=false)
+  //
+  // 强约束:bind 已在 config.ts schema 拒绝 0.0.0.0/::,这里不再二次校验。
+  const proxyBind = cfg.INTERNAL_PROXY_BIND;
+  const proxyPort = cfg.INTERNAL_PROXY_PORT;
+  let internalProxyServer: HttpServer | undefined;
+  let internalProxyHandler: AnthropicProxyHandler | undefined;
+  let internalProxyAddress: { host: string; port: number } | undefined;
+  if (!options.skipInternalProxy && proxyBind && proxyPort !== undefined) {
+    try {
+      const identityRepo = createPgIdentityRepo(getPool());
+      // proxy 模块需要 RateLimitRedis;wrapIoredis 已经满足 incr/expire/ttl 三方法
+      const rateLimitRedis = wrapIoredis(redis);
+      internalProxyHandler = makeAnthropicProxyHandler({
+        pgPool: getPool(),
+        pricing,
+        preCheckRedis,
+        scheduler,
+        identityRepo,
+        rateLimitRedis,
+      });
+      internalProxyServer = createHttpServer((req, res) => {
+        // peerIp 取 socket.remoteAddress(IP-only,无端口);verifyContainerIdentity 接受 string|undefined
+        const peerIp = req.socket.remoteAddress ?? "";
+        Promise.resolve(internalProxyHandler!(req, res, peerIp)).catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error("[commercial] anthropicProxy handler threw:", err);
+          if (!res.headersSent) {
+            try {
+              res.statusCode = 500;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: { code: "INTERNAL", message: "proxy error" } }));
+            } catch { /* socket gone */ }
+          } else {
+            try { res.end(); } catch { /* */ }
+          }
+        });
+      });
+      // 同步监听 + 转 promise:监听失败立即 throw,主流程 catch 后降级
+      await new Promise<void>((resolve, reject) => {
+        internalProxyServer!.once("error", reject);
+        internalProxyServer!.listen(proxyPort, proxyBind, () => {
+          internalProxyServer!.removeListener("error", reject);
+          resolve();
+        });
+      });
+      internalProxyAddress = { host: proxyBind, port: proxyPort };
+      // eslint-disable-next-line no-console
+      console.log(
+        `[commercial] internal anthropic proxy listening on ${proxyBind}:${proxyPort}`,
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[commercial] internal proxy listener failed; disabling:", err);
+      try { internalProxyServer?.close(); } catch { /* */ }
+      internalProxyServer = undefined;
+      internalProxyHandler = undefined;
+      internalProxyAddress = undefined;
+    }
+  } else if (!options.skipInternalProxy) {
+    // eslint-disable-next-line no-console
+    console.log(
+      "[commercial] internal anthropic proxy disabled; missing INTERNAL_PROXY_BIND / INTERNAL_PROXY_PORT",
+    );
+  }
 
   // T-12+ 真实 mailer:env 配 RESEND_API_KEY 后切到 Resend,否则保留 stub(dev/测试)。
   const resendKey = process.env.RESEND_API_KEY?.trim();
@@ -320,6 +424,18 @@ export async function registerCommercial(
     });
   }
 
+  // V3 Phase 2 Task 2H:用户 WS ↔ 容器 WS 桥接(/ws/user-chat-bridge)。
+  // Phase 2 注入 stub resolveContainerEndpoint,Phase 3D 由 supervisor 替换。
+  const resolveContainerEndpoint: ResolveContainerEndpoint =
+    options.resolveContainerEndpoint
+    ?? (async (_uid: bigint): Promise<{ host: string; port: number }> => {
+      throw new ContainerUnreadyError(5, "supervisor_not_wired");
+    });
+  const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
+    jwtSecret,
+    resolveContainerEndpoint,
+  });
+
   // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
   let alertScheduler: AlertScheduler | undefined;
   if (process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
@@ -335,11 +451,13 @@ export async function registerCommercial(
   return {
     handle: handler,
     handleWsUpgrade: (req, socket, head) => {
-      // V3: v2 /ws/chat 已删除;只剩 /ws/agent(legacy)和 P2-2E 的 /ws/user-chat-bridge(待加)。
+      // V3: 优先匹配 /ws/user-chat-bridge(2E),其次 /ws/agent(legacy)。
+      if (userChatBridge.handleUpgrade(req, socket, head)) return true;
       if (agentWsHandler && agentWsHandler.handleUpgrade(req, socket, head)) return true;
       return false;
     },
     shutdown: async () => {
+      try { await userChatBridge.shutdown(); } catch { /* ignore */ }
       if (agentWsHandler) {
         try { await agentWsHandler.shutdown(); } catch { /* ignore */ }
       }
@@ -349,10 +467,22 @@ export async function registerCommercial(
       if (alertScheduler) {
         try { await alertScheduler.stop(); } catch { /* ignore */ }
       }
+      if (internalProxyServer) {
+        await new Promise<void>((resolve) => {
+          try {
+            internalProxyServer!.close(() => resolve());
+            // 主动断现有连接,close 才能尽快回调
+            const closeAll = (internalProxyServer as unknown as { closeAllConnections?: () => void }).closeAllConnections;
+            if (typeof closeAll === "function") closeAll.call(internalProxyServer);
+          } catch { resolve(); }
+        });
+      }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closePool();
     },
+    /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */
+    internalProxyAddress,
   };
 }
 

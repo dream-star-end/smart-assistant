@@ -42,11 +42,32 @@ import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
 
+/**
+ * V3 Phase 2 Task 2H: 商业化模块 hook 形状(只声明 gateway 需要的接口,
+ * 不依赖 @openclaude/commercial 的具体实现)。
+ *
+ * - `handle(req, res) → Promise<boolean>`:返 true 表示已处理,gateway 不再继续路由
+ * - `handleWsUpgrade(req, socket, head) → boolean`:同上,boolean 表示是否已 upgrade/destroy
+ * - `shutdown()`:在 _doShutdown Stage 3.5 调用(channels 之后,sessions 之前)
+ * - `internalProxyAddress`:供 /healthz 反映内部代理是否上线
+ *
+ * 故意不 import @openclaude/commercial — 保持 gateway 包对商业化模块零编译期依赖,
+ * cli launcher 负责 dynamic import + 注入。
+ */
+export interface CommercialHook {
+  handle: (req: IncomingMessage, res: ServerResponse) => boolean | Promise<boolean>
+  handleWsUpgrade: (req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => boolean
+  shutdown: () => Promise<void>
+  internalProxyAddress?: { host: string; port: number }
+}
+
 export interface GatewayDeps {
   config: OpenClaudeConfig
   agentsConfig: AgentsConfig
   webRoot?: string // 静态 web UI 目录
   channelFactories?: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter>
+  /** V3 2H: 商业化模块挂载点(undefined = 未启用)。由 cli launcher 在 COMMERCIAL_ENABLED=1 时注入。 */
+  commercial?: CommercialHook
 }
 
 export class Gateway {
@@ -210,7 +231,33 @@ export class Gateway {
     const { config } = this.deps
 
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
-    this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' })
+    // V3 2H: 改用 noServer + 手动 upgrade dispatch,以便商业化模块的 /ws/user-chat-bridge
+    // 与 /ws/agent 路径在 gateway 自身的 /ws 之前优先匹配。原 `path: '/ws'` 模式下
+    // ws lib 会对所有非 /ws 请求 socket.destroy(),把商业化路径吃掉。
+    this.wss = new WebSocketServer({ noServer: true })
+    this.httpServer.on('upgrade', (req, socket, head) => {
+      // 1) 商业化模块优先(/ws/user-chat-bridge / /ws/agent / 未来私有路径)
+      try {
+        if (this.deps.commercial?.handleWsUpgrade(req, socket, head)) return
+      } catch (err) {
+        this.log.error('commercial.handleWsUpgrade threw', undefined, err)
+        try { socket.destroy() } catch {}
+        return
+      }
+      // 2) gateway 自身 /ws(浏览器 ↔ gateway 的 ChannelAdapter 协议)
+      const url = req.url ?? '/'
+      // 只接受 exact `/ws` 或 `/ws?…` 路径,剩余的 4xx + close
+      const path = (() => { try { return new URL(url, 'http://x').pathname } catch { return url } })()
+      if (path === '/ws') {
+        this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit('connection', ws, req))
+        return
+      }
+      // 3) 不认识的 ws path:401 + close(对齐 ws lib 默认对未匹配路径的处理)
+      try {
+        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n')
+        socket.destroy()
+      } catch {}
+    })
 
     // WS keepalive: ping every 25s, terminate if no pong in 35s
     this._wsKeepaliveTimer = setInterval(() => {
@@ -665,6 +712,15 @@ export class Gateway {
       }
     }
 
+    // ── Stage 3.5: V3 2H — drain 商业化模块(close redis/pricing/anthropic proxy/ws bridge) ──
+    if (this.deps.commercial) {
+      try {
+        await this.deps.commercial.shutdown()
+      } catch (err) {
+        this.log.warn('commercial shutdown error', undefined, err)
+      }
+    }
+
     // ── Stage 4: drain sessions (kill CCB subprocesses, flush resume map) ──
     try {
       await this.sessions.shutdownAll()
@@ -720,6 +776,38 @@ export class Gateway {
       return
     }
 
+    // V3 2H: 商业化模块优先 — 其 router 自管 auth + 输入校验 + status code,
+    // 返 true 即"已处理",gateway 不再走自家 /api/auth/login 等路径。
+    // 必须在 security headers 之前,否则 commercial 自己设置的 CSP/headers 会被覆盖。
+    if (this.deps.commercial) {
+      const r = this.deps.commercial.handle(req, res)
+      if (r === true) return
+      if (r && typeof (r as Promise<boolean>).then === 'function') {
+        ;(r as Promise<boolean>)
+          .then((handled) => {
+            if (handled) return
+            this._handleHttpAfterCommercial(req, res)
+          })
+          .catch((err) => {
+            this.log.error('commercial.handle threw', undefined, err)
+            if (!res.headersSent) {
+              try {
+                res.statusCode = 500
+                res.setHeader('Content-Type', 'application/json')
+                res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'commercial error' } }))
+              } catch {}
+            } else {
+              try { res.end() } catch {}
+            }
+          })
+        return
+      }
+      // false 同步 → 走 gateway 路由
+    }
+    this._handleHttpAfterCommercial(req, res)
+  }
+
+  private _handleHttpAfterCommercial(req: IncomingMessage, res: ServerResponse): void {
     const reqStart = Date.now()
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
     const method = req.method ?? 'GET'
@@ -852,8 +940,21 @@ export class Gateway {
     }
 
     if (url.pathname === '/healthz') {
+      // V3 2H: /healthz 增加 commercial 模块状态(供运维快速判断 v2/v3 实例形态)
+      const c = this.deps.commercial
+      const body = c
+        ? {
+            ok: true,
+            commercial: {
+              enabled: true,
+              internalProxy: c.internalProxyAddress
+                ? { host: c.internalProxyAddress.host, port: c.internalProxyAddress.port }
+                : null,
+            },
+          }
+        : { ok: true }
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: true }))
+      res.end(JSON.stringify(body))
       return
     }
     if (path === '/metrics') {
