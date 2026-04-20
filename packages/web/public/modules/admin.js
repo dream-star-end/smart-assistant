@@ -439,19 +439,41 @@ function _readAccountForm(isCreate) {
   return body
 }
 
+// 模块级 state:OAuth 拿到的 state 跟 modal 共享
+let _oauthPendingState = null
+
 function openCreateAccountModal() {
+  _oauthPendingState = null
   openModal(`
     <h3>新建账号</h3>
-    <div class="form-row">
-      <button class="btn-primary" id="acc-oauth" type="button">
-        🔐 用 Claude 订阅授权 (OAuth)
-      </button>
-      <small style="display:block;margin-top:6px;color:var(--muted)">
-        点击后弹出 Claude 授权页;授权完成后把回调 URL 里的 code 粘回来,
-        access/refresh/expires 三栏会自动填好。
-      </small>
+
+    <div class="oauth-box" style="
+      border:1px solid #6366f1; border-radius:8px;
+      padding:14px; margin-bottom:16px; background:rgba(99,102,241,0.08);
+    ">
+      <div style="font-weight:600;margin-bottom:8px">🔐 用 Claude 订阅授权 (推荐)</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+        <button class="btn-primary" id="acc-oauth-open" type="button"
+                style="white-space:nowrap">① 打开授权页</button>
+        <span id="acc-oauth-hint" style="color:var(--muted);font-size:13px">
+          点左边 → 新页签授权 → 复制回调 URL 里的 code
+        </span>
+      </div>
+      <div id="acc-oauth-step2" style="display:none">
+        <label style="display:block;font-size:13px;color:var(--muted);margin-bottom:4px">
+          ② 粘贴 code(或整段回调 URL,会自动抽 code 参数):
+        </label>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="acc-oauth-code" placeholder="粘 code 或 URL" style="flex:1" />
+          <button class="btn-primary" id="acc-oauth-submit" type="button" style="white-space:nowrap">
+            ③ 换 token
+          </button>
+        </div>
+      </div>
     </div>
-    <hr style="margin:14px 0;border:0;border-top:1px solid var(--border, #ddd)" />
+
+    <hr style="margin:14px 0;border:0;border-top:1px solid var(--border,#333)" />
+
     ${_accountFormFields(null)}
     <div class="form-actions">
       <button id="acc-cancel">取消</button>
@@ -459,7 +481,8 @@ function openCreateAccountModal() {
     </div>
   `)
   $('acc-cancel').addEventListener('click', closeModal)
-  $('acc-oauth').addEventListener('click', () => runAdminClaudeOAuthFlow())
+  $('acc-oauth-open').addEventListener('click', oauthStartStep)
+  $('acc-oauth-submit').addEventListener('click', oauthExchangeStep)
   $('acc-ok').addEventListener('click', async () => {
     let body
     try { body = _readAccountForm(true) }
@@ -475,14 +498,8 @@ function openCreateAccountModal() {
   })
 }
 
-// Claude OAuth 引导(管理员"新建账号"用):
-//   1. POST /api/admin/accounts/oauth/start → { authUrl, state }
-//   2. window.open(authUrl) — 用户在新窗口里授权
-//   3. prompt("粘 code 或回调 URL") → 自动从 URL 抽 code= 参数
-//   4. POST /api/admin/accounts/oauth/exchange { code, state }
-//      → { access_token, refresh_token, expires_at }
-//   5. 把三个值填进表单,管理员点 "创建" 走标准入库
-async function runAdminClaudeOAuthFlow() {
+// 步骤一:让后端发 PKCE state、生成 authUrl,新页签打开
+async function oauthStartStep() {
   let started
   try {
     started = await apiJson('POST', '/api/admin/accounts/oauth/start', {})
@@ -495,45 +512,62 @@ async function runAdminClaudeOAuthFlow() {
     toast('OAuth 启动返回不完整', 'danger')
     return
   }
-  // 弹新窗口去授权;部分浏览器拦截 → fall back 到当前窗口提示用户手动打开
-  const w = window.open(authUrl, '_blank', 'width=720,height=860')
-  if (!w) {
-    if (!confirm('弹窗被拦截。点击确定在当前窗口打开授权页(完成后请回到本页粘 code)')) return
-    window.location.href = authUrl
+  _oauthPendingState = oauthState
+  // 新 tab 打开;被拦截时降级 location.href(本页跳走 — 但 modal state 已存模块级,
+  // 用户回来重开 modal 也能续上 oauthExchange,虽然 state 已重置为 null;
+  // 实践上多数浏览器允许 user-gesture-driven window.open)
+  const win = window.open(authUrl, '_blank', 'noopener')
+  if (!win) {
+    toast('弹窗被拦截。请手动复制下方链接到新页签打开。', 'danger')
+    $('acc-oauth-hint').innerHTML =
+      `授权 URL(自己复制到新 tab):<br><code style="font-size:12px;word-break:break-all">${escapeHtml(authUrl)}</code>`
+  } else {
+    $('acc-oauth-hint').textContent = '授权页已在新 tab 打开,完成后回来粘 code ↓'
+  }
+  $('acc-oauth-step2').style.display = 'block'
+  setTimeout(() => $('acc-oauth-code')?.focus(), 50)
+}
+
+// 步骤二:把 code 拿去后端换 token,自动填表单
+async function oauthExchangeStep() {
+  if (!_oauthPendingState) {
+    toast('请先点"打开授权页",再粘 code', 'danger')
     return
   }
-  // 用户在新窗口里授权,完成后页面会跳到 platform.claude.com 并展示一个 code。
-  // 让 admin 把整段回调 URL 或 code 复制回来。
-  const raw = prompt('授权完成后,把回调地址里的 code(或整个 URL)粘到这里:')
-  if (!raw) return
-  let code = raw.trim()
-  // 自动从 URL 里抽 code= 参数
+  const raw = $('acc-oauth-code')?.value?.trim()
+  if (!raw) { toast('请粘 code 或 URL', 'danger'); return }
+
+  let code = raw
   try {
     if (code.startsWith('http')) {
       const u = new URL(code)
       code = u.searchParams.get('code') || code
     }
-  } catch { /* 不是 URL,按 code 处理 */ }
-  // claude 回调 code 后面常带 #...,server 会再清一次 hash,这里也兜底
+  } catch { /* 不是合法 URL,当 code 用 */ }
   if (code.includes('#')) code = code.split('#')[0]
 
   let exchanged
+  const btn = $('acc-oauth-submit')
+  if (btn) { btn.disabled = true; btn.textContent = '交换中…' }
   try {
     exchanged = await apiJson('POST', '/api/admin/accounts/oauth/exchange', {
-      code, state: oauthState,
+      code, state: _oauthPendingState,
     })
   } catch (e) {
     toast(`Token 交换失败: ${e.message}`, 'danger')
     return
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '③ 换 token' }
   }
-  // 自动填表单
-  const tokenEl = $('acc-token')
-  const refreshEl = $('acc-refresh')
-  const expiresEl = $('acc-expires')
-  if (tokenEl) tokenEl.value = exchanged.access_token || ''
-  if (refreshEl) refreshEl.value = exchanged.refresh_token || ''
-  if (expiresEl) expiresEl.value = exchanged.expires_at || ''
-  toast('已拿到 token,核对 label/plan 后点"创建"', 'success')
+
+  _oauthPendingState = null
+  if ($('acc-token')) $('acc-token').value = exchanged.access_token || ''
+  if ($('acc-refresh')) $('acc-refresh').value = exchanged.refresh_token || ''
+  if ($('acc-expires')) $('acc-expires').value = exchanged.expires_at || ''
+  $('acc-oauth-hint').innerHTML =
+    '<span style="color:#10b981">✓ token 已写入下方表单。核对 label/plan 后点 "创建"</span>'
+  $('acc-oauth-step2').style.display = 'none'
+  toast('Token 已自动填好,核对 label/plan 后点"创建"', 'success')
 }
 
 async function openEditAccountModal(id) {
