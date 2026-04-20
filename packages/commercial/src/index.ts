@@ -553,6 +553,38 @@ export type {
   ContainerIdentity,
   ContainerIdentityRepo,
 } from "./auth/containerIdentity.js";
+// V3 Phase 2 Task 2D: 内部 Anthropic 中央代理(monolith)
+export {
+  makeAnthropicProxyHandler,
+  proxyBodySchema,
+  enforceFieldByteBudgets,
+  estimateInputTokens,
+  estimateMaxCostBothSides,
+  buildSafeUpstreamHeaders,
+  ConcurrencyLimiter,
+  pipeStreamWithUsageCapture,
+  startInflightJournal,
+  makeFinalizer,
+  DEFAULT_UPSTREAM_ENDPOINT,
+  ANTHROPIC_VERSION,
+  ALLOWED_BETA_VALUES,
+  SIZE_LIMITS,
+  MAX_BODY_BYTES_DEFAULT,
+  MAX_MESSAGES_COUNT,
+  MAX_TOOLS_COUNT,
+  CHARS_PER_TOKEN_ESTIMATE,
+  DEFAULT_PROXY_RATE_LIMIT,
+  DEFAULT_MAX_CONCURRENT_PER_UID,
+} from "./http/anthropicProxy.js";
+export type {
+  AnthropicProxyDeps,
+  AnthropicProxyHandler,
+  ProxyBody,
+  UsageObservation,
+  PipeStreamResult,
+  FinalizeContext,
+  FinalizeOutcome,
+} from "./http/anthropicProxy.js";
 // T-53: Agent 订阅 + 生命周期
 export {
   openAgentSubscription,
