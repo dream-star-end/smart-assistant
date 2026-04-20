@@ -65,6 +65,7 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js'
 import { initBilling, refreshBalance } from './billing.js'
+import { initUserPrefs, openPrefsModal } from './userPrefs.js'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -1598,6 +1599,7 @@ async function init() {
     else if (action === 'feedback') openFeedbackModal()
     else if (action === 'claude-oauth') openOAuthModal()
     else if (action === 'wechat') openWechatModal()
+    else if (action === 'prefs') openPrefsModal()
     else if (action === 'logout') $('logout-btn').click()
   })
   // Memory modal events
@@ -1759,6 +1761,7 @@ async function init() {
   })
   initAuth()
   initBilling()
+  initUserPrefs()
   // Palette input
   $('palette-input').addEventListener('input', (e) => {
     paletteItems = buildPaletteItems(e.target.value)

@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=24" />
+<link rel="stylesheet" href="/style.css?v=25" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -210,6 +210,7 @@
             <button class="settings-item" data-settings="changelog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>更新日志<span id="changelog-badge" class="changelog-badge" hidden></span></button>
             <button class="settings-item" data-settings="feedback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>发送反馈</button>
             <div class="settings-section-label">系统</div>
+            <button class="settings-item" data-settings="prefs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9"/><polyline points="3 4 3 12 11 12"/></svg>用户偏好</button>
             <button class="settings-item" data-settings="theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>切换主题</button>
             <button class="settings-item" data-settings="config"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>查看配置</button>
             <button class="settings-item" data-settings="claude-oauth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>OAuth 认证</button>
@@ -732,6 +733,39 @@
   </div>
 </div>
 
+<!-- V3 commercial: 用户偏好(Phase 4C) -->
+<div id="prefs-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="用户偏好">
+  <div class="modal" style="max-width:520px">
+    <div class="modal-head">
+      <h3>用户偏好</h3>
+      <button class="modal-close" data-close-modal="prefs-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label for="prefs-default-model">默认模型</label>
+        <select id="prefs-default-model" class="prefs-select"></select>
+        <p class="prefs-hint">新建会话时默认选用。「跟随会话默认」= 由当前 agent / 会话决定。</p>
+      </div>
+      <div class="form-row">
+        <label>默认 effort</label>
+        <div id="prefs-effort-radios" class="prefs-effort-radios"></div>
+        <p class="prefs-hint">控制思考强度;effort 越高响应越深入但消耗也更多。</p>
+      </div>
+      <div class="form-row">
+        <label class="prefs-toggle">
+          <input type="checkbox" id="prefs-notify-email" />
+          <span>邮件通知支付与重要事件</span>
+        </label>
+      </div>
+      <div id="prefs-status" class="prefs-status"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" data-close-modal="prefs-modal" type="button">取消</button>
+      <button id="prefs-save-btn" class="btn btn-primary" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
 <!-- Lightbox for image/video zoom -->
 <div id="lightbox" class="lightbox-backdrop" hidden>
   <button class="lightbox-close" aria-label="关闭">&times;</button>
@@ -757,7 +791,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v13';
+  var V='sw-flush-v14';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -779,6 +813,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=24"></script>
+<script type="module" src="/modules/main.js?v=25"></script>
 </body>
 </html>

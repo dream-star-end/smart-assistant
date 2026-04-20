@@ -3941,3 +3941,64 @@ a:hover {
   font-size: var(--text-base);
   color: var(--fg);
 }
+
+/* ─── V3 commercial: user preferences modal (Phase 4C) ─── */
+.prefs-select {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  font-family: inherit;
+}
+.prefs-hint {
+  margin: 4px 0 0;
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
+.prefs-effort-radios {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.prefs-effort-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  user-select: none;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+.prefs-effort-pill:has(input:checked) {
+  background: color-mix(in srgb, var(--accent, #7c3aed) 20%, transparent);
+  border-color: var(--accent, #7c3aed);
+}
+.prefs-effort-pill input {
+  margin: 0;
+  accent-color: var(--accent, #7c3aed);
+}
+.prefs-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  user-select: none;
+}
+.prefs-toggle input {
+  margin: 0;
+  accent-color: var(--accent, #7c3aed);
+}
+.prefs-status {
+  margin-top: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+  min-height: 1.2em;
+}
