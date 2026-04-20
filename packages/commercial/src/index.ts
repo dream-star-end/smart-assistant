@@ -414,6 +414,7 @@ export async function registerCommercial(
     redis: wrapIoredis(redis),
     turnstileSecret: cfg.TURNSTILE_SECRET,
     turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,
+    turnstileSiteKey: cfg.TURNSTILE_SITE_KEY,
     requireEmailVerified: cfg.REQUIRE_EMAIL_VERIFIED,
     verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
     resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,

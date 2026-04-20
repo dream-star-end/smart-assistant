@@ -16,27 +16,102 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=22" />
+<link rel="stylesheet" href="/style.css?v=23" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
 
 <body>
 
-<!-- ═══════════════ LOGIN VIEW ═══════════════ -->
+<!-- ═══════════════ LOGIN VIEW (multi-mode auth) ═══════════════ -->
 <div id="login-view" class="login-view" hidden>
   <div class="login-brand">
     <div class="login-brand-mark">O</div>
     <div>
       <h2>OpenClaude</h2>
-      <div style="color:var(--fg-muted);font-size:var(--text-sm)">个人 AI 助理</div>
+      <div style="color:var(--fg-muted);font-size:var(--text-sm)">个人 AI 助理 · 商用版</div>
     </div>
   </div>
-  <p class="hint" id="login-hint">登录你的 AI 助理</p>
+
+  <!-- Tab switcher (hidden for URL-driven verify/reset modes) -->
+  <div id="auth-tabs" style="display:flex;gap:6px;margin-bottom:var(--space-3)">
+    <button id="auth-tab-login" type="button" class="btn btn-primary" style="flex:1;font-size:13px">登录</button>
+    <button id="auth-tab-register" type="button" class="btn btn-ghost" style="flex:1;font-size:13px">注册</button>
+    <button id="auth-tab-forgot" type="button" class="btn btn-ghost" style="flex:1;font-size:13px">忘记密码</button>
+  </div>
+
+  <!-- Shared error banner -->
   <div id="login-error" style="display:none;color:var(--error);font-size:var(--text-sm);margin-bottom:var(--space-2)"></div>
-  <input id="username" type="text" placeholder="用户名" autocomplete="username" style="margin-bottom:var(--space-2)" />
-  <input id="token" type="password" placeholder="密码" autocomplete="current-password" />
-  <button id="login-btn" class="btn btn-primary btn-full">登录</button>
+
+  <!-- ── Mode: login ── -->
+  <div id="auth-mode-login" hidden>
+    <input id="auth-login-email" type="email" placeholder="邮箱" autocomplete="email" style="margin-bottom:var(--space-2)" />
+    <input id="auth-login-password" type="password" placeholder="密码" autocomplete="current-password" style="margin-bottom:var(--space-2)" />
+    <div id="turnstile-login" style="margin-bottom:var(--space-2);min-height:65px"></div>
+    <button id="auth-login-btn" type="button" class="btn btn-primary btn-full">登录</button>
+    <div id="auth-login-resend-row" hidden style="margin-top:var(--space-2);text-align:center">
+      <button id="auth-resend-verify-btn" type="button" class="btn btn-ghost" style="font-size:13px">重发验证邮件</button>
+      <div id="auth-login-resend-status" hidden style="color:var(--fg-muted);font-size:var(--text-xs);margin-top:var(--space-1)"></div>
+    </div>
+  </div>
+
+  <!-- ── Mode: register ── -->
+  <div id="auth-mode-register" hidden>
+    <div id="auth-register-form">
+      <input id="auth-register-email" type="email" placeholder="邮箱" autocomplete="email" style="margin-bottom:var(--space-2)" />
+      <input id="auth-register-password" type="password" placeholder="密码(至少 8 位)" autocomplete="new-password" style="margin-bottom:var(--space-2)" />
+      <input id="auth-register-confirm" type="password" placeholder="再次输入密码" autocomplete="new-password" style="margin-bottom:var(--space-2)" />
+      <div id="turnstile-register" style="margin-bottom:var(--space-2);min-height:65px"></div>
+      <button id="auth-register-btn" type="button" class="btn btn-primary btn-full">注册</button>
+    </div>
+    <div id="auth-register-success" hidden style="text-align:center;padding:var(--space-3) 0">
+      <div style="font-size:32px;margin-bottom:var(--space-2)">✓</div>
+      <p style="font-weight:600;margin:0">注册成功!</p>
+      <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">
+        我们已向 <span id="auth-register-success-email" style="color:var(--fg)"></span> 发送验证邮件,请查收并点击链接完成验证。
+      </p>
+    </div>
+  </div>
+
+  <!-- ── Mode: forgot password ── -->
+  <div id="auth-mode-forgot" hidden>
+    <div id="auth-forgot-form">
+      <p class="hint" style="margin-bottom:var(--space-3)">输入注册邮箱,我们会发送密码重置链接</p>
+      <input id="auth-forgot-email" type="email" placeholder="邮箱" autocomplete="email" style="margin-bottom:var(--space-2)" />
+      <div id="turnstile-forgot" style="margin-bottom:var(--space-2);min-height:65px"></div>
+      <button id="auth-forgot-btn" type="button" class="btn btn-primary btn-full">发送重置链接</button>
+    </div>
+    <div id="auth-forgot-success" hidden style="text-align:center;padding:var(--space-3) 0">
+      <div style="font-size:32px;margin-bottom:var(--space-2)">✓</div>
+      <p style="font-weight:600;margin:0">已发送</p>
+      <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">
+        若 <span id="auth-forgot-success-email" style="color:var(--fg)"></span> 已注册,你将很快收到重置链接。请检查垃圾邮件。
+      </p>
+    </div>
+  </div>
+
+  <!-- ── Mode: confirm reset (URL-driven) ── -->
+  <div id="auth-mode-reset" hidden>
+    <div id="auth-reset-form">
+      <p class="hint" style="margin-bottom:var(--space-3)">设置新密码</p>
+      <input id="auth-reset-password" type="password" placeholder="新密码(至少 8 位)" autocomplete="new-password" style="margin-bottom:var(--space-2)" />
+      <input id="auth-reset-confirm" type="password" placeholder="再次输入新密码" autocomplete="new-password" style="margin-bottom:var(--space-2)" />
+      <button id="auth-reset-btn" type="button" class="btn btn-primary btn-full">重置密码</button>
+    </div>
+    <div id="auth-reset-success" hidden style="text-align:center;padding:var(--space-3) 0">
+      <div style="font-size:32px;margin-bottom:var(--space-2)">✓</div>
+      <p style="font-weight:600;margin:0">密码已重置</p>
+      <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">即将跳转到登录…</p>
+    </div>
+  </div>
+
+  <!-- ── Mode: verify email (URL-driven) ── -->
+  <div id="auth-mode-verify" hidden style="text-align:center;padding:var(--space-3) 0">
+    <div style="font-size:32px;margin-bottom:var(--space-2)">📧</div>
+    <p style="font-weight:600;margin:0">邮箱验证</p>
+    <p id="auth-verify-status" style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">正在验证…</p>
+    <button id="auth-verify-back-btn" type="button" class="btn btn-ghost" hidden style="margin-top:var(--space-3);font-size:13px">返回登录</button>
+  </div>
 </div>
 
 <!-- ═══════════════ SESSION MIGRATION MODAL ═══════════════ -->
@@ -637,7 +712,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v11';
+  var V='sw-flush-v12';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -659,6 +734,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=22"></script>
+<script type="module" src="/modules/main.js?v=23"></script>
 </body>
 </html>

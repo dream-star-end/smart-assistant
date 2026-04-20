@@ -63,6 +63,7 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
+import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -1001,18 +1002,27 @@ function closePalette() {
 // just 401 again (and funnel back through this handler).
 async function _forceLogout({ serverLogout } = {}) {
   if (serverLogout) {
+    // V3 commercial: POST /api/auth/logout 期望 body 含 refresh_token 来吊销该刷新 token。
     // suppressAuthRedirect=true: a 401 on this call would be meaningless
     // (we're already tearing down), and we don't want to recursively fire
     // the auth-expired handler. 5s timeout — if the server is slow the
     // local teardown continues regardless.
+    const refreshToken = state.refreshToken || ''
     apiFetch('/api/auth/logout', {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: refreshToken ? JSON.stringify({ refresh_token: refreshToken }) : undefined,
       timeout: 5000,
       suppressAuthRedirect: true,
     }).catch(() => {})
   }
   localStorage.removeItem('openclaude_token')
+  localStorage.removeItem('openclaude_access_token')
+  localStorage.removeItem('openclaude_refresh_token')
+  localStorage.removeItem('openclaude_access_exp')
   state.token = ''  // Clear token BEFORE close so onclose handler won't auto-reconnect
+  state.refreshToken = ''
+  state.tokenExp = 0
   // Rearm the auth-expired one-shot so a future session expiry can trigger
   // the logout flow again. login success also does this, but doing it here
   // too keeps the semantics symmetric across both teardown paths.
@@ -1042,9 +1052,31 @@ async function _forceLogout({ serverLogout } = {}) {
 function showLogin() {
   $('login-view').hidden = false
   $('app-view').hidden = true
-  $('login-error').style.display = 'none'
-  $('username').value = ''
-  $('token').value = ''
+  if ($('login-error')) $('login-error').style.display = 'none'
+  // Clear v3 commercial auth-mode form fields if present
+  for (const id of [
+    'auth-login-email','auth-login-password',
+    'auth-register-email','auth-register-password','auth-register-confirm',
+    'auth-forgot-email',
+    'auth-reset-password','auth-reset-confirm',
+  ]) {
+    const el = $(id)
+    if (el) el.value = ''
+  }
+  // Reset post-submit success panels back to form state
+  for (const [formId, successId] of [
+    ['auth-register-form','auth-register-success'],
+    ['auth-forgot-form','auth-forgot-success'],
+    ['auth-reset-form','auth-reset-success'],
+  ]) {
+    if ($(formId)) $(formId).hidden = false
+    if ($(successId)) $(successId).hidden = true
+  }
+  if ($('auth-login-resend-row')) $('auth-login-resend-row').hidden = true
+  if ($('auth-login-resend-status')) {
+    $('auth-login-resend-status').hidden = true
+    $('auth-login-resend-status').textContent = ''
+  }
   // Clear all in-memory state to prevent cross-identity leakage on auth-expiry re-login
   state.sessions.clear()
   state.currentSessionId = null
@@ -1060,7 +1092,8 @@ function showLogin() {
   // Clear composer draft
   const composer = $('input')
   if (composer) composer.value = ''
-  setTimeout(() => $('username').focus(), 50)
+  // Default back to login mode (auth.js handles tab visuals)
+  try { setAuthMode('login') } catch {}
 }
 
 // Session-cookie handshake for media preview.
@@ -1686,73 +1719,43 @@ async function init() {
   $('persona-model-preset')?.addEventListener('change', (e) => {
     if (e.target.value) $('persona-model').value = e.target.value
   })
-  // Login (username + password → JWT)
-  $('login-btn').onclick = async () => {
-    const username = $('username').value.trim()
-    const password = $('token').value.trim()
-    if (!password) return
-    $('login-error').style.display = 'none'
-    $('login-btn').disabled = true
-    $('login-btn').textContent = '登录中…'
+  // ── V3 commercial auth (Phase 4A) ──
+  // 多模态登录(login/register/forgot/reset/verify)+ Turnstile 由 modules/auth.js 接管。
+  // main.js 只负责"登录成功后该做什么"——清 IDB、装 token、连 ws、起 app view。
+  setAuthSuccessHandler(async ({ access_token, access_exp, refresh_token }) => {
+    state.token = access_token
+    state.refreshToken = refresh_token || ''
+    state.tokenExp = Number(access_exp) || 0
+    localStorage.setItem('openclaude_access_token', access_token)
+    if (refresh_token) localStorage.setItem('openclaude_refresh_token', refresh_token)
+    if (access_exp != null) localStorage.setItem('openclaude_access_exp', String(access_exp))
+    // Re-arm 401 handler — next token expiry will fire it again.
+    resetAuthExpired()
+    // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage.
     try {
-      const resp = await apiFetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: username || '', password }),
-        suppressAuthRedirect: true, // bad credentials → we render inline error, not logout flow
-      })
-      const data = await resp.json().catch(() => ({}))
-      if (!resp.ok) {
-        $('login-error').textContent = data.error || '登录失败'
-        $('login-error').style.display = 'block'
-        return
+      const stale = await dbGetAll()
+      for (const s of stale) await dbDelete(s.id)
+    } catch {}
+    await showApp()
+    renderSidebar()
+    renderMessages()
+    connect()
+    reloadAgents()
+    loadChangelog()
+    syncSessionsFromServer().then((result) => {
+      const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+      if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+        state.currentSessionId = updated[0]?.id || null
+        if (!state.currentSessionId) createSession()
+        renderMessages()
+      } else if (result?.needsRenderMessages) {
+        renderMessages()
       }
-      state.token = data.token
-      localStorage.setItem('openclaude_token', data.token)
-      // A fresh login re-arms the auth-expired handler so the *next* token
-      // expiry can trigger logout again (it's a one-shot guard per session).
-      resetAuthExpired()
-      // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage
-      try {
-        const stale = await dbGetAll()
-        for (const s of stale) await dbDelete(s.id)
-      } catch {}
-      // Await so the HttpOnly session cookie is in place before any
-      // <img>/<audio>/<video> tags get their src set by renderMessages.
-      await showApp()
       renderSidebar()
-      renderMessages()
-      connect()
-      reloadAgents()
-      loadChangelog()
-      // Pull sessions from server for this user (cross-device sync)
-      syncSessionsFromServer().then((result) => {
-        const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
-        if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
-          state.currentSessionId = updated[0]?.id || null
-          if (!state.currentSessionId) createSession()
-          renderMessages()
-        } else if (result?.needsRenderMessages) {
-          renderMessages()
-        }
-        renderSidebar()
-      }).catch(() => {})
-      // Check for unclaimed sessions to migrate
-      checkUnclaimedSessions()
-    } catch {
-      $('login-error').textContent = '网络错误，请重试'
-      $('login-error').style.display = 'block'
-    } finally {
-      $('login-btn').disabled = false
-      $('login-btn').textContent = '登录'
-    }
-  }
-  $('token').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.isComposing) $('login-btn').click()
+    }).catch(() => {})
+    checkUnclaimedSessions()
   })
-  $('username').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.isComposing) $('token').focus()
-  })
+  initAuth()
   // Palette input
   $('palette-input').addEventListener('input', (e) => {
     paletteItems = buildPaletteItems(e.target.value)

@@ -32,6 +32,12 @@ export interface CommercialHttpDeps {
   redis: RateLimitRedis;
   turnstileSecret?: string;
   turnstileBypass?: boolean;
+  /**
+   * Turnstile 公钥(client-side site key)。
+   * 经 `GET /api/public/config` 暴露给前端 auth 模态加载 widget 用。
+   * 未配 → 前端 widget 占位为空字符串,需配合 `turnstileBypass=true` 才能完成注册/登录。
+   */
+  turnstileSiteKey?: string;
   /** Turnstile fetchImpl 注入(用于测试) */
   fetchImpl?: typeof fetch;
   verifyEmailUrlBase?: string;
@@ -380,6 +386,28 @@ export async function handleMe(
       avatar_url: u.avatar_url,
       credits: u.credits,
     },
+  });
+}
+
+// ─── GET /api/public/config ─────────────────────────────────────────
+// 公开路径(Phase 4A:前端 auth 模态启动时拉取)。仅暴露公开值:
+//   - turnstile_site_key:Cloudflare 站点公钥,前端 widget 注册时必需
+//   - require_email_verified:布尔,影响登录前是否拦截 + 注册成功后是否提示去查邮箱
+// 未来扩展(brand_name / contact / commercial_enabled tier 等)在此追加,但绝不放
+// secrets/server-side flags(避免给攻击者侦察 surface)。
+// 不限流、不验证、不读 DB,纯静态(进程启动后由 deps 决定)→ 极快,可被前端缓存。
+
+export async function handleGetPublicConfig(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  sendJson(res, 200, {
+    turnstile_site_key: deps.turnstileSiteKey ?? "",
+    // turnstile_bypass=true → 前端可直接发"占位 token",dev/CI 用;生产必须 false
+    turnstile_bypass: deps.turnstileBypass === true,
+    require_email_verified: deps.requireEmailVerified === true,
   });
 }
 

@@ -789,7 +789,12 @@ export function connect() {
     hideTypingIndicator()
     if (e.code === 1008) {
       localStorage.removeItem('openclaude_token')
+      localStorage.removeItem('openclaude_access_token')
+      localStorage.removeItem('openclaude_refresh_token')
+      localStorage.removeItem('openclaude_access_exp')
       state.token = ''
+      state.refreshToken = ''
+      state.tokenExp = 0
       toast('Token 无效或已过期，请重新登录', 'error')
       _deps.showLogin()
       return

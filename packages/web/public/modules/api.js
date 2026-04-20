@@ -84,6 +84,77 @@ async function _extractErrorMessage(res) {
   }
 }
 
+// ── V3 commercial: silent refresh on 401 ──
+//
+// Behavior:
+//   • On 401, attempt POST /api/auth/refresh once with state.refreshToken;
+//     if it returns a new access_token, retry the original request once.
+//   • Concurrent 401s share a single in-flight refresh promise (_refreshInflight)
+//     so 5 parallel calls don't all spam the refresh endpoint.
+//   • If refresh fails (no token / 4xx) → fall through to _notifyAuthExpired
+//     and the caller sees the original 401 response.
+//   • Skipped for /api/auth/* paths to avoid recursion (login/refresh/logout
+//     legitimately return 401 and we don't want to refresh-loop on them).
+//   • Skipped when caller passes suppressAuthRedirect=true (login/probe paths).
+//   • Skipped on the retry pass itself (set _attemptedRefresh on the init).
+let _refreshInflight = null
+function _silentRefresh() {
+  if (_refreshInflight) return _refreshInflight
+  // Lazy-import to avoid an import cycle (state.js doesn't import api.js, but
+  // some modules may transitively).
+  _refreshInflight = (async () => {
+    if (!state.refreshToken) return false
+    try {
+      const r = await fetch('/api/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: state.refreshToken }),
+      })
+      if (!r.ok) return false
+      const data = await r.json().catch(() => ({}))
+      if (typeof data?.access_token !== 'string' || !data.access_token) return false
+      state.token = data.access_token
+      if (typeof data.access_exp === 'number') state.tokenExp = data.access_exp
+      try {
+        localStorage.setItem('openclaude_access_token', data.access_token)
+        if (typeof data.access_exp === 'number') {
+          localStorage.setItem('openclaude_access_exp', String(data.access_exp))
+        }
+      } catch {}
+      return true
+    } catch {
+      return false
+    }
+  })().finally(() => { _refreshInflight = null })
+  return _refreshInflight
+}
+
+function _isAuthEndpoint(path) {
+  // Don't refresh-loop on auth endpoints themselves
+  if (typeof path !== 'string') return false
+  return path.startsWith('/api/auth/login')
+      || path.startsWith('/api/auth/refresh')
+      || path.startsWith('/api/auth/logout')
+      || path.startsWith('/api/auth/register')
+      || path.startsWith('/api/auth/verify-email')
+      || path.startsWith('/api/auth/resend-verification')
+      || path.startsWith('/api/auth/request-password-reset')
+      || path.startsWith('/api/auth/confirm-password-reset')
+}
+
+// Rewrite Authorization header on retry. Caller may pass init.headers as plain
+// object OR as Headers; we normalize to plain object since most callers do.
+function _rewriteAuthHeader(headers) {
+  if (!headers) return { Authorization: `Bearer ${state.token}` }
+  if (headers instanceof Headers) {
+    const out = {}
+    headers.forEach((v, k) => { out[k] = v })
+    out.Authorization = `Bearer ${state.token}`
+    return out
+  }
+  return { ...headers, Authorization: `Bearer ${state.token}` }
+}
+
 // Low-level fetch wrapper. Exposes the raw Response so callers that care
 // about streaming, status codes, or custom parsing can still use it.
 export async function apiFetch(path, init = {}) {
@@ -91,16 +162,42 @@ export async function apiFetch(path, init = {}) {
     timeout = DEFAULT_TIMEOUT_MS,
     signal: userSignal,
     suppressAuthRedirect = false,
+    _attemptedRefresh = false,
     ...rest
   } = init
   const { signal, cleanup } = _composeSignal(userSignal, timeout)
+  let res
   try {
-    const res = await fetch(path, { ...rest, signal })
-    if (res.status === 401 && !suppressAuthRedirect) _notifyAuthExpired()
-    return res
+    res = await fetch(path, { ...rest, signal })
   } finally {
     cleanup()
   }
+  if (res.status !== 401) return res
+  // Auth endpoint or already retried → propagate 401 + maybe trigger logout
+  if (_attemptedRefresh || _isAuthEndpoint(path) || suppressAuthRedirect === false && !state.refreshToken) {
+    if (!suppressAuthRedirect) _notifyAuthExpired()
+    return res
+  }
+  if (suppressAuthRedirect) {
+    // Caller explicitly opted out of redirect — don't refresh either, just return.
+    return res
+  }
+  // Try one refresh + retry
+  const refreshed = await _silentRefresh()
+  if (!refreshed) {
+    _notifyAuthExpired()
+    return res
+  }
+  // Retry once with the new access token. Reuse caller's init (sans signal/timeout
+  // bookkeeping) and replace Authorization header.
+  return apiFetch(path, {
+    ...rest,
+    timeout,
+    signal: userSignal,
+    suppressAuthRedirect,
+    _attemptedRefresh: true,
+    headers: _rewriteAuthHeader(rest.headers),
+  })
 }
 
 export async function apiGet(path, opts = {}) {

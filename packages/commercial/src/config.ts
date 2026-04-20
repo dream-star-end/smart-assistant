@@ -61,6 +61,16 @@ const turnstileSecret = z.string().trim().min(1).optional();
 const turnstileBypass = z.enum(["0", "1"]).optional().transform((v) => v === "1");
 
 /**
+ * Turnstile 公钥(Cloudflare 的 client-side site key)。
+ * - 公开值,可被前端 `/api/public/config` 直接读出来嵌入 widget
+ * - 缺失时前端 turnstile 走"占位 token"路径(配合 `TURNSTILE_TEST_BYPASS=1` 用)
+ *
+ * 与 TURNSTILE_SECRET 必须配套配置:secret 给了但 site_key 没给时前端无法装载 widget,
+ * 走 bypass 也走不通(secret 校验真,site_key 测假)。生产部署清单(Phase 5)显式注入两侧。
+ */
+const turnstileSiteKey = z.string().trim().min(1).max(128).optional();
+
+/**
  * 虎皮椒支付相关(T-24)。所有字段 **optional** —— 商业化可以先不开支付功能,
  * 路由层在 deps 缺失时返 503。生产上线前必须配好,否则 /api/payment/hupi/* 全报错。
  */
@@ -228,6 +238,7 @@ export const commercialConfigSchema = z
     COMMERCIAL_ENABLED: enabledFlag,
     TURNSTILE_SECRET: turnstileSecret,
     TURNSTILE_TEST_BYPASS: turnstileBypass,
+    TURNSTILE_SITE_KEY: turnstileSiteKey,
     /** 1 → 强制 email_verified=true 才能登录 */
     REQUIRE_EMAIL_VERIFIED: z.enum(["0", "1"]).optional().transform((v) => v === "1"),
     HUPIJIAO_APP_ID: hupiAppId,

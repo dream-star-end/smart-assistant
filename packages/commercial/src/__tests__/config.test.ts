@@ -110,6 +110,31 @@ describe("config.loadConfig", () => {
     }
   });
 
+  // ─── Phase 4A — TURNSTILE_SITE_KEY (公开值,前端 widget 用) ───
+  test("TURNSTILE_SITE_KEY 缺省 = undefined,不强制配", () => {
+    const cfg = loadConfig(VALID_ENV);
+    assert.equal(cfg.TURNSTILE_SITE_KEY, undefined);
+  });
+
+  test("TURNSTILE_SITE_KEY 接受合法字符串", () => {
+    const cfg = loadConfig({ ...VALID_ENV, TURNSTILE_SITE_KEY: "0x4AAAAAAAxxxx" });
+    assert.equal(cfg.TURNSTILE_SITE_KEY, "0x4AAAAAAAxxxx");
+  });
+
+  test("TURNSTILE_SITE_KEY 拒绝纯空白(trim 后必须 >=1)", () => {
+    assert.throws(
+      () => loadConfig({ ...VALID_ENV, TURNSTILE_SITE_KEY: "   " }),
+      ConfigError,
+    );
+  });
+
+  test("TURNSTILE_SITE_KEY 拒绝超长(>128 字符)", () => {
+    assert.throws(
+      () => loadConfig({ ...VALID_ENV, TURNSTILE_SITE_KEY: "x".repeat(129) }),
+      ConfigError,
+    );
+  });
+
   test("does not leak raw env in error message", () => {
     try {
       loadConfig({

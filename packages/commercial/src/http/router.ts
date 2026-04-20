@@ -36,6 +36,7 @@ import {
   handleConfirmPasswordReset,
   handleMe,
   handleListPublicModels,
+  handleGetPublicConfig,
   handleGetMyPreferences,
   handlePatchMyPreferences,
   type CommercialHttpDeps,
@@ -124,6 +125,7 @@ export function createCommercialHandler(
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
     { method: "GET",   path: "/api/me/preferences", handler: handleGetMyPreferences },
     { method: "PATCH", path: "/api/me/preferences", handler: handlePatchMyPreferences },
+    { method: "GET", path: "/api/public/config", handler: handleGetPublicConfig },
     { method: "GET", path: "/api/public/models", handler: handleListPublicModels },
     // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler
     { method: "GET", path: "/api/models", handler: handleListPublicModels },
