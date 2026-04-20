@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=28" />
+<link rel="stylesheet" href="/style.css?v=30" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -233,20 +233,69 @@
 
 <!-- ═══════════════ LOGIN VIEW (multi-mode auth) ═══════════════ -->
 <div id="login-view" class="login-view" hidden>
-  <div class="login-brand">
-    <div class="login-brand-mark">O</div>
-    <div>
-      <h2>OpenClaude</h2>
-      <div style="color:var(--fg-muted);font-size:var(--text-sm)">个人 AI 助理 · 商用版</div>
+  <!-- ── Left aside: brand panel (desktop only) ── -->
+  <aside class="login-aside" aria-hidden="true">
+    <div class="login-aside-bg"></div>
+    <div class="login-aside-inner">
+      <a href="/" class="login-aside-brand">
+        <span class="login-aside-mark">O</span>
+        <span class="login-aside-wordmark">OpenClaude</span>
+      </a>
+      <div class="login-aside-hero">
+        <h1 class="login-aside-title">
+          一个账号<br/>
+          <span class="login-aside-title-accent">所有 Claude 能力</span>
+        </h1>
+        <p class="login-aside-sub">
+          Claude Opus 4.7 · Sonnet 4.6 · Haiku 4.5,按 token 计费,内置多模态生成、独立 Agent 工作空间、长期记忆与定时任务。
+        </p>
+      </div>
+      <ul class="login-aside-bullets">
+        <li>
+          <span class="login-aside-bullet-dot"></span>
+          <div>
+            <div class="login-aside-bullet-title">官方 Claude API,无中间商</div>
+            <div class="login-aside-bullet-desc">直连 Anthropic,token 计费 1¥ = $1</div>
+          </div>
+        </li>
+        <li>
+          <span class="login-aside-bullet-dot"></span>
+          <div>
+            <div class="login-aside-bullet-title">独立 Agent 容器</div>
+            <div class="login-aside-bullet-desc">每个用户隔离工作空间,代码 / 浏览器 / 文件全自由</div>
+          </div>
+        </li>
+        <li>
+          <span class="login-aside-bullet-dot"></span>
+          <div>
+            <div class="login-aside-bullet-title">多模态 + 长期记忆</div>
+            <div class="login-aside-bullet-desc">图 / 音 / 视频生成 + 跨会话记住你</div>
+          </div>
+        </li>
+      </ul>
+      <div class="login-aside-footer">
+        <a href="/">← 返回首页</a>
+      </div>
     </div>
-  </div>
+  </aside>
 
-  <!-- Tab switcher (hidden for URL-driven verify/reset modes) -->
-  <div id="auth-tabs" style="display:flex;gap:6px;margin-bottom:var(--space-3)">
-    <button id="auth-tab-login" type="button" class="btn btn-primary" style="flex:1;font-size:13px">登录</button>
-    <button id="auth-tab-register" type="button" class="btn btn-ghost" style="flex:1;font-size:13px">注册</button>
-    <button id="auth-tab-forgot" type="button" class="btn btn-ghost" style="flex:1;font-size:13px">忘记密码</button>
-  </div>
+  <!-- ── Right main: auth form card ── -->
+  <main class="login-main">
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="login-brand-mark">O</div>
+        <div>
+          <h2>欢迎回来</h2>
+          <div class="login-brand-sub">登录或注册以开始</div>
+        </div>
+      </div>
+
+      <!-- Tab switcher (hidden for URL-driven verify/reset modes) -->
+      <div id="auth-tabs" class="auth-tabs" role="tablist">
+        <button id="auth-tab-login" type="button" class="auth-tab is-active" role="tab">登录</button>
+        <button id="auth-tab-register" type="button" class="auth-tab" role="tab">注册</button>
+        <button id="auth-tab-forgot" type="button" class="auth-tab" role="tab">忘记密码</button>
+      </div>
 
   <!-- Shared error banner -->
   <div id="login-error" style="display:none;color:var(--error);font-size:var(--text-sm);margin-bottom:var(--space-2)"></div>
@@ -320,6 +369,12 @@
     <p id="auth-verify-status" style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">正在验证…</p>
     <button id="auth-verify-back-btn" type="button" class="btn btn-ghost" hidden style="margin-top:var(--space-3);font-size:13px">返回登录</button>
   </div>
+
+      <div class="login-foot">
+        <span>受 <a href="https://www.cloudflare.com/products/turnstile/" target="_blank" rel="noopener">Cloudflare Turnstile</a> 保护</span>
+      </div>
+    </div>
+  </main>
 </div>
 
 <!-- ═══════════════ SESSION MIGRATION MODAL ═══════════════ -->

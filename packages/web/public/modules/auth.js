@@ -145,12 +145,11 @@ export function setMode(mode) {
     const view = $(`auth-mode-${m}`)
     if (view) view.hidden = m !== mode
   }
-  // Update tab styling
+  // Update tab styling (segmented control)
   for (const m of ['login', 'register', 'forgot']) {
     const tab = $(`auth-tab-${m}`)
     if (tab) {
-      tab.classList.toggle('btn-primary', m === mode)
-      tab.classList.toggle('btn-ghost', m !== mode)
+      tab.classList.toggle('is-active', m === mode)
     }
   }
   // Hide tabs for URL-driven modes
