@@ -52,6 +52,8 @@ import {
 } from "./ws/userChatBridge.js";
 import {
   makeV3EnsureRunning,
+  startIdleSweepScheduler,
+  type IdleSweepScheduler,
   type V3SupervisorDeps,
 } from "./agent-sandbox/index.js";
 import {
@@ -464,6 +466,24 @@ export async function registerCommercial(
       "[commercial] v3 supervisor disabled; missing env: OC_RUNTIME_IMAGE",
     );
   }
+
+  // V3 Phase 3F:idle 30min stop+remove ephemeral 容器(MVP 单轨)。
+  // 仅在 v3 supervisor 装配后启用;cfg.OC_IDLE_SWEEP_DISABLED=1 可手动关掉
+  // (运维灾备时用,默认 60s tick / 30min idle cutoff)。
+  let idleSweepScheduler: IdleSweepScheduler | undefined;
+  if (v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
+    idleSweepScheduler = startIdleSweepScheduler(v3Deps, {
+      logger: {
+        debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
+        info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
+        warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
+        error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
+      },
+      runOnStart: false,
+    });
+    // eslint-disable-next-line no-console
+    console.log("[commercial] v3 idle sweep scheduler started (60s tick, 30min cutoff)");
+  }
   const resolveContainerEndpoint: ResolveContainerEndpoint =
     options.resolveContainerEndpoint
     ?? (v3Deps
@@ -510,6 +530,9 @@ export async function registerCommercial(
       }
       if (lifecycleScheduler) {
         try { await lifecycleScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (idleSweepScheduler) {
+        try { await idleSweepScheduler.stop(); } catch { /* ignore */ }
       }
       if (alertScheduler) {
         try { await alertScheduler.stop(); } catch { /* ignore */ }

@@ -25,6 +25,7 @@ export {
   provisionV3Container,
   stopAndRemoveV3Container,
   getV3ContainerStatus,
+  markV3ContainerActivity,
   removeV3Volume,
   v3ContainerNameFor,
   v3VolumeNameFor,
@@ -58,3 +59,17 @@ export {
   DEFAULT_WS_PROBE_MS,
   type WaitContainerReadyOptions,
 } from "./v3readiness.js";
+
+// V3 Phase 3F — idle 30min sweep(ephemeral 单轨)
+export {
+  startIdleSweepScheduler,
+  runIdleSweepTick,
+  DEFAULT_IDLE_SWEEP_INTERVAL_MS,
+  DEFAULT_IDLE_CUTOFF_MIN,
+  DEFAULT_SWEEP_BATCH_LIMIT,
+  type IdleSweepLogger,
+  type IdleSweepTickOptions,
+  type IdleSweepTickResult,
+  type StartIdleSweepSchedulerOptions,
+  type IdleSweepScheduler,
+} from "./v3idleSweep.js";

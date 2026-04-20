@@ -32,6 +32,7 @@
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import {
   getV3ContainerStatus,
+  markV3ContainerActivity,
   provisionV3Container,
   stopAndRemoveV3Container,
   V3_CONTAINER_PORT,
@@ -137,6 +138,9 @@ export function makeV3EnsureRunning(
     if (status && status.state === "running") {
       const ready = await waitContainerReady(status.boundIp, status.port, readinessOpts);
       if (!ready) throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "starting");
+      // 3F: 用户重连即视作活跃 — 刷新 last_ws_activity,推迟 idle sweep。
+      // 不 await 失败、也不阻塞 caller(markV3ContainerActivity 自吞错)。
+      void markV3ContainerActivity(deps, status.containerId);
       return { host: status.boundIp, port: status.port };
     }
 

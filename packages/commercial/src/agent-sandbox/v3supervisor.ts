@@ -539,6 +539,35 @@ export async function stopAndRemoveV3Container(
 }
 
 /**
+ * 把 active 行的 last_ws_activity 刷成 NOW()。
+ *
+ * 用法:
+ *   - ensureRunning 命中 'running' 分支(用户重连)调一次 → idle sweep 计时重置
+ *   - provision 时 INSERT 已经写 NOW(),不需要再调
+ *   - vanished 行不刷(WHERE state='active' 兜住)
+ *
+ * 不抛 — caller 拿不到错也无所谓,bridge 不会因为这个 break;最坏情况下
+ * 30min idle sweep 误杀 active 容器,用户重连即重 provision,数据全在 volume。
+ */
+export async function markV3ContainerActivity(
+  deps: V3SupervisorDeps,
+  agentContainerId: number,
+): Promise<void> {
+  if (!Number.isInteger(agentContainerId) || agentContainerId <= 0) return;
+  try {
+    await deps.pool.query(
+      `UPDATE agent_containers
+          SET last_ws_activity = NOW(),
+              updated_at = NOW()
+        WHERE id = $1::bigint AND state = 'active'`,
+      [String(agentContainerId)],
+    );
+  } catch {
+    // 不冒泡 — 见上方注释
+  }
+}
+
+/**
  * 查 active row + docker inspect 求标准化态。
  * 用户没 active row → null。docker inspect 404 → state='missing'。
  */
