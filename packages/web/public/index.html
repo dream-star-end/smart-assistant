@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=23" />
+<link rel="stylesheet" href="/style.css?v=24" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -184,6 +184,11 @@
         <span id="token-usage-text">0 tokens</span>
       </div>
       <div class="head-actions">
+        <!-- V3 commercial: 余额 pill (个人版无 /api/me → 自动隐藏) -->
+        <button id="balance-pill" class="balance-pill" type="button" title="点击充值" hidden>
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v12M9 9h4.5a2.5 2.5 0 0 1 0 5H9"/></svg>
+          <span id="balance-text">¥0.00</span>
+        </button>
         <button id="tasks-btn" class="icon-btn tasks-btn" title="后台任务" aria-label="后台任务" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
           <span id="tasks-badge" class="tasks-badge">0</span>
@@ -687,6 +692,46 @@
   </div>
 </div>
 
+<!-- V3 commercial: 充值模态(Phase 4B) -->
+<div id="topup-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="充值">
+  <div class="modal" style="max-width:560px">
+    <div class="modal-head">
+      <h3>充值</h3>
+      <button class="modal-close" data-close-modal="topup-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <!-- Stage A: 套餐选择 -->
+      <div id="topup-stage-plans">
+        <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:0 0 var(--space-3)">选择充值套餐,扫描微信二维码完成支付</p>
+        <div id="topup-plans-list" class="plan-grid"></div>
+      </div>
+      <!-- Stage B: 二维码 + 等待 -->
+      <div id="topup-stage-qr" hidden>
+        <div id="topup-order-info" class="topup-order-info"></div>
+        <div class="topup-qr-wrap">
+          <div id="topup-qr-frame" class="topup-qr-frame"></div>
+          <div class="topup-qr-meta">
+            <div id="topup-qr-status" class="topup-qr-status">正在等待支付…</div>
+            <div id="topup-expiry" class="topup-expiry"></div>
+          </div>
+        </div>
+        <p style="color:var(--fg-muted);font-size:var(--text-xs);margin:var(--space-3) 0 0">提示:用微信扫描二维码后完成支付,本页面会自动刷新到账状态。</p>
+      </div>
+      <!-- Stage C: 完成 -->
+      <div id="topup-stage-done" hidden>
+        <div class="topup-done-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="9 12 11 14 15 10"/></svg>
+        </div>
+        <div id="topup-done-summary" class="topup-done-summary">支付成功!</div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button id="topup-back-btn" class="btn btn-ghost" type="button">返回选择套餐</button>
+      <button class="btn btn-ghost" data-close-modal="topup-modal" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+
 <!-- Lightbox for image/video zoom -->
 <div id="lightbox" class="lightbox-backdrop" hidden>
   <button class="lightbox-close" aria-label="关闭">&times;</button>
@@ -712,7 +757,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v12';
+  var V='sw-flush-v13';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -734,6 +779,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=23"></script>
+<script type="module" src="/modules/main.js?v=24"></script>
 </body>
 </html>

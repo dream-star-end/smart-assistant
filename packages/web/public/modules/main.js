@@ -64,6 +64,7 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js'
+import { initBilling, refreshBalance } from './billing.js'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -1742,6 +1743,7 @@ async function init() {
     connect()
     reloadAgents()
     loadChangelog()
+    refreshBalance().catch(() => {})
     syncSessionsFromServer().then((result) => {
       const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
       if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
@@ -1756,6 +1758,7 @@ async function init() {
     checkUnclaimedSessions()
   })
   initAuth()
+  initBilling()
   // Palette input
   $('palette-input').addEventListener('input', (e) => {
     paletteItems = buildPaletteItems(e.target.value)
@@ -1841,6 +1844,7 @@ async function init() {
     connect()
     reloadAgents()
     loadChangelog()
+    refreshBalance().catch(() => {})
     // Cross-device sync: pull sessions from server in background
     syncSessionsFromServer().then((result) => {
       // Re-render if sessions changed (added or removed) or current session was updated
