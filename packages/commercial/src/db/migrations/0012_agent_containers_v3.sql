@@ -28,7 +28,7 @@
 
 ALTER TABLE agent_containers
   ADD COLUMN bound_ip              INET,
-  ADD COLUMN secret_hash           TEXT,
+  ADD COLUMN secret_hash           BYTEA,
   ADD COLUMN state                 TEXT NOT NULL DEFAULT 'active'
                                    CHECK (state IN ('active', 'vanished')),
   ADD COLUMN host_id               BIGINT,
@@ -60,8 +60,8 @@ COMMENT ON COLUMN agent_containers.bound_ip IS
   'Unique within active set; 401 unknown_container_ip_on_host if reverse-lookup misses.';
 
 COMMENT ON COLUMN agent_containers.secret_hash IS
-  'V3 §3.2: bcrypt/scrypt hash of the per-container long-lived secret (identity factor B). '
-  'Plain secret only ever lives in container env (ANTHROPIC_AUTH_TOKEN=oc-v3.<cid>.<secret>) '
+  'V3 §3.2: SHA-256(secret_bytes) of the per-container long-lived secret (identity factor B). '
+  '32-byte BYTEA. Plain secret only ever lives in container env (ANTHROPIC_AUTH_TOKEN=oc-v3.<cid>.<secret>) '
   'and is timing-safe-compared by edge proxy.';
 
 COMMENT ON COLUMN agent_containers.state IS

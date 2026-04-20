@@ -19,8 +19,12 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isProviderManagedEnvVar } from "../../../../claude-code-best/src/utils/managedEnvConstants.ts";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const ENTRYPOINT_TS_PATH = join(
   __dirname,
