@@ -638,7 +638,9 @@
       <div class="persona-section-label">模型</div>
       <!-- 商用版: 模型列表来自管理后台 model_pricing 表(/api/models),
            agents.js openPersonaEditor 打开时动态填充 #persona-model-preset。
-           Provider 选项已移除 — 商用环境后端统一走管理员配置的 anthropic 通道。 -->
+           Provider 选项已对用户隐藏 — 商用环境后端统一走管理员配置的 anthropic 通道。
+           注意 #persona-provider 必须保留在 DOM(hidden),否则缓存了旧 agents.js
+           的客户端会撞上 "Cannot set properties of null (setting 'value')"。 -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
         <div class="form-row" style="margin:0">
           <label>预设</label>
@@ -651,6 +653,10 @@
           <input id="persona-model" placeholder="自定义模型" />
         </div>
       </div>
+      <!-- 旧 agents.js 兼容: 隐藏 select,保留 id 让 .value=... 不爆 -->
+      <select id="persona-provider" hidden aria-hidden="true">
+        <option value=""></option>
+      </select>
       <!-- Behavior -->
       <div class="persona-section-label">行为</div>
       <div class="form-row">
