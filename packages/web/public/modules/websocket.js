@@ -666,7 +666,10 @@ export function connect() {
   }
   setStatus('连接中…', 'connecting')
   // Use Sec-WebSocket-Protocol for auth instead of query string (avoids token in URL/logs)
-  const url = `${(location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host}/ws`
+  // **v3 commercial 路径**:浏览器 → /ws/user-chat-bridge → commercial gateway 桥接 →
+  // 用户独立 docker 容器内的 personal-version /ws → 容器内 fork ccb。
+  // bridge 是 byte-exact 透传,前端不感知协议差异。
+  const url = `${(location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host}/ws/user-chat-bridge`
   const ws = new WebSocket(url, ['bearer', state.token])
   state.ws = ws
   ws.onopen = () => {

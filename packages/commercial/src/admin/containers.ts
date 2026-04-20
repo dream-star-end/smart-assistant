@@ -122,15 +122,27 @@ export class ContainerNotFoundError extends Error {
   constructor(id: bigint | string) { super(`agent_container not found: ${String(id)}`); this.name = "ContainerNotFoundError"; }
 }
 
+/** v3 行 docker_name=NULL(0017 drop NOT NULL),admin v2 操作路径无法处理 → 抛专用 error。 */
+export class V3RowNotSupportedError extends Error {
+  constructor(id: bigint | string) {
+    super(`agent_container ${String(id)} is a v3 row (docker_name NULL); admin actions go through v3 path (Phase 5 TODO)`);
+    this.name = "V3RowNotSupportedError";
+  }
+}
+
 /** 由 id 查 user_id(num)+ docker_name,用于操作 docker。 */
 async function lookupContainer(id: bigint | string): Promise<{ userId: number; dockerName: string } | null> {
-  const r = await query<{ user_id: string; docker_name: string }>(
+  const r = await query<{ user_id: string; docker_name: string | null }>(
     `SELECT user_id::text AS user_id, docker_name FROM agent_containers WHERE id = $1`,
     [String(id)],
   );
   if (r.rows.length === 0) return null;
   const n = Number(r.rows[0].user_id);
   if (!Number.isInteger(n) || n <= 0) throw new RangeError("invalid_user_id_in_row");
+  // v3 行 docker_name=NULL(0017 后允许)。v2 admin 路径(restart/stop/remove)拿 docker_name
+  // 直接喂 dockerode,NULL 喂下去会撞难看的 "No such container: undefined";不如这里 fast-fail
+  // 让上层翻 400 给 admin UI,文案明确。Phase 5 真正接 v3 admin 时这里会 dispatch 走另一条。
+  if (!r.rows[0].docker_name) throw new V3RowNotSupportedError(id);
   return { userId: n, dockerName: r.rows[0].docker_name };
 }
 

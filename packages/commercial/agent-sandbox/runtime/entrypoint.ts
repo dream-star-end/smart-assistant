@@ -83,7 +83,12 @@ try {
       auth: {
         // 容器内不做真 OAuth,所有 anthropic 调用走 ANTHROPIC_AUTH_TOKEN 注入到 ccb subprocess
         mode: "subscription",
+        // **指 prebuilt dist 而不是 src/entrypoints/cli.tsx** —— 容器镜像里
+        // 只有 node 没有 bun,直接 fork .tsx 入口会因 MACRO undefined 立即 exit 1。
+        // dist/cli.js 是 bun build 后的产物(post-process 过 import.meta.require → node 兼容,
+        // MACRO 已 inline),node 直接跑通。镜像 build 阶段由 build-image.sh 预先 bun build。
         claudeCodePath: "/opt/openclaude/claude-code-best",
+        claudeCodeEntry: "dist/cli.js",
         claudeCodeRuntime: "node",
       },
       // 必填占位:个人版 gateway.ts 在启动时直接读 config.channels.wechat / .telegram

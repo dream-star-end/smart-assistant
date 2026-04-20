@@ -535,6 +535,14 @@ export async function provisionV3Container(
       `ANTHROPIC_AUTH_TOKEN=${token}`,
       "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
       `CLAUDE_CONFIG_DIR=${V3_CONFIG_TMPFS_PATH}`,
+      // **bridge IP trust 旁路只在 v3 supervisor 真正 spawn 容器时注入**:
+      //   bridge 经 docker bridge gateway 172.30.0.1 把 ws upgrade 转给容器 18789/ws,
+      //   bridge 不持有容器 personal-version accessToken,所以 personal-version 在
+      //   /opt/openclaude/openclaude/packages/gateway/src/server.ts 加了一个 "源 IP =
+      //   $OPENCLAUDE_TRUST_BRIDGE_IP 时跳过 token 校验" 的旁路。env 不设默认 noop,
+      //   全靠 supervisor 显式注入,确保镜像哪怕被旁路其他渠道跑起来也仍然 fail-closed。
+      //   不在 entrypoint.sh 兜默认值 — 避免镜像变成"只要 host 能从 172.30.0.1 触达就免认证"。
+      `OPENCLAUDE_TRUST_BRIDGE_IP=${V3_GATEWAY_IP}`,
     ];
 
     let container;
@@ -726,7 +734,11 @@ export async function getV3ContainerStatus(
     port: number;
     container_internal_id: string | null;
   }>(
-    `SELECT id, user_id, bound_ip::text AS bound_ip, port, container_internal_id
+    // host(bound_ip): PG INET 类型 ::text 会带 /32 netmask(e.g. 172.30.227.97/32),
+    // 这串拼进 ws://host:port/ws 会让 dns lookup 直接 fail,readiness probe 永远 false,
+    // ensureRunning 路径表现为 4503 reason="starting" 死循环。host(inet) 只取地址本体,
+    // 与 IPv4/IPv6 都兼容,与 provision 路径 INSERT 时传入的 JS string 一致。
+    `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id
        FROM agent_containers
       WHERE user_id = $1::bigint AND state='active'
       LIMIT 1`,

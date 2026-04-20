@@ -277,10 +277,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       ws.on("close", onEarlyClose);
 
       void (async () => {
-        // 1) JWT 验证
-        const token = url.searchParams.get("token") ?? "";
+        // 1) JWT 验证 — token 来源优先级与 personal-version gateway extractToken 一致:
+        //    Sec-WebSocket-Protocol "bearer, <token>" > Authorization Bearer > ?token=
+        //    前端 `new WebSocket(url, ['bearer', token])` 会发 Sec-WebSocket-Protocol
+        let token = "";
+        const protoHeader = req.headers["sec-websocket-protocol"];
+        if (typeof protoHeader === "string") {
+          const protos = protoHeader.split(",").map((s) => s.trim());
+          if (protos.includes("bearer") && protos.length >= 2) {
+            token = protos[protos.length - 1] ?? "";
+          }
+        }
         if (!token) {
-          sendErrorFrame(ws, "UNAUTHORIZED", "missing token query param");
+          const authHeader = req.headers.authorization;
+          if (typeof authHeader === "string") {
+            token = authHeader.replace(/^Bearer\s+/i, "").trim();
+          }
+        }
+        if (!token) {
+          token = url.searchParams.get("token") ?? "";
+        }
+        if (!token) {
+          sendErrorFrame(ws, "UNAUTHORIZED", "missing token (bearer/protocol/query)");
           try { ws.close(CLOSE_BRIDGE.POLICY, "unauthorized"); } catch { /* */ }
           return;
         }

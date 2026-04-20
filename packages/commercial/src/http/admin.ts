@@ -64,6 +64,7 @@ import {
   adminStopContainer,
   adminRemoveContainer,
   ContainerNotFoundError,
+  V3RowNotSupportedError,
   type AdminContainerRowView,
 } from "../admin/containers.js";
 import {
@@ -912,6 +913,9 @@ export async function handleAdminAgentContainerAction(
     else await adminRemoveContainer(id, agent.docker, auditCtx);
   } catch (err) {
     if (err instanceof ContainerNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
+    // 0017 后 v2 admin 操作路径碰到 v3 行(docker_name=NULL)→ 400,文案明确,
+    // 不要让 dockerode 抛 "No such container: undefined" 这种 5xx 看不懂的错。
+    if (err instanceof V3RowNotSupportedError) throw new HttpError(400, "V3_NOT_SUPPORTED", err.message);
     throw err;
   }
   sendJson(res, 200, { ok: true, action });

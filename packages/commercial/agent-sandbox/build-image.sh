@@ -81,6 +81,23 @@ mkdir -p "$IMAGE_OUT_DIR"
 rm -rf "$BUILD_CTX"
 mkdir -p "$BUILD_CTX/personal-version"
 
+# 0. **预构建 claude-code-best dist** (容器内只有 node,没有 bun,需 prebuild)
+#    build.ts 走 Bun.build target=bun,后处理 import.meta.require → node 兼容
+#    产物 node dist/cli.js 直接可跑(MACRO defines 已烤进产物)
+if ! command -v bun >/dev/null 2>&1; then
+  echo "[build-image] FATAL: 没 bun (~/.bun/bin/bun) — 无法 prebuild claude-code-best/dist" >&2
+  exit 1
+fi
+if [ -d "$PERSONAL_SRC/claude-code-best" ]; then
+  echo "[build-image] prebuild $PERSONAL_SRC/claude-code-best/dist (bun)"
+  ( cd "$PERSONAL_SRC/claude-code-best" && bun install --silent && bun run build ) \
+    || { echo "[build-image] FATAL: ccb prebuild 失败" >&2; exit 1; }
+  if [ ! -f "$PERSONAL_SRC/claude-code-best/dist/cli.js" ]; then
+    echo "[build-image] FATAL: prebuild 完成但 dist/cli.js 不存在" >&2
+    exit 1
+  fi
+fi
+
 echo "[build-image] rsync $PERSONAL_SRC → $BUILD_CTX/personal-version/"
 # --delete 让 dest 和 src 完全一致;
 # 排除所有镜像里不需要 + 体积大的东西:node_modules(容器内 npm install 重装),
@@ -89,7 +106,7 @@ rsync -a --delete \
   --exclude='node_modules/' \
   --exclude='.git/' \
   --exclude='.gitignore' \
-  --exclude='dist/' \
+  --exclude='/dist/' \
   --exclude='build/' \
   --exclude='.next/' \
   --exclude='.turbo/' \
@@ -109,6 +126,17 @@ rsync -a --delete \
   --exclude='.openclaude-dev/' \
   --exclude='*.pem' \
   --exclude='*.key' \
+  --exclude='.ssh/' \
+  --exclude='.aws/' \
+  --exclude='.gnupg/' \
+  --exclude='.npmrc' \
+  --exclude='.netrc' \
+  --exclude='.bash_history' \
+  --exclude='.zsh_history' \
+  --exclude='.claude/' \
+  --exclude='.codex/' \
+  --exclude='.codex' \
+  --exclude='.playwright-mcp/' \
   "$PERSONAL_SRC/" "$BUILD_CTX/personal-version/"
 
 # 2. Dockerfile + runtime/

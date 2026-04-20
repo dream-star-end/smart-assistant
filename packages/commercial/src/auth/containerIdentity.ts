@@ -145,7 +145,11 @@ export function createPgIdentityRepo(pool: Pool): ContainerIdentityRepo {
         bound_ip: string;
         secret_hash: Buffer | null;
       }>(
-        `SELECT id, user_id, bound_ip::text AS bound_ip, secret_hash
+        // host(bound_ip):INET ::text 会带 /32(见 v3supervisor.getV3ContainerStatus
+        // 同名注释)。本路径 boundIp 只用作 ContainerIdentity.boundIp 透传给上游
+        // anthropicProxy 写 log,/32 不影响 WHERE 等值比较(WHERE 走 INET=$1),
+        // 但保持与其他读路径一致,避免 log 出现 "172.30.0.42/32" 难看也容易混淆。
+        `SELECT id, user_id, host(bound_ip) AS bound_ip, secret_hash
            FROM agent_containers
           WHERE state='active' AND bound_ip = $1
           LIMIT 1`,

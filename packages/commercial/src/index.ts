@@ -23,6 +23,7 @@ import { loadConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
+import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
 import { PricingCache } from "./billing/pricing.js";
@@ -570,6 +571,9 @@ export async function registerCommercial(
     jwtSecret,
     resolveContainerEndpoint,
     metrics: bridgeMetrics,
+    // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
+    // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
+    logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
   });
 
   // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
