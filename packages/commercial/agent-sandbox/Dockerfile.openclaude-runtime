@@ -1,0 +1,152 @@
+# syntax=docker/dockerfile:1.7
+# ------------------------------------------------------------
+# openclaude/openclaude-runtime  (v3 Phase 3A)
+# ------------------------------------------------------------
+# 每个商用版用户对应一个本镜像启动的容器。容器内跑**完整个人版 OpenClaude**
+# 的 gateway,但所有 Anthropic API 调用被 ANTHROPIC_BASE_URL 重定向到本机
+# v3 commercial gateway 的内部代理(172.30.0.1:18791),由内部代理负责账号
+# 池路由 + 计费 + 转发到真 Anthropic。
+#
+# 设计关键约束(对齐 docs/v3/02-DEVELOPMENT-PLAN.md §4.3 + §13.3):
+#   - 非 root 运行(uid=1000:1000),supervisor 也会再设一次 User=1000:1000
+#   - ENTRYPOINT 强制 unset 所有 provider 路由 env(用 personal-version 的
+#     `isProviderManagedEnvVar` helper,无漂移),只保留 supervisor 注入的
+#     ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+#   - 强制 CLAUDE_CONFIG_DIR=/run/oc/claude-config(supervisor 用 --tmpfs 挂)
+#     防 ~/.claude/settings.json 残留覆盖
+#   - 个人版 gateway 默认绑 0.0.0.0:18789,docker bridge net 内 commercial
+#     gateway 通过 bound_ip:18789 直连
+#
+# Build context 期待布局(由 Phase 3B 的 build-image.sh 准备):
+#   ./Dockerfile.openclaude-runtime
+#   ./runtime/entrypoint.sh
+#   ./runtime/entrypoint.ts
+#   ./personal-version/         <-- rsync 自 /opt/openclaude/openclaude/
+#       package.json
+#       packages/...
+#       claude-code-best/...
+#
+# 构建命令(供 3B 参考):
+#   docker build -f Dockerfile.openclaude-runtime -t openclaude/openclaude-runtime:<tag> .
+# ------------------------------------------------------------
+
+FROM node:22-slim AS base
+
+# 时区 + 语言环境(显式 Asia/Shanghai 与商用版宿主同步;不依赖 host 默认)
+ENV TZ=Asia/Shanghai \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    DEBIAN_FRONTEND=noninteractive \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false
+
+# 必装工具(精挑,避免镜像膨胀):
+#   - git / curl / ca-certificates: 个人版 ccb subprocess + 网络请求基本依赖
+#   - ripgrep / jq: 个人版 grep tool / 通用 shell 工具链
+#   - tini: PID 1 转发 SIGTERM 给 entrypoint,避免 zombie
+#   - bash: entrypoint.sh 用 bash
+# 不装: sudo / su / vim / python3(用户不应在容器内开 shell;agent 需要
+# 时由 ccb 子进程通过 Bash tool 执行,直接走 bash + apt 在 ccb 上下文里装)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        ca-certificates \
+        ripgrep \
+        jq \
+        tini \
+        bash \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
+    # 清掉 setuid/setgid 二进制(05-SEC §13 精神,减少本地提权面)
+    && find / -xdev -perm -4000 -type f 2>/dev/null | xargs -r chmod u-s \
+    && find / -xdev -perm -2000 -type f 2>/dev/null | xargs -r chmod g-s
+
+# ------------------------------------------------------------
+# 账户 agent (uid=1000)
+# ------------------------------------------------------------
+# node:22-slim 自带 uid=1000 的 node 用户;先 userdel 改名 agent,supervisor
+# 按 uid 认人,但 ps 看到 agent 更直观。
+# HOME = /home/agent,与 supervisor 的 volume 挂载点对齐。
+RUN set -eux; \
+    if id -u node >/dev/null 2>&1; then userdel -r node; fi; \
+    groupadd -g 1000 agent; \
+    useradd -u 1000 -g 1000 -m -d /home/agent -s /bin/bash agent; \
+    # /home/agent/.openclaude: supervisor 会把 oc-v3-data-u<uid> volume 挂到这里
+    # 镜像里建空目录 + chown,首次挂载时 docker 会保留 ownership
+    mkdir -p /home/agent/.openclaude; \
+    chown -R agent:agent /home/agent; \
+    chmod 750 /home/agent; \
+    # /run/oc/claude-config: CLAUDE_CONFIG_DIR 目标(supervisor --tmpfs 挂)。
+    # 镜像里建空目录,本地 build smoke 测试时若没挂 tmpfs 退到 root fs 也能跑。
+    mkdir -p /run/oc/claude-config; \
+    chown agent:agent /run/oc/claude-config; \
+    chmod 0700 /run/oc/claude-config
+
+# ------------------------------------------------------------
+# Personal-version 源码 + npm install
+# ------------------------------------------------------------
+# COPY 整个个人版源码树(含 claude-code-best 子目录),目标 /opt/openclaude
+# build context 由 3B 脚本用 rsync 准备(排除 node_modules / .git / dist 等)
+COPY --chown=agent:agent ./personal-version/ /opt/openclaude/
+
+# install 全部依赖(包括 devDependencies,因为 personal version 用 tsx 跑 .ts 入口)
+# claude-code-best 是 workspace 子模块以外的子目录,需要单独 install
+#
+# 用 `npm install` 而不是 `npm ci`: personal-version 仓库 package-lock.json 经常
+# 和 node_modules 漂移(有些 napi/native 子包按平台条件装),`npm ci` 会以 strict
+# 校验 lock vs 实际安装失败。`npm install` 容忍漂移直接按 package.json 装。
+# trade-off: 比 ci 慢一些,但镜像 build 是周期性动作(每次发版几次),可以接受。
+WORKDIR /opt/openclaude
+RUN set -eux; \
+    npm install --include=dev --no-audit --no-fund; \
+    # claude-code-best 是个人版 spawn 的 ccb 子目录,自己一份 package.json
+    # 即使 v3 容器内不一定 spawn ccb(内部代理走 anthropic SDK),先把依赖装好
+    # 避免某些 chat 模式触发 ccb 时再缺包
+    if [ -d /opt/openclaude/claude-code-best ]; then \
+        # --ignore-scripts: 跳过 claude-code-best 的 prepare 钩子(`git config core.hooksPath`),
+        # 镜像里没有 .git 目录,prepare 会 exit 128 把 install 整体 fail
+        cd /opt/openclaude/claude-code-best && \
+            npm install --include=dev --ignore-scripts --no-audit --no-fund || \
+            echo "[build] WARN: claude-code-best npm install failed, ccb spawn 模式可能不可用"; \
+    fi; \
+    # 清 npm 缓存
+    npm cache clean --force; \
+    rm -rf /root/.npm /tmp/* /var/tmp/*
+
+# /opt/openclaude 改 ownership 给 agent(npm ci 期间是 root 跑的)
+RUN chown -R agent:agent /opt/openclaude
+
+# ------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------
+# entrypoint.sh: 极薄 bash 壳,校验 supervisor 注入的 3 个 anthropic env,
+#                确保 CLAUDE_CONFIG_DIR 目录存在,然后 exec 到 entrypoint.ts
+# entrypoint.ts: 用 tsx 跑,import personal-version 的 isProviderManagedEnvVar
+#                helper 遍历 env 把所有 provider 路由变量 unset(留 3 个白名单),
+#                然后 spawn `npm run gateway`,转发 SIGTERM/SIGINT,退出码透传
+COPY --chown=root:root ./runtime/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chown=root:root ./runtime/entrypoint.ts /usr/local/lib/openclaude/entrypoint.ts
+RUN chmod 0755 /usr/local/bin/entrypoint.sh && \
+    chmod 0644 /usr/local/lib/openclaude/entrypoint.ts
+
+# ------------------------------------------------------------
+# 运行时配置
+# ------------------------------------------------------------
+WORKDIR /opt/openclaude
+
+# 强制非 root(双重保险,supervisor 也会设 User=1000:1000)
+USER agent:agent
+
+# 个人版 gateway 内部监听端口(默认 18789,见 personal-version
+# packages/storage/src/config.ts L48)。supervisor 会通过容器 bound_ip:18789
+# 直连,不暴露到宿主公网。
+EXPOSE 18789
+
+# tini 做 PID 1,转发信号给 entrypoint.sh
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+
+LABEL org.opencontainers.image.title="openclaude-runtime" \
+      org.opencontainers.image.description="Per-user OpenClaude personal-version sandbox (v3 commercial)" \
+      org.opencontainers.image.source="https://github.com/anthropics/openclaude" \
+      org.opencontainers.image.licenses="proprietary"
