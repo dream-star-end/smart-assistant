@@ -461,6 +461,55 @@ describe("auth.verify.requestPasswordReset (integ)", () => {
       // First row (expired) — used_at still null
       assert.equal(after.rows[0].used_at, null, "expired token row must not be re-marked used");
     });
+
+    // 2026-04-21 codex round 1 finding #5 FAIL 修复回归测试:
+    // 并发两次 reset request 必须被 per-user 行锁串行化,
+    // 任意时刻最多只有一张未消费 reset token。
+    test("concurrent reset requests are serialized — at most one active token", async (t) => {
+      if (skipIfNoPg(t)) return;
+      const { userId } = await registerAndCaptureVerifyToken(
+        "tracy-race@example.com",
+        "pwd tracy",
+      );
+
+      // 同一 user 同时打 5 个 reset request
+      const mailers = Array.from({ length: 5 }, () => new CapturingMailer());
+      await Promise.all(
+        mailers.map((m) => requestPasswordReset("tracy-race@example.com", { mailer: m })),
+      );
+
+      // 所有请求都该收到邮件(语义不变)
+      assert.equal(
+        mailers.filter((m) => m.sent.length === 1).length,
+        5,
+        "all 5 concurrent requests must produce a mail",
+      );
+
+      // 但 DB 中 active(未消费 + 未过期)的 reset_password 行只能有 1 张
+      const activeRows = await query<{ cnt: string }>(
+        `SELECT COUNT(*)::text AS cnt
+           FROM email_verifications
+          WHERE user_id = $1
+            AND purpose = 'reset_password'
+            AND used_at IS NULL
+            AND expires_at > NOW()`,
+        [userId],
+      );
+      assert.equal(
+        activeRows.rows[0].cnt,
+        "1",
+        "concurrent requests must collapse to a single active token (per-user row lock)",
+      );
+
+      // 总行数 = 5(每次都 INSERT 一行,前 4 张都被后续请求 UPDATE used_at 作废)
+      const totalRows = await query<{ cnt: string }>(
+        `SELECT COUNT(*)::text AS cnt
+           FROM email_verifications
+          WHERE user_id = $1 AND purpose = 'reset_password'`,
+        [userId],
+      );
+      assert.equal(totalRows.rows[0].cnt, "5", "total rows = number of requests");
+    });
   });
 });
 

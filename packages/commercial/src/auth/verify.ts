@@ -239,8 +239,16 @@ export async function requestPasswordReset(
   const expiresIso = new Date((ts + RESET_PASSWORD_TTL_SECONDS) * 1000).toISOString();
 
   // 安全审计 MED:先作废同一用户之前所有未消费/未过期的 reset_password token,
-  // 再插入新行 —— 同一事务保证并发申请也只能让最后一张生效。
+  // 再插入新行 —— 同一事务 + per-user 行锁保证并发申请被串行化,
+  // 任意时刻只有最后一张 reset 链接有效。
+  //
+  // 修复 (codex round 1 finding #5 FAIL): 之前事务里直接 UPDATE+INSERT 在
+  // READ COMMITTED 下,并发两个 reset request 各自看不到对方的 INSERT,
+  // 仍可同时插出两张 active token —— 串行化失效。
+  // 用 SELECT 1 FROM users WHERE id=$1 FOR UPDATE 锁住该 user 行,
+  // 强制后到的事务 wait 第一个事务 commit,从而能 UPDATE 掉它刚插入的新行。
   await tx(async (client) => {
+    await client.query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE", [userId]);
     await client.query(
       `UPDATE email_verifications
           SET used_at = NOW()
