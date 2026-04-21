@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=32" />
+<link rel="stylesheet" href="/style.css?v=33" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -259,11 +259,10 @@
         </div>
       </div>
 
-      <!-- Tab switcher (hidden for URL-driven verify/reset modes) -->
+      <!-- Tab switcher: 仅 登录/注册 (忘记密码改成 login 表单内小链接) -->
       <div id="auth-tabs" class="auth-tabs" role="tablist">
         <button id="auth-tab-login" type="button" class="auth-tab is-active" role="tab">登录</button>
         <button id="auth-tab-register" type="button" class="auth-tab" role="tab">注册</button>
-        <button id="auth-tab-forgot" type="button" class="auth-tab" role="tab">忘记密码</button>
       </div>
 
   <!-- Shared error banner -->
@@ -273,6 +272,9 @@
   <div id="auth-mode-login" hidden>
     <input id="auth-login-email" type="email" placeholder="邮箱" autocomplete="email" style="margin-bottom:var(--space-2)" />
     <input id="auth-login-password" type="password" placeholder="密码" autocomplete="current-password" style="margin-bottom:var(--space-2)" />
+    <div class="auth-row-helper">
+      <button id="auth-tab-forgot" type="button" class="auth-link-btn">忘记密码?</button>
+    </div>
     <div id="turnstile-login" style="margin-bottom:var(--space-2);min-height:65px"></div>
     <button id="auth-login-btn" type="button" class="btn btn-primary btn-full">登录</button>
     <div id="auth-login-resend-row" hidden style="margin-top:var(--space-2);text-align:center">
@@ -311,6 +313,9 @@
       <input id="auth-forgot-email" type="email" placeholder="邮箱" autocomplete="email" style="margin-bottom:var(--space-2)" />
       <div id="turnstile-forgot" style="margin-bottom:var(--space-2);min-height:65px"></div>
       <button id="auth-forgot-btn" type="button" class="btn btn-primary btn-full">发送重置链接</button>
+      <div style="margin-top:var(--space-3);text-align:center">
+        <button id="auth-forgot-back-btn" type="button" class="auth-link-btn">← 返回登录</button>
+      </div>
     </div>
     <div id="auth-forgot-success" hidden style="text-align:center;padding:var(--space-3) 0">
       <div style="font-size:32px;margin-bottom:var(--space-2)">✓</div>
@@ -318,6 +323,7 @@
       <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">
         若 <span id="auth-forgot-success-email" style="color:var(--fg)"></span> 已注册,你将很快收到重置链接。请检查垃圾邮件。
       </p>
+      <button id="auth-forgot-success-back-btn" type="button" class="btn btn-ghost" style="margin-top:var(--space-3);font-size:13px">返回登录</button>
     </div>
   </div>
 
@@ -1033,6 +1039,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=31"></script>
+<script type="module" src="/modules/main.js?v=32"></script>
 </body>
 </html>

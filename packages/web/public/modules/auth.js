@@ -215,6 +215,15 @@ export async function initAuth() {
   $('auth-reset-btn')?.addEventListener('click', _doConfirmReset)
   $('auth-resend-verify-btn')?.addEventListener('click', _doResendVerification)
   $('auth-verify-back-btn')?.addEventListener('click', () => setMode('login'))
+  $('auth-forgot-back-btn')?.addEventListener('click', () => setMode('login'))
+  $('auth-forgot-success-back-btn')?.addEventListener('click', () => {
+    // 重置 forgot 子视图回到 form,以便下次进入仍是邮箱输入态
+    const form = $('auth-forgot-form')
+    const ok = $('auth-forgot-success')
+    if (form) form.hidden = false
+    if (ok) ok.hidden = true
+    setMode('login')
+  })
   $('auth-register-back-btn')?.addEventListener('click', () => {
     // Reset register sub-view back to the form for next time
     const form = $('auth-register-form')
