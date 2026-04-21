@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=33" />
+<link rel="stylesheet" href="/style.css?v=34" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -41,7 +41,7 @@
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
       </button>
       <button type="button" id="landing-login-btn" class="btn btn-ghost landing-btn-sm">登录</button>
-      <button type="button" id="landing-register-btn" class="btn btn-primary landing-btn-sm">免费注册</button>
+      <button type="button" id="landing-register-btn" class="btn btn-primary landing-btn-sm">立即注册</button>
     </div>
   </header>
 
@@ -61,17 +61,17 @@
       </p>
       <div class="landing-hero-ctas">
         <button type="button" id="landing-hero-register-btn" class="btn btn-primary landing-btn-lg">
-          免费开始使用
+          立即开始
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
         </button>
         <button type="button" id="landing-hero-login-btn" class="btn btn-ghost landing-btn-lg">已有账号 → 登录</button>
       </div>
       <div class="landing-hero-meta">
+        <span><strong>1 元 = $1 美元</strong> token 额度</span>
+        <span class="landing-meta-sep">·</span>
         <span>官方 Claude Code Max 通道</span>
         <span class="landing-meta-sep">·</span>
         <span>满血 Opus 4.7 / Sonnet 4.6</span>
-        <span class="landing-meta-sep">·</span>
-        <span>按 token 精确计费</span>
       </div>
     </div>
   </section>
@@ -94,7 +94,7 @@
           <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg>
         </div>
         <h3>满血 Opus,不降智</h3>
-        <p>完整 thinking budget、不阉割上下文、不锁工具调用。Opus 4.7 / Sonnet 4.6 / Haiku 4.5 全系按需切换,推理深度可调到极限。</p>
+        <p>完整 thinking budget、不阉割上下文、不锁工具调用。Opus 4.7 / Sonnet 4.6 按需切换,推理深度可调到极限。</p>
       </div>
       <div class="landing-card">
         <div class="landing-card-icon">
@@ -117,7 +117,7 @@
     <div class="landing-section-head">
       <span class="landing-section-tag">模型矩阵</span>
       <h2 class="landing-section-title">全系 Claude 模型,定价透明到 token</h2>
-      <p class="landing-section-sub">输入 / 输出 / 缓存读写 全部分项标价,1 积分 = ¥1。</p>
+      <p class="landing-section-sub">输入 / 输出 / 缓存读写 全部分项标价。<strong>1 元 = $1 美元 = 100 积分</strong>,直接对标官网定价。</p>
     </div>
     <div id="landing-models" class="landing-models">
       <div class="landing-models-loading">加载中…</div>
@@ -154,7 +154,7 @@
       </details>
       <details class="landing-faq-item">
         <summary>计费方式是按月订阅还是按量?</summary>
-        <p>按量计费。充值后按实际 input / output token 扣账户余额,1 积分 = ¥1,精确到分。不用就不扣,余额永不过期。</p>
+        <p>按量计费。充值后按实际 input / output token 扣账户余额。<strong>1 元 = $1 美元 = 100 积分</strong>(1 积分 ≈ $0.01),精确到分。不用就不扣,余额永不过期。</p>
       </details>
       <details class="landing-faq-item">
         <summary>Agent 模式跑在哪里?数据安全吗?</summary>
@@ -178,7 +178,7 @@
   <section class="landing-cta-band">
     <div class="landing-cta-inner">
       <h2>准备好让 AI 替你干活了吗?</h2>
-      <p>邮箱注册即可开始,无需信用卡。第一次充值 ¥10 起。</p>
+      <p>邮箱注册即可开始,微信扫码充值,首次 ¥10 起。1 元 = $1 美元 token 额度,余额永不过期。</p>
       <button type="button" id="landing-foot-register-btn" class="btn btn-primary landing-btn-lg">立即开始 →</button>
     </div>
   </section>
@@ -216,7 +216,7 @@
           <span class="login-aside-title-accent">所有 Claude 能力</span>
         </h1>
         <p class="login-aside-sub">
-          Claude Opus 4.7 · Sonnet 4.6 · Haiku 4.5,按 token 计费,内置多模态生成、独立 Agent 工作空间、长期记忆与定时任务。
+          Claude Opus 4.7 · Sonnet 4.6,按 token 计费,内置多模态生成、独立 Agent 工作空间、长期记忆与定时任务。
         </p>
       </div>
       <ul class="login-aside-bullets">
@@ -1039,6 +1039,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=32"></script>
+<script type="module" src="/modules/main.js?v=33"></script>
 </body>
 </html>

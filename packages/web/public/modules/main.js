@@ -1161,7 +1161,6 @@ function _ktokToYuanPretty(creditsPerKtok) {
 function _modelTagFor(id) {
   if (/opus/i.test(id)) return '旗舰推理'
   if (/sonnet/i.test(id)) return '日常对话'
-  if (/haiku/i.test(id)) return '极速响应'
   return '通用'
 }
 async function _loadLandingData() {
@@ -1237,16 +1236,18 @@ async function _loadLandingData() {
       const featuredCode = 'plan-200'
       wrap.innerHTML = plans.map((p) => {
         const yuan = Math.round(Number(p.amount_cents) / 100)
-        const credits = Math.round(Number(p.credits) / 100) // 1 积分 = 100 raw cents
-        const baseCredits = yuan
-        const bonus = credits - baseCredits
-        const bonusPct = baseCredits > 0 ? Math.round((bonus / baseCredits) * 100) : 0
+        // 积分单位:1 元 = 100 积分 = $1 美元 = 100 美分。
+        // p.credits 是 raw cents,直接当积分数显示。
+        const credits = Math.round(Number(p.credits))
+        const baseCredits = yuan * 100
+        const bonusCredits = credits - baseCredits
+        const bonusPct = baseCredits > 0 ? Math.round((bonusCredits / baseCredits) * 100) : 0
         const featured = p.code === featuredCode
         return `
           <div class="landing-plan${featured ? ' landing-plan-featured' : ''}">
             <div class="landing-plan-amount"><span class="yuan">¥</span>${yuan}</div>
-            <div class="landing-plan-credits">${credits} 积分</div>
-            <div class="landing-plan-bonus">${bonus > 0 ? `赠 ${bonus} 积分 (+${bonusPct}%)` : '基础档'}</div>
+            <div class="landing-plan-credits">${credits.toLocaleString('zh-CN')} 积分</div>
+            <div class="landing-plan-bonus">${bonusCredits > 0 ? `多送 ${bonusCredits.toLocaleString('zh-CN')} 积分 (+${bonusPct}%)` : '基础档'}</div>
           </div>
         `
       }).join('')
