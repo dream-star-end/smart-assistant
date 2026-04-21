@@ -519,10 +519,21 @@ export type MessageLike = {
  *      clientMsgs has a message with the same id, replace it with the
  *      server version; if clientMsgs lacks that id, re-append the server
  *      version.
- *   2. Every non-server-authored entry stays exactly as the client sent it.
- *   3. Result is sorted by ts ascending; ties preserve insertion order
+ *   2. Every non-server-authored entry stays exactly as the client sent it,
+ *      EXCEPT for the "phantom-assistant dedupe" in rule 3.
+ *   3. **Phantom-assistant dedupe** (Phase 0.4 P0-3 fix): client and server
+ *      use independent assistant message IDs (client uses `m-*` from
+ *      msgId(); server writes `srv-${peerId}-t${turnIndex}`). When a turn
+ *      completes, BOTH can end up in `merged`: the client's partially-
+ *      streamed copy AND the server-authored authoritative copy. We drop
+ *      the client one when it is adjacent in the ts-sorted array to a
+ *      server-authored assistant message (no user message between them =
+ *      same turn). Never drops a server-authored entry. Without this rule
+ *      the user sees every assistant response twice after any mobile-
+ *      background recovery.
+ *   4. Result is sorted by ts ascending; ties preserve insertion order
  *      (Array.prototype.sort is stable in ES2019+).
- *   4. If there are zero server-authored entries, `clientMsgs` is returned
+ *   5. If there are zero server-authored entries, `clientMsgs` is returned
  *      verbatim (no copy, same reference) — callers rely on this as a fast
  *      path.
  */
@@ -549,11 +560,44 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
     }
     return m
   })
-  for (const [id, msg] of serverAuthored) {
-    if (!clientIds.has(id)) merged.push(msg)
+  for (const [, msg] of serverAuthored) {
+    if (typeof msg.id === 'string' && !clientIds.has(msg.id)) merged.push(msg)
   }
   merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
-  return merged
+
+  // Phantom-assistant dedupe (rule 3): walk the sorted merged[] and drop any
+  // non-server-authored assistant message that is adjacent to a server-
+  // authored assistant message. Adjacency in the ts-sorted array means no
+  // user message separates them — they're both for the same turn, and the
+  // client copy is the partially-streamed phantom.
+  //
+  // Tolerates both adjacency orders:
+  //   - [client-phantom, server-authoritative] — typical: client stamped ts
+  //     during streaming (earlier), server stamped ts at turn completion.
+  //   - [server-authoritative, client-phantom] — possible if client clock
+  //     is ahead of server clock (time zone drift, device time off), or the
+  //     server's `Date.now()` at handleResult was earlier than whatever
+  //     wallclock the client used for its partial message.
+  // Never drops a server-authored message; never merges two server-authored
+  // messages (they always have different ids, hence different turns).
+  const deduped: T[] = []
+  const isAssistant = (m: T) => (m as { role?: string }).role === 'assistant'
+  for (let i = 0; i < merged.length; i++) {
+    const cur = merged[i]
+    if (!cur) { deduped.push(cur); continue }
+    const prev = i > 0 ? merged[i - 1] : undefined
+    const next = merged[i + 1]
+    // Drop cur if: cur is a non-server-authored assistant message AND either
+    // neighbour is a server-authored assistant for the same turn (adjacency).
+    const curIsPhantom = isAssistant(cur) && cur._source !== 'server'
+    const prevIsServerAsst = prev && isAssistant(prev) && prev._source === 'server'
+    const nextIsServerAsst = next && isAssistant(next) && next._source === 'server'
+    if (curIsPhantom && (prevIsServerAsst || nextIsServerAsst)) {
+      continue
+    }
+    deduped.push(cur)
+  }
+  return deduped
 }
 
 /**
@@ -786,12 +830,35 @@ export async function appendServerAuthoredMessageDurable(
   message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
 ): Promise<
   | { applied: true }
-  | { applied: false; reason: 'session_not_found' | 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'already_exists' | 'malformed' }
   | { applied: false; reason: 'queued_to_outbox'; error: string }
 > {
   try {
     const r = await appendServerAuthoredMessage(sessId, userId, message)
-    return r as { applied: true } | { applied: false; reason: 'session_not_found' | 'already_exists' | 'malformed' }
+    if (r.applied) return { applied: true }
+    // Phase 0.4 P1-3 fix: when the client_sessions row doesn't exist yet
+    // (first-turn race — client's debounced PUT hasn't landed before the
+    // REPL finished), don't silently drop the authoritative assistant text.
+    // Queue it to the durable outbox so the next replayMsgOutbox() run
+    // (startup, or the periodic replay hook) can persist it once the client
+    // has pushed the session row. Without this, a fast new-chat turn can
+    // lose its reply entirely if the user backgrounds the tab between
+    // submit and PUT.
+    if (r.reason === 'session_not_found') {
+      await queueMessageToOutbox({
+        sessId,
+        userId,
+        message,
+        queuedAt: Date.now(),
+        reason: 'session_not_found',
+      })
+      return { applied: false, reason: 'queued_to_outbox', error: 'session_not_found' }
+    }
+    // Upstream's signature types `reason` as optional, but every applied:false
+    // branch above sets one of {'session_not_found','already_exists','malformed'}.
+    // We've handled 'session_not_found'; the rest fall through here. Default
+    // to 'malformed' if reason is somehow missing (unreachable in practice).
+    return { applied: false, reason: r.reason ?? 'malformed' }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     try {

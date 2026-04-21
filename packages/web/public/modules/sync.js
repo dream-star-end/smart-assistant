@@ -205,8 +205,18 @@ export async function syncSessionsFromServer() {
     if (!local) {
       toFetch.push(meta.id)
     } else if (local._syncedAt && meta.updatedAt > local._syncedAt) {
-      // Server has a newer version than our last sync point (server clock only)
-      if (meta.id === state.currentSessionId && state.sendingInFlight) continue
+      // Server has a newer version than our last sync point (server clock only).
+      // Normally we skip the current in-flight session to avoid stomping a
+      // live stream — but if something has flagged the session's live
+      // stream as authoritatively broken (Phase 0.4 resume_failed sets
+      // `_liveStreamBroken = true`), we MUST refetch: the whole point of
+      // the force sync is to reconcile from the server-authored tape.
+      const live = state.sessions.get(meta.id)
+      if (
+        meta.id === state.currentSessionId &&
+        state.sendingInFlight &&
+        !live?._liveStreamBroken
+      ) continue
       toFetch.push(meta.id)
     }
   }
@@ -249,6 +259,14 @@ export async function syncSessionsFromServer() {
     if (existingLocal?._sendingInFlight) sess._sendingInFlight = true
     if (existingLocal?._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
     if (existingLocal?._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
+    // Phase 0.4: preserve the frameSeq cursor across a sync-driven session
+    // replacement. If we drop it, the next hello would claim `lastFrameSeq: 0`
+    // and the gateway would replay every frame still in its ring — delivering
+    // the same assistant deltas a second time to handleOutbound, which
+    // dedupes by frameSeq; with the cursor reset those deltas look like
+    // "new" frames and would be appended again. Keep the cursor aligned to
+    // whatever we had last processed so dedupe stays authoritative.
+    if (typeof existingLocal?._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
     _rebuildSearchIndex(sess)
     clearDeleteTombstone(sess.id) // Allow saving if session was previously deleted locally
     state.sessions.set(sess.id, sess)

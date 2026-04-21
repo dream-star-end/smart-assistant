@@ -84,10 +84,22 @@ export class OutboundRingBuffer {
    * Compute replay decision for a client cursor. Does NOT actually call
    * ws.send — returns the frames to send (or a miss reason) so the caller
    * can wire it to whatever transport it owns.
+   *
+   * **Age-based prune on read**: `store()` prunes by `maxAgeMs` only when
+   * new frames arrive. After an idle tail (turn finished, session quiescent)
+   * nothing calls `store()`, so stale frames older than `maxAgeMs` stay in
+   * the ring and would get replayed to a late-reconnecting client. That's
+   * not just wasted bytes — the client's authoritative state has likely
+   * moved on (REST sync, other tabs), and replaying a stale transcript
+   * slice can resurrect deleted content or conflict with Phase 0.1 server-
+   * authored merges. We prune again here so a long-idle session that wakes
+   * up for a resume attempt either serves fresh frames or honestly reports
+   * `buffer_miss`, forcing the client down the REST-authoritative path.
    */
-  peekReplay(sessionKey: string, fromSeq: number): ReplayResult {
+  peekReplay(sessionKey: string, fromSeq: number, now: number = Date.now()): ReplayResult {
     const currentLast = this.lastSeq.get(sessionKey) ?? 0
     const ring = this.rings.get(sessionKey)
+    if (ring) this.prune(ring, now)
     if (fromSeq > currentLast) {
       // Client claims to have seen frames we don't know about. If we have
       // no ring for this sessionKey at all, assume the server restarted and

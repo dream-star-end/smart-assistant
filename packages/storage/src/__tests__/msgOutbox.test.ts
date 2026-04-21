@@ -210,4 +210,44 @@ describe('appendServerAuthoredMessageDurable', () => {
     const raw = await readFile(paths.msgOutbox, 'utf8').catch(() => '')
     assert.equal(raw, '', 'already_exists must not enqueue to outbox')
   })
+
+  it('P1-3: session_not_found is queued to outbox, not silently dropped', async () => {
+    // Reset outbox — earlier tests in this suite may have left entries.
+    await writeFile(paths.msgOutbox, '', 'utf8')
+
+    // First-turn race: CCB emits assistant text before the client has PUT
+    // the session row. The durable wrapper must queue (not drop) so a later
+    // replayMsgOutbox() can persist once the PUT has landed.
+    const r = await appendServerAuthoredMessageDurable('sess-does-not-exist', 'user-A', {
+      id: 'srv-sess-does-not-exist-t1',
+      role: 'assistant',
+      text: 'first-turn reply',
+      ts: 500,
+    })
+    assert.equal(r.applied, false)
+    if (r.applied) return
+    assert.equal(r.reason, 'queued_to_outbox', 'must route through outbox, not silently drop')
+    assert.equal(r.error, 'session_not_found')
+
+    // Outbox now carries the entry.
+    const raw = await readFile(paths.msgOutbox, 'utf8')
+    assert.ok(raw.includes('srv-sess-does-not-exist-t1'), 'queued line must reference the message id')
+
+    // Simulate the client's PUT landing later, then replay — entry should apply.
+    await upsertClientSession({
+      id: 'sess-does-not-exist',
+      userId: 'user-A',
+      agentId: 'default',
+      title: '',
+      pinned: false,
+      createdAt: 0, lastAt: 0, updatedAt: 0,
+      messages: [] as unknown[],
+    } as any)
+    const summary = await replayMsgOutbox()
+    assert.equal(summary.applied, 1, 'replay persists the queued first-turn reply')
+    const sess = await getClientSession('sess-does-not-exist')
+    assert.ok(sess)
+    const msgs = sess!.messages as Array<{ id?: string }>
+    assert.ok(msgs.some((m) => m.id === 'srv-sess-does-not-exist-t1'), 'replayed message now in session')
+  })
 })

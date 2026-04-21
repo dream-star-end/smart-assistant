@@ -147,6 +147,108 @@ describe('mergePreservingServerAuthored', () => {
     assert.equal(JSON.stringify(server), serverSnap)
     assert.equal(JSON.stringify(client), clientSnap)
   })
+
+  // ── P0-3: phantom-assistant dedupe ──────────────────────────────────────
+  // Client uses `m-*` ids (from msgId()), server writes `srv-${peerId}-t*`.
+  // After a mobile-background recovery the merge can land with BOTH entries
+  // for the same turn and the user would see duplicate assistant bubbles.
+
+  it('P0-3: drops client phantom when server-authored lands at a later ts (typical)', () => {
+    // User asked, client saw partial stream and stamped m-1 with ts during
+    // the stream; server finalised the turn later and stamped srv-1 at turn
+    // completion. Adjacency order after sort: [m-1, srv-1].
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user', 'hello'),
+      srv('srv-1', 200, 'full server text'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user', 'hello'),
+      { id: 'm-1', ts: 150, role: 'assistant', text: 'partial...' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'srv-1'],
+      'client phantom m-1 dropped, server srv-1 kept',
+    )
+    const srvEntry = out.find((m) => m.id === 'srv-1')!
+    assert.equal(srvEntry.text, 'full server text')
+    assert.equal(srvEntry._source, 'server')
+  })
+
+  it('P0-3: drops client phantom when server-authored lands at an EARLIER ts (clock drift)', () => {
+    // Client's wallclock is ahead of server's — client m-1 ts=250 vs srv-1
+    // ts=200. Sorted adjacency becomes [srv-1, m-1] (reverse of typical).
+    // Dedupe must still drop m-1.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srv('srv-1', 200, 'server text'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      { id: 'm-1', ts: 250, role: 'assistant', text: 'partial' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'srv-1'],
+      'client phantom m-1 dropped despite being sorted after srv-1',
+    )
+  })
+
+  it('P0-3: does not drop legitimate adjacent assistant from a different turn', () => {
+    // Two separate turns, each with its own user+assistant. The first turn's
+    // assistant is server-authored (recovery after background), the second
+    // turn's assistant is client-only (the user is mid-new-turn). Client's
+    // m-2 must NOT be dropped — it's in a different turn, separated by u-2.
+    const server: Msg[] = [
+      cli('u-1', 100, 'user'),
+      srv('srv-1', 200, 'turn1 server'),
+    ]
+    const client: Msg[] = [
+      cli('u-1', 100, 'user'),
+      cli('u-2', 300, 'user'),
+      { id: 'm-2', ts: 400, role: 'assistant', text: 'turn2 client-only' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-1', 'srv-1', 'u-2', 'm-2'],
+      'client m-2 preserved — it is in a different turn (u-2 separates it)',
+    )
+  })
+
+  it('P0-3: dedupe preserves idempotency — replaying the merge yields same result', () => {
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srv('srv-1', 200, 'server text'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      { id: 'm-1', ts: 150, role: 'assistant', text: 'partial' } as Msg,
+    ]
+    const once = mergePreservingServerAuthored(server, client) as Msg[]
+    const twice = mergePreservingServerAuthored(server, once) as Msg[]
+    assert.deepEqual(
+      twice.map((m) => m.id),
+      once.map((m) => m.id),
+      'second merge is a no-op on the deduped output',
+    )
+  })
+
+  it('P0-3: does not touch adjacent assistants that are both non-server (client-only history)', () => {
+    // Pure client history with no server-authored entries hits the fast path
+    // (returns clientMsgs verbatim). Even if two assistant entries are
+    // adjacent client-side, dedupe must not run.
+    const server: Msg[] = [cli('u1', 100, 'user')]
+    const client: Msg[] = [
+      cli('u1', 100, 'user'),
+      { id: 'a1', ts: 200, role: 'assistant', text: 'one' } as Msg,
+      { id: 'a2', ts: 300, role: 'assistant', text: 'two' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client)
+    assert.equal(out, client, 'fast path: identical reference, no dedupe')
+  })
 })
 
 describe('appendServerAuthoredPure', () => {

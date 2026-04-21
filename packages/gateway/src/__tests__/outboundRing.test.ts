@@ -53,7 +53,9 @@ describe('OutboundRingBuffer.peekReplay', () => {
     for (let i = 1; i <= 5; i++) {
       const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
     }
-    const rep = r.peekReplay('s1', 2)
+    // Pass `now` close to the stored ts so the P1-2 age-prune on read
+    // doesn't evict the synthetic test frames (default maxAgeMs = 10min).
+    const rep = r.peekReplay('s1', 2, 1005)
     assert.equal(rep.ok, true)
     if (!rep.ok) return
     assert.deepEqual(rep.sent.map((f) => f.seq), [3, 4, 5])
@@ -65,7 +67,7 @@ describe('OutboundRingBuffer.peekReplay', () => {
     for (let i = 1; i <= 3; i++) {
       const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
     }
-    const rep = r.peekReplay('s1', 0)
+    const rep = r.peekReplay('s1', 0, 1003)
     assert.equal(rep.ok, true)
     if (!rep.ok) return
     assert.deepEqual(rep.sent.map((f) => f.seq), [1, 2, 3])
@@ -89,7 +91,7 @@ describe('OutboundRingBuffer.peekReplay', () => {
   it('sequence_mismatch: client cursor ahead of server last', () => {
     const r = new OutboundRingBuffer()
     const s = r.nextSeq('s1'); r.store('s1', s, 1000, frame(s))
-    const rep = r.peekReplay('s1', 42)
+    const rep = r.peekReplay('s1', 42, 1000)
     assert.equal(rep.ok, false)
     if (rep.ok) return
     assert.equal(rep.reason, 'sequence_mismatch')
@@ -106,7 +108,7 @@ describe('OutboundRingBuffer.peekReplay', () => {
     assert.equal(r.lastFrameSeq('s1'), 6)
 
     // Client is at seq 2 — needs 3,4,5,6 but ring starts at 4 → buffer_miss.
-    const rep = r.peekReplay('s1', 2)
+    const rep = r.peekReplay('s1', 2, 1006)
     assert.equal(rep.ok, false)
     if (rep.ok) return
     assert.equal(rep.reason, 'buffer_miss')
@@ -119,10 +121,32 @@ describe('OutboundRingBuffer.peekReplay', () => {
       const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
     }
     // Ring holds seqs 3,4,5; client at 2 should be replayable (3,4,5 fresh).
-    const rep = r.peekReplay('s1', 2)
+    const rep = r.peekReplay('s1', 2, 1005)
     assert.equal(rep.ok, true)
     if (!rep.ok) return
     assert.deepEqual(rep.sent.map((f) => f.seq), [3, 4, 5])
+  })
+
+  it('P1-2: idle session with stale frames prunes on peekReplay read', () => {
+    // Short maxAge so the scenario is easy to construct without Date.now fiddling.
+    const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
+    for (let i = 1; i <= 3; i++) {
+      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+    }
+    assert.equal(r.size('s1'), 3, 'all frames present after store')
+
+    // Simulate a long-idle reconnect: client had cursor=2, server's ring has
+    // gone stale (all ts < cutoff), nothing new has been stored to trigger a
+    // prune. Without P1-2 the server would happily replay frame 3 from a
+    // months-old buffer; with P1-2 it evicts on read and returns no_buffer.
+    const rep = r.peekReplay('s1', 2, 2000)
+    assert.equal(r.size('s1'), 0, 'stale frames evicted on read, not only on next store()')
+    // Client cursor 2 + empty ring + lastFrameSeq=3 → no_buffer (can't
+    // distinguish this from server-restart; client escalates to REST sync).
+    assert.equal(rep.ok, false)
+    if (rep.ok) return
+    assert.equal(rep.reason, 'no_buffer')
+    assert.equal(rep.to, 3, 'lastFrameSeq preserved (only ring evicted)')
   })
 })
 
@@ -141,7 +165,8 @@ describe('OutboundRingBuffer pruning', () => {
     const s1 = r.nextSeq('s1'); r.store('s1', s1, 0,   frame(s1))
     const s2 = r.nextSeq('s1'); r.store('s1', s2, 150, frame(s2)) // cutoff = 150-100 = 50 → frame1 (ts=0) evicted
     assert.equal(r.size('s1'), 1)
-    const rep = r.peekReplay('s1', 0)
+    // Read at now=150: cutoff=50, frame2 (ts=150) survives.
+    const rep = r.peekReplay('s1', 0, 150)
     assert.equal(rep.ok, false, 'fromSeq=0 past the earliest still-buffered frame (2) → buffer_miss')
     if (rep.ok) return
     assert.equal(rep.reason, 'buffer_miss')

@@ -1534,24 +1534,46 @@ export function handleOutbound(frame) {
 //      authoritative server-persisted state.
 function handleResumeFailed(frame) {
   const peerId = frame.peer?.id
+  const affectedSessId = peerId
   if (peerId) {
     const sess = state.sessions.get(peerId)
     if (sess) {
+      // Reset the frameSeq cursor so a server restart (currentLast drops
+      // back to a small number) can be recovered — otherwise every
+      // subsequent frame would look "stale" to the dedupe in handleOutbound.
       sess._lastFrameSeq = 0
-      if (sess._sendingInFlight) {
-        sess._sendingInFlight = false
-        clearTurnTiming(sess)
-        resetReplyTracker(sess)
-        if (sess.id === state.currentSessionId) {
-          state.sendingInFlight = false
-          updateSendEnabled()
-          hideTypingIndicator()
-          setTitleBusy(false)
-        }
-      }
+      // Phase 0.4 P1-1: instead of force-clearing _sendingInFlight (which
+      // would lie about a still-running long REPL turn in buffer_miss
+      // cases), flag the live stream as known-broken. syncSessionsFromServer
+      // reads this flag and refetches the session from the server-authored
+      // tape even when state.sendingInFlight is true. The flag clears
+      // naturally on the next successful sync.
+      sess._liveStreamBroken = true
     }
   }
-  maybeSyncNow({ force: true })
+  maybeSyncNow({
+    force: true,
+    onResult: (result) => {
+      if (!result) return
+      // Successful sync — live stream has been reconciled from REST. Clear
+      // the override so subsequent maybeSyncNow calls respect the normal
+      // in-flight skip again.
+      if (affectedSessId) {
+        const live = state.sessions.get(affectedSessId)
+        if (live) live._liveStreamBroken = false
+      }
+      try { _deps.renderSidebar() } catch {}
+      // Re-render the transcript only if the affected session is what's
+      // currently on screen — a background-session resume_failed shouldn't
+      // steal focus from whatever the user is looking at.
+      if (
+        result.needsRenderMessages ||
+        (affectedSessId && affectedSessId === state.currentSessionId)
+      ) {
+        try { _deps.renderMessages() } catch {}
+      }
+    },
+  })
 }
 
 // ═══════════════ PERMISSION PROMPTS ═══════════════
