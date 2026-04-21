@@ -10,6 +10,18 @@ import { SupervisorError } from "./types.js";
  *
  * 出口流量要过代理(proxyUrl 注入到容器 env),让 dnsmasq/tinyproxy 来做
  * 白名单;这部分的策略属于 T-51 镜像里 supervisor.sh 的职责。
+ *
+ * **2026-04-21 安全审计 BLOCKER#2 双层防御**:
+ *   设计上的"靠代理出口白名单"在 v3 不完全适用 —— v3 容器跑完整个人版,
+ *   browser-automation / web-search / MCP fetch 等工具直接连公网,无法全走代理。
+ *   因此用 **host iptables 独立链 V3_EGRESS_IN** 兜底:
+ *     - INPUT 链:容器(172.30.0.0/16)→ host 仅放行 172.30.0.1:18791(internal proxy);
+ *       PG 5432 / Redis 6379 / gateway 18789 admin 等内部端口全部 DROP
+ *     - FORWARD 链:不动,容器→公网仍允许(否则浏览器/搜索瘫痪)
+ *   规则在 setup-host-net.sh 落地;boot 自动应用走 openclaude-v3-host-firewall.service。
+ *
+ *   v3 supervisor 这层的责任 = "确保 docker bridge 配置正确";
+ *   host iptables 是兜底层,即使本模块出 bug 也挡得住容器→host 横向。
  */
 
 /** 与 supervisor.ts 保持一致的 label key。 */

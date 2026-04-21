@@ -1,0 +1,22 @@
+[Unit]
+# Boot 后自动应用 v3 host 防火墙规则(setup-host-net.sh 中的 iptables 段)。
+# After=docker.service:确保 docker daemon 启动后再跑,避免 docker 自己重置 iptables 时
+#   清掉我们的链。
+# Wants=docker.service:依赖 docker;若 docker 没起,本服务也不应该跑(没意义)。
+Description=OpenClaude v3 host firewall (container egress isolation)
+After=docker.service ufw.service network-online.target
+Wants=docker.service network-online.target
+ConditionPathExists=/opt/openclaude/openclaude/packages/commercial/scripts/setup-host-net.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 路径与生产部署位置严格一致(GCP 34.146.172.239 的 v3 商用版部署在
+# /opt/openclaude/openclaude/ 下)。
+ExecStart=/bin/bash /opt/openclaude/openclaude/packages/commercial/scripts/setup-host-net.sh
+# 失败不影响 docker 本体;但要让 systemctl 退出码暴露问题
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

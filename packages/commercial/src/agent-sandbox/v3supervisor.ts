@@ -31,6 +31,21 @@
  *   - volume GC(3G,banned 7d / no-login 90d)
  *   - 内部代理 listener(2H 已在 index.ts 启好)
  *   - docker network 创建(setup-host-net.sh 一次性脚本搞定,不要 inspect/create)
+ *
+ * 容器→host 横向防御(2026-04-21 安全审计 BLOCKER#2):
+ *   本模块只负责"把容器挂在正确的 docker bridge + 强制 --ip + 双因子身份"。
+ *   docker bridge `openclaude-v3-net` 由 setup-host-net.sh 以 ICC=false 创建
+ *   (容器之间不互通);容器→host 的横向访问由 host 侧 iptables 独立链
+ *   `V3_EGRESS_IN` 兜底:仅放行 172.30.0.1:18791(internal proxy),其它 host
+ *   端口(PG / Redis / gateway 18789 admin / SSH)全部 DROP。
+ *   该 iptables 规则随 boot 由 systemd unit `openclaude-v3-host-firewall.service`
+ *   自动应用,即使本模块出 bug 漏配 cap-drop / 漏走 V3_NETWORK_NAME,host 层
+ *   也能挡住容器→host 的横向。详见 `network.ts` 顶部 BLOCKER#2 注释 +
+ *   `scripts/setup-host-net.sh` 的 ensure_v3_host_guard()。
+ *
+ *   **不开 FORWARD 链** —— 容器→公网仍然允许(浏览器/搜索/MCP fetch 必须走
+ *   公网)。出口策略统一(SNAT / IPRoyal / per-account egress_proxy)留给
+ *   Phase B,见 docs/v3/02-DEVELOPMENT-PLAN.md 后续 task。
  */
 
 import type Docker from "dockerode";

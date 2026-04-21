@@ -1,15 +1,22 @@
 #!/bin/bash
-# 2J-1: host 侧网络隔离 — idempotent
+# 2J-1 + 2J-2: host 侧网络隔离 — idempotent
 #
 # 作用:
 #   1. 创建 docker bridge 网络 openclaude-v3-net (subnet 172.30.0.0/16, gateway 172.30.0.1,
 #      IPv6=false, ICC=false 防容器横向)
 #   2. 添加 ufw 规则: 仅 172.30.0.0/16 可访问 172.30.0.1:18791 (内部代理 edge listener)
+#   3. **2J-2 (2026-04-21 安全审计 BLOCKER#2 修复)**: 用 iptables 独立链 V3_EGRESS_IN,
+#      把"v3 容器→host 横向访问"硬封死 —— 仅允许容器到 internal proxy 18791,
+#      其他 host 端口(PG 5432 / Redis 6379 / gateway 18789 admin / SSH 22 / etc)全部 DROP。
+#
+#      不动 FORWARD 链(容器→公网仍开),否则 browser-automation / web-search /
+#      MCP server fetch 全瘫 — 个人版那批工具就是直连公网的。
 #
 # 使用:  sudo bash setup-host-net.sh
 #
 # 幂等: 重复执行无副作用。docker network 已存在则校验 subnet/gateway/ipv6/icc 全吻合;
-#       ufw 规则走自身幂等 ("Skipping adding existing rule") + 解析 stderr 决定 [OK]/[ADDED]
+#       ufw 规则走自身幂等 ("Skipping adding existing rule") + 解析 stderr 决定 [OK]/[ADDED];
+#       iptables 用独立 V3_EGRESS_IN 链 + flush 重建 → 重跑保证终态一致。
 #
 # locale: 强制 LANG=C 确保 ufw / docker 输出英文 (codex 审计:Skipping/Rule added 是英文串,
 #         非英文 locale 下 grep 会漂)。
@@ -22,6 +29,8 @@ NET_NAME="openclaude-v3-net"
 SUBNET="172.30.0.0/16"
 GATEWAY="172.30.0.1"
 INTERNAL_PROXY_PORT="18791"
+# 容器→host 横向防火墙独立链
+V3_HOST_GUARD_CHAIN="V3_EGRESS_IN"
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -94,22 +103,85 @@ ensure_ufw_rule() {
     deny in proto tcp to any port "$INTERNAL_PROXY_PORT"
 }
 
+ensure_v3_host_guard() {
+  # 2J-2 BLOCKER 修复:用 iptables 独立链阻止容器→host 横向。
+  # 设计:
+  #   - 创建链 V3_EGRESS_IN(若已存在 → flush 重建,保证幂等且终态一致)
+  #   - 链内规则:目的=172.30.0.1:18791/tcp → RETURN(放行,继续走 INPUT 默认策略)
+  #                其他 → DROP
+  #   - INPUT 入口在第 1 条插一条 jump:`-s 172.30.0.0/16 -j V3_EGRESS_IN`
+  #     幂等检查用 -C(只查不存在再插)。
+  #
+  # 不开 FORWARD 链:容器→公网允许通过(浏览器/搜索/MCP fetch 必须),
+  # 出口策略走未来的 SNAT/代理统一(留给 Phase B,见 docs)。
+  #
+  # 备注:在 docker daemon 启动后跑此脚本,以免 docker 重置 iptables 时清掉我们的规则。
+  #       建议配套用 systemd unit "openclaude-v3-host-firewall.service" 在
+  #       docker.service After= 之后跑(本仓库 packages/commercial/scripts/ 同目录)。
+
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "[ABORT] 缺少 iptables 命令"
+    exit 1
+  fi
+
+  # 1) 创建/重置链
+  if iptables -L "$V3_HOST_GUARD_CHAIN" -n >/dev/null 2>&1; then
+    iptables -F "$V3_HOST_GUARD_CHAIN"
+    echo "[FLUSH] iptables chain $V3_HOST_GUARD_CHAIN"
+  else
+    iptables -N "$V3_HOST_GUARD_CHAIN"
+    echo "[CREATE] iptables chain $V3_HOST_GUARD_CHAIN"
+  fi
+
+  # 2) 链内规则:允许 internal proxy / 拒绝其他
+  iptables -A "$V3_HOST_GUARD_CHAIN" \
+    -d "$GATEWAY" -p tcp --dport "$INTERNAL_PROXY_PORT" -j RETURN \
+    -m comment --comment "v3 container -> internal proxy"
+  # ICMP echo 留着,容器内 ping 网关用作 readiness 检测可以;ICMP 不会泄露敏感
+  iptables -A "$V3_HOST_GUARD_CHAIN" \
+    -d "$GATEWAY" -p icmp --icmp-type echo-request -j RETURN \
+    -m comment --comment "v3 container -> gateway icmp (readiness)"
+  iptables -A "$V3_HOST_GUARD_CHAIN" \
+    -d "$GATEWAY" -j DROP \
+    -m comment --comment "v3 container -> any other host port: deny"
+  # 注意:不在链内匹配 src=172.30.0.0/16,src 已在 INPUT jump 时过滤
+  echo "[ADDED] $V3_HOST_GUARD_CHAIN allow $GATEWAY:$INTERNAL_PROXY_PORT, deny rest"
+
+  # 3) INPUT 入口 jump(幂等)
+  if iptables -C INPUT -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" 2>/dev/null; then
+    echo "[OK] INPUT jump → $V3_HOST_GUARD_CHAIN already present"
+  else
+    iptables -I INPUT 1 -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" \
+      -m comment --comment "v3 container egress isolation"
+    echo "[ADDED] INPUT -s $SUBNET -j $V3_HOST_GUARD_CHAIN (at position 1)"
+  fi
+}
+
 main() {
   require_root
   require_cmd docker
   require_cmd ufw
 
-  echo "=== [1/2] 创建 docker bridge 网络 ${NET_NAME} ==="
+  echo "=== [1/3] 创建 docker bridge 网络 ${NET_NAME} ==="
   ensure_network
 
   echo ""
-  echo "=== [2/2] 配置 ufw 入向规则 ==="
+  echo "=== [2/3] 配置 ufw 入向规则 (internal proxy 18791) ==="
   ensure_ufw_rule
+
+  echo ""
+  echo "=== [3/3] 配置 iptables 容器→host 横向阻断 (V3_EGRESS_IN 链) ==="
+  ensure_v3_host_guard
 
   echo ""
   echo "=== Done ==="
   echo "网络: ${NET_NAME} (${SUBNET}, gateway ${GATEWAY}, IPv6 disabled, ICC disabled)"
   echo "ufw: 仅 ${SUBNET} 可访问 ${GATEWAY}:${INTERNAL_PROXY_PORT}"
+  echo "iptables: 容器只能访问 ${GATEWAY}:${INTERNAL_PROXY_PORT}, 其他 host 端口全部 DROP"
+  echo ""
+  echo "建议: enable 配套的 systemd unit (boot 后自动应用 iptables 规则)"
+  echo "  cp packages/commercial/scripts/openclaude-v3-host-firewall.service /etc/systemd/system/"
+  echo "  systemctl enable --now openclaude-v3-host-firewall"
 }
 
 main "$@"
