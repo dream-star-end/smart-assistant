@@ -148,6 +148,7 @@ import {
   notifyTabVisible,
   resetReplyTracker,
   resetThinkingSafety,
+  safeWsSend,
   setMeta,
   setStatus,
   setWsDeps,
@@ -726,8 +727,15 @@ function send() {
   const _hasQueuedForSess = (state.offlineQueue?.some(i => i.sessId === sess.id)) ||
     (state._offlineQueuePending?.some(i => i.sessId === sess.id)) ||
     (state._offlineDrainingCurrent?.sessId === sess.id)
+  // 2026-04-22 Codex R1 BLOCKING#1:主发送必须走 safeWsSend。
+  // 背压超阈值时 safeWsSend 返回 false 并触发 close→reconnect。此时必须把消息
+  // requeue 到 offlineQueue,reconnect 后 drainOfflineQueue 会按序重发 —— 否则
+  // 消息在半死 buffer 里永久滞留,UI 已 markStatus='sent' 但 server 没收到。
+  let _sentNow = false
   if (state.ws && state.ws.readyState === 1 && !_hasQueuedForSess) {
-    state.ws.send(JSON.stringify(wsPayload))
+    _sentNow = safeWsSend(state.ws, JSON.stringify(wsPayload))
+  }
+  if (_sentNow) {
     userMsg.status = 'sent'
     updateMsgStatus(userMsg)
     setSending(true)
@@ -736,7 +744,11 @@ function send() {
     showTypingIndicator()
     setTitleBusy(true)
   } else {
-    // Offline or has pending queue items: queue to maintain order
+    // 三种进来的路径:
+    //   (a) ws 未 open / readyState ≠ 1 → 纯离线
+    //   (b) _hasQueuedForSess → 已有本 session 排队,保序插队
+    //   (c) safeWsSend 返回 false → 背压触发 close,正在 reconnect
+    // 统统 push offlineQueue + status='queued',reconnect 后 drain 按序重发。
     state.offlineQueue.push({ sessId: sess.id, payload: wsPayload, msgId: userMsg.id })
     userMsg.status = 'queued'
     updateMsgStatus(userMsg)

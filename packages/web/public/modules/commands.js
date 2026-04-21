@@ -8,6 +8,7 @@ import {
   localStopTeardown,
   nudgeDrain,
   resetReplyTracker,
+  safeWsSend,
 } from './websocket.js'
 
 // ── Late-binding for circular deps ──
@@ -76,16 +77,15 @@ const slashCommands = [
       _deps.renderMessages()
       _deps.scheduleSaveFromUserEdit(sess)
       // Notify gateway to kill the CCB subprocess so context is truly reset
-      // Next message will spawn a fresh process with no history
+      // Next message will spawn a fresh process with no history.
+      // safeWsSend:背压时 close+reconnect,reset 丢了下次发消息会重 spawn fresh。
       if (state.ws && state.ws.readyState === 1) {
-        state.ws.send(
-          JSON.stringify({
-            type: 'inbound.control.reset',
-            channel: 'webchat',
-            peer: { id: sess.id, kind: 'dm' },
-            agentId: sess.agentId || state.defaultAgentId,
-          }),
-        )
+        safeWsSend(state.ws, JSON.stringify({
+          type: 'inbound.control.reset',
+          channel: 'webchat',
+          peer: { id: sess.id, kind: 'dm' },
+          agentId: sess.agentId || state.defaultAgentId,
+        }))
       }
       toast('会话已清空，上下文已重置')
     },
@@ -96,14 +96,14 @@ const slashCommands = [
     run() {
       const sess = getSession()
       if (!sess || !state.ws) return
-      state.ws.send(
-        JSON.stringify({
-          type: 'inbound.control.stop',
-          channel: 'webchat',
-          peer: { id: sess.id, kind: 'dm' },
-          agentId: sess.agentId || state.defaultAgentId,
-        }),
-      )
+      // safeWsSend:背压时 close+reconnect;stop 丢了 server 端 channel cleanup
+      // 会接管,localStopTeardown 继续本地 UI 归位。
+      safeWsSend(state.ws, JSON.stringify({
+        type: 'inbound.control.stop',
+        channel: 'webchat',
+        peer: { id: sess.id, kind: 'dm' },
+        agentId: sess.agentId || state.defaultAgentId,
+      }))
       localStopTeardown(sess)
       toast('已发送停止信号')
     },

@@ -1278,44 +1278,56 @@ export class SessionManager {
 
   // 周期性 LRU 驱逐 — webchat sessions survive much longer than cron/task sessions
   startEvictionLoop(intervalMs = 60_000): () => void {
+    // 2026-04-22 Codex R1 N11:LRU 驱逐此前 fire-and-forget 调 runner.shutdown() 然后
+    // 立刻 `sessions.delete(key)` + `onSessionDestroyed(key)` 清 ring。问题是 shutdown
+    // 内部有 SIGTERM → 1s 等待 → SIGKILL 的异步链,在这期间 runner 仍可能从 stdout
+    // 读到残余字节并推给 server(通过 onFrame callback),而此刻 server 的 outboundRing
+    // 已被 onSessionDestroyed 清空 —— 这些尾帧会落到一个空 ring 上,下次 reconnect
+    // replay 时丢掉(数据不一致且无 warning)。
+    //
+    // 修复:await 每个 runner.shutdown() 完成后才 delete + onSessionDestroyed。
+    // 用 async IIFE 不阻塞 interval 队列(每轮 eviction 独立跑,上一轮若卡住不影响下一轮)。
+    let _inFlight = false
     const t = setInterval(() => {
-      const now = Date.now()
-      const toEvict: string[] = []
-      for (const [key, s] of this.sessions) {
-        // Cron/task sessions (contain ':cron:' or ':task:') use short idle timeout
-        // Webchat/user sessions use long idle timeout (7 days)
-        const isTempSession = key.includes(':cron:') || key.includes(':task:')
-        const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
-        // Use the more recent of lastUsedAt and runner.lastActivityAt to avoid
-        // killing sessions with long-running active tasks
-        const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
-        if (now - lastActive > maxIdle) {
-          toEvict.push(key)
+      if (_inFlight) return  // 防并行:shutdown 链慢 → 跳过本轮,下一轮再扫
+      _inFlight = true
+      ;(async () => {
+        try {
+          const now = Date.now()
+          const toEvict: string[] = []
+          for (const [key, s] of this.sessions) {
+            const isTempSession = key.includes(':cron:') || key.includes(':task:')
+            const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
+            const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
+            if (now - lastActive > maxIdle) {
+              toEvict.push(key)
+            }
+          }
+          for (const key of toEvict) {
+            const s = this.sessions.get(key)
+            if (!s) continue
+            // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
+            try {
+              await s.runner.shutdown()
+            } catch {}
+            this.sessions.delete(key)
+            if (!key.includes(':webchat:')) {
+              this._resumeMap.delete(key)
+              this._resumeMapTimestamps.delete(key)
+              this._resumeMapLastCost.delete(key)
+              this._resumeMapProvider.delete(key)
+            }
+            // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
+            // 接尾帧"的窗口。webchat 虽然 resume-map 留着等 reconnect,但 outboundRing
+            // 没必要留(重连时会重走 hello,server 按 lastFrameSeq=0 重建)。
+            try { this.onSessionDestroyed?.(key) } catch {}
+          }
+          if (toEvict.length > 0) this._saveResumeMap()
+          this._pruneResumeMap()
+        } finally {
+          _inFlight = false
         }
-      }
-      for (const key of toEvict) {
-        const s = this.sessions.get(key)
-        if (!s) continue
-        s.runner.shutdown().catch(() => {})
-        this.sessions.delete(key)
-        // Only webchat sessions should survive eviction in resume-map.
-        // All other session types (cron, task, inter-agent, telegram) are ephemeral.
-        if (!key.includes(':webchat:')) {
-          this._resumeMap.delete(key)
-          this._resumeMapTimestamps.delete(key)
-          this._resumeMapLastCost.delete(key)
-          this._resumeMapProvider.delete(key)
-        }
-        // (webchat entries stay in _resumeMap intentionally for cross-restart recovery)
-        // Medium#G1:任何被驱逐的 session 都通知 ring 清。webchat 虽然 resume-map
-        // 留着等 reconnect,但 outboundRing 没必要留(重连时会重走一次 hello,server
-        // 按 lastFrameSeq=0 重建,不读历史 ring),现在清掉正好把内存还回去。
-        try { this.onSessionDestroyed?.(key) } catch {}
-      }
-      if (toEvict.length > 0) this._saveResumeMap()
-
-      // TTL cleanup: remove resume-map entries older than 30 days that have no live session
-      this._pruneResumeMap()
+      })()
     }, intervalMs)
     return () => clearInterval(t)
   }

@@ -77,7 +77,15 @@ const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
 // Codex review IMPORTANT#1 指出了这个边界。
 const SAFE_WS_BUFFER_BYTES = 2 * 1024 * 1024
 const WS_CLOSE_CODE_STALLED = 4000  // app-level,不与 IANA 1xxx/3xxx 冲突
-function safeWsSend(ws, data) {
+// 2026-04-22 Codex R2 BLOCKING:safeWsSend 必须是所有 WS 发送的唯一入口。
+// 历史上只有 drain 和 ping 用了它,主发送 / regen / stop / permission 仍裸 ws.send(),
+// 半死连接达到 2MB 阈值时这些路径继续挤 buffer,直到 ping 才触发 close —— 在那之前
+// 用户消息已 markStatus='sent' 但实际在 buffer 里滞留,close 后 offlineQueue 里没有
+// 这条消息 → 丢失。修复:
+//   - export safeWsSend,main.js / messages.js / commands.js 所有发送都走它
+//   - 返回 false 时,调用方按自己语义决定 requeue(用户消息)/ drop(stop 类控制帧)
+//   - safeWsSend 本身负责 close+reconnect 触发,不需要调用方关心
+export function safeWsSend(ws, data) {
   if (!ws || ws.readyState !== 1) return false
   // bufferedAmount 在某些环境下可能 undefined(polyfill / mock);fallback 当 0
   const buffered = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0
@@ -113,16 +121,14 @@ function _resetThinkingSafety(sessId) {
       console.warn('[ws] Thinking safety timeout for session', sessId)
       // Send stop to backend so the turn is actually interrupted,
       // preventing late frames from being misattributed to a future turn.
-      try {
-        if (state.ws && state.ws.readyState === 1) {
-          state.ws.send(JSON.stringify({
-            type: 'inbound.control.stop',
-            channel: 'webchat',
-            peer: { id: sessId, kind: 'dm' },
-            agentId: s.agentId || state.defaultAgentId,
-          }))
-        }
-      } catch {}
+      // safeWsSend:若 buffer 堵死直接 close+reconnect,stop 丢了也 OK —— close 时
+      // server 端会走 channel cleanup,turn 自然终止(比 stop 帧更彻底)。
+      safeWsSend(state.ws, JSON.stringify({
+        type: 'inbound.control.stop',
+        channel: 'webchat',
+        peer: { id: sessId, kind: 'dm' },
+        agentId: s.agentId || state.defaultAgentId,
+      }))
       s._sendingInFlight = false
       clearTurnTiming(s)
       // Abandon the reply tracker — the turn is being torn down by timeout,
@@ -607,14 +613,12 @@ export function stopCurrentTurn() {
   if (!state.ws || state.ws.readyState !== 1) return
   const sess = getSession()
   if (!sess) return
-  state.ws.send(
-    JSON.stringify({
-      type: 'inbound.control.stop',
-      channel: 'webchat',
-      peer: { id: sess.id, kind: 'dm' },
-      agentId: sess.agentId || state.defaultAgentId,
-    }),
-  )
+  safeWsSend(state.ws, JSON.stringify({
+    type: 'inbound.control.stop',
+    channel: 'webchat',
+    peer: { id: sess.id, kind: 'dm' },
+    agentId: sess.agentId || state.defaultAgentId,
+  }))
   // Immediately tear down local UI state so typing indicator / stop button / title spinner
   // clear without waiting for the backend's isFinal (which can take seconds to minutes,
   // or never arrive if the backend is truly stuck).
@@ -787,7 +791,8 @@ export function connect() {
           lastFrameSeq: s._lastFrameSeq || 0,
         })
       }
-      ws.send(JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
+      // onopen 瞬间 bufferedAmount 必为 0,safeWsSend 只是保持统一入口
+      safeWsSend(ws, JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
     } catch {}
     // Flush offline queue — delay drain start to let hello/resume isFinals arrive first.
     // This prevents a resumed turn's isFinal from being mistaken for a drain response.
@@ -1892,7 +1897,9 @@ function _resolvePermission(frame, behavior, message, sess, msg, overlay, extras
     if (extras && extras.updatedInput && behavior === 'allow') {
       payload.updatedInput = extras.updatedInput
     }
-    state.ws.send(JSON.stringify(payload))
+    // safeWsSend:buffer 堵死时 close+reconnect —— server 端会 resume_failed 并
+    // 重发 permission_request,用户再看到一次 prompt,比"发了没到"静默挂死好。
+    safeWsSend(state.ws, JSON.stringify(payload))
   }
 
   // Update message in chat
@@ -2228,17 +2235,17 @@ function _displaceExistingPermissionModal() {
     if (state.ws && state.ws.readyState === 1 && old.frame) {
       const oldPeerId = old.frame.peer?.id
       const oldSess = oldPeerId ? state.sessions.get(oldPeerId) : null
-      try {
-        state.ws.send(JSON.stringify({
-          type: 'inbound.permission_response',
-          channel: old.frame.channel || 'webchat',
-          peer: old.frame.peer,
-          agentId: oldSess?.agentId || state.defaultAgentId,
-          requestId: oldRequestId,
-          behavior: 'deny',
-          message: 'Displaced by newer permission prompt',
-        }))
-      } catch {}
+      // safeWsSend:buffer 堵死时 close+reconnect;displace 的 deny 丢了影响很小
+      // (本地 overlay 已移除,老 request 在 server 端会因 ws close 连同一起 cleanup)
+      safeWsSend(state.ws, JSON.stringify({
+        type: 'inbound.permission_response',
+        channel: old.frame.channel || 'webchat',
+        peer: old.frame.peer,
+        agentId: oldSess?.agentId || state.defaultAgentId,
+        requestId: oldRequestId,
+        behavior: 'deny',
+        message: 'Displaced by newer permission prompt',
+      }))
       if (oldSess) {
         const oldMsg = oldSess.messages.find((m) => m.requestId === oldRequestId)
         if (oldMsg) {
@@ -2316,17 +2323,17 @@ export function clearPendingPermissions(sessId) {
     // Send deny for unanswered prompts so server doesn't wait forever
     const targetSess = peerId ? state.sessions.get(peerId) : null
     if (state.ws && state.ws.readyState === 1 && p.frame) {
-      try {
-        state.ws.send(JSON.stringify({
-          type: 'inbound.permission_response',
-          channel: p.frame.channel || 'webchat',
-          peer: p.frame.peer,
-          agentId: targetSess?.agentId || state.defaultAgentId,
-          requestId: p.frame.requestId,
-          behavior: 'deny',
-          message: 'Turn completed or session ended',
-        }))
-      } catch {}
+      // safeWsSend 失败即 close+reconnect;deny 丢了也无妨,server 侧 channel
+      // cleanup 会释放 pending permission。
+      safeWsSend(state.ws, JSON.stringify({
+        type: 'inbound.permission_response',
+        channel: p.frame.channel || 'webchat',
+        peer: p.frame.peer,
+        agentId: targetSess?.agentId || state.defaultAgentId,
+        requestId: p.frame.requestId,
+        behavior: 'deny',
+        message: 'Turn completed or session ended',
+      }))
     }
     // Update permission card in chat to show "Denied"
     if (targetSess) {

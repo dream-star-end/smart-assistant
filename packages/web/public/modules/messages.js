@@ -13,6 +13,7 @@ import {
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 import { msgTimeLabel, shortTime } from './util.js'
+import { safeWsSend } from './websocket.js'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
@@ -1258,7 +1259,9 @@ export function _buildMessageEl(msg) {
         // Stop any in-flight turn before regenerating to avoid concurrent requests.
         if (state.sendingInFlight) {
           if (state.ws && state.ws.readyState === 1) {
-            state.ws.send(JSON.stringify({
+            // safeWsSend:背压时 close+reconnect,stop 丢了也 OK —— server 端
+            // channel cleanup 会终止 turn,比靠 stop 帧更彻底。
+            safeWsSend(state.ws, JSON.stringify({
               type: 'inbound.control.stop',
               channel: 'webchat',
               peer: { id: sess.id, kind: 'dm' },
@@ -1318,8 +1321,12 @@ export function _buildMessageEl(msg) {
         const _hasQueued = (state.offlineQueue?.some(i => i.sessId === sess.id)) ||
           (state._offlineQueuePending?.some(i => i.sessId === sess.id)) ||
           (state._offlineDrainingCurrent?.sessId === sess.id)
+        // 2026-04-22 Codex R1 BLOCKING#1:regen 也必须走 safeWsSend + requeue。
+        let _regenSentNow = false
         if (state.ws && state.ws.readyState === 1 && !_hasQueued) {
-          state.ws.send(JSON.stringify(wsPayload))
+          _regenSentNow = safeWsSend(state.ws, JSON.stringify(wsPayload))
+        }
+        if (_regenSentNow) {
           sess._sendingInFlight = true
           // Clear any leftover regen timer from a previous regen/stop cycle
           if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
@@ -1327,17 +1334,15 @@ export function _buildMessageEl(msg) {
             sess._regenSafetyTimer = null
             if (sess._sendingInFlight) {
               console.warn('[regen] Safety timeout, clearing inFlight for', sess.id)
-              // Also interrupt the backend turn
-              try {
-                if (state.ws && state.ws.readyState === 1) {
-                  state.ws.send(JSON.stringify({
-                    type: 'inbound.control.stop',
-                    channel: 'webchat',
-                    peer: { id: sess.id, kind: 'dm' },
-                    agentId: sess.agentId || state.defaultAgentId,
-                  }))
-                }
-              } catch {}
+              // Also interrupt the backend turn — safeWsSend 自含 try/close 逻辑
+              if (state.ws && state.ws.readyState === 1) {
+                safeWsSend(state.ws, JSON.stringify({
+                  type: 'inbound.control.stop',
+                  channel: 'webchat',
+                  peer: { id: sess.id, kind: 'dm' },
+                  agentId: sess.agentId || state.defaultAgentId,
+                }))
+              }
               sess._sendingInFlight = false
               _clearTurnTiming?.(sess)
               // Abandon the reply tracker so any belated isFinal arriving for
@@ -1357,7 +1362,7 @@ export function _buildMessageEl(msg) {
           _showTypingIndicator()
           _setTitleBusy(true)
         } else {
-          // Offline or has pending queue items: queue to maintain order
+          // Offline / 已排队 / safeWsSend 背压 close:统统 requeue 保序
           state.offlineQueue.push({
             sessId: sess.id,
             payload: wsPayload,

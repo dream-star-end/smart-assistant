@@ -147,14 +147,23 @@ ensure_v3_host_guard() {
   # 注意:不在链内匹配 src=172.30.0.0/16,src 已在 INPUT jump 时过滤
   echo "[ADDED] $V3_HOST_GUARD_CHAIN allow $GATEWAY:$INTERNAL_PROXY_PORT, deny rest"
 
-  # 3) INPUT 入口 jump(幂等)
-  if iptables -C INPUT -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" 2>/dev/null; then
-    echo "[OK] INPUT jump → $V3_HOST_GUARD_CHAIN already present"
-  else
-    iptables -I INPUT 1 -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" \
-      -m comment --comment "v3 container egress isolation"
-    echo "[ADDED] INPUT -s $SUBNET -j $V3_HOST_GUARD_CHAIN (at position 1)"
-  fi
+  # 3) INPUT 入口 jump(真正幂等 — 2026-04-22 R2 B2 修复)
+  #
+  # 旧代码用 `iptables -C INPUT -s $SUBNET -j $V3_HOST_GUARD_CHAIN` 检查是否存在,
+  # 然后插入时带 `-m comment --comment "..."`。iptables -C 要求**全部 match**精确
+  # 相同(包括 comment match):不带 comment 的 -C 永远匹配不到带 comment 的现有
+  # 规则 → 每次重跑加一条新的。ExecStartPost on docker.service 把本脚本变成
+  # "每次 docker restart 都跑一次",就会累积重复 jump(实测 3 次重启后 INPUT
+  # 上有 3 条 V3_EGRESS_IN jump,功能无害但脏)。
+  #
+  # 新做法:先 while-loop 删光所有匹配(带/不带 comment 都试),再插入一条。
+  # 天然幂等,终态唯一。
+  while iptables -D INPUT -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" \
+        -m comment --comment "v3 container egress isolation" 2>/dev/null; do :; done
+  while iptables -D INPUT -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" 2>/dev/null; do :; done
+  iptables -I INPUT 1 -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" \
+    -m comment --comment "v3 container egress isolation"
+  echo "[ADDED] INPUT -s $SUBNET -j $V3_HOST_GUARD_CHAIN (at position 1, deduped)"
 }
 
 main() {

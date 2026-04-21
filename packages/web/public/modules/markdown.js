@@ -237,6 +237,16 @@ function _safeMediaUrl(url) {
   return ''
 }
 
+// 2026-04-22 Codex R1 I9:统一"URL → 安全 HTML 属性值"helper,替代散落各处的
+// `src="${url}"` 裸插。协议白名单 + htmlSafeEscape 缺一不可 —— 单独协议白名单放不住
+// `https://evil.com/x" onerror=...` 这种以合法 scheme 开头但含属性断开字符的 payload。
+// 返回值可直接塞进 src=/href=/data-* 等 HTML 属性,不需要再手动 escape;空串表示协议被拒。
+function _safeAttr(url) {
+  const rawSafe = _safeMediaUrl(url)
+  if (!rawSafe) return ''
+  return htmlSafeEscape(rawSafe)
+}
+
 export function _imgHtml(url, title) {
   const rawSafeUrl = _safeMediaUrl(url)
   if (!rawSafeUrl) return `<span>[blocked image: unsafe URL]</span>`
@@ -257,21 +267,25 @@ export function _imgHtml(url, title) {
 }
 
 export function _renderLocalMedia(filePath) {
-  const url = localPathToUrl(filePath)
+  // I9: 统一走 _safeAttr。localPathToUrl 出来的虽然 encodeURIComponent 过,理论无危险
+  // 字符,但 defense-in-depth —— 所有 src=/href= 都经过同一个 helper,未来万一 localPathToUrl
+  // 逻辑被改也不会意外漏防线。
+  const url = _safeAttr(localPathToUrl(filePath))
   const name = _basename(filePath) || 'file'
+  const safeName = htmlSafeEscape(name)
   if (_IMG_EXTS.test(filePath)) {
-    return _imgHtml(url, name)
+    return _imgHtml(localPathToUrl(filePath), name)
   }
   if (_AUD_EXTS.test(filePath)) {
-    return `<div class="media-wrap"><audio controls preload="none" src="${url}"></audio><div class="media-filename">${htmlSafeEscape(name)}</div></div>`
+    return `<div class="media-wrap"><audio controls preload="none" src="${url}"></audio><div class="media-filename">${safeName}</div></div>`
   }
   if (_VID_EXTS.test(filePath)) {
-    return `<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="${url}"></video><div class="media-filename">${htmlSafeEscape(name)}</div></div>`
+    return `<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="${url}"></video><div class="media-filename">${safeName}</div></div>`
   }
   if (_PDF_EXTS.test(filePath)) {
-    return `<a class="doc-card" href="${url}" target="_blank" rel="noopener"><span class="doc-card-icon">📄</span><span class="doc-card-name">${htmlSafeEscape(name)}</span></a>`
+    return `<a class="doc-card" href="${url}" target="_blank" rel="noopener"><span class="doc-card-icon">📄</span><span class="doc-card-name">${safeName}</span></a>`
   }
-  return `<a class="doc-card" href="${url}" target="_blank" rel="noopener" download="${htmlSafeEscape(name)}"><span class="doc-card-icon">📎</span><span class="doc-card-name">${htmlSafeEscape(name)}</span></a>`
+  return `<a class="doc-card" href="${url}" target="_blank" rel="noopener" download="${safeName}"><span class="doc-card-icon">📎</span><span class="doc-card-name">${safeName}</span></a>`
 }
 
 export function embedMediaUrls(html) {
@@ -335,18 +349,24 @@ export function embedMediaUrls(html) {
       decodedForExt = decodeURIComponent(url.split('?')[0])
     } catch {}
 
+    // I9: audio/video/pdf 分支此前直接插 `${url}`,URL_RE 已排除了 `"'<>` 但 `&` 仍会
+    // 裸漏,HTML 属性里非 `&amp;` 的 `&` 技术上可解析但某些 parser 策略下会生成警告 /
+    // sanitizer 二次改写。统一走 _safeAttr 一次性搞定:协议白名单 + HTML-attr escape。
+    // 协议被拒(如极端情况的 `javascript:` URL 被 URL_RE 漏放)→ 返回 match 原样不动。
+    const safeAttrUrl = _safeAttr(url)
+    if (!safeAttrUrl) return match
     if (_IMG_EXTS.test(decodedForExt)) {
       return _imgHtml(url, decodedForExt.split('/').pop() || '')
     }
     if (_AUD_EXTS.test(decodedForExt)) {
-      return `<div class="media-wrap"><audio controls preload="none" src="${url}"></audio></div>`
+      return `<div class="media-wrap"><audio controls preload="none" src="${safeAttrUrl}"></audio></div>`
     }
     if (_VID_EXTS.test(decodedForExt)) {
-      return `<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="${url}"></video></div>`
+      return `<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="${safeAttrUrl}"></video></div>`
     }
     if (_PDF_EXTS.test(decodedForExt)) {
       const name = decodedForExt.split('/').pop() || 'document.pdf'
-      return `<a class="doc-card" href="${url}" target="_blank" rel="noopener"><span class="doc-card-icon">📄</span><span class="doc-card-name">${htmlSafeEscape(name)}</span></a>`
+      return `<a class="doc-card" href="${safeAttrUrl}" target="_blank" rel="noopener"><span class="doc-card-icon">📄</span><span class="doc-card-name">${htmlSafeEscape(name)}</span></a>`
     }
     return match
   })

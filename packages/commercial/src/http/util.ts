@@ -21,11 +21,40 @@ export function ensureRequestId(req: IncomingMessage): string {
 }
 
 /**
- * 客户端 IP。优先用 socket.remoteAddress —— X-Forwarded-For 是客户端可伪造的,
- * 只有在 trustProxy=true 时才看 XFF。MVP 不开 XFF。
+ * 客户端 IP 提取。
+ *
+ * v3 架构:CF → Caddy:443 → gateway:127.0.0.1:18789。gateway 只监听 loopback
+ * + 172.30.0.1(容器内部代理),绝不暴露公网。所以:
+ *   - 当 socket.remoteAddress 是 loopback(Caddy 在本机反代过来)→ 信任 CF 注入的
+ *     CF-Connecting-IP,回退 X-Forwarded-For 首个段;这两个都是 Caddy 层透传,
+ *     攻击者在公网直连 gateway 根本不可达,所以不存在"XFF 伪造"。
+ *   - 当 socket.remoteAddress 是 172.30.x(容器来的 internal proxy 流量)→ 直接
+ *     用 socket IP;这个路径不是 auth/rate-limit 链路,clientIp 也只做审计用。
+ *   - 其他(不应发生)→ 用 socket IP,失败安全。
+ *
+ * 2026-04-22 Codex R1 IMPORTANT#3 修复:此前 refresh race fingerprint 和 rate
+ * limit 都拿 socket.remoteAddress,Caddy 后面 gateway 看到的都是 127.0.0.1
+ * → sameIp=true 永远成立,同 IP 桶 = 全站共享桶,高峰时 refresh/logout 限流相
+ * 互误伤。修后真实客户端 IP 才进 fingerprint/rate limit。
  */
+// IPv4 loopback、IPv6 loopback、IPv6-mapped IPv4 loopback
+const LOOPBACK_RE = /^(127\.|::1$|::ffff:127\.)/;
+// 宽松 IPv4/IPv6 校验:长度 + 只含合法字符。严格校验走不到这里(CF 不会注入垃圾),
+// 这里只是防拼 rate-limit key 时出奇怪字符串导致 Redis 命中错乱
+const IP_FORMAT_RE = /^[0-9a-fA-F:.]{3,45}$/;
+
 export function clientIpOf(req: IncomingMessage): string {
-  return req.socket.remoteAddress ?? "unknown";
+  const socketIp = req.socket.remoteAddress ?? "unknown";
+  if (!LOOPBACK_RE.test(socketIp)) return socketIp;
+  // loopback socket:信任 Caddy 透传的 CF 边缘 IP
+  const cf = req.headers["cf-connecting-ip"];
+  if (typeof cf === "string" && IP_FORMAT_RE.test(cf)) return cf;
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string") {
+    const first = xff.split(",")[0]?.trim();
+    if (first && IP_FORMAT_RE.test(first)) return first;
+  }
+  return socketIp;
 }
 
 export function userAgentOf(req: IncomingMessage): string | null {

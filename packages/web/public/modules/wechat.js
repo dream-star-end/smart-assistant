@@ -118,24 +118,32 @@ async function pollLoop(qrcode) {
   const startedAt = Date.now()
   let scannedAt = 0  // 0 = 尚未 scanned;>0 = scanned 时间戳,切到 confirm 阶段
   while (!ctrl.signal.aborted && _currentQrcode === qrcode) {
-    // 根据当前阶段应用不同死线
+    // 根据当前阶段应用不同死线,同时算出"距死线还剩多少"
     const now = Date.now()
+    let remainingUntilDeadline
     if (scannedAt === 0) {
-      if (now - startedAt > POLL_WAIT_DEADLINE_MS) {
+      remainingUntilDeadline = POLL_WAIT_DEADLINE_MS - (now - startedAt)
+      if (remainingUntilDeadline <= 0) {
         setError('扫码超时,请重新生成二维码')
         showState('unbound')
         return
       }
     } else {
-      if (now - scannedAt > POLL_CONFIRM_DEADLINE_MS) {
+      remainingUntilDeadline = POLL_CONFIRM_DEADLINE_MS - (now - scannedAt)
+      if (remainingUntilDeadline <= 0) {
         setError('确认超时,请重新扫码')
         showState('unbound')
         return
       }
     }
+    // 2026-04-22 Codex R1 I8:本轮请求超时 = min(POLL_TIMEOUT_MS, deadlineRemaining)
+    // 否则 "deadline 还剩 5s 但 POLL_TIMEOUT_MS=45s" 会导致最后一次 poll 正好阻塞到
+    // 45s 后才爆 AbortError,用户看到的"超时提示"比应有时间晚了 40s(弱网 UX 惨剧)。
+    // 下限给 1s:避免 0ms/负数打到 apiJson 立即 AbortError 进 retry busy-loop。
+    const thisRoundTimeout = Math.max(1_000, Math.min(POLL_TIMEOUT_MS, remainingUntilDeadline))
     let resp
     try {
-      resp = await apiJson('POST', '/api/wechat/pair/poll', { qrcode }, { signal: ctrl.signal, timeout: POLL_TIMEOUT_MS })
+      resp = await apiJson('POST', '/api/wechat/pair/poll', { qrcode }, { signal: ctrl.signal, timeout: thisRoundTimeout })
     } catch (e) {
       if (ctrl.signal.aborted) return
       retries++
