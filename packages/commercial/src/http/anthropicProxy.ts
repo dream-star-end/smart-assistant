@@ -53,10 +53,11 @@ import {
 } from "../auth/containerIdentity.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
 import {
-  preCheck,
+  preCheckWithCost,
   releasePreCheck,
   InsufficientCreditsError,
   type PreCheckRedis,
+  type ReservationHandle,
 } from "../billing/preCheck.js";
 import { computeCost, type TokenUsage } from "../billing/calculator.js";
 import {
@@ -620,7 +621,7 @@ export interface FinalizeContext {
   model: string;
   pricing: ModelPricing;
   precheckCredits: bigint;
-  preCheckLockKey: string;
+  preCheckReservation: ReservationHandle;
   log: Logger;
 }
 
@@ -786,7 +787,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
         const out = await runner();
         // releasePreCheck:即使失败,Redis TTL 也会兜底(300s)
         try {
-          await releasePreCheck(deps.preCheckRedis, ctx.preCheckLockKey);
+          await releasePreCheck(deps.preCheckRedis, ctx.preCheckReservation);
         } catch (e) {
           ctx.log.warn("proxy_release_precheck_failed", { err: errSummary(e) });
         }
@@ -1146,17 +1147,14 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
-      // 6) 双侧 cost 估算 + preCheck
+      // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)
       const inputTokens = estimateInputTokens(body);
       const totalMaxCost = estimateMaxCostBothSides(inputTokens, body.max_tokens, pricing);
       let pre;
       try {
-        // preCheck.maxTokens 走"已估好的总成本";estimateMaxCost 内部会再按 output_per_mtok 估一遍,
-        // 我们要的是用上面手算的 totalMaxCost,因此在这里手动调 SET 锁 + 余额校验比走 preCheck 干净。
-        // 但 preCheck 已经把"读余额 + sumByPrefix + SET lockKey"打包好,不重复实现。
-        // 折中:把 totalMaxCost 折回成"等价 maxTokens",让 estimateMaxCost 出同样数字 —— 不理想。
-        // 走法:直接 manual。
-        pre = await preCheckManual(deps.preCheckRedis, {
+        // 走 preCheckWithCost(已知 maxCost,跳过 estimateMaxCost 重算)。
+        // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
+        pre = await preCheckWithCost(deps.preCheckRedis, {
           userId: uid,
           requestId,
           maxCost: totalMaxCost,
@@ -1189,7 +1187,7 @@ export function makeAnthropicProxyHandler(
           model: body.model,
         });
       } catch (err) {
-        await releasePreCheck(deps.preCheckRedis, pre.lockKey).catch(() => {});
+        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
         if (err instanceof AccountPoolUnavailableError) {
           userLog.warn("proxy_account_pool_unavailable", { msg: err.message });
           incrAnthropicProxyReject("account_pool");
@@ -1241,7 +1239,7 @@ export function makeAnthropicProxyHandler(
                 result: { kind: "failure", error: errMessageShort(err) },
               })
               .catch(() => {});
-            await releasePreCheck(deps.preCheckRedis, pre.lockKey).catch(() => {});
+            await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
             incrAnthropicProxyReject("upstream_auth");
             sendJsonError(res, 502, "UPSTREAM_AUTH_REFRESH_FAILED", "failed to refresh upstream token", requestId);
             return;
@@ -1260,7 +1258,7 @@ export function makeAnthropicProxyHandler(
             result: { kind: "failure", error: errMessageShort(err) },
           })
           .catch(() => {});
-        await releasePreCheck(deps.preCheckRedis, pre.lockKey).catch(() => {});
+        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
         throw err;
       }
 
@@ -1286,7 +1284,7 @@ export function makeAnthropicProxyHandler(
             result: { kind: "failure", error: errMessageShort(err) },
           })
           .catch(() => {});
-        await releasePreCheck(deps.preCheckRedis, pre.lockKey).catch(() => {});
+        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
         userLog.error("proxy_journal_insert_failed", { err: errSummary(err) });
         sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
         return;
@@ -1307,7 +1305,7 @@ export function makeAnthropicProxyHandler(
           model: body.model,
           pricing,
           precheckCredits: pre.maxCost,
-          preCheckLockKey: pre.lockKey,
+          preCheckReservation: pre.reservation,
           log: userLog,
         },
       );
@@ -1475,38 +1473,6 @@ async function readBoundedJson(req: IncomingMessage, maxBytes: number): Promise<
   }
 }
 
-// ─── manual preCheck(accept 已算好的 maxCost,而非 maxTokens) ──────────
-
-interface PreCheckManualResult {
-  maxCost: bigint;
-  balance: bigint;
-  lockKey: string;
-}
-
-/**
- * 与 billing/preCheck.ts 的 preCheck() 等效,但接受预先算好的 totalMaxCost。
- *
- * 把 R3 双侧估算 (input + output 双管齐下) 的结果交给 preCheck 框架 —— 我们没有
- * 修改原 preCheck.ts 的接口(它接受 maxTokens),而是在这里走同样的 redis 协议。
- */
-async function preCheckManual(
-  redis: PreCheckRedis,
-  input: { userId: bigint; requestId: string; maxCost: bigint },
-): Promise<PreCheckManualResult> {
-  const { getBalance } = await import("../billing/ledger.js");
-  const balance = await getBalance(input.userId);
-  const uidKey = input.userId.toString();
-  const prefix = `precheck:user:${uidKey}:`;
-  const alreadyLocked = await redis.sumByPrefix(prefix);
-  const needTotal = alreadyLocked + input.maxCost;
-  if (balance < needTotal) {
-    throw new InsufficientCreditsError(balance, needTotal);
-  }
-  const lockKey = `precheck:user:${uidKey}:${input.requestId}`;
-  await redis.set(lockKey, input.maxCost.toString(), 300);
-  return { maxCost: input.maxCost, balance, lockKey };
-}
-
 // ─── err response helper(不走 router 的 sendError,因为 proxy 不走 router) ──
 
 function sendJsonError(
@@ -1537,5 +1503,4 @@ function sendJsonError(
 export {
   parseSseEvent as _parseSseEvent,
   UsageObserver as _UsageObserver,
-  preCheckManual as _preCheckManual,
 };

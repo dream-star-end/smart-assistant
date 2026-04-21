@@ -666,6 +666,7 @@ export type {
 } from "./billing/ledger.js";
 export {
   preCheck,
+  preCheckWithCost,
   releasePreCheck,
   estimateMaxCost,
   InsufficientCreditsError as PreCheckInsufficientCreditsError,
@@ -675,7 +676,10 @@ export {
 export type {
   PreCheckRedis,
   PreCheckInput,
+  PreCheckWithCostInput,
   PreCheckResult,
+  ReservationHandle,
+  AtomicReserveResult,
 } from "./billing/preCheck.js";
 export {
   signHupijiao,
