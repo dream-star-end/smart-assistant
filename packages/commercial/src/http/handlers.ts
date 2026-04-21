@@ -331,6 +331,9 @@ export async function handleRefresh(
       const status = err.code === "VALIDATION" ? 400 : 401;
       // LOW(2026-04-21):盗用与 普通过期/不存在 共享 INVALID_REFRESH 错误码,
       // 不给攻击者枚举区别。同时清浏览器 cookie,避免下一次还带着失效 token。
+      // 但 REFRESH_RACE(grace 内多 tab race)**不**清 cookie:此时浏览器
+      // cookie 实际已被 sibling tab 的响应种成新值,清掉反而会把合法用户
+      // 踢登录。前端只需 retry 一次即可继续。
       if (err.code === "INVALID_REFRESH") {
         clearRefreshCookie(res, { secure: deps.refreshCookieSecure });
       }

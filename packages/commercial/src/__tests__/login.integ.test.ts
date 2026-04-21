@@ -440,7 +440,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     }
   });
 
-  test("reuse old (rotated) refresh → INVALID_REFRESH + WHOLE family revoked='theft'", async (t) => {
+  test("reuse old (rotated) refresh OUTSIDE grace → INVALID_REFRESH + WHOLE family revoked='theft'", async (t) => {
     if (skipIfNoPg(t)) return;
     await setupUser("paul@example.com", "paul good password");
     const lr = await login(
@@ -449,7 +449,12 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     );
     const oldRaw = lr.refresh_token;
     const r1 = await refresh(oldRaw, { jwtSecret: JWT_SECRET });
-    // Now r1.refresh_token is the live one, oldRaw is revoked='rotated'.
+    // 把 oldRaw 行的 revoked_at 推到远古 → 模拟"超出 grace 的真盗用复用"
+    await query(
+      "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '1 hour' WHERE token_hash = $1",
+      [refreshTokenHash(oldRaw)],
+    );
+    // Now r1.refresh_token is the live one, oldRaw is revoked='rotated' & 1 小时前.
     // Attacker re-uses oldRaw → must mass-revoke entire family.
     let theftFired = false;
     let revokedCountSeen = 0;
@@ -482,6 +487,46 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     // At least the formerly-live r1 row must show theft.
     const theftRows = rows.rows.filter((r) => r.revoked_reason === "theft");
     assert.ok(theftRows.length >= 1, "at least one row must be marked theft");
+  });
+
+  // 2026-04-21 codex round 1 finding #7 修复回归:多 tab 同时 silent refresh
+  // 时,后到的 request 会在 GRACE 内复用刚被 rotated 的 token —— 必须
+  // 返回 REFRESH_RACE 而**不**触发 theft + 不 mass-revoke family。
+  test("reuse old (rotated) refresh INSIDE grace → REFRESH_RACE, family NOT touched", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("paula-race@example.com", "paula good password");
+    const lr = await login(
+      { email: "paula-race@example.com", password: "paula good password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+    const oldRaw = lr.refresh_token;
+    // 第一次 rotation,r1 是新 live token,oldRaw 刚被 revoked='rotated'(刚刚)
+    const r1 = await refresh(oldRaw, { jwtSecret: JWT_SECRET });
+
+    // 立刻再 reuse oldRaw —— grace 内,应判 RACE 不是 theft
+    let theftFired = false;
+    await assert.rejects(
+      refresh(oldRaw, {
+        jwtSecret: JWT_SECRET,
+        onTheftDetected: () => { theftFired = true; },
+      }),
+      (err: unknown) =>
+        err instanceof RefreshError && err.code === "REFRESH_RACE",
+    );
+    assert.equal(theftFired, false, "race window must NOT fire theft callback");
+
+    // r1(合法 live token)必须仍能正常 refresh —— family 没有被牵连
+    const r2 = await refresh(r1.refresh_token, { jwtSecret: JWT_SECRET });
+    assert.ok(typeof r2.refresh_token === "string" && r2.refresh_token.length > 0);
+
+    // family 内不应该有任何 'theft' 行
+    const rows = await query<{ revoked_reason: string | null }>(
+      `SELECT revoked_reason FROM refresh_tokens
+        WHERE family_id = (SELECT family_id FROM refresh_tokens WHERE token_hash = $1)`,
+      [refreshTokenHash(oldRaw)],
+    );
+    const theftRows = rows.rows.filter((r) => r.revoked_reason === "theft");
+    assert.equal(theftRows.length, 0, "race must not produce any theft-marked rows");
   });
 
   test("expired+rotated reuse does NOT trigger theft (token natural-dead, no signal)", async (t) => {

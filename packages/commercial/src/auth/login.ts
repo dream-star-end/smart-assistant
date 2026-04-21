@@ -71,7 +71,7 @@ export class LoginError extends Error {
   }
 }
 
-export type RefreshErrorCode = "VALIDATION" | "INVALID_REFRESH";
+export type RefreshErrorCode = "VALIDATION" | "INVALID_REFRESH" | "REFRESH_RACE";
 
 export class RefreshError extends Error {
   readonly code: RefreshErrorCode;
@@ -80,6 +80,32 @@ export class RefreshError extends Error {
     this.name = "RefreshError";
     this.code = code;
   }
+}
+
+/**
+ * Rotation race grace window:同 token 在 N 秒内被复用,99% 是合法的
+ * "多 tab/race 同时 silent refresh" 而不是攻击者复用旧 token。
+ *
+ * 工作原理:
+ *   - tab A 发 refresh,server rotate X→Y,response set-cookie Y
+ *   - tab B 同一刻发 refresh(cookie 还是 X),server 见 X 已 rotated
+ *   - 在 GRACE 内:返 REFRESH_RACE(401 但**不**清 cookie),tab B 前端
+ *     retry 时 cookie 已被 tab A 的响应种成 Y,retry 自动成功
+ *   - GRACE 外:等同 theft,整族 mass-revoke
+ *
+ * Trade-off: GRACE 内攻击者拿失窃 token 复用不会被检测;但 attacker 没有
+ * 新 cookie 可 retry,实际仍然拿不到 access token。这是 OAuth 2.1 实现里
+ * 常见的折衷,叫 "reuse interval" 或 "rotation grace window"。
+ *
+ * 默认 10s 足够覆盖正常多 tab silent refresh race;可由 env 调。
+ */
+const REFRESH_ROTATION_GRACE_SECONDS_DEFAULT = 10;
+function rotationGraceSeconds(): number {
+  const raw = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+  if (!raw) return REFRESH_ROTATION_GRACE_SECONDS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return REFRESH_ROTATION_GRACE_SECONDS_DEFAULT;
+  return n;
 }
 
 export interface LoginUser {
@@ -373,11 +399,24 @@ export async function refresh(
     // logout/password_reset/admin/theft 等显式撤销 reason 不触发 theft 链
     // (已经是用户/管理员主动登出,后续 reuse 视作普通失效),只 'rotated'
     // 才是"正主已经接到新 token,这张老的不该再回头被用"的强信号。
+    //
+    // 2026-04-21 codex round 1 finding #7 修复:加 rotation grace window。
+    // 在 GRACE 内的 rotated reuse 视作合法多 tab race,不触发 theft;
+    // GRACE 外的 reuse 才走 mass-revoke。详见 rotationGraceSeconds() 注释。
     if (
       row.revoked_at !== null &&
       !row.expired &&
       row.revoked_reason === "rotated"
     ) {
+      const revokedAtMs = new Date(row.revoked_at).getTime();
+      const ageSec = Number.isFinite(revokedAtMs)
+        ? (Date.now() - revokedAtMs) / 1000
+        : Number.POSITIVE_INFINITY;
+      const grace = rotationGraceSeconds();
+      if (ageSec < grace) {
+        // Race grace:返特殊 kind,handler 见后**不**清 cookie + 不报 theft
+        return { kind: "race" as const };
+      }
       const massRevoke = await client.query<{ id: string }>(
         `UPDATE refresh_tokens
             SET revoked_at = NOW(), revoked_reason = 'theft'
@@ -440,6 +479,13 @@ export async function refresh(
       newRefresh,
     };
   });
+
+  if (result.kind === "race") {
+    // 多 tab 同时 silent refresh 撞上老 cookie:返 REFRESH_RACE,
+    // handler 应**不**清 cookie,前端 retry 时浏览器会带 sibling
+    // 请求种回的新 cookie 一次性成功。
+    throw new RefreshError("REFRESH_RACE", "refresh token rotation race");
+  }
 
   if (result.kind === "theft") {
     try {

@@ -101,39 +101,64 @@ async function _extractErrorMessage(res) {
 //   • caller 传 suppressAuthRedirect=true(login/probe)整体跳过。
 //   • 重试 pass 上 set _attemptedRefresh=true,避免无限循环。
 let _refreshInflight = null
+
+// 单次 refresh 调用(不含 race retry)。
+async function _doRefreshOnce() {
+  const legacyBody = state.refreshToken
+    ? JSON.stringify({ refresh_token: state.refreshToken })
+    : undefined
+  const r = await fetch('/api/auth/refresh', {
+    method: 'POST',
+    // same-origin 是默认值,显式写出来表明"我们依赖浏览器自动带 cookie"。
+    credentials: 'same-origin',
+    headers: legacyBody ? { 'Content-Type': 'application/json' } : undefined,
+    body: legacyBody,
+  })
+  if (r.ok) {
+    const data = await r.json().catch(() => ({}))
+    if (typeof data?.access_token !== 'string' || !data.access_token) {
+      return { ok: false, race: false }
+    }
+    state.token = data.access_token
+    if (typeof data.access_exp === 'number') state.tokenExp = data.access_exp
+    try {
+      localStorage.setItem('openclaude_access_token', data.access_token)
+      if (typeof data.access_exp === 'number') {
+        localStorage.setItem('openclaude_access_exp', String(data.access_exp))
+      }
+      // 升级成功:server 已把 cookie 种回来,本地 localStorage / state 里的旧
+      // refresh token 不再需要 —— 留着只会在下次 refresh 又被当 body fallback
+      // 重新提交,徒增 XSS 时被 dump 的可能。一次性清零。
+      if (legacyBody) {
+        localStorage.removeItem('openclaude_refresh_token')
+        state.refreshToken = ''
+      }
+    } catch {}
+    return { ok: true, race: false }
+  }
+  // 401 + REFRESH_RACE = 多 tab race,server 没清 cookie,稍后 retry 一次
+  // 大概率因为浏览器已收到 sibling tab 的 set-cookie 而成功。
+  let race = false
+  if (r.status === 401) {
+    try {
+      const errBody = await r.json()
+      if (errBody && errBody.code === 'REFRESH_RACE') race = true
+    } catch {}
+  }
+  return { ok: false, race }
+}
+
 function _silentRefresh() {
   if (_refreshInflight) return _refreshInflight
   _refreshInflight = (async () => {
-    const legacyBody = state.refreshToken
-      ? JSON.stringify({ refresh_token: state.refreshToken })
-      : undefined
     try {
-      const r = await fetch('/api/auth/refresh', {
-        method: 'POST',
-        // same-origin 是默认值,显式写出来表明"我们依赖浏览器自动带 cookie"。
-        credentials: 'same-origin',
-        headers: legacyBody ? { 'Content-Type': 'application/json' } : undefined,
-        body: legacyBody,
-      })
-      if (!r.ok) return false
-      const data = await r.json().catch(() => ({}))
-      if (typeof data?.access_token !== 'string' || !data.access_token) return false
-      state.token = data.access_token
-      if (typeof data.access_exp === 'number') state.tokenExp = data.access_exp
-      try {
-        localStorage.setItem('openclaude_access_token', data.access_token)
-        if (typeof data.access_exp === 'number') {
-          localStorage.setItem('openclaude_access_exp', String(data.access_exp))
-        }
-        // 升级成功:server 已把 cookie 种回来,本地 localStorage / state 里的旧
-        // refresh token 不再需要 —— 留着只会在下次 refresh 又被当 body fallback
-        // 重新提交,徒增 XSS 时被 dump 的可能。一次性清零。
-        if (legacyBody) {
-          localStorage.removeItem('openclaude_refresh_token')
-          state.refreshToken = ''
-        }
-      } catch {}
-      return true
+      const first = await _doRefreshOnce()
+      if (first.ok) return true
+      if (!first.race) return false
+      // race grace:小睡再 retry 一次,让 sibling tab 的 set-cookie 生效。
+      await new Promise(r => setTimeout(r, 250))
+      const second = await _doRefreshOnce()
+      return second.ok
     } catch {
       return false
     }
