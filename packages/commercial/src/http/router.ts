@@ -233,6 +233,9 @@ export function createCommercialHandler(
     const ctx: RequestContext = {
       requestId,
       clientIp: clientIpOf(req),
+      // 稳定出口 IP —— 不经任何反代 header 解析,给 auth bound_ip 用。
+      // Caddy 反代时 = 127.0.0.1,直连 = 公网 IP。详见 RequestContext 的 JSDoc。
+      authBoundIp: req.socket.remoteAddress ?? "unknown",
       userAgent: userAgentOf(req),
       log: reqLog,
     };

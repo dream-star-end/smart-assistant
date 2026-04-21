@@ -103,7 +103,27 @@ export interface CommercialHttpDeps {
 
 export interface RequestContext {
   requestId: string;
+  /**
+   * "真实客户端 IP",给 rate-limit key / access log / metrics 用。
+   * Caddy 反代时 = XFF 首段(CF edge IP 或 CF-Connecting-IP,取决于 clientIpOf 判断)。
+   * 会随 CF 边缘节点漂移,**不适合**作为 auth bound_ip 的 fingerprint 基线。
+   */
   clientIp: string;
+  /**
+   * 2026-04-22 HIGH#4 回归修:auth 专用的"稳定出口 IP",给 login/refresh/register
+   * 的 `remoteIp` 参数用,作为 bound_ip 写入 refresh_tokens。
+   *
+   * 语义:**不经任何反代 header 解析**,直接 socket.remoteAddress:
+   *   - Caddy 反代时永远 = 127.0.0.1(loopback)→ race grace sameIp 恒真,合法多 tab
+   *     race 正常放行
+   *   - 攻击者绕过 Caddy 直连 gateway → 另一个非 loopback IP → 与旧 row bound_ip=127
+   *     必然 mismatch → 走 theft 路径 mass-revoke family
+   *
+   * 根本起因:R1 I3 把 `clientIp` 改成 CF edge IP(每次不同)后,HIGH#4 "Caddy 背后 IP
+   * 恒定" 的假设失效,grace race 里的 sameIp 比对持续 false → 合法用户被误判 theft →
+   * 整族 revoke → 下次 refresh cookie 已清 → 400 "refresh_token is required" → 登录页。
+   */
+  authBoundIp: string;
   userAgent: string | null;
   /**
    * V3 Phase 2 Task 2I-1:per-request 结构化 logger。
@@ -168,7 +188,7 @@ export async function handleRegister(
       turnstileSecret: deps.turnstileSecret,
       turnstileBypass: deps.turnstileBypass,
       fetchImpl: deps.fetchImpl,
-      remoteIp: ctx.clientIp,
+      remoteIp: ctx.authBoundIp,
       verifyEmailUrlBase: deps.verifyEmailUrlBase,
     });
     sendJson(res, 201, {
@@ -207,7 +227,7 @@ export async function handleLogin(
       turnstileSecret: deps.turnstileSecret,
       turnstileBypass: deps.turnstileBypass,
       fetchImpl: deps.fetchImpl,
-      remoteIp: ctx.clientIp,
+      remoteIp: ctx.authBoundIp,
       userAgent: ctx.userAgent ?? undefined,
       requireEmailVerified: deps.requireEmailVerified,
     });
@@ -331,15 +351,23 @@ export async function handleRefresh(
     // 不论来源是 cookie 还是 body,都把新 raw 写回 HttpOnly cookie 并丢弃
     // 客户端送来的旧 token(已被 refresh() 内部 revoked)。
     //
-    // 2026-04-21 安全审计 HIGH#4:remoteIp 走 ctx.clientIp(= clientIpOf,
-    // 只信 socket.remoteAddress),不再读 X-Forwarded-For。攻击者无法通过
-    // 伪造 XFF 让 sameIp 检查把盗用 race 识别成合法 race,从而绕过 theft
-    // 链。Caddy 前置时 socket.remoteAddress = Caddy IP,grace 内的合法多
-    // tab race 永远 sameIp=true(同一个代理出口);攻击者直连 gateway
-    // bypass Caddy 走的是另一个 socket.remoteAddress,必然 mismatch。
+    // 2026-04-22 HIGH#4 回归修:改用 ctx.authBoundIp(= socket.remoteAddress,
+    // 不经反代 header 解析)。
+    //
+    // 原注释(保留备忘)设想 `ctx.clientIp` 就是 socket.remoteAddress,但 R1 I3
+    // 修了 rate-limit 全站共享桶问题后,`ctx.clientIp` 改走 CF-Connecting-IP /
+    // XFF peer,每次 CF 边缘节点漂移都会让 bound_ip 值漂移 → grace race 里的
+    // sameIp 比对持续 false → 合法多 tab 用户被误判 theft → 整族 revoke → 下次
+    // refresh 400 "refresh_token is required" → 登录页。
+    //
+    // 分离之后:
+    //   - ctx.clientIp(CF edge / CF-Connecting-IP)继续给 rate-limit key / log 用
+    //   - ctx.authBoundIp(稳定 loopback)专供 auth bound_ip,维持 HIGH#4 原意
+    // 攻击者绕过 Caddy 直连 gateway 会有独立 socket.remoteAddress(非 loopback),
+    // 依旧 mismatch → theft 路径仍然能识别盗用。
     const r = await refresh(rawRefresh, {
       jwtSecret: deps.jwtSecret,
-      remoteIp: ctx.clientIp,
+      remoteIp: ctx.authBoundIp,
       userAgent: ctx.userAgent ?? undefined,
     });
     // cookie Max-Age = 新 token 真实剩余 TTL;到期时间由 server 主导
@@ -448,7 +476,7 @@ export async function handleRequestPasswordReset(
         resetUrlBase: deps.resetPasswordUrlBase,
         turnstileSecret: deps.turnstileSecret,
         turnstileBypass: deps.turnstileBypass,
-        remoteIp: ctx.clientIp,
+        remoteIp: ctx.authBoundIp,
         fetchImpl: deps.fetchImpl,
       },
     );
