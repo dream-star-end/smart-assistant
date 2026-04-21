@@ -69,16 +69,37 @@ function _composeSignal(userSignal, timeoutMs) {
   }
 }
 
-function _httpError(label, status, msg) {
+function _httpError(label, status, msg, code, issues) {
   const e = new Error(msg ? `${label} failed: ${status} ${msg}` : `${label} failed: ${status}`)
   e.status = status
+  if (code) e.code = code
+  if (issues) e.issues = issues
   return e
+}
+
+// 后端标准错误体: { error: { code, message, request_id, issues? } }
+// 旧/legacy 兼容: { error: string } 或 { message: string }
+function _readStdError(d) {
+  if (!d || typeof d !== 'object') return { code: undefined, message: undefined, issues: undefined }
+  // 标准格式
+  if (d.error && typeof d.error === 'object') {
+    return {
+      code: typeof d.error.code === 'string' ? d.error.code : undefined,
+      message: typeof d.error.message === 'string' ? d.error.message : undefined,
+      issues: Array.isArray(d.error.issues) ? d.error.issues : undefined,
+    }
+  }
+  // legacy 字符串 error
+  if (typeof d.error === 'string') return { code: undefined, message: d.error, issues: undefined }
+  if (typeof d.message === 'string') return { code: undefined, message: d.message, issues: undefined }
+  return { code: undefined, message: undefined, issues: undefined }
 }
 
 async function _extractErrorMessage(res) {
   try {
     const d = await res.clone().json()
-    return d?.error || d?.message
+    const std = _readStdError(d)
+    return std.message ?? std.code
   } catch {
     return undefined
   }
@@ -138,21 +159,25 @@ async function _doRefreshOnce() {
   }
   // 401 + REFRESH_RACE = 多 tab race,server 没清 cookie,稍后 retry 一次
   // 大概率因为浏览器已收到 sibling tab 的 set-cookie 而成功。
+  // R3 finding: 后端标准错误体是 { error: { code, ... } },不是顶层 code。
+  // 必须经 _readStdError 解析,否则 race 永远 false → bounded retry 死代码。
   let race = false
   if (r.status === 401) {
     try {
       const errBody = await r.json()
-      if (errBody && errBody.code === 'REFRESH_RACE') race = true
+      const std = _readStdError(errBody)
+      if (std.code === 'REFRESH_RACE') race = true
     } catch {}
   }
   return { ok: false, race }
 }
 
-// race grace 内 bounded retry:server 默认 grace=10s,但 sibling tab 的
-// refresh 通常 <500ms 完成,我们用 250/500/1000/2000 共 4 次 retry
-// (累计 ~3.75s,远低于 10s grace)足以覆盖绝大多数多 tab 场景。
-// R2 finding 加固:不再单次 retry —— 单次太短会在 sibling tab 慢的时候误踢用户。
-const _RACE_RETRY_DELAYS_MS = [250, 500, 1000, 2000]
+// race grace 内 bounded retry:server 默认 grace=10s,我们用约一半时间
+// (250/500/1000/1500/1750 共 5 次 retry,累计 ~5s)。这样 sibling tab
+// 即使比平时慢几倍仍能覆盖,但不会无限等(避免在 grace 已过的情况下
+// 把 INVALID_REFRESH 也轮询过去 — 内部 if (!last.race) 会即时退出)。
+// R3 finding 加固:R2 用的 [250,500,1000,2000] 累计 3.75s 偏短。
+const _RACE_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 1750]
 
 function _silentRefresh() {
   if (_refreshInflight) return _refreshInflight
@@ -268,6 +293,9 @@ export async function apiJson(method, path, body, opts = {}) {
     body: body != null ? JSON.stringify(body) : undefined,
   })
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw _httpError(`${method} ${path}`, res.status, data?.error || data?.message)
+  if (!res.ok) {
+    const std = _readStdError(data)
+    throw _httpError(`${method} ${path}`, res.status, std.message ?? std.code, std.code, std.issues)
+  }
   return data
 }
