@@ -365,6 +365,11 @@ export async function registerCommercial(
         scheduler,
         identityRepo,
         rateLimitRedis,
+        // HOTFIX 2026-04-21: 不传 refreshDeps 导致 anthropicProxy 里
+        //   `deps.refreshDeps && pick.expires_at && shouldRefresh(...)` 永远 false,
+        // OAuth token 过期后不会自动 refresh,结果上游直接 401。
+        // health 注入进来是为了 refresh 失败时按规约走 health.manualDisable。
+        refreshDeps: { health: healthTracker },
       });
       internalProxyServer = createHttpServer((req, res) => {
         // peerIp 取 socket.remoteAddress(IP-only,无端口);verifyContainerIdentity 接受 string|undefined
