@@ -225,6 +225,15 @@ export class SubprocessRunner extends EventEmitter {
     return this.currentSessionId
   }
 
+  /** Forget the cached CCB session id. Next start() will NOT pass --resume,
+   *  forcing CCB to allocate a fresh session. Used by sessionManager when a
+   *  previous run failed with "No conversation found with session ID: ..." —
+   *  without this, the runner keeps re-requesting the same dead id every
+   *  restart and perpetually crashes. */
+  clearSessionId(): void {
+    this.currentSessionId = null
+  }
+
   /** Update config (e.g. after OAuth token refresh). Takes effect on next start(). */
   updateConfig(config: OpenClaudeConfig): void {
     this.opts.config = config
@@ -321,18 +330,30 @@ export class SubprocessRunner extends EventEmitter {
 
     if (effectiveProvider === 'claude-subscription') {
       // Claude subscription: inject OAuth token, route to Anthropic API
-      if (this.opts.config.auth.claudeOAuth?.accessToken) {
-        providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
-      }
+      //
       // CRITICAL: Tell CCB that the host owns provider routing.
       // Without this, CCB's managedEnv.ts will Object.assign settings.json env
       // (ANTHROPIC_BASE_URL=minimax, ANTHROPIC_AUTH_TOKEN=minimax_key) OVER our
       // spawn env, routing Claude requests to MiniMax instead of Anthropic.
       // With this flag, CCB strips provider vars from settings.json during load.
       providerEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
-      providerEnv.ANTHROPIC_BASE_URL = ''
-      providerEnv.ANTHROPIC_AUTH_TOKEN = ''
-      providerEnv.ANTHROPIC_MODEL = ''
+      if (this.opts.config.auth.claudeOAuth?.accessToken) {
+        providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
+        // Host is injecting its own Claude OAuth for direct Anthropic routing.
+        // Wipe any inherited ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN so a user
+        // settings.json can't redirect CCB to a Minimax-compatible endpoint and
+        // steal OAuth-authed traffic. MANAGED_BY_HOST alone strips these from
+        // settings-sourced env, but a stray export in the gateway's own shell
+        // env could still bleed through — defense in depth.
+        providerEnv.ANTHROPIC_BASE_URL = ''
+        providerEnv.ANTHROPIC_AUTH_TOKEN = ''
+        providerEnv.ANTHROPIC_MODEL = ''
+      }
+      // else: no host OAuth to inject — some upstream (e.g. v3 commercial
+      // supervisor) has already put ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+      // into process.env at container-boot time, pointing CCB at the internal
+      // proxy. Leave those alone; MANAGED_BY_HOST still protects against
+      // settings.json overrides.
     } else if (effectiveProvider === 'codex' || effectiveProvider === 'openai') {
       // OpenAI/Codex: use Codex OAuth token via OpenAI-compatible endpoint
       // CCB doesn't natively support OpenAI, but OpenAI provides an Anthropic-compatible

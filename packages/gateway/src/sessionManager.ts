@@ -69,6 +69,11 @@ export interface AgentSession {
   _cronBridgeMap?: Map<string, string>
   // Current turn parser (for idle-timeout to check pendingToolCalls)
   _currentParser?: import('./ccbMessageParser.js').CcbMessageParser
+  /** Set by onFinish when the CCB result row signals a stale --resume session
+   *  id (file no longer exists). Read by the runner.exit handler to evict the
+   *  sessionKey's resume-map entry instead of re-persisting it. See
+   *  ccbMessageParser.ts TurnResult.staleResumeId. */
+  _pendingStaleResumeClear?: boolean
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -417,9 +422,26 @@ export class SessionManager {
     runner.on('exit', (info: { code: number | null; signal: string | null; crashed: boolean }) => {
       if (info.crashed) {
         log.warn('subprocess crashed', { sessionKey: opts.sessionKey, code: info.code, signal: info.signal })
-        // Ensure the session stays in resume-map so it can be restored on next submit()
-        // (SubprocessRunner.submit() auto-restarts with --resume when proc is null)
-        if (session.ccbSessionId) {
+        // If the most recent turn failed because the --resume session id on
+        // disk is stale (CCB: "No conversation found with session ID: ..."),
+        // evict the entry so the next submit() starts a fresh CCB session.
+        // Without this, every restart re-spawns CCB with the same dead id,
+        // producing the same error, and the subprocess never boots.
+        if (session._pendingStaleResumeClear) {
+          this._resumeMap.delete(opts.sessionKey)
+          this._resumeMapTimestamps.delete(opts.sessionKey)
+          this._resumeMapProvider.delete(opts.sessionKey)
+          this._resumeMapLastCost.delete(opts.sessionKey)
+          session.ccbSessionId = null
+          session._pendingStaleResumeClear = false
+          // Also forget the id inside the runner — otherwise submit()'s next
+          // start() reads it back as resumeSessionId and --resume the same
+          // dead id again.
+          session.runner.clearSessionId?.()
+          this._saveResumeMap()
+        } else if (session.ccbSessionId) {
+          // Ensure the session stays in resume-map so it can be restored on next submit()
+          // (SubprocessRunner.submit() auto-restarts with --resume when proc is null)
           this._resumeMap.set(opts.sessionKey, session.ccbSessionId)
           this._saveResumeMap()
         }
@@ -801,6 +823,25 @@ export class SessionManager {
         },
         onFinish: (result) => {
           detach()
+
+          // Detect stale --resume session id. CCB emits an error result with
+          // `errors: ["No conversation found with session ID: <id>"]` when
+          // the JSONL file for the requested resume id is missing on disk.
+          // Flag the session so the upcoming runner.exit handler evicts the
+          // entry from resume-map; otherwise every subsequent submit()
+          // re-spawns CCB with the same dead id and loops forever.
+          if (result?.staleResumeId) {
+            log.warn('stale --resume session id detected, will clear resume-map entry', {
+              sessionKey: session.sessionKey,
+              staleId: session.ccbSessionId,
+            })
+            session._pendingStaleResumeClear = true
+            session.totalCostUSD = prevCostUSD
+            session.turns = prevTurns
+            session._lastCcbCumulativeCost = prevLastCcbCost
+            settle(() => reject(new Error('STALE_RESUME_ID: Previous session file missing; next submit will start fresh')))
+            return
+          }
 
           // Detect auth error in assistant output — roll back counters and reject.
           // Two signals: (1) isError + broad keyword match, (2) CCB's exact error prefix.

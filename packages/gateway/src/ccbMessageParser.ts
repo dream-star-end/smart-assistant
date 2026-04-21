@@ -77,6 +77,12 @@ export interface TurnResult {
   stopReason: string | null
   /** num_turns from CCB result row, for diagnostics. null when absent. */
   numTurns: number | null
+  /** True when CCB's result row contains an error indicating the --resume
+   *  session id no longer exists on disk (e.g. "No conversation found with
+   *  session ID: ..."). SessionManager uses this as a signal to strip the
+   *  stale entry from resume-map so the next submit() starts a fresh session
+   *  instead of perpetually re-requesting the same non-existent conversation. */
+  staleResumeId: boolean
 }
 
 /**
@@ -487,6 +493,20 @@ export class CcbMessageParser {
       ? ((msg as any).num_turns as number)
       : null
 
+    // Detect stale --resume session id. When the gateway spawns CCB with
+    // --resume <id> and <id>.jsonl no longer exists (e.g. CCB crashed before
+    // the JSONL was persisted, and we still wrote the id to resume-map from
+    // the init message), CCB emits an error_during_execution result whose
+    // `errors` array contains "No conversation found with session ID: <id>".
+    // Left unchecked, every subsequent submit() re-spawns CCB with the same
+    // dead id and re-crashes, forming an infinite loop.
+    const errorsField = (msg as any).errors
+    const staleResumeId =
+      Array.isArray(errorsField) &&
+      errorsField.some(
+        (e) => typeof e === 'string' && e.includes('No conversation found with session ID'),
+      )
+
     this.turnResult = {
       cost: turnCost,
       inputTokens: usage.input_tokens ?? 0,
@@ -497,6 +517,7 @@ export class CcbMessageParser {
       isError: !!(msg as any).is_error,
       stopReason,
       numTurns,
+      staleResumeId,
     }
 
     this.finalized = true
