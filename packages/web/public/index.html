@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=31" />
+<link rel="stylesheet" href="/style.css?v=32" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -49,15 +49,15 @@
     <div class="landing-hero-inner">
       <div class="landing-hero-eyebrow">
         <span class="landing-dot"></span>
-        Powered by Claude Opus 4.7 &middot; Sonnet 4.6
+        基于官方 Claude Code · Max 账号池直连
       </div>
       <h1 class="landing-hero-title">
-        你的 AI 工作站<br/>
-        <span class="landing-hero-accent">一个账号,所有 Claude 能力</span>
+        原生 Claude Code 底座<br/>
+        <span class="landing-hero-accent">满血 Opus,不降智</span>
       </h1>
       <p class="landing-hero-sub">
-        对话、Agent、媒体生成、浏览器自动化、定时任务、长期记忆 ——
-        把日常工作交给一个不会下班的助手。
+        多账号轮询 · prompt cache 命中率 &gt; 95% ——
+        token 成本压到极低,你只为真正消耗的部分买单。
       </p>
       <div class="landing-hero-ctas">
         <button type="button" id="landing-hero-register-btn" class="btn btn-primary landing-btn-lg">
@@ -67,9 +67,9 @@
         <button type="button" id="landing-hero-login-btn" class="btn btn-ghost landing-btn-lg">已有账号 → 登录</button>
       </div>
       <div class="landing-hero-meta">
-        <span>邮箱注册 · 无需信用卡</span>
+        <span>官方 Claude Code Max 通道</span>
         <span class="landing-meta-sep">·</span>
-        <span>充值 ¥10 起</span>
+        <span>满血 Opus 4.7 / Sonnet 4.6</span>
         <span class="landing-meta-sep">·</span>
         <span>按 token 精确计费</span>
       </div>
@@ -79,50 +79,36 @@
   <section id="features" class="landing-section">
     <div class="landing-section-head">
       <span class="landing-section-tag">为什么选 OpenClaude</span>
-      <h2 class="landing-section-title">一个工作台,把 AI 能力全部装进来</h2>
+      <h2 class="landing-section-title">不是 API 包壳,是原生 Claude Code</h2>
     </div>
     <div class="landing-feature-grid">
       <div class="landing-card">
         <div class="landing-card-icon">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7h-9M14 17H5M5 7h2M17 17h2M9 12h6"/><circle cx="6" cy="7" r="2"/><circle cx="18" cy="17" r="2"/><circle cx="12" cy="12" r="2"/></svg>
         </div>
-        <h3>对话 + 思考强度可调</h3>
-        <p>同时挂载 Opus 4.7 与 Sonnet 4.6,一键切换"编码模式 / 科研模式 / 普通对话",按需要让模型多想或快答。</p>
+        <h3>官方 Claude Code Max 账号池</h3>
+        <p>多账号轮询调度,触发限速自动切换 —— 单账号被限不会让你的会话掉链子。所有调用走 Anthropic 官方通道,模型行为与官方完全一致。</p>
       </div>
       <div class="landing-card">
         <div class="landing-card-icon">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/></svg>
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg>
         </div>
-        <h3>独立 Agent 工作空间</h3>
-        <p>每位用户一个隔离的 Docker 容器,长期记忆与技能持久落盘,跨会话延续。Agent 帮你写代码、跑命令、改文件。</p>
+        <h3>满血 Opus,不降智</h3>
+        <p>完整 thinking budget、不阉割上下文、不锁工具调用。Opus 4.7 / Sonnet 4.6 / Haiku 4.5 全系按需切换,推理深度可调到极限。</p>
       </div>
       <div class="landing-card">
         <div class="landing-card-icon">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v12M9 9h4.5a2.5 2.5 0 0 1 0 5H9"/></svg>
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg>
         </div>
-        <h3>按 token 计费,不订阅不浪费</h3>
-        <p>充值后按实际 input/output token 扣费,精确到 ¥0.01。账户余额随时可见,用多少花多少。</p>
+        <h3>原生 Claude Code 为底座</h3>
+        <p>工具系统、子 Agent、文件操作、Bash、Grep、浏览器自动化 —— 官方 Claude Code 的全部能力原样保留,不是套壳 API。每位用户独立 Docker 容器,数据完全隔离。</p>
       </div>
       <div class="landing-card">
         <div class="landing-card-icon">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l3 7h7l-5.5 4 2 7-6.5-4.5L5.5 20l2-7L2 9h7z"/></svg>
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.55"/><path d="M21 4v6h-6"/></svg>
         </div>
-        <h3>多模态生成内置</h3>
-        <p>文生图、文生视频、TTS 语音、图像理解 —— MiniMax 全套生成模型已接入,一句中文直接出片。</p>
-      </div>
-      <div class="landing-card">
-        <div class="landing-card-icon">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        </div>
-        <h3>浏览器自动化 + 定时任务</h3>
-        <p>Playwright 浏览器内嵌、cron 定时调度,让 Agent 自己上网填表、抓数据、按时跑流程。</p>
-      </div>
-      <div class="landing-card">
-        <div class="landing-card-icon">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg>
-        </div>
-        <h3>长期记忆 + 技能自进化</h3>
-        <p>用户偏好、项目背景、操作习惯都能记下来。Agent 完成复杂任务后会主动沉淀可复用技能。</p>
+        <h3>缓存命中率 &gt; 95%</h3>
+        <p>prompt cache 全链路打满,长会话和重复任务的输入 token 几乎不重复计费。同样的工作量,token 账单往往只到原价的 1/5 ~ 1/10。</p>
       </div>
     </div>
   </section>
@@ -152,27 +138,6 @@
     </div>
   </section>
 
-  <section class="landing-section landing-section-alt">
-    <div class="landing-section-head">
-      <span class="landing-section-tag">能力一览</span>
-      <h2 class="landing-section-title">不止聊天 —— 一个 Agent 能干的事</h2>
-    </div>
-    <div class="landing-capabilities">
-      <div class="landing-cap"><span class="landing-cap-emoji">🖼️</span><span>文生图 / 图像理解</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">🎬</span><span>文生视频 / 短片合成</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">🔊</span><span>TTS 语音 / 语音克隆</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">🌐</span><span>浏览器自动化</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">⏰</span><span>cron 定时调度</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">🧠</span><span>长期记忆系统</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">🛠️</span><span>技能自动沉淀</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">📨</span><span>子 Agent 协作</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">📎</span><span>文件上传 / 解析</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">📊</span><span>图表 / Mermaid 渲染</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">📝</span><span>Markdown / LaTeX</span></div>
-      <div class="landing-cap"><span class="landing-cap-emoji">📄</span><span>导出 docx / TeX</span></div>
-    </div>
-  </section>
-
   <section id="faq" class="landing-section">
     <div class="landing-section-head">
       <span class="landing-section-tag">常见问题</span>
@@ -180,8 +145,12 @@
     </div>
     <div class="landing-faq">
       <details class="landing-faq-item">
-        <summary>OpenClaude 和官方 Claude.ai 有什么区别?</summary>
-        <p>OpenClaude 是构建在 Claude API 之上的 AI 工作站。除了对话能力之外,还提供独立 Agent 容器、长期记忆、媒体生成、浏览器自动化、定时任务等官方网页版没有的工程化能力,适合把 AI 真正用到日常工作流里。</p>
+        <summary>和直接订 Claude Pro / Max 比有什么区别?</summary>
+        <p>底座完全一样 —— 我们调用的就是官方 Claude Code Max 通道,模型是满血 Opus / Sonnet,不降智、不阉割上下文。差别在两点:① 多账号池轮询,你不会因为单账号 5 小时配额触顶而中断;② prompt cache 命中率 &gt; 95%,token 账单比直接走 API 通常便宜一个数量级。按量付费,不订阅,不浪费。</p>
+      </details>
+      <details class="landing-faq-item">
+        <summary>"原生 Claude Code 底座"是什么意思?</summary>
+        <p>市面上很多产品是"调 Claude API + 自己写一层壳"。我们直接用官方 Claude Code 作为底层 Agent 引擎 —— 工具系统、子 Agent 调度、文件操作、Bash、Grep、浏览器自动化全部原样保留。每位用户独立 Docker 容器跑一份完整的 Claude Code,行为与你本地装一份官方 CLI 完全一致。</p>
       </details>
       <details class="landing-faq-item">
         <summary>计费方式是按月订阅还是按量?</summary>
@@ -1064,6 +1033,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=30"></script>
+<script type="module" src="/modules/main.js?v=31"></script>
 </body>
 </html>
