@@ -178,6 +178,12 @@ export interface RequestResetInput {
  *   层的 3/min 太弱,不能挡 botnet);turnstile 验证失败 → TURNSTILE_FAILED,
  *   **必须在 email 查库之前就拒绝**,避免给"非空 turnstile + 真实 email"留
  *   timing 边信道。
+ *
+ * 旧 token 失效(2026-04-21 安全审计 MED):
+ *   每次签发新 reset_password token 前,必须把同一 user 之前所有未消费/未过期
+ *   的 reset_password 行 mark used_at = NOW()。否则:攻击者钓到一份 reset
+ *   邮件后,即使本人重新申请,旧链接仍可用,等于绕过"用户主动作废"的预期。
+ *   UPDATE + INSERT 必须在同一事务里,避免并发请求拿到同时有效的多张 token。
  */
 export async function requestPasswordReset(
   input: string | RequestResetInput,
@@ -232,11 +238,24 @@ export async function requestPasswordReset(
   const ts = nowSec(deps);
   const expiresIso = new Date((ts + RESET_PASSWORD_TTL_SECONDS) * 1000).toISOString();
 
-  await query(
-    `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
-     VALUES ($1, $2, 'reset_password', $3)`,
-    [userId, verify.hash, expiresIso],
-  );
+  // 安全审计 MED:先作废同一用户之前所有未消费/未过期的 reset_password token,
+  // 再插入新行 —— 同一事务保证并发申请也只能让最后一张生效。
+  await tx(async (client) => {
+    await client.query(
+      `UPDATE email_verifications
+          SET used_at = NOW()
+        WHERE user_id = $1
+          AND purpose = 'reset_password'
+          AND used_at IS NULL
+          AND expires_at > NOW()`,
+      [userId],
+    );
+    await client.query(
+      `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
+       VALUES ($1, $2, 'reset_password', $3)`,
+      [userId, verify.hash, expiresIso],
+    );
+  });
 
   const url = `${(deps.resetUrlBase ?? "").replace(/\/$/, "")}/reset-password?token=${verify.raw}`;
   try {

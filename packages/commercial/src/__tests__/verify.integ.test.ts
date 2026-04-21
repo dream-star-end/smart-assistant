@@ -361,6 +361,107 @@ describe("auth.verify.requestPasswordReset (integ)", () => {
       assert.equal(mailer.sent.length, 1, "string overload must remain unchanged");
     });
   });
+
+  // 2026-04-21 安全审计 MED:重复申请 reset 时,旧 token 必须立刻作废,
+  // 否则攻击者钓到旧 reset 邮件后,即使本人重新申请,旧链接仍可用。
+  describe("prior reset tokens invalidated on new request (MED)", () => {
+    test("issuing a new reset marks all previously outstanding tokens used_at=NOW()", async (t) => {
+      if (skipIfNoPg(t)) return;
+      await registerAndCaptureVerifyToken("paul@example.com", "pwd paul");
+
+      const mailer1 = new CapturingMailer();
+      await requestPasswordReset("paul@example.com", {
+        mailer: mailer1,
+        resetUrlBase: "https://claudeai.chat",
+      });
+      const firstToken = mailer1.sent[0]?.text.match(/token=([^\s]+)/)?.[1];
+      assert.ok(firstToken, "first reset token must be captured");
+
+      // Second request — should invalidate the first.
+      const mailer2 = new CapturingMailer();
+      await requestPasswordReset("paul@example.com", {
+        mailer: mailer2,
+        resetUrlBase: "https://claudeai.chat",
+      });
+      const secondToken = mailer2.sent[0]?.text.match(/token=([^\s]+)/)?.[1];
+      assert.ok(secondToken, "second reset token must be captured");
+      assert.notEqual(firstToken, secondToken, "tokens should differ");
+
+      // Old token must now fail confirmPasswordReset.
+      await assert.rejects(
+        confirmPasswordReset(firstToken!, "new password paul old"),
+        (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
+        "first (older) token must be invalidated by the new request",
+      );
+
+      // New token must still work.
+      const r = await confirmPasswordReset(secondToken!, "new password paul new");
+      assert.equal(typeof r.user_id, "string");
+      const u = await query<{ ph: string }>(
+        "SELECT password_hash AS ph FROM users WHERE email = $1",
+        ["paul@example.com"],
+      );
+      assert.equal(await verifyPassword("new password paul new", u.rows[0].ph), true);
+    });
+
+    test("only same-user reset tokens are invalidated (does not touch others)", async (t) => {
+      if (skipIfNoPg(t)) return;
+      await registerAndCaptureVerifyToken("quinn@example.com", "pwd quinn");
+      await registerAndCaptureVerifyToken("rachel@example.com", "pwd rachel");
+
+      const mailerQ = new CapturingMailer();
+      await requestPasswordReset("quinn@example.com", { mailer: mailerQ });
+      const quinnToken = mailerQ.sent[0]?.text.match(/token=([^\s]+)/)?.[1];
+      assert.ok(quinnToken);
+
+      // Rachel requests — must NOT invalidate Quinn's token.
+      const mailerR = new CapturingMailer();
+      await requestPasswordReset("rachel@example.com", { mailer: mailerR });
+
+      // Quinn's token still valid.
+      const r = await confirmPasswordReset(quinnToken!, "quinn new password");
+      assert.equal(typeof r.user_id, "string");
+    });
+
+    test("expired prior tokens are not re-touched (UPDATE filter on expires_at)", async (t) => {
+      if (skipIfNoPg(t)) return;
+      const { userId } = await registerAndCaptureVerifyToken("steve@example.com", "pwd steve");
+
+      // First reset, then artificially expire it.
+      const m1 = new CapturingMailer();
+      await requestPasswordReset("steve@example.com", { mailer: m1 });
+      await query(
+        `UPDATE email_verifications
+            SET expires_at = NOW() - INTERVAL '1 hour'
+          WHERE user_id = $1 AND purpose = 'reset_password'`,
+        [userId],
+      );
+
+      // Capture used_at NULL state of the now-expired row before the second request.
+      const beforeRows = await query<{ used_at: string | null }>(
+        "SELECT used_at::text AS used_at FROM email_verifications WHERE user_id = $1 AND purpose = 'reset_password'",
+        [userId],
+      );
+      assert.equal(beforeRows.rows.length, 1);
+      assert.equal(beforeRows.rows[0].used_at, null);
+
+      // Issue a second one.
+      const m2 = new CapturingMailer();
+      await requestPasswordReset("steve@example.com", { mailer: m2 });
+
+      // The expired row must remain untouched (used_at still NULL — no spurious writes).
+      const after = await query<{ used_at: string | null; expires_at: string }>(
+        `SELECT used_at::text AS used_at, expires_at::text AS expires_at
+           FROM email_verifications
+          WHERE user_id = $1 AND purpose = 'reset_password'
+          ORDER BY id`,
+        [userId],
+      );
+      assert.equal(after.rows.length, 2, "should now have two reset rows");
+      // First row (expired) — used_at still null
+      assert.equal(after.rows[0].used_at, null, "expired token row must not be re-marked used");
+    });
+  });
 });
 
 describe("auth.verify.confirmPasswordReset (integ)", () => {
