@@ -570,11 +570,43 @@ describe("stopAndRemoveV3Container", () => {
         { docker: dockerWithErr, pool: pool as unknown as Pool, image: TEST_IMAGE },
         { id: 77, container_internal_id: "halfdead" },
       ),
-      (err: Error) => err instanceof SupervisorError,
-      "non-404 docker stop error must propagate (admin sees the failure)",
+      // R2 加固:错必须包成 PartialV3Cleanup,admin handler 才能翻成 502 + 明确文案
+      (err: Error) => err instanceof SupervisorError && (err as SupervisorError).code === "PartialV3Cleanup",
+      "non-404 docker stop error must propagate as PartialV3Cleanup (admin sees the failure)",
     );
     // 关键断言:即使 docker 抛错,DB 已被先翻 vanished —— 下次 ensureRunning
     // 看到没 active 行,直接走 provision 而不是死循环 stopped。
+    assert.equal(pool.rows[0]!.state, "vanished");
+  });
+
+  // R2 加固:remove 步骤抛非 404 也要被包成 PartialV3Cleanup
+  test("docker remove 抛非-404 错 → 包成 PartialV3Cleanup, row 仍 vanished", async () => {
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 88,
+      user_id: 2,
+      bound_ip: "172.30.5.6",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "halfdead2",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const dockerRemoveErr = {
+      getContainer: () => ({
+        stop: async () => { /* stop ok */ },
+        remove: async () => { throw httpError(500, "docker daemon overloaded"); },
+      }),
+    } as unknown as Docker;
+    await assert.rejects(
+      stopAndRemoveV3Container(
+        { docker: dockerRemoveErr, pool: pool as unknown as Pool, image: TEST_IMAGE },
+        { id: 88, container_internal_id: "halfdead2" },
+      ),
+      (err: Error) => err instanceof SupervisorError && (err as SupervisorError).code === "PartialV3Cleanup",
+    );
     assert.equal(pool.rows[0]!.state, "vanished");
   });
 });

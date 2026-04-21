@@ -698,19 +698,35 @@ export async function stopAndRemoveV3Container(
       WHERE id = $1`,
     [String(containerRow.id)],
   );
-  // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing
+  // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing。
+  //    R2 finding 加固:此后任何错都已经过了 DB UPDATE,意图已落库。
+  //    把原 SupervisorError 包成 PartialV3Cleanup,admin HTTP 见此 code →
+  //    502 明确告诉运维"DB 已 vanished,docker 清理失败,reconciler 会重试"。
   if (!containerRow.container_internal_id) return;
   const handle = deps.docker.getContainer(containerRow.container_internal_id);
   try {
     await handle.stop({ t: timeoutSec });
   } catch (err) {
-    if (!isNotFound(err) && !isNotModified(err)) throw wrapDockerError(err);
+    if (!isNotFound(err) && !isNotModified(err)) {
+      throw wrapPartialV3Cleanup("stop", err);
+    }
   }
   try {
     await handle.remove({ force: true });
   } catch (err) {
-    if (!isNotFound(err)) throw wrapDockerError(err);
+    if (!isNotFound(err)) throw wrapPartialV3Cleanup("remove", err);
   }
+}
+
+/** v3 stop/remove 已在 DB 翻 vanished 后 docker 步骤失败 —— 把原 SupervisorError
+ *  包成 PartialV3Cleanup,保留原 message + statusCode 用于上层 admin HTTP 翻译。 */
+function wrapPartialV3Cleanup(stage: "stop" | "remove", err: unknown): SupervisorError {
+  const wrapped = wrapDockerError(err);
+  return new SupervisorError(
+    "PartialV3Cleanup",
+    `v3 container ${stage} failed after DB marked vanished: ${wrapped.message}`,
+    wrapped.cause,
+  );
 }
 
 /**

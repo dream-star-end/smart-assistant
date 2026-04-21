@@ -138,4 +138,8 @@ export type SupervisorErrorCode =
   | "DockerUnavailable"
   | "InvalidArgument"
   | "HostFull"
+  // R2 finding 加固:v3 stopAndRemove 已在 DB 翻 vanished 但 docker stop/remove
+  // 后续步骤失败 —— 用户/admin 意图已落库,docker 清理交由后台 reconciler。
+  // admin HTTP handler 见到此 code → 502 + 明确提示文案。
+  | "PartialV3Cleanup"
   | "Unknown";
