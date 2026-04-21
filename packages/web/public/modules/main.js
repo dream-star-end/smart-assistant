@@ -1004,16 +1004,16 @@ function closePalette() {
 // just 401 again (and funnel back through this handler).
 async function _forceLogout({ serverLogout } = {}) {
   if (serverLogout) {
-    // V3 commercial: POST /api/auth/logout 期望 body 含 refresh_token 来吊销该刷新 token。
-    // suppressAuthRedirect=true: a 401 on this call would be meaningless
-    // (we're already tearing down), and we don't want to recursively fire
-    // the auth-expired handler. 5s timeout — if the server is slow the
-    // local teardown continues regardless.
-    const refreshToken = state.refreshToken || ''
+    // V3 commercial: POST /api/auth/logout 用 HttpOnly cookie(oc_rt)定位要吊销的
+    // refresh token —— 浏览器自动随同源请求带它。HIGH#4 之前的 body fallback
+    // 仅在 state.refreshToken 还残留(老用户 localStorage)时才发,顺便让 server
+    // 把残留 cookie 同步清掉。suppressAuthRedirect=true:正在 teardown,401 没意义。
+    const legacyToken = state.refreshToken || ''
     apiFetch('/api/auth/logout', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: refreshToken ? JSON.stringify({ refresh_token: refreshToken }) : undefined,
+      credentials: 'same-origin',
+      headers: legacyToken ? { 'Content-Type': 'application/json' } : undefined,
+      body: legacyToken ? JSON.stringify({ refresh_token: legacyToken }) : undefined,
       timeout: 5000,
       suppressAuthRedirect: true,
     }).catch(() => {})
@@ -1871,15 +1871,19 @@ async function init() {
   $('persona-model-preset')?.addEventListener('change', (e) => {
     if (e.target.value) $('persona-model').value = e.target.value
   })
-  // ── V3 commercial auth (Phase 4A) ──
+  // ── V3 commercial auth (Phase 4A → 2026-04-21 HIGH#4) ──
   // 多模态登录(login/register/forgot/reset/verify)+ Turnstile 由 modules/auth.js 接管。
-  // main.js 只负责"登录成功后该做什么"——清 IDB、装 token、连 ws、起 app view。
-  setAuthSuccessHandler(async ({ access_token, access_exp, refresh_token }) => {
+  // main.js 只负责"登录成功后该做什么"——清 IDB、装 access token、连 ws、起 app view。
+  // refresh token 由 server 通过 Set-Cookie(HttpOnly oc_rt)下发,JS 读不到,这里
+  // 也不要尝试读 refresh_token 字段(后端已经从响应里拿掉)。
+  setAuthSuccessHandler(async ({ access_token, access_exp }) => {
     state.token = access_token
-    state.refreshToken = refresh_token || ''
     state.tokenExp = Number(access_exp) || 0
+    // 主动清掉老版本可能残留的 localStorage refresh token —— 一旦走完一次新版
+    // login,旧 token 既无用又是 XSS 攻击面,立刻零化。
+    state.refreshToken = ''
+    try { localStorage.removeItem('openclaude_refresh_token') } catch {}
     localStorage.setItem('openclaude_access_token', access_token)
-    if (refresh_token) localStorage.setItem('openclaude_refresh_token', refresh_token)
     if (access_exp != null) localStorage.setItem('openclaude_access_exp', String(access_exp))
     // Re-arm 401 handler — next token expiry will fire it again.
     resetAuthExpired()

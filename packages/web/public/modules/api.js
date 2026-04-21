@@ -86,29 +86,34 @@ async function _extractErrorMessage(res) {
 
 // ── V3 commercial: silent refresh on 401 ──
 //
-// Behavior:
-//   • On 401, attempt POST /api/auth/refresh once with state.refreshToken;
-//     if it returns a new access_token, retry the original request once.
-//   • Concurrent 401s share a single in-flight refresh promise (_refreshInflight)
-//     so 5 parallel calls don't all spam the refresh endpoint.
-//   • If refresh fails (no token / 4xx) → fall through to _notifyAuthExpired
-//     and the caller sees the original 401 response.
-//   • Skipped for /api/auth/* paths to avoid recursion (login/refresh/logout
-//     legitimately return 401 and we don't want to refresh-loop on them).
-//   • Skipped when caller passes suppressAuthRedirect=true (login/probe paths).
-//   • Skipped on the retry pass itself (set _attemptedRefresh on the init).
+// 2026-04-21 HIGH#4 改造:refresh token 已迁到 HttpOnly cookie(oc_rt,
+// Path=/api/auth)。浏览器在 fetch('/api/auth/refresh') 时自动带 cookie,
+// JS 看不到这个 cookie 也无法判断它是否存在。
+//
+// 行为:
+//   • 401 → POST /api/auth/refresh(同源 fetch 默认 same-origin cookie 自动携带)。
+//   • 迁移期(2 周):如果 state.refreshToken 还有值(老用户 localStorage 里
+//     残留),用 body 兜底,让 server 同时把 cookie 种回来,然后清 localStorage
+//     和 state.refreshToken,完成一次性升级。
+//   • 多并发 401 共享同一 _refreshInflight,避免 N 个并行调用重复打 refresh。
+//   • 失败(4xx / 网络挂)→ _notifyAuthExpired,原 401 透传给 caller。
+//   • /api/auth/* 路径本身跳过:这些端点天然返 401 不该再触发递归。
+//   • caller 传 suppressAuthRedirect=true(login/probe)整体跳过。
+//   • 重试 pass 上 set _attemptedRefresh=true,避免无限循环。
 let _refreshInflight = null
 function _silentRefresh() {
   if (_refreshInflight) return _refreshInflight
-  // Lazy-import to avoid an import cycle (state.js doesn't import api.js, but
-  // some modules may transitively).
   _refreshInflight = (async () => {
-    if (!state.refreshToken) return false
+    const legacyBody = state.refreshToken
+      ? JSON.stringify({ refresh_token: state.refreshToken })
+      : undefined
     try {
       const r = await fetch('/api/auth/refresh', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: state.refreshToken }),
+        // same-origin 是默认值,显式写出来表明"我们依赖浏览器自动带 cookie"。
+        credentials: 'same-origin',
+        headers: legacyBody ? { 'Content-Type': 'application/json' } : undefined,
+        body: legacyBody,
       })
       if (!r.ok) return false
       const data = await r.json().catch(() => ({}))
@@ -119,6 +124,13 @@ function _silentRefresh() {
         localStorage.setItem('openclaude_access_token', data.access_token)
         if (typeof data.access_exp === 'number') {
           localStorage.setItem('openclaude_access_exp', String(data.access_exp))
+        }
+        // 升级成功:server 已把 cookie 种回来,本地 localStorage / state 里的旧
+        // refresh token 不再需要 —— 留着只会在下次 refresh 又被当 body fallback
+        // 重新提交,徒增 XSS 时被 dump 的可能。一次性清零。
+        if (legacyBody) {
+          localStorage.removeItem('openclaude_refresh_token')
+          state.refreshToken = ''
         }
       } catch {}
       return true
@@ -173,8 +185,12 @@ export async function apiFetch(path, init = {}) {
     cleanup()
   }
   if (res.status !== 401) return res
-  // Auth endpoint or already retried → propagate 401 + maybe trigger logout
-  if (_attemptedRefresh || _isAuthEndpoint(path) || suppressAuthRedirect === false && !state.refreshToken) {
+  // Auth endpoint or already retried → propagate 401 + maybe trigger logout。
+  // 注意:HIGH#4 之后 refresh token 在 HttpOnly cookie 里,JS 看不到 → 不能再像
+  // 旧版那样 "!state.refreshToken 直接放弃 refresh"。无脑 try 一次,失败再走
+  // _notifyAuthExpired,代价就是无 cookie 的访客也会多一次 /api/auth/refresh
+  // 401(同源,无业务副作用)。
+  if (_attemptedRefresh || _isAuthEndpoint(path)) {
     if (!suppressAuthRedirect) _notifyAuthExpired()
     return res
   }

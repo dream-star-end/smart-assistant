@@ -431,6 +431,9 @@ export async function registerCommercial(
     turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,
     turnstileSiteKey: cfg.TURNSTILE_SITE_KEY,
     requireEmailVerified: cfg.REQUIRE_EMAIL_VERIFIED,
+    // HIGH#4:生产 claudeai.chat 全 HTTPS,默认 Secure cookie;
+    // 仅当 env COMMERCIAL_INSECURE_COOKIE=1(本地 dev / docker compose)才关
+    refreshCookieSecure: process.env.COMMERCIAL_INSECURE_COOKIE === "1" ? false : true,
     verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
     resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
     pricing,

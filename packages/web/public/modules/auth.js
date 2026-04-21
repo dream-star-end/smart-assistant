@@ -5,11 +5,11 @@
 // 接入端点:
 //   POST /api/auth/register           { email, password, turnstile_token }
 //   POST /api/auth/login              { email, password, turnstile_token }
-//   POST /api/auth/refresh            { refresh_token }
-//   POST /api/auth/logout             { refresh_token }
+//   POST /api/auth/refresh            ()  ← cookie oc_rt 自动携带,迁移期兼容 body { refresh_token }
+//   POST /api/auth/logout             ()  ← 同上
 //   POST /api/auth/verify-email       { token }
 //   POST /api/auth/resend-verification{ email }
-//   POST /api/auth/request-password-reset { email }
+//   POST /api/auth/request-password-reset { email, turnstile_token }
 //   POST /api/auth/confirm-password-reset { token, new_password }
 //   GET  /api/public/config           → { turnstile_site_key, turnstile_bypass, require_email_verified }
 //
@@ -17,9 +17,10 @@
 //   ?verify_email=<token>      → 自动切到 verify 模式并提交
 //   ?reset_password=<token>    → 切到 confirm-reset 模式
 //
-// Token 存储:access_token + refresh_token + expiry 全部写到 localStorage
-//   - openclaude_access_token / openclaude_refresh_token / openclaude_access_exp
-//   - 以上由 main.js 经 onLoginSuccess 回调统一写入,本模块只 dispatch result
+// Token 存储(2026-04-21 HIGH#4 后):
+//   - access JWT + access_exp → localStorage(openclaude_access_token / openclaude_access_exp)
+//   - refresh JWT             → 服务器 Set-Cookie HttpOnly oc_rt(JS 不可见)
+//   - 以上由 main.js 经 onLoginSuccess 回调统一处理,本模块只 dispatch result
 
 import { apiFetch } from './api.js'
 
@@ -296,11 +297,12 @@ async function _doLogin() {
       return
     }
     // Success — emit to main.js
+    // HIGH#4 后 refresh token 不再出现在 body,只通过 HttpOnly cookie 下发;
+    // refresh_exp 仍保留作为"会话剩余时间"展示用。
     _onLoginSuccess?.({
       user: data.user,
       access_token: data.access_token,
       access_exp: data.access_exp,
-      refresh_token: data.refresh_token,
       refresh_exp: data.refresh_exp,
     })
   })

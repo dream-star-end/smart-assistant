@@ -44,6 +44,7 @@ const COMMERCIAL_TABLES = [
   "refresh_tokens",
   "email_verifications",
   "users",
+  "system_settings",
   "schema_migrations",
 ];
 
@@ -120,6 +121,8 @@ before(async () => {
       turnstileBypass: true,
       verifyEmailUrlBase: "https://test.local",
       resetPasswordUrlBase: "https://test.local",
+      // HIGH#4:测试跑在 http://127.0.0.1,不能用 Secure cookie 否则 fetch 不回带。
+      refreshCookieSecure: false,
       // 限流放宽,免得 8 个 case 互相影响(每个 test 之前清 redis)
       rateLimits: {
         register: { scope: "register_test", windowSeconds: 60, max: 100 },
@@ -196,6 +199,39 @@ async function getJson(path: string, headers?: Record<string, string>): Promise<
   let json: Record<string, unknown> = {};
   try { json = (await r.json()) as Record<string, unknown>; } catch { /* */ }
   return { status: r.status, json, headers: r.headers };
+}
+
+/**
+ * HIGH#4 — 从一组 Set-Cookie 行里抠 `oc_rt`,返回 cookie 的属性 map(下游
+ * 既可以拿 value 拼 Cookie 头,又能 assert HttpOnly/SameSite/Path/Max-Age 等
+ * 安全属性是否齐全)。undici 的 headers.getSetCookie() 返回 string[],我们
+ * 自己拆 `name=value; key=value; ...`,key 统一小写以便 case-insensitive 比对。
+ */
+function parseSetCookie(setCookieHeaders: string[], name: string): null | {
+  value: string;
+  attrs: Record<string, string>;
+  flags: Set<string>;
+} {
+  for (const line of setCookieHeaders) {
+    const segs = line.split(";").map((s) => s.trim());
+    if (segs.length === 0) continue;
+    const head = segs[0];
+    const eq = head.indexOf("=");
+    if (eq <= 0) continue;
+    const cname = head.slice(0, eq);
+    if (cname !== name) continue;
+    const value = decodeURIComponent(head.slice(eq + 1));
+    const attrs: Record<string, string> = {};
+    const flags = new Set<string>();
+    for (let i = 1; i < segs.length; i++) {
+      const seg = segs[i];
+      const k = seg.indexOf("=");
+      if (k < 0) flags.add(seg.toLowerCase());
+      else attrs[seg.slice(0, k).toLowerCase()] = seg.slice(k + 1);
+    }
+    return { value, attrs, flags };
+  }
+  return null;
 }
 
 describe("commercial HTTP router (integ)", () => {
@@ -351,7 +387,7 @@ describe("commercial HTTP router (integ)", () => {
     assert.equal((r.json.error as Record<string, unknown>).code, "INVALID_CREDENTIALS");
   });
 
-  test("refresh + logout: refresh works once, then logout, then refresh fails", async (t) => {
+  test("refresh + logout via HttpOnly cookie (HIGH#4 happy path)", async (t) => {
     if (skipIfMissing(t)) return;
     await postJson("/api/auth/register", {
       email: "frank@example.com",
@@ -363,17 +399,80 @@ describe("commercial HTTP router (integ)", () => {
       password: "frank good password",
       turnstile_token: "tok",
     });
-    const refreshTok = lr.json.refresh_token as string;
-    const r1 = await postJson("/api/auth/refresh", { refresh_token: refreshTok });
+    assert.equal(lr.status, 200);
+    // body 不再回吐 refresh_token —— JS 拿不到才挡得住 XSS。
+    assert.equal(
+      lr.json.refresh_token,
+      undefined,
+      "login body must NOT carry refresh_token after HIGH#4",
+    );
+    const setCookies = lr.headers.getSetCookie();
+    const cookie = parseSetCookie(setCookies, "oc_rt");
+    assert.ok(cookie, "login must Set-Cookie oc_rt");
+    assert.ok(cookie.flags.has("httponly"), "oc_rt must be HttpOnly");
+    assert.equal(cookie.attrs["samesite"], "Strict");
+    assert.equal(cookie.attrs["path"], "/api/auth");
+    assert.ok(cookie.attrs["max-age"], "Max-Age must be set");
+    // refreshCookieSecure=false 路径(http test) → 不应该有 Secure flag
+    assert.equal(cookie.flags.has("secure"), false);
+    const cookieHeader = `oc_rt=${encodeURIComponent(cookie.value)}`;
+
+    // refresh 仅靠 cookie,body 不带任何东西
+    const r1 = await postJson("/api/auth/refresh", undefined, { Cookie: cookieHeader });
     assert.equal(r1.status, 200);
     assert.ok(r1.json.access_token);
 
-    const lo = await postJson("/api/auth/logout", { refresh_token: refreshTok });
+    // logout 同样仅靠 cookie + 必须返回一个清 cookie 指令(Max-Age=0)
+    const lo = await postJson("/api/auth/logout", undefined, { Cookie: cookieHeader });
     assert.equal(lo.status, 200);
     assert.equal(lo.json.revoked, true);
+    const clearCookie = parseSetCookie(lo.headers.getSetCookie(), "oc_rt");
+    assert.ok(clearCookie, "logout must emit a clearing Set-Cookie");
+    assert.equal(clearCookie.attrs["max-age"], "0", "clear cookie Max-Age must be 0");
 
-    const r2 = await postJson("/api/auth/refresh", { refresh_token: refreshTok });
+    // logout 后用同 cookie 再 refresh → server 拒(refresh_tokens row 已删/吊销)
+    const r2 = await postJson("/api/auth/refresh", undefined, { Cookie: cookieHeader });
     assert.equal(r2.status, 401);
+  });
+
+  test("refresh via legacy body (HIGH#4 migration window)", async (t) => {
+    if (skipIfMissing(t)) return;
+    await postJson("/api/auth/register", {
+      email: "legacy-frank@example.com",
+      password: "legacy good password",
+      turnstile_token: "tok",
+    });
+    const lr = await postJson("/api/auth/login", {
+      email: "legacy-frank@example.com",
+      password: "legacy good password",
+      turnstile_token: "tok",
+    });
+    assert.equal(lr.status, 200);
+    // 老前端不会读 cookie,但我们能从测试侧拿到 raw refresh token。
+    // 模拟"老用户 localStorage 里残留 refresh token"提交 body 而不带 cookie。
+    const cookie = parseSetCookie(lr.headers.getSetCookie(), "oc_rt");
+    assert.ok(cookie);
+    const rawRefresh = cookie.value;
+
+    const r1 = await postJson("/api/auth/refresh", { refresh_token: rawRefresh });
+    assert.equal(r1.status, 200, JSON.stringify(r1.json));
+    // 迁移期 server 顺手把 cookie 种回来 — 下次浏览器就有 cookie,不再走 body
+    const upgradedCookie = parseSetCookie(r1.headers.getSetCookie(), "oc_rt");
+    assert.ok(upgradedCookie, "legacy body refresh must auto-upgrade by Set-Cookie");
+    assert.ok(upgradedCookie.flags.has("httponly"));
+    assert.equal(upgradedCookie.attrs["samesite"], "Strict");
+
+    // logout 也得接受 legacy body
+    const lo = await postJson("/api/auth/logout", { refresh_token: rawRefresh });
+    assert.equal(lo.status, 200);
+    assert.equal(lo.json.revoked, true);
+  });
+
+  test("refresh without cookie or body → 400 VALIDATION", async (t) => {
+    if (skipIfMissing(t)) return;
+    const r = await postJson("/api/auth/refresh", undefined);
+    assert.equal(r.status, 400);
+    assert.equal((r.json.error as Record<string, unknown>).code, "VALIDATION");
   });
 
   test("rate limit returns 429 + Retry-After header (with tight limit)", async (t) => {

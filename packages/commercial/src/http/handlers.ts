@@ -13,6 +13,11 @@ import {
   clientIpOf,
   userAgentOf,
 } from "./util.js";
+import {
+  setRefreshCookie,
+  clearRefreshCookie,
+  readRefreshCookie,
+} from "./cookies.js";
 import { register, RegisterError } from "../auth/register.js";
 import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
 import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.js";
@@ -72,6 +77,12 @@ export interface CommercialHttpDeps {
   }>;
   /** T-12.1:开启后,login 强制要求 email_verified=true */
   requireEmailVerified?: boolean;
+  /**
+   * 2026-04-21 安全审计 HIGH#4 — refresh token Set-Cookie 是否带 `Secure` 标志。
+   * 默认 true(生产 claudeai.chat 全 HTTPS)。本地 dev / 单测走 http://
+   * 必须显式传 false,否则浏览器/fetch undici 不会回带 cookie 给 HTTP 端点。
+   */
+  refreshCookieSecure?: boolean;
   /**
    * T-53: Agent 运行时(docker + image + network + seccomp + proxy + rpc dir)。
    * 未注入时 `/api/agent/open` 返 503(仍允许 /status 查看过去订阅)。
@@ -184,11 +195,17 @@ export async function handleLogin(
       userAgent: ctx.userAgent ?? undefined,
       requireEmailVerified: deps.requireEmailVerified,
     });
+    // HIGH#4:refresh token 走 HttpOnly cookie 下发,不再放 body。
+    // Max-Age 用 (refresh_exp - now) 而不是固定 30d,确保前端能精确算到截止时间;
+    // 即使 result.refresh_exp 计算有偏差,Math.max(0,…) 兜底防负数 cookie。
+    const ttl = Math.max(0, result.refresh_exp - Math.floor(Date.now() / 1000));
+    setRefreshCookie(res, result.refresh_token, ttl, { secure: deps.refreshCookieSecure });
     sendJson(res, 200, {
       user: result.user,
       access_token: result.access_token,
       access_exp: result.access_exp,
-      refresh_token: result.refresh_token,
+      // refresh_exp 仍然回传,前端可凭它显示"会话剩余时间";
+      // refresh_token 本身不出现在 body —— XSS 拿不到。
       refresh_exp: result.refresh_exp,
     });
   } catch (err) {
@@ -274,13 +291,31 @@ export async function handleRefresh(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const body = (await readJsonBody(req)) as { refresh_token?: unknown } | undefined;
-  if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).refresh_token !== "string") {
+  // HIGH#4:优先读 HttpOnly cookie;迁移期(2 周内)兼容 body.refresh_token,
+  // 旧前端 localStorage 里存的 token 还能用一次,然后浏览器在下次 login 后
+  // 把 cookie 接管为唯一凭据。
+  const fromCookie = readRefreshCookie(req);
+  let rawRefresh: string | null = fromCookie;
+  if (!rawRefresh) {
+    const body = (await readJsonBody(req)) as { refresh_token?: unknown } | undefined;
+    if (body && typeof body === "object" && typeof (body as Record<string, unknown>).refresh_token === "string") {
+      rawRefresh = (body as { refresh_token: string }).refresh_token;
+    }
+  }
+  if (!rawRefresh) {
     throw new HttpError(400, "VALIDATION", "refresh_token is required");
   }
-  const rawRefresh = (body as { refresh_token: string }).refresh_token;
   try {
     const r = await refresh(rawRefresh, { jwtSecret: deps.jwtSecret });
+    // 迁移期把通过 body 提交的 refresh 自动"升级"到 cookie:旧前端发完
+    // 这一次 body 后,后续 cookie 就由浏览器自动带,逐步把 localStorage
+    // 里的 token 淘汰。已在 cookie 里的不重写(Max-Age 仍按原 cookie 走)。
+    if (!fromCookie) {
+      // refresh 不轮换 token(MVP),所以这里 cookie 里写的就是同一个 raw。
+      // TTL 按 REFRESH_TOKEN_TTL_SECONDS 给 30 天上限,真正过期由服务器
+      // refresh_tokens.expires_at 控制 — cookie TTL 长一点也无害。
+      setRefreshCookie(res, rawRefresh, 30 * 24 * 60 * 60, { secure: deps.refreshCookieSecure });
+    }
     sendJson(res, 200, { access_token: r.access_token, access_exp: r.access_exp });
   } catch (err) {
     if (err instanceof RefreshError) {
@@ -296,12 +331,23 @@ export async function handleRefresh(
 export async function handleLogout(
   req: IncomingMessage,
   res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  const body = (await readJsonBody(req)) as { refresh_token?: unknown } | undefined;
-  const rawRefresh = body && typeof (body as Record<string, unknown>).refresh_token === "string"
-    ? (body as { refresh_token: string }).refresh_token
-    : "";
+  // HIGH#4:cookie 优先;无论成败都清 cookie(本地清理永不依赖 server 状态)。
+  // 兼容 body.refresh_token 让旧前端能完成最后一次 logout。
+  const fromCookie = readRefreshCookie(req);
+  let rawRefresh = fromCookie ?? "";
+  if (!rawRefresh) {
+    const body = (await readJsonBody(req)) as { refresh_token?: unknown } | undefined;
+    if (body && typeof (body as Record<string, unknown>).refresh_token === "string") {
+      rawRefresh = (body as { refresh_token: string }).refresh_token;
+    }
+  }
   const r = await logout(rawRefresh);
+  // 即使 server 没找到匹配的 row,也清浏览器 cookie:不能让"server 觉得 token
+  // 已 revoked,但 cookie 还在浏览器"这种状态延续到下一次 refresh 又被认证。
+  clearRefreshCookie(res, { secure: deps.refreshCookieSecure });
   // logout 一律 200,即使 token 不存在(幂等)
   sendJson(res, 200, { revoked: r.revoked });
 }
