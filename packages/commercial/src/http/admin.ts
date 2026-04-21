@@ -606,6 +606,11 @@ function serializeContainer(r: AdminContainerRowView): Record<string, unknown> {
     home_volume: r.home_volume,
     image: r.image,
     status: r.status,
+    // R3 finding 加固:R1#4 SQL 算出来的 v3 状态字段没在这里输出 → 前端
+    // admin.js 取 c.row_kind/c.lifecycle 拿到 undefined,UI 显示 '?' / '—'。
+    state: r.state,
+    lifecycle: r.lifecycle,
+    row_kind: r.row_kind,
     last_started_at: r.last_started_at?.toISOString() ?? null,
     last_stopped_at: r.last_stopped_at?.toISOString() ?? null,
     volume_gc_at: r.volume_gc_at?.toISOString() ?? null,
@@ -942,6 +947,14 @@ export async function handleAdminAgentContainerAction(
           { path: "container_id", message: id },
           { path: "next", message: "row already marked vanished; orphan reconciler will retry docker cleanup" },
         ],
+      });
+    }
+    // R3 finding 加固:lookupContainer 对 v2 行缺 docker_name 抛 RangeError —
+    // 这是 DB 数据不变量被破坏的信号(v2 INSERT 必填 docker_name),不是用户
+    // 操作错误。翻成 500 SCHEMA_INVARIANT 让运维 grep 出来人工查。
+    if (err instanceof RangeError) {
+      throw new HttpError(500, "SCHEMA_INVARIANT", err.message, {
+        issues: [{ path: "container_id", message: id }],
       });
     }
     throw err;
