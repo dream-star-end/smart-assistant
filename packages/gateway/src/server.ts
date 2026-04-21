@@ -37,6 +37,7 @@ import { createLogger } from './logger.js'
 import { startMetricsCollection, serializeMetrics, httpRequestsTotal, httpRequestDuration, wsConnectionsTotal, sessionsActive } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
+import { OutboundRingBuffer } from './outboundRing.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
@@ -199,6 +200,15 @@ export class Gateway {
     { channel: string; peerId: string; sessionKey: string; at: number; userId: string }
   >()
 
+  // ── Phase 0.3: outbound frame ring buffer (short-term replay) ──
+  // See packages/gateway/src/outboundRing.ts for the standalone class.
+  // Every outbound.message frame delivered to a webchat peer gets a monotonic
+  // `frameSeq` stamped alongside `ts`; the ring backs
+  // `autoResumeFromHello(lastFrameSeq)` cursor replay so reconnecting clients
+  // can catch up without hitting REST. When the ring can't satisfy a resume,
+  // we emit `outbound.resume_failed` so the client escalates to REST sync.
+  private _outboundRing = new OutboundRingBuffer()
+
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
@@ -266,6 +276,7 @@ export class Gateway {
           }
           for (const k of keys) {
             try { await this.sessions.destroySession(k) } catch {}
+            this._outboundRing.clear(k)
           }
         },
       }
@@ -2641,7 +2652,10 @@ export class Gateway {
       // active session in the session manager (validated server-side).
       if ((frame as any).type === 'inbound.hello') {
         const hello = frame as any
-        const peers: Array<{ peerId: string; agentId: string }> = hello.peers || []
+        // Phase 0.3: peers may carry `lastFrameSeq` — the highest frameSeq
+        // this tab successfully processed before the disconnect. 0 = never
+        // received one (first connect / localStorage wiped / legacy client).
+        const peers: Array<{ peerId: string; agentId: string; inFlight?: boolean; lastFrameSeq?: number }> = hello.peers || []
         // Auto-resume: check if any peer has a resumable session that is NOT already active
         this.autoResumeFromHello(peers, ws).catch((err) =>
           this.log.error('auto-resume failed', undefined, err),
@@ -2698,6 +2712,10 @@ export class Gateway {
           }).agent.id
         const sessionKey = `agent:${agentId}:${f.channel}:${f.peer.kind}:${f.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
         await this.sessions.destroySession(sessionKey)
+        // Drop the outbound ring when the session is reset. Keeping stale
+        // frames around for a now-meaningless sessionKey would be wasteful
+        // and could mislead a future reconnect.
+        this._outboundRing.clear(sessionKey)
         this.log.info('reset destroyed session', { sessionKey })
       } else if ((frame as any).type === 'control.session.compact') {
         // Compact: send a compaction request to the agent as a user message
@@ -3166,7 +3184,7 @@ export class Gateway {
   }
 
   private async autoResumeFromHello(
-    peers: Array<{ peerId: string; agentId: string; inFlight?: boolean }>,
+    peers: Array<{ peerId: string; agentId: string; inFlight?: boolean; lastFrameSeq?: number }>,
     ws: WebSocket,
   ): Promise<void> {
     // Register the reconnected WS client for each peer that has an active/resumable session.
@@ -3225,6 +3243,45 @@ export class Gateway {
         registeredPeerKeys.push(peerKey)
       }
       this.log.info('auto-resume re-registered WS', { peerKey, sessionKey })
+
+      // ── Phase 0.3: ring-buffer replay on hello.lastFrameSeq ──
+      // If the client supplied a cursor, serve anything we still have buffered
+      // for this sessionKey. If the ring can't satisfy (pruned / restart /
+      // bogus cursor), emit `outbound.resume_failed` so the client triggers
+      // a REST force-sync. This is ONLY a short-term optimisation; the
+      // durable server-side persistence from Phase 0.1/0.2 remains the
+      // authoritative backstop for any duration of disconnect.
+      const peerRec = peers.find(p => p.peerId === peerId)
+      const clientLastSeq = typeof peerRec?.lastFrameSeq === 'number' ? peerRec.lastFrameSeq : 0
+      if (clientLastSeq >= 0) {
+        const replay = this._outboundRing.peekReplay(sessionKey, clientLastSeq)
+        if (replay.ok) {
+          for (const f of replay.sent) {
+            try { ws.send(f.data) } catch { break }
+          }
+          if (replay.sent.length > 0) {
+            this.log.info('resume replay served', {
+              sessionKey, from: clientLastSeq, to: replay.to, sent: replay.sent.length,
+            })
+          }
+        } else {
+          try {
+            ws.send(JSON.stringify({
+              type: 'outbound.resume_failed',
+              sessionKey,
+              channel: 'webchat',
+              peer: { id: peerId, kind: 'dm' },
+              from: clientLastSeq,
+              to: replay.to,
+              reason: replay.reason,
+              ts: Date.now(),
+            }))
+            this.log.warn('resume replay miss — signalled resume_failed', {
+              sessionKey, from: clientLastSeq, to: replay.to, reason: replay.reason,
+            })
+          } catch {}
+        }
+      }
 
       // Push a synthetic isFinal to the reconnected client for sessions that the client
       // reports as in-flight (had _sendingInFlight=true) but whose subprocess is not
@@ -3799,13 +3856,27 @@ export class Gateway {
     const deliverUserId: string =
       typeof stampedUserId === 'string' ? stampedUserId : 'default'
     const peerKey = Gateway.makePeerKey(deliverUserId, wire.channel, wire.peer.id)
-    const set = this.clientsByPeer.get(peerKey)
-    if (!set) return
+    // ── Phase 0.3: stamp frameSeq + push to ring buffer ──
+    // We stamp + store even if no clients are currently connected — that's
+    // the whole point: a later autoResumeFromHello for this sessionKey needs
+    // the frames to be in the buffer regardless of whether anyone was
+    // listening at the moment of the original deliver.
     // Stamp a server-assigned monotonic timestamp on every outbound frame so
     // the web client can reject stale / out-of-order frames after reconnect
     // or agent switches. Schema keeps `ts` unvalidated (extra field is
     // tolerated), so no protocol version bump is required.
-    const data = JSON.stringify({ ...wire, ts: Date.now() })
+    const now = Date.now()
+    const sessionKey = (wire as { sessionKey?: string }).sessionKey
+    let data: string
+    if (sessionKey) {
+      const frameSeq = this._outboundRing.nextSeq(sessionKey)
+      data = JSON.stringify({ ...wire, ts: now, frameSeq })
+      this._outboundRing.store(sessionKey, frameSeq, now, data)
+    } else {
+      data = JSON.stringify({ ...wire, ts: now })
+    }
+    const set = this.clientsByPeer.get(peerKey)
+    if (!set) return
     for (const ws of set) {
       try {
         ws.send(data)
