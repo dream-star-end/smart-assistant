@@ -33,10 +33,15 @@ export function ensureRequestId(req: IncomingMessage): string {
  *     用 socket IP;这个路径不是 auth/rate-limit 链路,clientIp 也只做审计用。
  *   - 其他(不应发生)→ 用 socket IP,失败安全。
  *
- * 2026-04-22 Codex R1 IMPORTANT#3 修复:此前 refresh race fingerprint 和 rate
- * limit 都拿 socket.remoteAddress,Caddy 后面 gateway 看到的都是 127.0.0.1
- * → sameIp=true 永远成立,同 IP 桶 = 全站共享桶,高峰时 refresh/logout 限流相
- * 互误伤。修后真实客户端 IP 才进 fingerprint/rate limit。
+ * 2026-04-22 Codex R1 IMPORTANT#3 修复:此前 rate limit 拿 socket.remoteAddress,
+ * Caddy 后面 gateway 看到的都是 127.0.0.1 → 同 IP 桶 = 全站共享桶,高峰时
+ * refresh/logout 限流相互误伤。修后 clientIpOf 返回真实客户端 IP 给 rate limit。
+ *
+ * 2026-04-22 HIGH#4 回归修:**clientIpOf 只给 rate limit / access log 用。auth
+ * 的 bound_ip / sameIp fingerprint **不要**用这个**,要用 `ctx.authBoundIp`
+ * (= socket.remoteAddress,Caddy 后恒 loopback)。CF edge IP 每次漂移,clientIpOf
+ * 作为 fingerprint 会让合法多 tab race 被误判 theft。见 handlers.ts 的 RequestContext
+ * JSDoc。
  */
 // IPv4 loopback、IPv6 loopback、IPv6-mapped IPv4 loopback
 const LOOPBACK_RE = /^(127\.|::1$|::ffff:127\.)/;

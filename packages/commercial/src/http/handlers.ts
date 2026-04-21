@@ -183,12 +183,14 @@ export async function handleRegister(
 
   const body = await readJsonBody(req);
   try {
+    // register 里 remoteIp 只给 Turnstile(CF bot scoring 需要真实访客 IP),不写
+    // refresh_tokens。用 ctx.clientIp(CF-Connecting-IP)。
     const result = await register(body, {
       mailer: deps.mailer,
       turnstileSecret: deps.turnstileSecret,
       turnstileBypass: deps.turnstileBypass,
       fetchImpl: deps.fetchImpl,
-      remoteIp: ctx.authBoundIp,
+      remoteIp: ctx.clientIp,
       verifyEmailUrlBase: deps.verifyEmailUrlBase,
     });
     sendJson(res, 201, {
@@ -222,12 +224,18 @@ export async function handleLogin(
 
   const body = await readJsonBody(req);
   try {
+    // login 里 remoteIp 被两处用到:
+    //   1. Turnstile verify — 需要真实访客 IP(CF bot scoring)
+    //   2. 写进 refresh_tokens.ip(bound_ip)— 需要稳定出口(Caddy loopback)
+    // 两个语义拆开:remoteIp 走 clientIp 保持 Turnstile 语义,bindIp 走 authBoundIp
+    // 让 refresh_tokens.ip 恒为 loopback,下一次 refresh sameIp 恒真。
     const result = await login(body, {
       jwtSecret: deps.jwtSecret,
       turnstileSecret: deps.turnstileSecret,
       turnstileBypass: deps.turnstileBypass,
       fetchImpl: deps.fetchImpl,
-      remoteIp: ctx.authBoundIp,
+      remoteIp: ctx.clientIp,
+      bindIp: ctx.authBoundIp,
       userAgent: ctx.userAgent ?? undefined,
       requireEmailVerified: deps.requireEmailVerified,
     });
@@ -476,7 +484,8 @@ export async function handleRequestPasswordReset(
         resetUrlBase: deps.resetPasswordUrlBase,
         turnstileSecret: deps.turnstileSecret,
         turnstileBypass: deps.turnstileBypass,
-        remoteIp: ctx.authBoundIp,
+        // requestPasswordReset 里 remoteIp 只给 Turnstile。用 ctx.clientIp。
+        remoteIp: ctx.clientIp,
         fetchImpl: deps.fetchImpl,
       },
     );

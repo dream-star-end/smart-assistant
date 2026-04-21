@@ -137,8 +137,18 @@ export interface LoginDeps {
   turnstileBypass?: boolean;
   /** 测试可注入 fetch(传给 turnstile) */
   fetchImpl?: typeof fetch;
-  /** 用户 IP / UA — 写到 refresh_tokens 表用于安全审计 */
+  /**
+   * 访客真实 IP — **仅** 传给 Turnstile 做 bot/risk 评分(CF 期望真实访客 IP,
+   * loopback 会削弱评分甚至被拒)。
+   */
   remoteIp?: string;
+  /**
+   * 2026-04-22 HIGH#4 回归修:写到 `refresh_tokens.ip`(bound_ip)的稳定出口 IP。
+   * 缺省回落到 `remoteIp`(向后兼容老测试)。生产里 handler 会注入
+   * `req.socket.remoteAddress`(Caddy 后恒 loopback),确保后续 refresh 的
+   * race grace `sameIp` 比对恒真。
+   */
+  bindIp?: string;
   userAgent?: string;
   /** 测试可注入 now(秒) */
   now?: () => number;
@@ -255,6 +265,9 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
     ttlSeconds: deps.refreshTtlSeconds ?? REFRESH_TOKEN_TTL_SECONDS,
   });
 
+  // 2026-04-22 HIGH#4 回归修:bound_ip 存稳定出口 (bindIp),不存真实访客 IP (remoteIp)。
+  // remoteIp 已在上面 Turnstile verify 用过。两处语义拆开见 LoginDeps JSDoc。
+  const bindIp = deps.bindIp ?? deps.remoteIp ?? null;
   await query(
     `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at)
      VALUES ($1, $2, $3, $4, to_timestamp($5))`,
@@ -262,7 +275,7 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
       user.id,
       refresh.hash,
       deps.userAgent ?? null,
-      deps.remoteIp ?? null,
+      bindIp,
       refresh.expires_at,
     ],
   );
