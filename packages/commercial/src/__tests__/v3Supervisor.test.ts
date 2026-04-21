@@ -642,6 +642,39 @@ describe("stopAndRemoveV3Container", () => {
     );
     assert.equal(pool.rows[0]!.state, "vanished");
   });
+
+  // R4 finding 加固(R5):stop 非-404 错 + remove 返回 404(容器已不存在)
+  // → 容器其实已经被清掉了,清理目的达成,**不应该**抛 PartialV3Cleanup。
+  // 之前的实现把 stop 失败 push 进 failures[],然后看见 failures.length>0 就抛
+  // ——即使 remove 收到 404 表示容器已 gone。这是个误报 partial,会让 admin
+  // 看到 502 V3_CLEANUP_PARTIAL,但其实状态已 vanished + docker 已清干净。
+  test("docker stop 抛非-404 + remove 返回 404 → 视作清理 OK (R5 幂等)", async () => {
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 100,
+      user_id: 4,
+      bound_ip: "172.30.5.8",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "halfdead4",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const dockerStopErrRemoveGone = {
+      getContainer: () => ({
+        stop: async () => { throw httpError(500, "stop boom"); },
+        remove: async () => { throw httpError(404, "no such container"); },
+      }),
+    } as unknown as Docker;
+    // 不应抛 —— 容器已不存在,清理目的达成
+    await stopAndRemoveV3Container(
+      { docker: dockerStopErrRemoveGone, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { id: 100, container_internal_id: "halfdead4" },
+    );
+    assert.equal(pool.rows[0]!.state, "vanished");
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────

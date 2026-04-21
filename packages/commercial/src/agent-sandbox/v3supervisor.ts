@@ -714,16 +714,23 @@ export async function stopAndRemoveV3Container(
       failures.push({ stage: "stop", err: wrapDockerError(err) });
     }
   }
-  // stop 失败后仍尝试 force remove;remove 成功即视作清理完成(残骸已移除)
+  // stop 失败后仍尝试 force remove;remove 成功 OR remove 404 (容器已不存在)
+  // 都视作清理完成(残骸已不在)。R4 finding:之前 remove 404 时只是不追加
+  // failure,但 stop 的 failure 还在,会误报 PartialV3Cleanup;实际上容器已没了,
+  // 应等同清理成功。
+  let containerCleared = false;
   try {
     await handle.remove({ force: true });
-    // 如果 stop 失败但 remove 成功:容器已被强制删除,等同清理成功
-    if (failures.length > 0 && failures.every((f) => f.stage === "stop")) {
-      return;
-    }
+    containerCleared = true;
   } catch (err) {
-    if (!isNotFound(err)) failures.push({ stage: "remove", err: wrapDockerError(err) });
+    if (isNotFound(err)) {
+      containerCleared = true; // 容器已不存在,清理目的达成
+    } else {
+      failures.push({ stage: "remove", err: wrapDockerError(err) });
+    }
   }
+  // 容器确认已清理 + 之前只有 stop 失败(没有 remove 失败) → 视作完整成功
+  if (containerCleared && failures.every((f) => f.stage === "stop")) return;
   if (failures.length > 0) throw aggregatePartialV3Cleanup(failures);
 }
 
