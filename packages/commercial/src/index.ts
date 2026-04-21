@@ -423,53 +423,9 @@ export async function registerCommercial(
     console.log("[commercial] mailer = stub (RESEND_API_KEY 未设置, 验证邮件只打日志)");
   }
 
-  const handler = createCommercialHandler({
-    jwtSecret,
-    mailer,
-    redis: wrapIoredis(redis),
-    turnstileSecret: cfg.TURNSTILE_SECRET,
-    turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,
-    turnstileSiteKey: cfg.TURNSTILE_SITE_KEY,
-    requireEmailVerified: cfg.REQUIRE_EMAIL_VERIFIED,
-    // HIGH#4:生产 claudeai.chat 全 HTTPS,默认 Secure cookie;
-    // 仅当 env COMMERCIAL_INSECURE_COOKIE=1(本地 dev / docker compose)才关
-    refreshCookieSecure: process.env.COMMERCIAL_INSECURE_COOKIE === "1" ? false : true,
-    verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
-    resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
-    pricing,
-    // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
-    preCheckRedis,
-    hupijiao,
-    hupijiaoConfig,
-    agentRuntime,
-  });
-
-  // T-52 /ws/agent:仅在 agent runtime 就绪时启用。
-  // 校验:token 合法 + checkAgentAccess 返 ok(active 订阅 + container 可连接)。
-  let agentWsHandler: AgentWsHandler | undefined;
-  if (agentRuntime) {
-    const rpcDir = cfg.AGENT_RPC_SOCKET_DIR!;
-    agentWsHandler = createAgentWsHandler({
-      jwtSecret,
-      pool: getPool(),
-      resolveSocketPath: (uid) =>
-        path.join(rpcDir, `u${uid.toString()}`, "agent.sock"),
-      // 连接前 DB 校验:订阅 + 容器。失败 → 发 error 帧 + close,不建 socket。
-      preCheck: async (uid) => await checkAgentAccess(uid as bigint | number),
-    });
-  }
-
-  // V3 Phase 2 Task 2H + Phase 3D:用户 WS ↔ 容器 WS 桥接(/ws/user-chat-bridge)。
-  //
-  // resolveContainerEndpoint 的解析顺序(高优先 → 低优先):
-  //   1. options.resolveContainerEndpoint(测试 / 显式覆盖)
-  //   2. v3 supervisor(env 完备 → makeV3EnsureRunning)
-  //   3. stub `supervisor_not_wired`(Phase 2 行为,/healthz 仍报 commercial up)
-  //
-  // 为什么 v3 supervisor 走 OC_RUNTIME_IMAGE 而不是 AGENT_IMAGE:
-  //   - v2 (`AGENT_IMAGE`) 是另一条独立路线的 claude-code agent 镜像;
-  //     v3 (`OC_RUNTIME_IMAGE`) 是 per-user openclaude-runtime,字段语义不同。
-  //   - 两条路线可独立配 / 禁,部署文档(Phase 5)显式注入 OC_RUNTIME_IMAGE。
+  // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
+  // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
+  // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
   let v3Deps: V3SupervisorDeps | undefined;
   if (cfg.OC_RUNTIME_IMAGE) {
     // 复用 agentRuntime 路径的 docker socket / 默认逻辑,避免 v2/v3 端再各开一个 docker client
@@ -504,6 +460,53 @@ export async function registerCommercial(
       "[commercial] v3 supervisor disabled; missing env: OC_RUNTIME_IMAGE",
     );
   }
+
+  const handler = createCommercialHandler({
+    jwtSecret,
+    mailer,
+    redis: wrapIoredis(redis),
+    turnstileSecret: cfg.TURNSTILE_SECRET,
+    turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,
+    turnstileSiteKey: cfg.TURNSTILE_SITE_KEY,
+    requireEmailVerified: cfg.REQUIRE_EMAIL_VERIFIED,
+    // HIGH#4:生产 claudeai.chat 全 HTTPS,默认 Secure cookie;
+    // 仅当 env COMMERCIAL_INSECURE_COOKIE=1(本地 dev / docker compose)才关
+    refreshCookieSecure: process.env.COMMERCIAL_INSECURE_COOKIE === "1" ? false : true,
+    verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
+    resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
+    pricing,
+    // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
+    preCheckRedis,
+    hupijiao,
+    hupijiaoConfig,
+    agentRuntime,
+    // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
+    v3Supervisor: v3Deps,
+  });
+
+  // T-52 /ws/agent:仅在 agent runtime 就绪时启用。
+  // 校验:token 合法 + checkAgentAccess 返 ok(active 订阅 + container 可连接)。
+  let agentWsHandler: AgentWsHandler | undefined;
+  if (agentRuntime) {
+    const rpcDir = cfg.AGENT_RPC_SOCKET_DIR!;
+    agentWsHandler = createAgentWsHandler({
+      jwtSecret,
+      pool: getPool(),
+      resolveSocketPath: (uid) =>
+        path.join(rpcDir, `u${uid.toString()}`, "agent.sock"),
+      // 连接前 DB 校验:订阅 + 容器。失败 → 发 error 帧 + close,不建 socket。
+      preCheck: async (uid) => await checkAgentAccess(uid as bigint | number),
+    });
+  }
+
+  // V3 Phase 2 Task 2H + Phase 3D:用户 WS ↔ 容器 WS 桥接(/ws/user-chat-bridge)。
+  //
+  // resolveContainerEndpoint 的解析顺序(高优先 → 低优先):
+  //   1. options.resolveContainerEndpoint(测试 / 显式覆盖)
+  //   2. v3 supervisor(env 完备 → makeV3EnsureRunning,见上方 v3Deps 装配)
+  //   3. stub `supervisor_not_wired`(Phase 2 行为,/healthz 仍报 commercial up)
+  //
+  // 注:v3Deps 已在 createCommercialHandler 之前装配(HIGH#6 admin v3 dispatch 需要)。
 
   // V3 Phase 3F:idle 30min stop+remove ephemeral 容器(MVP 单轨)。
   // 仅在 v3 supervisor 装配后启用;cfg.OC_IDLE_SWEEP_DISABLED=1 可手动关掉

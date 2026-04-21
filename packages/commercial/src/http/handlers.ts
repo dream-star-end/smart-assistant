@@ -30,6 +30,7 @@ import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { Logger } from "../logging/logger.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import type { AgentHttpDeps } from "./agent.js";
+import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -88,6 +89,13 @@ export interface CommercialHttpDeps {
    * 未注入时 `/api/agent/open` 返 503(仍允许 /status 查看过去订阅)。
    */
   agentRuntime?: AgentHttpDeps;
+  /**
+   * 2026-04-21 安全审计 HIGH#6 — v3 supervisor 依赖(docker + pool + image)。
+   * 注入后 admin 对 v3 行(docker_name=NULL)的 restart/stop/remove 走 v3 路径
+   * (`stopAndRemoveV3Container`,行标 vanished)。未注入时对 v3 行返 503。
+   * 与 `agentRuntime` 是平行的两条路线,两边各管各的镜像 / docker socket。
+   */
+  v3Supervisor?: V3SupervisorDeps;
 }
 
 export interface RequestContext {

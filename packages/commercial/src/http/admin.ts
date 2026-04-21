@@ -64,7 +64,7 @@ import {
   adminStopContainer,
   adminRemoveContainer,
   ContainerNotFoundError,
-  V3RowNotSupportedError,
+  V3SupervisorMissingError,
   type AdminContainerRowView,
 } from "../admin/containers.js";
 import {
@@ -907,15 +907,20 @@ export async function handleAdminAgentContainerAction(
     throw new HttpError(503, "AGENT_NOT_READY", "agent runtime is not configured");
   }
   const auditCtx = { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent };
+  // HIGH#6:v3 行(docker_name=NULL)经 v3Supervisor dispatch;v2 行走老路径。
+  // v3Supervisor 未注入(OC_RUNTIME_IMAGE 没配)且行是 v3 → 抛 V3SupervisorMissingError → 503。
+  const v3Supervisor = deps.v3Supervisor;
   try {
-    if (action === "restart") await adminRestartContainer(id, agent.docker, auditCtx);
-    else if (action === "stop") await adminStopContainer(id, agent.docker, auditCtx);
-    else await adminRemoveContainer(id, agent.docker, auditCtx);
+    if (action === "restart") await adminRestartContainer(id, agent.docker, auditCtx, v3Supervisor);
+    else if (action === "stop") await adminStopContainer(id, agent.docker, auditCtx, v3Supervisor);
+    else await adminRemoveContainer(id, agent.docker, auditCtx, v3Supervisor);
   } catch (err) {
     if (err instanceof ContainerNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
-    // 0017 后 v2 admin 操作路径碰到 v3 行(docker_name=NULL)→ 400,文案明确,
-    // 不要让 dockerode 抛 "No such container: undefined" 这种 5xx 看不懂的错。
-    if (err instanceof V3RowNotSupportedError) throw new HttpError(400, "V3_NOT_SUPPORTED", err.message);
+    // 0017 后 v2 admin 操作路径碰到 v3 行,但 gateway 没装配 v3 supervisor(OC_RUNTIME_IMAGE
+    // 缺失 / 启动跳过)→ 503,告诉 admin 配置缺,而不是 dockerode 抛 "No such container: undefined"。
+    if (err instanceof V3SupervisorMissingError) {
+      throw new HttpError(503, "V3_SUPERVISOR_NOT_READY", err.message);
+    }
     throw err;
   }
   sendJson(res, 200, { ok: true, action });
