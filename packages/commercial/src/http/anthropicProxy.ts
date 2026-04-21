@@ -110,17 +110,48 @@ export const ALLOWED_BETA_VALUES: ReadonlySet<string> = new Set([
   "context-1m-2025-08-07",
   "fine-grained-tool-streaming-2025-05-14",
   "prompt-caching-2024-07-31",
+  // 2026-04-21 上线:ccb v2.1.888+ 默认带这一组 beta,见个人版
+  // src/constants/betas.ts。一次加全,免得一个一个 ANTHROPIC_BETA_NOT_ALLOWED 反复。
+  "context-management-2025-06-27",
+  "prompt-caching-scope-2026-01-05",
+  "structured-outputs-2025-12-15",
+  "web-search-2025-03-05",
+  "advanced-tool-use-2025-11-20",
+  "tool-search-tool-2025-10-19",
+  "effort-2025-11-24",
+  "task-budgets-2026-03-13",
+  "fast-mode-2026-02-01",
+  "redact-thinking-2026-02-12",
+  "token-efficient-tools-2026-03-28",
+  "afk-mode-2026-01-31",
+  "advisor-tool-2026-03-01",
+  // ccb 桥接/teleport 路径用的 ccr-byoc / triggers / mcp-servers / environments
+  "ccr-byoc-2025-07-29",
+  "ccr-triggers-2026-01-30",
+  "environments-2025-11-01",
+  "mcp-servers-2025-12-04",
 ]);
 
-/** body 字段字节预算(R3)。Buffer.byteLength(JSON.stringify(field), 'utf8') 口径。 */
+/** body 字段字节预算(R3)。Buffer.byteLength(JSON.stringify(field), 'utf8') 口径。
+ *
+ * 2026-04-21 调整:原值(messages 256K / system 32K / tools 64K / 总 512K)是按
+ * 极简对话场景设的,boss 接 ccb 后立刻撞 system 32K 上限 — 个人版 ccb 的 system prompt
+ * 含 persona + identity + platform-capabilities + skills 索引 + memory 索引,光骨架就
+ * 50-200 KB,加上 13+ MCP 工具描述总轻松破 200 KB。提到 commercial v3 真实需求量级:
+ *   - system: 2 MB(留够工具描述 + skills 元数据 + 多 MCP server 拼接)
+ *   - tools: 2 MB(同上,tool schema 大量 JSON 描述)
+ *   - messages: 8 MB(长会话 + 嵌入图片 base64;低于 anthropic 的 ~32 MB 上限)
+ *   - 总 body: 16 MB
+ *   还是远低于 anthropic 自己的 ~32 MB 限制,但够用并防 DoS。
+ */
 export const SIZE_LIMITS = {
-  messages: 256 * 1024,
-  system: 32 * 1024,
-  tools: 64 * 1024,
+  messages: 8 * 1024 * 1024,
+  system: 2 * 1024 * 1024,
+  tools: 2 * 1024 * 1024,
 } as const;
 
 /** 总 body 上限(JSON 全文 byteLength)。超过 → 413。 */
-export const MAX_BODY_BYTES_DEFAULT = 512 * 1024;
+export const MAX_BODY_BYTES_DEFAULT = 16 * 1024 * 1024;
 
 /** messages / tools 数量上限(对齐 R3 §3.3 注解)。 */
 export const MAX_MESSAGES_COUNT = 200;
@@ -173,6 +204,15 @@ export const proxyBodySchema = z
     stream: z.literal(true).optional(),
     /** Claude SDK 会在 system + messages 之外塞 thinking;允许透传 */
     thinking: z.unknown().optional(),
+    /**
+     * 2026-04 新 beta: claude-code-best (CCB v2.1.888+) 会带 `context_management`
+     * (server-side 自动 context 截断)。不透传 → ccb 整轮 400 卡死(boss claudeai.chat
+     * 踩雷于 2026-04-21)。我们不解析它的语义,与 thinking 同样按 z.unknown() 透传给
+     * 上游 Anthropic 自决,size 走 system/messages/tools 现有预算。
+     */
+    context_management: z.unknown().optional(),
+    /** Anthropic priority/standard tier 提示;透传不解析。 */
+    service_tier: z.string().max(64).optional(),
   })
   .strict();
 
@@ -1294,6 +1334,16 @@ export function makeAnthropicProxyHandler(
           throw err;
         }
         safeHeaders.authorization = `Bearer ${pick.token.toString("utf8")}`;
+
+        // 强制注入 oauth-2025-04-20 — 我们所有 claude_accounts 都用 OAuth bearer,
+        // 没这个 beta header Anthropic 会回 401 "OAuth authentication is currently not supported"。
+        // 个人版 ccb 在 isClaudeAISubscriber()=false 时(我们容器内就是这种)不会自己加,
+        // 所以必须在 proxy 侧无条件补上(允许多 token 共存,merge 而不是覆盖)。
+        {
+          const existing = (safeHeaders["anthropic-beta"] ?? "").split(",").map(s => s.trim()).filter(Boolean);
+          if (!existing.includes("oauth-2025-04-20")) existing.unshift("oauth-2025-04-20");
+          safeHeaders["anthropic-beta"] = existing.join(",");
+        }
 
         // body 强制 stream:true
         const upstreamBodyJson = JSON.stringify({ ...body, stream: true });

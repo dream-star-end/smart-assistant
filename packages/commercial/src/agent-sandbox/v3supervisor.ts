@@ -580,8 +580,10 @@ export async function provisionV3Container(
           Privileged: false,
           SecurityOpt: ["no-new-privileges"],
           // CLAUDE_CONFIG_DIR tmpfs(防 ~/.claude/settings.json 残留)
+          // uid/gid=1000 必须显式给 — 容器跑 agent (1000:1000),tmpfs 默认 root:root
+          // 0700 会让 ccb 子进程 EACCES 读写 settings.json,表现为静默 exit 0(踩雷于 2026-04-21)
           Tmpfs: {
-            [V3_CONFIG_TMPFS_PATH]: "rw,nosuid,nodev,size=4m,mode=0700",
+            [V3_CONFIG_TMPFS_PATH]: "rw,nosuid,nodev,size=4m,mode=0700,uid=1000,gid=1000",
           },
           // 单 volume → /home/agent/.openclaude(个人版状态目录)
           Binds: [`${volumeName}:${V3_VOLUME_MOUNT}:rw`],
