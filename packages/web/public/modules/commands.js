@@ -95,9 +95,17 @@ const slashCommands = [
     desc: '停止当前生成',
     run() {
       const sess = getSession()
-      if (!sess || !state.ws) return
-      // safeWsSend:背压时 close+reconnect;stop 丢了 server 端 channel cleanup
-      // 会接管,localStopTeardown 继续本地 UI 归位。
+      if (!sess) return
+      // 2026-04-22 Codex R2 IMPORTANT#1:原实现只要 state.ws 存在就 localStopTeardown,
+      // ws 不是 OPEN 时 safeWsSend 直接返 false,stop 帧没发出,但本地 UI 已 teardown;
+      // 重连后 hello 汇报 inFlight=false,服务端不会发 interrupted final → 旧 turn 继续
+      // 跑、token 继续扣。必须 WS 处于 OPEN(readyState === 1)时才允许 stop,否则提示
+      // 用户网络未就绪。OPEN 但 safeWsSend 背压失败可以 teardown,因为它会 close(4000)
+      // 触发服务端 channel cleanup(服务端自会清 in-flight turn)。
+      if (!state.ws || state.ws.readyState !== 1) {
+        toast('当前连接未就绪,无法发送停止信号', 'error')
+        return
+      }
       safeWsSend(state.ws, JSON.stringify({
         type: 'inbound.control.stop',
         channel: 'webchat',

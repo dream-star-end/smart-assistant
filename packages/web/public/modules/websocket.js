@@ -100,6 +100,11 @@ export function safeWsSend(ws, data) {
     ws.send(data)
     return true
   } catch {
+    // 2026-04-22 Codex R2 IMPORTANT#2:ws.send() 抛异常不一定伴随 readyState 切换
+    // (比如某些浏览器 / polyfill 在 CLOSED 边缘态会先抛 InvalidStateError 但 readyState
+    // 还是 OPEN)。不 close 就进不了 onclose→reconnect→drain 链,调用方 requeue 的消息
+    // 永远停在 offlineQueue,UI 显示 queued 但没有任何自愈动作。
+    try { ws.close(WS_CLOSE_CODE_STALLED, 'send failed') } catch {}
     return false
   }
 }
