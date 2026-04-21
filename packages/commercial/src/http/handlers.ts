@@ -340,16 +340,37 @@ export async function handleRequestPasswordReset(
   const cfg = deps.rateLimits?.requestReset ?? DEFAULT_RATE_LIMITS.requestReset;
   await enforceRateLimit(deps, cfg, ctx.clientIp);
 
-  const body = (await readJsonBody(req)) as { email?: unknown } | undefined;
+  const body = (await readJsonBody(req)) as
+    | { email?: unknown; turnstile_token?: unknown }
+    | undefined;
   const email = body && typeof (body as Record<string, unknown>).email === "string"
     ? (body as { email: string }).email
     : "";
-  // 防枚举:即使 email 缺失也走 requestPasswordReset(它会 accept=true)
-  const r = await requestPasswordReset(email, {
-    mailer: deps.mailer,
-    resetUrlBase: deps.resetPasswordUrlBase,
-  });
-  sendJson(res, 200, { accepted: r.accepted });
+  const turnstileToken = body && typeof (body as Record<string, unknown>).turnstile_token === "string"
+    ? (body as { turnstile_token: string }).turnstile_token
+    : "";
+  // 防枚举:即使 email 缺失也走 requestPasswordReset(它会 accept=true)。
+  // 但 turnstile 是攻击者可控参数,缺/错都直接抛 TURNSTILE_FAILED —— 校验
+  // 发生在 email 查库之前,不会泄露邮箱存在性。
+  try {
+    const r = await requestPasswordReset(
+      { email, turnstile_token: turnstileToken },
+      {
+        mailer: deps.mailer,
+        resetUrlBase: deps.resetPasswordUrlBase,
+        turnstileSecret: deps.turnstileSecret,
+        turnstileBypass: deps.turnstileBypass,
+        remoteIp: ctx.clientIp,
+        fetchImpl: deps.fetchImpl,
+      },
+    );
+    sendJson(res, 200, { accepted: r.accepted });
+  } catch (err) {
+    if (err instanceof VerifyError) {
+      throw new HttpError(400, err.code, err.message);
+    }
+    throw err;
+  }
 }
 
 // ─── POST /api/auth/confirm-password-reset ──────────────────────────

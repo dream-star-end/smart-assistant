@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
 import { tx, query } from "../db/queries.js";
 import { hashPassword } from "./passwords.js";
 import { newVerifyToken, VERIFY_EMAIL_TTL_SECONDS } from "./register.js";
+import { verifyTurnstile, TurnstileError } from "./turnstile.js";
 import type { Mailer } from "./mail.js";
 
 /** 密码重置 token TTL:1 小时(短于 verify_email)05-SEC §15 */
@@ -38,8 +39,13 @@ const emailSchema = z
   .toLowerCase()
   .max(254)
   .regex(/^[a-z0-9._+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i, "invalid email format");
+const turnstileTokenSchema = z.string().min(1).max(2048);
 
-export type VerifyErrorCode = "VALIDATION" | "INVALID_TOKEN" | "WEAK_PASSWORD";
+export type VerifyErrorCode =
+  | "VALIDATION"
+  | "INVALID_TOKEN"
+  | "WEAK_PASSWORD"
+  | "TURNSTILE_FAILED";
 
 export class VerifyError extends Error {
   readonly code: VerifyErrorCode;
@@ -59,6 +65,14 @@ export interface RequestResetDeps extends CommonDeps {
   mailer: Mailer;
   /** 邮件中的链接 base url(部署时 https://claudeai.chat) */
   resetUrlBase?: string;
+  /** Cloudflare Turnstile server-side secret(env);bypass 模式可不传 */
+  turnstileSecret?: string;
+  /** 测试 bypass:跳过 turnstile,token 非空就 true */
+  turnstileBypass?: boolean;
+  /** 用户 IP — 转给 turnstile */
+  remoteIp?: string;
+  /** 测试可注入 fetch(传给 turnstile) */
+  fetchImpl?: typeof fetch;
 }
 
 /** 把 raw token 转成 token_hash(hex sha256 of raw bytes — base64url decoded) */
@@ -147,16 +161,57 @@ export interface RequestResetResult {
   accepted: true;
 }
 
+export interface RequestResetInput {
+  email: string;
+  turnstile_token: string;
+}
+
 /**
  * 申请密码重置。
  *
  * 防枚举:无论 email 是否存在、是否已验证,接口都返回 `{accepted: true}`。
  * 仅当邮箱在 users 表里存在时才真的写 reset 行 + 发邮件。
+ *
+ * Turnstile(05-SEC §15 + 2026-04-21 安全审计 HIGH#3):
+ *   注册/登录/重置 三个公开 unauth 端点必须强校验 turnstile,否则攻击者可以
+ *   通过本端点滥发邮件(每个 user 1 小时一封 reset 邮件,但 IP 限流靠 handler
+ *   层的 3/min 太弱,不能挡 botnet);turnstile 验证失败 → TURNSTILE_FAILED,
+ *   **必须在 email 查库之前就拒绝**,避免给"非空 turnstile + 真实 email"留
+ *   timing 边信道。
  */
 export async function requestPasswordReset(
-  rawEmail: string,
+  input: string | RequestResetInput,
   deps: RequestResetDeps,
 ): Promise<RequestResetResult> {
+  // 兼容历史调用(只传 email 字符串)— 测试 / 内部调用允许;
+  // public HTTP handler 必须传 RequestResetInput 走 turnstile 校验。
+  const rawEmail = typeof input === "string" ? input : input.email;
+  const turnstileToken = typeof input === "string" ? null : input.turnstile_token;
+
+  // 1) Turnstile 校验 — 在任何 DB lookup 前完成,避免 timing 区分 "邮箱存在与否"
+  if (turnstileToken !== null) {
+    const tokParsed = turnstileTokenSchema.safeParse(turnstileToken);
+    if (!tokParsed.success) {
+      throw new VerifyError("TURNSTILE_FAILED", "turnstile token missing or malformed");
+    }
+    let turnstileOk = false;
+    try {
+      turnstileOk = await verifyTurnstile(tokParsed.data, deps.turnstileSecret, {
+        remoteIp: deps.remoteIp,
+        bypass: deps.turnstileBypass === true,
+        fetchImpl: deps.fetchImpl,
+      });
+    } catch (err) {
+      if (err instanceof TurnstileError) {
+        throw new VerifyError("TURNSTILE_FAILED", "turnstile verification failed");
+      }
+      throw err;
+    }
+    if (!turnstileOk) {
+      throw new VerifyError("TURNSTILE_FAILED", "turnstile verification rejected");
+    }
+  }
+
   // email 格式失败也按 accepted 处理 —— 不告诉攻击者 "格式都没过"
   const parsed = emailSchema.safeParse(rawEmail);
   if (!parsed.success) {

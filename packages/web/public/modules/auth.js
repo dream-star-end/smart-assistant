@@ -425,12 +425,13 @@ async function _doRequestReset() {
   const turnstile_token = (_getTokenFns.forgot?.() || '').trim()
   if (!turnstile_token) { _showError('请完成人机验证'); return }
   await _withBusy('auth-forgot-btn', '提交中…', async () => {
-    // Note: backend doesn't currently take turnstile on this endpoint, but we still
-    // gate client-side to slow down enumeration via UI; safe to omit from body.
+    // Backend enforces turnstile (HIGH#3) — must include token in body, otherwise
+    // 400 TURNSTILE_FAILED. Token is captured client-side via _getTokenFns.forgot
+    // (set when this mode was mounted).
     const r = await apiFetch('/api/auth/request-password-reset', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, turnstile_token }),
       suppressAuthRedirect: true,
     })
     const data = await r.json().catch(() => ({}))

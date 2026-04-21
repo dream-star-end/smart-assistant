@@ -47,6 +47,7 @@ const COMMERCIAL_TABLES = [
   "claude_accounts",
   "refresh_tokens",
   "email_verifications",
+  "system_settings",
   "users",
   "schema_migrations",
 ];
@@ -265,6 +266,100 @@ describe("auth.verify.requestPasswordReset (integ)", () => {
     const mailer = new CapturingMailer();
     await requestPasswordReset("  EVE@Example.COM  ", { mailer });
     assert.equal(mailer.sent.length, 1, "uppercased email must still find user");
+  });
+
+  // HIGH#3 (2026-04-21 安全审计):新对象签名要求 turnstile_token,且必须在
+  // email 查库前完成校验,避免 timing oracle 区分 "邮箱存在"。
+  describe("turnstile (HIGH#3)", () => {
+    test("object input + bypass=true → accepts and writes reset row", async (t) => {
+      if (skipIfNoPg(t)) return;
+      await registerAndCaptureVerifyToken("kate@example.com", "pwd kate");
+      const mailer = new CapturingMailer();
+      const r = await requestPasswordReset(
+        { email: "kate@example.com", turnstile_token: "tok-bypassed" },
+        { mailer, turnstileBypass: true, resetUrlBase: "https://claudeai.chat" },
+      );
+      assert.equal(r.accepted, true);
+      assert.equal(mailer.sent.length, 1);
+      const ev = await query<{ cnt: string }>(
+        "SELECT COUNT(*)::text AS cnt FROM email_verifications WHERE purpose = 'reset_password'",
+      );
+      assert.equal(ev.rows[0].cnt, "1");
+    });
+
+    test("object input + empty turnstile_token → TURNSTILE_FAILED (no DB write)", async (t) => {
+      if (skipIfNoPg(t)) return;
+      await registerAndCaptureVerifyToken("liam@example.com", "pwd liam");
+      const mailer = new CapturingMailer();
+      await assert.rejects(
+        requestPasswordReset(
+          { email: "liam@example.com", turnstile_token: "" },
+          { mailer, turnstileBypass: true },
+        ),
+        (err: unknown) => err instanceof VerifyError && err.code === "TURNSTILE_FAILED",
+      );
+      assert.equal(mailer.sent.length, 0);
+      const ev = await query<{ cnt: string }>(
+        "SELECT COUNT(*)::text AS cnt FROM email_verifications WHERE purpose = 'reset_password'",
+      );
+      assert.equal(ev.rows[0].cnt, "0", "no row may be written when turnstile fails");
+    });
+
+    test("object input + remote turnstile rejected → TURNSTILE_FAILED (no DB write)", async (t) => {
+      if (skipIfNoPg(t)) return;
+      await registerAndCaptureVerifyToken("mary@example.com", "pwd mary");
+      const mailer = new CapturingMailer();
+      const fakeFetch: typeof fetch = (async () =>
+        new Response(JSON.stringify({ success: false }), { status: 200 })) as unknown as typeof fetch;
+      await assert.rejects(
+        requestPasswordReset(
+          { email: "mary@example.com", turnstile_token: "tok-bad" },
+          { mailer, turnstileSecret: "secret-x", fetchImpl: fakeFetch },
+        ),
+        (err: unknown) => err instanceof VerifyError && err.code === "TURNSTILE_FAILED",
+      );
+      assert.equal(mailer.sent.length, 0);
+    });
+
+    test("turnstile fails BEFORE email lookup (no enumeration timing oracle)", async (t) => {
+      if (skipIfNoPg(t)) return;
+      // Both an existing and a ghost email must hit the same TURNSTILE_FAILED
+      // path BEFORE we ever touch users → identical observable behavior.
+      await registerAndCaptureVerifyToken("nina@example.com", "pwd nina");
+      const mailer = new CapturingMailer();
+
+      let dbHits = 0;
+      const fakeFetch: typeof fetch = (async () => {
+        // If turnstile is checked first, we should see this called BEFORE any
+        // mailer.send / DB row appears.
+        return new Response(JSON.stringify({ success: false }), { status: 200 });
+      }) as unknown as typeof fetch;
+
+      for (const email of ["nina@example.com", "ghost@example.com"]) {
+        await assert.rejects(
+          requestPasswordReset(
+            { email, turnstile_token: "tok-bad" },
+            { mailer, turnstileSecret: "secret-x", fetchImpl: fakeFetch },
+          ),
+          (err: unknown) => err instanceof VerifyError && err.code === "TURNSTILE_FAILED",
+        );
+        dbHits += mailer.sent.length;
+      }
+      assert.equal(dbHits, 0);
+      const ev = await query<{ cnt: string }>(
+        "SELECT COUNT(*)::text AS cnt FROM email_verifications WHERE purpose = 'reset_password'",
+      );
+      assert.equal(ev.rows[0].cnt, "0");
+    });
+
+    test("legacy positional string input still works (skips turnstile, internal callers)", async (t) => {
+      if (skipIfNoPg(t)) return;
+      await registerAndCaptureVerifyToken("oscar@example.com", "pwd oscar");
+      const mailer = new CapturingMailer();
+      const r = await requestPasswordReset("oscar@example.com", { mailer });
+      assert.equal(r.accepted, true);
+      assert.equal(mailer.sent.length, 1, "string overload must remain unchanged");
+    });
   });
 });
 
