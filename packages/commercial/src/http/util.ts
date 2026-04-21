@@ -61,44 +61,165 @@ function cleanClientIp(v: unknown): string | null {
 }
 
 /**
- * 安全注意:此函数信任 CF-Connecting-IP / X-Forwarded-For 仅当 socket 是 loopback
- * (即 Caddy 反代过来)。但 Caddy 暴露在公网(:443)且当前 GCP firewall 对 80/443
- * 开放 Anywhere(未白名单 CF IP 段),攻击者可直连 Caddy 并伪造 CF-Connecting-IP。
+ * 2026-04-22 Codex R3 IMPORTANT:CF-RAY 可被攻击者直连 Caddy 时伪造,单靠 header
+ * 判断是否"来自 CF"不构成信任根。真正的信任根必须是"上一跳 TCP peer 是 Cloudflare"。
  *
- * 2026-04-22 Codex R2 IMPORTANT#3 defense-in-depth:
- *   - 信任 CF-Connecting-IP 必须同时看到 CF-RAY header(CF 边缘强制注入的追踪 ID,
- *     格式如 `8a3f2c4e...-HKG`,攻击者无法伪造真实 CF-RAY 但可以伪造看起来像的字符串
- *     —— 因此这只是弱化手段,真正的防御必须在 ops 层);
- *   - CF-RAY 缺失时回退到 XFF first;都没有就用 socket IP。
+ * 架构:CF → Caddy(公网 :443) → gateway(127.0.0.1:18789)。Caddyfile 里 XFF 被
+ * `header_up X-Forwarded-For {remote_host}` **覆盖**,所以 gateway 看到的 XFF 单段
+ * = Caddy 的直接 TCP peer IP:
+ *   - 走 CF:该值 ∈ Cloudflare edge IP 段
+ *   - 攻击者直连:该值 = 攻击者真实 IP(无法伪造,因为 TCP 三次握手)
  *
- * **Ops 必须做的事**(本仓库文档已记录):
- *   (a) Caddy 只接受来自 Cloudflare IP 段的连接(推荐:CF 官方 IP list + UFW/cloud FW),或
- *   (b) Caddy handler 里对非 CF 来源 `request_header -CF-Connecting-IP` 剔除。
- * 代码层只能拦住"拿到的值必须是 IP"+"CF-RAY 作为过关凭证";ops 层 CF-only 访问才是
- * 根治方案。
+ * 只有当 XFF 是 CF IP 时,才信任 CF-Connecting-IP;否则 XFF 本身已经是最可信的客户端
+ * IP(攻击者真实 IP)—— 直接用作 rate-limit key。
+ *
+ * 运维层根治方案(本代码之外):把 Caddy 80/443 限制到 CF IP 段(UFW 白名单)。
  */
-// CF-RAY 格式:16 字符 hex + `-` + 3 字符 IATA 机场代号(如 `8a3f2c4e1b2d3456-HKG`)。
-// 宽松点允许 8-40 hex 容忍未来扩展。
-const CF_RAY_RE = /^[0-9a-f]{8,40}-[A-Z]{3}$/;
+
+// Cloudflare IPv4 edge ranges(https://www.cloudflare.com/ips-v4 最后校验:2026-04-22)。
+// 列表半年以内基本不变;若 CF 新增段,请同步更新。
+const CF_IPV4_CIDRS = [
+  "103.21.244.0/22",
+  "103.22.200.0/22",
+  "103.31.4.0/22",
+  "104.16.0.0/13",
+  "104.24.0.0/14",
+  "108.162.192.0/18",
+  "131.0.72.0/22",
+  "141.101.64.0/18",
+  "162.158.0.0/15",
+  "172.64.0.0/13",
+  "173.245.48.0/20",
+  "188.114.96.0/20",
+  "190.93.240.0/20",
+  "197.234.240.0/22",
+  "198.41.128.0/17",
+] as const;
+
+// Cloudflare IPv6 edge ranges(https://www.cloudflare.com/ips-v6 最后校验:2026-04-22)。
+const CF_IPV6_CIDRS = [
+  "2400:cb00::/32",
+  "2606:4700::/32",
+  "2803:f800::/32",
+  "2405:b500::/32",
+  "2405:8100::/32",
+  "2a06:98c0::/29",
+  "2c0f:f248::/32",
+] as const;
+
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    const v = Number(p);
+    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
+    n = (n * 256) + v;
+  }
+  return n >>> 0; // 转 unsigned
+}
+
+/** 展开 IPv6 到 16 byte BigInt;仅在 CIDR 命中检查里用,不追求美观。 */
+function ipv6ToBigInt(ip: string): bigint | null {
+  // 处理 IPv4-mapped IPv6:`::ffff:1.2.3.4`
+  const v4mapMatch = ip.match(/^(.*:)?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/);
+  let normalized = ip;
+  if (v4mapMatch) {
+    const v4int = ipv4ToInt(v4mapMatch[2] ?? "");
+    if (v4int === null) return null;
+    const v4hex = v4int.toString(16).padStart(8, "0");
+    normalized = `${v4mapMatch[1] ?? ""}${v4hex.slice(0, 4)}:${v4hex.slice(4)}`;
+  }
+  // 展开 `::` → 中间补零
+  let parts: string[];
+  if (normalized.includes("::")) {
+    const [l, r] = normalized.split("::", 2);
+    const lp = l ? l.split(":") : [];
+    const rp = r ? r.split(":") : [];
+    const missing = 8 - lp.length - rp.length;
+    if (missing < 0) return null;
+    parts = [...lp, ...Array(missing).fill("0"), ...rp];
+  } else {
+    parts = normalized.split(":");
+  }
+  if (parts.length !== 8) return null;
+  let n = 0n;
+  for (const p of parts) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(p)) return null;
+    n = (n << 16n) | BigInt(Number.parseInt(p, 16));
+  }
+  return n;
+}
+
+function ipInCidrV4(ip: string, cidr: string): boolean {
+  const [base, bitsStr] = cidr.split("/", 2);
+  const bits = Number(bitsStr);
+  const ipInt = ipv4ToInt(ip);
+  const baseInt = ipv4ToInt(base ?? "");
+  if (ipInt === null || baseInt === null || !Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  if (bits === 0) return true;
+  const mask = bits === 32 ? 0xffffffff : (~((1 << (32 - bits)) - 1)) >>> 0;
+  return (ipInt & mask) === (baseInt & mask);
+}
+
+function ipInCidrV6(ip: string, cidr: string): boolean {
+  const [base, bitsStr] = cidr.split("/", 2);
+  const bits = Number(bitsStr);
+  const ipBig = ipv6ToBigInt(ip);
+  const baseBig = ipv6ToBigInt(base ?? "");
+  if (ipBig === null || baseBig === null || !Number.isInteger(bits) || bits < 0 || bits > 128) return false;
+  if (bits === 0) return true;
+  const mask = bits === 128 ? ((1n << 128n) - 1n) : (((1n << BigInt(bits)) - 1n) << BigInt(128 - bits));
+  return (ipBig & mask) === (baseBig & mask);
+}
+
+function isCloudflareIp(ip: string): boolean {
+  const v = isIP(ip);
+  if (v === 4) return CF_IPV4_CIDRS.some((c) => ipInCidrV4(ip, c));
+  if (v === 6) {
+    // 允许 IPv4-mapped 形式:`::ffff:a.b.c.d` → 按 IPv4 判
+    const v4 = ip.match(/^::ffff:([0-9.]+)$/i);
+    if (v4) return CF_IPV4_CIDRS.some((c) => ipInCidrV4(v4[1] ?? "", c));
+    return CF_IPV6_CIDRS.some((c) => ipInCidrV6(ip, c));
+  }
+  return false;
+}
+
+/** 归一化 IPv4-mapped IPv6(`::ffff:1.2.3.4` → `1.2.3.4`),避免 rate-limit 双桶。 */
+function normalizeClientIp(ip: string): string {
+  const m = ip.match(/^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/i);
+  return m && m[1] ? m[1] : ip;
+}
 
 export function clientIpOf(req: IncomingMessage): string {
-  const socketIp = req.socket.remoteAddress ?? "unknown";
-  if (!LOOPBACK_RE.test(socketIp)) return socketIp;
-  // loopback socket:信任 Caddy 透传的 CF 边缘 IP,但必须看到 CF-RAY 才信 CF-Connecting-IP
-  const cfRayHeader = req.headers["cf-ray"];
-  const hasCfRay = typeof cfRayHeader === "string" && CF_RAY_RE.test(cfRayHeader);
-  if (hasCfRay) {
+  const rawSocketIp = req.socket.remoteAddress ?? "unknown";
+  const socketIp = isIP(rawSocketIp) ? normalizeClientIp(rawSocketIp) : rawSocketIp;
+  if (!LOOPBACK_RE.test(rawSocketIp)) return socketIp;
+
+  // loopback 来源:Caddy 反代过来。XFF 首段 = Caddy 直接 TCP peer(Caddyfile 里
+  // `header_up X-Forwarded-For {remote_host}` 覆盖写入)。
+  const xffHeader = req.headers["x-forwarded-for"];
+  let caddyPeerIp: string | null = null;
+  if (typeof xffHeader === "string") {
+    caddyPeerIp = cleanClientIp(xffHeader.split(",")[0]?.trim());
+  }
+
+  // 仅当 Caddy peer 确实在 CF edge 范围内,才信任 CF-Connecting-IP 作为客户端 IP。
+  if (caddyPeerIp && isCloudflareIp(caddyPeerIp)) {
     const cfIp = cleanClientIp(req.headers["cf-connecting-ip"]);
-    if (cfIp) return cfIp;
+    if (cfIp) return normalizeClientIp(cfIp);
+    // CF peer 但没 CF-Connecting-IP:非常罕见,回退到 CF edge IP 本身(比直接信 XFF 安全)
+    return normalizeClientIp(caddyPeerIp);
   }
-  const xff = req.headers["x-forwarded-for"];
-  if (typeof xff === "string") {
-    const first = xff.split(",")[0]?.trim();
-    const firstIp = cleanClientIp(first);
-    if (firstIp) return firstIp;
-  }
+
+  // 非 CF peer:不能信 CF-Connecting-IP(可伪造)。此时 Caddy peer 就是攻击者/直连者
+  // 真实 IP,用它作为 rate-limit key 是最安全选择(TCP 三次握手无法伪造)。
+  if (caddyPeerIp) return normalizeClientIp(caddyPeerIp);
   return socketIp;
 }
+
+// 导出给测试用,不是 public API
+export const __internal_clientIp = { ipv4ToInt, ipv6ToBigInt, ipInCidrV4, ipInCidrV6, isCloudflareIp, normalizeClientIp };
 
 export function userAgentOf(req: IncomingMessage): string | null {
   const ua = req.headers["user-agent"];
