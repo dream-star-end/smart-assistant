@@ -9,12 +9,26 @@
  *   - 未验证邮箱:**允许登录**,但 user 对象上 `email_verified=false`,前端提示
  *   - 软删除/封号:UNAUTHORIZED 走同一个错误码(防枚举)
  *   - access JWT + opaque refresh token,refresh 入库存 sha256 hash
- *   - refresh 旋转:本任务**不**强制 rotate(MVP 简化),但 logout 必须置 revoked_at
  *   - turnstile 校验复用 T-12 模块
+ *
+ * Refresh token 轮换(2026-04-21 安全审计 LOW,migration 0019):
+ *   - 每次 /api/auth/refresh 都 **rotate**:旧 row revoked_at=NOW() +
+ *     reason='rotated' + rotated_to_id 指向新 row;同事务 INSERT 新 row,
+ *     family_id 沿用旧的;新 raw token 写回 HttpOnly cookie
+ *   - 盗用检测(reuse-after-rotate):客户端拿一张「已 revoked 但未到期」
+ *     的 refresh 来换 → 99% 是攻击者(正主已经拿到新 refresh,不会回头用
+ *     旧的)→ 把整个 family 全 revoke(reason='theft'),抛 INVALID_REFRESH。
+ *     正主下次刷新也会失败 → 跳登录 → 攻击者偷的所有未来 token 都失效
+ *   - 错误语义统一:RefreshError("INVALID_REFRESH") 不区分"过期/已撤销/
+ *     不存在/盗用",对客户端永远只是"重新登录"
+ *
+ * Logout:吊销当前 refresh row + 整个 family(避免某些会话留在飞中)。
+ *   理由:用户主动 logout 表示"这一刻起所有当前设备都该失效";如果只
+ *   revoke 一张,其他 tab 仍能 refresh 很久。reason='logout'。
  */
 
 import { z } from "zod";
-import { query } from "../db/queries.js";
+import { query, tx } from "../db/queries.js";
 import { hashPassword, verifyPassword } from "./passwords.js";
 import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "./jwt.js";
 import { verifyTurnstile, TurnstileError } from "./turnstile.js";
@@ -257,15 +271,56 @@ export interface RefreshDeps {
 export interface RefreshResult {
   access_token: string;
   access_exp: number;
+  /**
+   * 新的 raw refresh token(轮换后下发)。HTTP 层应把它写回 HttpOnly cookie,
+   * 并丢弃客户端送来的旧 token(已被本调用 revoked)。
+   */
+  refresh_token: string;
+  /** unix seconds */
+  refresh_exp: number;
+}
+
+export interface RefreshExtraDeps {
+  /** 写新 row 的 IP / UA(audit 追溯)。可空 — 测试用。 */
+  remoteIp?: string;
+  userAgent?: string;
+  /** 测试可注入新 refresh TTL。 */
+  refreshTtlSeconds?: number;
+  /**
+   * 盗用检测时的回调。HTTP 层可以挂日志 / metrics / 通知用户的钩子。
+   * 不抛错;同步运行,不要做重 I/O。
+   */
+  onTheftDetected?: (ev: {
+    user_id: string;
+    family_id: string;
+    revoked_count: number;
+    remoteIp?: string;
+    userAgent?: string;
+  }) => void;
 }
 
 /**
- * 用客户端的 refresh raw token 换一个新 access。
+ * 用客户端的 refresh raw token 换 access + 轮换出新的 refresh。
  *
- * 不轮换 refresh(MVP):同一 refresh 可重复换 access,直到过期或 logout。
- * 若未来要做 refresh rotation,改成本事务内 UPDATE 旧 row revoked_at + INSERT 新 row。
+ * 行为(2026-04-21 LOW 重做):
+ *   1. tx 开启,SELECT ... FOR UPDATE 锁定该 token_hash
+ *   2. 命中 revoked_at IS NOT NULL 但 expires_at > NOW() → 盗用!
+ *      → UPDATE 整个 family 的存活行 revoked_at=NOW(),reason='theft'
+ *      → 抛 INVALID_REFRESH(对外不区分原因)
+ *   3. 命中正常未撤销未过期行 → 校 user.status='active'
+ *   4. issueRefresh 生成新 raw + hash
+ *   5. INSERT 新 refresh_tokens 行(family_id 沿用,revoked_at=NULL),
+ *      捕获 RETURNING id
+ *   6. UPDATE 旧行 revoked_at=NOW(), revoked_reason='rotated',
+ *      rotated_to_id = 新行.id
+ *   7. COMMIT,signAccess,返回新 access + 新 refresh
+ *
+ * 错误语义:不区分"过期/已撤销/不存在/盗用",对外永远 INVALID_REFRESH。
  */
-export async function refresh(rawRefresh: string, deps: RefreshDeps): Promise<RefreshResult> {
+export async function refresh(
+  rawRefresh: string,
+  deps: RefreshDeps & RefreshExtraDeps = {} as RefreshDeps,
+): Promise<RefreshResult> {
   const parsed = refreshTokenSchema.safeParse(rawRefresh);
   if (!parsed.success) {
     throw new RefreshError("VALIDATION", "invalid refresh token format");
@@ -280,34 +335,139 @@ export async function refresh(rawRefresh: string, deps: RefreshDeps): Promise<Re
 
   const ts = nowSec(deps);
   const nowIso = new Date(ts * 1000).toISOString();
+  const refreshTtl = deps.refreshTtlSeconds ?? REFRESH_TOKEN_TTL_SECONDS;
 
-  const row = await query<{
-    user_id: string;
-    role: "user" | "admin";
-    status: string;
-  }>(
-    `SELECT rt.user_id::text AS user_id, u.role, u.status
-       FROM refresh_tokens rt
-       JOIN users u ON u.id = rt.user_id
-      WHERE rt.token_hash = $1
-        AND rt.revoked_at IS NULL
-        AND rt.expires_at > $2::timestamptz`,
-    [tokenHash, nowIso],
-  );
-  if (row.rows.length === 0) {
-    throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
-  }
-  if (row.rows[0].status !== "active") {
+  // 全流程在 tx 中:lock 旧 row → (theft 分支?) → INSERT 新 → UPDATE 旧
+  const result = await tx(async (client) => {
+    // FOR UPDATE 防并发同 token 双 rotate(经典竞态:两个 tab 同时 refresh)
+    const lookupRes = await client.query<{
+      id: string;
+      user_id: string;
+      family_id: string;
+      role: "user" | "admin";
+      status: string;
+      revoked_at: string | null;
+      revoked_reason: string | null;
+      expired: boolean;
+    }>(
+      `SELECT rt.id::text AS id,
+              rt.user_id::text AS user_id,
+              rt.family_id::text AS family_id,
+              u.role, u.status,
+              rt.revoked_at::text AS revoked_at,
+              rt.revoked_reason,
+              (rt.expires_at <= $2::timestamptz) AS expired
+         FROM refresh_tokens rt
+         JOIN users u ON u.id = rt.user_id
+        WHERE rt.token_hash = $1
+        FOR UPDATE OF rt`,
+      [tokenHash, nowIso],
+    );
+
+    if (lookupRes.rows.length === 0) {
+      throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
+    }
+    const row = lookupRes.rows[0];
+
+    // 盗用:revoked='rotated' 但还没过期 → 全 family revoke。
+    // logout/password_reset/admin/theft 等显式撤销 reason 不触发 theft 链
+    // (已经是用户/管理员主动登出,后续 reuse 视作普通失效),只 'rotated'
+    // 才是"正主已经接到新 token,这张老的不该再回头被用"的强信号。
+    if (
+      row.revoked_at !== null &&
+      !row.expired &&
+      row.revoked_reason === "rotated"
+    ) {
+      const massRevoke = await client.query<{ id: string }>(
+        `UPDATE refresh_tokens
+            SET revoked_at = NOW(), revoked_reason = 'theft'
+          WHERE family_id = $1::uuid
+            AND revoked_at IS NULL
+        RETURNING id::text AS id`,
+        [row.family_id],
+      );
+      // 在事务外触发 onTheftDetected,避免回调误抛影响 tx;但回调
+      // 拿 family_id + revoked_count 的快照足以审计。
+      return {
+        kind: "theft" as const,
+        family_id: row.family_id,
+        user_id: row.user_id,
+        revoked_count: massRevoke.rowCount ?? 0,
+      };
+    }
+
+    // 已过期 / 已 revoked 且也过期了 → 普通无效(不当作盗用,因为 token
+    // 是不是被偷已经无所谓,反正失效)
+    if (row.expired || row.revoked_at !== null) {
+      throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
+    }
+
+    if (row.status !== "active") {
+      throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
+    }
+
+    // 正常 rotation 路径
+    const newRefresh = issueRefresh({ now: ts, ttlSeconds: refreshTtl });
+    const ins = await client.query<{ id: string }>(
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at,
+                                  family_id, revoked_at, revoked_reason)
+       VALUES ($1, $2, $3, $4, to_timestamp($5), $6::uuid, NULL, NULL)
+       RETURNING id::text AS id`,
+      [
+        row.user_id,
+        newRefresh.hash,
+        deps.userAgent ?? null,
+        deps.remoteIp ?? null,
+        newRefresh.expires_at,
+        row.family_id,
+      ],
+    );
+    const newId = ins.rows[0].id;
+
+    await client.query(
+      `UPDATE refresh_tokens
+          SET revoked_at = NOW(),
+              revoked_reason = 'rotated',
+              rotated_to_id = $1::bigint
+        WHERE id = $2::bigint`,
+      [newId, row.id],
+    );
+
+    return {
+      kind: "rotated" as const,
+      user_id: row.user_id,
+      role: row.role,
+      newRefresh,
+    };
+  });
+
+  if (result.kind === "theft") {
+    try {
+      deps.onTheftDetected?.({
+        user_id: result.user_id,
+        family_id: result.family_id,
+        revoked_count: result.revoked_count,
+        remoteIp: deps.remoteIp,
+        userAgent: deps.userAgent,
+      });
+    } catch {
+      // 回调失败不影响响应语义
+    }
     throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
   }
 
   const access = await signAccess(
-    { sub: row.rows[0].user_id, role: row.rows[0].role },
+    { sub: result.user_id, role: result.role },
     deps.jwtSecret,
     { now: ts, ttlSeconds: deps.accessTtlSeconds },
   );
 
-  return { access_token: access.token, access_exp: access.exp };
+  return {
+    access_token: access.token,
+    access_exp: access.exp,
+    refresh_token: result.newRefresh.token,
+    refresh_exp: result.newRefresh.expires_at,
+  };
 }
 
 // ─── logout ───────────────────────────────────────────────────────────
@@ -318,10 +478,14 @@ export interface LogoutResult {
 }
 
 /**
- * Logout:吊销给定 refresh token。
+ * Logout:吊销给定 refresh token 及其同 family 所有未撤销行。
  *
  * 幂等:已 revoked / 已过期 / 不存在 一律返回 revoked=false(不报错)。
  * 这是为了让客户端"清 cookie 再 logout"也能成功。
+ *
+ * 2026-04-21 LOW:logout 必须 revoke 整个 family。理由是用户主动登出
+ * 表达"这一刻起所有当前会话都该失效";如果只 revoke 一张,其他 tab
+ * 仍能 refresh 很久。reason='logout' 区分于 'rotated'/'theft'。
  */
 export async function logout(rawRefresh: string): Promise<LogoutResult> {
   const parsed = refreshTokenSchema.safeParse(rawRefresh);
@@ -335,10 +499,13 @@ export async function logout(rawRefresh: string): Promise<LogoutResult> {
     return { revoked: false };
   }
 
+  // 一条 SQL 完成:子查询拿到 family_id,UPDATE 所有同 family 未撤销行
   const result = await query(
     `UPDATE refresh_tokens
-        SET revoked_at = NOW()
-      WHERE token_hash = $1
+        SET revoked_at = NOW(), revoked_reason = 'logout'
+      WHERE family_id = (
+              SELECT family_id FROM refresh_tokens WHERE token_hash = $1
+            )
         AND revoked_at IS NULL`,
     [tokenHash],
   );

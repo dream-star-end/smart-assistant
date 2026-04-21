@@ -314,24 +314,40 @@ export async function handleRefresh(
     throw new HttpError(400, "VALIDATION", "refresh_token is required");
   }
   try {
-    const r = await refresh(rawRefresh, { jwtSecret: deps.jwtSecret });
-    // 迁移期把通过 body 提交的 refresh 自动"升级"到 cookie:旧前端发完
-    // 这一次 body 后,后续 cookie 就由浏览器自动带,逐步把 localStorage
-    // 里的 token 淘汰。已在 cookie 里的不重写(Max-Age 仍按原 cookie 走)。
-    if (!fromCookie) {
-      // refresh 不轮换 token(MVP),所以这里 cookie 里写的就是同一个 raw。
-      // TTL 按 REFRESH_TOKEN_TTL_SECONDS 给 30 天上限,真正过期由服务器
-      // refresh_tokens.expires_at 控制 — cookie TTL 长一点也无害。
-      setRefreshCookie(res, rawRefresh, 30 * 24 * 60 * 60, { secure: deps.refreshCookieSecure });
-    }
+    // LOW(2026-04-21):refresh 现在每次轮换,返回新 raw token + exp。
+    // 不论来源是 cookie 还是 body,都把新 raw 写回 HttpOnly cookie 并丢弃
+    // 客户端送来的旧 token(已被 refresh() 内部 revoked)。
+    const r = await refresh(rawRefresh, {
+      jwtSecret: deps.jwtSecret,
+      remoteIp: ctxIp(req),
+      userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : undefined,
+    });
+    // cookie Max-Age = 新 token 真实剩余 TTL;到期时间由 server 主导
+    const cookieTtl = Math.max(1, r.refresh_exp - Math.floor(Date.now() / 1000));
+    setRefreshCookie(res, r.refresh_token, cookieTtl, { secure: deps.refreshCookieSecure });
     sendJson(res, 200, { access_token: r.access_token, access_exp: r.access_exp });
   } catch (err) {
     if (err instanceof RefreshError) {
       const status = err.code === "VALIDATION" ? 400 : 401;
+      // LOW(2026-04-21):盗用与 普通过期/不存在 共享 INVALID_REFRESH 错误码,
+      // 不给攻击者枚举区别。同时清浏览器 cookie,避免下一次还带着失效 token。
+      if (err.code === "INVALID_REFRESH") {
+        clearRefreshCookie(res, { secure: deps.refreshCookieSecure });
+      }
       throw new HttpError(status, err.code, err.message);
     }
     throw err;
   }
+}
+
+/** 提取请求方 IP — Caddy 已经在前面处理 X-Forwarded-For,这里读 remoteAddress 即可。 */
+function ctxIp(req: IncomingMessage): string | undefined {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.length > 0) {
+    return xf.split(",")[0].trim();
+  }
+  const ra = req.socket?.remoteAddress;
+  return typeof ra === "string" ? ra : undefined;
 }
 
 // ─── POST /api/auth/logout ──────────────────────────────────────────

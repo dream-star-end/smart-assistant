@@ -44,6 +44,7 @@ const COMMERCIAL_TABLES = [
   "claude_accounts",
   "refresh_tokens",
   "email_verifications",
+  "system_settings",
   "users",
   "schema_migrations",
 ];
@@ -371,6 +372,178 @@ describe("auth.refresh (integ)", () => {
     assert.ok(
       Math.abs(lr.refresh_exp - (expectedNow + REFRESH_TOKEN_TTL_SECONDS)) < 5,
       `expected refresh_exp ≈ now+${REFRESH_TOKEN_TTL_SECONDS}, got delta ${lr.refresh_exp - expectedNow}`,
+    );
+  });
+});
+
+// ─── 2026-04-21 LOW:refresh rotation + family + theft detection ─────
+//
+// Migration 0019 上线后,refresh 每次必须 rotate(旧 row revoked + 新 row
+// INSERT,family_id 沿用)。盗用检测:revoked_reason='rotated' 但未到期
+// 的 token 被 reuse → 整个 family 全 revoke,reason='theft'。logout 也
+// revoke 整个 family,reason='logout'(避免某个 tab 留在飞中)。
+describe("auth.refresh rotation (integ, LOW)", () => {
+  test("refresh rotates: returns new refresh_token != old, old hash revoked='rotated'", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("nina@example.com", "nina good password");
+    const lr = await login(
+      { email: "nina@example.com", password: "nina good password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+    const oldHash = refreshTokenHash(lr.refresh_token);
+
+    const rr = await refresh(lr.refresh_token, { jwtSecret: JWT_SECRET });
+    assert.ok(rr.refresh_token, "refresh must return a new refresh_token");
+    assert.notEqual(rr.refresh_token, lr.refresh_token, "rotation must change the token");
+    assert.ok(rr.refresh_exp > Math.floor(Date.now() / 1000), "new refresh_exp in future");
+
+    const oldRow = await query<{ revoked_at: string | null; revoked_reason: string | null; rotated_to_id: string | null }>(
+      "SELECT revoked_at::text AS revoked_at, revoked_reason, rotated_to_id::text AS rotated_to_id FROM refresh_tokens WHERE token_hash = $1",
+      [oldHash],
+    );
+    assert.notEqual(oldRow.rows[0].revoked_at, null, "old row must be revoked");
+    assert.equal(oldRow.rows[0].revoked_reason, "rotated");
+    assert.notEqual(oldRow.rows[0].rotated_to_id, null, "old row should chain to new row");
+
+    const newRow = await query<{ id: string; family_id: string; revoked_at: string | null }>(
+      "SELECT id::text AS id, family_id::text AS family_id, revoked_at::text AS revoked_at FROM refresh_tokens WHERE token_hash = $1",
+      [refreshTokenHash(rr.refresh_token)],
+    );
+    assert.equal(newRow.rows.length, 1, "new row must exist");
+    assert.equal(newRow.rows[0].revoked_at, null, "new row must be active");
+    assert.equal(oldRow.rows[0].rotated_to_id, newRow.rows[0].id, "rotated_to_id must point at new row");
+  });
+
+  test("family_id is preserved across multiple rotations", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("oliver@example.com", "oliver good password");
+    const lr = await login(
+      { email: "oliver@example.com", password: "oliver good password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+    const familyOriginal = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash = $1",
+      [refreshTokenHash(lr.refresh_token)],
+    );
+    const family = familyOriginal.rows[0].family_id;
+
+    const r1 = await refresh(lr.refresh_token, { jwtSecret: JWT_SECRET });
+    const r2 = await refresh(r1.refresh_token, { jwtSecret: JWT_SECRET });
+    const r3 = await refresh(r2.refresh_token, { jwtSecret: JWT_SECRET });
+
+    for (const t of [r1.refresh_token, r2.refresh_token, r3.refresh_token]) {
+      const f = await query<{ family_id: string }>(
+        "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash = $1",
+        [refreshTokenHash(t)],
+      );
+      assert.equal(f.rows[0].family_id, family, "family_id must be preserved across rotations");
+    }
+  });
+
+  test("reuse old (rotated) refresh → INVALID_REFRESH + WHOLE family revoked='theft'", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("paul@example.com", "paul good password");
+    const lr = await login(
+      { email: "paul@example.com", password: "paul good password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+    const oldRaw = lr.refresh_token;
+    const r1 = await refresh(oldRaw, { jwtSecret: JWT_SECRET });
+    // Now r1.refresh_token is the live one, oldRaw is revoked='rotated'.
+    // Attacker re-uses oldRaw → must mass-revoke entire family.
+    let theftFired = false;
+    let revokedCountSeen = 0;
+    await assert.rejects(
+      refresh(oldRaw, {
+        jwtSecret: JWT_SECRET,
+        onTheftDetected: (ev) => {
+          theftFired = true;
+          revokedCountSeen = ev.revoked_count;
+        },
+      }),
+      (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+    );
+    assert.equal(theftFired, true, "onTheftDetected must fire");
+    assert.ok(revokedCountSeen >= 1, "theft must mass-revoke ≥1 live row");
+
+    // r1 (the legitimate live token) is now also dead — attacker AND victim
+    // both kicked off; victim must re-login.
+    await assert.rejects(
+      refresh(r1.refresh_token, { jwtSecret: JWT_SECRET }),
+      (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+    );
+
+    const rows = await query<{ revoked_reason: string | null }>(
+      `SELECT revoked_reason FROM refresh_tokens
+        WHERE family_id = (SELECT family_id FROM refresh_tokens WHERE token_hash = $1)
+        ORDER BY id`,
+      [refreshTokenHash(oldRaw)],
+    );
+    // At least the formerly-live r1 row must show theft.
+    const theftRows = rows.rows.filter((r) => r.revoked_reason === "theft");
+    assert.ok(theftRows.length >= 1, "at least one row must be marked theft");
+  });
+
+  test("expired+rotated reuse does NOT trigger theft (token natural-dead, no signal)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("quinn@example.com", "quinn good password");
+    const lr = await login(
+      { email: "quinn@example.com", password: "quinn good password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+    const oldRaw = lr.refresh_token;
+    await refresh(oldRaw, { jwtSecret: JWT_SECRET });
+    // 强制把 oldRaw 行 expires_at 推过去 → 同时 revoked + expired
+    await query(
+      "UPDATE refresh_tokens SET expires_at = NOW() - INTERVAL '1 minute' WHERE token_hash = $1",
+      [refreshTokenHash(oldRaw)],
+    );
+    let theftFired = false;
+    await assert.rejects(
+      refresh(oldRaw, {
+        jwtSecret: JWT_SECRET,
+        onTheftDetected: () => { theftFired = true; },
+      }),
+      (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+    );
+    assert.equal(theftFired, false, "expired token reuse is not a theft signal");
+  });
+
+  test("logout-revoked reuse does NOT fire theft (logout is intentional, not stolen)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("rita@example.com", "rita good password");
+    const lr = await login(
+      { email: "rita@example.com", password: "rita good password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+    await logout(lr.refresh_token);
+    let theftFired = false;
+    await assert.rejects(
+      refresh(lr.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        onTheftDetected: () => { theftFired = true; },
+      }),
+      (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+    );
+    assert.equal(theftFired, false, "logout-revoked reuse must NOT classify as theft");
+  });
+
+  test("logout revokes ENTIRE family (all live rotations across tabs)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("sam@example.com", "sam good password");
+    const lr = await login(
+      { email: "sam@example.com", password: "sam good password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+    const r1 = await refresh(lr.refresh_token, { jwtSecret: JWT_SECRET });
+    const r2 = await refresh(r1.refresh_token, { jwtSecret: JWT_SECRET });
+    // r2 是当前 live 的;logout 用任意 family member 都要把整族干掉
+    const out = await logout(r1.refresh_token);
+    assert.equal(out.revoked, true);
+    // r2 现在也应失效
+    await assert.rejects(
+      refresh(r2.refresh_token, { jwtSecret: JWT_SECRET }),
+      (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
     );
   });
 });

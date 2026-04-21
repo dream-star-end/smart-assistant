@@ -403,8 +403,11 @@ export async function confirmPasswordReset(
       "UPDATE email_verifications SET used_at = $1::timestamptz WHERE id = $2",
       [nowIso, evId],
     );
+    // 2026-04-21 LOW(migration 0019):带上 revoked_reason 以便审计区分,
+    // 不再让 refresh-rotation 的 theft 检测误把 password_reset 撤销的 token
+    // reuse 当成攻击信号(theft 仅匹配 reason='rotated')。
     const revoked = await client.query(
-      `UPDATE refresh_tokens SET revoked_at = $1::timestamptz
+      `UPDATE refresh_tokens SET revoked_at = $1::timestamptz, revoked_reason = 'password_reset'
         WHERE user_id = $2 AND revoked_at IS NULL`,
       [nowIso, userId],
     );
