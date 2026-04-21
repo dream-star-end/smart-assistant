@@ -3214,6 +3214,12 @@ export class Gateway {
               agent,
               channel: 'webchat',
               peerId,
+              // Pre-warm path still knows the authenticated userId from the
+              // reconnected WS (hello). Pass it through so any turn that
+              // fires before a fresh inbound.message can still persist via
+              // the direct-userId path instead of short-circuiting on
+              // getClientSession(peerId).
+              userId: helloUserId,
             })
             this.lastActiveChannel.set(aid, {
               channel: 'webchat',
@@ -3436,6 +3442,12 @@ export class Gateway {
       agent,
       channel: frame.channel,
       peerId: frame.peer.id,
+      // Phase 0.4 P1-3: carry the authenticated userId onto the session so
+      // the durable-append path can persist server-authored text even
+      // before the client's debounced PUT lands (first-turn race). Without
+      // this the handleResult hook calls `getClientSession(peerId)`, gets
+      // null, and silently drops the reply.
+      userId: activeUserId,
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
       // (在那里和 turn 入队原子串行,避免并发 submit 之间互相覆盖)。

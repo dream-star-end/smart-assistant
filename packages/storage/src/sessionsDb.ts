@@ -565,34 +565,67 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   }
   merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
 
-  // Phantom-assistant dedupe (rule 3): walk the sorted merged[] and drop any
-  // non-server-authored assistant message that is adjacent to a server-
-  // authored assistant message. Adjacency in the ts-sorted array means no
-  // user message separates them — they're both for the same turn, and the
-  // client copy is the partially-streamed phantom.
+  // Phantom-assistant dedupe (rule 3): partition merged[] into turns on
+  // user/system messages (which act as turn boundaries — the model never
+  // produces those client-side on its own). Within each partition, if any
+  // server-authored assistant exists, drop ALL non-server-authored
+  // assistants in that partition (they are phantoms of the same turn).
   //
-  // Tolerates both adjacency orders:
-  //   - [client-phantom, server-authoritative] — typical: client stamped ts
-  //     during streaming (earlier), server stamped ts at turn completion.
-  //   - [server-authoritative, client-phantom] — possible if client clock
-  //     is ahead of server clock (time zone drift, device time off), or the
-  //     server's `Date.now()` at handleResult was earlier than whatever
-  //     wallclock the client used for its partial message.
-  // Never drops a server-authored message; never merges two server-authored
-  // messages (they always have different ids, hence different turns).
+  // This is broader than a simple adjacency check because tool-use turns
+  // end up with MULTIPLE client-side assistant segments separated by
+  // tool_use / tool_result messages (see websocket.js where a tool_use
+  // block clears `_streamingAssistant` so the next text creates a new
+  // bubble). Server writes one aggregated assistant per turn, so pair-wise
+  // adjacency would leave earlier client segments orphaned.
+  //
+  // Never drops a server-authored message; never drops a client message
+  // that is not an assistant (tool, tool_result, user, thinking, etc. are
+  // always preserved). Also tolerates both ts-sort orders of the server
+  // row relative to client segments (server clock earlier or later).
   const deduped: T[] = []
   const isAssistant = (m: T) => (m as { role?: string }).role === 'assistant'
+  const isTurnBoundary = (m: T) => {
+    const role = (m as { role?: string }).role
+    return role === 'user' || role === 'system'
+  }
+  // First pass: compute per-index turn group id, and whether that group has
+  // any server-authored assistant. We need this because the decision to
+  // drop a phantom depends on the ENTIRE partition, not just its neighbours.
+  const turnGroup: number[] = new Array(merged.length)
+  const groupHasServerAsst: boolean[] = []
+  let groupId = 0
+  let currentGroupHasServer = false
+  for (let i = 0; i < merged.length; i++) {
+    const cur = merged[i]
+    if (cur && isTurnBoundary(cur)) {
+      // Close previous group, open a new one. The boundary itself belongs
+      // to the starting group of what follows (a user message opens a new
+      // turn; we tag it with the new groupId so any dedupe scan after it
+      // lands in the right bucket).
+      groupHasServerAsst.push(currentGroupHasServer)
+      groupId++
+      currentGroupHasServer = false
+    }
+    turnGroup[i] = groupId
+    if (cur && isAssistant(cur) && cur._source === 'server') {
+      currentGroupHasServer = true
+    }
+  }
+  groupHasServerAsst.push(currentGroupHasServer)
+
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (!cur) { deduped.push(cur); continue }
-    const prev = i > 0 ? merged[i - 1] : undefined
-    const next = merged[i + 1]
-    // Drop cur if: cur is a non-server-authored assistant message AND either
-    // neighbour is a server-authored assistant for the same turn (adjacency).
-    const curIsPhantom = isAssistant(cur) && cur._source !== 'server'
-    const prevIsServerAsst = prev && isAssistant(prev) && prev._source === 'server'
-    const nextIsServerAsst = next && isAssistant(next) && next._source === 'server'
-    if (curIsPhantom && (prevIsServerAsst || nextIsServerAsst)) {
+    // Keep server-authored messages, non-assistant messages, and assistants
+    // in a partition that has no server-authored counterpart.
+    if (!isAssistant(cur) || cur._source === 'server') {
+      deduped.push(cur)
+      continue
+    }
+    const g = turnGroup[i]
+    if (groupHasServerAsst[g]) {
+      // This client-assistant lives in a turn that the server re-authored.
+      // Drop as phantom.
       continue
     }
     deduped.push(cur)

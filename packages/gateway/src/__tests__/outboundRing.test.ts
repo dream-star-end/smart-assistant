@@ -127,6 +127,24 @@ describe('OutboundRingBuffer.peekReplay', () => {
     assert.deepEqual(rep.sent.map((f) => f.seq), [3, 4, 5])
   })
 
+  it('P1-2 (tightened): fromSeq=0 + currentLast>0 + empty ring reports no_buffer', () => {
+    // Scenario: client has cursor 0 (fresh / state-reset), server has
+    // assigned frames (lastFrameSeq > 0) but ring pruned empty. Returning
+    // ok/[] would silently lie — the client would think it's caught up
+    // when in reality it missed everything. Force a no_buffer escalation
+    // so the client REST-syncs authoritative state.
+    const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
+    for (let i = 1; i <= 3; i++) {
+      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+    }
+    // Prune-on-read at now=2000 evicts everything (cutoff = 2000-100 = 1900).
+    const rep = r.peekReplay('s1', 0, 2000)
+    assert.equal(rep.ok, false)
+    if (rep.ok) return
+    assert.equal(rep.reason, 'no_buffer', 'must flag no_buffer even though fromSeq=0')
+    assert.equal(rep.to, 3, 'lastFrameSeq preserved')
+  })
+
   it('P1-2: idle session with stale frames prunes on peekReplay read', () => {
     // Short maxAge so the scenario is easy to construct without Date.now fiddling.
     const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })

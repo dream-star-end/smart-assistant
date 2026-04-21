@@ -236,6 +236,53 @@ describe('mergePreservingServerAuthored', () => {
     )
   })
 
+  it('P0-3: tool-use turn — drops ALL client assistant segments, keeps tool/tool_result', () => {
+    // Tool-use turn: the frontend splits assistant output at each tool_use
+    // boundary (websocket.js sets `_streamingAssistant = null` on tool_use /
+    // tool_result blocks). Server writes ONE aggregated srv-* assistant for
+    // the whole turn. Pair-wise adjacency dedupe would leave the earlier
+    // client segments orphaned; partition-wise dedupe drops them all.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srv('srv-1', 400, 'pre-tool text\nTOOL_CALL\npost-tool text'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      { id: 'm-asst-1', ts: 150, role: 'assistant', text: 'pre-tool text' } as Msg,
+      { id: 'm-tool-1', ts: 200, role: 'tool', toolName: 'Read' } as Msg,
+      { id: 'm-result-1', ts: 250, role: 'tool_result', text: 'file contents' } as Msg,
+      { id: 'm-asst-2', ts: 350, role: 'assistant', text: 'post-tool text' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'm-tool-1', 'm-result-1', 'srv-1'],
+      'both client assistant segments dropped, tool/result preserved, srv-1 kept',
+    )
+  })
+
+  it('P0-3: multi-turn history with server-authoritative first turn only', () => {
+    // Turn 1: recovered via server (srv-1), client phantom m-asst-1.
+    // Turn 2: client-only (server hadn't persisted yet; e.g. still live).
+    const server: Msg[] = [
+      cli('u-1', 100, 'user'),
+      srv('srv-1', 200, 'turn1 server'),
+      cli('u-2', 300, 'user'),
+    ]
+    const client: Msg[] = [
+      cli('u-1', 100, 'user'),
+      { id: 'm-asst-1', ts: 150, role: 'assistant', text: 'turn1 client phantom' } as Msg,
+      cli('u-2', 300, 'user'),
+      { id: 'm-asst-2', ts: 400, role: 'assistant', text: 'turn2 in-progress' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-1', 'srv-1', 'u-2', 'm-asst-2'],
+      'turn1 phantom dropped, turn2 client assistant preserved (no server rival)',
+    )
+  })
+
   it('P0-3: does not touch adjacent assistants that are both non-server (client-only history)', () => {
     // Pure client history with no server-authored entries hits the fast path
     // (returns clientMsgs verbatim). Even if two assistant entries are

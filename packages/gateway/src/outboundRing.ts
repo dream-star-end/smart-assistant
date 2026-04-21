@@ -115,9 +115,20 @@ export class OutboundRingBuffer {
       return { ok: true, sent: [], to: currentLast }
     }
     if (!ring || ring.frames.length === 0) {
-      return fromSeq > 0
-        ? { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
-        : { ok: true, sent: [], to: currentLast }
+      // Distinguish three cases:
+      //   - fromSeq>0:               client had a cursor we can no longer
+      //                              satisfy → no_buffer, client REST-syncs.
+      //   - fromSeq=0 + currentLast=0: brand-new session, genuine caught up.
+      //   - fromSeq=0 + currentLast>0: client has no cursor BUT server has
+      //                              already emitted frames. Returning ok/[]
+      //                              would silently lie about completeness.
+      //                              Flag no_buffer so the client pulls
+      //                              authoritative state from REST instead
+      //                              of trusting an empty replay.
+      if (fromSeq > 0 || currentLast > 0) {
+        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
+      }
+      return { ok: true, sent: [], to: currentLast }
     }
     const earliest = ring.frames[0].seq
     if (earliest > fromSeq + 1) {

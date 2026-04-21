@@ -1551,8 +1551,15 @@ function handleResumeFailed(frame) {
       sess._liveStreamBroken = true
     }
   }
+  // `freshAfterInFlight: true` guards against a race where a sync was already
+  // running when we set `_liveStreamBroken` — that sync may have decided to
+  // skip the affected session BEFORE we flagged it. Without the tail sync,
+  // the flag would stay set until the next throttled foreground event, and
+  // the user would see stale content. The tail sync re-observes the flag on
+  // its second pass and pulls the authoritative REST state.
   maybeSyncNow({
     force: true,
+    freshAfterInFlight: true,
     onResult: (result) => {
       if (!result) return
       // Successful sync — live stream has been reconciled from REST. Clear
