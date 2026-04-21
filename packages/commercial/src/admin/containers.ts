@@ -108,13 +108,19 @@ const CONTAINER_COLS = `
   c.image,
   c.status,
   c.state,
-  -- v2 行用 status,v3 行用 state,UI 拿一个字段就够
+  -- v2 行用 status,v3 行用 state,UI 拿一个字段就够。
+  -- R2 finding 加固:row_kind 判据加 subscription_id IS NULL 兜底。
+  -- 0017 把 docker_name 改 nullable 后,单看 docker_name 空判 v3 不稳:
+  -- 万一 v2 legacy row 出现 docker_name=NULL,会被错判 v3 → admin 走错
+  -- 操作路径(v3 dispatcher 调用 stopAndRemoveV3Container 在 v2 行上)。
+  -- v3 INSERT 不指定 subscription_id (NULL),v2 INSERT 必填 subscription_id;
+  -- subscription_id IS NULL ⟹ v3 (强 invariant,迁移 0001+0012 保证)。
   CASE
-    WHEN COALESCE(NULLIF(c.docker_name, ''), '') = '' THEN c.state
+    WHEN c.subscription_id IS NULL THEN c.state
     ELSE c.status
   END AS lifecycle,
   CASE
-    WHEN COALESCE(NULLIF(c.docker_name, ''), '') = '' THEN 'v3'
+    WHEN c.subscription_id IS NULL THEN 'v3'
     ELSE 'v2'
   END AS row_kind,
   c.last_started_at,
@@ -203,11 +209,13 @@ async function lookupContainer(id: bigint | string): Promise<ContainerLookup | n
   const r = await query<{
     id: string;
     user_id: string;
+    subscription_id: string | null;
     docker_name: string | null;
     container_internal_id: string | null;
   }>(
     `SELECT id::text AS id,
             user_id::text AS user_id,
+            subscription_id::text AS subscription_id,
             docker_name,
             container_internal_id
        FROM agent_containers
@@ -216,13 +224,22 @@ async function lookupContainer(id: bigint | string): Promise<ContainerLookup | n
   );
   if (r.rows.length === 0) return null;
   const row = r.rows[0]!;
-  // v2 行:docker_name 非空。v2 admin 用 user_id 调 supervisor。
-  if (row.docker_name) {
+  // R2 finding 加固:v2/v3 dispatch 判据从"docker_name 是否空"换成
+  // "subscription_id 是否 NULL"。后者是稳的 invariant:v2 INSERT 必填
+  // subscription_id;v3 INSERT 不指定 → NULL。和 admin/containers.ts 的
+  // CONTAINER_COLS row_kind 字段保持一致语义,避免 list 显示一种但 dispatch
+  // 走另一种。
+  if (row.subscription_id !== null) {
+    // v2 行:走 supervisor restart/stop/remove(用 user_id)
     const n = Number(row.user_id);
     if (!Number.isInteger(n) || n <= 0) throw new RangeError("invalid_user_id_in_row");
+    if (!row.docker_name) {
+      // 几乎不可能(v2 INSERT 必填),但兜底:防止 docker.getContainer('') 拉炸
+      throw new RangeError("v2_row_missing_docker_name");
+    }
     return { kind: "v2", userId: n, dockerName: row.docker_name };
   }
-  // v3 行:docker_name=NULL。container_internal_id 由 provisionV3Container UPDATE 填,
+  // v3 行:subscription_id IS NULL。container_internal_id 由 provisionV3Container UPDATE 填,
   // 极短窗口可能仍是 NULL(provision 跑 docker create 之间 / failed mid-flight),
   // stopAndRemoveV3Container 兼容 NULL 路径(不调 docker,只 UPDATE state='vanished')。
   const rowIdNum = Number(row.id);
