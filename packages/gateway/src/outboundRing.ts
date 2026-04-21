@@ -114,20 +114,38 @@ export class OutboundRingBuffer {
     if (fromSeq === currentLast) {
       return { ok: true, sent: [], to: currentLast }
     }
+    // P1-3: fromSeq=0 is NOT a valid resume cursor when the server has already
+    // emitted frames (currentLast>0). It means the client has either lost its
+    // cursor (cold tab / state reset / prior resume_failed) or was never party
+    // to the frames in the ring (multi-tab: new tab opened after a turn another
+    // tab processed). Ring-replaying in that state would re-deliver frames
+    // whose assistant deltas the client may already have (restored from IDB,
+    // or persisted by the other tab) — and since text blocks carry no blockId,
+    // the client cannot dedupe them at the block level and silently appends a
+    // duplicate assistant bubble.
+    //
+    // Honest signal: escalate to no_buffer so the client runs force-REST-sync
+    // via handleResumeFailed. The Phase 0.1/0.2 durable tape is authoritative.
+    //
+    // Genuinely fresh sessions (never-run, never-emitted) pass the earlier
+    // `fromSeq === currentLast` branch when both are 0 — so a new session
+    // saying "I've seen nothing" still resolves to ok/[].
+    if (fromSeq === 0 && currentLast > 0) {
+      return { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
+    }
     if (!ring || ring.frames.length === 0) {
-      // Distinguish three cases:
-      //   - fromSeq>0:               client had a cursor we can no longer
-      //                              satisfy → no_buffer, client REST-syncs.
-      //   - fromSeq=0 + currentLast=0: brand-new session, genuine caught up.
-      //   - fromSeq=0 + currentLast>0: client has no cursor BUT server has
-      //                              already emitted frames. Returning ok/[]
-      //                              would silently lie about completeness.
-      //                              Flag no_buffer so the client pulls
-      //                              authoritative state from REST instead
-      //                              of trusting an empty replay.
-      if (fromSeq > 0 || currentLast > 0) {
+      // After the fromSeq=0+currentLast>0 guard above, any no-ring state here
+      // means fromSeq>0: client held a cursor the server can no longer satisfy
+      // (ring pruned by age/bytes/entries, or this gateway instance restarted
+      // and never stored frames for this sessionKey). Escalate to no_buffer so
+      // the client force-REST-syncs.
+      if (fromSeq > 0) {
         return { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
       }
+      // Unreachable in the current flow — `fromSeq === currentLast === 0`
+      // already returned ok/[] above, and fromSeq=0+currentLast>0 returned
+      // no_buffer. Kept as a defensive total-cases guard in case future
+      // edits reorder the branches.
       return { ok: true, sent: [], to: currentLast }
     }
     const earliest = ring.frames[0].seq

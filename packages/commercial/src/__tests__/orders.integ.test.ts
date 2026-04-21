@@ -25,6 +25,7 @@ import {
   getOrderByNo,
   expirePendingOrders,
   PlanNotFoundError,
+  FirstTopupAlreadyUsedError,
   InvalidOrderStateError,
 } from "../payment/orders.js";
 
@@ -38,7 +39,7 @@ const COMMERCIAL_TABLES = [
   "agent_subscriptions", "user_preferences", "request_finalize_journal",
   "orders", "topup_plans", "usage_records",
   "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
-  "email_verifications", "users", "schema_migrations",
+  "email_verifications", "users", "system_settings", "schema_migrations",
 ];
 
 let pgAvailable = false;
@@ -87,22 +88,65 @@ async function makeUser(email: string, credits = 0n): Promise<string> {
 }
 
 describe("plans", () => {
-  test("listPlans 种子 4 档,按 sort_order DESC", async (t) => {
+  test("listPlans 启用 4 档(0022 之后 plan-50/plan-1000 已 disable),按 sort_order DESC", async (t) => {
     if (skipIfNoDb(t)) return;
     const plans = await listPlans();
-    assert.ok(plans.length >= 4, `expected >=4 plans, got ${plans.length}`);
-    // sort_order DESC → 100 先于 70。第一条应是 plan-10(sort=100)
-    assert.equal(plans[0].code, "plan-10");
+    assert.equal(plans.length, 4, `expected 4 enabled plans (10/100/200/500), got ${plans.length}`);
+    // sort_order DESC: plan-10 (100) → plan-100 (95) → plan-200 (90) → plan-500 (75)
+    assert.deepEqual(
+      plans.map((p) => p.code),
+      ["plan-10", "plan-100", "plan-200", "plan-500"],
+    );
     assert.equal(plans[0].amount_cents, 1000n);
     assert.equal(plans[0].credits, 1000n);
+    // plan-100: ¥100 → 10500 积分(赠 5%)
+    assert.equal(plans[1].amount_cents, 10000n);
+    assert.equal(plans[1].credits, 10500n);
+    // plan-200: ¥200 → 22000 积分(赠 10%)
+    assert.equal(plans[2].amount_cents, 20000n);
+    assert.equal(plans[2].credits, 22000n);
+    // plan-500: ¥500 → 57500 积分(赠 15%)
+    assert.equal(plans[3].amount_cents, 50000n);
+    assert.equal(plans[3].credits, 57500n);
   });
 
-  test("getPlanByCode 命中 / 不存在", async (t) => {
+  test("getPlanByCode 命中 / 不存在 / disabled 仍可读", async (t) => {
     if (skipIfNoDb(t)) return;
-    const p = await getPlanByCode("plan-50");
+    const p = await getPlanByCode("plan-100");
     assert.ok(p);
-    assert.equal(p.credits, 5500n);
+    assert.equal(p.credits, 10500n);
+    // plan-50 在 0022 之后 enabled=false,但 getPlanByCode 不过滤 enabled
+    const old = await getPlanByCode("plan-50");
+    assert.ok(old);
+    assert.equal(old.enabled, false);
     assert.equal(await getPlanByCode("nonexistent"), null);
+  });
+
+  test("listPlans({ userId }) 已付费用户看不到 plan-10 首充档", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const newbie = await makeUser("plans-newbie@example.com");
+    const veteran = await makeUser("plans-veteran@example.com");
+
+    // veteran 走完一次完整付款 → 进入"老用户"状态
+    const { order } = await createPendingOrder({ userId: veteran, planCode: "plan-100" });
+    await markOrderPaid({
+      orderNo: order.order_no, providerOrder: "TX_VET", callbackPayload: { status: "OD" },
+    });
+
+    const newPlans = await listPlans({ userId: newbie });
+    assert.ok(newPlans.find((p) => p.code === "plan-10"), "newbie should still see plan-10");
+
+    const vetPlans = await listPlans({ userId: veteran });
+    assert.equal(vetPlans.find((p) => p.code === "plan-10"), undefined,
+      "veteran should NOT see plan-10");
+    // 其它套餐仍然可见
+    assert.ok(vetPlans.find((p) => p.code === "plan-100"));
+    assert.ok(vetPlans.find((p) => p.code === "plan-200"));
+    assert.ok(vetPlans.find((p) => p.code === "plan-500"));
+
+    // 不传 userId(冷访客)→ 全量
+    const anon = await listPlans();
+    assert.ok(anon.find((p) => p.code === "plan-10"));
   });
 });
 
@@ -113,13 +157,13 @@ describe("createPendingOrder", () => {
     const fixedNow = new Date("2026-04-17T12:00:00Z");
     const { order, plan } = await createPendingOrder({
       userId: uid,
-      planCode: "plan-50",
+      planCode: "plan-100",
       nowFn: () => fixedNow,
     });
     assert.equal(order.status, "pending");
-    assert.equal(order.amount_cents, 5000n);
-    assert.equal(order.credits, 5500n);
-    assert.equal(plan.code, "plan-50");
+    assert.equal(order.amount_cents, 10000n);
+    assert.equal(order.credits, 10500n);
+    assert.equal(plan.code, "plan-100");
     // 15min default
     const diff = order.expires_at.getTime() - fixedNow.getTime();
     assert.equal(diff, 15 * 60 * 1000);
@@ -128,16 +172,45 @@ describe("createPendingOrder", () => {
   test("PLAN 未启用 → PlanNotFoundError", async (t) => {
     if (skipIfNoDb(t)) return;
     const uid = await makeUser("disabled-plan@example.com");
-    // 把 plan-10 临时 disable
-    await query("UPDATE topup_plans SET enabled = FALSE WHERE code = 'plan-10'");
-    try {
-      await assert.rejects(
-        createPendingOrder({ userId: uid, planCode: "plan-10" }),
-        (err: unknown) => err instanceof PlanNotFoundError,
-      );
-    } finally {
-      await query("UPDATE topup_plans SET enabled = TRUE WHERE code = 'plan-10'");
-    }
+    // plan-50 在 0022 之后已 enabled=false,直接拿来当 disabled fixture
+    await assert.rejects(
+      createPendingOrder({ userId: uid, planCode: "plan-50" }),
+      (err: unknown) => err instanceof PlanNotFoundError,
+    );
+  });
+
+  test("plan-10 首充:新用户 OK", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const uid = await makeUser("first-topup-newbie@example.com");
+    const { order, plan } = await createPendingOrder({ userId: uid, planCode: "plan-10" });
+    assert.equal(order.status, "pending");
+    assert.equal(order.amount_cents, 1000n);
+    assert.equal(plan.code, "plan-10");
+  });
+
+  test("plan-10 首充:已付费用户 → FirstTopupAlreadyUsedError", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const uid = await makeUser("first-topup-veteran@example.com");
+    // 先让用户成为"老用户":付一次 plan-100
+    const { order } = await createPendingOrder({ userId: uid, planCode: "plan-100" });
+    await markOrderPaid({
+      orderNo: order.order_no, providerOrder: "TX_VET2", callbackPayload: { status: "OD" },
+    });
+    // 现在再买 plan-10 应该被拒
+    await assert.rejects(
+      createPendingOrder({ userId: uid, planCode: "plan-10" }),
+      (err: unknown) => err instanceof FirstTopupAlreadyUsedError,
+    );
+  });
+
+  test("plan-10 首充:仅 pending 订单不算老用户,仍可下首充单", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const uid = await makeUser("first-topup-pending@example.com");
+    // pending plan-100 不应触发首充限制(只看 paid)
+    await createPendingOrder({ userId: uid, planCode: "plan-100" });
+    // 仍可下 plan-10
+    const { order } = await createPendingOrder({ userId: uid, planCode: "plan-10" });
+    assert.equal(order.amount_cents, 1000n);
   });
 });
 

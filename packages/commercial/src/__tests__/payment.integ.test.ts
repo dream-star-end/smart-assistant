@@ -176,14 +176,34 @@ async function postForm(path: string, form: Record<string, string>) {
 }
 
 describe("GET /api/payment/plans", () => {
-  test("公开访问,返回所有 enabled 档", async (t) => {
+  test("公开访问(未登录):返回所有 enabled 档,含 plan-10 首充", async (t) => {
     if (skipIfMissing(t)) return;
     const resp = await fetch(`${baseUrl}/api/payment/plans`);
     assert.equal(resp.status, 200);
     const json = await resp.json() as { ok: boolean; data: { plans: Array<{ code: string }> } };
     assert.equal(json.ok, true);
     const codes = json.data.plans.map((p) => p.code).sort();
-    assert.deepEqual(codes, ["plan-10", "plan-1000", "plan-200", "plan-50"]);
+    // 0022 之后:enabled = plan-10 / plan-100 / plan-200 / plan-500
+    assert.deepEqual(codes, ["plan-10", "plan-100", "plan-200", "plan-500"]);
+  });
+
+  test("已登录老用户:plan-10 被过滤掉(已用过首充)", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid, token } = await createUserWithToken("plans-veteran-http@example.com");
+    // 让用户成为"老用户":创建 + 标记 paid 一笔 plan-100 订单
+    const { order } = await (await import("../payment/orders.js")).createPendingOrder({
+      userId: uid, planCode: "plan-100",
+    });
+    await (await import("../payment/orders.js")).markOrderPaid({
+      orderNo: order.order_no, providerOrder: "TX_VET_HTTP", callbackPayload: { status: "OD" },
+    });
+    const resp = await fetch(`${baseUrl}/api/payment/plans`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(resp.status, 200);
+    const json = await resp.json() as { ok: boolean; data: { plans: Array<{ code: string }> } };
+    const codes = json.data.plans.map((p) => p.code).sort();
+    assert.deepEqual(codes, ["plan-100", "plan-200", "plan-500"]);
   });
 });
 
@@ -233,6 +253,23 @@ describe("POST /api/payment/hupi/create", () => {
     assert.equal((r.json.error as Record<string, unknown>).code, "UNAUTHORIZED");
   });
 
+  test("plan-10 首充已用 → 409 FIRST_TOPUP_USED", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid, token } = await createUserWithToken("create-first-used@example.com");
+    // 让用户成为已付费"老用户":先建一笔 paid 的 plan-100
+    const seed = await (await import("../payment/orders.js")).createPendingOrder({
+      userId: uid, planCode: "plan-100",
+    });
+    await (await import("../payment/orders.js")).markOrderPaid({
+      orderNo: seed.order.order_no, providerOrder: "TX_FIRST_USED", callbackPayload: { status: "OD" },
+    });
+    // 再尝试买 plan-10 → 409
+    mockNextCreate = { kind: "ok", qrcode: "weixin://wxpay/SHOULD_NOT_USE", providerOrder: "X" };
+    const r = await postJson("/api/payment/hupi/create", { plan_code: "plan-10" }, token);
+    assert.equal(r.status, 409, JSON.stringify(r.json));
+    assert.equal((r.json.error as Record<string, unknown>).code, "FIRST_TOPUP_USED");
+  });
+
   test("mock 抛 HupijiaoError → 502 UPSTREAM_*", async (t) => {
     if (skipIfMissing(t)) return;
     const { token } = await createUserWithToken("create-upfail@example.com");
@@ -279,13 +316,13 @@ describe("POST /api/payment/hupi/callback", () => {
   test("正确签名 + status=OD:200 'success' + paid + credits 到账", async (t) => {
     if (skipIfMissing(t)) return;
     const { id: uid } = await createUserWithToken("cb-ok@example.com", 0n);
-    const orderNo = await seedPendingOrder(uid, "plan-50");
+    const orderNo = await seedPendingOrder(uid, "plan-100");
     const form: Record<string, string> = {
       version: "1.1",
       appid: HUPI_APP_ID,
       trade_order_id: orderNo,
       transaction_id: "WX_TX_OK",
-      total_fee: "50.00",
+      total_fee: "100.00",
       status: "OD",
       nonce_str: "xxx",
       time: "1800000000",
@@ -298,7 +335,7 @@ describe("POST /api/payment/hupi/callback", () => {
     const u = await query<{ credits: string }>(
       "SELECT credits::text AS credits FROM users WHERE id=$1", [uid],
     );
-    assert.equal(u.rows[0].credits, "5500"); // plan-50 credits
+    assert.equal(u.rows[0].credits, "10500"); // plan-100 credits(¥100 +5%)
 
     const o = await query<{ status: string; provider_order: string }>(
       "SELECT status, provider_order FROM orders WHERE order_no=$1", [orderNo],

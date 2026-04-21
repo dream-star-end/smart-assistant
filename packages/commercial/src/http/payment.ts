@@ -37,6 +37,7 @@ import {
   getOrderByNo,
   markOrderPaid,
   PlanNotFoundError,
+  FirstTopupAlreadyUsedError,
   InvalidOrderStateError,
   OrderNotFoundError,
   type OrderRow,
@@ -61,13 +62,26 @@ function orderToPublicView(o: OrderRow): Record<string, unknown> {
 
 // ─── GET /api/payment/plans ───────────────────────────────────────────
 
+/**
+ * 公开端点 —— 未登录也能看(冷访客在 landing page 浏览套餐)。
+ * 但若 Authorization 头有效,则按用户身份过滤(老用户拿不到 plan-10 首充档)。
+ */
 export async function handleListPlans(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
   _ctx: RequestContext,
-  _deps: CommercialHttpDeps,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  const plans = await listPlans();
+  // try-auth:有 token 解出来用,无 token / 解析失败一律按未登录处理
+  // (不抛 401 —— 这是公开端点)
+  let userId: string | null = null;
+  try {
+    const u = await requireAuth(req, deps.jwtSecret);
+    userId = u.id;
+  } catch {
+    userId = null;
+  }
+  const plans = await listPlans({ userId });
   sendJson(res, 200, {
     ok: true,
     data: {
@@ -117,6 +131,10 @@ export async function handleCreateHupi(
   } catch (err) {
     if (err instanceof PlanNotFoundError) {
       throw new HttpError(400, "PLAN_NOT_FOUND", err.message);
+    }
+    if (err instanceof FirstTopupAlreadyUsedError) {
+      // 老用户(已有 paid 订单)企图再次买 plan-10 首充档
+      throw new HttpError(409, "FIRST_TOPUP_USED", "新用户首充已用过,请选择其它充值方案");
     }
     throw err;
   }

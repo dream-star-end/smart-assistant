@@ -62,15 +62,24 @@ describe('OutboundRingBuffer.peekReplay', () => {
     assert.equal(rep.to, 5)
   })
 
-  it('fromSeq=0 returns the whole buffer (full replay)', () => {
+  it('P1-3: fromSeq=0 + currentLast>0 with populated ring reports no_buffer (not full replay)', () => {
+    // Regression: the gateway previously full-replayed the ring whenever
+    // fromSeq=0, even when the server had already emitted frames. That made
+    // a client whose _lastFrameSeq had been reset (cold tab / state loss /
+    // prior resume_failed) receive every buffered assistant delta a second
+    // time and silently append a duplicate assistant bubble (text blocks
+    // carry no blockId, so client-side frame-level dedup is the only defense).
+    // peekReplay must escalate to no_buffer here so the client runs a REST
+    // authoritative sync instead.
     const r = new OutboundRingBuffer()
     for (let i = 1; i <= 3; i++) {
       const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
     }
     const rep = r.peekReplay('s1', 0, 1003)
-    assert.equal(rep.ok, true)
-    if (!rep.ok) return
-    assert.deepEqual(rep.sent.map((f) => f.seq), [1, 2, 3])
+    assert.equal(rep.ok, false, 'fromSeq=0 must not ring-replay when currentLast>0')
+    if (rep.ok) return
+    assert.equal(rep.reason, 'no_buffer')
+    assert.equal(rep.to, 3)
   })
 
   it('no_buffer: session never had frames + non-zero cursor = miss', () => {
@@ -183,11 +192,17 @@ describe('OutboundRingBuffer pruning', () => {
     const s1 = r.nextSeq('s1'); r.store('s1', s1, 0,   frame(s1))
     const s2 = r.nextSeq('s1'); r.store('s1', s2, 150, frame(s2)) // cutoff = 150-100 = 50 → frame1 (ts=0) evicted
     assert.equal(r.size('s1'), 1)
-    // Read at now=150: cutoff=50, frame2 (ts=150) survives.
-    const rep = r.peekReplay('s1', 0, 150)
-    assert.equal(rep.ok, false, 'fromSeq=0 past the earliest still-buffered frame (2) → buffer_miss')
-    if (rep.ok) return
-    assert.equal(rep.reason, 'buffer_miss')
+    // Read at now=150 with a non-zero cursor that predates the surviving frame:
+    // cutoff=50, frame2 (ts=150) survives the age prune, but client's cursor=1
+    // means it needs frame 2 onward — which the ring does have → replay frame 2.
+    // (We intentionally use fromSeq=1 rather than fromSeq=0 here: under P1-3,
+    //  fromSeq=0+currentLast>0 is treated as a cursor-reset and returns
+    //  no_buffer regardless of ring contents, so testing "age-prune leaves a
+    //  replayable tail" requires a non-zero cursor.)
+    const rep = r.peekReplay('s1', 1, 150)
+    assert.equal(rep.ok, true, 'ring still has frame 2 after age prune → replayable')
+    if (!rep.ok) return
+    assert.deepEqual(rep.sent.map((f) => f.seq), [2])
     assert.equal(rep.to, 2)
   })
 

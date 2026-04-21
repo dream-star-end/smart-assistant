@@ -70,6 +70,32 @@ export class PlanNotFoundError extends Error {
   }
 }
 
+/**
+ * 「新用户首充」专用套餐 code。该套餐只允许尚未有任何 paid 订单的用户使用。
+ * 入口同时由 `listPlans({ userId })` 过滤(老用户看不见) +
+ * `createPendingOrder` 二次校验(老用户即使知道 code 也下不了单)双重把关。
+ */
+export const FIRST_TOPUP_PLAN_CODE = "plan-10";
+
+export class FirstTopupAlreadyUsedError extends Error {
+  readonly code = "FIRST_TOPUP_USED" as const;
+  readonly userId: string;
+  constructor(userId: string) {
+    super(`user ${userId} already has paid orders, plan-10 is first-topup-only`);
+    this.name = "FirstTopupAlreadyUsedError";
+    this.userId = userId;
+  }
+}
+
+/** 用户是否有过任何 paid 订单(用于判定「新用户」)。 */
+async function userHasAnyPaidOrder(uid: string): Promise<boolean> {
+  const r = await query<{ one: number }>(
+    `SELECT 1 AS one FROM orders WHERE user_id = $1 AND status = 'paid' LIMIT 1`,
+    [uid],
+  );
+  return r.rowCount !== null && r.rowCount > 0;
+}
+
 export class OrderNotFoundError extends Error {
   readonly code = "ORDER_NOT_FOUND" as const;
   readonly orderNo: string;
@@ -160,8 +186,18 @@ function rowToOrder(r: {
   };
 }
 
+export interface ListPlansOptions {
+  /**
+   * 已认证用户 id。传了之后:
+   *   - 若该用户已有 paid 订单 → 过滤掉首充套餐 plan-10
+   *   - 否则全量返回(plan-10 仍可见)
+   * 不传(冷访客 / 未登录) → 全量返回(让 landing 上能看到首充优惠)
+   */
+  userId?: bigint | number | string | null;
+}
+
 /** 读所有 enabled 套餐,按 sort_order DESC。 */
-export async function listPlans(): Promise<TopupPlan[]> {
+export async function listPlans(opts: ListPlansOptions = {}): Promise<TopupPlan[]> {
   const r = await query<{
     id: string; code: string; label: string; amount_cents: string; credits: string;
     sort_order: number; enabled: boolean;
@@ -173,7 +209,14 @@ export async function listPlans(): Promise<TopupPlan[]> {
       WHERE enabled = TRUE
       ORDER BY sort_order DESC, id ASC`,
   );
-  return r.rows.map(rowToPlan);
+  const all = r.rows.map(rowToPlan);
+  if (opts.userId == null) return all;
+  const uid = normalizeUserId(opts.userId);
+  // 已老用户 → 过滤首充套餐
+  if (await userHasAnyPaidOrder(uid)) {
+    return all.filter((p) => p.code !== FIRST_TOPUP_PLAN_CODE);
+  }
+  return all;
 }
 
 /** 按 code 读一档(不过滤 enabled);找不到返 null,调用方决定怎么报错。 */
@@ -215,6 +258,16 @@ export async function createPendingOrder(
   const uid = normalizeUserId(input.userId);
   const plan = await getPlanByCode(input.planCode);
   if (!plan || !plan.enabled) throw new PlanNotFoundError(input.planCode);
+
+  // 首充套餐:必须用户从未有 paid 订单,否则拒
+  // 注意:这里只检查 paid 订单,pending 不算 —— 老用户可能并发尝试,
+  // 实际能否结算由 markOrderPaid 的状态机收尾。但若已有任何 paid 单,
+  // 当前的下单就直接拒,避免后续付款时再退款的扯皮。
+  if (plan.code === FIRST_TOPUP_PLAN_CODE) {
+    if (await userHasAnyPaidOrder(uid)) {
+      throw new FirstTopupAlreadyUsedError(uid);
+    }
+  }
 
   const nowFn = input.nowFn ?? (() => new Date());
   const ttlMs = Math.max(1, input.ttlMs ?? 15 * 60 * 1000);
