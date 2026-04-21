@@ -134,6 +134,23 @@ ensure_v3_host_guard() {
   fi
 
   # 2) 链内规则:允许 internal proxy / 拒绝其他
+  #
+  # 2026-04-22 回归修:第一条必须是 ct state RELATED,ESTABLISHED RETURN。
+  # 原因:host 上的 supervisor/bridge 必须主动 HTTP /healthz + WS upgrade
+  # 到容器 boundIp:18789 做 readiness probe。probe 是 host 发起的 TCP,
+  # TCP 三次握手的 SYN+ACK 和后续 response 的反向包 saddr=172.30.x.y、
+  # daddr=172.30.0.1(host)。这些包走 INPUT → V3_EGRESS_IN,原本只有 3
+  # 条无状态规则:tcp dport 18791 RETURN / icmp echo RETURN / else DROP。
+  # host 主动连的反向 response 会直接命中 DROP → readiness probe 永远
+  # timeout → user-chat-bridge "container not ready: starting" 死循环,
+  # 用户连上 chat 永远 agent 不回复。
+  #
+  # 修:在链头加 conntrack RELATED,ESTABLISHED RETURN,专门放行 host 发起
+  # 连接的反向包。语义不削弱 —— 容器主动发起的新连接仍然是 ctstate=NEW,
+  # 会继续命中下方的 DROP(除 18791 白名单)。
+  iptables -A "$V3_HOST_GUARD_CHAIN" \
+    -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN \
+    -m comment --comment "allow reply traffic for host-initiated conns"
   iptables -A "$V3_HOST_GUARD_CHAIN" \
     -d "$GATEWAY" -p tcp --dport "$INTERNAL_PROXY_PORT" -j RETURN \
     -m comment --comment "v3 container -> internal proxy"
