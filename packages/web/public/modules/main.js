@@ -64,12 +64,12 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js'
-// ?v=d4aeb94 bust: websocket.js now imports billing.js for refreshBalance() after
+// ?v=b0f88f0 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, refreshBalance } from './billing.js?v=d4aeb94'
+import { initBilling, refreshBalance } from './billing.js?v=b0f88f0'
 import { initUserPrefs, openPrefsModal } from './userPrefs.js'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
