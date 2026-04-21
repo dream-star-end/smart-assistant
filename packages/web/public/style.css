@@ -535,6 +535,21 @@ a:hover {
   text-decoration: underline;
 }
 
+/* ── Field wrapper (label above input) ── */
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: var(--space-3);
+}
+.auth-field label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  letter-spacing: 0.01em;
+  padding-left: 2px;
+}
+
 /* ── Inputs ── */
 .login-card input {
   width: 100%;
@@ -542,11 +557,19 @@ a:hover {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  margin-bottom: var(--space-3);
   font-size: 15px;
   min-height: 48px;
   color: var(--fg);
+  font-family: inherit;
   transition: border-color var(--transition-fast), box-shadow var(--transition-fast), background var(--transition-fast);
+}
+/* 兼容:不在 .auth-field 里的裸 input (早期 OTP 等) 保留底边距 */
+.login-card > input,
+.login-card form > input {
+  margin-bottom: var(--space-3);
+}
+.auth-field input {
+  margin-bottom: 0;
 }
 .login-card input::placeholder {
   color: var(--fg-dim);
@@ -650,6 +673,42 @@ a:hover {
 .btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Loading state — 按钮变 spinner,保留尺寸避免布局跳 */
+.btn.is-loading {
+  position: relative;
+  color: transparent !important;
+  pointer-events: none;
+  cursor: wait;
+}
+.btn.is-loading > * {
+  opacity: 0;
+}
+.btn.is-loading::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 18px;
+  height: 18px;
+  margin: -9px 0 0 -9px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: btn-spin 0.7s linear infinite;
+  color: var(--accent-fg);
+  opacity: 1;
+}
+.btn-secondary.is-loading::after,
+.btn-ghost.is-loading::after,
+.btn-danger.is-loading::after {
+  color: var(--accent);
+}
+@keyframes btn-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .btn-primary {

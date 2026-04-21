@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=d4aeb94" />
+<link rel="stylesheet" href="/style.css?v=ds1-a" />
 <!-- main.js version bumped 2026-04-21: 积分化 + /login routing -->
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -271,8 +271,14 @@
 
   <!-- ── Mode: login ── -->
   <div id="auth-mode-login" hidden>
-    <input id="auth-login-email" type="email" placeholder="邮箱" autocomplete="email" style="margin-bottom:var(--space-2)" />
-    <input id="auth-login-password" type="password" placeholder="密码" autocomplete="current-password" style="margin-bottom:var(--space-2)" />
+    <div class="auth-field">
+      <label for="auth-login-email">邮箱</label>
+      <input id="auth-login-email" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email" />
+    </div>
+    <div class="auth-field">
+      <label for="auth-login-password">密码</label>
+      <input id="auth-login-password" type="password" placeholder="输入你的密码" autocomplete="current-password" />
+    </div>
     <div class="auth-row-helper">
       <button id="auth-tab-forgot" type="button" class="auth-link-btn">忘记密码?</button>
     </div>
@@ -287,9 +293,18 @@
   <!-- ── Mode: register ── -->
   <div id="auth-mode-register" hidden>
     <div id="auth-register-form">
-      <input id="auth-register-email" type="email" placeholder="邮箱" autocomplete="email" style="margin-bottom:var(--space-2)" />
-      <input id="auth-register-password" type="password" placeholder="密码(至少 8 位)" autocomplete="new-password" style="margin-bottom:var(--space-2)" />
-      <input id="auth-register-confirm" type="password" placeholder="再次输入密码" autocomplete="new-password" style="margin-bottom:var(--space-2)" />
+      <div class="auth-field">
+        <label for="auth-register-email">邮箱</label>
+        <input id="auth-register-email" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email" />
+      </div>
+      <div class="auth-field">
+        <label for="auth-register-password">密码</label>
+        <input id="auth-register-password" type="password" placeholder="至少 8 位" autocomplete="new-password" />
+      </div>
+      <div class="auth-field">
+        <label for="auth-register-confirm">确认密码</label>
+        <input id="auth-register-confirm" type="password" placeholder="再次输入密码" autocomplete="new-password" />
+      </div>
       <div id="turnstile-register" style="margin-bottom:var(--space-2);min-height:65px"></div>
       <button id="auth-register-btn" type="button" class="btn btn-primary btn-full">注册</button>
     </div>
@@ -1040,6 +1055,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=d4aeb94"></script>
+<script type="module" src="/modules/main.js?v=ds1-a"></script>
 </body>
 </html>

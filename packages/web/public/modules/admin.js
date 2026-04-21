@@ -114,8 +114,34 @@ function showError(msg) {
   view().innerHTML = `<div class="error">${escapeHtml(msg)}</div>`
 }
 
-function setLoading() {
-  view().innerHTML = `<div class="loading">加载中…</div>`
+function setLoading(kind = 'table') {
+  if (kind === 'table') {
+    // skeleton 行,配合 admin.html 里 .skeleton .skeleton-row .skeleton-bar.w60/w80/w40
+    const rows = Array.from({ length: 6 }).map(() => `
+      <div class="skeleton-row">
+        <div class="skeleton-bar w60"></div>
+        <div class="skeleton-bar w80"></div>
+        <div class="skeleton-bar w40"></div>
+      </div>`).join('')
+    view().innerHTML = `<div class="panel"><div class="skeleton">${rows}</div></div>`
+  } else {
+    view().innerHTML = `<div class="loading">加载中…</div>`
+  }
+}
+
+// 按钮 loading:awaitFn() 期间给 btn 加 .is-loading,完成后还原
+async function withBtnLoading(btn, fn) {
+  if (!btn) return fn()
+  btn.disabled = true
+  btn.classList.add('is-loading')
+  btn.setAttribute('aria-busy', 'true')
+  try {
+    return await fn()
+  } finally {
+    btn.disabled = false
+    btn.classList.remove('is-loading')
+    btn.removeAttribute('aria-busy')
+  }
 }
 
 // ─── Modal ──────────────────────────────────────────────────────────
@@ -320,7 +346,7 @@ function openAdjustCreditsModal(userId) {
   }
   $('adj-delta').addEventListener('input', updatePreview)
   $('adj-cancel').addEventListener('click', closeModal)
-  $('adj-ok').addEventListener('click', async () => {
+  $('adj-ok').addEventListener('click', async (ev) => {
     const raw = $('adj-delta').value
     const memo = $('adj-memo').value.trim()
     const cents = parseYuanToCents(raw)
@@ -328,15 +354,17 @@ function openAdjustCreditsModal(userId) {
       toast('金额必须是非零数字,最多 2 位小数(如 1.00 / -0.50)', 'danger'); return
     }
     if (!memo) { toast('memo 不能为空', 'danger'); return }
-    try {
-      const r = await apiJson('POST', `/api/admin/users/${userId}/credits`,
-        { delta: String(cents), memo })
-      toast(`已记账,新余额 ${fmtCents(r.balance_after)}`)
-      closeModal()
-      applyHash()
-    } catch (e) {
-      toast(`失败: ${e.message}`, 'danger')
-    }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        const r = await apiJson('POST', `/api/admin/users/${userId}/credits`,
+          { delta: String(cents), memo })
+        toast(`已记账,新余额 ${fmtCents(r.balance_after)}`)
+        closeModal()
+        applyHash()
+      } catch (e) {
+        toast(`失败: ${e.message}`, 'danger')
+      }
+    })
   })
 }
 
@@ -413,7 +441,7 @@ async function renderAccountsTab() {
     b.addEventListener('click', () => openEditAccountModal(b.dataset.id))
   }
   for (const b of view().querySelectorAll('button[data-act="del-acc"]')) {
-    b.addEventListener('click', () => deleteAccount(b.dataset.id, b.dataset.label))
+    b.addEventListener('click', (ev) => deleteAccount(b.dataset.id, b.dataset.label, ev.currentTarget))
   }
 }
 
@@ -536,18 +564,20 @@ function openCreateAccountModal() {
   $('acc-cancel').addEventListener('click', closeModal)
   $('acc-oauth-open').addEventListener('click', oauthStartStep)
   $('acc-oauth-submit').addEventListener('click', oauthExchangeStep)
-  $('acc-ok').addEventListener('click', async () => {
+  $('acc-ok').addEventListener('click', async (ev) => {
     let body
     try { body = _readAccountForm(true) }
     catch (e) { toast(e.message, 'danger'); return }
-    try {
-      const r = await apiJson('POST', '/api/admin/accounts', body)
-      toast(`已创建账号 ${r?.account?.id || ''}`)
-      closeModal()
-      applyHash()
-    } catch (e) {
-      toast(`创建失败: ${e.message}`, 'danger')
-    }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        const r = await apiJson('POST', '/api/admin/accounts', body)
+        toast(`已创建账号 ${r?.account?.id || ''}`)
+        closeModal()
+        applyHash()
+      } catch (e) {
+        toast(`创建失败: ${e.message}`, 'danger')
+      }
+    })
   })
 }
 
@@ -601,17 +631,27 @@ async function oauthExchangeStep() {
 
   let exchanged
   const btn = $('acc-oauth-submit')
-  if (btn) { btn.disabled = true; btn.textContent = '交换中…' }
+  let failed = false
+  if (btn) {
+    btn.disabled = true
+    btn.classList.add('is-loading')
+    btn.setAttribute('aria-busy', 'true')
+  }
   try {
     exchanged = await apiJson('POST', '/api/admin/accounts/oauth/exchange', {
       code, state: _oauthPendingState,
     })
   } catch (e) {
     toast(`Token 交换失败: ${e.message}`, 'danger')
-    return
+    failed = true
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '③ 换 token' }
+    if (btn) {
+      btn.disabled = false
+      btn.classList.remove('is-loading')
+      btn.removeAttribute('aria-busy')
+    }
   }
+  if (failed) return
 
   _oauthPendingState = null
   if ($('acc-token')) $('acc-token').value = exchanged.access_token || ''
@@ -641,30 +681,34 @@ async function openEditAccountModal(id) {
     </div>
   `)
   $('acc-cancel').addEventListener('click', closeModal)
-  $('acc-ok').addEventListener('click', async () => {
+  $('acc-ok').addEventListener('click', async (ev) => {
     let body
     try { body = _readAccountForm(false) }
     catch (e) { toast(e.message, 'danger'); return }
-    try {
-      await apiJson('PATCH', `/api/admin/accounts/${encodeURIComponent(account.id)}`, body)
-      toast(`#${account.id} 已保存`)
-      closeModal()
-      applyHash()
-    } catch (e) {
-      toast(`保存失败: ${e.message}`, 'danger')
-    }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        await apiJson('PATCH', `/api/admin/accounts/${encodeURIComponent(account.id)}`, body)
+        toast(`#${account.id} 已保存`)
+        closeModal()
+        applyHash()
+      } catch (e) {
+        toast(`保存失败: ${e.message}`, 'danger')
+      }
+    })
   })
 }
 
-async function deleteAccount(id, label) {
+async function deleteAccount(id, label, btn) {
   if (!confirm(`确认删除账号 #${id} (${label})?\n此操作不可恢复;若有运行中容器仍在用此账号会失败。`)) return
-  try {
-    await apiJson('DELETE', `/api/admin/accounts/${encodeURIComponent(id)}`)
-    toast(`#${id} 已删除`)
-    applyHash()
-  } catch (e) {
-    toast(`删除失败: ${e.message}`, 'danger')
-  }
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('DELETE', `/api/admin/accounts/${encodeURIComponent(id)}`)
+      toast(`#${id} 已删除`)
+      applyHash()
+    } catch (e) {
+      toast(`删除失败: ${e.message}`, 'danger')
+    }
+  })
 }
 
 // ─── Tab: Containers ───────────────────────────────────────────────
@@ -706,19 +750,21 @@ async function renderContainersTab() {
     </div>
   `
   for (const b of view().querySelectorAll('button[data-act]')) {
-    b.addEventListener('click', () => containerAction(b.dataset.id, b.dataset.act))
+    b.addEventListener('click', (ev) => containerAction(b.dataset.id, b.dataset.act, ev.currentTarget))
   }
 }
 
-async function containerAction(id, action) {
+async function containerAction(id, action, btn) {
   if (!confirm(`确定 ${action} 容器 ${id}?`)) return
-  try {
-    await apiJson('POST', `/api/admin/agent-containers/${id}/${action}`)
-    toast(`已 ${action}`)
-    applyHash()
-  } catch (e) {
-    toast(`失败: ${e.message}`, 'danger')
-  }
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('POST', `/api/admin/agent-containers/${id}/${action}`)
+      toast(`已 ${action}`)
+      applyHash()
+    } catch (e) {
+      toast(`失败: ${e.message}`, 'danger')
+    }
+  })
 }
 
 // ─── Tab: Ledger ───────────────────────────────────────────────────
@@ -837,18 +883,20 @@ function openEditPricingModal(modelId, multiplier, enabled) {
     </div>
   `)
   $('p-cancel').addEventListener('click', closeModal)
-  $('p-ok').addEventListener('click', async () => {
+  $('p-ok').addEventListener('click', async (ev) => {
     const m = $('p-mult').value.trim()
     if (!/^\d+(\.\d{1,3})?$/.test(m)) { toast('multiplier 格式不对', 'danger'); return }
-    try {
-      await apiJson('PATCH', `/api/admin/pricing/${encodeURIComponent(modelId)}`,
-        { multiplier: m, enabled: $('p-enabled').checked })
-      toast('已保存')
-      closeModal()
-      applyHash()
-    } catch (e) {
-      toast(`失败: ${e.message}`, 'danger')
-    }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        await apiJson('PATCH', `/api/admin/pricing/${encodeURIComponent(modelId)}`,
+          { multiplier: m, enabled: $('p-enabled').checked })
+        toast('已保存')
+        closeModal()
+        applyHash()
+      } catch (e) {
+        toast(`失败: ${e.message}`, 'danger')
+      }
+    })
   })
 }
 
@@ -915,21 +963,23 @@ function openEditPlanModal(d) {
     </div>
   `)
   $('pl-cancel').addEventListener('click', closeModal)
-  $('pl-ok').addEventListener('click', async () => {
-    try {
-      await apiJson('PATCH', `/api/admin/plans/${encodeURIComponent(d.code)}`, {
-        label: $('pl-label').value,
-        amount_cents: $('pl-amount').value.trim(),
-        credits: $('pl-credits').value.trim(),
-        sort_order: Number($('pl-sort').value),
-        enabled: $('pl-enabled').checked,
-      })
-      toast('已保存')
-      closeModal()
-      applyHash()
-    } catch (e) {
-      toast(`失败: ${e.message}`, 'danger')
-    }
+  $('pl-ok').addEventListener('click', async (ev) => {
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        await apiJson('PATCH', `/api/admin/plans/${encodeURIComponent(d.code)}`, {
+          label: $('pl-label').value,
+          amount_cents: $('pl-amount').value.trim(),
+          credits: $('pl-credits').value.trim(),
+          sort_order: Number($('pl-sort').value),
+          enabled: $('pl-enabled').checked,
+        })
+        toast('已保存')
+        closeModal()
+        applyHash()
+      } catch (e) {
+        toast(`失败: ${e.message}`, 'danger')
+      }
+    })
   })
 }
 
@@ -965,7 +1015,7 @@ async function renderSettingsTab() {
     </div>
   `
   for (const btn of view().querySelectorAll('button[data-act="save-setting"]')) {
-    btn.addEventListener('click', () => saveSetting(btn.dataset.key))
+    btn.addEventListener('click', (ev) => saveSetting(btn.dataset.key, ev.currentTarget))
   }
 }
 
@@ -1016,7 +1066,7 @@ function _renderSettingRow(r) {
   `
 }
 
-async function saveSetting(key) {
+async function saveSetting(key, btn) {
   const valEl = $(`set-${key}-value`)
   const descEl = $(`set-${key}-desc`)
   if (!valEl) { toast(`找不到 ${key} 输入框`, 'danger'); return }
@@ -1032,16 +1082,18 @@ async function saveSetting(key) {
   } else {
     value = valEl.value
   }
-  try {
-    await apiJson('PUT', `/api/admin/settings/${encodeURIComponent(key)}`, {
-      value,
-      description: descEl?.value ?? null,
-    })
-    toast(`${key} 已保存`)
-    applyHash()
-  } catch (e) {
-    toast(`${key} 保存失败: ${e.message}`, 'danger')
-  }
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('PUT', `/api/admin/settings/${encodeURIComponent(key)}`, {
+        value,
+        description: descEl?.value ?? null,
+      })
+      toast(`${key} 已保存`)
+      applyHash()
+    } catch (e) {
+      toast(`${key} 保存失败: ${e.message}`, 'danger')
+    }
+  })
 }
 
 // ─── Tab: Audit ────────────────────────────────────────────────────

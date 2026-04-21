@@ -525,16 +525,19 @@ async function _doResendVerification() {
 async function _withBusy(btnId, busyText, fn) {
   const btn = $(btnId)
   if (!btn) { await fn(); return }
-  const orig = btn.textContent
+  // 新版:添加 .is-loading class (纯 spinner,文本保留以防回退),保留 disabled
+  // busyText 参数仅在浏览器不支持 CSS loading 态时作为 fallback(已弃用,保留签名兼容)
   btn.disabled = true
-  btn.textContent = busyText
+  btn.classList.add('is-loading')
+  btn.setAttribute('aria-busy', 'true')
   try {
     await fn()
   } catch (e) {
     _showError(`网络错误:${String(e?.message || e)}`)
   } finally {
     btn.disabled = false
-    btn.textContent = orig
+    btn.classList.remove('is-loading')
+    btn.removeAttribute('aria-busy')
   }
 }
 
