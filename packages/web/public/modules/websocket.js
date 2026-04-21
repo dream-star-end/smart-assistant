@@ -1,4 +1,5 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
+import { dbPut } from './db.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
@@ -1584,13 +1585,29 @@ export function handleOutbound(frame) {
 function handleResumeFailed(frame) {
   const peerId = frame.peer?.id
   const affectedSessId = peerId
+  // Server's currentLast at the moment it emitted resume_failed. frameTo=0
+  // indicates a genuine server restart (currentLast wiped); frameTo>0 means
+  // the server still has forward progress we need to honor on reconnect.
+  const frameTo = typeof frame.to === 'number' ? frame.to : 0
   if (peerId) {
     const sess = state.sessions.get(peerId)
     if (sess) {
-      // Reset the frameSeq cursor so a server restart (currentLast drops
-      // back to a small number) can be recovered — otherwise every
-      // subsequent frame would look "stale" to the dedupe in handleOutbound.
-      sess._lastFrameSeq = 0
+      // Advance the frameSeq cursor to the server's currentLast BEFORE the
+      // sync runs. Why here and not in the onResult callback:
+      //   - syncSessionsFromServer carries existingLocal._lastFrameSeq into
+      //     the merged session object (sync.js:~278) and dbPut persists it
+      //     (sync.js:~283). Setting it in onResult leaves IDB with the stale
+      //     cursor — on reload, the hello hand-shake would fire lastFrameSeq=0
+      //     (or the stale pre-advance value) and the gateway's P1-3 guard
+      //     would resume_failed us again, looping.
+      //   - frameTo=0 (server restart) maps to 0 here, which is correct:
+      //     we genuinely haven't seen anything from this server instance and
+      //     the dedupe in handleOutbound should accept all future frames.
+      //   - frameTo>0 sets the dedupe threshold to the server's last assigned
+      //     frame, so any late frames ≤ frameTo that triggered this
+      //     resume_failed are dropped (we'll get authoritative state from
+      //     REST) and future frames (seq > frameTo) are accepted normally.
+      sess._lastFrameSeq = frameTo
       // Phase 0.4 P1-1: instead of force-clearing _sendingInFlight (which
       // would lie about a still-running long REPL turn in buffer_miss
       // cases), flag the live stream as known-broken. syncSessionsFromServer
@@ -1598,6 +1615,18 @@ function handleResumeFailed(frame) {
       // tape even when state.sendingInFlight is true. The flag clears
       // naturally on the next successful sync.
       sess._liveStreamBroken = true
+      // Persist the cursor advance synchronously to IDB before maybeSyncNow
+      // runs. `syncSessionsFromServer` only fetches+dbPuts sessions where
+      // `meta.updatedAt > local._syncedAt` — on a pure server restart
+      // (frame.to=0, no new messages yet) or a sequence_mismatch against an
+      // idle backend, the sync can complete without touching this session,
+      // so the in-memory `_lastFrameSeq = frameTo` advance would never
+      // reach disk. A reload would then resurrect the stale cursor and we'd
+      // resume_failed → REST-sync loop on the next reconnect. Fire-and-
+      // forget is OK: if IDB is unavailable or throws we've already done
+      // the memory-state update, and the sync path will re-persist whatever
+      // state it ends up merging.
+      dbPut({ ...sess }).catch(() => {})
     }
   }
   // `freshAfterInFlight: true` guards against a race where a sync was already
@@ -1613,10 +1642,13 @@ function handleResumeFailed(frame) {
       if (!result) return
       // Successful sync — live stream has been reconciled from REST. Clear
       // the override so subsequent maybeSyncNow calls respect the normal
-      // in-flight skip again.
+      // in-flight skip again. _lastFrameSeq was already advanced synchronously
+      // above and persisted by the sync's dbPut, so nothing to do here for it.
       if (affectedSessId) {
         const live = state.sessions.get(affectedSessId)
-        if (live) live._liveStreamBroken = false
+        if (live) {
+          live._liveStreamBroken = false
+        }
       }
       try { _deps.renderSidebar() } catch {}
       // Re-render the transcript only if the affected session is what's

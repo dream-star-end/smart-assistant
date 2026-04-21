@@ -202,20 +202,37 @@ export async function syncSessionsFromServer() {
   const toFetch = []
   for (const meta of serverList) {
     const local = localMap.get(meta.id)
+    const live = state.sessions.get(meta.id)
     if (!local) {
+      toFetch.push(meta.id)
+    } else if (live?._liveStreamBroken) {
+      // Phase 0.4 P1-1: force-fetch any session whose live stream is flagged
+      // known-broken, REGARDLESS of server `updatedAt`. Two cases the normal
+      // `updatedAt > _syncedAt` gate would miss:
+      //   1. Server restart (resume_failed.to=0): the on-disk tape hasn't
+      //      necessarily grown since our last sync, so `updatedAt` can be
+      //      unchanged. Without a fetch the merge never runs, the merged
+      //      `sess` object is never persisted, and the synchronously-
+      //      advanced `_lastFrameSeq` (websocket.js handleResumeFailed)
+      //      stays only in memory for THIS tab — reload resurrects the
+      //      stale cursor and loops on the next reconnect.
+      //   2. `_liveStreamBroken` itself must be cleaned out of IDB. It's
+      //      written by the synchronous `dbPut` in handleResumeFailed as
+      //      a belt for case 1; if the sync never rewrites the session,
+      //      that flag persists to a future boot, where it would bypass
+      //      the in-flight skip guard for unrelated syncs.
+      // Force-fetch guarantees both concerns are resolved by the normal
+      // merge path at sync.js:~260 (which builds `sess` WITHOUT
+      // `_liveStreamBroken`, carries forward `_lastFrameSeq` via existingLocal,
+      // and dbPuts the clean version).
       toFetch.push(meta.id)
     } else if (local._syncedAt && meta.updatedAt > local._syncedAt) {
       // Server has a newer version than our last sync point (server clock only).
-      // Normally we skip the current in-flight session to avoid stomping a
-      // live stream — but if something has flagged the session's live
-      // stream as authoritatively broken (Phase 0.4 resume_failed sets
-      // `_liveStreamBroken = true`), we MUST refetch: the whole point of
-      // the force sync is to reconcile from the server-authored tape.
-      const live = state.sessions.get(meta.id)
+      // Normal in-flight guard still applies here — only the resume_failed
+      // flag unconditionally forces a fetch (branch above).
       if (
         meta.id === state.currentSessionId &&
-        state.sendingInFlight &&
-        !live?._liveStreamBroken
+        state.sendingInFlight
       ) continue
       toFetch.push(meta.id)
     }
@@ -238,16 +255,91 @@ export async function syncSessionsFromServer() {
   for (const remote of fetched) {
     if (isDeletePending(remote.id)) continue // locally deleted, pending server confirmation
     const existingLocal = state.sessions.get(remote.id)
-    if (existingLocal?._dirty) continue // local has unsynced edits, don't overwrite
+    // Normally we skip overwriting a locally-dirty session to avoid stomping
+    // unsynced user edits. The exception is `_liveStreamBroken`: Phase 0.4
+    // resume_failed flagged this session's live stream as known-bad and the
+    // whole point of the force-sync is to reconcile against the server-
+    // authored tape. Skipping here would silently strand the client on stale
+    // state and the `onResult` clear in handleResumeFailed would then lie
+    // about the recovery having succeeded.
+    //
+    // BUT: we can't just blindly overwrite. A just-sent user message may be
+    // sitting in existingLocal.messages with status='sending'/'queued'/'sent'/
+    // 'read', waiting for scheduleSave (~400ms debounce) to push it to server.
+    // If the resume_failed REST sync wins the race, that message is gone from
+    // state.sessions and the 409 conflict handler at line ~363 below will
+    // see the REST-replaced live object without it. Preserve local-only
+    // pending-send user rows before the overwrite, and keep _dirty so they
+    // get pushed on the next scheduleSave cycle.
+    //
+    // Predicate rationale:
+    //   - role === 'user': only user rows are client-authored; assistant /
+    //     thinking / tool results are server-authored via Phase 0.1 and their
+    //     authoritative state lives on the server. Don't resurrect local
+    //     partials.
+    //   - status ∈ {'sending','queued','sent','read'}: narrows to rows that
+    //     explicitly haven't completed their server roundtrip. 'sent' is set
+    //     after ws.send but BEFORE server ACK/persist; 'read' is set when the
+    //     assistant's first block arrives (websocket.js:~1094), often BEFORE
+    //     the debounced PUT of the user msg has landed. Missing status falls
+    //     through to server-wins (rare legacy rows only).
+    //   - !serverIds.has(id): server doesn't yet know about this row.
+    //
+    // Ordering: we MUST preserve local message ordering. In the resume_failed-
+    // during-streaming case, local has [..., userMsg, assistantMsg] where
+    // assistantMsg is server-authored (Phase 0.1) so REST already holds it.
+    // Naive "append preserved to tail" would place userMsg AFTER assistantMsg
+    // on the rebuilt timeline, breaking causality. Instead we rebuild
+    // messages by walking local's ordering: for each local row, use server's
+    // version if id matches (authoritative), else preserve if it's a pending
+    // user, else drop (cross-device delete / branch). Then append any
+    // server-only rows at the end (cross-device additions).
+    const PENDING_SEND_STATUSES = new Set(['sending', 'queued', 'sent', 'read'])
+    let mergedMessages = null
+    let hasPreservedPending = false
+    if (existingLocal?._liveStreamBroken && existingLocal?._dirty) {
+      const serverById = new Map()
+      for (const m of remote.messages || []) if (m?.id) serverById.set(m.id, m)
+      const usedServerIds = new Set()
+      const out = []
+      for (const local of existingLocal.messages || []) {
+        if (!local?.id) continue
+        const server = serverById.get(local.id)
+        if (server) {
+          out.push(server)
+          usedServerIds.add(local.id)
+        } else if (local.role === 'user' && PENDING_SEND_STATUSES.has(local.status)) {
+          out.push(local)
+          hasPreservedPending = true
+        }
+        // else: drop — local-only non-pending row, assume cross-device
+        // delete/branch authored on another tab. The whole point of
+        // force-sync is to honor that.
+      }
+      // Cross-device additions: server rows not seen in local ordering.
+      for (const s of remote.messages || []) {
+        if (s?.id && !usedServerIds.has(s.id)) out.push(s)
+      }
+      mergedMessages = out
+    } else if (existingLocal?._dirty && !existingLocal?._liveStreamBroken) {
+      continue
+    }
     const sess = {
       id: remote.id,
       title: remote.title,
       createdAt: remote.createdAt,
       lastAt: remote.lastAt,
-      messages: remote.messages || [],
+      messages: mergedMessages || remote.messages || [],
       agentId: remote.agentId || 'main',
       pinned: remote.pinned || false,
       _syncedAt: remote.updatedAt,
+    }
+    if (hasPreservedPending) {
+      // Preserved user msgs aren't on server yet; keep _dirty so the next
+      // scheduleSave cycle re-pushes. _syncedAt = remote.updatedAt so the
+      // next PUT carries the correct _baseSyncedAt (avoiding an immediate
+      // 409 loop).
+      sess._dirty = true
     }
     // Preserve local turn-state across the server-merge — the server
     // deliberately strips _sendingInFlight / _turnStartedAt / _lastFrameAt
