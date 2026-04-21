@@ -44,6 +44,38 @@ function fmtCents(cents) {
   return `${negative ? '-' : ''}¥${yuanFmt}.${fen}`
 }
 
+/**
+ * 把人类可读的人民币字符串(如 "1.50"、"-0.25"、"¥10"、"100")解析成"分"整数。
+ *
+ * 2026-04-21 安全审计 MED(单位语义统一):后端 /api/admin/users/:id/credits
+ * 收到的 delta 是「分」整数;但 admin 在 UI 里看到余额是 ¥X.XX,直接让他
+ * 输入分会让"加 ¥1"误打成 1(实际只加 1 分)或 100x 多加。这里加一道
+ * yuan→cents 转换 + 实时 ¥ 预览,避免单位错位事故。
+ *
+ * 接受:
+ *   - "1"、"1.5"、"1.50"、"-0.25"、"  ¥10  "、"+5.00"
+ * 拒绝(返回 null):
+ *   - 空串、非数字、超过 2 位小数、NaN/Inf、"0"/"0.00"(零变动无意义)
+ */
+function parseYuanToCents(input) {
+  if (typeof input !== 'string') return null
+  const trimmed = input.trim().replace(/^¥/, '').replace(/^\+/, '')
+  if (trimmed === '') return null
+  // sign + integer + optional .frac (max 2 digits)
+  const m = /^(-?)(\d+)(?:\.(\d{1,2}))?$/.exec(trimmed)
+  if (!m) return null
+  const negative = m[1] === '-'
+  const intPart = m[2]
+  const fracPart = (m[3] ?? '').padEnd(2, '0')
+  // BigInt-safe combine, then back to Number for caller transport (delta < 2^53 always
+  // —— 我们禁止单笔超过 ±10^12 cents,handler 也会再校验一次).
+  const combined = `${intPart}${fracPart}`.replace(/^0+(?=\d)/, '')
+  if (combined === '0' || combined === '') return null
+  const cents = Number(combined)
+  if (!Number.isFinite(cents) || !Number.isInteger(cents)) return null
+  return negative ? -cents : cents
+}
+
 function fmtDate(iso) {
   if (!iso) return '—'
   try {
@@ -233,7 +265,7 @@ async function renderUsersTab() {
                 <td class="num">${fmtCents(u.credits)}</td>
                 <td class="mono">${fmtDate(u.created_at)}</td>
                 <td class="actions">
-                  <button data-act="adjust" data-id="${escapeHtml(u.id)}">±积分</button>
+                  <button data-act="adjust" data-id="${escapeHtml(u.id)}">±余额</button>
                 </td>
               </tr>`).join('')}
           </tbody>
@@ -252,11 +284,14 @@ async function renderUsersTab() {
 }
 
 function openAdjustCreditsModal(userId) {
+  // 2026-04-21 安全审计 MED:UI 接受 ¥ 单位、内部转 cents,避免 admin 误把
+  // "加 ¥1" 输成 1(实际 1 分)或 100x 加多。实时 preview 显示 cents 等价值。
   openModal(`
-    <h3>调整积分(用户 ${escapeHtml(userId)})</h3>
+    <h3>调整余额(用户 ${escapeHtml(userId)})</h3>
     <div class="form-row">
-      <label>delta(分;正数加,负数扣)</label>
-      <input type="text" id="adj-delta" placeholder="例如 100 或 -50" />
+      <label>金额(¥;支持两位小数,正数加,负数扣)</label>
+      <input type="text" id="adj-delta" placeholder="例如 1.00 或 -0.50" autocomplete="off" />
+      <div class="hint" id="adj-preview" style="margin-top:4px; color:#888; font-size:12px;">解析后:—</div>
     </div>
     <div class="form-row">
       <label>memo(必填)</label>
@@ -267,17 +302,31 @@ function openAdjustCreditsModal(userId) {
       <button class="btn-primary" id="adj-ok">提交</button>
     </div>
   `)
+  const updatePreview = () => {
+    const raw = $('adj-delta').value
+    const cents = parseYuanToCents(raw)
+    const el = $('adj-preview')
+    if (cents == null) {
+      el.textContent = raw.trim() === '' ? '解析后:—' : '解析后:无效金额'
+      el.style.color = raw.trim() === '' ? '#888' : '#c00'
+    } else {
+      el.textContent = `解析后:${fmtCents(cents)}(${cents} 分)`
+      el.style.color = '#0a0'
+    }
+  }
+  $('adj-delta').addEventListener('input', updatePreview)
   $('adj-cancel').addEventListener('click', closeModal)
   $('adj-ok').addEventListener('click', async () => {
-    const delta = $('adj-delta').value.trim()
+    const raw = $('adj-delta').value
     const memo = $('adj-memo').value.trim()
-    if (!/^-?\d+$/.test(delta) || delta === '0') {
-      toast('delta 必须是非零整数', 'danger'); return
+    const cents = parseYuanToCents(raw)
+    if (cents == null) {
+      toast('金额必须是非零数字,最多 2 位小数(如 1.00 / -0.50)', 'danger'); return
     }
     if (!memo) { toast('memo 不能为空', 'danger'); return }
     try {
       const r = await apiJson('POST', `/api/admin/users/${userId}/credits`,
-        { delta, memo })
+        { delta: String(cents), memo })
       toast(`已记账,新余额 ${fmtCents(r.balance_after)}`)
       closeModal()
       applyHash()
@@ -811,7 +860,7 @@ async function renderPlansTab() {
         : `
         <table class="data">
           <thead>
-            <tr><th>code</th><th>label</th><th>金额</th><th>积分</th>
+            <tr><th>code</th><th>label</th><th>支付金额</th><th>到账余额</th>
                 <th>排序</th><th>启用</th><th class="actions">操作</th></tr>
           </thead>
           <tbody>
@@ -847,9 +896,9 @@ function openEditPlanModal(d) {
     <h3>编辑套餐 · ${escapeHtml(d.code)}</h3>
     <div class="form-row"><label>label</label>
       <input type="text" id="pl-label" value="${escapeHtml(d.label)}" /></div>
-    <div class="form-row"><label>amount_cents</label>
+    <div class="form-row"><label>amount_cents(支付金额,单位:分;¥1 = 100)</label>
       <input type="text" id="pl-amount" value="${escapeHtml(d.amount)}" /></div>
-    <div class="form-row"><label>credits</label>
+    <div class="form-row"><label>credits(到账余额,单位:分;¥1 = 100,可大于 amount 表赠送)</label>
       <input type="text" id="pl-credits" value="${escapeHtml(d.credits)}" /></div>
     <div class="form-row"><label>sort_order</label>
       <input type="number" id="pl-sort" value="${escapeHtml(d.sort)}" /></div>

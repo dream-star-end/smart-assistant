@@ -284,6 +284,55 @@ describe('T09: buildToolUseLabel — tool use display', () => {
   })
 })
 
+// ── T-MED: parseYuanToCents (admin.js, 2026-04-21 安全审计 单位语义统一) ──
+//
+// admin /api/admin/users/:id/credits 后端 delta 是「分」整数;UI 输入 ¥
+// 后由本函数转 cents,避免误把 "加 ¥1" 输成 1 分。
+const parseYuanToCents = makeCallable<(input: string) => number | null>(
+  extractFunction(appJs, 'parseYuanToCents'),
+)
+describe('T-MED: parseYuanToCents — ¥ → cents 转换 (单位语义统一)', () => {
+  it('整数 ¥', () => assert.equal(parseYuanToCents('1'), 100))
+  it('整数 + ¥ 前缀', () => assert.equal(parseYuanToCents('¥10'), 1000))
+  it('整数 + + 前缀', () => assert.equal(parseYuanToCents('+5'), 500))
+  it('两位小数', () => assert.equal(parseYuanToCents('1.50'), 150))
+  it('一位小数补零', () => assert.equal(parseYuanToCents('1.5'), 150))
+  it('负数', () => assert.equal(parseYuanToCents('-0.25'), -25))
+  it('负数 + ¥', () => assert.equal(parseYuanToCents('-¥0.5'), null), /* ¥ 必须在符号前 */)
+  it('两端空白', () => assert.equal(parseYuanToCents('  ¥1.00  '), 100))
+  it('大额', () => assert.equal(parseYuanToCents('99999.99'), 9999999))
+  it('零值拒绝(零变动无意义)', () => {
+    assert.equal(parseYuanToCents('0'), null)
+    assert.equal(parseYuanToCents('0.00'), null)
+    assert.equal(parseYuanToCents('-0'), null)
+  })
+  it('空串拒绝', () => assert.equal(parseYuanToCents(''), null))
+  it('空白拒绝', () => assert.equal(parseYuanToCents('   '), null))
+  it('非数字拒绝', () => assert.equal(parseYuanToCents('abc'), null))
+  it('超过 2 位小数拒绝(避免分以下精度)', () => {
+    assert.equal(parseYuanToCents('1.234'), null)
+    assert.equal(parseYuanToCents('0.001'), null)
+  })
+  it('科学记数法拒绝', () => {
+    assert.equal(parseYuanToCents('1e3'), null)
+    assert.equal(parseYuanToCents('1.5e2'), null)
+  })
+  it('多个小数点拒绝', () => {
+    assert.equal(parseYuanToCents('1.2.3'), null)
+  })
+  it('单位安全:¥1 一定是 100 分,不是 1 分', () => {
+    // 这条最重要:历史 admin UX 直接收 cents,boss 经常误打 "加 ¥1" → 输 1 →
+    // 实际只加 1 分。新版必须保证 ¥1 → 100 cents。
+    assert.equal(parseYuanToCents('1'), 100)
+    assert.equal(parseYuanToCents('1.00'), 100)
+  })
+  it('非字符串输入拒绝', () => {
+    assert.equal(parseYuanToCents(null as unknown as string), null)
+    assert.equal(parseYuanToCents(undefined as unknown as string), null)
+    assert.equal(parseYuanToCents(123 as unknown as string), null)
+  })
+})
+
 // ── T10: Function extractor sanity ──
 describe('T10: Function extractor sanity checks', () => {
   it('can extract _basename source', () => {
