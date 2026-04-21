@@ -375,6 +375,13 @@ export async function refresh(
       revoked_at: string | null;
       revoked_reason: string | null;
       expired: boolean;
+      // 用 DB 自己的 NOW() 算 age,避免 app/DB 时钟漂移把 race 误判成 theft
+      // 或反过来把真盗用当 race。NULL 当 revoked_at IS NULL 时也为 NULL。
+      revoked_age_sec: string | null;
+      // race 判定加 fingerprint:UA/IP 都对得上才认 race。攻击者从别的
+      // 客户端 replay 即使在 grace 内也会被 fingerprint 拒掉,继续走 theft。
+      bound_user_agent: string | null;
+      bound_ip: string | null;
     }>(
       `SELECT rt.id::text AS id,
               rt.user_id::text AS user_id,
@@ -382,7 +389,12 @@ export async function refresh(
               u.role, u.status,
               rt.revoked_at::text AS revoked_at,
               rt.revoked_reason,
-              (rt.expires_at <= $2::timestamptz) AS expired
+              (rt.expires_at <= $2::timestamptz) AS expired,
+              CASE WHEN rt.revoked_at IS NULL THEN NULL
+                   ELSE EXTRACT(EPOCH FROM (NOW() - rt.revoked_at))::text
+              END AS revoked_age_sec,
+              rt.user_agent AS bound_user_agent,
+              host(rt.ip) AS bound_ip
          FROM refresh_tokens rt
          JOIN users u ON u.id = rt.user_id
         WHERE rt.token_hash = $1
@@ -403,17 +415,24 @@ export async function refresh(
     // 2026-04-21 codex round 1 finding #7 修复:加 rotation grace window。
     // 在 GRACE 内的 rotated reuse 视作合法多 tab race,不触发 theft;
     // GRACE 外的 reuse 才走 mass-revoke。详见 rotationGraceSeconds() 注释。
+    //
+    // R2 finding 加固(2026-04-21):
+    //   1) ageSec 取 DB EXTRACT(EPOCH FROM NOW() - revoked_at),不再用 app
+    //      Date.now() — 避免 app/DB 时钟漂移把 race 误判成 theft 或反之
+    //   2) 加 UA + IP fingerprint:必须和原 row 写入时的 UA/IP 一致才算 race。
+    //      不同 UA/IP 的 grace 内 replay 仍走 theft 路径(攻击者从异地复用)
+    //   3) ageSec < 0(理论不可能,DB 时钟不会倒流)走保守的 theft 而非 race
     if (
       row.revoked_at !== null &&
       !row.expired &&
       row.revoked_reason === "rotated"
     ) {
-      const revokedAtMs = new Date(row.revoked_at).getTime();
-      const ageSec = Number.isFinite(revokedAtMs)
-        ? (Date.now() - revokedAtMs) / 1000
-        : Number.POSITIVE_INFINITY;
+      const ageSecRaw = row.revoked_age_sec !== null ? Number(row.revoked_age_sec) : Number.POSITIVE_INFINITY;
+      const ageSec = Number.isFinite(ageSecRaw) ? ageSecRaw : Number.POSITIVE_INFINITY;
       const grace = rotationGraceSeconds();
-      if (ageSec < grace) {
+      const sameUa = (row.bound_user_agent ?? "") === (deps.userAgent ?? "");
+      const sameIp = (row.bound_ip ?? "") === (deps.remoteIp ?? "");
+      if (grace > 0 && ageSec >= 0 && ageSec < grace && sameUa && sameIp) {
         // Race grace:返特殊 kind,handler 见后**不**清 cookie + 不报 theft
         return { kind: "race" as const };
       }

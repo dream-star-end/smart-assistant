@@ -148,17 +148,27 @@ async function _doRefreshOnce() {
   return { ok: false, race }
 }
 
+// race grace 内 bounded retry:server 默认 grace=10s,但 sibling tab 的
+// refresh 通常 <500ms 完成,我们用 250/500/1000/2000 共 4 次 retry
+// (累计 ~3.75s,远低于 10s grace)足以覆盖绝大多数多 tab 场景。
+// R2 finding 加固:不再单次 retry —— 单次太短会在 sibling tab 慢的时候误踢用户。
+const _RACE_RETRY_DELAYS_MS = [250, 500, 1000, 2000]
+
 function _silentRefresh() {
   if (_refreshInflight) return _refreshInflight
   _refreshInflight = (async () => {
     try {
-      const first = await _doRefreshOnce()
-      if (first.ok) return true
-      if (!first.race) return false
-      // race grace:小睡再 retry 一次,让 sibling tab 的 set-cookie 生效。
-      await new Promise(r => setTimeout(r, 250))
-      const second = await _doRefreshOnce()
-      return second.ok
+      let last = await _doRefreshOnce()
+      if (last.ok) return true
+      if (!last.race) return false
+      for (const delay of _RACE_RETRY_DELAYS_MS) {
+        await new Promise(r => setTimeout(r, delay))
+        last = await _doRefreshOnce()
+        if (last.ok) return true
+        // 中途 server 停 race(如 grace 已过 → INVALID_REFRESH)直接放弃
+        if (!last.race) return false
+      }
+      return false
     } catch {
       return false
     }

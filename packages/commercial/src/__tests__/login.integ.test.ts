@@ -497,17 +497,19 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     await setupUser("paula-race@example.com", "paula good password");
     const lr = await login(
       { email: "paula-race@example.com", password: "paula good password", turnstile_token: "tok" },
-      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", userAgent: "race-test-ua" },
     );
     const oldRaw = lr.refresh_token;
     // 第一次 rotation,r1 是新 live token,oldRaw 刚被 revoked='rotated'(刚刚)
-    const r1 = await refresh(oldRaw, { jwtSecret: JWT_SECRET });
+    const r1 = await refresh(oldRaw, { jwtSecret: JWT_SECRET, remoteIp: "10.1.2.3", userAgent: "race-test-ua" });
 
-    // 立刻再 reuse oldRaw —— grace 内,应判 RACE 不是 theft
+    // 立刻再 reuse oldRaw —— grace 内 + UA/IP 一致,应判 RACE 不是 theft
     let theftFired = false;
     await assert.rejects(
       refresh(oldRaw, {
         jwtSecret: JWT_SECRET,
+        remoteIp: "10.1.2.3",
+        userAgent: "race-test-ua",
         onTheftDetected: () => { theftFired = true; },
       }),
       (err: unknown) =>
@@ -516,7 +518,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     assert.equal(theftFired, false, "race window must NOT fire theft callback");
 
     // r1(合法 live token)必须仍能正常 refresh —— family 没有被牵连
-    const r2 = await refresh(r1.refresh_token, { jwtSecret: JWT_SECRET });
+    const r2 = await refresh(r1.refresh_token, { jwtSecret: JWT_SECRET, remoteIp: "10.1.2.3", userAgent: "race-test-ua" });
     assert.ok(typeof r2.refresh_token === "string" && r2.refresh_token.length > 0);
 
     // family 内不应该有任何 'theft' 行
@@ -527,6 +529,65 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     );
     const theftRows = rows.rows.filter((r) => r.revoked_reason === "theft");
     assert.equal(theftRows.length, 0, "race must not produce any theft-marked rows");
+  });
+
+  // R2 finding 加固:grace 窗口内但 UA/IP 不一致 → 视作攻击者从异地 replay,
+  // 仍走 theft 路径。哪怕攻击者抢在 10s 内复用,只要 fingerprint 不匹配,
+  // family 就被砍。
+  test("reuse INSIDE grace 但 UA/IP 不一致 → theft (fingerprint mismatch)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("quincy-fp@example.com", "quincy good password");
+    const lr = await login(
+      { email: "quincy-fp@example.com", password: "quincy good password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", userAgent: "browser-A" },
+    );
+    const oldRaw = lr.refresh_token;
+    await refresh(oldRaw, { jwtSecret: JWT_SECRET, remoteIp: "10.1.2.3", userAgent: "browser-A" });
+
+    // 立刻 reuse oldRaw,但从不同 IP/UA 来 → 不算 race,算 theft
+    let theftFired = false;
+    await assert.rejects(
+      refresh(oldRaw, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "1.2.3.4",  // 异地
+        userAgent: "evil-ua",
+        onTheftDetected: () => { theftFired = true; },
+      }),
+      (err: unknown) =>
+        err instanceof RefreshError && err.code === "INVALID_REFRESH",
+    );
+    assert.equal(theftFired, true, "fingerprint mismatch in grace must still fire theft");
+  });
+
+  // R2 finding 加固:grace=0 时关掉 race 行为(同 token 任何复用都视为 theft)
+  test("REFRESH_ROTATION_GRACE_SECONDS=0 → 任何 rotated reuse 都判 theft", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = "0";
+    try {
+      await setupUser("ronan-grace0@example.com", "ronan good password");
+      const lr = await login(
+        { email: "ronan-grace0@example.com", password: "ronan good password", turnstile_token: "tok" },
+        { jwtSecret: JWT_SECRET, turnstileBypass: true },
+      );
+      const oldRaw = lr.refresh_token;
+      await refresh(oldRaw, { jwtSecret: JWT_SECRET });
+
+      // 立刻 reuse — grace=0 应该跳过 race 直接 theft
+      let theftFired = false;
+      await assert.rejects(
+        refresh(oldRaw, {
+          jwtSecret: JWT_SECRET,
+          onTheftDetected: () => { theftFired = true; },
+        }),
+        (err: unknown) =>
+          err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      assert.equal(theftFired, true, "grace=0 must disable race window entirely");
+    } finally {
+      if (prev === undefined) delete process.env.REFRESH_ROTATION_GRACE_SECONDS;
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
   });
 
   test("expired+rotated reuse does NOT trigger theft (token natural-dead, no signal)", async (t) => {
