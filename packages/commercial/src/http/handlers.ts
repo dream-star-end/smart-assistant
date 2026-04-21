@@ -110,8 +110,17 @@ export interface RequestContext {
    */
   clientIp: string;
   /**
-   * 2026-04-22 HIGH#4 回归修:auth 专用的"稳定出口 IP",给 login/refresh/register
-   * 的 `remoteIp` 参数用,作为 bound_ip 写入 refresh_tokens。
+   * 2026-04-22 HIGH#4 回归修:auth 专用的"稳定出口 IP"。
+   *
+   * 用途(R5 audit 后精确范围):
+   *   - `handleLogin` → `LoginDeps.bindIp`,作为 `refresh_tokens.ip` 写入
+   *   - `handleRefresh` → `RefreshExtraDeps.remoteIp`,用于 race grace sameIp
+   *     比对 + 新 row 的 `refresh_tokens.ip`
+   *   - 所有写 / 比对 `refresh_tokens.ip`(bound_ip fingerprint)的场景
+   *
+   * **不用于** Turnstile remoteip(register/login/requestPasswordReset 里
+   * 的 `remoteIp` 参数只给 Turnstile,继续使用 `ctx.clientIp`,CF bot 评分需要
+   * 真实访客 IP)。详见 `LoginDeps.remoteIp` / `bindIp` 的 JSDoc。
    *
    * 语义:**不经任何反代 header 解析**,直接 socket.remoteAddress:
    *   - Caddy 反代时永远 = 127.0.0.1(loopback)→ race grace sameIp 恒真,合法多 tab
