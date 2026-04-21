@@ -507,6 +507,44 @@ describe("admin HTTP: /api/admin/users", () => {
     assert.equal(r2.status, 400);
   });
 
+  // 2026-04-21 codex round 1 finding #6 修复回归:
+  // delta abs > ¥100 万(1e8 cents) → 400 VALIDATION,服务端硬 cap。
+  test("POST /credits: delta 超 ±1e8 cents 硬 cap → 400 VALIDATION", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const uid = await createUser("u@x.com");
+    const atk = await tokenFor(admin, "admin");
+
+    // 字符串路径(BigInt safe)— 大数也能精确表达
+    const tooBig = "100000001"; // = 100,000,001 cents = ¥1,000,000.01
+    const r = await fetch(`${baseUrl}/api/admin/users/${uid}/credits`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${atk}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ delta: tooBig, memo: "should reject" }),
+    });
+    assert.equal(r.status, 400);
+    const body = await r.json() as { error: { code: string; message: string } };
+    assert.equal(body.error.code, "VALIDATION");
+    assert.match(body.error.message, /cap|exceed/i);
+
+    // 反向同样 reject
+    const r2 = await fetch(`${baseUrl}/api/admin/users/${uid}/credits`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${atk}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ delta: "-100000001", memo: "should reject" }),
+    });
+    assert.equal(r2.status, 400);
+
+    // 正好顶到 cap (1e8 cents = ¥1,000,000) 必须能通过(假设余额够;
+    // 这里只验证 cap 本身不误伤,我们让 user 起始有充足余额)
+    const r3 = await fetch(`${baseUrl}/api/admin/users/${uid}/credits`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${atk}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ delta: "100000000", memo: "exactly cap" }),
+    });
+    assert.equal(r3.status, 200, "cap-on-the-dot must succeed");
+  });
+
   test("POST /credits: negative > balance → 402 INSUFFICIENT_CREDITS", async (t) => {
     if (skipIfNoHttp(t)) return;
     const admin = await createUser("a@x.com", "admin");

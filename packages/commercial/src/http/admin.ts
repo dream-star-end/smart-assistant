@@ -314,6 +314,17 @@ export async function handleAdminAdjustCredits(
       issues: [{ path: "delta", message: "0" }],
     });
   }
+  // 2026-04-21 codex round 1 finding #6 修复:服务端硬 cap delta 绝对值 ≤
+  // ¥100 万(= 1 亿 cents)。前端 UI 已按 ¥X.XX 收并转 cents,但前端可被
+  // 绕过/Number 精度损失;服务端必须独立守住,不能把安全押在前端。
+  // 100 万 ¥ 远超任何合法 admin 手动调整场景;真要更大金额走 dev 直改 DB。
+  const MAX_ADMIN_DELTA_CENTS = 100_000_000n; // ¥1,000,000 = 100,000,000 cents
+  const absDelta = delta < 0n ? -delta : delta;
+  if (absDelta > MAX_ADMIN_DELTA_CENTS) {
+    throw new HttpError(400, "VALIDATION", "delta exceeds ±100,000,000 cents (¥1,000,000) cap", {
+      issues: [{ path: "delta", message: delta.toString() }],
+    });
+  }
   if (typeof b.memo !== "string" || b.memo.trim().length === 0) {
     throw new HttpError(400, "VALIDATION", "memo is required", {
       issues: [{ path: "memo", message: "" }],

@@ -331,6 +331,19 @@ describe('T-MED: parseYuanToCents — ¥ → cents 转换 (单位语义统一)',
     assert.equal(parseYuanToCents(undefined as unknown as string), null)
     assert.equal(parseYuanToCents(123 as unknown as string), null)
   })
+  // codex round 1 finding #6 — 与后端 ¥1,000,000 = 100,000,000 cents 硬 cap 对齐
+  it('恰好 cap (¥1,000,000) 接受', () => {
+    assert.equal(parseYuanToCents('1000000'), 100_000_000)
+    assert.equal(parseYuanToCents('1000000.00'), 100_000_000)
+  })
+  it('超过 cap 拒绝(避免 Number 精度丢 + 后端 400)', () => {
+    assert.equal(parseYuanToCents('1000000.01'), null)
+    assert.equal(parseYuanToCents('9999999'), null)
+  })
+  it('整数部位超 10 位直接拒绝(防 Number 精度损失)', () => {
+    assert.equal(parseYuanToCents('99999999999'), null) // 11 位
+    assert.equal(parseYuanToCents('12345678901.23'), null)
+  })
 })
 
 // ── T10: Function extractor sanity ──
