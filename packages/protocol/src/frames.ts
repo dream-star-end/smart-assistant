@@ -221,6 +221,33 @@ export const OutboundPermissionSettled = Type.Object({
 export type OutboundPermissionSettled = Static<typeof OutboundPermissionSettled>
 
 // ───────────────────────────────────────────────
+// Resume-failed notification (gateway → client)
+//
+// Emitted when a reconnecting client's hello frame carries a `lastFrameSeq`
+// that the server's outbound ring buffer can no longer satisfy (pruned by
+// size / age limits, or server restarted since last_seq). The client treats
+// this as "you missed frames you can no longer replay — force a full REST
+// sync of the session." Phase 0.3 durability guard rail.
+// ───────────────────────────────────────────────
+export const OutboundResumeFailed = Type.Object({
+  type: Type.Literal('outbound.resume_failed'),
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  /** Client's last-seen frameSeq from hello. */
+  from: Type.Number(),
+  /** Server's current frameSeq at time of resume attempt. */
+  to: Type.Number(),
+  /** Why replay couldn't be served. */
+  reason: Type.Union([
+    Type.Literal('buffer_miss'),          // Range exists but pruned (old / oversize).
+    Type.Literal('no_buffer'),            // No ring buffer (server restarted).
+    Type.Literal('sequence_mismatch'),    // Client seq ahead of server — bogus.
+  ]),
+})
+export type OutboundResumeFailed = Static<typeof OutboundResumeFailed>
+
+// ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
 export const ControlListSessions = Type.Object({
@@ -243,6 +270,7 @@ export const AnyFrame = Type.Union([
   OutboundMessage,
   OutboundPermissionRequest,
   OutboundPermissionSettled,
+  OutboundResumeFailed,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>

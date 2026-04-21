@@ -10,6 +10,7 @@
 // assistant_text) for the turn into sessions_fts. Queries use MATCH and
 // group hits by session_id to return top-N unique sessions.
 
+import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import Database from 'better-sqlite3'
@@ -497,39 +498,493 @@ export interface ClientSessionMeta {
   updatedAt: number
 }
 
+// ── Pure merge helpers (exported for unit testing) ──
+
+/** Minimal shape this module relies on. Real messages carry more fields. */
+export type MessageLike = {
+  id?: string
+  ts?: number
+  _source?: string
+  [k: string]: unknown
+}
+
+/**
+ * Merge a client PUT (`clientMsgs`) on top of what the server already has
+ * (`serverSideMsgs`), preserving any server-authored messages the client
+ * didn't include. Server-authored == `_source === 'server'`. The resulting
+ * array is sorted by `ts` ascending.
+ *
+ * Rules:
+ *   1. For each server-authored message, the server version wins: if
+ *      clientMsgs has a message with the same id, replace it with the
+ *      server version; if clientMsgs lacks that id, re-append the server
+ *      version.
+ *   2. Every non-server-authored entry stays exactly as the client sent it,
+ *      EXCEPT for the "phantom-assistant dedupe" in rule 3.
+ *   3. **Phantom-assistant dedupe** (Phase 0.4 P0-3 fix): client and server
+ *      use independent assistant message IDs (client uses `m-*` from
+ *      msgId(); server writes `srv-${peerId}-t${turnIndex}`). When a turn
+ *      completes, BOTH can end up in `merged`: the client's partially-
+ *      streamed copy AND the server-authored authoritative copy. We drop
+ *      the client one when it is adjacent in the ts-sorted array to a
+ *      server-authored assistant message (no user message between them =
+ *      same turn). Never drops a server-authored entry. Without this rule
+ *      the user sees every assistant response twice after any mobile-
+ *      background recovery.
+ *   4. Result is sorted by ts ascending; ties preserve insertion order
+ *      (Array.prototype.sort is stable in ES2019+).
+ *   5. If there are zero server-authored entries, `clientMsgs` is returned
+ *      verbatim (no copy, same reference) — callers rely on this as a fast
+ *      path.
+ */
+export function mergePreservingServerAuthored<T extends MessageLike>(
+  serverSideMsgs: readonly T[],
+  clientMsgs: readonly T[],
+): T[] | readonly T[] {
+  const serverAuthored = new Map<string, T>()
+  for (const m of serverSideMsgs) {
+    if (m && m._source === 'server' && typeof m.id === 'string') {
+      serverAuthored.set(m.id, m)
+    }
+  }
+  if (serverAuthored.size === 0) return clientMsgs
+
+  const clientIds = new Set<string>()
+  for (const m of clientMsgs) {
+    if (m && typeof m.id === 'string') clientIds.add(m.id)
+  }
+
+  const merged: T[] = clientMsgs.map((m) => {
+    if (m && typeof m.id === 'string' && serverAuthored.has(m.id)) {
+      return serverAuthored.get(m.id) as T
+    }
+    return m
+  })
+  for (const [, msg] of serverAuthored) {
+    if (typeof msg.id === 'string' && !clientIds.has(msg.id)) merged.push(msg)
+  }
+  merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+
+  // Phantom-assistant dedupe (rule 3): partition merged[] into turns on
+  // user/system messages (which act as turn boundaries — the model never
+  // produces those client-side on its own). Within each partition, if any
+  // server-authored assistant exists, drop ALL non-server-authored
+  // assistants in that partition (they are phantoms of the same turn).
+  //
+  // This is broader than a simple adjacency check because tool-use turns
+  // end up with MULTIPLE client-side assistant segments separated by
+  // tool_use / tool_result messages (see websocket.js where a tool_use
+  // block clears `_streamingAssistant` so the next text creates a new
+  // bubble). Server writes one aggregated assistant per turn, so pair-wise
+  // adjacency would leave earlier client segments orphaned.
+  //
+  // Never drops a server-authored message; never drops a client message
+  // that is not an assistant (tool, tool_result, user, thinking, etc. are
+  // always preserved). Also tolerates both ts-sort orders of the server
+  // row relative to client segments (server clock earlier or later).
+  const deduped: T[] = []
+  const isAssistant = (m: T) => (m as { role?: string }).role === 'assistant'
+  const isTurnBoundary = (m: T) => {
+    const role = (m as { role?: string }).role
+    return role === 'user' || role === 'system'
+  }
+  // First pass: compute per-index turn group id, and whether that group has
+  // any server-authored assistant. We need this because the decision to
+  // drop a phantom depends on the ENTIRE partition, not just its neighbours.
+  const turnGroup: number[] = new Array(merged.length)
+  const groupHasServerAsst: boolean[] = []
+  let groupId = 0
+  let currentGroupHasServer = false
+  for (let i = 0; i < merged.length; i++) {
+    const cur = merged[i]
+    if (cur && isTurnBoundary(cur)) {
+      // Close previous group, open a new one. The boundary itself belongs
+      // to the starting group of what follows (a user message opens a new
+      // turn; we tag it with the new groupId so any dedupe scan after it
+      // lands in the right bucket).
+      groupHasServerAsst.push(currentGroupHasServer)
+      groupId++
+      currentGroupHasServer = false
+    }
+    turnGroup[i] = groupId
+    if (cur && isAssistant(cur) && cur._source === 'server') {
+      currentGroupHasServer = true
+    }
+  }
+  groupHasServerAsst.push(currentGroupHasServer)
+
+  for (let i = 0; i < merged.length; i++) {
+    const cur = merged[i]
+    if (!cur) { deduped.push(cur); continue }
+    // Keep server-authored messages, non-assistant messages, and assistants
+    // in a partition that has no server-authored counterpart.
+    if (!isAssistant(cur) || cur._source === 'server') {
+      deduped.push(cur)
+      continue
+    }
+    const g = turnGroup[i]
+    if (groupHasServerAsst[g]) {
+      // This client-assistant lives in a turn that the server re-authored.
+      // Drop as phantom.
+      continue
+    }
+    deduped.push(cur)
+  }
+  return deduped
+}
+
+/**
+ * Idempotent append of a server-authored message to an existing messages
+ * array. Returns `{ applied: false, reason: 'already_exists' }` if a
+ * message with the same id already exists, else returns a new sorted
+ * array with the stamped message included.
+ *
+ * Pure: doesn't mutate `existing`. `message._source` is always stamped
+ * to `'server'` in the returned copy, and `ts` defaults to `now` if
+ * missing so subsequent sort is well-defined.
+ */
+export function appendServerAuthoredPure<T extends MessageLike>(
+  existing: readonly T[],
+  message: T & { id: string },
+  now: number = Date.now(),
+): { applied: true; messages: T[] } | { applied: false; reason: 'already_exists' } {
+  if (existing.some((m) => m && m.id === message.id)) {
+    return { applied: false, reason: 'already_exists' }
+  }
+  const stamped = { ...message, _source: 'server', ts: message.ts ?? now } as T
+  const next = [...existing, stamped]
+  next.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+  return { applied: true, messages: next }
+}
+
 /**
  * Returns true if the row was actually inserted/updated, false if rejected.
  * @param baseSyncedAt - client's last known server updated_at (optimistic concurrency).
  *   On conflict, the write is only applied if the existing row's updated_at <= baseSyncedAt
  *   (i.e., the client has seen the latest version). For new inserts this is ignored.
+ *
+ * **Server-authored message preservation**: messages in the existing row that
+ * carry `_source: 'server'` (written by {@link appendServerAuthoredMessage})
+ * MUST survive a client PUT that doesn't include them. This is the mobile
+ * stream durability contract — when a mobile client goes to background and
+ * misses the tail of an assistant message, its subsequent PUT would otherwise
+ * overwrite the server's complete copy with the truncated local copy. We
+ * delegate merging to {@link mergePreservingServerAuthored} so the policy is
+ * testable in isolation.
  */
 export async function upsertClientSession(session: ClientSession, baseSyncedAt = 0): Promise<boolean> {
   const db = await getSessionsDb()
-  const result = db.prepare(`
-    INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at)
-    VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @updatedAt)
-    ON CONFLICT(id) DO UPDATE SET
-      agent_id = excluded.agent_id,
-      title = excluded.title,
-      pinned = excluded.pinned,
-      last_at = excluded.last_at,
-      messages = excluded.messages,
-      updated_at = excluded.updated_at
-    WHERE client_sessions.updated_at <= @baseSyncedAt
-      AND client_sessions.user_id = @userId
-  `).run({
-    id: session.id,
-    userId: session.userId,
-    agentId: session.agentId,
-    title: session.title,
-    pinned: session.pinned ? 1 : 0,
-    createdAt: session.createdAt,
-    lastAt: session.lastAt,
-    messages: JSON.stringify(session.messages),
-    updatedAt: session.updatedAt,
-    baseSyncedAt,
+  const txn = db.transaction(() => {
+    const existing = db.prepare(
+      'SELECT messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(session.id, session.userId) as { messages: string; updated_at: number } | undefined
+
+    // Reject stale writes (same optimistic concurrency check as the pre-transaction version)
+    if (existing && existing.updated_at > baseSyncedAt) return false
+
+    let finalMessages: unknown[] = session.messages
+    if (existing) {
+      try {
+        const oldMsgs = JSON.parse(existing.messages) as MessageLike[]
+        if (Array.isArray(oldMsgs)) {
+          const clientMsgs = session.messages as MessageLike[]
+          finalMessages = mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[]
+        }
+      } catch { /* malformed existing messages JSON — fall back to client payload */ }
+    }
+
+    const result = db.prepare(`
+      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at)
+      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @updatedAt)
+      ON CONFLICT(id) DO UPDATE SET
+        agent_id = excluded.agent_id,
+        title = excluded.title,
+        pinned = excluded.pinned,
+        last_at = excluded.last_at,
+        messages = excluded.messages,
+        updated_at = excluded.updated_at
+      WHERE client_sessions.updated_at <= @baseSyncedAt
+        AND client_sessions.user_id = @userId
+    `).run({
+      id: session.id,
+      userId: session.userId,
+      agentId: session.agentId,
+      title: session.title,
+      pinned: session.pinned ? 1 : 0,
+      createdAt: session.createdAt,
+      lastAt: session.lastAt,
+      messages: JSON.stringify(finalMessages),
+      updatedAt: session.updatedAt,
+      baseSyncedAt,
+    })
+    return result.changes > 0
   })
-  return result.changes > 0
+  return txn()
+}
+
+/**
+ * Append a server-authored message to a client session's messages array,
+ * idempotently. Called by the gateway's turn.completed handler to persist the
+ * authoritative assistant message so the client can always recover it via
+ * REST force-sync, even if the WebSocket delivery was lost during mobile
+ * backgrounding, tab freeze, or network interruption.
+ *
+ * Key properties:
+ *   - Idempotent by message id: repeated calls with the same id are no-ops.
+ *   - Stamps `_source: 'server'` so subsequent client PUTs via
+ *     {@link upsertClientSession} won't drop or overwrite the message.
+ *   - Sorts messages by ts ascending to keep ordering stable across out-of-
+ *     order persistence (e.g., multiple turns completing in quick succession).
+ *   - Runs in a BEGIN IMMEDIATE transaction so read-modify-write is atomic
+ *     against concurrent client PUTs.
+ *
+ * Returns `applied: false` when the session row doesn't exist yet (caller
+ * should ensure the client has created it first) or when a message with the
+ * same id already exists.
+ */
+export async function appendServerAuthoredMessage(
+  sessId: string,
+  userId: string,
+  message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
+): Promise<{ applied: boolean; reason?: 'session_not_found' | 'already_exists' | 'malformed' }> {
+  const db = await getSessionsDb()
+  const txn = db.transaction(() => {
+    const row = db.prepare(
+      'SELECT messages FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(sessId, userId) as { messages: string } | undefined
+    if (!row) return { applied: false, reason: 'session_not_found' as const }
+
+    let msgs: MessageLike[]
+    try {
+      const parsed = JSON.parse(row.messages)
+      if (!Array.isArray(parsed)) return { applied: false, reason: 'malformed' as const }
+      msgs = parsed as MessageLike[]
+    } catch {
+      return { applied: false, reason: 'malformed' as const }
+    }
+
+    const result = appendServerAuthoredPure(msgs, message as MessageLike & { id: string })
+    if (!result.applied) return { applied: false, reason: result.reason }
+
+    const now = Date.now()
+    db.prepare(
+      'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ? WHERE id = ? AND user_id = ?'
+    ).run(JSON.stringify(result.messages), now, now, sessId, userId)
+    return { applied: true }
+  })
+  return txn()
+}
+
+// ── Phase 0.2: durable outbox for server-authored messages ──
+//
+// If the SQLite write fails (disk full, database locked, transient I/O error,
+// or gateway crash mid-transaction), we don't want to silently drop the
+// assistant message — that's the exact failure mode we're trying to prevent.
+// Instead, the message is appended as a single JSON line to
+// `paths.msgOutbox` and replayed on the next gateway startup.
+//
+// Schema: each line is a `QueuedMessage` JSON object. The file is line-
+// addressable so readers can process entries independently; an atomic
+// replace-and-truncate is used after successful replay.
+
+export interface QueuedMessage {
+  sessId: string
+  userId: string
+  message: {
+    id: string
+    role: 'assistant' | 'user' | 'system'
+    text?: string
+    ts?: number
+    status?: 'completed' | 'interrupted' | 'crashed'
+    [k: string]: unknown
+  }
+  /** When the write was queued (wall-clock ms). */
+  queuedAt: number
+  /** Optional reason the direct write failed — aids debugging on replay. */
+  reason?: string
+}
+
+/**
+ * Serialize one queued message to its JSONL form. Exported for tests.
+ * Never throws: non-JSON-safe values are stringified via try/catch at the
+ * call site.
+ */
+export function queuedMessageToLine(entry: QueuedMessage): string {
+  return JSON.stringify(entry) + '\n'
+}
+
+/**
+ * Parse a JSONL line into a `QueuedMessage`. Returns null if the line is
+ * blank or malformed — replay is best-effort, so we skip rather than crash.
+ * Exported for tests.
+ */
+export function parseQueuedMessageLine(line: string): QueuedMessage | null {
+  const trimmed = line.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = JSON.parse(trimmed) as QueuedMessage
+    if (
+      !parsed ||
+      typeof parsed.sessId !== 'string' ||
+      typeof parsed.userId !== 'string' ||
+      !parsed.message ||
+      typeof parsed.message.id !== 'string'
+    ) {
+      return null
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/** Append a queued message to the outbox file (create-if-missing). */
+export async function queueMessageToOutbox(entry: QueuedMessage): Promise<void> {
+  await mkdir(dirname(paths.msgOutbox), { recursive: true })
+  await appendFile(paths.msgOutbox, queuedMessageToLine(entry), { encoding: 'utf8' })
+}
+
+/**
+ * Durable variant of {@link appendServerAuthoredMessage}. On any thrown
+ * error from the DB write (disk full, BUSY, corrupt, etc.), the entry is
+ * appended to the msg-outbox JSONL file for replay on next startup.
+ *
+ * Return shape:
+ *   { applied: true }                                      — row updated
+ *   { applied: false, reason: 'session_not_found' }        — caller bug
+ *   { applied: false, reason: 'already_exists' }           — idempotent skip
+ *   { applied: false, reason: 'malformed' }                — bad row data
+ *   { applied: false, reason: 'queued_to_outbox', error } — DB failure,
+ *     message safely persisted to outbox and will be retried on startup.
+ */
+export async function appendServerAuthoredMessageDurable(
+  sessId: string,
+  userId: string,
+  message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
+): Promise<
+  | { applied: true }
+  | { applied: false; reason: 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'queued_to_outbox'; error: string }
+> {
+  try {
+    const r = await appendServerAuthoredMessage(sessId, userId, message)
+    if (r.applied) return { applied: true }
+    // Phase 0.4 P1-3 fix: when the client_sessions row doesn't exist yet
+    // (first-turn race — client's debounced PUT hasn't landed before the
+    // REPL finished), don't silently drop the authoritative assistant text.
+    // Queue it to the durable outbox so the next replayMsgOutbox() run
+    // (startup, or the periodic replay hook) can persist it once the client
+    // has pushed the session row. Without this, a fast new-chat turn can
+    // lose its reply entirely if the user backgrounds the tab between
+    // submit and PUT.
+    if (r.reason === 'session_not_found') {
+      await queueMessageToOutbox({
+        sessId,
+        userId,
+        message,
+        queuedAt: Date.now(),
+        reason: 'session_not_found',
+      })
+      return { applied: false, reason: 'queued_to_outbox', error: 'session_not_found' }
+    }
+    // Upstream's signature types `reason` as optional, but every applied:false
+    // branch above sets one of {'session_not_found','already_exists','malformed'}.
+    // We've handled 'session_not_found'; the rest fall through here. Default
+    // to 'malformed' if reason is somehow missing (unreachable in practice).
+    return { applied: false, reason: r.reason ?? 'malformed' }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    try {
+      await queueMessageToOutbox({
+        sessId,
+        userId,
+        message,
+        queuedAt: Date.now(),
+        reason: msg,
+      })
+    } catch (queueErr) {
+      // Both DB and outbox failed — the caller's try/catch will log. Surface
+      // the original DB error rather than the outbox one (more actionable).
+      throw err
+    }
+    return { applied: false, reason: 'queued_to_outbox', error: msg }
+  }
+}
+
+/**
+ * Replay any messages queued in the outbox. Called on gateway startup before
+ * opening the WS endpoint, so durable writes catch up before live traffic.
+ *
+ * Strategy:
+ *   1. Read the entire outbox file into memory (bounded by disk size; we
+ *      cap individual lines but total file size is trusted because only the
+ *      gateway itself ever writes to it).
+ *   2. For each parseable entry, attempt `appendServerAuthoredMessage`.
+ *   3. Entries that succeed or are permanent no-ops (`session_not_found` —
+ *      session was deleted while queued; `already_exists` — duplicate from
+ *      a prior partial replay) are dropped.
+ *   4. Entries whose DB write still throws are kept in the file for a
+ *      future retry.
+ *   5. After processing, atomically rewrite the file with survivors (or
+ *      delete it if empty).
+ *
+ * Returns a summary so the caller can emit telemetry.
+ */
+export async function replayMsgOutbox(): Promise<{
+  processed: number
+  applied: number
+  dropped: number
+  requeued: number
+  malformed: number
+}> {
+  let raw: string
+  try {
+    raw = await readFile(paths.msgOutbox, { encoding: 'utf8' })
+  } catch (err: any) {
+    if (err && err.code === 'ENOENT') {
+      return { processed: 0, applied: 0, dropped: 0, requeued: 0, malformed: 0 }
+    }
+    throw err
+  }
+  const lines = raw.split('\n')
+  let applied = 0
+  let dropped = 0
+  let malformed = 0
+  const survivors: string[] = []
+
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const entry = parseQueuedMessageLine(line)
+    if (!entry) {
+      malformed++
+      continue
+    }
+    try {
+      const r = await appendServerAuthoredMessage(entry.sessId, entry.userId, entry.message)
+      if (r.applied) {
+        applied++
+      } else if (r.reason === 'already_exists' || r.reason === 'session_not_found' || r.reason === 'malformed') {
+        dropped++
+      } else {
+        survivors.push(queuedMessageToLine(entry).trimEnd())
+      }
+    } catch {
+      survivors.push(queuedMessageToLine(entry).trimEnd())
+    }
+  }
+
+  const requeued = survivors.length
+  const processed = applied + dropped + requeued + malformed
+
+  // Atomic rewrite: write to .tmp, rename over. If survivors is empty, just
+  // overwrite with empty contents (keeping the file avoids repeated mkdir).
+  const tmp = `${paths.msgOutbox}.tmp-${process.pid}-${Date.now()}`
+  const content = survivors.length > 0 ? survivors.join('\n') + '\n' : ''
+  await mkdir(dirname(paths.msgOutbox), { recursive: true })
+  await writeFile(tmp, content, { encoding: 'utf8' })
+  await rename(tmp, paths.msgOutbox)
+
+  return { processed, applied, dropped, requeued, malformed }
 }
 
 export async function listClientSessions(userId: string): Promise<ClientSessionMeta[]> {

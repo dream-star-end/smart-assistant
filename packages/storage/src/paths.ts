@@ -23,6 +23,10 @@ export const paths = {
     join(HOME, 'agents', agentId, 'skills', skillName, 'SKILL.md'),
   // Session search (L2): SQLite FTS5 DB per install (not per agent)
   sessionsDb: join(HOME, 'sessions.db'),
+  // Phase 0.2: durable outbox for server-authored messages that couldn't be
+  // written to sessions.db immediately (disk full, SQLite BUSY, crash mid-write).
+  // Replayed on gateway startup. JSONL format, one queued write per line.
+  msgOutbox: join(HOME, 'msg-outbox.jsonl'),
   // Cron (L3)
   cronYaml: join(HOME, 'cron.yaml'),
   cronOutputsDir: join(HOME, 'cron', 'outputs'),
