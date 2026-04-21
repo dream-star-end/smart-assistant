@@ -568,6 +568,18 @@ export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult, f
       const callbacks = _pendingOnResultCallbacks
       _pendingOnResultCallbacks = []
       for (const entry of callbacks) {
+        if (entry.fresh) {
+          // `fresh: true` was enqueued while THIS sync was already running,
+          // meaning the caller mutated session-level flags (e.g.
+          // `_liveStreamBroken`) AFTER our wire request was in flight. Firing
+          // on `result` here would observe a pre-mutation snapshot and e.g.
+          // clear `_liveStreamBroken` before the tail sync actually re-pulls
+          // with the flag set. Re-queue as a regular (fresh:false) entry so
+          // the tail sync scheduled by the `freshAfterInFlight` branch picks
+          // it up and fires on its own — post-mutation — result.
+          _pendingOnResultCallbacks.push({ onResult: entry.onResult, fresh: false })
+          continue
+        }
         if (!entry.onResult) continue
         // Each callback is best-effort isolated: a throw from one must not
         // prevent the next from running or leak past the sync boundary.
