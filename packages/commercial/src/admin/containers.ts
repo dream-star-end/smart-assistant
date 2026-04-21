@@ -65,7 +65,27 @@ export interface AdminContainerRowView {
   workspace_volume: string;
   home_volume: string;
   image: string;
-  status: string;
+  /**
+   * v2 lifecycle 字段;v3 行不维护这个,看 `state` / `lifecycle`。
+   * 历史 v2 值:provisioning/running/stopped/removed/error。
+   */
+  status: string | null;
+  /**
+   * v3 lifecycle 字段(0012 起);v2 行不写这个。
+   * 值:active/vanished。NULL 表示这是 v2 行。
+   * codex round 1 finding #4 修复:之前 admin UI 只看 `status`,
+   * 看不到 v3 行真状态。
+   */
+  state: string | null;
+  /**
+   * UI 渲染用的统一 lifecycle 字段:
+   *   - v2 行(docker_name 非空) → 取 status
+   *   - v3 行(docker_name=NULL) → 取 state
+   * 由 SQL 直接 COALESCE 出来,前端无需再判类型。
+   */
+  lifecycle: string | null;
+  /** 行类型,显式给 UI 区分 v2/v3 用。 */
+  row_kind: "v2" | "v3";
   last_started_at: Date | null;
   last_stopped_at: Date | null;
   volume_gc_at: Date | null;
@@ -87,6 +107,16 @@ const CONTAINER_COLS = `
   c.home_volume,
   c.image,
   c.status,
+  c.state,
+  -- v2 行用 status,v3 行用 state,UI 拿一个字段就够
+  CASE
+    WHEN COALESCE(NULLIF(c.docker_name, ''), '') = '' THEN c.state
+    ELSE c.status
+  END AS lifecycle,
+  CASE
+    WHEN COALESCE(NULLIF(c.docker_name, ''), '') = '' THEN 'v3'
+    ELSE 'v2'
+  END AS row_kind,
   c.last_started_at,
   c.last_stopped_at,
   c.volume_gc_at,

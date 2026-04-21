@@ -541,6 +541,42 @@ describe("stopAndRemoveV3Container", () => {
     );
     assert.equal(pool.rows[0]!.state, "vanished");
   });
+
+  // 2026-04-21 codex round 1 finding #4 修复回归:
+  // docker stop 抛非 404 错误时,row 必须仍然被标 vanished(admin 意图权威),
+  // 避免行残留 active + ensureRunning 后续陷入 stopped 死循环。
+  test("docker stop 抛非-404 错 → row 仍标 vanished(意图权威),错向上抛", async () => {
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 77,
+      user_id: 1,
+      bound_ip: "172.30.5.5",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "halfdead",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const dockerWithErr = {
+      getContainer: () => ({
+        stop: async () => { throw httpError(500, "docker daemon overloaded"); },
+        remove: async () => { /* never reached */ },
+      }),
+    } as unknown as Docker;
+    await assert.rejects(
+      stopAndRemoveV3Container(
+        { docker: dockerWithErr, pool: pool as unknown as Pool, image: TEST_IMAGE },
+        { id: 77, container_internal_id: "halfdead" },
+      ),
+      (err: Error) => err instanceof SupervisorError,
+      "non-404 docker stop error must propagate (admin sees the failure)",
+    );
+    // 关键断言:即使 docker 抛错,DB 已被先翻 vanished —— 下次 ensureRunning
+    // 看到没 active 行,直接走 provision 而不是死循环 stopped。
+    assert.equal(pool.rows[0]!.state, "vanished");
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────

@@ -56,23 +56,27 @@ function fmtCents(cents) {
  *   - "1"、"1.5"、"1.50"、"-0.25"、"  ¥10  "、"+5.00"
  * 拒绝(返回 null):
  *   - 空串、非数字、超过 2 位小数、NaN/Inf、"0"/"0.00"(零变动无意义)
+ *   - 整数部分超过 10 位 / 绝对值超过 100,000,000 cents(¥100 万) —— 与
+ *     codex round 1 finding #6 修的服务端硬 cap 对齐,避免前端 Number()
+ *     精度损失把超长输入静默截断后再交给后端
  */
 function parseYuanToCents(input) {
+  // ¥1,000,000 = 100,000,000 cents — 与 commercial/src/http/admin.ts 后端硬 cap 严格一致
+  const MAX_ADMIN_DELTA_CENTS = 100_000_000
   if (typeof input !== 'string') return null
   const trimmed = input.trim().replace(/^¥/, '').replace(/^\+/, '')
   if (trimmed === '') return null
-  // sign + integer + optional .frac (max 2 digits)
-  const m = /^(-?)(\d+)(?:\.(\d{1,2}))?$/.exec(trimmed)
+  // sign + integer (最多 10 位防 Number 精度丢) + optional .frac (max 2 digits)
+  const m = /^(-?)(\d{1,10})(?:\.(\d{1,2}))?$/.exec(trimmed)
   if (!m) return null
   const negative = m[1] === '-'
   const intPart = m[2]
   const fracPart = (m[3] ?? '').padEnd(2, '0')
-  // BigInt-safe combine, then back to Number for caller transport (delta < 2^53 always
-  // —— 我们禁止单笔超过 ±10^12 cents,handler 也会再校验一次).
   const combined = `${intPart}${fracPart}`.replace(/^0+(?=\d)/, '')
   if (combined === '0' || combined === '') return null
   const cents = Number(combined)
   if (!Number.isFinite(cents) || !Number.isInteger(cents)) return null
+  if (cents > MAX_ADMIN_DELTA_CENTS) return null
   return negative ? -cents : cents
 }
 
@@ -676,7 +680,7 @@ async function renderContainersTab() {
         : `
         <table class="data">
           <thead>
-            <tr><th>id</th><th>用户</th><th>订阅</th><th>状态</th>
+            <tr><th>id</th><th>类型</th><th>用户</th><th>订阅</th><th>状态</th>
                 <th>docker</th><th>image</th><th>开始</th><th>停止</th>
                 <th class="actions">操作</th></tr>
           </thead>
@@ -684,9 +688,10 @@ async function renderContainersTab() {
             ${rows.map((c) => `
               <tr>
                 <td class="mono">${escapeHtml(c.id)}</td>
+                <td><span class="badge muted">${escapeHtml(c.row_kind || '?')}</span></td>
                 <td>${escapeHtml(c.user_email || c.user_id)}</td>
                 <td><span class="badge muted">${escapeHtml(c.subscription_status || '—')}</span></td>
-                <td>${statusBadge(c.status)}</td>
+                <td>${statusBadge(c.lifecycle || c.status || c.state || '—')}</td>
                 <td class="mono">${escapeHtml((c.docker_id || '').slice(0, 12) || '—')}</td>
                 <td class="mono">${escapeHtml(c.image || '')}</td>
                 <td class="mono">${fmtDate(c.last_started_at)}</td>

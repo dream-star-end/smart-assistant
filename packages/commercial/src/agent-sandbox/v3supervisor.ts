@@ -667,34 +667,30 @@ export async function provisionV3Container(
 /**
  * 优雅停止并删除一个 active 容器,把 row 标 vanished。
  *
- * 顺序:
- *   1. docker stop(t=5,SIGTERM 给 npm 5 秒)→ remove --force
- *      missing → noop(可能 supervisor 重启过,容器先死了)
- *   2. UPDATE agent_containers SET state='vanished' WHERE id = $1
+ * 顺序(2026-04-21 codex round 1 finding #4 修复):
+ *   1. UPDATE agent_containers SET state='vanished' WHERE id = $1 —— 优先落
+ *      DB,因为这是 admin / idle sweep 的"权威意图":这个行就是要走。
+ *      docker 实际清理是否成功是 best-effort;失败留半死容器也是 GC 兜的事
+ *      (`v3volumeGc` 见到 vanished 行的 docker_id 还残留时再 force remove)
+ *   2. docker stop(t=5,SIGTERM 给 npm 5 秒) —— missing 吞掉
+ *   3. docker remove(force) —— missing 吞掉
+ *   4. 任意 docker 步骤 wrapped 抛错 → 抛给 caller(admin 看错日志,但 row
+ *      已经是 vanished,下次 ensureRunning 会判 "无 active 行" 走 provision,
+ *      不会被半死行卡在 stopped/missing 状态再死循环)
  *
  * 不删 volume(GC 走 3G,banned 7d / no-login 90d 才动)。
+ *
+ * 旧顺序的 bug:先 docker stop,如果非 404 异常抛出 → 整个函数挂出错,
+ * UPDATE 没跑 → 行残留 active + 容器残留半死。下次 ensureRunning 命中
+ * stopped/missing 分支,要么"stopped" 拒绝 ensureRunning 长时间,要么
+ * 自递归调本函数死循环 wrap 同一个 docker 错。
  */
 export async function stopAndRemoveV3Container(
   deps: V3SupervisorDeps,
   containerRow: { id: number; container_internal_id?: string | null },
   timeoutSec = 5,
 ): Promise<void> {
-  // 优先用 container_internal_id 找;没有就用 name(老路径,不 fail-fast)
-  const handle = containerRow.container_internal_id
-    ? deps.docker.getContainer(containerRow.container_internal_id)
-    : null;
-  if (handle) {
-    try {
-      await handle.stop({ t: timeoutSec });
-    } catch (err) {
-      if (!isNotFound(err) && !isNotModified(err)) throw wrapDockerError(err);
-    }
-    try {
-      await handle.remove({ force: true });
-    } catch (err) {
-      if (!isNotFound(err)) throw wrapDockerError(err);
-    }
-  }
+  // 1) DB 先翻 vanished —— admin 意图就是销毁,不依赖 docker 步骤是否干净
   await deps.pool.query(
     `UPDATE agent_containers
         SET state='vanished',
@@ -702,6 +698,19 @@ export async function stopAndRemoveV3Container(
       WHERE id = $1`,
     [String(containerRow.id)],
   );
+  // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing
+  if (!containerRow.container_internal_id) return;
+  const handle = deps.docker.getContainer(containerRow.container_internal_id);
+  try {
+    await handle.stop({ t: timeoutSec });
+  } catch (err) {
+    if (!isNotFound(err) && !isNotModified(err)) throw wrapDockerError(err);
+  }
+  try {
+    await handle.remove({ force: true });
+  } catch (err) {
+    if (!isNotFound(err)) throw wrapDockerError(err);
+  }
 }
 
 /**

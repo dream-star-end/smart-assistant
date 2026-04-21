@@ -32,6 +32,7 @@ import {
   adminRemoveContainer,
   ContainerNotFoundError,
   V3SupervisorMissingError,
+  listContainers,
 } from "../admin/containers.js";
 import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 
@@ -369,5 +370,33 @@ describe("admin/containers HIGH#6 v2/v3 dispatch", () => {
       [String(id)],
     );
     assert.equal(r.rows[0]!.state, "vanished", "仍应 UPDATE state=vanished(掉单清理)");
+  });
+
+  // 2026-04-21 codex round 1 finding #4 part A:admin 列表必须暴露 v3 行的
+  // state(原来只看 status,v3 行 status 永远为 NULL → admin 看不到真状态)。
+  test("listContainers:暴露 row_kind + lifecycle,v3 行用 state,v2 行用 status", async (t) => {
+    if (!pgAvailable) return t.skip("PG fixture not available");
+    const uidV2 = await insertUser();
+    await insertV2Container(uidV2);
+    const uidV3 = await insertUser();
+    await insertV3Container(uidV3, "container-internal-xyz");
+
+    const rows = await listContainers({ limit: 10 });
+    assert.ok(rows.length >= 2, `expected >=2 rows, got ${rows.length}`);
+
+    const v2 = rows.find((r) => r.row_kind === "v2");
+    const v3 = rows.find((r) => r.row_kind === "v3");
+    assert.ok(v2, "v2 row must be in result");
+    assert.ok(v3, "v3 row must be in result");
+
+    // v2:lifecycle = status('running')
+    assert.equal(v2!.row_kind, "v2");
+    assert.equal(v2!.status, "running");
+    assert.equal(v2!.lifecycle, "running", "v2 lifecycle should fall back to status");
+
+    // v3:lifecycle = state('active');state 字段也直接暴露
+    assert.equal(v3!.row_kind, "v3");
+    assert.equal(v3!.state, "active");
+    assert.equal(v3!.lifecycle, "active", "v3 lifecycle should come from state");
   });
 });
