@@ -35,6 +35,9 @@ export const paths = {
   uploadsDir: join(HOME, 'uploads'),
   // MCP-generated media (images, audio, video) — served via /api/media/
   generatedDir: join(HOME, 'generated'),
+  // Runtime token file written by gateway, mtime-watched by ccb subprocesses
+  // so an OAuth refresh propagates without subprocess restart.
+  runtimeClaudeOauthToken: join(HOME, 'runtime', 'claude_oauth_token.json'),
   // Existing
   agentSessionsDir: (agentId: string) => join(HOME, 'agents', agentId, 'sessions'),
   sessionLog: (agentId: string, sessionKey: string) =>

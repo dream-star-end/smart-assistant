@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
@@ -589,7 +589,14 @@ export class Gateway {
       },
       Gateway.PENDING_PERMISSION_SWEEP_MS,
     )
-    // Check immediately on boot
+    // Materialize current token to runtime file BEFORE kicking off refresh,
+    // and await it. Two reasons:
+    //   1) Any ccb subprocess spawned during boot has a file to read.
+    //   2) Avoids a stale-overwrite race where refresh writes the new token
+    //      first, then this fire-and-forget sync (reading deps.config snapshot
+    //      from before refresh updated it) overwrites it with the old value.
+    await this.syncRuntimeOauthTokenFromConfig().catch(() => {})
+    // Check refresh on boot. Will write the file again if it actually rotates.
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
     await new Promise<void>((res) => {
@@ -2473,6 +2480,12 @@ export class Gateway {
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
+        // CCB subprocesses prefer the runtime token file over the spawn-time
+        // CLAUDE_CODE_OAUTH_TOKEN snapshot. Without writing it here, a stale
+        // file from before this /login would override the freshly-saved token.
+        if (providerKey === 'claude') {
+          await this.writeRuntimeOauthToken(oauthData)
+        }
         this.log.info('oauth tokens saved', { provider: providerKey })
       }
 
@@ -2485,6 +2498,78 @@ export class Gateway {
       this.log.error('oauth exchange error', { provider: providerKey }, err)
       this.sendError(res, 500, err?.message ?? 'token exchange failed')
     }
+  }
+
+  /**
+   * Runtime token file: gateway is the **sole writer**, ccb subprocess is the
+   * sole reader. Every claude OAuth refresh atomically writes the new access
+   * token here so long-running ccb subprocesses can pick it up without restart
+   * (they mtime-watch this file). See ccb's `getClaudeAIOAuthTokens`.
+   *
+   * The file is mode 0600. Format: `{accessToken, expiresAt, scope}` JSON.
+   * Path is `$OPENCLAUDE_HOME/runtime/claude_oauth_token.json`.
+   */
+  private async writeRuntimeOauthToken(state: {
+    accessToken: string
+    expiresAt: number
+    scope: string
+  }): Promise<void> {
+    const file = paths.runtimeClaudeOauthToken
+    try {
+      // 0o700 on the dir matches the credential-runtime semantics; 0o600 on the
+      // file itself is the load-bearing protection.
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+      // Random suffix avoids a same-millisecond tmp collision between two
+      // concurrent writers (eg. callback + boot refresh racing on /login).
+      const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${randomBytes(6).toString('hex')}`
+      const data = JSON.stringify({
+        accessToken: state.accessToken,
+        expiresAt: state.expiresAt,
+        scope: state.scope,
+      })
+      await writeFile(tmp, data, { mode: 0o600 })
+      await rename(tmp, file)
+    } catch (err) {
+      this.log.warn('failed to write runtime oauth token file', { file }, err as Error)
+    }
+  }
+
+  /**
+   * Best-effort delete of the runtime token file. Called when the gateway
+   * config has no claude OAuth token, to make sure a stale file from a prior
+   * /login can't "revive" old auth in a freshly-spawned ccb subprocess.
+   */
+  private async removeRuntimeOauthToken(): Promise<void> {
+    try {
+      await unlink(paths.runtimeClaudeOauthToken)
+    } catch (err) {
+      // ENOENT is the common case (never written) — silent.
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        this.log.warn(
+          'failed to remove stale runtime oauth token file',
+          { file: paths.runtimeClaudeOauthToken },
+          err as Error,
+        )
+      }
+    }
+  }
+
+  /**
+   * Idempotent: materialize current claude OAuth token to the runtime file
+   * if present, otherwise delete any stale runtime file. Called at startup
+   * so freshly-spawned subprocesses see fresh state, not leftovers.
+   */
+  private async syncRuntimeOauthTokenFromConfig(): Promise<void> {
+    const claudeOAuth = this.deps.config.auth.claudeOAuth
+    if (!claudeOAuth?.accessToken) {
+      await this.removeRuntimeOauthToken()
+      return
+    }
+    await this.writeRuntimeOauthToken({
+      accessToken: claudeOAuth.accessToken,
+      expiresAt: claudeOAuth.expiresAt,
+      scope: claudeOAuth.scope,
+    })
   }
 
   // Token auto-refresh (called periodically and on-demand after 401).
@@ -2567,6 +2652,11 @@ export class Gateway {
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
+        // Hot-reload: long-running ccb subprocesses watch this file's mtime
+        // and pick up the new access token without restart.
+        if (providerKey === 'claude') {
+          await this.writeRuntimeOauthToken(refreshed)
+        }
         this.log.info('oauth token refreshed', {
           provider: providerKey,
           expiresInSec: tokens.expires_in,

@@ -323,6 +323,12 @@ export class SubprocessRunner extends EventEmitter {
       // Claude subscription: inject OAuth token, route to Anthropic API
       if (this.opts.config.auth.claudeOAuth?.accessToken) {
         providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
+        // Hot-reload path: ccb watches this file's mtime and re-reads on change,
+        // so a gateway-side OAuth refresh propagates without subprocess restart.
+        // Falls back to CLAUDE_CODE_OAUTH_TOKEN env above when file is missing.
+        // Gated on config token existing so a stale runtime file (e.g. left
+        // over after the user logged out) can't "revive" old auth.
+        providerEnv.OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE = paths.runtimeClaudeOauthToken
       }
       // CRITICAL: Tell CCB that the host owns provider routing.
       // Without this, CCB's managedEnv.ts will Object.assign settings.json env

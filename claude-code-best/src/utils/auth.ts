@@ -1,6 +1,7 @@
 import chalk from 'chalk'
 import { exec } from 'child_process'
 import { execa } from 'execa'
+import { readFileSync } from 'fs'
 import { mkdir, stat } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
 import { join } from 'path'
@@ -1252,9 +1253,52 @@ export function saveOAuthTokensIfNeeded(tokens: OAuthTokens): {
   }
 }
 
+/**
+ * OpenClaude gateway hot-reload integration.
+ *
+ * When ccb runs as a child of the OpenClaude gateway, the gateway is the sole
+ * OAuth refresher and writes the current access token to a runtime file path
+ * passed via `OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE`. Reading from this file (with
+ * mtime invalidation in `invalidateOAuthCacheIfDiskChanged`) lets the long-
+ * running ccb subprocess pick up refreshed tokens without restart.
+ *
+ * Returns `null` on missing/unreadable file or invalid JSON — caller will then
+ * fall through to `CLAUDE_CODE_OAUTH_TOKEN` (the snapshot env var still set by
+ * the gateway as belt-and-braces fallback).
+ */
+function readOpenclaudeOauthTokenFile(): string | null {
+  const path = process.env.OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE
+  if (!path) return null
+  try {
+    const raw = readFileSync(path, { encoding: 'utf8' })
+    const parsed = JSON.parse(raw) as { accessToken?: unknown }
+    if (typeof parsed.accessToken !== 'string' || parsed.accessToken.length === 0) {
+      return null
+    }
+    return parsed.accessToken
+  } catch {
+    // Missing file / parse error: fall through to env-var snapshot.
+    return null
+  }
+}
+
 export const getClaudeAIOAuthTokens = memoize((): OAuthTokens | null => {
   // --bare: API-key-only. No OAuth env tokens, no keychain, no credentials file.
   if (isBareMode()) return null
+
+  // OpenClaude gateway hot-reload path: prefer the runtime file the gateway
+  // keeps fresh over the spawn-time snapshot CLAUDE_CODE_OAUTH_TOKEN env var.
+  const openclaudeToken = readOpenclaudeOauthTokenFile()
+  if (openclaudeToken) {
+    return {
+      accessToken: openclaudeToken,
+      refreshToken: null,
+      expiresAt: null,
+      scopes: ['user:inference'],
+      subscriptionType: null,
+      rateLimitTier: null,
+    }
+  }
 
   // Check for force-set OAuth token from environment variable
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
@@ -1311,13 +1355,41 @@ export function clearOAuthTokenCache(): void {
 }
 
 let lastCredentialsMtimeMs = 0
+let lastOpenclaudeTokenMtimeMs = 0
 
 // Cross-process staleness: another CC instance may write fresh tokens to
 // disk (refresh or /login), but this process's memoize caches forever.
 // Without this, terminal 1's /login fixes terminal 1; terminal 2's /login
 // then revokes terminal 1 server-side, and terminal 1's memoize never
 // re-reads — infinite /login regress (CC-1096, GH#24317).
+//
+// Also watches OpenClaude gateway's runtime token file: when the gateway
+// refreshes the OAuth token, it bumps that file's mtime so this long-running
+// ccb subprocess re-reads on the next API call instead of staying on a stale
+// snapshot until restart.
 async function invalidateOAuthCacheIfDiskChanged(): Promise<void> {
+  // 1) OpenClaude runtime token file (if env points at one): independent
+  //    invalidator — must run regardless of credentials-file outcome.
+  const openclaudeTokenPath = process.env.OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE
+  if (openclaudeTokenPath) {
+    try {
+      const { mtimeMs } = await stat(openclaudeTokenPath)
+      if (mtimeMs !== lastOpenclaudeTokenMtimeMs) {
+        lastOpenclaudeTokenMtimeMs = mtimeMs
+        clearOAuthTokenCache()
+      }
+    } catch {
+      // ENOENT path — gateway either hasn't written yet (boot) or has just
+      // deleted the file (user logged out at runtime). If we previously had a
+      // tracked mtime, the file's gone now → clear the memoize cache so the
+      // next read falls through to CLAUDE_CODE_OAUTH_TOKEN snapshot or null.
+      if (lastOpenclaudeTokenMtimeMs !== 0) {
+        lastOpenclaudeTokenMtimeMs = 0
+        clearOAuthTokenCache()
+      }
+    }
+  }
+
   try {
     const { mtimeMs } = await stat(
       join(getClaudeConfigHomeDir(), '.credentials.json'),
@@ -1377,14 +1449,24 @@ async function handleOAuth401ErrorImpl(
   clearOAuthTokenCache()
   const currentTokens = await getClaudeAIOAuthTokensAsync()
 
-  if (!currentTokens?.refreshToken) {
-    return false
-  }
-
-  // If keychain has a different token, another tab already refreshed - use it
-  if (currentTokens.accessToken !== failedAccessToken) {
+  // OpenClaude gateway hot-reload: gateway is the sole refresher and rotates
+  // the access token in our runtime file. If we now hold a different token
+  // than the one that failed, the rotation already happened — caller should
+  // retry without forcing an in-process refresh (which can't happen when
+  // refreshToken is null, the env-var/file-token case).
+  // This MUST be checked before the `!refreshToken` short-circuit below;
+  // otherwise file/env tokens would always return false here, and bridge-
+  // level retry-on-recovered logic never sees the rotated token.
+  if (
+    currentTokens?.accessToken &&
+    currentTokens.accessToken !== failedAccessToken
+  ) {
     logEvent('tengu_oauth_401_recovered_from_keychain', {})
     return true
+  }
+
+  if (!currentTokens?.refreshToken) {
+    return false
   }
 
   // Same token that failed - force refresh, bypassing local expiration check
@@ -1399,8 +1481,11 @@ async function handleOAuth401ErrorImpl(
 export async function getClaudeAIOAuthTokensAsync(): Promise<OAuthTokens | null> {
   if (isBareMode()) return null
 
-  // Env var and FD tokens are sync and don't hit the keychain
+  // Env var and FD tokens are sync and don't hit the keychain.
+  // OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE is the OpenClaude gateway hot-reload
+  // path — sync file read + mtime invalidation, also no keychain.
   if (
+    process.env.OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE ||
     process.env.CLAUDE_CODE_OAUTH_TOKEN ||
     getOAuthTokenFromFileDescriptor()
   ) {
