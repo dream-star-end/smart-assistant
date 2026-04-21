@@ -32,7 +32,8 @@ export function classifyFile(file) {
   if (t.startsWith('audio/')) return 'audio'
   if (t.startsWith('video/')) return 'video'
   // Binary document types → 'file' kind (sent as base64)
-  const binExts = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z)$/i
+  // 归档类扩展需放 `.tar.gz` / `.tgz` 在单独 alt 分支,`.gz` 放最后避免先匹配到。
+  const binExts = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar\.gz|tgz|tar|bz2|xz|gz)$/i
   if (
     binExts.test(file.name) ||
     t === 'application/pdf' ||

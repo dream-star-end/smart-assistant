@@ -3574,6 +3574,12 @@ export class Gateway {
       'application/vnd.ms-',                            // doc, xls, ppt
       'application/msword',                             // .doc
       'application/zip', 'application/x-zip',           // zip archives
+      'application/gzip', 'application/x-gzip',         // .gz, .tar.gz
+      'application/x-tar', 'application/x-compressed-tar', 'application/x-gtar', // .tar / tarball variants
+      'application/x-7z-compressed',                    // .7z
+      'application/vnd.rar', 'application/x-rar-compressed', // .rar
+      'application/x-bzip', 'application/x-bzip2',      // .bz2
+      'application/x-xz',                               // .xz
       'application/json',                               // json files
       'application/xml',                                // xml files
     ]
@@ -3660,6 +3666,21 @@ export class Gateway {
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
       'application/vnd.ms-excel': 'xls',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+      'application/zip': 'zip',
+      'application/x-zip': 'zip',
+      'application/x-zip-compressed': 'zip',
+      'application/gzip': 'gz',
+      'application/x-gzip': 'gz',
+      'application/x-tar': 'tar',
+      'application/x-compressed-tar': 'tar.gz',
+      'application/x-gtar': 'tar',
+      'application/x-7z-compressed': '7z',
+      'application/vnd.rar': 'rar',
+      'application/x-rar-compressed': 'rar',
+      'application/x-bzip': 'bz2',
+      'application/x-bzip2': 'bz2',
+      'application/x-xz': 'xz',
+      'text/html': 'html',
     }
 
     type SavedMedia = {
@@ -4192,7 +4213,20 @@ export function isFileBlocked(resolvedPath: string): boolean {
   return FILE_BLOCKED_PATTERNS.some((p) => p.test(resolvedPath))
 }
 
-export const UPLOAD_MIME_PREFIXES = ['image/', 'audio/', 'video/', 'application/pdf', 'text/']
+export const UPLOAD_MIME_PREFIXES = [
+  'image/', 'audio/', 'video/', 'application/pdf', 'text/',
+  'application/zip', 'application/x-zip',
+  'application/gzip', 'application/x-gzip',
+  'application/x-tar', 'application/x-compressed-tar', 'application/x-gtar',
+  'application/x-7z-compressed',
+  'application/vnd.rar', 'application/x-rar-compressed',
+  'application/x-bzip', 'application/x-bzip2',
+  'application/x-xz',
+  'application/json', 'application/xml',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.',
+  'application/vnd.ms-',
+]
 export const MAX_UPLOAD_SINGLE = 25 * 1024 * 1024
 export const MAX_UPLOAD_TOTAL = 50 * 1024 * 1024
 

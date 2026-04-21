@@ -190,6 +190,24 @@ describe('T02: isUploadMimeAllowed — upload type filtering', () => {
     assert.ok(isUploadMimeAllowed('application/octet-stream')))
   it('allows empty mime (no header)', () => assert.ok(isUploadMimeAllowed('')))
 
+  // Archive types (explicit whitelist — do NOT use `application/` blanket prefix
+  // because that would also let executables/JAR/PHP through, which T02 blocks below).
+  it('allows application/zip', () => assert.ok(isUploadMimeAllowed('application/zip')))
+  it('allows application/gzip (.gz, .tar.gz)', () =>
+    assert.ok(isUploadMimeAllowed('application/gzip')))
+  it('allows application/x-tar (.tar)', () =>
+    assert.ok(isUploadMimeAllowed('application/x-tar')))
+  it('allows application/x-compressed-tar (.tar.gz alt)', () =>
+    assert.ok(isUploadMimeAllowed('application/x-compressed-tar')))
+  it('allows application/x-7z-compressed (.7z)', () =>
+    assert.ok(isUploadMimeAllowed('application/x-7z-compressed')))
+  it('allows application/vnd.rar (.rar)', () =>
+    assert.ok(isUploadMimeAllowed('application/vnd.rar')))
+  it('allows application/x-bzip2 (.bz2)', () =>
+    assert.ok(isUploadMimeAllowed('application/x-bzip2')))
+  it('allows application/x-xz (.xz)', () => assert.ok(isUploadMimeAllowed('application/x-xz')))
+  it('allows text/html (.html)', () => assert.ok(isUploadMimeAllowed('text/html')))
+
   // Should BLOCK
   it('blocks application/x-executable', () =>
     assert.ok(!isUploadMimeAllowed('application/x-executable')))
