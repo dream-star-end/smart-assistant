@@ -76,6 +76,7 @@ import {
   DEFAULT_REFRESH_SKEW_MS,
   type RefreshDeps,
 } from "../account-pool/refresh.js";
+import { getDispatcherForAccount } from "../account-pool/egressDispatcher.js";
 import {
   observeAnthropicProxyTtft,
   observeAnthropicProxyStreamDuration,
@@ -1198,6 +1199,9 @@ export function makeAnthropicProxyHandler(
       }
       // 不持有 finalizer 之前,任何后续异常都得手动 release pick + preCheck;
       // 之后(从 startInflightJournal 起)统一交给 finalize.fail
+      // HIGH#5:同 account 的 chat 与 refresh 必须从同一出口 IP 出去 —— Anthropic
+      // anti-abuse 会把 refresh 与紧随其后的 chat 关联,IP 一变立即触发风控。
+      const accountDispatcher = getDispatcherForAccount(pick.account_id, pick.egress_proxy);
       try {
         if (
           deps.refreshDeps &&
@@ -1205,7 +1209,12 @@ export function makeAnthropicProxyHandler(
           shouldRefresh(pick.expires_at, new Date(), DEFAULT_REFRESH_SKEW_MS)
         ) {
           try {
-            const r = await refreshAccountToken(pick.account_id, deps.refreshDeps);
+            const r = await refreshAccountToken(pick.account_id, {
+              ...deps.refreshDeps,
+              // 显式覆盖:即使 caller 在 refreshDeps 里塞了别的 dispatcher,
+              // 也用 account 的固定出口,不让"全局 dispatcher 漏选"破坏稳定 IP。
+              dispatcher: accountDispatcher,
+            });
             // 释放老 token(零化),用新 token
             try {
               pick.token.fill(0);
@@ -1352,9 +1361,12 @@ export function makeAnthropicProxyHandler(
           body: upstreamBodyJson,
           signal: ac.signal,
         };
-        // egress proxy 走 undici dispatcher;buildEgressDispatcher 不在本模块职责内,
-        // MVP 单 host 不强制 — refreshDeps 给的 ProxyAgent 在 refresh 路径已用,
-        // chat 这里走默认 dispatcher。Phase 3 supervisor 集成时再补。
+        // HIGH#5:绑账号 egress_proxy。pick.egress_proxy 为 null → 走默认出口。
+        // dispatcher 由 egressDispatcher 缓存,同 account 的 chat / refresh 共享
+        // 同一 ProxyAgent,确保稳定 source IP。dispatcher 在 ProxyAgent.close()
+        // 时会等流结束 —— pipeStreamWithUsageCapture finally 块里 cancel reader,
+        // 这条流不会让 admin 改 proxy 时 hang(参 egressDispatcher.ts 注释)。
+        if (accountDispatcher) fetchInit.dispatcher = accountDispatcher;
 
         const fetchStartMs = Date.now();
         const upstream = await fetchFn(endpoint, fetchInit);
