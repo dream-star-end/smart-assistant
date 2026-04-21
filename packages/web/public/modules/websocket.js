@@ -4,6 +4,9 @@ import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
 import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
+// 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
+// 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
+import { refreshBalance } from './billing.js?v=36'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -868,6 +871,7 @@ export function connect() {
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
+      else if (f.type === 'outbound.cost_charged') handleCostCharged(f)
       else if (f.type === 'outbound.ack' && f.deduplicated) {
         // Server already processed this message; clear drain state so queue continues
         if (state._offlineDrainingCurrent) {
@@ -881,8 +885,16 @@ export function connect() {
 export function formatMeta(m) {
   if (!m) return ''
   const parts = []
-  if (typeof m.cost === 'number') parts.push(`$${m.cost.toFixed(4)}`)
-  if (typeof m.totalCost === 'number' && m.totalCost !== m.cost)
+  // 商用版 claudeai.chat:后端扣费完成后会推一帧 outbound.cost_charged 给前端,
+  // 前端会把 costCredits(bigint string,单位=分=积分)塞进 msg._rawMeta 再 re-format。
+  // 这里优先显示真实扣费积分,容器的 m.cost($ 估算)作 fallback。
+  // 约定:m.costCredits 存在且 ≥ 0 → 走积分;缺失 → 走旧的 $ 估算。
+  if (m.costCredits !== undefined && m.costCredits !== null) {
+    parts.push(formatCreditsInline(m.costCredits))
+  } else if (typeof m.cost === 'number') {
+    parts.push(`$${m.cost.toFixed(4)}`)
+  }
+  if (typeof m.totalCost === 'number' && m.totalCost !== m.cost && m.costCredits === undefined)
     parts.push(`total $${m.totalCost.toFixed(4)}`)
   if (typeof m.inputTokens === 'number') parts.push(`in ${m.inputTokens}`)
   if (typeof m.outputTokens === 'number') parts.push(`out ${m.outputTokens}`)
@@ -890,6 +902,29 @@ export function formatMeta(m) {
   if (m.cacheCreationTokens > 0) parts.push(`cache-w ${m.cacheCreationTokens}`)
   if (typeof m.turn === 'number') parts.push(`T${m.turn}`)
   return parts.join(' · ')
+}
+
+// credits(= 分 = ¥0.01)→ 中文可读字串。
+// 与 billing.js 里的 formatCredits/formatYuan 规则对齐:≥1元 显示"X.XX 元",<1元 显示"XX 积分"。
+// 1 元以下用"积分"字样更直观(不必 ¥0.03 这种小数),超 1 元切"¥"更省空间。
+function formatCreditsInline(raw) {
+  let n
+  try {
+    // BigInt 字符串首选路径 —— 后端发的 outbound.cost_charged.costCredits 就是这个。
+    if (typeof raw === 'string' && /^-?\d+$/.test(raw)) n = BigInt(raw)
+    else if (typeof raw === 'number' && Number.isFinite(raw)) n = BigInt(Math.trunc(raw))
+    else if (typeof raw === 'bigint') n = raw
+    else return ''
+  } catch { return '' }
+  if (n < 0n) n = -n
+  if (n >= 100n) {
+    // ≥1元 口径:X.XX 元(保留两位小数)
+    const yuan = n / 100n
+    const cents = n % 100n
+    const fraction = cents < 10n ? `0${cents}` : `${cents}`
+    return `¥${yuan}.${fraction}`
+  }
+  return `${n} 积分`
 }
 export function buildToolUseLabel(block) {
   const name = block.toolName || 'unknown'
@@ -1410,7 +1445,13 @@ export function handleOutbound(frame) {
   sess.lastAt = Date.now()
   if (frame.isFinal) {
     const metaText = formatMeta(frame.meta)
-    if (metaText && sess._streamingAssistant) setMeta(sess, sess._streamingAssistant, metaText)
+    if (metaText && sess._streamingAssistant) {
+      // 把原始 meta 存到消息上,这样后续 outbound.cost_charged 帧到达时可以把
+      // 容器口径的 $0.xxxx 改写成真实扣费积分再 re-format。没有这一手,cost_charged
+      // 只能拿到它自己的 costCredits 但丢掉 in/out/cache 字段。
+      sess._streamingAssistant._rawMeta = { ...frame.meta }
+      setMeta(sess, sess._streamingAssistant, metaText)
+    }
     // Accumulate token usage for session-level tracking
     if (frame.meta) {
       if (!sess._tokenUsage) sess._tokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
@@ -1589,6 +1630,79 @@ function handleResumeFailed(frame) {
       }
     },
   })
+}
+
+// ═══════════════ COST CHARGED (commercial v3 only) ═══════════════
+// 商用版专用帧:anthropicProxy 在 finalize.commit 成功扣费后广播给前端。
+// 规则:
+//   1) 后端 frame.sessionId 非空 → 只在该 session 里找目标。若前端没这个 session
+//      (已被 gc / 用户刚删),candidates 为空,走下面的 refreshBalance 兜底,
+//      **绝不回退扫其他 session**,避免把后台扣费错贴到前台消息。
+//   2) sessionId 为空(容器侧漏传 metadata.session_id)→ 回退到"当前会话优先
+//      + 其他按 lastAt 降序"的全局扫描。
+//   3) 目标 = 从消息尾部往前,**第一条已设 _rawMeta 且 costCredits 仍未填** 的
+//      assistant 消息。前端不记 per-message requestId,只能用这个 marker 兜底,
+//      误差上限 = 1 turn。
+function handleCostCharged(frame) {
+  const sid = typeof frame.sessionId === 'string' && frame.sessionId.length > 0
+    ? frame.sessionId
+    : null
+
+  // 选候选会话:sessionId 命中时只它一个;否则走全局扫描。
+  const candidates = []
+  if (sid) {
+    const s = state.sessions.get(sid)
+    if (s) candidates.push(s)
+    // sessionId 给了但前端没这个 session(极罕见:后端推得比 session.created 还早,
+    // 或者 session 已被前端 gc) → candidates 为空,往下直接落到 refreshBalance 兜底。
+  } else {
+    if (state.currentSessionId) {
+      const cur = state.sessions.get(state.currentSessionId)
+      if (cur) candidates.push(cur)
+    }
+    const others = []
+    for (const s of state.sessions.values()) {
+      if (state.currentSessionId && s.id === state.currentSessionId) continue
+      others.push(s)
+    }
+    others.sort((a, b) => (b.lastAt ?? 0) - (a.lastAt ?? 0))
+    candidates.push(...others)
+  }
+
+  let target = null
+  let targetSess = null
+  for (const sess of candidates) {
+    const msgs = sess.messages || []
+    // 从尾往前找最近一条已设 _rawMeta 且还没打上 costCredits 的 assistant
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]
+      if (m.role !== 'assistant') continue
+      if (!m._rawMeta) continue
+      if (m._rawMeta.costCredits !== undefined) continue
+      target = m
+      targetSess = sess
+      break
+    }
+    if (target) break
+  }
+
+  if (!target) {
+    // 没候选:可能是 cost_charged 先于 turn-end 到达(极罕见,LLM 链路响应比扣费
+    // 路径快得多),也可能是纯 tool-only turn 没出文本消息。静默丢弃,用户仍能
+    // 通过 refreshBalance 看到余额变化。
+    if (typeof frame.balanceAfter === 'string' || typeof frame.balanceAfter === 'number') {
+      try { refreshBalance() } catch {}
+    }
+    return
+  }
+
+  target._rawMeta.costCredits = frame.costCredits
+  const metaText = formatMeta(target._rawMeta)
+  setMeta(targetSess, target, metaText)
+
+  // 同步刷新左上角余额气泡 —— 服务端已写 DB,刷 /api/me 拿到的就是 balanceAfter。
+  // 传了 balanceAfter 的就直接乐观更新,避开一次 round-trip。
+  try { refreshBalance() } catch {}
 }
 
 // ═══════════════ PERMISSION PROMPTS ═══════════════

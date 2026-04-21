@@ -168,6 +168,17 @@ export interface UserChatBridgeHandler {
   shutdown(reason?: string): Promise<void>;
   /** 测试 / metrics:获取 ConnectionRegistry。 */
   registry: ConnectionRegistry;
+  /**
+   * 给指定 uid 的所有活跃 user WS 广播一个 JSON 帧(旁路透传管道,非容器来源)。
+   *
+   * 场景:anthropicProxy 在 finalize.commit 后想把实际扣费金额推给该用户的前端,
+   * 但 bridge 本身是 byte-transparent 的 —— 容器侧不知道扣费细节、也不该改帧。
+   * 所以新增此旁路入口,直接把 frame 注入到 user WS。
+   *
+   * 返回实际发送成功的连接数(用户可能没在线 / 没登录,返 0 是合法状态)。
+   * 非 JSON-serializable 输入会吞 JSON.stringify 异常,不抛。
+   */
+  broadcastToUser(uid: bigint, payload: unknown): number;
 }
 
 // ---------- 内部工具 --------------------------------------------------------
@@ -250,6 +261,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
   const registry = new ConnectionRegistry({ maxPerUser });
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes });
+
+  /**
+   * uid(string) → 该用户当前持有的所有正在正常桥接中的 user WS 集合。
+   *
+   * 为什么单独维护一份而不用 ConnectionRegistry:
+   *   - ConnectionRegistry 只存 { id, user_id, opened_at, close } — 没有 ws 句柄引用,
+   *     因为原设计保持"关连接靠回调"的抽象,不把 ws lib 泄漏到那层
+   *   - broadcastToUser 需要直接 ws.send —— 把 ws 加到 Conn 里会把 registry 接口污染,
+   *     所以这里单开一张表。两张表的增删时机严格一致(startBridge 开头加、cleanup 里删),
+   *     保持不变量"uidToUserWs[uid] 含的 ws 与 registry[uid] 含的 Conn 一一对应"。
+   *
+   * 注意:只有**早到帧处理完 + 桥真正开起来**的 ws 才进这张表 —— JWT 失败 / ContainerUnready
+   * 期间的 ws 不在这里,因为没有跑到 startBridge 里 registry.register。
+   */
+  const uidToUserWs = new Map<string, Set<WebSocket>>();
 
   function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean {
     const url = parseWsUrl(req);
@@ -397,6 +423,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const { unregister } = registry.register(conn);
 
     // 容器侧 WS。abort signal 给 createContainerSocket 在 connect 阶段中断。
+    // uidToUserWs 的 add 放在 createContainerSocket 之后 —— 同步抛错路径只需 unregister(),
+    // 不用再走 uid→ws 清理分支,避免遗漏清理造成 broadcastToUser 向 CLOSED ws 发送垃圾。
     const connectAbort = new AbortController();
     let containerWs: WebSocket;
     try {
@@ -410,6 +438,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       try { userWs.close(CLOSE_BRIDGE.INTERNAL, "agent unavailable"); } catch { /* */ }
       unregister();
       return;
+    }
+
+    // 同步加入 uid→ws 表,broadcastToUser 用得到。cleanup 里务必同步删除。
+    // 放在 container socket 成功构造之后:createContainerSocket 即使抛同步错也不会污染表。
+    {
+      const key = uid.toString();
+      let set = uidToUserWs.get(key);
+      if (!set) { set = new Set(); uidToUserWs.set(key, set); }
+      set.add(userWs);
     }
 
     // 连接超时:N ms 内 containerWs 没 OPEN → 取消 + 关 user
@@ -611,6 +648,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       } catch { /* */ }
       unregister();
+      // 同步从 uid→ws 表中摘掉;即便 registry 的 Conn.close 回调已被 kick 路径触发
+      // 过也是幂等的(Set.delete 不存在会返 false)。
+      {
+        const key = uid.toString();
+        const set = uidToUserWs.get(key);
+        if (set) {
+          set.delete(userWs);
+          if (set.size === 0) uidToUserWs.delete(key);
+        }
+      }
 
       const closeCode = userWs.readyState === WebSocket.CLOSED
         ? (userWs as unknown as { _closeCode?: number })._closeCode ?? CLOSE_BRIDGE.NORMAL
@@ -644,7 +691,41 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     });
   }
 
-  return { handleUpgrade, shutdown, registry };
+  /**
+   * 把 payload 以 JSON text 帧发送给 uid 名下所有 OPEN 状态的 user WS。
+   * 非 OPEN 状态的 ws 直接跳过(不是错误)。send 本身异常单独 catch,不连累其他 ws。
+   */
+  function broadcastToUser(uid: bigint, payload: unknown): number {
+    const set = uidToUserWs.get(uid.toString());
+    if (!set || set.size === 0) return 0;
+    let text: string;
+    try { text = JSON.stringify(payload); }
+    catch (err) {
+      log?.warn("user-chat-bridge: broadcastToUser stringify failed", {
+        uid: uid.toString(), err,
+      });
+      return 0;
+    }
+    let sent = 0;
+    for (const ws of set) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      try {
+        ws.send(text, { binary: false }, (err) => {
+          if (err) log?.warn("user-chat-bridge: broadcastToUser send error", {
+            uid: uid.toString(), err,
+          });
+        });
+        sent += 1;
+      } catch (err) {
+        log?.warn("user-chat-bridge: broadcastToUser send threw", {
+          uid: uid.toString(), err,
+        });
+      }
+    }
+    return sent;
+  }
+
+  return { handleUpgrade, shutdown, registry, broadcastToUser };
 }
 
 // ---------- 测试 re-exports ------------------------------------------------

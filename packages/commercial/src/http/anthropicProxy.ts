@@ -627,12 +627,32 @@ export interface FinalizeContext {
 }
 
 export interface FinalizeOutcome {
-  /** 写入数据库的最终积分扣减;abort/none → 0n */
+  /** 写入 usage_records.cost_credits 的标称积分(基于 pricing 算出);abort/none → 0n */
   finalCredits: bigint;
+  /**
+   * 真正 debit 进 credit_ledger 的积分数(== ledger delta 绝对值)。
+   *
+   * 与 finalCredits 的区别:
+   *   - clamp 场景:余额不足,debitedCredits = balance (< finalCredits)
+   *   - billing_failed 场景(obs.kind='partial'):不走 ledger,debitedCredits=null
+   *   - 23505 重入:DB 已提交,无法重读当次 debit → null
+   *   - abort / cost=0 / 广播器想知道"有没有真的扣"→ null 表示不可用
+   *
+   * 广播/UI 应该用这个,不要用 finalCredits,否则 billing_failed/clamp 时会误报。
+   */
+  debitedCredits: bigint | null;
   /** 'committed' | 'aborted' */
   state: "committed" | "aborted";
   /** journal 行的 PG 主键(== requestId) */
   requestId: string;
+  /**
+   * debit 完成后的 users.credits(== credit_ledger.balance_after)。
+   *
+   * 语义与 SettleResult.balanceAfter 一致:只要走了 ledger debit 事务就可读,
+   * 即便 clamp 到 0n 也是合法值;非扣费路径 / 23505 重入 → null。
+   * 调用方想展示"当前余额"且此处为 null 时,得另查 users 表。
+   */
+  balanceAfter: bigint | null;
 }
 
 interface FinalizeDeps {
@@ -744,7 +764,13 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
       if (status === "success" && cost_credits > 0n) {
         incrBillingDebit(settled.clamped ? "insufficient" : "success");
       }
-      return { finalCredits: cost_credits, state: "committed", requestId: ctx.requestId };
+      return {
+        finalCredits: cost_credits,
+        debitedCredits: settled.debitedCredits,
+        state: "committed",
+        requestId: ctx.requestId,
+        balanceAfter: settled.balanceAfter,
+      };
     } catch (err) {
       ctx.log.error("proxy_finalize_commit_db_failed", {
         err: errSummary(err),
@@ -773,7 +799,13 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
       ctx.log.error("proxy_finalize_abort_db_failed", { err: errSummary(dbErr) });
     }
     ctx.log.warn("proxy_finalize_aborted", { reason: msg });
-    return { finalCredits: 0n, state: "aborted", requestId: ctx.requestId };
+    return {
+      finalCredits: 0n,
+      debitedCredits: null,
+      state: "aborted",
+      requestId: ctx.requestId,
+      balanceAfter: null,
+    };
   }
 
   async function runFinalizeAndRelease(
@@ -828,6 +860,26 @@ interface SettleResult {
    * 仅在 `args.status === 'success'` 且 `costCredits > 0n` 路径才可能为 true。
    */
   clamped: boolean;
+  /**
+   * 真正 debit 进 ledger 的积分数(负号已去掉,就是绝对值)。
+   *   - status='success' + cost>0:实际 debit (clamp 时 = balance,否则 = costCredits)
+   *   - status='billing_failed' / cost=0:不走 ledger → null
+   *   - 23505 重入:无法重算 → null
+   *
+   * 调用方用这个值决定是否向前端广播"已扣费"事件,以及广播多少。
+   */
+  debitedCredits: bigint | null;
+  /**
+   * debit 完成后的 users.credits(即 ledger balance_after)。
+   *
+   * 取值规则:
+   *   - 走 ledger debit 的事务路径(status='success' + cost>0 + 非 23505 重入)
+   *     → debit 后的 newBalance(clamp 场景下可能是 0n,也算合法值)
+   *   - status='billing_failed' / cost=0 / abort / 23505 重入 → null
+   *
+   * caller 想展示"当前余额"且这里拿到 null 时,请另查 users 表。
+   */
+  balanceAfter: bigint | null;
 }
 
 /**
@@ -855,6 +907,8 @@ async function settleUsageAndLedger(
     let usageId: bigint;
     let ledgerId: bigint | null = null;
     let clamped = false;
+    let balanceAfter: bigint | null = null;
+    let debitedCredits: bigint | null = null;
     try {
       const ins = await client.query<{ id: string }>(
         `INSERT INTO usage_records
@@ -896,6 +950,11 @@ async function settleUsageAndLedger(
           usageId: BigInt(r.id),
           ledgerId: r.ledger_id === null ? null : BigInt(r.ledger_id),
           clamped: false,
+          // 重入路径 DB 已是提交态,原始 debit 金额无法安全重算,标 null
+          // (caller 用 null 决定不对外广播 cost_charged,只靠 refreshBalance 更新气泡)。
+          debitedCredits: null,
+          // 同上:余额可能被别的并发请求改过,无法还原当时的 balance_after。
+          balanceAfter: null,
         };
       }
       throw err;
@@ -915,6 +974,8 @@ async function settleUsageAndLedger(
       const debit = balance < args.costCredits ? balance : args.costCredits;
       clamped = debit < args.costCredits;
       const newBalance = balance - debit;
+      balanceAfter = newBalance;
+      debitedCredits = debit;
       await client.query(
         "UPDATE users SET credits=$1 WHERE id=$2",
         [newBalance.toString(), args.userId.toString()],
@@ -941,7 +1002,7 @@ async function settleUsageAndLedger(
       );
     }
     await client.query("COMMIT");
-    return { usageId, ledgerId, clamped };
+    return { usageId, ledgerId, clamped, debitedCredits, balanceAfter };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -1008,6 +1069,13 @@ export interface AnthropicProxyDeps {
   refreshDeps?: RefreshDeps;
   /** 根 logger */
   logger?: Logger;
+  /**
+   * 可选:扣费成功后把实际 credits / balance 推到该 uid 的前端 WS。
+   * 典型实现:userChatBridge.broadcastToUser。前端靠此帧把响应 meta 行的
+   * "$0.xxxx" 替换成真实扣费积分(容器侧的 m.cost 是 USD 估算,与商用扣费不一致)。
+   * 不传 → 扣费仍正常发生,只是前端看到的还是估算 $;deploy 时必须注入。
+   */
+  broadcastToUser?: (uid: bigint, payload: unknown) => void;
 }
 
 export interface AnthropicProxyHandler {
@@ -1419,10 +1487,42 @@ export function makeAnthropicProxyHandler(
           /* ignore */
         }
         // 中途断流(result.error != null)走 fail,但 observation 已捕获 partial 状态
+        let outcome: FinalizeOutcome;
         if (result.error !== null) {
-          await finalize.fail(observed, result.error);
+          outcome = await finalize.fail(observed, result.error);
         } else {
-          await finalize.commit(observed);
+          outcome = await finalize.commit(observed);
+        }
+        // 把真实扣费的积分 + 扣费后余额推给该 uid 的前端 WS,前端会替换响应 meta
+        // 行里 $0.xxxx(容器侧估算,口径不一致)为真实扣费积分。
+        //
+        // **只用 debitedCredits,不要用 finalCredits**:
+        //   - billing_failed 路径(obs.kind='partial') ledger 根本没 debit,
+        //     finalCredits 可能 > 0 但用户没被扣到 → debitedCredits=null → 跳过广播
+        //   - clamp(余额不足)路径 finalCredits=标称,debitedCredits=实际扣款(<标称),
+        //     必须发实际扣款值,否则用户面板看到的 meta 和左上角余额对不上
+        //   - 23505 重入路径 debitedCredits=null → 跳过广播,前端靠 refreshBalance 兜底
+        if (
+          deps.broadcastToUser
+          && outcome.state === "committed"
+          && outcome.debitedCredits !== null
+          && outcome.debitedCredits > 0n
+        ) {
+          try {
+            deps.broadcastToUser(uid, {
+              type: "outbound.cost_charged",
+              requestId,
+              // credits 用字符串序列化,保留 BigInt 精度,避免 JS Number 53bit 边界。
+              // (虽然单笔不太可能上亿积分,但 balance_after 累计可能。)
+              costCredits: outcome.debitedCredits.toString(),
+              balanceAfter: outcome.balanceAfter === null
+                ? null
+                : outcome.balanceAfter.toString(),
+              sessionId: body.metadata?.session_id ?? null,
+            });
+          } catch (err) {
+            userLog.warn("proxy_broadcast_cost_failed", { err: errSummary(err) });
+          }
         }
         // settle 三态(2I-2 codex 审核结论:partial 必须基于 observed.kind 判断,
         // 不能因 pipeStream 抛错就直接归 aborted —— observation 捕获了部分 usage):

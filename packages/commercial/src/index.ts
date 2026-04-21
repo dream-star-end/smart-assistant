@@ -353,6 +353,13 @@ export async function registerCommercial(
   let internalProxyServer: HttpServer | undefined;
   let internalProxyHandler: AnthropicProxyHandler | undefined;
   let internalProxyAddress: { host: string; port: number } | undefined;
+  // 前向引用占位:userChatBridge 在下方创建,但 anthropicProxy 在这里就要它的 broadcastToUser。
+  // 给 proxy 的 dep 是稳定的闭包(总是调 bridgeBroadcastRef.current),创建 bridge 后赋值。
+  // 在 bridge 初始化完成前到达的 cost_charged broadcast 会走到 noop,不 throw 也不落盘(前端
+  // 看不到积分显示,但扣费本身仍生效;生产上 proxy 处理请求前 bridge 必已初始化)。
+  const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
+    current: () => { /* bridge 还没装好,静默丢弃 */ },
+  };
   if (!options.skipInternalProxy && proxyBind && proxyPort !== undefined) {
     try {
       const identityRepo = createPgIdentityRepo(getPool());
@@ -370,6 +377,10 @@ export async function registerCommercial(
         // OAuth token 过期后不会自动 refresh,结果上游直接 401。
         // health 注入进来是为了 refresh 失败时按规约走 health.manualDisable。
         refreshDeps: { health: healthTracker },
+        // 真实扣费积分推送 —— proxy 在 finalize.commit 后调,通过 bridge 把
+        // outbound.cost_charged 帧发给用户。bridge 启动顺序在 proxy 之后,
+        // 故用 ref 打破先后(构造期调用是 noop,请求期 bridge 必已 wire)。
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
       });
       internalProxyServer = createHttpServer((req, res) => {
         // peerIp 取 socket.remoteAddress(IP-only,无端口);verifyContainerIdentity 接受 string|undefined
@@ -586,6 +597,11 @@ export async function registerCommercial(
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
   });
+  // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
+  // 扣费事件会实时推到用户前端。
+  bridgeBroadcastRef.current = (uid, payload) => {
+    userChatBridge.broadcastToUser(uid, payload);
+  };
 
   // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
   let alertScheduler: AlertScheduler | undefined;
