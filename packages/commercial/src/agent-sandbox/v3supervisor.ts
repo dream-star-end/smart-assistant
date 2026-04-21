@@ -700,32 +700,47 @@ export async function stopAndRemoveV3Container(
   );
   // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing。
   //    R2 finding 加固:此后任何错都已经过了 DB UPDATE,意图已落库。
-  //    把原 SupervisorError 包成 PartialV3Cleanup,admin HTTP 见此 code →
-  //    502 明确告诉运维"DB 已 vanished,docker 清理失败,reconciler 会重试"。
+  //    R3 finding 加固:stop 失败也仍然 try remove({force:true}) ——
+  //    force remove 通常能覆盖大部分 stop 失败 case(daemon 抖动、容器
+  //    死锁等),缩短"row vanished 但 docker 残骸还在"的窗口。
+  //    任一 stage 失败,记录,最后聚合抛 PartialV3Cleanup(含 stages)。
   if (!containerRow.container_internal_id) return;
   const handle = deps.docker.getContainer(containerRow.container_internal_id);
+  const failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }> = [];
   try {
     await handle.stop({ t: timeoutSec });
   } catch (err) {
     if (!isNotFound(err) && !isNotModified(err)) {
-      throw wrapPartialV3Cleanup("stop", err);
+      failures.push({ stage: "stop", err: wrapDockerError(err) });
     }
   }
+  // stop 失败后仍尝试 force remove;remove 成功即视作清理完成(残骸已移除)
   try {
     await handle.remove({ force: true });
+    // 如果 stop 失败但 remove 成功:容器已被强制删除,等同清理成功
+    if (failures.length > 0 && failures.every((f) => f.stage === "stop")) {
+      return;
+    }
   } catch (err) {
-    if (!isNotFound(err)) throw wrapPartialV3Cleanup("remove", err);
+    if (!isNotFound(err)) failures.push({ stage: "remove", err: wrapDockerError(err) });
   }
+  if (failures.length > 0) throw aggregatePartialV3Cleanup(failures);
 }
 
 /** v3 stop/remove 已在 DB 翻 vanished 后 docker 步骤失败 —— 把原 SupervisorError
- *  包成 PartialV3Cleanup,保留原 message + statusCode 用于上层 admin HTTP 翻译。 */
-function wrapPartialV3Cleanup(stage: "stop" | "remove", err: unknown): SupervisorError {
-  const wrapped = wrapDockerError(err);
+ *  包成 PartialV3Cleanup,保留原 message + statusCode 用于上层 admin HTTP 翻译。
+ *  R3:支持多 stage 失败聚合(stop 和 remove 都失败的极端 case)。 */
+function aggregatePartialV3Cleanup(
+  failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }>,
+): SupervisorError {
+  const stages = failures.map((f) => f.stage).join("+");
+  const detail = failures.map((f) => `${f.stage}: ${f.err.message}`).join("; ");
+  // cause 取第一个失败的 cause(通常 daemon 错相同)
+  const firstCause = failures[0]?.err.cause;
   return new SupervisorError(
     "PartialV3Cleanup",
-    `v3 container ${stage} failed after DB marked vanished: ${wrapped.message}`,
-    wrapped.cause,
+    `v3 container ${stages} failed after DB marked vanished: ${detail}`,
+    firstCause,
   );
 }
 
