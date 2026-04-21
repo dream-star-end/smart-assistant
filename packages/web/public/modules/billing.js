@@ -1,17 +1,19 @@
 // OpenClaude (commercial v3) — billing module
 //
 // Phase 4B 范围:
-//   - 顶栏「余额 pill」展示当前用户 ¥X.XX,点击打开充值模态。
+//   - 顶栏「积分 pill」展示当前用户 X 积分(DOM id 仍为 balance-pill,向后兼容),点击打开充值模态。
 //   - 充值模态三段式 stage:
 //       a) plans  — GET /api/payment/plans,用户选套餐
 //       b) qr     — POST /api/payment/hupi/create,展示虎皮椒返回的 url_qrcode 图,
 //                   每 3s 轮询 GET /api/payment/orders/:order_no 直到 paid / expired。
-//       c) done   — 支付成功:刷新余额、提示、2s 后自动关闭。
+//       c) done   — 支付成功:刷新积分显示、提示、2s 后自动关闭。
 //
 // 单位约定(很重要,见 CLAUDE.md / 个人版 memory「claudeai.chat credits 单位=分」):
 //   user.credits / plan.amount_cents / plan.credits / order.amount_cents / order.credits
-//   全部是 BigInt-as-string,以「分」为单位。前端用 `formatYuan()` 格式化为「¥X.XX」。
-//   不写「积分」字眼,统一 ¥ 表达。
+//   全部是 BigInt-as-string,以「分」为单位。
+//   2026-04-21 起展示口径改为「积分」:「1 积分 = 1 分 = ¥0.01」,credits 字段原值即积分,
+//   整数显示无精度损失。用 `formatCredits()` 格式化为「X,XXX 积分」。
+//   `formatYuan()` 保留给仍需展示人民币金额的场景(充值下单时显示实际付款 ¥XX)。
 //
 // 端点契约(见 packages/commercial/src/http/{handlers.ts,payment.ts}):
 //   GET  /api/me                          → { user: { id, email, credits, ... } }
@@ -67,6 +69,21 @@ export function formatYuan(cents) {
   return `${negative ? '-' : ''}¥${yuanFmt}.${fen}`
 }
 
+/**
+ * 把「积分」(= 分) 格式化为「X,XXX 积分」(带千分位,无小数)。
+ * 语义上 1 积分 = 1 分,所以 credits 字段原值直接就是积分数,不需要除法。
+ * @param {string|number|bigint|null|undefined} credits
+ */
+export function formatCredits(credits) {
+  if (credits == null) return '0 积分'
+  const s = String(credits)
+  if (!/^-?\d+$/.test(s)) return '0 积分'
+  const negative = s.startsWith('-')
+  const digits = negative ? s.slice(1) : s
+  const fmt = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `${negative ? '-' : ''}${fmt} 积分`
+}
+
 function _setPillText(text) {
   const el = $('balance-text')
   if (el) el.textContent = text
@@ -79,7 +96,7 @@ function _showPill(visible) {
   else el.setAttribute('hidden', '')
 }
 
-// ── 余额刷新 ────────────────────────────────────────────────────────
+// ── 积分刷新 ────────────────────────────────────────────────────────
 
 /**
  * 拉 /api/me,更新 balance pill。
@@ -97,7 +114,7 @@ export async function refreshBalance() {
     const data = await apiGet('/api/me')
     const user = data?.user || {}
     const credits = user.credits ?? '0'
-    _setPillText(formatYuan(credits))
+    _setPillText(formatCredits(credits))
     _showPill(true)
     _commercialMode = true
     _setAdminLinkVisible(user.role === 'admin')
@@ -149,11 +166,9 @@ async function _loadPlans() {
       card.className = 'plan-card'
       card.dataset.planCode = String(p.code || '')
       const amount = formatYuan(p.amount_cents)
-      const credits = formatYuan(p.credits)
-      const hasBonus = String(p.credits) !== String(p.amount_cents)
-      const bonusHtml = hasBonus
-        ? `<div class="plan-card-bonus">到账 ${credits}</div>`
-        : ''
+      const credits = formatCredits(p.credits)
+      // 积分口径下始终展示「到账 X 积分」,让用户看到面值等价关系(¥10 → 1,000 积分)。
+      const bonusHtml = `<div class="plan-card-bonus">到账 ${credits}</div>`
       card.innerHTML = `
         <div class="plan-card-label">${_escape(String(p.label || p.code || ''))}</div>
         <div class="plan-card-price">${amount}</div>
@@ -199,11 +214,9 @@ async function _onPlanSelected(plan) {
 
   if (orderInfo) {
     const amt = formatYuan(data.amount_cents)
-    const got = formatYuan(data.credits)
-    const bonus = String(data.credits) !== String(data.amount_cents)
-      ? ` <span class="topup-bonus">(到账 ${_escape(got)})</span>`
-      : ''
-    orderInfo.innerHTML = `<strong>${_escape(plan.label || plan.code)}</strong> · ${_escape(amt)}${bonus} · 订单号 <code>${_escape(data.order_no)}</code>`
+    const got = formatCredits(data.credits)
+    // 订单摘要:付款金额 ¥ 仍保留(微信支付需要让用户知道实际扣款),到账换成积分口径。
+    orderInfo.innerHTML = `<strong>${_escape(plan.label || plan.code)}</strong> · 支付 ${_escape(amt)} <span class="topup-bonus">(到账 ${_escape(got)})</span> · 订单号 <code>${_escape(data.order_no)}</code>`
   }
 
   // 渲染 QR(注意: qrcode_url 已是 PNG URL,直接 <img>)
@@ -312,8 +325,8 @@ function _onOrderPaid(orderData) {
   _setStage('done')
   const el = $('topup-done-summary')
   if (el) {
-    const got = formatYuan(orderData.credits)
-    el.innerHTML = `支付成功!余额已增加 <strong>${_escape(got)}</strong>`
+    const got = formatCredits(orderData.credits)
+    el.innerHTML = `支付成功!积分已增加 <strong>${_escape(got)}</strong>`
   }
   refreshBalance().catch(() => {})
   setTimeout(() => {

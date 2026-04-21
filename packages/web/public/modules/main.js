@@ -64,7 +64,11 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js'
-import { initBilling, refreshBalance } from './billing.js'
+// ?v=34 bust: billing.js changed in this deploy (积分 formatter), and Cloudflare
+// edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`).
+// Without a bumped query-string, users loading the versioned main.js?v=34 would
+// still pull stale billing.js from CF and see "¥X.XX" in the topbar.
+import { initBilling, refreshBalance } from './billing.js?v=34'
 import { initUserPrefs, openPrefsModal } from './userPrefs.js'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
@@ -1051,7 +1055,31 @@ async function _forceLogout({ serverLogout } = {}) {
   showLogin()
 }
 
+// URL routing helpers.
+//
+// Problem before this: all three views (landing / login / app) shared the same
+// path `/`, so clicking "登录" from landing seemed to "莫名跳到登录页" —— the URL
+// never changed and the browser back button was inert. Now we maintain:
+//   /        → landing (cold) or app (logged in)
+//   /login   → login view
+// Each show*() callee syncs the URL via pushState (or replaceState when already
+// matched) so history + reloads respect the current view. A popstate handler
+// re-routes when the user hits back/forward.
+function _syncPath(target, { replace = false } = {}) {
+  try {
+    const cur = window.location.pathname + window.location.search + window.location.hash
+    const qh = window.location.search + window.location.hash
+    const next = target + qh
+    if (cur === next) return
+    if (replace) window.history.replaceState(null, '', next)
+    else window.history.pushState(null, '', next)
+  } catch {
+    /* history API unavailable in exotic sandboxes — don't block the view switch */
+  }
+}
+
 function showLogin() {
+  _syncPath('/login')
   $('login-view').hidden = false
   $('app-view').hidden = true
   if ($('landing-view')) $('landing-view').hidden = true
@@ -1136,6 +1164,10 @@ async function _ensureSessionCookie() {
 }
 
 async function showApp() {
+  // replace (not push) so back-from-app skips the intermediate /login step —
+  // going back from a logged-in session should land on wherever the user
+  // came from (landing), not on a login form they no longer need.
+  _syncPath('/', { replace: true })
   $('login-view').hidden = true
   $('app-view').hidden = false
   if ($('landing-view')) $('landing-view').hidden = true
@@ -1145,18 +1177,24 @@ async function showApp() {
 
 // ───────── Landing page (cold-visitor marketing surface) ─────────
 let _landingDataLoaded = false
-function _ktokToYuanPretty(creditsPerKtok) {
-  // creditsPerKtok comes from /api/public/models as a string in raw "credits"
-  // unit. Per claudeai.chat convention: 1 积分 = ¥1 (the raw string from
-  // /api/public/models is already the user-facing 积分/¥ figure for those
-  // *_per_ktok_credits fields — confirmed by Opus 4.7 input being "0.030000"
-  // → ¥0.03 / 千 token). Just trim trailing zeros for display.
+function _ktokToCreditsPretty(creditsPerKtok) {
+  // Backend's /api/public/models returns *_per_ktok_credits as "分 per 1000 tok"
+  // but BIASED by a factor of 100 under the legacy "1 积分 = ¥1 = 100 分" semantic
+  // (see packages/commercial/src/billing/pricing.ts → perKtokCredits, which divides
+  // by 100_000 = 1_000 × 100). For Opus 4.7 input (500 分/Mtok × 2.0 mul) the API
+  // returns "0.010000" meaning "¥0.01 / 1K tok".
+  //
+  // 2026-04-21 展示口径改为「1 积分 = 1 分 = ¥0.01」—— 同样的 Opus 4.7 input 现在
+  // 应显示为 "1 积分 / 1K tok"。换算:新单位 = 旧值 × 100 (¥ → 分 = 积分)。
+  //
+  // 未改后端公式以保持 API 契约兼容,仅在前端做 × 100 转换。Stable 小数位四舍五入
+  // 到最多 3 位(1.000 → "1"、0.600 → "0.6"、0.075 → "0.075")。
   const n = Number(creditsPerKtok)
   if (!Number.isFinite(n)) return '—'
-  if (n === 0) return '¥0'
-  // Up to 4 significant decimals
-  const s = n.toFixed(4).replace(/\.?0+$/, '')
-  return `¥${s}`
+  if (n === 0) return '0'
+  const credits = n * 100
+  // up to 3 decimals, trim trailing zeros
+  return credits.toFixed(3).replace(/\.?0+$/, '')
 }
 function _modelTagFor(id) {
   if (/opus/i.test(id)) return '旗舰推理'
@@ -1182,10 +1220,10 @@ async function _loadLandingData() {
         const name = htmlSafeEscape(m.display_name || m.id || '')
         const id = htmlSafeEscape(m.id || '')
         const tag = htmlSafeEscape(_modelTagFor(m.id || ''))
-        const inP = _ktokToYuanPretty(m.input_per_ktok_credits)
-        const outP = _ktokToYuanPretty(m.output_per_ktok_credits)
-        const cacheR = _ktokToYuanPretty(m.cache_read_per_ktok_credits)
-        const cacheW = _ktokToYuanPretty(m.cache_write_per_ktok_credits)
+        const inP = _ktokToCreditsPretty(m.input_per_ktok_credits)
+        const outP = _ktokToCreditsPretty(m.output_per_ktok_credits)
+        const cacheR = _ktokToCreditsPretty(m.cache_read_per_ktok_credits)
+        const cacheW = _ktokToCreditsPretty(m.cache_write_per_ktok_credits)
         return `
           <div class="landing-model">
             <div class="landing-model-head">
@@ -1198,19 +1236,19 @@ async function _loadLandingData() {
             <div class="landing-model-prices">
               <div class="landing-model-price">
                 <span class="landing-model-price-label">输入</span>
-                <span class="landing-model-price-val">${inP}<span class="unit">/ 1K tok</span></span>
+                <span class="landing-model-price-val">${inP} <span class="unit">积分 / 1K tok</span></span>
               </div>
               <div class="landing-model-price">
                 <span class="landing-model-price-label">输出</span>
-                <span class="landing-model-price-val">${outP}<span class="unit">/ 1K tok</span></span>
+                <span class="landing-model-price-val">${outP} <span class="unit">积分 / 1K tok</span></span>
               </div>
               <div class="landing-model-price">
                 <span class="landing-model-price-label">缓存读</span>
-                <span class="landing-model-price-val">${cacheR}<span class="unit">/ 1K tok</span></span>
+                <span class="landing-model-price-val">${cacheR} <span class="unit">积分 / 1K tok</span></span>
               </div>
               <div class="landing-model-price">
                 <span class="landing-model-price-label">缓存写</span>
-                <span class="landing-model-price-val">${cacheW}<span class="unit">/ 1K tok</span></span>
+                <span class="landing-model-price-val">${cacheW} <span class="unit">积分 / 1K tok</span></span>
               </div>
             </div>
           </div>
@@ -1258,6 +1296,7 @@ async function _loadLandingData() {
 }
 function showLanding() {
   if (!$('landing-view')) { showLogin(); return }
+  _syncPath('/')
   $('landing-view').hidden = false
   $('login-view').hidden = true
   $('app-view').hidden = true
@@ -2030,9 +2069,11 @@ async function init() {
     // Cold visitor (no token):
     //  - URL-driven flows (?verify_email / ?reset_password / explicit ?login=1)
     //    skip landing and jump straight into the auth view.
+    //  - Pathname `/login` (shareable URL 2026-04-21+) also forces the auth view.
     //  - Otherwise show the marketing landing page; user clicks CTA → login-view.
     const sp = new URLSearchParams(window.location.search)
     const goStraightToAuth =
+      window.location.pathname === '/login' ||
       sp.has('verify_email') || sp.has('reset_password') ||
       sp.has('login') || sp.has('register') || sp.has('signin') || sp.has('signup')
     if (goStraightToAuth) {
@@ -2042,6 +2083,27 @@ async function init() {
       showLanding()
     }
   }
+
+  // Popstate: browser back/forward button must round-trip between landing
+  // and login when the user pivoted via CTA. We re-derive the view from
+  // the new pathname + token state. showApp/showLanding/showLogin internally
+  // call _syncPath(), but _syncPath() no-ops when the URL already matches —
+  // so re-entering isn't double-pushing history entries.
+  window.addEventListener('popstate', () => {
+    if (window.location.pathname === '/login') {
+      if (!$('login-view').hidden) return // already showing login
+      showLogin()
+      return
+    }
+    // `/` (or any other) path: app if logged in, else landing
+    if (state.token) {
+      if (!$('app-view').hidden) return
+      showApp().catch(() => {})
+    } else {
+      if ($('landing-view') && !$('landing-view').hidden) return
+      showLanding()
+    }
+  })
 
   // Service worker
   if ('serviceWorker' in navigator) {

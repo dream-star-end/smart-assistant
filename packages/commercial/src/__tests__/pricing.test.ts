@@ -26,10 +26,11 @@ const sonnet: ModelPricing = {
 const opus: ModelPricing = {
   model_id: "claude-opus-4-7",
   display_name: "Claude Opus 4.7",
-  input_per_mtok: 1500n,
-  output_per_mtok: 7500n,
-  cache_read_per_mtok: 150n,
-  cache_write_per_mtok: 1875n,
+  // 2026-04 Opus 4.7 platform.claude.com: $5 input / $25 output (migration 0020)
+  input_per_mtok: 500n,
+  output_per_mtok: 2500n,
+  cache_read_per_mtok: 50n,
+  cache_write_per_mtok: 625n,
   multiplier: "2.000",
   enabled: true,
   sort_order: 90,
@@ -113,9 +114,9 @@ describe("PricingCache (unit, no DB)", () => {
     assert.equal(list.length, 2);
     assert.equal(list[0].id, "claude-opus-4-7");
     assert.equal(list[1].id, "claude-sonnet-4-6");
-    // per-ktok 字段格式对上
-    assert.equal(list[0].input_per_ktok_credits, "0.030000");
-    assert.equal(list[0].output_per_ktok_credits, "0.150000");
+    // per-ktok 字段格式对上(Opus 4.7 new pricing: 500/2500 × 2.0 → 0.010/0.050)
+    assert.equal(list[0].input_per_ktok_credits, "0.010000");
+    assert.equal(list[0].output_per_ktok_credits, "0.050000");
     assert.equal(list[1].input_per_ktok_credits, "0.006000");
     assert.equal(list[0].multiplier, "2.000");
   });

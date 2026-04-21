@@ -17,6 +17,7 @@
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
 <link rel="stylesheet" href="/style.css?v=34" />
+<!-- main.js version bumped 2026-04-21: 积分化 + /login routing -->
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -67,7 +68,7 @@
         <button type="button" id="landing-hero-login-btn" class="btn btn-ghost landing-btn-lg">已有账号 → 登录</button>
       </div>
       <div class="landing-hero-meta">
-        <span><strong>1 元 = $1 美元</strong> token 额度</span>
+        <span><strong>¥1 = 100 积分 ≈ $1 美元</strong> token 额度</span>
         <span class="landing-meta-sep">·</span>
         <span>官方 Claude Code Max 通道</span>
         <span class="landing-meta-sep">·</span>
@@ -117,7 +118,7 @@
     <div class="landing-section-head">
       <span class="landing-section-tag">模型矩阵</span>
       <h2 class="landing-section-title">全系 Claude 模型,定价透明到 token</h2>
-      <p class="landing-section-sub">输入 / 输出 / 缓存读写 全部分项标价。<strong>1 元 = $1 美元 = 100 积分</strong>,直接对标官网定价。</p>
+      <p class="landing-section-sub">输入 / 输出 / 缓存读写 全部分项标价。<strong>1 积分 = ¥0.01 ≈ $0.01 美元</strong>,直接对标官网定价。</p>
     </div>
     <div id="landing-models" class="landing-models">
       <div class="landing-models-loading">加载中…</div>
@@ -128,7 +129,7 @@
     <div class="landing-section-head">
       <span class="landing-section-tag">充值方案</span>
       <h2 class="landing-section-title">充得越多,送得越多</h2>
-      <p class="landing-section-sub">余额永不过期,可按 token 用于任意模型。</p>
+      <p class="landing-section-sub">积分永不过期,可按 token 用于任意模型。</p>
     </div>
     <div id="landing-plans" class="landing-plans">
       <div class="landing-models-loading">加载中…</div>
@@ -154,7 +155,7 @@
       </details>
       <details class="landing-faq-item">
         <summary>计费方式是按月订阅还是按量?</summary>
-        <p>按量计费。充值后按实际 input / output token 扣账户余额。<strong>1 元 = $1 美元 = 100 积分</strong>(1 积分 ≈ $0.01),精确到分。不用就不扣,余额永不过期。</p>
+        <p>按量计费。充值后按实际 input / output token 扣账户积分。<strong>充 ¥1 到账 100 积分,1 积分 ≈ $0.01 美元</strong>,精确到单 token。不用就不扣,积分永不过期。</p>
       </details>
       <details class="landing-faq-item">
         <summary>Agent 模式跑在哪里?数据安全吗?</summary>
@@ -166,7 +167,7 @@
       </details>
       <details class="landing-faq-item">
         <summary>充错了 / 不想用了能退款吗?</summary>
-        <p>未消费的余额可以申请退回原支付渠道,扣除支付通道手续费后退款。已消费的 token 不可退。</p>
+        <p>未消费的积分可以申请退回原支付渠道,扣除支付通道手续费后退款。已消费的 token 不可退。</p>
       </details>
       <details class="landing-faq-item">
         <summary>有手机 / 移动端吗?</summary>
@@ -178,7 +179,7 @@
   <section class="landing-cta-band">
     <div class="landing-cta-inner">
       <h2>准备好让 AI 替你干活了吗?</h2>
-      <p>邮箱注册即可开始,微信扫码充值,首次 ¥10 起。1 元 = $1 美元 token 额度,余额永不过期。</p>
+      <p>邮箱注册即可开始,微信扫码充值,首次 ¥10 起。¥1 = 100 积分 ≈ $1 美元 token 额度,积分永不过期。</p>
       <button type="button" id="landing-foot-register-btn" class="btn btn-primary landing-btn-lg">立即开始 →</button>
     </div>
   </section>
@@ -224,7 +225,7 @@
           <span class="login-aside-bullet-dot"></span>
           <div>
             <div class="login-aside-bullet-title">官方 Claude API,无中间商</div>
-            <div class="login-aside-bullet-desc">直连 Anthropic,token 计费 1¥ = $1</div>
+            <div class="login-aside-bullet-desc">直连 Anthropic,¥1 = 100 积分 ≈ $1 美元 token 额度</div>
           </div>
         </li>
         <li>
@@ -427,10 +428,10 @@
         <span id="token-usage-text">0 tokens</span>
       </div>
       <div class="head-actions">
-        <!-- V3 commercial: 余额 pill (个人版无 /api/me → 自动隐藏) -->
-        <button id="balance-pill" class="balance-pill" type="button" title="点击充值" hidden>
+        <!-- V3 commercial: 积分 pill (个人版无 /api/me → 自动隐藏) -->
+        <button id="balance-pill" class="balance-pill" type="button" title="点击充值积分" hidden>
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v12M9 9h4.5a2.5 2.5 0 0 1 0 5H9"/></svg>
-          <span id="balance-text">¥0.00</span>
+          <span id="balance-text">0 积分</span>
         </button>
         <button id="tasks-btn" class="icon-btn tasks-btn" title="后台任务" aria-label="后台任务" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
@@ -1039,6 +1040,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=33"></script>
+<script type="module" src="/modules/main.js?v=34"></script>
 </body>
 </html>

@@ -135,7 +135,7 @@ describe("PricingCache.load (integ)", () => {
          multiplier, enabled, sort_order)
        VALUES
          ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100),
-         ('claude-opus-4-7','Claude Opus 4.7',1500,7500,150,1875,2.0,TRUE,90)`,
+         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90)`,
     );
   });
 
@@ -287,7 +287,7 @@ describe("/api/public/models (http integ)", () => {
          multiplier, enabled, sort_order)
        VALUES
          ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100),
-         ('claude-opus-4-7','Claude Opus 4.7',1500,7500,150,1875,2.0,TRUE,90)`,
+         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90)`,
     );
     pricing = new PricingCache();
     await pricing.load();
@@ -325,10 +325,12 @@ describe("/api/public/models (http integ)", () => {
     const j = (await r.json()) as { models: Array<Record<string, string>> };
     assert.ok(Array.isArray(j.models));
     assert.equal(j.models.length, 2);
-    // opus first (sort_order 90)
+    // opus first (sort_order 90). Opus 4.7 pricing per migration 0020:
+    // 500/2500 cents/Mtok × 2.0 mul → 0.010/0.050 credits/ktok (under legacy
+    // "1 积分 = ¥1 = 100 分" formula in perKtokCredits; see pricing.ts).
     assert.equal(j.models[0].id, "claude-opus-4-7");
-    assert.equal(j.models[0].input_per_ktok_credits, "0.030000");
-    assert.equal(j.models[0].output_per_ktok_credits, "0.150000");
+    assert.equal(j.models[0].input_per_ktok_credits, "0.010000");
+    assert.equal(j.models[0].output_per_ktok_credits, "0.050000");
     assert.equal(j.models[0].multiplier, "2.000");
     assert.equal(j.models[1].id, "claude-sonnet-4-6");
     assert.equal(j.models[1].input_per_ktok_credits, "0.006000");
