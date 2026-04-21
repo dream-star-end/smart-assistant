@@ -64,12 +64,12 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js'
-// ?v=508d7d2 bust: websocket.js now imports billing.js for refreshBalance() after
+// ?v=84d32d3 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, refreshBalance } from './billing.js?v=508d7d2'
+import { initBilling, refreshBalance } from './billing.js?v=84d32d3'
 import { initUserPrefs, openPrefsModal } from './userPrefs.js'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
@@ -170,7 +170,7 @@ import {
   showSlashPopup,
   slashPopupVisible,
 } from './commands.js'
-import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
+import { getEffortForSubmit, initModePills, renderModePills, clearEffortOnLogout } from './effortMode.js'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
 
 // ═══════════════════════════════════════════════════════════
@@ -1027,9 +1027,14 @@ async function _forceLogout({ serverLogout } = {}) {
   localStorage.removeItem('openclaude_access_token')
   localStorage.removeItem('openclaude_refresh_token')
   localStorage.removeItem('openclaude_access_exp')
+  // 2026-04-21 安全审计 HIGH#F3:清 per-agent effort pill 缓存,避免同浏览器
+  // 切账号时新用户继承老用户的 xhigh/max 选择(服务端 credits 会拦,但 pill
+  // 视觉状态会误导用户)。
+  clearEffortOnLogout()
   state.token = ''  // Clear token BEFORE close so onclose handler won't auto-reconnect
   state.refreshToken = ''
   state.tokenExp = 0
+  state.userId = null
   // Rearm the auth-expired one-shot so a future session expiry can trigger
   // the logout flow again. login success also does this, but doing it here
   // too keeps the semantics symmetric across both teardown paths.
@@ -1486,14 +1491,22 @@ async function loadChangelog() {
       const vEl = $('app-version')
       if (vEl) vEl.textContent = `v${_changelogData.currentVersion}`
     }
-    // Check if user has seen this version (scoped by token to avoid cross-user collision)
-    const _userKey = `openclaude_changelog_seen_${(state.token || '').slice(-8)}`
-    const lastSeen = localStorage.getItem(_userKey)
-    if (lastSeen !== _changelogData.currentVersion && _changelogData.releases?.length > 0) {
-      const badge = $('changelog-badge')
-      if (badge) {
-        badge.hidden = false
-        badge.textContent = 'NEW'
+    // 2026-04-21 安全审计 HIGH#F1 修复:用户桶原用 state.token 末 8 字节,
+    // 但 JWT 每次 refresh 会换,导致同一用户的"已读"状态反复丢失;更糟的是
+    // 首次进入(token 为空)时会落到 `openclaude_changelog_seen_`(空后缀)
+    // 这个共享 key,跨账号串到同一个桶。改用 billing.refreshBalance 写入的
+    // 稳定 state.userId;拿不到 user.id(未登录 / commercial 未启用 / /api/me
+    // 还没返回)时直接跳过"已读"判断,只显示版本号,避免污染 localStorage。
+    const _uid = state.userId ? String(state.userId) : ''
+    if (_uid && _changelogData.currentVersion) {
+      const _userKey = `openclaude_changelog_seen_${_uid}`
+      const lastSeen = localStorage.getItem(_userKey)
+      if (lastSeen !== _changelogData.currentVersion && _changelogData.releases?.length > 0) {
+        const badge = $('changelog-badge')
+        if (badge) {
+          badge.hidden = false
+          badge.textContent = 'NEW'
+        }
       }
     }
   } catch {}
@@ -1519,9 +1532,9 @@ function openChangelog() {
     `).join('')
     versionEl.textContent = `当前版本 v${_changelogData.currentVersion}`
   }
-  // Mark as seen (scoped by user token)
-  if (_changelogData?.currentVersion) {
-    const _userKey = `openclaude_changelog_seen_${(state.token || '').slice(-8)}`
+  // Mark as seen (scoped by stable user.id; 未登录用户不写入避免 key 污染)
+  if (_changelogData?.currentVersion && state.userId) {
+    const _userKey = `openclaude_changelog_seen_${String(state.userId)}`
     localStorage.setItem(_userKey, _changelogData.currentVersion)
     const badge = $('changelog-badge')
     if (badge) badge.hidden = true

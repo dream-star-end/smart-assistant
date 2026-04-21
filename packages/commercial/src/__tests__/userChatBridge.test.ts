@@ -112,7 +112,9 @@ async function makeJwt(uid: string): Promise<string> {
 }
 
 function openClient(port: number, token: string): WebSocket {
-  return new WebSocket(`ws://127.0.0.1:${port}${BRIDGE_WS_PATH}?token=${token}`);
+  // 2026-04-21 安全审计 HIGH#2:server 已不再接受 ?token= URL query fallback。
+  // 测试与生产前端一致走 Sec-WebSocket-Protocol "bearer, <token>" 子协议。
+  return new WebSocket(`ws://127.0.0.1:${port}${BRIDGE_WS_PATH}`, ["bearer", token]);
 }
 
 function waitClose(ws: WebSocket): Promise<{ code: number; reason: string }> {

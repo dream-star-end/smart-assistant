@@ -96,13 +96,16 @@ export async function checkRateLimit(
   const key = buildKey(cfg, identifier, windowStart);
 
   const count = await redis.incr(key);
-  if (count === 1) {
-    // 本窗口首次:设置过期到窗口结束 — 失败不致命(下次 INCR 还能再 EXPIRE)
-    try {
-      await redis.expire(key, cfg.windowSeconds);
-    } catch {
-      // 静默忽略,redis 偶发 EXPIRE 失败不应让请求失败;监控应另行采集
-    }
+  // 2026-04-21 安全审计 Medium#1:EXPIRE 之前只在 count===1 时调用。如果 redis
+  // 意外重启 / AOF rewrite 导致 PERSIST 残留(count>1 但无 TTL),key 将永远
+  // 不过期,占 redis 内存 + 永久把该 identifier 锁成 count>max 被 429。
+  // 修复:每次都 EXPIRE — 它是幂等的,只在 TTL<windowSeconds 时刷新不会破坏
+  // 固定窗口语义(窗口仍按 windowStart 对齐,key 名带 windowStart 保证不同
+  // 窗口 key 不同)。开销可忽略(redis 一次 RTT),换来永远不会有无 TTL 残留。
+  try {
+    await redis.expire(key, cfg.windowSeconds);
+  } catch {
+    // redis 偶发 EXPIRE 失败不应让请求失败;TTL 最坏下次 INCR 再兜底。监控另行采集。
   }
 
   const windowEnd = windowStart + cfg.windowSeconds;

@@ -241,6 +241,12 @@ export class Gateway {
     this.sessions = new SessionManager(deps.config)
     // Wire up auth error handler: force-refresh token when 401 detected (bypass expiry check)
     this.sessions.onAuthError = () => this.refreshClaudeOAuthIfNeeded(true)
+    // 2026-04-21 Medium#G1:被 sessionManager 内部驱逐/shutdown 的 sessionKey
+    // 由此 callback 统一走 outboundRing.clear,防 ring 内存长期泄漏。server.ts
+    // 其他已有的 destroySession 调用点仍然显式 clear(幂等 double-clear 无副作用)。
+    this.sessions.onSessionDestroyed = (sessionKey) => {
+      try { this._outboundRing.clear(sessionKey) } catch {}
+    }
   }
 
   async start(): Promise<void> {

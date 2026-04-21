@@ -35,6 +35,7 @@
 
 import { apiGet, apiJson } from './api.js'
 import { closeModal, openModal, toast } from './ui.js'
+import { state } from './state.js'
 
 // ── 常量 ───────────────────────────────────────────────────────────
 const POLL_INTERVAL_MS = 3000
@@ -170,6 +171,13 @@ export async function refreshBalance() {
     _setPillText(formatCredits(credits))
     _showPill(true)
     _commercialMode = true
+    // 2026-04-21 安全审计 HIGH#F1:把稳定 user.id 存到 state,changelog_seen /
+    // effort_by_agent 等用户级 localStorage 桶改用这个而不是 JWT 末 8 字节
+    // (JWT 每次 refresh 会变,不是稳定身份,会让"已读"状态反复丢失)。
+    if (user.id != null) {
+      const uid = String(user.id)
+      if (uid) state.userId = uid
+    }
     _setAdminLinkVisible(user.role === 'admin')
     return { shown: true, credits: String(credits), role: user.role || null }
   } catch (err) {

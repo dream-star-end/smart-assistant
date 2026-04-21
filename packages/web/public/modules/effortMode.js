@@ -119,3 +119,17 @@ export function initModePills() {
   })
   renderModePills()
 }
+
+/**
+ * 2026-04-21 安全审计 HIGH#F3:logout 时清当前用户的 agent effort 缓存。
+ *
+ * 此前 STORAGE_KEY 不带 user scope,同浏览器切换账号会把 A 用户设过的
+ * xhigh/max pill 继承给 B 用户,哪怕 B 根本没资格(积分不够 / Opus 4.7
+ * 未订阅)。服务端会用 credits 拦住,但 pill 视觉上已经 pressed 态,造成
+ * 混淆。logout 时直接清空是最简洁的修复 —— 新用户一切从零开始。
+ *
+ * 在 auth.js 的 logout / doLogout 里调用。
+ */
+export function clearEffortOnLogout() {
+  try { localStorage.removeItem(STORAGE_KEY) } catch { /* */ }
+}

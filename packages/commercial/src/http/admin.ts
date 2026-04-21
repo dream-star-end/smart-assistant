@@ -2,7 +2,13 @@
  * T-60 — /api/admin/* HTTP handlers。
  *
  * 统一约定:
- *   - 所有路由先走 `requireAdmin`(403 FORBIDDEN 非 admin;401 UNAUTHORIZED 无 token)
+ *   - **读**路由用 `requireAdmin`(只校验 JWT 里的 role='admin',24h TTL)
+ *   - **写**路由用 `requireAdminVerifyDb`(JWT + DB 双校验 role/status)
+ *     — 防止已被降权/封禁的 admin 在 JWT TTL 内继续用旧 token 改后台状态
+ *       (2026-04-21 安全审计 Medium#5)。写路由包含:
+ *         PatchUser / AdjustCredits / PatchPricing / PatchPlan /
+ *         CreateAccount / PatchAccount / DeleteAccount / OAuthExchange /
+ *         AgentContainerAction / PutSetting
  *   - 写操作的 before/after 写 admin_audit,在同一事务内(见各 ops 模块)
  *   - URL 动态段(/users/:id / /accounts/:id / /pricing/:model_id)
  *     从 url.pathname 抽取,不让 router 做正则 —— 保持 router 简单
@@ -13,7 +19,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { HttpError, sendJson, readJsonBody } from "./util.js";
-import { requireAdmin } from "../admin/requireAdmin.js";
+import { requireAdmin, requireAdminVerifyDb } from "../admin/requireAdmin.js";
 import {
   listUsers,
   getUser,
@@ -221,7 +227,7 @@ export async function handleAdminPatchUser(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const id = extractTailId(url, "/api/admin/users/");
 
@@ -276,7 +282,9 @@ export async function handleAdminAdjustCredits(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  // adjustCredits 能凭空发积分(= 钱),金额硬 cap ¥100 万 —— 写路由统一走
+  // requireAdminVerifyDb,见文件头注释。
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   // /api/admin/users/:id/credits → 提取 :id
   const prefix = "/api/admin/users/";
@@ -449,7 +457,7 @@ export async function handleAdminPatchPricing(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const modelId = extractTailSlug(url, "/api/admin/pricing/", /^[A-Za-z0-9._-]{1,64}$/);
 
@@ -509,7 +517,7 @@ export async function handleAdminPatchPlan(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const code = extractTailSlug(url, "/api/admin/plans/", /^[A-Za-z0-9_-]{1,64}$/);
 
@@ -678,7 +686,7 @@ export async function handleAdminCreateAccount(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const body = (await readJsonBody(req)) ?? {};
   if (typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "VALIDATION", "request body must be JSON object");
@@ -734,7 +742,7 @@ export async function handleAdminPatchAccount(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const id = extractTailId(url, "/api/admin/accounts/");
   const body = (await readJsonBody(req)) ?? {};
@@ -803,7 +811,7 @@ export async function handleAdminDeleteAccount(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const id = extractTailId(url, "/api/admin/accounts/");
   const ok = await adminDeleteAccount(id, {
@@ -841,7 +849,10 @@ export async function handleAdminOAuthExchange(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  await requireAdmin(req, deps.jwtSecret);
+  // 写路径:返回可落库的 anthropic OAuth token,后续 adminCreateAccount 真正入库。
+  // 虽然 exchange 本身不写 DB,但它是账号创建链路里必经的"换 token"动作,保持
+  // 与写族一致的 requireAdminVerifyDb 鉴权防降权 admin 重用旧 JWT 建账号。
+  await requireAdminVerifyDb(req, deps.jwtSecret);
   const body = (await readJsonBody(req)) ?? {};
   if (typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "VALIDATION", "request body must be JSON object");
@@ -916,7 +927,7 @@ export async function handleAdminAgentContainerAction(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const { id, action } = parseContainerActionUrl(url);
   const agent = deps.agentRuntime;
@@ -1136,7 +1147,7 @@ export async function handleAdminPutSetting(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdmin(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const key = extractTailKey(url, "/api/admin/settings/");
 

@@ -99,6 +99,21 @@ export class SessionManager {
   public onCronBridge?: (event: CronBridgeEvent) => Promise<void>
   /** Called when a 401 auth error is detected — gateway should trigger immediate token refresh */
   public onAuthError?: () => Promise<void>
+  /**
+   * 2026-04-21 安全审计 Medium#G1:被拆的 session 在 sessionManager 层把 subprocess
+   * 杀掉就结束,但 server.ts 里的 `_outboundRing` 按 sessionKey 各维护一圈 frame
+   * buffer,sessionManager 本身没这个引用。结果:LRU 驱逐/shutdownAll/
+   * destroySession 内部路径 里 outboundRing 条目永远不被清,cron/task 风格的
+   * 唯一 sessionKey 会随时间慢慢泄漏成常驻 frame 堆 —— 实测 5 周跑满 ~80 MB RSS。
+   *
+   * 修法:把 outboundRing.clear 通过这个 callback 回调给 server.ts,让 server 层
+   * 的唯一 owner 统一负责清理。server.ts 在 OpenClaudeServer 构造函数里就绑定 callback
+   * (见 server.ts:247 附近),确保第一次 destroySession 触发前 callback 已就位。
+   *
+   * 为何不把 OutboundRing 直接挪到 sessionManager:ring 的消费方(replay / store)
+   * 都在 server.ts 的 WS handler 内,移动代价比暴露一个清理 hook 大得多。
+   */
+  public onSessionDestroyed?: (sessionKey: string) => void
 
   private resumeMapPath = join(paths.home, 'resume-map.json')
 
@@ -1222,6 +1237,10 @@ export class SessionManager {
       this._resumeMapProvider.delete(sessionKey)
       this._saveResumeMap()
     }
+    // Medium#G1:让 server.ts 的 outboundRing 也清掉这个 key(两个 server.ts
+    // 里现存的 destroySession 调用点已经显式 clear 过,这里再调一次是幂等;
+    // 未来若有遗漏的路径,callback 能兜住)
+    try { this.onSessionDestroyed?.(sessionKey) } catch {}
   }
 
   async shutdownAll(): Promise<void> {
@@ -1229,8 +1248,14 @@ export class SessionManager {
     // (runner.shutdown() sets shuttingDown=true so the exit handler won't call _saveResumeMap)
     this._saveResumeMap()
     await this._resumeMapWrite
+    // Medium#G1:shutdown 前先把所有 live sessionKey 通知一次 ring 清理,防止
+    // 进程退出前最后一刻的 WS 重连拿到下一轮无主的 frame。
+    const keysToClear = [...this.sessions.keys()]
     await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
     this.sessions.clear()
+    for (const k of keysToClear) {
+      try { this.onSessionDestroyed?.(k) } catch {}
+    }
   }
 
   list(): {
@@ -1282,6 +1307,10 @@ export class SessionManager {
           this._resumeMapProvider.delete(key)
         }
         // (webchat entries stay in _resumeMap intentionally for cross-restart recovery)
+        // Medium#G1:任何被驱逐的 session 都通知 ring 清。webchat 虽然 resume-map
+        // 留着等 reconnect,但 outboundRing 没必要留(重连时会重走一次 hello,server
+        // 按 lastFrameSeq=0 重建,不读历史 ring),现在清掉正好把内存还回去。
+        try { this.onSessionDestroyed?.(key) } catch {}
       }
       if (toEvict.length > 0) this._saveResumeMap()
 

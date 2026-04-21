@@ -622,6 +622,18 @@ let _tailSyncScheduled = false
  *     running sync settles so caller observes state stamped after their call.
  */
 export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult, freshAfterInFlight = false } = {}) {
+  // 2026-04-21 安全审计 Medium#F1:当 tab 不可见时跳过所有非首屏 sync。
+  //   - `online` 事件在手机后台重拾信号时仍会触发,会让隐藏 tab 在无人看的
+  //     情况下跑完整 /sessions/list + N×GET /sessions/:id 轮询,空耗带宽 & CPU
+  //   - 多 tab 场景下,后台 tab 的 IDB 写会与前台 tab 的写竞争,历史上这里跑
+  //     过 dbPut 丢 message 的 race
+  //   - 首屏启动场景里 force=true 通常是必须跑的(init() 不会把 force 往里塞,
+  //     只有 online / websocket 恢复会),所以 hidden 时跳 force 也安全;真正
+  //     需要 sync 的话下一次 visibilitychange 会再触一次(已见 main.js:288)
+  // 例外:`typeof document === 'undefined'` 的测试/SSR 环境不经过这个分支。
+  if (typeof document !== 'undefined' && document.hidden) {
+    return Promise.resolve(null)
+  }
   if (_syncInFlight) {
     if (onResult || (force && freshAfterInFlight)) {
       _pendingOnResultCallbacks.push({

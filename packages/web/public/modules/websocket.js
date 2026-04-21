@@ -7,7 +7,7 @@ import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance } from './billing.js?v=508d7d2'
+import { refreshBalance } from './billing.js?v=84d32d3'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -60,6 +60,41 @@ const OFFLINE_LATCH_GRACE_MS = 60_000
 let _lastVisibilityReconnectAt = 0
 const VISIBILITY_RECONNECT_COOLDOWN_MS = 2000
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
+
+// 2026-04-21 安全审计 Medium#F2:`ws.send()` 在 readyState === OPEN 时永不报错,
+// 浏览器在内核内把 frame 压进 `bufferedAmount` 队列,半死连接 / 服务端暂停 /
+// 极慢上行时队列可以无限涨 —— 历史上线过 50MB/客户端的 RSS 占用。
+//
+// 这个 helper 在真发前先看 bufferedAmount:
+//   - < SAFE_WS_BUFFER_BYTES     → 正常发,返回 true
+//   - ≥ SAFE_WS_BUFFER_BYTES     → 拒发,主动 ws.close(4000, ...) 触发现有
+//                                   onclose 重连 + offline 队列补发逻辑;返回 false
+//
+// 2MB 是对 chat / permission / ping 都宽松的上限:一次用户 prompt 典型 <16KB,
+// 2MB 等价 128 条已排队等发的 prompt。真撞到这个阈值只能是连接实际已死或上行
+// 完全阻塞;此时不主动 close 会让 socket 半死永久挂起(drain/ping 都只会静默
+// 失败,无法自愈),主动 close(4000) 走 onclose→reconnect 是唯一的自愈路径。
+// Codex review IMPORTANT#1 指出了这个边界。
+const SAFE_WS_BUFFER_BYTES = 2 * 1024 * 1024
+const WS_CLOSE_CODE_STALLED = 4000  // app-level,不与 IANA 1xxx/3xxx 冲突
+function safeWsSend(ws, data) {
+  if (!ws || ws.readyState !== 1) return false
+  // bufferedAmount 在某些环境下可能 undefined(polyfill / mock);fallback 当 0
+  const buffered = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0
+  if (buffered >= SAFE_WS_BUFFER_BYTES) {
+    try { console.warn('[ws] send skipped: bufferedAmount', buffered, 'exceeds', SAFE_WS_BUFFER_BYTES, '- closing for reconnect') } catch {}
+    // readyState 立即跳到 CLOSING,阻止同一 tick 里其他 send 继续压 buffer。
+    // onclose handler 会触发重连并把离线队列里的消息重放。
+    try { ws.close(WS_CLOSE_CODE_STALLED, 'bufferedAmount exceeded') } catch {}
+    return false
+  }
+  try {
+    ws.send(data)
+    return true
+  } catch {
+    return false
+  }
+}
 
 // ── Per-session thinking safety timer ──
 // Clears stuck _sendingInFlight if no outbound frame arrives within 10 minutes.
@@ -433,30 +468,31 @@ function _drainNextOfflineItem() {
     state._offlineDrainingCurrent = null
     return
   }
-  try {
-    ws.send(JSON.stringify(item.payload))
-    const sess = state.sessions.get(item.sessId)
-    if (sess) {
-      const msg = sess.messages.find((m) => m.id === item.msgId)
-      if (msg) {
-        msg.status = 'sent'
-        updateMsgStatus(msg)
-      }
-      sess._sendingInFlight = true
-      _resetThinkingSafety(sess.id)
-      if (sess.id === state.currentSessionId) {
-        state.sendingInFlight = true
-        updateSendEnabled()
-        showTypingIndicator()
-        setTitleBusy(true)
-      }
-    }
-  } catch {
-    // Send failed — re-queue current + remaining
+  // Medium#F2:safeWsSend 会检查 bufferedAmount,半死连接时拒发并返 false。
+  // 拒发时和 throw 一样,把当前 item + 剩余放回 offlineQueue,等重连后再发。
+  const sent = safeWsSend(ws, JSON.stringify(item.payload))
+  if (!sent) {
     state.offlineQueue.unshift(item, ...queue)
     state._offlineQueuePending = []
     state._offlineQueueDraining = false
     state._offlineDrainingCurrent = null
+    return
+  }
+  const sess = state.sessions.get(item.sessId)
+  if (sess) {
+    const msg = sess.messages.find((m) => m.id === item.msgId)
+    if (msg) {
+      msg.status = 'sent'
+      updateMsgStatus(msg)
+    }
+    sess._sendingInFlight = true
+    _resetThinkingSafety(sess.id)
+    if (sess.id === state.currentSessionId) {
+      state.sendingInFlight = true
+      updateSendEnabled()
+      showTypingIndicator()
+      setTitleBusy(true)
+    }
   }
   // Safety timeout: if no isFinal arrives in 120s, advance the drain to prevent wedge
   state._drainTimeout = setTimeout(() => {
@@ -773,10 +809,8 @@ export function connect() {
   }
   // Client-side keepalive: prevent mobile browser from killing WS during long tasks
   const _wsKeepAlive = setInterval(() => {
-    if (ws.readyState === 1)
-      try {
-        ws.send('{"type":"ping"}')
-      } catch {}
+    // Medium#F2:ping 走 safeWsSend —— 半死连接下 bufferedAmount 会失控增长
+    safeWsSend(ws, '{"type":"ping"}')
   }, 30000)
 
   ws.onclose = (e) => {

@@ -24,6 +24,11 @@ export const state = {
   // 新 login 不再写它(refresh token 走 HttpOnly cookie)。
   refreshToken: localStorage.getItem('openclaude_refresh_token') || '',
   tokenExp: Number(localStorage.getItem('openclaude_access_exp') || '0') || 0,
+  // 2026-04-21 安全审计 HIGH#F1:changelog_seen / user-bucketed localStorage 此前
+  // 用 `state.token.slice(-8)` 做身份桶,但 JWT 末 8 字节并非稳定身份(每次
+  // refresh 会变成新 JWT,导致 "已读标志" 在同一用户下反复丢失)。改用真实
+  // user.id(来自 /api/me)。refreshBalance 成功时由 billing.js 写入。
+  userId: null,
   ws: null,
   wsStatus: 'disconnected',
   sessions: new Map(),

@@ -67,6 +67,24 @@ const DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS = 5_000;
 /** ConnectionRegistry 默认 maxPerUser(沿用 connections.ts 的 3)。 */
 const DEFAULT_MAX_PER_USER = 3;
 
+/**
+ * 2026-04-21 安全审计 HIGH#5:WS ping/pong 心跳。
+ *
+ * 为什么需要:
+ *   - 前端移动端 / 家宽 NAT / 运营商透明代理会在 60-180s 无流量时悄悄 half-close,
+ *     TCP 层不发 RST,gateway 以为 socket 还活着,持续占用一条 connection pool slot
+ *     + uid→ws 表里的死连接会被 broadcastToUser 当作在线在循环里 send 无效字节。
+ *   - 前端 webscoket.js onclose 心跳只检到自己这侧的 EOF,中间链路断掉它不感知,
+ *     最终靠业务帧失败才发觉,期间用户看到"发完消息没反应"。
+ *
+ * 实现:
+ *   - 每 30s server 向 client 发 ping;上一次 ping 发出后直到 60s 内必须收到 pong
+ *     或任何 message(下游正常聊天帧也算"还活着"的证据)。
+ *   - 超时 → terminate() + cleanup 走 client_close 路径,不对容器侧造成额外影响。
+ */
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 60_000;
+
 // ---------- 公共类型 --------------------------------------------------------
 
 /**
@@ -150,6 +168,10 @@ export interface UserChatBridgeDeps {
   maxBufferedBytes?: number;
   /** 可选:连接到容器的超时(默认 5s)。 */
   containerConnectTimeoutMs?: number;
+  /** 可选:心跳 ping 间隔 ms(默认 30s)。设 0 禁用(测试用)。 */
+  heartbeatIntervalMs?: number;
+  /** 可选:心跳超时 ms(默认 60s),超过未收到 pong/message 即判死链。 */
+  heartbeatTimeoutMs?: number;
   /** 可选:metrics 钩子(2I-2 接 prom-client)。 */
   metrics?: BridgeMetricSink;
   /** 可选:logger(2I-1)。不传则静默(降到 noop)。 */
@@ -253,6 +275,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const maxFrameBytes = deps.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
   const maxBufferedBytes = deps.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
   const connectTimeoutMs = deps.containerConnectTimeoutMs ?? DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS;
+  const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+  const heartbeatTimeoutMs = deps.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
   const createContainerSocket = deps.createContainerSocket
@@ -303,9 +327,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       ws.on("close", onEarlyClose);
 
       void (async () => {
-        // 1) JWT 验证 — token 来源优先级与 personal-version gateway extractToken 一致:
-        //    Sec-WebSocket-Protocol "bearer, <token>" > Authorization Bearer > ?token=
+        // 1) JWT 验证 — token 来源只接受:
+        //    Sec-WebSocket-Protocol "bearer, <token>" > Authorization Bearer
         //    前端 `new WebSocket(url, ['bearer', token])` 会发 Sec-WebSocket-Protocol
+        //
+        // 2026-04-21 安全审计 HIGH#2 修复:此前曾支持 `?token=<jwt>` URL query
+        // fallback,但 query string 会落 Caddy / gateway access log + 浏览器
+        // 历史 / referrer header,导致 access JWT 泄漏。前端已全部走
+        // ['bearer', token] 子协议路径,纯 server-only 的 fallback 直接删除。
         let token = "";
         const protoHeader = req.headers["sec-websocket-protocol"];
         if (typeof protoHeader === "string") {
@@ -321,10 +350,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
         if (!token) {
-          token = url.searchParams.get("token") ?? "";
-        }
-        if (!token) {
-          sendErrorFrame(ws, "UNAUTHORIZED", "missing token (bearer/protocol/query)");
+          sendErrorFrame(ws, "UNAUTHORIZED", "missing token (bearer protocol or Authorization header)");
           try { ws.close(CLOSE_BRIDGE.POLICY, "unauthorized"); } catch { /* */ }
           return;
         }
@@ -613,6 +639,33 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         uid: uid.toString(), connId, err,
       });
     });
+
+    // ---------- 心跳(HIGH#5) ----------
+    // 思路:"最后一次活跃" timestamp,每 heartbeatIntervalMs 醒来一次:
+    //   - 距上次活跃 > heartbeatTimeoutMs → 判死链,terminate()
+    //   - 否则发一个 ping(不等对端 pong 即可刷新 lastAlive,pong 来了也刷)
+    // 任意下行/上行消息 / pong 都刷 lastAlive;这样正常聊天的连接根本走不到 terminate 路径。
+    let lastAliveAt = Date.now();
+    const refreshAlive = (): void => { lastAliveAt = Date.now(); };
+    userWs.on("pong", refreshAlive);
+    userWs.on("message", refreshAlive); // 绑第二个 message handler 只刷时间戳,不干扰 onUserMessage
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    if (heartbeatIntervalMs > 0) {
+      heartbeatTimer = setInterval(() => {
+        if (userWs.readyState !== WebSocket.OPEN) return;
+        const idleMs = Date.now() - lastAliveAt;
+        if (idleMs > heartbeatTimeoutMs) {
+          log?.info("user-chat-bridge: heartbeat timeout, terminating", {
+            uid: uid.toString(), connId, idleMs,
+          });
+          cause = "client_close";
+          try { userWs.terminate(); } catch { /* */ }
+          cleanup();
+          return;
+        }
+        try { userWs.ping(); } catch { /* */ }
+      }, heartbeatIntervalMs);
+    }
     userWs.on("close", (code, reason) => {
       if (cause === "internal_error") cause = "client_close";
       // 把客户端关闭原因转给容器(透传 code/reason,容器侧也会触发 cleanup)
@@ -639,6 +692,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (cleaned) return;
       cleaned = true;
       clearTimeout(connectTimer);
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
       try { connectAbort.abort(); } catch { /* */ }
       try {
         // 注意:CLOSING 状态也强 terminate(),不依赖对端 echo,

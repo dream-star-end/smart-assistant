@@ -365,6 +365,61 @@ export class ConcurrencyLimiter {
   }
 }
 
+/**
+ * 2026-04-21 安全审计 HIGH#3 修复 — 进程内兜底限流器。
+ *
+ * 原设计:Redis 限流抖动 / 断连时一律 fail-open,记一行 error log 就放行。
+ * 风险:Redis 真出问题(集群分区 / OOM / 持续超时)时 proxy 变成无限流
+ * 开放中转,盗用 token 的攻击者可无约束打下游 Anthropic,秒级烧钱 + 触发
+ * 上游 429 连坐封我们整个 account pool。
+ *
+ * 修复:当 Redis 失败时,退到一个进程内固定窗口计数器。Cap 选 Redis cap
+ * 的 ~1/3(更严格),目的是"可用性降级而非开闸":正常用户可能体感慢,但
+ * 异常放大必然被拦住。窗口长度保持与 Redis 一致以便行为连续。
+ *
+ * 简化口径:
+ *   - 每 `windowSeconds` 固定窗口,无滑动;和 Redis 侧算法同构
+ *   - Map 定期 GC(每 60s 扫一遍丢过期窗口条目,防止过万 uid 时长期驻留)
+ *   - maxPerKey < 1 会拒绝构造(避免 0 等于无条件 block)
+ */
+export class FallbackRateLimiter {
+  private entries = new Map<string, { windowStart: number; count: number }>();
+  private lastGc = 0;
+  constructor(
+    readonly windowSeconds: number,
+    readonly maxPerKey: number,
+    private readonly now: () => number = () => Math.floor(Date.now() / 1000),
+  ) {
+    if (windowSeconds <= 0) throw new TypeError("windowSeconds must be > 0");
+    if (maxPerKey <= 0) throw new TypeError("maxPerKey must be > 0");
+  }
+  /** true = 放行,false = 拒绝。 */
+  tryAcquire(key: string): boolean {
+    const nowSec = this.now();
+    const windowStart = Math.floor(nowSec / this.windowSeconds) * this.windowSeconds;
+    // Cheap GC:每 60s 扫一次,丢掉 windowStart 已过 2 个窗口的 entry
+    if (nowSec - this.lastGc >= 60) {
+      this.lastGc = nowSec;
+      const cutoff = windowStart - this.windowSeconds;
+      for (const [k, v] of this.entries) {
+        if (v.windowStart < cutoff) this.entries.delete(k);
+      }
+    }
+    const e = this.entries.get(key);
+    if (!e || e.windowStart !== windowStart) {
+      this.entries.set(key, { windowStart, count: 1 });
+      return true;
+    }
+    if (e.count >= this.maxPerKey) return false;
+    e.count += 1;
+    return true;
+  }
+  /** 测试观察用 */
+  count(key: string): number {
+    return this.entries.get(key)?.count ?? 0;
+  }
+}
+
 // ─── usage capture(SSE 透传 + 旁路解析) ──────────────────────────────────
 
 /**
@@ -1099,6 +1154,11 @@ export function makeAnthropicProxyHandler(
   const concurrency = new ConcurrencyLimiter(
     deps.maxConcurrentPerUid ?? DEFAULT_MAX_CONCURRENT_PER_UID,
   );
+  // 2026-04-21 安全审计 HIGH#3:Redis 抖动时的兜底限流(cap = Redis cap 的 1/3,
+  // 向下取整至少 1;窗口同 Redis 以便行为连续)。Redis 正常时这个 map 始终空,
+  // 不占资源;Redis 异常时它是最后一道防线。
+  const fallbackCap = Math.max(1, Math.floor(rateLimitCfg.max / 3));
+  const fallbackLimiter = new FallbackRateLimiter(rateLimitCfg.windowSeconds, fallbackCap);
   const maxBodyBytes = deps.maxBodyBytes ?? MAX_BODY_BYTES_DEFAULT;
 
   return async function handle(req, res, peerIp) {
@@ -1170,8 +1230,27 @@ export function makeAnthropicProxyHandler(
         return;
       }
     } catch (err) {
-      // Redis 抖了 — fail open(允许通过)避免误伤。但记 alert。
+      // 2026-04-21 安全审计 HIGH#3 修复:Redis 抖动不再 fail-open 无脑放行。
+      // 退到进程内 FallbackRateLimiter(cap = Redis cap/3),保底防止"Redis 持续
+      // 宕掉 → proxy 变成无限流 open relay → 盗用 token 秒级烧钱"。
+      // Fallback 放行 → 继续(记 error log);Fallback 也拒 → 429 RATE_LIMITED。
       userLog.error("proxy_rate_limit_redis_failed", { err: errSummary(err) });
+      if (!fallbackLimiter.tryAcquire(`uid:${uid.toString()}`)) {
+        userLog.warn("proxy_rate_limit_fallback_blocked", {
+          fallbackCap,
+          fallbackCount: fallbackLimiter.count(`uid:${uid.toString()}`),
+        });
+        incrAnthropicProxyReject("rate_limited");
+        sendJsonError(
+          res,
+          429,
+          "RATE_LIMITED",
+          "rate limit fallback engaged (redis degraded)",
+          requestId,
+          { "Retry-After": String(rateLimitCfg.windowSeconds) },
+        );
+        return;
+      }
     }
 
     // 3) per-uid 并发上限

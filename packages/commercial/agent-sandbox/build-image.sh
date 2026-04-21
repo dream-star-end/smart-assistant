@@ -21,7 +21,12 @@ set -euo pipefail
 # ───────────────────────────────────────────────
 # 常量(硬编码,有意为之 — 不做"可配置")
 # ───────────────────────────────────────────────
-PERSONAL_SRC="/opt/openclaude/openclaude"            # 个人版源码(45.32 build 机标准位)
+# v3 仓库本身包含完整个人版代码树 (packages/{channels,cli,gateway,mcp-memory,plugin-sdk,protocol,storage,web} + claude-code-best)
+# 外加 v3 专属的 packages/commercial/。从 v3 构建可以拿到所有 v3-only 的 gateway 修复
+# (CCB 401、OAuth refresh、resume_failed 系列),不会再被 memory feedback_v3_image_built_from_master
+# 里描述的"重建镜像丢 v3 修复"坑炸。rsync 时排除 packages/commercial/ 即可避免容器
+# 里混入商用版代码。
+PERSONAL_SRC="/opt/openclaude/openclaude-v3"
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # 本脚本所在目录(agent-sandbox/)
 BUILD_CTX="/tmp/oc-runtime-build"
 IMAGE_REPO="openclaude/openclaude-runtime"
@@ -108,6 +113,8 @@ rsync -a --delete \
   --exclude='.gitignore' \
   --exclude='/dist/' \
   --exclude='build/' \
+  --exclude='packages/commercial/' \
+  --exclude='packages/commercial' \
   --exclude='.next/' \
   --exclude='.turbo/' \
   --exclude='coverage/' \
@@ -188,9 +195,10 @@ cat <<EOF
 [build-image]   tar size   : ${TAR_SIZE_MB} MiB
 [build-image]   tar sha256 : $TAR_SHA256
 [build-image] ====================================================================
-[build-image]   远端部署(5A 抄这两行):
-[build-image]     scp $TAR_PATH root@45.76.214.99:/var/lib/openclaude-v3/images/
-[build-image]     ssh root@45.76.214.99 "gunzip -c /var/lib/openclaude-v3/images/openclaude-runtime-${TAG}.tar.gz | docker load"
+[build-image]   远端部署 (商用版 v3 生产 = 34.146.172.239 / ssh alias commercial-v3):
+[build-image]     scp $TAR_PATH commercial-v3:/var/lib/openclaude-v3/images/
+[build-image]     ssh commercial-v3 "gunzip -c /var/lib/openclaude-v3/images/openclaude-runtime-${TAG}.tar.gz | docker load"
+[build-image]     ssh commercial-v3 "docker tag openclaude/openclaude-runtime:$TAG openclaude/openclaude-runtime:latest"
 [build-image] ====================================================================
 
 EOF

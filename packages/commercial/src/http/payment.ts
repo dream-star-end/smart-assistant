@@ -69,7 +69,7 @@ function orderToPublicView(o: OrderRow): Record<string, unknown> {
 export async function handleListPlans(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
   // try-auth:有 token 解出来用,无 token / 解析失败一律按未登录处理
@@ -78,8 +78,15 @@ export async function handleListPlans(
   try {
     const u = await requireAuth(req, deps.jwtSecret);
     userId = u.id;
-  } catch {
+  } catch (err) {
+    // 2026-04-21 安全审计 Medium#4:此前这个 catch 完全静默,让老用户反馈
+    // "首充档没出现"时 server 侧没有任何线索 —— 区分不了"bearer token 过期"
+    // (正常)vs "requireAuth 内部异常"(bug)。加一条 debug 日志即可,
+    // 公开端点照常放行,不向用户暴露细节。
     userId = null;
+    ctx.log.debug("list_plans_auth_skip", {
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
   const plans = await listPlans({ userId });
   sendJson(res, 200, {

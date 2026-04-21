@@ -238,8 +238,14 @@ function _safeMediaUrl(url) {
 }
 
 export function _imgHtml(url, title) {
-  const safeUrl = _safeMediaUrl(url)
-  if (!safeUrl) return `<span>[blocked image: unsafe URL]</span>`
+  const rawSafeUrl = _safeMediaUrl(url)
+  if (!rawSafeUrl) return `<span>[blocked image: unsafe URL]</span>`
+  // 2026-04-21 安全审计 Medium#F3:_safeMediaUrl 只做协议白名单,但拿到的字符串
+  // 会直接被插进三个 HTML 属性(`src=`、`data-img-src=`、`title=`),如果 URL 里
+  // 含 `"` / `<` / `&` 等字符(合法 data: 或攻击者构造 `https://evil.com/x" onerror=...`
+  // 都算),就会断开属性并注入 event handler。协议白名单 ≠ 可直接插 HTML,必须
+  // 再走一次 HTML-attribute escape。
+  const safeUrl = htmlSafeEscape(rawSafeUrl)
   const svgCopy =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
   const svgDl =

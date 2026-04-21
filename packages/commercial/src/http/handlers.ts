@@ -75,6 +75,9 @@ export interface CommercialHttpDeps {
     requestReset: RateLimitConfig;
     resendVerify: RateLimitConfig;
     hupiCreate: RateLimitConfig;
+    // 2026-04-21 安全审计 HIGH (refresh/logout 限流)补齐的条目
+    refresh: RateLimitConfig;
+    logout: RateLimitConfig;
   }>;
   /** T-12.1:开启后,login 强制要求 email_verified=true */
   requireEmailVerified?: boolean;
@@ -121,6 +124,11 @@ export const DEFAULT_RATE_LIMITS = {
   resendVerify: { scope: "resend_verify", windowSeconds: 60, max: 3 } satisfies RateLimitConfig,
   // 04-API §8:同用户 10 次 / 1h
   hupiCreate: { scope: "hupi_create", windowSeconds: 3600, max: 10 } satisfies RateLimitConfig,
+  // 2026-04-21 安全审计 HIGH#1:refresh/logout 从不限流,攻击者拿到泄漏的
+  // refresh token 可无限撞 grace window 试图刷出新 access。按 IP 每分钟 30
+  // 次足够覆盖正常多 tab race(典型 <10),又能堵枚举。
+  refresh: { scope: "refresh", windowSeconds: 60, max: 30 } satisfies RateLimitConfig,
+  logout: { scope: "logout", windowSeconds: 60, max: 30 } satisfies RateLimitConfig,
 };
 
 /**
@@ -296,9 +304,14 @@ export async function handleCheckVerification(
 export async function handleRefresh(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
+  // 2026-04-21 安全审计 HIGH#1:refresh 端点此前无限流,攻击者可暴力撞 grace
+  // window 刷出新 access token。按 IP 每分钟 30 次兜底,多 tab 正常 race 够用。
+  const cfg = deps.rateLimits?.refresh ?? DEFAULT_RATE_LIMITS.refresh;
+  await enforceRateLimit(deps, cfg, ctx.clientIp);
+
   // HIGH#4:优先读 HttpOnly cookie;迁移期(2 周内)兼容 body.refresh_token,
   // 旧前端 localStorage 里存的 token 还能用一次,然后浏览器在下次 login 后
   // 把 cookie 接管为唯一凭据。
@@ -317,10 +330,17 @@ export async function handleRefresh(
     // LOW(2026-04-21):refresh 现在每次轮换,返回新 raw token + exp。
     // 不论来源是 cookie 还是 body,都把新 raw 写回 HttpOnly cookie 并丢弃
     // 客户端送来的旧 token(已被 refresh() 内部 revoked)。
+    //
+    // 2026-04-21 安全审计 HIGH#4:remoteIp 走 ctx.clientIp(= clientIpOf,
+    // 只信 socket.remoteAddress),不再读 X-Forwarded-For。攻击者无法通过
+    // 伪造 XFF 让 sameIp 检查把盗用 race 识别成合法 race,从而绕过 theft
+    // 链。Caddy 前置时 socket.remoteAddress = Caddy IP,grace 内的合法多
+    // tab race 永远 sameIp=true(同一个代理出口);攻击者直连 gateway
+    // bypass Caddy 走的是另一个 socket.remoteAddress,必然 mismatch。
     const r = await refresh(rawRefresh, {
       jwtSecret: deps.jwtSecret,
-      remoteIp: ctxIp(req),
-      userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : undefined,
+      remoteIp: ctx.clientIp,
+      userAgent: ctx.userAgent ?? undefined,
     });
     // cookie Max-Age = 新 token 真实剩余 TTL;到期时间由 server 主导
     const cookieTtl = Math.max(1, r.refresh_exp - Math.floor(Date.now() / 1000));
@@ -343,24 +363,19 @@ export async function handleRefresh(
   }
 }
 
-/** 提取请求方 IP — Caddy 已经在前面处理 X-Forwarded-For,这里读 remoteAddress 即可。 */
-function ctxIp(req: IncomingMessage): string | undefined {
-  const xf = req.headers["x-forwarded-for"];
-  if (typeof xf === "string" && xf.length > 0) {
-    return xf.split(",")[0].trim();
-  }
-  const ra = req.socket?.remoteAddress;
-  return typeof ra === "string" ? ra : undefined;
-}
-
 // ─── POST /api/auth/logout ──────────────────────────────────────────
 
 export async function handleLogout(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
+  // 2026-04-21 安全审计 HIGH#1:logout 端点此前无限流,虽然本身破坏性有限
+  // (幂等 revoke),但同 IP 每分钟 30 次兜底防撞库枚举 / DoS 打 DB。
+  const cfg = deps.rateLimits?.logout ?? DEFAULT_RATE_LIMITS.logout;
+  await enforceRateLimit(deps, cfg, ctx.clientIp);
+
   // HIGH#4:cookie 优先;无论成败都清 cookie(本地清理永不依赖 server 状态)。
   // 兼容 body.refresh_token 让旧前端能完成最后一次 logout。
   const fromCookie = readRefreshCookie(req);

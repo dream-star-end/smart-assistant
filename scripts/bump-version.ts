@@ -19,8 +19,8 @@
 //   bun scripts/bump-version.ts --check  # verify files are at HEAD, exit 1 if not
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -81,6 +81,66 @@ function bumpFile(
   return { changed, hits };
 }
 
+// Walk `public/` and return every file path (relative to PUBLIC_DIR) containing
+// a *real* cache-bust reference. Used by --check to flag files that have tokens
+// but weren't declared in TARGETS — the classic drift mode where a new module
+// file sneaks in with `?v=` imports and silently stays at the first-ever commit
+// hash because bump-version doesn't know to touch it.
+//
+// vendor/ is excluded because mermaid.min.js / qrcode.min.js have incidental
+// `?v=` matches inside minified source (regex constants, URL tables) that
+// aren't our cache-bust tokens. Other minified output shouldn't exist under
+// public/ — if it starts to, extend this skip list.
+//
+// Codex review IMPORTANT#4: tightened the regex so it only matches tokens
+// inside actual URL/specifier strings (`"…/foo.ext?v=token"` shape), not every
+// occurrence of `?v=` in the file body. Without this, comments like
+//   // ?v=508d7d2 bust: …
+// (which we legitimately have in main.js) would get double-counted, and any
+// future README containing an example `?v=` would be a CI false positive.
+const SCAN_SKIP_DIRS = new Set(["vendor"]);
+
+// Matches: ['"] <anything-no-quote-no-ws> . <ext> ? v = <token>
+// - Requires a file extension immediately before `?v=`
+// - Requires the whole reference to live inside a quoted string
+// This covers: HTML src="…/foo.js?v=xxx", SW '/foo.css?v=xxx' array entries,
+// and ESM `from './foo.js?v=xxx'`. It does NOT match naked comments.
+const CACHE_BUST_QUOTED_REF_RE = /['"][^'"\s]+\.[A-Za-z0-9]+\?v=[A-Za-z0-9_-]+/;
+const VERSION_CONST_RE = /VERSION\s*=\s*['"]openclaude-[\w-]+['"]/;
+
+function scanPublicForCacheBustTokens(): string[] {
+  const hits: string[] = [];
+  const walk = (abs: string) => {
+    for (const name of readdirSync(abs)) {
+      const child = join(abs, name);
+      let st;
+      try {
+        st = statSync(child);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        if (SCAN_SKIP_DIRS.has(name)) continue;
+        walk(child);
+        continue;
+      }
+      // Only scan text-y files. Skip binary / image assets.
+      if (!/\.(html?|js|mjs|css|json)$/i.test(name)) continue;
+      let body: string;
+      try {
+        body = readFileSync(child, "utf-8");
+      } catch {
+        continue;
+      }
+      if (CACHE_BUST_QUOTED_REF_RE.test(body) || VERSION_CONST_RE.test(body)) {
+        hits.push(relative(PUBLIC_DIR, child).split(sep).join("/"));
+      }
+    }
+  };
+  walk(PUBLIC_DIR);
+  return hits;
+}
+
 function main() {
   const args = process.argv.slice(2);
   const checkMode = args.includes("--check");
@@ -119,9 +179,31 @@ function main() {
     `${totalChanged}/${TARGETS.length} file(s) ${verb}, ${totalHits} token(s) total`,
   );
 
-  if (checkMode && totalChanged > 0) {
-    console.error("FAIL: files drifted from target token");
-    process.exit(1);
+  // --check collects multiple failure kinds and reports them all before
+  // exiting. Running into "fix drift → re-run → orphan fail → re-run → ..." is
+  // annoying CI friction; one report per invocation is the principle.
+  if (checkMode) {
+    let failed = false;
+
+    if (totalChanged > 0) {
+      console.error("\nFAIL: files drifted from target token");
+      failed = true;
+    }
+
+    const scanned = scanPublicForCacheBustTokens();
+    const declared = new Set(TARGETS);
+    const orphans = scanned.filter((p) => !declared.has(p));
+    if (orphans.length > 0) {
+      console.error("\nFAIL: cache-bust tokens found outside declared TARGETS:");
+      for (const o of orphans) console.error(`  - ${o}`);
+      console.error(
+        "\nEither add these files to TARGETS in scripts/bump-version.ts,",
+      );
+      console.error("or remove the ?v= / VERSION pattern from them.");
+      failed = true;
+    }
+
+    if (failed) process.exit(1);
   }
 }
 

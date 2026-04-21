@@ -96,15 +96,46 @@ async function startPairing() {
   }
 }
 
+// 2026-04-21 安全审计 Medium#F4 + Codex IMPORTANT#2:
+//   - 请求超时保持 45s。服务端长轮询到 iLink 是 35s + 最多 5s 内部 slack(见
+//     channels/wechat/src/iLink.ts: ILINK_LONG_POLL_TIMEOUT_MS),减到 15s 会让
+//     client 每次都在 server 真返回前就 abort,产生 scan 永远 stuck 的重试风暴
+//   - 两段死线:
+//       * POLL_WAIT_DEADLINE_MS    —— 还在 waiting 状态(没扫)的最大等待
+//       * POLL_CONFIRM_DEADLINE_MS —— 一旦进 scanned,允许用户在手机上按确认
+//     只用单一死线会让"弱网下 2:55 才扫,1s 后超时"的 UX 惨剧发生(Codex 指出)。
+//     分段死线让 scanned→confirmed 的人工确认阶段重新获得 2 分钟窗口。
+//   - QR 上游 TTL 10 min,两段死线加起来 <10 min 留足冗余。
+const POLL_TIMEOUT_MS = 45_000
+const POLL_WAIT_DEADLINE_MS = 3 * 60_000     // 3 min 未扫即视为放弃
+const POLL_CONFIRM_DEADLINE_MS = 2 * 60_000  // 扫了之后 2 min 里必须点确认
+
 async function pollLoop(qrcode) {
   if (_pollAbort) _pollAbort.abort()
   const ctrl = new AbortController()
   _pollAbort = ctrl
   let retries = 0
+  const startedAt = Date.now()
+  let scannedAt = 0  // 0 = 尚未 scanned;>0 = scanned 时间戳,切到 confirm 阶段
   while (!ctrl.signal.aborted && _currentQrcode === qrcode) {
+    // 根据当前阶段应用不同死线
+    const now = Date.now()
+    if (scannedAt === 0) {
+      if (now - startedAt > POLL_WAIT_DEADLINE_MS) {
+        setError('扫码超时,请重新生成二维码')
+        showState('unbound')
+        return
+      }
+    } else {
+      if (now - scannedAt > POLL_CONFIRM_DEADLINE_MS) {
+        setError('确认超时,请重新扫码')
+        showState('unbound')
+        return
+      }
+    }
     let resp
     try {
-      resp = await apiJson('POST', '/api/wechat/pair/poll', { qrcode }, { signal: ctrl.signal, timeout: 45000 })
+      resp = await apiJson('POST', '/api/wechat/pair/poll', { qrcode }, { signal: ctrl.signal, timeout: POLL_TIMEOUT_MS })
     } catch (e) {
       if (ctrl.signal.aborted) return
       retries++
@@ -119,6 +150,7 @@ async function pollLoop(qrcode) {
     retries = 0
     if (resp?.status === 'waiting') continue
     if (resp?.status === 'scanned') {
+      if (scannedAt === 0) scannedAt = Date.now()  // 只在首次 scanned 时锚
       $('wechat-pairing-status').textContent = '已扫描,请在手机微信中点击"确认"...'
       continue
     }

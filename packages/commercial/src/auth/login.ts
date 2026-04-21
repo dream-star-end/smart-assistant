@@ -432,7 +432,19 @@ export async function refresh(
       const grace = rotationGraceSeconds();
       const sameUa = (row.bound_user_agent ?? "") === (deps.userAgent ?? "");
       const sameIp = (row.bound_ip ?? "") === (deps.remoteIp ?? "");
-      if (grace > 0 && ageSec >= 0 && ageSec < grace && sameUa && sameIp) {
+      // 2026-04-21 安全审计 Medium#3:race grace 必须要求 bound_ip 和 remoteIp
+      // 都非空。否则:
+      //   - row.bound_ip=NULL(历史行 / 测试数据 / ip 字段未写入),deps.remoteIp 也可能
+      //     因 socket 异常拿到空字符串,两边都空会让 `sameIp` 误判为 true,给攻击者一个
+      //     "没人知道我 IP"的 grace 绕过通道。
+      //   - row.bound_user_agent=NULL 同理。
+      // 双端都要有非空 fingerprint 才允许走 race 分支;任何一侧空就按 theft 处理。
+      const fingerprintPresent =
+        (row.bound_ip ?? "").length > 0 &&
+        (deps.remoteIp ?? "").length > 0 &&
+        (row.bound_user_agent ?? "").length > 0 &&
+        (deps.userAgent ?? "").length > 0;
+      if (grace > 0 && ageSec >= 0 && ageSec < grace && sameUa && sameIp && fingerprintPresent) {
         // Race grace:返特殊 kind,handler 见后**不**清 cookie + 不报 theft
         return { kind: "race" as const };
       }
