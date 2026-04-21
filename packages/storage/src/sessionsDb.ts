@@ -10,6 +10,7 @@
 // assistant_text) for the turn into sessions_fts. Queries use MATCH and
 // group hits by session_id to return top-N unique sessions.
 
+import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import Database from 'better-sqlite3'
@@ -695,6 +696,195 @@ export async function appendServerAuthoredMessage(
     return { applied: true }
   })
   return txn()
+}
+
+// ── Phase 0.2: durable outbox for server-authored messages ──
+//
+// If the SQLite write fails (disk full, database locked, transient I/O error,
+// or gateway crash mid-transaction), we don't want to silently drop the
+// assistant message — that's the exact failure mode we're trying to prevent.
+// Instead, the message is appended as a single JSON line to
+// `paths.msgOutbox` and replayed on the next gateway startup.
+//
+// Schema: each line is a `QueuedMessage` JSON object. The file is line-
+// addressable so readers can process entries independently; an atomic
+// replace-and-truncate is used after successful replay.
+
+export interface QueuedMessage {
+  sessId: string
+  userId: string
+  message: {
+    id: string
+    role: 'assistant' | 'user' | 'system'
+    text?: string
+    ts?: number
+    status?: 'completed' | 'interrupted' | 'crashed'
+    [k: string]: unknown
+  }
+  /** When the write was queued (wall-clock ms). */
+  queuedAt: number
+  /** Optional reason the direct write failed — aids debugging on replay. */
+  reason?: string
+}
+
+/**
+ * Serialize one queued message to its JSONL form. Exported for tests.
+ * Never throws: non-JSON-safe values are stringified via try/catch at the
+ * call site.
+ */
+export function queuedMessageToLine(entry: QueuedMessage): string {
+  return JSON.stringify(entry) + '\n'
+}
+
+/**
+ * Parse a JSONL line into a `QueuedMessage`. Returns null if the line is
+ * blank or malformed — replay is best-effort, so we skip rather than crash.
+ * Exported for tests.
+ */
+export function parseQueuedMessageLine(line: string): QueuedMessage | null {
+  const trimmed = line.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = JSON.parse(trimmed) as QueuedMessage
+    if (
+      !parsed ||
+      typeof parsed.sessId !== 'string' ||
+      typeof parsed.userId !== 'string' ||
+      !parsed.message ||
+      typeof parsed.message.id !== 'string'
+    ) {
+      return null
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/** Append a queued message to the outbox file (create-if-missing). */
+export async function queueMessageToOutbox(entry: QueuedMessage): Promise<void> {
+  await mkdir(dirname(paths.msgOutbox), { recursive: true })
+  await appendFile(paths.msgOutbox, queuedMessageToLine(entry), { encoding: 'utf8' })
+}
+
+/**
+ * Durable variant of {@link appendServerAuthoredMessage}. On any thrown
+ * error from the DB write (disk full, BUSY, corrupt, etc.), the entry is
+ * appended to the msg-outbox JSONL file for replay on next startup.
+ *
+ * Return shape:
+ *   { applied: true }                                      — row updated
+ *   { applied: false, reason: 'session_not_found' }        — caller bug
+ *   { applied: false, reason: 'already_exists' }           — idempotent skip
+ *   { applied: false, reason: 'malformed' }                — bad row data
+ *   { applied: false, reason: 'queued_to_outbox', error } — DB failure,
+ *     message safely persisted to outbox and will be retried on startup.
+ */
+export async function appendServerAuthoredMessageDurable(
+  sessId: string,
+  userId: string,
+  message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
+): Promise<
+  | { applied: true }
+  | { applied: false; reason: 'session_not_found' | 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'queued_to_outbox'; error: string }
+> {
+  try {
+    const r = await appendServerAuthoredMessage(sessId, userId, message)
+    return r as { applied: true } | { applied: false; reason: 'session_not_found' | 'already_exists' | 'malformed' }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    try {
+      await queueMessageToOutbox({
+        sessId,
+        userId,
+        message,
+        queuedAt: Date.now(),
+        reason: msg,
+      })
+    } catch (queueErr) {
+      // Both DB and outbox failed — the caller's try/catch will log. Surface
+      // the original DB error rather than the outbox one (more actionable).
+      throw err
+    }
+    return { applied: false, reason: 'queued_to_outbox', error: msg }
+  }
+}
+
+/**
+ * Replay any messages queued in the outbox. Called on gateway startup before
+ * opening the WS endpoint, so durable writes catch up before live traffic.
+ *
+ * Strategy:
+ *   1. Read the entire outbox file into memory (bounded by disk size; we
+ *      cap individual lines but total file size is trusted because only the
+ *      gateway itself ever writes to it).
+ *   2. For each parseable entry, attempt `appendServerAuthoredMessage`.
+ *   3. Entries that succeed or are permanent no-ops (`session_not_found` —
+ *      session was deleted while queued; `already_exists` — duplicate from
+ *      a prior partial replay) are dropped.
+ *   4. Entries whose DB write still throws are kept in the file for a
+ *      future retry.
+ *   5. After processing, atomically rewrite the file with survivors (or
+ *      delete it if empty).
+ *
+ * Returns a summary so the caller can emit telemetry.
+ */
+export async function replayMsgOutbox(): Promise<{
+  processed: number
+  applied: number
+  dropped: number
+  requeued: number
+  malformed: number
+}> {
+  let raw: string
+  try {
+    raw = await readFile(paths.msgOutbox, { encoding: 'utf8' })
+  } catch (err: any) {
+    if (err && err.code === 'ENOENT') {
+      return { processed: 0, applied: 0, dropped: 0, requeued: 0, malformed: 0 }
+    }
+    throw err
+  }
+  const lines = raw.split('\n')
+  let applied = 0
+  let dropped = 0
+  let malformed = 0
+  const survivors: string[] = []
+
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const entry = parseQueuedMessageLine(line)
+    if (!entry) {
+      malformed++
+      continue
+    }
+    try {
+      const r = await appendServerAuthoredMessage(entry.sessId, entry.userId, entry.message)
+      if (r.applied) {
+        applied++
+      } else if (r.reason === 'already_exists' || r.reason === 'session_not_found' || r.reason === 'malformed') {
+        dropped++
+      } else {
+        survivors.push(queuedMessageToLine(entry).trimEnd())
+      }
+    } catch {
+      survivors.push(queuedMessageToLine(entry).trimEnd())
+    }
+  }
+
+  const requeued = survivors.length
+  const processed = applied + dropped + requeued + malformed
+
+  // Atomic rewrite: write to .tmp, rename over. If survivors is empty, just
+  // overwrite with empty contents (keeping the file avoids repeated mkdir).
+  const tmp = `${paths.msgOutbox}.tmp-${process.pid}-${Date.now()}`
+  const content = survivors.length > 0 ? survivors.join('\n') + '\n' : ''
+  await mkdir(dirname(paths.msgOutbox), { recursive: true })
+  await writeFile(tmp, content, { encoding: 'utf8' })
+  await rename(tmp, paths.msgOutbox)
+
+  return { processed, applied, dropped, requeued, malformed }
 }
 
 export async function listClientSessions(userId: string): Promise<ClientSessionMeta[]> {

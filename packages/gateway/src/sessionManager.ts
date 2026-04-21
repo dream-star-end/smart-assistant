@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import {
   type AgentDef,
   type OpenClaudeConfig,
-  appendServerAuthoredMessage,
+  appendServerAuthoredMessageDurable,
   getClientSession,
   indexTurn,
   paths,
@@ -939,20 +939,32 @@ export class SessionManager {
               getClientSession(peerId).then((existing) => {
                 if (!existing) return // cron-style or pre-UI session, nothing to append to
                 const messageId = `srv-${peerId}-t${turnIndex}`
-                return appendServerAuthoredMessage(peerId, existing.userId, {
+                return appendServerAuthoredMessageDurable(peerId, existing.userId, {
                   id: messageId,
                   role: 'assistant',
                   text: assistantText,
                   ts: Date.now(),
+                  status: 'completed',
                 })
               }).then((r) => {
                 if (r && !r.applied && r.reason !== 'already_exists') {
-                  log.warn('server-authored message not persisted', {
-                    sessionKey: session.sessionKey,
-                    peerId,
-                    turnIndex,
-                    reason: r.reason,
-                  })
+                  // 'queued_to_outbox' is an expected degraded-mode outcome
+                  // (DB unavailable); log as warn not error so we don't spam
+                  // error aggregators when disk/SQLite has a hiccup. The
+                  // replay loop will pick it up on next restart.
+                  if (r.reason === 'queued_to_outbox') {
+                    log.warn('server-authored message queued to outbox (DB unavailable)', {
+                      sessionKey: session.sessionKey, peerId, turnIndex,
+                      error: r.error,
+                    })
+                  } else {
+                    log.warn('server-authored message not persisted', {
+                      sessionKey: session.sessionKey,
+                      peerId,
+                      turnIndex,
+                      reason: r.reason,
+                    })
+                  }
                 }
               }).catch((err) => {
                 log.error('appendServerAuthoredMessage failed', {
@@ -1041,6 +1053,35 @@ export class SessionManager {
               : info.code
                 ? `子进程异常退出 (code ${info.code})`
                 : '子进程意外退出'
+            // ── Phase 0.2: persist partial assistant text on interrupt/crash ──
+            // CCB was streaming into parser.assistantBuf when it died / was
+            // interrupted. Without this flush the partial text is only in RAM
+            // + whatever frames the ws client already received. If the client
+            // is backgrounded we lose it entirely. Persist with status marker
+            // 'interrupted' (user stop / SIGINT / idle-timeout signal) vs
+            // 'crashed' (unexpected exit code) so the UI can render a clear
+            // "[was interrupted]" trailer rather than showing a complete-
+            // looking bubble.
+            const partial = parser.assistantBuf
+            if (session.channel === 'webchat' && partial && partial.length > 0) {
+              const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
+              const peerId = session.peerId
+              const turnIndex = session.turns + 1 // turn hasn't been counted yet
+              getClientSession(peerId).then((existing) => {
+                if (!existing) return
+                return appendServerAuthoredMessageDurable(peerId, existing.userId, {
+                  id: `srv-${peerId}-t${turnIndex}`,
+                  role: 'assistant',
+                  text: partial,
+                  ts: Date.now(),
+                  status,
+                })
+              }).catch((err) => {
+                log.error('partial assistant flush failed', {
+                  sessionKey: session.sessionKey, peerId, turnIndex, status,
+                }, err as Error)
+              })
+            }
             onEvent({ kind: 'error', error: reason })
             detach()
             settle(() => resolve())

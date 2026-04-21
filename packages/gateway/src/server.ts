@@ -209,6 +209,21 @@ export class Gateway {
   async start(): Promise<void> {
     const { config } = this.deps
 
+    // Phase 0.2: replay any server-authored messages queued to the outbox
+    // while the previous gateway instance was unable to reach SQLite (disk
+    // full, crash mid-write, etc.). Runs before the WS endpoint opens so
+    // catch-up writes precede live traffic. Failures here must not block
+    // startup — we'd rather serve with a retryable queue than refuse boot.
+    try {
+      const { replayMsgOutbox } = await import('@openclaude/storage')
+      const summary = await replayMsgOutbox()
+      if (summary.processed > 0) {
+        this.log.info('msg-outbox replay', summary)
+      }
+    } catch (err) {
+      this.log.error('msg-outbox replay failed (continuing startup)', undefined, err as Error)
+    }
+
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
     this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' })
 
