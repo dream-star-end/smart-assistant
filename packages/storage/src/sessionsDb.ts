@@ -497,6 +497,88 @@ export interface ClientSessionMeta {
   updatedAt: number
 }
 
+// ── Pure merge helpers (exported for unit testing) ──
+
+/** Minimal shape this module relies on. Real messages carry more fields. */
+export type MessageLike = {
+  id?: string
+  ts?: number
+  _source?: string
+  [k: string]: unknown
+}
+
+/**
+ * Merge a client PUT (`clientMsgs`) on top of what the server already has
+ * (`serverSideMsgs`), preserving any server-authored messages the client
+ * didn't include. Server-authored == `_source === 'server'`. The resulting
+ * array is sorted by `ts` ascending.
+ *
+ * Rules:
+ *   1. For each server-authored message, the server version wins: if
+ *      clientMsgs has a message with the same id, replace it with the
+ *      server version; if clientMsgs lacks that id, re-append the server
+ *      version.
+ *   2. Every non-server-authored entry stays exactly as the client sent it.
+ *   3. Result is sorted by ts ascending; ties preserve insertion order
+ *      (Array.prototype.sort is stable in ES2019+).
+ *   4. If there are zero server-authored entries, `clientMsgs` is returned
+ *      verbatim (no copy, same reference) — callers rely on this as a fast
+ *      path.
+ */
+export function mergePreservingServerAuthored<T extends MessageLike>(
+  serverSideMsgs: readonly T[],
+  clientMsgs: readonly T[],
+): T[] | readonly T[] {
+  const serverAuthored = new Map<string, T>()
+  for (const m of serverSideMsgs) {
+    if (m && m._source === 'server' && typeof m.id === 'string') {
+      serverAuthored.set(m.id, m)
+    }
+  }
+  if (serverAuthored.size === 0) return clientMsgs
+
+  const clientIds = new Set<string>()
+  for (const m of clientMsgs) {
+    if (m && typeof m.id === 'string') clientIds.add(m.id)
+  }
+
+  const merged: T[] = clientMsgs.map((m) => {
+    if (m && typeof m.id === 'string' && serverAuthored.has(m.id)) {
+      return serverAuthored.get(m.id) as T
+    }
+    return m
+  })
+  for (const [id, msg] of serverAuthored) {
+    if (!clientIds.has(id)) merged.push(msg)
+  }
+  merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+  return merged
+}
+
+/**
+ * Idempotent append of a server-authored message to an existing messages
+ * array. Returns `{ applied: false, reason: 'already_exists' }` if a
+ * message with the same id already exists, else returns a new sorted
+ * array with the stamped message included.
+ *
+ * Pure: doesn't mutate `existing`. `message._source` is always stamped
+ * to `'server'` in the returned copy, and `ts` defaults to `now` if
+ * missing so subsequent sort is well-defined.
+ */
+export function appendServerAuthoredPure<T extends MessageLike>(
+  existing: readonly T[],
+  message: T & { id: string },
+  now: number = Date.now(),
+): { applied: true; messages: T[] } | { applied: false; reason: 'already_exists' } {
+  if (existing.some((m) => m && m.id === message.id)) {
+    return { applied: false, reason: 'already_exists' }
+  }
+  const stamped = { ...message, _source: 'server', ts: message.ts ?? now } as T
+  const next = [...existing, stamped]
+  next.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+  return { applied: true, messages: next }
+}
+
 /**
  * Returns true if the row was actually inserted/updated, false if rejected.
  * @param baseSyncedAt - client's last known server updated_at (optimistic concurrency).
@@ -509,9 +591,8 @@ export interface ClientSessionMeta {
  * stream durability contract — when a mobile client goes to background and
  * misses the tail of an assistant message, its subsequent PUT would otherwise
  * overwrite the server's complete copy with the truncated local copy. We
- * merge by id: server-authored entries win over any client-supplied entry
- * with the same id, and server-authored entries not present in the client
- * payload get re-inserted (sorted by ts).
+ * delegate merging to {@link mergePreservingServerAuthored} so the policy is
+ * testable in isolation.
  */
 export async function upsertClientSession(session: ClientSession, baseSyncedAt = 0): Promise<boolean> {
   const db = await getSessionsDb()
@@ -526,31 +607,10 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
     let finalMessages: unknown[] = session.messages
     if (existing) {
       try {
-        const oldMsgs = JSON.parse(existing.messages) as Array<{ id?: string; _source?: string; ts?: number }>
-        const serverAuthored = new Map<string, typeof oldMsgs[number]>()
-        for (const m of oldMsgs) {
-          if (m && m._source === 'server' && typeof m.id === 'string') {
-            serverAuthored.set(m.id, m)
-          }
-        }
-        if (serverAuthored.size > 0) {
-          const clientMsgs = session.messages as Array<{ id?: string; ts?: number }>
-          const clientIds = new Set(
-            clientMsgs.map((m) => (m && typeof m.id === 'string' ? m.id : null)).filter((x): x is string => x !== null)
-          )
-          // Replace client's same-id entry with the server version; keep others verbatim
-          const merged: Array<{ id?: string; ts?: number; [k: string]: unknown }> = clientMsgs.map((m) => {
-            if (m && typeof m.id === 'string' && serverAuthored.has(m.id)) {
-              return serverAuthored.get(m.id) as typeof m
-            }
-            return m
-          })
-          // Re-insert any server-authored message the client dropped
-          for (const [id, msg] of serverAuthored) {
-            if (!clientIds.has(id)) merged.push(msg)
-          }
-          merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
-          finalMessages = merged
+        const oldMsgs = JSON.parse(existing.messages) as MessageLike[]
+        if (Array.isArray(oldMsgs)) {
+          const clientMsgs = session.messages as MessageLike[]
+          finalMessages = mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[]
         }
       } catch { /* malformed existing messages JSON — fall back to client payload */ }
     }
@@ -616,27 +676,22 @@ export async function appendServerAuthoredMessage(
     ).get(sessId, userId) as { messages: string } | undefined
     if (!row) return { applied: false, reason: 'session_not_found' as const }
 
-    let msgs: Array<{ id?: string; ts?: number; [k: string]: unknown }>
+    let msgs: MessageLike[]
     try {
-      msgs = JSON.parse(row.messages) as typeof msgs
-      if (!Array.isArray(msgs)) return { applied: false, reason: 'malformed' as const }
+      const parsed = JSON.parse(row.messages)
+      if (!Array.isArray(parsed)) return { applied: false, reason: 'malformed' as const }
+      msgs = parsed as MessageLike[]
     } catch {
       return { applied: false, reason: 'malformed' as const }
     }
 
-    // Idempotency: skip if message with same id already exists
-    if (msgs.some((m) => m && m.id === message.id)) {
-      return { applied: false, reason: 'already_exists' as const }
-    }
-
-    const stamped = { ...message, _source: 'server' as const, ts: message.ts ?? Date.now() }
-    msgs.push(stamped)
-    msgs.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+    const result = appendServerAuthoredPure(msgs, message as MessageLike & { id: string })
+    if (!result.applied) return { applied: false, reason: result.reason }
 
     const now = Date.now()
     db.prepare(
       'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ? WHERE id = ? AND user_id = ?'
-    ).run(JSON.stringify(msgs), now, now, sessId, userId)
+    ).run(JSON.stringify(result.messages), now, now, sessId, userId)
     return { applied: true }
   })
   return txn()
