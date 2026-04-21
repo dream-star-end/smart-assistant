@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import {
   type AgentDef,
   type OpenClaudeConfig,
+  appendServerAuthoredMessageDurable,
+  getClientSession,
   indexTurn,
   paths,
   upsertSessionMeta,
@@ -27,6 +29,17 @@ export interface AgentSession {
   agentId: string
   channel: string
   peerId: string
+  /**
+   * The authenticated userId that owns the client_sessions row this
+   * AgentSession writes to. Set by the first `getOrCreate({ userId })`
+   * call (webchat: from the WS auth JWT; other channels usually 'default').
+   * Used by the Phase 0.2/0.4 durable-append path so we can persist
+   * server-authored assistant text even when the client_sessions row
+   * hasn't been upserted yet (first-turn race). `undefined` means we
+   * never had a userId (cron-style pre-warm or legacy code path); callers
+   * fall back to the old `getClientSession` lookup in that case.
+   */
+  userId?: string
   title: string
   startedAt: number
   runner: SubprocessRunner
@@ -255,6 +268,14 @@ export class SessionManager {
     agent: AgentDef
     channel?: string
     peerId?: string
+    /**
+     * Authenticated userId owning the client_sessions row. When provided,
+     * stored on the resulting AgentSession so the durable server-authored-
+     * append path can bypass the `getClientSession` short-circuit on
+     * first-turn races (Phase 0.4 P1-3). Optional for backwards compatibility:
+     * cron/webhook/pre-warm callers that don't have a user context can omit it.
+     */
+    userId?: string
     title?: string
     delegationDepth?: number
     /** 仅用于**新建** runner 时初始化 CLAUDE_CODE_EFFORT_LEVEL:
@@ -274,6 +295,11 @@ export class SessionManager {
       existing.lastUsedAt = Date.now()
       if (opts.title && (!existing.title || existing.title === 'New conversation'))
         existing.title = opts.title
+      // Adopt a userId from a later call if the session was first created
+      // without one (e.g. cron pre-warmed, then a webchat user attached).
+      // Never *overwrite* an already-set userId — doing so would enable a
+      // different authenticated user to redirect another user's persistence.
+      if (opts.userId && !existing.userId) existing.userId = opts.userId
       return existing
     }
     const cwd = opts.agent.cwd ?? process.cwd()
@@ -316,6 +342,7 @@ export class SessionManager {
       agentId: opts.agent.id,
       channel: opts.channel ?? 'webchat',
       peerId: opts.peerId ?? 'unknown',
+      userId: opts.userId,
       title: opts.title ?? 'New conversation',
       startedAt: now,
       runner,
@@ -913,6 +940,84 @@ export class SessionManager {
               indexTurn(sessId, session.turns, session.currentUserText ?? '', result.assistantText),
             ]).catch((err) => log.error('FTS5 index failed', { sessionKey: session.sessionKey }, err))
 
+            // ── Phase 0.1: persist server-authored assistant message ──
+            // Write the authoritative assistant text into the client_sessions
+            // row so that a mobile client that missed the tail of the
+            // streaming response (tab backgrounded, tab frozen, network
+            // drop, OS-level JS suspension) can recover the full turn via
+            // REST force-sync after reconnect. This is the core durability
+            // fix — prior to this, server.ts:3787 silently dropped outbound
+            // frames when no ws client was connected, and nothing else
+            // persisted the assistant text to the user-visible messages
+            // array. See docs/MOBILE_STREAM_DURABILITY_PLAN.md.
+            //
+            // Only applies to webchat sessions whose peerId matches a
+            // client_sessions row (i.e., the UI created the session before
+            // dispatching the first turn). Cron/webhook/telegram/delegate
+            // turns are not routed to a per-user client session and thus
+            // skip this path — they're tracked via sessions_meta / event_log
+            // instead, and will be addressed in Phase 1 (channel broadcast).
+            if (session.channel === 'webchat' && result.assistantText && result.assistantText.length > 0) {
+              const peerId = session.peerId
+              const assistantText = result.assistantText
+              const turnIndex = session.turns
+              // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
+              // we have it — this lets `appendServerAuthoredMessageDurable`
+              // route `session_not_found` into the outbox instead of silently
+              // dropping when the client's debounced PUT hasn't landed yet.
+              // Fall back to `getClientSession` lookup for legacy code paths
+              // that didn't carry userId (cron pre-warm, old webchat calls).
+              const directWrite = async () => {
+                if (session.userId) {
+                  const messageId = `srv-${peerId}-t${turnIndex}`
+                  return appendServerAuthoredMessageDurable(peerId, session.userId, {
+                    id: messageId,
+                    role: 'assistant',
+                    text: assistantText,
+                    ts: Date.now(),
+                    status: 'completed',
+                  })
+                }
+                const existing = await getClientSession(peerId)
+                if (!existing) return undefined // cron-style pre-UI, no owner
+                const messageId = `srv-${peerId}-t${turnIndex}`
+                return appendServerAuthoredMessageDurable(peerId, existing.userId, {
+                  id: messageId,
+                  role: 'assistant',
+                  text: assistantText,
+                  ts: Date.now(),
+                  status: 'completed',
+                })
+              }
+              directWrite().then((r) => {
+                if (r && !r.applied && r.reason !== 'already_exists') {
+                  // 'queued_to_outbox' is an expected degraded-mode outcome
+                  // (DB unavailable); log as warn not error so we don't spam
+                  // error aggregators when disk/SQLite has a hiccup. The
+                  // replay loop will pick it up on next restart.
+                  if (r.reason === 'queued_to_outbox') {
+                    log.warn('server-authored message queued to outbox (DB unavailable)', {
+                      sessionKey: session.sessionKey, peerId, turnIndex,
+                      error: r.error,
+                    })
+                  } else {
+                    log.warn('server-authored message not persisted', {
+                      sessionKey: session.sessionKey,
+                      peerId,
+                      turnIndex,
+                      reason: r.reason,
+                    })
+                  }
+                }
+              }).catch((err) => {
+                log.error('appendServerAuthoredMessage failed', {
+                  sessionKey: session.sessionKey,
+                  peerId,
+                  turnIndex,
+                }, err)
+              })
+            }
+
             // Emit turn.completed event (triggers event_log + usage_log persistence)
             const turnDurationMs = Date.now() - turnStartTime
             eventBus.emit('turn.completed', createEvent('turn.completed', session.agentId, {
@@ -991,6 +1096,41 @@ export class SessionManager {
               : info.code
                 ? `子进程异常退出 (code ${info.code})`
                 : '子进程意外退出'
+            // ── Phase 0.2: persist partial assistant text on interrupt/crash ──
+            // CCB was streaming into parser.assistantBuf when it died / was
+            // interrupted. Without this flush the partial text is only in RAM
+            // + whatever frames the ws client already received. If the client
+            // is backgrounded we lose it entirely. Persist with status marker
+            // 'interrupted' (user stop / SIGINT / idle-timeout signal) vs
+            // 'crashed' (unexpected exit code) so the UI can render a clear
+            // "[was interrupted]" trailer rather than showing a complete-
+            // looking bubble.
+            const partial = parser.assistantBuf
+            if (session.channel === 'webchat' && partial && partial.length > 0) {
+              const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
+              const peerId = session.peerId
+              const turnIndex = session.turns + 1 // turn hasn't been counted yet
+              // Same P1-3 treatment as handleResult: prefer session.userId so
+              // a pre-PUT crash still reaches the outbox; fall back to
+              // getClientSession for legacy code paths.
+              const flushPartial = async () => {
+                const uid = session.userId
+                  ?? ((await getClientSession(peerId))?.userId)
+                if (!uid) return undefined // no owner, nothing to persist to
+                return appendServerAuthoredMessageDurable(peerId, uid, {
+                  id: `srv-${peerId}-t${turnIndex}`,
+                  role: 'assistant',
+                  text: partial,
+                  ts: Date.now(),
+                  status,
+                })
+              }
+              flushPartial().catch((err) => {
+                log.error('partial assistant flush failed', {
+                  sessionKey: session.sessionKey, peerId, turnIndex, status,
+                }, err as Error)
+              })
+            }
             onEvent({ kind: 'error', error: reason })
             detach()
             settle(() => resolve())

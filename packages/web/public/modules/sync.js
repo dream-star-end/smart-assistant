@@ -205,8 +205,18 @@ export async function syncSessionsFromServer() {
     if (!local) {
       toFetch.push(meta.id)
     } else if (local._syncedAt && meta.updatedAt > local._syncedAt) {
-      // Server has a newer version than our last sync point (server clock only)
-      if (meta.id === state.currentSessionId && state.sendingInFlight) continue
+      // Server has a newer version than our last sync point (server clock only).
+      // Normally we skip the current in-flight session to avoid stomping a
+      // live stream — but if something has flagged the session's live
+      // stream as authoritatively broken (Phase 0.4 resume_failed sets
+      // `_liveStreamBroken = true`), we MUST refetch: the whole point of
+      // the force sync is to reconcile from the server-authored tape.
+      const live = state.sessions.get(meta.id)
+      if (
+        meta.id === state.currentSessionId &&
+        state.sendingInFlight &&
+        !live?._liveStreamBroken
+      ) continue
       toFetch.push(meta.id)
     }
   }
@@ -249,6 +259,14 @@ export async function syncSessionsFromServer() {
     if (existingLocal?._sendingInFlight) sess._sendingInFlight = true
     if (existingLocal?._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
     if (existingLocal?._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
+    // Phase 0.4: preserve the frameSeq cursor across a sync-driven session
+    // replacement. If we drop it, the next hello would claim `lastFrameSeq: 0`
+    // and the gateway would replay every frame still in its ring — delivering
+    // the same assistant deltas a second time to handleOutbound, which
+    // dedupes by frameSeq; with the cursor reset those deltas look like
+    // "new" frames and would be appended again. Keep the cursor aligned to
+    // whatever we had last processed so dedupe stays authoritative.
+    if (typeof existingLocal?._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
     _rebuildSearchIndex(sess)
     clearDeleteTombstone(sess.id) // Allow saving if session was previously deleted locally
     state.sessions.set(sess.id, sess)
@@ -488,9 +506,58 @@ const _pendingDeletes = new Set()
  */
 let _syncInFlight = null
 let _lastSyncAt = 0
-export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult } = {}) {
-  if (_syncInFlight) return _syncInFlight
+/**
+ * Callbacks registered while a sync was already in flight. Each entry is
+ * `{ onResult, fresh }`:
+ *   - `fresh: false` — piggyback on the running sync's result (default).
+ *   - `fresh: true`  — caller needs a **post-`_liveStreamBroken`** sync;
+ *     schedule a tail sync after the running one finishes so the new
+ *     `_liveStreamBroken` flag is respected during that second pass.
+ *
+ * Without this list a `resume_failed` arriving mid-sync would lose its
+ * renderer + flag-clear callback and stall recovery until the next throttled
+ * `visibilitychange`. The `fresh` flag guards against a subtler race: the
+ * running sync may have already iterated past the affected session BEFORE
+ * `_liveStreamBroken` was set on it, so simply attaching our callback to
+ * the running promise is not enough — we need a second pass.
+ */
+let _pendingOnResultCallbacks = []
+let _tailSyncScheduled = false
+/**
+ * `force: true` + in-flight sync:
+ *   - `freshAfterInFlight: false` (default) → piggyback for backward compat
+ *   - `freshAfterInFlight: true`            → schedule a tail sync once the
+ *     running sync settles so caller observes state stamped after their call.
+ */
+export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult, freshAfterInFlight = false } = {}) {
+  if (_syncInFlight) {
+    if (onResult || (force && freshAfterInFlight)) {
+      _pendingOnResultCallbacks.push({
+        onResult: onResult ?? null,
+        fresh: !!(force && freshAfterInFlight),
+      })
+    }
+    // If any queued caller requested a fresh pass, schedule the tail sync
+    // exactly once; it runs after the current sync's `.finally` clears
+    // `_syncInFlight`, so it re-observes whatever session-level flags were
+    // mutated during this window (notably `_liveStreamBroken`).
+    if (force && freshAfterInFlight && !_tailSyncScheduled) {
+      _tailSyncScheduled = true
+      _syncInFlight
+        .catch(() => undefined)
+        .finally(() => {
+          _tailSyncScheduled = false
+          // Recursive call: `_syncInFlight` is null in the finally callback
+          // body, so this kicks off a fresh pass. `force:true` bypasses the
+          // throttle; we preserve `onResult` for the callers that asked for
+          // a post-mutation render.
+          try { maybeSyncNow({ force: true }) } catch {}
+        })
+    }
+    return _syncInFlight
+  }
   if (!force && Date.now() - _lastSyncAt < minIntervalMs) return Promise.resolve(null)
+  if (onResult) _pendingOnResultCallbacks.push({ onResult, fresh: false })
   _syncInFlight = syncSessionsFromServer()
     // Defensive: syncSessionsFromServer catches its own network errors and
     // returns `undefined`, but we still guard against an unexpected throw
@@ -498,7 +565,28 @@ export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult } 
     .catch(() => undefined)
     .then((result) => {
       if (result !== undefined) _lastSyncAt = Date.now()
-      if (onResult) onResult(result)  // may throw — intentionally unprotected
+      const callbacks = _pendingOnResultCallbacks
+      _pendingOnResultCallbacks = []
+      for (const entry of callbacks) {
+        if (entry.fresh) {
+          // `fresh: true` was enqueued while THIS sync was already running,
+          // meaning the caller mutated session-level flags (e.g.
+          // `_liveStreamBroken`) AFTER our wire request was in flight. Firing
+          // on `result` here would observe a pre-mutation snapshot and e.g.
+          // clear `_liveStreamBroken` before the tail sync actually re-pulls
+          // with the flag set. Re-queue as a regular (fresh:false) entry so
+          // the tail sync scheduled by the `freshAfterInFlight` branch picks
+          // it up and fires on its own — post-mutation — result.
+          _pendingOnResultCallbacks.push({ onResult: entry.onResult, fresh: false })
+          continue
+        }
+        if (!entry.onResult) continue
+        // Each callback is best-effort isolated: a throw from one must not
+        // prevent the next from running or leak past the sync boundary.
+        try { entry.onResult(result) } catch (err) {
+          try { console.error('[sync] onResult callback threw', err) } catch {}
+        }
+      }
       return result
     })
     .finally(() => { _syncInFlight = null })
