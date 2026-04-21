@@ -2,6 +2,7 @@
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
+import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -730,10 +731,18 @@ export function connect() {
     }
     // Send hello with all active session peer IDs so gateway can auto-resume.
     // Include inFlight flag so gateway only pushes turn-interrupted for stuck sessions.
+    // Phase 0.4: include lastFrameSeq per peer so gateway can replay buffered
+    // outbound frames the client missed during the disconnect window. 0 means
+    // "I've never received a frameSeq'd frame" (fresh tab or legacy client).
     try {
       const peers = []
       for (const [id, s] of state.sessions) {
-        peers.push({ peerId: id, agentId: s.agentId || state.defaultAgentId, inFlight: !!s._sendingInFlight })
+        peers.push({
+          peerId: id,
+          agentId: s.agentId || state.defaultAgentId,
+          inFlight: !!s._sendingInFlight,
+          lastFrameSeq: s._lastFrameSeq || 0,
+        })
       }
       ws.send(JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
     } catch {}
@@ -850,6 +859,7 @@ export function connect() {
       if (f.type === 'outbound.message') handleOutbound(f)
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
+      else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
       else if (f.type === 'outbound.ack' && f.deduplicated) {
         // Server already processed this message; clear drain state so queue continues
         if (state._offlineDrainingCurrent) {
@@ -898,6 +908,19 @@ export function handleOutbound(frame) {
       console.warn('[ws] Ignoring frame for unknown peer:', peerId)
       return
     }
+  }
+  // ── Phase 0.3/0.4: frameSeq dedupe ──
+  // Gateway stamps a per-session monotonic `frameSeq` on every outbound frame.
+  // After a WS reconnect the gateway replays buffered frames >= our cursor +1;
+  // if multiple tabs resume concurrently or a quick flap duplicates deliveries
+  // we reject anything we've already processed. Update the cursor only on
+  // strictly-forward frames so out-of-order deliveries never regress it.
+  if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
+    const last = sess._lastFrameSeq || 0
+    if (frame.frameSeq <= last) {
+      return // already processed — drop silently
+    }
+    sess._lastFrameSeq = frame.frameSeq
   }
   if (!sess._blockIdToMsgId) {
     // Rebuild blockId→msgId and agentGroups mappings from restored messages (after page refresh)
@@ -1485,6 +1508,50 @@ export function handleOutbound(frame) {
   _deps.scheduleSave(sess, !!frame.isFinal)
   // Only rebuild sidebar on final message (not every streaming delta)
   if (frame.isFinal) _deps.renderSidebar()
+}
+
+// ── Phase 0.4: gateway-initiated resume failure ──
+// Gateway emits `outbound.resume_failed` when our hello.lastFrameSeq points at
+// a window it can no longer replay — ring buffer pruned (buffer_miss), server
+// restarted and lost memory (no_buffer), or our cursor somehow outran the
+// server (sequence_mismatch — shouldn't happen for trusted clients). In all
+// three cases the correct recovery is a forced REST sync: the server-authored
+// persistence layer (Phase 0.1/0.2) is authoritative, so a full pull
+// reconciles whatever we missed. `force: true` bypasses the 15s throttle in
+// maybeSyncNow since we explicitly know our live-stream state is stale.
+//
+// We also:
+//   1. Reset the session-level frameSeq cursor — after the sync we accept
+//      any future frameSeq as forward-progress. Without this, a server restart
+//      (where currentLast drops back to a low number) would make every
+//      subsequent frame look "stale" to the dedupe check in handleOutbound.
+//   2. Clear the stale `_sendingInFlight` marker on the affected session.
+//      syncSessionsFromServer skips refetching the current session while
+//      `state.sendingInFlight` is true (it avoids stomping a live stream).
+//      But resume_failed *proves* the live stream is broken, so keeping the
+//      marker would cause the sync to skip exactly the session we most need
+//      to reconcile. Clear it and rely on the just-triggered sync to pull
+//      authoritative server-persisted state.
+function handleResumeFailed(frame) {
+  const peerId = frame.peer?.id
+  if (peerId) {
+    const sess = state.sessions.get(peerId)
+    if (sess) {
+      sess._lastFrameSeq = 0
+      if (sess._sendingInFlight) {
+        sess._sendingInFlight = false
+        clearTurnTiming(sess)
+        resetReplyTracker(sess)
+        if (sess.id === state.currentSessionId) {
+          state.sendingInFlight = false
+          updateSendEnabled()
+          hideTypingIndicator()
+          setTitleBusy(false)
+        }
+      }
+    }
+  }
+  maybeSyncNow({ force: true })
 }
 
 // ═══════════════ PERMISSION PROMPTS ═══════════════
