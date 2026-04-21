@@ -502,34 +502,144 @@ export interface ClientSessionMeta {
  * @param baseSyncedAt - client's last known server updated_at (optimistic concurrency).
  *   On conflict, the write is only applied if the existing row's updated_at <= baseSyncedAt
  *   (i.e., the client has seen the latest version). For new inserts this is ignored.
+ *
+ * **Server-authored message preservation**: messages in the existing row that
+ * carry `_source: 'server'` (written by {@link appendServerAuthoredMessage})
+ * MUST survive a client PUT that doesn't include them. This is the mobile
+ * stream durability contract — when a mobile client goes to background and
+ * misses the tail of an assistant message, its subsequent PUT would otherwise
+ * overwrite the server's complete copy with the truncated local copy. We
+ * merge by id: server-authored entries win over any client-supplied entry
+ * with the same id, and server-authored entries not present in the client
+ * payload get re-inserted (sorted by ts).
  */
 export async function upsertClientSession(session: ClientSession, baseSyncedAt = 0): Promise<boolean> {
   const db = await getSessionsDb()
-  const result = db.prepare(`
-    INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at)
-    VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @updatedAt)
-    ON CONFLICT(id) DO UPDATE SET
-      agent_id = excluded.agent_id,
-      title = excluded.title,
-      pinned = excluded.pinned,
-      last_at = excluded.last_at,
-      messages = excluded.messages,
-      updated_at = excluded.updated_at
-    WHERE client_sessions.updated_at <= @baseSyncedAt
-      AND client_sessions.user_id = @userId
-  `).run({
-    id: session.id,
-    userId: session.userId,
-    agentId: session.agentId,
-    title: session.title,
-    pinned: session.pinned ? 1 : 0,
-    createdAt: session.createdAt,
-    lastAt: session.lastAt,
-    messages: JSON.stringify(session.messages),
-    updatedAt: session.updatedAt,
-    baseSyncedAt,
+  const txn = db.transaction(() => {
+    const existing = db.prepare(
+      'SELECT messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(session.id, session.userId) as { messages: string; updated_at: number } | undefined
+
+    // Reject stale writes (same optimistic concurrency check as the pre-transaction version)
+    if (existing && existing.updated_at > baseSyncedAt) return false
+
+    let finalMessages: unknown[] = session.messages
+    if (existing) {
+      try {
+        const oldMsgs = JSON.parse(existing.messages) as Array<{ id?: string; _source?: string; ts?: number }>
+        const serverAuthored = new Map<string, typeof oldMsgs[number]>()
+        for (const m of oldMsgs) {
+          if (m && m._source === 'server' && typeof m.id === 'string') {
+            serverAuthored.set(m.id, m)
+          }
+        }
+        if (serverAuthored.size > 0) {
+          const clientMsgs = session.messages as Array<{ id?: string; ts?: number }>
+          const clientIds = new Set(
+            clientMsgs.map((m) => (m && typeof m.id === 'string' ? m.id : null)).filter((x): x is string => x !== null)
+          )
+          // Replace client's same-id entry with the server version; keep others verbatim
+          const merged: Array<{ id?: string; ts?: number; [k: string]: unknown }> = clientMsgs.map((m) => {
+            if (m && typeof m.id === 'string' && serverAuthored.has(m.id)) {
+              return serverAuthored.get(m.id) as typeof m
+            }
+            return m
+          })
+          // Re-insert any server-authored message the client dropped
+          for (const [id, msg] of serverAuthored) {
+            if (!clientIds.has(id)) merged.push(msg)
+          }
+          merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+          finalMessages = merged
+        }
+      } catch { /* malformed existing messages JSON — fall back to client payload */ }
+    }
+
+    const result = db.prepare(`
+      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at)
+      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @updatedAt)
+      ON CONFLICT(id) DO UPDATE SET
+        agent_id = excluded.agent_id,
+        title = excluded.title,
+        pinned = excluded.pinned,
+        last_at = excluded.last_at,
+        messages = excluded.messages,
+        updated_at = excluded.updated_at
+      WHERE client_sessions.updated_at <= @baseSyncedAt
+        AND client_sessions.user_id = @userId
+    `).run({
+      id: session.id,
+      userId: session.userId,
+      agentId: session.agentId,
+      title: session.title,
+      pinned: session.pinned ? 1 : 0,
+      createdAt: session.createdAt,
+      lastAt: session.lastAt,
+      messages: JSON.stringify(finalMessages),
+      updatedAt: session.updatedAt,
+      baseSyncedAt,
+    })
+    return result.changes > 0
   })
-  return result.changes > 0
+  return txn()
+}
+
+/**
+ * Append a server-authored message to a client session's messages array,
+ * idempotently. Called by the gateway's turn.completed handler to persist the
+ * authoritative assistant message so the client can always recover it via
+ * REST force-sync, even if the WebSocket delivery was lost during mobile
+ * backgrounding, tab freeze, or network interruption.
+ *
+ * Key properties:
+ *   - Idempotent by message id: repeated calls with the same id are no-ops.
+ *   - Stamps `_source: 'server'` so subsequent client PUTs via
+ *     {@link upsertClientSession} won't drop or overwrite the message.
+ *   - Sorts messages by ts ascending to keep ordering stable across out-of-
+ *     order persistence (e.g., multiple turns completing in quick succession).
+ *   - Runs in a BEGIN IMMEDIATE transaction so read-modify-write is atomic
+ *     against concurrent client PUTs.
+ *
+ * Returns `applied: false` when the session row doesn't exist yet (caller
+ * should ensure the client has created it first) or when a message with the
+ * same id already exists.
+ */
+export async function appendServerAuthoredMessage(
+  sessId: string,
+  userId: string,
+  message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
+): Promise<{ applied: boolean; reason?: 'session_not_found' | 'already_exists' | 'malformed' }> {
+  const db = await getSessionsDb()
+  const txn = db.transaction(() => {
+    const row = db.prepare(
+      'SELECT messages FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(sessId, userId) as { messages: string } | undefined
+    if (!row) return { applied: false, reason: 'session_not_found' as const }
+
+    let msgs: Array<{ id?: string; ts?: number; [k: string]: unknown }>
+    try {
+      msgs = JSON.parse(row.messages) as typeof msgs
+      if (!Array.isArray(msgs)) return { applied: false, reason: 'malformed' as const }
+    } catch {
+      return { applied: false, reason: 'malformed' as const }
+    }
+
+    // Idempotency: skip if message with same id already exists
+    if (msgs.some((m) => m && m.id === message.id)) {
+      return { applied: false, reason: 'already_exists' as const }
+    }
+
+    const stamped = { ...message, _source: 'server' as const, ts: message.ts ?? Date.now() }
+    msgs.push(stamped)
+    msgs.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+
+    const now = Date.now()
+    db.prepare(
+      'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ? WHERE id = ? AND user_id = ?'
+    ).run(JSON.stringify(msgs), now, now, sessId, userId)
+    return { applied: true }
+  })
+  return txn()
 }
 
 export async function listClientSessions(userId: string): Promise<ClientSessionMeta[]> {

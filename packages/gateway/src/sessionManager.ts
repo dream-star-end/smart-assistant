@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import {
   type AgentDef,
   type OpenClaudeConfig,
+  appendServerAuthoredMessage,
+  getClientSession,
   indexTurn,
   paths,
   upsertSessionMeta,
@@ -912,6 +914,54 @@ export class SessionManager {
               }),
               indexTurn(sessId, session.turns, session.currentUserText ?? '', result.assistantText),
             ]).catch((err) => log.error('FTS5 index failed', { sessionKey: session.sessionKey }, err))
+
+            // ── Phase 0.1: persist server-authored assistant message ──
+            // Write the authoritative assistant text into the client_sessions
+            // row so that a mobile client that missed the tail of the
+            // streaming response (tab backgrounded, tab frozen, network
+            // drop, OS-level JS suspension) can recover the full turn via
+            // REST force-sync after reconnect. This is the core durability
+            // fix — prior to this, server.ts:3787 silently dropped outbound
+            // frames when no ws client was connected, and nothing else
+            // persisted the assistant text to the user-visible messages
+            // array. See docs/MOBILE_STREAM_DURABILITY_PLAN.md.
+            //
+            // Only applies to webchat sessions whose peerId matches a
+            // client_sessions row (i.e., the UI created the session before
+            // dispatching the first turn). Cron/webhook/telegram/delegate
+            // turns are not routed to a per-user client session and thus
+            // skip this path — they're tracked via sessions_meta / event_log
+            // instead, and will be addressed in Phase 1 (channel broadcast).
+            if (session.channel === 'webchat' && result.assistantText && result.assistantText.length > 0) {
+              const peerId = session.peerId
+              const assistantText = result.assistantText
+              const turnIndex = session.turns
+              getClientSession(peerId).then((existing) => {
+                if (!existing) return // cron-style or pre-UI session, nothing to append to
+                const messageId = `srv-${peerId}-t${turnIndex}`
+                return appendServerAuthoredMessage(peerId, existing.userId, {
+                  id: messageId,
+                  role: 'assistant',
+                  text: assistantText,
+                  ts: Date.now(),
+                })
+              }).then((r) => {
+                if (r && !r.applied && r.reason !== 'already_exists') {
+                  log.warn('server-authored message not persisted', {
+                    sessionKey: session.sessionKey,
+                    peerId,
+                    turnIndex,
+                    reason: r.reason,
+                  })
+                }
+              }).catch((err) => {
+                log.error('appendServerAuthoredMessage failed', {
+                  sessionKey: session.sessionKey,
+                  peerId,
+                  turnIndex,
+                }, err)
+              })
+            }
 
             // Emit turn.completed event (triggers event_log + usage_log persistence)
             const turnDurationMs = Date.now() - turnStartTime
