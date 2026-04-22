@@ -99,6 +99,25 @@ async function _waitForVisible(container, maxFrames = 30) {
   return container.offsetWidth > 0 && container.offsetHeight > 0
 }
 
+// 失败后 reset widget —— Cloudflare Turnstile token 是**一次性**的,CF 内部
+// verify 过一次之后再用同一个 token 会返回 `timeout-or-duplicate` (success=false),
+// 后端翻译成 TURNSTILE_FAILED。如果前端登录失败不 reset,下次提交仍然拿老
+// token,用户就卡在一直 rejected 里。
+// 只在**请求已发出到后端、CF token 已被消费**的失败路径上调用。
+function _resetTurnstileFor(mode) {
+  const containerId = {
+    login: 'turnstile-login',
+    register: 'turnstile-register',
+    forgot: 'turnstile-forgot',
+  }[mode]
+  if (!containerId) return
+  const c = $(containerId)
+  if (!c) return
+  const wid = _widgetIdByContainer.get(c)
+  if (wid == null) return // bypass 模式或 widget 还没挂载 → 无需 reset
+  try { window.turnstile?.reset(wid) } catch {}
+}
+
 // Ensures a widget exists in the given container; returns getResponseFn.
 async function _mountWidget(container) {
   const cfg = await loadPublicConfig()
@@ -300,6 +319,8 @@ async function _doLogin() {
     })
     const data = await r.json().catch(() => ({}))
     if (!r.ok) {
+      // 请求已发出,CF token 已被 verify(无论通没通),必须 reset 下次才能拿新 token
+      _resetTurnstileFor('login')
       if (r.status === 403 && data?.error === 'EMAIL_NOT_VERIFIED') {
         _showError('邮箱尚未验证 — 请检查收件箱,或点击下方"重发验证邮件"')
         $('auth-login-resend-row').hidden = false
@@ -339,6 +360,7 @@ async function _doRegister() {
     })
     const data = await r.json().catch(() => ({}))
     if (!r.ok) {
+      _resetTurnstileFor('register')
       _showError(_friendlyAuthError(data, r.status))
       return
     }
@@ -449,7 +471,7 @@ async function _doRequestReset() {
       suppressAuthRedirect: true,
     })
     const data = await r.json().catch(() => ({}))
-    if (!r.ok) { _showError(_friendlyAuthError(data, r.status)); return }
+    if (!r.ok) { _resetTurnstileFor('forgot'); _showError(_friendlyAuthError(data, r.status)); return }
     $('auth-forgot-form').hidden = true
     $('auth-forgot-success').hidden = false
     $('auth-forgot-success-email').textContent = email
