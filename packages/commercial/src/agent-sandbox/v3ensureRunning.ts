@@ -75,6 +75,15 @@ const RETRY_AFTER_HOST_FULL_SEC = 10;
 const RETRY_AFTER_IMAGE_MISSING_SEC = 300;
 
 /**
+ * Codex R2 修复 —— CcbBaselineMissing 也是部署级故障(rsync 漏了 baseline 或
+ * 权限被改),不是"再试 5s 就好"的瞬态。走与 ImageNotFound 同等的长重试,
+ * 避免前端每 5s 风暴重试放大运维噪声。运维补好 baseline 后 5min 内自恢复。
+ *
+ * reason='baseline_missing' 让前端/运维 dashboard 看见 distinct 信号。
+ */
+const RETRY_AFTER_BASELINE_MISSING_SEC = 300;
+
+/**
  * ensureRunning 注入项 — 测试可以覆盖 readiness 探活实现。
  *
  * 字段沿用 3D 命名(向后兼容),但语义已改为 §3E 的 readiness:HTTP /healthz +
@@ -196,6 +205,11 @@ export function makeV3EnsureRunning(
       if (err instanceof SupervisorError && err.code === "ImageNotFound") {
         throw new ContainerUnreadyError(RETRY_AFTER_IMAGE_MISSING_SEC, "image_missing");
       }
+      // Codex R2 fix:CcbBaselineMissing 同为部署级故障 — baseline rsync 漏了
+      // 或权限被改。走长重试避免风暴,留给运维修基线。
+      if (err instanceof SupervisorError && err.code === "CcbBaselineMissing") {
+        throw new ContainerUnreadyError(RETRY_AFTER_BASELINE_MISSING_SEC, "baseline_missing");
+      }
       // NameConflict(同 uid 并发 provision)/ IP 池满 都让前端短重试
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }
@@ -222,5 +236,6 @@ export const ENSURE_RUNNING_DEFAULTS = Object.freeze({
   RETRY_AFTER_STOPPED_SEC,
   RETRY_AFTER_HOST_FULL_SEC,
   RETRY_AFTER_IMAGE_MISSING_SEC,
+  RETRY_AFTER_BASELINE_MISSING_SEC,
   CONTAINER_PORT: V3_CONTAINER_PORT,
 });

@@ -1279,6 +1279,36 @@ describe("resolveCcbBaselineMounts", () => {
       b.cleanup();
     }
   });
+
+  // Codex R2 发现:中间目录 skills/ 未做 owner/mode 校验 → 攻击者可在校验通过后
+  // 替换 system-info 路径。现在 skills/ 也被 assertBaselineLeaf 锁死。
+  test("(root only) rejects world-writable intermediate skills/ dir", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      chmodSync(pathJoin(b.dir, "skills"), 0o757); // other-write
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects symlinked intermediate skills/ dir", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      // 把整个 skills/ 换成 symlink
+      const realSkills = pathJoin(b.dir, "__real_skills");
+      mkdirSync(realSkills, { mode: 0o755 });
+      mkdirSync(pathJoin(realSkills, "system-info"), { mode: 0o755 });
+      writeFileSync(pathJoin(realSkills, "system-info", "SKILL.md"), "# x\n", { mode: 0o644 });
+      rmSync(pathJoin(b.dir, "skills"), { recursive: true });
+      symlinkSync(realSkills, pathJoin(b.dir, "skills"));
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
 });
 
 describe("provisionV3Container — CCB baseline 挂载分支", () => {

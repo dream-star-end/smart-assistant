@@ -128,6 +128,7 @@ export const DEFAULT_V3_CCB_BASELINE_DIR =
 
 /** baseline 内部结构 —— 用 POSIX 绝对路径拼 docker Bind */
 export const V3_CCB_BASELINE_CLAUDE_MD_REL = "CLAUDE.md";
+export const V3_CCB_BASELINE_SKILLS_DIR_REL = "skills";
 export const V3_CCB_BASELINE_SYSTEM_INFO_REL = "skills/system-info";
 export const V3_CCB_BASELINE_SYSTEM_INFO_SKILL_MD_REL = "skills/system-info/SKILL.md";
 
@@ -218,12 +219,18 @@ export function resolveCcbBaselineMounts(
   if (!pathIsAbsolute(baselineDir)) return null;
   const abs = pathNormalize(baselineDir).replace(/(?<!^)\/+$/, "");
   try {
-    // baseline root 自己也按 dir 校验(非 symlink / root owned / 不可写)
+    // 每一级目录 / 文件都必须通过相同的 lstat + owner + mode + realpath 校验。
+    // **包含中间目录 `skills/`**:R2 codex 发现如果 skills/ 可写,攻击者可在
+    // resolve 通过后、docker createContainer 调度前替换 system-info 路径,造成
+    // TOCTOU。堵 skills/ 这层校验后,非 root 用户无法改动该链路上的任何一环。
     assertBaselineLeaf(abs, "dir", abs);
     const claudeMdPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_MD_REL);
+    const skillsDirPath = pathJoin(abs, V3_CCB_BASELINE_SKILLS_DIR_REL);
     const systemInfoPath = pathJoin(abs, V3_CCB_BASELINE_SYSTEM_INFO_REL);
     const systemInfoSkillMdPath = pathJoin(abs, V3_CCB_BASELINE_SYSTEM_INFO_SKILL_MD_REL);
     const claudeReal = assertBaselineLeaf(claudeMdPath, "file", abs);
+    // 中间目录 skills/ 必须和根一样被锁死(root owned + 非可写 + 非 symlink)
+    assertBaselineLeaf(skillsDirPath, "dir", abs);
     const systemInfoReal = assertBaselineLeaf(systemInfoPath, "dir", abs);
     // SKILL.md 必须存在(不挂这个文件,但缺了 skill loader 不生效,基线就失效了)
     assertBaselineLeaf(systemInfoSkillMdPath, "file", abs);
