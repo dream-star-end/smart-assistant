@@ -74,6 +74,18 @@ describe("proxyBodySchema — happy path", () => {
     });
     assert.equal(r.success, true);
   });
+
+  // 2026-04-22 回归:前端"思考深度"菜单选非默认档 → CCB 把 effort 放进
+  // output_config 里下来,proxy 不放行就整轮 400 BAD_BODY。
+  test("带 output_config: { effort: 'max' } (CCB effort beta)", () => {
+    const r = proxyBodySchema.safeParse({
+      model: "claude-opus-4-7",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "hi" }],
+      output_config: { effort: "max" },
+    });
+    assert.equal(r.success, true);
+  });
 });
 
 describe("proxyBodySchema — 拒绝 unknown 字段(strict)", () => {

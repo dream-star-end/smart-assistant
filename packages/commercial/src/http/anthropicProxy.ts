@@ -213,6 +213,18 @@ export const proxyBodySchema = z
      * 上游 Anthropic 自决,size 走 system/messages/tools 现有预算。
      */
     context_management: z.unknown().optional(),
+    /**
+     * 2026-04-22:CCB v2.1.9+ 把 effort / task_budget / format 等全塞进
+     * `output_config` 里发(claude-code-best claude.ts:1711-1713)。默认档不带
+     * 此字段 — 一旦用户在前端"思考深度"菜单里选 low/medium/high/xhigh/max,
+     * CCB 就会加 `output_config: { effort: 'xxx' }`,被 strict() 拒 → 整条
+     * 消息 400 BAD_BODY(user claudeai.chat 2026-04-22 踩雷于"最高"档位)。
+     * 对应 beta 是 effort-2025-11-24,已在 ALLOWED_BETA_VALUES 白名单里,
+     * 所以 header 侧没问题,只缺 body 侧放行。与 thinking/context_management
+     * 同策略,按 z.unknown() 透传给上游 Anthropic 自决,size 不受限
+     * (object 整体小,没必要专门预算)。
+     */
+    output_config: z.unknown().optional(),
     /** Anthropic priority/standard tier 提示;透传不解析。 */
     service_tier: z.string().max(64).optional(),
   })
