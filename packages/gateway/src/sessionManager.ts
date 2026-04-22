@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
@@ -147,28 +147,23 @@ export class SessionManager {
    *  produced by `wantProvider`. Cross-provider mismatches return undefined
    *  so we never feed a CCB session_id to codex (or vice versa).
    *
-   *  For CCB (`cwd` provided), also validate that the session's JSONL file
-   *  exists on disk. If the file was wiped (e.g. CCB_CONFIG_DIR projects
-   *  directory was reset — pre-2026-04-22 tmpfs on v3 containers was ephemeral),
+   *  For CCB, also validate that the session's JSONL file exists on disk.
+   *  If the file was wiped (e.g. CLAUDE_CONFIG_DIR projects directory was
+   *  reset — pre-2026-04-22 tmpfs on v3 containers was ephemeral),
    *  pretending to --resume yields a "No conversation found with session ID"
    *  crash and a scary "AI 进程异常退出" banner. Pre-detect and drop the
    *  entry so the next spawn starts a fresh session silently — UI history
    *  stays visible (it lives in the DB), but CCB has no memory of previous
    *  turns (unavoidable when the JSONL is gone). */
-  private _resumeIdFor(
-    sessionKey: string,
-    wantProvider: string,
-    cwd?: string,
-  ): string | undefined {
+  private _resumeIdFor(sessionKey: string, wantProvider: string): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
     const tag = this._resumeMapProvider.get(sessionKey) ?? SessionManager.CCB_PROVIDER_TAG
     if (tag !== wantProvider) return undefined
-    if (tag === SessionManager.CCB_PROVIDER_TAG && cwd && !this._ccbJsonlExists(id, cwd)) {
+    if (tag === SessionManager.CCB_PROVIDER_TAG && !this._ccbJsonlExists(id)) {
       log.warn('resume-map entry points to missing JSONL — dropping silently', {
         sessionKey,
         resumeId: id,
-        cwd,
       })
       this._resumeMap.delete(sessionKey)
       this._resumeMapTimestamps.delete(sessionKey)
@@ -180,22 +175,37 @@ export class SessionManager {
     return id
   }
 
-  /** Check whether a CCB session's JSONL file exists under CLAUDE_CONFIG_DIR.
-   *  Replicates CCB's sanitizePath encoding (`cwd.replace(/[^a-zA-Z0-9]/g, '-')`)
-   *  so we can compute the expected path without touching CCB internals.
+  /** Whether a CCB session's JSONL file exists somewhere under
+   *  `$CLAUDE_CONFIG_DIR/projects/*`. We don't try to replicate CCB's
+   *  sanitizePath(cwd) projection — worktree switches, EnterWorktreeTool
+   *  and the gap between CCB process cwd (= ccbDir) vs agent.cwd (=
+   *  --add-dir) each rearrange where the file actually lands. Instead we
+   *  scan every project directory under CLAUDE_CONFIG_DIR/projects and
+   *  look for `<id>.jsonl` with non-zero size. In v3 containers this dir
+   *  typically has ≤5 subdirs so the scan is cheap.
    *
-   *  For very long cwds CCB hashes the suffix — we conservatively return
-   *  `true` in that case (skip validation) and let the existing
-   *  ccbMessageParser stale-detection handle it. In practice every v3
-   *  container runs with cwd under `/home/agent` so the short-path branch
-   *  is the only one exercised. */
-  private _ccbJsonlExists(resumeId: string, cwd: string): boolean {
+   *  Conservative by design: errors, missing CLAUDE_CONFIG_DIR, or missing
+   *  projects/ dir all return `true` (skip validation) — we'd rather let
+   *  the old parser stale-detection fire than incorrectly evict a live
+   *  resume entry. */
+  private _ccbJsonlExists(resumeId: string): boolean {
     try {
       const configDir = process.env.CLAUDE_CONFIG_DIR
       if (!configDir) return true
-      const sanitized = cwd.replace(/[^a-zA-Z0-9]/g, '-')
-      if (sanitized.length > 200) return true
-      return existsSync(join(configDir, 'projects', sanitized, `${resumeId}.jsonl`))
+      const projectsDir = join(configDir, 'projects')
+      if (!existsSync(projectsDir)) return true
+      const entries = readdirSync(projectsDir, { withFileTypes: true })
+      for (const ent of entries) {
+        if (!ent.isDirectory()) continue
+        const candidate = join(projectsDir, ent.name, `${resumeId}.jsonl`)
+        try {
+          const st = statSync(candidate)
+          if (st.isFile() && st.size > 0) return true
+        } catch {
+          // ENOENT / permission denied — treat as not-here, keep scanning
+        }
+      }
+      return false
     } catch {
       return true
     }
@@ -385,7 +395,7 @@ export class SessionManager {
             // Only resume if the persisted id was produced by a codex-native
             // runner — feeding a CCB session_id to `codex exec resume` would
             // make codex reject the arg or attach to a nonexistent thread.
-            resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag, cwd),
+            resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
             model: opts.agent.model ?? this.config.defaults.model,
           }) as unknown as SubprocessRunner)
         : new SubprocessRunner({
@@ -400,10 +410,10 @@ export class SessionManager {
             agentMcpServers: opts.agent.mcpServers,
             agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
             delegationDepth: opts.delegationDepth,
-            // Symmetrically: only resume CCB from a CCB-tagged id. cwd drives
-            // on-disk JSONL existence check to skip --resume when the file
-            // was wiped (pre-2026-04-22 v3 containers).
-            resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag, cwd),
+            // Symmetrically: only resume CCB from a CCB-tagged id.
+            // _resumeIdFor also drops the entry silently when the CCB JSONL
+            // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
+            resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
             effortLevel: initialEffort,
           })
     const now = Date.now()
