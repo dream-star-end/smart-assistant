@@ -325,6 +325,32 @@ function _applySyncResult(result) {
   }
   renderSidebar()
 }
+
+let _syncBannerTimer = null
+function updateSyncIndicator(status) {
+  const banner = $('sync-banner')
+  if (!banner || !status?.state) return
+  const title = $('sync-banner-title')
+  const detail = $('sync-banner-detail')
+  if (_syncBannerTimer) {
+    clearTimeout(_syncBannerTimer)
+    _syncBannerTimer = null
+  }
+
+  banner.classList.remove('idle', 'syncing', 'synced', 'error')
+  banner.classList.add(status.state)
+  banner.setAttribute('aria-hidden', status.state === 'idle' ? 'true' : 'false')
+  if (title) title.textContent = status.label || '正在同步多端会话'
+  if (detail) detail.textContent = status.detail || ''
+
+  if (status.state === 'synced' || status.state === 'error') {
+    _syncBannerTimer = setTimeout(() => {
+      banner.classList.remove('syncing', 'synced', 'error')
+      banner.classList.add('idle')
+      banner.setAttribute('aria-hidden', 'true')
+    }, status.state === 'error' ? 4500 : 1800)
+  }
+}
 // ── Global error handlers ──
 // Last-resort UI feedback for any uncaught exception or unhandled promise
 // rejection that escapes module-level try/catch. Without this the user
@@ -1414,6 +1440,7 @@ async function init() {
   //     pane header title + subtitle (both normally set inside renderMessages),
   //     plus the agent dropdown (reflects sess.agentId).
   setSyncDeps({
+    onSyncStatusChange: updateSyncIndicator,
     onConflictResolved: (sessId, mode) => {
       if (sessId === state.currentSessionId) {
         const s = state.sessions.get(sessId)
