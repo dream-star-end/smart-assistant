@@ -8,7 +8,7 @@ import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance } from './billing.js?v=fcd1504'
+import { refreshBalance } from './billing.js?v=b5b7a74'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
