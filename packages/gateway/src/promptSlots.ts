@@ -21,7 +21,8 @@ export interface PromptSlotContext {
   provider?: string
   model?: string
   /** CCB effort level — 'xhigh' / 'max' 触发科研守则 slot,其它值(含 undefined)不触发。
-   *  仅在 Opus 4.7 + 用户选了"科研模式"pill 时会是 xhigh/max。 */
+   *  仅在 Opus 4.7 + 用户在"思考深度"菜单里选到 xhigh/max 档位时才会是这两个值
+   *  (UI 入口见 packages/web/public/modules/effortMode.js)。 */
   effortLevel?: string
 }
 
@@ -209,18 +210,20 @@ export function buildToolsSlot(): PromptSlot {
   }
 }
 
-// ── 科研模式 slot ──
-// 仅在 effortLevel = 'xhigh' / 'max' 时注入,驱动 agent 在涉及数值/公式/跨领域
-// 表达时更严谨。这不是对话 preamble(不注入 user text),而是 extra-prompt 里
-// 一条常驻守则,下一次 CCB 启动(effort 切换本来就会 recycle runner)自动生效。
+// ── 科研严谨度 slot ──
+// 仅在 effortLevel = 'max' 时注入,驱动 agent 在涉及数值/公式/跨领域表达时
+// 更严谨。这不是对话 preamble(不注入 user text),而是 extra-prompt 里一条
+// 常驻守则,下一次 CCB 启动(effort 切换本来就会 recycle runner)自动生效。
 //
 // 设计原则:只写 agent 能直接执行的行为规则,不写空泛倡导。alice(科研用户)
 // 历史对话里暴露的 6 类问题是这条 slot 的直接动机 —— 参见 memory
 // `feedback_scientific_numbers` 及 alice 5 条会话的真实痛点。
 //
-// 触发条件**仅** effortLevel === 'max'(UI 上叫"科研模式")。xhigh 是"编码模式",
-// 它也需要高 effort 但语义不同,不应继承这套科学严谨度守则(否则用户在
-// 编码模式下也会被"数值保守 / 公式前提 / 误差分类"污染)。
+// 触发条件**仅** effortLevel === 'max'(即"思考深度"菜单里的"最高"档位)。
+// xhigh("更高"档,偏长链路编码)不继承这套科学严谨度守则 —— 否则用户在编码
+// 任务里也会被"数值保守 / 公式前提 / 误差分类"污染。
+// 2026-04-22 重构:前端把原来的"科研模式 pill"合并进统一的"思考深度"菜单,
+// 此处的 slot 触发条件不变 —— 仍然只认 effortLevel === 'max'。
 // 未来如果要把"模式"和"effort"解耦,应在 PromptSlotContext 里新增
 // conversationMode 字段,不复用 effortLevel。
 const RESEARCH_EFFORT_LEVELS = new Set(['max'])
