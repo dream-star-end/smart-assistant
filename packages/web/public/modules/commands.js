@@ -1,6 +1,10 @@
 // OpenClaude — Slash Commands
 import { apiGet } from './api.js'
-import { isHostAgentAdmin } from './billing.js'
+// `?v=...` 必须跟 main.js / websocket.js 的 billing import 用同一版本,不然
+// 浏览器把 `./billing.js` 和 `./billing.js?v=...` 当两个独立 ES module 实例,
+// `_hostAgentAdmin` 模块状态不共享,admin 登录后本模块永远读到 false。
+// 版本号由 scripts/deploy-v3.sh 跟其它 ?v= 一起 bump。
+import { isHostAgentAdmin } from './billing.js?v=891cffd'
 import { $, _mod } from './dom.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
@@ -46,8 +50,15 @@ const slashCommands = [
     cmd: '/help',
     desc: '显示所有可用命令',
     run() {
+      // PR2: 同样过滤 host-scope 命令,避免非 admin 从 /help 里看到
+      // /memory /skills /persona /tasks —— palette/autocomplete 都已隐藏,
+      // 这里漏过就前后不一致。
+      const hostAdmin = isHostAgentAdmin()
       const lines = ['**可用命令:**', '']
-      for (const c of slashCommands) lines.push(`\`${c.cmd}\` — ${c.desc}`)
+      for (const c of slashCommands) {
+        if (HOST_SCOPED_SLASH_CMDS.has(c.cmd) && !hostAdmin) continue
+        lines.push(`\`${c.cmd}\` — ${c.desc}`)
+      }
       lines.push('', `也可以用 \`${_mod}K\` 打开命令面板`)
       addSystemMessage(lines.join('\n'))
     },

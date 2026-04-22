@@ -2060,6 +2060,10 @@ async function init() {
       createNewChat()
     } else if (key === 'm') {
       e.preventDefault()
+      // PR2: Ctrl/Cmd+M → Memory modal 同样命中 PR1 firewall 会 403 的 host-scope
+      // /api/agents/:id/memory/*,非 admin 直接吞按键不弹 modal(同 palette / slash
+      // / settings 一张表)。
+      if (!isHostAgentAdmin()) return
       openMemoryModal()
     } else if (key === 'b') {
       e.preventDefault()
