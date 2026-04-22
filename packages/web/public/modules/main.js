@@ -2005,6 +2005,12 @@ async function init() {
         renderMessages()
       }
       renderSidebar()
+      // 2026-04-22:agents + sessions 两条 fetch 在 login 后并发起飞,谁先谁后
+      // 决定了 renderModePills 首次跑时 state.currentSessionId 是否已定。如果
+      // sessions 后到,reloadAgents 里的 renderModePills 拿不到有效 sess →
+      // getCurrentAgentModel 返回 '' → 思考深度选择器一直 hidden,直到用户手动
+      // 刷新页面。兜底:sessions sync 完成后再 render 一次,让 selector 补显。
+      renderModePills()
     }).catch(() => {})
     checkUnclaimedSessions()
   })
