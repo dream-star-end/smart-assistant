@@ -35,6 +35,7 @@ const TARGETS = [
   "admin.html",
   "modules/main.js",
   "modules/websocket.js",
+  "modules/commands.js",
 ];
 
 function gitShortHead(): string {

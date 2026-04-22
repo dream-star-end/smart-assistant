@@ -161,6 +161,7 @@ VERSION_FILES=(
   packages/web/public/admin.html
   packages/web/public/modules/main.js
   packages/web/public/modules/websocket.js
+  packages/web/public/modules/commands.js
 )
 
 if [[ $DRY_RUN -eq 0 && $NO_COMMIT -eq 0 ]]; then
