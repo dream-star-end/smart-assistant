@@ -533,9 +533,12 @@ export type MessageLike = {
  *      background recovery.
  *   4. Result is sorted by ts ascending; ties preserve insertion order
  *      (Array.prototype.sort is stable in ES2019+).
- *   5. If there are zero server-authored entries, `clientMsgs` is returned
- *      verbatim (no copy, same reference) — callers rely on this as a fast
- *      path.
+ *   5. If there are zero server-authored entries AND no client entry carries
+ *      a forged `_source: 'server'`, `clientMsgs` is returned verbatim (no
+ *      copy, same reference) — callers rely on this as a fast path. If a
+ *      forgery is detected, a scrubbed copy is returned instead so later
+ *      callers (notably {@link appendServerAuthoredPure}) cannot be tricked
+ *      into treating a client row as authoritative.
  */
 export function mergePreservingServerAuthored<T extends MessageLike>(
   serverSideMsgs: readonly T[],
@@ -547,16 +550,32 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
       serverAuthored.set(m.id, m)
     }
   }
-  if (serverAuthored.size === 0) return clientMsgs
+  if (serverAuthored.size === 0) {
+    // Fast path preserved — but we must still scrub any client-spoofed
+    // `_source: 'server'` before returning, otherwise a malicious/bugged PUT
+    // can plant a fake authoritative row that later callers (including
+    // dropPhantomClientAssistants in appendServerAuthoredPure) will trust.
+    return scrubClientSourceSpoof(clientMsgs, serverAuthored)
+  }
 
   const clientIds = new Set<string>()
   for (const m of clientMsgs) {
     if (m && typeof m.id === 'string') clientIds.add(m.id)
   }
 
+  // Replace client-provided entries with authoritative server copies when ids
+  // match; strip `_source: 'server'` from all OTHER client entries so a client
+  // PUT cannot forge an authoritative record for an id the server has never
+  // authored. Only ids present in `serverAuthored` retain the flag.
   const merged: T[] = clientMsgs.map((m) => {
-    if (m && typeof m.id === 'string' && serverAuthored.has(m.id)) {
+    if (!m) return m
+    if (typeof m.id === 'string' && serverAuthored.has(m.id)) {
       return serverAuthored.get(m.id) as T
+    }
+    if ((m as MessageLike)._source === 'server') {
+      const { _source, ...rest } = m as MessageLike & { _source?: unknown }
+      void _source  // discard
+      return rest as T
     }
     return m
   })
@@ -565,67 +584,219 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   }
   merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
 
-  // Phantom-assistant dedupe (rule 3): partition merged[] into turns on
-  // user/system messages (which act as turn boundaries — the model never
-  // produces those client-side on its own). Within each partition, if any
-  // server-authored assistant exists, drop ALL non-server-authored
-  // assistants in that partition (they are phantoms of the same turn).
-  //
-  // This is broader than a simple adjacency check because tool-use turns
-  // end up with MULTIPLE client-side assistant segments separated by
-  // tool_use / tool_result messages (see websocket.js where a tool_use
-  // block clears `_streamingAssistant` so the next text creates a new
-  // bubble). Server writes one aggregated assistant per turn, so pair-wise
-  // adjacency would leave earlier client segments orphaned.
-  //
-  // Never drops a server-authored message; never drops a client message
-  // that is not an assistant (tool, tool_result, user, thinking, etc. are
-  // always preserved). Also tolerates both ts-sort orders of the server
-  // row relative to client segments (server clock earlier or later).
-  const deduped: T[] = []
-  const isAssistant = (m: T) => (m as { role?: string }).role === 'assistant'
-  const isTurnBoundary = (m: T) => {
+  return dropPhantomClientAssistants(merged)
+}
+
+/**
+ * Strips `_source: 'server'` from client-provided messages whose ids are not
+ * in the authoritative `trusted` map. Preserves input reference when nothing
+ * needs scrubbing (the common case — client never sets this field). See the
+ * merge-fast-path and appendServerAuthoredPure callers for why this matters:
+ * without it, a malformed PUT can make later phantom-dedupe passes treat
+ * spoofed client rows as server-authored and drop legitimate assistant rows.
+ */
+function scrubClientSourceSpoof<T extends MessageLike>(
+  clientMsgs: readonly T[],
+  trusted: ReadonlyMap<string, T>,
+): T[] | readonly T[] {
+  let needsScrub = false
+  for (const m of clientMsgs) {
+    if (!m) continue
+    if ((m as MessageLike)._source !== 'server') continue
+    if (typeof m.id === 'string' && trusted.has(m.id)) continue
+    needsScrub = true
+    break
+  }
+  if (!needsScrub) return clientMsgs
+  return clientMsgs.map((m) => {
+    if (!m) return m
+    if ((m as MessageLike)._source !== 'server') return m
+    if (typeof m.id === 'string' && trusted.has(m.id)) return m
+    const { _source, ...rest } = m as MessageLike & { _source?: unknown }
+    void _source
+    return rest as T
+  })
+}
+
+/**
+ * Phantom-assistant dedupe (Phase 0.4 P0-3). Partitions `messages` into turns
+ * on user/system boundaries and, within each turn, drops every client-authored
+ * assistant entry when that turn also contains at least one server-authored
+ * assistant. The server-authored message is the authoritative copy of the
+ * turn's full response; the client-side bubble(s) stamped during streaming
+ * are just UI scaffolding and would otherwise render as duplicates.
+ *
+ * Called from two write paths so phantom cleanup is uniform regardless of
+ * whether the server-authored entry arrived via client PUT merge
+ * ({@link mergePreservingServerAuthored}) or direct gateway append
+ * ({@link appendServerAuthoredPure}):
+ *
+ *   - Client PUT merge: the client's streamed `m-*` assistant message is
+ *     carried in the PUT payload while the server already has the `srv-*`
+ *     turn record; dedupe drops the former before we persist.
+ *   - Direct gateway append: gateway's turn.completed handler writes the
+ *     `srv-*` record into a messages array that may still contain a
+ *     client `m-*` phantom from an earlier PUT (happens when the client
+ *     does not PUT again after the turn finishes — mobile backgrounded,
+ *     tab closed, session switched). Without dedupe here the phantom lives
+ *     in the DB forever and every page load sees the assistant twice.
+ *
+ * Why partition-level (not pair-wise) — tool-use turns: the frontend splits
+ * assistant output at each tool_use boundary (websocket.js clears
+ * `_streamingAssistant` on tool_use / tool_result blocks), producing multiple
+ * `m-*` assistant segments around `tool` / `tool_result` rows. The server
+ * writes ONE aggregated `srv-*` assistant per turn. Adjacency-only dedupe
+ * would leave earlier client segments orphaned; partition-wise dedupe drops
+ * them all together.
+ *
+ * Invariants:
+ *   - Never drops a server-authored message.
+ *   - Never drops a non-assistant message (tool / tool_result / user /
+ *     thinking / etc. are always preserved).
+ *   - Tolerates both ts-sort orders within a turn (server ts before or after
+ *     client segments — wallclock drift across devices).
+ *   - Tolerates cross-boundary clock skew: if a server-authored assistant
+ *     sorts BEFORE its triggering user/system message (client clock was
+ *     ahead), the row's `srv-<peer>-t<N>` id is parsed to re-home it to
+ *     sort-order group N (1-indexed turn, matching sessionManager.ts's
+ *     `session.turns + 1`). Messages with ids that do not match the
+ *     `-t<N>` convention (cron/proactive/webhook origin) stay put — they
+ *     carry no turn-index signal and are not paired with any phantom.
+ *   - Stable for partitions without a server-authored assistant: those
+ *     client assistants survive unchanged.
+ *   - Fast path: returns the input reference verbatim when no server-authored
+ *     assistant exists anywhere (callers rely on this for the "pure client
+ *     history" shape; see the msgOutbox replay and first-PUT path).
+ */
+export function dropPhantomClientAssistants<T extends MessageLike>(
+  messages: readonly T[],
+): T[] | readonly T[] {
+  const isAssistant = (m: T | undefined) =>
+    !!m && (m as { role?: string }).role === 'assistant'
+  const isTurnBoundary = (m: T | undefined) => {
+    if (!m) return false
     const role = (m as { role?: string }).role
     return role === 'user' || role === 'system'
   }
-  // First pass: compute per-index turn group id, and whether that group has
-  // any server-authored assistant. We need this because the decision to
-  // drop a phantom depends on the ENTIRE partition, not just its neighbours.
-  const turnGroup: number[] = new Array(merged.length)
+
+  // Fast path: no server-authored assistant anywhere => no phantoms to drop.
+  // Lets callers short-circuit without allocating; also preserves the
+  // "pure client history returns same reference" contract relied on by
+  // mergePreservingServerAuthored's own fast-path invariants.
+  let hasAnyServerAsst = false
+  for (const m of messages) {
+    if (isAssistant(m) && (m as MessageLike)._source === 'server') {
+      hasAnyServerAsst = true
+      break
+    }
+  }
+  if (!hasAnyServerAsst) return messages
+
+  // First pass: compute per-index turn group id and whether that group has
+  // any server-authored assistant. We need the ENTIRE partition answer
+  // because a phantom earlier in the partition must drop even if the
+  // server-authored entry lands later (or vice versa — clock drift).
+  //
+  // We also maintain a parallel `userTurnToGroup[N]` map: the group id of the
+  // Nth user-bounded turn (1-indexed). Only `user` boundaries increment the
+  // user-turn counter, even though both `user` and `system` open new
+  // partitions. Gateway's `session.turns` counter (which produces the `-tN`
+  // suffix on server-authored ids) tracks model turns, which in the current
+  // codebase are always user-triggered; system rows (reserved for future
+  // context-injection or prompts) do not contribute to turn numbering. This
+  // separation prevents system messages from shifting `-tN` → group mapping.
+  const turnGroup: number[] = new Array(messages.length)
   const groupHasServerAsst: boolean[] = []
+  const userTurnToGroup: number[] = []  // userTurnToGroup[N] = sort-order group of Nth user turn
   let groupId = 0
   let currentGroupHasServer = false
-  for (let i = 0; i < merged.length; i++) {
-    const cur = merged[i]
-    if (cur && isTurnBoundary(cur)) {
-      // Close previous group, open a new one. The boundary itself belongs
-      // to the starting group of what follows (a user message opens a new
-      // turn; we tag it with the new groupId so any dedupe scan after it
-      // lands in the right bucket).
+  for (let i = 0; i < messages.length; i++) {
+    const cur = messages[i]
+    if (isTurnBoundary(cur)) {
+      // Close previous group, open a new one. The boundary row itself
+      // belongs to the newly-opened group (a user message opens a new
+      // turn; anything the model produces after it is part of that turn).
       groupHasServerAsst.push(currentGroupHasServer)
       groupId++
       currentGroupHasServer = false
+      // Only `user` boundaries advance the user-turn counter — system
+      // partitions get their own group slot but don't claim a turn index.
+      if ((cur as { role?: string }).role === 'user') {
+        userTurnToGroup.push(groupId)  // push at index (userTurnIdx - 1) where userTurnIdx starts at 1
+      }
     }
     turnGroup[i] = groupId
-    if (cur && isAssistant(cur) && cur._source === 'server') {
+    if (isAssistant(cur) && (cur as MessageLike)._source === 'server') {
       currentGroupHasServer = true
     }
   }
   groupHasServerAsst.push(currentGroupHasServer)
 
-  for (let i = 0; i < merged.length; i++) {
-    const cur = merged[i]
+  // Clock-skew normalization via id-aware turn mapping. Phase 0.1
+  // server-authored assistants are stamped with `srv-<peer>-t<N>` where N is
+  // the 1-indexed turn number (see sessionManager.ts: `session.turns + 1`).
+  // When the client's clock was ahead of the server by more than the turn's
+  // wallclock duration, the server row sorts before its triggering user
+  // message and lands in a lower sort-order group than its semantic turn N.
+  // Re-home those rows to the group containing the Nth user turn so phantom
+  // pairing uses the correct partition.
+  //
+  // Messages WITHOUT a `-tN` suffix — cron / proactive / webhook-origin writes
+  // via appendServerAuthoredMessage with arbitrary ids — carry no turn-index
+  // signal, so they stay in whatever sort-order group they landed in. Those
+  // writes are not paired with any phantom client assistant anyway (the
+  // triggering edge is server-side), so leaving them put is correct.
+  //
+  // MAX_TURN_DIGITS bounds the regex numeric capture to a safe-integer range
+  // without relying on Number.isSafeInteger at the edge — a session would need
+  // ~10^14 turns to approach Number.MAX_SAFE_INTEGER, far beyond anything real.
+  const TURN_ID_RE = /-t(\d{1,15})$/
+  let migrated = false
+  for (let i = 0; i < messages.length; i++) {
+    const cur = messages[i]
+    if (!isAssistant(cur) || (cur as MessageLike)._source !== 'server') continue
+    const id = (cur as MessageLike).id
+    if (typeof id !== 'string') continue
+    const m = TURN_ID_RE.exec(id)
+    if (!m) continue
+    const turnIdx = parseInt(m[1]!, 10)
+    if (!Number.isFinite(turnIdx) || turnIdx < 1) continue
+    // Map 1-indexed turn N to the group of the Nth user-bounded turn. If no
+    // such user turn exists yet in this messages array (e.g., the user boundary
+    // was not persisted), we cannot re-home safely and leave the row put — a
+    // later merge that introduces the user row can re-run this helper.
+    const targetGroup = userTurnToGroup[turnIdx - 1]
+    if (targetGroup === undefined) continue
+    if (turnGroup[i] === targetGroup) continue  // already in correct group
+    turnGroup[i] = targetGroup
+    migrated = true
+  }
+  if (migrated) {
+    // Rebuild group-has-server flags from scratch after any migration — cheaper
+    // and less error-prone than surgical flips, since we may have moved rows
+    // both forward (skew case) and conceivably backward across multiple turns.
+    for (let g = 0; g < groupHasServerAsst.length; g++) groupHasServerAsst[g] = false
+    for (let i = 0; i < messages.length; i++) {
+      const cur = messages[i]
+      if (isAssistant(cur) && (cur as MessageLike)._source === 'server') {
+        groupHasServerAsst[turnGroup[i]] = true
+      }
+    }
+  }
+
+  const deduped: T[] = []
+  for (let i = 0; i < messages.length; i++) {
+    const cur = messages[i]
     if (!cur) { deduped.push(cur); continue }
     // Keep server-authored messages, non-assistant messages, and assistants
-    // in a partition that has no server-authored counterpart.
-    if (!isAssistant(cur) || cur._source === 'server') {
+    // in a partition without a server-authored counterpart.
+    if (!isAssistant(cur) || (cur as MessageLike)._source === 'server') {
       deduped.push(cur)
       continue
     }
     const g = turnGroup[i]
     if (groupHasServerAsst[g]) {
-      // This client-assistant lives in a turn that the server re-authored.
-      // Drop as phantom.
+      // Client-assistant in a turn that the server re-authored. Drop.
       continue
     }
     deduped.push(cur)
@@ -654,7 +825,19 @@ export function appendServerAuthoredPure<T extends MessageLike>(
   const stamped = { ...message, _source: 'server', ts: message.ts ?? now } as T
   const next = [...existing, stamped]
   next.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
-  return { applied: true, messages: next }
+  // Phantom cleanup: client-side streaming may have stamped a `m-*` assistant
+  // bubble for the same turn we are now server-authoring. If the client never
+  // re-PUTs this session (mobile backgrounded, tab closed, switched away),
+  // upsertClientSession's merge-path dedupe never runs and the phantom would
+  // live forever — rendering as a duplicate assistant on every load. Doing
+  // dedupe here makes the write idempotent relative to prior client state.
+  //
+  // dropPhantomClientAssistants's fast path (no server-authored anywhere) is
+  // impossible post-append: we just stamped one. The returned array is a new
+  // allocation when any phantom was dropped; otherwise the function returns
+  // `next` verbatim. Narrow to T[] — we know it is mutable (we built it here).
+  const cleaned = dropPhantomClientAssistants(next) as T[]
+  return { applied: true, messages: cleaned }
 }
 
 /**
@@ -682,16 +865,22 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
     // Reject stale writes (same optimistic concurrency check as the pre-transaction version)
     if (existing && existing.updated_at > baseSyncedAt) return false
 
-    let finalMessages: unknown[] = session.messages
+    // Always route through mergePreservingServerAuthored so the client-forged
+    // `_source: 'server'` scrub runs uniformly. For new-session inserts we
+    // pass an empty `oldMsgs`, which hits the merge's empty-server fast path
+    // where the only work is `scrubClientSourceSpoof(clientMsgs, emptyMap)` —
+    // stripping `_source` off any unknown-id client entry so that a later
+    // `appendServerAuthoredMessage` cannot trust forged flags in the persisted
+    // messages array.
+    let oldMsgs: MessageLike[] = []
     if (existing) {
       try {
-        const oldMsgs = JSON.parse(existing.messages) as MessageLike[]
-        if (Array.isArray(oldMsgs)) {
-          const clientMsgs = session.messages as MessageLike[]
-          finalMessages = mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[]
-        }
-      } catch { /* malformed existing messages JSON — fall back to client payload */ }
+        const parsed = JSON.parse(existing.messages) as MessageLike[]
+        if (Array.isArray(parsed)) oldMsgs = parsed
+      } catch { /* malformed existing messages JSON — fall through with oldMsgs=[] */ }
     }
+    const clientMsgs = session.messages as MessageLike[]
+    const finalMessages = mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[]
 
     const result = db.prepare(`
       INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at)
