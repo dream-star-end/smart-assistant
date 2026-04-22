@@ -1,5 +1,6 @@
 // OpenClaude — Slash Commands
 import { apiGet } from './api.js'
+import { isHostAgentAdmin } from './billing.js'
 import { $, _mod } from './dom.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
@@ -10,6 +11,13 @@ import {
   resetReplyTracker,
   safeWsSend,
 } from './websocket.js'
+
+// V3 商用版多租户安全 PR2:这批 slash 命令打开的是 host-scope 单例端点
+// (/api/agents/:id/memory/*、/api/agents/:id/skills、/api/agents/:id、
+// /api/cron、/api/tasks),PR1 防火墙对非 admin commercial user 403。
+// 非 admin 时拒绝 —— admin 绕防火墙能正常用。服务端 PR1 仍是安全边界,
+// 这里只是避免用户看到 403 困惑。
+const HOST_SCOPED_SLASH_CMDS = new Set(['/memory', '/skills', '/persona', '/tasks'])
 
 // ── Late-binding for circular deps ──
 let _deps = {}
@@ -178,6 +186,10 @@ export function handleSlashCommand(text) {
     addSystemMessage(`未知命令: \`${cmdName}\`。输入 \`/help\` 查看可用命令。`)
     return true
   }
+  if (HOST_SCOPED_SLASH_CMDS.has(cmdName) && !isHostAgentAdmin()) {
+    addSystemMessage(`命令 \`${cmdName}\` 在当前账号不可用。`)
+    return true
+  }
   cmd.run(args)
   return true
 }
@@ -193,9 +205,13 @@ export function showSlashPopup(filter) {
     document.querySelector('.composer').appendChild(popup)
   }
   const q = filter.toLowerCase().slice(1) // remove leading /
-  _slashMatches = slashCommands.filter(
-    (c) => !q || c.cmd.slice(1).includes(q) || c.desc.includes(q),
-  )
+  // PR2: host-scope 命令(/memory /skills /persona /tasks)在非 admin 商用账号
+  // 隐藏,跟 handleSlashCommand 拦截同一套策略,避免 autocomplete 诱导用户输入。
+  const hostAdmin = isHostAgentAdmin()
+  _slashMatches = slashCommands.filter((c) => {
+    if (HOST_SCOPED_SLASH_CMDS.has(c.cmd) && !hostAdmin) return false
+    return !q || c.cmd.slice(1).includes(q) || c.desc.includes(q)
+  })
   if (_slashMatches.length === 0) {
     hideSlashPopup()
     return

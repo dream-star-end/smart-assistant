@@ -180,12 +180,14 @@ export async function refreshBalance() {
     }
     _setAdminLinkVisible(user.role === 'admin')
     _setHostAgentEntriesVisible(user.role === 'admin')
+    _hostAgentAdmin = user.role === 'admin'
     return { shown: true, credits: String(credits), role: user.role || null }
   } catch (err) {
     // 个人版无此接口;商用版 401 已被 api.js 处理,此处其它失败一律静默。
     _showPill(false)
     _setAdminLinkVisible(false)
     _setHostAgentEntriesVisible(false)
+    _hostAgentAdmin = false
     if (_commercialMode === null) _commercialMode = false
     return { shown: false, credits: null, role: null }
   }
@@ -199,13 +201,17 @@ function _setAdminLinkVisible(visible) {
 }
 
 /**
- * V3 商用版多租户防火墙(PR1)把 /api/agents/* /api/cron /api/tasks /api/memory/*
- * /api/skills 这些 host-scope 单例端点对 commercial user 403 掉了 —— 普通用户点了
- * 只会看到 403/404,徒增困惑。所以同步把对应设置菜单入口(人格编辑/管理 Agents/
- * 记忆/技能/定时任务)默认隐藏,仅 admin 可见(admin 绕过防火墙能正常用)。
- * 个人版:refreshBalance 404 走 catch 路径保持隐藏,不影响,因为个人版前端
- * 根本不加载这些 host-scope 单例(它们走 per-session REPL)—— 如果以后需要
- * 在个人版显示,重写这里把 hidden 属性去掉即可,不走 role 检查。
+ * V3 商用版多租户防火墙(PR1)把 /api/agents/*、/api/agents/:id/memory/*、
+ * /api/agents/:id/skills、/api/cron、/api/tasks 这些 host-scope 单例端点
+ * 对 commercial user 403 掉了 —— 普通用户点了只会看到 403/404,徒增困惑。
+ * 所以同步把对应设置菜单入口(人格编辑/管理 Agents/记忆/技能/定时任务)
+ * 默认隐藏,仅 admin 可见(admin 绕过防火墙能正常用)。注意:这只是 UX 层,
+ * 安全边界仍在 PR1 的服务端拦截 —— 用户就算 devtools 强行解 hidden,请求
+ * 也会被 403。
+ *
+ * 个人版:refreshBalance 404 走 catch 路径保持隐藏,不影响,因为个人版
+ * 前端 (/opt/openclaude/openclaude/packages/web/) 是单独的 index.html,
+ * 不引用本段代码。
  */
 function _setHostAgentEntriesVisible(visible) {
   for (const id of ['settings-section-agent', 'settings-section-learning']) {
@@ -214,6 +220,19 @@ function _setHostAgentEntriesVisible(visible) {
     if (visible) el.removeAttribute('hidden')
     else el.setAttribute('hidden', '')
   }
+}
+
+// ── Host-scope admin 权限快照(命令面板 / 斜杠命令读取)───────────────
+//
+// 同一批入口(memory/skills/tasks/persona/agents)除了出现在 settings
+// dropdown,还出现在 Ctrl+K 命令面板 和 slash 命令(/memory /skills
+// /persona /tasks)。它们全部命中 PR1 防火墙会 403 的端点。用 module
+// 级 flag 集中承载状态,refreshBalance 更新它,其它模块读 isHostAgentAdmin()
+// 做显示过滤。默认 false —— 在 /api/me 返回前不把入口暴露给非 admin。
+let _hostAgentAdmin = false
+
+export function isHostAgentAdmin() {
+  return _hostAgentAdmin
 }
 
 // ── Stage 切换 ──────────────────────────────────────────────────────

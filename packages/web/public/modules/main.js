@@ -69,7 +69,7 @@ import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMo
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, refreshBalance } from './billing.js?v=891cffd'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=891cffd'
 import { initUserPrefs, openPrefsModal } from './userPrefs.js'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
 import { initUsageStats, openUsageModal } from './usageStats.js?v=891cffd'
@@ -902,11 +902,25 @@ const ICON_SVG = {
 let paletteItems = []
 let paletteSelected = 0
 
+// V3 商用版多租户安全 PR2:这批 palette action 命中 PR1 firewall 的 host-scope
+// 端点,非 admin commercial user 点了只会看到 403。跟 settings-dropdown 同一张
+// 用户体验策略 —— admin 可见,其他人隐藏。isHostAgentAdmin() 默认返 false,
+// refreshBalance 拉到 user.role==='admin' 时置 true。注意:这只是 UX 过滤,
+// 服务端 PR1 仍是真正的安全边界。
+const HOST_SCOPED_PALETTE_IDS = new Set([
+  'open-memory',
+  'open-skills',
+  'open-tasks',
+  'manage-agents',
+])
+
 function buildPaletteItems(query) {
   const q = query.trim().toLowerCase()
   const items = []
+  const hostAdmin = isHostAgentAdmin()
   // Actions
   for (const a of paletteActions) {
+    if (HOST_SCOPED_PALETTE_IDS.has(a.id) && !hostAdmin) continue
     if (!q || a.label.toLowerCase().includes(q)) {
       items.push({ ...a, section: a.section })
     }
