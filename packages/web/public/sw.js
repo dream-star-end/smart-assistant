@@ -1,22 +1,22 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-6a77a0c'
+const VERSION = 'openclaude-891cffd'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=6a77a0c',  // versioned URL used in index.html
+  '/style.css?v=891cffd',  // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=6a77a0c',  // versioned URL used in index.html
+  '/modules/main.js?v=891cffd',  // versioned URL used in index.html
   '/modules/auth.js',
   '/modules/billing.js',
-  '/modules/billing.js?v=6a77a0c',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
+  '/modules/billing.js?v=891cffd',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
   '/modules/userPrefs.js',
   '/modules/usageStats.js',
-  '/modules/usageStats.js?v=6a77a0c',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/usageStats.js?v=891cffd',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
