@@ -1070,7 +1070,11 @@ async function _forceLogout({ serverLogout } = {}) {
     for (const s of all) await dbDelete(s.id)
   } catch {}
   if (state.ws) state.ws.close(1000)
-  showLogin()
+  // 2026-04-22:过期后回营销首页 (landing),而不是硬跳 /login —— 用户看到
+  // "/" 被强制变 "/login" 会困惑。landing 顶栏已有「登录」按钮,想继续用的
+  // 用户一键就能进。landing-view 不存在 (老模板) 才 fallback showLogin()。
+  if ($('landing-view')) showLanding()
+  else showLogin()
 }
 
 // URL routing helpers.
