@@ -24,6 +24,12 @@ export const state = {
   // 新 login 不再写它(refresh token 走 HttpOnly cookie)。
   refreshToken: localStorage.getItem('openclaude_refresh_token') || '',
   tokenExp: Number(localStorage.getItem('openclaude_access_exp') || '0') || 0,
+  // 2026-04-22 Codex R2 finding:silentRefresh 的异步期间可能跟 _forceLogout /
+  // 登另一个账号撞车,导致旧 refresh 响应回来时把已经 logout/切换的 state.token
+  // 又写回来。每次 login 成功 / _forceLogout / _tearDownWsAuth 递增这个计数,
+  // _doRefreshOnce 在 commit 前比对,epoch 变了就丢掉响应,别覆盖当前身份。
+  // 仅 in-memory:新 tab 从 0 起不会干扰其他 tab(那边独立 JS 上下文)。
+  authEpoch: 0,
   // 2026-04-21 安全审计 HIGH#F1:changelog_seen / user-bucketed localStorage 此前
   // 用 `state.token.slice(-8)` 做身份桶,但 JWT 末 8 字节并非稳定身份(每次
   // refresh 会变成新 JWT,导致 "已读标志" 在同一用户下反复丢失)。改用真实

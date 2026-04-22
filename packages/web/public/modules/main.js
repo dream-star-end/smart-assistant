@@ -21,7 +21,7 @@ import {
 import { getSession, isSending, setSending, state } from './state.js'
 
 // ── API layer ──
-import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired } from './api.js'
+import { abortInflightRefresh, apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired } from './api.js'
 
 // ── IndexedDB ──
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
@@ -1047,6 +1047,11 @@ async function _forceLogout({ serverLogout } = {}) {
   state.refreshToken = ''
   state.tokenExp = 0
   state.userId = null
+  // 2026-04-22 Codex R3:先 abort 在飞的 refresh(最大限度减少旧 response
+  // 里的 Set-Cookie 覆盖未来新账号 oc_rt 的时间窗),再 bump epoch(JS 侧
+  // 保险,_doRefreshOnce commit 前比对)。两层防护缺一不可。
+  abortInflightRefresh()
+  state.authEpoch = (state.authEpoch || 0) + 1
   // Rearm the auth-expired one-shot so a future session expiry can trigger
   // the logout flow again. login success also does this, but doing it here
   // too keeps the semantics symmetric across both teardown paths.
@@ -1947,8 +1952,15 @@ async function init() {
   // refresh token 由 server 通过 Set-Cookie(HttpOnly oc_rt)下发,JS 读不到,这里
   // 也不要尝试读 refresh_token 字段(后端已经从响应里拿掉)。
   setAuthSuccessHandler(async ({ access_token, access_exp }) => {
+    // 2026-04-22 Codex R3:login 前先 abort 可能在飞的 refresh(防止旧身份的
+    // Set-Cookie 覆盖新账号刚拿到的 oc_rt),再写新 state.token + bump epoch。
+    abortInflightRefresh()
     state.token = access_token
     state.tokenExp = Number(access_exp) || 0
+    // bump authEpoch —— 让任何在此之前起的 silentRefresh() 在它的响应回来时
+    // 不再敢把 state.token 覆写(那是上一个身份的 refresh 结果,旧 refresh
+    // token 已经在 server 端 rotate,新 access 可能串号)。
+    state.authEpoch = (state.authEpoch || 0) + 1
     // 主动清掉老版本可能残留的 localStorage refresh token —— 一旦走完一次新版
     // login,旧 token 既无用又是 XSS 攻击面,立刻零化。
     state.refreshToken = ''

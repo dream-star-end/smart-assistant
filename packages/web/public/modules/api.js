@@ -121,23 +121,58 @@ async function _extractErrorMessage(res) {
 //   • /api/auth/* 路径本身跳过:这些端点天然返 401 不该再触发递归。
 //   • caller 传 suppressAuthRedirect=true(login/probe)整体跳过。
 //   • 重试 pass 上 set _attemptedRefresh=true,避免无限循环。
-let _refreshInflight = null
+// 2026-04-22 Codex R3:inflight 必须按 authEpoch 绑定 —— 不同身份不能共享 inflight
+// promise(否则新身份起的 refresh 会复用旧身份的响应)。同 epoch 多并发仍然合并
+// 成一次网络调用。finally 里只清 "如果还是我" 的槽位,防止旧 inflight 归零时把
+// 新 inflight 的引用误清。
+let _refreshInflight = null  // { epoch, promise }
+// 2026-04-22 Codex R3 E 缓解:refresh fetch 挂 AbortController 的 signal,身份
+// 变更(login/logout/tearDown)路径 call abortInflightRefresh() 发 abort,让浏览器
+// 终止正在路上的请求 —— 最大限度减少旧 refresh 响应的 Set-Cookie 覆盖新账号
+// oc_rt cookie 的时间窗。注:浏览器 header 解析和 cookie jar 更新是原子的,
+// 已完成 response header 的 Set-Cookie 仍可能生效,这是前端能做到的最稳方案;
+// 彻底解决需要后端对 refresh/logout rotate race 做 revision 化(follow-up)。
+let _refreshAbort = null
 
-// 单次 refresh 调用(不含 race retry)。
-async function _doRefreshOnce() {
+export function abortInflightRefresh() {
+  try { _refreshAbort?.abort(new DOMException('auth epoch changed', 'AbortError')) } catch {}
+}
+
+// 单次 refresh 调用(不含 race retry)。expectedEpoch 由 caller 传入,绑定整个
+// _silentRefresh() 生命周期 —— 这样 retry 循环跨多次 _doRefreshOnce 仍然对齐
+// 同一个起始身份,避免 retry N+1 在 retry N 和 N+1 之间发生的身份变更中捡到
+// 新 epoch 后 commit(R3 finding C)。
+async function _doRefreshOnce(expectedEpoch) {
   const legacyBody = state.refreshToken
     ? JSON.stringify({ refresh_token: state.refreshToken })
     : undefined
-  const r = await fetch('/api/auth/refresh', {
-    method: 'POST',
-    // same-origin 是默认值,显式写出来表明"我们依赖浏览器自动带 cookie"。
-    credentials: 'same-origin',
-    headers: legacyBody ? { 'Content-Type': 'application/json' } : undefined,
-    body: legacyBody,
-  })
+  let r
+  try {
+    r = await fetch('/api/auth/refresh', {
+      method: 'POST',
+      // same-origin 是默认值,显式写出来表明"我们依赖浏览器自动带 cookie"。
+      credentials: 'same-origin',
+      headers: legacyBody ? { 'Content-Type': 'application/json' } : undefined,
+      body: legacyBody,
+      signal: _refreshAbort?.signal,
+    })
+  } catch (err) {
+    // 2026-04-22 Codex R4:三种 abort 情况都不走 race retry,让 _silentRefresh
+    // 立即 bail:
+    //   1) AbortError — 身份变更主动 abort(_forceLogout / login / _tearDownWsAuth)
+    //   2) TimeoutError — _silentRefresh 自己挂的 30s 兜底 timer 到期(见下方)
+    //   3) 其他网络异常 — DNS fail / connection refused 等,race retry 也救不了
+    const aborted = err?.name === 'AbortError' || err?.name === 'TimeoutError'
+    return { ok: false, race: false, aborted }
+  }
   if (r.ok) {
     const data = await r.json().catch(() => ({}))
     if (typeof data?.access_token !== 'string' || !data.access_token) {
+      return { ok: false, race: false }
+    }
+    // Epoch check 在 commit 前:当前 epoch 和 caller 预期的不一致 → 身份已变,
+    // 抛弃响应,不写 state.token / localStorage。
+    if ((state.authEpoch || 0) !== expectedEpoch) {
       return { ok: false, race: false }
     }
     state.token = data.access_token
@@ -179,17 +214,45 @@ async function _doRefreshOnce() {
 // R3 finding 加固:R2 用的 [250,500,1000,2000] 累计 3.75s 偏短。
 const _RACE_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 1750]
 
+// Exported for non-fetch callers (e.g. websocket.js needs to refresh the
+// access token after a 1008 close without falling through to showLogin).
+// Returns Promise<boolean>:true = state.token now holds a fresh access JWT.
+// Shares the same inflight promise as apiFetch's internal 401-retry path,
+// so a burst of HTTP 401 + WS 1008 only fires one /api/auth/refresh.
+export function silentRefresh() { return _silentRefresh() }
+
 function _silentRefresh() {
-  if (_refreshInflight) return _refreshInflight
-  _refreshInflight = (async () => {
+  const myEpoch = state.authEpoch || 0
+  // 同 epoch 且还有 inflight → 合并。跨 epoch 不合并(旧 inflight 注定被 abort/
+  // 拒绝,新的得独立跑)。
+  if (_refreshInflight && _refreshInflight.epoch === myEpoch) {
+    return _refreshInflight.promise
+  }
+  const myAbort = new AbortController()
+  // 2026-04-22 Codex R4:refresh fetch 没 timeout,网络层卡住会让 WS IIFE
+  // 永远等,`_wsAuthRefreshInFlight` 一直 true,所有 connect 入口都被 gate,
+  // 用户停在 "会话续期中…" —— WS 状态机卡死。30s 兜底:到期主动 abort fetch,
+  // `_doRefreshOnce` 的 catch 识别 TimeoutError 为 aborted,_silentRefresh bail,
+  // WS IIFE 收尾走 _tearDownWsAuth → showLogin,比挂住好。
+  const refreshTimer = setTimeout(() => {
+    try { myAbort.abort(new DOMException('refresh timeout', 'TimeoutError')) } catch {}
+  }, DEFAULT_TIMEOUT_MS)
+  _refreshAbort = myAbort
+  const promise = (async () => {
     try {
-      let last = await _doRefreshOnce()
+      let last = await _doRefreshOnce(myEpoch)
       if (last.ok) return true
+      if (last.aborted) return false
       if (!last.race) return false
       for (const delay of _RACE_RETRY_DELAYS_MS) {
         await new Promise(r => setTimeout(r, delay))
-        last = await _doRefreshOnce()
+        // 每次 delay 后先 check epoch,身份变了立即 bail —— 即便本次还会走 fetch
+        // 拿到 200,也会被 _doRefreshOnce 内 epoch check 拦下;这里提前退出
+        // 省掉一次网络调用。
+        if ((state.authEpoch || 0) !== myEpoch) return false
+        last = await _doRefreshOnce(myEpoch)
         if (last.ok) return true
+        if (last.aborted) return false
         // 中途 server 停 race(如 grace 已过 → INVALID_REFRESH)直接放弃
         if (!last.race) return false
       }
@@ -197,8 +260,18 @@ function _silentRefresh() {
     } catch {
       return false
     }
-  })().finally(() => { _refreshInflight = null })
-  return _refreshInflight
+  })().finally(() => {
+    // R4 timeout timer 一定要清(成功 / race bail / abort 三条出路都得走这里),
+    // 否则 30s 后 abort 一个已经 resolve 的 AbortController 虽无副作用,但若 finally
+    // 之后用户又起新 refresh,arr myAbort 已无引用 —— 仍然不会误 abort,但 timer
+    // 本身占资源,及时清干净。
+    clearTimeout(refreshTimer)
+    // 只清 "是我" 的槽位,防止旧 inflight 归零时踩掉已经创建的新 inflight。
+    if (_refreshInflight?.promise === promise) _refreshInflight = null
+    if (_refreshAbort === myAbort) _refreshAbort = null
+  })
+  _refreshInflight = { epoch: myEpoch, promise }
+  return promise
 }
 
 function _isAuthEndpoint(path) {

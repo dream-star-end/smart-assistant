@@ -1,4 +1,5 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
+import { abortInflightRefresh, silentRefresh } from './api.js'
 import { dbPut } from './db.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
@@ -59,6 +60,23 @@ const OFFLINE_LATCH_GRACE_MS = 60_000
 // can fire visibilitychange rapidly and we don't want to spam connect().
 let _lastVisibilityReconnectAt = 0
 const VISIBILITY_RECONNECT_COOLDOWN_MS = 2000
+// 2026-04-22 切后台>15min 再切回触发 1008 踢登录修复:WS 握手用 state.token,
+// 切回时 token 已过期 → server close(1008) → 以前直接 showLogin,丢弃了本可用的
+// 30 天 refresh cookie。现在 onclose 1008 走一次 silentRefresh,拿到新 access
+// 就立刻 reconnect。为防 "refresh 成功后新连接又被 server policy 1008(如 per-user
+// 3-conn 上限)"陷入死循环,同一 WS 实例最多只允许一次 refresh 重连;实例间
+// 靠 _lastWsAuthRefreshAt 窗口限制,避免重建后的新实例立刻又触发。
+let _lastWsAuthRefreshAt = 0
+const WS_AUTH_REFRESH_MIN_GAP_MS = 30_000
+// Codex R1 发现的 race:silent refresh 跑的异步期间,旧 WS readyState 已是 CLOSED(3),
+// connect()/notifyTabVisible()/notifyNetworkOnline() 的 `state.ws.readyState < 2` guard
+// 不会拦它们 → visibility/online 或残留 reconnectTimer 会拿**旧 expired state.token**
+// 插队新建一个 WS,server 又 close(1008),但插队 WS 的 `_authRefreshTried=false`,
+// 且 module-level `_lastWsAuthRefreshAt` 仍在 30s 窗口内 → canRetry 为 false,
+// 直接 _tearDownWsAuth,refresh 明明成功却被踢登录。
+//
+// 补丁:加 module-level 闸门,silent refresh 进行中所有 connect 入口都等它结束。
+let _wsAuthRefreshInFlight = false
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
 
 // 2026-04-21 安全审计 Medium#F2:`ws.send()` 在 readyState === OPEN 时永不报错,
@@ -679,6 +697,10 @@ export function notifyNetworkOnline() {
   // idempotent for truly duplicate events.
   _isBrowserOnline = true
   if (!state.token) return
+  // 等待 WS silent-refresh 完成 —— 在它收尾时自己会 call connect()。此处跳过
+  // 避免 race:否则会用旧 expired state.token 插队新 WS(见 _wsAuthRefreshInFlight
+  // 声明处的注释)。
+  if (_wsAuthRefreshInFlight) return
   _reconnectAttempts = 0
   if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
   if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
@@ -696,6 +718,8 @@ export function notifyNetworkOnline() {
 export function notifyTabVisible() {
   if (!state.token) return
   if (!_isBrowserOnline) return
+  // 同 notifyNetworkOnline:silent refresh 进行中别插队。
+  if (_wsAuthRefreshInFlight) return
   if (state.ws && state.ws.readyState < 2) return
   const now = Date.now()
   if (now - _lastVisibilityReconnectAt < VISIBILITY_RECONNECT_COOLDOWN_MS) return
@@ -705,8 +729,34 @@ export function notifyTabVisible() {
   connect()
 }
 
+// 1008 分支的兜底:silentRefresh 不可用(cookie 被浏览器清了 / 后端拒绝 / 超过
+// 重试窗口)时走原 hard-logout 路径 —— 清掉本地 token、toast 提示、showLogin。
+// 不 call /api/auth/logout:我们根本没拿到有效 refresh cookie,server 那边无 row
+// 可 revoke;反过来让 _forceLogout 的用户主动 logout 保留唯一 server-side 吊销入口。
+function _tearDownWsAuth() {
+  // 2026-04-22 Codex R3:先 abort 再清 state。同 _forceLogout 的双层防护模型。
+  abortInflightRefresh()
+  localStorage.removeItem('openclaude_token')
+  localStorage.removeItem('openclaude_access_token')
+  localStorage.removeItem('openclaude_refresh_token')
+  localStorage.removeItem('openclaude_access_exp')
+  state.token = ''
+  state.refreshToken = ''
+  state.tokenExp = 0
+  // bump authEpoch —— WS 1008 + silentRefresh 失败这条路径也是身份变更点
+  // (从"可能有效"变为"确认无效"),任何正在跑的 _doRefreshOnce 或其他路径
+  // 在它们 commit 前都应放弃。主 _forceLogout 在 main.js,这里独立 bump 避免
+  // 交叉依赖。
+  state.authEpoch = (state.authEpoch || 0) + 1
+  toast('Token 无效或已过期，请重新登录', 'error')
+  _deps.showLogin()
+}
+
 export function connect() {
   if (!state.token) return  // No token (logged out) — don't connect
+  // Silent refresh 进行中:不允许用当前(可能已过期的)state.token 起新 WS。
+  // IIFE 完成后会自己 call connect(),那次才是合法的。
+  if (_wsAuthRefreshInFlight) return
   if (state.ws && state.ws.readyState < 2) return
   // If the browser reports offline, don't attempt — the `online` handler
   // (notifyNetworkOnline) will call connect() when network comes back.
@@ -848,15 +898,54 @@ export function connect() {
     updateSendEnabled()
     hideTypingIndicator()
     if (e.code === 1008) {
-      localStorage.removeItem('openclaude_token')
-      localStorage.removeItem('openclaude_access_token')
-      localStorage.removeItem('openclaude_refresh_token')
-      localStorage.removeItem('openclaude_access_exp')
-      state.token = ''
-      state.refreshToken = ''
-      state.tokenExp = 0
-      toast('Token 无效或已过期，请重新登录', 'error')
-      _deps.showLogin()
+      // 最常见成因:WS 握手用的 state.token(= access JWT)已过期 —— 切后台>15min
+      // 回来首次 reconnect 会中招。refresh cookie(30 天)通常还在,先 silentRefresh
+      // 拿新 access 再 reconnect,别把 30 天会话当 15 分钟会话打死。
+      //
+      // 限流:同一 WS 实例最多尝试 1 次(_authRefreshTried),外加全局 30s 窗口
+      // (_lastWsAuthRefreshAt)防止"refresh 成功 → 新连接又 1008(比如 per-user
+      // 3-conn 上限 / preCheck 拒绝)→ 再 refresh"的尖峰循环。兜不住的(无
+      // cookie / refresh 失败 / 重连后 server 再 1008)最终回落到原 showLogin 路径。
+      const now = Date.now()
+      const canRetry = state.token
+        && !ws._authRefreshTried
+        && (now - _lastWsAuthRefreshAt) > WS_AUTH_REFRESH_MIN_GAP_MS
+      if (canRetry) {
+        ws._authRefreshTried = true
+        _lastWsAuthRefreshAt = now
+        _wsAuthRefreshInFlight = true
+        // 2026-04-22 Codex R2:capture authEpoch 在启动 refresh 之前。async
+        // 期间用户若 _forceLogout / 登别的账号 / 其他路径已 _tearDownWsAuth
+        // (三处都 bump epoch),这次 IIFE 的结果再操作 WS 就是 "帮上一个身份
+        // 续连" —— 既可能把 logout 撤掉,也可能给新账号建错误的 WS。epoch
+        // 一变就全盘放弃:不 connect(),也不 tearDown(teardown 已由 bump
+        // 者或其他路径负责)。
+        const epochAtStart = state.authEpoch || 0
+        setStatus('会话续期中…', 'connecting')
+        ;(async () => {
+          let ok = false
+          try {
+            ok = await silentRefresh().catch(() => false)
+          } finally {
+            _wsAuthRefreshInFlight = false
+          }
+          // Epoch 变了 → 当前身份已不是启动 refresh 时的那个,直接撤退。
+          // teardown 的路径(_forceLogout / 并发 _tearDownWsAuth)已经或
+          // 即将清完 state,我们再动手只会干扰。
+          if ((state.authEpoch || 0) !== epochAtStart) return
+          // 期间可能被 _forceLogout 等清了 state.token → 视为失败,交给 showLogin。
+          // 或在 async 期间用户登了别的账号(state.ws 换成了一个 CONNECTING/OPEN
+          // 的新 socket)→ 这种情况由 connect() 自己的 readyState 守卫拦截,
+          // 我们无脑 call connect() 也不会产生重复 WS。
+          if (ok && state.token) {
+            connect()
+          } else {
+            _tearDownWsAuth()
+          }
+        })()
+        return
+      }
+      _tearDownWsAuth()
       return
     }
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
