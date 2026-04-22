@@ -127,6 +127,7 @@ function getCurrentAgentModel() {
 let menuEventsBound = false
 let outsideClickListener = null
 let keydownListener = null
+let reflowListener = null
 
 function getTrigger() {
   return $('effort-trigger')
@@ -140,21 +141,47 @@ function isMenuOpen() {
   return !!m && !m.hidden
 }
 
+/** 基于 trigger 的 viewport 坐标把菜单摆好。
+ *
+ *  用 position: fixed 是为了逃离 .composer-inner 的 overflow:hidden —— 该父元素
+ *  为了让 textarea 尊重圆角裁剪得很严,导致默认 position: absolute 的菜单
+ *  (bottom: calc(100% + 6px)) 从上方弹出时整个被切掉。mobile 上 composer 更贴
+ *  视口底,裁剪最明显,表现就是"弹不出来"。fixed 定位后内联 top/bottom/left/right
+ *  会覆盖 CSS 里的 absolute 坐标。 */
+function positionMenu() {
+  const trigger = getTrigger()
+  const menu = getMenu()
+  if (!trigger || !menu) return
+  const rect = trigger.getBoundingClientRect()
+  menu.style.position = 'fixed'
+  // 菜单 bottom 边对齐到 trigger top 上方 6px(用 viewport 坐标)
+  menu.style.bottom = `${Math.max(0, window.innerHeight - rect.top + 6)}px`
+  // 菜单左对齐 trigger,但不超出视口右缘(min-width 220px,预留 8px 边距)
+  const menuMinWidth = 220
+  const maxLeft = Math.max(8, window.innerWidth - menuMinWidth - 8)
+  menu.style.left = `${Math.min(rect.left, maxLeft)}px`
+  menu.style.right = 'auto'
+  menu.style.top = 'auto'
+}
+
 function openMenu(focusFirst = false) {
   const trigger = getTrigger()
   const menu = getMenu()
   if (!trigger || !menu) return
+  positionMenu()
   menu.hidden = false
   trigger.setAttribute('aria-expanded', 'true')
-  // 聚焦:优先选中项,否则第一项 / 最后一项
+  // roving tabindex:标记选中项(或首项)为可 tab,其余 -1。
   const items = Array.from(menu.querySelectorAll('[role="option"]'))
-  if (items.length === 0) return
-  const current = getCurrentEffort() ?? ''
-  let target = items.find((el) => el.dataset.effort === current)
-  if (!target) target = focusFirst ? items[0] : items[0]
-  // roving tabindex
-  for (const it of items) it.setAttribute('tabindex', it === target ? '0' : '-1')
-  target.focus()
+  if (items.length > 0) {
+    const current = getCurrentEffort() ?? ''
+    const target = items.find((el) => el.dataset.effort === current) || items[0]
+    for (const it of items) it.setAttribute('tabindex', it === target ? '0' : '-1')
+    // 只在键盘触发(focusFirst=true)时主动 .focus(),避免 mobile tap 触发
+    // 程序性 focus 引起的滚动跳动 / 虚拟键盘弹出(按钮获取 focus 不会唤键盘,但
+    // 有些 mobile 浏览器仍会 scrollIntoView)。鼠标/触摸打开时保持 trigger focus。
+    if (focusFirst) target.focus()
+  }
   attachGlobalListeners()
 }
 
@@ -186,10 +213,22 @@ function attachGlobalListeners() {
       closeMenu(false)
     }
   }
+  // position: fixed 下窗口 resize / scroll / viewport 变化时(移动端虚拟键盘、
+  // 浏览器 URL 栏伸缩)要重新计算坐标,否则菜单会偏离 trigger。用 rAF 节流。
+  let rafId = 0
+  reflowListener = () => {
+    if (rafId) return
+    rafId = requestAnimationFrame(() => {
+      rafId = 0
+      if (isMenuOpen()) positionMenu()
+    })
+  }
   // pointerdown + capture=true:覆盖 mouse / touch / pen 三类指针设备
   // (mousedown 会漏掉部分移动浏览器对触摸的行为)。外部点击时关菜单。
   document.addEventListener('pointerdown', outsideClickListener, true)
   document.addEventListener('keydown', keydownListener, true)
+  window.addEventListener('resize', reflowListener)
+  window.addEventListener('scroll', reflowListener, true)
 }
 
 function detachGlobalListeners() {
@@ -200,6 +239,11 @@ function detachGlobalListeners() {
   if (keydownListener) {
     document.removeEventListener('keydown', keydownListener, true)
     keydownListener = null
+  }
+  if (reflowListener) {
+    window.removeEventListener('resize', reflowListener)
+    window.removeEventListener('scroll', reflowListener, true)
+    reflowListener = null
   }
 }
 
