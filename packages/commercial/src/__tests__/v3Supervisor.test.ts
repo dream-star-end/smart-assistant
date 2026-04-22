@@ -21,9 +21,10 @@
 import { describe, test, beforeEach, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join as pathJoin } from "node:path";
+import { dirname, join as pathJoin } from "node:path";
+import { fileURLToPath } from "node:url";
 import type Docker from "dockerode";
 import type { Pool, PoolClient } from "pg";
 
@@ -35,6 +36,7 @@ import {
   v3VolumeNameFor,
   v3ProjectsVolumeNameFor,
   resolveCcbBaselineMounts,
+  V3_CCB_BASELINE_SKILL_NAMES,
   V3_NETWORK_NAME,
   V3_INTERNAL_PROXY_URL,
   V3_CONTAINER_PORT,
@@ -1170,17 +1172,28 @@ describe("preheatV3Image (3I)", () => {
  * 权限(644/755,group/other 不可写)。owner 一般就是进程自己(test 跑在 root 下
  * 则是 root;普通用户跑则是 uid≠0 会被 assertBaselineLeaf 拒 —— 所以这类测试
  * 只在 root 下跑才能全绿)。如果不是 root,返回 null(跳过该分支测试)。
+ *
+ * 注入全部 `V3_CCB_BASELINE_SKILL_NAMES` 里的 skill(system-info + 其它 4 个),
+ * 所有 SKILL.md 都写;`withAllSkillMd=false` 时故意漏第一条 skill 的 SKILL.md,
+ * 用来覆盖"一条 skill 缺 SKILL.md → 整个 resolve 返 null"分支(fail-all)。
  */
-function makeFakeBaseline(withSkillMd = true): { dir: string; cleanup: () => void } | null {
+function makeFakeBaseline(withAllSkillMd = true): { dir: string; cleanup: () => void } | null {
   if (typeof process.getuid !== "function" || process.getuid() !== 0) {
     return null;
   }
   const dir = mkdtempSync(pathJoin(tmpdir(), "ccb-baseline-test-"));
   writeFileSync(pathJoin(dir, "CLAUDE.md"), "# test baseline\n", { mode: 0o644 });
   mkdirSync(pathJoin(dir, "skills"), { mode: 0o755 });
-  mkdirSync(pathJoin(dir, "skills", "system-info"), { mode: 0o755 });
-  if (withSkillMd) {
-    writeFileSync(pathJoin(dir, "skills", "system-info", "SKILL.md"), "# system-info\n", { mode: 0o644 });
+  for (const [idx, name] of V3_CCB_BASELINE_SKILL_NAMES.entries()) {
+    mkdirSync(pathJoin(dir, "skills", name), { mode: 0o755 });
+    // withAllSkillMd=false 时故意漏第一条 skill 的 SKILL.md,触发 fail-closed
+    if (withAllSkillMd || idx !== 0) {
+      writeFileSync(
+        pathJoin(dir, "skills", name, "SKILL.md"),
+        `# ${name}\n`,
+        { mode: 0o644 },
+      );
+    }
   }
   chmodSync(dir, 0o755);
   return {
@@ -1190,6 +1203,42 @@ function makeFakeBaseline(withSkillMd = true): { dir: string; cleanup: () => voi
 }
 
 describe("resolveCcbBaselineMounts", () => {
+  // R3 codex HIGH#2 防回归:PR3 加基线 skill 时,新目录必须真的存在于仓库里
+  // (不是只 manifest 数组加了名字,但 ccb-baseline/skills/<name>/ 目录漏 git-track)。
+  // 这个 test 不依赖 root,只检查仓库 checkout 下 manifest 里每条 skill 的
+  // `<name>/SKILL.md` 文件是否在。如果漏带,deploy 后生产每次 provision 都会
+  // fail-closed,这个 test 先在 CI / 本地 bun test 就把问题拦下。
+  test("shipped ccb-baseline has every manifest skill tracked in repo", () => {
+    // 从 test 文件位置反查 baseline 源:
+    // packages/commercial/src/__tests__/v3Supervisor.test.ts
+    //   ↑2 → packages/commercial/
+    //   → agent-sandbox/ccb-baseline/
+    const here = dirname(fileURLToPath(import.meta.url));
+    const baselineDir = pathJoin(here, "..", "..", "agent-sandbox", "ccb-baseline");
+    assert.ok(
+      existsSync(pathJoin(baselineDir, "CLAUDE.md")),
+      `shipped baseline CLAUDE.md missing at ${baselineDir}`,
+    );
+    const skillsDir = pathJoin(baselineDir, "skills");
+    assert.ok(
+      statSync(skillsDir).isDirectory(),
+      `shipped baseline skills/ is not a directory at ${skillsDir}`,
+    );
+    // 仓库里 skills/ 的顶层条目 === manifest
+    const shipped = new Set(readdirSync(skillsDir));
+    const declared = new Set<string>(V3_CCB_BASELINE_SKILL_NAMES);
+    assert.deepEqual(
+      [...shipped].sort(),
+      [...declared].sort(),
+      `shipped skills/ (${[...shipped].join(",")}) ≠ manifest (${[...declared].join(",")})`,
+    );
+    // 每条 skill 都必须带 SKILL.md
+    for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
+      const mdPath = pathJoin(skillsDir, name, "SKILL.md");
+      assert.ok(existsSync(mdPath), `shipped baseline missing ${name}/SKILL.md at ${mdPath}`);
+    }
+  });
+
   test("rejects empty / non-string", () => {
     assert.equal(resolveCcbBaselineMounts(""), null);
     assert.equal(resolveCcbBaselineMounts("   "), null);
@@ -1211,14 +1260,14 @@ describe("resolveCcbBaselineMounts", () => {
     assert.equal(resolveCcbBaselineMounts("/definitely/does/not/exist/baseline"), null);
   });
 
-  test("(root only) happy path returns both realpaths", () => {
+  test("(root only) happy path returns CLAUDE.md + skills/ realpaths", () => {
     const b = makeFakeBaseline();
     if (!b) return; // 非 root 跳过
     try {
       const got = resolveCcbBaselineMounts(b.dir);
       assert.ok(got, "expected non-null result");
       assert.equal(got!.claudeMdHostPath, pathJoin(b.dir, "CLAUDE.md"));
-      assert.equal(got!.systemInfoHostPath, pathJoin(b.dir, "skills", "system-info"));
+      assert.equal(got!.skillsDirHostPath, pathJoin(b.dir, "skills"));
     } finally {
       b.cleanup();
     }
@@ -1235,10 +1284,45 @@ describe("resolveCcbBaselineMounts", () => {
     }
   });
 
-  test("(root only) rejects missing SKILL.md", () => {
-    const b = makeFakeBaseline(false); // SKILL.md 不写
+  test("(root only) rejects if any one baseline skill SKILL.md is missing (fail-all)", () => {
+    const b = makeFakeBaseline(false); // 故意漏第一条 skill 的 SKILL.md
     if (!b) return;
     try {
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects if any one baseline skill has group/other writable SKILL.md", () => {
+    // parent-dir 挂载下,一条 skill 文件权限失守 = 整个 skills/ 挂进容器就暴露,
+    // 所以逐条校验 owner + mode 必须覆盖每一条 SKILL.md,不能因为 skills/ 父目录
+    // 本身 755+root 就给后代开放过。这里改随便一条基线 skill 的 SKILL.md 权限,
+    // 期望整个 resolve 返 null。
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      // 选中间一条(非 system-info)以证明不是只看第一条
+      const target = V3_CCB_BASELINE_SKILL_NAMES[1]!;
+      chmodSync(pathJoin(b.dir, "skills", target, "SKILL.md"), 0o664);
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects if any one baseline skill dir is a symlink", () => {
+    // 把某条 skill 的目录换成指向另一个目录的 symlink,校验应当拒绝
+    // (防 symlink 逃逸把宿主敏感目录的 SKILL.md 暴露进容器)
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[2]!;
+      const real = pathJoin(b.dir, `__real_${target}`);
+      mkdirSync(real, { mode: 0o755 });
+      writeFileSync(pathJoin(real, "SKILL.md"), "# x\n", { mode: 0o644 });
+      rmSync(pathJoin(b.dir, "skills", target), { recursive: true });
+      symlinkSync(real, pathJoin(b.dir, "skills", target));
       assert.equal(resolveCcbBaselineMounts(b.dir), null);
     } finally {
       b.cleanup();
@@ -1309,6 +1393,102 @@ describe("resolveCcbBaselineMounts", () => {
       b.cleanup();
     }
   });
+
+  // R3 codex HIGH#1 — parent-dir 挂载的额外校验面
+  // 以下几条 test 覆盖:"每条 manifest skill 都合规,但 skills/ 下多了未声明的条目 /
+  // 某条 skill 目录下多了 SKILL.md 之外的内容 / SKILL.md 是 symlink"。旧逻辑(仅
+  // 按 manifest 逐条 lstat)放过;新逻辑(readdir 白名单 + 严格 `["SKILL.md"]`)
+  // 必须拒绝,否则 parent-dir ro 挂进容器就暴露未校验内容。
+
+  test("(root only) rejects undeclared extra subdirectory under skills/", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      // 伪造一条 rsync 漏 --delete 留下的残余 skill
+      mkdirSync(pathJoin(b.dir, "skills", "__unknown_extra"), { mode: 0o755 });
+      writeFileSync(
+        pathJoin(b.dir, "skills", "__unknown_extra", "SKILL.md"),
+        "# leaked\n",
+        { mode: 0o644 },
+      );
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects undeclared extra file under skills/", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      // 手工误放的临时文件也拒
+      writeFileSync(pathJoin(b.dir, "skills", "README.md"), "# stray\n", { mode: 0o644 });
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects if a skill dir contains an extra file beyond SKILL.md", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[0]!;
+      writeFileSync(
+        pathJoin(b.dir, "skills", target, "notes.txt"),
+        "stuff\n",
+        { mode: 0o644 },
+      );
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects if a skill dir contains a subdirectory", () => {
+    // 未来要支持 scripts/ references/,必须显式改 manifest 校验代码扩白名单,
+    // 默认一律拒 —— parent-dir 挂载时 subdir 无论权限如何都会暴露进容器。
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[3]!;
+      mkdirSync(pathJoin(b.dir, "skills", target, "scripts"), { mode: 0o755 });
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects if SKILL.md itself is a symlink", () => {
+    // SKILL.md symlink 到宿主敏感文件,parent-dir 挂载会把 symlink 暴露进容器
+    // (容器里 readlink → 宿主文件)。assertBaselineLeaf 本来就 reject symlink,
+    // 这条 test 做防回归。
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[0]!;
+      const mdPath = pathJoin(b.dir, "skills", target, "SKILL.md");
+      rmSync(mdPath);
+      symlinkSync("/etc/hostname", mdPath);
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects if a manifest skill dir is group-writable", () => {
+    // skills/ 父目录合规,但某条 skill 自身 mode 宽松 —— 仍然拒
+    // (assertBaselineLeaf 对每条 skill 目录 owner + mode 都锁)
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[1]!;
+      chmodSync(pathJoin(b.dir, "skills", target), 0o775); // group-write
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
 });
 
 describe("provisionV3Container — CCB baseline 挂载分支", () => {
@@ -1373,7 +1553,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
     ]);
   });
 
-  test("(root only) baseline 齐全 → 4 条 Binds(2 volume + 2 ro)", async () => {
+  test("(root only) baseline 齐全 → 4 条 Binds(2 volume + CLAUDE.md + skills 父目录)", async () => {
     const b = makeFakeBaseline();
     if (!b) return; // 非 root 跳过
     try {
@@ -1394,7 +1574,9 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
         `oc-v3-data-u125:${V3_VOLUME_MOUNT}:rw`,
         `oc-v3-proj-u125:${V3_PROJECTS_MOUNT}:rw`,
         `${pathJoin(b.dir, "CLAUDE.md")}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
-        `${pathJoin(b.dir, "skills", "system-info")}:${V3_CONFIG_TMPFS_PATH}/skills/system-info:ro`,
+        // 挂 skills/ 整目录;父目录 ro 一次性覆盖所有基线 skill,
+        // 新增基线 skill 不改这里,只加一条 V3_CCB_BASELINE_SKILL_NAMES 即可。
+        `${pathJoin(b.dir, "skills")}:${V3_CONFIG_TMPFS_PATH}/skills:ro`,
       ]);
     } finally {
       b.cleanup();

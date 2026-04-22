@@ -475,7 +475,7 @@ export async function registerCommercial(
         console.log("[commercial] v3 ccb baseline ready", {
           baselineDir,
           claudeMd: resolved.claudeMdHostPath,
-          systemInfoDir: resolved.systemInfoHostPath,
+          skillsDir: resolved.skillsDirHostPath,
           optional: optionalFlagOn,
         });
       } else if (optionalFlagOn) {

@@ -50,7 +50,7 @@
 
 import type Docker from "dockerode";
 import { randomBytes, createHash } from "node:crypto";
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
 import type { Pool, PoolClient } from "pg";
 import { SupervisorError } from "./types.js";
@@ -102,14 +102,26 @@ const V3_AGENT_USER = "1000:1000";
 
 /**
  * CCB 平台基线目录的**默认**宿主路径(只读挂入容器 /run/oc/claude-config/ 的
- * CLAUDE.md 和 skills/system-info/)。
+ * CLAUDE.md + skills/ 整目录)。
  *
- * 用途:向容器内 Claude Code 子进程注入平台身份/守则/能力边界 —— 容器内任何
- * 进程(包括 AI 自己)都无法修改,走 kernel ro bind mount 兜底。
+ * 用途:向容器内 Claude Code 子进程注入平台身份/守则/能力边界 + 基线 skills ——
+ * 容器内任何进程(包括 AI 自己)都无法修改,走 kernel ro bind mount 兜底。
  *
  * 目录结构(repo 内 `packages/commercial/agent-sandbox/ccb-baseline/` 完整 rsync 上去):
  *   <baseline>/CLAUDE.md                     → /run/oc/claude-config/CLAUDE.md:ro
- *   <baseline>/skills/system-info/SKILL.md   → /run/oc/claude-config/skills/system-info:ro
+ *   <baseline>/skills/                       → /run/oc/claude-config/skills:ro   (整目录)
+ *       ├── system-info/SKILL.md
+ *       ├── memory-management/SKILL.md
+ *       ├── platform-capabilities/SKILL.md
+ *       ├── scheduled-tasks/SKILL.md
+ *       └── skill-management/SKILL.md
+ *
+ * 挂整个 skills/ 父目录(而不是逐 skill ro bind)好处:
+ *   1. 新增基线 skill 只改 manifest 一行 + 新加目录,不动 docker 挂载代码
+ *   2. 挂载数量恒定(2 条),不随 skill 数膨胀
+ *   3. 并发安全:同一次 provision 里所有基线 skill 原子可见(而不是半挂状态)
+ * 代价:容器内用户暂时无法再往 /run/oc/claude-config/skills/ 写用户自建 skill;
+ * 这个能力由 PR4 的 SkillStore 合并路径(/home/agent/.claude/skills 可写 + /run/oc 只读基线)恢复。
  *
  * 覆盖优先级(高→低):
  *   1. V3SupervisorDeps.ccbBaselineDir(测试注入 / 多机部署)
@@ -129,8 +141,28 @@ export const DEFAULT_V3_CCB_BASELINE_DIR =
 /** baseline 内部结构 —— 用 POSIX 绝对路径拼 docker Bind */
 export const V3_CCB_BASELINE_CLAUDE_MD_REL = "CLAUDE.md";
 export const V3_CCB_BASELINE_SKILLS_DIR_REL = "skills";
-export const V3_CCB_BASELINE_SYSTEM_INFO_REL = "skills/system-info";
-export const V3_CCB_BASELINE_SYSTEM_INFO_SKILL_MD_REL = "skills/system-info/SKILL.md";
+
+/**
+ * 基线 skill 清单 —— 每一项都是 `<baseline>/skills/<name>/SKILL.md` 的子目录名。
+ *
+ * 新增 / 下线一条基线 skill:
+ *   1. 改这个数组(新增 name 或删除过期 name)
+ *   2. 在 `packages/commercial/agent-sandbox/ccb-baseline/skills/<name>/SKILL.md` 增删文件
+ *   3. 如守则引用该路径,更新 `CLAUDE.md` / `skills/system-info/SKILL.md` 文案
+ *
+ * 校验意义:resolveCcbBaselineMounts 会为每条 name 强制 lstat + owner=root + mode + realpath,
+ * 只要有一条不合规(缺 SKILL.md / group-writable / symlink 逃逸),整个 provision 走 fail-closed。
+ * 这样基线永远是一个"全有或全无"的集合,避免 AI 只能看到部分 skill 的撕裂状态。
+ *
+ * 顺序无关;读来只是用来 iterate 校验,不影响运行时。
+ */
+export const V3_CCB_BASELINE_SKILL_NAMES = [
+  "system-info",
+  "memory-management",
+  "platform-capabilities",
+  "scheduled-tasks",
+  "skill-management",
+] as const;
 
 /**
  * 读 env `OC_V3_CCB_BASELINE_DIR`;为空或空字符串 → 回落默认路径。
@@ -201,19 +233,31 @@ function assertBaselineLeaf(
  * 严格校验(按顺序):
  *   1. 输入是非空字符串
  *   2. 输入是绝对路径(path.normalize 后与 path.resolve 结果相等,允许尾斜杠)
- *   3. baseline root、`CLAUDE.md`、`skills/system-info`、`skills/system-info/SKILL.md`
- *      每个叶子都:非 symlink、类型正确、root owned、非 group/other writable
- *   4. 所有 realpath 都在 baseline root 内
+ *   3. baseline root、`CLAUDE.md`、`skills/`,以及 `V3_CCB_BASELINE_SKILL_NAMES`
+ *      里每一条 skill 目录都:非 symlink、类型正确、root owned、非 group/other writable
+ *   4. `skills/` 下的顶层条目**必须完全等于** manifest(多余的 / 未声明的条目直接拒)
+ *   5. 每条 skill 目录下**必须只有** `SKILL.md` 一个文件,不允许 subdir / 其它文件 / symlink
+ *   6. 所有 realpath 都在 baseline root 内
  *
  * 任一项失败返回 null;调用方(provisionV3Container)按 OC_V3_CCB_BASELINE_OPTIONAL
  * 决定是 fail-closed 抛错还是 fail-open warn。
  *
  * 返回的路径是 **realpathSync 后**的,即使 baseline 目录结构本身经过软链(如部署软链
  * /opt/current/baseline → /opt/releases/xxx/baseline),docker Bind 也吃到真实路径。
+ *
+ * **为什么同时查 readdir**(R3 codex HIGH#1):
+ *   我们挂的是 `skills/` 父目录整棵树 ro,manifest 逐条校验只看到"声明过的那几条",
+ *   未声明的条目(运维 rsync 漏带 `--delete` 的残余目录、手工误放的临时文件、
+ *   被攻击者替换成 symlink 的"看起来不像 skill 但父目录挂进去就暴露"的项)都会跟着
+ *   父目录一起进容器。必须额外用 `readdirSync` 断言 `skills/` 和每条 skill 目录下
+ *   的条目**恰好等于** manifest / `["SKILL.md"]`,否则拒。
+ *
+ *   这样基线的"全有或全无"语义就严格成立 ——
+ *   skills/ 下看见的 ≡ manifest 声明的 ≡ 每条都 root owned + mode safe + SKILL.md 合规。
  */
 export function resolveCcbBaselineMounts(
   baselineDir: string,
-): { claudeMdHostPath: string; systemInfoHostPath: string } | null {
+): { claudeMdHostPath: string; skillsDirHostPath: string } | null {
   if (typeof baselineDir !== "string" || baselineDir.trim() === "") return null;
   // 必须绝对路径;path.normalize 吞掉尾斜杠、多余 `/` 等等价写法。
   if (!pathIsAbsolute(baselineDir)) return null;
@@ -221,22 +265,59 @@ export function resolveCcbBaselineMounts(
   try {
     // 每一级目录 / 文件都必须通过相同的 lstat + owner + mode + realpath 校验。
     // **包含中间目录 `skills/`**:R2 codex 发现如果 skills/ 可写,攻击者可在
-    // resolve 通过后、docker createContainer 调度前替换 system-info 路径,造成
+    // resolve 通过后、docker createContainer 调度前替换 skill 内容,造成
     // TOCTOU。堵 skills/ 这层校验后,非 root 用户无法改动该链路上的任何一环。
     assertBaselineLeaf(abs, "dir", abs);
     const claudeMdPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_MD_REL);
     const skillsDirPath = pathJoin(abs, V3_CCB_BASELINE_SKILLS_DIR_REL);
-    const systemInfoPath = pathJoin(abs, V3_CCB_BASELINE_SYSTEM_INFO_REL);
-    const systemInfoSkillMdPath = pathJoin(abs, V3_CCB_BASELINE_SYSTEM_INFO_SKILL_MD_REL);
     const claudeReal = assertBaselineLeaf(claudeMdPath, "file", abs);
     // 中间目录 skills/ 必须和根一样被锁死(root owned + 非可写 + 非 symlink)
-    assertBaselineLeaf(skillsDirPath, "dir", abs);
-    const systemInfoReal = assertBaselineLeaf(systemInfoPath, "dir", abs);
-    // SKILL.md 必须存在(不挂这个文件,但缺了 skill loader 不生效,基线就失效了)
-    assertBaselineLeaf(systemInfoSkillMdPath, "file", abs);
+    const skillsDirReal = assertBaselineLeaf(skillsDirPath, "dir", abs);
+
+    // R3 codex HIGH#1:父目录挂 ro → readdir 断言 skills/ 下看到的顶层条目集合
+    // 恰好 ≡ manifest 集合(未声明的条目一律拒,不管类型是什么)。
+    const manifestSet = new Set<string>(V3_CCB_BASELINE_SKILL_NAMES);
+    const actualTop = new Set(readdirSync(skillsDirPath));
+    if (actualTop.size !== manifestSet.size) {
+      throw new Error(
+        `skills/ has ${actualTop.size} top-level entries, manifest declares ${manifestSet.size}`,
+      );
+    }
+    for (const name of actualTop) {
+      if (!manifestSet.has(name)) {
+        throw new Error(`skills/ has undeclared top-level entry: ${name}`);
+      }
+    }
+    // (manifest 反向包含也要查一次 —— 否则 actualTop 漏了 manifest 某条,上面 size
+    // 相等的分支不会 catch 到;其实下面 for name of manifest 的 lstat 会 ENOENT,
+    // 但显式查一次意图更清晰、错误信息更好。)
+    for (const name of manifestSet) {
+      if (!actualTop.has(name)) {
+        throw new Error(`skills/ missing declared manifest entry: ${name}`);
+      }
+    }
+
+    // manifest 逐条校验:基线 skill 必须全部存在、每条 owner=root、
+    // SKILL.md 齐全 —— parent-dir 挂载会把"全部 skill 一次性 ro 给 AI",
+    // 所以校验也必须覆盖全部,否则 `skills/foo` 可能被运维误塞成 group-writable
+    // / symlink 成某宿主敏感目录,从父目录挂进容器就暴露了。
+    for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
+      const skillDir = pathJoin(skillsDirPath, name);
+      assertBaselineLeaf(skillDir, "dir", abs);
+      // R3 codex HIGH#1:skill 目录下**必须只有** SKILL.md。未来如果需要支持
+      // scripts/ references/ 等,要显式扩这条白名单,并把新条目加入 lstat 校验闭环。
+      const skillEntries = readdirSync(skillDir);
+      if (skillEntries.length !== 1 || skillEntries[0] !== "SKILL.md") {
+        throw new Error(
+          `skill dir ${name} must contain exactly one entry (SKILL.md), got: ${JSON.stringify(skillEntries)}`,
+        );
+      }
+      const skillMd = pathJoin(skillDir, "SKILL.md");
+      assertBaselineLeaf(skillMd, "file", abs);
+    }
     return {
       claudeMdHostPath: claudeReal,
-      systemInfoHostPath: systemInfoReal,
+      skillsDirHostPath: skillsDirReal,
     };
   } catch {
     // ENOENT / EACCES / 校验失败全走 fail-closed 路径(调用方处理)
@@ -381,8 +462,10 @@ export interface V3SupervisorDeps {
   maxRunningContainers?: number;
   /**
    * CCB 平台基线目录。覆盖 env `OC_V3_CCB_BASELINE_DIR`,env 不设则走
-   * `DEFAULT_V3_CCB_BASELINE_DIR`。目录不存在或结构不全 → provision 时 warn
-   * 并跳过基线挂载(fail-open,不阻断用户服务)。
+   * `DEFAULT_V3_CCB_BASELINE_DIR`。目录不存在或结构不全 → **默认 fail-closed**,
+   * provision 抛 `SupervisorError("CcbBaselineMissing")`,用户启动失败,运维
+   * 修好基线才能恢复。显式开 `OC_V3_CCB_BASELINE_OPTIONAL=1` 才走 warn+跳过挂载
+   * 的降级路径(仅限 dev/test/local)。
    *
    * 详见 `DEFAULT_V3_CCB_BASELINE_DIR` / `resolveCcbBaselineMounts` 注释。
    */
@@ -785,9 +868,10 @@ export async function provisionV3Container(
     // 显式降级:env `OC_V3_CCB_BASELINE_OPTIONAL=1` (或 "true"/"yes") → warn 并跳过
     // 挂载,容器照常启动。仅 dev/test/local 用,生产禁止设置。
     //
-    // 基线齐全 → 在 Binds 上追加两条 :ro 项(单文件 + 单目录,分别覆盖 tmpfs 内的
-    // CLAUDE.md 和 skills/system-info)。docker daemon 会按挂载点深度排序,tmpfs
-    // 先于 bind 挂上,然后 ro bind 叠加,顺序正确无需我们干预。
+    // 基线齐全 → 在 Binds 上追加两条 :ro 项(单文件 CLAUDE.md + 整目录 skills/,
+    // 后者覆盖 tmpfs 内 /run/oc/claude-config/skills 整个子树)。docker daemon
+    // 会按挂载点深度排序,tmpfs 先于 bind 挂上,然后 ro bind 叠加,顺序正确无需
+    // 我们干预。
     const baselineDir = deps.ccbBaselineDir ?? readCcbBaselineDirFromEnv();
     const baselineMounts = resolveCcbBaselineMounts(baselineDir);
     const baselineOptional = readCcbBaselineOptionalFromEnv();
@@ -818,7 +902,15 @@ export async function provisionV3Container(
     if (baselineMounts) {
       binds.push(
         `${baselineMounts.claudeMdHostPath}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
-        `${baselineMounts.systemInfoHostPath}:${V3_CONFIG_TMPFS_PATH}/skills/system-info:ro`,
+        // 挂 skills/ 整目录,一次性覆盖所有基线 skill(system-info /
+        // memory-management / platform-capabilities / scheduled-tasks /
+        // skill-management)。新增基线 skill 不再改这里,改
+        // V3_CCB_BASELINE_SKILL_NAMES manifest 即可。
+        //
+        // 代价:用户无法再往 /run/oc/claude-config/skills/ 写自建 skill;这条
+        // 路径由 PR4(SkillStore system+user 合并读 + safeReadFile 参数化 root)
+        // 迁到 /home/agent/.claude/skills/ 可写目录恢复。
+        `${baselineMounts.skillsDirHostPath}:${V3_CONFIG_TMPFS_PATH}/skills:ro`,
       );
     }
 
@@ -876,8 +968,8 @@ export async function provisionV3Container(
           // 无需 supervisor 再起 helper 容器 mkdir。
           //
           // 额外两条 :ro bind(若基线齐全):
-          //   - <baseline>/CLAUDE.md              → /run/oc/claude-config/CLAUDE.md:ro
-          //   - <baseline>/skills/system-info     → /run/oc/claude-config/skills/system-info:ro
+          //   - <baseline>/CLAUDE.md  → /run/oc/claude-config/CLAUDE.md:ro
+          //   - <baseline>/skills/    → /run/oc/claude-config/skills:ro(整目录,覆盖所有基线 skill)
           // 内核层强制只读,容器内 ccb 和用户都无法改动平台守则。
           Binds: binds,
           RestartPolicy: { Name: "no", MaximumRetryCount: 0 },

@@ -43,6 +43,7 @@ export {
   preheatV3Image,
   // CCB 平台基线(只读注入容器的身份/守则/自省 skill)
   DEFAULT_V3_CCB_BASELINE_DIR,
+  V3_CCB_BASELINE_SKILL_NAMES,
   resolveCcbBaselineMounts,
   type V3SupervisorDeps,
   type ProvisionedV3Container,
