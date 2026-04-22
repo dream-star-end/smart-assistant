@@ -1259,7 +1259,15 @@
         header.app .who {
           font-size: 12px;
           padding: 5px 10px;
-          max-width: 120px;
+          max-width: 100px;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        header.app .btn-logout {
+          white-space: nowrap;
+          padding: 6px 10px;
+          font-size: 12px;
         }
         .tabs {
           padding: var(--s-3) var(--s-3) 0;
@@ -1314,8 +1322,16 @@
 
       @media (max-width: 480px) {
         .btn, .toolbar .btn { padding: 10px 14px; font-size: 13px; min-height: 44px; }
-        header.app .btn-logout { padding: 8px 12px; font-size: 12px; min-height: 36px; }
-        header.app .theme-toggle { width: 38px; height: 38px; }
+        header.app .btn-logout {
+          padding: 6px 10px;
+          font-size: 11px;
+          min-height: 32px;
+          white-space: nowrap;
+        }
+        header.app .brand { font-size: 14px; }
+        header.app .brand svg { width: 20px; height: 20px; }
+        header.app .who { max-width: 80px; font-size: 11px; }
+        header.app .theme-toggle { width: 34px; height: 34px; }
         /* 触摸目标友好:header 元素保持够大 */
         h2 { font-size: 16px; }
         .form-actions { flex-direction: column-reverse; gap: var(--s-2); }
