@@ -179,11 +179,13 @@ export async function refreshBalance() {
       if (uid) state.userId = uid
     }
     _setAdminLinkVisible(user.role === 'admin')
+    _setHostAgentEntriesVisible(user.role === 'admin')
     return { shown: true, credits: String(credits), role: user.role || null }
   } catch (err) {
     // 个人版无此接口;商用版 401 已被 api.js 处理,此处其它失败一律静默。
     _showPill(false)
     _setAdminLinkVisible(false)
+    _setHostAgentEntriesVisible(false)
     if (_commercialMode === null) _commercialMode = false
     return { shown: false, credits: null, role: null }
   }
@@ -194,6 +196,24 @@ function _setAdminLinkVisible(visible) {
   if (!el) return
   if (visible) el.removeAttribute('hidden')
   else el.setAttribute('hidden', '')
+}
+
+/**
+ * V3 商用版多租户防火墙(PR1)把 /api/agents/* /api/cron /api/tasks /api/memory/*
+ * /api/skills 这些 host-scope 单例端点对 commercial user 403 掉了 —— 普通用户点了
+ * 只会看到 403/404,徒增困惑。所以同步把对应设置菜单入口(人格编辑/管理 Agents/
+ * 记忆/技能/定时任务)默认隐藏,仅 admin 可见(admin 绕过防火墙能正常用)。
+ * 个人版:refreshBalance 404 走 catch 路径保持隐藏,不影响,因为个人版前端
+ * 根本不加载这些 host-scope 单例(它们走 per-session REPL)—— 如果以后需要
+ * 在个人版显示,重写这里把 hidden 属性去掉即可,不走 role 检查。
+ */
+function _setHostAgentEntriesVisible(visible) {
+  for (const id of ['settings-section-agent', 'settings-section-learning']) {
+    const el = document.getElementById(id)
+    if (!el) continue
+    if (visible) el.removeAttribute('hidden')
+    else el.setAttribute('hidden', '')
+  }
 }
 
 // ── Stage 切换 ──────────────────────────────────────────────────────
