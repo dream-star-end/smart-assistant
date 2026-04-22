@@ -1,0 +1,228 @@
+/* ══════════════════════════════════════════════════════════════════
+ *  OpenClaude Design System — Colors, Type, Spacing, Radii, Shadow
+ *  Warm palette inspired by Claude.ai, with 3-way theming.
+ *  Ported from packages/web/public/style.css in openclaude-v3-temp.
+ * ══════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── Typography ── */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", "Microsoft YaHei",
+    "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+  --font-serif: "Source Serif Pro", "Noto Serif SC", ui-serif, Georgia, serif;
+
+  --text-xs: 11px;
+  --text-sm: 12.5px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 30px;
+
+  /* ── Spacing (4px baseline) ── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ── Radii ── */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --radius-2xl: 24px;
+  --radius-full: 9999px;
+
+  /* ── Motion ── */
+  --transition-fast: 120ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-base: 180ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-slow: 280ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ────────── Dark theme (warm, not pure black) — default ────────── */
+[data-theme="dark"], :root {
+  --bg:              #1a1a1d;
+  --bg-elevated:     #212125;
+  --bg-raised:       #2a2a30;
+  --bg-hover:        #31313a;
+  --bg-subtle:       #1e1e22;
+  --bg-inverse:      #faf9f6;
+
+  --border:          #32323a;
+  --border-strong:   #42424c;
+  --border-subtle:   #26262c;
+
+  --fg:              #eceae6;
+  --fg-strong:       #faf9f6;
+  --fg-muted:        #9f9c96;
+  --fg-dim:          #6a6862;
+  --fg-inverse:      #1a1a1d;
+
+  --accent:          #d97757;
+  --accent-hover:    #e48968;
+  --accent-active:   #c56a4a;
+  --accent-soft:     rgba(217, 119, 87, 0.14);
+  --accent-border:   rgba(217, 119, 87, 0.30);
+  --accent-fg:       #ffffff;
+
+  --success:         #86c781;
+  --warning:         #e8b64c;
+  --danger:          #e06c6c;
+  --info:            #7aafe6;
+  --thinking:        #b594ef;
+
+  --code-bg:         #141418;
+  --code-border:     #2c2c33;
+  --user-bubble:     #2a2a30;
+  --assistant-bubble: transparent;
+  --inline-code-bg:  rgba(155, 150, 140, 0.18);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.20);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.30);
+  --shadow-lg: 0 12px 48px rgba(0, 0, 0, 0.45);
+  --shadow-xl: 0 24px 96px rgba(0, 0, 0, 0.60);
+  --ring: 0 0 0 3px rgba(217, 119, 87, 0.25);
+
+  --glass-bg: rgba(26, 26, 29, 0.78);
+  --scrollbar: #32323a;
+  --scrollbar-hover: #42424c;
+}
+
+/* ────────── Light theme (cream) ────────── */
+[data-theme="light"] {
+  --bg:              #faf9f6;
+  --bg-elevated:     #ffffff;
+  --bg-raised:       #f3f2ed;
+  --bg-hover:        #ebeae3;
+  --bg-subtle:       #f6f5f1;
+  --bg-inverse:      #1a1a1d;
+
+  --border:          #e3e1d9;
+  --border-strong:   #cfccc2;
+  --border-subtle:   #ecebe4;
+
+  --fg:              #1a1a1d;
+  --fg-strong:       #000000;
+  --fg-muted:        #6a6862;
+  --fg-dim:          #9f9c96;
+  --fg-inverse:      #faf9f6;
+
+  --accent:          #bc4f22;
+  --accent-hover:    #a84418;
+  --accent-active:   #8f390f;
+  --accent-soft:     rgba(188, 79, 34, 0.08);
+  --accent-border:   rgba(188, 79, 34, 0.22);
+  --accent-fg:       #ffffff;
+
+  --success:         #3f9f4a;
+  --warning:         #b8820a;
+  --danger:          #c4393d;
+  --info:            #2a6ec2;
+  --thinking:        #7e48c7;
+
+  --code-bg:         #f3f2ec;
+  --code-border:     #e3e1d9;
+  --user-bubble:     #efeee7;
+  --assistant-bubble: transparent;
+  --inline-code-bg:  rgba(60, 58, 50, 0.08);
+
+  --shadow-sm: 0 1px 2px rgba(30, 25, 10, 0.06);
+  --shadow-md: 0 4px 16px rgba(30, 25, 10, 0.08);
+  --shadow-lg: 0 12px 48px rgba(30, 25, 10, 0.12);
+  --shadow-xl: 0 24px 96px rgba(30, 25, 10, 0.18);
+  --ring: 0 0 0 3px rgba(188, 79, 34, 0.22);
+
+  --glass-bg: rgba(250, 249, 246, 0.85);
+  --scrollbar: #d1cec4;
+  --scrollbar-hover: #b8b5ab;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Semantic text styles — map to the raw tokens above
+ *  Use these directly in component CSS; don't reach for `font-size: 24px`.
+ * ══════════════════════════════════════════════════════════════════ */
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, .h1 {
+  font-family: var(--font-serif);
+  font-size: clamp(var(--text-2xl), 5vw, var(--text-3xl));
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.08;
+  color: var(--fg-strong);
+  margin: 0 0 var(--space-3);
+}
+h2, .h2 {
+  font-size: var(--text-2xl);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+  color: var(--fg-strong);
+  margin: 0 0 var(--space-3);
+}
+h3, .h3 {
+  font-size: var(--text-xl);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--fg-strong);
+  margin: 0 0 var(--space-2);
+}
+h4, .h4 {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--fg-strong);
+  margin: 0 0 var(--space-2);
+}
+.eyebrow {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+p, .body {
+  font-size: var(--text-base);
+  line-height: 1.6;
+  color: var(--fg);
+  margin: 0 0 var(--space-3);
+}
+.body-sm {
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--fg-muted);
+}
+.muted { color: var(--fg-muted); }
+.dim   { color: var(--fg-dim);   }
+
+code, .code, kbd, .kbd {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+code, .code {
+  background: var(--inline-code-bg);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+kbd, .kbd {
+  font-size: var(--text-xs);
+  background: var(--bg);
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  color: var(--fg);
+}

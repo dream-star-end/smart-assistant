@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenClaude Web — UI Kit</title>
+<link rel="stylesheet" href="styles.css?v=8">
+<link rel="stylesheet" href="styles-extended.css?v=8">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script>
+  // Persist theme across reloads
+  (function() {
+    const saved = localStorage.getItem("oc.theme");
+    if (saved) document.documentElement.setAttribute("data-theme", saved);
+  })();
+</script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" src="components/Icon.jsx"></script>
+<script type="text/babel" src="components/Button.jsx"></script>
+<script type="text/babel" src="components/Chip.jsx"></script>
+<script type="text/babel" src="components/Sidebar.jsx"></script>
+<script type="text/babel" src="components/MessageList.jsx"></script>
+<script type="text/babel" src="components/Composer.jsx"></script>
+<script type="text/babel" src="components/Modal.jsx"></script>
+<script type="text/babel" src="components/LandingHero.jsx"></script>
+<script type="text/babel" src="components/LoginCard.jsx"></script>
+<script type="text/babel" src="components/Admin.jsx"></script>
+<script type="text/babel" src="components/Settings.jsx"></script>
+<script type="text/babel" src="components/Mobile.jsx"></script>
+
+<script type="text/babel" data-presets="react">
+/* eslint-disable no-undef */
+const { useState, useEffect, useRef } = React;
+const MessageRow = window.Message;
+
+const SEED_CONVS = [
+  { id: "c1", title: "OpenClaude UI 改版", meta: "14:02", pinned: true },
+  { id: "c2", title: "admin 控制台讨论", meta: "13:14" },
+  { id: "c3", title: "今天 token 账单分析", meta: "周一" },
+  { id: "c4", title: "prompt cache 调优记录", meta: "4/12" },
+  { id: "c5", title: "Docker 沙箱安全评估", meta: "4/09" },
+];
+
+const SEED_MESSAGES = {
+  c1: [
+    { role: "user", content: "帮我把 OpenClaude 的登录页改成更有辨识度的风格,看看你的建议。" },
+    { role: "assistant", content: (
+      <>
+        好。我看过 <code>index.html</code> 的 <code>#login-view</code>,可以沿用现有的 aurora 背景语言,但把右侧登录卡从纯白底改成 <b>bg-elevated</b> + <b>radius-2xl</b>,再加一条 <b>quote</b> 区块放产品定价原则 —— 让它不只是一个表单。
+      </>
+    )},
+    { role: "tool", name: "read_file", state: "done", statusLabel: "done · 1046 lines", body: "packages/web/public/index.html" },
+    { role: "tool", name: "edit_css", state: "running", statusLabel: "running…", body: ".login-card { border-radius: var(--radius-2xl); ... }" },
+    { role: "assistant", content: (
+      <>
+        我会做三个方向的 variation —— 一个保守(只换卡片阴影),一个平衡(加 quote 区),一个激进(把整个 aside 换成半屏品牌故事)。要我先出哪个?
+      </>
+    )},
+  ],
+  c2: [
+    { role: "user", content: "admin 控制台的账号池状态页该怎么布局?" },
+    { role: "assistant", content: "建议上方一条横向 stat bar(在线 / 限流 / 离线 / 总请求),下方一个带过滤的 table。" },
+  ],
+  c3: [
+    { role: "user", content: "今天 token 用了多少?" },
+    { role: "tool", name: "billing.usage", state: "done", statusLabel: "done", body: "{ tokens_today: 12438, cost_cny: 1.24 }" },
+    { role: "assistant", content: <>今天消耗 <b>12,438 tokens</b>,对应约 <b>¥1.24</b>。缓存命中率 <b>96.2%</b>,比昨天略升。</> },
+  ],
+  c4: [{ role: "assistant", content: "(空会话)" }],
+  c5: [{ role: "assistant", content: "(空会话)" }],
+};
+
+function App() {
+  const [surface, setSurface] = useState(() => localStorage.getItem("oc.surface") || "app");
+  const [convs] = useState(SEED_CONVS);
+  const [selectedId, setSelectedId] = useState("c1");
+  const [messagesById, setMessagesById] = useState(SEED_MESSAGES);
+  const [model, setModel] = useState("Opus 4.7");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const scrollRef = useRef(null);
+
+  useEffect(() => { localStorage.setItem("oc.surface", surface); }, [surface]);
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messagesById, selectedId, surface]);
+
+  const messages = messagesById[selectedId] || [];
+  const selected = convs.find((c) => c.id === selectedId) || convs[0];
+
+  const send = (text) => {
+    const next = { ...messagesById };
+    next[selectedId] = [...(next[selectedId] || []), { role: "user", content: text }];
+    setMessagesById(next);
+    setTimeout(() => {
+      setMessagesById((cur) => {
+        const n = { ...cur };
+        n[selectedId] = [...(n[selectedId] || []), {
+          role: "assistant",
+          content: <>收到。我会用 <b>{model}</b> 处理这个。(演示回复 —— UI kit 里不会真的调用 API)</>,
+        }];
+        return n;
+      });
+    }, 700);
+  };
+
+  const newChat = () => {
+    const id = "c" + (Math.random().toString(36).slice(2, 7));
+    setMessagesById((m) => ({ ...m, [id]: [] }));
+    setSelectedId(id);
+  };
+
+  return (
+    <>
+      <div className="surface-switch" data-screen-label="surface-switch">
+        {[["landing","Landing"],["login","Auth"],["app","App"],["admin","Admin"],["mobile","Mobile"]].map(([v,l]) => (
+          <button key={v} className={surface===v?"is-on":""} onClick={() => setSurface(v)}>{l}</button>
+        ))}
+      </div>
+
+      {surface === "admin" && (
+        <div data-screen-label="04 Admin"><Admin/></div>
+      )}
+
+      {surface === "mobile" && (
+        <div data-screen-label="05 Mobile"><Mobile/></div>
+      )}
+
+      {surface === "landing" && (
+        <div data-screen-label="01 Landing"><LandingHero onStart={() => setSurface("login")} /></div>
+      )}
+
+      {surface === "login" && (
+        <LoginCard onLogin={() => setSurface("app")} onBack={() => setSurface("landing")} />
+      )}
+
+      {surface === "app" && (
+        <div className="app-shell" data-screen-label="03 App">
+          <Sidebar
+            conversations={convs}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            onNew={newChat}
+            onSettings={() => setSettingsOpen(true)}
+          />
+          <div className="main-col">
+            <div className="main-header">
+              <h3>{selected.title}</h3>
+              <div className="main-header-meta">
+                <Chip tone="accent">{model}</Chip>
+                <Chip tone="neutral" dot="success">已连接</Chip>
+                <IconButton icon={<Icon.More/>} title="更多"/>
+              </div>
+            </div>
+            {messages.length === 0 ? (
+              <div className="empty">
+                <div className="empty-brand"><Icon.Logo/></div>
+                <div className="empty-title">你好,我是你的 AI 助手</div>
+                <div className="empty-sub">按 ⌘N 新建会话 · 按 ⌘K 打开快捷命令</div>
+              </div>
+            ) : (
+              <div ref={scrollRef} className="messages">
+                <div className="messages-inner">
+                  {messages.map((m, i) => (
+                    m.role === "tool"
+                      ? <ToolCard key={i} tool={m}/>
+                      : <MessageRow key={i} m={m}/>
+                  ))}
+                </div>
+              </div>
+            )}
+            <Composer onSend={send} model={model} onModelChange={() => setModel(model === "Opus 4.7" ? "Sonnet 4.5" : "Opus 4.7")} />
+          </div>
+          <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+        </div>
+      )}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

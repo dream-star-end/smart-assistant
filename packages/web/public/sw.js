@@ -34,6 +34,7 @@ const SHELL = [
   '/modules/memory.js',
   '/modules/tasks.js',
   '/modules/agents.js',
+  '/modules/agents.js?v=acf9959',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/effortMode.js',
   '/modules/sessions.js',
   '/modules/sync.js',

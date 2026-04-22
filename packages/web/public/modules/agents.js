@@ -10,11 +10,29 @@ export async function reloadAgents() {
     const data = await apiGet('/api/agents')
     state.agentsList = data.agents || []
     state.defaultAgentId = data.default || 'main'
-    renderAgentDropdown()
-    renderAgentsManagementList()
+    // commercial admin 才能切 agent — 普通用户即便成功也只有 main,没意义就隐藏。
+    const sel = $('agent-select')
+    if (sel) sel.hidden = state.agentsList.length <= 1
   } catch (err) {
-    console.warn('load agents failed:', err)
+    // v3 商用版 P0 防火墙对非 admin 用户把 /api/agents 403 掉了(见
+    // packages/commercial/src/http/router.ts BLOCKED_FOR_USER_RULES)。前端
+    // 拿不到列表时必须回落一个 main agent,否则 state.agentsList.find(...) 全 undefined:
+    //   - effortMode.getCurrentAgentModel() → '' → 思考深度 pill 一直隐藏
+    //   - renderAgentDropdown / setCurrentSessionId / websocket.restoreTurnState
+    //     拿 agentInfo 都会失败。顶栏那个切换下拉同时隐掉 —— 只有 main 没得切。
+    console.warn('load agents failed (commercial non-admin → fallback main):', err)
+    state.agentsList = [{
+      id: 'main',
+      displayName: 'main',
+      model: 'claude-opus-4-7',
+      provider: 'claude-subscription',
+    }]
+    state.defaultAgentId = 'main'
+    const sel = $('agent-select')
+    if (sel) sel.hidden = true
   }
+  renderAgentDropdown()
+  renderAgentsManagementList()
 }
 
 export function renderAgentDropdown() {
