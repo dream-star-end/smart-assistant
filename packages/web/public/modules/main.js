@@ -65,16 +65,16 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
-import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=eae5c6c'
-// ?v=eae5c6c bust: websocket.js now imports billing.js for refreshBalance() after
+import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=44f77ff'
+// ?v=44f77ff bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=eae5c6c'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=44f77ff'
 import { initUserPrefs, openPrefsModal } from './userPrefs.js'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { initUsageStats, openUsageModal } from './usageStats.js?v=eae5c6c'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=44f77ff'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
