@@ -1,7 +1,19 @@
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
-import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import {
+  constants as fsConstants,
+  closeSync,
+  createReadStream,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
+import { isIPv4 } from 'node:net'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import type { InboundFrame, InboundMessage, OutboundMessage } from '@openclaude/protocol'
@@ -940,7 +952,10 @@ export class Gateway {
       (url.pathname.startsWith('/api/') && url.pathname !== '/api/healthz') ||
       url.pathname.startsWith('/v1/') ||
       url.pathname === '/metrics'
-    if (needsAuth && !this.checkHttpAuth(req)) {
+    // v3 file proxy: HOST gateway → container /api/file or /api/media via docker bridge
+    // bypasses checkHttpAuth if all four conditions hold (see checkBridgeBypass).
+    const bridgeVerified = needsAuth ? this.checkBridgeBypass(req, url) : false
+    if (needsAuth && !bridgeVerified && !this.checkHttpAuth(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -994,7 +1009,24 @@ export class Gateway {
     if (url.pathname === '/healthz') {
       // V3 2H: /healthz 增加 commercial 模块状态(供运维快速判断 v2/v3 实例形态)
       const c = this.deps.commercial
-      const body = c
+      // v3 file proxy: advertise `file-proxy-v1` capability only when ALL three
+      // env vars HOST relies on are injected AND well-formed. Incomplete或形态不对
+      // (supervisor 写错 / 部署降级 / 容器复用)→ not ready → HOST 返 CONTAINER_OUTDATED,
+      // 避免 HOST 按 bypass 发头结果容器内 checkBridgeBypass 失败 401 的 dead lock。
+      // (Codex R1 SHOULD-3:校验形态,不只校验非空)
+      const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
+      const OC_CONTAINER_ID = process.env.OC_CONTAINER_ID || ''
+      const OC_BRIDGE_NONCE = process.env.OC_BRIDGE_NONCE || ''
+      // trust IP 必须是 IPv4 文本(docker bridge gateway,通常 172.30.0.1)
+      // 用 net.isIPv4 而不是松正则 —— R2 SHOULD:`999.999.999.999` 会过正则但
+      // remoteAddress 永远 match 不到,结果 /healthz 误报 ready 导致 HOST probe
+      // 通过但真实 bypass 全挂。
+      const TRUST_IP_OK = isIPv4(TRUST_BRIDGE_IP)
+      // container id 必须是 10 位以内正整数(BIGSERIAL),禁止 alpha / leading 0 / 超长
+      const CONTAINER_ID_OK = /^[1-9][0-9]{0,18}$/.test(OC_CONTAINER_ID)
+      const NONCE_OK = /^[0-9a-f]{64}$/i.test(OC_BRIDGE_NONCE)
+      const bridgeReady = TRUST_IP_OK && CONTAINER_ID_OK && NONCE_OK
+      const body: Record<string, unknown> = c
         ? {
             ok: true,
             commercial: {
@@ -1005,6 +1037,8 @@ export class Gateway {
             },
           }
         : { ok: true }
+      body.containerId = OC_CONTAINER_ID || null
+      body.capabilities = bridgeReady ? ['file-proxy-v1'] : []
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(body))
       return
@@ -1400,36 +1434,71 @@ export class Gateway {
     // Serve user-uploaded and MCP-generated media files for inline rendering.
     const mediaMatch = url.pathname.match(/^\/api\/media\/(.+)$/)
     if (mediaMatch) {
-      const filename = decodeURIComponent(mediaMatch[1])
+      let filename: string
+      try {
+        filename = decodeURIComponent(mediaMatch[1])
+      } catch {
+        res.writeHead(400)
+        res.end('bad request')
+        return
+      }
       // Reject path traversal attempts (../ or absolute paths)
       if (filename.includes('..') || filename.startsWith('/') || filename.startsWith('\\')) {
         res.writeHead(400)
         res.end('bad request')
         return
       }
-      // Search in uploads first, then generated
+      // Search in uploads first, then generated. Resolve via realpath so a
+      // symlink inside uploads/ cannot escape the directory.
       const dirs = [paths.uploadsDir, paths.generatedDir]
-      let found: string | null = null
-      let mediaStat: ReturnType<typeof statSync> | null = null
+      let realPath: string | null = null
       for (const dir of dirs) {
+        const baseReal = resolve(dir)
         const candidate = resolve(dir, filename)
-        // Security: ensure resolved path stays inside the allowed directory
-        if (!candidate.startsWith(resolve(dir))) continue
+        if (!candidate.startsWith(baseReal + '/') && candidate !== baseReal) continue
         try {
-          const s = statSync(candidate)
-          if (s.isFile()) {
-            found = candidate
-            mediaStat = s
+          const r = realpathSync(candidate)
+          if (r.startsWith(baseReal + '/')) {
+            realPath = r
             break
           }
         } catch {}
       }
-      if (!found || !mediaStat) {
+      if (!realPath) {
         res.writeHead(404)
         res.end('not found')
         return
       }
-      const mediaContentType = mimeFor(found)
+      const agentCwds = this.deps.agentsConfig.agents
+        .map((a) => a.cwd)
+        .filter((c): c is string => !!c)
+      // After realpath resolution, the path is already inside uploads/ or
+      // generated/; both are static FILE_ALLOWED_DIRS entries, so
+      // isFileAllowed returns true unconditionally. But do the blocklist
+      // check — someone could drop a .env into uploads/.
+      if (isFileBlocked(realPath)) {
+        res.writeHead(403)
+        res.end('access denied')
+        return
+      }
+      const fd = this.openFileHardened(res, realPath, agentCwds)
+      if (fd === null) return
+      let mediaStat: ReturnType<typeof fstatSync>
+      try {
+        mediaStat = fstatSync(fd)
+      } catch {
+        closeSync(fd)
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      if (!mediaStat.isFile()) {
+        closeSync(fd)
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      const mediaContentType = mimeFor(realPath)
       // C3: Force download for active content types to prevent same-origin script execution
       const mediaHeaders: Record<string, string | number> = {
         'Content-Type': mediaContentType,
@@ -1437,10 +1506,10 @@ export class Gateway {
         'Cache-Control': 'private, max-age=3600',
       }
       if (isActiveContentType(mediaContentType)) {
-        mediaHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(found) || 'file')}"`
+        mediaHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(realPath) || 'file')}"`
       }
       res.writeHead(200, mediaHeaders)
-      createReadStream(found).pipe(res)
+      createReadStream(null as unknown as string, { fd, autoClose: true }).pipe(res)
       return
     }
 
@@ -1459,46 +1528,64 @@ export class Gateway {
         res.end('bad path')
         return
       }
-      // Security: allowlist directories first, then blocklist as secondary defense.
+      // v3 file proxy hardening: use realpath (not resolve) so symlinks in the
+      // *path text* are resolved to their canonical target BEFORE allowlist
+      // check. Without this, a symlink /root/.openclaude/generated/foo →
+      // /root/openclaude.json would pass isFileAllowed (text startsWith check)
+      // and leak the config.
       const resolved = resolve(filePath)
-      const agentCwds = this.deps.agentsConfig.agents
-        .map((a) => a.cwd)
-        .filter((c): c is string => !!c)
-      if (!isFileAllowed(resolved, agentCwds)) {
-        this.log.warn('api/file denied (not in allowlist)', { path: resolved })
-        res.writeHead(403)
-        res.end('access denied')
-        return
-      }
-      if (isFileBlocked(resolved)) {
-        this.log.warn('api/file blocked sensitive', { path: resolved })
-        res.writeHead(403)
-        res.end('access denied')
-        return
-      }
-      let fileStat: ReturnType<typeof statSync>
+      let realPath: string
       try {
-        fileStat = statSync(resolved)
+        realPath = realpathSync(resolved)
       } catch {
         res.writeHead(404)
         res.end('not found')
         return
       }
-      if (!fileStat.isFile()) {
+      const agentCwds = this.deps.agentsConfig.agents
+        .map((a) => a.cwd)
+        .filter((c): c is string => !!c)
+      if (!isFileAllowed(realPath, agentCwds)) {
+        this.log.warn('api/file denied (not in allowlist)', { path: realPath })
+        res.writeHead(403)
+        res.end('access denied')
+        return
+      }
+      if (isFileBlocked(realPath)) {
+        this.log.warn('api/file blocked sensitive', { path: realPath })
+        res.writeHead(403)
+        res.end('access denied')
+        return
+      }
+      // fd-based open (O_NOFOLLOW + /proc/self/fd realpath check) closes the
+      // middle-directory swap race; see openFileHardened().
+      const fd = this.openFileHardened(res, realPath, agentCwds)
+      if (fd === null) return
+      let fileStat: ReturnType<typeof fstatSync>
+      try {
+        fileStat = fstatSync(fd)
+      } catch {
+        closeSync(fd)
         res.writeHead(404)
         res.end('not found')
         return
       }
-      const fileContentType = mimeFor(resolved)
+      if (!fileStat.isFile()) {
+        closeSync(fd)
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      const fileContentType = mimeFor(realPath)
       // C3: Force download for active content types to prevent same-origin script execution
       const fileDispositionMode = isActiveContentType(fileContentType) ? 'attachment' : 'inline'
       res.writeHead(200, {
         'Content-Type': fileContentType,
         'Content-Length': fileStat.size,
         'Cache-Control': 'private, max-age=3600',
-        'Content-Disposition': `${fileDispositionMode}; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
+        'Content-Disposition': `${fileDispositionMode}; filename="${encodeURIComponent(basename(realPath) || 'file')}"`,
       })
-      createReadStream(resolved).pipe(res)
+      createReadStream(null as unknown as string, { fd, autoClose: true }).pipe(res)
       return
     }
 
@@ -1617,6 +1704,94 @@ export class Gateway {
     if (this.verifyCommercialJwt(t) !== null) return true
     // Fall back to legacy single token
     return checkToken(t, this.deps.config.gateway.accessToken)
+  }
+
+  /**
+   * v3 file proxy: check whether this HTTP request is a valid HOST→container
+   * bridge call for /api/file or /api/media/*. When true, the normal
+   * checkHttpAuth() requirement is bypassed.
+   *
+   * All four conditions MUST hold:
+   *  1. remote IP === OPENCLAUDE_TRUST_BRIDGE_IP (host in docker bridge)
+   *  2. method ∈ {GET, HEAD} AND path ∈ {/api/file, /api/media/*}
+   *  3. X-OpenClaude-Container-Id === env.OC_CONTAINER_ID (binding)
+   *  4. timingSafeEqual(X-OpenClaude-Bridge-Nonce, env.OC_BRIDGE_NONCE)
+   *
+   * Container side doesn't know the HOST's HMAC rootSecret — only its own
+   * per-container nonce (HMAC(rootSecret, containerId)) injected at start.
+   */
+  private checkBridgeBypass(req: IncomingMessage, url: URL): boolean {
+    const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
+    const OC_CONTAINER_ID = process.env.OC_CONTAINER_ID || ''
+    const OC_BRIDGE_NONCE = process.env.OC_BRIDGE_NONCE || ''
+    if (!TRUST_BRIDGE_IP || !OC_CONTAINER_ID || !OC_BRIDGE_NONCE) return false
+    // Codex R1/R2 SHOULD-3:形态校验与 /healthz 保持一致,防止 env 写错时 bypass 只
+    // 看非空就放行(healthz 广播 ready 但 bypass 因细节 reject 会造成哑锁)。
+    // 用 net.isIPv4 严格校验,不用松正则 —— out-of-range octet 也要拒。
+    if (!isIPv4(TRUST_BRIDGE_IP)) return false
+    if (!/^[1-9][0-9]{0,18}$/.test(OC_CONTAINER_ID)) return false
+    if (!/^[0-9a-f]{64}$/i.test(OC_BRIDGE_NONCE)) return false
+    const remoteIp = req.socket.remoteAddress || ''
+    if (remoteIp !== TRUST_BRIDGE_IP && remoteIp !== `::ffff:${TRUST_BRIDGE_IP}`) return false
+    const m = req.method || ''
+    if (m !== 'GET' && m !== 'HEAD') return false
+    const p = url.pathname
+    if (p !== '/api/file' && !p.startsWith('/api/media/')) return false
+    const hdrId = String(req.headers['x-openclaude-container-id'] ?? '').trim()
+    if (hdrId !== OC_CONTAINER_ID) return false
+    const hdrNonce = String(req.headers['x-openclaude-bridge-nonce'] ?? '').trim()
+    if (!/^[0-9a-f]{64}$/i.test(hdrNonce)) return false
+    if (hdrNonce.length !== OC_BRIDGE_NONCE.length) return false
+    try {
+      return timingSafeEqual(Buffer.from(hdrNonce, 'hex'), Buffer.from(OC_BRIDGE_NONCE, 'hex'))
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * v3 file proxy: open a file with TOCTOU-hardened realpath checking.
+   * Callers must have already verified `realPath` against allowlist/blocklist.
+   *
+   *  - openSync(O_NOFOLLOW): last-component symlink defense.
+   *  - realpathSync(/proc/self/fd/<fd>) === realPath: middle-directory
+   *    symlink race defense. An attacker who swaps a parent directory
+   *    between our allowlist check and open() will show up here with
+   *    fdReal ≠ realPath.
+   *  - isFileAllowed/isFileBlocked re-checked on fdReal as fail-closed
+   *    defense (redundant but cheap).
+   *
+   * Returns an fd on success; writes 403/404 to res and returns null on failure.
+   */
+  private openFileHardened(
+    res: ServerResponse,
+    realPath: string,
+    agentCwds: string[],
+  ): number | null {
+    let fd: number
+    try {
+      fd = openSync(realPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+    } catch {
+      res.writeHead(404)
+      res.end('not found')
+      return null
+    }
+    let fdReal: string
+    try {
+      fdReal = realpathSync(`/proc/self/fd/${fd}`)
+    } catch {
+      closeSync(fd)
+      res.writeHead(404)
+      res.end('not found')
+      return null
+    }
+    if (fdReal !== realPath || !isFileAllowed(fdReal, agentCwds) || isFileBlocked(fdReal)) {
+      closeSync(fd)
+      res.writeHead(403)
+      res.end('access denied')
+      return null
+    }
+    return fd
   }
 
   /** Get authenticated userId from request. Returns 'default' for legacy token auth. */

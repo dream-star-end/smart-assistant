@@ -69,6 +69,7 @@ import {
   observeWsBridgeBuffered,
   observeWsBridgeSessionDuration,
 } from "./admin/metrics.js";
+import { loadOrCreateBridgeSecret, DEFAULT_BRIDGE_SECRET_PATH } from "./bridgeSecret.js";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -441,6 +442,23 @@ export async function registerCommercial(
     console.log("[commercial] mailer = stub (RESEND_API_KEY 未设置, 验证邮件只打日志)");
   }
 
+  // v3 file proxy:HOST bridge root secret。加载/生成 `/var/lib/openclaude/.v3-bridge-secret`。
+  // 任何失败(权限 / 磁盘 / 路径)→ fail-closed 只警告,让 supervisor 不注入 env,file
+  // proxy 整体降级为 CONTAINER_OUTDATED 503,不会阻止 gateway 启动。
+  let bridgeSecret: string | undefined;
+  try {
+    bridgeSecret = loadOrCreateBridgeSecret();
+    // eslint-disable-next-line no-console
+    console.log("[commercial] v3 bridge secret loaded", { path: DEFAULT_BRIDGE_SECRET_PATH });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      "[commercial] v3 bridge secret load/create failed; file proxy will be DISABLED",
+      { path: DEFAULT_BRIDGE_SECRET_PATH, error: (err as Error)?.message ?? String(err) },
+    );
+    bridgeSecret = undefined;
+  }
+
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
@@ -455,6 +473,9 @@ export async function registerCommercial(
       docker: v3Docker,
       pool: getPool(),
       image: cfg.OC_RUNTIME_IMAGE,
+      // bridgeSecret 注入后,provisionV3Container 会写 OC_CONTAINER_ID / OC_BRIDGE_NONCE
+      // 到容器 env;未注入则容器侧 /healthz 不广播 file-proxy-v1,代理自动 OUTDATED。
+      bridgeSecret,
     };
     // eslint-disable-next-line no-console
     console.log("[commercial] v3 supervisor wired", { image: cfg.OC_RUNTIME_IMAGE });
@@ -536,6 +557,10 @@ export async function registerCommercial(
     agentRuntime,
     // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
     v3Supervisor: v3Deps,
+    // v3 file proxy:root secret 给 containerFileProxy 签 per-request nonce;
+    // feature flag 控制 router 是否把 /api/file / /api/media/* 从 BLOCKED 拉进 PROXY 分支
+    bridgeSecret,
+    fileProxyEnabled: cfg.FILE_PROXY_ENABLED,
   });
 
   // T-52 /ws/agent:仅在 agent runtime 就绪时启用。

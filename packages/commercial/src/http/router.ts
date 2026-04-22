@@ -41,9 +41,13 @@ import {
   handleGetMyPreferences,
   handlePatchMyPreferences,
   handleGetMyUsage,
+  handleCreateSession,
+  handleClearSession,
   type CommercialHttpDeps,
   type RequestContext,
 } from "./handlers.js";
+import { containerFileProxy } from "./containerFileProxy.js";
+import { requireUserVerifyDb } from "./requireUser.js";
 import {
   handleListPlans,
   handleCreateHupi,
@@ -226,6 +230,35 @@ function matchBlockedRule(path: string, method: string): BlockedForUserRule | nu
   return null;
 }
 
+/**
+ * v3 file proxy PROXY 路径。命中的请求:
+ *   - user role + DB status=active → containerFileProxy 代理到容器
+ *   - admin / 无 JWT / 过期 → fall through 给 BLOCKED 继续走(admin bypass / 401)
+ *   - user banned → 403 FORBIDDEN(terminal)
+ *
+ * 排在 BLOCKED_FOR_USER_RULES 之前。BLOCKED 里的 /api/file + /api/media/* 仍保留
+ * 作为 feature flag OFF 时 + POST/PUT/DELETE 兜底的路径。
+ */
+interface ProxyForUserRule {
+  re: RegExp;
+  methods: ReadonlySet<string>;
+  label: string;
+}
+const PROXY_FOR_USER_RULES: readonly ProxyForUserRule[] = [
+  { re: /^\/api\/file$/, methods: M("GET"), label: "/api/file" },
+  { re: /^\/api\/media\/.+$/, methods: M("GET"), label: "/api/media/:file" },
+];
+
+function matchProxyRule(path: string, method: string, enabled: boolean): ProxyForUserRule | null {
+  if (!enabled) return null;
+  for (const rule of PROXY_FOR_USER_RULES) {
+    if (!rule.re.test(path)) continue;
+    if (!rule.methods.has(method)) continue;
+    return rule;
+  }
+  return null;
+}
+
 export type CommercialHandler = (
   req: IncomingMessage,
   res: ServerResponse,
@@ -291,6 +324,10 @@ export function createCommercialHandler(
     { method: "GET",  path: "/api/auth/check-verification",  handler: handleCheckVerification },
     { method: "POST", path: "/api/auth/request-password-reset", handler: handleRequestPasswordReset },
     { method: "POST", path: "/api/auth/confirm-password-reset", handler: (req, res) => handleConfirmPasswordReset(req, res) },
+    // v3 file proxy: 用 Bearer access token 换一个 HttpOnly `oc_session` cookie,
+    // 让 `<a href>` / `<img>` 等原生下载链接能携带身份(见 handlers.ts 详注)
+    { method: "POST", path: "/api/auth/session", handler: handleCreateSession },
+    { method: "POST", path: "/api/auth/session/logout", handler: handleClearSession },
     { method: "GET", path: "/api/me", handler: handleMe },
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
     { method: "GET",   path: "/api/me/preferences", handler: handleGetMyPreferences },
@@ -362,6 +399,81 @@ export function createCommercialHandler(
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
     const path = url.pathname;
     const method = req.method ?? "GET";
+
+    // ── v3 file proxy PROXY 路径(Stage 4 feature flag ON 时启用)──
+    //
+    // 必须排在 BLOCKED_FOR_USER_RULES 之前:
+    //   - Flag ON + user role + DB active → containerFileProxy 转发到容器
+    //   - Flag ON + admin → fall through(BLOCKED 会走 admin bypass 分支)
+    //   - Flag ON + user banned → 403 FORBIDDEN(terminal)
+    //   - Flag ON + 无 / 过期 / 伪造 JWT → fall through(BLOCKED 会 401)
+    //   - Flag OFF → 整个 PROXY 块不介入,仍走 BLOCKED(与上线前一致)
+    //
+    // deps.v3Supervisor + deps.bridgeSecret 都必须就位才启用 —— 任意缺失视作未启用。
+    const proxyRule =
+      deps.v3Supervisor && deps.bridgeSecret
+        ? matchProxyRule(path, method, !!deps.fileProxyEnabled)
+        : null;
+    if (proxyRule) {
+      setSecurityHeaders(res);
+      const requestId = ensureRequestId(req);
+      res.setHeader(REQUEST_ID_HEADER, requestId);
+      const proxyLog = (options.logger ?? rootLogger.child({ subsys: "commercial" })).child({
+        requestId,
+        route: "__file_proxy__",
+        rule: proxyRule.label,
+        method,
+        path,
+        clientIp: clientIpOf(req),
+      });
+      const token = extractTokenFromReq(req);
+      const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
+      if (!claims) {
+        // 无 / 过期 / 伪造 → fall through 给 BLOCKED(最终 401)
+        // 不在这里 return true:让 BLOCKED 分支写响应
+      } else if (claims.role === "admin") {
+        // admin → 走 BLOCKED 的 admin bypass(保留运维查盘能力)
+        // 同样 fall through
+      } else {
+        // commercial user:DB double-check status=active
+        const verified = await requireUserVerifyDb(claims.sub, deps.v3Supervisor!.pool);
+        if (!verified) {
+          proxyLog.warn("file_proxy_user_inactive", { sub: claims.sub });
+          sendError(res, 403, "FORBIDDEN", "user account not active", requestId);
+          incrGatewayRequest("__file_proxy__", method, res.statusCode);
+          return true;
+        }
+        proxyLog.info("file_proxy_dispatch", { sub: claims.sub });
+        const ctx: RequestContext = {
+          requestId,
+          clientIp: clientIpOf(req),
+          authBoundIp: req.socket.remoteAddress ?? "unknown",
+          userAgent: userAgentOf(req),
+          log: proxyLog,
+        };
+        const startedAt = Date.now();
+        try {
+          await containerFileProxy(
+            req,
+            res,
+            ctx,
+            {
+              v3: deps.v3Supervisor!,
+              bridgeSecret: deps.bridgeSecret!,
+            },
+            BigInt(claims.sub),
+          );
+        } catch (err) {
+          // containerFileProxy 内部已 catch,这里兜底
+          handleError(err, res, requestId, proxyLog);
+        }
+        incrGatewayRequest("__file_proxy__", method, res.statusCode);
+        const durationMs = Date.now() - startedAt;
+        proxyLog.info("http_request", { status: res.statusCode, durationMs });
+        return true;
+      }
+      // fall through 到 BLOCKED 分支 —— 不写 res,让 BLOCKED 接管
+    }
 
     // ── P0 v3 多租户越权防火墙 ──
     // 见 BLOCKED_FOR_USER_RULES 注释。在 `isOurs` 前就做,保证 host-scope endpoint

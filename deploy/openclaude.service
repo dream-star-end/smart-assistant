@@ -8,6 +8,8 @@ User=root
 WorkingDirectory=/opt/openclaude/openclaude
 Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="OPENCLAUDE_HOME=/root/.openclaude"
+StateDirectory=openclaude
+StateDirectoryMode=0700
 ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
 Restart=on-failure
 RestartSec=5

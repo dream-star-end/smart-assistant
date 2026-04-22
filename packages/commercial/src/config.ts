@@ -231,6 +231,15 @@ const internalProxyPort = z
  */
 const ocRuntimeImage = z.string().trim().min(1).max(256).optional();
 
+/**
+ * v3 file proxy feature flag —— 开启后 /api/file / /api/media/* 的 GET 会走
+ * `containerFileProxy` 代理到用户容器。OFF(默认) = 继续走 `BLOCKED_FOR_USER_RULES`
+ * 返 403,与上线前一致。
+ *
+ * 4 阶段部署节奏见 v3-file-return-spec-mvp.md §5,最后一步才翻 ON。
+ */
+const fileProxyEnabled = z.enum(["0", "1"]).optional().transform((v) => v === "1");
+
 export const commercialConfigSchema = z
   .object({
     DATABASE_URL: databaseUrl,
@@ -262,6 +271,7 @@ export const commercialConfigSchema = z
     INTERNAL_PROXY_BIND: internalProxyBind,
     INTERNAL_PROXY_PORT: internalProxyPort,
     OC_RUNTIME_IMAGE: ocRuntimeImage,
+    FILE_PROXY_ENABLED: fileProxyEnabled,
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。

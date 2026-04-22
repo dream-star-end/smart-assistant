@@ -22,7 +22,12 @@
 //   - refresh JWT             → 服务器 Set-Cookie HttpOnly oc_rt(JS 不可见)
 //   - 以上由 main.js 经 onLoginSuccess 回调统一处理,本模块只 dispatch result
 
+// NB: bare `./api.js` 必须与其他模块保持一致 —— ESM 按 URL 唯一性分 instance,
+// 加 ?v= 会与 main.js 等共享的 api.js 分叉两个实例,_refreshInflight 这类 module
+// singleton 全废。CF 边缘缓存对 api.js 改动靠 sw.js VERSION bump 触发 SW 新一轮
+// 预缓存 + 运行时 `cache: 'no-store'` 接管。
 import { apiFetch } from './api.js'
+import { state } from './state.js'
 
 const TURNSTILE_SCRIPT = 'https://challenges.cloudflare.com/turnstile/v0/api.js?onload=__ocTurnstileReady&render=explicit'
 let _publicConfig = null
@@ -35,6 +40,96 @@ let _onLoginSuccess = null
 
 export function onLoginSuccess(cb) {
   _onLoginSuccess = cb
+}
+
+// ───────── Session cookie mint / clear (V3 file-proxy) ─────────
+// V3 commercial 给 <img src="/api/file?...">、<a href="/api/media/...">download 这类
+// 浏览器原生发起的、没有 Authorization header 的 GET 请求加 HttpOnly 会话 cookie
+// `oc_session`(Path=/api/,SameSite=Strict,HttpOnly,Max-Age=min(exp-now, 30d))。
+//
+// 时机:login success / silentRefresh success / app 启动时 state.token 有效
+// 清除:_forceLogout 前调用 clearSessionCookie
+//
+// **身份切换竞态硬化**(Codex R1 BLOCKER):
+//   裸 fire-and-forget 的 mint/clear 在共享浏览器多账号切换场景有 "旧 A 的 mint
+//   响应在新 B 登录后到达,覆盖 B 的 oc_session 成 A 的" 问题 —— 随后 <img>/<a>
+//   请求只带 cookie,HOST 按 A 的身份代理到 A 容器,B 看到 A 的文件。
+//   解法:
+//     a) 每次 mint/clear 各挂自己的 AbortController,登录/登出/mint/clear 之间互相
+//        abort(缩短请求悬挂时间)
+//     b) mint 传入发起时的 authEpoch;响应回来后如果 epoch 已变,发起一次 self-clear
+//        抵消可能已被 Set-Cookie 的旧身份 cookie(Set-Cookie 在 response header
+//        到达时就被浏览器应用,abort 无法收回 —— 必须用反向操作消除影响)
+//     c) 登录流程:caller 先 abortInflightMintClear(),再 mint 新 token;
+//        登出流程:先 abortInflightMintClear(),再 clear
+let _mintClearAbort = null
+
+export function abortInflightMintClear() {
+  try { _mintClearAbort?.abort(new DOMException('auth epoch changed', 'AbortError')) } catch {}
+  _mintClearAbort = null
+}
+
+export async function mintSessionCookie(accessToken, expectedEpoch) {
+  // R3 BLOCKER:发请求前先做 epoch 预检 —— 防止 silentRefresh 成功回调里那个
+  // fire-and-forget 的 dynamic-import mint callback 跨身份漂移。
+  //   场景:A 的 refresh 还在路上 → B 登录成功(bump epoch + 串行 await clear→mint)
+  //   → A 的 refresh 响应到达 → _doRefreshOnce 内部 epoch check 已拦下(没 commit token),
+  //     但 success 分支的 `import('./auth.js').then(mint)` 异步链晚一 tick 才跑,到那时
+  //     epoch 已是 B 的,旧 A 的 mint 仍会:
+  //       1) abortInflightMintClear() 中断 B 的 mint/clear 请求
+  //       2) 发一个带 A token 的 /api/auth/session(Bearer 已用 data.access_token 参数拷贝)
+  //     结果 Set-Cookie 写 A 的 oc_session,才靠 response 后 mismatch self-clear 补救。
+  // 一行预检把第 1/2 步直接跳过,留"请求期间 epoch 变化"这一条窄边界给 self-clear 兜底。
+  if (typeof expectedEpoch === 'number' && (state.authEpoch || 0) !== expectedEpoch) return
+  abortInflightMintClear()
+  const ctrl = new AbortController()
+  _mintClearAbort = ctrl
+  let ok = false
+  try {
+    const r = await fetch('/api/auth/session', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: ctrl.signal,
+    })
+    ok = r.ok
+  } catch {
+    // aborted / network — cookie not affected
+    return
+  } finally {
+    if (_mintClearAbort === ctrl) _mintClearAbort = null
+  }
+  // R1 加固:response 已到,Set-Cookie 已生效。如果 authEpoch 在请求过程中
+  // 变过(login→logout / logout→login / multi-tab race),当前 oc_session 可能
+  // 反映的是已失效身份的 JWT。发一次 clear 把它擦掉;后续持有新身份 access token
+  // 的 caller 会再 mint 一次,最终 cookie 跟当前 epoch 对齐。
+  if (ok && typeof expectedEpoch === 'number' && (state.authEpoch || 0) !== expectedEpoch) {
+    try {
+      await fetch('/api/auth/session/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      })
+    } catch {
+      // 最后一道防护线挂了就算了;HttpOnly 且 Max-Age 短,等 JWT exp 自然失效
+    }
+  }
+}
+
+export async function clearSessionCookie() {
+  abortInflightMintClear()
+  const ctrl = new AbortController()
+  _mintClearAbort = ctrl
+  try {
+    await fetch('/api/auth/session/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      signal: ctrl.signal,
+    })
+  } catch {
+    // logout 本来就是 best-effort
+  } finally {
+    if (_mintClearAbort === ctrl) _mintClearAbort = null
+  }
 }
 
 function $(id) { return document.getElementById(id) }

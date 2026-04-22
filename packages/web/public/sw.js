@@ -1,6 +1,6 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-5d1ccc1'
+const VERSION = 'openclaude-fileproxy1'
 const SHELL = [
   '/',
   '/index.html',
@@ -10,9 +10,9 @@ const SHELL = [
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=5d1ccc1',  // versioned URL used in index.html
+  '/modules/main.js?v=fileproxy1',  // versioned URL used in index.html
   '/modules/auth.js',
-  '/modules/auth.js?v=5d1ccc1',  // versioned URL used in main.js import (Turnstile reset fix)
+  '/modules/auth.js?v=fileproxy1',  // versioned URL used in main.js import (session cookie mint/clear)
   '/modules/billing.js',
   '/modules/billing.js?v=5d1ccc1',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
   '/modules/userPrefs.js',

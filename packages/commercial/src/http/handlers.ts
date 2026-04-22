@@ -99,6 +99,20 @@ export interface CommercialHttpDeps {
    * 与 `agentRuntime` 是平行的两条路线,两边各管各的镜像 / docker socket。
    */
   v3Supervisor?: V3SupervisorDeps;
+  /**
+   * v3 file proxy —— HOST 侧签 per-container nonce 的 rootSecret(32 byte hex)。
+   * 由 `bridgeSecret.loadOrCreateBridgeSecret` 从 `/var/lib/openclaude/.v3-bridge-secret`
+   * 加载。supervisor 在启动容器时用它算 HMAC(rootSecret, containerId) 作为
+   * `OC_BRIDGE_NONCE` env 注入;containerFileProxy 在转发时用同一方式再算一遍写进
+   * 请求头。未注入 → file proxy 整体降级(router 按 BLOCKED 处理)。
+   */
+  bridgeSecret?: string;
+  /**
+   * v3 file proxy feature flag —— OFF = router 走 BLOCKED 403(与上线前一致);
+   * ON = PROXY 路径命中 /api/file GET + /api/media/* GET 时走 containerFileProxy。
+   * 任何一阶段发现问题立即 OFF 回退,见 v3-file-return-spec-mvp.md §5。
+   */
+  fileProxyEnabled?: boolean;
 }
 
 export interface RequestContext {
@@ -954,6 +968,99 @@ export async function handleGetMyUsage(
     ledger,
     cutoff_started_at: cutoff ? cutoff.toISOString() : null,
   });
+}
+
+// ─── v3 file proxy: session cookie endpoints ────────────────────────
+
+/**
+ * POST /api/auth/session —— 用 Bearer access token 换一个 HttpOnly `oc_session` cookie。
+ *
+ * **为什么要**:浏览器原生 `<a href="/api/file?path=...">` / `window.open()` / `<img>`
+ * 无法携带 `Authorization: Bearer`。commercial user 的 access token 存在 localStorage
+ * 里,下载链接 fallback 只能靠 cookie。为了不让长期存活的 token 落进 cookie
+ * XSS-readable 空间,我们:
+ *   - HttpOnly + SameSite=Strict + Secure + Path=/api/(仅 api 路径带,不污染静态资源)
+ *   - Max-Age = min(exp - now, 30d) —— 不比 JWT 本身活得更久
+ *   - 前端主动 mint(登录 / refresh 成功 / app 启动 `_ensureSessionCookie`)
+ *   - 只对有 Authorization 头的请求 mint —— 不自我续期、不从 cookie 刷 cookie
+ *
+ * 返回 `{ ok: true, maxAge }` 让前端知道 TTL(debug 用,不做决策)。
+ */
+export async function handleCreateSession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const authHeader = req.headers.authorization ?? "";
+  const m = authHeader.match(/^Bearer\s+(.+)$/);
+  if (!m) {
+    throw new HttpError(401, "UNAUTHORIZED", "bearer token required");
+  }
+  const token = m[1]!.trim();
+  if (!token) {
+    throw new HttpError(401, "UNAUTHORIZED", "bearer token required");
+  }
+  // 复用同步 JWT 校验(router BLOCKED 路径也用的是它)
+  const { verifyCommercialJwtSync } = await import("../auth/jwtSync.js");
+  const claims = verifyCommercialJwtSync(token, deps.jwtSecret);
+  if (!claims) {
+    throw new HttpError(401, "UNAUTHORIZED", "invalid or expired token");
+  }
+
+  // Secure 标志判定:socket.encrypted(直连 HTTPS)或 Caddy 反代 + X-Forwarded-Proto=https。
+  // 本地 dev(http://localhost + COMMERCIAL_INSECURE_COOKIE=1)拿不到 Secure → 不设。
+  const socket = req.socket as { encrypted?: boolean };
+  const xfp = req.headers["x-forwarded-proto"];
+  const isLoopback =
+    /^(::1|127\.|::ffff:127\.)/.test(req.socket.remoteAddress ?? "");
+  const secure = socket.encrypted || (isLoopback && xfp === "https") ? "; Secure" : "";
+
+  const now = Math.floor(Date.now() / 1000);
+  const ttl = Math.min(Math.max(1, claims.exp - now), 30 * 86400);
+
+  // 直接拼 Set-Cookie —— 与 cookies.ts 的 refresh cookie 并存(Path/Name 不同)
+  const existing = res.getHeader("Set-Cookie");
+  const line = `oc_session=${token}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=${ttl}`;
+  if (existing == null) {
+    res.setHeader("Set-Cookie", line);
+  } else if (Array.isArray(existing)) {
+    res.setHeader("Set-Cookie", [...existing, line]);
+  } else {
+    res.setHeader("Set-Cookie", [String(existing), line]);
+  }
+  sendJson(res, 200, { ok: true, maxAge: ttl });
+}
+
+/**
+ * POST /api/auth/session/logout —— 清 `oc_session` cookie。
+ * 必须和 `handleCreateSession` 的 attributes 完全一致(name/Path/HttpOnly/SameSite/Secure),
+ * 否则浏览器会视作"另一个 cookie"忽略。
+ *
+ * 幂等:不检查 body、不查 DB —— 清本地 cookie 足矣。真正的 token 失效由 JWT exp 负责。
+ */
+export async function handleClearSession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  _deps: CommercialHttpDeps,
+): Promise<void> {
+  const socket = req.socket as { encrypted?: boolean };
+  const xfp = req.headers["x-forwarded-proto"];
+  const isLoopback =
+    /^(::1|127\.|::ffff:127\.)/.test(req.socket.remoteAddress ?? "");
+  const secure = socket.encrypted || (isLoopback && xfp === "https") ? "; Secure" : "";
+
+  const existing = res.getHeader("Set-Cookie");
+  const line = `oc_session=; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=0`;
+  if (existing == null) {
+    res.setHeader("Set-Cookie", line);
+  } else if (Array.isArray(existing)) {
+    res.setHeader("Set-Cookie", [...existing, line]);
+  } else {
+    res.setHeader("Set-Cookie", [String(existing), line]);
+  }
+  sendJson(res, 200, { ok: true });
 }
 
 // helper for tests / 其他 module

@@ -65,7 +65,7 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
-import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=5d1ccc1'
+import { abortInflightMintClear, clearSessionCookie, initAuth, mintSessionCookie, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=fileproxy1'
 // ?v=5d1ccc1 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
@@ -1049,6 +1049,18 @@ async function _forceLogout({ serverLogout } = {}) {
       timeout: 5000,
       suppressAuthRedirect: true,
     }).catch(() => {})
+    // V3 file-proxy:清 oc_session cookie(fire-and-forget,Max-Age=0),
+    // 否则退出后还能继续用旧 cookie 拉 /api/file,跟 access JWT 的 logout 语义不一致。
+    // clearSessionCookie() 内部先 abortInflightMintClear() 阻止潜在在飞的 mint。
+    void clearSessionCookie()
+  } else {
+    // 非 serverLogout 路径(401 teardown):也要中断任何在飞的 mint,防止 mint 响应
+    // 回来后 Set-Cookie 把 HttpOnly 旧 cookie 留在浏览器。
+    // R4 SHOULD#1:还得 void clearSessionCookie() —— spurious 401 / WS 1008 时
+    // access JWT 可能还在 Max-Age 内,不主动清的话 oc_session 会继续让 /api/file
+    // 带旧身份访问,跟 UI 已登出语义分裂。fire-and-forget 即可,UI 马上跳 landing。
+    abortInflightMintClear()
+    void clearSessionCookie()
   }
   localStorage.removeItem('openclaude_token')
   localStorage.removeItem('openclaude_access_token')
@@ -1985,6 +1997,16 @@ async function init() {
     if (access_exp != null) localStorage.setItem('openclaude_access_exp', String(access_exp))
     // Re-arm 401 handler — next token expiry will fire it again.
     resetAuthExpired()
+    // V3 file-proxy 身份切换 race 硬化(Codex R2 BLOCKER):先 await 清旧 oc_session,
+    // 再 await mint 新身份 cookie,然后才继续 showApp/renderMessages。
+    // 原因:浏览器 Set-Cookie 在 response header 到达时就被应用,AbortController
+    // 没法在 header 已到后撤回;所以必须用"反向操作"——清后再种——保证进入 app
+    // 之前 HttpOnly oc_session 一定是当前身份。否则冷启动/切账号那几百 ms 内
+    // <img src="/api/file?..."> 原生请求会捎旧 cookie 跑到 HOST → 按旧身份代理
+    // 到旧容器 → 跨用户泄漏。clearSessionCookie 内部带 AbortController,中断的是
+    // 先前 mint 的 signal;它自身发出的 clear 会正常到达 server 落盘 Max-Age=0。
+    try { await clearSessionCookie() } catch {}
+    try { await mintSessionCookie(access_token, state.authEpoch) } catch {}
     // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage.
     try {
       const stale = await dbGetAll()
@@ -2096,6 +2118,12 @@ async function init() {
   else createSession()
 
   if (state.token) {
+    // V3 file-proxy:冷启动 state.token 从 localStorage 恢复,但 oc_session cookie
+    // 可能已过期(或跨浏览器清理),renderMessages 里 <img src="/api/file?..."> 会
+    // 因没 cookie 被 firewall 403。await mint —— 小概率 renderMessages 会立刻用到
+    // 图片 src,先把 cookie 种上再展示,避免首次 paint 里的 403 闪红。
+    // 传 state.authEpoch 做 self-heal:冷启动瞬间 epoch 一般不会变,兜底处理。
+    await mintSessionCookie(state.token, state.authEpoch || 0)
     // Await so the HttpOnly session cookie is in place before any
     // <img>/<audio>/<video> tags get their src set by renderMessages.
     await showApp()

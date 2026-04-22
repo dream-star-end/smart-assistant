@@ -190,6 +190,14 @@ async function _doRefreshOnce(expectedEpoch) {
         state.refreshToken = ''
       }
     } catch {}
+    // V3 file-proxy:access JWT 已轮换,oc_session cookie 也跟着对应的 exp 续期。
+    // fire-and-forget,避免阻塞 401-retry pipeline。传入 expectedEpoch = 本次
+    // refresh 绑定的 myEpoch —— mint 响应回来后若 epoch 变过会 self-clear,
+    // 防止旧身份的 session cookie 被新身份 inheritance。
+    // 用 dynamic import 避开与 auth.js 的循环依赖(auth.js 也 import 了 api.js)。
+    void import('./auth.js?v=fileproxy1').then(({ mintSessionCookie }) => {
+      mintSessionCookie(data.access_token, expectedEpoch).catch(() => {})
+    }).catch(() => {})
     return { ok: true, race: false }
   }
   // 401 + REFRESH_RACE = 多 tab race,server 没清 cookie,稍后 retry 一次

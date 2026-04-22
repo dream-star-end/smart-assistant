@@ -49,7 +49,7 @@
  */
 
 import type Docker from "dockerode";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, createHmac } from "node:crypto";
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
 import type { Pool, PoolClient } from "pg";
@@ -470,6 +470,18 @@ export interface V3SupervisorDeps {
    * 详见 `DEFAULT_V3_CCB_BASELINE_DIR` / `resolveCcbBaselineMounts` 注释。
    */
   ccbBaselineDir?: string;
+  /**
+   * v3 file proxy —— HOST 根 secret(32 byte hex),用于给每个容器算
+   * `OC_BRIDGE_NONCE = HMAC_SHA256(bridgeSecret, containerId)`。
+   *
+   * 注入 → provisionV3Container 会同时往容器 env 写入 OC_CONTAINER_ID +
+   * OC_BRIDGE_NONCE;容器内 /healthz 依赖这两个 env 存在才广播
+   * `file-proxy-v1` capability。
+   *
+   * 未注入 → 容器 env 里不写 OC_BRIDGE_NONCE → /healthz 不广播 capability →
+   * containerFileProxy 探测到 CONTAINER_OUTDATED → 503(等同 file proxy 未启用)。
+   */
+  bridgeSecret?: string;
 }
 
 /** provision 成功后返回。3D ensureRunning 拿来注入到 userChatBridge */
@@ -866,6 +878,19 @@ export async function provisionV3Container(
       // catch 后 warn+fallback user-only,不影响容器启动。
       `OPENCLAUDE_BASELINE_SKILLS_DIR=${V3_CONFIG_TMPFS_PATH}/skills`,
     ];
+
+    // v3 file proxy:bridgeSecret 就位 → 注入 OC_CONTAINER_ID + OC_BRIDGE_NONCE。
+    // 容器内 gateway 靠这两个 env 做 bridge bypass 校验 + /healthz capability 广播。
+    // 缺失(deps.bridgeSecret 未注入)→ 容器不广播 file-proxy-v1,HOST 代理探测到
+    // CONTAINER_OUTDATED 自动降级。
+    if (deps.bridgeSecret) {
+      env.push(`OC_CONTAINER_ID=${String(row.id)}`);
+      env.push(
+        `OC_BRIDGE_NONCE=${createHmac("sha256", deps.bridgeSecret)
+          .update(String(row.id))
+          .digest("hex")}`,
+      );
+    }
 
     // CCB 基线只读挂载。**fail-closed 默认**:基线缺失/校验失败 → 抛
     // SupervisorError("CcbBaselineMissing"),用户启动失败,运维必须修基线才能恢复。
