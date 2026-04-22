@@ -335,6 +335,41 @@ export function embedMediaUrls(html) {
     },
   )
 
+  // Step 1b: 任意扩展名的"约定发布目录"兜底 —— agent 按 platform-capabilities
+  // skill 指导把文件写到 /home/agent/.openclaude/ 或 /root/.openclaude/ 下,然后
+  // 在消息里写纯绝对路径。Step 1 的 _MEDIA_EXTS 只认媒体扩展,.txt/.zip/.json/.csv
+  // 等日常文件被漏掉变纯文字,用户点不开。这里加一条前缀白名单 fallback:路径以
+  // 约定目录开头 + 至少带一个扩展名 → 走 _renderLocalMedia 的 📎 文件卡片分支(该
+  // 函数已内置 img/audio/video/pdf 分支,其他扩展自动走 doc-card)。
+  // 前缀严格限定 .openclaude/ 子树,避免 /etc/passwd 这类路径被误转 —— 容器端白
+  // 名单也会拦,但前端不显示成链接更干净。
+  // <code> 包裹的路径同样由 step 1 的 <code> 分支只处理媒体,这里再加 <code> 版本
+  // 的 fallback 保持两条分支一致。
+  const _PUB_PREFIX = '(?:/home/agent|/root)/\\.openclaude/[^\\s<"\'`>]+?\\.[A-Za-z0-9]{1,10}'
+  html = html.replace(
+    new RegExp(`<code>(${_PUB_PREFIX})</code>`, 'g'),
+    (match, rawPath) => {
+      const filePath = rawPath
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+      return _renderLocalMedia(filePath)
+    },
+  )
+  html = html.replace(
+    new RegExp(`((?:^|[\\s>])(${_PUB_PREFIX}))`, 'g'),
+    (match, full, filePath, offset) => {
+      const before = html.substring(Math.max(0, offset - 10), offset)
+      if (/(?:src|href|poster)\s*=\s*["']?\s*$/i.test(before)) return match
+      if (/<(?:a|img|video|audio)[^>]*$/i.test(html.substring(Math.max(0, offset - 100), offset)))
+        return match
+      const prefix = full.charAt(0) !== '/' ? full.charAt(0) : ''
+      return prefix + _renderLocalMedia(filePath)
+    },
+  )
+
   // Step 2: Detect HTTP URLs and /api/ paths
   const URL_RE = /((?:https?:\/\/[^\s"'<>)]+|\/api\/(?:media|file)[^\s"'<>)]+))/g
 
