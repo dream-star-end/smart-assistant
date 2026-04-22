@@ -79,6 +79,19 @@ export const V3_CONTAINER_PORT = 18789;
 /** CLAUDE_CONFIG_DIR tmpfs 挂载点(防 settings.json 残留) */
 export const V3_CONFIG_TMPFS_PATH = "/run/oc/claude-config";
 
+/**
+ * 容器内 CCB session JSONL 文件的持久化挂载点(tmpfs 的 projects 子目录),
+ * supervisor 用独立 named volume 覆盖这段路径,让 `--resume <id>` 跨容器重启依然有效。
+ *
+ * 为什么 projects 要单独一个 volume 而不是跟主 volume 共用 subpath:
+ *   - docker VolumeOptions.Subpath 需要目标路径在 volume 内 pre-create,否则 mount 报错;
+ *     独立 volume 让 docker 基于镜像里的 `/run/oc/claude-config/projects/` 自动初始化,
+ *     ownership(agent:agent)+ mode(0700)都继承,不用 supervisor 额外起 helper 容器 mkdir。
+ *   - 持久化粒度独立:只 persist CCB 对话 JSONL,`.config.json` / `settings.json` /
+ *     `.credentials.json` 仍在 tmpfs,每次冷启都清空,保留原设计"settings 不残留"的意图。
+ */
+export const V3_PROJECTS_MOUNT = "/run/oc/claude-config/projects";
+
 /** 容器内单个 named volume 的挂载点(对应个人版 ~/.openclaude) */
 export const V3_VOLUME_MOUNT = "/home/agent/.openclaude";
 
@@ -261,12 +274,33 @@ export function v3ContainerNameFor(uid: number): string {
   return `oc-v3-u${uid}`;
 }
 
-/** uid → 单个 named volume 名。`oc-v3-data-u<uid>` */
+/** uid → 主 named volume 名(挂 /home/agent/.openclaude)。`oc-v3-data-u<uid>` */
 export function v3VolumeNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
   }
   return `oc-v3-data-u${uid}`;
+}
+
+/**
+ * uid → CCB projects(session JSONL)持久化 volume 名。`oc-v3-proj-u<uid>`。
+ *
+ * 独立于主 volume,专用于 `/run/oc/claude-config/projects` 挂载点。
+ * 主 volume 死了这个也要一起死(GC / reconcile 成对操作),两者生命周期绑定。
+ */
+export function v3ProjectsVolumeNameFor(uid: number): string {
+  if (!Number.isInteger(uid) || uid <= 0) {
+    throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
+  }
+  return `oc-v3-proj-u${uid}`;
+}
+
+/** 双 volume 名的打包返回值 */
+export interface V3VolumePair {
+  /** 主数据 volume(挂 /home/agent/.openclaude) */
+  data: string;
+  /** CCB projects volume(挂 /run/oc/claude-config/projects) */
+  projects: string;
 }
 
 /** 在 172.30.0.0/16 内挑一个 IP(默认实现) */
@@ -330,13 +364,21 @@ function isNotModified(err: unknown): boolean {
 // ───────────────────────────────────────────────────────────────────────
 
 /**
- * 幂等创建用户 volume(v3 单个,不像 v2 双 volume)。
+ * 幂等创建单个用户 volume 并校验 label/driver/options。
  *
  * 复用 v2 volumes.ts 的 label 守护模式:create 之后 inspect,断言 managed +
  * uid 对得上,Driver=local 且 Options 为空。任何不符 → 拒绝接管。
+ *
+ * `purpose` 仅用于错误诊断(wire 消息可读),不落 label —— 两条 volume 靠名字
+ * 前缀(oc-v3-data- / oc-v3-proj-)就能完全区分,多加 label 只增加接管时
+ * 校验负担,没实际收益。
  */
-async function ensureV3Volume(docker: Docker, uid: number): Promise<string> {
-  const name = v3VolumeNameFor(uid);
+async function ensureSingleV3Volume(
+  docker: Docker,
+  uid: number,
+  name: string,
+  purpose: "data" | "projects",
+): Promise<void> {
   await docker.createVolume({
     Name: name,
     Driver: "local",
@@ -349,20 +391,20 @@ async function ensureV3Volume(docker: Docker, uid: number): Promise<string> {
   if (info.Driver && info.Driver !== "local") {
     throw new SupervisorError(
       "InvalidArgument",
-      `volume ${name} exists with driver=${info.Driver}, expected local`,
+      `volume ${name} (${purpose}) exists with driver=${info.Driver}, expected local`,
     );
   }
   const labels = (info.Labels ?? {}) as Record<string, string>;
   if (labels[V3_MANAGED_LABEL_KEY] !== "1") {
     throw new SupervisorError(
       "InvalidArgument",
-      `volume ${name} exists but is not managed by openclaude v3 (missing ${V3_MANAGED_LABEL_KEY})`,
+      `volume ${name} (${purpose}) exists but is not managed by openclaude v3 (missing ${V3_MANAGED_LABEL_KEY})`,
     );
   }
   if (labels[V3_UID_LABEL_KEY] !== String(uid)) {
     throw new SupervisorError(
       "InvalidArgument",
-      `volume ${name} exists but belongs to uid=${labels[V3_UID_LABEL_KEY]}, expected ${uid}`,
+      `volume ${name} (${purpose}) exists but belongs to uid=${labels[V3_UID_LABEL_KEY]}, expected ${uid}`,
     );
   }
   // bind / nfs / 其它带 Options 的 volume 拒绝接管(防同名 + label 伪造)
@@ -370,20 +412,42 @@ async function ensureV3Volume(docker: Docker, uid: number): Promise<string> {
   if (opts && typeof opts === "object" && Object.keys(opts).length > 0) {
     throw new SupervisorError(
       "InvalidArgument",
-      `volume ${name} exists with custom Options=${JSON.stringify(opts)}; refuse to adopt`,
+      `volume ${name} (${purpose}) exists with custom Options=${JSON.stringify(opts)}; refuse to adopt`,
     );
   }
-  return name;
 }
 
-/** 删 user volume(stop+remove 容器后才能删,否则 docker 409)。missing → noop */
+/**
+ * 幂等创建用户两个 volume:
+ *   - 主 volume(`oc-v3-data-u<uid>`)→ /home/agent/.openclaude
+ *   - projects volume(`oc-v3-proj-u<uid>`)→ /run/oc/claude-config/projects
+ *
+ * 两个 volume 的生命周期绑定:ensureV3Volumes 一起建,removeV3Volumes 一起删。
+ * 任一 volume 被 label 守护拒绝 → 直接抛,不尝试部分接管(语义更清晰)。
+ */
+async function ensureV3Volumes(docker: Docker, uid: number): Promise<V3VolumePair> {
+  const data = v3VolumeNameFor(uid);
+  const projects = v3ProjectsVolumeNameFor(uid);
+  await ensureSingleV3Volume(docker, uid, data, "data");
+  await ensureSingleV3Volume(docker, uid, projects, "projects");
+  return { data, projects };
+}
+
+/**
+ * 删 user volume(stop+remove 容器后才能删,否则 docker 409)。missing → noop。
+ *
+ * 两个 volume 都删。任一抛错都直接抛;部分失败场景由 volumeGc / orphan
+ * reconcile 下一跳自愈(GC 会重新 SELECT 尚未删的候选)。
+ */
 export async function removeV3Volume(docker: Docker, uid: number): Promise<void> {
-  const name = v3VolumeNameFor(uid);
-  try {
-    await docker.getVolume(name).remove();
-  } catch (err) {
-    if (isNotFound(err)) return;
-    throw wrapDockerError(err);
+  const names = [v3VolumeNameFor(uid), v3ProjectsVolumeNameFor(uid)];
+  for (const name of names) {
+    try {
+      await docker.getVolume(name).remove();
+    } catch (err) {
+      if (isNotFound(err)) continue;
+      throw wrapDockerError(err);
+    }
   }
 }
 
@@ -496,7 +560,7 @@ export async function provisionV3Container(
   let row: { id: number; boundIp: string };
   let secret: string;
   let secretHash: Buffer;
-  let volumeName: string;
+  let volumeNames: V3VolumePair;
   let createdDockerId = "";
   try {
     await client.query("BEGIN");
@@ -524,9 +588,9 @@ export async function provisionV3Container(
       );
     }
 
-    // ensureV3Volume 必须在持 per-uid lock 期间调,防 GC race(见函数 doc)
+    // ensureV3Volumes 必须在持 per-uid lock 期间调,防 GC race(见函数 doc)
     try {
-      volumeName = await ensureV3Volume(deps.docker, uid);
+      volumeNames = await ensureV3Volumes(deps.docker, uid);
     } catch (err) {
       throw wrapDockerError(err);
     }
@@ -597,11 +661,25 @@ export async function provisionV3Container(
           // CLAUDE_CONFIG_DIR tmpfs(防 ~/.claude/settings.json 残留)
           // uid/gid=1000 必须显式给 — 容器跑 agent (1000:1000),tmpfs 默认 root:root
           // 0700 会让 ccb 子进程 EACCES 读写 settings.json,表现为静默 exit 0(踩雷于 2026-04-21)
+          //
+          // 注意:projects 子目录由下方 projects volume 覆盖挂载,CCB 的 session JSONL
+          // (`~/.claude/projects/<cwd>/<sessId>.jsonl`)因此跨容器重启依然在 —— 否则
+          // 用户再次进入历史会话,CCB `--resume <id>` 找不到 JSONL 直接 exit 1,前端
+          // 看到"AI 进程异常退出"(2026-04-22 修复)。
           Tmpfs: {
             [V3_CONFIG_TMPFS_PATH]: "rw,nosuid,nodev,size=4m,mode=0700,uid=1000,gid=1000",
           },
-          // 单 volume → /home/agent/.openclaude(个人版状态目录)
-          Binds: [`${volumeName}:${V3_VOLUME_MOUNT}:rw`],
+          // 双 volume:
+          //   - 主 volume → /home/agent/.openclaude(个人版状态目录)
+          //   - projects volume → /run/oc/claude-config/projects(CCB 对话 JSONL)
+          //
+          // projects volume 必须是独立 named volume(不能用 subpath),docker 基于镜像
+          // 里 /run/oc/claude-config/projects 目录初始化 ownership=agent:agent + mode=0700,
+          // 无需 supervisor 再起 helper 容器 mkdir。
+          Binds: [
+            `${volumeNames.data}:${V3_VOLUME_MOUNT}:rw`,
+            `${volumeNames.projects}:${V3_PROJECTS_MOUNT}:rw`,
+          ],
           RestartPolicy: { Name: "no", MaximumRetryCount: 0 },
           // 给容器分一些 shm,但限到 64MB 防 OOM 绕过
           ShmSize: 64 * 1024 * 1024,

@@ -79,9 +79,15 @@ RUN set -eux; \
     chmod 750 /home/agent; \
     # /run/oc/claude-config: CLAUDE_CONFIG_DIR 目标(supervisor --tmpfs 挂)。
     # 镜像里建空目录,本地 build smoke 测试时若没挂 tmpfs 退到 root fs 也能跑。
-    mkdir -p /run/oc/claude-config; \
-    chown agent:agent /run/oc/claude-config; \
-    chmod 0700 /run/oc/claude-config
+    #
+    # /run/oc/claude-config/projects: CCB 对话 JSONL 持久化目录,supervisor 会单独挂
+    # named volume `oc-v3-proj-u<uid>` 覆盖这段路径。docker 基于这里的 ownership +
+    # mode 初始化新 volume(0700 agent:agent),不能漏,漏了 CCB 以 agent uid 写会
+    # EACCES(2026-04-22 踩过)。
+    mkdir -p /run/oc/claude-config/projects; \
+    chown -R agent:agent /run/oc/claude-config; \
+    chmod 0700 /run/oc/claude-config; \
+    chmod 0700 /run/oc/claude-config/projects
 
 # ------------------------------------------------------------
 # Personal-version 源码 + npm install

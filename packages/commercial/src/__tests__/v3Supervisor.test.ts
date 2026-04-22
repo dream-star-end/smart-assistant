@@ -30,11 +30,13 @@ import {
   getV3ContainerStatus,
   v3ContainerNameFor,
   v3VolumeNameFor,
+  v3ProjectsVolumeNameFor,
   V3_NETWORK_NAME,
   V3_INTERNAL_PROXY_URL,
   V3_CONTAINER_PORT,
   V3_CONFIG_TMPFS_PATH,
   V3_VOLUME_MOUNT,
+  V3_PROJECTS_MOUNT,
   SupervisorError,
 } from "../agent-sandbox/index.js";
 
@@ -301,15 +303,17 @@ function fixedIps(ips: string[]): () => string {
 //  纯名字函数
 // ───────────────────────────────────────────────────────────────────────
 
-describe("v3ContainerNameFor / v3VolumeNameFor", () => {
+describe("v3ContainerNameFor / v3VolumeNameFor / v3ProjectsVolumeNameFor", () => {
   test("happy path", () => {
     assert.equal(v3ContainerNameFor(42), "oc-v3-u42");
     assert.equal(v3VolumeNameFor(42), "oc-v3-data-u42");
+    assert.equal(v3ProjectsVolumeNameFor(42), "oc-v3-proj-u42");
   });
   test("rejects bad uid", () => {
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       assert.throws(() => v3ContainerNameFor(bad as number), SupervisorError);
       assert.throws(() => v3VolumeNameFor(bad as number), SupervisorError);
+      assert.throws(() => v3ProjectsVolumeNameFor(bad as number), SupervisorError);
     }
   });
 });
@@ -339,11 +343,16 @@ describe("provisionV3Container", () => {
     assert.equal(result.token, `oc-v3.${result.containerId}.${SECRET}`);
     assert.ok(result.dockerContainerId.length > 0);
 
-    // volume 落 label
-    assert.equal(captured.volumesCreated.length, 1);
-    assert.equal(captured.volumesCreated[0]!.Name, "oc-v3-data-u777");
-    assert.equal(captured.volumesCreated[0]!.Labels?.["com.openclaude.v3.managed"], "1");
-    assert.equal(captured.volumesCreated[0]!.Labels?.["com.openclaude.v3.uid"], "777");
+    // volume 落 label(data + projects 两个,顺序按 ensureV3Volumes 内部)
+    assert.equal(captured.volumesCreated.length, 2);
+    const dataVol = captured.volumesCreated.find((v) => v.Name === "oc-v3-data-u777");
+    const projVol = captured.volumesCreated.find((v) => v.Name === "oc-v3-proj-u777");
+    assert.ok(dataVol, "oc-v3-data-u777 must be created");
+    assert.ok(projVol, "oc-v3-proj-u777 must be created");
+    assert.equal(dataVol!.Labels?.["com.openclaude.v3.managed"], "1");
+    assert.equal(dataVol!.Labels?.["com.openclaude.v3.uid"], "777");
+    assert.equal(projVol!.Labels?.["com.openclaude.v3.managed"], "1");
+    assert.equal(projVol!.Labels?.["com.openclaude.v3.uid"], "777");
 
     // container 参数
     assert.equal(captured.containersCreated.length, 1);
@@ -381,8 +390,11 @@ describe("provisionV3Container", () => {
     assert.match(tmp, /nodev/);
     assert.match(tmp, /mode=0700/);
 
-    // 单 volume → /home/agent/.openclaude:rw
-    assert.deepEqual(opts.HostConfig?.Binds, [`oc-v3-data-u777:${V3_VOLUME_MOUNT}:rw`]);
+    // 双 volume: data → /home/agent/.openclaude; projects → /run/oc/claude-config/projects
+    assert.deepEqual(opts.HostConfig?.Binds, [
+      `oc-v3-data-u777:${V3_VOLUME_MOUNT}:rw`,
+      `oc-v3-proj-u777:${V3_PROJECTS_MOUNT}:rw`,
+    ]);
 
     // restart no
     assert.equal(opts.HostConfig?.RestartPolicy?.Name, "no");

@@ -43,6 +43,7 @@ import type { Pool } from "pg";
 import {
   acquireUserLifecycleLock,
   removeV3Volume,
+  v3ProjectsVolumeNameFor,
   v3VolumeNameFor,
 } from "./v3supervisor.js";
 import type { V3SupervisorDeps } from "./v3supervisor.js";
@@ -90,7 +91,7 @@ export type VolumeGcReason = "banned" | "no_login";
 export interface VolumeGcTickResult {
   /** 本次 tick 扫到多少候选 uid(banned + no-login 合并去重) */
   scanned: number;
-  /** 实际被 docker volume rm 的 volume 数 */
+  /** 实际被 GC 的 user 数(每 user 一次性删 data + projects 两个 volume,计 1) */
   removed: number;
   /** 因有 active 容器行而 skip 的 uid 数 */
   skippedActiveContainer: number;
@@ -334,10 +335,11 @@ export async function runVolumeGcTick(
         });
       } else if (outcome.kind === "removed") {
         removed++;
-        log?.info?.("[v3/volumeGc] removed volume", {
+        log?.info?.("[v3/volumeGc] removed volumes", {
           uid: cand.uid,
           reason: cand.reason,
-          volume: v3VolumeNameFor(cand.uid),
+          // removeV3Volume 内部双删 data + projects;日志列两个名,便于事故定位
+          volumes: [v3VolumeNameFor(cand.uid), v3ProjectsVolumeNameFor(cand.uid)],
         });
       } else {
         errors.push({ uid: cand.uid, reason: cand.reason, error: outcome.error });

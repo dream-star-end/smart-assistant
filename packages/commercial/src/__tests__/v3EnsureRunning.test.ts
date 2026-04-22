@@ -221,7 +221,7 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
         Driver: "local",
         Labels: {
           "com.openclaude.v3.managed": "1",
-          "com.openclaude.v3.uid": name.replace(/^oc-v3-data-u/, ""),
+          "com.openclaude.v3.uid": name.replace(/^oc-v3-(data|proj)-u/, ""),
         },
       }),
       remove: async () => { /* noop */ },
