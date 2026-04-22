@@ -119,8 +119,17 @@ self.addEventListener('fetch', (event) => {
   const isAppModule = url.pathname.startsWith('/modules/') && url.pathname.endsWith('.js')
 
   if (isAppModule) {
+    // 2026-04-22 bug-fix:ES module `import './api.js'` 不带 ?v=,走 bare path。
+    // 如果不加 `cache: 'no-store'`,SW 的 fetch(req) 会命中浏览器自己的 http cache
+    // (Cache-Control: max-age=14400 来自 Caddy/CF),拿回的仍是旧版 —— 然后
+    // SW 把旧版 put 进 caches storage,后续所有 fetch 继续吃旧。现象:deploy 后
+    // 新 main.js 带新 ?v= 会拉新,但新 main.js 里 `import './api.js'` 走 bare path,
+    // 命中旧 api.js → "module does not provide an export named X" 崩溃。
+    // no-store 只影响浏览器 http cache;CF edge 仍会命中缓存(4h max-age),但
+    // deploy 后我们主动 rsync + 浏览器 request 直接到 CF,CF miss 后回源 Caddy
+    // 拿到新版 —— 整条链路最多一次 round-trip 就对齐了。
     event.respondWith(
-      fetch(req)
+      fetch(req, { cache: 'no-store' })
         .then((res) => {
           if (res.status === 200) {
             const copy = res.clone()
