@@ -859,6 +859,12 @@ export async function provisionV3Container(
       //   全靠 supervisor 显式注入,确保镜像哪怕被旁路其他渠道跑起来也仍然 fail-closed。
       //   不在 entrypoint.sh 兜默认值 — 避免镜像变成"只要 host 能从 172.30.0.1 触达就免认证"。
       `OPENCLAUDE_TRUST_BRIDGE_IP=${V3_GATEWAY_IP}`,
+      // PR4: 让容器内 mcp-memory 的 SkillStore 能看到 ro 挂载的平台基线 skill。
+      // mcp-memory 只认这个显式 env —— 不 fallback 到 CLAUDE_CONFIG_DIR,personal 版
+      // 不注入该 env 自动退化为 user-only,不会把用户自建 skill 误判成只读基线。
+      // baseline mount 本身若缺失/OPTIONAL=1,SkillStore 构造期会抛 → mcp-memory
+      // catch 后 warn+fallback user-only,不影响容器启动。
+      `OPENCLAUDE_BASELINE_SKILLS_DIR=${V3_CONFIG_TMPFS_PATH}/skills`,
     ];
 
     // CCB 基线只读挂载。**fail-closed 默认**:基线缺失/校验失败 → 抛
@@ -907,9 +913,10 @@ export async function provisionV3Container(
         // skill-management)。新增基线 skill 不再改这里,改
         // V3_CCB_BASELINE_SKILL_NAMES manifest 即可。
         //
-        // 代价:用户无法再往 /run/oc/claude-config/skills/ 写自建 skill;这条
-        // 路径由 PR4(SkillStore system+user 合并读 + safeReadFile 参数化 root)
-        // 迁到 /home/agent/.claude/skills/ 可写目录恢复。
+        // 用户自建 skill 由 PR4 的 SkillStore baseline-wins 合并视图在
+        // /home/agent/.openclaude/agents/<id>/skills/ 提供,通过 env
+        // OPENCLAUDE_BASELINE_SKILLS_DIR 让容器内 mcp-memory 把这个 ro 目录
+        // 叠加成 source=platform 只读视图,读路径走平台优先、写路径只落用户目录。
         `${baselineMounts.skillsDirHostPath}:${V3_CONFIG_TMPFS_PATH}/skills:ro`,
       );
     }

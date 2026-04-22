@@ -68,11 +68,11 @@ skill_save(
 - 名词开头表示知识类: `minimax-api-quirks`, `css-grid-patterns`
 - 以 `system-` 前缀标记平台内置 skill(不要删除这些)
 
-## 两套 skill 来源(不要混淆)
+## 两套 skill 来源(skill_list/skill_view 会统一合并展示)
 
-容器里有**两套独立 skill 机制**,走不同的路径、不同的工具:
+容器里有**两套存储**,但 MCP 工具会按 baseline-wins 规则合并给你看:
 
-### 1. 平台基线 skill(只读,Claude Code 直接加载)
+### 1. 平台基线 skill(只读,权威)
 
 claudeai.chat 容器启动时,平台通过 kernel ro bind mount 把一批基线 skill 挂进
 `/run/oc/claude-config/skills/`(整目录只读,EROFS)。这些是:
@@ -83,16 +83,24 @@ claudeai.chat 容器启动时,平台通过 kernel ro bind mount 把一批基线 
 - `scheduled-tasks` — 定时任务创建方法
 - `skill-management` — 本文件
 
-基线 skill **不进 `skill_list` / `skill_view`**。Claude Code(CCB)启动时直接从
-`$CLAUDE_CONFIG_DIR/skills/` 扫这批 skill,它们是 system-prompt 层面的能力,
-对基线路径的写操作都会被 kernel 拒,`skill_delete` 也删不掉。
+这批 skill 在 `skill_list` 输出里标 `source=platform`,在 `skill_view` 输出顶部
+也带 `[source: platform]` 标记。**只读**:`skill_save` 传相同 name 会被拒绝
+(错误文案里写 "reserved for platform baseline skill"),`skill_delete` 传基线
+名字也会被拒。同时 Claude Code(CCB)启动时还会从 `$CLAUDE_CONFIG_DIR/skills/`
+自动扫到这批 skill 进系统 prompt,所以你启动起来就能感知它们的存在。
 
-### 2. OpenClaude SkillStore(可读写,`skill_save` / `skill_list` / `skill_view`)
+### 2. 用户自建 skill(可读写)
 
 `skill_save` 写到 `/home/agent/.openclaude/agents/<agentId>/skills/`(named volume,
-跨容器重启保留,用户容器内读写没问题)。`skill_list` / `skill_view` / `skill_delete`
-**只看这条路径**,不跨界读基线挂载点。
+跨容器重启保留)。`skill_list` 里标 `source=user`,`skill_view` 顶部带
+`[source: user]` 标记。
 
-所以:
-- 要用户读到"基线 skill 做什么",引导他们看 `/run/oc/claude-config/skills/<name>/SKILL.md`
-- 要保存自己总结的新 skill,用 `skill_save(...)` —— 它会进 SkillStore,下次对话前自动出现在 system prompt
+### baseline-wins 语义
+
+- **读路径**(list / view):平台基线优先 —— 如果用户目录里碰巧有同名 skill 残留
+  (比如历史版本写过),会被基线遮蔽,不会出现在 list 输出,view 也只返回基线内容。
+- **清理路径**(delete):对被 shadow 的用户残件调用 `skill_delete(<baseline_name>)`
+  会清掉用户这一份(note 提示"platform baseline remains"),基线本身仍然保留、仍然
+  可见。纯粹基线 skill(用户目录里没同名)delete 会直接被拒。
+- **写路径**(save):命中基线名字直接被拒。想要"改基线"的想法是违规的,
+  写一个不同名的 skill 或者向平台团队反馈需求。

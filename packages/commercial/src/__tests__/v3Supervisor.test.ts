@@ -386,6 +386,11 @@ describe("provisionV3Container", () => {
     assert.ok(env.includes(`ANTHROPIC_AUTH_TOKEN=${result.token}`));
     assert.ok(env.includes("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1"));
     assert.ok(env.includes(`CLAUDE_CONFIG_DIR=${V3_CONFIG_TMPFS_PATH}`));
+    // PR4: mcp-memory SkillStore 通过这个 env 接管平台基线只读视图
+    assert.ok(
+      env.includes(`OPENCLAUDE_BASELINE_SKILLS_DIR=${V3_CONFIG_TMPFS_PATH}/skills`),
+      "supervisor must inject OPENCLAUDE_BASELINE_SKILLS_DIR so SkillStore can overlay platform baseline",
+    );
 
     // 网络 + IP forced via IPAMConfig
     assert.equal(opts.HostConfig?.NetworkMode, V3_NETWORK_NAME);

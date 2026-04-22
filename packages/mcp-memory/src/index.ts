@@ -49,7 +49,39 @@ const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 
 const memory = new MemoryStore(AGENT_ID)
 await memory.load()
-const skills = new SkillStore(AGENT_ID)
+
+/**
+ * PR4: optional platform baseline skills dir (ro mount in v3 containers).
+ * Only the explicit `OPENCLAUDE_BASELINE_SKILLS_DIR` env is honored — we
+ * deliberately avoid fallbacks like `${CLAUDE_CONFIG_DIR}/skills` because that
+ * env is common in personal/local setups where the dir contains regular
+ * user-writable skills (not a platform baseline) and silently treating those as
+ * read-only platform skills would break existing workflows.
+ *
+ * Any failure (missing dir, not a directory, SkillStore constructor throw)
+ * warns to stderr and falls back to single-root user-only behavior rather
+ * than crashing the MCP server.
+ */
+function resolveBaselineDir(): string | undefined {
+  const raw = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
+  if (!raw || raw.trim() === '') return undefined
+  return raw
+}
+
+function buildSkillStore(): SkillStore {
+  const baselineDir = resolveBaselineDir()
+  if (baselineDir == null) return new SkillStore(AGENT_ID)
+  try {
+    return new SkillStore(AGENT_ID, { baselineDir })
+  } catch (err: any) {
+    process.stderr.write(
+      `[mcp-memory] OPENCLAUDE_BASELINE_SKILLS_DIR invalid (${baselineDir}), falling back to user-only: ${err?.message ?? err}\n`,
+    )
+    return new SkillStore(AGENT_ID)
+  }
+}
+
+const skills = buildSkillStore()
 
 // Track in-flight embedding tasks to prevent add/delete race conditions
 const pendingEmbeds = new Map<string, Promise<void>>()
@@ -476,22 +508,49 @@ async function handleSkillList() {
       ],
     }
   }
+  // PR4: group by source so the agent can tell platform-baseline (read-only,
+  // auto-loaded by Claude Code) from user-created skills it can edit/delete.
+  const platform = list.filter((s) => s.source === 'platform')
+  const user = list.filter((s) => s.source === 'user')
   const lines = [`You have ${list.length} skill(s):`, '']
-  for (const s of list) {
-    lines.push(`### ${s.name}`)
-    lines.push(s.description)
-    if (s.tags && s.tags.length > 0) lines.push(`tags: ${s.tags.join(', ')}`)
+  if (platform.length > 0) {
+    lines.push('## Platform baseline (read-only)')
     lines.push('')
+    for (const s of platform) {
+      lines.push(`### ${s.name}`)
+      lines.push(s.description)
+      if (s.tags && s.tags.length > 0) lines.push(`tags: ${s.tags.join(', ')}`)
+      lines.push('')
+    }
+  }
+  if (user.length > 0) {
+    lines.push('## User-created')
+    lines.push('')
+    for (const s of user) {
+      lines.push(`### ${s.name}`)
+      lines.push(s.description)
+      if (s.tags && s.tags.length > 0) lines.push(`tags: ${s.tags.join(', ')}`)
+      lines.push('')
+    }
   }
   lines.push('Use `skill_view(name)` to load full instructions for any skill above.')
+  lines.push(
+    'Baseline skills cannot be overwritten via `skill_save` (name is reserved) or deleted via `skill_delete`.',
+  )
   return { content: [{ type: 'text', text: lines.join('\n') }] }
 }
 
 async function handleSkillView(args: { name: string; subfile?: string }) {
   const v = await skills.view(args.name, args.subfile)
   if (!v) return toolError('skill not found')
-  if (typeof v === 'string') return { content: [{ type: 'text', text: v }] }
-  return { content: [{ type: 'text', text: v.rawContent }] }
+  if (typeof v === 'string') {
+    // Subfile read returns a bare string; we have no source metadata here without
+    // a second lookup, but the containing skill_view call can be assumed to land
+    // in whichever root actually owned the parent name (baseline-wins).
+    return { content: [{ type: 'text', text: v }] }
+  }
+  const header = `[source: ${v.source}]`
+  return { content: [{ type: 'text', text: `${header}\n\n${v.rawContent}` }] }
 }
 
 async function handleSkillSave(args: {
@@ -515,7 +574,12 @@ async function handleSkillSave(args: {
 async function handleSkillDelete(args: { name: string }) {
   const r = await skills.delete(args.name)
   if (!r.ok) return toolError(r.error ?? 'delete failed')
-  return toolOk(`Deleted skill "${args.name}".`)
+  // PR4: when a user shadow was removed but the platform baseline remains,
+  // propagate the note so the agent understands why list still shows the name.
+  const msg = r.note
+    ? `Deleted skill "${args.name}". ${r.note}`
+    : `Deleted skill "${args.name}".`
+  return toolOk(msg)
 }
 
 // ── Archival Memory handlers ──

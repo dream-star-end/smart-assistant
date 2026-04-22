@@ -63,12 +63,11 @@ mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
 
 - 查看当前所有 CLAUDE.md(全局 + 项目级):
   `find /run/oc/claude-config /home/agent -name CLAUDE.md 2>/dev/null`
-- 查看已保存的 skills:分两套来源 —— 平台基线 skill 由 Claude Code 从
-  `/run/oc/claude-config/skills/` 直接加载(只读,不进 `skill_list`);用户自建
-  skill 由 OpenClaude SkillStore 管,`skill_list` 列出来、`skill_view` 读内容,
-  磁盘上在 `/home/agent/.openclaude/agents/<agentId>/skills/`。
+- 查看已保存的 skills:`skill_list` 现在会**合并**两套来源,按 source 分组输出
+  —— 平台基线(source=platform,只读,磁盘上在 `/run/oc/claude-config/skills/`)
+  和用户自建(source=user,磁盘上在 `/home/agent/.openclaude/agents/<agentId>/skills/`)。
+  基线撞名被 baseline-wins 遮蔽用户同名条目。直接读磁盘:
   `ls /run/oc/claude-config/skills/ /home/agent/.openclaude/agents/*/skills/ 2>/dev/null`
-  可一次把两套都瞥一眼
 - 清理本容器的个性化 AI 记忆(**不可逆**,两步走:先预览,确认后才删):
   1. **先预览**待删文件,让用户核对:
      `find /run/oc/claude-config/projects -type f -path '*/memory/*.md' -printf '%p\n'`

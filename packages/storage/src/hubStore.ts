@@ -216,6 +216,10 @@ export class HubStore {
           created_at: meta.created_at,
           updated_at: meta.updated_at,
           path: paths.hubSkillDir(slug),
+          // Hub-installed skills surface to the agent through the same MCP list/view
+          // flow as self-authored ones (can be uninstalled, not protected by the
+          // platform-baseline contract) — so they count as 'user' for SkillMetadata.
+          source: 'user',
         })
       } catch {}
     }
