@@ -1,20 +1,24 @@
 [Unit]
-Description=OpenClaude Gateway
-After=network.target
+Description=OpenClaude Gateway (v3 commercial)
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/openclaude/openclaude
+EnvironmentFile=/etc/openclaude/commercial.env
 Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="OPENCLAUDE_HOME=/root/.openclaude"
-StateDirectory=openclaude
-StateDirectoryMode=0700
+Environment="NODE_ENV=production"
 ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:/var/log/openclaude.log
 StandardError=append:/var/log/openclaude.log
+LimitNOFILE=65536
+StateDirectory=openclaude
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
