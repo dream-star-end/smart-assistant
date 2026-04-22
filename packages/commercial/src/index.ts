@@ -53,6 +53,8 @@ import {
   type BridgeMetricSink,
 } from "./ws/userChatBridge.js";
 import {
+  DEFAULT_V3_CCB_BASELINE_DIR,
+  resolveCcbBaselineMounts,
   makeV3EnsureRunning,
   preheatV3Image,
   startIdleSweepScheduler,
@@ -456,6 +458,28 @@ export async function registerCommercial(
     };
     // eslint-disable-next-line no-console
     console.log("[commercial] v3 supervisor wired", { image: cfg.OC_RUNTIME_IMAGE });
+
+    // CCB 基线自检(只读诊断,不影响启动)——
+    // 告诉运维"容器 provision 时会不会真的注入平台守则",避免 rsync 漏了目录
+    // 但新容器起来了还以为安全策略生效的灰区。fail-open:不存在不报错,仅 warn。
+    {
+      const baselineDir = process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR;
+      const resolved = resolveCcbBaselineMounts(baselineDir);
+      if (resolved) {
+        // eslint-disable-next-line no-console
+        console.log("[commercial] v3 ccb baseline ready", {
+          baselineDir,
+          claudeMd: resolved.claudeMdHostPath,
+          systemInfoDir: resolved.systemInfoHostPath,
+        });
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[commercial] v3 ccb baseline MISSING — new containers will spawn without platform guardrails",
+          { baselineDir },
+        );
+      }
+    }
 
     // V3 Phase 3I — 启动时镜像预热(fire-and-forget):本地已有 → noop;
     // 没有 → docker pull,把首次 provision 30-60s 拉镜像延迟摊到启动时。

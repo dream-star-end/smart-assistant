@@ -50,6 +50,8 @@
 
 import type Docker from "dockerode";
 import { randomBytes, createHash } from "node:crypto";
+import { statSync } from "node:fs";
+import { join as pathJoin, resolve as pathResolve } from "node:path";
 import type { Pool, PoolClient } from "pg";
 import { SupervisorError } from "./types.js";
 
@@ -97,6 +99,75 @@ export const V3_VOLUME_MOUNT = "/home/agent/.openclaude";
 
 /** 容器内 entrypoint 跑的非 root 用户(uid:gid),与 Dockerfile USER 一致 */
 const V3_AGENT_USER = "1000:1000";
+
+/**
+ * CCB 平台基线目录的**默认**宿主路径(只读挂入容器 /run/oc/claude-config/ 的
+ * CLAUDE.md 和 skills/system-info/)。
+ *
+ * 用途:向容器内 Claude Code 子进程注入平台身份/守则/能力边界 —— 容器内任何
+ * 进程(包括 AI 自己)都无法修改,走 kernel ro bind mount 兜底。
+ *
+ * 目录结构(repo 内 `packages/commercial/agent-sandbox/ccb-baseline/` 完整 rsync 上去):
+ *   <baseline>/CLAUDE.md                     → /run/oc/claude-config/CLAUDE.md:ro
+ *   <baseline>/skills/system-info/SKILL.md   → /run/oc/claude-config/skills/system-info:ro
+ *
+ * 覆盖优先级(高→低):
+ *   1. V3SupervisorDeps.ccbBaselineDir(测试注入 / 多机部署)
+ *   2. env `OC_V3_CCB_BASELINE_DIR`
+ *   3. DEFAULT_V3_CCB_BASELINE_DIR
+ *
+ * **fail-open**:目录不存在 / 文件缺失 → warn 并跳过挂载,不阻断 provision。
+ * 基线是"加固层",缺了会退化回"没有守则的 ccb",但不该让用户完全用不了服务。
+ */
+export const DEFAULT_V3_CCB_BASELINE_DIR =
+  "/opt/openclaude/openclaude/packages/commercial/agent-sandbox/ccb-baseline";
+
+/** baseline 内部结构 —— 用 POSIX 绝对路径拼 docker Bind */
+export const V3_CCB_BASELINE_CLAUDE_MD_REL = "CLAUDE.md";
+export const V3_CCB_BASELINE_SYSTEM_INFO_REL = "skills/system-info";
+
+/**
+ * 读 env `OC_V3_CCB_BASELINE_DIR`;为空或空字符串 → 回落默认路径。
+ * 不做绝对路径校验(留给 resolveCcbBaselineMounts 的 stat 去 fail-open)。
+ */
+function readCcbBaselineDirFromEnv(): string {
+  const raw = process.env.OC_V3_CCB_BASELINE_DIR;
+  if (raw == null || raw.trim() === "") return DEFAULT_V3_CCB_BASELINE_DIR;
+  return raw.trim();
+}
+
+/**
+ * 校验 baseline 目录是否齐全 + 返回可直接拼 docker Bind 的绝对路径。
+ *
+ * 两个关键源都 OK → 返回两个绝对路径 + 校验通过字段;任一缺失或类型不对 → null。
+ * 传入的 dir 必须是绝对路径;相对路径直接拒(防止 dev 环境误把 cwd 相对路径塞进去)。
+ *
+ * 注意:只 stat 根文件/根目录存在性,不递归检查 `skills/system-info/SKILL.md` —— 后者
+ * 由 ccb 自己 skill loader 去读,缺了就 skill_list 少一条,不影响容器可用性。
+ */
+export function resolveCcbBaselineMounts(
+  baselineDir: string,
+): { claudeMdHostPath: string; systemInfoHostPath: string } | null {
+  if (typeof baselineDir !== "string" || baselineDir.trim() === "") return null;
+  // 拒绝相对路径 —— docker Bind 源必须绝对
+  const abs = pathResolve(baselineDir);
+  if (abs !== baselineDir) {
+    // 传入非绝对路径(pathResolve 会把 cwd 拼上去),fail-open
+    return null;
+  }
+  try {
+    const claudeMdHostPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_MD_REL);
+    const systemInfoHostPath = pathJoin(abs, V3_CCB_BASELINE_SYSTEM_INFO_REL);
+    const claudeStat = statSync(claudeMdHostPath);
+    const systemInfoStat = statSync(systemInfoHostPath);
+    if (!claudeStat.isFile()) return null;
+    if (!systemInfoStat.isDirectory()) return null;
+    return { claudeMdHostPath, systemInfoHostPath };
+  } catch {
+    // ENOENT / EACCES 等全走 fail-open
+    return null;
+  }
+}
 
 /** managed label,GC / orphan reconcile 用 */
 const V3_MANAGED_LABEL_KEY = "com.openclaude.v3.managed";
@@ -233,6 +304,14 @@ export interface V3SupervisorDeps {
    * 都会被忽略走默认。
    */
   maxRunningContainers?: number;
+  /**
+   * CCB 平台基线目录。覆盖 env `OC_V3_CCB_BASELINE_DIR`,env 不设则走
+   * `DEFAULT_V3_CCB_BASELINE_DIR`。目录不存在或结构不全 → provision 时 warn
+   * 并跳过基线挂载(fail-open,不阻断用户服务)。
+   *
+   * 详见 `DEFAULT_V3_CCB_BASELINE_DIR` / `resolveCcbBaselineMounts` 注释。
+   */
+  ccbBaselineDir?: string;
 }
 
 /** provision 成功后返回。3D ensureRunning 拿来注入到 userChatBridge */
@@ -624,6 +703,31 @@ export async function provisionV3Container(
       `OPENCLAUDE_TRUST_BRIDGE_IP=${V3_GATEWAY_IP}`,
     ];
 
+    // CCB 基线只读挂载。fail-open:基线缺失 → warn,容器仍正常 provision(无守则)。
+    // 基线齐全 → 在 Binds 上追加两条 :ro 项(单文件 + 单目录,分别覆盖 tmpfs 内的
+    // CLAUDE.md 和 skills/system-info)。docker daemon 会按挂载点深度排序,tmpfs
+    // 先于 bind 挂上,然后 ro bind 叠加,顺序正确无需我们干预。
+    const baselineDir = deps.ccbBaselineDir ?? readCcbBaselineDirFromEnv();
+    const baselineMounts = resolveCcbBaselineMounts(baselineDir);
+    if (!baselineMounts) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[v3supervisor] CCB baseline dir missing/incomplete; container will spawn WITHOUT platform guardrails",
+        { baselineDir, uid },
+      );
+    }
+
+    const binds: string[] = [
+      `${volumeNames.data}:${V3_VOLUME_MOUNT}:rw`,
+      `${volumeNames.projects}:${V3_PROJECTS_MOUNT}:rw`,
+    ];
+    if (baselineMounts) {
+      binds.push(
+        `${baselineMounts.claudeMdHostPath}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
+        `${baselineMounts.systemInfoHostPath}:${V3_CONFIG_TMPFS_PATH}/skills/system-info:ro`,
+      );
+    }
+
     let container;
     try {
       container = await deps.docker.createContainer({
@@ -676,10 +780,12 @@ export async function provisionV3Container(
           // projects volume 必须是独立 named volume(不能用 subpath),docker 基于镜像
           // 里 /run/oc/claude-config/projects 目录初始化 ownership=agent:agent + mode=0700,
           // 无需 supervisor 再起 helper 容器 mkdir。
-          Binds: [
-            `${volumeNames.data}:${V3_VOLUME_MOUNT}:rw`,
-            `${volumeNames.projects}:${V3_PROJECTS_MOUNT}:rw`,
-          ],
+          //
+          // 额外两条 :ro bind(若基线齐全):
+          //   - <baseline>/CLAUDE.md              → /run/oc/claude-config/CLAUDE.md:ro
+          //   - <baseline>/skills/system-info     → /run/oc/claude-config/skills/system-info:ro
+          // 内核层强制只读,容器内 ccb 和用户都无法改动平台守则。
+          Binds: binds,
           RestartPolicy: { Name: "no", MaximumRetryCount: 0 },
           // 给容器分一些 shm,但限到 64MB 防 OOM 绕过
           ShmSize: 64 * 1024 * 1024,
