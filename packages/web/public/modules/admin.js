@@ -2061,9 +2061,17 @@ async function _openBindIlinkModal() {
   if (abort.aborted) return
 
   const qrcode = qrResp.qrcode
-  const imgSrc = qrResp.qrcode_img_content
-    ? (qrResp.qrcode_img_content.startsWith('data:') ? qrResp.qrcode_img_content : `data:image/png;base64,${qrResp.qrcode_img_content}`)
-    : ''
+  // iLink 给的 qrcode_img_content 实际是 liteapp.weixin.qq.com 的图片 URL(见
+  // packages/channels/wechat/src/iLink.ts:26 注释),不是 base64。所以这里要三分支:
+  //   1. data:... 直接用;2. http(s):// 当 URL 直接塞 src;3. 兜底才当裸 base64 拼前缀。
+  const raw = qrResp.qrcode_img_content || ''
+  const imgSrc = !raw
+    ? ''
+    : raw.startsWith('data:')
+      ? raw
+      : /^https?:\/\//i.test(raw)
+        ? raw
+        : `data:image/png;base64,${raw}`
   $('al-qr-box').innerHTML = `
     <div style="color:var(--muted);font-size:13px;margin-bottom:8px">
       用<strong>已注册该机器人的微信</strong>扫码,然后点确认;确认后请再向机器人发任意一句话以捕获 context_token。
