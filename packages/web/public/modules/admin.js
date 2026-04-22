@@ -2032,6 +2032,22 @@ async function _openEditChannelModal(id) {
 
 // ── 绑定 iLink 微信(QR 扫码)──────────────────────────────────────
 
+// 用 /vendor/qrcode.min.js (qrcode-generator) 把任意字符串 encode 成 data:url QR 图。
+// 与 modules/wechat.js 的 qrDataUrl 同一套路,不抽公共模块是因为 admin bundle 独立,
+// 而那边是 SPA import,两边 HTML 各自引 vendor 脚本。
+function _qrDataUrl(text, size = 240) {
+  const maker = typeof window !== 'undefined' ? window.qrcode : undefined
+  if (typeof maker !== 'function') {
+    throw new Error('QR 渲染库未加载 (qrcode-generator)')
+  }
+  const qr = maker(0, 'M')
+  qr.addData(String(text))
+  qr.make()
+  const modules = qr.getModuleCount()
+  const cellSize = Math.max(1, Math.floor(size / (modules + 4)))
+  return qr.createDataURL(cellSize, 2)
+}
+
 async function _openBindIlinkModal() {
   openModal(`
     <h3>绑定微信告警通道</h3>
@@ -2061,17 +2077,26 @@ async function _openBindIlinkModal() {
   if (abort.aborted) return
 
   const qrcode = qrResp.qrcode
-  // iLink 给的 qrcode_img_content 实际是 liteapp.weixin.qq.com 的图片 URL(见
-  // packages/channels/wechat/src/iLink.ts:26 注释),不是 base64。所以这里要三分支:
-  //   1. data:... 直接用;2. http(s):// 当 URL 直接塞 src;3. 兜底才当裸 base64 拼前缀。
+  // iLink 给的 qrcode_img_content 是"扫码后要跳转的 liteapp.weixin.qq.com 短链",
+  // 不是图片 URL 也不是 base64 PNG —— 必须客户端自己把这段字符串 encode 成 QR 图。
+  // 复用 SPA 侧 wechat.js 用的 qrcode-generator 库(admin.html 已引入 /vendor/qrcode.min.js,
+  // 挂到 window.qrcode)。fallback:万一哪天 iLink 真返 data:/https://图片 URL,也能直接塞。
   const raw = qrResp.qrcode_img_content || ''
-  const imgSrc = !raw
-    ? ''
-    : raw.startsWith('data:')
-      ? raw
-      : /^https?:\/\//i.test(raw)
-        ? raw
-        : `data:image/png;base64,${raw}`
+  let imgSrc = ''
+  if (raw) {
+    if (raw.startsWith('data:')) {
+      imgSrc = raw
+    } else if (/^https?:\/\/.*\.(png|jpe?g|gif|svg|webp)(\?|$)/i.test(raw)) {
+      // 罕见:iLink 以后直接返真图片 URL 时直接用
+      imgSrc = raw
+    } else {
+      try {
+        imgSrc = _qrDataUrl(raw)
+      } catch (e) {
+        console.error('[alerts] QR encode failed:', e)
+      }
+    }
+  }
   $('al-qr-box').innerHTML = `
     <div style="color:var(--muted);font-size:13px;margin-bottom:8px">
       用<strong>已注册该机器人的微信</strong>扫码,然后点确认;确认后请再向机器人发任意一句话以捕获 context_token。

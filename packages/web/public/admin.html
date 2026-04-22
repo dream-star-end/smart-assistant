@@ -1412,6 +1412,10 @@
         });
       })();
     </script>
+    <!-- QR 渲染库(qrcode-generator,MIT)。iLink bot 绑定流返的是一个短链 URL,
+         不是图片,要客户端 encode 成 QR 码图给 admin 扫。与 SPA 侧 wechat 绑定
+         复用同一份库。普通 script 标签(非 module),挂到 window.qrcode 全局。 -->
+    <script src="/vendor/qrcode.min.js"></script>
     <script type="module" src="/modules/admin.js?v=dd3b072"></script>
   </body>
 </html>
