@@ -4621,59 +4621,165 @@ a:hover {
 }
 
 /* ─── V3 commercial: user preferences modal (Phase 4C) ─── */
+
+/* 修复 .form-row input { width:100%; min-height:44px; ... } 对 checkbox/radio 的污染。
+   没这条 override 时,prefs-modal 内的原生 radio 被撑成 44px 大圆、checkbox 成 44px 大方框,
+   整个 effort 选择器和邮件开关全散架。放在任何用 form-row 的 modal 里都通用。 */
+.form-row input[type="checkbox"],
+.form-row input[type="radio"] {
+  width: auto;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
 .prefs-select {
   width: 100%;
-  padding: 8px 12px;
-  background: var(--bg-raised);
+  padding: 10px 14px;
+  padding-right: 36px;
+  background: var(--bg);
   border: 1px solid var(--border);
   color: var(--fg);
   border-radius: var(--radius-md);
   font-size: var(--text-sm);
   font-family: inherit;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%239f9c96' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='3 4.5 6 7.5 9 4.5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+.prefs-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--ring);
 }
 .prefs-hint {
-  margin: 4px 0 0;
+  margin: 6px 2px 0;
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
+
+/* Segmented control — 等宽 5 格,选中态是亮白底 + accent 色字 + 弱阴影。
+   原生 radio input 用 opacity:0 + absolute 视觉隐藏,键盘焦点仍然有效。 */
+.prefs-effort-radios {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 3px;
+}
+.prefs-effort-pill {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 4px;
+  border-radius: calc(var(--radius-md) - 3px);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+  background: transparent;
+  user-select: none;
+  transition: color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
+  min-width: 0;
+  white-space: nowrap;
+}
+.prefs-effort-pill:hover {
+  color: var(--fg);
+}
+.prefs-effort-pill input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  margin: 0;
+}
+.prefs-effort-pill:has(input:checked) {
+  background: var(--bg);
+  color: var(--accent, #7c3aed);
+  font-weight: 600;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent, #7c3aed) 35%, transparent),
+    0 1px 3px rgba(0, 0, 0, 0.08);
+}
+.prefs-effort-pill:has(input:focus-visible) {
+  outline: 2px solid color-mix(in srgb, var(--accent, #7c3aed) 60%, transparent);
+  outline-offset: 1px;
+}
+
+/* iOS-style toggle row —— 文字在左(含副标说明),开关在右。 */
+.prefs-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+}
+.prefs-toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.prefs-toggle-title {
+  font-size: var(--text-sm);
+  color: var(--fg);
+  font-weight: 500;
+}
+.prefs-toggle-desc {
   font-size: var(--text-xs);
   color: var(--fg-muted);
 }
-.prefs-effort-radios {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+.prefs-switch {
+  position: relative;
+  display: inline-block;
+  width: 42px;
+  height: 24px;
+  flex-shrink: 0;
+  cursor: pointer;
 }
-.prefs-effort-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 12px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
+.prefs-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+  position: absolute;
+}
+.prefs-switch-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
   border-radius: 999px;
-  cursor: pointer;
-  font-size: var(--text-sm);
-  user-select: none;
-  transition: background var(--transition-fast), border-color var(--transition-fast);
+  transition: background 0.2s ease;
 }
-.prefs-effort-pill:has(input:checked) {
-  background: color-mix(in srgb, var(--accent, #7c3aed) 20%, transparent);
-  border-color: var(--accent, #7c3aed);
+.prefs-switch-slider::before {
+  content: "";
+  position: absolute;
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  top: 3px;
+  background: #fff;
+  border-radius: 999px;
+  transition: transform 0.2s ease;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
 }
-.prefs-effort-pill input {
-  margin: 0;
-  accent-color: var(--accent, #7c3aed);
+.prefs-switch input:checked + .prefs-switch-slider {
+  background: var(--accent, #7c3aed);
 }
-.prefs-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  font-size: var(--text-sm);
-  user-select: none;
+.prefs-switch input:checked + .prefs-switch-slider::before {
+  transform: translateX(18px);
 }
-.prefs-toggle input {
-  margin: 0;
-  accent-color: var(--accent, #7c3aed);
+.prefs-switch input:focus-visible + .prefs-switch-slider {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #7c3aed) 30%, transparent);
 }
+
 .prefs-status {
   margin-top: var(--space-3);
   font-size: var(--text-sm);

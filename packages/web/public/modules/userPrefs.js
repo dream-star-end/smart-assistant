@@ -31,7 +31,8 @@ let _modelOptions = null   // GET /api/models 缓存
 let _modelOptionsInflight = null
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh']
-const EFFORT_LABELS = { low: '低', medium: '中', high: '高', xhigh: '超高 (Opus 4.7)' }
+// 短标签:segmented control 需要等宽显示,xhigh=Opus 4.7 的信息挪到 hint 里
+const EFFORT_LABELS = { low: '低', medium: '中', high: '高', xhigh: '超高' }
 
 function $(id) { return document.getElementById(id) }
 

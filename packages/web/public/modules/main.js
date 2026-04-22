@@ -72,7 +72,7 @@ import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMo
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
 import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=44f77ff'
-import { initUserPrefs, openPrefsModal } from './userPrefs.js'
+import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=44f77ff'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
 import { initUsageStats, openUsageModal } from './usageStats.js?v=44f77ff'
 import { initWechatListeners, openWechatModal } from './wechat.js'

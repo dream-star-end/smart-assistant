@@ -989,13 +989,19 @@
       <div class="form-row">
         <label>默认 effort</label>
         <div id="prefs-effort-radios" class="prefs-effort-radios"></div>
-        <p class="prefs-hint">控制思考强度;effort 越高响应越深入但消耗也更多。</p>
+        <p class="prefs-hint">控制思考强度;effort 越高响应越深入但消耗也更多。选择「超高」会切到 Opus 4.7。</p>
       </div>
       <div class="form-row">
-        <label class="prefs-toggle">
-          <input type="checkbox" id="prefs-notify-email" />
-          <span>邮件通知支付与重要事件</span>
-        </label>
+        <div class="prefs-toggle-row">
+          <div class="prefs-toggle-text">
+            <div class="prefs-toggle-title">邮件通知</div>
+            <div class="prefs-toggle-desc">支付与重要事件</div>
+          </div>
+          <label class="prefs-switch" aria-label="邮件通知支付与重要事件">
+            <input type="checkbox" id="prefs-notify-email" />
+            <span class="prefs-switch-slider"></span>
+          </label>
+        </div>
       </div>
       <div id="prefs-status" class="prefs-status"></div>
     </div>
