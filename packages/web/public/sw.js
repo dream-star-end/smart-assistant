@@ -1,24 +1,24 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-acf9959'
+const VERSION = 'openclaude-5d1ccc1'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=acf9959',  // versioned URL used in index.html
+  '/style.css?v=5d1ccc1',  // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=acf9959',  // versioned URL used in index.html
+  '/modules/main.js?v=5d1ccc1',  // versioned URL used in index.html
   '/modules/auth.js',
-  '/modules/auth.js?v=acf9959',  // versioned URL used in main.js import (Turnstile reset fix)
+  '/modules/auth.js?v=5d1ccc1',  // versioned URL used in main.js import (Turnstile reset fix)
   '/modules/billing.js',
-  '/modules/billing.js?v=acf9959',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
+  '/modules/billing.js?v=5d1ccc1',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
   '/modules/userPrefs.js',
-  '/modules/userPrefs.js?v=acf9959',  // versioned URL used in main.js import (prefs modal redesign)
+  '/modules/userPrefs.js?v=5d1ccc1',  // versioned URL used in main.js import (prefs modal redesign)
   '/modules/usageStats.js',
-  '/modules/usageStats.js?v=acf9959',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/usageStats.js?v=5d1ccc1',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -34,7 +34,7 @@ const SHELL = [
   '/modules/memory.js',
   '/modules/tasks.js',
   '/modules/agents.js',
-  '/modules/agents.js?v=acf9959',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/agents.js?v=5d1ccc1',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/effortMode.js',
   '/modules/sessions.js',
   '/modules/sync.js',
