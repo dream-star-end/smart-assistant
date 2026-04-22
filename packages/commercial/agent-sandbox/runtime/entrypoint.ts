@@ -56,6 +56,20 @@ if (removed.length > 0) {
 // 强制 CLAUDE_CONFIG_DIR 指 tmpfs(就算 supervisor 没传也兜底)
 cleanEnv.CLAUDE_CONFIG_DIR = "/run/oc/claude-config";
 
+// 强制 OPENCLAUDE_HOME 指容器内 per-user named volume 挂载点。
+// 注意:personal 版 `@openclaude/storage/paths.ts` 里 `HOME` 是 module-level const,
+// 解析时机 = 模块首次 import,**在 gateway/cli 进程启动时就冻结**。如果此时 env 没设,
+// 就永远兜底回 `~/.openclaude`(容器内 = /home/agent/.openclaude —— 刚好也指向 volume),
+// **但**下游 subprocessRunner 在 spawn MCP 时又会把 `process.env.OPENCLAUDE_HOME ?? ''`
+// 原样传给 mcp-memory。当 env 里是空串(不是 undefined)时 `??` 不回退,MCP 侧 paths.ts
+// 就会看到 `HOME=''`,然后所有 `join('', 'agents', 'main', 'MEMORY.md')` 变相对路径,
+// 落到 MCP 进程的 cwd 里(/opt/openclaude),完全错位。因此 **这里必须显式 set**,确保
+// 父 gateway 和子 MCP 看到的是同一个绝对路径 `/home/agent/.openclaude`。
+//
+// 修复配对:packages/gateway/src/subprocessRunner.ts 里 `OPENCLAUDE_HOME ?? ''` 改成
+// 存在才传,空串视作 undefined。
+cleanEnv.OPENCLAUDE_HOME = "/home/agent/.openclaude";
+
 // ───────────────────────────────────────────────
 // 2. 个人版 openclaude.json 首次启动 bootstrap
 // ───────────────────────────────────────────────

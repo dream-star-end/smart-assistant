@@ -83,11 +83,173 @@ import {
 } from "./admin.js";
 import { incrGatewayRequest } from "../admin/metrics.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
+import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
+import { requireAdminVerifyDb } from "../admin/requireAdmin.js";
+import { writeAdminAudit } from "../admin/audit.js";
+import { getPool } from "../db/index.js";
+
+/**
+ * **P0 — v3 multi-tenant leak firewall** (2026-04-22)
+ *
+ * v3 gateway 走 host-scope singleton 存储(`$OPENCLAUDE_HOME/agents/main/*`、
+ * `$OPENCLAUDE_HOME/cron.yaml`、sqlite `client_sessions` 的历史桶),大量端点从个人版
+ * 继承下来,**没有按 userId 做 partition**。在商业版 v3 下这意味着:
+ *
+ *   1. 付费用户 A 调 `/api/agents/main/memory/user` → 读/写 host 的
+ *      `~/.openclaude/agents/main/USER.md`,跨用户串号。
+ *   2. `/api/cron` / `/api/tasks` / `/api/webhooks/:id` / `/api/agents/:id/delegate`
+ *      / `/api/agents/:id/message` **允许注入 prompt**,host 侧 agent 会拿到这串 prompt
+ *      做 Bash 等动作 —— 付费用户直接在 HOST 上拿到 shell(RCE)。
+ *   3. `/api/usage` / `/api/usage/events` / `/api/runs` / `/api/doctor` / `/api/config`
+ *      / `/api/webhooks` 返 host 全局的计量、运行日志、配置、webhook 密钥 —— 跨用户
+ *      信息泄漏。
+ *   4. `/api/search` 跨 user 搜 session,返对方聊天记录片段。
+ *
+ * 正确的每用户空间隔离是在容器内做(`docker run` 把 per-user volume 挂进 agent 容器,
+ * agent 侧 MCP `create_reminder/memory/skills` 都走容器本地 127.0.0.1:18789 的
+ * personal-version gateway,天然按容器隔离)。**host gateway 这边完全不应该被商业用户
+ * 访问到这批路径** —— 把它们直接 403 掉。
+ *
+ * **策略**:
+ *   - 请求路径命中 `BLOCKED_FOR_USER_RULES` 里任意一条(+ 方法匹配)时,验 JWT:
+ *     - commercial user → 403 FORBIDDEN(不泄露 endpoint 存在)
+ *     - commercial admin → DB double-check(role=admin && status=active,
+ *       撤权立即生效);通过则 fall through 给 gateway 自己的 handler(保留运维调试)
+ *       **+ 额外写一条 admin_audit 事件**(action=blocked_route_bypass)
+ *     - 无 / 非法 / 过期 / 签名错 → fall through 给 gateway.checkHttpAuth 正常拒
+ *
+ * **设计**:**一定要精确到 method**。gateway 里一堆路径是只读也是写的同路径二义。
+ * 比如 `/api/agents` GET 只列表(低风险)但 POST 能创建 host agent(高风险);
+ * `/api/webhooks/:id` DELETE / POST 不同语义。用 `methods ⊇ method` 过滤。
+ *
+ * **不在本表里的放行项**:
+ *   - `/api/sessions` / `/api/sessions/list` / `/api/sessions/:id` —— 这三个 gateway 自己按 userId
+ *     过滤(`getUserId` → `c:${sub}`),commercial 用户拿到的是自己名下的 session。
+ *     **但** `/api/sessions/unclaimed` 和 `/api/sessions/claim` 在本表里拦 —— 前者列出所有未绑
+ *     userId 的历史 session(default 桶 / legacy 个人版数据),后者把任意 sessionId 迁给调用者;
+ *     付费用户用它能把别人的聊天记录"认领"过来。
+ *   - `/api/wechat/*` —— 多租户 per-user 绑定(getUserId 作 key)
+ *   - `/api/changelog` / `/api/healthz` / `/api/feedback` —— 读 changelog / 健康 / 反馈
+ *   - `/api/auth/claude/*` —— OAuth 引导,admin 独享,gateway 层自己再做 admin-only
+ *
+ * **`/api/file` + `/api/media/*` 为何也拦**:
+ *   - `/api/file?path=...` 走 `agentCwds` 白名单 —— 但 `agentsConfig.agents` 是 HOST 全局
+ *     的 agents,commercial 付费用户用它能读 HOST 主 agent(admin 的 main)cwd 下任何文件。
+ *     该端点给付费用户(容器内)访问"无意义"—— 容器 media 路径在 HOST 上 404,所以拦了
+ *     只是把"已经 404"的变成"403" —— 不影响任何合法用例,堵上一条跨租户读盘缝隙。
+ *   - `/api/media/:file` 服务 HOST uploads/ 和 MCP generated/ —— 跨用户可见。
+ *
+ * **`/v1/*` 为何全拦**:
+ *   - `/v1/chat/completions` 在 handleOpenAIRequest 里调 `sessions.submit(...)`,把 POST body
+ *     里的 prompt 喂给 HOST main agent → 付费用户直接在 HOST 上拿 Bash。`/v1/models` 信息
+ *     泄漏较轻,但合并拦简化策略。v3 付费用户走 WebChat WS → userChatBridge → 容器,根本不
+ *     需要 HOST `/v1/*`。admin 仍可 bypass 用于运维探活。
+ *
+ * **`/metrics` + `/api/doctor` 去方法限制**:
+ *   - `/metrics` 吐 HOST 全局 Prometheus(accounts/sessions/agent_audit 等),任何方法都应拦。
+ *   - `/api/doctor` 原来限 `GET`,但 gateway 对 `POST /api/doctor` 不校验 method → 落空。
+ *     改为全方法拦,admin bypass 审计后 fall through(gateway 自己只认 GET,其他 method 自然 404)。
+ *
+ * **为什么对 `/api/agents(/...)?` 整个分支"宁可错杀"**:
+ *   v3 web UI 已经全部走 WS(client_sessions 分区 + docker bridge → 容器 18789),
+ *   **不再直接 fetch /api/agents/:id/...**;即便历史 JS 代码里还有 fetch 残留(`agents.js`
+ *   和 `memory.js` 2026-04-22 已决定下线),我们宁可 403 + PR2 前端移除入口,也不留
+ *   任何 host-agent 写口给付费用户。
+ */
+interface BlockedForUserRule {
+  re: RegExp;
+  /** 若 undefined = 所有方法都拦。否则只对枚举方法拦,其他方法放行(fall through)。 */
+  methods?: ReadonlySet<string>;
+  /** 审计 / 日志里的可读 endpoint label,不带动态段 */
+  label: string;
+}
+
+const M = (...methods: string[]) => new Set(methods);
+
+const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
+  // ─── host agent RCE 面 ───
+  // /api/agents GET(列表 host agents)+ POST(创建 host agent);两者都不该给 user
+  { re: /^\/api\/agents$/, label: "/api/agents" },
+  // /api/agents/:id GET/PUT/DELETE —— 读 host agent 元信息、改 model/persona、删 agent
+  { re: /^\/api\/agents\/[^/]+$/, label: "/api/agents/:id" },
+  // /api/agents/:id/persona GET/PUT —— 读/写 host agent CLAUDE.md
+  { re: /^\/api\/agents\/[^/]+\/persona$/, label: "/api/agents/:id/persona" },
+  // /api/agents/:id/message POST + /api/agents/:id/delegate POST —— host agent 执行 prompt = RCE
+  { re: /^\/api\/agents\/[^/]+\/(message|delegate)$/, label: "/api/agents/:id/(message|delegate)" },
+  // 内存 / 技能(host singleton 存储)
+  { re: /^\/api\/agents\/[^/]+\/memory\/(memory|user)$/, label: "/api/agents/:id/memory/*" },
+  { re: /^\/api\/agents\/[^/]+\/skills(\/[A-Za-z0-9_\-]+)?$/, label: "/api/agents/:id/skills" },
+
+  // ─── host cron / tasks / webhooks(所有方法,prompt 注入 = RCE)───
+  { re: /^\/api\/cron(\/[^/]+)?$/, label: "/api/cron" },
+  { re: /^\/api\/tasks(\/[A-Za-z0-9_\-]+)?$/, label: "/api/tasks" },
+  { re: /^\/api\/tasks-executions$/, label: "/api/tasks-executions" },
+  { re: /^\/api\/webhooks$/, label: "/api/webhooks" }, // GET 列表 leak secret
+  { re: /^\/api\/webhooks\/[A-Za-z0-9_\-]+$/, label: "/api/webhooks/:id" }, // POST = host prompt 执行,DELETE = 删除 host webhook
+
+  // ─── 全局 host 信息泄漏面 ───
+  // /api/doctor 不限方法 —— gateway 里没显式校验 method,写成 "GET only" 会被 POST/HEAD 绕过。
+  // 全方法拦,admin bypass 后由 gateway 自己决定要不要接(不接就 404,也安全)。
+  { re: /^\/api\/doctor$/, label: "/api/doctor" },
+  { re: /^\/api\/runs$/, methods: M("GET"), label: "/api/runs" },
+  { re: /^\/api\/usage$/, methods: M("GET"), label: "/api/usage" },
+  { re: /^\/api\/usage\/events$/, methods: M("GET"), label: "/api/usage/events" },
+  { re: /^\/api\/config$/, label: "/api/config" }, // GET dumps gateway config + auth info
+  // /metrics 吐 host 全局 Prometheus(含 accounts/sessions/agent_audit 统计),不分方法。
+  { re: /^\/metrics$/, label: "/metrics" },
+
+  // ─── 跨 user session FTS ───
+  { re: /^\/api\/search$/, label: "/api/search" },
+
+  // ─── session 迁移(跨租户认领别人历史 session)───
+  // /api/sessions/unclaimed 列所有 default 桶未绑定 session,/api/sessions/claim 把任意
+  // sessionId 迁给调用者 —— 付费用户借此拿到 legacy 个人版 / 其他用户遗留的聊天记录。
+  // 正常用途只给 admin 运维(初次迁移 v2→v3 / default 桶清理)。
+  { re: /^\/api\/sessions\/(unclaimed|claim)$/, label: "/api/sessions/(unclaimed|claim)" },
+
+  // ─── HOST 文件访问(跨租户读 admin 主 agent cwd / HOST uploads / MCP generated)───
+  // 详见大注释「/api/file + /api/media/* 为何也拦」段落。
+  { re: /^\/api\/file$/, label: "/api/file" },
+  { re: /^\/api\/media\/.+$/, label: "/api/media/:file" },
+
+  // ─── HOST RCE 面(OpenAI 兼容层,POST body.prompt → sessions.submit → host main agent)───
+  // 覆盖 /v1/chat/completions、/v1/models;后者仅列模型但合并策略拦更简。admin bypass。
+  { re: /^\/v1\/.+$/, label: "/v1/*" },
+];
+
+function matchBlockedRule(path: string, method: string): BlockedForUserRule | null {
+  for (const rule of BLOCKED_FOR_USER_RULES) {
+    if (!rule.re.test(path)) continue;
+    if (rule.methods && !rule.methods.has(method)) continue;
+    return rule;
+  }
+  return null;
+}
 
 export type CommercialHandler = (
   req: IncomingMessage,
   res: ServerResponse,
 ) => Promise<boolean>;
+
+/**
+ * 从 req 抽 bearer token(header / cookie)—— 匹配 gateway/server.ts `extractToken`
+ * 对 HTTP 请求的 fallback 顺序。WS `sec-websocket-protocol` 不在这里抽,BLOCKED 路径
+ * 都是 HTTP REST,没有 WS upgrade。
+ */
+function extractTokenFromReq(req: IncomingMessage): string {
+  const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, "") ?? "";
+  if (authHeader) return authHeader;
+  const cookieHeader = req.headers.cookie ?? "";
+  const cookies = cookieHeader.split(";").reduce(
+    (acc, c) => {
+      const [k, ...v] = c.trim().split("=");
+      if (k) acc[k] = v.join("=");
+      return acc;
+    },
+    {} as Record<string, string>,
+  );
+  return cookies.oc_session || "";
+}
 
 type RouteHandler = (
   req: IncomingMessage,
@@ -200,6 +362,76 @@ export function createCommercialHandler(
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
     const path = url.pathname;
     const method = req.method ?? "GET";
+
+    // ── P0 v3 多租户越权防火墙 ──
+    // 见 BLOCKED_FOR_USER_RULES 注释。在 `isOurs` 前就做,保证 host-scope endpoint
+    // 在 gateway 自己的 handler 执行前被拦。method-scoped 匹配 —— rule.methods 为空 =
+    // 所有方法都拦;有值 = 只拦枚举方法。
+    const blockedRule = matchBlockedRule(path, method);
+    if (blockedRule) {
+      setSecurityHeaders(res);
+      const requestId = ensureRequestId(req);
+      res.setHeader(REQUEST_ID_HEADER, requestId);
+      const blockLog = (options.logger ?? rootLogger.child({ subsys: "commercial" })).child({
+        requestId,
+        route: "__blocked_for_user__",
+        rule: blockedRule.label,
+        method,
+        path,
+        clientIp: clientIpOf(req),
+      });
+      const token = extractTokenFromReq(req);
+      const claims = verifyCommercialJwtSync(token, deps.jwtSecret);
+      if (claims) {
+        if (claims.role === "admin") {
+          // admin: DB double-check(role/status 撤权立即生效),通过后 fall through
+          try {
+            const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+            blockLog.info("blocked_for_user_admin_bypass", {
+              sub: claims.sub,
+              adminId: admin.id,
+            });
+            // admin bypass 审计:写 admin_audit,方便事后查"谁在 host 敏感路由上动手"。
+            // 失败不影响放行(best-effort);审计写失败仅记 warn,避免"DB 故障导致 admin
+            // 运维路径被误杀"。
+            writeAdminAudit(getPool(), {
+              adminId: admin.id,
+              action: "blocked_route_bypass",
+              target: `${method} ${blockedRule.label}`,
+              before: null,
+              after: { path },
+              ip: clientIpOf(req),
+              userAgent: userAgentOf(req),
+            }).catch((err) => {
+              blockLog.warn("admin_audit_write_failed", {
+                err: err instanceof Error ? err.message : String(err),
+              });
+            });
+            // 不 return true —— 让 gateway 自己的 handler 继续处理
+            return false;
+          } catch (err) {
+            // admin 身份 DB 失效 → 403(不是 401,token 本身有效,是身份被撤)
+            handleError(err, res, requestId, blockLog);
+            incrGatewayRequest("__blocked_for_user__", method, res.statusCode);
+            return true;
+          }
+        }
+        // 普通付费用户:直接 403
+        blockLog.warn("blocked_for_user", { sub: claims.sub });
+        sendError(
+          res,
+          403,
+          "FORBIDDEN",
+          "this endpoint is not available in commercial mode",
+          requestId,
+        );
+        incrGatewayRequest("__blocked_for_user__", method, res.statusCode);
+        return true;
+      }
+      // 无 commercial JWT:可能是 legacy 单 token / 无 token / 非法 token。
+      // 不在这里拦 —— fall through 给 gateway 自己的 auth 层按正常 401/403 流程处理。
+      return false;
+    }
 
     const isOurs = prefixes.some((p) => path === p || path.startsWith(p));
     if (!isOurs) return false;

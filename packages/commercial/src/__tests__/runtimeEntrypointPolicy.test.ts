@@ -121,4 +121,17 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       "entrypoint.ts 必须强制 CLAUDE_CONFIG_DIR 指 tmpfs",
     );
   });
+
+  test("entrypoint.ts 强制 OPENCLAUDE_HOME=/home/agent/.openclaude", () => {
+    // 2026-04-22 P0 多租户防火墙 PR1 新增:容器内必须显式设 OPENCLAUDE_HOME,
+    // 否则 subprocessRunner 向 MCP 传 `process.env.OPENCLAUDE_HOME ?? ''`,MCP
+    // 侧 paths.ts 用 `?? join(homedir(), '.openclaude')` 兜底,空串不回退 → 相对路径,
+    // memory/skill/cron 被写到 MCP cwd (/opt/openclaude) 而不是 per-user volume。
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    assert.match(
+      src,
+      /cleanEnv\.OPENCLAUDE_HOME\s*=\s*"\/home\/agent\/\.openclaude"/,
+      "entrypoint.ts 必须强制 OPENCLAUDE_HOME 指 volume 挂载点",
+    );
+  });
 });

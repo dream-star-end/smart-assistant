@@ -739,7 +739,14 @@ export class SubprocessRunner extends EventEmitter {
           args: ['tsx', mcpEntry],
           env: {
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
-            OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME ?? '',
+            // 2026-04-22: 只在 host 进程里确实 set 了 OPENCLAUDE_HOME 时才向下传 —— 空串
+            // 会被 mcp-memory 的 paths.ts 当成"有值",与 `??` 语义冲突,让所有 memory/skill
+            // 路径退化为相对 cwd 的路径,跨容器串。v3 容器由 entrypoint.ts 显式注入
+            // `/home/agent/.openclaude`,个人版本机通常用默认 `~/.openclaude` 就行,
+            // 传 undefined 让下游 `??` 正确兜底到 homedir。
+            ...(process.env.OPENCLAUDE_HOME
+              ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME }
+              : {}),
             OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
             OPENCLAUDE_GATEWAY_TOKEN: this.opts.config.gateway.accessToken,
             OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0),
