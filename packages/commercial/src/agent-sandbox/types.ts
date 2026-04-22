@@ -142,4 +142,8 @@ export type SupervisorErrorCode =
   // 后续步骤失败 —— 用户/admin 意图已落库,docker 清理交由后台 reconciler。
   // admin HTTP handler 见到此 code → 502 + 明确提示文案。
   | "PartialV3Cleanup"
+  // V3 CCB 基线目录(平台守则 CLAUDE.md + system-info skill)缺失/校验失败。
+  // 商用版默认 fail-closed:没有守则不许起容器,避免 AI 在无守则状态裸奔。
+  // dev/test 可设 OC_V3_CCB_BASELINE_OPTIONAL=1 显式降级为 warn+跳过挂载。
+  | "CcbBaselineMissing"
   | "Unknown";

@@ -22,8 +22,12 @@ description: 展示当前 AI 助手的身份、所处容器环境、能力边界
 whoami && id
 # 容器启动时间
 uptime -s
-# 容器名(环境变量若暴露)
-env | grep -E '^(HOSTNAME|OC_|CLAUDE_CONFIG_DIR)=' | sort
+# 显式披露的环境(白名单 —— 不要回显其它 env,避免泄露内部字段):
+#   HOSTNAME          docker 容器名对应的 hostname
+#   CLAUDE_CONFIG_DIR ccb 读取全局 CLAUDE.md / skills 的路径(固定 /run/oc/claude-config)
+for k in HOSTNAME CLAUDE_CONFIG_DIR; do
+  printf '%s=%s\n' "$k" "${!k:-<unset>}"
+done
 # 平台基线挂载核验(应为 ro)
 stat -c 'path=%n owner=%U perm=%A' /run/oc/claude-config/CLAUDE.md /run/oc/claude-config/skills/system-info 2>/dev/null
 mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
@@ -60,8 +64,13 @@ mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
 - 查看当前所有 CLAUDE.md(全局 + 项目级):
   `find /run/oc/claude-config /home/agent -name CLAUDE.md 2>/dev/null`
 - 查看已保存的 skills:`skill_list` 或 `ls /run/oc/claude-config/skills/ /home/agent/.claude/skills/ 2>/dev/null`
-- 清理本容器的个性化 AI 记忆(**不可逆**,仅在用户明确要求时执行):
-  先让用户确认,再 `rm -rf /run/oc/claude-config/projects/*/memory/*.md`
+- 清理本容器的个性化 AI 记忆(**不可逆**,两步走:先预览,确认后才删):
+  1. **先预览**待删文件,让用户核对:
+     `find /run/oc/claude-config/projects -type f -path '*/memory/*.md' -printf '%p\n'`
+  2. 用户核对后,如果确认要删,**复述一次完整命令**等用户再次明确"删除" 后再执行:
+     `find /run/oc/claude-config/projects -type f -path '*/memory/*.md' -delete`
+  - 两步之间 AI 必须停下等用户确认,不得自行连着执行
+  - 不要用 `rm -rf <glob>`:shell 展开失败或目录错位容易炸掉整个 projects/
 
 ## 7. 反馈渠道
 

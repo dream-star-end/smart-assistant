@@ -459,23 +459,37 @@ export async function registerCommercial(
     // eslint-disable-next-line no-console
     console.log("[commercial] v3 supervisor wired", { image: cfg.OC_RUNTIME_IMAGE });
 
-    // CCB 基线自检(只读诊断,不影响启动)——
-    // 告诉运维"容器 provision 时会不会真的注入平台守则",避免 rsync 漏了目录
-    // 但新容器起来了还以为安全策略生效的灰区。fail-open:不存在不报错,仅 warn。
+    // CCB 基线自检(只读诊断,不自己阻断启动 —— 真正的 fail-closed 发生在
+    // provisionV3Container 里抛 SupervisorError("CcbBaselineMissing"))。
+    //
+    // 这里的作用是给运维在 gateway 启动日志上立刻看见 baseline 是否就绪,
+    // 避免"rsync 漏了目录,gateway 跑得好好的但下一个 provision 直接 500"。
+    // MISSING 时日志态势明确,不用等用户踩坑才发现。
     {
       const baselineDir = process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR;
       const resolved = resolveCcbBaselineMounts(baselineDir);
+      const optional = process.env.OC_V3_CCB_BASELINE_OPTIONAL?.trim().toLowerCase();
+      const optionalFlagOn = optional === "1" || optional === "true" || optional === "yes";
       if (resolved) {
         // eslint-disable-next-line no-console
         console.log("[commercial] v3 ccb baseline ready", {
           baselineDir,
           claudeMd: resolved.claudeMdHostPath,
           systemInfoDir: resolved.systemInfoHostPath,
+          optional: optionalFlagOn,
         });
-      } else {
+      } else if (optionalFlagOn) {
+        // dev/test 显式允许缺基线,不阻断
         // eslint-disable-next-line no-console
         console.warn(
-          "[commercial] v3 ccb baseline MISSING — new containers will spawn without platform guardrails",
+          "[commercial] v3 ccb baseline missing (OPTIONAL=1) — new containers will spawn WITHOUT platform guardrails",
+          { baselineDir },
+        );
+      } else {
+        // 生产路径 —— 下一次 provisionV3Container 将抛 CcbBaselineMissing
+        // eslint-disable-next-line no-console
+        console.error(
+          "[commercial] v3 ccb baseline MISSING — next provisionV3Container will FAIL (fail-closed). Fix baseline rsync or set OC_V3_CCB_BASELINE_OPTIONAL=1 for dev only.",
           { baselineDir },
         );
       }

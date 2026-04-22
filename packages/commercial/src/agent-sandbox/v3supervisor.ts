@@ -50,8 +50,8 @@
 
 import type Docker from "dockerode";
 import { randomBytes, createHash } from "node:crypto";
-import { statSync } from "node:fs";
-import { join as pathJoin, resolve as pathResolve } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
 import type { Pool, PoolClient } from "pg";
 import { SupervisorError } from "./types.js";
 
@@ -116,8 +116,12 @@ const V3_AGENT_USER = "1000:1000";
  *   2. env `OC_V3_CCB_BASELINE_DIR`
  *   3. DEFAULT_V3_CCB_BASELINE_DIR
  *
- * **fail-open**:目录不存在 / 文件缺失 → warn 并跳过挂载,不阻断 provision。
- * 基线是"加固层",缺了会退化回"没有守则的 ccb",但不该让用户完全用不了服务。
+ * **fail-closed**(默认):目录不存在 / 结构不全 / 校验不通过 → `provisionV3Container`
+ * 抛 `SupervisorError("CcbBaselineMissing")`,用户启动失败,上层应报告运维。
+ * 基线是"加固层",缺了意味着守则失效(AI 裸奔),商用版不允许这种降级默认上线。
+ *
+ * **显式 fail-open**:dev/test/local 可以设 `OC_V3_CCB_BASELINE_OPTIONAL=1`,
+ * 基线缺失时 warn 并跳过挂载(容器照起,无守则);生产禁止设置。
  */
 export const DEFAULT_V3_CCB_BASELINE_DIR =
   "/opt/openclaude/openclaude/packages/commercial/agent-sandbox/ccb-baseline";
@@ -125,10 +129,11 @@ export const DEFAULT_V3_CCB_BASELINE_DIR =
 /** baseline 内部结构 —— 用 POSIX 绝对路径拼 docker Bind */
 export const V3_CCB_BASELINE_CLAUDE_MD_REL = "CLAUDE.md";
 export const V3_CCB_BASELINE_SYSTEM_INFO_REL = "skills/system-info";
+export const V3_CCB_BASELINE_SYSTEM_INFO_SKILL_MD_REL = "skills/system-info/SKILL.md";
 
 /**
  * 读 env `OC_V3_CCB_BASELINE_DIR`;为空或空字符串 → 回落默认路径。
- * 不做绝对路径校验(留给 resolveCcbBaselineMounts 的 stat 去 fail-open)。
+ * 不做绝对路径校验(留给 resolveCcbBaselineMounts 的 stat 去 fail-closed)。
  */
 function readCcbBaselineDirFromEnv(): string {
   const raw = process.env.OC_V3_CCB_BASELINE_DIR;
@@ -137,34 +142,97 @@ function readCcbBaselineDirFromEnv(): string {
 }
 
 /**
+ * 读 env `OC_V3_CCB_BASELINE_OPTIONAL`:只有显式设成 "1" / "true" / "yes" 才返回 true,
+ * 其它任何值(含未设)都视为 false(fail-closed)。
+ */
+function readCcbBaselineOptionalFromEnv(): boolean {
+  const raw = process.env.OC_V3_CCB_BASELINE_OPTIONAL?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+/**
+ * 校验单个 baseline 叶子路径(文件或目录):
+ *   - lstat 必须是对应类型(`file` / `dir`),**拒绝 symlink**(避免把 /etc/shadow 之类
+ *     挂进容器 ro 暴露)
+ *   - realpath 必须严格在 baselineRoot 下(把"软链逃逸到 baseline 外"堵死)
+ *   - owner 必须是 root(uid=0)—— 非 root owned 说明部署态失控,直接拒
+ *   - mode 不允许 group/other 可写(020/002),防 baseline 被非 root 用户改
+ *
+ * 返回 normalized 绝对路径(和 realpath 一致,消除软链影响),失败抛 Error(调用方捕获)。
+ */
+function assertBaselineLeaf(
+  leafPath: string,
+  expected: "file" | "dir",
+  baselineRoot: string,
+): string {
+  const st = lstatSync(leafPath);
+  if (st.isSymbolicLink()) {
+    throw new Error(`baseline leaf is a symlink: ${leafPath}`);
+  }
+  if (expected === "file" && !st.isFile()) {
+    throw new Error(`baseline leaf is not a regular file: ${leafPath}`);
+  }
+  if (expected === "dir" && !st.isDirectory()) {
+    throw new Error(`baseline leaf is not a directory: ${leafPath}`);
+  }
+  if (st.uid !== 0) {
+    throw new Error(`baseline leaf not owned by root (uid=${st.uid}): ${leafPath}`);
+  }
+  // 低 3 位按 rwx for user/group/other。要求 group-write & other-write 都为 0。
+  if ((st.mode & 0o022) !== 0) {
+    throw new Error(
+      `baseline leaf group/other writable (mode=${(st.mode & 0o777).toString(8)}): ${leafPath}`,
+    );
+  }
+  // realpath 双重兜底:确保最终 bind 源不在 baselineRoot 外面
+  const real = realpathSync(leafPath);
+  const rootReal = realpathSync(baselineRoot);
+  // 允许 real === rootReal(baseline 根本身也允许),否则要求 real 在 rootReal 下
+  if (real !== rootReal && !real.startsWith(rootReal + pathSep)) {
+    throw new Error(`baseline leaf realpath escapes baselineRoot: ${leafPath} → ${real}`);
+  }
+  return real;
+}
+
+/**
  * 校验 baseline 目录是否齐全 + 返回可直接拼 docker Bind 的绝对路径。
  *
- * 两个关键源都 OK → 返回两个绝对路径 + 校验通过字段;任一缺失或类型不对 → null。
- * 传入的 dir 必须是绝对路径;相对路径直接拒(防止 dev 环境误把 cwd 相对路径塞进去)。
+ * 严格校验(按顺序):
+ *   1. 输入是非空字符串
+ *   2. 输入是绝对路径(path.normalize 后与 path.resolve 结果相等,允许尾斜杠)
+ *   3. baseline root、`CLAUDE.md`、`skills/system-info`、`skills/system-info/SKILL.md`
+ *      每个叶子都:非 symlink、类型正确、root owned、非 group/other writable
+ *   4. 所有 realpath 都在 baseline root 内
  *
- * 注意:只 stat 根文件/根目录存在性,不递归检查 `skills/system-info/SKILL.md` —— 后者
- * 由 ccb 自己 skill loader 去读,缺了就 skill_list 少一条,不影响容器可用性。
+ * 任一项失败返回 null;调用方(provisionV3Container)按 OC_V3_CCB_BASELINE_OPTIONAL
+ * 决定是 fail-closed 抛错还是 fail-open warn。
+ *
+ * 返回的路径是 **realpathSync 后**的,即使 baseline 目录结构本身经过软链(如部署软链
+ * /opt/current/baseline → /opt/releases/xxx/baseline),docker Bind 也吃到真实路径。
  */
 export function resolveCcbBaselineMounts(
   baselineDir: string,
 ): { claudeMdHostPath: string; systemInfoHostPath: string } | null {
   if (typeof baselineDir !== "string" || baselineDir.trim() === "") return null;
-  // 拒绝相对路径 —— docker Bind 源必须绝对
-  const abs = pathResolve(baselineDir);
-  if (abs !== baselineDir) {
-    // 传入非绝对路径(pathResolve 会把 cwd 拼上去),fail-open
-    return null;
-  }
+  // 必须绝对路径;path.normalize 吞掉尾斜杠、多余 `/` 等等价写法。
+  if (!pathIsAbsolute(baselineDir)) return null;
+  const abs = pathNormalize(baselineDir).replace(/(?<!^)\/+$/, "");
   try {
-    const claudeMdHostPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_MD_REL);
-    const systemInfoHostPath = pathJoin(abs, V3_CCB_BASELINE_SYSTEM_INFO_REL);
-    const claudeStat = statSync(claudeMdHostPath);
-    const systemInfoStat = statSync(systemInfoHostPath);
-    if (!claudeStat.isFile()) return null;
-    if (!systemInfoStat.isDirectory()) return null;
-    return { claudeMdHostPath, systemInfoHostPath };
+    // baseline root 自己也按 dir 校验(非 symlink / root owned / 不可写)
+    assertBaselineLeaf(abs, "dir", abs);
+    const claudeMdPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_MD_REL);
+    const systemInfoPath = pathJoin(abs, V3_CCB_BASELINE_SYSTEM_INFO_REL);
+    const systemInfoSkillMdPath = pathJoin(abs, V3_CCB_BASELINE_SYSTEM_INFO_SKILL_MD_REL);
+    const claudeReal = assertBaselineLeaf(claudeMdPath, "file", abs);
+    const systemInfoReal = assertBaselineLeaf(systemInfoPath, "dir", abs);
+    // SKILL.md 必须存在(不挂这个文件,但缺了 skill loader 不生效,基线就失效了)
+    assertBaselineLeaf(systemInfoSkillMdPath, "file", abs);
+    return {
+      claudeMdHostPath: claudeReal,
+      systemInfoHostPath: systemInfoReal,
+    };
   } catch {
-    // ENOENT / EACCES 等全走 fail-open
+    // ENOENT / EACCES / 校验失败全走 fail-closed 路径(调用方处理)
     return null;
   }
 }
@@ -703,18 +771,37 @@ export async function provisionV3Container(
       `OPENCLAUDE_TRUST_BRIDGE_IP=${V3_GATEWAY_IP}`,
     ];
 
-    // CCB 基线只读挂载。fail-open:基线缺失 → warn,容器仍正常 provision(无守则)。
+    // CCB 基线只读挂载。**fail-closed 默认**:基线缺失/校验失败 → 抛
+    // SupervisorError("CcbBaselineMissing"),用户启动失败,运维必须修基线才能恢复。
+    // 基线是"守则加固层",生产不允许容器在无守则状态启动(AI 裸奔风险)。
+    //
+    // 显式降级:env `OC_V3_CCB_BASELINE_OPTIONAL=1` (或 "true"/"yes") → warn 并跳过
+    // 挂载,容器照常启动。仅 dev/test/local 用,生产禁止设置。
+    //
     // 基线齐全 → 在 Binds 上追加两条 :ro 项(单文件 + 单目录,分别覆盖 tmpfs 内的
     // CLAUDE.md 和 skills/system-info)。docker daemon 会按挂载点深度排序,tmpfs
     // 先于 bind 挂上,然后 ro bind 叠加,顺序正确无需我们干预。
     const baselineDir = deps.ccbBaselineDir ?? readCcbBaselineDirFromEnv();
     const baselineMounts = resolveCcbBaselineMounts(baselineDir);
+    const baselineOptional = readCcbBaselineOptionalFromEnv();
     if (!baselineMounts) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[v3supervisor] CCB baseline dir missing/incomplete; container will spawn WITHOUT platform guardrails",
-        { baselineDir, uid },
-      );
+      if (baselineOptional) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[v3supervisor] CCB baseline dir missing/incomplete (OPTIONAL=1); container will spawn WITHOUT platform guardrails",
+          { baselineDir, uid },
+        );
+      } else {
+        // eslint-disable-next-line no-console
+        console.error(
+          "[v3supervisor] CCB baseline dir missing/incomplete; refusing to spawn container (set OC_V3_CCB_BASELINE_OPTIONAL=1 to override in dev)",
+          { baselineDir, uid },
+        );
+        throw new SupervisorError(
+          "CcbBaselineMissing",
+          `CCB baseline dir missing or failed validation: ${baselineDir}`,
+        );
+      }
     }
 
     const binds: string[] = [

@@ -18,9 +18,12 @@
  *   - 容器内 entrypoint scrub 行为(3A 测试已覆盖)
  */
 
-import { describe, test, beforeEach } from "node:test";
+import { describe, test, beforeEach, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 import type Docker from "dockerode";
 import type { Pool, PoolClient } from "pg";
 
@@ -31,6 +34,7 @@ import {
   v3ContainerNameFor,
   v3VolumeNameFor,
   v3ProjectsVolumeNameFor,
+  resolveCcbBaselineMounts,
   V3_NETWORK_NAME,
   V3_INTERNAL_PROXY_URL,
   V3_CONTAINER_PORT,
@@ -324,6 +328,17 @@ describe("v3ContainerNameFor / v3VolumeNameFor / v3ProjectsVolumeNameFor", () =>
 
 describe("provisionV3Container", () => {
   let pool: FakePool;
+  // 基线 fail-closed 默认启用;这些 happy-path 测试不关心基线内容,设 OPTIONAL 降级
+  // 为 warn+skip,避免触发 CcbBaselineMissing。基线专项测试在下一个 describe 里。
+  let prevOptional: string | undefined;
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
   beforeEach(() => {
     pool = new FakePool();
   });
@@ -505,6 +520,15 @@ describe("provisionV3Container", () => {
 // ───────────────────────────────────────────────────────────────────────
 
 describe("stopAndRemoveV3Container", () => {
+  let prevOptional: string | undefined;
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
   test("stops + removes + sets state='vanished'", async () => {
     const { docker, captured } = makeDocker();
     const pool = new FakePool();
@@ -776,6 +800,15 @@ describe("getV3ContainerStatus", () => {
 
 describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
   let pool: FakePool;
+  let prevOptional: string | undefined;
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
   beforeEach(() => {
     pool = new FakePool();
   });
@@ -1114,5 +1147,227 @@ describe("preheatV3Image (3I)", () => {
 
     assert.ok(events.find((e) => e.lvl === "info" && /already present/.test(e.msg)), "expected info log for already-present");
     assert.ok(events.find((e) => e.lvl === "warn" && /pull failed/.test(e.msg)), "expected warn log for pull failure");
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  CCB baseline (平台守则 CLAUDE.md + system-info skill 只读注入)
+//
+//  resolveCcbBaselineMounts:
+//   - 绝对路径 + path.normalize 比较(允许尾斜杠)
+//   - 每个叶子:lstat 非 symlink / 类型匹配 / root owned / 非 group/other writable
+//   - SKILL.md 也必须存在
+//   - 任一失败返 null
+//
+//  provisionV3Container 与基线的交互:
+//   - 基线 OK → Binds 从 2 条变 4 条(追加两条 :ro)
+//   - 基线缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn + 2 条 Binds
+//   - 基线缺失 + optional 未开 → 抛 SupervisorError("CcbBaselineMissing")
+// ───────────────────────────────────────────────────────────────────────
+
+/**
+ * Helper — 在 os.tmpdir() 下造一个合法的 baseline 目录,chmod 成符合我们校验口径的
+ * 权限(644/755,group/other 不可写)。owner 一般就是进程自己(test 跑在 root 下
+ * 则是 root;普通用户跑则是 uid≠0 会被 assertBaselineLeaf 拒 —— 所以这类测试
+ * 只在 root 下跑才能全绿)。如果不是 root,返回 null(跳过该分支测试)。
+ */
+function makeFakeBaseline(withSkillMd = true): { dir: string; cleanup: () => void } | null {
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) {
+    return null;
+  }
+  const dir = mkdtempSync(pathJoin(tmpdir(), "ccb-baseline-test-"));
+  writeFileSync(pathJoin(dir, "CLAUDE.md"), "# test baseline\n", { mode: 0o644 });
+  mkdirSync(pathJoin(dir, "skills"), { mode: 0o755 });
+  mkdirSync(pathJoin(dir, "skills", "system-info"), { mode: 0o755 });
+  if (withSkillMd) {
+    writeFileSync(pathJoin(dir, "skills", "system-info", "SKILL.md"), "# system-info\n", { mode: 0o644 });
+  }
+  chmodSync(dir, 0o755);
+  return {
+    dir,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+describe("resolveCcbBaselineMounts", () => {
+  test("rejects empty / non-string", () => {
+    assert.equal(resolveCcbBaselineMounts(""), null);
+    assert.equal(resolveCcbBaselineMounts("   "), null);
+    // @ts-expect-error 测试非法输入
+    assert.equal(resolveCcbBaselineMounts(null), null);
+    // @ts-expect-error
+    assert.equal(resolveCcbBaselineMounts(undefined), null);
+    // @ts-expect-error
+    assert.equal(resolveCcbBaselineMounts(123), null);
+  });
+
+  test("rejects relative path", () => {
+    assert.equal(resolveCcbBaselineMounts("relative/path"), null);
+    assert.equal(resolveCcbBaselineMounts("./foo"), null);
+    assert.equal(resolveCcbBaselineMounts("foo"), null);
+  });
+
+  test("rejects nonexistent absolute path", () => {
+    assert.equal(resolveCcbBaselineMounts("/definitely/does/not/exist/baseline"), null);
+  });
+
+  test("(root only) happy path returns both realpaths", () => {
+    const b = makeFakeBaseline();
+    if (!b) return; // 非 root 跳过
+    try {
+      const got = resolveCcbBaselineMounts(b.dir);
+      assert.ok(got, "expected non-null result");
+      assert.equal(got!.claudeMdHostPath, pathJoin(b.dir, "CLAUDE.md"));
+      assert.equal(got!.systemInfoHostPath, pathJoin(b.dir, "skills", "system-info"));
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) accepts trailing slash", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const got = resolveCcbBaselineMounts(b.dir + "/");
+      assert.ok(got, "expected trailing-slash path to still resolve");
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects missing SKILL.md", () => {
+    const b = makeFakeBaseline(false); // SKILL.md 不写
+    if (!b) return;
+    try {
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects symlinked CLAUDE.md (防 symlink 逃逸挂宿主敏感文件)", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      // 把 CLAUDE.md 换成指向外部文件的 symlink
+      rmSync(pathJoin(b.dir, "CLAUDE.md"));
+      symlinkSync("/etc/hostname", pathJoin(b.dir, "CLAUDE.md"));
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects world-writable CLAUDE.md", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      chmodSync(pathJoin(b.dir, "CLAUDE.md"), 0o646); // other-write
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects group-writable CLAUDE.md", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      chmodSync(pathJoin(b.dir, "CLAUDE.md"), 0o664); // group-write
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+});
+
+describe("provisionV3Container — CCB baseline 挂载分支", () => {
+  let pool: FakePool;
+  let prevDir: string | undefined;
+  let prevOptional: string | undefined;
+
+  before(() => {
+    prevDir = process.env.OC_V3_CCB_BASELINE_DIR;
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+  });
+  after(() => {
+    if (prevDir === undefined) delete process.env.OC_V3_CCB_BASELINE_DIR;
+    else process.env.OC_V3_CCB_BASELINE_DIR = prevDir;
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
+  beforeEach(() => {
+    pool = new FakePool();
+    delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+  });
+
+  test("baseline 缺失 + optional 未开 → 抛 CcbBaselineMissing", async () => {
+    const { docker, captured } = makeDocker();
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          randomIp: () => "172.30.6.6",
+          randomSecret: fixedSecret("a".repeat(64)),
+          ccbBaselineDir: "/definitely/not/a/baseline/dir",
+        },
+        123,
+      ),
+      (err: Error) => err instanceof SupervisorError && err.code === "CcbBaselineMissing",
+    );
+    // fail-closed:不应调用 docker.createContainer
+    assert.equal(captured.containersCreated.length, 0);
+  });
+
+  test("baseline 缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn 并继续(2 条 Binds)", async () => {
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+    const { docker, captured } = makeDocker();
+    await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        randomIp: () => "172.30.6.7",
+        randomSecret: fixedSecret("b".repeat(64)),
+        ccbBaselineDir: "/definitely/not/a/baseline/dir",
+      },
+      124,
+    );
+    const opts = captured.containersCreated[0]!;
+    // 只有 data + projects 两条 volume bind(没追加 baseline ro)
+    assert.deepEqual(opts.HostConfig?.Binds, [
+      `oc-v3-data-u124:${V3_VOLUME_MOUNT}:rw`,
+      `oc-v3-proj-u124:${V3_PROJECTS_MOUNT}:rw`,
+    ]);
+  });
+
+  test("(root only) baseline 齐全 → 4 条 Binds(2 volume + 2 ro)", async () => {
+    const b = makeFakeBaseline();
+    if (!b) return; // 非 root 跳过
+    try {
+      const { docker, captured } = makeDocker();
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          randomIp: () => "172.30.6.8",
+          randomSecret: fixedSecret("c".repeat(64)),
+          ccbBaselineDir: b.dir,
+        },
+        125,
+      );
+      const opts = captured.containersCreated[0]!;
+      assert.deepEqual(opts.HostConfig?.Binds, [
+        `oc-v3-data-u125:${V3_VOLUME_MOUNT}:rw`,
+        `oc-v3-proj-u125:${V3_PROJECTS_MOUNT}:rw`,
+        `${pathJoin(b.dir, "CLAUDE.md")}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
+        `${pathJoin(b.dir, "skills", "system-info")}:${V3_CONFIG_TMPFS_PATH}/skills/system-info:ro`,
+      ]);
+    } finally {
+      b.cleanup();
+    }
   });
 });
