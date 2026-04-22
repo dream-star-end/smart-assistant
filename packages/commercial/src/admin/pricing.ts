@@ -21,6 +21,8 @@
 import type { PoolClient } from "pg";
 import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
+import { safeEnqueueAlert } from "./alertOutbox.js";
+import { EVENTS } from "./alertEvents.js";
 
 export interface ModelPricingRowView {
   model_id: string;
@@ -167,6 +169,22 @@ export async function patchPricing(
       ip: ctx.ip ?? null,
       userAgent: ctx.userAgent ?? null,
     });
+
+    // T-63 告警:模型定价改动 —— warning,dedupe 按 (model, 分钟桶) 防 admin 连点。
+    safeEnqueueAlert({
+      event_type: EVENTS.SYSTEM_PRICING_CHANGED,
+      severity: "warning",
+      title: "模型定价改动",
+      body: `admin #${ctx.adminId} 修改了 \`${modelId}\` 的定价 —— before=${JSON.stringify(changedBefore)} → after=${JSON.stringify(changedAfter)}`,
+      payload: {
+        model_id: modelId,
+        before: changedBefore,
+        after: changedAfter,
+        admin_id: String(ctx.adminId),
+      },
+      dedupe_key: `system.pricing_changed:${modelId}:${new Date().toISOString().slice(0, 16)}`,
+    });
+
     return a;
   });
 }

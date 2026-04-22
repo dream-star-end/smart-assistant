@@ -34,10 +34,8 @@ import {
   snapshotForAlerts,
 } from "../admin/metrics.js";
 import {
-  startAlertScheduler,
   ruleAccountPoolAllDown,
   ruleNoAccountsConfigured,
-  type AlertSender,
   type Snapshot,
 } from "../admin/alerts.js";
 
@@ -386,101 +384,7 @@ describe("admin metrics — rules", () => {
   });
 });
 
-// ============================================================
-// 集成:alertScheduler fire → resolve
-// ============================================================
-
-class CollectingSender implements AlertSender {
-  readonly messages: string[] = [];
-  async send(text: string): Promise<void> { this.messages.push(text); }
-}
-
-describe("admin metrics — alertScheduler", () => {
-  test("全部账号 down → fire Telegram;恢复一个 → resolve 消息", async (t) => {
-    if (skipIfNoPg(t)) return;
-    await insertAccount("a1", "disabled", 0);
-    await insertAccount("a2", "cooldown", 10);
-
-    const sender = new CollectingSender();
-    const sched = startAlertScheduler({
-      intervalMs: 100_000, // 我们手动 tickNow,不让 interval 干扰
-      sender,
-      rules: [ruleAccountPoolAllDown], // 孤立一条 rule 验证
-      runOnStart: false,
-    });
-
-    try {
-      await sched.tickNow();
-      assert.equal(sender.messages.length, 1, "第一次 tick 应当发 1 条 firing");
-      assert.ok(sender.messages[0].includes("账号池全部失效"));
-      assert.deepEqual([...sched.firingRules()], ["account_pool_all_down"]);
-
-      // 再 tick 一次:state 未变,不重复发
-      await sched.tickNow();
-      assert.equal(sender.messages.length, 1, "保持 firing 时不重复发");
-
-      // 把 a1 改成 active + health=80 → 应该 resolve
-      await query("UPDATE claude_accounts SET status='active', health_score=80 WHERE label='a1'");
-      await sched.tickNow();
-      assert.equal(sender.messages.length, 2, "恢复应该发 1 条 resolved");
-      assert.ok(sender.messages[1].includes("RESOLVED"));
-      assert.deepEqual([...sched.firingRules()], []);
-    } finally {
-      await sched.stop();
-    }
-  });
-
-  test("无账号 → no_accounts_configured fire;插一个 → resolve", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const sender = new CollectingSender();
-    const sched = startAlertScheduler({
-      intervalMs: 100_000,
-      sender,
-      rules: [ruleNoAccountsConfigured],
-      runOnStart: false,
-    });
-
-    try {
-      await sched.tickNow();
-      assert.equal(sender.messages.length, 1);
-      assert.ok(sender.messages[0].includes("账号池为空"));
-
-      await insertAccount("a1", "active", 80);
-      await sched.tickNow();
-      assert.equal(sender.messages.length, 2);
-      assert.ok(sender.messages[1].includes("RESOLVED"));
-    } finally {
-      await sched.stop();
-    }
-  });
-
-  test("rule.evaluate 抛异常 → 走 onError,不影响后续 rule", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const sender = new CollectingSender();
-    const errors: Array<{ id: string; err: unknown }> = [];
-    const badRule = {
-      id: "bad",
-      evaluate: () => { throw new Error("boom"); },
-      firingMessage: () => "",
-      resolvedMessage: () => "",
-    };
-    const sched = startAlertScheduler({
-      intervalMs: 100_000,
-      sender,
-      rules: [badRule, ruleNoAccountsConfigured],
-      runOnStart: false,
-      onError: (id, err) => errors.push({ id, err }),
-    });
-
-    try {
-      await sched.tickNow();
-      // bad 抛了,但 ruleNoAccountsConfigured 依然被评估 + 发消息
-      assert.equal(errors.length, 1);
-      assert.equal(errors[0].id, "bad");
-      assert.equal(sender.messages.length, 1);
-      assert.ok(sender.messages[0].includes("账号池为空"));
-    } finally {
-      await sched.stop();
-    }
-  });
-});
+// NOTE: T-62 的 "alertScheduler fire → resolve" 集成测试已删除。T-63 把 scheduler
+// 重构成 runRulesOnce()(写 outbox)+ iLink worker(读 outbox 发微信),旧的
+// sender/rules 注入 + firingRules() 接口不再存在。相应集成测试见
+// `alertOutbox.integ.test.ts` + `alertRules.integ.test.ts`(T-63 新增)。

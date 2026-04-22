@@ -22,6 +22,8 @@
 import type { PoolClient } from "pg";
 import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
+import { safeEnqueueAlert } from "./alertOutbox.js";
+import { EVENTS } from "./alertEvents.js";
 
 export const USER_STATUSES = ["active", "banned", "deleting", "deleted"] as const;
 export type UserStatus = (typeof USER_STATUSES)[number];
@@ -86,8 +88,18 @@ export async function listUsers(input: ListUsersInput = {}): Promise<ListUsersRe
   const params: unknown[] = [];
   if (input.q !== undefined && input.q !== "") {
     if (input.q.length > 120) throw new RangeError("invalid_q");
-    params.push("%" + input.q.replace(/[\\%_]/g, "\\$&") + "%");
-    where.push(`email ILIKE $${params.length}`);
+    // 纯数字:按 id 精确匹配(id 是 BIGSERIAL,常见场景"我想搜 #123")
+    const trimmed = input.q.trim();
+    if (/^[1-9][0-9]{0,19}$/.test(trimmed)) {
+      params.push(trimmed);
+      where.push(`id = $${params.length}::bigint`);
+    } else {
+      // 其余按 email / display_name 做 ILIKE(转义 backslash/%/_ 以防 LIKE 注入)
+      params.push("%" + trimmed.replace(/[\\%_]/g, "\\$&") + "%");
+      where.push(
+        `(email ILIKE $${params.length} OR display_name ILIKE $${params.length})`,
+      );
+    }
   }
   if (input.status !== undefined) {
     const arr = Array.isArray(input.status) ? input.status : [input.status];
@@ -214,6 +226,27 @@ export async function patchUser(
       ip: ctx.ip ?? null,
       userAgent: ctx.userAgent ?? null,
     });
+
+    // T-63 告警:只有 role 真实变化才发 security.admin_role_changed —— critical
+    if (patch.role !== undefined && b.role !== a.role) {
+      const promoted = a.role === "admin";
+      safeEnqueueAlert({
+        event_type: EVENTS.SECURITY_ADMIN_ROLE_CHANGED,
+        severity: "critical",
+        title: promoted ? "用户被提升为 admin" : "admin 被降级",
+        body: `用户 #${idStr}(${a.email})的 role 从 \`${b.role}\` 改为 \`${a.role}\`,操作者 admin #${ctx.adminId}。`,
+        payload: {
+          target_user_id: idStr,
+          target_email: a.email,
+          before_role: b.role,
+          after_role: a.role,
+          admin_id: String(ctx.adminId),
+        },
+        // dedupe 按 (目标, 新角色) —— 同一次变更只发一次;角色再变会有新 key
+        dedupe_key: `security.admin_role_changed:${idStr}:${a.role}`,
+      });
+    }
+
     return a;
   });
 }

@@ -471,8 +471,11 @@ async function collectGauges(deps: CollectDeps): Promise<{
 
   let agentContainersRunning = 0;
   try {
+    // v3 ephemeral 容器用 `state='active'` 表示"本 supervisor 仍视为 alive"。
+    // 旧 `status='running'` 是 v2 legacy 列 —— v3 INSERT 只写 state,不写 status,
+    // 导致 v3 容器永远不会被旧查询计到,gauge 永远报 0。
     const r = await query<{ n: string }>(
-      "SELECT COUNT(*)::text AS n FROM agent_containers WHERE status = 'running'",
+      "SELECT COUNT(*)::text AS n FROM agent_containers WHERE state = 'active'",
     );
     agentContainersRunning = Number(r.rows[0]?.n ?? "0");
   } catch (err) {

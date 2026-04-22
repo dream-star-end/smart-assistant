@@ -85,6 +85,20 @@ import {
   handleAdminGetSetting,
   handleAdminPutSetting,
 } from "./admin.js";
+import {
+  handleAdminAlertsListEvents,
+  handleAdminAlertsListChannels,
+  handleAdminAlertsIlinkQrcode,
+  handleAdminAlertsIlinkPoll,
+  handleAdminAlertsPatchChannel,
+  handleAdminAlertsDeleteChannel,
+  handleAdminAlertsTestChannel,
+  handleAdminAlertsListOutbox,
+  handleAdminAlertsListSilences,
+  handleAdminAlertsCreateSilence,
+  handleAdminAlertsDeleteSilence,
+  handleAdminAlertsListRuleStates,
+} from "./adminAlerts.js";
 import { incrGatewayRequest } from "../admin/metrics.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
 import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
@@ -383,6 +397,22 @@ export function createCommercialHandler(
     { method: "GET", path: "/api/admin/settings",         handler: handleAdminListSettings },
     { method: "GET", pathPrefix: "/api/admin/settings/",  handler: handleAdminGetSetting },
     { method: "PUT", pathPrefix: "/api/admin/settings/",  handler: handleAdminPutSetting },
+    // T-63 超管告警(WeChat 推送)—— exact path 在前,prefix 在后
+    { method: "GET",    path: "/api/admin/alerts/events",        handler: handleAdminAlertsListEvents },
+    { method: "GET",    path: "/api/admin/alerts/channels",      handler: handleAdminAlertsListChannels },
+    { method: "POST",   path: "/api/admin/alerts/ilink/qrcode",  handler: handleAdminAlertsIlinkQrcode },
+    { method: "POST",   path: "/api/admin/alerts/ilink/poll",    handler: handleAdminAlertsIlinkPoll },
+    { method: "GET",    path: "/api/admin/alerts/outbox",        handler: handleAdminAlertsListOutbox },
+    { method: "GET",    path: "/api/admin/alerts/silences",      handler: handleAdminAlertsListSilences },
+    { method: "POST",   path: "/api/admin/alerts/silences",      handler: handleAdminAlertsCreateSilence },
+    { method: "GET",    path: "/api/admin/alerts/rule-states",   handler: handleAdminAlertsListRuleStates },
+    // /api/admin/alerts/channels/:id   (PATCH / DELETE)
+    // /api/admin/alerts/channels/:id/test (POST) —— handler 自己校验后缀
+    { method: "PATCH",  pathPrefix: "/api/admin/alerts/channels/", handler: handleAdminAlertsPatchChannel },
+    { method: "DELETE", pathPrefix: "/api/admin/alerts/channels/", handler: handleAdminAlertsDeleteChannel },
+    { method: "POST",   pathPrefix: "/api/admin/alerts/channels/", handler: handleAdminAlertsTestChannel },
+    // /api/admin/alerts/silences/:id   (DELETE)
+    { method: "DELETE", pathPrefix: "/api/admin/alerts/silences/", handler: handleAdminAlertsDeleteSilence },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [

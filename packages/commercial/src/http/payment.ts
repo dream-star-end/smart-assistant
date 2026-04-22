@@ -36,6 +36,7 @@ import {
   createPendingOrder,
   getOrderByNo,
   markOrderPaid,
+  countPaidOrdersForUser,
   PlanNotFoundError,
   FirstTopupAlreadyUsedError,
   InvalidOrderStateError,
@@ -45,6 +46,67 @@ import {
 import { verifyHupijiao } from "../payment/hupijiao/sign.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import { HupijiaoError } from "../payment/hupijiao/client.js";
+import { safeEnqueueAlert } from "../admin/alertOutbox.js";
+import { EVENTS } from "../admin/alertEvents.js";
+
+/**
+ * 告警:单笔充值金额达到此值(分)→ 发 payment.large_topup。
+ * 硬编码 200 元(20000 分),二期再接 system_settings。
+ */
+const LARGE_TOPUP_THRESHOLD_CENTS = 20_000n;
+
+/**
+ * 订单刚从 pending → paid 时发 payment.first_topup / payment.large_topup 告警。
+ *
+ * - fire-and-forget:失败不影响 callback 回 "success"
+ * - dedupe 按订单号,重复回调自动 ON CONFLICT DO NOTHING
+ * - 在 callback 主流程之外 await(同一 handler 内,但 safeEnqueueAlert 内部已 try/catch)
+ */
+async function emitPaymentPaidAlerts(order: OrderRow): Promise<void> {
+  try {
+    const yuan = (Number(order.amount_cents) / 100).toFixed(2);
+    // 首充:订单推到 paid 后若该用户 paid 订单数恰好 == 1,即本次为首单。
+    try {
+      const count = await countPaidOrdersForUser(order.user_id.toString());
+      if (count === 1) {
+        safeEnqueueAlert({
+          event_type: EVENTS.PAYMENT_FIRST_TOPUP,
+          severity: "info",
+          title: "首次充值",
+          body: `用户 #${order.user_id} 完成首次充值 ¥${yuan}(订单 \`${order.order_no}\`)。`,
+          payload: {
+            user_id: order.user_id.toString(),
+            order_no: order.order_no,
+            amount_cents: order.amount_cents.toString(),
+            credits: order.credits.toString(),
+          },
+          dedupe_key: `payment.first_topup:user:${order.user_id}`,
+        });
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("[commercial/payment] first_topup detection failed:", err);
+    }
+    // 大额:金额 ≥ 阈值 即告警。dedupe by order_no 确保同一订单只发一次。
+    if (order.amount_cents >= LARGE_TOPUP_THRESHOLD_CENTS) {
+      safeEnqueueAlert({
+        event_type: EVENTS.PAYMENT_LARGE_TOPUP,
+        severity: "info",
+        title: "大额充值",
+        body: `用户 #${order.user_id} 单笔充值 ¥${yuan}(订单 \`${order.order_no}\`)。`,
+        payload: {
+          user_id: order.user_id.toString(),
+          order_no: order.order_no,
+          amount_cents: order.amount_cents.toString(),
+        },
+        dedupe_key: `payment.large_topup:${order.order_no}`,
+      });
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[commercial/payment] emitPaymentPaidAlerts top-level:", err);
+  }
+}
 
 /** 订单对外视图(不暴露 user_id / callback_payload / ledger_id 等敏感字段)。 */
 function orderToPublicView(o: OrderRow): Record<string, unknown> {
@@ -207,6 +269,16 @@ export async function handleHupiCallback(
   if (!ok) {
     // eslint-disable-next-line no-console
     console.warn(`[commercial/payment] signature invalid for order ${orderNo} reqId=${ctx.requestId}`);
+    // 告警:签名校验失败 — 可能被伪造 / 密钥泄露 / 回调打错环境,critical。
+    // dedupe 按分钟桶防风暴。
+    safeEnqueueAlert({
+      event_type: EVENTS.PAYMENT_CALLBACK_SIGNATURE_INVALID,
+      severity: "critical",
+      title: "虎皮椒回调签名校验失败",
+      body: `订单 \`${orderNo}\` 的回调签名校验失败,可能被伪造或密钥泄露。reqId=${ctx.requestId}`,
+      payload: { order_no: orderNo, req_id: ctx.requestId },
+      dedupe_key: `payment.callback_signature_invalid:${new Date().toISOString().slice(0, 16)}`,
+    });
     throw new HttpError(400, "SIGNATURE_INVALID", "hupijiao callback signature mismatch");
   }
 
@@ -229,6 +301,9 @@ export async function handleHupiCallback(
     if (!r.newlyPaid) {
       // eslint-disable-next-line no-console
       console.info(`[commercial/payment] duplicate callback for paid order ${orderNo}, replied success`);
+    } else {
+      // 告警:本次刚推到 paid,判定首充 / 大额 —— fire-and-forget,失败不影响 callback 回包
+      void emitPaymentPaidAlerts(r.order);
     }
   } catch (err) {
     if (err instanceof OrderNotFoundError) {
@@ -242,6 +317,14 @@ export async function handleHupiCallback(
       console.warn(
         `[commercial/payment] callback late or conflict: order=${orderNo} current=${err.currentStatus} reqId=${ctx.requestId}`,
       );
+      safeEnqueueAlert({
+        event_type: EVENTS.PAYMENT_CALLBACK_CONFLICT,
+        severity: "critical",
+        title: "虎皮椒回调状态冲突",
+        body: `订单 \`${orderNo}\` 收到 paid 回调,但本地状态为 \`${err.currentStatus}\`。可能是用户超时付款或管理员已处理,需人工核对。`,
+        payload: { order_no: orderNo, current_status: err.currentStatus, req_id: ctx.requestId },
+        dedupe_key: `payment.callback_conflict:${orderNo}`,
+      });
       sendText(res, 200, "success");
       return;
     }

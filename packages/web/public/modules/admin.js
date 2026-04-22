@@ -153,6 +153,12 @@ function openModal(html) {
 function closeModal() {
   $('modal-bg').hidden = true
   $('modal-body').innerHTML = ''
+  // Abort any in-flight long-poll loops tied to the modal (e.g. iLink QR poll).
+  // Without this, dismissing via backdrop click leaves the loop running until
+  // its 125s deadline — harmless but wasteful. Cancel button already does this.
+  if (ALERTS_STATE && ALERTS_STATE.qrAbortFlag) {
+    ALERTS_STATE.qrAbortFlag.aborted = true
+  }
 }
 $('modal-bg').addEventListener('click', (e) => {
   if (e.target === $('modal-bg')) closeModal()
@@ -229,6 +235,7 @@ const TABS = {
   settings: renderSettingsTab,
   audit: renderAuditTab,
   health: renderHealthTab,
+  alerts: renderAlertsTab,
 }
 
 function navigate(tab) {
@@ -422,11 +429,13 @@ async function loadDashboardData() {
     ttftCnt > 0 ? `样本 ${ttftCnt.toLocaleString()}` : '暂无样本',
     ttftAvg == null ? null : (ttftAvg < 1 ? 'success' : ttftAvg < 3 ? 'warning' : 'danger'))
 
-  // 今日营收 — 从 ledger 里累加今日 plan_subscription / agent_subscription 的正 delta
+  // 今日营收 — 累加今日 topup / agent_subscription 的正 delta(用户付费进账)。
+  // 排除 promotion / admin_adjust(营销与人工补偿不算营收),排除 chat / agent_chat
+  // (它们是负 delta,filter(delta>0) 也会过滤掉,但留着白名单更明确)。
   const today = new Date().toISOString().slice(0, 10)
   const todayRevenue = ledger
     .filter((r) => String(r.created_at || '').startsWith(today))
-    .filter((r) => r.reason === 'plan_subscription' || r.reason === 'agent_subscription' || r.reason === 'promotion')
+    .filter((r) => r.reason === 'topup' || r.reason === 'agent_subscription')
     .filter((r) => Number(r.delta) > 0)
     .reduce((acc, r) => acc + Number(r.delta), 0)
   updateStat(statCards[5], fmtCents(todayRevenue),
@@ -1572,7 +1581,7 @@ async function renderHealthTab() {
       <div class="toolbar">
         <button class="btn" id="h-refresh">刷新</button>
         <span class="spacer"></span>
-        <a href="/api/admin/metrics" target="_blank" rel="noopener">查看原始 metrics →</a>
+        <button class="btn btn-secondary" id="h-raw">查看原始 metrics →</button>
       </div>
 
       <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin-bottom:16px;">
@@ -1638,6 +1647,22 @@ async function renderHealthTab() {
     </div>` : ''}
   `
   $('h-refresh').addEventListener('click', applyHash)
+  // 查看原始 metrics —— 直接用浏览器 <a href> 会丢 Authorization header,改走
+  // JS fetch 带 token 拉文本,包成 blob 再新窗口打开。
+  $('h-raw')?.addEventListener('click', async () => {
+    try {
+      const res = await apiFetch('/api/admin/metrics', { headers: authHeaders() })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const txt = await res.text()
+      const blob = new Blob([txt], { type: 'text/plain; charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      window.open(url, '_blank', 'noopener,noreferrer')
+      // 让浏览器有足够时间读 URL 再释放
+      setTimeout(() => URL.revokeObjectURL(url), 60_000)
+    } catch (e) {
+      showError(`拉取 metrics 失败: ${e.message}`)
+    }
+  })
 }
 
 function _kpiCard(title, value, sub) {
@@ -1684,6 +1709,658 @@ function _renderHistTable(histRows, keyHdr, countHdr, avgHdr, avgFmt) {
       </tbody>
     </table>
   `
+}
+
+// ─── Tab: Alerts(T-63 告警中心) ─────────────────────────────────────
+//
+// 四区:
+//   1. 通道 channels —— 列、绑定 iLink 微信(QR 扫码流程)、改订阅、发测试、删
+//   2. 投递 outbox  —— 事件/严重度/状态过滤 + 分页
+//   3. 静默 silences —— 7d 窗口内压制某类事件
+//   4. 规则状态 rule_states —— polled rule 快照,只读诊断
+//
+// 后端全部路由在 /api/admin/alerts/*(见 commercial/src/http/adminAlerts.ts)。
+//
+// iLink 扫码 UX:
+//   - 点"绑定" → modal 内显示 base64 QR + 文案"请用已登录该机器人的微信扫码"
+//   - 前端 setInterval 每 ~3s POST /api/admin/alerts/ilink/poll(qrcode)
+//   - server side 自己 long-poll 35s;返 pending → 继续;confirmed → 关 modal 刷新列表
+//   - modal 关掉会设 abortFlag 停轮询;QR 在 iLink 侧大约 120s 过期,超时直接报红
+//
+// 关键状态徽章(channel):
+//   activation_status = pending → "等待首次对话"(要先用微信给机器人发任意一句话,worker 抓 context_token)
+//                     = active  + has_context_token → "就绪"
+//                     = active  - has_context_token → "已激活但尚无 token"(异常态,提示再发一条)
+//                     = disabled/error → 红字
+
+const ALERTS_STATE = {
+  events: null,           // 事件目录缓存(按 group 渲染订阅 UI)
+  outboxFilter: { event_type: '', status: '', severity: '' },
+  qrAbortFlag: null,      // { aborted: boolean } —— modal 关时置 true
+}
+
+async function renderAlertsTab() {
+  // 先把事件目录吃到内存,subscribe modal 会复用
+  if (!ALERTS_STATE.events) {
+    try {
+      const d = await apiGet('/api/admin/alerts/events')
+      ALERTS_STATE.events = d?.rows ?? []
+    } catch (e) {
+      // 不致命;订阅 UI 会退化成 raw input
+      ALERTS_STATE.events = []
+      console.warn('[alerts] 加载事件目录失败:', e.message)
+    }
+  }
+
+  view().innerHTML = `
+    <div class="panel">
+      <h2>告警通道 <small>微信 iLink,只发给绑定了的超管</small></h2>
+      <div class="toolbar">
+        <button class="btn" id="al-ch-refresh">刷新</button>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="al-ch-bind">+ 绑定微信</button>
+      </div>
+      <div id="al-channels">加载中…</div>
+    </div>
+
+    <div class="panel">
+      <h2>投递历史 outbox</h2>
+      <div class="toolbar">
+        <label>事件:<select id="al-ob-event">
+          <option value="">全部</option>
+          ${(ALERTS_STATE.events || []).map((e) =>
+            `<option value="${escapeHtml(e.event_type)}">${escapeHtml(e.event_type)}</option>`,
+          ).join('')}
+        </select></label>
+        <label>严重度:<select id="al-ob-severity">
+          <option value="">全部</option>
+          <option value="critical">critical</option>
+          <option value="warning">warning</option>
+          <option value="info">info</option>
+        </select></label>
+        <label>状态:<select id="al-ob-status">
+          <option value="">全部</option>
+          <option value="pending">pending</option>
+          <option value="sent">sent</option>
+          <option value="failed">failed</option>
+          <option value="suppressed">suppressed</option>
+          <option value="skipped">skipped</option>
+        </select></label>
+        <button class="btn" id="al-ob-refresh">刷新</button>
+      </div>
+      <div id="al-outbox">加载中…</div>
+    </div>
+
+    <div class="panel">
+      <h2>静默 silences <small>最长 7 天</small></h2>
+      <div class="toolbar">
+        <button class="btn" id="al-sl-refresh">刷新</button>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="al-sl-new">+ 新建静默</button>
+      </div>
+      <div id="al-silences">加载中…</div>
+    </div>
+
+    <div class="panel">
+      <h2>规则状态 rule_states <small>polled scheduler 诊断</small></h2>
+      <div class="toolbar">
+        <button class="btn" id="al-rs-refresh">刷新</button>
+      </div>
+      <div id="al-rule-states">加载中…</div>
+    </div>
+  `
+
+  // 四区并行拉数据 —— 互不阻塞
+  _refreshAlertChannels()
+  _refreshAlertOutbox()
+  _refreshAlertSilences()
+  _refreshAlertRuleStates()
+
+  $('al-ch-refresh').addEventListener('click', _refreshAlertChannels)
+  $('al-ch-bind').addEventListener('click', _openBindIlinkModal)
+  $('al-ob-refresh').addEventListener('click', () => {
+    ALERTS_STATE.outboxFilter.event_type = $('al-ob-event').value
+    ALERTS_STATE.outboxFilter.severity = $('al-ob-severity').value
+    ALERTS_STATE.outboxFilter.status = $('al-ob-status').value
+    _refreshAlertOutbox()
+  })
+  $('al-sl-refresh').addEventListener('click', _refreshAlertSilences)
+  $('al-sl-new').addEventListener('click', _openCreateSilenceModal)
+  $('al-rs-refresh').addEventListener('click', _refreshAlertRuleStates)
+}
+
+// ── channels ────────────────────────────────────────────────────────
+
+async function _refreshAlertChannels() {
+  const el = $('al-channels')
+  if (!el) return
+  el.innerHTML = '<div class="loading">加载中…</div>'
+  try {
+    const d = await apiGet('/api/admin/alerts/channels')
+    const rows = d?.rows ?? []
+    if (rows.length === 0) {
+      el.innerHTML = '<div class="empty">暂无通道。点右上「绑定微信」开始。</div>'
+      return
+    }
+    el.innerHTML = `
+      <table class="data">
+        <thead>
+          <tr>
+            <th>#</th><th>标签</th><th>类型</th><th>启用</th>
+            <th>最低严重度</th><th>订阅</th><th>激活状态</th>
+            <th>最近发送</th><th>最近错误</th>
+            <th class="actions">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(_renderChannelRow).join('')}
+        </tbody>
+      </table>
+    `
+    for (const btn of el.querySelectorAll('button[data-act]')) {
+      const act = btn.dataset.act
+      const id = btn.dataset.id
+      btn.addEventListener('click', (ev) => _handleChannelAction(act, id, ev.currentTarget))
+    }
+  } catch (e) {
+    el.innerHTML = `<div class="error">加载通道失败: ${escapeHtml(e.message)}</div>`
+  }
+}
+
+function _renderChannelRow(c) {
+  const actBadge = _activationBadge(c)
+  const subs = c.event_types && c.event_types.length > 0
+    ? `<span class="badge muted">${c.event_types.length} 种</span>`
+    : '<span class="badge ok">全部</span>'
+  const enabled = c.enabled
+    ? '<span class="badge ok">ON</span>'
+    : '<span class="badge muted">OFF</span>'
+  return `
+    <tr>
+      <td class="mono">${escapeHtml(c.id)}</td>
+      <td>${escapeHtml(c.label)}</td>
+      <td class="mono">${escapeHtml(c.channel_type)}</td>
+      <td>${enabled}</td>
+      <td><span class="badge ${c.severity_min === 'critical' ? 'danger' : c.severity_min === 'warning' ? 'warn' : 'muted'}">${escapeHtml(c.severity_min)}</span></td>
+      <td>${subs}</td>
+      <td>${actBadge}</td>
+      <td class="mono">${fmtDate(c.last_send_at)}</td>
+      <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${escapeHtml(c.last_error || '')}">${escapeHtml(c.last_error || '—')}</td>
+      <td class="actions">
+        <button data-act="edit" data-id="${escapeHtml(c.id)}">编辑</button>
+        <button data-act="${c.enabled ? 'disable' : 'enable'}" data-id="${escapeHtml(c.id)}">${c.enabled ? '停用' : '启用'}</button>
+        <button data-act="test" data-id="${escapeHtml(c.id)}">测试</button>
+        <button data-act="delete" data-id="${escapeHtml(c.id)}" class="btn-danger">删</button>
+      </td>
+    </tr>
+  `
+}
+
+function _activationBadge(c) {
+  if (c.activation_status === 'active' && c.has_context_token) {
+    return '<span class="badge ok">就绪</span>'
+  }
+  if (c.activation_status === 'active' && !c.has_context_token) {
+    return '<span class="badge warn" title="已激活但尚未捕获 context_token。请用微信再向该机器人发一条消息。">已激活·待 token</span>'
+  }
+  if (c.activation_status === 'pending') {
+    return '<span class="badge warn" title="请用已扫码的微信向机器人发任意一句话,worker 会自动抓取 context_token。">等待首次对话</span>'
+  }
+  if (c.activation_status === 'disabled') return '<span class="badge muted">disabled</span>'
+  return `<span class="badge danger">${escapeHtml(c.activation_status)}</span>`
+}
+
+async function _handleChannelAction(act, id, btn) {
+  try {
+    if (act === 'enable' || act === 'disable') {
+      await withBtnLoading(btn, () =>
+        apiJson('PATCH', `/api/admin/alerts/channels/${id}`, { enabled: act === 'enable' }),
+      )
+      toast(`通道已${act === 'enable' ? '启用' : '停用'}`)
+      _refreshAlertChannels()
+    } else if (act === 'test') {
+      await withBtnLoading(btn, () =>
+        apiJson('POST', `/api/admin/alerts/channels/${id}/test`, {}),
+      )
+      toast('测试已入队,数秒后检查微信 / outbox')
+      setTimeout(_refreshAlertOutbox, 3000)
+    } else if (act === 'delete') {
+      if (!confirm(`确认删除通道 #${id}?此操作会立刻停止发送,但历史 outbox 会保留。`)) return
+      await withBtnLoading(btn, () => apiJson('DELETE', `/api/admin/alerts/channels/${id}`, null))
+      toast('已删除')
+      _refreshAlertChannels()
+    } else if (act === 'edit') {
+      await _openEditChannelModal(id)
+    }
+  } catch (e) {
+    toast(`失败: ${e.message}`, 'danger')
+  }
+}
+
+async function _openEditChannelModal(id) {
+  // 从当前列表快速拿(再查一次 /channels 也行,但展示已有数据更快)
+  const d = await apiGet('/api/admin/alerts/channels')
+  const c = (d?.rows || []).find((x) => x.id === id)
+  if (!c) { toast(`通道 #${id} 不存在`, 'danger'); return }
+
+  const checkbox = (evType, subs) =>
+    `<label style="display:inline-block;margin-right:8px;font-weight:normal">
+       <input type="checkbox" data-event="${escapeHtml(evType)}" ${subs.includes(evType) ? 'checked' : ''}>
+       ${escapeHtml(evType)}
+     </label>`
+  const currentSubs = c.event_types || []
+  const groups = {}
+  for (const e of (ALERTS_STATE.events || [])) {
+    groups[e.group] = groups[e.group] || []
+    groups[e.group].push(e)
+  }
+  const allEmpty = currentSubs.length === 0
+  openModal(`
+    <h3>编辑通道 #${escapeHtml(c.id)} — ${escapeHtml(c.label)}</h3>
+    <div class="form-row">
+      <label>标签 label</label>
+      <input type="text" id="al-ed-label" value="${escapeHtml(c.label)}" maxlength="64" />
+    </div>
+    <div class="form-row">
+      <label>最低严重度(低于此级别的不发)</label>
+      <select id="al-ed-severity">
+        <option value="info" ${c.severity_min === 'info' ? 'selected' : ''}>info(所有)</option>
+        <option value="warning" ${c.severity_min === 'warning' ? 'selected' : ''}>warning(默认)</option>
+        <option value="critical" ${c.severity_min === 'critical' ? 'selected' : ''}>critical(只发严重)</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>订阅事件
+        <small style="color:var(--muted)">
+          (留空 / 全勾 = <em>全部订阅</em>;部分勾 = 白名单)
+        </small>
+      </label>
+      <div id="al-ed-events" style="max-height:260px;overflow-y:auto;border:1px solid var(--border);padding:8px;border-radius:4px">
+        <div style="margin-bottom:6px">
+          <button class="btn" id="al-ed-all">全选</button>
+          <button class="btn" id="al-ed-none">全不选</button>
+          <small style="color:var(--muted);margin-left:8px">当前 ${allEmpty ? '全部订阅' : `订阅 ${currentSubs.length} 种`}</small>
+        </div>
+        ${Object.entries(groups).map(([g, list]) => `
+          <fieldset style="border:1px solid var(--border);margin-bottom:6px;padding:6px">
+            <legend style="color:var(--muted);font-size:12px">${escapeHtml(g)}</legend>
+            ${list.map((e) => checkbox(e.event_type, allEmpty ? list.map((x) => x.event_type) : currentSubs)).join('')}
+          </fieldset>
+        `).join('')}
+      </div>
+    </div>
+    <div class="form-actions">
+      <button id="al-ed-cancel">取消</button>
+      <button class="btn-primary" id="al-ed-ok">保存</button>
+    </div>
+  `)
+  const container = $('al-ed-events')
+  $('al-ed-all').addEventListener('click', (ev) => {
+    ev.preventDefault()
+    for (const cb of container.querySelectorAll('input[type=checkbox]')) cb.checked = true
+  })
+  $('al-ed-none').addEventListener('click', (ev) => {
+    ev.preventDefault()
+    for (const cb of container.querySelectorAll('input[type=checkbox]')) cb.checked = false
+  })
+  $('al-ed-cancel').addEventListener('click', closeModal)
+  $('al-ed-ok').addEventListener('click', async (ev) => {
+    const checked = Array.from(container.querySelectorAll('input[type=checkbox]:checked'))
+      .map((cb) => cb.dataset.event)
+    // 全选等价于"空数组=全部订阅" —— 显式写空数组避免一旦目录扩展了老白名单就漏新事件
+    const all = ALERTS_STATE.events || []
+    const eventTypes = (all.length > 0 && checked.length === all.length) ? [] : checked
+    const label = $('al-ed-label').value.trim()
+    if (label.length === 0 || label.length > 64) { toast('label 长度 1..64', 'danger'); return }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        await apiJson('PATCH', `/api/admin/alerts/channels/${c.id}`, {
+          label,
+          severity_min: $('al-ed-severity').value,
+          event_types: eventTypes,
+        })
+        toast('已保存')
+        closeModal()
+        _refreshAlertChannels()
+      } catch (e) {
+        toast(`失败: ${e.message}`, 'danger')
+      }
+    })
+  })
+}
+
+// ── 绑定 iLink 微信(QR 扫码)──────────────────────────────────────
+
+async function _openBindIlinkModal() {
+  openModal(`
+    <h3>绑定微信告警通道</h3>
+    <div id="al-qr-box" style="text-align:center;padding:20px">
+      <div class="loading">正在向 iLink 申请二维码…</div>
+    </div>
+    <div class="form-actions">
+      <button id="al-qr-cancel">取消</button>
+    </div>
+  `)
+  const abort = { aborted: false }
+  ALERTS_STATE.qrAbortFlag = abort
+  $('al-qr-cancel').addEventListener('click', () => {
+    abort.aborted = true
+    closeModal()
+  })
+
+  let qrResp
+  try {
+    qrResp = await apiJson('POST', '/api/admin/alerts/ilink/qrcode', {})
+  } catch (e) {
+    if (!abort.aborted) {
+      $('al-qr-box').innerHTML = `<div class="error">申请二维码失败: ${escapeHtml(e.message)}</div>`
+    }
+    return
+  }
+  if (abort.aborted) return
+
+  const qrcode = qrResp.qrcode
+  const imgSrc = qrResp.qrcode_img_content
+    ? (qrResp.qrcode_img_content.startsWith('data:') ? qrResp.qrcode_img_content : `data:image/png;base64,${qrResp.qrcode_img_content}`)
+    : ''
+  $('al-qr-box').innerHTML = `
+    <div style="color:var(--muted);font-size:13px;margin-bottom:8px">
+      用<strong>已注册该机器人的微信</strong>扫码,然后点确认;确认后请再向机器人发任意一句话以捕获 context_token。
+    </div>
+    ${imgSrc
+      ? `<img src="${escapeHtml(imgSrc)}" alt="iLink QR" style="max-width:240px;border:1px solid var(--border)" />`
+      : `<div class="error">iLink 没返回 QR 图片</div>`}
+    <div id="al-qr-status" style="margin-top:8px;color:var(--muted);font-size:12px">等待扫码… (会长轮询直到 ~120s 过期)</div>
+  `
+
+  // ~120s 超时(iLink QR 过期大致这个时间)—— 每轮 poll 自己 ~35s,所以最多 3~4 轮
+  const deadline = Date.now() + 125_000
+  while (!abort.aborted && Date.now() < deadline) {
+    let poll
+    try {
+      poll = await apiJson('POST', '/api/admin/alerts/ilink/poll', { qrcode })
+    } catch (e) {
+      if (abort.aborted) return
+      $('al-qr-status').innerHTML = `<span style="color:var(--danger)">poll 失败: ${escapeHtml(e.message)}</span>`
+      break
+    }
+    if (abort.aborted) return
+    if (poll?.status === 'confirmed') {
+      $('al-qr-status').innerHTML = '<span style="color:var(--ok)">扫码成功 ✓</span>'
+      toast(`通道已绑定: ${poll.channel?.label ?? ''}`)
+      closeModal()
+      _refreshAlertChannels()
+      return
+    }
+    // pending 继续下一轮
+  }
+  if (!abort.aborted) {
+    $('al-qr-status').innerHTML = '<span style="color:var(--warn)">超时,请重新打开</span>'
+  }
+}
+
+// ── outbox ──────────────────────────────────────────────────────────
+
+async function _refreshAlertOutbox() {
+  const el = $('al-outbox')
+  if (!el) return
+  el.innerHTML = '<div class="loading">加载中…</div>'
+  const sp = new URLSearchParams({ limit: '50' })
+  const f = ALERTS_STATE.outboxFilter
+  if (f.event_type) sp.set('event_type', f.event_type)
+  if (f.status) sp.set('status', f.status)
+  // severity 后端不支持直接过滤,前端 filter
+  try {
+    const d = await apiGet(`/api/admin/alerts/outbox?${sp.toString()}`)
+    let rows = d?.rows ?? []
+    if (f.severity) rows = rows.filter((r) => r.severity === f.severity)
+    if (rows.length === 0) {
+      el.innerHTML = '<div class="empty">无记录。</div>'
+      return
+    }
+    el.innerHTML = `
+      <table class="data">
+        <thead>
+          <tr>
+            <th>#</th><th>时间</th><th>事件</th><th>严重度</th>
+            <th>状态</th><th>通道</th><th>尝试</th><th>标题 / 错误</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(_renderOutboxRow).join('')}
+        </tbody>
+      </table>
+    `
+  } catch (e) {
+    el.innerHTML = `<div class="error">加载 outbox 失败: ${escapeHtml(e.message)}</div>`
+  }
+}
+
+function _renderOutboxRow(r) {
+  const sevBadge = `<span class="badge ${r.severity === 'critical' ? 'danger' : r.severity === 'warning' ? 'warn' : 'muted'}">${escapeHtml(r.severity)}</span>`
+  const statBadge = r.status === 'sent' ? '<span class="badge ok">sent</span>'
+    : r.status === 'failed' ? '<span class="badge danger">failed</span>'
+    : r.status === 'pending' ? '<span class="badge warn">pending</span>'
+    : r.status === 'suppressed' ? '<span class="badge muted">suppressed</span>'
+    : `<span class="badge muted">${escapeHtml(r.status)}</span>`
+  const titleOrErr = r.status === 'failed' && r.last_error
+    ? `<span style="color:var(--danger)" title="${escapeHtml(r.last_error)}">${escapeHtml(r.last_error.slice(0, 80))}</span>`
+    : escapeHtml(r.title || '')
+  return `
+    <tr>
+      <td class="mono">${escapeHtml(r.id)}</td>
+      <td class="mono">${fmtDate(r.created_at)}</td>
+      <td class="mono">${escapeHtml(r.event_type)}</td>
+      <td>${sevBadge}</td>
+      <td>${statBadge}</td>
+      <td class="mono">${escapeHtml(r.channel_id || '—')}</td>
+      <td class="num">${Number(r.attempts || 0)}</td>
+      <td style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${titleOrErr}</td>
+    </tr>
+  `
+}
+
+// ── silences ────────────────────────────────────────────────────────
+
+async function _refreshAlertSilences() {
+  const el = $('al-silences')
+  if (!el) return
+  el.innerHTML = '<div class="loading">加载中…</div>'
+  try {
+    const d = await apiGet('/api/admin/alerts/silences')
+    const rows = d?.rows ?? []
+    if (rows.length === 0) {
+      el.innerHTML = '<div class="empty">当前无静默。</div>'
+      return
+    }
+    el.innerHTML = `
+      <table class="data">
+        <thead>
+          <tr>
+            <th>#</th><th>状态</th><th>matcher</th><th>开始</th><th>结束</th>
+            <th>原因</th><th>创建人</th><th class="actions">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(_renderSilenceRow).join('')}
+        </tbody>
+      </table>
+    `
+    for (const btn of el.querySelectorAll('button[data-act="delete-silence"]')) {
+      btn.addEventListener('click', (ev) => _deleteSilence(btn.dataset.id, ev.currentTarget))
+    }
+  } catch (e) {
+    el.innerHTML = `<div class="error">加载 silences 失败: ${escapeHtml(e.message)}</div>`
+  }
+}
+
+function _renderSilenceRow(s) {
+  const m = s.matcher || {}
+  const parts = []
+  if (m.event_type) parts.push(`event=${escapeHtml(m.event_type)}`)
+  if (m.severity) parts.push(`severity=${escapeHtml(m.severity)}`)
+  if (m.rule_id) parts.push(`rule=${escapeHtml(m.rule_id)}`)
+  const matcher = parts.length > 0
+    ? `<span class="mono" style="font-size:12px">${parts.join(' · ')}</span>`
+    : '<span class="badge danger">空 matcher</span>'
+  const status = s.active
+    ? '<span class="badge warn">生效中</span>'
+    : '<span class="badge muted">已结束</span>'
+  return `
+    <tr>
+      <td class="mono">${escapeHtml(s.id)}</td>
+      <td>${status}</td>
+      <td>${matcher}</td>
+      <td class="mono">${fmtDate(s.starts_at)}</td>
+      <td class="mono">${fmtDate(s.ends_at)}</td>
+      <td>${escapeHtml(s.reason)}</td>
+      <td class="mono">${escapeHtml(s.created_by || '—')}</td>
+      <td class="actions">
+        ${s.active
+          ? `<button data-act="delete-silence" data-id="${escapeHtml(s.id)}" class="btn-danger">撤销</button>`
+          : '—'}
+      </td>
+    </tr>
+  `
+}
+
+async function _deleteSilence(id, btn) {
+  if (!confirm(`撤销静默 #${id}?被它压制的事件会立即恢复告警。`)) return
+  try {
+    await withBtnLoading(btn, () => apiJson('DELETE', `/api/admin/alerts/silences/${id}`, null))
+    toast('已撤销')
+    _refreshAlertSilences()
+  } catch (e) {
+    toast(`失败: ${e.message}`, 'danger')
+  }
+}
+
+function _openCreateSilenceModal() {
+  // 默认 1 小时后结束,最长 7d
+  const now = new Date()
+  const endDefault = new Date(now.getTime() + 60 * 60 * 1000)
+  const localIso = (d) => {
+    const pad = (n) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+  }
+  openModal(`
+    <h3>新建静默</h3>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:8px">
+      matcher 三字段任选其一或多选(AND 关系,命中则不发)。窗口最长 7 天。
+    </div>
+    <div class="form-row">
+      <label>事件类型(可选)</label>
+      <select id="al-ns-event">
+        <option value="">—</option>
+        ${(ALERTS_STATE.events || []).map((e) =>
+          `<option value="${escapeHtml(e.event_type)}">${escapeHtml(e.event_type)}</option>`,
+        ).join('')}
+      </select>
+    </div>
+    <div class="form-row">
+      <label>严重度(可选)</label>
+      <select id="al-ns-severity">
+        <option value="">—</option>
+        <option value="info">info</option>
+        <option value="warning">warning</option>
+        <option value="critical">critical</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>rule_id(可选,用于静默 polled 规则)</label>
+      <input type="text" id="al-ns-rule" placeholder="如 account_pool.all_down" maxlength="64" />
+    </div>
+    <div class="form-row">
+      <label>结束时间</label>
+      <input type="datetime-local" id="al-ns-ends" value="${localIso(endDefault)}" />
+    </div>
+    <div class="form-row">
+      <label>原因(必填,1..200)</label>
+      <input type="text" id="al-ns-reason" maxlength="200" placeholder="例如 周五例行演习" />
+    </div>
+    <div class="form-actions">
+      <button id="al-ns-cancel">取消</button>
+      <button class="btn-primary" id="al-ns-ok">创建</button>
+    </div>
+  `)
+  $('al-ns-cancel').addEventListener('click', closeModal)
+  $('al-ns-ok').addEventListener('click', async (ev) => {
+    const event_type = $('al-ns-event').value
+    const severity = $('al-ns-severity').value
+    const rule_id = $('al-ns-rule').value.trim()
+    const endsStr = $('al-ns-ends').value
+    const reason = $('al-ns-reason').value.trim()
+    const matcher = {}
+    if (event_type) matcher.event_type = event_type
+    if (severity) matcher.severity = severity
+    if (rule_id) matcher.rule_id = rule_id
+    if (Object.keys(matcher).length === 0) { toast('至少填一个 matcher 字段', 'danger'); return }
+    if (!endsStr) { toast('结束时间必填', 'danger'); return }
+    const endsAt = new Date(endsStr)
+    if (Number.isNaN(endsAt.getTime()) || endsAt.getTime() <= Date.now()) {
+      toast('结束时间必须晚于当前', 'danger'); return
+    }
+    if (endsAt.getTime() - Date.now() > 7 * 24 * 60 * 60 * 1000) {
+      toast('窗口最长 7 天', 'danger'); return
+    }
+    if (!reason) { toast('原因必填', 'danger'); return }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        await apiJson('POST', '/api/admin/alerts/silences', {
+          matcher,
+          ends_at: endsAt.toISOString(),
+          reason,
+        })
+        toast('已创建')
+        closeModal()
+        _refreshAlertSilences()
+      } catch (e) {
+        toast(`失败: ${e.message}`, 'danger')
+      }
+    })
+  })
+}
+
+// ── rule_states ─────────────────────────────────────────────────────
+
+async function _refreshAlertRuleStates() {
+  const el = $('al-rule-states')
+  if (!el) return
+  el.innerHTML = '<div class="loading">加载中…</div>'
+  try {
+    const d = await apiGet('/api/admin/alerts/rule-states')
+    const rows = d?.rows ?? []
+    if (rows.length === 0) {
+      el.innerHTML = '<div class="empty">尚无规则状态(scheduler 还没跑过一轮)。</div>'
+      return
+    }
+    el.innerHTML = `
+      <table class="data">
+        <thead>
+          <tr>
+            <th>rule_id</th><th>firing</th><th>dedupe_key</th>
+            <th>最近翻转</th><th>最近评估</th><th>最近 payload</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((r) => `
+            <tr>
+              <td class="mono">${escapeHtml(r.rule_id)}</td>
+              <td>${r.firing ? '<span class="badge danger">FIRING</span>' : '<span class="badge ok">ok</span>'}</td>
+              <td class="mono" style="font-size:12px">${escapeHtml(r.dedupe_key || '—')}</td>
+              <td class="mono">${fmtDate(r.last_transition_at)}</td>
+              <td class="mono">${fmtDate(r.last_evaluated_at)}</td>
+              <td class="mono" style="font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                  title="${escapeHtml(JSON.stringify(r.last_payload || {}))}">${escapeHtml(JSON.stringify(r.last_payload || {}))}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `
+  } catch (e) {
+    el.innerHTML = `<div class="error">加载 rule_states 失败: ${escapeHtml(e.message)}</div>`
+  }
 }
 
 // ─── Boot ──────────────────────────────────────────────────────────

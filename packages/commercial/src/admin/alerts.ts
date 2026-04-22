@@ -1,43 +1,42 @@
 /**
- * T-62 — 告警器。
+ * T-62 / T-63 — 告警调度器。
  *
- * ### 策略
- *   - 每 tickIntervalMs 轮询一次,取 metrics snapshot(不复用 /metrics 渲染,
- *     直接调 `snapshotForAlerts` 以便测试注入)
- *   - 对每条 rule 执行 evaluate:返 true = firing。
- *   - firing 状态从 false → true 时发"告警触发"消息;true → false 时发"恢复"消息。
- *   - 维持 firing 不重复发(避免 N 分钟轮一次 = N 条告警)。
+ * 负责:
+ *   1. 每 tickIntervalMs 跑一次 `runRulesOnce`(alertRules.ts 里定义的 5 条轮询规则)。
+ *      翻转 firing / resolved 时把事件 enqueue 到 admin_alert_outbox。
+ *   2. 启动 per-channel iLink long-poll + global dispatcher(ilinkAlertWorker.ts)。
+ *      dispatcher 5s tick,扫 outbox 发 WeChat。
  *
- * ### Telegram
- *   - env `ALERT_TG_BOT_TOKEN` / `ALERT_TG_CHAT` 两者任一缺失 → scheduler 仍 tick,
- *     但 sender 走 stdout(测试 / 干跑场景)
- *   - 发送用 fetch;失败仅 warn,不阻塞下一 tick
+ * 保留 T-62 的 Telegram/Snapshot API(SnapshotForAlerts)以兼容旧测试,但默认 scheduler
+ * 不再直接推 Telegram;所有告警走 outbox → iLink → WeChat。Telegram 可在二期接回成
+ * 一个额外 channel_type。
  *
- * ### 规则集(最小)
- *   - `account_pool_all_down`:没有任何账号处于 status=active 且 health_score>0
- *   - `no_accounts_configured`:账号池完全为空(部署新机器常见误报源头,所以单独 rule)
+ * env:
+ *   - COMMERCIAL_ALERTS_DISABLED=1  → 整个 scheduler 不启动
+ *   - COMMERCIAL_ALERT_TICK_MS      → scheduler 轮询间隔,默认 60_000ms,下限 1000ms
+ *   - COMMERCIAL_ILINK_DISPATCH_MS  → dispatcher 间隔,默认 5000ms,下限 500ms
  *
- * 更细粒度的 rate-based rules(debit error spike 等)按需追加 —— 这里先打基础。
+ * scheduler / worker 各跑各的 interval,互不阻塞:rule tick 只写 DB;worker 从 DB 读
+ * 并 iLink send。即便 WeChat 挂掉,outbox 会积压 + 指数退避,rule 继续工作。
  */
 
 import { snapshotForAlerts, type CollectDeps } from "./metrics.js";
+import { runRulesOnce, type RunRulesResult } from "./alertRules.js";
+import {
+  startIlinkAlertWorker,
+  type IlinkWorkerHandle,
+} from "./ilinkAlertWorker.js";
+
+// ─── 遗留类型(保留供旧测试 + snapshotForAlerts 消费)────────────────────
 
 export interface AlertSender {
-  /** 发送告警文本(Markdown / 纯文本皆可 —— 调用方和 sender 约定)。 */
   send(text: string): Promise<void>;
 }
 
 export interface AlertRule {
-  /** 唯一 id,供 state map / 日志使用。 */
   id: string;
-  /**
-   * @returns `true` 表示"当前应该告警";`false` 表示健康。
-   *          不抛:evaluate 内部应 swallow 自己造出的异常。
-   */
   evaluate(snapshot: Snapshot): Promise<boolean> | boolean;
-  /** 触发时的文本(返回 markdown,带换行)。 */
   firingMessage(snapshot: Snapshot): string;
-  /** 恢复时的文本。 */
   resolvedMessage(snapshot: Snapshot): string;
 }
 
@@ -47,38 +46,42 @@ export interface Snapshot {
 }
 
 export interface AlertSchedulerOptions {
-  /** tick 间隔,默认 60s。 */
+  /** rule tick 间隔,默认 60s。 */
   intervalMs?: number;
-  /** 规则集。缺省用 defaultRules()。 */
-  rules?: AlertRule[];
-  /** 告警 sender。缺省根据 env 选 Telegram / stdout。 */
-  sender?: AlertSender;
-  /** 采样 snapshot 的依赖 —— 测试注入 override。 */
-  collectDeps?: CollectDeps;
-  /** 启动后立即跑一次(默认 false:等到第一个 interval)。 */
+  /** 启动后是否立刻跑一次(默认 false,等 interval)。 */
   runOnStart?: boolean;
   /**
-   * 自定义错误回调 —— 默认 stderr。scheduler 自己不 throw。
-   * evaluate / sender 抛任何异常都走这里,不影响下一 tick。
+   * 测试:关闭 iLink worker(不起 long-poll / dispatcher)。生产必须 false。
    */
-  onError?: (ruleId: string, err: unknown) => void;
+  disableIlinkWorker?: boolean;
+  /** dispatcher 间隔(iLink worker),默认 5000ms。 */
+  ilinkDispatchIntervalMs?: number;
+  /** 错误回调 */
+  onError?: (scope: string, err: unknown) => void;
+  /** 兼容旧测试:允许注入 collectDeps / rules / sender(当前忽略,MVP 不回落)。 */
+  collectDeps?: CollectDeps;
+  rules?: AlertRule[];
+  sender?: AlertSender;
 }
 
 export interface AlertScheduler {
   stop(): Promise<void>;
-  /** 手动触发一次 tick(集成测试用)。 */
-  tickNow(): Promise<void>;
-  /** 当前 firing 中的 rule id 集合(测试可 assert)。 */
-  firingRules(): Set<string>;
+  /** 手动跑一次 rule tick(集成测试用)。 */
+  tickNow(): Promise<RunRulesResult>;
+  /** 手动踢一次 dispatcher(测试用)。 */
+  dispatchNow(): Promise<number>;
+  /** 当前活跃 long-poll channel ids(测试可 assert)。 */
+  activeChannels(): Set<string>;
 }
 
-function defaultOnError(ruleId: string, err: unknown): void {
+function defaultOnError(scope: string, err: unknown): void {
   // eslint-disable-next-line no-console
-  console.warn(`[admin/alerts] rule ${ruleId} tick error:`, err);
+  console.warn(`[admin/alerts] ${scope} error:`, err);
 }
 
-// ─── sender 实现 ──────────────────────────────────────────────────────
+// ─── Telegram sender(保留兼容)─────────────────────────────────────────
 
+/** @deprecated T-63 后告警走 iLink WeChat,Telegram sender 保留兼容。 */
 export function createTelegramSender(env: NodeJS.ProcessEnv = process.env): AlertSender {
   const token = env.ALERT_TG_BOT_TOKEN ?? "";
   const chat = env.ALERT_TG_CHAT ?? "";
@@ -116,17 +119,13 @@ export function createTelegramSender(env: NodeJS.ProcessEnv = process.env): Aler
   };
 }
 
-// ─── 默认规则 ─────────────────────────────────────────────────────────
+// ─── 遗留 rules 保留(兼容 snapshotForAlerts + 旧测试)──────────────────
 
-/**
- * account_pool_all_down:
- *   触发:accounts 非空,但 **无** 任何账号满足 status=active 且 health_score>0
- *   含义:线上聊天会全部打不出去
- */
+/** @deprecated T-63 用 alertRules.ts 的 PolledRule 集合,这里只留类型签名。 */
 export const ruleAccountPoolAllDown: AlertRule = {
   id: "account_pool_all_down",
   evaluate(s) {
-    if (s.accountHealth.length === 0) return false; // 由 no_accounts_configured 管
+    if (s.accountHealth.length === 0) return false;
     return !s.accountHealth.some((a) => a.status === "active" && a.health_score > 0);
   },
   firingMessage(s) {
@@ -142,16 +141,10 @@ export const ruleAccountPoolAllDown: AlertRule = {
   },
 };
 
-/**
- * no_accounts_configured:
- *   触发:accounts 表完全为空
- *   含义:要么部署刚上来还没配账号,要么管理员全删了 —— 二者都要人工干预
- */
+/** @deprecated 同上。 */
 export const ruleNoAccountsConfigured: AlertRule = {
   id: "no_accounts_configured",
-  evaluate(s) {
-    return s.accountHealth.length === 0;
-  },
+  evaluate(s) { return s.accountHealth.length === 0; },
   firingMessage() {
     return "*[ALERT] 账号池为空* —— 没有配置任何 Claude 账号,商业化聊天无法服务。";
   },
@@ -160,53 +153,32 @@ export const ruleNoAccountsConfigured: AlertRule = {
   },
 };
 
+/** @deprecated T-63 改用 alertRules.defaultPolledRules()。 */
 export function defaultRules(): AlertRule[] {
   return [ruleAccountPoolAllDown, ruleNoAccountsConfigured];
 }
 
-// ─── scheduler ────────────────────────────────────────────────────────
+// 兼容导出(旧测试从这里取 snapshot 类型)
+export { snapshotForAlerts };
+
+// ─── scheduler(T-63 新实现)──────────────────────────────────────────
 
 export function startAlertScheduler(opts: AlertSchedulerOptions = {}): AlertScheduler {
-  const interval = opts.intervalMs ?? 60_000;
-  const rules = opts.rules ?? defaultRules();
-  const sender = opts.sender ?? createTelegramSender();
+  const interval = Math.max(1000, opts.intervalMs ?? 60_000);
   const onError = opts.onError ?? defaultOnError;
-  const firing = new Set<string>();
   let stopped = false;
-  let inflight: Promise<void> | null = null;
+  let inflight: Promise<RunRulesResult> | null = null;
 
-  async function runOneTick(): Promise<void> {
-    let snapshot: Snapshot;
+  async function runOneTick(): Promise<RunRulesResult> {
     try {
-      snapshot = await snapshotForAlerts(opts.collectDeps ?? {});
+      return await runRulesOnce();
     } catch (err) {
-      onError("__snapshot__", err);
-      return;
-    }
-    for (const rule of rules) {
-      try {
-        const current = await rule.evaluate(snapshot);
-        const wasFiring = firing.has(rule.id);
-        if (current && !wasFiring) {
-          firing.add(rule.id);
-          await sender.send(rule.firingMessage(snapshot));
-        } else if (!current && wasFiring) {
-          firing.delete(rule.id);
-          await sender.send(rule.resolvedMessage(snapshot));
-        }
-      } catch (err) {
-        onError(rule.id, err);
-      }
+      onError("runRulesOnce", err);
+      return { evaluated: [], firings: [], resolutions: [], errors: [{ rule_id: "__top__", err: String(err) }] };
     }
   }
 
-  /**
-   * 串行化 tick:统一跑一条 "pending tick" 队列:
-   *   - 正在跑 → 把新请求合并到 pending(tickNow/interval 来几次都算一次 pending)
-   *   - 不在跑 → 立刻启动
-   * 这样 setInterval 和 tickNow 共享 lane,绝不并跑,resolve/fire state 不会错乱。
-   */
-  function scheduleTick(): Promise<void> {
+  function scheduleTick(): Promise<RunRulesResult> {
     if (inflight) return inflight;
     inflight = runOneTick().finally(() => { inflight = null; });
     return inflight;
@@ -214,14 +186,21 @@ export function startAlertScheduler(opts: AlertSchedulerOptions = {}): AlertSche
 
   const timer = setInterval(() => {
     if (stopped) return;
-    // 不 await:interval 只负责踢,不背压。scheduleTick 自己会去重。
     void scheduleTick();
   }, interval);
-  // 不阻塞进程退出
   if (typeof timer.unref === "function") timer.unref();
 
   if (opts.runOnStart) {
     void scheduleTick();
+  }
+
+  // iLink worker(生产必开;测试可通过 disableIlinkWorker 关)
+  let ilinkWorker: IlinkWorkerHandle | null = null;
+  if (!opts.disableIlinkWorker) {
+    ilinkWorker = startIlinkAlertWorker({
+      dispatchIntervalMs: opts.ilinkDispatchIntervalMs,
+      onError: (scope, err) => onError(`ilink:${scope}`, err),
+    });
   }
 
   return {
@@ -231,17 +210,21 @@ export function startAlertScheduler(opts: AlertSchedulerOptions = {}): AlertSche
       if (inflight) {
         try { await inflight; } catch { /* */ }
       }
+      if (ilinkWorker) {
+        try { await ilinkWorker.stop(); } catch { /* */ }
+      }
     },
     async tickNow() {
-      // 若当前已有 tick 在跑 → 等它,再跑一次保证观察最新状态。
-      // 若无 → 直接启一次。两路都走 scheduleTick,和 interval 共享 lane。
       if (inflight) {
         try { await inflight; } catch { /* */ }
       }
-      await scheduleTick();
+      return scheduleTick();
     },
-    firingRules() {
-      return new Set(firing);
+    async dispatchNow() {
+      return ilinkWorker?.dispatchNow() ?? 0;
+    },
+    activeChannels() {
+      return ilinkWorker?.activeChannels() ?? new Set();
     },
   };
 }

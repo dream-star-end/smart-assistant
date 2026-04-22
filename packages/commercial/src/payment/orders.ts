@@ -96,6 +96,15 @@ async function userHasAnyPaidOrder(uid: string): Promise<boolean> {
   return r.rowCount !== null && r.rowCount > 0;
 }
 
+/** 用户 paid 订单数(告警判定首充 / 大额充值用)。 */
+export async function countPaidOrdersForUser(uid: string): Promise<number> {
+  const r = await query<{ n: string }>(
+    `SELECT COUNT(*)::text AS n FROM orders WHERE user_id = $1 AND status = 'paid'`,
+    [uid],
+  );
+  return Number(r.rows[0]?.n ?? 0);
+}
+
 export class OrderNotFoundError extends Error {
   readonly code = "ORDER_NOT_FOUND" as const;
   readonly orderNo: string;

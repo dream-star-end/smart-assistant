@@ -25,6 +25,8 @@ import type { PoolClient } from "pg";
 import { z } from "zod";
 import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
+import { safeEnqueueAlert } from "./alertOutbox.js";
+import { EVENTS } from "./alertEvents.js";
 
 // ─── Allowlist + per-key schema ───────────────────────────────────────
 
@@ -40,6 +42,17 @@ export const KEY_SCHEMAS = {
   rate_limit_chat_per_min: z.number().int().min(1).max(1000),
   /** 维护模式;true → 非 admin 用户的所有 /api/* 返 503 SERVICE_UNAVAILABLE。 */
   maintenance_mode: z.boolean(),
+  // ── T-63 admin 告警(WeChat 推送)总开关 + 规则阈值 ──
+  /** 全局告警开关;false → 所有 polled rule tick 直接 return(passive 事件照发)。 */
+  alerts_enabled: z.boolean(),
+  /** risk.signup_spike 阈值:N 分钟内注册数 ≥ 此数触发。整数,1..10000。 */
+  alerts_signup_spike_threshold: z.number().int().min(1).max(10_000),
+  /** risk.signup_spike 时间窗口(分钟)。整数,1..240。 */
+  alerts_signup_window_min: z.number().int().min(1).max(240),
+  /** risk.rate_limit_spike 阈值:N 分钟内 rate_limit_events.blocked 数 ≥ 此数触发。整数,1..100000。 */
+  alerts_rate_limit_spike_threshold: z.number().int().min(1).max(100_000),
+  /** risk.rate_limit_spike 时间窗口(分钟)。整数,1..240。 */
+  alerts_rate_limit_window_min: z.number().int().min(1).max(240),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -53,6 +66,11 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   default_effort: "medium",
   rate_limit_chat_per_min: 60,
   maintenance_mode: false,
+  alerts_enabled: true,
+  alerts_signup_spike_threshold: 20,
+  alerts_signup_window_min: 10,
+  alerts_rate_limit_spike_threshold: 200,
+  alerts_rate_limit_window_min: 10,
 };
 
 /** 给前端做 schema 自描述(admin UI 渲染表单用)。 */
@@ -69,6 +87,23 @@ export const KEY_META: Record<
   },
   rate_limit_chat_per_min: { kind: "number", min: 1, max: 1000, description: "单用户每分钟 chat 请求上限" },
   maintenance_mode: { kind: "boolean", description: "true=非 admin 全部 503(维护模式)" },
+  alerts_enabled: { kind: "boolean", description: "全局告警总开关(passive 事件不受此影响)" },
+  alerts_signup_spike_threshold: {
+    kind: "number", min: 1, max: 10000,
+    description: "risk.signup_spike 阈值:N 分钟内注册数 ≥ 此数触发",
+  },
+  alerts_signup_window_min: {
+    kind: "number", min: 1, max: 240,
+    description: "risk.signup_spike 时间窗口(分钟)",
+  },
+  alerts_rate_limit_spike_threshold: {
+    kind: "number", min: 1, max: 100000,
+    description: "risk.rate_limit_spike 阈值:N 分钟内 rate_limit_events.blocked 数 ≥ 此数触发",
+  },
+  alerts_rate_limit_window_min: {
+    kind: "number", min: 1, max: 240,
+    description: "risk.rate_limit_spike 时间窗口(分钟)",
+  },
 };
 
 export const ALLOWED_KEYS: SystemSettingKey[] =
@@ -276,6 +311,13 @@ export async function setSystemSetting<K extends SystemSettingKey>(
       userAgent: ctx.userAgent ?? null,
     });
 
+    // T-63 告警:只在 value 实际变化时发(description 变化不发)。
+    // tx 外发送容易漏审,tx 内发送又容易把 alert 捆进业务事务 — safeEnqueueAlert 是
+    // fire-and-forget 且内部 try/catch,不会把 tx 拖失败。
+    if (!isSameValue) {
+      emitSystemSettingChangeAlert(key, beforeValue, value, ctx.adminId);
+    }
+
     return {
       key,
       value,
@@ -285,4 +327,34 @@ export async function setSystemSetting<K extends SystemSettingKey>(
       is_default: false,
     } as SystemSettingRow<K>;
   });
+}
+
+/**
+ * 按 key 发对应告警:
+ *   - maintenance_mode    → system.maintenance_mode_changed (warning)
+ *   - 其余 alerts_* / rate_* / allow_registration 等 → 不发(太吵)
+ *
+ * model_pricing / topup_plans 的改动走 pricing.ts 自己的 setter,由那里发
+ * system.pricing_changed。
+ */
+function emitSystemSettingChangeAlert(
+  key: string,
+  beforeValue: unknown,
+  afterValue: unknown,
+  adminId: bigint | number | string,
+): void {
+  if (key === "maintenance_mode") {
+    const on = afterValue === true;
+    safeEnqueueAlert({
+      event_type: EVENTS.SYSTEM_MAINTENANCE_MODE_CHANGED,
+      severity: "warning",
+      title: on ? "维护模式已开启" : "维护模式已关闭",
+      body: on
+        ? `admin #${adminId} 开启了维护模式,所有非 admin 用户的 /api/* 将返 503。`
+        : `admin #${adminId} 关闭了维护模式,服务恢复对外可用。`,
+      payload: { key, before: beforeValue, after: afterValue, admin_id: String(adminId) },
+      // dedupe 按分钟桶,避免 admin 快速开关刷屏
+      dedupe_key: `system.maintenance_mode_changed:${new Date().toISOString().slice(0, 16)}`,
+    });
+  }
 }

@@ -31,6 +31,8 @@
 import { getTokenForUse, updateAccount, type AccountPlan } from "./store.js";
 import { loadKmsKey } from "../crypto/keys.js";
 import type { AccountHealthTracker } from "./health.js";
+import { safeEnqueueAlert } from "../admin/alertOutbox.js";
+import { EVENTS } from "../admin/alertEvents.js";
 
 /** token 过期时间与当前时间差小于此值 → 应 refresh。5 分钟。 */
 export const DEFAULT_REFRESH_SKEW_MS = 5 * 60 * 1000;
@@ -171,6 +173,17 @@ async function disableOnFailure(
   accountId: bigint | string,
   reason: string,
 ): Promise<void> {
+  // T-63 告警:账号 OAuth refresh 失败到需要 disable 的程度 —— warning,
+  // 连续多账号撞上同一 reason 会被 dedupe 按分钟桶收敛。不阻塞 disable 主路径。
+  safeEnqueueAlert({
+    event_type: EVENTS.ACCOUNT_POOL_TOKEN_REFRESH_FAILED,
+    severity: "warning",
+    title: "账号 refresh 失败被 disable",
+    body: `账号 #${accountId} OAuth refresh 连续失败,已被自动降级为 disabled。reason=\`${reason}\``,
+    payload: { account_id: String(accountId), reason },
+    // 同一 reason + 同一分钟 → 合并
+    dedupe_key: `account_pool.token_refresh_failed:${reason}:${new Date().toISOString().slice(0, 16)}`,
+  });
   if (deps.health) {
     try {
       await deps.health.manualDisable(accountId, reason);

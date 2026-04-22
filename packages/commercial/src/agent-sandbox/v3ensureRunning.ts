@@ -40,6 +40,8 @@ import {
   type V3SupervisorDeps,
   type V3ContainerStatus,
 } from "./v3supervisor.js";
+import { safeEnqueueAlert } from "../admin/alertOutbox.js";
+import { EVENTS } from "../admin/alertEvents.js";
 import {
   waitContainerReady,
   DEFAULT_READINESS_TIMEOUT_MS,
@@ -199,18 +201,44 @@ export function makeV3EnsureRunning(
     } catch (err) {
       // V3 Phase 3I — host 满 cap 走专用 reason + 长 retryAfter,前端显示"系统繁忙"
       if (err instanceof SupervisorError && err.code === "HostFull") {
+        // 告警:host 达 MAX_RUNNING_CONTAINERS — 容量规划问题,critical。
+        // dedupe 按分钟桶避免风暴;运维扩容后自然解除。
+        safeEnqueueAlert({
+          event_type: EVENTS.CONTAINER_PROVISION_FAILED,
+          severity: "critical",
+          title: "容器 provision 失败 — 宿主容量满",
+          body: `uid=${uid} provision 被拒:宿主达到 MAX_RUNNING_CONTAINERS。需扩容或触发 idle sweep。`,
+          payload: { uid, reason: "host_full" },
+          dedupe_key: `container.provision_failed:host_full:${new Date().toISOString().slice(0, 16)}`,
+        });
         throw new ContainerUnreadyError(RETRY_AFTER_HOST_FULL_SEC, "host_full");
       }
       // Codex round 1 FAIL #4 fix:ImageNotFound 是部署级故障 — 5s 重试只会风暴
       if (err instanceof SupervisorError && err.code === "ImageNotFound") {
+        safeEnqueueAlert({
+          event_type: EVENTS.CONTAINER_PROVISION_FAILED,
+          severity: "critical",
+          title: "容器 provision 失败 — 镜像缺失",
+          body: `uid=${uid} provision 失败:docker image tag 不存在。部署级故障,需人工 \`docker pull\` 或重跑 build-image。`,
+          payload: { uid, reason: "image_missing" },
+          dedupe_key: `container.provision_failed:image_missing:${new Date().toISOString().slice(0, 13)}`,
+        });
         throw new ContainerUnreadyError(RETRY_AFTER_IMAGE_MISSING_SEC, "image_missing");
       }
       // Codex R2 fix:CcbBaselineMissing 同为部署级故障 — baseline rsync 漏了
       // 或权限被改。走长重试避免风暴,留给运维修基线。
       if (err instanceof SupervisorError && err.code === "CcbBaselineMissing") {
+        safeEnqueueAlert({
+          event_type: EVENTS.CONTAINER_PROVISION_FAILED,
+          severity: "critical",
+          title: "容器 provision 失败 — baseline 缺失",
+          body: `uid=${uid} provision 失败:claude-code-best baseline 目录不存在或权限错。需人工 rsync 修复。`,
+          payload: { uid, reason: "baseline_missing" },
+          dedupe_key: `container.provision_failed:baseline_missing:${new Date().toISOString().slice(0, 13)}`,
+        });
         throw new ContainerUnreadyError(RETRY_AFTER_BASELINE_MISSING_SEC, "baseline_missing");
       }
-      // NameConflict(同 uid 并发 provision)/ IP 池满 都让前端短重试
+      // NameConflict(同 uid 并发 provision)/ IP 池满 都让前端短重试 — 不告警
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }
 

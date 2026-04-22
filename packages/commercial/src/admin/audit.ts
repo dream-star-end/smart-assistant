@@ -16,6 +16,8 @@
 
 import type { QueryRunner } from "../db/queries.js";
 import { query } from "../db/queries.js";
+import { safeEnqueueAlert } from "./alertOutbox.js";
+import { EVENTS } from "./alertEvents.js";
 
 // ─── writeAdminAudit ───────────────────────────────────────────────
 
@@ -42,21 +44,43 @@ export async function writeAdminAudit(
   runner: QueryRunner,
   input: WriteAdminAuditInput,
 ): Promise<bigint> {
-  const r = await runner.query<{ id: string }>(
-    `INSERT INTO admin_audit(admin_id, action, target, before, after, ip, user_agent)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
-     RETURNING id::text AS id`,
-    [
-      String(input.adminId),
-      input.action,
-      input.target ?? null,
-      input.before === undefined ? null : JSON.stringify(input.before),
-      input.after === undefined ? null : JSON.stringify(input.after),
-      input.ip ?? null,
-      input.userAgent ?? null,
-    ],
-  );
-  return BigInt(r.rows[0].id);
+  try {
+    const r = await runner.query<{ id: string }>(
+      `INSERT INTO admin_audit(admin_id, action, target, before, after, ip, user_agent)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
+       RETURNING id::text AS id`,
+      [
+        String(input.adminId),
+        input.action,
+        input.target ?? null,
+        input.before === undefined ? null : JSON.stringify(input.before),
+        input.after === undefined ? null : JSON.stringify(input.after),
+        input.ip ?? null,
+        input.userAgent ?? null,
+      ],
+    );
+    return BigInt(r.rows[0].id);
+  } catch (err) {
+    // T-63 告警:审计写入失败是合规红线事故 —— critical。
+    // 业务 tx 会被调用方 rollback;alert 走独立 pool 连接(safeEnqueueAlert 内部
+    // 用 query() 而非 tx runner),不受 rollback 影响。
+    const msg = err instanceof Error ? err.message : String(err);
+    safeEnqueueAlert({
+      event_type: EVENTS.SECURITY_ADMIN_AUDIT_WRITE_FAILED,
+      severity: "critical",
+      title: "admin_audit 写入失败",
+      body: `admin=#${input.adminId} action=\`${input.action}\` target=\`${input.target ?? "-"}\` 审计写入抛错,业务已回滚。\n\nerror: ${msg.slice(0, 300)}`,
+      payload: {
+        admin_id: String(input.adminId),
+        action: input.action,
+        target: input.target ?? null,
+        error: msg.slice(0, 500),
+      },
+      // dedupe 按 (action, 分钟桶):避免同一故障在短时间内重复告警
+      dedupe_key: `security.admin_audit_write_failed:${input.action}:${new Date().toISOString().slice(0, 16)}`,
+    });
+    throw err;
+  }
 }
 
 // ─── listAdminAudit ────────────────────────────────────────────────
