@@ -219,6 +219,7 @@ function renderGate(msg) {
 // ─── Tab routing ────────────────────────────────────────────────────
 
 const TABS = {
+  dashboard: renderDashboardTab,
   users: renderUsersTab,
   accounts: renderAccountsTab,
   containers: renderContainersTab,
@@ -240,12 +241,282 @@ function navigate(tab) {
 
 function applyHash() {
   const m = /#tab=([a-z]+)/.exec(window.location.hash)
-  const tab = (m && TABS[m[1]]) ? m[1] : 'users'
+  const tab = (m && TABS[m[1]]) ? m[1] : 'dashboard'
   for (const btn of document.querySelectorAll('#tabs button')) {
     btn.classList.toggle('active', btn.dataset.tab === tab)
   }
   setLoading()
   TABS[tab]().catch((e) => showError(`加载失败: ${e.message}`))
+}
+
+// ─── Tab: Dashboard (总览) ──────────────────────────────────────────
+//
+// 由前端聚合现有 /api/admin/* 端点 + /api/admin/metrics (Prometheus) 渲染
+// 一屏总览。不依赖新后端接口。刷新按钮 / 30 秒自动轮询。
+
+const DASH_STATE = { parsedMetrics: null, refreshTimer: null }
+
+/** 把 Prometheus 文本解析成 { series_name: [{labels, value}] }。只抓我们关心的几条。 */
+function parsePromText(text) {
+  const lines = String(text || '').split('\n')
+  const out = Object.create(null)
+  const WHITELIST = new Set([
+    'gateway_http_requests_total',
+    'billing_debit_total',
+    'claude_api_requests_total',
+    'account_pool_health',
+    'agent_containers_running',
+    'anthropic_proxy_ttft_seconds_sum',
+    'anthropic_proxy_ttft_seconds_count',
+    'anthropic_proxy_settle_total',
+    'anthropic_proxy_reject_total',
+  ])
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    const m = /^([a-zA-Z_][a-zA-Z0-9_]*)(?:\{([^}]*)\})?\s+([0-9eE.+\-]+)$/.exec(line)
+    if (!m) continue
+    const [, name, labelBlob, val] = m
+    if (!WHITELIST.has(name)) continue
+    const labels = {}
+    if (labelBlob) {
+      const lm = labelBlob.matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"/g)
+      for (const l of lm) labels[l[1]] = l[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+    }
+    const n = Number(val)
+    if (!Number.isFinite(n)) continue
+    if (!out[name]) out[name] = []
+    out[name].push({ labels, value: n })
+  }
+  return out
+}
+
+function sumBy(rows, pred = () => true) {
+  if (!rows) return 0
+  return rows.reduce((acc, r) => acc + (pred(r.labels) ? r.value : 0), 0)
+}
+
+/** 拉 Prometheus metrics(文本)。失败返 null。 */
+async function fetchMetricsText() {
+  try {
+    const r = await apiFetch('/api/admin/metrics', { headers: authHeaders() })
+    if (!r.ok) return null
+    return await r.text()
+  } catch {
+    return null
+  }
+}
+
+async function renderDashboardTab() {
+  // 停掉上一个 tab 的定时器
+  if (DASH_STATE.refreshTimer) {
+    clearInterval(DASH_STATE.refreshTimer)
+    DASH_STATE.refreshTimer = null
+  }
+
+  // 先渲染骨架
+  view().innerHTML = `
+    <div class="dash">
+      <div class="dash-h1">
+        <h2>总览
+          <span class="dash-sub" id="dash-last-refresh">加载中…</span>
+        </h2>
+        <button class="btn" id="dash-refresh">刷新</button>
+      </div>
+
+      <div class="stat-grid">
+        ${['活跃用户','Token 消耗','请求总数','账号池可用','平均 TTFT','今日营收'].map((label) => `
+          <div class="stat-card">
+            <div class="stat-label">${escapeHtml(label)}</div>
+            <div class="stat-value is-loading">—</div>
+            <div class="stat-delta">—</div>
+          </div>`).join('')}
+      </div>
+
+      <div class="admin-two-col">
+        <div class="admin-card">
+          <div class="admin-card-head">
+            <h3>账号池状态</h3>
+            <a class="admin-link" data-nav="accounts">查看全部 →</a>
+          </div>
+          <div class="pool-list" id="dash-pools"><div class="skeleton-row"><div class="skeleton-bar w60"></div></div></div>
+        </div>
+        <div class="admin-card">
+          <div class="admin-card-head">
+            <h3>最近积分流水</h3>
+            <a class="admin-link" data-nav="ledger">打开流水 →</a>
+          </div>
+          <div class="log-list" id="dash-activity"><div class="skeleton-row"><div class="skeleton-bar w60"></div></div></div>
+        </div>
+      </div>
+    </div>`
+
+  // 装弹第一次数据
+  await loadDashboardData()
+
+  // 手动刷新
+  $('dash-refresh')?.addEventListener('click', async (ev) => {
+    await withBtnLoading(ev.currentTarget, () => loadDashboardData())
+  })
+  // 导航快捷键
+  for (const a of view().querySelectorAll('a[data-nav]')) {
+    a.addEventListener('click', (e) => {
+      e.preventDefault()
+      navigate(a.dataset.nav)
+    })
+  }
+  // 30 秒自动刷新(离开 tab 时 applyHash() 会重新渲染,不会重复 timer)
+  DASH_STATE.refreshTimer = setInterval(() => {
+    if (/#tab=dashboard/.test(window.location.hash) || window.location.hash === '') {
+      loadDashboardData().catch(() => {})
+    }
+  }, 30_000)
+}
+
+async function loadDashboardData() {
+  // 并行拉 3 条
+  const [accountsRes, ledgerRes, metricsText] = await Promise.allSettled([
+    apiGet('/api/admin/accounts').catch(() => null),
+    apiGet('/api/admin/ledger?limit=8').catch(() => null),
+    fetchMetricsText(),
+  ])
+  const accounts = accountsRes.status === 'fulfilled' ? (accountsRes.value?.rows || []) : []
+  const ledger = ledgerRes.status === 'fulfilled' ? (ledgerRes.value?.rows || []) : []
+  const prom = metricsText.status === 'fulfilled' && metricsText.value
+    ? parsePromText(metricsText.value)
+    : {}
+
+  // ─── Stat cards ───
+  const statCards = view().querySelectorAll('.stat-card')
+
+  // 活跃用户 — 暂无 /active_24h 端点,从 ledger 里提 unique user 数
+  const activeUsers = new Set(ledger.map((r) => r.user_id).filter(Boolean))
+  updateStat(statCards[0], activeUsers.size.toLocaleString(), '最近流水中的独立用户', null)
+
+  // Token 消耗 — 用 claude_api_requests_total(success) 汇总
+  const claudeSuccess = sumBy(prom.claude_api_requests_total, (l) => l.status === 'success')
+  const claudeErr = sumBy(prom.claude_api_requests_total, (l) => l.status === 'error')
+  updateStat(statCards[1], '—', 'Prometheus 无 token 计数', null)
+  // 请求总数
+  const totalReq = claudeSuccess + claudeErr
+  const errRate = totalReq > 0 ? (claudeErr / totalReq * 100) : 0
+  updateStat(statCards[2], totalReq.toLocaleString(),
+    totalReq > 0 ? `错误率 ${errRate.toFixed(2)}%` : '—',
+    errRate > 5 ? 'danger' : errRate > 1 ? 'warning' : 'success')
+
+  // 账号池可用
+  const poolAvail = accounts.filter((a) => a.status === 'active').length
+  const poolTotal = accounts.length
+  const poolCooldown = accounts.filter((a) => a.status === 'cooldown').length
+  const poolDisabled = accounts.filter((a) => a.status === 'disabled' || a.status === 'banned').length
+  updateStat(statCards[3], `${poolAvail} / ${poolTotal}`,
+    poolCooldown > 0 ? `${poolCooldown} 冷却中` : (poolDisabled > 0 ? `${poolDisabled} 禁用` : '全部健康'),
+    poolTotal === 0 ? null : (poolAvail === poolTotal ? 'success' : poolCooldown > 0 ? 'warning' : 'danger'))
+
+  // 平均 TTFT
+  const ttftSum = sumBy(prom.anthropic_proxy_ttft_seconds_sum)
+  const ttftCnt = sumBy(prom.anthropic_proxy_ttft_seconds_count)
+  const ttftAvg = ttftCnt > 0 ? (ttftSum / ttftCnt) : null
+  updateStat(statCards[4],
+    ttftAvg == null ? '—' : (ttftAvg < 1 ? `${Math.round(ttftAvg * 1000)} ms` : `${ttftAvg.toFixed(2)} s`),
+    ttftCnt > 0 ? `样本 ${ttftCnt.toLocaleString()}` : '暂无样本',
+    ttftAvg == null ? null : (ttftAvg < 1 ? 'success' : ttftAvg < 3 ? 'warning' : 'danger'))
+
+  // 今日营收 — 从 ledger 里累加今日 plan_subscription / agent_subscription 的正 delta
+  const today = new Date().toISOString().slice(0, 10)
+  const todayRevenue = ledger
+    .filter((r) => String(r.created_at || '').startsWith(today))
+    .filter((r) => r.reason === 'plan_subscription' || r.reason === 'agent_subscription' || r.reason === 'promotion')
+    .filter((r) => Number(r.delta) > 0)
+    .reduce((acc, r) => acc + Number(r.delta), 0)
+  updateStat(statCards[5], fmtCents(todayRevenue),
+    todayRevenue > 0 ? '已入账' : '样本仅最近 8 条',
+    todayRevenue > 0 ? 'success' : null)
+
+  // ─── Pool list ───
+  const poolEl = $('dash-pools')
+  if (poolEl) {
+    if (accounts.length === 0) {
+      poolEl.innerHTML = '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--muted)">暂无账号</div>'
+    } else {
+      poolEl.innerHTML = accounts.slice(0, 6).map((a) => {
+        const s = a.status
+        const tone = s === 'active' ? 'success' : s === 'cooldown' ? 'warning' : 'danger'
+        const health = Number(a.health_score ?? 100)
+        const loadPct = Math.max(2, Math.min(100, Math.round(health)))
+        return `
+          <div class="pool-row">
+            <code>${escapeHtml(a.label || `#${a.id}`)}</code>
+            <div class="pool-bar"><div class="pool-bar-fill pool-${tone}" style="width:${loadPct}%"></div></div>
+            <span class="pool-meta">${escapeHtml(a.plan || '-')}</span>
+            <span class="chip ${tone === 'success' ? '' : 'chip-accent'}">
+              <span class="chip-dot chip-dot-${tone}"></span>${escapeHtml(s)}
+            </span>
+          </div>`
+      }).join('')
+    }
+  }
+
+  // ─── Recent ledger activity ───
+  const activityEl = $('dash-activity')
+  if (activityEl) {
+    if (ledger.length === 0) {
+      activityEl.innerHTML = '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--muted)">暂无流水</div>'
+    } else {
+      activityEl.innerHTML = ledger.map((l) => {
+        const t = fmtTime(l.created_at)
+        const delta = Number(l.delta || 0)
+        const cls = delta > 0 ? 'is-positive' : delta < 0 ? 'is-negative' : ''
+        const sign = delta > 0 ? '+' : ''
+        const kindLabel = {
+          plan_subscription: '订阅',
+          agent_subscription: 'Agent 订阅',
+          chat_debit: '对话',
+          agent_chat_debit: 'Agent',
+          refund: '退款',
+          admin_adjust: '管理员调整',
+          promotion: '活动赠送',
+        }[l.reason] || l.reason
+        return `
+          <div class="log-row">
+            <span class="mono">${escapeHtml(t)}</span>
+            <span class="log-actor" title="${escapeHtml(String(l.user_id || ''))}"><code>${escapeHtml(String(l.user_id || '—').slice(0, 8))}</code> · ${escapeHtml(kindLabel)}</span>
+            <span class="log-delta ${cls}">${sign}${fmtCents(delta)}</span>
+            <span class="log-status ok">ok</span>
+          </div>`
+      }).join('')
+    }
+  }
+
+  const ts = $('dash-last-refresh')
+  if (ts) ts.textContent = `更新于 ${fmtTime(new Date().toISOString())}  ·  30s 自动刷新`
+}
+
+function updateStat(card, value, delta, tone) {
+  if (!card) return
+  const v = card.querySelector('.stat-value')
+  const d = card.querySelector('.stat-delta')
+  if (v) {
+    v.classList.remove('is-loading')
+    v.textContent = value
+  }
+  if (d) {
+    d.textContent = delta || ''
+    d.classList.remove('stat-success', 'stat-warning', 'stat-danger')
+    if (tone) d.classList.add(`stat-${tone}`)
+  }
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—'
+  try {
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return String(iso).slice(11, 19)
+    const HH = String(d.getHours()).padStart(2, '0')
+    const MM = String(d.getMinutes()).padStart(2, '0')
+    const SS = String(d.getSeconds()).padStart(2, '0')
+    return `${HH}:${MM}:${SS}`
+  } catch { return '—' }
 }
 
 // ─── Tab: Users ─────────────────────────────────────────────────────

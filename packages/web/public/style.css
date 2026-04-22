@@ -223,22 +223,300 @@ a:hover {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  Login view — split-screen: brand aside (left) + auth card (right)
+ *  Login view — design-kit "single centered card" layout with aurora
+ *  (旧版 split-screen 已废弃,aside/main 相关样式保留作 dead code)
  * ══════════════════════════════════════════════════════════════════ */
 .login-view {
   position: fixed;
   inset: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
-  background: var(--bg);
+  background: var(--bg-subtle);
   animation: fade-up var(--transition-slow);
   overflow: auto;
 }
-@media (max-width: 960px) {
-  .login-view {
-    grid-template-columns: 1fr;
+.login-stage-centered {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(16px, 5vh, 48px) clamp(16px, 5vw, 24px);
+  padding-top: max(env(safe-area-inset-top, 0), clamp(16px, 5vh, 48px));
+  padding-bottom: max(env(safe-area-inset-bottom, 0), clamp(24px, 5vh, 48px));
+  position: relative;
+  overflow-x: hidden;
+  overflow-y: auto;
+  min-height: 100dvh;
+}
+
+/* Aurora floating blobs — dark theme */
+.login-stage-centered .aurora {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(60px);
+  pointer-events: none;
+  z-index: 0;
+}
+.login-stage-centered .aurora-1 {
+  width: 420px; height: 420px;
+  top: -80px; left: -80px;
+  background: rgba(217, 119, 87, 0.35);
+  animation: aurora-float 20s ease-in-out infinite;
+}
+.login-stage-centered .aurora-2 {
+  width: 360px; height: 360px;
+  bottom: -60px; right: -100px;
+  background: rgba(181, 148, 239, 0.25);
+  animation: aurora-float 22s ease-in-out infinite reverse;
+}
+.login-stage-centered .aurora-3 {
+  width: 260px; height: 260px;
+  top: 40%; left: 50%;
+  background: rgba(122, 175, 230, 0.18);
+  animation: aurora-float 18s ease-in-out infinite;
+}
+/* Light theme: softer, warmer auroras */
+:root[data-theme="light"] .login-stage-centered .aurora-1 { background: rgba(217, 119, 87, 0.22); }
+:root[data-theme="light"] .login-stage-centered .aurora-2 { background: rgba(181, 148, 239, 0.18); }
+:root[data-theme="light"] .login-stage-centered .aurora-3 { background: rgba(122, 175, 230, 0.14); }
+
+/* Centered card */
+.login-stage-centered .login-card {
+  position: relative;
+  z-index: 1;
+  box-shadow: var(--shadow-xl);
+  width: 100%;
+  max-width: 420px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2xl);
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+@media (max-width: 480px) {
+  .login-stage-centered .login-card {
+    padding: 24px 20px;
+    border-radius: var(--radius-xl);
+    gap: 12px;
   }
 }
+
+/* Card head (brand + title + sub) */
+.login-card-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.login-card-head .login-brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 10px;
+  gap: var(--space-3);
+}
+.login-brand-back {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  text-decoration: none;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.login-brand-back:hover { background: var(--bg-hover); color: var(--fg); }
+.login-card-head h2 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--fg-strong);
+}
+.login-card-head p.muted {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+
+/* Utility: muted text (design-kit parity) */
+.login-stage-centered .muted { color: var(--fg-muted); }
+
+/* Error banner */
+.login-error-banner {
+  color: var(--error);
+  font-size: var(--text-sm);
+  background: rgba(220, 50, 50, 0.08);
+  border: 1px solid rgba(220, 50, 50, 0.2);
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+}
+
+/* Field wrapper (label + input stacked) */
+.login-stage-centered .login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.login-stage-centered .login-field label {
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding-left: 2px;
+}
+.login-stage-centered .login-field input {
+  width: 100%;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  font-size: 15px;
+  min-height: 46px;
+  font-family: inherit;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), background var(--transition-fast);
+}
+.login-stage-centered .login-field input::placeholder { color: var(--fg-dim); }
+.login-stage-centered .login-field input:hover:not(:focus) { border-color: var(--border-strong); }
+.login-stage-centered .login-field input:focus {
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+  background: var(--bg-elevated);
+}
+
+/* Remember-me row */
+.login-row-between {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  margin-top: 2px;
+}
+.login-row-between label {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+}
+.login-row-between input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+.login-row-between a {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+  font-weight: 500;
+}
+.login-row-between a:hover { text-decoration: underline; }
+
+/* Bottom toggle link */
+.login-toggle {
+  font-size: 13px;
+  text-align: center;
+  margin-top: 2px;
+  color: var(--fg-muted);
+}
+.login-toggle a {
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 600;
+  text-decoration: none;
+}
+.login-toggle a:hover { text-decoration: underline; }
+
+/* Turnstile slot */
+.login-turnstile {
+  min-height: 65px;
+  display: flex;
+  justify-content: center;
+  margin: 2px 0;
+}
+
+/* Submit button override (gradient, matches design kit btn-lg) */
+.login-stage-centered .login-submit {
+  margin-top: 4px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-active));
+  border: 0;
+  color: #fff;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  min-height: 48px;
+  font-size: 15px;
+  box-shadow: 0 4px 16px rgba(217, 119, 87, 0.28);
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast), filter var(--transition-fast);
+}
+.login-stage-centered .login-submit:hover:not(:disabled) {
+  filter: brightness(1.08);
+  box-shadow: 0 6px 24px rgba(217, 119, 87, 0.38);
+}
+.login-stage-centered .login-submit:active:not(:disabled) { transform: translateY(1px); }
+
+/* Resend verification row */
+.login-resend-row {
+  margin-top: var(--space-2);
+  text-align: center;
+}
+.login-resend-status {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  margin-top: var(--space-1);
+}
+
+/* Success panes (register success / forgot success / verify / reset success) */
+.login-success-pane {
+  text-align: center;
+  padding: var(--space-3) 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.login-success-icon { font-size: 32px; }
+.login-success-title { font-weight: 600; margin: 0; font-size: 16px; color: var(--fg-strong); }
+.login-success-desc {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  margin: 0;
+  line-height: 1.55;
+}
+.login-success-email { color: var(--fg); }
+.login-waiting {
+  margin-top: var(--space-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+.login-success-back { margin-top: var(--space-2); font-size: 13px; }
+.login-hint {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  margin: 0 0 var(--space-2);
+}
+
+/* Footer */
+.login-stage-centered .login-foot {
+  margin-top: 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: center;
+}
+.login-stage-centered .login-foot a {
+  color: var(--fg-muted);
+  text-decoration: none;
+}
+.login-stage-centered .login-foot a:hover { color: var(--fg); }
 
 /* ── Left aside ── */
 .login-aside {

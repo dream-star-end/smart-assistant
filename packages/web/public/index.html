@@ -201,176 +201,136 @@
   </footer>
 </div>
 
-<!-- ═══════════════ LOGIN VIEW (multi-mode auth) ═══════════════ -->
-<div id="login-view" class="login-view" hidden>
-  <!-- ── Left aside: brand panel (desktop only) ── -->
-  <aside class="login-aside" aria-hidden="true">
-    <div class="login-aside-bg"></div>
-    <div class="login-aside-inner">
-      <a href="/" class="login-aside-brand">
-        <span class="login-aside-mark">O</span>
-        <span class="login-aside-wordmark">OpenClaude</span>
-      </a>
-      <div class="login-aside-hero">
-        <h1 class="login-aside-title">
-          一个账号<br/>
-          <span class="login-aside-title-accent">所有 Claude 能力</span>
-        </h1>
-        <p class="login-aside-sub">
-          Claude Opus 4.7 · Sonnet 4.6,按 token 计费,内置多模态生成、独立 Agent 工作空间、长期记忆与定时任务。
-        </p>
-      </div>
-      <ul class="login-aside-bullets">
-        <li>
-          <span class="login-aside-bullet-dot"></span>
-          <div>
-            <div class="login-aside-bullet-title">官方 Claude API,无中间商</div>
-            <div class="login-aside-bullet-desc">直连 Anthropic,¥1 = 100 积分 ≈ $1 美元 token 额度</div>
-          </div>
-        </li>
-        <li>
-          <span class="login-aside-bullet-dot"></span>
-          <div>
-            <div class="login-aside-bullet-title">独立 Agent 容器</div>
-            <div class="login-aside-bullet-desc">每个用户隔离工作空间,代码 / 浏览器 / 文件全自由</div>
-          </div>
-        </li>
-        <li>
-          <span class="login-aside-bullet-dot"></span>
-          <div>
-            <div class="login-aside-bullet-title">多模态 + 长期记忆</div>
-            <div class="login-aside-bullet-desc">图 / 音 / 视频生成 + 跨会话记住你</div>
-          </div>
-        </li>
-      </ul>
-      <div class="login-aside-footer">
-        <a href="/">← 返回首页</a>
-      </div>
-    </div>
-  </aside>
-
-  <!-- ── Right main: auth form card ── -->
-  <main class="login-main">
-    <div class="login-card">
+<!-- ═══════════════ LOGIN VIEW (multi-mode auth) — design-kit "centered single card" ═══════════════ -->
+<div id="login-view" class="login-view login-stage-centered" hidden>
+  <div class="aurora aurora-1" aria-hidden="true"></div>
+  <div class="aurora aurora-2" aria-hidden="true"></div>
+  <div class="aurora aurora-3" aria-hidden="true"></div>
+  <div class="login-card">
+    <!-- Dynamic head: title/subtitle swapped by setMode() -->
+    <div class="login-card-head">
       <div class="login-brand">
         <div class="login-brand-mark">O</div>
-        <div>
-          <h2>欢迎回来</h2>
-          <div class="login-brand-sub">登录或注册以开始</div>
+        <a href="/" class="login-brand-back" title="返回首页">← 返回</a>
+      </div>
+      <h2 id="auth-card-title">欢迎回来</h2>
+      <p class="muted" id="auth-card-sub">登录你的 OpenClaude 账号</p>
+    </div>
+
+    <!-- Shared error banner -->
+    <div id="login-error" hidden class="login-error-banner"></div>
+
+    <!-- ── Mode: login ── -->
+    <div id="auth-mode-login" hidden>
+      <div class="login-field">
+        <label for="auth-login-email">邮箱</label>
+        <input id="auth-login-email" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email" />
+      </div>
+      <div class="login-field">
+        <label for="auth-login-password">密码</label>
+        <input id="auth-login-password" type="password" placeholder="输入你的密码" autocomplete="current-password" />
+      </div>
+      <div class="login-row-between muted">
+        <label><input id="auth-login-remember" type="checkbox" checked /> 记住我</label>
+        <a id="auth-tab-forgot" role="button" tabindex="0">忘记密码?</a>
+      </div>
+      <div id="turnstile-login" class="login-turnstile"></div>
+      <button id="auth-login-btn" type="button" class="btn btn-primary btn-lg btn-full login-submit">登录 →</button>
+      <div id="auth-login-resend-row" hidden class="login-resend-row">
+        <button id="auth-resend-verify-btn" type="button" class="btn btn-ghost btn-sm">重发验证邮件</button>
+        <div id="auth-login-resend-status" hidden class="login-resend-status"></div>
+      </div>
+      <div class="login-toggle muted">还没有账号? <a id="auth-tab-register" role="button" tabindex="0">立即注册</a></div>
+    </div>
+
+    <!-- ── Mode: register ── -->
+    <div id="auth-mode-register" hidden>
+      <div id="auth-register-form">
+        <div class="login-field">
+          <label for="auth-register-email">邮箱</label>
+          <input id="auth-register-email" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email" />
         </div>
+        <div class="login-field">
+          <label for="auth-register-password">密码</label>
+          <input id="auth-register-password" type="password" placeholder="至少 8 位" autocomplete="new-password" />
+        </div>
+        <div class="login-field">
+          <label for="auth-register-confirm">确认密码</label>
+          <input id="auth-register-confirm" type="password" placeholder="再次输入密码" autocomplete="new-password" />
+        </div>
+        <div id="turnstile-register" class="login-turnstile"></div>
+        <button id="auth-register-btn" type="button" class="btn btn-primary btn-lg btn-full login-submit">创建账号 →</button>
       </div>
-
-      <!-- Tab switcher: 仅 登录/注册 (忘记密码改成 login 表单内小链接) -->
-      <div id="auth-tabs" class="auth-tabs" role="tablist">
-        <button id="auth-tab-login" type="button" class="auth-tab is-active" role="tab">登录</button>
-        <button id="auth-tab-register" type="button" class="auth-tab" role="tab">注册</button>
+      <div id="auth-register-success" hidden class="login-success-pane">
+        <div class="login-success-icon">✓</div>
+        <p class="login-success-title">注册成功!</p>
+        <p class="login-success-desc">
+          我们已向 <span id="auth-register-success-email" class="login-success-email"></span> 发送验证邮件,请查收并点击链接完成验证。
+        </p>
+        <div id="auth-register-waiting" class="login-waiting">
+          <span class="auth-spinner" aria-hidden="true"></span>
+          <span>正在等待邮箱验证 — 在任意设备点击邮件链接后,本页会自动跳转登录</span>
+        </div>
+        <button id="auth-register-back-btn" type="button" class="btn btn-ghost btn-sm login-success-back">返回登录</button>
       </div>
+      <div class="login-toggle muted">已有账号? <a id="auth-tab-login-from-register" role="button" tabindex="0">直接登录</a></div>
+    </div>
 
-  <!-- Shared error banner -->
-  <div id="login-error" style="display:none;color:var(--error);font-size:var(--text-sm);margin-bottom:var(--space-2)"></div>
+    <!-- ── Mode: forgot password ── -->
+    <div id="auth-mode-forgot" hidden>
+      <div id="auth-forgot-form">
+        <p class="login-hint">输入注册邮箱,我们会发送密码重置链接</p>
+        <div class="login-field">
+          <label for="auth-forgot-email">邮箱</label>
+          <input id="auth-forgot-email" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email" />
+        </div>
+        <div id="turnstile-forgot" class="login-turnstile"></div>
+        <button id="auth-forgot-btn" type="button" class="btn btn-primary btn-lg btn-full login-submit">发送重置链接 →</button>
+      </div>
+      <div id="auth-forgot-success" hidden class="login-success-pane">
+        <div class="login-success-icon">✓</div>
+        <p class="login-success-title">已发送</p>
+        <p class="login-success-desc">
+          若 <span id="auth-forgot-success-email" class="login-success-email"></span> 已注册,你将很快收到重置链接。请检查垃圾邮件。
+        </p>
+        <button id="auth-forgot-success-back-btn" type="button" class="btn btn-ghost btn-sm login-success-back">返回登录</button>
+      </div>
+      <div class="login-toggle muted"><a id="auth-forgot-back-btn" role="button" tabindex="0">← 返回登录</a></div>
+    </div>
 
-  <!-- ── Mode: login ── -->
-  <div id="auth-mode-login" hidden>
-    <div class="auth-field">
-      <label for="auth-login-email">邮箱</label>
-      <input id="auth-login-email" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email" />
+    <!-- ── Mode: confirm reset (URL-driven) ── -->
+    <div id="auth-mode-reset" hidden>
+      <div id="auth-reset-form">
+        <p class="login-hint">设置新密码</p>
+        <div class="login-field">
+          <label for="auth-reset-password">新密码</label>
+          <input id="auth-reset-password" type="password" placeholder="至少 8 位" autocomplete="new-password" />
+        </div>
+        <div class="login-field">
+          <label for="auth-reset-confirm">确认新密码</label>
+          <input id="auth-reset-confirm" type="password" placeholder="再次输入新密码" autocomplete="new-password" />
+        </div>
+        <button id="auth-reset-btn" type="button" class="btn btn-primary btn-lg btn-full login-submit">重置密码 →</button>
+      </div>
+      <div id="auth-reset-success" hidden class="login-success-pane">
+        <div class="login-success-icon">✓</div>
+        <p class="login-success-title">密码已重置</p>
+        <p class="login-success-desc">即将跳转到登录…</p>
+      </div>
     </div>
-    <div class="auth-field">
-      <label for="auth-login-password">密码</label>
-      <input id="auth-login-password" type="password" placeholder="输入你的密码" autocomplete="current-password" />
+
+    <!-- ── Mode: verify email (URL-driven) ── -->
+    <div id="auth-mode-verify" hidden class="login-success-pane">
+      <div class="login-success-icon">📧</div>
+      <p class="login-success-title">邮箱验证</p>
+      <p id="auth-verify-status" class="login-success-desc">正在验证…</p>
+      <button id="auth-verify-back-btn" type="button" class="btn btn-ghost btn-sm login-success-back" hidden>返回登录</button>
     </div>
-    <div class="auth-row-helper">
-      <button id="auth-tab-forgot" type="button" class="auth-link-btn">忘记密码?</button>
-    </div>
-    <div id="turnstile-login" style="margin-bottom:var(--space-2);min-height:65px"></div>
-    <button id="auth-login-btn" type="button" class="btn btn-primary btn-full">登录</button>
-    <div id="auth-login-resend-row" hidden style="margin-top:var(--space-2);text-align:center">
-      <button id="auth-resend-verify-btn" type="button" class="btn btn-ghost" style="font-size:13px">重发验证邮件</button>
-      <div id="auth-login-resend-status" hidden style="color:var(--fg-muted);font-size:var(--text-xs);margin-top:var(--space-1)"></div>
+
+    <div class="login-foot">
+      受 <a href="https://www.cloudflare.com/products/turnstile/" target="_blank" rel="noopener">Cloudflare Turnstile</a> 保护
     </div>
   </div>
-
-  <!-- ── Mode: register ── -->
-  <div id="auth-mode-register" hidden>
-    <div id="auth-register-form">
-      <div class="auth-field">
-        <label for="auth-register-email">邮箱</label>
-        <input id="auth-register-email" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email" />
-      </div>
-      <div class="auth-field">
-        <label for="auth-register-password">密码</label>
-        <input id="auth-register-password" type="password" placeholder="至少 8 位" autocomplete="new-password" />
-      </div>
-      <div class="auth-field">
-        <label for="auth-register-confirm">确认密码</label>
-        <input id="auth-register-confirm" type="password" placeholder="再次输入密码" autocomplete="new-password" />
-      </div>
-      <div id="turnstile-register" style="margin-bottom:var(--space-2);min-height:65px"></div>
-      <button id="auth-register-btn" type="button" class="btn btn-primary btn-full">注册</button>
-    </div>
-    <div id="auth-register-success" hidden style="text-align:center;padding:var(--space-3) 0">
-      <div style="font-size:32px;margin-bottom:var(--space-2)">✓</div>
-      <p style="font-weight:600;margin:0">注册成功!</p>
-      <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">
-        我们已向 <span id="auth-register-success-email" style="color:var(--fg)"></span> 发送验证邮件,请查收并点击链接完成验证。
-      </p>
-      <div id="auth-register-waiting" style="margin-top:var(--space-3);display:flex;align-items:center;justify-content:center;gap:var(--space-2);color:var(--fg-muted);font-size:var(--text-xs)">
-        <span class="auth-spinner" aria-hidden="true"></span>
-        <span>正在等待邮箱验证 — 在任意设备点击邮件链接后,本页会自动跳转登录</span>
-      </div>
-      <button id="auth-register-back-btn" type="button" class="btn btn-ghost" style="margin-top:var(--space-3);font-size:13px">返回登录</button>
-    </div>
-  </div>
-
-  <!-- ── Mode: forgot password ── -->
-  <div id="auth-mode-forgot" hidden>
-    <div id="auth-forgot-form">
-      <p class="hint" style="margin-bottom:var(--space-3)">输入注册邮箱,我们会发送密码重置链接</p>
-      <input id="auth-forgot-email" type="email" placeholder="邮箱" autocomplete="email" style="margin-bottom:var(--space-2)" />
-      <div id="turnstile-forgot" style="margin-bottom:var(--space-2);min-height:65px"></div>
-      <button id="auth-forgot-btn" type="button" class="btn btn-primary btn-full">发送重置链接</button>
-      <div style="margin-top:var(--space-3);text-align:center">
-        <button id="auth-forgot-back-btn" type="button" class="auth-link-btn">← 返回登录</button>
-      </div>
-    </div>
-    <div id="auth-forgot-success" hidden style="text-align:center;padding:var(--space-3) 0">
-      <div style="font-size:32px;margin-bottom:var(--space-2)">✓</div>
-      <p style="font-weight:600;margin:0">已发送</p>
-      <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">
-        若 <span id="auth-forgot-success-email" style="color:var(--fg)"></span> 已注册,你将很快收到重置链接。请检查垃圾邮件。
-      </p>
-      <button id="auth-forgot-success-back-btn" type="button" class="btn btn-ghost" style="margin-top:var(--space-3);font-size:13px">返回登录</button>
-    </div>
-  </div>
-
-  <!-- ── Mode: confirm reset (URL-driven) ── -->
-  <div id="auth-mode-reset" hidden>
-    <div id="auth-reset-form">
-      <p class="hint" style="margin-bottom:var(--space-3)">设置新密码</p>
-      <input id="auth-reset-password" type="password" placeholder="新密码(至少 8 位)" autocomplete="new-password" style="margin-bottom:var(--space-2)" />
-      <input id="auth-reset-confirm" type="password" placeholder="再次输入新密码" autocomplete="new-password" style="margin-bottom:var(--space-2)" />
-      <button id="auth-reset-btn" type="button" class="btn btn-primary btn-full">重置密码</button>
-    </div>
-    <div id="auth-reset-success" hidden style="text-align:center;padding:var(--space-3) 0">
-      <div style="font-size:32px;margin-bottom:var(--space-2)">✓</div>
-      <p style="font-weight:600;margin:0">密码已重置</p>
-      <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">即将跳转到登录…</p>
-    </div>
-  </div>
-
-  <!-- ── Mode: verify email (URL-driven) ── -->
-  <div id="auth-mode-verify" hidden style="text-align:center;padding:var(--space-3) 0">
-    <div style="font-size:32px;margin-bottom:var(--space-2)">📧</div>
-    <p style="font-weight:600;margin:0">邮箱验证</p>
-    <p id="auth-verify-status" style="color:var(--fg-muted);font-size:var(--text-sm);margin:var(--space-2) 0 0">正在验证…</p>
-    <button id="auth-verify-back-btn" type="button" class="btn btn-ghost" hidden style="margin-top:var(--space-3);font-size:13px">返回登录</button>
-  </div>
-
-      <div class="login-foot">
-        <span>受 <a href="https://www.cloudflare.com/products/turnstile/" target="_blank" rel="noopener">Cloudflare Turnstile</a> 保护</span>
-      </div>
-    </div>
-  </main>
 </div>
 
 <!-- ═══════════════ SESSION MIGRATION MODAL ═══════════════ -->

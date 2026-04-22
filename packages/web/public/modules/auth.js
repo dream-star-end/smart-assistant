@@ -156,16 +156,17 @@ export function setMode(mode) {
     const view = $(`auth-mode-${m}`)
     if (view) view.hidden = m !== mode
   }
-  // Update tab styling (segmented control)
-  for (const m of ['login', 'register', 'forgot']) {
-    const tab = $(`auth-tab-${m}`)
-    if (tab) {
-      tab.classList.toggle('is-active', m === mode)
-    }
+  // Update card head title/subtitle (design-kit variant uses per-mode copy)
+  const HEADS = {
+    login: { t: '欢迎回来', s: '登录你的 OpenClaude 账号' },
+    register: { t: '创建账号', s: '1 分钟开始使用满血 Opus' },
+    forgot: { t: '找回密码', s: '我们会发送重置链接到你的邮箱' },
+    reset: { t: '重置密码', s: '请设置一个新的登录密码' },
+    verify: { t: '邮箱验证', s: '正在完成邮箱验证…' },
   }
-  // Hide tabs for URL-driven modes
-  const tabs = $('auth-tabs')
-  if (tabs) tabs.hidden = mode === 'reset' || mode === 'verify'
+  const head = HEADS[mode] || HEADS.login
+  const tEl = $('auth-card-title'); if (tEl) tEl.textContent = head.t
+  const sEl = $('auth-card-sub'); if (sEl) sEl.textContent = head.s
 
   // Mount turnstile widget for the current mode (only modes that need it)
   const widgetContainerId = {
@@ -203,10 +204,12 @@ export async function initAuth() {
   const verifyParam = params.get('verify_email')
   const resetParam = params.get('reset_password')
 
-  // Wire tab clicks
+  // Wire tab/toggle clicks (bottom inline links in design-kit layout)
   $('auth-tab-login')?.addEventListener('click', () => setMode('login'))
   $('auth-tab-register')?.addEventListener('click', () => setMode('register'))
   $('auth-tab-forgot')?.addEventListener('click', () => setMode('forgot'))
+  // Duplicate ID-free bottom toggle inside register pane: "已有账号? 直接登录"
+  $('auth-tab-login-from-register')?.addEventListener('click', () => setMode('login'))
 
   // Wire form submit handlers
   $('auth-login-btn')?.addEventListener('click', _doLogin)
