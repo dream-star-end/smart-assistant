@@ -1725,39 +1725,10 @@ export function updateSessionSub(s) {
   const el = $('session-sub')
   if (!s) {
     el.textContent = ''
-    updateTokenUsageDisplay(null)
     return
   }
   const n = s.messages.filter((m) => m.role === 'user').length
   const shortId = s.id.replace(/^web-/, '')
   el.textContent = (n > 0 ? `${n} 轮 · ` : '') + shortTime(s.lastAt) + ` · ${shortId}`
   el.title = s.id // full ID on hover
-  updateTokenUsageDisplay(s._tokenUsage)
-}
-
-function _formatTokenCount(n) {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
-  return String(n)
-}
-
-export function updateTokenUsageDisplay(usage) {
-  const el = $('token-usage')
-  const textEl = $('token-usage-text')
-  if (!el || !textEl) return
-  if (!usage || (usage.input === 0 && usage.output === 0)) {
-    el.classList.remove('has-usage')
-    textEl.textContent = '0 tokens'
-    el.title = '当前会话 token 消耗'
-    return
-  }
-  el.classList.add('has-usage')
-  const total = usage.input + usage.output
-  const parts = [_formatTokenCount(total) + ' tokens']
-  if (usage.cost > 0) parts.push('$' + usage.cost.toFixed(4))
-  textEl.textContent = parts.join(' · ')
-  el.title = `输入: ${_formatTokenCount(usage.input)} · 输出: ${_formatTokenCount(usage.output)}` +
-    (usage.cacheRead > 0 ? ` · 缓存读: ${_formatTokenCount(usage.cacheRead)}` : '') +
-    (usage.cacheWrite > 0 ? ` · 缓存写: ${_formatTokenCount(usage.cacheWrite)}` : '') +
-    (usage.cost > 0 ? ` · 费用: $${usage.cost.toFixed(4)}` : '')
 }

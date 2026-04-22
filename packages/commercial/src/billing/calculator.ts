@@ -17,6 +17,13 @@
 
 import type { ModelPricing } from "./pricing.js";
 
+/**
+ * 成本/节省计算的缩放系数:1_000_000 (Mtok→tok) × 1000 (multiplier×10³) = 10^9。
+ * 任何复用 price_snapshot 做累加的地方(例如「使用消耗统计」的 savings 精算)都
+ * 必须用这个常量,别再写裸 `1_000_000_000n`。
+ */
+export const COST_SCALE = 1_000_000_000n;
+
 export interface TokenUsage {
   input_tokens: bigint | number;
   output_tokens: bigint | number;
@@ -54,7 +61,7 @@ function normalizeTokens(name: string, v: bigint | number): bigint {
 }
 
 /** multiplier 字符串 → BigInt 放大到 10^3。例如 "2.0" → 2000n,"1.234" → 1234n。 */
-function multiplierToScaled(multiplier: string): bigint {
+export function multiplierToScaled(multiplier: string): bigint {
   const [intPart, fracRaw = ""] = multiplier.split(".");
   const frac = fracRaw.padEnd(3, "0").slice(0, 3);
   // 允许带正负号(BigInt 会自己处理),但负 multiplier 视为非法
@@ -91,8 +98,7 @@ export function computeCost(usage: TokenUsage, pricing: ModelPricing, capturedAt
     cacheRead * pricing.cache_read_per_mtok * mul +
     cacheWrite * pricing.cache_write_per_mtok * mul;
 
-  // scale = 1_000_000 (Mtok) * 1000 (multiplier 放大) = 10^9
-  const SCALE = 1_000_000_000n;
+  const SCALE = COST_SCALE;
   let cost: bigint;
   if (scaled === 0n) {
     cost = 0n;

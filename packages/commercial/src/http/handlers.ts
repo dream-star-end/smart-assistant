@@ -662,5 +662,299 @@ export async function handlePatchMyPreferences(
   }
 }
 
+// ─── GET /api/me/usage (「使用消耗统计」前端弹窗) ──────────────────────
+//
+// 鉴权:Bearer access JWT(同 /api/me)。返回当前用户在 usage_records / credit_ledger
+// 上的聚合视图,首版字段见 response shape 注释。
+//
+// 设计约束(Codex R1→R3 review 落地):
+//   - billed(名义账单)vs debited(实际扣款)分离:clamp/billing_failed 场景两者会不等
+//   - 精确 savings 用 price_snapshot + calculator 同口径 BigInt 重算,行数 >10000 时
+//     标记 `savings_unavailable=true`,不返回粗估假值
+//   - sessions 用 offset 分页 + LIMIT+1 探测 has_more;稳定排序 ORDER BY MAX(ts), session_id
+//   - ledger 复用 admin/ledger.ts 的 id 游标 keyset(`before`),不按时间
+//   - legacy_unattributed = session_id IS NULL 的聚合,让用户知道"为什么 summary > sessions 总和"
+//   - 所有大数字段以字符串返回(user balance / tokens / cost 都有越过 2^53 的风险)
+
+const USAGE_ID_RE = /^[1-9][0-9]{0,19}$/;
+const SAVINGS_ROW_CAP = 10_000;
+
+function parseUsageLimit(raw: string | null, def: number, max: number): number {
+  if (raw === null || raw === "") return def;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > max) {
+    throw new HttpError(400, "INVALID_USAGE_QUERY", `limit must be integer in [1,${max}]`);
+  }
+  return n;
+}
+
+function parseUsageOffset(raw: string | null): number {
+  if (raw === null || raw === "") return 0;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 1_000_000) {
+    throw new HttpError(400, "INVALID_USAGE_QUERY", "offset must be non-negative integer");
+  }
+  return n;
+}
+
+export async function handleGetMyUsage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sessionsLimit = parseUsageLimit(url.searchParams.get("sessions_limit"), 20, 100);
+  const sessionsOffset = parseUsageOffset(url.searchParams.get("sessions_offset"));
+  const ledgerLimit = parseUsageLimit(url.searchParams.get("ledger_limit"), 20, 100);
+  const ledgerBeforeRaw = url.searchParams.get("ledger_before");
+  if (ledgerBeforeRaw !== null && ledgerBeforeRaw !== "" && !USAGE_ID_RE.test(ledgerBeforeRaw)) {
+    throw new HttpError(400, "INVALID_USAGE_QUERY", "ledger_before must be a bigint id");
+  }
+
+  const uid = user.id; // bigint-safe string from auth
+
+  // 并发 6 条只读查询。所有语义均 WHERE user_id=$1,无 IDOR。
+  const [
+    summaryRow,
+    legacyRow,
+    debitedRow,
+    sessionsRows,
+    cutoffRow,
+    savingsRows,
+  ] = await Promise.all([
+    // 1) summary:全量 success(含 session_id NULL)
+    query<{
+      input_tokens: string;
+      output_tokens: string;
+      cache_read_tokens: string;
+      cache_write_tokens: string;
+      billed_credits: string;
+      requests_total: string;
+    }>(
+      `SELECT COALESCE(SUM(input_tokens),0)::text        AS input_tokens,
+              COALESCE(SUM(output_tokens),0)::text       AS output_tokens,
+              COALESCE(SUM(cache_read_tokens),0)::text   AS cache_read_tokens,
+              COALESCE(SUM(cache_write_tokens),0)::text  AS cache_write_tokens,
+              COALESCE(SUM(cost_credits),0)::text        AS billed_credits,
+              COUNT(*)::bigint::text                     AS requests_total
+         FROM usage_records
+        WHERE user_id = $1 AND status = 'success'`,
+      [uid],
+    ),
+    // 2) legacy:session_id IS NULL 的 success 行
+    query<{
+      requests: string;
+      input_tokens: string;
+      output_tokens: string;
+      cache_read_tokens: string;
+      cache_write_tokens: string;
+      billed_credits: string;
+    }>(
+      `SELECT COUNT(*)::bigint::text                      AS requests,
+              COALESCE(SUM(input_tokens),0)::text         AS input_tokens,
+              COALESCE(SUM(output_tokens),0)::text        AS output_tokens,
+              COALESCE(SUM(cache_read_tokens),0)::text    AS cache_read_tokens,
+              COALESCE(SUM(cache_write_tokens),0)::text   AS cache_write_tokens,
+              COALESCE(SUM(cost_credits),0)::text         AS billed_credits
+         FROM usage_records
+        WHERE user_id = $1 AND status = 'success' AND session_id IS NULL`,
+      [uid],
+    ),
+    // 3) debited:JOIN usage_records.ledger_id → credit_ledger,只统计真实 debit(delta<0)
+    //    (Codex 建议:比按 reason 白名单更精确,避免未来其他 reason 混入)
+    query<{ debited_credits: string }>(
+      `SELECT COALESCE(SUM(-cl.delta), 0)::text AS debited_credits
+         FROM usage_records ur
+         JOIN credit_ledger cl ON cl.id = ur.ledger_id
+        WHERE ur.user_id = $1 AND ur.status = 'success' AND cl.delta < 0`,
+      [uid],
+    ),
+    // 4) sessions 分页:GROUP BY session_id,非 NULL,稳定排序,LIMIT+1 探 has_more
+    query<{
+      session_id: string;
+      requests: string;
+      input_tokens: string;
+      output_tokens: string;
+      cache_read_tokens: string;
+      cache_write_tokens: string;
+      billed_credits: string;
+      last_used_at: Date;
+    }>(
+      `SELECT session_id,
+              COUNT(*)::bigint::text                     AS requests,
+              COALESCE(SUM(input_tokens),0)::text        AS input_tokens,
+              COALESCE(SUM(output_tokens),0)::text       AS output_tokens,
+              COALESCE(SUM(cache_read_tokens),0)::text   AS cache_read_tokens,
+              COALESCE(SUM(cache_write_tokens),0)::text  AS cache_write_tokens,
+              COALESCE(SUM(cost_credits),0)::text        AS billed_credits,
+              MAX(created_at)                            AS last_used_at
+         FROM usage_records
+        WHERE user_id = $1 AND status = 'success' AND session_id IS NOT NULL
+        GROUP BY session_id
+        ORDER BY MAX(created_at) DESC, session_id DESC
+        LIMIT $2 OFFSET $3`,
+      [uid, sessionsLimit + 1, sessionsOffset],
+    ),
+    // 5) cutoff:最早一次带 session_id 的时间戳。UI 里提示"从何时开始支持会话维度"
+    query<{ cutoff_started_at: Date | null }>(
+      `SELECT MIN(created_at) AS cutoff_started_at
+         FROM usage_records
+        WHERE user_id = $1 AND session_id IS NOT NULL`,
+      [uid],
+    ),
+    // 6) savings 精算所需原始行。LIMIT SAVINGS_ROW_CAP+1 真正截断,不做 COUNT(*) 扫全表
+    query<{ cache_read_tokens: string; price_snapshot: unknown }>(
+      `SELECT cache_read_tokens::text AS cache_read_tokens,
+              price_snapshot
+         FROM usage_records
+        WHERE user_id = $1 AND status = 'success' AND cache_read_tokens > 0
+        LIMIT ${SAVINGS_ROW_CAP + 1}`,
+      [uid],
+    ),
+  ]);
+
+  // ── savings 精算(BigInt,per-row 防御) ──────────────────────────────
+  // 公式:节省 = Σ ceil( cache_read_tokens × (input_per_mtok - cache_read_per_mtok) × mul_scaled / 1e9 )
+  //   单位:分。clamp ≥ 0。公式与 calculator.ts 同口径但更窄(仅 cache_read 维度)。
+  //
+  // 行数 > SAVINGS_ROW_CAP → savings_unavailable=true(Codex R3:不返回 ¥0 粗估,
+  // 也不冒充当前 pricing 作为历史值)。
+  const { multiplierToScaled, COST_SCALE } = await import("../billing/calculator.js");
+  let savingsTotal = 0n;
+  let savingsRowsSkipped = 0;
+  let savingsUnavailable = false;
+  if (savingsRows.rows.length > SAVINGS_ROW_CAP) {
+    savingsUnavailable = true;
+  } else {
+    for (const r of savingsRows.rows) {
+      try {
+        const snap = r.price_snapshot as {
+          input_per_mtok?: unknown;
+          cache_read_per_mtok?: unknown;
+          multiplier?: unknown;
+        } | null;
+        if (!snap || typeof snap !== "object") { savingsRowsSkipped++; continue; }
+        if (typeof snap.input_per_mtok !== "string" ||
+            typeof snap.cache_read_per_mtok !== "string" ||
+            typeof snap.multiplier !== "string") {
+          savingsRowsSkipped++;
+          continue;
+        }
+        const inputPer = BigInt(snap.input_per_mtok);
+        const cachePer = BigInt(snap.cache_read_per_mtok);
+        if (inputPer <= cachePer) continue;
+        const mul = multiplierToScaled(snap.multiplier);
+        const tokens = BigInt(r.cache_read_tokens);
+        if (tokens <= 0n) continue;
+        const scaled = tokens * (inputPer - cachePer) * mul;
+        if (scaled <= 0n) continue;
+        const cents = (scaled + COST_SCALE - 1n) / COST_SCALE;
+        savingsTotal += cents;
+      } catch {
+        savingsRowsSkipped++;
+      }
+    }
+  }
+
+  // ── cache hit rate:cache_read / (input + cache_read) ──────────────────
+  //   cache_write 是"写入成本"不计入命中率分母(Codex R2 建议)
+  const inTokStr = summaryRow.rows[0]?.input_tokens ?? "0";
+  const crTokStr = summaryRow.rows[0]?.cache_read_tokens ?? "0";
+  const inTok = BigInt(inTokStr);
+  const crTok = BigInt(crTokStr);
+  let hitRate: number | null = null;
+  const denom = inTok + crTok;
+  if (denom > 0n) {
+    // 比例转 Number 是安全的(值在 [0,1])
+    hitRate = Number((crTok * 10_000n) / denom) / 10_000;
+  }
+
+  // ── sessions 分页:splice 第 N+1 行 ───────────────────────────────────
+  const fetched = sessionsRows.rows;
+  const hasMore = fetched.length > sessionsLimit;
+  const rowsPage = hasMore ? fetched.slice(0, sessionsLimit) : fetched;
+  const sessions = rowsPage.map((r) => ({
+    session_id: r.session_id,
+    requests: r.requests,
+    input_tokens: r.input_tokens,
+    output_tokens: r.output_tokens,
+    cache_read_tokens: r.cache_read_tokens,
+    cache_write_tokens: r.cache_write_tokens,
+    billed_credits: r.billed_credits,
+    last_used_at: r.last_used_at.toISOString(),
+  }));
+
+  // ── ledger 分页:复用 admin/ledger 的 id 游标 keyset ───────────────────
+  //   用户自查不限 reason,也不允许按 reason 过滤(UI 首版不做 filter)
+  const { listLedger } = await import("../admin/ledger.js");
+  const ledgerResult = await listLedger({
+    userId: uid,
+    limit: ledgerLimit,
+    before: ledgerBeforeRaw && ledgerBeforeRaw !== "" ? ledgerBeforeRaw : undefined,
+  });
+  const ledger = {
+    rows: ledgerResult.rows.map((r) => ({
+      id: r.id,
+      delta: r.delta,
+      balance_after: r.balance_after,
+      reason: r.reason,
+      ref_type: r.ref_type,
+      ref_id: r.ref_id,
+      memo: r.memo,
+      created_at: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+    })),
+    next_before: ledgerResult.next_before,
+  };
+
+  const sum = summaryRow.rows[0] ?? {
+    input_tokens: "0", output_tokens: "0",
+    cache_read_tokens: "0", cache_write_tokens: "0",
+    billed_credits: "0", requests_total: "0",
+  };
+  const leg = legacyRow.rows[0] ?? {
+    requests: "0", input_tokens: "0", output_tokens: "0",
+    cache_read_tokens: "0", cache_write_tokens: "0", billed_credits: "0",
+  };
+  const deb = debitedRow.rows[0]?.debited_credits ?? "0";
+  const cutoff = cutoffRow.rows[0]?.cutoff_started_at ?? null;
+
+  sendJson(res, 200, {
+    summary: {
+      input_tokens: sum.input_tokens,
+      output_tokens: sum.output_tokens,
+      cache_read_tokens: sum.cache_read_tokens,
+      cache_write_tokens: sum.cache_write_tokens,
+      requests_total: sum.requests_total,
+      billed_credits: sum.billed_credits,
+      debited_credits: deb,
+    },
+    legacy_unattributed: {
+      requests: leg.requests,
+      input_tokens: leg.input_tokens,
+      output_tokens: leg.output_tokens,
+      cache_read_tokens: leg.cache_read_tokens,
+      cache_write_tokens: leg.cache_write_tokens,
+      billed_credits: leg.billed_credits,
+    },
+    savings: {
+      savings_credits: savingsUnavailable ? null : savingsTotal.toString(),
+      savings_is_estimate: !savingsUnavailable && savingsRowsSkipped > 0,
+      savings_unavailable: savingsUnavailable,
+      savings_rows_skipped: savingsRowsSkipped,
+    },
+    cache: { hit_rate: hitRate },
+    sessions: {
+      rows: sessions,
+      limit: sessionsLimit,
+      offset: sessionsOffset,
+      has_more: hasMore,
+    },
+    ledger,
+    cutoff_started_at: cutoff ? cutoff.toISOString() : null,
+  });
+}
+
 // helper for tests / 其他 module
 export { clientIpOf, userAgentOf };

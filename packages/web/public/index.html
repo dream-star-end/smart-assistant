@@ -483,10 +483,6 @@
         <h3 id="session-title">新会话</h3>
         <span id="session-sub" class="session-sub"></span>
       </div>
-      <div id="token-usage" class="token-usage" title="当前会话 token 消耗">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px;opacity:0.6"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-        <span id="token-usage-text">0 tokens</span>
-      </div>
       <div class="head-actions">
         <!-- V3 commercial: 积分 pill (个人版无 /api/me → 自动隐藏) -->
         <button id="balance-pill" class="balance-pill" type="button" title="点击充值积分" hidden>
@@ -515,6 +511,7 @@
             <button class="settings-item" data-settings="feedback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>发送反馈</button>
             <div class="settings-section-label">系统</div>
             <button class="settings-item" data-settings="prefs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9"/><polyline points="3 4 3 12 11 12"/></svg>用户偏好</button>
+            <button class="settings-item" data-settings="usage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>使用消耗统计</button>
             <button class="settings-item" data-settings="theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>切换主题</button>
             <!-- V3 商用版: 移除 OAuth 认证 / 查看配置 入口(2026-04-21 boss 反馈) -->
             <button class="settings-item" data-settings="wechat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/><path d="M21 12a9 9 0 1 0-3.39 7.06l3.06.94-.94-3.06A8.96 8.96 0 0 0 21 12z"/></svg>微信绑定</button>
@@ -1049,6 +1046,117 @@
     <div class="modal-foot">
       <button class="btn btn-ghost" data-close-modal="prefs-modal" type="button">取消</button>
       <button id="prefs-save-btn" class="btn btn-primary" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- V3 commercial: 使用消耗统计(设置 → 使用消耗统计) -->
+<div id="usage-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="使用消耗统计">
+  <div class="modal usage-modal-body" style="max-width:760px">
+    <div class="modal-head">
+      <h3>使用消耗统计</h3>
+      <button class="modal-close" data-close-modal="usage-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <div id="usage-loading" class="usage-loading">加载中…</div>
+      <div id="usage-error" class="usage-error" hidden></div>
+      <div id="usage-content" hidden>
+        <!-- 总览卡片 -->
+        <div class="usage-summary">
+          <div class="usage-stat">
+            <span class="usage-stat-label">总消耗费用</span>
+            <span class="usage-stat-value" id="usage-cost">—</span>
+            <span class="usage-stat-hint" id="usage-cost-clamp-hint" hidden></span>
+          </div>
+          <div class="usage-stat">
+            <span class="usage-stat-label">总请求数</span>
+            <span class="usage-stat-value" id="usage-requests">—</span>
+          </div>
+          <div class="usage-stat">
+            <span class="usage-stat-label">总输入 tokens</span>
+            <span class="usage-stat-value" id="usage-input">—</span>
+          </div>
+          <div class="usage-stat">
+            <span class="usage-stat-label">总输出 tokens</span>
+            <span class="usage-stat-value" id="usage-output">—</span>
+          </div>
+        </div>
+
+        <!-- 缓存命中率 + 节省 -->
+        <div class="usage-section">
+          <h4 class="usage-section-title">缓存命中率</h4>
+          <div class="usage-cache-row">
+            <div class="usage-cache-rate">
+              <span class="usage-stat-label">命中率</span>
+              <span class="usage-stat-value" id="usage-hit-rate">—</span>
+              <span class="usage-stat-hint">命中率 = 缓存读 / (输入 + 缓存读)</span>
+            </div>
+            <div class="usage-cache-savings">
+              <span class="usage-stat-label">缓存节省</span>
+              <span class="usage-stat-value" id="usage-savings">—</span>
+              <span class="usage-stat-hint" id="usage-savings-hint">按每次请求的价格快照精算,仅计算 cache_read 维度的差价。</span>
+            </div>
+            <div class="usage-cache-misc">
+              <span class="usage-stat-label">缓存写入</span>
+              <span class="usage-stat-value" id="usage-cache-write">—</span>
+              <span class="usage-stat-hint">首次写入的预热成本,不计入命中率。</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 每会话消耗 -->
+        <div class="usage-section">
+          <h4 class="usage-section-title">按会话消耗</h4>
+          <p class="usage-cutoff-note" id="usage-cutoff-note"></p>
+          <div class="usage-table-wrap">
+            <table class="usage-table" id="usage-sessions-table">
+              <thead>
+                <tr>
+                  <th>会话</th>
+                  <th>请求</th>
+                  <th>输入</th>
+                  <th>输出</th>
+                  <th>缓存读</th>
+                  <th>名义费用</th>
+                  <th>最近使用</th>
+                </tr>
+              </thead>
+              <tbody id="usage-sessions-tbody"></tbody>
+            </table>
+          </div>
+          <div id="usage-legacy-row" class="usage-legacy-row" hidden></div>
+          <div class="usage-pager">
+            <button id="usage-sessions-prev" class="btn btn-ghost" type="button" disabled>上一页</button>
+            <span class="usage-page-info" id="usage-sessions-info"></span>
+            <button id="usage-sessions-next" class="btn btn-ghost" type="button" disabled>下一页</button>
+          </div>
+        </div>
+
+        <!-- 积分流水 -->
+        <div class="usage-section">
+          <h4 class="usage-section-title">积分流水</h4>
+          <div class="usage-table-wrap">
+            <table class="usage-table" id="usage-ledger-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>类型</th>
+                  <th>变动</th>
+                  <th>余额</th>
+                  <th>备注</th>
+                </tr>
+              </thead>
+              <tbody id="usage-ledger-tbody"></tbody>
+            </table>
+          </div>
+          <div class="usage-pager">
+            <button id="usage-ledger-more" class="btn btn-ghost" type="button" hidden>加载更多</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" data-close-modal="usage-modal" type="button">关闭</button>
     </div>
   </div>
 </div>

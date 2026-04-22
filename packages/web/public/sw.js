@@ -15,6 +15,8 @@ const SHELL = [
   '/modules/billing.js',
   '/modules/billing.js?v=ce5a4ae',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
   '/modules/userPrefs.js',
+  '/modules/usageStats.js',
+  '/modules/usageStats.js?v=ce5a4ae',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',

@@ -71,6 +71,8 @@ import { initAuth, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMo
 // = runtime error) or stale websocket.js (still shows $ not 积分).
 import { initBilling, refreshBalance } from './billing.js?v=ce5a4ae'
 import { initUserPrefs, openPrefsModal } from './userPrefs.js'
+// ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
+import { initUsageStats, openUsageModal } from './usageStats.js?v=ce5a4ae'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -1819,6 +1821,7 @@ async function init() {
     else if (action === 'claude-oauth') openOAuthModal()
     else if (action === 'wechat') openWechatModal()
     else if (action === 'prefs') openPrefsModal()
+    else if (action === 'usage') openUsageModal()
     else if (action === 'admin') {
       // V3 Phase 4E:打开超管控制台。新窗口避免覆盖正在进行的对话。
       // 后端 /api/admin/* + 前端 admin.js 都会再校验一次 role,这里只是入口。
@@ -1997,6 +2000,7 @@ async function init() {
   initAuth()
   initBilling()
   initUserPrefs()
+  initUsageStats()
   _wireLandingButtons()
   // Palette input
   $('palette-input').addEventListener('input', (e) => {

@@ -679,6 +679,12 @@ export interface FinalizeContext {
   precheckCredits: bigint;
   preCheckReservation: ReservationHandle;
   log: Logger;
+  /**
+   * 调用方传来的 session_id(已 trim,空串→null)。
+   * 仅用于写 usage_records.session_id,方便「使用消耗统计」按会话聚合。
+   * 不参与调度 / 鉴权 / 限流;旧记录 session_id=NULL 属于 legacy 归属数据。
+   */
+  sessionId: string | null;
 }
 
 export interface FinalizeOutcome {
@@ -789,6 +795,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
         snapshotJson: JSON.stringify(snapshot),
         costCredits: cost_credits,
         status,
+        sessionId: ctx.sessionId ?? null,
       });
       await deps.pgPool.query(
         `UPDATE request_finalize_journal
@@ -954,6 +961,7 @@ async function settleUsageAndLedger(
     snapshotJson: string;
     costCredits: bigint;
     status: "success" | "billing_failed" | "error";
+    sessionId: string | null;
   },
 ): Promise<SettleResult> {
   const client = await pool.connect();
@@ -969,8 +977,8 @@ async function settleUsageAndLedger(
         `INSERT INTO usage_records
           (user_id, mode, account_id, model,
            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-           price_snapshot, cost_credits, request_id, status)
-         VALUES ($1, 'chat', $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+           price_snapshot, cost_credits, session_id, request_id, status)
+         VALUES ($1, 'chat', $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
@@ -982,6 +990,7 @@ async function settleUsageAndLedger(
           BigInt(args.usage.cache_write_tokens).toString(),
           args.snapshotJson,
           args.costCredits.toString(),
+          args.sessionId,
           args.requestId,
           args.status,
         ],
@@ -1463,6 +1472,8 @@ export function makeAnthropicProxyHandler(
           precheckCredits: pre.maxCost,
           preCheckReservation: pre.reservation,
           log: userLog,
+          // 空串 / 全空白 → null,避免聚合时混成"空 session_id"组
+          sessionId: body.metadata?.session_id?.trim() || null,
         },
       );
 
