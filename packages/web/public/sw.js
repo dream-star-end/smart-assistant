@@ -12,6 +12,7 @@ const SHELL = [
   '/modules/main.js',
   '/modules/main.js?v=eae5c6c',  // versioned URL used in index.html
   '/modules/auth.js',
+  '/modules/auth.js?v=eae5c6c',  // versioned URL used in main.js import (Turnstile reset fix)
   '/modules/billing.js',
   '/modules/billing.js?v=eae5c6c',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
   '/modules/userPrefs.js',
