@@ -1,5 +1,5 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
-import { abortInflightRefresh, silentRefresh } from './api.js'
+import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
 import { clearSessionCookie } from './auth.js?v=a187083'
@@ -739,6 +739,8 @@ export function notifyTabVisible() {
 function _tearDownWsAuth() {
   // 2026-04-22 Codex R3:先 abort 再清 state。同 _forceLogout 的双层防护模型。
   abortInflightRefresh()
+  // 清主动续期 timer —— WS hard-teardown 后不再需要。
+  clearProactiveRefresh()
   // R4 SHOULD#1:WS 1008 / silentRefresh 失败的 hard-logout 路径也要清 oc_session,
   // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file 请求通过,语义分裂。
   // 用 void 不 await —— teardown 要立即完成,cookie 清理失败不阻塞主流程(最坏

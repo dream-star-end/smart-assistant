@@ -207,6 +207,9 @@ async function _doRefreshOnce(expectedEpoch) {
     }
     state.token = data.access_token
     if (typeof data.access_exp === 'number') state.tokenExp = data.access_exp
+    // Codex R1:reactive refresh 成功后也重排主动续期 timer,让下一次主动续期
+    // 对齐新 exp —— 避免 timer 还按旧 exp 排期,和 reactive 路径状态打架。
+    scheduleProactiveRefresh()
     try {
       localStorage.setItem('openclaude_access_token', data.access_token)
       if (typeof data.access_exp === 'number') {
@@ -258,6 +261,80 @@ const _RACE_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 1750]
 // Shares the same inflight promise as apiFetch's internal 401-retry path,
 // so a burst of HTTP 401 + WS 1008 only fires one /api/auth/refresh.
 export function silentRefresh() { return _silentRefresh() }
+
+// ── Proactive refresh timer ──
+//
+// 2026-04-23:手机浏览器长时间后台回来被踢登录问题。原架构是反应式——等 401/WS 1008
+// 再 silentRefresh。手机 resume 瞬间多个入口(WS 重连 / maybeSyncNow / mintSessionCookie
+// / restore 请求)并发用旧 expired token 打请求,并发 401 撞上 _tearDownWsAuth /
+// _notifyAuthExpired 就会误踢登录。
+//
+// 主动式:tab 活着时,access token 到期前 2 分钟就续一次,reactive 路径只是兜底。
+// 手机后台 timer 被浏览器挂起无副作用,靠 visibilitychange 路径补刷(见 main.js)。
+//
+// Codex R1:
+//   - callback 执行时重新检查 tokenExp—— resume 时挂起的 setTimeout 可能被立即补跑,
+//     若 visibility 路径已先刷新过,旧 callback 不该再打一次 refresh
+//   - _doRefreshOnce 成功后也顺手重排 timer,让 reactive refresh 后的下一次主动续期
+//     对齐新 exp,状态不漂
+const PROACTIVE_REFRESH_LEAD_SECONDS = 120  // 到期前 2min 续,留 race grace 余量
+const PROACTIVE_REFRESH_RETRY_MS = 60_000    // 失败后 1min 重试
+let _proactiveTimer = null
+
+function _cancelProactiveTimer() {
+  if (_proactiveTimer) { clearTimeout(_proactiveTimer); _proactiveTimer = null }
+}
+
+export function clearProactiveRefresh() {
+  _cancelProactiveTimer()
+}
+
+export function scheduleProactiveRefresh() {
+  _cancelProactiveTimer()
+  if (!state.token || !state.tokenExp) return
+  const nowSec = Math.floor(Date.now() / 1000)
+  const secondsUntil = state.tokenExp - nowSec - PROACTIVE_REFRESH_LEAD_SECONDS
+  // 已过了预警窗口(或本身已过期)→ 立即跑一次;否则按预警时间排
+  const delayMs = Math.max(0, secondsUntil) * 1000
+  _proactiveTimer = setTimeout(() => {
+    _proactiveTimer = null
+    void _runProactiveRefresh()
+  }, delayMs)
+}
+
+async function _runProactiveRefresh() {
+  // Callback 保护:手机浏览器 resume 时被压抑的 setTimeout 可能立即补跑,
+  // 若 visibility 路径已先刷过,tokenExp 此刻距今天已远,不该再打一次 refresh。
+  if (!state.token) return
+  // Codex R2:绑启动时的 epoch。_silentRefresh() await 期间用户可能切账号
+  // (_forceLogout → new login),旧 run 返回时看到新账号的 state.token 会给新账号
+  // 错误地排 60s retry timer,覆盖 login 分支刚排好的正确 timer handle。
+  const epochAtStart = state.authEpoch || 0
+  const nowSec = Math.floor(Date.now() / 1000)
+  const secondsUntil = (state.tokenExp || 0) - nowSec
+  if (secondsUntil > PROACTIVE_REFRESH_LEAD_SECONDS) {
+    // 已被别的路径刷过,按新 exp 重排即可
+    scheduleProactiveRefresh()
+    return
+  }
+  const ok = await _silentRefresh().catch(() => false)
+  if (!state.token) return  // 期间被 _forceLogout / _tearDownWsAuth 清了
+  if ((state.authEpoch || 0) !== epochAtStart) return  // 身份变了,别碰新账号的 timer
+  if (ok) {
+    // 按新 tokenExp 重排
+    scheduleProactiveRefresh()
+  } else {
+    // 失败不 teardown —— 保留 state.token 给 apiFetch 的 401 路径再试;
+    // 1 min 后重试主动路径。真 cookie 丢了会在反应式路径走 _forceLogout。
+    // 先 cancel 兜底:虽然进入这条分支时 _proactiveTimer 理应已是 null(schedule/run
+    // 两处都会清),但显式 cancel 更稳,避免任何 future race 泄漏 timer。
+    _cancelProactiveTimer()
+    _proactiveTimer = setTimeout(() => {
+      _proactiveTimer = null
+      void _runProactiveRefresh()
+    }, PROACTIVE_REFRESH_RETRY_MS)
+  }
+}
 
 function _silentRefresh() {
   const myEpoch = state.authEpoch || 0

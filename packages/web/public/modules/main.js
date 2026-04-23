@@ -21,7 +21,7 @@ import {
 import { getSession, isSending, setSending, state } from './state.js'
 
 // ── API layer ──
-import { abortInflightRefresh, apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired } from './api.js'
+import { abortInflightRefresh, apiFetch, apiGet, apiJson, authHeaders, clearProactiveRefresh, onAuthExpired, resetAuthExpired, scheduleProactiveRefresh, silentRefresh } from './api.js'
 
 // ── IndexedDB ──
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
@@ -283,14 +283,25 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('online', () => notifyNetworkOnline())
 window.addEventListener('offline', () => notifyNetworkOffline())
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) {
+  if (document.hidden) return
+  // 2026-04-23:手机浏览器长时间后台 resume 前的 proactive refresh。
+  // access token 快过期或已过期时先刷,再触发 WS 重连 / sessions sync —— 避开多路
+  // 并发用旧 token 打请求、撞上 _tearDownWsAuth / _notifyAuthExpired 误踢登录。
+  // 写成 async IIFE:不阻塞事件处理器,但在 refresh 期间确保 sync/reconnect 延后。
+  void (async () => {
+    const nowSec = Math.floor(Date.now() / 1000)
+    if (state.token && (!state.tokenExp || state.tokenExp - nowSec < 120)) {
+      await silentRefresh().catch(() => false)
+    }
+    // 等待期间用户可能登出 —— 别在已 teardown 的 state 上继续
+    if (!state.token) return
     notifyTabVisible()
     // Pull fresh session list from server. Mobile browsers pause JS when the
     // tab is hidden, so sessions created/updated on another device won't
     // appear until the next full-page init unless we pull here. Throttled
     // inside maybeSyncNow to avoid storms on rapid focus flaps.
     maybeSyncNow({ onResult: _applySyncResult })
-  }
+  })()
 })
 // Window focus on desktop (covers alt-tab / click-back-to-window without a
 // hidden→visible transition). Same pull semantics.
@@ -1096,6 +1107,8 @@ async function _forceLogout({ serverLogout } = {}) {
   // 里的 Set-Cookie 覆盖未来新账号 oc_rt 的时间窗),再 bump epoch(JS 侧
   // 保险,_doRefreshOnce commit 前比对)。两层防护缺一不可。
   abortInflightRefresh()
+  // 清主动续期 timer —— 不然登出后仍会在 2min 后打 /api/auth/refresh。
+  clearProactiveRefresh()
   state.authEpoch = (state.authEpoch || 0) + 1
   // Rearm the auth-expired one-shot so a future session expiry can trigger
   // the logout flow again. login success also does this, but doing it here
@@ -2025,6 +2038,8 @@ async function init() {
     // 先前 mint 的 signal;它自身发出的 clear 会正常到达 server 落盘 Max-Age=0。
     try { await clearSessionCookie() } catch {}
     try { await mintSessionCookie(access_token, state.authEpoch) } catch {}
+    // 启动主动续期 timer,见 init() 的注释。
+    scheduleProactiveRefresh()
     // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage.
     try {
       const stale = await dbGetAll()
@@ -2136,12 +2151,23 @@ async function init() {
   else createSession()
 
   if (state.token) {
+    // 2026-04-23:冷启动 proactive refresh。localStorage 里的 access token 极可能
+    // 已过期(手机浏览器长时间后台导致),若直接走 mintSessionCookie / connect() 会
+    // 撞一堆 401/1008,多路并发可能误踢登录。先做一次 silentRefresh,拿新 access
+    // 再继续下游流程。失败不 teardown —— 保留旧 token 给 reactive 路径再试一次,
+    // 真 cookie 丢了才走 _forceLogout。
+    const nowSec = Math.floor(Date.now() / 1000)
+    if (!state.tokenExp || state.tokenExp - nowSec < 60) {
+      await silentRefresh().catch(() => false)
+    }
     // V3 file-proxy:冷启动 state.token 从 localStorage 恢复,但 oc_session cookie
     // 可能已过期(或跨浏览器清理),renderMessages 里 <img src="/api/file?..."> 会
     // 因没 cookie 被 firewall 403。await mint —— 小概率 renderMessages 会立刻用到
     // 图片 src,先把 cookie 种上再展示,避免首次 paint 里的 403 闪红。
     // 传 state.authEpoch 做 self-heal:冷启动瞬间 epoch 一般不会变,兜底处理。
     await mintSessionCookie(state.token, state.authEpoch || 0)
+    // 启动后台 timer:access token 到期前 2min 主动续期,只要 tab 活着就不掉线。
+    scheduleProactiveRefresh()
     // Await so the HttpOnly session cookie is in place before any
     // <img>/<audio>/<video> tags get their src set by renderMessages.
     await showApp()
