@@ -8,6 +8,7 @@ import {
   verifyEmail,
   requestPasswordReset,
   confirmPasswordReset,
+  resendVerification,
   VerifyError,
 } from "../auth/verify.js";
 import { verifyPassword } from "../auth/passwords.js";
@@ -115,12 +116,16 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
 }
 
 /**
- * 注册 + 抓出验证邮件中的 raw token(URL 末尾)。
- * 比直接读 DB 拿 token_hash 更接近真实流程(用户拿到的是 raw token)。
+ * 注册 + 从邮件正文抓 6 位验证码。
+ *
+ * 2026-04-23:注册邮件从 "click link" 改为 "6 digit code"。正则匹配邮件正文
+ * 里四空格缩进那行里的 6 位数字。这比读 DB 拿 hash 更接近真实流程(用户
+ * 拿到的就是 raw 6 位数字)。
  */
 async function registerAndCaptureVerifyToken(email: string, password: string): Promise<{
   userId: string;
-  rawToken: string;
+  rawCode: string;
+  verifyEmail: string;
 }> {
   const mailer = new CapturingMailer();
   const r = await register(
@@ -131,15 +136,16 @@ async function registerAndCaptureVerifyToken(email: string, password: string): P
       verifyEmailUrlBase: "https://claudeai.chat",
     },
   );
-  const url = mailer.sent[0]?.text.match(/token=([^\s]+)/)?.[1];
-  if (!url) throw new Error("test setup: verify URL not captured");
-  return { userId: r.user_id, rawToken: url };
+  // 匹配邮件正文 "    ${verify.raw}" 那一行的 6 位数字
+  const code = mailer.sent[0]?.text.match(/\n {4}(\d{6})\n/)?.[1];
+  if (!code) throw new Error("test setup: verify code not captured");
+  return { userId: r.user_id, rawCode: code, verifyEmail: email };
 }
 
 describe("auth.verify.verifyEmail (integ)", () => {
-  test("happy path: marks user email_verified=true and consumes token", async (t) => {
+  test("happy path: marks user email_verified=true and consumes code", async (t) => {
     if (skipIfNoPg(t)) return;
-    const { userId, rawToken } = await registerAndCaptureVerifyToken(
+    const { userId, rawCode, verifyEmail: email } = await registerAndCaptureVerifyToken(
       "alice@example.com",
       "good password 1",
     );
@@ -150,7 +156,7 @@ describe("auth.verify.verifyEmail (integ)", () => {
     );
     assert.equal(before.rows[0].ev, false);
 
-    const r = await verifyEmail(rawToken);
+    const r = await verifyEmail(email, rawCode);
     assert.equal(r.user_id, userId);
     assert.equal(r.newly_verified, true);
 
@@ -164,25 +170,25 @@ describe("auth.verify.verifyEmail (integ)", () => {
       "SELECT used_at::text AS used_at FROM email_verifications WHERE user_id = $1",
       [userId],
     );
-    assert.notEqual(ev.rows[0].used_at, null, "token must be marked used");
+    assert.notEqual(ev.rows[0].used_at, null, "code must be marked used");
   });
 
-  test("token reuse: second call → INVALID_TOKEN", async (t) => {
+  test("code reuse: second call → INVALID_TOKEN", async (t) => {
     if (skipIfNoPg(t)) return;
-    const { rawToken } = await registerAndCaptureVerifyToken(
+    const { rawCode, verifyEmail: email } = await registerAndCaptureVerifyToken(
       "bob@example.com",
       "good password 2",
     );
-    await verifyEmail(rawToken);
+    await verifyEmail(email, rawCode);
     await assert.rejects(
-      verifyEmail(rawToken),
+      verifyEmail(email, rawCode),
       (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
     );
   });
 
-  test("expired token → INVALID_TOKEN", async (t) => {
+  test("expired code → INVALID_TOKEN", async (t) => {
     if (skipIfNoPg(t)) return;
-    const { userId, rawToken } = await registerAndCaptureVerifyToken(
+    const { userId, rawCode, verifyEmail: email } = await registerAndCaptureVerifyToken(
       "carol@example.com",
       "good password 3",
     );
@@ -192,7 +198,7 @@ describe("auth.verify.verifyEmail (integ)", () => {
       [userId],
     );
     await assert.rejects(
-      verifyEmail(rawToken),
+      verifyEmail(email, rawCode),
       (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
     );
     const u = await query<{ ev: boolean }>(
@@ -202,20 +208,134 @@ describe("auth.verify.verifyEmail (integ)", () => {
     assert.equal(u.rows[0].ev, false, "user must remain unverified");
   });
 
-  test("garbage token → INVALID_TOKEN (not VALIDATION)", async (t) => {
+  test("wrong code for a real email → INVALID_TOKEN", async (t) => {
     if (skipIfNoPg(t)) return;
+    const { verifyEmail: email } = await registerAndCaptureVerifyToken(
+      "dana@example.com",
+      "good password 4",
+    );
     await assert.rejects(
-      verifyEmail("totally-not-a-real-token"),
+      verifyEmail(email, "000000"),
       (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
     );
   });
 
-  test("empty token → VALIDATION", async (t) => {
+  test("malformed code (not 6 digits) → VALIDATION", async (t) => {
     if (skipIfNoPg(t)) return;
     await assert.rejects(
-      verifyEmail(""),
+      verifyEmail("alice@example.com", "12345"),
       (err: unknown) => err instanceof VerifyError && err.code === "VALIDATION",
     );
+    await assert.rejects(
+      verifyEmail("alice@example.com", "abcdef"),
+      (err: unknown) => err instanceof VerifyError && err.code === "VALIDATION",
+    );
+  });
+
+  test("empty code → VALIDATION", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await assert.rejects(
+      verifyEmail("alice@example.com", ""),
+      (err: unknown) => err instanceof VerifyError && err.code === "VALIDATION",
+    );
+  });
+
+  test("another user's code cannot verify my email (email scoping)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const u1 = await registerAndCaptureVerifyToken("u1@example.com", "pwd u1 long");
+    await registerAndCaptureVerifyToken("u2@example.com", "pwd u2 long");
+    // 用 u1 的码搭配 u2 的 email —— 哪怕 u1 的码在 DB 里有效,也不该通过
+    await assert.rejects(
+      verifyEmail("u2@example.com", u1.rawCode),
+      (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
+    );
+  });
+});
+
+describe("auth.verify.resendVerification (integ)", () => {
+  test("resend invalidates previous code, new code works", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const u = await registerAndCaptureVerifyToken("resend@example.com", "pwd resend long");
+    const oldCode = u.rawCode;
+
+    const mailer = new CapturingMailer();
+    const r = await resendVerification("resend@example.com", { mailer });
+    assert.equal(r.accepted, true);
+    assert.equal(mailer.sent.length, 1, "resend 必须发一封新邮件");
+    const newCodeMatch = mailer.sent[0].text.match(/\n {4}(\d{6})\n/);
+    assert.ok(newCodeMatch, "新邮件必须含 6 位码");
+    const newCode = newCodeMatch![1];
+    assert.notEqual(oldCode, newCode, "重发应产生新码");
+
+    // 旧码已作废 → verify 应拒
+    await assert.rejects(
+      verifyEmail("resend@example.com", oldCode),
+      (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
+      "旧码必须已失效",
+    );
+
+    // 新码可用
+    const ok = await verifyEmail("resend@example.com", newCode);
+    assert.equal(ok.user_id, u.userId);
+    assert.equal(ok.newly_verified, true);
+  });
+
+  test("resend for already-verified user: accepted=true, NO mail, NO new row", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const u = await registerAndCaptureVerifyToken("alreadyok@example.com", "pwd verified");
+    // 先完成验证
+    await verifyEmail("alreadyok@example.com", u.rawCode);
+
+    const countBefore = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM email_verifications WHERE user_id = $1 AND purpose = 'verify_email'",
+      [u.userId],
+    );
+
+    const mailer = new CapturingMailer();
+    const r = await resendVerification("alreadyok@example.com", { mailer });
+    assert.equal(r.accepted, true, "对已验证用户也必须 accepted=true(防枚举)");
+    assert.equal(mailer.sent.length, 0, "已验证用户不应再收邮件");
+
+    const countAfter = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM email_verifications WHERE user_id = $1 AND purpose = 'verify_email'",
+      [u.userId],
+    );
+    assert.equal(countAfter.rows[0].cnt, countBefore.rows[0].cnt, "不应为已验证用户插入新 code 行");
+  });
+
+  test("resend for non-existing email: accepted=true, NO mail (anti-enumeration)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    const r = await resendVerification("ghost-resend@example.com", { mailer });
+    assert.equal(r.accepted, true);
+    assert.equal(mailer.sent.length, 0);
+  });
+
+  test("concurrent resend: only one code remains active, serialized by user row lock", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await registerAndCaptureVerifyToken("concurrent@example.com", "pwd concurrent long");
+
+    const mailer = new CapturingMailer();
+    // 并发两次 resend,预期:用户 row 上的 FOR UPDATE 串行化两次写
+    const [r1, r2] = await Promise.all([
+      resendVerification("concurrent@example.com", { mailer }),
+      resendVerification("concurrent@example.com", { mailer }),
+    ]);
+    assert.equal(r1.accepted, true);
+    assert.equal(r2.accepted, true);
+
+    // 最多 3 封邮件(register 的 + 两次 resend),但 active code 行应只有 1 张
+    const activeCodes = await query<{ cnt: string }>(
+      `SELECT COUNT(*)::text AS cnt
+         FROM email_verifications ev
+         JOIN users u ON u.id = ev.user_id
+        WHERE u.email = $1
+          AND ev.purpose = 'verify_email'
+          AND ev.used_at IS NULL
+          AND ev.expires_at > NOW()`,
+      ["concurrent@example.com"],
+    );
+    assert.equal(activeCodes.rows[0].cnt, "1", "任意时刻只应有 1 张 active verify_email code");
   });
 });
 
@@ -614,14 +734,18 @@ describe("auth.verify.confirmPasswordReset (integ)", () => {
     );
   });
 
-  test("wrong purpose: verify_email token cannot be used for confirmPasswordReset", async (t) => {
+  test("wrong purpose: verify_email code cannot be used for confirmPasswordReset", async (t) => {
     if (skipIfNoPg(t)) return;
-    const { rawToken } = await registerAndCaptureVerifyToken(
+    const { rawCode } = await registerAndCaptureVerifyToken(
       "ivan@example.com",
       "pwd ivan",
     );
+    // 6 位数字 code 被 confirmPasswordReset 当成 base64url token 解码 →
+    // sha256(base64url_decode(code)) 不会匹配任何 row(verify_email 行的 hash
+    // 是 sha256("123456"),不是 sha256(base64url_decode("123456")))→
+    // INVALID_TOKEN。兼顾 purpose scope 与 hash 方式双重隔离。
     await assert.rejects(
-      confirmPasswordReset(rawToken, "new password ivan"),
+      confirmPasswordReset(rawCode, "new password ivan"),
       (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
     );
   });

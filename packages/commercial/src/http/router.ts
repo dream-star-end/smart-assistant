@@ -345,7 +345,7 @@ export function createCommercialHandler(
     { method: "POST", path: "/api/auth/login", handler: handleLogin },
     { method: "POST", path: "/api/auth/refresh", handler: handleRefresh },
     { method: "POST", path: "/api/auth/logout", handler: handleLogout },
-    { method: "POST", path: "/api/auth/verify-email", handler: (req, res) => handleVerifyEmail(req, res) },
+    { method: "POST", path: "/api/auth/verify-email", handler: handleVerifyEmail },
     { method: "POST", path: "/api/auth/resend-verification", handler: handleResendVerification },
     { method: "GET",  path: "/api/auth/check-verification",  handler: handleCheckVerification },
     { method: "POST", path: "/api/auth/request-password-reset", handler: handleRequestPasswordReset },

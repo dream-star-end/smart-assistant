@@ -496,6 +496,28 @@ a:hover {
   line-height: 1.4;
 }
 .login-success-back { margin-top: var(--space-2); font-size: 13px; }
+
+/* 2026-04-23 邮箱验证码模式:header 区(图标/标题/副标题 = 原 success-pane 样式)
+   + 垃圾邮箱提示卡(突出色背景,避免用户看漏) */
+.login-verify-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+  margin-bottom: var(--space-3);
+}
+.login-spam-notice {
+  background: color-mix(in oklab, var(--accent, #d97757) 10%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent, #d97757) 28%, transparent);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: var(--text-xs);
+  line-height: 1.55;
+  color: var(--fg);
+  margin-bottom: var(--space-3);
+}
+.login-spam-notice strong { color: var(--fg-strong); }
 .login-hint {
   color: var(--fg-muted);
   font-size: var(--text-sm);

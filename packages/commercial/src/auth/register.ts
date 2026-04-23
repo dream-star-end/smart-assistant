@@ -23,7 +23,7 @@
  */
 
 import { z } from "zod";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, randomInt } from "node:crypto";
 import { tx } from "../db/queries.js";
 import { hashPassword } from "./passwords.js";
 import { verifyTurnstile, TurnstileError } from "./turnstile.js";
@@ -64,8 +64,21 @@ export class RegisterError extends Error {
   }
 }
 
-/** 验证 token 默认 24h 有效(密码重置稍短由 T-13 决定)。 */
-export const VERIFY_EMAIL_TTL_SECONDS = 24 * 60 * 60;
+/**
+ * 邮箱验证码 TTL:30 分钟。
+ *
+ * 2026-04-23 改造:由 24h 链接改为 6 位验证码后,TTL 砍短:
+ *   - 6 位数字 = 10^6 枚举空间,TTL 越长暴力破解窗口越大
+ *   - 30 min 够用户切 tab 去查邮件(含垃圾箱);不够就点"重发验证码"
+ *
+ * 注:2026-04-23 pivot 后 `/auth/verify-email` 只接受 {email, code},
+ * 任何 v3 启动初期发出的 24h 老 link token 已无 handler 路径可消费,
+ * 老用户必须点"重发验证码"拿到 6 位码才能完成验证(DB 里老行的 sha256
+ * (32B) hash 与 sha256(6 位码) hash 不可能相等,自然失效)。
+ *
+ * 密码重置仍走链接,TTL 1h,见 verify.ts RESET_PASSWORD_TTL_SECONDS。
+ */
+export const VERIFY_EMAIL_TTL_SECONDS = 30 * 60;
 
 export interface RegisterDeps {
   mailer: Mailer;
@@ -88,12 +101,35 @@ export interface RegisterResult {
   verify_email_sent: boolean;
 }
 
-/** 生成验证 token raw(返回 base64url) + 入库哈希(hex sha256) */
+/** 生成验证 token raw(返回 base64url) + 入库哈希(hex sha256)。密码重置仍走此函数。 */
 export function newVerifyToken(): { raw: string; hash: string } {
   const buf = randomBytes(32);
   return {
     raw: buf.toString("base64url"),
     hash: createHash("sha256").update(buf).digest("hex"),
+  };
+}
+
+/**
+ * 生成 6 位纯数字邮箱验证码 + sha256(code) 入库哈希。
+ *
+ * 设计:
+ *   - 纯数字:用户 IM/手机复制粘贴友好,不区分大小写/0O/Il 歧义
+ *   - 6 位:足够对抗短窗口暴力(30min TTL + handler 层 10/min/IP 限流
+ *     + resend 会作废历史码,任意时刻只有最新一张 active code)
+ *   - `randomInt(0, 1_000_000)` 取值域均匀;左 padStart '0' 到 6 位
+ *   - 哈希只是 `sha256(code)` 不加盐 —— 查询时用 `email + hash(code)` 两段一起
+ *     scope,即使两个用户撞同一验证码也不会串(见 verify.ts verifyEmail)
+ *
+ * 不复用 newVerifyToken() —— 后者生成的是 base64url 的 32 字节串,用户无法口述/
+ * 手输,只能靠点击链接;现在邮箱验证走 "code 输入框",必须纯数字。
+ */
+export function newVerifyCode(): { raw: string; hash: string } {
+  const n = randomInt(0, 1_000_000);
+  const raw = String(n).padStart(6, "0");
+  return {
+    raw,
+    hash: createHash("sha256").update(raw).digest("hex"),
   };
 }
 
@@ -133,9 +169,11 @@ export async function register(
     throw new RegisterError("TURNSTILE_FAILED", "turnstile verification rejected");
   }
 
-  // 3) DB 事务:user + verification token 一起落
+  // 3) DB 事务:user + 6 位验证码一起落。verify_email purpose 从 2026-04-23 起
+  // 从 base64url token 改为 6 位数字 code(用户 IM/手机复制粘贴友好),
+  // token_hash 列同存 sha256(code) hex,schema 无需改动。
   const passwordHash = await hashPassword(input.password);
-  const verify = newVerifyToken();
+  const verify = newVerifyCode();
   const nowSec = deps.now ? deps.now() : Math.floor(Date.now() / 1000);
   const expiresAtIso = new Date((nowSec + VERIFY_EMAIL_TTL_SECONDS) * 1000).toISOString();
 
@@ -164,14 +202,28 @@ export async function register(
     throw err;
   }
 
-  // 4) 发邮件(失败不回滚 user 创建 —— 用户可走 /resend-verification)
-  const verifyUrl = `${(deps.verifyEmailUrlBase ?? "").replace(/\/$/, "")}/verify-email?token=${verify.raw}`;
+  // 4) 发验证码邮件(失败不回滚 user 创建 —— 用户可走 /resend-verification)
+  //
+  // 2026-04-23 改造:从"点击链接"改为"6 位验证码"。邮件正文必须:
+  //   1) 显眼位置写验证码(用户手机切屏时一眼能抄)
+  //   2) **主动提示垃圾邮件箱** —— 商用版落地 SPF/DKIM 还不完美,Gmail/
+  //      163/QQ 把注册确认邮件扔垃圾箱概率较高;主动提示能省掉大量
+  //      "没收到邮件"工单。boss 2026-04-23 明确要求加此提示。
+  //   3) 告知 30min 过期 + 如何重发
   let sent = true;
   try {
     await deps.mailer.send({
       to: input.email,
-      subject: "[OpenClaude] 验证你的邮箱",
-      text: `Hi,\n\n请点击以下链接完成邮箱验证(24 小时内有效):\n\n${verifyUrl}\n\n如果这不是你本人操作,忽略此邮件即可。`,
+      subject: "[OpenClaude] 邮箱验证码",
+      text:
+        `你好,\n\n` +
+        `你的 OpenClaude 邮箱验证码是:\n\n` +
+        `    ${verify.raw}\n\n` +
+        `请回到注册页面输入此验证码完成验证。\n` +
+        `验证码 30 分钟内有效,一次性使用。\n\n` +
+        `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
+        `   并把 OpenClaude 寄件地址加入联系人 / 白名单以后续避免误判。\n\n` +
+        `如果这不是你本人操作,忽略此邮件即可,账号不会被激活。`,
     });
   } catch {
     sent = false;

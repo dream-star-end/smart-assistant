@@ -182,15 +182,21 @@ describe("auth.register (integ)", () => {
 
     assert.equal(mailer.sent.length, 1);
     assert.equal(mailer.sent[0].to, "alice@example.com");
-    assert.match(mailer.sent[0].text, /https:\/\/claudeai\.chat\/verify-email\?token=/);
-    // 邮件正文中的 raw token 不能等于 DB 里的 token_hash(数据库存的是 sha256 hex)
-    const url = mailer.sent[0].text.match(/token=([^\s]+)/)?.[1] ?? "";
-    assert.ok(url.length > 0);
+    // 2026-04-23:注册邮件从 link 改为 6 位数字 code。正文必须:
+    //   (a) 含 6 位数字验证码(四空格缩进行)
+    //   (b) 主动提示检查垃圾邮件箱(boss 明确要求)
+    //   (c) 不再出现 http/https 链接(别再留旧模板残骸混淆用户)
+    assert.match(mailer.sent[0].text, /\n {4}(\d{6})\n/, "邮件必须含 6 位验证码");
+    assert.match(mailer.sent[0].text, /垃圾邮件|Spam/, "邮件必须提示检查垃圾邮箱");
+    assert.doesNotMatch(mailer.sent[0].text, /https?:\/\//, "不应再有 URL 链接");
+    // 邮件正文中的 raw code 不能等于 DB 里的 token_hash(存的是 sha256 hex)
+    const code = mailer.sent[0].text.match(/\n {4}(\d{6})\n/)?.[1] ?? "";
+    assert.ok(code.length === 6);
     const hashRow = await query<{ token_hash: string }>(
       "SELECT token_hash FROM email_verifications WHERE user_id = $1",
       [result.user_id],
     );
-    assert.notEqual(url, hashRow.rows[0].token_hash, "raw token must not equal stored hash");
+    assert.notEqual(code, hashRow.rows[0].token_hash, "raw code must not equal stored hash");
   });
 
   test("email is normalized: trim + toLowerCase before insert", async (t) => {

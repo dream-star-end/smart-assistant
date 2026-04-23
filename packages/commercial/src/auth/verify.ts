@@ -24,7 +24,7 @@ import { z } from "zod";
 import { createHash } from "node:crypto";
 import { tx, query } from "../db/queries.js";
 import { hashPassword } from "./passwords.js";
-import { newVerifyToken, VERIFY_EMAIL_TTL_SECONDS } from "./register.js";
+import { newVerifyToken, newVerifyCode, VERIFY_EMAIL_TTL_SECONDS } from "./register.js";
 import { verifyTurnstile, TurnstileError } from "./turnstile.js";
 import type { Mailer } from "./mail.js";
 
@@ -40,6 +40,11 @@ const emailSchema = z
   .max(254)
   .regex(/^[a-z0-9._+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i, "invalid email format");
 const turnstileTokenSchema = z.string().min(1).max(2048);
+// 邮箱验证码:严格 6 位数字;容忍前后空白(复制粘贴常带)
+const verifyCodeSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{6}$/, "invalid code format");
 
 export type VerifyErrorCode =
   | "VALIDATION"
@@ -95,50 +100,89 @@ export interface VerifyEmailResult {
 }
 
 /**
- * 用 raw token 完成邮箱验证。
+ * 用 email + 6 位验证码完成邮箱验证。
+ *
+ * 2026-04-23 改造:从"链接 + base64url token"换成"6 位数字 code"。
+ *   - code 空间只有 10^6,因此必须:
+ *     (a) 同时校验 email 绑定,避免跨用户撞码通过
+ *     (b) 30 min TTL(见 register.ts VERIFY_EMAIL_TTL_SECONDS)
+ *     (c) handler 层套 IP 速率限制(10/min)防暴破
+ *   - token_hash 列仍复用 —— 存 sha256(code) hex,与旧的 sha256(32B) 同为 64
+ *     hex chars,无需 schema 迁移。
  *
  * 流程(单事务):
- *   1) 校验 token 长度
- *   2) hash → 查 email_verifications WHERE purpose='verify_email' AND used_at IS NULL AND expires_at > now()
- *   3) UPDATE used_at = NOW()
- *   4) UPDATE users SET email_verified = TRUE
+ *   1) 校验 email 格式 + code 6 位数字
+ *   2) hash(code) → 查 email_verifications JOIN users
+ *      WHERE u.email=$1 AND ev.token_hash=$2 AND purpose='verify_email'
+ *        AND used_at IS NULL AND expires_at > now()
+ *   3) UPDATE used_at
+ *   4) UPDATE users.email_verified = TRUE(幂等)
  *
- * 不返回 "用户不存在" 与 "token 已用" 的差别 → 一律 INVALID_TOKEN。
+ * 不区分 "邮箱不存在" vs "码错/过期" → 一律 INVALID_TOKEN(防枚举)。
  */
 export async function verifyEmail(
-  rawToken: string,
+  rawEmail: string,
+  rawCode: string,
   deps: CommonDeps = {},
 ): Promise<VerifyEmailResult> {
-  const parsed = tokenSchema.safeParse(rawToken);
-  if (!parsed.success) {
-    throw new VerifyError("VALIDATION", "invalid token format");
+  const emailParsed = emailSchema.safeParse(rawEmail);
+  const codeParsed = verifyCodeSchema.safeParse(rawCode);
+  if (!emailParsed.success || !codeParsed.success) {
+    // 两种失败都归 VALIDATION —— 前端提示"验证码格式错误",
+    // 不区分是 email 还是 code 出问题(防枚举 + 简化 UI)。
+    throw new VerifyError("VALIDATION", "invalid email or code format");
   }
-  const tokenHash = hashRawToken(parsed.data);
+  const email = emailParsed.data;
+  const code = codeParsed.data;
+  // 直接 sha256(code 字符串),不走 base64url 解码 —— 与 register.ts/newVerifyCode 一致
+  const codeHash = createHash("sha256").update(code).digest("hex");
   const ts = nowSec(deps);
   const nowIso = new Date(ts * 1000).toISOString();
 
   return await tx<VerifyEmailResult>(async (client) => {
-    const found = await client.query<{
-      id: string;
-      user_id: string;
-      already_verified: boolean;
-    }>(
-      `SELECT ev.id::text AS id,
-              ev.user_id::text AS user_id,
-              u.email_verified AS already_verified
-         FROM email_verifications ev
-         JOIN users u ON u.id = ev.user_id
-        WHERE ev.token_hash = $1
-          AND ev.purpose = 'verify_email'
-          AND ev.used_at IS NULL
-          AND ev.expires_at > $2::timestamptz
+    // 锁序必须统一为 users → email_verifications,否则与 resendVerification
+    // (users FOR UPDATE → UPDATE email_verifications) 交错会 PG deadlock
+    // detection 随机 kill 一侧。所以这里拆成两步:
+    //   ① 先按 email 锁 users 行
+    //   ② 再按 user_id + token_hash 锁 email_verifications 行
+    // 两步都可能是"未找到",统一抛 INVALID_TOKEN(防枚举,handler 里同条消息)。
+    const userRow = await client.query<{ id: string; already_verified: boolean }>(
+      `SELECT id::text AS id, email_verified AS already_verified
+         FROM users
+        WHERE email = $1 AND status != 'deleted'
         FOR UPDATE`,
-      [tokenHash, nowIso],
+      [email],
     );
-    if (found.rows.length === 0) {
-      throw new VerifyError("INVALID_TOKEN", "verification token invalid or expired");
+    if (userRow.rows.length === 0) {
+      // timing 对齐:不存在的 email 也执行一次 ev lookup,避免通过 DB
+      // round-trip 数/服务端耗时区分"email 存在 + code 错"与"email 不存在"。
+      // 注册端本身会暴露 EMAIL_EXISTS,这个 timing 屏蔽更多是纵深防御。
+      await client.query(
+        `SELECT 1 FROM email_verifications
+          WHERE token_hash = $1 AND purpose = 'verify_email'
+            AND used_at IS NULL AND expires_at > $2::timestamptz
+          LIMIT 1`,
+        [codeHash, nowIso],
+      );
+      throw new VerifyError("INVALID_TOKEN", "verification code invalid or expired");
     }
-    const { id: evId, user_id: userId, already_verified } = found.rows[0];
+    const { id: userId, already_verified } = userRow.rows[0];
+
+    const evRow = await client.query<{ id: string }>(
+      `SELECT id::text AS id
+         FROM email_verifications
+        WHERE user_id = $1
+          AND token_hash = $2
+          AND purpose = 'verify_email'
+          AND used_at IS NULL
+          AND expires_at > $3::timestamptz
+        FOR UPDATE`,
+      [userId, codeHash, nowIso],
+    );
+    if (evRow.rows.length === 0) {
+      throw new VerifyError("INVALID_TOKEN", "verification code invalid or expired");
+    }
+    const evId = evRow.rows[0].id;
 
     await client.query(
       "UPDATE email_verifications SET used_at = $1::timestamptz WHERE id = $2",
@@ -295,15 +339,21 @@ export interface ResendVerifyResult {
 }
 
 /**
- * 重发邮箱验证邮件。
+ * 重发邮箱验证码。
  *
  * 防枚举(05-SEC §15):
  *   - email 格式错 → accepted=true
  *   - 用户不存在 / 已 deleted → accepted=true(不发邮件)
  *   - 用户已验证 → accepted=true(不发邮件,避免被滥用骚扰已验证用户)
- *   - 仅当用户存在且未验证时才真的写新 token + 发邮件
+ *   - 仅当用户存在且未验证时才真的写新 code + 发邮件
  *
- * 不消费旧 token —— 旧 token 若仍有效用户也能用(简化重发幂等性)。
+ * 2026-04-23:旧 token/code 必须作废,只有最新一次发出的 code 有效(与
+ * requestPasswordReset 相同模式)。理由:
+ *   - code 只有 6 位数字,如果并发或重发后留着 N 张有效 code,攻击者暴破
+ *     窗口 ≈ N/10^6 成倍放大。
+ *   - 事务里 SELECT user FOR UPDATE + UPDATE 旧 + INSERT 新,串行化保证
+ *     任意时刻只有一张 active code。
+ *
  * 速率限制由调用方(handler)套 IP/email 维度。
  */
 export async function resendVerification(
@@ -314,32 +364,57 @@ export async function resendVerification(
   if (!parsed.success) return { accepted: true };
   const email = parsed.data;
 
-  const userRow = await query<{ id: string; email_verified: boolean }>(
-    "SELECT id::text AS id, email_verified FROM users WHERE email = $1 AND status != 'deleted'",
-    [email],
-  );
-  if (userRow.rows.length === 0 || userRow.rows[0].email_verified) {
-    return { accepted: true };
-  }
-  const userId = userRow.rows[0].id;
-
-  const verify = newVerifyToken();
+  const verify = newVerifyCode();
   const ts = nowSec(deps);
   const expiresIso = new Date((ts + VERIFY_EMAIL_TTL_SECONDS) * 1000).toISOString();
 
-  await query(
-    `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
-     VALUES ($1, $2, 'verify_email', $3)`,
-    [userId, verify.hash, expiresIso],
-  );
+  // 身份判断必须与写入处于同一事务并持 FOR UPDATE 行锁,否则存在
+  // verify-vs-resend 竞态:事务外 SELECT 得知 email_verified=false,
+  // 用户在这窗口内点验证链接/输码完成验证,事务内仍插入新 code + 发邮件,
+  // 给已验证用户多发一封垃圾邮件并留一张 active 码。
+  // (并发 resend 本身靠 users 行锁串行化。)
+  const emailSent = await tx(async (client) => {
+    const r = await client.query<{ id: string; email_verified: boolean }>(
+      `SELECT id::text AS id, email_verified
+         FROM users
+        WHERE email = $1 AND status != 'deleted'
+        FOR UPDATE`,
+      [email],
+    );
+    if (r.rows.length === 0 || r.rows[0].email_verified) return false;
+    const userId = r.rows[0].id;
 
-  const url = `${(deps.verifyEmailUrlBase ?? "").replace(/\/$/, "")}/verify-email?token=${verify.raw}`;
+    await client.query(
+      `UPDATE email_verifications
+          SET used_at = NOW()
+        WHERE user_id = $1
+          AND purpose = 'verify_email'
+          AND used_at IS NULL
+          AND expires_at > NOW()`,
+      [userId],
+    );
+    await client.query(
+      `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
+       VALUES ($1, $2, 'verify_email', $3)`,
+      [userId, verify.hash, expiresIso],
+    );
+    return true;
+  });
+
+  if (!emailSent) return { accepted: true };
+
   try {
     await deps.mailer.send({
       to: email,
-      subject: "[OpenClaude] 验证你的邮箱(重发)",
+      subject: "[OpenClaude] 邮箱验证码(重发)",
       text:
-        `Hi,\n\n请点击以下链接完成邮箱验证(24 小时内有效):\n\n${url}\n\n` +
+        `你好,\n\n` +
+        `你新的 OpenClaude 邮箱验证码是:\n\n` +
+        `    ${verify.raw}\n\n` +
+        `请回到注册页面输入此验证码完成验证。\n` +
+        `验证码 30 分钟内有效,一次性使用。此前发出的旧验证码已作废。\n\n` +
+        `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
+        `   并把 OpenClaude 寄件地址加入联系人 / 白名单以后续避免误判。\n\n` +
         `如果这不是你本人操作,忽略此邮件即可。`,
     });
   } catch {

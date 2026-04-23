@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=9b4cf12" />
+<link rel="stylesheet" href="/style.css?v=a187083" />
 <!-- main.js version bumped 2026-04-21: 积分化 + /login routing -->
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -346,17 +346,14 @@
         <div id="turnstile-register" class="login-turnstile"></div>
         <button id="auth-register-btn" type="button" class="btn btn-primary btn-lg btn-full login-submit">创建账号 →</button>
       </div>
-      <div id="auth-register-success" hidden class="login-success-pane">
-        <div class="login-success-icon">✓</div>
-        <p class="login-success-title">注册成功!</p>
-        <p class="login-success-desc">
-          我们已向 <span id="auth-register-success-email" class="login-success-email"></span> 发送验证邮件,请查收并点击链接完成验证。
-        </p>
-        <div id="auth-register-waiting" class="login-waiting">
-          <span class="auth-spinner" aria-hidden="true"></span>
-          <span>正在等待邮箱验证 — 在任意设备点击邮件链接后,本页会自动跳转登录</span>
-        </div>
-        <button id="auth-register-back-btn" type="button" class="btn btn-ghost btn-sm login-success-back">返回登录</button>
+      <!-- 2026-04-23:注册成功后走 setMode('verify') 直接去 auth-mode-verify
+           的 code 输入面板。保留这个空壳 sub-pane 仅为兼容:老 JS setMode 会
+           hide 这个 id,无 DOM 依赖;实际 code 输入 UI 在 auth-mode-verify。
+           之所以不直接删,是避免 JS 里任何意外的 getElementById 返回 null 崩溃
+           —— 删除要和 auth.js 改动一起批出才稳妥。 -->
+      <div id="auth-register-success" hidden>
+        <span id="auth-register-success-email" hidden></span>
+        <button id="auth-register-back-btn" type="button" hidden>返回登录</button>
       </div>
       <div class="login-toggle muted">已有账号? <a id="auth-tab-login-from-register" role="button" tabindex="0">直接登录</a></div>
     </div>
@@ -404,12 +401,33 @@
       </div>
     </div>
 
-    <!-- ── Mode: verify email (URL-driven) ── -->
-    <div id="auth-mode-verify" hidden class="login-success-pane">
-      <div class="login-success-icon">📧</div>
-      <p class="login-success-title">邮箱验证</p>
-      <p id="auth-verify-status" class="login-success-desc">正在验证…</p>
-      <button id="auth-verify-back-btn" type="button" class="btn btn-ghost btn-sm login-success-back" hidden>返回登录</button>
+    <!-- ── Mode: verify email (code entry, 2026-04-23) ──
+         用户从 register 成功 / login EMAIL_NOT_VERIFIED / "重发验证邮件"
+         按钮来到这里。输入 6 位数字 code 完成验证。
+         #auth-verify-status 保留原 id,只是从"正在验证"变成"成功/错误"提示行。 -->
+    <div id="auth-mode-verify" hidden>
+      <div class="login-verify-head">
+        <div class="login-success-icon">📧</div>
+        <p class="login-success-title">查收验证码</p>
+        <p class="login-success-desc">
+          我们已向 <span id="auth-verify-email" class="login-success-email"></span> 发送 6 位数字验证码。
+        </p>
+      </div>
+      <div class="login-spam-notice">
+        📬 没看到邮件?请先检查<strong>「垃圾邮件 / Spam」</strong>文件夹,并把 OpenClaude 加入联系人白名单。
+      </div>
+      <div class="login-field">
+        <label for="auth-verify-code">验证码</label>
+        <input id="auth-verify-code" type="text" inputmode="numeric" autocomplete="one-time-code"
+               pattern="[0-9]{6}" maxlength="6" placeholder="6 位数字" />
+      </div>
+      <button id="auth-verify-submit-btn" type="button" class="btn btn-primary btn-lg btn-full login-submit">验证邮箱 →</button>
+      <p id="auth-verify-status" class="login-success-desc" hidden></p>
+      <div class="login-row-between muted login-resend-row">
+        <a id="auth-verify-resend-btn" role="button" tabindex="0">重发验证码</a>
+        <span id="auth-verify-resend-status" hidden class="login-resend-status"></span>
+      </div>
+      <div class="login-toggle muted"><a id="auth-verify-back-btn" role="button" tabindex="0">← 返回登录</a></div>
     </div>
 
     <div class="login-foot">
@@ -1170,6 +1188,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=9b4cf12"></script>
+<script type="module" src="/modules/main.js?v=a187083"></script>
 </body>
 </html>

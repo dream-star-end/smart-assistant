@@ -7,15 +7,15 @@
 //   POST /api/auth/login              { email, password, turnstile_token }
 //   POST /api/auth/refresh            ()  ← cookie oc_rt 自动携带,迁移期兼容 body { refresh_token }
 //   POST /api/auth/logout             ()  ← 同上
-//   POST /api/auth/verify-email       { token }
+//   POST /api/auth/verify-email       { email, code }      (2026-04-23 改 code-based)
 //   POST /api/auth/resend-verification{ email }
 //   POST /api/auth/request-password-reset { email, turnstile_token }
 //   POST /api/auth/confirm-password-reset { token, new_password }
 //   GET  /api/public/config           → { turnstile_site_key, turnstile_bypass, require_email_verified }
 //
 // URL 参数(邮件链接落地):
-//   ?verify_email=<token>      → 自动切到 verify 模式并提交
 //   ?reset_password=<token>    → 切到 confirm-reset 模式
+//   (verify_email 不再走 URL,改为用户输入 6 位数字 code)
 //
 // Token 存储(2026-04-21 HIGH#4 后):
 //   - access JWT + access_exp → localStorage(openclaude_access_token / openclaude_access_exp)
@@ -247,23 +247,53 @@ async function _mountWidget(container) {
 const MODES = ['login', 'register', 'forgot', 'reset', 'verify']
 let _currentMode = 'login'
 let _resetToken = ''
-let _verifyToken = ''
-const _getTokenFns = {} // mode → fn returning turnstile response
+// 2026-04-23:verify 模式从 URL token 改为用户输入 6 位 code,绑定到 email。
+// register 成功 / login EMAIL_NOT_VERIFIED / "重发" 都会把 email 暂存到这里,
+// 供 verify 模式面板回填 + _doVerifyCode 提交时使用。
+let _verifyEmail = ''
 
-// Cross-device verification poll state (started after register success).
-// Cleared on mode switch / page hide / verified=true.
-let _verifyPollTimer = null
-let _verifyPollEmail = ''
-let _verifyPollStartedAt = 0
-const VERIFY_POLL_INTERVAL_MS = 4000
-const VERIFY_POLL_MAX_MS = 10 * 60 * 1000 // 10 min
+// resend cooldown:30s。避免用户连点 resend —— 服务端每次 resend 都会作废
+// 上一张 code,若刚收到邮件就再点一下,旧码作废、新邮件还在路上,窗口期无码
+// 可用;加之 handler 层 IP 10/min 限流,多连点几次还会被 429。
+const _RESEND_COOLDOWN_MS = 30_000
+const _resendNextAt = new Map() // btnId → epoch ms
+let _resendTimer = null
+function _resendLockUntil(btnId, untilMs) {
+  _resendNextAt.set(btnId, untilMs)
+  _tickResendCooldowns()
+}
+function _tickResendCooldowns() {
+  const now = Date.now()
+  let anyActive = false
+  for (const [btnId, until] of _resendNextAt) {
+    const btn = $(btnId)
+    if (!btn) continue
+    const remain = Math.max(0, Math.ceil((until - now) / 1000))
+    if (remain > 0) {
+      anyActive = true
+      btn.disabled = true
+      btn.setAttribute('data-cooldown-label', btn.getAttribute('data-cooldown-label') || btn.textContent || '重发验证码')
+      btn.textContent = `${remain}s 后可重发`
+    } else {
+      const orig = btn.getAttribute('data-cooldown-label')
+      if (orig) { btn.textContent = orig; btn.removeAttribute('data-cooldown-label') }
+      btn.disabled = false
+      _resendNextAt.delete(btnId)
+    }
+  }
+  if (anyActive && !_resendTimer) {
+    _resendTimer = setInterval(() => {
+      _tickResendCooldowns()
+      if (_resendNextAt.size === 0 && _resendTimer) { clearInterval(_resendTimer); _resendTimer = null }
+    }, 1000)
+  }
+}
+const _getTokenFns = {} // mode → fn returning turnstile response
 
 export function getCurrentMode() { return _currentMode }
 
 export function setMode(mode) {
   if (!MODES.includes(mode)) mode = 'login'
-  // Switching away from register kills any verify-pending poll
-  if (mode !== 'register') _stopVerifyPoll()
   _currentMode = mode
   _clearError()
   for (const m of MODES) {
@@ -276,7 +306,7 @@ export function setMode(mode) {
     register: { t: '创建账号', s: '1 分钟开始使用满血 Opus' },
     forgot: { t: '找回密码', s: '我们会发送重置链接到你的邮箱' },
     reset: { t: '重置密码', s: '请设置一个新的登录密码' },
-    verify: { t: '邮箱验证', s: '正在完成邮箱验证…' },
+    verify: { t: '邮箱验证', s: '输入邮件里的 6 位验证码' },
   }
   const head = HEADS[mode] || HEADS.login
   const tEl = $('auth-card-title'); if (tEl) tEl.textContent = head.t
@@ -295,9 +325,15 @@ export function setMode(mode) {
         .catch(() => { _getTokenFns[mode] = () => '' })
     }
   }
-  // Auto-trigger verify-email when entering verify mode
-  if (mode === 'verify' && _verifyToken) {
-    void _doVerifyEmail()
+  // 进入 verify 模式时回填 email + 清空上次的 code / 状态行,聚焦 code 输入框
+  if (mode === 'verify') {
+    const emailEl = $('auth-verify-email')
+    if (emailEl) emailEl.textContent = _verifyEmail || '你的邮箱'
+    const codeEl = $('auth-verify-code'); if (codeEl) codeEl.value = ''
+    const statusEl = $('auth-verify-status')
+    if (statusEl) { statusEl.textContent = ''; statusEl.hidden = true }
+    const resendStatus = $('auth-verify-resend-status')
+    if (resendStatus) { resendStatus.textContent = ''; resendStatus.hidden = true }
   }
   // Focus first input
   setTimeout(() => {
@@ -306,6 +342,7 @@ export function setMode(mode) {
       register: 'auth-register-email',
       forgot: 'auth-forgot-email',
       reset: 'auth-reset-password',
+      verify: 'auth-verify-code',
     }[mode]
     if (focusId) $(focusId)?.focus()
   }, 30)
@@ -313,9 +350,8 @@ export function setMode(mode) {
 
 // ───────── Init ─────────
 export async function initAuth() {
-  // Parse URL params for email-link-driven modes
+  // URL 邮件落地:现在只剩 reset_password 链接(verify_email 改 code,不再走 URL)
   const params = new URLSearchParams(window.location.search)
-  const verifyParam = params.get('verify_email')
   const resetParam = params.get('reset_password')
 
   // Wire tab/toggle clicks (bottom inline links in design-kit layout)
@@ -330,7 +366,11 @@ export async function initAuth() {
   $('auth-register-btn')?.addEventListener('click', _doRegister)
   $('auth-forgot-btn')?.addEventListener('click', _doRequestReset)
   $('auth-reset-btn')?.addEventListener('click', _doConfirmReset)
-  $('auth-resend-verify-btn')?.addEventListener('click', _doResendVerification)
+  // 登录页"重发验证邮件":从 login 流程被 EMAIL_NOT_VERIFIED 拦下时,
+  // 入口变成跳 verify 模式 + 调用 resend。用户随后在 verify 模式输 code。
+  $('auth-resend-verify-btn')?.addEventListener('click', _doResendFromLogin)
+  $('auth-verify-submit-btn')?.addEventListener('click', _doVerifyCode)
+  $('auth-verify-resend-btn')?.addEventListener('click', _doResendFromVerify)
   $('auth-verify-back-btn')?.addEventListener('click', () => setMode('login'))
   $('auth-forgot-back-btn')?.addEventListener('click', () => setMode('login'))
   $('auth-forgot-success-back-btn')?.addEventListener('click', () => {
@@ -341,28 +381,6 @@ export async function initAuth() {
     if (ok) ok.hidden = true
     setMode('login')
   })
-  $('auth-register-back-btn')?.addEventListener('click', () => {
-    // Reset register sub-view back to the form for next time
-    const form = $('auth-register-form')
-    const ok = $('auth-register-success')
-    if (form) form.hidden = false
-    if (ok) ok.hidden = true
-    setMode('login')
-  })
-
-  // Pause polling while tab is hidden — saves bandwidth + dodges throttling
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      if (_verifyPollTimer) {
-        clearTimeout(_verifyPollTimer)
-        _verifyPollTimer = null
-      }
-    } else if (_verifyPollEmail && !_verifyPollTimer && _currentMode === 'register') {
-      // Resume + check immediately on tab focus (catches verifications that
-      // happened while we were backgrounded)
-      _scheduleVerifyPoll(0)
-    }
-  })
 
   // Enter key submits
   for (const [inputId, btnId] of [
@@ -370,9 +388,20 @@ export async function initAuth() {
     ['auth-register-confirm', 'auth-register-btn'],
     ['auth-forgot-email', 'auth-forgot-btn'],
     ['auth-reset-confirm', 'auth-reset-btn'],
+    ['auth-verify-code', 'auth-verify-submit-btn'],
   ]) {
     $(inputId)?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.isComposing) $(btnId)?.click()
+    })
+  }
+
+  // code 输入框:自动过滤非数字 + 输满 6 位自动提交(常用 UX)
+  const codeEl = $('auth-verify-code')
+  if (codeEl) {
+    codeEl.addEventListener('input', () => {
+      const cleaned = codeEl.value.replace(/\D/g, '').slice(0, 6)
+      if (cleaned !== codeEl.value) codeEl.value = cleaned
+      if (cleaned.length === 6) $('auth-verify-submit-btn')?.click()
     })
   }
 
@@ -380,12 +409,7 @@ export async function initAuth() {
   loadPublicConfig().catch(() => {})
 
   // URL-driven modes win over default
-  if (verifyParam) {
-    _verifyToken = verifyParam
-    setMode('verify')
-    // Strip token from URL so a refresh doesn't re-submit
-    history.replaceState(null, '', window.location.pathname + window.location.hash)
-  } else if (resetParam) {
+  if (resetParam) {
     _resetToken = resetParam
     setMode('reset')
     history.replaceState(null, '', window.location.pathname + window.location.hash)
@@ -422,8 +446,16 @@ async function _doLogin() {
       const errCode =
         data?.error && typeof data.error === 'object' ? data.error.code : data?.error
       if (r.status === 403 && errCode === 'EMAIL_NOT_VERIFIED') {
-        _showError('邮箱尚未验证 — 请检查收件箱,或点击下方"重发验证邮件"')
-        $('auth-login-resend-row').hidden = false
+        // 2026-04-23:现在邮箱验证走 "6 位 code 输入",不再是 "点击邮件链接"。
+        // 把用户送进 verify 模式,预填 email,让他粘贴 code 直接输。
+        // 旧的 auth-resend-verify-btn 入口改为"去 verify 模式 + 触发一次 resend"。
+        _verifyEmail = email
+        setMode('verify')
+        const status = $('auth-verify-status')
+        if (status) {
+          status.textContent = '邮箱尚未验证 — 请输入邮件中的 6 位验证码'
+          status.hidden = false
+        }
         return
       }
       _showError(_friendlyAuthError(data, r.status))
@@ -464,94 +496,11 @@ async function _doRegister() {
       _showError(_friendlyAuthError(data, r.status))
       return
     }
-    // Show verify-pending sub-view inside register tab
-    $('auth-register-form').hidden = true
-    $('auth-register-success').hidden = false
-    $('auth-register-success-email').textContent = email
-    // Kick off cross-device verification polling
-    _startVerifyPoll(email)
+    // 2026-04-23:注册成功后直接进入 verify 模式(6 位 code 输入)。
+    // 不再需要跨设备 polling —— 用户在同一页面输 code 就完成验证。
+    _verifyEmail = email
+    setMode('verify')
   })
-}
-
-// ───────── Cross-device email-verify polling ─────────
-// After register success we don't know which device the user will open the
-// verification mail on. Poll the backend every 4s; when verified=true,
-// switch to login mode with email pre-filled.
-function _startVerifyPoll(email) {
-  _stopVerifyPoll()
-  _verifyPollEmail = email
-  _verifyPollStartedAt = Date.now()
-  _scheduleVerifyPoll(VERIFY_POLL_INTERVAL_MS)
-}
-
-function _stopVerifyPoll() {
-  if (_verifyPollTimer) {
-    clearTimeout(_verifyPollTimer)
-    _verifyPollTimer = null
-  }
-  _verifyPollEmail = ''
-  _verifyPollStartedAt = 0
-}
-
-function _scheduleVerifyPoll(delayMs) {
-  if (_verifyPollTimer) clearTimeout(_verifyPollTimer)
-  _verifyPollTimer = setTimeout(_pollVerifyOnce, delayMs)
-}
-
-async function _pollVerifyOnce() {
-  _verifyPollTimer = null
-  if (!_verifyPollEmail) return
-  // Time-bound the loop so we don't poll forever if the user wandered off
-  if (Date.now() - _verifyPollStartedAt > VERIFY_POLL_MAX_MS) {
-    const w = $('auth-register-waiting')
-    if (w) w.innerHTML = '<span style="color:var(--fg-muted)">已停止自动检查 — 请手动返回登录</span>'
-    _stopVerifyPoll()
-    return
-  }
-  const email = _verifyPollEmail
-  try {
-    const r = await apiFetch(
-      '/api/auth/check-verification?email=' + encodeURIComponent(email),
-      { method: 'GET', suppressAuthRedirect: true },
-    )
-    const data = await r.json().catch(() => ({}))
-    if (r.ok && data?.verified === true) {
-      // Verified! switch to login with email pre-filled
-      _stopVerifyPoll()
-      // Reset register sub-view so re-entering shows the form
-      const form = $('auth-register-form')
-      const ok = $('auth-register-success')
-      if (form) form.hidden = false
-      if (ok) ok.hidden = true
-      setMode('login')
-      const loginEmail = $('auth-login-email')
-      if (loginEmail) loginEmail.value = email
-      // Pre-fill + show a one-shot confirmation banner above the form
-      _showError('') // clear
-      const banner = $('login-error')
-      if (banner) {
-        banner.style.display = 'block'
-        banner.style.color = 'var(--success, #2da44e)'
-        banner.textContent = '✓ 邮箱验证成功 — 现在可以登录了'
-        // Restore color on next error
-        setTimeout(() => {
-          if (banner.textContent && banner.textContent.startsWith('✓')) {
-            banner.style.color = ''
-            banner.style.display = 'none'
-            banner.textContent = ''
-          }
-        }, 6000)
-      }
-      $('auth-login-password')?.focus()
-      return
-    }
-  } catch {
-    // network blip — fall through and reschedule
-  }
-  // Not verified yet — reschedule, but only if user is still on register tab
-  if (_currentMode === 'register' && _verifyPollEmail && !document.hidden) {
-    _scheduleVerifyPoll(VERIFY_POLL_INTERVAL_MS)
-  }
 }
 
 async function _doRequestReset() {
@@ -599,38 +548,111 @@ async function _doConfirmReset() {
   })
 }
 
-async function _doVerifyEmail() {
+/**
+ * 2026-04-23:邮箱验证走"输入 6 位 code"。
+ *
+ * verify 模式面板(auth-mode-verify)提交入口,body = { email, code }。
+ * 成功 → 切 login + 预填 email + banner 提示"验证成功,请登录"。
+ */
+async function _doVerifyCode() {
   _clearError()
-  const status = $('auth-verify-status')
-  if (status) status.textContent = '正在验证邮箱…'
-  try {
+  const statusEl = $('auth-verify-status')
+  const show = (text, kind) => {
+    if (!statusEl) return
+    statusEl.textContent = text
+    statusEl.hidden = false
+    statusEl.style.color = kind === 'error'
+      ? 'var(--danger, #d32f2f)'
+      : (kind === 'ok' ? 'var(--success, #2da44e)' : '')
+  }
+  const email = (_verifyEmail || '').trim().toLowerCase()
+  const code = ($('auth-verify-code')?.value || '').trim()
+  if (!_emailValid(email)) {
+    show('缺少邮箱 — 请返回登录重新开始', 'error'); return
+  }
+  if (!/^\d{6}$/.test(code)) {
+    show('请输入 6 位数字验证码', 'error'); return
+  }
+  await _withBusy('auth-verify-submit-btn', '验证中…', async () => {
     const r = await apiFetch('/api/auth/verify-email', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: _verifyToken }),
+      body: JSON.stringify({ email, code }),
       suppressAuthRedirect: true,
     })
     const data = await r.json().catch(() => ({}))
     if (!r.ok) {
-      if (status) status.textContent = `验证失败:${_friendlyAuthError(data, r.status)}`
-      $('auth-verify-back-btn').hidden = false
+      show(_friendlyAuthError(data, r.status), 'error')
       return
     }
-    if (status) {
-      status.textContent = data?.newly_verified ? '✓ 邮箱验证成功!现在可以登录了。' : '✓ 邮箱已验证。'
-    }
-    $('auth-verify-back-btn').hidden = false
-    setTimeout(() => setMode('login'), 1500)
-  } catch (e) {
-    if (status) status.textContent = `网络错误,请重试:${String(e?.message || e)}`
-    $('auth-verify-back-btn').hidden = false
-  }
+    show(data?.newly_verified ? '✓ 邮箱验证成功!' : '✓ 邮箱已验证。', 'ok')
+    // 切登录模式 + 预填 email + 顶部成功横幅,与原旧链接流程体验一致
+    setTimeout(() => {
+      const savedEmail = email
+      setMode('login')
+      const loginEmail = $('auth-login-email')
+      if (loginEmail) loginEmail.value = savedEmail
+      const banner = $('login-error')
+      if (banner) {
+        banner.style.display = 'block'
+        banner.style.color = 'var(--success, #2da44e)'
+        banner.textContent = '✓ 邮箱验证成功 — 现在可以登录了'
+        setTimeout(() => {
+          if (banner.textContent && banner.textContent.startsWith('✓')) {
+            banner.style.color = ''
+            banner.style.display = 'none'
+            banner.textContent = ''
+          }
+        }, 6000)
+      }
+      $('auth-login-password')?.focus()
+    }, 800)
+  })
 }
 
-async function _doResendVerification() {
+/**
+ * verify 模式下的"重发验证码"按钮。
+ * 成功提示展示在按钮旁边,不跳 mode。服务端已作废旧 code 只保留最新一张。
+ */
+async function _doResendFromVerify() {
+  _clearError()
+  const email = (_verifyEmail || '').trim().toLowerCase()
+  if (!_emailValid(email)) { _showError('缺少邮箱 — 请返回登录重新开始'); return }
+  // cooldown 过期前直接 noop(按钮在 cooldown 态已 disabled,这里是兜底)
+  const next = _resendNextAt.get('auth-verify-resend-btn') || 0
+  if (Date.now() < next) return
+  const statusEl = $('auth-verify-resend-status')
+  await _withBusy('auth-verify-resend-btn', '发送中…', async () => {
+    const r = await apiFetch('/api/auth/resend-verification', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+      suppressAuthRedirect: true,
+    })
+    const data = await r.json().catch(() => ({}))
+    if (!r.ok) { _showError(_friendlyAuthError(data, r.status)); return }
+    if (statusEl) {
+      statusEl.textContent = '新验证码已发送 — 请查收(含垃圾邮件箱)'
+      statusEl.hidden = false
+    }
+    // 清空之前输错的 code,方便用户直接输新的
+    const codeEl = $('auth-verify-code')
+    if (codeEl) { codeEl.value = ''; codeEl.focus() }
+    _resendLockUntil('auth-verify-resend-btn', Date.now() + _RESEND_COOLDOWN_MS)
+  })
+}
+
+/**
+ * login 页面"重发验证邮件"按钮(legacy row)。
+ * 2026-04-23 后新的 EMAIL_NOT_VERIFIED 失败路径直接 setMode('verify'),
+ * 此行通常不可见;但保留按钮 + 处理以防某些边界场景(旧 UI 被缓存)仍命中。
+ */
+async function _doResendFromLogin() {
   _clearError()
   const email = $('auth-login-email').value.trim().toLowerCase()
   if (!_emailValid(email)) { _showError('请先在登录框填写邮箱'); return }
+  const next = _resendNextAt.get('auth-resend-verify-btn') || 0
+  if (Date.now() < next) return
   await _withBusy('auth-resend-verify-btn', '发送中…', async () => {
     const r = await apiFetch('/api/auth/resend-verification', {
       method: 'POST',
@@ -640,9 +662,19 @@ async function _doResendVerification() {
     })
     const data = await r.json().catch(() => ({}))
     if (!r.ok) { _showError(_friendlyAuthError(data, r.status)); return }
-    _showError('') // clear
-    $('auth-login-resend-status').textContent = '验证邮件已发送(若邮箱已注册并未验证),请查收'
-    $('auth-login-resend-status').hidden = false
+    // 用户既然点了 resend 说明需要验证 —— 直接送进 verify 模式等他输 code
+    _verifyEmail = email
+    setMode('verify')
+    const statusEl = $('auth-verify-status')
+    if (statusEl) {
+      statusEl.textContent = '新验证码已发送 — 请查收邮件(含垃圾邮件箱)'
+      statusEl.hidden = false
+      statusEl.style.color = 'var(--success, #2da44e)'
+    }
+    // 两个 resend 按钮共享 cooldown 时钟:在 login 页按了就锁 verify 页的,反之亦然
+    const until = Date.now() + _RESEND_COOLDOWN_MS
+    _resendLockUntil('auth-resend-verify-btn', until)
+    _resendLockUntil('auth-verify-resend-btn', until)
   })
 }
 
@@ -701,7 +733,7 @@ function _friendlyAuthError(data, status) {
     case 'CONFLICT':            return '该邮箱已注册'
     case 'TURNSTILE_FAILED':    return '人机验证失败,请重试'
     case 'VALIDATION':          return msg || '输入格式不合法'
-    case 'INVALID_TOKEN':       return '链接已失效或被使用过,请重新获取'
+    case 'INVALID_TOKEN':       return '验证码或链接无效/已过期,请重新获取'
     case 'RATE_LIMITED':        return '操作过于频繁,请稍后再试'
     default:
       if (status === 401) return msg || '认证失败'

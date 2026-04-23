@@ -74,6 +74,12 @@ export interface CommercialHttpDeps {
     login: RateLimitConfig;
     requestReset: RateLimitConfig;
     resendVerify: RateLimitConfig;
+    /**
+     * 2026-04-23:邮箱验证从 link 改 6 位数字 code 后新增。
+     * code 空间 10^6,必须限制尝试频率防暴破;30 min TTL + 10/min/IP 足够挡住
+     * 自动化枚举,又不影响用户手动输错重试。
+     */
+    verifyEmail: RateLimitConfig;
     hupiCreate: RateLimitConfig;
     // 2026-04-21 安全审计 HIGH (refresh/logout 限流)补齐的条目
     refresh: RateLimitConfig;
@@ -165,6 +171,10 @@ export const DEFAULT_RATE_LIMITS = {
   login: { scope: "login", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
   requestReset: { scope: "request_reset", windowSeconds: 60, max: 3 } satisfies RateLimitConfig,
   resendVerify: { scope: "resend_verify", windowSeconds: 60, max: 3 } satisfies RateLimitConfig,
+  // 2026-04-23:邮箱验证码提交限流,防 10^6 key space 暴破。
+  // 10/min/IP 对正常用户宽松(手动输错重试 3-5 次),对自动化脚本
+  // 30min TTL 内最多 300 次尝试,相对 10^6 空间可忽略。
+  verifyEmail: { scope: "verify_email", windowSeconds: 60, max: 10 } satisfies RateLimitConfig,
   // 04-API §8:同用户 10 次 / 1h
   hupiCreate: { scope: "hupi_create", windowSeconds: 3600, max: 10 } satisfies RateLimitConfig,
   // 2026-04-21 安全审计 HIGH#1:refresh/logout 从不限流,攻击者拿到泄漏的
@@ -454,23 +464,38 @@ export async function handleLogout(
 }
 
 // ─── POST /api/auth/verify-email ────────────────────────────────────
+//
+// 2026-04-23:从 {token} 改为 {email, code}。
+//   - body 校验在这里做最小 shape 校验;email 格式/code 6 位数字的精确
+//     校验延迟到 verifyEmail() 用 zod schema 做,错误码统一 VALIDATION
+//   - 加 IP 速率限制(10/min):code 空间 10^6,必须限制尝试频率
 
 export async function handleVerifyEmail(
   req: IncomingMessage,
   res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  const body = (await readJsonBody(req)) as { token?: unknown } | undefined;
-  if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).token !== "string") {
-    throw new HttpError(400, "VALIDATION", "token is required");
+  const cfg = deps.rateLimits?.verifyEmail ?? DEFAULT_RATE_LIMITS.verifyEmail;
+  await enforceRateLimit(deps, cfg, ctx.clientIp);
+
+  const body = (await readJsonBody(req)) as { email?: unknown; code?: unknown } | undefined;
+  if (
+    !body ||
+    typeof body !== "object" ||
+    typeof (body as Record<string, unknown>).email !== "string" ||
+    typeof (body as Record<string, unknown>).code !== "string"
+  ) {
+    throw new HttpError(400, "VALIDATION", "email and code are required");
   }
-  const token = (body as { token: string }).token;
+  const { email, code } = body as { email: string; code: string };
   try {
-    const r = await verifyEmail(token);
+    const r = await verifyEmail(email, code);
     sendJson(res, 200, { user_id: r.user_id, newly_verified: r.newly_verified });
   } catch (err) {
     if (err instanceof VerifyError) {
-      const status = err.code === "VALIDATION" ? 400 : 400; // INVALID_TOKEN 也算 400(用户改不了的事)
-      throw new HttpError(status, err.code, err.message);
+      // INVALID_TOKEN 也是 400(用户改不了的格式错,需前端重新输)
+      throw new HttpError(400, err.code, err.message);
     }
     throw err;
   }
