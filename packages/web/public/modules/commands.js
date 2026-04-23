@@ -4,7 +4,7 @@ import { apiGet } from './api.js'
 // 浏览器把 `./billing.js` 和 `./billing.js?v=...` 当两个独立 ES module 实例,
 // `_hostAgentAdmin` 模块状态不共享,admin 登录后本模块永远读到 false。
 // 版本号由 scripts/deploy-v3.sh 跟其它 ?v= 一起 bump。
-import { isHostAgentAdmin } from './billing.js?v=9ac4c4d'
+import { isHostAgentAdmin } from './billing.js?v=54c779f'
 import { $, _mod } from './dom.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
