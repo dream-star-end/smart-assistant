@@ -6,15 +6,21 @@
  *
  * 被动事件(支付 / 容器 / 审计 / 安全)不在这里,在各自代码路径里直接 enqueueAlert。
  *
- * 本版实现 5 条:
+ * 本版实现 6 条:
  *   - account_pool.not_configured   (critical)
  *   - account_pool.all_down         (critical)
  *   - account_pool.low_capacity     (warning)
  *   - risk.signup_spike             (warning)
  *   - risk.rate_limit_spike         (warning)
+ *   - risk.login_failure_spike      (warning)
  *
- * health.5xx_spike / health.ttft_high / risk.login_failure_spike 依赖
- * metrics histogram snapshot API,放二期。
+ * risk.login_failure_spike 的数据源:rate_limit_events.scope='login' + blocked=TRUE。
+ *   语义:登录路由触发限流 = 某 IP 连续密码错(或账户枚举)把 5/min 配额打满。
+ *   不是"密码错误次数",但在攻击场景下等价信号。用 rate_limit_events 既避免新建
+ *   表,又继承已有的保留周期/清理策略。未来要做真正"failed_login count"需单起
+ *   login_events 表 + handleLogin 在 LoginError catch 里写一行 —— 放 Phase 3。
+ *
+ * health.5xx_spike / health.ttft_high 依赖 Prometheus histogram,放 Phase 3。
  */
 
 import { query } from "../db/queries.js";
@@ -28,6 +34,9 @@ export interface RuleSnapshot {
   signupWindowMin: number;
   rateLimitBlockedLastWindowMin: number;
   rateLimitWindowMin: number;
+  /** login 路由 rate_limit_events.blocked 数,窗口 loginFailureWindowMin */
+  loginFailureBlockedLastWindowMin: number;
+  loginFailureWindowMin: number;
 }
 
 export interface SnapshotDeps {
@@ -42,10 +51,12 @@ export interface SnapshotDeps {
 export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<RuleSnapshot> {
   const signupWindowMin = await readSettingNumber("alerts_signup_window_min", 10);
   const rateLimitWindowMin = await readSettingNumber("alerts_rate_limit_window_min", 10);
+  const loginFailureWindowMin = await readSettingNumber("alerts_login_failure_window_min", 10);
 
   let accountHealth: RuleSnapshot["accountHealth"] = [];
   let signupCountLastWindowMin = 0;
   let rateLimitBlockedLastWindowMin = 0;
+  let loginFailureBlockedLastWindowMin = 0;
 
   try {
     const r = await query<{ id: string; health_score: number; status: string }>(
@@ -85,12 +96,29 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
     console.warn("[admin/alertRules] rate_limit snapshot failed:", err);
   }
 
+  try {
+    // login 路由的 scope 固定是 "login"(见 http/handlers.ts DEFAULT_RATE_LIMITS.login),
+    // 所以过滤 scope='login' 即可。rate_limit_events 不区分 rule 名字,只按 scope。
+    const r = await query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM rate_limit_events
+        WHERE scope = 'login' AND blocked = TRUE
+          AND created_at >= NOW() - make_interval(mins => $1)`,
+      [loginFailureWindowMin],
+    );
+    loginFailureBlockedLastWindowMin = Number(r.rows[0]?.n ?? "0");
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[admin/alertRules] login_failure snapshot failed:", err);
+  }
+
   return {
     accountHealth,
     signupCountLastWindowMin,
     signupWindowMin,
     rateLimitBlockedLastWindowMin,
     rateLimitWindowMin,
+    loginFailureBlockedLastWindowMin,
+    loginFailureWindowMin,
     ...deps.override,
   };
 }
@@ -279,6 +307,35 @@ export const ruleRateLimitSpike: PolledRule = {
   },
 };
 
+export const ruleLoginFailureSpike: PolledRule = {
+  id: EVENTS.RISK_LOGIN_FAILURE_SPIKE,
+  event_type: EVENTS.RISK_LOGIN_FAILURE_SPIKE,
+  evaluate(s) {
+    const threshold =
+      (s as unknown as { _loginFailureThreshold?: number })._loginFailureThreshold ?? 30;
+    if (s.loginFailureBlockedLastWindowMin >= threshold) {
+      const bucketMs = 10 * 60 * 1000;
+      const bucket = Math.floor(Date.now() / bucketMs) * bucketMs;
+      return {
+        firing: true,
+        dedupe_key: `${EVENTS.RISK_LOGIN_FAILURE_SPIKE}:${bucket}`,
+        title: "[WARN] 登录限流触发激增",
+        body: `过去 ${s.loginFailureWindowMin} 分钟 login 路由被限流 **${s.loginFailureBlockedLastWindowMin}** 次(阈值 ${threshold})。疑似撞库/暴力破解 —— 建议检查 rate_limit_events.scope='login' 并评估临时收紧 login 限流。`,
+        payload: {
+          count: s.loginFailureBlockedLastWindowMin,
+          window_min: s.loginFailureWindowMin,
+          threshold,
+        },
+      };
+    }
+    return {
+      firing: false,
+      resolvedTitle: "[RESOLVED] 登录限流回落",
+      resolvedBody: `过去 ${s.loginFailureWindowMin} 分钟 login 路由限流 ${s.loginFailureBlockedLastWindowMin},低于阈值 ${threshold}。`,
+    };
+  },
+};
+
 export function defaultPolledRules(): PolledRule[] {
   return [
     ruleAccountPoolNotConfigured,
@@ -286,6 +343,7 @@ export function defaultPolledRules(): PolledRule[] {
     ruleAccountPoolLowCapacity,
     ruleSignupSpike,
     ruleRateLimitSpike,
+    ruleLoginFailureSpike,
   ];
 }
 
@@ -295,7 +353,7 @@ export interface RunRulesDeps {
   rules?: PolledRule[];
   snapshotDeps?: SnapshotDeps;
   /** 测试可注入 thresholds 绕过 DB 读 */
-  thresholds?: { signup?: number; rateLimit?: number };
+  thresholds?: { signup?: number; rateLimit?: number; loginFailure?: number };
   /** alerts 总开关 override(默认从 system_settings 读) */
   alertsEnabledOverride?: boolean;
 }
@@ -330,8 +388,11 @@ export async function runRulesOnce(deps: RunRulesDeps = {}): Promise<RunRulesRes
     deps.thresholds?.signup ?? (await readSettingNumber("alerts_signup_spike_threshold", 20));
   const rateLimitThreshold =
     deps.thresholds?.rateLimit ?? (await readSettingNumber("alerts_rate_limit_spike_threshold", 200));
+  const loginFailureThreshold =
+    deps.thresholds?.loginFailure ?? (await readSettingNumber("alerts_login_failure_spike_threshold", 30));
   (snap as unknown as Record<string, number>)._signupThreshold = signupThreshold;
   (snap as unknown as Record<string, number>)._rateLimitThreshold = rateLimitThreshold;
+  (snap as unknown as Record<string, number>)._loginFailureThreshold = loginFailureThreshold;
 
   const rules = deps.rules ?? defaultPolledRules();
   for (const rule of rules) {

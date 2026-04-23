@@ -36,6 +36,7 @@ import {
   createPendingOrder,
   getOrderByNo,
   markOrderPaid,
+  markOrderCanceled,
   countPaidOrdersForUser,
   PlanNotFoundError,
   FirstTopupAlreadyUsedError,
@@ -282,9 +283,57 @@ export async function handleHupiCallback(
     throw new HttpError(400, "SIGNATURE_INVALID", "hupijiao callback signature mismatch");
   }
 
-  // 2) 状态字段:status=OD(虎皮椒订单已支付);其他(PN=待支付, NF=未完成)忽略不推进
-  //    但仍返 "success":否则虎皮椒认为回调失败会一直重试
+  // 2) 状态字段:
+  //    - OD = 已支付(推进状态机)
+  //    - NF = 未完成(用户取消 / 支付失败 / 支付超时) → pending 推 canceled + 告警
+  //    - PN / 其它 = 待支付 / 未知 → 静默 success(不告警,正常流程)
+  //    任何分支都回 "success":否则虎皮椒认为回调失败会一直重试
   const statusRaw = pickString(form, "status");
+  if (statusRaw === "NF") {
+    // eslint-disable-next-line no-console
+    console.info(
+      `[commercial/payment] callback NF (user side failure/cancel): order=${orderNo} reqId=${ctx.requestId}`,
+    );
+
+    // 行为对齐 OD 分支的异常处理:
+    //   - DB / tx 抛 → 让 error 冒到 http handler 返 5xx,虎皮椒会重试
+    //     (吞掉 + 回 success 会让 transient DB error 下订单永远停在 pending)
+    //   - outcome=canceled → 推状态成功,发告警 + success
+    //   - outcome=already_*(paid/canceled/expired/refunded)→ 历史订单,不改不告警,success
+    //   - outcome=not_found → 对齐 OD 的 ORDER_NOT_FOUND 语义,400 告诉虎皮椒
+    //     "这订单不属于本系统,别再重试",避免错环境/错订单 NF 被完全吞掉
+    const r = await markOrderCanceled({
+      orderNo,
+      callbackPayload: { ...form, received_at: new Date().toISOString() },
+    });
+    if (r.outcome === "not_found") {
+      throw new HttpError(400, "ORDER_NOT_FOUND", `unknown order: ${orderNo}`);
+    }
+    if (r.outcome === "canceled") {
+      // 告警:本次把 pending → canceled,代表用户真实放弃/失败。
+      // 不看金额,低频但需要人工感知(可能代表 UX/价格/渠道问题)。
+      // dedupe_key 绑定 order_no;同一订单 outbox 层 ON CONFLICT DO NOTHING 挡重复入队。
+      // markOrderCanceled 本身在 DB 层 FOR UPDATE 幂等(非 pending 不改),
+      // 所以即使跨 outbox bucket / cache 失效也不会重复告警。
+      safeEnqueueAlert({
+        event_type: EVENTS.PAYMENT_FAILED,
+        severity: "warning",
+        title: "虎皮椒回调:支付失败 / 取消",
+        body: `订单 \`${orderNo}\` 虎皮椒回调 status=NF(用户侧支付失败 / 超时 / 取消)。若短时间内同一用户多次出现,排查支付链路或价格/渠道问题。`,
+        payload: { order_no: orderNo, status: "NF", req_id: ctx.requestId },
+        dedupe_key: `payment.failed:${orderNo}`,
+      });
+    } else {
+      // already_paid / already_canceled / already_expired / already_refunded
+      // eslint-disable-next-line no-console
+      console.info(
+        `[commercial/payment] NF callback ignored (non-pending): order=${orderNo} outcome=${r.outcome} reqId=${ctx.requestId}`,
+      );
+    }
+
+    sendText(res, 200, "success");
+    return;
+  }
   if (statusRaw !== "OD") {
     sendText(res, 200, "success");
     return;

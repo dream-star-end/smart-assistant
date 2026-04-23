@@ -20,6 +20,7 @@ import {
   ruleAccountPoolLowCapacity,
   ruleSignupSpike,
   ruleRateLimitSpike,
+  ruleLoginFailureSpike,
   defaultPolledRules,
   type RuleSnapshot,
 } from "../admin/alertRules.js";
@@ -36,6 +37,8 @@ function baseSnapshot(overrides: Partial<RuleSnapshot> = {}): RuleSnapshot {
     signupWindowMin: 10,
     rateLimitBlockedLastWindowMin: 0,
     rateLimitWindowMin: 10,
+    loginFailureBlockedLastWindowMin: 0,
+    loginFailureWindowMin: 10,
     ...overrides,
   };
 }
@@ -204,15 +207,48 @@ describe("ruleRateLimitSpike", () => {
   });
 });
 
+describe("ruleLoginFailureSpike", () => {
+  test("firing 当 login blocked 超阈值", () => {
+    const s = baseSnapshot({ loginFailureBlockedLastWindowMin: 50 }) as unknown as RuleSnapshot & {
+      _loginFailureThreshold: number;
+    };
+    s._loginFailureThreshold = 30;
+    const o = ruleLoginFailureSpike.evaluate(s);
+    assert.equal(o.firing, true);
+    if (o.firing) {
+      assert.ok(o.dedupe_key.startsWith(`${EVENTS.RISK_LOGIN_FAILURE_SPIKE}:`));
+      assert.equal(o.payload.count, 50);
+      assert.equal(o.payload.threshold, 30);
+      assert.equal(o.payload.window_min, 10);
+    }
+  });
+
+  test("不 firing 当数值低于阈值", () => {
+    const s = baseSnapshot({ loginFailureBlockedLastWindowMin: 5 }) as unknown as RuleSnapshot & {
+      _loginFailureThreshold: number;
+    };
+    s._loginFailureThreshold = 30;
+    assert.equal(ruleLoginFailureSpike.evaluate(s).firing, false);
+  });
+
+  test("默认阈值 30(snapshot 未注入 _loginFailureThreshold)", () => {
+    const s = baseSnapshot({ loginFailureBlockedLastWindowMin: 29 });
+    assert.equal(ruleLoginFailureSpike.evaluate(s).firing, false);
+    const s2 = baseSnapshot({ loginFailureBlockedLastWindowMin: 30 });
+    assert.equal(ruleLoginFailureSpike.evaluate(s2).firing, true);
+  });
+});
+
 describe("defaultPolledRules", () => {
-  test("包含 5 条默认规则", () => {
+  test("包含 6 条默认规则", () => {
     const rules = defaultPolledRules();
-    assert.equal(rules.length, 5);
+    assert.equal(rules.length, 6);
     const ids = rules.map((r) => r.id).sort();
     assert.deepEqual(ids, [
       EVENTS.ACCOUNT_POOL_ALL_DOWN,
       EVENTS.ACCOUNT_POOL_LOW_CAPACITY,
       EVENTS.ACCOUNT_POOL_NOT_CONFIGURED,
+      EVENTS.RISK_LOGIN_FAILURE_SPIKE,
       EVENTS.RISK_RATE_LIMIT_SPIKE,
       EVENTS.RISK_SIGNUP_SPIKE,
     ].sort());

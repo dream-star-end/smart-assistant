@@ -29,10 +29,9 @@ export interface EventMeta {
  * 事件目录 —— 单一真理源。
  *
  * **只列已真正 wire 的事件**。让 UI 能订阅但代码永远不会 enqueue 的"僵尸"事件
- * 是最糟糕的误导,所以 Phase 1 只保留实际触发的事件。二期计划加的事件:
- *   - payment.failed / payment.refund(要接新的失败回调和退款流程)
- *   - container.oom_exited / container.cleanup_partial(要从 dockerode events / 垃圾回收里抽)
- *   - risk.login_failure_spike(需要加一条 PolledRule 读 login_events)
+ * 是最糟糕的误导,所以只保留实际触发的事件。仍在 backlog 的:
+ *   - payment.refund(等退款产品流程)
+ *   - container.cleanup_partial(需要 v3 cleanup 路径先写)
  *   - health.5xx_spike / health.ttft_high(需要从 Prometheus histograms 聚合)
  * 都记在 docs/commercial-admin-backlog.md。
  */
@@ -43,18 +42,21 @@ export const EVENTS = {
   ACCOUNT_POOL_LOW_CAPACITY: "account_pool.low_capacity",
   ACCOUNT_POOL_TOKEN_REFRESH_FAILED: "account_pool.token_refresh_failed",
 
-  // ── 支付(4 个已 wire)──────────────────────────────────────
+  // ── 支付(5 个已 wire)──────────────────────────────────────
   PAYMENT_FIRST_TOPUP: "payment.first_topup",
   PAYMENT_LARGE_TOPUP: "payment.large_topup",
+  PAYMENT_FAILED: "payment.failed",
   PAYMENT_CALLBACK_SIGNATURE_INVALID: "payment.callback_signature_invalid",
   PAYMENT_CALLBACK_CONFLICT: "payment.callback_conflict",
 
-  // ── 容器(1 个已 wire)──────────────────────────────────────
+  // ── 容器(2 个已 wire)──────────────────────────────────────
   CONTAINER_PROVISION_FAILED: "container.provision_failed",
+  CONTAINER_OOM_EXITED: "container.oom_exited",
 
-  // ── 风控(2 个已 wire)──────────────────────────────────────
+  // ── 风控(3 个已 wire)──────────────────────────────────────
   RISK_SIGNUP_SPIKE: "risk.signup_spike",
   RISK_RATE_LIMIT_SPIKE: "risk.rate_limit_spike",
+  RISK_LOGIN_FAILURE_SPIKE: "risk.login_failure_spike",
 
   // ── 安全(2)────────────────────────────────────────────────
   SECURITY_ADMIN_ROLE_CHANGED: "security.admin_role_changed",
@@ -81,6 +83,8 @@ export const EVENT_META: EventMeta[] = [
     description: "用户完成首次充值", trigger: "passive" },
   { event_type: EVENTS.PAYMENT_LARGE_TOPUP, severity: "info", group: "payment",
     description: "单笔充值达到大额阈值", trigger: "passive" },
+  { event_type: EVENTS.PAYMENT_FAILED, severity: "warning", group: "payment",
+    description: "虎皮椒回调 status=NF(用户侧支付失败 / 取消)", trigger: "passive" },
   { event_type: EVENTS.PAYMENT_CALLBACK_SIGNATURE_INVALID, severity: "critical", group: "payment",
     description: "虎皮椒回调签名校验失败", trigger: "passive" },
   { event_type: EVENTS.PAYMENT_CALLBACK_CONFLICT, severity: "critical", group: "payment",
@@ -89,12 +93,16 @@ export const EVENT_META: EventMeta[] = [
   // container
   { event_type: EVENTS.CONTAINER_PROVISION_FAILED, severity: "critical", group: "container",
     description: "v3 容器开启失败(bridge / supervisor / 镜像问题)", trigger: "passive" },
+  { event_type: EVENTS.CONTAINER_OOM_EXITED, severity: "warning", group: "container",
+    description: "v3 容器 OOM 被 kernel 杀(exitCode=137 或 OOMKilled)", trigger: "passive" },
 
   // risk
   { event_type: EVENTS.RISK_SIGNUP_SPIKE, severity: "warning", group: "risk",
     description: "N 分钟内注册数超过阈值", trigger: "polled" },
   { event_type: EVENTS.RISK_RATE_LIMIT_SPIKE, severity: "warning", group: "risk",
     description: "rate_limit_events.blocked 激增", trigger: "polled" },
+  { event_type: EVENTS.RISK_LOGIN_FAILURE_SPIKE, severity: "warning", group: "risk",
+    description: "登录限流触发数激增(疑似撞库 / 暴力破解)", trigger: "polled" },
 
   // security
   { event_type: EVENTS.SECURITY_ADMIN_ROLE_CHANGED, severity: "critical", group: "security",

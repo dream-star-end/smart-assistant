@@ -114,3 +114,18 @@ export {
   type StartOrphanReconcileSchedulerOptions,
   type OrphanReconcileScheduler,
 } from "./v3orphanReconcile.js";
+
+// T-63 Phase 2 — docker container event stream 订阅:OOM → admin 告警
+export {
+  startV3ContainerEventsWorker,
+  handleContainerEvent,
+  uidFromContainerName,
+  createDedupeCache,
+  type V3ContainerEventsWorker,
+  type StartV3ContainerEventsWorkerOptions,
+  type ContainerEventsLogger,
+  type DockerContainerEvent,
+  type HandleResult,
+  type HandleContainerEventDeps,
+  type OomInspectFn,
+} from "./v3containerEvents.js";

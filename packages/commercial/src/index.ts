@@ -59,9 +59,11 @@ import {
   preheatV3Image,
   startIdleSweepScheduler,
   startOrphanReconcileScheduler,
+  startV3ContainerEventsWorker,
   startVolumeGcScheduler,
   type IdleSweepScheduler,
   type OrphanReconcileScheduler,
+  type V3ContainerEventsWorker,
   type V3SupervisorDeps,
   type VolumeGcScheduler,
 } from "./agent-sandbox/index.js";
@@ -639,6 +641,23 @@ export async function registerCommercial(
     console.log("[commercial] v3 orphan reconcile scheduler started (1h tick, runs on start)");
   }
 
+  // T-63 Phase 2:订阅 docker container events → `container.oom_exited` 告警。
+  // cfg.OC_CONTAINER_EVENTS_DISABLED=1 可关闭(运维灾备 / docker daemon 异常时用)。
+  let containerEventsWorker: V3ContainerEventsWorker | undefined;
+  if (v3Deps && process.env.OC_CONTAINER_EVENTS_DISABLED !== "1") {
+    containerEventsWorker = startV3ContainerEventsWorker({
+      docker: v3Deps.docker,
+      logger: {
+        debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
+        info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
+        warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
+        error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
+      },
+    });
+    // eslint-disable-next-line no-console
+    console.log("[commercial] v3 container events worker started (oom/die → alerts)");
+  }
+
   const resolveContainerEndpoint: ResolveContainerEndpoint =
     options.resolveContainerEndpoint
     ?? (v3Deps
@@ -702,6 +721,9 @@ export async function registerCommercial(
       }
       if (orphanReconcileScheduler) {
         try { await orphanReconcileScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (containerEventsWorker) {
+        try { await containerEventsWorker.stop(); } catch { /* ignore */ }
       }
       if (alertScheduler) {
         try { await alertScheduler.stop(); } catch { /* ignore */ }

@@ -53,6 +53,10 @@ export const KEY_SCHEMAS = {
   alerts_rate_limit_spike_threshold: z.number().int().min(1).max(100_000),
   /** risk.rate_limit_spike 时间窗口(分钟)。整数,1..240。 */
   alerts_rate_limit_window_min: z.number().int().min(1).max(240),
+  /** risk.login_failure_spike 阈值:N 分钟内 login 路由被限流次数 ≥ 此数触发。整数,1..10000。 */
+  alerts_login_failure_spike_threshold: z.number().int().min(1).max(10_000),
+  /** risk.login_failure_spike 时间窗口(分钟)。整数,1..240。 */
+  alerts_login_failure_window_min: z.number().int().min(1).max(240),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -71,6 +75,8 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   alerts_signup_window_min: 10,
   alerts_rate_limit_spike_threshold: 200,
   alerts_rate_limit_window_min: 10,
+  alerts_login_failure_spike_threshold: 30,
+  alerts_login_failure_window_min: 10,
 };
 
 /** 给前端做 schema 自描述(admin UI 渲染表单用)。 */
@@ -103,6 +109,14 @@ export const KEY_META: Record<
   alerts_rate_limit_window_min: {
     kind: "number", min: 1, max: 240,
     description: "risk.rate_limit_spike 时间窗口(分钟)",
+  },
+  alerts_login_failure_spike_threshold: {
+    kind: "number", min: 1, max: 10000,
+    description: "risk.login_failure_spike 阈值:N 分钟内 login 路由限流次数 ≥ 此数触发",
+  },
+  alerts_login_failure_window_min: {
+    kind: "number", min: 1, max: 240,
+    description: "risk.login_failure_spike 时间窗口(分钟)",
   },
 };
 

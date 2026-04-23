@@ -468,6 +468,73 @@ export async function markOrderPaid(
   });
 }
 
+export type MarkOrderCanceledOutcome =
+  /** 本次调用把 pending 推到 canceled(首次,应发告警) */
+  | "canceled"
+  /** 订单已在终态(paid / expired / refunded / canceled),本次无操作,不应告警 */
+  | "already_paid"
+  | "already_canceled"
+  | "already_expired"
+  | "already_refunded"
+  /** DB 里找不到此 order_no */
+  | "not_found";
+
+export interface MarkOrderCanceledResult {
+  outcome: MarkOrderCanceledOutcome;
+  /** 命中时原订单状态;not_found 时为 null */
+  previousStatus: OrderStatus | null;
+}
+
+/**
+ * 把 pending 订单推到 canceled。幂等 —— 已 paid / canceled / expired / refunded
+ * 都不改,只返回相应 outcome,让 caller 决定是否发告警。
+ *
+ * 用于虎皮椒 callback status=NF(用户侧失败/超时/取消)分支:
+ *   - pending → canceled:首次 NF,发 payment.failed 告警
+ *   - paid:用户先支付成功后又误回 NF(异常链路),不改状态,不发告警
+ *   - canceled/expired/refunded:历史订单,不发重复告警
+ *   - not_found:order_no 不属于本系统。**签名校验只能证明 payload 来自持有
+ *     secret 的一方,不能证明 order_no 是本系统产生的**。typical 原因:
+ *     生产 secret 被测试环境共用、虎皮椒平台串环境、或同商户号下不同系统。
+ *     caller 应该按 "未知订单" 处理(对齐 OD 分支 ORDER_NOT_FOUND 的 400),
+ *     而不是静默 success,否则异常 NF 回调会被完全吞掉。
+ *
+ * callback_payload 也顺手写入,便于事后排查。
+ */
+export async function markOrderCanceled(input: {
+  orderNo: string;
+  callbackPayload: unknown;
+}): Promise<MarkOrderCanceledResult> {
+  if (typeof input.orderNo !== "string" || input.orderNo.length === 0) {
+    throw new TypeError("markOrderCanceled: orderNo is required");
+  }
+  return tx(async (client) => {
+    const sel = await client.query<{ status: OrderStatus }>(
+      "SELECT status FROM orders WHERE order_no = $1 FOR UPDATE",
+      [input.orderNo],
+    );
+    if (sel.rows.length === 0) {
+      return { outcome: "not_found", previousStatus: null };
+    }
+    const prev = sel.rows[0].status;
+    if (prev !== "pending") {
+      return {
+        outcome: (`already_${prev}` as MarkOrderCanceledOutcome),
+        previousStatus: prev,
+      };
+    }
+    await client.query(
+      `UPDATE orders
+          SET status = 'canceled',
+              callback_payload = $1::jsonb,
+              updated_at = NOW()
+        WHERE id = (SELECT id FROM orders WHERE order_no = $2)`,
+      [JSON.stringify(input.callbackPayload ?? {}), input.orderNo],
+    );
+    return { outcome: "canceled", previousStatus: "pending" };
+  });
+}
+
 /**
  * 扫 pending 且 expires_at < now 的订单,置为 expired。返回受影响行数。
  *
