@@ -9,9 +9,9 @@
  *   - v2 removed / v3 vanished     → gone
  *   - v2 error                     → error
  *
- * 两个导出:
+ * 一个导出:
  *   - `getContainersPoolStats()` → 池级 KPI,一次查完给顶部 4 卡用
- *   - 无 per-row 今日聚合 —— docker stats 太贵,R4 scope 明确跳过
+ *   - 不做 per-row 今日聚合 —— docker stats 太贵,R4 scope 明确跳过
  *
  * 索引依赖:
  *   - idx_ac_state_activity (0012 建, state='active' partial) —— v3 running 分支命中

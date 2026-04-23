@@ -35,9 +35,11 @@ import {
 import { getUsersStats } from "../admin/usersStats.js";
 import {
   listAdminAudit,
+  writeAdminAudit,
   ADMIN_AUDIT_MAX_LIMIT,
   type AdminAuditRowView,
 } from "../admin/audit.js";
+import { getPool } from "../db/index.js";
 import {
   listPricing,
   patchPricing,
@@ -1053,10 +1055,12 @@ export async function handleAdminContainersStats(
 export async function handleAdminContainerLogs(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  await requireAdmin(req, deps.jwtSecret);
+  // Codex MEDIUM#2:日志比 stats/list 敏感(可能含用户 prompt / 调试输出 / 环境
+  // 信息),拉到 DB 双校验 —— 降权/封禁的 admin 24h JWT 内不能再读日志。
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   // 匹配 `/api/admin/agent-containers/:id/logs`。其它 GET prefix 一律 404,
   // 避免 future /api/admin/agent-containers/:id/inspect 等新路径误走到这里。
@@ -1082,6 +1086,25 @@ export async function handleAdminContainerLogs(
   }
   try {
     const logs = await adminContainerLogs(id, agent.docker, lines, deps.v3Supervisor);
+    // Codex MEDIUM#2 补:敏感读 best-effort audit(同 accounts/containers.ts 语义,
+    // 写 admin_audit 失败不阻塞响应)
+    try {
+      await writeAdminAudit(getPool(), {
+        adminId: admin.id,
+        action: "agent_container.logs",
+        target: `agent_container:${id}`,
+        before: null,
+        after: {
+          lines,
+          docker_ref: logs.docker_ref,
+          missing: logs.missing,
+          bytes: logs.combined.length,
+          partial: logs.partial,
+        },
+        ip: ctx.clientIp ?? null,
+        userAgent: ctx.userAgent ?? null,
+      });
+    } catch { /* best-effort */ }
     sendJson(res, 200, {
       id,
       lines,
@@ -1090,6 +1113,7 @@ export async function handleAdminContainerLogs(
       combined: logs.combined,
       docker_ref: logs.docker_ref,
       missing: logs.missing,
+      partial: logs.partial,
     });
   } catch (err) {
     if (err instanceof ContainerNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
@@ -1097,6 +1121,20 @@ export async function handleAdminContainerLogs(
       throw new HttpError(503, "V3_SUPERVISOR_NOT_READY", err.message);
     }
     if (err instanceof RangeError) translateRangeError(err);
+    // Codex LOW#4:非 404 docker 错(daemon down / network / 500)翻 502 DOCKER_LOGS_FAILED
+    // —— 不走默认 500 INTERNAL,让 admin 知道是上游 docker 挂了而不是 gateway bug
+    const e = err as { statusCode?: number; code?: string; message?: string };
+    const msg = typeof e?.message === "string" ? e.message : String(err);
+    if (
+      e?.statusCode === 500 ||
+      e?.code === "ECONNREFUSED" ||
+      e?.code === "ENOTFOUND" ||
+      /docker/i.test(msg)
+    ) {
+      throw new HttpError(502, "DOCKER_LOGS_FAILED", msg, {
+        issues: [{ path: "container_id", message: id }],
+      });
+    }
     throw err;
   }
 }

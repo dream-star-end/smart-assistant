@@ -1857,6 +1857,10 @@ async function containerAction(id, action, btn) {
   })
 }
 
+// Codex LOW#5:logs modal 的 loadSeq —— 同一 modal 内快速切 lines / 点刷新时,
+// 旧请求回来晚了别覆盖新请求写入的内容。
+const LOGS_MODAL_STATE = { loadSeq: 0 }
+
 async function openContainerLogsModal(id, label) {
   openModal(`
     <h2 style="margin-top:0">容器日志 <small style="color:var(--muted);font-weight:400;font-size:13px">${escapeHtml(label)}</small></h2>
@@ -1881,22 +1885,35 @@ async function openContainerLogsModal(id, label) {
 }
 
 async function _loadContainerLogs(id) {
+  const mySeq = ++LOGS_MODAL_STATE.loadSeq
   const body = $('lg-body')
   if (!body) return
   body.textContent = '加载中…'
   const lines = $('lg-lines')?.value || '200'
   try {
     const data = await apiGet(`/api/admin/agent-containers/${encodeURIComponent(id)}/logs?lines=${encodeURIComponent(lines)}`)
+    // 晚到的响应被更新版 / 关闭 modal 抢占 → 丢弃
+    if (mySeq !== LOGS_MODAL_STATE.loadSeq) return
+    const nowBody = $('lg-body')
+    if (!nowBody) return
     if (data.missing) {
-      body.textContent = `容器已不存在(docker_ref=${data.docker_ref ?? 'null'})。数据库行仍可见,可在 users tab 按 user 追查。`
+      nowBody.textContent = `容器已不存在(docker_ref=${data.docker_ref ?? 'null'})。数据库行仍可见,可在 users tab 按 user 追查。`
       return
     }
-    const combined = data.combined || '(无输出)'
-    body.textContent = combined
-    // 自动滚到底
-    body.scrollTop = body.scrollHeight
+    let combined = data.combined || '(无输出)'
+    // R4-2 LOW#3:后端若中途截断或报错,前端把警示横幅贴到日志头,避免 admin
+    // 误以为已经是完整 tail
+    if (data.partial === 'bytes_truncated') {
+      combined = `⚠ 后端命中 2 MiB 上限,仅展示前 2 MiB,之后内容已截断。\n────\n${combined}`
+    } else if (data.partial === 'stream_error') {
+      combined = `⚠ docker logs 流中途报错,以下内容不完整。\n────\n${combined}`
+    }
+    nowBody.textContent = combined
+    nowBody.scrollTop = nowBody.scrollHeight
   } catch (e) {
-    body.textContent = `加载失败:${e.message}`
+    if (mySeq !== LOGS_MODAL_STATE.loadSeq) return
+    const nowBody = $('lg-body')
+    if (nowBody) nowBody.textContent = `加载失败:${e.message}`
   }
 }
 

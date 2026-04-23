@@ -132,7 +132,20 @@ const CONTAINER_COLS = `
 `;
 
 export interface ListContainersInput {
-  /** 可选:单值或数组 status(provisioning/running/stopped/removed/error) */
+  /**
+   * 可选:单值或数组 lifecycle。
+   *
+   * Codex R4 MEDIUM#3 修复:过去这里直接下推 `c.status = ANY(...)`,v3 行
+   * status=NULL(0017 drop NOT NULL 后 v3 只写 state),过滤 "running" 时
+   * v3 active 容器全被隐藏 → admin UI 看不到 v3 侧 running 行,影响排障。
+   *
+   * 改成 lifecycle 语义,与 `row_kind`/`lifecycle` 列 + containersStats 对齐:
+   *   - running      = v2 status='running'       OR v3 state='active'
+   *   - provisioning = v2 status='provisioning'  (v3 无此态)
+   *   - stopped      = v2 status='stopped'       (v3 无此态)
+   *   - error        = v2 status='error'         (v3 CHECK 只有 active/vanished)
+   *   - removed      = v2 status='removed'       OR v3 state='vanished'
+   */
   status?: string | string[];
   limit?: number;
   offset?: number;
@@ -140,18 +153,37 @@ export interface ListContainersInput {
 
 const CONTAINER_STATUSES = ["provisioning", "running", "stopped", "removed", "error"] as const;
 
+/** 把 lifecycle 过滤值翻成 SQL 条件(已防 SQL 注入 —— 白名单映射,无参数)。 */
+function lifecycleWhereSql(lifecycle: string): string {
+  switch (lifecycle) {
+    case "running":
+      return "((c.subscription_id IS NOT NULL AND c.status = 'running') OR (c.subscription_id IS NULL AND c.state = 'active'))";
+    case "provisioning":
+      return "(c.subscription_id IS NOT NULL AND c.status = 'provisioning')";
+    case "stopped":
+      return "(c.subscription_id IS NOT NULL AND c.status = 'stopped')";
+    case "error":
+      return "(c.subscription_id IS NOT NULL AND c.status = 'error')";
+    case "removed":
+      return "((c.subscription_id IS NOT NULL AND c.status = 'removed') OR (c.subscription_id IS NULL AND c.state = 'vanished'))";
+    default:
+      throw new RangeError("invalid_status");
+  }
+}
+
 export async function listContainers(input: ListContainersInput = {}): Promise<AdminContainerRowView[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (input.status !== undefined) {
     const arr = Array.isArray(input.status) ? input.status : [input.status];
-    for (const s of arr) {
+    // 白名单校验 + 翻成 lifecycle-aware SQL(v2 status / v3 state 统一)
+    const parts = arr.map((s) => {
       if (!(CONTAINER_STATUSES as readonly string[]).includes(s)) {
         throw new RangeError("invalid_status");
       }
-    }
-    params.push(arr);
-    where.push(`c.status = ANY($${params.length}::text[])`);
+      return lifecycleWhereSql(s);
+    });
+    where.push(parts.length === 1 ? parts[0]! : `(${parts.join(" OR ")})`);
   }
   let limit = input.limit ?? 50;
   if (!Number.isInteger(limit) || limit <= 0) limit = 50;
@@ -304,6 +336,13 @@ export interface AdminContainerLogs {
   docker_ref: string | null;
   /** 容器在宿主机上不存在(v2 removed / v3 vanished / provision 失败)。 */
   missing: boolean;
+  /**
+   * 部分输出:被字节上限截断,或 mid-stream 出错。
+   *   - bytes_truncated:tail 累加到 LOGS_MAX_BYTES 后主动 destroy 流
+   *   - stream_error:docker 返回 200 后 socket 异常(ECONNRESET 之类),
+   *     partial logs 能返多少返多少,UI 需知悉不完整
+   */
+  partial: "bytes_truncated" | "stream_error" | null;
 }
 
 /** docker tail,默认 200 行,上限 500(再多 UI 也看不动)。 */
@@ -321,12 +360,17 @@ function decodeDockerLogFrames(buf: Buffer): { stdout: string; stderr: string; c
   while (off + 8 <= buf.length) {
     const stream = buf[off]!;
     const len = buf.readUInt32BE(off + 4);
-    if (off + 8 + len > buf.length) break; // 截断(不大可能,docker 会给完整帧)
-    const payload = buf.slice(off + 8, off + 8 + len).toString("utf8");
+    // Codex R4-2 MEDIUM#2:被裁剪到 LOGS_MAX_BYTES 时,最后一帧可能 header 完整
+    // 但 payload 被截。之前 `break` 会让整帧输出丢失 —— 即"单行巨帧"直接变空
+    // modal。改成 emit 能拿到的 partial payload,让 admin 至少能看到开头。
+    const frameEnd = off + 8 + len;
+    const avail = Math.min(frameEnd, buf.length);
+    const payload = buf.slice(off + 8, avail).toString("utf8");
     if (stream === 2) stderr += payload;
     else stdout += payload; // stream=1 或异常值都归 stdout
     combined += payload;
-    off += 8 + len;
+    if (frameEnd > buf.length) break; // 最后一帧被截,已消费完剩余 bytes
+    off = frameEnd;
   }
   return { stdout, stderr, combined };
 }
@@ -351,37 +395,111 @@ export async function adminContainerLogs(
     ref = info.containerInternalId; // 可能 NULL(provision 中 / vanished)
   }
   if (!ref) {
-    return { stdout: "", stderr: "", combined: "", docker_ref: null, missing: true };
+    return { stdout: "", stderr: "", combined: "", docker_ref: null, missing: true, partial: null };
   }
 
   try {
-    // dockerode 不设 follow 时返回 Buffer;类型写的是 NodeJS.ReadableStream,实际是 Buffer
-    const raw = (await docker.getContainer(ref).logs({
-      stdout: true,
-      stderr: true,
-      tail,
-      follow: false,
-      timestamps: true,
-    })) as unknown as Buffer;
-    let buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as unknown as ArrayBuffer);
-    // 字节上限防御:单行特别长(base64 dump)可能让 tail=500 返回 GB 级响应,
-    // 直接从 buffer 末尾裁,保留最后 LOGS_MAX_BYTES(admin 最关心最近输出)。
-    let truncated = false;
-    if (buf.length > LOGS_MAX_BYTES) {
-      buf = buf.slice(buf.length - LOGS_MAX_BYTES);
-      truncated = true;
-    }
+    // Codex R4 HIGH#1 + R4-2 MEDIUM#1 修复:
+    //
+    // dockerode 的 `container.logs({follow:false})` 走 modem buffered 分支
+    // (modem.js:339-345 先 Buffer.concat 全响应),单行 GB 级日志会先把
+    // gateway 内存打爆。`follow:true` 能拿 stream,但 docker 会保持 socket
+    // 等新日志,只能用 idle-timeout 启发式判断 tail 发完 —— 不是协议保证。
+    //
+    // 正确做法:绕过 dockerode,直接 modem.dial `follow=0` + `isStream:true`。
+    //   - follow=0 让 docker flush tail N 行后主动关 socket → `end` 是真的边界
+    //   - isStream:true 让 modem 透传 res stream(不 buffer)→ 我们 incrementally
+    //     read,超 LOGS_MAX_BYTES 主动 destroy 挡 OOM
+    //   - mid-stream error(ECONNRESET 等)设 partial='stream_error',返回
+    //     已 accumulate 的部分 + 明确标记,admin UI 不会误以为是完整日志
+    //
+    // Codex R4-3 LOW#1:path 必须以裸 `?` 结尾,query 放 `options.options`,
+    // 不能手拼完整 query 进 path —— docker-modem modem.js:160-165 的逻辑是
+    // "path 含 `?` 但没 opts 时,substring(0, len-1) 砍掉尾字符",手拼 query
+    // 的最后一个字符(这里是 timestamps=1 的 1)会被吞掉,变成 timestamps=
+    // → docker 400 拒。让 modem.buildQuerystring 基于 options.options 自己拼,
+    // 才能正确保留完整 query。
+    const docker_any = docker as unknown as {
+      modem: {
+        dial(
+          opts: Record<string, unknown>,
+          cb: (err: unknown, streamOrBody: unknown) => void,
+        ): void;
+      };
+    };
+    const stream = await new Promise<NodeJS.ReadableStream>((resolve, reject) => {
+      docker_any.modem.dial(
+        {
+          path: `/containers/${encodeURIComponent(ref)}/logs?`,
+          method: "GET",
+          options: {
+            stdout: true,
+            stderr: true,
+            tail,
+            follow: false,
+            timestamps: true,
+          },
+          isStream: true,
+          statusCodes: { 200: true, 404: "no such container", 500: "server error" },
+        },
+        (err, s) => {
+          if (err) reject(err);
+          else resolve(s as NodeJS.ReadableStream);
+        },
+      );
+    });
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let partial: "bytes_truncated" | "stream_error" | null = null;
+
+    await new Promise<void>((resolve) => {
+      let resolved = false;
+      const finish = () => {
+        if (resolved) return;
+        resolved = true;
+        try {
+          (stream as unknown as { destroy?: () => void }).destroy?.();
+        } catch { /* ignore */ }
+        resolve();
+      };
+      stream.on("data", (chunkIn: Buffer | string) => {
+        if (resolved) return;
+        const chunk = Buffer.isBuffer(chunkIn) ? chunkIn : Buffer.from(chunkIn);
+        if (total + chunk.length > LOGS_MAX_BYTES) {
+          const take = Math.max(0, LOGS_MAX_BYTES - total);
+          if (take > 0) chunks.push(chunk.slice(0, take));
+          total += take;
+          partial = "bytes_truncated";
+          finish();
+          return;
+        }
+        chunks.push(chunk);
+        total += chunk.length;
+      });
+      stream.on("end", finish);
+      stream.on("close", finish);
+      // Codex R4-2 LOW#3:mid-stream error 标 partial,不再静默吞掉
+      stream.on("error", () => {
+        if (resolved) return;
+        if (partial == null) partial = "stream_error";
+        finish();
+      });
+    });
+
+    const buf = Buffer.concat(chunks);
     const decoded = decodeDockerLogFrames(buf);
-    if (truncated) {
-      const note = `[admin/container-logs] 响应被裁剪到 ${LOGS_MAX_BYTES} 字节,仅保留最近输出\n`;
-      decoded.combined = note + decoded.combined;
+    if (partial === "bytes_truncated") {
+      decoded.combined += `\n[admin/container-logs] 已裁剪到 ${LOGS_MAX_BYTES} 字节,尾部输出被丢弃\n`;
+    } else if (partial === "stream_error") {
+      decoded.combined += `\n[admin/container-logs] docker socket 读取中断,输出可能不完整\n`;
     }
-    return { ...decoded, docker_ref: ref, missing: false };
+    return { ...decoded, docker_ref: ref, missing: false, partial };
   } catch (err) {
     // 404 → 容器不存在,返回空(不抛,admin UI 就显示"容器已不存在")
     const e = err as { statusCode?: number; reason?: string };
     if (e?.statusCode === 404 || (typeof e?.reason === "string" && e.reason.includes("no such container"))) {
-      return { stdout: "", stderr: "", combined: "", docker_ref: ref, missing: true };
+      return { stdout: "", stderr: "", combined: "", docker_ref: ref, missing: true, partial: null };
     }
     throw err;
   }
