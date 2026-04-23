@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
@@ -158,6 +158,16 @@ export class SessionManager {
     for (const path of [this.resumeMapPath, this.resumeMapPath + '.bak']) {
       try {
         if (!existsSync(path)) continue
+        // File mtime acts as the lower-bound timestamp for entries that lack
+        // their own `ts` (pre-Phase-0.2 legacy string values). Using Date.now()
+        // here would reset the TTL clock on every gateway restart, letting
+        // stale entries live forever — that's the bug this fixes. If stat
+        // fails (race with atomic-rename), fall back to 0 so _pruneResumeMap
+        // treats the entry as unknown-age and evicts it on first sweep.
+        let fileMtime = 0
+        try {
+          fileMtime = statSync(path).mtimeMs
+        } catch {}
         const data = JSON.parse(readFileSync(path, 'utf-8'))
         // Support both legacy format {key: sessionId} and new format
         // {key: {id, ts, lastCost?, provider?}}
@@ -166,7 +176,7 @@ export class SessionManager {
         for (const [key, val] of Object.entries(data)) {
           if (typeof val === 'string') {
             this._resumeMap.set(key, val)
-            this._resumeMapTimestamps.set(key, Date.now()) // legacy: assume "now" as baseline
+            this._resumeMapTimestamps.set(key, fileMtime)
             this._resumeMapProvider.set(key, SessionManager.CCB_PROVIDER_TAG)
           } else if (val && typeof val === 'object' && 'id' in (val as any)) {
             this._resumeMap.set(key, (val as any).id)
@@ -1258,21 +1268,31 @@ export class SessionManager {
   // `result` arrives (otherwise the parser would compute delta against 0 and
   // re-attribute the entire historical cumulative as this turn's cost).
   private _resumeMapLastCost = new Map<string, number>()
-  private static RESUME_MAP_TTL = 30 * 24 * 60 * 60 * 1000 // 30 days
+  // Idle TTL for entries whose in-memory AgentSession was already evicted.
+  // 7 days covers typical gateway restarts / multi-day reconnect gaps while
+  // preventing resume-map from growing unbounded. Rationale: resume-map exists
+  // to survive *restarts*, not to be a durable conversation archive.
+  private static RESUME_MAP_INACTIVE_TTL = 7 * 24 * 60 * 60 * 1000 // 7 days
 
   private _pruneResumeMap(): void {
     const now = Date.now()
     let pruned = false
     for (const [key] of this._resumeMap) {
       if (this.sessions.has(key)) continue // live session — keep
+      // ts=0 = unknown age (legacy entry whose file mtime could not be stat'd
+      // in _loadResumeMap). Treat as instantly-expired: `now - 0` is huge, so
+      // it trivially exceeds the threshold and gets pruned on first sweep.
       const ts = this._resumeMapTimestamps.get(key) ?? 0
-      if (ts > 0 && now - ts > SessionManager.RESUME_MAP_TTL) {
+      if (now - ts > SessionManager.RESUME_MAP_INACTIVE_TTL) {
         this._resumeMap.delete(key)
         this._resumeMapTimestamps.delete(key)
         this._resumeMapLastCost.delete(key)
         this._resumeMapProvider.delete(key)
         pruned = true
-        log.info('pruned stale resume-map entry', { sessionKey: key })
+        log.info('pruned idle resume-map entry', {
+          sessionKey: key,
+          ageMs: ts === 0 ? null : now - ts,
+        })
       }
     }
     if (pruned) this._saveResumeMap()
