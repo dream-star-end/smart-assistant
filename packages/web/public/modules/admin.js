@@ -1891,6 +1891,7 @@ function _renderChannelRow(c) {
         <button data-act="edit" data-id="${escapeHtml(c.id)}">编辑</button>
         <button data-act="${c.enabled ? 'disable' : 'enable'}" data-id="${escapeHtml(c.id)}">${c.enabled ? '停用' : '启用'}</button>
         <button data-act="test" data-id="${escapeHtml(c.id)}">测试</button>
+        ${c.activation_status === 'error' ? `<button data-act="rebind" data-id="${escapeHtml(c.id)}" title="把 activation_status=error 推回 pending,worker 会重新 long-poll。不重新扫码。">重新激活</button>` : ''}
         <button data-act="delete" data-id="${escapeHtml(c.id)}" class="btn-danger">删</button>
       </td>
     </tr>
@@ -1929,6 +1930,23 @@ async function _handleChannelAction(act, id, btn) {
       if (!confirm(`确认删除通道 #${id}?此操作会立刻停止发送,但历史 outbox 会保留。`)) return
       await withBtnLoading(btn, () => apiJson('DELETE', `/api/admin/alerts/channels/${id}`, null))
       toast('已删除')
+      _refreshAlertChannels()
+    } else if (act === 'rebind') {
+      // 重新激活:error → pending,worker 会重新 long-poll。不重新扫码。
+      // 后端幂等:already_active/already_pending 也返 200,按 outcome 分支。
+      // 若 bot_token 已失效,worker 会再次降级 error,此时用户要删掉重新扫码绑。
+      const r = await withBtnLoading(btn, () =>
+        apiJson('POST', `/api/admin/alerts/channels/${id}/rebind`, {}),
+      )
+      if (r?.outcome === 'reactivated') {
+        toast(r.next_step || '通道已重置为 pending,请用微信给 bot 发一条消息触发激活')
+      } else if (r?.outcome === 'already_active') {
+        toast('通道已是 active,无需重新激活', 'info')
+      } else if (r?.outcome === 'already_pending') {
+        toast('通道已是 pending,worker 将在下轮 tick 尝试 long-poll', 'info')
+      } else {
+        toast('重新激活请求已处理')
+      }
       _refreshAlertChannels()
     } else if (act === 'edit') {
       await _openEditChannelModal(id)

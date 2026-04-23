@@ -286,7 +286,18 @@ export async function markSent(id: string | number | bigint): Promise<void> {
   );
 }
 
-/** 指数退避:attempts+1 后,next = now + min(60s * 2^(attempts), 30min)。 */
+/**
+ * 指数退避 + jitter:attempts+1 后,
+ *   next = now + min(60s * 2^attempts, 30min) * (0.8 + random()*0.4)
+ *
+ * jitter(±20%)用来打散"同一时刻一批告警同时 fail → 同秒重试"的 thundering herd:
+ * iLink 侧 5xx 恢复后 N 条 failed 一起到期会瞬间打回去一次,再失败再同步。
+ * 乘一个 [0.8, 1.2) 区间的随机因子,让到期时间在目标值 ±20% 内散开。
+ *
+ * `random()` 每行求值一次(PG 的 VOLATILE 函数语义);不同行会拿到不同随机值,
+ * 即使 attempts 相同也不会撞。上限仍是硬 30min * 1.2 = 36min,实际很少触及
+ * 因为 attempts ≥ 6 时 60s*2^6=64min 已超过 30min,会被 LEAST 钳住。
+ */
 export async function markFailed(id: string | number | bigint, err: string): Promise<void> {
   await query(
     `UPDATE admin_alert_outbox
@@ -296,7 +307,7 @@ export async function markFailed(id: string | number | bigint, err: string): Pro
             next_attempt_at = NOW() + LEAST(
               INTERVAL '60 seconds' * POWER(2, attempts),
               INTERVAL '30 minutes'
-            )
+            ) * (0.8 + random() * 0.4)
       WHERE id = $1 AND status IN ('pending', 'failed')`,
     [String(id), err.slice(0, 1000)],
   );

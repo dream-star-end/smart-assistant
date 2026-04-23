@@ -117,7 +117,15 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
         if (!channelLoops.has(id)) {
           const ctrl = new AbortController();
           channelLoops.set(id, ctrl);
-          void runChannelLongPoll(id, ctrl.signal);
+          // 自清理:runChannelLongPoll 在 session_expired / 其他 return 时
+          // 必须把自己从 map 里摘掉,否则下轮 syncChannelLoops 看到 desired.has(id)
+          // + channelLoops.has(id) 会以为还在跑,跳过重启,导致 admin 重新激活
+          // (error→pending)后 worker 永远不会回到 long-poll。
+          // `=== ctrl` 防御性检查:万一将来谁在外部 stop 并替换了 entry,
+          // 不把别人的 ctrl 抹掉。
+          void runChannelLongPoll(id, ctrl.signal).finally(() => {
+            if (channelLoops.get(id) === ctrl) channelLoops.delete(id);
+          });
         }
       }
     } catch (err) {
@@ -163,7 +171,14 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
       const ret = Number((resp as { ret?: number })?.ret ?? 0);
       if (errcode === ILINK_SESSION_EXPIRED || ret === ILINK_SESSION_EXPIRED) {
         await markChannelError(channelId, "iLink session expired (errcode=-14)", true).catch(() => {});
-        // 会话过期 → 通道变 error,轮询退出,管理员需重新扫码
+        // 会话过期 → 通道变 error,轮询退出,管理员需重新扫码 / rebind
+        //
+        // 这里显式 skip 该 channel 的 pending outbox:
+        // 本函数 finally 里会自删 channelLoops entry(见 syncChannelLoops),
+        // 所以下一轮 sync 的"离场分支"不会再看到 entry,也就不会帮忙 skip。
+        // 不 skip 的话 dispatcher 会把 pending 行反复打回 failed 直到 attempts 用完,
+        // 还会占着 partial-unique dedupe 位让新告警丢条。
+        try { await skipPendingForChannel(channelId); } catch (err) { onError("skipPending(session_expired)", err); }
         return;
       }
 

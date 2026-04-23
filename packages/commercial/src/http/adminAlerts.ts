@@ -16,6 +16,7 @@
  *     PATCH  /api/admin/alerts/channels/:id               改 label/enabled/severity_min/event_types
  *     DELETE /api/admin/alerts/channels/:id               删
  *     POST   /api/admin/alerts/channels/:id/test          往该通道发测试告警(enqueueAlert path)
+ *     POST   /api/admin/alerts/channels/:id/rebind        activation_status=error → pending(worker 重新 long-poll,不重扫码)
  *     POST   /api/admin/alerts/silences                   建静默
  *     DELETE /api/admin/alerts/silences/:id               撤静默
  *
@@ -36,6 +37,7 @@ import {
   patchAlertChannel,
   deleteAlertChannel,
   getAlertChannel,
+  reactivateChannel,
   ChannelNotFoundError,
   type AlertChannelRow,
   type Severity,
@@ -362,22 +364,27 @@ export async function handleAdminAlertsDeleteChannel(
   sendJson(res, 200, { deleted: true });
 }
 
-// ─── POST /api/admin/alerts/channels/:id/test ─────────────────────────
+// ─── POST /api/admin/alerts/channels/:id/{test,rebind} ────────────────
 //
-// 发一条测试告警到该 channel —— 走 enqueueAlert 路径(insert outbox)。dispatcher
-// 5s 内捞出 → iLink 发送。前端 modal 提示"几秒后检查微信 / outbox"。
+// router 层所有 POST /api/admin/alerts/channels/ 都进这个 dispatcher,根据
+// 后缀分派:
+//   - /test   → 测试告警(enqueueAlert path)
+//   - /rebind → 重新激活(error → pending,让 worker 重新 long-poll)
 //
-// 为什么不直接 sendIlinkText:
-//   - 要覆盖完整链路(AEAD 解密 / long-poll 状态 / dispatcher)
-//   - outbox 行能让 admin 在 UI 看到结果(status=sent/failed)
+// 为什么在 handler 层分派:router 的 path-prefix 匹配是"同 method 取第一条",
+// 不支持多个 POST 共享同一 prefix。集中在这里做后缀分派避免改 router 框架。
 export async function handleAdminAlertsTestChannel(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = urlOf(req);
+  if (url.pathname.endsWith("/rebind")) {
+    return _handleRebindChannel(req, res, ctx, deps);
+  }
+  // default: /test
+  await requireAdminVerifyDb(req, deps.jwtSecret);
   const id = extractChannelId(url, "/api/admin/alerts/channels/", "/test");
   const ch = await getAlertChannel(id);
   if (!ch) throw new HttpError(404, "NOT_FOUND", "channel not found");
@@ -414,6 +421,63 @@ export async function handleAdminAlertsTestChannel(
     enqueued: result.enqueued,
     note: "dispatcher will send within ~5s; check outbox row status or your WeChat",
   });
+}
+
+// ─── POST /api/admin/alerts/channels/:id/rebind ───────────────────────
+//
+// 把 activation_status='error' 的通道推回 'pending',让 ilinkAlertWorker
+// 下轮 tick 重新 long-poll。不重新扫码、不换 bot_token 。
+//
+// **幂等**:无论当前状态是 error / active / pending 都返 200,携 outcome 让
+// 前端自己决定 toast 文案。这样多 tab 同时点、或 UI 看到 stale error 实际
+// worker 已自愈都不会误报失败。
+//
+// 请求无 body。响应:
+//   - 200 { outcome: 'reactivated', channel, next_step }
+//     真正做了 error→pending 转换,next_step 告诉 admin 要发条微信消息触发升级。
+//   - 200 { outcome: 'already_active' | 'already_pending', channel }
+//     no-op:通道已处于目标状态,幂等返回,caller 看 outcome 决定是否 toast。
+//   - 409 CHANNEL_DISABLED — 通道 enabled=false,需先启用
+//   - 404 NOT_FOUND — 通道不存在
+async function _handleRebindChannel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const url = urlOf(req);
+  const id = extractChannelId(url, "/api/admin/alerts/channels/", "/rebind");
+  const result = await reactivateChannel({
+    id,
+    adminId: admin.id,
+    ip: ctx.clientIp,
+    userAgent: ctx.userAgent,
+  });
+  if (result.outcome === "not_found") {
+    throw new HttpError(404, "NOT_FOUND", `channel ${id} not found`);
+  }
+  if (result.outcome === "disabled") {
+    throw new HttpError(409, "CHANNEL_DISABLED", `channel ${id} is disabled`, {
+      issues: [
+        {
+          path: "enabled",
+          message: "通道已停用,请先启用再重新激活",
+        },
+      ],
+    });
+  }
+  // reactivated / already_active / already_pending — 全部 200,前端按 outcome 分支
+  const body: Record<string, unknown> = {
+    outcome: result.outcome,
+    channel: result.channel,
+  };
+  if (result.outcome === "reactivated") {
+    body.next_step =
+      "通道已重置为 pending。请用已绑定的微信号向机器人发一条消息,worker 会抓新 context_token 自动升级 active。" +
+      "若重试仍回落 error,说明 bot_token 已失效,需删除通道后重新扫码绑定。";
+  }
+  sendJson(res, 200, body);
 }
 
 // ─── GET /api/admin/alerts/outbox ────────────────────────────────────

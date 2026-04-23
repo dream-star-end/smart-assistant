@@ -477,11 +477,17 @@ export async function markChannelError(
   sessionExpired = false,
 ): Promise<void> {
   if (sessionExpired) {
+    // session_expired (iLink errcode=-14) 有两种触发:
+    //   1. context_token 过期 → 清 context_token 即可,bot_token 仍能 long-poll
+    //   2. get_updates_buf (cursor) 过期 → 带旧 cursor 再 poll 会立刻再次 -14
+    // 无法区分是哪种,保险起见两个都清。否则 admin 重新激活 (error→pending)
+    // 后 worker 再次 getUpdates 会立刻再收 -14,再次降级 error,rebind 无效。
     await query(
       `UPDATE admin_alert_channels SET
          last_error = $2,
          activation_status = 'error',
          context_token = NULL,
+         get_updates_buf = '',
          updated_at = NOW()
        WHERE id = $1`,
       [String(id), err.slice(0, 500)],
@@ -495,6 +501,106 @@ export async function markChannelError(
       [String(id), err.slice(0, 500)],
     );
   }
+}
+
+export interface ReactivateChannelInput {
+  id: string | number | bigint;
+  adminId: bigint | number | string;
+  ip?: string | null;
+  userAgent?: string | null;
+}
+
+export type ReactivateOutcome =
+  /** 本次把 activation_status=error 推回 pending,worker 下轮 tick 会重新 long-poll */
+  | "reactivated"
+  /** 已经是 active/pending,无操作 */
+  | "already_active"
+  | "already_pending"
+  /** disabled (enabled=false),必须先启用 */
+  | "disabled"
+  /** 通道不存在 */
+  | "not_found";
+
+export interface ReactivateChannelResult {
+  outcome: ReactivateOutcome;
+  channel: AlertChannelRow | null;
+}
+
+/**
+ * 把 activation_status='error' 的通道推回 pending —— 让 ilinkAlertWorker
+ * 下轮 tick 重新 long-poll。**不换 bot_token**:
+ *   - 大多数 session_expired 只是 context_token / get_updates_buf 过期,
+ *     bot_token 本身还能用;重新 long-poll 一条 inbound 就能自动升级 active
+ *     (updateChannelInbound 的 CASE 把 pending/error 都翻成 active)。
+ *   - 如果 bot_token 真被 revoke,worker 会再次 markChannelError 降 error,
+ *     此时 admin 才需要删掉通道重新扫码。
+ *
+ * 只对 activation_status='error' 生效;active/pending/disabled 都不改,只返
+ * 相应 outcome。caller(HTTP handler)根据 outcome 发 toast。
+ *
+ * 幂等 —— tx + FOR UPDATE,多 tab 同时点不会重入。
+ */
+export async function reactivateChannel(
+  input: ReactivateChannelInput,
+): Promise<ReactivateChannelResult> {
+  return tx(async (client: PoolClient) => {
+    const sel = await client.query<Record<string, unknown>>(
+      `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels
+        WHERE id = $1::bigint FOR UPDATE`,
+      [String(input.id)],
+    );
+    if (sel.rows.length === 0) {
+      return { outcome: "not_found", channel: null };
+    }
+    const cur = rowToView(sel.rows[0]);
+    if (!cur.enabled) {
+      return { outcome: "disabled", channel: cur };
+    }
+    if (cur.activation_status === "active") {
+      return { outcome: "already_active", channel: cur };
+    }
+    if (cur.activation_status === "pending") {
+      return { outcome: "already_pending", channel: cur };
+    }
+    // 到这只剩 'error'(schema check 保证集合)
+    const upd = await client.query<Record<string, unknown>>(
+      `UPDATE admin_alert_channels SET
+         activation_status = 'pending',
+         last_error = NULL,
+         updated_at = NOW(),
+         updated_by = $2::bigint
+       WHERE id = $1::bigint
+         AND activation_status = 'error'
+       RETURNING ${SELECT_COLUMNS}`,
+      [String(input.id), String(input.adminId)],
+    );
+    if (upd.rows.length === 0) {
+      // 并发窗口:另一 tx 已改走;重读返回当前状态
+      const re = await client.query<Record<string, unknown>>(
+        `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels WHERE id = $1::bigint`,
+        [String(input.id)],
+      );
+      const again = rowToView(re.rows[0]);
+      return {
+        outcome: again.activation_status === "pending" ? "already_pending" : "already_active",
+        channel: again,
+      };
+    }
+    const row = rowToView(upd.rows[0]);
+    await writeAdminAudit(client, {
+      adminId: input.adminId,
+      action: "alert_channel.reactivate",
+      target: `channel:${row.id}`,
+      after: {
+        previous_status: "error",
+        new_status: "pending",
+        label: row.label,
+      },
+      ip: input.ip ?? null,
+      userAgent: input.userAgent ?? null,
+    });
+    return { outcome: "reactivated", channel: row };
+  });
 }
 
 /** dispatcher / worker 扫:enabled + activation_status=active 的通道。 */
