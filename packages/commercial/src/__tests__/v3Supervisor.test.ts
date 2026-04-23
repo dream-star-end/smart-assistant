@@ -397,6 +397,13 @@ describe("provisionV3Container", () => {
     const epc = opts.NetworkingConfig?.EndpointsConfig?.[V3_NETWORK_NAME];
     assert.equal(epc?.IPAMConfig?.IPv4Address, IP);
 
+    // 资源硬限额:默认 2GB / 1 核 / 1024 pids(env 未设,走 DEFAULT_V3_*)
+    assert.equal(opts.HostConfig?.Memory, 2048 * 1024 * 1024);
+    assert.equal(opts.HostConfig?.MemorySwap, 2048 * 1024 * 1024, "MemorySwap 必须 == Memory 禁 swap");
+    assert.equal(opts.HostConfig?.MemorySwappiness, 0);
+    assert.equal(opts.HostConfig?.NanoCpus, 1_000_000_000, "1.0 CPU = 1e9 ns");
+    assert.equal(opts.HostConfig?.PidsLimit, 1024);
+
     // cap-drop NET_RAW + NET_ADMIN
     assert.deepEqual(opts.HostConfig?.CapDrop, ["NET_RAW", "NET_ADMIN"]);
     assert.deepEqual(opts.HostConfig?.CapAdd, []);
@@ -427,6 +434,52 @@ describe("provisionV3Container", () => {
 
     // start 成功
     assert.equal(captured.started, 1);
+  });
+
+  test("资源限额 env 覆盖:合法小数 CPU 正确转换 + 非法微值回退默认(Codex round 1 BLOCKER 回归锁)", async () => {
+    // Codex round 1 抓到的 bug:OC_V3_MEMORY_MB=0.5 会被 floor 成 0,Docker 当"不限";必须回退默认
+    const savedMem = process.env.OC_V3_MEMORY_MB;
+    const savedCpu = process.env.OC_V3_CPUS;
+    const savedPid = process.env.OC_V3_PIDS_LIMIT;
+    try {
+      // 1) 微值(floor 后为 0)→ 回退默认,绝不传 0 给 Docker
+      process.env.OC_V3_MEMORY_MB = "0.5";
+      process.env.OC_V3_CPUS = "1e-10";
+      process.env.OC_V3_PIDS_LIMIT = "0.5";
+      {
+        const { docker, captured } = makeDocker();
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.9.1", randomSecret: fixedSecret("c".repeat(64)) },
+          901,
+        );
+        const hc = captured.containersCreated[0]!.HostConfig!;
+        assert.equal(hc.Memory, 2048 * 1024 * 1024, "floor 后 <1 必须回退 DEFAULT_V3_MEMORY_MB,不能传 0");
+        assert.equal(hc.NanoCpus, 1_000_000_000, "floor 后 <1 ns 必须回退 DEFAULT_V3_CPUS");
+        assert.equal(hc.PidsLimit, 1024, "floor 后 <1 必须回退 DEFAULT_V3_PIDS_LIMIT");
+      }
+
+      // 2) 合法小数 CPU 正确换算:0.5 核 → 5e8 ns
+      pool = new FakePool();
+      delete process.env.OC_V3_MEMORY_MB;
+      process.env.OC_V3_CPUS = "0.5";
+      delete process.env.OC_V3_PIDS_LIMIT;
+      {
+        const { docker, captured } = makeDocker();
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.9.2", randomSecret: fixedSecret("d".repeat(64)) },
+          902,
+        );
+        const hc = captured.containersCreated[0]!.HostConfig!;
+        assert.equal(hc.NanoCpus, 500_000_000, "0.5 核 == 500_000_000 ns");
+      }
+    } finally {
+      if (savedMem === undefined) delete process.env.OC_V3_MEMORY_MB;
+      else process.env.OC_V3_MEMORY_MB = savedMem;
+      if (savedCpu === undefined) delete process.env.OC_V3_CPUS;
+      else process.env.OC_V3_CPUS = savedCpu;
+      if (savedPid === undefined) delete process.env.OC_V3_PIDS_LIMIT;
+      else process.env.OC_V3_PIDS_LIMIT = savedPid;
+    }
   });
 
   test("agent_containers row: bound_ip + secret_hash(SHA256 BYTEA) + state=active + container_internal_id", async () => {

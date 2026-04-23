@@ -349,6 +349,52 @@ const V3_IP_ALLOC_MAX_ATTEMPTS = 30;
  */
 export const DEFAULT_MAX_RUNNING_CONTAINERS = 50;
 
+/**
+ * v3 容器资源硬限额默认值。env 可覆盖:
+ *   - OC_V3_MEMORY_MB   → DEFAULT_V3_MEMORY_MB
+ *   - OC_V3_CPUS        → DEFAULT_V3_CPUS(小数,0.5=半核)
+ *   - OC_V3_PIDS_LIMIT  → DEFAULT_V3_PIDS_LIMIT
+ *
+ * 非法值(NaN / 非数字 / ≤0 / floor 后 <1)一律回退默认,不抛。选值理由:
+ *   - Memory 2048 MB:v3 容器内跑 CCB + node + streaming + 用户工具 + skill 基线,
+ *     v2 的 384MB 对 v3 场景不够;2GB 给大模型上下文与编译留余量
+ *   - CPUs 1.0 核:交互式 agent 够用;峰值由 idle sweep 30min 回收兜底
+ *   - PidsLimit 1024:防 fork bomb;正常进程树 < 100,1024 有 10× 缓冲
+ */
+export const DEFAULT_V3_MEMORY_MB = 2048;
+export const DEFAULT_V3_CPUS = 1.0;
+export const DEFAULT_V3_PIDS_LIMIT = 1024;
+
+/**
+ * 解析 v3 容器资源限额。env 覆盖 + 非法值回退默认。
+ *
+ * 关键护栏(Codex round 1 BLOCKER):必须先 Math.floor 再要求 >=1,否则
+ * OC_V3_MEMORY_MB=0.5 / OC_V3_CPUS=1e-10 / OC_V3_PIDS_LIMIT=0.5 会被 floor 到 0,
+ * Docker 把 0 解读为"不限",跟修复目标直接冲突。
+ */
+function resolveV3ResourceLimits(): {
+  memoryBytes: number;
+  nanoCpus: number;
+  pidsLimit: number;
+} {
+  const MIB = 1024 * 1024;
+  const NANO_CPU = 1_000_000_000;
+
+  const memEnv = Number(process.env.OC_V3_MEMORY_MB);
+  const memMbFloored = Number.isFinite(memEnv) ? Math.floor(memEnv) : Number.NaN;
+  const memMb = memMbFloored >= 1 ? memMbFloored : DEFAULT_V3_MEMORY_MB;
+
+  const cpuEnv = Number(process.env.OC_V3_CPUS);
+  const nanoCpusRaw = Number.isFinite(cpuEnv) ? Math.floor(cpuEnv * NANO_CPU) : Number.NaN;
+  const nanoCpus = nanoCpusRaw >= 1 ? nanoCpusRaw : Math.floor(DEFAULT_V3_CPUS * NANO_CPU);
+
+  const pidsEnv = Number(process.env.OC_V3_PIDS_LIMIT);
+  const pidsFloored = Number.isFinite(pidsEnv) ? Math.floor(pidsEnv) : Number.NaN;
+  const pidsLimit = pidsFloored >= 1 ? pidsFloored : DEFAULT_V3_PIDS_LIMIT;
+
+  return { memoryBytes: memMb * MIB, nanoCpus, pidsLimit };
+}
+
 /** 读 env `OC_MAX_RUNNING_CONTAINERS`;非法值 → 落回默认 50 */
 function readMaxRunningContainersFromEnv(): number {
   const raw = process.env.OC_MAX_RUNNING_CONTAINERS;
@@ -946,6 +992,9 @@ export async function provisionV3Container(
       );
     }
 
+    // v3 容器资源硬限额(Memory / NanoCpus / PidsLimit)。env 覆盖见 resolveV3ResourceLimits。
+    const { memoryBytes, nanoCpus, pidsLimit } = resolveV3ResourceLimits();
+
     let container;
     try {
       container = await deps.docker.createContainer({
@@ -974,6 +1023,13 @@ export async function provisionV3Container(
         },
         HostConfig: {
           NetworkMode: V3_NETWORK_NAME,
+          // 资源硬限额 — 单容器吃不光宿主;env OC_V3_MEMORY_MB / OC_V3_CPUS / OC_V3_PIDS_LIMIT 覆盖
+          Memory: memoryBytes,
+          // MemorySwap == Memory → 禁 swap;不设 docker 会默认配 2×Memory
+          MemorySwap: memoryBytes,
+          MemorySwappiness: 0,
+          NanoCpus: nanoCpus,
+          PidsLimit: pidsLimit,
           // §9.3 cap-drop NET_RAW + NET_ADMIN(防 raw socket 伪造源 IP / 改路由)
           CapDrop: ["NET_RAW", "NET_ADMIN"],
           CapAdd: [],
