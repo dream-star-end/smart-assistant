@@ -2,7 +2,7 @@ import { apiGet, apiJson } from './api.js'
 // OpenClaude — Memory + Skills
 import { $, htmlSafeEscape } from './dom.js'
 import { getSession, state } from './state.js'
-import { closeModal, openModal, toast } from './ui.js'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js'
 
 let _memoryTab = 'memory'
 
@@ -27,7 +27,7 @@ export async function loadMemoryTab(target, agentId) {
     $('memory-label').innerHTML =
       `${target === 'memory' ? 'MEMORY.md (我的观察)' : 'USER.md (用户画像)'} — <span id="memory-count">${data.charCount ?? 0}</span> chars`
   } catch (err) {
-    toast(String(err), 'error')
+    toast(String(err), 'error', toastOptsFromError(err))
   }
 }
 
@@ -40,7 +40,7 @@ export async function saveMemory() {
     toast('已保存', 'success')
     closeModal('memory-modal')
   } catch (err) {
-    toast(String(err), 'error')
+    toast(String(err), 'error', toastOptsFromError(err))
   }
 }
 
@@ -98,7 +98,7 @@ export async function openSkillsModal(agentId) {
           toast('已删除')
           await openSkillsModal(id)
         } catch (err) {
-          toast(String(err), 'error')
+          toast(String(err), 'error', toastOptsFromError(err))
         }
       }
       row.appendChild(info)

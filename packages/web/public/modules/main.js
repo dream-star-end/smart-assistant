@@ -43,7 +43,7 @@ import {
 } from './markdown.js'
 
 // ── UI helpers ──
-import { closeLightbox, closeModal, openLightbox, openModal, toast } from './ui.js'
+import { closeLightbox, closeModal, openLightbox, openModal, toast, toastOptsFromError } from './ui.js'
 
 // ── Attachments ──
 import {
@@ -391,24 +391,42 @@ function _showErrorToastOnce(errLike, msg) {
   toast(`出错了: ${sig}`, 'error')
 }
 
+// 2026-04-23 改造:全局 handler 加结构化上下文。
+// toast 仍走 _shouldSuppressError 原有静默规则(AbortError/TimeoutError 不骚扰
+// 用户,因为调用方通常自己处理了 inline UI),但 console.error 一律详尽打印
+// —— 这样 F12 截图就是可用工单,运维看得到"是超时还是 JS 异常"。
 window.addEventListener('error', (ev) => {
-  // ev.error is the raw Error for scripts we own; ev.message is the display
-  // string the browser already computed. Prefer ev.error.message when available.
   const msg = ev.error?.message || ev.message || '未知脚本错误'
-  // Full details to console for debugging — NOT muted by the toast guard.
-  console.error('[global error]', ev.error || ev)
+  try {
+    console.error('[global error]', {
+      message: msg,
+      name: ev.error?.name,
+      filename: ev.filename,
+      lineno: ev.lineno,
+      colno: ev.colno,
+      stack: ev.error?.stack,
+    })
+  } catch { console.error('[global error]', ev.error || ev) }
   _showErrorToastOnce(ev.error, msg)
 })
 
 window.addEventListener('unhandledrejection', (ev) => {
   const reason = ev.reason
-  // Prefer Error.message, fall back to String(reason). Some code rejects with
-  // a plain object {error: "..."} — dig a level.
   const msg = reason?.message
     || reason?.error
     || (typeof reason === 'string' ? reason : null)
     || '未处理的异步错误'
-  console.error('[unhandled rejection]', reason)
+  try {
+    console.error('[unhandled rejection]', {
+      message: msg,
+      name: reason?.name,
+      // 如果 reason 是 Error 抛自 api.js,它带 e.status/code/requestId —— 打进 log
+      status: reason?.status,
+      code: reason?.code,
+      requestId: reason?.requestId,
+      stack: reason?.stack,
+    })
+  } catch { console.error('[unhandled rejection]', reason) }
   _showErrorToastOnce(reason, msg)
 })
 
@@ -1647,7 +1665,7 @@ async function submitFeedback() {
       toast(resp.error || '提交失败', 'error')
     }
   } catch (err) {
-    toast('提交失败: ' + String(err), 'error')
+    toast('提交失败: ' + String(err), 'error', toastOptsFromError(err))
   } finally {
     btn.disabled = false
     btn.textContent = '提交反馈'
@@ -1967,7 +1985,7 @@ async function init() {
       toast(`已创建 ${id}`, 'success')
       await reloadAgents()
     } catch (err) {
-      toast(String(err), 'error')
+      toast(String(err), 'error', toastOptsFromError(err))
     }
   }
   // Persona model preset syncs to free-text field

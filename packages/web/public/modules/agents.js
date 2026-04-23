@@ -3,7 +3,7 @@ import { apiGet, apiJson } from './api.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { renderModePills } from './effortMode.js'
 import { getSession, state } from './state.js'
-import { closeModal, openModal, toast } from './ui.js'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js'
 
 export async function reloadAgents() {
   try {
@@ -152,7 +152,7 @@ export async function openPersonaEditor(agentId) {
         closeModal('persona-modal')
         await reloadAgents()
       } catch (err) {
-        toast(String(err), 'error')
+        toast(String(err), 'error', toastOptsFromError(err))
       }
     }
     $('save-persona-btn').onclick = async () => {
@@ -179,11 +179,11 @@ export async function openPersonaEditor(agentId) {
         closeModal('persona-modal')
         await reloadAgents()
       } catch (err) {
-        toast(String(err), 'error')
+        toast(String(err), 'error', toastOptsFromError(err))
       }
     }
     openModal('persona-modal')
   } catch (err) {
-    toast(String(err), 'error')
+    toast(String(err), 'error', toastOptsFromError(err))
   }
 }

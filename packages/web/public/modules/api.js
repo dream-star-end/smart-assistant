@@ -69,39 +69,69 @@ function _composeSignal(userSignal, timeoutMs) {
   }
 }
 
-function _httpError(label, status, msg, code, issues) {
+function _httpError(label, status, msg, code, issues, requestId) {
   const e = new Error(msg ? `${label} failed: ${status} ${msg}` : `${label} failed: ${status}`)
   e.status = status
   if (code) e.code = code
   if (issues) e.issues = issues
+  if (requestId) e.requestId = requestId
   return e
 }
 
 // 后端标准错误体: { error: { code, message, request_id, issues? } }
 // 旧/legacy 兼容: { error: string } 或 { message: string }
+//
+// requestId 从 2026-04-23 前端改造开始 end-to-end 打通 —— catch 分支 e.requestId
+// 可直接塞进 toast 尾徽章,用户点一下就复制,运维用这串能精确回 grep journalctl。
 function _readStdError(d) {
-  if (!d || typeof d !== 'object') return { code: undefined, message: undefined, issues: undefined }
-  // 标准格式
+  if (!d || typeof d !== 'object') {
+    return { code: undefined, message: undefined, issues: undefined, requestId: undefined }
+  }
   if (d.error && typeof d.error === 'object') {
     return {
       code: typeof d.error.code === 'string' ? d.error.code : undefined,
       message: typeof d.error.message === 'string' ? d.error.message : undefined,
       issues: Array.isArray(d.error.issues) ? d.error.issues : undefined,
+      requestId: typeof d.error.request_id === 'string' ? d.error.request_id : undefined,
     }
   }
-  // legacy 字符串 error
-  if (typeof d.error === 'string') return { code: undefined, message: d.error, issues: undefined }
-  if (typeof d.message === 'string') return { code: undefined, message: d.message, issues: undefined }
-  return { code: undefined, message: undefined, issues: undefined }
+  if (typeof d.error === 'string') {
+    return { code: undefined, message: d.error, issues: undefined, requestId: undefined }
+  }
+  if (typeof d.message === 'string') {
+    return { code: undefined, message: d.message, issues: undefined, requestId: undefined }
+  }
+  return { code: undefined, message: undefined, issues: undefined, requestId: undefined }
 }
 
-async function _extractErrorMessage(res) {
+// 诊断面包屑环形 buffer:前端最近 N 条 API 错误,用于"复制诊断信息"按钮
+// dump 给 admin。裸 Error.message 不够,这里带完整 route/status/code/requestId。
+// WS 帧解析/派发异常只打 console.warn —— 为避免把 outbound.message 里的用户输入
+// /模型输出误入诊断 dump,目前不接入 _diagBuffer(见 websocket.js onmessage)。
+const _DIAG_MAX = 50
+const _diagBuffer = []
+function _pushDiag(entry) {
+  _diagBuffer.push({ ts: Date.now(), ...entry })
+  if (_diagBuffer.length > _DIAG_MAX) _diagBuffer.shift()
+}
+export function snapshotDiagnostics() {
+  return _diagBuffer.slice()
+}
+
+// 统一结构化 log:non-2xx 路径都走这里,前端 F12 截图即可作为工单线索。
+function _logApiError(ctx) {
+  try {
+    console.error('[api]', ctx)
+  } catch {}
+  _pushDiag({ kind: 'api', ...ctx })
+}
+
+async function _readStdErrorFromRes(res) {
   try {
     const d = await res.clone().json()
-    const std = _readStdError(d)
-    return std.message ?? std.code
+    return _readStdError(d)
   } catch {
-    return undefined
+    return { code: undefined, message: undefined, issues: undefined, requestId: undefined }
   }
 }
 
@@ -360,10 +390,38 @@ export async function apiFetch(path, init = {}) {
 export async function apiGet(path, opts = {}) {
   const res = await apiFetch(path, { ...opts, headers: authHeaders(opts.headers) })
   if (!res.ok) {
-    const msg = await _extractErrorMessage(res)
-    throw _httpError(`GET ${path}`, res.status, msg)
+    const std = await _readStdErrorFromRes(res)
+    _logApiError({
+      route: path,
+      method: 'GET',
+      status: res.status,
+      code: std.code,
+      requestId: std.requestId,
+      message: std.message,
+    })
+    throw _httpError(`GET ${path}`, res.status, std.message ?? std.code, std.code, std.issues, std.requestId)
   }
   return res.json()
+}
+
+// 同 apiGet,但响应体读成 text —— /api/admin/metrics 这种 Prometheus 格式走这里。
+// 过去 health 页直接 apiFetch + `throw new Error("HTTP " + status)`,rich error
+// (code / request_id)全丢,toast 尾徽章拿不到 reqId。codex R2 #2 要求改走 std 路径。
+export async function apiText(path, opts = {}) {
+  const res = await apiFetch(path, { ...opts, headers: authHeaders(opts.headers) })
+  if (!res.ok) {
+    const std = await _readStdErrorFromRes(res)
+    _logApiError({
+      route: path,
+      method: 'GET',
+      status: res.status,
+      code: std.code,
+      requestId: std.requestId,
+      message: std.message,
+    })
+    throw _httpError(`GET ${path}`, res.status, std.message ?? std.code, std.code, std.issues, std.requestId)
+  }
+  return res.text()
 }
 
 export async function apiJson(method, path, body, opts = {}) {
@@ -376,7 +434,15 @@ export async function apiJson(method, path, body, opts = {}) {
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     const std = _readStdError(data)
-    throw _httpError(`${method} ${path}`, res.status, std.message ?? std.code, std.code, std.issues)
+    _logApiError({
+      route: path,
+      method,
+      status: res.status,
+      code: std.code,
+      requestId: std.requestId,
+      message: std.message,
+    })
+    throw _httpError(`${method} ${path}`, res.status, std.message ?? std.code, std.code, std.issues, std.requestId)
   }
   return data
 }

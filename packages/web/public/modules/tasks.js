@@ -1,7 +1,7 @@
 import { apiGet, apiJson } from './api.js'
 // OpenClaude — Scheduled Tasks
 import { $, htmlSafeEscape } from './dom.js'
-import { closeModal, openModal, toast } from './ui.js'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js'
 import { _cronHuman, shortTime } from './util.js'
 
 let _currentTasksTab = 'cron'
@@ -58,7 +58,7 @@ export async function openTasksModal() {
           })
           await openTasksModal()
         } catch (err) {
-          toast(String(err), 'error')
+          toast(String(err), 'error', toastOptsFromError(err))
         }
       }
       // Delete button
@@ -73,7 +73,7 @@ export async function openTasksModal() {
           toast('已删除')
           await openTasksModal()
         } catch (err) {
-          toast(String(err), 'error')
+          toast(String(err), 'error', toastOptsFromError(err))
         }
       }
       row.appendChild(info)
@@ -140,7 +140,7 @@ export async function loadBgTasks() {
           await apiJson('POST', `/api/tasks/${encodeURIComponent(t.id)}`)
           toast('任务已触发')
         } catch (err) {
-          toast(String(err), 'error')
+          toast(String(err), 'error', toastOptsFromError(err))
         }
       }
       const del = document.createElement('button')
@@ -154,7 +154,7 @@ export async function loadBgTasks() {
           toast('已删除')
           await loadBgTasks()
         } catch (err) {
-          toast(String(err), 'error')
+          toast(String(err), 'error', toastOptsFromError(err))
         }
       }
       row.appendChild(info)
@@ -228,7 +228,7 @@ export function initTasksListeners() {
       closeModal('add-task-modal')
       await openTasksModal()
     } catch (err) {
-      toast(String(err), 'error')
+      toast(String(err), 'error', toastOptsFromError(err))
     }
   })
 }

@@ -17,7 +17,7 @@
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
 import { state } from './state.js'
-import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired } from './api.js'
+import { apiGet, apiJson, apiText, onAuthExpired } from './api.js'
 import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
@@ -120,16 +120,95 @@ function statusBadge(status) {
   return `<span class="badge ${cls}">${escapeHtml(status)}</span>`
 }
 
-function toast(msg, kind = 'ok', ttl = 3000) {
+/**
+ * admin panel toast
+ *
+ * 2026-04-23 改造:扩签名支持 {code, requestId},与主站 ui.js:toast 同语义 ——
+ * error 态把 `CODE · req:xxxx…` 贴在 msg 下面,req 徽章点击复制。admin 自己
+ * 排障时可直接把 request_id 交给运维去 grep journalctl,不用截 console。
+ */
+function toast(msg, kind = 'ok', optsOrTtl) {
+  let ttl = 3000
+  let opts
+  if (typeof optsOrTtl === 'number') ttl = optsOrTtl
+  else if (optsOrTtl && typeof optsOrTtl === 'object') {
+    opts = optsOrTtl
+    if (typeof opts.ttl === 'number') ttl = opts.ttl
+  }
+  const code = opts?.code
+  const reqId = opts?.requestId
+  // danger/err 类文案带 code|reqId 时延长到 7s
+  if (kind === 'danger' && (code || reqId)) ttl = Math.max(ttl, 7000)
   const el = document.createElement('div')
   el.className = `toast ${kind === 'danger' ? 'danger' : 'ok'}`
-  el.textContent = msg
+  const main = document.createElement('div')
+  main.textContent = msg
+  el.appendChild(main)
+  if (code || reqId) {
+    const trace = document.createElement('div')
+    trace.style.cssText = 'margin-top:4px;font-size:11px;opacity:0.85;display:flex;gap:6px;align-items:center'
+    if (code) {
+      const c = document.createElement('span')
+      c.textContent = String(code)
+      c.style.opacity = '0.75'
+      trace.appendChild(c)
+    }
+    if (reqId) {
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.title = '点击复制 request_id'
+      const label = `req:${String(reqId).slice(0, 8)}…`
+      btn.textContent = label
+      btn.style.cssText = 'background:rgba(0,0,0,0.08);border:1px solid rgba(0,0,0,0.12);color:inherit;cursor:pointer;font-family:var(--font-mono,ui-monospace,monospace);font-size:11px;padding:1px 6px;border-radius:3px'
+      // 注意:按钮只显示截断前缀,真正要复制的是完整 reqId。fallback 必须用
+      // 临时 textarea 托载完整串再 select,不能退回到 selectNodeContents(btn)
+      // —— 那样只会 select 到 "req:xxxxxxxx…"(codex R2 #4)。
+      btn.addEventListener('click', async (ev) => {
+        ev.stopPropagation()
+        const full = String(reqId)
+        const flash = () => {
+          btn.textContent = '已复制'
+          setTimeout(() => { if (btn.isConnected) btn.textContent = label }, 1500)
+        }
+        try {
+          await navigator.clipboard.writeText(full)
+          flash()
+          return
+        } catch {}
+        try {
+          const ta = document.createElement('textarea')
+          ta.value = full
+          ta.setAttribute('readonly', '')
+          ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0'
+          document.body.appendChild(ta)
+          ta.select()
+          ta.setSelectionRange(0, full.length)
+          const ok = document.execCommand && document.execCommand('copy')
+          document.body.removeChild(ta)
+          if (ok) flash()
+        } catch {}
+      })
+      trace.appendChild(btn)
+    }
+    el.appendChild(trace)
+  }
   $('toasts').appendChild(el)
   setTimeout(() => el.remove(), ttl)
 }
 
-function showError(msg) {
-  view().innerHTML = `<div class="error">${escapeHtml(msg)}</div>`
+// e.code / e.requestId 已由 modules/api.js 挂到 Error 对象上,这里一步抽取
+function toastOptsFromError(e) {
+  if (!e) return undefined
+  return { code: e.code, requestId: e.requestId }
+}
+
+function showError(msg, e) {
+  const code = e?.code
+  const reqId = e?.requestId
+  const trace = (code || reqId)
+    ? `<div style="margin-top:6px;font-size:11px;opacity:0.75;font-family:var(--font-mono,ui-monospace,monospace)">${code ? escapeHtml(String(code)) : ''}${code && reqId ? ' · ' : ''}${reqId ? 'req:' + escapeHtml(String(reqId)) : ''}</div>`
+    : ''
+  view().innerHTML = `<div class="error">${escapeHtml(msg)}${trace}</div>`
 }
 
 function setLoading(kind = 'table') {
@@ -197,7 +276,7 @@ async function bootstrap() {
       renderGate('未登录或会话已过期')
       return
     }
-    showError(`加载用户信息失败: ${e.message}`)
+    showError(`加载用户信息失败: ${e.message}`, e)
     return
   }
   const user = me?.user || me
@@ -292,7 +371,7 @@ function applyHash() {
     btn.classList.toggle('active', btn.dataset.tab === tab)
   }
   setLoading()
-  TABS[tab]().catch((e) => showError(`加载失败: ${e.message}`))
+  TABS[tab]().catch((e) => showError(`加载失败: ${e.message}`, e))
 }
 
 // ─── Tab: Dashboard (总览) ──────────────────────────────────────────
@@ -929,7 +1008,7 @@ async function _loadMoreUsers(renderSeq) {
     data = await apiGet(`/api/admin/users?${sp.toString()}`)
   } catch (err) {
     if (renderSeq !== USERS_STATE.renderSeq || _currentTab !== 'users') return
-    toast(`加载失败:${err.message}`, 'danger')
+    toast(`加载失败:${err.message}`, 'danger', toastOptsFromError(err))
     // 首屏失败 → 表格区显示错误态并停用 "加载更多";非首屏保留已有 rows + toast
     if (isFirstPage) {
       const el = $('u-table-container')
@@ -1115,7 +1194,7 @@ function openAdjustCreditsModal(userId) {
         closeModal()
         applyHash()
       } catch (e) {
-        toast(`失败: ${e.message}`, 'danger')
+        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
       }
     })
   })
@@ -1226,7 +1305,7 @@ async function _loadAccounts(renderSeq) {
     data = await apiGet(`/api/admin/accounts?${sp.toString()}`)
   } catch (err) {
     if (renderSeq !== ACCOUNTS_STATE.renderSeq || _currentTab !== 'accounts') return
-    toast(`加载失败:${err.message}`, 'danger')
+    toast(`加载失败:${err.message}`, 'danger', toastOptsFromError(err))
     const el = $('acc-table-container')
     if (el) el.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
     const cnt = $('acc-count'); if (cnt) cnt.textContent = '—'
@@ -1366,7 +1445,7 @@ async function resetAccountCooldown(id, label, btn) {
       _loadAccounts(ACCOUNTS_STATE.renderSeq)
       _loadAccountsKpis(ACCOUNTS_STATE.renderSeq)
     } catch (e) {
-      toast(`释放失败:${e.message}`, 'danger')
+      toast(`释放失败:${e.message}`, 'danger', toastOptsFromError(e))
     }
   })
 }
@@ -1501,7 +1580,7 @@ function openCreateAccountModal() {
         closeModal()
         applyHash()
       } catch (e) {
-        toast(`创建失败: ${e.message}`, 'danger')
+        toast(`创建失败: ${e.message}`, 'danger', toastOptsFromError(e))
       }
     })
   })
@@ -1513,7 +1592,7 @@ async function oauthStartStep() {
   try {
     started = await apiJson('POST', '/api/admin/accounts/oauth/start', {})
   } catch (e) {
-    toast(`OAuth 启动失败: ${e.message}`, 'danger')
+    toast(`OAuth 启动失败: ${e.message}`, 'danger', toastOptsFromError(e))
     return
   }
   const { authUrl, state: oauthState } = started || {}
@@ -1568,7 +1647,7 @@ async function oauthExchangeStep() {
       code, state: _oauthPendingState,
     })
   } catch (e) {
-    toast(`Token 交换失败: ${e.message}`, 'danger')
+    toast(`Token 交换失败: ${e.message}`, 'danger', toastOptsFromError(e))
     failed = true
   } finally {
     if (btn) {
@@ -1596,7 +1675,7 @@ async function openEditAccountModal(id) {
     account = r?.account
     if (!account) throw new Error('未找到账号')
   } catch (e) {
-    toast(`读取失败: ${e.message}`, 'danger'); return
+    toast(`读取失败: ${e.message}`, 'danger', toastOptsFromError(e)); return
   }
   openModal(`
     <h3>编辑账号 #${escapeHtml(account.id)}</h3>
@@ -1618,7 +1697,7 @@ async function openEditAccountModal(id) {
         closeModal()
         applyHash()
       } catch (e) {
-        toast(`保存失败: ${e.message}`, 'danger')
+        toast(`保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
       }
     })
   })
@@ -1632,7 +1711,7 @@ async function deleteAccount(id, label, btn) {
       toast(`#${id} 已删除`)
       applyHash()
     } catch (e) {
-      toast(`删除失败: ${e.message}`, 'danger')
+      toast(`删除失败: ${e.message}`, 'danger', toastOptsFromError(e))
     }
   })
 }
@@ -1737,7 +1816,7 @@ async function _loadContainers(renderSeq) {
     data = await apiGet(`/api/admin/agent-containers?${sp.toString()}`)
   } catch (err) {
     if (renderSeq !== CONTAINERS_STATE.renderSeq || _currentTab !== 'containers') return
-    toast(`加载失败:${err.message}`, 'danger')
+    toast(`加载失败:${err.message}`, 'danger', toastOptsFromError(err))
     const el = $('ct-table-container')
     if (el) el.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
     const cnt = $('ct-count'); if (cnt) cnt.textContent = '—'
@@ -1852,7 +1931,7 @@ async function containerAction(id, action, btn) {
       _loadContainers(CONTAINERS_STATE.renderSeq)
       _loadContainersKpis(CONTAINERS_STATE.renderSeq)
     } catch (e) {
-      toast(`失败: ${e.message}`, 'danger')
+      toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
     }
   })
 }
@@ -2051,7 +2130,7 @@ function openEditPricingModal(modelId, multiplier, enabled) {
         closeModal()
         applyHash()
       } catch (e) {
-        toast(`失败: ${e.message}`, 'danger')
+        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
       }
     })
   })
@@ -2134,7 +2213,7 @@ function openEditPlanModal(d) {
         closeModal()
         applyHash()
       } catch (e) {
-        toast(`失败: ${e.message}`, 'danger')
+        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
       }
     })
   })
@@ -2248,7 +2327,7 @@ async function saveSetting(key, btn) {
       toast(`${key} 已保存`)
       applyHash()
     } catch (e) {
-      toast(`${key} 保存失败: ${e.message}`, 'danger')
+      toast(`${key} 保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
     }
   })
 }
@@ -2405,11 +2484,9 @@ async function renderHealthTab() {
   view().innerHTML = `<div class="loading">正在抓取 /api/admin/metrics …</div>`
   let text
   try {
-    const res = await apiFetch('/api/admin/metrics', { headers: authHeaders() })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    text = await res.text()
+    text = await apiText('/api/admin/metrics')
   } catch (e) {
-    showError(`拉取 metrics 失败: ${e.message}`)
+    showError(`拉取 metrics 失败: ${e.message}`, e)
     return
   }
   const metrics = _parsePromText(text)
@@ -2528,16 +2605,14 @@ async function renderHealthTab() {
   // JS fetch 带 token 拉文本,包成 blob 再新窗口打开。
   $('h-raw')?.addEventListener('click', async () => {
     try {
-      const res = await apiFetch('/api/admin/metrics', { headers: authHeaders() })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const txt = await res.text()
+      const txt = await apiText('/api/admin/metrics')
       const blob = new Blob([txt], { type: 'text/plain; charset=utf-8' })
       const url = URL.createObjectURL(blob)
       window.open(url, '_blank', 'noopener,noreferrer')
       // 让浏览器有足够时间读 URL 再释放
       setTimeout(() => URL.revokeObjectURL(url), 60_000)
     } catch (e) {
-      showError(`拉取 metrics 失败: ${e.message}`)
+      showError(`拉取 metrics 失败: ${e.message}`, e)
     }
   })
 }
@@ -2829,7 +2904,7 @@ async function _handleChannelAction(act, id, btn) {
       await _openEditChannelModal(id)
     }
   } catch (e) {
-    toast(`失败: ${e.message}`, 'danger')
+    toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
   }
 }
 
@@ -2919,7 +2994,7 @@ async function _openEditChannelModal(id) {
         closeModal()
         _refreshAlertChannels()
       } catch (e) {
-        toast(`失败: ${e.message}`, 'danger')
+        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
       }
     })
   })
@@ -3160,7 +3235,7 @@ async function _deleteSilence(id, btn) {
     toast('已撤销')
     _refreshAlertSilences()
   } catch (e) {
-    toast(`失败: ${e.message}`, 'danger')
+    toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
   }
 }
 
@@ -3244,7 +3319,7 @@ function _openCreateSilenceModal() {
         closeModal()
         _refreshAlertSilences()
       } catch (e) {
-        toast(`失败: ${e.message}`, 'danger')
+        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
       }
     })
   })
@@ -3295,5 +3370,5 @@ async function _refreshAlertRuleStates() {
 
 bootstrap().catch((e) => {
   console.error('admin bootstrap failed', e)
-  showError(`bootstrap failed: ${e.message}`)
+  showError(`bootstrap failed: ${e.message}`, e)
 })

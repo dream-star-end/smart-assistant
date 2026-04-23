@@ -885,6 +885,16 @@ export function connect() {
     clearInterval(_wsKeepAlive)
     // Guard: ignore close events from stale sockets (a newer connect() may have replaced state.ws)
     if (state.ws !== ws) return
+    // 2026-04-23 改造:close code + reason 进结构化 log,事后排障能对齐 gateway
+    // 侧 ws_close 日志。之前只有"已断线"三个字 UI 态,用户截图运维无从下手。
+    try {
+      console.warn('[ws] close', {
+        code: e?.code,
+        reason: typeof e?.reason === 'string' ? e.reason.slice(0, 200) : '',
+        wasClean: !!e?.wasClean,
+        reconnectAttempts: _reconnectAttempts,
+      })
+    } catch {}
     if (state._offlineDrainTimer) { clearTimeout(state._offlineDrainTimer); state._offlineDrainTimer = null }
     if (state._drainTimeout) { clearTimeout(state._drainTimeout); state._drainTimeout = null }
     if (state._reconnectInFlightTimer) { clearTimeout(state._reconnectInFlightTimer); state._reconnectInFlightTimer = null; state._reconnectInFlightSet = null }
@@ -1003,12 +1013,43 @@ export function connect() {
     }
     state.reconnectTimer = setTimeout(connect, delay)
   }
-  ws.onerror = () => {}
+  // 2026-04-23 改造:onerror 不再完全吞。WS Error event 本身不带 reason(浏览器
+   // 规范没暴露,onclose 才带),但至少打一条带 readyState 的 warn,让 F12 能
+   // 看到"socket 层出过错"这个信号 —— 之前这行是空函数,完全不可见。
+  ws.onerror = (ev) => {
+    try {
+      console.warn('[ws] error', {
+        readyState: ws?.readyState,
+        // 多数浏览器 event.type 就是 'error',其他字段隐私敏感规范不暴露
+        type: ev?.type,
+        url: ws?.url,
+      })
+    } catch {}
+  }
   ws.onmessage = (ev) => {
     // Guard: ignore messages from stale sockets
     if (state.ws !== ws) return
+    // 拆 parse vs dispatch 两段 try/catch —— 避免把 frame payload 当诊断信息 log 出去。
+    // outbound.message.message 里可能夹用户输入、模型输出、余额、payload 片段,
+    // F12 截图或诊断 dump 泄漏这些是安全事故(codex R2 #3)。
+    // 解析阶段失败:只有这时帧才是"看不见"的,log 长度/前缀长度即可,不落原文。
+    // 派发阶段失败:已拿到结构化对象,只 log 安全字段(type + 键名)+ err。
+    let f
     try {
-      const f = JSON.parse(ev.data)
+      f = JSON.parse(ev.data)
+    } catch (e) {
+      try {
+        const rawLen = typeof ev?.data === 'string'
+          ? ev.data.length
+          : (ev?.data?.byteLength ?? -1)
+        console.warn('[ws] bad frame (parse)', {
+          err: e?.message || String(e),
+          rawLen,
+        })
+      } catch {}
+      return
+    }
+    try {
       if (f.type === 'outbound.message') handleOutbound(f)
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
@@ -1021,7 +1062,15 @@ export function connect() {
           nudgeDrain()
         }
       }
-    } catch {}
+    } catch (e) {
+      try {
+        console.warn('[ws] dispatch failed', {
+          err: e?.message || String(e),
+          type: typeof f?.type === 'string' ? f.type : null,
+          keys: f && typeof f === 'object' ? Object.keys(f).slice(0, 16) : [],
+        })
+      } catch {}
+    }
   }
 }
 export function formatMeta(m) {

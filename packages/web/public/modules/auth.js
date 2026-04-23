@@ -416,7 +416,12 @@ async function _doLogin() {
     if (!r.ok) {
       // 请求已发出,CF token 已被 verify(无论通没通),必须 reset 下次才能拿新 token
       _resetTurnstileFor('login')
-      if (r.status === 403 && data?.error === 'EMAIL_NOT_VERIFIED') {
+      // 2026-04-23 修复:data.error 是对象不是字符串(后端标准 shape),
+      // 之前 `data?.error === 'EMAIL_NOT_VERIFIED'` 永远 false,用户看到泛文案
+      // 而不是"重发验证邮件"入口
+      const errCode =
+        data?.error && typeof data.error === 'object' ? data.error.code : data?.error
+      if (r.status === 403 && errCode === 'EMAIL_NOT_VERIFIED') {
         _showError('邮箱尚未验证 — 请检查收件箱,或点击下方"重发验证邮件"')
         $('auth-login-resend-row').hidden = false
         return
@@ -661,9 +666,35 @@ async function _withBusy(btnId, busyText, fn) {
   }
 }
 
+/**
+ * 从后端响应 body 里抽取友好文案。
+ *
+ * 2026-04-23 修复:之前写的是 `const code = data?.error || ''`,但后端标准错误
+ * shape 是 `{error: {code, message, request_id}}` —— data.error 是对象不是
+ * 字符串,code 永远 = `[object Object]`,所有 switch 分支全走 default,用户看
+ * 到的永远是 `认证失败` / `请求失败(401)` 这种泛文案。TURNSTILE_FAILED /
+ * RATE_LIMITED / EMAIL_NOT_VERIFIED 的友好中文文案全都 dead code。
+ *
+ * 一并兜 legacy 格式(`{error: "CODE_STRING"}` 或 `{message: "..."}`),保持
+ * 向下兼容 —— 旧后端/中转层如果还返老 shape,fallback 仍能抽到 code/message。
+ */
 function _friendlyAuthError(data, status) {
-  const code = data?.error || ''
-  const msg = data?.message || ''
+  let code = ''
+  let msg = ''
+  if (data && typeof data === 'object') {
+    if (data.error && typeof data.error === 'object') {
+      // 后端标准:{ error: { code, message, request_id, issues? } }
+      code = typeof data.error.code === 'string' ? data.error.code : ''
+      msg = typeof data.error.message === 'string' ? data.error.message : ''
+    } else if (typeof data.error === 'string') {
+      // legacy:{ error: "CODE_STRING" }
+      code = data.error
+      msg = typeof data.message === 'string' ? data.message : ''
+    } else if (typeof data.message === 'string') {
+      // legacy:{ message: "..." }
+      msg = data.message
+    }
+  }
   switch (code) {
     case 'INVALID_CREDENTIALS': return '邮箱或密码错误'
     case 'EMAIL_NOT_VERIFIED':  return '邮箱尚未验证,请检查收件箱'
@@ -673,8 +704,8 @@ function _friendlyAuthError(data, status) {
     case 'INVALID_TOKEN':       return '链接已失效或被使用过,请重新获取'
     case 'RATE_LIMITED':        return '操作过于频繁,请稍后再试'
     default:
-      if (status === 401) return '认证失败'
-      if (status === 403) return '无权访问'
+      if (status === 401) return msg || '认证失败'
+      if (status === 403) return msg || '无权访问'
       return msg || code || `请求失败(${status})`
   }
 }
