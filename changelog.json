@@ -1,0 +1,16 @@
+{
+  "currentVersion": "v3-20260423T1451Z-cead231",
+  "releases": [
+    {
+      "version": "v3-20260423T1451Z-cead231",
+      "date": "2026-04-23",
+      "title": "发布机制上线",
+      "items": [
+        "新增 GET /version 端点 — 运维可一键确认当前线上跑哪个 tag / commit",
+        "新增 scripts/smoke-v3.sh — 部署后自动跑 healthz/version/首页/admin/changelog 五项回归",
+        "scripts/deploy-v3.sh 成功发版后自动打 git tag 并推 origin",
+        "changelog 发布流程正式启用 — 以后每次更新都会在设置里可见"
+      ]
+    }
+  ]
+}
