@@ -157,9 +157,12 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
       }
 
       // session expired
-      const code = Number((resp as { ret_code?: number })?.ret_code ?? (resp as { code?: number })?.code ?? 0);
-      if (code === ILINK_SESSION_EXPIRED) {
-        await markChannelError(channelId, "iLink session expired (ret_code=-14)", true).catch(() => {});
+      // iLink /getupdates 错误码实际走 `errcode` 或 `ret` 字段(见
+      // packages/channels/wechat/src/worker.ts:162-183 的范式),不是 ret_code/code。
+      const errcode = Number((resp as { errcode?: number })?.errcode ?? 0);
+      const ret = Number((resp as { ret?: number })?.ret ?? 0);
+      if (errcode === ILINK_SESSION_EXPIRED || ret === ILINK_SESSION_EXPIRED) {
+        await markChannelError(channelId, "iLink session expired (errcode=-14)", true).catch(() => {});
         // 会话过期 → 通道变 error,轮询退出,管理员需重新扫码
         return;
       }
@@ -178,12 +181,22 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
     resp: Record<string, unknown>,
     currentBuf: string,
   ): Promise<void> {
-    const nextBuf =
-      typeof resp.get_updates_buf === "string" ? (resp.get_updates_buf as string) : currentBuf;
-    const updates = Array.isArray(resp.updates) ? (resp.updates as Array<Record<string, unknown>>) : [];
+    // iLink /getupdates 响应真实 schema(见 packages/channels/wechat/src/worker.ts:185-186):
+    //   - 消息数组在 `msgs` 字段(不是 `updates`)
+    //   - 新游标在 `get_updates_buf`;偶尔还会带 `sync_buf`,兜底从它取
+    const rawNextBuf =
+      typeof resp.get_updates_buf === "string" && resp.get_updates_buf.trim()
+        ? (resp.get_updates_buf as string)
+        : typeof (resp as { sync_buf?: unknown }).sync_buf === "string"
+          ? ((resp as { sync_buf: string }).sync_buf)
+          : "";
+    const nextBuf = rawNextBuf.trim() || currentBuf;
+    const msgs = Array.isArray((resp as { msgs?: unknown }).msgs)
+      ? ((resp as { msgs: Array<Record<string, unknown>> }).msgs)
+      : [];
 
     // 没入站消息 → 只刷 buf
-    if (updates.length === 0) {
+    if (msgs.length === 0) {
       if (nextBuf !== currentBuf) {
         await updateChannelBuf(channelId, nextBuf).catch(() => {});
       }
@@ -192,14 +205,13 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
 
     // 取最后一条带 context_token 的 message 做激活;多条时 context_token 之间互相替代
     let lastCtx: { from: string; ctx: string } | null = null;
-    for (const upd of updates) {
-      const msg = (upd as { msg?: Record<string, unknown> }).msg ?? upd;
+    for (const msg of msgs) {
       if (!msg || typeof msg !== "object") continue;
       const ctx = typeof (msg as { context_token?: unknown }).context_token === "string"
-        ? String((msg as { context_token: string }).context_token)
+        ? String((msg as { context_token: string }).context_token).trim()
         : "";
       const from = typeof (msg as { from_user_id?: unknown }).from_user_id === "string"
-        ? String((msg as { from_user_id: string }).from_user_id)
+        ? String((msg as { from_user_id: string }).from_user_id).trim()
         : "";
       if (!ctx || !from) continue;
       lastCtx = { from, ctx };
