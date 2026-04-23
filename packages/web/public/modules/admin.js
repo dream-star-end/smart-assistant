@@ -1131,21 +1131,36 @@ function openAdjustCreditsModal(userId) {
 const ACCOUNT_PLANS = ['pro', 'max', 'team']
 const ACCOUNT_STATUSES = ['active', 'cooldown', 'disabled', 'banned']
 
+// R3 accounts tab 单 tab 状态 —— 结构与 R2 USERS_STATE 对齐。
+// 没有 cursor:账号池总量小(<1k),一次全拉(limit=500),前端 filter。
+const ACCOUNTS_STATE = {
+  renderSeq: 0, loadSeq: 0,
+  rows: [], filterStatus: '',
+}
+
 async function renderAccountsTab() {
-  const filterStatus = sessionStorage.getItem('admin_acc_status') || ''
-  const sp = new URLSearchParams({ limit: '200' })
-  if (filterStatus) sp.set('status', filterStatus)
-  const data = await apiGet(`/api/admin/accounts?${sp.toString()}`)
-  const rows = data?.rows ?? []
+  const mySeq = ++ACCOUNTS_STATE.renderSeq
+  ACCOUNTS_STATE.rows = []
+  ACCOUNTS_STATE.filterStatus = sessionStorage.getItem('admin_acc_status') || ''
+
   view().innerHTML = `
     <div class="panel">
-      <h2>账号池 <small>共 ${rows.length} 条</small></h2>
+      <h1 style="margin-top:0">账号池 <small style="color:var(--muted);font-weight:400;font-size:14px" id="acc-count">加载中…</small></h1>
+
+      <!-- 4 张 KPI 卡片 -->
+      <div class="stat-grid" id="acc-kpis" style="margin-bottom:18px">
+        <div class="stat-card"><div class="stat-label">总账号</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+        <div class="stat-card"><div class="stat-label">可用 / 冷却</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+        <div class="stat-card"><div class="stat-label">OAuth 过期风险</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+        <div class="stat-card"><div class="stat-label">今日请求</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+      </div>
+
       <div class="toolbar">
         <label>状态:
           <select id="acc-status">
             <option value="">全部</option>
             ${ACCOUNT_STATUSES.map((s) =>
-              `<option value="${s}" ${s === filterStatus ? 'selected' : ''}>${s}</option>`,
+              `<option value="${s}" ${s === ACCOUNTS_STATE.filterStatus ? 'selected' : ''}>${s}</option>`,
             ).join('')}
           </select>
         </label>
@@ -1153,49 +1168,207 @@ async function renderAccountsTab() {
         <span class="spacer"></span>
         <button class="btn btn-primary" id="acc-new">+ 新建账号</button>
       </div>
-      ${rows.length === 0
-        ? '<div class="empty">无匹配账号</div>'
-        : `
-        <table class="data">
-          <thead>
-            <tr><th>id</th><th>label</th><th>plan</th><th>状态</th>
-                <th>health</th><th>quota</th><th>egress</th>
-                <th>oauth_exp</th><th>last_used</th>
-                <th class="actions">操作</th></tr>
-          </thead>
-          <tbody>
-            ${rows.map((a) => `
-              <tr>
-                <td class="mono">${escapeHtml(a.id)}</td>
-                <td>${escapeHtml(a.label)}</td>
-                <td>${escapeHtml(a.plan)}</td>
-                <td>${statusBadge(a.status)}</td>
-                <td class="num">${a.health_score ?? '—'}</td>
-                <td class="num">${a.quota_remaining ?? '—'}</td>
-                <td class="mono" title="${escapeHtml(a.egress_proxy || '')}">${escapeHtml(a.egress_proxy || '—')}</td>
-                <td class="mono">${fmtDate(a.oauth_expires_at)}</td>
-                <td class="mono">${fmtDate(a.last_used_at)}</td>
-                <td class="actions">
-                  <button data-act="edit-acc" data-id="${escapeHtml(a.id)}">编辑</button>
-                  <button data-act="del-acc" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}">删除</button>
-                </td>
-              </tr>`).join('')}
-          </tbody>
-        </table>`}
+
+      <div id="acc-table-container"><div class="empty">加载中…</div></div>
     </div>
   `
+  // 先绑事件,避免首次拉数据期间切换/筛选延迟
   $('acc-status').addEventListener('change', (e) => {
+    ACCOUNTS_STATE.filterStatus = e.target.value
     sessionStorage.setItem('admin_acc_status', e.target.value)
-    applyHash()
+    // 首屏条件变化 = 重新一轮
+    renderAccountsTab()
   })
-  $('acc-refresh').addEventListener('click', applyHash)
+  $('acc-refresh').addEventListener('click', () => renderAccountsTab())
   $('acc-new').addEventListener('click', openCreateAccountModal)
-  for (const b of view().querySelectorAll('button[data-act="edit-acc"]')) {
+
+  await Promise.all([
+    _loadAccountsKpis(mySeq),
+    _loadAccounts(mySeq),
+  ])
+}
+
+async function _loadAccountsKpis(renderSeq) {
+  let s
+  try {
+    s = await apiGet('/api/admin/accounts/stats')
+  } catch {
+    if (renderSeq !== ACCOUNTS_STATE.renderSeq || _currentTab !== 'accounts') return
+    const cards = view().querySelectorAll('#acc-kpis .stat-card')
+    for (const c of cards) updateStat(c, '—', '加载失败', 'danger')
+    return
+  }
+  if (renderSeq !== ACCOUNTS_STATE.renderSeq || _currentTab !== 'accounts') return
+
+  const cards = view().querySelectorAll('#acc-kpis .stat-card')
+  updateStat(cards[0], s.total.toLocaleString(),
+    `disabled ${s.disabled} · banned ${s.banned}`,
+    s.banned > 0 ? 'warning' : null)
+  updateStat(cards[1], `${s.active} / ${s.cooldown}`,
+    s.cooldown > 0 ? `有 ${s.cooldown} 个冷却中` : '全部可用',
+    s.cooldown > 0 ? 'warning' : 'success')
+  updateStat(cards[2], `${s.expiring_24h} + ${s.expired}`,
+    `24h 内到期 / 已过期`,
+    (s.expired > 0) ? 'danger' : (s.expiring_24h > 0 ? 'warning' : 'success'))
+  const errRate = s.today_requests > 0 ? s.today_errors / s.today_requests : 0
+  updateStat(cards[3], s.today_requests.toLocaleString(),
+    `错误 ${s.today_errors}(${(errRate * 100).toFixed(1)}%)`,
+    errRate > 0.1 ? 'danger' : errRate > 0.02 ? 'warning' : 'success')
+}
+
+async function _loadAccounts(renderSeq) {
+  const myLoadSeq = ++ACCOUNTS_STATE.loadSeq
+  const sp = new URLSearchParams({ with_stats: '1', limit: '500' })
+  if (ACCOUNTS_STATE.filterStatus) sp.set('status', ACCOUNTS_STATE.filterStatus)
+
+  let data
+  try {
+    data = await apiGet(`/api/admin/accounts?${sp.toString()}`)
+  } catch (err) {
+    if (renderSeq !== ACCOUNTS_STATE.renderSeq || _currentTab !== 'accounts') return
+    toast(`加载失败:${err.message}`, 'danger')
+    const el = $('acc-table-container')
+    if (el) el.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
+    const cnt = $('acc-count'); if (cnt) cnt.textContent = '—'
+    return
+  }
+  if (renderSeq !== ACCOUNTS_STATE.renderSeq || myLoadSeq !== ACCOUNTS_STATE.loadSeq) return
+  if (_currentTab !== 'accounts') return
+
+  ACCOUNTS_STATE.rows = data?.rows ?? []
+  _renderAccountsTable()
+  const cnt = $('acc-count'); if (cnt) cnt.textContent = `共 ${ACCOUNTS_STATE.rows.length} 条`
+}
+
+function _renderAccountsTable() {
+  const el = $('acc-table-container')
+  if (!el) return
+  const rows = ACCOUNTS_STATE.rows
+  if (rows.length === 0) {
+    el.innerHTML = '<div class="empty">无匹配账号</div>'
+    return
+  }
+  el.innerHTML = `
+    <table class="data">
+      <thead>
+        <tr>
+          <th>id</th>
+          <th>label</th>
+          <th>plan</th>
+          <th>状态</th>
+          <th class="num">health</th>
+          <th class="num">今日 / 错误率</th>
+          <th class="num">累计 ok/fail</th>
+          <th>OAuth 到期</th>
+          <th>冷却至</th>
+          <th>最近使用</th>
+          <th>egress</th>
+          <th class="actions">操作</th>
+        </tr>
+      </thead>
+      <tbody>${rows.map(_renderAccountRow).join('')}</tbody>
+    </table>
+  `
+  for (const b of el.querySelectorAll('button[data-act="edit-acc"]')) {
     b.addEventListener('click', () => openEditAccountModal(b.dataset.id))
   }
-  for (const b of view().querySelectorAll('button[data-act="del-acc"]')) {
+  for (const b of el.querySelectorAll('button[data-act="del-acc"]')) {
     b.addEventListener('click', (ev) => deleteAccount(b.dataset.id, b.dataset.label, ev.currentTarget))
   }
+  for (const b of el.querySelectorAll('button[data-act="reset-cooldown"]')) {
+    b.addEventListener('click', (ev) => resetAccountCooldown(b.dataset.id, b.dataset.label, ev.currentTarget))
+  }
+}
+
+// 返回账号的 warning chip 拼好的 HTML 串(放在 label 单元格尾巴)。
+function _accountWarningChips(a) {
+  const chips = []
+  const now = Date.now()
+  if (a.last_error) {
+    chips.push(`<span class="chip chip-danger" title="${escapeHtml(a.last_error)}">最近出错</span>`)
+  }
+  if (a.oauth_expires_at) {
+    const expMs = new Date(a.oauth_expires_at).getTime()
+    if (!Number.isNaN(expMs)) {
+      if (expMs < now) {
+        chips.push(`<span class="chip chip-danger" title="${escapeHtml(fmtDate(a.oauth_expires_at))}">OAuth 已过期</span>`)
+      } else if (expMs - now < 24 * 3600 * 1000) {
+        chips.push(`<span class="chip chip-warn" title="${escapeHtml(fmtDate(a.oauth_expires_at))}">24h 内到期</span>`)
+      }
+    }
+  }
+  if (a.cooldown_until) {
+    const cMs = new Date(a.cooldown_until).getTime()
+    if (!Number.isNaN(cMs) && cMs > now) {
+      chips.push(`<span class="chip chip-warn">冷却中</span>`)
+    }
+  }
+  return chips.length > 0 ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:3px">${chips.join('')}</div>` : ''
+}
+
+function _renderAccountRow(a) {
+  // 累计成功率
+  const okN = Number(a.success_count || 0)
+  const failN = Number(a.fail_count || 0)
+  const totalN = okN + failN
+  const failRate = totalN > 0 ? failN / totalN : 0
+  const failRateChip = totalN > 20
+    ? `<small class="chip chip-${failRate > 0.15 ? 'danger' : failRate > 0.05 ? 'warn' : 'muted'}" style="margin-left:4px;">${(failRate * 100).toFixed(1)}%</small>`
+    : ''
+  // 今日请求 + error rate
+  const todayReq = a.today_requests ?? 0
+  const todayErr = a.today_errors ?? 0
+  const todayErrRate = todayReq > 0 ? todayErr / todayReq : 0
+  const todayChip = todayReq > 0
+    ? `<small class="chip chip-${todayErrRate > 0.1 ? 'danger' : todayErrRate > 0.02 ? 'warn' : 'ok'}" style="margin-left:4px;">${(todayErrRate * 100).toFixed(1)}%</small>`
+    : ''
+  // cooldown chip
+  const cdChip = a.cooldown_until
+    ? (() => {
+        const ms = new Date(a.cooldown_until).getTime() - Date.now()
+        if (Number.isNaN(ms)) return escapeHtml(String(a.cooldown_until))
+        if (ms <= 0) return `<span class="chip chip-muted" title="${escapeHtml(fmtDate(a.cooldown_until))}">已过</span>`
+        const mins = Math.max(1, Math.round(ms / 60000))
+        const label = mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`
+        return `<span class="chip chip-warn" title="${escapeHtml(fmtDate(a.cooldown_until))}">${label}</span>`
+      })()
+    : '—'
+  // cooldown reset 只对 cooldown_until 非空的账号显示
+  const showReset = !!a.cooldown_until
+  return `
+    <tr>
+      <td class="mono">${escapeHtml(a.id)}</td>
+      <td>${escapeHtml(a.label)}${_accountWarningChips(a)}</td>
+      <td>${escapeHtml(a.plan)}</td>
+      <td>${statusBadge(a.status)}</td>
+      <td class="num">${a.health_score ?? '—'}</td>
+      <td class="num">${todayReq}${todayChip}</td>
+      <td class="num">${okN}/${failN}${failRateChip}</td>
+      <td class="mono">${fmtDate(a.oauth_expires_at)}</td>
+      <td class="mono">${cdChip}</td>
+      <td class="mono">${fmtRelative(a.last_used_at)}</td>
+      <td class="mono" title="${escapeHtml(a.egress_proxy || '')}">${escapeHtml(a.egress_proxy || '—')}</td>
+      <td class="actions">
+        ${showReset ? `<button data-act="reset-cooldown" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}" title="清冷却 + last_error">释放冷却</button>` : ''}
+        <button data-act="edit-acc" data-id="${escapeHtml(a.id)}">编辑</button>
+        <button data-act="del-acc" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}">删除</button>
+      </td>
+    </tr>`
+}
+
+async function resetAccountCooldown(id, label, btn) {
+  if (!confirm(`释放账号 #${id} (${label}) 的冷却并清 last_error?\n不会修改 status。`)) return
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('POST', `/api/admin/accounts/${encodeURIComponent(id)}/reset-cooldown`)
+      toast(`#${id} 冷却已释放`)
+      // 局部刷新:只重拉 accounts,KPI 不变太快
+      _loadAccounts(ACCOUNTS_STATE.renderSeq)
+      _loadAccountsKpis(ACCOUNTS_STATE.renderSeq)
+    } catch (e) {
+      toast(`释放失败:${e.message}`, 'danger')
+    }
+  })
 }
 
 function _accountFormFields(prefill) {

@@ -333,6 +333,39 @@ export async function adminPatchAccount(
   return after;
 }
 
+// ─── Reset cooldown ───────────────────────────────────────────────
+//
+// R3:accounts tab 快捷动作。把 `cooldown_until` + `last_error` 清掉,让
+// scheduler 下一轮能重新选择该账号。不动 status、不动 oauth_token;如果 status
+// 也需要从 'cooldown' 回到 'active',admin 需要另走 patch(故意不偷偷改 status,
+// 避免 "reset cooldown" 无感恢复已被人工 disabled 的账号)。
+//
+// 审计:action='account.reset_cooldown',before 记旧 cooldown_until + last_error。
+export async function adminResetCooldown(
+  id: bigint | string,
+  ctx: AdminAuditCtx,
+): Promise<AccountRow> {
+  const before = await storeGet(id);
+  if (!before) throw new AccountNotFoundError(id);
+  const after = await storeUpdate(id, { cooldown_until: null, last_error: null });
+  if (!after) throw new AccountNotFoundError(id);
+
+  await bestEffortAudit(
+    ctx,
+    "account.reset_cooldown",
+    `account:${String(id)}`,
+    {
+      cooldown_until: before.cooldown_until?.toISOString() ?? null,
+      last_error: before.last_error,
+    },
+    {
+      cooldown_until: null,
+      last_error: null,
+    },
+  );
+  return after;
+}
+
 // ─── Delete ──────────────────────────────────────────────────────
 
 export async function adminDeleteAccount(

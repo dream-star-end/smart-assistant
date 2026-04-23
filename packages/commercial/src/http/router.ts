@@ -72,10 +72,12 @@ import {
   handleAdminListPlans,
   handleAdminPatchPlan,
   handleAdminListAccounts,
+  handleAdminAccountsStats,
   handleAdminGetAccount,
   handleAdminCreateAccount,
   handleAdminPatchAccount,
   handleAdminDeleteAccount,
+  handleAdminResetAccountCooldown,
   handleAdminOAuthStart,
   handleAdminOAuthExchange,
   handleAdminListAgentContainers,
@@ -390,9 +392,15 @@ export function createCommercialHandler(
     // T-60 超管账号池
     { method: "GET",    path: "/api/admin/accounts",         handler: handleAdminListAccounts },
     { method: "POST",   path: "/api/admin/accounts",         handler: handleAdminCreateAccount },
+    // R3:exact path 在 pathPrefix 之前精确命中(matchRoute exact-first)
+    { method: "GET",    path: "/api/admin/accounts/stats",   handler: handleAdminAccountsStats },
     // OAuth 引导:exact path 必须排在 prefix 之前(prefix 才能 fall through)
     { method: "POST",   path: "/api/admin/accounts/oauth/start",    handler: handleAdminOAuthStart },
     { method: "POST",   path: "/api/admin/accounts/oauth/exchange", handler: handleAdminOAuthExchange },
+    // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
+    //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
+    //  adjustCredits 走的是不同 prefix。
+    { method: "POST",   pathPrefix: "/api/admin/accounts/",  handler: handleAdminResetAccountCooldown },
     { method: "GET",    pathPrefix: "/api/admin/accounts/",  handler: handleAdminGetAccount },
     { method: "PATCH",  pathPrefix: "/api/admin/accounts/",  handler: handleAdminPatchAccount },
     { method: "DELETE", pathPrefix: "/api/admin/accounts/",  handler: handleAdminDeleteAccount },

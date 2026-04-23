@@ -58,10 +58,15 @@ import {
   adminCreateAccount,
   adminPatchAccount,
   adminDeleteAccount,
+  adminResetCooldown,
   maskEgressProxy,
   type AdminCreateAccountInput,
   type AdminPatchAccountInput,
 } from "../admin/accounts.js";
+import {
+  getAccountsPoolStats,
+  getAccountsTodayStats,
+} from "../admin/accountsStats.js";
 import {
   startClaudeOAuth,
   exchangeClaudeOAuth,
@@ -717,14 +722,45 @@ export async function handleAdminListAccounts(
   const status = sp.get("status") ?? undefined;
   const limit = parsePositiveInt(sp.get("limit"), "limit", 500);
   const offset = parseNonNegativeInt(sp.get("offset"), "offset");
+  // R3:with_stats=1 → 追加每账号今日请求/错误数。用 scoped LATERAL-free 聚合,
+  // scope 到本页 id[],≤500 id 受限不退化。默认不追,保持老调用者 shape。
+  const withStats = sp.get("with_stats") === "1";
   try {
     const rows = await adminListAccounts({
       status: status === undefined || status === "" ? undefined : (status as never),
       limit,
       offset,
     });
-    sendJson(res, 200, { rows: rows.map(serializeAccount) });
+    if (!withStats) {
+      sendJson(res, 200, { rows: rows.map(serializeAccount) });
+      return;
+    }
+    const ids = rows.map((r) => r.id);
+    const stats = await getAccountsTodayStats(ids);
+    const byId = new Map(stats.map((s) => [s.account_id, s]));
+    sendJson(res, 200, {
+      rows: rows.map((r) => {
+        const s = byId.get(r.id.toString());
+        return {
+          ...serializeAccount(r),
+          today_requests: s?.today_requests ?? 0,
+          today_errors: s?.today_errors ?? 0,
+        };
+      }),
+    });
   } catch (err) { translateRangeError(err); }
+}
+
+// ─── GET /api/admin/accounts/stats (R3 新增 KPI 面板) ──────────────
+export async function handleAdminAccountsStats(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const out = await getAccountsPoolStats();
+  sendJson(res, 200, out);
 }
 
 export async function handleAdminGetAccount(
@@ -880,6 +916,34 @@ export async function handleAdminDeleteAccount(
   });
   if (!ok) throw new HttpError(404, "NOT_FOUND", "account not found");
   sendJson(res, 200, { deleted: true });
+}
+
+// ─── POST /api/admin/accounts/:id/reset-cooldown (R3) ─────────────
+// 清空 cooldown_until + last_error;status 不动(见 accounts.ts 说明)。
+export async function handleAdminResetAccountCooldown(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  // URL 形如 /api/admin/accounts/:id/reset-cooldown;把 ":id" 抠出来
+  const m = url.pathname.match(/^\/api\/admin\/accounts\/([1-9][0-9]{0,19})\/reset-cooldown$/);
+  if (!m) throw new HttpError(400, "VALIDATION", "invalid account id");
+  const id = m[1];
+  try {
+    const a = await adminResetCooldown(id, {
+      adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, { account: serializeAccount(a) });
+  } catch (err) {
+    if (err instanceof RangeError) translateRangeError(err);
+    if (err instanceof Error && err.name === "AccountNotFoundError") {
+      throw new HttpError(404, "NOT_FOUND", "account not found");
+    }
+    throw err;
+  }
 }
 
 // ─── account-pool OAuth(管理员"新建账号"流程)──────────────────────
