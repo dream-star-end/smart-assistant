@@ -67,13 +67,36 @@ export interface ListUsersInput {
   status?: UserStatus | UserStatus[];
   /** 默认 50,上限 200 */
   limit?: number;
-  /** offset 分页(用户表相对小,OFFSET 可接受) */
+  /** offset 分页(保留兼容,新路径建议走 cursor) */
   offset?: number;
+  /**
+   * cursor 分页(id DESC):传上一页最后一行的 id,返回 id < cursor 的行。
+   * 优于 offset — 不会 scan 已跳过的行。与 q/status 兼容,cursor 仅影响排序位置。
+   */
+  cursor?: string;
 }
 
 export interface ListUsersResult {
   rows: AdminUserRowView[];
-  /** 调用者若 rows.length === limit 可继续翻页。此处不强制返 total(COUNT(*) 昂贵)。 */
+  /** cursor 模式下:若本页满页,给出下页 cursor(最后一行 id);否则 null 表示到底。 */
+  next_cursor: string | null;
+}
+
+/** R2 新增:list 行 + 运营关心的"动态"字段。 */
+export interface AdminUserWithStatsRowView extends AdminUserRowView {
+  /** 今日请求数(usage_records since date_trunc('day', NOW())) */
+  today_requests: number;
+  /** 今日错误请求数(status != 'success') */
+  today_errors: number;
+  /** 累计充值(cents,SUM(delta) WHERE reason='topup' AND delta > 0)  */
+  total_topup_cents: string;
+  /** 最近一次 usage_records.created_at(ISO string) ,null 表示从未调用过 */
+  last_active_at: string | null;
+}
+
+export interface ListUsersWithStatsResult {
+  rows: AdminUserWithStatsRowView[];
+  next_cursor: string | null;
 }
 
 /** 允许的 status 值白名单,避免任意字符串被发进 SQL。 */
@@ -83,18 +106,36 @@ function assertStatus(s: string): asserts s is UserStatus {
   }
 }
 
-export async function listUsers(input: ListUsersInput = {}): Promise<ListUsersResult> {
+/**
+ * bigint-string 强校验:正则只把住"全数字 + 无前导 0 + 长度 ≤ 20",但 20 位可能
+ * 越过 PG `bigint` 上限 (9223372036854775807)。R2 Codex M4:否则 DB 会抛 22003
+ * numeric_value_out_of_range → HTTP 500。这里加 BigInt 上界,失败抛 RangeError
+ * 让 handler 翻成 400 VALIDATION。
+ */
+const PG_BIGINT_MAX = 9223372036854775807n;
+function isValidBigintString(s: string): boolean {
+  if (!/^[1-9][0-9]{0,19}$/.test(s)) return false;
+  try {
+    return BigInt(s) <= PG_BIGINT_MAX;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 公共 where 构造 — listUsers + listUsersWithStats 共用,避免两次维护同一份
+ * 过滤语义漂移。
+ */
+function buildUsersWhere(input: ListUsersInput): { where: string[]; params: unknown[] } {
   const where: string[] = [];
   const params: unknown[] = [];
   if (input.q !== undefined && input.q !== "") {
     if (input.q.length > 120) throw new RangeError("invalid_q");
-    // 纯数字:按 id 精确匹配(id 是 BIGSERIAL,常见场景"我想搜 #123")
     const trimmed = input.q.trim();
-    if (/^[1-9][0-9]{0,19}$/.test(trimmed)) {
+    if (isValidBigintString(trimmed)) {
       params.push(trimmed);
       where.push(`id = $${params.length}::bigint`);
     } else {
-      // 其余按 email / display_name 做 ILIKE(转义 backslash/%/_ 以防 LIKE 注入)
       params.push("%" + trimmed.replace(/[\\%_]/g, "\\$&") + "%");
       where.push(
         `(email ILIKE $${params.length} OR display_name ILIKE $${params.length})`,
@@ -107,10 +148,28 @@ export async function listUsers(input: ListUsersInput = {}): Promise<ListUsersRe
     params.push(arr);
     where.push(`status = ANY($${params.length}::text[])`);
   }
+  if (input.cursor !== undefined && input.cursor !== "") {
+    if (!isValidBigintString(input.cursor)) throw new RangeError("invalid_cursor");
+    params.push(input.cursor);
+    where.push(`id < $${params.length}::bigint`);
+  }
+  return { where, params };
+}
+
+function clampUsersLimit(input: ListUsersInput): number {
   let limit = input.limit ?? 50;
   if (!Number.isInteger(limit) || limit <= 0) limit = 50;
   if (limit > 200) limit = 200;
+  return limit;
+}
+
+export async function listUsers(input: ListUsersInput = {}): Promise<ListUsersResult> {
+  const { where, params } = buildUsersWhere(input);
+  const limit = clampUsersLimit(input);
+  // cursor 优先,offset 只为兼容老调用链(测试 / 非 cursor 路径)。两者互斥时
+  // cursor 生效 —— buildUsersWhere 已经把 cursor 转成 WHERE。
   let offset = input.offset ?? 0;
+  if (input.cursor !== undefined && input.cursor !== "") offset = 0;
   if (!Number.isInteger(offset) || offset < 0) offset = 0;
 
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
@@ -124,7 +183,92 @@ export async function listUsers(input: ListUsersInput = {}): Promise<ListUsersRe
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params,
   );
-  return { rows: r.rows };
+  const next_cursor = r.rows.length === limit ? r.rows[r.rows.length - 1].id : null;
+  return { rows: r.rows, next_cursor };
+}
+
+/**
+ * R2 新增:listUsers 的"运营增强版"。先拿一页用户(ID DESC),再以这一页的
+ * user_id 集合为 scope,各走一条 user_id=ANY($ids) 的子查询把每个用户的
+ *  - 今日请求/错误计数
+ *  - 累计 topup 金额
+ *  - 最近一次 usage_records 时间
+ * 拼回来。所有子查询都走 (user_id, created_at DESC) 这对现有索引,
+ * 一页 ≤200 行最多 3 条 index range scan,规模受控。
+ *
+ * 分 2 次 query 而不是一次 CTE:避免把 usage_records/credit_ledger 的大范围 scan
+ * 跟 users 过滤捆在同一个 plan,PG 在大表面前容易选错 join 顺序。
+ */
+export async function listUsersWithStats(
+  input: ListUsersInput = {},
+): Promise<ListUsersWithStatsResult> {
+  const page = await listUsers(input);
+  if (page.rows.length === 0) {
+    return { rows: [], next_cursor: null };
+  }
+  // 只把 id 传进 scoped SQL,参数化 text[] → pg driver 自己转 bigint[]。
+  const ids = page.rows.map((r) => r.id);
+  const statsRes = await query<{
+    user_id: string;
+    today_requests: string;
+    today_errors: string;
+    total_topup_cents: string | null;
+    last_active_at: Date | null;
+  }>(
+    // last_seen 用 LATERAL(SELECT ... ORDER BY created_at DESC LIMIT 1) 稳定命中
+    //   (user_id, created_at DESC) 首行,比 MAX() GROUP BY 少扫整个分区。
+    // today/topup 仍走 GROUP BY + FILTER —— 今日窗口 + partial index
+    //   idx_cl_user_topup (0027) 都让范围很小。
+    `WITH ids AS (
+       SELECT unnest($1::bigint[]) AS user_id
+     ),
+     today AS (
+       SELECT user_id,
+              COUNT(*)                                        AS req_count,
+              COUNT(*) FILTER (WHERE status != 'success')     AS err_count
+       FROM usage_records
+       WHERE user_id = ANY($1::bigint[])
+         AND created_at > date_trunc('day', NOW())
+       GROUP BY user_id
+     ),
+     topup AS (
+       SELECT user_id, SUM(delta) AS total
+       FROM credit_ledger
+       WHERE user_id = ANY($1::bigint[])
+         AND reason = 'topup'
+         AND delta > 0
+       GROUP BY user_id
+     )
+     SELECT ids.user_id::text                                 AS user_id,
+            COALESCE(today.req_count, 0)::text                AS today_requests,
+            COALESCE(today.err_count, 0)::text                AS today_errors,
+            COALESCE(topup.total::text, '0')                  AS total_topup_cents,
+            ls.last_at                                        AS last_active_at
+     FROM ids
+     LEFT JOIN today ON today.user_id = ids.user_id
+     LEFT JOIN topup ON topup.user_id = ids.user_id
+     LEFT JOIN LATERAL (
+       SELECT created_at AS last_at
+         FROM usage_records
+        WHERE user_id = ids.user_id
+        ORDER BY created_at DESC
+        LIMIT 1
+     ) ls ON TRUE`,
+    [ids],
+  );
+  const byId = new Map(statsRes.rows.map((s) => [s.user_id, s]));
+
+  const rows: AdminUserWithStatsRowView[] = page.rows.map((u) => {
+    const s = byId.get(u.id);
+    return {
+      ...u,
+      today_requests: s ? Number(s.today_requests) : 0,
+      today_errors: s ? Number(s.today_errors) : 0,
+      total_topup_cents: s?.total_topup_cents ?? "0",
+      last_active_at: s?.last_active_at ? s.last_active_at.toISOString() : null,
+    };
+  });
+  return { rows, next_cursor: page.next_cursor };
 }
 
 // ─── 单条 ──────────────────────────────────────────────────────────

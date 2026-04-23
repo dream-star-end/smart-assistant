@@ -22,14 +22,17 @@ import { HttpError, sendJson, readJsonBody } from "./util.js";
 import { requireAdmin, requireAdminVerifyDb } from "../admin/requireAdmin.js";
 import {
   listUsers,
+  listUsersWithStats,
   getUser,
   patchUser,
   UserNotFoundError,
   type PatchUserInput,
   type AdminUserRowView,
+  type AdminUserWithStatsRowView,
   USER_STATUSES,
   USER_ROLES,
 } from "../admin/users.js";
+import { getUsersStats } from "../admin/usersStats.js";
 import {
   listAdminAudit,
   ADMIN_AUDIT_MAX_LIMIT,
@@ -158,6 +161,17 @@ function serializeUser(u: AdminUserRowView): Record<string, unknown> {
   };
 }
 
+/** R2 增强版:serializeUser + 运营 stats。 */
+function serializeUserWithStats(u: AdminUserWithStatsRowView): Record<string, unknown> {
+  return {
+    ...serializeUser(u),
+    today_requests: u.today_requests,
+    today_errors: u.today_errors,
+    total_topup_cents: u.total_topup_cents,
+    last_active_at: u.last_active_at,
+  };
+}
+
 function serializeAudit(r: AdminAuditRowView): Record<string, unknown> {
   return {
     id: r.id,
@@ -172,7 +186,7 @@ function serializeAudit(r: AdminAuditRowView): Record<string, unknown> {
   };
 }
 
-// ─── GET /api/admin/users?q=&status=&limit=&offset= ────────────────
+// ─── GET /api/admin/users?q=&status=&limit=&cursor=&with_stats=1 ────
 
 export async function handleAdminListUsers(
   req: IncomingMessage,
@@ -196,11 +210,58 @@ export async function handleAdminListUsers(
   }
   const limit = parsePositiveInt(sp.get("limit"), "limit", 200);
   const offset = parseNonNegativeInt(sp.get("offset"), "offset");
+  // R2:cursor 分页(id 数字字符串)。与 offset 互斥 —— 同时传时 users.ts
+  // 侧优先用 cursor,offset 归零。
+  const cursorRaw = sp.get("cursor");
+  let cursor: string | undefined;
+  if (cursorRaw !== null && cursorRaw !== "") {
+    if (!/^[1-9][0-9]{0,19}$/.test(cursorRaw)) {
+      throw new HttpError(400, "VALIDATION", "invalid cursor", {
+        issues: [{ path: "cursor", message: cursorRaw }],
+      });
+    }
+    cursor = cursorRaw;
+  }
+  // with_stats=1 → listUsersWithStats(追加 today/topup/last_active);默认不追,
+  // 保持老调用者(如集成测试)读到的 shape 不变。
+  const withStats = sp.get("with_stats") === "1";
 
   try {
-    const r = await listUsers({ q: q === "" ? undefined : q, status, limit, offset });
-    sendJson(res, 200, { rows: r.rows.map(serializeUser) });
+    if (withStats) {
+      const r = await listUsersWithStats({
+        q: q === "" ? undefined : q, status, limit, offset, cursor,
+      });
+      sendJson(res, 200, {
+        rows: r.rows.map(serializeUserWithStats),
+        next_cursor: r.next_cursor,
+      });
+      return;
+    }
+    const r = await listUsers({
+      q: q === "" ? undefined : q, status, limit, offset, cursor,
+    });
+    sendJson(res, 200, {
+      rows: r.rows.map(serializeUser),
+      next_cursor: r.next_cursor,
+    });
   } catch (err) { translateRangeError(err); }
+}
+
+// ─── GET /api/admin/users/stats (R2 新增 KPI 面板) ──────────────────
+//
+// 响应:{ total_users, active_users, banned_users, deleted_users,
+//         new_7d, active_7d, paying_7d, avg_credits_cents, total_credits_cents }
+// 所有字段定义见 admin/usersStats.ts。
+
+export async function handleAdminUsersStats(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const out = await getUsersStats();
+  sendJson(res, 200, out);
 }
 
 // ─── GET /api/admin/users/:id ──────────────────────────────────────

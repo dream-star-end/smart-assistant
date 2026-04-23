@@ -62,6 +62,7 @@ import {
 import { handleAdminAgentAudit } from "./adminAudit.js";
 import {
   handleAdminListUsers,
+  handleAdminUsersStats,
   handleAdminGetUser,
   handleAdminPatchUser,
   handleAdminAdjustCredits,
@@ -371,6 +372,8 @@ export function createCommercialHandler(
     { method: "GET", path: "/api/admin/agent-audit", handler: handleAdminAgentAudit },
     // T-60 超管 API —— 用户管理
     { method: "GET",   path: "/api/admin/users",       handler: handleAdminListUsers },
+    // R2:exact path 在 pathPrefix 之前优先匹配,避免被 /users/:id 吞掉。
+    { method: "GET",   path: "/api/admin/users/stats", handler: handleAdminUsersStats },
     // 动态路径用 pathPrefix。/api/admin/users/:id/credits 优先匹配,
     // 后退到 /api/admin/users/:id(GET/PATCH)。Handler 自己区分。
     { method: "POST",  pathPrefix: "/api/admin/users/", handler: handleAdminAdjustCredits },

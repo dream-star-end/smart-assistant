@@ -772,6 +772,21 @@ function fmtAgeSec(sec) {
   return `${Math.floor(s / 86400)} 天`
 }
 
+/** ISO 时间 → "刚刚" / "3 分钟前" / "2 天前" / "2026-01-03"(超 30 天)。 */
+function fmtRelative(iso) {
+  if (!iso) return '—'
+  try {
+    const t = new Date(iso).getTime()
+    if (Number.isNaN(t)) return '—'
+    const diff = Math.max(0, Math.floor((Date.now() - t) / 1000))
+    if (diff < 30) return '刚刚'
+    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
+    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
+    if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`
+    return new Date(iso).toISOString().slice(0, 10)
+  } catch { return '—' }
+}
+
 function updateStat(card, value, delta, tone) {
   if (!card) return
   const v = card.querySelector('.stat-value')
@@ -801,67 +816,254 @@ function fmtTime(iso) {
 
 // ─── Tab: Users ─────────────────────────────────────────────────────
 
+// 单 tab 状态 —— cursor 累积分页 + 触发版本号防异步竞态(沿用 dashboard 模式)。
+// 每次 renderUsersTab() 进入就递增 renderSeq,中途异步 continuation 必须确认
+// 自己仍是"最新一次 render"才能写 DOM。
+const USERS_STATE = {
+  renderSeq: 0,
+  loadSeq: 0,
+  /** 全部已加载的行(按 id DESC 排,append 更多的追加到末尾)。 */
+  rows: [],
+  /** 下一页 cursor;为 null 表示已到底。 */
+  nextCursor: null,
+  /** 当前搜索/过滤快照,用于判断"按条件翻下一页"时是否还是同一查询。 */
+  q: '',
+  status: '',
+}
+
+const USERS_PAGE_SIZE = 50
+
+/** 格式化"上一次活跃"的 tone:>7 天 danger,>1 天 warn,否则 ok。 */
+function _userActiveTone(iso) {
+  if (!iso) return 'muted'
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000
+  if (diff > 86400 * 7) return 'danger'
+  if (diff > 86400) return 'warn'
+  return 'ok'
+}
+
 async function renderUsersTab() {
-  const sp = new URLSearchParams()
-  const q = sessionStorage.getItem('admin_users_q') || ''
-  const status = sessionStorage.getItem('admin_users_status') || ''
-  if (q) sp.set('q', q)
-  if (status) sp.set('status', status)
-  sp.set('limit', '50')
-  const data = await apiGet(`/api/admin/users?${sp.toString()}`)
-  const rows = data?.rows ?? []
+  const mySeq = ++USERS_STATE.renderSeq
+
+  // toolbar 状态从 sessionStorage 恢复;state reset 只保留过滤条件不保留 rows。
+  USERS_STATE.q = sessionStorage.getItem('admin_users_q') || ''
+  USERS_STATE.status = sessionStorage.getItem('admin_users_status') || ''
+  USERS_STATE.rows = []
+  USERS_STATE.nextCursor = null
+
+  const q = USERS_STATE.q
+  const status = USERS_STATE.status
+
   view().innerHTML = `
     <div class="panel">
-      <h2>用户 <small>共 ${rows.length} 人(最多 50)</small></h2>
-      <div class="toolbar">
+      <div class="dash-h1">
+        <h2>用户 <span class="dash-sub" id="u-count">加载中…</span></h2>
+        <div style="display:flex;gap:var(--s-2);align-items:center;">
+          <button class="btn" id="u-refresh">刷新</button>
+        </div>
+      </div>
+
+      <div class="stat-grid" id="u-kpis">
+        ${['总用户数','7 天新注册','7 天活跃','7 天付费用户'].map((label) => `
+          <div class="stat-card">
+            <div class="stat-label">${escapeHtml(label)}</div>
+            <div class="stat-value is-loading">—</div>
+            <div class="stat-delta">—</div>
+          </div>`).join('')}
+      </div>
+
+      <div class="toolbar" style="margin-top:var(--s-3);">
         <input type="text" id="u-q" placeholder="搜索 邮箱 / id / 显示名"
                value="${escapeHtml(q)}" />
         <select id="u-status">
           <option value="">全部状态</option>
-          <option value="active" ${status === 'active' ? 'selected' : ''}>active</option>
-          <option value="banned" ${status === 'banned' ? 'selected' : ''}>banned</option>
+          <option value="active"   ${status === 'active'   ? 'selected' : ''}>active</option>
+          <option value="banned"   ${status === 'banned'   ? 'selected' : ''}>banned</option>
           <option value="deleting" ${status === 'deleting' ? 'selected' : ''}>deleting</option>
-          <option value="deleted" ${status === 'deleted' ? 'selected' : ''}>deleted</option>
+          <option value="deleted"  ${status === 'deleted'  ? 'selected' : ''}>deleted</option>
         </select>
         <button class="btn btn-primary" id="u-search">搜索</button>
       </div>
-      ${rows.length === 0
-        ? '<div class="empty">无用户</div>'
-        : `
-        <table class="data">
-          <thead>
-            <tr>
-              <th>id</th><th>邮箱</th><th>显示名</th><th>角色</th>
-              <th>状态</th><th>余额</th><th>注册时间</th><th class="actions">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows.map((u) => `
-              <tr>
-                <td class="mono">${escapeHtml(u.id)}</td>
-                <td>${escapeHtml(u.email || '')} ${u.email_verified ? '<span class="badge ok">✓</span>' : '<span class="badge warn">未验证</span>'}</td>
-                <td>${escapeHtml(u.display_name || '')}</td>
-                <td><span class="badge ${u.role === 'admin' ? 'warn' : 'muted'}">${escapeHtml(u.role)}</span></td>
-                <td>${statusBadge(u.status)}</td>
-                <td class="num">${fmtCents(u.credits)}</td>
-                <td class="mono">${fmtDate(u.created_at)}</td>
-                <td class="actions">
-                  <button data-act="adjust" data-id="${escapeHtml(u.id)}">±余额</button>
-                </td>
-              </tr>`).join('')}
-          </tbody>
-        </table>`}
-    </div>
-  `
+
+      <div id="u-table-container">
+        <div class="skeleton-row"><div class="skeleton-bar w60"></div></div>
+      </div>
+
+      <div id="u-load-more" style="margin-top:var(--s-3);display:none;text-align:center;">
+        <button class="btn" id="u-load-more-btn">加载更多</button>
+      </div>
+    </div>`
+
+  // ─── 事件绑定(先绑再 await,避免 Enter/Click 被 await 期间吞掉)───
   $('u-search').addEventListener('click', () => {
     sessionStorage.setItem('admin_users_q', $('u-q').value.trim())
     sessionStorage.setItem('admin_users_status', $('u-status').value)
     applyHash()
   })
   $('u-q').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('u-search').click() })
-  for (const b of view().querySelectorAll('button[data-act="adjust"]')) {
+  $('u-refresh').addEventListener('click', () => applyHash())
+  $('u-load-more-btn').addEventListener('click', async (ev) => {
+    await withBtnLoading(ev.currentTarget, () => _loadMoreUsers(mySeq))
+  })
+
+  await Promise.all([
+    _loadUsersKpis(mySeq),
+    _loadMoreUsers(mySeq),  // 首次加载 = 首页加载 = "加载更多"的第一次
+  ])
+}
+
+/** 加载/刷新一页用户(cursor = USERS_STATE.nextCursor,或首页 null)。 */
+async function _loadMoreUsers(renderSeq) {
+  const myLoadSeq = ++USERS_STATE.loadSeq
+  const sp = new URLSearchParams({
+    with_stats: '1',
+    limit: String(USERS_PAGE_SIZE),
+  })
+  if (USERS_STATE.q) sp.set('q', USERS_STATE.q)
+  if (USERS_STATE.status) sp.set('status', USERS_STATE.status)
+  if (USERS_STATE.nextCursor) sp.set('cursor', USERS_STATE.nextCursor)
+
+  const isFirstPage = USERS_STATE.rows.length === 0 && !USERS_STATE.nextCursor
+  let data
+  try {
+    data = await apiGet(`/api/admin/users?${sp.toString()}`)
+  } catch (err) {
+    if (renderSeq !== USERS_STATE.renderSeq || _currentTab !== 'users') return
+    toast(`加载失败:${err.message}`, 'danger')
+    // 首屏失败 → 表格区显示错误态并停用 "加载更多";非首屏保留已有 rows + toast
+    if (isFirstPage) {
+      const el = $('u-table-container')
+      if (el) el.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
+      const cnt = $('u-count'); if (cnt) cnt.textContent = '—'
+      USERS_STATE.nextCursor = null
+      _toggleLoadMoreBtn()
+    }
+    return
+  }
+  if (renderSeq !== USERS_STATE.renderSeq || myLoadSeq !== USERS_STATE.loadSeq) return
+  if (_currentTab !== 'users') return
+
+  const newRows = data?.rows ?? []
+  USERS_STATE.rows.push(...newRows)
+  USERS_STATE.nextCursor = data?.next_cursor ?? null
+
+  _renderUsersTable()
+  _updateUsersCount()
+  _toggleLoadMoreBtn()
+}
+
+/** 并行拉 KPI(/users/stats),4 张卡片各自独立填值;失败保持 "—"。 */
+async function _loadUsersKpis(renderSeq) {
+  let s
+  try {
+    s = await apiGet('/api/admin/users/stats')
+  } catch {
+    if (renderSeq !== USERS_STATE.renderSeq) return
+    const cards = view().querySelectorAll('#u-kpis .stat-card')
+    for (const c of cards) updateStat(c, '—', '加载失败', 'danger')
+    return
+  }
+  if (renderSeq !== USERS_STATE.renderSeq || _currentTab !== 'users') return
+
+  const cards = view().querySelectorAll('#u-kpis .stat-card')
+  updateStat(cards[0], s.total_users.toLocaleString(),
+    `active ${s.active_users} · banned ${s.banned_users} · 已删 ${s.deleted_users}`,
+    s.banned_users > 0 ? 'warning' : 'success')
+  updateStat(cards[1], s.new_7d.toLocaleString(),
+    `7d 累计`, s.new_7d > 0 ? 'success' : null)
+  updateStat(cards[2], s.active_7d.toLocaleString(),
+    `有 usage_records 的独立用户`, null)
+  updateStat(cards[3], s.paying_7d.toLocaleString(),
+    `平均余额 ${fmtCents(s.avg_credits_cents)}`,
+    s.paying_7d > 0 ? 'success' : null)
+}
+
+function _renderUsersTable() {
+  const el = $('u-table-container')
+  if (!el) return
+  const rows = USERS_STATE.rows
+  if (rows.length === 0) {
+    el.innerHTML = '<div class="empty">无用户</div>'
+    return
+  }
+  el.innerHTML = `
+    <table class="data">
+      <thead>
+        <tr>
+          <th>id</th>
+          <th>邮箱</th>
+          <th>显示名</th>
+          <th>角色</th>
+          <th>状态</th>
+          <th>余额</th>
+          <th>累计充值</th>
+          <th>今日请求</th>
+          <th>最近活跃</th>
+          <th>注册时间</th>
+          <th class="actions">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(_renderUserRow).join('')}
+      </tbody>
+    </table>`
+  for (const b of el.querySelectorAll('button[data-act="adjust"]')) {
     b.addEventListener('click', () => openAdjustCreditsModal(b.dataset.id))
   }
+}
+
+function _renderUserRow(u) {
+  const errRate = u.today_requests > 0
+    ? (u.today_errors / u.today_requests)
+    : 0
+  const errTone = errRate > 0.1 ? 'danger'
+    : errRate > 0.02 ? 'warn'
+    : (u.today_requests > 0 ? 'ok' : 'muted')
+  const reqCell = u.today_requests > 0
+    ? `<span>${u.today_requests}</span>
+       <small class="chip chip-${errTone}" style="margin-left:4px;">${(errRate * 100).toFixed(1)}%</small>`
+    : '<span class="muted">—</span>'
+
+  const lastTone = _userActiveTone(u.last_active_at)
+  const lastCell = u.last_active_at
+    ? `<span class="chip chip-${lastTone}" title="${escapeHtml(fmtDate(u.last_active_at))}">${escapeHtml(fmtRelative(u.last_active_at))}</span>`
+    : '<span class="muted">从未</span>'
+
+  return `
+    <tr>
+      <td class="mono">${escapeHtml(u.id)}</td>
+      <td>
+        ${escapeHtml(u.email || '')}
+        ${u.email_verified
+          ? '<span class="badge ok" title="已验证">✓</span>'
+          : '<span class="badge warn" title="未验证邮箱">未验证</span>'}
+      </td>
+      <td>${escapeHtml(u.display_name || '')}</td>
+      <td><span class="badge ${u.role === 'admin' ? 'warn' : 'muted'}">${escapeHtml(u.role)}</span></td>
+      <td>${statusBadge(u.status)}</td>
+      <td class="num">${fmtCents(u.credits)}</td>
+      <td class="num">${fmtCents(u.total_topup_cents)}</td>
+      <td class="num">${reqCell}</td>
+      <td>${lastCell}</td>
+      <td class="mono">${fmtDate(u.created_at)}</td>
+      <td class="actions">
+        <button data-act="adjust" data-id="${escapeHtml(u.id)}">±余额</button>
+      </td>
+    </tr>`
+}
+
+function _updateUsersCount() {
+  const el = $('u-count')
+  if (!el) return
+  const n = USERS_STATE.rows.length
+  const more = USERS_STATE.nextCursor ? '+' : ''
+  el.textContent = `共 ${n}${more} 人`
+}
+
+function _toggleLoadMoreBtn() {
+  const wrap = $('u-load-more')
+  if (!wrap) return
+  wrap.style.display = USERS_STATE.nextCursor ? '' : 'none'
 }
 
 function openAdjustCreditsModal(userId) {
