@@ -18,6 +18,24 @@
 
 import { state } from './state.js'
 import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired } from './api.js'
+import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js'
+
+// 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
+// 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
+// 400,或漏掉新 reason 的中文 label(R1 Codex L2)。
+const LEDGER_REASONS = [
+  'topup', 'chat', 'agent_chat', 'agent_subscription',
+  'refund', 'admin_adjust', 'promotion',
+]
+const LEDGER_REASON_LABELS = {
+  topup:              '充值',
+  chat:               '对话',
+  agent_chat:         'Agent 对话',
+  agent_subscription: 'Agent 订阅',
+  refund:             '退款',
+  admin_adjust:       '管理员调整',
+  promotion:          '活动赠送',
+}
 
 // ─── DOM helpers ────────────────────────────────────────────────────
 
@@ -246,9 +264,30 @@ function navigate(tab) {
   }
 }
 
+// 离开某 tab 时必须执行的清理(计时器 / chart 实例)。applyHash() 在目标 tab
+// != currentTab 时统一触发,保证切 tab 不泄漏 setInterval + Chart.js 实例。
+// R1 Codex M2:过去只有"重新进入 dashboard"会清理,切走期间 timer 仍在跑 +
+// canvas 持有 detached Chart 实例。
+const TAB_CLEANUPS = {
+  dashboard() {
+    if (DASH_STATE.refreshTimer) {
+      clearInterval(DASH_STATE.refreshTimer)
+      DASH_STATE.refreshTimer = null
+    }
+    _destroyDashCharts()
+  },
+}
+let _currentTab = null
+
 function applyHash() {
   const m = /#tab=([a-z]+)/.exec(window.location.hash)
   const tab = (m && TABS[m[1]]) ? m[1] : 'dashboard'
+  // 切 tab 时清理上一个 tab 的副作用(只跑非本 tab 的 cleanup;同 tab 重新
+  // 渲染时由 tab 自身的"停上一个 timer / destroy charts"逻辑接管)
+  if (_currentTab && _currentTab !== tab) {
+    try { TAB_CLEANUPS[_currentTab]?.() } catch {}
+  }
+  _currentTab = tab
   for (const btn of document.querySelectorAll('#tabs button')) {
     btn.classList.toggle('active', btn.dataset.tab === tab)
   }
@@ -258,61 +297,22 @@ function applyHash() {
 
 // ─── Tab: Dashboard (总览) ──────────────────────────────────────────
 //
-// 由前端聚合现有 /api/admin/* 端点 + /api/admin/metrics (Prometheus) 渲染
-// 一屏总览。不依赖新后端接口。刷新按钮 / 30 秒自动轮询。
+// 后端聚合走 /api/admin/stats/* (dau / revenue-by-day / request-series /
+// alerts-summary / account-pool)。前端只负责渲染 + Chart.js 绘图。
+// Prometheus metrics 只保留一项 TTFT 样本(新端点里没做,保留原逻辑)。
+// 刷新按钮 / 30 秒自动轮询。
 
-const DASH_STATE = { parsedMetrics: null, refreshTimer: null }
-
-/** 把 Prometheus 文本解析成 { series_name: [{labels, value}] }。只抓我们关心的几条。 */
-function parsePromText(text) {
-  const lines = String(text || '').split('\n')
-  const out = Object.create(null)
-  const WHITELIST = new Set([
-    'gateway_http_requests_total',
-    'billing_debit_total',
-    'claude_api_requests_total',
-    'account_pool_health',
-    'agent_containers_running',
-    'anthropic_proxy_ttft_seconds_sum',
-    'anthropic_proxy_ttft_seconds_count',
-    'anthropic_proxy_settle_total',
-    'anthropic_proxy_reject_total',
-  ])
-  for (const raw of lines) {
-    const line = raw.trim()
-    if (!line || line.startsWith('#')) continue
-    const m = /^([a-zA-Z_][a-zA-Z0-9_]*)(?:\{([^}]*)\})?\s+([0-9eE.+\-]+)$/.exec(line)
-    if (!m) continue
-    const [, name, labelBlob, val] = m
-    if (!WHITELIST.has(name)) continue
-    const labels = {}
-    if (labelBlob) {
-      const lm = labelBlob.matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"/g)
-      for (const l of lm) labels[l[1]] = l[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\')
-    }
-    const n = Number(val)
-    if (!Number.isFinite(n)) continue
-    if (!out[name]) out[name] = []
-    out[name].push({ labels, value: n })
-  }
-  return out
+const DASH_STATE = {
+  refreshTimer: null,
+  dauWindow: '24h',   // 活跃度卡片窗口 toggle
+  reqHours: 24,        // 请求趋势窗口 toggle
+  charts: {},          // canvas 引用,供主题切换 / 销毁用
+  renderSeq: 0,        // 每次 renderDashboardTab 递增,异步任务按此判断自己是否过期
+  loadSeq: 0,          // 每次 loadDashboardData 递增;防止 timer + 手刷重叠时旧请求覆盖新结果
 }
 
-function sumBy(rows, pred = () => true) {
-  if (!rows) return 0
-  return rows.reduce((acc, r) => acc + (pred(r.labels) ? r.value : 0), 0)
-}
-
-/** 拉 Prometheus metrics(文本)。失败返 null。 */
-async function fetchMetricsText() {
-  try {
-    const r = await apiFetch('/api/admin/metrics', { headers: authHeaders() })
-    if (!r.ok) return null
-    return await r.text()
-  } catch {
-    return null
-  }
-}
+// Prometheus metrics 的前端 parser 已被 /api/admin/stats/* 后端聚合替代。
+// 健康页(renderHealthTab)里保留了一份内部 `_parsePromText` 自用,不走此处。
 
 async function renderDashboardTab() {
   // 停掉上一个 tab 的定时器
@@ -320,19 +320,37 @@ async function renderDashboardTab() {
     clearInterval(DASH_STATE.refreshTimer)
     DASH_STATE.refreshTimer = null
   }
+  // 销毁上一个 tab 遗留的 chart(切 tab / 热更新防泄漏)
+  _destroyDashCharts()
 
-  // 先渲染骨架
+  // R2 Codex M1:await loadDashboardData() 期间用户可能切走 tab。
+  // 递增 seq,后续异步 continuation 必须确认自己仍是"最新一次 render"才做副作用。
+  const mySeq = ++DASH_STATE.renderSeq
+
+  const dauW = DASH_STATE.dauWindow
+  const reqH = DASH_STATE.reqHours
+
   view().innerHTML = `
     <div class="dash">
       <div class="dash-h1">
         <h2>总览
           <span class="dash-sub" id="dash-last-refresh">加载中…</span>
         </h2>
-        <button class="btn" id="dash-refresh">刷新</button>
+        <div style="display:flex;gap:var(--s-2);align-items:center;">
+          <div class="chart-toggle" id="dash-dau-toggle">
+            <button data-w="24h" class="${dauW==='24h'?'is-active':''}">24h</button>
+            <button data-w="7d"  class="${dauW==='7d' ?'is-active':''}">7d</button>
+            <button data-w="30d" class="${dauW==='30d'?'is-active':''}">30d</button>
+          </div>
+          <button class="btn" id="dash-refresh">刷新</button>
+        </div>
       </div>
 
-      <div class="stat-grid">
-        ${['活跃用户','Token 消耗','请求总数','账号池可用','平均 TTFT','今日营收'].map((label) => `
+      <div class="stat-grid" id="dash-kpis">
+        ${[
+          '活跃用户 DAU','窗口新注册','付费用户','返场用户',
+          '24h 请求数','24h Token','账号池 可用','告警 · 待处理',
+        ].map((label) => `
           <div class="stat-card">
             <div class="stat-label">${escapeHtml(label)}</div>
             <div class="stat-value is-loading">—</div>
@@ -340,10 +358,50 @@ async function renderDashboardTab() {
           </div>`).join('')}
       </div>
 
+      <div class="chart-grid">
+        <div class="chart-card">
+          <div class="chart-card-head">
+            <h3>请求趋势 · 最近 ${escapeHtml(String(reqH))} 小时</h3>
+            <div class="chart-toggle" id="dash-req-toggle">
+              <button data-h="24"  class="${reqH===24 ?'is-active':''}">24h</button>
+              <button data-h="72"  class="${reqH===72 ?'is-active':''}">3d</button>
+              <button data-h="168" class="${reqH===168?'is-active':''}">7d</button>
+            </div>
+          </div>
+          <div class="chart-card-body"><canvas id="dash-chart-req"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <div class="chart-card-head">
+            <h3>账号池状态</h3>
+            <a class="admin-link" data-nav="accounts">详情 →</a>
+          </div>
+          <div class="chart-card-body"><canvas id="dash-chart-pool"></canvas></div>
+        </div>
+      </div>
+
+      <div class="chart-grid" style="grid-template-columns: 1fr 1fr;">
+        <div class="chart-card">
+          <div class="chart-card-head">
+            <h3>营收 · 最近 14 天</h3>
+            <span class="chart-sub" id="dash-revenue-sub">—</span>
+          </div>
+          <div class="chart-card-body"><canvas id="dash-chart-revenue"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <div class="chart-card-head">
+            <h3>告警概况 · 24h</h3>
+            <a class="admin-link" data-nav="alerts">告警中心 →</a>
+          </div>
+          <div class="chart-card-body" id="dash-alerts-body">
+            <div class="skeleton-row"><div class="skeleton-bar w60"></div></div>
+          </div>
+        </div>
+      </div>
+
       <div class="admin-two-col">
         <div class="admin-card">
           <div class="admin-card-head">
-            <h3>账号池状态</h3>
+            <h3>账号池明细</h3>
             <a class="admin-link" data-nav="accounts">查看全部 →</a>
           </div>
           <div class="pool-list" id="dash-pools"><div class="skeleton-row"><div class="skeleton-bar w60"></div></div></div>
@@ -358,94 +416,298 @@ async function renderDashboardTab() {
       </div>
     </div>`
 
-  // 装弹第一次数据
-  await loadDashboardData()
+  await loadDashboardData(mySeq)
 
-  // 手动刷新
+  // R2 Codex M1:await 期间可能用户已切走或又点了一次 DAU toggle 触发新 render。
+  // 如果不是"最新一次 dashboard render",就不要再绑事件/起 timer —— 上一个 render
+  // 的副作用已经被 TAB_CLEANUPS 或下一个 render 清过了,这里重新绑会造成 handler
+  // 挂到已被 innerHTML 替换掉的旧节点上,或者启动多个平行的 30s timer。
+  if (mySeq !== DASH_STATE.renderSeq || _currentTab !== 'dashboard') return
+
+  // ─── 事件绑定 ───
   $('dash-refresh')?.addEventListener('click', async (ev) => {
-    await withBtnLoading(ev.currentTarget, () => loadDashboardData())
+    await withBtnLoading(ev.currentTarget, () => loadDashboardData(DASH_STATE.renderSeq))
   })
-  // 导航快捷键
+  for (const b of $('dash-dau-toggle')?.querySelectorAll('button[data-w]') || []) {
+    b.addEventListener('click', () => {
+      DASH_STATE.dauWindow = b.dataset.w
+      renderDashboardTab()
+    })
+  }
+  for (const b of $('dash-req-toggle')?.querySelectorAll('button[data-h]') || []) {
+    b.addEventListener('click', () => {
+      DASH_STATE.reqHours = Number(b.dataset.h) || 24
+      renderDashboardTab()
+    })
+  }
   for (const a of view().querySelectorAll('a[data-nav]')) {
     a.addEventListener('click', (e) => {
       e.preventDefault()
       navigate(a.dataset.nav)
     })
   }
-  // 30 秒自动刷新(离开 tab 时 applyHash() 会重新渲染,不会重复 timer)
+
+  // 30 秒自动刷新。切 tab 时 TAB_CLEANUPS.dashboard 会清掉 timer;此处捕获 seq
+  // 防止上一轮 render 的"游离 timer"在清理前又塞一次 loadDashboardData 到队列。
+  const timerSeq = mySeq
   DASH_STATE.refreshTimer = setInterval(() => {
-    if (/#tab=dashboard/.test(window.location.hash) || window.location.hash === '') {
-      loadDashboardData().catch(() => {})
-    }
+    if (timerSeq !== DASH_STATE.renderSeq || _currentTab !== 'dashboard') return
+    loadDashboardData(DASH_STATE.renderSeq).catch(() => {})
   }, 30_000)
 }
 
-async function loadDashboardData() {
-  // 并行拉 3 条
-  const [accountsRes, ledgerRes, metricsText] = await Promise.allSettled([
-    apiGet('/api/admin/accounts').catch(() => null),
-    apiGet('/api/admin/ledger?limit=8').catch(() => null),
-    fetchMetricsText(),
+/** 销毁 dashboard 所有缓存的 chart 实例,防止 tab 切换 / 重新渲染时泄漏。 */
+function _destroyDashCharts() {
+  for (const c of Object.values(DASH_STATE.charts)) {
+    if (c) destroyChart(c)
+  }
+  DASH_STATE.charts = {}
+}
+
+/** 在 canvas 上画个"加载失败"文本占位。
+ *  下一次 render 成功会走 destroyChart → 新 Chart.js 实例,占位自动被 Chart.js 盖住。 */
+function _renderChartError(canvas, msg) {
+  if (!canvas) return
+  destroyChart(canvas)
+  try {
+    // R2 Codex L2:canvas 没被 Chart.js attach 过时,其 backing store 默认是
+    // 300×150;直接按 canvas.width/height 居中画,文字会挤在左上角。
+    // 先按父容器的 clientSize + devicePixelRatio 把 canvas 抻到实际可视大小,
+    // 再画文字 —— 这样无论 chart-card-body 多大,"加载失败"都在视觉正中。
+    const parent = canvas.parentElement
+    const cssW = Math.max(160, parent?.clientWidth  || canvas.width)
+    const cssH = Math.max(120, parent?.clientHeight || canvas.height)
+    const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1))
+    canvas.style.width  = `${cssW}px`
+    canvas.style.height = `${cssH}px`
+    canvas.width  = Math.round(cssW * dpr)
+    canvas.height = Math.round(cssH * dpr)
+
+    const ctx = canvas.getContext('2d')
+    ctx.save()
+    ctx.scale(dpr, dpr)
+    ctx.clearRect(0, 0, cssW, cssH)
+    ctx.fillStyle = getComputedStyle(document.documentElement)
+      .getPropertyValue('--muted').trim() || '#888'
+    ctx.font = '13px -apple-system, "Inter", sans-serif'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillText(String(msg || '加载失败'), cssW / 2, cssH / 2)
+    ctx.restore()
+  } catch {
+    /* canvas 2d 不可用 ignore */
+  }
+}
+
+async function loadDashboardData(seq) {
+  const dauW = DASH_STATE.dauWindow
+  const reqH = DASH_STATE.reqHours
+  // R3 Codex L1:timer + 手动刷新 + toggle 连点 可能并发触发两次 loadDashboardData。
+  // 网络/后端延迟不保证"后发先到",旧请求若晚返回会把新结果覆盖回去(或"加载失败"
+  // 覆盖成功态)。用独立 loadSeq 判定"我是不是最新一次 load",非最新直接 bail。
+  const myLoadSeq = ++DASH_STATE.loadSeq
+
+  // 并行拉 5 条新 stats + 2 条明细 (accounts / ledger)。
+  // 每个端点独立 fulfilled/rejected,失败的不传染其他卡片(R1 Codex M3)。
+  const [dauR, revR, reqR, alertsR, poolR, accountsR, ledgerR] = await Promise.allSettled([
+    apiGet(`/api/admin/stats/dau?window=${encodeURIComponent(dauW)}`),
+    apiGet(`/api/admin/stats/revenue-by-day?days=14`),
+    apiGet(`/api/admin/stats/request-series?hours=${reqH}`),
+    apiGet(`/api/admin/stats/alerts-summary`),
+    apiGet(`/api/admin/stats/account-pool`),
+    apiGet(`/api/admin/accounts`),
+    apiGet(`/api/admin/ledger?limit=8`),
   ])
-  const accounts = accountsRes.status === 'fulfilled' ? (accountsRes.value?.rows || []) : []
-  const ledger = ledgerRes.status === 'fulfilled' ? (ledgerRes.value?.rows || []) : []
-  const prom = metricsText.status === 'fulfilled' && metricsText.value
-    ? parsePromText(metricsText.value)
-    : {}
 
-  // ─── Stat cards ───
-  const statCards = view().querySelectorAll('.stat-card')
+  // R2 Codex M1:fetch 期间如果用户切 tab / 又触发了一次 renderDashboardTab,
+  // 我们捕获的 seq 会过期。此时 DOM 可能已被替换,继续写是 no-op 但会在 canvas
+  // 上挂 Chart.js 实例拖到下一轮泄漏。直接 bail,不改任何 DOM。
+  // R3 Codex L1:同时检查 loadSeq —— 若另一个并发 loadDashboardData 已启动,
+  // 本次结果已过期,直接丢弃。
+  if (seq != null && (seq !== DASH_STATE.renderSeq || _currentTab !== 'dashboard')) return
+  if (myLoadSeq !== DASH_STATE.loadSeq) return
 
-  // 活跃用户 — 暂无 /active_24h 端点,从 ledger 里提 unique user 数
-  const activeUsers = new Set(ledger.map((r) => r.user_id).filter(Boolean))
-  updateStat(statCards[0], activeUsers.size.toLocaleString(), '最近流水中的独立用户', null)
+  const dau        = dauR.status === 'fulfilled' ? dauR.value : null
+  const revOk      = revR.status === 'fulfilled'
+  const reqOk      = reqR.status === 'fulfilled'
+  const alertsOk   = alertsR.status === 'fulfilled'
+  const poolOk     = poolR.status === 'fulfilled'
+  const accountsOk = accountsR.status === 'fulfilled'
+  const ledgerOk   = ledgerR.status  === 'fulfilled'
+  const rev        = revOk    ? (revR.value?.rows || []) : []
+  const reqSeries  = reqOk    ? (reqR.value?.rows || []) : []
+  const alerts     = alertsOk ? alertsR.value : null
+  const pool       = poolOk   ? poolR.value : null
+  const accounts   = accountsOk ? (accountsR.value?.rows || []) : []
+  const ledger     = ledgerOk  ? (ledgerR.value?.rows  || []) : []
 
-  // Token 消耗 — 用 claude_api_requests_total(success) 汇总
-  const claudeSuccess = sumBy(prom.claude_api_requests_total, (l) => l.status === 'success')
-  const claudeErr = sumBy(prom.claude_api_requests_total, (l) => l.status === 'error')
-  updateStat(statCards[1], '—', 'Prometheus 无 token 计数', null)
-  // 请求总数
-  const totalReq = claudeSuccess + claudeErr
-  const errRate = totalReq > 0 ? (claudeErr / totalReq * 100) : 0
-  updateStat(statCards[2], totalReq.toLocaleString(),
-    totalReq > 0 ? `错误率 ${errRate.toFixed(2)}%` : '—',
-    errRate > 5 ? 'danger' : errRate > 1 ? 'warning' : 'success')
+  // ─── KPI 卡片(8 项) ───
+  const statCards = view().querySelectorAll('#dash-kpis .stat-card')
+  const wLabel = dauW === '24h' ? '24 小时' : dauW === '7d' ? '7 天' : '30 天'
 
-  // 账号池可用
-  const poolAvail = accounts.filter((a) => a.status === 'active').length
-  const poolTotal = accounts.length
-  const poolCooldown = accounts.filter((a) => a.status === 'cooldown').length
-  const poolDisabled = accounts.filter((a) => a.status === 'disabled' || a.status === 'banned').length
-  updateStat(statCards[3], `${poolAvail} / ${poolTotal}`,
-    poolCooldown > 0 ? `${poolCooldown} 冷却中` : (poolDisabled > 0 ? `${poolDisabled} 禁用` : '全部健康'),
-    poolTotal === 0 ? null : (poolAvail === poolTotal ? 'success' : poolCooldown > 0 ? 'warning' : 'danger'))
+  // 1-4. DAU 相关四张卡 — /stats/dau 失败 → 保持骨架,不显示 0
+  if (dau) {
+    updateStat(statCards[0], dau.active_users.toLocaleString(), `窗口 ${wLabel}`, null)
+    updateStat(statCards[1], dau.new_users.toLocaleString(),
+      `窗口 ${wLabel} 首次注册`, dau.new_users > 0 ? 'success' : null)
+    updateStat(statCards[2], dau.paying_users.toLocaleString(),
+      `窗口 ${wLabel} 有 topup`, dau.paying_users > 0 ? 'success' : null)
+    updateStat(statCards[3], dau.returning_users.toLocaleString(),
+      `窗口 ${wLabel} 登录/续签`, null)
+  } else {
+    for (const i of [0, 1, 2, 3]) updateStat(statCards[i], '—', '加载失败', 'danger')
+  }
 
-  // 平均 TTFT
-  const ttftSum = sumBy(prom.anthropic_proxy_ttft_seconds_sum)
-  const ttftCnt = sumBy(prom.anthropic_proxy_ttft_seconds_count)
-  const ttftAvg = ttftCnt > 0 ? (ttftSum / ttftCnt) : null
-  updateStat(statCards[4],
-    ttftAvg == null ? '—' : (ttftAvg < 1 ? `${Math.round(ttftAvg * 1000)} ms` : `${ttftAvg.toFixed(2)} s`),
-    ttftCnt > 0 ? `样本 ${ttftCnt.toLocaleString()}` : '暂无样本',
-    ttftAvg == null ? null : (ttftAvg < 1 ? 'success' : ttftAvg < 3 ? 'warning' : 'danger'))
+  // 5-6. request series — 失败 → "—"
+  if (reqOk) {
+    const totalReq = reqSeries.reduce((a, r) => a + (Number(r.total) || 0), 0)
+    const totalErr = reqSeries.reduce((a, r) => a + (Number(r.error) || 0), 0)
+    const errRate = totalReq > 0 ? (totalErr / totalReq) : 0
+    updateStat(statCards[4], totalReq.toLocaleString(),
+      totalReq > 0 ? `错误率 ${(errRate * 100).toFixed(2)}%` : `窗口 ${reqH}h 无请求`,
+      totalReq === 0 ? null : (errRate > 0.05 ? 'danger' : errRate > 0.01 ? 'warning' : 'success'))
+    const totalTokens = reqSeries.reduce((a, r) => {
+      const t = Number(r.tokens || 0)
+      return Number.isFinite(t) ? a + t : a
+    }, 0)
+    updateStat(statCards[5], cfmt.compact(totalTokens), `窗口 ${reqH}h 总 token`, null)
+  } else {
+    updateStat(statCards[4], '—', '加载失败', 'danger')
+    updateStat(statCards[5], '—', '加载失败', 'danger')
+  }
 
-  // 今日营收 — 累加今日 topup / agent_subscription 的正 delta(用户付费进账)。
-  // 排除 promotion / admin_adjust(营销与人工补偿不算营收),排除 chat / agent_chat
-  // (它们是负 delta,filter(delta>0) 也会过滤掉,但留着白名单更明确)。
-  const today = new Date().toISOString().slice(0, 10)
-  const todayRevenue = ledger
-    .filter((r) => String(r.created_at || '').startsWith(today))
-    .filter((r) => r.reason === 'topup' || r.reason === 'agent_subscription')
-    .filter((r) => Number(r.delta) > 0)
-    .reduce((acc, r) => acc + Number(r.delta), 0)
-  updateStat(statCards[5], fmtCents(todayRevenue),
-    todayRevenue > 0 ? '已入账' : '样本仅最近 8 条',
-    todayRevenue > 0 ? 'success' : null)
+  // 7. 账号池
+  if (pool) {
+    const avail = pool.active
+    const tot = pool.total
+    const tone = tot === 0 ? null : (avail === tot ? 'success'
+      : pool.cooldown > 0 ? 'warning' : 'danger')
+    const meta = pool.cooldown > 0 ? `${pool.cooldown} 冷却`
+      : (pool.disabled + pool.banned > 0 ? `${pool.disabled + pool.banned} 禁用/封禁` : '全部健康')
+    updateStat(statCards[6], `${avail} / ${tot}`, meta, tone)
+  } else {
+    updateStat(statCards[6], '—', '加载失败', 'danger')
+  }
 
-  // ─── Pool list ───
+  // 8. 告警待处理
+  if (alerts) {
+    const p = alerts.outbox.pending + alerts.outbox.failed
+    const sev = alerts.events_24h_by_severity
+    const tone = alerts.outbox.failed > 0 ? 'danger'
+      : alerts.outbox.pending > 0 ? 'warning'
+      : sev.critical > 0 ? 'danger' : null
+    updateStat(statCards[7], p.toLocaleString(),
+      `发送 24h · ${alerts.outbox.sent_24h}  规则 firing · ${alerts.rules.firing}`,
+      tone)
+  } else {
+    updateStat(statCards[7], '—', '加载失败', 'danger')
+  }
+
+  // ─── Chart: 请求趋势(折线)───
+  const reqCanvas = document.getElementById('dash-chart-req')
+  if (reqCanvas) {
+    if (reqOk) {
+      reqCanvas.style.display = ''
+      DASH_STATE.charts.req = reqCanvas
+      lineChart(reqCanvas, {
+        labels: reqSeries.map((r) => reqH > 24 ? r.hour.slice(5, 16) : cfmt.hourShort(r.hour)),
+        series: [
+          { label: '成功', data: reqSeries.map((r) => Number(r.success) || 0), fill: true },
+          { label: '错误', data: reqSeries.map((r) => Number(r.error) || 0), color: getComputedStyle(document.documentElement).getPropertyValue('--danger').trim() || '#e06c6c', fill: false },
+          { label: '独立用户', data: reqSeries.map((r) => Number(r.users) || 0), color: getComputedStyle(document.documentElement).getPropertyValue('--warn').trim() || '#e8b64c', fill: false },
+        ],
+      })
+    } else {
+      _renderChartError(reqCanvas, '加载失败')
+    }
+  }
+
+  // ─── Chart: 账号池环形 ───
+  const poolCanvas = document.getElementById('dash-chart-pool')
+  if (poolCanvas) {
+    if (pool) {
+      DASH_STATE.charts.pool = poolCanvas
+      donutChart(poolCanvas, {
+        labels: ['active', 'cooldown', 'disabled', 'banned'],
+        values: [pool.active, pool.cooldown, pool.disabled, pool.banned],
+        colors: ['--ok', '--warn', '--muted', '--danger'],
+      })
+    } else {
+      _renderChartError(poolCanvas, '加载失败')
+    }
+  }
+
+  // ─── Chart: 营收柱状 ───
+  const revCanvas = document.getElementById('dash-chart-revenue')
+  if (revCanvas) {
+    if (revOk) {
+      DASH_STATE.charts.rev = revCanvas
+      barChart(revCanvas, {
+        labels: rev.map((r) => cfmt.dayShort(r.day)),
+        series: [
+          { label: '订单金额(元)', data: rev.map((r) => Number(r.paid_amount_cents) / 100) },
+          { label: '新订阅数',    data: rev.map((r) => Number(r.new_subscriptions) || 0),
+            color: getComputedStyle(document.documentElement).getPropertyValue('--warn').trim() || '#e8b64c' },
+        ],
+        yFormatter: (v) => {
+          // 第一 series 是元,第二是订阅数;formatter 对二者都生效,尺度主要由订单金额主导。
+          return Number.isInteger(v) ? String(v) : v.toFixed(1)
+        },
+      })
+      const sub = $('dash-revenue-sub')
+      if (sub) {
+        const totalY = rev.reduce((a, r) => a + Number(r.paid_amount_cents) / 100, 0)
+        const totalO = rev.reduce((a, r) => a + (Number(r.orders_paid) || 0), 0)
+        sub.textContent = `合计 ¥${totalY.toFixed(2)}  ·  ${totalO} 笔`
+      }
+    } else {
+      _renderChartError(revCanvas, '加载失败')
+      const sub = $('dash-revenue-sub')
+      if (sub) sub.textContent = '—'
+    }
+  }
+
+  // ─── 告警概况列表 ───
+  const alertsEl = $('dash-alerts-body')
+  if (alertsEl && !alertsOk) {
+    alertsEl.innerHTML = '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--danger)">加载失败</div>'
+  } else if (alertsEl && alerts) {
+    const sev = alerts.events_24h_by_severity
+    const bars = `
+      <div style="display:flex;gap:var(--s-3);flex-wrap:wrap;">
+        <span class="stat-chip danger">critical · ${sev.critical}</span>
+        <span class="stat-chip warn">warning · ${sev.warning}</span>
+        <span class="stat-chip ok">info · ${sev.info}</span>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-top:8px;">
+        outbox: <b>${alerts.outbox.pending}</b> 待发
+        · <b>${alerts.outbox.failed}</b> 失败
+        · <b>${alerts.outbox.sent_24h}</b> 24h 已发
+        ${alerts.outbox.oldest_pending_age_sec > 0
+          ? `<br>最老 pending 等待 <b>${fmtAgeSec(alerts.outbox.oldest_pending_age_sec)}</b>`
+          : ''}
+      </div>
+      <div class="dash-alerts" style="margin-top:var(--s-3);">
+        <div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:0.06em;">最近 firing 规则</div>
+        ${alerts.rules.recent_firing.length === 0
+          ? `<div class="empty" style="padding:8px;font-size:12px;color:var(--muted)">当前无规则处于 firing</div>`
+          : alerts.rules.recent_firing.map((r) => `
+              <div class="dash-alert-row">
+                <code>${escapeHtml(r.rule_id)}</code>
+                <span class="dash-alert-time">${escapeHtml(fmtDate(r.fired_at))}</span>
+              </div>`).join('')}
+      </div>`
+    alertsEl.innerHTML = bars
+  }
+
+  // ─── 账号池明细列 ───
   const poolEl = $('dash-pools')
   if (poolEl) {
-    if (accounts.length === 0) {
+    if (!accountsOk) {
+      // R2 Codex L1:拉账号列表失败时明确告诉用户"加载失败",
+      // 别和"真的没账号"(空数组)混在一起。
+      poolEl.innerHTML = '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--danger)">加载失败</div>'
+    } else if (accounts.length === 0) {
       poolEl.innerHTML = '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--muted)">暂无账号</div>'
     } else {
       poolEl.innerHTML = accounts.slice(0, 6).map((a) => {
@@ -466,10 +728,13 @@ async function loadDashboardData() {
     }
   }
 
-  // ─── Recent ledger activity ───
+  // ─── 最近流水 ───
   const activityEl = $('dash-activity')
   if (activityEl) {
-    if (ledger.length === 0) {
+    if (!ledgerOk) {
+      // R2 Codex L1:同上,区分"ledger 拉失败"与"真的没流水"。
+      activityEl.innerHTML = '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--danger)">加载失败</div>'
+    } else if (ledger.length === 0) {
       activityEl.innerHTML = '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--muted)">暂无流水</div>'
     } else {
       activityEl.innerHTML = ledger.map((l) => {
@@ -477,15 +742,8 @@ async function loadDashboardData() {
         const delta = Number(l.delta || 0)
         const cls = delta > 0 ? 'is-positive' : delta < 0 ? 'is-negative' : ''
         const sign = delta > 0 ? '+' : ''
-        const kindLabel = {
-          plan_subscription: '订阅',
-          agent_subscription: 'Agent 订阅',
-          chat_debit: '对话',
-          agent_chat_debit: 'Agent',
-          refund: '退款',
-          admin_adjust: '管理员调整',
-          promotion: '活动赠送',
-        }[l.reason] || l.reason
+        // 中文 label 复用顶部 LEDGER_REASON_LABELS(与后端 LEDGER_REASONS 同步)。
+        const kindLabel = LEDGER_REASON_LABELS[l.reason] || l.reason
         return `
           <div class="log-row">
             <span class="mono">${escapeHtml(t)}</span>
@@ -499,6 +757,19 @@ async function loadDashboardData() {
 
   const ts = $('dash-last-refresh')
   if (ts) ts.textContent = `更新于 ${fmtTime(new Date().toISOString())}  ·  30s 自动刷新`
+}
+
+/** 人类可读的等待秒数 ("5分02秒" / "1小时23分" / "3天")。 */
+function fmtAgeSec(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0))
+  if (s < 60) return `${s} 秒`
+  if (s < 3600) return `${Math.floor(s / 60)} 分 ${s % 60} 秒`
+  if (s < 86400) {
+    const h = Math.floor(s / 3600)
+    const m = Math.floor((s % 3600) / 60)
+    return `${h} 小时 ${m} 分`
+  }
+  return `${Math.floor(s / 86400)} 天`
 }
 
 function updateStat(card, value, delta, tone) {
@@ -1051,7 +1322,14 @@ async function containerAction(id, action, btn) {
 
 async function renderLedgerTab() {
   const userId = sessionStorage.getItem('admin_ledger_user') || ''
-  const reason = sessionStorage.getItem('admin_ledger_reason') || ''
+  // R2 Codex M2:sessionStorage 里残留的 reason 可能来自旧版本(比如 "expire" 已
+  // 不在白名单里);后端 ledger.ts 对 unknown reason 会 400 拒。启动时先按当前
+  // LEDGER_REASONS 白名单卫生一次 —— 不认的一律归为"全部"并清掉。
+  let reason = sessionStorage.getItem('admin_ledger_reason') || ''
+  if (reason && !LEDGER_REASONS.includes(reason)) {
+    reason = ''
+    sessionStorage.removeItem('admin_ledger_reason')
+  }
   const sp = new URLSearchParams({ limit: '100' })
   if (userId) sp.set('user_id', userId)
   if (reason) sp.set('reason', reason)
@@ -1064,8 +1342,8 @@ async function renderLedgerTab() {
         <input type="text" id="l-uid" placeholder="user_id 过滤" value="${escapeHtml(userId)}" />
         <select id="l-reason">
           <option value="">全部 reason</option>
-          ${['topup','chat','admin_adjust','refund','expire'].map((r) =>
-            `<option value="${r}" ${reason === r ? 'selected' : ''}>${r}</option>`).join('')}
+          ${LEDGER_REASONS.map((r) =>
+            `<option value="${r}" ${reason === r ? 'selected' : ''}>${LEDGER_REASON_LABELS[r]}</option>`).join('')}
         </select>
         <button class="btn btn-primary" id="l-go">查询</button>
       </div>

@@ -572,6 +572,112 @@
         display: block;
       }
 
+      /* ══════════ Chart cards (dashboard) ══════════ */
+      .chart-grid {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: var(--s-4);
+      }
+      @media (max-width: 1100px) {
+        .chart-grid { grid-template-columns: 1fr; }
+      }
+      .chart-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: var(--r-lg);
+        padding: var(--s-5);
+        box-shadow: var(--shadow-sm);
+        display: flex;
+        flex-direction: column;
+        gap: var(--s-3);
+        min-height: 320px;
+      }
+      .chart-card-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: var(--s-3);
+      }
+      .chart-card-head h3 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text-strong);
+      }
+      .chart-card-head .chart-sub {
+        color: var(--muted);
+        font-size: 11.5px;
+        font-family: var(--font-mono);
+      }
+      .chart-card-body {
+        flex: 1;
+        position: relative;
+        min-height: 240px;
+      }
+      .chart-card-body canvas {
+        max-width: 100%;
+      }
+      .chart-toggle {
+        display: flex;
+        gap: 2px;
+        padding: 2px;
+        background: var(--bg-subtle);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--r-pill);
+      }
+      .chart-toggle button {
+        background: transparent;
+        border: 0;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 500;
+        padding: 4px 12px;
+        border-radius: var(--r-pill);
+        cursor: pointer;
+        transition: color var(--t-fast), background var(--t-fast);
+      }
+      .chart-toggle button:hover { color: var(--text-strong); }
+      .chart-toggle button.is-active {
+        background: var(--panel);
+        color: var(--text-strong);
+        box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+      }
+
+      /* Dashboard alerts list (secondary section) */
+      .dash-alerts {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .dash-alert-row {
+        display: flex;
+        gap: var(--s-3);
+        align-items: center;
+        padding: 8px 10px;
+        border-radius: var(--r-sm);
+        background: var(--bg-subtle);
+        border: 1px solid var(--border-subtle);
+        font-size: 12.5px;
+      }
+      .dash-alert-row code { color: var(--text); font-family: var(--font-mono); }
+      .dash-alert-row .dash-alert-time { color: var(--muted); font-size: 11.5px; margin-left: auto; }
+
+      /* KPI chip (small colored pill shown after stat value) */
+      .stat-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+        border-radius: var(--r-pill);
+        font-size: 11px;
+        font-weight: 600;
+        margin-left: 8px;
+        vertical-align: middle;
+      }
+      .stat-chip.ok     { background: var(--ok-soft);     color: var(--ok); }
+      .stat-chip.warn   { background: var(--warn-soft);   color: var(--warn); }
+      .stat-chip.danger { background: var(--danger-soft); color: var(--danger); }
+
       @keyframes shimmer {
         0%   { background-position: 200% 0; }
         100% { background-position: -200% 0; }
@@ -1416,6 +1522,8 @@
          不是图片,要客户端 encode 成 QR 码图给 admin 扫。与 SPA 侧 wechat 绑定
          复用同一份库。普通 script 标签(非 module),挂到 window.qrcode 全局。 -->
     <script src="/vendor/qrcode.min.js"></script>
-    <script type="module" src="/modules/admin.js?v=a70fb17"></script>
+    <!-- Chart.js (MIT) 用于 dashboard 折线/柱/饼图。UMD bundle,挂到 window.Chart。 -->
+    <script src="/vendor/chart.umd.min.js"></script>
+    <script type="module" src="/modules/admin.js?v=d1a0002"></script>
   </body>
 </html>

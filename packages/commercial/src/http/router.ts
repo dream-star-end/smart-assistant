@@ -86,6 +86,13 @@ import {
   handleAdminPutSetting,
 } from "./admin.js";
 import {
+  handleAdminStatsDau,
+  handleAdminStatsRevenueByDay,
+  handleAdminStatsRequestSeries,
+  handleAdminStatsAlertsSummary,
+  handleAdminStatsAccountPool,
+} from "./adminStats.js";
+import {
   handleAdminAlertsListEvents,
   handleAdminAlertsListChannels,
   handleAdminAlertsIlinkQrcode,
@@ -393,6 +400,12 @@ export function createCommercialHandler(
     { method: "GET", path: "/api/admin/ledger", handler: handleAdminListLedger },
     // T-62 Prometheus 指标
     { method: "GET", path: "/api/admin/metrics", handler: handleAdminMetrics },
+    // T-60 R1 Dashboard 聚合(只读,requireAdmin JWT only)
+    { method: "GET", path: "/api/admin/stats/dau",             handler: handleAdminStatsDau },
+    { method: "GET", path: "/api/admin/stats/revenue-by-day",  handler: handleAdminStatsRevenueByDay },
+    { method: "GET", path: "/api/admin/stats/request-series",  handler: handleAdminStatsRequestSeries },
+    { method: "GET", path: "/api/admin/stats/alerts-summary",  handler: handleAdminStatsAlertsSummary },
+    { method: "GET", path: "/api/admin/stats/account-pool",    handler: handleAdminStatsAccountPool },
     // V3 Phase 4H 超管运行时设置(allowlist + per-key zod)
     { method: "GET", path: "/api/admin/settings",         handler: handleAdminListSettings },
     { method: "GET", pathPrefix: "/api/admin/settings/",  handler: handleAdminGetSetting },
