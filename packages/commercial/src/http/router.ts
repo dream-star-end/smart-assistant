@@ -81,6 +81,8 @@ import {
   handleAdminOAuthStart,
   handleAdminOAuthExchange,
   handleAdminListAgentContainers,
+  handleAdminContainersStats,
+  handleAdminContainerLogs,
   handleAdminAgentContainerAction,
   handleAdminListLedger,
   handleAdminMetrics,
@@ -406,6 +408,10 @@ export function createCommercialHandler(
     { method: "DELETE", pathPrefix: "/api/admin/accounts/",  handler: handleAdminDeleteAccount },
     // T-60 超管 Agent 容器
     { method: "GET",  path: "/api/admin/agent-containers",        handler: handleAdminListAgentContainers },
+    // R4:exact path 在 pathPrefix 之前(matchRoute exact-first)
+    { method: "GET",  path: "/api/admin/agent-containers/stats",  handler: handleAdminContainersStats },
+    // R4:GET /:id/logs(handler 内部 regex 匹配,其它 GET 子路径回 404)
+    { method: "GET",  pathPrefix: "/api/admin/agent-containers/", handler: handleAdminContainerLogs },
     { method: "POST", pathPrefix: "/api/admin/agent-containers/", handler: handleAdminAgentContainerAction },
     // T-60 超管积分流水
     { method: "GET", path: "/api/admin/ledger", handler: handleAdminListLedger },

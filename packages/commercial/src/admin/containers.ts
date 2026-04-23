@@ -273,6 +273,120 @@ async function auditBestEffort(
   }
 }
 
+// ─── logs ─────────────────────────────────────────────────────────
+
+/**
+ * R4 — admin 读取容器 tail 日志。
+ *
+ * dockerode 底层调 `GET /containers/:id/logs?stdout=1&stderr=1&tail=N`。
+ * Tty=false(supervisor.ts:385 / v3supervisor.ts:964 都是 false)→ 响应体是
+ * docker 的多路复用帧格式:
+ *   [uint8 stream][3 bytes padding][uint32 be payload_len][payload ...]
+ *   stream: 1=stdout, 2=stderr(0=stdin,通常看不到)
+ *
+ * 本函数返回 `{stdout, stderr, combined}`:
+ *   - combined = 原文流顺序拼接(admin 想像 `docker logs` 一样看)
+ *   - stdout/stderr = 只是按流拆开,前端可以选显示
+ *
+ * 错误语义:
+ *   - 行不存在 → ContainerNotFoundError
+ *   - v2 行但 docker 容器 404(legacy removed) → 返回空内容,不抛
+ *   - v3 行但 container_internal_id=NULL(vanished 或 provision 失败) → 返回空
+ *   - v3 行但 docker 404 → 返回空
+ *   - 其它 docker 错误(500 / network) → 透传给 caller,http 层翻 502
+ */
+export interface AdminContainerLogs {
+  stdout: string;
+  stderr: string;
+  combined: string;
+  /** 参考信息:调用时拿到的 docker identifier(name for v2, internal id for v3)。
+   *  admin UI 显示,便于直接去宿主机 `docker logs` 复查。 */
+  docker_ref: string | null;
+  /** 容器在宿主机上不存在(v2 removed / v3 vanished / provision 失败)。 */
+  missing: boolean;
+}
+
+/** docker tail,默认 200 行,上限 500(再多 UI 也看不动)。 */
+export const LOGS_MAX_LINES = 500;
+
+/** 响应字节上限。Docker `tail` 按行截断,但单行若是 base64/dump 可能上 MB 级别,
+ *  走一次 tail=500 可能意外拖 GB 内存到 gateway。2MiB 足够 admin 扫错误栈。 */
+export const LOGS_MAX_BYTES = 2 * 1024 * 1024;
+
+function decodeDockerLogFrames(buf: Buffer): { stdout: string; stderr: string; combined: string } {
+  let stdout = "";
+  let stderr = "";
+  let combined = "";
+  let off = 0;
+  while (off + 8 <= buf.length) {
+    const stream = buf[off]!;
+    const len = buf.readUInt32BE(off + 4);
+    if (off + 8 + len > buf.length) break; // 截断(不大可能,docker 会给完整帧)
+    const payload = buf.slice(off + 8, off + 8 + len).toString("utf8");
+    if (stream === 2) stderr += payload;
+    else stdout += payload; // stream=1 或异常值都归 stdout
+    combined += payload;
+    off += 8 + len;
+  }
+  return { stdout, stderr, combined };
+}
+
+export async function adminContainerLogs(
+  id: bigint | string,
+  docker: Docker,
+  tail: number,
+  v3Deps?: V3SupervisorDeps,
+): Promise<AdminContainerLogs> {
+  if (!Number.isInteger(tail) || tail <= 0) throw new RangeError("invalid_tail");
+  if (tail > LOGS_MAX_LINES) tail = LOGS_MAX_LINES;
+  const info = await lookupContainer(id);
+  if (!info) throw new ContainerNotFoundError(id);
+
+  // 选 docker identifier
+  let ref: string | null = null;
+  if (info.kind === "v2") {
+    ref = info.dockerName;
+  } else {
+    if (!v3Deps) throw new V3SupervisorMissingError(id);
+    ref = info.containerInternalId; // 可能 NULL(provision 中 / vanished)
+  }
+  if (!ref) {
+    return { stdout: "", stderr: "", combined: "", docker_ref: null, missing: true };
+  }
+
+  try {
+    // dockerode 不设 follow 时返回 Buffer;类型写的是 NodeJS.ReadableStream,实际是 Buffer
+    const raw = (await docker.getContainer(ref).logs({
+      stdout: true,
+      stderr: true,
+      tail,
+      follow: false,
+      timestamps: true,
+    })) as unknown as Buffer;
+    let buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as unknown as ArrayBuffer);
+    // 字节上限防御:单行特别长(base64 dump)可能让 tail=500 返回 GB 级响应,
+    // 直接从 buffer 末尾裁,保留最后 LOGS_MAX_BYTES(admin 最关心最近输出)。
+    let truncated = false;
+    if (buf.length > LOGS_MAX_BYTES) {
+      buf = buf.slice(buf.length - LOGS_MAX_BYTES);
+      truncated = true;
+    }
+    const decoded = decodeDockerLogFrames(buf);
+    if (truncated) {
+      const note = `[admin/container-logs] 响应被裁剪到 ${LOGS_MAX_BYTES} 字节,仅保留最近输出\n`;
+      decoded.combined = note + decoded.combined;
+    }
+    return { ...decoded, docker_ref: ref, missing: false };
+  } catch (err) {
+    // 404 → 容器不存在,返回空(不抛,admin UI 就显示"容器已不存在")
+    const e = err as { statusCode?: number; reason?: string };
+    if (e?.statusCode === 404 || (typeof e?.reason === "string" && e.reason.includes("no such container"))) {
+      return { stdout: "", stderr: "", combined: "", docker_ref: ref, missing: true };
+    }
+    throw err;
+  }
+}
+
 // ─── restart ──────────────────────────────────────────────────────
 
 /**

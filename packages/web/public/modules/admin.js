@@ -1639,58 +1639,265 @@ async function deleteAccount(id, label, btn) {
 
 // ─── Tab: Containers ───────────────────────────────────────────────
 
+// R4 — containers tab 重写(KPI 卡 + 客户端 status/email 过滤 + 日志 modal)
+
+const CONTAINER_STATUSES = ['provisioning', 'running', 'stopped', 'removed', 'error']
+
+const CONTAINERS_STATE = {
+  renderSeq: 0, loadSeq: 0,
+  rows: [], filterStatus: '', filterEmail: '',
+}
+
 async function renderContainersTab() {
-  const data = await apiGet('/api/admin/agent-containers?limit=200')
-  const rows = data?.rows ?? []
+  const mySeq = ++CONTAINERS_STATE.renderSeq
+  CONTAINERS_STATE.rows = []
+  CONTAINERS_STATE.filterStatus = sessionStorage.getItem('admin_ct_status') || ''
+  CONTAINERS_STATE.filterEmail = sessionStorage.getItem('admin_ct_email') || ''
+
   view().innerHTML = `
     <div class="panel">
-      <h2>Agent 容器 <small>共 ${rows.length} 条</small></h2>
-      ${rows.length === 0
-        ? '<div class="empty">无容器</div>'
-        : `
-        <table class="data">
-          <thead>
-            <tr><th>id</th><th>类型</th><th>用户</th><th>订阅</th><th>状态</th>
-                <th>docker</th><th>image</th><th>开始</th><th>停止</th>
-                <th class="actions">操作</th></tr>
-          </thead>
-          <tbody>
-            ${rows.map((c) => `
-              <tr>
-                <td class="mono">${escapeHtml(c.id)}</td>
-                <td><span class="badge muted">${escapeHtml(c.row_kind || '?')}</span></td>
-                <td>${escapeHtml(c.user_email || c.user_id)}</td>
-                <td><span class="badge muted">${escapeHtml(c.subscription_status || '—')}</span></td>
-                <td>${statusBadge(c.lifecycle || c.status || c.state || '—')}</td>
-                <td class="mono">${escapeHtml((c.docker_id || '').slice(0, 12) || '—')}</td>
-                <td class="mono">${escapeHtml(c.image || '')}</td>
-                <td class="mono">${fmtDate(c.last_started_at)}</td>
-                <td class="mono">${fmtDate(c.last_stopped_at)}</td>
-                <td class="actions">
-                  <button data-act="restart" data-id="${escapeHtml(c.id)}">重启</button>
-                  <button data-act="stop" data-id="${escapeHtml(c.id)}">停止</button>
-                </td>
-              </tr>`).join('')}
-          </tbody>
-        </table>`}
+      <h1 style="margin-top:0">Agent 容器 <small style="color:var(--muted);font-weight:400;font-size:14px" id="ct-count">加载中…</small></h1>
+
+      <!-- 4 张 KPI 卡片 -->
+      <div class="stat-grid" id="ct-kpis" style="margin-bottom:18px">
+        <div class="stat-card"><div class="stat-label">总容器</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+        <div class="stat-card"><div class="stat-label">运行中</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+        <div class="stat-card"><div class="stat-label">错误 / 有过报错</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+        <div class="stat-card"><div class="stat-label">7d 订阅到期</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+      </div>
+
+      <div class="toolbar">
+        <label>生命周期:
+          <select id="ct-status">
+            <option value="">全部</option>
+            ${CONTAINER_STATUSES.map((s) =>
+              `<option value="${s}" ${s === CONTAINERS_STATE.filterStatus ? 'selected' : ''}>${s}</option>`,
+            ).join('')}
+          </select>
+        </label>
+        <input type="text" id="ct-email" placeholder="email / user_id 过滤" value="${escapeHtml(CONTAINERS_STATE.filterEmail)}" />
+        <button class="btn" id="ct-refresh">刷新</button>
+      </div>
+
+      <div id="ct-table-container"><div class="empty">加载中…</div></div>
     </div>
   `
-  for (const b of view().querySelectorAll('button[data-act]')) {
-    b.addEventListener('click', (ev) => containerAction(b.dataset.id, b.dataset.act, ev.currentTarget))
+  $('ct-status').addEventListener('change', (e) => {
+    CONTAINERS_STATE.filterStatus = e.target.value
+    sessionStorage.setItem('admin_ct_status', e.target.value)
+    renderContainersTab()
+  })
+  $('ct-email').addEventListener('input', (e) => {
+    CONTAINERS_STATE.filterEmail = e.target.value
+    sessionStorage.setItem('admin_ct_email', e.target.value)
+    _renderContainersTable()
+  })
+  $('ct-refresh').addEventListener('click', () => renderContainersTab())
+
+  await Promise.all([
+    _loadContainersKpis(mySeq),
+    _loadContainers(mySeq),
+  ])
+}
+
+async function _loadContainersKpis(renderSeq) {
+  let s
+  try {
+    s = await apiGet('/api/admin/agent-containers/stats')
+  } catch {
+    if (renderSeq !== CONTAINERS_STATE.renderSeq || _currentTab !== 'containers') return
+    const cards = view().querySelectorAll('#ct-kpis .stat-card')
+    for (const c of cards) updateStat(c, '—', '加载失败', 'danger')
+    return
+  }
+  if (renderSeq !== CONTAINERS_STATE.renderSeq || _currentTab !== 'containers') return
+
+  const cards = view().querySelectorAll('#ct-kpis .stat-card')
+  updateStat(cards[0], s.total.toLocaleString(),
+    `v2 ${s.v2} · v3 ${s.v3} · 已清理 ${s.gone}`,
+    null)
+  updateStat(cards[1], s.running.toLocaleString(),
+    `provisioning ${s.provisioning} · stopped ${s.stopped}`,
+    s.provisioning > 5 ? 'warning' : 'success')
+  updateStat(cards[2], `${s.error} / ${s.with_last_error}`,
+    `error 态 / 曾有 last_error`,
+    s.error > 0 ? 'danger' : s.with_last_error > 0 ? 'warning' : 'success')
+  updateStat(cards[3], s.expiring_7d.toLocaleString(),
+    s.expiring_7d > 0 ? '需关注续订' : '暂无到期风险',
+    s.expiring_7d > 0 ? 'warning' : 'success')
+}
+
+async function _loadContainers(renderSeq) {
+  const myLoadSeq = ++CONTAINERS_STATE.loadSeq
+  const sp = new URLSearchParams({ limit: '500' })
+  if (CONTAINERS_STATE.filterStatus) sp.set('status', CONTAINERS_STATE.filterStatus)
+
+  let data
+  try {
+    data = await apiGet(`/api/admin/agent-containers?${sp.toString()}`)
+  } catch (err) {
+    if (renderSeq !== CONTAINERS_STATE.renderSeq || _currentTab !== 'containers') return
+    toast(`加载失败:${err.message}`, 'danger')
+    const el = $('ct-table-container')
+    if (el) el.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
+    const cnt = $('ct-count'); if (cnt) cnt.textContent = '—'
+    return
+  }
+  if (renderSeq !== CONTAINERS_STATE.renderSeq || myLoadSeq !== CONTAINERS_STATE.loadSeq) return
+  if (_currentTab !== 'containers') return
+
+  CONTAINERS_STATE.rows = data?.rows ?? []
+  _renderContainersTable()
+}
+
+function _renderContainersTable() {
+  const el = $('ct-table-container')
+  if (!el) return
+  const q = CONTAINERS_STATE.filterEmail.trim().toLowerCase()
+  const rows = q
+    ? CONTAINERS_STATE.rows.filter((c) =>
+        (c.user_email || '').toLowerCase().includes(q) ||
+        String(c.user_id || '').includes(q))
+    : CONTAINERS_STATE.rows
+  const cnt = $('ct-count')
+  if (cnt) cnt.textContent = q
+    ? `共 ${rows.length} / ${CONTAINERS_STATE.rows.length} 条(过滤中)`
+    : `共 ${rows.length} 条`
+  if (rows.length === 0) {
+    el.innerHTML = '<div class="empty">无匹配容器</div>'
+    return
+  }
+  el.innerHTML = `
+    <table class="data">
+      <thead>
+        <tr>
+          <th>id</th>
+          <th>类型</th>
+          <th>用户</th>
+          <th>订阅 / 到期</th>
+          <th>生命周期</th>
+          <th>image</th>
+          <th class="mono">docker</th>
+          <th>最近启动</th>
+          <th>最近停止</th>
+          <th class="actions">操作</th>
+        </tr>
+      </thead>
+      <tbody>${rows.map(_renderContainerRow).join('')}</tbody>
+    </table>
+  `
+  for (const b of el.querySelectorAll('button[data-act="ct-logs"]')) {
+    b.addEventListener('click', () => openContainerLogsModal(b.dataset.id, b.dataset.label))
+  }
+  for (const b of el.querySelectorAll('button[data-act="ct-action"]')) {
+    b.addEventListener('click', (ev) => containerAction(b.dataset.id, b.dataset.action, ev.currentTarget))
   }
 }
 
+function _containerWarningChips(c) {
+  const chips = []
+  if (c.last_error) {
+    chips.push(`<span class="chip chip-danger" title="${escapeHtml(c.last_error)}">最近出错</span>`)
+  }
+  if (c.row_kind === 'v2' && c.subscription_end_at && c.subscription_status === 'active') {
+    const end = new Date(c.subscription_end_at).getTime()
+    if (!Number.isNaN(end)) {
+      const days = (end - Date.now()) / 86400000
+      if (days < 0) chips.push(`<span class="chip chip-danger" title="${escapeHtml(fmtDate(c.subscription_end_at))}">订阅已过期</span>`)
+      else if (days < 7) chips.push(`<span class="chip chip-warn" title="${escapeHtml(fmtDate(c.subscription_end_at))}">${Math.ceil(days)}d 内到期</span>`)
+    }
+  }
+  return chips.length > 0 ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:3px">${chips.join('')}</div>` : ''
+}
+
+function _renderContainerRow(c) {
+  const kindClass = c.row_kind === 'v3' ? 'ok' : 'muted'
+  const user = c.user_email
+    ? `${escapeHtml(c.user_email)} <small style="color:var(--muted)">#${escapeHtml(c.user_id)}</small>`
+    : `#${escapeHtml(c.user_id)}`
+  const sub = c.row_kind === 'v2'
+    ? `<div><span class="badge muted">${escapeHtml(c.subscription_status || '—')}</span></div>
+       <small class="mono">${escapeHtml(fmtDate(c.subscription_end_at))}</small>`
+    : '<small style="color:var(--muted)">ephemeral (v3 按量)</small>'
+  const dockerRef = c.row_kind === 'v2'
+    ? (c.docker_name || '—')
+    : (c.docker_id || '').slice(0, 12) || '—'
+  const idStr = escapeHtml(c.id)
+  const label = `#${c.id} ${c.user_email || ''}`
+  return `
+    <tr>
+      <td class="mono">${idStr}</td>
+      <td><span class="badge ${kindClass}">${escapeHtml(c.row_kind || '?')}</span></td>
+      <td>${user}${_containerWarningChips(c)}</td>
+      <td>${sub}</td>
+      <td>${statusBadge(c.lifecycle || c.status || c.state || '—')}</td>
+      <td class="mono" title="${escapeHtml(c.image || '')}">${escapeHtml((c.image || '').split('/').pop() || '—')}</td>
+      <td class="mono" title="${escapeHtml(c.docker_name || c.docker_id || '')}">${escapeHtml(dockerRef)}</td>
+      <td class="mono">${fmtRelative(c.last_started_at)}</td>
+      <td class="mono">${fmtRelative(c.last_stopped_at)}</td>
+      <td class="actions">
+        <button data-act="ct-logs" data-id="${idStr}" data-label="${escapeHtml(label)}">日志</button>
+        <button data-act="ct-action" data-action="restart" data-id="${idStr}">重启</button>
+        <button data-act="ct-action" data-action="stop" data-id="${idStr}">停止</button>
+      </td>
+    </tr>`
+}
+
 async function containerAction(id, action, btn) {
-  if (!confirm(`确定 ${action} 容器 ${id}?`)) return
+  if (!confirm(`确定 ${action} 容器 #${id}?`)) return
   await withBtnLoading(btn, async () => {
     try {
-      await apiJson('POST', `/api/admin/agent-containers/${id}/${action}`)
-      toast(`已 ${action}`)
-      applyHash()
+      await apiJson('POST', `/api/admin/agent-containers/${encodeURIComponent(id)}/${action}`)
+      toast(`#${id} 已 ${action}`)
+      _loadContainers(CONTAINERS_STATE.renderSeq)
+      _loadContainersKpis(CONTAINERS_STATE.renderSeq)
     } catch (e) {
       toast(`失败: ${e.message}`, 'danger')
     }
   })
+}
+
+async function openContainerLogsModal(id, label) {
+  openModal(`
+    <h2 style="margin-top:0">容器日志 <small style="color:var(--muted);font-weight:400;font-size:13px">${escapeHtml(label)}</small></h2>
+    <div class="toolbar">
+      <label>行数:
+        <select id="lg-lines">
+          <option value="100">100</option>
+          <option value="200" selected>200</option>
+          <option value="500">500</option>
+        </select>
+      </label>
+      <button class="btn" id="lg-refresh">刷新</button>
+      <span class="spacer"></span>
+      <button class="btn" id="lg-close">关闭</button>
+    </div>
+    <pre id="lg-body" class="mono" style="max-height:60vh;overflow:auto;background:var(--bg-code, #111);color:var(--fg-code, #ddd);padding:12px;border-radius:6px;font-size:12px;white-space:pre-wrap;word-break:break-all;min-height:300px">加载中…</pre>
+  `)
+  $('lg-close').addEventListener('click', closeModal)
+  $('lg-refresh').addEventListener('click', () => _loadContainerLogs(id))
+  $('lg-lines').addEventListener('change', () => _loadContainerLogs(id))
+  await _loadContainerLogs(id)
+}
+
+async function _loadContainerLogs(id) {
+  const body = $('lg-body')
+  if (!body) return
+  body.textContent = '加载中…'
+  const lines = $('lg-lines')?.value || '200'
+  try {
+    const data = await apiGet(`/api/admin/agent-containers/${encodeURIComponent(id)}/logs?lines=${encodeURIComponent(lines)}`)
+    if (data.missing) {
+      body.textContent = `容器已不存在(docker_ref=${data.docker_ref ?? 'null'})。数据库行仍可见,可在 users tab 按 user 追查。`
+      return
+    }
+    const combined = data.combined || '(无输出)'
+    body.textContent = combined
+    // 自动滚到底
+    body.scrollTop = body.scrollHeight
+  } catch (e) {
+    body.textContent = `加载失败:${e.message}`
+  }
 }
 
 // ─── Tab: Ledger ───────────────────────────────────────────────────

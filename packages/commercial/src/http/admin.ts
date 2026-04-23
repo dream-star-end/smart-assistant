@@ -77,10 +77,13 @@ import {
   adminRestartContainer,
   adminStopContainer,
   adminRemoveContainer,
+  adminContainerLogs,
+  LOGS_MAX_LINES,
   ContainerNotFoundError,
   V3SupervisorMissingError,
   type AdminContainerRowView,
 } from "../admin/containers.js";
+import { getContainersPoolStats } from "../admin/containersStats.js";
 import { SupervisorError } from "../agent-sandbox/types.js";
 import {
   listLedger,
@@ -1022,6 +1025,80 @@ export async function handleAdminListAgentContainers(
     });
     sendJson(res, 200, { rows: rows.map(serializeContainer) });
   } catch (err) { translateRangeError(err); }
+}
+
+// ─── GET /api/admin/agent-containers/stats (R4 新增 KPI 面板) ──────
+//
+// 响应 ContainersPoolStats: { total, running, provisioning, stopped, error,
+//         gone, v2, v3, expiring_7d, with_last_error }
+// 定义见 admin/containersStats.ts。
+
+export async function handleAdminContainersStats(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const out = await getContainersPoolStats();
+  sendJson(res, 200, out);
+}
+
+// ─── GET /api/admin/agent-containers/:id/logs?lines=N ──────────────
+//
+// admin 读 docker tail logs(只读 + requireAdmin JWT 够)。
+// 容器已不存在 → { stdout:"", stderr:"", combined:"", missing:true };
+// 不抛 404(admin UI 在容器 vanished 后还想看 DB 记录,保留入口更友好)。
+
+export async function handleAdminContainerLogs(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  // 匹配 `/api/admin/agent-containers/:id/logs`。其它 GET prefix 一律 404,
+  // 避免 future /api/admin/agent-containers/:id/inspect 等新路径误走到这里。
+  const m = url.pathname.match(/^\/api\/admin\/agent-containers\/([1-9][0-9]{0,19})\/logs$/);
+  if (!m) {
+    throw new HttpError(404, "NOT_FOUND", "expected /agent-containers/:id/logs");
+  }
+  const id = m[1]!;
+  const linesRaw = url.searchParams.get("lines");
+  let lines = 200;
+  if (linesRaw !== null && linesRaw !== "") {
+    const n = Number(linesRaw);
+    if (!Number.isInteger(n) || n <= 0 || n > LOGS_MAX_LINES) {
+      throw new HttpError(400, "VALIDATION", `lines must be 1..${LOGS_MAX_LINES}`, {
+        issues: [{ path: "lines", message: linesRaw }],
+      });
+    }
+    lines = n;
+  }
+  const agent = deps.agentRuntime;
+  if (!agent) {
+    throw new HttpError(503, "AGENT_NOT_READY", "agent runtime is not configured");
+  }
+  try {
+    const logs = await adminContainerLogs(id, agent.docker, lines, deps.v3Supervisor);
+    sendJson(res, 200, {
+      id,
+      lines,
+      stdout: logs.stdout,
+      stderr: logs.stderr,
+      combined: logs.combined,
+      docker_ref: logs.docker_ref,
+      missing: logs.missing,
+    });
+  } catch (err) {
+    if (err instanceof ContainerNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
+    if (err instanceof V3SupervisorMissingError) {
+      throw new HttpError(503, "V3_SUPERVISOR_NOT_READY", err.message);
+    }
+    if (err instanceof RangeError) translateRangeError(err);
+    throw err;
+  }
 }
 
 type ContainerAction = "restart" | "stop" | "remove";
