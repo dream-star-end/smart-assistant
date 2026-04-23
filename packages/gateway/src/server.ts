@@ -1049,6 +1049,27 @@ export class Gateway {
       res.end(serializeMetrics())
       return
     }
+    // /version — reports currently-live release. Written by scripts/deploy-v3.sh
+    // as <cwd>/VERSION.json after rsync and before systemctl restart. Public
+    // (no auth) because commit hash of a private repo carries no secret value
+    // and matches the already-open /healthz posture.
+    if (url.pathname === '/version' && req.method === 'GET') {
+      let body: { tag: string; builtAt: string | null; commit?: string } = {
+        tag: 'unknown',
+        builtAt: null,
+      }
+      try {
+        const raw = readFileSync(resolve(process.cwd(), 'VERSION.json'), 'utf-8')
+        const j = JSON.parse(raw)
+        if (typeof j.tag === 'string') body.tag = j.tag
+        if (typeof j.builtAt === 'string') body.builtAt = j.builtAt
+        if (typeof j.commit === 'string') body.commit = j.commit
+      } catch {
+        // file missing / unreadable / malformed → return defaults above
+      }
+      this.sendJson(res, 200, body)
+      return
+    }
     if (url.pathname === '/api/doctor') {
       const summary = this._runLog.summary()
       const recentRuns = this._runLog.recent(20)
