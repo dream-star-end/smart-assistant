@@ -16,7 +16,7 @@
  *   - anthropic_proxy_stream_duration_seconds{model}       histogram (fetch 到 stream end)
  *   - anthropic_proxy_settle_total{kind}                   counter (final/partial/aborted)
  *   - anthropic_proxy_reject_total{reason}                 counter
- *       (insufficient/rate_limited/concurrency/account_pool/unknown_model/bad_body/too_large/identity)
+ *       (insufficient/rate_limited/concurrency/account_pool/account_pool_busy/unknown_model/bad_body/too_large/identity)
  *   - ws_bridge_buffered_bytes{side}                       histogram
  *   - ws_bridge_session_duration_seconds{cause}            histogram
  *
@@ -343,6 +343,7 @@ export const anthropicProxySettle = new Counter({
  *   - rate_limited    per-uid 滑窗
  *   - concurrency     per-uid 并发上限
  *   - account_pool    池空 / 全 down
+ *   - account_pool_busy  所有账号都到达 per-account 并发上限(瞬时过载,429)
  *   - unknown_model   定价表缺
  *   - bad_body        zod parse 失败
  *   - too_large       413
@@ -395,6 +396,7 @@ export type ProxyRejectReason =
   | "rate_limited"
   | "concurrency"
   | "account_pool"
+  | "account_pool_busy"
   | "unknown_model"
   | "bad_body"
   | "too_large"

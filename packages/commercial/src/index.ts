@@ -872,7 +872,11 @@ export type {
 export {
   AccountScheduler,
   AccountPoolUnavailableError,
+  AccountPoolBusyError,
   ERR_ACCOUNT_POOL_UNAVAILABLE,
+  ERR_ACCOUNT_POOL_BUSY,
+  DEFAULT_MAX_CONCURRENT_PER_ACCOUNT,
+  parseMaxConcurrentEnv,
   pickSticky,
   pickWeighted,
   defaultHash,

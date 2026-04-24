@@ -18,73 +18,118 @@
  *   - 本模块只做 "从 active 池子挑一个 account" 这一件事。
  */
 
-import { createHash } from "node:crypto";
-import type { QueryResultRow } from "pg";
-import { query } from "../db/queries.js";
-import { loadKmsKey } from "../crypto/keys.js";
-import { AeadError } from "../crypto/aead.js";
-import { getTokenForUse, updateAccount, type AccountPlan } from "./store.js";
-import type { AccountHealthTracker } from "./health.js";
+import { createHash } from 'node:crypto'
+import type { QueryResultRow } from 'pg'
+import { AeadError } from '../crypto/aead.js'
+import { loadKmsKey } from '../crypto/keys.js'
+import { query } from '../db/queries.js'
+import type { AccountHealthTracker } from './health.js'
+import { type AccountPlan, getTokenForUse, updateAccount } from './store.js'
 
-export const ERR_ACCOUNT_POOL_UNAVAILABLE = "ERR_ACCOUNT_POOL_UNAVAILABLE";
+export const ERR_ACCOUNT_POOL_UNAVAILABLE = 'ERR_ACCOUNT_POOL_UNAVAILABLE'
+export const ERR_ACCOUNT_POOL_BUSY = 'ERR_ACCOUNT_POOL_BUSY'
 
 export class AccountPoolUnavailableError extends Error {
-  readonly code = ERR_ACCOUNT_POOL_UNAVAILABLE;
+  readonly code = ERR_ACCOUNT_POOL_UNAVAILABLE
   constructor(reason: string) {
-    super(`account pool unavailable: ${reason}`);
-    this.name = "AccountPoolUnavailableError";
+    super(`account pool unavailable: ${reason}`)
+    this.name = 'AccountPoolUnavailableError'
   }
 }
 
+/**
+ * 所有 active 账号都到达 per-account in-flight 并发上限时抛出。
+ *
+ * 和 `AccountPoolUnavailableError`(无 active / 全 cooldown / 全 vanished)区分:
+ *   - Unavailable → 503(池子确实不可用,需要运维介入)
+ *   - Busy        → 429 + Retry-After(瞬时过载,前端 retry 即可)
+ */
+export class AccountPoolBusyError extends Error {
+  readonly code = ERR_ACCOUNT_POOL_BUSY
+  constructor(reason: string) {
+    super(`account pool busy: ${reason}`)
+    this.name = 'AccountPoolBusyError'
+  }
+}
+
+/** 单账号同时 in-flight 请求默认上限。防止单账号被 Anthropic 风控。 */
+export const DEFAULT_MAX_CONCURRENT_PER_ACCOUNT = 10
+
+/**
+ * 解析 `CLAUDE_ACCOUNT_MAX_CONCURRENT` 环境变量。
+ *
+ * 严格语义:只接受纯正整数字符串(如 `"10"`);`"10xyz"` / `"0"` / `"-1"` /
+ * `"1.5"` / `"abc"` / 空 均退回默认 10。
+ */
+export function parseMaxConcurrentEnv(
+  raw: string | undefined = process.env.CLAUDE_ACCOUNT_MAX_CONCURRENT,
+): number {
+  if (!raw || !/^[1-9]\d*$/.test(raw)) return DEFAULT_MAX_CONCURRENT_PER_ACCOUNT
+  return Number.parseInt(raw, 10)
+}
+
+/**
+ * 归一化构造参数 `deps.maxConcurrent`:非正整数一律回退默认 10。
+ * 与 env 路径同语义,避免调用方传 `0` / 小数 / NaN 破掉上限。
+ */
+function sanitizeMaxConcurrent(n: number | undefined): number {
+  if (n === undefined) return parseMaxConcurrentEnv()
+  if (!Number.isInteger(n) || n <= 0) return DEFAULT_MAX_CONCURRENT_PER_ACCOUNT
+  return n
+}
+
 export interface PickInput {
-  mode: "chat" | "agent";
+  mode: 'chat' | 'agent'
   /** agent 模式必传;chat 可选(若传也会作为加权采样的 PRNG seed,保留方便) */
-  sessionId?: string;
+  sessionId?: string
   /** 为未来 "按模型过滤账号池" 预留,目前不使用。 */
-  model?: string;
+  model?: string
 }
 
 export interface PickResult {
-  account_id: bigint;
-  plan: AccountPlan;
+  account_id: bigint
+  plan: AccountPlan
   /** 解密后的 OAuth access token —— **调用方用完必须 .fill(0)** */
-  token: Buffer;
+  token: Buffer
   /** 解密后的 refresh token(可能为 null)—— **调用方用完必须 .fill(0)** */
-  refresh: Buffer | null;
-  expires_at: Date | null;
+  refresh: Buffer | null
+  expires_at: Date | null
   /** 该账号专属出口代理(明文 URL,内含密码);null 表示走本机出口 */
-  egress_proxy: string | null;
+  egress_proxy: string | null
 }
 
-export type ReleaseResult =
-  | { kind: "success" }
-  | { kind: "failure"; error?: string | null };
+export type ReleaseResult = { kind: 'success' } | { kind: 'failure'; error?: string | null }
 
 export interface ReleaseInput {
-  account_id: bigint | string;
-  result: ReleaseResult;
+  account_id: bigint | string
+  result: ReleaseResult
 }
 
 export interface SchedulerDeps {
-  health: AccountHealthTracker;
+  health: AccountHealthTracker
   /** 注入测试 key fn;默认 loadKmsKey */
-  keyFn?: () => Buffer;
+  keyFn?: () => Buffer
   /** 注入 PRNG;默认 Math.random */
-  random?: () => number;
+  random?: () => number
   /** 注入 hash(用于测试;默认 SHA-256 64-bit) */
-  hash?: (s: string) => bigint;
+  hash?: (s: string) => bigint
+  /**
+   * 单账号同时 in-flight 请求上限。未传则读 `CLAUDE_ACCOUNT_MAX_CONCURRENT`,
+   * 再 fallback `DEFAULT_MAX_CONCURRENT_PER_ACCOUNT`(10)。
+   */
+  maxConcurrent?: number
 }
 
 interface CandidateRow extends QueryResultRow {
-  id: string;
-  plan: AccountPlan;
-  health_score: number;
+  id: string
+  plan: AccountPlan
+  health_score: number
 }
 
 /** 默认哈希:SHA-256,截前 8B 作 64-bit 无符号整数。 */
 export function defaultHash(s: string): bigint {
-  const h = createHash("sha256").update(s).digest();
-  return h.readBigUInt64BE(0);
+  const h = createHash('sha256').update(s).digest()
+  return h.readBigUInt64BE(0)
 }
 
 /**
@@ -101,18 +146,18 @@ export function pickSticky(
   hash: (s: string) => bigint = defaultHash,
 ): CandidateRow {
   if (candidates.length === 0) {
-    throw new AccountPoolUnavailableError("no candidates for sticky");
+    throw new AccountPoolUnavailableError('no candidates for sticky')
   }
-  let bestIdx = 0;
-  let bestScore = hash(`${sessionId}:${candidates[0].id}`);
+  let bestIdx = 0
+  let bestScore = hash(`${sessionId}:${candidates[0].id}`)
   for (let i = 1; i < candidates.length; i += 1) {
-    const s = hash(`${sessionId}:${candidates[i].id}`);
+    const s = hash(`${sessionId}:${candidates[i].id}`)
     if (s > bestScore) {
-      bestScore = s;
-      bestIdx = i;
+      bestScore = s
+      bestIdx = i
     }
   }
-  return candidates[bestIdx];
+  return candidates[bestIdx]
 }
 
 /**
@@ -123,23 +168,23 @@ export function pickWeighted(
   random: () => number = Math.random,
 ): CandidateRow {
   if (candidates.length === 0) {
-    throw new AccountPoolUnavailableError("no candidates for weighted");
+    throw new AccountPoolUnavailableError('no candidates for weighted')
   }
-  let total = 0;
-  const weights: number[] = [];
+  let total = 0
+  const weights: number[] = []
   for (const c of candidates) {
-    const w = Math.max(1, c.health_score);
-    weights.push(w);
-    total += w;
+    const w = Math.max(1, c.health_score)
+    weights.push(w)
+    total += w
   }
-  const r = random() * total;
-  let acc = 0;
+  const r = random() * total
+  let acc = 0
   for (let i = 0; i < candidates.length; i += 1) {
-    acc += weights[i];
-    if (r < acc) return candidates[i];
+    acc += weights[i]
+    if (r < acc) return candidates[i]
   }
   // 浮点误差兜底:取最后一个。
-  return candidates[candidates.length - 1];
+  return candidates[candidates.length - 1]
 }
 
 /**
@@ -150,16 +195,51 @@ export function pickWeighted(
  *   - release 时调 health tracker 更新统计
  */
 export class AccountScheduler {
-  private readonly health: AccountHealthTracker;
-  private readonly keyFn: () => Buffer;
-  private readonly random: () => number;
-  private readonly hash: (s: string) => bigint;
+  private readonly health: AccountHealthTracker
+  private readonly keyFn: () => Buffer
+  private readonly random: () => number
+  private readonly hash: (s: string) => bigint
+  /**
+   * 单账号 in-flight 计数。pick() 选中并准备返 token 之前 inc,
+   * release() 时 dec;归 0 就 delete 避免 Map 无限膨胀。
+   *
+   * 一致性边界:本字段是进程内状态,只在同一 AccountScheduler 实例内严格
+   * 满足 inflight[id] ≤ maxConcurrent。多进程部署不会自动汇总。
+   *
+   * TOCTOU 安全:`filter → pickSticky/pickWeighted → inc` 在 pick() 循环内
+   * 的一个同步块里完成,中间没有 await —— Node 单线程协作调度下两个并发
+   * pick() 只能在 await 边界交错,因此硬上限成立。
+   */
+  private readonly inflight = new Map<string, number>()
+  /** 单账号同时 in-flight 请求上限。 */
+  readonly maxConcurrent: number
 
   constructor(deps: SchedulerDeps) {
-    this.health = deps.health;
-    this.keyFn = deps.keyFn ?? loadKmsKey;
-    this.random = deps.random ?? Math.random;
-    this.hash = deps.hash ?? defaultHash;
+    this.health = deps.health
+    this.keyFn = deps.keyFn ?? loadKmsKey
+    this.random = deps.random ?? Math.random
+    this.hash = deps.hash ?? defaultHash
+    this.maxConcurrent = sanitizeMaxConcurrent(deps.maxConcurrent)
+  }
+
+  /**
+   * 当前 in-flight 计数。测试/监控用;非测试路径不要依赖返回值做判断。
+   */
+  getInflight(accountId: bigint | string): number {
+    return this.inflight.get(String(accountId)) ?? 0
+  }
+
+  private incInflight(id: string): void {
+    this.inflight.set(id, (this.inflight.get(id) ?? 0) + 1)
+  }
+
+  /** 幂等:对未计数/已归零的 id 调用无副作用、无日志噪音。 */
+  private decInflight(id: string): void {
+    const cur = this.inflight.get(id)
+    if (cur === undefined) return
+    const next = cur - 1
+    if (next <= 0) this.inflight.delete(id)
+    else this.inflight.set(id, next)
   }
 
   /**
@@ -176,12 +256,12 @@ export class AccountScheduler {
    * @throws `TypeError` 当 `mode=agent` 缺 sessionId
    */
   async pick(input: PickInput): Promise<PickResult> {
-    if (input.mode === "agent") {
+    if (input.mode === 'agent') {
       if (!input.sessionId || input.sessionId.length === 0) {
-        throw new TypeError("sessionId required when mode=agent");
+        throw new TypeError('sessionId required when mode=agent')
       }
-    } else if (input.mode !== "chat") {
-      throw new TypeError(`unknown mode: ${String(input.mode)}`);
+    } else if (input.mode !== 'chat') {
+      throw new TypeError(`unknown mode: ${String(input.mode)}`)
     }
 
     const res = await query<CandidateRow>(
@@ -189,24 +269,36 @@ export class AccountScheduler {
        FROM claude_accounts
        WHERE status = 'active'
        ORDER BY id`,
-    );
-    let pool = res.rows;
+    )
+    let pool = res.rows
     if (pool.length === 0) {
-      throw new AccountPoolUnavailableError("no active accounts");
+      throw new AccountPoolUnavailableError('no active accounts')
     }
 
     // 最多重选 N 轮(N = 候选数)。每次选中账号若解密时发现已不存在,
     // 剔除后从剩余候选再选一次 —— sticky 的 rendezvous-hash 对剩余集
     // 仍是稳定的,只是换到次优选择。
-    let vanished = 0;
-    let quarantined = 0;
+    //
+    // 并发上限:每轮先按 `inflight < maxConcurrent` 过滤出 under-cap 账号;
+    // filter → pick → incInflight 同一 sync 块内完成(无 await),保证硬上限。
+    // 若 active 池非空但 under-cap 为空 → AccountPoolBusyError(429);
+    // 若池子最终因 vanish/AEAD 被耗尽但曾经过至少一个 under-cap 账号 → Unavailable(503)。
+    let vanished = 0
+    let quarantined = 0
+    let sawAvailableCandidate = false
     while (pool.length > 0) {
+      const available = pool.filter((c) => (this.inflight.get(c.id) ?? 0) < this.maxConcurrent)
+      if (available.length === 0) break
+      sawAvailableCandidate = true
+
       const chosen =
-        input.mode === "agent"
-          ? pickSticky(pool, input.sessionId!, this.hash)
-          : pickWeighted(pool, this.random);
+        input.mode === 'agent'
+          ? pickSticky(available, input.sessionId!, this.hash)
+          : pickWeighted(available, this.random)
+      // 同步 reserve 槽位 —— 必须在下一个 await(getTokenForUse)之前完成
+      this.incInflight(chosen.id)
       try {
-        const tok = await getTokenForUse(chosen.id, this.keyFn);
+        const tok = await getTokenForUse(chosen.id, this.keyFn)
         if (tok) {
           return {
             account_id: BigInt(chosen.id),
@@ -215,29 +307,42 @@ export class AccountScheduler {
             refresh: tok.refresh,
             expires_at: tok.expires_at,
             egress_proxy: tok.egress_proxy,
-          };
+          }
         }
         // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选
-        vanished += 1;
-        pool = pool.filter((c) => c.id !== chosen.id);
+        this.decInflight(chosen.id)
+        vanished += 1
+        pool = pool.filter((c) => c.id !== chosen.id)
       } catch (err) {
+        this.decInflight(chosen.id)
         if (err instanceof AeadError) {
           // 密文坏 —— 隔离这个账号(异步 disable 不阻塞 pick 路径),从候选剔除继续选
-          void updateAccount(chosen.id, {
-            status: "disabled",
-            last_error: `AEAD decryption failed at pick(): ${err.message}`.slice(0, 500),
-          }, this.keyFn).catch(() => { /* best-effort;下一轮 pick 的 SELECT status='active' 也会自然排除 */ });
-          quarantined += 1;
-          pool = pool.filter((c) => c.id !== chosen.id);
-          continue;
+          void updateAccount(
+            chosen.id,
+            {
+              status: 'disabled',
+              last_error: `AEAD decryption failed at pick(): ${err.message}`.slice(0, 500),
+            },
+            this.keyFn,
+          ).catch(() => {
+            /* best-effort;下一轮 pick 的 SELECT status='active' 也会自然排除 */
+          })
+          quarantined += 1
+          pool = pool.filter((c) => c.id !== chosen.id)
+          continue
         }
-        throw err;
+        throw err
       }
+    }
+    if (!sawAvailableCandidate) {
+      throw new AccountPoolBusyError(
+        `all ${pool.length} active account(s) at per-account concurrency cap (max=${this.maxConcurrent})`,
+      )
     }
     throw new AccountPoolUnavailableError(
       `candidate pool drained while pick()ing: vanished=${vanished} (deleted between SELECT and readToken), ` +
         `aead_quarantined=${quarantined} (decryption failed → auto-disabled)`,
-    );
+    )
   }
 
   /**
@@ -261,13 +366,12 @@ export class AccountScheduler {
    *   ```
    */
   async release(input: ReleaseInput): Promise<void> {
-    if (input.result.kind === "success") {
-      await this.health.onSuccess(input.account_id);
+    // 先 dec inflight(幂等,健康 tracker 抛错也不能让 slot 永久占用)
+    this.decInflight(String(input.account_id))
+    if (input.result.kind === 'success') {
+      await this.health.onSuccess(input.account_id)
     } else {
-      await this.health.onFailure(
-        input.account_id,
-        input.result.error ?? null,
-      );
+      await this.health.onFailure(input.account_id, input.result.error ?? null)
     }
   }
 }

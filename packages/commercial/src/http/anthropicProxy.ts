@@ -62,6 +62,7 @@ import {
 import { computeCost, type TokenUsage } from "../billing/calculator.js";
 import {
   AccountPoolUnavailableError,
+  AccountPoolBusyError,
   type AccountScheduler,
 } from "../account-pool/scheduler.js";
 import {
@@ -156,7 +157,7 @@ export const SIZE_LIMITS = {
 export const MAX_BODY_BYTES_DEFAULT = 16 * 1024 * 1024;
 
 /** messages / tools 数量上限(对齐 R3 §3.3 注解)。 */
-export const MAX_MESSAGES_COUNT = 200;
+export const MAX_MESSAGES_COUNT = 2000;
 export const MAX_TOOLS_COUNT = 64;
 
 /** 估算 input token 时的字符 → token 经验比(保守:chars/4 即 1 token = 4 chars)。 */
@@ -1357,6 +1358,19 @@ export function makeAnthropicProxyHandler(
         });
       } catch (err) {
         await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+        if (err instanceof AccountPoolBusyError) {
+          userLog.warn("proxy_account_pool_busy", { msg: err.message });
+          incrAnthropicProxyReject("account_pool_busy");
+          sendJsonError(
+            res,
+            429,
+            "ACCOUNT_POOL_BUSY",
+            "all accounts busy, retry later",
+            requestId,
+            { "Retry-After": "5" },
+          );
+          return;
+        }
         if (err instanceof AccountPoolUnavailableError) {
           userLog.warn("proxy_account_pool_unavailable", { msg: err.message });
           incrAnthropicProxyReject("account_pool");
