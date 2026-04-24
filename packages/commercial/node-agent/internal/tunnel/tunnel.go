@@ -79,6 +79,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid port", http.StatusBadRequest)
 		return
 	}
+	// deny-list(#H1′):v3 tunnel 目标是容器内应用端口(HTML preview / devserver 等),
+	// 用户应用一般监听在 1024+;常见的管理端口即使被意外暴露也不应让 master 反代过去。
+	// 拒绝 <1024(但放行 80/443,这俩常用),以及明确列出的常见管理端口。
+	if isDeniedPort(port) {
+		http.Error(w, `{"code":"BLOCKED_PORT"}`, http.StatusBadRequest)
+		return
+	}
 
 	// 解出容器 bound IP
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -205,6 +212,43 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, target, upstream
 	}()
 	<-errc
 	<-errc
+}
+
+// deniedPorts:明确列出的常见管理 / 数据库 / 缓存 / search / mail 端口。
+// 任何改动需审计:添加=更严,删除=放开(需说明业务原因)。
+var deniedPorts = map[int]struct{}{
+	22:    {}, // ssh
+	25:    {}, // smtp
+	111:   {}, // rpcbind
+	445:   {}, // smb
+	465:   {}, // smtps
+	587:   {}, // smtp submission
+	2375:  {}, // docker (plain)
+	2376:  {}, // docker (tls)
+	3306:  {}, // mysql
+	3389:  {}, // rdp
+	5432:  {}, // postgresql
+	5984:  {}, // couchdb
+	6379:  {}, // redis
+	9200:  {}, // elasticsearch http
+	9300:  {}, // elasticsearch transport
+	11211: {}, // memcached
+	27017: {}, // mongodb
+	27018: {}, // mongodb shard
+}
+
+// isDeniedPort 规则:
+//   - 明确清单里的端口 → 拒
+//   - <1024 但不在 {80,443} 里 → 拒(保留 http/https)
+//   - 其他 → 放(应用层用户应用空间)
+func isDeniedPort(p int) bool {
+	if _, ok := deniedPorts[p]; ok {
+		return true
+	}
+	if p < 1024 && p != 80 && p != 443 {
+		return true
+	}
+	return false
 }
 
 // singleLine 防 CRLF 注入:剥掉 \r\n

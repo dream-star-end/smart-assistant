@@ -15,8 +15,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -38,6 +41,7 @@ type Reloader interface {
 type Handler struct {
 	cfg      *config.Config
 	reloader Reloader
+	caPool   *x509.CertPool
 
 	mu     sync.Mutex
 	active map[string]time.Time // nonce -> issuedAt
@@ -45,8 +49,10 @@ type Handler struct {
 
 const nonceTTL = 3 * time.Minute
 
-func New(cfg *config.Config, r Reloader) *Handler {
-	return &Handler{cfg: cfg, reloader: r, active: map[string]time.Time{}}
+// New 构建 renew handler。caPool 用于 /renew-cert/deliver 的 leaf 证书链校验,
+// 必须传入(nil 会在 Deliver 时拒绝所有新 cert)。
+func New(cfg *config.Config, r Reloader, caPool *x509.CertPool) *Handler {
+	return &Handler{cfg: cfg, reloader: r, caPool: caPool, active: map[string]time.Time{}}
 }
 
 // gcLocked 清掉过期 nonce。
@@ -159,6 +165,17 @@ func (h *Handler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // Deliver handler /renew-cert/deliver
+//
+// 写盘前必须做全套校验,避免 master 误签(或被攻陷后发垃圾 cert)把节点 TLS 搞挂:
+//  1. 解析 PEM 链 —— 第一张当 leaf,其余当 intermediates
+//  2. leaf.Verify(Roots=caPool, Intermediates=chain) 校验 CA 信任链
+//  3. leaf.URIs 必须恰好是 `spiffe://openclaude/host/<uuid>`(和本节点身份一致)
+//  4. tls.X509KeyPair(certPem, keyBytes) 校验本地私钥与新 cert 配对
+// 任一失败 → 400,不改动磁盘。
+//
+// 写盘后 ReloadTLS 失败 → 用保存在内存的 oldBytes atomicWrite 回去,再 ReloadTLS 一次
+// 让节点继续跑旧 cert(master 可再发一次 renew)。不用 .bak rename 方案因为
+// rename 会让 cfg.TLSCrt 有一瞬间不存在,此时进程重启会起不来。
 func (h *Handler) HandleDeliver(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
@@ -180,26 +197,125 @@ func (h *Handler) HandleDeliver(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"code":"STALE_NONCE"}`, http.StatusBadRequest)
 		return
 	}
-	// 基础 PEM 校验:must 开头是 -----BEGIN CERTIFICATE-----
-	if !bytes.Contains([]byte(body.CertPem), []byte("-----BEGIN CERTIFICATE-----")) {
+	certBytes := []byte(body.CertPem)
+
+	// 1. 校验 PEM 链并取 leaf + intermediates
+	leaf, interPool, err := parseCertChain(certBytes)
+	if err != nil {
+		logging.L().Warn("cert chain parse failed", "err", err.Error())
 		http.Error(w, `{"code":"BAD_CERT_PEM"}`, http.StatusBadRequest)
 		return
 	}
-	// 原子写
-	if err := atomicWrite(h.cfg.TLSCrt, []byte(body.CertPem), 0o644); err != nil {
+
+	// 2. CA 信任链校验
+	if h.caPool == nil {
+		logging.L().Error("renew caPool not configured; refusing deliver")
+		http.Error(w, `{"code":"NO_CA_POOL"}`, http.StatusInternalServerError)
+		return
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         h.caPool,
+		Intermediates: interPool,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}); err != nil {
+		logging.L().Warn("cert ca verify failed", "err", err.Error())
+		http.Error(w, `{"code":"BAD_CERT_VERIFY"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 3. SPIFFE URI 必须精确匹配本节点身份
+	wantURI := fmt.Sprintf("spiffe://openclaude/host/%s", h.cfg.HostUUID)
+	if len(leaf.URIs) != 1 || leaf.URIs[0].String() != wantURI {
+		logging.L().Warn("cert SAN URI mismatch",
+			"want", wantURI,
+			"got", fmt.Sprintf("%v", leaf.URIs),
+		)
+		http.Error(w, `{"code":"BAD_CERT_SAN"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 4. 私钥配对 —— 确保新 cert 的公钥和本地 tls_key 匹配
+	keyBytes, err := os.ReadFile(h.cfg.TLSKey)
+	if err != nil {
+		logging.L().Error("read tls key failed", "err", err.Error())
+		http.Error(w, `{"code":"FS_READ_KEY"}`, http.StatusInternalServerError)
+		return
+	}
+	if _, err := tls.X509KeyPair(certBytes, keyBytes); err != nil {
+		logging.L().Warn("cert/key pair mismatch", "err", err.Error())
+		http.Error(w, `{"code":"KEY_MISMATCH"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 5. 保存旧 cert 内存副本(首次部署可能没有,忽略 ENOENT)
+	oldBytes, readErr := os.ReadFile(h.cfg.TLSCrt)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		logging.L().Error("read old cert failed", "err", readErr.Error())
+		http.Error(w, `{"code":"FS_READ_OLD"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// 6. 原子写新 cert
+	if err := atomicWrite(h.cfg.TLSCrt, certBytes, 0o644); err != nil {
 		logging.L().Error("cert atomic write failed", "err", err.Error())
 		http.Error(w, `{"code":"FS_WRITE"}`, http.StatusInternalServerError)
 		return
 	}
-	// 触发 TLS reload
+
+	// 7. ReloadTLS;失败就用旧 bytes 回滚,再 reload 一次恢复旧 cert
 	if err := h.reloader.ReloadTLS(); err != nil {
-		logging.L().Error("tls reload failed", "err", err.Error())
-		// 不回滚 cert(master 已确认新 cert 可用);TLS 继续用旧 cache 直到下次 reload
+		logging.L().Error("tls reload failed; rolling back", "err", err.Error())
+		if oldBytes != nil {
+			if wErr := atomicWrite(h.cfg.TLSCrt, oldBytes, 0o644); wErr != nil {
+				logging.L().Error("rollback write failed", "err", wErr.Error())
+			} else if rErr := h.reloader.ReloadTLS(); rErr != nil {
+				logging.L().Error("rollback reload failed", "err", rErr.Error())
+			} else {
+				logging.L().Info("cert rolled back to previous version")
+			}
+		} else {
+			logging.L().Warn("no old cert to roll back to (first-install path)")
+		}
 		http.Error(w, `{"code":"RELOAD_FAIL"}`, http.StatusInternalServerError)
 		return
 	}
 	logging.L().Info("cert renewed and reloaded", "uuid", h.cfg.HostUUID)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// parseCertChain 解析 PEM 链:第一张 CERTIFICATE block 当 leaf,
+// 后续所有 CERTIFICATE block 塞进 intermediates pool(可为空)。
+// 非 CERTIFICATE 类型 block 一律拒绝(防止夹带 PRIVATE KEY 等)。
+func parseCertChain(pemBytes []byte) (*x509.Certificate, *x509.CertPool, error) {
+	if !bytes.Contains(pemBytes, []byte("-----BEGIN CERTIFICATE-----")) {
+		return nil, nil, errors.New("no CERTIFICATE block found")
+	}
+	var leaf *x509.Certificate
+	interPool := x509.NewCertPool()
+	rest := pemBytes
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return nil, nil, fmt.Errorf("unexpected PEM block type %q", block.Type)
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse cert: %w", err)
+		}
+		if leaf == nil {
+			leaf = c
+		} else {
+			interPool.AddCert(c)
+		}
+	}
+	if leaf == nil {
+		return nil, nil, errors.New("empty PEM chain")
+	}
+	return leaf, interPool, nil
 }
 
 // atomicWrite tmp + fsync + rename

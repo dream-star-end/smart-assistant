@@ -59,7 +59,7 @@ func New(cfg *config.Config, baselinePoller *baseline.Poller) (*Server, error) {
 		return nil, err
 	}
 	s.verifier = bootstrap.NewVerifier(cfg)
-	s.renew = renew.New(cfg, s)
+	s.renew = renew.New(cfg, s, pool)
 	s.tunnel = tunnel.NewHandler(s.runner)
 	s.files = files.New()
 	s.sshmux = sshmux.New()

@@ -42,6 +42,7 @@ import {
   FirstTopupAlreadyUsedError,
   InvalidOrderStateError,
   OrderNotFoundError,
+  OrderCallbackTamperedError,
   type OrderRow,
 } from "../payment/orders.js";
 import { verifyHupijiao } from "../payment/hupijiao/sign.js";
@@ -249,6 +250,26 @@ function pickString(form: Record<string, string>, key: string): string {
   return typeof v === "string" ? v : "";
 }
 
+/**
+ * 严格定点十进制解析 total_fee("元" 字符串 → bigint cents)。
+ *
+ * 只接受 `^\d+(\.\d{1,2})?$`(整数,或整数 + 1-2 位小数)。拒绝:
+ *   - 空 / undefined
+ *   - 负号(签名校验通常会过,但 "-10" 进 DB 比对是灾难)
+ *   - 指数记法 `1e2`(JS Number 会当作 100)
+ *   - 千分位 `1,000.00`
+ *   - 非数字 `abc`、`NaN`、`Infinity`
+ *   - 过度精度 `10.123`(微信 / 支付宝协议最小单位是分)
+ *
+ * 不用 `Number + Math.round`:浮点 rounding 在 0.29 之类边界会飘。
+ */
+function parseTotalFeeToCents(raw: string): bigint | null {
+  if (!/^\d+(\.\d{1,2})?$/.test(raw)) return null;
+  const [intPart, fracPart = ""] = raw.split(".");
+  const cents = BigInt(intPart) * 100n + BigInt((fracPart + "00").slice(0, 2));
+  return cents;
+}
+
 export async function handleHupiCallback(
   req: IncomingMessage,
   res: ServerResponse,
@@ -341,11 +362,48 @@ export async function handleHupiCallback(
 
   // 3) 推进状态机
   const providerOrder = pickString(form, "transaction_id");
+  // 回调字段纵深防御校验(M22 fail-closed)
+  // ─────────────────────────────────────────────────────────────────
+  // 设计前提就是"不信签名那一层":如果走到这里 = 签名已过,但我们仍要
+  // 防 appSecret 泄露 / hupijiao 签名算法瑕疵 / 攻击者重签。fail-open
+  // 版本(老逻辑)只要 callback 不带 total_fee 就跳校验 = 直接打通攻击。
+  //
+  // - total_fee:严格定点十进制 `^\d+(\.\d{1,2})?$`,拒绝 `1e2` / `abc`
+  //   / `10.123`;成功 → bigint cents,失败 → 走 tampered 告警
+  // - appid:必须等于配置里的 appId;缺 / 不等 → tampered
+  //
+  // 缺失 / 非法一律走 OrderCallbackTamperedError 统一告警路径,不传到
+  // markOrderPaid(tx 内校验作为"未来新 caller 不走 handler"的第二道防线仍保留)
+  const totalFeeRaw = pickString(form, "total_fee");
+  const expectedAmountCents = parseTotalFeeToCents(totalFeeRaw);
+  const callbackAppid = pickString(form, "appid");
+  const refAppid = deps.hupijiaoConfig.appId;
+
   try {
+    // handler 层 fail-closed 前置校验:字段缺 / 格式非法 / appid 不等 → 抛 tampered
+    // 同 catch 分支走相同 alert + 400 路径,不进 markOrderPaid 扣积分事务
+    if (expectedAmountCents === null) {
+      throw new OrderCallbackTamperedError(
+        orderNo,
+        "amount_cents",
+        "<order amount from DB>",
+        totalFeeRaw.length === 0 ? "<missing>" : `<invalid:${totalFeeRaw}>`,
+      );
+    }
+    if (callbackAppid.length === 0) {
+      throw new OrderCallbackTamperedError(orderNo, "appid", refAppid, "<missing>");
+    }
+    if (callbackAppid !== refAppid) {
+      throw new OrderCallbackTamperedError(orderNo, "appid", refAppid, callbackAppid);
+    }
+
     const r = await markOrderPaid({
       orderNo,
       providerOrder: providerOrder.length > 0 ? providerOrder : null,
       callbackPayload: { ...form, received_at: new Date().toISOString() },
+      expectedAmountCents,
+      expectedAppid: callbackAppid,
+      expectedAppidRef: refAppid,
     });
     if (!r.newlyPaid) {
       // eslint-disable-next-line no-console
@@ -358,6 +416,34 @@ export async function handleHupiCallback(
     if (err instanceof OrderNotFoundError) {
       // 订单不存在:可能是回调到了错的环境(生产→测试)。400 告诉虎皮椒不要再重试
       throw new HttpError(400, "ORDER_NOT_FOUND", `unknown order: ${orderNo}`);
+    }
+    if (err instanceof OrderCallbackTamperedError) {
+      // 回调字段与 DB 不匹配 — 签名对得上但金额 / appid 被改,要么 hupijiao 实现有 bug,
+      // 要么 appSecret 泄露被攻击者重签。订单保持 pending(下次回调有机会被纠正,
+      // 或 15min 后 expire)。critical 告警让人工介入。
+      // eslint-disable-next-line no-console
+      console.error(
+        `[commercial/payment] callback tampered: order=${orderNo} field=${err.field} expected=${err.expected} got=${err.got} reqId=${ctx.requestId}`,
+      );
+      safeEnqueueAlert({
+        event_type: EVENTS.PAYMENT_CALLBACK_TAMPERED,
+        severity: "critical",
+        title: "虎皮椒回调字段篡改",
+        body:
+          `订单 \`${orderNo}\` 的回调 ${err.field} 字段与本地订单不匹配 ` +
+          `(expected=\`${err.expected}\`, got=\`${err.got}\`)。` +
+          `签名验过但关键字段被改,可能是 appSecret 泄露或上游签名 bug,需人工核对。`,
+        payload: {
+          order_no: orderNo,
+          field: err.field,
+          expected: err.expected,
+          got: err.got,
+          req_id: ctx.requestId,
+        },
+        dedupe_key: `payment.callback_tampered:${orderNo}:${err.field}`,
+      });
+      const code = err.field === "amount_cents" ? "AMOUNT_MISMATCH" : "APPID_MISMATCH";
+      throw new HttpError(400, code, err.message);
     }
     if (err instanceof InvalidOrderStateError) {
       // 已过期 / 已退款 / 已取消 —— 典型是用户超时后才付款 / 管理员已处理

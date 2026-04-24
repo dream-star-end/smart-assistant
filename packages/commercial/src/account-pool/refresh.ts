@@ -13,10 +13,10 @@
  * **禁用策略**(Codex review 1bacae8 收紧):
  *   - `account_not_found` — 读账号返 null(也许被并发删了),不禁(无可禁)
  *   - `no_refresh_token` — DB 里没 refresh_token,**禁用**(永久无法自救)
- *   - `http_error` — fetch 抛(底层网络/DNS/TLS/代理不通)→ **不禁用**;
+ *   - `network_transient` — fetch 抛(底层网络/DNS/TLS/代理不通)→ **不禁用**;
  *     按账号 egress_proxy 后,代理一抖等于全池烧光,代价过大;
- *     上层 orchestrator 把 RefreshError 当 release(failure)走健康度扣分,
- *     连续失败仍会进 cooldown,不会"无事发生"
+ *     上层 scheduler.release 按 `kind:"transient_network"` 处理(H9):
+ *     dec inflight slot 但**不扣健康分**,避免代理一抖就把整池账号连环 cooldown/disable
  *   - `http_error` — 上游返 4xx/5xx → **禁用**(显式服务端拒绝,通常是 token 真坏)
  *   - `bad_response` — 2xx 但 JSON 解析失败 / 缺 access_token,**禁用**
  *   - `persist_error` — 远端 refresh 成功了,但本地 updateAccount 抛了;
@@ -52,6 +52,7 @@ export type RefreshErrorCode =
   | "account_not_found"
   | "no_refresh_token"
   | "http_error"
+  | "network_transient"
   | "bad_response"
   | "persist_error";
 
@@ -204,14 +205,65 @@ async function disableOnFailure(
 }
 
 /**
+ * 单进程 per-account singleflight。
+ *
+ * **问题**:Anthropic refresh_token 轮换机制下,并发 N 个请求同时对同一账号触发
+ * refresh → 先到的用旧 refresh_token 换到新 access+refresh,后到的再拿"旧 refresh_token"
+ * 去换会被 Anthropic 判为 reuse → 返 4xx → `disableOnFailure` → **账号被自己烧了**。
+ *
+ * 本 Map 保证同一时刻同一 accountId 只有一个 in-flight refresh 协程,其他 waiter
+ * 都 await 同一个 Promise。失败时每个 waiter 都会拿到同一个 rejection。
+ *
+ * **注意:仅保护本进程内并发**。横向扩到多 gateway 节点时必须加跨进程锁
+ * (Redis SET NX / PG advisory lock),否则相同竞态会在跨进程层再次出现。
+ * 当前 v3 商用版是单 gateway 部署,此层足够。扩容前必须升级此处(见 AUDIT_2026-04-25.md)。
+ */
+const refreshInflight = new Map<string, Promise<RefreshedTokens>>();
+
+/**
+ * Buffer 克隆 —— 每个 waiter 都要拿到独立副本。
+ * 不 clone 的后果:waiter A 用完 `.fill(0)` 会把 waiter B 正在用的 token 也清零。
+ */
+function cloneTokens(r: RefreshedTokens): RefreshedTokens {
+  return {
+    token: Buffer.from(r.token),
+    refresh: r.refresh !== null ? Buffer.from(r.refresh) : null,
+    expires_at: r.expires_at,
+    plan: r.plan,
+  };
+}
+
+/**
  * 刷新账号 token。成功 → 写回 DB + 返新 token;失败 → throw RefreshError。
  * 是否禁用账号取决于错误类型,见文件头部"禁用策略"章节。
+ *
+ * 并发保护:同 accountId 的 in-flight refresh 会被合并(见 refreshInflight 注释)。
  *
  * @throws {@link RefreshError}
  */
 export async function refreshAccountToken(
   accountId: bigint | string,
   deps: RefreshDeps = {},
+): Promise<RefreshedTokens> {
+  const key = String(accountId);
+  const existing = refreshInflight.get(key);
+  if (existing) {
+    // 复用 in-flight Promise,但返回克隆后的 Buffer 避免多个 waiter 互相污染
+    const r = await existing;
+    return cloneTokens(r);
+  }
+  const p = refreshAccountTokenInner(accountId, deps);
+  refreshInflight.set(key, p);
+  try {
+    return await p;
+  } finally {
+    refreshInflight.delete(key);
+  }
+}
+
+async function refreshAccountTokenInner(
+  accountId: bigint | string,
+  deps: RefreshDeps,
 ): Promise<RefreshedTokens> {
   const http = deps.http ?? defaultHttp;
   const keyFn = deps.keyFn ?? loadKmsKey;
@@ -258,14 +310,14 @@ export async function refreshAccountToken(
       deps.dispatcher,
     );
   } catch (err) {
-    // 不 disable —— 网络层异常(DNS / TCP / TLS / proxy 不通)无法区分是 anthropic
-    // 挂了还是出口代理基础设施抖动。把健康账号 disable 等于代理一抖就把账号烧了。
-    // 更上层(orchestrator.classifyError)对 RefreshError 当前算 "failure"(健康分扣
-    // 一格),那是合理的;但状态机层面账号仍 active,下次 pick 还能尝试。
+    // 网络层异常(DNS / TCP / TLS / proxy 不通)—— 区分于 http_error。
+    // 账号**不 disable**(代理抖动时一次性烧整池代价过大)。
+    // 更上层的 scheduler.release 应按 `kind:"transient_network"` 处理:
+    // dec inflight 但**不扣健康分**(#H9)。连续多次可由 orchestrator 层再自行限流。
     // 不把底层 err.message 拼进 message:未来如果 endpoint 可带凭据,
     // 上游 fetch 错误的 url 片段可能泄露;完整异常走 cause 链。
     throw new RefreshError(
-      "http_error",
+      "network_transient",
       "refresh network call failed",
       { cause: err },
     );

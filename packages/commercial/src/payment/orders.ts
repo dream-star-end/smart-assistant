@@ -127,6 +127,36 @@ export class InvalidOrderStateError extends Error {
   }
 }
 
+/**
+ * 回调 payload 中声称的字段与本地订单不匹配 —— 签名验过了但业务字段被篡改。
+ * 只在 markOrderPaid 事务入口做纵深防御校验,保证即使 hupijiao 签名算法有瑕疵或
+ * appSecret 泄露,攻击者也无法让「100 元订单」只付 1 元进账。
+ *
+ * field: "amount_cents" 或 "appid" — 区分告警语义
+ */
+export class OrderCallbackTamperedError extends Error {
+  readonly code = "PAYMENT_CALLBACK_TAMPERED" as const;
+  readonly orderNo: string;
+  readonly field: "amount_cents" | "appid";
+  readonly expected: string;
+  readonly got: string;
+  constructor(
+    orderNo: string,
+    field: "amount_cents" | "appid",
+    expected: string,
+    got: string,
+  ) {
+    super(
+      `order ${orderNo} callback ${field} mismatch: expected=${expected} got=${got}`,
+    );
+    this.name = "OrderCallbackTamperedError";
+    this.orderNo = orderNo;
+    this.field = field;
+    this.expected = expected;
+    this.got = got;
+  }
+}
+
 /** 归一化 user_id,复用 ledger 里同样的宽容策略。 */
 function normalizeUserId(userId: bigint | number | string): string {
   if (typeof userId === "bigint") return userId.toString();
@@ -340,6 +370,22 @@ export interface MarkOrderPaidInput {
   orderNo: string;
   providerOrder?: string | null;
   callbackPayload: unknown;
+  /**
+   * 回调里声称的 amount_cents。传了就在 tx 里 FOR UPDATE 拿到订单后,校验
+   * 与 DB 的 amount_cents 完全相等;不等 → 抛 OrderCallbackTamperedError。
+   * 不传 → 跳过校验(给内部强制推进 / 测试用;不应由外部 callback 直接调到不传路径)。
+   */
+  expectedAmountCents?: bigint;
+  /**
+   * 回调里声称的支付渠道 appid。给了就要求等于 expectedAppidRef;
+   * 不等 → OrderCallbackTamperedError(field=appid)。
+   */
+  expectedAppid?: string;
+  /**
+   * 比对 expectedAppid 的基准值(来自服务端配置)。
+   * 两者一定要同时传或同时不传:外层没配 appid 基准,就不做 appid 校验。
+   */
+  expectedAppidRef?: string;
 }
 
 export interface MarkOrderPaidResult {
@@ -398,6 +444,32 @@ export async function markOrderPaid(
     if (current.status !== "pending") {
       // expired/canceled/refunded 都不能翻回 paid
       throw new InvalidOrderStateError(input.orderNo, current.status);
+    }
+
+    // 纵深防御:回调字段与订单不匹配 → 中止,不扣积分不写 ledger,订单保持 pending
+    // 等待下次回调或 expire。攻击面覆盖"签名算法绕过 / appSecret 泄露 / 上游 bug"。
+    if (
+      input.expectedAmountCents !== undefined &&
+      input.expectedAmountCents !== current.amount_cents
+    ) {
+      throw new OrderCallbackTamperedError(
+        input.orderNo,
+        "amount_cents",
+        current.amount_cents.toString(),
+        input.expectedAmountCents.toString(),
+      );
+    }
+    if (
+      input.expectedAppid !== undefined &&
+      input.expectedAppidRef !== undefined &&
+      input.expectedAppid !== input.expectedAppidRef
+    ) {
+      throw new OrderCallbackTamperedError(
+        input.orderNo,
+        "appid",
+        input.expectedAppidRef,
+        input.expectedAppid,
+      );
     }
 
     // 1. 锁用户余额

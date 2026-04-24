@@ -48,6 +48,7 @@ export const EVENTS = {
   PAYMENT_FAILED: "payment.failed",
   PAYMENT_CALLBACK_SIGNATURE_INVALID: "payment.callback_signature_invalid",
   PAYMENT_CALLBACK_CONFLICT: "payment.callback_conflict",
+  PAYMENT_CALLBACK_TAMPERED: "payment.callback_tampered",
 
   // ── 容器(2 个已 wire)──────────────────────────────────────
   CONTAINER_PROVISION_FAILED: "container.provision_failed",
@@ -89,6 +90,8 @@ export const EVENT_META: EventMeta[] = [
     description: "虎皮椒回调签名校验失败", trigger: "passive" },
   { event_type: EVENTS.PAYMENT_CALLBACK_CONFLICT, severity: "critical", group: "payment",
     description: "回调状态与订单冲突(重复支付 / 过期订单被标 paid 等)", trigger: "passive" },
+  { event_type: EVENTS.PAYMENT_CALLBACK_TAMPERED, severity: "critical", group: "payment",
+    description: "回调 payload 字段与订单不匹配(total_fee / appid 被篡改)", trigger: "passive" },
 
   // container
   { event_type: EVENTS.CONTAINER_PROVISION_FAILED, severity: "critical", group: "container",

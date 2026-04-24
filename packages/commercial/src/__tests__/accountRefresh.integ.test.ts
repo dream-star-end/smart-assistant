@@ -12,7 +12,7 @@
  *   6. HTTP 5xx → 禁用 + 抛 http_error(status=502)
  *   7. HTTP 返非 JSON → 禁用 + 抛 bad_response
  *   8. HTTP 返 JSON 但缺 access_token → 禁用 + 抛 bad_response
- *   9. network throw → 抛 http_error 但 **不**禁用账号(网络/代理抖动可恢复)
+ *   9. network throw → 抛 network_transient 但 **不**禁用账号(网络/代理抖动可恢复)
  *  10. health.manualDisable 注入时走 health 路径而非 updateAccount
  */
 
@@ -375,7 +375,7 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
     assert.equal(row!.status, "disabled");
   });
 
-  test("network 抛 → http_error,但 **不** 禁用账号(代理/网络抖动可恢复)", async (t) => {
+  test("network 抛 → network_transient,**不**禁用账号(代理/网络抖动可恢复)", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
       { label: "net", plan: "pro", token: "T", refresh: "R" },
@@ -389,12 +389,14 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
       }),
       (err: unknown) =>
         err instanceof RefreshError &&
-        (err as RefreshError).code === "http_error" &&
+        (err as RefreshError).code === "network_transient" &&
         (err as RefreshError).status === undefined,
     );
     // 政策更新(2026-04-19,Codex 8ec407b 复审):网络层异常无法区分是 anthropic 挂
     // 还是出口代理抖,不再 disable 账号 —— 否则代理供应商抖一次就把所有挂代理的
     // 账号烧掉。orchestrator 会照常 yield error,下次 pick 再重试。
+    // 2026-04-25 审计 #H9:错误码从 http_error 拆出 network_transient,
+    // 调度器按 kind:"transient_network" 释放,不扣健康分。
     const row = await getAccount(a.id);
     assert.equal(row!.status, "active");
   });
@@ -449,5 +451,87 @@ describe("refreshAccountToken — 并发删除", () => {
       (err: unknown) =>
         err instanceof RefreshError && (err as RefreshError).code === "account_not_found",
     );
+  });
+});
+
+describe("refreshAccountToken — singleflight (#H8)", () => {
+  test("同账号 5 个并发 refresh → http.post 只被打 1 次,5 个 waiter 都拿到结果", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const a = await createAccount(
+      { label: "sf", plan: "pro", token: "T", refresh: "R" },
+      keyFn,
+    );
+
+    // 记录 http.post 被调用次数,并让 post 慢一点让并发真能撞上
+    let postCount = 0;
+    const slowHttp: RefreshHttpClient = {
+      async post() {
+        postCount++;
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return {
+          status: 200,
+          body: JSON.stringify({
+            access_token: "NEW_ACCESS",
+            refresh_token: "NEW_REFRESH",
+            expires_in: 3600,
+          }),
+        };
+      },
+    };
+
+    const ps = [];
+    for (let i = 0; i < 5; i++) {
+      ps.push(refreshAccountToken(a.id, { http: slowHttp, keyFn, now }));
+    }
+    const results = await Promise.all(ps);
+    assert.equal(postCount, 1, "http.post 应只调用 1 次");
+    assert.equal(results.length, 5);
+    // 每个 waiter 拿到独立 Buffer 实例,互不污染
+    for (let i = 0; i < results.length; i++) {
+      assert.equal(results[i].token.toString("utf8"), "NEW_ACCESS");
+      assert.equal(results[i].refresh?.toString("utf8"), "NEW_REFRESH");
+      // 不同的 Buffer 对象:一个 fill(0) 不应影响另一个
+      if (i > 0) {
+        assert.notEqual(results[i].token, results[0].token, "Buffer 对象必须独立");
+      }
+    }
+    // 一个 waiter fill(0) 之后,其他 waiter 的 token 不受影响
+    results[0].token.fill(0);
+    assert.equal(results[1].token.toString("utf8"), "NEW_ACCESS");
+  });
+
+  test("in-flight 失败 → 所有 waiter 都拒绝;下一次 call 从头再跑", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const a = await createAccount(
+      { label: "sf-fail", plan: "pro", token: "T", refresh: "R" },
+      keyFn,
+    );
+
+    let postCount = 0;
+    const http: RefreshHttpClient = {
+      async post() {
+        postCount++;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        throw new Error("network down");
+      },
+    };
+
+    const ps = [
+      refreshAccountToken(a.id, { http, keyFn, now }),
+      refreshAccountToken(a.id, { http, keyFn, now }),
+      refreshAccountToken(a.id, { http, keyFn, now }),
+    ];
+    const settled = await Promise.allSettled(ps);
+    for (const s of settled) {
+      assert.equal(s.status, "rejected");
+      const err = (s as PromiseRejectedResult).reason;
+      assert.ok(err instanceof RefreshError);
+      assert.equal((err as RefreshError).code, "network_transient");
+    }
+    assert.equal(postCount, 1, "3 个并发 → 1 次 HTTP");
+
+    // inflight Map 必须被清掉:下一次调用会重新打 HTTP
+    await assert.rejects(refreshAccountToken(a.id, { http, keyFn, now }));
+    assert.equal(postCount, 2, "第二批调用应重新打 HTTP");
   });
 });

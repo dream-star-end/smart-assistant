@@ -98,7 +98,20 @@ export interface PickResult {
   egress_proxy: string | null
 }
 
-export type ReleaseResult = { kind: 'success' } | { kind: 'failure'; error?: string | null }
+/**
+ * 请求释放结果。
+ *
+ * - `success`:请求正常完成。onSuccess → 健康分恢复
+ * - `failure`:上游显式报错(4xx / 5xx / 解析失败 / 显式业务失败)。onFailure → 扣健康分
+ * - `transient_network`:纯网络层抖动(DNS / TCP / TLS / proxy 不通),**不扣健康分**,
+ *   仅 dec 并发槽位。设计动机:账号配 egress_proxy 后,代理一抖等于一次性把整池账号
+ *   全扣分 → 误判 cooldown / disable。网络抖动应由连续多次 http_error(上游)体现,
+ *   而非把纯网络失败算到具体账号头上。
+ */
+export type ReleaseResult =
+  | { kind: 'success' }
+  | { kind: 'failure'; error?: string | null }
+  | { kind: 'transient_network'; error?: string | null }
 
 export interface ReleaseInput {
   account_id: bigint | string
@@ -370,8 +383,9 @@ export class AccountScheduler {
     this.decInflight(String(input.account_id))
     if (input.result.kind === 'success') {
       await this.health.onSuccess(input.account_id)
-    } else {
+    } else if (input.result.kind === 'failure') {
       await this.health.onFailure(input.account_id, input.result.error ?? null)
     }
+    // transient_network:已释放 slot,但不扣健康分(见 ReleaseResult 注释)
   }
 }

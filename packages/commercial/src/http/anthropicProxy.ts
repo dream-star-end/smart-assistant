@@ -1438,16 +1438,24 @@ export function makeAnthropicProxyHandler(
             };
           } catch (err) {
             // refresh 失败:account 已在 RefreshError 内部按规约处理 disable/不 disable;
-            // 我们 release(failure) 让 health 扣分,然后 502
+            // 调度器层面:
+            //   - network_transient(#H9):纯网络抖动(代理挂 / DNS / TLS)。不扣健康分,
+            //     仅 dec inflight。否则代理一抖全池账号瞬间被连续扣分 → 误判 cooldown/disable。
+            //   - 其它(上游 4xx/5xx / bad_response / persist_error / 未知):按 failure 扣分。
+            const isTransient =
+              err instanceof RefreshError && err.code === "network_transient";
             userLog.warn("proxy_refresh_failed", {
               accountId: pick.account_id.toString(),
               code: err instanceof RefreshError ? err.code : "unknown",
               msg: err instanceof Error ? err.message : String(err),
+              transient: isTransient,
             });
             await deps.scheduler
               .release({
                 account_id: pick.account_id,
-                result: { kind: "failure", error: errMessageShort(err) },
+                result: isTransient
+                  ? { kind: "transient_network", error: errMessageShort(err) }
+                  : { kind: "failure", error: errMessageShort(err) },
               })
               .catch(() => {});
             await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});

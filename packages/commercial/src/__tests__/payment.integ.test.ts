@@ -405,6 +405,140 @@ describe("POST /api/payment/hupi/callback", () => {
     const json = JSON.parse(r.text) as { error: { code: string } };
     assert.equal(json.error.code, "ORDER_NOT_FOUND");
   });
+
+  test("total_fee 篡改:400 AMOUNT_MISMATCH + 订单仍 pending + 积分不到账", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid } = await createUserWithToken("cb-tampered-fee@example.com", 0n);
+    // plan-100 订单实际是 ¥100 = 10000 cents
+    const orderNo = await seedPendingOrder(uid, "plan-100");
+    // 回调伪造成 ¥1,并用合法 appSecret 重新签名 → 签名能过,但金额对不上本地
+    const form: Record<string, string> = {
+      version: "1.1",
+      appid: HUPI_APP_ID,
+      trade_order_id: orderNo,
+      transaction_id: "WX_TAMPER",
+      total_fee: "1.00",
+      status: "OD",
+      nonce_str: "aaa",
+      time: "1800000001",
+    };
+    form.hash = signHupijiao(form, HUPI_SECRET);
+    const r = await postForm("/api/payment/hupi/callback", form);
+    assert.equal(r.status, 400);
+    const json = JSON.parse(r.text) as { error: { code: string } };
+    assert.equal(json.error.code, "AMOUNT_MISMATCH");
+
+    // 订单仍 pending,用户积分未到账,ledger 未写
+    const o = await query<{ status: string }>(
+      "SELECT status FROM orders WHERE order_no=$1", [orderNo],
+    );
+    assert.equal(o.rows[0].status, "pending");
+    const u = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id=$1", [uid],
+    );
+    assert.equal(u.rows[0].credits, "0");
+    const cnt = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id=$1", [uid],
+    );
+    assert.equal(cnt.rows[0].cnt, "0");
+  });
+
+  test("appid 篡改:400 APPID_MISMATCH + 订单仍 pending", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid } = await createUserWithToken("cb-tampered-appid@example.com", 0n);
+    const orderNo = await seedPendingOrder(uid, "plan-10");
+    // 篡改 appid + 用合法 secret 重签 → 签名过,但 appid 对不上 deps.hupijiaoConfig.appId
+    const form: Record<string, string> = {
+      appid: "WRONG_APP",
+      trade_order_id: orderNo,
+      total_fee: "10.00",
+      status: "OD",
+      transaction_id: "WX_TAMPER_APPID",
+    };
+    form.hash = signHupijiao(form, HUPI_SECRET);
+    const r = await postForm("/api/payment/hupi/callback", form);
+    assert.equal(r.status, 400);
+    const json = JSON.parse(r.text) as { error: { code: string } };
+    assert.equal(json.error.code, "APPID_MISMATCH");
+
+    const o = await query<{ status: string }>(
+      "SELECT status FROM orders WHERE order_no=$1", [orderNo],
+    );
+    assert.equal(o.rows[0].status, "pending");
+  });
+
+  // fail-closed 覆盖:签名验过但 callback 缺 / 非法字段 → 仍走 tampered 告警,不推进订单
+  test("total_fee 缺失:400 AMOUNT_MISMATCH + 订单仍 pending + 积分不到账", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid } = await createUserWithToken("cb-missing-fee@example.com", 0n);
+    const orderNo = await seedPendingOrder(uid, "plan-10");
+    // 故意不传 total_fee(虎皮椒签名算法跳过空字段,所以仍可合法签名)
+    const form: Record<string, string> = {
+      appid: HUPI_APP_ID,
+      trade_order_id: orderNo,
+      status: "OD",
+      transaction_id: "WX_NO_FEE",
+    };
+    form.hash = signHupijiao(form, HUPI_SECRET);
+    const r = await postForm("/api/payment/hupi/callback", form);
+    assert.equal(r.status, 400);
+    const json = JSON.parse(r.text) as { error: { code: string } };
+    assert.equal(json.error.code, "AMOUNT_MISMATCH");
+
+    const o = await query<{ status: string }>(
+      "SELECT status FROM orders WHERE order_no=$1", [orderNo],
+    );
+    assert.equal(o.rows[0].status, "pending");
+    const u = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id=$1", [uid],
+    );
+    assert.equal(u.rows[0].credits, "0");
+  });
+
+  test("total_fee 非法格式:400 AMOUNT_MISMATCH(拒绝 abc / 指数 / 过度精度)", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid } = await createUserWithToken("cb-invalid-fee@example.com", 0n);
+    for (const bad of ["abc", "1e2", "10.123", "-10.00", " 10.00", "NaN", "1,000"]) {
+      const orderNo = await seedPendingOrder(uid, "plan-10");
+      const form: Record<string, string> = {
+        appid: HUPI_APP_ID,
+        trade_order_id: orderNo,
+        total_fee: bad,
+        status: "OD",
+        transaction_id: `WX_BAD_${bad}`,
+      };
+      form.hash = signHupijiao(form, HUPI_SECRET);
+      const r = await postForm("/api/payment/hupi/callback", form);
+      assert.equal(r.status, 400, `value ${JSON.stringify(bad)} should be rejected`);
+      const json = JSON.parse(r.text) as { error: { code: string } };
+      assert.equal(json.error.code, "AMOUNT_MISMATCH");
+      const o = await query<{ status: string }>(
+        "SELECT status FROM orders WHERE order_no=$1", [orderNo],
+      );
+      assert.equal(o.rows[0].status, "pending");
+    }
+  });
+
+  test("appid 缺失:400 APPID_MISMATCH", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid } = await createUserWithToken("cb-missing-appid@example.com", 0n);
+    const orderNo = await seedPendingOrder(uid, "plan-10");
+    const form: Record<string, string> = {
+      trade_order_id: orderNo,
+      total_fee: "10.00",
+      status: "OD",
+      transaction_id: "WX_NO_APPID",
+    };
+    form.hash = signHupijiao(form, HUPI_SECRET);
+    const r = await postForm("/api/payment/hupi/callback", form);
+    assert.equal(r.status, 400);
+    const json = JSON.parse(r.text) as { error: { code: string } };
+    assert.equal(json.error.code, "APPID_MISMATCH");
+    const o = await query<{ status: string }>(
+      "SELECT status FROM orders WHERE order_no=$1", [orderNo],
+    );
+    assert.equal(o.rows[0].status, "pending");
+  });
 });
 
 describe("GET /api/payment/orders/:order_no", () => {
