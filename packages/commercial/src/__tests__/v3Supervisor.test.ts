@@ -150,6 +150,7 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
 type FakeRow = {
   id: number;
   user_id: number;
+  host_uuid: string | null;
   bound_ip: string;
   secret_hash: Buffer;
   state: "active" | "vanished";
@@ -203,11 +204,12 @@ class FakePool {
             e.constraint = "uniq_ac_bound_ip_active";
             throw e;
           }
-          // params: [user_id, bound_ip, secret_hash, port]
+          // params: [user_id, host_uuid, bound_ip, secret_hash, port]
           const userId = Number.parseInt(String(params![0]), 10);
-          const boundIp = String(params![1]);
-          const secretHash = params![2] as Buffer;
-          const port = Number(params![3]);
+          const hostUuid = params![1] == null ? null : String(params![1]);
+          const boundIp = String(params![2]);
+          const secretHash = params![3] as Buffer;
+          const port = Number(params![4]);
           // 真 uniq:active 中已有同 IP → 23505
           if (self.rows.some((r) => r.state === "active" && r.bound_ip === boundIp)) {
             const e = new Error("duplicate key") as Error & { code: string; constraint: string };
@@ -220,6 +222,7 @@ class FakePool {
           self.rows.push({
             id,
             user_id: userId,
+            host_uuid: hostUuid,
             bound_ip: boundIp,
             secret_hash: secretHash,
             state: "active",
@@ -250,7 +253,7 @@ class FakePool {
           }
           return { rowCount: r ? 1 : 0, rows: [] };
         }
-        if (/SELECT id, user_id, bound_ip::text/i.test(trimmed) && /WHERE user_id/i.test(trimmed)) {
+        if (/SELECT id, user_id,\s*host\(bound_ip\)/i.test(trimmed) && /WHERE user_id/i.test(trimmed)) {
           const userId = Number.parseInt(String(params![0]), 10);
           const r = self.rows.find((x) => x.user_id === userId && x.state === "active");
           if (!r) return { rowCount: 0, rows: [] };
@@ -262,6 +265,7 @@ class FakePool {
               bound_ip: r.bound_ip,
               port: r.port,
               container_internal_id: r.container_internal_id,
+              host_uuid: r.host_uuid,
             }],
           };
         }
@@ -615,6 +619,7 @@ describe("stopAndRemoveV3Container", () => {
     pool.rows.push({
       id: 99,
       user_id: 1,
+      host_uuid: null,
       bound_ip: "172.30.4.4",
       secret_hash: Buffer.alloc(32),
       state: "active",
@@ -646,6 +651,7 @@ describe("stopAndRemoveV3Container", () => {
     pool.rows.push({
       id: 77,
       user_id: 1,
+      host_uuid: null,
       bound_ip: "172.30.5.5",
       secret_hash: Buffer.alloc(32),
       state: "active",
@@ -677,6 +683,7 @@ describe("stopAndRemoveV3Container", () => {
     pool.rows.push({
       id: 88,
       user_id: 2,
+      host_uuid: null,
       bound_ip: "172.30.5.6",
       secret_hash: Buffer.alloc(32),
       state: "active",
@@ -711,6 +718,7 @@ describe("stopAndRemoveV3Container", () => {
     pool.rows.push({
       id: 99,
       user_id: 3,
+      host_uuid: null,
       bound_ip: "172.30.5.7",
       secret_hash: Buffer.alloc(32),
       state: "active",
@@ -749,6 +757,7 @@ describe("stopAndRemoveV3Container", () => {
     pool.rows.push({
       id: 100,
       user_id: 4,
+      host_uuid: null,
       bound_ip: "172.30.5.8",
       secret_hash: Buffer.alloc(32),
       state: "active",
@@ -812,6 +821,7 @@ describe("getV3ContainerStatus", () => {
     pool.rows.push({
       id: 1,
       user_id: 5,
+      host_uuid: null,
       bound_ip: "172.30.11.11",
       secret_hash: Buffer.alloc(32),
       state: "active",
@@ -835,6 +845,7 @@ describe("getV3ContainerStatus", () => {
     pool.rows.push({
       id: 1,
       user_id: 5,
+      host_uuid: null,
       bound_ip: "172.30.12.12",
       secret_hash: Buffer.alloc(32),
       state: "active",
@@ -880,6 +891,7 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
       pool.rows.push({
         id: pool.nextId++,
         user_id: 1000 + i,
+        host_uuid: null,
         bound_ip: `172.30.100.${i + 1}`,
         secret_hash: Buffer.alloc(32),
         state: "active",
@@ -966,6 +978,7 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
       pool.rows.push({
         id: pool.nextId++,
         user_id: 8000 + i,
+        host_uuid: null,
         bound_ip: `172.30.200.${i + 1}`,
         secret_hash: Buffer.alloc(32),
         state: "vanished",

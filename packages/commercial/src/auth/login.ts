@@ -46,6 +46,14 @@ export const loginInputSchema = z.object({
   email: emailSchema,
   password: passwordSchema,
   turnstile_token: z.string().min(1).max(2048),
+  /**
+   * "记住我" checkbox。
+   *   true(默认,向后兼容旧前端):refresh cookie Max-Age=30d,浏览器关闭后
+   *     下次打开仍自动登录;access token 也走 localStorage(跨 session 存活)
+   *   false:refresh cookie 无 Max-Age(session cookie,浏览器关闭即删);
+   *     access token 走 sessionStorage。下次打开必须重新登录。
+   */
+  remember: z.boolean().optional(),
 });
 
 export type LoginInput = z.infer<typeof loginInputSchema>;
@@ -128,6 +136,11 @@ export interface LoginResult {
   refresh_token: string;
   /** unix seconds */
   refresh_exp: number;
+  /**
+   * 透传给 handler,决定 Set-Cookie 是 persistent(Max-Age=30d)还是 session
+   * cookie(无 Max-Age)。缺省 input.remember 视为 true。
+   */
+  remember: boolean;
 }
 
 export interface LoginDeps {
@@ -268,15 +281,18 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
   // 2026-04-22 HIGH#4 回归修:bound_ip 存稳定出口 (bindIp),不存真实访客 IP (remoteIp)。
   // remoteIp 已在上面 Turnstile verify 用过。两处语义拆开见 LoginDeps JSDoc。
   const bindIp = deps.bindIp ?? deps.remoteIp ?? null;
+  // "记住我":默认视为 true,保持对不带 remember 字段的旧前端完全兼容。
+  const rememberMe = input.remember !== false;
   await query(
-    `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at)
-     VALUES ($1, $2, $3, $4, to_timestamp($5))`,
+    `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
+     VALUES ($1, $2, $3, $4, to_timestamp($5), $6)`,
     [
       user.id,
       refresh.hash,
       deps.userAgent ?? null,
       bindIp,
       refresh.expires_at,
+      rememberMe,
     ],
   );
 
@@ -294,6 +310,7 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
     access_exp: access.exp,
     refresh_token: refresh.token,
     refresh_exp: refresh.expires_at,
+    remember: rememberMe,
   };
 }
 
@@ -317,6 +334,12 @@ export interface RefreshResult {
   refresh_token: string;
   /** unix seconds */
   refresh_exp: number;
+  /**
+   * 继承自原 token 所属 family 的 remember_me 标志,HTTP 层据此决定新 cookie
+   * 是 persistent(Max-Age=refresh_exp)还是 session cookie(无 Max-Age)。
+   * 老行(migration 0031 前写入的)默认 true,保持 30d 行为。
+   */
+  remember: boolean;
 }
 
 export interface RefreshExtraDeps {
@@ -395,6 +418,8 @@ export async function refresh(
       // 客户端 replay 即使在 grace 内也会被 fingerprint 拒掉,继续走 theft。
       bound_user_agent: string | null;
       bound_ip: string | null;
+      /** 0031 新增;老行默认 TRUE(迁移时 DEFAULT)。 */
+      remember_me: boolean;
     }>(
       `SELECT rt.id::text AS id,
               rt.user_id::text AS user_id,
@@ -407,7 +432,8 @@ export async function refresh(
                    ELSE EXTRACT(EPOCH FROM (NOW() - rt.revoked_at))::text
               END AS revoked_age_sec,
               rt.user_agent AS bound_user_agent,
-              host(rt.ip) AS bound_ip
+              host(rt.ip) AS bound_ip,
+              rt.remember_me AS remember_me
          FROM refresh_tokens rt
          JOIN users u ON u.id = rt.user_id
         WHERE rt.token_hash = $1
@@ -489,12 +515,14 @@ export async function refresh(
       throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
     }
 
-    // 正常 rotation 路径
+    // 正常 rotation 路径 —— 继承 remember_me,保持本次 family 的语义一致
+    // (否则每次 rotate 都会把 session 级会话"升级"回 persistent,记住我
+    // unchecked 形同虚设)。
     const newRefresh = issueRefresh({ now: ts, ttlSeconds: refreshTtl });
     const ins = await client.query<{ id: string }>(
       `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at,
-                                  family_id, revoked_at, revoked_reason)
-       VALUES ($1, $2, $3, $4, to_timestamp($5), $6::uuid, NULL, NULL)
+                                  family_id, revoked_at, revoked_reason, remember_me)
+       VALUES ($1, $2, $3, $4, to_timestamp($5), $6::uuid, NULL, NULL, $7)
        RETURNING id::text AS id`,
       [
         row.user_id,
@@ -503,6 +531,7 @@ export async function refresh(
         deps.remoteIp ?? null,
         newRefresh.expires_at,
         row.family_id,
+        row.remember_me,
       ],
     );
     const newId = ins.rows[0].id;
@@ -521,6 +550,7 @@ export async function refresh(
       user_id: row.user_id,
       role: row.role,
       newRefresh,
+      remember: row.remember_me,
     };
   });
 
@@ -557,6 +587,7 @@ export async function refresh(
     access_exp: access.exp,
     refresh_token: result.newRefresh.token,
     refresh_exp: result.newRefresh.expires_at,
+    remember: result.remember,
   };
 }
 

@@ -49,7 +49,10 @@ import {
   DEFAULT_HTTP_PROBE_MS,
   DEFAULT_WS_PROBE_MS,
   type WaitContainerReadyOptions,
+  type ReadinessEndpoint,
 } from "./v3readiness.js";
+import { schedule as schedulePlacement, type SchedulePlacement } from "../compute-pool/nodeScheduler.js";
+import { NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/types.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
@@ -101,13 +104,33 @@ export interface EnsureRunningOptions {
   /** 单次 WS upgrade probe 超时,默认 1.5s(3E 新增) */
   wsProbeMs?: number;
   /** 测试钩子:覆盖 HTTP /healthz 探活 */
-  probeHealthz?: (host: string, port: number) => Promise<boolean>;
+  probeHealthz?: () => Promise<boolean>;
   /** 测试钩子:覆盖 WS upgrade 探活(3E 新增) */
-  probeWsUpgrade?: (host: string, port: number) => Promise<boolean>;
+  probeWsUpgrade?: () => Promise<boolean>;
   /** 测试钩子:覆盖 setTimeout(主要给 fake-timer/排测试) */
   sleep?: (ms: number) => Promise<void>;
   /** 测试钩子:可注入"现在是几号"用于 timeout 计算 */
   now?: () => number;
+}
+
+/**
+ * B.4:根据 hostId vs selfHostId 选 direct / node-tunnel readiness endpoint。
+ *
+ *   - hostId 为 null(单机 MVP 遗留行)或 hostId === selfHostId → direct
+ *   - hostId 非 null 且 !== selfHostId 且 selfHostId 存在 → node-tunnel
+ *   - selfHostId 未注入(MVP 部署)→ 永远 direct(即使 hostId 非 null,也只能按本机处理)
+ */
+function chooseReadinessEndpoint(
+  hostId: string | null,
+  selfHostId: string | undefined,
+  boundIp: string,
+  port: number,
+  containerInternalId: string,
+): ReadinessEndpoint {
+  if (hostId && selfHostId && hostId !== selfHostId) {
+    return { kind: "node-tunnel", hostId, containerInternalId };
+  }
+  return { kind: "direct", host: boundIp, port };
 }
 
 function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerReadyOptions {
@@ -167,7 +190,14 @@ export function makeV3EnsureRunning(
 
     // 2a) running 直接进 readiness 探活(HTTP /healthz + WS upgrade)
     if (status && status.state === "running") {
-      const ready = await waitContainerReady(status.boundIp, status.port, readinessOpts);
+      const endpoint = chooseReadinessEndpoint(
+        status.hostId,
+        deps.selfHostId,
+        status.boundIp,
+        status.port,
+        status.dockerContainerId,
+      );
+      const ready = await waitContainerReady(endpoint, readinessOpts);
       if (!ready) throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "starting");
       // 3F: 用户重连即视作活跃 — 刷新 last_ws_activity,推迟 idle sweep。
       // 不 await 失败、也不阻塞 caller(markV3ContainerActivity 自吞错)。
@@ -195,9 +225,22 @@ export function makeV3EnsureRunning(
     }
 
     // 3) provision 新容器(无 active 行 OR 刚清掉 missing 行)
+    // B.4:注入了 containerService → 走 scheduler 挑 host + 分 IP;否则走单机 MVP(randomIp)
+    let placement: SchedulePlacement | undefined;
+    if (deps.containerService) {
+      try {
+        placement = await schedulePlacement({ userId: uid });
+      } catch (err) {
+        if (err instanceof NodePoolBusyError || err instanceof NodePoolUnavailableError) {
+          throw new ContainerUnreadyError(RETRY_AFTER_HOST_FULL_SEC, "host_full");
+        }
+        throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "supervisor_error");
+      }
+    }
+
     let provisioned;
     try {
-      provisioned = await provisionV3Container(deps, uid);
+      provisioned = await provisionV3Container(deps, uid, placement?.hostId, placement?.boundIp);
     } catch (err) {
       // V3 Phase 3I — host 满 cap 走专用 reason + 长 retryAfter,前端显示"系统繁忙"
       if (err instanceof SupervisorError && err.code === "HostFull") {
@@ -243,7 +286,14 @@ export function makeV3EnsureRunning(
     }
 
     // 4) waitContainerReady —— 容器内 OpenClaude 起来需要 3-8s,HTTP+WS 双过才算 ready
-    const ready = await waitContainerReady(provisioned.boundIp, provisioned.port, readinessOpts);
+    const endpoint = chooseReadinessEndpoint(
+      provisioned.hostId,
+      deps.selfHostId,
+      provisioned.boundIp,
+      provisioned.port,
+      provisioned.dockerContainerId,
+    );
+    const ready = await waitContainerReady(endpoint, readinessOpts);
     if (!ready) {
       // 起来了但 readiness 没通 — 前端按 retryAfter 重连(下次再调本 ensureRunning,
       // 那时 status='running',probe 可能已经 ok)

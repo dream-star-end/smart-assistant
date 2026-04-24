@@ -4,9 +4,9 @@ import { state } from './state.js'
 import { toast } from './ui.js'
 import { _basename, formatSize } from './util.js'
 
-const MAX_FILE_SIZE_SMALL = 5 * 1024 * 1024 // 5MB for images/text
-const MAX_FILE_SIZE_LARGE = 25 * 1024 * 1024 // 25MB for audio/video/docs
-const MAX_TOTAL_SIZE = 50 * 1024 * 1024 // 50MB total (matches server limit)
+const MAX_FILE_SIZE_SMALL = 200 * 1024 * 1024 // 200MB single file
+const MAX_FILE_SIZE_LARGE = 200 * 1024 * 1024 // 200MB single file
+const MAX_TOTAL_SIZE = 300 * 1024 * 1024 // 300MB total (matches server limit)
 const MAX_FILES = 5
 
 export function fileToDataURL(file) {

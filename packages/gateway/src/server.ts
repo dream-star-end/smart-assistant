@@ -283,7 +283,10 @@ export class Gateway {
     // V3 2H: 改用 noServer + 手动 upgrade dispatch,以便商业化模块的 /ws/user-chat-bridge
     // 与 /ws/agent 路径在 gateway 自身的 /ws 之前优先匹配。原 `path: '/ws'` 模式下
     // ws lib 会对所有非 /ws 请求 socket.destroy(),把商业化路径吃掉。
-    this.wss = new WebSocketServer({ noServer: true })
+    // 商用 v3:容器内 gateway 作为 server 接收 bridge client 转发的 user 帧。
+    // 用户允许单附件 200 MiB / 总 300 MiB,base64 后 ≈ 400 MiB + envelope → 448 MiB。
+    // ws 默认 maxPayload=100 MiB 会让 Receiver 对大附件帧直接 RangeError 关连接。
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: 448 * 1024 * 1024 })
     this.httpServer.on('upgrade', (req, socket, head) => {
       // 1) 商业化模块优先(/ws/user-chat-bridge / /ws/agent / 未来私有路径)
       try {
@@ -3858,8 +3861,28 @@ export class Gateway {
     const media = frame.content.media ?? []
 
     // Server-side upload validation
-    const MAX_SINGLE_FILE = 25 * 1024 * 1024 // 25MB
-    const MAX_TOTAL_MEDIA = 50 * 1024 * 1024 // 50MB total
+    const MAX_SINGLE_FILE = 200 * 1024 * 1024 // 200MB
+    const MAX_TOTAL_MEDIA = 300 * 1024 * 1024 // 300MB total
+    // text-kind attachments 在前端 buildMessageText() 阶段就拼进 content.text,
+    // 绕过了下面基于 m.base64 的 per-file 校验。给 content.text 整体上限兜底,
+    // 防止 (a) 绕前端构造巨 text 帧 (b) 大 text 附件 + 大正文叠加超 300 MB 契约。
+    const textByteLen = Buffer.byteLength(text, 'utf8')
+    if (textByteLen > MAX_TOTAL_MEDIA) {
+      const errMsg = `消息文本超过 ${MAX_TOTAL_MEDIA / 1024 / 1024}MB 限制 (${(textByteLen / 1024 / 1024).toFixed(1)}MB)`
+      this.log.warn('upload rejected: text too large', { reason: errMsg, textByteLen, sessionKey })
+      this.deliver(
+        {
+          type: 'outbound.message',
+          sessionKey: sessionKey!,
+          channel: frame.channel,
+          peer: frame.peer,
+          blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
+          isFinal: true,
+        },
+        adapter,
+      )
+      return
+    }
     const ALLOWED_MIME_PREFIXES = [
       'image/', 'audio/', 'video/', 'application/pdf', 'text/',
       'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
@@ -4485,8 +4508,8 @@ export function isFileBlocked(resolvedPath: string): boolean {
 }
 
 export const UPLOAD_MIME_PREFIXES = ['image/', 'audio/', 'video/', 'application/pdf', 'text/']
-export const MAX_UPLOAD_SINGLE = 25 * 1024 * 1024
-export const MAX_UPLOAD_TOTAL = 50 * 1024 * 1024
+export const MAX_UPLOAD_SINGLE = 200 * 1024 * 1024
+export const MAX_UPLOAD_TOTAL = 300 * 1024 * 1024
 
 /** Returns true if the MIME type is allowed for upload. */
 export function isUploadMimeAllowed(mime: string): boolean {

@@ -59,6 +59,14 @@ import {
   handleAgentStatus,
   handleAgentCancel,
 } from "./agent.js";
+import {
+  handleListRemoteHosts,
+  handleCreateRemoteHost,
+  handleGetRemoteHost,
+  handlePatchRemoteHost,
+  handleDeleteRemoteHost,
+  handleRemoteHostAction,
+} from "./remoteHosts.js";
 import { handleAdminAgentAudit } from "./adminAudit.js";
 import {
   handleAdminListUsers,
@@ -97,6 +105,13 @@ import {
   handleAdminStatsAlertsSummary,
   handleAdminStatsAccountPool,
 } from "./adminStats.js";
+import {
+  handleAdminListComputeHosts,
+  handleAdminAddComputeHost,
+  handleAdminComputeHostBootstrapLog,
+  handleAdminComputeHostAction,
+  handleAdminBaselineVersion,
+} from "./adminComputeHosts.js";
 import {
   handleAdminAlertsListEvents,
   handleAdminAlertsListChannels,
@@ -372,6 +387,15 @@ export function createCommercialHandler(
     { method: "POST", path: "/api/agent/open", handler: handleAgentOpen },
     { method: "GET", path: "/api/agent/status", handler: handleAgentStatus },
     { method: "POST", path: "/api/agent/cancel", handler: handleAgentCancel },
+    // FEATURE_REMOTE_SSH —— 用户远程执行机 CRUD + test + reset-fingerprint。
+    //   列表 / 创建走 exact path;读/改/删/action 走 prefix(handler 自抽 :id)。
+    //   POST prefix 同时承载 /:id/test 和 /:id/reset-fingerprint,handler 内按 suffix 派发。
+    { method: "GET",    path: "/api/remote-hosts",        handler: handleListRemoteHosts },
+    { method: "POST",   path: "/api/remote-hosts",        handler: handleCreateRemoteHost },
+    { method: "GET",    pathPrefix: "/api/remote-hosts/", handler: handleGetRemoteHost },
+    { method: "PATCH",  pathPrefix: "/api/remote-hosts/", handler: handlePatchRemoteHost },
+    { method: "DELETE", pathPrefix: "/api/remote-hosts/", handler: handleDeleteRemoteHost },
+    { method: "POST",   pathPrefix: "/api/remote-hosts/", handler: handleRemoteHostAction },
     // T-54 Agent 审计(超管)
     { method: "GET", path: "/api/admin/agent-audit", handler: handleAdminAgentAudit },
     // T-60 超管 API —— 用户管理
@@ -443,6 +467,16 @@ export function createCommercialHandler(
     { method: "POST",   pathPrefix: "/api/admin/alerts/channels/", handler: handleAdminAlertsTestChannel },
     // /api/admin/alerts/silences/:id   (DELETE)
     { method: "DELETE", pathPrefix: "/api/admin/alerts/silences/", handler: handleAdminAlertsDeleteSilence },
+    // V3 D.3 多机 compute_hosts 管理(超管)
+    //   exact path 优先于 pathPrefix(matchRoute exact-first),所以
+    //   /compute-hosts 和 /compute-hosts/add 不会被 prefix handler 吞掉。
+    //   pathPrefix GET 只命中 /:id/bootstrap-log,handler 自己 404 其它后缀。
+    //   pathPrefix POST 按 action 分发 drain / remove / quarantine-clear。
+    { method: "GET",  path: "/api/admin/v3/compute-hosts",        handler: handleAdminListComputeHosts },
+    { method: "POST", path: "/api/admin/v3/compute-hosts/add",    handler: handleAdminAddComputeHost },
+    { method: "GET",  path: "/api/admin/v3/baseline-version",     handler: handleAdminBaselineVersion },
+    { method: "GET",  pathPrefix: "/api/admin/v3/compute-hosts/", handler: handleAdminComputeHostBootstrapLog },
+    { method: "POST", pathPrefix: "/api/admin/v3/compute-hosts/", handler: handleAdminComputeHostAction },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [
@@ -453,6 +487,8 @@ export function createCommercialHandler(
     "/api/payment/",
     "/api/agent/",
     "/api/admin/",
+    // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`
+    "/api/remote-hosts",
   ];
 
   return async function commercialHandler(req, res): Promise<boolean> {

@@ -474,7 +474,7 @@ const BodySchema = z.object({
   model: z.string().refine(m => ALLOWED_MODELS.has(m)),
   max_tokens: z.number().int().positive().refine(n => n <= MAX_OUTPUT_TOKENS_PER_MODEL[body.model]),
   stream: z.literal(true),                                          // 强制 stream
-  messages: z.array(z.any()).max(MAX_MESSAGES_COUNT /* 200 */),     // 限条数
+  messages: z.array(z.any()).max(MAX_MESSAGES_COUNT /* 2000 */),    // 限条数
   system: z.union([z.string(), z.array(z.any())]).optional(),
   tools: z.array(z.any()).max(MAX_TOOLS_COUNT /* 64 */).optional(),
   stop_sequences: z.array(z.string().max(64)).max(8).optional(),

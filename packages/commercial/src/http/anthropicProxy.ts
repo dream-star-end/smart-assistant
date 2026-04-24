@@ -1155,16 +1155,35 @@ export interface AnthropicProxyDeps {
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
 }
 
+/**
+ * 身份定位上下文。两条路径的来源不同,由 caller 决定:
+ *   - self-host(plaintext 18791 listener):hostUuid = 进程级 SELF_HOST_UUID,
+ *     boundIp = socket.remoteAddress(docker bridge 上的容器 IP)
+ *   - remote-host(mTLS 18443 listener):hostUuid 从 client cert SAN URI 解出
+ *     (`verifyIncomingHostCert` helper),boundIp 从 `X-V3-Container-IP` 头取
+ *     (node-agent L7 反代层注入,容器不可伪造)
+ *
+ * 见 docs/v3/D1-plan-draft.md。
+ */
+export interface AnthropicProxyIdentityCtx {
+  hostUuid: string;
+  boundIp: string;
+}
+
 export interface AnthropicProxyHandler {
-  (req: IncomingMessage, res: ServerResponse, peerIp: string): Promise<void>;
+  (
+    req: IncomingMessage,
+    res: ServerResponse,
+    ctx: AnthropicProxyIdentityCtx,
+  ): Promise<void>;
 }
 
 /**
- * 工厂:返回 (req, res, peerIp) 的 async handler。
+ * 工厂:返回 (req, res, ctx) 的 async handler。
  *
- * peerIp 由 caller 提供 —— gateway/server.ts 在 IP 18791 监听上拿 socket.remoteAddress
- * 传进来。容器内 OpenClaude 出去的 peerIp 是 docker bridge 上的 container_internal_ip,
- * 与 agent_containers.bound_ip 等值(2C 双因子的因子 A)。
+ * ctx 双字段语义见 AnthropicProxyIdentityCtx 注释。容器内 OpenClaude 出去的
+ * bound_ip 是 docker bridge 上的 container_internal_ip,与 agent_containers.bound_ip
+ * 等值(2C 双因子的因子 A)。
  */
 export function makeAnthropicProxyHandler(
   deps: AnthropicProxyDeps,
@@ -1183,13 +1202,14 @@ export function makeAnthropicProxyHandler(
   const fallbackLimiter = new FallbackRateLimiter(rateLimitCfg.windowSeconds, fallbackCap);
   const maxBodyBytes = deps.maxBodyBytes ?? MAX_BODY_BYTES_DEFAULT;
 
-  return async function handle(req, res, peerIp) {
+  return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
     const requestId = ensureRequestId(req);
     res.setHeader(REQUEST_ID_HEADER, requestId);
     const reqLog = log.child({
       requestId,
-      peerIp,
+      hostUuid: ctx.hostUuid,
+      boundIp: ctx.boundIp,
       method: req.method ?? "GET",
       path: req.url ?? "",
     });
@@ -1208,7 +1228,7 @@ export function makeAnthropicProxyHandler(
     try {
       identity = await verifyContainerIdentity(
         deps.identityRepo,
-        peerIp,
+        ctx,
         req.headers.authorization,
       );
     } catch (err) {

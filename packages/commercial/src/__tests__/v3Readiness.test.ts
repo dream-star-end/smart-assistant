@@ -146,14 +146,17 @@ describe("waitContainerReady", () => {
   test("HTTP+WS 立即 ok → 一次轮询返 true", async () => {
     let httpCalls = 0;
     let wsCalls = 0;
-    const ok = await waitContainerReady("h", 1, {
-      probeHttp: async () => { httpCalls++; return true; },
-      probeWs: async () => { wsCalls++; return true; },
-      sleep: async () => { /* */ },
-      now: () => 0,
-      timeoutMs: 1000,
-      intervalMs: 100,
-    });
+    const ok = await waitContainerReady(
+      { kind: "direct", host: "h", port: 1 },
+      {
+        probeHttp: async () => { httpCalls++; return true; },
+        probeWs: async () => { wsCalls++; return true; },
+        sleep: async () => { /* */ },
+        now: () => 0,
+        timeoutMs: 1000,
+        intervalMs: 100,
+      },
+    );
     assert.strictEqual(ok, true);
     assert.strictEqual(httpCalls, 1);
     assert.strictEqual(wsCalls, 1);
@@ -163,14 +166,17 @@ describe("waitContainerReady", () => {
     let httpCalls = 0;
     let wsCalls = 0;
     let nowVal = 0;
-    const ok = await waitContainerReady("h", 1, {
-      probeHttp: async () => { httpCalls++; return false; },
-      probeWs: async () => { wsCalls++; return true; },  // 不应该被调到
-      sleep: async (ms) => { nowVal += ms; },
-      now: () => nowVal,
-      timeoutMs: 500,
-      intervalMs: 100,
-    });
+    const ok = await waitContainerReady(
+      { kind: "direct", host: "h", port: 1 },
+      {
+        probeHttp: async () => { httpCalls++; return false; },
+        probeWs: async () => { wsCalls++; return true; },  // 不应该被调到
+        sleep: async (ms: number) => { nowVal += ms; },
+        now: () => nowVal,
+        timeoutMs: 500,
+        intervalMs: 100,
+      },
+    );
     assert.strictEqual(ok, false);
     assert.ok(httpCalls >= 2, `httpCalls should be >= 2, got ${httpCalls}`);
     assert.strictEqual(wsCalls, 0);
@@ -180,14 +186,17 @@ describe("waitContainerReady", () => {
     let httpCalls = 0;
     let wsCalls = 0;
     let nowVal = 0;
-    const ok = await waitContainerReady("h", 1, {
-      probeHttp: async () => { httpCalls++; return true; },
-      probeWs: async () => { wsCalls++; return false; },
-      sleep: async (ms) => { nowVal += ms; },
-      now: () => nowVal,
-      timeoutMs: 500,
-      intervalMs: 100,
-    });
+    const ok = await waitContainerReady(
+      { kind: "direct", host: "h", port: 1 },
+      {
+        probeHttp: async () => { httpCalls++; return true; },
+        probeWs: async () => { wsCalls++; return false; },
+        sleep: async (ms: number) => { nowVal += ms; },
+        now: () => nowVal,
+        timeoutMs: 500,
+        intervalMs: 100,
+      },
+    );
     assert.strictEqual(ok, false);
     assert.ok(httpCalls >= 2);
     assert.ok(wsCalls >= 2);
@@ -196,14 +205,17 @@ describe("waitContainerReady", () => {
   test("第三轮才 ready → true", async () => {
     let attempts = 0;
     let nowVal = 0;
-    const ok = await waitContainerReady("h", 1, {
-      probeHttp: async () => { attempts++; return attempts >= 3; },
-      probeWs: async () => true,
-      sleep: async (ms) => { nowVal += ms; },
-      now: () => nowVal,
-      timeoutMs: 5000,
-      intervalMs: 100,
-    });
+    const ok = await waitContainerReady(
+      { kind: "direct", host: "h", port: 1 },
+      {
+        probeHttp: async () => { attempts++; return attempts >= 3; },
+        probeWs: async () => true,
+        sleep: async (ms: number) => { nowVal += ms; },
+        now: () => nowVal,
+        timeoutMs: 5000,
+        intervalMs: 100,
+      },
+    );
     assert.strictEqual(ok, true);
     assert.strictEqual(attempts, 3);
   });
@@ -211,12 +223,15 @@ describe("waitContainerReady", () => {
   test("end-to-end 走真 server (HTTP+WS 都起)→ true", async () => {
     const s = await startHttpAndOptionalWs({ attachWs: true });
     try {
-      const ok = await waitContainerReady("127.0.0.1", s.port, {
-        timeoutMs: 3000,
-        intervalMs: 100,
-        httpProbeMs: 1000,
-        wsProbeMs: 1000,
-      });
+      const ok = await waitContainerReady(
+        { kind: "direct", host: "127.0.0.1", port: s.port },
+        {
+          timeoutMs: 3000,
+          intervalMs: 100,
+          httpProbeMs: 1000,
+          wsProbeMs: 1000,
+        },
+      );
       assert.strictEqual(ok, true);
     } finally { await s.close(); }
   });
@@ -224,12 +239,15 @@ describe("waitContainerReady", () => {
   test("end-to-end 走真 server (只有 HTTP, 无 WS)→ false (3E 要双过)", async () => {
     const s = await startHttpAndOptionalWs({ attachWs: false });
     try {
-      const ok = await waitContainerReady("127.0.0.1", s.port, {
-        timeoutMs: 500,
-        intervalMs: 100,
-        httpProbeMs: 200,
-        wsProbeMs: 200,
-      });
+      const ok = await waitContainerReady(
+        { kind: "direct", host: "127.0.0.1", port: s.port },
+        {
+          timeoutMs: 500,
+          intervalMs: 100,
+          httpProbeMs: 200,
+          wsProbeMs: 200,
+        },
+      );
       assert.strictEqual(ok, false);
     } finally { await s.close(); }
   });

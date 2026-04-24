@@ -6,9 +6,48 @@ import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
 import { buildPromptContext } from './promptSlots.js'
+import type { ExecutionTarget } from './remoteTarget.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
+
+/**
+ * 构造容器侧 OC_REMOTE_* env。
+ *
+ * 宿主侧 mux 路径:`/run/ccb-ssh/u<uid>/h<hid>/{ctl.sock,known_hosts}`
+ * 容器侧挂载:supervisor 把 host `/run/ccb-ssh/u<uid>` bind ro 到容器 `/run/ccb-ssh`
+ * 所以容器内可见路径:`/run/ccb-ssh/h<hid>/{ctl.sock,known_hosts}`
+ *
+ * 这里直接按 hostId 重新拼容器侧绝对路径,不复用 hostMeta.controlPath —— 后者
+ * 是宿主路径,容器里不存在。
+ */
+function buildRemoteTargetEnv(target: ExecutionTarget | undefined): Record<string, string> {
+  if (!target || target.kind !== 'remote') {
+    // 确保切回 local 时 CCB 看到的是空串 —— 不留 inherit 下来的旧值
+    return {
+      OC_REMOTE_TARGET: '',
+      OC_REMOTE_HOST_ID: '',
+      OC_REMOTE_CTL_SOCK: '',
+      OC_REMOTE_KNOWN_HOSTS: '',
+      OC_REMOTE_USER: '',
+      OC_REMOTE_HOST: '',
+      OC_REMOTE_PORT: '',
+      OC_REMOTE_WORKDIR: '',
+    }
+  }
+  const { hostId, hostMeta } = target
+  const containerBase = `/run/ccb-ssh/h${hostId}`
+  return {
+    OC_REMOTE_TARGET: 'ssh',
+    OC_REMOTE_HOST_ID: hostId,
+    OC_REMOTE_CTL_SOCK: `${containerBase}/ctl.sock`,
+    OC_REMOTE_KNOWN_HOSTS: `${containerBase}/known_hosts`,
+    OC_REMOTE_USER: hostMeta.username,
+    OC_REMOTE_HOST: hostMeta.host,
+    OC_REMOTE_PORT: String(hostMeta.port),
+    OC_REMOTE_WORKDIR: hostMeta.remoteWorkdir,
+  }
+}
 
 // ───────────────────────────────────────────────
 // SubprocessRunner
@@ -48,6 +87,13 @@ export interface SubprocessRunnerOpts {
   // CCB recognises in EFFORT_LEVELS — currently 'low'|'medium'|'high'|'xhigh'|'max'.
   // Source-of-truth lives in claude-code-best/src/utils/effort.ts.
   effortLevel?: string
+  /**
+   * 执行目标。undefined / { kind:'local' } → CCB 所有工具在本地容器里执行(默认)。
+   * { kind:'remote', ... } → 下次 spawn 时注入 OC_REMOTE_* env,CCB RemoteExecutor
+   * 启用 ssh ControlMaster 分支。env 只在 spawn 时读,调用 setExecutionTarget()
+   * 后需要 shutdown() 让下次 submit 触发重启才能生效 —— 与 setEffortLevel 同构。
+   */
+  executionTarget?: ExecutionTarget
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -252,6 +298,17 @@ export class SubprocessRunner extends EventEmitter {
     this.opts.effortLevel = level
   }
 
+  /** Current execution target (used by sessionManager to detect changes). */
+  get executionTarget(): ExecutionTarget {
+    return this.opts.executionTarget ?? { kind: 'local' }
+  }
+
+  /** Update execution target. Caller must restart the subprocess (shutdown()
+   *  + next submit() auto-restarts) for OC_REMOTE_* env to be re-read. */
+  setExecutionTarget(target: ExecutionTarget): void {
+    this.opts.executionTarget = target
+  }
+
   /** True if the subprocess is currently alive or being started */
   get isRunning(): boolean {
     return (this.proc !== null && !this.closed) || this.starting
@@ -400,6 +457,13 @@ export class SubprocessRunner extends EventEmitter {
           CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
           IS_SANDBOX: '1',
           FEATURE_VERIFICATION_AGENT: '1',
+          // 远程执行目标:kind='remote' 时让 CCB RemoteExecutor 启用 ssh mux 分支。
+          // 空串 = 本地执行(默认);OC_REMOTE_* 其余变量仅在 remote 分支设。
+          // 容器里 ctl.sock 的真实路径是宿主侧 /run/ccb-ssh/u<uid>/h<hid>/ctl.sock,
+          // bind 进容器后去掉 u<uid> 前缀 → /run/ccb-ssh/h<hid>/ctl.sock;
+          // 因此这里把 hostMeta.controlPath/knownHostsPath 的 `/u<uid>` 部分
+          // 剥掉后注入(substitute 宿主路径为容器内视图)。
+          ...buildRemoteTargetEnv(this.opts.executionTarget),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: true, // create process group so shutdown() can kill all children

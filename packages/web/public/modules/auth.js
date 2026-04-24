@@ -17,10 +17,14 @@
 //   ?reset_password=<token>    → 切到 confirm-reset 模式
 //   (verify_email 不再走 URL,改为用户输入 6 位数字 code)
 //
-// Token 存储(2026-04-21 HIGH#4 后):
-//   - access JWT + access_exp → localStorage(openclaude_access_token / openclaude_access_exp)
-//   - refresh JWT             → 服务器 Set-Cookie HttpOnly oc_rt(JS 不可见)
-//   - 以上由 main.js 经 onLoginSuccess 回调统一处理,本模块只 dispatch result
+// Token 存储(2026-04-24 "记住我" 之后):
+//   - access JWT + access_exp → localStorage(勾选"记住我",默认)或
+//                                sessionStorage(不勾,浏览器关窗口即清)
+//     具体读写全走 state.js 的 _readStoredAccessToken / _writeStoredAccessToken /
+//     _clearStoredAccessToken 三个 helper,不要再直接访问 localStorage。
+//   - refresh JWT             → 服务器 Set-Cookie HttpOnly oc_rt(JS 不可见),
+//                                persistent 属性跟着 remember 走(handlers.ts)。
+//   - 以上由 main.js 经 onLoginSuccess 回调统一处理,本模块只 dispatch result。
 
 // NB: bare `./api.js` 必须与其他模块保持一致 —— ESM 按 URL 唯一性分 instance,
 // 加 ?v= 会与 main.js 等共享的 api.js 分叉两个实例,_refreshInflight 这类 module
@@ -137,7 +141,8 @@ function _showError(msg) {
   const el = $('login-error')
   if (!el) return
   el.textContent = msg || ''
-  el.style.display = msg ? 'block' : 'none'
+  el.style.removeProperty('display')
+  el.hidden = !msg
 }
 function _clearError() { _showError('') }
 
@@ -166,9 +171,20 @@ export async function loadPublicConfig() {
 function _loadTurnstileScript() {
   if (_turnstileScriptLoaded) return Promise.resolve()
   if (_turnstileScriptInflight) return _turnstileScriptInflight
-  _turnstileScriptInflight = new Promise((resolve, reject) => {
+  // Per-attempt guard: only this attempt's failure handlers may reset the
+  // global inflight pointer, otherwise a stale A-attempt onerror could clobber
+  // a later B-attempt's inflight marker and cause duplicate script injection.
+  const promise = new Promise((resolve, reject) => {
+    const resetIfCurrent = () => {
+      if (_turnstileScriptInflight === promise) _turnstileScriptInflight = null
+    }
+    const timer = setTimeout(() => {
+      resetIfCurrent()
+      reject(new Error('turnstile script load timeout'))
+    }, 15000)
     // Global ready hook required by ?onload=__ocTurnstileReady
     window.__ocTurnstileReady = () => {
+      clearTimeout(timer)
       _turnstileScriptLoaded = true
       resolve()
     }
@@ -176,10 +192,15 @@ function _loadTurnstileScript() {
     s.src = TURNSTILE_SCRIPT
     s.async = true
     s.defer = true
-    s.onerror = () => reject(new Error('failed to load turnstile script'))
+    s.onerror = () => {
+      clearTimeout(timer)
+      resetIfCurrent()
+      reject(new Error('failed to load turnstile script'))
+    }
     document.head.appendChild(s)
   })
-  return _turnstileScriptInflight
+  _turnstileScriptInflight = promise
+  return promise
 }
 
 // Wait until the container is actually painted (non-zero dimensions).
@@ -221,7 +242,16 @@ async function _mountWidget(container) {
     container.innerHTML = '<div style="color:var(--fg-muted);font-size:var(--text-xs)">[turnstile bypass]</div>'
     return () => 'bypass'
   }
-  await _loadTurnstileScript()
+  // Show loading placeholder so user knows the widget is coming (CF challenges.
+  // cloudflare.com can be slow or blocked; a blank div looked broken).
+  // render() at L_RENDER below will overwrite this via innerHTML = ''.
+  container.innerHTML = '<div class="muted" style="font-size:var(--text-xs);padding:8px 0">正在加载人机验证…</div>'
+  try {
+    await _loadTurnstileScript()
+  } catch {
+    container.innerHTML = '<div style="color:var(--danger);font-size:var(--text-xs);padding:8px 0">人机验证加载失败,请检查网络后刷新页面</div>'
+    return () => ''
+  }
   const existing = _widgetIdByContainer.get(container)
   if (existing != null) {
     try { window.turnstile?.reset(existing) } catch {}
@@ -229,13 +259,23 @@ async function _mountWidget(container) {
       try { return window.turnstile?.getResponse(existing) || '' } catch { return '' }
     }
   }
-  // Don't try to render into an invisible container — Turnstile bails silently.
-  await _waitForVisible(container)
+  // Don't try to render into an invisible container — Turnstile bails silently
+  // inside a 0×0 parent,但 render() 仍返回 widgetId;后续 setMode 只做 reset 而
+  // 不 re-render → widget 永远卡死,用户必须 F5 才能恢复。
+  // 正确做法:容器仍不可见就 no-op(留 "正在加载…" placeholder,且**不**写
+  // _widgetIdByContainer)。下次调用(登录按钮触发 setMode,此时可见)会再走
+  // 这段 existing==null 分支完成首次真实渲染。
+  const visible = await _waitForVisible(container)
+  if (!visible) return () => ''
   container.innerHTML = ''
   const widgetId = window.turnstile.render(container, {
     sitekey: cfg.turnstile_site_key,
     theme: document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark',
     size: 'normal',
+    retry: 'auto',
+    'error-callback': () => {
+      _showError('人机验证出现问题,请稍后重试或刷新页面')
+    },
   })
   _widgetIdByContainer.set(container, widgetId)
   return () => {
@@ -362,7 +402,13 @@ export async function initAuth() {
   $('auth-tab-login-from-register')?.addEventListener('click', () => setMode('login'))
 
   // Wire form submit handlers
-  $('auth-login-btn')?.addEventListener('click', _doLogin)
+  // 2026-04-25 login 改成 <form> + submit 监听(而非 button click),
+  // 让浏览器密码管理器能识别为登录表单、offer 保存并下次自动填充。
+  // Enter 在 form 内原生触发 submit,下方 Enter-key 映射中已移除 password→btn 以免双提交。
+  $('auth-mode-login')?.addEventListener('submit', (e) => {
+    e.preventDefault()
+    _doLogin()
+  })
   $('auth-register-btn')?.addEventListener('click', _doRegister)
   $('auth-forgot-btn')?.addEventListener('click', _doRequestReset)
   $('auth-reset-btn')?.addEventListener('click', _doConfirmReset)
@@ -383,8 +429,9 @@ export async function initAuth() {
   })
 
   // Enter key submits
+  // login-password → login-btn 的映射已移除:login 区已是 <form>,Enter 原生触发 submit,
+  // 再手动 .click() 会双提交。其它 mode 仍用 <div>,保留手动链式触发。
   for (const [inputId, btnId] of [
-    ['auth-login-password', 'auth-login-btn'],
     ['auth-register-confirm', 'auth-register-btn'],
     ['auth-forgot-email', 'auth-forgot-btn'],
     ['auth-reset-confirm', 'auth-reset-btn'],
@@ -429,11 +476,14 @@ async function _doLogin() {
   if (!password) { _showError('请输入密码'); return }
   const turnstile_token = (_getTokenFns.login?.() || '').trim()
   if (!turnstile_token) { _showError('请完成人机验证'); return }
+  // "记住我":默认勾选;取消勾选 → 后端 cookie 不带 Max-Age(session),前端
+  // access token 同步走 sessionStorage,关窗口即清,下次访问必须重新登录。
+  const remember = $('auth-login-remember')?.checked !== false
   await _withBusy('auth-login-btn', '登录中…', async () => {
     const r = await apiFetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, turnstile_token }),
+      body: JSON.stringify({ email, password, turnstile_token, remember }),
       suppressAuthRedirect: true,
     })
     const data = await r.json().catch(() => ({}))
@@ -464,11 +514,14 @@ async function _doLogin() {
     // Success — emit to main.js
     // HIGH#4 后 refresh token 不再出现在 body,只通过 HttpOnly cookie 下发;
     // refresh_exp 仍保留作为"会话剩余时间"展示用。
+    // 2026-04-24:回传 remember 让 main.js 决定 access token 用 sessionStorage
+    // 还是 localStorage(与后端 cookie 生命周期对齐)。
     _onLoginSuccess?.({
       user: data.user,
       access_token: data.access_token,
       access_exp: data.access_exp,
       refresh_exp: data.refresh_exp,
+      remember: data.remember !== false,
     })
   })
 }
@@ -594,13 +647,13 @@ async function _doVerifyCode() {
       if (loginEmail) loginEmail.value = savedEmail
       const banner = $('login-error')
       if (banner) {
-        banner.style.display = 'block'
         banner.style.color = 'var(--success, #2da44e)'
         banner.textContent = '✓ 邮箱验证成功 — 现在可以登录了'
+        banner.hidden = false
         setTimeout(() => {
           if (banner.textContent && banner.textContent.startsWith('✓')) {
             banner.style.color = ''
-            banner.style.display = 'none'
+            banner.hidden = true
             banner.textContent = ''
           }
         }, 6000)

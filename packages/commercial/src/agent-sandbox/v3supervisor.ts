@@ -51,8 +51,11 @@
 import type Docker from "dockerode";
 import { randomBytes, createHash, createHmac } from "node:crypto";
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
+import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
 import type { Pool, PoolClient } from "pg";
+import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
+import { V3_AGENT_GID } from "./constants.js";
 import { SupervisorError } from "./types.js";
 
 // ───────────────────────────────────────────────────────────────────────
@@ -99,6 +102,22 @@ export const V3_VOLUME_MOUNT = "/home/agent/.openclaude";
 
 /** 容器内 entrypoint 跑的非 root 用户(uid:gid),与 Dockerfile USER 一致 */
 const V3_AGENT_USER = "1000:1000";
+
+/**
+ * 宿主侧远程执行 mux 目录 per-user 分片根。
+ *
+ * 完整布局(sshMux.ts 与本模块共同维护):
+ *   /run/ccb-ssh/                       systemd RuntimeDirectory 0700 root:root
+ *     u<uid>/                           本文件 ensureSshUserRunDir 创建,0750 root:AGENT_GID
+ *       h<hostId>/                      sshMux acquireMux 创建,0750 root:AGENT_GID
+ *         ctl.sock                      ssh ControlMaster 自建 → 改 0660 root:AGENT_GID
+ *         known_hosts                   sshMux materialize,0640 root:AGENT_GID
+ *
+ * 容器侧挂载映射:`u<uid>` **整目录** ro 挂到 `/run/ccb-ssh`(去掉 u<uid> 前缀),
+ * 容器内 CCB 只能看到当前 user 自己的所有 host 目录;跨用户隔离由 host path 不同保证。
+ */
+const V3_SSH_RUN_ROOT_HOST = "/run/ccb-ssh";
+const V3_SSH_RUN_CONTAINER_MOUNT = "/run/ccb-ssh";
 
 /**
  * CCB 平台基线目录的**默认**宿主路径(只读挂入容器 /run/oc/claude-config/ 的
@@ -528,6 +547,20 @@ export interface V3SupervisorDeps {
    * containerFileProxy 探测到 CONTAINER_OUTDATED → 503(等同 file proxy 未启用)。
    */
   bridgeSecret?: string;
+  /**
+   * 多机 compute-pool facade。注入 + 传入的 `hostId !== selfHostId` 时,
+   * provision/stop/status 的 docker 操作走 remote node-agent;否则所有
+   * docker 调用仍然走本地 `deps.docker`(保留单机 MVP 行为,零风险)。
+   *
+   * 未注入 → 单机路径,所有 docker 操作直接用 `deps.docker`。
+   */
+  containerService?: ContainerService;
+  /**
+   * 本机在 compute_hosts 表里的 host_id(UUID)。与 `containerService` 一起注入
+   * 才有意义 —— 用来判定"这次 provision 调度到的目标 host == 自己 vs. 远端"。
+   * 不注入 → facade 路径也退化为"一切都是自己"。
+   */
+  selfHostId?: string;
 }
 
 /** provision 成功后返回。3D ensureRunning 拿来注入到 userChatBridge */
@@ -544,6 +577,11 @@ export interface ProvisionedV3Container {
   dockerContainerId: string;
   /** 用户态 token —— 仅用于 caller 测试 / debug;生产路径不应该回看 */
   token: string;
+  /**
+   * 调度到的 host_uuid。null = 单机 MVP(容器在 master 本机);非 null 且 !==
+   * deps.selfHostId = remote host(caller 的 readiness 要走 node-tunnel)。
+   */
+  hostId: string | null;
 }
 
 /** getV3ContainerStatus 返回 */
@@ -555,6 +593,11 @@ export interface V3ContainerStatus {
   dockerContainerId: string;
   /** docker inspect 后的标准化态。docker missing 也归 stopped(由 caller 决定 vanish) */
   state: "running" | "stopped" | "missing";
+  /**
+   * agent_containers.host_uuid。null = 单机 MVP 遗留行 / 本机;非 null 且 !==
+   * deps.selfHostId = remote host(caller 的 readiness/stop 要走 node-tunnel)。
+   */
+  hostId: string | null;
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -747,6 +790,40 @@ export async function removeV3Volume(docker: Docker, uid: number): Promise<void>
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// 远程执行 mux per-user 目录
+// ───────────────────────────────────────────────────────────────────────
+
+/**
+ * 宿主侧预创建 `/run/ccb-ssh/u<uid>`,模式 0750 owner=root group=V3_AGENT_GID。
+ *
+ * 为什么必须 supervisor 预创建(不能靠 docker 或 sshMux 兜底):
+ *   - docker 发现 source 路径不存在会自动 mkdir 0755 root:root;mount 之后再 chmod
+ *     的窗口里,容器已经在跑 → 容器可见的权限跟我们期望不一致。
+ *   - sshMux.ensureRunDir 只在首次 acquireMux 时才跑,但 bind mount 发生在 docker
+ *     createContainer 时。容器从未触发 acquireMux 的情况下(99% 场景),dir
+ *     权限不会被收紧。
+ *
+ * 幂等:已存在目录则只 chmod/chown,不抛。
+ *
+ * 失败不阻塞容器启动 —— RuntimeDirectory=/run/ccb-ssh 必须存在(systemd unit 提供),
+ * 若不存在(unit 没装好)本函数抛,上层 provisionV3Container 失败 → 用户启动失败,
+ * 运维必须修好 systemd RuntimeDirectory 才能继续。
+ */
+async function ensureSshUserRunDir(uid: number): Promise<string> {
+  if (!Number.isInteger(uid) || uid <= 0) {
+    throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
+  }
+  const dir = pathJoin(V3_SSH_RUN_ROOT_HOST, `u${uid}`);
+  await fsMkdir(dir, { recursive: true, mode: 0o750 });
+  // mkdir 对已存在目录不改权限;显式 chmod + chown 抵御权限漂移。
+  // owner=root(gateway/supervisor 进程) group=V3_AGENT_GID(容器 agent 用户)
+  // → 容器通过 gid 进 dir、沿路径 connect() 到下层 ctl.sock;宿主其他 uid 无权。
+  await fsChmod(dir, 0o750);
+  await fsChown(dir, 0, V3_AGENT_GID);
+  return dir;
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // IP 分配:INSERT-and-retry,unique partial index 兜底
 // ───────────────────────────────────────────────────────────────────────
 
@@ -770,18 +847,43 @@ async function allocateBoundIpAndInsertRow(
   uid: number,
   secretHash: Buffer,
   pickIp: () => string,
+  hostUuid: string | null,
+  fixedBoundIp?: string,
 ): Promise<{ id: number; boundIp: string }> {
+  const insertSql = `INSERT INTO agent_containers
+       (user_id, host_uuid, bound_ip, secret_hash, state, port, last_ws_activity, created_at, updated_at)
+     VALUES
+       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, NOW(), NOW(), NOW())
+     RETURNING id`;
+
+  // B.4: scheduler 已经为我们选好了 IP — 不 retry,冲突直接 NameConflict。
+  // 单次冲突意味着 scheduler 的 pickBoundIp 跟别的并发 request 撞了 → 交上层重试。
+  if (fixedBoundIp !== undefined) {
+    try {
+      const r = await client.query<{ id: string }>(insertSql, [
+        String(uid), hostUuid, fixedBoundIp, secretHash, V3_CONTAINER_PORT,
+      ]);
+      const id = Number.parseInt(r.rows[0]!.id, 10);
+      return { id, boundIp: fixedBoundIp };
+    } catch (err) {
+      const e = err as { code?: string; constraint?: string };
+      if (e.code === "23505") {
+        throw new SupervisorError(
+          "NameConflict",
+          `bound_ip ${fixedBoundIp} already taken (scheduler race)`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  // 单机 MVP 路径:randomIp + retry-on-uniq-conflict
   for (let attempt = 0; attempt < V3_IP_ALLOC_MAX_ATTEMPTS; attempt++) {
     const candidate = pickIp();
     try {
-      const r = await client.query<{ id: string }>(
-        `INSERT INTO agent_containers
-           (user_id, bound_ip, secret_hash, state, port, last_ws_activity, created_at, updated_at)
-         VALUES
-           ($1::bigint, $2::inet, $3::bytea, 'active', $4::int, NOW(), NOW(), NOW())
-         RETURNING id`,
-        [String(uid), candidate, secretHash, V3_CONTAINER_PORT],
-      );
+      const r = await client.query<{ id: string }>(insertSql, [
+        String(uid), hostUuid, candidate, secretHash, V3_CONTAINER_PORT,
+      ]);
       const id = Number.parseInt(r.rows[0]!.id, 10);
       return { id, boundIp: candidate };
     } catch (err) {
@@ -831,6 +933,8 @@ async function allocateBoundIpAndInsertRow(
 export async function provisionV3Container(
   deps: V3SupervisorDeps,
   uid: number,
+  hostId?: string,
+  boundIp?: string,
 ): Promise<ProvisionedV3Container> {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
@@ -842,6 +946,19 @@ export async function provisionV3Container(
   const containerName = v3ContainerNameFor(uid);
   const pickIp = deps.randomIp ?? defaultPickRandomIp;
   const mintSecret = deps.randomSecret ?? defaultRandomSecret;
+
+  // 多机路由:hostId 明确给出,且 ≠ 本机,且 containerService facade 已就位 → remote。
+  // 任一条件不满足 → 退化为单机路径(保留 MVP 行为完全不变)。
+  const useRemote =
+    typeof hostId === "string"
+    && typeof deps.selfHostId === "string"
+    && hostId !== deps.selfHostId
+    && deps.containerService !== undefined;
+  // hostId 未给出(monolith 路径)时,回落到 selfHostId;再没有才 NULL。
+  // 避免出现 host_uuid=NULL 的 legacy 行(否则 findUserStickyHost 的 INNER JOIN
+  // 永远匹配不上,该用户下一次 provision 会被当新用户重跑 pickHost)。
+  const hostUuidForInsert =
+    typeof hostId === "string" ? hostId : (deps.selfHostId ?? null);
 
   // V3 Phase 3I — 实例级 active 容器硬限。优先 deps 注入(测试 / 多机),回落 env / 默认。
   const cap =
@@ -885,7 +1002,16 @@ export async function provisionV3Container(
 
     // ensureV3Volumes 必须在持 per-uid lock 期间调,防 GC race(见函数 doc)
     try {
-      volumeNames = await ensureV3Volumes(deps.docker, uid);
+      if (useRemote) {
+        // 远端路径:label 守护由 node-agent 侧负责;这里只确保两个 volume 存在。
+        const dataName = v3VolumeNameFor(uid);
+        const projectsName = v3ProjectsVolumeNameFor(uid);
+        await deps.containerService!.ensureVolume(hostId!, dataName);
+        await deps.containerService!.ensureVolume(hostId!, projectsName);
+        volumeNames = { data: dataName, projects: projectsName };
+      } else {
+        volumeNames = await ensureV3Volumes(deps.docker, uid);
+      }
     } catch (err) {
       throw wrapDockerError(err);
     }
@@ -899,7 +1025,7 @@ export async function provisionV3Container(
     }
     secretHash = hashSecretToBuffer(secret);
 
-    row = await allocateBoundIpAndInsertRow(client, uid, secretHash, pickIp);
+    row = await allocateBoundIpAndInsertRow(client, uid, secretHash, pickIp, hostUuidForInsert, boundIp);
 
     // 3) docker create with --ip + 4 个 anthropic env + cap-drop + tmpfs + 单 volume
     const token = `oc-v3.${row.id}.${secret}`;
@@ -949,8 +1075,19 @@ export async function provisionV3Container(
     // 后者覆盖 tmpfs 内 /run/oc/claude-config/skills 整个子树)。docker daemon
     // 会按挂载点深度排序,tmpfs 先于 bind 挂上,然后 ro bind 叠加,顺序正确无需
     // 我们干预。
-    const baselineDir = deps.ccbBaselineDir ?? readCcbBaselineDirFromEnv();
-    const baselineMounts = resolveCcbBaselineMounts(baselineDir);
+    // 远端 host:baseline 落在 node-agent 维护的 /var/lib/openclaude/baseline(Batch A 推入),
+    // 不再由 master 的本地目录做结构校验(能连上 node-agent 本身就是一种 liveness)。
+    // 此路径拿到 {CLAUDE.md, skills/} 即用,校验责任在 node-agent bootstrap 的 baseline pull。
+    let baselineMounts: { claudeMdHostPath: string; skillsDirHostPath: string } | null;
+    let baselineDir: string;
+    if (useRemote) {
+      const remotePaths = await deps.containerService!.resolveBaselinePaths(hostId!);
+      baselineMounts = remotePaths;
+      baselineDir = remotePaths.skillsDirHostPath.replace(/\/skills$/, "");
+    } else {
+      baselineDir = deps.ccbBaselineDir ?? readCcbBaselineDirFromEnv();
+      baselineMounts = resolveCcbBaselineMounts(baselineDir);
+    }
     const baselineOptional = readCcbBaselineOptionalFromEnv();
     if (!baselineMounts) {
       if (baselineOptional) {
@@ -972,10 +1109,27 @@ export async function provisionV3Container(
       }
     }
 
+    // 远程执行 mux per-user 目录:ro 挂到容器 /run/ccb-ssh。
+    // 用户启用远程执行机前,dir 是空目录(无 host 子目录),容器侧 CCB 检测到
+    // 空目录按本地执行处理,符合 feature off 语义。启用后 sshMux 会在宿主侧
+    // dir 里 materialize u<uid>/h<hid>/{ctl.sock,known_hosts},对容器立即可见。
+    // 在 binds 组装前先创建 —— docker 不自动 mkdir,容器 bind 前我们控制权限。
+    //
+    // 远端 host:ssh mux 跨机策略在 Batch C 解决(scheduler 持 host affinity,
+    // 远端 node-agent 代管 /run/ccb-ssh/u<uid>)。B.3 阶段远端跳过 ssh 挂载 —
+    // 等同"远端容器暂不支持 CCB 远程执行",能支撑单元测试/基本流量。
+    const sshUserRunDir = useRemote ? null : await ensureSshUserRunDir(uid);
+
     const binds: string[] = [
       `${volumeNames.data}:${V3_VOLUME_MOUNT}:rw`,
       `${volumeNames.projects}:${V3_PROJECTS_MOUNT}:rw`,
     ];
+    if (sshUserRunDir) {
+      // ro 防容器内 agent 篡改 ctl.sock / known_hosts。容器对 unix socket
+      // 的 connect() 走 inode 的 w 位而非 mount 的 ro 位,仍然可连接;ro 只阻塞
+      // write/unlink/rename/create,正好是我们要拒绝的攻击面。
+      binds.push(`${sshUserRunDir}:${V3_SSH_RUN_CONTAINER_MOUNT}:ro`);
+    }
     if (baselineMounts) {
       binds.push(
         `${baselineMounts.claudeMdHostPath}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
@@ -995,92 +1149,130 @@ export async function provisionV3Container(
     // v3 容器资源硬限额(Memory / NanoCpus / PidsLimit)。env 覆盖见 resolveV3ResourceLimits。
     const { memoryBytes, nanoCpus, pidsLimit } = resolveV3ResourceLimits();
 
-    let container;
-    try {
-      container = await deps.docker.createContainer({
+    if (useRemote) {
+      // 远端路径:facade 组装 HostConfig(硬化选项在 node-agent /containers/run 侧固定)。
+      // ContainerSpec 只携带因容器而异的字段,env/binds/label 用对象形式,facade 转字符串。
+      const envMap: Record<string, string> = {};
+      for (const e of env) {
+        const i = e.indexOf("=");
+        if (i > 0) envMap[e.slice(0, i)] = e.slice(i + 1);
+      }
+      const bindObjs = binds.map((b) => {
+        // b 形如 "src:target:rw" 或 "src:target:ro"
+        const lastColon = b.lastIndexOf(":");
+        const mid = b.lastIndexOf(":", lastColon - 1);
+        const src = b.slice(0, mid);
+        const target = b.slice(mid + 1, lastColon);
+        const mode = b.slice(lastColon + 1);
+        return { source: src, target, readonly: mode === "ro" };
+      });
+      const spec: ContainerSpec = {
+        containerDbId: row.id,
+        boundIp: row.boundIp,
+        image: deps.image,
         name: containerName,
-        Image: deps.image,
-        Env: env,
-        // 镜像本身 USER agent (uid=1000),supervisor 这层再强制一遍防镜像被改回 root
-        User: V3_AGENT_USER,
-        Labels: {
-          [V3_MANAGED_LABEL_KEY]: "1",
-          [V3_UID_LABEL_KEY]: String(uid),
-        },
-        AttachStdin: false,
-        AttachStdout: false,
-        AttachStderr: false,
-        Tty: false,
-        OpenStdin: false,
-        // 强制 --ip:在 EndpointsConfig 上设 IPAMConfig.IPv4Address
-        // (docker create 接受 NetworkingConfig.EndpointsConfig.<net>.IPAMConfig)
-        NetworkingConfig: {
-          EndpointsConfig: {
-            [V3_NETWORK_NAME]: {
-              IPAMConfig: { IPv4Address: row.boundIp },
+        env: envMap,
+        labels: { [V3_UID_LABEL_KEY]: String(uid) },
+        binds: bindObjs,
+        memoryBytes,
+        nanoCpus,
+        pidsLimit,
+        internalPort: V3_CONTAINER_PORT,
+      };
+      try {
+        const r = await deps.containerService!.createAndStart(hostId!, spec);
+        createdDockerId = r.containerInternalId;
+      } catch (err) {
+        throw wrapDockerError(err);
+      }
+    } else {
+      let container;
+      try {
+        container = await deps.docker.createContainer({
+          name: containerName,
+          Image: deps.image,
+          Env: env,
+          // 镜像本身 USER agent (uid=1000),supervisor 这层再强制一遍防镜像被改回 root
+          User: V3_AGENT_USER,
+          Labels: {
+            [V3_MANAGED_LABEL_KEY]: "1",
+            [V3_UID_LABEL_KEY]: String(uid),
+          },
+          AttachStdin: false,
+          AttachStdout: false,
+          AttachStderr: false,
+          Tty: false,
+          OpenStdin: false,
+          // 强制 --ip:在 EndpointsConfig 上设 IPAMConfig.IPv4Address
+          // (docker create 接受 NetworkingConfig.EndpointsConfig.<net>.IPAMConfig)
+          NetworkingConfig: {
+            EndpointsConfig: {
+              [V3_NETWORK_NAME]: {
+                IPAMConfig: { IPv4Address: row.boundIp },
+              },
             },
           },
-        },
-        HostConfig: {
-          NetworkMode: V3_NETWORK_NAME,
-          // 资源硬限额 — 单容器吃不光宿主;env OC_V3_MEMORY_MB / OC_V3_CPUS / OC_V3_PIDS_LIMIT 覆盖
-          Memory: memoryBytes,
-          // MemorySwap == Memory → 禁 swap;不设 docker 会默认配 2×Memory
-          MemorySwap: memoryBytes,
-          MemorySwappiness: 0,
-          NanoCpus: nanoCpus,
-          PidsLimit: pidsLimit,
-          // §9.3 cap-drop NET_RAW + NET_ADMIN(防 raw socket 伪造源 IP / 改路由)
-          CapDrop: ["NET_RAW", "NET_ADMIN"],
-          CapAdd: [],
-          // 禁 privileged + 禁 setuid/setgid 提权
-          Privileged: false,
-          SecurityOpt: ["no-new-privileges"],
-          // CLAUDE_CONFIG_DIR tmpfs(防 ~/.claude/settings.json 残留)
-          // uid/gid=1000 必须显式给 — 容器跑 agent (1000:1000),tmpfs 默认 root:root
-          // 0700 会让 ccb 子进程 EACCES 读写 settings.json,表现为静默 exit 0(踩雷于 2026-04-21)
-          //
-          // 注意:projects 子目录由下方 projects volume 覆盖挂载,CCB 的 session JSONL
-          // (`~/.claude/projects/<cwd>/<sessId>.jsonl`)因此跨容器重启依然在 —— 否则
-          // 用户再次进入历史会话,CCB `--resume <id>` 找不到 JSONL 直接 exit 1,前端
-          // 看到"AI 进程异常退出"(2026-04-22 修复)。
-          Tmpfs: {
-            [V3_CONFIG_TMPFS_PATH]: "rw,nosuid,nodev,size=4m,mode=0700,uid=1000,gid=1000",
+          HostConfig: {
+            NetworkMode: V3_NETWORK_NAME,
+            // 资源硬限额 — 单容器吃不光宿主;env OC_V3_MEMORY_MB / OC_V3_CPUS / OC_V3_PIDS_LIMIT 覆盖
+            Memory: memoryBytes,
+            // MemorySwap == Memory → 禁 swap;不设 docker 会默认配 2×Memory
+            MemorySwap: memoryBytes,
+            MemorySwappiness: 0,
+            NanoCpus: nanoCpus,
+            PidsLimit: pidsLimit,
+            // §9.3 cap-drop NET_RAW + NET_ADMIN(防 raw socket 伪造源 IP / 改路由)
+            CapDrop: ["NET_RAW", "NET_ADMIN"],
+            CapAdd: [],
+            // 禁 privileged + 禁 setuid/setgid 提权
+            Privileged: false,
+            SecurityOpt: ["no-new-privileges"],
+            // CLAUDE_CONFIG_DIR tmpfs(防 ~/.claude/settings.json 残留)
+            // uid/gid=1000 必须显式给 — 容器跑 agent (1000:1000),tmpfs 默认 root:root
+            // 0700 会让 ccb 子进程 EACCES 读写 settings.json,表现为静默 exit 0(踩雷于 2026-04-21)
+            //
+            // 注意:projects 子目录由下方 projects volume 覆盖挂载,CCB 的 session JSONL
+            // (`~/.claude/projects/<cwd>/<sessId>.jsonl`)因此跨容器重启依然在 —— 否则
+            // 用户再次进入历史会话,CCB `--resume <id>` 找不到 JSONL 直接 exit 1,前端
+            // 看到"AI 进程异常退出"(2026-04-22 修复)。
+            Tmpfs: {
+              [V3_CONFIG_TMPFS_PATH]: "rw,nosuid,nodev,size=4m,mode=0700,uid=1000,gid=1000",
+            },
+            // 双 volume:
+            //   - 主 volume → /home/agent/.openclaude(个人版状态目录)
+            //   - projects volume → /run/oc/claude-config/projects(CCB 对话 JSONL)
+            //
+            // projects volume 必须是独立 named volume(不能用 subpath),docker 基于镜像
+            // 里 /run/oc/claude-config/projects 目录初始化 ownership=agent:agent + mode=0700,
+            // 无需 supervisor 再起 helper 容器 mkdir。
+            //
+            // 额外两条 :ro bind(若基线齐全):
+            //   - <baseline>/CLAUDE.md  → /run/oc/claude-config/CLAUDE.md:ro
+            //   - <baseline>/skills/    → /run/oc/claude-config/skills:ro(整目录,覆盖所有基线 skill)
+            // 内核层强制只读,容器内 ccb 和用户都无法改动平台守则。
+            Binds: binds,
+            RestartPolicy: { Name: "no", MaximumRetryCount: 0 },
+            // 给容器分一些 shm,但限到 64MB 防 OOM 绕过
+            ShmSize: 64 * 1024 * 1024,
+            UsernsMode: "",
           },
-          // 双 volume:
-          //   - 主 volume → /home/agent/.openclaude(个人版状态目录)
-          //   - projects volume → /run/oc/claude-config/projects(CCB 对话 JSONL)
-          //
-          // projects volume 必须是独立 named volume(不能用 subpath),docker 基于镜像
-          // 里 /run/oc/claude-config/projects 目录初始化 ownership=agent:agent + mode=0700,
-          // 无需 supervisor 再起 helper 容器 mkdir。
-          //
-          // 额外两条 :ro bind(若基线齐全):
-          //   - <baseline>/CLAUDE.md  → /run/oc/claude-config/CLAUDE.md:ro
-          //   - <baseline>/skills/    → /run/oc/claude-config/skills:ro(整目录,覆盖所有基线 skill)
-          // 内核层强制只读,容器内 ccb 和用户都无法改动平台守则。
-          Binds: binds,
-          RestartPolicy: { Name: "no", MaximumRetryCount: 0 },
-          // 给容器分一些 shm,但限到 64MB 防 OOM 绕过
-          ShmSize: 64 * 1024 * 1024,
-          UsernsMode: "",
-        },
-      });
-      createdDockerId = container.id;
-    } catch (createErr) {
-      throw wrapDockerError(createErr);
-    }
-
-    try {
-      await container.start();
-    } catch (startErr) {
-      // start 失败,回收 container 后让 PG 事务回滚
-      try {
-        await container.remove({ force: true });
-      } catch {
-        /* swallow */
+        });
+        createdDockerId = container.id;
+      } catch (createErr) {
+        throw wrapDockerError(createErr);
       }
-      throw wrapDockerError(startErr);
+
+      try {
+        await container.start();
+      } catch (startErr) {
+        // start 失败,回收 container 后让 PG 事务回滚
+        try {
+          await container.remove({ force: true });
+        } catch {
+          /* swallow */
+        }
+        throw wrapDockerError(startErr);
+      }
     }
 
     // 4) UPDATE container_internal_id
@@ -1101,6 +1293,7 @@ export async function provisionV3Container(
       port: V3_CONTAINER_PORT,
       dockerContainerId: createdDockerId,
       token,
+      hostId: hostUuidForInsert,
     };
   } catch (err) {
     // 回滚 PG;尽力清理 docker(若 createContainer 之后失败)
@@ -1111,7 +1304,11 @@ export async function provisionV3Container(
     }
     if (createdDockerId) {
       try {
-        await deps.docker.getContainer(createdDockerId).remove({ force: true });
+        if (useRemote) {
+          await deps.containerService!.remove(hostId!, createdDockerId, { force: true });
+        } else {
+          await deps.docker.getContainer(createdDockerId).remove({ force: true });
+        }
       } catch {
         /* swallow */
       }
@@ -1145,7 +1342,7 @@ export async function provisionV3Container(
  */
 export async function stopAndRemoveV3Container(
   deps: V3SupervisorDeps,
-  containerRow: { id: number; container_internal_id?: string | null },
+  containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
   timeoutSec = 5,
 ): Promise<void> {
   // 1) DB 先翻 vanished —— admin 意图就是销毁,不依赖 docker 步骤是否干净
@@ -1163,10 +1360,19 @@ export async function stopAndRemoveV3Container(
   //    死锁等),缩短"row vanished 但 docker 残骸还在"的窗口。
   //    任一 stage 失败,记录,最后聚合抛 PartialV3Cleanup(含 stages)。
   if (!containerRow.container_internal_id) return;
-  const handle = deps.docker.getContainer(containerRow.container_internal_id);
+  const cid = containerRow.container_internal_id;
+  const useRemote =
+    typeof containerRow.host_uuid === "string"
+    && typeof deps.selfHostId === "string"
+    && containerRow.host_uuid !== deps.selfHostId
+    && deps.containerService !== undefined;
   const failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }> = [];
   try {
-    await handle.stop({ t: timeoutSec });
+    if (useRemote) {
+      await deps.containerService!.stop(containerRow.host_uuid!, cid, { timeoutSec });
+    } else {
+      await deps.docker.getContainer(cid).stop({ t: timeoutSec });
+    }
   } catch (err) {
     if (!isNotFound(err) && !isNotModified(err)) {
       failures.push({ stage: "stop", err: wrapDockerError(err) });
@@ -1178,7 +1384,11 @@ export async function stopAndRemoveV3Container(
   // 应等同清理成功。
   let containerCleared = false;
   try {
-    await handle.remove({ force: true });
+    if (useRemote) {
+      await deps.containerService!.remove(containerRow.host_uuid!, cid, { force: true });
+    } else {
+      await deps.docker.getContainer(cid).remove({ force: true });
+    }
     containerCleared = true;
   } catch (err) {
     if (isNotFound(err)) {
@@ -1255,12 +1465,13 @@ export async function getV3ContainerStatus(
     bound_ip: string;
     port: number;
     container_internal_id: string | null;
+    host_uuid: string | null;
   }>(
     // host(bound_ip): PG INET 类型 ::text 会带 /32 netmask(e.g. 172.30.227.97/32),
     // 这串拼进 ws://host:port/ws 会让 dns lookup 直接 fail,readiness probe 永远 false,
     // ensureRunning 路径表现为 4503 reason="starting" 死循环。host(inet) 只取地址本体,
     // 与 IPv4/IPv6 都兼容,与 provision 路径 INSERT 时传入的 JS string 一致。
-    `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id
+    `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id, host_uuid
        FROM agent_containers
       WHERE user_id = $1::bigint AND state='active'
       LIMIT 1`,
@@ -1277,14 +1488,26 @@ export async function getV3ContainerStatus(
       port: row.port ?? V3_CONTAINER_PORT,
       dockerContainerId: "",
       state: "stopped",
+      hostId: row.host_uuid,
     };
   }
 
+  const useRemote =
+    typeof row.host_uuid === "string"
+    && typeof deps.selfHostId === "string"
+    && row.host_uuid !== deps.selfHostId
+    && deps.containerService !== undefined;
+
   let state: V3ContainerStatus["state"];
   try {
-    const info = await deps.docker.getContainer(row.container_internal_id).inspect();
-    const running = Boolean(info.State && info.State.Running);
-    state = running ? "running" : "stopped";
+    if (useRemote) {
+      const info = await deps.containerService!.inspect(row.host_uuid!, row.container_internal_id);
+      state = info.state === "running" ? "running" : "stopped";
+    } else {
+      const info = await deps.docker.getContainer(row.container_internal_id).inspect();
+      const running = Boolean(info.State && info.State.Running);
+      state = running ? "running" : "stopped";
+    }
   } catch (err) {
     if (isNotFound(err)) {
       state = "missing";
@@ -1300,6 +1523,7 @@ export async function getV3ContainerStatus(
     port: row.port ?? V3_CONTAINER_PORT,
     dockerContainerId: row.container_internal_id,
     state,
+    hostId: row.host_uuid,
   };
 }
 

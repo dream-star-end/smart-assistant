@@ -31,6 +31,7 @@ import type { Logger } from "../logging/logger.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import type { AgentHttpDeps } from "./agent.js";
 import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
+import type { RemoteHostTester } from "../remoteHosts/service.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -119,6 +120,17 @@ export interface CommercialHttpDeps {
    * 任何一阶段发现问题立即 OFF 回退,见 v3-file-return-spec-mvp.md §5。
    */
   fileProxyEnabled?: boolean;
+  /**
+   * FEATURE_REMOTE_SSH 灰度 flag。OFF 时 `/api/remote-hosts/*` 全部返 503
+   * FEATURE_DISABLED。前端也会根据 `/api/public/config.feature_remote_ssh` 决定
+   * 是否渲染执行环境切换器。
+   */
+  remoteSshEnabled?: boolean;
+  /**
+   * SSH 探测回调。由 gateway 装配时提供(ControlMaster 模块)。未注入 →
+   * `POST /api/remote-hosts/:id/test` 返 503 TESTER_NOT_CONFIGURED。
+   */
+  remoteHostTester?: RemoteHostTester;
 }
 
 export interface RequestContext {
@@ -275,8 +287,15 @@ export async function handleLogin(
     // HIGH#4:refresh token 走 HttpOnly cookie 下发,不再放 body。
     // Max-Age 用 (refresh_exp - now) 而不是固定 30d,确保前端能精确算到截止时间;
     // 即使 result.refresh_exp 计算有偏差,Math.max(0,…) 兜底防负数 cookie。
+    //
+    // 2026-04-24 "记住我" 语义:unchecked → persistent=false → cookie 不带 Max-Age,
+    // 浏览器作为 session cookie 处理,关窗口即清。remember_me 也已落到
+    // refresh_tokens.remember_me 列,确保后续 rotate 继承。
     const ttl = Math.max(0, result.refresh_exp - Math.floor(Date.now() / 1000));
-    setRefreshCookie(res, result.refresh_token, ttl, { secure: deps.refreshCookieSecure });
+    setRefreshCookie(res, result.refresh_token, ttl, {
+      secure: deps.refreshCookieSecure,
+      persistent: result.remember,
+    });
     sendJson(res, 200, {
       user: result.user,
       access_token: result.access_token,
@@ -284,6 +303,9 @@ export async function handleLogin(
       // refresh_exp 仍然回传,前端可凭它显示"会话剩余时间";
       // refresh_token 本身不出现在 body —— XSS 拿不到。
       refresh_exp: result.refresh_exp,
+      // 把服务端定稿的 remember 回传;前端据此决定 access token 存 localStorage
+      // (persistent)还是 sessionStorage(关窗口即清,与 cookie 同生命周期)。
+      remember: result.remember,
     });
   } catch (err) {
     if (err instanceof LoginError) {
@@ -411,10 +433,22 @@ export async function handleRefresh(
       remoteIp: ctx.authBoundIp,
       userAgent: ctx.userAgent ?? undefined,
     });
-    // cookie Max-Age = 新 token 真实剩余 TTL;到期时间由 server 主导
+    // cookie Max-Age = 新 token 真实剩余 TTL;到期时间由 server 主导。
+    // 2026-04-24 "记住我":继承 refresh_tokens.remember_me(refresh() 返回),
+    // rotate 后 cookie 仍然保持 session / persistent 属性不漂移。
     const cookieTtl = Math.max(1, r.refresh_exp - Math.floor(Date.now() / 1000));
-    setRefreshCookie(res, r.refresh_token, cookieTtl, { secure: deps.refreshCookieSecure });
-    sendJson(res, 200, { access_token: r.access_token, access_exp: r.access_exp });
+    setRefreshCookie(res, r.refresh_token, cookieTtl, {
+      secure: deps.refreshCookieSecure,
+      persistent: r.remember,
+    });
+    // 2026-04-24 回传 remember 让前端 refresh 成功时把 access token 写到
+    // 正确的 storage:persistent → localStorage / session → sessionStorage。
+    // 不回传的话前端无从得知原登录选择,rotate 后 access 可能错放。
+    sendJson(res, 200, {
+      access_token: r.access_token,
+      access_exp: r.access_exp,
+      remember: r.remember,
+    });
   } catch (err) {
     if (err instanceof RefreshError) {
       const status = err.code === "VALIDATION" ? 400 : 401;
@@ -639,6 +673,8 @@ export async function handleGetPublicConfig(
     // turnstile_bypass=true → 前端可直接发"占位 token",dev/CI 用;生产必须 false
     turnstile_bypass: deps.turnstileBypass === true,
     require_email_verified: deps.requireEmailVerified === true,
+    // FEATURE_REMOTE_SSH 灰度状态 —— 前端据此决定是否渲染执行环境切换器。
+    feature_remote_ssh: deps.remoteSshEnabled === true,
   });
 }
 

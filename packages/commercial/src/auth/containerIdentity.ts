@@ -1,18 +1,22 @@
 /**
- * V3 Phase 2 Task 2C — 容器身份双因子校验。
+ * V3 Phase 2 Task 2C — 容器身份双因子校验(多 host 版,2026-04-24 D.1a 改造)。
  *
- * 见 docs/v3/02-DEVELOPMENT-PLAN.md §3.2 / 03-MVP-CHECKLIST.md Task 2C
+ * 见 docs/v3/02-DEVELOPMENT-PLAN.md §3.2 / 03-MVP-CHECKLIST.md Task 2C /
+ * docs/v3/D1-plan-draft.md(本次 D.1 多机 identity 改造)。
  *
  * 用途:
  *   anthropicProxy(2D)收到容器内 OpenClaude 发来的 /v1/messages 请求时,
  *   先调本模块验证两个因子,任一失败 → 401。journal 不写、preCheck 不调,
  *   防止外部仿冒容器消耗用户额度。
  *
- * 双因子语义(MVP 单 host monolith):
- *   - 因子 A(网络):socket peer IP 必须命中 agent_containers.bound_ip
- *     (state='active' 唯一)。docker bridge IP 由 supervisor `--ip` 在
- *     provision 时强制分配,容器内进程**不可能**伪造源 IP(NET_RAW/NET_ADMIN
- *     已 cap-drop,见 §3.2;ipset/ufw 还会再挡一道,见 2J-1)。
+ * 双因子语义(多 host 版):
+ *   - 因子 A(网络):(host_uuid, bound_ip) 必须命中一行 state='active' 的
+ *     agent_containers(0030 migration 把 bound_ip 全局唯一改为 per-host 唯一)。
+ *     hostUuid 与 boundIp 的来源由 caller 区分:
+ *       • self-host 路径:hostUuid = 进程级 SELF_HOST_UUID,boundIp = socket.remoteAddress
+ *       • remote-host 路径(master:18443 mTLS):hostUuid = client cert SAN URI 解出,
+ *         boundIp = `X-V3-Container-IP` 头(由 node-agent 反代层注入,带 fingerprint
+ *         pin 防 cert 泄露;头注入只发生在 node-agent,容器不能伪造,见 D.1c)
  *   - 因子 B(密钥):Authorization 头格式 `Bearer oc-v3.<containerId>.<secret>`
  *     的 secret 经 SHA-256 必须 == 该 row 的 secret_hash。secret 在容器
  *     env 里、在用户文件里都不会出现(supervisor 注入时不写 host fs),
@@ -23,18 +27,19 @@
  *     方便定位攻击模式但**不外泄给容器** — 401 message 永远是
  *     "container identity verification failed",errcode 仅出现在 server log)
  *   - row 必须 state='active' 才认。'vanished' / NULL / 任何其他态 → 401
- *   - 多 host 场景的 host_id 比较(R6.5)推迟到 P1,MVP 单 host 无此分支
+ *   - 不再校验 row.host_uuid == ctx.hostUuid:`findActiveByHostAndBoundIp`
+ *     的 WHERE 已把 host_uuid 钉死(queries.ts:145),重复校验是冗余防御(Codex D.1 Q6)
  *
  * 不做的:
- *   - 不做 hot map(`§3.2 ⑤`)— MVP 单 host,每请求 SELECT 1 行 + 一次 SHA
- *     ~100µs,撑得住;P1 接 multi-host 时再加 hot map + LISTEN/NOTIFY
+ *   - 不做 hot map — M1 多 host 仍是每请求 1 行 + 1 次 SHA,<100µs 撑得住;
+ *     LISTEN/NOTIFY 留给 P1
  *   - 不做 rate-limit per-IP — 那归 anthropicProxy(2D)统一管
- *   - 不做 docker inspect 反查自愈 — MVP 假设 supervisor 写入即立即可见
- *     (单进程内无 lag);P1 多 host 时再加 §3.2 自愈链路
+ *   - 不做 docker inspect 反查自愈 — 单机 master 内 supervisor 即刻可见,
+ *     多 host 间同步由 hostHealth poll 负责
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Pool } from "pg";
+import { findActiveByHostAndBoundIp } from "../compute-pool/queries.js";
 
 export class ContainerIdentityError extends Error {
   constructor(
@@ -59,6 +64,8 @@ export interface ContainerIdentity {
   userId: number;
   /** agent_containers.bound_ip(给上游 anthropicProxy 写 log 用) */
   boundIp: string;
+  /** agent_containers.host_uuid(多 host 审计需要) */
+  hostUuid: string;
 }
 
 /**
@@ -115,54 +122,56 @@ export function compareHash(a: Buffer, b: Buffer): boolean {
 }
 
 /**
- * MVP DB 接口最小化:本模块只需要"按 IP 反查 active container row"的能力。
+ * 校验上下文。由 caller 显式提供两个定位信息:
+ *   - hostUuid:self-host 路径用 SELF_HOST_UUID 常量;remote-host 路径从
+ *     mTLS client cert SAN URI 解出(见 certAuthority.verifyIncomingHostCert,D.1b)
+ *   - boundIp:self-host 路径用 socket.remoteAddress;remote-host 路径从
+ *     `X-V3-Container-IP` 头取(node-agent L7 反代注入,见 D.1c)
+ */
+export interface ContainerIdentityContext {
+  hostUuid: string;
+  boundIp: string;
+}
+
+/**
+ * DB 接口最小化:本模块只需要"按 (host, boundIp) 反查 active container row"的能力。
  * 抽象成 deps 让单测可注入纯内存版,不必拖 PG。
  */
 export interface ContainerIdentityRepo {
   /**
-   * 返回 bound_ip == ip 且 state='active' 的 agent_containers 行(0 或 1 行)。
-   * 单 host MVP:bound_ip 在 active 集合内全局唯一(0012 partial UNIQUE 索引保证)。
+   * 返回 host_uuid=hostUuid AND bound_ip=boundIp AND state='active' 的行(0 或 1 行)。
+   * M1 多 host: `(host_uuid, bound_ip)` partial UNIQUE 索引保证 active 集合内唯一
+   * (见 migration 0030)。
    */
-  findActiveByBoundIp(ip: string): Promise<{
+  findActiveByHostAndBoundIp(
+    hostUuid: string,
+    boundIp: string,
+  ): Promise<{
     id: number;
     user_id: number;
     bound_ip: string;
+    host_uuid: string;
     secret_hash: Buffer | null;
   } | null>;
 }
 
 /**
- * pg.Pool 实现的默认 repo。生产用。
+ * 默认 repo。底层调 compute-pool/queries 的模块级 getPool() singleton。
+ *
+ * 不接受 Pool 入参 —— 即使传进来我们也用不上,签名诚实一点,避免 caller 误以为
+ * 可以注入测试 pool。测试路径请直接用 memRepo(见 containerIdentity.test.ts)。
  */
-export function createPgIdentityRepo(pool: Pool): ContainerIdentityRepo {
+export function createPgIdentityRepo(): ContainerIdentityRepo {
   return {
-    async findActiveByBoundIp(ip: string) {
-      // bound_ip 是 INET,允许字符串比较;但 INET 类型对 "127.0.0.1" 与
-      // "127.0.0.001" 等价,这里依赖 PG 的等值语义,不在 JS 层归一化
-      const r = await pool.query<{
-        id: string;
-        user_id: string;
-        bound_ip: string;
-        secret_hash: Buffer | null;
-      }>(
-        // host(bound_ip):INET ::text 会带 /32(见 v3supervisor.getV3ContainerStatus
-        // 同名注释)。本路径 boundIp 只用作 ContainerIdentity.boundIp 透传给上游
-        // anthropicProxy 写 log,/32 不影响 WHERE 等值比较(WHERE 走 INET=$1),
-        // 但保持与其他读路径一致,避免 log 出现 "172.30.0.42/32" 难看也容易混淆。
-        `SELECT id, user_id, host(bound_ip) AS bound_ip, secret_hash
-           FROM agent_containers
-          WHERE state='active' AND bound_ip = $1
-          LIMIT 1`,
-        [ip],
-      );
-      if (r.rowCount === 0) return null;
-      const row = r.rows[0]!;
-      // pg int8 默认转字符串,显式转 number(MVP 单库 < 2^53)
+    async findActiveByHostAndBoundIp(hostUuid: string, boundIp: string) {
+      const r = await findActiveByHostAndBoundIp(hostUuid, boundIp);
+      if (!r) return null;
       return {
-        id: Number.parseInt(row.id, 10),
-        user_id: Number.parseInt(row.user_id, 10),
-        bound_ip: row.bound_ip,
-        secret_hash: row.secret_hash,
+        id: r.id,
+        user_id: r.user_id,
+        bound_ip: r.bound_ip,
+        host_uuid: r.host_uuid,
+        secret_hash: r.secret_hash,
       };
     },
   };
@@ -174,10 +183,9 @@ export function createPgIdentityRepo(pool: Pool): ContainerIdentityRepo {
  *
  * 流程:
  *   1) 解析 token 拿 (claimedContainerId, claimedSecret)。失败 → BAD_TOKEN_FORMAT
- *   2) 用 peerIp 查 active row。无 → UNKNOWN_CONTAINER_IP
+ *   2) 用 (ctx.hostUuid, ctx.boundIp) 查 active row。无 → UNKNOWN_CONTAINER_IP
  *   3) row.id 必须 == claimedContainerId(防"用容器 A 的 IP + 容器 B 的 token"
- *      跨容器拼装;实际上 MVP 单 host 内一个 IP 唯一对应一个 container_id,
- *      但严格比一遍是 defense-in-depth)。失败 → CONTAINER_ID_MISMATCH
+ *      跨容器拼装)。失败 → CONTAINER_ID_MISMATCH
  *   4) row.secret_hash 必须存在 + timing-safe compare hash(claimedSecret)。
  *      失败 → BAD_SECRET
  *   5) 返 ContainerIdentity
@@ -187,26 +195,26 @@ export function createPgIdentityRepo(pool: Pool): ContainerIdentityRepo {
  */
 export async function verifyContainerIdentity(
   repo: ContainerIdentityRepo,
-  peerIp: string,
+  ctx: ContainerIdentityContext,
   authorizationHeader: string | undefined,
 ): Promise<ContainerIdentity> {
   const { containerId: claimedCid, secret } = parseContainerToken(authorizationHeader);
 
-  const row = await repo.findActiveByBoundIp(peerIp);
+  const row = await repo.findActiveByHostAndBoundIp(ctx.hostUuid, ctx.boundIp);
   if (!row) {
     throw new ContainerIdentityError(
       "UNKNOWN_CONTAINER_IP",
-      `no active container bound to ip ${peerIp}`,
+      `no active container for host=${ctx.hostUuid} ip=${ctx.boundIp}`,
     );
   }
   if (row.id !== claimedCid) {
     throw new ContainerIdentityError(
       "CONTAINER_ID_MISMATCH",
-      `peer ip ${peerIp} → container ${row.id} but token claims ${claimedCid}`,
+      `host=${ctx.hostUuid} ip=${ctx.boundIp} → container ${row.id} but token claims ${claimedCid}`,
     );
   }
   if (!row.secret_hash) {
-    // active 行竟然没 secret_hash:0012 没有 NOT NULL(MVP 单 host 我们不强约束),
+    // active 行竟然没 secret_hash:0012 没有 NOT NULL(M1 单 host 我们不强约束),
     // 但 supervisor.provision 必须填,fallback 视为 BAD_SECRET
     throw new ContainerIdentityError(
       "BAD_SECRET",
@@ -222,5 +230,6 @@ export async function verifyContainerIdentity(
     containerId: row.id,
     userId: row.user_id,
     boundIp: row.bound_ip,
+    hostUuid: row.host_uuid,
   };
 }

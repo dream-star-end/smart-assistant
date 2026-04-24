@@ -18,7 +18,7 @@
  *   - 真 ws 桥接(2E 自己有测)
  */
 
-import { describe, test } from "node:test";
+import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -46,6 +46,7 @@ import {
 type FakeRow = {
   id: number;
   user_id: number;
+  host_uuid: string | null;
   bound_ip: string;
   secret_hash: Buffer;
   state: "active" | "vanished";
@@ -68,6 +69,7 @@ class FakePool {
     const row: FakeRow = {
       id: this.nextId++,
       user_id: uid,
+      host_uuid: null,
       bound_ip: boundIp,
       secret_hash: Buffer.alloc(32, 0xaa),
       state: "active",
@@ -118,9 +120,10 @@ class FakePool {
         throw e;
       }
       const userId = Number.parseInt(String(params![0]), 10);
-      const boundIp = String(params![1]);
-      const secretHash = params![2] as Buffer;
-      const port = Number(params![3]);
+      const hostUuid = params![1] == null ? null : String(params![1]);
+      const boundIp = String(params![2]);
+      const secretHash = params![3] as Buffer;
+      const port = Number(params![4]);
       if (this.rows.some((r) => r.state === "active" && r.bound_ip === boundIp)) {
         const e = new Error("uniq conflict") as Error & { code: string; constraint: string };
         e.code = "23505";
@@ -132,6 +135,7 @@ class FakePool {
       this.rows.push({
         id,
         user_id: userId,
+        host_uuid: hostUuid,
         bound_ip: boundIp,
         secret_hash: secretHash,
         state: "active",
@@ -162,7 +166,7 @@ class FakePool {
       }
       return { rowCount: r ? 1 : 0, rows: [] };
     }
-    if (/SELECT id, user_id, bound_ip::text/i.test(trimmed) && /WHERE user_id/i.test(trimmed)) {
+    if (/SELECT id, user_id,\s*host\(bound_ip\)/i.test(trimmed) && /WHERE user_id/i.test(trimmed)) {
       const userId = Number.parseInt(String(params![0]), 10);
       const r = this.rows.find((x) => x.user_id === userId && x.state === "active");
       if (!r) return { rowCount: 0, rows: [] };
@@ -174,6 +178,7 @@ class FakePool {
           bound_ip: r.bound_ip,
           port: r.port,
           container_internal_id: r.container_internal_id,
+          host_uuid: r.host_uuid,
         }],
       };
     }
@@ -282,6 +287,19 @@ const fixedNow = () => 1_000_000;
 // ───────────────────────────────────────────────────────────────────────
 
 describe("makeV3EnsureRunning", () => {
+  // 基线 fail-closed 默认启用;ensureRunning 走 provision 路径的用例不关心基线内容,
+  // 设 OC_V3_CCB_BASELINE_OPTIONAL=1 降级为 warn+skip,避免 CcbBaselineMissing。
+  // 对齐 v3Supervisor.test.ts provisionV3Container 测试的既有模式。
+  let prevOptional: string | undefined;
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
+
   test("active + running + healthz ok → 返 {host, port}", async () => {
     const pool = new FakePool();
     pool.preInsertActive(7, "172.30.1.1", "dockerid-pre-7");

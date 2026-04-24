@@ -55,8 +55,11 @@ export const CLOSE_BRIDGE = {
   CONTAINER_UNREADY: 4503,
 } as const;
 
-/** 入站 / 出站 帧的最大字节数(单帧)。1MB 比 chat 单条消息上限大一截,够覆盖大型工具结果。 */
-const DEFAULT_MAX_FRAME_BYTES = 1 * 1024 * 1024;
+/** 入站 / 出站 帧的最大字节数(单帧)。
+ * 前端允许附件单文件 200 MiB / 总量 300 MiB (raw),一条 inbound.message 帧一次性打包全部 media,
+ * base64 膨胀 4/3 ≈ 400 MiB + JSON/dataURL prefix/文件名 envelope → 448 MiB 圆整。
+ * 早期 1 MiB / 80 MiB 会让大附件被 ws 库 Receiver 以 RangeError 直接关连接,消息到不了业务层。 */
+const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 
 /** 单方向 buffer 上限。超出 = 慢消费者 / 死循环 → close。 */
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
@@ -281,7 +284,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const metrics = deps.metrics ?? {};
   const createContainerSocket = deps.createContainerSocket
     ?? ((host, port, _signal) =>
-        new WebSocket(`ws://${host}:${port}/ws`, { perMessageDeflate: false }));
+        new WebSocket(`ws://${host}:${port}/ws`, { perMessageDeflate: false, maxPayload: maxFrameBytes }));
 
   const registry = new ConnectionRegistry({ maxPerUser });
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes });

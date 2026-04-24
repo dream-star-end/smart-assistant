@@ -11,7 +11,7 @@
 //     out (login/logout probes) opt out with opts.suppressAuthRedirect=true.
 //   • Errors thrown carry e.status (HTTP status code) so callers can branch
 //     on it without parsing the message.
-import { state } from './state.js'
+import { state, _writeStoredAccessToken } from './state.js'
 
 const DEFAULT_TIMEOUT_MS = 30000
 
@@ -211,10 +211,16 @@ async function _doRefreshOnce(expectedEpoch) {
     // 对齐新 exp —— 避免 timer 还按旧 exp 排期,和 reactive 路径状态打架。
     scheduleProactiveRefresh()
     try {
-      localStorage.setItem('openclaude_access_token', data.access_token)
-      if (typeof data.access_exp === 'number') {
-        localStorage.setItem('openclaude_access_exp', String(data.access_exp))
-      }
+      // 2026-04-24 "记住我":server 把原登录选择(refresh_tokens.remember_me)
+      // 回带,前端据此决定 access token 写入 localStorage(持久)还是
+      // sessionStorage(关窗口即清)。data.remember 缺失(老 server 或迁移期
+      // 老 body)→ 默认 true,等同旧行为。
+      const remember = data?.remember !== false
+      _writeStoredAccessToken(
+        data.access_token,
+        typeof data.access_exp === 'number' ? data.access_exp : null,
+        remember,
+      )
       // 升级成功:server 已把 cookie 种回来,本地 localStorage / state 里的旧
       // refresh token 不再需要 —— 留着只会在下次 refresh 又被当 body fallback
       // 重新提交,徒增 XSS 时被 dump 的可能。一次性清零。

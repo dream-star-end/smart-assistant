@@ -329,27 +329,29 @@
     <div id="login-error" hidden class="login-error-banner"></div>
 
     <!-- ── Mode: login ── -->
-    <div id="auth-mode-login" hidden>
+    <!-- 2026-04-25 登录区用 <form> 包裹 + name/autocomplete=username+current-password,
+         让浏览器密码管理器能识别为登录表单并 offer 保存/自动填充账号密码。 -->
+    <form id="auth-mode-login" hidden autocomplete="on">
       <div class="login-field">
         <label for="auth-login-email">邮箱</label>
-        <input id="auth-login-email" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email" />
+        <input id="auth-login-email" name="email" type="email" placeholder="you@example.com" autocomplete="username" inputmode="email" />
       </div>
       <div class="login-field">
         <label for="auth-login-password">密码</label>
-        <input id="auth-login-password" type="password" placeholder="输入你的密码" autocomplete="current-password" />
+        <input id="auth-login-password" name="password" type="password" placeholder="输入你的密码" autocomplete="current-password" />
       </div>
       <div class="login-row-between muted">
         <label><input id="auth-login-remember" type="checkbox" checked /> 记住我</label>
         <a id="auth-tab-forgot" role="button" tabindex="0">忘记密码?</a>
       </div>
       <div id="turnstile-login" class="login-turnstile"></div>
-      <button id="auth-login-btn" type="button" class="btn btn-primary btn-lg btn-full login-submit">登录 →</button>
+      <button id="auth-login-btn" type="submit" class="btn btn-primary btn-lg btn-full login-submit">登录 →</button>
       <div id="auth-login-resend-row" hidden class="login-resend-row">
         <button id="auth-resend-verify-btn" type="button" class="btn btn-ghost btn-sm">重发验证邮件</button>
         <div id="auth-login-resend-status" hidden class="login-resend-status"></div>
       </div>
       <div class="login-toggle muted">还没有账号? <a id="auth-tab-register" role="button" tabindex="0">立即注册</a></div>
-    </div>
+    </form>
 
     <!-- ── Mode: register ── -->
     <div id="auth-mode-register" hidden>

@@ -205,11 +205,11 @@ describe('T02: isUploadMimeAllowed — upload type filtering', () => {
 
 // ── T03: Upload size limits ──
 describe('T03: Upload size limits', () => {
-  it('MAX_UPLOAD_SINGLE is 25MB', () => {
-    assert.equal(MAX_UPLOAD_SINGLE, 25 * 1024 * 1024)
+  it('MAX_UPLOAD_SINGLE is 200MB', () => {
+    assert.equal(MAX_UPLOAD_SINGLE, 200 * 1024 * 1024)
   })
-  it('MAX_UPLOAD_TOTAL is 50MB', () => {
-    assert.equal(MAX_UPLOAD_TOTAL, 50 * 1024 * 1024)
+  it('MAX_UPLOAD_TOTAL is 300MB', () => {
+    assert.equal(MAX_UPLOAD_TOTAL, 300 * 1024 * 1024)
   })
   it('single limit is less than total limit', () => {
     assert.ok(MAX_UPLOAD_SINGLE < MAX_UPLOAD_TOTAL)

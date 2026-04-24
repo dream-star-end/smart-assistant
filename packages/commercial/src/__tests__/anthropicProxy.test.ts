@@ -138,8 +138,8 @@ describe("proxyBodySchema — 数值/数组边界", () => {
     assert.equal(r.success, false);
   });
 
-  test("messages 超 200 条 → fail", () => {
-    const msgs = Array.from({ length: 201 }, () => ({ role: "user", content: "x" }));
+  test("messages 超 2000 条 → fail", () => {
+    const msgs = Array.from({ length: 2001 }, () => ({ role: "user", content: "x" }));
     const r = proxyBodySchema.safeParse({
       model: "claude-sonnet-4-6",
       max_tokens: 1024,

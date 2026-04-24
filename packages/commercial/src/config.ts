@@ -217,6 +217,42 @@ const internalProxyPort = z
   .optional();
 
 /**
+ * V3 Phase D — 多机容器池外部 mTLS 入口(remote node-agent L7 反代目标)。
+ *
+ * 拓扑:
+ *   remote host 容器 → http://<bridge_gw>:18791 (plaintext)
+ *     → node-agent L7 反代 → mTLS HTTPS POST https://${EXTERNAL_MTLS_BIND}:${EXTERNAL_MTLS_PORT}/v1/messages
+ *     → master 读 client cert SAN URI 解出 host_uuid + fingerprint pin 查 DB
+ *     → 读 `X-V3-Container-IP` 头取 bound_ip
+ *     → 喂给同一个 anthropicProxy handler
+ *
+ * 推荐生产值:`EXTERNAL_MTLS_BIND=0.0.0.0` `EXTERNAL_MTLS_PORT=18443`
+ *   — 绑公网 IP 是必需的(远程 host 要从外网拨过来),防线靠:
+ *     (1) GCP firewall rule 白名单 only allow node-agent 公网 IP
+ *     (2) mTLS server requestCert=true + rejectUnauthorized=true(自建 CA 私签)
+ *     (3) SAN URI 匹配 spiffe://openclaude/host/<uuid>
+ *     (4) compute_hosts.agent_cert_fingerprint_sha256 pin + state='ready' 每请求查
+ *
+ * 缺任一字段或 EXTERNAL_MTLS_ENABLED 未开 → 静默不启动,self-host 仍用 18791 plaintext。
+ */
+const externalMtlsBind = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .optional();
+const externalMtlsPort = z
+  .string()
+  .regex(/^\d+$/, "EXTERNAL_MTLS_PORT must be a positive integer")
+  .transform((v) => Number.parseInt(v, 10))
+  .refine((n) => n > 0 && n < 65536, "EXTERNAL_MTLS_PORT must be in (0, 65535]")
+  .optional();
+const externalMtlsEnabled = z
+  .string()
+  .transform((v) => v === "1" || v.toLowerCase() === "true")
+  .optional();
+
+/**
  * V3 Phase 3D — per-user openclaude-runtime 镜像名(含 tag)。
  *
  * 例:`openclaude/openclaude-runtime:abc123def456`(由 build-image.sh 输出 git sha12)。
@@ -239,6 +275,12 @@ const ocRuntimeImage = z.string().trim().min(1).max(256).optional();
  * 4 阶段部署节奏见 v3-file-return-spec-mvp.md §5,最后一步才翻 ON。
  */
 const fileProxyEnabled = z.enum(["0", "1"]).optional().transform((v) => v === "1");
+
+/**
+ * 远程执行机(SSH)feature flag。OFF 时 `/api/remote-hosts/*` 全部 503 FEATURE_DISABLED,
+ * 前端切换器也不渲染 "远程" 选项。灰度策略:先开给 boss 账户验证,再逐步放开。
+ */
+const featureRemoteSsh = z.enum(["0", "1"]).optional().transform((v) => v === "1");
 
 export const commercialConfigSchema = z
   .object({
@@ -270,8 +312,12 @@ export const commercialConfigSchema = z
     AGENT_LIFECYCLE_TICK_MS: agentLifecycleTickMs,
     INTERNAL_PROXY_BIND: internalProxyBind,
     INTERNAL_PROXY_PORT: internalProxyPort,
+    EXTERNAL_MTLS_BIND: externalMtlsBind,
+    EXTERNAL_MTLS_PORT: externalMtlsPort,
+    EXTERNAL_MTLS_ENABLED: externalMtlsEnabled,
     OC_RUNTIME_IMAGE: ocRuntimeImage,
     FILE_PROXY_ENABLED: fileProxyEnabled,
+    FEATURE_REMOTE_SSH: featureRemoteSsh,
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。

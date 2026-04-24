@@ -39,6 +39,14 @@ export interface CookieOptions {
    * 默认 true,测试通过 deps 注入 false。
    */
   secure?: boolean;
+  /**
+   * 2026-04-24 "记住我" 语义:
+   *   - true(默认):持久 cookie,带 `Max-Age`,关浏览器仍保留(30 天)
+   *   - false:session cookie,**不**输出 `Max-Age/Expires`,浏览器关闭即清除
+   * login 时根据用户是否勾选 "记住我" 决定;refresh 继承 refresh_tokens.remember_me
+   * 不在 rotate 时发生漂移。
+   */
+  persistent?: boolean;
 }
 
 /**
@@ -52,13 +60,18 @@ export function setRefreshCookie(
   opts: CookieOptions = {},
 ): void {
   const secure = opts.secure ?? true;
+  const persistent = opts.persistent ?? true;
   const parts = [
     `${REFRESH_COOKIE_NAME}=${encodeURIComponent(rawToken)}`,
-    `Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}`,
     `Path=${REFRESH_COOKIE_PATH}`,
     "HttpOnly",
     "SameSite=Strict",
   ];
+  // persistent=false 省略 Max-Age / Expires:浏览器当 session cookie 处理,
+  // 关窗口即清。persistent=true 走原逻辑(30 天 Max-Age)。
+  if (persistent) {
+    parts.splice(1, 0, `Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}`);
+  }
   if (secure) parts.push("Secure");
   appendSetCookie(res, parts.join("; "));
 }

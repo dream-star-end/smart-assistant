@@ -12,6 +12,10 @@
 
 import type { IncomingMessage } from "node:http";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+import type { TLSSocket } from "node:tls";
+import { timingSafeEqual } from "node:crypto";
+import { isIPv4 } from "node:net";
 import type { Duplex } from "node:stream";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -72,6 +76,28 @@ import {
   observeWsBridgeSessionDuration,
 } from "./admin/metrics.js";
 import { loadOrCreateBridgeSecret, DEFAULT_BRIDGE_SECRET_PATH } from "./bridgeSecret.js";
+import { setRemoteMuxDeps } from "./remoteHosts/sshMux.js";
+import { RemoteHostError } from "./remoteHosts/service.js";
+import * as computeQueries from "./compute-pool/queries.js";
+import {
+  hostRowToTarget,
+  startSshControlMaster,
+  stopSshControlMaster,
+  putFile as nodeAgentPutFile,
+  deleteFile as nodeAgentDeleteFile,
+} from "./compute-pool/nodeAgentClient.js";
+import { createContainerService } from "./compute-pool/containerService.js";
+import {
+  getBaselineServer,
+  type BaselineServer,
+} from "./compute-pool/baselineServer.js";
+import {
+  ensureCa,
+  ensureMasterLeaf,
+  extractSpiffeUris,
+  extractHostUuidFromSpiffe,
+} from "./compute-pool/certAuthority.js";
+import type { ServerResponse } from "node:http";
 
 /**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
@@ -125,6 +151,11 @@ export interface RegisterCommercialResult {
    */
   internalProxyAddress?: { host: string; port: number };
   /**
+   * V3 D.1b:外部 mTLS 监听地址(18443)。remote-host node-agent L7 反代从这里进。
+   * 未启用(EXTERNAL_MTLS_ENABLED != 1 / 缺 bind/port / 监听失败)时为 undefined。
+   */
+  externalMtlsAddress?: { host: string; port: number };
+  /**
    * Commercial access JWT 的 HMAC 密钥(已规范化为 ≥32 byte Uint8Array)。
    *
    * 暴露给 gateway,使其在 checkHttpAuth / getUserId 时能识别 commercial
@@ -137,6 +168,133 @@ export interface RegisterCommercialResult {
    * 也不需要把 checkHttpAuth 链路改 async(改动面太大)。
    */
   jwtSecret: Uint8Array;
+}
+
+// ─── D.1b: 18443 mTLS 反代前置校验 ─────────────────────────────────────────
+//
+// remote-host 的 node-agent 通过 mTLS 把容器出站 POST 反代到 master:18443。
+// 入口做四件事:
+//   1. TLS 层已经验了证书链;我们还要从 SAN URI 解出 host uuid
+//   2. DB 查 `compute_hosts.id = hostUuid`:确认 status='ready' + fingerprint pin
+//      (fingerprint 校验是撤销机制 —— cert 泄露时 admin 轮换 db 行的 fp 即时生效)
+//   3. 校验 X-V3-Container-IP 头:只允许单一字符串、不含 CR/LF、且是合法 IPv4
+//   4. 去掉 X-V3-Container-IP 头,再把请求以 { hostUuid, boundIp } ctx 交给 proxyHandler
+//
+// 任意校验失败都直接以 JSON error 结束;不进 proxy,不消耗 account,不扣分。
+
+/** Raw DER → PEM。node TLSSocket.getPeerCertificate(true).raw 是 DER Buffer。 */
+function derToPem(der: Buffer): string {
+  const b64 = der.toString("base64");
+  const lines: string[] = [];
+  for (let i = 0; i < b64.length; i += 64) {
+    lines.push(b64.slice(i, i + 64));
+  }
+  return `-----BEGIN CERTIFICATE-----\n${lines.join("\n")}\n-----END CERTIFICATE-----\n`;
+}
+
+function sendMtlsError(
+  res: ServerResponse,
+  status: number,
+  code: string,
+  extra?: Record<string, unknown>,
+): void {
+  if (res.headersSent) {
+    try { res.end(); } catch { /* socket gone */ }
+    return;
+  }
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({ error: { code, ...(extra ?? {}) } }));
+}
+
+async function handleExternalMtls(
+  req: IncomingMessage,
+  res: ServerResponse,
+  proxyHandler: AnthropicProxyHandler,
+): Promise<void> {
+  const socket = req.socket as TLSSocket;
+  // TLS 层已经 rejectUnauthorized:true,到这里 authorized 理论必真;额外 belt-and-suspenders
+  if (!socket.authorized) {
+    sendMtlsError(res, 401, "PEER_UNAUTHORIZED", { reason: socket.authorizationError?.message });
+    return;
+  }
+  const peerCert = socket.getPeerCertificate(true);
+  if (!peerCert || !peerCert.raw || peerCert.raw.length === 0) {
+    sendMtlsError(res, 401, "NO_PEER_CERT");
+    return;
+  }
+
+  // SPIFFE URI → host uuid
+  const certPem = derToPem(peerCert.raw);
+  let uris: string[];
+  try {
+    uris = await extractSpiffeUris(certPem);
+  } catch {
+    sendMtlsError(res, 403, "CERT_PARSE_FAIL");
+    return;
+  }
+  const hostUri = uris.find((u) => u.startsWith("spiffe://openclaude/host/"));
+  if (!hostUri) {
+    sendMtlsError(res, 403, "NO_HOST_SPIFFE");
+    return;
+  }
+  const hostUuid = extractHostUuidFromSpiffe(hostUri);
+  if (!hostUuid) {
+    sendMtlsError(res, 403, "BAD_SPIFFE_URI");
+    return;
+  }
+
+  // DB state + fingerprint pin。**不做 in-proc cache**,每请求一查 —— admin 轮换 fp 就即时生效
+  const row = await computeQueries.getHostById(hostUuid);
+  if (!row) {
+    sendMtlsError(res, 403, "HOST_NOT_FOUND");
+    return;
+  }
+  if (row.status !== "ready") {
+    sendMtlsError(res, 503, "HOST_NOT_READY", { status: row.status });
+    return;
+  }
+  const expectedFp = row.agent_cert_fingerprint_sha256;
+  if (!expectedFp) {
+    sendMtlsError(res, 403, "NO_PINNED_FP");
+    return;
+  }
+  // peerCert.fingerprint256 是 "AA:BB:..." 冒号分隔大写 hex。
+  // 异常 TLS 对象形态下可能为 undefined/"",统一落 401 而非走到后面抛 500。
+  if (!peerCert.fingerprint256 || typeof peerCert.fingerprint256 !== "string") {
+    sendMtlsError(res, 401, "NO_PEER_FINGERPRINT");
+    return;
+  }
+  const presentedFp = peerCert.fingerprint256.replace(/:/g, "").toLowerCase();
+  const pBuf = Buffer.from(presentedFp, "hex");
+  const eBuf = Buffer.from(expectedFp.toLowerCase(), "hex");
+  if (pBuf.length !== eBuf.length || pBuf.length === 0 || !timingSafeEqual(pBuf, eBuf)) {
+    sendMtlsError(res, 403, "FINGERPRINT_MISMATCH");
+    return;
+  }
+
+  // X-V3-Container-IP 校验:三重防御(数组 / CRLF header-folding / 非 IPv4)
+  const rawIp = req.headers["x-v3-container-ip"];
+  if (Array.isArray(rawIp)) {
+    sendMtlsError(res, 400, "IP_HEADER_ARRAY");
+    return;
+  }
+  if (!rawIp || typeof rawIp !== "string") {
+    sendMtlsError(res, 400, "IP_HEADER_MISSING");
+    return;
+  }
+  if (rawIp.includes("\r") || rawIp.includes("\n")) {
+    sendMtlsError(res, 400, "IP_HEADER_CRLF");
+    return;
+  }
+  if (!isIPv4(rawIp)) {
+    sendMtlsError(res, 400, "IP_HEADER_NOT_IPV4");
+    return;
+  }
+
+  // 剥掉 X-V3-Container-IP 头,防止透传到 anthropic 上游
+  delete req.headers["x-v3-container-ip"];
+  await proxyHandler(req, res, { hostUuid, boundIp: rawIp });
 }
 
 /**
@@ -358,6 +516,8 @@ export async function registerCommercial(
   let internalProxyServer: HttpServer | undefined;
   let internalProxyHandler: AnthropicProxyHandler | undefined;
   let internalProxyAddress: { host: string; port: number } | undefined;
+  let externalMtlsServer: HttpsServer | undefined;
+  let externalMtlsAddress: { host: string; port: number } | undefined;
   // 前向引用占位:userChatBridge 在下方创建,但 anthropicProxy 在这里就要它的 broadcastToUser。
   // 给 proxy 的 dep 是稳定的闭包(总是调 bridgeBroadcastRef.current),创建 bridge 后赋值。
   // 在 bridge 初始化完成前到达的 cost_charged broadcast 会走到 noop,不 throw 也不落盘(前端
@@ -365,9 +525,28 @@ export async function registerCommercial(
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
   };
-  if (!options.skipInternalProxy && proxyBind && proxyPort !== undefined) {
+  // D.1b: self host uuid 取失败只降级多机路径(proxy / v3Deps.containerService /
+  // baselineServer),不牵连整个 commercial 启动。多处共用,提前一次性取。
+  let selfHostUuid: string | undefined;
+  try {
+    selfHostUuid = (await computeQueries.getSelfHost()).id;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      "[commercial] getSelfHost failed; multi-host routing + internal proxy disabled",
+      { err: (err as Error)?.message ?? String(err) },
+    );
+    // selfHostUuid 保持 undefined;下面 proxy / v3Deps / baselineServer 全部靠 guard 跳过
+  }
+
+  if (
+    !options.skipInternalProxy &&
+    proxyBind &&
+    proxyPort !== undefined &&
+    selfHostUuid
+  ) {
     try {
-      const identityRepo = createPgIdentityRepo(getPool());
+      const identityRepo = createPgIdentityRepo();
       // proxy 模块需要 RateLimitRedis;wrapIoredis 已经满足 incr/expire/ttl 三方法
       const rateLimitRedis = wrapIoredis(redis);
       internalProxyHandler = makeAnthropicProxyHandler({
@@ -388,9 +567,13 @@ export async function registerCommercial(
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
       });
       internalProxyServer = createHttpServer((req, res) => {
-        // peerIp 取 socket.remoteAddress(IP-only,无端口);verifyContainerIdentity 接受 string|undefined
+        // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,
+        // hostUuid 固定 = selfHostUuid(本机容器不需要也不可能带 mTLS cert)。
+        // selfHostUuid 在外层闭包已取,保证非 undefined(否则根本走不到 createHttpServer 这行)。
         const peerIp = req.socket.remoteAddress ?? "";
-        Promise.resolve(internalProxyHandler!(req, res, peerIp)).catch((err) => {
+        Promise.resolve(
+          internalProxyHandler!(req, res, { hostUuid: selfHostUuid!, boundIp: peerIp }),
+        ).catch((err) => {
           // eslint-disable-next-line no-console
           console.error("[commercial] anthropicProxy handler threw:", err);
           if (!res.headersSent) {
@@ -430,6 +613,78 @@ export async function registerCommercial(
     console.log(
       "[commercial] internal anthropic proxy disabled; missing INTERNAL_PROXY_BIND / INTERNAL_PROXY_PORT",
     );
+  }
+
+  // V3 D.1b: 18443 mTLS listener。remote-host node-agent 走 L7 反代过来,master 这边
+  // 用 master leaf cert 作服务端 cert,并要求对端出示 host leaf cert(SPIFFE host/<uuid>)。
+  // 通过 handleExternalMtls 做 cert + fingerprint + container-ip 头三级校验后,
+  // 走到同一个 internalProxyHandler(和 self-host plain 18791 共用)。
+  //
+  // 启用条件:EXTERNAL_MTLS_ENABLED=1 + bind + port 都配齐 + internalProxyHandler 已就绪。
+  // 关掉 / 配不齐 / 监听失败 → 单边降级,remote host 出不来但 self host 不受影响。
+  if (
+    internalProxyHandler &&
+    cfg.EXTERNAL_MTLS_ENABLED &&
+    cfg.EXTERNAL_MTLS_BIND &&
+    cfg.EXTERNAL_MTLS_PORT !== undefined
+  ) {
+    const mtlsBind = cfg.EXTERNAL_MTLS_BIND;
+    const mtlsPort = cfg.EXTERNAL_MTLS_PORT;
+    try {
+      const caMat = await ensureCa();
+      const masterLeaf = await ensureMasterLeaf();
+      const caPem = await fs.promises.readFile(caMat.caCertPath, "utf8");
+      const masterKey = await fs.promises.readFile(masterLeaf.keyPath, "utf8");
+      const capturedHandler = internalProxyHandler;
+      externalMtlsServer = createHttpsServer(
+        {
+          key: masterKey,
+          cert: masterLeaf.certPem,
+          ca: caPem,
+          requestCert: true,
+          rejectUnauthorized: true,
+          // master + node-agent 都我们自己控(Node 18+ / Go 1.22 均原生 TLS 1.3),
+          // 没有历史客户端兼容性包袱,直接 hard-require 1.3。
+          minVersion: "TLSv1.3",
+        },
+        (req, res) => {
+          Promise.resolve(handleExternalMtls(req, res, capturedHandler)).catch((err) => {
+            // eslint-disable-next-line no-console
+            console.error("[commercial] external mTLS handler threw:", err);
+            if (!res.headersSent) {
+              try {
+                res.statusCode = 500;
+                res.setHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ error: { code: "INTERNAL", message: "mtls error" } }));
+              } catch { /* socket gone */ }
+            } else {
+              try { res.end(); } catch { /* */ }
+            }
+          });
+        },
+      );
+      await new Promise<void>((resolve, reject) => {
+        externalMtlsServer!.once("error", reject);
+        externalMtlsServer!.listen(mtlsPort, mtlsBind, () => {
+          externalMtlsServer!.removeListener("error", reject);
+          resolve();
+        });
+      });
+      externalMtlsAddress = { host: mtlsBind, port: mtlsPort };
+      // eslint-disable-next-line no-console
+      console.log(
+        `[commercial] external mTLS listening on ${mtlsBind}:${mtlsPort}`,
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[commercial] external mTLS listener failed; disabling:", err);
+      try { externalMtlsServer?.close(); } catch { /* */ }
+      externalMtlsServer = undefined;
+      externalMtlsAddress = undefined;
+    }
+  } else if (internalProxyHandler && !cfg.EXTERNAL_MTLS_ENABLED) {
+    // eslint-disable-next-line no-console
+    console.log("[commercial] external mTLS listener disabled (EXTERNAL_MTLS_ENABLED != 1)");
   }
 
   // T-12+ 真实 mailer:env 配 RESEND_API_KEY 后切到 Resend,否则保留 stub(dev/测试)。
@@ -478,9 +733,22 @@ export async function registerCommercial(
       // bridgeSecret 注入后,provisionV3Container 会写 OC_CONTAINER_ID / OC_BRIDGE_NONCE
       // 到容器 env;未注入则容器侧 /healthz 不广播 file-proxy-v1,代理自动 OUTDATED。
       bridgeSecret,
+      // 多机路由 wiring:selfHostUuid 取到才同时注入 containerService + selfHostId,
+      // 避免出现 "containerService 注入但 selfHostId undefined" 的半 wire 状态
+      // (provisionV3Container 的 useRemote 判定依赖 selfHostId 非空)。
+      ...(selfHostUuid
+        ? {
+            containerService: createContainerService(v3Docker),
+            selfHostId: selfHostUuid,
+          }
+        : {}),
     };
     // eslint-disable-next-line no-console
-    console.log("[commercial] v3 supervisor wired", { image: cfg.OC_RUNTIME_IMAGE });
+    console.log("[commercial] v3 supervisor wired", {
+      image: cfg.OC_RUNTIME_IMAGE,
+      multiHost: Boolean(selfHostUuid),
+      selfHostId: selfHostUuid ?? null,
+    });
 
     // CCB 基线自检(只读诊断,不自己阻断启动 —— 真正的 fail-closed 发生在
     // provisionV3Container 里抛 SupervisorError("CcbBaselineMissing"))。
@@ -537,6 +805,88 @@ export async function registerCommercial(
       "[commercial] v3 supervisor disabled; missing env: OC_RUNTIME_IMAGE",
     );
   }
+
+  // V3 多机路由:启动 BaselineServer,给远端 node-agent 提供
+  // /internal/v3/baseline-{version,tarball} 端点。只在 v3Deps + selfHostUuid
+  // 都就绪时起(多机 wiring 前置条件),失败不阻断 gateway —— remote host 拉
+  // baseline 失败时 provisionV3Container 会走 CcbBaselineMissing fail-closed。
+  // bind 0.0.0.0 + mTLS + PSK 双因子认证;GCP default-allow-internal 挡公网。
+  let baselineSrv: BaselineServer | undefined;
+  if (v3Deps && selfHostUuid) {
+    try {
+      const baselineDir =
+        process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR;
+      baselineSrv = getBaselineServer({
+        baselineDir,
+        bind: "0.0.0.0",
+        port: 18792,
+      });
+      await baselineSrv.start();
+      // eslint-disable-next-line no-console
+      console.log("[commercial] baseline server started", {
+        bind: "0.0.0.0",
+        port: 18792,
+        baselineDir,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[commercial] baseline server start failed", {
+        err: (err as Error)?.message ?? String(err),
+      });
+      baselineSrv = undefined;
+    }
+  }
+
+  // C.3 — 向 sshMux 注入 remote-aware 依赖。不注入时 acquireMux 的 remote 分支
+  // 会抛 "RPC fns not configured"(sshMux.ts defaultDeps),等价于死代码。此处必须
+  // 在 createCommercialHandler / sessionManager 初始化之前完成注入。
+  //
+  // resolvePlacement 合约(sshMux.ts):按 userId 查 sticky compute_host;self → {kind:'self'},
+  // 其它 → {kind:'remote', target}。fail-closed:DB 错 / 无 active 容器 → 抛
+  // RemoteHostError("INTERNAL", "NO_CONTAINER: ...")。sshMux caller 会把异常 propagate。
+  //
+  // 注:M1 语义是"一个 user 最多占一台 compute_host"(findUserStickyHost LIMIT 1),故 hostId
+  // 参数目前只用于日志;未来若放宽"单用户多容器",此处要重新 keyed by (userId, hostId)。
+  setRemoteMuxDeps({
+    async resolvePlacement(userId, hostId) {
+      const uidInt = Number.parseInt(userId, 10);
+      if (!Number.isFinite(uidInt) || uidInt <= 0 || String(uidInt) !== userId) {
+        throw new RemoteHostError(
+          "INTERNAL",
+          `resolvePlacement: userId not positive integer: ${userId}`,
+        );
+      }
+      const sticky = await computeQueries.findUserStickyHost(uidInt);
+      if (!sticky) {
+        throw new RemoteHostError(
+          "INTERNAL",
+          `NO_CONTAINER: user ${userId} has no active container (hostId=${hostId})`,
+        );
+      }
+      const hostRow = await computeQueries.getHostById(sticky.hostUuid);
+      if (!hostRow) {
+        throw new RemoteHostError(
+          "INTERNAL",
+          `compute_host ${sticky.hostUuid} not found (userId=${userId} hostId=${hostId})`,
+        );
+      }
+      rootLogger.debug("sshMux resolvePlacement", {
+        subsys: "remote-ssh",
+        userId,
+        hostId,
+        resolvedHostUuid: hostRow.id,
+        resolvedName: hostRow.name,
+      });
+      if (hostRow.name === "self") return { kind: "self" };
+      return { kind: "remote", target: hostRowToTarget(hostRow) };
+    },
+    startSshControlMaster,
+    stopSshControlMaster,
+    putRemoteFile: nodeAgentPutFile,
+    deleteRemoteFile: nodeAgentDeleteFile,
+  });
+  // eslint-disable-next-line no-console
+  console.log("[commercial] sshMux remote deps wired");
 
   const handler = createCommercialHandler({
     jwtSecret,
@@ -728,6 +1078,9 @@ export async function registerCommercial(
       if (alertScheduler) {
         try { await alertScheduler.stop(); } catch { /* ignore */ }
       }
+      if (baselineSrv) {
+        try { await baselineSrv.stop(); } catch { /* ignore */ }
+      }
       if (internalProxyServer) {
         await new Promise<void>((resolve) => {
           try {
@@ -738,12 +1091,23 @@ export async function registerCommercial(
           } catch { resolve(); }
         });
       }
+      if (externalMtlsServer) {
+        await new Promise<void>((resolve) => {
+          try {
+            externalMtlsServer!.close(() => resolve());
+            const closeAll = (externalMtlsServer as unknown as { closeAllConnections?: () => void }).closeAllConnections;
+            if (typeof closeAll === "function") closeAll.call(externalMtlsServer);
+          } catch { resolve(); }
+        });
+      }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closePool();
     },
     /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */
     internalProxyAddress,
+    /** V3 D.1b 测试 / /healthz 探测用:外部 mTLS 监听地址(undefined = 未启用)。 */
+    externalMtlsAddress,
     // 已规范化为 ≥32 byte Uint8Array,gateway 可直接喂 createHmac
     jwtSecret: secretToKey(jwtSecret),
   };

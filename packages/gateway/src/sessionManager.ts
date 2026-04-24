@@ -19,6 +19,11 @@ import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { SubprocessRunner } from './subprocessRunner.js'
 import { CodexRunner } from './codexRunner.js'
+import {
+  type ExecutionTarget,
+  type RemoteTargetController,
+  RemoteTargetUnavailableError,
+} from './remoteTarget.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -74,6 +79,12 @@ export interface AgentSession {
    *  sessionKey's resume-map entry instead of re-persisting it. See
    *  ccbMessageParser.ts TurnResult.staleResumeId. */
   _pendingStaleResumeClear?: boolean
+  /**
+   * 当前执行目标(local = 容器内本地,remote = ssh ControlMaster 到远程机)。
+   * 默认 { kind:'local' }。切换走 `SessionManager.setExecutionTarget`,整个
+   * swap 过程受 `lock` 保护,保证 in-flight turn 看到的是一个一致的 target。
+   */
+  executionTarget: ExecutionTarget
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -127,6 +138,18 @@ export class SessionManager {
     for (const session of this.sessions.values()) {
       session.runner.updateConfig(config)
     }
+  }
+
+  /**
+   * 注入远程目标控制器。commercial 侧在启动装配时调用;personal / 测试环境不调,
+   * setExecutionTarget('remote') 会抛 RemoteTargetUnavailableError。
+   *
+   * 故意不是构造器参数 —— SessionManager 在 gateway 包里,controller 实现
+   * 在 commercial 包,反向依赖禁止(Codex R11 BLOCK-1)。
+   */
+  private _remoteTargetController?: RemoteTargetController
+  setRemoteTargetController(ctrl: RemoteTargetController | undefined): void {
+    this._remoteTargetController = ctrl
   }
 
   // Resume map: sessionKey → ccbSessionId (survives gateway restart)
@@ -450,6 +473,7 @@ export class SessionManager {
       _lastCcbCumulativeCost: this._lastCostFor(opts.sessionKey, providerTag) ?? 0,
       model: opts.agent.model ?? this.config.defaults.model,
       toolUseIdToName: new Map(),
+      executionTarget: { kind: 'local' },
     }
     runner.on('session_id', (id: string) => {
       session.ccbSessionId = id
@@ -1281,12 +1305,129 @@ export class SessionManager {
     return this.sessions.get(sessionKey)
   }
 
+  /**
+   * 切换 session 的执行目标 (local ⇄ remote)。
+   *
+   * 语义(与 boss 对齐):
+   *   - 切换意味着**清空上下文** —— shutdown 当前 runner + 清 resume-map。用户
+   *     在进入切换时已被 UI 明确告知此行为(前端侧)。
+   *   - lock chain 保护:integrated 进 session.lock,跟 submit 相互串行,
+   *     保证不会在 in-flight turn 中途偷偷换掉 target。
+   *   - 切入 remote 先 acquireMux 成功再 swap,失败路径不碰 runner;切走 remote
+   *     在 swap 成功后才 release 旧 mux(outside lock,避免持锁做 IO)。
+   *   - 幂等:target.kind 与当前相同且(remote 时)hostId 相同 → noop 返回。
+   *
+   * 失败:
+   *   - controller 未注入但 target.kind='remote' → RemoteTargetUnavailableError
+   *   - session 不存在 → throw
+   *   - session.userId 缺失(cron / 历史路径) → throw(remote 必须绑 user)
+   *   - acquireMux 抛 → rethrow(已回滚,runner 未动)
+   */
+  async setExecutionTarget(
+    sessionKey: string,
+    target: { kind: 'local' } | { kind: 'remote'; hostId: string },
+  ): Promise<void> {
+    const session = this.sessions.get(sessionKey)
+    if (!session) throw new Error(`session not found: ${sessionKey}`)
+
+    const prev = session.lock
+    let release!: () => void
+    session.lock = new Promise<void>((r) => (release = r))
+    try {
+      await prev
+
+      const current = session.executionTarget
+      // 幂等短路:target 未变(remote 需 hostId 相同)
+      if (current.kind === target.kind) {
+        if (current.kind === 'local') return
+        if (current.kind === 'remote' && target.kind === 'remote' && current.hostId === target.hostId) return
+      }
+
+      // 切入 remote 的前置校验
+      let newTarget: ExecutionTarget
+      if (target.kind === 'remote') {
+        const ctrl = this._remoteTargetController
+        if (!ctrl) throw new RemoteTargetUnavailableError('controller not injected')
+        if (!session.userId) {
+          // remote 必须绑 userId,做跨用户隔离;cron 风格 session 不允许远程执行
+          throw new Error('session not switchable to remote: userId missing')
+        }
+        const userId = session.userId
+        // 先 acquire,失败抛异常由外层 rethrow,不动 runner
+        const handle = await ctrl.acquireMux(sessionKey, userId, target.hostId)
+        newTarget = { kind: 'remote', hostId: target.hostId, hostMeta: handle }
+      } else {
+        newTarget = { kind: 'local' }
+      }
+
+      // Swap:到这里新目标资源已就绪(local 无资源,remote 已 hold mux)。
+      // 下面做"清上下文 + 改 runner 配置":
+      //   1. runner.shutdown 优雅停 CCB(graceful,in-flight turn 会被打断,
+      //      但 session.crashed 不会触发 —— shuttingDown 标志位让 exit 归类
+      //      为预期退出)。
+      //   2. 清 resume-map 四张平行表 + session.ccbSessionId + runner sessionId
+      //      —— 下次 submit 就会用新 env spawn 一个全新 CCB。
+      //   3. runner.setExecutionTarget 在重启前就位,新 spawn 读到新 env。
+      //
+      // 任何一步抛 → release 新 mux 做 rollback;session.executionTarget 不提交。
+      try {
+        await session.runner.shutdown()
+        this._resumeMap.delete(sessionKey)
+        this._resumeMapTimestamps.delete(sessionKey)
+        this._resumeMapProvider.delete(sessionKey)
+        this._resumeMapLastCost.delete(sessionKey)
+        session.ccbSessionId = null
+        session.runner.clearSessionId?.()
+        this._saveResumeMap()
+        session.runner.setExecutionTarget(newTarget)
+      } catch (err) {
+        if (newTarget.kind === 'remote' && session.userId) {
+          await this._remoteTargetController
+            ?.releaseMux(sessionKey, session.userId, newTarget.hostId)
+            .catch((e) => log.warn('rollback releaseMux failed', { sessionKey, err: String(e) }))
+        }
+        throw err
+      }
+
+      // 提交新 target。旧 mux(若之前是 remote)在锁外异步 release,别让 IO
+      // 阻塞 lock chain;release 幂等,失败只告警。
+      const oldTarget = session.executionTarget
+      session.executionTarget = newTarget
+      if (oldTarget.kind === 'remote' && session.userId) {
+        const uid = session.userId
+        const oldHostId = oldTarget.hostId
+        queueMicrotask(() => {
+          this._remoteTargetController
+            ?.releaseMux(sessionKey, uid, oldHostId)
+            .catch((err) => log.warn('release old mux failed', { sessionKey, oldHostId, err: String(err) }))
+        })
+      }
+      log.info('execution target switched', {
+        sessionKey,
+        from: oldTarget.kind,
+        to: newTarget.kind,
+        hostId: newTarget.kind === 'remote' ? newTarget.hostId : undefined,
+      })
+    } finally {
+      release()
+    }
+  }
+
   /** Destroy a single session: kill subprocess + remove from map + clear resume mapping.
    *  Also clears resume-map even if the session was already evicted from memory. */
   async destroySession(sessionKey: string): Promise<void> {
     const s = this.sessions.get(sessionKey)
     if (s) {
       await s.runner.shutdown()
+      // 释放 remote mux refcount —— destroy 是 session 终结态,refcount 必须归零,
+      // 否则 mux 泄漏。release 幂等,失败只 warn 不抛(上游不关心)。
+      if (s.executionTarget.kind === 'remote' && s.userId) {
+        await this._remoteTargetController
+          ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
+          .catch((err) =>
+            log.warn('destroySession releaseMux failed', { sessionKey, err: String(err) }),
+          )
+      }
       this.sessions.delete(sessionKey)
     }
     // Always clear resume-map (handles both live and evicted sessions)
@@ -1311,7 +1452,23 @@ export class SessionManager {
     // Medium#G1:shutdown 前先把所有 live sessionKey 通知一次 ring 清理,防止
     // 进程退出前最后一刻的 WS 重连拿到下一轮无主的 frame。
     const keysToClear = [...this.sessions.keys()]
+    // 收集所有 remote session 的 mux 句柄,用于 shutdown 后统一 release,
+    // 避免 mux 泄漏跨进程(systemd 重启 tmpfs 清干净是最后兜底,但 release
+    // 在自 process 内做,是正路)。
+    const muxReleases: Array<() => Promise<void>> = []
+    for (const s of this.sessions.values()) {
+      if (s.executionTarget.kind === 'remote' && s.userId) {
+        const uid = s.userId
+        const key = s.sessionKey
+        const hostId = s.executionTarget.hostId
+        muxReleases.push(() =>
+          this._remoteTargetController?.releaseMux(key, uid, hostId).catch(() => {}) ??
+            Promise.resolve(),
+        )
+      }
+    }
     await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
+    await Promise.all(muxReleases.map((fn) => fn()))
     this.sessions.clear()
     for (const k of keysToClear) {
       try { this.onSessionDestroyed?.(k) } catch {}
@@ -1370,6 +1527,12 @@ export class SessionManager {
             try {
               await s.runner.shutdown()
             } catch {}
+            // 释放 remote mux refcount(若为 remote)—— 与 destroySession 语义一致
+            if (s.executionTarget.kind === 'remote' && s.userId) {
+              await this._remoteTargetController
+                ?.releaseMux(key, s.userId, s.executionTarget.hostId)
+                .catch((err) => log.warn('evict releaseMux failed', { key, err: String(err) }))
+            }
             this.sessions.delete(key)
             if (!key.includes(':webchat:')) {
               this._resumeMap.delete(key)
