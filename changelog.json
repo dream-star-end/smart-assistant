@@ -1,6 +1,14 @@
 {
-  "currentVersion": "v3-20260424T1054Z-1263fe4",
+  "currentVersion": "v3-20260424T1621Z-cb42bd0",
   "releases": [
+    {
+      "version": "v3-20260424T1621Z-cb42bd0",
+      "date": "2026-04-25",
+      "title": "登录页支持浏览器密码管理器",
+      "items": [
+        "登录区改为标准 form 结构,首次登录后 Chrome/Safari/Firefox 会 offer 保存账号密码,下次访问自动填充"
+      ]
+    },
     {
       "version": "v3-20260424T1054Z-1263fe4",
       "date": "2026-04-24",
