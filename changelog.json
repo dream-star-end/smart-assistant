@@ -1,8 +1,8 @@
 {
-  "currentVersion": "v3-20260424T1621Z-cb42bd0",
+  "currentVersion": "v3-20260424T2005Z-8399315",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v3-20260424T2005Z-8399315",
       "date": "2026-04-25",
       "title": "维护模式 + 微信通道状态可见",
       "items": [
