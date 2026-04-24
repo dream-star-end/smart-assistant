@@ -16,7 +16,7 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { state } from './state.js'
+import { _clearStoredAccessToken, state } from './state.js'
 import { apiGet, apiJson, apiText, onAuthExpired } from './api.js'
 import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js'
 
@@ -299,9 +299,9 @@ async function bootstrap() {
 }
 
 function logout() {
-  try { localStorage.removeItem('openclaude_access_token') } catch {}
+  // 2026-04-24 "记住我":access token 可能在 localStorage 或 sessionStorage,两处都清。
+  _clearStoredAccessToken()
   try { localStorage.removeItem('openclaude_refresh_token') } catch {}
-  try { localStorage.removeItem('openclaude_access_exp') } catch {}
   window.location.href = '/'
 }
 
@@ -326,6 +326,7 @@ const TABS = {
   users: renderUsersTab,
   accounts: renderAccountsTab,
   containers: renderContainersTab,
+  hosts: renderHostsTab,
   ledger: renderLedgerTab,
   pricing: renderPricingTab,
   plans: renderPlansTab,
@@ -354,6 +355,12 @@ const TAB_CLEANUPS = {
       DASH_STATE.refreshTimer = null
     }
     _destroyDashCharts()
+  },
+  hosts() {
+    if (HOSTS_STATE.refreshTimer) {
+      clearInterval(HOSTS_STATE.refreshTimer)
+      HOSTS_STATE.refreshTimer = null
+    }
   },
 }
 let _currentTab = null
@@ -3364,6 +3371,360 @@ async function _refreshAlertRuleStates() {
   } catch (e) {
     el.innerHTML = `<div class="error">加载 rule_states 失败: ${escapeHtml(e.message)}</div>`
   }
+}
+
+// ─── Tab: Hosts (V3 D.4 虚机池) ─────────────────────────────────────
+//
+// 后端路由:
+//   GET  /api/admin/v3/compute-hosts
+//   POST /api/admin/v3/compute-hosts/add
+//   GET  /api/admin/v3/compute-hosts/:id/bootstrap-log
+//   POST /api/admin/v3/compute-hosts/:id/drain|remove|quarantine-clear
+//   GET  /api/admin/v3/baseline-version
+//
+// 刷新策略:首屏并行拉 list + baseline-version,进入 tab 后每 5s 轮询一次。
+// 切 tab 时 TAB_CLEANUPS.hosts 清 interval,不泄漏。
+
+const HOSTS_STATE = {
+  rows: [],
+  baseline: null,
+  renderSeq: 0,
+  refreshTimer: null,
+}
+
+async function renderHostsTab() {
+  const mySeq = ++HOSTS_STATE.renderSeq
+
+  view().innerHTML = `
+    <div class="panel">
+      <h1 style="margin-top:0">虚机池 <small style="color:var(--muted);font-weight:400;font-size:14px" id="h-count">加载中…</small></h1>
+      <div id="h-baseline" style="margin-bottom:16px"></div>
+      <div class="toolbar">
+        <button class="btn" id="h-refresh">刷新</button>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="h-new">+ 添加虚机</button>
+      </div>
+      <div id="h-table-container"><div class="empty">加载中…</div></div>
+    </div>
+  `
+  $('h-refresh').addEventListener('click', () => _loadHostsData(HOSTS_STATE.renderSeq))
+  $('h-new').addEventListener('click', openAddHostModal)
+
+  await _loadHostsData(mySeq)
+
+  // 5s 轮询 —— bootstrap/health 状态会自行推进,让 UI 跟上
+  if (HOSTS_STATE.refreshTimer) clearInterval(HOSTS_STATE.refreshTimer)
+  HOSTS_STATE.refreshTimer = setInterval(() => {
+    if (_currentTab !== 'hosts') return
+    _loadHostsData(HOSTS_STATE.renderSeq)
+  }, 5000)
+}
+
+async function _loadHostsData(renderSeq) {
+  let listRes, baselineRes
+  try {
+    ;[listRes, baselineRes] = await Promise.all([
+      apiGet('/api/admin/v3/compute-hosts'),
+      apiGet('/api/admin/v3/baseline-version'),
+    ])
+  } catch (err) {
+    if (renderSeq !== HOSTS_STATE.renderSeq || _currentTab !== 'hosts') return
+    const el = $('h-table-container')
+    if (el) el.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
+    const cnt = $('h-count'); if (cnt) cnt.textContent = '—'
+    return
+  }
+  if (renderSeq !== HOSTS_STATE.renderSeq || _currentTab !== 'hosts') return
+
+  HOSTS_STATE.rows = listRes?.hosts ?? []
+  HOSTS_STATE.baseline = baselineRes ?? null
+  _renderBaselineCard()
+  _renderHostsTable()
+}
+
+function _renderBaselineCard() {
+  const el = $('h-baseline')
+  if (!el) return
+  const b = HOSTS_STATE.baseline
+  if (!b) { el.innerHTML = ''; return }
+  const masterV = b.master_version
+    ? `<code style="font-size:13px">${escapeHtml(b.master_version)}</code>`
+    : `<span style="color:var(--danger)">未初始化${b.master_err ? ` · ${escapeHtml(b.master_err)}` : ''}</span>`
+  const perHost = b.per_host || []
+  const perHostHtml = perHost.length === 0
+    ? '<span style="color:var(--muted);font-size:13px">(暂无远程虚机)</span>'
+    : perHost.map((h) => {
+        const match = b.master_version && h.remote_version === b.master_version
+        const cls = h.err ? 'chip-danger' : match ? 'chip-ok' : 'chip-warn'
+        const label = h.err
+          ? `${h.name}: ERR`
+          : `${h.name}: ${h.remote_version || '—'}`
+        const title = h.err ? h.err : (h.remote_version || '')
+        return `<span class="chip ${cls}" title="${escapeHtml(title)}" style="margin-right:4px">${escapeHtml(label)}</span>`
+      }).join('')
+  el.innerHTML = `
+    <div style="background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:10px 12px;">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">Baseline 版本</div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+        <span>master: ${masterV}</span>
+        <span style="color:var(--muted)">·</span>
+        <span>per-host: ${perHostHtml}</span>
+      </div>
+    </div>
+  `
+}
+
+function _hostStatusBadge(status) {
+  const cls = status === 'ready' ? 'ok'
+    : status === 'bootstrapping' || status === 'draining' ? 'warn'
+    : status === 'quarantined' ? 'warn'
+    : status === 'broken' || status === 'removed' ? 'danger'
+    : 'muted'
+  return `<span class="badge ${cls}">${escapeHtml(status)}</span>`
+}
+
+function _certChipForHost(h) {
+  if (!h.cert_not_after) return '<span style="color:var(--muted)">—</span>'
+  const ms = new Date(h.cert_not_after).getTime() - Date.now()
+  if (Number.isNaN(ms)) return escapeHtml(h.cert_not_after)
+  const days = Math.floor(ms / 86400000)
+  if (days < 0) return `<span class="chip chip-danger" title="${escapeHtml(fmtDate(h.cert_not_after))}">已过期</span>`
+  if (days < 7) return `<span class="chip chip-warn" title="${escapeHtml(fmtDate(h.cert_not_after))}">${days}d</span>`
+  return `<span class="chip chip-muted" title="${escapeHtml(fmtDate(h.cert_not_after))}">${days}d</span>`
+}
+
+function _renderHostsTable() {
+  const el = $('h-table-container')
+  if (!el) return
+  const rows = HOSTS_STATE.rows
+  const cnt = $('h-count'); if (cnt) cnt.textContent = `共 ${rows.length} 台`
+  if (rows.length === 0) {
+    el.innerHTML = '<div class="empty">无虚机</div>'
+    return
+  }
+  el.innerHTML = `
+    <table class="data">
+      <thead>
+        <tr>
+          <th>name</th>
+          <th>host:port</th>
+          <th>状态</th>
+          <th class="num">active / max</th>
+          <th>cert 到期</th>
+          <th>最近健康</th>
+          <th>最近 bootstrap</th>
+          <th class="actions">操作</th>
+        </tr>
+      </thead>
+      <tbody>${rows.map(_renderHostRow).join('')}</tbody>
+    </table>
+  `
+  for (const b of el.querySelectorAll('button[data-act="h-log"]')) {
+    b.addEventListener('click', () => openBootstrapLogModal(b.dataset.id, b.dataset.name))
+  }
+  for (const b of el.querySelectorAll('button[data-act="h-drain"]')) {
+    b.addEventListener('click', (ev) => drainHost(b.dataset.id, b.dataset.name, ev.currentTarget))
+  }
+  for (const b of el.querySelectorAll('button[data-act="h-remove"]')) {
+    b.addEventListener('click', (ev) => removeHost(b.dataset.id, b.dataset.name, ev.currentTarget))
+  }
+  for (const b of el.querySelectorAll('button[data-act="h-clearq"]')) {
+    b.addEventListener('click', (ev) => clearHostQuarantine(b.dataset.id, b.dataset.name, ev.currentTarget))
+  }
+}
+
+function _renderHostRow(h) {
+  const healthChip = h.last_health_ok === true
+    ? `<span class="chip chip-ok" title="${escapeHtml(fmtDate(h.last_health_at || ''))}">OK</span>`
+    : h.last_health_ok === false
+      ? `<span class="chip chip-danger" title="${escapeHtml(h.last_health_err || '')}">FAIL</span>`
+      : '<span style="color:var(--muted)">—</span>'
+  const bootstrapChip = h.last_bootstrap_err
+    ? `<span class="chip chip-danger" title="${escapeHtml(h.last_bootstrap_err)}">ERR</span>`
+    : h.last_bootstrap_at
+      ? `<span class="chip chip-ok" title="${escapeHtml(fmtDate(h.last_bootstrap_at))}">OK</span>`
+      : '<span style="color:var(--muted)">—</span>'
+  const isSelf = h.name === 'self'
+  const canDrain = !isSelf && (h.status === 'ready' || h.status === 'quarantined' || h.status === 'broken')
+  const canRemove = !isSelf && h.status === 'draining' && (h.active_containers | 0) === 0
+  const canClearQ = h.status === 'quarantined'
+  const nameAttr = escapeHtml(h.name)
+  const idAttr = escapeHtml(h.id)
+  const btns = []
+  btns.push(`<button data-act="h-log" data-id="${idAttr}" data-name="${nameAttr}">日志</button>`)
+  if (canClearQ) btns.push(`<button data-act="h-clearq" data-id="${idAttr}" data-name="${nameAttr}">解除隔离</button>`)
+  if (canDrain) btns.push(`<button data-act="h-drain" data-id="${idAttr}" data-name="${nameAttr}">排空</button>`)
+  if (canRemove) btns.push(`<button data-act="h-remove" data-id="${idAttr}" data-name="${nameAttr}" style="color:var(--danger)">删除</button>`)
+  return `
+    <tr>
+      <td><strong>${escapeHtml(h.name)}</strong>${isSelf ? ' <small style="color:var(--muted)">(master)</small>' : ''}</td>
+      <td class="mono">${escapeHtml(h.host)}:${h.ssh_port}${h.agent_port && h.agent_port !== 9443 ? ` <small style="color:var(--muted)">(agent ${h.agent_port})</small>` : ''}</td>
+      <td>${_hostStatusBadge(h.status)}</td>
+      <td class="num">${h.active_containers | 0} / ${h.max_containers | 0}</td>
+      <td>${_certChipForHost(h)}</td>
+      <td>${healthChip}</td>
+      <td>${bootstrapChip}</td>
+      <td class="actions">${btns.join(' ')}</td>
+    </tr>
+  `
+}
+
+// ─── Hosts: add modal ────────────────────────────────────────────────
+
+function openAddHostModal() {
+  openModal(`
+    <h3>添加虚机</h3>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      master 会 SSH 到目标机装 node-agent、签证书、起代理。完成后轮询 bootstrap 日志可看进度。
+    </div>
+    <div class="form-row"><label>name</label>
+      <input type="text" id="nh-name" placeholder="tk-01" maxlength="64" />
+    </div>
+    <div class="form-row"><label>host</label>
+      <input type="text" id="nh-host" placeholder="1.2.3.4 或 host.example.com" />
+    </div>
+    <div class="form-row"><label>ssh_port</label>
+      <input type="number" id="nh-ssh-port" value="22" min="1" max="65535" />
+    </div>
+    <div class="form-row"><label>ssh_user</label>
+      <input type="text" id="nh-ssh-user" value="root" maxlength="64" />
+    </div>
+    <div class="form-row"><label>password</label>
+      <input type="password" id="nh-password" placeholder="SSH 密码(AES-GCM 存库)" autocomplete="new-password" />
+    </div>
+    <div class="form-row"><label>agent_port</label>
+      <input type="number" id="nh-agent-port" value="9443" min="1024" max="65535" />
+    </div>
+    <div class="form-row"><label>bridge_cidr</label>
+      <input type="text" id="nh-bridge-cidr" placeholder="172.30.1.0/24" />
+      <small style="color:var(--muted);font-size:12px">容器网段,各虚机不能重叠</small>
+    </div>
+    <div class="form-row"><label>max_containers</label>
+      <input type="number" id="nh-max" value="20" min="1" max="200" />
+    </div>
+    <div class="form-actions">
+      <button id="nh-cancel">取消</button>
+      <button class="btn-primary" id="nh-ok">添加并 Bootstrap</button>
+    </div>
+  `)
+  $('nh-cancel').addEventListener('click', closeModal)
+  $('nh-ok').addEventListener('click', async (ev) => {
+    const body = {
+      name: $('nh-name').value.trim(),
+      host: $('nh-host').value.trim(),
+      ssh_port: Number($('nh-ssh-port').value),
+      ssh_user: $('nh-ssh-user').value.trim(),
+      password: $('nh-password').value,
+      agent_port: Number($('nh-agent-port').value),
+      bridge_cidr: $('nh-bridge-cidr').value.trim(),
+      max_containers: Number($('nh-max').value),
+    }
+    if (!body.name || !body.host || !body.password || !body.bridge_cidr) {
+      toast('请填完必填项', 'danger'); return
+    }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        const r = await apiJson('POST', '/api/admin/v3/compute-hosts/add', body)
+        toast(`已添加 ${body.name}(status=${r?.status || 'bootstrapping'})`)
+        closeModal()
+        // 立刻打开 bootstrap-log 让用户看进度
+        if (r?.hostId) openBootstrapLogModal(r.hostId, body.name)
+        _loadHostsData(HOSTS_STATE.renderSeq)
+      } catch (e) {
+        toast(`添加失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  })
+}
+
+// ─── Hosts: bootstrap-log modal (带轮询) ─────────────────────────────
+
+let _bootstrapLogTimer = null
+function openBootstrapLogModal(hostId, name) {
+  // 关掉老 timer(反复打开时)
+  if (_bootstrapLogTimer) { clearInterval(_bootstrapLogTimer); _bootstrapLogTimer = null }
+  openModal(`
+    <h3>Bootstrap 日志 · ${escapeHtml(name)}</h3>
+    <div id="bl-body"><div class="loading">加载中…</div></div>
+    <div class="form-actions">
+      <button id="bl-close">关闭</button>
+    </div>
+  `)
+  const stopPoll = () => { if (_bootstrapLogTimer) { clearInterval(_bootstrapLogTimer); _bootstrapLogTimer = null } }
+  $('bl-close').addEventListener('click', () => { stopPoll(); closeModal() })
+
+  const tick = async () => {
+    // modal 已关(无 bl-body) → 停
+    if (!$('bl-body')) { stopPoll(); return }
+    let data
+    try {
+      data = await apiGet(`/api/admin/v3/compute-hosts/${encodeURIComponent(hostId)}/bootstrap-log`)
+    } catch (e) {
+      if (!$('bl-body')) { stopPoll(); return }
+      $('bl-body').innerHTML = `<div class="error">读取失败: ${escapeHtml(e.message)}</div>`
+      stopPoll()
+      return
+    }
+    if (!$('bl-body')) { stopPoll(); return }
+    const stepChip = data.failed_step
+      ? `<span class="chip chip-danger" style="margin-left:6px">失败步骤: ${escapeHtml(data.failed_step)}</span>`
+      : ''
+    $('bl-body').innerHTML = `
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+        <span>状态: ${_hostStatusBadge(data.status)}</span>
+        ${stepChip}
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">最近 bootstrap 时间</div>
+      <div class="mono" style="margin-bottom:10px">${data.last_bootstrap_at ? escapeHtml(fmtDate(data.last_bootstrap_at)) : '—'}</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">最近错误</div>
+      <pre style="max-height:240px;overflow:auto;background:var(--panel-2);padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word">${data.last_bootstrap_err ? escapeHtml(data.last_bootstrap_err) : '(无)'}</pre>
+    `
+    // bootstrapping 时继续轮询,其他终态停
+    if (data.status !== 'bootstrapping') stopPoll()
+  }
+  tick()
+  _bootstrapLogTimer = setInterval(tick, 3000)
+}
+
+// ─── Hosts: drain / remove / clearQuarantine ─────────────────────────
+
+async function drainHost(id, name, btn) {
+  if (!window.confirm(`排空虚机 ${name}?新容器不会再调度到它,但已有容器继续跑。`)) return
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('POST', `/api/admin/v3/compute-hosts/${encodeURIComponent(id)}/drain`, {})
+      toast(`${name} 已进入 draining`)
+      _loadHostsData(HOSTS_STATE.renderSeq)
+    } catch (e) {
+      toast(`排空失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
+}
+
+async function removeHost(id, name, btn) {
+  if (!window.confirm(`从虚机池删除 ${name}?要求 draining + active=0,不可逆。`)) return
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('POST', `/api/admin/v3/compute-hosts/${encodeURIComponent(id)}/remove`, {})
+      toast(`${name} 已删除`)
+      _loadHostsData(HOSTS_STATE.renderSeq)
+    } catch (e) {
+      toast(`删除失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
+}
+
+async function clearHostQuarantine(id, name, btn) {
+  if (!window.confirm(`解除 ${name} 的隔离状态?之后新容器可能调度到它。`)) return
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('POST', `/api/admin/v3/compute-hosts/${encodeURIComponent(id)}/quarantine-clear`, {})
+      toast(`${name} 已解除隔离`)
+      _loadHostsData(HOSTS_STATE.renderSeq)
+    } catch (e) {
+      toast(`解除失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
 }
 
 // ─── Boot ──────────────────────────────────────────────────────────
