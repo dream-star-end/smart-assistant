@@ -278,6 +278,11 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
         servername: "node-agent", // SNI(server 侧按需校验)
         timeout: opts.timeoutMs ?? REQUEST_TIMEOUT_MS,
         // TLS 握手本身也要快,否则 settle timeout
+        // Node 20 的 https.globalAgent 默认 keepAlive:true;本 RPC 文件头 L16 约定
+        // "每请求新建 TLS connection(不池化)"。若走 globalAgent,pooled TLSSocket
+        // 在并发轮询下会让 getPeerCertificate() 返回空 cert,cert pinning 误触发
+        // "server presented no certificate"。`agent: false` 把实现拉回设计意图。
+        agent: false,
       },
       (res) => {
         // 握手刚完成时 res.socket 必定指向当前 TLSSocket;闭包抓住,避免 end 事件
