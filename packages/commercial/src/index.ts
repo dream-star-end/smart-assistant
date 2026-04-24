@@ -944,51 +944,38 @@ export async function registerCommercial(
   // (运维灾备时用,默认 60s tick / 30min idle cutoff)。
   let idleSweepScheduler: IdleSweepScheduler | undefined;
   if (v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
+    const idleSweepLog = rootLogger.child({ subsys: "v3/idleSweep" });
     idleSweepScheduler = startIdleSweepScheduler(v3Deps, {
-      logger: {
-        debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
-        info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
-        warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
-        error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
-      },
+      logger: idleSweepLog,
       runOnStart: false,
     });
-    // eslint-disable-next-line no-console
-    console.log("[commercial] v3 idle sweep scheduler started (60s tick, 30min cutoff)");
+    idleSweepLog.info("scheduler started", { tickSec: 60, idleCutoffMin: 30 });
   }
 
   // V3 Phase 3G:volume GC(banned 7d / no-login 90d)。1h 一跑,删孤立 volume。
   // cfg.OC_VOLUME_GC_DISABLED=1 可手动关掉(运维灾备 / 数据回滚演练时用)。
   let volumeGcScheduler: VolumeGcScheduler | undefined;
   if (v3Deps && process.env.OC_VOLUME_GC_DISABLED !== "1") {
+    const volumeGcLog = rootLogger.child({ subsys: "v3/volumeGc" });
     volumeGcScheduler = startVolumeGcScheduler(v3Deps, {
-      logger: {
-        debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
-        info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
-        warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
-        error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
-      },
+      logger: volumeGcLog,
       runOnStart: false,
     });
-    // eslint-disable-next-line no-console
-    console.log("[commercial] v3 volume gc scheduler started (1h tick, banned 7d / no-login 90d)");
+    volumeGcLog.info("scheduler started", {
+      tickSec: 3600, bannedDays: 7, noLoginDays: 90,
+    });
   }
 
   // V3 Phase 3H:orphan reconcile(gateway 启动立刻 + 1h tick)。docker↔DB 双向对账。
   // cfg.OC_ORPHAN_RECONCILE_DISABLED=1 可关闭(运维灾备 / 数据冷恢复时用)。
   let orphanReconcileScheduler: OrphanReconcileScheduler | undefined;
   if (v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
+    const orphanReconcileLog = rootLogger.child({ subsys: "v3/orphanReconcile" });
     orphanReconcileScheduler = startOrphanReconcileScheduler(v3Deps, {
-      logger: {
-        debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
-        info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
-        warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
-        error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
-      },
+      logger: orphanReconcileLog,
       // 默认 runOnStart=true(§3H 明确"gateway 启动 reconcile")
     });
-    // eslint-disable-next-line no-console
-    console.log("[commercial] v3 orphan reconcile scheduler started (1h tick, runs on start)");
+    orphanReconcileLog.info("scheduler started", { tickSec: 3600, runOnStart: true });
   }
 
   // T-63 Phase 2:订阅 docker container events → `container.oom_exited` 告警。

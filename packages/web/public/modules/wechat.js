@@ -43,17 +43,32 @@ function showState(name) {
 
 async function loadBinding() {
   try {
-    const { binding } = await apiGet('/api/wechat/binding')
+    const resp = await apiGet('/api/wechat/binding')
+    const { binding, channel_enabled } = resp || {}
     if (!binding) {
       showState('unbound')
+      // 2026-04-25 audit P0-1:生产 channels.wechat.enabled=false 时用户点"开始"
+      // 会被 409。提前给一行提示让其别白扫。
+      if (channel_enabled === false) {
+        setError('服务端暂未启用微信通道,请联系管理员')
+      } else {
+        setError('')
+      }
       return null
     }
     $('wechat-account').textContent = `account_id=${binding.accountId}\nlogin_user_id=${binding.loginUserId || '(未知)'}`
     const statusColor = binding.status === 'active' ? 'var(--success, #22c55e)'
       : binding.status === 'expired' ? 'var(--danger, #ef4444)'
       : 'var(--fg-muted)'
+    // worker_running=false 但 status=active:DB 记录在,但 manager 没起 worker
+    // (config.enabled=false / 新绑定还没 reconcile / init 失败)。告诉用户消息收不到,
+    // 避免看到绿色 active 以为一切正常(生产 2026-04-25 踩过坑)。
+    const workerWarn = (binding.worker_running === false)
+      ? ` <span style="color:var(--danger, #ef4444);margin-left:8px">· 通道未启用,消息收不到</span>`
+      : ''
     $('wechat-status').innerHTML = `<span style="color:${statusColor}">${binding.status}</span>` +
-      (binding.lastEventAt ? ` · 最近消息 ${new Date(binding.lastEventAt).toLocaleString()}` : '')
+      (binding.lastEventAt ? ` · 最近消息 ${new Date(binding.lastEventAt).toLocaleString()}` : '') +
+      workerWarn
     showState('bound')
     return binding
   } catch (e) {
@@ -91,7 +106,17 @@ async function startPairing() {
     showState('pairing')
     pollLoop(qrcode)
   } catch (e) {
-    setError(`获取二维码失败: ${e?.message || e}`)
+    // WECHAT_DISABLED 是服务端 channels.wechat.enabled=false 时的专属 409 码
+    // (audit 2026-04-25 P0-1),给明确提示而不是通用"获取二维码失败"。
+    // setError 写在 modal 内 banner,另加 toast 是因为弹窗内容被 scroll 遮挡
+    // 或用户视线不在 banner 处时 toast 能即时给反馈(Codex R2 IMPORTANT#4)。
+    if (e?.code === 'WECHAT_DISABLED') {
+      const msg = e.message || '服务端暂未启用微信通道,请联系管理员'
+      setError(msg)
+      toast(msg, 'error')
+    } else {
+      setError(`获取二维码失败: ${e?.message || e}`)
+    }
     showState('unbound')
   }
 }

@@ -132,6 +132,7 @@ import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
 import { requireAdminVerifyDb } from "../admin/requireAdmin.js";
 import { writeAdminAudit } from "../admin/audit.js";
 import { getPool } from "../db/index.js";
+import { isInMaintenance, isActiveAdmin } from "../middleware/maintenanceMode.js";
 
 /**
  * **P0 — v3 multi-tenant leak firewall** (2026-04-22)
@@ -309,8 +310,10 @@ export type CommercialHandler = (
  * 从 req 抽 bearer token(header / cookie)—— 匹配 gateway/server.ts `extractToken`
  * 对 HTTP 请求的 fallback 顺序。WS `sec-websocket-protocol` 不在这里抽,BLOCKED 路径
  * 都是 HTTP REST,没有 WS upgrade。
+ *
+ * 导出给 middleware/maintenanceMode 复用(同一 token 提取逻辑,避免漂移)。
  */
-function extractTokenFromReq(req: IncomingMessage): string {
+export function extractTokenFromReq(req: IncomingMessage): string {
   const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, "") ?? "";
   if (authHeader) return authHeader;
   const cookieHeader = req.headers.cookie ?? "";
@@ -495,6 +498,55 @@ export function createCommercialHandler(
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
     const path = url.pathname;
     const method = req.method ?? "GET";
+
+    // ── V3 Phase 4H+ maintenance 闸门 ────────────────────────────────────
+    //
+    // **必须是 commercial handler 的第一步**,早于 file proxy / BLOCKED 分支:
+    //   - file proxy:`/api/file` / `/api/media/*` 在维护期也得被 503,否则
+    //     付费用户仍能把容器里的文件 drain 出来,维护"停掉所有业务"的意图被绕过。
+    //   - BLOCKED (host-scope P0 防火墙):本来就会 403,但 Codex R1 IMPORTANT:
+    //     维护期语义应是 503 MAINTENANCE 而不是 403 FORBIDDEN —— 前端对这两个码
+    //     的提示 / toast 文案不一样,用户看到 503 会明白"系统正在维护",看到 403
+    //     会以为自己被封了。统一用 503 更好。
+    //   - 仅对"商业化管路径"做闸门:gateway 自身的路径(如 `/ws`、`/healthz`、
+    //     host-scope 读接口等)不在本 handler 处理范围内,isOurs==false 的路径
+    //     fall through 给下层 handler 照常走 —— 维护期 health check 必须能过,
+    //     cloudflared / k8s liveness 才不会误判。
+    //
+    // allowlist(维护期也能通):
+    //   - /api/admin/*        —— admin 后台必须能用(否则 admin 无法关回维护)
+    //   - /api/public/config  —— 前端要读 maintenance 标志才能显示 banner
+    //   - /api/auth/logout    —— 已登录用户应该能登出
+    //   - /api/auth/refresh   —— 不因短暂维护把所有在线用户强踢 token 过期
+    //
+    // 这里**先检查 isOurs**,把 "不关心的路径(如 /ws 、/healthz)" 留给下层。
+    const isOursForMaintenance = prefixes.some((p) => path === p || path.startsWith(p));
+    const isAllowlistForMaintenance =
+      path.startsWith("/api/admin/") ||
+      path === "/api/public/config" ||
+      path === "/api/auth/logout" ||
+      path === "/api/auth/refresh";
+    if (
+      isOursForMaintenance &&
+      !isAllowlistForMaintenance &&
+      (await isInMaintenance())
+    ) {
+      const token = extractTokenFromReq(req);
+      const adminOk = await isActiveAdmin(req, token, deps.jwtSecret);
+      if (!adminOk) {
+        setSecurityHeaders(res);
+        const requestId = ensureRequestId(req);
+        res.setHeader(REQUEST_ID_HEADER, requestId);
+        httpLogger.child({ requestId, route: "__maintenance__", method, path })
+          .warn("maintenance_block");
+        sendError(
+          res, 503, "MAINTENANCE", "服务正在维护中,请稍后再试",
+          requestId, undefined, { "Retry-After": 60 },
+        );
+        incrGatewayRequest("__maintenance__", method, res.statusCode);
+        return true;
+      }
+    }
 
     // ── v3 file proxy PROXY 路径(Stage 4 feature flag ON 时启用)──
     //

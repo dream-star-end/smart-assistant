@@ -151,7 +151,10 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
     }
   }
 
-  return {
+  // 扩展局部类型:ChannelAdapter 公共契约 + 仅 wechat 暴露的 isWorkerRunning
+  // 内省方法(网关侧 duck-type 读取)。
+  type WechatAdapter = ChannelAdapter & { isWorkerRunning(userId: string): boolean }
+  const adapter: WechatAdapter = {
     id: 'wechat',
     name: 'wechat',
     type: 'channel' as const,
@@ -226,7 +229,25 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
       await Promise.all(Array.from(workers.values()).map((w) => w.stop().catch(() => {})))
       workers.clear()
     },
+
+    // Duck-typed introspection for the gateway's /api/wechat/binding GET.
+    // DB 里 status=active 但 manager 没有 worker(比如 enabled=false 跳过了 init)
+    // 时,让前端能显示"通道未启用,消息收不到"而不是假绿灯。
+    // 不进 ChannelAdapter 公共契约 —— 网关侧用本地 type guard 读取。
+    //
+    // 2026-04-25 Codex IMPORTANT#3: 仅 workers.has() 不够 —— WechatWorker loop
+    // 因 auth expire / getupdates 不可恢复 break 或 loop 内未捕获异常而退出时,
+    // map entry 仍然在(只有 unbind/shutdown 才 delete),UI 会假绿灯。改成让
+    // worker 自己汇报 running 状态,任一阶段停摆都会如实反映到 UI 红字提示。
+    isWorkerRunning(userId: string): boolean {
+      const w = workers.get(userId)
+      return w !== undefined && w.isRunning()
+    },
   }
+  // 用扩展局部类型而非 `as ChannelAdapter` 断言 —— 断言会使整个对象文字的类型
+  // 检查变钝,漏掉 ChannelAdapter 本体成员的类型错误。网关侧依然通过 duck-typing
+  // (`{ isWorkerRunning?: ... }`) 读取,不污染 plugin-sdk 的公共契约。
+  return adapter
 }
 
 /**

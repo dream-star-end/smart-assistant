@@ -48,6 +48,12 @@ export class WechatWorker {
   private readonly onInbound: InboundHandler
   private stopFlag = false
   private loopPromise: Promise<void> | null = null
+  /**
+   * true 仅在 loop 实际运行时(auth 过期 / getupdates 不可恢复 / loop 内未捕获异常
+   * 导致 loop 自然结束时立即翻 false)。manager.isWorkerRunning() 读这个标志,
+   * 避免 worker crash 后 workers.has() 仍 true 误导 UI"通道 healthy"。
+   */
+  private running = false
   private contextTokens: Record<string, string>
 
   constructor(opts: WechatWorkerOpts) {
@@ -126,9 +132,21 @@ export class WechatWorker {
   start(): void {
     if (this.loopPromise) return
     this.stopFlag = false
-    this.loopPromise = this.loop().catch((err) => {
-      this.ctx.log.error(`[wechat:${this.userId}] worker crashed: ${err?.message || err}`)
-    })
+    this.running = true
+    this.loopPromise = this.loop()
+      .catch((err) => {
+        this.ctx.log.error(`[wechat:${this.userId}] worker crashed: ${err?.message || err}`)
+      })
+      .finally(() => {
+        // loop 自然结束(auth expired break / getupdates 不可恢复)或异常退出时
+        // 立即翻回 false,让 manager.isWorkerRunning() 如实汇报"通道已停"。
+        this.running = false
+      })
+  }
+
+  /** 真正在跑吗?workers.has() + running + !stopFlag 三段守卫,任一 false 即 UI 给 danger。 */
+  isRunning(): boolean {
+    return this.running && !this.stopFlag
   }
 
   async stop(): Promise<void> {

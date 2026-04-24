@@ -24,6 +24,7 @@ import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.
 import { requireAuth } from "./auth.js";
 import { query } from "../db/queries.js";
 import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLimitRedis } from "../middleware/rateLimit.js";
+import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
@@ -223,6 +224,13 @@ export async function handleRegister(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
+  // V3 Phase 4H+:system_settings.allow_registration=false 时直接 403。
+  // 顺序上放在 rate limit 之前 —— 开关关了就别让这条路径消耗限流额度,
+  // 也避免 401/400 把真正的"注册关闭"语义掩盖掉。
+  const allowReg = await getSystemSetting("allow_registration");
+  if (allowReg.value !== true) {
+    throw new HttpError(403, "REGISTRATION_DISABLED", "已关闭新用户注册");
+  }
   const cfg = deps.rateLimits?.register ?? DEFAULT_RATE_LIMITS.register;
   await enforceRateLimit(deps, cfg, ctx.clientIp);
 

@@ -39,6 +39,7 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
+import { isInMaintenance } from "../middleware/maintenanceMode.js";
 
 // ---------- 协议 / 常量 -----------------------------------------------------
 
@@ -53,6 +54,9 @@ export const CLOSE_BRIDGE = {
   INTERNAL: 1011,
   /** 容器未就绪 / 迁移中(对应 supervisor.ensureRunning 的 503)。前端按 retryAfter 重试。 */
   CONTAINER_UNREADY: 4503,
+  /** V3 Phase 4H+ maintenance_mode=true 时非 admin 的 close code。前端按 retryAfter 重连,
+   *  但在维护期内会持续被拒,直到管理员关闭开关。 */
+  MAINTENANCE: 4504,
 } as const;
 
 /** 入站 / 出站 帧的最大字节数(单帧)。
@@ -376,6 +380,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           log?.error("user-chat-bridge: bad sub claim", { err });
           sendErrorFrame(ws, "UNAUTHORIZED", "bad uid in token");
           try { ws.close(CLOSE_BRIDGE.POLICY, "unauthorized"); } catch { /* */ }
+          return;
+        }
+
+        // 1.5) V3 Phase 4H+ maintenance 闸门:非 admin 在维护模式下不得建立新 chat 会话。
+        //   - admin 判定只看 claims.role —— WS chat 不是"动账/改配置"的破坏性操作,
+        //     按 HTTP 中间件那种 DB double-check 会让每次 handshake 多一次 PG roundtrip。
+        //   - admin 降权立即生效由 HTTP 层(requireAdminVerifyDb)承担;WS 最坏场景是
+        //     JWT 未过期的原 admin 仍能在维护期开聊,JWT 24h 内自然淘汰,可接受。
+        //   - 维护时**不**force close 已在飞的连接:只拦新建。
+        if (claims.role !== "admin" && (await isInMaintenance())) {
+          log?.info("user-chat-bridge: maintenance block", { uid: uid.toString() });
+          sendErrorFrame(ws, "MAINTENANCE", "服务正在维护中,请稍后再试");
+          try {
+            ws.close(
+              CLOSE_BRIDGE.MAINTENANCE,
+              JSON.stringify({ retryAfterSec: 60, reason: "maintenance" }),
+            );
+          } catch { /* */ }
           return;
         }
 

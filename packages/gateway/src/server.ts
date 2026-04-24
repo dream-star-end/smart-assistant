@@ -2379,6 +2379,29 @@ export class Gateway {
     res: ServerResponse,
     pathname: string,
   ): Promise<void> {
+    const userId = this.getUserId(req)
+    // 来自 config;enabled=false 时 manager 从未启动(gateway.ts:88 直接跳过 import)
+    // 此时禁止 pair/* 等会真正调上游 iLink 的写操作,避免用户扫完码绑定成功 —
+    // 实际 worker 没跑 — UI 显示 active 误导用户(生产踩过坑,audit P0-1)。
+    // GET/DELETE binding 仍放行,让用户看到/清理残留。
+    const wechatEnabled = Boolean(
+      (this.deps.config.channels as any)?.wechat?.enabled,
+    )
+    const isPairingWrite =
+      (pathname === '/api/wechat/pair/start' && req.method === 'POST') ||
+      (pathname === '/api/wechat/pair/poll' && req.method === 'POST') ||
+      (pathname === '/api/wechat/pair/cancel' && req.method === 'POST') ||
+      (pathname === '/api/wechat/binding/status' && req.method === 'PUT')
+    if (!wechatEnabled && isPairingWrite) {
+      this.sendJson(res, 409, {
+        error: {
+          code: 'WECHAT_DISABLED',
+          message: '服务端暂未启用微信通道,请联系管理员',
+        },
+      })
+      return
+    }
+
     // Lazy import so the gateway doesn't pull in qrcode/iLink deps unless the
     // WeChat channel is wired up. Importing a workspace package is ~free in
     // Bun — this is purely to avoid hard-coupling the gateway to it.
@@ -2386,7 +2409,12 @@ export class Gateway {
     try {
       pairing = await import('@openclaude/channel-wechat' as any)
     } catch (err) {
-      this.sendError(res, 503, '@openclaude/channel-wechat not available: ' + String(err))
+      this.sendJson(res, 503, {
+        error: {
+          code: 'WECHAT_UNAVAILABLE',
+          message: '@openclaude/channel-wechat not available: ' + String(err),
+        },
+      })
       return
     }
     const {
@@ -2400,8 +2428,6 @@ export class Gateway {
       deleteWechatBinding,
       updateWechatBindingStatus,
     } = await import('@openclaude/storage')
-
-    const userId = this.getUserId(req)
 
     // ── POST /api/wechat/pair/start ──
     if (pathname === '/api/wechat/pair/start' && req.method === 'POST') {
@@ -2449,9 +2475,25 @@ export class Gateway {
     if (pathname === '/api/wechat/binding' && req.method === 'GET') {
       const b = await getWechatBindingByUserId(userId)
       if (!b) {
-        this.sendJson(res, 200, { binding: null })
+        // binding=null 时仍要带 channel_enabled,前端 wechat.js 用这个值决定
+        // 是否渲染"服务端暂未启用微信通道"红字提示(否则 enabled=false 下点
+        // 开始按钮才 409,UX 差 —— Codex R2 IMPORTANT#2)
+        this.sendJson(res, 200, { binding: null, channel_enabled: wechatEnabled })
         return
       }
+      // worker_running:enabled × manager 实际持有该用户的 worker 才算 true。
+      // enabled=false → 必 false;enabled=true 但 manager 没起 worker(新绑定
+      // 还没过 reconcile 或 init 失败)→ false。前端据此显示"通道未启用/消息收不到"。
+      // 读 adapter 时用 duck-typed 方法访问(manager.ts 暴露 isWorkerRunning),
+      // 避免污染 plugin-sdk 的 ChannelAdapter 公共接口。
+      const adapter = this.channels.get('wechat') as unknown as
+        | { isWorkerRunning?: (uid: string) => boolean }
+        | undefined
+      const workerRunning =
+        wechatEnabled &&
+        b.status === 'active' &&
+        typeof adapter?.isWorkerRunning === 'function' &&
+        adapter.isWorkerRunning(userId) === true
       // Redact bot_token from client view
       this.sendJson(res, 200, {
         binding: {
@@ -2461,7 +2503,9 @@ export class Gateway {
           createdAt: b.createdAt,
           updatedAt: b.updatedAt,
           lastEventAt: b.lastEventAt,
+          worker_running: workerRunning,
         },
+        channel_enabled: wechatEnabled,
       })
       return
     }
