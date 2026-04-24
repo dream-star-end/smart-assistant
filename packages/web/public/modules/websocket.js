@@ -2,16 +2,16 @@
 import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=cead231'
+import { clearSessionCookie } from './auth.js?v=d9d4a67'
 import { dbPut } from './db.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
-import { getSession, state } from './state.js'
+import { _clearStoredAccessToken, getSession, state } from './state.js'
 import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance } from './billing.js?v=cead231'
+import { refreshBalance } from './billing.js?v=d9d4a67'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -747,9 +747,9 @@ function _tearDownWsAuth() {
   // 情况是 cookie 自然过期 ≤30d)。
   void clearSessionCookie()
   localStorage.removeItem('openclaude_token')
-  localStorage.removeItem('openclaude_access_token')
   localStorage.removeItem('openclaude_refresh_token')
-  localStorage.removeItem('openclaude_access_exp')
+  // 2026-04-24 "记住我":access token 可能落在 localStorage 或 sessionStorage,两处都清。
+  _clearStoredAccessToken()
   state.token = ''
   state.refreshToken = ''
   state.tokenExp = 0

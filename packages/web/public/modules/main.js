@@ -18,7 +18,7 @@ import {
 } from './util.js'
 
 // ── App state ──
-import { getSession, isSending, setSending, state } from './state.js'
+import { _clearStoredAccessToken, _writeStoredAccessToken, getSession, isSending, setSending, state } from './state.js'
 
 // ── API layer ──
 import { abortInflightRefresh, apiFetch, apiGet, apiJson, authHeaders, clearProactiveRefresh, onAuthExpired, resetAuthExpired, scheduleProactiveRefresh, silentRefresh } from './api.js'
@@ -65,16 +65,16 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
-import { abortInflightMintClear, clearSessionCookie, initAuth, mintSessionCookie, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=cead231'
-// ?v=cead231 bust: websocket.js now imports billing.js for refreshBalance() after
+import { abortInflightMintClear, clearSessionCookie, initAuth, mintSessionCookie, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=d9d4a67'
+// ?v=d9d4a67 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=cead231'
-import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=cead231'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=d9d4a67'
+import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=d9d4a67'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { initUsageStats, openUsageModal } from './usageStats.js?v=cead231'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=d9d4a67'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -95,7 +95,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=cead231'  // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=d9d4a67'  // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
@@ -1092,9 +1092,10 @@ async function _forceLogout({ serverLogout } = {}) {
     void clearSessionCookie()
   }
   localStorage.removeItem('openclaude_token')
-  localStorage.removeItem('openclaude_access_token')
   localStorage.removeItem('openclaude_refresh_token')
-  localStorage.removeItem('openclaude_access_exp')
+  // 2026-04-24 "记住我":access token 可能落在 localStorage 或 sessionStorage,
+  // 两处都清,防止漏清让下次冷启动又被认证。
+  _clearStoredAccessToken()
   // 2026-04-21 安全审计 HIGH#F3:清 per-agent effort pill 缓存,避免同浏览器
   // 切账号时新用户继承老用户的 xhigh/max 选择(服务端 credits 会拦,但 pill
   // 视觉状态会误导用户)。
@@ -1169,7 +1170,7 @@ function showLogin() {
   $('app-view').hidden = true
   if ($('landing-view')) $('landing-view').hidden = true
   document.body.classList.remove('body-landing')
-  if ($('login-error')) $('login-error').style.display = 'none'
+  if ($('login-error')) $('login-error').hidden = true
   // Clear v3 commercial auth-mode form fields if present
   for (const id of [
     'auth-login-email','auth-login-password',
@@ -1568,7 +1569,7 @@ async function loadChangelog() {
     // Show version in sidebar
     if (_changelogData.currentVersion) {
       const vEl = $('app-version')
-      if (vEl) vEl.textContent = `v${_changelogData.currentVersion}`
+      if (vEl) vEl.textContent = _changelogData.currentVersion
     }
     // 2026-04-21 安全审计 HIGH#F1 修复:用户桶原用 state.token 末 8 字节,
     // 但 JWT 每次 refresh 会换,导致同一用户的"已读"状态反复丢失;更糟的是
@@ -1600,16 +1601,16 @@ function openChangelog() {
     content.innerHTML = _changelogData.releases.map((r, i) => `
       <div class="changelog-entry${i === 0 ? ' latest' : ''}">
         <div class="changelog-entry-head">
-          <span class="changelog-version-tag">v${htmlSafeEscape(r.version)}</span>
+          <span class="changelog-version-tag">${htmlSafeEscape(r.version)}</span>
           <span class="changelog-date">${htmlSafeEscape(r.date)}</span>
         </div>
         <h4 class="changelog-title">${htmlSafeEscape(r.title)}</h4>
         <ul class="changelog-list">
-          ${r.highlights.map(h => `<li>${htmlSafeEscape(h)}</li>`).join('')}
+          ${r.items.map(h => `<li>${htmlSafeEscape(h)}</li>`).join('')}
         </ul>
       </div>
     `).join('')
-    versionEl.textContent = `当前版本 v${_changelogData.currentVersion}`
+    versionEl.textContent = `当前版本 ${_changelogData.currentVersion}`
   }
   // Mark as seen (scoped by stable user.id; 未登录用户不写入避免 key 污染)
   if (_changelogData?.currentVersion && state.userId) {
@@ -2010,7 +2011,7 @@ async function init() {
   // main.js 只负责"登录成功后该做什么"——清 IDB、装 access token、连 ws、起 app view。
   // refresh token 由 server 通过 Set-Cookie(HttpOnly oc_rt)下发,JS 读不到,这里
   // 也不要尝试读 refresh_token 字段(后端已经从响应里拿掉)。
-  setAuthSuccessHandler(async ({ access_token, access_exp }) => {
+  setAuthSuccessHandler(async ({ access_token, access_exp, remember }) => {
     // 2026-04-22 Codex R3:login 前先 abort 可能在飞的 refresh(防止旧身份的
     // Set-Cookie 覆盖新账号刚拿到的 oc_rt),再写新 state.token + bump epoch。
     abortInflightRefresh()
@@ -2024,8 +2025,9 @@ async function init() {
     // login,旧 token 既无用又是 XSS 攻击面,立刻零化。
     state.refreshToken = ''
     try { localStorage.removeItem('openclaude_refresh_token') } catch {}
-    localStorage.setItem('openclaude_access_token', access_token)
-    if (access_exp != null) localStorage.setItem('openclaude_access_exp', String(access_exp))
+    // 2026-04-24 "记住我":remember=true(默认)→ localStorage(持久),
+    // false → sessionStorage(关窗口即清,与 cookie 同生命周期)。
+    _writeStoredAccessToken(access_token, access_exp, remember !== false)
     // Re-arm 401 handler — next token expiry will fire it again.
     resetAuthExpired()
     // V3 file-proxy 身份切换 race 硬化(Codex R2 BLOCKER):先 await 清旧 oc_session,
