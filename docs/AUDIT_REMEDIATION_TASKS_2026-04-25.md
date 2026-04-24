@@ -38,12 +38,13 @@
   2. 代码侧增加防御:`/api/wechat/pair/start` 在 `enabled=false` 时直接 409 `WECHAT_DISABLED`;前端 wechat.js 解析该码显示"服务端未启用微信通道,请联系管理员"
   3. `/api/wechat/binding` 返回增加 `worker_running: boolean` 字段;UI"已绑定"文案根据该字段给出 warning 样式
 - **验证**:生产扫码绑定 → 从 iLink 发一条 test 消息 → 日志里看到 worker poll → DB `last_event_at` 刷新 → 前端能收到 inbound 帧
-- **状态**: `code-done,待部署验证`
+- **状态**: `已上线 v3-20260424T2005Z-8399315`
 - **实施记录 (2026-04-25)**:
   - gateway `/api/wechat/pair/start` 已接 409 `WECHAT_DISABLED`;`/api/wechat/binding` 在未绑定时也返回 `channel_enabled`
   - `worker_running` = `enabled × manager.isWorkerRunning(uid)`,Codex IMPORTANT#3 后改为 worker 自报 `running` 标志,crash 后 UI 红字不再假绿
   - 前端 `modules/wechat.js` 同时 setError + toast,避免 banner 被遮时用户无感知
   - 最后一轮 Codex: PASS (NITs 已吸纳或记录)
+  - **验证**:远端仍为 `channels.wechat.enabled=false`,gateway/modules/wechat.js 中 `WECHAT_DISABLED`/`channel_enabled` 代码均已就位;真实扫码 E2E 待下次有登录 session 时跑(需真实微信号)
 
 ### P0-2 `maintenance_mode` / `allow_registration` 中间件接线
 - **问题**:`systemSettings.ts` allowlist 里两个 key 都在,admin 能写、能 audit,但全仓 grep 在 `src/http` 和 `src/middleware` 里 **0 命中**,开了等于装饰
@@ -53,13 +54,17 @@
   2. `/api/auth/register` 处理函数入口读 `allow_registration`,false 时 403 `REGISTRATION_DISABLED`
   3. 单元测试覆盖 on/off 两态 + admin 豁免;前端在全局 error handler 渲染友好文案
 - **验证**:登录 admin → 开 maintenance_mode → curl 普通用户 API 得 503 → admin 请求仍通;关闭后恢复
-- **状态**: `code-done,待部署验证`
+- **状态**: `已上线 v3-20260424T2005Z-8399315,生产验证 PASS`
 - **实施记录 (2026-04-25)**:
   - 新 `src/middleware/maintenanceMode.ts`:`isInMaintenance()` 60s 缓存 + fail-open;`isActiveAdmin()` JWT+DB 双查,任何异常 swallow→false
   - Codex IMPORTANT#1 后 gate 上提到 `commercialHandler` 顶部(先于 file proxy + BLOCKED),避免付费用户在维护期仍能拉文件
   - WS `userChatBridge` 也挡住普通用户(close code 4504),admin 走 claim-only bypass(JWT 24h TTL + 非破坏性操作的权衡)
   - `/api/auth/register` 在 rate-limit 之前读 `allow_registration`,false 时直接 403 `REGISTRATION_DISABLED`
   - 6 个单元测试覆盖 fail-open/cache/_clear/空 token/乱写 token/非法签名,全部通过
+  - **生产验证 2026-04-25**:
+    - `UPDATE system_settings SET value='true' WHERE key='maintenance_mode'` → 62s 后 anon `POST /api/auth/session` 返回 `503 MAINTENANCE` (含 `Retry-After: 60`、`X-Request-Id`);`GET /api/public/config` 仍 200(allowlist 正确)
+    - `maintenance_mode=false` + `allow_registration=false` → anon `POST /api/auth/register` 返回 `403 REGISTRATION_DISABLED`
+    - 关闭所有开关后正常 401 恢复
 
 ### P0-3 Admin 订单管理页面
 - **问题**:`orders` 表完整,`idx_orders_status` partial index 就位,但 `admin/` 下无 `orders.ts`、无对应路由;运营查 "24h 失败 / pending 超时 / callback 冲突" 只能直连 PG
@@ -180,10 +185,11 @@
 ### P2-17 消灭非 JSON 日志噪音
 - **问题**:`[v3/idleSweep] scan {...}` 每分钟一条,jq parse fail
 - **方案**:改走 logger.debug,prod level info 不输出;或 grep 找所有这类 console.log 统一改
-- **状态**: `code-done,待部署验证`
+- **状态**: `已上线 v3-20260424T2005Z-8399315,生产验证 PASS`
 - **实施记录 (2026-04-25)**:
   - `src/index.ts` 中 idleSweep / volumeGc / orphanReconcile 三个 scheduler inline console shim 改用 `rootLogger.child({ subsys: 'v3/idleSweep' | 'v3/volumeGc' | 'v3/orphanReconcile' })`
   - 现在 journalctl 可 `jq 'select(.subsys=="v3/idleSweep")'` 过滤
+  - **生产验证 2026-04-25**:`/var/log/openclaude.log` 20:05 重启后 `[v3/idleSweep] scan` 噪音 0 条,`scheduler started` 以 JSON 格式写入(带 `subsys`/`tickSec`/`idleCutoffMin` 字段)。per-tick scan log 现在走 `logger.debug`,prod info 级别下正常沉默
 
 ### P2-18 Deploy 多代 snapshot
 - **问题**:只 1 代 .prev,连做两次就失去前版回滚
