@@ -89,7 +89,7 @@ export interface CronBridgeEvent {
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
   private maxIdleMsCron = 30 * 60 * 1000 // 30 min for cron/task sessions
-  private maxIdleMsChat = 2 * 60 * 60 * 1000 // 2 hours for webchat sessions (resume-map persists for reconnect)
+  private maxIdleMsChat = 30 * 60 * 1000 // 30 min for webchat sessions — aggressive eviction to curb subprocess accumulation on small personal VPS (bun+playwright+mcp stack per peer); resume-map (7d persist) handles cold reconnect via --resume
   /** @deprecated Use eventBus 'task.created'/'task.deleted' instead. Kept for backward compat. */
   public onCronBridge?: (event: CronBridgeEvent) => Promise<void>
   /** Called when a 401 auth error is detected — gateway should trigger immediate token refresh */
@@ -1226,8 +1226,9 @@ export class SessionManager {
       const now = Date.now()
       const toEvict: string[] = []
       for (const [key, s] of this.sessions) {
-        // Cron/task sessions (contain ':cron:' or ':task:') use short idle timeout
-        // Webchat/user sessions use long idle timeout (7 days)
+        // Cron/task sessions (contain ':cron:' or ':task:') and webchat sessions
+        // both use 30 min idle timeout. Webchat's resume-map persists for 7 days
+        // so an evicted webchat subprocess can cold-start via --resume on next message.
         const isTempSession = key.includes(':cron:') || key.includes(':task:')
         const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
         // Use the more recent of lastUsedAt and runner.lastActivityAt to avoid
