@@ -177,6 +177,12 @@ import {
 } from './commands.js'
 import { getEffortForSubmit, initModePills, renderModePills, clearEffortOnLogout } from './effortMode.js'
 
+// Signal to the inline boot-watchdog in index.html that the module graph loaded.
+// If ANY static import above fails (typically CF edge cache mismatch after a
+// deploy where main.js?v=NEW imports a bare-URL state.js that CF still serves
+// old), this line is never reached → watchdog fires at T+15s and self-heals.
+window.__ocBooted = true
+
 // ═══════════════════════════════════════════════════════════
 // 1. Wire late-bound dependencies
 // ═══════════════════════════════════════════════════════════

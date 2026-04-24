@@ -68,6 +68,88 @@ for arg in "$@"; do
   esac
 done
 
+# ── Load CF credentials from .env.keys (optional; purge is graceful-degrade) ──
+# Only read the two specific vars we need — don't `source` the whole file
+# to avoid polluting the deploy script's env with unrelated keys.
+CLOUDFLARE_API_TOKEN=""
+CLOUDFLARE_ZONE_ID_CLAUDEAI=""
+ENV_KEYS_PATH="/root/.openclaude/.env.keys"
+if [[ -f "$ENV_KEYS_PATH" ]]; then
+  CLOUDFLARE_API_TOKEN=$(grep -E '^CLOUDFLARE_API_TOKEN=' "$ENV_KEYS_PATH" | head -1 | cut -d= -f2- || true)
+  CLOUDFLARE_ZONE_ID_CLAUDEAI=$(grep -E '^CLOUDFLARE_ZONE_ID_CLAUDEAI=' "$ENV_KEYS_PATH" | head -1 | cut -d= -f2- || true)
+fi
+
+# ── Shared: CF edge cache purge ──
+# Why this exists: SW's `cache: 'no-store'` only bypasses the browser's HTTP
+# cache, NOT CF's edge cache. Versioned URLs (main.js?v=HASH) miss CF cleanly,
+# but bare-URL imports inside main.js (e.g. `import './state.js'`) hit the edge
+# and get the OLD file for up to 4h (max-age=14400). Result: new main.js calls
+# a symbol the old state.js doesn't export → module graph fails → black screen.
+# This purge tells CF to drop the cached copies so the next fetch returns new.
+#
+# Failure mode: warn-only. Code is already live at this point; purge failing
+# just means users might see stale cache for the normal TTL (4h). We don't want
+# to mark the deploy as failed and block the git tag / smoke flow over a cache op.
+cf_purge() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "   (--dry-run, skipping CF purge)"
+    return 0
+  fi
+  if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ZONE_ID_CLAUDEAI" ]]; then
+    echo "   WARN: CLOUDFLARE_API_TOKEN / CLOUDFLARE_ZONE_ID_CLAUDEAI not set in $ENV_KEYS_PATH — skipping CF purge" >&2
+    echo "         new deploys may take up to 4h (CF edge max-age) to propagate fully." >&2
+    return 0
+  fi
+
+  echo "-- purging CF edge cache --"
+
+  # Extract the SHELL array literals from sw.js. Scoped strictly to the
+  # `const SHELL = [ ... ]` block so we don't pick up unrelated path strings
+  # ('/api/', '/ws', '/healthz', etc.) that appear in the fetch handler.
+  local shell_paths=()
+  mapfile -t shell_paths < <(
+    awk '/^const SHELL = \[/,/^\]/' packages/web/public/sw.js \
+      | grep -oE "'/[^']*'" | tr -d "'" | sort -u
+  )
+  # Fallback guard: if the parser picked up too few items, format likely changed.
+  # Refuse to run a degenerate purge (which would leave most files stale anyway).
+  if (( ${#shell_paths[@]} < 5 )); then
+    echo "   WARN: parsed only ${#shell_paths[@]} paths from sw.js SHELL — format may have changed; skipping purge" >&2
+    return 0
+  fi
+
+  # URLs to purge = SHELL entries + a few that are served but not in SHELL.
+  local urls=()
+  local p
+  for p in "${shell_paths[@]}"; do
+    urls+=("https://claudeai.chat$p")
+  done
+  # admin.html is served but not in SHELL (admins only, no SW precache).
+  urls+=("https://claudeai.chat/admin.html")
+
+  echo "   purging ${#urls[@]} URLs in batches of 30"
+
+  # CF's purge_cache endpoint caps `files` at 30 per call. Batch it.
+  local i batch body_files resp
+  for ((i=0; i<${#urls[@]}; i+=30)); do
+    batch=("${urls[@]:i:30}")
+    body_files=$(printf '"%s",' "${batch[@]}" | sed 's/,$//')
+    resp=$(curl -sS -X POST \
+      "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID_CLAUDEAI/purge_cache" \
+      -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data "{\"files\":[$body_files]}" 2>&1) || {
+        echo "   WARN: CF purge batch $((i/30+1)) curl failed: $resp" >&2
+        continue
+      }
+    # CF returns {"success":true,...} on happy path.
+    if ! grep -q '"success":true' <<<"$resp"; then
+      echo "   WARN: CF purge batch $((i/30+1)) returned non-success: $resp" >&2
+    fi
+  done
+  echo "   CF purge done"
+}
+
 # ── Shared: remote WS safety check ──
 # Returns the current active WS count; bails if >1 unless FORCE.
 remote_safety_check() {
@@ -328,6 +410,14 @@ if ! remote_restart_and_healthz; then
   echo "   rollback: scripts/deploy-v3.sh --rollback" >&2
   exit 1
 fi
+
+# ── 8.5. CF edge cache purge ──
+# After healthz passes (= new code is live), tell CF to drop cached copies of
+# the app shell so users stop getting the 4h-stale pre-deploy versions. Without
+# this, bare-URL module imports (import './state.js') keep hitting edge cache
+# and loading the old file, causing module-graph load failures → black screen.
+# Graceful-degrade: failure here doesn't block smoke/tag (code is already live).
+cf_purge
 
 # ── 9. Smoke test ──
 echo "-- running smoke-v3 --"

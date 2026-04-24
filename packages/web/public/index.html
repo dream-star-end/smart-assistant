@@ -11,6 +11,29 @@
 <meta name="apple-mobile-web-app-title" content="OpenClaude" />
 <meta name="mobile-web-app-capable" content="yes" />
 <title>OpenClaude</title>
+<!--
+  Boot-watchdog: if main.js fails to set window.__ocBooted within BOOT_TIMEOUT_MS,
+  assume a broken module graph (typically CF edge cache mismatch after a deploy
+  where main.js?v=NEW imports an un-versioned state.js that CF still serves old) —
+  unregister SW + clear caches + reload once. sessionStorage lock prevents loops
+  on a genuine bug where reload won't help. See deploy-v3.sh cf_purge() for the
+  root-cause fix; this is a client-side backstop.
+-->
+<script>
+(function(){
+  var BOOT_TIMEOUT_MS = 15000;
+  setTimeout(function(){
+    if (window.__ocBooted) return;
+    try { if (sessionStorage.getItem('__oc_self_heal__')) return; } catch(e) {}
+    try { sessionStorage.setItem('__oc_self_heal__', '1'); } catch(e) {}
+    Promise.resolve()
+      .then(function(){ return navigator.serviceWorker && navigator.serviceWorker.getRegistrations().then(function(rs){ return Promise.all(rs.map(function(r){ return r.unregister(); })); }); })
+      .then(function(){ return window.caches && caches.keys().then(function(ks){ return Promise.all(ks.map(function(k){ return caches.delete(k); })); }); })
+      .catch(function(){})
+      .then(function(){ location.reload(); });
+  }, BOOT_TIMEOUT_MS);
+})();
+</script>
 <link rel="manifest" href="/manifest.json" />
 <link rel="icon" type="image/svg+xml" href="/icon.svg" />
 <link rel="apple-touch-icon" href="/icon.svg" />
