@@ -245,10 +245,26 @@
   2. `/api/admin/diagnostics` 返 `{ outbox_pending, outbox_failed, inflight_by_uid, accounts_healthy_pct, last_deploy_tag }`
 - **验证**:CSV 能用 Excel 打开;diagnostics 数值和手工 SQL 一致
 
-### P2-21 Alert outbox "重发失败项"按钮 + ack 三态
-- **方案**:
-  1. `POST /api/admin/alerts/outbox/:id/retry` 把 status=failed 行重置 pending + next_attempt_at=NOW
-  2. Rule state 加 `acked` 中间态,admin UI 支持 open/ack/resolved 流转
+### P2-21 Alert outbox "重发失败项"按钮 + ack 三态 ✅ DONE 2026-04-25 (M8.3 / `v3-20260425T0439Z-c7b2b61`)
+
+- **设计要点**:
+  - **outbox retry**:`POST /api/admin/alerts/outbox/:id/retry` 把 `status=failed && attempts<MAX_ATTEMPTS` 行的 `next_attempt_at` 拉到 NOW(),让 dispatcher 下个 tick 立刻重试。**不重置 attempts**,预算靠 `MAX_ATTEMPTS=10` 卡;dead-letter 行(attempts ≥ 10)→ 409 NOT_RETRYABLE。`status=pending/sent/suppressed/skipped` 一律 NOT_RETRYABLE(避免重置 sent / 撞 suppressed 语义)
+  - **rule firing ack 三态**:rule_state 表加 `acked / acked_at / acked_by`(BIGINT,无 FK,删账号不挂)。UI 从 `(firing, acked)` 推 `'open' / 'acked' / 'resolved'`;`POST /api/admin/alerts/rules/:rule_id/ack` 写 `acked=true, acked_by=adminId` + 一条 `alert_rule.ack` audit
+  - **transitionRuleState 翻转清 ack**:`false→true` 必须清(否则新一轮告警继承旧 ack);`true→false` 也清(resolved 状态下 ack 无意义);no-op(firing 未变)保留 ack(已确认在处理中的语义)
+  - **idempotent ack**:已 ack 的二次点击返 `alreadyAcked=true`,**不刷 acked_at/acked_by 也不写新 audit**(首次 audit 已定位"谁何时介入",重复点不必重复记)
+  - **错误码**:
+    - retry 不可重试 → 409 `NOT_RETRYABLE`(行不存在 / 非 failed / 超预算)
+    - ack 非 firing → 409 `NOT_FIRING`(rule_state 不存在 / firing=false)
+    - 无效 id 格式 → 400 `VALIDATION`
+  - **路由 dispatcher 层级**:`pathPrefix '/api/admin/alerts/outbox/'` + handler 自校验 `/retry` 后缀;`/rules/` 同理 `/ack` 后缀。和现有 `/channels/` `/silences/` prefix 不冲突
+- **migration**:`0036_admin_alert_rule_state_ack.sql` `ALTER TABLE … ADD COLUMN acked NOT NULL DEFAULT FALSE, acked_at, acked_by`(NULL 兼容旧行)
+- **验证**:
+  - tsc 无新错误(只剩 runtimeEntrypointPolicy.test.ts 的预存 TS5097)
+  - smoke 5/5 PASS(`v3-20260425T0439Z-c7b2b61`)
+  - 远端 `\d admin_alert_rule_state` 确认列已加,`schema_migrations` 含 `0036_admin_alert_rule_state_ack`
+  - `POST /api/admin/alerts/outbox/1/retry` 无 token → 401 UNAUTHORIZED;`POST /api/admin/alerts/rules/x.y/ack` 同
+  - 集成测试覆盖 `retryOutbox`(5 case)+ `ackRule`(4 case,含 idempotent 不写 audit)+ `transitionRuleState` ack 重置(no-op 保留 / true→false / false→true 各 1)+ HTTP smoke(invalid id 400 / NOT_RETRYABLE 409 / NOT_FIRING 409 / 401 / happy path)
+- **Codex review**:Plan v2 PASS(3 IMPORTANT 全采纳 — retryOutbox 返回 `{retried}`、ack 写 audit、acked_by BIGINT 兼容 string admin id);Code review IMPORTANT(缺测试)→ 补完后 PASS,2 个 NIT 修(ensureAdmin 顺手 SET status=active、401 收紧不再 ||403)
 
 ### P2-22 Containers 列表加 host 列 + 按 host 过滤
 - **方案**:admin.js 列表新增 host_name 列(关联 containers.compute_host_id → compute_hosts.name);hosts tab 加 "per-host 用户分布 top 5"
