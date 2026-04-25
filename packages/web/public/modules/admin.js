@@ -3569,11 +3569,12 @@ async function renderAlertsTab() {
 
   view().innerHTML = `
     <div class="panel">
-      <h2>告警通道 <small>微信 iLink,只发给绑定了的超管</small></h2>
+      <h2>告警通道 <small>微信 iLink / Telegram,只发给绑定了的超管</small></h2>
       <div class="toolbar">
         <button class="btn" id="al-ch-refresh">刷新</button>
         <span class="spacer"></span>
-        <button class="btn btn-primary" id="al-ch-bind">+ 绑定微信</button>
+        <button class="btn btn-primary" id="al-ch-bind">+ 绑定 iLink 微信</button>
+        <button class="btn btn-primary" id="al-ch-tg">+ 添加 Telegram</button>
       </div>
       <div id="al-channels">加载中…</div>
     </div>
@@ -3633,6 +3634,7 @@ async function renderAlertsTab() {
 
   $('al-ch-refresh').addEventListener('click', _refreshAlertChannels)
   $('al-ch-bind').addEventListener('click', _openBindIlinkModal)
+  $('al-ch-tg').addEventListener('click', _openCreateTelegramModal)
   $('al-ob-refresh').addEventListener('click', () => {
     ALERTS_STATE.outboxFilter.event_type = $('al-ob-event').value
     ALERTS_STATE.outboxFilter.severity = $('al-ob-severity').value
@@ -3690,11 +3692,16 @@ function _renderChannelRow(c) {
   const enabled = c.enabled
     ? '<span class="badge ok">ON</span>'
     : '<span class="badge muted">OFF</span>'
+  const typeLabel = c.channel_type === 'ilink_wechat'
+    ? '<span class="badge muted">微信 iLink</span>'
+    : c.channel_type === 'telegram'
+      ? '<span class="badge muted">Telegram</span>'
+      : `<span class="badge muted">${escapeHtml(c.channel_type)}</span>`
   return `
     <tr>
       <td class="mono">${escapeHtml(c.id)}</td>
       <td>${escapeHtml(c.label)}</td>
-      <td class="mono">${escapeHtml(c.channel_type)}</td>
+      <td>${typeLabel}</td>
       <td>${enabled}</td>
       <td><span class="badge ${c.severity_min === 'critical' ? 'danger' : c.severity_min === 'warning' ? 'warn' : 'muted'}">${escapeHtml(c.severity_min)}</span></td>
       <td>${subs}</td>
@@ -3706,7 +3713,7 @@ function _renderChannelRow(c) {
         <button data-act="edit" data-id="${escapeHtml(c.id)}">编辑</button>
         <button data-act="${c.enabled ? 'disable' : 'enable'}" data-id="${escapeHtml(c.id)}">${c.enabled ? '停用' : '启用'}</button>
         <button data-act="test" data-id="${escapeHtml(c.id)}">测试</button>
-        ${c.activation_status === 'error' ? `<button data-act="rebind" data-id="${escapeHtml(c.id)}" title="把 activation_status=error 推回 pending,worker 会重新 long-poll。不重新扫码。">重新激活</button>` : ''}
+        ${c.activation_status === 'error' && c.channel_type === 'ilink_wechat' ? `<button data-act="rebind" data-id="${escapeHtml(c.id)}" title="把 activation_status=error 推回 pending,worker 会重新 long-poll。不重新扫码。">重新激活</button>` : ''}
         <button data-act="delete" data-id="${escapeHtml(c.id)}" class="btn-danger">删</button>
       </td>
     </tr>
@@ -3714,6 +3721,13 @@ function _renderChannelRow(c) {
 }
 
 function _activationBadge(c) {
+  // Telegram 通道没有 context_token / pending 等 iLink 专属阶段 —— 创建即 active,
+  // 只有 permanent-error (401/403/404) 会把 activation_status 推到 error。
+  if (c.channel_type === 'telegram') {
+    if (c.activation_status === 'active') return '<span class="badge ok">就绪</span>'
+    if (c.activation_status === 'disabled') return '<span class="badge muted">disabled</span>'
+    return `<span class="badge danger" title="${escapeHtml(c.last_error || '')}">${escapeHtml(c.activation_status)}</span>`
+  }
   if (c.activation_status === 'active' && c.has_context_token) {
     return '<span class="badge ok">就绪</span>'
   }
@@ -3964,6 +3978,96 @@ async function _openBindIlinkModal() {
   if (!abort.aborted) {
     $('al-qr-status').innerHTML = '<span style="color:var(--warn)">超时,请重新打开</span>'
   }
+}
+
+async function _openCreateTelegramModal() {
+  // Telegram 通道没有扫码流程 —— admin 从 BotFather 拿到 bot_token,
+  // 再把 bot 拉进目标 chat 拿到 chat_id(数字 ID 或 @username),直接填表创建。
+  // severity_min 默认 warning;event_types 留空 = 订阅全部(跟 iLink 一致)。
+  const groups = {}
+  for (const e of (ALERTS_STATE.events || [])) {
+    groups[e.group] = groups[e.group] || []
+    groups[e.group].push(e)
+  }
+  const groupNames = Object.keys(groups)
+  const eventsHtml = groupNames.length === 0
+    ? '<div class="muted" style="font-size:12px">事件目录未加载</div>'
+    : groupNames.map((g) => `
+        <div style="margin-bottom:6px">
+          <div style="font-weight:600;font-size:12px;color:var(--muted);margin-bottom:2px">${escapeHtml(g)}</div>
+          ${groups[g].map((e) => `
+            <label style="display:inline-block;margin-right:8px;font-weight:normal;font-size:12px">
+              <input type="checkbox" data-event="${escapeHtml(e.event_type)}">
+              ${escapeHtml(e.event_type)}
+            </label>
+          `).join('')}
+        </div>
+      `).join('')
+  openModal(`
+    <h3>添加 Telegram 告警通道</h3>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:10px;line-height:1.5">
+      步骤:<br>
+      1. 用 Telegram 找 <code>@BotFather</code>,<code>/newbot</code> 拿 bot_token (形如 <code>123456:ABC-xxx</code>)<br>
+      2. 把 bot 添加到目标 chat / channel,或直接跟它私聊<br>
+      3. 获取 chat_id:数字 ID(私聊填数字,群聊填 <code>-100…</code>)或 <code>@channelusername</code>
+    </div>
+    <div class="form-row">
+      <label>标签 label(必填,1..64)</label>
+      <input type="text" id="al-tg-label" maxlength="64" placeholder="例如 ops-alert-tg" />
+    </div>
+    <div class="form-row">
+      <label>Bot Token(必填)</label>
+      <input type="password" id="al-tg-token" autocomplete="new-password" placeholder="123456:ABC-xxx…" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>Chat ID(必填,数字 或 @username)</label>
+      <input type="text" id="al-tg-chat" maxlength="64" placeholder="-1001234567890 或 @my_channel" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>最低严重度</label>
+      <select id="al-tg-severity">
+        <option value="info">info</option>
+        <option value="warning" selected>warning</option>
+        <option value="critical">critical</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>订阅事件(留空 = 全部)</label>
+      <div id="al-tg-events" style="max-height:180px;overflow:auto;border:1px solid var(--border);padding:8px;border-radius:4px">
+        ${eventsHtml}
+      </div>
+    </div>
+    <div class="form-actions">
+      <button id="al-tg-cancel">取消</button>
+      <button class="btn-primary" id="al-tg-ok">创建</button>
+    </div>
+  `)
+  $('al-tg-cancel').addEventListener('click', closeModal)
+  $('al-tg-ok').addEventListener('click', async (ev) => {
+    const label = $('al-tg-label').value.trim()
+    const bot_token = $('al-tg-token').value.trim()
+    const chat_id = $('al-tg-chat').value.trim()
+    const severity_min = $('al-tg-severity').value
+    if (!label) { toast('label 必填', 'danger'); return }
+    if (!bot_token) { toast('bot_token 必填', 'danger'); return }
+    if (!chat_id) { toast('chat_id 必填', 'danger'); return }
+    const event_types = []
+    for (const cb of $('al-tg-events').querySelectorAll('input[type=checkbox]')) {
+      if (cb.checked) event_types.push(cb.dataset.event)
+    }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        const r = await apiJson('POST', '/api/admin/alerts/channels/telegram', {
+          label, bot_token, chat_id, severity_min, event_types,
+        })
+        toast(`通道已创建: ${r.channel?.label ?? label}`)
+        closeModal()
+        _refreshAlertChannels()
+      } catch (e) {
+        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  })
 }
 
 // ── outbox ──────────────────────────────────────────────────────────

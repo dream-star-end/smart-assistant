@@ -13,88 +13,92 @@
  *     admin 禁用 → disabled
  */
 
-import type { PoolClient } from "pg";
-import { query, tx, type QueryRunner } from "../db/queries.js";
-import { encrypt, decrypt, AeadError } from "../crypto/aead.js";
-import { loadKmsKey } from "../crypto/keys.js";
-import { writeAdminAudit } from "./audit.js";
+import type { PoolClient } from 'pg'
+import { query, tx, type QueryRunner } from '../db/queries.js'
+import { encrypt, decrypt, AeadError } from '../crypto/aead.js'
+import { loadKmsKey } from '../crypto/keys.js'
+import { writeAdminAudit } from './audit.js'
 
-export type ChannelType = "ilink_wechat";
-export type Severity = "info" | "warning" | "critical";
-export type ActivationStatus = "pending" | "active" | "disabled" | "error";
+export type ChannelType = 'ilink_wechat' | 'telegram'
+export type Severity = 'info' | 'warning' | 'critical'
+export type ActivationStatus = 'pending' | 'active' | 'disabled' | 'error'
 
 export interface AlertChannelRow {
-  id: string;
-  admin_id: string;
-  channel_type: ChannelType;
-  label: string;
-  enabled: boolean;
-  severity_min: Severity;
-  event_types: string[];
+  id: string
+  admin_id: string
+  channel_type: ChannelType
+  label: string
+  enabled: boolean
+  severity_min: Severity
+  event_types: string[]
   /** iLink bot 身份 */
-  ilink_account_id: string | null;
+  ilink_account_id: string | null
   /** 扫码者的 wechat ilink_user_id */
-  ilink_login_user_id: string | null;
+  ilink_login_user_id: string | null
   /** 告警接收端(一般等于 ilink_login_user_id) */
-  target_sender_id: string | null;
-  activation_status: ActivationStatus;
-  last_inbound_at: string | null;
-  last_send_at: string | null;
-  last_error: string | null;
+  target_sender_id: string | null
+  activation_status: ActivationStatus
+  last_inbound_at: string | null
+  last_send_at: string | null
+  last_error: string | null
   /** 是否已捕获 context_token(用于 UI 显示"可发送") */
-  has_context_token: boolean;
-  created_at: string;
-  updated_at: string;
+  has_context_token: boolean
+  /** Telegram chat_id(数字或 @username);non-telegram 行为 null */
+  tg_chat_id: string | null
+  created_at: string
+  updated_at: string
 }
 
 export class ChannelNotFoundError extends Error {
   constructor(id: string | number | bigint) {
-    super(`alert channel not found: ${id}`);
-    this.name = "ChannelNotFoundError";
+    super(`alert channel not found: ${id}`)
+    this.name = 'ChannelNotFoundError'
   }
 }
 
 /** 解密后给 worker 用的完整 secrets;调用后 token.fill(0) 风险由调用方自理。 */
 export interface ChannelSecrets {
-  botToken: string;
-  contextToken: string | null;
-  getUpdatesBuf: string;
-  targetSenderId: string | null;
-  ilinkAccountId: string | null;
+  botToken: string
+  contextToken: string | null
+  getUpdatesBuf: string
+  targetSenderId: string | null
+  ilinkAccountId: string | null
+  /** Telegram 通道有值;iLink 通道为 null。 */
+  tgChatId: string | null
 }
 
-const LABEL_RE = /^[\p{L}\p{N} _./:()\-]{1,64}$/u;
-const EVENT_TYPE_RE = /^[a-z][a-z0-9_]*\.[a-z0-9_]+$/;
+const LABEL_RE = /^[\p{L}\p{N} _./:()\-]{1,64}$/u
+const EVENT_TYPE_RE = /^[a-z][a-z0-9_]*\.[a-z0-9_]+$/
 
 function normalizeEventTypes(raw: unknown): string[] {
-  if (!Array.isArray(raw)) throw new RangeError("event_types must be array");
-  const out: string[] = [];
+  if (!Array.isArray(raw)) throw new RangeError('event_types must be array')
+  const out: string[] = []
   for (const x of raw) {
-    if (typeof x !== "string") throw new RangeError("event_types item must be string");
-    if (!EVENT_TYPE_RE.test(x)) throw new RangeError(`invalid event_type: ${x}`);
-    out.push(x);
+    if (typeof x !== 'string') throw new RangeError('event_types item must be string')
+    if (!EVENT_TYPE_RE.test(x)) throw new RangeError(`invalid event_type: ${x}`)
+    out.push(x)
   }
   // 去重保持顺序
-  return Array.from(new Set(out));
+  return Array.from(new Set(out))
 }
 
 function validateSeverity(s: unknown): Severity {
-  if (s !== "info" && s !== "warning" && s !== "critical") {
-    throw new RangeError("severity_min must be info|warning|critical");
+  if (s !== 'info' && s !== 'warning' && s !== 'critical') {
+    throw new RangeError('severity_min must be info|warning|critical')
   }
-  return s;
+  return s
 }
 
 function validateLabel(s: unknown): string {
-  if (typeof s !== "string") throw new RangeError("label must be string");
-  const t = s.trim();
-  if (!LABEL_RE.test(t)) throw new RangeError("label must be 1-64 unicode chars");
-  return t;
+  if (typeof s !== 'string') throw new RangeError('label must be string')
+  const t = s.trim()
+  if (!LABEL_RE.test(t)) throw new RangeError('label must be 1-64 unicode chars')
+  return t
 }
 
 function rowToView(r: Record<string, unknown>): AlertChannelRow {
-  let events: string[] = [];
-  if (Array.isArray(r.event_types)) events = r.event_types as string[];
+  let events: string[] = []
+  if (Array.isArray(r.event_types)) events = r.event_types as string[]
   return {
     id: String(r.id),
     admin_id: String(r.admin_id),
@@ -111,9 +115,10 @@ function rowToView(r: Record<string, unknown>): AlertChannelRow {
     last_send_at: r.last_send_at ? (r.last_send_at as Date).toISOString() : null,
     last_error: (r.last_error as string | null) ?? null,
     has_context_token: Boolean(r.has_context_token),
+    tg_chat_id: (r.tg_chat_id as string | null) ?? null,
     created_at: (r.created_at as Date).toISOString(),
     updated_at: (r.updated_at as Date).toISOString(),
-  };
+  }
 }
 
 const SELECT_COLUMNS = `
@@ -132,9 +137,10 @@ const SELECT_COLUMNS = `
   last_send_at,
   last_error,
   (context_token IS NOT NULL AND length(context_token) > 0) AS has_context_token,
+  tg_chat_id,
   created_at,
   updated_at
-`;
+`
 
 // ─── CRUD ─────────────────────────────────────────────────────────────
 
@@ -142,30 +148,32 @@ const SELECT_COLUMNS = `
 export async function listAlertChannels(): Promise<AlertChannelRow[]> {
   const r = await query<Record<string, unknown>>(
     `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels ORDER BY id DESC`,
-  );
-  return r.rows.map(rowToView);
+  )
+  return r.rows.map(rowToView)
 }
 
-export async function getAlertChannel(id: string | number | bigint): Promise<AlertChannelRow | null> {
+export async function getAlertChannel(
+  id: string | number | bigint,
+): Promise<AlertChannelRow | null> {
   const r = await query<Record<string, unknown>>(
     `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels WHERE id = $1`,
     [String(id)],
-  );
-  return r.rows.length === 0 ? null : rowToView(r.rows[0]);
+  )
+  return r.rows.length === 0 ? null : rowToView(r.rows[0])
 }
 
 export interface CreateIlinkChannelInput {
-  adminId: bigint | number | string;
-  label: string;
-  botToken: string;
-  ilinkAccountId: string;
-  ilinkLoginUserId: string;
+  adminId: bigint | number | string
+  label: string
+  botToken: string
+  ilinkAccountId: string
+  ilinkLoginUserId: string
   /** 默认 = ilinkLoginUserId(告警发回给扫码者自己) */
-  targetSenderId?: string;
-  severityMin?: Severity;
-  eventTypes?: string[];
-  ip?: string | null;
-  userAgent?: string | null;
+  targetSenderId?: string
+  severityMin?: Severity
+  eventTypes?: string[]
+  ip?: string | null
+  userAgent?: string | null
 }
 
 /**
@@ -173,20 +181,20 @@ export interface CreateIlinkChannelInput {
  * 等 ilinkAlertWorker 第一次收到入站消息再转 active。
  */
 export async function createIlinkChannel(input: CreateIlinkChannelInput): Promise<AlertChannelRow> {
-  const label = validateLabel(input.label);
-  const severity = validateSeverity(input.severityMin ?? "warning");
-  const events = normalizeEventTypes(input.eventTypes ?? []);
+  const label = validateLabel(input.label)
+  const severity = validateSeverity(input.severityMin ?? 'warning')
+  const events = normalizeEventTypes(input.eventTypes ?? [])
   if (!input.botToken || input.botToken.length < 8) {
-    throw new RangeError("botToken invalid");
+    throw new RangeError('botToken invalid')
   }
   if (!input.ilinkAccountId || !input.ilinkLoginUserId) {
-    throw new RangeError("ilink ids missing");
+    throw new RangeError('ilink ids missing')
   }
-  const target = input.targetSenderId ?? input.ilinkLoginUserId;
+  const target = input.targetSenderId ?? input.ilinkLoginUserId
 
-  const kmsKey = loadKmsKey();
-  const enc = encrypt(input.botToken, kmsKey);
-  kmsKey.fill(0);
+  const kmsKey = loadKmsKey()
+  const enc = encrypt(input.botToken, kmsKey)
+  kmsKey.fill(0)
 
   return tx(async (client: PoolClient) => {
     // 2026-04-23 Codex FAIL finding #2:前端 /ilink/poll 在多 tab / 重复点击
@@ -224,7 +232,7 @@ export async function createIlinkChannel(input: CreateIlinkChannelInput): Promis
         input.ilinkLoginUserId,
         target,
       ],
-    );
+    )
 
     if (ins.rows.length === 0) {
       // 并发重复扫码 → 返回已存在的那条
@@ -235,18 +243,18 @@ export async function createIlinkChannel(input: CreateIlinkChannelInput): Promis
             AND ilink_account_id = $2
             AND ilink_login_user_id = $3`,
         [String(input.adminId), input.ilinkAccountId, input.ilinkLoginUserId],
-      );
+      )
       if (existing.rows.length === 0) {
         // 概率极低,但要打回可追溯错误
-        throw new Error("alert channel upsert conflicted but cannot find existing row");
+        throw new Error('alert channel upsert conflicted but cannot find existing row')
       }
-      return rowToView(existing.rows[0]);
+      return rowToView(existing.rows[0])
     }
 
-    const row = rowToView(ins.rows[0]);
+    const row = rowToView(ins.rows[0])
     await writeAdminAudit(client, {
       adminId: input.adminId,
-      action: "alert_channel.create",
+      action: 'alert_channel.create',
       target: `channel:${row.id}`,
       after: {
         channel_type: row.channel_type,
@@ -257,80 +265,205 @@ export async function createIlinkChannel(input: CreateIlinkChannelInput): Promis
       },
       ip: input.ip ?? null,
       userAgent: input.userAgent ?? null,
-    });
-    return row;
-  });
+    })
+    return row
+  })
+}
+
+// ─── Telegram channel creation ────────────────────────────────────────
+
+/**
+ * Telegram chat_id 验证。允许:
+ *   - `-?\d{1,32}`     用户 / 群组 / supergroup / channel 数字 ID(可负)
+ *   - `@[A-Za-z0-9_]{3,32}` 公开 channel/bot username
+ * 不限制数字位数严格上限,Telegram 未来可能扩,正则给 32 位上限够用。
+ */
+const TG_CHAT_ID_RE = /^(?:-?\d{1,32}|@[A-Za-z0-9_]{3,32})$/
+
+/**
+ * Telegram bot token 形如 `<digits>:<base64ish>` 长度通常 45+ 字符。
+ * 我们只做最低限度检查,真正的合法性靠 Telegram API 401/404 反馈。
+ */
+export function validateTgBotToken(s: unknown): string {
+  if (typeof s !== 'string') throw new RangeError('bot_token must be string')
+  const t = s.trim()
+  if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(t)) {
+    throw new RangeError("bot_token format invalid (expected '<digits>:<token>')")
+  }
+  return t
+}
+
+export function validateTgChatId(s: unknown): string {
+  if (typeof s !== 'string') throw new RangeError('chat_id must be string')
+  const t = s.trim()
+  if (!TG_CHAT_ID_RE.test(t))
+    throw new RangeError('chat_id format invalid (expected -?digits or @username)')
+  return t
+}
+
+export interface CreateTelegramChannelInput {
+  adminId: bigint | number | string
+  label: string
+  botToken: string
+  chatId: string
+  severityMin?: Severity
+  eventTypes?: string[]
+  ip?: string | null
+  userAgent?: string | null
+}
+
+/**
+ * 落库一条 Telegram 通道。无扫码 / 无 inbound 流程,activation_status 直接 = 'active'。
+ * bot_token AES-GCM 加密入 bot_token_enc / nonce(同 iLink 共享密钥),chat_id 明文。
+ *
+ * 并发幂等:同 (admin_id, tg_chat_id) 命中 partial unique idx_aac_tg_identity → 返回已有行(不重复 audit)。
+ */
+export async function createTelegramChannel(
+  input: CreateTelegramChannelInput,
+): Promise<AlertChannelRow> {
+  const label = validateLabel(input.label)
+  const severity = validateSeverity(input.severityMin ?? 'warning')
+  const events = normalizeEventTypes(input.eventTypes ?? [])
+  const botToken = validateTgBotToken(input.botToken)
+  const chatId = validateTgChatId(input.chatId)
+
+  const kmsKey = loadKmsKey()
+  const enc = encrypt(botToken, kmsKey)
+  kmsKey.fill(0)
+
+  return tx(async (client: PoolClient) => {
+    const ins = await client.query<Record<string, unknown>>(
+      `INSERT INTO admin_alert_channels(
+         admin_id, channel_type, label, enabled, severity_min, event_types,
+         bot_token_enc, bot_token_nonce,
+         tg_chat_id,
+         activation_status,
+         updated_by
+       ) VALUES (
+         $1::bigint, 'telegram', $2, TRUE, $3, $4::jsonb,
+         $5, $6,
+         $7,
+         'active',
+         $1::bigint
+       )
+       ON CONFLICT (admin_id, tg_chat_id)
+         WHERE channel_type = 'telegram'
+           AND tg_chat_id IS NOT NULL
+         DO NOTHING
+       RETURNING ${SELECT_COLUMNS}`,
+      [
+        String(input.adminId),
+        label,
+        severity,
+        JSON.stringify(events),
+        enc.ciphertext,
+        enc.nonce,
+        chatId,
+      ],
+    )
+
+    if (ins.rows.length === 0) {
+      const existing = await client.query<Record<string, unknown>>(
+        `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels
+          WHERE admin_id = $1::bigint
+            AND channel_type = 'telegram'
+            AND tg_chat_id = $2`,
+        [String(input.adminId), chatId],
+      )
+      if (existing.rows.length === 0) {
+        throw new Error('telegram channel upsert conflicted but cannot find existing row')
+      }
+      return rowToView(existing.rows[0])
+    }
+
+    const row = rowToView(ins.rows[0])
+    await writeAdminAudit(client, {
+      adminId: input.adminId,
+      action: 'alert_channel.create',
+      target: `channel:${row.id}`,
+      after: {
+        channel_type: row.channel_type,
+        label: row.label,
+        severity_min: row.severity_min,
+        event_types: row.event_types,
+        tg_chat_id: row.tg_chat_id,
+      },
+      ip: input.ip ?? null,
+      userAgent: input.userAgent ?? null,
+    })
+    return row
+  })
 }
 
 export interface PatchAlertChannelInput {
-  adminId: bigint | number | string;
-  id: string | number | bigint;
-  label?: string;
-  enabled?: boolean;
-  severityMin?: Severity;
-  eventTypes?: string[];
-  ip?: string | null;
-  userAgent?: string | null;
+  adminId: bigint | number | string
+  id: string | number | bigint
+  label?: string
+  enabled?: boolean
+  severityMin?: Severity
+  eventTypes?: string[]
+  ip?: string | null
+  userAgent?: string | null
 }
 
 /** PATCH 可改字段:label / enabled / severity_min / event_types。不能改 iLink 身份字段。 */
 export async function patchAlertChannel(input: PatchAlertChannelInput): Promise<AlertChannelRow> {
-  const sets: string[] = [];
-  const params: unknown[] = [];
-  const after: Record<string, unknown> = {};
+  const sets: string[] = []
+  const params: unknown[] = []
+  const after: Record<string, unknown> = {}
 
   if (input.label !== undefined) {
-    const v = validateLabel(input.label);
-    params.push(v);
-    sets.push(`label = $${params.length}`);
-    after.label = v;
+    const v = validateLabel(input.label)
+    params.push(v)
+    sets.push(`label = $${params.length}`)
+    after.label = v
   }
   if (input.enabled !== undefined) {
-    if (typeof input.enabled !== "boolean") throw new RangeError("enabled must be boolean");
-    params.push(input.enabled);
-    sets.push(`enabled = $${params.length}`);
-    after.enabled = input.enabled;
+    if (typeof input.enabled !== 'boolean') throw new RangeError('enabled must be boolean')
+    params.push(input.enabled)
+    sets.push(`enabled = $${params.length}`)
+    after.enabled = input.enabled
   }
   if (input.severityMin !== undefined) {
-    const v = validateSeverity(input.severityMin);
-    params.push(v);
-    sets.push(`severity_min = $${params.length}`);
-    after.severity_min = v;
+    const v = validateSeverity(input.severityMin)
+    params.push(v)
+    sets.push(`severity_min = $${params.length}`)
+    after.severity_min = v
   }
   if (input.eventTypes !== undefined) {
-    const v = normalizeEventTypes(input.eventTypes);
-    params.push(JSON.stringify(v));
-    sets.push(`event_types = $${params.length}::jsonb`);
-    after.event_types = v;
+    const v = normalizeEventTypes(input.eventTypes)
+    params.push(JSON.stringify(v))
+    sets.push(`event_types = $${params.length}::jsonb`)
+    after.event_types = v
   }
   if (sets.length === 0) {
-    const existing = await getAlertChannel(input.id);
-    if (!existing) throw new ChannelNotFoundError(input.id);
-    return existing;
+    const existing = await getAlertChannel(input.id)
+    if (!existing) throw new ChannelNotFoundError(input.id)
+    return existing
   }
 
   return tx(async (client: PoolClient) => {
     const before = await client.query<Record<string, unknown>>(
       `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels WHERE id = $1 FOR UPDATE`,
       [String(input.id)],
-    );
-    if (before.rows.length === 0) throw new ChannelNotFoundError(input.id);
-    const beforeView = rowToView(before.rows[0]);
+    )
+    if (before.rows.length === 0) throw new ChannelNotFoundError(input.id)
+    const beforeView = rowToView(before.rows[0])
 
-    params.push(String(input.adminId));
-    sets.push(`updated_by = $${params.length}::bigint`);
-    sets.push(`updated_at = NOW()`);
-    params.push(String(input.id));
+    params.push(String(input.adminId))
+    sets.push(`updated_by = $${params.length}::bigint`)
+    sets.push(`updated_at = NOW()`)
+    params.push(String(input.id))
     const upd = await client.query<Record<string, unknown>>(
-      `UPDATE admin_alert_channels SET ${sets.join(", ")} WHERE id = $${params.length}
+      `UPDATE admin_alert_channels SET ${sets.join(', ')} WHERE id = $${params.length}
        RETURNING ${SELECT_COLUMNS}`,
       params,
-    );
-    const row = rowToView(upd.rows[0]);
+    )
+    const row = rowToView(upd.rows[0])
 
     await writeAdminAudit(client, {
       adminId: input.adminId,
-      action: "alert_channel.patch",
+      action: 'alert_channel.patch',
       target: `channel:${row.id}`,
       before: {
         label: beforeView.label,
@@ -341,9 +474,9 @@ export async function patchAlertChannel(input: PatchAlertChannelInput): Promise<
       after,
       ip: input.ip ?? null,
       userAgent: input.userAgent ?? null,
-    });
-    return row;
-  });
+    })
+    return row
+  })
 }
 
 export async function deleteAlertChannel(
@@ -356,13 +489,13 @@ export async function deleteAlertChannel(
     const before = await client.query<Record<string, unknown>>(
       `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels WHERE id = $1 FOR UPDATE`,
       [String(id)],
-    );
-    if (before.rows.length === 0) throw new ChannelNotFoundError(id);
-    const beforeView = rowToView(before.rows[0]);
-    await client.query(`DELETE FROM admin_alert_channels WHERE id = $1`, [String(id)]);
+    )
+    if (before.rows.length === 0) throw new ChannelNotFoundError(id)
+    const beforeView = rowToView(before.rows[0])
+    await client.query(`DELETE FROM admin_alert_channels WHERE id = $1`, [String(id)])
     await writeAdminAudit(client, {
       adminId,
-      action: "alert_channel.delete",
+      action: 'alert_channel.delete',
       target: `channel:${id}`,
       before: {
         label: beforeView.label,
@@ -371,8 +504,8 @@ export async function deleteAlertChannel(
       },
       ip: ip ?? null,
       userAgent: userAgent ?? null,
-    });
-  });
+    })
+  })
 }
 
 // ─── worker-facing helpers(不对外暴露) ──────────────────────────────
@@ -383,42 +516,45 @@ export async function deleteAlertChannel(
  */
 export async function loadChannelSecrets(
   id: string | number | bigint,
-  runner: QueryRunner = (undefined as unknown) as QueryRunner,
+  runner: QueryRunner = undefined as unknown as QueryRunner,
 ): Promise<ChannelSecrets | null> {
   const r = await (runner ?? { query: query as any }).query<{
-    bot_token_enc: Buffer | null;
-    bot_token_nonce: Buffer | null;
-    context_token: string | null;
-    get_updates_buf: string | null;
-    target_sender_id: string | null;
-    ilink_account_id: string | null;
+    bot_token_enc: Buffer | null
+    bot_token_nonce: Buffer | null
+    context_token: string | null
+    get_updates_buf: string | null
+    target_sender_id: string | null
+    ilink_account_id: string | null
+    tg_chat_id: string | null
   }>(
     `SELECT bot_token_enc, bot_token_nonce,
-            context_token, get_updates_buf, target_sender_id, ilink_account_id
+            context_token, get_updates_buf, target_sender_id, ilink_account_id,
+            tg_chat_id
        FROM admin_alert_channels WHERE id = $1`,
     [String(id)],
-  );
-  if (r.rows.length === 0) return null;
-  const row = r.rows[0];
-  if (!row.bot_token_enc || !row.bot_token_nonce) return null;
+  )
+  if (r.rows.length === 0) return null
+  const row = r.rows[0]
+  if (!row.bot_token_enc || !row.bot_token_nonce) return null
 
-  const kmsKey = loadKmsKey();
-  let botToken: string;
+  const kmsKey = loadKmsKey()
+  let botToken: string
   try {
-    botToken = decrypt(row.bot_token_enc, row.bot_token_nonce, kmsKey);
+    botToken = decrypt(row.bot_token_enc, row.bot_token_nonce, kmsKey)
   } catch (err) {
-    kmsKey.fill(0);
-    if (err instanceof AeadError) return null; // key 换了或被 tamper,worker 会降级
-    throw err;
+    kmsKey.fill(0)
+    if (err instanceof AeadError) return null // key 换了或被 tamper,worker 会降级
+    throw err
   }
-  kmsKey.fill(0);
+  kmsKey.fill(0)
   return {
     botToken,
     contextToken: row.context_token ?? null,
-    getUpdatesBuf: row.get_updates_buf ?? "",
+    getUpdatesBuf: row.get_updates_buf ?? '',
     targetSenderId: row.target_sender_id ?? null,
     ilinkAccountId: row.ilink_account_id ?? null,
-  };
+    tgChatId: row.tg_chat_id ?? null,
+  }
 }
 
 /** worker 收到新入站:更新 context_token + get_updates_buf + last_inbound_at + 激活。 */
@@ -440,7 +576,7 @@ export async function updateChannelInbound(
        updated_at = NOW()
      WHERE id = $1`,
     [String(id), input.contextToken, input.getUpdatesBuf, input.senderId ?? null],
-  );
+  )
 }
 
 /** worker 只刷 get_updates_buf(没 inbound 时,长轮询超时也要持久化 buf)。 */
@@ -451,7 +587,7 @@ export async function updateChannelBuf(
   await query(
     `UPDATE admin_alert_channels SET get_updates_buf = $2, updated_at = NOW() WHERE id = $1`,
     [String(id), getUpdatesBuf],
-  );
+  )
 }
 
 /** worker 发送成功:更新 last_send_at,清 last_error。 */
@@ -467,16 +603,25 @@ export async function markChannelSendSuccess(id: string | number | bigint): Prom
        updated_at = NOW()
      WHERE id = $1`,
     [String(id)],
-  );
+  )
 }
 
-/** worker 发送失败 / session expired:标记 last_error,必要时降级状态。 */
+/**
+ * worker 发送失败 / session expired:标记 last_error,必要时降级状态。
+ *
+ * kind:
+ *  - undefined (默认) = transient 错误,只写 last_error,不动 activation_status
+ *  - 'session_expired' = iLink errcode=-14,降级 error 并清 iLink 专属字段
+ *    (context_token / get_updates_buf),让 admin 重新激活
+ *  - 'permanent' = Telegram 401/403/404 / bad chat_id 等不可恢复错误,
+ *    直接降级 error,不动 iLink 字段(telegram 行本就没有)
+ */
 export async function markChannelError(
   id: string | number | bigint,
   err: string,
-  sessionExpired = false,
+  kind?: 'session_expired' | 'permanent',
 ): Promise<void> {
-  if (sessionExpired) {
+  if (kind === 'session_expired') {
     // session_expired (iLink errcode=-14) 有两种触发:
     //   1. context_token 过期 → 清 context_token 即可,bot_token 仍能 long-poll
     //   2. get_updates_buf (cursor) 过期 → 带旧 cursor 再 poll 会立刻再次 -14
@@ -491,7 +636,16 @@ export async function markChannelError(
          updated_at = NOW()
        WHERE id = $1`,
       [String(id), err.slice(0, 500)],
-    );
+    )
+  } else if (kind === 'permanent') {
+    await query(
+      `UPDATE admin_alert_channels SET
+         last_error = $2,
+         activation_status = 'error',
+         updated_at = NOW()
+       WHERE id = $1`,
+      [String(id), err.slice(0, 500)],
+    )
   } else {
     await query(
       `UPDATE admin_alert_channels SET
@@ -499,31 +653,31 @@ export async function markChannelError(
          updated_at = NOW()
        WHERE id = $1`,
       [String(id), err.slice(0, 500)],
-    );
+    )
   }
 }
 
 export interface ReactivateChannelInput {
-  id: string | number | bigint;
-  adminId: bigint | number | string;
-  ip?: string | null;
-  userAgent?: string | null;
+  id: string | number | bigint
+  adminId: bigint | number | string
+  ip?: string | null
+  userAgent?: string | null
 }
 
 export type ReactivateOutcome =
   /** 本次把 activation_status=error 推回 pending,worker 下轮 tick 会重新 long-poll */
-  | "reactivated"
+  | 'reactivated'
   /** 已经是 active/pending,无操作 */
-  | "already_active"
-  | "already_pending"
+  | 'already_active'
+  | 'already_pending'
   /** disabled (enabled=false),必须先启用 */
-  | "disabled"
+  | 'disabled'
   /** 通道不存在 */
-  | "not_found";
+  | 'not_found'
 
 export interface ReactivateChannelResult {
-  outcome: ReactivateOutcome;
-  channel: AlertChannelRow | null;
+  outcome: ReactivateOutcome
+  channel: AlertChannelRow | null
 }
 
 /**
@@ -548,19 +702,19 @@ export async function reactivateChannel(
       `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels
         WHERE id = $1::bigint FOR UPDATE`,
       [String(input.id)],
-    );
+    )
     if (sel.rows.length === 0) {
-      return { outcome: "not_found", channel: null };
+      return { outcome: 'not_found', channel: null }
     }
-    const cur = rowToView(sel.rows[0]);
+    const cur = rowToView(sel.rows[0])
     if (!cur.enabled) {
-      return { outcome: "disabled", channel: cur };
+      return { outcome: 'disabled', channel: cur }
     }
-    if (cur.activation_status === "active") {
-      return { outcome: "already_active", channel: cur };
+    if (cur.activation_status === 'active') {
+      return { outcome: 'already_active', channel: cur }
     }
-    if (cur.activation_status === "pending") {
-      return { outcome: "already_pending", channel: cur };
+    if (cur.activation_status === 'pending') {
+      return { outcome: 'already_pending', channel: cur }
     }
     // 到这只剩 'error'(schema check 保证集合)
     const upd = await client.query<Record<string, unknown>>(
@@ -573,34 +727,34 @@ export async function reactivateChannel(
          AND activation_status = 'error'
        RETURNING ${SELECT_COLUMNS}`,
       [String(input.id), String(input.adminId)],
-    );
+    )
     if (upd.rows.length === 0) {
       // 并发窗口:另一 tx 已改走;重读返回当前状态
       const re = await client.query<Record<string, unknown>>(
         `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels WHERE id = $1::bigint`,
         [String(input.id)],
-      );
-      const again = rowToView(re.rows[0]);
+      )
+      const again = rowToView(re.rows[0])
       return {
-        outcome: again.activation_status === "pending" ? "already_pending" : "already_active",
+        outcome: again.activation_status === 'pending' ? 'already_pending' : 'already_active',
         channel: again,
-      };
+      }
     }
-    const row = rowToView(upd.rows[0]);
+    const row = rowToView(upd.rows[0])
     await writeAdminAudit(client, {
       adminId: input.adminId,
-      action: "alert_channel.reactivate",
+      action: 'alert_channel.reactivate',
       target: `channel:${row.id}`,
       after: {
-        previous_status: "error",
-        new_status: "pending",
+        previous_status: 'error',
+        new_status: 'pending',
         label: row.label,
       },
       ip: input.ip ?? null,
       userAgent: input.userAgent ?? null,
-    });
-    return { outcome: "reactivated", channel: row };
-  });
+    })
+    return { outcome: 'reactivated', channel: row }
+  })
 }
 
 /** dispatcher / worker 扫:enabled + activation_status=active 的通道。 */
@@ -609,6 +763,6 @@ export async function listDispatchableChannels(): Promise<AlertChannelRow[]> {
     `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels
       WHERE enabled = TRUE AND activation_status IN ('active', 'pending')
       ORDER BY id`,
-  );
-  return r.rows.map(rowToView);
+  )
+  return r.rows.map(rowToView)
 }

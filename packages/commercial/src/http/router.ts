@@ -15,7 +15,7 @@
  *   - CORS:由 gateway 层统一处理(目前暂不开放跨域;Web 同源)
  */
 
-import type { IncomingMessage, ServerResponse } from "node:http";
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   HttpError,
   REQUEST_ID_HEADER,
@@ -24,7 +24,7 @@ import {
   setSecurityHeaders,
   clientIpOf,
   userAgentOf,
-} from "./util.js";
+} from './util.js'
 import {
   handleRegister,
   handleLogin,
@@ -46,20 +46,11 @@ import {
   handleSubmitFeedback,
   type CommercialHttpDeps,
   type RequestContext,
-} from "./handlers.js";
-import { containerFileProxy } from "./containerFileProxy.js";
-import { requireUserVerifyDb } from "./requireUser.js";
-import {
-  handleListPlans,
-  handleCreateHupi,
-  handleHupiCallback,
-  handleGetOrder,
-} from "./payment.js";
-import {
-  handleAgentOpen,
-  handleAgentStatus,
-  handleAgentCancel,
-} from "./agent.js";
+} from './handlers.js'
+import { containerFileProxy } from './containerFileProxy.js'
+import { requireUserVerifyDb } from './requireUser.js'
+import { handleListPlans, handleCreateHupi, handleHupiCallback, handleGetOrder } from './payment.js'
+import { handleAgentOpen, handleAgentStatus, handleAgentCancel } from './agent.js'
 import {
   handleListRemoteHosts,
   handleCreateRemoteHost,
@@ -67,8 +58,8 @@ import {
   handlePatchRemoteHost,
   handleDeleteRemoteHost,
   handleRemoteHostAction,
-} from "./remoteHosts.js";
-import { handleAdminAgentAudit } from "./adminAudit.js";
+} from './remoteHosts.js'
+import { handleAdminAgentAudit } from './adminAudit.js'
 import {
   handleAdminListUsers,
   handleAdminUsersStats,
@@ -104,21 +95,21 @@ import {
   handleAdminGetOrder,
   handleAdminListFeedback,
   handleAdminAckFeedback,
-} from "./admin.js";
+} from './admin.js'
 import {
   handleAdminStatsDau,
   handleAdminStatsRevenueByDay,
   handleAdminStatsRequestSeries,
   handleAdminStatsAlertsSummary,
   handleAdminStatsAccountPool,
-} from "./adminStats.js";
+} from './adminStats.js'
 import {
   handleAdminListComputeHosts,
   handleAdminAddComputeHost,
   handleAdminComputeHostBootstrapLog,
   handleAdminComputeHostAction,
   handleAdminBaselineVersion,
-} from "./adminComputeHosts.js";
+} from './adminComputeHosts.js'
 import {
   handleAdminAlertsListEvents,
   handleAdminAlertsListChannels,
@@ -127,19 +118,20 @@ import {
   handleAdminAlertsPatchChannel,
   handleAdminAlertsDeleteChannel,
   handleAdminAlertsTestChannel,
+  handleAdminAlertsCreateTelegramChannel,
   handleAdminAlertsListOutbox,
   handleAdminAlertsListSilences,
   handleAdminAlertsCreateSilence,
   handleAdminAlertsDeleteSilence,
   handleAdminAlertsListRuleStates,
-} from "./adminAlerts.js";
-import { incrGatewayRequest } from "../admin/metrics.js";
-import { rootLogger, type Logger } from "../logging/logger.js";
-import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
-import { requireAdminVerifyDb } from "../admin/requireAdmin.js";
-import { writeAdminAudit } from "../admin/audit.js";
-import { getPool } from "../db/index.js";
-import { isInMaintenance, isActiveAdmin } from "../middleware/maintenanceMode.js";
+} from './adminAlerts.js'
+import { incrGatewayRequest } from '../admin/metrics.js'
+import { rootLogger, type Logger } from '../logging/logger.js'
+import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
+import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
+import { writeAdminAudit } from '../admin/audit.js'
+import { getPool } from '../db/index.js'
+import { isInMaintenance, isActiveAdmin } from '../middleware/maintenanceMode.js'
 
 /**
  * **P0 — v3 multi-tenant leak firewall** (2026-04-22)
@@ -210,73 +202,73 @@ import { isInMaintenance, isActiveAdmin } from "../middleware/maintenanceMode.js
  *   任何 host-agent 写口给付费用户。
  */
 interface BlockedForUserRule {
-  re: RegExp;
+  re: RegExp
   /** 若 undefined = 所有方法都拦。否则只对枚举方法拦,其他方法放行(fall through)。 */
-  methods?: ReadonlySet<string>;
+  methods?: ReadonlySet<string>
   /** 审计 / 日志里的可读 endpoint label,不带动态段 */
-  label: string;
+  label: string
 }
 
-const M = (...methods: string[]) => new Set(methods);
+const M = (...methods: string[]) => new Set(methods)
 
 const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // ─── host agent RCE 面 ───
   // /api/agents GET(列表 host agents)+ POST(创建 host agent);两者都不该给 user
-  { re: /^\/api\/agents$/, label: "/api/agents" },
+  { re: /^\/api\/agents$/, label: '/api/agents' },
   // /api/agents/:id GET/PUT/DELETE —— 读 host agent 元信息、改 model/persona、删 agent
-  { re: /^\/api\/agents\/[^/]+$/, label: "/api/agents/:id" },
+  { re: /^\/api\/agents\/[^/]+$/, label: '/api/agents/:id' },
   // /api/agents/:id/persona GET/PUT —— 读/写 host agent CLAUDE.md
-  { re: /^\/api\/agents\/[^/]+\/persona$/, label: "/api/agents/:id/persona" },
+  { re: /^\/api\/agents\/[^/]+\/persona$/, label: '/api/agents/:id/persona' },
   // /api/agents/:id/message POST + /api/agents/:id/delegate POST —— host agent 执行 prompt = RCE
-  { re: /^\/api\/agents\/[^/]+\/(message|delegate)$/, label: "/api/agents/:id/(message|delegate)" },
+  { re: /^\/api\/agents\/[^/]+\/(message|delegate)$/, label: '/api/agents/:id/(message|delegate)' },
   // 内存 / 技能(host singleton 存储)
-  { re: /^\/api\/agents\/[^/]+\/memory\/(memory|user)$/, label: "/api/agents/:id/memory/*" },
-  { re: /^\/api\/agents\/[^/]+\/skills(\/[A-Za-z0-9_\-]+)?$/, label: "/api/agents/:id/skills" },
+  { re: /^\/api\/agents\/[^/]+\/memory\/(memory|user)$/, label: '/api/agents/:id/memory/*' },
+  { re: /^\/api\/agents\/[^/]+\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/agents/:id/skills' },
 
   // ─── host cron / tasks / webhooks(所有方法,prompt 注入 = RCE)───
-  { re: /^\/api\/cron(\/[^/]+)?$/, label: "/api/cron" },
-  { re: /^\/api\/tasks(\/[A-Za-z0-9_\-]+)?$/, label: "/api/tasks" },
-  { re: /^\/api\/tasks-executions$/, label: "/api/tasks-executions" },
-  { re: /^\/api\/webhooks$/, label: "/api/webhooks" }, // GET 列表 leak secret
-  { re: /^\/api\/webhooks\/[A-Za-z0-9_\-]+$/, label: "/api/webhooks/:id" }, // POST = host prompt 执行,DELETE = 删除 host webhook
+  { re: /^\/api\/cron(\/[^/]+)?$/, label: '/api/cron' },
+  { re: /^\/api\/tasks(\/[A-Za-z0-9_\-]+)?$/, label: '/api/tasks' },
+  { re: /^\/api\/tasks-executions$/, label: '/api/tasks-executions' },
+  { re: /^\/api\/webhooks$/, label: '/api/webhooks' }, // GET 列表 leak secret
+  { re: /^\/api\/webhooks\/[A-Za-z0-9_\-]+$/, label: '/api/webhooks/:id' }, // POST = host prompt 执行,DELETE = 删除 host webhook
 
   // ─── 全局 host 信息泄漏面 ───
   // /api/doctor 不限方法 —— gateway 里没显式校验 method,写成 "GET only" 会被 POST/HEAD 绕过。
   // 全方法拦,admin bypass 后由 gateway 自己决定要不要接(不接就 404,也安全)。
-  { re: /^\/api\/doctor$/, label: "/api/doctor" },
-  { re: /^\/api\/runs$/, methods: M("GET"), label: "/api/runs" },
-  { re: /^\/api\/usage$/, methods: M("GET"), label: "/api/usage" },
-  { re: /^\/api\/usage\/events$/, methods: M("GET"), label: "/api/usage/events" },
-  { re: /^\/api\/config$/, label: "/api/config" }, // GET dumps gateway config + auth info
+  { re: /^\/api\/doctor$/, label: '/api/doctor' },
+  { re: /^\/api\/runs$/, methods: M('GET'), label: '/api/runs' },
+  { re: /^\/api\/usage$/, methods: M('GET'), label: '/api/usage' },
+  { re: /^\/api\/usage\/events$/, methods: M('GET'), label: '/api/usage/events' },
+  { re: /^\/api\/config$/, label: '/api/config' }, // GET dumps gateway config + auth info
   // /metrics 吐 host 全局 Prometheus(含 accounts/sessions/agent_audit 统计),不分方法。
-  { re: /^\/metrics$/, label: "/metrics" },
+  { re: /^\/metrics$/, label: '/metrics' },
 
   // ─── 跨 user session FTS ───
-  { re: /^\/api\/search$/, label: "/api/search" },
+  { re: /^\/api\/search$/, label: '/api/search' },
 
   // ─── session 迁移(跨租户认领别人历史 session)───
   // /api/sessions/unclaimed 列所有 default 桶未绑定 session,/api/sessions/claim 把任意
   // sessionId 迁给调用者 —— 付费用户借此拿到 legacy 个人版 / 其他用户遗留的聊天记录。
   // 正常用途只给 admin 运维(初次迁移 v2→v3 / default 桶清理)。
-  { re: /^\/api\/sessions\/(unclaimed|claim)$/, label: "/api/sessions/(unclaimed|claim)" },
+  { re: /^\/api\/sessions\/(unclaimed|claim)$/, label: '/api/sessions/(unclaimed|claim)' },
 
   // ─── HOST 文件访问(跨租户读 admin 主 agent cwd / HOST uploads / MCP generated)───
   // 详见大注释「/api/file + /api/media/* 为何也拦」段落。
-  { re: /^\/api\/file$/, label: "/api/file" },
-  { re: /^\/api\/media\/.+$/, label: "/api/media/:file" },
+  { re: /^\/api\/file$/, label: '/api/file' },
+  { re: /^\/api\/media\/.+$/, label: '/api/media/:file' },
 
   // ─── HOST RCE 面(OpenAI 兼容层,POST body.prompt → sessions.submit → host main agent)───
   // 覆盖 /v1/chat/completions、/v1/models;后者仅列模型但合并策略拦更简。admin bypass。
-  { re: /^\/v1\/.+$/, label: "/v1/*" },
-];
+  { re: /^\/v1\/.+$/, label: '/v1/*' },
+]
 
 function matchBlockedRule(path: string, method: string): BlockedForUserRule | null {
   for (const rule of BLOCKED_FOR_USER_RULES) {
-    if (!rule.re.test(path)) continue;
-    if (rule.methods && !rule.methods.has(method)) continue;
-    return rule;
+    if (!rule.re.test(path)) continue
+    if (rule.methods && !rule.methods.has(method)) continue
+    return rule
   }
-  return null;
+  return null
 }
 
 /**
@@ -289,29 +281,26 @@ function matchBlockedRule(path: string, method: string): BlockedForUserRule | nu
  * 作为 feature flag OFF 时 + POST/PUT/DELETE 兜底的路径。
  */
 interface ProxyForUserRule {
-  re: RegExp;
-  methods: ReadonlySet<string>;
-  label: string;
+  re: RegExp
+  methods: ReadonlySet<string>
+  label: string
 }
 const PROXY_FOR_USER_RULES: readonly ProxyForUserRule[] = [
-  { re: /^\/api\/file$/, methods: M("GET"), label: "/api/file" },
-  { re: /^\/api\/media\/.+$/, methods: M("GET"), label: "/api/media/:file" },
-];
+  { re: /^\/api\/file$/, methods: M('GET'), label: '/api/file' },
+  { re: /^\/api\/media\/.+$/, methods: M('GET'), label: '/api/media/:file' },
+]
 
 function matchProxyRule(path: string, method: string, enabled: boolean): ProxyForUserRule | null {
-  if (!enabled) return null;
+  if (!enabled) return null
   for (const rule of PROXY_FOR_USER_RULES) {
-    if (!rule.re.test(path)) continue;
-    if (!rule.methods.has(method)) continue;
-    return rule;
+    if (!rule.re.test(path)) continue
+    if (!rule.methods.has(method)) continue
+    return rule
   }
-  return null;
+  return null
 }
 
-export type CommercialHandler = (
-  req: IncomingMessage,
-  res: ServerResponse,
-) => Promise<boolean>;
+export type CommercialHandler = (req: IncomingMessage, res: ServerResponse) => Promise<boolean>
 
 /**
  * 从 req 抽 bearer token(header / cookie)—— 匹配 gateway/server.ts `extractToken`
@@ -321,18 +310,18 @@ export type CommercialHandler = (
  * 导出给 middleware/maintenanceMode 复用(同一 token 提取逻辑,避免漂移)。
  */
 export function extractTokenFromReq(req: IncomingMessage): string {
-  const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, "") ?? "";
-  if (authHeader) return authHeader;
-  const cookieHeader = req.headers.cookie ?? "";
-  const cookies = cookieHeader.split(";").reduce(
+  const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, '') ?? ''
+  if (authHeader) return authHeader
+  const cookieHeader = req.headers.cookie ?? ''
+  const cookies = cookieHeader.split(';').reduce(
     (acc, c) => {
-      const [k, ...v] = c.trim().split("=");
-      if (k) acc[k] = v.join("=");
-      return acc;
+      const [k, ...v] = c.trim().split('=')
+      if (k) acc[k] = v.join('=')
+      return acc
     },
     {} as Record<string, string>,
-  );
-  return cookies.oc_session || "";
+  )
+  return cookies.oc_session || ''
 }
 
 type RouteHandler = (
@@ -340,188 +329,267 @@ type RouteHandler = (
   res: ServerResponse,
   ctx: RequestContext,
   deps: CommercialHttpDeps,
-) => Promise<void>;
+) => Promise<void>
 
 interface Route {
-  method: string;
+  method: string
   /**
    * 精确路径。动态参数路由(如 `/api/payment/orders/:order_no`)用 `pathPrefix` 字段,
    * 不在这里出现。
    */
-  path?: string;
+  path?: string
   /**
    * 前缀匹配:path 以 `pathPrefix` 开头的请求都会命中。Handler 自己从 url 中抽参数。
    * 用于少数带路径变量的 GET 接口。同一 method 多个 prefix 顺序即优先级。
    */
-  pathPrefix?: string;
-  handler: RouteHandler;
+  pathPrefix?: string
+  handler: RouteHandler
 }
 
 export function createCommercialHandler(
   deps: CommercialHttpDeps,
   options: {
     /** 测试可注入特定 logger;默认走 rootLogger.child({ subsys: "commercial" }) */
-    logger?: Logger;
+    logger?: Logger
   } = {},
 ): CommercialHandler {
-  const httpLogger = options.logger ?? rootLogger.child({ subsys: "commercial" });
+  const httpLogger = options.logger ?? rootLogger.child({ subsys: 'commercial' })
   const routes: Route[] = [
-    { method: "POST", path: "/api/auth/register", handler: handleRegister },
-    { method: "POST", path: "/api/auth/login", handler: handleLogin },
-    { method: "POST", path: "/api/auth/refresh", handler: handleRefresh },
-    { method: "POST", path: "/api/auth/logout", handler: handleLogout },
-    { method: "POST", path: "/api/auth/verify-email", handler: handleVerifyEmail },
-    { method: "POST", path: "/api/auth/resend-verification", handler: handleResendVerification },
-    { method: "GET",  path: "/api/auth/check-verification",  handler: handleCheckVerification },
-    { method: "POST", path: "/api/auth/request-password-reset", handler: handleRequestPasswordReset },
-    { method: "POST", path: "/api/auth/confirm-password-reset", handler: (req, res) => handleConfirmPasswordReset(req, res) },
+    { method: 'POST', path: '/api/auth/register', handler: handleRegister },
+    { method: 'POST', path: '/api/auth/login', handler: handleLogin },
+    { method: 'POST', path: '/api/auth/refresh', handler: handleRefresh },
+    { method: 'POST', path: '/api/auth/logout', handler: handleLogout },
+    { method: 'POST', path: '/api/auth/verify-email', handler: handleVerifyEmail },
+    { method: 'POST', path: '/api/auth/resend-verification', handler: handleResendVerification },
+    { method: 'GET', path: '/api/auth/check-verification', handler: handleCheckVerification },
+    {
+      method: 'POST',
+      path: '/api/auth/request-password-reset',
+      handler: handleRequestPasswordReset,
+    },
+    {
+      method: 'POST',
+      path: '/api/auth/confirm-password-reset',
+      handler: (req, res) => handleConfirmPasswordReset(req, res),
+    },
     // v3 file proxy: 用 Bearer access token 换一个 HttpOnly `oc_session` cookie,
     // 让 `<a href>` / `<img>` 等原生下载链接能携带身份(见 handlers.ts 详注)
-    { method: "POST", path: "/api/auth/session", handler: handleCreateSession },
-    { method: "POST", path: "/api/auth/session/logout", handler: handleClearSession },
-    { method: "GET", path: "/api/me", handler: handleMe },
+    { method: 'POST', path: '/api/auth/session', handler: handleCreateSession },
+    { method: 'POST', path: '/api/auth/session/logout', handler: handleClearSession },
+    { method: 'GET', path: '/api/me', handler: handleMe },
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
-    { method: "GET",   path: "/api/me/preferences", handler: handleGetMyPreferences },
-    { method: "PATCH", path: "/api/me/preferences", handler: handlePatchMyPreferences },
+    { method: 'GET', path: '/api/me/preferences', handler: handleGetMyPreferences },
+    { method: 'PATCH', path: '/api/me/preferences', handler: handlePatchMyPreferences },
     // 使用消耗统计(含 summary / sessions 分页 / ledger 分页 / savings)
-    { method: "GET",   path: "/api/me/usage",       handler: handleGetMyUsage },
-    { method: "GET", path: "/api/public/config", handler: handleGetPublicConfig },
-    { method: "GET", path: "/api/public/models", handler: handleListPublicModels },
+    { method: 'GET', path: '/api/me/usage', handler: handleGetMyUsage },
+    { method: 'GET', path: '/api/public/config', handler: handleGetPublicConfig },
+    { method: 'GET', path: '/api/public/models', handler: handleListPublicModels },
     // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler
-    { method: "GET", path: "/api/models", handler: handleListPublicModels },
-    { method: "GET", path: "/api/payment/plans", handler: handleListPlans },
-    { method: "POST", path: "/api/payment/hupi/create", handler: handleCreateHupi },
-    { method: "POST", path: "/api/payment/hupi/callback", handler: handleHupiCallback },
-    { method: "GET", pathPrefix: "/api/payment/orders/", handler: handleGetOrder },
+    { method: 'GET', path: '/api/models', handler: handleListPublicModels },
+    { method: 'GET', path: '/api/payment/plans', handler: handleListPlans },
+    { method: 'POST', path: '/api/payment/hupi/create', handler: handleCreateHupi },
+    { method: 'POST', path: '/api/payment/hupi/callback', handler: handleHupiCallback },
+    { method: 'GET', pathPrefix: '/api/payment/orders/', handler: handleGetOrder },
     // T-53 Agent 订阅
-    { method: "POST", path: "/api/agent/open", handler: handleAgentOpen },
-    { method: "GET", path: "/api/agent/status", handler: handleAgentStatus },
-    { method: "POST", path: "/api/agent/cancel", handler: handleAgentCancel },
+    { method: 'POST', path: '/api/agent/open', handler: handleAgentOpen },
+    { method: 'GET', path: '/api/agent/status', handler: handleAgentStatus },
+    { method: 'POST', path: '/api/agent/cancel', handler: handleAgentCancel },
     // FEATURE_REMOTE_SSH —— 用户远程执行机 CRUD + test + reset-fingerprint。
     //   列表 / 创建走 exact path;读/改/删/action 走 prefix(handler 自抽 :id)。
     //   POST prefix 同时承载 /:id/test 和 /:id/reset-fingerprint,handler 内按 suffix 派发。
-    { method: "GET",    path: "/api/remote-hosts",        handler: handleListRemoteHosts },
-    { method: "POST",   path: "/api/remote-hosts",        handler: handleCreateRemoteHost },
-    { method: "GET",    pathPrefix: "/api/remote-hosts/", handler: handleGetRemoteHost },
-    { method: "PATCH",  pathPrefix: "/api/remote-hosts/", handler: handlePatchRemoteHost },
-    { method: "DELETE", pathPrefix: "/api/remote-hosts/", handler: handleDeleteRemoteHost },
-    { method: "POST",   pathPrefix: "/api/remote-hosts/", handler: handleRemoteHostAction },
+    { method: 'GET', path: '/api/remote-hosts', handler: handleListRemoteHosts },
+    { method: 'POST', path: '/api/remote-hosts', handler: handleCreateRemoteHost },
+    { method: 'GET', pathPrefix: '/api/remote-hosts/', handler: handleGetRemoteHost },
+    { method: 'PATCH', pathPrefix: '/api/remote-hosts/', handler: handlePatchRemoteHost },
+    { method: 'DELETE', pathPrefix: '/api/remote-hosts/', handler: handleDeleteRemoteHost },
+    { method: 'POST', pathPrefix: '/api/remote-hosts/', handler: handleRemoteHostAction },
     // T-54 Agent 审计(超管)
-    { method: "GET", path: "/api/admin/agent-audit", handler: handleAdminAgentAudit },
+    { method: 'GET', path: '/api/admin/agent-audit', handler: handleAdminAgentAudit },
     // T-60 超管 API —— 用户管理
-    { method: "GET",   path: "/api/admin/users",       handler: handleAdminListUsers },
+    { method: 'GET', path: '/api/admin/users', handler: handleAdminListUsers },
     // R2:exact path 在 pathPrefix 之前优先匹配,避免被 /users/:id 吞掉。
-    { method: "GET",   path: "/api/admin/users/stats", handler: handleAdminUsersStats },
+    { method: 'GET', path: '/api/admin/users/stats', handler: handleAdminUsersStats },
     // 动态路径用 pathPrefix。/api/admin/users/:id/credits 优先匹配,
     // 后退到 /api/admin/users/:id(GET/PATCH)。Handler 自己区分。
-    { method: "POST",  pathPrefix: "/api/admin/users/", handler: handleAdminAdjustCredits },
-    { method: "GET",   pathPrefix: "/api/admin/users/", handler: handleAdminGetUser },
-    { method: "PATCH", pathPrefix: "/api/admin/users/", handler: handleAdminPatchUser },
+    { method: 'POST', pathPrefix: '/api/admin/users/', handler: handleAdminAdjustCredits },
+    { method: 'GET', pathPrefix: '/api/admin/users/', handler: handleAdminGetUser },
+    { method: 'PATCH', pathPrefix: '/api/admin/users/', handler: handleAdminPatchUser },
     // T-60 超管审计记录
-    { method: "GET",   path: "/api/admin/audit",       handler: handleAdminListAudit },
+    { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
     // T-60 超管定价
-    { method: "GET",   path: "/api/admin/pricing",        handler: handleAdminListPricing },
-    { method: "PATCH", pathPrefix: "/api/admin/pricing/", handler: handleAdminPatchPricing },
+    { method: 'GET', path: '/api/admin/pricing', handler: handleAdminListPricing },
+    { method: 'PATCH', pathPrefix: '/api/admin/pricing/', handler: handleAdminPatchPricing },
     // T-60 超管充值套餐
-    { method: "GET",   path: "/api/admin/plans",          handler: handleAdminListPlans },
-    { method: "PATCH", pathPrefix: "/api/admin/plans/",   handler: handleAdminPatchPlan },
+    { method: 'GET', path: '/api/admin/plans', handler: handleAdminListPlans },
+    { method: 'PATCH', pathPrefix: '/api/admin/plans/', handler: handleAdminPatchPlan },
     // T-60 超管账号池
-    { method: "GET",    path: "/api/admin/accounts",         handler: handleAdminListAccounts },
-    { method: "POST",   path: "/api/admin/accounts",         handler: handleAdminCreateAccount },
+    { method: 'GET', path: '/api/admin/accounts', handler: handleAdminListAccounts },
+    { method: 'POST', path: '/api/admin/accounts', handler: handleAdminCreateAccount },
     // R3:exact path 在 pathPrefix 之前精确命中(matchRoute exact-first)
-    { method: "GET",    path: "/api/admin/accounts/stats",   handler: handleAdminAccountsStats },
+    { method: 'GET', path: '/api/admin/accounts/stats', handler: handleAdminAccountsStats },
     // OAuth 引导:exact path 必须排在 prefix 之前(prefix 才能 fall through)
-    { method: "POST",   path: "/api/admin/accounts/oauth/start",    handler: handleAdminOAuthStart },
-    { method: "POST",   path: "/api/admin/accounts/oauth/exchange", handler: handleAdminOAuthExchange },
+    { method: 'POST', path: '/api/admin/accounts/oauth/start', handler: handleAdminOAuthStart },
+    {
+      method: 'POST',
+      path: '/api/admin/accounts/oauth/exchange',
+      handler: handleAdminOAuthExchange,
+    },
     // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
     //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
     //  adjustCredits 走的是不同 prefix。
-    { method: "POST",   pathPrefix: "/api/admin/accounts/",  handler: handleAdminResetAccountCooldown },
-    { method: "GET",    pathPrefix: "/api/admin/accounts/",  handler: handleAdminGetAccount },
-    { method: "PATCH",  pathPrefix: "/api/admin/accounts/",  handler: handleAdminPatchAccount },
-    { method: "DELETE", pathPrefix: "/api/admin/accounts/",  handler: handleAdminDeleteAccount },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/accounts/',
+      handler: handleAdminResetAccountCooldown,
+    },
+    { method: 'GET', pathPrefix: '/api/admin/accounts/', handler: handleAdminGetAccount },
+    { method: 'PATCH', pathPrefix: '/api/admin/accounts/', handler: handleAdminPatchAccount },
+    { method: 'DELETE', pathPrefix: '/api/admin/accounts/', handler: handleAdminDeleteAccount },
     // T-60 超管 Agent 容器
-    { method: "GET",  path: "/api/admin/agent-containers",        handler: handleAdminListAgentContainers },
+    { method: 'GET', path: '/api/admin/agent-containers', handler: handleAdminListAgentContainers },
     // R4:exact path 在 pathPrefix 之前(matchRoute exact-first)
-    { method: "GET",  path: "/api/admin/agent-containers/stats",  handler: handleAdminContainersStats },
+    {
+      method: 'GET',
+      path: '/api/admin/agent-containers/stats',
+      handler: handleAdminContainersStats,
+    },
     // R4:GET /:id/logs(handler 内部 regex 匹配,其它 GET 子路径回 404)
-    { method: "GET",  pathPrefix: "/api/admin/agent-containers/", handler: handleAdminContainerLogs },
-    { method: "POST", pathPrefix: "/api/admin/agent-containers/", handler: handleAdminAgentContainerAction },
+    {
+      method: 'GET',
+      pathPrefix: '/api/admin/agent-containers/',
+      handler: handleAdminContainerLogs,
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/agent-containers/',
+      handler: handleAdminAgentContainerAction,
+    },
     // T-60 超管积分流水
     // P1-5: `.csv` 是写路由(写 audit),与 GET `/ledger` 共存。matchRoute 用 exact-first,
     // 两条 exact 互不干扰,顺序无关。
-    { method: "GET", path: "/api/admin/ledger.csv", handler: handleAdminExportLedgerCsv },
-    { method: "GET", path: "/api/admin/ledger", handler: handleAdminListLedger },
+    { method: 'GET', path: '/api/admin/ledger.csv', handler: handleAdminExportLedgerCsv },
+    { method: 'GET', path: '/api/admin/ledger', handler: handleAdminListLedger },
     // T-62 Prometheus 指标
-    { method: "GET", path: "/api/admin/metrics", handler: handleAdminMetrics },
+    { method: 'GET', path: '/api/admin/metrics', handler: handleAdminMetrics },
     // T-60 R1 Dashboard 聚合(只读,requireAdmin JWT only)
-    { method: "GET", path: "/api/admin/stats/dau",             handler: handleAdminStatsDau },
-    { method: "GET", path: "/api/admin/stats/revenue-by-day",  handler: handleAdminStatsRevenueByDay },
-    { method: "GET", path: "/api/admin/stats/request-series",  handler: handleAdminStatsRequestSeries },
-    { method: "GET", path: "/api/admin/stats/alerts-summary",  handler: handleAdminStatsAlertsSummary },
-    { method: "GET", path: "/api/admin/stats/account-pool",    handler: handleAdminStatsAccountPool },
+    { method: 'GET', path: '/api/admin/stats/dau', handler: handleAdminStatsDau },
+    {
+      method: 'GET',
+      path: '/api/admin/stats/revenue-by-day',
+      handler: handleAdminStatsRevenueByDay,
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/stats/request-series',
+      handler: handleAdminStatsRequestSeries,
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/stats/alerts-summary',
+      handler: handleAdminStatsAlertsSummary,
+    },
+    { method: 'GET', path: '/api/admin/stats/account-pool', handler: handleAdminStatsAccountPool },
     // V3 Phase 4H 超管运行时设置(allowlist + per-key zod)
-    { method: "GET", path: "/api/admin/settings",         handler: handleAdminListSettings },
-    { method: "GET", pathPrefix: "/api/admin/settings/",  handler: handleAdminGetSetting },
-    { method: "PUT", pathPrefix: "/api/admin/settings/",  handler: handleAdminPutSetting },
+    { method: 'GET', path: '/api/admin/settings', handler: handleAdminListSettings },
+    { method: 'GET', pathPrefix: '/api/admin/settings/', handler: handleAdminGetSetting },
+    { method: 'PUT', pathPrefix: '/api/admin/settings/', handler: handleAdminPutSetting },
     // T-63 超管告警(WeChat 推送)—— exact path 在前,prefix 在后
-    { method: "GET",    path: "/api/admin/alerts/events",        handler: handleAdminAlertsListEvents },
-    { method: "GET",    path: "/api/admin/alerts/channels",      handler: handleAdminAlertsListChannels },
-    { method: "POST",   path: "/api/admin/alerts/ilink/qrcode",  handler: handleAdminAlertsIlinkQrcode },
-    { method: "POST",   path: "/api/admin/alerts/ilink/poll",    handler: handleAdminAlertsIlinkPoll },
-    { method: "GET",    path: "/api/admin/alerts/outbox",        handler: handleAdminAlertsListOutbox },
-    { method: "GET",    path: "/api/admin/alerts/silences",      handler: handleAdminAlertsListSilences },
-    { method: "POST",   path: "/api/admin/alerts/silences",      handler: handleAdminAlertsCreateSilence },
-    { method: "GET",    path: "/api/admin/alerts/rule-states",   handler: handleAdminAlertsListRuleStates },
+    { method: 'GET', path: '/api/admin/alerts/events', handler: handleAdminAlertsListEvents },
+    { method: 'GET', path: '/api/admin/alerts/channels', handler: handleAdminAlertsListChannels },
+    {
+      method: 'POST',
+      path: '/api/admin/alerts/ilink/qrcode',
+      handler: handleAdminAlertsIlinkQrcode,
+    },
+    { method: 'POST', path: '/api/admin/alerts/ilink/poll', handler: handleAdminAlertsIlinkPoll },
+    { method: 'GET', path: '/api/admin/alerts/outbox', handler: handleAdminAlertsListOutbox },
+    { method: 'GET', path: '/api/admin/alerts/silences', handler: handleAdminAlertsListSilences },
+    { method: 'POST', path: '/api/admin/alerts/silences', handler: handleAdminAlertsCreateSilence },
+    {
+      method: 'GET',
+      path: '/api/admin/alerts/rule-states',
+      handler: handleAdminAlertsListRuleStates,
+    },
     // /api/admin/alerts/channels/:id   (PATCH / DELETE)
     // /api/admin/alerts/channels/:id/test (POST) —— handler 自己校验后缀
-    { method: "PATCH",  pathPrefix: "/api/admin/alerts/channels/", handler: handleAdminAlertsPatchChannel },
-    { method: "DELETE", pathPrefix: "/api/admin/alerts/channels/", handler: handleAdminAlertsDeleteChannel },
-    { method: "POST",   pathPrefix: "/api/admin/alerts/channels/", handler: handleAdminAlertsTestChannel },
+    // exact route 优先于 prefix(router 先 exact 后 prefix),保证 /telegram
+    // 不会被 :id dispatcher 吞掉。
+    {
+      method: 'POST',
+      path: '/api/admin/alerts/channels/telegram',
+      handler: handleAdminAlertsCreateTelegramChannel,
+    },
+    {
+      method: 'PATCH',
+      pathPrefix: '/api/admin/alerts/channels/',
+      handler: handleAdminAlertsPatchChannel,
+    },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/admin/alerts/channels/',
+      handler: handleAdminAlertsDeleteChannel,
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/alerts/channels/',
+      handler: handleAdminAlertsTestChannel,
+    },
     // /api/admin/alerts/silences/:id   (DELETE)
-    { method: "DELETE", pathPrefix: "/api/admin/alerts/silences/", handler: handleAdminAlertsDeleteSilence },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/admin/alerts/silences/',
+      handler: handleAdminAlertsDeleteSilence,
+    },
     // V3 D.3 多机 compute_hosts 管理(超管)
     //   exact path 优先于 pathPrefix(matchRoute exact-first),所以
     //   /compute-hosts 和 /compute-hosts/add 不会被 prefix handler 吞掉。
     //   pathPrefix GET 只命中 /:id/bootstrap-log,handler 自己 404 其它后缀。
     //   pathPrefix POST 按 action 分发 drain / remove / quarantine-clear。
-    { method: "GET",  path: "/api/admin/v3/compute-hosts",        handler: handleAdminListComputeHosts },
-    { method: "POST", path: "/api/admin/v3/compute-hosts/add",    handler: handleAdminAddComputeHost },
-    { method: "GET",  path: "/api/admin/v3/baseline-version",     handler: handleAdminBaselineVersion },
-    { method: "GET",  pathPrefix: "/api/admin/v3/compute-hosts/", handler: handleAdminComputeHostBootstrapLog },
-    { method: "POST", pathPrefix: "/api/admin/v3/compute-hosts/", handler: handleAdminComputeHostAction },
+    { method: 'GET', path: '/api/admin/v3/compute-hosts', handler: handleAdminListComputeHosts },
+    { method: 'POST', path: '/api/admin/v3/compute-hosts/add', handler: handleAdminAddComputeHost },
+    { method: 'GET', path: '/api/admin/v3/baseline-version', handler: handleAdminBaselineVersion },
+    {
+      method: 'GET',
+      pathPrefix: '/api/admin/v3/compute-hosts/',
+      handler: handleAdminComputeHostBootstrapLog,
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/v3/compute-hosts/',
+      handler: handleAdminComputeHostAction,
+    },
     // P1-2 用户反馈入库(commercial 接管;gateway/server.ts:1325 那段对 commercial 已是死路)
     //   匿名 / 已登录均可,IP 限流防 spam(handler 内 enforceRateLimit)
-    { method: "POST", path: "/api/feedback", handler: handleSubmitFeedback },
+    { method: 'POST', path: '/api/feedback', handler: handleSubmitFeedback },
     // P0-3 订单 admin —— exact path 在 prefix 之前(matchRoute exact-first)
     //   /api/admin/orders/kpi 必须排前,否则会被 /api/admin/orders/ prefix 吞成 ORDER_NOT_FOUND
-    { method: "GET",  path: "/api/admin/orders",       handler: handleAdminListOrders },
-    { method: "GET",  path: "/api/admin/orders/kpi",   handler: handleAdminOrdersKpi },
-    { method: "GET",  pathPrefix: "/api/admin/orders/", handler: handleAdminGetOrder },
+    { method: 'GET', path: '/api/admin/orders', handler: handleAdminListOrders },
+    { method: 'GET', path: '/api/admin/orders/kpi', handler: handleAdminOrdersKpi },
+    { method: 'GET', pathPrefix: '/api/admin/orders/', handler: handleAdminGetOrder },
     // P1-2 反馈 admin —— GET 列表 / POST :id/ack
-    { method: "GET",  path: "/api/admin/feedback",       handler: handleAdminListFeedback },
-    { method: "POST", pathPrefix: "/api/admin/feedback/", handler: handleAdminAckFeedback },
-  ];
+    { method: 'GET', path: '/api/admin/feedback', handler: handleAdminListFeedback },
+    { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminAckFeedback },
+  ]
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [
-    "/api/auth/",
-    "/api/me",
-    "/api/public/",
-    "/api/models", // V3 2F: alias of /api/public/models, GET only
-    "/api/payment/",
-    "/api/agent/",
-    "/api/admin/",
+    '/api/auth/',
+    '/api/me',
+    '/api/public/',
+    '/api/models', // V3 2F: alias of /api/public/models, GET only
+    '/api/payment/',
+    '/api/agent/',
+    '/api/admin/',
     // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`
-    "/api/remote-hosts",
+    '/api/remote-hosts',
     // P1-2 (2026-04-25):commercial 接管 /api/feedback POST,阻止 fall through
     // 到 gateway/server.ts:1325 的文件落盘 handler
-    "/api/feedback",
-  ];
+    '/api/feedback',
+  ]
 
   return async function commercialHandler(req, res): Promise<boolean> {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-    const path = url.pathname;
-    const method = req.method ?? "GET";
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)
+    const path = url.pathname
+    const method = req.method ?? 'GET'
 
     // ── V3 Phase 4H+ maintenance 闸门 ────────────────────────────────────
     //
@@ -544,31 +612,27 @@ export function createCommercialHandler(
     //   - /api/auth/refresh   —— 不因短暂维护把所有在线用户强踢 token 过期
     //
     // 这里**先检查 isOurs**,把 "不关心的路径(如 /ws 、/healthz)" 留给下层。
-    const isOursForMaintenance = prefixes.some((p) => path === p || path.startsWith(p));
+    const isOursForMaintenance = prefixes.some((p) => path === p || path.startsWith(p))
     const isAllowlistForMaintenance =
-      path.startsWith("/api/admin/") ||
-      path === "/api/public/config" ||
-      path === "/api/auth/logout" ||
-      path === "/api/auth/refresh";
-    if (
-      isOursForMaintenance &&
-      !isAllowlistForMaintenance &&
-      (await isInMaintenance())
-    ) {
-      const token = extractTokenFromReq(req);
-      const adminOk = await isActiveAdmin(req, token, deps.jwtSecret);
+      path.startsWith('/api/admin/') ||
+      path === '/api/public/config' ||
+      path === '/api/auth/logout' ||
+      path === '/api/auth/refresh'
+    if (isOursForMaintenance && !isAllowlistForMaintenance && (await isInMaintenance())) {
+      const token = extractTokenFromReq(req)
+      const adminOk = await isActiveAdmin(req, token, deps.jwtSecret)
       if (!adminOk) {
-        setSecurityHeaders(res);
-        const requestId = ensureRequestId(req);
-        res.setHeader(REQUEST_ID_HEADER, requestId);
-        httpLogger.child({ requestId, route: "__maintenance__", method, path })
-          .warn("maintenance_block");
-        sendError(
-          res, 503, "MAINTENANCE", "服务正在维护中,请稍后再试",
-          requestId, undefined, { "Retry-After": 60 },
-        );
-        incrGatewayRequest("__maintenance__", method, res.statusCode);
-        return true;
+        setSecurityHeaders(res)
+        const requestId = ensureRequestId(req)
+        res.setHeader(REQUEST_ID_HEADER, requestId)
+        httpLogger
+          .child({ requestId, route: '__maintenance__', method, path })
+          .warn('maintenance_block')
+        sendError(res, 503, 'MAINTENANCE', '服务正在维护中,请稍后再试', requestId, undefined, {
+          'Retry-After': 60,
+        })
+        incrGatewayRequest('__maintenance__', method, res.statusCode)
+        return true
       }
     }
 
@@ -585,45 +649,45 @@ export function createCommercialHandler(
     const proxyRule =
       deps.v3Supervisor && deps.bridgeSecret
         ? matchProxyRule(path, method, !!deps.fileProxyEnabled)
-        : null;
+        : null
     if (proxyRule) {
-      setSecurityHeaders(res);
-      const requestId = ensureRequestId(req);
-      res.setHeader(REQUEST_ID_HEADER, requestId);
-      const proxyLog = (options.logger ?? rootLogger.child({ subsys: "commercial" })).child({
+      setSecurityHeaders(res)
+      const requestId = ensureRequestId(req)
+      res.setHeader(REQUEST_ID_HEADER, requestId)
+      const proxyLog = (options.logger ?? rootLogger.child({ subsys: 'commercial' })).child({
         requestId,
-        route: "__file_proxy__",
+        route: '__file_proxy__',
         rule: proxyRule.label,
         method,
         path,
         clientIp: clientIpOf(req),
-      });
-      const token = extractTokenFromReq(req);
-      const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
+      })
+      const token = extractTokenFromReq(req)
+      const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null
       if (!claims) {
         // 无 / 过期 / 伪造 → fall through 给 BLOCKED(最终 401)
         // 不在这里 return true:让 BLOCKED 分支写响应
-      } else if (claims.role === "admin") {
+      } else if (claims.role === 'admin') {
         // admin → 走 BLOCKED 的 admin bypass(保留运维查盘能力)
         // 同样 fall through
       } else {
         // commercial user:DB double-check status=active
-        const verified = await requireUserVerifyDb(claims.sub, deps.v3Supervisor!.pool);
+        const verified = await requireUserVerifyDb(claims.sub, deps.v3Supervisor!.pool)
         if (!verified) {
-          proxyLog.warn("file_proxy_user_inactive", { sub: claims.sub });
-          sendError(res, 403, "FORBIDDEN", "user account not active", requestId);
-          incrGatewayRequest("__file_proxy__", method, res.statusCode);
-          return true;
+          proxyLog.warn('file_proxy_user_inactive', { sub: claims.sub })
+          sendError(res, 403, 'FORBIDDEN', 'user account not active', requestId)
+          incrGatewayRequest('__file_proxy__', method, res.statusCode)
+          return true
         }
-        proxyLog.info("file_proxy_dispatch", { sub: claims.sub });
+        proxyLog.info('file_proxy_dispatch', { sub: claims.sub })
         const ctx: RequestContext = {
           requestId,
           clientIp: clientIpOf(req),
-          authBoundIp: req.socket.remoteAddress ?? "unknown",
+          authBoundIp: req.socket.remoteAddress ?? 'unknown',
           userAgent: userAgentOf(req),
           log: proxyLog,
-        };
-        const startedAt = Date.now();
+        }
+        const startedAt = Date.now()
         try {
           await containerFileProxy(
             req,
@@ -634,15 +698,15 @@ export function createCommercialHandler(
               bridgeSecret: deps.bridgeSecret!,
             },
             BigInt(claims.sub),
-          );
+          )
         } catch (err) {
           // containerFileProxy 内部已 catch,这里兜底
-          handleError(err, res, requestId, proxyLog);
+          handleError(err, res, requestId, proxyLog)
         }
-        incrGatewayRequest("__file_proxy__", method, res.statusCode);
-        const durationMs = Date.now() - startedAt;
-        proxyLog.info("http_request", { status: res.statusCode, durationMs });
-        return true;
+        incrGatewayRequest('__file_proxy__', method, res.statusCode)
+        const durationMs = Date.now() - startedAt
+        proxyLog.info('http_request', { status: res.statusCode, durationMs })
+        return true
       }
       // fall through 到 BLOCKED 分支 —— 不写 res,让 BLOCKED 接管
     }
@@ -651,93 +715,96 @@ export function createCommercialHandler(
     // 见 BLOCKED_FOR_USER_RULES 注释。在 `isOurs` 前就做,保证 host-scope endpoint
     // 在 gateway 自己的 handler 执行前被拦。method-scoped 匹配 —— rule.methods 为空 =
     // 所有方法都拦;有值 = 只拦枚举方法。
-    const blockedRule = matchBlockedRule(path, method);
+    const blockedRule = matchBlockedRule(path, method)
     if (blockedRule) {
-      setSecurityHeaders(res);
-      const requestId = ensureRequestId(req);
-      res.setHeader(REQUEST_ID_HEADER, requestId);
-      const blockLog = (options.logger ?? rootLogger.child({ subsys: "commercial" })).child({
+      setSecurityHeaders(res)
+      const requestId = ensureRequestId(req)
+      res.setHeader(REQUEST_ID_HEADER, requestId)
+      const blockLog = (options.logger ?? rootLogger.child({ subsys: 'commercial' })).child({
         requestId,
-        route: "__blocked_for_user__",
+        route: '__blocked_for_user__',
         rule: blockedRule.label,
         method,
         path,
         clientIp: clientIpOf(req),
-      });
-      const token = extractTokenFromReq(req);
-      const claims = verifyCommercialJwtSync(token, deps.jwtSecret);
+      })
+      const token = extractTokenFromReq(req)
+      const claims = verifyCommercialJwtSync(token, deps.jwtSecret)
       if (claims) {
-        if (claims.role === "admin") {
+        if (claims.role === 'admin') {
           // admin: DB double-check(role/status 撤权立即生效),通过后 fall through
           try {
-            const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
-            blockLog.info("blocked_for_user_admin_bypass", {
+            const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
+            blockLog.info('blocked_for_user_admin_bypass', {
               sub: claims.sub,
               adminId: admin.id,
-            });
+            })
             // admin bypass 审计:写 admin_audit,方便事后查"谁在 host 敏感路由上动手"。
             // 失败不影响放行(best-effort);审计写失败仅记 warn,避免"DB 故障导致 admin
             // 运维路径被误杀"。
             writeAdminAudit(getPool(), {
               adminId: admin.id,
-              action: "blocked_route_bypass",
+              action: 'blocked_route_bypass',
               target: `${method} ${blockedRule.label}`,
               before: null,
               after: { path },
               ip: clientIpOf(req),
               userAgent: userAgentOf(req),
             }).catch((err) => {
-              blockLog.warn("admin_audit_write_failed", {
+              blockLog.warn('admin_audit_write_failed', {
                 err: err instanceof Error ? err.message : String(err),
-              });
-            });
+              })
+            })
             // 不 return true —— 让 gateway 自己的 handler 继续处理
-            return false;
+            return false
           } catch (err) {
             // admin 身份 DB 失效 → 403(不是 401,token 本身有效,是身份被撤)
-            handleError(err, res, requestId, blockLog);
-            incrGatewayRequest("__blocked_for_user__", method, res.statusCode);
-            return true;
+            handleError(err, res, requestId, blockLog)
+            incrGatewayRequest('__blocked_for_user__', method, res.statusCode)
+            return true
           }
         }
         // 普通付费用户:直接 403
-        blockLog.warn("blocked_for_user", { sub: claims.sub });
+        blockLog.warn('blocked_for_user', { sub: claims.sub })
         sendError(
           res,
           403,
-          "FORBIDDEN",
-          "this endpoint is not available in commercial mode",
+          'FORBIDDEN',
+          'this endpoint is not available in commercial mode',
           requestId,
-        );
-        incrGatewayRequest("__blocked_for_user__", method, res.statusCode);
-        return true;
+        )
+        incrGatewayRequest('__blocked_for_user__', method, res.statusCode)
+        return true
       }
       // 无 commercial JWT:可能是 legacy 单 token / 无 token / 非法 token。
       // 不在这里拦 —— fall through 给 gateway 自己的 auth 层按正常 401/403 流程处理。
-      return false;
+      return false
     }
 
-    const isOurs = prefixes.some((p) => path === p || path.startsWith(p));
-    if (!isOurs) return false;
+    const isOurs = prefixes.some((p) => path === p || path.startsWith(p))
+    if (!isOurs) return false
 
-    setSecurityHeaders(res);
-    const requestId = ensureRequestId(req);
-    res.setHeader(REQUEST_ID_HEADER, requestId);
+    setSecurityHeaders(res)
+    const requestId = ensureRequestId(req)
+    res.setHeader(REQUEST_ID_HEADER, requestId)
 
     // 1) 精确匹配 —— 同一 path 下可能有多个 method(例:PATCH + GET /api/admin/users/:id)
-    const exactCandidates = routes.filter((r) => r.path !== undefined && r.path === path);
+    const exactCandidates = routes.filter((r) => r.path !== undefined && r.path === path)
     // 2) 前缀匹配(仅在精确不中时尝试)。T-60 同 prefix 下 GET/PATCH/POST 并存,必须
     //    在 candidates 里挑 method 匹配项;否则拿到首个(可能是 POST)就抛 405。
-    const prefixCandidates = exactCandidates.length === 0
-      ? routes.filter((r) => r.pathPrefix !== undefined && path.startsWith(r.pathPrefix))
-      : [];
-    const candidates = exactCandidates.length > 0 ? exactCandidates : prefixCandidates;
-    const route = candidates.find((r) => r.method === method);
+    const prefixCandidates =
+      exactCandidates.length === 0
+        ? routes.filter((r) => r.pathPrefix !== undefined && path.startsWith(r.pathPrefix))
+        : []
+    const candidates = exactCandidates.length > 0 ? exactCandidates : prefixCandidates
+    const route = candidates.find((r) => r.method === method)
     // route label —— 同时给 metrics 与 access log 使用
     const labelRoute =
-      route?.path ?? route?.pathPrefix ??
-      candidates[0]?.path ?? candidates[0]?.pathPrefix ??
-      "__unmatched__";
+      route?.path ??
+      route?.pathPrefix ??
+      candidates[0]?.path ??
+      candidates[0]?.pathPrefix ??
+      '__unmatched__'
 
     // V3 2I-1:在 dispatch 前派生 per-request logger,挂进 ctx;
     // 任何下游 handler / preCheck / proxy / finalize 都通过 ctx.log 派生子 logger,
@@ -747,33 +814,33 @@ export function createCommercialHandler(
       route: labelRoute,
       method,
       clientIp: clientIpOf(req),
-    });
+    })
 
     const ctx: RequestContext = {
       requestId,
       clientIp: clientIpOf(req),
       // 稳定出口 IP —— 不经任何反代 header 解析,给 auth bound_ip 用。
       // Caddy 反代时 = 127.0.0.1,直连 = 公网 IP。详见 RequestContext 的 JSDoc。
-      authBoundIp: req.socket.remoteAddress ?? "unknown",
+      authBoundIp: req.socket.remoteAddress ?? 'unknown',
       userAgent: userAgentOf(req),
       log: reqLog,
-    };
+    }
 
-    const startedAt = Date.now();
+    const startedAt = Date.now()
     try {
       if (candidates.length === 0) {
-        throw new HttpError(404, "NOT_FOUND", "endpoint not found");
+        throw new HttpError(404, 'NOT_FOUND', 'endpoint not found')
       }
       if (!route) {
         // method mismatch:返合并后的 Allow 头(该 path 下所有已定义 method)
-        const allowed = [...new Set(candidates.map((r) => r.method))].join(", ");
-        throw new HttpError(405, "METHOD_NOT_ALLOWED", `method ${method} not allowed`, {
+        const allowed = [...new Set(candidates.map((r) => r.method))].join(', ')
+        throw new HttpError(405, 'METHOD_NOT_ALLOWED', `method ${method} not allowed`, {
           extraHeaders: { Allow: allowed },
-        });
+        })
       }
-      await route.handler(req, res, ctx, deps);
+      await route.handler(req, res, ctx, deps)
     } catch (err) {
-      handleError(err, res, requestId, reqLog);
+      handleError(err, res, requestId, reqLog)
     }
     // T-62 metrics:route label 严格用 "声明的 path/pathPrefix"。
     //   - 405 (method mismatch):仍有 candidates → 取首个的声明 label,Prometheus
@@ -781,41 +848,36 @@ export function createCommercialHandler(
     //   - 404 (无 candidates):落到固定 `__unmatched__`,**不要**把原始 path 刷
     //     进 label —— `/api/admin/foo-<uuid>` 之类会让 label 基数爆掉。
     //   status 直接拿响应对象实际写出的码,对齐真实 401/403/402/5xx。
-    incrGatewayRequest(labelRoute, method, res.statusCode);
+    incrGatewayRequest(labelRoute, method, res.statusCode)
     // V3 2I-1:access log 一行,含 status / 耗时。错误已经在 handleError 内
     // 用 error 级别详记过(含异常)。这条统一收尾。
-    const durationMs = Date.now() - startedAt;
-    reqLog.info("http_request", { status: res.statusCode, durationMs });
-    return true;
-  };
+    const durationMs = Date.now() - startedAt
+    reqLog.info('http_request', { status: res.statusCode, durationMs })
+    return true
+  }
 }
 
-function handleError(
-  err: unknown,
-  res: ServerResponse,
-  requestId: string,
-  log: Logger,
-): void {
+function handleError(err: unknown, res: ServerResponse, requestId: string, log: Logger): void {
   if (res.headersSent) {
     // 响应已发出,无能为力 — 关连接
-    log.warn("http_response_after_headers_sent", { err: errorSummary(err) });
-    res.destroy();
-    return;
+    log.warn('http_response_after_headers_sent', { err: errorSummary(err) })
+    res.destroy()
+    return
   }
   if (err instanceof HttpError) {
     // 预期内的业务错(401/403/404/4xx 大多在这里):记 warn,不拉警报
-    log.warn("http_error", { status: err.status, code: err.code, message: err.message });
-    sendError(res, err.status, err.code, err.message, requestId, err.issues, err.extraHeaders);
-    return;
+    log.warn('http_error', { status: err.status, code: err.code, message: err.message })
+    sendError(res, err.status, err.code, err.message, requestId, err.issues, err.extraHeaders)
+    return
   }
   // 未捕获 → 500;记 error 级别,带 stack
-  log.error("http_unhandled_error", { err: errorSummary(err) });
-  sendError(res, 500, "INTERNAL", "internal server error", requestId);
+  log.error('http_unhandled_error', { err: errorSummary(err) })
+  sendError(res, 500, 'INTERNAL', 'internal server error', requestId)
 }
 
 function errorSummary(err: unknown): Record<string, unknown> {
   if (err instanceof Error) {
-    return { name: err.name, message: err.message, stack: err.stack };
+    return { name: err.name, message: err.message, stack: err.stack }
   }
-  return { value: String(err) };
+  return { value: String(err) }
 }

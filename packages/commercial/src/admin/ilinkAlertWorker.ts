@@ -24,7 +24,7 @@ import {
   sendIlinkText,
   extractIlinkText,
   ILINK_SESSION_EXPIRED,
-} from "../../../channels/wechat/src/iLink.js";
+} from '../../../channels/wechat/src/iLink.js'
 import {
   listDispatchableChannels,
   loadChannelSecrets,
@@ -33,90 +33,92 @@ import {
   updateChannelBuf,
   updateChannelInbound,
   type AlertChannelRow,
-} from "./alertChannels.js";
-import {
-  claimReadyAlerts,
-  markFailed,
-  markSent,
-  skipPendingForChannel,
-} from "./alertOutbox.js";
+} from './alertChannels.js'
+import { claimReadyAlerts, markFailed, markSent, skipPendingForChannel } from './alertOutbox.js'
+import { sendTelegramAlert, TelegramPermanentError } from './telegramAlertSender.js'
 
 // ─── 配置 ─────────────────────────────────────────────────────────────
 
 export interface IlinkWorkerOptions {
   /** dispatcher 扫 outbox 的间隔。默认 5s,下限 500ms。 */
-  dispatchIntervalMs?: number;
+  dispatchIntervalMs?: number
   /** 刷新 channel 列表的间隔(用于检测新加 / 删除的 channel)。默认 30s。 */
-  refreshChannelsIntervalMs?: number;
+  refreshChannelsIntervalMs?: number
   /** long-poll 循环错误后回退时间。默认 10s 起,指数退避封顶 5min。 */
-  pollBackoffMinMs?: number;
-  pollBackoffMaxMs?: number;
+  pollBackoffMinMs?: number
+  pollBackoffMaxMs?: number
   /** 如为 true,worker 不真正 fetch,只扫 outbox 走测试 sender(测试用)。 */
-  disableLongPoll?: boolean;
+  disableLongPoll?: boolean
   /** 替换真实 iLink 函数(测试用)。 */
   inject?: {
-    sendIlinkText?: typeof sendIlinkText;
-    getIlinkUpdates?: typeof getIlinkUpdates;
-  };
+    sendIlinkText?: typeof sendIlinkText
+    getIlinkUpdates?: typeof getIlinkUpdates
+  }
   /** 错误回调;默认 console.warn。 */
-  onError?: (scope: string, err: unknown) => void;
+  onError?: (scope: string, err: unknown) => void
 }
 
 export interface IlinkWorkerHandle {
-  stop(): Promise<void>;
+  stop(): Promise<void>
   /** 测试:强制跑一次 dispatch tick。 */
-  dispatchNow(): Promise<number>;
+  dispatchNow(): Promise<number>
   /** 当前活跃 long-poll channel ids。 */
-  activeChannels(): Set<string>;
+  activeChannels(): Set<string>
 }
 
 export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorkerHandle {
-  const dispatchMs = Math.max(500, opts.dispatchIntervalMs ?? 5_000);
-  const refreshMs = Math.max(5_000, opts.refreshChannelsIntervalMs ?? 30_000);
-  const pollMin = Math.max(1_000, opts.pollBackoffMinMs ?? 10_000);
-  const pollMax = Math.max(pollMin, opts.pollBackoffMaxMs ?? 300_000);
-  const onError = opts.onError ?? ((scope, err) => {
-    // eslint-disable-next-line no-console
-    console.warn(`[admin/ilinkWorker] ${scope}:`, err);
-  });
+  const dispatchMs = Math.max(500, opts.dispatchIntervalMs ?? 5_000)
+  const refreshMs = Math.max(5_000, opts.refreshChannelsIntervalMs ?? 30_000)
+  const pollMin = Math.max(1_000, opts.pollBackoffMinMs ?? 10_000)
+  const pollMax = Math.max(pollMin, opts.pollBackoffMaxMs ?? 300_000)
+  const onError =
+    opts.onError ??
+    ((scope, err) => {
+      // eslint-disable-next-line no-console
+      console.warn(`[admin/ilinkWorker] ${scope}:`, err)
+    })
 
-  const sendFn = opts.inject?.sendIlinkText ?? sendIlinkText;
-  const getUpdatesFn = opts.inject?.getIlinkUpdates ?? getIlinkUpdates;
+  const sendFn = opts.inject?.sendIlinkText ?? sendIlinkText
+  const getUpdatesFn = opts.inject?.getIlinkUpdates ?? getIlinkUpdates
 
-  let stopped = false;
-  const channelLoops = new Map<string, AbortController>();
+  let stopped = false
+  const channelLoops = new Map<string, AbortController>()
 
   // ── channel refresh loop ───────────────────────────────────────────
   const refreshTimer = setInterval(() => {
-    if (stopped || opts.disableLongPoll) return;
-    void syncChannelLoops();
-  }, refreshMs);
-  if (typeof refreshTimer.unref === "function") refreshTimer.unref();
+    if (stopped || opts.disableLongPoll) return
+    void syncChannelLoops()
+  }, refreshMs)
+  if (typeof refreshTimer.unref === 'function') refreshTimer.unref()
 
   async function syncChannelLoops(): Promise<void> {
     try {
-      const channels = await listDispatchableChannels();
-      const desired = new Set<string>();
+      const channels = await listDispatchableChannels()
+      const desired = new Set<string>()
       for (const ch of channels) {
-        if (ch.channel_type !== "ilink_wechat") continue;
-        if (!ch.enabled) continue;
-        if (ch.activation_status !== "active" && ch.activation_status !== "pending") continue;
-        desired.add(ch.id);
+        if (ch.channel_type !== 'ilink_wechat') continue
+        if (!ch.enabled) continue
+        if (ch.activation_status !== 'active' && ch.activation_status !== 'pending') continue
+        desired.add(ch.id)
       }
       // stop 离场的
       for (const [id, ctrl] of channelLoops.entries()) {
         if (!desired.has(id)) {
-          ctrl.abort();
-          channelLoops.delete(id);
+          ctrl.abort()
+          channelLoops.delete(id)
           // 属于此 channel 的 pending outbox 也清掉
-          try { await skipPendingForChannel(id); } catch (err) { onError("skipPending", err); }
+          try {
+            await skipPendingForChannel(id)
+          } catch (err) {
+            onError('skipPending', err)
+          }
         }
       }
       // start 新加的
       for (const id of desired) {
         if (!channelLoops.has(id)) {
-          const ctrl = new AbortController();
-          channelLoops.set(id, ctrl);
+          const ctrl = new AbortController()
+          channelLoops.set(id, ctrl)
           // 自清理:runChannelLongPoll 在 session_expired / 其他 return 时
           // 必须把自己从 map 里摘掉,否则下轮 syncChannelLoops 看到 desired.has(id)
           // + channelLoops.has(id) 会以为还在跑,跳过重启,导致 admin 重新激活
@@ -124,53 +126,60 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
           // `=== ctrl` 防御性检查:万一将来谁在外部 stop 并替换了 entry,
           // 不把别人的 ctrl 抹掉。
           void runChannelLongPoll(id, ctrl.signal).finally(() => {
-            if (channelLoops.get(id) === ctrl) channelLoops.delete(id);
-          });
+            if (channelLoops.get(id) === ctrl) channelLoops.delete(id)
+          })
         }
       }
     } catch (err) {
-      onError("syncChannelLoops", err);
+      onError('syncChannelLoops', err)
     }
   }
 
   // 启动时先同步一次
   if (!opts.disableLongPoll) {
-    void syncChannelLoops();
+    void syncChannelLoops()
   }
 
   async function runChannelLongPoll(channelId: string, signal: AbortSignal): Promise<void> {
-    let backoff = pollMin;
+    let backoff = pollMin
     while (!stopped && !signal.aborted) {
       const secrets = await loadChannelSecrets(channelId).catch((err) => {
-        onError(`loadSecrets[${channelId}]`, err);
-        return null;
-      });
+        onError(`loadSecrets[${channelId}]`, err)
+        return null
+      })
       if (!secrets) {
         // 没凭据:等一会儿再试,可能刚 create 完还没 commit
-        await sleep(backoff, signal);
-        backoff = Math.min(pollMax, backoff * 2);
-        continue;
+        await sleep(backoff, signal)
+        backoff = Math.min(pollMax, backoff * 2)
+        continue
       }
-      let resp: Record<string, unknown>;
+      let resp: Record<string, unknown>
       try {
-        resp = (await getUpdatesFn(secrets.botToken, secrets.getUpdatesBuf)) as Record<string, unknown>;
-        backoff = pollMin; // 成功:重置退避
+        resp = (await getUpdatesFn(secrets.botToken, secrets.getUpdatesBuf)) as Record<
+          string,
+          unknown
+        >
+        backoff = pollMin // 成功:重置退避
       } catch (err) {
-        if (signal.aborted) return;
-        onError(`getUpdates[${channelId}]`, err);
-        await markChannelError(channelId, (err as Error)?.message ?? String(err)).catch(() => {});
-        await sleep(backoff, signal);
-        backoff = Math.min(pollMax, backoff * 2);
-        continue;
+        if (signal.aborted) return
+        onError(`getUpdates[${channelId}]`, err)
+        await markChannelError(channelId, (err as Error)?.message ?? String(err)).catch(() => {})
+        await sleep(backoff, signal)
+        backoff = Math.min(pollMax, backoff * 2)
+        continue
       }
 
       // session expired
       // iLink /getupdates 错误码实际走 `errcode` 或 `ret` 字段(见
       // packages/channels/wechat/src/worker.ts:162-183 的范式),不是 ret_code/code。
-      const errcode = Number((resp as { errcode?: number })?.errcode ?? 0);
-      const ret = Number((resp as { ret?: number })?.ret ?? 0);
+      const errcode = Number((resp as { errcode?: number })?.errcode ?? 0)
+      const ret = Number((resp as { ret?: number })?.ret ?? 0)
       if (errcode === ILINK_SESSION_EXPIRED || ret === ILINK_SESSION_EXPIRED) {
-        await markChannelError(channelId, "iLink session expired (errcode=-14)", true).catch(() => {});
+        await markChannelError(
+          channelId,
+          'iLink session expired (errcode=-14)',
+          'session_expired',
+        ).catch(() => {})
         // 会话过期 → 通道变 error,轮询退出,管理员需重新扫码 / rebind
         //
         // 这里显式 skip 该 channel 的 pending outbox:
@@ -178,15 +187,19 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
         // 所以下一轮 sync 的"离场分支"不会再看到 entry,也就不会帮忙 skip。
         // 不 skip 的话 dispatcher 会把 pending 行反复打回 failed 直到 attempts 用完,
         // 还会占着 partial-unique dedupe 位让新告警丢条。
-        try { await skipPendingForChannel(channelId); } catch (err) { onError("skipPending(session_expired)", err); }
-        return;
+        try {
+          await skipPendingForChannel(channelId)
+        } catch (err) {
+          onError('skipPending(session_expired)', err)
+        }
+        return
       }
 
       // parse updates
       try {
-        await handleUpdates(channelId, resp, secrets.getUpdatesBuf);
+        await handleUpdates(channelId, resp, secrets.getUpdatesBuf)
       } catch (err) {
-        onError(`handleUpdates[${channelId}]`, err);
+        onError(`handleUpdates[${channelId}]`, err)
       }
     }
   }
@@ -200,39 +213,41 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
     //   - 消息数组在 `msgs` 字段(不是 `updates`)
     //   - 新游标在 `get_updates_buf`;偶尔还会带 `sync_buf`,兜底从它取
     const rawNextBuf =
-      typeof resp.get_updates_buf === "string" && resp.get_updates_buf.trim()
+      typeof resp.get_updates_buf === 'string' && resp.get_updates_buf.trim()
         ? (resp.get_updates_buf as string)
-        : typeof (resp as { sync_buf?: unknown }).sync_buf === "string"
-          ? ((resp as { sync_buf: string }).sync_buf)
-          : "";
-    const nextBuf = rawNextBuf.trim() || currentBuf;
+        : typeof (resp as { sync_buf?: unknown }).sync_buf === 'string'
+          ? (resp as { sync_buf: string }).sync_buf
+          : ''
+    const nextBuf = rawNextBuf.trim() || currentBuf
     const msgs = Array.isArray((resp as { msgs?: unknown }).msgs)
-      ? ((resp as { msgs: Array<Record<string, unknown>> }).msgs)
-      : [];
+      ? (resp as { msgs: Array<Record<string, unknown>> }).msgs
+      : []
 
     // 没入站消息 → 只刷 buf
     if (msgs.length === 0) {
       if (nextBuf !== currentBuf) {
-        await updateChannelBuf(channelId, nextBuf).catch(() => {});
+        await updateChannelBuf(channelId, nextBuf).catch(() => {})
       }
-      return;
+      return
     }
 
     // 取最后一条带 context_token 的 message 做激活;多条时 context_token 之间互相替代
-    let lastCtx: { from: string; ctx: string } | null = null;
+    let lastCtx: { from: string; ctx: string } | null = null
     for (const msg of msgs) {
-      if (!msg || typeof msg !== "object") continue;
-      const ctx = typeof (msg as { context_token?: unknown }).context_token === "string"
-        ? String((msg as { context_token: string }).context_token).trim()
-        : "";
-      const from = typeof (msg as { from_user_id?: unknown }).from_user_id === "string"
-        ? String((msg as { from_user_id: string }).from_user_id).trim()
-        : "";
-      if (!ctx || !from) continue;
-      lastCtx = { from, ctx };
+      if (!msg || typeof msg !== 'object') continue
+      const ctx =
+        typeof (msg as { context_token?: unknown }).context_token === 'string'
+          ? String((msg as { context_token: string }).context_token).trim()
+          : ''
+      const from =
+        typeof (msg as { from_user_id?: unknown }).from_user_id === 'string'
+          ? String((msg as { from_user_id: string }).from_user_id).trim()
+          : ''
+      if (!ctx || !from) continue
+      lastCtx = { from, ctx }
       // 把文本抽出来(可选:未来可做命令,例如发 /silence 1h 静默告警)
-      const _text = extractIlinkText(msg);
-      void _text;
+      const _text = extractIlinkText(msg)
+      void _text
     }
 
     if (lastCtx) {
@@ -240,115 +255,168 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
         contextToken: lastCtx.ctx,
         getUpdatesBuf: nextBuf,
         senderId: lastCtx.from,
-      }).catch((err) => onError(`updateInbound[${channelId}]`, err));
+      }).catch((err) => onError(`updateInbound[${channelId}]`, err))
     } else if (nextBuf !== currentBuf) {
-      await updateChannelBuf(channelId, nextBuf).catch(() => {});
+      await updateChannelBuf(channelId, nextBuf).catch(() => {})
     }
   }
 
   // ── dispatch loop ─────────────────────────────────────────────────
   const dispatchTimer = setInterval(() => {
-    if (stopped) return;
-    void dispatchTick();
-  }, dispatchMs);
-  if (typeof dispatchTimer.unref === "function") dispatchTimer.unref();
+    if (stopped) return
+    void dispatchTick()
+  }, dispatchMs)
+  if (typeof dispatchTimer.unref === 'function') dispatchTimer.unref()
 
-  let dispatchInflight: Promise<number> | null = null;
+  let dispatchInflight: Promise<number> | null = null
   async function dispatchTick(): Promise<number> {
-    if (dispatchInflight) return dispatchInflight;
-    dispatchInflight = doDispatch().finally(() => { dispatchInflight = null; });
-    return dispatchInflight;
+    if (dispatchInflight) return dispatchInflight
+    dispatchInflight = doDispatch().finally(() => {
+      dispatchInflight = null
+    })
+    return dispatchInflight
   }
 
   async function doDispatch(): Promise<number> {
-    let sent = 0;
-    let ready: Awaited<ReturnType<typeof claimReadyAlerts>>;
+    let sent = 0
+    let ready: Awaited<ReturnType<typeof claimReadyAlerts>>
     try {
-      ready = await claimReadyAlerts(20);
+      ready = await claimReadyAlerts(20)
     } catch (err) {
-      onError("claimReady", err);
-      return 0;
+      onError('claimReady', err)
+      return 0
     }
-    if (ready.length === 0) return 0;
+    if (ready.length === 0) return 0
 
     for (const row of ready) {
-      if (stopped) break;
+      if (stopped) break
       if (!row.channel_id || !row.channel) {
         // channel 被删 / 不可用 → 标 failed 并留给 cron 清理
-        await markFailed(row.id, "channel missing").catch(() => {});
-        continue;
+        await markFailed(row.id, 'channel missing').catch(() => {})
+        continue
       }
-      if (row.channel.channel_type !== "ilink_wechat") {
-        // 未来的其他 channel_type 留给不同 sender;当前硬跳过
-        await markFailed(row.id, `unsupported channel_type ${row.channel.channel_type}`).catch(() => {});
-        continue;
+      if (!row.channel.enabled || row.channel.activation_status !== 'active') {
+        await markFailed(
+          row.id,
+          `channel not active (status=${row.channel.activation_status}, enabled=${row.channel.enabled})`,
+        ).catch(() => {})
+        continue
       }
-      if (!row.channel.enabled || row.channel.activation_status !== "active") {
-        await markFailed(row.id, `channel not active (status=${row.channel.activation_status}, enabled=${row.channel.enabled})`).catch(() => {});
-        continue;
+      const secrets = await loadChannelSecrets(row.channel_id).catch(() => null)
+      if (!secrets) {
+        await markFailed(row.id, 'channel secrets unavailable').catch(() => {})
+        continue
       }
-      const secrets = await loadChannelSecrets(row.channel_id).catch(() => null);
-      if (!secrets || !secrets.contextToken || !secrets.targetSenderId) {
-        await markFailed(row.id, "channel missing context_token/target_sender_id").catch(() => {});
-        continue;
-      }
-      const text = formatOutboxText(row);
-      try {
-        const resp = await sendFn(secrets.botToken, secrets.targetSenderId, secrets.contextToken, text);
-        const code = Number((resp as { ret_code?: number })?.ret_code ?? 0);
-        if (code === ILINK_SESSION_EXPIRED) {
-          await markChannelError(row.channel_id, "iLink session expired on send", true).catch(() => {});
-          await markFailed(row.id, "session expired").catch(() => {});
-          continue;
+      const text = formatOutboxText(row)
+
+      // M4 / P1-4 — 按 channel_type 分发到对应 sender。新 channel_type 加分支即可,
+      // outbox / dedupe / 退避 都共用,不动。
+      if (row.channel.channel_type === 'ilink_wechat') {
+        if (!secrets.contextToken || !secrets.targetSenderId) {
+          await markFailed(row.id, 'channel missing context_token/target_sender_id').catch(() => {})
+          continue
         }
-        if (code !== 0 && code !== undefined && Number.isFinite(code) && code < 0) {
-          await markFailed(row.id, `iLink ret_code=${code}`).catch(() => {});
-          continue;
+        try {
+          const resp = await sendFn(
+            secrets.botToken,
+            secrets.targetSenderId,
+            secrets.contextToken,
+            text,
+          )
+          const code = Number((resp as { ret_code?: number })?.ret_code ?? 0)
+          if (code === ILINK_SESSION_EXPIRED) {
+            await markChannelError(
+              row.channel_id,
+              'iLink session expired on send',
+              'session_expired',
+            ).catch(() => {})
+            await markFailed(row.id, 'session expired').catch(() => {})
+            continue
+          }
+          if (code !== 0 && code !== undefined && Number.isFinite(code) && code < 0) {
+            await markFailed(row.id, `iLink ret_code=${code}`).catch(() => {})
+            continue
+          }
+          await markSent(row.id)
+          await markChannelSendSuccess(row.channel_id).catch(() => {})
+          sent++
+        } catch (err) {
+          const msg = (err as Error)?.message ?? String(err)
+          await markFailed(row.id, msg).catch(() => {})
+          await markChannelError(row.channel_id, msg).catch(() => {})
         }
-        await markSent(row.id);
-        await markChannelSendSuccess(row.channel_id).catch(() => {});
-        sent++;
-      } catch (err) {
-        const msg = (err as Error)?.message ?? String(err);
-        await markFailed(row.id, msg).catch(() => {});
-        await markChannelError(row.channel_id, msg).catch(() => {});
+      } else if (row.channel.channel_type === 'telegram') {
+        if (!secrets.tgChatId) {
+          await markFailed(row.id, 'telegram channel missing chat_id').catch(() => {})
+          continue
+        }
+        try {
+          await sendTelegramAlert({
+            botToken: secrets.botToken,
+            chatId: secrets.tgChatId,
+            text,
+          })
+          await markSent(row.id)
+          await markChannelSendSuccess(row.channel_id).catch(() => {})
+          sent++
+        } catch (err) {
+          const msg = (err as Error)?.message ?? String(err)
+          await markFailed(row.id, msg).catch(() => {})
+          // Permanent → 降级 activation_status=error,写 last_error,UI 会显示红字
+          // 并且 list 上不再显示 rebind 按钮(rebind 只对 iLink 有意义);admin 需删重建。
+          if (err instanceof TelegramPermanentError) {
+            await markChannelError(row.channel_id, msg, 'permanent').catch(() => {})
+          }
+        }
+      } else {
+        await markFailed(row.id, `unsupported channel_type ${row.channel.channel_type}`).catch(
+          () => {},
+        )
       }
     }
-    return sent;
+    return sent
   }
 
   return {
     async stop() {
-      stopped = true;
-      clearInterval(refreshTimer);
-      clearInterval(dispatchTimer);
-      for (const ctrl of channelLoops.values()) ctrl.abort();
-      channelLoops.clear();
+      stopped = true
+      clearInterval(refreshTimer)
+      clearInterval(dispatchTimer)
+      for (const ctrl of channelLoops.values()) ctrl.abort()
+      channelLoops.clear()
       if (dispatchInflight) {
-        try { await dispatchInflight; } catch { /* */ }
+        try {
+          await dispatchInflight
+        } catch {
+          /* */
+        }
       }
     },
     async dispatchNow() {
-      return dispatchTick();
+      return dispatchTick()
     },
     activeChannels() {
-      return new Set(channelLoops.keys());
+      return new Set(channelLoops.keys())
     },
-  };
+  }
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
+    const t = setTimeout(resolve, ms)
     if (signal) {
-      signal.addEventListener("abort", () => {
-        clearTimeout(t);
-        resolve();
-      }, { once: true });
+      signal.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(t)
+          resolve()
+        },
+        { once: true },
+      )
     }
-  });
+  })
 }
 
 /**
@@ -357,19 +425,23 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  * 用户在微信里看到的是原始字符,但信息足够。
  */
 export function formatOutboxText(row: {
-  event_type: string;
-  severity: string;
-  title: string;
-  body: string;
-  payload: Record<string, unknown>;
+  event_type: string
+  severity: string
+  title: string
+  body: string
+  payload: Record<string, unknown>
 }): string {
-  const sevTag = row.severity.toUpperCase();
-  const time = new Date().toISOString().slice(0, 19).replace("T", " ");
-  const base = `【${sevTag}】${row.title}\n${row.body}`;
+  const sevTag = row.severity.toUpperCase()
+  const time = new Date().toISOString().slice(0, 19).replace('T', ' ')
+  const base = `【${sevTag}】${row.title}\n${row.body}`
   // 附加 event_type + 时间,便于 admin 对账
-  return `${base}\n\n— event: ${row.event_type} @ ${time} UTC`;
+  return `${base}\n\n— event: ${row.event_type} @ ${time} UTC`
 }
 
 // ─── QR bind flow(adminAlerts.ts 调用)──────────────────────────────
 
-export { fetchIlinkQrcode, pollIlinkQrcodeStatus, extractConfirmed } from "../../../channels/wechat/src/iLink.js";
+export {
+  fetchIlinkQrcode,
+  pollIlinkQrcodeStatus,
+  extractConfirmed,
+} from '../../../channels/wechat/src/iLink.js'
