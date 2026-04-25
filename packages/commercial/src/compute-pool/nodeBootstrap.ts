@@ -13,7 +13,8 @@
  *   5. apply_firewall:**原子 swap** — iptables-save > old;写 new 规则;
  *        `systemd-run --on-active=60 --unit=ocfw-rollback iptables-restore < old`
  *        先挂回滚 watchdog,再 apply new,最后再 cancel 回滚(apply 成功后)
- *   6. start_service:systemctl enable --now openclaude-node-agent
+ *   6. start_service:systemctl daemon-reload + enable + restart(不能用 --now,
+ *        re-add 场景下 service 已 active,--now 是 no-op,新 cert/yml 不 reload)
  *   7. verify:mTLS /health + /bootstrap/verify
  *
  * 失败处理:
@@ -476,7 +477,12 @@ async function startService(target: SshTarget): Promise<void> {
     target,
     `
 set -e
-systemctl enable --now openclaude-node-agent
+# enable + restart(不用 --now):service 已 active 时 --now 是 no-op,
+# 新推的 cert/yml/binary 不会被进程重新加载 → agent_verify 阶段
+# fingerprint mismatch。restart 幂等,inactive=start,active=stop+start。
+systemctl daemon-reload
+systemctl enable openclaude-node-agent
+systemctl restart openclaude-node-agent
 # 等 3s 让 service 起来
 sleep 3
 systemctl is-active openclaude-node-agent
