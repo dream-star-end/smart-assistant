@@ -48,7 +48,8 @@ const ORDER_LIST_COLS = `
   o.id::text             AS id,
   o.order_no,
   o.user_id::text        AS user_id,
-  u.username,
+  -- users 表无 username 列;display_name 可空,用 email 兜底
+  COALESCE(u.display_name, u.email) AS username,
   o.provider,
   o.provider_order,
   o.amount_cents::text   AS amount_cents,

@@ -51,7 +51,8 @@ const FEEDBACK_COLS = `
   f.handled_by::text  AS handled_by,
   f.handled_at,
   f.created_at,
-  u.username
+  -- users 表无 username 列;display_name 可空,用 email 兜底
+  COALESCE(u.display_name, u.email) AS username
 `;
 
 // ─── List ──────────────────────────────────────────────────────────
