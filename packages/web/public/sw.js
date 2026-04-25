@@ -36,6 +36,8 @@ const SHELL = [
   '/modules/agents.js',
   '/modules/agents.js?v=5241d45',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/effortMode.js',
+  '/modules/modelPicker.js',
+  '/modules/modelPicker.js?v=5241d45',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/sessions.js',
   '/modules/sync.js',
   '/modules/messages.js',

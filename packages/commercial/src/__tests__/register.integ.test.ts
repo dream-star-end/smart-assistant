@@ -161,13 +161,13 @@ describe("auth.register (integ)", () => {
     assert.equal(u.rows[0].role, "user");
     assert.equal(u.rows[0].status, "active");
 
-    // 2026-04-26 注册赠送 ¥2 / 200 积分:users.credits = 200,credit_ledger 1 行
-    // (reason='promotion', balance_after=200)。账面与流水必须严格对齐。
+    // 2026-04-26 注册赠送 ¥3 / 300 积分:users.credits = 300,credit_ledger 1 行
+    // (reason='promotion', balance_after=300)。账面与流水必须严格对齐。
     const credRow = await query<{ credits: string }>(
       "SELECT credits::text AS credits FROM users WHERE id = $1",
       [result.user_id],
     );
-    assert.equal(credRow.rows[0].credits, "200", "新用户余额应为 200 积分");
+    assert.equal(credRow.rows[0].credits, "300", "新用户余额应为 300 积分");
     const ledRows = await query<{
       delta: string;
       balance_after: string;
@@ -179,8 +179,8 @@ describe("auth.register (integ)", () => {
       [result.user_id],
     );
     assert.equal(ledRows.rows.length, 1, "应只有 1 条注册赠送 ledger 行");
-    assert.equal(ledRows.rows[0].delta, "200");
-    assert.equal(ledRows.rows[0].balance_after, "200");
+    assert.equal(ledRows.rows[0].delta, "300");
+    assert.equal(ledRows.rows[0].balance_after, "300");
     assert.equal(ledRows.rows[0].reason, "promotion");
     assert.match(ledRows.rows[0].memo ?? "", /注册赠送/);
     // password 真的被 argon2 哈希了

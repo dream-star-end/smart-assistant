@@ -115,7 +115,7 @@ import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broad
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
 import { initUsageStats, openUsageModal } from './usageStats.js?v=5241d45'
-import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=5241d45'
+import { clearUserPrefsCache, initUserPrefs, loadUserPrefs, openPrefsModal, setOnPrefsChanged } from './userPrefs.js?v=5241d45'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -136,6 +136,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
+  setRenderModelPill,
 } from './agents.js?v=5241d45' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
@@ -222,6 +223,7 @@ import {
   initModePills,
   renderModePills,
 } from './effortMode.js'
+import { initModelPicker, renderModelPill } from './modelPicker.js?v=5241d45'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
@@ -698,6 +700,22 @@ initWechatListeners()
 // 内再触发一次;这里只是绑定点击/键盘事件并把初始隐藏态打上去。
 initModePills()
 
+// ── 模型选择器(v1.0.4 新增): bind once + 注入 reloadAgents 回调 ──
+// 切换成功后内部会调 _reloadAgents() 拉最新 agent.model 进 state,然后再
+// renderModelPill / renderModePills。直接传 reloadAgents 避免循环依赖。
+// 同时把 renderModelPill 注入回 agents.js,让 reloadAgents 完成后能刷新 pill。
+initModelPicker({ reload: reloadAgents })
+setRenderModelPill(renderModelPill)
+
+// 2026-04-26 v1.0.4 — prefs modal 保存成功后回调:同时刷 model + effort pill,
+// 避免用户在「偏好」里改 default_model / default_effort 后 composer 还显示旧值
+// 直到下次刷新。setCachedPrefField 只在 modelPicker pill 单字段切换时用,modal
+// 走 PATCH 后已直接覆盖 state.userPrefs;这里只负责"看"。
+setOnPrefsChanged(() => {
+  renderModelPill()
+  renderModePills()
+})
+
 // ── Feedback: submit wiring ──
 $('feedback-submit-btn').onclick = submitFeedback
 $('feedback-desc').addEventListener('input', () => {
@@ -813,6 +831,10 @@ function send() {
       filename: a.name,
     }))
   const effortLevel = getEffortForSubmit()
+  // v1.0.4 — frame.model 从 user prefs 取(C 方案)。空字符串视同未设。
+  // server.ts WS 入口对此值做静态白名单兜底,前端无需 validate。
+  const _prefModel = state.userPrefs?.default_model
+  const modelOverride = (typeof _prefModel === 'string' && _prefModel) ? _prefModel : undefined
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -823,6 +845,9 @@ function send() {
     // string='xhigh'/'max' → 切到该 effort;null → 显式清除回模型默认;
     // undefined → 不参与 effort 协商(非 Opus 4.7 agent 走这条)。
     ...(effortLevel !== undefined ? { effortLevel } : {}),
+    // string=model id → 触发 runner 切模型(下次 spawn 生效);
+    // undefined → 沿用 agent.model。无清除语义(setModel(undefined) 会重置)
+    ...(modelOverride !== undefined ? { model: modelOverride } : {}),
     ts: Date.now(),
   }
   // Add user message with status tracking + persist media & full text for regen
@@ -1201,6 +1226,9 @@ async function _forceLogout({ serverLogout, broadcast = Boolean(serverLogout) } 
   // 切账号时新用户继承老用户的 xhigh/max 选择(服务端 credits 会拦,但 pill
   // 视觉状态会误导用户)。
   clearEffortOnLogout()
+  // 2026-04-26 v1.0.4 — 同样清 user prefs 缓存,避免下个用户读到上个用户的
+  // default_model / default_effort,导致 sendMessage 帧带错 model id。
+  clearUserPrefsCache()
   state.token = '' // Clear token BEFORE close so onclose handler won't auto-reconnect
   state.refreshToken = ''
   state.tokenExp = 0
@@ -2245,6 +2273,12 @@ async function init() {
       const stale = await dbGetAll()
       for (const s of stale) await dbDelete(s.id)
     } catch {}
+    // 2026-04-26 v1.0.4 — 拉取用户偏好(default_model / default_effort 等)给
+    // composer 顶部的 model/effort pill 用。await 让 connect() 之前 prefs 已就位,
+    // 否则 sendMessage 帧里 frame.model 就漏了 → 第一条消息按 agent 默认模型走。
+    // 失败 fallback 已在 loadUserPrefs 内部处理(state.userPrefs={}),不会卡登录。
+    clearUserPrefsCache()
+    await loadUserPrefs(true)
     await showApp()
     renderSidebar()
     renderMessages()
@@ -2396,6 +2430,9 @@ async function init() {
     await mintSessionCookie(state.token, state.authEpoch || 0)
     // 启动后台 timer:access token 到期前 2min 主动续期,只要 tab 活着就不掉线。
     scheduleProactiveRefresh()
+    // 2026-04-26 v1.0.4 — 冷启动 prefetch 用户偏好(同登录路径)。必须在 connect()
+    // 之前完成,sendMessage 才能把 default_model 塞进首帧。失败兜底见 loadUserPrefs。
+    await loadUserPrefs(true)
     // Await so the HttpOnly session cookie is in place before any
     // <img>/<audio>/<video> tags get their src set by renderMessages.
     await showApp()

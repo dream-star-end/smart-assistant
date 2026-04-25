@@ -298,6 +298,20 @@ export class SubprocessRunner extends EventEmitter {
     this.opts.effortLevel = level
   }
 
+  /** Current model id (used by sessionManager.submit to detect changes
+   *  before deciding whether to recycle the subprocess). 2026-04-26 v1.0.4
+   *  起新增,配合 InboundMessage.model 让用户在前端 pill 切模型生效。 */
+  get model(): string | undefined {
+    return this.opts.model
+  }
+
+  /** Update model. Caller is responsible for restarting the subprocess
+   *  (via shutdown(); next submit() auto-restarts) for the new value to take
+   *  effect — model is only passed as `--model` cli arg at spawn time. */
+  setModel(model: string | undefined): void {
+    this.opts.model = model
+  }
+
   /** Current execution target (used by sessionManager to detect changes). */
   get executionTarget(): ExecutionTarget {
     return this.opts.executionTarget ?? { kind: 'local' }

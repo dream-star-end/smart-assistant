@@ -57,6 +57,17 @@ import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
 
 /**
+ * 协议级允许的 InboundMessage.model 值(2026-04-26 v1.0.4 加)。
+ *
+ * 不查 deps.pricing(GatewayDeps 没 pricing;商用版 admin 启用列表是 host 概念,
+ * 容器 gateway 拿不到)。新增模型时这里同步更新。安全意义:防止用户 prefs 残留
+ * 已下线模型 / 恶意 frame 注入字符串让 CCB --model 拿到非法值导致 spawn 失败 →
+ * session 卡死。运行时校验在 server.ts:WS handler 里;export 出来便于 unit test
+ * 与未来抽 helper。
+ */
+export const ALLOWED_INBOUND_MODELS = new Set(['claude-opus-4-7', 'claude-sonnet-4-6'])
+
+/**
  * V3 Phase 2 Task 2H: 商业化模块 hook 形状(只声明 gateway 需要的接口,
  * 不依赖 @openclaude/commercial 的具体实现)。
  *
@@ -3867,6 +3878,15 @@ export class Gateway {
       safeEffortLevel = undefined
     }
 
+    // Same defensive sanitize for InboundMessage.model (2026-04-26 v1.0.4):
+    //   - 合法 model id(ALLOWED_INBOUND_MODELS) → 透传给 sessionManager.submit,
+    //     在那里比对 runner.model 决定是否 setModel + shutdown(下次 submit 自动 spawn 新模型)
+    //   - 缺省 / 非法 → undefined,sessionManager 不动 runner 当前 model
+    //   allowlist 抽到文件顶部 export 便于 unit test + 后续加模型集中改一处。
+    const _frameModel = (frame as any).model
+    const safeModel: string | undefined =
+      typeof _frameModel === 'string' && ALLOWED_INBOUND_MODELS.has(_frameModel) ? _frameModel : undefined
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
@@ -4313,7 +4333,7 @@ export class Gateway {
           adapter,
         )
       }
-    }, safeEffortLevel)
+    }, safeEffortLevel, safeModel)
   }
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {

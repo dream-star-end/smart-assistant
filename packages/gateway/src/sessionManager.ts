@@ -580,31 +580,52 @@ export class SessionManager {
      *  effort 应用、prev await、本 turn 的 _runOneTurn 全部串在同一个新 lock 里;
      *  闭包捕获 desiredEffort 后,后到的 submit() 不会污染本 turn 的 effort。 */
     effortLevel?: string | null,
+    /** 来自 InboundMessage.model(2026-04-26 v1.0.4 起加),用于本条消息开始执行
+     *  **之前**切换 runner 的 --model:
+     *    - string    : caller 想用此 model — 与 runner.model 不同 → 触发 setModel + shutdown
+     *    - undefined : caller 没指定,沿用 runner 当前 model(没有"清除回 agent 默认"语义)
+     *
+     *  与 effortLevel 共用同一把 lock + 同一次 shutdown(若 model 与 effort 都变,
+     *  两次 setX 后只 shutdown 一次,避免双 warn 噪声 + 双 race)。 */
+    model?: string,
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
       effortLevel === null ? undefined : effortLevel
     const callerSpecifiedEffort = effortLevel !== undefined
+    const desiredModel: string | undefined = model
+    const callerSpecifiedModel = model !== undefined
 
     const prev = session.lock
     let release!: () => void
     session.lock = new Promise<void>((r) => (release = r))
     try {
       await prev
-      // effort 应用必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
+      // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn
-      //   - 本 turn 之后:env 已被 CCB 启动时读完,改也无效
-      // 同时受 lock chain 保护,后到的 submit 想 set 别的 effort 也得排在我们后面。
-      if (callerSpecifiedEffort && session.runner.effortLevel !== desiredEffort) {
+      //   - 本 turn 之后:env / cli args 已被 CCB 启动时读完,改也无效
+      // 同时受 lock chain 保护,后到的 submit 想 set 别的 effort/model 也得排在我们后面。
+      // 把 effort/model 的 needsRestart 信号合并 → 一次 shutdown(下次 submit 自动 spawn 用新 effort+model)。
+      const effortChanged =
+        callerSpecifiedEffort && session.runner.effortLevel !== desiredEffort
+      const modelChanged = callerSpecifiedModel && session.runner.model !== desiredModel
+      if (effortChanged) session.runner.setEffortLevel(desiredEffort)
+      if (modelChanged) {
+        session.runner.setModel(desiredModel)
+        // 同步更新 session.model,outbound 帧 / metrics / audit 都靠它,避免
+        // 下次 spawn 前的窗口期 stale。runner.model 要等 spawn 才生效;但 shutdown
+        // 已让 runner 死,窗口期内不会产生新 metrics —— session.model 提前对齐安全。
+        session.model = desiredModel ?? this.config.defaults.model ?? 'claude-opus-4-7'
+      }
+      if (effortChanged || modelChanged) {
         try {
-          session.runner.setEffortLevel(desiredEffort)
           await session.runner.shutdown()
           // Delta tracker reset happens automatically on the next 'spawn' event
           // when SubprocessRunner auto-respawns on the next submit().
         } catch (err) {
           log.warn(
-            'effort-change shutdown failed',
-            { sessionKey: session.sessionKey },
+            'effort/model-change shutdown failed',
+            { sessionKey: session.sessionKey, effortChanged, modelChanged },
             err,
           )
         }

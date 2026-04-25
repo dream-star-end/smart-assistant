@@ -55,6 +55,17 @@ export const InboundMessage = Type.Object({
       Type.Literal('max'),
     ]),
   ),
+  // CCB --model override for this session(2026-04-26 v1.0.4 起加;一般来自
+  // Web 端 user_preferences.default_model)。
+  //   - 字符串 (model id):把 CCB --model 设成该值;若与 runner.model 不同
+  //     会触发 runner shutdown(下次 submit 自动 spawn 新模型)
+  //   - 字段缺省 (undefined):不参与覆盖,沿用 agent.model / config.defaults.model
+  // 不区分 null vs undefined —— 我们没有"清除回 agent 默认"的产品语义(用户
+  // 在 pill 选了 sonnet 就一直 sonnet,直到主动选回 opus)。effortLevel 当年
+  // 加 null 是为支持"取消选中"UI,这里没这个入口。
+  // 实际接收方(gateway server.ts)会按静态 allowlist 过滤,无效 model 静默
+  // 丢弃 —— 防止用户 prefs 里残留 admin 已 disable 的 model 把 CCB 启不起来。
+  model: Type.Optional(Type.String()),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>

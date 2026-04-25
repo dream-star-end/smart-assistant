@@ -241,7 +241,7 @@ async function _doRefreshOnce(expectedEpoch) {
     // refresh 绑定的 myEpoch —— mint 响应回来后若 epoch 变过会 self-clear,
     // 防止旧身份的 session cookie 被新身份 inheritance。
     // 用 dynamic import 避开与 auth.js 的循环依赖(auth.js 也 import 了 api.js)。
-    void import('./auth.js?v=fileproxy1')
+    void import('./auth.js?v=landingux1')
       .then(({ mintSessionCookie }) => {
         mintSessionCookie(data.access_token, expectedEpoch).catch(() => {})
       })
@@ -250,7 +250,7 @@ async function _doRefreshOnce(expectedEpoch) {
     // userId 缺失(早期 race,/api/me 还没回)时 publishTokenRefresh 内部会 skip,
     // 不广播是安全降级 —— 接收方走 reactive 401 兜底。fire-and-forget。
     if (state.userId != null) {
-      void import('./broadcast.js?v=1')
+      void import('./broadcast.js?v=landingux1')
         .then(({ publishTokenRefresh }) => {
           publishTokenRefresh({
             access_token: data.access_token,

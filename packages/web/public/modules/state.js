@@ -104,6 +104,13 @@ export const state = {
   recognizing: false,
   windowFocused: document.hasFocus(),
   offlineQueue: [], // messages queued while disconnected
+  // 2026-04-26 v1.0.4:user_preferences 缓存。modelPicker / effortMode / 发送
+  // 帧时塞 frame.model 都走这份。
+  //   - null      : 还没拉取(冷启动 / 登录后 race);UI 应隐藏依赖此字段的 pill
+  //                 避免"先显 Opus 再切 Sonnet"的闪烁
+  //   - {} / 含字段对象 : 已拉取完成(空对象 = 用户没设过任何偏好)
+  // 由 main.js 在登录成功 + 冷启动有 token 两条路径下统一通过 loadUserPrefs() 写入。
+  userPrefs: null,
 }
 
 // P2-24 — offlineQueue 软上限。

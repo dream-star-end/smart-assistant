@@ -136,6 +136,17 @@ export class CodexRunner extends EventEmitter {
     // codex CLI manages its own effort; we don't map CCB effort here
   }
 
+  // ── model getter / setter (parity with SubprocessRunner; 2026-04-26) ──
+  // sessionManager.submit 现在会调 runner.setModel,即便商用版当前不用 codex,
+  // 接口仍要存在,否则 cast 后 NPE。codexRunner 的 buildArgs() 已读 this.opts.model
+  // 渲染 `--model` 参数,setModel 后下次 spawn 自动用新值。
+  get model(): string | undefined {
+    return this.opts.model
+  }
+  setModel(model: string | undefined): void {
+    this.opts.model = model
+  }
+
   sendPermissionResponse(_requestId: string, _response: unknown): boolean {
     // codex has its own sandbox approval flow (workspace-write) — gateway
     // permission prompts are never emitted by this runner, so nothing to

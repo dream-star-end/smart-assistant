@@ -37,6 +37,7 @@
   --transition-fast: 120ms cubic-bezier(0.4, 0, 0.2, 1);
   --transition-base: 180ms cubic-bezier(0.4, 0, 0.2, 1);
   --transition-slow: 280ms cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 /* ────── Dark theme (warm, not pure black) ────── */
@@ -86,6 +87,11 @@
   --glass-bg: rgba(26, 26, 29, 0.78);
   --scrollbar: #32323a;
   --scrollbar-hover: #42424c;
+
+  /* ── Brand-luxe gradient (Stripe/Resend 风,纯橙系) ── */
+  --brand-gradient: linear-gradient(135deg, #e48968 0%, #f29d7a 50%, #d97757 100%);
+  --shadow-card-3d: 0 1px 2px rgba(0, 0, 0, 0.25), 0 6px 12px -2px rgba(0, 0, 0, 0.35), 0 16px 32px -8px rgba(0, 0, 0, 0.45);
+  --accent-glow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent), 0 16px 40px -8px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 /* ────── Light theme (cream) ────── */
@@ -135,6 +141,11 @@
   --glass-bg: rgba(250, 249, 246, 0.85);
   --scrollbar: #d1cec4;
   --scrollbar-hover: #b8b5ab;
+
+  /* ── Brand-luxe gradient (Stripe/Resend 风,纯橙系) ── */
+  --brand-gradient: linear-gradient(135deg, #d96a3e 0%, #e8895c 50%, #c4513a 100%);
+  --shadow-card-3d: 0 1px 1px rgba(30, 25, 10, 0.04), 0 4px 6px -1px rgba(30, 25, 10, 0.05), 0 12px 24px -8px rgba(30, 25, 10, 0.10);
+  --accent-glow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent), 0 16px 40px -8px color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -4647,6 +4658,7 @@ a:hover {
 .topup-bonus {
   color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
 }
+
 /* 充值面板顶部的注册赠送营销 banner — 静态文案,与套餐列表区分开。 */
 .topup-bonus-banner {
   font-size: var(--text-sm);
@@ -5120,38 +5132,75 @@ body.body-landing {
 
 .landing-hero {
   position: relative;
-  padding: 80px var(--space-6) 100px;
+  padding: 96px var(--space-6) 120px;
   text-align: center;
   overflow: hidden;
 }
-.landing-hero::before {
-  content: "";
+/* Mesh aurora layers (decorative DOM, aria-hidden) — Stripe/Resend 风 */
+.hero-aurora {
   position: absolute;
-  inset: 0;
+  border-radius: 50%;
+  filter: blur(80px);
   pointer-events: none;
-  background:
-    radial-gradient(60% 70% at 50% 0%, var(--accent-soft) 0%, transparent 60%),
-    radial-gradient(80% 50% at 50% 100%, color-mix(in srgb, var(--accent) 6%, transparent) 0%, transparent 70%);
   z-index: 0;
+  opacity: 0.85;
 }
+.hero-aurora-1 {
+  width: 540px; height: 540px;
+  top: -160px; left: 50%;
+  transform: translateX(-60%);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+  animation: aurora-float 22s ease-in-out infinite;
+}
+.hero-aurora-2 {
+  width: 420px; height: 420px;
+  top: 20%; right: -120px;
+  background: color-mix(in srgb, #f29d7a 50%, transparent);
+  animation: aurora-float 26s ease-in-out infinite reverse;
+}
+.hero-aurora-3 {
+  width: 380px; height: 380px;
+  bottom: -120px; left: -80px;
+  background: color-mix(in srgb, #c4513a 40%, transparent);
+  animation: aurora-float 28s ease-in-out infinite;
+}
+:root[data-theme="light"] .hero-aurora-1 { opacity: 0.55; }
+:root[data-theme="light"] .hero-aurora-2 { opacity: 0.45; }
+:root[data-theme="light"] .hero-aurora-3 { opacity: 0.35; }
 .landing-hero-inner {
   position: relative;
   z-index: 1;
-  max-width: 880px;
+  max-width: 920px;
   margin: 0 auto;
 }
 .landing-hero-eyebrow {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 14px;
+  padding: 7px 16px;
   border-radius: var(--radius-full);
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
+  background-clip: padding-box;
   color: var(--fg-muted);
   font-size: var(--text-sm);
   font-weight: 500;
   margin-bottom: var(--space-6);
+  box-shadow: 0 4px 14px -4px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+/* Gradient ring border (mask trick — Safari ≥14.1) */
+.landing-hero-eyebrow::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: var(--brand-gradient);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
 }
 .landing-dot {
   display: inline-block;
@@ -5162,19 +5211,20 @@ body.body-landing {
   box-shadow: 0 0 0 4px var(--accent-soft);
 }
 .landing-hero-title {
-  font-size: clamp(36px, 6vw, 64px);
-  line-height: 1.08;
+  font-size: clamp(44px, 7vw, 76px);
+  line-height: 1.05;
   font-weight: 800;
-  letter-spacing: -0.025em;
-  margin: 0 0 var(--space-5);
+  letter-spacing: -0.03em;
+  margin: 0 0 var(--space-6);
   color: var(--fg-strong);
 }
 .landing-hero-accent {
-  background: linear-gradient(120deg, var(--accent) 0%, var(--accent-hover) 100%);
+  background: var(--brand-gradient);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
   color: transparent;
+  filter: drop-shadow(0 2px 16px color-mix(in srgb, var(--accent) 25%, transparent));
 }
 .landing-hero-sub {
   font-size: clamp(15px, 2vw, 18px);
@@ -5267,12 +5317,13 @@ body.body-landing {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  transition: transform 200ms ease, border-color 200ms ease, box-shadow 200ms ease;
+  box-shadow: var(--shadow-card-3d);
+  transition: transform 220ms var(--ease-spring), border-color 200ms ease, box-shadow 220ms ease;
 }
 .landing-card:hover {
-  transform: translateY(-2px);
+  transform: translateY(-3px);
   border-color: var(--accent-border);
-  box-shadow: 0 8px 24px color-mix(in srgb, var(--accent) 8%, transparent);
+  box-shadow: var(--shadow-card-3d), 0 18px 36px -12px color-mix(in srgb, var(--accent) 14%, transparent);
 }
 .landing-card-icon {
   display: inline-flex;
@@ -5318,6 +5369,12 @@ body.body-landing {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+  box-shadow: var(--shadow-card-3d);
+  transition: transform 220ms var(--ease-spring), border-color 200ms ease, box-shadow 220ms ease;
+}
+.landing-model:hover {
+  transform: translateY(-3px);
+  border-color: var(--accent-border);
 }
 .landing-model-head {
   display: flex;
@@ -5388,29 +5445,31 @@ body.body-landing {
   border-radius: var(--radius-lg);
   padding: var(--space-6) var(--space-5);
   text-align: center;
-  transition: transform 200ms ease, border-color 200ms ease;
+  box-shadow: var(--shadow-card-3d);
+  transition: transform 220ms var(--ease-spring), border-color 200ms ease, box-shadow 220ms ease;
 }
 .landing-plan:hover {
-  transform: translateY(-2px);
+  transform: translateY(-3px);
   border-color: var(--accent-border);
 }
 .landing-plan-featured {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent), 0 12px 30px color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: transparent;
+  box-shadow: var(--accent-glow), var(--shadow-card-3d);
 }
 .landing-plan-featured::before {
   content: "推荐";
   position: absolute;
-  top: -10px;
+  top: -12px;
   left: 50%;
   transform: translateX(-50%);
-  padding: 3px 12px;
+  padding: 4px 14px;
   border-radius: var(--radius-full);
-  background: var(--accent);
-  color: var(--accent-fg);
+  background: var(--brand-gradient);
+  color: #fff;
   font-size: var(--text-xs);
   font-weight: 700;
   letter-spacing: 0.05em;
+  box-shadow: 0 6px 16px -4px color-mix(in srgb, var(--accent) 50%, transparent);
 }
 .landing-plan-amount {
   font-size: 38px;
@@ -5495,9 +5554,12 @@ body.body-landing {
   color: var(--accent);
 }
 .landing-bench th.bench-col-us {
-  background: color-mix(in srgb, var(--accent) 8%, var(--bg-subtle));
-  border-left: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-  border-right: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 16%, transparent) 0%, color-mix(in srgb, var(--accent) 6%, transparent) 100%),
+    var(--bg-subtle);
+  border-left: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-right: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow: inset 0 2px 0 0 color-mix(in srgb, var(--accent) 60%, transparent);
 }
 .landing-bench th.bench-metric {
   text-align: left;
@@ -5644,15 +5706,46 @@ body.body-landing {
 
 .landing-cta-band {
   position: relative;
-  padding: 80px var(--space-6);
+  padding: 96px var(--space-6);
   text-align: center;
-  background:
-    radial-gradient(80% 100% at 50% 50%, var(--accent-soft) 0%, transparent 70%),
-    var(--bg);
+  background: var(--bg);
   border-top: 1px solid var(--border-subtle);
   border-bottom: 1px solid var(--border-subtle);
+  overflow: hidden;
 }
+.cta-aurora {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.7;
+}
+.cta-aurora-1 {
+  width: 480px; height: 480px;
+  top: -120px; left: 12%;
+  background: color-mix(in srgb, var(--accent) 50%, transparent);
+  animation: aurora-float 24s ease-in-out infinite;
+}
+.cta-aurora-2 {
+  width: 380px; height: 380px;
+  bottom: -100px; right: 10%;
+  background: color-mix(in srgb, #f29d7a 45%, transparent);
+  animation: aurora-float 28s ease-in-out infinite reverse;
+}
+.cta-aurora-3 {
+  width: 320px; height: 320px;
+  top: 30%; left: 50%;
+  transform: translateX(-50%);
+  background: color-mix(in srgb, #c4513a 35%, transparent);
+  animation: aurora-float 30s ease-in-out infinite;
+}
+:root[data-theme="light"] .cta-aurora-1 { opacity: 0.42; }
+:root[data-theme="light"] .cta-aurora-2 { opacity: 0.36; }
+:root[data-theme="light"] .cta-aurora-3 { opacity: 0.30; }
 .landing-cta-inner {
+  position: relative;
+  z-index: 1;
   max-width: 640px;
   margin: 0 auto;
 }
@@ -5703,6 +5796,98 @@ body.body-landing {
   transition: color 120ms ease;
 }
 .landing-footer-meta a:hover { color: var(--fg); }
+
+/* ── Brand-luxe CTAs (hero + CTA band primary buttons + login submit) ── */
+.landing .landing-btn-lg.btn-primary,
+.login-stage-centered .login-submit {
+  position: relative;
+  overflow: hidden;
+  background: var(--brand-gradient);
+  border: 0;
+  color: #fff;
+  box-shadow: 0 8px 24px -6px color-mix(in srgb, var(--accent) 40%, transparent),
+    0 2px 6px -2px color-mix(in srgb, var(--accent) 30%, transparent);
+  transition: transform 180ms var(--ease-spring), box-shadow 220ms ease, filter 180ms ease;
+}
+.landing .landing-btn-lg.btn-primary:hover:not(:disabled),
+.login-stage-centered .login-submit:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+  box-shadow: 0 14px 36px -8px color-mix(in srgb, var(--accent) 50%, transparent),
+    0 3px 10px -2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.landing .landing-btn-lg.btn-primary:active:not(:disabled),
+.login-stage-centered .login-submit:active:not(:disabled) {
+  transform: translateY(0);
+  filter: brightness(0.98);
+}
+/* Shimmer sweep on hover (pure CSS) */
+.landing .landing-btn-lg.btn-primary::after,
+.login-stage-centered .login-submit::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -120%;
+  width: 60%;
+  height: 100%;
+  background: linear-gradient(110deg, transparent 0%, rgba(255, 255, 255, 0.32) 50%, transparent 100%);
+  transform: skewX(-18deg);
+  pointer-events: none;
+  transition: left 700ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.landing .landing-btn-lg.btn-primary:hover::after,
+.login-stage-centered .login-submit:hover::after {
+  left: 140%;
+}
+
+/* Login card: gradient ring border (mask trick) + slight elevation on hover */
+.login-stage-centered .login-card {
+  position: relative;
+}
+.login-stage-centered .login-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: var(--brand-gradient);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  opacity: 0.55;
+  transition: opacity 220ms ease;
+}
+.login-stage-centered .login-card:hover::before { opacity: 0.85; }
+
+/* Login card-head: micro gradient underline (Stripe-style brand mark) */
+.login-card-head h2 {
+  position: relative;
+  padding-bottom: 8px;
+}
+.login-card-head h2::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 36px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--brand-gradient);
+}
+
+/* prefers-reduced-motion: disable aurora float + shimmer (keep static blobs) */
+@media (prefers-reduced-motion: reduce) {
+  .hero-aurora,
+  .cta-aurora,
+  .login-stage-centered .aurora {
+    animation: none !important;
+  }
+  .landing .landing-btn-lg.btn-primary::after,
+  .login-stage-centered .login-submit::after {
+    display: none;
+  }
+}
 
 @media (max-width: 720px) {
   .landing-nav { padding: var(--space-3) var(--space-4); }

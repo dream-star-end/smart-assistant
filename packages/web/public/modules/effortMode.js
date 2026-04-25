@@ -1,13 +1,19 @@
 // OpenClaude — 思考深度选择器(Opus 4.7 专属)
 //
 // 过去这里有两个独立 pill(编码模式 / 科研模式),只能开 xhigh 或 max。2026-04-22
-// 重构为一个带弹出菜单的选择器,覆盖五档 (low / medium / high / xhigh / max)
-// + "默认"。当前显示策略与旧版一致:仅 Opus 4.7 agent 展示入口。注意这是
-// commercial v3 的**产品 UI 策略**,不是协议限制 —— 后端/协议 low/medium/high
-// 对所有模型都支持(见 packages/protocol/src/frames.ts:48-57)。
+// 重构为一个带弹出菜单的选择器,覆盖五档 (low / medium / high / xhigh / max)。
+// 当前显示策略与旧版一致:仅 Opus 4.7 agent 展示入口。注意这是 commercial v3
+// 的**产品 UI 策略**,不是协议限制 —— 后端/协议 low/medium/high 对所有模型都
+// 支持(见 packages/protocol/src/frames.ts:48-57)。
 //
-// pill 状态按 agent 持久化在 localStorage,page reload 后复原。默认空(unset),
-// 让 CCB 用模型默认 effort。
+// 2026-04-26 v1.0.4 起去掉"默认 / 由模型决定"档位:Opus 4.7 会话默认就是
+// 'medium',永远向 gateway 显式发 effortLevel(不再发 null)。理由:产品要给
+// 用户稳定可预期的体验,'让模型自决' 在不同模型/不同时段有歧义,新用户难以
+// 理解。store 里旧的 ''(empty,代表旧"默认"档)在 getCurrentEffort 中自动
+// fallback 到 DEFAULT_EFFORT。
+//
+// pill 状态按 agent 持久化在 localStorage,page reload 后复原。store 缺失或
+// 含非法值 → 视为 DEFAULT_EFFORT。
 import { $ } from './dom.js'
 import { getSession, state } from './state.js'
 
@@ -17,12 +23,13 @@ const STORAGE_KEY = 'openclaude_effort_by_agent'
 // 改动时同步更新两处。
 const VALID = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 
-// 菜单渲染顺序 + 文案(key='' 代表"默认",value=null → getEffortForSubmit → 显式清除)。
-// 顺序按思考强度递增,"默认"置顶。
+// 默认档位:store 缺失或被清掉时显示的值。v1.0.4 从"由模型决定"改成 medium。
+const DEFAULT_EFFORT = 'medium'
+
+// 菜单渲染顺序 + 文案。v1.0.4 移除首项"默认 / 由模型决定" — 永远落到具体档位。
 const MENU_OPTIONS = [
-  { value: '', label: '默认', hint: '由模型决定' },
   { value: 'low', label: '低', hint: '快速响应' },
-  { value: 'medium', label: '中', hint: '均衡' },
+  { value: 'medium', label: '中', hint: '均衡(默认)' },
   { value: 'high', label: '高', hint: '更彻底' },
   { value: 'xhigh', label: '更高', hint: '长链路 / 复杂编码' },
   { value: 'max', label: '最高', hint: '深度推理(token 消耗显著上升)' },
@@ -61,11 +68,11 @@ function writeStore(obj) {
   }
 }
 
-/** 取当前会话的 agent 当前选中的 effort('low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined)。
- *  返回 undefined 表示没选(默认档),仅用于 UI 渲染。
- *  发 inbound.message 用 getEffortForSubmit(),它会区分"未选" vs "Opus4.7 但取消"。
+/** 取当前会话 agent 当前选中的 effort('low' | 'medium' | 'high' | 'xhigh' | 'max')。
+ *  v1.0.4 起:store 缺失 / 旧版 '' / 非法值 全部 fallback 到 DEFAULT_EFFORT('medium'),
+ *  不再返回 undefined。session 缺失时(冷启动 race)仍返回 undefined,让调用方跳过 UI。
  *
- *  自愈:store 里如果留有非法值(比如老版本遗留),视为未选并顺手清掉。 */
+ *  自愈:store 里如果留有非法值或旧版 '',顺手清掉,下次读直接 fallback。 */
 export function getCurrentEffort() {
   const sess = getSession()
   if (!sess) return undefined
@@ -73,41 +80,43 @@ export function getCurrentEffort() {
   if (!agentId) return undefined
   const store = readStore()
   const v = store[agentId]
-  if (v === undefined || v === null) return undefined
   if (VALID.has(v)) return v
-  // 非法值 — 清理并返回 undefined
-  delete store[agentId]
-  writeStore(store)
-  return undefined
+  // store 缺失 / 旧版 '' / 非法值 — 清理(若有)并 fallback 到默认
+  if (v !== undefined) {
+    delete store[agentId]
+    writeStore(store)
+  }
+  return DEFAULT_EFFORT
 }
 
 /** 决定 inbound.message.effortLevel 的取值:
- *    - 字符串 ∈ VALID:用户在 Opus 4.7 会话里选了对应档位
- *    - null:**显式清除** — 当前 agent 是 Opus 4.7 但没选具体档位。让 gateway 把
- *           已存在 runner 的 effort env 复位到模型默认(否则一旦升过档就回不去)
+ *    - 字符串 ∈ VALID:当前 agent 是 Opus 4.7 → 永远发具体档位(默认 medium)
  *    - undefined:不传字段 — 当前 agent 不支持扩展 effort,完全不参与 effort 协商
  *
- *  返回 undefined 时调用方应省略 effortLevel 字段;返回 null/string 时按值发送。 */
+ *  v1.0.4 起不再返回 null:'让模型自决' 档位被废,Opus 4.7 永远显式带 effort。 */
 export function getEffortForSubmit() {
-  if (!modelSupportsExtraEffort(getCurrentAgentModel())) return undefined
-  const cur = getCurrentEffort()
-  // Opus 4.7 + 未选档位 → 显式 null,让 gateway 重启回模型默认 effort
-  return cur === undefined ? null : cur
+  // v1.0.4 改读"effective model"(state.userPrefs.default_model 优先);否则
+  // 切到 Sonnet 但还按 agent.model=Opus 4.7 算,会发出 effortLevel='medium' →
+  // 后端虽然能 accept,但产品语义上 Sonnet 不该带这字段。
+  if (!modelSupportsExtraEffort(getEffectiveModel())) return undefined
+  return getCurrentEffort() ?? DEFAULT_EFFORT
 }
 
-/** 设置当前会话 agent 的 effort。传 undefined / '' / null 取消选中(回"默认")。 */
+/** 设置当前会话 agent 的 effort。
+ *  - 传 DEFAULT_EFFORT:delete store entry — 缺失语义就是 medium,免无意义写
+ *  - 传其他 VALID 值:写入 store
+ *  - 传非法值:静默忽略 */
 function setCurrentEffort(level) {
   const sess = getSession()
   if (!sess) return
   const agentId = sess.agentId || state.defaultAgentId
   if (!agentId) return
+  if (!VALID.has(level)) return
   const store = readStore()
-  if (level === undefined || level === null || level === '') {
+  if (level === DEFAULT_EFFORT) {
     delete store[agentId]
-  } else if (VALID.has(level)) {
-    store[agentId] = level
   } else {
-    return
+    store[agentId] = level
   }
   writeStore(store)
   renderModePills()
@@ -119,6 +128,15 @@ function getCurrentAgentModel() {
   const agentId = sess.agentId || state.defaultAgentId
   const a = (state.agentsList || []).find((x) => x.id === agentId)
   return a?.model || ''
+}
+
+/** 当前生效模型 id:state.userPrefs.default_model 优先,否则 agent.model。
+ *  注意 state.userPrefs===null 表示尚未拉取 — 调用方应单独处理(返回空串
+ *  让 shouldShowEffortControl 判 false,但 renderModePills 会显式隐藏避免闪烁)。 */
+function getEffectiveModel() {
+  const pref = state.userPrefs?.default_model
+  if (typeof pref === 'string' && pref) return pref
+  return getCurrentAgentModel()
 }
 
 // ── Menu open/close ────────────────────────────────────────────────
@@ -174,7 +192,7 @@ function openMenu(focusFirst = false) {
   // roving tabindex:标记选中项(或首项)为可 tab,其余 -1。
   const items = Array.from(menu.querySelectorAll('[role="option"]'))
   if (items.length > 0) {
-    const current = getCurrentEffort() ?? ''
+    const current = getCurrentEffort() ?? DEFAULT_EFFORT
     const target = items.find((el) => el.dataset.effort === current) || items[0]
     for (const it of items) it.setAttribute('tabindex', it === target ? '0' : '-1')
     // 只在键盘触发(focusFirst=true)时主动 .focus(),避免 mobile tap 触发
@@ -250,36 +268,45 @@ function detachGlobalListeners() {
 // ── Render ─────────────────────────────────────────────────────────
 
 function labelForCurrent() {
-  const cur = getCurrentEffort()
-  const opt = MENU_OPTIONS.find((o) => o.value === (cur ?? ''))
-  const which = opt ? opt.label : '默认'
+  const cur = getCurrentEffort() ?? DEFAULT_EFFORT
+  const opt = MENU_OPTIONS.find((o) => o.value === cur)
+  const which = opt ? opt.label : '中'
   return `思考深度: ${which}`
 }
 
-/** 根据当前会话 agent 的 model 决定整个选择器的可见性,并同步 trigger label /
- *  pressed 态 / menu option 的 aria-selected / 选中项样式。
+/** 根据当前会话 agent 的 model 决定 effort-trigger 自身的可见性,并同步 trigger
+ *  label / pressed 态 / menu option 的 aria-selected / 选中项样式。
  *  (roving tabindex 由 openMenu() 按焦点接管,这里不动 tabindex。)
  *  应在 agent 切换、session 切换、agent list 加载完成后调用。
  *
+ *  v1.0.4 起:此函数只控制 effort-trigger + effort-menu 自身,不再 hide
+ *  整个 composer-modes 容器(那由 modelPicker.renderModelPill 控制)。
  *  切到不展示控件的 agent 时强制关闭菜单,避免"pop-open 后切 agent 留幽灵弹出"。 */
 export function renderModePills() {
-  const wrap = $('composer-modes')
-  if (!wrap) return
-  const model = getCurrentAgentModel()
-  const visible = shouldShowEffortControl(model)
-  wrap.hidden = !visible
-  if (!visible) {
-    // 隐藏时也要把菜单显式收起,避免切 agent 后菜单残留可见
-    if (isMenuOpen()) closeMenu(false)
-    return
-  }
   const trigger = getTrigger()
   const menu = getMenu()
   if (!trigger || !menu) return
+  // v1.0.4 — prefs 还没拉取(冷启动/登录 race)时统一隐藏,避免"先按 agent
+  // 默认显 Opus → loadUserPrefs 完后切 Sonnet 又消失"的闪烁。
+  if (state.userPrefs === null) {
+    trigger.hidden = true
+    menu.hidden = true
+    if (isMenuOpen()) closeMenu(false)
+    return
+  }
+  const model = getEffectiveModel()
+  const visible = shouldShowEffortControl(model)
+  // 只 hide trigger + menu,不动 composer-modes wrap
+  trigger.hidden = !visible
+  if (!visible) {
+    menu.hidden = true
+    if (isMenuOpen()) closeMenu(false)
+    return
+  }
 
-  const current = getCurrentEffort() ?? ''
-  // trigger:仅非默认档位 pressed
-  trigger.setAttribute('aria-pressed', current !== '' ? 'true' : 'false')
+  const current = getCurrentEffort() ?? DEFAULT_EFFORT
+  // trigger:仅非默认档位(medium)pressed
+  trigger.setAttribute('aria-pressed', current !== DEFAULT_EFFORT ? 'true' : 'false')
   const labelEl = $('effort-label')
   if (labelEl) labelEl.textContent = labelForCurrent()
 
@@ -336,8 +363,7 @@ export function initModePills() {
   menu.addEventListener('click', (e) => {
     const btn = e.target.closest('[role="option"]')
     if (!btn || !menu.contains(btn)) return
-    const v = btn.dataset.effort
-    setCurrentEffort(v || undefined)
+    setCurrentEffort(btn.dataset.effort)
     closeMenu(true)
   })
   menu.addEventListener('keydown', (e) => {
@@ -369,8 +395,7 @@ export function initModePills() {
       e.preventDefault()
       const btn = items[idx]
       if (btn) {
-        const v = btn.dataset.effort
-        setCurrentEffort(v || undefined)
+        setCurrentEffort(btn.dataset.effort)
         closeMenu(true)
       }
     }

@@ -5,6 +5,14 @@ import { renderModePills } from './effortMode.js'
 import { getSession, state } from './state.js'
 import { closeModal, openModal, toast, toastOptsFromError } from './ui.js'
 
+// modelPicker.renderModelPill 的 late-binding setter — 避免 modelPicker.js
+// (依赖本模块的 reloadAgents)与本模块互相 import 形成循环。
+// main.js 在 init 时调 setRenderModelPill(renderModelPill) 注入。
+let _renderModelPill = () => {}
+export function setRenderModelPill(fn) {
+  if (typeof fn === 'function') _renderModelPill = fn
+}
+
 export async function reloadAgents() {
   try {
     const data = await apiGet('/api/agents')
@@ -51,6 +59,9 @@ export function renderAgentDropdown() {
   if (sess) sel.value = sess.agentId || state.defaultAgentId
   // 思考深度选择器可见性依赖当前 agent 的 model — 任何 agent 列表/会话切换后都要刷新一次。
   renderModePills()
+  // 模型 pill 也跟着 agent 当前 model 走;late-binding setter 在 modelPicker
+  // 注入前是 noop,不会炸。
+  _renderModelPill()
 }
 
 export function renderAgentsManagementList() {

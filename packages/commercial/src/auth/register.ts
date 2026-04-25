@@ -83,16 +83,16 @@ export const VERIFY_EMAIL_TTL_SECONDS = 30 * 60;
 /**
  * 新用户注册赠送积分(单位 = 分,1¥ = 100 积分)。
  *
- * 2026-04-26 boss 决策:每个新注册用户首登即送 ¥2 / 200 积分。同事务里 INSERT
- * users(credits=200) + 写一条 reason='promotion' 的 ledger 行,保证账面与流水
- * 一致(`users.credits = ledger.balance_after = 200`)。
+ * 2026-04-26 boss 决策:每个新注册用户首登即送 ¥3 / 300 积分(v1.0.4 从 ¥2 加码)。
+ * 同事务里 INSERT users(credits=300) + 写一条 reason='promotion' 的 ledger 行,
+ * 保证账面与流水一致(`users.credits = ledger.balance_after = 300`)。
  *
  * 直接走原生 SQL 而非 billing/credit() helper —— 后者自带 BEGIN/COMMIT,会从
  * 当前 register tx 里逃出去;register 失败回滚就拿不回送出去的钱。
  *
  * 已注册用户不补送 —— admin 手动补,见 admin/accounts UI 的"调整积分"。
  */
-export const SIGNUP_BONUS_CENTS = 200n;
+export const SIGNUP_BONUS_CENTS = 300n;
 
 export interface RegisterDeps {
   mailer: Mailer;
@@ -214,7 +214,7 @@ export async function register(
           uid,
           SIGNUP_BONUS_CENTS.toString(),
           SIGNUP_BONUS_CENTS.toString(),
-          "新用户注册赠送 ¥2",
+          "新用户注册赠送 ¥3",
         ],
       );
       await client.query(

@@ -23,12 +23,61 @@
 //   - 没有任何改动 → 不发请求,直接 close + toast"无变化"
 
 import { apiGet, apiJson } from './api.js'
+import { state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
 
 let _wired = false
 let _lastSnapshot = null   // 最近一次从后端拿到的 prefs 对象(diff base)
 let _modelOptions = null   // GET /api/models 缓存
 let _modelOptionsInflight = null
+
+// 2026-04-26 v1.0.4 — modelPicker / effortMode / sendMessage 的 model pill 都
+// 共用同一份 prefs 缓存。提供两个 export:
+//   - loadUserPrefs(force?): 双路径 prefetch(登录成功 callback + 冷启动有 token)
+//     共用此函数,把结果同步到 state.userPrefs + 此模块 _lastSnapshot,避免
+//     "modelPicker 拉一份,prefs modal 拉另一份"双源不一致。失败时 fallback
+//     到 {} 让 UI 走默认值,不阻塞登录。
+//   - clearUserPrefsCache(): 退登 / 切换账号时调,防止下个用户读到上个用户的偏好。
+export async function loadUserPrefs(force = false) {
+  if (!force && state.userPrefs) return state.userPrefs
+  try {
+    const j = await apiGet('/api/me/preferences')
+    const prefs = (j && typeof j.prefs === 'object' && j.prefs !== null) ? { ...j.prefs } : {}
+    state.userPrefs = prefs
+    _lastSnapshot = { ...prefs }
+    return prefs
+  } catch (err) {
+    // 失败兜底:state.userPrefs = {} 让 modelPicker / effortMode 走 fallback,
+    // 不让 chat 卡住。后续用户改了偏好 → PATCH 自动重试。
+    state.userPrefs = {}
+    _lastSnapshot = null
+    console.warn('loadUserPrefs failed:', err)
+    return {}
+  }
+}
+
+export function clearUserPrefsCache() {
+  state.userPrefs = null
+  _lastSnapshot = null
+}
+
+/** 切模型 pill 等"快速 PATCH"路径成功后调,把单字段更新塞进缓存,
+ *  避免下次开 prefs modal 显示旧值。 */
+export function setCachedPrefField(key, value) {
+  if (state.userPrefs) {
+    if (value == null) delete state.userPrefs[key]
+    else state.userPrefs[key] = value
+  }
+  if (_lastSnapshot) {
+    if (value == null) delete _lastSnapshot[key]
+    else _lastSnapshot[key] = value
+  }
+}
+
+/** 暴露 admin 启用的 model 列表,modelPicker 用来渲染菜单 + 校验 prefs 是否有效。 */
+export async function getEnabledModels() {
+  return await _loadModelOptions()
+}
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh']
 // 短标签:segmented control 需要等宽显示,xhigh=Opus 4.7 的信息挪到 hint 里
@@ -181,7 +230,16 @@ async function _savePrefs() {
   if (status) status.textContent = '保存中…'
   try {
     const j = await apiJson('PATCH', '/api/me/preferences', patch)
-    _lastSnapshot = (j && typeof j.prefs === 'object' && j.prefs !== null) ? { ...j.prefs } : {}
+    const fresh = (j && typeof j.prefs === 'object' && j.prefs !== null) ? { ...j.prefs } : {}
+    _lastSnapshot = { ...fresh }
+    // 关键:同步 state.userPrefs,否则 modal 改完 default_model / default_effort
+    // 后 composer 的 modelPicker / effortMode pill 还会拿旧值,frame.model 也错。
+    // 必须等 reder pills 才让 UI 看到新值;late-binding 回调由 main.js 注入
+    // (避免循环 import modelPicker/effortMode)。
+    state.userPrefs = fresh
+    if (_onPrefsChanged) {
+      try { _onPrefsChanged() } catch (e) { console.warn('onPrefsChanged failed', e) }
+    }
     toast('偏好已保存', 'success')
     closeModal('prefs-modal')
   } catch (err) {
@@ -194,6 +252,15 @@ async function _savePrefs() {
 
 export function openPrefsModal() {
   _openPrefsModal()
+}
+
+/** Late-binding 注入"prefs 改变后刷新 composer pills"回调。
+ *  main.js 在 init 时调:setOnPrefsChanged(() => { renderModelPill(); renderModePills() })
+ *  分离原因:避免 userPrefs.js 直接 import modelPicker.js / effortMode.js 形成
+ *  循环依赖(它俩反过来 import userPrefs 取缓存)。 */
+let _onPrefsChanged = null
+export function setOnPrefsChanged(fn) {
+  _onPrefsChanged = typeof fn === 'function' ? fn : null
 }
 
 export function initUserPrefs() {

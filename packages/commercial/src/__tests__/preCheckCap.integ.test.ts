@@ -7,7 +7,8 @@
  *   3. balance > 0, maxCost ∈ (balance, balance+ceiling] → 放行,reservation = balance,capped=true
  *   4. balance > 0, maxCost ≤ balance → 正常路径,reservation = maxCost,capped=false
  *   5. 同一 uid 并发:第一笔 capped=true 占满 balance,第二笔被 Lua 拒
- *   6. boss 实测场景:balance=200 (¥2 注册赠送), maxCost=300 (opus 4.7 60K 估算) → 放行
+ *   6. boss 实测场景:balance=200 (cap 算法回归基线 — v1.0.4 起注册赠送已升至 ¥3=300,但
+ *      此用例固定 200 / 300 数字不动,继续验证 maxCost ∈ (balance, balance+ceiling] 路径)
  */
 
 import { describe, test, before, after, beforeEach } from "node:test";
@@ -229,7 +230,8 @@ describe("preCheckWithCost cap-to-balance (v1.0.3)", () => {
 
   test("boss 实测场景:¥2 余额发送 opus 4.7 默认 60K max_tokens 请求 → 放行", async (t) => {
     if (skipIfNoPg(t)) return;
-    // 注册赠送 ¥2 = 200 cents
+    // 200 cents 是 v1.0.3 上线时的注册赠送基线,v1.0.4 已升到 300 cents。
+    // 数字固定不动 — 这个用例验的是 cap 算法,不是注册赠送数额。
     const uid = await createUser("boss-scenario@example.com", 200n);
     const redis = new InMemoryPreCheckRedis();
     // (~30 input + 60_000 output) * 2500 (output price) * 2.0 (multiplier) / 10^9 ≈ 300 cents

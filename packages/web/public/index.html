@@ -77,14 +77,14 @@
     <div class="landing-hero-inner">
       <div class="landing-hero-eyebrow">
         <span class="landing-dot"></span>
-        基于官方 Claude Code · Max 账号池直连
+        原生 Claude Code · 你的个人 AI 助手
       </div>
       <h1 class="landing-hero-title">
         原生 Claude Code 底座<br/>
         <span class="landing-hero-accent">满血 Opus,不降智</span>
       </h1>
       <p class="landing-hero-sub">
-        多账号轮询 · prompt cache 命中率 &gt; 95% ——
+        满血 Opus · prompt cache 命中率 &gt; 95% ——
         token 成本压到极低,你只为真正消耗的部分买单。
       </p>
       <div class="landing-hero-ctas">
@@ -97,7 +97,7 @@
       <div class="landing-hero-meta">
         <span><strong>¥1 = 100 积分 ≈ $1 美元</strong> token 额度</span>
         <span class="landing-meta-sep">·</span>
-        <span>官方 Claude Code Max 通道</span>
+        <span>开箱即用 · 注册即可开始</span>
         <span class="landing-meta-sep">·</span>
         <span>满血 Opus 4.7 / Sonnet 4.6</span>
       </div>
@@ -114,8 +114,8 @@
         <div class="landing-card-icon">
           <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7h-9M14 17H5M5 7h2M17 17h2M9 12h6"/><circle cx="6" cy="7" r="2"/><circle cx="18" cy="17" r="2"/><circle cx="12" cy="12" r="2"/></svg>
         </div>
-        <h3>官方 Claude Code Max 账号池</h3>
-        <p>多账号轮询调度,触发限速自动切换 —— 单账号被限不会让你的会话掉链子。所有调用走 Anthropic 官方通道,模型行为与官方完全一致。</p>
+        <h3>满血 Opus,价格便宜</h3>
+        <p>完整 Opus 4.7 推理能力,按 token 据实计费,token 账单往往只到官方订阅成本的几分之一。无最低消费、无月费、积分永不过期。</p>
       </div>
       <div class="landing-card">
         <div class="landing-card-icon">
@@ -255,8 +255,8 @@
     </div>
     <div class="landing-faq">
       <details class="landing-faq-item">
-        <summary>和直接订 Claude Pro / Max 比有什么区别?</summary>
-        <p>底座完全一样 —— 我们调用的就是官方 Claude Code Max 通道,模型是满血 Opus / Sonnet,不降智、不阉割上下文。差别在两点:① 多账号池轮询,你不会因为单账号 5 小时配额触顶而中断;② prompt cache 命中率 &gt; 95%,token 账单比直接走 API 通常便宜一个数量级。按量付费,不订阅,不浪费。</p>
+        <summary>OpenClaude 比直接调 Claude API 有什么优势?</summary>
+        <p>我们用原生 Claude Code 作为 Agent 引擎(不是套壳 API),开箱即用 —— 注册即送 ¥3 体验额度,不用配 SDK / API key / 自己写 Agent loop。计费按实际 input / output token,不订阅、不浪费,token 账单往往只到直接走 API 的零头。</p>
       </details>
       <details class="landing-faq-item">
         <summary>"原生 Claude Code 底座"是什么意思?</summary>
@@ -602,16 +602,31 @@
         <div id="composer-modes" class="composer-modes" hidden>
           <button
             type="button"
+            id="model-trigger"
+            class="mode-pill mode-pill--trigger"
+            aria-haspopup="listbox"
+            aria-expanded="false"
+            aria-controls="model-menu"
+            aria-pressed="false"
+            title="切换该 agent 使用的模型。注意:切换会影响该 agent 的所有会话。"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 9h6v6H9z"/></svg>
+            <span id="model-label">模型: Opus 4.7</span>
+            <svg class="mode-pill-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+          <div id="model-menu" class="effort-menu" role="listbox" aria-labelledby="model-trigger" hidden></div>
+          <button
+            type="button"
             id="effort-trigger"
             class="mode-pill mode-pill--trigger"
             aria-haspopup="listbox"
             aria-expanded="false"
             aria-controls="effort-menu"
             aria-pressed="false"
-            title="选择思考深度:默认 / 低 / 中 / 高 / 更高 / 最高。仅 Opus 4.7 会话可见。"
+            title="选择思考深度:低 / 中 / 高 / 更高 / 最高。默认中。仅 Opus 4.7 会话可见。"
           >
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
-            <span id="effort-label">思考深度: 默认</span>
+            <span id="effort-label">思考深度: 中</span>
             <svg class="mode-pill-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
           </button>
           <div id="effort-menu" class="effort-menu" role="listbox" aria-labelledby="effort-trigger" hidden></div>

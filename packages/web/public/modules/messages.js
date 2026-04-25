@@ -1,5 +1,5 @@
 // OpenClaude — Message rendering and display
-import { _openTopupModal } from './billing.js?v=f06f8b1'
+import { _openTopupModal } from './billing.js?v=landingux1'
 import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
 import { getEffortForSubmit } from './effortMode.js'
 import { exportMessageDocx } from './export-docx.js'
@@ -1377,6 +1377,10 @@ export function _buildMessageEl(msg) {
         renderMessages()
         // Re-send via proper path: build payload with original media if present
         const _regenEffort = getEffortForSubmit()
+        // v1.0.4 — regen 也走当前 user prefs 的 model(可能跟原消息不同;
+        // 用户重发就是想换条件再试)。语义见 main.js send()。
+        const _regenPrefModel = state.userPrefs?.default_model
+        const _regenModelOverride = (typeof _regenPrefModel === 'string' && _regenPrefModel) ? _regenPrefModel : undefined
         const wsPayload = {
           type: 'inbound.message',
           idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1389,6 +1393,7 @@ export function _buildMessageEl(msg) {
           },
           // 与 main.js send() 同语义:string=切档 / null=清除 / undefined=不参与
           ...(_regenEffort !== undefined ? { effortLevel: _regenEffort } : {}),
+          ...(_regenModelOverride !== undefined ? { model: _regenModelOverride } : {}),
           ts: Date.now(),
         }
         // Check if there are pending offline items for this session to prevent reordering
