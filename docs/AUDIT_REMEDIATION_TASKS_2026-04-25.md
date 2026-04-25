@@ -75,7 +75,14 @@
   3. 前端 `modules/admin.js` 加 "订单" tab,列 order_no/用户/金额/状态/paid_at,异常状态(expired/refunded/conflict)红色,明细 modal 显示 callback_payload
   4. Dashboard 顶部加 "24h pending 超时" / "24h callback 冲突" 两个 KPI 卡片,点击跳转 orders tab 预过滤
 - **验证**:列表分页 + 过滤生效、明细展示 payload、KPI 数值与手工 SQL 一致
-- **状态**: `pending`
+- **状态**: `已上线 v3-20260425T0020Z-d325d42,生产验证 PASS`
+- **实施记录 (2026-04-25)**:
+  - 新 `src/admin/orders.ts`:`listOrders` 复合游标 (created_at, id) 分页 / `getOrdersKpi` (24h 卡单/累计卡单/24h 回调冲突/24h 已付) / `getOrderById` 详情(含 callback_payload + ledger 关联)
+  - 新 5 路由(读 `requireAdmin`,无写操作),前端 `admin.js` 加"订单"tab(50/页 + 加载更多)+ KPI 条 + 详情 modal
+  - Dashboard 加 2 个 KPI 卡(24h pending 超时 / 24h 回调冲突),点击跳转预过滤
+  - Codex 1 轮 NEEDS_FIX → 加分页 + 索引补 idx_feedback_created/带 id DESC + parseBigintIdParam BIGINT 范围校验 → SHIP
+  - **生产 hotfix**:`u.username` 列不存在 → `COALESCE(u.display_name, u.email) AS username`(users 表实际只有 email/display_name)
+  - **生产验证 2026-04-25**:8 单订单列表正确显示 user.email、KPI 显示累计卡单 6 单(与手工 SQL 一致)
 
 ---
 
@@ -86,7 +93,11 @@
 - **证据**:`packages/web/public/modules/main.js:1671`
 - **方案**:提交时组装 `{ version, last_api_error: _diagBuffer 最近 5 条, request_ids: 最近 10 条, current_route, sw_version }` 附加到 body;后端新增字段落库或写入 meta JSON
 - **验证**:触发一次假错误 → 打开反馈表单 → 提交 → 在 admin 反馈面板看到完整上下文
-- **状态**: `pending`(依赖 P1-2 后端入库)
+- **状态**: `已上线 v3-20260425T0020Z-d325d42,生产验证 PASS`
+- **实施记录 (2026-04-25)**:
+  - `main.js` 改 `submitFeedback` 装 `{ last_api_errors[5], request_ids[10], current_route, sw_active, sw_state, ts }` 进 meta
+  - 后端 P1-2 表的 meta JSONB 列直接持久化,admin 详情 modal JSON pretty 显示
+  - **生产验证**:用户提交后 admin "反馈" tab 详情能看到完整上下文,journalctl grep 命令模板可一键复制
 
 ### P1-2 反馈入库 + Admin 面板
 - **问题**:当前 `gateway/src/server.ts:1325-1372` 把反馈落盘 `~/.openclaude/feedback/fb-*.json`,超管只能 `ssh ls`
@@ -96,7 +107,13 @@
   3. 新 admin 路由 `GET /api/admin/feedback?status&user_id&from&to&before&limit`;新 `POST /api/admin/feedback/:id/ack` 改 status=acked
   4. 前端 admin.js 新 "反馈" tab,列表 + 明细 modal(含 meta 和对应日志 grep 建议命令)
 - **验证**:前端提交反馈 → admin 面板秒级看到 → ack 后 status 持久化
-- **状态**: `pending`
+- **状态**: `已上线 v3-20260425T0020Z-d325d42,生产验证 PASS`
+- **实施记录 (2026-04-25)**:
+  - migration 0033:新表 `feedback` (含 status open/acked/closed + handled_by/handled_at) + 3 索引(status_created / created / user_created 全部带 id DESC tie-break)
+  - `POST /api/feedback`:Bearer-only auth(避免 CSRF 误绑用户)+ 15-10000 字符 + meta ≤ 8KB + rate-limit 5/min/IP
+  - 文件 fallback 决策放弃(Codex 同意:admin 只读 PG,文件 fallback 是 unreconciled shadow data,运维价值低)
+  - `ackFeedback` 用 `FOR UPDATE` + 写 admin_audit;已 acked/closed 不重复写 audit(幂等)
+  - **生产验证 2026-04-25**:POST 反馈 id=1 写入 → ack 1 次 status=acked + 1 行 admin_audit → ack 第 2 次依然 acked,handled_at 不变,**audit 仍仅 1 行**(idempotent ✓)。rate-limit 第 5 次返回 429 ✓
 
 ### P1-3 402 INSUFFICIENT_CREDITS 流式错误专属 UX
 - **问题**:流中途余额不足,anthropicProxy 返 402,前端 `websocket.js` 的 `handleOutbound` 只认 text/thinking/tool_use/tool_result,错误被吞或串进 text
