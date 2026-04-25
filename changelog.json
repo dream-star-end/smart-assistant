@@ -1,8 +1,8 @@
 {
-  "currentVersion": "v3-20260425T0113Z-ec11962",
+  "currentVersion": "v3-20260425T0201Z-96a31e4",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v3-20260425T0201Z-96a31e4",
       "date": "2026-04-25",
       "title": "多标签页登录态自动同步",
       "items": [
