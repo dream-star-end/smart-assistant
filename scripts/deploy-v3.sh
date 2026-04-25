@@ -10,7 +10,9 @@
 #   4. Auto-bump cache-bust tokens (sw.js VERSION + ?v=XX) to source hash.
 #   5. Finalize changelog: replace PENDING → TAG, bump currentVersion.
 #   6. Stage + commit bump + changelog as `chore(deploy): v<TAG>`.
-#   7. Snapshot remote /opt/openclaude/openclaude/ → /opt/openclaude/openclaude.prev/.
+#   7. Snapshot remote /opt/openclaude/openclaude/ → /opt/openclaude/openclaude.prev.1/
+#      (rotates .prev.1..5/ ctime-ordered; oldest dropped). Legacy single-gen
+#      .prev/ (if present) is migrated to .prev.1/ once on first new deploy.
 #   8. rsync /opt/openclaude/openclaude-v3/ → commercial-v3:/opt/openclaude/openclaude/.
 #   9. Write VERSION.json on remote (atomic: scp → ssh mv).
 #  10. rsync repo changelog.json → commercial-v3:/root/.openclaude/changelog.json
@@ -28,10 +30,12 @@
 #   scripts/deploy-v3.sh --no-commit     # bump versions but don't auto-commit
 #   scripts/deploy-v3.sh --no-changelog  # skip PENDING prompt when 0 entries
 #   scripts/deploy-v3.sh --force         # skip remote WS-count safety check
-#   scripts/deploy-v3.sh --rollback      # restore last snapshot (.prev/) + restart
+#   scripts/deploy-v3.sh --rollback      # restore .prev.1/ (latest snapshot) + restart
+#   scripts/deploy-v3.sh --rollback=N    # restore .prev.N/ (N=1..5) + restart
 #
-# Rollback window = one deploy. Rollback does NOT restore changelog.json in
-# paths.home (accepted small inconsistency — next forward deploy fixes it).
+# Rollback window = up to 5 deploys (.prev.1..5/ rotation). Rollback does NOT
+# restore changelog.json in paths.home (accepted small inconsistency — next
+# forward deploy fixes it).
 
 set -euo pipefail
 
@@ -51,14 +55,22 @@ fi
 DRY_RUN=0
 NO_COMMIT=0
 FORCE=0
-ROLLBACK=0
+# Rollback request is two-state: ROLLBACK_REQUESTED tracks whether the user
+# typed any --rollback* flag at all; ROLLBACK_N holds the literal target value
+# (validated as a string regex ^[1-5]$ before any numeric eval). Splitting
+# these avoids the silent surprise where `--rollback=` (empty value) or
+# `--rollback=0` would otherwise look identical to "no flag" and fall through
+# to the main deploy path.
+ROLLBACK_REQUESTED=0
+ROLLBACK_N=""
 NO_CHANGELOG=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run)      DRY_RUN=1 ;;
     --no-commit)    NO_COMMIT=1 ;;
     --force)        FORCE=1 ;;
-    --rollback)     ROLLBACK=1 ;;
+    --rollback)     ROLLBACK_REQUESTED=1; ROLLBACK_N=1 ;;             # latest snapshot (.prev.1/)
+    --rollback=*)   ROLLBACK_REQUESTED=1; ROLLBACK_N="${arg#*=}" ;;   # specific generation; validated below
     --no-changelog) NO_CHANGELOG=1 ;;
     -h|--help)
       sed -n '1,/^set -/p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -191,26 +203,34 @@ remote_restart_and_healthz() {
 }
 
 # ── Rollback path ──
-# Restores commercial-v3:/opt/openclaude/openclaude.prev/ back to
+# Restores commercial-v3:/opt/openclaude/openclaude.prev.N/ back to
 # /opt/openclaude/openclaude/, then restart + healthz. Skips bump/commit/push.
-# The `.prev/` snapshot is created by the normal deploy path just before rsync.
-if [[ $ROLLBACK -eq 1 ]]; then
-  echo "=== deploy-v3 ROLLBACK ==="
+# .prev.1..5/ snapshots are created by the normal deploy path (rotation just
+# before rsync). N=1 = latest snapshot; N=5 = oldest still-retained snapshot.
+if [[ $ROLLBACK_REQUESTED -eq 1 ]]; then
+  # String-first validation: covers --rollback=0, --rollback=, --rollback=1.5,
+  # --rollback=abc, --rollback=6 etc. before any numeric eval.
+  if ! [[ "$ROLLBACK_N" =~ ^[1-5]$ ]]; then
+    echo "ERROR: --rollback=N requires N in 1..5 (got: '$ROLLBACK_N')" >&2
+    exit 2
+  fi
+  echo "=== deploy-v3 ROLLBACK → .prev.${ROLLBACK_N}/ ==="
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "ERROR: --dry-run with --rollback is not meaningful (nothing local changes)." >&2
     exit 2
   fi
   remote_safety_check
 
+  PREV_DIR="/opt/openclaude/openclaude.prev.${ROLLBACK_N}"
   # Verify snapshot exists on remote before touching anything.
-  if ! ssh commercial-v3 'test -d /opt/openclaude/openclaude.prev && test -f /opt/openclaude/openclaude.prev/package.json' 2>/dev/null; then
-    echo "ERROR: no rollback snapshot at commercial-v3:/opt/openclaude/openclaude.prev/" >&2
-    echo "       (either no deploy has been run since --rollback was added, or the" >&2
-    echo "        snapshot was manually removed). Cannot proceed." >&2
+  if ! ssh commercial-v3 "test -d '${PREV_DIR}' && test -f '${PREV_DIR}/package.json'" 2>/dev/null; then
+    echo "ERROR: no rollback snapshot at commercial-v3:${PREV_DIR}/" >&2
+    echo "       (snapshot from ${ROLLBACK_N} deploys ago not yet rotated into existence," >&2
+    echo "        or was manually removed). Cannot proceed." >&2
     exit 1
   fi
 
-  echo "-- restoring /opt/openclaude/openclaude.prev/ → /opt/openclaude/openclaude/ --"
+  echo "-- restoring ${PREV_DIR}/ → /opt/openclaude/openclaude/ --"
   # -a preserves perms/times; --delete mirrors the prev snapshot exactly.
   # Exclude data/node_modules so we don't churn those on restore — they live outside
   # the code layer and shouldn't diverge just from a rollback. .env likewise stays put.
@@ -218,7 +238,7 @@ if [[ $ROLLBACK -eq 1 ]]; then
     --exclude=/data \
     --exclude=/node_modules \
     --exclude=.env \
-    /opt/openclaude/openclaude.prev/ /opt/openclaude/openclaude/" || {
+    '${PREV_DIR}/' /opt/openclaude/openclaude/" || {
     echo "FATAL: rollback rsync failed" >&2
     exit 1
   }
@@ -313,11 +333,11 @@ if [[ $DRY_RUN -eq 0 && $NO_COMMIT -eq 0 ]]; then
   fi
 fi
 
-# ── 4. Snapshot remote state for --rollback ──
-# Runs BEFORE the push so .prev/ captures what's currently live. Using rsync
+# ── 4. Snapshot remote state for --rollback (5-gen rotation) ──
+# Runs BEFORE the push so .prev.1/ captures what's currently live. Using rsync
 # with --delete inside the remote shell is fast (local disk) and atomic enough:
 # if this step fails we exit before touching /opt/openclaude/openclaude/, so we
-# never end up in a state where the live tree is half-updated and .prev is bad.
+# never end up in a state where the live tree is half-updated and .prev.1 is bad.
 # data/node_modules/.env are excluded on purpose — they're not part of the code
 # layer and rolling them back from an older snapshot could be destructive
 # (e.g. fresh container user-data shouldn't revert).
@@ -328,15 +348,62 @@ fi
 # 制回 live 树 —— 用明确的 rm + --delete-excluded 双保险。
 # --delete-excluded 只在 snapshot 方向用;rollback 方向不加,否则会删 live 的
 # .env/data/node_modules。
+#
+# Rotation strategy (P2-18):
+#   1. Legacy migration: if a single-gen .prev/ exists from before this script
+#      version (and no .prev.1/ yet), rename it to .prev.1/. One-shot, idempotent.
+#      If both exist (corrupt mixed state), keep the rotated chain and warn —
+#      don't auto-delete legacy data without operator review.
+#   2. Stage new snapshot in .prev.new/. If rsync fails, .prev.1..5/ are
+#      untouched; .prev.new/ remains for inspection and is overwritten next run
+#      (every snapshot starts with `rm -rf .prev.new` before the rsync).
+#   3. Rotate via mv (O(1) metadata): drop .prev.5, shift 4→5, 3→4, 2→3, 1→2,
+#      then promote .prev.new → .prev.1. Each `mv` is guarded against
+#      dest-exists (would otherwise nest dirs under a corrupt mixed state).
+#
+# Crash safety: live tree is not touched until after this block returns 0. A
+# crash during the mv-chain can leave a gap in the chain; deploy aborts before
+# push and operator can inspect/repair. Not a full transaction system by
+# design — see Codex review M8.1 for rationale.
 if [[ $DRY_RUN -eq 0 ]]; then
-  echo "-- snapshotting remote live tree → /opt/openclaude/openclaude.prev/ --"
-  ssh commercial-v3 "mkdir -p /opt/openclaude/openclaude.prev && \
-    rsync -a --delete --delete-excluded \
-      --exclude=/data \
-      --exclude=/node_modules \
-      --exclude=.env \
-      /opt/openclaude/openclaude/ /opt/openclaude/openclaude.prev/" || {
-    echo "FATAL: remote snapshot failed; aborting before push" >&2
+  echo "-- snapshotting remote live tree → /opt/openclaude/openclaude.prev.1/ (5-gen rotation) --"
+  ssh commercial-v3 'bash -s' <<'REMOTE' || {
+set -euo pipefail
+PREV_BASE=/opt/openclaude/openclaude.prev
+LIVE=/opt/openclaude/openclaude
+
+# 1. Legacy single-gen .prev/ migration (one-shot, idempotent).
+if [ -d "${PREV_BASE}" ] && [ ! -d "${PREV_BASE}.1" ]; then
+  echo "   (migrating legacy ${PREV_BASE}/ → ${PREV_BASE}.1/)"
+  mv "${PREV_BASE}" "${PREV_BASE}.1"
+elif [ -d "${PREV_BASE}" ]; then
+  echo "   WARN: legacy ${PREV_BASE}/ exists alongside rotated snapshots; leaving untouched" >&2
+fi
+
+# 2. Stage new snapshot in .prev.new/ (any prior residue cleared first).
+NEW="${PREV_BASE}.new"
+rm -rf "$NEW"
+mkdir -p "$NEW"
+rsync -a --delete --delete-excluded \
+  --exclude=/data \
+  --exclude=/node_modules \
+  --exclude=.env \
+  "${LIVE}/" "${NEW}/"
+
+# 3. Rotate: drop oldest, shift older→older+1, promote new→1.
+[ -d "${PREV_BASE}.5" ] && rm -rf "${PREV_BASE}.5"
+for i in 4 3 2 1; do
+  if [ -d "${PREV_BASE}.${i}" ]; then
+    if [ -e "${PREV_BASE}.$((i+1))" ]; then
+      echo "FATAL: ${PREV_BASE}.$((i+1)) unexpectedly exists; aborting rotation" >&2
+      exit 1
+    fi
+    mv "${PREV_BASE}.${i}" "${PREV_BASE}.$((i+1))"
+  fi
+done
+mv "$NEW" "${PREV_BASE}.1"
+REMOTE
+    echo "FATAL: remote snapshot/rotation failed; aborting before push" >&2
     exit 1
   }
 fi
@@ -407,7 +474,8 @@ rsync -az "$REPO_ROOT/changelog.json" commercial-v3:/root/.openclaude/changelog.
 # ── 8. Remote restart + health-check ──
 if ! remote_restart_and_healthz; then
   echo "=== deploy-v3 $TAG FAILED at healthz ===" >&2
-  echo "   rollback: scripts/deploy-v3.sh --rollback" >&2
+  echo "   rollback (latest):  scripts/deploy-v3.sh --rollback" >&2
+  echo "   rollback older:     scripts/deploy-v3.sh --rollback=N   (N=1..5)" >&2
   exit 1
 fi
 
@@ -426,7 +494,8 @@ if ! bash "$REPO_ROOT/scripts/smoke-v3.sh" "$TAG" https://claudeai.chat; then
   echo "=== deploy-v3 $TAG FAILED at smoke ===" >&2
   echo "   code is LIVE but one or more smoke checks failed." >&2
   echo "   inspect: curl https://claudeai.chat/version" >&2
-  echo "   rollback: scripts/deploy-v3.sh --rollback" >&2
+  echo "   rollback (latest):  scripts/deploy-v3.sh --rollback" >&2
+  echo "   rollback older:     scripts/deploy-v3.sh --rollback=N   (N=1..5)" >&2
   exit 1
 fi
 
@@ -447,4 +516,5 @@ fi
 echo ""
 echo "=== deploy-v3 $TAG complete ==="
 echo "   live: curl https://claudeai.chat/version"
-echo "   rollback: scripts/deploy-v3.sh --rollback"
+echo "   rollback (latest):  scripts/deploy-v3.sh --rollback"
+echo "   rollback older:     scripts/deploy-v3.sh --rollback=N   (N=1..5)"
