@@ -1209,6 +1209,11 @@ async function _forceLogout({ serverLogout, broadcast = Boolean(serverLogout) } 
   state.attachments = []
   renderAttachments()
   hideTypingIndicator()
+  // 2026-04-25:logout teardown 才清登录密码字段(不在 showLogin 清,以保留浏览器
+  // 密码管理器自动填充的值)。手输未保存的密码不应跨 logout 残留在 DOM。
+  // email 不清 — 用户登出后再登录通常还是同一邮箱,保留减少摩擦。
+  const _pwEl = $('auth-login-password')
+  if (_pwEl) _pwEl.value = ''
   // Clear IndexedDB to prevent cross-user data leakage on shared browsers
   try {
     const all = await dbGetAll()
@@ -1259,10 +1264,11 @@ function showLogin() {
   if ($('landing-view')) $('landing-view').hidden = true
   document.body.classList.remove('body-landing')
   if ($('login-error')) $('login-error').hidden = true
-  // Clear v3 commercial auth-mode form fields if present
+  // Clear v3 commercial auth-mode form fields if present.
+  // 2026-04-25:故意不清 auth-login-email / auth-login-password —— 让浏览器密码管理器
+  // 自动填的值能保留下来。手输密码的残留在 _forceLogout() 里清(logout teardown 才清,
+  // 进入登录页的常规路径不清)。register/forgot/reset 字段保持清空(草稿数据残留防御)。
   for (const id of [
-    'auth-login-email',
-    'auth-login-password',
     'auth-register-email',
     'auth-register-password',
     'auth-register-confirm',

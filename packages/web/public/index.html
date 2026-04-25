@@ -330,8 +330,12 @@
 
     <!-- ── Mode: login ── -->
     <!-- 2026-04-25 登录区用 <form> 包裹 + name/autocomplete=username+current-password,
-         让浏览器密码管理器能识别为登录表单并 offer 保存/自动填充账号密码。 -->
-    <form id="auth-mode-login" hidden autocomplete="on">
+         让浏览器密码管理器能识别为登录表单并 offer 保存/自动填充账号密码。
+         form 自身不带 hidden(setMode 切到 register/forgot 时再加 hidden=true)—
+         page load 阶段 form 在 DOM 中可被密码管理器扫描到字段。
+         method/action 占位帮 Safari + 1Password / Bitwarden 扩展识别为登录表单
+         (e.preventDefault() 拦了真实 submit,不会触发实际 navigation)。 -->
+    <form id="auth-mode-login" autocomplete="on" method="post" action="/api/auth/login">
       <div class="login-field">
         <label for="auth-login-email">邮箱</label>
         <input id="auth-login-email" name="email" type="email" placeholder="you@example.com" autocomplete="username" inputmode="email" />
