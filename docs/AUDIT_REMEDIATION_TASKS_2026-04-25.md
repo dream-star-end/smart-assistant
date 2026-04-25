@@ -239,11 +239,39 @@
   - Critical guard: 第一次跑用错路径 `/root/.openclaude/.env` (从 45.32 personal 抄错),dispatch 失败但 marker NOT touched — 完美符合设计,下个 tick 自动重试。后续 fix 改成 `/etc/openclaude/commercial.env`
 - **Codex review (3 轮)**:1 BLOCKING (ProtectHome=true 让 /root 不可读) + 2 IMPORTANT (jsonb_typeof 防御、payload JSON 转义) + 1 NIT (RuntimeDirectoryMode 显式 0700) 全部修复。最终 PASS
 
-### P2-20 Admin CSV 导出 + 诊断端点
-- **方案**:
-  1. `/api/admin/users.csv` `/api/admin/orders.csv` `/api/admin/ledger.csv` 流式导出
-  2. `/api/admin/diagnostics` 返 `{ outbox_pending, outbox_failed, inflight_by_uid, accounts_healthy_pct, last_deploy_tag }`
-- **验证**:CSV 能用 Excel 打开;diagnostics 数值和手工 SQL 一致
+### P2-20 Admin CSV 导出 + 诊断端点 ✅ DONE 2026-04-25 (M8.4 / `v3-20260425T0501Z-53c6994`)
+
+- **设计要点**:
+  - **三个 CSV 端点同型**:`/api/admin/users.csv` / `/api/admin/orders.csv` / `/api/admin/ledger.csv`(已存在)统一走 **内存构建 + 50000 行硬上限**(不流式 — 与 Codex plan v1 的 streaming 提议反过来。Codex plan v2 同意"对齐已有 ledger.csv 的 KISS 选择")
+  - **鉴权统一**:三个 CSV 全部 `requireAdminVerifyDb` + `writeAdminAudit`(action=`users.export_csv` / `orders.export_csv` / `ledger.export_csv`),before `writeHead`(失败 → 不下发 body)
+  - **csvHelper 抽出**:`admin/csvHelper.ts::csvEscapeCell` + `csvFilename` 共用 — formula injection 防护(`= + - @ \t \r` 起首加 `'` 前缀)+ RFC 4180 quoting 跟原 ledger.ts:142 一字不差
+  - **diagnostics**:`requireAdmin`(JWT-only,与 stats.* 同),并发拉 `getAlertsSummary` + `getAccountPoolSnapshot` + `SELECT version()` + `getPool()` 计数。返 flat shape `{ server, db, alerts, account_pool }`(不嵌套,Codex plan v2 修正)。`server.version` 走 `process.cwd()/VERSION.json`(与 gateway `/version` 同步,避免引入 `@openclaude/storage` 新 dep)
+  - **money 列命名一致**:全用 `_cents`(`credits_cents`, `amount_cents`, `delta_cents`)
+  - **ORDER_STATUSES export**:从 `http/admin.ts` 私有挪到 `admin/orders.ts` export,list / CSV / 任何 runtime 校验共用一份白名单(Codex plan v2 修正点 3)
+  - **不导出敏感字段**:users.csv 跳过 `password_hash` / `avatar_url` / `deleted_at`;orders.csv 跳过 `callback_payload`(体积大 + 含上游回调原文)
+
+- **错误处理**:
+  - 模块层 ops 失败 → `RangeError("invalid_X")`;HTTP 层 `translateRangeError` → 400 VALIDATION
+  - bigint 溢出守卫(`> 9223372036854775807n` → RangeError)在 `buildOrdersCsvWhere` 模块边界,防 PG 22003 numeric_value_out_of_range — Codex code review IMPORTANT 修
+  - audit 写失败 → 抛 → 客户端拿 500(没拿到 CSV) — 设计意图
+
+- **测试覆盖** (`adminCsvDiagnostics.integ.test.ts`):
+  - csvEscapeCell formula(`=` `+` `-` `@` `\t` `\r`)+ RFC4180(`,` `"` `\n`)+ 复合(`\r` 同时触发两种)
+  - csvFilename 格式 `<prefix>-YYYYMMDDTHHmm.csv`
+  - buildUsersCsv:空表 / formula 字段 escape / status filter / invalid status RangeError
+  - buildOrdersCsv:空表 / status filter / user_id filter / invalid status / invalid user_id / **bigint 溢出 user_id** / invalid from / invalid to
+  - HTTP /users.csv & /orders.csv:无 token → 401 / 普通用户 → 403 / admin → 200 + CSV body + `admin_audit` 写入断言 / invalid status → 400 VALIDATION
+  - HTTP /diagnostics:无 token / 普通用户 / admin → 200 + 字段断言(server.version / db.pool_total / db.pg_version 含 "PostgreSQL" / alerts / account_pool)
+
+- **Codex review summary**:
+  - **Plan v1**: 2 BLOCKING(formula injection 缺失 / 鉴权降级)+ 多个 IMPORTANT(streaming backpressure / mid-stream error)
+  - **Plan v2**: PASS,3 个修正(db shape flat / VERSION.json 路径 / ORDER_STATUSES 提到 module)
+  - **Code review**: 2 个 finding(BLOCKING provider='wechat' 写错应为 'hupijiao' / IMPORTANT bigint 溢出守卫)→ 全修 → re-review PASS
+
+- **验证**:
+  - `scripts/deploy-v3.sh --no-changelog` 5/5 smoke pass(version tag 一致)
+  - 3 个新路由 401 envelope(`UNAUTHORIZED` + request_id)正常
+  - 本地测试 6 pass / 19 skip(no pg fixture)/ 0 fail
 
 ### P2-21 Alert outbox "重发失败项"按钮 + ack 三态 ✅ DONE 2026-04-25 (M8.3 / `v3-20260425T0439Z-c7b2b61`)
 
