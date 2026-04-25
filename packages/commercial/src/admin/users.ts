@@ -93,6 +93,8 @@ export interface AdminUserWithStatsRowView extends AdminUserRowView {
   total_topup_cents: string;
   /** 最近一次 usage_records.created_at(ISO string) ,null 表示从未调用过 */
   last_active_at: string | null;
+  /** 当前活跃容器数(v3 state='active' + v2 status='running')。0 = 灰显不可点。 */
+  containers_active: number;
 }
 
 export interface ListUsersWithStatsResult {
@@ -215,11 +217,15 @@ export async function listUsersWithStats(
     today_errors: string;
     total_topup_cents: string | null;
     last_active_at: Date | null;
+    containers_active: number;
   }>(
     // last_seen 用 LATERAL(SELECT ... ORDER BY created_at DESC LIMIT 1) 稳定命中
     //   (user_id, created_at DESC) 首行,比 MAX() GROUP BY 少扫整个分区。
     // today/topup 仍走 GROUP BY + FILTER —— 今日窗口 + partial index
     //   idx_cl_user_topup (0027) 都让范围很小。
+    // ct_v3: partial unique uniq_ac_user_id_active(WHERE state='active')命中。
+    // ct_v2: 由 0039 新增 partial b-tree idx_ac_user_running_v2 命中。
+    // 显式 ::int cast 避免 PG COUNT(*) 返回 int8 → node-pg 默认转字符串。
     `WITH ids AS (
        SELECT unnest($1::bigint[]) AS user_id
      ),
@@ -239,15 +245,32 @@ export async function listUsersWithStats(
          AND reason = 'topup'
          AND delta > 0
        GROUP BY user_id
+     ),
+     ct_v3 AS (
+       SELECT user_id, COUNT(*) AS n
+       FROM agent_containers
+       WHERE state = 'active' AND subscription_id IS NULL
+         AND user_id = ANY($1::bigint[])
+       GROUP BY user_id
+     ),
+     ct_v2 AS (
+       SELECT user_id, COUNT(*) AS n
+       FROM agent_containers
+       WHERE status = 'running' AND subscription_id IS NOT NULL
+         AND user_id = ANY($1::bigint[])
+       GROUP BY user_id
      )
      SELECT ids.user_id::text                                 AS user_id,
             COALESCE(today.req_count, 0)::text                AS today_requests,
             COALESCE(today.err_count, 0)::text                AS today_errors,
             COALESCE(topup.total::text, '0')                  AS total_topup_cents,
-            ls.last_at                                        AS last_active_at
+            ls.last_at                                        AS last_active_at,
+            (COALESCE(ct_v3.n, 0) + COALESCE(ct_v2.n, 0))::int AS containers_active
      FROM ids
      LEFT JOIN today ON today.user_id = ids.user_id
      LEFT JOIN topup ON topup.user_id = ids.user_id
+     LEFT JOIN ct_v3 ON ct_v3.user_id = ids.user_id
+     LEFT JOIN ct_v2 ON ct_v2.user_id = ids.user_id
      LEFT JOIN LATERAL (
        SELECT created_at AS last_at
          FROM usage_records
@@ -267,6 +290,8 @@ export async function listUsersWithStats(
       today_errors: s ? Number(s.today_errors) : 0,
       total_topup_cents: s?.total_topup_cents ?? "0",
       last_active_at: s?.last_active_at ? s.last_active_at.toISOString() : null,
+      // ::int cast 后 pg 应返回 number;Number() 是 belt-and-suspenders 防御。
+      containers_active: s ? Number(s.containers_active ?? 0) : 0,
     };
   });
   return { rows, next_cursor: page.next_cursor };

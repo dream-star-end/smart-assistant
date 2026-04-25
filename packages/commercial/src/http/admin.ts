@@ -63,6 +63,7 @@ import {
   adminPatchAccount,
   adminDeleteAccount,
   adminResetCooldown,
+  getAccountRecentUsers,
   maskEgressProxy,
   type AdminCreateAccountInput,
   type AdminPatchAccountInput,
@@ -206,6 +207,7 @@ function serializeUserWithStats(u: AdminUserWithStatsRowView): Record<string, un
     today_errors: u.today_errors,
     total_topup_cents: u.total_topup_cents,
     last_active_at: u.last_active_at,
+    containers_active: u.containers_active,
   };
 }
 
@@ -706,7 +708,7 @@ function serializeAccount(a: AccountRow): Record<string, unknown> {
   };
 }
 
-function serializeContainer(r: AdminContainerRowView): Record<string, unknown> {
+export function serializeContainer(r: AdminContainerRowView): Record<string, unknown> {
   return {
     id: r.id,
     user_id: r.user_id,
@@ -731,6 +733,8 @@ function serializeContainer(r: AdminContainerRowView): Record<string, unknown> {
     last_error: r.last_error,
     created_at: r.created_at.toISOString(),
     updated_at: r.updated_at.toISOString(),
+    host_uuid: r.host_uuid,
+    host_name: r.host_name,
   };
 }
 
@@ -811,10 +815,62 @@ export async function handleAdminGetAccount(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-  const id = extractTailId(url, "/api/admin/accounts/");
-  const a = await adminGetAccount(id);
+  // accounts 走 router 的 pathPrefix `/api/admin/accounts/`,所有 GET 都走这一个
+  // 入口。子资源(/recent-users)在这里 dispatch — 不能为子路径单独注册 route
+  // (会被 prefix 吞)。参考 R3 reset-cooldown 的同模式(router.ts:445-452)。
+  //
+  // 不用 split limit=2:那样 /123/recent-users/extra 会让 action="recent-users"
+  // 通过 → 行为不该的子路径被静默接受。slice(1).join("/") 让 extra 段把
+  // action 撑成 "recent-users/extra",落到下方的 action !== "" 404 分支。
+  const tail = url.pathname.slice("/api/admin/accounts/".length);
+  const parts = tail.split("/");
+  const idRaw = parts[0] ?? "";
+  const action = parts.slice(1).join("/");
+  if (!/^[1-9][0-9]{0,19}$/.test(idRaw)) {
+    throw new HttpError(400, "VALIDATION", "invalid id in URL", {
+      issues: [{ path: "id", message: idRaw }],
+    });
+  }
+  if (action === "recent-users") {
+    return handleAccountRecentUsers(idRaw, url, res);
+  }
+  if (action !== "") {
+    throw new HttpError(404, "NOT_FOUND", "endpoint not found");
+  }
+  const a = await adminGetAccount(idRaw);
   if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
   sendJson(res, 200, { account: serializeAccount(a) });
+}
+
+/**
+ * GET /api/admin/accounts/:id/recent-users?hours=24&limit=20
+ * 列出最近 N 小时使用过这个账号的用户(按请求量倒序)。
+ *
+ * caller 是 handleAdminGetAccount 的 sub-dispatcher,id 已校验过 bigint 形态;
+ * requireAdmin 也已通过。
+ */
+async function handleAccountRecentUsers(
+  id: string,
+  url: URL,
+  res: ServerResponse,
+): Promise<void> {
+  const hoursRaw = url.searchParams.get("hours");
+  const limitRaw = url.searchParams.get("limit");
+  const hours =
+    hoursRaw !== null && hoursRaw !== ""
+      ? parsePositiveInt(hoursRaw, "hours", 24 * 30) ?? 24
+      : 24;
+  const limit =
+    limitRaw !== null && limitRaw !== ""
+      ? parsePositiveInt(limitRaw, "limit", 100) ?? 20
+      : 20;
+  // 账号存在校验 → 否则 404(避免静默返空)
+  const a = await adminGetAccount(id);
+  if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
+  try {
+    const rows = await getAccountRecentUsers(id, hours, limit);
+    sendJson(res, 200, { rows });
+  } catch (err) { translateRangeError(err); }
 }
 
 /**
@@ -1093,6 +1149,8 @@ export async function handleAdminOAuthExchange(
 
 // ─── agent containers ──────────────────────────────────────────────
 
+const HOST_UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 export async function handleAdminListAgentContainers(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1105,11 +1163,20 @@ export async function handleAdminListAgentContainers(
   const status = sp.get("status") ?? undefined;
   const limit = parsePositiveInt(sp.get("limit"), "limit", 500);
   const offset = parseNonNegativeInt(sp.get("offset"), "offset");
+  const hostUuidRaw = sp.get("host_uuid");
+  let hostUuid: string | undefined;
+  if (hostUuidRaw !== null && hostUuidRaw !== "") {
+    if (!HOST_UUID_RE.test(hostUuidRaw)) {
+      throw new HttpError(400, "INVALID_HOST_UUID", "host_uuid must be UUID");
+    }
+    hostUuid = hostUuidRaw;
+  }
   try {
     const rows = await listContainers({
       status: status === undefined || status === "" ? undefined : status,
       limit,
       offset,
+      host_uuid: hostUuid,
     });
     sendJson(res, 200, { rows: rows.map(serializeContainer) });
   } catch (err) { translateRangeError(err); }

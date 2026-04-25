@@ -33,6 +33,8 @@ import {
   clearQuarantineForHost,
   getBaselineVersions,
 } from "../admin/computeHosts.js";
+import { listContainers } from "../admin/containers.js";
+import { serializeContainer } from "./admin.js";
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -88,7 +90,17 @@ export async function handleAdminAddComputeHost(
   sendJson(res, 201, result);
 }
 
-export async function handleAdminComputeHostBootstrapLog(
+/**
+ * GET prefix handler for `/api/admin/v3/compute-hosts/:id/<sub>`。
+ * 因 router 走 prefix 一个 GET handler 接所有 /:id/* 路径,此处 switch action。
+ *
+ * 当前覆盖:
+ *   - bootstrap-log → 进度日志
+ *   - containers    → 该 host 上的 agent_containers 列表(deeplink 跳转用)
+ *
+ * 旧函数名 handleAdminComputeHostBootstrapLog 已重命名,router.ts 的引用同步更新。
+ */
+export async function handleAdminComputeHostGetSubresource(
   req: IncomingMessage,
   res: ServerResponse,
   _ctx: RequestContext,
@@ -97,12 +109,20 @@ export async function handleAdminComputeHostBootstrapLog(
   await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const { id, action } = extractIdAndAction(url.pathname, "/api/admin/v3/compute-hosts/");
-  // GET prefix handler 只应命中 /:id/bootstrap-log;其它 404
-  if (action !== "bootstrap-log") {
-    throw new HttpError(404, "NOT_FOUND", "endpoint not found");
+  switch (action) {
+    case "bootstrap-log": {
+      const log = await getBootstrapLog(id);
+      sendJson(res, 200, log);
+      return;
+    }
+    case "containers": {
+      const rows = await listContainers({ host_uuid: id });
+      sendJson(res, 200, { rows: rows.map(serializeContainer) });
+      return;
+    }
+    default:
+      throw new HttpError(404, "NOT_FOUND", "endpoint not found");
   }
-  const log = await getBootstrapLog(id);
-  sendJson(res, 200, log);
 }
 
 export async function handleAdminComputeHostAction(

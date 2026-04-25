@@ -26,6 +26,7 @@
  */
 
 import { getPool } from "../db/index.js";
+import { query } from "../db/queries.js";
 import {
   ACCOUNT_PLANS,
   ACCOUNT_STATUSES,
@@ -472,4 +473,58 @@ export async function adminDeleteAccount(
     null,
   );
   return true;
+}
+
+// ─── Recent users (cross-tab deeplink) ─────────────────────────────
+
+export interface AccountRecentUserView {
+  user_id: string;
+  email: string | null;
+  request_count: number;
+  last_used_at: string;
+}
+
+/**
+ * 列出最近 `hours` 小时内"使用过这个账号"的用户(按请求量倒序)。
+ *
+ * 走 idx_ur_account (account_id, created_at DESC)(0002 建)。
+ * COUNT(*) 在 PG 是 int8 — node-pg 默认转字符串,这里 ::int 强制返回 number,
+ * 避免前端 `=== 0` 严格比较失效。
+ */
+export async function getAccountRecentUsers(
+  accountId: bigint | string,
+  hours = 24,
+  limit = 20,
+): Promise<AccountRecentUserView[]> {
+  const id = typeof accountId === "bigint" ? accountId.toString() : accountId;
+  if (!/^[1-9][0-9]{0,19}$/.test(id)) {
+    throw new RangeError("invalid_account_id");
+  }
+  const h = Number.isInteger(hours) && hours > 0 && hours <= 24 * 30 ? hours : 24;
+  const lim = Number.isInteger(limit) && limit > 0 && limit <= 100 ? limit : 20;
+  const r = await query<{
+    user_id: string;
+    email: string | null;
+    request_count: number;
+    last_used_at: Date;
+  }>(
+    `SELECT u.id::text AS user_id,
+            u.email,
+            COUNT(*)::int AS request_count,
+            MAX(ur.created_at) AS last_used_at
+       FROM usage_records ur
+       JOIN users u ON u.id = ur.user_id
+      WHERE ur.account_id = $1::bigint
+        AND ur.created_at > NOW() - ($2::int || ' hours')::interval
+   GROUP BY u.id, u.email
+   ORDER BY request_count DESC
+      LIMIT $3::int`,
+    [id, h, lim],
+  );
+  return r.rows.map((row) => ({
+    user_id: row.user_id,
+    email: row.email,
+    request_count: Number(row.request_count),
+    last_used_at: row.last_used_at.toISOString(),
+  }));
 }

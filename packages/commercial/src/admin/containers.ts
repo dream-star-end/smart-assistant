@@ -92,6 +92,10 @@ export interface AdminContainerRowView {
   last_error: string | null;
   created_at: Date;
   updated_at: Date;
+  /** 宿主机 uuid(v3 行,LEFT JOIN compute_hosts);v2 / 未分配 = NULL。 */
+  host_uuid: string | null;
+  /** 宿主机 name(LEFT JOIN compute_hosts.name);未关联 = NULL。 */
+  host_name: string | null;
 }
 
 const CONTAINER_COLS = `
@@ -128,7 +132,9 @@ const CONTAINER_COLS = `
   c.volume_gc_at,
   c.last_error,
   c.created_at,
-  c.updated_at
+  c.updated_at,
+  c.host_uuid::text       AS host_uuid,
+  ch.name                 AS host_name
 `;
 
 export interface ListContainersInput {
@@ -149,6 +155,8 @@ export interface ListContainersInput {
   status?: string | string[];
   limit?: number;
   offset?: number;
+  /** 可选:按宿主机 uuid 过滤(deeplink 跳转用)。caller 必须先验证 UUID 形态。 */
+  host_uuid?: string;
 }
 
 const CONTAINER_STATUSES = ["provisioning", "running", "stopped", "removed", "error"] as const;
@@ -185,6 +193,10 @@ export async function listContainers(input: ListContainersInput = {}): Promise<A
     });
     where.push(parts.length === 1 ? parts[0]! : `(${parts.join(" OR ")})`);
   }
+  if (input.host_uuid !== undefined && input.host_uuid !== "") {
+    params.push(input.host_uuid);
+    where.push(`c.host_uuid = $${params.length}::uuid`);
+  }
   let limit = input.limit ?? 50;
   if (!Number.isInteger(limit) || limit <= 0) limit = 50;
   if (limit > 500) limit = 500;
@@ -201,6 +213,7 @@ export async function listContainers(input: ListContainersInput = {}): Promise<A
      FROM agent_containers c
      JOIN users u ON u.id = c.user_id
      LEFT JOIN agent_subscriptions s ON s.id = c.subscription_id
+     LEFT JOIN compute_hosts ch ON ch.id = c.host_uuid
      ${whereClause}
      ORDER BY c.id DESC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,

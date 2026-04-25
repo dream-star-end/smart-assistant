@@ -110,7 +110,7 @@ import {
 import {
   handleAdminListComputeHosts,
   handleAdminAddComputeHost,
-  handleAdminComputeHostBootstrapLog,
+  handleAdminComputeHostGetSubresource,
   handleAdminComputeHostAction,
   handleAdminBaselineVersion,
 } from './adminComputeHosts.js'
@@ -567,7 +567,7 @@ export function createCommercialHandler(
     // V3 D.3 多机 compute_hosts 管理(超管)
     //   exact path 优先于 pathPrefix(matchRoute exact-first),所以
     //   /compute-hosts 和 /compute-hosts/add 不会被 prefix handler 吞掉。
-    //   pathPrefix GET 只命中 /:id/bootstrap-log,handler 自己 404 其它后缀。
+    //   pathPrefix GET 在 handler 内部 switch action(bootstrap-log / containers / 404)。
     //   pathPrefix POST 按 action 分发 drain / remove / quarantine-clear。
     { method: 'GET', path: '/api/admin/v3/compute-hosts', handler: handleAdminListComputeHosts },
     { method: 'POST', path: '/api/admin/v3/compute-hosts/add', handler: handleAdminAddComputeHost },
@@ -575,7 +575,7 @@ export function createCommercialHandler(
     {
       method: 'GET',
       pathPrefix: '/api/admin/v3/compute-hosts/',
-      handler: handleAdminComputeHostBootstrapLog,
+      handler: handleAdminComputeHostGetSubresource,
     },
     {
       method: 'POST',

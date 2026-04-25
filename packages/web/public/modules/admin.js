@@ -338,9 +338,41 @@ const TABS = {
   alerts: renderAlertsTab,
 }
 
-function navigate(tab) {
-  if (window.location.hash !== `#tab=${tab}`) {
-    window.location.hash = `#tab=${tab}`
+// pendingDeeplink:cross-tab 跳转时,把 query 暂存到这个一次性 token。
+// 接管 tab 的 render 函数读到后**立即**清空,确保只生效一次,不污染后续手动操作。
+// 同步也写 sessionStorage 一份(原有"过滤值持久化"的契约保持),
+// 但 render 的优先级是 pendingDeeplink > sessionStorage,
+// 解决 Codex review 标识的"sessionStorage 残留覆盖刚跳过来的 query"问题。
+let pendingDeeplink = null
+
+/**
+ * 把元素的 data-q-* 属性收成 navigate 的 query 参数对象。
+ *   <a data-nav="containers" data-q-user_email="x@y" data-q-host_uuid="...">
+ *     → { user_email: "x@y", host_uuid: "..." }
+ *
+ * dataset 把 hyphen 转成 camelCase,所以 data-q-user_email → dataset.qUser_email,
+ * 但我们用 underscore key 不带 hyphen,dataset 直接保留为 quser_email — 不可靠。
+ * 改用 element.attributes 遍历,显式过滤 data-q- 前缀,稳定。
+ */
+function _navQueryFrom(el) {
+  const out = {}
+  for (const attr of el.attributes) {
+    if (attr.name.startsWith('data-q-')) {
+      const k = attr.name.slice('data-q-'.length)
+      if (k && attr.value !== '') out[k] = attr.value
+    }
+  }
+  return Object.keys(out).length === 0 ? null : out
+}
+
+function navigate(tab, query) {
+  // query 可选:无 query 时与原行为完全一致(只切 tab)。
+  const qs = query
+    ? '&' + new URLSearchParams(query).toString()
+    : ''
+  const target = `#tab=${tab}${qs}`
+  if (window.location.hash !== target) {
+    window.location.hash = target
   } else {
     applyHash()
   }
@@ -368,8 +400,26 @@ const TAB_CLEANUPS = {
 let _currentTab = null
 
 function applyHash() {
-  const m = /#tab=([a-z]+)/.exec(window.location.hash)
+  // 扩展原正则,支持 #tab=NAME 和 #tab=NAME&k=v&k2=v2 两种形态。
+  const m = /#tab=([a-z]+)(?:&(.+))?$/.exec(window.location.hash)
   const tab = (m && TABS[m[1]]) ? m[1] : 'dashboard'
+  const params = m && m[2] ? new URLSearchParams(m[2]) : null
+
+  // pendingDeeplink:render 函数优先消费它(覆盖 sessionStorage 残留)。
+  pendingDeeplink = params ? { tab, params } : null
+
+  // 也写一份 sessionStorage:保持现有"刷新页面后过滤值还在"的契约。
+  // 注意 render 的覆盖优先级:pendingDeeplink > sessionStorage。
+  if (params) {
+    if (tab === 'containers') {
+      if (params.has('user_email')) sessionStorage.setItem('admin_ct_email', params.get('user_email'))
+      if (params.has('host_uuid')) sessionStorage.setItem('admin_ct_host_uuid', params.get('host_uuid'))
+    }
+    if (tab === 'hosts' && params.has('focus_uuid')) {
+      sessionStorage.setItem('admin_h_focus_uuid', params.get('focus_uuid'))
+    }
+  }
+
   // 切 tab 时清理上一个 tab 的副作用(只跑非本 tab 的 cleanup;同 tab 重新
   // 渲染时由 tab 自身的"停上一个 timer / destroy charts"逻辑接管)
   if (_currentTab && _currentTab !== tab) {
@@ -533,7 +583,7 @@ async function renderDashboardTab() {
   for (const a of view().querySelectorAll('a[data-nav]')) {
     a.addEventListener('click', (e) => {
       e.preventDefault()
-      navigate(a.dataset.nav)
+      navigate(a.dataset.nav, _navQueryFrom(a))
     })
   }
 
@@ -1136,6 +1186,13 @@ function _renderUsersTable() {
   for (const b of el.querySelectorAll('button[data-act="adjust"]')) {
     b.addEventListener('click', () => openAdjustCreditsModal(b.dataset.id))
   }
+  // chip-跳转(用户行的"X 容器" → containers tab + email 过滤)
+  for (const a of el.querySelectorAll('a[data-nav]')) {
+    a.addEventListener('click', (e) => {
+      e.preventDefault()
+      navigate(a.dataset.nav, _navQueryFrom(a))
+    })
+  }
 }
 
 function _renderUserRow(u) {
@@ -1155,6 +1212,12 @@ function _renderUserRow(u) {
     ? `<span class="chip chip-${lastTone}" title="${escapeHtml(fmtDate(u.last_active_at))}">${escapeHtml(fmtRelative(u.last_active_at))}</span>`
     : '<span class="muted">从未</span>'
 
+  // 当前活跃容器数 chip:>0 → 链跳到 containers tab + email 过滤;0 → muted。
+  const ctActive = Number(u.containers_active ?? 0)
+  const ctChip = ctActive > 0
+    ? `<a class="chip chip-muted" data-nav="containers" data-q-user_email="${escapeHtml(u.email || '')}" title="查看该用户的活跃容器">${ctActive} 容器</a>`
+    : `<span class="chip chip-muted" style="opacity:.5">0 容器</span>`
+
   return `
     <tr>
       <td class="mono">${escapeHtml(u.id)}</td>
@@ -1163,6 +1226,7 @@ function _renderUserRow(u) {
         ${u.email_verified
           ? '<span class="badge ok" title="已验证">✓</span>'
           : '<span class="badge warn" title="未验证邮箱">未验证</span>'}
+        ${ctChip}
       </td>
       <td>${escapeHtml(u.display_name || '')}</td>
       <td><span class="badge ${u.role === 'admin' ? 'warn' : 'muted'}">${escapeHtml(u.role)}</span></td>
@@ -1409,6 +1473,47 @@ function _renderAccountsTable() {
   for (const b of el.querySelectorAll('button[data-act="refresh-history"]')) {
     b.addEventListener('click', () => _openRefreshHistoryModal(b.dataset.id, b.dataset.label))
   }
+  for (const b of el.querySelectorAll('button[data-act="acc-recent-users"]')) {
+    b.addEventListener('click', () => _openAccountRecentUsersModal(b.dataset.id, b.dataset.label))
+  }
+}
+
+/**
+ * 弹窗:近 24h 使用过该账号的用户(按请求量倒序)。
+ * 后端 GET /api/admin/accounts/:id/recent-users?hours=24&limit=20。
+ */
+async function _openAccountRecentUsersModal(accountId, accountLabel) {
+  const headerHtml = `
+    <h3 style="margin:0 0 12px 0;">账号 #${escapeHtml(accountId)} (${escapeHtml(accountLabel)}) — 近 24h 使用方</h3>
+  `
+  openModal(headerHtml + `<div id="acc-rusers-body"><div class="muted" style="padding:12px 0;">加载中…</div></div>`)
+  const body = document.getElementById('acc-rusers-body')
+  try {
+    const url = `/api/admin/accounts/${encodeURIComponent(accountId)}/recent-users?hours=24&limit=20`
+    const r = await apiGet(url)
+    const rows = Array.isArray(r?.rows) ? r.rows : []
+    if (rows.length === 0) {
+      body.innerHTML = `<div class="muted" style="padding:12px 0;">近 24h 无用户使用过该账号。</div>`
+      return
+    }
+    const trs = rows.map((u) => `
+      <tr>
+        <td class="mono">${escapeHtml(u.user_id)}</td>
+        <td>${escapeHtml(u.email || '')}</td>
+        <td class="num">${Number(u.request_count).toLocaleString()}</td>
+        <td class="mono">${escapeHtml(fmtDate(u.last_used_at))}</td>
+      </tr>
+    `).join('')
+    body.innerHTML = `
+      <table class="data-table">
+        <thead><tr><th>user_id</th><th>email</th><th class="num">请求数</th><th>最近使用</th></tr></thead>
+        <tbody>${trs}</tbody>
+      </table>
+      <div class="muted" style="margin-top:8px;font-size:12px;">仅近 24h、Top 20。</div>
+    `
+  } catch (e) {
+    body.innerHTML = `<div class="chip chip-danger">加载失败:${escapeHtml(e.message || String(e))}</div>`
+  }
 }
 
 // M6/P1-9 — 渲染 refresh 事件类型为可读 chip
@@ -1552,6 +1657,7 @@ function _renderAccountRow(a) {
       <td class="mono" title="${escapeHtml(a.egress_proxy || '')}">${escapeHtml(a.egress_proxy || '—')}</td>
       <td class="actions">
         ${showReset ? `<button data-act="reset-cooldown" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}" title="清冷却 + last_error">释放冷却</button>` : ''}
+        <button data-act="acc-recent-users" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}" title="近 24h 使用过该账号的用户">查看使用方</button>
         <button data-act="refresh-history" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}" title="查看 OAuth refresh 最近 50 次结果">刷新历史</button>
         <button data-act="edit-acc" data-id="${escapeHtml(a.id)}">编辑</button>
         <button data-act="del-acc" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}">删除</button>
@@ -1848,14 +1954,35 @@ const CONTAINER_STATUSES = ['provisioning', 'running', 'stopped', 'removed', 'er
 
 const CONTAINERS_STATE = {
   renderSeq: 0, loadSeq: 0,
-  rows: [], filterStatus: '', filterEmail: '',
+  rows: [], filterStatus: '', filterEmail: '', filterHostUuid: '',
 }
 
 async function renderContainersTab() {
   const mySeq = ++CONTAINERS_STATE.renderSeq
   CONTAINERS_STATE.rows = []
-  CONTAINERS_STATE.filterStatus = sessionStorage.getItem('admin_ct_status') || ''
-  CONTAINERS_STATE.filterEmail = sessionStorage.getItem('admin_ct_email') || ''
+  // deeplink 命中本 tab 时按"完整目标态"处理:query 里没出现的 cross-tab
+  // filter 字段一律清空(并 remove sessionStorage),避免上一次跳转的残留
+  // 与本次 deeplink 做交集 — 例如先按 host 过滤、再点用户的 chip,会变成
+  // "host_uuid + user_email" 而不是预期的"只按 user_email"。
+  // (Codex review #1 阻断项:deeplink 与 sessionStorage 残留的交集 bug)
+  if (pendingDeeplink && pendingDeeplink.tab === 'containers') {
+    const p = pendingDeeplink.params
+    const ue = p.get('user_email') || ''
+    const hu = p.get('host_uuid') || ''
+    const st = p.get('status') || ''
+    CONTAINERS_STATE.filterEmail = ue
+    CONTAINERS_STATE.filterHostUuid = hu
+    CONTAINERS_STATE.filterStatus = st
+    if (ue) sessionStorage.setItem('admin_ct_email', ue); else sessionStorage.removeItem('admin_ct_email')
+    if (hu) sessionStorage.setItem('admin_ct_host_uuid', hu); else sessionStorage.removeItem('admin_ct_host_uuid')
+    if (st) sessionStorage.setItem('admin_ct_status', st); else sessionStorage.removeItem('admin_ct_status')
+    pendingDeeplink = null
+  } else {
+    // 非 deeplink 进入(直接点 sidebar / 刷新页面)→ 沿用 sessionStorage。
+    CONTAINERS_STATE.filterStatus = sessionStorage.getItem('admin_ct_status') || ''
+    CONTAINERS_STATE.filterEmail = sessionStorage.getItem('admin_ct_email') || ''
+    CONTAINERS_STATE.filterHostUuid = sessionStorage.getItem('admin_ct_host_uuid') || ''
+  }
 
   view().innerHTML = `
     <div class="panel">
@@ -1880,6 +2007,9 @@ async function renderContainersTab() {
         </label>
         <input type="text" id="ct-email" placeholder="email / user_id 过滤" value="${escapeHtml(CONTAINERS_STATE.filterEmail)}" />
         <button class="btn" id="ct-refresh">刷新</button>
+        ${CONTAINERS_STATE.filterHostUuid
+          ? `<button class="btn btn-link" id="ct-clear-host" title="清除 host_uuid 链接过滤">× 清除虚机过滤</button>`
+          : ''}
       </div>
 
       <div id="ct-table-container"><div class="empty">加载中…</div></div>
@@ -1896,6 +2026,12 @@ async function renderContainersTab() {
     _renderContainersTable()
   })
   $('ct-refresh').addEventListener('click', () => renderContainersTab())
+  // 清除 host_uuid 链接过滤(仅在过滤生效时渲染按钮)
+  $('ct-clear-host')?.addEventListener('click', () => {
+    CONTAINERS_STATE.filterHostUuid = ''
+    sessionStorage.removeItem('admin_ct_host_uuid')
+    renderContainersTab()
+  })
 
   await Promise.all([
     _loadContainersKpis(mySeq),
@@ -1934,6 +2070,7 @@ async function _loadContainers(renderSeq) {
   const myLoadSeq = ++CONTAINERS_STATE.loadSeq
   const sp = new URLSearchParams({ limit: '500' })
   if (CONTAINERS_STATE.filterStatus) sp.set('status', CONTAINERS_STATE.filterStatus)
+  if (CONTAINERS_STATE.filterHostUuid) sp.set('host_uuid', CONTAINERS_STATE.filterHostUuid)
 
   let data
   try {
@@ -1981,6 +2118,7 @@ function _renderContainersTable() {
           <th>生命周期</th>
           <th>image</th>
           <th class="mono">docker</th>
+          <th>虚机</th>
           <th>最近启动</th>
           <th>最近停止</th>
           <th class="actions">操作</th>
@@ -1994,6 +2132,13 @@ function _renderContainersTable() {
   }
   for (const b of el.querySelectorAll('button[data-act="ct-action"]')) {
     b.addEventListener('click', (ev) => containerAction(b.dataset.id, b.dataset.action, ev.currentTarget))
+  }
+  // 链跳:虚机列 → hosts tab + focus
+  for (const a of el.querySelectorAll('a[data-nav]')) {
+    a.addEventListener('click', (e) => {
+      e.preventDefault()
+      navigate(a.dataset.nav, _navQueryFrom(a))
+    })
   }
 }
 
@@ -2027,6 +2172,10 @@ function _renderContainerRow(c) {
     : (c.docker_id || '').slice(0, 12) || '—'
   const idStr = escapeHtml(c.id)
   const label = `#${c.id} ${c.user_email || ''}`
+  // 虚机列:有 host_uuid → 链跳 hosts tab + focus;无(v2 / 未分配)→ 灰显
+  const hostCell = c.host_uuid
+    ? `<a class="mono" data-nav="hosts" data-q-focus_uuid="${escapeHtml(c.host_uuid)}" title="${escapeHtml(c.host_uuid)}">${escapeHtml(c.host_name || c.host_uuid.slice(0, 8))}</a>`
+    : '<span class="muted">—</span>'
   return `
     <tr>
       <td class="mono">${idStr}</td>
@@ -2036,6 +2185,7 @@ function _renderContainerRow(c) {
       <td>${statusBadge(c.lifecycle || c.status || c.state || '—')}</td>
       <td class="mono" title="${escapeHtml(c.image || '')}">${escapeHtml((c.image || '').split('/').pop() || '—')}</td>
       <td class="mono" title="${escapeHtml(c.docker_name || c.docker_id || '')}">${escapeHtml(dockerRef)}</td>
+      <td>${hostCell}</td>
       <td class="mono">${fmtRelative(c.last_started_at)}</td>
       <td class="mono">${fmtRelative(c.last_stopped_at)}</td>
       <td class="actions">
@@ -4502,10 +4652,19 @@ const HOSTS_STATE = {
   baseline: null,
   renderSeq: 0,
   refreshTimer: null,
+  focusUuid: '',  // deeplink 高亮用,render 时读 sessionStorage / pendingDeeplink
 }
 
 async function renderHostsTab() {
   const mySeq = ++HOSTS_STATE.renderSeq
+
+  // deeplink:pendingDeeplink 优先,fallback sessionStorage(刷新页保活)
+  HOSTS_STATE.focusUuid = sessionStorage.getItem('admin_h_focus_uuid') || ''
+  if (pendingDeeplink && pendingDeeplink.tab === 'hosts') {
+    const p = pendingDeeplink.params
+    if (p.has('focus_uuid')) HOSTS_STATE.focusUuid = p.get('focus_uuid')
+    pendingDeeplink = null
+  }
 
   view().innerHTML = `
     <div class="panel">
@@ -4643,6 +4802,21 @@ function _renderHostsTable() {
   for (const b of el.querySelectorAll('button[data-act="h-clearq"]')) {
     b.addEventListener('click', (ev) => clearHostQuarantine(b.dataset.id, b.dataset.name, ev.currentTarget))
   }
+  // active/max 链跳:跳 containers tab + host_uuid 过滤
+  for (const a of el.querySelectorAll('a[data-nav]')) {
+    a.addEventListener('click', (e) => {
+      e.preventDefault()
+      navigate(a.dataset.nav, _navQueryFrom(a))
+    })
+  }
+  // focus 高亮 + scrollIntoView(deeplink 跳过来时)
+  if (HOSTS_STATE.focusUuid) {
+    const tr = el.querySelector(`tr[data-host-uuid="${CSS.escape(HOSTS_STATE.focusUuid)}"]`)
+    if (tr) {
+      tr.classList.add('is-focused')
+      tr.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }
 }
 
 function _renderHostRow(h) {
@@ -4667,12 +4841,17 @@ function _renderHostRow(h) {
   if (canClearQ) btns.push(`<button data-act="h-clearq" data-id="${idAttr}" data-name="${nameAttr}">解除隔离</button>`)
   if (canDrain) btns.push(`<button data-act="h-drain" data-id="${idAttr}" data-name="${nameAttr}">排空</button>`)
   if (canRemove) btns.push(`<button data-act="h-remove" data-id="${idAttr}" data-name="${nameAttr}" style="color:var(--danger)">删除</button>`)
+  // active/max 链跳容器列表 + host_uuid 过滤
+  const activeStr = `${h.active_containers | 0} / ${h.max_containers | 0}`
+  const activeCell = h.id
+    ? `<a class="num" data-nav="containers" data-q-host_uuid="${escapeHtml(h.id)}" title="查看该 host 上的容器">${activeStr}</a>`
+    : `<span class="num">${activeStr}</span>`
   return `
-    <tr>
+    <tr data-host-uuid="${escapeHtml(h.id || '')}">
       <td><strong>${escapeHtml(h.name)}</strong>${isSelf ? ' <small style="color:var(--muted)">(master)</small>' : ''}</td>
       <td class="mono">${escapeHtml(h.host)}:${h.ssh_port}${h.agent_port && h.agent_port !== 9443 ? ` <small style="color:var(--muted)">(agent ${h.agent_port})</small>` : ''}</td>
       <td>${_hostStatusBadge(h.status)}</td>
-      <td class="num">${h.active_containers | 0} / ${h.max_containers | 0}</td>
+      <td>${activeCell}</td>
       <td>${_certChipForHost(h)}</td>
       <td>${healthChip}</td>
       <td>${bootstrapChip}</td>
