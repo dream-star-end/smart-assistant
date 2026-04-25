@@ -1,8 +1,8 @@
 {
-  "currentVersion": "v3-20260424T2005Z-8399315",
+  "currentVersion": "v3-20260425T0113Z-ec11962",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v3-20260425T0113Z-ec11962",
       "date": "2026-04-25",
       "title": "余额不足时给清晰提示和「去充值」按钮",
       "items": [
