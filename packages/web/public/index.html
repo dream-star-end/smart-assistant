@@ -485,6 +485,16 @@
 
 <!-- ═══════════════ APP VIEW ═══════════════ -->
 <div id="app-view" class="app" hidden>
+  <div id="sync-banner" class="sync-banner idle" aria-live="polite" aria-hidden="true">
+    <div class="sync-orbit" aria-hidden="true">
+      <span></span>
+      <span></span>
+    </div>
+    <div class="sync-copy">
+      <strong id="sync-banner-title">正在同步多端会话</strong>
+      <span id="sync-banner-detail">从服务器拉取最新会话，稍等片刻</span>
+    </div>
+  </div>
   <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
 
   <!-- Sidebar -->

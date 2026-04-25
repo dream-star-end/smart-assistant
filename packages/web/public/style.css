@@ -5705,3 +5705,151 @@ body.body-landing {
   .landing-bench thead th { padding: var(--space-3) 10px; font-size: var(--text-sm); }
   .landing-bench tbody td { padding: 10px; font-size: var(--text-sm); }
 }
+
+/* ── Sync banner (multi-end session sync feedback) — port from master 73930b0 ── */
+.sync-banner {
+  position: fixed;
+  top: calc(var(--space-3) + env(safe-area-inset-top, 0));
+  left: 50%;
+  width: min(440px, calc(100vw - 32px));
+  min-height: 58px;
+  transform: translate(-50%, -18px);
+  z-index: 240;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 10px 14px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-elevated) 92%, var(--accent) 8%);
+  box-shadow: var(--shadow-lg);
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+  transition:
+    opacity var(--transition-base),
+    transform var(--transition-base),
+    border-color var(--transition-base),
+    background var(--transition-base);
+}
+.sync-banner::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  transform: translateX(-100%);
+}
+.sync-banner.syncing,
+.sync-banner.synced,
+.sync-banner.error {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+.sync-banner.syncing::before {
+  animation: sync-progress 1.05s linear infinite;
+}
+.sync-banner.synced {
+  border-color: color-mix(in srgb, var(--success) 68%, transparent);
+  background: color-mix(in srgb, var(--bg-elevated) 90%, var(--success) 10%);
+}
+.sync-banner.synced::before {
+  background: var(--success);
+  transform: translateX(0);
+}
+.sync-banner.error {
+  border-color: color-mix(in srgb, var(--danger) 70%, transparent);
+  background: color-mix(in srgb, var(--bg-elevated) 90%, var(--danger) 10%);
+}
+.sync-banner.error::before {
+  background: var(--danger);
+  transform: translateX(0);
+}
+.sync-orbit {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border-radius: var(--radius-full);
+  border: 2px solid var(--accent-border);
+}
+.sync-orbit::before {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  box-shadow: 0 0 16px var(--accent-border);
+}
+.sync-orbit span {
+  position: absolute;
+  inset: -2px;
+  border-radius: var(--radius-full);
+  border: 2px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+  animation: sync-orbit 0.9s linear infinite;
+}
+.sync-orbit span:last-child {
+  inset: 4px;
+  animation-duration: 1.25s;
+  animation-direction: reverse;
+  opacity: 0.72;
+}
+.sync-banner.synced .sync-orbit,
+.sync-banner.error .sync-orbit {
+  border-color: transparent;
+}
+.sync-banner.synced .sync-orbit::before {
+  background: var(--success);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--success) 40%, transparent);
+}
+.sync-banner.error .sync-orbit::before {
+  background: var(--danger);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--danger) 40%, transparent);
+}
+.sync-banner.synced .sync-orbit span,
+.sync-banner.error .sync-orbit span {
+  animation: none;
+  border-color: currentColor;
+  opacity: 0.25;
+}
+.sync-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+}
+.sync-copy strong {
+  color: var(--fg-strong);
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+.sync-copy span {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 560px) {
+  .sync-banner {
+    top: calc(var(--space-2) + env(safe-area-inset-top, 0));
+    min-height: 54px;
+  }
+}
+@keyframes sync-progress {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+@keyframes sync-orbit {
+  to {
+    transform: rotate(360deg);
+  }
+}

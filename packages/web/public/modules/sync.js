@@ -17,9 +17,17 @@ let _onConflictResolved = null
 // because that would bump lastAt (polluting sidebar order) and reset the
 // dbPut retry budget — retry is not a user edit.
 let _onRequestRetryPush = null
-export function setSyncDeps({ onConflictResolved, onRequestRetryPush }) {
+let _onSyncStatusChange = null
+export function setSyncDeps({ onConflictResolved, onRequestRetryPush, onSyncStatusChange }) {
   _onConflictResolved = onConflictResolved
   _onRequestRetryPush = onRequestRetryPush
+  _onSyncStatusChange = onSyncStatusChange
+}
+
+function _emitSyncStatus(status) {
+  try {
+    _onSyncStatusChange?.({ ...status, ts: Date.now() })
+  } catch {}
 }
 
 // Per-session cap for 409 local-dominates auto-retries. Prevents infinite
@@ -169,6 +177,19 @@ function _rebindStreamingPointers(sess) {
  * Server wins on conflict (newer updatedAt / lastAt).
  */
 export async function syncSessionsFromServer() {
+  // Delay the "syncing" banner by 400ms — fast pulls (most background
+  // visibilitychange/focus/WS-reconnect triggers) finish well under that
+  // and never flash the banner. Only slow/first-time syncs actually show
+  // the indicator, which is when feedback is useful.
+  let _syncingBannerShown = false
+  const _syncingDelay = setTimeout(() => {
+    _syncingBannerShown = true
+    _emitSyncStatus({
+      state: 'syncing',
+      label: '正在同步多端会话',
+      detail: '从服务器拉取最新会话，稍等片刻',
+    })
+  }, 400)
   // Retry any pending deletes from previous failures
   for (const id of _pendingDeletes) {
     try {
@@ -183,6 +204,12 @@ export async function syncSessionsFromServer() {
     serverList = resp.sessions || []
   } catch {
     // Offline or auth error — fall back to local only
+    clearTimeout(_syncingDelay)
+    _emitSyncStatus({
+      state: 'error',
+      label: '同步失败',
+      detail: '当前显示本地缓存，联网后会自动重试',
+    })
     return
   }
 
@@ -252,6 +279,7 @@ export async function syncSessionsFromServer() {
 
   // Merge fetched sessions into local state + IDB (skip dirty local sessions)
   let currentSessionUpdated = false
+  let fetchedCount = 0
   for (const remote of fetched) {
     if (isDeletePending(remote.id)) continue // locally deleted, pending server confirmation
     const existingLocal = state.sessions.get(remote.id)
@@ -362,6 +390,7 @@ export async function syncSessionsFromServer() {
     _rebuildSearchIndex(sess)
     clearDeleteTombstone(sess.id) // Allow saving if session was previously deleted locally
     state.sessions.set(sess.id, sess)
+    fetchedCount++
     if (sess.id === state.currentSessionId) currentSessionUpdated = true
     try { await dbPut({ ...sess, _syncedAt: remote.updatedAt }) } catch {}
   }
@@ -369,6 +398,7 @@ export async function syncSessionsFromServer() {
   // Remove locally-synced sessions that were deleted on server
   // Check LIVE state (not stale localMap snapshot) for dirty flag
   let removedCurrent = false
+  let removedCount = 0
   for (const [id, local] of localMap) {
     if (!serverIds.has(id) && local._syncedAt) {
       const live = state.sessions.get(id)
@@ -378,6 +408,7 @@ export async function syncSessionsFromServer() {
       }
       if (id === state.currentSessionId) removedCurrent = true
       state.sessions.delete(id)
+      removedCount++
       try { await dbDelete(id) } catch {}
     }
   }
@@ -400,6 +431,21 @@ export async function syncSessionsFromServer() {
     if (!serverIds.has(id) && isDeletePending(id)) clearDeleteTombstone(id)
   }
 
+  const changedCount = fetchedCount + removedCount
+  clearTimeout(_syncingDelay)
+  if (changedCount > 0) {
+    // Meaningful update — tell the user what changed. Worth the 1.8s toast.
+    _emitSyncStatus({
+      state: 'synced',
+      label: '同步完成',
+      detail: `已更新 ${changedCount} 个会话`,
+    })
+  } else if (_syncingBannerShown) {
+    // Banner is already visible (slow sync) — dismiss it quietly without
+    // a "已同步 / 多端会话已是最新" toast, which is noise during active chat.
+    _emitSyncStatus({ state: 'idle', label: '', detail: '' })
+  }
+  // else: fast no-change sync — banner never appeared, nothing to emit.
   return { needsRenderMessages: currentSessionUpdated || removedCurrent }
 }
 
