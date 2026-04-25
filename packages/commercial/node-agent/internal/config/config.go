@@ -53,6 +53,12 @@ type Config struct {
 	// 例 "https://master.internal:18792";poller 会附加 /internal/v3/baseline-{version,tarball}。
 	// 空字符串 → 禁用 baseline poller(如 self host 或不需要基线的测试场景)。
 	MasterBaselineBaseURL string `yaml:"master_baseline_base_url"`
+
+	// 0038:master forward proxy。每台 host 上 master 端 dispatcher 拨此处 CONNECT
+	// api.anthropic.com:443,以本机 NIC 出口为 OAuth 账号专属稳定 IP。
+	// 空字符串 → 禁用(self host 不需要 — 自机出口跟"不走 proxy"等价)。
+	// 典型值 "0.0.0.0:9444"。监听需要从 master VM IP 可达;防火墙由 nodeBootstrap 同步。
+	MasterEgressBind string `yaml:"master_egress_bind"`
 }
 
 func Load(path string) (*Config, error) {
@@ -113,6 +119,12 @@ func (c *Config) Validate() error {
 	}
 	for i, h := range c.EgressAllowHosts {
 		c.EgressAllowHosts[i] = strings.ToLower(strings.TrimSpace(h))
+	}
+	// 0038:master_egress_bind 校验。空 = 禁用,非空必须 host:port 形态。
+	if c.MasterEgressBind != "" {
+		if _, _, err := net.SplitHostPort(c.MasterEgressBind); err != nil {
+			return fmt.Errorf("master_egress_bind invalid: %w", err)
+		}
 	}
 	// D.1c:一对配对 —— bind + masterURL 要么都有,要么都空(禁用)。
 	// 一个有一个没有肯定是配置错误。

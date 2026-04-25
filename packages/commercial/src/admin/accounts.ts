@@ -44,6 +44,12 @@ import {
 } from "../account-pool/store.js";
 import { writeAdminAudit } from "./audit.js";
 import { incrAdminAuditWriteFailure } from "./metrics.js";
+import {
+  pickAndAssignEgressHost,
+  reassignEgressHost,
+} from "../account-pool/egressAssignment.js";
+
+// getPool 已在文件顶部 import,不重复
 
 export interface AdminAuditCtx {
   adminId: bigint | number | string;
@@ -192,6 +198,20 @@ export async function adminCreateAccount(
   };
   const row = await storeCreate(createInput);
 
+  // 0038 — 自动分配 egress host(仅当账号没显式手填 egress_proxy)。
+  // admin 手填代理 → 不动 host 字段(优先级:proxy > host)。
+  // 池里没合格 host → 返 null 不报错,账号继续走 master 默认出口。
+  // assign 失败不阻塞账号创建,记 best-effort audit。
+  let assignedHostId: string | null = null;
+  if (egressProxy === null) {
+    try {
+      assignedHostId = await pickAndAssignEgressHost(row.id);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[admin/accounts] egress host auto-assign failed", err);
+    }
+  }
+
   await bestEffortAudit(
     ctx,
     "account.create",
@@ -200,6 +220,7 @@ export async function adminCreateAccount(
     {
       ...snapshotForAudit(row),
       has_refresh_token: refresh !== null,
+      egress_host_uuid: assignedHostId,
       // 不记明文 token / proxy 密码 —— snapshotForAudit 已 mask
     },
   );
@@ -218,6 +239,14 @@ export interface AdminPatchAccountInput {
   oauth_expires_at?: Date | string | null;
   /** undefined = 不动;null = 清空(走本机出口);string = 设/换代理 URL。 */
   egress_proxy?: string | null;
+  /**
+   * 0038 — 重新分配 egress host。
+   *   - undefined = 不动
+   *   - null = 清空(账号回退到 master 默认出口或 egress_proxy)
+   *   - "auto" = 走 pickAndAssignEgressHost(选最少账号的合格 host)
+   *   - "<uuid>" = 直接绑该 host(校验必须 ready+endpoint+cert+psk 齐全)
+   */
+  egress_host_uuid?: string | null;
 }
 
 export async function adminPatchAccount(
@@ -258,6 +287,41 @@ export async function adminPatchAccount(
     }
     validateEgressProxyOrThrow(patch.egress_proxy);
   }
+  if (patch.egress_host_uuid !== undefined && patch.egress_host_uuid !== null) {
+    if (typeof patch.egress_host_uuid !== "string" || patch.egress_host_uuid.length === 0) {
+      throw new RangeError("invalid_egress_host_uuid");
+    }
+    // "auto" 不验,reassignEgressHost 处理;UUID 形态走宽松正则
+    if (
+      patch.egress_host_uuid !== "auto" &&
+      !/^[0-9a-fA-F-]{36}$/.test(patch.egress_host_uuid)
+    ) {
+      throw new RangeError("invalid_egress_host_uuid");
+    }
+    // 显式 UUID 必须 eligible(ready + endpoint + cert + psk)。预校验避免 storeUpdate
+    // 跑完后再因 reassignEgressHost throw 导致半写(label/token 已落库 + egress 没改)。
+    // 'auto' 不预校验:pickAndAssign 不抛,只可能返 null(无合格 host)。
+    // null 不预校验:仅清空,不查 host 表。
+    if (
+      patch.egress_host_uuid !== "auto" &&
+      patch.egress_host_uuid !== null
+    ) {
+      const r = await getPool().query<{ id: string }>(
+        `SELECT id FROM compute_hosts
+          WHERE id = $1
+            AND status = 'ready'
+            AND egress_proxy_endpoint IS NOT NULL
+            AND agent_cert_fingerprint_sha256 IS NOT NULL
+            AND octet_length(agent_psk_nonce) > 0
+            AND octet_length(agent_psk_ct)    > 0
+          LIMIT 1`,
+        [patch.egress_host_uuid],
+      );
+      if (r.rowCount === 0) {
+        throw new RangeError("egress_host_not_eligible");
+      }
+    }
+  }
   let expiresAt: Date | null | undefined = undefined;
   if (patch.oauth_expires_at !== undefined) {
     if (patch.oauth_expires_at === null) {
@@ -279,6 +343,7 @@ export async function adminPatchAccount(
     patch.oauth_token !== undefined ||
     patch.oauth_refresh_token !== undefined ||
     patch.egress_proxy !== undefined ||
+    patch.egress_host_uuid !== undefined ||
     expiresAt !== undefined;
   if (!touched) {
     const cur = await storeGet(id);
@@ -301,6 +366,23 @@ export async function adminPatchAccount(
 
   const after = await storeUpdate(id, storePatch);
   if (!after) throw new AccountNotFoundError(id);
+
+  // 0038 — egress_host_uuid 在 storeUpdate 之后(独立 SQL 不进 store.ts patch 路径)。
+  // 显式 UUID 的 eligibility 已在前文预校验,此处只剩极低概率 race(校验后 host
+  // 变 broken)。race 时 reassignEgressHost 抛 RangeError,admin 看到 4xx,
+  // 此时 storeUpdate 已落库 → 半写,但 admin 知道 egress 没改,可手动 retry;
+  // 这比为 race window 加事务更轻(见 KISS)。
+  let egressHostBefore: string | null | undefined;
+  let egressHostAfter: string | null | undefined;
+  if (patch.egress_host_uuid !== undefined) {
+    // 用 raw SQL 取 before(store 不暴露此列;不为它加方法,见 KISS)
+    const beforeRow = await getPool().query<{ egress_host_uuid: string | null }>(
+      `SELECT egress_host_uuid FROM claude_accounts WHERE id = $1`,
+      [String(id)],
+    );
+    egressHostBefore = beforeRow.rowCount === 0 ? null : beforeRow.rows[0]!.egress_host_uuid;
+    egressHostAfter = await reassignEgressHost(id, patch.egress_host_uuid);
+  }
 
   // audit: 只记 admin 显式改的字段,密文字段只记 "*_changed" 布尔
   const changedBefore: Record<string, unknown> = {};
@@ -327,6 +409,10 @@ export async function adminPatchAccount(
   if (patch.egress_proxy !== undefined) {
     changedBefore.egress_proxy = maskEgressProxy(before.egress_proxy);
     changedAfter.egress_proxy = maskEgressProxy(after.egress_proxy);
+  }
+  if (patch.egress_host_uuid !== undefined) {
+    changedBefore.egress_host_uuid = egressHostBefore ?? null;
+    changedAfter.egress_host_uuid = egressHostAfter ?? null;
   }
 
   await bestEffortAudit(ctx, "account.patch", `account:${String(id)}`, changedBefore, changedAfter);

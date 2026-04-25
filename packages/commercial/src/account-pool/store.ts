@@ -65,6 +65,12 @@ export interface AccountRow {
    * 由 chat orchestrator 构造 undici ProxyAgent 注入到 fetch dispatcher。
    */
   egress_proxy: string | null;
+  /**
+   * 0038 — 自动分配的 compute_host id(UUID 字符串)。
+   * NULL = 未分配,走 master 默认出口或 admin 手填的 egress_proxy。
+   * 列表/详情都要返回,admin UI 拿来显示绑定状态 + 触发重分配。
+   */
+  egress_host_uuid: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -86,6 +92,29 @@ export interface AccountToken {
   expires_at: Date | null;
   /** 出口代理(明文 URL,内含密码) —— 仅在调用 fetch 时构造 dispatcher 用。 */
   egress_proxy: string | null;
+  /**
+   * mTLS forward proxy 自动分配的 compute_host 出口(0038 引入)。
+   *
+   * 仅在 `egress_proxy` 为 null + account 已绑定 host + host 满足以下条件时非 null:
+   *   - compute_hosts.status = 'ready'
+   *   - compute_hosts.egress_proxy_endpoint IS NOT NULL(:9444 探活通过)
+   *   - compute_hosts.agent_cert_fingerprint_sha256 IS NOT NULL(fail-closed)
+   *
+   * 任一条件不满足 → null,fallback 到 master 默认出口(已知的稳定性退化)。
+   *
+   * 字段全部由同一条 JOIN SQL 取出;callers 不再回查 DB。
+   * 加密 PSK 字段(nonce + ct)随结构体过界,在 egressDispatcher cache miss 时才解密。
+   */
+  egress_target: {
+    /** discriminant — 与 egressDispatcher.EgressTargetMtls 对齐(目前唯一种类) */
+    kind: 'mtls';
+    hostUuid: string;
+    host: string;
+    port: number;
+    fingerprint: string;
+    pskNonce: Buffer;
+    pskCt: Buffer;
+  } | null;
 }
 
 export interface CreateAccountInput {
@@ -157,6 +186,7 @@ const META_COLUMNS = `
   quota_7d_resets_at,
   quota_updated_at,
   egress_proxy,
+  egress_host_uuid::text AS egress_host_uuid,
   created_at,
   updated_at
 `;
@@ -180,6 +210,7 @@ interface RawMetaRow extends QueryResultRow {
   quota_7d_resets_at: Date | null;
   quota_updated_at: Date | null;
   egress_proxy: string | null;
+  egress_host_uuid: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -193,7 +224,23 @@ interface RawSecretRow extends QueryResultRow {
   oauth_refresh_nonce: Buffer | null;
   oauth_expires_at: Date | null;
   egress_proxy: string | null;
+  // 0038 — JOIN compute_hosts 取的字段;LEFT JOIN + 全字段非 NULL 才落地
+  egress_host_id: string | null;
+  egress_host: string | null;
+  egress_host_fp: string | null;
+  egress_host_psk_nonce: Buffer | null;
+  egress_host_psk_ct: Buffer | null;
 }
+
+/**
+ * node-agent forward proxy 固定端口。
+ *
+ * compute_hosts.agent_port 是 :9443(RPC mTLS),与此处的 forward proxy 端口分离 ——
+ * forward proxy 不复用 RPC 信任面,SAN 校验 + 仅放行 api.anthropic.com:443 是其独立设计。
+ * 所以这里硬编码,不读 schema 列,也不 parse compute_hosts.egress_proxy_endpoint(那只是
+ * 探活成败 marker)。
+ */
+const EGRESS_FORWARD_PROXY_PORT = 9444;
 
 function parseMetaRow(row: RawMetaRow): AccountRow {
   return {
@@ -215,6 +262,7 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     quota_7d_resets_at: row.quota_7d_resets_at,
     quota_updated_at: row.quota_updated_at,
     egress_proxy: row.egress_proxy,
+    egress_host_uuid: row.egress_host_uuid,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -369,13 +417,36 @@ export async function getTokenForUse(
   id: bigint | string,
   keyFn: () => Buffer = loadKmsKey,
 ): Promise<AccountToken | null> {
+  // 0038 — JOIN compute_hosts 一次拿出 mTLS forward proxy 信息(避免 chat 路径再回查):
+  //   - LEFT JOIN: 账号未分配 host(egress_host_uuid IS NULL)→ 所有 ch.* 都是 NULL,
+  //     egress_target 在 mapper 里也置 null,fallback 到 master 默认出口
+  //   - WHERE 部分(JOIN 条件):仅当 host status='ready' + endpoint 探活通过 +
+  //     fingerprint 已落库 时才返字段。任一缺失 → ch.* 视为 NULL,fallback。
+  //     这是 fail-closed 设计:与其用半就绪 host 出口让 mTLS 握手必败,不如退回默认出口
+  //     让请求过(代价是 IP 不稳,但 chat 不报错)。
+  //
+  //   - egress_proxy_endpoint 不解析 host:port,master 端用 ch.host + 固定 9444 构造
+  //     EgressTarget;endpoint 列只是探活成败的 marker。
   const res = await query<RawSecretRow>(
-    `SELECT id::text AS id, plan,
-       oauth_token_enc, oauth_nonce,
-       oauth_refresh_enc, oauth_refresh_nonce,
-       oauth_expires_at,
-       egress_proxy
-     FROM claude_accounts WHERE id = $1`,
+    `SELECT a.id::text AS id, a.plan,
+       a.oauth_token_enc, a.oauth_nonce,
+       a.oauth_refresh_enc, a.oauth_refresh_nonce,
+       a.oauth_expires_at,
+       a.egress_proxy,
+       ch.id::text                          AS egress_host_id,
+       ch.host                              AS egress_host,
+       ch.agent_cert_fingerprint_sha256     AS egress_host_fp,
+       ch.agent_psk_nonce                   AS egress_host_psk_nonce,
+       ch.agent_psk_ct                      AS egress_host_psk_ct
+     FROM claude_accounts a
+     LEFT JOIN compute_hosts ch
+       ON ch.id = a.egress_host_uuid
+       AND ch.status = 'ready'
+       AND ch.egress_proxy_endpoint IS NOT NULL
+       AND ch.agent_cert_fingerprint_sha256 IS NOT NULL
+       AND octet_length(ch.agent_psk_nonce) > 0
+       AND octet_length(ch.agent_psk_ct)    > 0
+     WHERE a.id = $1`,
     [String(id)],
   );
   if (res.rows.length === 0) return null;
@@ -389,6 +460,26 @@ export async function getTokenForUse(
     if (row.oauth_refresh_enc && row.oauth_refresh_nonce) {
       refresh = decryptToBuffer(row.oauth_refresh_enc, row.oauth_refresh_nonce, key);
     }
+    // egress_target 组装:JOIN 命中(所有 ch.* 字段都非 NULL)→ 给值;否则 null。
+    // SQL JOIN 已加 octet_length 守门,这里 null check 仅作 TS 类型收窄。
+    let egressTarget: AccountToken["egress_target"] = null;
+    if (
+      row.egress_host_id != null &&
+      row.egress_host != null &&
+      row.egress_host_fp != null &&
+      row.egress_host_psk_nonce != null &&
+      row.egress_host_psk_ct != null
+    ) {
+      egressTarget = {
+        kind: 'mtls',
+        hostUuid: row.egress_host_id,
+        host: row.egress_host,
+        port: EGRESS_FORWARD_PROXY_PORT,
+        fingerprint: row.egress_host_fp,
+        pskNonce: row.egress_host_psk_nonce,
+        pskCt: row.egress_host_psk_ct,
+      };
+    }
     const out: AccountToken = {
       id: BigInt(row.id),
       plan: row.plan,
@@ -396,6 +487,7 @@ export async function getTokenForUse(
       refresh,
       expires_at: row.oauth_expires_at,
       egress_proxy: row.egress_proxy,
+      egress_target: egressTarget,
     };
     // 成功路径:token/refresh 交给调用方,不在 finally 清零
     token = null;

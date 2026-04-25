@@ -1,8 +1,8 @@
 /**
- * HIGH#5 — egressDispatcher 缓存行为单测。
+ * egressDispatcher 缓存行为单测(plain proxy 路径)。
  *
- * 不连真代理:只验证 cache hit/miss / evict / 同 account 切 URL / 空值。
- * ProxyAgent 实例化本身不会发包,验证"返回相同实例"等同于"复用同一连接池"。
+ * mTLS 路径需要 master TLS material(读 ./certs)+ KMS key + ProxyAgent 真发握手,
+ * 走 e2e/集成测试更合适;此处只覆盖 plain HTTP proxy 与 cache LRU 行为。
  */
 
 import { describe, test, beforeEach } from "node:test";
@@ -18,63 +18,61 @@ beforeEach(() => {
   _clearEgressDispatcherCacheForTest();
 });
 
-describe("egressDispatcher (HIGH#5)", () => {
-  test("null / 空字符串 → undefined,不进缓存", () => {
-    assert.equal(getDispatcherForAccount(1n, null), undefined);
-    assert.equal(getDispatcherForAccount(1n, ""), undefined);
-    assert.equal(getDispatcherForAccount(1n, undefined), undefined);
+describe("egressDispatcher (plain proxy)", () => {
+  test("null / 空字符串 / undefined egressProxy + null egressTarget → undefined", async () => {
+    assert.equal(await getDispatcherForAccount(1n, null, null), undefined);
+    assert.equal(await getDispatcherForAccount(1n, "", null), undefined);
+    assert.equal(await getDispatcherForAccount(1n, undefined, null), undefined);
     assert.equal(_egressDispatcherCacheSizeForTest(), 0);
   });
 
-  test("同 account + 同 URL → 二次调用返同一实例(命中缓存)", () => {
+  test("同 account + 同 URL → 二次调用返同一实例(命中缓存)", async () => {
     const url = "http://proxy.example.com:8080";
-    const d1 = getDispatcherForAccount(7n, url);
-    const d2 = getDispatcherForAccount(7n, url);
+    const d1 = await getDispatcherForAccount(7n, url, null);
+    const d2 = await getDispatcherForAccount(7n, url, null);
     assert.ok(d1, "first call must build dispatcher");
     assert.strictEqual(d1, d2, "second call must reuse the same instance");
     assert.equal(_egressDispatcherCacheSizeForTest(), 1);
   });
 
-  test("同 account 切 URL → 老实例下线,新实例换上,cache size=1", () => {
+  test("同 account 切 URL → 老实例下线,新实例换上,cache size=1", async () => {
     const oldUrl = "http://proxy-a.example.com:8080";
     const newUrl = "http://proxy-b.example.com:8080";
-    const d1 = getDispatcherForAccount(42n, oldUrl);
-    const d2 = getDispatcherForAccount(42n, newUrl);
+    const d1 = await getDispatcherForAccount(42n, oldUrl, null);
+    const d2 = await getDispatcherForAccount(42n, newUrl, null);
     assert.ok(d1);
     assert.ok(d2);
     assert.notStrictEqual(d1, d2, "URL change must build a fresh dispatcher");
     assert.equal(_egressDispatcherCacheSizeForTest(), 1, "old entry must be evicted");
   });
 
-  test("不同 account 各持 1 份(各算各的连接池)", () => {
+  test("不同 account 各持 1 份(各算各的连接池)", async () => {
     const url = "http://shared.example.com:8080";
-    const d1 = getDispatcherForAccount(1n, url);
-    const d2 = getDispatcherForAccount(2n, url);
+    const d1 = await getDispatcherForAccount(1n, url, null);
+    const d2 = await getDispatcherForAccount(2n, url, null);
     assert.notStrictEqual(d1, d2);
     assert.equal(_egressDispatcherCacheSizeForTest(), 2);
   });
 
-  test("切回 null → 同 account 旧 dispatcher 下线", () => {
+  test("切回 null → 同 account 旧 dispatcher 下线", async () => {
     const url = "http://proxy.example.com:8080";
-    getDispatcherForAccount(99n, url);
+    await getDispatcherForAccount(99n, url, null);
     assert.equal(_egressDispatcherCacheSizeForTest(), 1);
-    const d2 = getDispatcherForAccount(99n, null);
+    const d2 = await getDispatcherForAccount(99n, null, null);
     assert.equal(d2, undefined);
     assert.equal(_egressDispatcherCacheSizeForTest(), 0);
   });
 
-  test("非法 URL → undefined + 不进缓存(不抛,不阻塞 chat)", () => {
-    const d = getDispatcherForAccount(11n, "this is not a url");
+  test("非法 URL → undefined + 不进缓存(不抛,不阻塞 chat)", async () => {
+    const d = await getDispatcherForAccount(11n, "this is not a url", null);
     assert.equal(d, undefined);
     assert.equal(_egressDispatcherCacheSizeForTest(), 0);
   });
 
-  test("LRU evict:超过 MAX 后 size 不会无限增长", () => {
-    // MAX+1 个不同账号,每个不同 URL → 触发 evict
+  test("LRU evict:超过 MAX 后 size 不会无限增长", async () => {
     for (let i = 0; i < EGRESS_DISPATCHER_CACHE_MAX + 5; i += 1) {
-      getDispatcherForAccount(BigInt(i), `http://p${i}.example.com:8080`);
+      await getDispatcherForAccount(BigInt(i), `http://p${i}.example.com:8080`, null);
     }
-    // 不严格 == MAX(我们只 evict 一个 / 调用),但绝不能突破 MAX 太多
     const size = _egressDispatcherCacheSizeForTest();
     assert.ok(
       size <= EGRESS_DISPATCHER_CACHE_MAX + 1,
@@ -82,17 +80,35 @@ describe("egressDispatcher (HIGH#5)", () => {
     );
   });
 
-  test("重复读最近的不会被 LRU 踢:稳定老 account 上的 dispatcher 一直在", () => {
+  test("重复读最近的不会被 LRU 踢:稳定老 account 上的 dispatcher 一直在", async () => {
     const oldAccountUrl = "http://stable.example.com:8080";
-    const stable = getDispatcherForAccount(1000n, oldAccountUrl);
+    const stable = await getDispatcherForAccount(1000n, oldAccountUrl, null);
     assert.ok(stable);
-    // 灌满缓存,期间反复"用"老 account,刷新它的 lastUsed
     for (let i = 0; i < EGRESS_DISPATCHER_CACHE_MAX + 5; i += 1) {
-      getDispatcherForAccount(BigInt(2000 + i), `http://p${i}.example.com:8080`);
-      // 重新访问保持 LRU 新鲜
-      getDispatcherForAccount(1000n, oldAccountUrl);
+      await getDispatcherForAccount(BigInt(2000 + i), `http://p${i}.example.com:8080`, null);
+      await getDispatcherForAccount(1000n, oldAccountUrl, null);
     }
-    const stillThere = getDispatcherForAccount(1000n, oldAccountUrl);
+    const stillThere = await getDispatcherForAccount(1000n, oldAccountUrl, null);
     assert.strictEqual(stillThere, stable, "stable account must survive LRU pressure");
+  });
+
+  test("plain 优先于 mtls:同时给 egressProxy 和 egressTarget,走 plain", async () => {
+    // 即使给了一个看起来合法的 mTLS target,plain URL 非空就走 plain
+    const fakeTarget = {
+      kind: "mtls" as const,
+      hostUuid: "11111111-1111-1111-1111-111111111111",
+      host: "10.0.0.1",
+      port: 9444,
+      fingerprint: "deadbeef".repeat(8),
+      pskNonce: Buffer.alloc(12),
+      pskCt: Buffer.alloc(48),
+    };
+    const d = await getDispatcherForAccount(
+      555n,
+      "http://manual.example.com:8080",
+      fakeTarget,
+    );
+    assert.ok(d, "plain proxy must be used when egressProxy is non-empty");
+    assert.equal(_egressDispatcherCacheSizeForTest(), 1);
   });
 });

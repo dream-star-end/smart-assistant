@@ -20,6 +20,7 @@ import (
 	"github.com/openclaude/node-agent/internal/egress"
 	"github.com/openclaude/node-agent/internal/internalproxy"
 	"github.com/openclaude/node-agent/internal/logging"
+	"github.com/openclaude/node-agent/internal/masteregress"
 	"github.com/openclaude/node-agent/internal/server"
 )
 
@@ -73,6 +74,20 @@ func main() {
 		}
 	}
 
+	// 0038:可选 master forward proxy(:9444)。配了 master_egress_bind 才启用。
+	// 用于让 OAuth 账号专属 IP 锚到本机 NIC,master 端 dispatcher 拨入。
+	var meg *masteregress.Server
+	if cfg.MasterEgressBind != "" {
+		meg, err = masteregress.New(cfg)
+		if err != nil {
+			log.Error("masteregress init failed", "err", err.Error())
+			os.Exit(1)
+		}
+		// renew handler 续期后会调 srv.ReloadTLS;让 :9444 同步 reload 新 cert,
+		// 避免 master egressDispatcher 因 fingerprint 不匹配握手失败。
+		srv.SetExtraReloader(meg.ReloadCert)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -90,6 +105,9 @@ func main() {
 		routines++
 	}
 	if ip != nil {
+		routines++
+	}
+	if meg != nil {
 		routines++
 	}
 	wg.Add(routines)
@@ -119,6 +137,15 @@ func main() {
 			defer wg.Done()
 			if err := ip.ListenAndServe(ctx); err != nil {
 				log.Error("internal proxy exited with error", "err", err.Error())
+				cancel()
+			}
+		}()
+	}
+	if meg != nil {
+		go func() {
+			defer wg.Done()
+			if err := meg.ListenAndServe(ctx); err != nil {
+				log.Error("master egress proxy exited with error", "err", err.Error())
 				cancel()
 			}
 		}()

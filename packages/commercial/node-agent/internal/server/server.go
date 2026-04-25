@@ -38,7 +38,15 @@ type Server struct {
 	files    *files.Handler
 	sshmux   *sshmux.Manager
 	baseline *baseline.Poller // nil when disabled (empty base url)
+
+	// 续期后追加调用的 reloader(例如 masteregress :9444)。可为 nil。
+	// 顺序无所谓:每个独立 atomic 切换;失败仅 log,不挡 :9443 reload 成功路径。
+	extraReloader func() error
 }
+
+// SetExtraReloader 注册 cert 续期后的额外 reload hook(0038:masteregress)。
+// 必须在 server.New 后、第一次 renew 前调。线程不安全;不应运行时多次替换。
+func (s *Server) SetExtraReloader(fn func() error) { s.extraReloader = fn }
 
 // New 构建 Server;baselinePoller 可为 nil(禁用 baseline 同步)。
 func New(cfg *config.Config, baselinePoller *baseline.Poller) (*Server, error) {
@@ -67,7 +75,9 @@ func New(cfg *config.Config, baselinePoller *baseline.Poller) (*Server, error) {
 	return s, nil
 }
 
-// ReloadTLS 从磁盘重读 tls_cert + tls_key,原子切换。旧连接保持不变。
+// ReloadTLS 从磁盘重读 tls_cert + tls_key,原子切换 :9443 出示的证书。
+// 旧连接保持不变。若注册了 extraReloader(:9444 masteregress),也一并触发。
+// extraReloader 失败只 log,不影响 :9443 主路径已成功 reload。
 func (s *Server) ReloadTLS() error {
 	cert, err := tls.LoadX509KeyPair(s.cfg.TLSCrt, s.cfg.TLSKey)
 	if err != nil {
@@ -75,6 +85,11 @@ func (s *Server) ReloadTLS() error {
 	}
 	s.cert.Store(&cert)
 	logging.L().Info("tls cert loaded/reloaded")
+	if s.extraReloader != nil {
+		if err := s.extraReloader(); err != nil {
+			logging.L().Error("extra reloader failed (non-fatal)", "err", err.Error())
+		}
+	}
 	return nil
 }
 
@@ -126,9 +141,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		MinVersion:     tls.VersionTLS12,
 	}
 	srv := &http.Server{
-		Addr:      s.cfg.Bind,
-		TLSConfig: tlsCfg,
-		Handler:   s.buildMux(),
+		Addr:              s.cfg.Bind,
+		TLSConfig:         tlsCfg,
+		Handler:           s.buildMux(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

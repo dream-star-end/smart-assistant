@@ -47,6 +47,12 @@ export interface ComputeHostRow {
    * 旧行可能为 null(迁移 0032 之前建的):scheduler 会 fallback 到公式。
    */
   bridge_cidr: string | null;
+  /**
+   * 0038:节点 :9444 mTLS forward proxy 探活成功后写入的 marker URI
+   * (格式 `mtls://<host>:9444`)。NULL = 未探活通过 → 不参与 OAuth 账号 egress 自动分配。
+   * 实际端口由 master 端 EgressTarget 构造,这里仅作存在性 + host 来源记录。
+   */
+  egress_proxy_endpoint: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -111,6 +117,7 @@ export type BootstrapStep =
   | "firewall_apply"
   | "baseline_first_pull"
   | "image_pull"
+  | "egress_endpoint_probe"
   | "final_verify";
 
 /** node-agent /health 响应 — 与 Go daemon 定义保持一致。 */

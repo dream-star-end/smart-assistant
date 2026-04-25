@@ -94,8 +94,13 @@ export interface PickResult {
   /** 解密后的 refresh token(可能为 null)—— **调用方用完必须 .fill(0)** */
   refresh: Buffer | null
   expires_at: Date | null
-  /** 该账号专属出口代理(明文 URL,内含密码);null 表示走本机出口 */
+  /** 该账号专属出口代理(明文 URL,内含密码);null 表示走本机出口或 mTLS host 出口 */
   egress_proxy: string | null
+  /**
+   * mTLS forward proxy 自动分配的 host(0038);仅在 egress_proxy 为 null 时使用。
+   * egressDispatcher 优先级:egress_proxy > egress_target > 默认。
+   */
+  egress_target: import('./store.js').AccountToken['egress_target']
 }
 
 /**
@@ -320,6 +325,7 @@ export class AccountScheduler {
             refresh: tok.refresh,
             expires_at: tok.expires_at,
             egress_proxy: tok.egress_proxy,
+            egress_target: tok.egress_target,
           }
         }
         // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选

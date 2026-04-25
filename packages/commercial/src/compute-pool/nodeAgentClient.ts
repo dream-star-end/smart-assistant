@@ -25,7 +25,7 @@ import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { request as httpsRequest } from "node:https";
 import type { OutgoingHttpHeaders } from "node:http";
 import type { Socket } from "node:net";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 import { rootLogger } from "../logging/logger.js";
 import {
@@ -64,6 +64,13 @@ interface MasterTlsMaterial {
   cert: Buffer;
   ca: Buffer;
   notAfter: Date;
+  /**
+   * cert PEM 字节的 sha256 前 16 hex(64-bit 熵足够区分续期版本)。
+   * 用作 egressDispatcher cache key 的一部分:master leaf 续期 → version 变 → 旧 ProxyAgent
+   * 自动失效,避免新连接继续出示老 cert(节点 :9444 端会基于 SAN 拒绝)。
+   * 用 PEM 而非 DER 算:省一步 PEM→DER 转换;PEM 与 DER 一一对应,版本变化检测等价。
+   */
+  version: string;
 }
 
 let cachedMaster: MasterTlsMaterial | null = null;
@@ -82,7 +89,8 @@ async function getMasterTls(): Promise<MasterTlsMaterial> {
     fs.readFile(leaf.certPath),
     fs.readFile(ca.caCertPath),
   ]);
-  cachedMaster = { key, cert, ca: caBuf, notAfter: leaf.notAfter };
+  const version = createHash("sha256").update(cert).digest("hex").slice(0, 16);
+  cachedMaster = { key, cert, ca: caBuf, notAfter: leaf.notAfter, version };
   cachedMasterLoadedAt = now;
   return cachedMaster;
 }
@@ -91,6 +99,25 @@ async function getMasterTls(): Promise<MasterTlsMaterial> {
 export function invalidateMasterTlsCache(): void {
   cachedMaster = null;
   cachedMasterLoadedAt = 0;
+}
+
+/**
+ * Master TLS material + 版本 hash,供 egressDispatcher 构造 mTLS ProxyAgent。
+ *
+ * 版本来源:cert PEM 字节的 sha256 前 16 hex。master leaf 续期 → version 变 →
+ * dispatcher cache key 变 → 旧 ProxyAgent 自动失效,新连接以新 cert 出口。
+ *
+ * 1 分钟内多次调用复用同一 material;cert renewal 周期(月级)远长于此,
+ * 实际不会有"续期完仍用旧 cert"的窗口。
+ */
+export async function getMasterTlsForEgress(): Promise<{
+  key: Buffer;
+  cert: Buffer;
+  ca: Buffer;
+  version: string;
+}> {
+  const m = await getMasterTls();
+  return { key: m.key, cert: m.cert, ca: m.ca, version: m.version };
 }
 
 // ─── Cert 指纹 pinning ────────────────────────────────────────────────

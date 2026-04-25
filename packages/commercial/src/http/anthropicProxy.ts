@@ -1404,7 +1404,13 @@ export function makeAnthropicProxyHandler(
       // 之后(从 startInflightJournal 起)统一交给 finalize.fail
       // HIGH#5:同 account 的 chat 与 refresh 必须从同一出口 IP 出去 —— Anthropic
       // anti-abuse 会把 refresh 与紧随其后的 chat 关联,IP 一变立即触发风控。
-      const accountDispatcher = getDispatcherForAccount(pick.account_id, pick.egress_proxy);
+      // 0038:dispatcher 在 plain proxy 与 mTLS forward proxy 之间二选一(plain 优先);
+      // 都缺则 undefined,fetch 走默认出口(master VM)。
+      const accountDispatcher = await getDispatcherForAccount(
+        pick.account_id,
+        pick.egress_proxy,
+        pick.egress_target,
+      );
       try {
         if (
           deps.refreshDeps &&
@@ -1436,6 +1442,7 @@ export function makeAnthropicProxyHandler(
               refresh: r.refresh,
               expires_at: r.expires_at,
               egress_proxy: pick.egress_proxy,
+              egress_target: pick.egress_target,
             };
           } catch (err) {
             // refresh 失败:account 已在 RefreshError 内部按规约处理 disable/不 disable;

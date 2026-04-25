@@ -26,7 +26,7 @@ const COMPUTE_HOST_COLS = `
   status, last_bootstrap_at, last_bootstrap_err,
   last_health_at, last_health_ok, last_health_err,
   consecutive_health_fail, consecutive_health_ok,
-  max_containers, bridge_cidr, created_at, updated_at
+  max_containers, bridge_cidr, egress_proxy_endpoint, created_at, updated_at
 `;
 
 export async function listAllHosts(): Promise<ComputeHostRow[]> {
@@ -396,6 +396,23 @@ export async function updateAgentPsk(
             updated_at = NOW()
       WHERE id = $1`,
     [id, nonce, ct],
+  );
+}
+
+/**
+ * 0038 — bootstrap egress_endpoint_probe step 回写。
+ * endpoint 非空 = :9444 mTLS forward proxy 探活通过(host 可参与账号自动分配);
+ * NULL = 探活未通过(host 仍可调度容器,但被排除在 egress 自动分配外)。
+ */
+export async function setEgressProxyEndpoint(
+  id: string,
+  endpoint: string | null,
+): Promise<void> {
+  await getPool().query(
+    `UPDATE compute_hosts
+        SET egress_proxy_endpoint = $2, updated_at = NOW()
+      WHERE id = $1`,
+    [id, endpoint],
   );
 }
 

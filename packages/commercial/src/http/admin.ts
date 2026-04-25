@@ -699,6 +699,8 @@ function serializeAccount(a: AccountRow): Record<string, unknown> {
     /** 已 mask 密码,UI 安全显示;明文绝不出库 */
     egress_proxy: maskEgressProxy(a.egress_proxy),
     has_egress_proxy: a.egress_proxy !== null,
+    /** 0038 — 自动分配的 compute_host id;UI 显示绑定状态 + 触发重分配。 */
+    egress_host_uuid: a.egress_host_uuid,
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };
@@ -968,6 +970,15 @@ export async function handleAdminPatchAccount(
       typeof b.egress_proxy === "string" && b.egress_proxy.trim().length === 0
         ? null
         : (b.egress_proxy as string | null);
+  }
+  if (b.egress_host_uuid !== undefined) {
+    if (b.egress_host_uuid !== null && typeof b.egress_host_uuid !== "string") {
+      throw new HttpError(400, "VALIDATION", "egress_host_uuid must be string or null");
+    }
+    patch.egress_host_uuid =
+      typeof b.egress_host_uuid === "string" && b.egress_host_uuid.trim().length === 0
+        ? null
+        : (b.egress_host_uuid as string | null);
   }
 
   try {

@@ -69,6 +69,19 @@ const MASTER_BASELINE_BASE_URL = process.env.OPENCLAUDE_MASTER_BASELINE_BASE_URL
 /** node-agent 本地 baseline 落盘位置(跟 baseline.go BaselineDir 对齐)。 */
 const REMOTE_BASELINE_VERSION_FILE = "/var/lib/openclaude/baseline/.version";
 
+/**
+ * 0038 — node-agent master forward proxy(:9444 mTLS CONNECT api.anthropic.com:443)
+ * 监听端口。与 store.ts EGRESS_FORWARD_PROXY_PORT 必须一致。
+ * 独立于 agent_port(:9443 RPC)。Cloud-agnostic:每台 host 都开,master 拨入。
+ */
+const EGRESS_FORWARD_PROXY_PORT = 9444;
+
+/**
+ * egress_endpoint_probe 探活超时:TLS 握手 + CONNECT 往返 + master 端拨 api.anthropic.com TCP 握手。
+ * 上游 dial 在 node-agent 侧有 10s budget,我们留 20s 富余。
+ */
+const EGRESS_PROBE_TIMEOUT_MS = 20_000;
+
 /** baseline_first_pull 等 .version 落地的超时。 */
 const BASELINE_PULL_DEADLINE_MS = 2 * 60_000;
 
@@ -182,6 +195,7 @@ export async function bootstrapHost(params: BootstrapParams): Promise<BootstrapR
     await step("image_pull", async () => {
       /* M1 镜像 pull 放到 nodeScheduler 第一次 run 时懒执行,本阶段 no-op */
     });
+    await step("egress_endpoint_probe", () => probeEgressEndpointStep(params.hostId));
     await step("final_verify", async () => {
       // 再拉一次 health 确认状态稳定
       await verifyNodeAgent(params.hostId);
@@ -294,6 +308,9 @@ async function deployNodeAgent(
     `egress_allow_hosts: []`,
     `docker_bin: "docker"`,
     `master_baseline_base_url: "${MASTER_BASELINE_BASE_URL.replace(/"/g, "")}"`,
+    // 0038:master forward proxy(api.anthropic.com 出口锚定本机 NIC)。
+    // bind 0.0.0.0 允许 master VM 拨入;真实访问由 mTLS+psk+SAN URI 三因子守护。
+    `master_egress_bind: "0.0.0.0:${EGRESS_FORWARD_PROXY_PORT}"`,
     "",
   ].join("\n");
   await sshUpload(target, `${REMOTE_CFG_DIR}/node-agent.yml`, cfgYaml, 0o644);
@@ -451,9 +468,11 @@ systemd-run --unit=${rollbackUnit} --on-active=60 --timer-property=AccuracySec=1
   /bin/sh -c "iptables-restore < /tmp/oc-fw/old.rules; systemctl stop ${rollbackUnit}.service 2>/dev/null || true"
 
 # 应用新规则(只加必要条目,不清空 — 兼容 docker 自己的 FORWARD 链)
-# INPUT: 仅放行 SSH(22)、node-agent(:agent_port)、docker 已有
+# INPUT: 仅放行 SSH(22)、node-agent(:agent_port)、master forward proxy(:9444,0038)、docker 已有
 iptables -C INPUT -p tcp --dport ${agentPort} -j ACCEPT 2>/dev/null \
   || iptables -I INPUT -p tcp --dport ${agentPort} -j ACCEPT
+iptables -C INPUT -p tcp --dport ${EGRESS_FORWARD_PROXY_PORT} -j ACCEPT 2>/dev/null \
+  || iptables -I INPUT -p tcp --dport ${EGRESS_FORWARD_PROXY_PORT} -j ACCEPT
 
 # FORWARD bridge 本 cidr(ingress/egress)
 iptables -C FORWARD -s ${cidr} -j ACCEPT 2>/dev/null \
@@ -573,6 +592,121 @@ async function verifyNodeAgent(hostId: string): Promise<void> {
     await new Promise((r) => setTimeout(r, 2000));
   }
   throw new Error(`verify timeout: ${lastErr}`);
+}
+
+/**
+ * egress_endpoint_probe — 0038。
+ *
+ * 从 master 主动建立到 host:9444 的 mTLS TLS 连接,发一条
+ * `CONNECT api.anthropic.com:443` 探活请求(带 Bearer psk),读响应状态行:
+ *   - 200 → 端到端打通(node-agent listener up + master cert/psk 双因子被 listener
+ *     接受 + listener 能从本机 NIC 拨到 api.anthropic.com)→ 写
+ *     `compute_hosts.egress_proxy_endpoint = mtls://<host>:9444`
+ *   - 任何其他响应 / 网络错误 → 视为本台 host 不可作 egress 出口 → 写 NULL
+ *     (host 仍 ready,可调度容器,只是被排除在 OAuth 账号自动分配外)
+ *
+ * 不抛错:bootstrap 主流程不会因 host 暂时拨不到 anthropic 而 broken。
+ * 异常仅 log.warn,DB 端点列写 NULL;运维可在 admin UI 触发 reboot/手动 retry。
+ */
+async function probeEgressEndpointStep(hostId: string): Promise<void> {
+  const row = await queries.getHostById(hostId);
+  if (!row) throw new Error("host row vanished");
+  let psk: Buffer | null = null;
+  try {
+    psk = decryptAgentPsk(row.id, row.agent_psk_nonce, row.agent_psk_ct);
+  } catch (e) {
+    log.warn("egress probe: psk decrypt failed", {
+      hostId,
+      err: e instanceof Error ? e.message : String(e),
+    });
+    await queries.setEgressProxyEndpoint(hostId, null);
+    return;
+  }
+  try {
+    const ok = await probeEgressEndpoint(row.host, psk);
+    if (ok) {
+      const endpoint = `mtls://${row.host}:${EGRESS_FORWARD_PROXY_PORT}`;
+      await queries.setEgressProxyEndpoint(hostId, endpoint);
+      log.info("egress probe ok", { hostId, endpoint });
+    } else {
+      await queries.setEgressProxyEndpoint(hostId, null);
+      log.warn("egress probe failed: not 200", { hostId, host: row.host });
+    }
+  } catch (e) {
+    await queries.setEgressProxyEndpoint(hostId, null);
+    log.warn("egress probe error", {
+      hostId,
+      err: e instanceof Error ? e.message : String(e),
+    });
+  } finally {
+    psk.fill(0);
+  }
+}
+
+/**
+ * 真正的 mTLS CONNECT 探活。**只读响应状态行**,握手成功后立即关闭连接 ——
+ * 不真的把 master 流量过去 anthropic,只验通路。
+ *
+ * 复用 nodeAgentClient.getMasterTlsForEgress 同一份 master leaf,跟 anthropicProxy 一致。
+ */
+async function probeEgressEndpoint(host: string, psk: Buffer): Promise<boolean> {
+  const { connect: tlsConnect } = await import("node:tls");
+  const { getMasterTlsForEgress } = await import("./nodeAgentClient.js");
+  const m = await getMasterTlsForEgress();
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const settle = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    const sock = tlsConnect({
+      host,
+      port: EGRESS_FORWARD_PROXY_PORT,
+      ca: m.ca,
+      cert: m.cert,
+      key: m.key,
+      rejectUnauthorized: true,
+      // node-agent leaf 没 DNS/IP SAN(只 SPIFFE URI),跳过默认 hostname check;
+      // 链验证由 ca + rejectUnauthorized 兜底,身份在 listener 端用 master SAN URI 校验。
+      checkServerIdentity: () => undefined,
+      servername: "node-agent",
+    });
+    const timer = setTimeout(() => {
+      sock.destroy();
+      settle(false);
+    }, EGRESS_PROBE_TIMEOUT_MS);
+    let buf = "";
+    sock.once("error", () => {
+      clearTimeout(timer);
+      settle(false);
+    });
+    sock.once("close", () => {
+      clearTimeout(timer);
+      settle(buf.startsWith("HTTP/1.1 200"));
+    });
+    sock.once("secureConnect", () => {
+      const lines = [
+        "CONNECT api.anthropic.com:443 HTTP/1.1",
+        "Host: api.anthropic.com:443",
+        `Authorization: Bearer ${psk.toString("hex")}`,
+        "",
+        "",
+      ].join("\r\n");
+      sock.write(lines);
+    });
+    sock.on("data", (c: Buffer) => {
+      buf += c.toString("utf8");
+      // 拿到状态行就够了;不真的让 master ↔ anthropic 流量过去
+      const i = buf.indexOf("\r\n");
+      if (i >= 0) {
+        clearTimeout(timer);
+        const ok = buf.slice(0, i).startsWith("HTTP/1.1 200");
+        sock.destroy();
+        settle(ok);
+      }
+    });
+  });
 }
 
 // ─── utils ────────────────────────────────────────────────────────
