@@ -222,9 +222,22 @@
   - 边界 case 全本地验证:`--rollback=6/abc/empty/1.5/0` → exit 2 + 友好错误
   - **生产验证 2026-04-25 02:51 UTC**:首次 deploy 触发 legacy migration(`.prev/` → `.prev.1/`);第二次 deploy(本次)`.prev.1/` shift 到 `.prev.2/`,新 snapshot 落 `.prev.1/`,无 `.prev/` / `.prev.new/` 残留。两代各 114M,smoke 5/5 PASS
 
-### P2-19 独立 cron 跑 smoke
-- **方案**:systemd timer 每 5 分钟调 `smoke-v3.sh https://claudeai.chat`,失败 enqueueAlert `health.smoke_failed`
-- **验证**:stop 服务 → 5 min 内收到告警;recover 后告警 resolve
+### P2-19 独立 cron 跑 smoke ✅ DONE
+- **方案**:systemd timer 每 5 分钟调一个**全新的最小 smoke** (`scripts/health-smoke-v3.sh`,只做 curl /healthz + curl /),wrapper 失败时**直接 INSERT admin_alert_outbox** (SQL fan-out 复刻 listDispatchableChannels)。完全不依赖 openclaude.service,解决 "service 死掉时所有内部告警通道都哑了" 的盲点
+- **关键设计**:
+  - 全新 smoke 脚本 (≠ deploy 用的 `smoke-v3.sh`,后者绑 EXPECTED_TAG)
+  - Marker file (`/var/lib/openclaude/health-smoke-v3.failed`) 实现 outage 级 dedup,只在 dispatch INSERT 成功后才 touch(避免 DB 一次抖动永久压制)
+  - silence **故意不在 SQL 里复刻** — matcherMatches() 的 jsonb DSL 复杂度高,double-impl 必 drift。maintenance suppression 走 `systemctl stop health-smoke-v3.timer`
+  - `CASE WHEN jsonb_typeof(c.event_types) <> 'array'` 防御 schema 脏数据(避免 planner 对非 array 预求值 jsonb_array_length 报错)
+  - payload 用 `jsonb_build_object` 在 SQL 端拼,避免 bash 拼 JSON 转义陷阱
+  - smoke 脚本 grep 用 heredoc 不用 pipe,避 `set -o pipefail` + SIGPIPE 陷阱(64KB body grep -q 命中后 echo 收 SIGPIPE 让 pipefail 翻译成 fail)
+- **生产验证 2026-04-25 04:18 UTC** (`v3-20260425T0418Z-d21c148`):
+  - OK→FAIL: marker 创建,INSERT 0 0(唯一 channel id=1 状态 error,被 activation_status filter 排除 — 正确)
+  - 用 BEGIN/ROLLBACK 把 channel 临时置 active 验证 SQL fan-out: INSERT 0 1 出来 payload `{"url","host","checked_at"}` 合法 JSON,severity=critical, title 正确
+  - 2nd FAIL with marker present → 静默不重复 INSERT
+  - FAIL→OK: marker 清除,日志 RECOVERED
+  - Critical guard: 第一次跑用错路径 `/root/.openclaude/.env` (从 45.32 personal 抄错),dispatch 失败但 marker NOT touched — 完美符合设计,下个 tick 自动重试。后续 fix 改成 `/etc/openclaude/commercial.env`
+- **Codex review (3 轮)**:1 BLOCKING (ProtectHome=true 让 /root 不可读) + 2 IMPORTANT (jsonb_typeof 防御、payload JSON 转义) + 1 NIT (RuntimeDirectoryMode 显式 0700) 全部修复。最终 PASS
 
 ### P2-20 Admin CSV 导出 + 诊断端点
 - **方案**:
