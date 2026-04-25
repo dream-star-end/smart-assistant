@@ -94,6 +94,7 @@ import {
   handleAdminContainerLogs,
   handleAdminAgentContainerAction,
   handleAdminListLedger,
+  handleAdminExportLedgerCsv,
   handleAdminMetrics,
   handleAdminListSettings,
   handleAdminGetSetting,
@@ -447,6 +448,9 @@ export function createCommercialHandler(
     { method: "GET",  pathPrefix: "/api/admin/agent-containers/", handler: handleAdminContainerLogs },
     { method: "POST", pathPrefix: "/api/admin/agent-containers/", handler: handleAdminAgentContainerAction },
     // T-60 超管积分流水
+    // P1-5: `.csv` 是写路由(写 audit),与 GET `/ledger` 共存。matchRoute 用 exact-first,
+    // 两条 exact 互不干扰,顺序无关。
+    { method: "GET", path: "/api/admin/ledger.csv", handler: handleAdminExportLedgerCsv },
     { method: "GET", path: "/api/admin/ledger", handler: handleAdminListLedger },
     // T-62 Prometheus 指标
     { method: "GET", path: "/api/admin/metrics", handler: handleAdminMetrics },

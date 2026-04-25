@@ -152,7 +152,15 @@ export async function listAdminAudit(input: ListAdminAuditInput): Promise<ListAd
   const where: string[] = [];
   const params: unknown[] = [];
   if (adminId !== null) { params.push(adminId); where.push(`admin_id = $${params.length}`); }
-  if (action !== null) { params.push(action); where.push(`action = $${params.length}`); }
+  if (action !== null) {
+    // P1-8 前缀过滤:UI placeholder 写"action 前缀(如 user.)",过去后端是精确比较,
+    // 输 `user.` 会 0 命中。改成 ILIKE prefix。LIKE 元字符 `_`/`%`/`\` escape 必做 ——
+    // ACTION_RE 允许 `_`(`system_settings.set` 是真实 action),不 escape 的话 `system_`
+    // 会匹配任意 7 字符,污染审计查询。`\` 不在 ACTION_RE 字符集,但保留通用 escape。
+    const liked = action.replace(/\\/g, "\\\\").replace(/[_%]/g, "\\$&");
+    params.push(`${liked}%`);
+    where.push(`action ILIKE $${params.length} ESCAPE '\\'`);
+  }
   if (before !== null) { params.push(before); where.push(`id < $${params.length}`); }
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 

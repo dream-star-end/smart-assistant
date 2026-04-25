@@ -106,6 +106,17 @@ export const state = {
   offlineQueue: [], // messages queued while disconnected
 }
 
+// P2-24 — offlineQueue 软上限。
+// 长时间离线下用户狂发,offlineQueue 无界堆积会:1) 占内存 2) 重连后一次性 drain
+// 卡死 UI / 后端。设 200 条,达到时拒收新消息,UI 提示重试。
+// _offlineQueuePending 不计入(那是正在 drain 的副本,不会无限增长)。
+export const MAX_OFFLINE_QUEUE = 200
+export function tryEnqueueOffline(item) {
+  if (state.offlineQueue.length >= MAX_OFFLINE_QUEUE) return false
+  state.offlineQueue.push(item)
+  return true
+}
+
 export function getSession(id) {
   return state.sessions.get(id || state.currentSessionId)
 }

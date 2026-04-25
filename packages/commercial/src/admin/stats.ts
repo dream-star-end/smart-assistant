@@ -83,7 +83,7 @@ const WINDOW_HOURS: Record<ActivityWindow, number> = {
 // ─── 营收趋势(按天) ─────────────────────────────────────────────────
 
 export interface RevenueByDayRow {
-  /** ISO 日期(用户当天 UTC,PG 的 date_trunc('day', ...) 默认 UTC) */
+  /** ISO 日期(`YYYY-MM-DD`,Asia/Shanghai 当天) */
   day: string;
   /** 当日付清订单金额总和(cents) */
   paid_amount_cents: string;
@@ -96,8 +96,13 @@ export interface RevenueByDayRow {
 /**
  * 最近 N 天营收。N clamp 到 [1, 90]。
  * 返回 exactly N 个 bucket:今天(含) + 前 N-1 天。
- * 过滤条件对齐到第一个 bucket 的起点(date_trunc('day', NOW() - (N-1) days)),
- * 保证窗口外的"第 N+1 天"不泄漏进图表(R1 Codex M1)。
+ *
+ * **P1-6 时区**:全部按 Asia/Shanghai 截取。`paid_at` 是 `timestamptz`,
+ * `paid_at AT TIME ZONE 'Asia/Shanghai'` 返回 `timestamp without time zone`(把
+ * 那一瞬解释到 +08:00 的墙上时钟),`date_trunc('day', ...)` 即得 +08:00 当天 00:00。
+ * `days` CTE 同样用 `NOW() AT TIME ZONE 'Asia/Shanghai'` → naive timestamp,JOIN 类型
+ * 对齐。WHERE 过滤把第一个 bucket 起点(naive)用 `AT TIME ZONE 'Asia/Shanghai'`
+ * 转回 `timestamptz`(+08:00 那一瞬的 UTC instant),与 `paid_at` 类型一致。
  */
 export async function getRevenueByDay(days = 14): Promise<RevenueByDayRow[]> {
   const d = Math.min(90, Math.max(1, Math.floor(days)));
@@ -109,28 +114,28 @@ export async function getRevenueByDay(days = 14): Promise<RevenueByDayRow[]> {
   }>(
     `WITH days AS (
        SELECT generate_series(
-         date_trunc('day', NOW() - ($1::int - 1) * INTERVAL '1 day'),
-         date_trunc('day', NOW()),
+         date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - ($1::int - 1) * INTERVAL '1 day',
+         date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai'),
          INTERVAL '1 day'
        ) AS day
      ),
      orders_agg AS (
-       SELECT date_trunc('day', paid_at) AS day,
+       SELECT date_trunc('day', paid_at AT TIME ZONE 'Asia/Shanghai') AS day,
               SUM(amount_cents) AS paid_amount_cents,
               COUNT(*) AS orders_paid
        FROM orders
        WHERE status = 'paid'
-         AND paid_at >= date_trunc('day', NOW() - ($1::int - 1) * INTERVAL '1 day')
+         AND paid_at >= ((date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - ($1::int - 1) * INTERVAL '1 day') AT TIME ZONE 'Asia/Shanghai')
        GROUP BY 1
      ),
      subs_agg AS (
        -- 按 agent_subscriptions.created_at 统计新订阅行数。Agent 订阅不走
        -- credit_ledger delta 扣费(subscription 表本身是来源),统计"行数"等价
        -- 于"该日新购"。status = active/canceled/... 不影响"新购"数据,不过滤。
-       SELECT date_trunc('day', created_at) AS day,
+       SELECT date_trunc('day', created_at AT TIME ZONE 'Asia/Shanghai') AS day,
               COUNT(*) AS new_subscriptions
        FROM agent_subscriptions
-       WHERE created_at >= date_trunc('day', NOW() - ($1::int - 1) * INTERVAL '1 day')
+       WHERE created_at >= ((date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - ($1::int - 1) * INTERVAL '1 day') AT TIME ZONE 'Asia/Shanghai')
        GROUP BY 1
      )
      SELECT to_char(days.day, 'YYYY-MM-DD') AS day,

@@ -18,7 +18,7 @@ import {
 } from './util.js'
 
 // ── App state ──
-import { _clearStoredAccessToken, _writeStoredAccessToken, getSession, isSending, setSending, state } from './state.js'
+import { _clearStoredAccessToken, _writeStoredAccessToken, getSession, isSending, setSending, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js'
 
 // ── API layer ──
 import { abortInflightRefresh, apiFetch, apiGet, apiJson, authHeaders, clearProactiveRefresh, onAuthExpired, resetAuthExpired, scheduleProactiveRefresh, silentRefresh, snapshotDiagnostics } from './api.js'
@@ -785,7 +785,20 @@ function send() {
     //   (b) _hasQueuedForSess → 已有本 session 排队,保序插队
     //   (c) safeWsSend 返回 false → 背压触发 close,正在 reconnect
     // 统统 push offlineQueue + status='queued',reconnect 后 drain 按序重发。
-    state.offlineQueue.push({ sessId: sess.id, payload: wsPayload, msgId: userMsg.id })
+    // P2-24 软上限 — 超过 200 直接拒收避免无限堆积。
+    const enqueued = tryEnqueueOffline({ sessId: sess.id, payload: wsPayload, msgId: userMsg.id })
+    if (!enqueued) {
+      userMsg.status = 'error'
+      updateMsgStatus(userMsg)
+      toast(`离线缓冲已满 (${MAX_OFFLINE_QUEUE} 条),请恢复网络后重试`, 'danger')
+      $('input').value = ''
+      state.attachments = []
+      renderAttachments()
+      autoResize()
+      scheduleSaveFromUserEdit(sess)
+      renderSidebar()
+      return
+    }
     userMsg.status = 'queued'
     updateMsgStatus(userMsg)
     if (!state.ws || state.ws.readyState !== 1) {

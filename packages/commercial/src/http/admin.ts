@@ -89,11 +89,13 @@ import { getContainersPoolStats } from "../admin/containersStats.js";
 import { SupervisorError } from "../agent-sandbox/types.js";
 import {
   listLedger,
+  buildLedgerCsv,
   LEDGER_MAX_LIMIT,
   LEDGER_REASONS,
   type LedgerRowView,
   type LedgerReason,
 } from "../admin/ledger.js";
+import { tx } from "../db/queries.js";
 import { AccountNotFoundError, type AccountRow } from "../account-pool/store.js";
 import { adminAdjust, InsufficientCreditsError } from "../billing/ledger.js";
 import { renderPrometheus } from "../admin/metrics.js";
@@ -1229,20 +1231,17 @@ export async function handleAdminAgentContainerAction(
 
 // ─── ledger ────────────────────────────────────────────────────────
 
-export async function handleAdminListLedger(
-  req: IncomingMessage,
-  res: ServerResponse,
-  _ctx: RequestContext,
-  deps: CommercialHttpDeps,
-): Promise<void> {
-  await requireAdmin(req, deps.jwtSecret);
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-  const sp = url.searchParams;
+/** 从 sp 提取 ledger 共用过滤参数(user_id / reason / from / to)。 */
+function parseLedgerFilter(sp: URLSearchParams): {
+  userId: string | undefined;
+  reason: LedgerReason | undefined;
+  from: string | undefined;
+  to: string | undefined;
+} {
   const userIdRaw = sp.get("user_id");
   const reasonRaw = sp.get("reason");
-  const beforeRaw = sp.get("before");
-  const limit = parsePositiveInt(sp.get("limit"), "limit", LEDGER_MAX_LIMIT);
-
+  const fromRaw = sp.get("from");
+  const toRaw = sp.get("to");
   let reason: LedgerReason | undefined;
   if (reasonRaw !== null && reasonRaw !== "") {
     if (!(LEDGER_REASONS as readonly string[]).includes(reasonRaw)) {
@@ -1252,11 +1251,30 @@ export async function handleAdminListLedger(
     }
     reason = reasonRaw as LedgerReason;
   }
+  return {
+    userId: userIdRaw === null || userIdRaw === "" ? undefined : userIdRaw,
+    reason,
+    from: fromRaw === null || fromRaw === "" ? undefined : fromRaw,
+    to: toRaw === null || toRaw === "" ? undefined : toRaw,
+  };
+}
+
+export async function handleAdminListLedger(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+  const filter = parseLedgerFilter(sp);
+  const beforeRaw = sp.get("before");
+  const limit = parsePositiveInt(sp.get("limit"), "limit", LEDGER_MAX_LIMIT);
 
   try {
     const r = await listLedger({
-      userId: userIdRaw === null || userIdRaw === "" ? undefined : userIdRaw,
-      reason,
+      ...filter,
       before: beforeRaw === null || beforeRaw === "" ? undefined : beforeRaw,
       limit,
     });
@@ -1265,6 +1283,64 @@ export async function handleAdminListLedger(
       next_before: r.next_before,
     });
   } catch (err) { translateRangeError(err); }
+}
+
+// ─── GET /api/admin/ledger.csv?user_id&reason&from&to (P1-5) ────────
+//
+// 写路由 — 用 requireAdminVerifyDb,审计 'ledger.export_csv'。
+// CSV 内存构建,审计成功后再 writeHead(避免 header/body 顺序 bug)。
+
+export async function handleAdminExportLedgerCsv(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const filter = parseLedgerFilter(url.searchParams);
+
+  let csv: string;
+  let rowCount: number;
+  try {
+    const r = await buildLedgerCsv(filter);
+    csv = r.csv;
+    rowCount = r.rowCount;
+  } catch (err) { translateRangeError(err); }
+
+  // 审计先写,失败抛 → 不下发 body。
+  await tx(async (client) => {
+    await writeAdminAudit(client, {
+      adminId: admin.id,
+      action: "ledger.export_csv",
+      target: filter.userId ? `user:${filter.userId}` : "all",
+      after: {
+        rows: rowCount,
+        filter: {
+          user_id: filter.userId ?? null,
+          reason: filter.reason ?? null,
+          from: filter.from ?? null,
+          to: filter.to ?? null,
+        },
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+  });
+
+  // YYYYMMDDTHHmm(UTC,文件名不掺时区差异)
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}T${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`;
+  const filename = `ledger-${stamp}.csv`;
+
+  res.writeHead(200, {
+    "Content-Type": "text/csv; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${filename}"`,
+    "Content-Length": Buffer.byteLength(csv, "utf-8"),
+    "Cache-Control": "no-store",
+  });
+  res.end(csv);
 }
 
 // ─── metrics(T-62)──────────────────────────────────────────────────

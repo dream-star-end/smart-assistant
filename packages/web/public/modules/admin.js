@@ -17,7 +17,7 @@
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
 import { _clearStoredAccessToken, state } from './state.js'
-import { apiGet, apiJson, apiText, onAuthExpired } from './api.js'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js'
 import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
@@ -2044,67 +2044,227 @@ async function _loadContainerLogs(id) {
 }
 
 // ─── Tab: Ledger ───────────────────────────────────────────────────
+//
+// P1-5: 后端有 keyset 游标(`before` = 上一页最小 id)+ from/to 时间范围 +
+// LEDGER_MAX_LIMIT=500 + .csv 导出。前端复用 ORDERS_STATE 的"加载更多"模式。
+
+const LEDGER_STATE = {
+  renderSeq: 0,
+  loadSeq: 0,
+  rows: [],
+  nextBefore: null, // 上一页返回的 next_before,本批 query 的 ?before=
+  done: false,
+  userId: '',
+  reason: '',
+  from: '', // ISO 字符串(toISOString 后),空字符串表示不过滤
+  to: '',
+}
+const LEDGER_PAGE_SIZE = 50
+
+/** 把 <input type="datetime-local"> 的本地值(YYYY-MM-DDTHH:mm)转 ISO,空串透传。 */
+function _datetimeLocalToIso(v) {
+  if (!v) return ''
+  const d = new Date(v) // 浏览器按本地时区解析 datetime-local
+  return Number.isFinite(d.getTime()) ? d.toISOString() : ''
+}
+/** ISO → datetime-local 显示值(本地时间)。 */
+function _isoToDatetimeLocal(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (!Number.isFinite(d.getTime())) return ''
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
 
 async function renderLedgerTab() {
-  const userId = sessionStorage.getItem('admin_ledger_user') || ''
-  // R2 Codex M2:sessionStorage 里残留的 reason 可能来自旧版本(比如 "expire" 已
-  // 不在白名单里);后端 ledger.ts 对 unknown reason 会 400 拒。启动时先按当前
-  // LEDGER_REASONS 白名单卫生一次 —— 不认的一律归为"全部"并清掉。
+  const mySeq = ++LEDGER_STATE.renderSeq
+
+  LEDGER_STATE.userId = sessionStorage.getItem('admin_ledger_user') || ''
   let reason = sessionStorage.getItem('admin_ledger_reason') || ''
+  // sessionStorage 残留的 reason 可能来自旧版本(白名单变更)。不认的清掉。
   if (reason && !LEDGER_REASONS.includes(reason)) {
     reason = ''
     sessionStorage.removeItem('admin_ledger_reason')
   }
-  const sp = new URLSearchParams({ limit: '100' })
-  if (userId) sp.set('user_id', userId)
-  if (reason) sp.set('reason', reason)
-  const data = await apiGet(`/api/admin/ledger?${sp.toString()}`)
-  const rows = data?.rows ?? []
+  LEDGER_STATE.reason = reason
+  LEDGER_STATE.from = sessionStorage.getItem('admin_ledger_from') || ''
+  LEDGER_STATE.to = sessionStorage.getItem('admin_ledger_to') || ''
+  LEDGER_STATE.rows = []
+  LEDGER_STATE.nextBefore = null
+  LEDGER_STATE.done = false
+
   view().innerHTML = `
     <div class="panel">
-      <h2>积分流水 <small>共 ${rows.length} 条(最多 100)</small></h2>
-      <div class="toolbar">
-        <input type="text" id="l-uid" placeholder="user_id 过滤" value="${escapeHtml(userId)}" />
+      <h2>积分流水 <small id="l-count">加载中…</small></h2>
+      <div class="toolbar" style="flex-wrap:wrap;gap:var(--s-2)">
+        <input type="text" id="l-uid" placeholder="user_id 过滤" value="${escapeHtml(LEDGER_STATE.userId)}" />
         <select id="l-reason">
           <option value="">全部 reason</option>
           ${LEDGER_REASONS.map((r) =>
-            `<option value="${r}" ${reason === r ? 'selected' : ''}>${LEDGER_REASON_LABELS[r]}</option>`).join('')}
+            `<option value="${r}" ${LEDGER_STATE.reason === r ? 'selected' : ''}>${LEDGER_REASON_LABELS[r]}</option>`).join('')}
         </select>
+        <label style="display:flex;gap:var(--s-1);align-items:center;font-size:12px;opacity:0.85">
+          从 <input type="datetime-local" id="l-from" value="${escapeHtml(_isoToDatetimeLocal(LEDGER_STATE.from))}" />
+        </label>
+        <label style="display:flex;gap:var(--s-1);align-items:center;font-size:12px;opacity:0.85">
+          至 <input type="datetime-local" id="l-to" value="${escapeHtml(_isoToDatetimeLocal(LEDGER_STATE.to))}" />
+        </label>
         <button class="btn btn-primary" id="l-go">查询</button>
+        <button class="btn" id="l-clear">清空</button>
+        <button class="btn" id="l-csv" title="导出当前过滤条件下最多 50000 行 CSV">导出 CSV</button>
       </div>
-      ${rows.length === 0
-        ? '<div class="empty">无记录</div>'
-        : `
-        <table class="data">
-          <thead>
-            <tr><th>id</th><th>用户</th><th>delta</th><th>余额</th>
-                <th>reason</th><th>memo</th><th>时间</th></tr>
-          </thead>
-          <tbody>
-            ${rows.map((r) => {
-              const negative = String(r.delta).startsWith('-')
-              return `
-              <tr>
-                <td class="mono">${escapeHtml(r.id)}</td>
-                <td class="mono">${escapeHtml(r.user_id)}</td>
-                <td class="num" style="color:${negative ? 'var(--danger)' : 'var(--ok)'}">
-                  ${fmtCents(r.delta)}
-                </td>
-                <td class="num">${fmtCents(r.balance_after)}</td>
-                <td><span class="badge muted">${escapeHtml(r.reason)}</span></td>
-                <td>${escapeHtml(r.memo || '')}</td>
-                <td class="mono">${fmtDate(r.created_at)}</td>
-              </tr>`
-            }).join('')}
-          </tbody>
-        </table>`}
+      <div id="l-table-container"><div class="skeleton-row"><div class="skeleton-bar w60"></div></div></div>
+      <div id="l-load-more" style="margin-top:var(--s-3);display:none;text-align:center;">
+        <button class="btn" id="l-load-more-btn">加载更多</button>
+      </div>
     </div>
   `
+
   $('l-go').addEventListener('click', () => {
     sessionStorage.setItem('admin_ledger_user', $('l-uid').value.trim())
     sessionStorage.setItem('admin_ledger_reason', $('l-reason').value)
+    const fromIso = _datetimeLocalToIso($('l-from').value)
+    const toIso = _datetimeLocalToIso($('l-to').value)
+    if (fromIso) sessionStorage.setItem('admin_ledger_from', fromIso)
+    else sessionStorage.removeItem('admin_ledger_from')
+    if (toIso) sessionStorage.setItem('admin_ledger_to', toIso)
+    else sessionStorage.removeItem('admin_ledger_to')
     applyHash()
   })
+  $('l-clear').addEventListener('click', () => {
+    sessionStorage.removeItem('admin_ledger_user')
+    sessionStorage.removeItem('admin_ledger_reason')
+    sessionStorage.removeItem('admin_ledger_from')
+    sessionStorage.removeItem('admin_ledger_to')
+    applyHash()
+  })
+  $('l-load-more-btn').addEventListener('click', async (ev) => {
+    await withBtnLoading(ev.currentTarget, () => _loadMoreLedger(mySeq))
+  })
+  $('l-csv').addEventListener('click', async (ev) => {
+    await withBtnLoading(ev.currentTarget, () => _exportLedgerCsv())
+  })
+
+  await _loadMoreLedger(mySeq)
+}
+
+async function _loadMoreLedger(renderSeq) {
+  if (LEDGER_STATE.done) return
+  const myLoadSeq = ++LEDGER_STATE.loadSeq
+
+  const sp = new URLSearchParams({ limit: String(LEDGER_PAGE_SIZE) })
+  if (LEDGER_STATE.userId) sp.set('user_id', LEDGER_STATE.userId)
+  if (LEDGER_STATE.reason) sp.set('reason', LEDGER_STATE.reason)
+  if (LEDGER_STATE.from) sp.set('from', LEDGER_STATE.from)
+  if (LEDGER_STATE.to) sp.set('to', LEDGER_STATE.to)
+  if (LEDGER_STATE.nextBefore) sp.set('before', LEDGER_STATE.nextBefore)
+
+  const isFirstPage = LEDGER_STATE.rows.length === 0 && !LEDGER_STATE.nextBefore
+
+  let data
+  try {
+    data = await apiGet(`/api/admin/ledger?${sp.toString()}`)
+  } catch (err) {
+    if (renderSeq !== LEDGER_STATE.renderSeq || _currentTab !== 'ledger') return
+    if (myLoadSeq !== LEDGER_STATE.loadSeq) return
+    if (isFirstPage) {
+      const tc = $('l-table-container')
+      if (tc) tc.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message || String(err))}</div>`
+      const lm = $('l-load-more'); if (lm) lm.style.display = 'none'
+    } else {
+      toast(`加载失败:${err.message}`, 'danger', toastOptsFromError(err))
+    }
+    return
+  }
+  if (renderSeq !== LEDGER_STATE.renderSeq || _currentTab !== 'ledger') return
+  if (myLoadSeq !== LEDGER_STATE.loadSeq) return
+
+  const newRows = data?.rows ?? []
+  LEDGER_STATE.rows.push(...newRows)
+  LEDGER_STATE.nextBefore = data?.next_before ?? null
+  if (!LEDGER_STATE.nextBefore) LEDGER_STATE.done = true
+
+  _renderLedgerTable()
+}
+
+function _renderLedgerTable() {
+  const cnt = $('l-count')
+  if (cnt) cnt.textContent = `共 ${LEDGER_STATE.rows.length} 条${LEDGER_STATE.done ? '' : '+'}`
+  const tc = $('l-table-container')
+  if (!tc) return
+
+  const rows = LEDGER_STATE.rows
+  if (rows.length === 0) {
+    tc.innerHTML = '<div class="empty">无记录</div>'
+  } else {
+    tc.innerHTML = `
+      <table class="data">
+        <thead>
+          <tr><th>id</th><th>用户</th><th>delta</th><th>余额</th>
+              <th>reason</th><th>memo</th><th>时间</th></tr>
+        </thead>
+        <tbody>
+          ${rows.map((r) => {
+            const negative = String(r.delta).startsWith('-')
+            return `
+            <tr>
+              <td class="mono">${escapeHtml(r.id)}</td>
+              <td class="mono">${escapeHtml(r.user_id)}</td>
+              <td class="num" style="color:${negative ? 'var(--danger)' : 'var(--ok)'}">
+                ${fmtCents(r.delta)}
+              </td>
+              <td class="num">${fmtCents(r.balance_after)}</td>
+              <td><span class="badge muted">${escapeHtml(LEDGER_REASON_LABELS[r.reason] || r.reason)}</span></td>
+              <td>${escapeHtml(r.memo || '')}</td>
+              <td class="mono">${fmtDate(r.created_at)}</td>
+            </tr>`
+          }).join('')}
+        </tbody>
+      </table>`
+  }
+
+  const lm = $('l-load-more')
+  if (lm) lm.style.display = LEDGER_STATE.done ? 'none' : 'block'
+}
+
+async function _exportLedgerCsv() {
+  const sp = new URLSearchParams()
+  if (LEDGER_STATE.userId) sp.set('user_id', LEDGER_STATE.userId)
+  if (LEDGER_STATE.reason) sp.set('reason', LEDGER_STATE.reason)
+  if (LEDGER_STATE.from) sp.set('from', LEDGER_STATE.from)
+  if (LEDGER_STATE.to) sp.set('to', LEDGER_STATE.to)
+  // 用 apiFetch 走 401→refresh→retry 路径,不能 window.open(token 在 Authorization
+  // header,不在 cookie 里)。一次性内存读 ≤ 50k 行 CSV(~10MB)再触发下载。
+  let res
+  try {
+    res = await apiFetch(`/api/admin/ledger.csv?${sp.toString()}`, { headers: authHeaders() })
+  } catch (e) {
+    toast(`导出失败:${e.message}`, 'danger', toastOptsFromError(e))
+    return
+  }
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`
+    try { const j = await res.json(); msg = j?.error?.message || msg } catch {}
+    toast(`导出失败:${msg}`, 'danger')
+    return
+  }
+  const blob = await res.blob()
+  // Content-Disposition filename 已由后端给出,但 a.download 也要赋值 — 浏览器
+  // 没有 server-driven filename 接口,只能从 header 抠或本地生成。后端格式稳定,
+  // 这里直接重生成同样的文件名。
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}T${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `ledger-${stamp}.csv`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  // 等异步触发后再 revoke,Safari/Firefox 立即 revoke 会让下载半路失败
+  setTimeout(() => URL.revokeObjectURL(url), 30_000)
+  toast('CSV 已开始下载')
 }
 
 // ─── Tab: Orders (P0-3 订单管理)──────────────────────────────────
@@ -2974,6 +3134,9 @@ async function renderAuditTab() {
   if (action) sp.set('action', action)
   const data = await apiGet(`/api/admin/audit?${sp.toString()}`)
   const rows = data?.rows ?? []
+  // 把当前页 row by id 缓存,diff modal 点击时按 id 取(避免在 onclick 里塞 JSON 大对象)
+  _AUDIT_ROWS_BY_ID.clear()
+  for (const r of rows) _AUDIT_ROWS_BY_ID.set(String(r.id), r)
   view().innerHTML = `
     <div class="panel">
       <h2>审计日志 <small>共 ${rows.length} 条(最多 100)</small></h2>
@@ -2988,7 +3151,7 @@ async function renderAuditTab() {
         <table class="data">
           <thead>
             <tr><th>id</th><th>admin</th><th>action</th><th>target</th>
-                <th>before → after</th><th>ip</th><th>时间</th></tr>
+                <th>变更</th><th>ip</th><th>时间</th></tr>
           </thead>
           <tbody>
             ${rows.map((r) => `
@@ -2997,11 +3160,9 @@ async function renderAuditTab() {
                 <td class="mono">${escapeHtml(r.admin_id)}</td>
                 <td><span class="badge muted">${escapeHtml(r.action)}</span></td>
                 <td class="mono">${escapeHtml(r.target || '—')}</td>
-                <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis"
-                    title="${escapeHtml(JSON.stringify({ before: r.before, after: r.after }))}">
-                  ${escapeHtml(JSON.stringify(r.before || {}).slice(0, 60))}
-                  →
-                  ${escapeHtml(JSON.stringify(r.after || {}).slice(0, 60))}
+                <td>
+                  <button class="btn" data-act="audit-diff" data-id="${escapeHtml(r.id)}"
+                    style="padding:2px 8px;font-size:12px;">查看 diff</button>
                 </td>
                 <td class="mono">${escapeHtml(r.ip || '')}</td>
                 <td class="mono">${fmtDate(r.created_at)}</td>
@@ -3015,6 +3176,76 @@ async function renderAuditTab() {
     sessionStorage.setItem('admin_audit_action', $('a-act').value.trim())
     applyHash()
   })
+  for (const b of view().querySelectorAll('button[data-act="audit-diff"]')) {
+    b.addEventListener('click', () => {
+      const row = _AUDIT_ROWS_BY_ID.get(b.dataset.id)
+      if (row) openAuditDiffModal(row)
+    })
+  }
+}
+
+// P2-28 — Audit diff modal: 完整展开 before → after,top-level key by key 对比。
+// 不递归深度 diff(audit 实践里一行 before/after 都是 ≤ 5-10 个 top-level 字段,
+// 嵌套对象直接 JSON.stringify(2) 显示原文足够看懂)。
+
+const _AUDIT_ROWS_BY_ID = new Map()
+
+function _formatJsonValue(v) {
+  if (v === undefined) return '<i style="opacity:0.5">undefined</i>'
+  if (v === null) return '<i style="opacity:0.5">null</i>'
+  if (typeof v === 'string') return escapeHtml(v)
+  if (typeof v === 'number' || typeof v === 'boolean') return escapeHtml(String(v))
+  // object/array: 紧凑 + 缩进 2,UI 显示用 <pre> 保格式
+  try {
+    return `<pre style="margin:0;white-space:pre-wrap;font-family:var(--font-mono);font-size:12px;">${escapeHtml(JSON.stringify(v, null, 2))}</pre>`
+  } catch {
+    return escapeHtml(String(v))
+  }
+}
+
+function _shallowEq(a, b) {
+  if (a === b) return true
+  if (a === null || b === null || a === undefined || b === undefined) return false
+  if (typeof a !== 'object' || typeof b !== 'object') return false
+  try { return JSON.stringify(a) === JSON.stringify(b) } catch { return false }
+}
+
+function openAuditDiffModal(r) {
+  const before = (r.before && typeof r.before === 'object') ? r.before : {}
+  const after = (r.after && typeof r.after === 'object') ? r.after : {}
+  const keys = Array.from(new Set([...Object.keys(before), ...Object.keys(after)])).sort()
+
+  const rowsHtml = keys.length === 0
+    ? `<tr><td colspan="3" class="empty">无字段变更(audit 行 before/after 都为空)</td></tr>`
+    : keys.map((k) => {
+        const bv = before[k]
+        const av = after[k]
+        const changed = !_shallowEq(bv, av)
+        const cls = changed ? 'background:rgba(220,180,80,0.10);' : ''
+        return `<tr style="${cls}">
+          <td class="mono" style="vertical-align:top;font-weight:600">${escapeHtml(k)}</td>
+          <td style="vertical-align:top;max-width:360px;overflow:auto">${_formatJsonValue(bv)}</td>
+          <td style="vertical-align:top;max-width:360px;overflow:auto">${_formatJsonValue(av)}</td>
+        </tr>`
+      }).join('')
+
+  openModal(`
+    <h3>审计 diff · #${escapeHtml(r.id)}</h3>
+    <div style="display:grid;grid-template-columns:auto 1fr;gap:8px 16px;margin-bottom:var(--s-3);font-size:13px;">
+      <div style="opacity:0.7">action</div><div><span class="badge muted">${escapeHtml(r.action)}</span></div>
+      <div style="opacity:0.7">admin</div><div class="mono">#${escapeHtml(r.admin_id)}</div>
+      <div style="opacity:0.7">target</div><div class="mono">${escapeHtml(r.target || '—')}</div>
+      <div style="opacity:0.7">ip</div><div class="mono">${escapeHtml(r.ip || '—')}</div>
+      <div style="opacity:0.7">user_agent</div><div class="mono" style="word-break:break-all">${escapeHtml(r.user_agent || '—')}</div>
+      <div style="opacity:0.7">时间</div><div class="mono">${escapeHtml(fmtDate(r.created_at))}</div>
+    </div>
+    <table class="data" style="font-size:12px">
+      <thead><tr><th style="width:160px">字段</th><th>before</th><th>after</th></tr></thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>
+    <div class="form-actions"><button class="btn" id="a-diff-close">关闭</button></div>
+  `)
+  $('a-diff-close')?.addEventListener('click', closeModal)
 }
 
 // ─── Tab: Health(4L)──────────────────────────────────────────────

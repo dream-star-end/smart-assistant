@@ -10,7 +10,7 @@ import {
   renderMarkdown,
   renderStreamingMarkdown,
 } from './markdown.js'
-import { getSession, state } from './state.js'
+import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js'
 import { toast } from './ui.js'
 import { msgTimeLabel, shortTime } from './util.js'
 import { safeWsSend } from './websocket.js'
@@ -1298,7 +1298,8 @@ export function _buildMessageEl(msg) {
           toast('没有找到可重发的用户消息', 'error')
           return
         }
-        // Remove messages from this one onwards
+        // Remove messages from this one onwards (snapshot for restore on enqueue-full)
+        const _regenSnapshot = sess.messages.slice(idx)
         sess.messages.splice(idx)
         renderMessages()
         // Re-send via proper path: build payload with original media if present
@@ -1362,12 +1363,22 @@ export function _buildMessageEl(msg) {
           _showTypingIndicator()
           _setTitleBusy(true)
         } else {
-          // Offline / 已排队 / safeWsSend 背压 close:统统 requeue 保序
-          state.offlineQueue.push({
+          // Offline / 已排队 / safeWsSend 背压 close:统统 requeue 保序。
+          // P2-24 软上限 — 满了直接拒,提示用户。
+          const enqueued = tryEnqueueOffline({
             sessId: sess.id,
             payload: wsPayload,
             msgId: lastUserMsg.id,
           })
+          if (!enqueued) {
+            // P2-24 数据保护:enqueue 失败必须恢复 splice 掉的消息,否则 regen 操作
+            // 既没发出去、又把会话历史搞没了。restore 后跳过 _scheduleSaveFromUserEdit
+            // 避免把本次"恢复后的状态"再写入磁盘(等价于无操作,但显式更稳)。
+            sess.messages.push(..._regenSnapshot)
+            renderMessages()
+            toast(`离线缓冲已满 (${MAX_OFFLINE_QUEUE} 条),请恢复网络后重试`, 'danger')
+            return
+          }
           if (!state.ws || state.ws.readyState !== 1) {
             toast('离线排队中，重连后自动重新生成')
           }
