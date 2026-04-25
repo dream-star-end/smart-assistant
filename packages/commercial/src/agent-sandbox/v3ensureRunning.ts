@@ -281,7 +281,14 @@ export function makeV3EnsureRunning(
         });
         throw new ContainerUnreadyError(RETRY_AFTER_BASELINE_MISSING_SEC, "baseline_missing");
       }
-      // NameConflict(同 uid 并发 provision)/ IP 池满 都让前端短重试 — 不告警
+      // NameConflict(同 uid 并发 provision)/ IP 池满 都让前端短重试 — 不告警。
+      // 2026-04-25 v1.0.2:之前这里完全吞错,uid=28 12 分钟死循环里 0 条 stack 可查,
+      // 排障只能瞎猜。补 console.warn 落 /var/log/openclaude.log,行为不变,只加观测。
+      const errCode =
+        err instanceof SupervisorError ? err.code : (err as { code?: string } | null)?.code;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // eslint-disable-next-line no-console
+      console.warn("[v3ensureRunning] provision failed (catch-all)", { uid, errCode, errMsg });
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }
 

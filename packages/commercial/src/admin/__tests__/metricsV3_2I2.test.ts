@@ -17,6 +17,7 @@ import {
   incrAnthropicProxySettle,
   // 顺带验证老 helper 仍可用
   incrBillingDebit,
+  incrPrecheckCapped,
   observeAnthropicProxyStreamDuration,
   observeAnthropicProxyTtft,
   observeWsBridgeBuffered,
@@ -214,11 +215,15 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       observeWsBridgeSessionDuration('client_close', 10)
       // 顺带验证老 helper 也被 reset 影响
       incrBillingDebit('success')
+      // v1.0.3 新增 precheck cap 计数 — 同 reset 路径
+      incrPrecheckCapped('claude-sonnet-4-6-20260101')
 
       let text = await renderPrometheus({ override: { agentContainersRunning: 0 } })
       assert.ok(/anthropic_proxy_ttft_seconds_count/.test(text))
       assert.ok(/anthropic_proxy_settle_total\{kind="final"\}/.test(text))
       assert.ok(/billing_debit_total\{result="success"\}/.test(text))
+      // shortModel 应把日期后缀折掉
+      assert.ok(/precheck_capped_total\{model="claude-sonnet-4-6"\}/.test(text), text)
 
       resetMetricsForTest()
       text = await renderPrometheus({ override: { agentContainersRunning: 0 } })
@@ -226,8 +231,10 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       assert.ok(!/anthropic_proxy_ttft_seconds_count/.test(text), text)
       assert.ok(!/anthropic_proxy_settle_total\{/.test(text), text)
       assert.ok(!/billing_debit_total\{/.test(text), text)
+      assert.ok(!/precheck_capped_total\{/.test(text), text)
       // HELP 行还在
       assert.ok(/# HELP anthropic_proxy_ttft_seconds/.test(text))
+      assert.ok(/# HELP precheck_capped_total/.test(text))
     })
   })
 
@@ -239,6 +246,7 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       assert.ok(text.includes('# HELP billing_debit_total'))
       assert.ok(text.includes('# HELP claude_api_requests_total'))
       assert.ok(text.includes('# HELP admin_audit_write_failures_total'))
+      assert.ok(text.includes('# HELP precheck_capped_total'))
       // v3 2I-2 系列
       assert.ok(text.includes('# HELP anthropic_proxy_ttft_seconds'))
       assert.ok(text.includes('# HELP anthropic_proxy_stream_duration_seconds'))
@@ -254,8 +262,8 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       const helpCount = (text.match(/^# HELP /gm) ?? []).length
       assert.equal(
         helpCount,
-        12,
-        `HELP 行总数 = 12 (4 v1 counter + 6 v3 + 2 gauge), got ${helpCount}`,
+        13,
+        `HELP 行总数 = 13 (4 v1 counter + 6 v3 + 2 gauge + 1 v1.0.3 precheck_capped), got ${helpCount}`,
       )
     })
   })

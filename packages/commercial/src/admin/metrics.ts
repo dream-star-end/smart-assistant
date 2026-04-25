@@ -270,6 +270,19 @@ export const adminAuditWriteFailures = new Counter({
   labelNames: ["action"],
 });
 
+/**
+ * preCheck reservation 被 cap 到余额的次数(per model)。
+ *
+ * 2026-04-26 v1.0.3:preCheck 改为允许 drain-to-zero 后,余额 < 估算 cost
+ * 的请求会把 reservation cap 到 balance。这条 counter 让运维观察 cap 触发率,
+ * 间接反映"潜在 overage 暴露面"。
+ */
+export const precheckCappedTotal = new Counter({
+  name: "precheck_capped_total",
+  help: "Pre-check reservation was capped to user balance (drain-to-zero with finalize clamp safety net)",
+  labelNames: ["model"],
+});
+
 /** 便捷 incr helper —— 把 labels 去 undefined。 */
 export function incrGatewayRequest(route: string, method: string, status: number | string): void {
   gatewayRequests.inc({ route: normalizeRoute(route), method, status: String(status) });
@@ -289,6 +302,13 @@ export function incrClaudeApi(accountId: bigint | number | string | null, status
 
 export function incrAdminAuditWriteFailure(action: string): void {
   adminAuditWriteFailures.inc({ action });
+}
+
+/**
+ * preCheck cap 计数。caller 传原始 model 名,内部用 shortModel 归一化防 cardinality 爆。
+ */
+export function incrPrecheckCapped(model: string): void {
+  precheckCappedTotal.inc({ model: shortModel(model) });
 }
 
 // ─── V3 2I-2:anthropicProxy + userChatBridge 系列 ────────────────────
@@ -519,6 +539,7 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   billingDebits.render(out);
   claudeApiRequests.render(out);
   adminAuditWriteFailures.render(out);
+  precheckCappedTotal.render(out);
   // V3 2I-2 新增系列
   anthropicProxyTtft.render(out);
   anthropicProxyStreamDuration.render(out);
@@ -540,6 +561,7 @@ export function resetMetricsForTest(): void {
   billingDebits.reset();
   claudeApiRequests.reset();
   adminAuditWriteFailures.reset();
+  precheckCappedTotal.reset();
   // V3 2I-2
   anthropicProxyTtft.reset();
   anthropicProxyStreamDuration.reset();

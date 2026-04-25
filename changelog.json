@@ -1,4 +1,13 @@
 {
-  "currentVersion": "v1.0.2",
-  "releases": []
+  "currentVersion": "v1.0.3",
+  "releases": [
+    {
+      "version": "v1.0.3",
+      "date": "2026-04-26",
+      "title": "余额可以用到 0 — 注册赠送 ¥2 不再卡死",
+      "items": [
+        "修复:余额低于单次请求最坏估算时直接 402 INSUFFICIENT_CREDITS — 新用户拿到 ¥2 赠送积分却连一句『你好』都发不出。现在余额 > 0 就能发请求,真实费用按 token 据实扣费,余额自动用到 0。"
+      ]
+    }
+  ]
 }

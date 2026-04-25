@@ -85,6 +85,7 @@ import {
   incrAnthropicProxySettle,
   incrAnthropicProxyReject,
   incrBillingDebit,
+  incrPrecheckCapped,
   type ProxyRejectReason,
 } from "../admin/metrics.js";
 
@@ -1345,6 +1346,7 @@ export function makeAnthropicProxyHandler(
       try {
         // 走 preCheckWithCost(已知 maxCost,跳过 estimateMaxCost 重算)。
         // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
+        // 余额 < 估算 cost 时 cap 到 balance(drain-to-zero,详见 PRECHECK_OVERAGE_CEILING_CENTS)。
         pre = await preCheckWithCost(deps.preCheckRedis, {
           userId: uid,
           requestId,
@@ -1367,6 +1369,15 @@ export function makeAnthropicProxyHandler(
           return;
         }
         throw err;
+      }
+
+      if (pre.capped) {
+        incrPrecheckCapped(body.model);
+        userLog.info("precheck_capped", {
+          balance: pre.balance.toString(),
+          originalMaxCost: pre.originalMaxCost.toString(),
+          effectiveMaxCost: pre.maxCost.toString(),
+        });
       }
 
       // 7) 取账号 + (按需)刷 token
