@@ -6,7 +6,7 @@
 #   2. Compute TAG = v3-<UTC-YYYYMMDDTHHMMZ>-<sourceHash> (tag suffix reflects
 #      the pre-deploy source commit, NOT the tagged HEAD after version-bump).
 #   3. Pre-check changelog.json for exactly-one version:"PENDING" entry.
-#      0 entries → y/N prompt (or --no-changelog to skip). 2+ → abort.
+#      0 entries OK (semver mode), 1 finalize, 2+ abort. (--no-changelog noop.)
 #   4. Auto-bump cache-bust tokens (sw.js VERSION + ?v=XX) to source hash.
 #   5. Finalize changelog: replace PENDING → TAG, bump currentVersion.
 #   6. Stage + commit bump + changelog as `chore(deploy): v<TAG>`.
@@ -28,7 +28,7 @@
 #   scripts/deploy-v3.sh
 #   scripts/deploy-v3.sh --dry-run       # show what would happen, no writes
 #   scripts/deploy-v3.sh --no-commit     # bump versions but don't auto-commit
-#   scripts/deploy-v3.sh --no-changelog  # skip PENDING prompt when 0 entries
+#   scripts/deploy-v3.sh --no-changelog  # legacy no-op flag (kept for compat)
 #   scripts/deploy-v3.sh --force         # skip remote WS-count safety check
 #   scripts/deploy-v3.sh --rollback      # restore .prev.1/ (latest snapshot) + restart
 #   scripts/deploy-v3.sh --rollback=N    # restore .prev.N/ (N=1..5) + restart
@@ -249,44 +249,54 @@ if [[ $ROLLBACK_REQUESTED -eq 1 ]]; then
 fi
 
 HASH=$(git rev-parse --short HEAD)
-# TAG is computed once at the start and used for:
+# TAG is now driven by changelog.json `currentVersion` (semver vX.Y.Z), bumped
+# manually before deploy. Used for:
 #   - VERSION.json (written on remote; /version endpoint serves it)
-#   - changelog.json finalize (replaces PENDING markers)
+#   - changelog.json finalize (only when a stale PENDING entry exists)
 #   - deploy commit message
 #   - git tag at the end
-# NOTE: the <hash> suffix is the *source* hash at deploy start, NOT the HEAD
-# commit after the bump + changelog commit. Tag naming intentionally reflects
-# "what code base this deploy shipped from", not the synthetic bump commit.
+# Pre-2026-04-26 deploys used v3-<UTC>-<hash> auto-tags; those legacy git tags
+# remain in history. New flow: bump changelog.json `currentVersion` → run deploy
+# → script verifies semver + tag uniqueness (local + remote, fail-closed).
 BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-TAG="v3-$(date -u +%Y%m%dT%H%MZ)-$HASH"
+TAG=$(jq -r '.currentVersion' "$REPO_ROOT/changelog.json")
+if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "ERROR: changelog.json currentVersion '$TAG' is not semver vX.Y.Z" >&2
+  echo "       Bump changelog.json before deploy (e.g. v1.0.0 → v1.0.1)." >&2
+  exit 1
+fi
+# Local tag conflict — boss forgot to bump.
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+  echo "ERROR: local git tag $TAG already exists — bump changelog.json currentVersion before deploy" >&2
+  exit 1
+fi
+# Remote tag conflict — fail-closed: any non-2 status (network/auth/DNS) aborts,
+# so we never silently treat "lookup failed" as "tag does not exist".
+git fetch --tags origin >/dev/null 2>&1 || true  # best-effort sync; the explicit ls-remote below is authoritative
+LS_REMOTE_STATUS=0
+git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 || LS_REMOTE_STATUS=$?
+if [[ $LS_REMOTE_STATUS -eq 0 ]]; then
+  echo "ERROR: remote git tag $TAG already exists on origin — bump changelog.json currentVersion" >&2
+  exit 1
+elif [[ $LS_REMOTE_STATUS -ne 2 ]]; then
+  echo "ERROR: failed to check remote tags on origin (git ls-remote exit=$LS_REMOTE_STATUS); aborting" >&2
+  exit 1
+fi
 echo "=== deploy-v3 → tag $TAG  branch $BRANCH ==="
 
 # ── 1. Remote safety check ──
 remote_safety_check
 
 # ── 2. Changelog PENDING pre-check ──
-# Expect exactly one release entry with version:"PENDING". 0 → prompt (or skip
-# via --no-changelog); 2+ → abort (ambiguous which to finalize).
+# Semver mode (post 2026-04-26): boss bumps `currentVersion` + adds release
+# entry pre-deploy, so 0 PENDING is the normal case (no prompt, no abort).
+# 1 PENDING is still allowed (legacy / manual workflow) → finalize replaces
+# version="PENDING" with $TAG. 2+ remains ambiguous and aborts.
+# `--no-changelog` flag retained as a no-op for backward compat.
 PENDING_COUNT=$(bun "$REPO_ROOT/scripts/changelog-finalize.ts" --count)
 echo "-- changelog PENDING entries: $PENDING_COUNT --"
 case "$PENDING_COUNT" in
-  0)
-    if [[ $NO_CHANGELOG -eq 1 ]]; then
-      echo "   (--no-changelog, skipping prompt)"
-    elif [[ -t 0 ]]; then
-      read -r -p "   No PENDING entry in changelog.json. Continue anyway? [y/N] " reply
-      case "$reply" in
-        y|Y|yes|YES) echo "   proceeding without changelog update" ;;
-        *) echo "   aborted by user"; exit 1 ;;
-      esac
-    else
-      echo "ERROR: 0 PENDING entries and stdin is not a TTY." >&2
-      echo "       Either prepend a {version:\"PENDING\", ...} entry to changelog.json" >&2
-      echo "       or pass --no-changelog." >&2
-      exit 1
-    fi
-    ;;
-  1) : ;; # OK
+  0|1) : ;; # OK
   *)
     echo "ERROR: $PENDING_COUNT PENDING entries in changelog.json (expect 0 or 1)." >&2
     echo "       Collapse them into one before deploying." >&2

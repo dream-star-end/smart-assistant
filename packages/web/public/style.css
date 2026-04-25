@@ -4647,6 +4647,16 @@ a:hover {
 .topup-bonus {
   color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
 }
+/* 充值面板顶部的注册赠送营销 banner — 静态文案,与套餐列表区分开。 */
+.topup-bonus-banner {
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-3);
+  margin: 0 0 var(--space-3);
+  border-radius: var(--radius-sm, 6px);
+  background: color-mix(in srgb, var(--accent, #7c3aed) 12%, transparent);
+  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
+  border: 1px solid color-mix(in srgb, var(--accent, #7c3aed) 24%, transparent);
+}
 
 .topup-qr-wrap {
   display: flex;

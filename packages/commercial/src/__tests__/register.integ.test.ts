@@ -160,6 +160,29 @@ describe("auth.register (integ)", () => {
     assert.equal(u.rows[0].email_verified, false);
     assert.equal(u.rows[0].role, "user");
     assert.equal(u.rows[0].status, "active");
+
+    // 2026-04-26 注册赠送 ¥2 / 200 积分:users.credits = 200,credit_ledger 1 行
+    // (reason='promotion', balance_after=200)。账面与流水必须严格对齐。
+    const credRow = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id = $1",
+      [result.user_id],
+    );
+    assert.equal(credRow.rows[0].credits, "200", "新用户余额应为 200 积分");
+    const ledRows = await query<{
+      delta: string;
+      balance_after: string;
+      reason: string;
+      memo: string | null;
+    }>(
+      `SELECT delta::text AS delta, balance_after::text AS balance_after, reason, memo
+         FROM credit_ledger WHERE user_id = $1`,
+      [result.user_id],
+    );
+    assert.equal(ledRows.rows.length, 1, "应只有 1 条注册赠送 ledger 行");
+    assert.equal(ledRows.rows[0].delta, "200");
+    assert.equal(ledRows.rows[0].balance_after, "200");
+    assert.equal(ledRows.rows[0].reason, "promotion");
+    assert.match(ledRows.rows[0].memo ?? "", /注册赠送/);
     // password 真的被 argon2 哈希了
     assert.match(u.rows[0].password_hash, /^\$argon2id\$/);
     assert.equal(
@@ -250,6 +273,11 @@ describe("auth.register (integ)", () => {
       "SELECT COUNT(*)::text AS cnt FROM email_verifications",
     );
     assert.equal(ev.rows[0].cnt, "1", "second register must not leave dangling verification");
+    // 第二次注册因 23505 整事务回滚:不应多写 ledger 行 / 不应多送积分。
+    const ledCnt = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE reason = 'promotion'",
+    );
+    assert.equal(ledCnt.rows[0].cnt, "1", "second register must not double-credit");
   });
 
   test("weak password (<8 chars) → RegisterError code=VALIDATION, no DB writes", async (t) => {

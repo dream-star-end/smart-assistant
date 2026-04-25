@@ -67,9 +67,15 @@ if (arg === "--count") {
 }
 
 // Replace mode — arg is the TAG.
+// Accepts both legacy `v3-YYYYMMDDTHHMMZ-<hash>` and new semver `vX.Y.Z`
+// (post-2026-04-26 semver workflow; old tag format kept for any in-flight
+// rollback scripts that still pass the legacy shape).
 const TAG = arg;
-if (!/^v3-\d{8}T\d{4}Z-[0-9a-f]+$/.test(TAG)) {
-  die(`tag does not match expected format v3-YYYYMMDDTHHMMZ-<hash>: ${TAG}`, 2);
+if (
+  !/^v3-\d{8}T\d{4}Z-[0-9a-f]+$/.test(TAG) &&
+  !/^v\d+\.\d+\.\d+$/.test(TAG)
+) {
+  die(`tag does not match expected format vX.Y.Z or v3-YYYYMMDDTHHMMZ-<hash>: ${TAG}`, 2);
 }
 
 const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)

@@ -80,6 +80,20 @@ export class RegisterError extends Error {
  */
 export const VERIFY_EMAIL_TTL_SECONDS = 30 * 60;
 
+/**
+ * 新用户注册赠送积分(单位 = 分,1¥ = 100 积分)。
+ *
+ * 2026-04-26 boss 决策:每个新注册用户首登即送 ¥2 / 200 积分。同事务里 INSERT
+ * users(credits=200) + 写一条 reason='promotion' 的 ledger 行,保证账面与流水
+ * 一致(`users.credits = ledger.balance_after = 200`)。
+ *
+ * 直接走原生 SQL 而非 billing/credit() helper —— 后者自带 BEGIN/COMMIT,会从
+ * 当前 register tx 里逃出去;register 失败回滚就拿不回送出去的钱。
+ *
+ * 已注册用户不补送 —— admin 手动补,见 admin/accounts UI 的"调整积分"。
+ */
+export const SIGNUP_BONUS_CENTS = 200n;
+
 export interface RegisterDeps {
   mailer: Mailer;
   /** turnstile secret(env);bypass 模式可不传 */
@@ -180,12 +194,29 @@ export async function register(
   let userId: string;
   try {
     userId = await tx<string>(async (client) => {
-      // INSERT user;email UNIQUE 约束撞了会抛 23505
+      // INSERT user;email UNIQUE 约束撞了会抛 23505。credits 直接带上注册赠送
+      // 额(单条 INSERT 比 INSERT + UPDATE 少一次 round-trip,且新行不会被并发
+      // 修改,无锁竞争)。
       const ins = await client.query<{ id: string }>(
-        `INSERT INTO users(email, password_hash) VALUES ($1, $2) RETURNING id::text AS id`,
-        [input.email, passwordHash],
+        `INSERT INTO users(email, password_hash, credits)
+         VALUES ($1, $2, $3::bigint)
+         RETURNING id::text AS id`,
+        [input.email, passwordHash, SIGNUP_BONUS_CENTS.toString()],
       );
       const uid = ins.rows[0].id;
+      // 写一条赠送流水,保账面与流水一致(users.credits = balance_after)。
+      // 绕过 billing/credit() helper —— 那个函数自带 BEGIN/COMMIT,会跳出当前
+      // register tx,register 回滚时积分就发出去拿不回了。
+      await client.query(
+        `INSERT INTO credit_ledger(user_id, delta, balance_after, reason, memo)
+         VALUES ($1::bigint, $2::bigint, $3::bigint, 'promotion', $4)`,
+        [
+          uid,
+          SIGNUP_BONUS_CENTS.toString(),
+          SIGNUP_BONUS_CENTS.toString(),
+          "新用户注册赠送 ¥2",
+        ],
+      );
       await client.query(
         `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
          VALUES ($1, $2, 'verify_email', $3)`,
