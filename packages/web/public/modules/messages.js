@@ -1,4 +1,5 @@
 // OpenClaude — Message rendering and display
+import { _openTopupModal } from './billing.js?v=f06f8b1'
 import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
 import { getEffortForSubmit } from './effortMode.js'
 import { exportMessageDocx } from './export-docx.js'
@@ -1118,6 +1119,78 @@ export function _buildMessageEl(msg) {
       badge.className = 'cron-push-badge'
       badge.textContent = `📋 ${msg.cronLabel || '定时任务'}`
       el.appendChild(badge)
+    }
+    // P1-3: 服务端归类的可识别错误 (insufficient_credits / rate_limited /
+    // upstream_failed) 走独立的红色错误卡渲染,不走 markdown,也不要 regen/tts
+    // 等动作 — 这些在错误状态下没有意义。保留 copy/del 让用户可以复制错误文案
+    // 或清掉这条消息。
+    if (msg._errorCode) {
+      el.classList.add('msg-error-card')
+      const card = document.createElement('div')
+      card.className = 'msg-body msg-error'
+      card.dataset.errorCode = msg._errorCode
+      const title = document.createElement('div')
+      title.className = 'msg-error-title'
+      title.textContent = msg.text || '出错了'
+      card.appendChild(title)
+      if (msg._errorDetail) {
+        const det = document.createElement('details')
+        det.className = 'msg-error-detail'
+        const sum = document.createElement('summary')
+        sum.textContent = '查看详情'
+        det.appendChild(sum)
+        const pre = document.createElement('pre')
+        pre.textContent = String(msg._errorDetail)
+        det.appendChild(pre)
+        card.appendChild(det)
+      }
+      if (msg._errorCode === 'insufficient_credits') {
+        const cta = document.createElement('button')
+        cta.className = 'msg-error-cta'
+        cta.type = 'button'
+        cta.textContent = '去充值'
+        cta.addEventListener('click', () => {
+          try {
+            _openTopupModal()
+          } catch (e) {
+            toast('打开充值失败', 'error')
+            console.error('[msg-error-cta] _openTopupModal failed', e)
+          }
+        })
+        card.appendChild(cta)
+      }
+      el.appendChild(card)
+      const actErr = document.createElement('div')
+      actErr.className = 'msg-actions'
+      actErr.innerHTML =
+        '<button data-action="copy" title="复制"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>' +
+        '<button data-action="del" title="删除"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>'
+      actErr.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-action]')
+        if (!btn) return
+        const sess = getSession()
+        if (!sess) return
+        if (btn.dataset.action === 'copy') {
+          const raw = msg.text || ''
+          if (navigator.clipboard?.writeText) {
+            navigator.clipboard.writeText(raw).catch(() => fallbackCopy(raw))
+          } else fallbackCopy(raw)
+          toast('已复制', 'success')
+        } else if (btn.dataset.action === 'del') {
+          const i = sess.messages.findIndex((m) => m.id === msg.id)
+          if (i >= 0) {
+            sess.messages.splice(i, 1)
+            renderMessages()
+            _scheduleSaveFromUserEdit?.(sess)
+          }
+        }
+      })
+      el.appendChild(actErr)
+      const ts = document.createElement('div')
+      ts.className = 'msg-time'
+      ts.textContent = msgTimeLabel(msg.ts)
+      el.appendChild(ts)
+      return el
     }
     const body = document.createElement('div')
     body.className = 'msg-body'

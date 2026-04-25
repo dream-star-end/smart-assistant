@@ -1709,6 +1709,63 @@ a:hover {
 @media (hover: none) {
   .msg-actions { opacity: 1; }
 }
+/* P1-3: 服务端归类错误的红色错误卡 */
+.msg-body.msg-error {
+  border: 1px solid #fca5a5;
+  background: #fef2f2;
+  color: #991b1b;
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.msg-error-title {
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.msg-error-detail {
+  font-size: 12px;
+}
+.msg-error-detail summary {
+  cursor: pointer;
+  color: #b91c1c;
+  user-select: none;
+}
+.msg-error-detail pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  background: rgba(127, 29, 29, .06);
+  border-radius: 4px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+}
+.msg-error-cta {
+  align-self: flex-start;
+  background: #dc2626;
+  color: #fff;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.msg-error-cta:hover { background: #b91c1c; }
+@media (prefers-color-scheme: dark) {
+  .msg-body.msg-error {
+    background: rgba(220, 38, 38, .12);
+    border-color: rgba(252, 165, 165, .35);
+    color: #fecaca;
+  }
+  .msg-error-detail summary { color: #fca5a5; }
+  .msg-error-detail pre { background: rgba(252, 165, 165, .08); }
+}
 .msg.assistant .avatar {
   grid-column: 1;
   grid-row: 1;

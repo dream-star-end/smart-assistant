@@ -248,6 +248,35 @@ export const OutboundResumeFailed = Type.Object({
 export type OutboundResumeFailed = Static<typeof OutboundResumeFailed>
 
 // ───────────────────────────────────────────────
+// OutboundError — P1-3 流式错误专属帧。
+//
+// 双帧设计:此帧 isFinal=false(纯描述性 + 携带 code 给前端做 UX 分类),
+// 紧随其后的 outbound.message {[error] ...} isFinal=true 才是 turn 终止器。
+// 这样新客户端识别此帧渲染红色卡片 + CTA,同帧后的 [error] 文本被前端按
+// frameSeq 抑制不重复渲染;旧客户端忽略此帧 type,只看到末尾 [error] 文本
+// 文字气泡,降级 UX 但 turn 仍能正常关闭。
+// ───────────────────────────────────────────────
+export const OutboundError = Type.Object({
+  type: Type.Literal('outbound.error'),
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  /** 已识别错误分类。前端按 code 决定 UX(insufficient_credits → 给"去充值"CTA)。 */
+  code: Type.Union([
+    Type.Literal('insufficient_credits'),
+    Type.Literal('rate_limited'),
+    Type.Literal('upstream_failed'),
+  ]),
+  /** 简短人类文案,前端直接渲染。 */
+  message: Type.String(),
+  /** 折叠区显示的原始 error string,排查用。 */
+  detail: Type.Optional(Type.String()),
+  /** 故意 false:本帧不是 turn 终止器,后续紧跟一帧 outbound.message isFinal=true。 */
+  isFinal: Type.Literal(false),
+})
+export type OutboundError = Static<typeof OutboundError>
+
+// ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
 export const ControlListSessions = Type.Object({
@@ -271,6 +300,7 @@ export const AnyFrame = Type.Union([
   OutboundPermissionRequest,
   OutboundPermissionSettled,
   OutboundResumeFailed,
+  OutboundError,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>

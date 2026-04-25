@@ -517,7 +517,8 @@ function _onOrderPaid(orderData) {
 
 // ── 模态打开 / 关闭 ─────────────────────────────────────────────────
 
-function _openTopupModal() {
+// P1-3: 也由 messages.js 的 outbound.error CTA 调用,export 出去。
+export function _openTopupModal() {
   if (!_commercialMode) {
     toast('充值功能未启用', 'error')
     return

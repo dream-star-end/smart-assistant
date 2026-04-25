@@ -16,7 +16,8 @@ import { type IncomingMessage, type ServerResponse, createServer } from 'node:ht
 import { isIPv4 } from 'node:net'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
-import type { InboundFrame, InboundMessage, OutboundMessage } from '@openclaude/protocol'
+import type { InboundFrame, InboundMessage, OutboundError, OutboundMessage } from '@openclaude/protocol'
+import { classifyRunError } from './errorClassify.js'
 import {
   type AgentDef,
   type AgentsConfig,
@@ -4281,6 +4282,28 @@ export class Gateway {
         this._runLog.complete(_run, { status: 'failed', error: e.error })
         // Remove idempotency key on failure to allow client retry
         if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+        // P1-3 — 已识别错误(余额/限流/上游)发结构化 outbound.error 帧 + 紧跟
+        // 老的 [error] text bubble (turn 终止器,frameSeq 单调,新客户端按 seq
+        // 抑制重复气泡,旧客户端无视 outbound.error,只看到 [error] 文本降级 UX)。
+        const cls = classifyRunError(e.error)
+        if (cls.code !== 'unknown') {
+          // 注意:errFrame 必须含 _userId 才能让 deliver() 路由到正确 peerKey,
+          // 与 out 同源(out 已带 _userId 走过 dispatchInbound 全程)。
+          const errFrame: OutboundError & { _userId?: string } = {
+            type: 'outbound.error',
+            sessionKey: out.sessionKey,
+            channel: out.channel,
+            peer: out.peer,
+            code: cls.code,
+            message: cls.message,
+            detail: e.error,
+            isFinal: false,
+            ...(((out as OutboundMessage & { _userId?: string })._userId)
+              ? { _userId: (out as OutboundMessage & { _userId?: string })._userId }
+              : {}),
+          }
+          this.deliver(errFrame as unknown as OutboundMessage, adapter)
+        }
         this.deliver(
           {
             ...out,

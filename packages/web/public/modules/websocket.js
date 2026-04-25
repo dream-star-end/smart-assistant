@@ -11,7 +11,7 @@ import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance } from './billing.js?v=f06f8b1'
+import { refreshBalance, _openTopupModal } from './billing.js?v=f06f8b1'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -1053,6 +1053,7 @@ export function connect() {
     }
     try {
       if (f.type === 'outbound.message') handleOutbound(f)
+      else if (f.type === 'outbound.error') handleOutboundError(f)
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
@@ -1157,6 +1158,28 @@ export function handleOutbound(frame) {
       return // already processed — drop silently
     }
     sess._lastFrameSeq = frame.frameSeq
+  }
+  // P1-3 双帧抑制 — 后端在已识别 error 场景下连发两帧:
+  //   1) outbound.error (frameSeq=N, 走 handleOutboundError, 设置
+  //      sess._suppressErrorBubbleAtSeq = N+1)
+  //   2) outbound.message [error] text isFinal=true (frameSeq=N+1, 进入这里)
+  // 如果 frame.frameSeq 命中 sess._suppressErrorBubbleAtSeq 且是 [error] text isFinal,
+  // 跳过 addMessage(避免在红色 error card 之后再追一条丑陋的灰色文本气泡),但仍
+  // 走 isFinal 收尾(typing/replyTracker/empty-turn 检测)。flag 一次性,用后即清。
+  let _suppressLegacyErrorText = false
+  if (
+    sess._suppressErrorBubbleAtSeq !== undefined &&
+    typeof frame.frameSeq === 'number' &&
+    frame.frameSeq === sess._suppressErrorBubbleAtSeq &&
+    frame.isFinal &&
+    Array.isArray(frame.blocks) &&
+    frame.blocks.length === 1 &&
+    frame.blocks[0]?.kind === 'text' &&
+    typeof frame.blocks[0]?.text === 'string' &&
+    frame.blocks[0].text.startsWith('[error]')
+  ) {
+    _suppressLegacyErrorText = true
+    sess._suppressErrorBubbleAtSeq = undefined
   }
   if (!sess._blockIdToMsgId) {
     // Rebuild blockId→msgId and agentGroups mappings from restored messages (after page refresh)
@@ -1426,7 +1449,10 @@ export function handleOutbound(frame) {
   // Skip drain advancement for cron/heartbeat pushes (not real turn completions)
   const _isCronOrHeartbeat = !!frame.cronJob
 
-  for (const block of frame.blocks || []) {
+  // P1-3 — 已识别 error 双帧的第二帧 [error] text bubble 不渲染(被前序
+  // outbound.error 红色 card 替代),但 isFinal 收尾路径已经在上面跑过了。
+  const _blocksToRender = _suppressLegacyErrorText ? [] : (frame.blocks || [])
+  for (const block of _blocksToRender) {
     // Defensive: coerce block.text to string to prevent [object Object] rendering
     const blockText =
       typeof block.text === 'string'
@@ -1927,6 +1953,41 @@ function handleCostCharged(frame) {
   // 同步刷新左上角余额气泡 —— 服务端已写 DB,刷 /api/me 拿到的就是 balanceAfter。
   // 传了 balanceAfter 的就直接乐观更新,避开一次 round-trip。
   try { refreshBalance() } catch {}
+}
+
+// P1-3 — outbound.error 处理。
+// 后端在已识别错误(余额不足 / 限流 / 上游挂)场景双帧:本帧(isFinal=false,
+// frameSeq=N)+ 紧跟一帧 outbound.message [error] text isFinal=true(frameSeq=N+1)。
+// 本 handler 的责任:
+//   1) frameSeq dedupe(同 handleOutbound 语义,resume 重放时不重复渲染)
+//   2) 在 sess.messages 追加一条带 _errorCode flag 的 assistant 消息
+//      (renderer 在 messages.js:_buildMessageEl 内部按 _errorCode 渲染红色卡片
+//      + "去充值" CTA);
+//   3) 设置 sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1,让后续 [error]
+//      text isFinal 帧在 handleOutbound 内被识别并跳过 addMessage(只走 isFinal
+//      收尾路径);
+//   4) insufficient_credits 时主动 refreshBalance(让余额气泡立刻反映)。
+//
+// 故意不在这里关 typing / replyTracker —— 那些工作 handleOutbound 在 isFinal
+// 分支会做,本帧不是 turn 终止器。
+function handleOutboundError(frame) {
+  const peerId = frame.peer?.id
+  const sess = peerId ? state.sessions.get(peerId) : null
+  if (!sess) return
+  // frameSeq dedupe
+  if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
+    const last = sess._lastFrameSeq || 0
+    if (frame.frameSeq <= last) return
+    sess._lastFrameSeq = frame.frameSeq
+    sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1
+  }
+  addMessage(sess, 'assistant', frame.message || '出错了', {
+    _errorCode: frame.code,
+    _errorDetail: typeof frame.detail === 'string' ? frame.detail : '',
+  })
+  if (frame.code === 'insufficient_credits') {
+    try { refreshBalance() } catch {}
+  }
 }
 
 // ═══════════════ PERMISSION PROMPTS ═══════════════
