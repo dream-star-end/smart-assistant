@@ -51,6 +51,7 @@ async function startRig(opts: {
   resolve?: ResolveContainerEndpoint;
   maxPerUser?: number;
   maxFrameBytes?: number;
+  markContainerActivity?: (containerId: number) => void;
 } = {}): Promise<TestRig> {
   // 1) mock 容器 ws server
   const containerSeen: Array<{ data: string | Buffer; isBinary: boolean }> = [];
@@ -81,6 +82,7 @@ async function startRig(opts: {
     maxPerUser: opts.maxPerUser,
     maxFrameBytes: opts.maxFrameBytes,
     containerConnectTimeoutMs: 1500,
+    markContainerActivity: opts.markContainerActivity,
   });
 
   // 3) gateway HTTP server,只挂 bridge upgrade
@@ -462,6 +464,148 @@ describe("userChatBridge — upgrade path mismatch", () => {
     const head = Buffer.alloc(0);
     const handled = rig.bridge.handleUpgrade(req, sock, head);
     assert.equal(handled, false);
+    await stopRig(rig);
+  });
+});
+
+// ------- PR1:client→container 帧 debounced markContainerActivity -----------
+//
+// 防 idle sweep 误杀长 WS:bridge 在每帧 client→container 时刷 last_ws_activity,
+// 但 60s 内只刷一次。container→user 帧不算(防容器 chatty 输出把 idle 假装活跃)。
+// resolve 返 containerId === undefined → 整层逻辑跳过(测试/单测 mock 路径)。
+
+describe("userChatBridge — markContainerActivity (PR1 idle hibernate 前置)", () => {
+  test("30 条 client→container 帧 60s 内最多调 1 次 markActivity", async () => {
+    const seen: number[] = [];
+    // 注:startRig 内部用 `rig.resolveImpl` 闭包,但返回值是新对象——
+    // 在 startRig 之后修改返回值的 resolveImpl 不会改 bridge 里的 closure。
+    // 用 ref 对象延迟读 containerPort,并通过 opts.resolve 一次性传进去。
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 42,
+      }),
+      markContainerActivity: (cid) => { seen.push(cid); },
+    });
+    portRef.p = rig.containerPort;
+
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("500");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    await containerOpenP;
+
+    // 30 条文本帧 — 同步 send(测试单进程,Date.now() 不会跨过 60s)
+    for (let i = 0; i < 30; i++) {
+      ws.send(JSON.stringify({ type: "frame", n: i }));
+    }
+    // 让 bridge 处理完
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    assert.equal(seen.length, 1, `期待 debounce 后 == 1 次,实际 ${seen.length}`);
+    assert.equal(seen[0], 42, "containerId 应被透传给 markActivity");
+
+    ws.close();
+    await waitClose(ws);
+    await stopRig(rig);
+  });
+
+  test("container→user 帧不刷活动", async () => {
+    const seen: number[] = [];
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 99,
+      }),
+      markContainerActivity: (cid) => { seen.push(cid); },
+    });
+    portRef.p = rig.containerPort;
+
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("501");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    const containerWs = await containerOpenP;
+
+    // 容器主动 send 10 条 → user
+    const recvCount = new Promise<void>((resolve) => {
+      let n = 0;
+      ws.on("message", () => {
+        n += 1;
+        if (n >= 10) resolve();
+      });
+    });
+    for (let i = 0; i < 10; i++) {
+      containerWs.send(JSON.stringify({ type: "delta", i }));
+    }
+    await recvCount;
+
+    assert.equal(seen.length, 0,
+      "container→user 流量不应触发 markActivity(否则 chatty 容器假装 idle 用户活跃)");
+
+    ws.close();
+    await waitClose(ws);
+    await stopRig(rig);
+  });
+
+  test("resolve 返 containerId === undefined → 不调 markActivity", async () => {
+    const seen: number[] = [];
+    const rig = await startRig({
+      markContainerActivity: (cid) => { seen.push(cid); },
+    });
+    // 默认 resolve 不带 containerId — 验证降级路径
+
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("502");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    await containerOpenP;
+
+    for (let i = 0; i < 5; i++) {
+      ws.send(JSON.stringify({ ping: i }));
+    }
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    assert.equal(seen.length, 0,
+      "containerId undefined 时整层逻辑应跳过(向后兼容旧 resolve)");
+
+    ws.close();
+    await waitClose(ws);
+    await stopRig(rig);
+  });
+
+  test("markActivity throw → bridge 不挂(异常 swallow)", async () => {
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 7,
+      }),
+      markContainerActivity: () => { throw new Error("simulated db down"); },
+    });
+    portRef.p = rig.containerPort;
+
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("503");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    const containerWs = await containerOpenP;
+
+    // send 一帧触发 markActivity throw — bridge 应继续工作
+    const seenP = new Promise<{ data: Buffer | string; isBinary: boolean }>((r) => {
+      containerWs.once("message", (data, isBinary) => {
+        const buf = typeof data === "string" ? data
+          : Buffer.isBuffer(data) ? data : Buffer.concat(data as Buffer[]);
+        r({ data: buf, isBinary });
+      });
+    });
+    ws.send(JSON.stringify({ type: "hi" }));
+    const got = await seenP;
+    const txt = typeof got.data === "string" ? got.data : got.data.toString("utf8");
+    assert.deepEqual(JSON.parse(txt), { type: "hi" },
+      "markActivity throw 后 bridge 应仍能透传帧");
+
+    ws.close();
+    await waitClose(ws);
     await stopRig(rig);
   });
 });

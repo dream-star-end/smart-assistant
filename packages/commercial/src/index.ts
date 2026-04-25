@@ -67,6 +67,7 @@ import {
   preheatV3Image,
   startIdleSweepScheduler,
   startOrphanReconcileScheduler,
+  markV3ContainerActivity,
   startV3ContainerEventsWorker,
   startVolumeGcScheduler,
   type IdleSweepScheduler,
@@ -1003,7 +1004,7 @@ export async function registerCommercial(
     options.resolveContainerEndpoint
     ?? (v3Deps
       ? makeV3EnsureRunning(v3Deps)
-      : async (_uid: bigint): Promise<{ host: string; port: number }> => {
+      : async (_uid: bigint) => {
         throw new ContainerUnreadyError(5, "supervisor_not_wired");
       });
   // V3 2I-2:把 buffered_bytes / session_duration 接到 prometheus histogram。
@@ -1012,10 +1013,18 @@ export async function registerCommercial(
     onBufferedBytes: (_uid, side, bytes) => observeWsBridgeBuffered(side, bytes),
     onClose: (stats) => observeWsBridgeSessionDuration(stats.cause, stats.durationMs / 1000),
   };
+  // PR1:bridge 拿到 client→container 帧时刷 last_ws_activity(60s debounce)。
+  // 防 idle sweep 把"长 WS 单连但持续在用"的会话误判为 idle。fire-and-forget 包到
+  // 闭包里;markV3ContainerActivity 自身已 swallow 异常。无 v3Deps(单测 / mock)
+  // → 不注入,bridge 退化为 PR1 之前的行为(只 ensureRunning 刷一次)。
+  const markActivityForBridge = v3Deps
+    ? (cid: number) => { void markV3ContainerActivity(v3Deps!, cid); }
+    : undefined;
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     resolveContainerEndpoint,
     metrics: bridgeMetrics,
+    markContainerActivity: markActivityForBridge,
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),

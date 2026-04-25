@@ -169,10 +169,10 @@ function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerReadyOptio
 export function makeV3EnsureRunning(
   deps: V3SupervisorDeps,
   options: EnsureRunningOptions = {},
-): (uid: bigint) => Promise<{ host: string; port: number }> {
+): (uid: bigint) => Promise<{ host: string; port: number; containerId: number }> {
   const readinessOpts = buildReadinessOpts(options);
 
-  return async function ensureRunning(uidBig: bigint): Promise<{ host: string; port: number }> {
+  return async function ensureRunning(uidBig: bigint): Promise<{ host: string; port: number; containerId: number }> {
     // bigint → number,显式 guard(>2^53 不会发生,MVP 用户量 < 1k,但守住)
     if (uidBig <= 0n || uidBig > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new ContainerUnreadyError(60, "invalid_uid");
@@ -202,7 +202,7 @@ export function makeV3EnsureRunning(
       // 3F: 用户重连即视作活跃 — 刷新 last_ws_activity,推迟 idle sweep。
       // 不 await 失败、也不阻塞 caller(markV3ContainerActivity 自吞错)。
       void markV3ContainerActivity(deps, status.containerId);
-      return { host: status.boundIp, port: status.port };
+      return { host: status.boundIp, port: status.port, containerId: status.containerId };
     }
 
     // 2b) stopped(active 行 + container_internal_id 已写但容器没 Running)
@@ -300,7 +300,7 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "starting");
     }
 
-    return { host: provisioned.boundIp, port: provisioned.port };
+    return { host: provisioned.boundIp, port: provisioned.port, containerId: provisioned.containerId };
   };
 }
 

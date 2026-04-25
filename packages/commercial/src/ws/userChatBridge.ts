@@ -104,7 +104,16 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 60_000;
  */
 export type ResolveContainerEndpoint = (
   uid: bigint,
-) => Promise<{ host: string; port: number }>;
+) => Promise<{
+  host: string;
+  port: number;
+  /**
+   * agent_containers.id —— 用于 bridge 调用 markContainerActivity 刷
+   * last_ws_activity 防 idle sweep 误杀长会话。可选:测试 / 单测 mock 不需要;
+   * v3 supervisor 路径会填上。缺失时 bridge 不发活动信号(语义降级)。
+   */
+  containerId?: number;
+}>;
 
 /**
  * 容器未就绪(provision 中 / 迁移中 / 临时不可达)。
@@ -188,7 +197,25 @@ export interface UserChatBridgeDeps {
    * 默认实现:`new WebSocket(\`ws://${host}:${port}/ws\`)`
    */
   createContainerSocket?: (host: string, port: number, signal: AbortSignal) => WebSocket;
+  /**
+   * 可选:每收到一帧 client→container 消息时调用,用于刷 last_ws_activity。
+   *
+   * bridge 内部做了 60s debounce(常量 `ACTIVITY_REFRESH_INTERVAL_MS`),所以 caller
+   * 不必再做节流。container→user 帧、ping/pong、心跳**都不刷**(防 chatty 输出
+   * 把 idle 假装成活跃)。markContainerActivity 自身要 fire-and-forget(不阻塞 bridge),
+   * 异常也要 swallow,典型实现包 `void markV3ContainerActivity(deps, cid)`。
+   *
+   * 没注入 / endpoint 没返 containerId → bridge 直接跳过这层逻辑(等价空实现)。
+   */
+  markContainerActivity?: (containerId: number) => void;
 }
+
+/**
+ * 单连每 N ms 最多调一次 markContainerActivity —— 防 chatty 用户每帧都冲 DB。
+ * 60s 与 idle sweep 默认 30min cutoff 之间留够余量(用户哪怕 60s 才发一帧
+ * 也不会被误判 idle)。
+ */
+const ACTIVITY_REFRESH_INTERVAL_MS = 60_000;
 
 export interface UserChatBridgeHandler {
   /** Gateway HTTP server 的 'upgrade' 事件入口。返 false → 路径不匹配,gateway 路由别处。 */
@@ -402,7 +429,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
 
         // 2) 解析容器端点(ensureRunning)
-        let endpoint: { host: string; port: number };
+        let endpoint: { host: string; port: number; containerId?: number };
         try {
           endpoint = await deps.resolveContainerEndpoint(uid);
         } catch (err) {
@@ -437,7 +464,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return;
         }
 
-        startBridge(ws, uid, endpoint, pendingMessages);
+        startBridge(ws, uid, endpoint, pendingMessages, endpoint.containerId);
       })().catch((err: unknown) => {
         log?.error("user-chat-bridge: upgrade pipeline threw", { err });
         try { ws.close(CLOSE_BRIDGE.INTERNAL, "internal error"); } catch { /* */ }
@@ -451,9 +478,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     uid: bigint,
     endpoint: { host: string; port: number },
     earlyMessages: Array<{ data: RawData; isBinary: boolean }>,
+    /**
+     * 可选 agent_containers.id。来自 ResolveContainerEndpoint;v3 supervisor
+     * 路径填,test mock 路径可不填。无值或 deps.markContainerActivity 未注入
+     * → 不刷活动(等价于回到本 PR 之前的行为,只在 ensureRunning 刷一次)。
+     */
+    containerId?: number,
   ): void {
     const connId = randomUUID();
     const startedAt = Date.now();
+    // PR1:debounced last_ws_activity 刷新窗口。
+    // 初始化为 0 → 第一帧 client→container 一定刷一次。
+    // ensureRunning 虽然也刷,但是 fire-and-forget(可能静默失败);bridge 自己再
+    // 刷一次更稳妥,代价只是握手后多一次 UPDATE,可接受。
+    let lastActivityRefreshAt = 0;
+    const markActivity = deps.markContainerActivity;
     let bytesUC = 0;
     let bytesCU = 0;
     let bufferedUC = 0; // user → container 待发字节
@@ -526,6 +565,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
         cleanup();
         return;
+      }
+      // PR1:client→container 帧才刷活动(container→user 输出 / ping/pong 不算)。
+      // 60s debounce 已在 lastActivityRefreshAt 比较里。markActivity 必须 fire-and-forget。
+      if (markActivity && containerId !== undefined) {
+        const now = Date.now();
+        if (now - lastActivityRefreshAt >= ACTIVITY_REFRESH_INTERVAL_MS) {
+          lastActivityRefreshAt = now;
+          try { markActivity(containerId); } catch { /* swallow — bridge 不挂 */ }
+        }
       }
       if (containerWs.readyState !== WebSocket.OPEN) {
         // 容器还没 OPEN(早到帧场景);ws.send 在 CONNECTING 状态下抛
