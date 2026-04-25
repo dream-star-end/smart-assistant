@@ -41,7 +41,7 @@ echo "[1/6] install /usr/local/bin/health-smoke-v3.sh (0755)"
 install -m 0755 -o root -g root "$SMOKE_SRC" /usr/local/bin/health-smoke-v3.sh
 
 echo "[2/6] install /usr/local/bin/health-smoke-v3-runner.sh (0700)"
-# 0700: runner reads DATABASE_URL line via grep on /root/.openclaude/.env;
+# 0700: runner reads DATABASE_URL line via grep on /etc/openclaude/commercial.env;
 # it doesn't itself contain secrets, but tighter perms = fewer surprises.
 install -m 0700 -o root -g root "$RUNNER_SRC" /usr/local/bin/health-smoke-v3-runner.sh
 

@@ -38,8 +38,8 @@ log() {
 dispatch_alert() {
   # Read DATABASE_URL line only (avoid sourcing whole .env into env).
   local dburl
-  dburl=$(grep -E '^DATABASE_URL=' /root/.openclaude/.env 2>/dev/null | head -1 | cut -d= -f2-) || {
-    log "WARN: cannot read DATABASE_URL from /root/.openclaude/.env"
+  dburl=$(grep -E '^DATABASE_URL=' /etc/openclaude/commercial.env 2>/dev/null | head -1 | cut -d= -f2-) || {
+    log "WARN: cannot read DATABASE_URL from /etc/openclaude/commercial.env"
     return 1
   }
   # Strip surrounding double quotes if present.

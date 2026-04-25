@@ -21,11 +21,11 @@ Nice=10
 IOSchedulingClass=idle
 
 # Hardening
+# runner 需要读 /etc/openclaude/commercial.env 的 DATABASE_URL 行.
+# /etc 在 ProtectSystem=strict 下默认只读, 不需要额外 ReadOnlyPaths. /root
+# 不会被读, 所以 ProtectHome=true 可以保留(比 read-only 更严).
 ProtectSystem=strict
-# read-only (不是 true) — runner 需要读 /root/.openclaude/.env 的 DATABASE_URL 行.
-# ProtectHome=true 会把 /root 标 InaccessiblePaths, ReadOnlyPaths 不能在它下面
-# 重新开洞 (Codex M8.2 BLOCKING 修复). read-only 仍然防写, 安全收益保留.
-ProtectHome=read-only
+ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
