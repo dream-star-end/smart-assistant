@@ -22,6 +22,13 @@ import { query } from "../db/queries.js";
 
 // ─── Row types ─────────────────────────────────────────────────────
 
+/**
+ * orders.status 白名单(M8.4 — 提到模块层共享给 list / CSV / 任何 runtime 校验)。
+ * 与 0003_init_payment.sql CHECK 一致。
+ */
+export const ORDER_STATUSES = ["pending", "paid", "expired", "refunded", "canceled"] as const;
+export type OrderStatus = (typeof ORDER_STATUSES)[number];
+
 export interface OrderRowView {
   id: string;
   order_no: string;
@@ -31,7 +38,7 @@ export interface OrderRowView {
   provider_order: string | null;
   amount_cents: string;
   credits: string;
-  status: "pending" | "paid" | "expired" | "refunded" | "canceled";
+  status: OrderStatus;
   paid_at: Date | null;
   expires_at: Date;
   created_at: Date;
@@ -71,7 +78,7 @@ const ORDER_DETAIL_COLS = `
 // ─── List ──────────────────────────────────────────────────────────
 
 export interface ListOrdersInput {
-  status?: OrderRowView["status"];
+  status?: OrderStatus;
   user_id?: string;
   // ISO timestamps for range filter on created_at
   from?: string;
@@ -207,4 +214,118 @@ export async function getOrdersKpi(): Promise<OrdersKpiView> {
     paid_24h_count: Number(paid.rows[0].n),
     paid_24h_amount_cents: paid.rows[0].amt,
   };
+}
+
+// ─── CSV 导出(M8.4 / P2-20)──────────────────────────────────────
+//
+// 与 admin/ledger.ts::buildLedgerCsv 同型:LIMIT ORDERS_CSV_MAX_ROWS 一次拉到内存,
+// 不做 cursor / limit。CSV 注入防护走 ./csvHelper.ts。
+//
+// 列选择:不导 callback_payload(体积大且含上游回调原文,泄漏价值不对等)。
+
+import { csvEscapeCell } from "./csvHelper.js";
+
+/** 单次 CSV 最大行数(50k * ~200B ≈ 10MB,内存可接受)。 */
+export const ORDERS_CSV_MAX_ROWS = 50000;
+
+const ORDERS_CSV_HEADER = [
+  "id",
+  "order_no",
+  "user_id",
+  "username",
+  "provider",
+  "provider_order",
+  "amount_cents",
+  "credits_cents",
+  "status",
+  "paid_at",
+  "expires_at",
+  "created_at",
+];
+
+export interface BuildOrdersCsvInput {
+  status?: OrderStatus;
+  user_id?: string;
+  /** ISO timestamp on created_at */
+  from?: string;
+  /** ISO timestamp on created_at */
+  to?: string;
+}
+
+export interface BuildOrdersCsvResult {
+  csv: string;
+  rowCount: number;
+}
+
+/** 抛 RangeError("invalid_X") 由 caller 翻 400(与 ledger.ts 模式一致)。 */
+function buildOrdersCsvWhere(input: BuildOrdersCsvInput): { where: string[]; params: unknown[] } {
+  const where: string[] = [];
+  const params: unknown[] = [];
+
+  if (input.status !== undefined) {
+    if (!(ORDER_STATUSES as readonly string[]).includes(input.status)) {
+      throw new RangeError("invalid_status");
+    }
+    params.push(input.status);
+    where.push(`o.status = $${params.length}`);
+  }
+  if (input.user_id !== undefined) {
+    // 与 users.ts::isValidBigintString 一致:正则 + BigInt 上界(防 22003 numeric_value_out_of_range)
+    if (!/^[1-9][0-9]{0,19}$/.test(input.user_id)) throw new RangeError("invalid_user_id");
+    try {
+      if (BigInt(input.user_id) > 9223372036854775807n) throw new RangeError("invalid_user_id");
+    } catch {
+      throw new RangeError("invalid_user_id");
+    }
+    params.push(input.user_id);
+    where.push(`o.user_id = $${params.length}::bigint`);
+  }
+  if (input.from !== undefined) {
+    if (!Number.isFinite(Date.parse(input.from))) throw new RangeError("invalid_from");
+    params.push(input.from);
+    where.push(`o.created_at >= $${params.length}::timestamptz`);
+  }
+  if (input.to !== undefined) {
+    if (!Number.isFinite(Date.parse(input.to))) throw new RangeError("invalid_to");
+    params.push(input.to);
+    where.push(`o.created_at <= $${params.length}::timestamptz`);
+  }
+  return { where, params };
+}
+
+export async function buildOrdersCsv(input: BuildOrdersCsvInput = {}): Promise<BuildOrdersCsvResult> {
+  const { where, params } = buildOrdersCsvWhere(input);
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  params.push(ORDERS_CSV_MAX_ROWS);
+  const r = await query<OrderRowView>(
+    `SELECT ${ORDER_LIST_COLS}
+       FROM orders o
+       LEFT JOIN users u ON u.id = o.user_id
+       ${whereClause}
+       ORDER BY o.created_at DESC, o.id DESC
+       LIMIT $${params.length}`,
+    params,
+  );
+  const lines: string[] = [ORDERS_CSV_HEADER.join(",")];
+  for (const row of r.rows) {
+    lines.push(
+      [
+        row.id,
+        row.order_no,
+        row.user_id,
+        row.username,
+        row.provider,
+        row.provider_order,
+        row.amount_cents,
+        row.credits, // credits 列在 schema 是 bigint cents → CSV 列名 credits_cents
+        row.status,
+        row.paid_at instanceof Date ? row.paid_at.toISOString() : row.paid_at,
+        row.expires_at instanceof Date ? row.expires_at.toISOString() : row.expires_at,
+        row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+      ]
+        .map(csvEscapeCell)
+        .join(","),
+    );
+  }
+  return { csv: `${lines.join("\r\n")}\r\n`, rowCount: r.rows.length };
 }

@@ -24,6 +24,7 @@ import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
 import { safeEnqueueAlert } from "./alertOutbox.js";
 import { EVENTS } from "./alertEvents.js";
+import { csvEscapeCell } from "./csvHelper.js";
 
 export const USER_STATUSES = ["active", "banned", "deleting", "deleted"] as const;
 export type UserStatus = (typeof USER_STATUSES)[number];
@@ -393,4 +394,68 @@ export async function patchUser(
 
     return a;
   });
+}
+
+// ─── CSV 导出(M8.4 / P2-20)──────────────────────────────────────
+//
+// 同型 buildLedgerCsv:LIMIT USERS_CSV_MAX_ROWS 一次拉到内存。复用 buildUsersWhere
+// 保留与 list 一致的 q/status 语义。**不导**:password_hash(密钥)/ avatar_url
+// (体积)/ deleted_at(status='deleted' 已表达)。
+
+/** 单次 CSV 最大行数(50k * ~200B ≈ 10MB)。 */
+export const USERS_CSV_MAX_ROWS = 50000;
+
+const USERS_CSV_HEADER = [
+  "id",
+  "email",
+  "email_verified",
+  "display_name",
+  "role",
+  "status",
+  "credits_cents",
+  "created_at",
+  "updated_at",
+];
+
+export interface BuildUsersCsvInput {
+  q?: string;
+  status?: UserStatus | UserStatus[];
+}
+
+export interface BuildUsersCsvResult {
+  csv: string;
+  rowCount: number;
+}
+
+export async function buildUsersCsv(input: BuildUsersCsvInput = {}): Promise<BuildUsersCsvResult> {
+  // buildUsersWhere 复用 list 的语义:q ILIKE / status whitelist。
+  // 不传 cursor — CSV 永远从最新到最旧,USERS_CSV_MAX_ROWS 行硬上限。
+  const { where, params } = buildUsersWhere({ q: input.q, status: input.status });
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  params.push(USERS_CSV_MAX_ROWS);
+  const r = await query<AdminUserRowView>(
+    `SELECT ${USER_COLUMNS} FROM users ${whereClause}
+     ORDER BY id DESC
+     LIMIT $${params.length}`,
+    params,
+  );
+  const lines: string[] = [USERS_CSV_HEADER.join(",")];
+  for (const row of r.rows) {
+    lines.push(
+      [
+        row.id,
+        row.email,
+        row.email_verified ? "true" : "false",
+        row.display_name,
+        row.role,
+        row.status,
+        row.credits, // schema 字段 credits 是 bigint cents → CSV 列名 credits_cents
+        row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+        row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+      ]
+        .map(csvEscapeCell)
+        .join(","),
+    );
+  }
+  return { csv: `${lines.join("\r\n")}\r\n`, rowCount: r.rows.length };
 }

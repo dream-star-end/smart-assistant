@@ -25,10 +25,12 @@ import {
   listUsersWithStats,
   getUser,
   patchUser,
+  buildUsersCsv,
   UserNotFoundError,
   type PatchUserInput,
   type AdminUserRowView,
   type AdminUserWithStatsRowView,
+  type UserStatus,
   USER_STATUSES,
   USER_ROLES,
 } from "../admin/users.js";
@@ -119,10 +121,14 @@ import {
   listOrders,
   getOrderDetail,
   getOrdersKpi,
+  buildOrdersCsv,
+  ORDER_STATUSES,
   type OrderRowView,
   type OrderDetailView,
   type OrdersKpiView,
+  type OrderStatus,
 } from "../admin/orders.js";
+import { csvFilename } from "../admin/csvHelper.js";
 import {
   listFeedback,
   ackFeedback,
@@ -1390,6 +1396,139 @@ export async function handleAdminExportLedgerCsv(
   res.end(csv);
 }
 
+// ─── GET /api/admin/users.csv?q&status (M8.4 / P2-20) ──────────────
+//
+// 写路由级保护:requireAdminVerifyDb + admin_audit('users.export_csv')。
+// 内存构建,审计先于 writeHead — 失败抛 → 不下发 body。
+
+export async function handleAdminExportUsersCsv(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+
+  const qRaw = sp.get("q");
+  const q = qRaw === null || qRaw === "" ? undefined : qRaw;
+
+  // status 参数:repeat ?status=active&status=banned 或单值;统一传给 buildUsersCsv。
+  const statusList = sp.getAll("status").filter(Boolean);
+  for (const s of statusList) {
+    if (!(USER_STATUSES as readonly string[]).includes(s)) {
+      throw new HttpError(400, "VALIDATION", `invalid status: ${s}`, {
+        issues: [{ path: "status", message: s }],
+      });
+    }
+  }
+  const status: UserStatus | UserStatus[] | undefined =
+    statusList.length === 0
+      ? undefined
+      : statusList.length === 1
+        ? (statusList[0] as UserStatus)
+        : (statusList as UserStatus[]);
+
+  let csv: string;
+  let rowCount: number;
+  try {
+    const r = await buildUsersCsv({ q, status });
+    csv = r.csv;
+    rowCount = r.rowCount;
+  } catch (err) {
+    translateRangeError(err);
+  }
+
+  await tx(async (client) => {
+    await writeAdminAudit(client, {
+      adminId: admin.id,
+      action: "users.export_csv",
+      target: q ? `q:${q}` : "all",
+      after: {
+        rows: rowCount,
+        filter: { q: q ?? null, status: status ?? null },
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+  });
+
+  const filename = csvFilename("users");
+  res.writeHead(200, {
+    "Content-Type": "text/csv; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${filename}"`,
+    "Content-Length": Buffer.byteLength(csv, "utf-8"),
+    "Cache-Control": "no-store",
+  });
+  res.end(csv);
+}
+
+// ─── GET /api/admin/orders.csv?status&user_id&from&to (M8.4) ───────
+
+export async function handleAdminExportOrdersCsv(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+
+  const statusRaw = sp.get("status");
+  let status: OrderStatus | undefined;
+  if (statusRaw !== null && statusRaw !== "") {
+    if (!(ORDER_STATUSES as readonly string[]).includes(statusRaw)) {
+      throw new HttpError(400, "VALIDATION", "invalid status", {
+        issues: [{ path: "status", message: statusRaw }],
+      });
+    }
+    status = statusRaw as OrderStatus;
+  }
+  const userId = parseUserId(sp.get("user_id"));
+  const from = parseIsoTimestamp(sp.get("from"), "from");
+  const to = parseIsoTimestamp(sp.get("to"), "to");
+
+  let csv: string;
+  let rowCount: number;
+  try {
+    const r = await buildOrdersCsv({ status, user_id: userId, from, to });
+    csv = r.csv;
+    rowCount = r.rowCount;
+  } catch (err) {
+    translateRangeError(err);
+  }
+
+  await tx(async (client) => {
+    await writeAdminAudit(client, {
+      adminId: admin.id,
+      action: "orders.export_csv",
+      target: userId ? `user:${userId}` : status ? `status:${status}` : "all",
+      after: {
+        rows: rowCount,
+        filter: {
+          status: status ?? null,
+          user_id: userId ?? null,
+          from: from ?? null,
+          to: to ?? null,
+        },
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+  });
+
+  const filename = csvFilename("orders");
+  res.writeHead(200, {
+    "Content-Type": "text/csv; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${filename}"`,
+    "Content-Length": Buffer.byteLength(csv, "utf-8"),
+    "Cache-Control": "no-store",
+  });
+  res.end(csv);
+}
+
 // ─── metrics(T-62)──────────────────────────────────────────────────
 
 /**
@@ -1575,8 +1714,6 @@ export async function handleAdminPutSetting(
 // ─── /api/admin/orders (P0-3 订单管理) ────────────────────────────
 
 const ORDERS_MAX_LIMIT = 200;
-const ORDER_STATUSES = ["pending", "paid", "expired", "refunded", "canceled"] as const;
-type OrderStatus = (typeof ORDER_STATUSES)[number];
 
 function parseOrderStatus(raw: string | null): OrderStatus | undefined {
   if (raw === null || raw === "") return undefined;

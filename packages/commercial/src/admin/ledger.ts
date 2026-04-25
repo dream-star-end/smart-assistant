@@ -18,6 +18,7 @@
  */
 
 import { query } from "../db/queries.js";
+import { csvEscapeCell } from "./csvHelper.js";
 
 export const LEDGER_REASONS = [
   "topup",
@@ -133,19 +134,8 @@ export async function listLedger(input: ListLedgerInput = {}): Promise<ListLedge
 }
 
 // ─── CSV 导出(P1-5)──────────────────────────────────────────────
-
-/**
- * Excel/Sheets 公式注入:单元格以 `=`/`+`/`-`/`@`/\t/\r 起首会被当公式解析。
- * 加 `'` 前缀让 Excel 当文本(`'` 不显示但终止公式 parse)。
- * RFC 4180 quote 用 `"` 包裹 + 内部 `"` 转 `""`。换行 / `,` / `"` 触发 quote。
- */
-function csvEscapeCell(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  let s = typeof v === "string" ? v : String(v);
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-  if (/[",\r\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
+//
+// csvEscapeCell 已抽到 ./csvHelper.ts(M8.4),与 users.csv / orders.csv 共用。
 
 const CSV_HEADER = [
   "id",

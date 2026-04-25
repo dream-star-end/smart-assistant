@@ -87,6 +87,8 @@ import {
   handleAdminAgentContainerAction,
   handleAdminListLedger,
   handleAdminExportLedgerCsv,
+  handleAdminExportUsersCsv,
+  handleAdminExportOrdersCsv,
   handleAdminMetrics,
   handleAdminListSettings,
   handleAdminGetSetting,
@@ -103,6 +105,7 @@ import {
   handleAdminStatsRequestSeries,
   handleAdminStatsAlertsSummary,
   handleAdminStatsAccountPool,
+  handleAdminDiagnostics,
 } from './adminStats.js'
 import {
   handleAdminListComputeHosts,
@@ -474,6 +477,10 @@ export function createCommercialHandler(
     // 两条 exact 互不干扰,顺序无关。
     { method: 'GET', path: '/api/admin/ledger.csv', handler: handleAdminExportLedgerCsv },
     { method: 'GET', path: '/api/admin/ledger', handler: handleAdminListLedger },
+    // M8.4 / P2-20 超管 CSV 导出 + 诊断 endpoint(三处都写 admin_audit)
+    { method: 'GET', path: '/api/admin/users.csv', handler: handleAdminExportUsersCsv },
+    { method: 'GET', path: '/api/admin/orders.csv', handler: handleAdminExportOrdersCsv },
+    { method: 'GET', path: '/api/admin/diagnostics', handler: handleAdminDiagnostics },
     // T-62 Prometheus 指标
     { method: 'GET', path: '/api/admin/metrics', handler: handleAdminMetrics },
     // T-60 R1 Dashboard 聚合(只读,requireAdmin JWT only)
