@@ -103,19 +103,19 @@ import {
   mintSessionCookie,
   setMode as setAuthMode,
   onLoginSuccess as setAuthSuccessHandler,
-} from './auth.js?v=741be20'
-// ?v=741be20 bust: websocket.js now imports billing.js for refreshBalance() after
+} from './auth.js?v=dc73c59'
+// ?v=dc73c59 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=741be20'
-import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=741be20'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=dc73c59'
+import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=dc73c59'
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { initUsageStats, openUsageModal } from './usageStats.js?v=741be20'
-import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=741be20'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=dc73c59'
+import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=dc73c59'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -136,7 +136,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=741be20' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=dc73c59' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
@@ -225,7 +225,7 @@ import {
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
-// deploy where main.js?v=741be20 imports a bare-URL state.js that CF still serves
+// deploy where main.js?v=dc73c59 imports a bare-URL state.js that CF still serves
 // old), this line is never reached → watchdog fires at T+15s and self-heals.
 window.__ocBooted = true
 
