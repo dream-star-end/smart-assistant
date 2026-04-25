@@ -2,7 +2,7 @@
 import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=fe41e18'
+import { clearSessionCookie } from './auth.js?v=151d5fd'
 import { dbPut } from './db.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
@@ -11,7 +11,7 @@ import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance, _openTopupModal } from './billing.js?v=fe41e18'
+import { refreshBalance, _openTopupModal } from './billing.js?v=151d5fd'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -998,8 +998,33 @@ export function connect() {
       setStatus('离线', 'disconnected')
       return
     }
-    const delay = Math.min(2000 * Math.pow(2, _reconnectAttempts), 30000) + Math.random() * 1000
-    _reconnectAttempts++
+    // 2026-04-25 v1.0.2:bridge close(4503 CONTAINER_UNREADY)/4504 (MAINTENANCE)
+    // 时把 reason 编码成 JSON `{retryAfterSec, reason}`(userChatBridge.ts
+    // encode4503Reason)。之前前端只 log 不读 → server 让 5s 重试,client 走
+    // 2/4/8/16/30s 指数 backoff,节奏完全错开,12 分钟死循环里用户看到的就是
+    // "已断线 / X 秒后重连" 不停闪。
+    //
+    // 解析失败 / 没有 hint / 其它 close code → 仍走原指数 backoff,完全保持兼容。
+    // 1008 在上面已 return,这里不会走到;无需特判。
+    let serverHintedDelay = 0
+    if ((e.code === 4503 || e.code === 4504) && typeof e.reason === 'string' && e.reason.length > 0) {
+      try {
+        const parsed = JSON.parse(e.reason)
+        const sec = parsed?.retryAfterSec
+        if (Number.isFinite(sec) && sec > 0) {
+          // clamp 1s 防风暴下限,60s 防永久卡死(maintenance 当前 hint 60s,不会被砍)
+          const clamped = Math.min(Math.max(sec * 1000, 1000), 60_000)
+          // jitter 比纯 backoff 的 1000ms 短 —— server 已主动节流,无需大抖动
+          serverHintedDelay = clamped + Math.random() * 500
+        }
+      } catch { /* 不是 JSON / 非法格式 → 走 fallback backoff */ }
+    }
+    const delay = serverHintedDelay > 0
+      ? serverHintedDelay
+      : Math.min(2000 * Math.pow(2, _reconnectAttempts), 30000) + Math.random() * 1000
+    // server hint 是"server 主动节流",不归类为 client 端 retry attempt;
+    // 否则一旦 hint 用尽再回 backoff,attempts 会被恶性放大。
+    if (serverHintedDelay === 0) _reconnectAttempts++
     if (delay >= 4000) {
       let remaining = Math.ceil(delay / 1000)
       setStatus(`${remaining} 秒后重连…`, 'disconnected')
