@@ -65,16 +65,16 @@ import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBus
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
-import { abortInflightMintClear, clearSessionCookie, initAuth, mintSessionCookie, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=65d9c27'
-// ?v=65d9c27 bust: websocket.js now imports billing.js for refreshBalance() after
+import { abortInflightMintClear, clearSessionCookie, initAuth, mintSessionCookie, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=d325d42'
+// ?v=d325d42 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=65d9c27'
-import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=65d9c27'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=d325d42'
+import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=d325d42'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { initUsageStats, openUsageModal } from './usageStats.js?v=65d9c27'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=d325d42'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -95,7 +95,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=65d9c27'  // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=d325d42'  // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
@@ -179,7 +179,7 @@ import { getEffortForSubmit, initModePills, renderModePills, clearEffortOnLogout
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
-// deploy where main.js?v=65d9c27 imports a bare-URL state.js that CF still serves
+// deploy where main.js?v=d325d42 imports a bare-URL state.js that CF still serves
 // old), this line is never reached → watchdog fires at T+15s and self-heals.
 window.__ocBooted = true
 
