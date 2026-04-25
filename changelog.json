@@ -1,8 +1,8 @@
 {
-  "currentVersion": "PENDING",
+  "currentVersion": "v3-20260425T0812Z-2ed7c45",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v3-20260425T0812Z-2ed7c45",
       "date": "2026-04-25",
       "title": "多端会话同步 banner + 长会话稳定性",
       "items": [
