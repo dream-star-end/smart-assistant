@@ -108,6 +108,20 @@ import {
   type SystemSettingKey,
   type SystemSettingRow,
 } from "../admin/systemSettings.js";
+import {
+  listOrders,
+  getOrderDetail,
+  getOrdersKpi,
+  type OrderRowView,
+  type OrderDetailView,
+  type OrdersKpiView,
+} from "../admin/orders.js";
+import {
+  listFeedback,
+  ackFeedback,
+  FeedbackNotFoundError,
+  type FeedbackRowView,
+} from "../admin/feedback.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
 
 // ─── shared helpers ──────────────────────────────────────────────────
@@ -1430,6 +1444,256 @@ export async function handleAdminPutSetting(
       throw new HttpError(400, "VALIDATION", err.message, {
         issues: err.issues.map((m) => ({ path: "value", message: m })),
       });
+    }
+    throw err;
+  }
+}
+
+// ─── /api/admin/orders (P0-3 订单管理) ────────────────────────────
+
+const ORDERS_MAX_LIMIT = 200;
+const ORDER_STATUSES = ["pending", "paid", "expired", "refunded", "canceled"] as const;
+type OrderStatus = (typeof ORDER_STATUSES)[number];
+
+function parseOrderStatus(raw: string | null): OrderStatus | undefined {
+  if (raw === null || raw === "") return undefined;
+  if (!(ORDER_STATUSES as readonly string[]).includes(raw)) {
+    throw new HttpError(400, "VALIDATION", "invalid status", {
+      issues: [{ path: "status", message: raw }],
+    });
+  }
+  return raw as OrderStatus;
+}
+
+// PG BIGINT 上限 = 9223372036854775807 (19 digits)。正则放到 20 位,溢出靠 BigInt 比较拦截。
+const BIGINT_MAX = 9223372036854775807n;
+function parseBigintIdParam(raw: string | null, name: string): string | undefined {
+  if (raw === null || raw === "") return undefined;
+  if (!/^[1-9][0-9]{0,19}$/.test(raw)) {
+    throw new HttpError(400, "VALIDATION", `invalid ${name}`, {
+      issues: [{ path: name, message: raw }],
+    });
+  }
+  if (BigInt(raw) > BIGINT_MAX) {
+    throw new HttpError(400, "VALIDATION", `${name} out of range`, {
+      issues: [{ path: name, message: raw }],
+    });
+  }
+  return raw;
+}
+
+function parseUserId(raw: string | null): string | undefined {
+  return parseBigintIdParam(raw, "user_id");
+}
+
+function parseIsoTimestamp(raw: string | null, name: string): string | undefined {
+  if (raw === null || raw === "") return undefined;
+  // 简单校验:Date 解析得出来即可。多余格式由 PG ::timestamptz 兜底。
+  if (Number.isNaN(Date.parse(raw))) {
+    throw new HttpError(400, "VALIDATION", `${name} must be ISO timestamp`, {
+      issues: [{ path: name, message: raw }],
+    });
+  }
+  return raw;
+}
+
+function serializeOrderRow(row: OrderRowView): Record<string, unknown> {
+  return {
+    id: row.id,
+    order_no: row.order_no,
+    user_id: row.user_id,
+    username: row.username,
+    provider: row.provider,
+    provider_order: row.provider_order,
+    amount_cents: row.amount_cents,
+    credits: row.credits,
+    status: row.status,
+    paid_at: row.paid_at?.toISOString() ?? null,
+    expires_at: row.expires_at.toISOString(),
+    created_at: row.created_at.toISOString(),
+    updated_at: row.updated_at.toISOString(),
+  };
+}
+
+function serializeOrderDetail(row: OrderDetailView): Record<string, unknown> {
+  return {
+    ...serializeOrderRow(row),
+    callback_payload: row.callback_payload,
+    ledger_id: row.ledger_id,
+    refunded_ledger_id: row.refunded_ledger_id,
+  };
+}
+
+function serializeOrdersKpi(k: OrdersKpiView): Record<string, unknown> {
+  return {
+    pending_overdue: k.pending_overdue,
+    pending_overdue_24h: k.pending_overdue_24h,
+    callback_conflicts_24h: k.callback_conflicts_24h,
+    paid_24h_count: k.paid_24h_count,
+    paid_24h_amount_cents: k.paid_24h_amount_cents,
+  };
+}
+
+export async function handleAdminListOrders(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const status = parseOrderStatus(url.searchParams.get("status"));
+  const userId = parseUserId(url.searchParams.get("user_id"));
+  const from = parseIsoTimestamp(url.searchParams.get("from"), "from");
+  const to = parseIsoTimestamp(url.searchParams.get("to"), "to");
+  const beforeCreatedAt = parseIsoTimestamp(url.searchParams.get("before_created_at"), "before_created_at");
+  const beforeId = parseBigintIdParam(url.searchParams.get("before_id"), "before_id");
+  const limit = parsePositiveInt(url.searchParams.get("limit"), "limit", ORDERS_MAX_LIMIT);
+  const r = await listOrders({
+    status,
+    user_id: userId,
+    from,
+    to,
+    before_created_at: beforeCreatedAt,
+    before_id: beforeId,
+    limit,
+  });
+  sendJson(res, 200, {
+    rows: r.rows.map(serializeOrderRow),
+    next_before_created_at: r.next_before_created_at,
+    next_before_id: r.next_before_id,
+  });
+}
+
+export async function handleAdminOrdersKpi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const k = await getOrdersKpi();
+  sendJson(res, 200, { kpi: serializeOrdersKpi(k) });
+}
+
+export async function handleAdminGetOrder(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const tail = url.pathname.slice("/api/admin/orders/".length);
+  // order_no 是 hupijiao 拼出来的字符串;现行实现是 yyyymmdd-uid-uuid 风格,
+  // 但 hupijiao 也能传来自定义。这里宽松校验:非空、长度 ≤ 64、ASCII 安全字符。
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(tail)) {
+    throw new HttpError(400, "VALIDATION", "invalid order_no", {
+      issues: [{ path: "order_no", message: tail }],
+    });
+  }
+  const row = await getOrderDetail(tail);
+  if (!row) {
+    throw new HttpError(404, "ORDER_NOT_FOUND", "order not found");
+  }
+  sendJson(res, 200, { order: serializeOrderDetail(row) });
+}
+
+// ─── /api/admin/feedback (P1-2 反馈管理) ──────────────────────────
+
+const FEEDBACK_MAX_LIMIT = 200;
+const FEEDBACK_STATUSES = ["open", "acked", "closed"] as const;
+type FeedbackStatusFilter = (typeof FEEDBACK_STATUSES)[number];
+
+function parseFeedbackStatus(raw: string | null): FeedbackStatusFilter | undefined {
+  if (raw === null || raw === "") return undefined;
+  if (!(FEEDBACK_STATUSES as readonly string[]).includes(raw)) {
+    throw new HttpError(400, "VALIDATION", "invalid status", {
+      issues: [{ path: "status", message: raw }],
+    });
+  }
+  return raw as FeedbackStatusFilter;
+}
+
+function serializeFeedbackRow(row: FeedbackRowView): Record<string, unknown> {
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    username: row.username,
+    category: row.category,
+    description: row.description,
+    request_id: row.request_id,
+    version: row.version,
+    session_id: row.session_id,
+    user_agent: row.user_agent,
+    meta: row.meta,
+    status: row.status,
+    handled_by: row.handled_by,
+    handled_at: row.handled_at?.toISOString() ?? null,
+    created_at: row.created_at.toISOString(),
+  };
+}
+
+export async function handleAdminListFeedback(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const status = parseFeedbackStatus(url.searchParams.get("status"));
+  const userId = parseUserId(url.searchParams.get("user_id"));
+  const beforeCreatedAt = parseIsoTimestamp(url.searchParams.get("before_created_at"), "before_created_at");
+  const beforeId = parseBigintIdParam(url.searchParams.get("before_id"), "before_id");
+  const limit = parsePositiveInt(url.searchParams.get("limit"), "limit", FEEDBACK_MAX_LIMIT);
+  const r = await listFeedback({
+    status,
+    user_id: userId,
+    before_created_at: beforeCreatedAt,
+    before_id: beforeId,
+    limit,
+  });
+  sendJson(res, 200, {
+    rows: r.rows.map(serializeFeedbackRow),
+    next_before_created_at: r.next_before_created_at,
+    next_before_id: r.next_before_id,
+  });
+}
+
+export async function handleAdminAckFeedback(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  // 写操作 + 改 status + 写 audit:用 DB double-check
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  // /api/admin/feedback/:id/ack → 抠 :id
+  const m = url.pathname.match(/^\/api\/admin\/feedback\/([^/]+)\/ack$/);
+  if (!m) {
+    throw new HttpError(400, "VALIDATION", "invalid feedback id in URL", {
+      issues: [{ path: "id", message: url.pathname }],
+    });
+  }
+  // 走统一的 BIGINT 范围校验,超 9223372036854775807 直接 400 而非 DB 500
+  const id = parseBigintIdParam(m[1], "id");
+  if (!id) {
+    throw new HttpError(400, "VALIDATION", "invalid feedback id in URL", {
+      issues: [{ path: "id", message: m[1] }],
+    });
+  }
+  try {
+    const row = await ackFeedback(id, {
+      adminId: admin.id,
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, { feedback: serializeFeedbackRow(row) });
+  } catch (err) {
+    if (err instanceof FeedbackNotFoundError) {
+      throw new HttpError(404, "FEEDBACK_NOT_FOUND", err.message);
     }
     throw err;
   }

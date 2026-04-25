@@ -328,8 +328,10 @@ const TABS = {
   containers: renderContainersTab,
   hosts: renderHostsTab,
   ledger: renderLedgerTab,
+  orders: renderOrdersTab,
   pricing: renderPricingTab,
   plans: renderPlansTab,
+  feedback: renderFeedbackTab,
   settings: renderSettingsTab,
   audit: renderAuditTab,
   health: renderHealthTab,
@@ -436,6 +438,8 @@ async function renderDashboardTab() {
         ${[
           '活跃用户 DAU','窗口新注册','付费用户','返场用户',
           '24h 请求数','24h Token','账号池 可用','告警 · 待处理',
+          // P0-3 (2026-04-25):订单异常 KPI;点击跳转 orders tab 预过滤
+          '24h pending 超时','24h 回调冲突',
         ].map((label) => `
           <div class="stat-card">
             <div class="stat-label">${escapeHtml(label)}</div>
@@ -593,9 +597,9 @@ async function loadDashboardData(seq) {
   // 覆盖成功态)。用独立 loadSeq 判定"我是不是最新一次 load",非最新直接 bail。
   const myLoadSeq = ++DASH_STATE.loadSeq
 
-  // 并行拉 5 条新 stats + 2 条明细 (accounts / ledger)。
+  // 并行拉 5 条新 stats + 2 条明细 (accounts / ledger) + P0-3 orders KPI。
   // 每个端点独立 fulfilled/rejected,失败的不传染其他卡片(R1 Codex M3)。
-  const [dauR, revR, reqR, alertsR, poolR, accountsR, ledgerR] = await Promise.allSettled([
+  const [dauR, revR, reqR, alertsR, poolR, accountsR, ledgerR, ordersKpiR] = await Promise.allSettled([
     apiGet(`/api/admin/stats/dau?window=${encodeURIComponent(dauW)}`),
     apiGet(`/api/admin/stats/revenue-by-day?days=14`),
     apiGet(`/api/admin/stats/request-series?hours=${reqH}`),
@@ -603,6 +607,7 @@ async function loadDashboardData(seq) {
     apiGet(`/api/admin/stats/account-pool`),
     apiGet(`/api/admin/accounts`),
     apiGet(`/api/admin/ledger?limit=8`),
+    apiGet(`/api/admin/orders/kpi`),
   ])
 
   // R2 Codex M1:fetch 期间如果用户切 tab / 又触发了一次 renderDashboardTab,
@@ -626,6 +631,8 @@ async function loadDashboardData(seq) {
   const pool       = poolOk   ? poolR.value : null
   const accounts   = accountsOk ? (accountsR.value?.rows || []) : []
   const ledger     = ledgerOk  ? (ledgerR.value?.rows  || []) : []
+  const ordersKpiOk = ordersKpiR.status === 'fulfilled'
+  const ordersKpi   = ordersKpiOk ? (ordersKpiR.value?.kpi || null) : null
 
   // ─── KPI 卡片(8 项) ───
   const statCards = view().querySelectorAll('#dash-kpis .stat-card')
@@ -687,6 +694,39 @@ async function loadDashboardData(seq) {
       tone)
   } else {
     updateStat(statCards[7], '—', '加载失败', 'danger')
+  }
+
+  // 9-10. P0-3 订单异常(orders/kpi)— 失败 → "—"
+  if (ordersKpi) {
+    const overdue = Number(ordersKpi.pending_overdue_24h || 0)
+    const overdueAll = Number(ordersKpi.pending_overdue || 0)
+    const tone1 = overdue > 0 ? 'warning' : null
+    updateStat(statCards[8], overdue.toLocaleString(),
+      overdueAll > 0 ? `累计卡单 ${overdueAll}` : '无累计卡单', tone1)
+
+    const conflict = Number(ordersKpi.callback_conflicts_24h || 0)
+    const tone2 = conflict > 0 ? 'danger' : null
+    updateStat(statCards[9], conflict.toLocaleString(),
+      conflict > 0 ? '点击进入订单' : '无冲突', tone2)
+  } else {
+    updateStat(statCards[8], '—', '加载失败', 'danger')
+    updateStat(statCards[9], '—', '加载失败', 'danger')
+  }
+  // P0-3:KPI 卡片整张点击跳转 orders tab 并预过滤(state.js 持久化)
+  // statCards[8] = pending overdue → 预过滤 status='pending'
+  // statCards[9] = callback conflicts → 不能纯靠 status 过滤(冲突走 alert outbox),
+  //                直接跳到 orders 列表,运营再用 user/order 检索
+  statCards[8]?.addEventListener('click', () => {
+    sessionStorage.setItem('admin_orders_status', 'pending')
+    navigate('orders')
+  })
+  statCards[9]?.addEventListener('click', () => {
+    sessionStorage.removeItem('admin_orders_status')
+    navigate('orders')
+  })
+  // 鼠标悬停时给 KPI 卡可点击的视觉提示
+  for (const i of [8, 9]) {
+    if (statCards[i]) statCards[i].style.cursor = 'pointer'
   }
 
   // ─── Chart: 请求趋势(折线)───
@@ -2067,6 +2107,299 @@ async function renderLedgerTab() {
   })
 }
 
+// ─── Tab: Orders (P0-3 订单管理)──────────────────────────────────
+//
+// 后端:
+//   GET /api/admin/orders?status&user_id&from&to&before_created_at&before_id&limit
+//   GET /api/admin/orders/:order_no            → 详情(含 callback_payload)
+//   GET /api/admin/orders/kpi                  → 顶部 KPI 卡片
+//
+// 前端:status / user_id 过滤 + 复合游标翻页;异常状态(expired / refunded /
+// canceled)行高亮;详情 modal 显示完整 callback_payload(支付方原始回调)用于排查。
+//
+// 缓存 in-memory(切 tab 不保留)— 翻页参数在 sessionStorage 持久化以便回到 tab
+// 时回到上次的过滤状态(与 ledger tab 一致)。
+
+const ORDER_STATUSES = ['pending', 'paid', 'expired', 'refunded', 'canceled']
+const ORDER_STATUS_LABELS = {
+  pending:  '待支付',
+  paid:     '已支付',
+  expired:  '已过期',
+  refunded: '已退款',
+  canceled: '已取消',
+}
+function _orderStatusBadge(s) {
+  const cls = s === 'paid' ? 'ok'
+    : s === 'pending' ? 'warn'
+    : (s === 'expired' || s === 'refunded' || s === 'canceled') ? 'danger'
+    : 'muted'
+  return `<span class="badge ${cls}">${escapeHtml(ORDER_STATUS_LABELS[s] || s)}</span>`
+}
+
+// 复合游标分页状态(沿用 USERS_STATE 模式)
+const ORDERS_STATE = {
+  renderSeq: 0,
+  loadSeq: 0,
+  rows: [],
+  nextBeforeCreatedAt: null,
+  nextBeforeId: null,
+  status: '',
+  userId: '',
+  done: false,
+}
+const ORDERS_PAGE_SIZE = 50
+
+async function renderOrdersTab() {
+  const mySeq = ++ORDERS_STATE.renderSeq
+
+  // 过滤参数:status (sessionStorage 持久化 — 仪表盘 KPI 卡片可预过滤)、user_id
+  ORDERS_STATE.status = sessionStorage.getItem('admin_orders_status') || ''
+  if (ORDERS_STATE.status && !ORDER_STATUSES.includes(ORDERS_STATE.status)) {
+    sessionStorage.removeItem('admin_orders_status')
+    ORDERS_STATE.status = ''
+  }
+  ORDERS_STATE.userId = sessionStorage.getItem('admin_orders_user') || ''
+  ORDERS_STATE.rows = []
+  ORDERS_STATE.nextBeforeCreatedAt = null
+  ORDERS_STATE.nextBeforeId = null
+  ORDERS_STATE.done = false
+
+  view().innerHTML = `
+    <div class="panel">
+      <h2>订单 <small id="o-count">加载中…</small></h2>
+      <div id="o-kpis"></div>
+      <div class="toolbar">
+        <select id="o-status">
+          <option value="">全部状态</option>
+          ${ORDER_STATUSES.map((s) =>
+            `<option value="${s}" ${ORDERS_STATE.status === s ? 'selected' : ''}>${ORDER_STATUS_LABELS[s]}</option>`).join('')}
+        </select>
+        <input type="text" id="o-uid" placeholder="user_id 过滤" value="${escapeHtml(ORDERS_STATE.userId)}" />
+        <button class="btn btn-primary" id="o-go">查询</button>
+        <button class="btn" id="o-clear">清空过滤</button>
+      </div>
+      <div id="o-table-container"><div class="skeleton-row"><div class="skeleton-bar w60"></div></div></div>
+      <div id="o-load-more" style="margin-top:var(--s-3);display:none;text-align:center;">
+        <button class="btn" id="o-load-more-btn">加载更多</button>
+      </div>
+    </div>
+  `
+
+  $('o-go').addEventListener('click', () => {
+    const newStatus = $('o-status').value
+    const newUid = $('o-uid').value.trim()
+    if (newStatus) sessionStorage.setItem('admin_orders_status', newStatus)
+    else sessionStorage.removeItem('admin_orders_status')
+    if (newUid) sessionStorage.setItem('admin_orders_user', newUid)
+    else sessionStorage.removeItem('admin_orders_user')
+    applyHash()
+  })
+  $('o-clear').addEventListener('click', () => {
+    sessionStorage.removeItem('admin_orders_status')
+    sessionStorage.removeItem('admin_orders_user')
+    applyHash()
+  })
+  $('o-load-more-btn').addEventListener('click', async (ev) => {
+    await withBtnLoading(ev.currentTarget, () => _loadMoreOrders(mySeq))
+  })
+
+  // KPI 独立失败,不阻塞列表
+  apiGet('/api/admin/orders/kpi').then((r) => {
+    if (mySeq !== ORDERS_STATE.renderSeq || _currentTab !== 'orders') return
+    _renderOrdersKpiStrip(r?.kpi || null)
+  }).catch(() => { /* KPI 拉失败保持空 */ })
+
+  await _loadMoreOrders(mySeq)
+}
+
+function _renderOrdersKpiStrip(kpi) {
+  const el = $('o-kpis')
+  if (!el) return
+  if (!kpi) { el.innerHTML = ''; return }
+  el.innerHTML = `
+    <div class="toolbar" style="gap:var(--s-3);flex-wrap:wrap;">
+      <span class="stat-chip ${kpi.pending_overdue_24h > 0 ? 'warn' : 'ok'}">
+        24h 卡单 · <b>${kpi.pending_overdue_24h}</b>
+      </span>
+      <span class="stat-chip ${kpi.pending_overdue > 0 ? 'warn' : 'ok'}">
+        累计卡单 · <b>${kpi.pending_overdue}</b>
+      </span>
+      <span class="stat-chip ${kpi.callback_conflicts_24h > 0 ? 'danger' : 'ok'}">
+        24h 回调冲突 · <b>${kpi.callback_conflicts_24h}</b>
+      </span>
+      <span class="stat-chip ok">
+        24h 已付 · <b>${kpi.paid_24h_count}</b>
+        <span style="opacity:0.7">(${fmtCents(kpi.paid_24h_amount_cents)})</span>
+      </span>
+    </div>`
+}
+
+async function _loadMoreOrders(renderSeq) {
+  if (ORDERS_STATE.done) return
+  const myLoadSeq = ++ORDERS_STATE.loadSeq
+
+  const sp = new URLSearchParams({ limit: String(ORDERS_PAGE_SIZE) })
+  if (ORDERS_STATE.status) sp.set('status', ORDERS_STATE.status)
+  if (ORDERS_STATE.userId) sp.set('user_id', ORDERS_STATE.userId)
+  if (ORDERS_STATE.nextBeforeCreatedAt) sp.set('before_created_at', ORDERS_STATE.nextBeforeCreatedAt)
+  if (ORDERS_STATE.nextBeforeId) sp.set('before_id', ORDERS_STATE.nextBeforeId)
+
+  const isFirstPage = ORDERS_STATE.rows.length === 0 && !ORDERS_STATE.nextBeforeId
+
+  let data
+  try {
+    data = await apiGet(`/api/admin/orders?${sp.toString()}`)
+  } catch (err) {
+    if (renderSeq !== ORDERS_STATE.renderSeq || _currentTab !== 'orders') return
+    if (myLoadSeq !== ORDERS_STATE.loadSeq) return
+    if (isFirstPage) {
+      const tc = $('o-table-container')
+      if (tc) tc.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message || String(err))}</div>`
+      const lm = $('o-load-more'); if (lm) lm.style.display = 'none'
+    } else {
+      toast(`加载失败:${err.message}`, 'danger', toastOptsFromError(err))
+    }
+    return
+  }
+  if (renderSeq !== ORDERS_STATE.renderSeq || _currentTab !== 'orders') return
+  if (myLoadSeq !== ORDERS_STATE.loadSeq) return
+
+  const newRows = data?.rows ?? []
+  ORDERS_STATE.rows.push(...newRows)
+  ORDERS_STATE.nextBeforeCreatedAt = data?.next_before_created_at ?? null
+  ORDERS_STATE.nextBeforeId = data?.next_before_id ?? null
+  if (!ORDERS_STATE.nextBeforeCreatedAt || !ORDERS_STATE.nextBeforeId) ORDERS_STATE.done = true
+
+  _renderOrdersTable()
+}
+
+function _renderOrdersTable() {
+  const cnt = $('o-count')
+  if (cnt) cnt.textContent = `共 ${ORDERS_STATE.rows.length} 条${ORDERS_STATE.done ? '' : '+'}`
+  const tc = $('o-table-container')
+  if (!tc) return
+
+  const rows = ORDERS_STATE.rows
+  if (rows.length === 0) {
+    tc.innerHTML = '<div class="empty">无订单</div>'
+  } else {
+    tc.innerHTML = `
+      <table class="data">
+        <thead>
+          <tr>
+            <th>order_no</th><th>用户</th><th>provider</th>
+            <th class="num">金额</th><th class="num">积分</th>
+            <th>状态</th><th>paid_at</th><th>created_at</th>
+            <th class="actions">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((r) => {
+            // 异常状态行加底色提示
+            const rowCls = (r.status === 'expired' || r.status === 'refunded' || r.status === 'canceled')
+              ? ' style="background:rgba(220,80,80,0.06)"' : ''
+            const userLabel = r.username
+              ? `${escapeHtml(r.username)} <code style="opacity:0.6">#${escapeHtml(r.user_id)}</code>`
+              : `<code>#${escapeHtml(r.user_id)}</code>`
+            return `
+            <tr${rowCls}>
+              <td class="mono">${escapeHtml(r.order_no)}</td>
+              <td>${userLabel}</td>
+              <td><span class="badge muted">${escapeHtml(r.provider)}</span></td>
+              <td class="num">${fmtCents(r.amount_cents)}</td>
+              <td class="num">${escapeHtml(r.credits)}</td>
+              <td>${_orderStatusBadge(r.status)}</td>
+              <td class="mono">${fmtDate(r.paid_at)}</td>
+              <td class="mono">${fmtDate(r.created_at)}</td>
+              <td class="actions">
+                <button data-act="view-order" data-no="${escapeHtml(r.order_no)}">查看</button>
+              </td>
+            </tr>`
+          }).join('')}
+        </tbody>
+      </table>`
+  }
+
+  const lm = $('o-load-more')
+  if (lm) lm.style.display = ORDERS_STATE.done ? 'none' : 'block'
+
+  for (const b of view().querySelectorAll('button[data-act="view-order"]')) {
+    b.addEventListener('click', () => openOrderDetailModal(b.dataset.no))
+  }
+}
+
+async function openOrderDetailModal(orderNo) {
+  openModal(`<h3>订单 · ${escapeHtml(orderNo)}</h3>
+    <div class="loading">加载中…</div>`)
+  let data
+  try {
+    data = await apiGet(`/api/admin/orders/${encodeURIComponent(orderNo)}`)
+  } catch (e) {
+    openModal(`<h3>订单 · ${escapeHtml(orderNo)}</h3>
+      <div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(e.message || String(e))}</div>
+      <div class="form-actions"><button id="o-close">关闭</button></div>`)
+    $('o-close')?.addEventListener('click', closeModal)
+    return
+  }
+  const o = data?.order
+  if (!o) {
+    openModal(`<h3>订单 · ${escapeHtml(orderNo)}</h3>
+      <div class="empty">未找到该订单</div>
+      <div class="form-actions"><button id="o-close">关闭</button></div>`)
+    $('o-close')?.addEventListener('click', closeModal)
+    return
+  }
+
+  // callback_payload 是支付方回调原文,排查异常时最关键 → JSON 美化展示
+  const payloadText = o.callback_payload
+    ? JSON.stringify(o.callback_payload, null, 2)
+    : '(无 callback,可能未到账或还在 pending)'
+
+  openModal(`
+    <h3>订单 · ${escapeHtml(o.order_no)}</h3>
+    <div class="form-row">
+      <label>状态</label>
+      <div>${_orderStatusBadge(o.status)}</div>
+    </div>
+    <div class="form-row">
+      <label>用户</label>
+      <div>${o.username ? `${escapeHtml(o.username)} ` : ''}<code>#${escapeHtml(o.user_id)}</code></div>
+    </div>
+    <div class="form-row">
+      <label>支付通道</label>
+      <div><span class="badge muted">${escapeHtml(o.provider)}</span>
+           ${o.provider_order ? `<code style="margin-left:8px">${escapeHtml(o.provider_order)}</code>` : ''}</div>
+    </div>
+    <div class="form-row">
+      <label>金额 / 积分</label>
+      <div>${fmtCents(o.amount_cents)} → ${escapeHtml(o.credits)} 积分</div>
+    </div>
+    <div class="form-row">
+      <label>时间</label>
+      <div class="mono" style="font-size:12px">
+        created: ${fmtDate(o.created_at)}<br>
+        paid:    ${fmtDate(o.paid_at)}<br>
+        expires: ${fmtDate(o.expires_at)}<br>
+        updated: ${fmtDate(o.updated_at)}
+      </div>
+    </div>
+    ${o.ledger_id ? `
+      <div class="form-row">
+        <label>积分流水</label>
+        <div><code>#${escapeHtml(o.ledger_id)}</code>${o.refunded_ledger_id ? ` · 退款 <code>#${escapeHtml(o.refunded_ledger_id)}</code>` : ''}</div>
+      </div>` : ''}
+    <div class="form-row">
+      <label>callback_payload</label>
+      <pre class="mono" style="background:var(--bg-2);padding:var(--s-3);border-radius:6px;
+           max-height:280px;overflow:auto;font-size:11px;line-height:1.5;">${escapeHtml(payloadText)}</pre>
+    </div>
+    <div class="form-actions">
+      <button id="o-close">关闭</button>
+    </div>
+  `)
+  $('o-close')?.addEventListener('click', closeModal)
+}
+
 // ─── Tab: Pricing ──────────────────────────────────────────────────
 
 async function renderPricingTab() {
@@ -2224,6 +2557,298 @@ function openEditPlanModal(d) {
       }
     })
   })
+}
+
+// ─── Tab: Feedback (P1-2 用户反馈管理)──────────────────────────────
+//
+// 后端:
+//   GET  /api/admin/feedback?status&user_id&before_created_at&before_id&limit
+//   POST /api/admin/feedback/:id/ack            → 改 status=acked + admin_audit
+//
+// 前端:status / user_id 过滤 + 复合游标翻页;详情 modal 显示完整 description +
+// meta(JSON pretty)+ 反查命令建议。
+//
+// 列表 UI 上明确区分 open / acked / closed:open 行高亮(运营要看到的)。
+
+const FEEDBACK_STATUSES = ['open', 'acked', 'closed']
+const FEEDBACK_STATUS_LABELS = {
+  open:   '未处理',
+  acked:  '已确认',
+  closed: '已关闭',
+}
+function _feedbackStatusBadge(s) {
+  const cls = s === 'open' ? 'warn'
+    : s === 'acked' ? 'ok'
+    : s === 'closed' ? 'muted'
+    : 'muted'
+  return `<span class="badge ${cls}">${escapeHtml(FEEDBACK_STATUS_LABELS[s] || s)}</span>`
+}
+
+// 复合游标分页状态(沿用 USERS_STATE / ORDERS_STATE 模式)
+const FEEDBACK_STATE = {
+  renderSeq: 0,
+  loadSeq: 0,
+  rows: [],
+  nextBeforeCreatedAt: null,
+  nextBeforeId: null,
+  status: '',
+  userId: '',
+  done: false,
+}
+const FEEDBACK_PAGE_SIZE = 50
+
+async function renderFeedbackTab() {
+  const mySeq = ++FEEDBACK_STATE.renderSeq
+
+  FEEDBACK_STATE.status = sessionStorage.getItem('admin_feedback_status') || ''
+  if (FEEDBACK_STATE.status && !FEEDBACK_STATUSES.includes(FEEDBACK_STATE.status)) {
+    sessionStorage.removeItem('admin_feedback_status')
+    FEEDBACK_STATE.status = ''
+  }
+  FEEDBACK_STATE.userId = sessionStorage.getItem('admin_feedback_user') || ''
+  FEEDBACK_STATE.rows = []
+  FEEDBACK_STATE.nextBeforeCreatedAt = null
+  FEEDBACK_STATE.nextBeforeId = null
+  FEEDBACK_STATE.done = false
+
+  view().innerHTML = `
+    <div class="panel">
+      <h2>用户反馈 <small id="f-count">加载中…</small></h2>
+      <div class="toolbar">
+        <select id="f-status">
+          <option value="">全部状态</option>
+          ${FEEDBACK_STATUSES.map((s) =>
+            `<option value="${s}" ${FEEDBACK_STATE.status === s ? 'selected' : ''}>${FEEDBACK_STATUS_LABELS[s]}</option>`).join('')}
+        </select>
+        <input type="text" id="f-uid" placeholder="user_id 过滤" value="${escapeHtml(FEEDBACK_STATE.userId)}" />
+        <button class="btn btn-primary" id="f-go">查询</button>
+        <button class="btn" id="f-clear">清空过滤</button>
+      </div>
+      <div id="f-table-container"><div class="skeleton-row"><div class="skeleton-bar w60"></div></div></div>
+      <div id="f-load-more" style="margin-top:var(--s-3);display:none;text-align:center;">
+        <button class="btn" id="f-load-more-btn">加载更多</button>
+      </div>
+    </div>
+  `
+
+  $('f-go').addEventListener('click', () => {
+    const newStatus = $('f-status').value
+    const newUid = $('f-uid').value.trim()
+    if (newStatus) sessionStorage.setItem('admin_feedback_status', newStatus)
+    else sessionStorage.removeItem('admin_feedback_status')
+    if (newUid) sessionStorage.setItem('admin_feedback_user', newUid)
+    else sessionStorage.removeItem('admin_feedback_user')
+    applyHash()
+  })
+  $('f-clear').addEventListener('click', () => {
+    sessionStorage.removeItem('admin_feedback_status')
+    sessionStorage.removeItem('admin_feedback_user')
+    applyHash()
+  })
+  $('f-load-more-btn').addEventListener('click', async (ev) => {
+    await withBtnLoading(ev.currentTarget, () => _loadMoreFeedback(mySeq))
+  })
+
+  await _loadMoreFeedback(mySeq)
+}
+
+async function _loadMoreFeedback(renderSeq) {
+  if (FEEDBACK_STATE.done) return
+  const myLoadSeq = ++FEEDBACK_STATE.loadSeq
+
+  const sp = new URLSearchParams({ limit: String(FEEDBACK_PAGE_SIZE) })
+  if (FEEDBACK_STATE.status) sp.set('status', FEEDBACK_STATE.status)
+  if (FEEDBACK_STATE.userId) sp.set('user_id', FEEDBACK_STATE.userId)
+  if (FEEDBACK_STATE.nextBeforeCreatedAt) sp.set('before_created_at', FEEDBACK_STATE.nextBeforeCreatedAt)
+  if (FEEDBACK_STATE.nextBeforeId) sp.set('before_id', FEEDBACK_STATE.nextBeforeId)
+
+  const isFirstPage = FEEDBACK_STATE.rows.length === 0 && !FEEDBACK_STATE.nextBeforeId
+
+  let data
+  try {
+    data = await apiGet(`/api/admin/feedback?${sp.toString()}`)
+  } catch (err) {
+    if (renderSeq !== FEEDBACK_STATE.renderSeq || _currentTab !== 'feedback') return
+    if (myLoadSeq !== FEEDBACK_STATE.loadSeq) return
+    if (isFirstPage) {
+      const tc = $('f-table-container')
+      if (tc) tc.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message || String(err))}</div>`
+      const lm = $('f-load-more'); if (lm) lm.style.display = 'none'
+    } else {
+      toast(`加载失败:${err.message}`, 'danger', toastOptsFromError(err))
+    }
+    return
+  }
+  if (renderSeq !== FEEDBACK_STATE.renderSeq || _currentTab !== 'feedback') return
+  if (myLoadSeq !== FEEDBACK_STATE.loadSeq) return
+
+  const newRows = data?.rows ?? []
+  FEEDBACK_STATE.rows.push(...newRows)
+  FEEDBACK_STATE.nextBeforeCreatedAt = data?.next_before_created_at ?? null
+  FEEDBACK_STATE.nextBeforeId = data?.next_before_id ?? null
+  if (!FEEDBACK_STATE.nextBeforeCreatedAt || !FEEDBACK_STATE.nextBeforeId) FEEDBACK_STATE.done = true
+
+  _renderFeedbackTable()
+}
+
+function _renderFeedbackTable() {
+  const rows = FEEDBACK_STATE.rows
+  const openCount = rows.filter((r) => r.status === 'open').length
+  const cnt = $('f-count')
+  if (cnt) {
+    cnt.innerHTML = `共 ${rows.length} 条${FEEDBACK_STATE.done ? '' : '+'}` +
+      (openCount > 0 ? ` · <span style="color:var(--warn)">${openCount} 条未处理</span>` : '')
+  }
+  const tc = $('f-table-container')
+  if (!tc) return
+
+  if (rows.length === 0) {
+    tc.innerHTML = '<div class="empty">无反馈</div>'
+  } else {
+    tc.innerHTML = `
+      <table class="data">
+        <thead>
+          <tr>
+            <th>id</th><th>created_at</th><th>用户</th>
+            <th>category</th><th>描述</th><th>request_id</th>
+            <th>version</th><th>状态</th>
+            <th class="actions">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((r) => {
+            const rowCls = r.status === 'open' ? ' style="background:rgba(232,182,76,0.06)"' : ''
+            const userLabel = r.user_id
+              ? (r.username
+                  ? `${escapeHtml(r.username)} <code style="opacity:0.6">#${escapeHtml(r.user_id)}</code>`
+                  : `<code>#${escapeHtml(r.user_id)}</code>`)
+              : '<span style="opacity:0.6">匿名</span>'
+            const desc = r.description.length > 80
+              ? escapeHtml(r.description.slice(0, 80)) + '…'
+              : escapeHtml(r.description)
+            const ackBtn = r.status === 'open'
+              ? `<button data-act="ack-feedback" data-id="${escapeHtml(r.id)}" class="btn-primary">确认</button>`
+              : ''
+            return `
+            <tr${rowCls}>
+              <td class="mono">${escapeHtml(r.id)}</td>
+              <td class="mono">${fmtDate(r.created_at)}</td>
+              <td>${userLabel}</td>
+              <td><span class="badge muted">${escapeHtml(r.category)}</span></td>
+              <td title="${escapeHtml(r.description)}" style="max-width:380px">${desc}</td>
+              <td class="mono" style="font-size:11px">${escapeHtml((r.request_id || '').slice(0, 12))}${r.request_id && r.request_id.length > 12 ? '…' : ''}</td>
+              <td class="mono" style="font-size:11px">${escapeHtml(r.version || '—')}</td>
+              <td>${_feedbackStatusBadge(r.status)}</td>
+              <td class="actions">
+                <button data-act="view-feedback" data-id="${escapeHtml(r.id)}">查看</button>
+                ${ackBtn}
+              </td>
+            </tr>`
+          }).join('')}
+        </tbody>
+      </table>`
+  }
+
+  const lm = $('f-load-more')
+  if (lm) lm.style.display = FEEDBACK_STATE.done ? 'none' : 'block'
+
+  // 内存缓存当前累积 rows,modal 直接读不再多发一次请求
+  const rowMap = new Map(rows.map((r) => [r.id, r]))
+
+  for (const b of view().querySelectorAll('button[data-act="view-feedback"]')) {
+    b.addEventListener('click', () => openFeedbackDetailModal(rowMap.get(b.dataset.id)))
+  }
+  for (const b of view().querySelectorAll('button[data-act="ack-feedback"]')) {
+    b.addEventListener('click', async (ev) => {
+      const id = b.dataset.id
+      try {
+        await withBtnLoading(ev.currentTarget, () =>
+          apiJson('POST', `/api/admin/feedback/${encodeURIComponent(id)}/ack`, {}))
+        toast(`已确认反馈 #${id}`, 'ok')
+        applyHash() // 重新拉列表
+      } catch (e) {
+        toast(`确认失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  }
+}
+
+function openFeedbackDetailModal(r) {
+  if (!r) return
+  // meta JSON pretty;结合 request_id 给一个 grep 命令模板让运维直接复制
+  const metaText = r.meta && Object.keys(r.meta).length > 0
+    ? JSON.stringify(r.meta, null, 2)
+    : '(无 meta)'
+  const grepCmd = r.request_id
+    ? `journalctl -u openclaude --since "1 hour ago" | grep "${r.request_id}"`
+    : '# 此反馈无 request_id,无法 grep'
+
+  openModal(`
+    <h3>反馈 · #${escapeHtml(r.id)}</h3>
+    <div class="form-row">
+      <label>状态 / 时间</label>
+      <div>${_feedbackStatusBadge(r.status)}
+           <span class="mono" style="margin-left:8px;font-size:12px;opacity:0.7">${fmtDate(r.created_at)}</span>
+           ${r.handled_by ? `<br><span style="font-size:12px;opacity:0.7">已由 admin <code>#${escapeHtml(r.handled_by)}</code> 于 ${fmtDate(r.handled_at)} 确认</span>` : ''}</div>
+    </div>
+    <div class="form-row">
+      <label>用户</label>
+      <div>${r.user_id
+        ? (r.username
+            ? `${escapeHtml(r.username)} <code style="opacity:0.6">#${escapeHtml(r.user_id)}</code>`
+            : `<code>#${escapeHtml(r.user_id)}</code>`)
+        : '<span style="opacity:0.6">匿名</span>'}</div>
+    </div>
+    <div class="form-row">
+      <label>category</label>
+      <div><span class="badge muted">${escapeHtml(r.category)}</span></div>
+    </div>
+    <div class="form-row">
+      <label>描述</label>
+      <pre class="mono" style="background:var(--bg-2);padding:var(--s-3);border-radius:6px;
+           max-height:200px;overflow:auto;font-size:13px;line-height:1.5;
+           white-space:pre-wrap;word-break:break-word;">${escapeHtml(r.description)}</pre>
+    </div>
+    <div class="form-row">
+      <label>上下文</label>
+      <div class="mono" style="font-size:12px">
+        ${r.request_id ? `request_id: <code>${escapeHtml(r.request_id)}</code><br>` : ''}
+        ${r.version    ? `version:    <code>${escapeHtml(r.version)}</code><br>` : ''}
+        ${r.session_id ? `session_id: <code>${escapeHtml(r.session_id)}</code><br>` : ''}
+        ${r.user_agent ? `UA:         ${escapeHtml(r.user_agent)}<br>` : ''}
+      </div>
+    </div>
+    <div class="form-row">
+      <label>meta(JSON)</label>
+      <pre class="mono" style="background:var(--bg-2);padding:var(--s-3);border-radius:6px;
+           max-height:240px;overflow:auto;font-size:11px;line-height:1.5;">${escapeHtml(metaText)}</pre>
+    </div>
+    <div class="form-row">
+      <label>反查命令</label>
+      <pre class="mono" style="background:var(--bg-2);padding:var(--s-3);border-radius:6px;
+           font-size:11px;user-select:all;">${escapeHtml(grepCmd)}</pre>
+    </div>
+    <div class="form-actions">
+      ${r.status === 'open'
+        ? '<button id="f-modal-ack" class="btn-primary">确认</button>'
+        : ''}
+      <button id="f-modal-close">关闭</button>
+    </div>
+  `)
+  $('f-modal-close')?.addEventListener('click', closeModal)
+  if (r.status === 'open') {
+    $('f-modal-ack')?.addEventListener('click', async (ev) => {
+      try {
+        await withBtnLoading(ev.currentTarget, () =>
+          apiJson('POST', `/api/admin/feedback/${encodeURIComponent(r.id)}/ack`, {}))
+        closeModal()
+        toast(`已确认反馈 #${r.id}`, 'ok')
+        applyHash()
+      } catch (e) {
+        toast(`确认失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  }
 }
 
 // ─── Tab: Settings(4I)─────────────────────────────────────────────

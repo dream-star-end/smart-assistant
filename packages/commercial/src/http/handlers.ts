@@ -23,6 +23,8 @@ import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerifica
 import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.js";
 import { requireAuth } from "./auth.js";
 import { query } from "../db/queries.js";
+import { insertFeedback } from "../admin/feedback.js";
+import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
 import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLimitRedis } from "../middleware/rateLimit.js";
 import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
@@ -86,6 +88,8 @@ export interface CommercialHttpDeps {
     // 2026-04-21 安全审计 HIGH (refresh/logout 限流)补齐的条目
     refresh: RateLimitConfig;
     logout: RateLimitConfig;
+    // P1-2 (2026-04-25):用户反馈匿名可提交,必须按 IP 限流防 spam
+    feedback: RateLimitConfig;
   }>;
   /** T-12.1:开启后,login 强制要求 email_verified=true */
   requireEmailVerified?: boolean;
@@ -195,6 +199,8 @@ export const DEFAULT_RATE_LIMITS = {
   // 次足够覆盖正常多 tab race(典型 <10),又能堵枚举。
   refresh: { scope: "refresh", windowSeconds: 60, max: 30 } satisfies RateLimitConfig,
   logout: { scope: "logout", windowSeconds: 60, max: 30 } satisfies RateLimitConfig,
+  // P1-2:5/min/IP — 反馈是低频操作,匿名也允许,这个上限挡 spam 又不影响真实用户
+  feedback: { scope: "feedback", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
 };
 
 /**
@@ -1130,6 +1136,100 @@ export async function handleClearSession(
     res.setHeader("Set-Cookie", [String(existing), line]);
   }
   sendJson(res, 200, { ok: true });
+}
+
+// ─── POST /api/feedback (P1-2) ──────────────────────────────────────
+//
+// 用户反馈入库。匿名 / 已登录均可:
+//   - **user_id 关联**:仅认 Bearer token(避免 cookie-only 提交被 CSRF 误绑作者)
+//   - 匿名 / 过期 / 伪造 → user_id = null
+// 限流 5/min/IP。description 必填(15..10000),meta 必须为 object 且 JSON ≤ 8KB。
+// admin 通过 GET /api/admin/feedback + POST /api/admin/feedback/:id/ack 后台流转。
+//
+// **没有文件 fallback**(与个人版 gateway/server.ts:1325 不同):commercial 全栈
+// 依赖 PG,PG 故障期间 auth/sessions 都崩;反馈写不进就返 500,等 PG 恢复用户重试。
+
+export async function handleSubmitFeedback(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const cfg = deps.rateLimits?.feedback ?? DEFAULT_RATE_LIMITS.feedback;
+  await enforceRateLimit(deps, cfg, ctx.clientIp);
+
+  // **仅 Bearer 关联 user_id**(Codex 审:cookie 关联会被 CSRF 误绑)。
+  // 没 token / 校验失败 → 匿名,不抛错,gateway 行为兼容。
+  const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, "") ?? "";
+  let userId: string | null = null;
+  if (authHeader) {
+    const claims = verifyCommercialJwtSync(authHeader, deps.jwtSecret);
+    if (claims) userId = claims.sub;
+  }
+
+  const body = (await readJsonBody(req)) as Record<string, unknown> | undefined;
+  if (!body || typeof body !== "object") {
+    throw new HttpError(400, "VALIDATION", "invalid body");
+  }
+
+  const description =
+    typeof body.description === "string" ? body.description.trim() : "";
+  if (description.length < 15) {
+    throw new HttpError(400, "VALIDATION", "反馈描述至少需要 15 个字符", {
+      issues: [{ path: "description", message: "min 15 chars" }],
+    });
+  }
+  if (description.length > 10_000) {
+    throw new HttpError(400, "VALIDATION", "description too long (max 10000)", {
+      issues: [{ path: "description", message: "max 10000" }],
+    });
+  }
+
+  // 截断而不抛错:UA 等字段长度可能超限但语义无损;business field (description) 才硬拒
+  function strField(v: unknown, max: number): string | null {
+    if (typeof v !== "string") return null;
+    const t = v.trim();
+    if (!t) return null;
+    return t.length <= max ? t : t.slice(0, max);
+  }
+
+  const category = strField(body.category, 32) ?? "general";
+  const requestId = strField(body.request_id, 128);
+  const version = strField(body.version, 32);
+  const sessionId = strField(body.session_id, 64);
+  const userAgent =
+    strField(body.user_agent, 512) ?? strField(req.headers["user-agent"], 512);
+
+  let meta: Record<string, unknown> = {};
+  if (body.meta !== undefined) {
+    if (typeof body.meta !== "object" || body.meta === null || Array.isArray(body.meta)) {
+      throw new HttpError(400, "VALIDATION", "meta must be an object", {
+        issues: [{ path: "meta", message: "must be object" }],
+      });
+    }
+    const serialized = JSON.stringify(body.meta);
+    if (serialized.length > 8192) {
+      throw new HttpError(400, "VALIDATION", "meta too large (max 8KB)", {
+        issues: [{ path: "meta", message: `${serialized.length} bytes` }],
+      });
+    }
+    meta = body.meta as Record<string, unknown>;
+  }
+
+  const r = await insertFeedback({
+    user_id: userId,
+    category,
+    description,
+    request_id: requestId,
+    version,
+    session_id: sessionId,
+    user_agent: userAgent,
+    meta,
+  });
+
+  // 不记 description / meta(可能含 PII / 敏感上下文);仅 id + 关联 user + category
+  ctx.log.info("feedback_submitted", { id: r.id, user_id: userId, category });
+  sendJson(res, 200, { ok: true, id: r.id });
 }
 
 // helper for tests / 其他 module

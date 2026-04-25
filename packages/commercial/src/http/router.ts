@@ -43,6 +43,7 @@ import {
   handleGetMyUsage,
   handleCreateSession,
   handleClearSession,
+  handleSubmitFeedback,
   type CommercialHttpDeps,
   type RequestContext,
 } from "./handlers.js";
@@ -97,6 +98,11 @@ import {
   handleAdminListSettings,
   handleAdminGetSetting,
   handleAdminPutSetting,
+  handleAdminListOrders,
+  handleAdminOrdersKpi,
+  handleAdminGetOrder,
+  handleAdminListFeedback,
+  handleAdminAckFeedback,
 } from "./admin.js";
 import {
   handleAdminStatsDau,
@@ -480,6 +486,17 @@ export function createCommercialHandler(
     { method: "GET",  path: "/api/admin/v3/baseline-version",     handler: handleAdminBaselineVersion },
     { method: "GET",  pathPrefix: "/api/admin/v3/compute-hosts/", handler: handleAdminComputeHostBootstrapLog },
     { method: "POST", pathPrefix: "/api/admin/v3/compute-hosts/", handler: handleAdminComputeHostAction },
+    // P1-2 用户反馈入库(commercial 接管;gateway/server.ts:1325 那段对 commercial 已是死路)
+    //   匿名 / 已登录均可,IP 限流防 spam(handler 内 enforceRateLimit)
+    { method: "POST", path: "/api/feedback", handler: handleSubmitFeedback },
+    // P0-3 订单 admin —— exact path 在 prefix 之前(matchRoute exact-first)
+    //   /api/admin/orders/kpi 必须排前,否则会被 /api/admin/orders/ prefix 吞成 ORDER_NOT_FOUND
+    { method: "GET",  path: "/api/admin/orders",       handler: handleAdminListOrders },
+    { method: "GET",  path: "/api/admin/orders/kpi",   handler: handleAdminOrdersKpi },
+    { method: "GET",  pathPrefix: "/api/admin/orders/", handler: handleAdminGetOrder },
+    // P1-2 反馈 admin —— GET 列表 / POST :id/ack
+    { method: "GET",  path: "/api/admin/feedback",       handler: handleAdminListFeedback },
+    { method: "POST", pathPrefix: "/api/admin/feedback/", handler: handleAdminAckFeedback },
   ];
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [
@@ -492,6 +509,9 @@ export function createCommercialHandler(
     "/api/admin/",
     // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`
     "/api/remote-hosts",
+    // P1-2 (2026-04-25):commercial 接管 /api/feedback POST,阻止 fall through
+    // 到 gateway/server.ts:1325 的文件落盘 handler
+    "/api/feedback",
   ];
 
   return async function commercialHandler(req, res): Promise<boolean> {

@@ -21,7 +21,7 @@ import {
 import { _clearStoredAccessToken, _writeStoredAccessToken, getSession, isSending, setSending, state } from './state.js'
 
 // ── API layer ──
-import { abortInflightRefresh, apiFetch, apiGet, apiJson, authHeaders, clearProactiveRefresh, onAuthExpired, resetAuthExpired, scheduleProactiveRefresh, silentRefresh } from './api.js'
+import { abortInflightRefresh, apiFetch, apiGet, apiJson, authHeaders, clearProactiveRefresh, onAuthExpired, resetAuthExpired, scheduleProactiveRefresh, silentRefresh, snapshotDiagnostics } from './api.js'
 
 // ── IndexedDB ──
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
@@ -1668,11 +1668,39 @@ async function submitFeedback() {
   btn.textContent = '提交中…'
   try {
     const sess = getSession()
+    // P1-1 (2026-04-25):附诊断上下文给 admin 反查。_diagBuffer 存最近 50 条 API
+    // 错误,这里取最后 5 条;request_id 取这 5 条里有的 requestId 去重前 10 个。
+    const diag = snapshotDiagnostics()
+    const lastErrors = diag.slice(-5).map(e => ({
+      ts: e.ts,
+      route: e.route,
+      status: e.status,
+      code: e.code,
+      message: e.message,
+      requestId: e.requestId,
+    }))
+    const requestIds = Array.from(new Set(
+      diag.map(e => e.requestId).filter(Boolean)
+    )).slice(-10)
+    const swCtl = (typeof navigator !== 'undefined' && navigator.serviceWorker)
+      ? navigator.serviceWorker.controller
+      : null
+    const meta = {
+      last_api_errors: lastErrors,
+      request_ids: requestIds,
+      current_route: window.location.pathname + window.location.search + window.location.hash,
+      sw_active: !!swCtl,
+      sw_state: swCtl?.state ?? null,
+      ts: new Date().toISOString(),
+    }
     const resp = await apiJson('POST', '/api/feedback', {
       category,
       description: desc,
-      sessionId: sess?.id || null,
-      userAgent: navigator.userAgent,
+      // 后端字段命名:snake_case (与 admin/feedback.ts 入参一致)
+      session_id: sess?.id || null,
+      user_agent: navigator.userAgent,
+      version: (_changelogData && _changelogData.currentVersion) || null,
+      meta,
     })
     if (resp.ok) {
       // Show success state
