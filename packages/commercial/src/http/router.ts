@@ -105,6 +105,8 @@ import {
   handleAdminStatsRequestSeries,
   handleAdminStatsAlertsSummary,
   handleAdminStatsAccountPool,
+  handleAdminStatsHostsUtilization,
+  handleAdminStatsAlertEvents7d,
   handleAdminDiagnostics,
 } from './adminStats.js'
 import {
@@ -502,6 +504,17 @@ export function createCommercialHandler(
       handler: handleAdminStatsAlertsSummary,
     },
     { method: 'GET', path: '/api/admin/stats/account-pool', handler: handleAdminStatsAccountPool },
+    // P2 Plan v10 — 虚机利用率分布 + 7d 告警事件分布(dashboard 重排新增)
+    {
+      method: 'GET',
+      path: '/api/admin/stats/hosts-utilization',
+      handler: handleAdminStatsHostsUtilization,
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/stats/alert-events-7d',
+      handler: handleAdminStatsAlertEvents7d,
+    },
     // V3 Phase 4H 超管运行时设置(allowlist + per-key zod)
     { method: 'GET', path: '/api/admin/settings', handler: handleAdminListSettings },
     { method: 'GET', pathPrefix: '/api/admin/settings/', handler: handleAdminGetSetting },

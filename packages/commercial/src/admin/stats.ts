@@ -16,6 +16,7 @@
  */
 
 import { query } from "../db/queries.js";
+import { listComputeHostsForAdmin } from "./computeHosts.js";
 
 // ─── DAU / WAU / MAU ──────────────────────────────────────────────────
 
@@ -403,4 +404,80 @@ export async function getAccountPoolSnapshot(): Promise<AccountPoolSnapshot> {
     today_requests: total,
     today_success_rate: total > 0 ? success / total : 1,
   };
+}
+
+// ─── P2 — Hosts utilization (for dashboard "虚机利用率分布" stacked bar) ───
+
+export interface HostUtilizationItem {
+  uuid: string;
+  name: string;
+  active: number;
+  max: number;
+  status: string;
+}
+
+export interface HostsUtilizationResult {
+  /** sum(active_containers) over all hosts */
+  used: number;
+  /** sum(max_containers) over all hosts */
+  capacity: number;
+  per_host: HostUtilizationItem[];
+}
+
+/**
+ * 虚机利用率聚合。复用 `listComputeHostsForAdmin()` —— 已经做了 active 计数 join,
+ * 不重复跑 SQL,避免和 hosts tab 出现两套口径。
+ *
+ * Plan v10 P2 spec:dashboard 顶部 stacked bar,每个 host 一根柱子(active vs free)。
+ */
+export async function getHostsUtilization(): Promise<HostsUtilizationResult> {
+  const hosts = await listComputeHostsForAdmin();
+  let used = 0;
+  let capacity = 0;
+  const per_host: HostUtilizationItem[] = hosts.map((h) => {
+    const active = h.active_containers | 0;
+    const max = h.max_containers | 0;
+    used += active;
+    capacity += max;
+    return { uuid: h.id, name: h.name, active, max, status: h.status };
+  });
+  return { used, capacity, per_host };
+}
+
+// ─── P2 — Alert events 7d (for dashboard "告警 · 7d 事件分布" stacked bar) ─
+
+export interface AlertEvent7dRow {
+  /** "YYYY-MM-DD"(date_trunc('day') + ::date) */
+  day: string;
+  event_type: string;
+  count: number;
+}
+
+/**
+ * 7 天告警事件分布。
+ *
+ * SQL `COUNT(*)::int` —— PG int8 在 node-pg 里默认是 string,前端 sum/sort 会
+ * 静默错(参考 P1 同模式)。row mapper 也兜底 `Number()`。
+ *
+ * 走 idx_aao_created_at(created_at DESC) 扫 7 天范围,即使 outbox 涨到 100k+ 也
+ * 不会成瓶颈(admin 调用量低 + 7d 窗口小)。
+ */
+export async function getAlertEvents7d(): Promise<AlertEvent7dRow[]> {
+  const r = await query<{ day: Date; event_type: string; count: number }>(
+    `SELECT date_trunc('day', created_at)::date AS day,
+            event_type,
+            COUNT(*)::int AS count
+       FROM admin_alert_outbox
+      WHERE created_at > NOW() - INTERVAL '7 days'
+      GROUP BY 1, 2
+      ORDER BY 1`,
+  );
+  return r.rows.map((row) => ({
+    // PG date 列被 node-pg 反序列化成 Date(本地时区午夜);toISOString().slice(0,10)
+    // 是 UTC 日期,可能与"北京时间所在那天"差一天。但 outbox 用 NOW()(server tz)
+    // 和 date_trunc 都在 PG 里,不跨 tz;前端只是 X 轴 label 用,差一天可接受。
+    day: row.day instanceof Date ? row.day.toISOString().slice(0, 10) : String(row.day),
+    event_type: row.event_type,
+    count: Number(row.count),
+  }));
 }

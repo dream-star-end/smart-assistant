@@ -25,6 +25,8 @@ import {
   getRequestSeries,
   getAlertsSummary,
   getAccountPoolSnapshot,
+  getHostsUtilization,
+  getAlertEvents7d,
   type ActivityWindow,
 } from "../admin/stats.js";
 import { getPool } from "../db/index.js";
@@ -125,6 +127,32 @@ export async function handleAdminStatsAccountPool(
   await requireAdmin(req, deps.jwtSecret);
   const out = await getAccountPoolSnapshot();
   sendJson(res, 200, out);
+}
+
+// ─── GET /api/admin/stats/hosts-utilization (P2 Plan v10) ────────────
+
+export async function handleAdminStatsHostsUtilization(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const out = await getHostsUtilization();
+  sendJson(res, 200, out);
+}
+
+// ─── GET /api/admin/stats/alert-events-7d (P2 Plan v10) ──────────────
+
+export async function handleAdminStatsAlertEvents7d(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const rows = await getAlertEvents7d();
+  sendJson(res, 200, { rows });
 }
 
 // ─── GET /api/admin/diagnostics (M8.4 / P2-20) ────────────────────────

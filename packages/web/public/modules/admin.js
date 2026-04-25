@@ -18,7 +18,7 @@
 
 import { _clearStoredAccessToken, state } from './state.js'
 import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js'
-import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js'
+import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
@@ -486,10 +486,12 @@ async function renderDashboardTab() {
 
       <div class="stat-grid" id="dash-kpis">
         ${[
+          // P2 Plan v10:11 张 KPI,2 行 6+5(商业 6 / 资源 5)。
+          // 商业类
           '活跃用户 DAU','窗口新注册','付费用户','返场用户',
-          '24h 请求数','24h Token','账号池 可用','告警 · 待处理',
-          // P0-3 (2026-04-25):订单异常 KPI;点击跳转 orders tab 预过滤
-          '24h pending 超时','24h 回调冲突',
+          '7d 营收','24h 订单异常',
+          // 资源类
+          '24h 请求数','24h Token','账号池 可用','容器活跃','虚机利用率',
         ].map((label) => `
           <div class="stat-card">
             <div class="stat-label">${escapeHtml(label)}</div>
@@ -512,10 +514,10 @@ async function renderDashboardTab() {
         </div>
         <div class="chart-card">
           <div class="chart-card-head">
-            <h3>账号池状态</h3>
-            <a class="admin-link" data-nav="accounts">详情 →</a>
+            <h3>虚机利用率分布</h3>
+            <a class="admin-link" data-nav="hosts">主机管理 →</a>
           </div>
-          <div class="chart-card-body"><canvas id="dash-chart-pool"></canvas></div>
+          <div class="chart-card-body"><canvas id="dash-chart-hosts"></canvas></div>
         </div>
       </div>
 
@@ -529,11 +531,11 @@ async function renderDashboardTab() {
         </div>
         <div class="chart-card">
           <div class="chart-card-head">
-            <h3>告警概况 · 24h</h3>
+            <h3>告警 · 7d 事件分布</h3>
             <a class="admin-link" data-nav="alerts">告警中心 →</a>
           </div>
-          <div class="chart-card-body" id="dash-alerts-body">
-            <div class="skeleton-row"><div class="skeleton-bar w60"></div></div>
+          <div class="chart-card-body" id="dash-alerts7d-body">
+            <canvas id="dash-chart-alerts7d"></canvas>
           </div>
         </div>
       </div>
@@ -639,6 +641,29 @@ function _renderChartError(canvas, msg) {
   }
 }
 
+/** 替换 alerts7d-body 的内容为占位文本前,先 destroy 已挂的 chart 防泄漏。
+ *  下一轮恢复有数据时由 _ensureAlerts7dCanvas() 重建 canvas。 */
+function _replaceAlerts7dWithText(bodyEl, html) {
+  if (DASH_STATE.charts.alerts7d) {
+    destroyChart(DASH_STATE.charts.alerts7d)
+    DASH_STATE.charts.alerts7d = null
+  }
+  bodyEl.innerHTML = html
+}
+
+/** 确保 alerts7d-body 内有 canvas;若上一轮被 _replaceAlerts7dWithText 换成 div
+ *  了,重建一个 canvas 节点并返回。 */
+function _ensureAlerts7dCanvas(bodyEl) {
+  let canvas = document.getElementById('dash-chart-alerts7d')
+  if (!canvas) {
+    bodyEl.innerHTML = ''
+    canvas = document.createElement('canvas')
+    canvas.id = 'dash-chart-alerts7d'
+    bodyEl.appendChild(canvas)
+  }
+  return canvas
+}
+
 async function loadDashboardData(seq) {
   const dauW = DASH_STATE.dauWindow
   const reqH = DASH_STATE.reqHours
@@ -647,17 +672,19 @@ async function loadDashboardData(seq) {
   // 覆盖成功态)。用独立 loadSeq 判定"我是不是最新一次 load",非最新直接 bail。
   const myLoadSeq = ++DASH_STATE.loadSeq
 
-  // 并行拉 5 条新 stats + 2 条明细 (accounts / ledger) + P0-3 orders KPI。
-  // 每个端点独立 fulfilled/rejected,失败的不传染其他卡片(R1 Codex M3)。
-  const [dauR, revR, reqR, alertsR, poolR, accountsR, ledgerR, ordersKpiR] = await Promise.allSettled([
+  // 并行拉 stats + 明细 (accounts / ledger) + orders KPI + P2 Plan v10 新 2 条
+  // (hosts-utilization 用于"容器活跃""虚机利用率"KPI 与新堆叠柱;alert-events-7d
+  // 替换原 24h alerts 卡)。每个端点独立 fulfilled/rejected,失败的不传染其他卡。
+  const [dauR, revR, reqR, poolR, accountsR, ledgerR, ordersKpiR, hostsR, alerts7dR] = await Promise.allSettled([
     apiGet(`/api/admin/stats/dau?window=${encodeURIComponent(dauW)}`),
     apiGet(`/api/admin/stats/revenue-by-day?days=14`),
     apiGet(`/api/admin/stats/request-series?hours=${reqH}`),
-    apiGet(`/api/admin/stats/alerts-summary`),
     apiGet(`/api/admin/stats/account-pool`),
     apiGet(`/api/admin/accounts`),
     apiGet(`/api/admin/ledger?limit=8`),
     apiGet(`/api/admin/orders/kpi`),
+    apiGet(`/api/admin/stats/hosts-utilization`),
+    apiGet(`/api/admin/stats/alert-events-7d`),
   ])
 
   // R2 Codex M1:fetch 期间如果用户切 tab / 又触发了一次 renderDashboardTab,
@@ -671,24 +698,28 @@ async function loadDashboardData(seq) {
   const dau        = dauR.status === 'fulfilled' ? dauR.value : null
   const revOk      = revR.status === 'fulfilled'
   const reqOk      = reqR.status === 'fulfilled'
-  const alertsOk   = alertsR.status === 'fulfilled'
   const poolOk     = poolR.status === 'fulfilled'
   const accountsOk = accountsR.status === 'fulfilled'
   const ledgerOk   = ledgerR.status  === 'fulfilled'
   const rev        = revOk    ? (revR.value?.rows || []) : []
   const reqSeries  = reqOk    ? (reqR.value?.rows || []) : []
-  const alerts     = alertsOk ? alertsR.value : null
   const pool       = poolOk   ? poolR.value : null
   const accounts   = accountsOk ? (accountsR.value?.rows || []) : []
   const ledger     = ledgerOk  ? (ledgerR.value?.rows  || []) : []
   const ordersKpiOk = ordersKpiR.status === 'fulfilled'
   const ordersKpi   = ordersKpiOk ? (ordersKpiR.value?.kpi || null) : null
+  const hostsOk    = hostsR.status === 'fulfilled'
+  const hostsUtil  = hostsOk ? hostsR.value : null
+  const alerts7dOk = alerts7dR.status === 'fulfilled'
+  const alerts7d   = alerts7dOk ? (alerts7dR.value?.rows || []) : []
 
-  // ─── KPI 卡片(8 项) ───
+  // ─── KPI 卡片(P2 Plan v10:11 张,2 行 6+5) ───
+  // 商业类(0..5): DAU / 新注册 / 付费 / 返场 / 7d营收 / 24h订单异常
+  // 资源类(6..10): 24h请求 / 24h Token / 账号池可用 / 容器活跃 / 虚机利用率
   const statCards = view().querySelectorAll('#dash-kpis .stat-card')
   const wLabel = dauW === '24h' ? '24 小时' : dauW === '7d' ? '7 天' : '30 天'
 
-  // 1-4. DAU 相关四张卡 — /stats/dau 失败 → 保持骨架,不显示 0
+  // 0-3. DAU 相关四张卡 — /stats/dau 失败 → "加载失败"占位
   if (dau) {
     updateStat(statCards[0], dau.active_users.toLocaleString(), `窗口 ${wLabel}`, null)
     updateStat(statCards[1], dau.new_users.toLocaleString(),
@@ -701,25 +732,48 @@ async function loadDashboardData(seq) {
     for (const i of [0, 1, 2, 3]) updateStat(statCards[i], '—', '加载失败', 'danger')
   }
 
-  // 5-6. request series — 失败 → "—"
+  // 4. 7d 营收 — 复用 revenue-by-day 14d 数据,取最近 7 天求和
+  if (revOk) {
+    const last7 = rev.slice(-7)
+    const cents7 = last7.reduce((a, r) => a + (Number(r.paid_amount_cents) || 0), 0)
+    const orders7 = last7.reduce((a, r) => a + (Number(r.orders_paid) || 0), 0)
+    updateStat(statCards[4], `¥${(cents7 / 100).toFixed(2)}`,
+      `${orders7} 笔 · 最近 7 天`, cents7 > 0 ? 'success' : null)
+  } else {
+    updateStat(statCards[4], '—', '加载失败', 'danger')
+  }
+
+  // 5. 24h 订单异常 — pending_overdue_24h + callback_conflicts_24h 合并
+  if (ordersKpi) {
+    const overdue24 = Number(ordersKpi.pending_overdue_24h || 0)
+    const conflict24 = Number(ordersKpi.callback_conflicts_24h || 0)
+    const total = overdue24 + conflict24
+    const tone = conflict24 > 0 ? 'danger' : overdue24 > 0 ? 'warning' : null
+    updateStat(statCards[5], total.toLocaleString(),
+      total > 0 ? `卡单 ${overdue24} · 冲突 ${conflict24}` : '24h 无异常', tone)
+  } else {
+    updateStat(statCards[5], '—', '加载失败', 'danger')
+  }
+
+  // 6-7. request series — 失败 → "—"
   if (reqOk) {
     const totalReq = reqSeries.reduce((a, r) => a + (Number(r.total) || 0), 0)
     const totalErr = reqSeries.reduce((a, r) => a + (Number(r.error) || 0), 0)
     const errRate = totalReq > 0 ? (totalErr / totalReq) : 0
-    updateStat(statCards[4], totalReq.toLocaleString(),
+    updateStat(statCards[6], totalReq.toLocaleString(),
       totalReq > 0 ? `错误率 ${(errRate * 100).toFixed(2)}%` : `窗口 ${reqH}h 无请求`,
       totalReq === 0 ? null : (errRate > 0.05 ? 'danger' : errRate > 0.01 ? 'warning' : 'success'))
     const totalTokens = reqSeries.reduce((a, r) => {
       const t = Number(r.tokens || 0)
       return Number.isFinite(t) ? a + t : a
     }, 0)
-    updateStat(statCards[5], cfmt.compact(totalTokens), `窗口 ${reqH}h 总 token`, null)
+    updateStat(statCards[7], cfmt.compact(totalTokens), `窗口 ${reqH}h 总 token`, null)
   } else {
-    updateStat(statCards[4], '—', '加载失败', 'danger')
-    updateStat(statCards[5], '—', '加载失败', 'danger')
+    updateStat(statCards[6], '—', '加载失败', 'danger')
+    updateStat(statCards[7], '—', '加载失败', 'danger')
   }
 
-  // 7. 账号池
+  // 8. 账号池可用
   if (pool) {
     const avail = pool.active
     const tot = pool.total
@@ -727,55 +781,37 @@ async function loadDashboardData(seq) {
       : pool.cooldown > 0 ? 'warning' : 'danger')
     const meta = pool.cooldown > 0 ? `${pool.cooldown} 冷却`
       : (pool.disabled + pool.banned > 0 ? `${pool.disabled + pool.banned} 禁用/封禁` : '全部健康')
-    updateStat(statCards[6], `${avail} / ${tot}`, meta, tone)
-  } else {
-    updateStat(statCards[6], '—', '加载失败', 'danger')
-  }
-
-  // 8. 告警待处理
-  if (alerts) {
-    const p = alerts.outbox.pending + alerts.outbox.failed
-    const sev = alerts.events_24h_by_severity
-    const tone = alerts.outbox.failed > 0 ? 'danger'
-      : alerts.outbox.pending > 0 ? 'warning'
-      : sev.critical > 0 ? 'danger' : null
-    updateStat(statCards[7], p.toLocaleString(),
-      `发送 24h · ${alerts.outbox.sent_24h}  规则 firing · ${alerts.rules.firing}`,
-      tone)
-  } else {
-    updateStat(statCards[7], '—', '加载失败', 'danger')
-  }
-
-  // 9-10. P0-3 订单异常(orders/kpi)— 失败 → "—"
-  if (ordersKpi) {
-    const overdue = Number(ordersKpi.pending_overdue_24h || 0)
-    const overdueAll = Number(ordersKpi.pending_overdue || 0)
-    const tone1 = overdue > 0 ? 'warning' : null
-    updateStat(statCards[8], overdue.toLocaleString(),
-      overdueAll > 0 ? `累计卡单 ${overdueAll}` : '无累计卡单', tone1)
-
-    const conflict = Number(ordersKpi.callback_conflicts_24h || 0)
-    const tone2 = conflict > 0 ? 'danger' : null
-    updateStat(statCards[9], conflict.toLocaleString(),
-      conflict > 0 ? '点击进入订单' : '无冲突', tone2)
+    updateStat(statCards[8], `${avail} / ${tot}`, meta, tone)
   } else {
     updateStat(statCards[8], '—', '加载失败', 'danger')
-    updateStat(statCards[9], '—', '加载失败', 'danger')
   }
-  // P0-3:KPI 卡片整张点击跳转 orders tab 并预过滤(state.js 持久化)
-  // statCards[8] = pending overdue → 预过滤 status='pending'
-  // statCards[9] = callback conflicts → 不能纯靠 status 过滤(冲突走 alert outbox),
-  //                直接跳到 orders 列表,运营再用 user/order 检索
-  statCards[8]?.addEventListener('click', () => {
-    sessionStorage.setItem('admin_orders_status', 'pending')
-    navigate('orders')
-  })
-  statCards[9]?.addEventListener('click', () => {
+
+  // 9-10. 容器活跃 / 虚机利用率(P2 Plan v10 新)
+  if (hostsUtil) {
+    const used = Number(hostsUtil.used || 0)
+    const cap = Number(hostsUtil.capacity || 0)
+    updateStat(statCards[9], used.toLocaleString(),
+      `${(hostsUtil.per_host || []).length} 台主机`, used > 0 ? 'success' : null)
+    if (cap > 0) {
+      const pct = (used / cap) * 100
+      const tone = pct >= 90 ? 'danger' : pct >= 70 ? 'warning' : null
+      updateStat(statCards[10], `${pct.toFixed(0)}%`, `${used} / ${cap} 容量`, tone)
+    } else {
+      updateStat(statCards[10], '—', '无主机配额', null)
+    }
+  } else {
+    updateStat(statCards[9], '—', '加载失败', 'danger')
+    updateStat(statCards[10], '—', '加载失败', 'danger')
+  }
+
+  // KPI 跳转:订单异常 → orders;容器活跃 / 虚机利用率 → containers / hosts
+  statCards[5]?.addEventListener('click', () => {
     sessionStorage.removeItem('admin_orders_status')
     navigate('orders')
   })
-  // 鼠标悬停时给 KPI 卡可点击的视觉提示
-  for (const i of [8, 9]) {
+  statCards[9]?.addEventListener('click', () => navigate('containers'))
+  statCards[10]?.addEventListener('click', () => navigate('hosts'))
+  for (const i of [5, 9, 10]) {
     if (statCards[i]) statCards[i].style.cursor = 'pointer'
   }
 
@@ -798,18 +834,28 @@ async function loadDashboardData(seq) {
     }
   }
 
-  // ─── Chart: 账号池环形 ───
-  const poolCanvas = document.getElementById('dash-chart-pool')
-  if (poolCanvas) {
-    if (pool) {
-      DASH_STATE.charts.pool = poolCanvas
-      donutChart(poolCanvas, {
-        labels: ['active', 'cooldown', 'disabled', 'banned'],
-        values: [pool.active, pool.cooldown, pool.disabled, pool.banned],
-        colors: ['--ok', '--warn', '--muted', '--danger'],
+  // ─── Chart: 虚机利用率分布(P2 Plan v10:每 host 一根柱,active vs free) ───
+  const hostsCanvas = document.getElementById('dash-chart-hosts')
+  if (hostsCanvas) {
+    if (hostsUtil) {
+      const phs = hostsUtil.per_host || []
+      DASH_STATE.charts.hosts = hostsCanvas
+      // 名字过长截断到 16 字;主机数受 hosts 表 max_containers 配额管理,实际不会过多
+      const labels = phs.map((h) => (h.name || h.uuid || '').slice(0, 16))
+      const activeData = phs.map((h) => Number(h.active) || 0)
+      const freeData = phs.map((h) => Math.max(0, (Number(h.max) || 0) - (Number(h.active) || 0)))
+      barChart(hostsCanvas, {
+        labels,
+        stacked: true,
+        series: [
+          { label: '已用', data: activeData },
+          { label: '剩余', data: freeData,
+            color: getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#888' },
+        ],
+        yFormatter: (v) => Number.isInteger(v) ? String(v) : v.toFixed(1),
       })
     } else {
-      _renderChartError(poolCanvas, '加载失败')
+      _renderChartError(hostsCanvas, '加载失败')
     }
   }
 
@@ -843,37 +889,63 @@ async function loadDashboardData(seq) {
     }
   }
 
-  // ─── 告警概况列表 ───
-  const alertsEl = $('dash-alerts-body')
-  if (alertsEl && !alertsOk) {
-    alertsEl.innerHTML = '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--danger)">加载失败</div>'
-  } else if (alertsEl && alerts) {
-    const sev = alerts.events_24h_by_severity
-    const bars = `
-      <div style="display:flex;gap:var(--s-3);flex-wrap:wrap;">
-        <span class="stat-chip danger">critical · ${sev.critical}</span>
-        <span class="stat-chip warn">warning · ${sev.warning}</span>
-        <span class="stat-chip ok">info · ${sev.info}</span>
-      </div>
-      <div style="font-size:12px;color:var(--muted);margin-top:8px;">
-        outbox: <b>${alerts.outbox.pending}</b> 待发
-        · <b>${alerts.outbox.failed}</b> 失败
-        · <b>${alerts.outbox.sent_24h}</b> 24h 已发
-        ${alerts.outbox.oldest_pending_age_sec > 0
-          ? `<br>最老 pending 等待 <b>${fmtAgeSec(alerts.outbox.oldest_pending_age_sec)}</b>`
-          : ''}
-      </div>
-      <div class="dash-alerts" style="margin-top:var(--s-3);">
-        <div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:0.06em;">最近 firing 规则</div>
-        ${alerts.rules.recent_firing.length === 0
-          ? `<div class="empty" style="padding:8px;font-size:12px;color:var(--muted)">当前无规则处于 firing</div>`
-          : alerts.rules.recent_firing.map((r) => `
-              <div class="dash-alert-row">
-                <code>${escapeHtml(r.rule_id)}</code>
-                <span class="dash-alert-time">${escapeHtml(fmtDate(r.fired_at))}</span>
-              </div>`).join('')}
-      </div>`
-    alertsEl.innerHTML = bars
+  // ─── Chart: 告警 · 7d 事件分布(P2 Plan v10:每天一根柱,按 event_type 堆叠) ───
+  // - 永远固定 7 根日柱(今天 - 6 ... 今天),稀疏事件 0 补齐,避免视觉误导(Codex review #1)
+  // - empty 判定看 totalCount(行数 0 或聚合 0 都算 empty-ok)
+  // - DOM:用 _ensureAlerts7dCanvas() 在 empty/失败 后能恢复 canvas;若直接 innerHTML
+  //   替换 canvas → 下一轮 30s 刷新 getElementById 拿不到 canvas 卡死(Codex review #1)
+  const alertsBody = $('dash-alerts7d-body')
+  if (alertsBody) {
+    if (!alerts7dOk) {
+      _replaceAlerts7dWithText(alertsBody,
+        '<div class="empty" style="padding:var(--s-3);font-size:13px;color:var(--danger)">加载失败</div>')
+    } else {
+      // 1. 固定生成最近 7 天 day labels(本地时区,与 PG date_trunc 服务器时区可能差一天,
+      //    跨边界的 row 直接丢弃 — admin 看趋势够用)
+      const days = []
+      const today = new Date()
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i)
+        const yyyy = d.getFullYear()
+        const mm = String(d.getMonth() + 1).padStart(2, '0')
+        const dd = String(d.getDate()).padStart(2, '0')
+        days.push(`${yyyy}-${mm}-${dd}`)
+      }
+      const dayIndex = new Map(days.map((d, i) => [d, i]))
+      // 2. 收集 event_type(出场顺序)
+      const types = []
+      const typeIndex = new Map()
+      for (const r of alerts7d) {
+        if (!typeIndex.has(r.event_type)) {
+          typeIndex.set(r.event_type, types.length)
+          types.push(r.event_type)
+        }
+      }
+      // 3. 矩阵 + total
+      const matrix = types.map(() => days.map(() => 0))
+      let total = 0
+      for (const r of alerts7d) {
+        const di = dayIndex.get(r.day)
+        if (di == null) continue  // 7 日窗口外的 row 丢弃
+        const ti = typeIndex.get(r.event_type)
+        const v = Number(r.count) || 0
+        matrix[ti][di] = v
+        total += v
+      }
+      if (total === 0) {
+        _replaceAlerts7dWithText(alertsBody,
+          `<div class="empty-ok" style="padding:var(--s-4);font-size:13px;color:var(--ok);text-align:center;">近 7 天无告警 · 一切正常</div>`)
+      } else {
+        const canvas = _ensureAlerts7dCanvas(alertsBody)
+        DASH_STATE.charts.alerts7d = canvas
+        barChart(canvas, {
+          labels: days.map((d) => cfmt.dayShort(d)),
+          stacked: true,
+          series: types.map((t, i) => ({ label: t, data: matrix[i] })),
+          yFormatter: (v) => Number.isInteger(v) ? String(v) : v.toFixed(1),
+        })
+      }
+    }
   }
 
   // ─── 账号池明细列 ───
@@ -933,19 +1005,6 @@ async function loadDashboardData(seq) {
 
   const ts = $('dash-last-refresh')
   if (ts) ts.textContent = `更新于 ${fmtTime(new Date().toISOString())}  ·  30s 自动刷新`
-}
-
-/** 人类可读的等待秒数 ("5分02秒" / "1小时23分" / "3天")。 */
-function fmtAgeSec(sec) {
-  const s = Math.max(0, Math.floor(Number(sec) || 0))
-  if (s < 60) return `${s} 秒`
-  if (s < 3600) return `${Math.floor(s / 60)} 分 ${s % 60} 秒`
-  if (s < 86400) {
-    const h = Math.floor(s / 3600)
-    const m = Math.floor((s % 3600) / 60)
-    return `${h} 小时 ${m} 分`
-  }
-  return `${Math.floor(s / 86400)} 天`
 }
 
 /** ISO 时间 → "刚刚" / "3 分钟前" / "2 天前" / "2026-01-03"(超 30 天)。 */
