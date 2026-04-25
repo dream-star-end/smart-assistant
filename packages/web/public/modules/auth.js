@@ -242,22 +242,27 @@ async function _mountWidget(container) {
     container.innerHTML = '<div style="color:var(--fg-muted);font-size:var(--text-xs)">[turnstile bypass]</div>'
     return () => 'bypass'
   }
-  // Show loading placeholder so user knows the widget is coming (CF challenges.
-  // cloudflare.com can be slow or blocked; a blank div looked broken).
-  // render() at L_RENDER below will overwrite this via innerHTML = ''.
-  container.innerHTML = '<div class="muted" style="font-size:var(--text-xs);padding:8px 0">正在加载人机验证…</div>'
-  try {
-    await _loadTurnstileScript()
-  } catch {
-    container.innerHTML = '<div style="color:var(--danger);font-size:var(--text-xs);padding:8px 0">人机验证加载失败,请检查网络后刷新页面</div>'
-    return () => ''
-  }
+  // 必须先查 existing,再决定要不要写 placeholder —— 之前 render 过的话,
+  // CF widget 的 DOM 节点是 container 的子树,任何 innerHTML 写入都会把它
+  // 物理销毁。CF 内部 widgetId map 仍指向旧节点 → reset/getResponse 都失败,
+  // console 会出现 "Cannot find Widget cf-chl-widget-XXX",用户停在 placeholder
+  // 上提交时 token 是空 → 后端 TURNSTILE_FAILED。(2026-04-26 boss 反馈)
   const existing = _widgetIdByContainer.get(container)
   if (existing != null) {
     try { window.turnstile?.reset(existing) } catch {}
     return () => {
       try { return window.turnstile?.getResponse(existing) || '' } catch { return '' }
     }
+  }
+  // 首次 mount 才走 placeholder + script load + render 路径。
+  // CF challenges.cloudflare.com 可能慢或被墙;空 div 看起来像坏了,所以放
+  // placeholder。render() 成功时下面的 innerHTML='' 会覆盖它。
+  container.innerHTML = '<div class="muted" style="font-size:var(--text-xs);padding:8px 0">正在加载人机验证…</div>'
+  try {
+    await _loadTurnstileScript()
+  } catch {
+    container.innerHTML = '<div style="color:var(--danger);font-size:var(--text-xs);padding:8px 0">人机验证加载失败,请检查网络后刷新页面</div>'
+    return () => ''
   }
   // Don't try to render into an invisible container — Turnstile bails silently
   // inside a 0×0 parent,但 render() 仍返回 widgetId;后续 setMode 只做 reset 而
