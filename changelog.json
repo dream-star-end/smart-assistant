@@ -1,8 +1,8 @@
 {
-  "currentVersion": "v3-20260425T0201Z-96a31e4",
+  "currentVersion": "v3-20260425T0735Z-af46433",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v3-20260425T0735Z-af46433",
       "date": "2026-04-25",
       "title": "登录页自动填充补丁",
       "items": [
