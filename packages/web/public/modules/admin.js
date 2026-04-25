@@ -1404,6 +1404,52 @@ function _renderAccountsTable() {
   for (const b of el.querySelectorAll('button[data-act="reset-cooldown"]')) {
     b.addEventListener('click', (ev) => resetAccountCooldown(b.dataset.id, b.dataset.label, ev.currentTarget))
   }
+  for (const b of el.querySelectorAll('button[data-act="refresh-history"]')) {
+    b.addEventListener('click', () => _openRefreshHistoryModal(b.dataset.id, b.dataset.label))
+  }
+}
+
+// M6/P1-9 — 渲染 refresh 事件类型为可读 chip
+function _renderRefreshEventChip(ev) {
+  if (ev.ok) return '<span class="chip chip-ok">成功</span>'
+  const code = ev.err_code || 'unknown'
+  // network_transient 不 disable 账号 → muted;其他都是 disable 类 → danger
+  const cls = code === 'network_transient' ? 'chip-warn' : 'chip-danger'
+  return `<span class="chip ${cls}">${escapeHtml(code)}</span>`
+}
+
+async function _openRefreshHistoryModal(accountId, accountLabel) {
+  const headerHtml = `
+    <h3 style="margin:0 0 12px 0;">账号 #${escapeHtml(accountId)} (${escapeHtml(accountLabel)}) — OAuth refresh 历史</h3>
+  `
+  openModal(headerHtml + `<div id="refresh-events-body"><div class="muted" style="padding:12px 0;">加载中…</div></div>`)
+  const body = document.getElementById('refresh-events-body')
+  try {
+    const url = `/api/admin/accounts/refresh-events?account_id=${encodeURIComponent(accountId)}&limit=50`
+    const r = await apiGet(url)
+    const events = Array.isArray(r?.events) ? r.events : []
+    if (events.length === 0) {
+      body.innerHTML = `<div class="muted" style="padding:12px 0;">该账号暂无 refresh 事件记录(28 天 retention)。</div>`
+      return
+    }
+    const rows = events.map((ev) => {
+      const tsStr = fmtDate(ev.ts)
+      const chip = _renderRefreshEventChip(ev)
+      const detail = ev.ok
+        ? '—'
+        : `<span class="mono">${escapeHtml(ev.err_msg || '')}</span>`
+      return `<tr><td class="mono">${escapeHtml(tsStr)}</td><td>${chip}</td><td>${detail}</td></tr>`
+    }).join('')
+    body.innerHTML = `
+      <table class="data-table">
+        <thead><tr><th>时间</th><th>结果</th><th>详情</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="muted" style="margin-top:8px;font-size:12px;">仅展示最近 50 条;事件保留 28 天后自动清理。详情字段为后端枚举字面量,不含 raw error。</div>
+    `
+  } catch (e) {
+    body.innerHTML = `<div class="chip chip-danger">加载失败:${escapeHtml(e.message || String(e))}</div>`
+  }
 }
 
 // 返回账号的 warning chip 拼好的 HTML 串(放在 label 单元格尾巴)。
@@ -1476,6 +1522,7 @@ function _renderAccountRow(a) {
       <td class="mono" title="${escapeHtml(a.egress_proxy || '')}">${escapeHtml(a.egress_proxy || '—')}</td>
       <td class="actions">
         ${showReset ? `<button data-act="reset-cooldown" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}" title="清冷却 + last_error">释放冷却</button>` : ''}
+        <button data-act="refresh-history" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}" title="查看 OAuth refresh 最近 50 次结果">刷新历史</button>
         <button data-act="edit-acc" data-id="${escapeHtml(a.id)}">编辑</button>
         <button data-act="del-acc" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}">删除</button>
       </td>

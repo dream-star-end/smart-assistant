@@ -97,6 +97,11 @@ import {
 } from "../admin/ledger.js";
 import { tx } from "../db/queries.js";
 import { AccountNotFoundError, type AccountRow } from "../account-pool/store.js";
+import {
+  listRefreshEvents,
+  MAX_LIST_LIMIT as REFRESH_EVENTS_MAX_LIMIT,
+  DEFAULT_LIST_LIMIT as REFRESH_EVENTS_DEFAULT_LIMIT,
+} from "../account-pool/refreshEvents.js";
 import { adminAdjust, InsufficientCreditsError } from "../billing/ledger.js";
 import { renderPrometheus } from "../admin/metrics.js";
 import {
@@ -796,6 +801,48 @@ export async function handleAdminGetAccount(
   const a = await adminGetAccount(id);
   if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
   sendJson(res, 200, { account: serializeAccount(a) });
+}
+
+/**
+ * M6/P1-9 — GET /api/admin/accounts/refresh-events?account_id=N&limit=50
+ *
+ * 返回该账号最近 N 次 OAuth refresh 事件,倒序。limit 默认 50,上限 500。
+ *
+ * 注意:用 query string 而非 :id path 参数 —— router 不支持 path-param,
+ * 走 pathPrefix 会被 handleAdminGetAccount 吞掉。用 exact path 注册在
+ * `/api/admin/accounts/` prefix 之前优先匹配(同 `/api/admin/accounts/stats` 模式)。
+ */
+export async function handleAdminListRefreshEvents(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const accountIdRaw = url.searchParams.get("account_id");
+  if (!accountIdRaw || !/^[1-9][0-9]{0,19}$/.test(accountIdRaw)) {
+    throw new HttpError(400, "VALIDATION", "account_id query param required (positive integer)", {
+      issues: [{ path: "account_id", message: accountIdRaw ?? "(missing)" }],
+    });
+  }
+  const limit =
+    parsePositiveInt(url.searchParams.get("limit"), "limit", REFRESH_EVENTS_MAX_LIMIT) ??
+    REFRESH_EVENTS_DEFAULT_LIMIT;
+  // 校验账号存在(给 admin 一个清晰 404,而不是返空数组)
+  const a = await adminGetAccount(accountIdRaw);
+  if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
+  const events = await listRefreshEvents(accountIdRaw, limit);
+  sendJson(res, 200, {
+    events: events.map((e) => ({
+      id: e.id.toString(),
+      account_id: e.account_id.toString(),
+      ts: e.ts.toISOString(),
+      ok: e.ok,
+      err_code: e.err_code,
+      err_msg: e.err_msg,
+    })),
+  });
 }
 
 export async function handleAdminCreateAccount(

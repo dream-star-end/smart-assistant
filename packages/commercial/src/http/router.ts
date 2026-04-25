@@ -73,6 +73,7 @@ import {
   handleAdminPatchPlan,
   handleAdminListAccounts,
   handleAdminAccountsStats,
+  handleAdminListRefreshEvents,
   handleAdminGetAccount,
   handleAdminCreateAccount,
   handleAdminPatchAccount,
@@ -427,6 +428,8 @@ export function createCommercialHandler(
     { method: 'POST', path: '/api/admin/accounts', handler: handleAdminCreateAccount },
     // R3:exact path 在 pathPrefix 之前精确命中(matchRoute exact-first)
     { method: 'GET', path: '/api/admin/accounts/stats', handler: handleAdminAccountsStats },
+    // M6/P1-9 — refresh 历史 exact path,必须排在 pathPrefix 之前
+    { method: 'GET', path: '/api/admin/accounts/refresh-events', handler: handleAdminListRefreshEvents },
     // OAuth 引导:exact path 必须排在 prefix 之前(prefix 才能 fall through)
     { method: 'POST', path: '/api/admin/accounts/oauth/start', handler: handleAdminOAuthStart },
     {

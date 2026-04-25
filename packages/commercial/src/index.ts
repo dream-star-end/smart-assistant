@@ -45,6 +45,10 @@ import {
 import type { AgentHttpDeps } from "./http/agent.js";
 import { startAlertScheduler, type AlertScheduler } from "./admin/alerts.js";
 import {
+  startRefreshEventsSweeper,
+  type SweeperHandle as RefreshEventsSweeperHandle,
+} from "./account-pool/refreshEventsSweeper.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -1034,6 +1038,13 @@ export async function registerCommercial(
     });
   }
 
+  // M6/P1-9 — account_refresh_events 28 天 retention sweeper(24h interval,unref)。
+  // boot 不立即跑,等 24h 后第一次 tick(不会冲启动 DB 负载)。
+  let refreshEventsSweeper: RefreshEventsSweeperHandle | undefined;
+  if (process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== "1") {
+    refreshEventsSweeper = startRefreshEventsSweeper();
+  }
+
   return {
     handle: handler,
     handleWsUpgrade: (req, socket, head) => {
@@ -1064,6 +1075,9 @@ export async function registerCommercial(
       }
       if (alertScheduler) {
         try { await alertScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (refreshEventsSweeper) {
+        try { refreshEventsSweeper.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }
