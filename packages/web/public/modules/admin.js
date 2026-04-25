@@ -4142,6 +4142,7 @@ async function _refreshAlertOutbox() {
           <tr>
             <th>#</th><th>时间</th><th>事件</th><th>严重度</th>
             <th>状态</th><th>通道</th><th>尝试</th><th>标题 / 错误</th>
+            <th class="actions">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -4149,6 +4150,9 @@ async function _refreshAlertOutbox() {
         </tbody>
       </table>
     `
+    for (const btn of el.querySelectorAll('button[data-act="retry-outbox"]')) {
+      btn.addEventListener('click', (ev) => _retryOutbox(btn.dataset.id, ev.currentTarget))
+    }
   } catch (e) {
     el.innerHTML = `<div class="error">加载 outbox 失败: ${escapeHtml(e.message)}</div>`
   }
@@ -4164,6 +4168,13 @@ function _renderOutboxRow(r) {
   const titleOrErr = r.status === 'failed' && r.last_error
     ? `<span style="color:var(--danger)" title="${escapeHtml(r.last_error)}">${escapeHtml(r.last_error.slice(0, 80))}</span>`
     : escapeHtml(r.title || '')
+  // 仅 status=failed 且 attempts<10 才显示重试。MAX_ATTEMPTS=10 在后端,前端
+  // 用 attempts>=10 当 dead-letter 阈值;若后端拒绝(NOT_RETRYABLE)则前端
+  // 提示并刷新即可。
+  const canRetry = r.status === 'failed' && Number(r.attempts || 0) < 10
+  const action = canRetry
+    ? `<button class="btn btn-sm" data-act="retry-outbox" data-id="${escapeHtml(r.id)}">重试</button>`
+    : ''
   return `
     <tr>
       <td class="mono">${escapeHtml(r.id)}</td>
@@ -4174,8 +4185,27 @@ function _renderOutboxRow(r) {
       <td class="mono">${escapeHtml(r.channel_id || '—')}</td>
       <td class="num">${Number(r.attempts || 0)}</td>
       <td style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${titleOrErr}</td>
+      <td class="actions">${action}</td>
     </tr>
   `
+}
+
+async function _retryOutbox(id, btn) {
+  if (!id) return
+  if (btn) { btn.disabled = true; btn.textContent = '重试中…' }
+  try {
+    await apiJson('POST', `/api/admin/alerts/outbox/${encodeURIComponent(id)}/retry`)
+    toast('已排入重试,dispatcher 5s 内执行')
+    _refreshAlertOutbox()
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = '重试' }
+    if (e.code === 'NOT_RETRYABLE') {
+      toast('该行不可重试(已发送 / 已耗尽预算 / 状态变更)', 'danger')
+      _refreshAlertOutbox()
+    } else {
+      toast('重试失败: ' + e.message, 'danger', toastOptsFromError(e))
+    }
+  }
 }
 
 // ── silences ────────────────────────────────────────────────────────
@@ -4356,27 +4386,72 @@ async function _refreshAlertRuleStates() {
       <table class="data">
         <thead>
           <tr>
-            <th>rule_id</th><th>firing</th><th>dedupe_key</th>
+            <th>rule_id</th><th>状态</th><th>ack</th><th>dedupe_key</th>
             <th>最近翻转</th><th>最近评估</th><th>最近 payload</th>
+            <th class="actions">操作</th>
           </tr>
         </thead>
         <tbody>
-          ${rows.map((r) => `
-            <tr>
-              <td class="mono">${escapeHtml(r.rule_id)}</td>
-              <td>${r.firing ? '<span class="badge danger">FIRING</span>' : '<span class="badge ok">ok</span>'}</td>
-              <td class="mono" style="font-size:12px">${escapeHtml(r.dedupe_key || '—')}</td>
-              <td class="mono">${fmtDate(r.last_transition_at)}</td>
-              <td class="mono">${fmtDate(r.last_evaluated_at)}</td>
-              <td class="mono" style="font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-                  title="${escapeHtml(JSON.stringify(r.last_payload || {}))}">${escapeHtml(JSON.stringify(r.last_payload || {}))}</td>
-            </tr>
-          `).join('')}
+          ${rows.map(_renderRuleStateRow).join('')}
         </tbody>
       </table>
     `
+    for (const btn of el.querySelectorAll('button[data-act="ack-rule"]')) {
+      btn.addEventListener('click', (ev) => _ackRule(btn.dataset.ruleId, ev.currentTarget))
+    }
   } catch (e) {
     el.innerHTML = `<div class="error">加载 rule_states 失败: ${escapeHtml(e.message)}</div>`
+  }
+}
+
+function _renderRuleStateRow(r) {
+  // 三态:firing=true,acked=false → open; firing=true,acked=true → acked;
+  // firing=false → resolved(acked 字段无意义)。
+  let statusBadge, ackCol, action
+  if (!r.firing) {
+    statusBadge = '<span class="badge ok">resolved</span>'
+    ackCol = '<span style="color:var(--muted)">—</span>'
+    action = ''
+  } else if (r.acked) {
+    statusBadge = '<span class="badge warn">ACKED</span>'
+    ackCol = `#${escapeHtml(r.acked_by || '?')} <span class="mono" style="color:var(--muted);font-size:11px">${fmtDate(r.acked_at)}</span>`
+    action = ''
+  } else {
+    statusBadge = '<span class="badge danger">FIRING</span>'
+    ackCol = '<span style="color:var(--muted)">未确认</span>'
+    action = `<button class="btn btn-sm" data-act="ack-rule" data-rule-id="${escapeHtml(r.rule_id)}">确认</button>`
+  }
+  const payload = JSON.stringify(r.last_payload || {})
+  return `
+    <tr>
+      <td class="mono">${escapeHtml(r.rule_id)}</td>
+      <td>${statusBadge}</td>
+      <td>${ackCol}</td>
+      <td class="mono" style="font-size:12px">${escapeHtml(r.dedupe_key || '—')}</td>
+      <td class="mono">${fmtDate(r.last_transition_at)}</td>
+      <td class="mono">${fmtDate(r.last_evaluated_at)}</td>
+      <td class="mono" style="font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${escapeHtml(payload)}">${escapeHtml(payload)}</td>
+      <td class="actions">${action}</td>
+    </tr>
+  `
+}
+
+async function _ackRule(ruleId, btn) {
+  if (!ruleId) return
+  if (btn) { btn.disabled = true; btn.textContent = '确认中…' }
+  try {
+    await apiJson('POST', `/api/admin/alerts/rules/${encodeURIComponent(ruleId)}/ack`)
+    toast('已确认')
+    _refreshAlertRuleStates()
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = '确认' }
+    if (e.code === 'NOT_FIRING') {
+      toast('规则当前未在 firing,无需确认', 'danger')
+      _refreshAlertRuleStates()
+    } else {
+      toast('确认失败: ' + e.message, 'danger', toastOptsFromError(e))
+    }
   }
 }
 

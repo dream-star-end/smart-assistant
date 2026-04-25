@@ -125,6 +125,8 @@ import {
   handleAdminAlertsCreateSilence,
   handleAdminAlertsDeleteSilence,
   handleAdminAlertsListRuleStates,
+  handleAdminAlertsRetryOutbox,
+  handleAdminAlertsAckRule,
 } from './adminAlerts.js'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { rootLogger, type Logger } from '../logging/logger.js'
@@ -512,6 +514,18 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/admin/alerts/rule-states',
       handler: handleAdminAlertsListRuleStates,
+    },
+    // M8.3/P2-21:outbox 行手动重试 + rule firing ack。handler 自己校验
+    // path 后缀 /retry / /ack,非匹配翻 404。
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/alerts/outbox/',
+      handler: handleAdminAlertsRetryOutbox,
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/alerts/rules/',
+      handler: handleAdminAlertsAckRule,
     },
     // /api/admin/alerts/channels/:id   (PATCH / DELETE)
     // /api/admin/alerts/channels/:id/test (POST) —— handler 自己校验后缀

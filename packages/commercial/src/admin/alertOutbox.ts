@@ -610,6 +610,11 @@ export async function listSilences(): Promise<SilenceRowView[]> {
 export interface RuleStateRow {
   rule_id: string;
   firing: boolean;
+  /** M8.3/P2-21:ack 三态. firing=true,acked=false → 'open'; firing=true,acked=true → 'acked'; firing=false → 'resolved'(acked 无意义). */
+  acked: boolean;
+  acked_at: string | null;
+  /** admin user id(BIGINT serialized as string),不做 FK,保留删账号不挂. */
+  acked_by: string | null;
   dedupe_key: string | null;
   last_transition_at: string | null;
   last_evaluated_at: string | null;
@@ -641,6 +646,9 @@ export async function transitionRuleState(
       );
       return { transitioned: false, previous: prev };
     }
+    // 翻转(任意方向)清掉 ack 三态. M8.3/P2-21:
+    //   false→true 必须清, 否则新一轮告警继承旧 ack.
+    //   true→false 也清, 因为 acked 字段在 resolved 状态下没意义.
     await client.query(
       `INSERT INTO admin_alert_rule_state(rule_id, firing, dedupe_key, last_transition_at, last_evaluated_at, last_payload)
        VALUES ($1, $2, $3, NOW(), NOW(), $4::jsonb)
@@ -649,7 +657,10 @@ export async function transitionRuleState(
          dedupe_key = EXCLUDED.dedupe_key,
          last_transition_at = NOW(),
          last_evaluated_at = NOW(),
-         last_payload = EXCLUDED.last_payload`,
+         last_payload = EXCLUDED.last_payload,
+         acked = FALSE,
+         acked_at = NULL,
+         acked_by = NULL`,
       [rule_id, firing, dedupe_key, JSON.stringify(payload)],
     );
     return { transitioned: true, previous: prev };
@@ -660,20 +671,104 @@ export async function listRuleStates(): Promise<RuleStateRow[]> {
   const r = await query<{
     rule_id: string;
     firing: boolean;
+    acked: boolean;
+    acked_at: Date | null;
+    acked_by: string | null;
     dedupe_key: string | null;
     last_transition_at: Date | null;
     last_evaluated_at: Date | null;
     last_payload: unknown;
   }>(
-    `SELECT rule_id, firing, dedupe_key, last_transition_at, last_evaluated_at, last_payload
+    `SELECT rule_id, firing,
+            acked, acked_at, acked_by::text AS acked_by,
+            dedupe_key, last_transition_at, last_evaluated_at, last_payload
        FROM admin_alert_rule_state ORDER BY rule_id`,
   );
   return r.rows.map((row) => ({
     rule_id: row.rule_id,
     firing: row.firing,
+    acked: row.acked,
+    acked_at: row.acked_at ? row.acked_at.toISOString() : null,
+    acked_by: row.acked_by,
     dedupe_key: row.dedupe_key,
     last_transition_at: row.last_transition_at ? row.last_transition_at.toISOString() : null,
     last_evaluated_at: row.last_evaluated_at ? row.last_evaluated_at.toISOString() : null,
     last_payload: parsePayload(row.last_payload),
   }));
+}
+
+// ─── M8.3/P2-21:retry + ack ─────────────────────────────────────────
+
+/**
+ * 手动 retry 一条 outbox 行:把 status=failed && attempts<MAX_ATTEMPTS 的行
+ * next_attempt_at 拉到 NOW(),让 dispatcher 下个 tick 立刻重试。
+ *
+ * 返回 retried=true 当且仅当真有一行被更新。其他场景(不存在 / 非 failed /
+ * 已超 MAX_ATTEMPTS)返回 retried=false,HTTP 层翻 409。
+ *
+ * 不重置 attempts:重试预算靠 MAX_ATTEMPTS 控制,人工 retry 也耗预算。
+ */
+export async function retryOutbox(
+  id: string | number | bigint,
+): Promise<{ retried: boolean }> {
+  const r = await query(
+    `UPDATE admin_alert_outbox
+        SET next_attempt_at = NOW()
+      WHERE id = $1
+        AND status = 'failed'
+        AND attempts < $2`,
+    [String(id), MAX_ATTEMPTS],
+  );
+  return { retried: (r.rowCount ?? 0) > 0 };
+}
+
+/**
+ * Ack 一条 firing rule:`acked=true, acked_at=NOW(), acked_by=adminId`。
+ * 已 ack 的 idempotent(不抛、不写 audit、不改 acked_at/acked_by)。
+ *
+ * 抛 RangeError(code='NOT_FIRING')当:
+ *   - rule_state 行不存在(从未 firing 过)
+ *   - 行存在但 firing=false(已 resolved,ack 无意义)
+ * HTTP 层翻 409。
+ *
+ * audit 仅在首次 ack(acked=false→true)时写,target='rule:${rule_id}',
+ * after.previous_acked=false。
+ */
+export async function ackRule(
+  rule_id: string,
+  adminId: bigint | number | string,
+  ip?: string | null,
+  userAgent?: string | null,
+): Promise<{ acked: boolean; alreadyAcked: boolean }> {
+  return tx(async (client: PoolClient) => {
+    const cur = await client.query<{ firing: boolean; acked: boolean }>(
+      `SELECT firing, acked FROM admin_alert_rule_state WHERE rule_id = $1 FOR UPDATE`,
+      [rule_id],
+    );
+    if (cur.rows.length === 0 || !cur.rows[0].firing) {
+      const e = new RangeError("rule is not firing");
+      (e as { code?: string }).code = "NOT_FIRING";
+      throw e;
+    }
+    if (cur.rows[0].acked) {
+      // 已 ack — 幂等,不写 audit。
+      return { acked: true, alreadyAcked: true };
+    }
+    await client.query(
+      `UPDATE admin_alert_rule_state
+          SET acked = TRUE, acked_at = NOW(), acked_by = $2::bigint
+        WHERE rule_id = $1`,
+      [rule_id, String(adminId)],
+    );
+    const { writeAdminAudit } = await import("./audit.js");
+    await writeAdminAudit(client, {
+      adminId,
+      action: "alert_rule.ack",
+      target: `rule:${rule_id}`,
+      after: { previous_acked: false },
+      ip: ip ?? null,
+      userAgent: userAgent ?? null,
+    });
+    return { acked: true, alreadyAcked: false };
+  });
 }

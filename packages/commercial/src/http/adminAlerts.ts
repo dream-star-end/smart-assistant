@@ -50,6 +50,8 @@ import {
   listSilences,
   listOutbox,
   listRuleStates,
+  retryOutbox,
+  ackRule,
   OUTBOX_DEFAULT_LIMIT,
   OUTBOX_MAX_LIMIT,
   type AlertStatus,
@@ -734,4 +736,67 @@ export async function handleAdminAlertsListRuleStates(
   await requireAdmin(req, deps.jwtSecret)
   const rows = await listRuleStates()
   sendJson(res, 200, { rows: rows.map(serializeRuleState) })
+}
+
+// ─── POST /api/admin/alerts/outbox/:id/retry ─────────────────────────
+//
+// 把一条 status=failed 且 attempts<MAX_ATTEMPTS 的 outbox 行 next_attempt_at
+// 拉到 NOW(),让 dispatcher 下个 tick 立刻重试。其它状态(pending / sent /
+// suppressed / skipped)或已耗尽预算 → 409 NOT_RETRYABLE。
+export async function handleAdminAlertsRetryOutbox(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const url = urlOf(req)
+  const prefix = '/api/admin/alerts/outbox/'
+  const suffix = '/retry'
+  if (!url.pathname.startsWith(prefix) || !url.pathname.endsWith(suffix)) {
+    throw new HttpError(404, 'NOT_FOUND', 'route not found')
+  }
+  const id = url.pathname.slice(prefix.length, url.pathname.length - suffix.length)
+  if (!ID_RE.test(id)) {
+    throw new HttpError(400, 'VALIDATION', 'invalid outbox id')
+  }
+  const result = await retryOutbox(id)
+  if (!result.retried) {
+    throw new HttpError(409, 'NOT_RETRYABLE', 'outbox row is not in a retryable state')
+  }
+  sendJson(res, 200, { retried: true })
+}
+
+// ─── POST /api/admin/alerts/rules/:rule_id/ack ───────────────────────
+//
+// Ack 一条正在 firing 的 polled rule。已 ack 幂等(返 200 acked=true)。
+// 当 rule_state 不存在 / firing=false → 409 NOT_FIRING。
+const RULE_ID_RE = /^[a-z][a-z0-9_.]{0,63}$/
+
+export async function handleAdminAlertsAckRule(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
+  const url = urlOf(req)
+  const prefix = '/api/admin/alerts/rules/'
+  const suffix = '/ack'
+  if (!url.pathname.startsWith(prefix) || !url.pathname.endsWith(suffix)) {
+    throw new HttpError(404, 'NOT_FOUND', 'route not found')
+  }
+  const ruleId = url.pathname.slice(prefix.length, url.pathname.length - suffix.length)
+  if (!RULE_ID_RE.test(ruleId)) {
+    throw new HttpError(400, 'VALIDATION', 'invalid rule_id')
+  }
+  try {
+    const result = await ackRule(ruleId, admin.id, ctx.clientIp, ctx.userAgent)
+    sendJson(res, 200, { acked: result.acked, already_acked: result.alreadyAcked })
+  } catch (err) {
+    if (err instanceof RangeError && (err as { code?: string }).code === 'NOT_FIRING') {
+      throw new HttpError(409, 'NOT_FIRING', 'rule is not currently firing')
+    }
+    throw err
+  }
 }
