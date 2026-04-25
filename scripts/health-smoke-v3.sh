@@ -32,7 +32,10 @@ curl_check() {
     echo "FAIL: $desc — got HTTP $code" >&2
     return 1
   fi
-  if [ -n "$body_pat" ] && ! echo "$body" | grep -q "$body_pat"; then
+  # 用 heredoc 避免 `echo | grep -q` 在 set -o pipefail 下的 SIGPIPE 陷阱:
+  # grep -q 命中后立刻退出, echo 写入未消费的 pipe 收 SIGPIPE 退 141, pipefail
+  # 让整条 pipeline 返回 141, `!` 翻成 true, 误判 "body missing pattern".
+  if [ -n "$body_pat" ] && ! grep -q "$body_pat" <<< "$body"; then
     echo "FAIL: $desc — body missing pattern '$body_pat'" >&2
     return 1
   fi
