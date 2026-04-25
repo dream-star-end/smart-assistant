@@ -212,6 +212,15 @@
 - **问题**:只 1 代 .prev,连做两次就失去前版回滚
 - **方案**:`.prev/` → `.prev.1/`、`.prev.2/`、…、`.prev.5/` rotate(ctime-ordered)
 - **验证**:做 3 次 deploy,能 `--rollback 2` 回到倒数第二版
+- **状态**: `已上线 v3-20260425T0351Z-77f038a,生产验证 PASS`
+- **实施记录 (2026-04-25)**:
+  - `scripts/deploy-v3.sh` 单文件改动 (+96 / -30)
+  - snapshot 阶段:rsync → `.prev.new/`,通过 mv 链 rotate(.5 删 → .4→.5 → ... → .1→.2 → .new→.1)。每个 mv 守护 destination 不存在,corrupt mixed state 不会嵌套
+  - legacy single-gen `.prev/` 自动迁移成 `.prev.1/`(一次性,幂等);混合状态仅 WARN 不删
+  - `--rollback=N`(N=1..5)指定代恢复;`--rollback` 默认=1 向后兼容
+  - `ROLLBACK_REQUESTED` + `ROLLBACK_N` 双变量分离,杜绝 `--rollback=0` / `--rollback=` silent 落主 deploy 流程
+  - 边界 case 全本地验证:`--rollback=6/abc/empty/1.5/0` → exit 2 + 友好错误
+  - **生产验证 2026-04-25 02:51 UTC**:首次 deploy 触发 legacy migration(`.prev/` → `.prev.1/`);第二次 deploy(本次)`.prev.1/` shift 到 `.prev.2/`,新 snapshot 落 `.prev.1/`,无 `.prev/` / `.prev.new/` 残留。两代各 114M,smoke 5/5 PASS
 
 ### P2-19 独立 cron 跑 smoke
 - **方案**:systemd timer 每 5 分钟调 `smoke-v3.sh https://claudeai.chat`,失败 enqueueAlert `health.smoke_failed`
