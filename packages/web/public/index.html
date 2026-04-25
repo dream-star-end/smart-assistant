@@ -14,7 +14,7 @@
 <!--
   Boot-watchdog: if main.js fails to set window.__ocBooted within BOOT_TIMEOUT_MS,
   assume a broken module graph (typically CF edge cache mismatch after a deploy
-  where main.js?v=5a799da imports an un-versioned state.js that CF still serves old) —
+  where main.js?v=d346008 imports an un-versioned state.js that CF still serves old) —
   unregister SW + clear caches + reload once. sessionStorage lock prevents loops
   on a genuine bug where reload won't help. See deploy-v3.sh cf_purge() for the
   root-cause fix; this is a client-side backstop.
@@ -39,7 +39,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=5a799da" />
+<link rel="stylesheet" href="/style.css?v=d346008" />
 <!-- main.js version bumped 2026-04-21: 积分化 + /login routing -->
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -71,6 +71,9 @@
   </header>
 
   <section id="top" class="landing-hero">
+    <div class="hero-aurora hero-aurora-1" aria-hidden="true"></div>
+    <div class="hero-aurora hero-aurora-2" aria-hidden="true"></div>
+    <div class="hero-aurora hero-aurora-3" aria-hidden="true"></div>
     <div class="landing-hero-inner">
       <div class="landing-hero-eyebrow">
         <span class="landing-dot"></span>
@@ -155,11 +158,9 @@
             </th>
             <th class="bench-col" scope="col">
               <div class="bench-model">GPT-5.4</div>
-              <div class="bench-price">需 ChatGPT Plus $20/月</div>
             </th>
             <th class="bench-col" scope="col">
               <div class="bench-model">Gemini 3.1 Pro</div>
-              <div class="bench-price">需 Gemini Advanced $20/月</div>
             </th>
             <th class="bench-col" scope="col">
               <div class="bench-model">Mythos Preview</div>
@@ -285,6 +286,9 @@
   </section>
 
   <section class="landing-cta-band">
+    <div class="cta-aurora cta-aurora-1" aria-hidden="true"></div>
+    <div class="cta-aurora cta-aurora-2" aria-hidden="true"></div>
+    <div class="cta-aurora cta-aurora-3" aria-hidden="true"></div>
     <div class="landing-cta-inner">
       <h2>准备好让 AI 替你干活了吗?</h2>
       <p>邮箱注册即可开始,微信扫码充值,首次 ¥10 起。¥1 = 100 积分 ≈ $1 美元 token 额度,积分永不过期。</p>
@@ -1227,6 +1231,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=5a799da"></script>
+<script type="module" src="/modules/main.js?v=d346008"></script>
 </body>
 </html>

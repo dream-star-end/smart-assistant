@@ -530,6 +530,18 @@
       .chip-warn   { background: var(--warn-soft);   color: var(--warn);   border-color: transparent; }
       .chip-danger { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
       .chip-muted  { background: var(--panel-2);     color: var(--muted);  border-color: var(--border-subtle); }
+      a.chip { text-decoration: none; cursor: pointer; }
+      a.chip:hover { filter: brightness(1.1); border-color: var(--border-strong, var(--border)); }
+      .btn.btn-link {
+        background: transparent;
+        border: 1px dashed var(--border);
+        color: var(--muted);
+      }
+      .btn.btn-link:hover { color: var(--text); border-color: var(--border-strong, var(--accent)); }
+      tr.is-focused td {
+        background: var(--accent-soft, rgba(255, 200, 100, 0.15)) !important;
+        outline: 1px solid var(--accent, #ffaa00);
+      }
 
       /* Activity log list */
       .log-list { display: flex; flex-direction: column; }
@@ -1532,6 +1544,6 @@
     <script src="/vendor/qrcode.min.js"></script>
     <!-- Chart.js (MIT) 用于 dashboard 折线/柱/饼图。UMD bundle,挂到 window.Chart。 -->
     <script src="/vendor/chart.umd.min.js"></script>
-    <script type="module" src="/modules/admin.js?v=5a799da"></script>
+    <script type="module" src="/modules/admin.js?v=d346008"></script>
   </body>
 </html>
