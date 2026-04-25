@@ -1,0 +1,32 @@
+[Unit]
+Description=Weekly pg restore drill for openclaude_commercial (M7/P1-10)
+After=postgresql.service
+Requires=postgresql.service
+# 失败走统一 v3 timer alert template(已存在,见 v3-timer-failure-alert@.service)
+OnFailure=v3-timer-failure-alert@pg-restore-test.service
+
+[Service]
+Type=oneshot
+# RuntimeDirectory= 由 systemd 自动创建 /run/openclaude 并设为 RW(给本 unit),
+# 不依赖对 /run 是否被 ProtectSystem=strict 自动豁免的假设。M7 review I1。
+RuntimeDirectory=openclaude
+# flock 防 timer Persistent 回放 / 手工触发 / 长跑重叠
+ExecStart=/usr/bin/flock -n /run/openclaude/pg-restore-test.lock /usr/local/bin/pg-restore-test.sh
+# 小 DB 当前 ~10MB,正常 <30s。30min 给极大冗余。
+TimeoutStartSec=30min
+TimeoutStopSec=10s
+Nice=10
+IOSchedulingClass=idle
+
+# Hardening 与 pg-backup-openclaude 对齐(脚本以 root 跑 + 内部 runuser -u postgres)。
+# 不开 NoNewPrivileges / RestrictSUIDSGID(不破坏 runuser/su)。
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# /var/log:写 pg-restore-test.log
+# /tmp 不需要列(PrivateTmp=true 已给完整 RW 私有 /tmp)
+# PG socket /var/run/postgresql 只读连接即可,ProtectSystem=strict 默认允许 / 读
+ReadWritePaths=/var/log
+PrivateTmp=true

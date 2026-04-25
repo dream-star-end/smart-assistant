@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly PG restore drill timer
+
+[Timer]
+# 周日 03:00 UTC = 12:00 Asia/Tokyo,周末低峰窗口
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target
