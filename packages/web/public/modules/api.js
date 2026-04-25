@@ -11,7 +11,7 @@
 //     out (login/logout probes) opt out with opts.suppressAuthRedirect=true.
 //   • Errors thrown carry e.status (HTTP status code) so callers can branch
 //     on it without parsing the message.
-import { state, _writeStoredAccessToken } from './state.js'
+import { _writeStoredAccessToken, state } from './state.js'
 
 const DEFAULT_TIMEOUT_MS = 30000
 
@@ -155,7 +155,7 @@ async function _readStdErrorFromRes(res) {
 // promise(否则新身份起的 refresh 会复用旧身份的响应)。同 epoch 多并发仍然合并
 // 成一次网络调用。finally 里只清 "如果还是我" 的槽位,防止旧 inflight 归零时把
 // 新 inflight 的引用误清。
-let _refreshInflight = null  // { epoch, promise }
+let _refreshInflight = null // { epoch, promise }
 // 2026-04-22 Codex R3 E 缓解:refresh fetch 挂 AbortController 的 signal,身份
 // 变更(login/logout/tearDown)路径 call abortInflightRefresh() 发 abort,让浏览器
 // 终止正在路上的请求 —— 最大限度减少旧 refresh 响应的 Set-Cookie 覆盖新账号
@@ -165,7 +165,9 @@ let _refreshInflight = null  // { epoch, promise }
 let _refreshAbort = null
 
 export function abortInflightRefresh() {
-  try { _refreshAbort?.abort(new DOMException('auth epoch changed', 'AbortError')) } catch {}
+  try {
+    _refreshAbort?.abort(new DOMException('auth epoch changed', 'AbortError'))
+  } catch {}
 }
 
 // 单次 refresh 调用(不含 race retry)。expectedEpoch 由 caller 传入,绑定整个
@@ -200,27 +202,32 @@ async function _doRefreshOnce(expectedEpoch) {
     if (typeof data?.access_token !== 'string' || !data.access_token) {
       return { ok: false, race: false }
     }
-    // Epoch check 在 commit 前:当前 epoch 和 caller 预期的不一致 → 身份已变,
-    // 抛弃响应,不写 state.token / localStorage。
+    const newExp = typeof data.access_exp === 'number' ? data.access_exp : null
+    // ① Epoch check 在 commit 前:当前 epoch 和 caller 预期的不一致 → 身份已变,
+    // 抛弃响应,不写 state.token / localStorage。Codex 强调:必须先做 epoch 再做 stale,
+    // 否则旧 epoch 的响应会借 stale 路径返回 ok:true,绕过 epoch fence 语义。
     if ((state.authEpoch || 0) !== expectedEpoch) {
       return { ok: false, race: false }
     }
+    // ② Stale-response guard(M5):同 epoch 多个并发 refresh(本 tab 主动 + reactive
+    // 撞了 / 跨 tab 广播 + 本 tab race retry)收到一个旧响应时,旧 access_exp <= 当前
+    // state.tokenExp。整个响应丢弃:不写 state、不写 storage、不 mint cookie、不广播。
+    // 否则会把已被广播 / race winner 更新的新 token 覆盖回旧的。
+    if (state.token && newExp != null && newExp <= (state.tokenExp || 0)) {
+      return { ok: true, race: false }
+    }
     state.token = data.access_token
-    if (typeof data.access_exp === 'number') state.tokenExp = data.access_exp
+    if (newExp != null) state.tokenExp = newExp
     // Codex R1:reactive refresh 成功后也重排主动续期 timer,让下一次主动续期
     // 对齐新 exp —— 避免 timer 还按旧 exp 排期,和 reactive 路径状态打架。
     scheduleProactiveRefresh()
+    const remember = data?.remember !== false
     try {
       // 2026-04-24 "记住我":server 把原登录选择(refresh_tokens.remember_me)
       // 回带,前端据此决定 access token 写入 localStorage(持久)还是
       // sessionStorage(关窗口即清)。data.remember 缺失(老 server 或迁移期
       // 老 body)→ 默认 true,等同旧行为。
-      const remember = data?.remember !== false
-      _writeStoredAccessToken(
-        data.access_token,
-        typeof data.access_exp === 'number' ? data.access_exp : null,
-        remember,
-      )
+      _writeStoredAccessToken(data.access_token, newExp, remember)
       // 升级成功:server 已把 cookie 种回来,本地 localStorage / state 里的旧
       // refresh token 不再需要 —— 留着只会在下次 refresh 又被当 body fallback
       // 重新提交,徒增 XSS 时被 dump 的可能。一次性清零。
@@ -234,9 +241,26 @@ async function _doRefreshOnce(expectedEpoch) {
     // refresh 绑定的 myEpoch —— mint 响应回来后若 epoch 变过会 self-clear,
     // 防止旧身份的 session cookie 被新身份 inheritance。
     // 用 dynamic import 避开与 auth.js 的循环依赖(auth.js 也 import 了 api.js)。
-    void import('./auth.js?v=fileproxy1').then(({ mintSessionCookie }) => {
-      mintSessionCookie(data.access_token, expectedEpoch).catch(() => {})
-    }).catch(() => {})
+    void import('./auth.js?v=fileproxy1')
+      .then(({ mintSessionCookie }) => {
+        mintSessionCookie(data.access_token, expectedEpoch).catch(() => {})
+      })
+      .catch(() => {})
+    // M5:广播给同源其他 tab,让它们直接接管新 token,免去各自再打 /api/auth/refresh。
+    // userId 缺失(早期 race,/api/me 还没回)时 publishTokenRefresh 内部会 skip,
+    // 不广播是安全降级 —— 接收方走 reactive 401 兜底。fire-and-forget。
+    if (state.userId != null) {
+      void import('./broadcast.js?v=1')
+        .then(({ publishTokenRefresh }) => {
+          publishTokenRefresh({
+            access_token: data.access_token,
+            access_exp: newExp,
+            remember,
+            userId: state.userId,
+          })
+        })
+        .catch(() => {})
+    }
     return { ok: true, race: false }
   }
   // 401 + REFRESH_RACE = 多 tab race,server 没清 cookie,稍后 retry 一次
@@ -266,7 +290,9 @@ const _RACE_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 1750]
 // Returns Promise<boolean>:true = state.token now holds a fresh access JWT.
 // Shares the same inflight promise as apiFetch's internal 401-retry path,
 // so a burst of HTTP 401 + WS 1008 only fires one /api/auth/refresh.
-export function silentRefresh() { return _silentRefresh() }
+export function silentRefresh() {
+  return _silentRefresh()
+}
 
 // ── Proactive refresh timer ──
 //
@@ -283,12 +309,15 @@ export function silentRefresh() { return _silentRefresh() }
 //     若 visibility 路径已先刷新过,旧 callback 不该再打一次 refresh
 //   - _doRefreshOnce 成功后也顺手重排 timer,让 reactive refresh 后的下一次主动续期
 //     对齐新 exp,状态不漂
-const PROACTIVE_REFRESH_LEAD_SECONDS = 120  // 到期前 2min 续,留 race grace 余量
-const PROACTIVE_REFRESH_RETRY_MS = 60_000    // 失败后 1min 重试
+const PROACTIVE_REFRESH_LEAD_SECONDS = 120 // 到期前 2min 续,留 race grace 余量
+const PROACTIVE_REFRESH_RETRY_MS = 60_000 // 失败后 1min 重试
 let _proactiveTimer = null
 
 function _cancelProactiveTimer() {
-  if (_proactiveTimer) { clearTimeout(_proactiveTimer); _proactiveTimer = null }
+  if (_proactiveTimer) {
+    clearTimeout(_proactiveTimer)
+    _proactiveTimer = null
+  }
 }
 
 export function clearProactiveRefresh() {
@@ -324,8 +353,8 @@ async function _runProactiveRefresh() {
     return
   }
   const ok = await _silentRefresh().catch(() => false)
-  if (!state.token) return  // 期间被 _forceLogout / _tearDownWsAuth 清了
-  if ((state.authEpoch || 0) !== epochAtStart) return  // 身份变了,别碰新账号的 timer
+  if (!state.token) return // 期间被 _forceLogout / _tearDownWsAuth 清了
+  if ((state.authEpoch || 0) !== epochAtStart) return // 身份变了,别碰新账号的 timer
   if (ok) {
     // 按新 tokenExp 重排
     scheduleProactiveRefresh()
@@ -356,7 +385,9 @@ function _silentRefresh() {
   // `_doRefreshOnce` 的 catch 识别 TimeoutError 为 aborted,_silentRefresh bail,
   // WS IIFE 收尾走 _tearDownWsAuth → showLogin,比挂住好。
   const refreshTimer = setTimeout(() => {
-    try { myAbort.abort(new DOMException('refresh timeout', 'TimeoutError')) } catch {}
+    try {
+      myAbort.abort(new DOMException('refresh timeout', 'TimeoutError'))
+    } catch {}
   }, DEFAULT_TIMEOUT_MS)
   _refreshAbort = myAbort
   const promise = (async () => {
@@ -366,7 +397,7 @@ function _silentRefresh() {
       if (last.aborted) return false
       if (!last.race) return false
       for (const delay of _RACE_RETRY_DELAYS_MS) {
-        await new Promise(r => setTimeout(r, delay))
+        await new Promise((r) => setTimeout(r, delay))
         // 每次 delay 后先 check epoch,身份变了立即 bail —— 即便本次还会走 fetch
         // 拿到 200,也会被 _doRefreshOnce 内 epoch check 拦下;这里提前退出
         // 省掉一次网络调用。
@@ -398,14 +429,16 @@ function _silentRefresh() {
 function _isAuthEndpoint(path) {
   // Don't refresh-loop on auth endpoints themselves
   if (typeof path !== 'string') return false
-  return path.startsWith('/api/auth/login')
-      || path.startsWith('/api/auth/refresh')
-      || path.startsWith('/api/auth/logout')
-      || path.startsWith('/api/auth/register')
-      || path.startsWith('/api/auth/verify-email')
-      || path.startsWith('/api/auth/resend-verification')
-      || path.startsWith('/api/auth/request-password-reset')
-      || path.startsWith('/api/auth/confirm-password-reset')
+  return (
+    path.startsWith('/api/auth/login') ||
+    path.startsWith('/api/auth/refresh') ||
+    path.startsWith('/api/auth/logout') ||
+    path.startsWith('/api/auth/register') ||
+    path.startsWith('/api/auth/verify-email') ||
+    path.startsWith('/api/auth/resend-verification') ||
+    path.startsWith('/api/auth/request-password-reset') ||
+    path.startsWith('/api/auth/confirm-password-reset')
+  )
 }
 
 // Rewrite Authorization header on retry. Caller may pass init.headers as plain
@@ -414,7 +447,9 @@ function _rewriteAuthHeader(headers) {
   if (!headers) return { Authorization: `Bearer ${state.token}` }
   if (headers instanceof Headers) {
     const out = {}
-    headers.forEach((v, k) => { out[k] = v })
+    headers.forEach((v, k) => {
+      out[k] = v
+    })
     out.Authorization = `Bearer ${state.token}`
     return out
   }
@@ -482,7 +517,14 @@ export async function apiGet(path, opts = {}) {
       requestId: std.requestId,
       message: std.message,
     })
-    throw _httpError(`GET ${path}`, res.status, std.message ?? std.code, std.code, std.issues, std.requestId)
+    throw _httpError(
+      `GET ${path}`,
+      res.status,
+      std.message ?? std.code,
+      std.code,
+      std.issues,
+      std.requestId,
+    )
   }
   return res.json()
 }
@@ -502,7 +544,14 @@ export async function apiText(path, opts = {}) {
       requestId: std.requestId,
       message: std.message,
     })
-    throw _httpError(`GET ${path}`, res.status, std.message ?? std.code, std.code, std.issues, std.requestId)
+    throw _httpError(
+      `GET ${path}`,
+      res.status,
+      std.message ?? std.code,
+      std.code,
+      std.issues,
+      std.requestId,
+    )
   }
   return res.text()
 }
@@ -525,7 +574,14 @@ export async function apiJson(method, path, body, opts = {}) {
       requestId: std.requestId,
       message: std.message,
     })
-    throw _httpError(`${method} ${path}`, res.status, std.message ?? std.code, std.code, std.issues, std.requestId)
+    throw _httpError(
+      `${method} ${path}`,
+      res.status,
+      std.message ?? std.code,
+      std.code,
+      std.issues,
+      std.requestId,
+    )
   }
   return data
 }

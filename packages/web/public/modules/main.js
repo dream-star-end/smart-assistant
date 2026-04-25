@@ -18,10 +18,31 @@ import {
 } from './util.js'
 
 // ── App state ──
-import { _clearStoredAccessToken, _writeStoredAccessToken, getSession, isSending, setSending, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js'
+import {
+  MAX_OFFLINE_QUEUE,
+  _clearStoredAccessToken,
+  _writeStoredAccessToken,
+  getSession,
+  isSending,
+  setSending,
+  state,
+  tryEnqueueOffline,
+} from './state.js'
 
 // ── API layer ──
-import { abortInflightRefresh, apiFetch, apiGet, apiJson, authHeaders, clearProactiveRefresh, onAuthExpired, resetAuthExpired, scheduleProactiveRefresh, silentRefresh, snapshotDiagnostics } from './api.js'
+import {
+  abortInflightRefresh,
+  apiFetch,
+  apiGet,
+  apiJson,
+  authHeaders,
+  clearProactiveRefresh,
+  onAuthExpired,
+  resetAuthExpired,
+  scheduleProactiveRefresh,
+  silentRefresh,
+  snapshotDiagnostics,
+} from './api.js'
 
 // ── IndexedDB ──
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
@@ -43,7 +64,14 @@ import {
 } from './markdown.js'
 
 // ── UI helpers ──
-import { closeLightbox, closeModal, openLightbox, openModal, toast, toastOptsFromError } from './ui.js'
+import {
+  closeLightbox,
+  closeModal,
+  openLightbox,
+  openModal,
+  toast,
+  toastOptsFromError,
+} from './ui.js'
 
 // ── Attachments ──
 import {
@@ -59,22 +87,35 @@ import {
 import { initSpeech, setAutoResize, toggleVoice } from './speech.js'
 
 // ── Notifications ──
-import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBusy } from './notifications.js'
+import {
+  maybeNotify,
+  refreshDocumentTitle,
+  requestNotifyPermission,
+  setTitleBusy,
+} from './notifications.js'
 
-// ── OAuth ──
-import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
-import { abortInflightMintClear, clearSessionCookie, initAuth, mintSessionCookie, onLoginSuccess as setAuthSuccessHandler, setMode as setAuthMode } from './auth.js?v=a53a780'
+import {
+  abortInflightMintClear,
+  clearSessionCookie,
+  initAuth,
+  mintSessionCookie,
+  setMode as setAuthMode,
+  onLoginSuccess as setAuthSuccessHandler,
+} from './auth.js?v=a53a780'
 // ?v=a53a780 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
 import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=a53a780'
-import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=a53a780'
+import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=1'
+// ── OAuth ──
+import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
 import { initUsageStats, openUsageModal } from './usageStats.js?v=a53a780'
+import { initUserPrefs, openPrefsModal } from './userPrefs.js?v=a53a780'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -95,7 +136,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=a53a780'  // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=a53a780' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
@@ -141,8 +182,8 @@ import {
   addMessage,
   addSystemMessage,
   buildToolUseLabel,
-  completeBgTask,
   clearTurnTiming,
+  completeBgTask,
   connect,
   formatMeta,
   handleOutbound,
@@ -175,7 +216,12 @@ import {
   showSlashPopup,
   slashPopupVisible,
 } from './commands.js'
-import { getEffortForSubmit, initModePills, renderModePills, clearEffortOnLogout } from './effortMode.js'
+import {
+  clearEffortOnLogout,
+  getEffortForSubmit,
+  initModePills,
+  renderModePills,
+} from './effortMode.js'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
@@ -402,7 +448,7 @@ function _showErrorToastOnce(errLike, msg) {
   _errorToastHistory.set(sig, now)
   // Light cap on map size so long-running tabs don't grow it unbounded.
   if (_errorToastHistory.size > 64) {
-    const oldest = [...(_errorToastHistory.entries())].sort((a, b) => a[1] - b[1])[0]
+    const oldest = [..._errorToastHistory.entries()].sort((a, b) => a[1] - b[1])[0]
     if (oldest) _errorToastHistory.delete(oldest[0])
   }
   toast(`出错了: ${sig}`, 'error')
@@ -423,16 +469,19 @@ window.addEventListener('error', (ev) => {
       colno: ev.colno,
       stack: ev.error?.stack,
     })
-  } catch { console.error('[global error]', ev.error || ev) }
+  } catch {
+    console.error('[global error]', ev.error || ev)
+  }
   _showErrorToastOnce(ev.error, msg)
 })
 
 window.addEventListener('unhandledrejection', (ev) => {
   const reason = ev.reason
-  const msg = reason?.message
-    || reason?.error
-    || (typeof reason === 'string' ? reason : null)
-    || '未处理的异步错误'
+  const msg =
+    reason?.message ||
+    reason?.error ||
+    (typeof reason === 'string' ? reason : null) ||
+    '未处理的异步错误'
   try {
     console.error('[unhandled rejection]', {
       message: msg,
@@ -443,7 +492,9 @@ window.addEventListener('unhandledrejection', (ev) => {
       requestId: reason?.requestId,
       stack: reason?.stack,
     })
-  } catch { console.error('[unhandled rejection]', reason) }
+  } catch {
+    console.error('[unhandled rejection]', reason)
+  }
   _showErrorToastOnce(reason, msg)
 })
 
@@ -752,17 +803,18 @@ function send() {
   const userMsg = addMessage(sess, 'user', displayText, {
     status: 'sending',
     _media: media.length > 0 ? media : undefined,
-    _modelText: modelText !== text ? modelText : undefined,  // Full text with attachments for replay
+    _modelText: modelText !== text ? modelText : undefined, // Full text with attachments for replay
   })
   sess._streamingAssistant = null
   sess._streamingThinking = null
   sess._blockIdToMsgId = new Map()
-  sess._agentSwitchedAt = null  // Clear switch guard — new send is intentional
+  sess._agentSwitchedAt = null // Clear switch guard — new send is intentional
   // If offline queue is draining or pending for this session, route through queue
   // to prevent message reordering (new msg arriving before old queued ones)
-  const _hasQueuedForSess = (state.offlineQueue?.some(i => i.sessId === sess.id)) ||
-    (state._offlineQueuePending?.some(i => i.sessId === sess.id)) ||
-    (state._offlineDrainingCurrent?.sessId === sess.id)
+  const _hasQueuedForSess =
+    state.offlineQueue?.some((i) => i.sessId === sess.id) ||
+    state._offlineQueuePending?.some((i) => i.sessId === sess.id) ||
+    state._offlineDrainingCurrent?.sessId === sess.id
   // 2026-04-22 Codex R1 BLOCKING#1:主发送必须走 safeWsSend。
   // 背压超阈值时 safeWsSend 返回 false 并触发 close→reconnect。此时必须把消息
   // requeue 到 offlineQueue,reconnect 后 drainOfflineQueue 会按序重发 —— 否则
@@ -1082,7 +1134,11 @@ function closePalette() {
 // the login screen. Skipped entirely when triggered by 401 auth-expired —
 // the cookie is already invalid server-side and another round-trip would
 // just 401 again (and funnel back through this handler).
-async function _forceLogout({ serverLogout } = {}) {
+// M5(P1-7):broadcast 默认绑定 serverLogout —— 只有用户主动点退出才广播。
+// reactive 路径(401 teardown、refresh 失败、WS 1008)不广播:本 tab 因 BC 丢失 /
+// 早期 userId 缺失 / refresh race 导致 teardown 时,可能 tab A 仍有效会话,广播会
+// 误踢 tab A。Codex M5 review:_forceLogout({ serverLogout: false }) 必须不广播。
+async function _forceLogout({ serverLogout, broadcast = Boolean(serverLogout) } = {}) {
   if (serverLogout) {
     // V3 commercial: POST /api/auth/logout 用 HttpOnly cookie(oc_rt)定位要吊销的
     // refresh token —— 浏览器自动随同源请求带它。HIGH#4 之前的 body fallback
@@ -1119,7 +1175,7 @@ async function _forceLogout({ serverLogout } = {}) {
   // 切账号时新用户继承老用户的 xhigh/max 选择(服务端 credits 会拦,但 pill
   // 视觉状态会误导用户)。
   clearEffortOnLogout()
-  state.token = ''  // Clear token BEFORE close so onclose handler won't auto-reconnect
+  state.token = '' // Clear token BEFORE close so onclose handler won't auto-reconnect
   state.refreshToken = ''
   state.tokenExp = 0
   state.userId = null
@@ -1134,8 +1190,14 @@ async function _forceLogout({ serverLogout } = {}) {
   // the logout flow again. login success also does this, but doing it here
   // too keeps the semantics symmetric across both teardown paths.
   resetAuthExpired()
-  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
-  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer)
+    state.reconnectTimer = null
+  }
+  if (state.reconnectCountdown) {
+    clearInterval(state.reconnectCountdown)
+    state.reconnectCountdown = null
+  }
   // Clear all in-memory session data and offline queues to prevent cross-identity leakage
   state.sessions.clear()
   state.currentSessionId = null
@@ -1153,6 +1215,13 @@ async function _forceLogout({ serverLogout } = {}) {
     for (const s of all) await dbDelete(s.id)
   } catch {}
   if (state.ws) state.ws.close(1000)
+  // M5(P1-7):通知同源其他 tab 一起切登录态。broadcast=false 表示本次 teardown
+  // 由对端广播触发(避免风暴 / 二次广播)。fire-and-forget。
+  if (broadcast) {
+    try {
+      publishLogout()
+    } catch {}
+  }
   // 2026-04-22:过期后回营销首页 (landing),而不是硬跳 /login —— 用户看到
   // "/" 被强制变 "/login" 会困惑。landing 顶栏已有「登录」按钮,想继续用的
   // 用户一键就能进。landing-view 不存在 (老模板) 才 fallback showLogin()。
@@ -1192,19 +1261,23 @@ function showLogin() {
   if ($('login-error')) $('login-error').hidden = true
   // Clear v3 commercial auth-mode form fields if present
   for (const id of [
-    'auth-login-email','auth-login-password',
-    'auth-register-email','auth-register-password','auth-register-confirm',
+    'auth-login-email',
+    'auth-login-password',
+    'auth-register-email',
+    'auth-register-password',
+    'auth-register-confirm',
     'auth-forgot-email',
-    'auth-reset-password','auth-reset-confirm',
+    'auth-reset-password',
+    'auth-reset-confirm',
   ]) {
     const el = $(id)
     if (el) el.value = ''
   }
   // Reset post-submit success panels back to form state
   for (const [formId, successId] of [
-    ['auth-register-form','auth-register-success'],
-    ['auth-forgot-form','auth-forgot-success'],
-    ['auth-reset-form','auth-reset-success'],
+    ['auth-register-form', 'auth-register-success'],
+    ['auth-forgot-form', 'auth-forgot-success'],
+    ['auth-reset-form', 'auth-reset-success'],
   ]) {
     if ($(formId)) $(formId).hidden = false
     if ($(successId)) $(successId).hidden = true
@@ -1230,7 +1303,9 @@ function showLogin() {
   const composer = $('input')
   if (composer) composer.value = ''
   // Default back to login mode (auth.js handles tab visuals)
-  try { setAuthMode('login') } catch {}
+  try {
+    setAuthMode('login')
+  } catch {}
 }
 
 // Session-cookie handshake for media preview.
@@ -1321,15 +1396,16 @@ async function _loadLandingData() {
         wrap.innerHTML = '<div class="landing-models-loading">暂无可用模型</div>'
         return
       }
-      wrap.innerHTML = models.map((m) => {
-        const name = htmlSafeEscape(m.display_name || m.id || '')
-        const id = htmlSafeEscape(m.id || '')
-        const tag = htmlSafeEscape(_modelTagFor(m.id || ''))
-        const inP = _ktokToCreditsPretty(m.input_per_ktok_credits)
-        const outP = _ktokToCreditsPretty(m.output_per_ktok_credits)
-        const cacheR = _ktokToCreditsPretty(m.cache_read_per_ktok_credits)
-        const cacheW = _ktokToCreditsPretty(m.cache_write_per_ktok_credits)
-        return `
+      wrap.innerHTML = models
+        .map((m) => {
+          const name = htmlSafeEscape(m.display_name || m.id || '')
+          const id = htmlSafeEscape(m.id || '')
+          const tag = htmlSafeEscape(_modelTagFor(m.id || ''))
+          const inP = _ktokToCreditsPretty(m.input_per_ktok_credits)
+          const outP = _ktokToCreditsPretty(m.output_per_ktok_credits)
+          const cacheR = _ktokToCreditsPretty(m.cache_read_per_ktok_credits)
+          const cacheW = _ktokToCreditsPretty(m.cache_write_per_ktok_credits)
+          return `
           <div class="landing-model">
             <div class="landing-model-head">
               <div>
@@ -1358,7 +1434,8 @@ async function _loadLandingData() {
             </div>
           </div>
         `
-      }).join('')
+        })
+        .join('')
     } catch {
       wrap.innerHTML = '<div class="landing-models-loading">加载失败,请刷新重试</div>'
     }
@@ -1377,30 +1454,35 @@ async function _loadLandingData() {
       }
       // Featured = "plan-200" (best ratio of bonus + accessible price)
       const featuredCode = 'plan-200'
-      wrap.innerHTML = plans.map((p) => {
-        const yuan = Math.round(Number(p.amount_cents) / 100)
-        // 积分单位:1 元 = 100 积分 = $1 美元 = 100 美分。
-        // p.credits 是 raw cents,直接当积分数显示。
-        const credits = Math.round(Number(p.credits))
-        const baseCredits = yuan * 100
-        const bonusCredits = credits - baseCredits
-        const bonusPct = baseCredits > 0 ? Math.round((bonusCredits / baseCredits) * 100) : 0
-        const featured = p.code === featuredCode
-        return `
+      wrap.innerHTML = plans
+        .map((p) => {
+          const yuan = Math.round(Number(p.amount_cents) / 100)
+          // 积分单位:1 元 = 100 积分 = $1 美元 = 100 美分。
+          // p.credits 是 raw cents,直接当积分数显示。
+          const credits = Math.round(Number(p.credits))
+          const baseCredits = yuan * 100
+          const bonusCredits = credits - baseCredits
+          const bonusPct = baseCredits > 0 ? Math.round((bonusCredits / baseCredits) * 100) : 0
+          const featured = p.code === featuredCode
+          return `
           <div class="landing-plan${featured ? ' landing-plan-featured' : ''}">
             <div class="landing-plan-amount"><span class="yuan">¥</span>${yuan}</div>
             <div class="landing-plan-credits">${credits.toLocaleString('zh-CN')} 积分</div>
             <div class="landing-plan-bonus">${bonusCredits > 0 ? `多送 ${bonusCredits.toLocaleString('zh-CN')} 积分 (+${bonusPct}%)` : '基础档'}</div>
           </div>
         `
-      }).join('')
+        })
+        .join('')
     } catch {
       wrap.innerHTML = '<div class="landing-models-loading">加载失败,请刷新重试</div>'
     }
   })()
 }
 function showLanding() {
-  if (!$('landing-view')) { showLogin(); return }
+  if (!$('landing-view')) {
+    showLogin()
+    return
+  }
   _syncPath('/')
   $('landing-view').hidden = false
   $('login-view').hidden = true
@@ -1410,21 +1492,39 @@ function showLanding() {
   document.body.classList.add('body-landing')
   _loadLandingData()
   // Smooth scroll to top so cross-page anchor returns to hero
-  try { window.scrollTo({ top: 0, behavior: 'instant' }) } catch { window.scrollTo(0, 0) }
+  try {
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  } catch {
+    window.scrollTo(0, 0)
+  }
 }
 function _wireLandingButtons() {
   const lv = $('landing-view')
   if (!lv) return
-  const goRegister = () => { showLogin(); try { setAuthMode('register') } catch {} }
-  const goLogin = () => { showLogin(); try { setAuthMode('login') } catch {} }
-  ;['landing-register-btn', 'landing-hero-register-btn', 'landing-foot-register-btn'].forEach((id) => {
-    $(id)?.addEventListener('click', goRegister)
-  })
+  const goRegister = () => {
+    showLogin()
+    try {
+      setAuthMode('register')
+    } catch {}
+  }
+  const goLogin = () => {
+    showLogin()
+    try {
+      setAuthMode('login')
+    } catch {}
+  }
+  ;['landing-register-btn', 'landing-hero-register-btn', 'landing-foot-register-btn'].forEach(
+    (id) => {
+      $(id)?.addEventListener('click', goRegister)
+    },
+  )
   ;['landing-login-btn', 'landing-hero-login-btn'].forEach((id) => {
     $(id)?.addEventListener('click', goLogin)
   })
   $('landing-theme-btn')?.addEventListener('click', () => {
-    try { cycleTheme() } catch {}
+    try {
+      cycleTheme()
+    } catch {}
   })
 }
 
@@ -1525,8 +1625,14 @@ function showMigrateModal(sessions) {
   for (const s of sessions) {
     const item = document.createElement('label')
     item.className = 'migrate-item'
-    item.style.cssText = 'display:flex;gap:var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--border);cursor:pointer;align-items:flex-start'
-    const date = new Date(s.lastAt).toLocaleString('zh-CN', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
+    item.style.cssText =
+      'display:flex;gap:var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--border);cursor:pointer;align-items:flex-start'
+    const date = new Date(s.lastAt).toLocaleString('zh-CN', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
     item.innerHTML = `
       <input type="checkbox" data-sid="${htmlSafeEscape(s.id)}" style="margin-top:3px;flex-shrink:0">
       <div style="flex:1;min-width:0">
@@ -1617,7 +1723,9 @@ function openChangelog() {
   if (!_changelogData || !_changelogData.releases?.length) {
     content.innerHTML = '<p style="color:var(--fg-muted);text-align:center">暂无更新记录</p>'
   } else {
-    content.innerHTML = _changelogData.releases.map((r, i) => `
+    content.innerHTML = _changelogData.releases
+      .map(
+        (r, i) => `
       <div class="changelog-entry${i === 0 ? ' latest' : ''}">
         <div class="changelog-entry-head">
           <span class="changelog-version-tag">${htmlSafeEscape(r.version)}</span>
@@ -1625,10 +1733,12 @@ function openChangelog() {
         </div>
         <h4 class="changelog-title">${htmlSafeEscape(r.title)}</h4>
         <ul class="changelog-list">
-          ${r.items.map(h => `<li>${htmlSafeEscape(h)}</li>`).join('')}
+          ${r.items.map((h) => `<li>${htmlSafeEscape(h)}</li>`).join('')}
         </ul>
       </div>
-    `).join('')
+    `,
+      )
+      .join('')
     versionEl.textContent = `当前版本 ${_changelogData.currentVersion}`
   }
   // Mark as seen (scoped by stable user.id; 未登录用户不写入避免 key 污染)
@@ -1669,7 +1779,8 @@ async function submitFeedback() {
   if (desc.length < FEEDBACK_MIN_CHARS) {
     const clarifyEl = $('feedback-clarify')
     const textEl = $('feedback-clarify-text')
-    const msg = FEEDBACK_CLARIFY_MESSAGES[Math.floor(Math.random() * FEEDBACK_CLARIFY_MESSAGES.length)]
+    const msg =
+      FEEDBACK_CLARIFY_MESSAGES[Math.floor(Math.random() * FEEDBACK_CLARIFY_MESSAGES.length)]
     textEl.textContent = msg
     clarifyEl.hidden = false
     $('feedback-desc').focus()
@@ -1684,7 +1795,7 @@ async function submitFeedback() {
     // P1-1 (2026-04-25):附诊断上下文给 admin 反查。_diagBuffer 存最近 50 条 API
     // 错误,这里取最后 5 条;request_id 取这 5 条里有的 requestId 去重前 10 个。
     const diag = snapshotDiagnostics()
-    const lastErrors = diag.slice(-5).map(e => ({
+    const lastErrors = diag.slice(-5).map((e) => ({
       ts: e.ts,
       route: e.route,
       status: e.status,
@@ -1692,12 +1803,11 @@ async function submitFeedback() {
       message: e.message,
       requestId: e.requestId,
     }))
-    const requestIds = Array.from(new Set(
-      diag.map(e => e.requestId).filter(Boolean)
-    )).slice(-10)
-    const swCtl = (typeof navigator !== 'undefined' && navigator.serviceWorker)
-      ? navigator.serviceWorker.controller
-      : null
+    const requestIds = Array.from(new Set(diag.map((e) => e.requestId).filter(Boolean))).slice(-10)
+    const swCtl =
+      typeof navigator !== 'undefined' && navigator.serviceWorker
+        ? navigator.serviceWorker.controller
+        : null
     const meta = {
       last_api_errors: lastErrors,
       request_ids: requestIds,
@@ -1871,7 +1981,10 @@ async function init() {
     // a new user message on the switched-to agent.
     resetReplyTracker(sess)
     clearTurnTiming(sess)
-    if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
+    if (sess._regenSafetyTimer) {
+      clearTimeout(sess._regenSafetyTimer)
+      sess._regenSafetyTimer = null
+    }
     state.sendingInFlight = false
     hideTypingIndicator()
     updateSendEnabled()
@@ -1930,8 +2043,7 @@ async function init() {
       // V3 Phase 4E:打开超管控制台。新窗口避免覆盖正在进行的对话。
       // 后端 /api/admin/* + 前端 admin.js 都会再校验一次 role,这里只是入口。
       window.open('/admin.html', '_blank', 'noopener,noreferrer')
-    }
-    else if (action === 'logout') $('logout-btn').click()
+    } else if (action === 'logout') $('logout-btn').click()
   })
   // Memory modal events
   $('memory-tab-memory').onclick = async () => {
@@ -2071,7 +2183,9 @@ async function init() {
     // 主动清掉老版本可能残留的 localStorage refresh token —— 一旦走完一次新版
     // login,旧 token 既无用又是 XSS 攻击面,立刻零化。
     state.refreshToken = ''
-    try { localStorage.removeItem('openclaude_refresh_token') } catch {}
+    try {
+      localStorage.removeItem('openclaude_refresh_token')
+    } catch {}
     // 2026-04-24 "记住我":remember=true(默认)→ localStorage(持久),
     // false → sessionStorage(关窗口即清,与 cookie 同生命周期)。
     _writeStoredAccessToken(access_token, access_exp, remember !== false)
@@ -2085,8 +2199,12 @@ async function init() {
     // <img src="/api/file?..."> 原生请求会捎旧 cookie 跑到 HOST → 按旧身份代理
     // 到旧容器 → 跨用户泄漏。clearSessionCookie 内部带 AbortController,中断的是
     // 先前 mint 的 signal;它自身发出的 clear 会正常到达 server 落盘 Max-Age=0。
-    try { await clearSessionCookie() } catch {}
-    try { await mintSessionCookie(access_token, state.authEpoch) } catch {}
+    try {
+      await clearSessionCookie()
+    } catch {}
+    try {
+      await mintSessionCookie(access_token, state.authEpoch)
+    } catch {}
     // 启动主动续期 timer,见 init() 的注释。
     scheduleProactiveRefresh()
     // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage.
@@ -2101,26 +2219,54 @@ async function init() {
     reloadAgents()
     loadChangelog()
     refreshBalance().catch(() => {})
-    syncSessionsFromServer().then((result) => {
-      const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
-      if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
-        state.currentSessionId = updated[0]?.id || null
-        if (!state.currentSessionId) createSession()
-        renderMessages()
-      } else if (result?.needsRenderMessages) {
-        renderMessages()
-      }
-      renderSidebar()
-      // 2026-04-22:agents + sessions 两条 fetch 在 login 后并发起飞,谁先谁后
-      // 决定了 renderModePills 首次跑时 state.currentSessionId 是否已定。如果
-      // sessions 后到,reloadAgents 里的 renderModePills 拿不到有效 sess →
-      // getCurrentAgentModel 返回 '' → 思考深度选择器一直 hidden,直到用户手动
-      // 刷新页面。兜底:sessions sync 完成后再 render 一次,让 selector 补显。
-      renderModePills()
-    }).catch(() => {})
+    syncSessionsFromServer()
+      .then((result) => {
+        const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+        if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+          state.currentSessionId = updated[0]?.id || null
+          if (!state.currentSessionId) createSession()
+          renderMessages()
+        } else if (result?.needsRenderMessages) {
+          renderMessages()
+        }
+        renderSidebar()
+        // 2026-04-22:agents + sessions 两条 fetch 在 login 后并发起飞,谁先谁后
+        // 决定了 renderModePills 首次跑时 state.currentSessionId 是否已定。如果
+        // sessions 后到,reloadAgents 里的 renderModePills 拿不到有效 sess →
+        // getCurrentAgentModel 返回 '' → 思考深度选择器一直 hidden,直到用户手动
+        // 刷新页面。兜底:sessions sync 完成后再 render 一次,让 selector 补显。
+        renderModePills()
+      })
+      .catch(() => {})
     checkUnclaimedSessions()
   })
   initAuth()
+  // M5(P1-7):多 tab 认证状态同步。同浏览器同源的其他 tab 退出 / 刷新 token 时,
+  // 本 tab in-place 跟进,免去 reactive 401 → 重登流程。
+  // 严格同身份校验(userId)+ stale guard(access_exp 必须新于本 tab 当前 tokenExp)。
+  onAuthBroadcast((msg) => {
+    if (!msg || typeof msg !== 'object') return
+    if (msg.type === 'logout') {
+      // 对端已经 server logout 过,本地仅做 teardown。broadcast:false 避免再发出去
+      // 触发风暴,也避免对端反复收到自己的回声(BC 标准上不会,storage fallback 可能会)。
+      void _forceLogout({ serverLogout: false, broadcast: false })
+      return
+    }
+    if (msg.type === 'token_refresh') {
+      // 五重校验全收敛在 shouldAdoptTokenRefresh —— 单元测试覆盖。
+      if (!shouldAdoptTokenRefresh(state, msg)) return
+      state.token = msg.access_token
+      state.tokenExp = msg.access_exp
+      try {
+        _writeStoredAccessToken(msg.access_token, msg.access_exp, msg.remember !== false)
+      } catch {}
+      try {
+        scheduleProactiveRefresh()
+      } catch {}
+      // file-proxy session cookie 也跟着续期。绑当前 epoch,与 reactive 路径一致。
+      void mintSessionCookie(msg.access_token, state.authEpoch || 0).catch(() => {})
+    }
+  })
   initBilling()
   initUserPrefs()
   initUsageStats()
@@ -2233,28 +2379,30 @@ async function init() {
     loadChangelog()
     refreshBalance().catch(() => {})
     // Cross-device sync: pull sessions from server in background
-    syncSessionsFromServer().then((result) => {
-      // Re-render if sessions changed (added or removed) or current session was updated
-      const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
-      let currentChanged = false
-      if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
-        state.currentSessionId = updated[0]?.id || null
-        if (!state.currentSessionId) createSession()
-        currentChanged = true
-        renderMessages()
-      } else if (result?.needsRenderMessages) {
-        renderMessages()
-      }
-      // Sync the typing indicator / title-busy state if the current session
-      // was swapped or re-fetched (sync may have replaced the session object
-      // with a fresh one whose persisted turn-state differs from what the
-      // UI is showing). This is the sync-path counterpart to the initial
-      // boot-time restore above.
-      if (currentChanged || result?.needsRenderMessages) {
-        restoreCurrentSessionInFlightUI()
-      }
-      renderSidebar()
-    }).catch(() => {})
+    syncSessionsFromServer()
+      .then((result) => {
+        // Re-render if sessions changed (added or removed) or current session was updated
+        const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+        let currentChanged = false
+        if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+          state.currentSessionId = updated[0]?.id || null
+          if (!state.currentSessionId) createSession()
+          currentChanged = true
+          renderMessages()
+        } else if (result?.needsRenderMessages) {
+          renderMessages()
+        }
+        // Sync the typing indicator / title-busy state if the current session
+        // was swapped or re-fetched (sync may have replaced the session object
+        // with a fresh one whose persisted turn-state differs from what the
+        // UI is showing). This is the sync-path counterpart to the initial
+        // boot-time restore above.
+        if (currentChanged || result?.needsRenderMessages) {
+          restoreCurrentSessionInFlightUI()
+        }
+        renderSidebar()
+      })
+      .catch(() => {})
   } else {
     // Cold visitor (no token):
     //  - URL-driven flows (?verify_email / ?reset_password / explicit ?login=1)
@@ -2264,11 +2412,19 @@ async function init() {
     const sp = new URLSearchParams(window.location.search)
     const goStraightToAuth =
       window.location.pathname === '/login' ||
-      sp.has('verify_email') || sp.has('reset_password') ||
-      sp.has('login') || sp.has('register') || sp.has('signin') || sp.has('signup')
+      sp.has('verify_email') ||
+      sp.has('reset_password') ||
+      sp.has('login') ||
+      sp.has('register') ||
+      sp.has('signin') ||
+      sp.has('signup')
     if (goStraightToAuth) {
       showLogin()
-      if (sp.has('register') || sp.has('signup')) { try { setAuthMode('register') } catch {} }
+      if (sp.has('register') || sp.has('signup')) {
+        try {
+          setAuthMode('register')
+        } catch {}
+      }
     } else {
       showLanding()
     }
