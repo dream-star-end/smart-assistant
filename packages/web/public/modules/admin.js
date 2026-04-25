@@ -1456,9 +1456,11 @@ async function _loadAccountsKpis(renderSeq) {
   updateStat(cards[1], `${s.active} / ${s.cooldown}`,
     s.cooldown > 0 ? `有 ${s.cooldown} 个冷却中` : '全部可用',
     s.cooldown > 0 ? 'warning' : 'success')
-  updateStat(cards[2], `${s.expiring_24h} + ${s.expired}`,
-    `24h 内到期 / 已过期`,
-    (s.expired > 0) ? 'danger' : (s.expiring_24h > 0 ? 'warning' : 'success'))
+  // 主值只把"真正需要人工介入"算进去:24h 内到期 + 过期且无 refresh token。
+  // 过期但有 refresh 的会被 anthropicProxy 的 lazy refresh 自愈,不该 danger。
+  updateStat(cards[2], `${s.expiring_24h} + ${s.expired_unrefreshable}`,
+    `24h 内到期 / 待刷新 ${s.expired_refreshable} / 已过期 ${s.expired_unrefreshable}`,
+    (s.expired_unrefreshable > 0) ? 'danger' : (s.expiring_24h > 0 ? 'warning' : 'success'))
   const errRate = s.today_requests > 0 ? s.today_errors / s.today_requests : 0
   updateStat(cards[3], s.today_requests.toLocaleString(),
     `错误 ${s.today_errors}(${(errRate * 100).toFixed(1)}%)`,
@@ -1629,7 +1631,13 @@ function _accountWarningChips(a) {
     const expMs = new Date(a.oauth_expires_at).getTime()
     if (!Number.isNaN(expMs)) {
       if (expMs < now) {
-        chips.push(`<span class="chip chip-danger" title="${escapeHtml(fmtDate(a.oauth_expires_at))}">OAuth 已过期</span>`)
+        // 有 refresh token → lazy refresh 会自愈,muted chip;没 refresh → 真坏,danger。
+        // 严格 === true 防 cache/旧后端 falsy 值误判成可自愈。
+        if (a.has_refresh_token === true) {
+          chips.push(`<span class="chip chip-muted" title="${escapeHtml(fmtDate(a.oauth_expires_at))}">OAuth 待刷新</span>`)
+        } else {
+          chips.push(`<span class="chip chip-danger" title="${escapeHtml(fmtDate(a.oauth_expires_at))}">OAuth 已过期</span>`)
+        }
       } else if (expMs - now < 24 * 3600 * 1000) {
         chips.push(`<span class="chip chip-warn" title="${escapeHtml(fmtDate(a.oauth_expires_at))}">24h 内到期</span>`)
       }

@@ -347,18 +347,21 @@ export async function listLedger(
   //   在并发场景下,先 BEGIN 后拿锁 commit 的 tx 反而会有更早的 created_at,排序会错。
   //   id 是 BIGSERIAL,在 FOR UPDATE 串行化前提下严格跟 commit 顺序一致。
   // created_at 依然保留给"用户感知时间"展示,但不用它排序。
+  // ORDER BY 用 qualified `cl.id`:`SELECT id::text AS id` 让 PG 优先 SELECT alias
+  // 排序 → text 字典序("9" > "57")。`cl.id` 强制走 source bigint。
+  // cursor 仍用 `created_at < $2`(沿用 API 合约,不改分页语义)。
   const sql = before
-    ? `SELECT id::text AS id, user_id::text AS user_id, delta::text AS delta,
-              balance_after::text AS balance_after, reason, ref_type, ref_id, memo, created_at
-         FROM credit_ledger
-        WHERE user_id = $1 AND created_at < $2
-        ORDER BY id DESC
+    ? `SELECT cl.id::text AS id, cl.user_id::text AS user_id, cl.delta::text AS delta,
+              cl.balance_after::text AS balance_after, cl.reason, cl.ref_type, cl.ref_id, cl.memo, cl.created_at
+         FROM credit_ledger cl
+        WHERE cl.user_id = $1 AND cl.created_at < $2
+        ORDER BY cl.id DESC
         LIMIT $3`
-    : `SELECT id::text AS id, user_id::text AS user_id, delta::text AS delta,
-              balance_after::text AS balance_after, reason, ref_type, ref_id, memo, created_at
-         FROM credit_ledger
-        WHERE user_id = $1
-        ORDER BY id DESC
+    : `SELECT cl.id::text AS id, cl.user_id::text AS user_id, cl.delta::text AS delta,
+              cl.balance_after::text AS balance_after, cl.reason, cl.ref_type, cl.ref_id, cl.memo, cl.created_at
+         FROM credit_ledger cl
+        WHERE cl.user_id = $1
+        ORDER BY cl.id DESC
         LIMIT $2`;
   const params: unknown[] = before ? [uid, before, limit] : [uid, limit];
   const r = await rootQuery<{

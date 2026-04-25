@@ -703,6 +703,8 @@ function serializeAccount(a: AccountRow): Record<string, unknown> {
     has_egress_proxy: a.egress_proxy !== null,
     /** 0038 — 自动分配的 compute_host id;UI 显示绑定状态 + 触发重分配。 */
     egress_host_uuid: a.egress_host_uuid,
+    /** UI 区分 oauth 过期"可自愈(待 lazy refresh)"vs"需人工"的依据。 */
+    has_refresh_token: a.has_refresh_token,
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };

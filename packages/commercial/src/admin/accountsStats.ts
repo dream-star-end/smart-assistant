@@ -21,8 +21,16 @@ export interface AccountsPoolStats {
   cooldown: number;
   disabled: number;
   banned: number;
-  /** oauth_expires_at IS NOT NULL AND oauth_expires_at < NOW() */
-  expired: number;
+  /**
+   * oauth_expires_at < NOW() 且**有** refresh token(密文 + nonce 都非空)。
+   * 走 anthropicProxy.ts 的 lazy refresh,人工无需介入,UI 用 muted chip。
+   */
+  expired_refreshable: number;
+  /**
+   * oauth_expires_at < NOW() 且**没有** refresh token —— 真坏,需要管理员重登。
+   * KPI 主值的 danger 信号源。
+   */
+  expired_unrefreshable: number;
   /** oauth_expires_at ≥ NOW() AND oauth_expires_at < NOW() + 24h */
   expiring_24h: number;
   /** 今日 usage_records 总请求数(所有账号汇总) */
@@ -40,7 +48,8 @@ export async function getAccountsPoolStats(): Promise<AccountsPoolStats> {
     cooldown: string;
     disabled: string;
     banned: string;
-    expired: string;
+    expired_refreshable: string;
+    expired_unrefreshable: string;
     expiring_24h: string;
   }>(
     `SELECT
@@ -50,8 +59,16 @@ export async function getAccountsPoolStats(): Promise<AccountsPoolStats> {
        COUNT(*) FILTER (WHERE status = 'disabled')                      AS disabled,
        COUNT(*) FILTER (WHERE status = 'banned')                        AS banned,
        COUNT(*) FILTER (
-         WHERE oauth_expires_at IS NOT NULL AND oauth_expires_at < NOW()
-       )                                                                 AS expired,
+         WHERE oauth_expires_at IS NOT NULL
+           AND oauth_expires_at < NOW()
+           AND oauth_refresh_enc IS NOT NULL
+           AND oauth_refresh_nonce IS NOT NULL
+       )                                                                 AS expired_refreshable,
+       COUNT(*) FILTER (
+         WHERE oauth_expires_at IS NOT NULL
+           AND oauth_expires_at < NOW()
+           AND (oauth_refresh_enc IS NULL OR oauth_refresh_nonce IS NULL)
+       )                                                                 AS expired_unrefreshable,
        COUNT(*) FILTER (
          WHERE oauth_expires_at IS NOT NULL
            AND oauth_expires_at >= NOW()
@@ -71,7 +88,7 @@ export async function getAccountsPoolStats(): Promise<AccountsPoolStats> {
 
   const p = r.rows[0] ?? {
     total: "0", active: "0", cooldown: "0", disabled: "0", banned: "0",
-    expired: "0", expiring_24h: "0",
+    expired_refreshable: "0", expired_unrefreshable: "0", expiring_24h: "0",
   };
   const t = u.rows[0] ?? { today_requests: "0", today_errors: "0" };
   return {
@@ -80,7 +97,8 @@ export async function getAccountsPoolStats(): Promise<AccountsPoolStats> {
     cooldown: Number(p.cooldown),
     disabled: Number(p.disabled),
     banned: Number(p.banned),
-    expired: Number(p.expired),
+    expired_refreshable: Number(p.expired_refreshable),
+    expired_unrefreshable: Number(p.expired_unrefreshable),
     expiring_24h: Number(p.expiring_24h),
     today_requests: Number(t.today_requests),
     today_errors: Number(t.today_errors),

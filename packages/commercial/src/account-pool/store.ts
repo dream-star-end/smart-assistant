@@ -71,6 +71,12 @@ export interface AccountRow {
    * 列表/详情都要返回,admin UI 拿来显示绑定状态 + 触发重分配。
    */
   egress_host_uuid: string | null;
+  /**
+   * 是否存有 refresh token(密文 + nonce 都非空)。
+   * admin UI 用来区分"过期可自愈"和"过期需人工"两种 chip 语义 ——
+   * lazy refresh 触发条件见 anthropicProxy.ts:1417 / shouldRefresh()。
+   */
+  has_refresh_token: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -187,6 +193,7 @@ const META_COLUMNS = `
   quota_updated_at,
   egress_proxy,
   egress_host_uuid::text AS egress_host_uuid,
+  (oauth_refresh_enc IS NOT NULL AND oauth_refresh_nonce IS NOT NULL) AS has_refresh_token,
   created_at,
   updated_at
 `;
@@ -211,6 +218,7 @@ interface RawMetaRow extends QueryResultRow {
   quota_updated_at: Date | null;
   egress_proxy: string | null;
   egress_host_uuid: string | null;
+  has_refresh_token: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -263,6 +271,7 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     quota_updated_at: row.quota_updated_at,
     egress_proxy: row.egress_proxy,
     egress_host_uuid: row.egress_host_uuid,
+    has_refresh_token: row.has_refresh_token,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };

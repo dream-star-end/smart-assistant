@@ -99,7 +99,9 @@ function buildLedgerWhere(input: ListLedgerInput): { where: string[]; params: un
   if (input.before !== undefined) {
     if (!ID_RE.test(input.before)) throw new RangeError("invalid_before");
     params.push(input.before);
-    where.push(`id < $${params.length}::bigint`);
+    // 用 qualified `cl.id` 防 SELECT 列别名 `id::text AS id` 误把 cursor 比较拽
+    // 进字符串域(详见 listLedger / buildLedgerCsv 的 ORDER BY 同模式注释)。
+    where.push(`cl.id < $${params.length}::bigint`);
   }
   return { where, params };
 }
@@ -113,18 +115,21 @@ export async function listLedger(input: ListLedgerInput = {}): Promise<ListLedge
 
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
   params.push(limit);
+  // ORDER BY 用 qualified `cl.id` —— `SELECT id::text AS id` 让 PG 的 ORDER BY
+  // 优先 SELECT alias(text 类型)做字典序排序("9" > "57" > "6"),线上能复现。
+  // 用 `cl.id` 强制走 source 列(bigint),数值降序正确。
   const r = await query<LedgerRowView>(
-    `SELECT id::text            AS id,
-            user_id::text       AS user_id,
-            delta::text         AS delta,
-            balance_after::text AS balance_after,
-            reason,
-            ref_type,
-            ref_id,
-            memo,
-            created_at
-     FROM credit_ledger ${whereClause}
-     ORDER BY id DESC
+    `SELECT cl.id::text            AS id,
+            cl.user_id::text       AS user_id,
+            cl.delta::text         AS delta,
+            cl.balance_after::text AS balance_after,
+            cl.reason,
+            cl.ref_type,
+            cl.ref_id,
+            cl.memo,
+            cl.created_at
+     FROM credit_ledger cl ${whereClause}
+     ORDER BY cl.id DESC
      LIMIT $${params.length}`,
     params,
   );
@@ -166,18 +171,19 @@ export async function buildLedgerCsv(input: BuildLedgerCsvInput = {}): Promise<B
   const { where, params } = buildLedgerWhere(input);
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
   params.push(LEDGER_CSV_MAX_ROWS);
+  // 同 listLedger:qualified `cl.id` 防 SELECT alias 触发字典序排序。
   const r = await query<LedgerRowView>(
-    `SELECT id::text            AS id,
-            user_id::text       AS user_id,
-            delta::text         AS delta,
-            balance_after::text AS balance_after,
-            reason,
-            ref_type,
-            ref_id,
-            memo,
-            created_at
-     FROM credit_ledger ${whereClause}
-     ORDER BY id DESC
+    `SELECT cl.id::text            AS id,
+            cl.user_id::text       AS user_id,
+            cl.delta::text         AS delta,
+            cl.balance_after::text AS balance_after,
+            cl.reason,
+            cl.ref_type,
+            cl.ref_id,
+            cl.memo,
+            cl.created_at
+     FROM credit_ledger cl ${whereClause}
+     ORDER BY cl.id DESC
      LIMIT $${params.length}`,
     params,
   );
