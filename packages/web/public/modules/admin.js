@@ -1386,6 +1386,8 @@ function _renderAccountsTable() {
           <th class="num">今日 / 错误率</th>
           <th class="num">累计 ok/fail</th>
           <th>OAuth 到期</th>
+          <th class="num" title="近 5 小时利用率(被动从上游响应头采集)">5h%</th>
+          <th class="num" title="近 7 天利用率(被动从上游响应头采集)">7d%</th>
           <th>冷却至</th>
           <th>最近使用</th>
           <th>egress</th>
@@ -1478,6 +1480,28 @@ function _accountWarningChips(a) {
   return chips.length > 0 ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:3px">${chips.join('')}</div>` : ''
 }
 
+// M9 — 渲染 5h / 7d 配额单元格。
+//   pct: number | null (0-100)
+//   resetsAt: ISO string | null
+//   updatedAt: ISO string | null  (整个账号的 quota_updated_at,共用)
+// 陈旧数据 (>1h) → 灰色 chip(不再着色,但仍显示 % 数值)。
+// 5h/7d 共用 quota_updated_at,prod 假设两组 header 同步返(见 quota.ts 注释)。
+function _renderQuotaCell(pct, resetsAt, updatedAt) {
+  if (pct === null || pct === undefined) return '<span class="muted">—</span>'
+  const num = Number(pct)
+  if (!Number.isFinite(num)) return '<span class="muted">—</span>'
+  const updMs = updatedAt ? new Date(updatedAt).getTime() : NaN
+  const ageMs = Number.isFinite(updMs) ? Date.now() - updMs : Infinity
+  const stale = ageMs > 60 * 60 * 1000
+  const cls = stale ? 'chip-muted' : (num >= 95 ? 'chip-danger' : num >= 80 ? 'chip-warn' : '')
+  const label = `${num.toFixed(0)}%`
+  const titleParts = []
+  if (resetsAt) titleParts.push(`重置: ${fmtDate(resetsAt)}`)
+  if (updatedAt) titleParts.push(`更新: ${fmtDate(updatedAt)}${stale ? ' (陈旧)' : ''}`)
+  const title = titleParts.length ? ` title="${escapeHtml(titleParts.join(' · '))}"` : ''
+  return cls ? `<span class="chip ${cls}"${title}>${label}</span>` : `<span${title}>${label}</span>`
+}
+
 function _renderAccountRow(a) {
   // 累计成功率
   const okN = Number(a.success_count || 0)
@@ -1507,6 +1531,10 @@ function _renderAccountRow(a) {
     : '—'
   // cooldown reset 只对 cooldown_until 非空的账号显示
   const showReset = !!a.cooldown_until
+  // 5h / 7d 配额单元格(M9)。utilization 0-100 number|null。
+  // quota_updated_at 早于 1h 显灰(陈旧),≥ 95 红 / ≥ 80 黄 / 否则常态。
+  const cell5h = _renderQuotaCell(a.quota_5h_pct, a.quota_5h_resets_at, a.quota_updated_at)
+  const cell7d = _renderQuotaCell(a.quota_7d_pct, a.quota_7d_resets_at, a.quota_updated_at)
   return `
     <tr>
       <td class="mono">${escapeHtml(a.id)}</td>
@@ -1517,6 +1545,8 @@ function _renderAccountRow(a) {
       <td class="num">${todayReq}${todayChip}</td>
       <td class="num">${okN}/${failN}${failRateChip}</td>
       <td class="mono">${fmtDate(a.oauth_expires_at)}</td>
+      <td class="num">${cell5h}</td>
+      <td class="num">${cell7d}</td>
       <td class="mono">${cdChip}</td>
       <td class="mono">${fmtRelative(a.last_used_at)}</td>
       <td class="mono" title="${escapeHtml(a.egress_proxy || '')}">${escapeHtml(a.egress_proxy || '—')}</td>

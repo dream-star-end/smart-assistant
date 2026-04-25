@@ -690,6 +690,12 @@ function serializeAccount(a: AccountRow): Record<string, unknown> {
     success_count: a.success_count.toString(),
     fail_count: a.fail_count.toString(),
     quota_remaining: a.quota_remaining,
+    /** M9 配额可见性 — 由 anthropicProxy 上游响应头被动写入。pct 是 0-100 的 number|null。 */
+    quota_5h_pct: a.quota_5h_pct,
+    quota_5h_resets_at: a.quota_5h_resets_at?.toISOString() ?? null,
+    quota_7d_pct: a.quota_7d_pct,
+    quota_7d_resets_at: a.quota_7d_resets_at?.toISOString() ?? null,
+    quota_updated_at: a.quota_updated_at?.toISOString() ?? null,
     /** 已 mask 密码,UI 安全显示;明文绝不出库 */
     egress_proxy: maskEgressProxy(a.egress_proxy),
     has_egress_proxy: a.egress_proxy !== null,

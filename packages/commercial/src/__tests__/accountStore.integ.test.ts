@@ -129,6 +129,12 @@ describe("createAccount", () => {
     assert.equal(row.success_count, 0n);
     assert.equal(row.fail_count, 0n);
     assert.ok(row.id > 0n);
+    // M9 配额可见性 — 新建账号时 5 字段都应为 null(未被 anthropicProxy 写过)
+    assert.equal(row.quota_5h_pct, null);
+    assert.equal(row.quota_5h_resets_at, null);
+    assert.equal(row.quota_7d_pct, null);
+    assert.equal(row.quota_7d_resets_at, null);
+    assert.equal(row.quota_updated_at, null);
     const raw = await readRawSecretColumns(row.id);
     assert.equal(raw.oauth_nonce.length, 12);
     assert.ok(raw.oauth_token_enc.length > ACCESS.length, "密文含 16B tag,必 > 明文");

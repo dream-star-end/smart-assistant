@@ -78,6 +78,7 @@ import {
   type RefreshDeps,
 } from "../account-pool/refresh.js";
 import { getDispatcherForAccount } from "../account-pool/egressDispatcher.js";
+import { maybeUpdateAccountQuota } from "../account-pool/quota.js";
 import {
   observeAnthropicProxyTtft,
   observeAnthropicProxyStreamDuration,
@@ -1605,6 +1606,13 @@ export function makeAnthropicProxyHandler(
           sendJsonError(res, 502, "UPSTREAM_NO_BODY", "upstream returned no body", requestId);
           return;
         }
+        // M9 配额可见性 — 从上游响应头抽 5h/7d utilization + reset,fire-and-forget
+        // UPDATE accounts。30s 进程内 throttle + SQL WHERE + 全局 cap 32 三层防护,
+        // 详见 quota.ts 文件头。maybeUpdateAccountQuota 内部已吞所有错,这里 .catch
+        // 仅做最后兜底(理论不会触发),保留以防未来重构破坏内部 swallow 语义。
+        maybeUpdateAccountQuota(deps.pgPool, pick.account_id, upstream.headers).catch((err) => {
+          userLog.warn("proxy_quota_update_failed", { err: errSummary(err) });
+        });
         // 写 SSE 响应头,开始 byte-pipe
         res.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",

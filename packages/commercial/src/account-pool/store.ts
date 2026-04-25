@@ -50,6 +50,16 @@ export interface AccountRow {
   fail_count: bigint;
   quota_remaining: number | null;
   /**
+   * M9 配额可见性 — 由 anthropicProxy.ts 上行响应头被动写入。
+   * NUMERIC(5,2) 在 pg 默认返 string,SELECT 时 cast ::float8,所以这里是 number|null。
+   * 见 quota.ts。
+   */
+  quota_5h_pct: number | null;
+  quota_5h_resets_at: Date | null;
+  quota_7d_pct: number | null;
+  quota_7d_resets_at: Date | null;
+  quota_updated_at: Date | null;
+  /**
    * 出口代理 URL,形如 `http://user:pass@host:port`。
    * NULL = 走本机出口(默认/旧账号兼容)。
    * 由 chat orchestrator 构造 undici ProxyAgent 注入到 fetch dispatcher。
@@ -141,6 +151,11 @@ const META_COLUMNS = `
   success_count::text AS success_count,
   fail_count::text AS fail_count,
   quota_remaining,
+  quota_5h_pct::float8       AS quota_5h_pct,
+  quota_5h_resets_at,
+  quota_7d_pct::float8       AS quota_7d_pct,
+  quota_7d_resets_at,
+  quota_updated_at,
   egress_proxy,
   created_at,
   updated_at
@@ -159,6 +174,11 @@ interface RawMetaRow extends QueryResultRow {
   success_count: string;
   fail_count: string;
   quota_remaining: number | null;
+  quota_5h_pct: number | null;
+  quota_5h_resets_at: Date | null;
+  quota_7d_pct: number | null;
+  quota_7d_resets_at: Date | null;
+  quota_updated_at: Date | null;
   egress_proxy: string | null;
   created_at: Date;
   updated_at: Date;
@@ -189,6 +209,11 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     success_count: BigInt(row.success_count),
     fail_count: BigInt(row.fail_count),
     quota_remaining: row.quota_remaining,
+    quota_5h_pct: row.quota_5h_pct,
+    quota_5h_resets_at: row.quota_5h_resets_at,
+    quota_7d_pct: row.quota_7d_pct,
+    quota_7d_resets_at: row.quota_7d_resets_at,
+    quota_updated_at: row.quota_updated_at,
     egress_proxy: row.egress_proxy,
     created_at: row.created_at,
     updated_at: row.updated_at,
