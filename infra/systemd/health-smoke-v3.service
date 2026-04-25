@@ -1,0 +1,34 @@
+[Unit]
+Description=Liveness smoke for claudeai.chat (M8.2/P2-19)
+# 不依赖 openclaude.service:smoke 的目的就是侦测 service 死掉.
+# After 仅指顺序提示, 不强约束依赖.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# RuntimeDirectory= 自动创建 /run/openclaude 并赋写权限给本 unit.
+# 跟 pg-restore-test 共享同一目录,锁文件名隔离.
+RuntimeDirectory=openclaude
+# 显式 0700 — Codex M8.2 NIT, 跟注释里的 700 对齐 (默认是 0755).
+RuntimeDirectoryMode=0700
+# flock -n: 避免长 outage 中 timer Persistent 回放/手工 start/单次 hang 导致重叠
+ExecStart=/usr/bin/flock -n /run/openclaude/health-smoke-v3.lock /usr/local/bin/health-smoke-v3-runner.sh
+# Curl --max-time 10 + 2 个 endpoint = 最坏 ~25s. 60s 给足冗余.
+TimeoutStartSec=60s
+TimeoutStopSec=10s
+Nice=10
+IOSchedulingClass=idle
+
+# Hardening
+ProtectSystem=strict
+# read-only (不是 true) — runner 需要读 /root/.openclaude/.env 的 DATABASE_URL 行.
+# ProtectHome=true 会把 /root 标 InaccessiblePaths, ReadOnlyPaths 不能在它下面
+# 重新开洞 (Codex M8.2 BLOCKING 修复). read-only 仍然防写, 安全收益保留.
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# 写 /var/log/health-smoke-v3.log + /var/lib/openclaude/health-smoke-v3.failed
+ReadWritePaths=/var/log /var/lib/openclaude
+PrivateTmp=true

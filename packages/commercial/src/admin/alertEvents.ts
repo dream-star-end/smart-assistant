@@ -63,6 +63,9 @@ export const EVENTS = {
   SECURITY_ADMIN_ROLE_CHANGED: "security.admin_role_changed",
   SECURITY_ADMIN_AUDIT_WRITE_FAILED: "security.admin_audit_write_failed",
 
+  // ── 健康(1)────────────────────────────────────────────────
+  HEALTH_SMOKE_FAILED: "health.smoke_failed",
+
   // ── 系统(2)────────────────────────────────────────────────
   SYSTEM_MAINTENANCE_MODE_CHANGED: "system.maintenance_mode_changed",
   SYSTEM_PRICING_CHANGED: "system.pricing_changed",
@@ -112,6 +115,10 @@ export const EVENT_META: EventMeta[] = [
     description: "admin 角色被提权或降权", trigger: "passive" },
   { event_type: EVENTS.SECURITY_ADMIN_AUDIT_WRITE_FAILED, severity: "critical", group: "security",
     description: "admin_audit 写入失败(可能审计缺漏)", trigger: "passive" },
+
+  // health
+  { event_type: EVENTS.HEALTH_SMOKE_FAILED, severity: "critical", group: "health",
+    description: "claudeai.chat /healthz 或 / 不可达(每 5 分钟独立 cron 探活,与 openclaude.service 解耦)", trigger: "passive" },
 
   // system
   { event_type: EVENTS.SYSTEM_MAINTENANCE_MODE_CHANGED, severity: "warning", group: "system",

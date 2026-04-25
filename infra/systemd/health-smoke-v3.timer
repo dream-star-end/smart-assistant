@@ -1,0 +1,16 @@
+[Unit]
+Description=Liveness smoke timer for claudeai.chat (M8.2/P2-19)
+
+[Timer]
+# 每 5 分钟一跳. 整 5 分钟边界 (00, 05, 10 ...) — 便于人肉对齐日志.
+OnCalendar=*:0/5:00
+# Persistent=true: 机器宕过/timer 停过期间错过的 tick 会在恢复后立刻补一次.
+# 对 liveness 有意义 — 重启/恢复后第一时间确认服务真的活着.
+Persistent=true
+# 30s 随机抖动: 避免多个 timer 在整 5 分钟同时压源端 (此处影响小, 但便宜的好习惯).
+RandomizedDelaySec=30s
+AccuracySec=10s
+Unit=health-smoke-v3.service
+
+[Install]
+WantedBy=timers.target
