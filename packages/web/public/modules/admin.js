@@ -3795,6 +3795,15 @@ async function renderAlertsTab() {
   }
 
   view().innerHTML = `
+    <!-- P3 Plan v10:事件覆盖矩阵 — admin 一眼看清"哪些事件没人收 / 订阅了但被卡住" -->
+    <div class="panel">
+      <h2>事件覆盖矩阵 <small>EVENT_META × channels.event_types — 谁能收、最近一次入队</small></h2>
+      <div class="toolbar">
+        <button class="btn" id="al-cv-refresh">刷新</button>
+      </div>
+      <div id="al-coverage">加载中…</div>
+    </div>
+
     <div class="panel">
       <h2>告警通道 <small>微信 iLink / Telegram,只发给绑定了的超管</small></h2>
       <div class="toolbar">
@@ -3853,12 +3862,14 @@ async function renderAlertsTab() {
     </div>
   `
 
-  // 四区并行拉数据 —— 互不阻塞
+  // 五区并行拉数据 —— 互不阻塞(coverage 是新加的 P3 panel)
+  _refreshAlertCoverage()
   _refreshAlertChannels()
   _refreshAlertOutbox()
   _refreshAlertSilences()
   _refreshAlertRuleStates()
 
+  $('al-cv-refresh').addEventListener('click', _refreshAlertCoverage)
   $('al-ch-refresh').addEventListener('click', _refreshAlertChannels)
   $('al-ch-bind').addEventListener('click', _openBindIlinkModal)
   $('al-ch-tg').addEventListener('click', _openCreateTelegramModal)
@@ -3871,6 +3882,94 @@ async function renderAlertsTab() {
   $('al-sl-refresh').addEventListener('click', _refreshAlertSilences)
   $('al-sl-new').addEventListener('click', _openCreateSilenceModal)
   $('al-rs-refresh').addEventListener('click', _refreshAlertRuleStates)
+}
+
+// ── coverage matrix (P3 Plan v10) ───────────────────────────────────
+
+// 7 group label 顺序按业务重要性排:account_pool / payment / container 在前
+const COVERAGE_GROUP_LABEL = {
+  account_pool: '账号池',
+  payment: '支付',
+  container: '容器',
+  risk: '风控',
+  health: '健康',
+  security: '安全',
+  system: '系统',
+}
+const COVERAGE_GROUP_ORDER = ['account_pool', 'payment', 'container', 'risk', 'health', 'security', 'system']
+
+const COVERAGE_SEV_TONE = { critical: 'danger', warning: 'warn', info: 'muted' }
+
+async function _refreshAlertCoverage() {
+  const el = $('al-coverage')
+  if (!el) return
+  el.innerHTML = '<div class="loading">加载中…</div>'
+  try {
+    const d = await apiGet('/api/admin/alerts/events/coverage')
+    const rows = d?.rows ?? []
+    if (rows.length === 0) {
+      el.innerHTML = '<div class="empty">暂无事件 — EVENT_META 为空?</div>'
+      return
+    }
+    // 按 group 分桶,保持后端给的 EVENT_META 顺序(已按业务排过)
+    const byGroup = {}
+    for (const r of rows) {
+      if (!byGroup[r.group]) byGroup[r.group] = []
+      byGroup[r.group].push(r)
+    }
+    const html = COVERAGE_GROUP_ORDER
+      .filter((g) => byGroup[g] && byGroup[g].length > 0)
+      .map((g) => `
+        <div class="coverage-group">
+          <h4 style="margin:12px 0 6px 0;">${escapeHtml(COVERAGE_GROUP_LABEL[g] || g)} <small style="color:var(--muted);font-weight:400;">(${byGroup[g].length})</small></h4>
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>事件</th>
+                <th>严重度</th>
+                <th>触发</th>
+                <th class="num">订阅</th>
+                <th class="num">可投递</th>
+                <th>最近一次入队</th>
+              </tr>
+            </thead>
+            <tbody>${byGroup[g].map(_renderCoverageRow).join('')}</tbody>
+          </table>
+        </div>
+      `).join('')
+    el.innerHTML = html
+  } catch (e) {
+    el.innerHTML = `<div class="chip chip-danger">加载失败:${escapeHtml(e.message || String(e))}</div>`
+  }
+}
+
+function _renderCoverageRow(r) {
+  const sevTone = COVERAGE_SEV_TONE[r.severity] || 'muted'
+  // subscriber=0 → 红:没人订阅
+  // subscriber>0 && deliverable=0 → 黄:订阅了但 severity_min 卡住 / iLink 未激活
+  // subscriber>0 && deliverable>0 → 灰:正常
+  let subTone = 'muted', delTone = 'muted', delHint = ''
+  if (r.subscriber_count === 0) {
+    subTone = 'warn'; delTone = 'warn'; delHint = '没人订阅这个事件'
+  } else if (r.deliverable_count === 0) {
+    delTone = 'warn'; delHint = '有 channel 订阅但 severity_min 卡住 / iLink 未激活'
+  }
+  const lastCell = r.last_fired_at
+    ? `<span class="mono" title="最近 severity: ${escapeHtml(r.last_severity || '')}">${escapeHtml(fmtRelative(r.last_fired_at))}</span>`
+    : '<span class="muted">从未</span>'
+  return `
+    <tr>
+      <td>
+        <span class="mono">${escapeHtml(r.event_type)}</span>
+        <div class="muted" style="font-size:12px;">${escapeHtml(r.description || '')}</div>
+      </td>
+      <td><span class="chip chip-${sevTone}">${escapeHtml(r.severity)}</span></td>
+      <td><span class="chip chip-muted" title="${escapeHtml(r.trigger === 'polled' ? '轮询 scheduler' : r.trigger === 'passive' ? '代码路径被动 enqueue' : '两者都有')}">${escapeHtml(r.trigger)}</span></td>
+      <td class="num"><span class="chip chip-${subTone}">${r.subscriber_count}</span></td>
+      <td class="num"><span class="chip chip-${delTone}" ${delHint ? `title="${escapeHtml(delHint)}"` : ''}>${r.deliverable_count}</span></td>
+      <td>${lastCell}</td>
+    </tr>
+  `
 }
 
 // ── channels ────────────────────────────────────────────────────────

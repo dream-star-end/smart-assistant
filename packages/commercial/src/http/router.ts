@@ -130,6 +130,7 @@ import {
   handleAdminAlertsListRuleStates,
   handleAdminAlertsRetryOutbox,
   handleAdminAlertsAckRule,
+  handleListEventCoverage,
 } from './adminAlerts.js'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { rootLogger, type Logger } from '../logging/logger.js'
@@ -507,6 +508,8 @@ export function createCommercialHandler(
     { method: 'PUT', pathPrefix: '/api/admin/settings/', handler: handleAdminPutSetting },
     // T-63 超管告警(WeChat 推送)—— exact path 在前,prefix 在后
     { method: 'GET', path: '/api/admin/alerts/events', handler: handleAdminAlertsListEvents },
+    // P3 — 事件覆盖矩阵(EVENT_META + channel join + 30d outbox 最近一次)
+    { method: 'GET', path: '/api/admin/alerts/events/coverage', handler: handleListEventCoverage },
     { method: 'GET', path: '/api/admin/alerts/channels', handler: handleAdminAlertsListChannels },
     {
       method: 'POST',

@@ -60,6 +60,7 @@ import {
   type OutboxRowView,
 } from '../admin/alertOutbox.js'
 import { EVENT_META } from '../admin/alertEvents.js'
+import { getEventCoverage } from '../admin/alertCoverage.js'
 import {
   fetchIlinkQrcode,
   pollIlinkQrcodeStatus,
@@ -176,6 +177,22 @@ export async function handleAdminAlertsListEvents(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret)
   sendJson(res, 200, { rows: EVENT_META })
+}
+
+// ─── GET /api/admin/alerts/events/coverage ───────────────────────────
+//
+// Plan v10 P3 — 事件覆盖矩阵。和 /alerts/events 区分:那个返事件目录,
+// 这个返"目录 + channel 订阅 / 投递性 / 最近一次 outbox"。前端 alerts tab
+// 顶部 panel 用。requireAdmin(只读),per-call ~2 query,可接受。
+export async function handleListEventCoverage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret)
+  const rows = await getEventCoverage()
+  sendJson(res, 200, { rows })
 }
 
 // ─── GET /api/admin/alerts/channels ──────────────────────────────────
