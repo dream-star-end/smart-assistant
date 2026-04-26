@@ -2,7 +2,7 @@
 import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=c2420e6'
+import { clearSessionCookie } from './auth.js?v=abe05b5'
 import { dbPut } from './db.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
@@ -11,7 +11,7 @@ import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance, _openTopupModal } from './billing.js?v=c2420e6'
+import { refreshBalance, _openTopupModal } from './billing.js?v=abe05b5'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -1068,11 +1068,20 @@ export function connect() {
     // 1008 在上面已 return,这里不会走到;无需特判。
     let serverHintedDelay = 0
     // 容器初始化期 banner 目标状态 —— onclose 走完后 set 一次,避免:
-    //   (a) 显示后下一轮 close 是 4504 maintenance 或 4503 其它 reason
-    //       (starting / stopped / host_full / image_missing / supervisor_error)
-    //       时旧 banner 残留;
+    //   (a) 显示后下一轮 close 是 4504 maintenance 或 4503 错误类 reason
+    //       (host_full / image_missing / baseline_missing / host_gone /
+    //        supervisor_error / invalid_uid)时旧 banner 残留;
     //   (b) 任何 4503 但缺 reason / 解析失败的边界路径误显示。
-    // 默认 false,只在确认 reason==='provisioning' 才 true,统一在 try 外 set。
+    // 默认 false,仅 4503 + reason ∈ allowlist 才 true,统一在 try 外 set。
+    //
+    // allowlist 仅含真正"容器在准备/初始化中"且短重试可自恢复的 reason:
+    //   - provisioning: NameConflict / IP 池满等 catch-all
+    //   - starting:     provision 后等 healthz / running+healthz timeout
+    //                   (首登冷启 5-10s 最常见的路径)
+    //   - stopped:      容器停了等 idle sweep + 下次 ws 重连 provision
+    // host_gone 故意排除:hosts 行被外部删除,容器 row 还指向已不存在的
+    //   host_id,5s 短重试无法自恢复,banner 文案会误导用户期望。
+    const PROVISIONING_REASONS = ['provisioning', 'starting', 'stopped']
     let isProvisioning = false
     if ((e.code === 4503 || e.code === 4504) && typeof e.reason === 'string' && e.reason.length > 0) {
       try {
@@ -1084,15 +1093,14 @@ export function connect() {
           // jitter 比纯 backoff 的 1000ms 短 —— server 已主动节流,无需大抖动
           serverHintedDelay = clamped + Math.random() * 500
         }
-        // 仅 4503 + reason==="provisioning" 显示"环境初始化"。4504 / 其它 reason 走 false。
-        if (e.code === 4503 && parsed?.reason === 'provisioning') {
+        if (e.code === 4503 && PROVISIONING_REASONS.includes(parsed?.reason)) {
           isProvisioning = true
         }
       } catch { /* 不是 JSON / 非法格式 → 走 fallback backoff */ }
     }
-    // 任意非 provisioning close(包括 1006/1011 / server 主动断 / 4504 等)都会清掉
-    // 旧 banner;onopen 之外这是另一个收敛点。setProvisioningBanner 内部有短路,
-    // 状态未变就不会动 DOM,不会引发闪烁。
+    // 任意非 allowlist close(包括 1006/1011 / server 主动断 / 4504 / 4503 错误类
+    // reason 等)都会清掉旧 banner;onopen 之外这是另一个收敛点。
+    // setProvisioningBanner 内部有短路,状态未变就不会动 DOM,不会引发闪烁。
     setProvisioningBanner(isProvisioning)
     const delay = serverHintedDelay > 0
       ? serverHintedDelay
