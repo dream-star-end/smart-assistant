@@ -53,6 +53,7 @@ import {
 } from "./v3readiness.js";
 import { schedule as schedulePlacement, type SchedulePlacement } from "../compute-pool/nodeScheduler.js";
 import { NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/types.js";
+import { getHostById } from "../compute-pool/queries.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
@@ -258,13 +259,30 @@ export function makeV3EnsureRunning(
       }
       // Codex round 1 FAIL #4 fix:ImageNotFound 是部署级故障 — 5s 重试只会风暴
       if (err instanceof SupervisorError && err.code === "ImageNotFound") {
+        // 2026-04-26 enrich:加 host_id/host_name/image,dedup 升级到
+        //   image_missing:<host>:<image>:<hour-bucket> —— 原 hour-only dedup 太粗,
+        //   同小时内 host A + host B 都缺镜像只会发 1 条,丢第 2 host 信号。
+        //
+        // host_name 查 DB 是 best-effort:catch 路径不是热路径,1 次额外查可接受;
+        // 失败也不能改变控制流(否则把 ImageNotFound 变成别的异常)。
+        const hostId = placement?.hostId ?? "unknown-host";
+        let hostName: string = hostId;
+        if (placement?.hostId) {
+          try {
+            const row = await getHostById(placement.hostId);
+            if (row?.name) hostName = row.name;
+          } catch {
+            // 静默吞;hostName 退回 hostId 已经能表达
+          }
+        }
+        const imageRef = deps.image;
         safeEnqueueAlert({
           event_type: EVENTS.CONTAINER_PROVISION_FAILED,
           severity: "critical",
-          title: "容器 provision 失败 — 镜像缺失",
-          body: `uid=${uid} provision 失败:docker image tag 不存在。部署级故障,需人工 \`docker pull\` 或重跑 build-image。`,
-          payload: { uid, reason: "image_missing" },
-          dedupe_key: `container.provision_failed:image_missing:${new Date().toISOString().slice(0, 13)}`,
+          title: `容器 provision 失败 — 镜像缺失 [${hostName}]`,
+          body: `uid=${uid} 在 host=${hostName}(${hostId})上 provision 失败:image=\`${imageRef}\` 不存在。部署级故障,需人工 \`docker pull\` 或重跑 build-image / streamImageToHost。`,
+          payload: { uid, reason: "image_missing", host_id: hostId, host_name: hostName, image: imageRef },
+          dedupe_key: `container.provision_failed:image_missing:${hostId}:${imageRef}:${new Date().toISOString().slice(0, 13)}`,
         });
         throw new ContainerUnreadyError(RETRY_AFTER_IMAGE_MISSING_SEC, "image_missing");
       }

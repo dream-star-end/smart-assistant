@@ -69,6 +69,8 @@ export const EVENTS = {
   // ── 系统(2)────────────────────────────────────────────────
   SYSTEM_MAINTENANCE_MODE_CHANGED: "system.maintenance_mode_changed",
   SYSTEM_PRICING_CHANGED: "system.pricing_changed",
+  // ── 健康(新增 1)──────────────────────────────────────────
+  COMPUTE_HOST_DISK_HIGH: "health.compute_host_disk_high",
 } as const;
 
 export const EVENT_META: EventMeta[] = [
@@ -125,6 +127,8 @@ export const EVENT_META: EventMeta[] = [
     description: "维护模式切换", trigger: "passive" },
   { event_type: EVENTS.SYSTEM_PRICING_CHANGED, severity: "warning", group: "system",
     description: "模型定价 / 套餐被修改", trigger: "passive" },
+  { event_type: EVENTS.COMPUTE_HOST_DISK_HIGH, severity: "warning", group: "health",
+    description: "远端 compute_host 磁盘使用率超阈值(默认 warn>=85% / critical>=95%,5min 轮询)", trigger: "polled" },
 ];
 
 export const ALL_EVENT_TYPES: string[] = EVENT_META.map((e) => e.event_type);

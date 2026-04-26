@@ -26,6 +26,10 @@ import {
   startIlinkAlertWorker,
   type IlinkWorkerHandle,
 } from "./ilinkAlertWorker.js";
+import {
+  startComputeHostDiskMonitor,
+  type DiskMonitorHandle,
+} from "../compute-pool/computeHostsDiskMonitor.js";
 
 // ─── 遗留类型(保留供旧测试 + snapshotForAlerts 消费)────────────────────
 
@@ -56,6 +60,10 @@ export interface AlertSchedulerOptions {
   disableIlinkWorker?: boolean;
   /** dispatcher 间隔(iLink worker),默认 5000ms。 */
   ilinkDispatchIntervalMs?: number;
+  /**
+   * 测试:关闭 compute_host 磁盘监控(不起 5min interval + SSH)。生产必须 false。
+   */
+  disableDiskMonitor?: boolean;
   /** 错误回调 */
   onError?: (scope: string, err: unknown) => void;
   /** 兼容旧测试:允许注入 collectDeps / rules / sender(当前忽略,MVP 不回落)。 */
@@ -203,6 +211,12 @@ export function startAlertScheduler(opts: AlertSchedulerOptions = {}): AlertSche
     });
   }
 
+  // compute_host 磁盘监控(5min 独立 interval,生产必开;测试可关)
+  let diskMonitor: DiskMonitorHandle | null = null;
+  if (!opts.disableDiskMonitor) {
+    diskMonitor = startComputeHostDiskMonitor({});
+  }
+
   return {
     async stop() {
       stopped = true;
@@ -212,6 +226,9 @@ export function startAlertScheduler(opts: AlertSchedulerOptions = {}): AlertSche
       }
       if (ilinkWorker) {
         try { await ilinkWorker.stop(); } catch { /* */ }
+      }
+      if (diskMonitor) {
+        try { await diskMonitor.stop(); } catch { /* */ }
       }
     },
     async tickNow() {
