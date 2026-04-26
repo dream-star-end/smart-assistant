@@ -2,7 +2,7 @@
 import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=2268f9b'
+import { clearSessionCookie } from './auth.js?v=1b6ce60'
 import { dbPut } from './db.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
@@ -11,7 +11,7 @@ import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance, _openTopupModal } from './billing.js?v=2268f9b'
+import { refreshBalance, _openTopupModal } from './billing.js?v=1b6ce60'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
