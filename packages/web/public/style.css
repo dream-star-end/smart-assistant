@@ -6048,3 +6048,56 @@ body.body-landing {
     transform: rotate(360deg);
   }
 }
+
+/* ─────────────────────────────────────────────
+   Provisioning banner — shows above composer when ws closed 4503
+   reason="provisioning". Single-line preferred; allow wrap on narrow
+   viewport but cap padding so it never eats a meaningful slice of the
+   message area. Hidden by default via [hidden] attribute (no JS toggle
+   needed for visibility — just remove/add `hidden`).
+   ───────────────────────────────────────────── */
+.provisioning-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 16px 8px;
+  padding: 8px 14px;
+  min-height: 36px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
+  font-size: 13px;
+  line-height: 1.4;
+  /* 让 banner 出现/消失更平滑,但不要喧宾夺主 */
+  animation: provisioning-banner-in 180ms ease-out;
+}
+.provisioning-banner[hidden] {
+  display: none;
+}
+.provisioning-banner-spinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-border);
+  border-top-color: var(--accent);
+  animation: sync-orbit 0.9s linear infinite;
+}
+.provisioning-banner-text {
+  flex: 1 1 auto;
+}
+@keyframes provisioning-banner-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+/* 移动端边距小一点,避免占用太多输入框上方空间;高度仍维持 36px 不要进一步压扁 */
+@media (max-width: 640px) {
+  .provisioning-banner {
+    margin: 0 12px 6px;
+    padding: 6px 12px;
+    min-height: 36px;
+    font-size: 12.5px;
+  }
+}
+

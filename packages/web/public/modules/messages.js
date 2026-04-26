@@ -116,7 +116,9 @@ const _STATUS_SVG = {
 }
 const _STATUS_LABEL = {
   sending: '发送中',
-  queued: '排队中',
+  // 2026-04-27:"排队中"→"待发送"。"排队"暗示后端拥堵,实际只是离线缓冲。
+  // websocket.js 同名表也同步改了,两处必须保持一致。
+  queued: '待发送',
   sent: '已发送',
   read: '已读',
   replied: '已回复',
