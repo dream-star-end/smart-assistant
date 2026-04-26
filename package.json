@@ -27,6 +27,7 @@
     "test:gateway": "npx tsx --test packages/gateway/src/__tests__/*.test.ts",
     "test:web": "npx tsx --test packages/web/__tests__/*.test.ts",
     "lint:agent-containers-sql": "tsx packages/commercial/scripts/lint-agent-containers-sql.ts",
+    "lint:scheduler-wiring": "tsx scripts/check-schedulers.ts",
     "test:commercial:unit": "npx tsx --test $(find packages/commercial/src -type f -name '*.test.ts' ! -name '*.integ.test.ts')",
     "test:commercial:integ": "npx tsx --test --test-concurrency=1 $(find packages/commercial/src -type f -name '*.integ.test.ts')",
     "test:commercial": "npm run test:commercial:unit && npm run test:commercial:integ",
@@ -34,7 +35,7 @@
     "test": "npm run test:gateway && npm run test:web && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
     "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/storage/tsconfig.json && tsc --noEmit -p packages/gateway/tsconfig.json && tsc --noEmit -p packages/mcp-memory/tsconfig.json && tsc --noEmit -p packages/cli/tsconfig.json && tsc --noEmit -p packages/commercial/tsconfig.json",
-    "check": "npm run lint && npm run lint:agent-containers-sql && npm run typecheck && npm run test"
+    "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run typecheck && npm run test"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
