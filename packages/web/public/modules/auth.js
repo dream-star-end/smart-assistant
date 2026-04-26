@@ -26,9 +26,13 @@
 //                                persistent 属性跟着 remember 走(handlers.ts)。
 //   - 以上由 main.js 经 onLoginSuccess 回调统一处理,本模块只 dispatch result。
 
-// NB: bare `./api.js` 必须与其他模块保持一致 —— ESM 按 URL 唯一性分 instance,
-// 加 ?v= 会与 main.js 等共享的 api.js 分叉两个实例,_refreshInflight 这类 module
-// singleton 全废。CF 边缘缓存对 api.js 改动靠 sw.js VERSION bump 触发 SW 新一轮
+// NB:这两行 import 必须与其他模块对 ./api.js / ./state.js 的引用共享同一 URL。
+// ESM 按 URL 唯一性分 instance —— 一旦「裸 import」和「带 ?v= 的 import」并存,
+// 浏览器会建出两个 module instance,_refreshInflight 这类 module-level singleton
+// 全废。v1.0.15 起的机制是「所有模块统一带 ?v=<token>」由 scripts/bump-version.ts
+// 同步替换 + --check 防退化;手工把这两行改回 bare 会重新破坏 URL 一致性。
+//
+// CF 边缘缓存对 api.js/state.js 自身的改动仍靠 sw.js VERSION bump 触发 SW 新一轮
 // 预缓存 + 运行时 `cache: 'no-store'` 接管。
 import { apiFetch } from './api.js?v=55ce6b5'
 import { state } from './state.js?v=55ce6b5'
