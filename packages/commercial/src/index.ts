@@ -95,6 +95,7 @@ import {
 } from "./compute-pool/nodeAgentClient.js";
 import { createContainerService } from "./compute-pool/containerService.js";
 import { distributePreheatToAllHosts } from "./compute-pool/imageDistribute.js";
+import { getHealthPoller, type HealthPoller } from "./compute-pool/nodeHealth.js";
 import {
   getBaselineServer,
   type BaselineServer,
@@ -1016,6 +1017,19 @@ export async function registerCommercial(
     orphanReconcileLog.info("scheduler started", { tickSec: 3600, runOnStart: true });
   }
 
+  // fix:HealthPoller(compute-pool/nodeHealth.ts)在 5029a69 引入但从未在 service
+  // boot 接 .start() — last_health_at 一直 NULL,自动 quarantine/recovery 状态机失效,
+  // mTLS cert 临近过期的自动 renewal 也跟着失效。OC_HEALTH_POLLER_DISABLED=1 给单
+  // host / dev 场景保留 disable。
+  let healthPoller: HealthPoller | undefined;
+  if (v3Deps && process.env.OC_HEALTH_POLLER_DISABLED !== "1") {
+    healthPoller = getHealthPoller();
+    healthPoller.start();
+    rootLogger.child({ subsys: "node-health" }).info("scheduler started", {
+      intervalMs: 30_000,
+    });
+  }
+
   // T-63 Phase 2:订阅 docker container events → `container.oom_exited` 告警。
   // cfg.OC_CONTAINER_EVENTS_DISABLED=1 可关闭(运维灾备 / docker daemon 异常时用)。
   let containerEventsWorker: V3ContainerEventsWorker | undefined;
@@ -1118,6 +1132,9 @@ export async function registerCommercial(
       }
       if (orphanReconcileScheduler) {
         try { await orphanReconcileScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (healthPoller) {
+        try { healthPoller.stop(); } catch { /* ignore */ }
       }
       if (containerEventsWorker) {
         try { await containerEventsWorker.stop(); } catch { /* ignore */ }
