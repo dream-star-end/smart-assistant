@@ -54,6 +54,8 @@ export interface ComputeHostView {
   last_health_at: string | null;
   last_health_ok: boolean | null;
   last_health_err: string | null;
+  consecutive_health_ok: number;
+  consecutive_health_fail: number;
   last_bootstrap_at: string | null;
   last_bootstrap_err: string | null;
   created_at: string;
@@ -76,6 +78,8 @@ function mapRowToView(row: ComputeHostRow, activeContainers: number): ComputeHos
     last_health_at: row.last_health_at ? row.last_health_at.toISOString() : null,
     last_health_ok: row.last_health_ok ?? null,
     last_health_err: row.last_health_err ?? null,
+    consecutive_health_ok: row.consecutive_health_ok ?? 0,
+    consecutive_health_fail: row.consecutive_health_fail ?? 0,
     last_bootstrap_at: row.last_bootstrap_at ? row.last_bootstrap_at.toISOString() : null,
     last_bootstrap_err: row.last_bootstrap_err ?? null,
     created_at: row.created_at.toISOString(),

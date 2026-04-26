@@ -4991,6 +4991,12 @@ function _renderHostRow(h) {
     : h.last_health_ok === false
       ? `<span class="chip chip-danger" title="${escapeHtml(h.last_health_err || '')}">FAIL</span>`
       : '<span style="color:var(--muted)">—</span>'
+  // 连续 OK/FAIL 计数(3 次切换 quarantined ↔ ready)。新机两个都 0,不渲染避免噪声。
+  const okN = (h.consecutive_health_ok | 0)
+  const failN = (h.consecutive_health_fail | 0)
+  const healthCounter = (okN > 0 || failN > 0)
+    ? ` <small style="color:var(--muted)" title="连续 OK / 连续 FAIL(各 3 次切换状态)">${okN}/${failN}</small>`
+    : ''
   const bootstrapChip = h.last_bootstrap_err
     ? `<span class="chip chip-danger" title="${escapeHtml(h.last_bootstrap_err)}">ERR</span>`
     : h.last_bootstrap_at
@@ -5019,7 +5025,7 @@ function _renderHostRow(h) {
       <td>${_hostStatusBadge(h.status)}</td>
       <td>${activeCell}</td>
       <td>${_certChipForHost(h)}</td>
-      <td>${healthChip}</td>
+      <td>${healthChip}${healthCounter}</td>
       <td>${bootstrapChip}</td>
       <td class="actions">${btns.join(' ')}</td>
     </tr>
