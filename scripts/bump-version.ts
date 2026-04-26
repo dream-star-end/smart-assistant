@@ -27,16 +27,27 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..");
 const PUBLIC_DIR = join(REPO_ROOT, "packages", "web", "public");
 
-// Files to rewrite. Keep this list tight — only files that actually contain
-// cache-bust tokens. Adding a file here without a matching token is a no-op.
-const TARGETS = [
-  "sw.js",
-  "index.html",
-  "admin.html",
-  "modules/main.js",
-  "modules/websocket.js",
-  "modules/commands.js",
-];
+// Files to rewrite.
+//
+// Static targets: top-level entry files that contain cache-bust tokens
+// (sw.js VERSION + index.html / admin.html ?v= query strings).
+//
+// Dynamic targets: every modules/*.js — because (since v1.0.15) all inter-module
+// imports use `?v=auto` placeholders that bump-version rewrites to the current
+// commit hash on every deploy. Hardcoding a subset here was the v1.0.13/14
+// drift bug: a new module file (or a new import in an old module) would ship
+// to prod with stale ?v= tokens and users would 4h-cache the old code.
+const STATIC_TARGETS = ["sw.js", "index.html", "admin.html"];
+
+function listModuleTargets(): string[] {
+  const modulesDir = join(PUBLIC_DIR, "modules");
+  return readdirSync(modulesDir)
+    .filter((f) => f.endsWith(".js"))
+    .sort()
+    .map((f) => `modules/${f}`);
+}
+
+const TARGETS = [...STATIC_TARGETS, ...listModuleTargets()];
 
 function gitShortHead(): string {
   const r = spawnSync("git", ["rev-parse", "--short", "HEAD"], {
@@ -108,6 +119,56 @@ const SCAN_SKIP_DIRS = new Set(["vendor"]);
 // and ESM `from './foo.js?v=xxx'`. It does NOT match naked comments.
 const CACHE_BUST_QUOTED_REF_RE = /['"][^'"\s]+\.[A-Za-z0-9]+\?v=[A-Za-z0-9_-]+/;
 const VERSION_CONST_RE = /VERSION\s*=\s*['"]openclaude-[\w-]+['"]/;
+
+// Naked inter-module import detector for packages/web/public/modules/*.js.
+// Catches three ESM specifier shapes that all suffer the same 4h disk-cache
+// problem when written without a `?v=` cache-bust suffix:
+//
+//   1. `import { x } from './X.js'`   (named static import)
+//   2. `import './X.js'`              (side-effect static import)
+//   3. `import('./X.js')`             (dynamic import)
+//
+// Without a query suffix, browsers see a stable URL and aggressively disk-cache
+// the response (modules served with `cache-control: max-age=14400`). Deploy
+// bumps every declared file but those tokens never reach users until cache
+// expires — exactly the v1.0.13/14 banner ship-but-don't-ship bug.
+//
+// Returns `<file>:<line>: <import-line>` strings, suitable for direct printing.
+//
+// NOTE: this regex *will* false-positive on example specifiers in code
+// comments. That's accepted — the cost (a comment carrying `?v=auto`) is
+// trivial; missing a real naked import in production code is not.
+const NAKED_MODULE_IMPORT_RES = [
+  // static `from './X.js'` (no ?v=)
+  /from\s+['"]\.\/[A-Za-z_][A-Za-z0-9_-]*\.js['"]/,
+  // static side-effect `import './X.js'` (no `from`, no ?v=)
+  /(?:^|[^.\w])import\s+['"]\.\/[A-Za-z_][A-Za-z0-9_-]*\.js['"]/,
+  // dynamic `import('./X.js')` (no ?v=)
+  /import\(\s*['"]\.\/[A-Za-z_][A-Za-z0-9_-]*\.js['"]\s*\)/,
+];
+
+function scanModulesForNakedImports(): string[] {
+  const hits: string[] = [];
+  const modulesDir = join(PUBLIC_DIR, "modules");
+  for (const name of readdirSync(modulesDir)) {
+    if (!name.endsWith(".js")) continue;
+    const abs = join(modulesDir, name);
+    let body: string;
+    try {
+      body = readFileSync(abs, "utf-8");
+    } catch {
+      continue;
+    }
+    const lines = body.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (NAKED_MODULE_IMPORT_RES.some((re) => re.test(line))) {
+        hits.push(`modules/${name}:${i + 1}: ${line.trim()}`);
+      }
+    }
+  }
+  return hits;
+}
 
 function scanPublicForCacheBustTokens(): string[] {
   const hits: string[] = [];
@@ -201,6 +262,22 @@ function main() {
         "\nEither add these files to TARGETS in scripts/bump-version.ts,",
       );
       console.error("or remove the ?v= / VERSION pattern from them.");
+      failed = true;
+    }
+
+    // Naked inter-module imports (modules/*.js → './X.js' without ?v=…) bypass
+    // the cache-bust mechanism entirely: browsers see a stable URL and 4h-cache
+    // the old code even after a deploy bumps every declared file. v1.0.13/14
+    // banner ship-but-don't-ship bug came from exactly this. Fail CI if any
+    // sneaks back in.
+    const nakedHits = scanModulesForNakedImports();
+    if (nakedHits.length > 0) {
+      console.error("\nFAIL: naked inter-module imports (no ?v= cache-bust):");
+      for (const h of nakedHits) console.error(`  - ${h}`);
+      console.error(
+        "\nAppend `?v=auto` to each — bump-version will rewrite to the current",
+      );
+      console.error("commit hash on every deploy. See v1.0.15 release notes.");
       failed = true;
     }
 

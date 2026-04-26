@@ -3,7 +3,7 @@
 // This file exports nothing; it IS the application.
 
 // ── DOM utilities ──
-import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
+import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=auto'
 
 // ── Pure utilities ──
 import {
@@ -15,7 +15,7 @@ import {
   sessionGroup,
   shortTime,
   uuid,
-} from './util.js'
+} from './util.js?v=auto'
 
 // ── App state ──
 import {
@@ -27,7 +27,7 @@ import {
   setSending,
   state,
   tryEnqueueOffline,
-} from './state.js'
+} from './state.js?v=auto'
 
 // ── API layer ──
 import {
@@ -42,16 +42,16 @@ import {
   scheduleProactiveRefresh,
   silentRefresh,
   snapshotDiagnostics,
-} from './api.js'
+} from './api.js?v=auto'
 
 // ── IndexedDB ──
-import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
+import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js?v=auto'
 
 // ── Cross-device sync ──
-import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js'
+import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=auto'
 
 // ── Theme ──
-import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
+import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js?v=auto'
 
 // ── Markdown / rich rendering ──
 import {
@@ -61,7 +61,7 @@ import {
   localPathToUrl,
   processRichBlocks,
   renderMarkdown,
-} from './markdown.js'
+} from './markdown.js?v=auto'
 
 // ── UI helpers ──
 import {
@@ -71,7 +71,7 @@ import {
   openModal,
   toast,
   toastOptsFromError,
-} from './ui.js'
+} from './ui.js?v=auto'
 
 // ── Attachments ──
 import {
@@ -81,10 +81,10 @@ import {
   fileToText,
   removeAttachment,
   renderAttachments,
-} from './attachments.js'
+} from './attachments.js?v=auto'
 
 // ── Speech recognition ──
-import { initSpeech, setAutoResize, toggleVoice } from './speech.js'
+import { initSpeech, setAutoResize, toggleVoice } from './speech.js?v=auto'
 
 // ── Notifications ──
 import {
@@ -92,7 +92,7 @@ import {
   refreshDocumentTitle,
   requestNotifyPermission,
   setTitleBusy,
-} from './notifications.js'
+} from './notifications.js?v=auto'
 
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
@@ -112,14 +112,14 @@ import {
 import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=abe05b5'
 import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=abe05b5'
 // ── OAuth ──
-import { initOAuthListeners, openOAuthModal } from './oauth.js'
+import { initOAuthListeners, openOAuthModal } from './oauth.js?v=auto'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
 import { initUsageStats, openUsageModal } from './usageStats.js?v=abe05b5'
 import { clearUserPrefsCache, initUserPrefs, loadUserPrefs, openPrefsModal, setOnPrefsChanged } from './userPrefs.js?v=abe05b5'
-import { initWechatListeners, openWechatModal } from './wechat.js'
+import { initWechatListeners, openWechatModal } from './wechat.js?v=auto'
 
 // ── Memory & Skills ──
-import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js'
+import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=auto'
 
 // ── Scheduled tasks ──
 import {
@@ -128,7 +128,7 @@ import {
   loadExecLog,
   openTasksModal,
   switchTasksTab,
-} from './tasks.js'
+} from './tasks.js?v=auto'
 
 // ── Agents ──
 import {
@@ -159,7 +159,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js'
+} from './sessions.js?v=auto'
 
 // ── Messages ──
 import {
@@ -174,7 +174,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js'
+} from './messages.js?v=auto'
 
 // ── WebSocket ──
 import {
@@ -204,7 +204,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js'
+} from './websocket.js?v=auto'
 
 // ── Slash commands ──
 import {
@@ -217,13 +217,13 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js'
+} from './commands.js?v=auto'
 import {
   clearEffortOnLogout,
   getEffortForSubmit,
   initModePills,
   renderModePills,
-} from './effortMode.js'
+} from './effortMode.js?v=auto'
 import { initModelPicker, renderModelPill } from './modelPicker.js?v=abe05b5'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.

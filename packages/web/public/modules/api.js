@@ -11,7 +11,7 @@
 //     out (login/logout probes) opt out with opts.suppressAuthRedirect=true.
 //   • Errors thrown carry e.status (HTTP status code) so callers can branch
 //     on it without parsing the message.
-import { _writeStoredAccessToken, state } from './state.js'
+import { _writeStoredAccessToken, state } from './state.js?v=auto'
 
 const DEFAULT_TIMEOUT_MS = 30000
 

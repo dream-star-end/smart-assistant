@@ -320,15 +320,24 @@ if [[ $DRY_RUN -eq 0 && "$PENDING_COUNT" == "1" ]]; then
 fi
 
 # ── 5. Stage + commit version bump + changelog ──
+# Must mirror scripts/bump-version.ts TARGETS exactly: any file that script
+# rewrites must also be staged here, otherwise the deploy commit is missing the
+# ?v= bumps and rsync ships old tokens to prod (the v1.0.13/14 messages.js drift
+# bug). Static entry files + every modules/*.js + changelog.
 VERSION_FILES=(
   packages/web/public/sw.js
   packages/web/public/index.html
   packages/web/public/admin.html
-  packages/web/public/modules/main.js
-  packages/web/public/modules/websocket.js
-  packages/web/public/modules/commands.js
   changelog.json
 )
+# nullglob guard: if modules/ is empty (shouldn't happen in prod, but possible
+# in a stale dry-run / fresh checkout / CI cache), bash would otherwise leave
+# the literal "*.js" path in VERSION_FILES and `git add` would error out.
+shopt -s nullglob
+for f in "$REPO_ROOT"/packages/web/public/modules/*.js; do
+  VERSION_FILES+=("packages/web/public/modules/${f##*/}")
+done
+shopt -u nullglob
 
 if [[ $DRY_RUN -eq 0 && $NO_COMMIT -eq 0 ]]; then
   # Stage only the deploy-owned files — avoid grabbing unrelated WIP from the tree.
