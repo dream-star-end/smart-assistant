@@ -714,6 +714,15 @@ export function wrapDockerError(err: unknown): SupervisorError {
     // SupervisorError.cause 只接 {statusCode, message} 两字段(types.ts:124),
     // node-agent 的 hostId/agentErrCode 已经编码在 message 里(nodeAgentClient.ts:348
     // 拼成 "agent returned 500: {code:RUN_FAIL,error:...}"),不再额外塞。
+    // v1.0.8:VOL_CREATE_FAIL 几乎都是 host 级 docker daemon 问题(磁盘满 /
+    // overlay2 锁 / 权限),归 TransientHostFault 让 v3ensureRunning 标该 host
+    // 60s cooldown,用户下次 5s 重连自动换台。即使是真·应用 bug(volume 名非法等),
+    // 行为退化为"轮一遍所有 host 最后报 host_full",可接受不有害。
+    if (err.agentErrCode === "VOL_CREATE_FAIL") {
+      return new SupervisorError("TransientHostFault", message, {
+        statusCode: err.httpStatus, message,
+      });
+    }
     if (
       err.agentErrCode === "RUN_FAIL" &&
       NODE_AGENT_IMAGE_MISSING_PATTERNS.some((re) => re.test(message))

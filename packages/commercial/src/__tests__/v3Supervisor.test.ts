@@ -1383,6 +1383,20 @@ describe("wrapDockerError — node-agent AgentAppError 路径", () => {
     assert.equal(wrapDockerError(err).code, "TransientHostFault");
   });
 
+  // v1.0.8 — node-agent VOL_CREATE_FAIL 几乎都是 host 级 docker daemon 问题,
+  // 归 TransientHostFault 让 v3ensureRunning 标该 host 60s cooldown 自动换台。
+  test("VOL_CREATE_FAIL → TransientHostFault(不依赖文案,任何 VOL_CREATE_FAIL 都归)", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError(
+      "h",
+      500,
+      "VOL_CREATE_FAIL",
+      "agent returned 500: {code:VOL_CREATE_FAIL,error:create volume oc-v3-data-u28: ...}",
+    );
+    assert.equal(wrapDockerError(err).code, "TransientHostFault");
+  });
+
   test("ImageNotFound 文案优先于 TransientHostFault(同时命中时按 image 缺失走 5min 长重试)", async () => {
     // 防御:如果有人写了带 "Address already in use" 又含 "Unable to find image" 的怪异文案,
     // 应该优先按 image 缺失分类(它是部署级故障,5min retry 比 60s cooldown 更合适)

@@ -396,9 +396,12 @@ export function makeV3EnsureRunning(
       // v1.0.7:TransientHostFault(远端 docker run "Address already in use" 类) →
       // 把 host 标 cooldown,下次 5s 重连 nodeScheduler 自然换台。
       // 单进程内存即可,不持久化(重启自然清,失败 host 会被自然探测重新进 cooldown)。
+      // v1.0.8:扩到 RemoteContractViolation(node-agent 协议违约 — 同 host
+      // 60s 内必然继续撞)。VOL_CREATE_FAIL 由 wrapDockerError 已归为
+      // TransientHostFault,无需在此重复列出。
       if (
         err instanceof SupervisorError &&
-        err.code === "TransientHostFault" &&
+        (err.code === "TransientHostFault" || err.code === "RemoteContractViolation") &&
         placement?.hostId
       ) {
         markHostCooldown(placement.hostId, TRANSIENT_HOST_FAULT_COOLDOWN_MS);
