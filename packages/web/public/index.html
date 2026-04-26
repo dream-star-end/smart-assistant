@@ -14,7 +14,7 @@
 <!--
   Boot-watchdog: if main.js fails to set window.__ocBooted within BOOT_TIMEOUT_MS,
   assume a broken module graph (typically CF edge cache mismatch after a deploy
-  where main.js?v=5241d45 imports an un-versioned state.js that CF still serves old) —
+  where main.js?v=2268f9b imports an un-versioned state.js that CF still serves old) —
   unregister SW + clear caches + reload once. sessionStorage lock prevents loops
   on a genuine bug where reload won't help. See deploy-v3.sh cf_purge() for the
   root-cause fix; this is a client-side backstop.
@@ -39,7 +39,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=5241d45" />
+<link rel="stylesheet" href="/style.css?v=2268f9b" />
 <!-- main.js version bumped 2026-04-21: 积分化 + /login routing -->
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -1247,6 +1247,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=5241d45"></script>
+<script type="module" src="/modules/main.js?v=2268f9b"></script>
 </body>
 </html>
