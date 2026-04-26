@@ -239,6 +239,9 @@ describe("createContainer", () => {
     assert.ok(env.includes(`HTTP_PROXY=${DEFAULT_PROXY_URL}`));
     assert.ok(env.includes(`HTTPS_PROXY=${DEFAULT_PROXY_URL}`));
     assert.ok(env.some((e) => e.startsWith("NO_PROXY=")));
+    // 商用版容器必须默认跳过 personal-version 自反思 cron(否则用户没说话也每天扣 ~¥2-3)。
+    // 处理逻辑见 packages/gateway/src/cron.ts::ensureCronFile。
+    assert.ok(env.includes("OC_SEED_DEFAULT_CRON=0"));
 
     const hc = opts.HostConfig!;
     // 资源限额

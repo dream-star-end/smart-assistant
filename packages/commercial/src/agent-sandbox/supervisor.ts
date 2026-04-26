@@ -353,6 +353,10 @@ export async function createContainer(
   env.push(`https_proxy=${opts.proxyUrl}`);
   // 不走代理的目标:localhost(容器内)
   env.push("NO_PROXY=localhost,127.0.0.1");
+  // 商用版容器:跳过 personal-version 默认 cron jobs(daily-reflection /
+  // weekly-curation / skill-check / heartbeat)的首次 seed,避免没人交互时也
+  // 自动烧 credits。处理逻辑见 packages/gateway/src/cron.ts::ensureCronFile。
+  env.push("OC_SEED_DEFAULT_CRON=0");
 
   try {
     // 网络 / volume 预创建放到 try 里,socket 级错误(ENOENT/ECONNREFUSED)

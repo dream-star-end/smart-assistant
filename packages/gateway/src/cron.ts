@@ -126,8 +126,14 @@ export async function ensureCronFile(): Promise<CronFile> {
   const path = paths.cronYaml
   if (!existsSync(path)) {
     await mkdir(dirname(path), { recursive: true })
-    await atomicWriteYaml(path, { jobs: DEFAULT_JOBS })
-    return { jobs: DEFAULT_JOBS }
+    // Controls only the first-time bootstrap when cron.yaml is missing.
+    // Existing cron.yaml files and user-created jobs are left untouched.
+    // Set OC_SEED_DEFAULT_CRON=0 in v3 commercial containers to skip seeding
+    // the personal-version self-reflection jobs (they would burn user credits).
+    const seedDefaults = process.env.OC_SEED_DEFAULT_CRON !== '0'
+    const initialJobs = seedDefaults ? DEFAULT_JOBS : []
+    await atomicWriteYaml(path, { jobs: initialJobs })
+    return { jobs: initialJobs }
   }
   try {
     const raw = await readFile(path, 'utf-8')

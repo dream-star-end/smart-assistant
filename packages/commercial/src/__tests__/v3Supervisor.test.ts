@@ -395,6 +395,13 @@ describe("provisionV3Container", () => {
       env.includes(`OPENCLAUDE_BASELINE_SKILLS_DIR=${V3_CONFIG_TMPFS_PATH}/skills`),
       "supervisor must inject OPENCLAUDE_BASELINE_SKILLS_DIR so SkillStore can overlay platform baseline",
     );
+    // 商用版容器必须默认跳过 personal-version 自反思 cron(否则用户没说话也每天扣 ~¥2-3)。
+    // 处理逻辑见 packages/gateway/src/cron.ts::ensureCronFile。本地路径覆盖在这里;
+    // remote 路径会把同一 env 数组转换成 ContainerSpec.env 透传给 node-agent。
+    assert.ok(
+      env.includes("OC_SEED_DEFAULT_CRON=0"),
+      "supervisor must inject OC_SEED_DEFAULT_CRON=0 to skip personal-version default cron seeding",
+    );
 
     // 网络 + IP forced via IPAMConfig
     assert.equal(opts.HostConfig?.NetworkMode, V3_NETWORK_NAME);

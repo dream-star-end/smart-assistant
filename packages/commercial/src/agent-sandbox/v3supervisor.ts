@@ -1090,6 +1090,12 @@ export async function provisionV3Container(
       // baseline mount 本身若缺失/OPTIONAL=1,SkillStore 构造期会抛 → mcp-memory
       // catch 后 warn+fallback user-only,不影响容器启动。
       `OPENCLAUDE_BASELINE_SKILLS_DIR=${V3_CONFIG_TMPFS_PATH}/skills`,
+      // 商用版容器:跳过 personal-version 默认 cron jobs(daily-reflection /
+      // weekly-curation / skill-check / heartbeat)的首次 seed。这些 job 每天会触发
+      // ~11 次自动 agent 调用,过 anthropicProxy 扣 users.credits。商用用户没主动
+      // 用 agent 也照扣,与产品语义不符。env 只影响 cron.yaml 不存在时的 bootstrap,
+      // 已存在的用户自建 cron 不动。处理逻辑见 packages/gateway/src/cron.ts::ensureCronFile。
+      "OC_SEED_DEFAULT_CRON=0",
     ];
 
     // v3 file proxy:bridgeSecret 就位 → 注入 OC_CONTAINER_ID + OC_BRIDGE_NONCE。
