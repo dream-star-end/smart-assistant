@@ -103,19 +103,19 @@ import {
   mintSessionCookie,
   setMode as setAuthMode,
   onLoginSuccess as setAuthSuccessHandler,
-} from './auth.js?v=e45d534'
-// ?v=e45d534 bust: websocket.js now imports billing.js for refreshBalance() after
+} from './auth.js?v=c2420e6'
+// ?v=c2420e6 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=e45d534'
-import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=e45d534'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=c2420e6'
+import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=c2420e6'
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { initUsageStats, openUsageModal } from './usageStats.js?v=e45d534'
-import { clearUserPrefsCache, initUserPrefs, loadUserPrefs, openPrefsModal, setOnPrefsChanged } from './userPrefs.js?v=e45d534'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=c2420e6'
+import { clearUserPrefsCache, initUserPrefs, loadUserPrefs, openPrefsModal, setOnPrefsChanged } from './userPrefs.js?v=c2420e6'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
 // ── Memory & Skills ──
@@ -137,7 +137,7 @@ import {
   renderAgentDropdown,
   renderAgentsManagementList,
   setRenderModelPill,
-} from './agents.js?v=e45d534' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=c2420e6' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
@@ -196,6 +196,7 @@ import {
   resetThinkingSafety,
   safeWsSend,
   setMeta,
+  setProvisioningBanner,
   setStatus,
   setWsDeps,
   showTypingIndicator,
@@ -223,11 +224,11 @@ import {
   initModePills,
   renderModePills,
 } from './effortMode.js'
-import { initModelPicker, renderModelPill } from './modelPicker.js?v=e45d534'
+import { initModelPicker, renderModelPill } from './modelPicker.js?v=c2420e6'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
-// deploy where main.js?v=e45d534 imports a bare-URL state.js that CF still serves
+// deploy where main.js?v=c2420e6 imports a bare-URL state.js that CF still serves
 // old), this line is never reached → watchdog fires at T+15s and self-heals.
 window.__ocBooted = true
 
@@ -1263,6 +1264,9 @@ async function _forceLogout({ serverLogout, broadcast = Boolean(serverLogout) } 
   state.attachments = []
   renderAttachments()
   hideTypingIndicator()
+  // 2026-04-27:容器初始化 banner 是上一身份的 ws 容器状态信号,logout 后必须清,
+  // 否则跳到 landing 还闪着"环境初始化中…"完全不合语义。
+  setProvisioningBanner(false)
   // 2026-04-25:logout teardown 才清登录密码字段(不在 showLogin 清,以保留浏览器
   // 密码管理器自动填充的值)。手输未保存的密码不应跨 logout 残留在 DOM。
   // email 不清 — 用户登出后再登录通常还是同一邮箱,保留减少摩擦。

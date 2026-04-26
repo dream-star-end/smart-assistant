@@ -2,7 +2,7 @@
 import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=e45d534'
+import { clearSessionCookie } from './auth.js?v=c2420e6'
 import { dbPut } from './db.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
@@ -11,7 +11,7 @@ import { maybeSyncNow } from './sync.js'
 import { toast } from './ui.js'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance, _openTopupModal } from './billing.js?v=e45d534'
+import { refreshBalance, _openTopupModal } from './billing.js?v=c2420e6'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -414,7 +414,9 @@ const _STATUS_SVG = {
 }
 const _STATUS_LABEL = {
   sending: '发送中',
-  queued: '排队中',
+  // 2026-04-27:"排队中"→"待发送" —— "排队"暗示后端拥堵,实际只是离线缓冲会
+  // 自动重发。messages.js 同名表也同步改了,两处必须保持一致。
+  queued: '待发送',
   sent: '已发送',
   read: '已读',
   replied: '已回复',
@@ -559,6 +561,45 @@ function _drainNextOfflineItem() {
 }
 
 // ═══════════════ WEBSOCKET ═══════════════
+
+// 容器初始化期 UX 提示(2026-04-27):
+//   后端在容器未 ready 时会 ws close 4503 + reason="provisioning"。当前轻量提示:
+//   composer 上方 inline banner + 输入框/发送按钮禁用。一旦 ws.onopen 触发或者
+//   进入 offline / logout / auth teardown 等"绝对不在 provisioning"路径,立即清。
+//
+//   不做全屏 splash —— idle 重连/host 迁移等场景一样会撞 4503,只在登录时铺
+//   splash 治标不治本;而且大多数登录是秒连,splash 是不必要打扰。
+//
+//   单一职责:setProvisioningBanner 同时管 DOM 显隐和 _provisioningHint flag,
+//   updateSendEnabled() 只读 flag(避免它处理 DOM 细节)。
+//   原 textarea placeholder 写死,banner 收回时统一恢复(不需要保存原值,
+//   index.html 是源头)。
+let _provisioningHint = false
+const _ORIGINAL_INPUT_PLACEHOLDER = '发消息给 agent…'
+const _PROVISIONING_PLACEHOLDER = '环境初始化中,稍候片刻…'
+export function setProvisioningBanner(visible) {
+  // 短路:状态未变就不动 DOM,避免 reconnect 风暴期间反复刷
+  if (_provisioningHint === !!visible) return
+  _provisioningHint = !!visible
+  const banner = $('provisioning-banner')
+  if (banner) {
+    if (_provisioningHint) banner.removeAttribute('hidden')
+    else banner.setAttribute('hidden', '')
+  }
+  const input = $('input')
+  if (input) {
+    if (_provisioningHint) {
+      input.disabled = true
+      input.placeholder = _PROVISIONING_PLACEHOLDER
+    } else {
+      input.disabled = false
+      input.placeholder = _ORIGINAL_INPUT_PLACEHOLDER
+    }
+  }
+  // updateSendEnabled() 会根据新 flag 调整发送按钮的 disabled / 灰态
+  updateSendEnabled()
+}
+
 export function setStatus(label, klass) {
   state.wsStatus = klass
   const el = $('status')
@@ -570,6 +611,15 @@ export function setStatus(label, klass) {
 export function updateSendEnabled() {
   const btn = $('send')
   const svg = btn.querySelector('svg')
+  // Provisioning 期间硬禁:输入框已 disabled,但发送按钮也明确 disabled+灰态,
+  // 避免视觉上"按钮亮但点不动"造成混淆。优先级最高,放最前。
+  if (_provisioningHint) {
+    btn.disabled = true
+    btn.classList.remove('stopping')
+    if (svg)
+      svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
+    return
+  }
   // Allow sending even when disconnected — messages will be queued offline
   // (matching Enter-key behavior which already queues)
   if (state.wsStatus !== 'connected' && !state.sendingInFlight) {
@@ -675,6 +725,10 @@ export function notifyNetworkOffline() {
   _isBrowserOnline = false
   if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
   if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  // 浏览器实证 offline 优先级高于"环境初始化"信号 —— 此刻底层根本没在 ping
+  // 容器,banner 文案就是误导。等 online 事件回来再走一遍 connect → 4503,
+  // 如果容器仍未 ready 会重新 set。
+  setProvisioningBanner(false)
   setStatus('离线', 'disconnected')
 }
 
@@ -758,6 +812,9 @@ function _tearDownWsAuth() {
   // 在它们 commit 前都应放弃。主 _forceLogout 在 main.js,这里独立 bump 避免
   // 交叉依赖。
   state.authEpoch = (state.authEpoch || 0) + 1
+  // Auth teardown:旧身份的容器初始化提示对新登录态无意义,清掉。后续新登录
+  // 走 connect → 4503 时会重新 set。
+  setProvisioningBanner(false)
   toast('Token 无效或已过期，请重新登录', 'error')
   _deps.showLogin()
 }
@@ -794,6 +851,9 @@ export function connect() {
     _isBrowserOnline = true
     _pendingBrowserOfflineAt = 0
     if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+    // 容器初始化 banner —— onopen 是"WS 实际可用"的唯一可信信号,任何 4503 残留
+    // 都在这里清掉。若后续 server 又以 4503 close,onclose 分支会再 set true。
+    setProvisioningBanner(false)
     setStatus('已连接', 'connected')
     // Restore UI state for the current session if it was mid-turn before disconnect
     const _currentSess = getSession()
@@ -1007,6 +1067,13 @@ export function connect() {
     // 解析失败 / 没有 hint / 其它 close code → 仍走原指数 backoff,完全保持兼容。
     // 1008 在上面已 return,这里不会走到;无需特判。
     let serverHintedDelay = 0
+    // 容器初始化期 banner 目标状态 —— onclose 走完后 set 一次,避免:
+    //   (a) 显示后下一轮 close 是 4504 maintenance 或 4503 其它 reason
+    //       (starting / stopped / host_full / image_missing / supervisor_error)
+    //       时旧 banner 残留;
+    //   (b) 任何 4503 但缺 reason / 解析失败的边界路径误显示。
+    // 默认 false,只在确认 reason==='provisioning' 才 true,统一在 try 外 set。
+    let isProvisioning = false
     if ((e.code === 4503 || e.code === 4504) && typeof e.reason === 'string' && e.reason.length > 0) {
       try {
         const parsed = JSON.parse(e.reason)
@@ -1017,8 +1084,16 @@ export function connect() {
           // jitter 比纯 backoff 的 1000ms 短 —— server 已主动节流,无需大抖动
           serverHintedDelay = clamped + Math.random() * 500
         }
+        // 仅 4503 + reason==="provisioning" 显示"环境初始化"。4504 / 其它 reason 走 false。
+        if (e.code === 4503 && parsed?.reason === 'provisioning') {
+          isProvisioning = true
+        }
       } catch { /* 不是 JSON / 非法格式 → 走 fallback backoff */ }
     }
+    // 任意非 provisioning close(包括 1006/1011 / server 主动断 / 4504 等)都会清掉
+    // 旧 banner;onopen 之外这是另一个收敛点。setProvisioningBanner 内部有短路,
+    // 状态未变就不会动 DOM,不会引发闪烁。
+    setProvisioningBanner(isProvisioning)
     const delay = serverHintedDelay > 0
       ? serverHintedDelay
       : Math.min(2000 * Math.pow(2, _reconnectAttempts), 30000) + Math.random() * 1000

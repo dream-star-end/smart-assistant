@@ -14,7 +14,7 @@
 <!--
   Boot-watchdog: if main.js fails to set window.__ocBooted within BOOT_TIMEOUT_MS,
   assume a broken module graph (typically CF edge cache mismatch after a deploy
-  where main.js?v=e45d534 imports an un-versioned state.js that CF still serves old) —
+  where main.js?v=c2420e6 imports an un-versioned state.js that CF still serves old) —
   unregister SW + clear caches + reload once. sessionStorage lock prevents loops
   on a genuine bug where reload won't help. See deploy-v3.sh cf_purge() for the
   root-cause fix; this is a client-side backstop.
@@ -39,7 +39,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=e45d534" />
+<link rel="stylesheet" href="/style.css?v=c2420e6" />
 <!-- main.js version bumped 2026-04-21: 积分化 + /login routing -->
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -595,6 +595,13 @@
     </header>
 
     <div id="messages" class="messages" aria-live="polite"></div>
+
+    <!-- 容器初始化期 banner:仅在 ws close 4503 reason=provisioning 时显示;
+         ws.onopen / 离线 / logout / auth teardown 任一路径都会清除。文案保持单行。 -->
+    <div id="provisioning-banner" class="provisioning-banner" hidden role="status" aria-live="polite">
+      <span class="provisioning-banner-spinner" aria-hidden="true"></span>
+      <span class="provisioning-banner-text">环境初始化中,首次启动约 5-10 秒…</span>
+    </div>
 
     <footer class="composer">
       <div class="composer-inner">
@@ -1247,6 +1254,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=e45d534"></script>
+<script type="module" src="/modules/main.js?v=c2420e6"></script>
 </body>
 </html>
