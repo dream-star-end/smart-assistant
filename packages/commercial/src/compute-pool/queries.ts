@@ -488,6 +488,14 @@ export async function getUserPinnedHost(userId: number): Promise<string | null> 
 /**
  * 调度用 sticky 查找:某 user 是否已有 active 容器 → 返其 host_uuid。
  * 如果 host 已经 not ready,调用方应拒 sticky 并进 pickHost。
+ *
+ * **保留意图**:语义"必须存在 active 容器"。`sshMux resolvePlacement`
+ * (index.ts:898)依赖此语义把 SSH 命令路由到正在跑的容器所在 host —— 不能
+ * 改成包含 vanished,否则会路由到没有运行容器的 host。
+ *
+ * **注意**:nodeScheduler.pickHost 不再用此函数,改用下面的 findUserDataHost
+ * (覆盖 vanished,把用户的 docker named volume 留在哪台 host 作为强 sticky
+ * 依据)。详见 v1.0.17 changelog 与 findUserDataHost doc。
  */
 export async function findUserStickyHost(userId: number): Promise<{
   hostUuid: string;
@@ -514,5 +522,88 @@ export async function findUserStickyHost(userId: number): Promise<{
     hostUuid: row.host_uuid,
     hostStatus: row.host_status,
     containerId: Number.parseInt(row.container_id, 10),
+  };
+}
+
+/**
+ * v1.0.17 — 调度用"数据 sticky":找该 user 数据(docker named volume
+ * `oc-v3-data-u<uid>` + `oc-v3-proj-u<uid>`)最近一次落在哪台 host。
+ *
+ * 与 findUserStickyHost 的区别:
+ *   - findUserStickyHost: 只查 state='active' —— "正在跑的容器在哪"
+ *   - findUserDataHost:   查 active + vanished —— "用户数据 volume 在哪"
+ *
+ * 为什么需要这个新函数:idle sweep(30 min)把容器 vanished 后 docker volume
+ * 不删(GC 只在 banned 7d / no-login 90d 才动 volume),volume 物理上是
+ * host-local 的,跨 host 没有同步代码。如果 vanished 后用户重连被调度到
+ * 不同 host → ensureVolume 在新 host 上幂等创建**空** volume → 用户工作
+ * 目录 + ~/.openclaude (skills/agents/CLAUDE.md/shell history) 全空。
+ *
+ * 排序:
+ *   1. (state = 'active') DESC —— active 必然是最新写,优先
+ *   2. created_at DESC —— 否则取最近一次 vanished 容器
+ *   3. id DESC —— created_at 撞上 tie-break(同毫秒内的并发)
+ *
+ * `WHERE ac.host_uuid IS NOT NULL` 防御性兜住老的 host_uuid=NULL legacy 行
+ * (M1 monolith 阶段 INSERT 时不带 host_uuid 的极少数遗留)。
+ *
+ * 现网线上 agent_containers ~190 行,顺序扫无性能问题。表过万行后建议补
+ * idx_ac_user_state_created (user_id, state, created_at DESC, id DESC)
+ * WHERE host_uuid IS NOT NULL —— 但本次修复不加索引,KISS。
+ *
+ * 调用方语义(主动 vs 被动状态严格区分):
+ *   - 返 null → user 全新,从未 provision 过(走 least-loaded)
+ *   - 非 null + hostStatus='ready' + host 未满 + 非 cooldown → 命中,return
+ *   - 非 null + hostStatus='ready' + host 满 → 抛 NodePoolBusyError(让客户端
+ *     host_full retry;不 fallback,fallback=空 volume)
+ *   - 非 null + cooldown 中 → 同上抛 NodePoolBusyError(60s 临时避让)
+ *   - 非 null + hostStatus='draining' → 抛 NodePoolBusyError。draining 是 admin
+ *     **主动**状态,数据仍在 host 本地,fall-through 会重现空 volume bug
+ *   - 非 null + hostStatus='quarantined'/'broken' → fall through(被动故障,
+ *     host 真坏,数据救不回来,优先可用性)
+ *   - 非 null + hostStatus='bootstrapping' → fall through(过渡态)
+ *
+ * 注:JOIN compute_hosts 的语义决定 host 行真不存在时本函数返 null(等价于
+ * "user 全新")而不是 hostStatus='missing'。M1 schema migration 0030 将
+ * agent_containers.host_uuid 设为 ON DELETE RESTRICT,所以理论上不会出现
+ * "容器行存在但 host 行被删"的情况;调用方仍按"missing → fall through"防御。
+ */
+export async function findUserDataHost(userId: number): Promise<{
+  hostUuid: string;
+  hostStatus: ComputeHostStatus;
+  containerId: number;
+  containerState: "active" | "vanished";
+} | null> {
+  // SQL state filter 必须 5 行内显式 — 仓库 lint-agent-containers-sql.ts 强校验。
+  // ORDER BY (state='active') DESC 显式 active 优先于 vanished;然后 created_at
+  // DESC + id DESC tie-break。LIMIT 1 因为只要最近一台。
+  const r = await getPool().query<{
+    container_id: string;
+    host_uuid: string;
+    host_status: ComputeHostStatus;
+    state: "active" | "vanished";
+  }>(
+    `SELECT ac.id AS container_id,
+            ac.host_uuid,
+            ch.status AS host_status,
+            ac.state
+       FROM agent_containers ac
+       JOIN compute_hosts ch ON ch.id = ac.host_uuid
+      WHERE ac.user_id = $1
+        AND ac.state IN ('active', 'vanished')
+        AND ac.host_uuid IS NOT NULL
+      ORDER BY (ac.state = 'active') DESC,
+               ac.created_at DESC,
+               ac.id DESC
+      LIMIT 1`,
+    [userId],
+  );
+  if (r.rowCount === 0) return null;
+  const row = r.rows[0]!;
+  return {
+    hostUuid: row.host_uuid,
+    hostStatus: row.host_status,
+    containerId: Number.parseInt(row.container_id, 10),
+    containerState: row.state,
   };
 }

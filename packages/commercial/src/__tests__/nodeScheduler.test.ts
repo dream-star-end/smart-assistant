@@ -4,11 +4,16 @@
  * 覆盖:
  *   pickHost:
  *     - requireHostId: 强制落单机(ready + 未满 → 返;非 ready → 抛)
- *     - sticky: 近期有活容器的 host 命中 → 直接返
- *     - sticky miss(host 非 ready 或满) → 走 least-loaded
+ *     - dataHost(v1.0.17):用户最近一次容器(active 或 vanished)所在 host 命中
+ *     - dataHost ready + 满 → NodePoolBusyError(不 fallback,数据完整性优先)
+ *     - dataHost ready + cooldown → NodePoolBusyError(同上)
+ *     - dataHost status=draining → NodePoolBusyError(admin 主动状态,数据仍在)
+ *     - dataHost status=quarantined/broken → fall through(被动故障,host 真坏)
+ *     - dataHost status=bootstrapping → fall through(过渡态)
+ *     - vanished 命中(idle sweep 后重连场景)
+ *     - 多个 host 都有 vanished → 取最近一次 created_at
  *     - 最少负载选择(多 host 从 activeContainers 最少挑)
- *     - 全部满 → NodePoolBusyError
- *     - 无 ready host → NodePoolUnavailableError
+ *     - 全部满 → NodePoolBusyError / 无 ready host → NodePoolUnavailableError
  *
  *   pickBoundIp:
  *     - 已有容器时,从 [.10, .250] 取最低未占用
@@ -53,6 +58,8 @@ interface FakeContainer {
   host_uuid: string;
   bound_ip: string;
   state: "active" | "vanished";
+  /** v1.0.17 — findUserDataHost ORDER BY created_at DESC tie-break */
+  created_at: Date;
 }
 
 function mkHost(
@@ -101,8 +108,16 @@ class FakePool {
   nextContainerId = 1;
 
   addHost(h: ComputeHostRow): void { this.hosts.push(h); }
-  addContainer(c: Omit<FakeContainer, "id">): void {
-    this.containers.push({ id: this.nextContainerId++, ...c });
+  addContainer(c: Omit<FakeContainer, "id" | "created_at"> & { created_at?: Date }): void {
+    // 默认 created_at = now,按 nextContainerId 单调递增确保 ORDER BY id 稳定
+    this.containers.push({
+      id: this.nextContainerId++,
+      created_at: c.created_at ?? new Date(),
+      user_id: c.user_id,
+      host_uuid: c.host_uuid,
+      bound_ip: c.bound_ip,
+      state: c.state,
+    });
   }
   setUserPinnedHost(userId: number, hostId: string | null): void {
     this.pinnedByUser.set(userId, hostId);
@@ -161,7 +176,40 @@ class FakePool {
       if (v === undefined) return { rows: [], rowCount: 0 };
       return { rows: [{ pinned_host_uuid: v }], rowCount: 1 };
     }
-    // findUserStickyHost
+    // findUserDataHost (v1.0.17): 按 SQL 标识 `state IN ('active', 'vanished')` 区分
+    // —— active 优先,然后 created_at DESC,最后 id DESC tie-break。
+    if (
+      /FROM agent_containers ac\s+JOIN compute_hosts ch/.test(s)
+      && /state IN \('active', 'vanished'\)/.test(s)
+    ) {
+      const userId = params[0] as number;
+      // 过滤 host_uuid !== "" + state ∈ {active, vanished} + user_id 匹配
+      const candidates = this.containers
+        .filter((x) => x.user_id === userId && (x.state === "active" || x.state === "vanished") && x.host_uuid)
+        .filter((x) => this.hosts.some((h) => h.id === x.host_uuid));
+      if (candidates.length === 0) return { rows: [], rowCount: 0 };
+      // ORDER BY (state='active') DESC, created_at DESC, id DESC
+      candidates.sort((a, b) => {
+        const aActive = a.state === "active" ? 1 : 0;
+        const bActive = b.state === "active" ? 1 : 0;
+        if (aActive !== bActive) return bActive - aActive;
+        const dt = b.created_at.getTime() - a.created_at.getTime();
+        if (dt !== 0) return dt;
+        return b.id - a.id;
+      });
+      const c = candidates[0]!;
+      const host = this.hosts.find((h) => h.id === c.host_uuid)!;
+      return {
+        rows: [{
+          container_id: String(c.id),
+          host_uuid: c.host_uuid,
+          host_status: host.status,
+          state: c.state,
+        }],
+        rowCount: 1,
+      };
+    }
+    // findUserStickyHost (legacy: 只查 active —— sshMux resolvePlacement 仍依赖)
     if (/FROM agent_containers ac\s+JOIN compute_hosts ch/.test(s)) {
       const userId = params[0] as number;
       const c = this.containers.find((x) => x.user_id === userId && x.state === "active");
@@ -222,12 +270,105 @@ describe("nodeScheduler.pickHost", () => {
     await assert.rejects(pickHost({ requireHostId: "h3" }), NodePoolBusyError);
   });
 
-  test("sticky: returns user's previous host when ready and not full", async () => {
+  test("dataHost: returns user's previous host when ready and not full (active container)", async () => {
     fp.addHost(mkHost({ id: "hA", name: "self", status: "ready", created_at: new Date(2026, 3, 1) }));
     fp.addHost(mkHost({ id: "hB", name: "tk-01", status: "ready", created_at: new Date(2026, 3, 2) }));
     fp.addContainer({ user_id: 42, host_uuid: "hB", bound_ip: "172.30.2.10", state: "active" });
     const r = await pickHost({ userId: 42 });
     assert.equal(r.row.id, "hB");
+  });
+
+  // v1.0.17 — 关键修复:idle sweep 销毁后 user 重连,vanished 容器仍能命中 sticky,
+  // 让 user 回到原 host 拿原 docker volume(不在新 host 创建空 volume)。
+  test("dataHost: vanished container 命中 sticky(idle sweep 后重连场景)", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "self", status: "ready", created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hB", name: "tk-01", status: "ready", created_at: new Date(2026, 3, 2) }));
+    // user 42 之前在 hB 跑过容器,但 idle sweep 已 vanished
+    fp.addContainer({ user_id: 42, host_uuid: "hB", bound_ip: "172.30.2.10", state: "vanished" });
+    const r = await pickHost({ userId: 42 });
+    assert.equal(r.row.id, "hB");
+  });
+
+  test("dataHost: 多个 host 都有 vanished → 取最近一次 created_at", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "self", status: "ready", created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hB", name: "tk-01", status: "ready", created_at: new Date(2026, 3, 2) }));
+    fp.addHost(mkHost({ id: "hC", name: "boheyun-1", status: "ready", created_at: new Date(2026, 3, 3) }));
+    // user 42 历史:hA → hB → hC, 都 vanished;最近一次在 hC
+    fp.addContainer({ user_id: 42, host_uuid: "hA", bound_ip: "172.30.0.10", state: "vanished", created_at: new Date(2026, 3, 10) });
+    fp.addContainer({ user_id: 42, host_uuid: "hB", bound_ip: "172.30.1.10", state: "vanished", created_at: new Date(2026, 3, 20) });
+    fp.addContainer({ user_id: 42, host_uuid: "hC", bound_ip: "172.30.2.10", state: "vanished", created_at: new Date(2026, 3, 25) });
+    const r = await pickHost({ userId: 42 });
+    assert.equal(r.row.id, "hC");
+  });
+
+  test("dataHost: active 优先于 vanished(即便 vanished 更新)", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "self", status: "ready", created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hB", name: "tk-01", status: "ready", created_at: new Date(2026, 3, 2) }));
+    // 病态情况:vanished 比 active 更新(理论上不会,active 总是最新写;但
+    // ORDER BY 必须显式 active 优先以防 clock skew 或测试时序)
+    fp.addContainer({ user_id: 42, host_uuid: "hA", bound_ip: "172.30.0.10", state: "active", created_at: new Date(2026, 3, 1) });
+    fp.addContainer({ user_id: 42, host_uuid: "hB", bound_ip: "172.30.1.10", state: "vanished", created_at: new Date(2026, 3, 30) });
+    const r = await pickHost({ userId: 42 });
+    assert.equal(r.row.id, "hA"); // active wins
+  });
+
+  // v1.0.17 关键策略:dataHost ready 但满 → throw NodePoolBusyError,**不 fallback**,
+  // 因为 fallback 到 least-loaded 会在新 host 上写空 volume,等同丢数据。
+  test("dataHost ready + 满 → 抛 NodePoolBusyError(不 fallback,数据完整性优先)", async () => {
+    fp.addHost(mkHost({ id: "hData", name: "self", status: "ready", max_containers: 1, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOther", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    // user 42 数据在 hData(vanished),但 hData 已被别的 user 占满
+    fp.addContainer({ user_id: 42, host_uuid: "hData", bound_ip: "172.30.0.10", state: "vanished" });
+    fp.addContainer({ user_id: 99, host_uuid: "hData", bound_ip: "172.30.0.11", state: "active" }); // 占满
+    // 必须抛 busy,而不是 fall-through 到 hOther 写空 volume
+    await assert.rejects(pickHost({ userId: 42 }), NodePoolBusyError);
+  });
+
+  // v1.0.17 关键策略:dataHost 被动故障(quarantined/broken)→ fall through 到
+  // least-loaded(host 真坏,数据救不回来,优先可用性)。draining 是 admin 主动
+  // 状态,**不**走 fall through 而是 throw busy(见上方独立 test)。
+  test("dataHost status=quarantined → fall through 到 least-loaded(数据丢失 trade-off:host 真坏)", async () => {
+    fp.addHost(mkHost({ id: "hData", name: "self", status: "quarantined", created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOther", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.addContainer({ user_id: 42, host_uuid: "hData", bound_ip: "172.30.0.10", state: "vanished" });
+    const r = await pickHost({ userId: 42 });
+    assert.equal(r.row.id, "hOther");
+  });
+
+  // v1.0.17 — draining 是 admin **主动**状态(预备下架),数据 volume 仍在
+  // host 本地,fall-through 会重现空 volume bug。必须抛 busy,让用户 retry 等
+  // admin 完成迁移流程。
+  test("dataHost status=draining → 抛 NodePoolBusyError(admin 主动状态,数据完整性优先)", async () => {
+    fp.addHost(mkHost({ id: "hData", name: "self", status: "draining", created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOther", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.addContainer({ user_id: 42, host_uuid: "hData", bound_ip: "172.30.0.10", state: "vanished" });
+    await assert.rejects(pickHost({ userId: 42 }), NodePoolBusyError);
+  });
+
+  // v1.0.17 — broken(被动故障:bootstrap 失败) → fall through(host 真挂,优先可用)
+  test("dataHost status=broken → fall through 到 least-loaded(被动故障,host 真挂)", async () => {
+    fp.addHost(mkHost({ id: "hData", name: "self", status: "broken", created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOther", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.addContainer({ user_id: 42, host_uuid: "hData", bound_ip: "172.30.0.10", state: "vanished" });
+    const r = await pickHost({ userId: 42 });
+    assert.equal(r.row.id, "hOther");
+  });
+
+  // v1.0.17 — bootstrapping(过渡态)→ fall through(host 还没就绪)
+  test("dataHost status=bootstrapping → fall through 到 least-loaded", async () => {
+    fp.addHost(mkHost({ id: "hData", name: "self", status: "bootstrapping", created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOther", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.addContainer({ user_id: 42, host_uuid: "hData", bound_ip: "172.30.0.10", state: "vanished" });
+    const r = await pickHost({ userId: 42 });
+    assert.equal(r.row.id, "hOther");
+  });
+
+  test("无 dataHost(全新 user)→ least-loaded", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hB", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    // user 42 没有任何容器历史
+    const r = await pickHost({ userId: 42 });
+    assert.equal(r.row.id, "hA"); // 0 active
   });
 
   test("least-loaded: picks host with fewest active containers", async () => {
@@ -277,15 +418,18 @@ describe("nodeScheduler.pickHost — host cooldown (v1.0.7)", () => {
     assert.equal(r.row.id, "hB");
   });
 
-  test("cooldown 让 sticky fall-through 到 least-loaded", async () => {
+  // v1.0.17 — dataHost ready + cooldown 的策略从 "fall-through" 改为
+  // "throw NodePoolBusyError",原因:fall-through 到另一台 host 会
+  // 创建空 docker volume,等同丢用户工作区数据。NodePoolBusyError
+  // 让客户端 5s 后重试,届时 cooldown 自然过期,继续回到原 host。
+  test("dataHost 在 cooldown → 抛 NodePoolBusyError(不 fallback,数据完整性优先)", async () => {
     fp.addHost(mkHost({ id: "hSelf", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
     fp.addHost(mkHost({ id: "hStuck", name: "tk1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
-    // user 42 sticky 在 hStuck
+    // user 42 数据在 hStuck (active)
     fp.addContainer({ user_id: 42, host_uuid: "hStuck", bound_ip: "172.30.2.10", state: "active" });
     markHostCooldown("hStuck", 60_000);
-    const r = await pickHost({ userId: 42 });
-    // sticky 被 cooldown 跳,least-loaded 也排除 hStuck → 落 hSelf
-    assert.equal(r.row.id, "hSelf");
+    // 必须抛 busy(等待 cooldown 过期回到 hStuck),而不是 fall-through 到 hSelf 写空 volume
+    await assert.rejects(pickHost({ userId: 42 }), NodePoolBusyError);
   });
 
   test("requireHostId 显式指定时,绕过 cooldown(admin debug 不受限)", async () => {

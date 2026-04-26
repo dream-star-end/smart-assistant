@@ -158,18 +158,93 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
     }
   }
 
-  // sticky: user 最近的 host(status 必须 ready 且未满)。
-  // host 在 cooldown 时跳过 sticky → fall-through 到 least-loaded
+  // v1.0.17 — data sticky: 用户的 docker named volume(`oc-v3-data-u<uid>` +
+  // `oc-v3-proj-u<uid>`) 物理上是 host-local 的,跨 host 没有同步路径。所以
+  // 必须把用户调度回**最近一次容器所在 host**(active 优先,vanished 其次),
+  // 否则在新 host ensureVolume 幂等创建空 volume → 用户工作目录 + skills 全空。
+  //
+  // 优先级与 fall-through 策略(主动 vs 被动状态严格区分):
+  //   - dataHost ready + 未满 + 非 cooldown → 命中,return(99% 路径)
+  //   - dataHost ready + 满 → throw NodePoolBusyError(让 v3ensureRunning 翻
+  //     ContainerUnreadyError(10s, "host_full"),客户端 host_full retry。
+  //     **不 fallback**:fallback=空 volume,等同丢数据)
+  //   - dataHost ready + cooldown → 同上抛 busy(60s 临时避让,可能马上恢复;
+  //     此时 fallback 就会重现"空 volume"bug)
+  //   - dataHost status=draining → 抛 busy。draining 是 admin **主动**状态
+  //     (预备下架),数据 volume 仍在 host 本地,fall-through 会创建空 volume,
+  //     完全是本次修复要避免的事。等 admin 完成迁移流程后再恢复
+  //   - dataHost status=quarantined/broken 或 host 行 missing → fall through。
+  //     这是**被动**故障状态(健康探针 3 连 fail / bootstrap 失败 / host 行被
+  //     删的极罕见 race),host 真出问题,数据救不回来,优先让用户能登录。
+  //     可用性 vs 数据完整性 trade-off,由运维介入 / R6.8 freeze+rsync 处理
+  //   - dataHost status=bootstrapping(其他过渡态)→ fall through。host 还
+  //     没就绪,fall-through 让用户先用别的 host;ready 后用户再回来时 sticky
+  //     命中
+  //   - dataHost 为 null (user 全新,从未 provision) → fall through 到
+  //     least-loaded(首次落点不影响数据完整性,因为还没有数据)
   if (typeof opts.userId === "number") {
-    const sticky = await queries.findUserStickyHost(opts.userId);
-    if (sticky && !isHostInCooldown(sticky.hostUuid)) {
-      const row = await queries.getHostById(sticky.hostUuid);
-      if (row && row.status === "ready") {
+    const dataHost = await queries.findUserDataHost(opts.userId);
+    if (dataHost) {
+      const row = await queries.getHostById(dataHost.hostUuid);
+      if (!row || row.status === "quarantined" || row.status === "broken") {
+        // 被动故障 / host 行 missing(ON DELETE RESTRICT 下罕见)→ fall through
+        log.warn("data host in passive failure, falling through (user volume may not load)", {
+          userId: opts.userId,
+          hostId: dataHost.hostUuid,
+          status: row?.status ?? "missing",
+          containerState: dataHost.containerState,
+        });
+        // fall through → least-loaded
+      } else if (row.status === "draining") {
+        // draining 不 fallback:admin 主动状态,数据仍在 host 本地。
+        log.info("data host in draining, throwing busy to preserve user data", {
+          userId: opts.userId,
+          hostId: row.id,
+          containerState: dataHost.containerState,
+        });
+        throw new NodePoolBusyError(
+          `data host ${row.id} in draining for uid=${opts.userId}`,
+        );
+      } else if (row.status !== "ready") {
+        // 兜底其他过渡态(bootstrapping)。
+        log.warn("data host not ready, falling through", {
+          userId: opts.userId,
+          hostId: dataHost.hostUuid,
+          status: row.status,
+          containerState: dataHost.containerState,
+        });
+        // fall through → least-loaded
+      } else if (isHostInCooldown(dataHost.hostUuid)) {
+        // cooldown 不 fallback:host 通常 60s 后恢复,fallback 会写空 volume
+        log.info("data host in cooldown, throwing busy to preserve user data", {
+          userId: opts.userId,
+          hostId: row.id,
+          containerState: dataHost.containerState,
+        });
+        throw new NodePoolBusyError(
+          `data host ${row.id} in cooldown for uid=${opts.userId}`,
+        );
+      } else {
         const count = await queries.countActiveContainersOnHost(row.id);
-        if (count < row.max_containers) {
-          log.debug("sticky host hit", { userId: opts.userId, hostId: row.id });
-          return { row, activeContainers: count };
+        if (count >= row.max_containers) {
+          // 满不 fallback:同样会写空 volume。让用户 host_full retry 等出空位
+          log.info("data host at capacity, throwing busy to preserve user data", {
+            userId: opts.userId,
+            hostId: row.id,
+            activeContainers: count,
+            maxContainers: row.max_containers,
+            containerState: dataHost.containerState,
+          });
+          throw new NodePoolBusyError(
+            `data host ${row.id} at capacity for uid=${opts.userId}`,
+          );
         }
+        log.debug("data host hit", {
+          userId: opts.userId,
+          hostId: row.id,
+          containerState: dataHost.containerState,
+        });
+        return { row, activeContainers: count };
       }
     }
   }
