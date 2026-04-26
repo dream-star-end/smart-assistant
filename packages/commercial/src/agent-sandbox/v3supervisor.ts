@@ -683,6 +683,25 @@ const NODE_AGENT_IMAGE_MISSING_PATTERNS: RegExp[] = [
   /no such image/i, // node-agent 若透传 docker daemon "No such image" 文案,与 dockerode 4xx 路径同源覆盖
 ];
 
+/**
+ * v1.0.7 — 远端 docker run 失败、message 命中以下任一文案时,把它归到
+ * `TransientHostFault`,让 v3ensureRunning 把该 host 进 nodeScheduler cooldown。
+ *
+ *  匹配的文案样本(2026-04-26 实战):
+ *    - "Address already in use"        — bridge IP/iptables/NAT 残留冲突
+ *    - "port is already allocated"     — 同 host 端口已被占
+ *    - "Conflict. The container name ... is already in use" — 同名容器残留
+ *
+ *  全部转 lowercase 比对,避免 docker 大小写文案漂移。匹配规则故意宽:
+ *  此 code 只影响"短期避让该 host"的调度决定,误归类的代价只是 60s 内不挑该 host,
+ *  对正确性无影响;漏归类则用户继续走 5s 死循环,代价大。
+ */
+const NODE_AGENT_HOST_FAULT_PATTERNS: RegExp[] = [
+  /address already in use/i,
+  /port is already allocated/i,
+  /conflict.*container.*already in use/i,
+];
+
 /** 把 supervisor 内部错误归到 SupervisorError,便于上层按 code 处理。
  *  export 仅用于单测;生产路径只在本文件内调用。 */
 export function wrapDockerError(err: unknown): SupervisorError {
@@ -700,6 +719,14 @@ export function wrapDockerError(err: unknown): SupervisorError {
       NODE_AGENT_IMAGE_MISSING_PATTERNS.some((re) => re.test(message))
     ) {
       return new SupervisorError("ImageNotFound", message, {
+        statusCode: err.httpStatus, message,
+      });
+    }
+    if (
+      err.agentErrCode === "RUN_FAIL" &&
+      NODE_AGENT_HOST_FAULT_PATTERNS.some((re) => re.test(message))
+    ) {
+      return new SupervisorError("TransientHostFault", message, {
         statusCode: err.httpStatus, message,
       });
     }

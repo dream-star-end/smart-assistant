@@ -1315,6 +1315,58 @@ describe("wrapDockerError — node-agent AgentAppError 路径", () => {
     const err = Object.assign(new Error("connect refused"), { code: "ECONNREFUSED" });
     assert.equal(wrapDockerError(err).code, "DockerUnavailable");
   });
+
+  // v1.0.7 — node-agent docker run 抛宿主级冲突归 TransientHostFault,
+  // v3ensureRunning 据此把 host 进 cooldown(60s),让用户 5s 重连换台。
+  test("RUN_FAIL + 'Address already in use' → TransientHostFault", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError(
+      "h",
+      500,
+      "RUN_FAIL",
+      "docker run: exit status 125: ... docker: Error response from daemon: Address already in use.",
+    );
+    assert.equal(wrapDockerError(err).code, "TransientHostFault");
+  });
+
+  test("RUN_FAIL + 'port is already allocated' → TransientHostFault", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError(
+      "h",
+      500,
+      "RUN_FAIL",
+      "docker: Error response from daemon: driver failed programming external connectivity on endpoint oc-v3-u28: Bind for 0.0.0.0:18789 failed: port is already allocated",
+    );
+    assert.equal(wrapDockerError(err).code, "TransientHostFault");
+  });
+
+  test("RUN_FAIL + 'Conflict ... container name ... is already in use' → TransientHostFault", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError(
+      "h",
+      500,
+      "RUN_FAIL",
+      'Conflict. The container name "/oc-v3-u28" is already in use by container "abc"',
+    );
+    assert.equal(wrapDockerError(err).code, "TransientHostFault");
+  });
+
+  test("ImageNotFound 文案优先于 TransientHostFault(同时命中时按 image 缺失走 5min 长重试)", async () => {
+    // 防御:如果有人写了带 "Address already in use" 又含 "Unable to find image" 的怪异文案,
+    // 应该优先按 image 缺失分类(它是部署级故障,5min retry 比 60s cooldown 更合适)
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError(
+      "h",
+      500,
+      "RUN_FAIL",
+      "Unable to find image 'foo:bar' locally. Address already in use",
+    );
+    assert.equal(wrapDockerError(err).code, "ImageNotFound");
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────

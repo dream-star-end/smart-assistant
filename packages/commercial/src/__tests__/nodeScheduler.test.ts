@@ -29,6 +29,8 @@ import {
   pickHost,
   pickBoundIp,
   schedule,
+  markHostCooldown,
+  _clearHostCooldownForTests,
 } from "../compute-pool/nodeScheduler.js";
 import {
   NodePoolBusyError,
@@ -235,6 +237,84 @@ describe("nodeScheduler.pickHost", () => {
   test("no ready host throws NodePoolUnavailableError", async () => {
     fp.addHost(mkHost({ id: "hQ", name: "sick", status: "quarantined" }));
     await assert.rejects(pickHost({}), NodePoolUnavailableError);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  v1.0.7 — host cooldown:
+//  上层 v3ensureRunning 在 docker run 抛"Address already in use"类宿主级冲突
+//  时调 markHostCooldown,该 host 60s 内 pickHost 跳过,用户下次 5s 重连
+//  自然换台。
+// ───────────────────────────────────────────────────────────────────────
+
+describe("nodeScheduler.pickHost — host cooldown (v1.0.7)", () => {
+  let fp: FakePool;
+  beforeEach(() => { fp = installFake(); _clearHostCooldownForTests(); });
+  afterEach(async () => { _clearHostCooldownForTests(); await resetPool(); });
+
+  test("cooldown 中的 host 在 least-loaded 路径被剔除", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "n1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hB", name: "n2", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    // hA 0 active,hB 1 active —— 默认 hA 会被选(0 < 1)
+    fp.addContainer({ user_id: 1, host_uuid: "hB", bound_ip: "172.30.2.10", state: "active" });
+    // 标 hA cooldown 60s,接下来必须落 hB(虽然 hB load 高)
+    markHostCooldown("hA", 60_000);
+    const r = await pickHost({});
+    assert.equal(r.row.id, "hB");
+  });
+
+  test("cooldown 让 sticky fall-through 到 least-loaded", async () => {
+    fp.addHost(mkHost({ id: "hSelf", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hStuck", name: "tk1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    // user 42 sticky 在 hStuck
+    fp.addContainer({ user_id: 42, host_uuid: "hStuck", bound_ip: "172.30.2.10", state: "active" });
+    markHostCooldown("hStuck", 60_000);
+    const r = await pickHost({ userId: 42 });
+    // sticky 被 cooldown 跳,least-loaded 也排除 hStuck → 落 hSelf
+    assert.equal(r.row.id, "hSelf");
+  });
+
+  test("requireHostId 显式指定时,绕过 cooldown(admin debug 不受限)", async () => {
+    fp.addHost(mkHost({ id: "hX", name: "tk-x", status: "ready", max_containers: 5 }));
+    markHostCooldown("hX", 60_000);
+    const r = await pickHost({ requireHostId: "hX" });
+    assert.equal(r.row.id, "hX");
+  });
+
+  test("所有 ready host 都在 cooldown → NodePoolBusyError", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "n1", status: "ready", max_containers: 5 }));
+    fp.addHost(mkHost({ id: "hB", name: "n2", status: "ready", max_containers: 5 }));
+    markHostCooldown("hA", 60_000);
+    markHostCooldown("hB", 60_000);
+    await assert.rejects(pickHost({}), NodePoolBusyError);
+  });
+
+  test("过期 cooldown 自动失效(durationMs 已过 → 重新可调度)", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "n1", status: "ready", max_containers: 5 }));
+    // 标负毫秒 duration 不会写入(防御性);标 1ms 然后等 5ms 即过期
+    markHostCooldown("hA", 1);
+    await new Promise((r) => setTimeout(r, 5));
+    const r = await pickHost({});
+    assert.equal(r.row.id, "hA");
+  });
+
+  test("markHostCooldown 重复标取较晚的过期时间", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "n1", status: "ready", max_containers: 5 }));
+    fp.addHost(mkHost({ id: "hB", name: "n2", status: "ready", max_containers: 5 }));
+    markHostCooldown("hA", 60_000);
+    markHostCooldown("hA", 1); // 想缩短不行,保留长的
+    const r = await pickHost({});
+    assert.equal(r.row.id, "hB"); // hA 仍在 cooldown
+  });
+
+  test("非法参数(空 hostId / 0 / 负 / NaN duration)被静默忽略", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "n1", status: "ready", max_containers: 5 }));
+    markHostCooldown("", 60_000);
+    markHostCooldown("hA", 0);
+    markHostCooldown("hA", -100);
+    markHostCooldown("hA", Number.NaN);
+    const r = await pickHost({});
+    assert.equal(r.row.id, "hA"); // 都没生效
   });
 });
 

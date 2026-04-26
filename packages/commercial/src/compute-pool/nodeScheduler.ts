@@ -66,11 +66,51 @@ async function bridgeCidrFromExisting(hostId: string): Promise<string | null> {
 }
 
 /**
+ * v1.0.7 — 进程内 host cooldown 注册表。
+ *
+ * 用途:某 host docker run 抛"Address already in use"等宿主级冲突时,
+ * v3ensureRunning 调用 markHostCooldown(hostId, 60_000),60s 内 pickHost 跳过它,
+ * 用户下一次 5s 重连自然会落到另一台 host。
+ *
+ * 设计取舍:
+ *   - 进程内、不持久化:重启后清空可接受(失败 host 会被自然探测重新进 cooldown)
+ *   - 不做指数退避:简单等量 60s 已经能避开大多数瞬态故障
+ *   - 不影响 requireHostId 路径:admin 显式指定 host 时不应被 cooldown 拦
+ *   - sticky 路径:fall-through 到 least-loaded(对用户而言不算降级,反正都是新挑)
+ *
+ * 测试用 _clearHostCooldownForTests 重置;生产代码不应调用。
+ */
+const hostCooldown = new Map<string, number>();
+
+export function markHostCooldown(hostId: string, durationMs: number): void {
+  if (!hostId || !Number.isFinite(durationMs) || durationMs <= 0) return;
+  const expireAt = Date.now() + durationMs;
+  // 同 host 重复标:取较晚的过期时间(stronger evidence wins)
+  const prev = hostCooldown.get(hostId) ?? 0;
+  if (expireAt > prev) hostCooldown.set(hostId, expireAt);
+}
+
+function isHostInCooldown(hostId: string): boolean {
+  const expireAt = hostCooldown.get(hostId);
+  if (expireAt === undefined) return false;
+  if (Date.now() >= expireAt) {
+    hostCooldown.delete(hostId);
+    return false;
+  }
+  return true;
+}
+
+export function _clearHostCooldownForTests(): void {
+  hostCooldown.clear();
+}
+
+/**
  * 选 host。
  * 不做 IP 分配,IP 由 pickBoundIp 单独调用(分两步便于测试)。
  */
 export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableHost> {
   if (opts.requireHostId) {
+    // 显式指定 host:绕过 cooldown,admin debug 优先
     const row = await queries.getHostById(opts.requireHostId);
     if (!row || row.status !== "ready") {
       throw new NodePoolUnavailableError(`host ${opts.requireHostId} not ready`);
@@ -82,10 +122,11 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
     return { row, activeContainers: count };
   }
 
-  // sticky: user 最近的 host(status 必须 ready 且未满)
+  // sticky: user 最近的 host(status 必须 ready 且未满)。
+  // host 在 cooldown 时跳过 sticky → fall-through 到 least-loaded
   if (typeof opts.userId === "number") {
     const sticky = await queries.findUserStickyHost(opts.userId);
-    if (sticky) {
+    if (sticky && !isHostInCooldown(sticky.hostUuid)) {
       const row = await queries.getHostById(sticky.hostUuid);
       if (row && row.status === "ready") {
         const count = await queries.countActiveContainersOnHost(row.id);
@@ -97,16 +138,19 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
     }
   }
 
-  // least-loaded
+  // least-loaded(剔除 cooldown 中的 host)
   const candidates = await queries.listSchedulableHosts();
   const ok = candidates.filter(
-    (c) => c.activeContainers < c.row.max_containers,
+    (c) => c.activeContainers < c.row.max_containers && !isHostInCooldown(c.row.id),
   );
   if (ok.length === 0) {
     if (candidates.length === 0) {
       throw new NodePoolUnavailableError("no ready host");
     }
-    throw new NodePoolBusyError("all ready hosts at capacity");
+    // listSchedulableHosts 已在 SQL 层过滤掉 active >= max_containers 的 host,
+    // 所以走到这里说明所有 ready host 都在 cooldown 中。沿用 NodePoolBusyError —
+    // 让 v3ensureRunning 走 host_full retry(10s)路径,不污染日志。
+    throw new NodePoolBusyError("all ready hosts in cooldown");
   }
   ok.sort((a, b) => a.activeContainers - b.activeContainers);
   return ok[0]!;

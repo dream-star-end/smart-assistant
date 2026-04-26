@@ -146,4 +146,8 @@ export type SupervisorErrorCode =
   // 商用版默认 fail-closed:没有守则不许起容器,避免 AI 在无守则状态裸奔。
   // dev/test 可设 OC_V3_CCB_BASELINE_OPTIONAL=1 显式降级为 warn+跳过挂载。
   | "CcbBaselineMissing"
+  // v1.0.7:node-agent 的 docker run 抛"地址/端口/容器名已占用"类宿主级冲突。
+  // 单宿主短期内大概率会再撞;由 v3ensureRunning 标 host 进 nodeScheduler cooldown,
+  // 下次 retry 5s 后自然走另一台。区别于 NameConflict(同 uid 并发),后者仍走老路径。
+  | "TransientHostFault"
   | "Unknown";

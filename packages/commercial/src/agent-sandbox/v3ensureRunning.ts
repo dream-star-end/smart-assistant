@@ -51,13 +51,27 @@ import {
   type WaitContainerReadyOptions,
   type ReadinessEndpoint,
 } from "./v3readiness.js";
-import { schedule as schedulePlacement, type SchedulePlacement } from "../compute-pool/nodeScheduler.js";
+import {
+  schedule as schedulePlacement,
+  markHostCooldown,
+  type SchedulePlacement,
+} from "../compute-pool/nodeScheduler.js";
 import { NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/types.js";
 import { getHostById } from "../compute-pool/queries.js";
 import { hostRowToTarget, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
+
+/**
+ * v1.0.7 — 远端 docker run 抛宿主级冲突("Address already in use" 等)时,
+ * 把该 host 标 60s cooldown,下次用户 5s 重连时 nodeScheduler 跳过它。
+ *
+ * 60s 是经验值:
+ *   - 大多数 IPAM/iptables 残留瞬态故障 60s 内自然清,过短会立刻又撞
+ *   - 太长会压沉一台 host(集群只 3 台时尤其明显);60s 给两次重连机会
+ */
+const TRANSIENT_HOST_FAULT_COOLDOWN_MS = 60_000;
 
 /** 前端 retry-after 提示秒数(stopped — 等 3F 清理)。短一点,避免用户等久。 */
 const RETRY_AFTER_STOPPED_SEC = 3;
@@ -375,11 +389,28 @@ export function makeV3EnsureRunning(
       // NameConflict(同 uid 并发 provision)/ IP 池满 都让前端短重试 — 不告警。
       // 2026-04-25 v1.0.2:之前这里完全吞错,uid=28 12 分钟死循环里 0 条 stack 可查,
       // 排障只能瞎猜。补 console.warn 落 /var/log/openclaude.log,行为不变,只加观测。
+      // v1.0.7:加 host_uuid / bound_ip 字段,排障时能直接定位是哪台 host 出问题。
       const errCode =
         err instanceof SupervisorError ? err.code : (err as { code?: string } | null)?.code;
       const errMsg = err instanceof Error ? err.message : String(err);
+      // v1.0.7:TransientHostFault(远端 docker run "Address already in use" 类) →
+      // 把 host 标 cooldown,下次 5s 重连 nodeScheduler 自然换台。
+      // 单进程内存即可,不持久化(重启自然清,失败 host 会被自然探测重新进 cooldown)。
+      if (
+        err instanceof SupervisorError &&
+        err.code === "TransientHostFault" &&
+        placement?.hostId
+      ) {
+        markHostCooldown(placement.hostId, TRANSIENT_HOST_FAULT_COOLDOWN_MS);
+      }
       // eslint-disable-next-line no-console
-      console.warn("[v3ensureRunning] provision failed (catch-all)", { uid, errCode, errMsg });
+      console.warn("[v3ensureRunning] provision failed (catch-all)", {
+        uid,
+        errCode,
+        errMsg,
+        hostId: placement?.hostId,
+        boundIp: placement?.boundIp,
+      });
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }
 
