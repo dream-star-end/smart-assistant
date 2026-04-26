@@ -4213,8 +4213,60 @@ export class Gateway {
           ? ('inter-agent' as const)
           : ('chat' as const)
     const _run = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
+    // P1-3 续 — CCB 用 createAssistantAPIErrorMessage 把 API 调用错误包成
+    // "API Error: ..." 文本作为正常 assistant text 流出(不抛 process error),
+    // 因此走的是 e.kind === 'block' + 'final' 的正常 turn 路径,绕开了下面
+    // `e.kind === 'error'` 分支的 classifyRunError。这里在 turn 状态层补一次
+    // 识别:任一 text block 整段以 "API Error: " 开头,且 classify 命中非
+    // unknown(insufficient_credits / rate_limited / upstream_failed),就把
+    // 这个 turn 当成已识别错误,转走与 e.kind === 'error' 分支一致的双帧 UX
+    // (outbound.error + [error] text final),前端红卡 + 「去充值」CTA 同链路。
+    // 不限 "turn 内首块" — sub-agent (Task) 路径下,主 agent 的 Agent tool_use
+    // block 会先进 aggregatedBlocks,带这层守卫会让 sub-agent INSUFFICIENT_CREDITS
+    // 永远拦不到。
+    let _apiErrorIntercepted = false
+    let _apiErrorText = ''
     await this.sessions.submit(session, payload, (e) => {
       if (e.kind === 'block') {
+        // turn 已被 API_ERROR 拦截 → 后续 block 一律吞掉,等 final 关闭
+        if (_apiErrorIntercepted) return
+
+        // 检查 block 是否是可分类 API Error。
+        // 故意不限定 "turn 必须为空":CCB 的 createAssistantAPIErrorMessage
+        // 会作为独立 assistant message 流出,不会与正常 text 混在同一消息里;
+        // 而 sub-agent (Task) 路径下,主 agent 的 Agent tool_use block 通常
+        // 已先于 sub-agent 的 API Error text block 进入 aggregatedBlocks ——
+        // 限"turn 空"会让 sub-agent 场景永远拦不到 (boss 决策 2B)。前端
+        // _suppressLegacyErrorText 只 suppress 替代 final 帧本身的 [error] text,
+        // 之前已 deliver 的正常 block 会保留显示(部分上下文 + 红卡的合理 UX)。
+        const _b0 = e.block as { kind?: string; text?: string }
+        if (
+          _b0.kind === 'text' &&
+          typeof _b0.text === 'string' &&
+          _b0.text.startsWith('API Error: ')
+        ) {
+          const _cls = classifyRunError(_b0.text)
+          if (_cls.code !== 'unknown') {
+            _apiErrorIntercepted = true
+            _apiErrorText = _b0.text
+            const errFrame: OutboundError & { _userId?: string } = {
+              type: 'outbound.error',
+              sessionKey: out.sessionKey,
+              channel: out.channel,
+              peer: out.peer,
+              code: _cls.code,
+              message: _cls.message,
+              detail: _b0.text,
+              isFinal: false,
+              ...(((out as OutboundMessage & { _userId?: string })._userId)
+                ? { _userId: (out as OutboundMessage & { _userId?: string })._userId }
+                : {}),
+            }
+            this.deliver(errFrame as unknown as OutboundMessage, adapter)
+            return
+          }
+        }
+
         if (adapter) {
           // For partial tool_use blocks, replace any prior block with same blockId
           const b = e.block as any
@@ -4231,6 +4283,22 @@ export class Gateway {
           this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
         }
       } else if (e.kind === 'final') {
+        if (_apiErrorIntercepted) {
+          // 替代原 final:发 [error] text final 关闭 turn。不附 e.meta(boss
+          // 决策:错误卡不显示 cost),与 e.kind === 'error' 分支一致;runLog
+          // 也按 failed 记账,idempotency key 释放允许 client retry。
+          this._runLog.complete(_run, { status: 'failed', error: _apiErrorText })
+          if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+          this.deliver(
+            {
+              ...out,
+              blocks: [{ kind: 'text', text: `[error] ${_apiErrorText}` }],
+              isFinal: true,
+            },
+            adapter,
+          )
+          return
+        }
         this._runLog.complete(_run, {
           status: 'completed',
           cost: e.meta?.cost,
