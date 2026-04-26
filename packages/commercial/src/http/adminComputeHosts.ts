@@ -32,6 +32,8 @@ import {
   removeComputeHost,
   clearQuarantineForHost,
   getBaselineVersions,
+  adminDistributeImageToAllHosts,
+  adminDistributeImageToHost,
 } from "../admin/computeHosts.js";
 import { listContainers } from "../admin/containers.js";
 import { serializeContainer } from "./admin.js";
@@ -148,9 +150,38 @@ export async function handleAdminComputeHostAction(
       await clearQuarantineForHost(id, auditCtx);
       sendJson(res, 200, { id, status: "ready" });
       return;
+    case "distribute-image": {
+      // 同步等待 stream 完成。3.5GB 慢链路最长约 30 分钟,前端/反代 timeout 要够长。
+      // 本处不做异步 task — 商用版当前规模 host 数 <10,sync 直接返回 per-host 结果
+      // 比加 task queue 简单。
+      const result = await adminDistributeImageToHost(id, auditCtx);
+      sendJson(res, 200, { id, result });
+      return;
+    }
     default:
       throw new HttpError(404, "NOT_FOUND", "endpoint not found");
   }
+}
+
+/**
+ * POST /api/admin/v3/distribute-image — 把 OC_RUNTIME_IMAGE 推到所有 ready host。
+ * 同步等待全部完成,返回 per-host 结果数组。
+ *
+ * 运维 build-image.sh 之后 curl 一次,把新 image 摊到全集群,避免靠用户调度时
+ * docker auto-pull 失败再走 ImageNotFound 5min retry。
+ *
+ * 0 ready host → 200 + 空数组(明确告知 noop,而非 404 / 412)。
+ */
+export async function handleAdminDistributeImageToAllHosts(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const auditCtx = auditCtxOf(req, ctx, admin.id);
+  const results = await adminDistributeImageToAllHosts(auditCtx);
+  sendJson(res, 200, { results });
 }
 
 export async function handleAdminBaselineVersion(

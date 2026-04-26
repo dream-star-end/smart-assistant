@@ -92,6 +92,7 @@ import {
   deleteFile as nodeAgentDeleteFile,
 } from "./compute-pool/nodeAgentClient.js";
 import { createContainerService } from "./compute-pool/containerService.js";
+import { distributePreheatToAllHosts } from "./compute-pool/imageDistribute.js";
 import {
   getBaselineServer,
   type BaselineServer,
@@ -803,6 +804,36 @@ export async function registerCommercial(
         // eslint-disable-next-line no-console
         console.warn("[commercial] v3 preheat unexpectedly threw", { error: (err as Error)?.message ?? String(err) });
       });
+
+      // 多机分发:把 image 推到所有 ready 的远端 host。
+      // 启动时 fire-and-forget(3.5GB stream 不阻塞 ws 接入)。
+      // 失败 best-effort —— 兜底是 wrapDockerError 把 RUN_FAIL/Unable-to-find-image
+      // 翻译成 ImageNotFound,前端 5min retry 而非 5s 风暴。
+      // OC_IMAGE_DISTRIBUTE_DISABLED=1 关(单机部署 / 测试)。
+      if (process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1") {
+        void distributePreheatToAllHosts(cfg.OC_RUNTIME_IMAGE, {
+          logger: rootLogger.child({ subsys: "image-distribute-startup" }),
+        })
+          .then((results) => {
+            const summary = results.map((r) => `${r.hostName}:${r.outcome}`).join(",");
+            // eslint-disable-next-line no-console
+            console.log("[commercial] v3 image distribute summary", { results: summary, count: results.length });
+            const failed = results.filter((r) => r.outcome === "error");
+            if (failed.length > 0) {
+              // eslint-disable-next-line no-console
+              console.warn("[commercial] v3 image distribute had failures", {
+                failed: failed.map((r) => ({ host: r.hostName, source: r.errorSource, error: r.error })),
+              });
+            }
+          })
+          .catch((err: unknown) => {
+            // distributePreheatToAllHosts 内部应该 best-effort 不抛;真抛了就是 bug
+            // eslint-disable-next-line no-console
+            console.warn("[commercial] v3 image distribute unexpectedly threw", {
+              error: (err as Error)?.message ?? String(err),
+            });
+          });
+      }
     }
   } else {
     // eslint-disable-next-line no-console

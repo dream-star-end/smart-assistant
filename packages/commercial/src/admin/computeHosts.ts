@@ -25,6 +25,14 @@ import {
   hostRowToTarget,
 } from "../compute-pool/nodeAgentClient.js";
 import { getBaselineServer } from "../compute-pool/baselineServer.js";
+import { decryptSshPassword } from "../compute-pool/crypto.js";
+import {
+  distributePreheatToAllHosts,
+  streamImageToHost,
+  ImageDistributeError,
+  type DistributeHostResult,
+} from "../compute-pool/imageDistribute.js";
+import type { SshTarget } from "../compute-pool/sshExec.js";
 import { rootLogger } from "../logging/logger.js";
 
 const log = rootLogger.child({ subsys: "admin.computeHosts" });
@@ -421,4 +429,134 @@ export async function getBaselineVersions(): Promise<BaselineVersionView> {
     master_err: masterErr,
     per_host: perHost,
   };
+}
+
+// ─── distribute v3 runtime image to remote hosts ─────────────────
+
+/**
+ * 业务层:把 OC_RUNTIME_IMAGE stream 到所有 ready 的 remote host。
+ * 同步等待返回 per-host 结果(`already` / `loaded` / `error`)。
+ *
+ * 调用场景:运维 build-image.sh 之后 curl 一次,把新 image 摊到全集群,
+ * 避免靠用户调度时 docker auto-pull 失败再走 ImageNotFound 5min retry。
+ *
+ * 注意:3.5GB image 在慢链路可能 5-10 分钟。前端/反代 timeout 要够长。
+ */
+export async function adminDistributeImageToAllHosts(
+  ctx: AdminAuditCtx,
+): Promise<DistributeHostResult[]> {
+  const image = process.env.OC_RUNTIME_IMAGE?.trim() ?? "";
+  if (!image) {
+    throw new HttpError(412, "PRECONDITION_FAILED", "OC_RUNTIME_IMAGE not set in env");
+  }
+  log.info("admin distribute-image to all hosts", { adminId: String(ctx.adminId), image });
+  const results = await distributePreheatToAllHosts(image, { logger: log });
+  await bestEffortAudit(
+    ctx,
+    "compute_host.distribute_image_all",
+    `image:${image}`,
+    null,
+    {
+      image,
+      hosts: results.map((r) => ({
+        name: r.hostName, outcome: r.outcome,
+        durationMs: r.durationMs, bytes: r.bytes ?? null,
+        errorSource: r.errorSource ?? null,
+      })),
+    },
+  );
+  return results;
+}
+
+/**
+ * 业务层:把 OC_RUNTIME_IMAGE stream 到指定 host。
+ *
+ * 与 all-hosts 版本不同:**允许非 ready 状态**(运维场景:bootstrap 失败的
+ * host 想手动补镜像后重新 bootstrap;quarantined host 准备 reuse)。
+ * self host 仍然拒绝(本地 docker 不需要 SSH stream)。
+ */
+export async function adminDistributeImageToHost(
+  hostId: string,
+  ctx: AdminAuditCtx,
+): Promise<DistributeHostResult> {
+  const image = process.env.OC_RUNTIME_IMAGE?.trim() ?? "";
+  if (!image) {
+    throw new HttpError(412, "PRECONDITION_FAILED", "OC_RUNTIME_IMAGE not set in env");
+  }
+  const row = await queries.getHostById(hostId);
+  if (!row) throw new HttpError(404, "NOT_FOUND", `compute host ${hostId} not found`);
+  if (row.name === "self") {
+    throw new HttpError(403, "FORBIDDEN", "cannot distribute image to self host (use local docker)");
+  }
+  log.info("admin distribute-image to host", {
+    adminId: String(ctx.adminId), hostId, hostName: row.name, image,
+  });
+
+  let password: Buffer | null = null;
+  let result: DistributeHostResult;
+  try {
+    try {
+      password = decryptSshPassword(row.id, row.ssh_password_nonce, row.ssh_password_ct);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new HttpError(500, "DECRYPT_FAILED", `decrypt ssh password: ${msg}`);
+    }
+    // 同 _distributeOne / nodeBootstrap.ts:141-146 —— 当前 fingerprint 是远端
+    // ssh-keyscan 127.0.0.1 写入,host marker 与外连目标不匹配,strict 必失败。
+    // 等 0031 严格化时与 nodeBootstrap 一起切。
+    const target: SshTarget = {
+      host: row.host,
+      port: row.ssh_port,
+      username: row.ssh_user,
+      password,
+      knownHostsContent: null,
+    };
+    try {
+      const r = await streamImageToHost(target, image, { hostId: row.id, logger: log });
+      result = {
+        hostId: row.id,
+        hostName: row.name,
+        outcome: r.outcome,
+        durationMs: r.durationMs,
+        bytes: r.bytes,
+      };
+    } catch (e) {
+      if (e instanceof ImageDistributeError) {
+        result = {
+          hostId: row.id,
+          hostName: row.name,
+          outcome: "error",
+          durationMs: e.durationMs,
+          bytes: e.bytesTransferred,
+          error: e.message,
+          errorSource: e.source,
+        };
+      } else {
+        const msg = e instanceof Error ? e.message : String(e);
+        result = {
+          hostId: row.id,
+          hostName: row.name,
+          outcome: "error",
+          durationMs: 0,
+          error: msg,
+        };
+      }
+    }
+  } finally {
+    if (password) password.fill(0);
+  }
+
+  await bestEffortAudit(
+    ctx,
+    "compute_host.distribute_image",
+    `compute_host:${hostId}`,
+    { image },
+    {
+      outcome: result.outcome,
+      durationMs: result.durationMs,
+      bytes: result.bytes ?? null,
+      errorSource: result.errorSource ?? null,
+    },
+  );
+  return result;
 }

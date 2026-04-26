@@ -115,6 +115,7 @@ import {
   handleAdminComputeHostGetSubresource,
   handleAdminComputeHostAction,
   handleAdminBaselineVersion,
+  handleAdminDistributeImageToAllHosts,
 } from './adminComputeHosts.js'
 import {
   handleAdminAlertsListEvents,
@@ -588,6 +589,9 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/admin/v3/compute-hosts', handler: handleAdminListComputeHosts },
     { method: 'POST', path: '/api/admin/v3/compute-hosts/add', handler: handleAdminAddComputeHost },
     { method: 'GET', path: '/api/admin/v3/baseline-version', handler: handleAdminBaselineVersion },
+    // V3: 把 OC_RUNTIME_IMAGE 推到所有 ready remote host(同步等返回 per-host result)
+    // 单 host 路径在 prefix POST handler 里(action=distribute-image)
+    { method: 'POST', path: '/api/admin/v3/distribute-image', handler: handleAdminDistributeImageToAllHosts },
     {
       method: 'GET',
       pathPrefix: '/api/admin/v3/compute-hosts/',

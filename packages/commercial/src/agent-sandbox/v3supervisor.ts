@@ -55,6 +55,7 @@ import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/pr
 import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
 import type { Pool, PoolClient } from "pg";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
+import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
 import { V3_AGENT_GID } from "./constants.js";
 import { SupervisorError } from "./types.js";
 
@@ -663,9 +664,49 @@ function hashSecretToBuffer(secretHex: string): Buffer {
   return createHash("sha256").update(Buffer.from(secretHex, "hex")).digest();
 }
 
-/** 把 supervisor 内部错误归到 SupervisorError,便于上层按 code 处理 */
-function wrapDockerError(err: unknown): SupervisorError {
+/** node-agent 通过 docker CLI 跑 `docker run`,image 缺失时返回的错误文案。
+ *  对应 v3ensureRunning 的 RETRY_AFTER_IMAGE_MISSING_SEC=300 长重试路径,
+ *  避免 5s 风暴(详见 v3ensureRunning.ts:71 注释)。
+ *
+ *  匹配的文案样本(docker CLI 实测):
+ *    - "Unable to find image 'foo:bar' locally" + "pull access denied"
+ *    - "manifest unknown"
+ *    - "repository ... not found"
+ *  注意 dockerode 走 daemon API 走 statusCode=404 + "No such image" 路径,
+ *  跟这里的 CLI 文案不同;两条路径都要覆盖。
+ */
+const NODE_AGENT_IMAGE_MISSING_PATTERNS: RegExp[] = [
+  /unable to find image/i,
+  /pull access denied/i,
+  /manifest unknown/i,
+  /repository .* not found/i,
+  /no such image/i, // node-agent 若透传 docker daemon "No such image" 文案,与 dockerode 4xx 路径同源覆盖
+];
+
+/** 把 supervisor 内部错误归到 SupervisorError,便于上层按 code 处理。
+ *  export 仅用于单测;生产路径只在本文件内调用。 */
+export function wrapDockerError(err: unknown): SupervisorError {
   if (err instanceof SupervisorError) return err;
+  // 远端 node-agent RPC 错误(走 docker CLI exec)。优先识别"image 缺失"
+  // 文案 → ImageNotFound,让 v3ensureRunning 走 5min 长重试而不是 5s 风暴。
+  // 其它 RUN_FAIL 落 Unknown,与原行为一致。
+  if (err instanceof AgentAppError) {
+    const message = err.message;
+    // SupervisorError.cause 只接 {statusCode, message} 两字段(types.ts:124),
+    // node-agent 的 hostId/agentErrCode 已经编码在 message 里(nodeAgentClient.ts:348
+    // 拼成 "agent returned 500: {code:RUN_FAIL,error:...}"),不再额外塞。
+    if (
+      err.agentErrCode === "RUN_FAIL" &&
+      NODE_AGENT_IMAGE_MISSING_PATTERNS.some((re) => re.test(message))
+    ) {
+      return new SupervisorError("ImageNotFound", message, {
+        statusCode: err.httpStatus, message,
+      });
+    }
+    return new SupervisorError("Unknown", message, {
+      statusCode: err.httpStatus, message,
+    });
+  }
   const e = err as { statusCode?: number; message?: string; code?: string };
   const message = typeof e.message === "string" ? e.message : String(err);
   if (e.code === "ENOENT" || e.code === "EACCES" || e.code === "ECONNREFUSED") {

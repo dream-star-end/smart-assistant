@@ -41,6 +41,7 @@ import {
   shEscape,
   type SshTarget,
 } from "./sshExec.js";
+import { streamImageToHost, ImageDistributeError } from "./imageDistribute.js";
 
 const log = rootLogger.child({ subsys: "node-bootstrap" });
 
@@ -56,8 +57,13 @@ const LOCAL_BIN_PATH =
   process.env.OPENCLAUDE_NODE_AGENT_BIN ??
   "/opt/openclaude/openclaude-v3/packages/commercial/node-agent/node-agent";
 
-/** bootstrap 总超时。 */
-const BOOTSTRAP_TOTAL_MS = 15 * 60_000;
+/**
+ * bootstrap 总超时。45 分钟覆盖 image_pull 阶段最坏情况:
+ *   - 3.5GB image,30 分钟传输上限(慢链路 / 跨洲)
+ *   - 其余阶段约 5-10 分钟(apt install + cert + agent verify)
+ * 比硬塞 15 分钟更稳。
+ */
+const BOOTSTRAP_TOTAL_MS = 45 * 60_000;
 
 /**
  * 远端 node-agent 回连 master baselineServer 用的 base URL(HTTPS,含端口)。
@@ -193,7 +199,28 @@ export async function bootstrapHost(params: BootstrapParams): Promise<BootstrapR
     await step("agent_verify", () => verifyNodeAgent(params.hostId));
     await step("baseline_first_pull", () => pullBaselineOnce(params.hostId));
     await step("image_pull", async () => {
-      /* M1 镜像 pull 放到 nodeScheduler 第一次 run 时懒执行,本阶段 no-op */
+      // 把 master 本地的 v3 runtime image stream 到远端。bootstrap 必须保证
+      // host 入池前 image 就绪,否则首个用户调度过来 docker run 必失败。
+      // 已存在 → inspect 短路 noop;否则 docker save | ssh docker load。
+      const image = process.env.OC_RUNTIME_IMAGE?.trim() ?? "";
+      if (!image) {
+        log.warn("OC_RUNTIME_IMAGE empty — skipping image_pull (host will fail to provision until image arrives)", {
+          hostId: params.hostId,
+        });
+        return;
+      }
+      try {
+        const r = await streamImageToHost(target, image, { hostId: params.hostId });
+        log.info("bootstrap image_pull ok", {
+          hostId: params.hostId, image, outcome: r.outcome,
+          durationMs: r.durationMs, bytes: r.bytes,
+        });
+      } catch (e) {
+        if (e instanceof ImageDistributeError) {
+          throw new Error(`image_pull failed (${e.source}): ${e.message}`);
+        }
+        throw e;
+      }
     });
     await step("egress_endpoint_probe", () => probeEgressEndpointStep(params.hostId));
     await step("final_verify", async () => {

@@ -72,8 +72,12 @@ async function acquire(): Promise<() => void> {
  * 构建用于 ssh 的 known_hosts 文件内容。
  * - strict 模式:已有 knownHostsContent,写盘后 ssh -o StrictHostKeyChecking=yes
  * - accept-new:无 known_hosts,accept-new 策略,首次连接后从 ~/.ssh/known_hosts 读
+ *
+ * `export` 是给同模块组的 imageDistribute.ts 复用 — 流式 docker save | docker load
+ * 也要相同的 host key 校验姿态,不能各自 fork 出 `StrictHostKeyChecking=no` 之类
+ * 的弱化版本(否则就是给 SSH 密码开 MITM 的口子)。
  */
-async function prepareKnownHosts(
+export async function prepareKnownHosts(
   tmpDir: string,
   target: SshTarget,
 ): Promise<{ khPath: string; isNew: boolean }> {
@@ -87,8 +91,9 @@ async function prepareKnownHosts(
   return { khPath, isNew: true };
 }
 
-/** 基础 ssh 选项(strict/accept-new)。 */
-function sshOpts(khPath: string, strict: boolean): string[] {
+/** 基础 ssh 选项(strict/accept-new)。export 同 prepareKnownHosts 的理由 —
+ *  imageDistribute.ts 流式管道里的 ssh 命令也要走同一套选项,避免参数漂移。 */
+export function sshOpts(khPath: string, strict: boolean): string[] {
   return [
     "-o", `UserKnownHostsFile=${khPath}`,
     "-o", `StrictHostKeyChecking=${strict ? "yes" : "accept-new"}`,

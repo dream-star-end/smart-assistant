@@ -1224,6 +1224,93 @@ describe("preheatV3Image (3I)", () => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
+//  wrapDockerError — node-agent AgentAppError 翻译路径
+//
+//  关键:RUN_FAIL + "Unable to find image" 等 docker CLI 文案 → ImageNotFound,
+//  让 v3ensureRunning 走 RETRY_AFTER_IMAGE_MISSING_SEC=300 而不是 5s 风暴。
+//  其它 RUN_FAIL → Unknown(保留原行为);dockerode 404 走另一分支(下面也覆盖)。
+// ───────────────────────────────────────────────────────────────────────
+
+describe("wrapDockerError — node-agent AgentAppError 路径", () => {
+  test("RUN_FAIL + 'Unable to find image' → ImageNotFound (核心修复)", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError(
+      "host-uuid-1",
+      500,
+      "RUN_FAIL",
+      "docker run failed: Unable to find image 'openclaude/openclaude-runtime:abc123' locally",
+    );
+    const wrapped = wrapDockerError(err);
+    assert.equal(wrapped.code, "ImageNotFound");
+    assert.match(wrapped.message, /Unable to find image/);
+  });
+
+  test("RUN_FAIL + 'pull access denied' → ImageNotFound", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError("h", 500, "RUN_FAIL", "docker run failed: pull access denied for foo/bar");
+    assert.equal(wrapDockerError(err).code, "ImageNotFound");
+  });
+
+  test("RUN_FAIL + 'manifest unknown' → ImageNotFound", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError("h", 500, "RUN_FAIL", "docker pull: manifest unknown");
+    assert.equal(wrapDockerError(err).code, "ImageNotFound");
+  });
+
+  test("RUN_FAIL + 'repository ... not found' → ImageNotFound", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError("h", 500, "RUN_FAIL", "Error response: repository openclaude/foo not found");
+    assert.equal(wrapDockerError(err).code, "ImageNotFound");
+  });
+
+  test("RUN_FAIL + 'No such image' → ImageNotFound (与 dockerode 4xx 同源)", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError("h", 500, "RUN_FAIL", "docker run failed: No such image: openclaude/runtime:abc");
+    assert.equal(wrapDockerError(err).code, "ImageNotFound");
+  });
+
+  test("RUN_FAIL 但文案不是 image 缺失(如 'cgroup' / 'permission denied') → Unknown", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = new AgentAppError("h", 500, "RUN_FAIL", "docker run failed: cgroup error");
+    const wrapped = wrapDockerError(err);
+    assert.equal(wrapped.code, "Unknown");
+    assert.match(wrapped.message, /cgroup error/);
+  });
+
+  test("非 RUN_FAIL 的 AgentAppError(如 STOP_FAIL) → Unknown,不触发 ImageNotFound", async () => {
+    const { AgentAppError } = await import("../compute-pool/nodeAgentClient.js");
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    // 即使 message 含 "Unable to find image",code 不是 RUN_FAIL 就不归类
+    const err = new AgentAppError("h", 500, "STOP_FAIL", "Unable to find image during stop");
+    assert.equal(wrapDockerError(err).code, "Unknown");
+  });
+
+  test("dockerode 404 + 'No such image' 老路径未被破坏", async () => {
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = Object.assign(new Error("No such image: foo:bar"), { statusCode: 404 });
+    assert.equal(wrapDockerError(err).code, "ImageNotFound");
+  });
+
+  test("dockerode 404 但文案不像 image(普通 NotFound) → NotFound", async () => {
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = Object.assign(new Error("No such container: xxx"), { statusCode: 404 });
+    assert.equal(wrapDockerError(err).code, "NotFound");
+  });
+
+  test("ENOENT/ECONNREFUSED → DockerUnavailable", async () => {
+    const { wrapDockerError } = await import("../agent-sandbox/v3supervisor.js");
+    const err = Object.assign(new Error("connect refused"), { code: "ECONNREFUSED" });
+    assert.equal(wrapDockerError(err).code, "DockerUnavailable");
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
 //  CCB baseline (平台守则 CLAUDE.md + system-info skill 只读注入)
 //
 //  resolveCcbBaselineMounts:
