@@ -122,6 +122,42 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
     return { row, activeContainers: count };
   }
 
+  // user-level pin: admin 把特定 user 钉到特定 host(QA/测试用)。
+  // 命中条件: host ready + 未满 + 不在 cooldown。任一不满足 → log.warn + fall-through
+  // 到 sticky/least-loaded(避免 host 维护期把 pinned 用户全卡死)。
+  // 优先级: requireHostId(admin debug) > pinned > sticky > least-loaded。
+  if (typeof opts.userId === "number") {
+    const pinnedHostId = await queries.getUserPinnedHost(opts.userId);
+    if (pinnedHostId) {
+      if (isHostInCooldown(pinnedHostId)) {
+        log.warn("pinned host in cooldown, falling through", {
+          userId: opts.userId,
+          hostId: pinnedHostId,
+        });
+      } else {
+        const row = await queries.getHostById(pinnedHostId);
+        if (!row || row.status !== "ready") {
+          log.warn("pinned host not ready, falling through", {
+            userId: opts.userId,
+            hostId: pinnedHostId,
+            status: row?.status ?? "missing",
+          });
+        } else {
+          const count = await queries.countActiveContainersOnHost(row.id);
+          if (count >= row.max_containers) {
+            log.warn("pinned host at capacity, falling through", {
+              userId: opts.userId,
+              hostId: row.id,
+            });
+          } else {
+            log.debug("pinned host hit", { userId: opts.userId, hostId: row.id });
+            return { row, activeContainers: count };
+          }
+        }
+      }
+    }
+  }
+
   // sticky: user 最近的 host(status 必须 ready 且未满)。
   // host 在 cooldown 时跳过 sticky → fall-through 到 least-loaded
   if (typeof opts.userId === "number") {

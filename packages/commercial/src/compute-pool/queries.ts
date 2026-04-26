@@ -471,6 +471,21 @@ export async function deleteHost(id: string): Promise<boolean> {
 }
 
 /**
+ * 调度用 user-level pin 查找:admin 把特定 user 钉到特定 host(QA/测试)。
+ * 返 NULL 表示该 user 未设 pin,scheduler 走默认 sticky+least-loaded 路径。
+ *
+ * 仅返 host_uuid;调用方自己判 host 是否 ready / 满 / cooldown,失效 fall-through。
+ * 0040 migration 引入 users.pinned_host_uuid。
+ */
+export async function getUserPinnedHost(userId: number): Promise<string | null> {
+  const r = await getPool().query<{ pinned_host_uuid: string | null }>(
+    `SELECT pinned_host_uuid FROM users WHERE id = $1`,
+    [userId],
+  );
+  return r.rows[0]?.pinned_host_uuid ?? null;
+}
+
+/**
  * 调度用 sticky 查找:某 user 是否已有 active 容器 → 返其 host_uuid。
  * 如果 host 已经 not ready,调用方应拒 sticky 并进 pickHost。
  */

@@ -95,11 +95,17 @@ function mkHost(
 class FakePool {
   hosts: ComputeHostRow[] = [];
   containers: FakeContainer[] = [];
+  // pinnedByUser: 模拟 users.pinned_host_uuid 列(0040 migration)。
+  // 不在测试里实例化整张 users 表,只存调度器需要的 user→host 映射。
+  pinnedByUser = new Map<number, string | null>();
   nextContainerId = 1;
 
   addHost(h: ComputeHostRow): void { this.hosts.push(h); }
   addContainer(c: Omit<FakeContainer, "id">): void {
     this.containers.push({ id: this.nextContainerId++, ...c });
+  }
+  setUserPinnedHost(userId: number, hostId: string | null): void {
+    this.pinnedByUser.set(userId, hostId);
   }
   async end(): Promise<void> { /* FakePool.end — no real connections */ }
 
@@ -146,6 +152,14 @@ class FakePool {
         (c) => c.host_uuid === hostUuid && c.state === "active",
       ).length;
       return { rows: [{ n: String(n) }], rowCount: 1 };
+    }
+    // getUserPinnedHost: SELECT pinned_host_uuid FROM users WHERE id = $1
+    if (/SELECT pinned_host_uuid FROM users WHERE id = \$1/.test(s)) {
+      const userId = params[0] as number;
+      // map.get 没设 → undefined → 视为 user 不存在,返 0 行(scheduler 会按 NULL 处理)
+      const v = this.pinnedByUser.get(userId);
+      if (v === undefined) return { rows: [], rowCount: 0 };
+      return { rows: [{ pinned_host_uuid: v }], rowCount: 1 };
     }
     // findUserStickyHost
     if (/FROM agent_containers ac\s+JOIN compute_hosts ch/.test(s)) {
@@ -315,6 +329,88 @@ describe("nodeScheduler.pickHost — host cooldown (v1.0.7)", () => {
     markHostCooldown("hA", Number.NaN);
     const r = await pickHost({});
     assert.equal(r.row.id, "hA"); // 都没生效
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  0040 — user-level host pin:
+//  admin 把特定 user 钉到特定 host(QA/测试)。pinned 优先级高于 sticky,
+//  低于 requireHostId。host 不可用时 fall-through 到 sticky/least-loaded。
+// ───────────────────────────────────────────────────────────────────────
+
+describe("nodeScheduler.pickHost — user-level pinned host (0040)", () => {
+  let fp: FakePool;
+  beforeEach(() => { fp = installFake(); _clearHostCooldownForTests(); });
+  afterEach(async () => { _clearHostCooldownForTests(); await resetPool(); });
+
+  test("pinned host ready 且未满 → 命中并优先于 sticky", async () => {
+    fp.addHost(mkHost({ id: "hPin", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hSticky", name: "tk1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    // user 50 sticky 在 hSticky,但 pinned 在 hPin → 必须命中 pinned
+    fp.addContainer({ user_id: 50, host_uuid: "hSticky", bound_ip: "172.30.2.10", state: "active" });
+    fp.setUserPinnedHost(50, "hPin");
+    const r = await pickHost({ userId: 50 });
+    assert.equal(r.row.id, "hPin");
+  });
+
+  test("pinned host 不存在 → fall-through 到 sticky", async () => {
+    fp.addHost(mkHost({ id: "hSticky", name: "self", status: "ready", max_containers: 5 }));
+    fp.addContainer({ user_id: 51, host_uuid: "hSticky", bound_ip: "172.30.0.10", state: "active" });
+    // pin 写到一个不存在的 host id(host 已被删 + ON DELETE SET NULL 之前的 race 罕见;
+    // 测一遍稳健性)
+    fp.setUserPinnedHost(51, "hGhost");
+    const r = await pickHost({ userId: 51 });
+    assert.equal(r.row.id, "hSticky");
+  });
+
+  test("pinned host status=draining → fall-through", async () => {
+    fp.addHost(mkHost({ id: "hPin", name: "tk1", status: "draining", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOk", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.setUserPinnedHost(52, "hPin");
+    const r = await pickHost({ userId: 52 });
+    assert.equal(r.row.id, "hOk"); // 没 sticky,落 least-loaded
+  });
+
+  test("pinned host 满容量 → fall-through 到 least-loaded", async () => {
+    fp.addHost(mkHost({ id: "hPin", name: "tk1", status: "ready", max_containers: 1, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOk", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.addContainer({ user_id: 99, host_uuid: "hPin", bound_ip: "172.30.1.10", state: "active" }); // 占满
+    fp.setUserPinnedHost(53, "hPin");
+    const r = await pickHost({ userId: 53 });
+    assert.equal(r.row.id, "hOk");
+  });
+
+  test("pinned host 在 cooldown → fall-through(关键: 不能破坏瞬态故障自愈)", async () => {
+    fp.addHost(mkHost({ id: "hPin", name: "tk1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOk", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.setUserPinnedHost(54, "hPin");
+    markHostCooldown("hPin", 60_000);
+    const r = await pickHost({ userId: 54 });
+    assert.equal(r.row.id, "hOk");
+  });
+
+  test("pinned NULL → 维持原 sticky/least-loaded 行为", async () => {
+    fp.addHost(mkHost({ id: "hA", name: "n1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hB", name: "n2", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.setUserPinnedHost(55, null); // 显式 NULL
+    fp.addContainer({ user_id: 55, host_uuid: "hB", bound_ip: "172.30.2.10", state: "active" });
+    const r = await pickHost({ userId: 55 });
+    assert.equal(r.row.id, "hB"); // sticky
+  });
+
+  test("requireHostId 仍优先于 pinned(admin debug 最高级)", async () => {
+    fp.addHost(mkHost({ id: "hPin", name: "tk1", status: "ready", max_containers: 5 }));
+    fp.addHost(mkHost({ id: "hForce", name: "self", status: "ready", max_containers: 5 }));
+    fp.setUserPinnedHost(56, "hPin");
+    const r = await pickHost({ userId: 56, requireHostId: "hForce" });
+    assert.equal(r.row.id, "hForce");
+  });
+
+  test("opts.userId 不传 → 完全不查 pin", async () => {
+    fp.addHost(mkHost({ id: "hOnly", name: "self", status: "ready", max_containers: 5 }));
+    // 没设 pin,且不传 userId → least-loaded
+    const r = await pickHost({});
+    assert.equal(r.row.id, "hOnly");
   });
 });
 

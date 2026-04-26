@@ -72,6 +72,21 @@ const BOOTSTRAP_TOTAL_MS = 45 * 60_000;
  */
 const MASTER_BASELINE_BASE_URL = process.env.OPENCLAUDE_MASTER_BASELINE_BASE_URL ?? "";
 
+/**
+ * 远端 node-agent L7 anthropic 反代回连 master 的 mTLS URL。
+ * 配齐才会启用 D.1c 反代(同时写 internal_proxy_bind:<gw>:18791 + master_mtls_url
+ * 到 yaml,node-agent 启动后在 18791 监听 plain HTTP,反代 mTLS 到这里)。
+ * 空 → 不写这两行,node-agent 不启 internalproxy 模块(self-only / dev 兼容)。
+ * 实际部署时形如 "https://34.146.172.239:18443"。
+ */
+const MASTER_MTLS_URL = process.env.OPENCLAUDE_MASTER_MTLS_URL ?? "";
+
+/**
+ * node-agent internalproxy 监听端口。容器 ANTHROPIC_BASE_URL 指向 <gw>:18791
+ * (v3supervisor.ts 里也是同一常量),因此两边必须对齐。
+ */
+const NODE_AGENT_INTERNAL_PROXY_PORT = 18791;
+
 /** node-agent 本地 baseline 落盘位置(跟 baseline.go BaselineDir 对齐)。 */
 const REMOTE_BASELINE_VERSION_FILE = "/var/lib/openclaude/baseline/.version";
 
@@ -321,6 +336,10 @@ async function deployNodeAgent(
   const gw = computeGatewayIp(cidr);
 
   // 写 config yaml
+  // D.1c 反代:仅当 OPENCLAUDE_MASTER_MTLS_URL 配齐时一并写 internal_proxy_bind +
+  // master_mtls_url 两行。config.go Validate 要求两者要么都有要么都空,任何一边
+  // 单独写都会让 node-agent 启动失败。
+  const masterMtlsUrl = MASTER_MTLS_URL.trim();
   const cfgYaml = [
     `host_uuid: ${row.id}`,
     `bind: "0.0.0.0:${agentPort}"`,
@@ -331,6 +350,12 @@ async function deployNodeAgent(
     `docker_bridge: "openclaude-br0"`,
     `bridge_cidr: "${cidr}"`,
     `proxy_bind: "${gw}:3128"`,
+    ...(masterMtlsUrl
+      ? [
+          `internal_proxy_bind: "${gw}:${NODE_AGENT_INTERNAL_PROXY_PORT}"`,
+          `master_mtls_url: "${masterMtlsUrl.replace(/"/g, "")}"`,
+        ]
+      : []),
     `master_hosts: []`, // 由调用方后续更新或者 admin UI 填写
     `egress_allow_hosts: []`,
     `docker_bin: "docker"`,
