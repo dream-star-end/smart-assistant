@@ -40,6 +40,7 @@ import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
 import { isInMaintenance } from "../middleware/maintenanceMode.js";
+import type { NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 
 // ---------- 协议 / 常量 -----------------------------------------------------
 
@@ -62,8 +63,10 @@ export const CLOSE_BRIDGE = {
 /** 入站 / 出站 帧的最大字节数(单帧)。
  * 前端允许附件单文件 200 MiB / 总量 300 MiB (raw),一条 inbound.message 帧一次性打包全部 media,
  * base64 膨胀 4/3 ≈ 400 MiB + JSON/dataURL prefix/文件名 envelope → 448 MiB 圆整。
- * 早期 1 MiB / 80 MiB 会让大附件被 ws 库 Receiver 以 RangeError 直接关连接,消息到不了业务层。 */
-const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
+ * 早期 1 MiB / 80 MiB 会让大附件被 ws 库 Receiver 以 RangeError 直接关连接,消息到不了业务层。
+ *
+ * 导出供 index.ts 装配 createTunnelContainerSocket 时复用,避免两处 magic number 漂移。 */
+export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 
 /** 单方向 buffer 上限。超出 = 慢消费者 / 死循环 → close。 */
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
@@ -113,6 +116,22 @@ export type ResolveContainerEndpoint = (
    * v3 supervisor 路径会填上。缺失时 bridge 不发活动信号(语义降级)。
    */
   containerId?: number;
+  /**
+   * 跨 host 路由信号:set 表示这个容器在远端 host(boundIp/port 不可直达),
+   * bridge 必须经 node-agent tunnel 拉 WS。`nodeAgent` 是为本次 bridge 建链
+   * 重新 hydrate 的 NodeAgentTarget(短生命周期,bridge 用完就丢) — 不要复用
+   * readiness 内部那份(那份 psk 探活完 fill(0) 了)。
+   *
+   * 未 set → bridge 直接 dial host:port(self-host / 单机 MVP 场景,行为不变)。
+   *
+   * 历史 bug(2026-04-26):没有这个字段时 bridge 对 remote-host 容器一直
+   * EHOSTUNREACH,readiness 通过后立即 4503 重连风暴。
+   */
+  tunnel?: {
+    hostId: string;
+    containerInternalId: string;
+    nodeAgent: NodeAgentTarget;
+  };
 }>;
 
 /**
@@ -194,9 +213,25 @@ export interface UserChatBridgeDeps {
   logger?: Logger;
   /**
    * 可选:覆盖容器 WS 客户端构造,主要给单测注入 ws.Server 双向 mock。
-   * 默认实现:`new WebSocket(\`ws://${host}:${port}/ws\`)`
+   * 默认实现:`new WebSocket(\`ws://${host}:${port}/ws\`)`。
+   * 仅用于 endpoint.tunnel **未** set 的情况(self-host / 单机 MVP)。
    */
   createContainerSocket?: (host: string, port: number, signal: AbortSignal) => WebSocket;
+  /**
+   * 必选(若任何 endpoint 可能返回 tunnel):跨 host 路径下从 node-agent tunnel 拉
+   * 容器 WS。default 装配在 commercial/src/index.ts;单测可注入 mock。
+   *
+   * async 是因为内部要先 await 完 mTLS+pin TLS 握手才能把 socket 交给 ws 库
+   * (避免在 cert 校验未完成时把 PSK 写出去)。bridge 在 await 期间继续接早到帧。
+   *
+   * 抛错或返 reject 都视作"容器不可达",bridge close(1011)。endpoint.tunnel 已
+   * set 但本字段未注入 → 同样按"容器不可达"处理(见 handleUpgrade)。
+   */
+  createTunnelContainerSocket?: (
+    tunnel: { hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget },
+    containerPort: number,
+    signal: AbortSignal,
+  ) => Promise<WebSocket>;
   /**
    * 可选:每收到一帧 client→container 消息时调用,用于刷 last_ws_activity。
    *
@@ -429,7 +464,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
 
         // 2) 解析容器端点(ensureRunning)
-        let endpoint: { host: string; port: number; containerId?: number };
+        let endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>;
         try {
           endpoint = await deps.resolveContainerEndpoint(uid);
         } catch (err) {
@@ -453,18 +488,58 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return;
         }
 
-        // 3) 把"早到帧"还回来 + 解绑 early handlers,然后开始正式桥接
-        ws.off("message", onEarlyMessage);
-        ws.off("close", onEarlyClose);
-        if (earlyClose !== null) {
-          // 客户端在 await 期间已经撤了
-          log?.info("user-chat-bridge: client closed during ensure", {
+        // 3) 构造容器 WS — direct(sync)或 tunnel(async pre-dial mTLS+pin)。
+        //    早到帧 handler 故意保留挂着,等真正进 startBridge 才解绑;async 拨号期间
+        //    用户继续发的帧会进 pendingMessages,startBridge 内 replay。
+        const connectAbort = new AbortController();
+        let containerWs: WebSocket;
+        try {
+          if (endpoint.tunnel) {
+            if (!deps.createTunnelContainerSocket) {
+              // 部署级配置漏注 — 给 4503 让前端别死循环重连(会上报 alert 由 ensureRunning 路径)
+              log?.error("user-chat-bridge: tunnel endpoint but factory not injected", {
+                uid: uid.toString(),
+                hostId: endpoint.tunnel.hostId,
+                containerInternalId: endpoint.tunnel.containerInternalId,
+              });
+              sendErrorFrame(ws, "ERR_INTERNAL", "tunnel not configured");
+              try { ws.close(CLOSE_BRIDGE.INTERNAL, "tunnel not configured"); } catch { /* */ }
+              return;
+            }
+            containerWs = await deps.createTunnelContainerSocket(
+              endpoint.tunnel,
+              endpoint.port,
+              connectAbort.signal,
+            );
+          } else {
+            containerWs = createContainerSocket(endpoint.host, endpoint.port, connectAbort.signal);
+          }
+        } catch (err) {
+          log?.error("user-chat-bridge: container socket factory failed", {
             uid: uid.toString(),
+            tunnel: !!endpoint.tunnel,
+            hostId: endpoint.tunnel?.hostId,
+            err,
           });
+          sendErrorFrame(ws, "ERR_CONTAINER", "cannot connect");
+          try { ws.close(CLOSE_BRIDGE.INTERNAL, "agent unavailable"); } catch { /* */ }
           return;
         }
 
-        startBridge(ws, uid, endpoint, pendingMessages, endpoint.containerId);
+        // 4) 把"早到帧"解绑 + 检查客户端是否已撤,再交给 startBridge
+        ws.off("message", onEarlyMessage);
+        ws.off("close", onEarlyClose);
+        if (earlyClose !== null) {
+          // 客户端在 await 期间(ensureRunning 或 tunnel pre-dial)已经撤了
+          log?.info("user-chat-bridge: client closed during ensure", {
+            uid: uid.toString(),
+          });
+          try { containerWs.terminate(); } catch { /* */ }
+          try { connectAbort.abort(); } catch { /* */ }
+          return;
+        }
+
+        startBridge(ws, uid, endpoint, pendingMessages, endpoint.containerId, containerWs, connectAbort);
       })().catch((err: unknown) => {
         log?.error("user-chat-bridge: upgrade pipeline threw", { err });
         try { ws.close(CLOSE_BRIDGE.INTERNAL, "internal error"); } catch { /* */ }
@@ -483,7 +558,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 路径填,test mock 路径可不填。无值或 deps.markContainerActivity 未注入
      * → 不刷活动(等价于回到本 PR 之前的行为,只在 ensureRunning 刷一次)。
      */
-    containerId?: number,
+    containerId: number | undefined,
+    /**
+     * 已构造好的容器侧 WS(direct 或 tunnel)。caller 在 handleUpgrade 内
+     * 完成构造,把成功品交给本函数;失败品 caller 自己 close,不进 bridge。
+     */
+    containerWs: WebSocket,
+    /**
+     * caller 持有的 abort controller(同 createXxxContainerSocket 收到的 signal)。
+     * cleanup 时调 abort() — 让 tunnel WS 在握手阶段 abort 也能被打断。
+     */
+    connectAbort: AbortController,
   ): void {
     const connId = randomUUID();
     const startedAt = Date.now();
@@ -512,26 +597,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     };
     const { unregister } = registry.register(conn);
 
-    // 容器侧 WS。abort signal 给 createContainerSocket 在 connect 阶段中断。
-    // uidToUserWs 的 add 放在 createContainerSocket 之后 —— 同步抛错路径只需 unregister(),
-    // 不用再走 uid→ws 清理分支,避免遗漏清理造成 broadcastToUser 向 CLOSED ws 发送垃圾。
-    const connectAbort = new AbortController();
-    let containerWs: WebSocket;
-    try {
-      containerWs = createContainerSocket(endpoint.host, endpoint.port, connectAbort.signal);
-    } catch (err) {
-      log?.error("user-chat-bridge: createContainerSocket threw", {
-        uid: uid.toString(), connId, err,
-      });
-      cause = "container_error";
-      sendErrorFrame(userWs, "ERR_CONTAINER", "cannot connect");
-      try { userWs.close(CLOSE_BRIDGE.INTERNAL, "agent unavailable"); } catch { /* */ }
-      unregister();
-      return;
-    }
-
     // 同步加入 uid→ws 表,broadcastToUser 用得到。cleanup 里务必同步删除。
-    // 放在 container socket 成功构造之后:createContainerSocket 即使抛同步错也不会污染表。
     {
       const key = uid.toString();
       let set = uidToUserWs.get(key);

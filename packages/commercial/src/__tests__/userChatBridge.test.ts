@@ -609,3 +609,155 @@ describe("userChatBridge — markContainerActivity (PR1 idle hibernate 前置)",
     await stopRig(rig);
   });
 });
+
+// ------- regression:跨 host tunnel 路由 ----------------------------------
+// 历史 bug(2026-04-26):endpoint 返回 tunnel 字段时,bridge 仍用默认
+// `new WebSocket(\`ws://${host}:${port}/ws\`)` 直接拨远端 docker bridge IP
+// → EHOSTUNREACH → 用户 ws 4503 重连风暴。修复后 bridge 必须走 tunnelFactory,
+// 绝不 dial endpoint.host。
+
+describe("userChatBridge — tunnel routing (regression)", () => {
+  test("endpoint.tunnel set → 调 tunnelFactory,不 dial endpoint.host", async () => {
+    // mock 容器 ws server(只为给 tunnelFactory 返回一个真 ws)
+    const containerWss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((r) => containerWss.once("listening", () => r()));
+    const containerPort = (containerWss.address() as { port: number }).port;
+    const containerSeen: Array<{ data: string | Buffer; isBinary: boolean }> = [];
+    containerWss.on("connection", (ws) => {
+      ws.on("message", (data, isBinary) => {
+        const buf = typeof data === "string" ? data
+          : Buffer.isBuffer(data) ? data : Buffer.concat(data as Buffer[]);
+        containerSeen.push({ data: buf, isBinary });
+      });
+    });
+
+    let directDialed = false;
+    const tunnelCalls: Array<{
+      hostId: string; containerInternalId: string; port: number;
+    }> = [];
+
+    const fakeNodeAgent = {
+      hostId: "host-remote",
+      host: "10.0.0.42",      // 远端,实际不会被 dial(tunnelFactory 内部 mock)
+      agentPort: 9443,
+      expectedFingerprint: null,
+      psk: null,
+    };
+
+    const bridge = createUserChatBridge({
+      jwtSecret: JWT_SECRET,
+      resolveContainerEndpoint: async () => ({
+        // host/port 是远端 docker bridge — 若 bridge 错误地直连这里就 EHOSTUNREACH;
+        // tunnelFactory 路径下应该被忽略
+        host: "172.30.99.99",
+        port: 18789,
+        containerId: 1,
+        tunnel: {
+          hostId: "host-remote",
+          containerInternalId: "deadbeef" + "0".repeat(56),
+          nodeAgent: fakeNodeAgent,
+        },
+      }),
+      // direct 工厂:若被调到就标记 + dial 一个不存在的端口 → 测试断言 directDialed === false
+      createContainerSocket: (host, port, _signal) => {
+        directDialed = true;
+        // 返回一个不会 connect 的 ws,避免污染 mock 容器
+        return new WebSocket(`ws://127.0.0.1:1/__should-not-be-called__`);
+      },
+      // tunnel 工厂:实际就连本地 mock 容器 ws,把 hostId/cid/port 记下来给断言
+      createTunnelContainerSocket: async (tunnel, port, _signal) => {
+        tunnelCalls.push({
+          hostId: tunnel.hostId,
+          containerInternalId: tunnel.containerInternalId,
+          port,
+        });
+        return new WebSocket(`ws://127.0.0.1:${containerPort}/ws`);
+      },
+      containerConnectTimeoutMs: 1500,
+    });
+
+    const gateway = http.createServer((_, res) => res.end());
+    gateway.on("upgrade", (req, socket, head) => {
+      if (!bridge.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    await new Promise<void>((r) => gateway.listen(0, "127.0.0.1", () => r()));
+    const gatewayPort = (gateway.address() as { port: number }).port;
+
+    try {
+      const token = await makeJwt("777");
+      const ws = openClient(gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+
+      // 等容器 ws 真连上(说明 tunnel 工厂返回的 ws 确实在跑)
+      await new Promise<void>((r, j) => {
+        const t = setTimeout(() => j(new Error("container never connected")), 1500);
+        containerWss.once("connection", () => { clearTimeout(t); r(); });
+      });
+      // 发一帧验证整条链通
+      ws.send(JSON.stringify({ type: "ping" }));
+      // 等 mock 容器收到
+      const start = Date.now();
+      while (containerSeen.length === 0 && Date.now() - start < 1500) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      assert.equal(directDialed, false,
+        "tunnel endpoint 时绝不能调 createContainerSocket(直连远端 docker bridge IP 必 EHOSTUNREACH)");
+      assert.equal(tunnelCalls.length, 1, "tunnel 工厂应被调一次");
+      assert.equal(tunnelCalls[0]!.hostId, "host-remote");
+      assert.equal(tunnelCalls[0]!.port, 18789);
+      assert.ok(tunnelCalls[0]!.containerInternalId.startsWith("deadbeef"));
+      assert.equal(containerSeen.length, 1, "用户帧应通过 tunnel 工厂的 ws 传到容器");
+
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await bridge.shutdown();
+      await new Promise<void>((r) => containerWss.close(() => r()));
+      await new Promise<void>((r) => gateway.close(() => r()));
+    }
+  });
+
+  test("endpoint.tunnel set 但 createTunnelContainerSocket 未注入 → close(1011)", async () => {
+    const fakeNodeAgent = {
+      hostId: "host-remote",
+      host: "10.0.0.42",
+      agentPort: 9443,
+      expectedFingerprint: null,
+      psk: null,
+    };
+
+    const bridge = createUserChatBridge({
+      jwtSecret: JWT_SECRET,
+      resolveContainerEndpoint: async () => ({
+        host: "172.30.99.99",
+        port: 18789,
+        tunnel: {
+          hostId: "host-remote",
+          containerInternalId: "abc123",
+          nodeAgent: fakeNodeAgent,
+        },
+      }),
+      // 故意不注入 createTunnelContainerSocket
+      containerConnectTimeoutMs: 1500,
+    });
+
+    const gateway = http.createServer((_, res) => res.end());
+    gateway.on("upgrade", (req, socket, head) => {
+      if (!bridge.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    await new Promise<void>((r) => gateway.listen(0, "127.0.0.1", () => r()));
+    const gatewayPort = (gateway.address() as { port: number }).port;
+
+    try {
+      const token = await makeJwt("888");
+      const ws = openClient(gatewayPort, token);
+      const closed = await waitClose(ws);
+      assert.equal(closed.code, CLOSE_BRIDGE.INTERNAL,
+        "tunnel endpoint 但工厂未注入 → close(1011) — 不能默默 fall back 到直连");
+    } finally {
+      await bridge.shutdown();
+      await new Promise<void>((r) => gateway.close(() => r()));
+    }
+  });
+});

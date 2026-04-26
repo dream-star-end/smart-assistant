@@ -691,24 +691,25 @@ export interface TunnelDialOptions {
 }
 
 /**
- * 建立到 node-agent 的 TLS socket,发原始 HTTP 请求,**不 hydrate body**。
- * 专给 bridge WS 代理 + readiness 探活用:调用方拿到 TLS socket 后
- * 自行读 raw 字节(WS handshake 101 + 后续帧 bi-di 透传)。
+ * 建立到 node-agent 的 mTLS+pin TLS socket,**不**写任何 HTTP request line。
  *
- * TLS 握手完成后同样做 cert SAN + fingerprint 校验。
+ * 用途:bridge tunnel WS factory(`createTunnelContainerSocket`)需要把 socket
+ * 交给 ws@8.20 client,让 ws 库自己组 `GET /tunnel/.../ws ... HTTP/1.1` + WS
+ * upgrade headers。我们只负责"安全建链"那一段:CA 链 + SPIFFE URI + 指纹 pin
+ * 全部通过后才返回。pre-dial 完成,后续 PSK Authorization 头才会上线 — 避免
+ * 在 cert 校验未完成时把 PSK 写出去的 TOCTOU。
  *
- * 生命周期:返回的 socket 关闭由调用方负责。出错路径 caller 可捕获后自行决定。
+ * 失败路径:任一阶段 reject 都会先清 listener 并 destroy socket(不留半开链)。
  */
-export async function dialTunnelSocket(
-  opts: TunnelDialOptions,
+export async function dialNodeAgentVerifiedTls(
+  target: NodeAgentTarget,
 ): Promise<TLSSocket> {
   const master = await getMasterTls();
-  const t = opts.target;
 
   const socket: TLSSocket = await new Promise((resolve, reject) => {
     const s = tlsConnect({
-      host: t.host,
-      port: t.agentPort,
+      host: target.host,
+      port: target.agentPort,
       ca: master.ca,
       cert: master.cert,
       key: master.key,
@@ -717,26 +718,60 @@ export async function dialTunnelSocket(
       checkServerIdentity: () => undefined,
       servername: "node-agent",
     });
-    const handshakeTimer = setTimeout(() => {
-      s.destroy();
-      reject(new AgentUnreachableError(t.hostId, "tls handshake timeout"));
-    }, TLS_HANDSHAKE_TIMEOUT_MS);
-    s.once("secureConnect", () => {
+    let settled = false;
+    const cleanup = (): void => {
+      s.removeListener("secureConnect", onConnect);
+      s.removeListener("error", onError);
       clearTimeout(handshakeTimer);
+    };
+    const onConnect = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve(s);
-    });
-    s.once("error", (err) => {
-      clearTimeout(handshakeTimer);
-      reject(new AgentUnreachableError(t.hostId, `tls connect failed: ${err.message}`));
-    });
+    };
+    const onError = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try { s.destroy(); } catch { /* */ }
+      reject(new AgentUnreachableError(target.hostId, `tls connect failed: ${err.message}`));
+    };
+    const handshakeTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try { s.destroy(); } catch { /* */ }
+      reject(new AgentUnreachableError(target.hostId, "tls handshake timeout"));
+    }, TLS_HANDSHAKE_TIMEOUT_MS);
+    s.once("secureConnect", onConnect);
+    s.once("error", onError);
   });
 
   try {
-    await verifyServerCert(socket, t.hostId, t.expectedFingerprint);
+    await verifyServerCert(socket, target.hostId, target.expectedFingerprint);
   } catch (e) {
-    socket.destroy();
+    try { socket.destroy(); } catch { /* */ }
     throw e;
   }
+
+  return socket;
+}
+
+/**
+ * 建立到 node-agent 的 TLS socket,发原始 HTTP 请求,**不 hydrate body**。
+ * 专给 readiness 探活用(状态行直接读返回,不走 ws 库帧解析)。
+ *
+ * TLS 握手 + cert SAN + fingerprint 校验复用 `dialNodeAgentVerifiedTls`;
+ * 本函数只在其上多写一段 HTTP/1.1 起始行 + headers。
+ *
+ * 生命周期:返回的 socket 关闭由调用方负责。出错路径 caller 可捕获后自行决定。
+ */
+export async function dialTunnelSocket(
+  opts: TunnelDialOptions,
+): Promise<TLSSocket> {
+  const t = opts.target;
+  const socket = await dialNodeAgentVerifiedTls(t);
 
   // 发 HTTP 请求起始行 + headers
   const target = `/tunnel/containers/${encodeURIComponent(opts.containerInternalId)}${opts.pathAndQuery}`;

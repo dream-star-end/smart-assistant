@@ -56,10 +56,12 @@ import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import {
   createUserChatBridge,
   ContainerUnreadyError,
+  DEFAULT_MAX_FRAME_BYTES,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
   type BridgeMetricSink,
 } from "./ws/userChatBridge.js";
+import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
   DEFAULT_V3_CCB_BASELINE_DIR,
   resolveCcbBaselineMounts,
@@ -1056,6 +1058,13 @@ export async function registerCommercial(
     resolveContainerEndpoint,
     metrics: bridgeMetrics,
     markContainerActivity: markActivityForBridge,
+    // 跨 host 容器:bridge 用 node-agent tunnel 拉容器 WS(direct dial 必然 EHOSTUNREACH)。
+    // 工厂内部走 mTLS+pin 预拨 + ws.createConnection hijack;maxFrameBytes 与 bridge 默认对齐
+    // (factory 内会用同一上限;不显式传则 ws 默认无限,有 OOM 风险)。
+    createTunnelContainerSocket: (tunnel, port, signal) =>
+      createTunnelContainerSocket(tunnel.nodeAgent, tunnel.containerInternalId, port, signal, {
+        maxFrameBytes: DEFAULT_MAX_FRAME_BYTES,
+      }),
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),

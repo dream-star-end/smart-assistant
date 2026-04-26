@@ -54,6 +54,7 @@ import {
 import { schedule as schedulePlacement, type SchedulePlacement } from "../compute-pool/nodeScheduler.js";
 import { NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/types.js";
 import { getHostById } from "../compute-pool/queries.js";
+import { hostRowToTarget, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
@@ -112,14 +113,30 @@ export interface EnsureRunningOptions {
   sleep?: (ms: number) => Promise<void>;
   /** 测试钩子:可注入"现在是几号"用于 timeout 计算 */
   now?: () => number;
+  /**
+   * 测试钩子:跨 host 路径下用 hostId hydrate NodeAgentTarget(给 bridge 用)。
+   * 默认实现:`getHostById` + `hostRowToTarget`。生产代码不必传。
+   *
+   * 重要:这个 target 的 psk 由 caller(bridge)持有,**不能**复用 readiness 那个
+   * (waitContainerReady 在 finally 段 fill(0))。所以这里每次都现 hydrate 新 target。
+   */
+  resolveBridgeTunnelTarget?: (hostId: string) => Promise<NodeAgentTarget>;
+}
+
+/**
+ * 容器是否在 remote host(非自己) — readiness + bridge 共用判定,SSOT。
+ *
+ *   - hostId 为 null(单机 MVP 遗留行)→ false
+ *   - selfHostId 未注入(MVP 部署)→ false(即使 hostId 非 null,也只能按本机处理)
+ *   - hostId === selfHostId → false
+ *   - 其余 → true
+ */
+function isRemoteHost(hostId: string | null, selfHostId: string | undefined): boolean {
+  return !!(hostId && selfHostId && hostId !== selfHostId);
 }
 
 /**
  * B.4:根据 hostId vs selfHostId 选 direct / node-tunnel readiness endpoint。
- *
- *   - hostId 为 null(单机 MVP 遗留行)或 hostId === selfHostId → direct
- *   - hostId 非 null 且 !== selfHostId 且 selfHostId 存在 → node-tunnel
- *   - selfHostId 未注入(MVP 部署)→ 永远 direct(即使 hostId 非 null,也只能按本机处理)
  */
 function chooseReadinessEndpoint(
   hostId: string | null,
@@ -128,10 +145,42 @@ function chooseReadinessEndpoint(
   port: number,
   containerInternalId: string,
 ): ReadinessEndpoint {
-  if (hostId && selfHostId && hostId !== selfHostId) {
-    return { kind: "node-tunnel", hostId, containerInternalId };
+  if (isRemoteHost(hostId, selfHostId)) {
+    return { kind: "node-tunnel", hostId: hostId as string, containerInternalId };
   }
   return { kind: "direct", host: boundIp, port };
+}
+
+/**
+ * 跨 host 容器:为 bridge hydrate 一份新 NodeAgentTarget。同 host / 单机直连 → undefined。
+ *
+ * 失败语义:
+ *   - host 行从 DB 消失(extreme race)→ ContainerUnreadyError("host_gone"),前端短重试
+ *   - resolveTarget 抛(典型:psk 解密失败)→ 透传,被 bridge 兜底为 1011
+ *
+ * caller(bridge)拿到 NodeAgentTarget 后立即用于 createTunnelContainerSocket;
+ * 那个工厂内部 .toString("hex") 拷一份给 ws header,然后 fill(0) 清原 Buffer
+ * (匹配 readiness finally 的清零模式)。本函数不做 cleanup。
+ */
+async function buildBridgeTunnelIfRemote(
+  hostId: string | null,
+  selfHostId: string | undefined,
+  containerInternalId: string,
+  resolveTarget: (hostId: string) => Promise<NodeAgentTarget>,
+): Promise<{ hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget } | undefined> {
+  if (!isRemoteHost(hostId, selfHostId)) return undefined;
+  const id = hostId as string;
+  const nodeAgent = await resolveTarget(id);
+  return { hostId: id, containerInternalId, nodeAgent };
+}
+
+/** 默认 bridge tunnel target resolver:DB 查 + 解密 psk。 */
+async function defaultResolveBridgeTunnelTarget(hostId: string): Promise<NodeAgentTarget> {
+  const row = await getHostById(hostId);
+  if (!row) {
+    throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "host_gone");
+  }
+  return hostRowToTarget(row);
 }
 
 function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerReadyOptions {
@@ -170,10 +219,22 @@ function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerReadyOptio
 export function makeV3EnsureRunning(
   deps: V3SupervisorDeps,
   options: EnsureRunningOptions = {},
-): (uid: bigint) => Promise<{ host: string; port: number; containerId: number }> {
+): (uid: bigint) => Promise<{
+  host: string;
+  port: number;
+  containerId: number;
+  tunnel?: { hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget };
+}> {
   const readinessOpts = buildReadinessOpts(options);
+  const resolveBridgeTunnelTarget =
+    options.resolveBridgeTunnelTarget ?? defaultResolveBridgeTunnelTarget;
 
-  return async function ensureRunning(uidBig: bigint): Promise<{ host: string; port: number; containerId: number }> {
+  return async function ensureRunning(uidBig: bigint): Promise<{
+    host: string;
+    port: number;
+    containerId: number;
+    tunnel?: { hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget };
+  }> {
     // bigint → number,显式 guard(>2^53 不会发生,MVP 用户量 < 1k,但守住)
     if (uidBig <= 0n || uidBig > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new ContainerUnreadyError(60, "invalid_uid");
@@ -203,7 +264,19 @@ export function makeV3EnsureRunning(
       // 3F: 用户重连即视作活跃 — 刷新 last_ws_activity,推迟 idle sweep。
       // 不 await 失败、也不阻塞 caller(markV3ContainerActivity 自吞错)。
       void markV3ContainerActivity(deps, status.containerId);
-      return { host: status.boundIp, port: status.port, containerId: status.containerId };
+      // 跨 host 容器:为 bridge hydrate 一份 NodeAgentTarget(readiness 那份 psk 已被 fill(0))。
+      const tunnel = await buildBridgeTunnelIfRemote(
+        status.hostId,
+        deps.selfHostId,
+        status.dockerContainerId,
+        resolveBridgeTunnelTarget,
+      );
+      return {
+        host: status.boundIp,
+        port: status.port,
+        containerId: status.containerId,
+        ...(tunnel ? { tunnel } : {}),
+      };
     }
 
     // 2b) stopped(active 行 + container_internal_id 已写但容器没 Running)
@@ -325,7 +398,19 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "starting");
     }
 
-    return { host: provisioned.boundIp, port: provisioned.port, containerId: provisioned.containerId };
+    // 跨 host 容器:为 bridge hydrate 一份 NodeAgentTarget(同 running 路径)。
+    const tunnel = await buildBridgeTunnelIfRemote(
+      provisioned.hostId,
+      deps.selfHostId,
+      provisioned.dockerContainerId,
+      resolveBridgeTunnelTarget,
+    );
+    return {
+      host: provisioned.boundIp,
+      port: provisioned.port,
+      containerId: provisioned.containerId,
+      ...(tunnel ? { tunnel } : {}),
+    };
   };
 }
 
