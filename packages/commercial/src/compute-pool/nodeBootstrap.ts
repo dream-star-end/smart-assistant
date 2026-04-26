@@ -42,6 +42,7 @@ import {
   type SshTarget,
 } from "./sshExec.js";
 import { streamImageToHost, ImageDistributeError } from "./imageDistribute.js";
+import { chooseMasterMtlsUrl } from "./master-mtls-url.js";
 
 const log = rootLogger.child({ subsys: "node-bootstrap" });
 
@@ -80,6 +81,15 @@ const MASTER_BASELINE_BASE_URL = process.env.OPENCLAUDE_MASTER_BASELINE_BASE_URL
  * 实际部署时形如 "https://34.146.172.239:18443"。
  */
 const MASTER_MTLS_URL = process.env.OPENCLAUDE_MASTER_MTLS_URL ?? "";
+
+/**
+ * 同 VPC 内 worker 回连 master 的 mTLS URL(私网 IP 形式)。
+ * 配齐才启用智能选择;空 → 所有 host 都走 MASTER_MTLS_URL(向后兼容)。
+ * GCE / AWS / Azure 等云不允许同 VPC 实例通过外网 IP 互通,VPC 内 worker
+ * 必须走 master 的内网 IP。判断依据 = compute_hosts.host 是否 RFC1918 私网。
+ * 实际部署形如 "https://10.146.0.2:18443"。
+ */
+const MASTER_MTLS_URL_INTERNAL = process.env.OPENCLAUDE_MASTER_MTLS_URL_INTERNAL ?? "";
 
 /**
  * node-agent internalproxy 监听端口。容器 ANTHROPIC_BASE_URL 指向 <gw>:18791
@@ -339,7 +349,13 @@ async function deployNodeAgent(
   // D.1c 反代:仅当 OPENCLAUDE_MASTER_MTLS_URL 配齐时一并写 internal_proxy_bind +
   // master_mtls_url 两行。config.go Validate 要求两者要么都有要么都空,任何一边
   // 单独写都会让 node-agent 启动失败。
-  const masterMtlsUrl = MASTER_MTLS_URL.trim();
+  // 智能选择:VPC 内私网 worker 用内网 URL,VPC 外 worker 用外网 URL。
+  // 两个 env 先 trim,避免误设成纯空格时内部判断不空但下游为空导致跳过 mTLS 配置写入。
+  const masterMtlsUrl = chooseMasterMtlsUrl({
+    targetHost: row.host,
+    defaultUrl: MASTER_MTLS_URL.trim(),
+    internalUrl: MASTER_MTLS_URL_INTERNAL.trim(),
+  });
   const cfgYaml = [
     `host_uuid: ${row.id}`,
     `bind: "0.0.0.0:${agentPort}"`,
