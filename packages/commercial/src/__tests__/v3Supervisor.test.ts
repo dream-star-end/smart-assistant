@@ -266,6 +266,7 @@ class FakePool {
               port: r.port,
               container_internal_id: r.container_internal_id,
               host_uuid: r.host_uuid,
+              created_at: r.created_at,
             }],
           };
         }
@@ -846,7 +847,7 @@ describe("getV3ContainerStatus", () => {
     assert.equal(r!.state, "missing");
   });
 
-  test("active row 但 container_internal_id 为 NULL → state='stopped'(provision 中间窗口)", async () => {
+  test("active row 但 container_internal_id 为 NULL + age<15s → state='stopped'(commit 后极短窗口 grace)", async () => {
     const { docker } = makeDocker();
     const pool = new FakePool();
     pool.rows.push({
@@ -868,6 +869,34 @@ describe("getV3ContainerStatus", () => {
     );
     assert.ok(r);
     assert.equal(r!.state, "stopped");
+    assert.equal(r!.dockerContainerId, "");
+  });
+
+  test("active row + container_internal_id NULL + age>=15s → state='missing'(孤儿 row 自愈,v1.0.8)", async () => {
+    const { docker } = makeDocker();
+    const pool = new FakePool();
+    // row 1120-style 孤儿:created_at 30s 之前,container_internal_id 仍 NULL
+    // → 不可能是合法 in-flight provision,视作 missing,让 ensureRunning 走
+    //   stopAndRemove + re-provision 自愈,而不是死在 "stopped" 5s 重连循环。
+    pool.rows.push({
+      id: 1,
+      user_id: 5,
+      host_uuid: null,
+      bound_ip: "172.30.12.13",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: null,
+      last_ws_activity: new Date(),
+      created_at: new Date(Date.now() - 30_000),
+      updated_at: new Date(Date.now() - 30_000),
+    });
+    const r = await getV3ContainerStatus(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      5,
+    );
+    assert.ok(r);
+    assert.equal(r!.state, "missing");
     assert.equal(r!.dockerContainerId, "");
   });
 });
@@ -1798,5 +1827,101 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
     } finally {
       b.cleanup();
     }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  v1.0.8 — RemoteContractViolation 守门:node-agent 返回空 containerInternalId
+//  防止孤儿 row(state='active' + container_internal_id IS NULL)入库,根因
+//  覆盖 v1.0.7 报告的 "5秒后重连" 死循环 bug。
+// ───────────────────────────────────────────────────────────────────────
+
+describe("provisionV3Container — RemoteContractViolation 守门(v1.0.8)", () => {
+  let prevOptional: string | undefined;
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
+
+  // 远端路径需要 hostId !== selfHostId + containerService 注入,触发 useRemote=true 分支。
+  const SELF_HOST = "00000000-0000-0000-0000-00000000aaaa";
+  const REMOTE_HOST = "00000000-0000-0000-0000-00000000bbbb";
+
+  function makeStubContainerService(createAndStartReturn: unknown) {
+    return {
+      ensureVolume: async () => undefined,
+      removeVolume: async () => undefined,
+      inspectVolume: async () => ({ exists: true }),
+      createAndStart: async () => createAndStartReturn as { containerInternalId: string },
+      stop: async () => undefined,
+      remove: async () => undefined,
+      inspect: async () => {
+        throw new Error("unused in test");
+      },
+      isRemote: async () => true,
+      resolveBaselinePaths: async () => ({
+        claudeMdHostPath: "/var/lib/openclaude/baseline/CLAUDE.md",
+        skillsDirHostPath: "/var/lib/openclaude/baseline/skills",
+      }),
+    };
+  }
+
+  async function runRemoteProvisionExpectViolation(badReturn: unknown): Promise<{ pool: FakePool; err: Error }> {
+    const { docker } = makeDocker();
+    const pool = new FakePool();
+    const containerService = makeStubContainerService(badReturn);
+    let caught: Error | undefined;
+    try {
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          containerService: containerService as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+          selfHostId: SELF_HOST,
+          randomIp: () => "172.30.42.42",
+          randomSecret: fixedSecret("a".repeat(64)),
+        },
+        88,
+        REMOTE_HOST,
+      );
+    } catch (e) {
+      caught = e as Error;
+    }
+    assert.ok(caught, "expected provisionV3Container to throw");
+    return { pool, err: caught! };
+  }
+
+  test("createAndStart 返回 {containerInternalId: ''} → RemoteContractViolation + ROLLBACK", async () => {
+    const { pool, err } = await runRemoteProvisionExpectViolation({ containerInternalId: "" });
+    assert.ok(err instanceof SupervisorError);
+    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
+    // 关键断言:事务必须 ROLLBACK,不能 COMMIT(否则就是又一个孤儿 row)
+    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+  });
+
+  test("createAndStart 返回 {containerInternalId: undefined} → RemoteContractViolation + ROLLBACK", async () => {
+    const { pool, err } = await runRemoteProvisionExpectViolation({ containerInternalId: undefined });
+    assert.ok(err instanceof SupervisorError);
+    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
+    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+  });
+
+  test("createAndStart 返回 null(整个响应缺失)→ RemoteContractViolation + ROLLBACK", async () => {
+    const { pool, err } = await runRemoteProvisionExpectViolation(null);
+    assert.ok(err instanceof SupervisorError);
+    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
+    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+  });
+
+  test("createAndStart 返回 {containerInternalId: '   '} (纯空白) → RemoteContractViolation + ROLLBACK", async () => {
+    const { pool, err } = await runRemoteProvisionExpectViolation({ containerInternalId: "   " });
+    assert.ok(err instanceof SupervisorError);
+    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
+    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
   });
 });

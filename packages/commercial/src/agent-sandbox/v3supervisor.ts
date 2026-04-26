@@ -1255,8 +1255,25 @@ export async function provisionV3Container(
       };
       try {
         const r = await deps.containerService!.createAndStart(hostId!, spec);
+        // v1.0.8 守门:node-agent 协议要求 containerInternalId 是非空字符串。
+        // 一旦返回 undefined / null / "" / 空白 / 整个 r 为 null,以前会让
+        // createdDockerId="" 并继续 UPDATE → COMMIT 一行 container_internal_id IS NULL
+        // 的"孤儿 row",后续 getV3ContainerStatus 把它当 "stopped" 卡用户死循环重连。
+        // 这里抛 RemoteContractViolation → 走 catch → ROLLBACK,孤儿不入库。
+        if (
+          !r ||
+          typeof r.containerInternalId !== "string" ||
+          r.containerInternalId.trim().length === 0
+        ) {
+          throw new SupervisorError(
+            "RemoteContractViolation",
+            `node-agent createAndStart returned empty containerInternalId (host=${hostId})`,
+          );
+        }
         createdDockerId = r.containerInternalId;
       } catch (err) {
+        // RemoteContractViolation 已经是 SupervisorError,不再 wrap;dockerErr 才 wrap。
+        if (err instanceof SupervisorError) throw err;
         throw wrapDockerError(err);
       }
     } else {
@@ -1540,12 +1557,13 @@ export async function getV3ContainerStatus(
     port: number;
     container_internal_id: string | null;
     host_uuid: string | null;
+    created_at: Date;
   }>(
     // host(bound_ip): PG INET 类型 ::text 会带 /32 netmask(e.g. 172.30.227.97/32),
     // 这串拼进 ws://host:port/ws 会让 dns lookup 直接 fail,readiness probe 永远 false,
     // ensureRunning 路径表现为 4503 reason="starting" 死循环。host(inet) 只取地址本体,
     // 与 IPv4/IPv6 都兼容,与 provision 路径 INSERT 时传入的 JS string 一致。
-    `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id, host_uuid
+    `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id, host_uuid, created_at
        FROM agent_containers
       WHERE user_id = $1::bigint AND state='active'
       LIMIT 1`,
@@ -1554,14 +1572,26 @@ export async function getV3ContainerStatus(
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;
   if (!row.container_internal_id) {
-    // 行存在但 supervisor 还没填 container_internal_id —— 极短窗口,视作 stopped
+    // 行被外部 SELECT 看到 = 事务已 COMMIT;但 container_internal_id IS NULL 是
+    // 异常态(provisionV3Container 正常 COMMIT 都会 UPDATE container_internal_id)。
+    // 成因:
+    //   1) 远端 createAndStart 返回空 containerInternalId(v1.0.8 已被 RemoteContractViolation 守门)
+    //   2) 进程异常崩溃留下的边缘状态 / migration 前的旧数据
+    //
+    // 15s grace 仅遮蔽 commit 后极短窗口内并发 SELECT 的理论可能;真实跑这个分支
+    // 基本是孤儿。超 15s → 视作 missing,ensureRunning 自愈走 stopAndRemove +
+    // re-provision(stopAndRemoveV3Container 对 NULL container_internal_id 提前
+    // return,只翻 state='vanished',不动 docker)。
+    //
+    // 修复 v1.0.7 报告的死循环:row 1120 这种孤儿 row 让用户看到 "5秒后重连" 无穷循环。
+    const ageMs = Date.now() - new Date(row.created_at).getTime();
     return {
       containerId: Number.parseInt(row.id, 10),
       userId: Number.parseInt(row.user_id, 10),
       boundIp: row.bound_ip,
       port: row.port ?? V3_CONTAINER_PORT,
       dockerContainerId: "",
-      state: "stopped",
+      state: ageMs < 15_000 ? "stopped" : "missing",
       hostId: row.host_uuid,
     };
   }

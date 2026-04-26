@@ -150,4 +150,8 @@ export type SupervisorErrorCode =
   // 单宿主短期内大概率会再撞;由 v3ensureRunning 标 host 进 nodeScheduler cooldown,
   // 下次 retry 5s 后自然走另一台。区别于 NameConflict(同 uid 并发),后者仍走老路径。
   | "TransientHostFault"
+  // v1.0.8:node-agent /containers/run 返回 200 但 containerInternalId 为空/非字符串
+  // —— 协议违约。守门后 ROLLBACK 防止 agent_containers 行 commit 时 container_internal_id
+  // 为 NULL,继而被 getV3ContainerStatus 视作 "stopped" 卡住用户死循环重连。
+  | "RemoteContractViolation"
   | "Unknown";
