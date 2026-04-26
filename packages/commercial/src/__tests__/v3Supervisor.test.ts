@@ -38,7 +38,9 @@ import {
   resolveCcbBaselineMounts,
   V3_CCB_BASELINE_SKILL_NAMES,
   V3_NETWORK_NAME,
+  V3_GATEWAY_IP,
   V3_INTERNAL_PROXY_URL,
+  gatewayIpFromV3Cidr,
   V3_CONTAINER_PORT,
   V3_CONFIG_TMPFS_PATH,
   V3_VOLUME_MOUNT,
@@ -1902,6 +1904,8 @@ describe("provisionV3Container — RemoteContractViolation 守门(v1.0.8)", () =
         },
         88,
         REMOTE_HOST,
+        undefined,
+        "172.30.42.0/24",
       );
     } catch (e) {
       caught = e as Error;
@@ -1936,6 +1940,239 @@ describe("provisionV3Container — RemoteContractViolation 守门(v1.0.8)", () =
     const { pool, err } = await runRemoteProvisionExpectViolation({ containerInternalId: "   " });
     assert.ok(err instanceof SupervisorError);
     assert.equal((err as SupervisorError).code, "RemoteContractViolation");
+    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  per-host bridge gateway IP — fix for cross-host WS 1008 unauthorized
+//
+//  Bug 现象:test2 (tk1, bridge_cidr=172.30.2.0/24) / test3 (boheyun, 172.30.1.0/24)
+//  登录后 WS 立即 1008 close、前端弹"Token 失效"。根因:
+//    OPENCLAUDE_TRUST_BRIDGE_IP=V3_GATEWAY_IP("172.30.0.1")硬编码,远端容器
+//    实际看到的 source IP 是本机 bridge gateway(172.30.2.1 / 172.30.1.1)→
+//    mismatch → 走 token 校验 → master tunnel 不带 token → 1008。
+//  修复:gatewayIpFromV3Cidr(host.bridge_cidr) 计算 per-host 真实 .1。
+// ───────────────────────────────────────────────────────────────────────
+
+describe("gatewayIpFromV3Cidr — helper unit", () => {
+  test("X.Y.Z.0/24 → X.Y.Z.1", () => {
+    assert.equal(gatewayIpFromV3Cidr("172.30.0.0/24"), "172.30.0.1");
+    assert.equal(gatewayIpFromV3Cidr("172.30.1.0/24"), "172.30.1.1");
+    assert.equal(gatewayIpFromV3Cidr("172.30.2.0/24"), "172.30.2.1");
+    assert.equal(gatewayIpFromV3Cidr("10.99.5.0/24"), "10.99.5.1");
+  });
+
+  test("trim 前后空白", () => {
+    assert.equal(gatewayIpFromV3Cidr("  172.30.7.0/24\n"), "172.30.7.1");
+  });
+
+  test("形状不符 → InvalidArgument(防止真 CIDR 计算被静默接受)", () => {
+    const cases = [
+      "",
+      "not-a-cidr",
+      "172.30.0.0",                  // 缺 /24
+      "172.30.0.0/16",               // 错 prefix
+      "172.30.0.16/28",              // 错 prefix + 非 .0 base
+      "172.30.0.1/24",               // base 不是 .0
+      "172.30.0.0/24/extra",
+    ];
+    for (const c of cases) {
+      assert.throws(
+        () => gatewayIpFromV3Cidr(c),
+        (err: Error) => err instanceof SupervisorError && err.code === "InvalidArgument",
+        `expected InvalidArgument for cidr="${c}"`,
+      );
+    }
+  });
+
+  test("octet 越界 → InvalidArgument", () => {
+    // regex \d{1,3} 会接受 999;靠 Number 校验 0..255 兜底
+    assert.throws(
+      () => gatewayIpFromV3Cidr("999.30.0.0/24"),
+      (err: Error) => err instanceof SupervisorError && err.code === "InvalidArgument",
+    );
+    assert.throws(
+      () => gatewayIpFromV3Cidr("172.300.0.0/24"),
+      (err: Error) => err instanceof SupervisorError && err.code === "InvalidArgument",
+    );
+  });
+});
+
+describe("provisionV3Container — per-host bridge gateway env injection", () => {
+  let prevOptional: string | undefined;
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
+
+  const SELF_HOST = "00000000-0000-0000-0000-00000000aaaa";
+  const REMOTE_HOST = "00000000-0000-0000-0000-00000000bbbb";
+
+  // 远端路径 createAndStart 收的是 ContainerSpec(env 是 Record<string,string>),
+  // 不是 docker.createContainer 的 Env 数组。stub 把它捕获起来供断言查证。
+  function makeRemoteContainerService() {
+    const captured: { spec?: { env: Record<string, string>; binds?: unknown } } = {};
+    const svc = {
+      ensureVolume: async () => undefined,
+      removeVolume: async () => undefined,
+      inspectVolume: async () => ({ exists: true }),
+      createAndStart: async (_hostId: string, spec: { env: Record<string, string>; binds?: unknown }) => {
+        captured.spec = spec;
+        return { containerInternalId: "remote-cid-1" };
+      },
+      stop: async () => undefined,
+      remove: async () => undefined,
+      inspect: async () => {
+        throw new Error("unused in test");
+      },
+      isRemote: async () => true,
+      resolveBaselinePaths: async () => ({
+        claudeMdHostPath: "/var/lib/openclaude/baseline/CLAUDE.md",
+        skillsDirHostPath: "/var/lib/openclaude/baseline/skills",
+      }),
+    };
+    return { svc, captured };
+  }
+
+  test("self host 默认路径(monolith)→ env 仍是 V3_GATEWAY_IP=172.30.0.1", async () => {
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        randomIp: () => "172.30.0.42",
+        randomSecret: fixedSecret("a".repeat(64)),
+      },
+      555,
+    );
+    const env = captured.containersCreated[0]!.Env ?? [];
+    // 行为不变 — self host 注入 V3_GATEWAY_IP / V3_INTERNAL_PROXY_URL
+    assert.ok(env.includes(`OPENCLAUDE_TRUST_BRIDGE_IP=${V3_GATEWAY_IP}`));
+    assert.ok(env.includes(`ANTHROPIC_BASE_URL=${V3_INTERNAL_PROXY_URL}`));
+  });
+
+  test("remote host + bridgeCidr=172.30.2.0/24(tk1)→ env 注入 172.30.2.1", async () => {
+    const { docker } = makeDocker();
+    const pool = new FakePool();
+    const { svc, captured } = makeRemoteContainerService();
+    await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        containerService: svc as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+        selfHostId: SELF_HOST,
+        randomIp: () => "172.30.2.10",
+        randomSecret: fixedSecret("b".repeat(64)),
+      },
+      888,
+      REMOTE_HOST,
+      undefined,
+      "172.30.2.0/24",
+    );
+    assert.ok(captured.spec, "containerService.createAndStart must be called");
+    const env = captured.spec!.env;
+    assert.equal(env.OPENCLAUDE_TRUST_BRIDGE_IP, "172.30.2.1");
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://172.30.2.1:18791");
+    // 严格断言:不能再有任何 172.30.0.1 残留
+    for (const [k, v] of Object.entries(env)) {
+      assert.ok(
+        !v.includes("172.30.0.1"),
+        `remote-host env[${k}] must NOT contain self-host gateway 172.30.0.1, got ${v}`,
+      );
+    }
+  });
+
+  test("remote host + bridgeCidr=172.30.1.0/24(boheyun)→ env 注入 172.30.1.1", async () => {
+    const { docker } = makeDocker();
+    const pool = new FakePool();
+    const { svc, captured } = makeRemoteContainerService();
+    await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        containerService: svc as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+        selfHostId: SELF_HOST,
+        randomIp: () => "172.30.1.10",
+        randomSecret: fixedSecret("c".repeat(64)),
+      },
+      889,
+      REMOTE_HOST,
+      undefined,
+      "172.30.1.0/24",
+    );
+    const env = captured.spec!.env;
+    assert.equal(env.OPENCLAUDE_TRUST_BRIDGE_IP, "172.30.1.1");
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://172.30.1.1:18791");
+  });
+
+  test("remote host + 缺 bridgeCidr → InvalidArgument(fail-fast,不静默退化为 self IP)", async () => {
+    const { docker } = makeDocker();
+    const pool = new FakePool();
+    const { svc } = makeRemoteContainerService();
+    let caught: Error | undefined;
+    try {
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          containerService: svc as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+          selfHostId: SELF_HOST,
+          randomIp: () => "172.30.9.10",
+          randomSecret: fixedSecret("d".repeat(64)),
+        },
+        890,
+        REMOTE_HOST,
+        // boundIp / bridgeCidr 都不传
+      );
+    } catch (e) {
+      caught = e as Error;
+    }
+    assert.ok(caught, "expected fail-fast for remote without bridgeCidr");
+    assert.ok(caught instanceof SupervisorError);
+    assert.equal((caught as SupervisorError).code, "InvalidArgument");
+    // ROLLBACK — 不能因为 bridgeCidr 缺失就把 row 真留下来
+    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+  });
+
+  test("remote host + bridgeCidr 形状不符 → InvalidArgument(docker create 前拦截)", async () => {
+    const { docker } = makeDocker();
+    const pool = new FakePool();
+    const { svc, captured } = makeRemoteContainerService();
+    let caught: Error | undefined;
+    try {
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          containerService: svc as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+          selfHostId: SELF_HOST,
+          randomIp: () => "172.30.5.10",
+          randomSecret: fixedSecret("e".repeat(64)),
+        },
+        891,
+        REMOTE_HOST,
+        undefined,
+        "172.30.0.16/28", // 不是 v3 拓扑接受的形态
+      );
+    } catch (e) {
+      caught = e as Error;
+    }
+    assert.ok(caught, "expected fail-fast for invalid bridgeCidr shape");
+    assert.ok(caught instanceof SupervisorError);
+    assert.equal((caught as SupervisorError).code, "InvalidArgument");
+    // 不能进到 createAndStart
+    assert.equal(captured.spec, undefined);
     assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
   });
 });

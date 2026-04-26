@@ -328,7 +328,13 @@ export function makeV3EnsureRunning(
 
     let provisioned;
     try {
-      provisioned = await provisionV3Container(deps, uid, placement?.hostId, placement?.boundIp);
+      provisioned = await provisionV3Container(
+        deps,
+        uid,
+        placement?.hostId,
+        placement?.boundIp,
+        placement?.bridgeCidr,
+      );
     } catch (err) {
       // V3 Phase 3I — host 满 cap 走专用 reason + 长 retryAfter,前端显示"系统繁忙"
       if (err instanceof SupervisorError && err.code === "HostFull") {

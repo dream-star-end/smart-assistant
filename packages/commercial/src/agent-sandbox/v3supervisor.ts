@@ -66,15 +66,55 @@ import { SupervisorError } from "./types.js";
 /** docker bridge 网络名 — setup-host-net.sh 创建,本模块只引用 */
 export const V3_NETWORK_NAME = "openclaude-v3-net";
 
-/** docker bridge 子网 / 网关 — 与 setup-host-net.sh 严格一致 */
+/** docker bridge 子网 / 网关 — self host 一侧,与 setup-host-net.sh 严格一致。
+ *
+ * **多机注意**:不同 host 的 bridge 用不同的 /24(self=172.30.0.0/24,
+ * 远端 host 由 nodeScheduler 按 host 索引分配 172.30.X.0/24),所以容器 env
+ * 里的 ANTHROPIC_BASE_URL / OPENCLAUDE_TRUST_BRIDGE_IP 必须**按 host 计算**,
+ * 不能直接用这两个常量。本常量仅 master 自身用于:
+ *   - master 上的 anthropicProxy bind(config.ts INTERNAL_PROXY_BIND/PORT)
+ *   - Caddyfile reverse_proxy 反代(checkCaddyfileScript 测试)
+ *   - monolith / self host 路径的 fallback 默认值
+ * 容器 env 的 per-host 计算见 provisionV3Container 内 hostGatewayIp。
+ */
 export const V3_SUBNET_CIDR = "172.30.0.0/16";
 export const V3_GATEWAY_IP = "172.30.0.1";
 
-/**
- * 容器内 ANTHROPIC_BASE_URL 必须指向的内部代理地址。
- * gateway 是 docker bridge 网关 IP,内部代理(2H)绑在这个 IP:18791 上。
- */
+/** 同上注释 — master 自身用,容器 env 的 per-host 版本由 supervisor 计算。 */
 export const V3_INTERNAL_PROXY_URL = "http://172.30.0.1:18791";
+
+/**
+ * 从 v3 docker bridge CIDR 推该 host 的 bridge gateway IP。
+ *
+ * v3 网络规划(setup-host-net.sh + node-agent createBridge):**所有 host
+ * bridge 必为 X.Y.Z.0/24**,gateway 一律 `.1`。不接受 /28、/16 等其他 prefix
+ * —— 这些都不是 v3 拓扑里会出现的形态,与其试图猜测 gateway 算法
+ * (network address+1),不如 fail-fast 让运维感知到 host 装错网。
+ *
+ * 本函数在 provisionV3Container 容器 env 注入路径调用,任何形状不符 → 抛
+ * SupervisorError("InvalidArgument") 在 docker create 前失败,避免静默退化
+ * 导致跨 host 容器拿到错误 trust IP 触发 WS 1008 unauthorized。
+ */
+export function gatewayIpFromV3Cidr(cidr: string): string {
+  const trimmed = cidr.trim();
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.0\/24$/.exec(trimmed);
+  if (!m) {
+    throw new SupervisorError(
+      "InvalidArgument",
+      `bridge_cidr ${cidr} not in expected v3 form X.Y.Z.0/24`,
+    );
+  }
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  const c = Number(m[3]);
+  if (a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255) {
+    throw new SupervisorError(
+      "InvalidArgument",
+      `bridge_cidr ${cidr} octet out of range`,
+    );
+  }
+  return `${a}.${b}.${c}.1`;
+}
 
 /**
  * 容器内 OpenClaude gateway 监听端口(默认 18789,见 personal-version
@@ -1012,6 +1052,7 @@ export async function provisionV3Container(
   uid: number,
   hostId?: string,
   boundIp?: string,
+  bridgeCidr?: string | null,
 ): Promise<ProvisionedV3Container> {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
@@ -1107,19 +1148,48 @@ export async function provisionV3Container(
     // 3) docker create with --ip + 4 个 anthropic env + cap-drop + tmpfs + 单 volume
     const token = `oc-v3.${row.id}.${secret}`;
 
+    // hostGatewayIp:容器所在 host 的 docker bridge gateway IP(.1 of bridge_cidr)。
+    // self host = 172.30.0.1,远端 host 各自 172.30.X.1。**两件事必须用本变量,
+    // 不能用 V3_GATEWAY_IP 常量**:
+    //   1) ANTHROPIC_BASE_URL — 容器出站 API 流量目标:self 直连 master 的
+    //      anthropicProxy(本机 bridge gw),remote 经 node-agent internalproxy
+    //      (绑在 host 自己 bridge gw 上)再 mTLS 反代回 master。
+    //   2) OPENCLAUDE_TRUST_BRIDGE_IP — 容器 WS 入站旁路信任 IP,必须 = 容器
+    //      看到的实际 source IP(本机 bridge gw),否则 WS auth 走 token 路径
+    //      但 master 不带 bearer → 1008 unauthorized → 用户弹 Token 失效。
+    //
+    // bridgeCidr 的来源(三层 fallback):
+    //   1) placement.bridgeCidr 来自 schedule(),已做过 compute_hosts.bridge_cidr
+    //      / 历史容器反推 / fallback 公式 三层兼容
+    //   2) bridgeCidr 缺失但是 monolith / self 路径(useRemote=false)→ V3_GATEWAY_IP
+    //   3) bridgeCidr 缺失但目标是 remote → fail fast,避免静默退化注入 self IP
+    //      让远端容器再次踩 1008 bug
+    let hostGatewayIp: string;
+    if (typeof bridgeCidr === "string" && bridgeCidr.length > 0) {
+      hostGatewayIp = gatewayIpFromV3Cidr(bridgeCidr);
+    } else if (!useRemote) {
+      hostGatewayIp = V3_GATEWAY_IP;
+    } else {
+      throw new SupervisorError(
+        "InvalidArgument",
+        `remote host ${hostId} requires bridgeCidr; got ${bridgeCidr === null ? "null" : "undefined"}`,
+      );
+    }
+    const internalProxyUrl = `http://${hostGatewayIp}:18791`;
+
     const env: string[] = [
-      `ANTHROPIC_BASE_URL=${V3_INTERNAL_PROXY_URL}`,
+      `ANTHROPIC_BASE_URL=${internalProxyUrl}`,
       `ANTHROPIC_AUTH_TOKEN=${token}`,
       "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
       `CLAUDE_CONFIG_DIR=${V3_CONFIG_TMPFS_PATH}`,
       // **bridge IP trust 旁路只在 v3 supervisor 真正 spawn 容器时注入**:
-      //   bridge 经 docker bridge gateway 172.30.0.1 把 ws upgrade 转给容器 18789/ws,
-      //   bridge 不持有容器 personal-version accessToken,所以 personal-version 在
-      //   /opt/openclaude/openclaude/packages/gateway/src/server.ts 加了一个 "源 IP =
+      //   bridge 经 docker bridge gateway <host bridge .1> 把 ws upgrade 转给
+      //   容器 18789/ws,bridge 不持有容器 personal-version accessToken,所以
+      //   personal-version 在 packages/gateway/src/server.ts 加了一个 "源 IP =
       //   $OPENCLAUDE_TRUST_BRIDGE_IP 时跳过 token 校验" 的旁路。env 不设默认 noop,
       //   全靠 supervisor 显式注入,确保镜像哪怕被旁路其他渠道跑起来也仍然 fail-closed。
-      //   不在 entrypoint.sh 兜默认值 — 避免镜像变成"只要 host 能从 172.30.0.1 触达就免认证"。
-      `OPENCLAUDE_TRUST_BRIDGE_IP=${V3_GATEWAY_IP}`,
+      //   不在 entrypoint.sh 兜默认值 — 避免镜像变成"只要 host 能从 .1 触达就免认证"。
+      `OPENCLAUDE_TRUST_BRIDGE_IP=${hostGatewayIp}`,
       // PR4: 让容器内 mcp-memory 的 SkillStore 能看到 ro 挂载的平台基线 skill。
       // mcp-memory 只认这个显式 env —— 不 fallback 到 CLAUDE_CONFIG_DIR,personal 版
       // 不注入该 env 自动退化为 user-only,不会把用户自建 skill 误判成只读基线。
