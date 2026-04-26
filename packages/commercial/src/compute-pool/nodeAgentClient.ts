@@ -345,7 +345,10 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
               target.hostId,
               status,
               agentCode,
-              `agent returned ${status}: ${raw.slice(0, 400)}`,
+              // 4000 字符 cap:docker daemon 报错(VOL_CREATE_FAIL / RUN_FAIL 等)
+              // 通常 < 500 字符,4000 留余量看完整 stack;1.0.10 之前的 400 cap
+              // 让 v1.0.8/9 排查时关键栈被截断。
+              `agent returned ${status}: ${raw.slice(0, 4000)}`,
             ));
             return;
           }
@@ -360,7 +363,7 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
               target.hostId,
               status,
               null,
-              `agent returned non-JSON body: ${raw.slice(0, 200)}`,
+              `agent returned non-JSON body: ${raw.slice(0, 2000)}`,
             ));
           }
         });
