@@ -18,7 +18,16 @@ import {
   waitContainerReady,
   probeHealthzHttp,
   probeWsUpgrade,
+  probeHealthzViaTunnel,
+  probeWsUpgradeViaTunnel,
 } from "../agent-sandbox/v3readiness.js";
+import type {
+  NodeAgentTarget,
+  TunnelDialOptions,
+} from "../compute-pool/nodeAgentClient.js";
+import type { TLSSocket } from "node:tls";
+import { V3_CONTAINER_PORT } from "../agent-sandbox/v3supervisor.js";
+import { mock } from "node:test";
 
 // ───────────────────────────────────────────────────────────────────────
 //  Fixture helpers
@@ -250,5 +259,56 @@ describe("waitContainerReady", () => {
       );
       assert.strictEqual(ok, false);
     } finally { await s.close(); }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  tunnel readiness probes — 必须带 `?port=<V3_CONTAINER_PORT>`
+//
+//  regression guard:node-agent 的 /tunnel/containers/{cid}/{sub} handler
+//  强制要求 ?port=N(缺则 400 "missing port query param");历史 bug 这两条
+//  探针漏传 port,导致远端 host 容器永远 readiness=false → ensureRunning
+//  抛 "starting" → bridge 4503 风暴(2026-04-26 修复)。
+// ───────────────────────────────────────────────────────────────────────
+
+describe("tunnel readiness probes — port query contract", () => {
+  const target: NodeAgentTarget = {
+    hostId: "fake-host",
+    host: "127.0.0.1",
+    agentPort: 9443,
+    expectedFingerprint: null,
+    psk: null,
+  };
+  const cid = "abc123def456";
+
+  test("probeHealthzViaTunnel 经 dial 传 /healthz?port=<V3_CONTAINER_PORT>", async () => {
+    const calls: TunnelDialOptions[] = [];
+    const fakeDial = mock.fn(async (opts: TunnelDialOptions): Promise<TLSSocket> => {
+      calls.push(opts);
+      // 让 readStatusLine 立刻 close 拿到空,probe 会返 false;但我们只关心 path 契约
+      throw new Error("fake-dial-stop");
+    });
+    const ok = await probeHealthzViaTunnel(target, cid, 100, fakeDial as unknown as typeof import("../compute-pool/nodeAgentClient.js").dialTunnelSocket);
+    assert.strictEqual(ok, false, "throw 路径必须返 false");
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0]!.pathAndQuery, `/healthz?port=${V3_CONTAINER_PORT}`);
+    assert.strictEqual(calls[0]!.containerInternalId, cid);
+    assert.strictEqual(calls[0]!.method, "GET");
+  });
+
+  test("probeWsUpgradeViaTunnel 经 dial 传 /ws?port=<V3_CONTAINER_PORT>", async () => {
+    const calls: TunnelDialOptions[] = [];
+    const fakeDial = mock.fn(async (opts: TunnelDialOptions): Promise<TLSSocket> => {
+      calls.push(opts);
+      throw new Error("fake-dial-stop");
+    });
+    const ok = await probeWsUpgradeViaTunnel(target, cid, 100, fakeDial as unknown as typeof import("../compute-pool/nodeAgentClient.js").dialTunnelSocket);
+    assert.strictEqual(ok, false);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0]!.pathAndQuery, `/ws?port=${V3_CONTAINER_PORT}`);
+    assert.strictEqual(calls[0]!.upgradeWebSocket, true);
+    // WS 协议要求的两个头不能丢
+    assert.ok(calls[0]!.headers?.["Sec-WebSocket-Key"]);
+    assert.strictEqual(calls[0]!.headers?.["Sec-WebSocket-Version"], "13");
   });
 });

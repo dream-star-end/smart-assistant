@@ -41,6 +41,9 @@ import { WebSocket } from "ws";
 
 import { dialTunnelSocket, hostRowToTarget, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 import * as queries from "../compute-pool/queries.js";
+// node-agent /tunnel/containers/{cid}/{sub} 强制要求 ?port=N(handler 缺则 400)。
+// 只 import 常量,避免环依赖(v3supervisor 没引 v3readiness)。
+import { V3_CONTAINER_PORT } from "./v3supervisor.js";
 
 /** 默认 readiness 总超时(ms)。容器从 docker start 到 npm run gateway 完整 listen 一般 3-8s,留 10s 余量。 */
 export const DEFAULT_READINESS_TIMEOUT_MS = 10_000;
@@ -189,19 +192,25 @@ function readStatusLine(
   });
 }
 
-/** 单次 HTTP /healthz probe via node-agent tunnel。 */
+/**
+ * 单次 HTTP /healthz probe via node-agent tunnel。
+ *
+ * `dial` 默认走真 dialTunnelSocket;暴露此参数是为了在 Node 20(无 mock.module)
+ * 下让单测能断言传给 dialer 的 path 契约。生产调用使用默认 dialer。
+ */
 export async function probeHealthzViaTunnel(
   target: NodeAgentTarget,
   containerInternalId: string,
   timeoutMs: number,
+  dial: typeof dialTunnelSocket = dialTunnelSocket,
 ): Promise<boolean> {
   let socket: TLSSocket | null = null;
   try {
-    socket = await dialTunnelSocket({
+    socket = await dial({
       target,
       method: "GET",
       containerInternalId,
-      pathAndQuery: "/healthz",
+      pathAndQuery: `/healthz?port=${V3_CONTAINER_PORT}`,
       connectTimeoutMs: timeoutMs,
     });
   } catch {
@@ -219,19 +228,24 @@ export async function probeHealthzViaTunnel(
   }
 }
 
-/** 单次 WS upgrade probe via node-agent tunnel;期待 HTTP/1.1 101。 */
+/**
+ * 单次 WS upgrade probe via node-agent tunnel;期待 HTTP/1.1 101。
+ *
+ * `dial` 仅供单测注入,见 probeHealthzViaTunnel 注释。
+ */
 export async function probeWsUpgradeViaTunnel(
   target: NodeAgentTarget,
   containerInternalId: string,
   timeoutMs: number,
+  dial: typeof dialTunnelSocket = dialTunnelSocket,
 ): Promise<boolean> {
   let socket: TLSSocket | null = null;
   try {
-    socket = await dialTunnelSocket({
+    socket = await dial({
       target,
       method: "GET",
       containerInternalId,
-      pathAndQuery: "/ws",
+      pathAndQuery: `/ws?port=${V3_CONTAINER_PORT}`,
       upgradeWebSocket: true,
       // WebSocket 协议要求这两个头,缺失 server 可能拒 400。
       headers: {
