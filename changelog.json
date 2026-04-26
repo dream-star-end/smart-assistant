@@ -1,8 +1,8 @@
 {
-  "currentVersion": "v1.0.5",
+  "currentVersion": "v1.0.6",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v1.0.6",
       "date": "2026-04-26",
       "title": "彻底修复非主服务器账号 WebSocket 持续断开重连",
       "items": [
