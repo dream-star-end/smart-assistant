@@ -20,12 +20,12 @@
 // 之前的 PUT /api/agents/:id { model } 路径被 v3 多租户防火墙 BLOCKED_FOR_USER
 // 拦截(只有 host admin 能改 agent 配置),因此切换不到这条路。
 
-import { apiJson } from './api.js?v=5d4f08f'
-import { $ } from './dom.js?v=5d4f08f'
-import { renderModePills } from './effortMode.js?v=5d4f08f'
-import { getSession, state } from './state.js?v=5d4f08f'
-import { toast, toastOptsFromError } from './ui.js?v=5d4f08f'
-import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=5d4f08f'
+import { apiJson } from './api.js?v=5537761'
+import { $ } from './dom.js?v=5537761'
+import { renderModePills } from './effortMode.js?v=5537761'
+import { getSession, state } from './state.js?v=5537761'
+import { toast, toastOptsFromError } from './ui.js?v=5537761'
+import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=5537761'
 
 // ── 当前选择(prefs 优先,否则 agent.model)─────────────────────────
 
