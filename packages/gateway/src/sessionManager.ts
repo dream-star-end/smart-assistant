@@ -6,6 +6,7 @@ import {
   type OpenClaudeConfig,
   appendServerAuthoredMessageDurable,
   getClientSession,
+  getMaxTurnIdx,
   indexTurn,
   paths,
   upsertSessionMeta,
@@ -502,6 +503,28 @@ export class SessionManager {
       session.currentAssistantBuf = ''
       // Reset activity baseline so idle timeout measures from turn start, not last stdout
       session.runner.lastActivityAt = Date.now()
+      // Resume the per-session turn counter from the FTS index on the first
+      // turn of this in-memory Session. `getOrCreate` initializes
+      // `session.turns = 0` for every fresh AgentSession, so without this
+      // every gateway/CCB lifecycle would start writing turn_idx 1, 2, 3 …
+      // colliding with already-persisted rows for the same sessionKey and
+      // breaking the frontend's per-(session_id, turn_idx) dedupe.
+      // Must run BEFORE the auto-name block below: the auto-name guard
+      // checks `session.turns === 0`, and we only want auto-name to fire
+      // for genuinely-new sessions (no FTS history), not for resumed ones.
+      // Legacy fallback: rows persisted before the FTS sessId was tightened
+      // to sessionKey were keyed by ccbSessionId. The resume-map preserves
+      // the last-known sessionKey→ccbSessionId mapping across restarts, so
+      // we pass both ids and take the global max — otherwise pre-existing
+      // sessions would silently restart turn_idx from 1.
+      if (session.turns === 0) {
+        const legacyId = this._resumeMap.get(session.sessionKey)
+        const ids =
+          legacyId && legacyId !== session.sessionKey
+            ? [session.sessionKey, legacyId]
+            : [session.sessionKey]
+        session.turns = await getMaxTurnIdx(ids)
+      }
       // Auto-name session from first user turn
       if (session.turns === 0 && session.currentUserText) {
         const title = session.currentUserText.slice(0, 50).replace(/\s+/g, ' ').trim()
@@ -933,8 +956,13 @@ export class SessionManager {
             // would only get updated when session_id changes, which lags
             // behind real turn completion by many turns.
             this._saveResumeMap()
-            // L2: persist to FTS5 for session_search
-            const sessId = session.ccbSessionId ?? session.sessionKey
+            // L2: persist to FTS5 for session_search.
+            // Use sessionKey (not ccbSessionId) as the FTS / sessions_meta
+            // identity: sessionKey is stable across CCB process lifecycles
+            // and across provider switches, while ccbSessionId rotates and
+            // would split one logical session's history into multiple rows
+            // — also breaking getMaxTurnIdx() lookup on resume.
+            const sessId = session.sessionKey
             Promise.all([
               upsertSessionMeta({
                 id: sessId,

@@ -254,6 +254,28 @@ export async function indexTurn(
   if (assistantText) stmt.run(sessionId, turnIdx, 'assistant', assistantText)
 }
 
+// Returns the maximum turn_idx already persisted in the FTS index across
+// any of `sessionIds`, or 0 if none. Used by the gateway's SessionManager
+// to resume the per-session turn counter after a process restart so that
+// re-indexed turns don't collide with already-persisted (session_id,
+// turn_idx) rows.
+//
+// Accepts an array because legacy rows may have been written under a
+// different id (e.g. ccbSessionId) before FTS sessId was tightened to
+// sessionKey. Caller passes [sessionKey, legacyId?] so the resumed
+// counter is the global max across both ids.
+export async function getMaxTurnIdx(sessionIds: string[]): Promise<number> {
+  if (sessionIds.length === 0) return 0
+  const db = await getSessionsDb()
+  const placeholders = sessionIds.map(() => '?').join(',')
+  const row = db
+    .prepare(
+      `SELECT MAX(turn_idx) AS m FROM sessions_fts WHERE session_id IN (${placeholders})`,
+    )
+    .get(...sessionIds) as { m: number | null } | undefined
+  return row?.m == null ? 0 : Math.floor(row.m)
+}
+
 export interface SearchHit {
   sessionId: string
   agentId: string
