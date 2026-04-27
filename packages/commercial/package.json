@@ -9,6 +9,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@google-cloud/storage": "^7.19.0",
     "argon2": "^0.44.0",
     "dockerode": "^4.0.10",
     "ioredis": "^5.10.1",

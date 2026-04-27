@@ -282,6 +282,55 @@ const fileProxyEnabled = z.enum(["0", "1"]).optional().transform((v) => v === "1
  */
 const featureRemoteSsh = z.enum(["0", "1"]).optional().transform((v) => v === "1");
 
+/**
+ * R7 — Docker volume GCS backup/restore (R7.1 broker + manual CLI 阶段)。
+ *
+ * 详见 `docs/v3/R7-volume-gcs-backup-plan.md`。R7.1 阶段:这些 env 仅被
+ * `r7-backup/cli.ts` 直接读取,**不**接入 supervisor / scheduler — 那是 R7.3+。
+ *
+ * 字段全 optional,任一关键字段(bucket / creds / 任一 enabled flag)缺失或显式 "0"
+ * 等价于 R7 disabled,broker 主动跳过所有路径,master 主路径无任何 GCS 调用。
+ *
+ * 字段:
+ *   - R7_GCS_BUCKET            目标 bucket 名(GCS 命名规则:3-63 字符,小写 / 数字 / 点/横线/下划线,
+ *                              不允许 IPv4-like、`..`、`goog`/`google` 前缀)。
+ *   - GOOGLE_APPLICATION_CREDENTIALS  GCP 标准 env;指向 service account JSON 绝对路径。
+ *                              这是 GCP 通用 env,R7 复用,不强行加 R7_ 前缀。
+ *   - R7_BACKUP_ENABLED        master kill-switch;"1" → backup 路径开,其它视作 OFF。
+ *   - R7_RESTORE_ENABLED       master kill-switch(独立控制);"1" → restore 路径开。
+ *   - R7_BACKUP_TIMEOUT_SEC    helper 单次 backup hard timeout(R7.2 才用,R7.1 仅占位)。
+ *   - R7_RESTORE_TIMEOUT_SEC   helper 单次 restore hard timeout(R7.2 才用)。
+ *   - R7_HELPER_IMAGE          R7.2 helper 镜像 tag,R7.1 仅 schema 占位不读。
+ *
+ * Bucket regex 加固原因(R7.1 plan v2 Codex round-1 finding):
+ *   - GCS bucket 名规则严苛(GCP doc),手抖配错会让 R7 静默失败。在 config 层尽早拒绝。
+ *   - `..` 在 path 拼接时是危险 token;IPv4-like 是 GCS 保留;`goog`/`google` 也是保留前缀。
+ */
+const GCS_BUCKET_FORBIDDEN_IPV4 = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+const r7GcsBucket = z
+  .string()
+  .trim()
+  .min(3, "R7_GCS_BUCKET min 3 chars")
+  .max(63, "R7_GCS_BUCKET max 63 chars")
+  .regex(
+    /^[a-z0-9][a-z0-9._-]*[a-z0-9]$/,
+    "R7_GCS_BUCKET must be lowercase letters/digits/._-, start and end with letter or digit",
+  )
+  .refine((v) => !v.includes(".."), "R7_GCS_BUCKET cannot contain '..'")
+  .refine((v) => !GCS_BUCKET_FORBIDDEN_IPV4.test(v), "R7_GCS_BUCKET cannot be IPv4-like")
+  .refine(
+    (v) => !v.startsWith("goog") && !v.includes("google"),
+    "R7_GCS_BUCKET cannot start with 'goog' or contain 'google' (GCS reserved)",
+  )
+  .optional();
+
+const r7GcsCredentialsPath = absolutePath("GOOGLE_APPLICATION_CREDENTIALS");
+const r7BackupEnabled = z.enum(["0", "1"]).optional().transform((v) => v === "1");
+const r7RestoreEnabled = z.enum(["0", "1"]).optional().transform((v) => v === "1");
+const r7BackupTimeoutSec = positiveInt(3600);
+const r7RestoreTimeoutSec = positiveInt(3600);
+const r7HelperImage = z.string().trim().min(1).max(256).optional();
+
 export const commercialConfigSchema = z
   .object({
     DATABASE_URL: databaseUrl,
@@ -318,6 +367,13 @@ export const commercialConfigSchema = z
     OC_RUNTIME_IMAGE: ocRuntimeImage,
     FILE_PROXY_ENABLED: fileProxyEnabled,
     FEATURE_REMOTE_SSH: featureRemoteSsh,
+    R7_GCS_BUCKET: r7GcsBucket,
+    GOOGLE_APPLICATION_CREDENTIALS: r7GcsCredentialsPath,
+    R7_BACKUP_ENABLED: r7BackupEnabled,
+    R7_RESTORE_ENABLED: r7RestoreEnabled,
+    R7_BACKUP_TIMEOUT_SEC: r7BackupTimeoutSec,
+    R7_RESTORE_TIMEOUT_SEC: r7RestoreTimeoutSec,
+    R7_HELPER_IMAGE: r7HelperImage,
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。
@@ -374,6 +430,40 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       path: i.path.join("."),
       code: i.code,
       // i.message 由 zod 生成,不包含实际值,复用安全
+      message: i.message,
+    }));
+    throw new ConfigError(issues);
+  }
+  return result.data;
+}
+
+/**
+ * R7 子集 schema — 只解析 R7 backup/restore 需要的字段。
+ *
+ * 用途:`scripts/r7-cli.ts` 这种独立的 manual 工具。CLI 不应被 master 主进程的
+ * DATABASE_URL/REDIS_URL/JWT_SECRET 等无关项绑死,否则 ops 在 helper host 上验证
+ * R7 行为时还得伪造一堆 dummy env,反过来掩盖真实配置错误。
+ *
+ * 字段语义跟 commercialConfigSchema 完全一致(同一 zod 校验器),不会出现两份
+ * R7 schema 漂移的问题。
+ */
+export const r7ConfigSchema = z.object({
+  R7_GCS_BUCKET: r7GcsBucket,
+  GOOGLE_APPLICATION_CREDENTIALS: r7GcsCredentialsPath,
+  R7_BACKUP_ENABLED: r7BackupEnabled,
+  R7_RESTORE_ENABLED: r7RestoreEnabled,
+  R7_BACKUP_TIMEOUT_SEC: r7BackupTimeoutSec,
+  R7_RESTORE_TIMEOUT_SEC: r7RestoreTimeoutSec,
+  R7_HELPER_IMAGE: r7HelperImage,
+});
+export type R7Config = z.infer<typeof r7ConfigSchema>;
+
+export function loadR7Config(env: Record<string, string | undefined> = process.env): R7Config {
+  const result = r7ConfigSchema.safeParse(env);
+  if (!result.success) {
+    const issues = result.error.issues.map((i) => ({
+      path: i.path.join("."),
+      code: i.code,
       message: i.message,
     }));
     throw new ConfigError(issues);
