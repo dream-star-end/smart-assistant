@@ -347,7 +347,7 @@ import { unassignTeammateTasks } from '../utils/tasks.js'
 import { getRunningTasks } from '../utils/task/framework.js'
 import { isBackgroundTask } from '../tasks/types.js'
 import { stopTask } from '../tasks/stopTask.js'
-import { drainSdkEvents } from '../utils/sdkEventQueue.js'
+import { drainSdkEvents, setFlushListener } from '../utils/sdkEventQueue.js'
 import { initializeGrowthBook } from '../services/analytics/growthbook.js'
 import { errorMessage, toError } from '../utils/errors.js'
 import { sleep } from '../utils/sleep.js'
@@ -1014,6 +1014,20 @@ function runHeadlessStreaming(
   let abortController: AbortController | undefined
   // Same queue sendRequest() enqueues to — one FIFO for everything.
   const output = structuredIO.outbound
+
+  // Push-mode SDK events: background tasks (e.g. bash output tail polling)
+  // emit while the main turn loop is idle. Without a listener those events
+  // would only leave on the next message's drainSdkEvents() call. Routing
+  // them straight to the output stream eliminates the latency.
+  const unsubscribeFlushListener = setFlushListener(events => {
+    for (const event of events) {
+      output.enqueue({
+        ...event,
+        uuid: randomUUID(),
+        session_id: getSessionId(),
+      })
+    }
+  })
 
   // Ctrl+C in -p mode: abort the in-flight query, then shut down gracefully.
   // gracefulShutdown persists session state and flushes analytics, with a
@@ -2672,6 +2686,7 @@ function runHeadlessStreaming(
         await finalizePendingAsyncHooks()
         unsubscribeSkillChanges()
         unsubscribeAuthStatus?.()
+        unsubscribeFlushListener()
         statusListeners.delete(rateLimitListener)
         output.done()
       }

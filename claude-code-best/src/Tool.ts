@@ -272,6 +272,15 @@ export type ToolUseContext = {
     toolInputSummary?: string | null,
   ) => (request: PromptRequest) => Promise<PromptResponse>
   toolUseId?: string
+  /**
+   * The toolUseId of the wrapping AgentTool when this context belongs to a
+   * subagent's inner tool call. Set by createSubagentContext to the parent
+   * AgentTool's toolUseId so SDK side-channel events (e.g. bash_output_tail)
+   * can carry parent_tool_use_id for routing back to the right agent card.
+   * Undefined for main-thread tool calls. Survives the per-tool wrapping in
+   * toolExecution.ts that stamps `toolUseId` since the spread preserves it.
+   */
+  parentToolUseId?: string
   criticalSystemReminder_EXPERIMENTAL?: string
   /** When true, preserve toolUseResult on messages even for subagents.
    * Used by in-process teammates whose transcripts are viewable by the user. */

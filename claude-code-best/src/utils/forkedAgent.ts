@@ -455,6 +455,15 @@ export function createSubagentContext(
     },
     fileReadingLimits: parentContext.fileReadingLimits,
     userModified: parentContext.userModified,
+    // Carry the wrapping tool's toolUseId so SDK side-channel events emitted
+    // by the subagent's inner tools (e.g. BashTool's bash_output_tail) can
+    // tag parent_tool_use_id for the gateway/web to route into the agent
+    // card. parentContext.toolUseId is set by toolExecution.ts at each tool
+    // invocation; for AgentTool's call() it equals the AgentTool's invocation
+    // id. Inherits a parent's parentToolUseId for nested-subagent depth — but
+    // the immediate wrapping AgentTool ID always wins.
+    parentToolUseId:
+      parentContext.toolUseId ?? parentContext.parentToolUseId,
     criticalSystemReminder_EXPERIMENTAL:
       overrides?.criticalSystemReminder_EXPERIMENTAL,
     requireCanUseTool: overrides?.requireCanUseTool,

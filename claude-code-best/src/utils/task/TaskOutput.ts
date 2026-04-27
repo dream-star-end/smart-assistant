@@ -49,10 +49,19 @@ export class TaskOutput {
 
   // --- Shared poller state ---
 
-  /** Registry of all file-mode TaskOutput instances with onProgress callbacks. */
+  /** Registry of all file-mode TaskOutput instances. */
   static #registry = new Map<string, TaskOutput>()
-  /** Subset of #registry currently being polled (visibility-driven by React). */
+  /** Subset of #registry currently being polled. */
   static #activePolling = new Map<string, TaskOutput>()
+  /**
+   * Ref count of active polling subscribers per taskId. Both BashTool's
+   * progress loop AND LocalShellTask's tail-keepalive (background paths)
+   * call startPolling, so the poller only stops once both have detached.
+   * Without ref counting, BashTool's stopPolling() in its finally block
+   * would kill the poller while LocalShellTask still needs ticks for the
+   * backgrounded command, freezing the live tail in the web UI.
+   */
+  static #pollRefCount = new Map<string, number>()
   static #pollInterval: ReturnType<typeof setInterval> | null = null
 
   constructor(
@@ -68,19 +77,25 @@ export class TaskOutput {
     this.#onProgress = onProgress
 
     // Register for polling when stdout goes to a file and progress is needed.
-    // Actual polling is started/stopped by React via startPolling/stopPolling.
+    // Polling is gated by startPolling/stopPolling (ref-counted).
     if (stdoutToFile && onProgress) {
       TaskOutput.#registry.set(taskId, this)
     }
   }
 
   /**
-   * Begin polling the output file for progress. Called from React
-   * useEffect when the progress component mounts.
+   * Begin polling the output file for progress. Increments the per-task
+   * ref count; pair with stopPolling. Both BashTool's progress loop and
+   * LocalShellTask's keepalive call this — see #pollRefCount comment.
    */
   static startPolling(taskId: string): void {
     const instance = TaskOutput.#registry.get(taskId)
     if (!instance || !instance.#onProgress) {
+      return
+    }
+    const cur = TaskOutput.#pollRefCount.get(taskId) ?? 0
+    TaskOutput.#pollRefCount.set(taskId, cur + 1)
+    if (cur > 0) {
       return
     }
     TaskOutput.#activePolling.set(taskId, instance)
@@ -91,10 +106,19 @@ export class TaskOutput {
   }
 
   /**
-   * Stop polling the output file. Called from React useEffect cleanup
-   * when the progress component unmounts.
+   * Decrement the per-task ref count; stops polling when the count
+   * hits zero. Mirror of startPolling — pair them 1:1.
    */
   static stopPolling(taskId: string): void {
+    const cur = TaskOutput.#pollRefCount.get(taskId) ?? 0
+    if (cur <= 0) {
+      return
+    }
+    if (cur > 1) {
+      TaskOutput.#pollRefCount.set(taskId, cur - 1)
+      return
+    }
+    TaskOutput.#pollRefCount.delete(taskId)
     TaskOutput.#activePolling.delete(taskId)
     if (TaskOutput.#activePolling.size === 0 && TaskOutput.#pollInterval) {
       clearInterval(TaskOutput.#pollInterval)
@@ -384,7 +408,20 @@ export class TaskOutput {
     this.#recentLines.clear()
     this.#onProgress = null
     this.#disk?.cancel()
-    TaskOutput.stopPolling(this.taskId)
+    // Force the ref count to zero so the shared poller releases this task
+    // even if LocalShellTask's keepalive forgot to release (we just nulled
+    // onProgress so future ticks would be no-ops anyway).
+    if (TaskOutput.#pollRefCount.has(this.taskId)) {
+      TaskOutput.#pollRefCount.delete(this.taskId)
+      TaskOutput.#activePolling.delete(this.taskId)
+      if (
+        TaskOutput.#activePolling.size === 0 &&
+        TaskOutput.#pollInterval
+      ) {
+        clearInterval(TaskOutput.#pollInterval)
+        TaskOutput.#pollInterval = null
+      }
+    }
     TaskOutput.#registry.delete(this.taskId)
   }
 }

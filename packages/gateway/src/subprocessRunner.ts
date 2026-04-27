@@ -375,14 +375,14 @@ export class SubprocessRunner extends EventEmitter {
           // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
           // gateway-process env doesn't bleed into spawned CCBs.
           CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
-          // Force all subagents/Bash runs to foreground so their execution
-          // is visible inline in the web UI. Opus 4.7 was aggressively
-          // choosing run_in_background=true for long tasks, which hid the
-          // subagent's progress behind a single "Noted, continuing to wait"
-          // message. This env var makes CCB strip run_in_background from the
-          // Agent/Bash/PowerShell tool schemas at module load, so the model
-          // can never select background mode.
-          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+          // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
+          // here to strip run_in_background from Bash/Agent/PowerShell tool
+          // schemas (visibility band-aid for Opus 4.7 over-using background
+          // mode). Removed once CCB started streaming bash_output_tail
+          // SDK events at 1 Hz — the underlying UX problem (background
+          // commands looking idle) is now solved end-to-end (CCB
+          // sdkEventQueue → gateway ccbMessageParser → web tool_output_tail
+          // block), so the model can pick run_in_background:true again.
           IS_SANDBOX: '1',
           FEATURE_VERIFICATION_AGENT: '1',
         },

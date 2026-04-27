@@ -322,6 +322,25 @@ function _appendSubagentBlock(sess, groupMsg, block, blockText) {
         error: !!block.isError,
       })
     }
+  } else if (block.kind === 'tool_output_tail') {
+    // Subagent Bash tail: locate the child Bash card by its tool_use blockId
+    // and stash a tail snapshot on it. The renderer (_renderBash) prefers
+    // msg.output once present (final tool_result), so this only shows
+    // up while the command is still running. Monotonic guard: stale
+    // tail frames (totalBytes regressed) are dropped — async tailFile
+    // promises can resolve out of order under disk pressure.
+    const tail = typeof block.tail === 'string' ? block.tail : ''
+    const totalBytes = typeof block.totalBytes === 'number' ? block.totalBytes : 0
+    const truncatedHead = !!block.truncatedHead
+    const target = block.toolUseBlockId
+      ? children.find((c) => c.kind === 'tool_use' && c.blockId === block.toolUseBlockId)
+      : null
+    if (target) {
+      const prev = target.bashTail?.totalBytes ?? 0
+      if (totalBytes >= prev) {
+        target.bashTail = { tail, totalBytes, truncatedHead }
+      }
+    }
   }
 }
 
@@ -1397,6 +1416,28 @@ export function handleOutbound(frame) {
         _partial: false,
       })
       if (block.blockId) sess._blockIdToMsgId.set(block.blockId, m.id)
+    } else if (block.kind === 'tool_output_tail') {
+      // Main-stream Bash tail: locate the existing tool_use msg by its
+      // blockId and stash a snapshot. The msg model carries the tail
+      // (msg.bashTail) so any subsequent updateMessageEl re-render keeps
+      // it intact — DOM-only writes would be wiped on the next full
+      // re-render of the card. _renderBash reads msg.bashTail and
+      // displays it while msg.output (final tool_result preview) is
+      // still empty. Monotonic guard: drop stale frames (totalBytes
+      // regressed) so out-of-order async tailFile promises can't make
+      // the visible tail jump backwards.
+      if (!block.toolUseBlockId) continue
+      if (!sess._blockIdToMsgId?.has(block.toolUseBlockId)) continue
+      const mid = sess._blockIdToMsgId.get(block.toolUseBlockId)
+      const existing = sess.messages.find((m) => m.id === mid)
+      if (!existing) continue
+      const tail = typeof block.tail === 'string' ? block.tail : ''
+      const totalBytes = typeof block.totalBytes === 'number' ? block.totalBytes : 0
+      const truncatedHead = !!block.truncatedHead
+      const prev = existing.bashTail?.totalBytes ?? 0
+      if (totalBytes < prev) continue
+      existing.bashTail = { tail, totalBytes, truncatedHead }
+      if (sess.id === state.currentSessionId) _deps.updateMessageEl(existing)
     }
   }
   sess.lastAt = Date.now()
