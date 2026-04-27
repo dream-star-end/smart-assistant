@@ -253,7 +253,12 @@ class FakePool {
             r.state = "vanished";
             r.updated_at = new Date();
           }
-          return { rowCount: r ? 1 : 0, rows: [] };
+          // v1.0.22 stopAndRemoveV3Container 用 RETURNING host_uuid 兜底跨 host 路由
+          const returnsHostUuid = /RETURNING\s+host_uuid/i.test(trimmed);
+          return {
+            rowCount: r ? 1 : 0,
+            rows: r && returnsHostUuid ? [{ host_uuid: r.host_uuid }] : [],
+          };
         }
         if (/SELECT id, user_id,\s*host\(bound_ip\)/i.test(trimmed) && /WHERE user_id/i.test(trimmed)) {
           const userId = Number.parseInt(String(params![0]), 10);
@@ -788,6 +793,311 @@ describe("stopAndRemoveV3Container", () => {
       { docker: dockerStopErrRemoveGone, pool: pool as unknown as Pool, image: TEST_IMAGE },
       { id: 100, container_internal_id: "halfdead4" },
     );
+    assert.equal(pool.rows[0]!.state, "vanished");
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.0.22 host-aware stopAndRemove —— 系统性修复
+  // 5/6 处调用点(idleSweep / ensureRunning stale recovery / admin 三处)
+  // 都没传 host_uuid,跨 host 容器在远端不会被真清。本函数用 RETURNING host_uuid
+  // 兜底,所有调用点自动 host-aware。
+  //
+  // 关键安全 gate(Codex round 1 review):
+  //   A) host 未知 + 多 host 系统 → skip docker(host_uuid 缺失 ≠ 本地安全)
+  //   B) cross-host + containerService 未注入 → skip docker(避免清错宿主)
+  //
+  // caller 显式传的 host_uuid 优先于 DB 里的(reconcile 路径已显式传 + 并发可信);
+  // 不一致 → warn 留诊断线索,按 caller 走。
+  // ─────────────────────────────────────────────────────────────────────
+
+  /** 容器服务 stub —— 记录所有 stop/remove 调用,缺省其它方法。 */
+  function makeContainerServiceStub() {
+    const calls: Array<{ op: "stop" | "remove"; hostId: string; cid: string }> = [];
+    const cs = {
+      ensureVolume: async () => {},
+      removeVolume: async () => {},
+      inspectVolume: async () => ({ exists: false }),
+      createAndStart: async () => ({ containerInternalId: "" }),
+      stop: async (hostId: string, cid: string, _opts?: unknown) => {
+        calls.push({ op: "stop", hostId, cid });
+      },
+      remove: async (hostId: string, cid: string, _opts?: unknown) => {
+        calls.push({ op: "remove", hostId, cid });
+      },
+      inspect: async () => { throw new Error("inspect should not be called"); },
+      isRemote: async () => true,
+      resolveBaselinePaths: async () => ({ baseDir: "/tmp/baseline-not-used" }),
+    };
+    return { cs, calls };
+  }
+
+  /** console.warn 捕获,断言 gate 触发了诊断日志。 */
+  async function withCapturedWarns<T>(fn: () => Promise<T>): Promise<{ result: T; warns: string[] }> {
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warns.push(args.map((a) => typeof a === "string" ? a : JSON.stringify(a)).join(" "));
+    };
+    try {
+      const result = await fn();
+      return { result, warns };
+    } finally {
+      console.warn = orig;
+    }
+  }
+
+  test("v1.0.22: caller 无 host_uuid + DB host=remote → 用 RETURNING 兜底走 containerService", async () => {
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 1189,
+      user_id: 33,
+      host_uuid: "boheyun-1",
+      bound_ip: "172.30.2.10",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "8654750e",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const { cs, calls } = makeContainerServiceStub();
+
+    // caller 没传 host_uuid(模拟 idleSweep / admin 旧调用点)
+    await stopAndRemoveV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        // biome-ignore lint/suspicious/noExplicitAny: containerService 类型只在这里 stub
+        containerService: cs as any,
+        selfHostId: "self",
+      },
+      { id: 1189, container_internal_id: "8654750e" },
+    );
+
+    // RETURNING host_uuid 给到 boheyun-1 → 走 containerService,本地 docker 必须 0 触
+    assert.equal(captured.stopped, 0, "本地 docker.stop 不应被调");
+    assert.equal(captured.removed, 0, "本地 docker.remove 不应被调");
+    assert.equal(calls.length, 2, "containerService 应被调 stop + remove 两次");
+    assert.deepEqual(calls[0], { op: "stop", hostId: "boheyun-1", cid: "8654750e" });
+    assert.deepEqual(calls[1], { op: "remove", hostId: "boheyun-1", cid: "8654750e" });
+    assert.equal(pool.rows[0]!.state, "vanished");
+  });
+
+  test("v1.0.22: caller 无 host_uuid + DB host=selfHostId → 走本地 docker", async () => {
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 50,
+      user_id: 7,
+      host_uuid: "self",
+      bound_ip: "172.30.0.50",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "selfcid",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const { cs, calls } = makeContainerServiceStub();
+
+    await stopAndRemoveV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        // biome-ignore lint/suspicious/noExplicitAny: containerService 类型只在这里 stub
+        containerService: cs as any,
+        selfHostId: "self",
+      },
+      { id: 50, container_internal_id: "selfcid" },
+    );
+
+    assert.equal(captured.stopped, 1, "本地 docker.stop 必须被调");
+    assert.ok(captured.removed >= 1, "本地 docker.remove 必须被调");
+    assert.equal(calls.length, 0, "containerService 不应被调");
+    assert.equal(pool.rows[0]!.state, "vanished");
+  });
+
+  test("v1.0.22: caller 无 host_uuid + DB host=null + 单机模式 → 走本地 docker(legacy)", async () => {
+    // selfHostId 缺失 → isMultiHost=false → host_uuid=null 被允许走本地
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 60,
+      user_id: 8,
+      host_uuid: null,
+      bound_ip: "172.30.0.60",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "legacycid",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+
+    await stopAndRemoveV3Container(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE }, // 不注入 selfHostId/containerService
+      { id: 60, container_internal_id: "legacycid" },
+    );
+
+    assert.equal(captured.stopped, 1);
+    assert.ok(captured.removed >= 1);
+    assert.equal(pool.rows[0]!.state, "vanished");
+  });
+
+  test("v1.0.22: caller 无 host_uuid + UPDATE 0 行(row 已并发删) + 多 host → skip + warn", async () => {
+    // FakePool 没插任何 row → UPDATE 0 行 → effectiveHostUuid=null
+    // 多 host 系统下 host 未知不可假设本地,gate A 触发
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    const { cs, calls } = makeContainerServiceStub();
+
+    const { warns } = await withCapturedWarns(async () => {
+      await stopAndRemoveV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          // biome-ignore lint/suspicious/noExplicitAny: containerService 类型只在这里 stub
+          containerService: cs as any,
+          selfHostId: "self",
+        },
+        { id: 9999, container_internal_id: "ghostcid" },
+      );
+    });
+
+    assert.equal(captured.stopped, 0, "host 未知不应触本地 docker");
+    assert.equal(captured.removed, 0);
+    assert.equal(calls.length, 0, "containerService 也不应被调");
+    assert.ok(
+      warns.some((w) => /host_uuid unknown in multi-host system/.test(w)),
+      `gate A warn 必须写 console:实际 warns=${JSON.stringify(warns)}`,
+    );
+  });
+
+  test("v1.0.22: caller 显式 remote host + DB host=null → caller 优先,走 containerService", async () => {
+    // 模拟 reconcile 路径已显式传 host_uuid 但 DB 里 host_uuid 还没补全 / 并发改
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 70,
+      user_id: 9,
+      host_uuid: null, // DB 没填
+      bound_ip: "172.30.3.70",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "callercid",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const { cs, calls } = makeContainerServiceStub();
+
+    await stopAndRemoveV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        // biome-ignore lint/suspicious/noExplicitAny: containerService 类型只在这里 stub
+        containerService: cs as any,
+        selfHostId: "self",
+      },
+      { id: 70, container_internal_id: "callercid", host_uuid: "boheyun-1" },
+    );
+
+    assert.equal(captured.stopped, 0);
+    assert.equal(captured.removed, 0);
+    assert.equal(calls.length, 2, "caller 显式 host 必须走 containerService");
+    assert.equal(calls[0]!.hostId, "boheyun-1");
+    assert.equal(calls[1]!.hostId, "boheyun-1");
+  });
+
+  test("v1.0.22: caller 显式 self + DB host=remote → caller 优先,走本地 + warn 不一致", async () => {
+    // 反向 case:caller 自信本地,DB 里却是 remote;按 caller 走但留诊断 warn
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 80,
+      user_id: 10,
+      host_uuid: "boheyun-1", // DB 里是远端
+      bound_ip: "172.30.0.80",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "reversecid",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const { cs, calls } = makeContainerServiceStub();
+
+    const { warns } = await withCapturedWarns(async () => {
+      await stopAndRemoveV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          // biome-ignore lint/suspicious/noExplicitAny: containerService 类型只在这里 stub
+          containerService: cs as any,
+          selfHostId: "self",
+        },
+        { id: 80, container_internal_id: "reversecid", host_uuid: "self" }, // caller 说本地
+      );
+    });
+
+    assert.equal(captured.stopped, 1, "caller=self → 必须走本地 docker");
+    assert.ok(captured.removed >= 1);
+    assert.equal(calls.length, 0, "containerService 不应被调");
+    assert.ok(
+      warns.some((w) => /caller host_uuid != db host_uuid/.test(w)),
+      `不一致 warn 必须写 console:实际 warns=${JSON.stringify(warns)}`,
+    );
+  });
+
+  test("v1.0.22: caller 无 host_uuid + DB host=remote + containerService 缺失 → skip + warn", async () => {
+    // gate B:cross-host 但缺 containerService(配置漏装) → 不静默回退本地
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 90,
+      user_id: 11,
+      host_uuid: "boheyun-1",
+      bound_ip: "172.30.4.90",
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "noservicecid",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+
+    const { warns } = await withCapturedWarns(async () => {
+      await stopAndRemoveV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: "self",
+          // 故意不注入 containerService
+        },
+        { id: 90, container_internal_id: "noservicecid" },
+      );
+    });
+
+    assert.equal(captured.stopped, 0, "cross-host + 无 service 不能回退本地 docker");
+    assert.equal(captured.removed, 0);
+    assert.ok(
+      warns.some((w) => /cross-host row but containerService missing/.test(w)),
+      `gate B warn 必须写 console:实际 warns=${JSON.stringify(warns)}`,
+    );
+    // row 仍 vanished(DB 意图已落库)
     assert.equal(pool.rows[0]!.state, "vanished");
   });
 });
