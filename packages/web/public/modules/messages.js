@@ -684,7 +684,49 @@ function _renderBash(body, input, msg) {
     cmdBlock.appendChild(cmd)
     body.appendChild(cmdBlock)
   }
-  if (msg.output) {
+  // Detect "background placeholder" — BashTool.tsx returns one of three forms
+  // for backgrounded shells (auto / manual / explicit run_in_background:true).
+  // All three share: starts with one of the three prefixes, contains
+  // "with ID: b<8-alnum>." and "Output is being written to: <path>".
+  // Anchoring to the prefix + the strict task-id shape (Task.ts:80,96) avoids
+  // false positives if a foreground command's stdout happens to contain
+  // similar substrings.
+  const bgMatch = typeof msg.output === 'string'
+    ? msg.output.match(
+        /^(?:Command running in background|Command was manually backgrounded by user|Command exceeded the assistant-mode blocking budget \(\d+s\) and was moved to the background) [\s\S]*?with ID:\s+(b[0-9a-z]{8})\.[\s\S]*?Output is being written to:\s*(\S+)/,
+      )
+    : null
+  if (bgMatch) {
+    // Background bash: replace the verbose placeholder with a compact note
+    // and stream the live tail from CCB's TaskOutput poller. The poller keeps
+    // emitting bash_output_tail even after the foreground tool_result returns,
+    // thanks to attachBashTailKeepalive in LocalShellTask.
+    const taskId = bgMatch[1]
+    // Auto-backgrounded form ends "...Output is being written to: <path>. In
+    // assistant mode..." — \S+ greedily eats the trailing period. Strip it so
+    // the hover title shows a clean path.
+    const outputPath = bgMatch[2].replace(/\.$/, '')
+    const hasTail =
+      msg.bashTail && typeof msg.bashTail.tail === 'string' && msg.bashTail.tail.length > 0
+    const meta = document.createElement('div')
+    meta.className = 'tool-file-meta'
+    meta.textContent = hasTail ? `(后台运行 #${taskId})` : `(后台运行 #${taskId}, 等待输出…)`
+    if (outputPath) meta.title = `Output: ${outputPath}`
+    body.appendChild(meta)
+    if (hasTail) {
+      if (msg.bashTail.truncatedHead) {
+        const note = document.createElement('div')
+        note.className = 'tool-file-meta'
+        const total = typeof msg.bashTail.totalBytes === 'number' ? msg.bashTail.totalBytes : 0
+        note.textContent = `… (head 已截断, 共 ${total} 字节)`
+        body.appendChild(note)
+      }
+      const outBlock = document.createElement('pre')
+      outBlock.className = 'tool-output bash-tail-live'
+      outBlock.textContent = msg.bashTail.tail
+      body.appendChild(outBlock)
+    }
+  } else if (msg.output) {
     // Final tool_result preview wins once the command finishes. The
     // streaming bashTail is hidden in this branch — the gateway-emitted
     // tool_result.preview is the canonical truncated output sent by CCB.
