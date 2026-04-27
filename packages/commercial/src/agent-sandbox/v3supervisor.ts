@@ -1520,14 +1520,40 @@ export async function stopAndRemoveV3Container(
   containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
   timeoutSec = 5,
 ): Promise<void> {
-  // 1) DB 先翻 vanished —— admin 意图就是销毁,不依赖 docker 步骤是否干净
-  await deps.pool.query(
+  // 1) DB 先翻 vanished —— admin 意图就是销毁,不依赖 docker 步骤是否干净。
+  //    用 RETURNING host_uuid 兜底:v1.0.20 修了 v3orphanReconcile 的 isNotFound bug
+  //    后,本函数其余 5 处调用点(idleSweep / ensureRunning stale recovery / admin
+  //    stop/restart/remove)都没传 host_uuid,跨 host 容器在远端 docker 不会被真清,
+  //    留下 ghost 撞下次 docker run name/IP 冲突 → host markCooldown(60s)反复 retry。
+  //    这里就近从 DB 读出 host_uuid,所有调用点自动 host-aware,零额外 query。
+  const updateResult = await deps.pool.query<{ host_uuid: string | null }>(
     `UPDATE agent_containers
         SET state='vanished',
             updated_at=NOW()
-      WHERE id = $1`,
+      WHERE id = $1
+      RETURNING host_uuid`,
     [String(containerRow.id)],
   );
+  const rowFound = (updateResult.rowCount ?? 0) > 0;
+  const dbHostUuid: string | null = updateResult.rows[0]?.host_uuid ?? null;
+  // caller 显式传 host_uuid 优先(reconcile 已显式传,且并发场景下 caller 更可信);
+  // caller 没传 → 用 UPDATE RETURNING 兜底。
+  const callerHostUuid: string | null = containerRow.host_uuid ?? null;
+  // caller vs DB 不一致 → 留诊断线索(理论不该发生,可能 row 被并发改 / 容器迁移)。
+  if (
+    callerHostUuid !== null
+    && dbHostUuid !== null
+    && callerHostUuid !== dbHostUuid
+  ) {
+    // eslint-disable-next-line no-console
+    console.warn("[v3supervisor.stopAndRemove] caller host_uuid != db host_uuid", {
+      containerId: containerRow.id,
+      callerHostUuid,
+      dbHostUuid,
+    });
+  }
+  const effectiveHostUuid: string | null = callerHostUuid ?? dbHostUuid;
+
   // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing。
   //    R2 finding 加固:此后任何错都已经过了 DB UPDATE,意图已落库。
   //    R3 finding 加固:stop 失败也仍然 try remove({force:true}) ——
@@ -1536,15 +1562,44 @@ export async function stopAndRemoveV3Container(
   //    任一 stage 失败,记录,最后聚合抛 PartialV3Cleanup(含 stages)。
   if (!containerRow.container_internal_id) return;
   const cid = containerRow.container_internal_id;
-  const useRemote =
-    typeof containerRow.host_uuid === "string"
+  // 多 host 系统标志:selfHostId 已配 + containerService 注入。
+  // 单机 legacy 模式下 (selfHostId 缺失) host_uuid 为 null 是正常的,允许走本地。
+  const isMultiHost =
+    typeof deps.selfHostId === "string" && deps.containerService !== undefined;
+  // 安全 gate A:多 host 系统下 host 未知 → 不假设本地。
+  // 触发条件:UPDATE 0 行(row 已并发删 / id 错)且 caller 没传,
+  //         或 row 在 DB 里 host_uuid 就是 null(legacy row 跑在多 host 系统)。
+  // 默认本地 docker.remove 在跨 host 时是 noop(404),但语义上不对:
+  // 调用方期望"清这个容器",容器实际在远端,我们却往本地打。明确 skip + warn 比静默
+  // 好,出问题排障也能从日志看到 host_uuid 缺失。
+  if (effectiveHostUuid === null && isMultiHost) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[v3supervisor.stopAndRemove] host_uuid unknown in multi-host system, skipping docker cleanup",
+      { containerId: containerRow.id, cid, rowFound },
+    );
+    return;
+  }
+  // 决定走远端还是本地(只在 effectiveHostUuid 非 null 时区分)。
+  const isRemote =
+    typeof effectiveHostUuid === "string"
     && typeof deps.selfHostId === "string"
-    && containerRow.host_uuid !== deps.selfHostId
-    && deps.containerService !== undefined;
+    && effectiveHostUuid !== deps.selfHostId;
+  // 安全 gate B:cross-host 但 containerService 缺失 → 不静默回退本地(会清错宿主)。
+  // 跟 v3orphanReconcile 已有 fail-safe gate 语义一致(containerService 未注入 → skip)。
+  if (isRemote && deps.containerService === undefined) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[v3supervisor.stopAndRemove] cross-host row but containerService missing, skipping docker cleanup",
+      { containerId: containerRow.id, cid, hostUuid: effectiveHostUuid },
+    );
+    return;
+  }
+  const useRemote = isRemote;
   const failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }> = [];
   try {
     if (useRemote) {
-      await deps.containerService!.stop(containerRow.host_uuid!, cid, { timeoutSec });
+      await deps.containerService!.stop(effectiveHostUuid!, cid, { timeoutSec });
     } else {
       await deps.docker.getContainer(cid).stop({ t: timeoutSec });
     }
@@ -1560,7 +1615,7 @@ export async function stopAndRemoveV3Container(
   let containerCleared = false;
   try {
     if (useRemote) {
-      await deps.containerService!.remove(containerRow.host_uuid!, cid, { force: true });
+      await deps.containerService!.remove(effectiveHostUuid!, cid, { force: true });
     } else {
       await deps.docker.getContainer(cid).remove({ force: true });
     }
