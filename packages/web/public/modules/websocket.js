@@ -1,17 +1,17 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
-import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js?v=be8d76a'
+import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js?v=5d4f08f'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=be8d76a'
-import { dbPut } from './db.js?v=be8d76a'
-import { $, htmlSafeEscape } from './dom.js?v=be8d76a'
-import { maybeNotify, setTitleBusy } from './notifications.js?v=be8d76a'
-import { _clearStoredAccessToken, getSession, state } from './state.js?v=be8d76a'
-import { maybeSyncNow } from './sync.js?v=be8d76a'
-import { toast } from './ui.js?v=be8d76a'
+import { clearSessionCookie } from './auth.js?v=5d4f08f'
+import { dbPut } from './db.js?v=5d4f08f'
+import { $, htmlSafeEscape } from './dom.js?v=5d4f08f'
+import { maybeNotify, setTitleBusy } from './notifications.js?v=5d4f08f'
+import { _clearStoredAccessToken, getSession, state } from './state.js?v=5d4f08f'
+import { maybeSyncNow } from './sync.js?v=5d4f08f'
+import { toast } from './ui.js?v=5d4f08f'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance, _openTopupModal } from './billing.js?v=be8d76a'
+import { refreshBalance, _openTopupModal } from './billing.js?v=5d4f08f'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
