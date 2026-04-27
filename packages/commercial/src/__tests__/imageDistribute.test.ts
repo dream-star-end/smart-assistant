@@ -59,6 +59,7 @@ function fakeRow(over: Partial<ComputeHostRow> = {}): ComputeHostRow {
     max_containers: 20,
     bridge_cidr: null,
     egress_proxy_endpoint: null,
+    expires_at: null,
     created_at: now,
     updated_at: now,
     ...over,

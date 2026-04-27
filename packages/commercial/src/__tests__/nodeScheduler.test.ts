@@ -94,6 +94,7 @@ function mkHost(
     // bridge_cidr: migration 0032 新列。测试默认 null → pickBoundIp 走 fallback 路径,
     // 可单测显式传入 "172.30.x.0/24" 覆盖 DB 走源。
     bridge_cidr: opts.bridge_cidr ?? null,
+    expires_at: opts.expires_at ?? null,
     created_at: opts.created_at ?? now,
     updated_at: opts.updated_at ?? now,
   } as ComputeHostRow;

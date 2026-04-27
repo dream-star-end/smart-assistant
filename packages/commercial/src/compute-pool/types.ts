@@ -53,6 +53,11 @@ export interface ComputeHostRow {
    * 实际端口由 master 端 EgressTarget 构造,这里仅作存在性 + host 来源记录。
    */
   egress_proxy_endpoint: string | null;
+  /**
+   * 0041:VPS 租期到期时间(TIMESTAMPTZ,UTC 入库)。
+   * NULL = self 或未填(永久/自有)。仅展示用,不参与调度,不触发自动化。
+   */
+  expires_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -78,6 +83,8 @@ export interface ComputeHost {
   consecutiveHealthFail: number;
   consecutiveHealthOk: number;
   maxContainers: number;
+  /** 0041:VPS 租期到期 ISO8601(UTC,toISOString())。NULL = 永久/未填。 */
+  expiresAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -248,6 +255,7 @@ export function mapRowToHost(row: ComputeHostRow): ComputeHost {
     consecutiveHealthFail: row.consecutive_health_fail,
     consecutiveHealthOk: row.consecutive_health_ok,
     maxContainers: row.max_containers,
+    expiresAt: row.expires_at ? row.expires_at.toISOString() : null,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   };

@@ -26,7 +26,8 @@ const COMPUTE_HOST_COLS = `
   status, last_bootstrap_at, last_bootstrap_err,
   last_health_at, last_health_ok, last_health_err,
   consecutive_health_fail, consecutive_health_ok,
-  max_containers, bridge_cidr, egress_proxy_endpoint, created_at, updated_at
+  max_containers, bridge_cidr, egress_proxy_endpoint,
+  expires_at, created_at, updated_at
 `;
 
 export async function listAllHosts(): Promise<ComputeHostRow[]> {
@@ -192,6 +193,8 @@ export interface CreateHostInput {
   maxContainers: number;
   /** 用户在 admin UI 里填的 bridge 子网;落 DB 后 scheduler 用它分配 bound_ip。 */
   bridgeCidr: string;
+  /** 0041:VPS 租期到期(UTC Date 或 null=永久/未填)。仅展示,不参与调度。 */
+  expiresAt?: Date | null;
 }
 
 export async function createHost(input: CreateHostInput): Promise<ComputeHostRow> {
@@ -201,9 +204,9 @@ export async function createHost(input: CreateHostInput): Promise<ComputeHostRow
          id, name, host, ssh_port, ssh_user, agent_port,
          ssh_password_nonce, ssh_password_ct,
          agent_psk_nonce, agent_psk_ct,
-         max_containers, bridge_cidr, status
+         max_containers, bridge_cidr, expires_at, status
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'bootstrapping')
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'bootstrapping')
        RETURNING ${COMPUTE_HOST_COLS}`,
       [
         input.id,
@@ -218,6 +221,7 @@ export async function createHost(input: CreateHostInput): Promise<ComputeHostRow
         input.agentPskCt,
         input.maxContainers,
         input.bridgeCidr,
+        input.expiresAt ?? null,
       ],
     );
     return r.rows[0]!;
@@ -227,9 +231,9 @@ export async function createHost(input: CreateHostInput): Promise<ComputeHostRow
        name, host, ssh_port, ssh_user, agent_port,
        ssh_password_nonce, ssh_password_ct,
        agent_psk_nonce, agent_psk_ct,
-       max_containers, bridge_cidr, status
+       max_containers, bridge_cidr, expires_at, status
      )
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'bootstrapping')
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'bootstrapping')
      RETURNING ${COMPUTE_HOST_COLS}`,
     [
       input.name,
@@ -243,9 +247,27 @@ export async function createHost(input: CreateHostInput): Promise<ComputeHostRow
       input.agentPskCt,
       input.maxContainers,
       input.bridgeCidr,
+      input.expiresAt ?? null,
     ],
   );
   return r.rows[0]!;
+}
+
+/**
+ * 0041:更新 host 的 expires_at(可清空)。
+ * 返 true 表更新到行,false 表 host 不存在。
+ */
+export async function updateExpiresAt(
+  id: string,
+  expiresAt: Date | null,
+): Promise<boolean> {
+  const r = await getPool().query(
+    `UPDATE compute_hosts
+        SET expires_at = $2, updated_at = NOW()
+      WHERE id = $1`,
+    [id, expiresAt],
+  );
+  return (r.rowCount ?? 0) > 0;
 }
 
 export async function updateStatus(

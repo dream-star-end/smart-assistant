@@ -8,6 +8,7 @@
  *   POST /api/admin/v3/compute-hosts/:id/drain             进入 draining
  *   POST /api/admin/v3/compute-hosts/:id/remove            删除(仅 draining + active=0)
  *   POST /api/admin/v3/compute-hosts/:id/quarantine-clear  quarantined → ready
+ *   POST /api/admin/v3/compute-hosts/:id/expires-at        更新 VPS 到期时间(0041)
  *   GET  /api/admin/v3/baseline-version                    master + 每 host baseline 版本
  *
  * 鉴权:全部 requireAdminVerifyDb(JWT + DB 双校验)。
@@ -31,6 +32,7 @@ import {
   drainComputeHost,
   removeComputeHost,
   clearQuarantineForHost,
+  updateComputeHostExpiresAt,
   getBaselineVersions,
   adminDistributeImageToAllHosts,
   adminDistributeImageToHost,
@@ -156,6 +158,16 @@ export async function handleAdminComputeHostAction(
       // 比加 task queue 简单。
       const result = await adminDistributeImageToHost(id, auditCtx);
       sendJson(res, 200, { id, result });
+      return;
+    }
+    case "expires-at": {
+      // 0041:更新 VPS 租期。body { expires_at: ISO8601-tz | null }。
+      // 成功返 204 No Content(前端拿到后直接 _loadHostsData 刷新)。
+      const body = (await readJsonBody(req)) ?? {};
+      await updateComputeHostExpiresAt(id, body, auditCtx);
+      res.statusCode = 204;
+      res.setHeader("Cache-Control", "no-store");
+      res.end();
       return;
     }
     default:

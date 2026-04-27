@@ -4930,6 +4930,52 @@ function _certChipForHost(h) {
   return `<span class="chip chip-muted" title="${escapeHtml(fmtDate(h.cert_not_after))}">${days}d</span>`
 }
 
+// 0041: VPS 租期到期 chip。
+// 无值 → 灰底"—"按钮(点击设置);有值 → 按"剩余天数"红/黄/灰,点击编辑。
+// 可点击区域用 button data-act="h-set-exp" 让外层 event delegation 接管(避免 inline onclick)。
+function _expiresChipForHost(h) {
+  const idAttr = escapeHtml(h.id || '')
+  const nameAttr = escapeHtml(h.name || '')
+  if (!h.expires_at) {
+    return `<button class="chip chip-muted" data-act="h-set-exp" data-id="${idAttr}" data-name="${nameAttr}" data-current="" title="点击设置 VPS 到期" style="cursor:pointer">设置</button>`
+  }
+  const ms = new Date(h.expires_at).getTime() - Date.now()
+  const tipFull = escapeHtml(fmtDate(h.expires_at))
+  const dataCurrent = escapeHtml(h.expires_at)
+  const baseAttrs = `data-act="h-set-exp" data-id="${idAttr}" data-name="${nameAttr}" data-current="${dataCurrent}" style="cursor:pointer"`
+  if (Number.isNaN(ms)) {
+    return `<button class="chip chip-muted" ${baseAttrs} title="${tipFull}">${escapeHtml(h.expires_at)}</button>`
+  }
+  const days = Math.floor(ms / 86400000)
+  if (days < 0) {
+    return `<button class="chip chip-danger" ${baseAttrs} title="${tipFull}">已过期</button>`
+  }
+  if (days < 7) {
+    return `<button class="chip chip-warn" ${baseAttrs} title="${tipFull}">${days}d</button>`
+  }
+  return `<button class="chip chip-muted" ${baseAttrs} title="${tipFull}">${days}d</button>`
+}
+
+// 0041: 把 ISO8601(UTC)转成 datetime-local 控件能消费的"北京时间(UTC+8)墙钟"字符串
+// `YYYY-MM-DDTHH:mm`。手算 +8h offset 用 UTC 字段读出墙钟,避免依赖浏览器本地时区。
+function isoToShanghaiInputValue(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const sh = new Date(d.getTime() + 8 * 3600 * 1000)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${sh.getUTCFullYear()}-${pad(sh.getUTCMonth() + 1)}-${pad(sh.getUTCDate())}T${pad(sh.getUTCHours())}:${pad(sh.getUTCMinutes())}`
+}
+
+// 0041: datetime-local 输入(`YYYY-MM-DDTHH:mm`)+ 北京时区 → ISO8601 with offset。
+// 空串 → null。返回值直接 POST 到后端(后端正则校验只接 +08:00 这种带冒号 offset)。
+function shanghaiInputToIso(val) {
+  const s = (val ?? '').trim()
+  if (!s) return null
+  // datetime-local 缺秒:补 ":00";拼上东八区 offset 让后端把这串当北京时间解析
+  return `${s}:00+08:00`
+}
+
 function _renderHostsTable() {
   const el = $('h-table-container')
   if (!el) return
@@ -4948,6 +4994,7 @@ function _renderHostsTable() {
           <th>状态</th>
           <th class="num">active / max</th>
           <th>cert 到期</th>
+          <th>VPS 到期</th>
           <th>最近健康</th>
           <th>最近 bootstrap</th>
           <th class="actions">操作</th>
@@ -4967,6 +5014,10 @@ function _renderHostsTable() {
   }
   for (const b of el.querySelectorAll('button[data-act="h-clearq"]')) {
     b.addEventListener('click', (ev) => clearHostQuarantine(b.dataset.id, b.dataset.name, ev.currentTarget))
+  }
+  // 0041:VPS 到期 chip 点击 → 编辑模态
+  for (const b of el.querySelectorAll('button[data-act="h-set-exp"]')) {
+    b.addEventListener('click', () => openSetExpiresModal(b.dataset.id, b.dataset.name, b.dataset.current || ''))
   }
   // active/max 链跳:跳 containers tab + host_uuid 过滤
   for (const a of el.querySelectorAll('a[data-nav]')) {
@@ -5025,6 +5076,7 @@ function _renderHostRow(h) {
       <td>${_hostStatusBadge(h.status)}</td>
       <td>${activeCell}</td>
       <td>${_certChipForHost(h)}</td>
+      <td>${_expiresChipForHost(h)}</td>
       <td>${healthChip}${healthCounter}</td>
       <td>${bootstrapChip}</td>
       <td class="actions">${btns.join(' ')}</td>
@@ -5065,6 +5117,10 @@ function openAddHostModal() {
     <div class="form-row"><label>max_containers</label>
       <input type="number" id="nh-max" value="20" min="1" max="200" />
     </div>
+    <div class="form-row"><label>VPS 到期</label>
+      <input type="datetime-local" id="nh-expires" />
+      <small style="color:var(--muted);font-size:12px">北京时间(UTC+8),可留空</small>
+    </div>
     <div class="form-actions">
       <button id="nh-cancel">取消</button>
       <button class="btn-primary" id="nh-ok">添加并 Bootstrap</button>
@@ -5081,6 +5137,7 @@ function openAddHostModal() {
       agent_port: Number($('nh-agent-port').value),
       bridge_cidr: $('nh-bridge-cidr').value.trim(),
       max_containers: Number($('nh-max').value),
+      expires_at: shanghaiInputToIso($('nh-expires').value),
     }
     if (!body.name || !body.host || !body.password || !body.bridge_cidr) {
       toast('请填完必填项', 'danger'); return
@@ -5147,6 +5204,50 @@ function openBootstrapLogModal(hostId, name) {
   }
   tick()
   _bootstrapLogTimer = setInterval(tick, 3000)
+}
+
+// ─── Hosts: 0041 set expires_at modal ────────────────────────────────
+
+function openSetExpiresModal(hostId, name, currentIso) {
+  const initVal = isoToShanghaiInputValue(currentIso)
+  openModal(`
+    <h3>设置 VPS 到期 · ${escapeHtml(name)}</h3>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      北京时间(UTC+8)。清空(永久/未填)请点"清空"按钮,直接留空保存会被拒绝。
+    </div>
+    <div class="form-row"><label>到期时间</label>
+      <input type="datetime-local" id="he-input" value="${escapeHtml(initVal)}" />
+    </div>
+    <div class="form-actions">
+      <button id="he-cancel">取消</button>
+      <button id="he-clear">清空</button>
+      <button class="btn-primary" id="he-ok">保存</button>
+    </div>
+  `)
+  $('he-cancel').addEventListener('click', closeModal)
+  const submit = async (ev, expiresAt /* string|null */) => {
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        await apiJson('POST', `/api/admin/v3/compute-hosts/${encodeURIComponent(hostId)}/expires-at`, {
+          expires_at: expiresAt,
+        })
+        toast(expiresAt ? `${name} 到期已更新` : `${name} 到期已清空`)
+        closeModal()
+        _loadHostsData(HOSTS_STATE.renderSeq)
+      } catch (e) {
+        toast(`保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  }
+  $('he-clear').addEventListener('click', (ev) => submit(ev, null))
+  $('he-ok').addEventListener('click', (ev) => {
+    const iso = shanghaiInputToIso($('he-input').value)
+    if (!iso) {
+      toast('请先填写到期时间,或点"清空"', 'danger')
+      return
+    }
+    submit(ev, iso)
+  })
 }
 
 // ─── Hosts: drain / remove / clearQuarantine ─────────────────────────

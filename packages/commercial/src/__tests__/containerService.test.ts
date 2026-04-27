@@ -60,7 +60,7 @@ function mkHost(id: string, name: string, status: ComputeHostStatus = "ready"): 
     status, last_bootstrap_at: null, last_bootstrap_err: null,
     last_health_at: null, last_health_ok: null, last_health_err: null,
     consecutive_health_fail: 0, consecutive_health_ok: 0,
-    max_containers: 20, created_at: now, updated_at: now,
+    max_containers: 20, expires_at: null, created_at: now, updated_at: now,
   } as unknown as ComputeHostRow;
 }
 
