@@ -134,6 +134,25 @@ export const OutboundContentBlock = Type.Union([
     text: Type.String(),
     parentToolUseId: Type.Optional(Type.String()),
   }),
+  // Snapshot of a long-running bash command's tail output. Snapshot
+  // semantics: the consumer REPLACES its prior tail buffer with `tail`
+  // rather than appending — the polling cadence is deliberately lossy
+  // on the head when output exceeds the tail window (~4 KB). Truncated
+  // head is signalled by `truncatedHead`. Frames are throttled by the
+  // gateway so the wire never floods even when output is dense.
+  // `toolUseBlockId` MUST match the parent BashTool tool_use blockId so
+  // the web side can locate the right card via _blockIdToMsgId.
+  Type.Object({
+    kind: Type.Literal('tool_output_tail'),
+    /** The parent BashTool tool_use blockId — used for routing. */
+    toolUseBlockId: Type.String(),
+    tail: Type.String(),
+    /** File size at capture time, in bytes. */
+    totalBytes: Type.Number(),
+    /** True when output exceeded the tail window and the head is missing. */
+    truncatedHead: Type.Boolean(),
+    parentToolUseId: Type.Optional(Type.String()),
+  }),
 ])
 export type OutboundContentBlock = Static<typeof OutboundContentBlock>
 

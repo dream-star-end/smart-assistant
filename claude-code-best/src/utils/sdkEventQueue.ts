@@ -65,19 +65,49 @@ type SessionStateChangedEvent = {
   state: 'idle' | 'running' | 'requires_action'
 }
 
+// Snapshot of the latest tail of a bash command's output, emitted on a polling
+// cadence (~1 Hz, driven by TaskOutput's shared poller). `tail` is a tail-only
+// snapshot in plain text — the consumer should REPLACE its prior tail buffer
+// rather than append. `total_bytes` is the file size at the time of capture;
+// `truncated_head` is true when output exceeded the tail window and the
+// preceding content is not in `tail`.
+//
+// For background tasks the tool_use_id is the original BashTool toolUseId
+// captured at spawn time; the gateway uses it (plus parent_tool_use_id for
+// subagents) to route the frame back to the right UI card.
+type BashOutputTailEvent = {
+  type: 'system'
+  subtype: 'bash_output_tail'
+  tool_use_id: string
+  parent_tool_use_id?: string
+  task_id?: string
+  tail: string
+  total_bytes: number
+  truncated_head: boolean
+}
+
 export type SdkEvent =
   | TaskStartedEvent
   | TaskProgressEvent
   | TaskNotificationSdkEvent
   | SessionStateChangedEvent
+  | BashOutputTailEvent
 
 const MAX_QUEUE_SIZE = 1000
 const queue: SdkEvent[] = []
+let flushListener: ((events: SdkEvent[]) => void) | null = null
 
 export function enqueueSdkEvent(event: SdkEvent): void {
   // SDK events are only consumed (drained) in headless/streaming mode.
   // In TUI mode they would accumulate up to the cap and never be read.
   if (!getIsNonInteractiveSession()) {
+    return
+  }
+  // Push-mode: bypass the queue entirely so background-task ticks don't
+  // wait for the next message in the main turn loop. The listener stamps
+  // uuid+session_id and writes to the output stream immediately.
+  if (flushListener) {
+    flushListener([event])
     return
   }
   if (queue.length >= MAX_QUEUE_SIZE) {
@@ -98,6 +128,34 @@ export function drainSdkEvents(): Array<
     uuid: randomUUID(),
     session_id: getSessionId(),
   }))
+}
+
+/**
+ * Register a listener that receives SDK events synchronously as they are
+ * enqueued. While a listener is set, enqueueSdkEvent skips the in-memory
+ * queue entirely — events flow straight to the listener. This is required
+ * for background-task ticks (e.g. bash_output_tail) that must reach the
+ * client even when the main turn loop is idle (no message → no drain).
+ *
+ * Returns a disposer; the caller MUST call it on shutdown to drop the
+ * reference and resume queue mode for any subsequent (post-listener)
+ * emissions.
+ */
+export function setFlushListener(
+  listener: (events: SdkEvent[]) => void,
+): () => void {
+  flushListener = listener
+  // Drain anything that was queued before the listener was attached so it
+  // isn't lost when print.ts later switches over to drain-on-message.
+  if (queue.length > 0) {
+    const pending = queue.splice(0)
+    listener(pending)
+  }
+  return () => {
+    if (flushListener === listener) {
+      flushListener = null
+    }
+  }
 }
 
 /**
@@ -130,5 +188,31 @@ export function emitTaskTerminatedSdk(
     output_file: opts?.outputFile ?? '',
     summary: opts?.summary ?? '',
     usage: opts?.usage,
+  })
+}
+
+/**
+ * Emit a snapshot of a bash command's tail output. Snapshot semantics:
+ * the consumer (gateway → web) replaces its prior tail buffer with `tail`
+ * rather than appending — the polling cadence is deliberately lossy on
+ * the head when output exceeds the tail window, which is signalled by
+ * `truncatedHead`.
+ */
+export function emitBashOutputTail(
+  toolUseId: string,
+  tail: string,
+  totalBytes: number,
+  truncatedHead: boolean,
+  opts?: { taskId?: string; parentToolUseId?: string },
+): void {
+  enqueueSdkEvent({
+    type: 'system',
+    subtype: 'bash_output_tail',
+    tool_use_id: toolUseId,
+    parent_tool_use_id: opts?.parentToolUseId,
+    task_id: opts?.taskId,
+    tail,
+    total_bytes: totalBytes,
+    truncated_head: truncatedHead,
   })
 }

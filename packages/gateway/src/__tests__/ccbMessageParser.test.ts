@@ -322,6 +322,92 @@ describe('CcbMessageParser: system', () => {
     parser.parse({ type: 'system', session_id: 'test-123' } as any)
     assert.equal(events.length, 0)
   })
+
+  it('emits tool_output_tail block for system bash_output_tail', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'bash_output_tail',
+      tool_use_id: 'toolu_bash_123',
+      tail: 'line1\nline2\n',
+      total_bytes: 12,
+      truncated_head: false,
+    } as any)
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'block')
+    if (events[0].kind === 'block') {
+      const b = events[0].block as any
+      assert.equal(b.kind, 'tool_output_tail')
+      assert.equal(b.toolUseBlockId, 'toolu_bash_123')
+      assert.equal(b.tail, 'line1\nline2\n')
+      assert.equal(b.totalBytes, 12)
+      assert.equal(b.truncatedHead, false)
+      assert.equal(b.parentToolUseId, undefined)
+    }
+  })
+
+  it('forwards parent_tool_use_id on bash_output_tail for subagent routing', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'bash_output_tail',
+      tool_use_id: 'toolu_bash_child',
+      parent_tool_use_id: 'toolu_agent_parent',
+      tail: 'sub output',
+      total_bytes: 10,
+      truncated_head: true,
+    } as any)
+    assert.equal(events.length, 1)
+    if (events[0].kind === 'block') {
+      const b = events[0].block as any
+      assert.equal(b.parentToolUseId, 'toolu_agent_parent')
+      assert.equal(b.truncatedHead, true)
+    }
+  })
+
+  it('drops bash_output_tail with missing/empty tool_use_id (no orphan blocks)', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'bash_output_tail',
+      tail: 'orphan',
+      total_bytes: 6,
+      truncated_head: false,
+    } as any)
+    parser.parse({
+      type: 'system',
+      subtype: 'bash_output_tail',
+      tool_use_id: '',
+      tail: 'empty id',
+      total_bytes: 8,
+      truncated_head: false,
+    } as any)
+    assert.equal(events.length, 0)
+  })
+
+  it('coerces missing tail/total_bytes to safe defaults', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'bash_output_tail',
+      tool_use_id: 'toolu_x',
+    } as any)
+    assert.equal(events.length, 1)
+    if (events[0].kind === 'block') {
+      const b = events[0].block as any
+      assert.equal(b.tail, '')
+      assert.equal(b.totalBytes, 0)
+      assert.equal(b.truncatedHead, false)
+    }
+  })
+
+  it('ignores other system subtypes (e.g. task_progress, init)', () => {
+    const { parser, events } = createParser()
+    parser.parse({ type: 'system', subtype: 'init', session_id: 'x' } as any)
+    parser.parse({ type: 'system', subtype: 'task_progress', task_id: 't1' } as any)
+    parser.parse({ type: 'system', subtype: 'task_started', task_id: 't1' } as any)
+    assert.equal(events.length, 0)
+  })
 })
 
 console.log('CcbMessageParser tests passed.')

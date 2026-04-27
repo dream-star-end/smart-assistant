@@ -13,6 +13,7 @@ import { enqueuePendingNotification } from '../../utils/messageQueueManager.js';
 import type { ShellCommand } from '../../utils/ShellCommand.js';
 import { evictTaskOutput, getTaskOutputPath } from '../../utils/task/diskOutput.js';
 import { registerTask, updateTaskState } from '../../utils/task/framework.js';
+import { TaskOutput } from '../../utils/task/TaskOutput.js';
 import { escapeXml } from '../../utils/xml.js';
 import { backgroundAgentTask, isLocalAgentTask } from '../LocalAgentTask/LocalAgentTask.js';
 import { isMainSessionTask } from '../LocalMainSessionTask.js';
@@ -170,6 +171,29 @@ function enqueueShellNotification(taskId: string, description: string, status: '
     agentId
   });
 }
+/**
+ * Keep the shared TaskOutput poller alive for a backgrounded shell so
+ * the foreground BashTool's onProgress closure (still wired in
+ * TaskOutput) keeps firing bash_output_tail SDK events after the
+ * BashTool generator has already exited and dropped its own ref.
+ *
+ * Single-emitter design: only the constructor-time onProgress emits
+ * tail frames (see BashTool.tsx). LocalShellTask just bumps the poll
+ * ref count via startPolling so the poller doesn't shut off when
+ * BashTool's finally calls stopPolling. No second listener — that
+ * would double-emit during the brief overlap when both refs are
+ * active. Returns a release function the caller MUST invoke once
+ * the command has terminated.
+ */
+function attachBashTailKeepalive(taskId: string): () => void {
+  TaskOutput.startPolling(taskId);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    TaskOutput.stopPolling(taskId);
+  };
+}
 export const LocalShellTask: Task = {
   name: 'LocalShellTask',
   type: 'local_bash',
@@ -219,8 +243,13 @@ export async function spawnShellTask(input: LocalShellSpawnInput & {
   // Just transition to backgrounded state so the process keeps running.
   shellCommand.background(taskId);
   const cancelStallWatchdog = startStallWatchdog(taskId, description, kind, toolUseId, agentId);
+  // Stream the tail to the SDK channel so the web shows live output for
+  // backgrounded commands. Detached after the result resolves; clear() in
+  // flushAndCleanup is also safe (it drops listeners + halts polling).
+  const detachTail = attachBashTailKeepalive(taskId);
   void shellCommand.result.then(async result => {
     cancelStallWatchdog();
+    detachTail();
     await flushAndCleanup(shellCommand);
     let wasKilled = false;
     updateTaskState<LocalShellTaskState>(taskId, setAppState, task => {
@@ -326,10 +355,14 @@ function backgroundTask(taskId: string, getAppState: () => AppState, setAppState
     };
   });
   const cancelStallWatchdog = startStallWatchdog(taskId, description, kind, toolUseId, agentId);
+  // Backgrounded via Ctrl+B: keep streaming the tail so the user can
+  // still watch the moved-to-background command in the web UI.
+  const detachTail = attachBashTailKeepalive(taskId);
 
   // Set up result handler
   void shellCommand.result.then(async result => {
     cancelStallWatchdog();
+    detachTail();
     await flushAndCleanup(shellCommand);
     let wasKilled = false;
     let cleanupFn: (() => void) | undefined;
@@ -440,10 +473,14 @@ export function backgroundExistingForegroundTask(taskId: string, shellCommand: S
     };
   });
   const cancelStallWatchdog = startStallWatchdog(taskId, description, undefined, toolUseId, agentId);
+  // Auto-backgrounded after timeout: same tail-streaming as Ctrl+B path
+  // so the foreground command's existing live output keeps flowing.
+  const detachTail = attachBashTailKeepalive(taskId);
 
   // Set up result handler (mirrors backgroundTask's handler)
   void shellCommand.result.then(async result => {
     cancelStallWatchdog();
+    detachTail();
     await flushAndCleanup(shellCommand);
     let wasKilled = false;
     let cleanupFn: (() => void) | undefined;
