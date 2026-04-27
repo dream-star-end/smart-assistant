@@ -287,7 +287,22 @@ echo "=== deploy-v3 → tag $TAG  branch $BRANCH ==="
 # ── 1. Remote safety check ──
 remote_safety_check
 
-# ── 2. Changelog PENDING pre-check ──
+# ── 2. Changelog boss-approval gate (post 2026-04-27) ──
+# Boss requires explicit approval for any user-facing changelog content. Two
+# layered checks:
+#   (a) releases[] length: any non-empty releases array means a release entry
+#       will be shipped to prod. AI agents must never bypass — gate via
+#       BOSS_APPROVED_CHANGELOG=1 env var.
+#   (b) changelog-finalize.ts has its own internal gate when PENDING → TAG
+#       replacement happens.
+RELEASE_COUNT=$(jq '.releases | length' "$REPO_ROOT/changelog.json")
+if [[ "$RELEASE_COUNT" -gt 0 && "${BOSS_APPROVED_CHANGELOG:-}" != "1" ]]; then
+  echo "ERROR: changelog.json releases 数组非空 ($RELEASE_COUNT 条),但未带 BOSS_APPROVED_CHANGELOG=1。" >&2
+  echo "       任何更新日志变更必须 boss 显式批准。" >&2
+  exit 1
+fi
+
+# Changelog PENDING pre-check.
 # Semver mode (post 2026-04-26): boss bumps `currentVersion` + adds release
 # entry pre-deploy, so 0 PENDING is the normal case (no prompt, no abort).
 # 1 PENDING is still allowed (legacy / manual workflow) → finalize replaces

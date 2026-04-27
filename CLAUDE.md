@@ -34,3 +34,7 @@ Workflow:
 Exception: docs / ops scripts / typo fixes don't need a dev instance.
 
 For commercial v2 (38.55), use `deploy-to-remote.sh` — that path is separate and not governed by this rule.
+
+## Changelog 审核制度
+
+`changelog.json` 的 `releases[]` 内容必须由 boss 亲自决定。AI agent 不得自行起草、新增、修改、重写更新日志条目(含 PENDING 占位)。deploy 流程已加 hard gate 拦截。

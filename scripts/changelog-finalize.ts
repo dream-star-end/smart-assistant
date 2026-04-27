@@ -66,6 +66,16 @@ if (arg === "--count") {
   process.exit(0);
 }
 
+// Boss-approval gate (post 2026-04-27): replacing PENDING means writing a new
+// release entry into prod's user-facing changelog. Boss requires explicit
+// approval for any changelog content. AI agents must never bypass this.
+if (process.env.BOSS_APPROVED_CHANGELOG !== "1") {
+  die(
+    "changelog 内容修改必须由 boss 显式批准。请设置 BOSS_APPROVED_CHANGELOG=1 后重试。",
+    4,
+  );
+}
+
 // Replace mode — arg is the TAG.
 // Accepts both legacy `v3-YYYYMMDDTHHMMZ-<hash>` and new semver `vX.Y.Z`
 // (post-2026-04-26 semver workflow; old tag format kept for any in-flight
