@@ -3,31 +3,35 @@
  *
  * 见 docs/v3/02-DEVELOPMENT-PLAN.md §9.3 Task 3H + §1.0.2 I3 hostAgentReconcile。
  *
- * 双向对账(MVP 单 host 单进程):
+ * 双向对账:
  *
  *   Direction A — docker → DB orphan(本机 v3 标签容器 不在 DB active 集合)
  *     - listContainers({all:true, filters:{label:'com.openclaude.v3.managed=1'}})
- *     - SELECT container_internal_id FROM agent_containers WHERE state='active'
+ *     - SELECT container_internal_id, host_uuid FROM agent_containers WHERE state='active'
+ *     - dbActiveCids 只取 (host_uuid IS NULL OR = selfHostId) 的行;selfHostId 缺失
+ *       时退回原全集,避免误排除本机带 host_uuid 的真实容器
  *     - diff: docker 有但 DB 不在 → docker 孤儿(supervisor 崩 / 老进程残留)
  *     - 安全护栏:跳过 Created < SAFETY_RACE_WINDOW_SEC(默认 300s)的容器,
  *       避免撞 provision 中 INSERT-then-create-then-UPDATE 之间的窗口
  *     - 命中 → docker stop + remove --force(missing → noop)
  *
- *   Direction B — DB → docker orphan(DB active 行 docker inspect 404)
- *     - SELECT id, container_internal_id FROM agent_containers
+ *   Direction B — DB → docker orphan(DB active 行 inspect 404)
+ *     - SELECT id, container_internal_id, host_uuid FROM agent_containers
  *         WHERE state='active' AND container_internal_id IS NOT NULL
- *     - 对每行 docker.getContainer(cid).inspect(),404 → 标 vanished
- *     - 这复用 stopAndRemoveV3Container(handle 在 isNotFound 分支会 noop,
- *       UPDATE state='vanished' 必跑 — 跟 ensureRunning 的 missing 路径同
- *       一段语义,只是这里是周期主动扫,不等用户重连)
+ *     - 多机路由(2026-04-27 修复):
+ *       · host_uuid NULL/空 或 === selfHostId → 走本机 deps.docker.inspect
+ *       · host_uuid !== selfHostId 且 containerService + selfHostId 都注入
+ *         → 走 deps.containerService.inspect(host_uuid, cid) (mTLS 到 node-agent)
+ *       · 其他(selfHostId 缺失 / 跨 host 但 containerService 没注入)→ skip,
+ *         debug 日志,绝不 vanish (无法确认死活时不做破坏性动作)
+ *     - inspect 404 → 标 vanished;非 404 错误(网络/mTLS 临时失败)→ errors[],
+ *       绝不 vanish — 控制面不可达不证明容器消失
+ *     - 复用 stopAndRemoveV3Container(它内部按 host_uuid 路由 stop/remove)
  *
- * MVP 简化(单 host 单进程):
- *   - 没有 host_id 概念 → 全表 diff,不按 host 划分
- *   - 没有 agent_migrations ledger → R6.11 reader 二选一 trivial 满足
- *     (本文件在 RECONCILER_WHITELIST 内,§9 3M)
+ * 关于 NULL 行:
  *   - container_internal_id IS NULL 的行 不参与 direction B(provision 中间窗口
- *     INSERT 已落但 UPDATE 还没跑;若 supervisor 崩在中间会留 NULL 行,但
- *     完整 BEGIN/COMMIT 兜住该窗口,实际不会出现 — 留个 TODO P1 加 stuck-row 巡)
+ *     INSERT 已落但 UPDATE 还没跑;完整 BEGIN/COMMIT 兜住该窗口,实际不会出现)
+ *   - host_uuid IS NULL 视为 legacy/单机 行,Direction B 走本机 inspect
  *
  * 不在本文件管:
  *   - volume orphan reconcile(volume 没绑容器但 PG 没标记):3G 已扫 banned/no-login,
@@ -124,8 +128,12 @@ export interface OrphanReconcileScheduler {
 // ───────────────────────────────────────────────────────────────────────
 
 function isNotFound(err: unknown): boolean {
-  return typeof err === "object" && err !== null && "statusCode" in err
-    && (err as { statusCode: number }).statusCode === 404;
+  if (typeof err !== "object" || err === null) return false;
+  // dockerode 抛 `{ statusCode: 404 }`;远端 RemoteNodeAgentBackend 走
+  // nodeAgentClient 抛 `AgentAppError { httpStatus: 404 }`(见
+  // compute-pool/nodeAgentClient.ts:344)。两者都视作"容器在该 host 已不存在"。
+  const e = err as { statusCode?: unknown; httpStatus?: unknown };
+  return e.statusCode === 404 || e.httpStatus === 404;
 }
 
 interface DockerContainerInfo {
@@ -167,6 +175,12 @@ async function listManagedContainers(
 interface DbActiveRow {
   id: number;
   container_internal_id: string | null;
+  /**
+   * 调度到的 host_uuid。NULL = 单机 MVP 遗留行(视为本机);非空且 ≠ selfHostId
+   * 时 Direction B 必须走 `containerService.inspect(host_uuid, cid)` 路由,
+   * 否则本机 docker inspect 必 404 → 误标 vanished(已修复)。
+   */
+  host_uuid: string | null;
 }
 
 /**
@@ -175,8 +189,12 @@ interface DbActiveRow {
  * R6.11 reader 二选一:本文件在 RECONCILER_WHITELIST 内,trivial 满足。
  */
 async function listActiveRows(pool: Pool, batchLimit: number): Promise<DbActiveRow[]> {
-  const r = await pool.query<{ id: string; container_internal_id: string | null }>(
-    `SELECT id, container_internal_id
+  const r = await pool.query<{
+    id: string;
+    container_internal_id: string | null;
+    host_uuid: string | null;
+  }>(
+    `SELECT id, container_internal_id, host_uuid
        FROM agent_containers
       WHERE state = 'active'
       ORDER BY id ASC
@@ -186,6 +204,7 @@ async function listActiveRows(pool: Pool, batchLimit: number): Promise<DbActiveR
   return r.rows.map((row) => ({
     id: Number.parseInt(row.id, 10),
     container_internal_id: row.container_internal_id,
+    host_uuid: row.host_uuid,
   }));
 }
 
@@ -234,7 +253,15 @@ async function reconcileDockerOrphans(
 /**
  * Direction B — 把 docker inspect 404 的 active 行标 vanished。
  *
- * 复用 stopAndRemoveV3Container(它内部 missing → noop + UPDATE state='vanished')。
+ * 复用 stopAndRemoveV3Container(它内部 missing → noop + UPDATE state='vanished',
+ * 并按 host_uuid 路由 stop/remove)。
+ *
+ * 多机路由(2026-04-27 修复):row.host_uuid 非空且 ≠ selfHostId 时必须走
+ * `containerService.inspect(host_uuid, cid)`,不能直打本机 docker socket
+ * (跨 host 容器在本机 docker 必 404 → 误标 vanished;hshi/user33 案,见 1185)。
+ *
+ * Fail-safe:`selfHostId` 或 `containerService` 任一缺失,且 row 是跨 host 行,
+ * 则 skip 该行 — 无法确认容器死活时绝不做破坏性动作。
  */
 async function reconcileDbOrphans(
   deps: V3SupervisorDeps,
@@ -246,30 +273,63 @@ async function reconcileDbOrphans(
   let vanished = 0;
   for (const row of rows) {
     if (!row.container_internal_id) continue; // skip NULL — 见文件头注释
+    const cid = row.container_internal_id;
+    // host 路由判定:row 有 host_uuid 且 ≠ selfHostId → remote
+    const isRemoteRow =
+      typeof row.host_uuid === "string"
+      && row.host_uuid !== ""
+      && typeof deps.selfHostId === "string"
+      && row.host_uuid !== deps.selfHostId;
+    // selfHostId 缺失但 row 显式带 host_uuid → 无法判定本机/远端,skip 不破坏
+    if (
+      typeof row.host_uuid === "string"
+      && row.host_uuid !== ""
+      && typeof deps.selfHostId !== "string"
+    ) {
+      log?.debug?.("[v3/orphanReconcile] skip row: selfHostId missing", {
+        containerId: row.id, host_uuid: row.host_uuid,
+      });
+      continue;
+    }
+    // remote row 但 containerService 没注入 → skip
+    if (isRemoteRow && !deps.containerService) {
+      log?.debug?.("[v3/orphanReconcile] skip remote row: containerService missing", {
+        containerId: row.id, host_uuid: row.host_uuid,
+      });
+      continue;
+    }
     try {
-      const info = await deps.docker.getContainer(row.container_internal_id).inspect();
-      // docker inspect ok → 容器仍存在,direction B 不动它(不管 running 与否,
+      const info = isRemoteRow
+        ? await deps.containerService!.inspect(row.host_uuid!, cid)
+        : await deps.docker.getContainer(cid).inspect();
+      // inspect ok → 容器仍存在,direction B 不动它(不管 running 与否,
       // running 由 idle sweep 管;stopped 等 ensureRunning 触发 missing 路径)
       if (info.State) {
         log?.debug?.("[v3/orphanReconcile] db row alive", {
           containerId: row.id,
-          docker: row.container_internal_id,
+          docker: cid,
+          host_uuid: row.host_uuid,
           running: Boolean(info.State.Running),
         });
       }
     } catch (err) {
       if (isNotFound(err)) {
-        // docker 容器消失 → 标 vanished
+        // 对应 host 上的容器确实消失 → 标 vanished
         try {
           await stopAndRemoveV3Container(
             deps,
-            { id: row.id, container_internal_id: row.container_internal_id },
+            {
+              id: row.id,
+              container_internal_id: cid,
+              host_uuid: row.host_uuid,
+            },
             stopTimeoutSec,
           );
           vanished++;
           log?.info?.("[v3/orphanReconcile] vanished db orphan", {
             containerId: row.id,
-            docker: row.container_internal_id,
+            docker: cid,
+            host_uuid: row.host_uuid,
           });
         } catch (innerErr) {
           const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
@@ -279,10 +339,11 @@ async function reconcileDbOrphans(
           });
         }
       } else {
+        // 网络 / mTLS / docker daemon 临时错 → 不能证明容器消失,绝不 vanish
         const msg = err instanceof Error ? err.message : String(err);
         errors.push({ kind: "db", id: String(row.id), error: msg });
         log?.warn?.("[v3/orphanReconcile] db row inspect failed", {
-          containerId: row.id, err: msg,
+          containerId: row.id, host_uuid: row.host_uuid, err: msg,
         });
       }
     }
@@ -316,8 +377,19 @@ export async function runOrphanReconcileTick(
     deps.docker, safetySec, batchLimit,
   );
   const dbRows = await listActiveRows(deps.pool, batchLimit);
+  // Direction A 的 dbActiveCids 只能用"本机应该有的" cid:host_uuid IS NULL
+  // (legacy 单机行)或 host_uuid === selfHostId。跨 host 行的 cid 不会出现在
+  // 本机 docker.listContainers 里,纳入集合无害但语义不干净;真正的风险是
+  // selfHostId 缺失时,如果还按 host_uuid 过滤,本机带 host_uuid 的 active row
+  // 会被误排除 → 它们的 docker 容器被误判为本机孤儿删掉。selfHostId 缺失时
+  // 退回原全集行为(包含所有 cid),不做 host-aware 缩集。
+  const selfId = deps.selfHostId;
   const dbActiveCids = new Set(
     dbRows
+      .filter((r) => {
+        if (typeof selfId !== "string") return true; // selfHostId 缺失:全集兜底
+        return r.host_uuid === null || r.host_uuid === "" || r.host_uuid === selfId;
+      })
       .map((r) => r.container_internal_id)
       .filter((cid): cid is string => cid !== null && cid !== ""),
   );

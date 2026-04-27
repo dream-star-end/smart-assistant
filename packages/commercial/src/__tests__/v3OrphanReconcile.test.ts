@@ -131,6 +131,7 @@ interface FakeDbRow {
   id: number;
   state: "active" | "vanished";
   container_internal_id: string | null;
+  host_uuid?: string | null;
 }
 
 class FakePool {
@@ -143,9 +144,9 @@ class FakePool {
 
   async query(sql: string, params?: unknown[]): Promise<unknown> {
     const trimmed = String(sql).trim();
-    // SELECT id, container_internal_id FROM agent_containers WHERE state='active'
+    // SELECT id, container_internal_id, host_uuid FROM agent_containers WHERE state='active'
     if (
-      /^SELECT id, container_internal_id\s+FROM agent_containers/i.test(trimmed) &&
+      /^SELECT id, container_internal_id, host_uuid\s+FROM agent_containers/i.test(trimmed) &&
       /WHERE state = 'active'/i.test(trimmed)
     ) {
       const limit = Number(params?.[0]);
@@ -158,6 +159,7 @@ class FakePool {
         rows: matched.map((r) => ({
           id: String(r.id),
           container_internal_id: r.container_internal_id,
+          host_uuid: r.host_uuid ?? null,
         })),
       };
     }
@@ -470,5 +472,289 @@ describe("startOrphanReconcileScheduler", () => {
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(captured.stopped.length, 0);
     await sched.stop();
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  multi-host routing —— hshi/user33 (1185) 误删 bug 的回归测试
+//  bug: Direction B 直打 deps.docker.inspect,跨 host 容器必 404 → 误标 vanished
+//  fix: row.host_uuid !== selfHostId 时走 deps.containerService.inspect(host_uuid, cid)
+// ───────────────────────────────────────────────────────────────────────
+
+interface CsCaptured {
+  inspected: Array<{ hostId: string; cid: string }>;
+  stopped: Array<{ hostId: string; cid: string }>;
+  removed: Array<{ hostId: string; cid: string }>;
+}
+
+function makeContainerService(opts: {
+  /** 这些 cid 在 inspect 时返回 dockerode 风格 404(`statusCode=404`)*/
+  notFoundCids?: Set<string>;
+  /** 这些 cid 在 inspect 时返回 nodeAgent 风格 404(`AgentAppError.httpStatus=404`)*/
+  notFoundCidsHttp?: Set<string>;
+  /** 这些 cid 在 inspect 时抛非 404(模拟 mTLS 临时错)*/
+  throwCids?: Set<string>;
+} = {}): { svc: NonNullable<V3SupervisorDeps["containerService"]>; captured: CsCaptured } {
+  const captured: CsCaptured = { inspected: [], stopped: [], removed: [] };
+  // 模拟 nodeAgentClient.AgentAppError 形状(httpStatus,而非 statusCode)
+  const makeHttpNotFound = (cid: string) => {
+    const e = new Error(`agent returned 404: No such container: ${cid}`) as Error & { httpStatus: number };
+    e.httpStatus = 404;
+    return e;
+  };
+  const svc = {
+    async inspect(hostId: string, cid: string) {
+      captured.inspected.push({ hostId, cid });
+      if (opts.notFoundCids?.has(cid)) {
+        const e = new Error(`No such container: ${cid}`) as Error & { statusCode: number };
+        e.statusCode = 404;
+        throw e;
+      }
+      if (opts.notFoundCidsHttp?.has(cid)) {
+        throw makeHttpNotFound(cid);
+      }
+      if (opts.throwCids?.has(cid)) {
+        const e = new Error("mTLS unavailable") as Error & { statusCode: number };
+        e.statusCode = 502;
+        throw e;
+      }
+      return { Id: cid, State: { Running: true } };
+    },
+    async stop(hostId: string, cid: string) {
+      captured.stopped.push({ hostId, cid });
+      // 模拟 missing → 404(stopAndRemoveV3Container 会吞)
+      if (opts.notFoundCids?.has(cid)) {
+        const e = new Error(`No such container: ${cid}`) as Error & { statusCode: number };
+        e.statusCode = 404;
+        throw e;
+      }
+      if (opts.notFoundCidsHttp?.has(cid)) {
+        throw makeHttpNotFound(cid);
+      }
+    },
+    async remove(hostId: string, cid: string) {
+      captured.removed.push({ hostId, cid });
+      if (opts.notFoundCids?.has(cid)) {
+        const e = new Error(`No such container: ${cid}`) as Error & { statusCode: number };
+        e.statusCode = 404;
+        throw e;
+      }
+      if (opts.notFoundCidsHttp?.has(cid)) {
+        throw makeHttpNotFound(cid);
+      }
+    },
+    // 余下 ContainerService 接口未在 reconcile 路径上调用,塞 throw 占位
+    async ensureVolume() { throw new Error("not used in reconcile"); },
+    async removeVolume() { throw new Error("not used in reconcile"); },
+    async inspectVolume() { throw new Error("not used in reconcile"); },
+    async createAndStart() { throw new Error("not used in reconcile"); },
+    async resolveBaselinePaths() { throw new Error("not used in reconcile"); },
+  } as unknown as NonNullable<V3SupervisorDeps["containerService"]>;
+  return { svc, captured };
+}
+
+// 需要在文件顶部引入 V3SupervisorDeps 类型
+// (本套件的 import 用的是 agent-sandbox/index.js,该 barrel 不再 re-export 类型)
+// 这里直接通过 NonNullable<…> + 内部 cast 的方式取到 containerService 字段类型
+import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
+
+const SELF_HOST = "self-host-uuid-aaaa";
+const REMOTE_HOST = "remote-host-uuid-bbbb";
+
+describe("runOrphanReconcileTick · multi-host routing", () => {
+  test("跨 host row + containerService.inspect ok → 不 vanish(回归 hshi/user33 1185)", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 1185, state: "active",
+      container_internal_id: "remote-cid-X",
+      host_uuid: REMOTE_HOST,
+    });
+    const { docker, captured: dockerCap } = makeDocker(); // 本机 docker 啥都没有
+    const { svc, captured: csCap } = makeContainerService();
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      containerService: svc, selfHostId: SELF_HOST,
+    });
+    assert.equal(r.dbOrphansVanished, 0, "跨 host row 不应被 vanish");
+    assert.equal(pool.rows[0]!.state, "active", "DB 行仍 active");
+    assert.deepEqual(csCap.inspected, [{ hostId: REMOTE_HOST, cid: "remote-cid-X" }],
+      "inspect 必须走 containerService 而不是本机 docker");
+    assert.equal(dockerCap.inspected.length, 0, "本机 docker.inspect 不该被调");
+  });
+
+  test("跨 host row + containerService.inspect 404 (statusCode dockerode 形状) → vanish(走 cs.stop+remove)", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 1186, state: "active",
+      container_internal_id: "remote-cid-Y",
+      host_uuid: REMOTE_HOST,
+    });
+    const { docker } = makeDocker();
+    const { svc, captured: csCap } = makeContainerService({
+      notFoundCids: new Set(["remote-cid-Y"]),
+    });
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      containerService: svc, selfHostId: SELF_HOST,
+    });
+    assert.equal(r.dbOrphansVanished, 1);
+    assert.deepEqual(pool.vanishedCalls, [1186]);
+    assert.equal(pool.rows[0]!.state, "vanished");
+    // stopAndRemoveV3Container 走 remote 路径,stop+remove 通过 containerService
+    assert.deepEqual(csCap.stopped, [{ hostId: REMOTE_HOST, cid: "remote-cid-Y" }]);
+    assert.deepEqual(csCap.removed, [{ hostId: REMOTE_HOST, cid: "remote-cid-Y" }]);
+  });
+
+  test("跨 host row + containerService.inspect 404 (httpStatus AgentAppError 形状) → vanish", async () => {
+    // 真实远端路径走 nodeAgentClient,404 抛 `AgentAppError { httpStatus: 404 }`
+    // 而不是 dockerode 的 `{ statusCode: 404 }`。回归保护 isNotFound 必须同时识别。
+    const pool = new FakePool();
+    pool.seed({
+      id: 1191, state: "active",
+      container_internal_id: "remote-cid-Y2",
+      host_uuid: REMOTE_HOST,
+    });
+    const { docker } = makeDocker();
+    const { svc, captured: csCap } = makeContainerService({
+      notFoundCidsHttp: new Set(["remote-cid-Y2"]),
+    });
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      containerService: svc, selfHostId: SELF_HOST,
+    });
+    assert.equal(r.dbOrphansVanished, 1, "httpStatus=404 也必须走 vanish");
+    assert.equal(r.errors.length, 0, "404 不该进 errors[]");
+    assert.deepEqual(pool.vanishedCalls, [1191]);
+    assert.equal(pool.rows[0]!.state, "vanished");
+    // 同时回归 stopAndRemoveV3Container 的 isNotFound:remote stop/remove 抛
+    // httpStatus=404 不应聚合成 PartialV3Cleanup
+    assert.deepEqual(csCap.stopped, [{ hostId: REMOTE_HOST, cid: "remote-cid-Y2" }]);
+    assert.deepEqual(csCap.removed, [{ hostId: REMOTE_HOST, cid: "remote-cid-Y2" }]);
+  });
+
+  test("跨 host row + containerService 未注入 → skip,不 vanish", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 1187, state: "active",
+      container_internal_id: "remote-cid-Z",
+      host_uuid: REMOTE_HOST,
+    });
+    const { docker, captured: dockerCap } = makeDocker();
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      // 故意只给 selfHostId 不给 containerService
+      selfHostId: SELF_HOST,
+    });
+    assert.equal(r.dbOrphansVanished, 0, "containerService 缺失时跨 host row 必须 skip");
+    assert.equal(r.errors.length, 0);
+    assert.equal(pool.rows[0]!.state, "active");
+    assert.equal(dockerCap.inspected.length, 0, "也不该回退本机 docker");
+  });
+
+  test("row.host_uuid 有值但 selfHostId 缺失 → skip,绝不 vanish", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 1188, state: "active",
+      container_internal_id: "ambiguous-cid",
+      host_uuid: REMOTE_HOST,
+    });
+    const { docker, captured: dockerCap } = makeDocker();
+    const { svc, captured: csCap } = makeContainerService();
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      containerService: svc,
+      // selfHostId 故意不传:无法判定 row 是本机还是远端
+    });
+    assert.equal(r.dbOrphansVanished, 0, "无法判定 host 时绝不破坏");
+    assert.equal(pool.rows[0]!.state, "active");
+    assert.equal(dockerCap.inspected.length, 0, "不该走本机");
+    assert.equal(csCap.inspected.length, 0, "也不该走远端");
+  });
+
+  test("row.host_uuid === selfHostId → 走本机 docker.inspect", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 1189, state: "active",
+      container_internal_id: "local-cid-A",
+      host_uuid: SELF_HOST,
+    });
+    const { docker, captured: dockerCap } = makeDocker({
+      containers: [{ Id: "local-cid-A", Created: NOW_SEC() - 1000 }],
+    });
+    const { svc, captured: csCap } = makeContainerService();
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      containerService: svc, selfHostId: SELF_HOST,
+    });
+    assert.equal(r.dbOrphansVanished, 0);
+    assert.deepEqual(dockerCap.inspected, ["local-cid-A"], "本机行走本机 docker");
+    assert.equal(csCap.inspected.length, 0, "本机行不该走 containerService");
+  });
+
+  test("跨 host inspect 抛非 404(mTLS 抖动)→ errors[],不 vanish", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 1190, state: "active",
+      container_internal_id: "flaky-cid",
+      host_uuid: REMOTE_HOST,
+    });
+    const { docker } = makeDocker();
+    const { svc } = makeContainerService({
+      throwCids: new Set(["flaky-cid"]),
+    });
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      containerService: svc, selfHostId: SELF_HOST,
+    });
+    assert.equal(r.dbOrphansVanished, 0, "非 404 错误绝不升级为 vanish");
+    assert.equal(r.errors.length, 1);
+    assert.equal(r.errors[0]!.kind, "db");
+    assert.equal(r.errors[0]!.id, "1190");
+    assert.match(r.errors[0]!.error, /mTLS unavailable/);
+    assert.equal(pool.rows[0]!.state, "active");
+  });
+
+  test("Direction A:selfHostId 存在时,跨 host row cid 不阻止本机 dockerOrphan 删除", async () => {
+    // 反向回归:本机 listContainers 列出一个真孤儿,DB 里只有跨 host active 行
+    // (host_uuid !== selfHostId)。修复后跨 host cid 不进 dbActiveCids,本机
+    // 孤儿能被正常清理。
+    const pool = new FakePool();
+    pool.seed({
+      id: 9000, state: "active",
+      container_internal_id: "cross-host-cid", // 与本机 docker 列表无关
+      host_uuid: REMOTE_HOST,
+    });
+    const { docker, captured: dockerCap } = makeDocker({
+      containers: [{ Id: "local-orphan", Created: NOW_SEC() - 1000 }],
+    });
+    const { svc } = makeContainerService();
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      containerService: svc, selfHostId: SELF_HOST,
+    });
+    assert.equal(r.dockerOrphansRemoved, 1);
+    assert.deepEqual(dockerCap.stopped, ["local-orphan"]);
+    assert.deepEqual(dockerCap.removed, ["local-orphan"]);
+  });
+
+  test("Direction A:selfHostId 缺失时退回原全集,跨 host cid 与本机 docker id 同名时不误删", async () => {
+    // selfHostId 缺失场景:多 host 配置出错。退回原行为 = 全部 active cid 都进
+    // dbActiveCids,即便撞上跨 host cid 也不删本机容器。
+    const pool = new FakePool();
+    pool.seed({
+      id: 9001, state: "active",
+      container_internal_id: "shared-cid", // 巧合与本机 docker id 同名
+      host_uuid: REMOTE_HOST,
+    });
+    const { docker, captured: dockerCap } = makeDocker({
+      containers: [{ Id: "shared-cid", Created: NOW_SEC() - 1000 }],
+    });
+    const r = await runOrphanReconcileTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      // 注意:selfHostId 缺失
+    });
+    assert.equal(r.dockerOrphansRemoved, 0, "本机容器不应被误删");
+    assert.equal(dockerCap.stopped.length, 0);
+    assert.equal(dockerCap.removed.length, 0);
   });
 });

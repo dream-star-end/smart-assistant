@@ -805,8 +805,13 @@ export function wrapDockerError(err: unknown): SupervisorError {
 }
 
 function isNotFound(err: unknown): boolean {
-  return typeof err === "object" && err !== null && "statusCode" in err
-    && (err as { statusCode: number }).statusCode === 404;
+  if (typeof err !== "object" || err === null) return false;
+  // dockerode 抛 `{ statusCode: 404 }`;远端 RemoteNodeAgentBackend 走
+  // nodeAgentClient 抛 `AgentAppError { httpStatus: 404 }`(见
+  // compute-pool/nodeAgentClient.ts:344)。stopAndRemoveV3Container 在跨 host
+  // 路径上调用 deps.containerService.stop/remove,需统一识别两种 404 形状。
+  const e = err as { statusCode?: unknown; httpStatus?: unknown };
+  return e.statusCode === 404 || e.httpStatus === 404;
 }
 
 function isNotModified(err: unknown): boolean {
