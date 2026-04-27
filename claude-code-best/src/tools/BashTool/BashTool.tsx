@@ -36,6 +36,7 @@ import { semanticNumber } from '../../utils/semanticNumber.js';
 import { EndTruncatingAccumulator } from '../../utils/stringUtils.js';
 import { getTaskOutputPath } from '../../utils/task/diskOutput.js';
 import { TaskOutput } from '../../utils/task/TaskOutput.js';
+import { emitBashOutputTail } from '../../utils/sdkEventQueue.js';
 import { isOutputLineTruncated } from '../../utils/terminal.js';
 import { buildLargeToolResultMessage, ensureToolResultsDir, generatePreview, getToolResultPath, PREVIEW_SIZE_BYTES } from '../../utils/toolResultStorage.js';
 import { userFacingName as fileEditUserFacingName } from '../FileEditTool/UI.js';
@@ -653,7 +654,8 @@ export const BashTool = buildTool({
         preventCwdChanges,
         isMainThread,
         toolUseId: toolUseContext.toolUseId,
-        agentId: toolUseContext.agentId
+        agentId: toolUseContext.agentId,
+        parentToolUseId: toolUseContext.parentToolUseId
       });
 
       // Consume the generator and capture the return value
@@ -831,7 +833,8 @@ async function* runShellCommand({
   preventCwdChanges,
   isMainThread,
   toolUseId,
-  agentId
+  agentId,
+  parentToolUseId
 }: {
   input: BashToolInput;
   abortController: AbortController;
@@ -841,6 +844,7 @@ async function* runShellCommand({
   isMainThread?: boolean;
   toolUseId?: string;
   agentId?: AgentId;
+  parentToolUseId?: string;
 }): AsyncGenerator<{
   type: 'progress';
   output: string;
@@ -885,6 +889,15 @@ async function* runShellCommand({
       fullOutput = allLines;
       lastTotalLines = totalLines;
       lastTotalBytes = isIncomplete ? totalBytes : 0;
+      // Push the tail snapshot to the SDK stream so the web client can
+      // render real-time output without waiting for the next message.
+      // Only fires for foreground bash; backgrounded commands route via
+      // the LocalShellTask listener installed in spawnShellTask /
+      // backgroundExistingForegroundTask. Skipping when toolUseId is
+      // absent (TUI mode / unit tests construct without it).
+      if (toolUseId) {
+        emitBashOutputTail(toolUseId, allLines, totalBytes, isIncomplete, parentToolUseId ? { parentToolUseId } : undefined);
+      }
       // Wake the generator so it yields the new progress data
       const resolve = resolveProgress;
       if (resolve) {

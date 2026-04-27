@@ -171,20 +171,48 @@ export class CcbMessageParser {
   }
 
   private _parseInner(msg: SdkMessage): void {
-    // ── system:init ──
-    if (msg.type === 'system') return
-
     // CCB stamps every SDK message with parent_tool_use_id. Non-null means
     // this message was produced by a subagent spawned via the Agent tool.
     // We forward it untouched on every emitted block so the frontend can
     // route subagent content into the owning Agent card instead of the
     // main stream. Main-agent messages carry null/undefined and flow to
     // the main stream as before.
+    //
+    // Extracted BEFORE the system early-return so the bash_output_tail
+    // branch below can attach parent routing — subagent Bash tails must
+    // land in the Agent card's child Bash tool, not the main stream.
     const raw = msg as any
     const parentToolUseId: string | undefined =
       typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id.length > 0
         ? raw.parent_tool_use_id
         : undefined
+
+    // ── system messages ──
+    // Most system subtypes (init / status / success / error / task_*) are
+    // ignored by the gateway; CCB emits them for SDK consumers like VS Code
+    // and Scuttle that listen on stdout directly. The one we DO surface is
+    // `bash_output_tail` — the snapshot tail of a long-running Bash command
+    // that BashTool/LocalShellTask emit on a 1 Hz cadence. It carries the
+    // original BashTool tool_use_id so the frontend can route the tail to
+    // the right tool card. See packages/protocol/src/frames.ts for the
+    // OutboundContentBlock 'tool_output_tail' shape.
+    if (msg.type === 'system') {
+      if (raw.subtype === 'bash_output_tail') {
+        const toolUseId = raw.tool_use_id
+        if (typeof toolUseId === 'string' && toolUseId.length > 0) {
+          const block: Record<string, unknown> = {
+            kind: 'tool_output_tail',
+            toolUseBlockId: toolUseId,
+            tail: typeof raw.tail === 'string' ? raw.tail : '',
+            totalBytes: typeof raw.total_bytes === 'number' ? raw.total_bytes : 0,
+            truncatedHead: !!raw.truncated_head,
+          }
+          if (parentToolUseId) block.parentToolUseId = parentToolUseId
+          this.onEvent({ kind: 'block', block: block as any })
+        }
+      }
+      return
+    }
 
     // ── stream_event: streaming partial deltas ──
     if (msg.type === 'stream_event') {

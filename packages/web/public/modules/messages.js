@@ -689,9 +689,29 @@ function _renderBash(body, input, msg) {
     body.appendChild(cmdBlock)
   }
   if (msg.output) {
+    // Final tool_result preview wins once the command finishes. The
+    // streaming bashTail is hidden in this branch — the gateway-emitted
+    // tool_result.preview is the canonical truncated output sent by CCB.
     const outBlock = document.createElement('pre')
     outBlock.className = 'tool-output'
     outBlock.textContent = msg.output
+    body.appendChild(outBlock)
+  } else if (msg.bashTail && typeof msg.bashTail.tail === 'string') {
+    // Live tail snapshot from CCB's TaskOutput poller (~1 Hz). Replace
+    // semantics: the snapshot already contains the latest tail window
+    // (~4 KB); we render it as-is. truncatedHead === true means earlier
+    // output exceeded the window and is missing, signalled with a
+    // single muted prefix line.
+    const outBlock = document.createElement('pre')
+    outBlock.className = 'tool-output bash-tail-live'
+    if (msg.bashTail.truncatedHead) {
+      const note = document.createElement('div')
+      note.className = 'tool-file-meta'
+      const total = typeof msg.bashTail.totalBytes === 'number' ? msg.bashTail.totalBytes : 0
+      note.textContent = `… (head 已截断, 共 ${total} 字节)`
+      body.appendChild(note)
+    }
+    outBlock.textContent = msg.bashTail.tail
     body.appendChild(outBlock)
   }
 }
