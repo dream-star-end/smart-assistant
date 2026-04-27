@@ -161,6 +161,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       created_at INTEGER NOT NULL,
       last_at INTEGER NOT NULL,
       messages TEXT NOT NULL DEFAULT '[]',
+      message_count INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_client_sessions_last ON client_sessions(last_at);
@@ -181,6 +182,15 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("ALTER TABLE client_sessions ADD COLUMN deleted_at INTEGER DEFAULT NULL")
       // Migrate existing __deleted__ tombstones to the new column
       db.exec("UPDATE client_sessions SET deleted_at = updated_at WHERE title = '__deleted__'")
+    }
+  } catch { /* table just created with column already */ }
+  // Migration: store message counts separately so list endpoints don't parse
+  // every session's messages JSON on each request.
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'message_count')) {
+      db.exec("ALTER TABLE client_sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0")
+      db.exec("UPDATE client_sessions SET message_count = COALESCE(json_array_length(messages), 0)")
     }
   } catch { /* table just created with column already */ }
 
@@ -905,14 +915,15 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
     const finalMessages = mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[]
 
     const result = db.prepare(`
-      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at)
-      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @updatedAt)
+      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at)
+      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, @updatedAt)
       ON CONFLICT(id) DO UPDATE SET
         agent_id = excluded.agent_id,
         title = excluded.title,
         pinned = excluded.pinned,
         last_at = excluded.last_at,
         messages = excluded.messages,
+        message_count = excluded.message_count,
         updated_at = excluded.updated_at
       WHERE client_sessions.updated_at <= @baseSyncedAt
         AND client_sessions.user_id = @userId
@@ -925,6 +936,7 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
       createdAt: session.createdAt,
       lastAt: session.lastAt,
       messages: JSON.stringify(finalMessages),
+      messageCount: finalMessages.length,
       updatedAt: session.updatedAt,
       baseSyncedAt,
     })
@@ -979,8 +991,8 @@ export async function appendServerAuthoredMessage(
 
     const now = Date.now()
     db.prepare(
-      'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ? WHERE id = ? AND user_id = ?'
-    ).run(JSON.stringify(result.messages), now, now, sessId, userId)
+      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ? WHERE id = ? AND user_id = ?'
+    ).run(JSON.stringify(result.messages), result.messages.length, now, now, sessId, userId)
     return { applied: true }
   })
   return txn()
@@ -1202,7 +1214,7 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
   const db = await getSessionsDb()
   const rows = db.prepare(`
     SELECT id, agent_id, title, pinned, created_at, last_at, updated_at,
-           json_array_length(messages) as msg_count
+           message_count as msg_count
     FROM client_sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY last_at DESC
   `).all(userId) as Array<{
     id: string; agent_id: string; title: string; pinned: number;
@@ -1247,8 +1259,8 @@ export async function getClientSession(id: string, userId?: string): Promise<Cli
 export async function deleteClientSession(id: string, userId?: string): Promise<boolean> {
   const db = await getSessionsDb()
   const sql = userId
-    ? "UPDATE client_sessions SET deleted_at = ?, messages = '[]' WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "UPDATE client_sessions SET deleted_at = ?, messages = '[]' WHERE id = ? AND deleted_at IS NULL"
+    ? "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    : "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND deleted_at IS NULL"
   const now = Date.now()
   const result = userId ? db.prepare(sql).run(now, id, userId) : db.prepare(sql).run(now, id)
   return result.changes > 0
@@ -1262,7 +1274,7 @@ export async function listUnclaimedSessions(): Promise<Array<{
   const db = await getSessionsDb()
   const rows = db.prepare(`
     SELECT id, agent_id, title, created_at, last_at, messages,
-           json_array_length(messages) as msg_count
+           message_count as msg_count
     FROM client_sessions
     WHERE user_id = 'default' AND deleted_at IS NULL
     ORDER BY last_at DESC
