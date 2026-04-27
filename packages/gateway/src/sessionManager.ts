@@ -70,6 +70,11 @@ export interface AgentSession {
   _cronBridgeMap?: Map<string, string>
   // Current turn parser (for idle-timeout to check pendingToolCalls)
   _currentParser?: import('./ccbMessageParser.js').CcbMessageParser
+  // Cross-turn stdout 'message' listener. Per-turn _runOneTurn replaces
+  // (not removes) this on the next turn so bg-bash bash_output_tail
+  // emitted after the turn's `result` keeps flowing through parser ->
+  // onEvent -> deliver. destroySession/shutdownAll explicitly off().
+  _currentMessageListener?: ((msg: any) => void) | null
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -767,14 +772,21 @@ export class SessionManager {
         })
       }
 
+      let detached = false
       const detach = () => {
+        if (detached) return
+        detached = true
         clearTimeout(timer)
         parser.finish()
         // Only clear if still pointing to this turn's parser (prevents race
         // where idle-timeout releases the lock, a new turn starts and sets
         // a new parser, then this stale detach wipes the new reference).
         if (session._currentParser === parser) session._currentParser = undefined
-        runner.off('message', handleMessage)
+        // 故意不卸载 runner.off('message', handleMessage):
+        // CCB 的 bg bash 在 turn 结束后仍 emit bash_output_tail,
+        // 需要继续流经 parser (允许 finalized 通过 tail) → wrappedOnEvent
+        // → onEvent → this.deliver。下一轮 _runOneTurn 启动时会主动替换
+        // session._currentMessageListener,旧闭包链届时被 GC。
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('telemetry', handleTelemetry)
@@ -1115,7 +1127,10 @@ export class SessionManager {
 
       const handleMessage = (msg: any) => {
         // Any message from runner means the agent is still active — reset idle timer.
-        timer.refresh()
+        // detach 后跳过 timer.refresh():Node Timer.refresh() 即使已 clearTimeout
+        // 也会重新 arm,会让旧 turn 的 idle 回调在 30 分钟后被无意义地触发
+        // (回调内有 !parser.finalized 守卫所以是 no-op,但还是不要触发更干净)。
+        if (!detached) timer.refresh()
         parser.parse(msg)
       }
       const handleError = (err: Error) => {
@@ -1179,7 +1194,17 @@ export class SessionManager {
         }, 150)
       }
 
+      // Replace any prior turn's stdout listener (kept attached across turn
+      // boundaries to forward bg bash bash_output_tail) before installing
+      // this turn's listener. This ensures there's at most one
+      // 'message' listener per session at any time, so closures from old
+      // turns become unreachable and GC'able.
+      if (session._currentMessageListener) {
+        try { runner.off('message', session._currentMessageListener) } catch {}
+        session._currentMessageListener = null
+      }
       runner.on('message', handleMessage)
+      session._currentMessageListener = handleMessage
       runner.on('error', handleError)
       runner.on('exit', handleExit)
       runner.on('telemetry', handleTelemetry)
@@ -1208,6 +1233,12 @@ export class SessionManager {
   async destroySession(sessionKey: string): Promise<void> {
     const s = this.sessions.get(sessionKey)
     if (s) {
+      // Detach cross-turn message listener before shutting down to release
+      // the closure chain (parser + per-turn onEvent + frame envelope).
+      if (s._currentMessageListener) {
+        try { s.runner.off('message', s._currentMessageListener) } catch {}
+        s._currentMessageListener = null
+      }
       await s.runner.shutdown()
       this.sessions.delete(sessionKey)
     }
@@ -1226,6 +1257,12 @@ export class SessionManager {
     // (runner.shutdown() sets shuttingDown=true so the exit handler won't call _saveResumeMap)
     this._saveResumeMap()
     await this._resumeMapWrite
+    for (const s of this.sessions.values()) {
+      if (s._currentMessageListener) {
+        try { s.runner.off('message', s._currentMessageListener) } catch {}
+        s._currentMessageListener = null
+      }
+    }
     await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
     this.sessions.clear()
   }
@@ -1269,6 +1306,10 @@ export class SessionManager {
       for (const key of toEvict) {
         const s = this.sessions.get(key)
         if (!s) continue
+        if (s._currentMessageListener) {
+          try { s.runner.off('message', s._currentMessageListener) } catch {}
+          s._currentMessageListener = null
+        }
         s.runner.shutdown().catch(() => {})
         this.sessions.delete(key)
         // Only webchat sessions should survive eviction in resume-map.

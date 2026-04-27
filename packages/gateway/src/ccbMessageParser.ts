@@ -149,7 +149,24 @@ export class CcbMessageParser {
    * from SubprocessRunner.
    */
   parse(msg: SdkMessage): void {
-    if (this.finalized) return
+    if (this.finalized) {
+      // bash_output_tail 是 CCB 的后台 bash keepalive 信号:TaskOutput 1Hz
+      // poller 在跨 turn 的整个 bash 生命周期内持续 emit。它不修改 parser
+      // 任何累积器(没有 totals / buffers / 流式装配),只是把 tail 快照转成
+      // tool_output_tail block 派发出去。turn 结束后必须放行,否则前端会
+      // 卡在第一行——bg bash 完成时间晚于 agent 回复时是常态。
+      if (
+        (msg as any)?.type === 'system' &&
+        (msg as any)?.subtype === 'bash_output_tail'
+      ) {
+        try {
+          this._parseInner(msg)
+        } catch (err) {
+          this.onEvent({ kind: 'error', error: String(err) })
+        }
+      }
+      return
+    }
     try {
       this._parseInner(msg)
     } catch (err) {
