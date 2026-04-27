@@ -85,6 +85,11 @@ export interface AgentSession {
    * swap 过程受 `lock` 保护,保证 in-flight turn 看到的是一个一致的 target。
    */
   executionTarget: ExecutionTarget
+  // Cross-turn stdout 'message' listener. Per-turn _runOneTurn replaces
+  // (not removes) this on the next turn so bg-bash bash_output_tail
+  // emitted after the turn's `result` keeps flowing through parser ->
+  // onEvent -> deliver. destroySession/shutdownAll explicitly off().
+  _currentMessageListener?: ((msg: any) => void) | null
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -886,14 +891,21 @@ export class SessionManager {
         })
       }
 
+      let detached = false
       const detach = () => {
+        if (detached) return
+        detached = true
         clearTimeout(timer)
         parser.finish()
         // Only clear if still pointing to this turn's parser (prevents race
         // where idle-timeout releases the lock, a new turn starts and sets
         // a new parser, then this stale detach wipes the new reference).
         if (session._currentParser === parser) session._currentParser = undefined
-        runner.off('message', handleMessage)
+        // 故意不卸载 runner.off('message', handleMessage):
+        // CCB 的 bg bash 在 turn 结束后仍 emit bash_output_tail,
+        // 需要继续流经 parser (允许 finalized 通过 tail) → wrappedOnEvent
+        // → onEvent → this.deliver。下一轮 _runOneTurn 启动时会主动替换
+        // session._currentMessageListener,旧闭包链届时被 GC。
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('telemetry', handleTelemetry)
@@ -1248,7 +1260,10 @@ export class SessionManager {
 
       const handleMessage = (msg: any) => {
         // Any message from runner means the agent is still active — reset idle timer.
-        timer.refresh()
+        // detach 后跳过 timer.refresh():Node Timer.refresh() 即使已 clearTimeout
+        // 也会重新 arm,会让旧 turn 的 idle 回调在 30 分钟后被无意义地触发
+        // (回调内有 !parser.finalized 守卫所以是 no-op,但还是不要触发更干净)。
+        if (!detached) timer.refresh()
         parser.parse(msg)
       }
       const handleError = (err: Error) => {
@@ -1312,7 +1327,17 @@ export class SessionManager {
         }, 150)
       }
 
+      // Replace any prior turn's stdout listener (kept attached across turn
+      // boundaries to forward bg bash bash_output_tail) before installing
+      // this turn's listener. This ensures there's at most one
+      // 'message' listener per session at any time, so closures from old
+      // turns become unreachable and GC'able.
+      if (session._currentMessageListener) {
+        try { runner.off('message', session._currentMessageListener) } catch {}
+        session._currentMessageListener = null
+      }
       runner.on('message', handleMessage)
+      session._currentMessageListener = handleMessage
       runner.on('error', handleError)
       runner.on('exit', handleExit)
       runner.on('telemetry', handleTelemetry)
@@ -1449,6 +1474,12 @@ export class SessionManager {
   async destroySession(sessionKey: string): Promise<void> {
     const s = this.sessions.get(sessionKey)
     if (s) {
+      // Detach cross-turn message listener before shutting down to release
+      // the closure chain (parser + per-turn onEvent + frame envelope).
+      if (s._currentMessageListener) {
+        try { s.runner.off('message', s._currentMessageListener) } catch {}
+        s._currentMessageListener = null
+      }
       await s.runner.shutdown()
       // 释放 remote mux refcount —— destroy 是 session 终结态,refcount 必须归零,
       // 否则 mux 泄漏。release 幂等,失败只 warn 不抛(上游不关心)。
@@ -1488,6 +1519,12 @@ export class SessionManager {
     // 在自 process 内做,是正路)。
     const muxReleases: Array<() => Promise<void>> = []
     for (const s of this.sessions.values()) {
+      // Detach cross-turn message listener (kept attached for bg-bash tail
+      // forwarding) before shutdown to release closure chain.
+      if (s._currentMessageListener) {
+        try { s.runner.off('message', s._currentMessageListener) } catch {}
+        s._currentMessageListener = null
+      }
       if (s.executionTarget.kind === 'remote' && s.userId) {
         const uid = s.userId
         const key = s.sessionKey
@@ -1554,6 +1591,13 @@ export class SessionManager {
           for (const key of toEvict) {
             const s = this.sessions.get(key)
             if (!s) continue
+            // Detach cross-turn message listener (kept attached for bg-bash
+            // bash_output_tail forwarding) before shutdown to release the
+            // closure chain.
+            if (s._currentMessageListener) {
+              try { s.runner.off('message', s._currentMessageListener) } catch {}
+              s._currentMessageListener = null
+            }
             // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
             try {
               await s.runner.shutdown()

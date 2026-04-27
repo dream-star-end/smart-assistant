@@ -3046,9 +3046,10 @@ export class Gateway {
     }
     // v3 commercial 容器内信任 docker bridge gateway IP 直连。commercial 侧 userChatBridge
     // 经 docker bridge 网络转发的 ws → /ws 不带 bearer(容器随机生成的 accessToken supervisor
-    // 没回传)。仅当容器 entrypoint.sh 显式注入 OPENCLAUDE_TRUST_BRIDGE_IP=172.30.0.1 时生效;
-    // 个人版 / 任何未配置该 env 的场景下 process.env.OPENCLAUDE_TRUST_BRIDGE_IP 为空,
-    // 旁路恒为 false,checkHttpAuth 行为完全不变。
+    // 没回传)。仅当 commercial supervisor 显式注入 OPENCLAUDE_TRUST_BRIDGE_IP=<本机 bridge
+    // 网关 .1>(self host=172.30.0.1,远端 host 由 v3supervisor.gatewayIpFromV3Cidr 按
+    // host.bridge_cidr 算)时生效;个人版 / 任何未配置该 env 的场景下
+    // process.env.OPENCLAUDE_TRUST_BRIDGE_IP 为空,旁路恒为 false,checkHttpAuth 行为完全不变。
     const remoteIp = req.socket.remoteAddress || ''
     const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
     const isFromBridge = !!TRUST_BRIDGE_IP && (
@@ -4228,7 +4229,22 @@ export class Gateway {
     let _apiErrorText = ''
     await this.sessions.submit(session, payload, (e) => {
       if (e.kind === 'block') {
-        // turn 已被 API_ERROR 拦截 → 后续 block 一律吞掉,等 final 关闭
+        const b = e.block as any
+        // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让
+        // bg-bash 在 turn 结束后跨 turn 继续 emit。如果累积到 out.blocks /
+        // aggregatedBlocks 里,旧 turn 闭包会随 bash 生命周期持续增长内存。
+        // 直接派送(WebChat)/丢弃(adapter,非流式不需要快照)即可。
+        // 必须放在 _apiErrorIntercepted guard 之前:本 turn 先启动 bg bash 再
+        // 命中 API_ERROR 时,parser 已允许 finalized 后的 bash_output_tail 进来,
+        // 这里若被 API_ERROR 吞掉,前端会再次卡在第一行——回归到修复前的症状。
+        const isTail = b?.kind === 'tool_output_tail'
+        if (isTail) {
+          if (adapter) return
+          this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
+          return
+        }
+
+        // turn 已被 API_ERROR 拦截 → 后续非 tail block 一律吞掉,等 final 关闭
         if (_apiErrorIntercepted) return
 
         // 检查 block 是否是可分类 API Error。
@@ -4269,7 +4285,6 @@ export class Gateway {
 
         if (adapter) {
           // For partial tool_use blocks, replace any prior block with same blockId
-          const b = e.block as any
           if (b.blockId) {
             const idx = aggregatedBlocks.findIndex((x: any) => x.blockId === b.blockId)
             if (idx >= 0) aggregatedBlocks[idx] = e.block
@@ -4297,6 +4312,10 @@ export class Gateway {
             },
             adapter,
           )
+          // 跨 turn message listener 仍持有这个闭包(供 bg-bash tail 转发),
+          // 不清空数组的话,API_ERROR 前已聚合的 block 会被钉到下次 turn 替换 listener。
+          out.blocks.length = 0
+          aggregatedBlocks.length = 0
           return
         }
         this._runLog.complete(_run, {
@@ -4307,10 +4326,19 @@ export class Gateway {
           turn: e.meta?.turn,
         })
         if (adapter) {
-          this.deliver({ ...out, blocks: aggregatedBlocks, isFinal: true, meta: e.meta }, adapter)
+          // adapter.send() 是 async,内部可能在 await 之后才读 wire.blocks。
+          // 如果直接传 aggregatedBlocks,接着同步清空数组,adapter 读到的就是空。
+          // 拷贝一份脱钩本地引用。
+          this.deliver({ ...out, blocks: aggregatedBlocks.slice(), isFinal: true, meta: e.meta }, adapter)
         } else {
           this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
         }
+        // 释放本轮聚合数组的内存。本闭包跨 turn 仍会被 sessionManager 的
+        // 跨 turn message listener 调用(转发 bg-bash bash_output_tail);
+        // 不清空的话 out.blocks / aggregatedBlocks 引用的旧 block 实例
+        // 会被钉到下一轮 listener 替换之前。
+        out.blocks.length = 0
+        aggregatedBlocks.length = 0
       } else if (e.kind === 'permission_request') {
         // Forward permission prompt to WebSocket clients for user approval.
         // userId is stashed on the frame by the WS handler (see handleWsConnection)
