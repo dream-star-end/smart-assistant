@@ -14,8 +14,8 @@
 //
 // pill 状态按 agent 持久化在 localStorage,page reload 后复原。store 缺失或
 // 含非法值 → 视为 DEFAULT_EFFORT。
-import { $ } from './dom.js?v=9bfdc3a'
-import { getSession, state } from './state.js?v=9bfdc3a'
+import { $ } from './dom.js?v=8463ef0'
+import { getSession, state } from './state.js?v=8463ef0'
 
 const STORAGE_KEY = 'openclaude_effort_by_agent'
 

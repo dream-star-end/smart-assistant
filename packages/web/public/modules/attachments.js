@@ -1,8 +1,8 @@
 // OpenClaude — Attachments
-import { $ } from './dom.js?v=9bfdc3a'
-import { state } from './state.js?v=9bfdc3a'
-import { toast } from './ui.js?v=9bfdc3a'
-import { _basename, formatSize } from './util.js?v=9bfdc3a'
+import { $ } from './dom.js?v=8463ef0'
+import { state } from './state.js?v=8463ef0'
+import { toast } from './ui.js?v=8463ef0'
+import { _basename, formatSize } from './util.js?v=8463ef0'
 
 const MAX_FILE_SIZE_SMALL = 200 * 1024 * 1024 // 200MB single file
 const MAX_FILE_SIZE_LARGE = 200 * 1024 * 1024 // 200MB single file
