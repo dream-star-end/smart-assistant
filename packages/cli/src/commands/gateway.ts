@@ -70,6 +70,25 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   process.on('uncaughtException', (err) => emergencyExit('uncaughtException', err))
   process.on('unhandledRejection', (reason) => emergencyExit('unhandledRejection', reason))
 
+  // Route Node's native fetch() through HTTP_PROXY when set so gateway-internal
+  // OAuth token exchange / refresh (handleOAuthCallback / _refreshToken hits
+  // platform.claude.com / auth.openai.com) goes through the residential proxy.
+  // CCB and MCP subprocesses already pick up HTTP_PROXY via env inheritance and
+  // their own proxy-aware HTTP clients; this closes the gap for the gateway
+  // process itself, since Node fetch() does NOT auto-read HTTP_PROXY.
+  // EnvHttpProxyAgent reads HTTP_PROXY/HTTPS_PROXY/NO_PROXY (and lowercase)
+  // itself; with no proxy env it is effectively a normal Agent.
+  if (
+    process.env.HTTP_PROXY ||
+    process.env.HTTPS_PROXY ||
+    process.env.http_proxy ||
+    process.env.https_proxy
+  ) {
+    const { setGlobalDispatcher, EnvHttpProxyAgent } = await import('undici')
+    setGlobalDispatcher(new EnvHttpProxyAgent())
+    log.info('gateway: routing fetch via HTTP_PROXY (EnvHttpProxyAgent)')
+  }
+
   const config = await readConfig()
   if (!config) {
     console.error('未找到配置。请先运行 `openclaude onboard`')
