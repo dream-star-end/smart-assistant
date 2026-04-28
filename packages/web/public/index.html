@@ -359,6 +359,11 @@
         <div id="auth-login-resend-status" hidden class="login-resend-status"></div>
       </div>
       <div class="login-toggle muted">还没有账号? <a id="auth-tab-register" role="button" tabindex="0">立即注册</a></div>
+      <!-- LDC SSO: 顶层 GET 导航走 302,不能用 fetch — server 要 Set-Cookie + Location -->
+      <div class="login-or-divider"><span>或</span></div>
+      <a class="btn btn-linuxdo btn-lg btn-full" href="/api/auth/linuxdo/start" rel="nofollow">
+        使用 LINUX DO 账号登录
+      </a>
     </form>
 
     <!-- ── Mode: register ── -->
@@ -389,6 +394,10 @@
         <button id="auth-register-back-btn" type="button" hidden>返回登录</button>
       </div>
       <div class="login-toggle muted">已有账号? <a id="auth-tab-login-from-register" role="button" tabindex="0">直接登录</a></div>
+      <div class="login-or-divider"><span>或</span></div>
+      <a class="btn btn-linuxdo btn-lg btn-full" href="/api/auth/linuxdo/start" rel="nofollow">
+        使用 LINUX DO 账号登录
+      </a>
     </div>
 
     <!-- ── Mode: forgot password ── -->

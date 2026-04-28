@@ -440,6 +440,54 @@ a:hover {
 }
 .login-toggle a:hover { text-decoration: underline; }
 
+/* "或" divider — separates email-password form and SSO buttons */
+.login-or-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 14px 0 6px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.login-or-divider::before,
+.login-or-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* LINUX DO SSO 按钮 — 用 LDC 品牌橙偏暗色,跟主登录按钮的渐变橙刻意区分,
+   一眼能识别出是第三方登录入口而不是主路径。<a> 顶层导航 + display:flex
+   居中 caption,避免按钮里 caption 跑偏。 */
+.btn-linuxdo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: #f3f4f6;
+  color: #111827;
+  border: 1px solid var(--border);
+  font-weight: 600;
+  text-decoration: none;
+  transition: background var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
+}
+.btn-linuxdo:hover {
+  background: #fef3ec;
+  border-color: #f0aa6e;
+  text-decoration: none;
+}
+.btn-linuxdo:active { transform: translateY(1px); }
+[data-theme='dark'] .btn-linuxdo {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--fg);
+  border-color: rgba(255, 255, 255, 0.12);
+}
+[data-theme='dark'] .btn-linuxdo:hover {
+  background: rgba(240, 170, 110, 0.12);
+  border-color: rgba(240, 170, 110, 0.5);
+}
+
 /* Turnstile slot */
 .login-turnstile {
   min-height: 65px;

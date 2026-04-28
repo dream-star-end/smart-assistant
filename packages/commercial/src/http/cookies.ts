@@ -123,8 +123,11 @@ export function readRefreshCookie(req: IncomingMessage): string | null {
  * 把一行 Set-Cookie 追加到响应头。
  * res.setHeader("Set-Cookie", ...) 单独调用第二次会**覆盖**第一次,
  * 必须传数组才能多 cookie 共存。
+ *
+ * 2026-04-28: 公开供 auth/linuxdo.ts 复用(写 OAuth state nonce cookie),
+ * 不需要在两个文件里重写一份相同的累加逻辑。
  */
-function appendSetCookie(res: ServerResponse, line: string): void {
+export function appendSetCookie(res: ServerResponse, line: string): void {
   const existing = res.getHeader("Set-Cookie");
   if (existing == null) {
     res.setHeader("Set-Cookie", line);

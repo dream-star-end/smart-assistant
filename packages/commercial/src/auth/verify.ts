@@ -20,83 +20,79 @@
  * 邮件只在用户存在时实际发出(无副作用泄露给攻击者)。
  */
 
-import { z } from "zod";
-import { createHash } from "node:crypto";
-import { tx, query } from "../db/queries.js";
-import { hashPassword } from "./passwords.js";
-import { newVerifyToken, newVerifyCode, VERIFY_EMAIL_TTL_SECONDS } from "./register.js";
-import { verifyTurnstile, TurnstileError } from "./turnstile.js";
-import type { Mailer } from "./mail.js";
+import { z } from 'zod'
+import { createHash } from 'node:crypto'
+import { tx, query } from '../db/queries.js'
+import { hashPassword } from './passwords.js'
+import { newVerifyToken, newVerifyCode, VERIFY_EMAIL_TTL_SECONDS } from './register.js'
+import { verifyTurnstile, TurnstileError } from './turnstile.js'
+import type { Mailer } from './mail.js'
 
 /** 密码重置 token TTL:1 小时(短于 verify_email)05-SEC §15 */
-export const RESET_PASSWORD_TTL_SECONDS = 60 * 60;
+export const RESET_PASSWORD_TTL_SECONDS = 60 * 60
 
-const tokenSchema = z.string().min(1).max(2048);
-const passwordSchema = z.string().min(8).max(72);
+const tokenSchema = z.string().min(1).max(2048)
+const passwordSchema = z.string().min(8).max(72)
 const emailSchema = z
   .string()
   .trim()
   .toLowerCase()
   .max(254)
-  .regex(/^[a-z0-9._+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i, "invalid email format");
-const turnstileTokenSchema = z.string().min(1).max(2048);
+  .regex(/^[a-z0-9._+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i, 'invalid email format')
+const turnstileTokenSchema = z.string().min(1).max(2048)
 // 邮箱验证码:严格 6 位数字;容忍前后空白(复制粘贴常带)
 const verifyCodeSchema = z
   .string()
   .trim()
-  .regex(/^\d{6}$/, "invalid code format");
+  .regex(/^\d{6}$/, 'invalid code format')
 
-export type VerifyErrorCode =
-  | "VALIDATION"
-  | "INVALID_TOKEN"
-  | "WEAK_PASSWORD"
-  | "TURNSTILE_FAILED";
+export type VerifyErrorCode = 'VALIDATION' | 'INVALID_TOKEN' | 'WEAK_PASSWORD' | 'TURNSTILE_FAILED'
 
 export class VerifyError extends Error {
-  readonly code: VerifyErrorCode;
+  readonly code: VerifyErrorCode
   constructor(code: VerifyErrorCode, message: string) {
-    super(message);
-    this.name = "VerifyError";
-    this.code = code;
+    super(message)
+    this.name = 'VerifyError'
+    this.code = code
   }
 }
 
 export interface CommonDeps {
   /** 测试可注入 now(秒) */
-  now?: () => number;
+  now?: () => number
 }
 
 export interface RequestResetDeps extends CommonDeps {
-  mailer: Mailer;
+  mailer: Mailer
   /** 邮件中的链接 base url(部署时 https://claudeai.chat) */
-  resetUrlBase?: string;
+  resetUrlBase?: string
   /** Cloudflare Turnstile server-side secret(env);bypass 模式可不传 */
-  turnstileSecret?: string;
+  turnstileSecret?: string
   /** 测试 bypass:跳过 turnstile,token 非空就 true */
-  turnstileBypass?: boolean;
+  turnstileBypass?: boolean
   /** 用户 IP — 转给 turnstile */
-  remoteIp?: string;
+  remoteIp?: string
   /** 测试可注入 fetch(传给 turnstile) */
-  fetchImpl?: typeof fetch;
+  fetchImpl?: typeof fetch
 }
 
 /** 把 raw token 转成 token_hash(hex sha256 of raw bytes — base64url decoded) */
 function hashRawToken(raw: string): string {
   // raw 是 base64url 编码的 32 字节随机数;Buffer.from 兼容 base64url(node 16+)
-  const bytes = Buffer.from(raw, "base64url");
-  return createHash("sha256").update(bytes).digest("hex");
+  const bytes = Buffer.from(raw, 'base64url')
+  return createHash('sha256').update(bytes).digest('hex')
 }
 
 function nowSec(deps?: CommonDeps): number {
-  return deps?.now ? deps.now() : Math.floor(Date.now() / 1000);
+  return deps?.now ? deps.now() : Math.floor(Date.now() / 1000)
 }
 
 // ─── verifyEmail ───────────────────────────────────────────────────────
 
 export interface VerifyEmailResult {
-  user_id: string;
+  user_id: string
   /** true 当且仅当本次调用真的把用户从 unverified 翻成 verified */
-  newly_verified: boolean;
+  newly_verified: boolean
 }
 
 /**
@@ -125,19 +121,19 @@ export async function verifyEmail(
   rawCode: string,
   deps: CommonDeps = {},
 ): Promise<VerifyEmailResult> {
-  const emailParsed = emailSchema.safeParse(rawEmail);
-  const codeParsed = verifyCodeSchema.safeParse(rawCode);
+  const emailParsed = emailSchema.safeParse(rawEmail)
+  const codeParsed = verifyCodeSchema.safeParse(rawCode)
   if (!emailParsed.success || !codeParsed.success) {
     // 两种失败都归 VALIDATION —— 前端提示"验证码格式错误",
     // 不区分是 email 还是 code 出问题(防枚举 + 简化 UI)。
-    throw new VerifyError("VALIDATION", "invalid email or code format");
+    throw new VerifyError('VALIDATION', 'invalid email or code format')
   }
-  const email = emailParsed.data;
-  const code = codeParsed.data;
+  const email = emailParsed.data
+  const code = codeParsed.data
   // 直接 sha256(code 字符串),不走 base64url 解码 —— 与 register.ts/newVerifyCode 一致
-  const codeHash = createHash("sha256").update(code).digest("hex");
-  const ts = nowSec(deps);
-  const nowIso = new Date(ts * 1000).toISOString();
+  const codeHash = createHash('sha256').update(code).digest('hex')
+  const ts = nowSec(deps)
+  const nowIso = new Date(ts * 1000).toISOString()
 
   return await tx<VerifyEmailResult>(async (client) => {
     // 锁序必须统一为 users → email_verifications,否则与 resendVerification
@@ -152,7 +148,7 @@ export async function verifyEmail(
         WHERE email = $1 AND status != 'deleted'
         FOR UPDATE`,
       [email],
-    );
+    )
     if (userRow.rows.length === 0) {
       // timing 对齐:不存在的 email 也执行一次 ev lookup,避免通过 DB
       // round-trip 数/服务端耗时区分"email 存在 + code 错"与"email 不存在"。
@@ -163,10 +159,10 @@ export async function verifyEmail(
             AND used_at IS NULL AND expires_at > $2::timestamptz
           LIMIT 1`,
         [codeHash, nowIso],
-      );
-      throw new VerifyError("INVALID_TOKEN", "verification code invalid or expired");
+      )
+      throw new VerifyError('INVALID_TOKEN', 'verification code invalid or expired')
     }
-    const { id: userId, already_verified } = userRow.rows[0];
+    const { id: userId, already_verified } = userRow.rows[0]
 
     const evRow = await client.query<{ id: string }>(
       `SELECT id::text AS id
@@ -178,36 +174,36 @@ export async function verifyEmail(
           AND expires_at > $3::timestamptz
         FOR UPDATE`,
       [userId, codeHash, nowIso],
-    );
+    )
     if (evRow.rows.length === 0) {
-      throw new VerifyError("INVALID_TOKEN", "verification code invalid or expired");
+      throw new VerifyError('INVALID_TOKEN', 'verification code invalid or expired')
     }
-    const evId = evRow.rows[0].id;
+    const evId = evRow.rows[0].id
 
-    await client.query(
-      "UPDATE email_verifications SET used_at = $1::timestamptz WHERE id = $2",
-      [nowIso, evId],
-    );
+    await client.query('UPDATE email_verifications SET used_at = $1::timestamptz WHERE id = $2', [
+      nowIso,
+      evId,
+    ])
     if (!already_verified) {
       await client.query(
-        "UPDATE users SET email_verified = TRUE, updated_at = $1::timestamptz WHERE id = $2",
+        'UPDATE users SET email_verified = TRUE, updated_at = $1::timestamptz WHERE id = $2',
         [nowIso, userId],
-      );
+      )
     }
-    return { user_id: userId, newly_verified: !already_verified };
-  });
+    return { user_id: userId, newly_verified: !already_verified }
+  })
 }
 
 // ─── requestPasswordReset ─────────────────────────────────────────────
 
 export interface RequestResetResult {
   /** 总是 true:防枚举,接口语义上一律视为"已受理" */
-  accepted: true;
+  accepted: true
 }
 
 export interface RequestResetInput {
-  email: string;
-  turnstile_token: string;
+  email: string
+  turnstile_token: string
 }
 
 /**
@@ -235,52 +231,67 @@ export async function requestPasswordReset(
 ): Promise<RequestResetResult> {
   // 兼容历史调用(只传 email 字符串)— 测试 / 内部调用允许;
   // public HTTP handler 必须传 RequestResetInput 走 turnstile 校验。
-  const rawEmail = typeof input === "string" ? input : input.email;
-  const turnstileToken = typeof input === "string" ? null : input.turnstile_token;
+  const rawEmail = typeof input === 'string' ? input : input.email
+  const turnstileToken = typeof input === 'string' ? null : input.turnstile_token
 
   // 1) Turnstile 校验 — 在任何 DB lookup 前完成,避免 timing 区分 "邮箱存在与否"
   if (turnstileToken !== null) {
-    const tokParsed = turnstileTokenSchema.safeParse(turnstileToken);
+    const tokParsed = turnstileTokenSchema.safeParse(turnstileToken)
     if (!tokParsed.success) {
-      throw new VerifyError("TURNSTILE_FAILED", "turnstile token missing or malformed");
+      throw new VerifyError('TURNSTILE_FAILED', 'turnstile token missing or malformed')
     }
-    let turnstileOk = false;
+    let turnstileOk = false
     try {
       turnstileOk = await verifyTurnstile(tokParsed.data, deps.turnstileSecret, {
         remoteIp: deps.remoteIp,
         bypass: deps.turnstileBypass === true,
         fetchImpl: deps.fetchImpl,
-      });
+      })
     } catch (err) {
       if (err instanceof TurnstileError) {
-        throw new VerifyError("TURNSTILE_FAILED", "turnstile verification failed");
+        throw new VerifyError('TURNSTILE_FAILED', 'turnstile verification failed')
       }
-      throw err;
+      throw err
     }
     if (!turnstileOk) {
-      throw new VerifyError("TURNSTILE_FAILED", "turnstile verification rejected");
+      throw new VerifyError('TURNSTILE_FAILED', 'turnstile verification rejected')
     }
   }
 
   // email 格式失败也按 accepted 处理 —— 不告诉攻击者 "格式都没过"
-  const parsed = emailSchema.safeParse(rawEmail);
+  const parsed = emailSchema.safeParse(rawEmail)
   if (!parsed.success) {
-    return { accepted: true };
+    return { accepted: true }
   }
-  const email = parsed.data;
+  const email = parsed.data
+
+  // SSO 合成 email 不允许走密码重置链路(Codex R6 BLOCKING)。
+  // socialLogin.ts 给 LDC 一键登录用户写入合成 email
+  // `<provider>-<id>@users.claudeai.chat` + email_verified=true。这个域是
+  // 我们自己控制的占位域,**永远不应作为收件地址**。允许重置会:
+  //   1. 一旦 users.claudeai.chat 的 MX/catch-all 被任何错误配置/续期失误/
+  //      CDN 中转激活,就成了 SSO 账号接管路径(枚举 id → reset → 收件 → 设密)。
+  //   2. 即使 MX 永远没设,也是"对外发邮件到攻击者可猜测的合成地址"的
+  //      mail-relay vector,无业务收益直接砍掉。
+  // 判定按 email 后缀,与 socialLogin.ts:SYNTHETIC_EMAIL_DOMAIN 保持同步;
+  // 未来如果接其他 provider,还是同一个合成域 → 同条规则继续生效。
+  // 防枚举:返 accepted=true,与"用户不存在"路径无差别;不查 DB 也无 timing 差异。
+  if (email.endsWith('@users.claudeai.chat')) {
+    return { accepted: true }
+  }
 
   const userRow = await query<{ id: string }>(
     "SELECT id::text AS id FROM users WHERE email = $1 AND status != 'deleted'",
     [email],
-  );
+  )
   if (userRow.rows.length === 0) {
-    return { accepted: true };
+    return { accepted: true }
   }
-  const userId = userRow.rows[0].id;
+  const userId = userRow.rows[0].id
 
-  const verify = newVerifyToken();
-  const ts = nowSec(deps);
-  const expiresIso = new Date((ts + RESET_PASSWORD_TTL_SECONDS) * 1000).toISOString();
+  const verify = newVerifyToken()
+  const ts = nowSec(deps)
+  const expiresIso = new Date((ts + RESET_PASSWORD_TTL_SECONDS) * 1000).toISOString()
 
   // 安全审计 MED:先作废同一用户之前所有未消费/未过期的 reset_password token,
   // 再插入新行 —— 同一事务 + per-user 行锁保证并发申请被串行化,
@@ -292,7 +303,7 @@ export async function requestPasswordReset(
   // 用 SELECT 1 FROM users WHERE id=$1 FOR UPDATE 锁住该 user 行,
   // 强制后到的事务 wait 第一个事务 commit,从而能 UPDATE 掉它刚插入的新行。
   await tx(async (client) => {
-    await client.query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE", [userId]);
+    await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId])
     await client.query(
       `UPDATE email_verifications
           SET used_at = NOW()
@@ -301,41 +312,41 @@ export async function requestPasswordReset(
           AND used_at IS NULL
           AND expires_at > NOW()`,
       [userId],
-    );
+    )
     await client.query(
       `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
        VALUES ($1, $2, 'reset_password', $3)`,
       [userId, verify.hash, expiresIso],
-    );
-  });
+    )
+  })
 
-  const url = `${(deps.resetUrlBase ?? "").replace(/\/$/, "")}/reset-password?token=${verify.raw}`;
+  const url = `${(deps.resetUrlBase ?? '').replace(/\/$/, '')}/reset-password?token=${verify.raw}`
   try {
     await deps.mailer.send({
       to: email,
-      subject: "[OpenClaude] 重置你的密码",
+      subject: '[OpenClaude] 重置你的密码',
       text:
         `Hi,\n\n请点击以下链接重置密码(1 小时内有效):\n\n${url}\n\n` +
         `如果这不是你本人操作,忽略此邮件即可,密码不会被改动。`,
-    });
+    })
   } catch {
     // 邮件失败不影响 accepted 语义 —— 用户可重新申请
   }
 
-  return { accepted: true };
+  return { accepted: true }
 }
 
 // ─── resendVerification ───────────────────────────────────────────────
 
 export interface ResendVerifyDeps extends CommonDeps {
-  mailer: Mailer;
+  mailer: Mailer
   /** 邮件中验证链接的 base url(部署时 https://claudeai.chat) */
-  verifyEmailUrlBase?: string;
+  verifyEmailUrlBase?: string
 }
 
 export interface ResendVerifyResult {
   /** 总是 true:防枚举,接口语义上一律视为"已受理" */
-  accepted: true;
+  accepted: true
 }
 
 /**
@@ -360,13 +371,13 @@ export async function resendVerification(
   rawEmail: string,
   deps: ResendVerifyDeps,
 ): Promise<ResendVerifyResult> {
-  const parsed = emailSchema.safeParse(rawEmail);
-  if (!parsed.success) return { accepted: true };
-  const email = parsed.data;
+  const parsed = emailSchema.safeParse(rawEmail)
+  if (!parsed.success) return { accepted: true }
+  const email = parsed.data
 
-  const verify = newVerifyCode();
-  const ts = nowSec(deps);
-  const expiresIso = new Date((ts + VERIFY_EMAIL_TTL_SECONDS) * 1000).toISOString();
+  const verify = newVerifyCode()
+  const ts = nowSec(deps)
+  const expiresIso = new Date((ts + VERIFY_EMAIL_TTL_SECONDS) * 1000).toISOString()
 
   // 身份判断必须与写入处于同一事务并持 FOR UPDATE 行锁,否则存在
   // verify-vs-resend 竞态:事务外 SELECT 得知 email_verified=false,
@@ -380,9 +391,9 @@ export async function resendVerification(
         WHERE email = $1 AND status != 'deleted'
         FOR UPDATE`,
       [email],
-    );
-    if (r.rows.length === 0 || r.rows[0].email_verified) return false;
-    const userId = r.rows[0].id;
+    )
+    if (r.rows.length === 0 || r.rows[0].email_verified) return false
+    const userId = r.rows[0].id
 
     await client.query(
       `UPDATE email_verifications
@@ -392,21 +403,21 @@ export async function resendVerification(
           AND used_at IS NULL
           AND expires_at > NOW()`,
       [userId],
-    );
+    )
     await client.query(
       `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
        VALUES ($1, $2, 'verify_email', $3)`,
       [userId, verify.hash, expiresIso],
-    );
-    return true;
-  });
+    )
+    return true
+  })
 
-  if (!emailSent) return { accepted: true };
+  if (!emailSent) return { accepted: true }
 
   try {
     await deps.mailer.send({
       to: email,
-      subject: "[OpenClaude] 邮箱验证码(重发)",
+      subject: '[OpenClaude] 邮箱验证码(重发)',
       text:
         `你好,\n\n` +
         `你新的 OpenClaude 邮箱验证码是:\n\n` +
@@ -416,20 +427,20 @@ export async function resendVerification(
         `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
         `   并把 OpenClaude 寄件地址加入联系人 / 白名单以后续避免误判。\n\n` +
         `如果这不是你本人操作,忽略此邮件即可。`,
-    });
+    })
   } catch {
     // 邮件失败不影响 accepted 语义 —— 用户可重试
   }
 
-  return { accepted: true };
+  return { accepted: true }
 }
 
 // ─── confirmPasswordReset ─────────────────────────────────────────────
 
 export interface ConfirmResetResult {
-  user_id: string;
+  user_id: string
   /** 同事务内被 revoke 的 refresh token 数量 */
-  revoked_refresh_tokens: number;
+  revoked_refresh_tokens: number
 }
 
 /**
@@ -448,19 +459,19 @@ export async function confirmPasswordReset(
   newPassword: string,
   deps: CommonDeps = {},
 ): Promise<ConfirmResetResult> {
-  const tokenParsed = tokenSchema.safeParse(rawToken);
+  const tokenParsed = tokenSchema.safeParse(rawToken)
   if (!tokenParsed.success) {
-    throw new VerifyError("VALIDATION", "invalid token format");
+    throw new VerifyError('VALIDATION', 'invalid token format')
   }
-  const pwdParsed = passwordSchema.safeParse(newPassword);
+  const pwdParsed = passwordSchema.safeParse(newPassword)
   if (!pwdParsed.success) {
-    throw new VerifyError("WEAK_PASSWORD", "password must be 8-72 chars");
+    throw new VerifyError('WEAK_PASSWORD', 'password must be 8-72 chars')
   }
 
-  const tokenHash = hashRawToken(tokenParsed.data);
-  const newHash = await hashPassword(pwdParsed.data);
-  const ts = nowSec(deps);
-  const nowIso = new Date(ts * 1000).toISOString();
+  const tokenHash = hashRawToken(tokenParsed.data)
+  const newHash = await hashPassword(pwdParsed.data)
+  const ts = nowSec(deps)
+  const nowIso = new Date(ts * 1000).toISOString()
 
   return await tx<ConfirmResetResult>(async (client) => {
     const found = await client.query<{ id: string; user_id: string }>(
@@ -472,20 +483,20 @@ export async function confirmPasswordReset(
           AND expires_at > $2::timestamptz
         FOR UPDATE`,
       [tokenHash, nowIso],
-    );
+    )
     if (found.rows.length === 0) {
-      throw new VerifyError("INVALID_TOKEN", "reset token invalid or expired");
+      throw new VerifyError('INVALID_TOKEN', 'reset token invalid or expired')
     }
-    const { id: evId, user_id: userId } = found.rows[0];
+    const { id: evId, user_id: userId } = found.rows[0]
 
     await client.query(
-      "UPDATE users SET password_hash = $1, updated_at = $2::timestamptz WHERE id = $3",
+      'UPDATE users SET password_hash = $1, updated_at = $2::timestamptz WHERE id = $3',
       [newHash, nowIso, userId],
-    );
-    await client.query(
-      "UPDATE email_verifications SET used_at = $1::timestamptz WHERE id = $2",
-      [nowIso, evId],
-    );
+    )
+    await client.query('UPDATE email_verifications SET used_at = $1::timestamptz WHERE id = $2', [
+      nowIso,
+      evId,
+    ])
     // 2026-04-21 LOW(migration 0019):带上 revoked_reason 以便审计区分,
     // 不再让 refresh-rotation 的 theft 检测误把 password_reset 撤销的 token
     // reuse 当成攻击信号(theft 仅匹配 reason='rotated')。
@@ -493,11 +504,11 @@ export async function confirmPasswordReset(
       `UPDATE refresh_tokens SET revoked_at = $1::timestamptz, revoked_reason = 'password_reset'
         WHERE user_id = $2 AND revoked_at IS NULL`,
       [nowIso, userId],
-    );
+    )
 
     return {
       user_id: userId,
       revoked_refresh_tokens: revoked.rowCount ?? 0,
-    };
-  });
+    }
+  })
 }

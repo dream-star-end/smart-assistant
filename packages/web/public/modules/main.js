@@ -115,7 +115,13 @@ import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broad
 import { initOAuthListeners, openOAuthModal } from './oauth.js?v=9457912'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
 import { initUsageStats, openUsageModal } from './usageStats.js?v=9457912'
-import { clearUserPrefsCache, initUserPrefs, loadUserPrefs, openPrefsModal, setOnPrefsChanged } from './userPrefs.js?v=9457912'
+import {
+  clearUserPrefsCache,
+  initUserPrefs,
+  loadUserPrefs,
+  openPrefsModal,
+  setOnPrefsChanged,
+} from './userPrefs.js?v=9457912'
 import { initWechatListeners, openWechatModal } from './wechat.js?v=9457912'
 
 // ── Memory & Skills ──
@@ -422,11 +428,14 @@ function updateSyncIndicator(status) {
   if (detail) detail.textContent = status.detail || ''
 
   if (status.state === 'synced' || status.state === 'error') {
-    _syncBannerTimer = setTimeout(() => {
-      banner.classList.remove('syncing', 'synced', 'error')
-      banner.classList.add('idle')
-      banner.setAttribute('aria-hidden', 'true')
-    }, status.state === 'error' ? 4500 : 1800)
+    _syncBannerTimer = setTimeout(
+      () => {
+        banner.classList.remove('syncing', 'synced', 'error')
+        banner.classList.add('idle')
+        banner.setAttribute('aria-hidden', 'true')
+      },
+      status.state === 'error' ? 4500 : 1800,
+    )
   }
 }
 // ── Global error handlers ──
@@ -835,7 +844,7 @@ function send() {
   // v1.0.4 — frame.model 从 user prefs 取(C 方案)。空字符串视同未设。
   // server.ts WS 入口对此值做静态白名单兜底,前端无需 validate。
   const _prefModel = state.userPrefs?.default_model
-  const modelOverride = (typeof _prefModel === 'string' && _prefModel) ? _prefModel : undefined
+  const modelOverride = typeof _prefModel === 'string' && _prefModel ? _prefModel : undefined
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1908,6 +1917,132 @@ async function submitFeedback() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 4.5 runPostLoginPipeline — login 成功 / SSO oauthCallback 共用 boot 流水线
+// ═══════════════════════════════════════════════════════════
+//
+// 把"刚拿到 access token,要进入 app"的所有步骤抽出来。两个 caller:
+//   1. setAuthSuccessHandler — 邮箱密码 / 注册 / 验证邮箱 流程,access_token 来自
+//      `/api/auth/login` 的响应 body
+//   2. SSO oauthCallback boot 分支 — 浏览器从 `/?source=linuxdo` 进来,refresh
+//      cookie 已由 server 下发,要先 silentRefresh({skipSessionCookieMint:true})
+//      拿 access token 再跑这条流水线
+//
+// **R5 Codex 反馈核心**:silentRefresh 内部 fire-and-forget mint 与本函数
+// `clearSessionCookie() → mintSessionCookie()` race 时,旧 mint 可能在 clear 之后
+// 才到达 → cookie 短暂回到旧身份。SSO caller 用 skipSessionCookieMint:true 显式
+// 关闭 silentRefresh 的自动 mint,让本函数串行 clear→mint 唯一持有 cookie 写入权。
+//
+// 顺序敏感(每步 await 的原因都在 setAuthSuccessHandler 原注释里):
+//   1) abortInflightRefresh + bump epoch + 写 state.token + storage
+//   2) await clearSessionCookie  ← 必须在 mint 前 await,否则旧 oc_session 短窗口
+//      会被新 <img> 命中
+//   3) await mintSessionCookie   ← 必须在 showApp/renderMessages 前 await
+//   4) scheduleProactiveRefresh
+//   5) clear stale IDB(同浏览器切账号防泄漏)
+//   6) state.sessions.clear() —— SSO 路径上,boot 阶段的 IDB 装载已经把上一身份
+//      的 session 灌进 state.sessions(在 init() if-state.token 之前的 dbGetAll 里)。
+//      若不清,后续 syncSessionsFromServer 拿到的是 merge 视图,跨账号串号。
+//      legacy login 路径上 state.sessions 已被 _forceLogout 清过,这里清一次幂等。
+//   7) loadUserPrefs
+//   8) showApp + renders + connect + balance + sync + checkUnclaimedSessions
+async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
+  // 2026-04-22 Codex R3:login 前先 abort 可能在飞的 refresh(防止旧身份的
+  // Set-Cookie 覆盖新账号刚拿到的 oc_rt),再写新 state.token + bump epoch。
+  abortInflightRefresh()
+  state.token = accessToken
+  state.tokenExp = Number(accessExp) || 0
+  // bump authEpoch —— 让任何在此之前起的 silentRefresh() 在它的响应回来时
+  // 不再敢把 state.token 覆写(那是上一个身份的 refresh 结果,旧 refresh
+  // token 已经在 server 端 rotate,新 access 可能串号)。
+  state.authEpoch = (state.authEpoch || 0) + 1
+  // 主动清掉老版本可能残留的 localStorage refresh token —— 一旦走完一次新版
+  // login,旧 token 既无用又是 XSS 攻击面,立刻零化。
+  state.refreshToken = ''
+  try {
+    localStorage.removeItem('openclaude_refresh_token')
+  } catch {}
+  // 2026-04-24 "记住我":remember=true(默认)→ localStorage(持久),
+  // false → sessionStorage(关窗口即清,与 cookie 同生命周期)。
+  _writeStoredAccessToken(accessToken, accessExp, remember !== false)
+  // Re-arm 401 handler — next token expiry will fire it again.
+  resetAuthExpired()
+  // V3 file-proxy 身份切换 race 硬化(Codex R2 BLOCKER):先 await 清旧 oc_session,
+  // 再 await mint 新身份 cookie,然后才继续 showApp/renderMessages。
+  // 原因:浏览器 Set-Cookie 在 response header 到达时就被应用,AbortController
+  // 没法在 header 已到后撤回;所以必须用"反向操作"——清后再种——保证进入 app
+  // 之前 HttpOnly oc_session 一定是当前身份。否则冷启动/切账号那几百 ms 内
+  // <img src="/api/file?..."> 原生请求会捎旧 cookie 跑到 HOST → 按旧身份代理
+  // 到旧容器 → 跨用户泄漏。clearSessionCookie 内部带 AbortController,中断的是
+  // 先前 mint 的 signal;它自身发出的 clear 会正常到达 server 落盘 Max-Age=0。
+  try {
+    await clearSessionCookie()
+  } catch {}
+  let mintOk = false
+  try {
+    mintOk = await mintSessionCookie(accessToken, state.authEpoch)
+  } catch {
+    mintOk = false
+  }
+  // 2026-04-28 Codex R5:mint 失败时 file-proxy(/api/file <img>)会 401。不阻塞
+  // 后续登录(token 已拿到,聊天能用),但 toast 一句让用户知道图片预览暂时受限。
+  // 多 tab race 后 self-clear 也会返 false —— 此时 cookie 已被擦,fall-through
+  // 到 reactive 401 路径下次访问时再 mint,toast 提示一致。
+  if (!mintOk) {
+    try {
+      toast('文件预览身份初始化失败,部分图片可能 401,稍后重试', 'warning')
+    } catch {}
+  }
+  // 启动主动续期 timer,见 init() 的注释。
+  scheduleProactiveRefresh()
+  // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage.
+  try {
+    const stale = await dbGetAll()
+    for (const s of stale) await dbDelete(s.id)
+  } catch {}
+  // SSO oauthCallback 路径:boot 已把 IDB 灌进 state.sessions,必须显式清
+  // 否则跨账号串号(legacy login 路径上 _forceLogout 已经清过,幂等无害)。
+  state.sessions.clear()
+  state.currentSessionId = null
+  // 2026-04-26 v1.0.4 — 拉取用户偏好(default_model / default_effort 等)给
+  // composer 顶部的 model/effort pill 用。await 让 connect() 之前 prefs 已就位,
+  // 否则 sendMessage 帧里 frame.model 就漏了 → 第一条消息按 agent 默认模型走。
+  // 失败 fallback 已在 loadUserPrefs 内部处理(state.userPrefs={}),不会卡登录。
+  clearUserPrefsCache()
+  await loadUserPrefs(true)
+  await showApp()
+  renderSidebar()
+  renderMessages()
+  connect()
+  reloadAgents()
+  loadChangelog()
+  refreshBalance().catch(() => {})
+  syncSessionsFromServer()
+    .then((result) => {
+      const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+      if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+        state.currentSessionId = updated[0]?.id || null
+        if (!state.currentSessionId) createSession()
+        renderMessages()
+      } else if (result?.needsRenderMessages) {
+        renderMessages()
+      }
+      renderSidebar()
+      // 2026-04-22 + 2026-04-27:agents + sessions 两条 fetch 在 login 后并发
+      // 起飞,谁先谁后决定首次 render 时 state.currentSessionId 是否已定。如果
+      // sessions 后到,reloadAgents 里的两次 render 都拿不到有效 sess —— effort
+      // pill 因 getCurrentAgentModel 返回 '' 隐藏(产品逻辑要求 Opus 4.7),
+      // model pill 因 getCurrentAgent() 返回 null 隐藏 —— 直到用户刷新或新建
+      // 会话。兜底:sessions sync 完成后两个 pill 都重 render 一次。
+      // 2026-04-27 v1.0.16:补 renderModelPill,v1.0.4 加 modelPicker 时漏写。
+      renderModePills()
+      renderModelPill()
+    })
+    .catch(() => {})
+  checkUnclaimedSessions()
+  return mintOk
+}
+
+// ═══════════════════════════════════════════════════════════
 // 5. init() -- THE application bootstrap
 // ═══════════════════════════════════════════════════════════
 
@@ -2235,85 +2370,13 @@ async function init() {
   // main.js 只负责"登录成功后该做什么"——清 IDB、装 access token、连 ws、起 app view。
   // refresh token 由 server 通过 Set-Cookie(HttpOnly oc_rt)下发,JS 读不到,这里
   // 也不要尝试读 refresh_token 字段(后端已经从响应里拿掉)。
-  setAuthSuccessHandler(async ({ access_token, access_exp, remember }) => {
-    // 2026-04-22 Codex R3:login 前先 abort 可能在飞的 refresh(防止旧身份的
-    // Set-Cookie 覆盖新账号刚拿到的 oc_rt),再写新 state.token + bump epoch。
-    abortInflightRefresh()
-    state.token = access_token
-    state.tokenExp = Number(access_exp) || 0
-    // bump authEpoch —— 让任何在此之前起的 silentRefresh() 在它的响应回来时
-    // 不再敢把 state.token 覆写(那是上一个身份的 refresh 结果,旧 refresh
-    // token 已经在 server 端 rotate,新 access 可能串号)。
-    state.authEpoch = (state.authEpoch || 0) + 1
-    // 主动清掉老版本可能残留的 localStorage refresh token —— 一旦走完一次新版
-    // login,旧 token 既无用又是 XSS 攻击面,立刻零化。
-    state.refreshToken = ''
-    try {
-      localStorage.removeItem('openclaude_refresh_token')
-    } catch {}
-    // 2026-04-24 "记住我":remember=true(默认)→ localStorage(持久),
-    // false → sessionStorage(关窗口即清,与 cookie 同生命周期)。
-    _writeStoredAccessToken(access_token, access_exp, remember !== false)
-    // Re-arm 401 handler — next token expiry will fire it again.
-    resetAuthExpired()
-    // V3 file-proxy 身份切换 race 硬化(Codex R2 BLOCKER):先 await 清旧 oc_session,
-    // 再 await mint 新身份 cookie,然后才继续 showApp/renderMessages。
-    // 原因:浏览器 Set-Cookie 在 response header 到达时就被应用,AbortController
-    // 没法在 header 已到后撤回;所以必须用"反向操作"——清后再种——保证进入 app
-    // 之前 HttpOnly oc_session 一定是当前身份。否则冷启动/切账号那几百 ms 内
-    // <img src="/api/file?..."> 原生请求会捎旧 cookie 跑到 HOST → 按旧身份代理
-    // 到旧容器 → 跨用户泄漏。clearSessionCookie 内部带 AbortController,中断的是
-    // 先前 mint 的 signal;它自身发出的 clear 会正常到达 server 落盘 Max-Age=0。
-    try {
-      await clearSessionCookie()
-    } catch {}
-    try {
-      await mintSessionCookie(access_token, state.authEpoch)
-    } catch {}
-    // 启动主动续期 timer,见 init() 的注释。
-    scheduleProactiveRefresh()
-    // Clear stale IDB from previous user BEFORE sync to prevent cross-user leakage.
-    try {
-      const stale = await dbGetAll()
-      for (const s of stale) await dbDelete(s.id)
-    } catch {}
-    // 2026-04-26 v1.0.4 — 拉取用户偏好(default_model / default_effort 等)给
-    // composer 顶部的 model/effort pill 用。await 让 connect() 之前 prefs 已就位,
-    // 否则 sendMessage 帧里 frame.model 就漏了 → 第一条消息按 agent 默认模型走。
-    // 失败 fallback 已在 loadUserPrefs 内部处理(state.userPrefs={}),不会卡登录。
-    clearUserPrefsCache()
-    await loadUserPrefs(true)
-    await showApp()
-    renderSidebar()
-    renderMessages()
-    connect()
-    reloadAgents()
-    loadChangelog()
-    refreshBalance().catch(() => {})
-    syncSessionsFromServer()
-      .then((result) => {
-        const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
-        if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
-          state.currentSessionId = updated[0]?.id || null
-          if (!state.currentSessionId) createSession()
-          renderMessages()
-        } else if (result?.needsRenderMessages) {
-          renderMessages()
-        }
-        renderSidebar()
-        // 2026-04-22 + 2026-04-27:agents + sessions 两条 fetch 在 login 后并发
-        // 起飞,谁先谁后决定首次 render 时 state.currentSessionId 是否已定。如果
-        // sessions 后到,reloadAgents 里的两次 render 都拿不到有效 sess —— effort
-        // pill 因 getCurrentAgentModel 返回 '' 隐藏(产品逻辑要求 Opus 4.7),
-        // model pill 因 getCurrentAgent() 返回 null 隐藏 —— 直到用户刷新或新建
-        // 会话。兜底:sessions sync 完成后两个 pill 都重 render 一次。
-        // 2026-04-27 v1.0.16:补 renderModelPill,v1.0.4 加 modelPicker 时漏写。
-        renderModePills()
-        renderModelPill()
-      })
-      .catch(() => {})
-    checkUnclaimedSessions()
-  })
+  setAuthSuccessHandler(async ({ access_token, access_exp, remember }) =>
+    runPostLoginPipeline({
+      accessToken: access_token,
+      accessExp: access_exp,
+      remember: remember !== false,
+    }),
+  )
   initAuth()
   // M5(P1-7):多 tab 认证状态同步。同浏览器同源的其他 tab 退出 / 刷新 token 时,
   // 本 tab in-place 跟进,免去 reactive 401 → 重登流程。
@@ -2419,7 +2482,56 @@ async function init() {
   if (arr.length > 0) state.currentSessionId = arr[0].id
   else createSession()
 
-  if (state.token) {
+  // ─────────────────────────────────────────────────────────────────
+  // SSO oauthCallback boot 分支 — 必须在 state.token 检查之前
+  // ─────────────────────────────────────────────────────────────────
+  // server 完成 LDC OAuth 后 302 回 `/?source=linuxdo`,refresh cookie 已下发。
+  // 本 tab 此前可能:
+  //   (a) 已登录另一身份 — state.token 非空 / IDB 已灌进 state.sessions
+  //   (b) 未登录冷启动 — state.token 空
+  // 两种情况都需要"以新 refresh cookie 为准 silentRefresh 一次拿 access token,
+  // 然后跑 runPostLoginPipeline",所以这条分支优先于下面的 if (state.token) 与
+  // else 冷启动逻辑。
+  //
+  // skipSessionCookieMint:true —— silentRefresh 内部默认会 fire-and-forget
+  // mintSessionCookie,会与 runPostLoginPipeline 里 await 的 clear→mint
+  // race。SSO 路径关掉自动 mint,让流水线串行写 cookie。
+  const _bootSp = new URLSearchParams(window.location.search)
+  if (_bootSp.get('source') === 'linuxdo') {
+    // 1) 把 ?source=linuxdo 从 URL 抹掉(避免 reload / 分享时再次触发)
+    try {
+      const cleanUrl = new URL(window.location.href)
+      cleanUrl.searchParams.delete('source')
+      window.history.replaceState({}, '', cleanUrl.toString())
+    } catch {}
+    // 2) 全身份重置:abort 在飞 refresh、清旧 access token、bump epoch。
+    //    state.sessions 不在这里清 — runPostLoginPipeline 会清。
+    abortInflightRefresh()
+    _clearStoredAccessToken()
+    state.token = ''
+    state.refreshToken = ''
+    state.tokenExp = 0
+    state.authEpoch = (state.authEpoch || 0) + 1
+    // 3) 用新下发的 refresh cookie 拿 access token。skipSessionCookieMint:true。
+    let ok = false
+    try {
+      ok = await silentRefresh({ skipSessionCookieMint: true })
+    } catch {
+      ok = false
+    }
+    if (ok && state.token) {
+      // 4) 共用流水线把账号装进 app
+      await runPostLoginPipeline({
+        accessToken: state.token,
+        accessExp: state.tokenExp,
+        remember: true,
+      })
+    } else {
+      // 5) 失败兜底:server 那边已经 ctx.log 记录了 oauth_error,前端只 toast
+      toast('LINUX DO 登录失败，请稍后再试', 'error')
+      showLogin()
+    }
+  } else if (state.token) {
     // 2026-04-23:冷启动 proactive refresh。localStorage 里的 access token 极可能
     // 已过期(手机浏览器长时间后台导致),若直接走 mintSessionCookie / connect() 会
     // 撞一堆 401/1008,多路并发可能误踢登录。先做一次 silentRefresh,拿新 access
@@ -2500,6 +2612,33 @@ async function init() {
       if (sp.has('register') || sp.has('signup')) {
         try {
           setAuthMode('register')
+        } catch {}
+      }
+      // SSO 失败回流:server 把错误码塞进 ?login=1&oauth_error=<code> 重定向回来,
+      // 我们在登录页 toast 一句中文友好提示。短码到中文的映射对齐
+      // oauthLinuxdo.ts:mapErrorCode 的输出值。把 oauth_error 从 URL 抹掉,
+      // 避免 reload / 分享时复读。
+      const _oauthErr = sp.get('oauth_error')
+      if (_oauthErr) {
+        const _msg =
+          _oauthErr === 'denied'
+            ? '已取消 LINUX DO 登录'
+            : _oauthErr === 'invalid_state'
+              ? 'LINUX DO 登录会话已失效，请重试'
+              : _oauthErr === 'token_failed'
+                ? 'LINUX DO 授权码兑换失败，请重试'
+                : _oauthErr === 'userinfo_failed'
+                  ? '获取 LINUX DO 用户信息失败，请重试'
+                  : _oauthErr === 'disabled'
+                    ? '账号已被禁用，无法登录'
+                    : _oauthErr === 'unavailable'
+                      ? 'LINUX DO 登录暂时不可用'
+                      : 'LINUX DO 登录失败，请稍后再试'
+        toast(_msg, _oauthErr === 'denied' ? 'info' : 'error')
+        try {
+          const cleanUrl = new URL(window.location.href)
+          cleanUrl.searchParams.delete('oauth_error')
+          window.history.replaceState({}, '', cleanUrl.toString())
         } catch {}
       }
     } else {

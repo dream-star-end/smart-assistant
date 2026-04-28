@@ -48,6 +48,7 @@ import {
   type RequestContext,
 } from './handlers.js'
 import { containerFileProxy } from './containerFileProxy.js'
+import { handleLinuxdoStart, handleLinuxdoCallback } from './oauthLinuxdo.js'
 import { requireUserVerifyDb } from './requireUser.js'
 import { handleListPlans, handleCreateHupi, handleHupiCallback, handleGetOrder } from './payment.js'
 import { handleAgentOpen, handleAgentStatus, handleAgentCancel } from './agent.js'
@@ -382,6 +383,12 @@ export function createCommercialHandler(
       path: '/api/auth/confirm-password-reset',
       handler: (req, res) => handleConfirmPasswordReset(req, res),
     },
+    // LINUX DO Connect (LDC) SSO —— 一键登录入口 / OAuth callback
+    //   start:GET 顶层导航,302 → connect.linux.do/oauth2/authorize
+    //   callback:GET 顶层导航,LDC 把用户带回来,落库 + 签 token + 302 → /?source=linuxdo
+    //   失败一律 302 → /?login=1&oauth_error=<code>(SPA 接管 toast)
+    { method: 'GET', path: '/api/auth/linuxdo/start', handler: handleLinuxdoStart },
+    { method: 'GET', path: '/api/auth/linuxdo/callback', handler: handleLinuxdoCallback },
     // v3 file proxy: 用 Bearer access token 换一个 HttpOnly `oc_session` cookie,
     // 让 `<a href>` / `<img>` 等原生下载链接能携带身份(见 handlers.ts 详注)
     { method: 'POST', path: '/api/auth/session', handler: handleCreateSession },

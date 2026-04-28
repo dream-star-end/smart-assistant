@@ -174,7 +174,7 @@ export function abortInflightRefresh() {
 // _silentRefresh() 生命周期 —— 这样 retry 循环跨多次 _doRefreshOnce 仍然对齐
 // 同一个起始身份,避免 retry N+1 在 retry N 和 N+1 之间发生的身份变更中捡到
 // 新 epoch 后 commit(R3 finding C)。
-async function _doRefreshOnce(expectedEpoch) {
+async function _doRefreshOnce(expectedEpoch, opts) {
   const legacyBody = state.refreshToken
     ? JSON.stringify({ refresh_token: state.refreshToken })
     : undefined
@@ -241,11 +241,19 @@ async function _doRefreshOnce(expectedEpoch) {
     // refresh 绑定的 myEpoch —— mint 响应回来后若 epoch 变过会 self-clear,
     // 防止旧身份的 session cookie 被新身份 inheritance。
     // 用 dynamic import 避开与 auth.js 的循环依赖(auth.js 也 import 了 api.js)。
-    void import('./auth.js?v=9457912')
-      .then(({ mintSessionCookie }) => {
-        mintSessionCookie(data.access_token, expectedEpoch).catch(() => {})
-      })
-      .catch(() => {})
+    //
+    // 2026-04-28 SSO oauthCallback 路径:caller 传 skipSessionCookieMint=true 时
+    // 跳过自动 mint —— 因为 caller(main.js runPostLoginPipeline)会自己显式
+    // clearSessionCookie() → mintSessionCookie() 串行调度,避免与本处的 fire-and-forget
+    // mint 抢同一份 oc_session cookie(race 时旧 mint 把新 mint 的结果覆盖回旧值,
+    // 极端情况让 file-proxy 短窗口内带错 user 的 session)。
+    if (!opts?.skipSessionCookieMint) {
+      void import('./auth.js?v=9457912')
+        .then(({ mintSessionCookie }) => {
+          mintSessionCookie(data.access_token, expectedEpoch).catch(() => {})
+        })
+        .catch(() => {})
+    }
     // M5:广播给同源其他 tab,让它们直接接管新 token,免去各自再打 /api/auth/refresh。
     // userId 缺失(早期 race,/api/me 还没回)时 publishTokenRefresh 内部会 skip,
     // 不广播是安全降级 —— 接收方走 reactive 401 兜底。fire-and-forget。
@@ -290,8 +298,14 @@ const _RACE_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 1750]
 // Returns Promise<boolean>:true = state.token now holds a fresh access JWT.
 // Shares the same inflight promise as apiFetch's internal 401-retry path,
 // so a burst of HTTP 401 + WS 1008 only fires one /api/auth/refresh.
-export function silentRefresh() {
-  return _silentRefresh()
+/**
+ * @param {{ skipSessionCookieMint?: boolean } | undefined} opts
+ *   - skipSessionCookieMint:跳过 _doRefreshOnce 内部 fire-and-forget 的
+ *     mintSessionCookie 调度。SSO oauthCallback 等 caller 会自己显式 mint(且
+ *     先 clearSessionCookie),用此 flag 防双重 mint race。
+ */
+export function silentRefresh(opts) {
+  return _silentRefresh(opts)
 }
 
 // ── Proactive refresh timer ──
@@ -371,7 +385,7 @@ async function _runProactiveRefresh() {
   }
 }
 
-function _silentRefresh() {
+function _silentRefresh(opts) {
   const myEpoch = state.authEpoch || 0
   // 同 epoch 且还有 inflight → 合并。跨 epoch 不合并(旧 inflight 注定被 abort/
   // 拒绝,新的得独立跑)。
@@ -392,7 +406,7 @@ function _silentRefresh() {
   _refreshAbort = myAbort
   const promise = (async () => {
     try {
-      let last = await _doRefreshOnce(myEpoch)
+      let last = await _doRefreshOnce(myEpoch, opts)
       if (last.ok) return true
       if (last.aborted) return false
       if (!last.race) return false
@@ -402,7 +416,7 @@ function _silentRefresh() {
         // 拿到 200,也会被 _doRefreshOnce 内 epoch check 拦下;这里提前退出
         // 省掉一次网络调用。
         if ((state.authEpoch || 0) !== myEpoch) return false
-        last = await _doRefreshOnce(myEpoch)
+        last = await _doRefreshOnce(myEpoch, opts)
         if (last.ok) return true
         if (last.aborted) return false
         // 中途 server 停 race(如 grace 已过 → INVALID_REFRESH)直接放弃

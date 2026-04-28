@@ -77,6 +77,18 @@ export function abortInflightMintClear() {
   _mintClearAbort = null
 }
 
+/**
+ * 给当前身份种 oc_session HttpOnly cookie(file-proxy 用,没 cookie file 链接 401)。
+ *
+ * 返回值(2026-04-28 SSO 接入新增):
+ *   - true  → 服务端 200 且 epoch 在请求前后未变(cookie 与当前身份一致)
+ *   - false → 任何失败:network、!r.ok、aborted、或请求中 epoch 已变(self-clear 后)
+ *
+ * SSO oauthCallback 路径 caller(main.js runPostLoginPipeline)需要据此判断是否
+ * 需要降级提示用户"file 预览暂时不可用"—— 旧版 swallow error 的语义对登录
+ * 主链路是合理的(mint 失败不该挡 access token 写入),但对 SSO 整体 UX 来说,
+ * 知道 mint 是否成功能让 toast 文案更精准。
+ */
 export async function mintSessionCookie(accessToken, expectedEpoch) {
   // R3 BLOCKER:发请求前先做 epoch 预检 —— 防止 silentRefresh 成功回调里那个
   // fire-and-forget 的 dynamic-import mint callback 跨身份漂移。
@@ -88,7 +100,7 @@ export async function mintSessionCookie(accessToken, expectedEpoch) {
   //       2) 发一个带 A token 的 /api/auth/session(Bearer 已用 data.access_token 参数拷贝)
   //     结果 Set-Cookie 写 A 的 oc_session,才靠 response 后 mismatch self-clear 补救。
   // 一行预检把第 1/2 步直接跳过,留"请求期间 epoch 变化"这一条窄边界给 self-clear 兜底。
-  if (typeof expectedEpoch === 'number' && (state.authEpoch || 0) !== expectedEpoch) return
+  if (typeof expectedEpoch === 'number' && (state.authEpoch || 0) !== expectedEpoch) return false
   abortInflightMintClear()
   const ctrl = new AbortController()
   _mintClearAbort = ctrl
@@ -103,7 +115,7 @@ export async function mintSessionCookie(accessToken, expectedEpoch) {
     ok = r.ok
   } catch {
     // aborted / network — cookie not affected
-    return
+    return false
   } finally {
     if (_mintClearAbort === ctrl) _mintClearAbort = null
   }
@@ -120,7 +132,10 @@ export async function mintSessionCookie(accessToken, expectedEpoch) {
     } catch {
       // 最后一道防护线挂了就算了;HttpOnly 且 Max-Age 短,等 JWT exp 自然失效
     }
+    // self-clear 走过 = 当前 cookie 已不属于 caller 期望的 epoch,返 false
+    return false
   }
+  return ok
 }
 
 export async function clearSessionCookie() {
