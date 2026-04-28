@@ -446,6 +446,13 @@ export async function markOrderPaid(
       throw new InvalidOrderStateError(input.orderNo, current.status);
     }
 
+    // 不在 markOrderPaid 内做"expires_at < now → 拒付"的硬防线。
+    // 理由:用户 15 分 0 秒 ~ 15 分 30 秒扫码到回调到达的真实路径很常见,
+    // 硬拒会让"扣了钱但订单未入账"的体验广泛出现。过期单的清理由 sweeper
+    // (pendingOrdersExpirer 60s tick)负责:订单被推 expired 后,markOrderPaid
+    // 走上面的 status!=='pending' 分支自然拒付。这等价于"60s 宽容尾巴",
+    // 兼顾价格冻结漏洞修复 + 用户超时体验。
+
     // 纵深防御:回调字段与订单不匹配 → 中止,不扣积分不写 ledger,订单保持 pending
     // 等待下次回调或 expire。攻击面覆盖"签名算法绕过 / appSecret 泄露 / 上游 bug"。
     if (

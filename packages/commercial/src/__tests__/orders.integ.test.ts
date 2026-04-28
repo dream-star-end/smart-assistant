@@ -300,6 +300,30 @@ describe("markOrderPaid", () => {
     assert.equal(u.rows[0].credits, "0");
   });
 
+  test("A1 易用性兼容:expires_at 已过但仍 pending(sweeper 未 tick)→ markOrderPaid 仍可成功", async (t) => {
+    // 设计意图:不在 markOrderPaid 内对 expires_at 做硬防线。用户超时几秒扫码
+    // 的真实路径常见,硬拒会让"扣了钱但订单未入账"广泛出现。过期清理由 sweeper
+    // 负责;订单仍 pending 时 markOrderPaid 仍认账。
+    if (skipIfNoDb(t)) return;
+    const uid = await makeUser("pay-stale-pending@example.com", 0n);
+    const { order } = await createPendingOrder({ userId: uid, planCode: "plan-10" });
+    // 模拟 sweeper 还没 tick 到的窗口:status 仍是 pending,但 expires_at 已经过去
+    await query(
+      "UPDATE orders SET expires_at = NOW() - INTERVAL '1 second' WHERE id=$1",
+      [order.id.toString()],
+    );
+    const r = await markOrderPaid({
+      orderNo: order.order_no,
+      callbackPayload: { status: "OD" },
+    });
+    assert.equal(r.newlyPaid, true);
+    // 用户拿到积分
+    const u = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id=$1", [uid],
+    );
+    assert.equal(u.rows[0].credits, "1000");
+  });
+
   test("并发同单 2 次:只加一次积分(行锁)", async (t) => {
     if (skipIfNoDb(t)) return;
     const uid = await makeUser("pay-race@example.com", 0n);

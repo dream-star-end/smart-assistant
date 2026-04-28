@@ -475,6 +475,85 @@ describe("commercial HTTP router (integ)", () => {
     assert.equal((r.json.error as Record<string, unknown>).code, "VALIDATION");
   });
 
+  test("A6: verify-email per-email rate limit caps total attempts on a single mailbox", async (t) => {
+    if (skipIfMissing(t)) return;
+    // 紧限流 server:IP 维度放松到 100/min(便于不被 IP 桶先打死),
+    // email 维度紧到 3/30min,验证 4 次同邮箱(无论大小写)都计入同桶。
+    const tight = createCommercialHandler({
+      jwtSecret: JWT_SECRET,
+      mailer,
+      redis: wrapIoredis(redis!),
+      turnstileBypass: true,
+      verifyEmailUrlBase: "https://test.local",
+      rateLimits: {
+        // IP 桶留宽,确保不是 IP 桶先 429 — 否则就测不到 email 桶
+        verifyEmail: { scope: "verify_email_smoke_ip", windowSeconds: 60, max: 100 },
+        // 把 email 桶钳到 3,4th 就该 429
+        verifyEmailEmail: { scope: "verify_email_smoke_email", windowSeconds: 1800, max: 3 },
+      },
+    });
+    const tightServer = createServer(async (req, res) => {
+      const handled = await tight(req, res);
+      if (!handled) {
+        res.statusCode = 404;
+        res.end();
+      }
+    });
+    await new Promise<void>((resolve) => tightServer.listen(0, "127.0.0.1", () => resolve()));
+    const tightAddr = (tightServer.address() as AddressInfo).port;
+    try {
+      const url = `http://127.0.0.1:${tightAddr}/api/auth/verify-email`;
+      const sendVerify = (email: string, code: string) =>
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, code }),
+        });
+      const sendBadShape = () =>
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          // 缺 code 字段,handler 应在 email 限流之前 throw VALIDATION
+          body: JSON.stringify({ email: "a6-target@example.com" }),
+        });
+      // Codex 建议补:body shape 校验 不能 消耗 email 桶。先打 5 次缺字段
+      // 请求(超过 max=3),仍允许后续 3 次合法 shape 通过 email 桶 —— 证明
+      // 限流顺序是 IP → body 校验 → email,空 body 不进 email 桶。
+      for (let i = 0; i < 5; i++) {
+        const r = await sendBadShape();
+        assert.equal(r.status, 400, `bad-shape #${i + 1} expected 400, got ${r.status}`);
+      }
+      // 前 3 次(大小写混合 + 前后空格,验证 trim+lowercase 归一化)都过限流
+      // → 业务层 VerifyError(无 pending verification),返 400 INVALID_CODE 之类。
+      const variants = [
+        "a6-target@example.com",
+        "A6-Target@Example.com",
+        "  A6-TARGET@example.COM  ", // Codex 建议补:验证 trim() 归一化
+      ];
+      for (let i = 0; i < 3; i++) {
+        const r = await sendVerify(variants[i], "000000");
+        assert.notEqual(r.status, 429, `attempt ${i + 1} should not be rate-limited`);
+        assert.notEqual(r.status, 200, `attempt ${i + 1} should fail business validation`);
+      }
+      // 第 4 次同邮箱(原始 lowercase)应 429 — 证明跨大小写/空格共享桶
+      const r4 = await sendVerify("a6-target@example.com", "000000");
+      assert.equal(r4.status, 429, "4th attempt on same email (any case/whitespace) must be rate-limited");
+      assert.ok(r4.headers.get("retry-after"));
+      // rate_limit_events 落库:scope=verify_email_smoke_email,key=sha256 前缀
+      // (绝不是明文 email)
+      const ev = await query<{ key: string }>(
+        "SELECT key FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
+        ["verify_email_smoke_email"],
+      );
+      assert.equal(ev.rows.length, 1, "exactly 1 blocked event");
+      const id = ev.rows[0].key;
+      assert.match(id, /^[0-9a-f]{16}$/, `key must be 16-hex sha256 prefix, got: ${id}`);
+      assert.ok(!id.includes("@"), "key must not contain plaintext email");
+    } finally {
+      await new Promise<void>((resolve) => tightServer.close(() => resolve()));
+    }
+  });
+
   test("rate limit returns 429 + Retry-After header (with tight limit)", async (t) => {
     if (skipIfMissing(t)) return;
     // 临时构造一个紧限流的 server,只允许 2 次/分钟 register

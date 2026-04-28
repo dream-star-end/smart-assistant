@@ -617,9 +617,10 @@ export async function updateAccount(
 /**
  * 删除账号。
  *
- * 注意:usage_records.account_id FK `ON DELETE RESTRICT`,
- * 若存在历史流水 DB 会抛错(错误透传给调用方)。运维应先把账号
- * 标记为 `disabled`,保留历史。
+ * 注意:usage_records.account_id FK `ON DELETE SET NULL`(0044 migration),
+ * 删除账号后历史 usage_records 行保留 user_id/cost_credits/request_id/timing
+ * 等计费核心字段,仅 account_id 置 NULL 表示"已删除账号"。
+ * account_refresh_events FK 是 CASCADE,会随账号一起删。
  *
  * @returns true 删了一行,false 未找到
  */

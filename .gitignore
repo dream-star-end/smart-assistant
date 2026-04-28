@@ -9,3 +9,6 @@ dist/
 deploy/.env
 claude-code-best/node_modules/
 claude-code-best/dist/
+
+# 编译产物,不进 git(rsync 仍会推到部署目标)
+packages/commercial/node-agent/node-agent

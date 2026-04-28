@@ -6,6 +6,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import {
   HttpError,
   readJsonBody,
@@ -84,6 +85,14 @@ export interface CommercialHttpDeps {
      * 自动化枚举,又不影响用户手动输错重试。
      */
     verifyEmail: RateLimitConfig;
+    /**
+     * 2026-04-28 (A6):per-email 限流,补 verifyEmail 仅按 IP 的盲点。
+     * 攻击者切 IP 池绕过 verifyEmail(IP 维度),但目标邮箱固定,加这条
+     * 后单一目标邮箱 30min 最多 10 次尝试,10^6 空间下成功概率 0.001%/30min。
+     * key 用 sha256(email.trim().toLowerCase()).slice(0,16),避免 PII 落
+     * rate_limit_events 表(明文邮箱不能进可被取证读出的限流日志)。
+     */
+    verifyEmailEmail: RateLimitConfig;
     hupiCreate: RateLimitConfig;
     // 2026-04-21 安全审计 HIGH (refresh/logout 限流)补齐的条目
     refresh: RateLimitConfig;
@@ -192,6 +201,10 @@ export const DEFAULT_RATE_LIMITS = {
   // 10/min/IP 对正常用户宽松(手动输错重试 3-5 次),对自动化脚本
   // 30min TTL 内最多 300 次尝试,相对 10^6 空间可忽略。
   verifyEmail: { scope: "verify_email", windowSeconds: 60, max: 10 } satisfies RateLimitConfig,
+  // 2026-04-28 (A6):per-email 30min 窗口最多 10 次,补 IP 维度的盲点
+  // (攻击者切 IP 池但目标邮箱固定就能撞码)。窗口拉长到 30min 与 code TTL
+  // 对齐 —— 一个 code 生命周期内至多 10 次尝试,10^6 空间下成功率 ≈ 0.001%。
+  verifyEmailEmail: { scope: "verify_email_email", windowSeconds: 1800, max: 10 } satisfies RateLimitConfig,
   // 04-API §8:同用户 10 次 / 1h
   hupiCreate: { scope: "hupi_create", windowSeconds: 3600, max: 10 } satisfies RateLimitConfig,
   // 2026-04-21 安全审计 HIGH#1:refresh/logout 从不限流,攻击者拿到泄漏的
@@ -202,6 +215,27 @@ export const DEFAULT_RATE_LIMITS = {
   // P1-2:5/min/IP — 反馈是低频操作,匿名也允许,这个上限挡 spam 又不影响真实用户
   feedback: { scope: "feedback", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
 };
+
+/**
+ * A6 (2026-04-28):把 email 规范化后取 sha256 前缀作为 rate-limit identifier。
+ *
+ * 为什么不直接用 email:
+ *   - rate_limit_events 表会持久化 identifier 字段,明文邮箱进入运维可读日志
+ *     等同 PII 泄漏(GDPR / 国内个保法都要求最小化原则)
+ *   - sha256 不可逆,事后只能用同样的 hash 做匹配,不能从日志反推用户邮箱
+ *
+ * 为什么 trim+lowercase:
+ *   - "User@Example.com" 与 "user@example.com" 在邮件投递层是同一个收件人
+ *     (RFC5321 域名部分大小写不敏感;本地部分理论敏感但绝大多数 MTA 也不敏感)。
+ *     不做归一化 → 攻击者大小写翻转就开新桶,限流形同虚设。
+ *
+ * 为什么截 16 hex (64 bit):
+ *   - 64 bit 空间足够稀疏,常规规模碰撞概率忽略;短串 redis key 友好。
+ */
+export function hashEmailForRateLimit(email: string): string {
+  const normalized = email.trim().toLowerCase();
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
 
 /**
  * 限流帮助:超限抛 HttpError(429),并写一行 rate_limit_events。
@@ -537,6 +571,12 @@ export async function handleVerifyEmail(
     throw new HttpError(400, "VALIDATION", "email and code are required");
   }
   const { email, code } = body as { email: string; code: string };
+  // A6 (2026-04-28):per-email 限流,补按 IP 限流的盲点。
+  // 顺序 IP 限流 → body 校验 → email 限流:
+  //   - 必须先过 body shape 校验,否则攻击者发空 body 也会消耗 email 限流额度
+  //   - email 维度桶 key 用 sha256 前缀,避免明文邮箱写 rate_limit_events
+  const emailCfg = deps.rateLimits?.verifyEmailEmail ?? DEFAULT_RATE_LIMITS.verifyEmailEmail;
+  await enforceRateLimit(deps, emailCfg, hashEmailForRateLimit(email));
   try {
     const r = await verifyEmail(email, code);
     sendJson(res, 200, { user_id: r.user_id, newly_verified: r.newly_verified });

@@ -49,6 +49,10 @@ import {
   type SweeperHandle as RefreshEventsSweeperHandle,
 } from "./account-pool/refreshEventsSweeper.js";
 import {
+  startPendingOrdersExpirer,
+  type SweeperHandle as PendingOrdersExpirerHandle,
+} from "./payment/pendingOrdersExpirer.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -1128,6 +1132,17 @@ export async function registerCommercial(
     refreshEventsSweeper = startRefreshEventsSweeper();
   }
 
+  // A1 — pending 订单 expirer(默认 60s tick,部署即 boot 跑一次清历史脏单)。
+  // markOrderPaid 不在事务内对 expires_at 做硬防线(避免用户超时几秒扫码就硬失败
+  // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
+  // 非法 / 空 / NaN → 60s;下限 1s(防 typo 把 DB 打穿)
+  let pendingOrdersExpirer: PendingOrdersExpirerHandle | undefined;
+  if (process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== "1") {
+    const raw = Number(process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+    pendingOrdersExpirer = startPendingOrdersExpirer({ intervalMs });
+  }
+
   return {
     handle: handler,
     handleWsUpgrade: (req, socket, head) => {
@@ -1166,6 +1181,9 @@ export async function registerCommercial(
       }
       if (refreshEventsSweeper) {
         try { refreshEventsSweeper.stop(); } catch { /* ignore */ }
+      }
+      if (pendingOrdersExpirer) {
+        try { pendingOrdersExpirer.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }

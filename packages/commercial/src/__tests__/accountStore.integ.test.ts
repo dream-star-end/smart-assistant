@@ -17,7 +17,7 @@
  *  13. updateAccount 空 patch → noop 返现状
  *  14. updateAccount 不存在 id → null
  *  15. deleteAccount → DB 行消失;不存在 id → false
- *  16. deleteAccount 当有 usage_records 引用时 → FK RESTRICT 报错
+ *  16. deleteAccount 当有 usage_records 引用时 → 账号被删,历史行保留且 account_id 置 NULL(FK SET NULL,0044)
  *  17. listAccounts 永远不把密文查回来(列白名单防回退 —— 断言 RETURNING row 的 key 集)
  *  18. createAccount 非法 plan → TypeError
  *  19. updateAccount health_score 越界 → RangeError
@@ -410,7 +410,7 @@ describe("deleteAccount", () => {
     assert.equal(await deleteAccount(999_999n), false);
   });
 
-  test("有 usage_records 引用 → FK RESTRICT 报错", async (t) => {
+  test("有 usage_records 引用 → 账号删除成功,历史行保留且 account_id 置 NULL(FK SET NULL)", async (t) => {
     if (skipIfNoDb(t)) return;
     const acc = await createAccount(
       { label: "has-usage", plan: "pro", token: "T" },
@@ -429,8 +429,17 @@ describe("deleteAccount", () => {
        ) VALUES ($1,'sess','chat',$2,'claude-sonnet',0,0,0,0,'{}'::jsonb,0,'req-fk-1','success')`,
       [u.rows[0].id, acc.id.toString()],
     );
-    await assert.rejects(deleteAccount(acc.id));
-    // 账号仍存在
-    assert.ok(await getAccount(acc.id));
+    // 账号能成功删除
+    assert.equal(await deleteAccount(acc.id), true);
+    assert.equal(await getAccount(acc.id), null);
+    // 历史 usage_records 行保留,account_id 置 NULL
+    const r = await query<{ user_id: string; account_id: string | null; request_id: string }>(
+      `SELECT user_id::text AS user_id, account_id::text AS account_id, request_id
+         FROM usage_records WHERE request_id = 'req-fk-1' AND user_id = $1`,
+      [u.rows[0].id],
+    );
+    assert.equal(r.rows.length, 1, "usage_records 历史行必须保留");
+    assert.equal(r.rows[0].account_id, null, "account_id 必须被 SET NULL");
+    assert.equal(r.rows[0].request_id, "req-fk-1");
   });
 });

@@ -199,21 +199,33 @@ describe("full migration suite 0001-0007", () => {
     assert.equal(tp.rows[0].cnt, "4", "topup_plans must not have duplicates");
   });
 
-  test("FK: usage_records.account_id references claude_accounts after 0004", async (t) => {
+  test("FK: usage_records.account_id references claude_accounts after 0004 + SET NULL after 0044", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
     const fkRows = await query<{
-      conname: string; conrelid: string; confrelid: string;
+      conname: string; conrelid: string; confrelid: string; convalidated: boolean;
     }>(
       `SELECT conname,
               conrelid::regclass::text AS conrelid,
-              confrelid::regclass::text AS confrelid
+              confrelid::regclass::text AS confrelid,
+              convalidated
          FROM pg_constraint
         WHERE contype = 'f'
           AND conrelid = 'usage_records'::regclass
           AND confrelid = 'claude_accounts'::regclass`,
     );
     assert.equal(fkRows.rows.length, 1, "expected exactly one FK from usage_records to claude_accounts");
+    assert.equal(fkRows.rows[0].convalidated, true, "FK must be validated (not NOT VALID)");
+
+    // 0044 把 fk_usage_records_account 的 delete_rule 从 RESTRICT 改成 SET NULL,
+    // 让 admin 删除账号时历史 usage_records 自动孤儿化。
+    const ruleRows = await query<{ delete_rule: string }>(
+      `SELECT delete_rule
+         FROM information_schema.referential_constraints
+        WHERE constraint_name = 'fk_usage_records_account'`,
+    );
+    assert.equal(ruleRows.rows.length, 1, "fk_usage_records_account must exist");
+    assert.equal(ruleRows.rows[0].delete_rule, "SET NULL", "0044 must change delete_rule to SET NULL");
   });
 
   test("admin_audit RULE blocks UPDATE and DELETE (append-only)", async (t) => {
