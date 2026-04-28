@@ -688,7 +688,19 @@ function _renderBash(body, input, msg) {
     cmdBlock.appendChild(cmd)
     body.appendChild(cmdBlock)
   }
-  if (msg.output) {
+  // bg-bash 的 tool_result.preview 永远只是 placeholder 文案 (CCB
+  // backgroundInfo:"Command running in background with ID: …. Output is being
+  // written to: …."),不是真实输出 — 后台进程的真实 stdout/stderr 走 SDK
+  // bash_output_tail → tool_output_tail 帧 → msg.bashTail。原来 `if (msg.output)`
+  // 优先级让 placeholder 永远遮住 bashTail,bg-bash 卡片就只显示 ID 行不见 tail。
+  // 识别三种 backgroundInfo 句首(BashTool.tsx 615/613/611):显式 bg、用户手动
+  // bg、assistant-mode 自动 bg。命中 → 优先 bashTail;tail 还没到再回退 placeholder。
+  const isBgPlaceholder = typeof msg.output === 'string' && (
+    msg.output.startsWith('Command running in background with ID:') ||
+    msg.output.startsWith('Command was manually backgrounded by user with ID:') ||
+    msg.output.includes('was moved to the background with ID:')
+  )
+  if (msg.output && !isBgPlaceholder) {
     // Final tool_result preview wins once the command finishes. The
     // streaming bashTail is hidden in this branch — the gateway-emitted
     // tool_result.preview is the canonical truncated output sent by CCB.
@@ -712,6 +724,14 @@ function _renderBash(body, input, msg) {
       body.appendChild(note)
     }
     outBlock.textContent = msg.bashTail.tail
+    body.appendChild(outBlock)
+  } else if (msg.output) {
+    // 兜底:bg-bash placeholder 命中、tail 还没到 (命令几乎瞬间完成 / 没产出
+    // stdout / 第一个 1Hz 轮询前 detach 了),至少先把 placeholder 显示出来,
+    // 避免空卡片。后续 tail 到达时 updateMessageEl 会重渲染换成 tail。
+    const outBlock = document.createElement('pre')
+    outBlock.className = 'tool-output'
+    outBlock.textContent = msg.output
     body.appendChild(outBlock)
   }
 }
