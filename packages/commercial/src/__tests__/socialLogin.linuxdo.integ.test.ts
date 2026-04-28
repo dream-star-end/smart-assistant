@@ -1,23 +1,25 @@
-import { describe, test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { createPool, closePool, setPoolOverride, resetPool } from '../db/index.js'
-import { query } from '../db/queries.js'
+import { after, before, beforeEach, describe, test } from 'node:test'
+import { SocialLoginError, socialLoginOrCreate } from '../auth/socialLogin.js'
+import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
-import { socialLoginOrCreate, SocialLoginError } from '../auth/socialLogin.js'
+import { query } from '../db/queries.js'
 
 /**
  * LDC SSO 业务编排集成测试 — socialLoginOrCreate 端到端打通真 Postgres。
  *
- * 验收点(对齐 Codex R5 plan):
- *   1. 首登:users + oauth_identities + credit_ledger 各 1 行,credits=300,
- *      memo 含 "LINUX DO ... 赠送";access/refresh token 都签出来,refresh_tokens
- *      插入一行(remember_me=TRUE)。
- *   2. 二登:同 (provider, provider_user_id) 不创建新用户、不双发积分。LDC 侧
- *      改昵称/换头像/升 trust_level → identity 行的快照字段被 UPDATE。
+ * 验收点:
+ *   1. 首登:users + oauth_identities + credit_ledger 各 1 行,credits 按
+ *      bonusForTrustLevel 阶梯计算,memo 含 "LINUX DO ... 赠送 ¥X (TL{n})";
+ *      access/refresh token 都签出来,refresh_tokens 插入一行(remember_me=TRUE)。
+ *   2. 二登:同 (provider, provider_user_id) 不创建新用户、不双发积分,
+ *      **trust_level 升级也不补差额**。LDC 侧改昵称/换头像/升 TL → identity
+ *      行的快照字段被 UPDATE。
  *   3. 用户被 ban(status='banned')→ 抛 SocialLoginError(USER_DISABLED)。
  *   4. provider_user_id 不合法 → 抛 SocialLoginError(INVALID_INPUT)。
  *   5. 并发首登 race:两个 tx 同时落 → advisory_xact_lock 串行化,
  *      共建 1 个 user / 1 个 identity / 1 行 ledger,无 23505。
+ *   6. trust_level 阶梯覆盖:TL0/TL3/TL4 各自首登赠金等于阶梯金额。
  *
  * 全部用 testJwtSecret 签 token,不调外网。
  */
@@ -122,7 +124,7 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
 }
 
 describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
-  test('first login creates user + identity + 300 credits + ledger row', async (t) => {
+  test('first login (TL2) creates user + identity + ¥10 (1000 cents) + ledger row', async (t) => {
     if (skipIfNoPg(t)) return
     const result = await socialLoginOrCreate(
       {
@@ -142,7 +144,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
     assert.equal(result.remember, true)
     assert.equal(result.user.email, 'linuxdo-12345@users.claudeai.chat')
     assert.equal(result.user.email_verified, true)
-    assert.equal(result.user.credits, '300')
+    assert.equal(result.user.credits, '1000')
     assert.equal(result.user.role, 'user')
     assert.equal(result.user.display_name, 'alice_ldo')
 
@@ -150,7 +152,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
       'SELECT COUNT(*)::text AS cnt, MIN(credits::text) AS credits, MIN(status) AS status, MIN(email) AS email FROM users',
     )
     assert.equal(u.rows[0].cnt, '1')
-    assert.equal(u.rows[0].credits, '300')
+    assert.equal(u.rows[0].credits, '1000')
     assert.equal(u.rows[0].status, 'active')
     assert.equal(u.rows[0].email, 'linuxdo-12345@users.claudeai.chat')
 
@@ -186,11 +188,13 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
               MIN(memo) AS memo FROM credit_ledger`,
     )
     assert.equal(led.rows[0].cnt, '1')
-    assert.equal(led.rows[0].delta, '300')
-    assert.equal(led.rows[0].balance_after, '300')
+    assert.equal(led.rows[0].delta, '1000')
+    assert.equal(led.rows[0].balance_after, '1000')
     assert.equal(led.rows[0].reason, 'promotion')
     assert.match(led.rows[0].memo ?? '', /LINUX DO/)
     assert.match(led.rows[0].memo ?? '', /赠送/)
+    assert.match(led.rows[0].memo ?? '', /¥10/)
+    assert.match(led.rows[0].memo ?? '', /TL2/)
 
     const rt = await query<{
       cnt: string
@@ -240,7 +244,8 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
       `SELECT COUNT(*)::text AS cnt, MIN(credits::text) AS credits FROM users`,
     )
     assert.equal(u.rows[0].cnt, '1', '二登必须复用同一行 user')
-    assert.equal(u.rows[0].credits, '300', '二登不发新积分')
+    // 首登 TL1 = ¥5 (500 cents);二登 TL 升到 3 但不补差额(产品决策)。
+    assert.equal(u.rows[0].credits, '500', '二登不发新积分,且 TL 升级不补差')
 
     const led = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM credit_ledger')
     assert.equal(led.rows[0].cnt, '1', '二登不写新 ledger')
@@ -353,7 +358,8 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
       `SELECT COUNT(*)::text AS cnt, MIN(credits::text) AS credits FROM users`,
     )
     assert.equal(u.rows[0].cnt, '1', '并发只该建 1 个 user')
-    assert.equal(u.rows[0].credits, '300', '并发不能双发积分')
+    // 两边都传 TL1 = 500 cents,并发不能双发(advisory lock 序列化)
+    assert.equal(u.rows[0].credits, '500', '并发不能双发积分')
 
     const oi = await query<{ cnt: string }>(
       `SELECT COUNT(*)::text AS cnt FROM oauth_identities WHERE provider_user_id='424242'`,
@@ -363,4 +369,56 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
     const led = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM credit_ledger')
     assert.equal(led.rows[0].cnt, '1', '并发只该写 1 行 ledger')
   })
+})
+
+describe('auth.socialLoginOrCreate (linuxdo) — trust_level bonus tier coverage', () => {
+  // 覆盖 TL0/TL3/TL4 三档首登赠金,确保阶梯生效。
+  // TL1=¥5 已被并发测试覆盖,TL2=¥10 已被 first-login 主测试覆盖。
+  const tiers: Array<{
+    tl: number
+    pid: string
+    expectedCredits: string
+    expectedYuan: string
+    expectedTlLabel: string
+  }> = [
+    { tl: 0, pid: '500000', expectedCredits: '300', expectedYuan: '¥3', expectedTlLabel: 'TL0' },
+    { tl: 3, pid: '500003', expectedCredits: '2000', expectedYuan: '¥20', expectedTlLabel: 'TL3' },
+    { tl: 4, pid: '500004', expectedCredits: '3000', expectedYuan: '¥30', expectedTlLabel: 'TL4' },
+  ]
+
+  for (const tier of tiers) {
+    test(`first login (TL${tier.tl}) → ${tier.expectedYuan} (${tier.expectedCredits} cents)`, async (t) => {
+      if (skipIfNoPg(t)) return
+      const result = await socialLoginOrCreate(
+        {
+          provider: 'linuxdo',
+          providerUserId: tier.pid,
+          username: `tl${tier.tl}_user`,
+          email: null,
+          trustLevel: tier.tl,
+          avatarUrl: null,
+        },
+        { jwtSecret: testJwtSecret },
+      )
+      assert.equal(result.isNew, true)
+      assert.equal(result.user.credits, tier.expectedCredits)
+
+      const u = await query<{ credits: string }>(
+        'SELECT credits::text AS credits FROM users WHERE id = $1',
+        [result.user.id],
+      )
+      assert.equal(u.rows[0].credits, tier.expectedCredits, 'users.credits 必须等于阶梯金额')
+
+      const led = await query<{ delta: string; balance_after: string; memo: string | null }>(
+        `SELECT delta::text AS delta, balance_after::text AS balance_after, memo
+           FROM credit_ledger WHERE user_id = $1`,
+        [result.user.id],
+      )
+      assert.equal(led.rows.length, 1, '阶梯首登只写 1 行 ledger')
+      assert.equal(led.rows[0].delta, tier.expectedCredits)
+      assert.equal(led.rows[0].balance_after, tier.expectedCredits)
+      assert.match(led.rows[0].memo ?? '', new RegExp(tier.expectedYuan))
+      assert.match(led.rows[0].memo ?? '', new RegExp(tier.expectedTlLabel))
+    })
+  }
 })
