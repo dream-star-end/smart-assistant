@@ -21,6 +21,7 @@ import (
 	"github.com/openclaude/node-agent/internal/internalproxy"
 	"github.com/openclaude/node-agent/internal/logging"
 	"github.com/openclaude/node-agent/internal/masteregress"
+	"github.com/openclaude/node-agent/internal/selfprobe"
 	"github.com/openclaude/node-agent/internal/server"
 )
 
@@ -53,7 +54,12 @@ func main() {
 		log.Info("baseline poller disabled (master_baseline_base_url empty)")
 	}
 
-	srv, err := server.New(cfg, bp)
+	// 0042:selfprobe 跑 uplink/egress/image 三项自检,缓存给 /health 返。
+	// 任一维度 cfg 为空 → 该维度 nil 跳过,master 容忍 undefined。三者都空 = poller 仍启动
+	// 但每 30s 都是 noop(代码简单可读优于"完全不启 goroutine"的省 5KB heap)。
+	probePoller := selfprobe.New(cfg)
+
+	srv, err := server.New(cfg, bp, probePoller)
 	if err != nil {
 		log.Error("server init failed", "err", err.Error())
 		os.Exit(1)
@@ -100,7 +106,8 @@ func main() {
 	}()
 
 	var wg sync.WaitGroup
-	routines := 2
+	// mTLS server + egress proxy + selfprobe loop 总是跑;baseline / internalproxy / masteregress 可选
+	routines := 3
 	if bp != nil {
 		routines++
 	}
@@ -125,6 +132,10 @@ func main() {
 			log.Error("egress proxy exited with error", "err", err.Error())
 			cancel()
 		}
+	}()
+	go func() {
+		defer wg.Done()
+		probePoller.Start(ctx) // 阻塞直到 ctx done;探针失败仅 log,不挂 daemon
 	}()
 	if bp != nil {
 		go func() {

@@ -16,6 +16,60 @@ export type ComputeHostStatus =
   | "draining"
   | "broken";
 
+/**
+ * 0042 — quarantine reason 分类。soft = host 内部状态可自愈,等下一轮 probe;
+ * hard = 必须靠 imagePromote / 运维 distribute / clearQuarantine 介入。
+ */
+export const QUARANTINE_REASONS = {
+  EGRESS_PROBE_FAILED: "egress-probe-failed",
+  HEALTH_POLL_FAIL: "health-poll-fail",
+  UPLINK_PROBE_FAILED: "uplink-probe-failed",
+  IMAGE_MISMATCH: "image-mismatch",
+  IMAGE_DISTRIBUTE_FAILED: "image-distribute-failed",
+  RUNTIME_IMAGE_MISSING: "runtime-image-missing",
+} as const;
+
+export type QuarantineReasonCode =
+  (typeof QUARANTINE_REASONS)[keyof typeof QUARANTINE_REASONS];
+
+export const SOFT_QUARANTINE_REASONS: ReadonlyArray<QuarantineReasonCode> = [
+  QUARANTINE_REASONS.EGRESS_PROBE_FAILED,
+  QUARANTINE_REASONS.HEALTH_POLL_FAIL,
+  QUARANTINE_REASONS.UPLINK_PROBE_FAILED,
+];
+
+export const HARD_QUARANTINE_REASONS: ReadonlyArray<QuarantineReasonCode> = [
+  QUARANTINE_REASONS.IMAGE_MISMATCH,
+  QUARANTINE_REASONS.IMAGE_DISTRIBUTE_FAILED,
+  QUARANTINE_REASONS.RUNTIME_IMAGE_MISSING,
+];
+
+export function isSoftQuarantineReason(code: QuarantineReasonCode | null | undefined): boolean {
+  return code !== null && code !== undefined && SOFT_QUARANTINE_REASONS.includes(code);
+}
+
+export function isHardQuarantineReason(code: QuarantineReasonCode | null | undefined): boolean {
+  return code !== null && code !== undefined && HARD_QUARANTINE_REASONS.includes(code);
+}
+
+/**
+ * 0042 — reason 优先级:同时多维度失败时,以最严重者为准。
+ *   uplink-probe-failed > health-poll-fail > egress-probe-failed
+ * 数字小 = 优先级高。hard 类不入此优先级序(由各操作模块直接 set,语义明确)。
+ */
+export function softReasonPriority(code: QuarantineReasonCode): number {
+  switch (code) {
+    case QUARANTINE_REASONS.UPLINK_PROBE_FAILED:
+      return 1;
+    case QUARANTINE_REASONS.HEALTH_POLL_FAIL:
+      return 2;
+    case QUARANTINE_REASONS.EGRESS_PROBE_FAILED:
+      return 3;
+    default:
+      return 99;
+  }
+}
+
 export interface ComputeHostRow {
   id: string;
   name: string;
@@ -58,6 +112,30 @@ export interface ComputeHostRow {
    * NULL = self 或未填(永久/自有)。仅展示用,不参与调度,不触发自动化。
    */
   expires_at: Date | null;
+  /**
+   * 0042 — runtime image 真实就位标识。bootstrap.image_pull / distribute 完成后写入
+   * docker image config ID(sha256:...)。NULL = 从未推送/拉取,host 不可调度。
+   */
+  loaded_image_id: string | null;
+  loaded_image_at: Date | null;
+  /**
+   * 0042 — quarantine 细分。reason_code 受 CHECK 约束(QUARANTINE_REASONS 枚举),
+   * NULL = 非隔离 / 历史已 clear。reason_detail = 自由文本辅诊。
+   */
+  quarantine_reason_code: QuarantineReasonCode | null;
+  quarantine_reason_detail: string | null;
+  quarantine_at: Date | null;
+  /**
+   * 0042 — health 各维度独立 last-* 字段。placement gate 严格读取这些。
+   * last_health_endpoint_ok 与历史 last_health_ok 并存(后者保留兼容/回滚),
+   * 写路径双写,gate 读新字段。
+   */
+  last_health_endpoint_ok: boolean | null;
+  last_health_poll_at: Date | null;
+  last_uplink_ok: boolean | null;
+  last_uplink_at: Date | null;
+  last_egress_probe_ok: boolean | null;
+  last_egress_probe_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -85,6 +163,18 @@ export interface ComputeHost {
   maxContainers: number;
   /** 0041:VPS 租期到期 ISO8601(UTC,toISOString())。NULL = 永久/未填。 */
   expiresAt: string | null;
+  /** 0042: runtime image 就位标识(camelCase 视图)。 */
+  loadedImageId: string | null;
+  loadedImageAt: string | null;
+  quarantineReasonCode: QuarantineReasonCode | null;
+  quarantineReasonDetail: string | null;
+  quarantineAt: string | null;
+  lastHealthEndpointOk: boolean | null;
+  lastHealthPollAt: string | null;
+  lastUplinkOk: boolean | null;
+  lastUplinkAt: string | null;
+  lastEgressProbeOk: boolean | null;
+  lastEgressProbeAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -137,6 +227,28 @@ export interface AgentHealthResponse {
   dockerOk: boolean;
   agentVersion: string;
   uptimeSeconds: number;
+  /**
+   * 0042 — host 内 :9444 mTLS forward proxy 自检结果。
+   * Go daemon 每 30s 向自身 :9444 发 HTTP CONNECT 一次,缓存最近一次结果。
+   * undefined = 老 agent 不报这字段,master 容忍并把 last_egress_probe_ok 留 null。
+   */
+  egressProbeOk?: boolean;
+  egressProbeAt?: string;
+  egressProbeErr?: string;
+  /**
+   * 0042 — host → master:18443 反向通道自检结果。
+   * Go daemon 周期性 mTLS dial master:18443 + GET /v3/agent-uplink-probe 一次。
+   * 同样 undefined = 老 agent 未升级,master 容忍。
+   */
+  uplinkOk?: boolean;
+  uplinkAt?: string;
+  uplinkErr?: string;
+  /**
+   * 0042 — host 上 OC_RUNTIME_IMAGE 当前实际 docker image config ID。
+   * Go daemon `docker image inspect <tag> --format '{{.Id}}'`,失败/不存在 → undefined。
+   */
+  loadedImageId?: string;
+  loadedImageTag?: string;
 }
 
 /** agent /containers/run request (master → node-agent) */
@@ -256,6 +368,17 @@ export function mapRowToHost(row: ComputeHostRow): ComputeHost {
     consecutiveHealthOk: row.consecutive_health_ok,
     maxContainers: row.max_containers,
     expiresAt: row.expires_at ? row.expires_at.toISOString() : null,
+    loadedImageId: row.loaded_image_id,
+    loadedImageAt: row.loaded_image_at ? row.loaded_image_at.toISOString() : null,
+    quarantineReasonCode: row.quarantine_reason_code,
+    quarantineReasonDetail: row.quarantine_reason_detail,
+    quarantineAt: row.quarantine_at ? row.quarantine_at.toISOString() : null,
+    lastHealthEndpointOk: row.last_health_endpoint_ok,
+    lastHealthPollAt: row.last_health_poll_at ? row.last_health_poll_at.toISOString() : null,
+    lastUplinkOk: row.last_uplink_ok,
+    lastUplinkAt: row.last_uplink_at ? row.last_uplink_at.toISOString() : null,
+    lastEgressProbeOk: row.last_egress_probe_ok,
+    lastEgressProbeAt: row.last_egress_probe_at ? row.last_egress_probe_at.toISOString() : null,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   };

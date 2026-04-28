@@ -5,6 +5,7 @@
  *   GET  /api/admin/v3/compute-hosts                       列表
  *   POST /api/admin/v3/compute-hosts/add                   新增 + 异步 bootstrap
  *   GET  /api/admin/v3/compute-hosts/:id/bootstrap-log     bootstrap 进度
+ *   GET  /api/admin/v3/compute-hosts/:id/diagnostic        host 详情 + 近期 audit + pool 全局
  *   POST /api/admin/v3/compute-hosts/:id/drain             进入 draining
  *   POST /api/admin/v3/compute-hosts/:id/remove            删除(仅 draining + active=0)
  *   POST /api/admin/v3/compute-hosts/:id/quarantine-clear  quarantined → ready
@@ -39,6 +40,11 @@ import {
 } from "../admin/computeHosts.js";
 import { listContainers } from "../admin/containers.js";
 import { serializeContainer } from "./admin.js";
+import * as queries from "../compute-pool/queries.js";
+import { mapRowToHost } from "../compute-pool/types.js";
+import { listAuditEventsForHost } from "../compute-pool/audit.js";
+import { getPoolState } from "../compute-pool/poolState.js";
+import { getPool } from "../db/index.js";
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -122,6 +128,38 @@ export async function handleAdminComputeHostGetSubresource(
     case "containers": {
       const rows = await listContainers({ host_uuid: id });
       sendJson(res, 200, { rows: rows.map(serializeContainer) });
+      return;
+    }
+    case "diagnostic": {
+      // 0042 — 给 admin UI 一个汇总 endpoint:host 当前完整 row(camelCase 视图)+
+      // 最近若干条 compute_host_audit + pool 全局 desired_image / master_epoch。
+      // ?limit=n 控制 audit 行数,默认 100,夹在 [1, 500]。
+      const limitRaw = url.searchParams.get("limit");
+      let limit = 100;
+      if (limitRaw !== null) {
+        const parsed = Number.parseInt(limitRaw, 10);
+        if (Number.isFinite(parsed)) {
+          limit = Math.max(1, Math.min(500, parsed));
+        }
+      }
+      const row = await queries.getHostById(id);
+      if (!row) {
+        throw new HttpError(404, "HOST_NOT_FOUND", "host not found");
+      }
+      const [audit, pool] = await Promise.all([
+        listAuditEventsForHost(getPool(), id, limit),
+        getPoolState(),
+      ]);
+      sendJson(res, 200, {
+        host: mapRowToHost(row),
+        audit,
+        pool: {
+          desiredImageId: pool.desiredImageId,
+          desiredImageTag: pool.desiredImageTag,
+          masterEpoch: pool.masterEpoch.toString(),
+          updatedAt: pool.updatedAt.toISOString(),
+        },
+      });
       return;
     }
     default:

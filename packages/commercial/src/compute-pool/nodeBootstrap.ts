@@ -33,7 +33,14 @@ import { rootLogger } from "../logging/logger.js";
 import * as queries from "./queries.js";
 import * as ca from "./certAuthority.js";
 import { decryptSshPassword, decryptAgentPsk } from "./crypto.js";
-import type { ComputeHostRow, BootstrapStep, BootstrapResult } from "./types.js";
+import type {
+  ComputeHostRow,
+  BootstrapStep,
+  BootstrapResult,
+  QuarantineReasonCode,
+  AgentHealthResponse,
+} from "./types.js";
+import { inspectLocalImageId } from "./imagePromote.js";
 import {
   sshRun,
   sshUpload,
@@ -174,6 +181,16 @@ export async function bootstrapHost(params: BootstrapParams): Promise<BootstrapR
   let fingerprint = "";
   let certNotAfter: Date = new Date();
 
+  // 0042 — bootstrap 全程共享 operationId,所有 audit 行串起来。
+  const operationId = randomUUID();
+  const actor = `system:bootstrap:${params.hostId}`;
+  // image_pull 阶段成功后填:host 上看到的 docker config ID = master 本地的 ID。
+  let loadedImage: { id: string; tag: string } | null = null;
+  // egress / uplink 探测结果(captured,不直接 throw)。bootstrap 跑完前结合到
+  // markBootstrapResult 的 softQuarantine arg。
+  let egressProbeError: string | null = null;
+  let uplinkProbeError: string | null = null;
+
   const step = async (name: BootstrapStep, fn: () => Promise<void>): Promise<void> => {
     currentStep = name;
     if (Date.now() > totalDeadline) {
@@ -224,15 +241,18 @@ export async function bootstrapHost(params: BootstrapParams): Promise<BootstrapR
     await step("agent_verify", () => verifyNodeAgent(params.hostId));
     await step("baseline_first_pull", () => pullBaselineOnce(params.hostId));
     await step("image_pull", async () => {
-      // 把 master 本地的 v3 runtime image stream 到远端。bootstrap 必须保证
-      // host 入池前 image 就绪,否则首个用户调度过来 docker run 必失败。
-      // 已存在 → inspect 短路 noop;否则 docker save | ssh docker load。
+      // 0042 — image_pull 是 hard gate:OC_RUNTIME_IMAGE 必须配齐 + master 本地 image
+      // 必须存在 + 远端 docker save/load 必须成功。任何一项失败 → bootstrap fail。
+      // 容器 ready 时 image 100% 就位,排除 test3 那类"ready 但没 image"窒息。
       const image = process.env.OC_RUNTIME_IMAGE?.trim() ?? "";
       if (!image) {
-        log.warn("OC_RUNTIME_IMAGE empty — skipping image_pull (host will fail to provision until image arrives)", {
-          hostId: params.hostId,
-        });
-        return;
+        throw new Error("OC_RUNTIME_IMAGE not configured on master");
+      }
+      // master 本地 image config ID — host load 完后这与 host 上的 ID 一致(docker
+      // save 同步 content)。先于 stream 抓取,避免在 stream 中途 master 本地被改。
+      const masterImageId = await inspectLocalImageId(image);
+      if (!masterImageId) {
+        throw new Error(`master local docker image '${image}' not present`);
       }
       try {
         const r = await streamImageToHost(target, image, { hostId: params.hostId });
@@ -240,6 +260,7 @@ export async function bootstrapHost(params: BootstrapParams): Promise<BootstrapR
           hostId: params.hostId, image, outcome: r.outcome,
           durationMs: r.durationMs, bytes: r.bytes,
         });
+        loadedImage = { id: masterImageId, tag: image };
       } catch (e) {
         if (e instanceof ImageDistributeError) {
           throw new Error(`image_pull failed (${e.source}): ${e.message}`);
@@ -247,18 +268,52 @@ export async function bootstrapHost(params: BootstrapParams): Promise<BootstrapR
         throw e;
       }
     });
-    await step("egress_endpoint_probe", () => probeEgressEndpointStep(params.hostId));
+    await step("egress_endpoint_probe", async () => {
+      // 0042 — 不抛错。把结果(成功/失败)记到 egressProbeError,bootstrap 跑完后
+      // 在 markBootstrapResult 阶段决定是否 soft-quarantine。
+      const r = await probeEgressEndpointStep(params.hostId);
+      if (!r.ok) {
+        egressProbeError = r.error;
+      }
+    });
     await step("final_verify", async () => {
-      // 再拉一次 health 确认状态稳定
-      await verifyNodeAgent(params.hostId);
+      // 0042 — final_verify 升级到 deep verify:不仅看 endpoint 200,还读 agent
+      // /health 的 uplinkOk(host → master:18443 反向通道自检)。失败 → softQuarantine。
+      const health = await verifyNodeAgentDeep(params.hostId);
+      if (health.uplinkOk === false) {
+        uplinkProbeError = health.uplinkErr ?? "uplink probe failed (host → master:18443)";
+      }
+      // health.uplinkOk === undefined(老 agent 不报)→ 不视为失败,容忍升级期。
     });
 
-    await queries.markBootstrapResult(params.hostId, true, null);
+    // 决定 softQuarantine。优先级:uplink > endpoint > egress(plan v4 reason priority)。
+    // endpoint 在这里不会失败(verifyNodeAgentDeep 走完没抛 = endpoint OK);留给
+    // 周期性 health poll 后续覆盖。
+    let softQuarantine: { reason: QuarantineReasonCode; detail: string } | undefined;
+    if (uplinkProbeError) {
+      softQuarantine = { reason: "uplink-probe-failed", detail: uplinkProbeError };
+    } else if (egressProbeError) {
+      softQuarantine = { reason: "egress-probe-failed", detail: egressProbeError };
+    }
+
+    await queries.markBootstrapResult(params.hostId, {
+      success: true,
+      err: null,
+      softQuarantine,
+      loadedImage: loadedImage ?? undefined,
+      operationId,
+      actor,
+    });
     return { kind: "ok", fingerprint, certNotAfter, psk: true };
   } catch (e) {
     const err = e instanceof Error ? e.message : String(e);
     log.error("bootstrap failed", { hostId: params.hostId, step: currentStep, err });
-    await queries.markBootstrapResult(params.hostId, false, `${currentStep}: ${err}`);
+    await queries.markBootstrapResult(params.hostId, {
+      success: false,
+      err: `${currentStep}: ${err}`,
+      operationId,
+      actor,
+    });
     return { kind: "fail", step: currentStep, message: err };
   } finally {
     password.fill(0);
@@ -379,6 +434,9 @@ async function deployNodeAgent(
     // 0038:master forward proxy(api.anthropic.com 出口锚定本机 NIC)。
     // bind 0.0.0.0 允许 master VM 拨入;真实访问由 mTLS+psk+SAN URI 三因子守护。
     `master_egress_bind: "0.0.0.0:${EGRESS_FORWARD_PROXY_PORT}"`,
+    // 0042:agent self-probe 用,docker image inspect 这个 tag 报回 loaded_image_id。
+    // 必填(image_pull step 已 enforce OC_RUNTIME_IMAGE 非空);空字符串则 self-probe 跳过 loaded image 报告。
+    `runtime_image_tag: "${(process.env.OC_RUNTIME_IMAGE?.trim() ?? "").replace(/"/g, "")}"`,
     "",
   ].join("\n");
   await sshUpload(target, `${REMOTE_CFG_DIR}/node-agent.yml`, cfgYaml, 0o644);
@@ -676,19 +734,19 @@ async function verifyNodeAgent(hostId: string): Promise<void> {
  * 不抛错:bootstrap 主流程不会因 host 暂时拨不到 anthropic 而 broken。
  * 异常仅 log.warn,DB 端点列写 NULL;运维可在 admin UI 触发 reboot/手动 retry。
  */
-async function probeEgressEndpointStep(hostId: string): Promise<void> {
+async function probeEgressEndpointStep(
+  hostId: string,
+): Promise<{ ok: boolean; error: string | null }> {
   const row = await queries.getHostById(hostId);
   if (!row) throw new Error("host row vanished");
   let psk: Buffer | null = null;
   try {
     psk = decryptAgentPsk(row.id, row.agent_psk_nonce, row.agent_psk_ct);
   } catch (e) {
-    log.warn("egress probe: psk decrypt failed", {
-      hostId,
-      err: e instanceof Error ? e.message : String(e),
-    });
+    const msg = e instanceof Error ? e.message : String(e);
+    log.warn("egress probe: psk decrypt failed", { hostId, err: msg });
     await queries.setEgressProxyEndpoint(hostId, null);
-    return;
+    return { ok: false, error: `psk decrypt: ${msg}` };
   }
   try {
     const ok = await probeEgressEndpoint(row.host, psk);
@@ -696,19 +754,53 @@ async function probeEgressEndpointStep(hostId: string): Promise<void> {
       const endpoint = `mtls://${row.host}:${EGRESS_FORWARD_PROXY_PORT}`;
       await queries.setEgressProxyEndpoint(hostId, endpoint);
       log.info("egress probe ok", { hostId, endpoint });
-    } else {
-      await queries.setEgressProxyEndpoint(hostId, null);
-      log.warn("egress probe failed: not 200", { hostId, host: row.host });
+      return { ok: true, error: null };
     }
-  } catch (e) {
     await queries.setEgressProxyEndpoint(hostId, null);
-    log.warn("egress probe error", {
-      hostId,
-      err: e instanceof Error ? e.message : String(e),
-    });
+    log.warn("egress probe failed: not 200", { hostId, host: row.host });
+    return { ok: false, error: "egress probe returned non-200" };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await queries.setEgressProxyEndpoint(hostId, null);
+    log.warn("egress probe error", { hostId, err: msg });
+    return { ok: false, error: msg };
   } finally {
     psk.fill(0);
   }
+}
+
+/**
+ * verifyNodeAgentDeep — bootstrap final_verify 用的"读完整 health 响应"版本。
+ *
+ * 策略与 verifyNodeAgent 类似(30s 内循环 healthCheck),但成功路径**返回**
+ * AgentHealthResponse,允许 caller 检查 uplinkOk / egressProbeOk 等扩展字段。
+ *
+ * uplinkOk === undefined 视为"未知"(老 agent 不报),不阻断;false → 抛错供
+ * caller 决定 softQuarantine。
+ */
+async function verifyNodeAgentDeep(hostId: string): Promise<AgentHealthResponse> {
+  const deadline = Date.now() + 30_000;
+  const { healthCheck, hostRowToTarget } = await import("./nodeAgentClient.js");
+  let lastErr = "not yet connected";
+  while (Date.now() < deadline) {
+    const row = await queries.getHostById(hostId);
+    if (!row) throw new Error("host row vanished");
+    const t = hostRowToTarget(row);
+    try {
+      const res = await healthCheck(t);
+      if (res.ok) {
+        if (t.psk) t.psk.fill(0);
+        return res;
+      }
+      lastErr = `health returned ok=false`;
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (t.psk) t.psk.fill(0);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`verify timeout: ${lastErr}`);
 }
 
 /**

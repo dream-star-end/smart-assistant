@@ -20,7 +20,7 @@ import {
   deliverRenewedCert,
 } from "./nodeAgentClient.js";
 import { signHostLeafCsr } from "./certAuthority.js";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 const log = rootLogger.child({ subsys: "node-health" });
 
@@ -96,13 +96,25 @@ export class HealthPoller {
     const row = await queries.getHostById(hostId);
     if (!row) return;
     const target = hostRowToTarget(row);
+    const operationId = randomUUID();
+    const actor = "system:healthPoller";
     try {
       const r = await healthCheck(target);
-      const { nextStatus, previousStatus } = await queries.markHealth(
-        hostId,
-        r.ok,
-        r.ok ? null : "health ok=false",
-      );
+      const { previousStatus, nextStatus } = await queries.applyHealthSnapshot(hostId, {
+        endpointOk: r.ok,
+        endpointErr: r.ok ? null : "health ok=false",
+        uplinkOk: r.uplinkOk,
+        uplinkErr: r.uplinkErr ?? null,
+        egressOk: r.egressProbeOk,
+        egressErr: r.egressProbeErr ?? null,
+        // plan v4 round-2:string|undefined,不要 ?? null;applyHealthSnapshot
+        // 只在 string 时才把值写回 row.loaded_image_id(undefined = "agent 没报",
+        // 不能把 DB 已知值清成 NULL)。
+        loadedImageId: typeof r.loadedImageId === "string" ? r.loadedImageId : undefined,
+        loadedImageTag: r.loadedImageTag ?? null,
+        operationId,
+        actor,
+      });
       if (nextStatus !== previousStatus) {
         log.info("host status transition", {
           hostId,
@@ -122,9 +134,17 @@ export class HealthPoller {
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      await queries.markHealth(hostId, false, msg.slice(0, 500)).catch(() => {
-        /* swallow to avoid cascade */
-      });
+      // RPC 失败 → 仅 endpoint 维度已知,其它维度未知(undefined)
+      await queries
+        .applyHealthSnapshot(hostId, {
+          endpointOk: false,
+          endpointErr: msg.slice(0, 500),
+          operationId,
+          actor,
+        })
+        .catch(() => {
+          /* swallow to avoid cascade */
+        });
     } finally {
       if (target.psk) target.psk.fill(0);
     }

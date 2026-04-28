@@ -376,7 +376,10 @@ export async function drainComputeHost(id: string, ctx: AdminAuditCtx): Promise<
   if (row.name === "self") {
     throw new HttpError(403, "FORBIDDEN", "cannot drain self host");
   }
-  const ok = await queries.setDraining(id);
+  const ok = await queries.setDraining(id, {
+    actor: `admin:${ctx.adminId}`,
+    operationId: randomUUID(),
+  });
   if (!ok) {
     throw new HttpError(
       409,
@@ -415,7 +418,10 @@ export async function removeComputeHost(id: string, ctx: AdminAuditCtx): Promise
 export async function clearQuarantineForHost(id: string, ctx: AdminAuditCtx): Promise<void> {
   const row = await queries.getHostById(id);
   if (!row) throw new HttpError(404, "NOT_FOUND", `compute host ${id} not found`);
-  const ok = await queries.clearQuarantine(id);
+  const ok = await queries.clearQuarantine(id, {
+    actor: `admin:${ctx.adminId}`,
+    operationId: randomUUID(),
+  });
   if (!ok) {
     throw new HttpError(
       409,

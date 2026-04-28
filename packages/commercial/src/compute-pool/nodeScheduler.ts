@@ -110,7 +110,10 @@ export function _clearHostCooldownForTests(): void {
  */
 export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableHost> {
   if (opts.requireHostId) {
-    // 显式指定 host:绕过 cooldown,admin debug 优先
+    // 显式指定 host:admin debug / 强制路径,**有意绕过 full placement gate**。
+    // 仍要求 status='ready'(防止把 quarantined/broken host 喂给 admin)。
+    // pinned/dataHost/least-loaded 三个非强制路径都经 full gate;requireHostId
+    // 是唯一保留 status-only 入口,只暴露给 scheduler API/tests,不暴露给用户路径。
     const row = await queries.getHostById(opts.requireHostId);
     if (!row || row.status !== "ready") {
       throw new NodePoolUnavailableError(`host ${opts.requireHostId} not ready`);
@@ -119,12 +122,17 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
     if (count >= row.max_containers) {
       throw new NodePoolBusyError(`host ${row.id} at capacity`);
     }
+    log.warn("requireHostId path bypassing full placement gate", {
+      hostId: row.id,
+      reason: "admin/debug forced placement",
+    });
     return { row, activeContainers: count };
   }
 
   // user-level pin: admin 把特定 user 钉到特定 host(QA/测试用)。
-  // 命中条件: host ready + 未满 + 不在 cooldown。任一不满足 → log.warn + fall-through
-  // 到 sticky/least-loaded(避免 host 维护期把 pinned 用户全卡死)。
+  // 命中条件: host 通过 full placement gate(loaded_image 对齐 + 三维度 fresh)
+  // + 未满 + 不在 cooldown。任一不满足 → log.warn + fall-through 到 sticky/
+  // least-loaded(避免 host 维护期把 pinned 用户全卡死)。
   // 优先级: requireHostId(admin debug) > pinned > sticky > least-loaded。
   if (typeof opts.userId === "number") {
     const pinnedHostId = await queries.getUserPinnedHost(opts.userId);
@@ -135,24 +143,23 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
           hostId: pinnedHostId,
         });
       } else {
-        const row = await queries.getHostById(pinnedHostId);
-        if (!row || row.status !== "ready") {
-          log.warn("pinned host not ready, falling through", {
+        // plan v4 round-2:走 full gate(不再只看 status==='ready')。
+        // gate fail = host 当前不可调度(status 非 ready / loaded_image 不对齐
+        // / dim stale 等),fall-through 到 sticky/least-loaded。
+        const sched = await queries.getSchedulableHostById(pinnedHostId);
+        if (!sched) {
+          log.warn("pinned host failed full placement gate, falling through", {
             userId: opts.userId,
             hostId: pinnedHostId,
-            status: row?.status ?? "missing",
+          });
+        } else if (sched.activeContainers >= sched.row.max_containers) {
+          log.warn("pinned host at capacity, falling through", {
+            userId: opts.userId,
+            hostId: sched.row.id,
           });
         } else {
-          const count = await queries.countActiveContainersOnHost(row.id);
-          if (count >= row.max_containers) {
-            log.warn("pinned host at capacity, falling through", {
-              userId: opts.userId,
-              hostId: row.id,
-            });
-          } else {
-            log.debug("pinned host hit", { userId: opts.userId, hostId: row.id });
-            return { row, activeContainers: count };
-          }
+          log.debug("pinned host hit", { userId: opts.userId, hostId: sched.row.id });
+          return sched;
         }
       }
     }
@@ -225,26 +232,42 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
           `data host ${row.id} in cooldown for uid=${opts.userId}`,
         );
       } else {
-        const count = await queries.countActiveContainersOnHost(row.id);
-        if (count >= row.max_containers) {
-          // 满不 fallback:同样会写空 volume。让用户 host_full retry 等出空位
-          log.info("data host at capacity, throwing busy to preserve user data", {
+        // plan v4 round-2:status='ready' 的 dataHost 仍要跑 full placement gate
+        // (loaded_image 对齐 + 三维度 fresh)。gate fail = host 暂时不可调度
+        // (新 image 还没 distribute / dim 还没就位),与 cooldown / capacity
+        // 同档处理:throw NodePoolBusyError 让 client retry,**不 fall-through**
+        // (fall-through 会落到 least-loaded → 写空 volume → 数据丢失)。
+        // 与 dataHost 现行"数据优先"策略一致。
+        const sched = await queries.getSchedulableHostById(row.id);
+        if (!sched) {
+          log.info("data host failed full placement gate, throwing busy to preserve user data", {
             userId: opts.userId,
             hostId: row.id,
-            activeContainers: count,
-            maxContainers: row.max_containers,
             containerState: dataHost.containerState,
           });
           throw new NodePoolBusyError(
-            `data host ${row.id} at capacity for uid=${opts.userId}`,
+            `data host ${row.id} not schedulable (gate fail) for uid=${opts.userId}`,
+          );
+        }
+        if (sched.activeContainers >= sched.row.max_containers) {
+          // 满不 fallback:同样会写空 volume。让用户 host_full retry 等出空位
+          log.info("data host at capacity, throwing busy to preserve user data", {
+            userId: opts.userId,
+            hostId: sched.row.id,
+            activeContainers: sched.activeContainers,
+            maxContainers: sched.row.max_containers,
+            containerState: dataHost.containerState,
+          });
+          throw new NodePoolBusyError(
+            `data host ${sched.row.id} at capacity for uid=${opts.userId}`,
           );
         }
         log.debug("data host hit", {
           userId: opts.userId,
-          hostId: row.id,
+          hostId: sched.row.id,
           containerState: dataHost.containerState,
         });
-        return { row, activeContainers: count };
+        return sched;
       }
     }
   }

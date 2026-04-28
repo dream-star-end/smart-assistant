@@ -94,8 +94,9 @@ import {
   deleteFile as nodeAgentDeleteFile,
 } from "./compute-pool/nodeAgentClient.js";
 import { createContainerService } from "./compute-pool/containerService.js";
-import { distributePreheatToAllHosts } from "./compute-pool/imageDistribute.js";
 import { getHealthPoller, type HealthPoller } from "./compute-pool/nodeHealth.js";
+import { initComputePool } from "./compute-pool/poolInit.js";
+import { getImagePromoteScheduler } from "./compute-pool/imagePromote.js";
 import {
   getBaselineServer,
   type BaselineServer,
@@ -259,10 +260,6 @@ async function handleExternalMtls(
     sendMtlsError(res, 403, "HOST_NOT_FOUND");
     return;
   }
-  if (row.status !== "ready") {
-    sendMtlsError(res, 503, "HOST_NOT_READY", { status: row.status });
-    return;
-  }
   const expectedFp = row.agent_cert_fingerprint_sha256;
   if (!expectedFp) {
     sendMtlsError(res, 403, "NO_PINNED_FP");
@@ -279,6 +276,23 @@ async function handleExternalMtls(
   const eBuf = Buffer.from(expectedFp.toLowerCase(), "hex");
   if (pBuf.length !== eBuf.length || pBuf.length === 0 || !timingSafeEqual(pBuf, eBuf)) {
     sendMtlsError(res, 403, "FINGERPRINT_MISMATCH");
+    return;
+  }
+
+  // 0042 — agent-uplink-probe 专用快路径:绕过 status='ready' 与 X-V3-Container-IP 校验。
+  // 目的:让 quarantined host 也能从 uplink-probe-failed 自愈;同时不开放任何代理能力,
+  // 仅返回 200 {ok:true,hostUuid} 让 agent 知道 mTLS+fingerprint 校验通过。
+  // 请求路径硬匹配 GET /v3/agent-uplink-probe。
+  if (req.method === "GET" && req.url === "/v3/agent-uplink-probe") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ ok: true, hostUuid }));
+    return;
+  }
+
+  // 业务流量(/v1/messages 等)需要 host 处于 ready
+  if (row.status !== "ready") {
+    sendMtlsError(res, 503, "HOST_NOT_READY", { status: row.status });
     return;
   }
 
@@ -808,31 +822,37 @@ export async function registerCommercial(
         console.warn("[commercial] v3 preheat unexpectedly threw", { error: (err as Error)?.message ?? String(err) });
       });
 
-      // 多机分发:把 image 推到所有 ready 的远端 host。
-      // 启动时 fire-and-forget(3.5GB stream 不阻塞 ws 接入)。
-      // 失败 best-effort —— 兜底是 wrapDockerError 把 RUN_FAIL/Unable-to-find-image
-      // 翻译成 ImageNotFound,前端 5min retry 而非 5s 风暴。
-      // OC_IMAGE_DISTRIBUTE_DISABLED=1 关(单机部署 / 测试)。
+      // 0042 — 启动时 compute pool 初始化:
+      //   1. inspect 本地 OC_RUNTIME_IMAGE → 算 desiredImageId
+      //   2. setDesiredImage(打开 placement gate)
+      //   3. setLoadedImage(self,= master 本机 image)
+      //   4. backfill:并发 4 / 单 host 30s / 整体 5min,拉一遍 /health 给非-self host 写各维度
+      //   5. 一次 promoteOnce(distribute 把 host 与 desired 对齐)
+      //   后台启动 ImagePromoteScheduler — 每 5min 自动 inspect+distribute,补 master image 升级后的状态收敛。
+      //
+      //  本调用替代旧 distributePreheatToAllHosts startup 调用 —— promoteOnce 内部已经包了
+      //  distribute,且会写 loaded_image_id + clear quarantine。
+      //  OC_IMAGE_DISTRIBUTE_DISABLED=1 仍可关掉(单机 dev / 测试)。
       if (process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1") {
-        void distributePreheatToAllHosts(cfg.OC_RUNTIME_IMAGE, {
-          logger: rootLogger.child({ subsys: "image-distribute-startup" }),
-        })
-          .then((results) => {
-            const summary = results.map((r) => `${r.hostName}:${r.outcome}`).join(",");
+        void initComputePool({ imageTag: cfg.OC_RUNTIME_IMAGE })
+          .then((r) => {
             // eslint-disable-next-line no-console
-            console.log("[commercial] v3 image distribute summary", { results: summary, count: results.length });
-            const failed = results.filter((r) => r.outcome === "error");
-            if (failed.length > 0) {
-              // eslint-disable-next-line no-console
-              console.warn("[commercial] v3 image distribute had failures", {
-                failed: failed.map((r) => ({ host: r.hostName, source: r.errorSource, error: r.error })),
-              });
-            }
+            console.log("[commercial] compute pool init done", {
+              desiredImageId: r.desiredImageId,
+              selfSynced: r.selfSynced,
+              backfillHosts: r.backfillHosts,
+              backfillSucceeded: r.backfillSucceeded,
+              backfillSkipped: r.backfillSkipped,
+              backfillTimedOut: r.backfillTimedOut,
+              promoteRan: r.promoteRan,
+            });
+            // 启动周期性 promote scheduler(60s 后第一 tick,之后每 5min)
+            getImagePromoteScheduler({ imageTag: cfg.OC_RUNTIME_IMAGE }).start();
           })
           .catch((err: unknown) => {
-            // distributePreheatToAllHosts 内部应该 best-effort 不抛;真抛了就是 bug
+            // initComputePool 内部 best-effort 不抛;到这里就是 bug
             // eslint-disable-next-line no-console
-            console.warn("[commercial] v3 image distribute unexpectedly threw", {
+            console.warn("[commercial] compute pool init unexpectedly threw", {
               error: (err as Error)?.message ?? String(err),
             });
           });
@@ -1136,6 +1156,8 @@ export async function registerCommercial(
       if (healthPoller) {
         try { healthPoller.stop(); } catch { /* ignore */ }
       }
+      // 0042 — ImagePromoteScheduler 是 module 级单例,getImagePromoteScheduler() 拿到实例后调 stop
+      try { getImagePromoteScheduler().stop(); } catch { /* ignore */ }
       if (containerEventsWorker) {
         try { await containerEventsWorker.stop(); } catch { /* ignore */ }
       }

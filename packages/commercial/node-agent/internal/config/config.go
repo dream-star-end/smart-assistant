@@ -59,6 +59,11 @@ type Config struct {
 	// 空字符串 → 禁用(self host 不需要 — 自机出口跟"不走 proxy"等价)。
 	// 典型值 "0.0.0.0:9444"。监听需要从 master VM IP 可达;防火墙由 nodeBootstrap 同步。
 	MasterEgressBind string `yaml:"master_egress_bind"`
+
+	// 0042:self-probe 用。agent 周期性 docker image inspect 这个 tag,
+	// 把 ID + tag 在 /health 回包里报给 master,作为 loaded_image_id 唯一可信来源。
+	// 空字符串 → self-probe 跳过 loaded image 探测(loadedImageId/loadedImageTag = nil)。
+	RuntimeImageTag string `yaml:"runtime_image_tag"`
 }
 
 func Load(path string) (*Config, error) {

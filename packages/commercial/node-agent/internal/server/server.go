@@ -22,6 +22,7 @@ import (
 	"github.com/openclaude/node-agent/internal/files"
 	"github.com/openclaude/node-agent/internal/logging"
 	"github.com/openclaude/node-agent/internal/renew"
+	"github.com/openclaude/node-agent/internal/selfprobe"
 	"github.com/openclaude/node-agent/internal/sshmux"
 	"github.com/openclaude/node-agent/internal/tunnel"
 )
@@ -37,7 +38,8 @@ type Server struct {
 	tunnel   *tunnel.Handler
 	files    *files.Handler
 	sshmux   *sshmux.Manager
-	baseline *baseline.Poller // nil when disabled (empty base url)
+	baseline *baseline.Poller   // nil when disabled (empty base url)
+	probe    *selfprobe.Poller  // nil when wholly disabled (no master_mtls_url + no master_egress_bind + no runtime_image_tag)
 
 	// 续期后追加调用的 reloader(例如 masteregress :9444)。可为 nil。
 	// 顺序无所谓:每个独立 atomic 切换;失败仅 log,不挡 :9443 reload 成功路径。
@@ -48,8 +50,8 @@ type Server struct {
 // 必须在 server.New 后、第一次 renew 前调。线程不安全;不应运行时多次替换。
 func (s *Server) SetExtraReloader(fn func() error) { s.extraReloader = fn }
 
-// New 构建 Server;baselinePoller 可为 nil(禁用 baseline 同步)。
-func New(cfg *config.Config, baselinePoller *baseline.Poller) (*Server, error) {
+// New 构建 Server;baselinePoller / probePoller 可为 nil(禁用对应能力)。
+func New(cfg *config.Config, baselinePoller *baseline.Poller, probePoller *selfprobe.Poller) (*Server, error) {
 	caBytes, err := os.ReadFile(cfg.CACrt)
 	if err != nil {
 		return nil, fmt.Errorf("read ca: %w", err)
@@ -72,6 +74,7 @@ func New(cfg *config.Config, baselinePoller *baseline.Poller) (*Server, error) {
 	s.files = files.New()
 	s.sshmux = sshmux.New()
 	s.baseline = baselinePoller
+	s.probe = probePoller
 	return s, nil
 }
 
@@ -176,12 +179,37 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "use GET", http.StatusMethodNotAllowed)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	body := map[string]any{
 		"ok":     true,
 		"uptime": time.Since(startTime).Seconds(),
 		"host":   s.cfg.HostUUID,
-	})
+	}
+	// 0042:挂载 selfprobe 缓存(uplink / egress / loaded image)。
+	// 字段名 = TS AgentHealthResponse(uplinkOk/uplinkAt/uplinkErr 等),
+	// 任一为 nil 时不写,master 端按 undefined 处理("未知"语义)。
+	if s.probe != nil {
+		snap := s.probe.Snapshot()
+		if snap.Uplink != nil {
+			body["uplinkOk"] = snap.Uplink.OK
+			body["uplinkAt"] = snap.Uplink.At.UTC().Format(time.RFC3339Nano)
+			if !snap.Uplink.OK && snap.Uplink.Err != "" {
+				body["uplinkErr"] = snap.Uplink.Err
+			}
+		}
+		if snap.Egress != nil {
+			body["egressProbeOk"] = snap.Egress.OK
+			body["egressProbeAt"] = snap.Egress.At.UTC().Format(time.RFC3339Nano)
+			if !snap.Egress.OK && snap.Egress.Err != "" {
+				body["egressProbeErr"] = snap.Egress.Err
+			}
+		}
+		if snap.Image != nil {
+			body["loadedImageId"] = snap.Image.ID
+			body["loadedImageTag"] = snap.Image.Tag
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {

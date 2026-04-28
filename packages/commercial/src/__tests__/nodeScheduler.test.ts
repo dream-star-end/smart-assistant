@@ -107,6 +107,11 @@ class FakePool {
   // 不在测试里实例化整张 users 表,只存调度器需要的 user→host 映射。
   pinnedByUser = new Map<number, string | null>();
   nextContainerId = 1;
+  // plan v4 round-2 — 让特定 host 在 placement gate 维度 fail。
+  // 模拟 getSchedulableHostById / listSchedulableHosts 返 NULL/空集 的场景
+  // (image-mismatch / dim stale 等)。仅影响 *Schedulable* 路径,getHostById
+  // 仍按 status 字段返。
+  gateFailHostIds = new Set<string>();
 
   addHost(h: ComputeHostRow): void { this.hosts.push(h); }
   addContainer(c: Omit<FakeContainer, "id" | "created_at"> & { created_at?: Date }): void {
@@ -123,11 +128,48 @@ class FakePool {
   setUserPinnedHost(userId: number, hostId: string | null): void {
     this.pinnedByUser.set(userId, hostId);
   }
+  setHostGateFail(hostId: string, fail: boolean): void {
+    if (fail) this.gateFailHostIds.add(hostId);
+    else this.gateFailHostIds.delete(hostId);
+  }
   async end(): Promise<void> { /* FakePool.end — no real connections */ }
 
   async query(sql: string, params: unknown[] = []): Promise<{ rows: unknown[]; rowCount: number }> {
     const s = sql.trim();
 
+    // plan v4 round-2 — getSchedulableHostById:`WITH desired AS` + `WHERE id = $1`
+    // 模拟 placement gate:gateFailHostIds 中的 host 视作 gate fail (返 0 行);
+    // 其他按 status='ready' 通过(测试默认不模拟 image/dim 维度,full gate 由
+    // queriesAtomicLifecycle.integ 测真 PG)。
+    if (/WITH desired AS/.test(s) && /WHERE id = \$1/.test(s)) {
+      const id = params[0] as string;
+      const h = this.hosts.find((x) => x.id === id);
+      if (!h || h.status !== "ready" || this.gateFailHostIds.has(id)) {
+        return { rows: [], rowCount: 0 };
+      }
+      const row = {
+        ...h,
+        active_containers: String(
+          this.containers.filter((c) => c.host_uuid === h.id && c.state === "active").length,
+        ),
+      };
+      return { rows: [row], rowCount: 1 };
+    }
+    // plan v4 round-2 — listSchedulableHosts (CTE shape):
+    // 同上,gateFailHostIds 中的 host 排除。
+    if (/WITH desired AS/.test(s) && /FROM compute_hosts, desired/.test(s)) {
+      const rows = this.hosts
+        .filter((h) => h.status === "ready" && !this.gateFailHostIds.has(h.id))
+        .slice()
+        .sort((a, b) => a.created_at.getTime() - b.created_at.getTime())
+        .map((h) => ({
+          ...h,
+          active_containers: String(
+            this.containers.filter((c) => c.host_uuid === h.id && c.state === "active").length,
+          ),
+        }));
+      return { rows, rowCount: rows.length };
+    }
     // getHostById
     if (/FROM compute_hosts\s+WHERE id = \$1\s+LIMIT 1/.test(s)) {
       const id = params[0] as string;
@@ -140,7 +182,8 @@ class FakePool {
       const row = this.hosts.find((h) => h.name === name) ?? null;
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
     }
-    // listSchedulableHosts: SELECT ... WHERE status = 'ready' ORDER BY created_at
+    // 旧 listSchedulableHosts 兜底(legacy `WHERE status = 'ready'` 直接 WHERE)。
+    // 当前 0042 已迁到 CTE;留这分支兼容潜在 ad-hoc 老查询。
     if (/WHERE status = 'ready'/.test(s) && /FROM compute_hosts/.test(s)) {
       const rows = this.hosts
         .filter((h) => h.status === "ready")
@@ -556,6 +599,84 @@ describe("nodeScheduler.pickHost — user-level pinned host (0040)", () => {
     // 没设 pin,且不传 userId → least-loaded
     const r = await pickHost({});
     assert.equal(r.row.id, "hOnly");
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  plan v4 round-2 — placement gate (loaded_image 对齐 + dim 新鲜) 在 bypass
+//  路径上的强制执行。pinned/dataHost 走 getSchedulableHostById,任一维度 fail
+//  即视作"该 host 暂时不可调度",分别按各自策略处理:
+//    - pinned: gate-fail → fall-through(避免被特定 host 维护期卡死)
+//    - dataHost: gate-fail → throw NodePoolBusyError(数据完整性优先,不
+//      fall-through 到空 volume)
+//    - requireHostId: 仍只看 status='ready'(admin debug 最高优先级,有意 bypass)
+// ───────────────────────────────────────────────────────────────────────
+
+describe("nodeScheduler.pickHost — placement gate full enforcement (round-2)", () => {
+  let fp: FakePool;
+  beforeEach(() => { fp = installFake(); _clearHostCooldownForTests(); });
+  afterEach(async () => { _clearHostCooldownForTests(); await resetPool(); });
+
+  test("pinned host status=ready 但 gate fail → fall-through(避免单 host 维护期卡死 pin 用户)", async () => {
+    fp.addHost(mkHost({ id: "hPin", name: "tk1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOk", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    // hPin status='ready' 但 gate fail(模拟 image 还没 distribute / dim stale)
+    fp.setHostGateFail("hPin", true);
+    fp.setUserPinnedHost(60, "hPin");
+    const r = await pickHost({ userId: 60 });
+    assert.equal(r.row.id, "hOk", "pinned gate-fail 必须 fall-through 而不是被卡");
+  });
+
+  test("dataHost status=ready 但 gate fail → 抛 NodePoolBusyError(数据优先,等 retry)", async () => {
+    fp.addHost(mkHost({ id: "hData", name: "tk1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOk", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    // user 61 的数据(volume)在 hData;hData ready 但 gate fail
+    fp.addContainer({ user_id: 61, host_uuid: "hData", bound_ip: "172.30.1.10", state: "vanished" });
+    fp.setHostGateFail("hData", true);
+    // 必须抛 busy 而不是 fall-through 到 hOk(fall-through = 写空 volume)
+    await assert.rejects(
+      pickHost({ userId: 61 }),
+      (e: unknown) =>
+        e instanceof NodePoolBusyError && /not schedulable.*gate fail/.test((e as Error).message),
+    );
+  });
+
+  test("dataHost gate fail + 没 fallback host → 仍抛 busy(不会因没 fallback 翻车)", async () => {
+    // 只有一个 host(dataHost),还 gate fail。结果仍是 busy(数据优先),
+    // 不是 NodePoolUnavailableError(unavailable 是"全集没 ready 节点")
+    fp.addHost(mkHost({ id: "hData", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addContainer({ user_id: 62, host_uuid: "hData", bound_ip: "172.30.0.10", state: "active" });
+    fp.setHostGateFail("hData", true);
+    await assert.rejects(pickHost({ userId: 62 }), NodePoolBusyError);
+  });
+
+  test("requireHostId 仍只看 status(有意 bypass full gate,admin debug 最高级)", async () => {
+    // 即使 gate fail,requireHostId 路径仍按老语义放行(只查 status='ready' + 容量)
+    fp.addHost(mkHost({ id: "hX", name: "tk-x", status: "ready", max_containers: 5 }));
+    fp.setHostGateFail("hX", true);
+    const r = await pickHost({ requireHostId: "hX" });
+    assert.equal(r.row.id, "hX", "requireHostId 路径不受 placement gate 影响");
+  });
+
+  test("least-loaded 路径排除 gate fail host", async () => {
+    fp.addHost(mkHost({ id: "hBad", name: "tk1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOk", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.setHostGateFail("hBad", true);
+    const r = await pickHost({});
+    assert.equal(r.row.id, "hOk");
+  });
+
+  test("pinned + dataHost 同 host gate fail:dataHost 语义优先(throw busy 而非 pinned 的 fall-through)", async () => {
+    // 真实场景:user 既被 admin pin 到 hX,数据也在 hX;hX gate fail。
+    // pinned 检查先执行,fall-through;然后 dataHost 检查命中相同 host → throw busy。
+    // (这是 pickHost 当前的执行顺序:pinned → dataHost → least-loaded)
+    fp.addHost(mkHost({ id: "hX", name: "tk1", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 1) }));
+    fp.addHost(mkHost({ id: "hOk", name: "self", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
+    fp.setUserPinnedHost(63, "hX");
+    fp.addContainer({ user_id: 63, host_uuid: "hX", bound_ip: "172.30.1.10", state: "active" });
+    fp.setHostGateFail("hX", true);
+    // dataHost 关卡先于 least-loaded;数据完整性兜底 → busy
+    await assert.rejects(pickHost({ userId: 63 }), NodePoolBusyError);
   });
 });
 

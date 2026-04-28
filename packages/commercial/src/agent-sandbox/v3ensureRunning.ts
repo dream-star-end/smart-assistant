@@ -57,8 +57,10 @@ import {
   type SchedulePlacement,
 } from "../compute-pool/nodeScheduler.js";
 import { NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/types.js";
-import { getHostById } from "../compute-pool/queries.js";
+import { getHostById, setQuarantined } from "../compute-pool/queries.js";
 import { hostRowToTarget, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
+import { promoteOnce } from "../compute-pool/imagePromote.js";
+import { randomUUID } from "node:crypto";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
@@ -373,10 +375,30 @@ export function makeV3EnsureRunning(
           event_type: EVENTS.CONTAINER_PROVISION_FAILED,
           severity: "critical",
           title: `容器 provision 失败 — 镜像缺失 [${hostName}]`,
-          body: `uid=${uid} 在 host=${hostName}(${hostId})上 provision 失败:image=\`${imageRef}\` 不存在。部署级故障,需人工 \`docker pull\` 或重跑 build-image / streamImageToHost。`,
+          body: `uid=${uid} 在 host=${hostName}(${hostId})上 provision 失败:image=\`${imageRef}\` 不存在。部署级故障,placement gate 已自动 quarantine 该 host,后台 imagePromote 会异步重分发。`,
           payload: { uid, reason: "image_missing", host_id: hostId, host_name: hostName, image: imageRef },
           dedupe_key: `container.provision_failed:image_missing:${hostId}:${imageRef}:${new Date().toISOString().slice(0, 13)}`,
         });
+        // Plan v4:host 报告 image 已加载但 runtime 实际拉容器时撞 ImageNotFound
+        // → 立即 hard quarantine(reason='runtime-image-missing'),关 placement gate,
+        //   后续用户被 schedule 到其它 host;同时 fire-and-forget 一轮 promoteOnce 异步重分发,
+        //   若成功 imagePromote 会清掉 quarantine 让 host 重回 ready。
+        if (placement?.hostId) {
+          const operationId = randomUUID();
+          await setQuarantined(placement.hostId, {
+            reason: "runtime-image-missing",
+            detail: `runtime ImageNotFound: ${imageRef}`,
+            operationId,
+            actor: "system:v3ensureRunning",
+          }).catch(() => {
+            // 静默吞;quarantine 失败也不能改变控制流(throw 仍按 ImageNotFound 走)
+          });
+          // 不 await,避免阻塞 user-facing throw。
+          // plan v4 round-2:把同一 operationId 透给 promoteOnce,使
+          // setQuarantined → distribute → clearQuarantineByReason 三段审计行
+          // 通过 operation_id 索引串起来,运维追溯一次故障只需一次查询。
+          void promoteOnce({ imageTag: imageRef, operationId }).catch(() => undefined);
+        }
         throw new ContainerUnreadyError(RETRY_AFTER_IMAGE_MISSING_SEC, "image_missing");
       }
       // Codex R2 fix:CcbBaselineMissing 同为部署级故障 — baseline rsync 漏了
