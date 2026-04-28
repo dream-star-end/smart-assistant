@@ -2,6 +2,7 @@ import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/grow
 import { splitCommand_DEPRECATED } from '../../utils/bash/commands.js'
 import { SandboxManager } from '../../utils/sandbox/sandbox-adapter.js'
 import { getSettings_DEPRECATED } from '../../utils/settings/settings.js'
+import { normalizeBackgroundCommand } from './bashCommandNormalize.js'
 import {
   BINARY_HIJACK_VARS,
   bashPermissionRule,
@@ -13,6 +14,7 @@ import {
 type SandboxInput = {
   command?: string
   dangerouslyDisableSandbox?: boolean
+  run_in_background?: boolean
 }
 
 // NOTE: excludedCommands is a user-facing convenience feature, not a security boundary.
@@ -144,8 +146,14 @@ export function shouldUseSandbox(input: Partial<SandboxInput>): boolean {
     return false
   }
 
+  // Normalize trailing-`&` for run_in_background:true to match what BashTool
+  // actually executes. Keeps sandbox decisions and exec aligned even when
+  // shouldUseSandbox is invoked from generic permission code (permissions.ts
+  // auto-allow path, BashPermissionRequest UI).
+  const command = normalizeBackgroundCommand(input.command, input.run_in_background)
+
   // Don't sandbox if the command contains user-configured excluded commands
-  if (containsExcludedCommand(input.command)) {
+  if (containsExcludedCommand(command)) {
     return false
   }
 
