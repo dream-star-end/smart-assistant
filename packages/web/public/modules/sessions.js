@@ -1,14 +1,14 @@
-import { dbDelete, dbPut } from './db.js?v=85fd3f7'
+import { dbDelete, dbPut } from './db.js?v=1fead16'
 // OpenClaude — Session management, sidebar, context menu
-import { $, htmlSafeEscape } from './dom.js?v=85fd3f7'
-import { exportSessionDocx } from './export-docx.js?v=85fd3f7'
-import { exportSessionTex } from './export-tex.js?v=85fd3f7'
-import { setTitleBusy } from './notifications.js?v=85fd3f7'
-import { getSession, state } from './state.js?v=85fd3f7'
-import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=85fd3f7'
-import { toast } from './ui.js?v=85fd3f7'
-import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=85fd3f7'
-import { nudgeDrain } from './websocket.js?v=85fd3f7'
+import { $, htmlSafeEscape } from './dom.js?v=1fead16'
+import { exportSessionDocx } from './export-docx.js?v=1fead16'
+import { exportSessionTex } from './export-tex.js?v=1fead16'
+import { setTitleBusy } from './notifications.js?v=1fead16'
+import { getSession, state } from './state.js?v=1fead16'
+import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=1fead16'
+import { toast } from './ui.js?v=1fead16'
+import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=1fead16'
+import { nudgeDrain } from './websocket.js?v=1fead16'
 
 // Late-bound references set by main.js
 let _renderMessages
