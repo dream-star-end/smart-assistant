@@ -74,6 +74,10 @@ export const DEFAULT_OAUTH_ENDPOINT = 'https://platform.claude.com/v1/oauth/toke
  *  这个 client_id 是 Anthropic 给 Claude Code CLI 的固定 ID,所有 OAuth refresh 都得带。 */
 export const DEFAULT_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 
+/** Claude Code CLI 风格 User-Agent。Node fetch 默认 `undici/...` 是非 CC 指纹。
+ *  与 gateway/server.ts 的 CLAUDE_OAUTH_USER_AGENT 同源同语义,共用 env 覆盖名。 */
+export const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_FOR_OAUTH || '2.1.888'} (external, cli)`
+
 /** refresh 成功但服务器没给 expires_in/expires_at 时的保底:1 小时。 */
 export const DEFAULT_FALLBACK_EXPIRES_MS = 60 * 60 * 1000
 
@@ -328,6 +332,7 @@ async function refreshAccountTokenInner(
       {
         'Content-Type': 'application/x-www-form-urlencoded',
         Accept: 'application/json',
+        'User-Agent': CLAUDE_OAUTH_USER_AGENT,
       },
       form.toString(),
       deps.dispatcher,
