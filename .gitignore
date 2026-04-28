@@ -9,3 +9,12 @@ dist/
 deploy/.env
 claude-code-best/node_modules/
 claude-code-best/dist/
+
+# 本地浏览器/codex/playwright 临时数据
+.playwright-mcp/
+claude-code-best/.playwright-mcp/
+claude-code-best/.codex
+# CCB 测试/调试遗留截图
+claude-code-best/*.png
+# vendor/ripgrep 是本地 /usr/bin/rg 符号链接 hack,跨机不通用
+claude-code-best/src/utils/vendor/
