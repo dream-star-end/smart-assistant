@@ -1031,6 +1031,119 @@ describe("applyHealthSnapshot — loadedImageId 写回保护(round-2)", () => {
   });
 });
 
+// ─── sha-divergence guard — applyHealthSnapshot 不让 daemon sha 覆盖已对齐 host ──
+
+describe("applyHealthSnapshot — sha-divergence guard (option A)", () => {
+  // 业务背景:docker save | docker load 后远端 daemon 重算 sha,
+  // selfprobe 报上来的 daemon sha 永远 ≠ master 写入的 desired_image_id。
+  // imagePromote 一旦把 host 对齐到 desired,health-snapshot 不应再用
+  // daemon sha 覆盖,否则 PLACEMENT_GATE_PREDICATE 永远失败。
+
+  test("已对齐 host (loaded == desired) → daemon 报不同 sha 时不覆盖", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:desired", "openclaude-runtime:tag");
+    const id = await insertTestHost("host-shadiv-aligned", {
+      status: "ready",
+      loadedImageId: "sha256:desired",
+    });
+    await query(
+      `UPDATE compute_hosts SET loaded_image_at = NOW() - INTERVAL '1 hour' WHERE id = $1`,
+      [id],
+    );
+    const before = await getHostById(id);
+    const oldAt = before!.loaded_image_at;
+
+    // 模拟 docker daemon 报出 save/load 后重算的不同 sha
+    await applyHealthSnapshot(id, {
+      endpointOk: true,
+      uplinkOk: true,
+      egressOk: true,
+      loadedImageId: "sha256:daemonshifted",
+      operationId: "shadiv-aligned",
+      actor: "system:health",
+    });
+    const row = await getHostById(id);
+    assert.equal(
+      row!.loaded_image_id,
+      "sha256:desired",
+      "已对齐 host 不应被 daemon-reported sha 覆盖",
+    );
+    assert.equal(
+      row!.loaded_image_at?.getTime(),
+      oldAt?.getTime(),
+      "guard 命中时 loaded_image_at 也不应刷新",
+    );
+  });
+
+  test("未对齐 host (loaded != desired) → daemon 报新 sha 时仍覆盖(保留 drift detection)", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:newdesired", "openclaude-runtime:tag");
+    const id = await insertTestHost("host-shadiv-unaligned", {
+      status: "ready",
+      loadedImageId: "sha256:olddesired", // 与 desired 不等
+    });
+    await query(
+      `UPDATE compute_hosts SET loaded_image_at = NOW() - INTERVAL '1 hour' WHERE id = $1`,
+      [id],
+    );
+    const before = await getHostById(id);
+    const oldAt = before!.loaded_image_at;
+
+    await applyHealthSnapshot(id, {
+      endpointOk: true,
+      uplinkOk: true,
+      egressOk: true,
+      loadedImageId: "sha256:daemonactual",
+      operationId: "shadiv-unaligned",
+      actor: "system:health",
+    });
+    const row = await getHostById(id);
+    assert.equal(
+      row!.loaded_image_id,
+      "sha256:daemonactual",
+      "未对齐 host 仍应让 health 写回 daemon sha,触发 imagePromote 重新对齐",
+    );
+    assert.ok(
+      (row!.loaded_image_at?.getTime() ?? 0) > (oldAt?.getTime() ?? 0),
+      "实际写入时 loaded_image_at 应被刷新",
+    );
+  });
+
+  test("desired 切换后 → 已对齐到旧 desired 的 host 重新允许 health 写回", async (t) => {
+    if (skipIfNoDb(t)) return;
+    // 起始:desired=old,host loaded=old(已对齐)
+    await setDesiredImage("sha256:olddesired", "openclaude-runtime:old");
+    const id = await insertTestHost("host-shadiv-rotate", {
+      status: "ready",
+      loadedImageId: "sha256:olddesired",
+    });
+    await query(
+      `UPDATE compute_hosts SET loaded_image_at = NOW() - INTERVAL '1 hour' WHERE id = $1`,
+      [id],
+    );
+
+    // admin 推新 desired
+    await setDesiredImage("sha256:newdesired", "openclaude-runtime:new");
+
+    // 此时 host loaded (olddesired) ≠ desired (newdesired) → guard 不该再保护
+    // health 报上来的 daemon sha 应被写入
+    await applyHealthSnapshot(id, {
+      endpointOk: true,
+      uplinkOk: true,
+      egressOk: true,
+      loadedImageId: "sha256:daemonactual",
+      operationId: "shadiv-rotate",
+      actor: "system:health",
+    });
+    const row = await getHostById(id);
+    assert.equal(
+      row!.loaded_image_id,
+      "sha256:daemonactual",
+      "desired 已切换,旧对齐失效,health 应能写回 daemon sha 让 imagePromote 觉察 mismatch",
+    );
+  });
+});
+
 // ─── plan v4 round-2 — clearQuarantine audit previousReason ────────────
 
 describe("clearQuarantine — audit previousReason(round-2)", () => {

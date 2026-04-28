@@ -760,15 +760,35 @@ export async function applyHealthSnapshot(
                 WHEN $11::boolean THEN NULL
                 ELSE quarantine_at
               END,
+              -- sha-divergence guard:docker save | docker load 后远端 daemon
+              -- 重算 layer/manifest sha,daemon-reported sha 永远 ≠ master 写入的
+              -- desired_image_id。imagePromote 一旦把 host 对齐到 desired
+              -- (loaded_image_id == desired_image_id),health-snapshot 不应再用
+              -- daemon sha 覆盖 — 否则 PLACEMENT_GATE_PREDICATE 永远失败,数据
+              -- sticky 用户在 nodeScheduler 走 NodePoolBusy 死循环。
+              --
+              -- 代价:同 tag 不同 image 的"操作员手动 docker pull"漂移本层察觉
+              -- 不到(promote loaded==desired 时直接 already,不再调
+              -- streamImageToHost 重检)。runtime-image-missing hard quarantine
+              -- 只能兜底 tag 缺失/不可运行;同 tag 被替换成另一个仍可运行的真实
+              -- image 属于本方案接受的弱化风险,DB 会继续认为 host 已对齐。
               loaded_image_id = CASE
                 WHEN $13::text IS NOT NULL
                   AND $13::text IS DISTINCT FROM loaded_image_id
+                  AND loaded_image_id IS DISTINCT FROM (
+                    SELECT desired_image_id FROM compute_pool_state
+                     WHERE singleton = 'singleton'
+                  )
                 THEN $13::text
                 ELSE loaded_image_id
               END,
               loaded_image_at = CASE
                 WHEN $13::text IS NOT NULL
                   AND $13::text IS DISTINCT FROM loaded_image_id
+                  AND loaded_image_id IS DISTINCT FROM (
+                    SELECT desired_image_id FROM compute_pool_state
+                     WHERE singleton = 'singleton'
+                  )
                 THEN NOW()
                 ELSE loaded_image_at
               END,
