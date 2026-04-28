@@ -56,6 +56,17 @@ import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
 
+// User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
+// Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
+// Anthropic's OAuth endpoint. Mimic the Claude Code CLI UA pattern instead.
+// Version is overridable via env so this stays in sync with installed CCB after
+// CCB upgrades; CCB's own MACRO.VERSION is a build-time constant unreachable
+// from the gateway process, so we can't auto-derive it.
+// Codex (auth.openai.com) intentionally NOT covered — different fingerprint
+// regime, no evidence of risk, and the gateway _refreshToken path is a backup
+// to codex-cli's own internal refresh anyway.
+const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_FOR_OAUTH || '2.1.888'} (external, cli)`
+
 /**
  * 协议级允许的 InboundMessage.model 值(2026-04-26 v1.0.4 加)。
  *
@@ -2867,7 +2878,10 @@ export class Gateway {
     try {
       const tokenRes = await fetch(prov.tokenUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(providerKey === 'claude' ? { 'User-Agent': CLAUDE_OAUTH_USER_AGENT } : {}),
+        },
         body: JSON.stringify({
           grant_type: 'authorization_code',
           client_id: prov.clientId,
@@ -2980,7 +2994,10 @@ export class Gateway {
     try {
       const tokenRes = await fetch(prov.tokenUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(providerKey === 'claude' ? { 'User-Agent': CLAUDE_OAUTH_USER_AGENT } : {}),
+        },
         body: JSON.stringify({
           grant_type: 'refresh_token',
           client_id: prov.clientId,

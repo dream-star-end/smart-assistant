@@ -16,6 +16,7 @@
     "@openclaude/channel-wechat": "*",
     "@openclaude/commercial": "*",
     "commander": "^12.1.0",
-    "grammy": "^1.30.0"
+    "grammy": "^1.30.0",
+    "undici": "^7.0.0"
   }
 }
