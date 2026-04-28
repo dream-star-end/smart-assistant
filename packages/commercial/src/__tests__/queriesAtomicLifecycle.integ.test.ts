@@ -34,6 +34,7 @@ import {
   getSchedulableHostById,
   setDraining,
   getHostById,
+  listAllHostsForAdmin,
 } from "../compute-pool/queries.js";
 import { setDesiredImage } from "../compute-pool/poolState.js";
 import { listAuditEventsForHost } from "../compute-pool/audit.js";
@@ -1277,5 +1278,191 @@ describe("clearQuarantineByReason — hard reason(round-2)", () => {
     row = await getHostById(id);
     assert.equal(row!.status, "ready");
     assert.equal(row!.quarantine_reason_code, null);
+  });
+});
+
+// ─── 0042 — listAllHostsForAdmin (admin view + placement_gate_open) ─────
+
+describe("listAllHostsForAdmin", () => {
+  test("normal ready+healthy host with image match → placement_gate_open=true", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:img", "tag");
+    const id = await insertTestHost("host-adm-ok", {
+      status: "ready",
+      loadedImageId: "sha256:img",
+      healthy: true,
+    });
+    const list = await listAllHostsForAdmin();
+    const found = list.find((h) => h.row.id === id);
+    assert.ok(found, "host should be in admin list");
+    assert.equal(found!.placementGateOpen, true);
+    assert.equal(found!.desiredImageId, "sha256:img");
+    assert.equal(found!.activeContainers, 0);
+  });
+
+  test("self host with loaded_image_id matching desired → placement_gate_open=true", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:img", "tag");
+    await query(
+      `UPDATE compute_hosts
+          SET loaded_image_id = 'sha256:img', loaded_image_at = NOW(), status = 'ready'
+        WHERE name = 'self'`,
+    );
+    const list = await listAllHostsForAdmin();
+    const self = list.find((h) => h.row.name === "self");
+    assert.ok(self, "self host always present");
+    assert.equal(self!.placementGateOpen, true, "self skips fresh dims");
+  });
+
+  test("loaded_image_id IS NULL → placement_gate_open=false", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:img", "tag");
+    const id = await insertTestHost("host-adm-noimg", {
+      status: "ready",
+      loadedImageId: null,
+      healthy: true,
+    });
+    const list = await listAllHostsForAdmin();
+    const found = list.find((h) => h.row.id === id);
+    assert.ok(found);
+    assert.equal(found!.placementGateOpen, false);
+  });
+
+  test("desired_image_id IS NULL (singleton not init) → all hosts gate=false", async (t) => {
+    if (skipIfNoDb(t)) return;
+    // beforeEach 已 reset desired_image_id=NULL
+    const id = await insertTestHost("host-adm-nogate", {
+      status: "ready",
+      loadedImageId: "sha256:any",
+      healthy: true,
+    });
+    const list = await listAllHostsForAdmin();
+    assert.ok(list.length > 0);
+    for (const h of list) {
+      assert.equal(h.placementGateOpen, false, `host ${h.row.name} should be gate=false when desired NULL`);
+      assert.equal(h.desiredImageId, null);
+    }
+    // 但仍包含该 host(admin 列表不过滤,只标 chip)
+    assert.ok(list.some((h) => h.row.id === id));
+  });
+
+  test("loaded_image_id 与 desired 不一致 → placement_gate_open=false", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:expected", "tag");
+    const id = await insertTestHost("host-adm-mm", {
+      status: "ready",
+      loadedImageId: "sha256:other",
+      healthy: true,
+    });
+    const list = await listAllHostsForAdmin();
+    const found = list.find((h) => h.row.id === id);
+    assert.ok(found);
+    assert.equal(found!.placementGateOpen, false);
+  });
+
+  test("last_health_poll_at = NOW() - 65s (>60s window) → gate=false", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:img", "tag");
+    const id = await insertTestHost("host-adm-stale-h", {
+      status: "ready",
+      loadedImageId: "sha256:img",
+      healthy: true,
+    });
+    await query(
+      `UPDATE compute_hosts
+          SET last_health_poll_at = NOW() - INTERVAL '65 seconds'
+        WHERE id = $1`,
+      [id],
+    );
+    const list = await listAllHostsForAdmin();
+    const found = list.find((h) => h.row.id === id);
+    assert.equal(found!.placementGateOpen, false);
+  });
+
+  test("uplink_ok=false → gate=false", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:img", "tag");
+    const id = await insertTestHost("host-adm-uplink-bad", {
+      status: "ready",
+      loadedImageId: "sha256:img",
+      healthy: true,
+    });
+    await query(
+      `UPDATE compute_hosts
+          SET last_uplink_ok = FALSE, last_uplink_at = NOW()
+        WHERE id = $1`,
+      [id],
+    );
+    const list = await listAllHostsForAdmin();
+    const found = list.find((h) => h.row.id === id);
+    assert.equal(found!.placementGateOpen, false);
+  });
+
+  test("last_egress_probe_at > 60s old → gate=false", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:img", "tag");
+    const id = await insertTestHost("host-adm-egress-stale", {
+      status: "ready",
+      loadedImageId: "sha256:img",
+      healthy: true,
+    });
+    await query(
+      `UPDATE compute_hosts
+          SET last_egress_probe_at = NOW() - INTERVAL '120 seconds'
+        WHERE id = $1`,
+      [id],
+    );
+    const list = await listAllHostsForAdmin();
+    const found = list.find((h) => h.row.id === id);
+    assert.equal(found!.placementGateOpen, false);
+  });
+
+  test("status='quarantined' → gate=false 即使其他维度全 OK", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:img", "tag");
+    const id = await insertTestHost("host-adm-q", {
+      status: "quarantined",
+      loadedImageId: "sha256:img",
+      healthy: true,
+    });
+    const list = await listAllHostsForAdmin();
+    const found = list.find((h) => h.row.id === id);
+    assert.ok(found, "quarantined host 仍在 admin 列表里");
+    assert.equal(found!.row.status, "quarantined");
+    assert.equal(found!.placementGateOpen, false);
+  });
+
+  test("60s 边界 — last_uplink_at = NOW() - 60s 在 tx 内调真实 listAllHostsForAdmin 应判 false", async (t) => {
+    if (skipIfNoDb(t)) return;
+    await setDesiredImage("sha256:img", "tag");
+    const id = await insertTestHost("host-adm-60s", {
+      status: "ready",
+      loadedImageId: "sha256:img",
+      healthy: true,
+    });
+    // Postgres NOW() 在同 transaction 内是 stable 的(返 statement_timestamp 上层
+    // = transaction_timestamp)。开 tx → UPDATE 把 last_uplink_at 设为 NOW()-60s →
+    // 在同一 tx 调真实 listAllHostsForAdmin(client),predicate 用的 NOW() 与 UPDATE
+    // 的 NOW() 严格相等,验"= NOW()-60s 不严格 > NOW()-INTERVAL'60s' → 关闭"。
+    const client = await getPool().connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `UPDATE compute_hosts SET last_uplink_at = NOW() - INTERVAL '60 seconds' WHERE id = $1`,
+        [id],
+      );
+      const list = await listAllHostsForAdmin(client);
+      const found = list.find((h) => h.row.id === id);
+      assert.ok(found, "host should still appear in admin list");
+      assert.equal(
+        found!.placementGateOpen,
+        false,
+        "= NOW()-INTERVAL'60s' 不严格 > NOW()-INTERVAL'60s' → 边界应判 false",
+      );
+    } finally {
+      // 即使 assertion throw 也要 ROLLBACK,否则 release 时 tx 还开着会污染连接池
+      try { await client.query("ROLLBACK"); } catch { /* connection 已坏,忽略 */ }
+      client.release();
+    }
   });
 });

@@ -233,6 +233,61 @@ export async function listAllHostsWithCounts(): Promise<SchedulableHost[]> {
   }));
 }
 
+/**
+ * 0042 admin 视图:host + 容器计数 + 全局 desired_image_id + placement gate 判定。
+ *
+ * 单条 SQL 把以下三件事原子化:
+ *   - desired CTE 取 compute_pool_state singleton(desired_image_id)
+ *   - 即时容器计数(同 listAllHostsWithCounts)
+ *   - placement_gate_open = PLACEMENT_GATE_PREDICATE 当布尔表达式 SELECT
+ *
+ * 对应 Codex plan-review:UI 显示的 placement gate 必须跟真实调度路径用**同一份**
+ * predicate / 同一个 statement 的 NOW()/snapshot,JS 侧不重算 fresh window 避免漂移。
+ *
+ * COALESCE(... , FALSE):predicate 的三值逻辑(NULL)未来若被改坏,这里钉死成
+ * boolean 契约不外泄。
+ */
+export interface AdminHostWithGate {
+  row: ComputeHostRow;
+  activeContainers: number;
+  desiredImageId: string | null;
+  placementGateOpen: boolean;
+}
+
+export async function listAllHostsForAdmin(
+  client?: PoolClient,
+): Promise<AdminHostWithGate[]> {
+  const q = client ?? getPool();
+  const r = await q.query<
+    ComputeHostRow & {
+      active_containers: string;
+      desired_image_id_global: string | null;
+      placement_gate_open: boolean;
+    }
+  >(
+    `WITH desired AS (
+        SELECT desired_image_id FROM compute_pool_state WHERE singleton='singleton'
+     )
+     SELECT ${COMPUTE_HOST_COLS},
+            desired.desired_image_id AS desired_image_id_global,
+            COALESCE(
+              (SELECT COUNT(*) FROM agent_containers ac
+                WHERE ac.host_uuid = compute_hosts.id
+                  AND ac.state = 'active'),
+              0
+            )::text AS active_containers,
+            COALESCE((${PLACEMENT_GATE_PREDICATE}), FALSE) AS placement_gate_open
+       FROM compute_hosts, desired
+      ORDER BY created_at ASC`,
+  );
+  return r.rows.map((row) => ({
+    row,
+    activeContainers: Number.parseInt(row.active_containers, 10),
+    desiredImageId: row.desired_image_id_global,
+    placementGateOpen: row.placement_gate_open,
+  }));
+}
+
 export async function countActiveContainersOnHost(
   hostUuid: string,
   client?: PoolClient,

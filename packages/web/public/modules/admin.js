@@ -4920,6 +4920,55 @@ function _hostStatusBadge(status) {
   return `<span class="badge ${cls}">${escapeHtml(status)}</span>`
 }
 
+// 0042: 显示真实 placement gate(后端 SQL 与调度路径同一份 PLACEMENT_GATE_PREDICATE 算出)。
+// status='ready' 不等于真的可调度;loaded_image_id ≠ desired / 任一维度 stale 都会让 gate 关闭。
+// open=true → 绿色 "gate open"
+// open=false → 黄色 "gate closed",tooltip 列出**诊断/可能原因**(不权威 — 真值以后端 predicate 为准)
+function _placementGateChip(h) {
+  if (h.placement_gate_open === true) {
+    return `<span class="chip chip-ok" title="placement gate 通过 — 调度路径会考虑这台 host">gate open</span>`
+  }
+  if (h.placement_gate_open !== false) {
+    // 老后端 / 字段缺失 → 不渲染避免误导
+    return ''
+  }
+  // 拼诊断/可能原因(本地观测 — 与后端 NOW() 可能有秒级偏差,仅供人工 debug)
+  const reasons = []
+  if (h.status !== 'ready') reasons.push(`状态 = ${h.status}(非 ready)`)
+  if (h.desired_image_id == null) reasons.push('desired_image_id 未初始化(pool 还在 warmup?)')
+  else if (h.loaded_image_id == null) reasons.push('loaded_image_id 未上报(node-agent selfprobe 没跑过)')
+  else if (h.loaded_image_id !== h.desired_image_id) {
+    reasons.push(`镜像不一致: loaded=${(h.loaded_image_id || '').slice(0, 19)}… ≠ desired=${(h.desired_image_id || '').slice(0, 19)}…`)
+  }
+  // self host 跳过维度新鲜度 — 仅当 name!=='self' 时检查
+  if (h.name !== 'self') {
+    const nowMs = Date.now()
+    const FRESH_MS = 60 * 1000
+    const checkDim = (label, ok, atIso) => {
+      if (ok === false) reasons.push(`${label} = false`)
+      else if (ok == null) reasons.push(`${label} 未上报`)
+      else if (atIso == null) {
+        // SQL gate 显式要求 last_*_at IS NOT NULL,即使 ok=true 这里也会关闭
+        reasons.push(`${label} timestamp 未上报`)
+      }
+      else {
+        const t = new Date(atIso).getTime()
+        if (Number.isFinite(t) && nowMs - t > FRESH_MS) {
+          const ageS = Math.round((nowMs - t) / 1000)
+          reasons.push(`${label} 过期(${ageS}s 前)`)
+        }
+      }
+    }
+    checkDim('health endpoint', h.last_health_endpoint_ok, h.last_health_poll_at)
+    checkDim('uplink', h.last_uplink_ok, h.last_uplink_at)
+    checkDim('egress', h.last_egress_probe_ok, h.last_egress_probe_at)
+  }
+  const tip = reasons.length > 0
+    ? `诊断/可能原因(以后端为准):\n- ${reasons.join('\n- ')}`
+    : '诊断/可能原因:placement gate 关闭,但客户端无法定位具体维度(后端 predicate 与本地观测可能有秒级偏差)'
+  return `<span class="chip chip-warn" title="${escapeHtml(tip)}">gate closed</span>`
+}
+
 function _certChipForHost(h) {
   if (!h.cert_not_after) return '<span style="color:var(--muted)">—</span>'
   const ms = new Date(h.cert_not_after).getTime() - Date.now()
@@ -5073,7 +5122,7 @@ function _renderHostRow(h) {
     <tr data-host-uuid="${escapeHtml(h.id || '')}">
       <td><strong>${escapeHtml(h.name)}</strong>${isSelf ? ' <small style="color:var(--muted)">(master)</small>' : ''}</td>
       <td class="mono">${escapeHtml(h.host)}:${h.ssh_port}${h.agent_port && h.agent_port !== 9443 ? ` <small style="color:var(--muted)">(agent ${h.agent_port})</small>` : ''}</td>
-      <td>${_hostStatusBadge(h.status)}</td>
+      <td>${_hostStatusBadge(h.status)} ${_placementGateChip(h)}</td>
       <td>${activeCell}</td>
       <td>${_certChipForHost(h)}</td>
       <td>${_expiresChipForHost(h)}</td>

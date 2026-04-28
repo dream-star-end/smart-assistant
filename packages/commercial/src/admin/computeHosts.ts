@@ -62,9 +62,31 @@ export interface ComputeHostView {
   expires_at: string | null;
   created_at: string;
   updated_at: string;
+  /** 0042:host 实际加载的镜像 sha(由 selfprobe 上报)。 */
+  loaded_image_id: string | null;
+  /** 0042:全局 desired image sha(compute_pool_state.desired_image_id)。所有 row 同值。 */
+  desired_image_id: string | null;
+  /** 0042:host 三维 selfprobe 最新结果。null = 还没探过。 */
+  last_health_endpoint_ok: boolean | null;
+  last_uplink_ok: boolean | null;
+  last_egress_probe_ok: boolean | null;
+  last_health_poll_at: string | null;
+  last_uplink_at: string | null;
+  last_egress_probe_at: string | null;
+  /**
+   * 0042:placement gate 是否通过(仅 gate 判定,**不含 capacity**)。
+   * 由 SQL 直接计算(PLACEMENT_GATE_PREDICATE),不在 JS 侧重算 fresh window。
+   * status='ready' 但 placement_gate_open=false 表示真实不可调度。
+   */
+  placement_gate_open: boolean;
 }
 
-function mapRowToView(row: ComputeHostRow, activeContainers: number): ComputeHostView {
+function mapRowToView(
+  row: ComputeHostRow,
+  activeContainers: number,
+  desiredImageId: string | null,
+  placementGateOpen: boolean,
+): ComputeHostView {
   return {
     id: row.id,
     name: row.name,
@@ -87,6 +109,15 @@ function mapRowToView(row: ComputeHostRow, activeContainers: number): ComputeHos
     expires_at: row.expires_at ? row.expires_at.toISOString() : null,
     created_at: row.created_at.toISOString(),
     updated_at: row.updated_at.toISOString(),
+    loaded_image_id: row.loaded_image_id ?? null,
+    desired_image_id: desiredImageId,
+    last_health_endpoint_ok: row.last_health_endpoint_ok ?? null,
+    last_uplink_ok: row.last_uplink_ok ?? null,
+    last_egress_probe_ok: row.last_egress_probe_ok ?? null,
+    last_health_poll_at: row.last_health_poll_at ? row.last_health_poll_at.toISOString() : null,
+    last_uplink_at: row.last_uplink_at ? row.last_uplink_at.toISOString() : null,
+    last_egress_probe_at: row.last_egress_probe_at ? row.last_egress_probe_at.toISOString() : null,
+    placement_gate_open: placementGateOpen,
   };
 }
 
@@ -122,8 +153,10 @@ async function bestEffortAudit(
 // ─── list ────────────────────────────────────────────────────────
 
 export async function listComputeHostsForAdmin(): Promise<ComputeHostView[]> {
-  const hosts = await queries.listAllHostsWithCounts();
-  return hosts.map(({ row, activeContainers }) => mapRowToView(row, activeContainers));
+  const hosts = await queries.listAllHostsForAdmin();
+  return hosts.map(({ row, activeContainers, desiredImageId, placementGateOpen }) =>
+    mapRowToView(row, activeContainers, desiredImageId, placementGateOpen),
+  );
 }
 
 // ─── create ──────────────────────────────────────────────────────
