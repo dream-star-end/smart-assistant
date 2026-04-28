@@ -41,6 +41,7 @@ import { isOutputLineTruncated } from '../../utils/terminal.js';
 import { buildLargeToolResultMessage, ensureToolResultsDir, generatePreview, getToolResultPath, PREVIEW_SIZE_BYTES } from '../../utils/toolResultStorage.js';
 import { userFacingName as fileEditUserFacingName } from '../FileEditTool/UI.js';
 import { trackGitOperations } from '../shared/gitOperationTracking.js';
+import { normalizeBackgroundCommand, normalizeBashInput } from './bashCommandNormalize.js';
 import { bashToolHasPermission, commandHasAnyCd, matchWildcardPattern, permissionRuleExtractPrefix } from './bashPermissions.js';
 import { interpretCommandResult } from './commandSemantics.js';
 import { getDefaultTimeoutMs, getMaxTimeoutMs, getSimplePrompt } from './prompt.js';
@@ -239,7 +240,7 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
 - find . -name "*.tmp" -exec rm {} \\; → "Find and delete all .tmp files recursively"
 - git reset --hard origin/main → "Discard all local changes and match remote main"
 - curl -s url | jq '.data[]' → "Fetch JSON from URL and extract data array elements"`),
-  run_in_background: semanticBoolean(z.boolean().optional()).describe(`Set to true to run this command in the background. Use Read to read the output later.`),
+  run_in_background: semanticBoolean(z.boolean().optional()).describe(`Set to true to run this command in the background. Use Read to read the output later. Do not append a shell '&' to the command — run_in_background already backgrounds the command, and a trailing '&' will make the parent shell exit before tail output is streamed.`),
   dangerouslyDisableSandbox: semanticBoolean(z.boolean().optional()).describe('Set this to true to dangerously override sandbox mode and run commands without sandboxing.'),
   _simulatedSedEdit: z.object({
     filePath: z.string(),
@@ -436,16 +437,16 @@ export const BashTool = buildTool({
     return this.isReadOnly?.(input) ?? false;
   },
   isReadOnly(input) {
-    const compoundCommandHasCd = commandHasAnyCd(input.command);
-    const result = checkReadOnlyConstraints(input, compoundCommandHasCd);
+    const normalized = normalizeBashInput(input);
+    const compoundCommandHasCd = commandHasAnyCd(normalized.command);
+    const result = checkReadOnlyConstraints(normalized, compoundCommandHasCd);
     return result.behavior === 'allow';
   },
   toAutoClassifierInput(input) {
-    return input.command;
+    return normalizeBackgroundCommand(input.command, input.run_in_background);
   },
-  async preparePermissionMatcher({
-    command
-  }) {
+  async preparePermissionMatcher(input) {
+    const { command } = normalizeBashInput(input);
     // Hook `if` filtering is "no match → skip hook" (deny-like semantics), so
     // compound commands must fire the hook if ANY subcommand matches. Without
     // splitting, `ls && git push` would bypass a `Bash(git *)` security hook.
@@ -500,7 +501,7 @@ export const BashTool = buildTool({
     // `new RegExp` per call. userFacingName runs per-render for every bash
     // message in history; with ~50 msgs + one slow-to-tokenize command, this
     // exceeds the shimmer tick → transition abort → infinite retry (#21605).
-    return isEnvTruthy(process.env.CLAUDE_CODE_BASH_SANDBOX_SHOW_INDICATOR) && shouldUseSandbox(input) ? 'SandboxedBash' : 'Bash';
+    return isEnvTruthy(process.env.CLAUDE_CODE_BASH_SANDBOX_SHOW_INDICATOR) && shouldUseSandbox(normalizeBashInput(input)) ? 'SandboxedBash' : 'Bash';
   },
   getToolUseSummary(input) {
     if (!input?.command) {
@@ -538,7 +539,7 @@ export const BashTool = buildTool({
     };
   },
   async checkPermissions(input, context): Promise<PermissionResult> {
-    return bashToolHasPermission(input, context);
+    return bashToolHasPermission(normalizeBashInput(input), context);
   },
   renderToolUseMessage,
   renderToolUseProgressMessage,
@@ -622,12 +623,16 @@ export const BashTool = buildTool({
       is_error: interrupted
     };
   },
-  async call(input: BashToolInput, toolUseContext, _canUseTool?: CanUseToolFn, parentMessage?: AssistantMessage, onProgress?: ToolCallProgress<BashProgress>) {
+  async call(rawInput: BashToolInput, toolUseContext, _canUseTool?: CanUseToolFn, parentMessage?: AssistantMessage, onProgress?: ToolCallProgress<BashProgress>) {
     // Handle simulated sed edit - apply directly instead of running sed
     // This ensures what the user previewed is exactly what gets written
-    if (input._simulatedSedEdit) {
-      return applySedEdit(input._simulatedSedEdit, toolUseContext, parentMessage);
+    if (rawInput._simulatedSedEdit) {
+      return applySedEdit(rawInput._simulatedSedEdit, toolUseContext, parentMessage);
     }
+    // Normalize trailing-`&` for run_in_background:true at the call entry so
+    // every downstream step (runShellCommand → exec, isSilentBashCommand, etc)
+    // operates on the same string we will actually execute.
+    const input = normalizeBashInput(rawInput);
     const {
       abortController,
       getAppState,
@@ -826,7 +831,7 @@ export const BashTool = buildTool({
   }
 } satisfies ToolDef<InputSchema, Out, BashProgress>);
 async function* runShellCommand({
-  input,
+  input: rawInput,
   abortController,
   setAppState,
   setToolJSX,
@@ -855,6 +860,14 @@ async function* runShellCommand({
   taskId?: string;
   timeoutMs?: number;
 }, ExecResult, void> {
+  // When run_in_background:true, strip a trailing shell `&`. The shell `&`
+  // makes the parent bash exit immediately, which triggers detachTail and
+  // stops the TaskOutput poller before any stdout is captured — the SDK
+  // then never emits bash_output_tail and the web client only sees the
+  // background placeholder. run_in_background already daemonizes via
+  // spawnShellTask, so the trailing `&` is redundant. See
+  // bashCommandNormalize.ts for the conservatism rationale.
+  const input = normalizeBashInput(rawInput);
   const {
     command,
     description,
