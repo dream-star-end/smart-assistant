@@ -14,7 +14,7 @@ import {
 import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=bc16fc8'
 import { toast } from './ui.js?v=bc16fc8'
 import { msgTimeLabel, shortTime } from './util.js?v=bc16fc8'
-import { safeWsSend } from './websocket.js?v=bc16fc8'
+import { safeWsSend, _resetTurnBillingState } from './websocket.js?v=bc16fc8'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
@@ -1449,6 +1449,9 @@ export function _buildMessageEl(msg) {
         }
         if (_regenSentNow) {
           sess._sendingInFlight = true
+          // 新 turn 开始(regen 路径):清跨 turn cost-charged 归因状态。
+          // 跟普通 send 路径(websocket.js:541)对齐。
+          _resetTurnBillingState(sess, 'regen-start')
           // Clear any leftover regen timer from a previous regen/stop cycle
           if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
           sess._regenSafetyTimer = setTimeout(() => {

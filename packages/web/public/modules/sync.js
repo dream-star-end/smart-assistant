@@ -454,7 +454,7 @@ export async function syncSessionsFromServer() {
  */
 export function pushSessionToServer(sess) {
   if (!sess?.id || !state.token) return Promise.resolve()
-  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, ...clean } = sess
+  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, ...clean } = sess
   // Include baseSyncedAt for optimistic concurrency — server rejects if row is newer
   clean._baseSyncedAt = _syncedAt || 0
   const preFlightLastAt = sess.lastAt // snapshot BEFORE PUT for 409 conflict detection

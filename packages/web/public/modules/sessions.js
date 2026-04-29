@@ -291,7 +291,7 @@ async function _doSave(sess) {
   // _turnStartedAt, _lastFrameAt) is intentionally PRESERVED so a page
   // refresh can restore the in-flight UI and correctly signal inFlight=true
   // in the next hello frame. Staleness is handled at load time.
-  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, ...persist } = sess
+  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, ...persist } = sess
   // Expose a dbPut-only checkpoint promise to deleteSession(). Registered
   // BEFORE awaiting dbPut so a concurrent deleteSession() synchronously sees
   // an in-flight local write and can await it before calling dbDelete().

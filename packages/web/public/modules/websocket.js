@@ -539,6 +539,11 @@ function _drainNextOfflineItem() {
       updateMsgStatus(msg)
     }
     sess._sendingInFlight = true
+    // 新 turn 开始:防御性清理上一 turn 的 cost-charged 归因状态。
+    // 串行性保证此处 pending 应该是 0(上一 turn isFinal 已 drain),非 0
+    // 说明上一 turn 的 cost_charged 在 isFinal 之后还有遗漏 —— 概率极低,
+    // 但带进新 turn 会被 isFinal drain 误算到新 turn 头上,所以丢并打 warn。
+    _resetTurnBillingState(sess, 'turn-start')
     _resetThinkingSafety(sess.id)
     if (sess.id === state.currentSessionId) {
       state.sendingInFlight = true
@@ -1818,7 +1823,33 @@ export function handleOutbound(frame) {
       // 容器口径的 $0.xxxx 改写成真实扣费积分再 re-format。没有这一手,cost_charged
       // 只能拿到它自己的 costCredits 但丢掉 in/out/cache 字段。
       sess._streamingAssistant._rawMeta = { ...frame.meta }
-      setMeta(sess, sess._streamingAssistant, metaText)
+      // ── 早到 cost_charged 的 drain ──
+      // anthropicProxy.commit 在 pipeStream 完成后立即 broadcast cost_charged,
+      // 而 gateway 的 isFinal 还要等 CCB 处理 result、emit message_stop。多 API
+      // 调用 turn 里,前几次的 cost_charged 几乎一定**早于** 本帧到达,
+      // handleCostCharged 找不到 target(_rawMeta 还没设)只能 enqueue。这里把
+      // 累加的 pending 总和塞进 costCredits,formatMeta 后续看到字段存在就会
+      // 显示真实积分而不是 $0.xxxx 估算。
+      // _pendingCostCredits 是字符串("0" 或正整数串),不是 BigInt:sync.js
+      // 持久化 stringify 不会序列化 BigInt。
+      try {
+        const pending = BigInt(sess._pendingCostCredits || '0')
+        if (pending > 0n) {
+          sess._streamingAssistant._rawMeta.costCredits = pending.toString()
+          sess._pendingCostCredits = '0'
+        }
+      } catch {
+        console.warn('[billing] _pendingCostCredits poisoned at isFinal drain', {
+          sess: sess.id,
+          val: sess._pendingCostCredits,
+        })
+        sess._pendingCostCredits = '0'
+      }
+      setMeta(sess, sess._streamingAssistant, formatMeta(sess._streamingAssistant._rawMeta))
+      // 锚定本 turn assistant id,让 isFinal 后晚到的 cost_charged 能找回来。
+      // 60s TTL(handleCostCharged 内判定),防止久远孤儿帧贴到无关消息。
+      sess._lastFinaledAssistantId = sess._streamingAssistant.id
+      sess._lastFinaledAt = Date.now()
     }
     // Accumulate token usage for session-level tracking
     if (frame.meta) {
@@ -2031,77 +2062,150 @@ function handleResumeFailed(frame) {
   })
 }
 
+// 新 turn 开始时清掉跨 turn 的 cost-charged 归因状态(被 ACK 路径和
+// regen 路径共享调用)。导出给 messages.js 的 regen 路径用,所以 export。
+//
+// 注意 _pendingCostCredits 是字符串("0" 或正整数十进制串),不是 BigInt:
+// session 对象会被 sync.js / IndexedDB 序列化,JSON.stringify 不支持 BigInt
+// (会直接抛 TypeError)。所有读写都走字符串 ↔ BigInt 转换。
+export function _resetTurnBillingState(sess, reason) {
+  let stale = 0n
+  try { stale = BigInt(sess._pendingCostCredits || '0') } catch {}
+  if (stale > 0n) {
+    console.warn('[billing] stale pending costCredits dropped at ' + reason, {
+      sess: sess.id,
+      pending: stale.toString(),
+    })
+  }
+  sess._pendingCostCredits = '0'
+  sess._lastFinaledAssistantId = null
+  sess._lastFinaledAt = 0
+}
+
 // ═══════════════ COST CHARGED (commercial v3 only) ═══════════════
 // 商用版专用帧:anthropicProxy 在 finalize.commit 成功扣费后广播给前端。
-// 规则:
-//   1) 后端 frame.sessionId 非空 → 只在该 session 里找目标。若前端没这个 session
-//      (已被 gc / 用户刚删),candidates 为空,走下面的 refreshBalance 兜底,
-//      **绝不回退扫其他 session**,避免把后台扣费错贴到前台消息。
-//   2) sessionId 为空(容器侧漏传 metadata.session_id)→ 回退到"当前会话优先
-//      + 其他按 lastAt 降序"的全局扫描。
-//   3) 目标 = 从消息尾部往前,**第一条已设 _rawMeta 且 costCredits 仍未填** 的
-//      assistant 消息。前端不记 per-message requestId,只能用这个 marker 兜底,
-//      误差上限 = 1 turn。
+//
+// **不走 frameSeq dedupe** —— 帧本身不会被重发:anthropicProxy.commit
+// 单次 broadcastToUser,不持久化到 outboundRing(那是 outbound.message 专用),
+// reconnect 不重放,后端 ledger journal 保证同 requestId 不重复 commit/广播。
+// 如果将来给 cost_charged 加 WS replay,本路径累加会变成双倍,需要先加 dedupe。
+//
+// 归因规则(2026-04-29 重写,Codex 双审通过):
+//
+//   Session 选择 — 严格,不跨会话:
+//     1) frame.sessionId 命中前端持有的 session → 用它
+//     2) 没 sessionId 时退到 currentSession
+//     3) 都不在 → 只 refreshBalance,丢弃展示更新
+//      (旧版的"按 lastAt 全局扫"已删除:跨 session 错贴风险 > 显示美元代价)
+//
+//   target 选择 — 只匹配本 turn:
+//     1) sess._streamingAssistant 存在 → 用它(turn 进行中或 isFinal 处理过程中)
+//     2) sess._streamingAssistant=null + 60s 内 _lastFinaledAssistantId 命中
+//        → 用该 id 对应消息(turn 刚 final 完晚到的 cost_charged)
+//     3) 都不命中 → 只 refreshBalance,丢弃展示更新
+//      (旧版的"扫历史最近一条带 _rawMeta 的 assistant"已删除:会把下一 turn
+//      早到的 cost_charged 错贴到上一 turn,Codex 抓的归因黑洞)
+//
+//   action — 累加而不是覆盖(治多 API 调用 turn):
+//     - target 有 _rawMeta:BigInt 累加到 costCredits
+//     - target 无 _rawMeta(turn 进行中,isFinal 还没到):enqueue 到
+//       sess._pendingCostCredits,等 isFinal 时 drain
+//
+// 跨 turn 状态(_lastFinaledAssistantId / _lastFinaledAt / _pendingCostCredits)
+// 在新 turn 开始时(websocket.js:541 ACK 路径 + messages.js:1451 regen 路径)
+// 主动清零,防止跨 turn 污染。
+const COST_CHARGED_LAST_FINAL_TTL_MS = 60_000
 function handleCostCharged(frame) {
   const sid = typeof frame.sessionId === 'string' && frame.sessionId.length > 0
     ? frame.sessionId
     : null
 
-  // 选候选会话:sessionId 命中时只它一个;否则走全局扫描。
-  const candidates = []
-  if (sid) {
-    const s = state.sessions.get(sid)
-    if (s) candidates.push(s)
-    // sessionId 给了但前端没这个 session(极罕见:后端推得比 session.created 还早,
-    // 或者 session 已被前端 gc) → candidates 为空,往下直接落到 refreshBalance 兜底。
-  } else {
-    if (state.currentSessionId) {
-      const cur = state.sessions.get(state.currentSessionId)
-      if (cur) candidates.push(cur)
-    }
-    const others = []
-    for (const s of state.sessions.values()) {
-      if (state.currentSessionId && s.id === state.currentSessionId) continue
-      others.push(s)
-    }
-    others.sort((a, b) => (b.lastAt ?? 0) - (a.lastAt ?? 0))
-    candidates.push(...others)
-  }
-
-  let target = null
-  let targetSess = null
-  for (const sess of candidates) {
-    const msgs = sess.messages || []
-    // 从尾往前找最近一条已设 _rawMeta 且还没打上 costCredits 的 assistant
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i]
-      if (m.role !== 'assistant') continue
-      if (!m._rawMeta) continue
-      if (m._rawMeta.costCredits !== undefined) continue
-      target = m
-      targetSess = sess
-      break
-    }
-    if (target) break
-  }
-
-  if (!target) {
-    // 没候选:可能是 cost_charged 先于 turn-end 到达(极罕见,LLM 链路响应比扣费
-    // 路径快得多),也可能是纯 tool-only turn 没出文本消息。静默丢弃,用户仍能
-    // 通过 refreshBalance 看到余额变化。
-    if (typeof frame.balanceAfter === 'string' || typeof frame.balanceAfter === 'number') {
+  let sess = null
+  if (sid) sess = state.sessions.get(sid) || null
+  else if (state.currentSessionId) sess = state.sessions.get(state.currentSessionId) || null
+  if (!sess) {
+    if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) {
       try { refreshBalance() } catch {}
     }
     return
   }
 
-  target._rawMeta.costCredits = frame.costCredits
-  const metaText = formatMeta(target._rawMeta)
-  setMeta(targetSess, target, metaText)
+  let target = null
+  if (sess._streamingAssistant) {
+    target = sess._streamingAssistant
+  } else if (
+    sess._lastFinaledAssistantId &&
+    sess._lastFinaledAt &&
+    Date.now() - sess._lastFinaledAt < COST_CHARGED_LAST_FINAL_TTL_MS
+  ) {
+    target = (sess.messages || []).find((m) => m.id === sess._lastFinaledAssistantId) || null
+  }
 
-  // 同步刷新左上角余额气泡 —— 服务端已写 DB,刷 /api/me 拿到的就是 balanceAfter。
-  // 传了 balanceAfter 的就直接乐观更新,避开一次 round-trip。
-  try { refreshBalance() } catch {}
+  // 解析 frame.costCredits → BigInt(协议是数字串,但要防御非法值)
+  let add = null
+  try {
+    const parsed = BigInt(frame.costCredits)
+    if (parsed < 0n) {
+      console.warn('[billing] negative costCredits dropped', frame.costCredits)
+    } else {
+      add = parsed
+    }
+  } catch {
+    console.warn('[billing] invalid costCredits (not a bigint string)', frame.costCredits)
+  }
+
+  // target 不存在 — drop 展示更新,只 refreshBalance。
+  // 这覆盖两类:
+  //   (a) 没 active turn(_streamingAssistant=null 且 lastFinal 过期):cost_charged
+  //       不知道贴哪条消息,enqueue 会被下一 turn 的 isFinal drain 错算
+  //   (b) tool-only turn 没产出 text,_streamingAssistant 始终为 null
+  if (!target) {
+    if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) {
+      try { refreshBalance() } catch {}
+    }
+    return
+  }
+
+  // target 存在但还没 _rawMeta — turn 进行中且 isFinal 还没到。
+  // 这只可能在 _streamingAssistant 路径(lastFinal 命中的 target 必有 _rawMeta)。
+  // enqueue 到 _pendingCostCredits,等 isFinal 时 drain。
+  if (!target._rawMeta) {
+    if (add !== null) {
+      try {
+        const cur = BigInt(sess._pendingCostCredits || '0')
+        sess._pendingCostCredits = (cur + add).toString()
+      } catch {
+        // pending 字段被外部污染成非数字串(理论不发生),重置后用本帧值起步
+        sess._pendingCostCredits = add.toString()
+      }
+    }
+    if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) {
+      try { refreshBalance() } catch {}
+    }
+    return
+  }
+
+  // target 命中且有 _rawMeta — 累加 costCredits,re-format meta。
+  // 多 API 调用 turn 内多次 cost_charged 都进这里,逐次累加得到总扣费。
+  if (add !== null) {
+    let cur = 0n
+    if (target._rawMeta.costCredits !== undefined && target._rawMeta.costCredits !== null) {
+      try {
+        cur = BigInt(target._rawMeta.costCredits)
+      } catch {
+        console.warn('[billing] target costCredits poisoned, restarting from 0', {
+          sess: sess.id,
+          val: target._rawMeta.costCredits,
+        })
+      }
+    }
+    target._rawMeta.costCredits = (cur + add).toString()
+    setMeta(sess, target, formatMeta(target._rawMeta))
+  }
+  // 同步刷新左上角余额气泡 —— 不被解析失败吞掉,balance 是单独字段。
+  if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) {
+    try { refreshBalance() } catch {}
+  }
 }
 
 // P1-3 — outbound.error 处理。
