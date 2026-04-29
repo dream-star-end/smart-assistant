@@ -1,8 +1,8 @@
-import { apiGet, apiJson } from './api.js?v=bc16fc8'
+import { apiGet, apiJson } from './api.js?v=d167eba'
 // OpenClaude — Scheduled Tasks
-import { $, htmlSafeEscape } from './dom.js?v=bc16fc8'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=bc16fc8'
-import { _cronHuman, shortTime } from './util.js?v=bc16fc8'
+import { $, htmlSafeEscape } from './dom.js?v=d167eba'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=d167eba'
+import { _cronHuman, shortTime } from './util.js?v=d167eba'
 
 let _currentTasksTab = 'cron'
 
