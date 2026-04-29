@@ -36,6 +36,7 @@ const COMPUTE_HOST_COLS = `
   last_health_endpoint_ok, last_health_poll_at,
   last_uplink_ok, last_uplink_at,
   last_egress_probe_ok, last_egress_probe_at,
+  disk_pct, mem_pct, load1, cpu_count, metrics_at,
   created_at, updated_at
 `;
 

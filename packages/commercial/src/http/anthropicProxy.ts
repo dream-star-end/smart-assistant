@@ -88,6 +88,7 @@ import {
   incrPrecheckCapped,
   type ProxyRejectReason,
 } from "../admin/metrics.js";
+import { recordHostRequest } from "../compute-pool/hostReqCounter.js";
 
 // ─── 常量 ──────────────────────────────────────────────────────────────────
 
@@ -1252,6 +1253,10 @@ export function makeAnthropicProxyHandler(
     const uid = BigInt(identity.userId);
     const containerIdBig = BigInt(identity.containerId);
     const userLog = reqLog.child({ uid: uid.toString(), containerId: containerIdBig.toString() });
+
+    // 0045 — admin "5min req" 计数器 hook 点。**仅**统计身份双因子通过的
+    // /v1/messages,排除 health probe / WS / 后台任务,反映真实 LLM 流量。
+    recordHostRequest(ctx.hostUuid);
 
     // 2) 限流(per-uid 滑动固定窗口)
     try {

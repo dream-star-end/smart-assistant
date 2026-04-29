@@ -136,6 +136,15 @@ export interface ComputeHostRow {
   last_uplink_at: Date | null;
   last_egress_probe_ok: boolean | null;
   last_egress_probe_at: Date | null;
+  /**
+   * 0045 — host 系统层指标(每 5min 采集一次,all-or-nothing)。
+   * 全部为展示用,不参与调度。NULL = 从未采集成功 / 失败一次不覆盖旧值。
+   */
+  disk_pct: number | null;
+  mem_pct: number | null;
+  load1: string | null; // pg NUMERIC → string,JS 端解析为 float
+  cpu_count: number | null;
+  metrics_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -175,6 +184,12 @@ export interface ComputeHost {
   lastUplinkAt: string | null;
   lastEgressProbeOk: boolean | null;
   lastEgressProbeAt: string | null;
+  /** 0045: 主机层 metrics(NULL = 从未采集成功)。 */
+  diskPct: number | null;
+  memPct: number | null;
+  load1: number | null;
+  cpuCount: number | null;
+  metricsAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -379,6 +394,11 @@ export function mapRowToHost(row: ComputeHostRow): ComputeHost {
     lastUplinkAt: row.last_uplink_at ? row.last_uplink_at.toISOString() : null,
     lastEgressProbeOk: row.last_egress_probe_ok,
     lastEgressProbeAt: row.last_egress_probe_at ? row.last_egress_probe_at.toISOString() : null,
+    diskPct: row.disk_pct,
+    memPct: row.mem_pct,
+    load1: row.load1 !== null ? Number(row.load1) : null,
+    cpuCount: row.cpu_count,
+    metricsAt: row.metrics_at ? row.metrics_at.toISOString() : null,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   };

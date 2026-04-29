@@ -79,6 +79,17 @@ export interface ComputeHostView {
    * status='ready' 但 placement_gate_open=false 表示真实不可调度。
    */
   placement_gate_open: boolean;
+  /**
+   * 0045:主机系统层 metrics(每 5min 采集)。NULL = 从未采集成功。
+   * `req_5m` 不入库,由 admin API 在 response 时合 in-memory 计数器。
+   * 语义见 hostReqCounter.ts:仅统计上行 /v1/messages 请求数。
+   */
+  disk_pct: number | null;
+  mem_pct: number | null;
+  load1: number | null;
+  cpu_count: number | null;
+  metrics_at: string | null;
+  req_5m: number;
 }
 
 function mapRowToView(
@@ -86,6 +97,7 @@ function mapRowToView(
   activeContainers: number,
   desiredImageId: string | null,
   placementGateOpen: boolean,
+  req5m: number,
 ): ComputeHostView {
   return {
     id: row.id,
@@ -118,6 +130,12 @@ function mapRowToView(
     last_uplink_at: row.last_uplink_at ? row.last_uplink_at.toISOString() : null,
     last_egress_probe_at: row.last_egress_probe_at ? row.last_egress_probe_at.toISOString() : null,
     placement_gate_open: placementGateOpen,
+    disk_pct: row.disk_pct,
+    mem_pct: row.mem_pct,
+    load1: row.load1 !== null ? Number(row.load1) : null,
+    cpu_count: row.cpu_count,
+    metrics_at: row.metrics_at ? row.metrics_at.toISOString() : null,
+    req_5m: req5m,
   };
 }
 
@@ -154,8 +172,11 @@ async function bestEffortAudit(
 
 export async function listComputeHostsForAdmin(): Promise<ComputeHostView[]> {
   const hosts = await queries.listAllHostsForAdmin();
+  // 0045:in-memory 5min 滑动窗口计数器(/v1/messages 上行请求,见 hostReqCounter.ts)。
+  // 仅在 admin response 时合并,不入库。
+  const { getHostReqCount5m } = await import("../compute-pool/hostReqCounter.js");
   return hosts.map(({ row, activeContainers, desiredImageId, placementGateOpen }) =>
-    mapRowToView(row, activeContainers, desiredImageId, placementGateOpen),
+    mapRowToView(row, activeContainers, desiredImageId, placementGateOpen, getHostReqCount5m(row.id)),
   );
 }
 

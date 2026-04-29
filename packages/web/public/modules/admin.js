@@ -5042,6 +5042,7 @@ function _renderHostsTable() {
           <th>host:port</th>
           <th>状态</th>
           <th class="num">active / max</th>
+          <th title="磁盘 / 内存 / load1 (1min) / 5min 请求数 — 每 5min 采集一次">资源</th>
           <th>cert 到期</th>
           <th>VPS 到期</th>
           <th>最近健康</th>
@@ -5124,6 +5125,7 @@ function _renderHostRow(h) {
       <td class="mono">${escapeHtml(h.host)}:${h.ssh_port}${h.agent_port && h.agent_port !== 9443 ? ` <small style="color:var(--muted)">(agent ${h.agent_port})</small>` : ''}</td>
       <td>${_hostStatusBadge(h.status)} ${_placementGateChip(h)}</td>
       <td>${activeCell}</td>
+      <td>${_metricsCellForHost(h)}</td>
       <td>${_certChipForHost(h)}</td>
       <td>${_expiresChipForHost(h)}</td>
       <td>${healthChip}${healthCounter}</td>
@@ -5131,6 +5133,45 @@ function _renderHostRow(h) {
       <td class="actions">${btns.join(' ')}</td>
     </tr>
   `
+}
+
+// 0045 — 主机系统层资源 cell。4 chip 紧凑横排:磁盘 / 内存 / load / 5min req。
+// metrics_at 为 null 或 > 10min 旧时整行灰化并加 stale tag。
+//
+// 阈值与 alerts_disk_high_warn_pct/critical_pct (默认 85/95) 对齐,UX 一致性:
+// 用户看到 84% 行黄色 = 没收到告警;88% 行黄色 = 已发 warn 告警。
+function _metricsCellForHost(h) {
+  const STALE_MS = 10 * 60 * 1000
+  const now = Date.now()
+  const at = h.metrics_at ? Date.parse(h.metrics_at) : NaN
+  const isStale = !Number.isFinite(at) || (now - at) > STALE_MS
+
+  const pctChip = (label, val, warnPct, critPct) => {
+    if (val === null || val === undefined) return `<span class="chip" style="background:transparent;color:var(--muted);padding:0 4px">${label}—</span>`
+    let cls = 'chip-ok'
+    if (val >= critPct) cls = 'chip-danger'
+    else if (val >= warnPct) cls = 'chip-warn'
+    return `<span class="chip ${cls}" style="padding:0 6px" title="${label} ${val}%">${label}${val}%</span>`
+  }
+  const loadChip = () => {
+    if (h.load1 === null || h.load1 === undefined) return '<span class="chip" style="background:transparent;color:var(--muted);padding:0 4px">load—</span>'
+    const cpu = (h.cpu_count | 0) || 1
+    const ratio = h.load1 / cpu
+    let cls = 'chip-ok'
+    if (ratio >= 1.5) cls = 'chip-danger'
+    else if (ratio >= 1.0) cls = 'chip-warn'
+    const loadStr = Number(h.load1).toFixed(2)
+    return `<span class="chip ${cls}" style="padding:0 6px" title="load1=${loadStr} / ${cpu} cpu = ${ratio.toFixed(2)}/cpu">L${loadStr}</span>`
+  }
+  const reqChip = () => {
+    const n = h.req_5m | 0
+    return `<span class="chip" style="padding:0 6px;background:var(--panel-2);color:var(--fg)" title="过去 5 分钟内 /v1/messages 请求数(in-memory 计数器)">${n} req</span>`
+  }
+  const stale = isStale
+    ? '<small style="color:var(--muted);margin-left:6px" title="metrics 未更新或超过 10 分钟未刷新 — 等下一轮 5min tick">stale</small>'
+    : ''
+  const opacity = isStale ? 'opacity:0.55;' : ''
+  return `<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;${opacity}">${pctChip('D', h.disk_pct, 85, 95)}${pctChip('M', h.mem_pct, 85, 95)}${loadChip()}${reqChip()}${stale}</div>`
 }
 
 // ─── Hosts: add modal ────────────────────────────────────────────────
