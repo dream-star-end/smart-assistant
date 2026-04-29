@@ -256,9 +256,12 @@ function _resetTurnstileFor(mode) {
 // Ensures a widget exists in the given container; returns getResponseFn.
 async function _mountWidget(container) {
   const cfg = await loadPublicConfig()
-  // bypass mode: no widget, return fixed token
+  // bypass mode: no widget, hide the slot entirely (.login-turnstile has
+  // min-height:65px + margin → 即使 innerHTML='' 也会留 65px 空白,所以用
+  // hidden 整块隐藏,后端 bypass 路径不变。
   if (cfg.turnstile_bypass || !cfg.turnstile_site_key) {
-    container.innerHTML = '<div style="color:var(--fg-muted);font-size:var(--text-xs)">[turnstile bypass]</div>'
+    container.innerHTML = ''
+    container.hidden = true
     return () => 'bypass'
   }
   // 必须先查 existing,再决定要不要写 placeholder —— 之前 render 过的话,
@@ -276,6 +279,9 @@ async function _mountWidget(container) {
   // 首次 mount 才走 placeholder + script load + render 路径。
   // CF challenges.cloudflare.com 可能慢或被墙;空 div 看起来像坏了,所以放
   // placeholder。render() 成功时下面的 innerHTML='' 会覆盖它。
+  // 对偶恢复:若先前在 bypass 分支被 hidden,这里要 unhide,否则 turnstile.render
+  // 进 0×0 容器会静默失败。
+  container.hidden = false
   container.innerHTML = '<div class="muted" style="font-size:var(--text-xs);padding:8px 0">正在加载人机验证…</div>'
   try {
     await _loadTurnstileScript()
