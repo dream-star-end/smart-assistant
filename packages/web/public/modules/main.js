@@ -110,6 +110,7 @@ import {
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
 import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=24725e3'
+import { startInbox, stopInbox } from './inbox.js?v=auto'
 import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=24725e3'
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js?v=24725e3'
@@ -1239,6 +1240,8 @@ async function _forceLogout({ serverLogout, broadcast = Boolean(serverLogout) } 
   // 2026-04-26 v1.0.4 — 同样清 user prefs 缓存,避免下个用户读到上个用户的
   // default_model / default_effort,导致 sendMessage 帧带错 model id。
   clearUserPrefsCache()
+  // 站内信 polling / 铃铛在登出后停掉,避免下一身份冷启动时短暂看到上一身份未读。
+  stopInbox()
   state.token = '' // Clear token BEFORE close so onclose handler won't auto-reconnect
   state.refreshToken = ''
   state.tokenExp = 0
@@ -2015,7 +2018,9 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
   connect()
   reloadAgents()
   loadChangelog()
-  refreshBalance().catch(() => {})
+  refreshBalance()
+    .then((r) => { if (r?.shown) startInbox(); else stopInbox() })
+    .catch(() => {})
   syncSessionsFromServer()
     .then((result) => {
       const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
@@ -2566,7 +2571,9 @@ async function init() {
     connect()
     reloadAgents()
     loadChangelog()
-    refreshBalance().catch(() => {})
+    refreshBalance()
+      .then((r) => { if (r?.shown) startInbox(); else stopInbox() })
+      .catch(() => {})
     // Cross-device sync: pull sessions from server in background
     syncSessionsFromServer()
       .then((result) => {

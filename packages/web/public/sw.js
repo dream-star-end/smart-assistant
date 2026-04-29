@@ -44,6 +44,7 @@ const SHELL = [
   '/modules/websocket.js',
   '/modules/commands.js',
   '/modules/wechat.js',
+  '/modules/inbox.js',
   '/modules/export-docx.js',
   '/modules/export-tex.js',
   // Vendored dependencies

@@ -44,6 +44,10 @@ import {
   handleCreateSession,
   handleClearSession,
   handleSubmitFeedback,
+  handleListMyInbox,
+  handleCountMyInboxUnread,
+  handleMarkInboxRead,
+  handleReadAllInbox,
   type CommercialHttpDeps,
   type RequestContext,
 } from './handlers.js'
@@ -99,6 +103,9 @@ import {
   handleAdminGetOrder,
   handleAdminListFeedback,
   handleAdminAckFeedback,
+  handleAdminListInbox,
+  handleAdminCreateInbox,
+  handleAdminDeleteInbox,
 } from './admin.js'
 import {
   handleAdminStatsDau,
@@ -620,6 +627,23 @@ export function createCommercialHandler(
     // P1-2 反馈 admin —— GET 列表 / POST :id/ack
     { method: 'GET', path: '/api/admin/feedback', handler: handleAdminListFeedback },
     { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminAckFeedback },
+    // 站内信(in-app messages)用户侧
+    //   GET  /api/me/messages                    → 列表 + unread_count
+    //   GET  /api/me/messages/unread_count       → 仅 unread_count(polling 用)
+    //   POST /api/me/messages/:id/read           → 标记单条已读(handler 自己 regex 抠 :id)
+    //   POST /api/me/messages/read_all           → 一次清完
+    //   exact 排在 pathPrefix 前(matchRoute exact-first),:id/read 走 prefix 兜底
+    { method: 'GET', path: '/api/me/messages', handler: handleListMyInbox },
+    { method: 'GET', path: '/api/me/messages/unread_count', handler: handleCountMyInboxUnread },
+    { method: 'POST', path: '/api/me/messages/read_all', handler: handleReadAllInbox },
+    { method: 'POST', pathPrefix: '/api/me/messages/', handler: handleMarkInboxRead },
+    // 站内信 admin 侧
+    //   GET    /api/admin/messages          → 列表(只读 requireAdmin)
+    //   POST   /api/admin/messages          → 创建(requireAdminVerifyDb)
+    //   DELETE /api/admin/messages/:id      → 删除(requireAdminVerifyDb)
+    { method: 'GET', path: '/api/admin/messages', handler: handleAdminListInbox },
+    { method: 'POST', path: '/api/admin/messages', handler: handleAdminCreateInbox },
+    { method: 'DELETE', pathPrefix: '/api/admin/messages/', handler: handleAdminDeleteInbox },
   ]
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [

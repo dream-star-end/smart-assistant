@@ -1274,5 +1274,110 @@ export async function handleSubmitFeedback(
   sendJson(res, 200, { ok: true, id: r.id });
 }
 
+// ─── /api/me/messages — 站内信(in-app inbox)用户侧 ────────────────────
+//
+// 鉴权:`requireAuth`(JWT only,不查 DB role/status)— 与 /api/me/preferences /
+// /api/me/usage 同档。banned 但 access JWT 未到期的用户读自己 inbox 不属于业务
+// 风险(读不出别人的、写不动表;reads 表幂等 ON CONFLICT DO NOTHING)。
+//
+// 路由:
+//   GET  /api/me/messages?unread_only=0|1&limit=20&offset=0  → 列表 + unread_count
+//   GET  /api/me/messages/unread_count                       → 仅 unread_count(polling 用)
+//   POST /api/me/messages/:id/read                           → 标记已读(幂等)
+//   POST /api/me/messages/read_all                           → 一次清所有未读
+//
+// 错误:不可见 / 不存在 → 404 NOT_FOUND;参数非法 → 400 VALIDATION。
+
+function parseInboxLimit(raw: string | null): number | undefined {
+  if (raw === null || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 100) {
+    throw new HttpError(400, "VALIDATION", "limit must be integer in [1,100]", {
+      issues: [{ path: "limit", message: raw }],
+    });
+  }
+  return n;
+}
+
+function parseInboxOffset(raw: string | null): number | undefined {
+  if (raw === null || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 1_000_000) {
+    throw new HttpError(400, "VALIDATION", "offset must be non-negative integer", {
+      issues: [{ path: "offset", message: raw }],
+    });
+  }
+  return n;
+}
+
+export async function handleListMyInbox(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+  const unreadOnlyRaw = sp.get("unread_only");
+  const unreadOnly = unreadOnlyRaw === "1" || unreadOnlyRaw === "true";
+  const limit = parseInboxLimit(sp.get("limit"));
+  const offset = parseInboxOffset(sp.get("offset"));
+
+  const { listMyInbox } = await import("../inbox/inbox.js");
+  const r = await listMyInbox({ userId: user.id, unreadOnly, limit, offset });
+  sendJson(res, 200, r);
+}
+
+export async function handleCountMyInboxUnread(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const { countMyUnread } = await import("../inbox/inbox.js");
+  const n = await countMyUnread(user.id);
+  sendJson(res, 200, { unread_count: n });
+}
+
+export async function handleMarkInboxRead(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  // /api/me/messages/:id/read
+  const m = url.pathname.match(/^\/api\/me\/messages\/([1-9][0-9]{0,19})\/read$/);
+  if (!m) {
+    throw new HttpError(404, "NOT_FOUND", "expected /api/me/messages/:id/read");
+  }
+  const id = m[1]!;
+  const { markRead, InboxError } = await import("../inbox/inbox.js");
+  try {
+    const r = await markRead(user.id, id);
+    sendJson(res, 200, { ok: true, already: r.already });
+  } catch (err) {
+    if (err instanceof InboxError && err.code === "NOT_FOUND") {
+      throw new HttpError(404, "NOT_FOUND", err.message);
+    }
+    throw err;
+  }
+}
+
+export async function handleReadAllInbox(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const { readAll } = await import("../inbox/inbox.js");
+  const r = await readAll(user.id);
+  sendJson(res, 200, { ok: true, inserted: r.inserted });
+}
+
 // helper for tests / 其他 module
 export { clientIpOf, userAgentOf };

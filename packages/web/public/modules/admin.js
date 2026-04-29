@@ -332,6 +332,7 @@ const TABS = {
   pricing: renderPricingTab,
   plans: renderPlansTab,
   feedback: renderFeedbackTab,
+  inbox: renderInboxTab,
   settings: renderSettingsTab,
   audit: renderAuditTab,
   health: renderHealthTab,
@@ -3303,6 +3304,240 @@ function openFeedbackDetailModal(r) {
       }
     })
   }
+}
+
+// ─── Tab: 站内信(in-app inbox)─────────────────────────────────────
+//
+// 端点(已审计 admin_audit:inbox.create / inbox.delete):
+//   GET    /api/admin/messages?limit=20&offset=0     → { messages, total }
+//   POST   /api/admin/messages  body=...             → 201 { message }
+//   DELETE /api/admin/messages/:id                   → 200 { deleted: true }
+//
+// 表单字段:audience (all|user) / user_id (audience=user 必填) / title /
+//   body_md (Markdown) / level (info|notice|promo|warning) / expires_at (可选)
+//
+// 列表默认 50 条,本 MVP 不做分页(发送频次低,日均 < 10);超过 50 条
+// 再补 limit/offset toolbar。delete 是硬删,reads CASCADE 自动清。
+
+const INBOX_LEVELS = ['info', 'notice', 'promo', 'warning']
+const INBOX_LEVEL_LABELS = {
+  info: '普通',
+  notice: '通知',
+  promo: '运营',
+  warning: '警告',
+}
+
+async function renderInboxTab() {
+  view().innerHTML = `
+    <div class="panel">
+      <h2>新建站内信 <small>admin 写入 → 用户铃铛实时拉取</small></h2>
+      <div class="form-row">
+        <label>收件范围</label>
+        <select id="im-audience">
+          <option value="all">全员广播</option>
+          <option value="user">单个用户</option>
+        </select>
+      </div>
+      <div class="form-row" id="im-user-row" style="display:none">
+        <label>user_id</label>
+        <input type="text" id="im-user-id" placeholder="例如 1234" inputmode="numeric" />
+      </div>
+      <div class="form-row">
+        <label>标题</label>
+        <input type="text" id="im-title" maxlength="200" placeholder="≤200 字" />
+      </div>
+      <div class="form-row">
+        <label>正文 (Markdown)</label>
+        <textarea id="im-body" rows="6" maxlength="16384" placeholder="支持完整 Markdown,最长 16KB"></textarea>
+      </div>
+      <div class="form-row">
+        <label>级别</label>
+        <select id="im-level">
+          ${INBOX_LEVELS.map((l) => `<option value="${l}">${INBOX_LEVEL_LABELS[l]}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>过期时间</label>
+        <input type="datetime-local" id="im-expires" />
+        <small style="color:var(--muted);margin-left:8px">可选;留空则永不过期</small>
+      </div>
+      <div class="form-row">
+        <button class="btn btn-primary" id="im-send">发送</button>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:var(--s-3)">
+      <h2>历史消息 <small id="im-count">加载中…</small></h2>
+      <div id="im-table-container"><div class="loading">加载中…</div></div>
+    </div>
+  `
+
+  $('im-audience').addEventListener('change', _toggleInboxUserRow)
+  $('im-send').addEventListener('click', _onInboxSend)
+  await _loadInboxList()
+}
+
+function _toggleInboxUserRow() {
+  const row = $('im-user-row')
+  if (!row) return
+  row.style.display = $('im-audience').value === 'user' ? '' : 'none'
+}
+
+async function _onInboxSend(ev) {
+  const audience = $('im-audience').value
+  const title = $('im-title').value.trim()
+  const body_md = $('im-body').value
+  const level = $('im-level').value
+  const expiresRaw = $('im-expires').value
+  const userIdRaw = $('im-user-id').value.trim()
+
+  if (!title) { toast('标题不能为空', 'danger'); return }
+  if (!body_md.trim()) { toast('正文不能为空', 'danger'); return }
+  if (audience === 'user' && !/^[1-9]\d{0,19}$/.test(userIdRaw)) {
+    toast('user_id 必须是正整数', 'danger'); return
+  }
+
+  const payload = { audience, title, body_md, level }
+  if (audience === 'user') payload.user_id = userIdRaw
+  if (expiresRaw) {
+    // datetime-local 是 'YYYY-MM-DDTHH:mm';转成带本地 TZ 的 ISO
+    const d = new Date(expiresRaw)
+    if (Number.isNaN(d.getTime())) { toast('过期时间格式不对', 'danger'); return }
+    payload.expires_at = d.toISOString()
+  }
+
+  try {
+    await withBtnLoading(ev.currentTarget, () =>
+      apiJson('POST', '/api/admin/messages', payload))
+    toast('已发送', 'ok')
+    // 清表单(audience / level / user_id 保留方便连发)
+    $('im-title').value = ''
+    $('im-body').value = ''
+    $('im-expires').value = ''
+    await _loadInboxList()
+  } catch (e) {
+    toast(`发送失败: ${e.message}`, 'danger', toastOptsFromError(e))
+  }
+}
+
+async function _loadInboxList() {
+  const tc = $('im-table-container')
+  if (!tc) return
+  let data
+  try {
+    data = await apiGet('/api/admin/messages?limit=50')
+  } catch (e) {
+    tc.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(e.message || String(e))}</div>`
+    return
+  }
+  const rows = data?.messages ?? []
+  const total = data?.total ?? rows.length
+  const cnt = $('im-count')
+  if (cnt) cnt.textContent = `共 ${total} 条`
+
+  if (rows.length === 0) {
+    tc.innerHTML = '<div class="empty">暂无消息</div>'
+    return
+  }
+
+  tc.innerHTML = `
+    <table class="data">
+      <thead>
+        <tr>
+          <th>id</th>
+          <th>created_at</th>
+          <th>范围</th>
+          <th>级别</th>
+          <th>标题</th>
+          <th>过期</th>
+          <th>已读 / 收件人</th>
+          <th class="actions">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map((r) => {
+          const audLabel = r.audience === 'all'
+            ? '<span class="badge muted">全员</span>'
+            : `<span class="badge">单发 #${escapeHtml(r.user_id || '')}</span>`
+          const expLabel = r.expires_at ? fmtDate(r.expires_at) : '<span style="opacity:0.5">永不</span>'
+          const titlePreview = r.title.length > 40
+            ? escapeHtml(r.title.slice(0, 40)) + '…'
+            : escapeHtml(r.title)
+          return `
+            <tr>
+              <td class="mono">${escapeHtml(r.id)}</td>
+              <td class="mono">${fmtDate(r.created_at)}</td>
+              <td>${audLabel}</td>
+              <td><span class="badge">${INBOX_LEVEL_LABELS[r.level] || r.level}</span></td>
+              <td title="${escapeHtml(r.title)}" style="max-width:300px">${titlePreview}</td>
+              <td class="mono" style="font-size:12px">${expLabel}</td>
+              <td class="mono">${escapeHtml(String(r.read_count))} / ${escapeHtml(String(r.recipients))}</td>
+              <td class="actions">
+                <button data-act="view-inbox" data-id="${escapeHtml(r.id)}">查看</button>
+                <button data-act="del-inbox" data-id="${escapeHtml(r.id)}" class="btn-danger">删除</button>
+              </td>
+            </tr>`
+        }).join('')}
+      </tbody>
+    </table>`
+
+  const rowMap = new Map(rows.map((r) => [r.id, r]))
+  for (const b of view().querySelectorAll('button[data-act="view-inbox"]')) {
+    b.addEventListener('click', () => _openInboxDetail(rowMap.get(b.dataset.id)))
+  }
+  for (const b of view().querySelectorAll('button[data-act="del-inbox"]')) {
+    b.addEventListener('click', async (ev) => {
+      const id = b.dataset.id
+      if (!confirm(`确认删除站内信 #${id}?所有用户的已读记录会一起清除。`)) return
+      try {
+        await withBtnLoading(ev.currentTarget, () =>
+          apiJson('DELETE', `/api/admin/messages/${encodeURIComponent(id)}`, null))
+        toast(`已删除 #${id}`, 'ok')
+        await _loadInboxList()
+      } catch (e) {
+        toast(`删除失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  }
+}
+
+function _openInboxDetail(r) {
+  if (!r) return
+  openModal(`
+    <h3>站内信 · #${escapeHtml(r.id)}</h3>
+    <div class="form-row">
+      <label>范围 / 时间</label>
+      <div>
+        ${r.audience === 'all'
+          ? '<span class="badge muted">全员</span>'
+          : `<span class="badge">单发 #${escapeHtml(r.user_id || '')}</span>`}
+        <span class="mono" style="margin-left:8px;font-size:12px;opacity:0.7">${fmtDate(r.created_at)}</span>
+      </div>
+    </div>
+    <div class="form-row">
+      <label>级别</label>
+      <div><span class="badge">${INBOX_LEVEL_LABELS[r.level] || r.level}</span></div>
+    </div>
+    <div class="form-row">
+      <label>过期</label>
+      <div class="mono" style="font-size:12px">${r.expires_at ? fmtDate(r.expires_at) : '永不过期'}</div>
+    </div>
+    <div class="form-row">
+      <label>已读 / 收件人</label>
+      <div class="mono">${escapeHtml(String(r.read_count))} / ${escapeHtml(String(r.recipients))}</div>
+    </div>
+    <div class="form-row">
+      <label>标题</label>
+      <div>${escapeHtml(r.title)}</div>
+    </div>
+    <div class="form-row">
+      <label>正文 (Markdown 源码)</label>
+      <pre style="white-space:pre-wrap;background:var(--panel-2);padding:8px;border-radius:6px;max-height:300px;overflow:auto;font-size:12px">${escapeHtml(r.body_md)}</pre>
+    </div>
+    <div class="form-row" style="justify-content:flex-end">
+      <button class="btn" id="im-detail-close">关闭</button>
+    </div>
+  `)
+  $('im-detail-close')?.addEventListener('click', closeModal)
 }
 
 // ─── Tab: Settings(4I)─────────────────────────────────────────────
