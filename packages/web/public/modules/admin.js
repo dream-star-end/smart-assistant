@@ -4657,6 +4657,37 @@ function _activationBadge(c) {
   return `<span class="badge danger">${escapeHtml(c.activation_status)}</span>`
 }
 
+// 把 /test 路径常见的 409 翻译成中文 actionable 指引。后端 message 是英文,
+// admin.js 自家 toast 又不渲染 issues,boss 直接看到 "channel not active: pending"
+// 一脸懵。优先匹配后端结构化 issues[].path,fallback 才到 message.includes()。
+// 范围严格限定 act === 'test':rebind 自己有 outcome=='reactivated' 友好文案,
+// 其他 action(enable/disable/delete/edit) 走原 e.message 透传。
+function _friendlyTestError(e) {
+  const msg = String(e?.message || '')
+  const issueMsg = String(
+    e?.issues?.find?.((x) => x?.path === 'activation')?.message || '',
+  )
+  if (
+    issueMsg.includes('awaiting first inbound message') ||
+    msg.includes('channel not active: pending')
+  ) {
+    return '通道还在等待激活 — 请用扫码绑定的微信向 bot 发任意一句话,worker 抓到首条消息会自动转为 active,几秒后再点测试'
+  }
+  if (msg.includes('channel not active: error')) {
+    return '通道处于错误状态,请点「重新激活」后,再用微信发一条消息触发激活'
+  }
+  if (msg.includes('channel not active: disabled')) {
+    return '通道处于 disabled 状态,请联系管理员或删除重建'
+  }
+  if (msg.includes('channel missing context_token')) {
+    return '通道已激活,但还未抓到 context_token — 请再用微信向 bot 发一条消息触发抓取,几秒后再点测试'
+  }
+  if (msg.includes('channel disabled')) {
+    return '通道未启用,请先点「启用」再测试'
+  }
+  return null
+}
+
 async function _handleChannelAction(act, id, btn) {
   try {
     if (act === 'enable' || act === 'disable') {
@@ -4697,7 +4728,8 @@ async function _handleChannelAction(act, id, btn) {
       await _openEditChannelModal(id)
     }
   } catch (e) {
-    toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    const friendly = act === 'test' ? _friendlyTestError(e) : null
+    toast(friendly || `失败: ${e.message}`, 'danger', toastOptsFromError(e))
   }
 }
 
