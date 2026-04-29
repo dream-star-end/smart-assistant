@@ -25,10 +25,10 @@
  *    存 argon2(randomBytes(32)) 一个**永不可能匹配**的真实哈希,login.ts 不需
  *    要任何特殊路径,verify 永远 false → INVALID_CREDENTIALS。schema 不动。
  *
- * 4) **按 trust_level 分阶赠送**:同 tx INSERT users(credits=bonus) +
- *    INSERT credit_ledger(reason='promotion'),金额按 LDC trust_level 阶梯映射
- *    (TL0=¥3, TL1=¥5, TL2=¥10, TL3=¥20, TL4=¥30 — linux.do 推广策略,见
- *    TRUST_LEVEL_BONUS 注释)。memo 标注 effective TL 便于运营审计。
+ * 4) **首登统一赠送 ¥5**:同 tx INSERT users(credits=500) +
+ *    INSERT credit_ledger(reason='promotion'),所有 LDC 用户首登一律 ¥5 / 500
+ *    cents,与 trust_level 无关(见 LINUXDO_BONUS_CENTS 注释)。memo 仍标注
+ *    用户当时的 effective TL,便于运营审计 + 历史分群。
  *    **赠金只在首登一次性结算**,后续 trust_level 升级不补差。
  */
 
@@ -39,46 +39,40 @@ import { REFRESH_TOKEN_TTL_SECONDS, issueRefresh, signAccess } from './jwt.js'
 import { hashPassword } from './passwords.js'
 
 /**
- * LDC trust_level 分阶赠金(linux.do 推广策略,1¥ = 100 cents)。
+ * LDC 首登统一赠金(1¥ = 100 cents)。
  *
- * 推广考虑:
- * - TL0 与邮箱注册赠金持平(¥3),防女巫攻击 — TL0 LDC 账号成本 ≈ 邮箱注册。
- * - TL2 是论坛真实活跃用户主力层,赠金做明显差异化(¥10)拉转化。
- * - TL3/4 数量极少,加码到 ¥20/¥30 做口碑覆盖。
+ * 历史:曾按 trust_level 分阶(TL0=¥3 / TL1=¥5 / TL2=¥10 / TL3=¥20 / TL4=¥30),
+ * 2026-04-29 boss 决策改为统一 ¥5,不分级。已注册用户不补差(本来就不补差)。
  *
- * **赠金只按首登时的 trust_level 一次性结算**:
- *   用户日后从 TL1 升 TL3 后再 SSO 登录,只 UPDATE oauth_identities.trust_level
- *   快照,**不补差额**。简化运营 + 防套利路径(故意压 TL 早注册→活跃升级→反复领差)。
- *   想升级补金请走人工运营,不在 SSO 路径里做。
+ * **赠金只在首登一次性结算**:用户后续 SSO 登录只 UPDATE oauth_identities
+ * 的 trust_level / username / avatar 快照,credits/ledger 不动。
  */
-const TRUST_LEVEL_BONUS: Record<0 | 1 | 2 | 3 | 4, bigint> = {
-  0: 300n, // ¥3
-  1: 500n, // ¥5
-  2: 1000n, // ¥10
-  3: 2000n, // ¥20
-  4: 3000n, // ¥30
-}
+const LINUXDO_BONUS_CENTS = 500n // ¥5
 
 export interface BonusForTrustLevelResult {
   bonusCents: bigint
-  /** 实际用于查表的 TL(clamp/normalize 后),用于 ledger memo + 审计 */
+  /** clamp/normalize 后的 TL(0..4),仅用于 ledger memo + 审计标签;不再决定金额 */
   effectiveTrustLevel: 0 | 1 | 2 | 3 | 4
 }
 
 /**
- * 把 LDC userinfo 的 trust_level 映射成赠金 + effective TL。
- * - null/undefined/非整数/负数 → TL0(防御性兜底,正常 zod schema 已挡住大部分)
- * - >=4 → clamp 到 TL4(Discourse 实际上限 4,LDC 不会返 5+,但保险)
+ * 计算 LDC 首登赠金 + effective TL 标签。
  *
- * 纯函数,无副作用。在 tx 外或内调用都安全。
+ * - bonusCents 永远 = LINUXDO_BONUS_CENTS(¥5),与 trust_level 无关。
+ * - effectiveTrustLevel 仍按原规则规范化(null/undefined/非整数/负数 → 0;
+ *   >=4 → clamp 到 4),供 ledger memo 写入审计标签;LDC 数据异常时(raw=NaN
+ *   / Infinity / >4)退回 TL0 标记,与 raw TL 一并落 memo 便于运营排查。
+ *
+ * 纯函数,无副作用。在 tx 外或内调用都安全。函数名保留向后兼容(测试 +
+ * 内部调用方都 import 这个名字),语义已改成"始终 ¥5"。
  */
 export function bonusForTrustLevel(tl: number | null | undefined): BonusForTrustLevelResult {
   if (tl == null || !Number.isInteger(tl) || tl < 0) {
-    return { bonusCents: TRUST_LEVEL_BONUS[0], effectiveTrustLevel: 0 }
+    return { bonusCents: LINUXDO_BONUS_CENTS, effectiveTrustLevel: 0 }
   }
-  if (tl >= 4) return { bonusCents: TRUST_LEVEL_BONUS[4], effectiveTrustLevel: 4 }
+  if (tl >= 4) return { bonusCents: LINUXDO_BONUS_CENTS, effectiveTrustLevel: 4 }
   const lvl = tl as 0 | 1 | 2 | 3 | 4
-  return { bonusCents: TRUST_LEVEL_BONUS[lvl], effectiveTrustLevel: lvl }
+  return { bonusCents: LINUXDO_BONUS_CENTS, effectiveTrustLevel: lvl }
 }
 
 /** 合成 email 域名 — 不收件,只占 UNIQUE 槽位。改这个域名前查清现存合成 email */
