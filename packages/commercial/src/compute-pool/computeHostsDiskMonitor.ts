@@ -264,6 +264,13 @@ export function startComputeHostDiskMonitor(
   }, interval);
   if (typeof timer.unref === "function") timer.unref();
 
+  // 0045: startup 立刻 tick 一次,避免重启后 5min 内 admin UI metrics 全 NULL。
+  // 走 setImmediate 确保不阻塞 startAlertScheduler 的同步返回。
+  setImmediate(() => {
+    if (stopped) return;
+    void scheduleTick();
+  });
+
   return {
     async stop() {
       if (stopped) return;
