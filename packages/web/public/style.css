@@ -4784,6 +4784,77 @@ a:hover {
   box-shadow: none;
 }
 
+/* ── 个人信息 modal:账户信息卡片(只读)─────────────────────────────
+   渲染于 #profile-account-card,5 行展示 邮箱 / 身份 / 积分 / ID / 注册时间。
+   Sticky 到 modal 顶部,与下方偏好分割。 */
+.profile-account-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  background: var(--bg-elev-1, var(--surface, rgba(255,255,255,0.03)));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.profile-section-label {
+  font-size: var(--text-xs);
+  color: var(--text-muted, var(--fg-muted));
+  margin: 4px 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.profile-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  font-size: var(--text-sm);
+  line-height: 1.4;
+}
+.profile-row-fallback {
+  color: var(--text-muted, var(--fg-muted));
+  font-style: italic;
+}
+.profile-row-label {
+  flex: 0 0 80px;
+  color: var(--text-muted, var(--fg-muted));
+  font-size: 13px;
+}
+.profile-row-value {
+  color: var(--fg);
+  word-break: break-all;
+}
+.profile-mono {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 13px;
+}
+.profile-verified {
+  color: #2ea043;
+  font-size: 12px;
+  margin-left: 4px;
+}
+.profile-unverified {
+  color: var(--text-muted, var(--fg-muted));
+  font-size: 12px;
+  margin-left: 4px;
+}
+.profile-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+}
+.profile-badge--admin {
+  border-color: rgba(255, 153, 0, 0.4);
+  background: rgba(255, 153, 0, 0.1);
+  color: #ff9900;
+}
+
 .prefs-select {
   width: 100%;
   padding: 10px 14px;

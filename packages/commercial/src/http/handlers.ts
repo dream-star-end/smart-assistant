@@ -684,9 +684,10 @@ export async function handleMe(
     avatar_url: string | null;
     credits: string;
     status: string;
+    created_at: Date;
   }>(
     `SELECT id::text AS id, email, email_verified, role, display_name, avatar_url,
-            credits::text AS credits, status
+            credits::text AS credits, status, created_at
        FROM users WHERE id = $1`,
     [user.id],
   );
@@ -704,6 +705,7 @@ export async function handleMe(
       display_name: u.display_name,
       avatar_url: u.avatar_url,
       credits: u.credits,
+      created_at: u.created_at instanceof Date ? u.created_at.toISOString() : u.created_at,
     },
   });
 }

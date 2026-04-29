@@ -23,6 +23,7 @@
 //   - 没有任何改动 → 不发请求,直接 close + toast"无变化"
 
 import { apiGet, apiJson } from './api.js?v=af48829'
+import { formatCredits } from './billing.js?v=auto'
 import { state } from './state.js?v=af48829'
 import { closeModal, openModal, toast } from './ui.js?v=af48829'
 
@@ -158,6 +159,70 @@ async function _loadPreferences() {
   }
 }
 
+// 渲染只读账户信息卡片(5 行:邮箱 / 用户身份 / 积分 / 用户ID / 注册时间)。
+// 失败兜底由 _loadAccountInfo 调用方自己处理 — 这里 user 只能是真对象。
+function _renderAccountInfo(user) {
+  const card = $('profile-account-card')
+  if (!card) return
+  const email = String(user.email || '')
+  const verified = user.email_verified === true
+  const role = user.role === 'admin' ? '管理员' : '普通用户'
+  const credits = formatCredits(user.credits)
+  const userId = String(user.id || '')
+  let createdText = ''
+  if (user.created_at) {
+    const d = new Date(user.created_at)
+    if (!Number.isNaN(d.getTime())) {
+      createdText = d.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
+    }
+  }
+  card.innerHTML = ''
+  const rows = [
+    { label: '邮箱', html: `<span class="profile-row-value">${_escape(email)}</span>` +
+        (verified
+          ? '<span class="profile-verified" title="已验证">✓ 已验证</span>'
+          : '<span class="profile-unverified" title="未验证">未验证</span>') },
+    { label: '身份', html: `<span class="profile-badge profile-badge--${user.role === 'admin' ? 'admin' : 'user'}">${role}</span>` },
+    { label: '积分余额', html: `<span class="profile-row-value">${_escape(credits)}</span>` },
+    { label: '用户 ID', html: `<span class="profile-row-value profile-mono">${_escape(userId)}</span>` },
+    { label: '注册时间', html: `<span class="profile-row-value">${_escape(createdText || '—')}</span>` },
+  ]
+  for (const r of rows) {
+    const row = document.createElement('div')
+    row.className = 'profile-row'
+    row.innerHTML = `<span class="profile-row-label">${r.label}</span>${r.html}`
+    card.appendChild(row)
+  }
+}
+
+function _renderAccountFallback(message) {
+  const card = $('profile-account-card')
+  if (!card) return
+  card.innerHTML = `<div class="profile-row profile-row-fallback">${_escape(message)}</div>`
+}
+
+function _escape(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ))
+}
+
+async function _loadAccountInfo() {
+  // 失败 swallow:账户信息只读展示,失败不应阻塞偏好编辑主流程。
+  try {
+    const j = await apiGet('/api/me')
+    const user = (j && typeof j.user === 'object' && j.user !== null) ? j.user : null
+    if (!user) {
+      _renderAccountFallback('账户信息加载失败')
+      return
+    }
+    _renderAccountInfo(user)
+  } catch (err) {
+    console.warn('loadAccountInfo failed:', err)
+    _renderAccountFallback('账户信息加载失败')
+  }
+}
+
 async function _openPrefsModal() {
   // 先打开模态(避免感觉卡顿),再异步拉数据
   openModal('prefs-modal')
@@ -166,6 +231,9 @@ async function _openPrefsModal() {
   // 锁住 save 直到加载完成
   const saveBtn = $('prefs-save-btn')
   if (saveBtn) saveBtn.disabled = true
+
+  // 账户信息加载失败不阻塞偏好,但偏好/模型加载失败仍然 abort(原行为)
+  _loadAccountInfo()
 
   let prefs
   try {

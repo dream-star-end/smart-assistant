@@ -590,7 +590,7 @@
             <button class="settings-item" data-settings="changelog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>更新日志<span id="changelog-badge" class="changelog-badge" hidden></span></button>
             <button class="settings-item" data-settings="feedback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>发送反馈</button>
             <div class="settings-section-label">系统</div>
-            <button class="settings-item" data-settings="prefs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9"/><polyline points="3 4 3 12 11 12"/></svg>用户偏好</button>
+            <button class="settings-item" data-settings="prefs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>个人信息</button>
             <button class="settings-item" data-settings="usage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>使用消耗统计</button>
             <button class="settings-item" data-settings="theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>切换主题</button>
             <!-- V3 商用版: 移除 OAuth 认证 / 查看配置 入口(2026-04-21 boss 反馈) -->
@@ -1066,14 +1066,17 @@
   </div>
 </div>
 
-<!-- V3 commercial: 用户偏好(Phase 4C) -->
-<div id="prefs-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="用户偏好">
+<!-- V3 commercial: 个人信息(原 Phase 4C 用户偏好) -->
+<div id="prefs-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="个人信息">
   <div class="modal" style="max-width:520px">
     <div class="modal-head">
-      <h3>用户偏好</h3>
+      <h3>个人信息</h3>
       <button class="modal-close" data-close-modal="prefs-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
+      <!-- 账户信息(只读)— 5 行,_renderAccountInfo() 渲染 -->
+      <section id="profile-account-card" class="profile-account-card" aria-label="账户信息"></section>
+      <div class="profile-section-label">偏好设置</div>
       <div class="form-row">
         <label for="prefs-default-model">默认模型</label>
         <select id="prefs-default-model" class="prefs-select"></select>
