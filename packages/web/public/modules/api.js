@@ -11,7 +11,7 @@
 //     out (login/logout probes) opt out with opts.suppressAuthRedirect=true.
 //   • Errors thrown carry e.status (HTTP status code) so callers can branch
 //     on it without parsing the message.
-import { _writeStoredAccessToken, state } from './state.js?v=09595c5'
+import { _writeStoredAccessToken, state } from './state.js?v=0b1eb59'
 
 const DEFAULT_TIMEOUT_MS = 30000
 
@@ -248,7 +248,7 @@ async function _doRefreshOnce(expectedEpoch, opts) {
     // mint 抢同一份 oc_session cookie(race 时旧 mint 把新 mint 的结果覆盖回旧值,
     // 极端情况让 file-proxy 短窗口内带错 user 的 session)。
     if (!opts?.skipSessionCookieMint) {
-      void import('./auth.js?v=09595c5')
+      void import('./auth.js?v=0b1eb59')
         .then(({ mintSessionCookie }) => {
           mintSessionCookie(data.access_token, expectedEpoch).catch(() => {})
         })
@@ -258,7 +258,7 @@ async function _doRefreshOnce(expectedEpoch, opts) {
     // userId 缺失(早期 race,/api/me 还没回)时 publishTokenRefresh 内部会 skip,
     // 不广播是安全降级 —— 接收方走 reactive 401 兜底。fire-and-forget。
     if (state.userId != null) {
-      void import('./broadcast.js?v=09595c5')
+      void import('./broadcast.js?v=0b1eb59')
         .then(({ publishTokenRefresh }) => {
           publishTokenRefresh({
             access_token: data.access_token,
