@@ -263,6 +263,51 @@ export function enforceFieldByteBudgets(body: ProxyBody): void {
 }
 
 /**
+ * 从请求 metadata 提取 session_id,写入 usage_records.session_id 用于「按会话消耗」聚合。
+ *
+ * Anthropic API 标准 metadata schema 只有 `user_id: string` 一个字段。Claude Code CLI
+ * 把多字段编码成 JSON 塞进 `user_id`(`device_id` / `account_uuid` / `session_id`),
+ * 见 claude-code-best/src/services/api/claude.ts:485-510。如果只看顶层
+ * `metadata.session_id`,所有 Claude Code 客户端都会落 NULL → 「按会话消耗」表永远空。
+ *
+ * 提取顺序:
+ *   1. 显式顶层 `metadata.session_id`(优先,任何客户端可主动传)
+ *   2. 解析 `metadata.user_id` 为 JSON,若是 plain object 且 `session_id` 是 string,提取
+ *
+ * 任何路径异常都返回 null:
+ *   - JSON 不是 object / 是 array / parse 失败 / session_id 类型不对 / trim 后为空
+ * trim 是因为 zod schema 已经允许 ≤256 字符,但中间空白不应阻断 fallback;truncate 到 256
+ * 是兜底防御(zod schema 上限若被改大或绕过,DB 列也是 VARCHAR(256))。
+ *
+ * 安全:此函数只产出"分组键",最终 SQL 在 handlers.ts 始终先 `WHERE user_id = $1` 隔离,
+ * 任何客户端伪造 session_id 也只影响自己的聚合视图。
+ */
+export function extractSessionId(
+  metadata: { user_id?: string; session_id?: string } | undefined,
+): string | null {
+  // 1) 显式顶层优先
+  const explicit = metadata?.session_id?.trim();
+  if (explicit) return explicit.slice(0, 256);
+
+  // 2) fallback: 从 user_id JSON 提取
+  const uid = metadata?.user_id;
+  if (typeof uid !== "string" || uid.length === 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(uid);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const sid = (parsed as Record<string, unknown>).session_id;
+      if (typeof sid === "string") {
+        const trimmed = sid.trim();
+        return trimmed ? trimmed.slice(0, 256) : null;
+      }
+    }
+  } catch {
+    /* user_id 不是 JSON(普通字符串),正常情况,静默 */
+  }
+  return null;
+}
+
+/**
  * 估算 input token 数(保守口径,宁可高估)。
  *
  * MVP 不引入完整 tokenizer(`@anthropic-ai/tokenizer` 增加依赖体积),用
@@ -1390,7 +1435,7 @@ export function makeAnthropicProxyHandler(
       try {
         pick = await deps.scheduler.pick({
           mode: "chat",
-          sessionId: body.metadata?.session_id,
+          sessionId: extractSessionId(body.metadata) ?? undefined,
           model: body.model,
         });
       } catch (err) {
@@ -1550,8 +1595,9 @@ export function makeAnthropicProxyHandler(
           precheckCredits: pre.maxCost,
           preCheckReservation: pre.reservation,
           log: userLog,
-          // 空串 / 全空白 → null,避免聚合时混成"空 session_id"组
-          sessionId: body.metadata?.session_id?.trim() || null,
+          // 提取 session_id:支持顶层 metadata.session_id + Claude Code 把
+          // session_id 嵌套在 metadata.user_id JSON 里两种姿势(见 extractSessionId)
+          sessionId: extractSessionId(body.metadata),
         },
       );
 
@@ -1693,7 +1739,7 @@ export function makeAnthropicProxyHandler(
               balanceAfter: outcome.balanceAfter === null
                 ? null
                 : outcome.balanceAfter.toString(),
-              sessionId: body.metadata?.session_id ?? null,
+              sessionId: extractSessionId(body.metadata),
             });
           } catch (err) {
             userLog.warn("proxy_broadcast_cost_failed", { err: errSummary(err) });

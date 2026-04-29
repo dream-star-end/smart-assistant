@@ -24,6 +24,7 @@ import {
   estimateMaxCostBothSides,
   buildSafeUpstreamHeaders,
   ConcurrencyLimiter,
+  extractSessionId,
   ALLOWED_BETA_VALUES,
   ANTHROPIC_VERSION,
   SIZE_LIMITS,
@@ -573,5 +574,131 @@ describe("UsageObserver — SSE 解析 + usage 提取", () => {
     o.push(garbage);
     // observer 不抛、没有事件命中 → 仍是 none
     assert.deepEqual(o.result(), { kind: "none" });
+  });
+});
+
+// ─── extractSessionId ─────────────────────────────────────────────────────
+
+describe("extractSessionId — 顶层 metadata.session_id 优先", () => {
+  test("显式 session_id 直接返回", () => {
+    assert.equal(extractSessionId({ session_id: "abc" }), "abc");
+  });
+
+  test("显式 + user_id 都有 → 取显式", () => {
+    assert.equal(
+      extractSessionId({
+        session_id: "explicit",
+        user_id: JSON.stringify({ session_id: "nested" }),
+      }),
+      "explicit",
+    );
+  });
+
+  test("显式 trim 空白", () => {
+    assert.equal(extractSessionId({ session_id: "  abc  " }), "abc");
+  });
+
+  test("显式截断到 256(防 zod 上限被改大)", () => {
+    const long = "x".repeat(300);
+    const got = extractSessionId({ session_id: long });
+    assert.equal(got?.length, 256);
+    assert.equal(got, "x".repeat(256));
+  });
+
+  test("显式全空白 → fallback 到 user_id 不被阻断", () => {
+    assert.equal(
+      extractSessionId({
+        session_id: "   ",
+        user_id: JSON.stringify({ session_id: "sid-1" }),
+      }),
+      "sid-1",
+    );
+  });
+});
+
+describe("extractSessionId — 从 user_id JSON 提取(Claude Code 编码方式)", () => {
+  test("user_id 是 JSON object 含 session_id → 提取", () => {
+    assert.equal(
+      extractSessionId({
+        user_id: JSON.stringify({
+          device_id: "d",
+          account_uuid: "a",
+          session_id: "sid-1",
+        }),
+      }),
+      "sid-1",
+    );
+  });
+
+  test("嵌套 session_id trim", () => {
+    assert.equal(
+      extractSessionId({ user_id: JSON.stringify({ session_id: "  sid-1  " }) }),
+      "sid-1",
+    );
+  });
+
+  test("user_id JSON 无 session_id 字段 → null", () => {
+    assert.equal(
+      extractSessionId({ user_id: JSON.stringify({ device_id: "d" }) }),
+      null,
+    );
+  });
+
+  test("user_id 是普通字符串(非 JSON) → null", () => {
+    assert.equal(extractSessionId({ user_id: "raw-device-string" }), null);
+  });
+
+  test("user_id 是 malformed JSON → null(catch 路径)", () => {
+    assert.equal(extractSessionId({ user_id: "{bad json" }), null);
+  });
+
+  test("user_id JSON 但 session_id 类型错误 → null", () => {
+    assert.equal(
+      extractSessionId({ user_id: JSON.stringify({ session_id: 12345 }) }),
+      null,
+    );
+    assert.equal(
+      extractSessionId({ user_id: JSON.stringify({ session_id: null }) }),
+      null,
+    );
+  });
+
+  test("user_id 是 JSON 数组 → null(必须 plain object)", () => {
+    assert.equal(extractSessionId({ user_id: JSON.stringify(["sid"]) }), null);
+  });
+
+  test("user_id 是 JSON 数字 / null → null", () => {
+    assert.equal(extractSessionId({ user_id: "42" }), null);
+    assert.equal(extractSessionId({ user_id: "null" }), null);
+  });
+
+  test("user_id 中 session_id 长度 >256 → 截断到 256", () => {
+    const long = "y".repeat(300);
+    const got = extractSessionId({
+      user_id: JSON.stringify({ session_id: long }),
+    });
+    assert.equal(got?.length, 256);
+    assert.equal(got, "y".repeat(256));
+  });
+
+  test("嵌套 session_id 全空白 → null", () => {
+    assert.equal(
+      extractSessionId({ user_id: JSON.stringify({ session_id: "   " }) }),
+      null,
+    );
+  });
+});
+
+describe("extractSessionId — 边界", () => {
+  test("metadata=undefined → null", () => {
+    assert.equal(extractSessionId(undefined), null);
+  });
+
+  test("metadata={} → null", () => {
+    assert.equal(extractSessionId({}), null);
+  });
+
+  test("user_id 为空字符串 → null", () => {
+    assert.equal(extractSessionId({ user_id: "" }), null);
   });
 });
