@@ -116,6 +116,42 @@ export function perKtokCredits(perMtokCents: bigint, multiplier: string): string
 }
 
 /**
+ * 已知的 canonical model_id 列表(DB `model_pricing.model_id` 取值集合的全集 +
+ * 未来可能开放的同系模型)。顺序很重要:更具体版本必须在更通用前缀前面,
+ * 否则 `claude-opus-4-7` 会被 `claude-opus-4` 抢先匹配。
+ *
+ * 这里只覆盖"Anthropic firstParty 带日期 alias → canonical 短名"的归一化,
+ * 不是通用模型别名系统;未来如需更复杂的别名映射,请专门设计而不是塞进这里。
+ */
+const CANONICAL_MODEL_IDS = [
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-opus-4-5",
+  "claude-opus-4-1",
+  "claude-opus-4",
+  "claude-sonnet-4-6",
+  "claude-sonnet-4-5",
+  "claude-sonnet-4",
+  "claude-haiku-4-5",
+] as const;
+
+/**
+ * 把 Anthropic firstParty 模型 ID 归一化成 DB 里存的 canonical 短名。
+ * 例:`claude-haiku-4-5-20251001` → `claude-haiku-4-5`。
+ *
+ * 匹配规则:`name === id || name.startsWith(id + "-")`,即严格精确或带 `-`
+ * 分隔的任意后缀(包括日期 `-20251001`、修饰 `-thinking` 等 firstParty 形式)。
+ * **不用 `includes()`**:网关是边界层,要拒绝 `my-claude-opus-4-1-finetune`
+ * 这类前缀垃圾输入被误匹配。
+ *
+ * 未识别(非 4.x 系列 / 未列入)→ 原样返回,让上层 `get()` 自然 miss → null。
+ */
+export function canonicalizeModelId(modelId: string): string {
+  const name = modelId.toLowerCase();
+  return CANONICAL_MODEL_IDS.find((id) => name === id || name.startsWith(`${id}-`)) ?? modelId;
+}
+
+/**
  * 定价缓存 + NOTIFY 监听。单实例使用;测试可 new 多个并用 connectionString override。
  */
 export class PricingCache {
@@ -194,9 +230,16 @@ export class PricingCache {
     this.map = new Map();
   }
 
-  /** 热路径查询:O(1),不做 I/O。 */
+  /**
+   * 热路径查询:固定小白名单归一化 + O(1) Map 查询,不做 I/O。
+   *
+   * 入参可以是 canonical 短名(`claude-haiku-4-5`)也可以是 firstParty 带日期形式
+   * (`claude-haiku-4-5-20251001`)。后者通过 `canonicalizeModelId` 归一化后再查。
+   * 这个归一化集中在唯一查询入口,所有调用方(anthropicProxy / preCheck / ...)
+   * 自动受益,避免逐个 caller 改且漂移。
+   */
   get(modelId: string): ModelPricing | null {
-    return this.map.get(modelId) ?? null;
+    return this.map.get(canonicalizeModelId(modelId)) ?? null;
   }
 
   /** 测试用:直接注入 pricing(跳过 DB)。 */

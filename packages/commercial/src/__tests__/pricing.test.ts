@@ -8,7 +8,25 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { PricingCache, perKtokCredits, type ModelPricing } from "../billing/pricing.js";
+import {
+  PricingCache,
+  canonicalizeModelId,
+  perKtokCredits,
+  type ModelPricing,
+} from "../billing/pricing.js";
+
+const haiku: ModelPricing = {
+  model_id: "claude-haiku-4-5",
+  display_name: "Claude Haiku 4.5",
+  input_per_mtok: 80n,
+  output_per_mtok: 400n,
+  cache_read_per_mtok: 8n,
+  cache_write_per_mtok: 100n,
+  multiplier: "1.500",
+  enabled: true,
+  sort_order: 110,
+  updated_at: new Date("2026-04-01T00:00:00Z"),
+};
 
 const sonnet: ModelPricing = {
   model_id: "claude-sonnet-4-6",
@@ -135,5 +153,118 @@ describe("PricingCache (unit, no DB)", () => {
     assert.equal(p.size(), 1);
     await p.shutdown();
     assert.equal(p.size(), 0);
+  });
+
+  test("get accepts firstParty dated id and canonical id alike (haiku-4-5 path)", () => {
+    // Bug 修复回归测试:
+    //   ccb WebFetch 工具发出来的 model 字段是 firstParty 带日期形式
+    //   (`claude-haiku-4-5-20251001`),DB 里存 canonical 短名 `claude-haiku-4-5`。
+    //   修复前 PricingCache.get() 精确查 map → miss → anthropicProxy 返回
+    //   400 UNKNOWN_MODEL,即便 boss 已经在 admin UI 把 Haiku enabled 翻 true。
+    const p = new PricingCache();
+    p._setForTests([haiku]);
+    const dated = p.get("claude-haiku-4-5-20251001");
+    const canonical = p.get("claude-haiku-4-5");
+    assert.ok(dated !== null, "dated firstParty id should hit");
+    assert.ok(canonical !== null, "canonical id should hit");
+    assert.equal(dated, canonical);
+  });
+
+  test("get is case-insensitive for the input id", () => {
+    const p = new PricingCache();
+    p._setForTests([haiku]);
+    assert.equal(
+      p.get("CLAUDE-HAIKU-4-5-20251001")?.model_id,
+      "claude-haiku-4-5",
+    );
+  });
+
+  test("get does NOT confuse claude-opus-4-7 with claude-opus-4 (longest-first match)", () => {
+    // 顺序回归:`claude-opus-4-7-20260101` 必须命中 opus-4-7,而不是
+    // 抢先匹配到 `claude-opus-4`(同样在 CANONICAL_MODEL_IDS 里)。
+    const p = new PricingCache();
+    p._setForTests([opus]); // model_id = "claude-opus-4-7"
+    assert.equal(p.get("claude-opus-4-7-20260101")?.model_id, "claude-opus-4-7");
+  });
+
+  test("get rejects garbage prefix even when haiku row exists", () => {
+    // 真实入口行为锁定:即便 DB 里有 haiku 这一条,前缀垃圾也不能命中。
+    // canonicalizeModelId 单独有同样的拒绝测试,这里再多覆盖 PricingCache.get
+    // 整条链路,防止以后有人误把 canonicalize 改宽松了。
+    const p = new PricingCache();
+    p._setForTests([haiku]);
+    assert.equal(p.get("my-claude-haiku-4-5-20251001"), null);
+    assert.equal(p.get("not-claude-haiku-4-5"), null);
+  });
+});
+
+describe("canonicalizeModelId (边界层防御)", () => {
+  test("canonical id returns itself", () => {
+    assert.equal(canonicalizeModelId("claude-haiku-4-5"), "claude-haiku-4-5");
+    assert.equal(canonicalizeModelId("claude-sonnet-4-6"), "claude-sonnet-4-6");
+    assert.equal(canonicalizeModelId("claude-opus-4-7"), "claude-opus-4-7");
+  });
+
+  test("firstParty dated id maps to canonical", () => {
+    assert.equal(
+      canonicalizeModelId("claude-haiku-4-5-20251001"),
+      "claude-haiku-4-5",
+    );
+    assert.equal(
+      canonicalizeModelId("claude-sonnet-4-5-20250929"),
+      "claude-sonnet-4-5",
+    );
+    assert.equal(
+      canonicalizeModelId("claude-opus-4-1-20250805"),
+      "claude-opus-4-1",
+    );
+  });
+
+  test("more specific version wins over shorter prefix (顺序敏感性)", () => {
+    // 验证 `claude-opus-4-1-...` 不会被 `claude-opus-4` 抢匹配
+    assert.equal(
+      canonicalizeModelId("claude-opus-4-1-20250805"),
+      "claude-opus-4-1",
+    );
+    // sonnet-4-6 不会被 sonnet-4 抢
+    assert.equal(
+      canonicalizeModelId("claude-sonnet-4-6-anything"),
+      "claude-sonnet-4-6",
+    );
+  });
+
+  test("rejects garbage prefix (不接受 my-claude-haiku-4-5-...)", () => {
+    // 边界:`includes()` 会误命中,我们用 `=== || startsWith(id + "-")` 严格匹配。
+    // 这种垃圾输入应当原样返回,让上层 get() 走 map miss → null → UNKNOWN_MODEL,
+    // 是符合"不可信外部 model 字段"的拒绝路径,不能悄悄归一化成已知模型。
+    assert.equal(
+      canonicalizeModelId("my-claude-haiku-4-5-20251001"),
+      "my-claude-haiku-4-5-20251001",
+    );
+    assert.equal(
+      canonicalizeModelId("not-claude-opus-4-7"),
+      "not-claude-opus-4-7",
+    );
+  });
+
+  test("rejects bare id with junk suffix that's not '-'-separated", () => {
+    // `claude-haiku-4-5fake` 没有 `-` 分隔后缀,严格匹配应该不命中
+    assert.equal(
+      canonicalizeModelId("claude-haiku-4-5fake"),
+      "claude-haiku-4-5fake",
+    );
+  });
+
+  test("unknown model returns itself", () => {
+    assert.equal(canonicalizeModelId("gpt-5"), "gpt-5");
+    assert.equal(canonicalizeModelId("claude-some-future-model"), "claude-some-future-model");
+    assert.equal(canonicalizeModelId(""), "");
+  });
+
+  test("uppercase input is normalized to lowercase canonical", () => {
+    assert.equal(
+      canonicalizeModelId("CLAUDE-HAIKU-4-5-20251001"),
+      "claude-haiku-4-5",
+    );
   });
 });
