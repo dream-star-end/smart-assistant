@@ -5084,7 +5084,11 @@ body.body-landing {
   min-height: 100vh;
   background: var(--bg);
   color: var(--fg);
-  overflow-x: hidden;
+  /* 必须用 clip 而不是 hidden:hidden 会让 .landing 变成 scroll container,
+     导致内部 .landing-nav 的 sticky 失去对 viewport 的吸附(页面滚动时 nav 消失)。
+     clip 不创建 scroll container,sticky 正常工作;
+     水平溢出兜底由 hero / cta-band 自身的 overflow:hidden 接管。 */
+  overflow-x: clip;
 }
 .landing[hidden] { display: none; }
 
