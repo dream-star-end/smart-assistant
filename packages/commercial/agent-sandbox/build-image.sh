@@ -106,7 +106,18 @@ fi
 echo "[build-image] rsync $PERSONAL_SRC → $BUILD_CTX/personal-version/"
 # --delete 让 dest 和 src 完全一致;
 # 排除所有镜像里不需要 + 体积大的东西:node_modules(容器内 npm install 重装),
-# .git / dist / build 产物 / 缓存 / 日志 / IDE / OS 杂物
+# .git / dist / build 产物 / 缓存 / 日志 / IDE / OS 杂物。
+#
+# v3 leak hardening (2026-04-29) — 紧跟下面那一组 `/foo` 锚定 exclude:
+#   镜像 /opt/openclaude/ 在容器内 agent shell 可读。容器只跑 npm run gateway
+#   (走 packages/cli),根目录 *.md / docs / evals / infra / deploy / scripts
+#   对 runtime 0 依赖,但暴露 boss 名字 / 45.32 master / Codex workflow /
+#   内网 IP / SSH 凭据路径等平台敏感信息。Layer 1 (subprocessRunner.ts
+#   --setting-sources user) 已堵住 ccb 自动加载注入,本组 exclude 关闭剩余
+#   "用户 cat 直读" 攻击面。
+#   '/foo' 锚定 src 根,不会误删 packages/*/foo 之类的同名 child
+#   (claude-code-best/scripts/ 等保留)。用户数据走 named volume +
+#   /run/oc/claude-config tmpfs,与 build context 0 重叠,不受影响。
 rsync -a --delete \
   --exclude='node_modules/' \
   --exclude='.git/' \
@@ -144,6 +155,21 @@ rsync -a --delete \
   --exclude='.codex/' \
   --exclude='.codex' \
   --exclude='.playwright-mcp/' \
+  --exclude='/CLAUDE.md' \
+  --exclude='/README.md' \
+  --exclude='/AUDIT_REMEDIATION_TASKS_*.md' \
+  --exclude='/CCB_ASSISTANT_REFACTOR_PLAN_*.md' \
+  --exclude='/docs/' \
+  --exclude='/evals/' \
+  --exclude='/infra/' \
+  --exclude='/deploy/' \
+  --exclude='/scripts/' \
+  --exclude='/claude-code-best/CLAUDE.md' \
+  --exclude='/claude-code-best/DEV-LOG.md' \
+  --exclude='/claude-code-best/README.md' \
+  --exclude='/claude-code-best/SECURITY.md' \
+  --exclude='/claude-code-best/TODO.md' \
+  --exclude='/claude-code-best/docs/' \
   "$PERSONAL_SRC/" "$BUILD_CTX/personal-version/"
 
 # 2. Dockerfile + runtime/
