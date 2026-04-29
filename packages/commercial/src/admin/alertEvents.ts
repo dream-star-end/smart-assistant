@@ -54,10 +54,11 @@ export const EVENTS = {
   CONTAINER_PROVISION_FAILED: "container.provision_failed",
   CONTAINER_OOM_EXITED: "container.oom_exited",
 
-  // ── 风控(3 个已 wire)──────────────────────────────────────
+  // ── 风控(4 个已 wire)──────────────────────────────────────
   RISK_SIGNUP_SPIKE: "risk.signup_spike",
   RISK_RATE_LIMIT_SPIKE: "risk.rate_limit_spike",
   RISK_LOGIN_FAILURE_SPIKE: "risk.login_failure_spike",
+  RISK_SILENT_NEW_USER_COHORT: "risk.silent_new_user_cohort",
 
   // ── 安全(2)────────────────────────────────────────────────
   SECURITY_ADMIN_ROLE_CHANGED: "security.admin_role_changed",
@@ -111,6 +112,8 @@ export const EVENT_META: EventMeta[] = [
     description: "rate_limit_events.blocked 激增", trigger: "polled" },
   { event_type: EVENTS.RISK_LOGIN_FAILURE_SPIKE, severity: "warning", group: "risk",
     description: "登录限流触发数激增(疑似撞库 / 暴力破解)", trigger: "polled" },
+  { event_type: EVENTS.RISK_SILENT_NEW_USER_COHORT, severity: "info", group: "risk",
+    description: "过去 24h 注册的用户中沉默(无任何 usage_records)的人数超阈值 — 转化漏斗预警", trigger: "polled" },
 
   // security
   { event_type: EVENTS.SECURITY_ADMIN_ROLE_CHANGED, severity: "critical", group: "security",

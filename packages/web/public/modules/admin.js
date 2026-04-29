@@ -1127,7 +1127,7 @@ const FUNNEL_STATE_CHIPS = [
   { value: 'unverified',   label: '未验证邮箱' },
   { value: 'no_topup',     label: '未充值' },
   { value: 'no_request',   label: '未请求' },
-  { value: 'silent_24h',   label: '24h 内沉默' },
+  { value: 'silent_24h',   label: '注册满 24h 沉默' },
 ]
 
 const USERS_PAGE_SIZE = 50
@@ -1147,11 +1147,16 @@ async function renderUsersTab() {
   // toolbar 状态从 sessionStorage 恢复;state reset 只保留过滤条件不保留 rows。
   USERS_STATE.q = sessionStorage.getItem('admin_users_q') || ''
   USERS_STATE.status = sessionStorage.getItem('admin_users_status') || ''
+  USERS_STATE.registeredWithin = sessionStorage.getItem('admin_users_reg_within') || ''
+  USERS_STATE.funnelState = sessionStorage.getItem('admin_users_funnel') || ''
+  const fdRaw = Number(sessionStorage.getItem('admin_users_funnel_days') || '7')
+  USERS_STATE.funnelDays = fdRaw === 30 ? 30 : 7
   USERS_STATE.rows = []
   USERS_STATE.nextCursor = null
 
   const q = USERS_STATE.q
   const status = USERS_STATE.status
+  const fday = USERS_STATE.funnelDays
 
   view().innerHTML = `
     <div class="panel">
@@ -1164,6 +1169,22 @@ async function renderUsersTab() {
 
       <div class="stat-grid" id="u-kpis">
         ${['总用户数','7 天新注册','7 天活跃','7 天付费用户'].map((label) => `
+          <div class="stat-card">
+            <div class="stat-label">${escapeHtml(label)}</div>
+            <div class="stat-value is-loading">—</div>
+            <div class="stat-delta">—</div>
+          </div>`).join('')}
+      </div>
+
+      <div class="dash-h1" style="margin-top:var(--s-3);">
+        <h3 style="margin:0;font-size:14px;">新用户漏斗 <span class="dash-sub" id="u-funnel-sub">最近 ${fday} 天</span></h3>
+        <div class="chart-toggle" id="u-funnel-toggle">
+          <button data-d="7"  class="${fday===7 ?'is-active':''}">7d</button>
+          <button data-d="30" class="${fday===30?'is-active':''}">30d</button>
+        </div>
+      </div>
+      <div class="stat-grid" id="u-funnel-kpis">
+        ${['cohort 总数','已验证邮箱','首次充值','首次请求','D1 留存','D7 留存'].map((label) => `
           <div class="stat-card">
             <div class="stat-label">${escapeHtml(label)}</div>
             <div class="stat-value is-loading">—</div>
@@ -1184,7 +1205,20 @@ async function renderUsersTab() {
         <button class="btn btn-primary" id="u-search">搜索</button>
       </div>
 
-      <div id="u-table-container">
+      <div id="u-chips-reg" style="display:flex;gap:var(--s-1);flex-wrap:wrap;margin-top:var(--s-2);align-items:center;">
+        <span style="font-size:12px;color:var(--muted);margin-right:4px;">注册时间:</span>
+        ${REG_WITHIN_CHIPS.map((c) => `
+          <button class="chip ${USERS_STATE.registeredWithin === c.value ? 'chip-ok' : 'chip-muted'}"
+                  data-rw="${escapeHtml(c.value)}">${escapeHtml(c.label)}</button>`).join('')}
+      </div>
+      <div id="u-chips-funnel" style="display:flex;gap:var(--s-1);flex-wrap:wrap;margin-top:var(--s-1);align-items:center;">
+        <span style="font-size:12px;color:var(--muted);margin-right:4px;">漏斗:</span>
+        ${FUNNEL_STATE_CHIPS.map((c) => `
+          <button class="chip ${USERS_STATE.funnelState === c.value ? 'chip-ok' : 'chip-muted'}"
+                  data-fs="${escapeHtml(c.value)}">${escapeHtml(c.label)}</button>`).join('')}
+      </div>
+
+      <div id="u-table-container" style="margin-top:var(--s-2);">
         <div class="skeleton-row"><div class="skeleton-bar w60"></div></div>
       </div>
 
@@ -1204,11 +1238,93 @@ async function renderUsersTab() {
   $('u-load-more-btn').addEventListener('click', async (ev) => {
     await withBtnLoading(ev.currentTarget, () => _loadMoreUsers(mySeq))
   })
+  // chip 单选;再点同一个等于"清空"。变化触发完整 reload(走 applyHash 让 URL 也保持一致)。
+  for (const b of $('u-chips-reg')?.querySelectorAll('button[data-rw]') || []) {
+    b.addEventListener('click', () => {
+      const next = USERS_STATE.registeredWithin === b.dataset.rw ? '' : b.dataset.rw
+      sessionStorage.setItem('admin_users_reg_within', next)
+      applyHash()
+    })
+  }
+  for (const b of $('u-chips-funnel')?.querySelectorAll('button[data-fs]') || []) {
+    b.addEventListener('click', () => {
+      const next = USERS_STATE.funnelState === b.dataset.fs ? '' : b.dataset.fs
+      sessionStorage.setItem('admin_users_funnel', next)
+      applyHash()
+    })
+  }
+  for (const b of $('u-funnel-toggle')?.querySelectorAll('button[data-d]') || []) {
+    b.addEventListener('click', () => {
+      const d = Number(b.dataset.d) === 30 ? 30 : 7
+      sessionStorage.setItem('admin_users_funnel_days', String(d))
+      USERS_STATE.funnelDays = d
+      // 不走 applyHash —— 7/30 切换只影响 funnel KPI,不重拉用户列表。
+      const sub = $('u-funnel-sub'); if (sub) sub.textContent = `最近 ${d} 天`
+      for (const x of $('u-funnel-toggle')?.querySelectorAll('button[data-d]') || []) {
+        x.classList.toggle('is-active', Number(x.dataset.d) === d)
+      }
+      _loadFunnelKpis(mySeq)
+    })
+  }
 
   await Promise.all([
     _loadUsersKpis(mySeq),
+    _loadFunnelKpis(mySeq),
     _loadMoreUsers(mySeq),  // 首次加载 = 首页加载 = "加载更多"的第一次
   ])
+}
+
+/** 加载漏斗 KPI(独立 funnelLoadSeq 防 7/30 切换连点)。 */
+async function _loadFunnelKpis(renderSeq) {
+  const myLoadSeq = ++USERS_STATE.funnelLoadSeq
+  const days = USERS_STATE.funnelDays
+  let f
+  try {
+    f = await apiGet(`/api/admin/stats/funnel?days=${days}`)
+  } catch {
+    if (renderSeq !== USERS_STATE.renderSeq || myLoadSeq !== USERS_STATE.funnelLoadSeq) return
+    if (_currentTab !== 'users') return
+    const cards = view().querySelectorAll('#u-funnel-kpis .stat-card')
+    for (const c of cards) updateStat(c, '—', '加载失败', 'danger')
+    return
+  }
+  if (renderSeq !== USERS_STATE.renderSeq || myLoadSeq !== USERS_STATE.funnelLoadSeq) return
+  if (_currentTab !== 'users') return
+
+  const cards = view().querySelectorAll('#u-funnel-kpis .stat-card')
+  const total = Number(f.cohort_total) || 0
+  const verified = Number(f.verified) || 0
+  const topup = Number(f.first_topup) || 0
+  const req = Number(f.first_request) || 0
+  const elig1 = Number(f.eligible_for_d1) || 0
+  const elig7 = Number(f.eligible_for_d7) || 0
+  const ret1 = Number(f.d1_retained) || 0
+  const ret7 = Number(f.d7_retained) || 0
+  const pct = (n, d) => d > 0 ? `${((n / d) * 100).toFixed(1)}%` : '—'
+
+  // cohort 总数
+  updateStat(cards[0], total.toLocaleString(),
+    total > 0 ? `最近 ${days} 天注册` : `最近 ${days} 天无新注册`, total > 0 ? 'success' : null)
+  // verified — 占 cohort 比例
+  updateStat(cards[1], verified.toLocaleString(),
+    total > 0 ? `占 cohort ${pct(verified, total)}` : '—',
+    total > 0 && verified / total < 0.5 ? 'warning' : null)
+  // 首次充值 — 占 cohort 比例
+  updateStat(cards[2], topup.toLocaleString(),
+    total > 0 ? `占 cohort ${pct(topup, total)}` : '—',
+    topup > 0 ? 'success' : null)
+  // 首次请求 — 占 cohort 比例
+  updateStat(cards[3], req.toLocaleString(),
+    total > 0 ? `占 cohort ${pct(req, total)}` : '—',
+    req > 0 ? 'success' : null)
+  // D1 留存 — 注意 eligible 分母
+  updateStat(cards[4], pct(ret1, elig1),
+    elig1 > 0 ? `${ret1} / ${elig1} 合格 cohort` : '窗口未到',
+    elig1 > 0 && ret1 / elig1 < 0.2 ? 'warning' : null)
+  // D7 留存
+  updateStat(cards[5], pct(ret7, elig7),
+    elig7 > 0 ? `${ret7} / ${elig7} 合格 cohort` : '窗口未到',
+    elig7 > 0 && ret7 / elig7 < 0.1 ? 'warning' : null)
 }
 
 /** 加载/刷新一页用户(cursor = USERS_STATE.nextCursor,或首页 null)。 */
@@ -1220,6 +1336,8 @@ async function _loadMoreUsers(renderSeq) {
   })
   if (USERS_STATE.q) sp.set('q', USERS_STATE.q)
   if (USERS_STATE.status) sp.set('status', USERS_STATE.status)
+  if (USERS_STATE.registeredWithin) sp.set('registered_within', USERS_STATE.registeredWithin)
+  if (USERS_STATE.funnelState) sp.set('funnel_state', USERS_STATE.funnelState)
   if (USERS_STATE.nextCursor) sp.set('cursor', USERS_STATE.nextCursor)
 
   const isFirstPage = USERS_STATE.rows.length === 0 && !USERS_STATE.nextCursor
@@ -1307,14 +1425,22 @@ function _renderUsersTable() {
       </tbody>
     </table>`
   for (const b of el.querySelectorAll('button[data-act="adjust"]')) {
-    b.addEventListener('click', () => openAdjustCreditsModal(b.dataset.id))
+    b.addEventListener('click', (e) => {
+      e.stopPropagation() // 防止冒泡到 tr 触发 detail modal
+      openAdjustCreditsModal(b.dataset.id)
+    })
   }
   // chip-跳转(用户行的"X 容器" → containers tab + email 过滤)
   for (const a of el.querySelectorAll('a[data-nav]')) {
     a.addEventListener('click', (e) => {
       e.preventDefault()
+      e.stopPropagation()
       navigate(a.dataset.nav, _navQueryFrom(a))
     })
+  }
+  // 行点击 → 打开 detail modal(adjust 按钮 / chip-跳转都已 stopPropagation)
+  for (const tr of el.querySelectorAll('tr[data-uid]')) {
+    tr.addEventListener('click', () => openUserDetailModal(tr.dataset.uid))
   }
 }
 
@@ -1342,7 +1468,7 @@ function _renderUserRow(u) {
     : `<span class="chip chip-muted" style="opacity:.5">0 容器</span>`
 
   return `
-    <tr>
+    <tr data-uid="${escapeHtml(u.id)}" style="cursor:pointer;" title="点击查看详情">
       <td class="mono">${escapeHtml(u.id)}</td>
       <td>
         ${escapeHtml(u.email || '')}
@@ -1432,6 +1558,105 @@ function openAdjustCreditsModal(userId) {
       }
     })
   })
+}
+
+/** 用户详情 modal — 后端 GET /api/admin/users/:id/detail。 */
+async function openUserDetailModal(userId) {
+  // 先开 modal 占位,异步加载;失败 → modal 内显示错误,不关闭。
+  openModal(`
+    <h3>用户详情 #${escapeHtml(userId)}</h3>
+    <div id="ud-body" style="min-height:200px;">
+      <div class="skeleton-row"><div class="skeleton-bar w60"></div></div>
+    </div>
+    <div class="form-actions">
+      <button id="ud-close">关闭</button>
+    </div>
+  `)
+  $('ud-close').addEventListener('click', closeModal)
+
+  let d
+  try {
+    d = await apiGet(`/api/admin/users/${encodeURIComponent(userId)}/detail`)
+  } catch (e) {
+    const body = $('ud-body')
+    if (body) {
+      body.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(e.message)}</div>`
+    }
+    return
+  }
+
+  const body = $('ud-body')
+  if (!body) return // modal 已被关闭
+
+  const u = d.user
+  const lc = d.lifecycle || {}
+  const topups = d.topups || []
+  const reqs = d.recent_requests || []
+  const sess = d.recent_sessions || []
+
+  // 头部 — 关键字段一行
+  const head = `
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:var(--s-2);margin-bottom:var(--s-3);">
+      <div><div class="stat-label">邮箱</div><div>${escapeHtml(u.email || '')}
+        ${u.email_verified ? '<span class="badge ok">✓</span>' : '<span class="badge warn">未验证</span>'}</div></div>
+      <div><div class="stat-label">角色 / 状态</div><div>
+        <span class="badge ${u.role === 'admin' ? 'warn' : 'muted'}">${escapeHtml(u.role)}</span>
+        ${statusBadge(u.status)}</div></div>
+      <div><div class="stat-label">余额</div><div class="num">${fmtCents(u.credits)}</div></div>
+      <div><div class="stat-label">注册时间</div><div class="mono">${escapeHtml(fmtDate(u.created_at))}</div></div>
+      <div><div class="stat-label">首次充值</div><div class="mono">${lc.first_topup_at ? escapeHtml(fmtDate(lc.first_topup_at)) : '<span class="muted">从未</span>'}</div></div>
+      <div><div class="stat-label">首次请求</div><div class="mono">${lc.first_request_at ? escapeHtml(fmtDate(lc.first_request_at)) : '<span class="muted">从未</span>'}</div></div>
+      <div><div class="stat-label">最近活跃</div><div class="mono">${lc.last_active_at ? escapeHtml(fmtRelative(lc.last_active_at)) : '<span class="muted">从未</span>'}</div></div>
+      <div><div class="stat-label">显示名</div><div>${escapeHtml(u.display_name || '')}</div></div>
+    </div>`
+
+  // 充值历史(最多 20 笔)
+  const topupsTbl = topups.length === 0
+    ? '<div class="empty">暂无充值记录</div>'
+    : `<table class="data" style="width:100%;font-size:13px;">
+        <thead><tr><th>时间</th><th>金额</th><th>memo</th></tr></thead>
+        <tbody>${topups.map((t) => `
+          <tr>
+            <td class="mono">${escapeHtml(fmtDate(t.created_at))}</td>
+            <td class="num">${fmtCents(t.delta)}</td>
+            <td>${escapeHtml(t.memo || '')}</td>
+          </tr>`).join('')}</tbody>
+       </table>`
+
+  // 最近请求(最多 30 条)
+  const reqsTbl = reqs.length === 0
+    ? '<div class="empty">暂无请求记录</div>'
+    : `<table class="data" style="width:100%;font-size:13px;">
+        <thead><tr><th>时间</th><th>模型</th><th>cost</th><th>状态</th></tr></thead>
+        <tbody>${reqs.map((r) => `
+          <tr>
+            <td class="mono">${escapeHtml(fmtDate(r.created_at))}</td>
+            <td>${escapeHtml(r.model || '—')}</td>
+            <td class="num">${fmtCents(r.cost_credits || 0)}</td>
+            <td><span class="badge ${r.status === 'success' ? 'ok' : 'warn'}">${escapeHtml(r.status || '')}</span></td>
+          </tr>`).join('')}</tbody>
+       </table>`
+
+  // 最近会话(最多 10 条;90 天窗口)
+  const sessTbl = sess.length === 0
+    ? '<div class="empty">90 天内暂无会话</div>'
+    : `<table class="data" style="width:100%;font-size:13px;">
+        <thead><tr><th>session_id</th><th>最早</th><th>最近</th><th>请求数</th><th>cost</th></tr></thead>
+        <tbody>${sess.map((s) => `
+          <tr>
+            <td class="mono">${escapeHtml(String(s.session_id || '').slice(0, 16))}</td>
+            <td class="mono">${escapeHtml(fmtDate(s.first_at))}</td>
+            <td class="mono">${escapeHtml(fmtDate(s.last_at))}</td>
+            <td class="num">${Number(s.request_count || 0).toLocaleString()}</td>
+            <td class="num">${fmtCents(s.total_cost_credits || 0)}</td>
+          </tr>`).join('')}</tbody>
+       </table>`
+
+  body.innerHTML = `
+    ${head}
+    <div style="margin-top:var(--s-2);"><h4 style="margin:0 0 var(--s-1) 0;font-size:13px;">最近充值(${topups.length})</h4>${topupsTbl}</div>
+    <div style="margin-top:var(--s-3);"><h4 style="margin:0 0 var(--s-1) 0;font-size:13px;">最近请求(${reqs.length})</h4>${reqsTbl}</div>
+    <div style="margin-top:var(--s-3);"><h4 style="margin:0 0 var(--s-1) 0;font-size:13px;">最近会话 · 90 天(${sess.length})</h4>${sessTbl}</div>`
 }
 
 // ─── Tab: Accounts(CRUD)───────────────────────────────────────────

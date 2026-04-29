@@ -37,6 +37,12 @@ export interface RuleSnapshot {
   /** login 路由 rate_limit_events.blocked 数,窗口 loginFailureWindowMin */
   loginFailureBlockedLastWindowMin: number;
   loginFailureWindowMin: number;
+  /**
+   * 过去 24h 注册的用户中,从未发出过任何 usage_records 的人数。
+   * 注册了但从未使用 = 转化漏斗最早期的"沉默"信号。
+   * 与 ruleSilentNewUserCohort 配对,阈值由 alerts_silent_new_user_threshold 控。
+   */
+  silentNewUserCount24h: number;
 }
 
 export interface SnapshotDeps {
@@ -57,6 +63,7 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
   let signupCountLastWindowMin = 0;
   let rateLimitBlockedLastWindowMin = 0;
   let loginFailureBlockedLastWindowMin = 0;
+  let silentNewUserCount24h = 0;
 
   try {
     const r = await query<{ id: string; health_score: number; status: string }>(
@@ -111,6 +118,23 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
     console.warn("[admin/alertRules] login_failure snapshot failed:", err);
   }
 
+  try {
+    // 过去 24h 注册 + 从未有 usage_records 的人数。NOT EXISTS 子查询走
+    // idx_ur_user_time(user_id, created_at DESC),只看是否存在所以单点扫描代价低。
+    const r = await query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM users u
+        WHERE u.created_at >= NOW() - INTERVAL '24 hours'
+          AND u.deleted_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM usage_records ur WHERE ur.user_id = u.id
+          )`,
+    );
+    silentNewUserCount24h = Number(r.rows[0]?.n ?? "0");
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[admin/alertRules] silent_new_user snapshot failed:", err);
+  }
+
   return {
     accountHealth,
     signupCountLastWindowMin,
@@ -119,6 +143,7 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
     rateLimitWindowMin,
     loginFailureBlockedLastWindowMin,
     loginFailureWindowMin,
+    silentNewUserCount24h,
     ...deps.override,
   };
 }
@@ -336,6 +361,38 @@ export const ruleLoginFailureSpike: PolledRule = {
   },
 };
 
+export const ruleSilentNewUserCohort: PolledRule = {
+  id: EVENTS.RISK_SILENT_NEW_USER_COHORT,
+  event_type: EVENTS.RISK_SILENT_NEW_USER_COHORT,
+  evaluate(s) {
+    const threshold =
+      (s as unknown as { _silentNewUserThreshold?: number })._silentNewUserThreshold ?? 5;
+    if (s.silentNewUserCount24h >= threshold) {
+      // 单 dedupe key("…:global"):靠 transitionRuleState 的 firing-once 语义
+      // —— rule_state 已 firing 时同 key 不再 enqueue;直到回落到 resolved 才能再次 firing。
+      // 不要做日桶 (`:YYYYMMDD`),那样跨日会重复触发。
+      return {
+        firing: true,
+        dedupe_key: `${EVENTS.RISK_SILENT_NEW_USER_COHORT}:global`,
+        // 显式声明 severity=info,绕过 inferSeverity() 的 warning 默认。
+        severity: "info",
+        title: "[INFO] 新用户沉默预警",
+        body: `过去 24h 注册的用户中,有 **${s.silentNewUserCount24h}** 人(阈值 ${threshold})从未发出过任何请求。可能是引导流程问题或刷号。建议:超管 → 用户列表按注册时间倒序看最近 24h 注册的用户,逐个排查。`,
+        payload: {
+          silent_count: s.silentNewUserCount24h,
+          threshold,
+          window_hours: 24,
+        },
+      };
+    }
+    return {
+      firing: false,
+      resolvedTitle: "[RESOLVED] 新用户沉默回落",
+      resolvedBody: `过去 24h 沉默新用户数 ${s.silentNewUserCount24h},已低于阈值 ${threshold}。`,
+    };
+  },
+};
+
 export function defaultPolledRules(): PolledRule[] {
   return [
     ruleAccountPoolNotConfigured,
@@ -344,6 +401,7 @@ export function defaultPolledRules(): PolledRule[] {
     ruleSignupSpike,
     ruleRateLimitSpike,
     ruleLoginFailureSpike,
+    ruleSilentNewUserCohort,
   ];
 }
 
@@ -353,7 +411,7 @@ export interface RunRulesDeps {
   rules?: PolledRule[];
   snapshotDeps?: SnapshotDeps;
   /** 测试可注入 thresholds 绕过 DB 读 */
-  thresholds?: { signup?: number; rateLimit?: number; loginFailure?: number };
+  thresholds?: { signup?: number; rateLimit?: number; loginFailure?: number; silentNewUser?: number };
   /** alerts 总开关 override(默认从 system_settings 读) */
   alertsEnabledOverride?: boolean;
 }
@@ -390,9 +448,12 @@ export async function runRulesOnce(deps: RunRulesDeps = {}): Promise<RunRulesRes
     deps.thresholds?.rateLimit ?? (await readSettingNumber("alerts_rate_limit_spike_threshold", 200));
   const loginFailureThreshold =
     deps.thresholds?.loginFailure ?? (await readSettingNumber("alerts_login_failure_spike_threshold", 30));
+  const silentNewUserThreshold =
+    deps.thresholds?.silentNewUser ?? (await readSettingNumber("alerts_silent_new_user_threshold", 5));
   (snap as unknown as Record<string, number>)._signupThreshold = signupThreshold;
   (snap as unknown as Record<string, number>)._rateLimitThreshold = rateLimitThreshold;
   (snap as unknown as Record<string, number>)._loginFailureThreshold = loginFailureThreshold;
+  (snap as unknown as Record<string, number>)._silentNewUserThreshold = silentNewUserThreshold;
 
   const rules = deps.rules ?? defaultPolledRules();
   for (const rule of rules) {

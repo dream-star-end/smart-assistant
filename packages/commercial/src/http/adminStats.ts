@@ -22,6 +22,7 @@ import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
 import {
   getActivityStats,
   getRevenueByDay,
+  getSignupsByDay,
   getRequestSeries,
   getAlertsSummary,
   getAccountPoolSnapshot,
@@ -29,6 +30,7 @@ import {
   getAlertEvents7d,
   type ActivityWindow,
 } from "../admin/stats.js";
+import { getFunnelStats } from "../admin/usersStats.js";
 import { getPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 
@@ -80,6 +82,29 @@ export async function handleAdminStatsRevenueByDay(
   sendJson(res, 200, { rows });
 }
 
+// ─── GET /api/admin/stats/signups-by-day ─────────────────────────────
+
+export async function handleAdminStatsSignupsByDay(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = urlOf(req);
+  const raw = url.searchParams.get("days");
+  let days = 14;
+  if (raw != null) {
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1 || n > 90) {
+      throw new HttpError(400, "BAD_PARAM", "days must be integer in [1, 90]");
+    }
+    days = n;
+  }
+  const rows = await getSignupsByDay(days);
+  sendJson(res, 200, { rows });
+}
+
 // ─── GET /api/admin/stats/request-series ─────────────────────────────
 
 export async function handleAdminStatsRequestSeries(
@@ -113,6 +138,29 @@ export async function handleAdminStatsAlertsSummary(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
   const out = await getAlertsSummary();
+  sendJson(res, 200, out);
+}
+
+// ─── GET /api/admin/stats/funnel ──────────────────────────────────────
+//
+// 新用户漏斗 KPI(P-FUNNEL):cohort 阶段绝对值 + D1/D7 留存率 + eligible 分母。
+// days = 7 | 30(allowlist),其他值 → 400 BAD_PARAM。
+// 所有字段定义见 admin/usersStats.ts FunnelStatsResult。
+
+export async function handleAdminStatsFunnel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = urlOf(req);
+  const raw = url.searchParams.get("days") ?? "7";
+  const n = Number(raw);
+  if (!Number.isInteger(n) || (n !== 7 && n !== 30)) {
+    throw new HttpError(400, "BAD_PARAM", "days must be 7 or 30");
+  }
+  const out = await getFunnelStats(n);
   sendJson(res, 200, out);
 }
 

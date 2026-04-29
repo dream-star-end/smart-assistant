@@ -61,6 +61,27 @@ const USER_COLUMNS = `
 
 // ─── 列表 ──────────────────────────────────────────────────────────
 
+/** 注册时间窗口 chip(全部按 Asia/Shanghai 自然日切)。 */
+export const REGISTERED_WITHIN_VALUES = ["today", "yesterday", "7d", "30d"] as const;
+export type RegisteredWithin = (typeof REGISTERED_WITHIN_VALUES)[number];
+
+/**
+ * 漏斗状态 chip。语义:
+ *   - unverified  : email_verified=FALSE
+ *   - no_topup    : 从未充值过(credit_ledger reason=topup AND delta>0 NOT EXISTS)
+ *   - no_request  : 从未发起过 LLM 请求(usage_records NOT EXISTS)
+ *   - silent_24h  : 注册满 24h AND 既无充值又无请求
+ *
+ * 全部默认拼 deleted_at IS NULL —— 漏斗筛选只看活用户,删除状态不在新用户跟踪范围。
+ */
+export const FUNNEL_STATES = [
+  "unverified",
+  "no_topup",
+  "no_request",
+  "silent_24h",
+] as const;
+export type FunnelState = (typeof FUNNEL_STATES)[number];
+
 export interface ListUsersInput {
   /** 可选:ILIKE 匹配 email(添加 `%` 前后)。 */
   q?: string;
@@ -75,6 +96,10 @@ export interface ListUsersInput {
    * 优于 offset — 不会 scan 已跳过的行。与 q/status 兼容,cursor 仅影响排序位置。
    */
   cursor?: string;
+  /** Phase B:注册时间窗口 chip,与 q/status 可叠加。 */
+  registered_within?: RegisteredWithin;
+  /** Phase B:漏斗状态 chip,与 q/status/registered_within 可叠加。 */
+  funnel_state?: FunnelState;
 }
 
 export interface ListUsersResult {
@@ -156,6 +181,75 @@ function buildUsersWhere(input: ListUsersInput): { where: string[]; params: unkn
     params.push(input.cursor);
     where.push(`id < $${params.length}::bigint`);
   }
+
+  // Phase B:注册时间窗口。SQL 全部按 Asia/Shanghai 自然日截取,与 stats.ts
+  // (revenue-by-day / signups-by-day)的边界语义保持一致 —— 例如 "today" =
+  // 上海时区今天 00:00 起。这些字面量是常量(switch 内枚举写死),不参数化。
+  if (input.registered_within !== undefined) {
+    const todayStart = `((date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai')`;
+    switch (input.registered_within) {
+      case "today":
+        where.push(`created_at >= ${todayStart}`);
+        break;
+      case "yesterday":
+        where.push(
+          `created_at >= ((date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '1 day') AT TIME ZONE 'Asia/Shanghai')`,
+        );
+        where.push(`created_at < ${todayStart}`);
+        break;
+      case "7d":
+        where.push(
+          `created_at >= ((date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '6 days') AT TIME ZONE 'Asia/Shanghai')`,
+        );
+        break;
+      case "30d":
+        where.push(
+          `created_at >= ((date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '29 days') AT TIME ZONE 'Asia/Shanghai')`,
+        );
+        break;
+      default: {
+        const v: never = input.registered_within;
+        throw new RangeError(`invalid_registered_within:${String(v)}`);
+      }
+    }
+  }
+
+  // Phase B:漏斗状态。所有分支默认拼 deleted_at IS NULL(漏斗筛选只看活用户)。
+  // EXISTS 子查询命中索引:
+  //   credit_ledger.idx_cl_user_topup (partial WHERE reason='topup' AND delta>0,0027)
+  //   usage_records.idx_ur_user_time  ((user_id, created_at DESC),0002)
+  if (input.funnel_state !== undefined) {
+    where.push(`deleted_at IS NULL`);
+    switch (input.funnel_state) {
+      case "unverified":
+        where.push(`email_verified = FALSE`);
+        break;
+      case "no_topup":
+        where.push(
+          `NOT EXISTS (SELECT 1 FROM credit_ledger cl WHERE cl.user_id = users.id AND cl.reason = 'topup' AND cl.delta > 0)`,
+        );
+        break;
+      case "no_request":
+        where.push(
+          `NOT EXISTS (SELECT 1 FROM usage_records ur WHERE ur.user_id = users.id)`,
+        );
+        break;
+      case "silent_24h":
+        where.push(`created_at < NOW() - INTERVAL '24 hours'`);
+        where.push(
+          `NOT EXISTS (SELECT 1 FROM usage_records ur WHERE ur.user_id = users.id)`,
+        );
+        where.push(
+          `NOT EXISTS (SELECT 1 FROM credit_ledger cl WHERE cl.user_id = users.id AND cl.reason = 'topup' AND cl.delta > 0)`,
+        );
+        break;
+      default: {
+        const v: never = input.funnel_state;
+        throw new RangeError(`invalid_funnel_state:${String(v)}`);
+      }
+    }
+  }
+
   return { where, params };
 }
 
@@ -308,6 +402,155 @@ export async function getUser(id: bigint | string): Promise<AdminUserRowView | n
   return r.rows[0] ?? null;
 }
 
+// ─── 详情页(admin 专属:用户运营画像) ─────────────────────────────
+//
+// 一个请求拿到 admin 详情 modal 需要的全部数据。语义边界:
+//   - 主行 user 走 getUser
+//   - 4 条独立 SQL 并行(Promise.all)各自走索引,绝不 union/CTE 让 PG 选错 plan
+//   - lifecycle / topups / recent_requests 全时段;recent_sessions **限 90 天**
+//     避免重度用户全量 GROUP BY(权衡:超 90 天会话 admin 用 recent_requests
+//     翻页拼出来即可)
+// 索引依赖:
+//   credit_ledger.idx_cl_user_topup  (0027 partial WHERE reason='topup' AND delta>0)
+//   usage_records.idx_ur_user_time   ((user_id, created_at DESC),0002)
+
+export interface AdminUserTopupRow {
+  id: string;
+  delta: string; // cents,正数
+  memo: string | null;
+  created_at: string; // ISO
+}
+export interface AdminUserRequestRow {
+  id: string;
+  model: string;
+  status: "success" | "billing_failed" | "error";
+  cost_credits: string; // cents
+  session_id: string | null;
+  created_at: string; // ISO
+}
+export interface AdminUserSessionRow {
+  session_id: string;
+  request_count: number;
+  first_at: string; // ISO
+  last_at: string; // ISO
+  total_cost_credits: string; // cents
+}
+export interface AdminUserDetailResult {
+  user: AdminUserRowView;
+  lifecycle: {
+    first_topup_at: string | null;
+    first_request_at: string | null;
+    last_active_at: string | null;
+  };
+  topups: AdminUserTopupRow[];
+  recent_requests: AdminUserRequestRow[];
+  recent_sessions: AdminUserSessionRow[];
+}
+
+export async function getUserDetail(
+  id: bigint | string,
+): Promise<AdminUserDetailResult | null> {
+  if (!/^[1-9][0-9]{0,19}$/.test(String(id))) throw new RangeError("invalid_user_id");
+  const idStr = String(id);
+
+  const user = await getUser(idStr);
+  if (!user) return null;
+
+  const [lifecycleRes, topupsRes, requestsRes, sessionsRes] = await Promise.all([
+    // 单 SQL 三个标量,各自命中独立索引(子查询并行执行)
+    query<{
+      first_topup_at: Date | null;
+      first_request_at: Date | null;
+      last_active_at: Date | null;
+    }>(
+      `SELECT
+         (SELECT MIN(created_at) FROM credit_ledger
+            WHERE user_id = $1::bigint AND reason = 'topup' AND delta > 0) AS first_topup_at,
+         (SELECT MIN(created_at) FROM usage_records
+            WHERE user_id = $1::bigint) AS first_request_at,
+         (SELECT MAX(created_at) FROM usage_records
+            WHERE user_id = $1::bigint) AS last_active_at`,
+      [idStr],
+    ),
+    query<{ id: string; delta: string; memo: string | null; created_at: Date }>(
+      `SELECT id::text AS id, delta::text AS delta, memo, created_at
+         FROM credit_ledger
+        WHERE user_id = $1::bigint AND reason = 'topup' AND delta > 0
+        ORDER BY created_at DESC
+        LIMIT 20`,
+      [idStr],
+    ),
+    query<{
+      id: string;
+      model: string;
+      status: "success" | "billing_failed" | "error";
+      cost_credits: string;
+      session_id: string | null;
+      created_at: Date;
+    }>(
+      `SELECT id::text AS id, model, status, cost_credits::text AS cost_credits,
+              session_id, created_at
+         FROM usage_records
+        WHERE user_id = $1::bigint
+        ORDER BY created_at DESC
+        LIMIT 30`,
+      [idStr],
+    ),
+    query<{
+      session_id: string;
+      request_count: string;
+      first_at: Date;
+      last_at: Date;
+      total_cost_credits: string;
+    }>(
+      `SELECT session_id,
+              COUNT(*)::text                              AS request_count,
+              MIN(created_at)                             AS first_at,
+              MAX(created_at)                             AS last_at,
+              COALESCE(SUM(cost_credits), 0)::text        AS total_cost_credits
+         FROM usage_records
+        WHERE user_id = $1::bigint
+          AND session_id IS NOT NULL
+          AND created_at > NOW() - INTERVAL '90 days'
+        GROUP BY session_id
+        ORDER BY MAX(created_at) DESC
+        LIMIT 10`,
+      [idStr],
+    ),
+  ]);
+
+  const lc = lifecycleRes.rows[0];
+  return {
+    user,
+    lifecycle: {
+      first_topup_at: lc?.first_topup_at?.toISOString() ?? null,
+      first_request_at: lc?.first_request_at?.toISOString() ?? null,
+      last_active_at: lc?.last_active_at?.toISOString() ?? null,
+    },
+    topups: topupsRes.rows.map((r) => ({
+      id: r.id,
+      delta: r.delta,
+      memo: r.memo,
+      created_at: r.created_at.toISOString(),
+    })),
+    recent_requests: requestsRes.rows.map((r) => ({
+      id: r.id,
+      model: r.model,
+      status: r.status,
+      cost_credits: r.cost_credits,
+      session_id: r.session_id,
+      created_at: r.created_at.toISOString(),
+    })),
+    recent_sessions: sessionsRes.rows.map((r) => ({
+      session_id: r.session_id,
+      request_count: Number(r.request_count),
+      first_at: r.first_at.toISOString(),
+      last_at: r.last_at.toISOString(),
+      total_cost_credits: r.total_cost_credits,
+    })),
+  };
+}
+
 // ─── Patch ─────────────────────────────────────────────────────────
 
 export interface PatchUserInput {
@@ -445,6 +688,9 @@ const USERS_CSV_HEADER = [
 export interface BuildUsersCsvInput {
   q?: string;
   status?: UserStatus | UserStatus[];
+  /** Phase B:与列表保持一致的过滤维度 */
+  registered_within?: RegisteredWithin;
+  funnel_state?: FunnelState;
 }
 
 export interface BuildUsersCsvResult {
@@ -453,9 +699,15 @@ export interface BuildUsersCsvResult {
 }
 
 export async function buildUsersCsv(input: BuildUsersCsvInput = {}): Promise<BuildUsersCsvResult> {
-  // buildUsersWhere 复用 list 的语义:q ILIKE / status whitelist。
+  // buildUsersWhere 复用 list 的语义:q ILIKE / status whitelist /
+  // registered_within / funnel_state(Phase B —— UI 与导出过滤保持一致)。
   // 不传 cursor — CSV 永远从最新到最旧,USERS_CSV_MAX_ROWS 行硬上限。
-  const { where, params } = buildUsersWhere({ q: input.q, status: input.status });
+  const { where, params } = buildUsersWhere({
+    q: input.q,
+    status: input.status,
+    registered_within: input.registered_within,
+    funnel_state: input.funnel_state,
+  });
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
   params.push(USERS_CSV_MAX_ROWS);
   const r = await query<AdminUserRowView>(

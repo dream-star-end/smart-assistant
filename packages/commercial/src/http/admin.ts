@@ -24,15 +24,21 @@ import {
   listUsers,
   listUsersWithStats,
   getUser,
+  getUserDetail,
   patchUser,
   buildUsersCsv,
   UserNotFoundError,
   type PatchUserInput,
   type AdminUserRowView,
   type AdminUserWithStatsRowView,
+  type AdminUserDetailResult,
   type UserStatus,
+  type RegisteredWithin,
+  type FunnelState,
   USER_STATUSES,
   USER_ROLES,
+  REGISTERED_WITHIN_VALUES,
+  FUNNEL_STATES,
 } from "../admin/users.js";
 import { getUsersStats } from "../admin/usersStats.js";
 import {
@@ -174,6 +180,36 @@ function parseNonNegativeInt(raw: string | null, name: string): number | undefin
   return n;
 }
 
+/**
+ * Phase B:Users 列表 + CSV 共用 — 解析 registered_within / funnel_state。
+ * 提到 helper 是因为这两参 List 接口 + CSV 接口都要传,把校验逻辑收一处避免漂移。
+ */
+function parseUserFunnelFilters(sp: URLSearchParams): {
+  registered_within?: RegisteredWithin;
+  funnel_state?: FunnelState;
+} {
+  const out: { registered_within?: RegisteredWithin; funnel_state?: FunnelState } = {};
+  const rw = sp.get("registered_within");
+  if (rw !== null && rw !== "") {
+    if (!(REGISTERED_WITHIN_VALUES as readonly string[]).includes(rw)) {
+      throw new HttpError(400, "VALIDATION", "invalid registered_within", {
+        issues: [{ path: "registered_within", message: rw }],
+      });
+    }
+    out.registered_within = rw as RegisteredWithin;
+  }
+  const fs = sp.get("funnel_state");
+  if (fs !== null && fs !== "") {
+    if (!(FUNNEL_STATES as readonly string[]).includes(fs)) {
+      throw new HttpError(400, "VALIDATION", "invalid funnel_state", {
+        issues: [{ path: "funnel_state", message: fs }],
+      });
+    }
+    out.funnel_state = fs as FunnelState;
+  }
+  return out;
+}
+
 /** RangeError(来自 ops 层)统一翻译成 400 VALIDATION。 */
 function translateRangeError(err: unknown): never {
   if (!(err instanceof RangeError)) throw err;
@@ -264,11 +300,13 @@ export async function handleAdminListUsers(
   // with_stats=1 → listUsersWithStats(追加 today/topup/last_active);默认不追,
   // 保持老调用者(如集成测试)读到的 shape 不变。
   const withStats = sp.get("with_stats") === "1";
+  // Phase B:新过滤维度,与 q/status/cursor 可叠加。
+  const funnelFilters = parseUserFunnelFilters(sp);
 
   try {
     if (withStats) {
       const r = await listUsersWithStats({
-        q: q === "" ? undefined : q, status, limit, offset, cursor,
+        q: q === "" ? undefined : q, status, limit, offset, cursor, ...funnelFilters,
       });
       sendJson(res, 200, {
         rows: r.rows.map(serializeUserWithStats),
@@ -277,7 +315,7 @@ export async function handleAdminListUsers(
       return;
     }
     const r = await listUsers({
-      q: q === "" ? undefined : q, status, limit, offset, cursor,
+      q: q === "" ? undefined : q, status, limit, offset, cursor, ...funnelFilters,
     });
     sendJson(res, 200, {
       rows: r.rows.map(serializeUser),
@@ -303,7 +341,16 @@ export async function handleAdminUsersStats(
   sendJson(res, 200, out);
 }
 
-// ─── GET /api/admin/users/:id ──────────────────────────────────────
+// ─── GET /api/admin/users/:id 或 /api/admin/users/:id/detail ───────
+//
+// router 同 method+pathPrefix 只挂一个 handler(matchRoute 找到第一个就 dispatch),
+// 所以 detail 子路径必须由本 handler 内部分流。规则:
+//   - /api/admin/users/:id/detail  → 返回 admin 详情聚合(getUserDetail)
+//   - /api/admin/users/:id         → 返回单行 user(getUser)
+// 严格正则,不允许任何尾段;否则 404。其它子路径(如 :id/credits)走 POST,
+// 不在本 GET 路径上。
+
+const USER_DETAIL_RE = /^\/api\/admin\/users\/([1-9][0-9]{0,19})\/detail$/;
 
 export async function handleAdminGetUser(
   req: IncomingMessage,
@@ -313,10 +360,34 @@ export async function handleAdminGetUser(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+
+  // detail 子路径优先匹配
+  const detailMatch = USER_DETAIL_RE.exec(url.pathname);
+  if (detailMatch) {
+    const id = detailMatch[1];
+    // id 已被正则保证为合法 bigint 字符串,getUserDetail 不会抛 RangeError;
+    // DB 错误正常冒泡到 router。
+    const detail = await getUserDetail(id);
+    if (!detail) throw new HttpError(404, "NOT_FOUND", "user not found");
+    sendJson(res, 200, serializeUserDetail(detail));
+    return;
+  }
+
+  // 否则要求严格 /api/admin/users/:id(extractTailId 会拒绝任何非 bigint 尾段)
   const id = extractTailId(url, "/api/admin/users/");
   const u = await getUser(id);
   if (!u) throw new HttpError(404, "NOT_FOUND", "user not found");
   sendJson(res, 200, { user: serializeUser(u) });
+}
+
+function serializeUserDetail(d: AdminUserDetailResult): Record<string, unknown> {
+  return {
+    user: serializeUser(d.user),
+    lifecycle: d.lifecycle,
+    topups: d.topups,
+    recent_requests: d.recent_requests,
+    recent_sessions: d.recent_sessions,
+  };
 }
 
 // ─── PATCH /api/admin/users/:id ────────────────────────────────────
@@ -1516,10 +1587,13 @@ export async function handleAdminExportUsersCsv(
         ? (statusList[0] as UserStatus)
         : (statusList as UserStatus[]);
 
+  // Phase B:CSV 导出与列表使用同一组过滤维度,避免运营看见的列表 ≠ 导出集
+  const funnelFilters = parseUserFunnelFilters(sp);
+
   let csv: string;
   let rowCount: number;
   try {
-    const r = await buildUsersCsv({ q, status });
+    const r = await buildUsersCsv({ q, status, ...funnelFilters });
     csv = r.csv;
     rowCount = r.rowCount;
   } catch (err) {
@@ -1533,7 +1607,12 @@ export async function handleAdminExportUsersCsv(
       target: q ? `q:${q}` : "all",
       after: {
         rows: rowCount,
-        filter: { q: q ?? null, status: status ?? null },
+        filter: {
+          q: q ?? null,
+          status: status ?? null,
+          registered_within: funnelFilters.registered_within ?? null,
+          funnel_state: funnelFilters.funnel_state ?? null,
+        },
       },
       ip: ctx.clientIp,
       userAgent: ctx.userAgent,

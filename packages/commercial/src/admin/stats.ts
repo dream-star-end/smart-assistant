@@ -157,6 +157,68 @@ export async function getRevenueByDay(days = 14): Promise<RevenueByDayRow[]> {
   }));
 }
 
+// ─── 注册趋势(按天) ─────────────────────────────────────────────────
+//
+// Phase C(admin 新用户跟踪):dashboard 注册量日折线。语义边界完全 mirror
+// getRevenueByDay —— Asia/Shanghai 自然日,exactly N 个 bucket(今天 + 前 N-1 天)。
+//
+// `verified` 是当前状态视角:cohort 中 email_verified=TRUE 的人数,会随时间
+// 单调上升(用户后续验证邮箱也会落入历史 bucket)。schema 没存 email_verified_at
+// 所以无法做"该日产生的验证事件"语义,这是已知 trade-off。
+
+export interface SignupsByDayRow {
+  /** ISO 日期(`YYYY-MM-DD`,Asia/Shanghai 当天) */
+  day: string;
+  /** 当日新注册人数(deleted_at IS NULL) */
+  signups: number;
+  /** 当日注册并已验证邮箱人数(cohort 当前状态) */
+  verified: number;
+}
+
+/**
+ * 最近 N 天注册量。N clamp 到 [1, 90],与 getRevenueByDay 一致。
+ *
+ * 索引依赖:users 表当前 <100k seq scan 可接受(usersStats.ts 既有结论);若
+ * 长期超过该规模,补 `users(created_at DESC) WHERE deleted_at IS NULL`。
+ */
+export async function getSignupsByDay(days = 14): Promise<SignupsByDayRow[]> {
+  const d = Math.min(90, Math.max(1, Math.floor(days)));
+  const r = await query<{
+    day: string;
+    signups: string;
+    verified: string;
+  }>(
+    `WITH days AS (
+       SELECT generate_series(
+         date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - ($1::int - 1) * INTERVAL '1 day',
+         date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai'),
+         INTERVAL '1 day'
+       ) AS day
+     ),
+     signups_agg AS (
+       SELECT date_trunc('day', created_at AT TIME ZONE 'Asia/Shanghai') AS day,
+              COUNT(*)                                AS signups,
+              COUNT(*) FILTER (WHERE email_verified)  AS verified
+       FROM users
+       WHERE deleted_at IS NULL
+         AND created_at >= ((date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - ($1::int - 1) * INTERVAL '1 day') AT TIME ZONE 'Asia/Shanghai')
+       GROUP BY 1
+     )
+     SELECT to_char(days.day, 'YYYY-MM-DD')              AS day,
+            COALESCE(signups_agg.signups,  0)::text       AS signups,
+            COALESCE(signups_agg.verified, 0)::text       AS verified
+     FROM days
+     LEFT JOIN signups_agg ON signups_agg.day = days.day
+     ORDER BY days.day ASC`,
+    [d],
+  );
+  return r.rows.map((x) => ({
+    day: x.day,
+    signups: Number(x.signups),
+    verified: Number(x.verified),
+  }));
+}
+
 // ─── 请求趋势(按小时) ───────────────────────────────────────────────
 
 export interface RequestSeriesBucket {

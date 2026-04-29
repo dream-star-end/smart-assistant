@@ -39,6 +39,7 @@ function baseSnapshot(overrides: Partial<RuleSnapshot> = {}): RuleSnapshot {
     rateLimitWindowMin: 10,
     loginFailureBlockedLastWindowMin: 0,
     loginFailureWindowMin: 10,
+    silentNewUserCount24h: 0,
     ...overrides,
   };
 }
@@ -240,9 +241,9 @@ describe("ruleLoginFailureSpike", () => {
 });
 
 describe("defaultPolledRules", () => {
-  test("包含 6 条默认规则", () => {
+  test("包含 7 条默认规则", () => {
     const rules = defaultPolledRules();
-    assert.equal(rules.length, 6);
+    assert.equal(rules.length, 7);
     const ids = rules.map((r) => r.id).sort();
     assert.deepEqual(ids, [
       EVENTS.ACCOUNT_POOL_ALL_DOWN,
@@ -251,6 +252,7 @@ describe("defaultPolledRules", () => {
       EVENTS.RISK_LOGIN_FAILURE_SPIKE,
       EVENTS.RISK_RATE_LIMIT_SPIKE,
       EVENTS.RISK_SIGNUP_SPIKE,
+      EVENTS.RISK_SILENT_NEW_USER_COHORT,
     ].sort());
   });
 

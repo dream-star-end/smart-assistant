@@ -57,6 +57,11 @@ export const KEY_SCHEMAS = {
   alerts_login_failure_spike_threshold: z.number().int().min(1).max(10_000),
   /** risk.login_failure_spike 时间窗口(分钟)。整数,1..240。 */
   alerts_login_failure_window_min: z.number().int().min(1).max(240),
+  /**
+   * risk.silent_new_user_cohort 阈值:过去 24h 注册但从未发过请求的人数 ≥ 此数触发。
+   * 整数,1..10000。窗口固定 24h(无对应 *_window_min)。
+   */
+  alerts_silent_new_user_threshold: z.number().int().min(1).max(10_000),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -77,6 +82,7 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   alerts_rate_limit_window_min: 10,
   alerts_login_failure_spike_threshold: 30,
   alerts_login_failure_window_min: 10,
+  alerts_silent_new_user_threshold: 5,
 };
 
 /** 给前端做 schema 自描述(admin UI 渲染表单用)。 */
@@ -117,6 +123,10 @@ export const KEY_META: Record<
   alerts_login_failure_window_min: {
     kind: "number", min: 1, max: 240,
     description: "risk.login_failure_spike 时间窗口(分钟)",
+  },
+  alerts_silent_new_user_threshold: {
+    kind: "number", min: 1, max: 10000,
+    description: "risk.silent_new_user_cohort 阈值:过去 24h 注册但从未发请求的人数 ≥ 此数触发(窗口固定 24h)",
   },
 };
 

@@ -110,6 +110,8 @@ import {
 import {
   handleAdminStatsDau,
   handleAdminStatsRevenueByDay,
+  handleAdminStatsSignupsByDay,
+  handleAdminStatsFunnel,
   handleAdminStatsRequestSeries,
   handleAdminStatsAlertsSummary,
   handleAdminStatsAccountPool,
@@ -507,6 +509,16 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/admin/stats/revenue-by-day',
       handler: handleAdminStatsRevenueByDay,
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/stats/signups-by-day',
+      handler: handleAdminStatsSignupsByDay,
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/stats/funnel',
+      handler: handleAdminStatsFunnel,
     },
     {
       method: 'GET',
