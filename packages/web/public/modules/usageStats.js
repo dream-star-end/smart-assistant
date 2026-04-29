@@ -12,9 +12,9 @@
 //   - cache_hit_rate = cache_read / (input + cache_read);cache_write 单独展示
 //   - 本地 formatYuan,不 import billing.js(避免双 ES module 实例)
 
-import { apiGet } from './api.js?v=0b1eb59'
-import { closeModal, openModal, toast } from './ui.js?v=0b1eb59'
-import { state } from './state.js?v=0b1eb59'
+import { apiGet } from './api.js?v=4f6693d'
+import { closeModal, openModal, toast } from './ui.js?v=4f6693d'
+import { state } from './state.js?v=4f6693d'
 
 let _wired = false
 // 分页状态:一个当前打开 modal 的快照。关闭后下次 open 会重置。
