@@ -209,7 +209,109 @@ TAR_SIZE_MB="$(( TAR_SIZE_BYTES / 1024 / 1024 ))"
 TAR_SHA256="$(sha256sum "$TAR_PATH" | awk '{print $1}')"
 
 # ───────────────────────────────────────────────
-# 4. summary
+# 4. master-side image GC (保留最新 N 个 + latest + 当前在用 + 本次 build)
+# ───────────────────────────────────────────────
+# 背景:每次 build 在 master 同时累积一份 docker image (~3.5GB) 和一份
+# tar.gz (~660MB)。8 个 tag 就能把 49GB 根盘打到 99% (历史事件 2026-04-29)。
+#
+# 远端 host 已有 _pruneRemoteStaleImages 在分发后自动清旧 tag,master 没有
+# 对应路径,所以这里收尾。
+#
+# 触发点:仅 build-image.sh 末尾。**不**写 systemd timer / cron — build 是
+# rebuild 的唯一入口,GC 频率 ≈ 累积频率,自然平衡。
+#
+# 保留集 = {本次 build $TAG} ∪ {latest} ∪ {OC_RUNTIME_IMAGE 当前指向 tag}
+#         ∪ {top OC_IMAGE_KEEP_LAST 个 by created desc}
+#
+# 边界:
+#   - in-use image rmi 自然 fail,best-effort skip(脚本不抛)
+#   - 不调 docker image prune / system prune(多租户主机越权 — archival
+#     arc-mof4luq1-r9o8ze 教训)
+#   - 不删 latest tag 自身
+#   - 不动 dangling <none>:<none>
+#   - 不删 build cache(boss 自管 docker builder prune)
+#
+# Env switches:
+#   OC_IMAGE_KEEP_LAST=N      # 默认 3
+#   OC_IMAGE_GC=0             # 整体跳过 GC(冻结历史 / 调试)
+#   OC_IMAGE_GC_DRY_RUN=1     # 打印待清单不执行
+if [ "${OC_IMAGE_GC:-1}" = "0" ]; then
+  echo "[build-image] image-gc skipped (OC_IMAGE_GC=0)"
+else
+  KEEP_LAST="${OC_IMAGE_KEEP_LAST:-3}"
+  DRY_RUN="${OC_IMAGE_GC_DRY_RUN:-0}"
+  ENV_FILE="/etc/openclaude/commercial.env"
+
+  # 当前在用 tag(从 OC_RUNTIME_IMAGE env 提取 ":<tag>" 部分)
+  # 文件不存在 / 行不存在都返回空字符串,不让 set -e 中断
+  CURRENT_TAG=""
+  if [ -f "$ENV_FILE" ]; then
+    OC_LINE="$(grep -E '^OC_RUNTIME_IMAGE=' "$ENV_FILE" 2>/dev/null || true)"
+    if [ -n "$OC_LINE" ]; then
+      # OC_RUNTIME_IMAGE=openclaude/openclaude-runtime:<tag>  →  <tag>
+      CURRENT_TAG="$(printf '%s' "$OC_LINE" | sed -n 's/^OC_RUNTIME_IMAGE=.*:\([^[:space:]]*\)$/\1/p')"
+    fi
+  fi
+
+  # 列出本仓所有 tag,按 docker images 默认 created desc 顺序
+  # --format 用 \t 分隔,docker 自身保证 created desc(最新在前)
+  ALL_TAGS_FILE="$(mktemp)"
+  trap 'rm -f "$ALL_TAGS_FILE"' EXIT
+  docker images "$IMAGE_REPO" --format '{{.Tag}}' > "$ALL_TAGS_FILE" 2>/dev/null || true
+
+  # 构建 keep set (用 newline-separated 文本,grep -F -x -f 比较)。
+  # 选 top KEEP_LAST 个历史 tag 时:**先**过滤掉 latest / TAG / CURRENT_TAG,
+  # 否则它们会占 KEEP_LAST 槽位,实际保留的独立历史版本数 < KEEP_LAST。
+  KEEP_FILE="$(mktemp)"
+  trap 'rm -f "$ALL_TAGS_FILE" "$KEEP_FILE"' EXIT
+  PROTECT_FILE="$(mktemp)"
+  trap 'rm -f "$ALL_TAGS_FILE" "$KEEP_FILE" "$PROTECT_FILE"' EXIT
+  {
+    echo "$TAG"
+    echo "latest"
+    [ -n "$CURRENT_TAG" ] && echo "$CURRENT_TAG"
+  } | sort -u > "$PROTECT_FILE"
+  # `|| true` 兜底:全新机器首次 build 时 ALL_TAGS - PROTECT 可能为空,grep -v
+  # 无匹配返回 exit 1,set -euo pipefail 下会让外层 { } 子块中断。
+  {
+    cat "$PROTECT_FILE"
+    { grep -v '^<none>$' "$ALL_TAGS_FILE" | grep -F -x -v -f "$PROTECT_FILE" | head -n "$KEEP_LAST"; } || true
+  } | sort -u > "$KEEP_FILE"
+
+  # 待清 = ALL - KEEP, 跳过 <none>
+  STALE_TAGS="$(grep -v '^<none>$' "$ALL_TAGS_FILE" | grep -F -x -v -f "$KEEP_FILE" || true)"
+
+  echo "[build-image] image-gc keep_last=$KEEP_LAST dry_run=$DRY_RUN current_tag=${CURRENT_TAG:-<none>}"
+  echo "[build-image] image-gc keep set:"
+  sed 's/^/  - /' "$KEEP_FILE"
+
+  if [ -z "$STALE_TAGS" ]; then
+    echo "[build-image] image-gc no stale tags to remove"
+  else
+    echo "[build-image] image-gc stale tags:"
+    printf '  - %s\n' $STALE_TAGS
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "[build-image] image-gc DRY_RUN — no changes"
+    else
+      for t in $STALE_TAGS; do
+        if docker rmi "${IMAGE_REPO}:${t}" >/dev/null 2>&1; then
+          echo "[build-image] image-gc rmi ok: ${IMAGE_REPO}:${t}"
+          # 同时清对应 tar.gz(若存在)
+          STALE_TAR="${IMAGE_OUT_DIR}/openclaude-runtime-${t}.tar.gz"
+          if [ -f "$STALE_TAR" ]; then
+            rm -f "$STALE_TAR" && echo "[build-image] image-gc rm tar: $STALE_TAR"
+          fi
+        else
+          # 多半是 in-use(active container 引用),best-effort skip
+          echo "[build-image] image-gc rmi skipped (in-use? other err): ${IMAGE_REPO}:${t}"
+        fi
+      done
+    fi
+  fi
+fi
+
+# ───────────────────────────────────────────────
+# 5. summary
 # ───────────────────────────────────────────────
 cat <<EOF
 
