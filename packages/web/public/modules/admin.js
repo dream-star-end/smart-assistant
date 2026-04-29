@@ -16,9 +16,9 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { _clearStoredAccessToken, state } from './state.js?v=e2174fa'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=e2174fa'
-import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=e2174fa'
+import { _clearStoredAccessToken, state } from './state.js?v=d42fc0d'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=d42fc0d'
+import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=d42fc0d'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
@@ -532,6 +532,16 @@ async function renderDashboardTab() {
         </div>
         <div class="chart-card">
           <div class="chart-card-head">
+            <h3>新注册 · 最近 14 天</h3>
+            <span class="chart-sub" id="dash-signups-sub">—</span>
+          </div>
+          <div class="chart-card-body"><canvas id="dash-chart-signups"></canvas></div>
+        </div>
+      </div>
+
+      <div class="chart-grid" style="grid-template-columns: 1fr 1fr;">
+        <div class="chart-card">
+          <div class="chart-card-head">
             <h3>告警 · 7d 事件分布</h3>
             <a class="admin-link" data-nav="alerts">告警中心 →</a>
           </div>
@@ -676,7 +686,7 @@ async function loadDashboardData(seq) {
   // 并行拉 stats + 明细 (accounts / ledger) + orders KPI + P2 Plan v10 新 2 条
   // (hosts-utilization 用于"容器活跃""虚机利用率"KPI 与新堆叠柱;alert-events-7d
   // 替换原 24h alerts 卡)。每个端点独立 fulfilled/rejected,失败的不传染其他卡。
-  const [dauR, revR, reqR, poolR, accountsR, ledgerR, ordersKpiR, hostsR, alerts7dR] = await Promise.allSettled([
+  const [dauR, revR, reqR, poolR, accountsR, ledgerR, ordersKpiR, hostsR, alerts7dR, signupsR] = await Promise.allSettled([
     apiGet(`/api/admin/stats/dau?window=${encodeURIComponent(dauW)}`),
     apiGet(`/api/admin/stats/revenue-by-day?days=14`),
     apiGet(`/api/admin/stats/request-series?hours=${reqH}`),
@@ -686,6 +696,7 @@ async function loadDashboardData(seq) {
     apiGet(`/api/admin/orders/kpi`),
     apiGet(`/api/admin/stats/hosts-utilization`),
     apiGet(`/api/admin/stats/alert-events-7d`),
+    apiGet(`/api/admin/stats/signups-by-day?days=14`),
   ])
 
   // R2 Codex M1:fetch 期间如果用户切 tab / 又触发了一次 renderDashboardTab,
@@ -713,6 +724,8 @@ async function loadDashboardData(seq) {
   const hostsUtil  = hostsOk ? hostsR.value : null
   const alerts7dOk = alerts7dR.status === 'fulfilled'
   const alerts7d   = alerts7dOk ? (alerts7dR.value?.rows || []) : []
+  const signupsOk  = signupsR.status === 'fulfilled'
+  const signups    = signupsOk ? (signupsR.value?.rows || []) : []
 
   // ─── KPI 卡片(P2 Plan v10:11 张,2 行 6+5) ───
   // 商业类(0..5): DAU / 新注册 / 付费 / 返场 / 7d营收 / 24h订单异常
@@ -886,6 +899,33 @@ async function loadDashboardData(seq) {
     } else {
       _renderChartError(revCanvas, '加载失败')
       const sub = $('dash-revenue-sub')
+      if (sub) sub.textContent = '—'
+    }
+  }
+
+  // ─── Chart: 新注册柱状(signups + verified 双柱)───
+  const signupsCanvas = document.getElementById('dash-chart-signups')
+  if (signupsCanvas) {
+    if (signupsOk) {
+      DASH_STATE.charts.signups = signupsCanvas
+      barChart(signupsCanvas, {
+        labels: signups.map((r) => cfmt.dayShort(r.day)),
+        series: [
+          { label: '新注册', data: signups.map((r) => Number(r.signups) || 0) },
+          { label: '已验证', data: signups.map((r) => Number(r.verified) || 0),
+            color: getComputedStyle(document.documentElement).getPropertyValue('--success').trim() || '#5cb85c' },
+        ],
+        yFormatter: (v) => Number.isInteger(v) ? String(v) : v.toFixed(1),
+      })
+      const sub = $('dash-signups-sub')
+      if (sub) {
+        const totalS = signups.reduce((a, r) => a + (Number(r.signups) || 0), 0)
+        const totalV = signups.reduce((a, r) => a + (Number(r.verified) || 0), 0)
+        sub.textContent = `合计 ${totalS} 注册  ·  ${totalV} 已验证`
+      }
+    } else {
+      _renderChartError(signupsCanvas, '加载失败')
+      const sub = $('dash-signups-sub')
       if (sub) sub.textContent = '—'
     }
   }
@@ -1065,7 +1105,30 @@ const USERS_STATE = {
   /** 当前搜索/过滤快照,用于判断"按条件翻下一页"时是否还是同一查询。 */
   q: '',
   status: '',
+  /** P-FILTER:注册时间 chip — 空 / today / yesterday / 7d / 30d。 */
+  registeredWithin: '',
+  /** P-FILTER:漏斗状态 chip — 空 / unverified / no_topup / no_request / silent_24h。 */
+  funnelState: '',
+  /** P-FUNNEL:漏斗 KPI 窗口 7 / 30(只前端显示用,后端两个参数化端点)。 */
+  funnelDays: 7,
+  /** 防 funnel KPI 异步竞态(切 7/30 来回点)。 */
+  funnelLoadSeq: 0,
 }
+
+const REG_WITHIN_CHIPS = [
+  { value: '',          label: '全部时间' },
+  { value: 'today',     label: '今天' },
+  { value: 'yesterday', label: '昨天' },
+  { value: '7d',        label: '7 天内' },
+  { value: '30d',       label: '30 天内' },
+]
+const FUNNEL_STATE_CHIPS = [
+  { value: '',             label: '全部漏斗' },
+  { value: 'unverified',   label: '未验证邮箱' },
+  { value: 'no_topup',     label: '未充值' },
+  { value: 'no_request',   label: '未请求' },
+  { value: 'silent_24h',   label: '24h 内沉默' },
+]
 
 const USERS_PAGE_SIZE = 50
 

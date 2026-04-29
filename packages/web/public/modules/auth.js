@@ -34,8 +34,8 @@
 //
 // CF 边缘缓存对 api.js/state.js 自身的改动仍靠 sw.js VERSION bump 触发 SW 新一轮
 // 预缓存 + 运行时 `cache: 'no-store'` 接管。
-import { apiFetch } from './api.js?v=e2174fa'
-import { state } from './state.js?v=e2174fa'
+import { apiFetch } from './api.js?v=d42fc0d'
+import { state } from './state.js?v=d42fc0d'
 
 const TURNSTILE_SCRIPT = 'https://challenges.cloudflare.com/turnstile/v0/api.js?onload=__ocTurnstileReady&render=explicit'
 let _publicConfig = null
@@ -94,7 +94,7 @@ export async function mintSessionCookie(accessToken, expectedEpoch) {
   // fire-and-forget 的 dynamic-import mint callback 跨身份漂移。
   //   场景:A 的 refresh 还在路上 → B 登录成功(bump epoch + 串行 await clear→mint)
   //   → A 的 refresh 响应到达 → _doRefreshOnce 内部 epoch check 已拦下(没 commit token),
-  //     但 success 分支的 `import('./auth.js?v=e2174fa').then(mint)` 异步链晚一 tick 才跑,到那时
+  //     但 success 分支的 `import('./auth.js?v=d42fc0d').then(mint)` 异步链晚一 tick 才跑,到那时
   //     epoch 已是 B 的,旧 A 的 mint 仍会:
   //       1) abortInflightMintClear() 中断 B 的 mint/clear 请求
   //       2) 发一个带 A token 的 /api/auth/session(Bearer 已用 data.access_token 参数拷贝)
