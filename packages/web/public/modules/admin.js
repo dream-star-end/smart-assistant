@@ -16,9 +16,9 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { _clearStoredAccessToken, state } from './state.js?v=f04112d'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=f04112d'
-import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=f04112d'
+import { _clearStoredAccessToken, state } from './state.js?v=af48829'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=af48829'
+import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=af48829'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
