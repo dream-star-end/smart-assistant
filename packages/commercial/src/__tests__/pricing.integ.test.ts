@@ -280,6 +280,8 @@ describe("/api/public/models (http integ)", () => {
   before(async () => {
     if (!pgAvailable || !redis) return;
     await query("DELETE FROM model_pricing");
+    // 注意:haiku 故意 enabled=TRUE 模拟生产状态(boss 翻 true 让 WebFetch 能用),
+    // 但 listPublic / /api/public/models 必须把它过滤掉(品牌叙事:UI 不展示)。
     await query(
       `INSERT INTO model_pricing(model_id, display_name,
          input_per_mtok, output_per_mtok,
@@ -287,7 +289,8 @@ describe("/api/public/models (http integ)", () => {
          multiplier, enabled, sort_order)
        VALUES
          ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100),
-         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90)`,
+         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90),
+         ('claude-haiku-4-5','Claude Haiku 4.5',80,400,8,100,1.5,TRUE,110)`,
     );
     pricing = new PricingCache();
     await pricing.load();
@@ -334,6 +337,21 @@ describe("/api/public/models (http integ)", () => {
     assert.equal(j.models[0].multiplier, "2.000");
     assert.equal(j.models[1].id, "claude-sonnet-4-6");
     assert.equal(j.models[1].input_per_ktok_credits, "0.006000");
+  });
+
+  test("/api/public/models excludes haiku-4-5 even when enabled (品牌 vs 路由二态)", async (t) => {
+    if (skipIfNoPg(t) || !redis || !server) {
+      t.skip("fixtures not ready");
+      return;
+    }
+    // 端到端验证:DB 里 haiku enabled=TRUE 且 PricingCache.get('claude-haiku-4-5')
+    // 命中(下条 assertion);但 /api/public/models 响应里**不**含 haiku。
+    // 这把品牌侧的"前台不展示"行为锁死在 http 出口。
+    assert.ok(pricing!.get("claude-haiku-4-5"), "DB 里 haiku 仍应可路由");
+    const r = await fetch(`${baseUrl}/api/public/models`);
+    const j = (await r.json()) as { models: Array<{ id: string }> };
+    assert.ok(!j.models.some((m) => m.id === "claude-haiku-4-5"));
+    assert.equal(j.models.length, 2, "只有 sonnet + opus 出现在 picker");
   });
 
   test("/api/models alias returns same payload (V3 2F)", async (t) => {

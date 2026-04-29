@@ -187,6 +187,23 @@ describe("PricingCache (unit, no DB)", () => {
     assert.equal(p.get("claude-opus-4-7-20260101")?.model_id, "claude-opus-4-7");
   });
 
+  test("haiku-4-5 is hidden from listPublic but reachable via get() (品牌 vs 路由二态分离)", () => {
+    // 品牌叙事:Haiku 不在前台 picker / landing 显示。
+    // 路由层:WebFetch 等容器内部小模型用途仍然命中 pricing.get()。
+    // 这条用例锁定二态分离;参见 pricing.ts HIDDEN_FROM_PUBLIC_LIST 的注释。
+    const p = new PricingCache();
+    p._setForTests([haiku, sonnet, opus]);
+
+    // listPublic 不含 haiku
+    const ids = p.listPublic().map((m) => m.id);
+    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6"]);
+    assert.ok(!ids.includes("claude-haiku-4-5"), "haiku must be hidden");
+
+    // 但 get 仍然命中(用 canonical 和 firstParty 长名两条路径都验)
+    assert.equal(p.get("claude-haiku-4-5")?.model_id, "claude-haiku-4-5");
+    assert.equal(p.get("claude-haiku-4-5-20251001")?.model_id, "claude-haiku-4-5");
+  });
+
   test("get rejects garbage prefix even when haiku row exists", () => {
     // 真实入口行为锁定:即便 DB 里有 haiku 这一条,前缀垃圾也不能命中。
     // canonicalizeModelId 单独有同样的拒绝测试,这里再多覆盖 PricingCache.get

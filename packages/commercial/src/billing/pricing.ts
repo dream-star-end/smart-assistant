@@ -152,6 +152,27 @@ export function canonicalizeModelId(modelId: string): string {
 }
 
 /**
+ * 模型对前台不可见(但 API 路由仍可调用)的黑名单。
+ *
+ * 语义:
+ *   - `enabled=true` + `model_id ∈ HIDDEN_FROM_PUBLIC_LIST`
+ *     → `pricing.get()` 仍命中,anthropicProxy 接受请求,正常计费(WebFetch
+ *       等容器内部小模型用途不受影响)
+ *     → `listPublic()` 排除,所有走 `/api/public/models` / `/api/models` 的
+ *       前台消费方(模型选择器、landing 价格表、agents 偏好等)看不到
+ *
+ * 为什么不直接 `enabled=false`:
+ *   anthropicProxy 路由前会检查 `pricing.enabled`,关闭后容器内 WebFetch 调
+ *   Haiku 摘要直接 400 UNKNOWN_MODEL。所以"内部能用、前台不展示"必须二态
+ *   分离。
+ *
+ * 当前唯一成员:
+ *   - claude-haiku-4-5(品牌叙事是"满血 Opus / Sonnet",Haiku 不出现在 UI;
+ *     boss 决策 2026-04-21,WebFetch 修复路径见 fix(commercial/pricing) e2174fa)
+ */
+const HIDDEN_FROM_PUBLIC_LIST: ReadonlySet<string> = new Set(["claude-haiku-4-5"]);
+
+/**
  * 定价缓存 + NOTIFY 监听。单实例使用;测试可 new 多个并用 connectionString override。
  */
 export class PricingCache {
@@ -253,12 +274,13 @@ export class PricingCache {
   }
 
   /**
-   * 列出启用模型(按 sort_order 升序),用于 `/api/public/models`。
+   * 列出启用且**对前台可见**的模型(按 sort_order 升序),用于 `/api/public/models`。
+   * 同时过滤 `enabled=false` 和 `HIDDEN_FROM_PUBLIC_LIST`(后者参见上方 const 注释)。
    * 返回已经算好"每 ktok 积分数"的公共视图,调用方 JSON.stringify 即可。
    */
   listPublic(): PublicModel[] {
     return [...this.map.values()]
-      .filter((p) => p.enabled)
+      .filter((p) => p.enabled && !HIDDEN_FROM_PUBLIC_LIST.has(p.model_id))
       .sort((a, b) => a.sort_order - b.sort_order)
       .map((p) => ({
         id: p.model_id,
