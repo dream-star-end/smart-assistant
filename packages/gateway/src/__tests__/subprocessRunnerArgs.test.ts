@@ -154,6 +154,30 @@ describe('buildCcbCliArgs', () => {
     }
   })
 
+  it('emits --setting-sources user when restrictedMemorySources=true', () => {
+    // v3 商业版容器 leak fix: CCB 默认会从 cwd 父链扫描 Project/Local CLAUDE.md,
+    // 把镜像内 /opt/openclaude/CLAUDE.md (个人版 dev rules) 注入系统提示。
+    // 启用后只读 User memory = ${CLAUDE_CONFIG_DIR}/CLAUDE.md = 平台 baseline ro mount。
+    const args = buildCcbCliArgs({ ...BASE, restrictedMemorySources: true })
+    assert.ok(
+      hasFlagWithValue(args, '--setting-sources', 'user'),
+      'restrictedMemorySources=true must emit --setting-sources user',
+    )
+    // placeholder '' 必须仍是最后一个 arg(setting-sources 在它之前)
+    assert.equal(args[args.length - 1], '')
+  })
+
+  it('omits --setting-sources entirely when restrictedMemorySources is false/undefined', () => {
+    for (const v of [false, undefined]) {
+      const args = buildCcbCliArgs({ ...BASE, restrictedMemorySources: v })
+      assert.equal(
+        args.includes('--setting-sources'),
+        false,
+        `restrictedMemorySources=${String(v)} must NOT emit --setting-sources (个人版/dev 行为不变)`,
+      )
+    }
+  })
+
   it('always terminates args with the empty prompt placeholder', () => {
     // Several shapes — the empty string always trails.
     for (const input of [
@@ -161,6 +185,7 @@ describe('buildCcbCliArgs', () => {
       { ...BASE, permissionMode: 'bypassPermissions' },
       { ...BASE, resumeSessionId: 'x' },
       { ...BASE, addDir: '/tmp' },
+      { ...BASE, restrictedMemorySources: true },
     ]) {
       const args = buildCcbCliArgs(input)
       assert.equal(args[args.length - 1], '', `last arg must be '' for input ${JSON.stringify(input)}`)

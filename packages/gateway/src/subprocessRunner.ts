@@ -141,6 +141,19 @@ export interface CcbCliArgsInput {
   mcpConfigFile?: string
   addDir?: string
   resumeSessionId?: string | null
+  /**
+   * 屏蔽 CCB 的 Project / Local CLAUDE.md 自动扫描,只读 User memory
+   * (= `${CLAUDE_CONFIG_DIR}/CLAUDE.md`,在 v3 商业版容器里就是平台基线 ro mount)。
+   *
+   * 商业版 v3 用户容器镜像里 `/opt/openclaude/` 仓库副本含 `CLAUDE.md`、
+   * `claude-code-best/CLAUDE.md` 等内部文件,默认情况下 CCB 项目内存父链扫描会
+   * 把它们注入系统提示 → 个人版 dev 流程 / 反编译声明等敏感信息泄露给商业版用户。
+   * 启用此项后,CCB 启动时传 `--setting-sources user`,Project + Local 全跳过,
+   * 仅保留平台显式 mount 的 baseline CLAUDE.md(走 User memory 通道)。
+   *
+   * 个人版 / dev 实例不应启用 —— boss 自己使用时仍要 Project memory(本仓 CLAUDE.md)。
+   */
+  restrictedMemorySources?: boolean
 }
 
 /**
@@ -168,6 +181,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     mcpConfigFile,
     addDir,
     resumeSessionId,
+    restrictedMemorySources,
   } = input
   const args: string[] = [
     runtime === 'bun' ? 'run' : '--experimental-strip-types',
@@ -198,6 +212,9 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   if (mcpConfigFile) args.push('--mcp-config', mcpConfigFile)
   if (addDir) args.push('--add-dir', addDir)
   if (resumeSessionId) args.push('--resume', resumeSessionId)
+  // v3 商业版用户容器: 只允许 User memory(=平台 baseline ro mount), Project/Local 全跳过。
+  // 见 CcbCliArgsInput.restrictedMemorySources 注释。
+  if (restrictedMemorySources) args.push('--setting-sources', 'user')
   // 必须给一个 prompt placeholder,CCB stream-json 会从 stdin 接管
   args.push('')
   return args
@@ -391,6 +408,14 @@ export class SubprocessRunner extends EventEmitter {
       mcpConfigFile: learningContext.mcpConfigFile,
       addDir: this.opts.cwd,
       resumeSessionId: this.currentSessionId,
+      // v3 商业版用户容器判定。双信号 OR 兜底:
+      //  - OC_CONTAINER_ID:私有 env,v3supervisor 仅在 bridgeSecret 就位时注入(语义最清晰)。
+      //  - CLAUDE_CONFIG_DIR === '/run/oc/claude-config':v3supervisor.ts:1189 无条件注入,
+      //    即使 bridgeSecret 缺失(降级模式,容器无 OC_CONTAINER_ID)依然能识别为 v3 容器。
+      // 个人版 master / dev 都不会出现这两条之一,信号空间不重叠。
+      restrictedMemorySources:
+        !!process.env.OC_CONTAINER_ID ||
+        process.env.CLAUDE_CONFIG_DIR === '/run/oc/claude-config',
     })
 
     // ── Provider-aware auth injection ──
