@@ -24,7 +24,12 @@ import { z } from 'zod'
 import { createHash } from 'node:crypto'
 import { tx, query } from '../db/queries.js'
 import { hashPassword } from './passwords.js'
-import { newVerifyToken, newVerifyCode, VERIFY_EMAIL_TTL_SECONDS } from './register.js'
+import {
+  newVerifyToken,
+  newVerifyCode,
+  SIGNUP_BONUS_CENTS,
+  VERIFY_EMAIL_TTL_SECONDS,
+} from './register.js'
 import { verifyTurnstile, TurnstileError } from './turnstile.js'
 import type { Mailer } from './mail.js'
 
@@ -185,10 +190,56 @@ export async function verifyEmail(
       evId,
     ])
     if (!already_verified) {
-      await client.query(
-        'UPDATE users SET email_verified = TRUE, updated_at = $1::timestamptz WHERE id = $2',
-        [nowIso, userId],
+      // 反薅羊毛改造(2026-04-29):注册 ¥3 赠金从 register 移到这里发放,
+      // 攻击者必须真能收到验证邮件 + 输码才能拿到积分。
+      //
+      // 幂等:同 user 已有任何 reason='promotion' 行 → 跳过加钱。
+      // 兼容三种历史 ledger 形态:
+      //   (a) 旧用户已 verified:不会进本分支(already_verified=true)
+      //   (b) 旧用户未 verified 但 register 时已发了 ¥3(ref_type IS NULL):
+      //       该 user 已有 promotion 行 → 跳过 → credits 维持 300
+      //   (c) 新用户(本次 fix 之后注册):无 promotion 行 → 发新行
+      //       (ref_type='signup_bonus' 标记新策略)
+      //
+      // LDC SSO 用户的 promotion 行写在 socialLogin.ts,但合成 email
+      // `linuxdo-<id>@users.claudeai.chat` 永远不会进 verifyEmail 流程,
+      // 不存在串扰。
+      //
+      // Admin 手动写过 reason='promotion' 调整的 user 不再补注册赠金,
+      // admin 已动过的账户算特殊处理(罕见,可手动再调)。
+      const dup = await client.query(
+        `SELECT 1 FROM credit_ledger
+          WHERE user_id = $1 AND reason = 'promotion'
+          LIMIT 1`,
+        [userId],
       )
+      if (dup.rows.length === 0) {
+        const upd = await client.query<{ credits: string }>(
+          `UPDATE users
+              SET credits = credits + $1::bigint,
+                  email_verified = TRUE,
+                  updated_at = $2::timestamptz
+            WHERE id = $3
+            RETURNING credits::text AS credits`,
+          [SIGNUP_BONUS_CENTS.toString(), nowIso, userId],
+        )
+        await client.query(
+          `INSERT INTO credit_ledger(user_id, delta, balance_after, reason, ref_type, memo)
+           VALUES ($1::bigint, $2::bigint, $3::bigint, 'promotion', 'signup_bonus', $4)`,
+          [
+            userId,
+            SIGNUP_BONUS_CENTS.toString(),
+            upd.rows[0].credits,
+            '邮箱验证赠送 ¥3',
+          ],
+        )
+      } else {
+        // 已发过(旧未验证用户 / admin 调过) → 只翻 verified flag
+        await client.query(
+          'UPDATE users SET email_verified = TRUE, updated_at = $1::timestamptz WHERE id = $2',
+          [nowIso, userId],
+        )
+      }
     }
     return { user_id: userId, newly_verified: !already_verified }
   })

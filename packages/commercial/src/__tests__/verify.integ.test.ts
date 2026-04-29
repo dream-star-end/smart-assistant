@@ -171,6 +171,110 @@ describe("auth.verify.verifyEmail (integ)", () => {
       [userId],
     );
     assert.notEqual(ev.rows[0].used_at, null, "code must be marked used");
+
+    // 2026-04-29 反薅羊毛改造:¥3 赠金在 verifyEmail 时刻发,不在 register。
+    // 验证后 users.credits=300,credit_ledger 出 1 行 promotion + ref_type='signup_bonus'。
+    const cred = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id = $1",
+      [userId],
+    );
+    assert.equal(cred.rows[0].credits, "300", "verifyEmail 应发放 ¥3 注册赠金");
+    const led = await query<{
+      delta: string;
+      balance_after: string;
+      reason: string;
+      ref_type: string | null;
+      memo: string | null;
+    }>(
+      `SELECT delta::text AS delta, balance_after::text AS balance_after,
+              reason, ref_type, memo
+         FROM credit_ledger WHERE user_id = $1`,
+      [userId],
+    );
+    assert.equal(led.rows.length, 1, "应只有 1 条赠送 ledger 行");
+    assert.equal(led.rows[0].delta, "300");
+    assert.equal(led.rows[0].balance_after, "300");
+    assert.equal(led.rows[0].reason, "promotion");
+    assert.equal(led.rows[0].ref_type, "signup_bonus");
+    assert.match(led.rows[0].memo ?? "", /邮箱验证赠送/);
+  });
+
+  test("idempotent bonus: admin resets email_verified→false, re-verify does NOT double-credit", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { userId, rawCode, verifyEmail: email } =
+      await registerAndCaptureVerifyToken("idem@example.com", "pwd idem long");
+    await verifyEmail(email, rawCode);
+
+    // 模拟 admin 把 email_verified 重置为 false 并发新码
+    await query(
+      "UPDATE users SET email_verified = FALSE WHERE id = $1",
+      [userId],
+    );
+    const mailer = new CapturingMailer();
+    await resendVerification(email, { mailer });
+    const newCode = mailer.sent[0]?.text.match(/\n {4}(\d{6})\n/)?.[1];
+    assert.ok(newCode, "重发应产生新码");
+
+    // 再走一次 verifyEmail → email_verified 翻 TRUE,但 credits 不重复加
+    const r = await verifyEmail(email, newCode!);
+    assert.equal(r.newly_verified, true, "再次进入 false→true 路径");
+
+    const cred = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id = $1",
+      [userId],
+    );
+    assert.equal(cred.rows[0].credits, "300", "credits 不应被重复发放");
+    const led = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1 AND reason = 'promotion'",
+      [userId],
+    );
+    assert.equal(led.rows[0].cnt, "1", "promotion ledger 仍应只有 1 行");
+  });
+
+  test("legacy unverified user with pre-existing promotion row: re-verify keeps credits=300, no new ledger", async (t) => {
+    if (skipIfNoPg(t)) return;
+    // 模拟旧版用户:register 时已写过 credits=300 + promotion(ref_type IS NULL)
+    const { userId, rawCode, verifyEmail: email } =
+      await registerAndCaptureVerifyToken("legacy@example.com", "pwd legacy long");
+    await query(
+      "UPDATE users SET credits = 300 WHERE id = $1",
+      [userId],
+    );
+    await query(
+      `INSERT INTO credit_ledger(user_id, delta, balance_after, reason, memo)
+       VALUES ($1::bigint, 300, 300, 'promotion', '新用户注册赠送 ¥3')`,
+      [userId],
+    );
+
+    const r = await verifyEmail(email, rawCode);
+    assert.equal(r.newly_verified, true);
+
+    // 旧 promotion 行存在 → dup 命中 → 不再加 credits / 不再写新行
+    const cred = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id = $1",
+      [userId],
+    );
+    assert.equal(cred.rows[0].credits, "300", "旧用户余额维持 300,不应翻倍");
+    const led = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1 AND reason = 'promotion'",
+      [userId],
+    );
+    assert.equal(led.rows[0].cnt, "1", "应仅 1 行 promotion(原有的旧行)");
+  });
+
+  test("invalid code → no credits granted", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { userId, verifyEmail: email } =
+      await registerAndCaptureVerifyToken("nocred@example.com", "pwd nocred long");
+    await assert.rejects(
+      verifyEmail(email, "000000"),
+      (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
+    );
+    const cred = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id = $1",
+      [userId],
+    );
+    assert.equal(cred.rows[0].credits, "0", "失败的 verify 不应发放赠金");
   });
 
   test("code reuse: second call → INVALID_TOKEN", async (t) => {
