@@ -1,5 +1,9 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { copyFile, mkdir, readdir } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, join } from 'node:path'
+import { paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'codexRunner' })
@@ -47,6 +51,26 @@ export interface CodexRunnerOpts {
 /** Max stderr we keep per turn. Codex CLI normally logs only on error, but
  *  if it goes haywire we don't want to balloon memory. */
 const STDERR_CAP = 64 * 1024 // 64 KB
+
+/** Image extensions produced by codex's built-in image_gen tool. We scan the
+ *  per-thread generated_images directory after each turn for new files matching
+ *  these so we can surface them to the web client (codex's image_gen does NOT
+ *  emit item.* events on the JSON stream — see scanForNewImages docstring). */
+const IMAGE_EXTS = ['.png', '.webp', '.jpg', '.jpeg']
+
+/**
+ * Per-thread directory where codex CLI persists images created via the built-in
+ * `image_gen` skill. Path mirrors what we observed in the codex 0.125 install
+ * at `~/.codex/generated_images/<thread_id>/ig_<hash>.png`.
+ *
+ * threadId is sanitized: codex thread_ids are ULID-like (alphanumeric + hyphens)
+ * but we sanitize defensively so future format drift cannot escape the dir.
+ *
+ * Exported only so tests can construct expected paths consistently.
+ */
+export function _sanitizeThreadId(threadId: string): string {
+  return threadId.replace(/[^A-Za-z0-9._-]/g, '')
+}
 
 /** Env keys scrubbed from the codex subprocess environment.
  *  Rationale: codex CLI uses ChatGPT oauth from ~/.codex/auth.json — it has
@@ -189,6 +213,100 @@ export class CodexRunner extends EventEmitter {
     this.threadId = opts.resumeSessionId ?? null
   }
 
+  /** Per-thread codex image dir. Overridable in tests via subclass / patch. */
+  protected getCodexImageDir(threadId: string): string {
+    return join(homedir(), '.codex', 'generated_images', _sanitizeThreadId(threadId))
+  }
+
+  /** OpenClaude public generated/ dir. Overridable in tests. */
+  protected getPublicGeneratedDir(): string {
+    return paths.generatedDir
+  }
+
+  /**
+   * List image filenames in a codex thread image dir, swallowing ENOENT/etc.
+   * Returns an empty set when threadId is null or the directory doesn't exist
+   * yet (fresh thread before its first image_gen call).
+   */
+  protected async readImageDirSafe(threadId: string | null): Promise<Set<string>> {
+    if (!threadId) return new Set()
+    try {
+      const entries = await readdir(this.getCodexImageDir(threadId), {
+        withFileTypes: true,
+      })
+      const out = new Set<string>()
+      for (const e of entries) {
+        if (!e.isFile()) continue
+        const lower = e.name.toLowerCase()
+        if (IMAGE_EXTS.some((ext) => lower.endsWith(ext))) out.add(e.name)
+      }
+      return out
+    } catch {
+      // ENOENT, EACCES → "no images" from our perspective.
+      return new Set()
+    }
+  }
+
+  /**
+   * Copy newly-generated codex images into OpenClaude's public generated/ dir
+   * (which is in `FILE_ALLOWED_DIRS` — the gateway `/api/file` allowlist).
+   *
+   * Codex's native dir `~/.codex/generated_images/` is NOT in the allowlist, so
+   * surfacing those raw paths to the web client would result in 403 from
+   * `/api/file?path=...`. By copying we keep the allowlist surface narrow.
+   *
+   * Returns successfully copied entries (with both source and public paths so
+   * caller can dedupe against either) plus a list of names that failed to copy.
+   * Per Codex review: failures are NOT downgraded to "use source path" because
+   * that path is unreachable from the web client anyway.
+   */
+  protected async copyImagesToPublicDir(
+    threadId: string,
+    filenames: string[],
+  ): Promise<{
+    copied: Array<{ srcName: string; srcPath: string; publicPath: string }>
+    failedNames: string[]
+  }> {
+    const safeThread = _sanitizeThreadId(threadId)
+    const srcDir = this.getCodexImageDir(threadId)
+    const dstDir = this.getPublicGeneratedDir()
+    // paths.generatedDir is created on demand elsewhere (uploads, MCP media);
+    // on a fresh OpenClaude install with no prior media, it may not exist yet.
+    // mkdir recursive is idempotent — cheaper than a stat+create dance.
+    try {
+      await mkdir(dstDir, { recursive: true })
+    } catch (err) {
+      // If we can't create the dir, every copyFile below will ENOENT and we'll
+      // surface "image copy failed" to the user. Log once here so the root
+      // cause is in the journal.
+      log.warn('codex image public dir mkdir failed', {
+        dstDir,
+        err: (err as Error).message,
+      })
+    }
+    const copied: Array<{ srcName: string; srcPath: string; publicPath: string }> = []
+    const failedNames: string[] = []
+    for (const name of filenames) {
+      const src = join(srcDir, name)
+      // codex-${threadId}-${basename} prevents cross-thread or repeat-copy
+      // collisions in the shared public dir. The basename itself is already a
+      // 32+ hex hash from codex (`ig_<hash>.png`).
+      const dst = join(dstDir, `codex-${safeThread}-${basename(name)}`)
+      try {
+        await copyFile(src, dst)
+        copied.push({ srcName: name, srcPath: src, publicPath: dst })
+      } catch (err) {
+        log.warn('codex image copy failed', {
+          src,
+          dst,
+          err: (err as Error).message,
+        })
+        failedNames.push(name)
+      }
+    }
+    return { copied, failedNames }
+  }
+
   async start(): Promise<void> {
     // Codex runs per-turn; there's no long-lived child. We still emit `spawn`
     // synchronously so sessionManager resets its per-session cost baseline
@@ -267,7 +385,7 @@ export class CodexRunner extends EventEmitter {
     return buildCodexCliArgs({ model: this.opts.model, threadId: this.threadId })
   }
 
-  private runTurn(prompt: string): Promise<void> {
+  private async runTurn(prompt: string): Promise<void> {
     const startedAt = Date.now()
     const args = this.buildArgs()
     log.info('codex turn start', {
@@ -275,6 +393,15 @@ export class CodexRunner extends EventEmitter {
       resumed: this.threadId != null,
       promptChars: prompt.length,
     })
+
+    // Baseline scan of codex's per-thread image dir so we can identify which
+    // files are NEW after this turn. For resume turns we have threadId already;
+    // for fresh turns (no resume id) the dir typically doesn't exist yet — we
+    // re-scan in the close handler with this.threadId, and any pre-existing
+    // file would have to predate `thread.started`, which is impossible in
+    // practice (dir is created by codex when it persists the first image of
+    // that thread). Fresh-turn baseline is therefore safely empty.
+    const baselineFiles = await this.readImageDirSafe(this.threadId)
 
     return new Promise<void>((resolve) => {
       let settled = false
@@ -382,35 +509,171 @@ export class CodexRunner extends EventEmitter {
       })
 
       proc.on('close', (code, signal) => {
-        this.proc = null
-        const durationMs = Date.now() - startedAt
-        log.info('codex turn end', {
-          sessionKey: this.opts.sessionKey,
+        // Hand off to async finalizer. We deliberately do NOT await inside the
+        // 'close' callback (Node EventEmitter ignores the returned promise);
+        // instead the helper owns try/catch and end-of-turn ordering:
+        //   image scan → image copy → text_delta emit → emitResult → settle.
+        // Any throw is caught and downgraded to log+result so we never leave
+        // a turn unsettled.
+        void this.finalizeTurn({
           code,
           signal,
-          durationMs,
-          assistantChars: lastAssistantText.length,
+          startedAt,
+          baselineFiles,
+          stderrBuf,
+          getLastAssistantText: () => lastAssistantText,
+          setLastAssistantText: (v: string) => {
+            lastAssistantText = v
+          },
+          usage,
+          settled: () => settled,
+          settle,
         })
-        if (code === 0) {
-          this.emitResult({
-            durationMs,
-            ok: true,
-            text: lastAssistantText,
-            usage,
-          })
-        } else {
-          const errMsg =
-            stderrBuf.trim().slice(-2000) ||
-            `codex exec exited code=${code} signal=${signal ?? ''}`
-          this.emitResult({
-            durationMs,
-            ok: false,
-            error: errMsg,
-          })
-        }
-        settle()
       })
     })
+  }
+
+  /**
+   * Finalize a turn after the codex child process has closed: scan for newly
+   * generated `image_gen` files, copy them into the public `generated/` dir,
+   * inject their absolute paths as a `text_delta` so the web client renders
+   * them, then emit the `result` event and settle.
+   *
+   * Why this exists: codex's built-in `image_gen` tool persists images at
+   * `~/.codex/generated_images/<thread_id>/ig_<hash>.png` but does NOT emit
+   * any `item.started`/`item.completed` event for the image_gen call itself
+   * on the `--json` exec stream. Without this finalizer, an image-only turn
+   * looks like an empty `agent_message` to upstream (assistantChars=0) and
+   * the web client reports "no content".
+   */
+  private async finalizeTurn(args: {
+    code: number | null
+    signal: NodeJS.Signals | null
+    startedAt: number
+    baselineFiles: Set<string>
+    stderrBuf: string
+    getLastAssistantText: () => string
+    setLastAssistantText: (v: string) => void
+    usage: { input_tokens?: number; output_tokens?: number } | undefined
+    settled: () => boolean
+    settle: () => void
+  }): Promise<void> {
+    const { code, signal, startedAt, baselineFiles, stderrBuf, settled, settle } = args
+    this.proc = null
+    if (settled()) return // 'error' handler already settled; nothing to do.
+
+    // Wrap the entire body in try/catch/finally so that even if logging or
+    // an emitResult listener throws synchronously, settle() still fires (from
+    // finally) and the catch downgrades the throw to a logged error — without
+    // this, the close handler's `void this.finalizeTurn(...)` would surface
+    // as an unhandled promise rejection.
+    try {
+      const durationMs = Date.now() - startedAt
+      let imageFiles = 0
+
+      // Only scan on success — a non-zero exit means we have nothing meaningful
+      // to surface; the user gets the stderr-derived error instead.
+      if (code === 0 && this.threadId) {
+        try {
+          const allFiles = await this.readImageDirSafe(this.threadId)
+          const newNames = [...allFiles].filter((f) => !baselineFiles.has(f)).sort()
+          imageFiles = newNames.length
+          if (newNames.length > 0) {
+            const { copied, failedNames } = await this.copyImagesToPublicDir(
+              this.threadId,
+              newNames,
+            )
+            // Dedupe only against the public path. We deliberately do NOT skip
+            // when codex already mentioned the source path or bare basename:
+            // - source path (~/.codex/generated_images/...) is unreachable from
+            //   the web client (not in `/api/file` allowlist), so emitting our
+            //   public copy alongside is what makes the image actually visible
+            // - bare basename in model prose ("saved as ig_x.png") is not a
+            //   renderable path, so suppressing the public path emit would
+            //   regress to the original "no image visible" bug.
+            const currentText = args.getLastAssistantText()
+            const toEmit = copied
+              .filter(({ publicPath }) => !currentText.includes(publicPath))
+              .map((c) => c.publicPath)
+            if (toEmit.length > 0) {
+              // Surrounding blank lines ensure the frontend's "absolute path on
+              // its own line → render attachment" recognizer matches each path.
+              const imgText = `\n\n${toEmit.join('\n')}\n`
+              this.emit('message', {
+                type: 'stream_event',
+                session_id: this.threadId,
+                event: {
+                  type: 'content_block_delta',
+                  index: 0,
+                  delta: { type: 'text_delta', text: imgText },
+                },
+              } as unknown as RunnerMessage)
+              args.setLastAssistantText(currentText + imgText)
+            }
+            if (failedNames.length > 0) {
+              // Per Codex review: don't emit unreachable source paths. Just tell
+              // the user copy failed so the absence of an attachment is
+              // explained — a UI "silent drop" is worse than an error line.
+              const note = `\n\n[image copy failed: ${failedNames.join(', ')}]\n`
+              this.emit('message', {
+                type: 'stream_event',
+                session_id: this.threadId,
+                event: {
+                  type: 'content_block_delta',
+                  index: 0,
+                  delta: { type: 'text_delta', text: note },
+                },
+              } as unknown as RunnerMessage)
+              args.setLastAssistantText(args.getLastAssistantText() + note)
+            }
+          }
+        } catch (err) {
+          // Image surfacing must never block the turn from settling. Worst case
+          // the user sees the (possibly empty) original assistant text.
+          log.warn('codex image scan/copy failed', {
+            sessionKey: this.opts.sessionKey,
+            err: (err as Error).message,
+          })
+        }
+      }
+
+      const finalAssistantText = args.getLastAssistantText()
+      log.info('codex turn end', {
+        sessionKey: this.opts.sessionKey,
+        code,
+        signal,
+        durationMs,
+        assistantChars: finalAssistantText.length,
+        imageFiles,
+      })
+
+      if (code === 0) {
+        this.emitResult({
+          durationMs,
+          ok: true,
+          text: finalAssistantText,
+          usage: args.usage,
+        })
+      } else {
+        const errMsg =
+          stderrBuf.trim().slice(-2000) || `codex exec exited code=${code} signal=${signal ?? ''}`
+        this.emitResult({
+          durationMs,
+          ok: false,
+          error: errMsg,
+        })
+      }
+    } catch (err) {
+      // Synchronous throws from this.emit / emitResult / log.* would otherwise
+      // become unhandled promise rejections (close handler calls us via
+      // `void this.finalizeTurn(...)`). settle() still fires from finally.
+      log.error('codex turn finalize failed', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
+    } finally {
+      settle()
+    }
   }
 
   /**
@@ -575,7 +838,7 @@ export class CodexRunner extends EventEmitter {
       total_cost_usd: 0,
       duration_ms: opts.durationMs,
       is_error: !opts.ok,
-      result: opts.ok ? opts.text ?? '' : opts.error ?? 'codex error',
+      result: opts.ok ? (opts.text ?? '') : (opts.error ?? 'codex error'),
       usage: opts.usage,
     }
     this.emit('message', msg)
