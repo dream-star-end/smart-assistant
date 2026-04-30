@@ -45,6 +45,7 @@ import { EVENTS } from "../admin/alertEvents.js";
 import {
   waitContainerReady,
   DEFAULT_READINESS_TIMEOUT_MS,
+  DEFAULT_READINESS_TIMEOUT_REMOTE_MS,
   DEFAULT_READINESS_INTERVAL_MS,
   DEFAULT_HTTP_PROBE_MS,
   DEFAULT_WS_PROBE_MS,
@@ -199,13 +200,21 @@ async function defaultResolveBridgeTunnelTarget(hostId: string): Promise<NodeAge
   return hostRowToTarget(row);
 }
 
-function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerReadyOptions {
+/**
+ * @internal exported for regression test only。
+ *
+ * 注意:不 eager 填 timeoutMs(self/remote 默认值不同,由 waitContainerReady 按
+ * endpoint kind 决策)。caller 显式传 healthzTimeoutMs 时才透传。本约定靠
+ * v3EnsureRunning.test.ts 的 buildReadinessOpts 用例守门 — 历史上有人把 eager
+ * default 加回来会让 remote 默认 25s 退化回 10s,该测试会 fail。
+ */
+export function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerReadyOptions {
   const out: WaitContainerReadyOptions = {
-    timeoutMs: opts.healthzTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS,
     intervalMs: opts.healthzIntervalMs ?? DEFAULT_READINESS_INTERVAL_MS,
     httpProbeMs: opts.healthzProbeMs ?? DEFAULT_HTTP_PROBE_MS,
     wsProbeMs: opts.wsProbeMs ?? DEFAULT_WS_PROBE_MS,
   };
+  if (opts.healthzTimeoutMs !== undefined) out.timeoutMs = opts.healthzTimeoutMs;
   if (opts.probeHealthz) out.probeHttp = opts.probeHealthz;
   if (opts.probeWsUpgrade) out.probeWs = opts.probeWsUpgrade;
   if (opts.sleep) out.sleep = opts.sleep;
@@ -478,7 +487,10 @@ export function makeV3EnsureRunning(
 
 // 给测试用的 default constants(也作为 wrapper 默认值的 SSOT,改这里要同步)
 export const ENSURE_RUNNING_DEFAULTS = Object.freeze({
+  /** self-host(direct) readiness 默认总超时 */
   HEALTHZ_TIMEOUT_MS: DEFAULT_READINESS_TIMEOUT_MS,
+  /** remote host(node-tunnel) readiness 默认总超时 — 比 self 长,吸收 mTLS RTT */
+  HEALTHZ_TIMEOUT_REMOTE_MS: DEFAULT_READINESS_TIMEOUT_REMOTE_MS,
   HEALTHZ_INTERVAL_MS: DEFAULT_READINESS_INTERVAL_MS,
   HEALTHZ_PROBE_MS: DEFAULT_HTTP_PROBE_MS,
   WS_PROBE_MS: DEFAULT_WS_PROBE_MS,

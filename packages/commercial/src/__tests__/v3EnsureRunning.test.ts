@@ -28,6 +28,7 @@ import type { Pool, PoolClient } from "pg";
 import {
   makeV3EnsureRunning,
   ENSURE_RUNNING_DEFAULTS,
+  buildReadinessOpts,
 } from "../agent-sandbox/v3ensureRunning.js";
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import {
@@ -635,5 +636,28 @@ describe("makeV3EnsureRunning", () => {
     // cap 在事务前直接拒 → 不 createContainer / 不 start
     assert.strictEqual(captured.containersCreated, 0);
     assert.strictEqual(captured.started, 0);
+  });
+
+  // V1.0.53 — buildReadinessOpts 不再 eager 填 timeoutMs(留给 waitContainerReady
+  // 按 endpoint kind 选 self 10s / remote 25s)。这条测试守门:谁要把 eager
+  // default 加回来,这里会先 fail,免得 remote 默认 25s 又退化回 10s。
+  describe("buildReadinessOpts (lazy timeout regression guard)", () => {
+    test("不传 healthzTimeoutMs → out.timeoutMs 必须 undefined(留给 waitContainerReady 按 endpoint 决策)", () => {
+      const out = buildReadinessOpts({});
+      assert.strictEqual(out.timeoutMs, undefined,
+        "如果这里不是 undefined,说明谁在 buildReadinessOpts 里 eager 填了 default — 会让 remote 退回 10s");
+    });
+
+    test("显式传 healthzTimeoutMs → 透传到 out.timeoutMs", () => {
+      const out = buildReadinessOpts({ healthzTimeoutMs: 12_345 });
+      assert.strictEqual(out.timeoutMs, 12_345);
+    });
+
+    test("interval / probe 单次超时 仍 eager 填 default(只有总 timeout 改 lazy)", () => {
+      const out = buildReadinessOpts({});
+      assert.strictEqual(out.intervalMs, ENSURE_RUNNING_DEFAULTS.HEALTHZ_INTERVAL_MS);
+      assert.strictEqual(out.httpProbeMs, ENSURE_RUNNING_DEFAULTS.HEALTHZ_PROBE_MS);
+      assert.strictEqual(out.wsProbeMs, ENSURE_RUNNING_DEFAULTS.WS_PROBE_MS);
+    });
   });
 });

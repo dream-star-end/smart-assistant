@@ -20,6 +20,8 @@ import {
   probeWsUpgrade,
   probeHealthzViaTunnel,
   probeWsUpgradeViaTunnel,
+  DEFAULT_READINESS_TIMEOUT_MS,
+  DEFAULT_READINESS_TIMEOUT_REMOTE_MS,
 } from "../agent-sandbox/v3readiness.js";
 import type {
   NodeAgentTarget,
@@ -259,6 +261,75 @@ describe("waitContainerReady", () => {
       );
       assert.strictEqual(ok, false);
     } finally { await s.close(); }
+  });
+
+  // V1.0.53 — 跨 host 默认 timeout 25s,self 默认 10s,caller 不传 timeoutMs
+  // 时由 endpoint kind 决策(逻辑放在 waitContainerReady 内)。
+  //
+  // loop 语义(读测试的人务必看):waitContainerReady 第一轮 probe 在 t=0 立即跑(不等 interval),
+  // 之后每轮 sleep(intervalMs) 推进 mock now;`now() >= deadline` 时直接 return false **不再 probe**。
+  // intervalMs=5000 + direct deadline=10000 → probe 在 t=0,5000 各 1 次,t=10000 触达退出 → 共 2 次。
+  // intervalMs=5000 + remote deadline=25000 → probe 在 t=0,5000,10000,15000,20000 各 1 次,t=25000 退出 → 共 5 次。
+  // 改 loop 边界(例如改成 deadline 时再 probe 一次)需要同步本测试断言。
+  test("direct endpoint + 不传 timeoutMs → 默认 deadline = 10s", async () => {
+    let httpCalls = 0;
+    let nowVal = 0;
+    const ok = await waitContainerReady(
+      { kind: "direct", host: "h", port: 1 },
+      {
+        // 故意不传 timeoutMs;intervalMs=5000 让 loop 5 步内退出便于断言
+        intervalMs: 5_000,
+        probeHttp: async () => { httpCalls++; return false; },
+        probeWs: async () => true,  // 不应被调到(httpFalse 跳过 ws)
+        sleep: async (ms: number) => { nowVal += ms; },
+        now: () => nowVal,
+      },
+    );
+    assert.strictEqual(ok, false);
+    // direct 默认 10s:probe 调 2 次(t=0, t=5000),t=10000 时 deadline 触达退出。
+    // 等价于"deadline ≤ DEFAULT_READINESS_TIMEOUT_MS",不会进第 3 轮。
+    assert.strictEqual(DEFAULT_READINESS_TIMEOUT_MS, 10_000, "default self timeout 改了请同步本测试");
+    assert.strictEqual(httpCalls, 2, `direct 默认 10s 应调 probeHttp 2 次,实际 ${httpCalls}`);
+  });
+
+  test("node-tunnel endpoint + 不传 timeoutMs → 默认 deadline = 25s(remote 长 timeout)", async () => {
+    let httpCalls = 0;
+    let nowVal = 0;
+    const ok = await waitContainerReady(
+      // 注意:同时传 probeHttp+probeWs 时 needTarget=false,不触发 resolveTarget
+      { kind: "node-tunnel", hostId: "fake-host", containerInternalId: "fake-cid" },
+      {
+        intervalMs: 5_000,
+        probeHttp: async () => { httpCalls++; return false; },
+        probeWs: async () => true,
+        sleep: async (ms: number) => { nowVal += ms; },
+        now: () => nowVal,
+      },
+    );
+    assert.strictEqual(ok, false);
+    // node-tunnel 默认 25s:probe 调 5 次(t=0, 5000, 10000, 15000, 20000),
+    // t=25000 时 deadline 触达退出。区分自 direct 的关键断言。
+    assert.strictEqual(DEFAULT_READINESS_TIMEOUT_REMOTE_MS, 25_000, "default remote timeout 改了请同步本测试");
+    assert.strictEqual(httpCalls, 5, `node-tunnel 默认 25s 应调 probeHttp 5 次,实际 ${httpCalls}`);
+  });
+
+  test("caller 显式传 timeoutMs 时 endpoint kind 不影响超时", async () => {
+    // node-tunnel 但 caller 把 timeout 缩到 10s — caller 优先级最高
+    let httpCalls = 0;
+    let nowVal = 0;
+    const ok = await waitContainerReady(
+      { kind: "node-tunnel", hostId: "h", containerInternalId: "c" },
+      {
+        timeoutMs: 10_000,  // 覆盖默认的 25s
+        intervalMs: 5_000,
+        probeHttp: async () => { httpCalls++; return false; },
+        probeWs: async () => true,
+        sleep: async (ms: number) => { nowVal += ms; },
+        now: () => nowVal,
+      },
+    );
+    assert.strictEqual(ok, false);
+    assert.strictEqual(httpCalls, 2, `caller 传 timeoutMs=10000 应覆盖 remote 默认值,实际 ${httpCalls} 次`);
   });
 });
 
