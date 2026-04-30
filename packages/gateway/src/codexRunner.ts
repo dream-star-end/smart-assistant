@@ -110,6 +110,37 @@ interface QueuedTurn {
   reject: (err: Error) => void
 }
 
+/**
+ * Pure argv builder for `codex exec [resume]`. Exported for unit tests.
+ *
+ * Permission stance: `--dangerously-bypass-approvals-and-sandbox` is a single
+ * flag that sets `sandbox_mode=danger-full-access` AND `approval_policy=never`
+ * in one go. We use it because:
+ *   - OpenClaude's personal instance treats codex with the same trust as ccb
+ *     (bypassPermissions). Restricting codex to workspace-write while ccb runs
+ *     unrestricted on the same machine is incoherent.
+ *   - Approvals can never be answered: `sendPermissionResponse` is a no-op
+ *     (codex has no UI back-channel through OpenClaude).
+ *   - Verified against codex 0.125.0: this flag is accepted by both
+ *     `codex exec` and `codex exec resume`. (Earlier versions rejected
+ *     `--sandbox` on resume with code=2 — that's why this code historically
+ *     used `--full-auto` instead. The bypass flag has no such asymmetry.)
+ *
+ * Do NOT combine with `--full-auto` or `-c approval_policy=...` — they are
+ * either redundant or conflicting once bypass is set.
+ */
+export function buildCodexCliArgs(opts: {
+  model?: string
+  threadId?: string | null
+}): string[] {
+  const base = ['--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox']
+  if (opts.model) base.push('--model', opts.model)
+  if (opts.threadId) {
+    return ['exec', 'resume', ...base, opts.threadId, '-']
+  }
+  return ['exec', ...base, '-']
+}
+
 export class CodexRunner extends EventEmitter {
   private threadId: string | null
   private proc: ChildProcessWithoutNullStreams | null = null
@@ -137,9 +168,9 @@ export class CodexRunner extends EventEmitter {
   }
 
   sendPermissionResponse(_requestId: string, _response: unknown): boolean {
-    // codex has its own sandbox approval flow (workspace-write) — gateway
-    // permission prompts are never emitted by this runner, so nothing to
-    // respond to.
+    // codex doesn't route approvals through OpenClaude (we run it with
+    // --dangerously-bypass-approvals-and-sandbox + approval=never), so this
+    // runner never emits permission prompts and there's nothing to respond to.
     return false
   }
 
@@ -233,25 +264,7 @@ export class CodexRunner extends EventEmitter {
   }
 
   private buildArgs(): string[] {
-    // approval_policy=never prevents codex from ever asking for approval
-    // (we have no UI path to answer — sendPermissionResponse is a no-op).
-    // --full-auto is codex's alias for `--sandbox workspace-write` AND is
-    // the only sandbox-setting flag accepted by both `codex exec` and
-    // `codex exec resume` (resume rejects `--sandbox` outright, which
-    // silently broke every multi-turn codex conversation with code=2).
-    // Model comes from agents.yaml.
-    const base = [
-      '--json',
-      '--skip-git-repo-check',
-      '--full-auto',
-      '-c',
-      'approval_policy="never"',
-    ]
-    if (this.opts.model) base.push('--model', this.opts.model)
-    if (this.threadId) {
-      return ['exec', 'resume', ...base, this.threadId, '-']
-    }
-    return ['exec', ...base, '-']
+    return buildCodexCliArgs({ model: this.opts.model, threadId: this.threadId })
   }
 
   private runTurn(prompt: string): Promise<void> {
