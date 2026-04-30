@@ -218,6 +218,16 @@ export function clearTurnTiming(sess) {
   if (!sess) return
   sess._turnStartedAt = null
   sess._lastFrameAt = null
+  // 2026-04-30 v1.0.54 — cold-start hint 也是 turn 级状态:turn 收尾(isFinal/stop/stuck)
+  // 必须清掉,避免下一轮没必要地继续显示 "容器首次加载中"。挂在这里覆盖所有 teardown
+  // 路径(handleOutbound isFinal / outbound.error / sendStop / handleResumeFailed)。
+  sess._isFirstTurnAfterReady = false
+}
+
+// Cold-start hint 后缀:仅当 sess._isFirstTurnAfterReady 为 true 时附加。
+// 与 stale-warn / stale-danger 互斥的展示策略由调用点决定;后缀只参与 "正常思考中" 文案。
+function _coldHintSuffix(sess) {
+  return sess && sess._isFirstTurnAfterReady ? ' · 容器首次加载中,稍候' : ''
 }
 
 export function showTypingIndicator() {
@@ -230,7 +240,8 @@ export function showTypingIndicator() {
   const agentInfo = state.agentsList.find((a) => a.id === (sess?.agentId || state.defaultAgentId))
   const av = htmlSafeEscape(agentInfo?.avatarEmoji || 'O')
   const name = agentInfo?.displayName || sess?.agentId || 'AI'
-  el.innerHTML = `<div class="avatar">${av}</div><div class="typing-dots"><span></span><span></span><span></span></div><span class="typing-label">${htmlSafeEscape(name)} 思考中</span>`
+  const hint = _coldHintSuffix(sess)
+  el.innerHTML = `<div class="avatar">${av}</div><div class="typing-dots"><span></span><span></span><span></span></div><span class="typing-label">${htmlSafeEscape(name)} 思考中${htmlSafeEscape(hint)}</span>`
   // Bind to the session that owned the current view when the indicator was created,
   // so the timer keeps reading the correct session even if the user switches tabs.
   const boundSessId = sess?.id || null
@@ -246,6 +257,9 @@ export function showTypingIndicator() {
     const label = el.querySelector('.typing-label')
     if (!label) return
     const silenceMs = Date.now() - lastFrame
+    // stale-warn / stale-danger 时不带 cold-hint(信息已饱和,再加冗长后缀只会噪声)。
+    // 仅 "正常思考中" 文案保留 hint —— 这是 cold-start 起首几秒最需要的窗口。
+    const hint = _coldHintSuffix(_sess)
     if (silenceMs >= STALE_DANGER_MS) {
       label.textContent = `${name} 可能已卡住 (${secs}s · 已 ${Math.round(silenceMs / 1000)}s 无响应)`
       el.classList.add('stale-danger')
@@ -255,7 +269,11 @@ export function showTypingIndicator() {
       el.classList.add('stale-warn')
       el.classList.remove('stale-danger')
     } else if (secs >= 5) {
-      label.textContent = `${name} 思考中 (${secs}s)`
+      label.textContent = `${name} 思考中 (${secs}s)${hint}`
+      el.classList.remove('stale-warn', 'stale-danger')
+    } else if (hint) {
+      // <5s 也允许 cold hint 进入(sys.cold_start 在 typing 起首即可激活,不等 5s)。
+      label.textContent = `${name} 思考中${hint}`
       el.classList.remove('stale-warn', 'stale-danger')
     }
   }, 1000)
@@ -1190,6 +1208,7 @@ export function connect() {
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
       else if (f.type === 'outbound.cost_charged') handleCostCharged(f)
+      else if (f.type === 'sys.cold_start') handleColdStart(f)
       else if (f.type === 'outbound.ack' && f.deduplicated) {
         // Server already processed this message; clear drain state so queue continues
         if (state._offlineDrainingCurrent) {
@@ -2223,6 +2242,37 @@ function handleCostCharged(frame) {
 //
 // 故意不在这里关 typing / replyTracker —— 那些工作 handleOutbound 在 isFinal
 // 分支会做,本帧不是 turn 终止器。
+
+// 2026-04-30 v1.0.54 — sys.cold_start 是 v3 商用版 ws bridge 的副信道帧:
+// userChatBridge 在 ResolveContainerEndpoint.coldStart === true 且 containerWs open
+// 时主动注入。表示 "本次容器是冷启动 provision 的,首条响应会偏慢"。
+//
+// 副作用:
+//   1) 当前活跃 session 标记 _isFirstTurnAfterReady = true,typing-indicator
+//      下次 1s tick 自动加上 hint(<5s 也走 hint 分支,不必等 5s 才显);
+//   2) 如果 typing-indicator 已经渲染,主动改 DOM —— 因为 sys.cold_start 通常
+//      在 user 帧已发出 / typing-indicator 已 mount 之后才到达,等 1s tick 太慢。
+//
+// flag 在 clearTurnTiming(isFinal / stop / stuck)时统一清除,无需在此自洽。
+function handleColdStart(_frame) {
+  const sess = getSession()
+  if (!sess) return
+  sess._isFirstTurnAfterReady = true
+  const el = document.getElementById('__typing')
+  if (!el) return
+  const label = el.querySelector('.typing-label')
+  if (!label) return
+  // 已渲染情况下 stale-warn / stale-danger 已带统计后缀,不打扰;只有正常状态才覆盖。
+  if (el.classList.contains('stale-warn') || el.classList.contains('stale-danger')) return
+  const agentInfo = state.agentsList.find((a) => a.id === (sess.agentId || state.defaultAgentId))
+  const name = agentInfo?.displayName || sess.agentId || 'AI'
+  const startedAt = sess._turnStartedAt || Date.now()
+  const secs = Math.round((Date.now() - startedAt) / 1000)
+  label.textContent = secs >= 5
+    ? `${name} 思考中 (${secs}s) · 容器首次加载中,稍候`
+    : `${name} 思考中 · 容器首次加载中,稍候`
+}
+
 function handleOutboundError(frame) {
   const peerId = frame.peer?.id
   const sess = peerId ? state.sessions.get(peerId) : null

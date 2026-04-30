@@ -20,6 +20,10 @@
  *   - ws_bridge_buffered_bytes{side}                       histogram
  *   - ws_bridge_session_duration_seconds{cause}            histogram
  *
+ * v3 cold-start observability:
+ *   - container_ensure_duration_seconds{kind}              histogram (cold=provision, warm=reuse)
+ *   - ws_bridge_ttft_seconds{kind}                         histogram (first user→container frame to first container→user frame)
+ *
  * ### 设计取舍
  *   - 不引 `prom-client`:依赖小 + 我们只要十几个系列,手搓可控(2I-2 加 Histogram 类)
  *   - 计数器是进程级 module-level Map(单实例 gateway 进程内聚合,符合当前部署)
@@ -396,6 +400,34 @@ export const wsBridgeSessionDuration = new Histogram(
   WS_SESSION_DURATION_BUCKETS,
 );
 
+// V3 cold-start observability:
+//   - container_ensure_duration_seconds:ensureRunning 总耗时(包含 readiness 等待),
+//     kind=cold 表示本次调用走了 provision 分支,warm 表示直接命中 running。
+//     注:仅在 ensure 成功 return 时 observe;throw 路径不计(混入会拉偏 latency 分布)。
+//   - ws_bridge_ttft_seconds:bridge 视角的"用户感知响应时间",起点是 bridge 收到首个
+//     user→container 帧,终点是首个 container→user 帧。kind 透 endpoint.coldStart。
+//     不用 upgrade/handshake 起点是为了避免被欢迎弹窗 / 用户阅读时间污染。
+const COLDSTART_BUCKETS = [0.5, 1, 2, 5, 10, 15, 30, 60] as const;
+const TTFT_BRIDGE_BUCKETS = [0.1, 0.5, 1, 2, 5, 10, 30] as const;
+
+export const containerEnsureDuration = new Histogram(
+  {
+    name: "container_ensure_duration_seconds",
+    help: "Time spent in v3 ensureRunning (seconds), labeled by kind: cold=provision branch, warm=running reuse",
+    labelNames: ["kind"], // cold | warm
+  },
+  COLDSTART_BUCKETS,
+);
+
+export const wsBridgeTtft = new Histogram(
+  {
+    name: "ws_bridge_ttft_seconds",
+    help: "First user frame to first container frame in user-chat-bridge (seconds), labeled by kind from endpoint.coldStart. Note: kind=warm does not strictly mean the user did not experience a cold start (provision+readiness retry can mislabel; trade-off accepted).",
+    labelNames: ["kind"], // cold | warm
+  },
+  TTFT_BRIDGE_BUCKETS,
+);
+
 // ─── 便捷 incr / observe helpers ────────────────────────────────────
 
 export function observeAnthropicProxyTtft(model: string, seconds: number): void {
@@ -435,6 +467,16 @@ export function observeWsBridgeBuffered(side: BridgeSide, bytes: number): void {
 
 export function observeWsBridgeSessionDuration(cause: string, seconds: number): void {
   wsBridgeSessionDuration.observe({ cause }, seconds);
+}
+
+export type ColdWarmKind = "cold" | "warm";
+
+export function observeContainerEnsureDuration(kind: ColdWarmKind, seconds: number): void {
+  containerEnsureDuration.observe({ kind }, seconds);
+}
+
+export function observeWsBridgeTtft(kind: ColdWarmKind, seconds: number): void {
+  wsBridgeTtft.observe({ kind }, seconds);
 }
 
 /**
@@ -547,6 +589,8 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   anthropicProxyReject.render(out);
   wsBridgeBufferedBytes.render(out);
   wsBridgeSessionDuration.render(out);
+  containerEnsureDuration.render(out);
+  wsBridgeTtft.render(out);
   // gauges 走 collector
   accountPoolHealth.render(out);
   agentRunning.render(out);
@@ -569,6 +613,8 @@ export function resetMetricsForTest(): void {
   anthropicProxyReject.reset();
   wsBridgeBufferedBytes.reset();
   wsBridgeSessionDuration.reset();
+  containerEnsureDuration.reset();
+  wsBridgeTtft.reset();
 }
 
 /** 给 alerts.ts 读取 account health / agent running 的 snapshot(避免双查)。 */

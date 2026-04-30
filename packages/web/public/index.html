@@ -987,6 +987,34 @@
   </div>
 </div>
 
+<!-- Welcome modal — 新用户首次登录弹一次,介绍核心功能。
+     gating(main.js maybeShowWelcomeModal):state.userId 有值 + localStorage 未读 +
+     created_at < 24h 三重满足才弹。点关闭即写 localStorage,后续不再弹。 -->
+<div id="welcome-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+  <div class="modal" style="max-width:520px">
+    <div class="modal-head">
+      <h3>&#128075; 欢迎使用 OpenClaude</h3>
+      <button class="modal-close" data-close-modal="welcome-modal" aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p style="margin:0 0 12px;color:var(--fg-muted);font-size:var(--text-sm)">
+        OpenClaude 是基于 Claude 模型的多 agent AI 助手平台。几个你可能想知道的事:
+      </p>
+      <ul style="margin:0;padding-left:20px;line-height:1.8;color:var(--fg);font-size:var(--text-sm)">
+        <li>每位用户有独立容器化运行环境,首次启动需 5-10 秒</li>
+        <li>多模型可选(Opus/Sonnet/Haiku),可在输入框上方切换</li>
+        <li>支持文件上传、语音输入、浏览器自动化等多种交互</li>
+        <li>记忆与定时任务持久化,跨会话延续上下文</li>
+        <li>计费透明,顶部余额条随时可见</li>
+      </ul>
+    </div>
+    <div class="modal-foot">
+      <div style="flex:1"></div>
+      <button class="btn btn-primary" data-close-modal="welcome-modal">开始使用</button>
+    </div>
+  </div>
+</div>
+
 <!-- Changelog / Release Notes modal -->
 <div id="changelog-modal" class="modal-backdrop" role="dialog" aria-modal="true">
   <div class="modal" style="max-width:560px">

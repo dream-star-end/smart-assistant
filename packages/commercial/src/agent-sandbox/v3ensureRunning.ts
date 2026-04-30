@@ -61,6 +61,7 @@ import { NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/typ
 import { getHostById, setQuarantined } from "../compute-pool/queries.js";
 import { hostRowToTarget, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 import { promoteOnce } from "../compute-pool/imagePromote.js";
+import { observeContainerEnsureDuration } from "../admin/metrics.js";
 import { randomUUID } from "node:crypto";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
@@ -248,6 +249,17 @@ export function makeV3EnsureRunning(
   host: string;
   port: number;
   containerId: number;
+  /**
+   * 本次 ensureRunning 是否走了 provision 分支。
+   * - true:容器在本次调用中被 provision(冷启)
+   * - false:命中 status='running',直接复用
+   *
+   * 注意:这是"本次调用"语义,**不是**"用户是否经历过冷启"。
+   * 例如 provision 成功但 readiness 超时 → 4503 → 用户重连 → 本次 ensure 命中 running
+   * 这种情况下 coldStart=false,但用户实际经历了冷启(漏标 trade-off,见
+   * admin/metrics.ts wsBridgeTtft help 文档)。
+   */
+  coldStart: boolean;
   tunnel?: { hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget };
 }> {
   const readinessOpts = buildReadinessOpts(options);
@@ -258,8 +270,11 @@ export function makeV3EnsureRunning(
     host: string;
     port: number;
     containerId: number;
+    coldStart: boolean;
     tunnel?: { hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget };
   }> {
+    // metrics:成功 return 时 observe;throw 路径不计(避免拉偏 latency 分布)。
+    const ensureStartedAt = Date.now();
     // bigint → number,显式 guard(>2^53 不会发生,MVP 用户量 < 1k,但守住)
     if (uidBig <= 0n || uidBig > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new ContainerUnreadyError(60, "invalid_uid");
@@ -296,10 +311,12 @@ export function makeV3EnsureRunning(
         status.dockerContainerId,
         resolveBridgeTunnelTarget,
       );
+      observeContainerEnsureDuration("warm", (Date.now() - ensureStartedAt) / 1000);
       return {
         host: status.boundIp,
         port: status.port,
         containerId: status.containerId,
+        coldStart: false,
         ...(tunnel ? { tunnel } : {}),
       };
     }
@@ -476,10 +493,12 @@ export function makeV3EnsureRunning(
       provisioned.dockerContainerId,
       resolveBridgeTunnelTarget,
     );
+    observeContainerEnsureDuration("cold", (Date.now() - ensureStartedAt) / 1000);
     return {
       host: provisioned.boundIp,
       port: provisioned.port,
       containerId: provisioned.containerId,
+      coldStart: true,
       ...(tunnel ? { tunnel } : {}),
     };
   };

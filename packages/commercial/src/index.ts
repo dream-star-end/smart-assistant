@@ -85,6 +85,7 @@ import {
 import {
   observeWsBridgeBuffered,
   observeWsBridgeSessionDuration,
+  observeWsBridgeTtft,
 } from "./admin/metrics.js";
 import { loadOrCreateBridgeSecret, DEFAULT_BRIDGE_SECRET_PATH } from "./bridgeSecret.js";
 import { setRemoteMuxDeps } from "./remoteHosts/sshMux.js";
@@ -1083,6 +1084,7 @@ export async function registerCommercial(
   const bridgeMetrics: BridgeMetricSink = {
     onBufferedBytes: (_uid, side, bytes) => observeWsBridgeBuffered(side, bytes),
     onClose: (stats) => observeWsBridgeSessionDuration(stats.cause, stats.durationMs / 1000),
+    onTtft: (_uid, kind, seconds) => observeWsBridgeTtft(kind, seconds),
   };
   // PR1:bridge 拿到 client→container 帧时刷 last_ws_activity(60s debounce)。
   // 防 idle sweep 把"长 WS 单连但持续在用"的会话误判为 idle。fire-and-forget 包到

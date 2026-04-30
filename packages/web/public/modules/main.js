@@ -1793,6 +1793,28 @@ async function loadChangelog() {
   } catch {}
 }
 
+// 欢迎弹窗 — 新用户首次登录展示一次。挂在 refreshBalance().then() 链里,确保
+// state.userId / state.userCreatedAt 已就位(refreshBalance 是写入这两个字段的唯一入口)。
+//
+// 三重 gating(必须全部满足):
+//   1. state.userId 有值(commercial 已启用 + /api/me 200)
+//   2. localStorage 没记录该 userId 见过
+//   3. user.created_at 在 24h 内(防止老用户清 localStorage 后被误弹)
+//
+// 弹窗后立即写 localStorage,即使用户秒关也算见过。
+const WELCOME_NEW_USER_WINDOW_MS = 24 * 60 * 60 * 1000
+function maybeShowWelcomeModal() {
+  if (!state.userId) return
+  const _userKey = `openclaude_welcome_seen_${String(state.userId)}`
+  if (localStorage.getItem(_userKey)) return
+  if (!state.userCreatedAt) return
+  const createdAtMs = new Date(state.userCreatedAt).getTime()
+  if (!Number.isFinite(createdAtMs)) return
+  if (Date.now() - createdAtMs >= WELCOME_NEW_USER_WINDOW_MS) return
+  localStorage.setItem(_userKey, '1')
+  openModal('welcome-modal')
+}
+
 function openChangelog() {
   const content = $('changelog-content')
   const versionEl = $('changelog-version')
@@ -2019,7 +2041,13 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
   reloadAgents()
   loadChangelog()
   refreshBalance()
-    .then((r) => { if (r?.shown) startInbox(); else stopInbox() })
+    .then((r) => {
+      if (r?.shown) startInbox(); else stopInbox()
+      // 2026-04-30 v1.0.54 — welcome modal 必须在 refreshBalance 后调用:
+      // userId / userCreatedAt 由 refreshBalance 写入 state,放 .then 里能保证
+      // gating 字段已就位,不会因 race 漏弹/误弹。
+      maybeShowWelcomeModal()
+    })
     .catch(() => {})
   syncSessionsFromServer()
     .then((result) => {
@@ -2572,7 +2600,11 @@ async function init() {
     reloadAgents()
     loadChangelog()
     refreshBalance()
-      .then((r) => { if (r?.shown) startInbox(); else stopInbox() })
+      .then((r) => {
+        if (r?.shown) startInbox(); else stopInbox()
+        // 冷启动也走一遍欢迎判定。已弹过的 localStorage 标志会拦下重复弹窗。
+        maybeShowWelcomeModal()
+      })
       .catch(() => {})
     // Cross-device sync: pull sessions from server in background
     syncSessionsFromServer()

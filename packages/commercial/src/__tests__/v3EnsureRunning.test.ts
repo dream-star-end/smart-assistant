@@ -313,7 +313,12 @@ describe("makeV3EnsureRunning", () => {
     });
 
     const ep = await ensureRunning(7n);
-    assert.deepStrictEqual(ep, { host: "172.30.1.1", port: V3_CONTAINER_PORT });
+    assert.deepStrictEqual(ep, {
+      host: "172.30.1.1",
+      port: V3_CONTAINER_PORT,
+      containerId: 1,
+      coldStart: false, // running 重用分支
+    });
   });
 
   test("active + running + healthz 一直返 false → ContainerUnreadyError('starting')", async () => {
@@ -397,7 +402,12 @@ describe("makeV3EnsureRunning", () => {
     });
 
     const ep = await ensureRunning(11n);
-    assert.deepStrictEqual(ep, { host: "172.30.5.42", port: V3_CONTAINER_PORT });
+    assert.deepStrictEqual(ep, {
+      host: "172.30.5.42",
+      port: V3_CONTAINER_PORT,
+      containerId: 1,
+      coldStart: true, // provision 分支
+    });
     assert.strictEqual(captured.containersCreated, 1);
     assert.strictEqual(captured.started, 1);
     assert.strictEqual(pool.rows.length, 1);
@@ -549,7 +559,12 @@ describe("makeV3EnsureRunning", () => {
     pool.rows[0]!.port = port;
     try {
       const ep = await ensureRunning(15n);
-      assert.deepStrictEqual(ep, { host: "127.0.0.1", port });
+      assert.deepStrictEqual(ep, {
+        host: "127.0.0.1",
+        port,
+        containerId: 1,
+        coldStart: false, // running 重用分支
+      });
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }

@@ -117,6 +117,19 @@ export type ResolveContainerEndpoint = (
    */
   containerId?: number;
   /**
+   * 本次 ensureRunning 是否走了 provision 分支(冷启)。
+   * - true → bridge 在 containerWs 'open' 时给 userWs 发一帧 `{type:"sys.cold_start"}`,
+   *   前端据此把 typing indicator 文案换成"首次加载上下文较慢"提示
+   * - false → 不发,前端走标准"思考中"
+   *
+   * 缺失视同 false(向后兼容,测试 mock 不必填)。
+   *
+   * 漏标 trade-off:provision 成功但 readiness 超时 → 4503 → 重连后命中 running 分支,
+   * 此时 coldStart=false 但用户实际经历了冷启。低概率事件,运维 metric 也会有同样
+   * 漏标(ws_bridge_ttft_seconds.kind=warm 不严格等于"未冷启")。
+   */
+  coldStart?: boolean;
+  /**
    * 跨 host 路由信号:set 表示这个容器在远端 host(boundIp/port 不可直达),
    * bridge 必须经 node-agent tunnel 拉 WS。`nodeAgent` 是为本次 bridge 建链
    * 重新 hydrate 的 NodeAgentTarget(短生命周期,bridge 用完就丢) — 不要复用
@@ -161,6 +174,12 @@ export interface BridgeMetricSink {
   onUserFrame?(uid: bigint, bytes: number, isBinary: boolean): void;
   /** 一条容器帧已转发到用户。 */
   onContainerFrame?(uid: bigint, bytes: number, isBinary: boolean): void;
+  /**
+   * Bridge TTFT:首个 user→container 帧 ↔ 首个 container→user 帧 的间隔。
+   * 每个 bridge session 至多触发一次(若用户从未发帧,则不触发)。
+   * kind 透 endpoint.coldStart(undefined → "warm",见 ResolveContainerEndpoint 漏标说明)。
+   */
+  onTtft?(uid: bigint, kind: "cold" | "warm", seconds: number): void;
   /** 当前任意一侧 buffered bytes 取最大值上报(用于 prometheus gauge)。 */
   onBufferedBytes?(uid: bigint, side: "user_to_container" | "container_to_user", bytes: number): void;
   /** 桥关闭时单次,拿到本次会话总字节数 / 时长 / closeCode。 */
@@ -384,10 +403,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // 同 agent.ts:先 upgrade,认证错也走 ws frame 报告,前端体验比 HTTP 401 直接关好。
     wss.handleUpgrade(req, socket, head, (ws) => {
       // 早到帧暂存(auth + ensureRunning 是 async)
-      const pendingMessages: Array<{ data: RawData; isBinary: boolean }> = [];
+      // receivedAtMs 用于 bridge TTFT 起点 — 早到帧也算"用户已发首条消息"。
+      const pendingMessages: Array<{ data: RawData; isBinary: boolean; receivedAtMs: number }> = [];
       let earlyClose: { code: number; reason: Buffer } | null = null;
       const onEarlyMessage = (data: RawData, isBinary: boolean): void => {
-        pendingMessages.push({ data, isBinary });
+        pendingMessages.push({ data, isBinary, receivedAtMs: Date.now() });
       };
       const onEarlyClose = (code: number, reason: Buffer): void => {
         earlyClose = { code, reason };
@@ -551,8 +571,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   function startBridge(
     userWs: WebSocket,
     uid: bigint,
-    endpoint: { host: string; port: number },
-    earlyMessages: Array<{ data: RawData; isBinary: boolean }>,
+    endpoint: { host: string; port: number; coldStart?: boolean },
+    earlyMessages: Array<{ data: RawData; isBinary: boolean; receivedAtMs: number }>,
     /**
      * 可选 agent_containers.id。来自 ResolveContainerEndpoint;v3 supervisor
      * 路径填,test mock 路径可不填。无值或 deps.markContainerActivity 未注入
@@ -584,6 +604,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let bufferedCU = 0; // container → user 待发字节
     let cause: BridgeCloseCause = "internal_error";
     let cleaned = false;
+    // Bridge TTFT:首个 user→container 帧 ↔ 首个 container→user 帧。
+    // - firstUserFrameAtMs 由 onUserMessage / earlyMessages replay 第一次进入时设置
+    // - firstContainerFrameAtMs 仅作 dedupe(确保只 observe 一次)
+    // - 守卫 firstUserFrameAtMs !== null 是防御"容器在用户发帧前主动 push"导致负值
+    let firstUserFrameAtMs: number | null = null;
+    let firstContainerFrameAtMs: number | null = null;
+    const ttftKind: "cold" | "warm" = endpoint.coldStart === true ? "cold" : "warm";
 
     // 注册到 registry,超额会踢老的
     const conn: Conn = {
@@ -632,6 +659,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cleanup();
         return;
       }
+      // Bridge TTFT 起点:首个 user→container 帧。oversize 拒绝路径不算(已 close)。
+      if (firstUserFrameAtMs === null) firstUserFrameAtMs = Date.now();
       // PR1:client→container 帧才刷活动(container→user 输出 / ping/pong 不算)。
       // 60s debounce 已在 lastActivityRefreshAt 比较里。markActivity 必须 fire-and-forget。
       if (markActivity && containerId !== undefined) {
@@ -696,6 +725,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cleanup();
         return;
       }
+      // Bridge TTFT 终点:首个 container→user 帧。
+      // 守卫 firstUserFrameAtMs !== null 防御容器在用户发帧前主动 push(理论不发生,
+      // 但保险 — 否则会算负值/无意义观测)。oversize 拒绝路径已 return,不会走到这。
+      if (firstContainerFrameAtMs === null && firstUserFrameAtMs !== null) {
+        firstContainerFrameAtMs = Date.now();
+        metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
+      }
       if (userWs.readyState !== WebSocket.OPEN) {
         // user 已经走了,丢
         return;
@@ -740,6 +776,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       log?.debug("user-chat-bridge: container connected", {
         uid: uid.toString(), connId, host: endpoint.host, port: endpoint.port,
       });
+      // V3 cold-start UX 提示:本次 ensureRunning 走了 provision 分支 → 给前端发
+      // 一帧 sidecar,前端把 typing indicator 文案换成"首次加载上下文较慢"。
+      // 用 sys.* 命名空间避免与 ccb outbound.* 帧冲突;前端 default case 会忽略未知 type,
+      // 加 case 是 additive。
+      if (endpoint.coldStart === true && userWs.readyState === WebSocket.OPEN) {
+        try {
+          userWs.send(JSON.stringify({ type: "sys.cold_start" }));
+        } catch { /* swallow — sidecar 提示失败不能影响 bridge */ }
+      }
       // 冲刷 preopen queue
       for (const m of preopenQueue) sendToContainer(m.data, m.isBinary, m.len);
       preopenQueue.length = 0;
@@ -821,7 +866,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       cleanup();
     });
 
-    // 把"upgrade 期间早到的帧"先 emit 一遍 → 走正常 onUserMessage 流程
+    // 把"upgrade 期间早到的帧"先 emit 一遍 → 走正常 onUserMessage 流程。
+    // TTFT 起点用第一条早到帧的 receivedAtMs(更准 — 用户发帧瞬间,而不是 replay 瞬间);
+    // 后续帧 onUserMessage 内部的 firstUserFrameAtMs !== null 守卫会跳过覆盖。
+    if (earlyMessages.length > 0 && firstUserFrameAtMs === null) {
+      firstUserFrameAtMs = earlyMessages[0]!.receivedAtMs;
+    }
     for (const m of earlyMessages) {
       onUserMessage(m.data, m.isBinary);
     }

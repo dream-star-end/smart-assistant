@@ -178,6 +178,10 @@ export async function refreshBalance() {
       const uid = String(user.id)
       if (uid) state.userId = uid
     }
+    // welcome-modal gating 用:user.created_at 是 ISO 字符串(handlers.ts:708 写)。
+    // null/undefined 也写进去 — 老路径(commercial 未启用)userCreatedAt 保持 null,
+    // welcome 自然不弹。
+    state.userCreatedAt = typeof user.created_at === 'string' ? user.created_at : null
     _setAdminLinkVisible(user.role === 'admin')
     _setHostAgentEntriesVisible(user.role === 'admin')
     _hostAgentAdmin = user.role === 'admin'

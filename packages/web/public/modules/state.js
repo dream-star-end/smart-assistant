@@ -91,6 +91,10 @@ export const state = {
   // refresh 会变成新 JWT,导致 "已读标志" 在同一用户下反复丢失)。改用真实
   // user.id(来自 /api/me)。refreshBalance 成功时由 billing.js 写入。
   userId: null,
+  // 用户注册时间(ISO 字符串,来自 /api/me)。welcome-modal 通过它 + localStorage
+  // 三重 gating 判定是否给"新用户"弹欢迎介绍 — 仅 created_at < 24h 才弹,
+  // 防止老用户清 localStorage 后被弹一次。refreshBalance 成功时写入。
+  userCreatedAt: null,
   ws: null,
   wsStatus: 'disconnected',
   sessions: new Map(),
