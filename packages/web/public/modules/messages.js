@@ -1794,6 +1794,42 @@ export function renderMessages() {
     const _name = _ai?.displayName || 'OpenClaude'
     const _av = htmlSafeEscape(_ai?.avatarEmoji || 'O')
     empty.innerHTML = `<div class="empty-brand">${_av}</div><h1>${htmlSafeEscape(_name)}</h1><p>你的个人 AI 助理，随时待命</p><div class="hint-kbd">按 <kbd>${_mod}K</kbd> 打开命令面板 · 输入 <kbd>/</kbd> 查看命令</div>`
+    // 首次会话引导:starter prompt 卡片(2026-04-30)
+    // 数据观察:赠送积分后的真实用户里 ~60% 进了 chat 页但没发任何消息,
+    // 容器拉起后停留几十秒到几十分钟再离开 — 主因是面对空白输入框不知道
+    // 说什么。给 4 个示例 prompt 卡片,点击后填入 input(不直接发送),
+    // 用户可改可发,降低首句门槛。
+    const _STARTERS = [
+      { title: '写代码', text: '用 Python 写一个简单的脚本,读取 CSV 并按某一列分组求和' },
+      { title: '调试报错', text: '我有段 JavaScript 报 "TypeError: cannot read property of undefined",帮我列举常见原因和排查步骤' },
+      { title: '解释概念', text: '用通俗语言解释一下 React 的 useEffect 是干嘛的' },
+      { title: '帮写文字', text: '帮我写一封专业的离职邮件,语气得体,不到 200 字' },
+    ]
+    const grid = document.createElement('div')
+    grid.className = 'empty-starter-grid'
+    for (const item of _STARTERS) {
+      const card = document.createElement('button')
+      card.type = 'button'
+      card.className = 'empty-starter-card'
+      const t = document.createElement('div')
+      t.className = 'empty-starter-title'
+      t.textContent = item.title
+      const p = document.createElement('div')
+      p.className = 'empty-starter-text'
+      p.textContent = item.text
+      card.appendChild(t)
+      card.appendChild(p)
+      card.addEventListener('click', () => {
+        const input = document.getElementById('input')
+        if (!input || input.disabled) return
+        input.value = item.text
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        input.focus()
+        try { input.setSelectionRange(input.value.length, input.value.length) } catch {}
+      })
+      grid.appendChild(card)
+    }
+    empty.appendChild(grid)
     main.appendChild(empty)
     return
   }
