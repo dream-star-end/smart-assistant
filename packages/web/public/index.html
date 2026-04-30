@@ -989,28 +989,55 @@
 
 <!-- Welcome modal — 新用户首次登录弹一次,介绍核心功能。
      gating(main.js maybeShowWelcomeModal):state.userId 有值 + localStorage 未读 +
-     created_at < 24h 三重满足才弹。点关闭即写 localStorage,后续不再弹。 -->
-<div id="welcome-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal" style="max-width:520px">
-    <div class="modal-head">
-      <h3>&#128075; 欢迎使用 OpenClaude</h3>
-      <button class="modal-close" data-close-modal="welcome-modal" aria-label="关闭">&times;</button>
+     created_at < 24h 三重满足才弹。点关闭即写 localStorage,后续不再弹。
+     专属类 welcome-modal 覆盖通用 .modal 移动端全屏规则,跨端保持紧凑卡片。 -->
+<div id="welcome-modal" class="modal-backdrop welcome-modal-bd" role="dialog" aria-modal="true" aria-labelledby="welcome-modal-title">
+  <div class="modal welcome-modal">
+    <button class="welcome-close" data-close-modal="welcome-modal" aria-label="关闭">&times;</button>
+    <div class="welcome-hero">
+      <div class="welcome-hero-emoji" aria-hidden="true">&#128075;</div>
+      <h2 class="welcome-hero-title" id="welcome-modal-title">欢迎来到 OpenClaude</h2>
+      <p class="welcome-hero-sub">基于 Claude 模型的多 agent AI 助手</p>
     </div>
-    <div class="modal-body">
-      <p style="margin:0 0 12px;color:var(--fg-muted);font-size:var(--text-sm)">
-        OpenClaude 是基于 Claude 模型的多 agent AI 助手平台。几个你可能想知道的事:
-      </p>
-      <ul style="margin:0;padding-left:20px;line-height:1.8;color:var(--fg);font-size:var(--text-sm)">
-        <li>每位用户有独立容器化运行环境,首次启动需 5-10 秒</li>
-        <li>多模型可选(Opus/Sonnet/Haiku),可在输入框上方切换</li>
-        <li>支持文件上传、语音输入、浏览器自动化等多种交互</li>
-        <li>记忆与定时任务持久化,跨会话延续上下文</li>
-        <li>计费透明,顶部余额条随时可见</li>
-      </ul>
+    <div class="welcome-features">
+      <div class="welcome-feature">
+        <div class="welcome-feature-icon" aria-hidden="true">&#128230;</div>
+        <div class="welcome-feature-text">
+          <div class="welcome-feature-title">独立容器化环境</div>
+          <div class="welcome-feature-desc">每位用户专属沙盒,首次启动需 5–10 秒</div>
+        </div>
+      </div>
+      <div class="welcome-feature">
+        <div class="welcome-feature-icon" aria-hidden="true">&#129504;</div>
+        <div class="welcome-feature-text">
+          <div class="welcome-feature-title">多模型可选</div>
+          <div class="welcome-feature-desc">Opus / Sonnet 自由切换,输入框上方一键</div>
+        </div>
+      </div>
+      <div class="welcome-feature">
+        <div class="welcome-feature-icon" aria-hidden="true">&#128194;</div>
+        <div class="welcome-feature-text">
+          <div class="welcome-feature-title">文件 &amp; 浏览器自动化</div>
+          <div class="welcome-feature-desc">上传图片/文档,调用浏览器抓取或操作网页</div>
+        </div>
+      </div>
+      <div class="welcome-feature">
+        <div class="welcome-feature-icon" aria-hidden="true">&#128190;</div>
+        <div class="welcome-feature-text">
+          <div class="welcome-feature-title">长期记忆 &amp; 定时任务</div>
+          <div class="welcome-feature-desc">跨会话延续上下文,可设置 cron 定时执行</div>
+        </div>
+      </div>
+      <div class="welcome-feature">
+        <div class="welcome-feature-icon" aria-hidden="true">&#128176;</div>
+        <div class="welcome-feature-text">
+          <div class="welcome-feature-title">透明计费</div>
+          <div class="welcome-feature-desc">顶部余额条随时可见,按 token 实时扣费</div>
+        </div>
+      </div>
     </div>
-    <div class="modal-foot">
-      <div style="flex:1"></div>
-      <button class="btn btn-primary" data-close-modal="welcome-modal">开始使用</button>
+    <div class="welcome-foot">
+      <button class="btn btn-primary welcome-cta" data-close-modal="welcome-modal">开始使用 →</button>
     </div>
   </div>
 </div>
