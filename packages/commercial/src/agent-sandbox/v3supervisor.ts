@@ -957,8 +957,12 @@ async function ensureSshUserRunDir(uid: number): Promise<string> {
  *   - 占位的 row 决定 row id,row id 进 token,token 进容器 env。
  *     如果先 docker create 再 INSERT,docker --ip 撞了同 IP 才发现要换 IP,
  *     然后撤销 docker → 比 INSERT 重试代价大很多。
- *   - 唯一约束 `uniq_ac_bound_ip_active` 在 PG 层做仲裁,业务层只 INSERT,
- *     避免 N 个进程同时 SELECT 后撞 IP 的 race(2I-1 调度 N=1 也不能放 race)。
+ *   - 唯一约束 composite `idx_ac_host_bound_ip_active` (host_uuid, bound_ip)
+ *     WHERE state='active' 在 PG 层做仲裁,业务层只 INSERT,避免 N 个进程同时
+ *     SELECT 后撞 IP 的 race(2I-1 调度 N=1 也不能放 race)。0048 之前还共存
+ *     一个全局 partial UNIQUE `uniq_ac_bound_ip_active`(M1 单 host 期的全局
+ *     旧索引);0048 drop 后 retry 路径仍同时识别两个 constraint 名,以免
+ *     deploy 顺序错位时炸。
  *
  * 失败模式:
  *   - 唯一冲突(23505) → 换 IP 重试,V3_IP_ALLOC_MAX_ATTEMPTS 次后放弃 → InvalidArgument
@@ -1010,8 +1014,20 @@ async function allocateBoundIpAndInsertRow(
       return { id, boundIp: candidate };
     } catch (err) {
       const e = err as { code?: string; constraint?: string };
-      // 23505 = unique_violation
-      if (e.code === "23505" && (e.constraint === "uniq_ac_bound_ip_active" || /uniq_ac_bound_ip_active/i.test(String((err as Error).message)))) {
+      // 23505 = unique_violation. 双名字白名单:
+      //   - uniq_ac_bound_ip_active        — 0012 全局 partial UNIQUE,0048 drop
+      //   - idx_ac_host_bound_ip_active    — 0030 per-host composite UNIQUE(0048 后的仲裁器)
+      // 两个都接受,deploy 顺序错位(代码先上 / migration 先跑)时不会误杀 retry。
+      // 故意不泛化到"23505 + 同表"—— 同表还有 `uniq_ac_user_id_active` 等非 IP unique,
+      // 误把 user-active 冲突当 IP 冲突会掩盖真正 lifecycle bug(Codex 审查反馈)。
+      if (
+        e.code === "23505"
+        && (
+          e.constraint === "uniq_ac_bound_ip_active"
+          || e.constraint === "idx_ac_host_bound_ip_active"
+          || /uniq_ac_bound_ip_active|idx_ac_host_bound_ip_active/i.test(String((err as Error).message))
+        )
+      ) {
         // IP 撞了,换一个继续
         continue;
       }

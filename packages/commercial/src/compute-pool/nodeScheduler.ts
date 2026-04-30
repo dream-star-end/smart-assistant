@@ -4,8 +4,9 @@
  * 策略(M1 简单有效):
  *   1. sticky:同 userId 近期有容器存活 → 复用该 host(减少 IP/状态迁移)
  *   2. least-loaded:否则从 ready + activeContainers<max_containers 里挑 load 最少
- *   3. 并发下 bound_ip 分配原子性由 M1 全局 uniq_ac_bound_ip_active 保证(INSERT 冲突 retry)
- *      0031 drop 后走 per-host 唯一
+ *   3. 并发下 bound_ip 分配原子性由 0030 per-host composite UNIQUE
+ *      idx_ac_host_bound_ip_active (host_uuid, bound_ip) WHERE state='active' 保证。
+ *      旧的全局 uniq_ac_bound_ip_active(0012)在 0048 drop 后,各 host 可复用完整网段。
  *
  * bridge IP 分配:
  *   - 给定 host.bridge_cidr(如 172.30.1.0/24),gateway=.1,可分配 .10~.250

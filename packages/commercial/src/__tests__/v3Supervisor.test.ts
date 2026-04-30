@@ -170,6 +170,13 @@ class FakePool {
   clientLog: Array<"BEGIN" | "COMMIT" | "ROLLBACK"> = [];
   /** test 钩子:第 N 次 INSERT 强制抛 23505(模拟 uniq 冲突),序号从 0 开始 */
   forceUniqConflictOnInserts: Set<number> = new Set();
+  /**
+   * test 钩子:覆盖某次 INSERT 抛错时 PG constraint 名字。
+   *   - 默认抛 `uniq_ac_bound_ip_active`(0012 旧名,模拟旧索引仍在的环境)
+   *   - 0048 之后新仲裁器是 `idx_ac_host_bound_ip_active`,可通过此 map 注入校验
+   *     supervisor retry filter 同时识别两个名字
+   */
+  forceConflictConstraintName: Map<number, string> = new Map();
   insertCount = 0;
 
   async connect(): Promise<PoolClient> {
@@ -198,12 +205,13 @@ class FakePool {
         if (/INSERT INTO agent_containers/i.test(trimmed)) {
           const idx = self.insertCount++;
           if (self.forceUniqConflictOnInserts.has(idx)) {
-            const e = new Error('duplicate key value violates unique constraint "uniq_ac_bound_ip_active"') as Error & {
-              code: string;
-              constraint: string;
-            };
+            const constraintName =
+              self.forceConflictConstraintName.get(idx) ?? "uniq_ac_bound_ip_active";
+            const e = new Error(
+              `duplicate key value violates unique constraint "${constraintName}"`,
+            ) as Error & { code: string; constraint: string };
             e.code = "23505";
-            e.constraint = "uniq_ac_bound_ip_active";
+            e.constraint = constraintName;
             throw e;
           }
           // params: [user_id, host_uuid, bound_ip, secret_hash, port]
@@ -535,6 +543,25 @@ describe("provisionV3Container", () => {
       55,
     );
     // 第三次 INSERT 才成功
+    assert.equal(result.boundIp, "172.30.0.12");
+    assert.equal(pool.insertCount, 3);
+    assert.equal(pool.rows.length, 1);
+  });
+
+  test("idx_ac_host_bound_ip_active(0030 composite,0048 后新仲裁器)冲突也走 retry 路径", async () => {
+    // 0048 drop uniq_ac_bound_ip_active 后,IP 撞车 23505 由 composite
+    // (host_uuid, bound_ip) 抛,constraint 名换成 idx_ac_host_bound_ip_active。
+    // supervisor retry filter 必须同时识别新旧名字(deploy 顺序错位也不死)。
+    const { docker } = makeDocker();
+    pool.forceUniqConflictOnInserts.add(0);
+    pool.forceConflictConstraintName.set(0, "idx_ac_host_bound_ip_active");
+    pool.forceUniqConflictOnInserts.add(1);
+    pool.forceConflictConstraintName.set(1, "idx_ac_host_bound_ip_active");
+    const ips = fixedIps(["172.30.0.10", "172.30.0.11", "172.30.0.12"]);
+    const result = await provisionV3Container(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: ips, randomSecret: fixedSecret("c".repeat(64)) },
+      56,
+    );
     assert.equal(result.boundIp, "172.30.0.12");
     assert.equal(pool.insertCount, 3);
     assert.equal(pool.rows.length, 1);
