@@ -92,7 +92,13 @@ const ENV_SCRUB_KEYS = new Set<string>([
 ])
 const ENV_SCRUB_PREFIXES = ['ANTHROPIC_', 'CLAUDE_CODE_', 'OPENCLAUDE_']
 
-function buildCodexEnv(): NodeJS.ProcessEnv {
+/**
+ * Build the env passed to a codex subprocess. Exported so the app-server runner
+ * (which spawns `codex app-server` instead of `codex exec`) can share the same
+ * scrubbing rules — both subprocesses are codex's own CLI and have identical
+ * env exposure concerns.
+ */
+export function buildCodexEnv(): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue
@@ -101,6 +107,60 @@ function buildCodexEnv(): NodeJS.ProcessEnv {
     out[k] = v
   }
   return out
+}
+
+/**
+ * Copy a list of absolute image paths into OpenClaude's public generated/ dir.
+ * Module-level so both the legacy exec runner (which scans a per-thread dir)
+ * and the app-server runner (which gets `savedPath` directly on the
+ * `imageGeneration` thread item) can use the same copy + naming strategy.
+ *
+ * Naming: `codex-${sanitizedThreadId}-${basename(srcPath)}` — the basename is
+ * already a content-addressable hash from codex (`ig_<hash>.png`), and the
+ * thread id prefix prevents cross-thread collisions in the shared public dir.
+ *
+ * Caller is expected to pre-resolve `srcPaths` to absolute filesystem paths.
+ * Failures (ENOENT, EACCES, EROFS) are logged once at warn and surfaced via
+ * `failedNames` so the caller can render an "image copy failed" line — we
+ * deliberately do NOT downgrade to "use srcPath" because the codex source dir
+ * is not in `FILE_ALLOWED_DIRS` and would 403 from `/api/file?path=`.
+ */
+export async function copyImagePathsToPublicDir(
+  threadId: string,
+  srcPaths: string[],
+  dstDir: string,
+): Promise<{
+  copied: Array<{ srcPath: string; publicPath: string }>
+  failedNames: string[]
+}> {
+  const safeThread = _sanitizeThreadId(threadId)
+  // Idempotent — paths.generatedDir may not exist on a fresh install.
+  try {
+    await mkdir(dstDir, { recursive: true })
+  } catch (err) {
+    log.warn('codex image public dir mkdir failed', {
+      dstDir,
+      err: (err as Error).message,
+    })
+  }
+  const copied: Array<{ srcPath: string; publicPath: string }> = []
+  const failedNames: string[] = []
+  for (const src of srcPaths) {
+    const name = basename(src)
+    const dst = join(dstDir, `codex-${safeThread}-${name}`)
+    try {
+      await copyFile(src, dst)
+      copied.push({ srcPath: src, publicPath: dst })
+    } catch (err) {
+      log.warn('codex image copy failed', {
+        src,
+        dst,
+        err: (err as Error).message,
+      })
+      failedNames.push(name)
+    }
+  }
+  return { copied, failedNames }
 }
 
 /** Runner message shape used by sessionManager.ts (subset of SdkMessage). */
@@ -248,17 +308,16 @@ export class CodexRunner extends EventEmitter {
   }
 
   /**
-   * Copy newly-generated codex images into OpenClaude's public generated/ dir
-   * (which is in `FILE_ALLOWED_DIRS` — the gateway `/api/file` allowlist).
+   * Copy newly-generated codex images (resolved by per-thread directory scan)
+   * into OpenClaude's public generated/ dir. Thin wrapper around the
+   * module-level `copyImagePathsToPublicDir`: builds absolute src paths from
+   * `getCodexImageDir(threadId)` + filename and delegates the actual copy.
    *
-   * Codex's native dir `~/.codex/generated_images/` is NOT in the allowlist, so
-   * surfacing those raw paths to the web client would result in 403 from
-   * `/api/file?path=...`. By copying we keep the allowlist surface narrow.
-   *
-   * Returns successfully copied entries (with both source and public paths so
-   * caller can dedupe against either) plus a list of names that failed to copy.
-   * Per Codex review: failures are NOT downgraded to "use source path" because
-   * that path is unreachable from the web client anyway.
+   * Kept as a `protected` instance method (same signature as before) so the
+   * existing `codexRunnerImageGen.test.ts` harness — which both overrides
+   * `getCodexImageDir`/`getPublicGeneratedDir` AND directly stubs
+   * `copyImagesToPublicDir` to simulate copy failure — keeps working without
+   * modification.
    */
   protected async copyImagesToPublicDir(
     threadId: string,
@@ -267,44 +326,19 @@ export class CodexRunner extends EventEmitter {
     copied: Array<{ srcName: string; srcPath: string; publicPath: string }>
     failedNames: string[]
   }> {
-    const safeThread = _sanitizeThreadId(threadId)
     const srcDir = this.getCodexImageDir(threadId)
     const dstDir = this.getPublicGeneratedDir()
-    // paths.generatedDir is created on demand elsewhere (uploads, MCP media);
-    // on a fresh OpenClaude install with no prior media, it may not exist yet.
-    // mkdir recursive is idempotent — cheaper than a stat+create dance.
-    try {
-      await mkdir(dstDir, { recursive: true })
-    } catch (err) {
-      // If we can't create the dir, every copyFile below will ENOENT and we'll
-      // surface "image copy failed" to the user. Log once here so the root
-      // cause is in the journal.
-      log.warn('codex image public dir mkdir failed', {
-        dstDir,
-        err: (err as Error).message,
-      })
+    const srcPaths = filenames.map((name) => join(srcDir, name))
+    const { copied, failedNames } = await copyImagePathsToPublicDir(threadId, srcPaths, dstDir)
+    // Map back to the legacy `srcName` field expected by callers/tests.
+    return {
+      copied: copied.map((c) => ({
+        srcName: basename(c.srcPath),
+        srcPath: c.srcPath,
+        publicPath: c.publicPath,
+      })),
+      failedNames,
     }
-    const copied: Array<{ srcName: string; srcPath: string; publicPath: string }> = []
-    const failedNames: string[] = []
-    for (const name of filenames) {
-      const src = join(srcDir, name)
-      // codex-${threadId}-${basename} prevents cross-thread or repeat-copy
-      // collisions in the shared public dir. The basename itself is already a
-      // 32+ hex hash from codex (`ig_<hash>.png`).
-      const dst = join(dstDir, `codex-${safeThread}-${basename(name)}`)
-      try {
-        await copyFile(src, dst)
-        copied.push({ srcName: name, srcPath: src, publicPath: dst })
-      } catch (err) {
-        log.warn('codex image copy failed', {
-          src,
-          dst,
-          err: (err as Error).message,
-        })
-        failedNames.push(name)
-      }
-    }
-    return { copied, failedNames }
   }
 
   async start(): Promise<void> {

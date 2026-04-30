@@ -145,6 +145,13 @@ export interface AgentDef {
   // Per-agent provider & MCP overrides
   provider?: string // 覆盖全局 config.provider (如 "minimax", "anthropic", "deepseek")
   mcpServers?: McpServerConfig[] // agent 专属 MCP servers (合并到系统共享工具之上)
+  // Codex backend selection (only consulted when provider === 'codex-native').
+  // 'exec'        — legacy `codex exec [resume] --json` subprocess (one process per turn,
+  //                 no token-level streaming, current default for backward compat).
+  // 'app-server'  — `codex app-server --listen stdio://` long-lived JSON-RPC subprocess
+  //                 (token-level item/agentMessage/delta streaming).
+  // Undefined → 'exec' (default).
+  runnerKind?: 'exec' | 'app-server'
   updatedAt?: string // ISO timestamp of last config change
 }
 
