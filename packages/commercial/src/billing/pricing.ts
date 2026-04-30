@@ -22,6 +22,8 @@ import { Client } from "pg";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 
+export type ModelVisibility = "public" | "admin" | "hidden";
+
 export interface ModelPricing {
   model_id: string;
   display_name: string;
@@ -34,6 +36,13 @@ export interface ModelPricing {
   multiplier: string;
   enabled: boolean;
   sort_order: number;
+  /**
+   * 可见性范围(0049 引入)。see listForUser() for resolution semantics.
+   * - public:登录/未登录用户都能看到
+   * - admin:role=admin 或在 model_visibility_grants 里
+   * - hidden:仅在 model_visibility_grants 里(连 admin 默认也看不到)
+   */
+  visibility: ModelVisibility;
   updated_at: Date;
 }
 
@@ -64,10 +73,13 @@ type RawRow = {
   multiplier: string;
   enabled: boolean;
   sort_order: number;
+  visibility: string;
   updated_at: Date;
 };
 
 function rowToPricing(r: RawRow): ModelPricing {
+  // visibility 在 0049 加 CHECK 约束;DB 不可能写入非法值。这里仅做 narrowing。
+  const vis = r.visibility as ModelVisibility;
   return {
     model_id: r.model_id,
     display_name: r.display_name,
@@ -78,6 +90,7 @@ function rowToPricing(r: RawRow): ModelPricing {
     multiplier: r.multiplier,
     enabled: r.enabled,
     sort_order: r.sort_order,
+    visibility: vis,
     updated_at: r.updated_at,
   };
 }
@@ -151,26 +164,14 @@ export function canonicalizeModelId(modelId: string): string {
   return CANONICAL_MODEL_IDS.find((id) => name === id || name.startsWith(`${id}-`)) ?? modelId;
 }
 
-/**
- * 模型对前台不可见(但 API 路由仍可调用)的黑名单。
- *
- * 语义:
- *   - `enabled=true` + `model_id ∈ HIDDEN_FROM_PUBLIC_LIST`
- *     → `pricing.get()` 仍命中,anthropicProxy 接受请求,正常计费(WebFetch
- *       等容器内部小模型用途不受影响)
- *     → `listPublic()` 排除,所有走 `/api/public/models` / `/api/models` 的
- *       前台消费方(模型选择器、landing 价格表、agents 偏好等)看不到
- *
- * 为什么不直接 `enabled=false`:
- *   anthropicProxy 路由前会检查 `pricing.enabled`,关闭后容器内 WebFetch 调
- *   Haiku 摘要直接 400 UNKNOWN_MODEL。所以"内部能用、前台不展示"必须二态
- *   分离。
- *
- * 当前唯一成员:
- *   - claude-haiku-4-5(品牌叙事是"满血 Opus / Sonnet",Haiku 不出现在 UI;
- *     boss 决策 2026-04-21,WebFetch 修复路径见 fix(commercial/pricing) e2174fa)
- */
-const HIDDEN_FROM_PUBLIC_LIST: ReadonlySet<string> = new Set(["claude-haiku-4-5"]);
+// 0049 引入 model_pricing.visibility 列后,"对前台不可见但内部仍能用" 的语义
+// 由 visibility='admin' / 'hidden' 表达,而不再由 HIDDEN_FROM_PUBLIC_LIST 这种
+// 硬编码常量。例如 claude-haiku-4-5 现在 DB 中 visibility='admin' —— admin 列
+// 表能看到,匿名/普通用户看不到,anthropicProxy 仍可路由(enabled=true)。
+//
+// 为什么不直接 `enabled=false`:
+//   anthropicProxy 路由前会检查 `pricing.enabled`,关闭后容器内 WebFetch 调
+//   Haiku 摘要直接 400 UNKNOWN_MODEL。"内部能用、前台不展示" 必须二态分离。
 
 /**
  * 定价缓存 + NOTIFY 监听。单实例使用;测试可 new 多个并用 connectionString override。
@@ -195,7 +196,7 @@ export class PricingCache {
               cache_read_per_mtok::text  AS cache_read_per_mtok,
               cache_write_per_mtok::text AS cache_write_per_mtok,
               multiplier::text           AS multiplier,
-              enabled, sort_order, updated_at
+              enabled, sort_order, visibility, updated_at
          FROM model_pricing`,
     );
     const next = new Map<string, ModelPricing>();
@@ -273,23 +274,58 @@ export class PricingCache {
     return this.map.size;
   }
 
+  private toPublicModel = (p: ModelPricing): PublicModel => ({
+    id: p.model_id,
+    display_name: p.display_name,
+    input_per_ktok_credits: perKtokCredits(p.input_per_mtok, p.multiplier),
+    output_per_ktok_credits: perKtokCredits(p.output_per_mtok, p.multiplier),
+    cache_read_per_ktok_credits: perKtokCredits(p.cache_read_per_mtok, p.multiplier),
+    cache_write_per_ktok_credits: perKtokCredits(p.cache_write_per_mtok, p.multiplier),
+    multiplier: p.multiplier,
+  });
+
   /**
-   * 列出启用且**对前台可见**的模型(按 sort_order 升序),用于 `/api/public/models`。
-   * 同时过滤 `enabled=false` 和 `HIDDEN_FROM_PUBLIC_LIST`(后者参见上方 const 注释)。
-   * 返回已经算好"每 ktok 积分数"的公共视图,调用方 JSON.stringify 即可。
+   * 公共可见模型列表(按 sort_order 升序),用于 `/api/public/models` 给匿名访客。
+   * 仅包含 enabled=true && visibility='public'。
    */
   listPublic(): PublicModel[] {
     return [...this.map.values()]
-      .filter((p) => p.enabled && !HIDDEN_FROM_PUBLIC_LIST.has(p.model_id))
+      .filter((p) => p.enabled && p.visibility === "public")
       .sort((a, b) => a.sort_order - b.sort_order)
-      .map((p) => ({
-        id: p.model_id,
-        display_name: p.display_name,
-        input_per_ktok_credits: perKtokCredits(p.input_per_mtok, p.multiplier),
-        output_per_ktok_credits: perKtokCredits(p.output_per_mtok, p.multiplier),
-        cache_read_per_ktok_credits: perKtokCredits(p.cache_read_per_mtok, p.multiplier),
-        cache_write_per_ktok_credits: perKtokCredits(p.cache_write_per_mtok, p.multiplier),
-        multiplier: p.multiplier,
-      }));
+      .map(this.toPublicModel);
+  }
+
+  /**
+   * 登录用户可见模型列表 —— 0049/0050 GPT 灰度发布的核心。
+   *
+   * 规则(plan v3 §E1):一个模型对该用户可见,当且仅当 enabled=true 且满足下列之一:
+   *   - visibility='public'
+   *   - visibility='admin' AND (role='admin' OR model_id ∈ grantedModelIds)
+   *   - visibility='hidden' AND model_id ∈ grantedModelIds
+   *
+   * 语义是 "visibility 的默认范围 OR 显式 grants",grants 总是放大可见集而非取代。
+   * 这样 admin 不需要给自己手动 grant,普通 boss 通过 admin UI 给具体 user
+   * 添加 grant 即可让该 user 看到 admin/hidden 模型。
+   *
+   * 调用方在 handlers 里把当前 user 的 role 和 grants 集合传进来。grants 集合
+   * 由 admin/modelGrants.ts 的 listGrantsForUser() 提供,通常合并到 JWT context
+   * 之上还要查一次 DB(per-user 数据,无 NOTIFY 重载)。
+   */
+  listForUser(args: {
+    role: "user" | "admin";
+    grantedModelIds: ReadonlySet<string>;
+  }): PublicModel[] {
+    return [...this.map.values()]
+      .filter((p) => {
+        if (!p.enabled) return false;
+        if (p.visibility === "public") return true;
+        if (p.visibility === "admin") {
+          return args.role === "admin" || args.grantedModelIds.has(p.model_id);
+        }
+        // visibility === 'hidden'
+        return args.grantedModelIds.has(p.model_id);
+      })
+      .sort((a, b) => a.sort_order - b.sort_order)
+      .map(this.toPublicModel);
   }
 }

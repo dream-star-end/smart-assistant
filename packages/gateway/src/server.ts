@@ -55,6 +55,8 @@ import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
+import { syncCodexAuthFiles } from './codexAuthSync.js'
+import { inferAgentForModel } from './inferAgentForModel.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
@@ -76,7 +78,37 @@ const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_
  * session 卡死。运行时校验在 server.ts:WS handler 里;export 出来便于 unit test
  * 与未来抽 helper。
  */
-export const ALLOWED_INBOUND_MODELS = new Set(['claude-opus-4-7', 'claude-sonnet-4-6'])
+export const ALLOWED_INBOUND_MODELS = new Set(['claude-opus-4-7', 'claude-sonnet-4-6', 'gpt-5.5'])
+
+// v3 commercial: shared codex chatgpt OAuth between host gateway and per-user
+// containers requires two host directories — master (refresh_token, never
+// mounted) and container (stripped, ro bind-mounted into containers). See
+// codexAuthSync.ts for the design. Defaults can be overridden by env to
+// support staging / alt deploys.
+const CODEX_MASTER_DIR_DEFAULT = '/var/lib/openclaude-v3/codex-master-auth'
+const CODEX_CONTAINER_DIR_DEFAULT = '/var/lib/openclaude-v3/codex-container-auth'
+
+// Container Dockerfile (packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime)
+// fixes the agent user at uid=1000 / gid=1000. Default here matches that
+// invariant so a missing env var doesn't silently leave auth.json root-owned
+// (which would prevent the container's agent uid from reading it). Overrideable
+// via CODEX_CONTAINER_AUTH_UID for non-default deploys / dev.
+const CODEX_CONTAINER_AUTH_UID_DEFAULT = 1000
+
+function getCodexAuthDirs(): {
+  masterDir: string
+  containerDir: string
+  containerUid: number
+} {
+  const uidRaw = process.env.CODEX_CONTAINER_AUTH_UID
+  const containerUid =
+    uidRaw && /^\d+$/.test(uidRaw) ? Number(uidRaw) : CODEX_CONTAINER_AUTH_UID_DEFAULT
+  return {
+    masterDir: process.env.CODEX_MASTER_DIR || CODEX_MASTER_DIR_DEFAULT,
+    containerDir: process.env.CODEX_CONTAINER_DIR || CODEX_CONTAINER_DIR_DEFAULT,
+    containerUid,
+  }
+}
 
 /**
  * V3 Phase 2 Task 2H: 商业化模块 hook 形状(只声明 gateway 需要的接口,
@@ -688,6 +720,14 @@ export class Gateway {
     )
     // Check immediately on boot
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
+
+    // v3 commercial: self-heal codex auth files on boot. If host master /
+    // container files were lost (deploy moved dirs, perms got stomped, fresh
+    // host) but codexOAuth in config is still valid, regenerate them so
+    // per-user containers can read the shared chatgpt subscription without
+    // requiring boss to re-OAuth. Force-write — no ownership check needed
+    // because we trust the in-memory config as source of truth on boot.
+    void this._selfHealCodexAuthOnBoot()
 
     await new Promise<void>((res) => {
       this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
@@ -2893,11 +2933,16 @@ export class Gateway {
       })
 
       if (!tokenRes.ok) {
-        const errText = await tokenRes.text()
+        // plan v3 §11(日志脱敏): 不入 log 原 body —— OAuth provider 错误响应
+        // 可能含完整 access/refresh token 残片(provider 故障时)、内部 grant
+        // 配置或客户的 email/account id。body 仅消费一次以释放 connection,
+        // 不输入 logger;只 log status code + bodyLen(用于排查"空 body"等
+        // 边界 case)。需要详细 body 时 boss 用 curl 重放 OAuth flow 现场抓。
+        const _body = await tokenRes.text().catch(() => '')
         this.log.error('oauth token exchange failed', {
           provider: providerKey,
           status: tokenRes.status,
-          body: errText,
+          bodyLen: _body.length,
         })
         return this.sendError(res, 502, `token exchange failed: ${tokenRes.status}`)
       }
@@ -2929,6 +2974,24 @@ export class Gateway {
         this.deps.config = config
         this.sessions.updateConfig(config)
         this.log.info('oauth tokens saved', { provider: providerKey })
+
+        // v3 commercial: callback path = boss just OAuth'd via the UI →
+        // force-write both master and container auth.json so per-user
+        // containers can immediately use the shared chatgpt subscription.
+        // No expectedPreviousRefreshToken: this is an explicit user action,
+        // overwriting any prior file is intended.
+        if (providerKey === 'codex') {
+          const dirs = getCodexAuthDirs()
+          await syncCodexAuthFiles({
+            oauth: { accessToken: oauthData.accessToken, refreshToken: oauthData.refreshToken },
+            masterDir: dirs.masterDir,
+            containerDir: dirs.containerDir,
+            containerUid: dirs.containerUid,
+            log: this.log,
+          }).catch((err) =>
+            this.log.warn('codex auth sync after OAuth callback failed', undefined, err),
+          )
+        }
       }
 
       this.sendJson(res, 200, {
@@ -2949,6 +3012,28 @@ export class Gateway {
   private _refreshPromise: Promise<void> | null = null
   private _refreshForced = false
 
+  /**
+   * v3 commercial: regenerate master + container auth.json on gateway boot
+   * if config has a codexOAuth token. Idempotent — same JSON written to
+   * stable paths via atomic rename. Fire-and-forget; never throws.
+   */
+  private async _selfHealCodexAuthOnBoot(): Promise<void> {
+    try {
+      const codexOAuth = this.deps.config.auth.codexOAuth
+      if (!codexOAuth?.accessToken || !codexOAuth.refreshToken) return
+      const dirs = getCodexAuthDirs()
+      await syncCodexAuthFiles({
+        oauth: { accessToken: codexOAuth.accessToken, refreshToken: codexOAuth.refreshToken },
+        masterDir: dirs.masterDir,
+        containerDir: dirs.containerDir,
+        containerUid: dirs.containerUid,
+        log: this.log,
+      })
+    } catch (err) {
+      this.log.warn('codex auth self-heal on boot failed', undefined, err)
+    }
+  }
+
   private refreshClaudeOAuthIfNeeded(force = false): Promise<void> {
     if (this._refreshPromise) {
       if (force && !this._refreshForced) {
@@ -2966,14 +3051,18 @@ export class Gateway {
   }
 
   private async _refreshClaudeOAuthImpl(force: boolean): Promise<void> {
-    // Try refreshing Claude OAuth
+    // Refresh threshold: 15 min before expiry (was 5 min). v3 plan A9 — wider
+    // window so per-user containers reading the bind-mounted container
+    // auth.json see the new access_token before the old one expires
+    // mid-turn. Combined with the 10-min periodic timer this gives 5–15 min
+    // of lead time.
+    const REFRESH_LEAD_MS = 15 * 60_000
     const claudeOAuth = this.deps.config.auth.claudeOAuth
-    if (claudeOAuth?.refreshToken && (force || Date.now() >= claudeOAuth.expiresAt - 5 * 60_000)) {
+    if (claudeOAuth?.refreshToken && (force || Date.now() >= claudeOAuth.expiresAt - REFRESH_LEAD_MS)) {
       await this._refreshToken('claude', claudeOAuth)
     }
-    // Try refreshing Codex OAuth
     const codexOAuth = this.deps.config.auth.codexOAuth
-    if (codexOAuth?.refreshToken && (force || Date.now() >= codexOAuth.expiresAt - 5 * 60_000)) {
+    if (codexOAuth?.refreshToken && (force || Date.now() >= codexOAuth.expiresAt - REFRESH_LEAD_MS)) {
       await this._refreshToken('codex', codexOAuth)
     }
   }
@@ -3029,6 +3118,26 @@ export class Gateway {
           provider: providerKey,
           expiresInSec: tokens.expires_in,
         })
+
+        // v3 commercial: refresh path → write master with ownership check
+        // (only overwrite if master file's refresh_token is still the one
+        // we just consumed = oauth.refreshToken before swap), then write
+        // container variant. Single-actor invariant: in v3 commercial the
+        // gateway is a single systemd unit — _refreshPromise dedups inside
+        // this process. See risk #3 in plan v3 for multi-gateway caveats.
+        if (providerKey === 'codex') {
+          const dirs = getCodexAuthDirs()
+          await syncCodexAuthFiles({
+            oauth: { accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken },
+            masterDir: dirs.masterDir,
+            containerDir: dirs.containerDir,
+            containerUid: dirs.containerUid,
+            log: this.log,
+            expectedPreviousRefreshToken: oauth.refreshToken,
+          }).catch((err) =>
+            this.log.warn('codex auth sync after token refresh failed', undefined, err),
+          )
+        }
       }
     } catch (err) {
       this.log.error('oauth refresh error', { provider: providerKey }, err)
@@ -3857,8 +3966,8 @@ export class Gateway {
     // Explicit agentId override (web UI per-session selection)
     let sessionKey: string
     let agent: AgentDef
+    const cfg = await this._getAgentsConfig()
     if (frame.agentId) {
-      const cfg = await this._getAgentsConfig()
       const ag = cfg.agents.find((a) => a.id === frame.agentId) ?? { id: frame.agentId }
       agent = ag
       // Include agentId in sessionKey so different agents get isolated subprocesses
@@ -3868,6 +3977,114 @@ export class Gateway {
       sessionKey = routed.sessionKey
       agent = routed.agent
     }
+
+    // ── plan v3 §B/§B1: model→agent fail-closed routing ──
+    // 把 inferAgentForModel 接到生产 message 链路。在 agent 已确定 + safeModel 已审过
+    // 之后做家族匹配判定:
+    //   - gpt-* 模型 + 显式非 codex agent / 默认 agent + gpt-* → 路由到固定 id 'codex'
+    //   - 找不到 codex agent / 不是 codex-native → fail closed(error='no_codex_agent')
+    //   - 显式 agent 与 model 家族不兼容 → fail closed(error='mismatch')
+    // 失败 → 立刻向 user 回 error 帧并 return,不进 sessionManager。这样未授权用户
+    // 即便绕过 modelPicker 直接 POST,也不会暴露 codex agent 的存在 / 配置状态
+    // (canUseModel 在 ws bridge 层已先于此路径拦截,这是 belt-and-suspenders)。
+    const _frameModelRaw = (frame as any).model
+    const safeModelForRouting: string | undefined =
+      typeof _frameModelRaw === 'string' && ALLOWED_INBOUND_MODELS.has(_frameModelRaw)
+        ? _frameModelRaw
+        : undefined
+    if (safeModelForRouting) {
+      // 用 router/explicit 已解析出的 agent.id,而不是 frame.agentId ?? cfg.default。
+      // 否则如果 router 通过 routes 规则选了一个非 default 的 claude agent,这里会把它
+      // 错误地 "降级" 回 cfg.default,造成路由回归(Codex review v2 finding 2)。
+      const decision = inferAgentForModel({
+        model: safeModelForRouting,
+        requestedAgentId: agent.id,
+        defaultAgentId: cfg.default,
+        agents: cfg.agents,
+      })
+      if ('error' in decision) {
+        const _errUserId: string =
+          typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+        const errFrame = {
+          type: 'outbound.message' as const,
+          sessionKey,
+          channel: frame.channel,
+          peer: frame.peer,
+          blocks: [
+            {
+              kind: 'text' as const,
+              text: `[error] model routing rejected (${decision.error})`,
+            },
+          ],
+          isFinal: true,
+          _userId: _errUserId,
+        }
+        // 不要泄漏 decision.reason 内文(可能含 agent provider 等内部线索),
+        // 仅给前端 error code,内部细节走 log。
+        this.log.warn('inferAgentForModel rejected', {
+          model: safeModelForRouting,
+          requestedAgentId: agent.id,
+          error: decision.error,
+          reason: decision.reason,
+        })
+        this.deliver(errFrame as unknown as OutboundMessage, adapter)
+        return
+      }
+      if (decision.agentId !== agent.id) {
+        const overrideAgent = cfg.agents.find((a) => a.id === decision.agentId)
+        if (overrideAgent) {
+          agent = overrideAgent
+          // 模型路由换了 agent → 强制 per-agent 隔离 sessionKey,避免 codex 与
+          // 其他 agent 的 subprocess 污染同一 SessionManager 槽。
+          sessionKey = `agent:${agent.id}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+        } else {
+          // inferAgentForModel 已校验 codex agent 存在,这里不应到达;防御性 log。
+          this.log.error('inferAgentForModel returned unknown agentId', {
+            decisionAgentId: decision.agentId,
+          })
+        }
+      }
+    }
+
+    // ── plan v3 §B4 review v3 finding 1: defense-in-depth ──
+    // Gateway runs inside the per-user container with no commercial DB access,
+    // so it can't run model authz directly — that's the bridge's job. But
+    // bridge's AGENT_AUTHZ_IMPLIED_MODEL allowlist only covers the canonical
+    // id='codex'. A user who edits `agents.yaml` to add a second agent with
+    // `provider: 'codex-native'` under a custom id and sends
+    // `{agentId: '<custom>'}` (no `model` field) would bypass:
+    //   - bridge: no frame.model + custom id not in allowlist → no authz check
+    //   - gateway: safeModelForRouting=undefined → inferAgentForModel skipped
+    //   - sessionManager: provider==='codex-native' → spawns CodexRunner
+    // Close the loop here: any codex-native agent execution MUST carry an
+    // explicit ALLOWED_INBOUND_MODELS gpt-* model so the bridge's frame.model
+    // authz path runs. Frontend always sends `model` with codex selection,
+    // so legit flows are unaffected. Reject is fail-closed (error frame +
+    // return, never enters sessionManager).
+    if (agent.provider === 'codex-native' && !safeModelForRouting) {
+      const _errUserId: string =
+        typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+      const errFrame = {
+        type: 'outbound.message' as const,
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [
+          {
+            kind: 'text' as const,
+            text: '[error] codex-native agent requires explicit model field',
+          },
+        ],
+        isFinal: true,
+        _userId: _errUserId,
+      }
+      this.log.warn('codex-native agent invoked without explicit model — rejected', {
+        agentId: agent.id,
+      })
+      this.deliver(errFrame as unknown as OutboundMessage, adapter)
+      return
+    }
+
     // Track last active channel for proactive push
     const activeUserId: string =
       typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
@@ -3896,14 +4113,13 @@ export class Gateway {
       safeEffortLevel = undefined
     }
 
-    // Same defensive sanitize for InboundMessage.model (2026-04-26 v1.0.4):
+    // Defensive sanitize for InboundMessage.model (2026-04-26 v1.0.4):
     //   - 合法 model id(ALLOWED_INBOUND_MODELS) → 透传给 sessionManager.submit,
     //     在那里比对 runner.model 决定是否 setModel + shutdown(下次 submit 自动 spawn 新模型)
     //   - 缺省 / 非法 → undefined,sessionManager 不动 runner 当前 model
     //   allowlist 抽到文件顶部 export 便于 unit test + 后续加模型集中改一处。
-    const _frameModel = (frame as any).model
-    const safeModel: string | undefined =
-      typeof _frameModel === 'string' && ALLOWED_INBOUND_MODELS.has(_frameModel) ? _frameModel : undefined
+    // 已在 inferAgentForModel 路由前算过(safeModelForRouting),此处复用避免重复。
+    const safeModel: string | undefined = safeModelForRouting
 
     const session = await this.sessions.getOrCreate({
       sessionKey,

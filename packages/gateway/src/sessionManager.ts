@@ -18,6 +18,7 @@ import {
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { SubprocessRunner } from './subprocessRunner.js'
+import { CodexAppServerRunner } from './codexAppServerRunner.js'
 import { CodexRunner } from './codexRunner.js'
 import {
   type ExecutionTarget,
@@ -423,37 +424,56 @@ export class SessionManager {
     // provider=codex-native routes to `codex` CLI instead of CCB; runner shape
     // (EventEmitter with start/submit/shutdown + same events) is compatible,
     // so upstream session bookkeeping works unchanged.
+    //
+    // Within codex-native, `agent.runnerKind` picks the codex backend:
+    //   'exec'        — legacy `codex exec` per-turn subprocess (no token streaming)
+    //   'app-server'  — `codex app-server` long-lived JSON-RPC (token-level streaming)
+    // Default is 'exec' for backward compat with existing agents.yaml entries.
     const providerTag = SessionManager.providerTag(opts.agent.provider)
-    const runner: SubprocessRunner =
-      opts.agent.provider === 'codex-native'
-        ? (new CodexRunner({
-            sessionKey: opts.sessionKey,
-            agentId: opts.agent.id,
-            cwd,
-            // Only resume if the persisted id was produced by a codex-native
-            // runner — feeding a CCB session_id to `codex exec resume` would
-            // make codex reject the arg or attach to a nonexistent thread.
-            resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
-            model: opts.agent.model ?? this.config.defaults.model,
-          }) as unknown as SubprocessRunner)
-        : new SubprocessRunner({
-            sessionKey: opts.sessionKey,
-            agentId: opts.agent.id,
-            cwd,
-            config: this.config,
-            persona,
-            model: opts.agent.model ?? this.config.defaults.model,
-            permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
-            agentProvider: opts.agent.provider,
-            agentMcpServers: opts.agent.mcpServers,
-            agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
-            delegationDepth: opts.delegationDepth,
-            // Symmetrically: only resume CCB from a CCB-tagged id.
-            // _resumeIdFor also drops the entry silently when the CCB JSONL
-            // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
-            resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
-            effortLevel: initialEffort,
-          })
+    let runner: SubprocessRunner
+    if (opts.agent.provider === 'codex-native') {
+      // Only resume if the persisted id was produced by a codex-native runner —
+      // feeding a CCB session_id to either codex backend would make codex reject
+      // the id or attach to a nonexistent thread.
+      const codexResumeId = this._resumeIdFor(opts.sessionKey, providerTag)
+      const codexModel = opts.agent.model ?? this.config.defaults.model
+      if (opts.agent.runnerKind === 'app-server') {
+        runner = new CodexAppServerRunner({
+          sessionKey: opts.sessionKey,
+          agentId: opts.agent.id,
+          cwd,
+          resumeSessionId: codexResumeId,
+          model: codexModel,
+        }) as unknown as SubprocessRunner
+      } else {
+        runner = new CodexRunner({
+          sessionKey: opts.sessionKey,
+          agentId: opts.agent.id,
+          cwd,
+          resumeSessionId: codexResumeId,
+          model: codexModel,
+        }) as unknown as SubprocessRunner
+      }
+    } else {
+      runner = new SubprocessRunner({
+        sessionKey: opts.sessionKey,
+        agentId: opts.agent.id,
+        cwd,
+        config: this.config,
+        persona,
+        model: opts.agent.model ?? this.config.defaults.model,
+        permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
+        agentProvider: opts.agent.provider,
+        agentMcpServers: opts.agent.mcpServers,
+        agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
+        delegationDepth: opts.delegationDepth,
+        // Symmetrically: only resume CCB from a CCB-tagged id.
+        // _resumeIdFor also drops the entry silently when the CCB JSONL
+        // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
+        resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
+        effortLevel: initialEffort,
+      })
+    }
     const now = Date.now()
     const session: AgentSession = {
       sessionKey: opts.sessionKey,

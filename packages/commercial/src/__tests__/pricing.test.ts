@@ -15,6 +15,8 @@ import {
   type ModelPricing,
 } from "../billing/pricing.js";
 
+// visibility='admin' 锁定 0049 迁移后 haiku 的新状态(老 HIDDEN_FROM_PUBLIC_LIST
+// 行为由 visibility 列表达;详见 pricing.ts 顶部注释)。
 const haiku: ModelPricing = {
   model_id: "claude-haiku-4-5",
   display_name: "Claude Haiku 4.5",
@@ -25,6 +27,7 @@ const haiku: ModelPricing = {
   multiplier: "1.500",
   enabled: true,
   sort_order: 110,
+  visibility: "admin",
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
@@ -38,6 +41,7 @@ const sonnet: ModelPricing = {
   multiplier: "2.000",
   enabled: true,
   sort_order: 100,
+  visibility: "public",
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
@@ -52,6 +56,7 @@ const opus: ModelPricing = {
   multiplier: "2.000",
   enabled: true,
   sort_order: 90,
+  visibility: "public",
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
@@ -65,7 +70,39 @@ const disabled: ModelPricing = {
   multiplier: "1.500",
   enabled: false,
   sort_order: 200,
+  visibility: "public",
   updated_at: new Date("2026-04-01T00:00:00Z"),
+};
+
+// GPT 5.5 — 0050 seed 引入,visibility='admin' 默认对普通用户隐藏。
+const gpt55: ModelPricing = {
+  model_id: "gpt-5.5",
+  display_name: "GPT 5.5 (Codex)",
+  input_per_mtok: 500n,
+  output_per_mtok: 2500n,
+  cache_read_per_mtok: 50n,
+  cache_write_per_mtok: 625n,
+  multiplier: "2.000",
+  enabled: true,
+  sort_order: 110,
+  visibility: "admin",
+  updated_at: new Date("2026-04-29T00:00:00Z"),
+};
+
+// 隐藏型(visibility='hidden')—— 默认连 admin 都看不到,只对 grants 中的用户可见。
+// 用于覆盖 listForUser 的边角分支;DB 里目前没有这种行实例。
+const hiddenModel: ModelPricing = {
+  model_id: "internal-tool",
+  display_name: "Internal Tool",
+  input_per_mtok: 100n,
+  output_per_mtok: 500n,
+  cache_read_per_mtok: 10n,
+  cache_write_per_mtok: 125n,
+  multiplier: "1.000",
+  enabled: true,
+  sort_order: 999,
+  visibility: "hidden",
+  updated_at: new Date("2026-04-29T00:00:00Z"),
 };
 
 describe("perKtokCredits (helper)", () => {
@@ -188,20 +225,115 @@ describe("PricingCache (unit, no DB)", () => {
   });
 
   test("haiku-4-5 is hidden from listPublic but reachable via get() (品牌 vs 路由二态分离)", () => {
-    // 品牌叙事:Haiku 不在前台 picker / landing 显示。
-    // 路由层:WebFetch 等容器内部小模型用途仍然命中 pricing.get()。
-    // 这条用例锁定二态分离;参见 pricing.ts HIDDEN_FROM_PUBLIC_LIST 的注释。
+    // 0049 后这条改由 visibility='admin' 表达。锁定:
+    //   - listPublic (visibility='public' 过滤) 不含 haiku
+    //   - get() 仍命中(给 anthropicProxy / WebFetch 路由用)
     const p = new PricingCache();
     p._setForTests([haiku, sonnet, opus]);
 
-    // listPublic 不含 haiku
     const ids = p.listPublic().map((m) => m.id);
     assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6"]);
-    assert.ok(!ids.includes("claude-haiku-4-5"), "haiku must be hidden");
+    assert.ok(!ids.includes("claude-haiku-4-5"), "haiku must be hidden from public");
 
-    // 但 get 仍然命中(用 canonical 和 firstParty 长名两条路径都验)
     assert.equal(p.get("claude-haiku-4-5")?.model_id, "claude-haiku-4-5");
     assert.equal(p.get("claude-haiku-4-5-20251001")?.model_id, "claude-haiku-4-5");
+  });
+
+  test("listPublic excludes visibility='admin' and 'hidden'", () => {
+    const p = new PricingCache();
+    p._setForTests([opus, sonnet, haiku, gpt55, hiddenModel]);
+    const ids = p.listPublic().map((m) => m.id);
+    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6"]);
+  });
+});
+
+describe("PricingCache.listForUser (visibility OR grants)", () => {
+  const allModels = [opus, sonnet, haiku, gpt55, hiddenModel, disabled];
+
+  test("普通用户无 grants → 只看到 visibility='public' 模型", () => {
+    const p = new PricingCache();
+    p._setForTests(allModels);
+    const ids = p
+      .listForUser({ role: "user", grantedModelIds: new Set() })
+      .map((m) => m.id);
+    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6"]);
+  });
+
+  test("admin 看到 public + admin (haiku/gpt-5.5),仍不含 hidden", () => {
+    const p = new PricingCache();
+    p._setForTests(allModels);
+    const ids = p
+      .listForUser({ role: "admin", grantedModelIds: new Set() })
+      .map((m) => m.id);
+    // sort_order:opus 90, sonnet 100, haiku 110, gpt-5.5 110(并列时 stable)
+    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5", "gpt-5.5"]);
+    assert.ok(!ids.includes("internal-tool"), "hidden 不应给默认 admin");
+  });
+
+  test("普通用户被 grant gpt-5.5 → 看到 public + grant 模型", () => {
+    const p = new PricingCache();
+    p._setForTests(allModels);
+    const ids = p
+      .listForUser({ role: "user", grantedModelIds: new Set(["gpt-5.5"]) })
+      .map((m) => m.id);
+    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.5"]);
+  });
+
+  test("普通用户被 grant hidden 模型 → 也能看到", () => {
+    const p = new PricingCache();
+    p._setForTests(allModels);
+    const ids = p
+      .listForUser({ role: "user", grantedModelIds: new Set(["internal-tool"]) })
+      .map((m) => m.id);
+    assert.ok(ids.includes("internal-tool"), "hidden 模型 grant 后该用户应可见");
+  });
+
+  test("admin 被 grant hidden 模型 → 也能看到", () => {
+    // 验证 visibility OR grants 语义:admin 默认看不到 hidden,grant 是 OR 放大
+    const p = new PricingCache();
+    p._setForTests(allModels);
+    const ids = p
+      .listForUser({ role: "admin", grantedModelIds: new Set(["internal-tool"]) })
+      .map((m) => m.id);
+    assert.ok(ids.includes("internal-tool"));
+    assert.ok(ids.includes("claude-haiku-4-5"));
+    assert.ok(ids.includes("gpt-5.5"));
+  });
+
+  test("disabled 模型对任何身份都不出现", () => {
+    const p = new PricingCache();
+    p._setForTests([disabled]);
+    assert.equal(p.listForUser({ role: "admin", grantedModelIds: new Set(["claude-legacy"]) }).length, 0);
+    assert.equal(p.listForUser({ role: "user", grantedModelIds: new Set(["claude-legacy"]) }).length, 0);
+  });
+
+  test("空缓存 → 空列表", () => {
+    const p = new PricingCache();
+    assert.deepEqual(p.listForUser({ role: "admin", grantedModelIds: new Set() }), []);
+  });
+
+  test("grant 不存在的 model_id 不影响其他逻辑(无副作用)", () => {
+    const p = new PricingCache();
+    p._setForTests([sonnet]);
+    const result = p.listForUser({
+      role: "user",
+      grantedModelIds: new Set(["does-not-exist", "sonnet-typo"]),
+    });
+    assert.deepEqual(
+      result.map((m) => m.id),
+      ["claude-sonnet-4-6"],
+    );
+  });
+
+  test("hidden 模型不被自动给 admin —— 锁定语义,避免 'admin sees everything' 假设", () => {
+    // 故意单独一条测试,因为这是反 admin 直觉的设计(plan v3 §E1 OR-语义):
+    // visibility='hidden' 时 admin 必须显式被 grant 才能看到。
+    const p = new PricingCache();
+    p._setForTests([hiddenModel]);
+    const ids = p
+      .listForUser({ role: "admin", grantedModelIds: new Set() })
+      .map((m) => m.id);
+    assert.deepEqual(ids, []);
   });
 
   test("get rejects garbage prefix even when haiku row exists", () => {

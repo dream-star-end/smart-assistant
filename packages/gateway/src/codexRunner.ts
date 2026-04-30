@@ -1,8 +1,74 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { copyFile, mkdir } from 'node:fs/promises'
+import { basename, join } from 'node:path'
 import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'codexRunner' })
+
+/**
+ * Per-thread directory where codex CLI persists images created via the built-in
+ * `image_gen` skill. threadId is sanitized: codex thread_ids are ULID-like
+ * (alphanumeric + hyphens) but we sanitize defensively so future format drift
+ * cannot escape the dir.
+ *
+ * Exported so codexAppServerRunner (and tests) can construct expected paths
+ * consistently.
+ */
+export function _sanitizeThreadId(threadId: string): string {
+  return threadId.replace(/[^A-Za-z0-9._-]/g, '')
+}
+
+/**
+ * Copy a list of absolute image paths into OpenClaude's public generated/ dir.
+ * Module-level helper so both the legacy exec runner (which scans a per-thread
+ * dir) and the app-server runner (which gets `savedPath` directly on the
+ * `imageGeneration` thread item) can use the same copy + naming strategy.
+ *
+ * Naming: `codex-${sanitizedThreadId}-${basename(srcPath)}` — the basename is
+ * already a content-addressable hash from codex (`ig_<hash>.png`), and the
+ * thread id prefix prevents cross-thread collisions in the shared public dir.
+ *
+ * Caller is expected to pre-resolve `srcPaths` to absolute filesystem paths.
+ * Failures (ENOENT, EACCES, EROFS) are logged once at warn and surfaced via
+ * `failedNames` so the caller can render an "image copy failed" line.
+ */
+export async function copyImagePathsToPublicDir(
+  threadId: string,
+  srcPaths: string[],
+  dstDir: string,
+): Promise<{
+  copied: Array<{ srcPath: string; publicPath: string }>
+  failedNames: string[]
+}> {
+  const safeThread = _sanitizeThreadId(threadId)
+  try {
+    await mkdir(dstDir, { recursive: true })
+  } catch (err) {
+    log.warn('codex image public dir mkdir failed', {
+      dstDir,
+      err: (err as Error).message,
+    })
+  }
+  const copied: Array<{ srcPath: string; publicPath: string }> = []
+  const failedNames: string[] = []
+  for (const src of srcPaths) {
+    const name = basename(src)
+    const dst = join(dstDir, `codex-${safeThread}-${name}`)
+    try {
+      await copyFile(src, dst)
+      copied.push({ srcPath: src, publicPath: dst })
+    } catch (err) {
+      log.warn('codex image copy failed', {
+        src,
+        dst,
+        err: (err as Error).message,
+      })
+      failedNames.push(name)
+    }
+  }
+  return { copied, failedNames }
+}
 
 // ───────────────────────────────────────────────
 // CodexRunner
@@ -68,7 +134,13 @@ const ENV_SCRUB_KEYS = new Set<string>([
 ])
 const ENV_SCRUB_PREFIXES = ['ANTHROPIC_', 'CLAUDE_CODE_', 'OPENCLAUDE_']
 
-function buildCodexEnv(): NodeJS.ProcessEnv {
+/**
+ * Build the env passed to a codex subprocess. Exported so the app-server runner
+ * (which spawns `codex app-server` instead of `codex exec`) can share the same
+ * scrubbing rules — both subprocesses are codex's own CLI and have identical
+ * env exposure concerns.
+ */
+export function buildCodexEnv(): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue

@@ -63,6 +63,24 @@ RUN apt-get update \
     && find / -xdev -perm -2000 -type f 2>/dev/null | xargs -r chmod g-s
 
 # ------------------------------------------------------------
+# Codex CLI(@openai/codex)— 跑 GPT 系模型用 app-server JSON-RPC runner
+# ------------------------------------------------------------
+# 个人版 commit 257674bf 已经把 codex app-server 流式 runner 做完(4 轮 Codex review PASS)。
+# v3 容器复用同一份 codex CLI 二进制,gateway 选到 gpt-5.5 时,sessionManager 通过
+# `runnerKind:'app-server'` 路由到 CodexAppServerRunner,长驻一个 codex app-server 子进程。
+#
+# 版本 pin 0.125.0:与个人版生产环境一致,避免 daily build 引入 protocol 漂移。
+# 全局装到 /usr/local/lib/node_modules/@openai/codex,二进制 symlink 在 /usr/local/bin/codex。
+# 容器内 USER=agent 走默认 PATH 即可命中。
+#
+# Auth: codex CLI 默认读 $CODEX_HOME/auth.json(下面 ENV CODEX_HOME 显式 set),
+# host 通过 ro bind-mount 把剥离 refresh_token 的 auth.json 写到 /home/agent/.codex/。
+# 详见 packages/gateway/src/codexAuthSync.ts 的 writeContainerVariant + supervisor mount。
+RUN npm install -g @openai/codex@0.125.0 --no-audit --no-fund \
+    && npm cache clean --force \
+    && rm -rf /root/.npm
+
+# ------------------------------------------------------------
 # 账户 agent (uid=1000)
 # ------------------------------------------------------------
 # node:22-slim 自带 uid=1000 的 node 用户;先 userdel 改名 agent,supervisor

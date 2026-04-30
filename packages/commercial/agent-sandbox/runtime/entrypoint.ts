@@ -21,9 +21,16 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
+import * as YAML from "yaml";
 import { isProviderManagedEnvVar } from "/opt/openclaude/claude-code-best/src/utils/managedEnvConstants.ts";
 
 // ───────────────────────────────────────────────
@@ -69,6 +76,15 @@ cleanEnv.CLAUDE_CONFIG_DIR = "/run/oc/claude-config";
 // 修复配对:packages/gateway/src/subprocessRunner.ts 里 `OPENCLAUDE_HOME ?? ''` 改成
 // 存在才传,空串视作 undefined。
 cleanEnv.OPENCLAUDE_HOME = "/home/agent/.openclaude";
+
+// Codex CLI 默认从 $CODEX_HOME/auth.json 读 OAuth token。host 把剥离 refresh_token
+// 的 auth.json 通过 ro bind-mount 写到 /home/agent/.codex/(见 v3supervisor.ts 的
+// codex-container-auth 目录挂载),codex 默认路径直接命中。**不要**把这个目录改到
+// 别处,否则 `codex` 二进制找不到 auth → 启动即 fail。
+//
+// boss 未 OAuth 时,host 不写 auth.json,但 mount 始终在(空目录),codex 启动报
+// "未授权"是预期行为(GPT 模型在 admin UI 也未发授权,前端 modelPicker 不会出选项)。
+cleanEnv.CODEX_HOME = "/home/agent/.codex";
 
 // ───────────────────────────────────────────────
 // 2. 个人版 openclaude.json 首次启动 bootstrap
@@ -126,29 +142,130 @@ try {
     console.error(`[entrypoint] bootstrapped minimal openclaude.json at ${ocConfigPath}`);
   }
 
-  // 个人版 SessionManager 也需要 agents.yaml 才能解析 opts.agent。volume 是空时
-  // 同步 bootstrap 一份单 agent 配置(default=main, model=opus-4-7,
-  // permissionMode=bypassPermissions —— v3 容器是 sandbox,内部不再做权限交互)。
+  // 个人版 SessionManager 也需要 agents.yaml 才能解析 opts.agent。两件事:
+  //
+  //   (a) volume 空 → bootstrap "main" + "codex" 两个 agent
+  //   (b) volume 已有 yaml(用户/旧版镜像写过)→ **强制 merge 固定 id `codex`**:
+  //       - 不存在 codex agent → append
+  //       - 存在但 provider/runnerKind/model 不匹配 → 覆盖并日志告警(原文件先 .bak)
+  //       - 解析失败 → 备份原文件到 .bak.<rand>,重新写一份双 agent yaml
+  //
+  // **安全边界放在后端 canUseModel + inferAgentForModel(fail-closed),agents.yaml
+  // 不当权限系统**。这里 merge 的目的只是确保 `id:codex` agent 一定存在 + 配置正确,
+  // 让 SessionManager 路由 gpt-5.5 时能找到 runnerKind:'app-server' 的目标。
+  // 用户哪怕手改 yaml 加了别的 codex agent,后端 canUseModel 不放行也无意义。
   const agentsPath = join(ocConfigDir, "agents.yaml");
+  const personaDir = join(ocConfigDir, "agents", "main");
+  const personaPath = join(personaDir, "CLAUDE.md");
+  mkdirSync(personaDir, { recursive: true });
+  if (!existsSync(personaPath)) {
+    writeFileSync(personaPath, "你是 OpenClaude 上的助手,简洁中文回答。\n", { mode: 0o644 });
+  }
+
+  // 期望的 codex agent 配置 —— 任何字段不匹配都覆盖
+  const desiredCodexAgent = {
+    id: "codex",
+    model: "gpt-5.5",
+    permissionMode: "bypassPermissions",
+    provider: "codex-native",
+    runnerKind: "app-server",
+    displayName: "GPT 5.5 (Codex)",
+  };
+
+  const desiredMainAgent = {
+    id: "main",
+    model: "claude-opus-4-7",
+    persona: personaPath,
+    permissionMode: "bypassPermissions",
+    provider: "claude-subscription",
+    displayName: "main",
+  };
+
   if (!existsSync(agentsPath)) {
-    const personaDir = join(ocConfigDir, "agents", "main");
-    const personaPath = join(personaDir, "CLAUDE.md");
-    mkdirSync(personaDir, { recursive: true });
-    if (!existsSync(personaPath)) {
-      writeFileSync(personaPath, "你是 OpenClaude 上的助手,简洁中文回答。\n", { mode: 0o644 });
-    }
-    const agentsYaml =
-      "agents:\n" +
-      "  - id: main\n" +
-      "    model: claude-opus-4-7\n" +
-      `    persona: ${personaPath}\n` +
-      "    permissionMode: bypassPermissions\n" +
-      "    provider: claude-subscription\n" +
-      "    displayName: main\n" +
-      "routes: []\n" +
-      "default: main\n";
-    writeFileSync(agentsPath, agentsYaml, { mode: 0o644 });
+    const initialDoc = {
+      agents: [desiredMainAgent, desiredCodexAgent],
+      routes: [],
+      default: "main",
+    };
+    writeFileSync(agentsPath, YAML.stringify(initialDoc), { mode: 0o644 });
     console.error(`[entrypoint] bootstrapped agents.yaml at ${agentsPath}`);
+  } else {
+    // merge 路径
+    let parsed: unknown = null;
+    let parseFailed = false;
+    try {
+      const raw = readFileSync(agentsPath, "utf8");
+      parsed = YAML.parse(raw);
+    } catch (parseErr) {
+      parseFailed = true;
+      const bakSuffix = randomBytes(4).toString("hex");
+      const bakPath = `${agentsPath}.bak.${bakSuffix}`;
+      try {
+        copyFileSync(agentsPath, bakPath);
+        console.error(
+          `[entrypoint] WARN: agents.yaml 解析失败,原文件备份到 ${bakPath}: ${(parseErr as Error).message}`,
+        );
+      } catch (bakErr) {
+        console.error(
+          `[entrypoint] WARN: agents.yaml 解析失败且 .bak 备份也失败: ${(bakErr as Error).message}`,
+        );
+      }
+    }
+
+    if (parseFailed || parsed === null || typeof parsed !== "object") {
+      // 重新写一份完整的双 agent yaml(保险)
+      const initialDoc = {
+        agents: [desiredMainAgent, desiredCodexAgent],
+        routes: [],
+        default: "main",
+      };
+      writeFileSync(agentsPath, YAML.stringify(initialDoc), { mode: 0o644 });
+      console.error(`[entrypoint] rewrote agents.yaml at ${agentsPath} (parse failed or empty)`);
+    } else {
+      const doc = parsed as { agents?: unknown; routes?: unknown; default?: unknown };
+      const agents = Array.isArray(doc.agents) ? [...(doc.agents as unknown[])] : [];
+      const codexIndex = agents.findIndex(
+        (a) => a !== null && typeof a === "object" && (a as { id?: unknown }).id === "codex",
+      );
+      let mutated = false;
+      if (codexIndex < 0) {
+        agents.push(desiredCodexAgent);
+        mutated = true;
+        console.error(`[entrypoint] agents.yaml: appended codex agent`);
+      } else {
+        const existing = agents[codexIndex] as Record<string, unknown>;
+        const mismatch =
+          existing.provider !== desiredCodexAgent.provider ||
+          existing.runnerKind !== desiredCodexAgent.runnerKind ||
+          existing.model !== desiredCodexAgent.model;
+        if (mismatch) {
+          // 备份后覆盖(用户 / 旧镜像污染了 codex 条目)
+          const bakSuffix = randomBytes(4).toString("hex");
+          const bakPath = `${agentsPath}.bak.${bakSuffix}`;
+          try {
+            copyFileSync(agentsPath, bakPath);
+          } catch (bakErr) {
+            console.error(
+              `[entrypoint] WARN: agents.yaml 覆盖 codex 前 .bak 备份失败: ${(bakErr as Error).message}`,
+            );
+          }
+          agents[codexIndex] = desiredCodexAgent;
+          mutated = true;
+          console.error(
+            `[entrypoint] agents.yaml: codex agent 字段不匹配,已覆盖(原文件备份到 ${bakPath})`,
+          );
+        }
+      }
+      if (mutated) {
+        const newDoc = {
+          ...doc,
+          agents,
+          routes: Array.isArray(doc.routes) ? doc.routes : [],
+          default: typeof doc.default === "string" ? doc.default : "main",
+        };
+        writeFileSync(agentsPath, YAML.stringify(newDoc), { mode: 0o644 });
+      }
+    }
   }
 } catch (err) {
   // 不致命: 如果 volume 没挂(本地 build smoke)或 perm 异常,gateway 自己会 onboard 流程报错

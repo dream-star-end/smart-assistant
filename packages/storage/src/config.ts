@@ -146,6 +146,11 @@ export interface AgentDef {
   provider?: string // 覆盖全局 config.provider (如 "minimax", "anthropic", "deepseek")
   mcpServers?: McpServerConfig[] // agent 专属 MCP servers (合并到系统共享工具之上)
   updatedAt?: string // ISO timestamp of last config change
+  // Codex runner mode: 'exec' = legacy per-turn `codex exec` spawn (default);
+  // 'app-server' = long-lived `codex app-server --listen stdio://` JSON-RPC
+  // process with token-streaming via item/agentMessage/delta. Only meaningful
+  // when provider='codex-native'.
+  runnerKind?: 'exec' | 'app-server'
 }
 
 export interface RouteRule {

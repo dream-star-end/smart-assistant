@@ -145,6 +145,39 @@ export const V3_VOLUME_MOUNT = "/home/agent/.openclaude";
 const V3_AGENT_USER = "1000:1000";
 
 /**
+ * Codex CLI(GPT 模型走 codex app-server runner)的容器侧 auth 目录挂载点。
+ *
+ * **设计要点(plan v3 §D + 风险 #4)**:
+ *   - 容器内 codex CLI 默认读 `$CODEX_HOME/auth.json`,entrypoint.ts 已强制
+ *     `CODEX_HOME=/home/agent/.codex`,docker bind-mount 把 host 的剥离
+ *     refresh_token 版本 auth.json 挂到这里,**ro**。
+ *   - **必须挂目录而非单文件**:host atomic rename(`auth.json.tmp.<rand> → auth.json`)
+ *     在文件 bind-mount 下绑死旧 inode,容器永远看不到新 token。挂目录后
+ *     容器看到的是 dirfd → entry "auth.json",rename 替换 entry 后立即可见。
+ *   - **永不挂 master 目录**(`codex-master-auth/`)—— 那里有完整 refresh_token,
+ *     挂入容器即扩大泄漏面。本常量只引用 container 目录。
+ *   - **始终挂载**(boss 未 OAuth 时目录内无 auth.json,codex 启动报"未授权"
+ *     是预期行为;前端 modelPicker 在 GPT 未授权时也不会出选项)。
+ *   - **当前限制**:host 写入由 master gateway 完成,远端 host(useRemote=true)
+ *     的容器拿不到 auth.json,GPT 模型仅在 master host 容器可用。跨 host 同步
+ *     auth.json 是后续 task,plan v3 范围内不处理。
+ */
+export const V3_CODEX_CONTAINER_MOUNT = "/home/agent/.codex";
+
+/**
+ * Host 侧容器 auth 目录默认路径。对应 codexAuthSync.writeContainerVariant
+ * 写入的目标目录。env `OC_V3_CODEX_CONTAINER_DIR` 覆盖,与 gateway 端环境
+ * 变量保持一致即可(默认值已对齐)。
+ */
+export const DEFAULT_V3_CODEX_CONTAINER_DIR = "/var/lib/openclaude-v3/codex-container-auth";
+
+function readCodexContainerDirFromEnv(): string {
+  const raw = process.env.OC_V3_CODEX_CONTAINER_DIR;
+  if (raw == null || raw.trim() === "") return DEFAULT_V3_CODEX_CONTAINER_DIR;
+  return raw.trim();
+}
+
+/**
  * 宿主侧远程执行 mux 目录 per-user 分片根。
  *
  * 完整布局(sshMux.ts 与本模块共同维护):
@@ -1298,6 +1331,31 @@ export async function provisionV3Container(
       `${volumeNames.data}:${V3_VOLUME_MOUNT}:rw`,
       `${volumeNames.projects}:${V3_PROJECTS_MOUNT}:rw`,
     ];
+
+    // Codex auth ro bind-mount(plan v3 §D1)。仅本地 provision 路径挂 ——
+    // 远端 host 上无对应目录,跨机同步 auth.json 是后续 task(GPT 模型在远端
+    // 容器报未授权,与未 OAuth 路径合并到同一种 fail mode,前端 modelPicker
+    // 不会给远端用户出 GPT 选项 / 后端 canUseModel 在执行路径再兜底一次)。
+    //
+    // 始终挂载:目录由本模块在 provision 前 mkdir(idempotent),即使 host 还没
+    // 跑过 codexAuthSync,容器看到的是空目录,codex 启动报无 auth(预期)。
+    // host 写入后无需重启容器,mount 是目录而非单文件,新 entry 立即可见。
+    if (!useRemote) {
+      const codexContainerDir = readCodexContainerDirFromEnv();
+      try {
+        // mode 0755:owner=root rwx,其他用户(含容器内 agent uid)只能 r-x。
+        // 防容器内进程往 host 这个目录写,但允许进入查 auth.json。
+        await fsMkdir(codexContainerDir, { recursive: true, mode: 0o755 });
+      } catch (mkErr) {
+        // mkdir 失败不致命:bind-mount 时 docker 自身会报错,SupervisorError
+        // 走标准 wrapDockerError 路径。这里只做日志,不打断 provision。
+        console.error(
+          `[v3supervisor] WARN: ensure codex container dir failed: ${(mkErr as Error).message}`,
+        );
+      }
+      binds.push(`${codexContainerDir}:${V3_CODEX_CONTAINER_MOUNT}:ro`);
+    }
+
     if (sshUserRunDir) {
       // ro 防容器内 agent 篡改 ctl.sock / known_hosts。容器对 unix socket
       // 的 connect() 走 inode 的 w 位而非 mount 的 ro 位,仍然可连接;ro 只阻塞

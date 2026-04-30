@@ -331,6 +331,7 @@ const TABS = {
   orders: renderOrdersTab,
   pricing: renderPricingTab,
   plans: renderPlansTab,
+  modelGrants: renderModelGrantsTab,
   feedback: renderFeedbackTab,
   inbox: renderInboxTab,
   settings: renderSettingsTab,
@@ -3300,6 +3301,171 @@ function openEditPlanModal(d) {
       }
     })
   })
+}
+
+// ─── Tab: Model Grants(0049 模型可见性 / 用户级灰度授权)─────────
+//
+// 数据流:
+//   1. GET /api/admin/pricing → 全部定价行(含 visibility)
+//      visibility=public 不需要授权,所有人可见
+//      visibility=admin  默认 admin 可见,普通用户需 grant
+//      visibility=hidden 任何 role 都需 grant 才可见 / 才能用
+//   2. 输入 user_email/uid → GET /api/admin/users?q=... 取 uid
+//   3. GET /api/admin/users/:uid/model-grants → 当前 grants
+//   4. POST /api/admin/users/:uid/model-grants { model_id } → 添加
+//   5. DELETE /api/admin/users/:uid/model-grants/:model_id → 撤销
+//
+// 安全边界:不在前端做拦截,后端 canUseModel + WS bridge 双重校验。前端
+// 只是 admin 的可视化操作面板。
+//
+// 简化:不分页(visibility=admin/hidden 模型在可见未来都不会很多,< 50 行)。
+
+const MODEL_GRANTS_STATE = {
+  selectedUid: '',     // 选中用户的 uid 字符串(后端 BIGINT)
+  selectedEmail: '',   // 显示用
+  pricingRows: null,   // 全量定价行(缓存,不随用户切换重拉)
+  grantedSet: null,    // 当前选中用户已授权的 model_id Set
+}
+
+async function renderModelGrantsTab() {
+  view().innerHTML = `
+    <div class="panel">
+      <h2>用户模型授权 <small>visibility = admin / hidden 的模型按用户灰度</small></h2>
+      <div class="toolbar">
+        <input type="text" id="mg-q" placeholder="用户邮箱 或 UID"
+               value="${escapeHtml(MODEL_GRANTS_STATE.selectedEmail || '')}"
+               style="min-width:240px;" />
+        <button class="btn btn-primary" id="mg-search">查询</button>
+        ${MODEL_GRANTS_STATE.selectedUid
+          ? `<span style="color:var(--muted);font-size:13px;">当前:${escapeHtml(MODEL_GRANTS_STATE.selectedEmail)} (uid=${escapeHtml(MODEL_GRANTS_STATE.selectedUid)})</span>`
+          : ''}
+      </div>
+      <div id="mg-body" style="margin-top:var(--s-3);">
+        ${MODEL_GRANTS_STATE.selectedUid ? '<div class="loading">加载中…</div>' : '<div class="empty">输入用户邮箱或 UID 开始</div>'}
+      </div>
+    </div>
+  `
+  $('mg-search').addEventListener('click', _onModelGrantsSearch)
+  $('mg-q').addEventListener('keydown', (e) => { if (e.key === 'Enter') _onModelGrantsSearch() })
+
+  if (MODEL_GRANTS_STATE.selectedUid) {
+    await _loadAndRenderModelGrants()
+  }
+}
+
+async function _onModelGrantsSearch() {
+  const q = $('mg-q').value.trim()
+  if (!q) { toast('输入邮箱或 UID', 'warn'); return }
+  let uid = ''
+  let email = ''
+  // 纯数字按 uid 直查;否则当 email 模糊搜
+  if (/^\d+$/.test(q)) {
+    try {
+      const detail = await apiGet(`/api/admin/users/${encodeURIComponent(q)}/detail`)
+      uid = String(detail?.user?.id ?? q)
+      email = detail?.user?.email ?? ''
+    } catch (err) {
+      toast(`找不到用户 uid=${q}: ${err.message}`, 'danger', toastOptsFromError(err))
+      return
+    }
+  } else {
+    try {
+      const sp = new URLSearchParams({ q, limit: '5' })
+      const data = await apiGet(`/api/admin/users?${sp.toString()}`)
+      const rows = data?.rows ?? []
+      const exact = rows.find((r) => (r.email || '').toLowerCase() === q.toLowerCase())
+      const hit = exact || rows[0]
+      if (!hit) { toast('未找到用户', 'warn'); return }
+      uid = String(hit.id)
+      email = hit.email || ''
+    } catch (err) {
+      toast(`查询失败: ${err.message}`, 'danger', toastOptsFromError(err))
+      return
+    }
+  }
+  MODEL_GRANTS_STATE.selectedUid = uid
+  MODEL_GRANTS_STATE.selectedEmail = email
+  await _loadAndRenderModelGrants()
+  // 更新 toolbar 状态文字
+  await renderModelGrantsTab()
+}
+
+async function _loadAndRenderModelGrants() {
+  const uid = MODEL_GRANTS_STATE.selectedUid
+  if (!uid) return
+  const body = $('mg-body')
+  if (body) body.innerHTML = '<div class="loading">加载中…</div>'
+
+  try {
+    // pricing 缓存:模型不会高频变,缓存到 STATE.pricingRows
+    if (!MODEL_GRANTS_STATE.pricingRows) {
+      const pr = await apiGet('/api/admin/pricing')
+      MODEL_GRANTS_STATE.pricingRows = pr?.rows ?? []
+    }
+    const grantsResp = await apiGet(`/api/admin/users/${encodeURIComponent(uid)}/model-grants`)
+    const granted = grantsResp?.rows ?? []
+    MODEL_GRANTS_STATE.grantedSet = new Set(granted.map((g) => g.model_id))
+  } catch (err) {
+    if (body) body.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
+    return
+  }
+
+  // 只展示需要授权的模型(visibility != public)。public 模型对所有用户可见,
+  // 列出来无意义。
+  const restricted = (MODEL_GRANTS_STATE.pricingRows || []).filter(
+    (p) => (p.visibility || 'public') !== 'public',
+  )
+  const html = restricted.length === 0
+    ? '<div class="empty">无受限模型(所有定价均为 visibility=public)</div>'
+    : `<table class="data">
+        <thead><tr>
+          <th>model_id</th><th>显示名</th><th>visibility</th>
+          <th>启用</th><th class="actions">授权</th>
+        </tr></thead>
+        <tbody>
+          ${restricted.map((p) => {
+            const isGranted = MODEL_GRANTS_STATE.grantedSet.has(p.model_id)
+            return `<tr>
+              <td class="mono">${escapeHtml(p.model_id)}</td>
+              <td>${escapeHtml(p.display_name || '')}</td>
+              <td>${escapeHtml(p.visibility || 'public')}</td>
+              <td>${p.enabled ? '<span class="badge ok">on</span>' : '<span class="badge muted">off</span>'}</td>
+              <td class="actions">
+                <button data-act="${isGranted ? 'mg-revoke' : 'mg-grant'}"
+                        data-model="${escapeHtml(p.model_id)}">
+                  ${isGranted ? '撤销' : '授权'}
+                </button>
+              </td>
+            </tr>`
+          }).join('')}
+        </tbody>
+      </table>`
+  if (body) body.innerHTML = html
+  for (const b of view().querySelectorAll('button[data-act="mg-grant"], button[data-act="mg-revoke"]')) {
+    b.addEventListener('click', async (ev) => {
+      const modelId = b.dataset.model
+      const action = b.dataset.act === 'mg-grant' ? 'grant' : 'revoke'
+      await withBtnLoading(ev.currentTarget, () => _toggleModelGrant(modelId, action))
+    })
+  }
+}
+
+async function _toggleModelGrant(modelId, action) {
+  const uid = MODEL_GRANTS_STATE.selectedUid
+  if (!uid) return
+  try {
+    if (action === 'grant') {
+      await apiJson('POST', `/api/admin/users/${encodeURIComponent(uid)}/model-grants`,
+        { model_id: modelId })
+      toast(`已授权 ${modelId}`)
+    } else {
+      await apiJson('DELETE', `/api/admin/users/${encodeURIComponent(uid)}/model-grants/${encodeURIComponent(modelId)}`, null)
+      toast(`已撤销 ${modelId}`)
+    }
+    await _loadAndRenderModelGrants()
+  } catch (err) {
+    toast(`失败: ${err.message}`, 'danger', toastOptsFromError(err))
+  }
 }
 
 // ─── Tab: Feedback (P1-2 用户反馈管理)──────────────────────────────

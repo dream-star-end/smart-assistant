@@ -738,7 +738,7 @@ export async function handleGetPublicConfig(
 // 公开路径,不限流、不需要登录;返回启用模型的公开视图(含 per-ktok 积分估价)。
 
 export async function handleListPublicModels(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
@@ -746,7 +746,29 @@ export async function handleListPublicModels(
   if (!deps.pricing) {
     throw new HttpError(503, "PRICING_NOT_READY", "pricing cache not initialized");
   }
-  sendJson(res, 200, { models: deps.pricing.listPublic() });
+  // 0049/0050:登录用户走 listForUser(visibility OR grants 语义),
+  //          匿名 / 无 token / 过期 token 走 listPublic。
+  // **不**对 token 失败抛 401:这是公开端点,即便 token 过期也允许列模型,
+  // 退化到 public 视图(避免每次登录态过期就 401 把前端 model 列表打没)。
+  // jwt 解析走 sync 校验(同 router.ts 的 verifyCommercialJwtSync 路径),
+  // 失败/过期/未提供 token 都视作匿名;不验 DB(只读 + listForUser 失败兜底由 grants 空集合保护)。
+  const authHeader = req.headers.authorization;
+  let token = "";
+  if (typeof authHeader === "string") {
+    token = authHeader.replace(/^Bearer\s+/i, "").trim();
+  }
+  const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
+  if (!claims) {
+    sendJson(res, 200, { models: deps.pricing.listPublic() });
+    return;
+  }
+  // 登录用户 —— 查一次 grants(per-user 表,无 NOTIFY 重载;每次请求查表是合理代价)
+  const { listGrantsForUser } = await import("../admin/modelGrants.js");
+  const grants = await listGrantsForUser(claims.sub);
+  const grantedSet = new Set(grants.map((g) => g.model_id));
+  sendJson(res, 200, {
+    models: deps.pricing.listForUser({ role: claims.role, grantedModelIds: grantedSet }),
+  });
 }
 
 // ─── GET / PATCH /api/me/preferences (V3 Phase 2 Task 2G) ──────────────

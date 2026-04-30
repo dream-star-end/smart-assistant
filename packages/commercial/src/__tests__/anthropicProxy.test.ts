@@ -44,6 +44,7 @@ const sonnet: ModelPricing = {
   multiplier: "2.000",
   enabled: true,
   sort_order: 100,
+  visibility: "public",
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 

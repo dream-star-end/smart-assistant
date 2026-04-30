@@ -262,6 +262,31 @@ export interface UserChatBridgeDeps {
    * 没注入 / endpoint 没返 containerId → bridge 直接跳过这层逻辑(等价空实现)。
    */
   markContainerActivity?: (containerId: number) => void;
+  /**
+   * 0049 模型授权(plan v3 §B3/§B4 + §F4)—— 桥接层是 v3 commercial **唯一**能
+   * 看到 inbound.message 帧并且也能拿到 user role + grants 的位置:
+   *   - 容器内 personal-version gateway 没有 commercial DB 连接,查不了 grants
+   *   - HTTP message-create handler 在 v3 不存在(用户消息走 WS,不走 REST)
+   *
+   * caller(commercial/index.ts)在 bridge 启动连接时**只调一次** loadAllowedModelChecker,
+   * 拿到一个**已绑定 uid+role+grants 集合**的纯同步 closure;后续每条 user→container
+   * 文本帧若是 inbound.message 且带 `model` 字段,就 sync 调一次 checker。返 false →
+   * 桥发 error frame + close(1008),不把帧 forward 进容器(避免容器侧 inferAgentForModel
+   * 错误信息泄漏 codex agent / config 状态;plan v3 §B4 review v3 补)。
+   *
+   * loadAllowedModelChecker 失败 throw → 桥关 1011 'agent unavailable'(grants 加载
+   * 失败不能 silently 放行,bridge 不区分 DB 故障 vs 用户被禁,统一拒)。
+   *
+   * 未注入(测试 / 个人版上下文)→ 桥不做模型校验,完全透传(行为与本字段加入前一致)。
+   *
+   * 为什么不在 bridge 内部直接持 PricingCache + listGrantsForUser:这一层不应耦合
+   * billing / admin 子模块;dep injection 把"鉴权策略"留给 caller 拼装,bridge 单测
+   * 可注入 mock checker 而不必拖起 PricingCache。
+   */
+  loadAllowedModelChecker?: (
+    uid: bigint,
+    role: "user" | "admin",
+  ) => Promise<(modelId: string) => boolean>;
 }
 
 /**
@@ -270,6 +295,39 @@ export interface UserChatBridgeDeps {
  * 也不会被误判 idle)。
  */
 const ACTIVITY_REFRESH_INTERVAL_MS = 60_000;
+
+/**
+ * 0049 模型授权 refresh 间隔(plan v3 review v1 §F4 follow-up)。
+ *
+ * 桥接连接 lifetime 内,每 N ms 重新调一次 loadAllowedModelChecker 拉最新
+ * grants 快照 + visibility,使 admin 取消授权后**无需用户重连**就能在窗口内
+ * 失效。30s 足够低延迟(用户感知近实时),又不至于把 PG 打穿(每用户每分钟
+ * 2 次 SELECT;1k 在线 ≈ 33 QPS,远低于 PricingCache 的 LISTEN/NOTIFY 路径)。
+ *
+ * Refresh 失败 → 保留上一次成功的 checker,不切到"全拒"或"全放"。原因:DB
+ * 临时抖动比授权状态变化更频繁,把已经授权的连接因为一次抖动踢掉会更糟。
+ */
+const GRANTS_REFRESH_INTERVAL_MS = 30_000;
+
+/**
+ * Agent → 隐含 model 授权映射(plan v3 round-2 finding 1 fix)。
+ *
+ * 为什么需要:用户提交 inbound.message 时可以**只**带 `agentId` 不带 `model`
+ * (v3 webchat 的常见情况:用户切到某 agent,不主动选 model)。这种帧到达时:
+ *   - bridge 之前只看 frame.model → 没 model 就 skip authz
+ *   - 容器内 gateway 把 frame 路由给 agentId='codex' 那个 agent → CodexAppServerRunner
+ *     用 agent.model='gpt-5.5' 启动 → 未授权用户拿到 codex API
+ *
+ * 因此:bridge 看到 agentId 命中本表 → 用对应 modelId 做 authz 校验。本质是
+ * "哪些 agentId 一旦使用,等于在用受限 model"的 explicit allowlist。新增 codex
+ * agent 必须在此登记。
+ *
+ * 与 agents.yaml 的关系:agents.yaml 是 runtime 配置,本表是**安全 contract**;
+ * 二者偏离不影响安全(本表多列 = 多拦,少列 = 漏拦但 inferAgentForModel 仍兜底)。
+ */
+const AGENT_AUTHZ_IMPLIED_MODEL: Record<string, string> = {
+  codex: "gpt-5.5",
+};
 
 export interface UserChatBridgeHandler {
   /** Gateway HTTP server 的 'upgrade' 事件入口。返 false → 路径不匹配,gateway 路由别处。 */
@@ -465,6 +523,51 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return;
         }
 
+        // 1.4) 0049 模型授权 checker —— 在 ensureRunning 之前拉一次 grants。
+        //   - load 失败 throw → close(1011)。grants DB 故障期间不做"放行"假设,
+        //     不然付费用户能在故障窗口里调到任何 hidden model。
+        //   - 测试 / 个人版上下文未注入 deps.loadAllowedModelChecker → handle=null,
+        //     桥行为与本字段加入前完全一致(无校验,纯透传)。
+        //   - 桥每 GRANTS_REFRESH_INTERVAL_MS ms 重新加载一次,使 admin 取消授权能
+        //     在窗口内对**已开 ws 连接**生效(plan v3 review v1 §F4 follow-up)。
+        //     refresh 失败保留上次 checker。lifetime 与连接绑定:cleanup() 清 timer。
+        let modelCheckerHandle:
+          | {
+              isAllowed: (modelId: string) => boolean;
+              refresh: () => Promise<void>;
+            }
+          | null = null;
+        if (deps.loadAllowedModelChecker) {
+          const loader = deps.loadAllowedModelChecker;
+          let inner: (modelId: string) => boolean;
+          try {
+            inner = await loader(uid, claims.role);
+          } catch (err) {
+            log?.error("user-chat-bridge: loadAllowedModelChecker threw", {
+              uid: uid.toString(),
+              err,
+            });
+            sendErrorFrame(ws, "ERR_INTERNAL", "authorization unavailable");
+            try { ws.close(CLOSE_BRIDGE.INTERNAL, "authorization unavailable"); } catch { /* */ }
+            return;
+          }
+          modelCheckerHandle = {
+            isAllowed: (modelId) => inner(modelId),
+            refresh: async () => {
+              try {
+                const next = await loader(uid, claims.role);
+                inner = next;
+              } catch (err) {
+                // 不切 inner —— 保留上次成功 checker。详见 GRANTS_REFRESH_INTERVAL_MS 注释。
+                log?.warn("user-chat-bridge: modelChecker refresh failed (keep last good)", {
+                  uid: uid.toString(),
+                  err,
+                });
+              }
+            },
+          };
+        }
+
         // 1.5) V3 Phase 4H+ maintenance 闸门:非 admin 在维护模式下不得建立新 chat 会话。
         //   - admin 判定只看 claims.role —— WS chat 不是"动账/改配置"的破坏性操作,
         //     按 HTTP 中间件那种 DB double-check 会让每次 handshake 多一次 PG roundtrip。
@@ -559,7 +662,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return;
         }
 
-        startBridge(ws, uid, endpoint, pendingMessages, endpoint.containerId, containerWs, connectAbort);
+        startBridge(
+          ws,
+          uid,
+          endpoint,
+          pendingMessages,
+          endpoint.containerId,
+          containerWs,
+          connectAbort,
+          modelCheckerHandle,
+        );
       })().catch((err: unknown) => {
         log?.error("user-chat-bridge: upgrade pipeline threw", { err });
         try { ws.close(CLOSE_BRIDGE.INTERNAL, "internal error"); } catch { /* */ }
@@ -589,6 +701,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * cleanup 时调 abort() — 让 tunnel WS 在握手阶段 abort 也能被打断。
      */
     connectAbort: AbortController,
+    /**
+     * 0049 模型授权 handle —— null 表示本连接不做模型校验(deps 未注入,或
+     * caller 显式不要鉴权)。
+     *   - `isAllowed(modelId)`:已绑定本连接的 uid + role + grants 集合的 sync 闭包
+     *   - `refresh()`:重新拉一次 grants(本桥 lifetime 内每 GRANTS_REFRESH_INTERVAL_MS
+     *     ms 调一次,使 admin 取消授权对已开桥也生效)
+     * onUserMessage 每条 inbound.message 帧 sync 调一次 isAllowed,且追踪
+     * lastSeenModelId 让没带 model 字段的后续帧也参与校验(plan v3 review v1
+     * follow-up:防"已用 gpt-5.5 跑起来的桥被撤销后无 model 字段帧透传")。
+     */
+    modelCheckerHandle:
+      | {
+          isAllowed: (modelId: string) => boolean;
+          refresh: () => Promise<void>;
+        }
+      | null,
   ): void {
     const connId = randomUUID();
     const startedAt = Date.now();
@@ -611,6 +739,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let firstUserFrameAtMs: number | null = null;
     let firstContainerFrameAtMs: number | null = null;
     const ttftKind: "cold" | "warm" = endpoint.coldStart === true ? "cold" : "warm";
+    // plan v3 review v1 §F4 follow-up:per-bridge 最后一次"用户主动声明"的 modelId。
+    // 用于在没带 model 字段的后续帧上仍然能用对应 model 校验 grants(防在飞会话
+    // 被撤销后还能继续发字)。null = 本桥还没收过任何带 model 的帧。
+    let lastSeenModelId: string | null = null;
+    // 周期 refresh modelChecker 的定时器;cleanup() 务必清掉。
+    let modelCheckerRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
     // 注册到 registry,超额会踢老的
     const conn: Conn = {
@@ -658,6 +792,88 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
         cleanup();
         return;
+      }
+      // 0049 模型授权(plan v3 §B3/§B4 + review v1/v2 follow-up):
+      //   inbound.message 帧 sync 检查 visibility OR per-user grants。优先级:
+      //     (1) frame.model — 用户/前端显式声明 → 必须有授权
+      //     (2) AGENT_AUTHZ_IMPLIED_MODEL[frame.agentId] — agentId 隐含 model
+      //         (review v2 finding 1:防 agentId='codex' 不带 model 绕过)
+      //     (3) lastSeenModelId — 本桥之前出现过的 model(review v1 follow-up:
+      //         防"已用 gpt-5.5 跑起来的桥被撤销 grant 后,后续无 model/agentId
+      //         的 delta 帧仍能透传"。一旦撤销,继续帧都被拦)
+      //     (4) 三者全无 → 透传(本桥从没碰过受限 model,默认 claude-* visibility=
+      //         public 不需要 grant)
+      //
+      //   命中 (1) / (2) 时也更新 lastSeenModelId — 任一形式提到过受限 model
+      //   都进入"本桥追踪"状态。
+      //
+      //   modelChecker 内部由周期 refresh 在背后更新(GRANTS_REFRESH_INTERVAL_MS),
+      //   admin 取消授权后下一次 frame check 会用最新快照拦帧。
+      //
+      //   只检查 text 帧 + JSON parsable + type==='inbound.message'。binary 帧 /
+      //   非 JSON / 其他类型 → 透传(不校验)。server.ts ALLOWED_INBOUND_MODELS +
+      //   inferAgentForModel fail-closed 是 server 端兜底。
+      //
+      //   这条 check **故意没 try/catch** 套整个 if 块:JSON.parse 异常下面已处理,
+      //   isAllowed 是纯同步(canUseModel 读 PricingCache cache 命中即返),异常仅
+      //   可能来自代码 bug,不该静默吞。
+      if (modelCheckerHandle !== null && !isBinary) {
+        let frameStr: string | null = null;
+        if (typeof data === "string") frameStr = data;
+        else if (Buffer.isBuffer(data)) {
+          try { frameStr = data.toString("utf8"); } catch { frameStr = null; }
+        }
+        if (frameStr !== null) {
+          let parsed: unknown = null;
+          try { parsed = JSON.parse(frameStr); } catch { /* 非 JSON 帧透传 */ }
+          if (
+            parsed !== null &&
+            typeof parsed === "object" &&
+            (parsed as { type?: unknown }).type === "inbound.message"
+          ) {
+            const frameModelRaw = (parsed as { model?: unknown }).model;
+            const frameModelId = typeof frameModelRaw === "string" ? frameModelRaw : null;
+            const frameAgentIdRaw = (parsed as { agentId?: unknown }).agentId;
+            const frameAgentId = typeof frameAgentIdRaw === "string" ? frameAgentIdRaw : null;
+            const agentImpliedModel =
+              frameAgentId !== null ? AGENT_AUTHZ_IMPLIED_MODEL[frameAgentId] : undefined;
+
+            // 选用顺序:frame.model > agent 隐含 model > lastSeenModelId
+            let effectiveModel: string | null = null;
+            let source: "frame.model" | "agentId.implied" | "lastSeen" | null = null;
+            if (frameModelId !== null) {
+              effectiveModel = frameModelId;
+              source = "frame.model";
+            } else if (agentImpliedModel !== undefined) {
+              effectiveModel = agentImpliedModel;
+              source = "agentId.implied";
+            } else if (lastSeenModelId !== null) {
+              effectiveModel = lastSeenModelId;
+              source = "lastSeen";
+            }
+            // 命中 frame.model / agentId.implied 时把效果 model 记进 lastSeenModelId,
+            // 后续无 model/agentId 帧仍可继续校验。lastSeen 命中时不更新(就是它自己)。
+            if (source === "frame.model" || source === "agentId.implied") {
+              lastSeenModelId = effectiveModel;
+            }
+            if (effectiveModel !== null && !modelCheckerHandle.isAllowed(effectiveModel)) {
+              log?.info("user-chat-bridge: model not authorized", {
+                uid: uid.toString(),
+                modelId: effectiveModel,
+                source,
+              });
+              cause = "client_close"; // user 提交了无权访问的 model,等同被拒
+              sendErrorFrame(
+                userWs,
+                "UNAUTHORIZED_MODEL",
+                `model not authorized for current user: ${effectiveModel}`,
+              );
+              try { userWs.close(CLOSE_BRIDGE.POLICY, "unauthorized_model"); } catch { /* */ }
+              cleanup();
+              return;
+            }
+          }
+        }
       }
       // Bridge TTFT 起点:首个 user→container 帧。oversize 拒绝路径不算(已 close)。
       if (firstUserFrameAtMs === null) firstUserFrameAtMs = Date.now();
@@ -850,6 +1066,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try { userWs.ping(); } catch { /* */ }
       }, heartbeatIntervalMs);
     }
+
+    // plan v3 review v1 §F4 follow-up:周期重新拉 grants 让 admin 取消授权能在
+    // 已开桥上生效。fire-and-forget;refresh 自己 swallow error,不会 reject。
+    if (modelCheckerHandle !== null) {
+      modelCheckerRefreshTimer = setInterval(() => {
+        // 注意:不绑 await/then;refresh 内部 swallow error,这里只是触发。
+        modelCheckerHandle.refresh();
+      }, GRANTS_REFRESH_INTERVAL_MS);
+      // 不阻塞进程退出 —— bridge 不在则 timer 也无意义。
+      modelCheckerRefreshTimer.unref?.();
+    }
     userWs.on("close", (code, reason) => {
       if (cause === "internal_error") cause = "client_close";
       // 把客户端关闭原因转给容器(透传 code/reason,容器侧也会触发 cleanup)
@@ -884,6 +1111,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (heartbeatTimer !== null) {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
+      }
+      if (modelCheckerRefreshTimer !== null) {
+        clearInterval(modelCheckerRefreshTimer);
+        modelCheckerRefreshTimer = null;
       }
       try { connectAbort.abort(); } catch { /* */ }
       try {

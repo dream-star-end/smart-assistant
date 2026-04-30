@@ -282,15 +282,17 @@ describe("/api/public/models (http integ)", () => {
     await query("DELETE FROM model_pricing");
     // 注意:haiku 故意 enabled=TRUE 模拟生产状态(boss 翻 true 让 WebFetch 能用),
     // 但 listPublic / /api/public/models 必须把它过滤掉(品牌叙事:UI 不展示)。
+    // 0049 后 visibility 列控制 listPublic 过滤;haiku 显式 visibility='admin'
+    // 锁定生产 migration 行为(老 HIDDEN_FROM_PUBLIC_LIST 等价物)。
     await query(
       `INSERT INTO model_pricing(model_id, display_name,
          input_per_mtok, output_per_mtok,
          cache_read_per_mtok, cache_write_per_mtok,
-         multiplier, enabled, sort_order)
+         multiplier, enabled, sort_order, visibility)
        VALUES
-         ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100),
-         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90),
-         ('claude-haiku-4-5','Claude Haiku 4.5',80,400,8,100,1.5,TRUE,110)`,
+         ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100,'public'),
+         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90,'public'),
+         ('claude-haiku-4-5','Claude Haiku 4.5',80,400,8,100,1.5,TRUE,110,'admin')`,
     );
     pricing = new PricingCache();
     await pricing.load();

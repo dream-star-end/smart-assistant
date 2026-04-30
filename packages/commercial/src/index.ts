@@ -1108,6 +1108,19 @@ export async function registerCommercial(
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
+    // 0049 模型授权(plan v3 §B3/§B4)— bridge 层是 v3 commercial 唯一同时拿得到
+    // user role 与 grants 的位置(容器内个人版 gateway 没 commercial DB 连接)。
+    // 每次新桥连接时调一次:拉本 user grants → 返回一个绑定 pricing+role+grants
+    // 的 sync closure,后续每条 inbound.message 帧 sync 校验。pricing 是进程级
+    // singleton,grants 失败 throw → bridge 关 1011(不做 silent 放行)。
+    loadAllowedModelChecker: async (uid, role) => {
+      const { listGrantsForUser } = await import("./admin/modelGrants.js");
+      const { canUseModel } = await import("./billing/authzModels.js");
+      const grants = await listGrantsForUser(uid);
+      const grantedSet = new Set(grants.map((g) => g.model_id));
+      return (modelId: string) =>
+        canUseModel({ pricing }, { role, grantedModelIds: grantedSet, modelId });
+    },
   });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
   // 扣费事件会实时推到用户前端。

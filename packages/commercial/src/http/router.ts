@@ -106,6 +106,7 @@ import {
   handleAdminListInbox,
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
+  handleAdminRemoveUserModelGrant,
 } from './admin.js'
 import {
   handleAdminStatsDau,
@@ -440,6 +441,9 @@ export function createCommercialHandler(
     { method: 'POST', pathPrefix: '/api/admin/users/', handler: handleAdminAdjustCredits },
     { method: 'GET', pathPrefix: '/api/admin/users/', handler: handleAdminGetUser },
     { method: 'PATCH', pathPrefix: '/api/admin/users/', handler: handleAdminPatchUser },
+    // 0049 model-grants:DELETE /api/admin/users/:id/model-grants/:model_id —— 撤销授权
+    // /api/admin/users/ prefix 下目前只这一个 DELETE 子资源,handler 自带 path 校验
+    { method: 'DELETE', pathPrefix: '/api/admin/users/', handler: handleAdminRemoveUserModelGrant },
     // T-60 超管审计记录
     { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
     // T-60 超管定价

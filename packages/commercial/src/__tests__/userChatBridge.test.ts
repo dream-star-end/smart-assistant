@@ -52,6 +52,10 @@ async function startRig(opts: {
   maxPerUser?: number;
   maxFrameBytes?: number;
   markContainerActivity?: (containerId: number) => void;
+  loadAllowedModelChecker?: (
+    uid: bigint,
+    role: "user" | "admin",
+  ) => Promise<(modelId: string) => boolean>;
 } = {}): Promise<TestRig> {
   // 1) mock 容器 ws server
   const containerSeen: Array<{ data: string | Buffer; isBinary: boolean }> = [];
@@ -83,6 +87,7 @@ async function startRig(opts: {
     maxFrameBytes: opts.maxFrameBytes,
     containerConnectTimeoutMs: 1500,
     markContainerActivity: opts.markContainerActivity,
+    loadAllowedModelChecker: opts.loadAllowedModelChecker,
   });
 
   // 3) gateway HTTP server,只挂 bridge upgrade
@@ -758,6 +763,137 @@ describe("userChatBridge — tunnel routing (regression)", () => {
     } finally {
       await bridge.shutdown();
       await new Promise<void>((r) => gateway.close(() => r()));
+    }
+  });
+});
+
+// ------- 0049 模型授权(plan v3 review v1/v2 follow-up)----------------------
+
+describe("userChatBridge — model authorization", () => {
+  test("inbound.message 带 model 且未授权 → close(POLICY)", async () => {
+    const allowed = new Set<string>(["claude-opus-4-7"]); // gpt-5.5 不在
+    const rig = await startRig({
+      loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
+    });
+    try {
+      const token = await makeJwt("200");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+
+      const errFrameP = waitMessage(ws);
+      const closeP = waitClose(ws);
+      ws.send(JSON.stringify({ type: "inbound.message", model: "gpt-5.5" }));
+      const err = await errFrameP;
+      assert.match(err.data.toString(), /UNAUTHORIZED_MODEL/);
+      const closed = await closeP;
+      assert.equal(closed.code, CLOSE_BRIDGE.POLICY);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("inbound.message 仅带 agentId='codex' 不带 model 且未授权 → 仍被拦(round-2 finding 1)", async () => {
+    // 这是 Codex review v2 finding 1 修复的核心:agentId='codex' 隐含 gpt-5.5,
+    // 即便不带 model 也必须按 gpt-5.5 校验,否则未授权用户可以用纯 agentId 帧绕过 authz。
+    const allowed = new Set<string>(["claude-opus-4-7"]);
+    const rig = await startRig({
+      loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
+    });
+    try {
+      const token = await makeJwt("201");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+
+      const errFrameP = waitMessage(ws);
+      const closeP = waitClose(ws);
+      ws.send(JSON.stringify({ type: "inbound.message", agentId: "codex" }));
+      const err = await errFrameP;
+      assert.match(err.data.toString(), /UNAUTHORIZED_MODEL/);
+      const closed = await closeP;
+      assert.equal(closed.code, CLOSE_BRIDGE.POLICY);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("inbound.message 带 claude-* model 且授权 → 透传到容器", async () => {
+    // 普通 claude 帧路径不应受 round-2 修改影响。
+    const allowed = new Set<string>(["claude-opus-4-7"]);
+    const rig = await startRig({
+      loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const token = await makeJwt("202");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+
+      const seenP = new Promise<{ data: Buffer | string; isBinary: boolean }>((r) => {
+        containerWs.once("message", (data, isBinary) => {
+          const buf = typeof data === "string" ? data
+            : Buffer.isBuffer(data) ? data
+              : Buffer.concat(data as Buffer[]);
+          r({ data: buf, isBinary });
+        });
+      });
+
+      ws.send(JSON.stringify({ type: "inbound.message", model: "claude-opus-4-7" }));
+      const got = await seenP;
+      const text = typeof got.data === "string" ? got.data : got.data.toString("utf8");
+      assert.deepEqual(JSON.parse(text), { type: "inbound.message", model: "claude-opus-4-7" });
+
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("第一帧带 gpt-5.5(授权)→ 第二帧不带 model 仍按 lastSeenModelId 校验(review v1 follow-up)", async () => {
+    // 场景:bridge lifetime 内 user 第一帧合法用了 gpt-5.5;之后流式增量帧仅带
+    // delta/text 不带 model。如果中间 admin 撤销了 grant,后续的 delta 帧也必须
+    // 被拦(lastSeenModelId 兜底)。这里通过 mock checker 在 mid-session 切语义
+    // 来模拟"撤销"。
+    const state = { allowGpt: true };
+    const rig = await startRig({
+      loadAllowedModelChecker: async () => (id: string) => {
+        if (id === "claude-opus-4-7") return true;
+        if (id === "gpt-5.5") return state.allowGpt;
+        return false;
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const token = await makeJwt("203");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+
+      // 1) 首帧带 gpt-5.5,被授权 → 透传
+      const firstP = new Promise<Buffer | string>((r) => {
+        containerWs.once("message", (d) => {
+          r(typeof d === "string" ? d : Buffer.isBuffer(d) ? d : Buffer.concat(d as Buffer[]));
+        });
+      });
+      ws.send(JSON.stringify({ type: "inbound.message", model: "gpt-5.5", n: 1 }));
+      const first = await firstP;
+      const firstText = typeof first === "string" ? first : first.toString("utf8");
+      assert.match(firstText, /"gpt-5\.5"/);
+
+      // 2) admin 撤销
+      state.allowGpt = false;
+
+      // 3) 第二帧不带 model,但 lastSeenModelId='gpt-5.5' → 应该被拦
+      const errFrameP = waitMessage(ws);
+      const closeP = waitClose(ws);
+      ws.send(JSON.stringify({ type: "inbound.message", n: 2 }));
+      const err = await errFrameP;
+      assert.match(err.data.toString(), /UNAUTHORIZED_MODEL/);
+      const closed = await closeP;
+      assert.equal(closed.code, CLOSE_BRIDGE.POLICY);
+    } finally {
+      await stopRig(rig);
     }
   });
 });
