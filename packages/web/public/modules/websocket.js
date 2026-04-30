@@ -875,6 +875,22 @@ export function connect() {
     if (state.ws !== ws) return
     try {
       const f = JSON.parse(ev.data)
+      // ── Pre-dispatch frameSeq cursor ──
+      // Advance `sess._lastFrameSeq` for ANY stamped outbound frame, not just
+      // `outbound.message`. Permission frames now also flow through the
+      // gateway's outbound ring (so a reconnecting tab can replay missed
+      // approval prompts), and they must participate in the same cursor
+      // protocol — otherwise gateway would re-replay them on every reconnect.
+      // Sess unresolved (unknown peer) → leave cursor untouched and let the
+      // type-specific handler decide whether to warn or silently ignore.
+      if (typeof f.frameSeq === 'number' && f.frameSeq > 0) {
+        const sess = _resolveSessForFrame(f)
+        if (sess) {
+          const last = sess._lastFrameSeq || 0
+          if (f.frameSeq <= last) return // already processed — drop silently
+          sess._lastFrameSeq = f.frameSeq
+        }
+      }
       if (f.type === 'outbound.message') handleOutbound(f)
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
@@ -909,6 +925,25 @@ export function buildToolUseLabel(block) {
   const body = preview ? `  ${preview}${ellipsis}` : block.partial ? '  …' : ''
   return name + body
 }
+// Resolve the client-side session a stamped outbound frame belongs to.
+// Mirrors the resolution logic in handleOutbound so cursor advancement at the
+// pre-dispatch stage applies identically to all stamped outbound types
+// (message / permission_request / permission_settled). Returns null when the
+// frame references a peer we don't track and no fallback applies.
+function _resolveSessForFrame(frame) {
+  const peerId = frame.peer?.id
+  let sess = peerId ? state.sessions.get(peerId) : null
+  if (!sess) {
+    if (frame.cronJob || !peerId) {
+      sess = getSession()
+      if (!sess) return null
+    } else {
+      return null
+    }
+  }
+  return sess
+}
+
 export function handleOutbound(frame) {
   const peerId = frame.peer?.id
   let sess = peerId ? state.sessions.get(peerId) : null
@@ -928,19 +963,9 @@ export function handleOutbound(frame) {
       return
     }
   }
-  // ── Phase 0.3/0.4: frameSeq dedupe ──
-  // Gateway stamps a per-session monotonic `frameSeq` on every outbound frame.
-  // After a WS reconnect the gateway replays buffered frames >= our cursor +1;
-  // if multiple tabs resume concurrently or a quick flap duplicates deliveries
-  // we reject anything we've already processed. Update the cursor only on
-  // strictly-forward frames so out-of-order deliveries never regress it.
-  if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
-    const last = sess._lastFrameSeq || 0
-    if (frame.frameSeq <= last) {
-      return // already processed — drop silently
-    }
-    sess._lastFrameSeq = frame.frameSeq
-  }
+  // frameSeq dedupe + cursor advance is now handled pre-dispatch in
+  // ws.onmessage — see _resolveSessForFrame. By the time we land here, any
+  // stale or duplicate frame has already been dropped at the entry point.
   if (!sess._blockIdToMsgId) {
     // Rebuild blockId→msgId and agentGroups mappings from restored messages (after page refresh)
     sess._blockIdToMsgId = new Map()
@@ -1630,6 +1655,33 @@ const _pendingPermissions = new Map() // requestId -> { frame, el, timer }
 function handlePermissionRequest(frame) {
   const sess = frame.peer?.id ? state.sessions.get(frame.peer.id) : null
   if (!sess) return
+
+  // Idempotency on requestId: if we've already created a card for this
+  // request (replayed from gateway ring after iOS Safari restored a
+  // suspended tab from IDB, or any other reconnect path), don't duplicate
+  // the inline card. Just rehydrate the volatile modal state.
+  // - existing._resolved=true → already settled, replay is a no-op
+  // - existing._resolved=false but no modal in DOM → tab was reloaded;
+  //   re-attach the modal so user can act on the still-pending request.
+  const existing = sess.messages.find(
+    (m) => m.role === 'permission' && m.requestId === frame.requestId,
+  )
+  if (existing) {
+    if (existing._resolved) return
+    if (!document.getElementById('permission-modal')) {
+      if (
+        frame.toolName === 'AskUserQuestion' &&
+        Array.isArray(frame.inputJson?.questions) &&
+        frame.inputJson.questions.length > 0
+      ) {
+        _showAskUserQuestionModal(frame, sess, existing)
+      } else {
+        _showPermissionModal(frame, sess, existing)
+      }
+      _notifSound()
+    }
+    return
+  }
 
   // Add a permission card to the chat
   const msg = addMessage(sess, 'permission', frame.toolName, {

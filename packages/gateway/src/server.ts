@@ -3112,14 +3112,46 @@ export class Gateway {
       answers?: Record<string, string>
     },
   ): void {
-    const clients = this.clientsByPeer.get(peerKey)
-    if (!clients || clients.size === 0) return
-    const frame = JSON.stringify({
+    // Route through the stamped session-frame helper so the settlement is
+    // recorded in the outbound ring buffer keyed by sessionKey. A reconnecting
+    // tab that missed the live broadcast (e.g. iOS Safari suspended its WS)
+    // can then receive the settled frame via ring replay and update the
+    // inline permission card from "Waiting" to "Allowed/Denied".
+    this._sendStampedSessionFrame(payload.sessionKey, peerKey, {
       type: 'outbound.permission_settled',
       ...payload,
     })
-    for (const ws of clients) {
-      try { ws.send(frame) } catch {}
+  }
+
+  /** Send a session-scoped wire frame to all WS clients at a peerKey, stamping
+   *  it with `frameSeq` + `ts` and storing it in `_outboundRing` so a later
+   *  `autoResumeFromHello` reconnect can replay it. WS-only equivalent of
+   *  `deliver()` for non-message frames (permission_request / permission_settled).
+   *  Adapter dispatch is not applicable — these frames are interactive-only.
+   *
+   *  When `sessionKey` is empty (legacy fallback path with no server-side
+   *  pending entry to look up), we skip ring storage and only broadcast — the
+   *  same `else` branch deliver() uses for frames without a sessionKey. */
+  private _sendStampedSessionFrame(
+    sessionKey: string,
+    peerKey: string,
+    wireFrame: Record<string, unknown>,
+  ): void {
+    const now = Date.now()
+    let data: string
+    if (sessionKey) {
+      const frameSeq = this._outboundRing.nextSeq(sessionKey)
+      data = JSON.stringify({ ...wireFrame, ts: now, frameSeq })
+      this._outboundRing.store(sessionKey, frameSeq, now, data)
+    } else {
+      data = JSON.stringify({ ...wireFrame, ts: now })
+    }
+    const set = this.clientsByPeer.get(peerKey)
+    if (!set) return
+    for (const ws of set) {
+      try {
+        ws.send(data)
+      } catch {}
     }
   }
 
@@ -3959,10 +3991,11 @@ export class Gateway {
               peer: frame.peer,
               expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
             })
-            const data = JSON.stringify(permFrame)
-            for (const ws of clients) {
-              try { ws.send(data) } catch {}
-            }
+            // Stamp + store in outbound ring so a reconnecting client (e.g. iOS
+            // Safari restored a suspended tab) can replay the request via
+            // autoResumeFromHello. Without ring storage the modal would never
+            // re-fire after a disconnect window.
+            this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
           } else {
             // No connected client — auto-deny
             session.runner.sendPermissionResponse(e.request.requestId, {
