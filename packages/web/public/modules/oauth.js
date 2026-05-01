@@ -1,7 +1,7 @@
 // OpenClaude — OAuth
-import { apiJson } from './api.js?v=42dafce0'
-import { $ } from './dom.js?v=42dafce0'
-import { closeModal, openModal, toast } from './ui.js?v=42dafce0'
+import { apiJson } from './api.js?v=e9cf80b2'
+import { $ } from './dom.js?v=e9cf80b2'
+import { closeModal, openModal, toast } from './ui.js?v=e9cf80b2'
 
 let _oauthState = null
 
