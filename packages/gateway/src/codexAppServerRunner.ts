@@ -91,9 +91,84 @@ interface RunnerMessage {
   total_cost_usd?: number
   duration_ms?: number
   is_error?: boolean
-  usage?: { input_tokens?: number; output_tokens?: number }
+  // Anthropic-style usage shape — ccbMessageParser._handleResult reads
+  // `input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens`.
+  // We additionally surface `reasoning_output_tokens` (codex-only field) so
+  // PR2 billing can decide whether to fold it into output billing or split
+  // it out. Other readers ignore the extra field.
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_input_tokens?: number
+    cache_creation_input_tokens?: number
+    reasoning_output_tokens?: number
+  }
   event?: unknown
 }
+
+/** codex `ThreadTokenUsage.{last,total}` shape — schema at
+ *  /tmp/codex-protocol/v2/ThreadTokenUsageUpdatedNotification.json. */
+interface CodexTokenBreakdown {
+  cachedInputTokens: number
+  inputTokens: number
+  outputTokens: number
+  reasoningOutputTokens: number
+  totalTokens: number
+}
+
+const _EMPTY_TOKEN_BREAKDOWN: Readonly<CodexTokenBreakdown> = Object.freeze({
+  cachedInputTokens: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  reasoningOutputTokens: 0,
+  totalTokens: 0,
+})
+
+/** Defensive coerce: ThreadTokenUsageUpdatedNotification.params.tokenUsage.{last,total}.
+ *  All numeric fields are required per schema, but a malformed frame should
+ *  never throw — coerce non-numbers to 0 and clamp negatives. */
+function _coerceTokenBreakdown(v: unknown): CodexTokenBreakdown {
+  if (!v || typeof v !== 'object') return { ..._EMPTY_TOKEN_BREAKDOWN }
+  const o = v as Record<string, unknown>
+  const num = (k: string) => {
+    const n = o[k]
+    return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : 0
+  }
+  return {
+    cachedInputTokens: num('cachedInputTokens'),
+    inputTokens: num('inputTokens'),
+    outputTokens: num('outputTokens'),
+    reasoningOutputTokens: num('reasoningOutputTokens'),
+    totalTokens: num('totalTokens'),
+  }
+}
+
+/** Compute per-turn delta = current cumulative thread total - prior turn's
+ *  cumulative total. Codex's `total` is monotonic across the thread, so taking
+ *  the most-recent total minus the snapshot at last completed turn boundary
+ *  yields the active turn's actual usage independent of how many notifications
+ *  arrive during the turn (multi-LLM-call agentic turns issue one notification
+ *  per server-side call). Clamp to 0 to defend against any rare retrograde
+ *  updates (codex shouldn't emit them; defense in depth). */
+function _subtractTokenBreakdown(
+  a: CodexTokenBreakdown,
+  b: CodexTokenBreakdown,
+): CodexTokenBreakdown {
+  return {
+    cachedInputTokens: Math.max(0, a.cachedInputTokens - b.cachedInputTokens),
+    inputTokens: Math.max(0, a.inputTokens - b.inputTokens),
+    outputTokens: Math.max(0, a.outputTokens - b.outputTokens),
+    reasoningOutputTokens: Math.max(0, a.reasoningOutputTokens - b.reasoningOutputTokens),
+    totalTokens: Math.max(0, a.totalTokens - b.totalTokens),
+  }
+}
+
+/** ThreadItem.type values that are server-internal echoes (not real tool
+ *  invocations) and therefore must not surface in the UI. `userMessage` is
+ *  the codex echoing back what we just sent; `hookPrompt` is a system hook
+ *  (e.g. session-init scaffolding). Either one as a tool card produces the
+ *  ugly "CODEX:USERMESSAGE" dump boss flagged. */
+const _SUPPRESSED_ITEM_TYPES = new Set<string>(['userMessage', 'hookPrompt'])
 
 type JsonRpcLine =
   | {
@@ -176,6 +251,26 @@ export class CodexAppServerRunner extends EventEmitter {
    *  imageGeneration savedPath emissions against text the model already
    *  surfaced via deltas. */
   private currentAssistantBuf = ''
+  /** Cumulative thread `tokenUsage.total` snapshot at the moment the last
+   *  turn completed — i.e. the baseline against which we compute the next
+   *  turn's delta. null on first turn after construction (treated as
+   *  EMPTY = all zeros). Intentionally preserved across shutdown() so that
+   *  a proc respawn + thread/resume doesn't over-bill the first
+   *  resumed-turn by the entire prior-thread total. Only re-instantiating
+   *  the runner class (new conversation) resets to null. Caveat: if the
+   *  runner instance is GC'd and a fresh CodexAppServerRunner is created
+   *  for the same threadId (e.g. server restart), we lose the baseline
+   *  and the first turn over-bills — accepted PR1 trade-off; see PR2 for
+   *  potential persistence-layer fix. */
+  private priorTurnTotal: CodexTokenBreakdown | null = null
+  /** Most-recent cumulative `tokenUsage.total` observed during the active
+   *  turn. Updated on every `thread/tokenUsage/updated` notification;
+   *  promoted to priorTurnTotal on `turn/completed`. */
+  private activeTurnTotal: CodexTokenBreakdown | null = null
+  /** Per-turn delta computed from activeTurnTotal − priorTurnTotal. Read
+   *  by emitResult on turn/completed; null if no token notifications were
+   *  received this turn (codex bug or zero-LLM turn). */
+  private currentTurnUsage: CodexTokenBreakdown | null = null
 
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
@@ -306,6 +401,25 @@ export class CodexAppServerRunner extends EventEmitter {
     this.attached = false
     this.proc = null
     this.stdoutBuf = ''
+    // Clear in-flight token state. priorTurnTotal is INTENTIONALLY preserved
+    // across shutdown — codex's thread token totals are server-side and
+    // monotonic, so when the same instance respawns and resumes the thread,
+    // the next `thread/tokenUsage/updated.total` value will still include
+    // every prior turn's tokens. Resetting our baseline would over-bill the
+    // first turn after a respawn by the entire thread total.
+    //
+    // Mid-turn shutdown: if activeTurnTotal has a value (we received at least
+    // one tokenUsage notification this turn before being killed), promote it
+    // to priorTurnTotal so the NEXT turn's delta baseline accounts for the
+    // tokens consumed by the killed turn. Without this, those tokens would
+    // be attributed to the next turn (skewing its bill upward) or lost if
+    // there is no next turn. The killed turn itself is NOT billed — its
+    // emitResult goes through the catch path with no usagePayload.
+    if (this.activeTurnTotal !== null) {
+      this.priorTurnTotal = this.activeTurnTotal
+    }
+    this.activeTurnTotal = null
+    this.currentTurnUsage = null
     this.emit('exit', { code: 0, signal: null, crashed: false })
     this.shuttingDown = false
   }
@@ -592,6 +706,39 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       return
     }
+    if (method === 'thread/tokenUsage/updated') {
+      // Schema: ThreadTokenUsageUpdatedNotification — { threadId, turnId,
+      // tokenUsage: { last, total, modelContextWindow? } }. Both `last` and
+      // `total` are TokenUsageBreakdown (cachedInputTokens, inputTokens,
+      // outputTokens, reasoningOutputTokens, totalTokens).
+      //
+      // Strategy (per Codex review v2): use `total` for idempotent snapshots
+      // — it's monotonically growing across the thread, so overwriting our
+      // activeTurnTotal on every notification is safe even if codex emits
+      // duplicate frames. Per-turn delta = activeTurnTotal − priorTurnTotal
+      // is computed at turn/completed time, decoupling notification-frame
+      // count from the billed amount.
+      const tu = p.tokenUsage as Record<string, unknown> | undefined
+      if (!tu) return
+      const total = _coerceTokenBreakdown(tu.total)
+      // Bootstrap baseline on the FIRST notification of a fresh runner
+      // instance attached to a thread with prior history (e.g. server hot-
+      // reload mid-conversation, sessionManager constructs a new
+      // CodexAppServerRunner with resumeSessionId). Without this, priorTurnTotal
+      // would be null and the next turn's delta = full thread total → massive
+      // over-bill. `tokenUsage.last` is "tokens used by the most recent LLM
+      // call", so `total - last` ≈ "everything before this most recent call"
+      // ≈ correct baseline IF this is the first call of the turn. Multi-call
+      // turns whose runner happens to be constructed mid-turn (essentially
+      // impossible given current sessionManager wiring) would undercount;
+      // accepted defensive trade-off.
+      if (this.priorTurnTotal === null && this.activeTurnTotal === null) {
+        const last = _coerceTokenBreakdown(tu.last)
+        this.priorTurnTotal = _subtractTokenBreakdown(total, last)
+      }
+      this.activeTurnTotal = total
+      return
+    }
     // Other notifications (turn/started, plan/delta, config-warning, etc.)
     // are dropped — they are observability/UI hints that don't gate the
     // turn lifecycle.
@@ -623,17 +770,17 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     // agentMessage / reasoning are streamed via deltas; nothing to surface
-    // here. Other types (mcpToolCall, webSearch, imageGeneration, ...)
-    // surface as generic tool_use so the user sees something happened —
-    // keeps parity with CodexRunner.
-    if (
-      itemType &&
-      itemType !== 'agentMessage' &&
-      itemType !== 'reasoning' &&
-      typeof itemType === 'string'
-    ) {
-      this.emitAssistantToolUse(itemId, `Codex:${itemType}`, item)
-    }
+    // here. userMessage / hookPrompt are server-internal echoes — also
+    // suppressed (otherwise they emit as ugly "CODEX:USERMESSAGE" tool
+    // cards). Other types (mcpToolCall, webSearch, imageGeneration, plan,
+    // dynamicToolCall, collabAgentToolCall, contextCompaction, etc.)
+    // surface as `codex:<type>` tool_use so the frontend's
+    // _CODEX_TYPE_META table can render them with friendly icons +
+    // labels.
+    if (typeof itemType !== 'string') return
+    if (_SUPPRESSED_ITEM_TYPES.has(itemType)) return
+    if (itemType === 'agentMessage' || itemType === 'reasoning') return
+    this.emitAssistantToolUse(itemId, `codex:${itemType}`, item)
   }
 
   private async handleItemCompleted(itemUnk: unknown): Promise<void> {
@@ -641,6 +788,11 @@ export class CodexAppServerRunner extends EventEmitter {
     const item = itemUnk as Record<string, unknown>
     const itemId = typeof item.id === 'string' ? item.id : `codex-${Date.now()}`
     const itemType = item.type
+    // Mirror handleItemStarted suppression — userMessage/hookPrompt have no
+    // tool_use card to attach a result to, and the generic JSON.stringify
+    // fallback at the bottom of this function would dump the echo content
+    // into a pseudo-tool-result.
+    if (typeof itemType === 'string' && _SUPPRESSED_ITEM_TYPES.has(itemType)) return
     if (itemType === 'commandExecution') {
       const out = typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput : ''
       const exit = typeof item.exitCode === 'number' ? item.exitCode : undefined
@@ -733,6 +885,13 @@ export class CodexAppServerRunner extends EventEmitter {
       promptChars: prompt.length,
     })
     this.currentAssistantBuf = ''
+    // Per-turn token state: cleared at turn-start so a partial state from a
+    // crashed prior turn never bleeds into this turn's billing. priorTurnTotal
+    // is intentionally NOT cleared — it's the cumulative-thread baseline that
+    // must persist across turns. activeTurnTotal/currentTurnUsage are
+    // refreshed by `thread/tokenUsage/updated` notifications during the turn.
+    this.activeTurnTotal = null
+    this.currentTurnUsage = null
 
     try {
       await this.ensureSpawned()
@@ -795,18 +954,56 @@ export class CodexAppServerRunner extends EventEmitter {
 
       const durationMs = Date.now() - startedAt
       const status = turn?.status
+      // Compute per-turn usage delta from the most recent
+      // thread/tokenUsage/updated snapshot we observed during this turn.
+      // If codex never emitted one (e.g. an empty/no-LLM turn or a cancelled
+      // turn before the first call settled), fall through with usage=undefined.
+      let turnUsage: CodexTokenBreakdown | null = null
+      if (this.activeTurnTotal) {
+        const baseline = this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN
+        turnUsage = _subtractTokenBreakdown(this.activeTurnTotal, baseline)
+        this.currentTurnUsage = turnUsage
+        // Promote the active total to the new baseline only on a settled turn
+        // — for failed/interrupted turns the codex thread state may still
+        // include partially-charged tokens, which is fine to baseline against.
+        this.priorTurnTotal = this.activeTurnTotal
+      }
+      this.activeTurnTotal = null
       log.info('codex app-server turn end', {
         sessionKey: this.opts.sessionKey,
         status,
         durationMs,
         assistantChars: this.currentAssistantBuf.length,
+        ...(turnUsage
+          ? {
+              inputTokens: turnUsage.inputTokens,
+              outputTokens: turnUsage.outputTokens,
+              cachedInputTokens: turnUsage.cachedInputTokens,
+              reasoningOutputTokens: turnUsage.reasoningOutputTokens,
+            }
+          : {}),
       })
+
+      const usagePayload = turnUsage
+        ? {
+            // Map codex breakdown → Anthropic-shaped usage that
+            // ccbMessageParser._handleResult reads. Reasoning tokens are
+            // surfaced as a separate field so PR2 billing can decide whether
+            // to fold them into output_tokens (current default) or split.
+            input_tokens: turnUsage.inputTokens,
+            output_tokens: turnUsage.outputTokens,
+            cache_read_input_tokens: turnUsage.cachedInputTokens,
+            cache_creation_input_tokens: 0,
+            reasoning_output_tokens: turnUsage.reasoningOutputTokens,
+          }
+        : undefined
 
       if (status === 'completed') {
         this.emitResult({
           durationMs,
           ok: true,
           text: this.currentAssistantBuf,
+          usage: usagePayload,
         })
       } else if (status === 'failed') {
         const errMsg = turn?.error?.message ?? 'codex turn failed'
@@ -821,14 +1018,22 @@ export class CodexAppServerRunner extends EventEmitter {
             delta: { type: 'text_delta', text: `\n\n[turn failed: ${errMsg}]\n` },
           },
         } as unknown as RunnerMessage)
-        this.emitResult({ durationMs, ok: false, error: errMsg })
+        this.emitResult({ durationMs, ok: false, error: errMsg, usage: usagePayload })
       } else if (status === 'interrupted') {
-        this.emitResult({ durationMs, ok: false, error: 'codex turn interrupted' })
+        // Bill partial work on interrupted turns: codex already charged for
+        // tokens before the user hit stop, so emit the delta we observed.
+        this.emitResult({
+          durationMs,
+          ok: false,
+          error: 'codex turn interrupted',
+          usage: usagePayload,
+        })
       } else {
         this.emitResult({
           durationMs,
           ok: false,
           error: `codex turn unexpected status=${status ?? 'unknown'}`,
+          usage: usagePayload,
         })
       }
     } catch (err) {
@@ -883,7 +1088,13 @@ export class CodexAppServerRunner extends EventEmitter {
     ok: boolean
     text?: string
     error?: string
-    usage?: { input_tokens?: number; output_tokens?: number }
+    usage?: {
+      input_tokens?: number
+      output_tokens?: number
+      cache_read_input_tokens?: number
+      cache_creation_input_tokens?: number
+      reasoning_output_tokens?: number
+    }
   }): void {
     const msg: RunnerMessage = {
       type: 'result',

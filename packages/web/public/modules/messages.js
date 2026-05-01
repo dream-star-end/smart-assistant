@@ -237,6 +237,25 @@ const _MCP_SERVER_META = {
   'quant-system': { icon: _ICON_CHART, label: '量化' },
 }
 
+// Codex thread item types — emitted as `codex:<itemType>` tool_use by
+// CodexAppServerRunner.handleItemStarted (gateway). commandExecution and
+// fileChange are aliased to Bash/Write/Edit upstream and never reach this
+// table. userMessage / hookPrompt / agentMessage / reasoning are suppressed
+// at the gateway. The remaining types fall here so the user sees a proper
+// labelled card instead of the old uppercase "CODEX:XXX" generic dump.
+const _CODEX_TYPE_META = {
+  plan: { icon: _ICON_CHECK_LIST, label: 'Codex 计划' },
+  mcpToolCall: { icon: _ICON_GEAR, label: 'Codex MCP 工具' },
+  dynamicToolCall: { icon: _ICON_GEAR, label: 'Codex 动态工具' },
+  collabAgentToolCall: { icon: _ICON_BOT, label: 'Codex 协作 Agent' },
+  webSearch: { icon: _ICON_GLOBE, label: '联网搜索' },
+  imageView: { icon: _ICON_EYE, label: '查看图片' },
+  imageGeneration: { icon: _ICON_IMAGE, label: '生成图片' },
+  enteredReviewMode: { icon: _ICON_BOT, label: '进入审阅模式' },
+  exitedReviewMode: { icon: _ICON_BOT, label: '退出审阅模式' },
+  contextCompaction: { icon: _ICON_ARCHIVE, label: '压缩上下文' },
+}
+
 // Per-op overrides for richer icons (server-scoped).
 const _MCP_OP_META = {
   // browser
@@ -307,9 +326,25 @@ function _humanizeOp(op) {
   return (op || '').replace(/_/g, ' ').trim()
 }
 
+// Parse `codex:<itemType>` → itemType (e.g. `codex:webSearch` → `webSearch`).
+// Returns null for non-codex names. Lowercase prefix is required (gateway
+// emits lowercase as of v1.0.65; older `Codex:` prefix from earlier
+// rollouts is intentionally NOT matched — those messages are stale and
+// should fall through to the generic gear icon).
+function _parseCodexTypeName(name) {
+  if (typeof name !== 'string' || !name.startsWith('codex:')) return null
+  return name.slice(6)
+}
+
 // Resolve icon + label for a tool name (handles MCP names).
 function _toolMeta(name) {
   if (_TOOL_ICONS[name]) return { icon: _TOOL_ICONS[name], label: _TOOL_LABELS[name] || name }
+  const codexType = _parseCodexTypeName(name)
+  if (codexType) {
+    const meta = _CODEX_TYPE_META[codexType]
+    if (meta) return meta
+    return { icon: _ICON_BOT, label: `Codex: ${codexType}` }
+  }
   const mcp = _parseMcpName(name)
   if (mcp) {
     const opMeta = _MCP_OP_META[`${mcp.server}:${mcp.op}`]
@@ -594,6 +629,8 @@ function _renderToolBody(body, name, input, msg) {
     case 'WebFetch': return _renderWebFetch(body, input, msg)
     case 'WebSearch': return _renderWebSearch(body, input, msg)
   }
+  const codexType = _parseCodexTypeName(name)
+  if (codexType) return _renderCodexItem(body, codexType, input, msg)
   const mcp = _parseMcpName(name)
   if (mcp) {
     if (mcp.server === 'browser') return _renderBrowser(body, mcp.op, input, msg)
@@ -623,10 +660,39 @@ function _toolSummary(name, input, msg) {
     case 'NotebookEdit': return _shortPath(input.notebook_path)
     case 'Task': case 'Agent': return (input.description || input.prompt || '').slice(0, 60)
   }
+  // codex:<itemType> summaries
+  const codexType = _parseCodexTypeName(name)
+  if (codexType) return _codexSummary(codexType, input).slice(0, 80)
   // MCP fallback summaries
   const mcp = _parseMcpName(name)
   if (!mcp) return ''
   return _mcpSummary(mcp.server, mcp.op, input).slice(0, 80)
+}
+
+// Compact summary for codex thread items rendered as tool cards.
+// Looked up from the `input` blob (which is the raw ThreadItem JSON for
+// fallback emits in CodexAppServerRunner.handleItemStarted).
+function _codexSummary(codexType, input) {
+  if (!input || typeof input !== 'object') return ''
+  switch (codexType) {
+    case 'plan': {
+      const steps = Array.isArray(input.steps) ? input.steps : []
+      return steps.length ? `${steps.length} 步` : ''
+    }
+    case 'webSearch': return input.query || ''
+    case 'imageView': return _shortPath(input.path || input.url || '')
+    case 'imageGeneration': return input.prompt ? input.prompt.slice(0, 60) : (input.savedPath ? _shortPath(input.savedPath) : '')
+    case 'mcpToolCall': {
+      const server = input.server || input.serverName || ''
+      const tool = input.tool || input.toolName || input.name || ''
+      return server && tool ? `${server} · ${tool}` : (tool || server || '')
+    }
+    case 'dynamicToolCall': return input.toolName || input.name || ''
+    case 'collabAgentToolCall': return input.agentId || input.agent || input.target || ''
+    case 'contextCompaction': return ''
+    case 'enteredReviewMode': case 'exitedReviewMode': return ''
+  }
+  return ''
 }
 
 function _mcpSummary(server, op, input) {
@@ -1066,6 +1132,174 @@ function _renderMemory(body, op, input, msg) {
 // ── Generic fallback: key-value list (no raw JSON dump) ──
 function _renderGeneric(body, input, msg) {
   if (input && typeof input === 'object') _renderKvList(body, input)
+  _renderOutput(body, msg.output)
+}
+
+// ── codex thread items: per-type body renderer ──
+//
+// `input` is the raw ThreadItem JSON the gateway forwarded as the tool_use
+// `input` field (CodexAppServerRunner.emitAssistantToolUse passes the
+// item object directly, so e.g. for `webSearch` you get { id, type,
+// query, results? }). msg.output is the JSON-stringified item from the
+// generic completion path in handleItemCompleted (used as a result
+// fallback when no specialized handler emitted a richer tool_result).
+function _renderCodexItem(body, codexType, input, msg) {
+  if (!input || typeof input !== 'object') {
+    _renderOutput(body, msg.output)
+    return
+  }
+  switch (codexType) {
+    case 'plan': return _renderCodexPlan(body, input, msg)
+    case 'webSearch': return _renderCodexWebSearch(body, input, msg)
+    case 'imageGeneration': return _renderCodexImageGeneration(body, input, msg)
+    case 'imageView': return _renderCodexImageView(body, input, msg)
+    case 'mcpToolCall': return _renderCodexMcpToolCall(body, input, msg)
+    case 'dynamicToolCall': return _renderCodexDynamicToolCall(body, input, msg)
+    case 'collabAgentToolCall': return _renderCodexCollabAgent(body, input, msg)
+    case 'contextCompaction': return _renderCodexContextCompaction(body, input, msg)
+    case 'enteredReviewMode':
+    case 'exitedReviewMode': return _renderCodexReviewMode(body, codexType, input, msg)
+  }
+  // Unknown codex type — clean kv-list, never raw JSON dump.
+  _renderKvList(body, input, { skip: ['id', 'type'] })
+  _renderOutput(body, msg.output)
+}
+
+function _renderCodexPlan(body, input, msg) {
+  const steps = Array.isArray(input.steps) ? input.steps : []
+  if (steps.length === 0) {
+    _renderKvList(body, input, { skip: ['id', 'type'] })
+    _renderOutput(body, msg.output)
+    return
+  }
+  const list = document.createElement('div')
+  list.className = 'tool-todo-list'
+  for (const s of steps) {
+    if (!s || typeof s !== 'object') continue
+    const row = document.createElement('div')
+    const status = s.status || 'pending'
+    row.className = `tool-todo-item tool-todo-${status}`
+    const mark = document.createElement('span')
+    mark.className = 'tool-todo-mark'
+    mark.textContent = status === 'completed' ? '✓' : status === 'in_progress' ? '◐' : '○'
+    const text = document.createElement('span')
+    text.className = 'tool-todo-text'
+    text.textContent = s.text || s.description || ''
+    row.appendChild(mark)
+    row.appendChild(text)
+    list.appendChild(row)
+  }
+  body.appendChild(list)
+}
+
+function _renderCodexWebSearch(body, input, msg) {
+  if (input.query) {
+    const p = document.createElement('div')
+    p.className = 'tool-prompt'
+    p.textContent = input.query
+    body.appendChild(p)
+  }
+  // Some codex builds attach results inline; render as compact list when present.
+  const results = Array.isArray(input.results) ? input.results : null
+  if (results && results.length > 0) {
+    const list = document.createElement('div')
+    list.className = 'tool-kv-list'
+    for (const r of results.slice(0, 8)) {
+      if (!r || typeof r !== 'object') continue
+      const item = document.createElement('div')
+      item.className = 'tool-kv-item'
+      const titleEl = document.createElement('span')
+      titleEl.className = 'tool-kv-key'
+      titleEl.textContent = (r.title || r.url || '').slice(0, 80)
+      const urlEl = document.createElement('span')
+      urlEl.className = 'tool-kv-val'
+      urlEl.textContent = r.url || ''
+      item.appendChild(titleEl)
+      item.appendChild(urlEl)
+      list.appendChild(item)
+    }
+    if (list.children.length) body.appendChild(list)
+  }
+  _renderOutput(body, msg.output)
+}
+
+function _renderCodexImageGeneration(body, input, msg) {
+  if (input.prompt) {
+    const p = document.createElement('div')
+    p.className = 'tool-prompt'
+    p.textContent = input.prompt
+    body.appendChild(p)
+  }
+  if (input.savedPath) {
+    const meta = document.createElement('div')
+    meta.className = 'tool-file-meta'
+    meta.textContent = _shortPath(input.savedPath)
+    body.appendChild(meta)
+  }
+  _renderOutput(body, msg.output)
+}
+
+function _renderCodexImageView(body, input, msg) {
+  const target = input.path || input.url || ''
+  if (target) {
+    const meta = document.createElement('div')
+    meta.className = 'tool-file-meta'
+    meta.textContent = _shortPath(target)
+    body.appendChild(meta)
+  }
+  _renderOutput(body, msg.output)
+}
+
+function _renderCodexMcpToolCall(body, input, msg) {
+  const kv = {
+    server: input.server || input.serverName || '',
+    tool: input.tool || input.toolName || input.name || '',
+    arguments: input.arguments || input.args || input.params,
+  }
+  _renderKvList(body, kv, { maxValueLen: 300 })
+  _renderOutput(body, msg.output)
+}
+
+function _renderCodexDynamicToolCall(body, input, msg) {
+  const kv = {
+    tool: input.toolName || input.name || '',
+    arguments: input.arguments || input.args || input.params,
+  }
+  _renderKvList(body, kv, { maxValueLen: 300 })
+  _renderOutput(body, msg.output)
+}
+
+function _renderCodexCollabAgent(body, input, msg) {
+  const kv = {
+    agent: input.agentId || input.agent || input.target,
+    goal: input.goal || input.prompt || input.message,
+    context: input.context,
+  }
+  _renderKvList(body, kv, { maxValueLen: 300 })
+  _renderOutput(body, msg.output)
+}
+
+function _renderCodexContextCompaction(body, input, msg) {
+  const kv = {
+    'tokens before': input.tokensBefore ?? input.beforeTokens,
+    'tokens after': input.tokensAfter ?? input.afterTokens,
+    note: input.note || input.summary,
+  }
+  _renderKvList(body, kv)
+  _renderOutput(body, msg.output)
+}
+
+function _renderCodexReviewMode(body, codexType, input, msg) {
+  const note = document.createElement('div')
+  note.className = 'tool-status-ok'
+  note.textContent = codexType === 'enteredReviewMode' ? '已进入审阅模式' : '已退出审阅模式'
+  body.appendChild(note)
+  if (input.note || input.summary) {
+    const p = document.createElement('div')
+    p.className = 'tool-prompt'
+    p.textContent = input.note || input.summary
+    body.appendChild(p)
+  }
   _renderOutput(body, msg.output)
 }
 
