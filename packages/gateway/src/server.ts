@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
+import { homedir } from 'node:os'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import type { InboundFrame, InboundMessage, OutboundMessage } from '@openclaude/protocol'
@@ -29,6 +30,7 @@ import {
 } from '@openclaude/storage'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
+import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
 import { parseDocument } from './documentParser.js'
 import { eventBus, createEvent } from './eventBus.js'
@@ -2504,6 +2506,9 @@ export class Gateway {
         expires_in?: number
         scope?: string
         token_type?: string
+        // OIDC id_token — present when scope includes `openid` (codex provider).
+        // Required by codex 0.125 chatgpt mode for /v1/responses auth header.
+        id_token?: string
       }
 
       // Save to config (keyed by provider)
@@ -2529,6 +2534,19 @@ export class Gateway {
         // file from before this /login would override the freshly-saved token.
         if (providerKey === 'claude') {
           await this.writeRuntimeOauthToken(oauthData)
+        } else if (providerKey === 'codex') {
+          // Mirror the new token into ~/.codex/auth.json so codex CLI / MCP
+          // sees the new account. Force-write since user just explicitly
+          // logged in via the OpenClaude UI.
+          await syncCodexAuthFile({
+            oauth: {
+              accessToken: oauthData.accessToken,
+              refreshToken: oauthData.refreshToken,
+              idToken: tokens.id_token,
+            },
+            filePath: join(homedir(), '.codex', 'auth.json'),
+            log: this.log,
+          })
         }
         this.log.info('oauth tokens saved', { provider: providerKey })
       }
@@ -2703,6 +2721,25 @@ export class Gateway {
         // and pick up the new access token without restart.
         if (providerKey === 'claude') {
           await this.writeRuntimeOauthToken(refreshed)
+        } else if (providerKey === 'codex') {
+          // Sync to ~/.codex/auth.json with ownership check: only overwrite
+          // if the file's refresh_token matches the one we just consumed.
+          // If the user has run `codex login` directly since our last write,
+          // the refresh_token will differ and we skip — don't stomp explicit
+          // user choice with our background refresh.
+          await syncCodexAuthFile({
+            oauth: {
+              accessToken: refreshed.accessToken,
+              refreshToken: refreshed.refreshToken,
+              // refresh_token grant typically does not return a new id_token
+              // (OIDC Core §12); falsy here → syncCodexAuthFile preserves
+              // the prior file's id_token on same-identity match.
+              idToken: tokens.id_token,
+            },
+            filePath: join(homedir(), '.codex', 'auth.json'),
+            log: this.log,
+            expectedPreviousRefreshToken: oauth.refreshToken,
+          })
         }
         this.log.info('oauth token refreshed', {
           provider: providerKey,
