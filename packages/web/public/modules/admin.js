@@ -1667,8 +1667,8 @@ async function openUserDetailModal(userId) {
 //
 // 4J 实装:状态过滤 + 新建/编辑/删除。
 // 后端字段: label / plan(pro|max|team) / status(active|cooldown|disabled|banned)
-// / oauth_token / oauth_refresh_token / oauth_expires_at / egress_proxy
-// (后端会 mask egress_proxy 里的密码,前端表单输入新值才会写库)
+// / oauth_token / oauth_refresh_token / oauth_expires_at / egress_proxy_id
+// (0055: egress 必须通过 egress_proxies 池条目 id 引用;raw text 列已锁 NULL)
 
 const ACCOUNT_PLANS = ['pro', 'max', 'team']
 const ACCOUNT_STATUSES = ['active', 'cooldown', 'disabled', 'banned']
@@ -2014,7 +2014,7 @@ function _renderAccountRow(a) {
       <td class="num">${cell7d}</td>
       <td class="mono">${cdChip}</td>
       <td class="mono">${fmtRelative(a.last_used_at)}</td>
-      <td class="mono" title="${escapeHtml(a.egress_proxy || '')}">${escapeHtml(a.egress_proxy || '—')}</td>
+      <td class="mono" title="${escapeHtml(a.egress_proxy_pool_label || '')}">${escapeHtml(a.egress_proxy_pool_label || '—')}</td>
       <td class="actions">
         ${showReset ? `<button data-act="reset-cooldown" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}" title="清冷却 + last_error">释放冷却</button>` : ''}
         <button data-act="acc-recent-users" data-id="${escapeHtml(a.id)}" data-label="${escapeHtml(a.label)}" title="近 24h 使用过该账号的用户">查看使用方</button>
@@ -2040,11 +2040,34 @@ async function resetAccountCooldown(id, label, btn) {
   })
 }
 
-function _accountFormFields(prefill) {
+function _accountFormFields(prefill, activeProxies = []) {
   // prefill = null → 新建;否则 = 现有 account 对象。
   // oauth_token 在 PATCH 模式下必须用户主动输入才发送(避免误覆盖)。
+  // activeProxies = [{id, label, url_masked}] 给 egress_proxy_id dropdown 用。
   const isCreate = !prefill
   const a = prefill || {}
+  // 0055: egress 必须通过 egress_proxies 池条目。dropdown 选项来自 active 池。
+  // 编辑时若当前绑定的 entry 已被禁用,把它单独 append 到尾部("已禁用"标签),
+  // 保持选中态可见(避免静默切到第一项)。
+  const currentEpid = a.egress_proxy_id != null ? String(a.egress_proxy_id) : ''
+  const currentLabel = a.egress_proxy_pool_label || ''
+  const inActiveList = activeProxies.some((p) => String(p.id) === currentEpid)
+  const epidOptions = [
+    isCreate
+      ? `<option value="" disabled ${currentEpid ? '' : 'selected'}>— 请选择代理池条目 —</option>`
+      : '',
+    ...activeProxies.map(
+      (p) =>
+        `<option value="${escapeHtml(String(p.id))}" ${
+          String(p.id) === currentEpid ? 'selected' : ''
+        }>${escapeHtml(p.label)} <${escapeHtml(p.url_masked || '')}></option>`,
+    ),
+    !isCreate && currentEpid && !inActiveList
+      ? `<option value="${escapeHtml(currentEpid)}" selected>${escapeHtml(currentLabel || `#${currentEpid}`)}(已禁用)</option>`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('')
   return `
     <div class="form-row">
       <label>label(账号标签,必填)</label>
@@ -2077,23 +2100,26 @@ function _accountFormFields(prefill) {
              value="${escapeHtml(a.oauth_expires_at || '')}" />
     </div>
     <div class="form-row">
-      <label>egress_proxy ${isCreate ? '(可选 http(s)://[user:pass@]host:port)' : '(留空不动;输入 NULL 清空;输入新 URL 覆盖)'}</label>
-      <input type="text" id="acc-egress" placeholder="可选;留空走本机"
-             value="${isCreate ? '' : ''}" />
-      ${!isCreate && a.has_egress_proxy ? `<small style="color:var(--muted)">当前(已 mask): ${escapeHtml(a.egress_proxy || '')}</small>` : ''}
+      <label>egress 代理池条目${isCreate ? '(必选)' : '(必选;不可清空)'}</label>
+      <select id="acc-egress-id">${epidOptions}</select>
+      <small style="color:var(--muted)">从"代理池"页维护可用条目;此处仅显示 active 项${
+        !isCreate && currentEpid && !inActiveList ? ',当前条目已被禁用' : ''
+      }。</small>
     </div>
   `
 }
 
 // 把 form 字段读成 PATCH/CREATE body。空 string 在 PATCH 模式下表示 "不动",
 // 字符串 "NULL"(大小写不敏感)表示显式置空。
-function _readAccountForm(isCreate) {
+// 0055: egress_proxy_id 必填(create) / 不允许清空(patch)。
+// 第二个参数 prefillEpid 在 patch 模式下用来判断是否变更,避免无谓写。
+function _readAccountForm(isCreate, prefillEpid = '') {
   const label = $('acc-label').value.trim()
   const plan = $('acc-plan').value
   const tokenRaw = $('acc-token').value.trim()
   const refreshRaw = $('acc-refresh').value.trim()
   const expiresRaw = $('acc-expires').value.trim()
-  const egressRaw = $('acc-egress').value.trim()
+  const egressIdRaw = $('acc-egress-id').value.trim()
   const isNull = (v) => v.toUpperCase() === 'NULL'
 
   if (!label) throw new Error('label 必填')
@@ -2101,16 +2127,18 @@ function _readAccountForm(isCreate) {
 
   if (isCreate) {
     if (!tokenRaw) throw new Error('oauth_token 必填')
+    if (!egressIdRaw) throw new Error('egress 代理池条目 必选')
     body.oauth_token = tokenRaw
     if (refreshRaw) body.oauth_refresh_token = isNull(refreshRaw) ? null : refreshRaw
     if (expiresRaw) body.oauth_expires_at = isNull(expiresRaw) ? null : expiresRaw
-    if (egressRaw) body.egress_proxy = isNull(egressRaw) ? null : egressRaw
+    body.egress_proxy_id = egressIdRaw
   } else {
     body.status = $('acc-status-edit').value
     if (tokenRaw) body.oauth_token = tokenRaw
     if (refreshRaw) body.oauth_refresh_token = isNull(refreshRaw) ? null : refreshRaw
     if (expiresRaw) body.oauth_expires_at = isNull(expiresRaw) ? null : expiresRaw
-    if (egressRaw) body.egress_proxy = isNull(egressRaw) ? null : egressRaw
+    if (!egressIdRaw) throw new Error('egress 代理池条目 不可清空')
+    if (egressIdRaw !== String(prefillEpid || '')) body.egress_proxy_id = egressIdRaw
   }
   return body
 }
@@ -2127,9 +2155,25 @@ function _selectedProviderFromRadio() {
   return checked && (checked.value === 'codex') ? 'codex' : 'claude'
 }
 
-function openCreateAccountModal() {
+// 拉 active 代理池条目;dropdown 选项只显示 active(disabled 不允许新绑)。
+async function _fetchActiveEgressProxies() {
+  const sp = new URLSearchParams({ status: 'active', limit: '500' })
+  const r = await apiGet(`/api/admin/egress-proxies?${sp.toString()}`)
+  return Array.isArray(r?.rows) ? r.rows : []
+}
+
+async function openCreateAccountModal() {
   _oauthPendingState = null
   _oauthSelectedProvider = 'claude'
+  let activeProxies
+  try {
+    activeProxies = await _fetchActiveEgressProxies()
+  } catch (e) {
+    toast(`加载代理池失败: ${e.message}`, 'danger', toastOptsFromError(e)); return
+  }
+  if (activeProxies.length === 0) {
+    toast('代理池没有 active 条目,先去"代理池"页新建并启用一条', 'danger'); return
+  }
   openModal(`
     <h3>新建账号</h3>
 
@@ -2172,7 +2216,7 @@ function openCreateAccountModal() {
 
     <hr style="margin:14px 0;border:0;border-top:1px solid var(--border,#333)" />
 
-    ${_accountFormFields(null)}
+    ${_accountFormFields(null, activeProxies)}
     <div class="form-actions">
       <button id="acc-cancel">取消</button>
       <button class="btn-primary" id="acc-ok">创建</button>
@@ -2183,7 +2227,7 @@ function openCreateAccountModal() {
   $('acc-oauth-submit').addEventListener('click', oauthExchangeStep)
   $('acc-ok').addEventListener('click', async (ev) => {
     let body
-    try { body = _readAccountForm(true) }
+    try { body = _readAccountForm(true, '') }
     catch (e) { toast(e.message, 'danger'); return }
     // 默认 claude(后端兼容历史 caller);codex 时显式传
     body.provider = _selectedProviderFromRadio()
@@ -2288,16 +2332,22 @@ async function oauthExchangeStep() {
 
 async function openEditAccountModal(id) {
   let account
+  let activeProxies
   try {
-    const r = await apiGet(`/api/admin/accounts/${encodeURIComponent(id)}`)
-    account = r?.account
+    const [accResp, proxies] = await Promise.all([
+      apiGet(`/api/admin/accounts/${encodeURIComponent(id)}`),
+      _fetchActiveEgressProxies(),
+    ])
+    account = accResp?.account
     if (!account) throw new Error('未找到账号')
+    activeProxies = proxies
   } catch (e) {
     toast(`读取失败: ${e.message}`, 'danger', toastOptsFromError(e)); return
   }
+  const prefillEpid = account.egress_proxy_id != null ? String(account.egress_proxy_id) : ''
   openModal(`
     <h3>编辑账号 #${escapeHtml(account.id)}</h3>
-    ${_accountFormFields(account)}
+    ${_accountFormFields(account, activeProxies)}
     <div class="form-actions">
       <button id="acc-cancel">取消</button>
       <button class="btn-primary" id="acc-ok">保存</button>
@@ -2306,7 +2356,7 @@ async function openEditAccountModal(id) {
   $('acc-cancel').addEventListener('click', closeModal)
   $('acc-ok').addEventListener('click', async (ev) => {
     let body
-    try { body = _readAccountForm(false) }
+    try { body = _readAccountForm(false, prefillEpid) }
     catch (e) { toast(e.message, 'danger'); return }
     await withBtnLoading(ev.currentTarget, async () => {
       try {
@@ -2338,8 +2388,8 @@ async function deleteAccount(id, label, btn) {
 //
 // CRUD list — admin 维护一组出口代理 URL,创建/编辑账号时挂到 claude_accounts.egress_proxy_id。
 // 列表只展示 url_masked(后端遮蔽),明文 URL 永远不出库。
-// 删除受 ON DELETE SET NULL 保护:删 proxy 时把绑定的 account.egress_proxy_id 置 NULL,
-// 后端返回 unbound_account_count 让 UI 提示"刚解绑了 N 个账号"。
+// 0055: 删除被账号绑定的池条目 → 后端 409 PROXY_IN_USE,admin 必须先把账号迁到
+// 其他池条目(在"账号"页编辑账号 → 改 egress 代理池条目下拉)。
 
 const EGRESS_PROXY_STATE = {
   renderSeq: 0,
@@ -2528,12 +2578,13 @@ async function openEditEgressProxyModal(id) {
 }
 
 async function deleteEgressProxy(id, label, btn) {
-  if (!confirm(`确认删除代理 "${label}"?\n\n绑定它的账号会被自动解绑(egress_proxy_id 置 NULL)。`)) return
+  // 0055: 被绑账号 → 后端 409 PROXY_IN_USE,admin 必须先迁。前端不预查 count,
+  // 直接发请求让后端权威判定;失败 toast 把 issues.bound_account_count 透出。
+  if (!confirm(`确认删除代理 "${label}"?\n\n注: 若仍有账号绑定该代理,后端会拒绝;请先在"账号"页把绑定的账号改到其他代理。`)) return
   await withBtnLoading(btn, async () => {
     try {
-      const r = await apiJson('DELETE', `/api/admin/egress-proxies/${encodeURIComponent(id)}`, null)
-      const n = r?.unbound_account_count ?? 0
-      toast(n > 0 ? `已删除,顺手解绑 ${n} 个账号` : '已删除')
+      await apiJson('DELETE', `/api/admin/egress-proxies/${encodeURIComponent(id)}`, null)
+      toast('已删除')
       renderEgressProxiesTab()
     } catch (e) {
       toast(`删除失败: ${e.message}`, 'danger', toastOptsFromError(e))

@@ -23,7 +23,7 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { KMS_KEY_BYTES } from "../crypto/keys.js";
-import { decryptToBuffer } from "../crypto/aead.js";
+import { decryptToBuffer, encrypt } from "../crypto/aead.js";
 import {
   createAccount,
   getAccount,
@@ -48,11 +48,12 @@ const COMMERCIAL_TABLES = [
   "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
   "agent_subscriptions", "user_preferences", "request_finalize_journal",
   "orders", "topup_plans", "usage_records",
-  "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
+  "credit_ledger", "model_pricing", "claude_accounts", "egress_proxies", "refresh_tokens",
   "email_verifications", "users", "schema_migrations",
 ];
 
 let pgAvailable = false;
+let TEST_EGRESS_PROXY_ID = "1";
 const KEY = randomBytes(KMS_KEY_BYTES);
 const keyFn = (): Buffer => Buffer.from(KEY);
 
@@ -72,6 +73,12 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }));
   await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
   await runMigrations();
+  const _ep = encrypt("http://test:test@10.0.0.1:8080", KEY);
+  const _r = await query<{ id: string }>(
+    "INSERT INTO egress_proxies(label, url_enc, url_nonce, status) VALUES ($1, $2, $3, 'active') RETURNING id::text AS id",
+    [`t-pool-${Date.now()}`, _ep.ciphertext, _ep.nonce],
+  );
+  TEST_EGRESS_PROXY_ID = _r.rows[0].id;
 });
 
 after(async () => {
@@ -146,6 +153,7 @@ describe("refreshAccountToken — 成功路径", () => {
         token: "OLD-ACCESS",
         refresh: "OLD-REFRESH",
         expires_at: new Date(FIXED_NOW.getTime() - 60_000),
+        egress_proxy_id: TEST_EGRESS_PROXY_ID,
       },
       keyFn,
     );
@@ -176,7 +184,7 @@ describe("refreshAccountToken — 成功路径", () => {
   test("refresh_token 轮换:服务器返新 refresh → DB 更新 + 返回 Buffer 明文匹配", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "r2", plan: "max", token: "OLD-A", refresh: "OLD-R" },
+      { label: "r2", plan: "max", token: "OLD-A", refresh: "OLD-R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     const http = mockHttp({
@@ -198,7 +206,7 @@ describe("refreshAccountToken — 成功路径", () => {
   test("expires_at(epoch seconds)也可识别", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "r-es", plan: "pro", token: "T", refresh: "R" },
+      { label: "r-es", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     const target = Math.floor(FIXED_NOW.getTime() / 1000) + 1800;
@@ -214,7 +222,7 @@ describe("refreshAccountToken — 成功路径", () => {
   test("expires_at(epoch ms)也可识别", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "r-em", plan: "pro", token: "T", refresh: "R" },
+      { label: "r-em", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     const targetMs = FIXED_NOW.getTime() + 5000;
@@ -230,7 +238,7 @@ describe("refreshAccountToken — 成功路径", () => {
   test("无 expires_in/expires_at → fallback 1h", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "r-fb", plan: "pro", token: "T", refresh: "R" },
+      { label: "r-fb", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     const http = mockHttp({
@@ -245,7 +253,7 @@ describe("refreshAccountToken — 成功路径", () => {
   test("成功后 last_error 被清空(上次失败可能留下 msg)", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "r-le", plan: "pro", token: "T", refresh: "R" },
+      { label: "r-le", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     await query(
@@ -265,7 +273,7 @@ describe("refreshAccountToken — 成功路径", () => {
   test("构造的 form body 含 grant_type=refresh_token + refresh_token", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "r-form", plan: "pro", token: "T", refresh: "R-VAL" },
+      { label: "r-form", plan: "pro", token: "T", refresh: "R-VAL", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     let capturedBody = "";
@@ -300,7 +308,7 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
   test("无 refresh_token → 禁用 + 抛 no_refresh_token", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "nr", plan: "pro", token: "T" },
+      { label: "nr", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     await assert.rejects(
@@ -316,7 +324,7 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
   test("HTTP 502 → 禁用 + 抛 http_error(status=502)", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "h502", plan: "pro", token: "T", refresh: "R" },
+      { label: "h502", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     await assert.rejects(
@@ -340,7 +348,7 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
   test("HTTP 2xx 但非 JSON → bad_response + 禁用", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "badjson", plan: "pro", token: "T", refresh: "R" },
+      { label: "badjson", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     await assert.rejects(
@@ -359,7 +367,7 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
   test("HTTP 2xx JSON 但缺 access_token → bad_response + 禁用", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "nokey", plan: "pro", token: "T", refresh: "R" },
+      { label: "nokey", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     await assert.rejects(
@@ -378,7 +386,7 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
   test("network 抛 → network_transient,**不**禁用账号(代理/网络抖动可恢复)", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "net", plan: "pro", token: "T", refresh: "R" },
+      { label: "net", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     await assert.rejects(
@@ -404,7 +412,7 @@ describe("refreshAccountToken — 失败路径(禁用 + 抛)", () => {
   test("health.manualDisable 注入时走 health 路径;Redis 计数器也被清", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "h-dep", plan: "pro", token: "T", refresh: "R" },
+      { label: "h-dep", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     const redis = new InMemoryHealthRedis();
@@ -433,7 +441,7 @@ describe("refreshAccountToken — 并发删除", () => {
   test("refresh 成功但账号在写回前被删 → account_not_found", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "gone", plan: "pro", token: "T", refresh: "R" },
+      { label: "gone", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     // http mock 在 post 里删账号,模拟 "在 HTTP 返回后、DB updateAccount 前" 的窗口
@@ -458,7 +466,7 @@ describe("refreshAccountToken — singleflight (#H8)", () => {
   test("同账号 5 个并发 refresh → http.post 只被打 1 次,5 个 waiter 都拿到结果", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "sf", plan: "pro", token: "T", refresh: "R" },
+      { label: "sf", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
 
@@ -503,7 +511,7 @@ describe("refreshAccountToken — singleflight (#H8)", () => {
   test("in-flight 失败 → 所有 waiter 都拒绝;下一次 call 从头再跑", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "sf-fail", plan: "pro", token: "T", refresh: "R" },
+      { label: "sf-fail", plan: "pro", token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
 

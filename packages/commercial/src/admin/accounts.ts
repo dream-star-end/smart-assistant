@@ -48,7 +48,6 @@ import {
 import { writeAdminAudit } from "./audit.js";
 import { incrAdminAuditWriteFailure } from "./metrics.js";
 import {
-  pickAndAssignEgressHost,
   reassignEgressHost,
 } from "../account-pool/egressAssignment.js";
 
@@ -151,24 +150,27 @@ export interface AdminCreateAccountInput {
   oauth_token: string;
   oauth_refresh_token?: string | null;
   oauth_expires_at?: Date | string | null;
-  /** 出口代理 URL,如 `http://user:pass@host:port`。null/省略 = 走本机出口 */
-  egress_proxy?: string | null;
   /**
-   * 0053 — 代理池 entry id。与 egress_proxy 文本互斥(决策 R):
-   *   - 同时提供 → 抛 'invalid_egress_proxy_mutex'
-   *   - 只提供 id → store 层落 id,raw 为 null
-   * 后端不在创建路径校验 entry 是否 active(decision R 简化:list dropdown 已只
-   * 出 active,active→disabled 中间态由前端容忍)。
+   * 0055 — 代理池 entry id(必填)。boss 强约束:每个账号必须关联池条目,
+   * raw `egress_proxy` 文本字段已不再支持。
+   * 校验:格式 `^[1-9][0-9]{0,19}$` + 存在性预检(SELECT FROM egress_proxies)。
+   * 不校验 active 状态:与 0053 决策一致,允许 active→disabled 中间态;
+   * disabled entry 运行时 dispatcher fallback(优先级:plain proxy > egress_target
+   * mTLS host > master 默认出口),不阻塞 admin 流程。
    */
-  egress_proxy_id?: bigint | string | null;
+  egress_proxy_id: bigint | string;
 }
 
-/** http(s)://[user:pass@]host[:port][/path] —— store.ts 的 validateEgressProxy 同样规则,这里前置 fail-fast */
-function validateEgressProxyOrThrow(raw: string): void {
-  let u: URL;
-  try { u = new URL(raw); } catch { throw new RangeError("invalid_egress_proxy"); }
-  if (u.protocol !== "http:" && u.protocol !== "https:") throw new RangeError("invalid_egress_proxy");
-  if (!u.hostname) throw new RangeError("invalid_egress_proxy");
+/**
+ * 0055 — 代理池 entry 存在性预检。FK 23503 在 PG 层会变 500,提前 SELECT 给 400。
+ * 不校验 status='active' / 不校验 url_enc 完整性 — 仅存在性。
+ */
+async function ensureEgressProxyExistsOrThrow(id: string): Promise<void> {
+  const r = await getPool().query<{ id: string }>(
+    `SELECT id::text AS id FROM egress_proxies WHERE id = $1::bigint`,
+    [id],
+  );
+  if (r.rowCount === 0) throw new RangeError("invalid_egress_proxy_id_not_found");
 }
 
 export async function adminCreateAccount(
@@ -203,25 +205,16 @@ export async function adminCreateAccount(
   if (provider === "codex" && refresh === null) {
     throw new RangeError("codex_account_requires_refresh_token");
   }
-  let egressProxy: string | null = null;
-  if (input.egress_proxy !== undefined && input.egress_proxy !== null) {
-    if (typeof input.egress_proxy !== "string" || input.egress_proxy.length === 0) {
-      throw new RangeError("invalid_egress_proxy");
-    }
-    validateEgressProxyOrThrow(input.egress_proxy);
-    egressProxy = input.egress_proxy;
+  // 0055:egress_proxy_id 必填(类型签名已锁,这里 runtime 兜底防 JS 调用方绕过 TS)
+  if (input.egress_proxy_id === undefined || input.egress_proxy_id === null) {
+    throw new RangeError("invalid_egress_proxy_id_missing");
   }
-  let egressProxyId: string | null = null;
-  if (input.egress_proxy_id !== undefined && input.egress_proxy_id !== null) {
-    egressProxyId = String(input.egress_proxy_id);
-    if (!/^[1-9][0-9]{0,19}$/.test(egressProxyId)) {
-      throw new RangeError("invalid_egress_proxy_id");
-    }
+  const egressProxyId = String(input.egress_proxy_id);
+  if (!/^[1-9][0-9]{0,19}$/.test(egressProxyId)) {
+    throw new RangeError("invalid_egress_proxy_id");
   }
-  // egress_proxy 与 egress_proxy_id 互斥(决策 R):同一账号只能从一处取代理 URL
-  if (egressProxy !== null && egressProxyId !== null) {
-    throw new RangeError("invalid_egress_proxy_mutex");
-  }
+  // 存在性预检 — 不存在的 FK 在 store 层会冒成 23503 → 500,提前 SELECT 给 400。
+  await ensureEgressProxyExistsOrThrow(egressProxyId);
 
   const createInput: CreateAccountInput = {
     provider,
@@ -230,25 +223,12 @@ export async function adminCreateAccount(
     token: input.oauth_token,
     refresh,
     expires_at: expiresAt,
-    egress_proxy: egressProxy,
     egress_proxy_id: egressProxyId,
   };
   const row = await storeCreate(createInput);
 
-  // 0038 — 自动分配 egress host(仅当 provider='claude' 且账号没显式 egress_proxy/_id)。
-  // admin 手填代理(raw 或 pool id) → 不动 host 字段(优先级:proxy > host)。
-  // codex 账号:容器内 codex CLI 直连 OpenAI,不走 mTLS forward proxy(决策 U)。
-  // 池里没合格 host → 返 null 不报错,账号继续走 master 默认出口。
-  // assign 失败不阻塞账号创建,记 best-effort audit。
-  let assignedHostId: string | null = null;
-  if (provider === "claude" && egressProxy === null && egressProxyId === null) {
-    try {
-      assignedHostId = await pickAndAssignEgressHost(row.id);
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[admin/accounts] egress host auto-assign failed", err);
-    }
-  }
+  // 0055:account 必有 egress_proxy_id 池引用,运行时优先用池 URL,host 字段已无意义。
+  // 不再在 create 路径自动分配 egress_host_uuid(0038 路径退化为 admin 手动 patch 触发)。
 
   await bestEffortAudit(
     ctx,
@@ -258,7 +238,6 @@ export async function adminCreateAccount(
     {
       ...snapshotForAudit(row),
       has_refresh_token: refresh !== null,
-      egress_host_uuid: assignedHostId,
       // 不记明文 token / proxy 密码 —— snapshotForAudit 已 mask
     },
   );
@@ -280,20 +259,16 @@ export interface AdminPatchAccountInput {
   oauth_token?: string;
   oauth_refresh_token?: string | null;
   oauth_expires_at?: Date | string | null;
-  /** undefined = 不动;null = 清空(走本机出口);string = 设/换代理 URL。 */
-  egress_proxy?: string | null;
   /**
-   * 0053 引入。undefined = 不动;null = 解绑代理池;bigint/string = 绑指定 entry。
-   * 互斥规则(决策 R):
-   *   - 同时显式提供 egress_proxy 与 egress_proxy_id → 'invalid_egress_proxy_mutex'
-   *   - 只显式提供 egress_proxy_id → 自动把 egress_proxy 清成 null(防残留 raw)
-   *   - 只显式提供 egress_proxy → 自动把 egress_proxy_id 清成 null
+   * 0055 — undefined = 不动;bigint/string = 换池 entry id。
+   * 不接受 null:CHECK constraint 要求账号生命周期内 egress_proxy_id 永远 NOT NULL。
+   * raw `egress_proxy` 文本字段已不再支持(由 0055 锁死为 NULL)。
    */
-  egress_proxy_id?: bigint | string | null;
+  egress_proxy_id?: bigint | string;
   /**
    * 0038 — 重新分配 egress host。
    *   - undefined = 不动
-   *   - null = 清空(账号回退到 master 默认出口或 egress_proxy)
+   *   - null = 清空(账号 egress 由 dispatcher 决定:plain proxy > egress_target mTLS > master)
    *   - "auto" = 走 pickAndAssignEgressHost(选最少账号的合格 host)
    *   - "<uuid>" = 直接绑该 host(校验必须 ready+endpoint+cert+psk 齐全)
    */
@@ -332,32 +307,20 @@ export async function adminPatchAccount(
       throw new RangeError("invalid_oauth_refresh_token");
     }
   }
-  if (patch.egress_proxy !== undefined && patch.egress_proxy !== null) {
-    if (typeof patch.egress_proxy !== "string" || patch.egress_proxy.length === 0) {
-      throw new RangeError("invalid_egress_proxy");
-    }
-    validateEgressProxyOrThrow(patch.egress_proxy);
-  }
-  let normalizedEgressProxyId: string | null | undefined = undefined;
+  let normalizedEgressProxyId: string | undefined = undefined;
   if (patch.egress_proxy_id !== undefined) {
+    // 0055:NULL 不再接受(CHECK constraint + 生命周期强约束)。
+    // 类型已锁,这里 runtime 兜底防 JS 调用方绕过 TS。
     if (patch.egress_proxy_id === null) {
-      normalizedEgressProxyId = null;
-    } else {
-      const s = String(patch.egress_proxy_id);
-      if (!/^[1-9][0-9]{0,19}$/.test(s)) {
-        throw new RangeError("invalid_egress_proxy_id");
-      }
-      normalizedEgressProxyId = s;
+      throw new RangeError("invalid_egress_proxy_id_unset");
     }
-  }
-  // 互斥(决策 R):同时显式提供两者(且都非 null)→ 拒绝
-  if (
-    patch.egress_proxy !== undefined &&
-    patch.egress_proxy !== null &&
-    normalizedEgressProxyId !== undefined &&
-    normalizedEgressProxyId !== null
-  ) {
-    throw new RangeError("invalid_egress_proxy_mutex");
+    const s = String(patch.egress_proxy_id);
+    if (!/^[1-9][0-9]{0,19}$/.test(s)) {
+      throw new RangeError("invalid_egress_proxy_id");
+    }
+    // 存在性预检 — 不存在的 FK 在 store 层会冒成 23503 → 500。
+    await ensureEgressProxyExistsOrThrow(s);
+    normalizedEgressProxyId = s;
   }
   if (patch.egress_host_uuid !== undefined && patch.egress_host_uuid !== null) {
     if (typeof patch.egress_host_uuid !== "string" || patch.egress_host_uuid.length === 0) {
@@ -414,7 +377,6 @@ export async function adminPatchAccount(
     patch.health_score !== undefined ||
     patch.oauth_token !== undefined ||
     patch.oauth_refresh_token !== undefined ||
-    patch.egress_proxy !== undefined ||
     patch.egress_proxy_id !== undefined ||
     patch.egress_host_uuid !== undefined ||
     expiresAt !== undefined;
@@ -434,23 +396,7 @@ export async function adminPatchAccount(
   if (patch.health_score !== undefined) storePatch.health_score = patch.health_score;
   if (patch.oauth_token !== undefined) storePatch.token = patch.oauth_token;
   if (patch.oauth_refresh_token !== undefined) storePatch.refresh = patch.oauth_refresh_token;
-  if (patch.egress_proxy !== undefined) storePatch.egress_proxy = patch.egress_proxy;
   if (normalizedEgressProxyId !== undefined) storePatch.egress_proxy_id = normalizedEgressProxyId;
-  // 决策 R:只显式设了 id(非 null)→ 自动清 raw;只显式设了 raw(非 null)→ 自动清 id
-  if (
-    normalizedEgressProxyId !== undefined &&
-    normalizedEgressProxyId !== null &&
-    patch.egress_proxy === undefined
-  ) {
-    storePatch.egress_proxy = null;
-  }
-  if (
-    patch.egress_proxy !== undefined &&
-    patch.egress_proxy !== null &&
-    normalizedEgressProxyId === undefined
-  ) {
-    storePatch.egress_proxy_id = null;
-  }
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;
 
   const after = await storeUpdate(id, storePatch);
@@ -494,10 +440,6 @@ export async function adminPatchAccount(
   if (expiresAt !== undefined) {
     changedBefore.oauth_expires_at = before.oauth_expires_at?.toISOString() ?? null;
     changedAfter.oauth_expires_at = after.oauth_expires_at?.toISOString() ?? null;
-  }
-  if (patch.egress_proxy !== undefined) {
-    changedBefore.egress_proxy = maskEgressProxy(before.egress_proxy);
-    changedAfter.egress_proxy = maskEgressProxy(after.egress_proxy);
   }
   if (patch.egress_proxy_id !== undefined) {
     changedBefore.egress_proxy_id = before.egress_proxy_id !== null ? before.egress_proxy_id.toString() : null;

@@ -33,6 +33,7 @@ import {
   adminPatchAccount,
   adminDeleteAccount,
 } from "../admin/accounts.js";
+import { createEgressProxy } from "../admin/egressProxies.js";
 import { listLedger } from "../admin/ledger.js";
 import { adminAdjust } from "../billing/ledger.js";
 
@@ -56,6 +57,7 @@ const COMMERCIAL_TABLES = [
   "credit_ledger",
   "model_pricing",
   "claude_accounts",
+  "egress_proxies",
   "refresh_tokens",
   "email_verifications",
   "users",
@@ -143,7 +145,7 @@ after(async () => {
 beforeEach(async () => {
   if (!pgAvailable) return;
   await query(
-    "TRUNCATE TABLE admin_audit, agent_audit, agent_containers, agent_subscriptions, usage_records, credit_ledger, claude_accounts, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
+    "TRUNCATE TABLE admin_audit, agent_audit, agent_containers, agent_subscriptions, usage_records, credit_ledger, claude_accounts, egress_proxies, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
   );
   if (redis) await redis.flushdb();
 });
@@ -170,6 +172,21 @@ async function tokenFor(uid: bigint, role: "user" | "admin"): Promise<string> {
   return r.token;
 }
 
+// 0055: claude_accounts.egress_proxy_id 必填,且必须指向 egress_proxies 池里的现有
+// row。每条测试自己 setup 一个 active 池条目并返回 id 字符串供 create 使用。
+let _testEpidCounter = 0;
+async function setupEgressProxy(adminId: bigint): Promise<string> {
+  _testEpidCounter += 1;
+  const ep = await createEgressProxy(
+    {
+      label: `t-pool-${_testEpidCounter}`,
+      url: `http://user:pass@10.0.0.${_testEpidCounter}:8080`,
+    },
+    { adminId },
+  );
+  return ep.id.toString();
+}
+
 // ============================================================
 // accounts — DB
 // ============================================================
@@ -178,18 +195,19 @@ describe("admin accounts — DB 层", () => {
   test("create + get + list + patch + delete 流程", async (t) => {
     if (skipIfNoPg(t)) return;
     const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
 
     const created = await adminCreateAccount(
-      { label: "pro-1", plan: "pro", oauth_token: "sk-ant-oat-PLAINTEXT" },
+      { label: "pro-1", plan: "pro", oauth_token: "sk-ant-oat-PLAINTEXT", egress_proxy_id: epid },
       { adminId: admin },
     );
     assert.equal(created.label, "pro-1");
     assert.equal(created.plan, "pro");
     assert.equal(created.status, "active");
 
-    // 1 条审计:account.create,before=null,after 不含明文 token
+    // setup 那一条 egress_proxy.create + account.create = 2 条
     let audits = await listAdminAudit({});
-    assert.equal(audits.rows.length, 1);
+    assert.equal(audits.rows.length, 2);
     assert.equal(audits.rows[0].action, "account.create");
     const createdAuditAfter = audits.rows[0].after as Record<string, unknown>;
     assert.equal(createdAuditAfter.has_refresh_token, false);
@@ -211,7 +229,8 @@ describe("admin accounts — DB 层", () => {
     assert.equal(patched.health_score, 50);
 
     audits = await listAdminAudit({});
-    assert.equal(audits.rows.length, 2);
+    // 加 patch:egress_proxy.create + account.create + account.patch = 3
+    assert.equal(audits.rows.length, 3);
     const patchAudit = audits.rows[0];
     assert.equal(patchAudit.action, "account.patch");
     assert.deepEqual(
@@ -222,15 +241,23 @@ describe("admin accounts — DB 层", () => {
     const del = await adminDeleteAccount(created.id, { adminId: admin });
     assert.equal(del, true);
     audits = await listAdminAudit({});
-    assert.equal(audits.rows.length, 3);
+    // 加 delete:egress_proxy.create + account.create + account.patch + account.delete = 4
+    assert.equal(audits.rows.length, 4);
     assert.equal(audits.rows[0].action, "account.delete");
   });
 
   test("patch:rotate token/refresh → audit 只记 _changed 布尔,不落明文", async (t) => {
     if (skipIfNoPg(t)) return;
     const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
     const a = await adminCreateAccount(
-      { label: "pro-1", plan: "pro", oauth_token: "tok1", oauth_refresh_token: "ref1" },
+      {
+        label: "pro-1",
+        plan: "pro",
+        oauth_token: "tok1",
+        oauth_refresh_token: "ref1",
+        egress_proxy_id: epid,
+      },
       { adminId: admin },
     );
     await adminPatchAccount(
@@ -270,18 +297,24 @@ describe("admin accounts — HTTP", () => {
     const admin = await createUser("a@x.com", "admin");
     const uTok = await tokenFor(u, "user");
     const aTok = await tokenFor(admin, "admin");
+    const epid = await setupEgressProxy(admin);
 
     const forbid = await fetch(`${baseUrl}/api/admin/accounts`, {
       method: "POST",
       headers: { Authorization: `Bearer ${uTok}`, "content-type": "application/json" },
-      body: JSON.stringify({ label: "x", plan: "pro", oauth_token: "t" }),
+      body: JSON.stringify({ label: "x", plan: "pro", oauth_token: "t", egress_proxy_id: epid }),
     });
     assert.equal(forbid.status, 403);
 
     const created = await fetch(`${baseUrl}/api/admin/accounts`, {
       method: "POST",
       headers: { Authorization: `Bearer ${aTok}`, "content-type": "application/json" },
-      body: JSON.stringify({ label: "pro-1", plan: "pro", oauth_token: "sk-SECRET-TOKEN" }),
+      body: JSON.stringify({
+        label: "pro-1",
+        plan: "pro",
+        oauth_token: "sk-SECRET-TOKEN",
+        egress_proxy_id: epid,
+      }),
     });
     assert.equal(created.status, 201);
     const body = (await created.json()) as { account: { id: string; label: string } };
@@ -309,8 +342,9 @@ describe("admin accounts — HTTP", () => {
     if (skipIfNoHttp(t)) return;
     const admin = await createUser("a@x.com", "admin");
     const aTok = await tokenFor(admin, "admin");
+    const epid = await setupEgressProxy(admin);
     const a = await adminCreateAccount(
-      { label: "pro-1", plan: "pro", oauth_token: "tok" },
+      { label: "pro-1", plan: "pro", oauth_token: "tok", egress_proxy_id: epid },
       { adminId: admin },
     );
 
@@ -345,6 +379,134 @@ describe("admin accounts — HTTP", () => {
       body: JSON.stringify({ plan: "pro" }),
     });
     assert.equal(r.status, 400);
+  });
+});
+
+// ============================================================
+// accounts — 0055 强约束:egress_proxy_id 必须 + 池条目存在
+// ============================================================
+
+describe("admin accounts — 0055 egress_proxy_id 必须", () => {
+  test("DB:adminCreateAccount 缺 egress_proxy_id → invalid_egress_proxy_id_missing", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    await assert.rejects(
+      () =>
+        adminCreateAccount(
+          // @ts-expect-error 故意构造缺字段的入参证明运行时拒绝
+          { label: "p", plan: "pro", oauth_token: "tok" },
+          { adminId: admin },
+        ),
+      (e) => e instanceof RangeError && /invalid_egress_proxy_id_missing/.test(e.message),
+    );
+  });
+
+  test("DB:adminCreateAccount 非数字 egress_proxy_id → invalid_egress_proxy_id", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    await assert.rejects(
+      () =>
+        adminCreateAccount(
+          { label: "p", plan: "pro", oauth_token: "tok", egress_proxy_id: "abc" },
+          { adminId: admin },
+        ),
+      (e) => e instanceof RangeError && /invalid_egress_proxy_id$/.test(e.message),
+    );
+  });
+
+  test("DB:adminCreateAccount 不存在的 egress_proxy_id → invalid_egress_proxy_id_not_found", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    await assert.rejects(
+      () =>
+        adminCreateAccount(
+          { label: "p", plan: "pro", oauth_token: "tok", egress_proxy_id: "9999999" },
+          { adminId: admin },
+        ),
+      (e) => e instanceof RangeError && /invalid_egress_proxy_id_not_found/.test(e.message),
+    );
+  });
+
+  test("DB:adminPatchAccount 显式 null egress_proxy_id → invalid_egress_proxy_id_unset", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    const a = await adminCreateAccount(
+      { label: "p", plan: "pro", oauth_token: "tok", egress_proxy_id: epid },
+      { adminId: admin },
+    );
+    await assert.rejects(
+      () =>
+        adminPatchAccount(
+          a.id,
+          // @ts-expect-error 0055 收紧后类型禁止 null,运行时也拒绝
+          { egress_proxy_id: null },
+          { adminId: admin },
+        ),
+      (e) => e instanceof RangeError && /invalid_egress_proxy_id_unset/.test(e.message),
+    );
+  });
+
+  test("HTTP:POST 含 legacy egress_proxy → 400 legacy_egress_proxy_not_allowed", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const aTok = await tokenFor(admin, "admin");
+    const epid = await setupEgressProxy(admin);
+    const r = await fetch(`${baseUrl}/api/admin/accounts`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${aTok}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        label: "p",
+        plan: "pro",
+        oauth_token: "tok",
+        egress_proxy: "http://x:y@1.2.3.4:8080",
+        egress_proxy_id: epid,
+      }),
+    });
+    assert.equal(r.status, 400);
+    const body = (await r.json()) as { error?: { message?: string } };
+    assert.match(String(body.error?.message ?? ""), /legacy_egress_proxy_not_allowed/);
+  });
+
+  test("HTTP:POST 缺 egress_proxy_id → 400", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const aTok = await tokenFor(admin, "admin");
+    const r = await fetch(`${baseUrl}/api/admin/accounts`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${aTok}`, "content-type": "application/json" },
+      body: JSON.stringify({ label: "p", plan: "pro", oauth_token: "tok" }),
+    });
+    assert.equal(r.status, 400);
+    const body = (await r.json()) as { error?: { message?: string } };
+    assert.match(String(body.error?.message ?? ""), /egress_proxy_id is required/);
+  });
+
+  test("HTTP:PATCH 含 legacy egress_proxy → 400;PATCH egress_proxy_id=null → 400", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const aTok = await tokenFor(admin, "admin");
+    const epid = await setupEgressProxy(admin);
+    const a = await adminCreateAccount(
+      { label: "p", plan: "pro", oauth_token: "tok", egress_proxy_id: epid },
+      { adminId: admin },
+    );
+
+    const legacy = await fetch(`${baseUrl}/api/admin/accounts/${a.id}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${aTok}`, "content-type": "application/json" },
+      body: JSON.stringify({ egress_proxy: "http://x:y@1.2.3.4:8080" }),
+    });
+    assert.equal(legacy.status, 400);
+    const lb = (await legacy.json()) as { error?: { message?: string } };
+    assert.match(String(lb.error?.message ?? ""), /legacy_egress_proxy_not_allowed/);
+
+    const nullified = await fetch(`${baseUrl}/api/admin/accounts/${a.id}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${aTok}`, "content-type": "application/json" },
+      body: JSON.stringify({ egress_proxy_id: null }),
+    });
+    assert.equal(nullified.status, 400);
   });
 });
 

@@ -24,6 +24,7 @@ import {
 } from '../account-pool/quota.js'
 import { createAccount, listAccounts } from '../account-pool/store.js'
 import { KMS_KEY_BYTES } from '../crypto/keys.js'
+import { encrypt } from '../crypto/aead.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
@@ -46,6 +47,7 @@ const COMMERCIAL_TABLES = [
   'credit_ledger',
   'model_pricing',
   'claude_accounts',
+  'egress_proxies',
   'refresh_tokens',
   'email_verifications',
   'users',
@@ -55,6 +57,7 @@ const COMMERCIAL_TABLES = [
 const KEY = randomBytes(KMS_KEY_BYTES)
 const keyFn = (): Buffer => Buffer.from(KEY)
 let pgAvailable = false
+let TEST_EGRESS_PROXY_ID = '1'
 
 async function probe(): Promise<boolean> {
   const p = createPool({ connectionString: TEST_DB_URL, max: 2, connectionTimeoutMillis: 1500 })
@@ -82,6 +85,12 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
   await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(', ')} CASCADE`)
   await runMigrations()
+  const _ep = encrypt('http://test:test@10.0.0.1:8080', KEY)
+  const _r = await query<{ id: string }>(
+    "INSERT INTO egress_proxies(label, url_enc, url_nonce, status) VALUES ($1, $2, $3, 'active') RETURNING id::text AS id",
+    [`t-pool-${Date.now()}`, _ep.ciphertext, _ep.nonce],
+  )
+  TEST_EGRESS_PROXY_ID = _r.rows[0].id
 })
 
 after(async () => {
@@ -185,7 +194,7 @@ describe('parseResetEpoch', () => {
 describe('maybeUpdateAccountQuota', () => {
   test('首次写入 — 4 列 + quota_updated_at 全部落地', async (t) => {
     if (skipIfNoDb(t)) return
-    const acc = await createAccount({ label: 'q1', plan: 'pro', token: 'T' }, keyFn)
+    const acc = await createAccount({ label: 'q1', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const headers = makeHeaders({
       'anthropic-ratelimit-unified-5h-utilization': '0.32',
       'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.now() / 1000) + 3600),
@@ -204,7 +213,7 @@ describe('maybeUpdateAccountQuota', () => {
 
   test('30s 内重复调用 — JS 节流跳过(SQL 不打)', async (t) => {
     if (skipIfNoDb(t)) return
-    const acc = await createAccount({ label: 'q2', plan: 'pro', token: 'T' }, keyFn)
+    const acc = await createAccount({ label: 'q2', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const h1 = makeHeaders({ 'anthropic-ratelimit-unified-5h-utilization': '0.10' })
     await maybeUpdateAccountQuota(getPool(), acc.id, h1)
     const after1 = (await listAccounts())[0]
@@ -220,7 +229,7 @@ describe('maybeUpdateAccountQuota', () => {
 
   test('> 30s 后再调用 — 数据更新', async (t) => {
     if (skipIfNoDb(t)) return
-    const acc = await createAccount({ label: 'q3', plan: 'pro', token: 'T' }, keyFn)
+    const acc = await createAccount({ label: 'q3', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     // 第一次设置一个 31s 前的 lastAttempt(JS 层),然后让 SQL 也跨过 30s
     const startMs = Date.now() - 31 * 1000
     await maybeUpdateAccountQuota(
@@ -246,7 +255,7 @@ describe('maybeUpdateAccountQuota', () => {
 
   test('全 null header — 不写不抛', async (t) => {
     if (skipIfNoDb(t)) return
-    const acc = await createAccount({ label: 'q4', plan: 'pro', token: 'T' }, keyFn)
+    const acc = await createAccount({ label: 'q4', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     await maybeUpdateAccountQuota(getPool(), acc.id, makeHeaders({}))
     const after = (await listAccounts())[0]
     assert.equal(after.quota_5h_pct, null)
@@ -255,8 +264,8 @@ describe('maybeUpdateAccountQuota', () => {
 
   test('listAccounts 新字段类型断言(number|null,不是 string)', async (t) => {
     if (skipIfNoDb(t)) return
-    await createAccount({ label: 'q5a', plan: 'pro', token: 'T' }, keyFn)
-    const acc2 = await createAccount({ label: 'q5b', plan: 'pro', token: 'T' }, keyFn)
+    await createAccount({ label: 'q5a', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
+    const acc2 = await createAccount({ label: 'q5b', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     await maybeUpdateAccountQuota(
       getPool(),
       acc2.id,

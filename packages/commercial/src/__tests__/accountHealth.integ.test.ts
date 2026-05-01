@@ -29,6 +29,7 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { KMS_KEY_BYTES } from "../crypto/keys.js";
+import { encrypt } from "../crypto/aead.js";
 import { createAccount, getAccount, updateAccount } from "../account-pool/store.js";
 import {
   AccountHealthTracker,
@@ -46,11 +47,12 @@ const COMMERCIAL_TABLES = [
   "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
   "agent_subscriptions", "user_preferences", "request_finalize_journal",
   "orders", "topup_plans", "usage_records",
-  "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
+  "credit_ledger", "model_pricing", "claude_accounts", "egress_proxies", "refresh_tokens",
   "email_verifications", "users", "schema_migrations",
 ];
 
 let pgAvailable = false;
+let TEST_EGRESS_PROXY_ID = "1";
 const KEY = randomBytes(KMS_KEY_BYTES);
 const keyFn = (): Buffer => Buffer.from(KEY);
 
@@ -70,6 +72,12 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }));
   await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
   await runMigrations();
+  const _ep = encrypt("http://test:test@10.0.0.1:8080", KEY);
+  const _r = await query<{ id: string }>(
+    "INSERT INTO egress_proxies(label, url_enc, url_nonce, status) VALUES ($1, $2, $3, 'active') RETURNING id::text AS id",
+    [`t-pool-${Date.now()}`, _ep.ciphertext, _ep.nonce],
+  );
+  TEST_EGRESS_PROXY_ID = _r.rows[0].id;
 });
 
 after(async () => {
@@ -90,7 +98,7 @@ function skipIfNoDb(t: { skip: (reason: string) => void }): boolean {
 }
 
 async function freshAccount(): Promise<bigint> {
-  const a = await createAccount({ label: "h-test", plan: "pro", token: "T" }, keyFn);
+  const a = await createAccount({ label: "h-test", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
   return a.id;
 }
 

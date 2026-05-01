@@ -14,6 +14,7 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { KMS_KEY_BYTES } from "../crypto/keys.js";
+import { encrypt } from "../crypto/aead.js";
 import {
   createAccount,
   getAccount,
@@ -38,11 +39,12 @@ const COMMERCIAL_TABLES = [
   "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
   "agent_subscriptions", "user_preferences", "request_finalize_journal",
   "orders", "topup_plans", "usage_records",
-  "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
+  "credit_ledger", "model_pricing", "claude_accounts", "egress_proxies", "refresh_tokens",
   "email_verifications", "users", "schema_migrations",
 ];
 
 let pgAvailable = false;
+let TEST_EGRESS_PROXY_ID = "1";
 const KEY = randomBytes(KMS_KEY_BYTES);
 const keyFn = (): Buffer => Buffer.from(KEY);
 
@@ -62,6 +64,12 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }));
   await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
   await runMigrations();
+  const _ep = encrypt("http://test:test@10.0.0.1:8080", KEY);
+  const _r = await query<{ id: string }>(
+    "INSERT INTO egress_proxies(label, url_enc, url_nonce, status) VALUES ($1, $2, $3, 'active') RETURNING id::text AS id",
+    [`t-pool-${Date.now()}`, _ep.ciphertext, _ep.nonce],
+  );
+  TEST_EGRESS_PROXY_ID = _r.rows[0].id;
 });
 
 after(async () => {
@@ -106,7 +114,7 @@ describe("端到端 - 正常流", () => {
   test("pick → streamClaude → 透传事件", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "e2e", plan: "pro", token: "VALID-TOKEN", refresh: "R" },
+      { label: "e2e", plan: "pro", token: "VALID-TOKEN", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     // 用 getTokenForUse 读出真明文 buffer
@@ -148,6 +156,7 @@ describe("端到端 - token 过期 → refresh → 重试", () => {
         token: "EXPIRED-TOKEN",
         refresh: "OLD-REFRESH",
         expires_at: new Date(FIXED_NOW.getTime() - 60_000),
+        egress_proxy_id: TEST_EGRESS_PROXY_ID,
       },
       keyFn,
     );
@@ -237,7 +246,7 @@ describe("端到端 - refresh 失败 → 账号禁用", () => {
   test("refresh 返 401 → RefreshError + status=disabled + last_error 记录", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "e2e-fail", plan: "pro", token: "X", refresh: "BAD-R" },
+      { label: "e2e-fail", plan: "pro", token: "X", refresh: "BAD-R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     const refreshHttp: RefreshHttpClient = {

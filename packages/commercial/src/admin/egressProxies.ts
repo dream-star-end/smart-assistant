@@ -9,7 +9,9 @@
  *   - admin CRUD(list/get/create/patch/delete);AEAD 加密 URL;
  *     每次 UPDATE url 重新 randomBytes(12) nonce(决策 Q,nonce 不复用)
  *   - 读路径返还 masked URL(`maskEgressProxy`),**永远不返明文/密文/nonce**
- *   - 删除路径 ON DELETE SET NULL(0053 FK 决定),已绑账号自动 NULL,落 audit
+ *   - 删除路径(0055):FK ON DELETE RESTRICT;deleteEgressProxy 显式预检
+ *     被绑账号数,> 0 抛 EgressProxyInUseError → HTTP 层 409 PROXY_IN_USE,
+ *     admin 必须先把账号迁到其他池条目再删。落 audit。
  *   - 所有 mutate 写 admin_audit;失败 best-effort 不冒泡
  */
 
@@ -349,8 +351,23 @@ export async function patchEgressProxy(
 
 export interface DeleteEgressProxyResult {
   deleted: boolean;
-  /** 0053 ON DELETE SET NULL — 这次 DELETE 顺手把多少 claude_accounts 行的 egress_proxy_id 置 NULL。 */
-  unbound_account_count: number;
+}
+
+/**
+ * 0055 — 池条目被 claude_accounts 绑定时,删除被拒绝。
+ * 调用方(http/admin.ts)翻译为 409 PROXY_IN_USE 让 admin UI 提示先迁。
+ *
+ * 0055 前:0053 FK ON DELETE SET NULL 自动 unbind,删返 unbound_account_count。
+ * 0055 后:CHECK constraint 禁 NULL,FK 改 ON DELETE RESTRICT,删被绑条目
+ * 在 PG 层会冒成 23503,但语义不清(admin 不知道哪些账号被绑)。预检 + 显
+ * 式 error class 把"先迁账号"的责任放回 admin。
+ */
+export class EgressProxyInUseError extends Error {
+  readonly code = "PROXY_IN_USE";
+  constructor(public readonly boundAccountCount: number) {
+    super(`egress_proxy still bound to ${boundAccountCount} account(s)`);
+    this.name = "EgressProxyInUseError";
+  }
 }
 
 export async function deleteEgressProxy(
@@ -358,30 +375,32 @@ export async function deleteEgressProxy(
   ctx: EgressProxyAuditCtx,
 ): Promise<DeleteEgressProxyResult> {
   const before = await getEgressProxy(id);
-  if (!before) return { deleted: false, unbound_account_count: 0 };
+  if (!before) return { deleted: false };
 
-  // 先看会影响多少 claude_accounts 行 — 0053 FK ON DELETE SET NULL 自动 unbind,
-  // 这里只是为了 audit 记录。注意 claude_accounts 数量很可控(admin 池规模),
-  // 简单 COUNT 不会有性能问题。
+  // 0055 — 预检绑定账号数 → 非 0 直接拒绝。注意 SELECT 与 DELETE 之间存在
+  // race(admin 在另一窗 patch 把账号绑过来),但 FK ON DELETE RESTRICT 会
+  // 在 DELETE 时再做兜底校验,生产 23503 错。admin 池规模可控,COUNT 不会
+  // 有性能问题。
   const cnt = await query<{ c: string }>(
     `SELECT COUNT(*)::text AS c FROM claude_accounts WHERE egress_proxy_id = $1`,
     [String(id)],
   );
-  const unbound = Number(cnt.rows[0]?.c ?? "0");
+  const bound = Number(cnt.rows[0]?.c ?? "0");
+  if (bound > 0) throw new EgressProxyInUseError(bound);
 
   const r = await query<{ id: string }>(
     `DELETE FROM egress_proxies WHERE id = $1 RETURNING id::text AS id`,
     [String(id)],
   );
   const deleted = (r.rows[0]?.id ?? null) !== null;
-  if (!deleted) return { deleted: false, unbound_account_count: 0 };
+  if (!deleted) return { deleted: false };
 
   await audit(
     ctx,
     "egress_proxy.delete",
     `egress_proxy:${before.id.toString()}`,
-    { ...snapshotForAudit(before), unbound_account_count: unbound },
+    snapshotForAudit(before),
     null,
   );
-  return { deleted: true, unbound_account_count: unbound };
+  return { deleted: true };
 }

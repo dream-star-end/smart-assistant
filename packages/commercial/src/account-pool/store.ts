@@ -158,11 +158,13 @@ export interface CreateAccountInput {
   token: string;
   refresh?: string | null;
   expires_at?: Date | null;
-  egress_proxy?: string | null;
   /**
-   * 0053 引入。create 时 admin layer 校验互斥与存在性;store 层只做 INSERT。
+   * 0055 — 必须引用 egress_proxies 池条目(boss 决策,强约束)。raw text 列
+   * (0010)在 0055 CHECK constraint 下必须 NULL,store 层不再暴露其 setter。
+   * 不再可空:store 层守门,缺省 → throw TypeError。entry 存在性校验在
+   * admin layer(adminCreateAccount 显式 SELECT FROM egress_proxies)。
    */
-  egress_proxy_id?: bigint | string | null;
+  egress_proxy_id: bigint | string;
 }
 
 /**
@@ -190,15 +192,13 @@ export interface UpdateAccountPatch {
   token?: string;
   refresh?: string | null;
   /**
-   * undefined = 不变;null = 清空(走本机出口);string = 设/换代理 URL。
-   */
-  egress_proxy?: string | null;
-  /**
-   * 0053 引入。undefined = 不变;null = 解绑代理池;bigint/string = 绑指定 entry。
+   * 0055 — undefined = 不变;bigint/string = 换池 entry。
+   * 不允许 null:CHECK constraint 要求账号生命周期内 egress_proxy_id 永远 NOT NULL。
+   * raw `egress_proxy` 文本列在 store 层不再暴露(由 0055 CHECK 锁死为 NULL)。
    * provider 不在 patch — admin layer 显式拒绝 PATCH provider(decision R)。
-   * 互斥与 entry 存在性校验在 admin layer。
+   * entry 存在性校验在 admin layer。
    */
-  egress_proxy_id?: bigint | string | null;
+  egress_proxy_id?: bigint | string;
 }
 
 export class AccountNotFoundError extends Error {
@@ -327,26 +327,10 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
 }
 
 /**
- * 校验 egress_proxy URL 形态。允许 http(s) scheme,主机非空,端口可选(默认 80/443)。
- * 不做联通性测试 —— 那是 admin 创建后人工/自动 health 检查的事。
- */
-function validateEgressProxy(raw: string): void {
-  let u: URL;
-  try {
-    u = new URL(raw);
-  } catch {
-    throw new TypeError(`egress_proxy is not a valid URL: ${raw}`);
-  }
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
-    throw new TypeError(`egress_proxy must be http(s):// scheme, got ${u.protocol}`);
-  }
-  if (!u.hostname) {
-    throw new TypeError("egress_proxy missing host");
-  }
-}
-
-/**
  * 创建账号 —— 加密 token(+ 可选 refresh)后 INSERT。
+ *
+ * 0055:egress_proxy raw 文本列写死 NULL,egress_proxy_id 必须 NOT NULL
+ * (CHECK constraint 强制)。raw 列保留只为 backup restore 兼容,不再当业务字段。
  *
  * @returns 新行的元信息(不含任何密文)
  */
@@ -364,6 +348,11 @@ export async function createAccount(
   if (typeof input.token !== "string" || input.token.length === 0) {
     throw new TypeError("token must be non-empty string");
   }
+  // 0055:egress_proxy_id 必填(类型签名已锁,这里 runtime 兜底防 JS 调用方绕过 TS)
+  if (input.egress_proxy_id === undefined || input.egress_proxy_id === null) {
+    throw new TypeError("egress_proxy_id is required (0055)");
+  }
+  const egressProxyId = String(input.egress_proxy_id);
 
   const key = keyFn();
   try {
@@ -379,20 +368,6 @@ export async function createAccount(
       refNonce = r.nonce;
     }
 
-    let egressProxy: string | null = null;
-    if (input.egress_proxy !== undefined && input.egress_proxy !== null) {
-      if (typeof input.egress_proxy !== "string" || input.egress_proxy.length === 0) {
-        throw new TypeError("egress_proxy must be non-empty string or null/undefined");
-      }
-      validateEgressProxy(input.egress_proxy);
-      egressProxy = input.egress_proxy;
-    }
-
-    let egressProxyId: string | null = null;
-    if (input.egress_proxy_id !== undefined && input.egress_proxy_id !== null) {
-      egressProxyId = String(input.egress_proxy_id);
-    }
-
     const res = await query<RawMetaRow>(
       `INSERT INTO claude_accounts(
          provider, label, plan,
@@ -401,7 +376,7 @@ export async function createAccount(
          oauth_expires_at,
          egress_proxy, egress_proxy_id
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -412,7 +387,6 @@ export async function createAccount(
         refEnc,
         refNonce,
         input.expires_at ?? null,
-        egressProxy,
         egressProxyId,
       ],
     );
@@ -653,19 +627,14 @@ export async function updateAccount(
     push("health_score", patch.health_score);
   }
   if (patch.oauth_expires_at !== undefined) push("oauth_expires_at", patch.oauth_expires_at);
-  if (patch.egress_proxy !== undefined) {
-    if (patch.egress_proxy === null) {
-      push("egress_proxy", null);
-    } else {
-      if (typeof patch.egress_proxy !== "string" || patch.egress_proxy.length === 0) {
-        throw new TypeError("egress_proxy must be non-empty string or null");
-      }
-      validateEgressProxy(patch.egress_proxy);
-      push("egress_proxy", patch.egress_proxy);
-    }
-  }
   if (patch.egress_proxy_id !== undefined) {
-    push("egress_proxy_id", patch.egress_proxy_id === null ? null : String(patch.egress_proxy_id));
+    // 0055:NULL 不再接受(CHECK constraint 与生命周期强约束)。类型已锁住,
+    // 这里 runtime 兜底防 JS 调用方绕过 TS。
+    // raw `egress_proxy` 列在 0055 后必须 NULL,store 层不再暴露其 setter。
+    if (patch.egress_proxy_id === null) {
+      throw new TypeError("egress_proxy_id cannot be null (0055)");
+    }
+    push("egress_proxy_id", String(patch.egress_proxy_id));
   }
 
   let key: Buffer | null = null;

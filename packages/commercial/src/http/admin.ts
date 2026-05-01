@@ -1076,10 +1076,24 @@ export async function handleAdminCreateAccount(
     if (b.provider === "claude" || b.provider === "codex") provider = b.provider;
     else throw new HttpError(400, "VALIDATION", "provider must be 'claude' or 'codex'");
   }
+  // 0055: 拒绝 legacy raw egress_proxy 字段。所有出口必须通过 egress_proxies 池
+  // (egress_proxy_id),raw text 列已 CHECK NULL 锁死。
+  if (b.egress_proxy !== undefined) {
+    throw new HttpError(400, "VALIDATION", "legacy_egress_proxy_not_allowed");
+  }
+  // egress_proxy_id 创建时必填,具体存在性由 admin 层兜底校验
+  if (b.egress_proxy_id === undefined || b.egress_proxy_id === null || b.egress_proxy_id === "") {
+    throw new HttpError(400, "VALIDATION", "egress_proxy_id is required");
+  }
+  if (typeof b.egress_proxy_id !== "string" && typeof b.egress_proxy_id !== "number") {
+    throw new HttpError(400, "VALIDATION", "egress_proxy_id must be string or number");
+  }
+
   const input: AdminCreateAccountInput = {
     label: b.label,
     plan: b.plan as AdminCreateAccountInput["plan"],
     oauth_token: b.oauth_token,
+    egress_proxy_id: String(b.egress_proxy_id),
     ...(provider !== undefined ? { provider } : {}),
   };
   if (b.oauth_refresh_token !== undefined) {
@@ -1093,30 +1107,6 @@ export async function handleAdminCreateAccount(
       throw new HttpError(400, "VALIDATION", "oauth_expires_at must be ISO string or null");
     }
     input.oauth_expires_at = b.oauth_expires_at as string | null;
-  }
-  if (b.egress_proxy !== undefined) {
-    if (b.egress_proxy !== null && typeof b.egress_proxy !== "string") {
-      throw new HttpError(400, "VALIDATION", "egress_proxy must be string or null");
-    }
-    // 空串视作 null(便于前端表单清空)
-    input.egress_proxy =
-      typeof b.egress_proxy === "string" && b.egress_proxy.trim().length === 0
-        ? null
-        : (b.egress_proxy as string | null);
-  }
-  if (b.egress_proxy_id !== undefined) {
-    // null/数字字符串/数字均可,数字校验由 adminCreateAccount 兜底
-    if (
-      b.egress_proxy_id !== null &&
-      typeof b.egress_proxy_id !== "string" &&
-      typeof b.egress_proxy_id !== "number"
-    ) {
-      throw new HttpError(400, "VALIDATION", "egress_proxy_id must be string/number/null");
-    }
-    input.egress_proxy_id =
-      b.egress_proxy_id === null || b.egress_proxy_id === ""
-        ? null
-        : String(b.egress_proxy_id);
   }
 
   try {
@@ -1183,27 +1173,19 @@ export async function handleAdminPatchAccount(
     }
     patch.oauth_expires_at = b.oauth_expires_at as string | null;
   }
+  // 0055: 拒绝 legacy raw egress_proxy 字段。
   if (b.egress_proxy !== undefined) {
-    if (b.egress_proxy !== null && typeof b.egress_proxy !== "string") {
-      throw new HttpError(400, "VALIDATION", "egress_proxy must be string or null");
-    }
-    patch.egress_proxy =
-      typeof b.egress_proxy === "string" && b.egress_proxy.trim().length === 0
-        ? null
-        : (b.egress_proxy as string | null);
+    throw new HttpError(400, "VALIDATION", "legacy_egress_proxy_not_allowed");
   }
+  // egress_proxy_id 不允许 null / 空串(账号必须始终绑定池条目)
   if (b.egress_proxy_id !== undefined) {
-    if (
-      b.egress_proxy_id !== null &&
-      typeof b.egress_proxy_id !== "string" &&
-      typeof b.egress_proxy_id !== "number"
-    ) {
-      throw new HttpError(400, "VALIDATION", "egress_proxy_id must be string/number/null");
+    if (b.egress_proxy_id === null || b.egress_proxy_id === "") {
+      throw new HttpError(400, "VALIDATION", "egress_proxy_id cannot be null");
     }
-    patch.egress_proxy_id =
-      b.egress_proxy_id === null || b.egress_proxy_id === ""
-        ? null
-        : String(b.egress_proxy_id);
+    if (typeof b.egress_proxy_id !== "string" && typeof b.egress_proxy_id !== "number") {
+      throw new HttpError(400, "VALIDATION", "egress_proxy_id must be string or number");
+    }
+    patch.egress_proxy_id = String(b.egress_proxy_id);
   }
   if (b.egress_host_uuid !== undefined) {
     if (b.egress_host_uuid !== null && typeof b.egress_host_uuid !== "string") {
@@ -2566,7 +2548,7 @@ export async function handleAdminRemoveUserModelGrant(
 //   POST   /api/admin/egress-proxies              create (label + url + status?, notes?)
 //   GET    /api/admin/egress-proxies/:id          get one (URL masked)
 //   PATCH  /api/admin/egress-proxies/:id          patch label/url/status/notes
-//   DELETE /api/admin/egress-proxies/:id          delete (ON DELETE SET NULL 自动 unbind)
+//   DELETE /api/admin/egress-proxies/:id          delete; 被绑账号 → 409 PROXY_IN_USE (0055)
 //
 // 鉴权:读 requireAdmin,写 requireAdminVerifyDb(同 accounts 模块)。
 // 返回 url_masked 而非明文/密文(决策 R 安全规约)。
@@ -2728,10 +2710,21 @@ export async function handleAdminDeleteEgressProxy(
   const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const id = extractTailId(url, "/api/admin/egress-proxies/");
-  const { deleteEgressProxy } = await import("../admin/egressProxies.js");
-  const out = await deleteEgressProxy(id, {
-    adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
-  });
-  if (!out.deleted) throw new HttpError(404, "NOT_FOUND", "egress proxy not found");
-  sendJson(res, 200, { deleted: true, unbound_account_count: out.unbound_account_count });
+  const { deleteEgressProxy, EgressProxyInUseError } = await import("../admin/egressProxies.js");
+  try {
+    const out = await deleteEgressProxy(id, {
+      adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
+    });
+    if (!out.deleted) throw new HttpError(404, "NOT_FOUND", "egress proxy not found");
+    sendJson(res, 200, { deleted: true });
+  } catch (err) {
+    if (err instanceof EgressProxyInUseError) {
+      // 0055 — admin 必须先把绑定的账号迁到其他池条目再删。
+      // issues 字段把绑定数 surface 到前端 toast,避免 admin 盲目重试。
+      throw new HttpError(409, err.code, err.message, {
+        issues: [{ path: "bound_account_count", message: String(err.boundAccountCount) }],
+      });
+    }
+    throw err;
+  }
 }

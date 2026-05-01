@@ -35,7 +35,7 @@ describe("createAccount — 预校验在 DB 之前拦截", () => {
   test("非法 plan → TypeError(不触 DB)", async () => {
     await assert.rejects(
       createAccount(
-        { label: "x", plan: "FREE" as unknown as "pro", token: "t" },
+        { label: "x", plan: "FREE" as unknown as "pro", token: "t", egress_proxy_id: "1" },
         keyFn,
       ),
       TypeError,
@@ -44,7 +44,7 @@ describe("createAccount — 预校验在 DB 之前拦截", () => {
 
   test("空 token → TypeError", async () => {
     await assert.rejects(
-      createAccount({ label: "x", plan: "pro", token: "" }, keyFn),
+      createAccount({ label: "x", plan: "pro", token: "", egress_proxy_id: "1" }, keyFn),
       TypeError,
     );
   });
@@ -52,7 +52,7 @@ describe("createAccount — 预校验在 DB 之前拦截", () => {
   test("非字符串 token → TypeError", async () => {
     await assert.rejects(
       createAccount(
-        { label: "x", plan: "pro", token: 42 as unknown as string },
+        { label: "x", plan: "pro", token: 42 as unknown as string, egress_proxy_id: "1" },
         keyFn,
       ),
       TypeError,
@@ -61,7 +61,7 @@ describe("createAccount — 预校验在 DB 之前拦截", () => {
 
   test("空字符串 refresh → TypeError", async () => {
     await assert.rejects(
-      createAccount({ label: "x", plan: "pro", token: "t", refresh: "" }, keyFn),
+      createAccount({ label: "x", plan: "pro", token: "t", refresh: "", egress_proxy_id: "1" }, keyFn),
       TypeError,
     );
   });
