@@ -19,11 +19,13 @@ import { dirname, join } from 'node:path'
  *                   $CODEX_HOME/auth.json -> /run/oc/codex-auth/auth.json)
  *   ─────────────
  *     /var/lib/openclaude-v3/codex-container-auth/auth.json
- *     STRIPPED schema — no refresh_token, no id_token.
- *     chown CODEX_CONTAINER_AUTH_UID, mode 0400.
- *     Codex CLI inside the container can read access_token + auth_mode +
- *     account_id (enough to make API calls) but cannot self-refresh
- *     (no refresh_token) and cannot write back (ro mount).
+ *     External-token schema (codex 0.125 strict): `auth_mode:
+ *     "chatgptAuthTokens"`, empty `refresh_token`, JWT-shaped `id_token`
+ *     (we reuse access_token to satisfy the JWT shape, mirroring codex's
+ *     own `from_external_tokens` pattern). chown CODEX_CONTAINER_AUTH_UID,
+ *     mode 0400. Codex CLI inside the container has no real refresh token
+ *     and cannot self-refresh; the host-side G2 refresh actor is the
+ *     single refresh writer.
  *
  * Two write paths into syncCodexAuthFiles():
  *   - Callback (boss just OAuth'd via the OpenClaude UI): force-write.
@@ -117,7 +119,18 @@ export function decideCodexAuthWrite(args: {
     }
   }
 
-  let idToken = ''
+  // id_token policy:
+  //   - same-account preserve: keep prior real id_token (from a real
+  //     `codex login`) verbatim — most accurate identity material.
+  //   - fresh-write fallback (no prev / different account / unparseable):
+  //     write `access_token` instead of `''`. codex 0.125 strictly
+  //     deserializes id_token via `parse_chatgpt_jwt_claims`/
+  //     `decode_jwt_payload` which requires JWT shape (3 non-empty
+  //     dot-separated parts); empty string fails deserialize, breaking
+  //     the whole auth file. access_token IS JWT-shaped and carries the
+  //     same chatgpt_account_id claim. This matches codex's own
+  //     `from_external_tokens` pattern.
+  let idToken = args.oauth.accessToken
   const prevAccountId =
     typeof prev?.tokens?.account_id === 'string' ? (prev.tokens.account_id as string) : ''
   const prevIdToken =
@@ -146,28 +159,34 @@ export function decideCodexAuthWrite(args: {
 }
 
 /**
- * Build the STRIPPED variant for the container file.
+ * Build the external-token variant for the container file (legacy
+ * fallback path: NULL-codex_account_id containers, see v3supervisor).
  *
- * Schema: same shape codex CLI expects, but `refresh_token` and `id_token`
- * are removed entirely (NOT empty-string'd) — codex inside the container
- * has no way to self-refresh and cannot leak refresh_token via filesystem
- * exfil even if the container is compromised.
+ * Schema (codex 0.125 strict deserialize): no real refresh token;
+ * `refresh_token` MUST be present as empty string (the field has no
+ * `#[serde(default)]`), `id_token` MUST be JWT-shaped (we reuse
+ * `access_token` to satisfy `parse_chatgpt_jwt_claims`/`decode_jwt_payload`,
+ * which decodes but does not verify the JWT). `auth_mode` is
+ * `"chatgptAuthTokens"` — codex's external-host-app token mode, mirroring
+ * its own `from_external_tokens` pattern (`login/src/auth/manager.rs`).
  *
- * The serialized output MUST NOT contain the substring "refresh_token";
- * tests assert this directly on the returned string.
+ * Codex inside the container has no way to self-refresh; the host-side
+ * gateway/G2 actor is the single refresh writer. The serialized file MUST
+ * NOT contain the actual real refresh_token VALUE — tests assert this on
+ * the returned string (defense against accidental leakage).
  */
 export function buildContainerVariantContent(args: {
   oauth: CodexOAuthInput
   nowIso: string
 }): string {
   const accountId = extractChatGptAccountId(args.oauth.accessToken) ?? ''
-  // Note: keys are intentionally only access_token + account_id under
-  // tokens. No id_token, no refresh_token. JSON.stringify drops undefined.
   return JSON.stringify({
     OPENAI_API_KEY: null,
-    auth_mode: 'chatgpt',
+    auth_mode: 'chatgptAuthTokens',
     tokens: {
+      id_token: args.oauth.accessToken,
       access_token: args.oauth.accessToken,
+      refresh_token: '',
       account_id: accountId,
     },
     last_refresh: args.nowIso,

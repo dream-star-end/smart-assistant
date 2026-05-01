@@ -4,8 +4,8 @@
  * The token's payload (second JWT segment) carries an
  * `https://api.openai.com/auth.chatgpt_account_id` claim. Returns `null`
  * on any parse failure — callers should still write the file with an
- * empty account_id since `auth_mode: chatgpt` + valid access_token is the
- * load-bearing part for codex CLI.
+ * empty account_id since `auth_mode: chatgptAuthTokens` + valid access_token
+ * is the load-bearing part for codex CLI.
  *
  * Mirrors the same-named function in
  * `packages/gateway/src/codexAuthSync.ts:extractChatGptAccountId` — kept

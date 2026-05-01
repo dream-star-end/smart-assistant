@@ -13,11 +13,16 @@
  * `config.auth.codexOAuth` and is preserved untouched for backward
  * compatibility with NULL-codex_account_id containers.
  *
- * **Container variant strips `refresh_token`**: only access_token (+ auth_mode
- * "chatgpt" + account_id) is written. The codex CLI inside the container has
- * no refresh_token so it cannot self-refresh — the commercial-side refresh
- * actor (G2) is the single source of truth, preventing rotate races between
- * a container and the gateway/actor.
+ * **Container variant**: no real refresh token; codex 0.125's external-token
+ * schema requires the file to deserialize cleanly, which means an empty
+ * `refresh_token` string (must be present, not omitted) and a JWT-shaped
+ * `id_token`. We satisfy the JWT shape by reusing `access_token` for
+ * `id_token` — codex CLI in `chatgptAuthTokens` mode uses `id_token` only
+ * to decode (not verify) the chatgpt_account_id claim, and access_token
+ * carries the same claim. This mirrors codex's own `from_external_tokens`
+ * pattern (`login/src/auth/manager.rs`). The commercial-side refresh actor
+ * (G2) is the single refresh writer on the host — containers cannot
+ * self-refresh, preventing rotate races between a container and the actor.
  *
  * **Atomic write protocol** (matches plan M2 invariant):
  *   1. mkdir parent dir 0o755 (so container agent uid 1000 can enter)
@@ -89,6 +94,40 @@ function resolveAuthPath(rootDir: string, containerId: string): {
 }
 
 /**
+ * Build the per-container `auth.json` JSON body. Pure function — kept
+ * exported so unit tests can assert the schema directly without mocking
+ * filesystem IO.
+ *
+ * Schema notes (codex 0.125 `AuthDotJson` strict deserialize):
+ * - `auth_mode: "chatgptAuthTokens"` — the external-host-app token mode
+ *   (matches codex's own `ApiAuthMode::ChatgptAuthTokens` rendering).
+ * - `tokens.id_token`: must be JWT-shaped; we reuse `access_token` to
+ *   satisfy `parse_chatgpt_jwt_claims`/`decode_jwt_payload`.
+ * - `tokens.refresh_token`: required field (no `#[serde(default)]`); we
+ *   write `""` because the host's G2 refresh actor is the only refresher.
+ * - `tokens.account_id`: extracted from access_token JWT; `""` when the
+ *   token is malformed (still produces a structurally complete file —
+ *   codex will reject it in that case, which is no worse than today).
+ */
+export function buildPerContainerAuthJson(args: {
+  accessToken: string;
+  lastRefreshIso: string;
+}): string {
+  const accountId = extractChatGptAccountId(args.accessToken) ?? "";
+  return JSON.stringify({
+    OPENAI_API_KEY: null,
+    auth_mode: "chatgptAuthTokens",
+    tokens: {
+      id_token: args.accessToken,
+      access_token: args.accessToken,
+      refresh_token: "",
+      account_id: accountId,
+    },
+    last_refresh: args.lastRefreshIso,
+  });
+}
+
+/**
  * Write the per-container `auth.json` atomically.
  *
  * **Throws** on any IO failure — caller is expected to catch and rollback
@@ -98,25 +137,13 @@ export async function writeCodexContainerAuthFile(
   opts: WriteCodexContainerAuthFileOptions,
 ): Promise<WriteCodexContainerAuthFileResult> {
   const { parentDir, filePath } = resolveAuthPath(opts.rootDir, opts.containerId);
-  const accountId = extractChatGptAccountId(opts.auth.accessToken) ?? "";
 
   // Parent must allow agent uid to enter (0o755 owner=root rwx, others=r-x).
   await mkdir(parentDir, { recursive: true, mode: 0o755 });
 
-  // Container variant: NO refresh_token. id_token empty (not preserved across
-  // accounts — different codex accounts may have different identities, and
-  // chatgpt auth_mode tolerates empty id_token because the access_token
-  // carries identity).
-  const content = JSON.stringify({
-    OPENAI_API_KEY: null,
-    auth_mode: "chatgpt",
-    tokens: {
-      id_token: "",
-      access_token: opts.auth.accessToken,
-      refresh_token: "",
-      account_id: accountId,
-    },
-    last_refresh: opts.auth.lastRefreshIso,
+  const content = buildPerContainerAuthJson({
+    accessToken: opts.auth.accessToken,
+    lastRefreshIso: opts.auth.lastRefreshIso,
   });
 
   const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${randomBytes(6).toString("hex")}`;

@@ -58,7 +58,7 @@ describe('decideCodexAuthWrite — callback path (force-write, master file)', ()
     nowIso: '2026-04-29T08:00:00Z',
   }
 
-  it('writes a fresh file when no previous file exists', () => {
+  it('writes a fresh file when no previous file exists (fresh-write fallback uses access_token as id_token)', () => {
     const decision = decideCodexAuthWrite({ ...baseArgs, previousFileText: null })
     assert.equal(decision.action, 'write')
     if (decision.action !== 'write') return
@@ -68,7 +68,9 @@ describe('decideCodexAuthWrite — callback path (force-write, master file)', ()
     assert.equal(parsed.tokens.access_token, baseArgs.oauth.accessToken)
     assert.equal(parsed.tokens.refresh_token, 'rt_new')
     assert.equal(parsed.tokens.account_id, 'new-account')
-    assert.equal(parsed.tokens.id_token, '')
+    // fresh-write: id_token MUST be JWT-shaped (codex 0.125 strict
+    // deserialize); we reuse access_token, never empty string.
+    assert.equal(parsed.tokens.id_token, baseArgs.oauth.accessToken)
     assert.equal(parsed.last_refresh, '2026-04-29T08:00:00Z')
   })
 
@@ -89,7 +91,7 @@ describe('decideCodexAuthWrite — callback path (force-write, master file)', ()
     assert.equal(parsed.tokens.id_token, 'old-id-token')
   })
 
-  it('drops prior id_token when previous file is a DIFFERENT account', () => {
+  it('drops prior id_token when previous file is a DIFFERENT account (fallback to access_token)', () => {
     const prev = JSON.stringify({
       auth_mode: 'chatgpt',
       tokens: { id_token: 'old-id-token', refresh_token: 'rt_old', account_id: 'OTHER-account' },
@@ -98,15 +100,17 @@ describe('decideCodexAuthWrite — callback path (force-write, master file)', ()
     assert.equal(decision.action, 'write')
     if (decision.action !== 'write') return
     const parsed = JSON.parse(decision.content)
-    assert.equal(parsed.tokens.id_token, '')
+    // Different account → don't preserve old id_token (could mismatch);
+    // fall back to access_token (JWT-shaped, codex 0.125 deserialize-safe).
+    assert.equal(parsed.tokens.id_token, baseArgs.oauth.accessToken)
   })
 
-  it('treats unparseable previous file as no previous file', () => {
+  it('treats unparseable previous file as no previous file (fallback to access_token)', () => {
     const decision = decideCodexAuthWrite({ ...baseArgs, previousFileText: 'not json' })
     assert.equal(decision.action, 'write')
     if (decision.action !== 'write') return
     const parsed = JSON.parse(decision.content)
-    assert.equal(parsed.tokens.id_token, '')
+    assert.equal(parsed.tokens.id_token, baseArgs.oauth.accessToken)
   })
 
   it('writes account_id="" but still writes when JWT is malformed', () => {
@@ -193,50 +197,43 @@ describe('decideCodexAuthWrite — refresh path (ownership check, master file)',
   })
 })
 
-describe('buildContainerVariantContent — stripped variant for container mount', () => {
+describe('buildContainerVariantContent — external-token variant for container mount', () => {
   const oauth = { accessToken: tokenForAccount('container-account'), refreshToken: 'rt_secret' }
   const nowIso = '2026-04-30T10:00:00Z'
 
-  it('serialized output has the load-bearing fields for codex CLI', () => {
+  it('serialized output matches codex 0.125 external-token schema', () => {
     const content = buildContainerVariantContent({ oauth, nowIso })
     const parsed = JSON.parse(content)
-    assert.equal(parsed.auth_mode, 'chatgpt')
+    assert.equal(parsed.auth_mode, 'chatgptAuthTokens')
     assert.equal(parsed.OPENAI_API_KEY, null)
     assert.equal(parsed.tokens.access_token, oauth.accessToken)
     assert.equal(parsed.tokens.account_id, 'container-account')
     assert.equal(parsed.last_refresh, nowIso)
   })
 
-  it('STRONG: serialized string MUST NOT contain "refresh_token" anywhere', () => {
+  it('id_token reuses access_token (JWT-shaped; codex 0.125 strict deserialize)', () => {
     const content = buildContainerVariantContent({ oauth, nowIso })
-    // Substring check — defense against future code paths that might
-    // re-introduce the field (e.g. via Object spread / template tweaks).
-    assert.equal(
-      content.includes('refresh_token'),
-      false,
-      `container variant must not include refresh_token; got: ${content}`,
-    )
+    const parsed = JSON.parse(content)
+    assert.equal(parsed.tokens.id_token, oauth.accessToken)
+    // JWT shape: 3 non-empty dot-separated parts.
+    const parts = String(parsed.tokens.id_token).split('.')
+    assert.equal(parts.length, 3)
+    for (const p of parts) assert.notEqual(p, '')
   })
 
-  it('STRONG: serialized string MUST NOT contain the actual refresh_token value', () => {
+  it('refresh_token is present as empty string (required field, no real refresh writer in container)', () => {
+    const content = buildContainerVariantContent({ oauth, nowIso })
+    const parsed = JSON.parse(content)
+    assert.equal('refresh_token' in parsed.tokens, true)
+    assert.equal(parsed.tokens.refresh_token, '')
+  })
+
+  it('STRONG: serialized string MUST NOT contain the real refresh_token VALUE (leak defense)', () => {
     const content = buildContainerVariantContent({ oauth, nowIso })
     assert.equal(content.includes('rt_secret'), false)
   })
 
-  it('STRONG: parsed object has no `refresh_token` key at any level', () => {
-    const content = buildContainerVariantContent({ oauth, nowIso })
-    const parsed = JSON.parse(content)
-    assert.equal('refresh_token' in parsed.tokens, false)
-    assert.equal('refresh_token' in parsed, false)
-  })
-
-  it('STRONG: parsed object has no `id_token` key (container side does not need it)', () => {
-    const content = buildContainerVariantContent({ oauth, nowIso })
-    const parsed = JSON.parse(content)
-    assert.equal('id_token' in parsed.tokens, false)
-  })
-
-  it('still writes account_id="" when JWT is malformed', () => {
+  it('malformed JWT: still produces a structurally complete file (does not leak refresh_token); codex 0.125 will reject deserialization on the JWT shape, so functional GPT in container is not guaranteed in this branch — this test only enforces shape integrity', () => {
     const content = buildContainerVariantContent({
       oauth: { accessToken: 'malformed', refreshToken: 'rt' },
       nowIso,
@@ -244,7 +241,9 @@ describe('buildContainerVariantContent — stripped variant for container mount'
     const parsed = JSON.parse(content)
     assert.equal(parsed.tokens.account_id, '')
     assert.equal(parsed.tokens.access_token, 'malformed')
-    // and still must not contain refresh_token
-    assert.equal(content.includes('refresh_token'), false)
+    assert.equal(parsed.tokens.id_token, 'malformed')
+    assert.equal(parsed.tokens.refresh_token, '')
+    // and still must not contain the real refresh_token VALUE
+    assert.equal(content.includes('"rt"'), false)
   })
 })
