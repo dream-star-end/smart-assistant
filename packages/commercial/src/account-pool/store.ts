@@ -35,9 +35,25 @@ export type AccountPlan = (typeof ACCOUNT_PLANS)[number];
 export const ACCOUNT_STATUSES = ["active", "cooldown", "disabled", "banned"] as const;
 export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
 
+/**
+ * V3 account provider — claude (claude.ai OAuth) or codex (auth.openai.com OAuth).
+ *
+ * 决定 OAuth 流程、scheduler 分区、容器内 auth 写法。`provider` 在 create 后
+ * 不可改(admin layer 拒 PATCH provider,见 decision R)。
+ *
+ * 默认值('claude'):
+ *   - 存量 claude_accounts 行通过 0051 migration DEFAULT 自动 backfill
+ *   - 所有不传 provider 的调用方(scheduler.pick / listAccounts / createAccount)
+ *     默认按 'claude' 走,与 v2 行为一致
+ */
+export const ACCOUNT_PROVIDERS = ["claude", "codex"] as const;
+export type AccountProvider = (typeof ACCOUNT_PROVIDERS)[number];
+
 /** 不含任何加密 / nonce 列的账号元信息 —— 安全打 log / 返 admin UI。 */
 export interface AccountRow {
   id: bigint;
+  /** V3 provider:claude / codex(0051 migration 加,默认 'claude')。 */
+  provider: AccountProvider;
   label: string;
   plan: AccountPlan;
   status: AccountStatus;
@@ -65,6 +81,13 @@ export interface AccountRow {
    * 由 chat orchestrator 构造 undici ProxyAgent 注入到 fetch dispatcher。
    */
   egress_proxy: string | null;
+  /**
+   * 0053 — 引用代理池(0052 egress_proxies)的 entry id。
+   * NULL = 未绑代理池,回落到 raw `egress_proxy` 文本列;非 NULL 时 HTTP 层
+   * 互斥校验拒绝同时设 raw `egress_proxy`(decision R)。
+   * 运行时 getTokenForUse 优先用 pool URL;codex 路径本 PR 不接(decision U)。
+   */
+  egress_proxy_id: bigint | null;
   /**
    * 0038 — 自动分配的 compute_host id(UUID 字符串)。
    * NULL = 未分配,走 master 默认出口或 admin 手填的 egress_proxy。
@@ -125,11 +148,21 @@ export interface AccountToken {
 
 export interface CreateAccountInput {
   label: string;
+  /**
+   * V3 provider(默认 'claude' 与 v2 行为一致)。
+   * provider='codex' 必须有 refresh_token(refresh actor 依赖,plan 决策 Q);
+   * 校验在 admin layer (account-pool/admin.ts) 实施,store 层不强制以保留灵活性。
+   */
+  provider?: AccountProvider;
   plan: AccountPlan;
   token: string;
   refresh?: string | null;
   expires_at?: Date | null;
   egress_proxy?: string | null;
+  /**
+   * 0053 引入。create 时 admin layer 校验互斥与存在性;store 层只做 INSERT。
+   */
+  egress_proxy_id?: bigint | string | null;
 }
 
 /**
@@ -160,6 +193,12 @@ export interface UpdateAccountPatch {
    * undefined = 不变;null = 清空(走本机出口);string = 设/换代理 URL。
    */
   egress_proxy?: string | null;
+  /**
+   * 0053 引入。undefined = 不变;null = 解绑代理池;bigint/string = 绑指定 entry。
+   * provider 不在 patch — admin layer 显式拒绝 PATCH provider(decision R)。
+   * 互斥与 entry 存在性校验在 admin layer。
+   */
+  egress_proxy_id?: bigint | string | null;
 }
 
 export class AccountNotFoundError extends Error {
@@ -175,6 +214,7 @@ export { AeadError } from "../crypto/aead.js";
 /** 可重用的列清单 —— 明确不含 *_enc / *_nonce。 */
 const META_COLUMNS = `
   id::text AS id,
+  provider,
   label,
   plan,
   status,
@@ -192,6 +232,7 @@ const META_COLUMNS = `
   quota_7d_resets_at,
   quota_updated_at,
   egress_proxy,
+  egress_proxy_id::text AS egress_proxy_id,
   egress_host_uuid::text AS egress_host_uuid,
   (oauth_refresh_enc IS NOT NULL AND oauth_refresh_nonce IS NOT NULL) AS has_refresh_token,
   created_at,
@@ -200,6 +241,7 @@ const META_COLUMNS = `
 
 interface RawMetaRow extends QueryResultRow {
   id: string;
+  provider: AccountProvider;
   label: string;
   plan: AccountPlan;
   status: AccountStatus;
@@ -217,6 +259,7 @@ interface RawMetaRow extends QueryResultRow {
   quota_7d_resets_at: Date | null;
   quota_updated_at: Date | null;
   egress_proxy: string | null;
+  egress_proxy_id: string | null;
   egress_host_uuid: string | null;
   has_refresh_token: boolean;
   created_at: Date;
@@ -238,6 +281,10 @@ interface RawSecretRow extends QueryResultRow {
   egress_host_fp: string | null;
   egress_host_psk_nonce: Buffer | null;
   egress_host_psk_ct: Buffer | null;
+  // 0052/0053 — JOIN egress_proxies 拿 pool URL 密文。LEFT JOIN + status='active'
+  // 才落地;NULL 表示账号没绑代理池或绑的 entry 已 disabled(等同未绑)。
+  pool_url_enc: Buffer | null;
+  pool_url_nonce: Buffer | null;
 }
 
 /**
@@ -253,6 +300,7 @@ const EGRESS_FORWARD_PROXY_PORT = 9444;
 function parseMetaRow(row: RawMetaRow): AccountRow {
   return {
     id: BigInt(row.id),
+    provider: row.provider,
     label: row.label,
     plan: row.plan,
     status: row.status,
@@ -270,6 +318,7 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     quota_7d_resets_at: row.quota_7d_resets_at,
     quota_updated_at: row.quota_updated_at,
     egress_proxy: row.egress_proxy,
+    egress_proxy_id: row.egress_proxy_id !== null ? BigInt(row.egress_proxy_id) : null,
     egress_host_uuid: row.egress_host_uuid,
     has_refresh_token: row.has_refresh_token,
     created_at: row.created_at,
@@ -305,6 +354,10 @@ export async function createAccount(
   input: CreateAccountInput,
   keyFn: () => Buffer = loadKmsKey,
 ): Promise<AccountRow> {
+  const provider: AccountProvider = input.provider ?? "claude";
+  if (!ACCOUNT_PROVIDERS.includes(provider)) {
+    throw new TypeError(`invalid provider: ${String(input.provider)}`);
+  }
   if (!ACCOUNT_PLANS.includes(input.plan)) {
     throw new TypeError(`invalid plan: ${input.plan}`);
   }
@@ -335,17 +388,23 @@ export async function createAccount(
       egressProxy = input.egress_proxy;
     }
 
+    let egressProxyId: string | null = null;
+    if (input.egress_proxy_id !== undefined && input.egress_proxy_id !== null) {
+      egressProxyId = String(input.egress_proxy_id);
+    }
+
     const res = await query<RawMetaRow>(
       `INSERT INTO claude_accounts(
-         label, plan,
+         provider, label, plan,
          oauth_token_enc, oauth_nonce,
          oauth_refresh_enc, oauth_refresh_nonce,
          oauth_expires_at,
-         egress_proxy
+         egress_proxy, egress_proxy_id
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING ${META_COLUMNS}`,
       [
+        provider,
         input.label,
         input.plan,
         tok.ciphertext,
@@ -354,6 +413,7 @@ export async function createAccount(
         refNonce,
         input.expires_at ?? null,
         egressProxy,
+        egressProxyId,
       ],
     );
     return parseMetaRow(res.rows[0]);
@@ -375,6 +435,11 @@ export async function getAccount(id: bigint | string): Promise<AccountRow | null
 export interface ListAccountsOptions {
   /** 仅返这些状态(不传 = 所有) */
   status?: AccountStatus | AccountStatus[];
+  /**
+   * 仅返这些 provider(不传 = 所有,等价 ['claude','codex'])。
+   * V3 Phase 2 admin UI 默认按 provider tab 切换 list。
+   */
+  provider?: AccountProvider | AccountProvider[];
   /** 默认 100,最大 500 —— 防止无界扫描 */
   limit?: number;
   offset?: number;
@@ -394,6 +459,13 @@ export async function listAccounts(
     if (arr.length > 0) {
       params.push(arr);
       whereParts.push(`status = ANY($${params.length}::text[])`);
+    }
+  }
+  if (opts.provider !== undefined) {
+    const arr = Array.isArray(opts.provider) ? opts.provider : [opts.provider];
+    if (arr.length > 0) {
+      params.push(arr);
+      whereParts.push(`provider = ANY($${params.length}::text[])`);
     }
   }
   const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
@@ -436,6 +508,14 @@ export async function getTokenForUse(
   //
   //   - egress_proxy_endpoint 不解析 host:port,master 端用 ch.host + 固定 9444 构造
   //     EgressTarget;endpoint 列只是探活成败的 marker。
+  //
+  // 0052/0053 — LEFT JOIN egress_proxies(代理池):
+  //   - egress_proxy_id IS NOT NULL 且 entry status='active' → 拿 url_enc/url_nonce,
+  //     decrypt 后**覆盖** legacy a.egress_proxy 列(优先级:池 > raw 列)
+  //   - egress_proxy_id IS NULL / entry status='disabled' / entry 被删 →
+  //     ep.* 字段全 NULL,落到 a.egress_proxy(legacy raw 列)。意味着 disabled
+  //     的 proxy 对已绑账号 = 视作未绑(等同 master 默认出口),与
+  //     getEgressProxyUrlPlaintext() 语义一致(disabled → 不可用)。
   const res = await query<RawSecretRow>(
     `SELECT a.id::text AS id, a.plan,
        a.oauth_token_enc, a.oauth_nonce,
@@ -446,7 +526,9 @@ export async function getTokenForUse(
        ch.host                              AS egress_host,
        ch.agent_cert_fingerprint_sha256     AS egress_host_fp,
        ch.agent_psk_nonce                   AS egress_host_psk_nonce,
-       ch.agent_psk_ct                      AS egress_host_psk_ct
+       ch.agent_psk_ct                      AS egress_host_psk_ct,
+       ep.url_enc                           AS pool_url_enc,
+       ep.url_nonce                         AS pool_url_nonce
      FROM claude_accounts a
      LEFT JOIN compute_hosts ch
        ON ch.id = a.egress_host_uuid
@@ -455,6 +537,9 @@ export async function getTokenForUse(
        AND ch.agent_cert_fingerprint_sha256 IS NOT NULL
        AND octet_length(ch.agent_psk_nonce) > 0
        AND octet_length(ch.agent_psk_ct)    > 0
+     LEFT JOIN egress_proxies ep
+       ON ep.id = a.egress_proxy_id
+       AND ep.status = 'active'
      WHERE a.id = $1`,
     [String(id)],
   );
@@ -489,13 +574,25 @@ export async function getTokenForUse(
         pskCt: row.egress_host_psk_ct,
       };
     }
+    // 0052/0053 — 代理池 URL 解密。LEFT JOIN 命中(active entry)→ 用池 URL 覆盖
+    // legacy a.egress_proxy 列。disabled entry 的 url_enc/url_nonce 已被 SQL
+    // status='active' filter 拦掉(返 NULL),自动 fallback 到 row.egress_proxy。
+    let resolvedEgressProxy: string | null = row.egress_proxy;
+    if (row.pool_url_enc !== null && row.pool_url_nonce !== null) {
+      const poolUrlBuf = decryptToBuffer(row.pool_url_enc, row.pool_url_nonce, key);
+      try {
+        resolvedEgressProxy = poolUrlBuf.toString("utf8");
+      } finally {
+        zeroBuffer(poolUrlBuf);
+      }
+    }
     const out: AccountToken = {
       id: BigInt(row.id),
       plan: row.plan,
       token,
       refresh,
       expires_at: row.oauth_expires_at,
-      egress_proxy: row.egress_proxy,
+      egress_proxy: resolvedEgressProxy,
       egress_target: egressTarget,
     };
     // 成功路径:token/refresh 交给调用方,不在 finally 清零
@@ -567,6 +664,9 @@ export async function updateAccount(
       push("egress_proxy", patch.egress_proxy);
     }
   }
+  if (patch.egress_proxy_id !== undefined) {
+    push("egress_proxy_id", patch.egress_proxy_id === null ? null : String(patch.egress_proxy_id));
+  }
 
   let key: Buffer | null = null;
   try {
@@ -630,4 +730,86 @@ export async function deleteAccount(id: bigint | string): Promise<boolean> {
     [String(id)],
   );
   return (res.rowCount ?? 0) > 0;
+}
+
+/**
+ * Codex 账号 token 快照 —— 仅供 v3 codex provision / refresh actor / lazy migrate 使用。
+ *
+ * 与 `getTokenForUse` 的区别:
+ *   - 不接 inflight / health(provision 不是真实 API 调用,refresh actor 也不算 turn)
+ *   - 不解析 egress_target / egress_proxy(codex 容器内 CLI 直连 OpenAI,
+ *     egress 暂不进容器运行时,见 plan 决策 U)
+ *   - 加 provider 校验:非 codex 账号 → 抛错(防误用 claude 账号)
+ *
+ * **token / refresh Buffer 调用方用完必须 .fill(0)**(同 getTokenForUse 契约)。
+ *
+ * @returns null 若账号不存在
+ * @throws TypeError 若账号 provider !== 'codex'(防 claude 账号误进 codex 路径)
+ * @throws AeadError 若密文损坏(调用方应视为账号损坏,触发 disable + 告警)
+ */
+export interface CodexTokenSnapshot {
+  id: bigint;
+  /** 解密后的 OAuth access token —— **调用方用完必须 .fill(0)** */
+  token: Buffer;
+  /** 解密后的 refresh token —— Phase 1 codex 账号必有,但 Phase 2 active 状态可能缺;**调用方用完必须 .fill(0)** */
+  refresh: Buffer | null;
+  expires_at: Date | null;
+}
+
+interface RawCodexSecretRow extends QueryResultRow {
+  id: string;
+  provider: AccountProvider;
+  oauth_token_enc: Buffer;
+  oauth_nonce: Buffer;
+  oauth_refresh_enc: Buffer | null;
+  oauth_refresh_nonce: Buffer | null;
+  oauth_expires_at: Date | null;
+}
+
+export async function getCodexTokenSnapshot(
+  id: bigint | string,
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<CodexTokenSnapshot | null> {
+  const res = await query<RawCodexSecretRow>(
+    `SELECT id::text AS id, provider,
+       oauth_token_enc, oauth_nonce,
+       oauth_refresh_enc, oauth_refresh_nonce,
+       oauth_expires_at
+     FROM claude_accounts
+     WHERE id = $1`,
+    [String(id)],
+  );
+  if (res.rows.length === 0) return null;
+  const row = res.rows[0];
+  if (row.provider !== "codex") {
+    throw new TypeError(
+      `getCodexTokenSnapshot called on non-codex account ${String(id)} (provider=${row.provider})`,
+    );
+  }
+
+  const key = keyFn();
+  let token: Buffer | null = null;
+  let refresh: Buffer | null = null;
+  try {
+    token = decryptToBuffer(row.oauth_token_enc, row.oauth_nonce, key);
+    if (row.oauth_refresh_enc && row.oauth_refresh_nonce) {
+      refresh = decryptToBuffer(row.oauth_refresh_enc, row.oauth_refresh_nonce, key);
+    }
+    const out: CodexTokenSnapshot = {
+      id: BigInt(row.id),
+      token,
+      refresh,
+      expires_at: row.oauth_expires_at,
+    };
+    // 成功路径:token/refresh 交给调用方,不在 finally 清零
+    token = null;
+    refresh = null;
+    return out;
+  } catch (err) {
+    if (token) zeroBuffer(token);
+    if (refresh) zeroBuffer(refresh);
+    throw err instanceof AeadError ? err : new AeadError("decryption failed", { cause: err });
+  } finally {
+    zeroBuffer(key);
+  }
 }

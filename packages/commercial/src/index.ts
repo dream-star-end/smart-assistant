@@ -33,8 +33,15 @@ import { secretToKey } from "./auth/jwt.js";
 import { PricingCache } from "./billing/pricing.js";
 import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
-import { AccountScheduler } from "./account-pool/scheduler.js";
+import {
+  AccountScheduler,
+  pickCodexAccountForBinding,
+} from "./account-pool/scheduler.js";
+import { getCodexTokenSnapshot } from "./account-pool/store.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
+import { writeCodexContainerAuthFile } from "./codex-auth/codexAuthFile.js";
+import { zeroBuffer } from "./crypto/keys.js";
+import { tx } from "./db/queries.js";
 import { createAgentWsHandler, type AgentWsHandler } from "./ws/agent.js";
 import {
   startLifecycleScheduler,
@@ -48,6 +55,14 @@ import {
   startRefreshEventsSweeper,
   type SweeperHandle as RefreshEventsSweeperHandle,
 } from "./account-pool/refreshEventsSweeper.js";
+import {
+  startCodexRefreshActor,
+  type CodexRefreshActorHandle,
+} from "./account-pool/codexAccountActor.js";
+import {
+  DEFAULT_V3_CODEX_CONTAINER_DIR,
+} from "./agent-sandbox/v3supervisor.js";
+import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
 import {
   startPendingOrdersExpirer,
   type SweeperHandle as PendingOrdersExpirerHandle,
@@ -64,6 +79,7 @@ import {
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
   type BridgeMetricSink,
+  type CodexBindingHandle,
 } from "./ws/userChatBridge.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
@@ -1093,6 +1109,105 @@ export async function registerCommercial(
   const markActivityForBridge = v3Deps
     ? (cid: number) => { void markV3ContainerActivity(v3Deps!, cid); }
     : undefined;
+
+  // plan v3 G5/G7 — codex per-account 并发槽 + lazy migrate handle。
+  //   - acquire(containerId):FOR UPDATE 锁 agent_containers row + LEFT JOIN claude_accounts
+  //     看绑定账号状态:
+  //       * codex_account_id IS NULL → 返回 null(legacy 容器,mount immutable,决策 N3)
+  //       * 已 active → tx 不写,返回 account_id;tx 提交后(无写)再 acquireCodexSlot
+  //       * 非 active(disabled / quarantined)→ pickCodexAccountForBinding 重选 →
+  //         getCodexTokenSnapshot → writeCodexContainerAuthFile 原子写 → UPDATE
+  //         codex_account_id;tx 提交后再 acquireCodexSlot(失败 → bridge fast-fail,
+  //         migrate 已落盘永久不回滚:下次重连 active 路径直接走 happy 分支)
+  //   - acquireCodexSlot 在 tx **外**调,避免 commit 失败造成的 in-process slot 永久泄漏:
+  //     已经持有 slot 但 UPDATE 回滚 → 调用方拿到错误 → bridge.acquiredCodexAccountId
+  //     未被赋值 → cleanup() 与 G6 timer 都不知道哪个 account 该 release → 永久泄漏。
+  //   - release(account_id):dec inflight,幂等。
+  //   - v3Deps 未注入(测试 / 早期 boot 路径)→ codexBinding=undefined,bridge 退化为不做并发管控
+  const codexBinding: CodexBindingHandle | undefined = v3Deps
+    ? {
+        async acquire(containerId: number) {
+          // tx 内做"锁 + 查 + 可能 lazy migrate";acquire slot 在 tx 外
+          const result = await tx<{ account_id: bigint } | null>(async (client) => {
+            const lookup = await client.query<{
+              account_id: string | null;
+              account_status: string | null;
+            }>(
+              `SELECT ac.codex_account_id::text AS account_id,
+                      ca.status AS account_status
+               FROM agent_containers ac
+               LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
+               WHERE ac.id = $1
+               FOR UPDATE OF ac`,
+              [containerId],
+            );
+            if (lookup.rows.length === 0) {
+              // 容器在 acquire 前刚被删了 — 当 legacy 透传(下游 sendToContainer 必失败,
+              // 错误从那条路径返回给前端,与本桥状态一致)
+              return null;
+            }
+            const row = lookup.rows[0];
+            if (row.account_id === null) {
+              // 决策 N3:legacy NULL 容器永远不进 acquire / lazy migrate 路径
+              return null;
+            }
+            if (row.account_status === "active") {
+              return { account_id: BigInt(row.account_id) };
+            }
+            // disabled / quarantined / 任意非 active → lazy migrate
+            const picked = await pickCodexAccountForBinding(String(containerId), {});
+            if (!picked) {
+              throw new Error(
+                `codex pool empty during lazy migrate for container ${containerId}`,
+              );
+            }
+            const codexContainerDir =
+              process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
+            let snap: Awaited<ReturnType<typeof getCodexTokenSnapshot>> = null;
+            try {
+              snap = await getCodexTokenSnapshot(picked.account_id);
+              if (!snap || !snap.token) {
+                throw new Error(
+                  `codex token snapshot missing for account ${String(picked.account_id)}`,
+                );
+              }
+              await writeCodexContainerAuthFile({
+                rootDir: codexContainerDir,
+                containerId: String(containerId),
+                containerUid: V3_AGENT_UID,
+                containerGid: V3_AGENT_GID,
+                auth: {
+                  accessToken: snap.token.toString("utf8"),
+                  lastRefreshIso: new Date().toISOString(),
+                },
+              });
+            } finally {
+              if (snap?.token) zeroBuffer(snap.token);
+              if (snap?.refresh) zeroBuffer(snap.refresh);
+            }
+            // FOR UPDATE 持锁内 UPDATE,COMMIT 时一同落盘。失败 → tx 抛出 → ROLLBACK
+            // (写入的 auth.json 是孤儿,由 stopAndRemoveV3Container / volume gc / 同
+            //  containerId 重 provision 覆盖兜底,与 v3supervisor provision 路径同处理)
+            await client.query(
+              `UPDATE agent_containers
+               SET codex_account_id = $1, updated_at = NOW()
+               WHERE id = $2`,
+              [String(picked.account_id), containerId],
+            );
+            return { account_id: picked.account_id };
+          });
+          if (result === null) return null;
+          // tx 已 commit;现在尝试占 in-process per-account slot。Busy → 抛 AccountPoolBusyError
+          // (bridge 转 CODEX_POOL_BUSY)。lazy migrate 已落盘不会回滚,Busy 只影响本 turn。
+          scheduler.acquireCodexSlot(result.account_id);
+          return result;
+        },
+        release(account_id: bigint): void {
+          try { scheduler.releaseCodexSlot(account_id); } catch { /* */ }
+        },
+      }
+    : undefined;
+
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     resolveContainerEndpoint,
@@ -1121,6 +1236,9 @@ export async function registerCommercial(
       return (modelId: string) =>
         canUseModel({ pricing }, { role, grantedModelIds: grantedSet, modelId });
     },
+    // plan v3 G5/G7 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
+    // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
+    codexBinding,
   });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
   // 扣费事件会实时推到用户前端。
@@ -1145,6 +1263,20 @@ export async function registerCommercial(
   let refreshEventsSweeper: RefreshEventsSweeperHandle | undefined;
   if (process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== "1") {
     refreshEventsSweeper = startRefreshEventsSweeper();
+  }
+
+  // plan G2/G4 — codex token refresh actor(commercial 单进程独占,60s tick,unref)。
+  // 扫 codex 账号 → 提前 15min refresh → 持锁逐容器写 per-container auth.json。
+  // 永不写 master 文件 / legacy 共享 dir。详见 codexAccountActor.ts 头注。
+  let codexRefreshActor: CodexRefreshActorHandle | undefined;
+  if (process.env.COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED !== "1") {
+    const codexContainerDir =
+      process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
+    codexRefreshActor = startCodexRefreshActor({
+      codexContainerDir,
+      containerUid: V3_AGENT_UID,
+      containerGid: V3_AGENT_GID,
+    });
   }
 
   // A1 — pending 订单 expirer(默认 60s tick,部署即 boot 跑一次清历史脏单)。
@@ -1196,6 +1328,9 @@ export async function registerCommercial(
       }
       if (refreshEventsSweeper) {
         try { refreshEventsSweeper.stop(); } catch { /* ignore */ }
+      }
+      if (codexRefreshActor) {
+        try { codexRefreshActor.stop(); } catch { /* ignore */ }
       }
       if (pendingOrdersExpirer) {
         try { pendingOrdersExpirer.stop(); } catch { /* ignore */ }

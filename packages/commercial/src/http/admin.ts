@@ -71,6 +71,7 @@ import {
   adminResetCooldown,
   getAccountRecentUsers,
   maskEgressProxy,
+  AccountHasActiveCodexBindingsError,
   type AdminCreateAccountInput,
   type AdminPatchAccountInput,
 } from "../admin/accounts.js";
@@ -79,9 +80,10 @@ import {
   getAccountsTodayStats,
 } from "../admin/accountsStats.js";
 import {
-  startClaudeOAuth,
-  exchangeClaudeOAuth,
+  startAccountOAuth,
+  exchangeAccountOAuth,
   OAuthExchangeError,
+  type OAuthProvider,
 } from "../admin/oauth.js";
 import {
   listContainers,
@@ -762,9 +764,15 @@ export async function handleAdminPatchPlan(
 // T-60(3/3): accounts / agent-containers / ledger
 // ════════════════════════════════════════════════════════════════════
 
-function serializeAccount(a: AccountRow): Record<string, unknown> {
+function serializeAccount(
+  a: AccountRow,
+  poolLabels?: Map<string, string>,
+): Record<string, unknown> {
+  const epid = a.egress_proxy_id !== null ? a.egress_proxy_id.toString() : null;
   return {
     id: a.id.toString(),
+    /** V3 provider:'claude' | 'codex'(0051)。决定 admin UI tab + 容器内 auth 路径。 */
+    provider: a.provider,
     label: a.label,
     plan: a.plan,
     status: a.status,
@@ -785,6 +793,10 @@ function serializeAccount(a: AccountRow): Record<string, unknown> {
     /** 已 mask 密码,UI 安全显示;明文绝不出库 */
     egress_proxy: maskEgressProxy(a.egress_proxy),
     has_egress_proxy: a.egress_proxy !== null,
+    /** 0053 代理池 entry id(NULL = 走 raw egress_proxy 或本机出口)。 */
+    egress_proxy_id: epid,
+    /** JOIN egress_proxies 查到的池条目 label;前端 UI 直接显示这一行的"代理池"列。 */
+    egress_proxy_pool_label: epid !== null ? (poolLabels?.get(epid) ?? null) : null,
     /** 0038 — 自动分配的 compute_host id;UI 显示绑定状态 + 触发重分配。 */
     egress_host_uuid: a.egress_host_uuid,
     /** UI 区分 oauth 过期"可自愈(待 lazy refresh)"vs"需人工"的依据。 */
@@ -792,6 +804,30 @@ function serializeAccount(a: AccountRow): Record<string, unknown> {
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };
+}
+
+/**
+ * 批量解析 egress_proxy_id → label。给 list/get accounts 路径用。
+ * 走 IN clause,limit ≤ 500(adminListAccounts limit 上限),不会爆 SQL。
+ */
+async function fetchEgressProxyLabels(
+  rows: AccountRow[],
+): Promise<Map<string, string>> {
+  const ids = new Set<string>();
+  for (const r of rows) {
+    if (r.egress_proxy_id !== null) ids.add(r.egress_proxy_id.toString());
+  }
+  if (ids.size === 0) return new Map();
+  const idArr = [...ids];
+  const r = await getPool().query<{ id: string; label: string }>(
+    `SELECT id::text AS id, label
+     FROM egress_proxies
+     WHERE id = ANY($1::bigint[])`,
+    [idArr],
+  );
+  const m = new Map<string, string>();
+  for (const row of r.rows) m.set(row.id, row.label);
+  return m;
 }
 
 export function serializeContainer(r: AdminContainerRowView): Record<string, unknown> {
@@ -850,6 +886,18 @@ export async function handleAdminListAccounts(
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const sp = url.searchParams;
   const status = sp.get("status") ?? undefined;
+  const providerRaw = sp.get("provider");
+  // V3 admin tab "Claude / Codex" 切换 — UI 显式传 provider=claude 或 codex 来过滤。
+  // 不传/空字符串/"all" = 不过滤(向后兼容老调用者)。前端 G 节会显式传值,因此
+  // 该兼容路径仅用于:外部脚本 / curl 调试 / 历史调用点。
+  let providerFilter: OAuthProvider | undefined;
+  if (providerRaw === null || providerRaw === "" || providerRaw === "all") {
+    providerFilter = undefined;
+  } else if (providerRaw === "claude" || providerRaw === "codex") {
+    providerFilter = providerRaw;
+  } else {
+    throw new HttpError(400, "VALIDATION", "provider must be claude/codex/all");
+  }
   const limit = parsePositiveInt(sp.get("limit"), "limit", 500);
   const offset = parseNonNegativeInt(sp.get("offset"), "offset");
   // R3:with_stats=1 → 追加每账号今日请求/错误数。用 scoped LATERAL-free 聚合,
@@ -858,11 +906,13 @@ export async function handleAdminListAccounts(
   try {
     const rows = await adminListAccounts({
       status: status === undefined || status === "" ? undefined : (status as never),
+      provider: providerFilter,
       limit,
       offset,
     });
+    const poolLabels = await fetchEgressProxyLabels(rows);
     if (!withStats) {
-      sendJson(res, 200, { rows: rows.map(serializeAccount) });
+      sendJson(res, 200, { rows: rows.map((r) => serializeAccount(r, poolLabels)) });
       return;
     }
     const ids = rows.map((r) => r.id);
@@ -872,7 +922,7 @@ export async function handleAdminListAccounts(
       rows: rows.map((r) => {
         const s = byId.get(r.id.toString());
         return {
-          ...serializeAccount(r),
+          ...serializeAccount(r, poolLabels),
           today_requests: s?.today_requests ?? 0,
           today_errors: s?.today_errors ?? 0,
         };
@@ -925,7 +975,8 @@ export async function handleAdminGetAccount(
   }
   const a = await adminGetAccount(idRaw);
   if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
-  sendJson(res, 200, { account: serializeAccount(a) });
+  const poolLabels = await fetchEgressProxyLabels([a]);
+  sendJson(res, 200, { account: serializeAccount(a, poolLabels) });
 }
 
 /**
@@ -1018,10 +1069,18 @@ export async function handleAdminCreateAccount(
   if (typeof b.oauth_token !== "string" || b.oauth_token.length === 0) {
     throw new HttpError(400, "VALIDATION", "oauth_token is required");
   }
+  // V3 — provider 默认 'claude' 与历史行为一致;传 'codex' 时 admin 层会同时
+  // 强制要求 oauth_refresh_token(refresh actor 60s tick 依赖)。
+  let provider: OAuthProvider | undefined;
+  if (b.provider !== undefined) {
+    if (b.provider === "claude" || b.provider === "codex") provider = b.provider;
+    else throw new HttpError(400, "VALIDATION", "provider must be 'claude' or 'codex'");
+  }
   const input: AdminCreateAccountInput = {
     label: b.label,
     plan: b.plan as AdminCreateAccountInput["plan"],
     oauth_token: b.oauth_token,
+    ...(provider !== undefined ? { provider } : {}),
   };
   if (b.oauth_refresh_token !== undefined) {
     if (b.oauth_refresh_token !== null && typeof b.oauth_refresh_token !== "string") {
@@ -1045,12 +1104,27 @@ export async function handleAdminCreateAccount(
         ? null
         : (b.egress_proxy as string | null);
   }
+  if (b.egress_proxy_id !== undefined) {
+    // null/数字字符串/数字均可,数字校验由 adminCreateAccount 兜底
+    if (
+      b.egress_proxy_id !== null &&
+      typeof b.egress_proxy_id !== "string" &&
+      typeof b.egress_proxy_id !== "number"
+    ) {
+      throw new HttpError(400, "VALIDATION", "egress_proxy_id must be string/number/null");
+    }
+    input.egress_proxy_id =
+      b.egress_proxy_id === null || b.egress_proxy_id === ""
+        ? null
+        : String(b.egress_proxy_id);
+  }
 
   try {
     const a = await adminCreateAccount(input, {
       adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
     });
-    sendJson(res, 201, { account: serializeAccount(a) });
+    const poolLabels = await fetchEgressProxyLabels([a]);
+    sendJson(res, 201, { account: serializeAccount(a, poolLabels) });
   } catch (err) {
     if (err instanceof RangeError) translateRangeError(err);
     throw err;
@@ -1071,6 +1145,11 @@ export async function handleAdminPatchAccount(
     throw new HttpError(400, "VALIDATION", "request body must be JSON object");
   }
   const b = body as Record<string, unknown>;
+  // V3 — provider 创建后不可改(决策 R)。前端早就知道这点,挡在 HTTP 层显式 reject
+  // 防降权 admin 误传 provider 把 codex 账号回退到 claude(再去走 claude OAuth 路径)。
+  if (b.provider !== undefined) {
+    throw new HttpError(400, "VALIDATION", "provider cannot be changed after creation");
+  }
   const patch: AdminPatchAccountInput = {};
   if (b.label !== undefined) {
     if (typeof b.label !== "string") throw new HttpError(400, "VALIDATION", "label must be string");
@@ -1113,6 +1192,19 @@ export async function handleAdminPatchAccount(
         ? null
         : (b.egress_proxy as string | null);
   }
+  if (b.egress_proxy_id !== undefined) {
+    if (
+      b.egress_proxy_id !== null &&
+      typeof b.egress_proxy_id !== "string" &&
+      typeof b.egress_proxy_id !== "number"
+    ) {
+      throw new HttpError(400, "VALIDATION", "egress_proxy_id must be string/number/null");
+    }
+    patch.egress_proxy_id =
+      b.egress_proxy_id === null || b.egress_proxy_id === ""
+        ? null
+        : String(b.egress_proxy_id);
+  }
   if (b.egress_host_uuid !== undefined) {
     if (b.egress_host_uuid !== null && typeof b.egress_host_uuid !== "string") {
       throw new HttpError(400, "VALIDATION", "egress_host_uuid must be string or null");
@@ -1127,7 +1219,8 @@ export async function handleAdminPatchAccount(
     const a = await adminPatchAccount(id, patch, {
       adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
     });
-    sendJson(res, 200, { account: serializeAccount(a) });
+    const poolLabels = await fetchEgressProxyLabels([a]);
+    sendJson(res, 200, { account: serializeAccount(a, poolLabels) });
   } catch (err) {
     if (err instanceof AccountNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
     if (err instanceof RangeError) translateRangeError(err);
@@ -1144,11 +1237,31 @@ export async function handleAdminDeleteAccount(
   const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const id = extractTailId(url, "/api/admin/accounts/");
-  const ok = await adminDeleteAccount(id, {
-    adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
-  });
-  if (!ok) throw new HttpError(404, "NOT_FOUND", "account not found");
-  sendJson(res, 200, { deleted: true });
+  // codex 账号若被 stopped/vanished 容器持有 FK,需要 ?force=1 让 admin 层先把
+  // 那些非 active row 的 codex_account_id 置 NULL,再 DELETE(决策 B + 0054 RESTRICT)。
+  // active 容器仍引用 → 任何 force 值都会抛 AccountHasActiveCodexBindingsError → 409。
+  const force = url.searchParams.get("force") === "1";
+  try {
+    const ok = await adminDeleteAccount(
+      id,
+      { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+      { force },
+    );
+    if (!ok) throw new HttpError(404, "NOT_FOUND", "account not found");
+    sendJson(res, 200, { deleted: true });
+  } catch (err) {
+    if (err instanceof AccountHasActiveCodexBindingsError) {
+      throw new HttpError(409, err.code, err.message, {
+        // 标准 error.issues 数组用 path/message 编码 active_binding_count,
+        // 前端 admin.js 看到 code=ACCOUNT_HAS_ACTIVE_CODEX_BINDINGS 时
+        // 解析 issues 拿 count 显示"X 个活跃容器仍绑此账号"。
+        issues: [
+          { path: "active_binding_count", message: String(err.active_binding_count) },
+        ],
+      });
+    }
+    throw err;
+  }
 }
 
 // ─── POST /api/admin/accounts/:id/reset-cooldown (R3) ─────────────
@@ -1169,7 +1282,8 @@ export async function handleAdminResetAccountCooldown(
     const a = await adminResetCooldown(id, {
       adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
     });
-    sendJson(res, 200, { account: serializeAccount(a) });
+    const poolLabels = await fetchEgressProxyLabels([a]);
+    sendJson(res, 200, { account: serializeAccount(a, poolLabels) });
   } catch (err) {
     if (err instanceof RangeError) translateRangeError(err);
     if (err instanceof Error && err.name === "AccountNotFoundError") {
@@ -1197,8 +1311,31 @@ export async function handleAdminOAuthStart(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
-  const r = startClaudeOAuth();
-  sendJson(res, 200, r);
+  // POST body 可选 { provider: "claude" | "codex" },默认 claude。
+  // 走 try/catch 因为 readJsonBody 对空 body 返回 null,不要让它把 GET 客户端打挂。
+  let provider: OAuthProvider = "claude";
+  try {
+    const body = await readJsonBody(req);
+    if (body && typeof body === "object" && !Array.isArray(body)) {
+      const p = (body as Record<string, unknown>).provider;
+      if (p === "claude" || p === "codex") provider = p;
+      else if (p !== undefined) {
+        throw new HttpError(400, "VALIDATION", "provider must be 'claude' or 'codex'");
+      }
+    }
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    // body parse 失败 → 当作无 body,沿用默认 provider
+  }
+  try {
+    const r = startAccountOAuth(provider);
+    sendJson(res, 200, r);
+  } catch (err) {
+    if (err instanceof OAuthExchangeError) {
+      throw new HttpError(err.status, "OAUTH_FAILED", err.message);
+    }
+    throw err;
+  }
 }
 
 export async function handleAdminOAuthExchange(
@@ -1223,7 +1360,7 @@ export async function handleAdminOAuthExchange(
     throw new HttpError(400, "VALIDATION", "state is required");
   }
   try {
-    const r = await exchangeClaudeOAuth(b.code, b.state);
+    const r = await exchangeAccountOAuth(b.code, b.state);
     sendJson(res, 200, r);
   } catch (err) {
     if (err instanceof OAuthExchangeError) {
@@ -2418,4 +2555,183 @@ export async function handleAdminRemoveUserModelGrant(
     }
     throw err;
   }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// V3 — Egress Proxy Pool(决策 P/Q/R + migration 0052/0053)
+// ════════════════════════════════════════════════════════════════════
+//
+// 五个端点:
+//   GET    /api/admin/egress-proxies              list (status filter, pagination)
+//   POST   /api/admin/egress-proxies              create (label + url + status?, notes?)
+//   GET    /api/admin/egress-proxies/:id          get one (URL masked)
+//   PATCH  /api/admin/egress-proxies/:id          patch label/url/status/notes
+//   DELETE /api/admin/egress-proxies/:id          delete (ON DELETE SET NULL 自动 unbind)
+//
+// 鉴权:读 requireAdmin,写 requireAdminVerifyDb(同 accounts 模块)。
+// 返回 url_masked 而非明文/密文(决策 R 安全规约)。
+
+function serializeEgressProxy(r: import("../admin/egressProxies.js").EgressProxyRow): Record<string, unknown> {
+  return {
+    id: r.id.toString(),
+    label: r.label,
+    status: r.status,
+    notes: r.notes,
+    url_masked: r.url_masked,
+    created_at: r.created_at.toISOString(),
+    updated_at: r.updated_at.toISOString(),
+  };
+}
+
+export async function handleAdminListEgressProxies(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+  const statusRaw = sp.get("status");
+  let status: "active" | "disabled" | undefined;
+  if (statusRaw === null || statusRaw === "" || statusRaw === "all") status = undefined;
+  else if (statusRaw === "active" || statusRaw === "disabled") status = statusRaw;
+  else throw new HttpError(400, "VALIDATION", "status must be active/disabled/all");
+  const limit = parsePositiveInt(sp.get("limit"), "limit", 500);
+  const offset = parseNonNegativeInt(sp.get("offset"), "offset");
+  const { listEgressProxies } = await import("../admin/egressProxies.js");
+  try {
+    const rows = await listEgressProxies({ status, limit, offset });
+    sendJson(res, 200, { rows: rows.map(serializeEgressProxy) });
+  } catch (err) { translateRangeError(err); }
+}
+
+export async function handleAdminGetEgressProxy(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const id = extractTailId(url, "/api/admin/egress-proxies/");
+  const { getEgressProxy } = await import("../admin/egressProxies.js");
+  const r = await getEgressProxy(id);
+  if (!r) throw new HttpError(404, "NOT_FOUND", "egress proxy not found");
+  sendJson(res, 200, { row: serializeEgressProxy(r) });
+}
+
+export async function handleAdminCreateEgressProxy(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.label !== "string") throw new HttpError(400, "VALIDATION", "label is required");
+  if (typeof b.url !== "string") throw new HttpError(400, "VALIDATION", "url is required");
+  const input: import("../admin/egressProxies.js").CreateEgressProxyInput = {
+    label: b.label,
+    url: b.url,
+  };
+  if (b.status !== undefined) {
+    if (b.status !== "active" && b.status !== "disabled") {
+      throw new HttpError(400, "VALIDATION", "status must be active or disabled");
+    }
+    input.status = b.status;
+  }
+  if (b.notes !== undefined) {
+    if (b.notes !== null && typeof b.notes !== "string") {
+      throw new HttpError(400, "VALIDATION", "notes must be string or null");
+    }
+    input.notes = b.notes;
+  }
+  const { createEgressProxy, EgressProxyLabelTakenError } = await import(
+    "../admin/egressProxies.js"
+  );
+  try {
+    const r = await createEgressProxy(input, {
+      adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
+    });
+    sendJson(res, 201, { row: serializeEgressProxy(r) });
+  } catch (err) {
+    if (err instanceof EgressProxyLabelTakenError) {
+      throw new HttpError(409, err.code, err.message);
+    }
+    if (err instanceof RangeError) translateRangeError(err);
+    throw err;
+  }
+}
+
+export async function handleAdminPatchEgressProxy(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const id = extractTailId(url, "/api/admin/egress-proxies/");
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  const patch: import("../admin/egressProxies.js").PatchEgressProxyInput = {};
+  if (b.label !== undefined) {
+    if (typeof b.label !== "string") throw new HttpError(400, "VALIDATION", "label must be string");
+    patch.label = b.label;
+  }
+  if (b.url !== undefined) {
+    if (typeof b.url !== "string") throw new HttpError(400, "VALIDATION", "url must be string");
+    patch.url = b.url;
+  }
+  if (b.status !== undefined) {
+    if (b.status !== "active" && b.status !== "disabled") {
+      throw new HttpError(400, "VALIDATION", "status must be active or disabled");
+    }
+    patch.status = b.status;
+  }
+  if (b.notes !== undefined) {
+    if (b.notes !== null && typeof b.notes !== "string") {
+      throw new HttpError(400, "VALIDATION", "notes must be string or null");
+    }
+    patch.notes = b.notes;
+  }
+  const { patchEgressProxy, EgressProxyNotFoundError, EgressProxyLabelTakenError } = await import(
+    "../admin/egressProxies.js"
+  );
+  try {
+    const r = await patchEgressProxy(id, patch, {
+      adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, { row: serializeEgressProxy(r) });
+  } catch (err) {
+    if (err instanceof EgressProxyNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
+    if (err instanceof EgressProxyLabelTakenError) throw new HttpError(409, err.code, err.message);
+    if (err instanceof RangeError) translateRangeError(err);
+    throw err;
+  }
+}
+
+export async function handleAdminDeleteEgressProxy(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const id = extractTailId(url, "/api/admin/egress-proxies/");
+  const { deleteEgressProxy } = await import("../admin/egressProxies.js");
+  const out = await deleteEgressProxy(id, {
+    adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
+  });
+  if (!out.deleted) throw new HttpError(404, "NOT_FOUND", "egress proxy not found");
+  sendJson(res, 200, { deleted: true, unbound_account_count: out.unbound_account_count });
 }

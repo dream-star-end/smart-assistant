@@ -1,5 +1,5 @@
 /**
- * Admin-pool Claude OAuth — PKCE start + code exchange。
+ * Admin-pool OAuth — PKCE start + code exchange,支持 claude / codex 双 provider。
  *
  * 与 gateway 的 personal-version `handleOAuth*` 区别:
  *   - 这里只生成 PKCE/换 code,**不写任何持久化**
@@ -9,23 +9,56 @@
  * pending state 内存 Map(进程级,10 分钟 TTL):
  *   - 同一 admin 浏览器内一次性流程,不需要持久化
  *   - 50 条上限,LRU 驱逐(防内存爆)
+ *
+ * Provider 差异(决策 V):
+ *   - claude: claude.ai authorize → platform.claude.com token,token body 含 state
+ *   - codex:  auth.openai.com authorize/token,authorize 加 extraParams,
+ *            token body 不含 state,redirect 必须是 http://localhost:1455/auth/callback
+ *            (codex CLI 约定,后端不真起 listener,前端粘 callback URL 解析 code)
  */
 
 import { createHash, randomBytes } from "node:crypto";
 
-// authUrl 用最终域 claude.ai(claude.com 是 307 跳板;部分梯子 only-claude.ai
-// 的策略下,跳板域被掐 → ERR_CONNECTION_CLOSED)。
-// tokenUrl 由后端调用,走服务器出网,域名维持 platform.claude.com 即可。
-const CLAUDE_OAUTH = {
-  clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-  authUrl: "https://claude.ai/oauth/authorize",
-  tokenUrl: "https://platform.claude.com/v1/oauth/token",
-  redirect: "https://platform.claude.com/oauth/code/callback",
-  scopes: "user:profile user:inference user:sessions:claude_code user:mcp_servers",
-} as const;
+const ACCOUNT_PROVIDERS = ["claude", "codex"] as const;
+export type OAuthProvider = (typeof ACCOUNT_PROVIDERS)[number];
+
+interface OAuthProviderConfig {
+  clientId: string;
+  authUrl: string;
+  tokenUrl: string;
+  redirect: string;
+  scopes: string;
+  extraParams?: Record<string, string>;
+}
+
+const OAUTH_PROVIDERS: Record<OAuthProvider, OAuthProviderConfig> = {
+  // authUrl 用最终域 claude.ai(claude.com 是 307 跳板;部分梯子 only-claude.ai
+  // 的策略下,跳板域被掐 → ERR_CONNECTION_CLOSED)。
+  // tokenUrl 由后端调用,走服务器出网,域名维持 platform.claude.com 即可。
+  claude: {
+    clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    authUrl: "https://claude.ai/oauth/authorize",
+    tokenUrl: "https://platform.claude.com/v1/oauth/token",
+    redirect: "https://platform.claude.com/oauth/code/callback",
+    scopes: "user:profile user:inference user:sessions:claude_code user:mcp_servers",
+  },
+  codex: {
+    clientId: "app_EMoamEEZ73f0CkXaXp7hrann",
+    authUrl: "https://auth.openai.com/oauth/authorize",
+    tokenUrl: "https://auth.openai.com/oauth/token",
+    redirect: "http://localhost:1455/auth/callback",
+    scopes: "openid profile email offline_access",
+    extraParams: {
+      id_token_add_organizations: "true",
+      codex_cli_simplified_flow: "true",
+      originator: "codex_vscode",
+    },
+  },
+};
 
 interface PendingState {
   codeVerifier: string;
+  provider: OAuthProvider;
   createdAt: number;
 }
 
@@ -39,34 +72,46 @@ function gcPending(): void {
   if (oldest) pending.delete(oldest);
 }
 
+function isOAuthProvider(v: unknown): v is OAuthProvider {
+  return typeof v === "string" && (ACCOUNT_PROVIDERS as readonly string[]).includes(v);
+}
+
 export interface OAuthStartResult {
   authUrl: string;
   state: string;
+  provider: OAuthProvider;
 }
 
-export function startClaudeOAuth(): OAuthStartResult {
+export function startAccountOAuth(provider: OAuthProvider = "claude"): OAuthStartResult {
+  if (!isOAuthProvider(provider)) {
+    throw new OAuthExchangeError(400, `unknown oauth provider: ${String(provider)}`);
+  }
+  const prov = OAUTH_PROVIDERS[provider];
+
   const codeVerifier = randomBytes(32).toString("base64url");
   const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
   const state = randomBytes(16).toString("hex");
 
   gcPending();
-  pending.set(state, { codeVerifier, createdAt: Date.now() });
+  pending.set(state, { codeVerifier, provider, createdAt: Date.now() });
   // best-effort GC: 单独 timer 自删
   setTimeout(() => pending.delete(state), PENDING_TTL_MS).unref?.();
 
   const params = new URLSearchParams({
-    client_id: CLAUDE_OAUTH.clientId,
-    redirect_uri: CLAUDE_OAUTH.redirect,
+    client_id: prov.clientId,
+    redirect_uri: prov.redirect,
     response_type: "code",
-    scope: CLAUDE_OAUTH.scopes,
+    scope: prov.scopes,
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
     state,
+    ...(prov.extraParams ?? {}),
   });
 
   return {
-    authUrl: `${CLAUDE_OAUTH.authUrl}?${params.toString()}`,
+    authUrl: `${prov.authUrl}?${params.toString()}`,
     state,
+    provider,
   };
 }
 
@@ -76,6 +121,7 @@ export interface OAuthExchangeResult {
   /** ISO string,server 拿到 expires_in 之后算的;前端可直接填进表单 */
   expires_at: string;
   scope: string;
+  provider: OAuthProvider;
 }
 
 export class OAuthExchangeError extends Error {
@@ -85,7 +131,7 @@ export class OAuthExchangeError extends Error {
   }
 }
 
-export async function exchangeClaudeOAuth(
+export async function exchangeAccountOAuth(
   code: string,
   state: string,
 ): Promise<OAuthExchangeResult> {
@@ -94,17 +140,22 @@ export async function exchangeClaudeOAuth(
   if (!p) throw new OAuthExchangeError(400, "invalid or expired state");
   pending.delete(state);
 
-  const tokenRes = await fetch(CLAUDE_OAUTH.tokenUrl, {
+  const prov = OAUTH_PROVIDERS[p.provider];
+
+  const tokenBody: Record<string, string> = {
+    grant_type: "authorization_code",
+    client_id: prov.clientId,
+    code: cleanCode,
+    code_verifier: p.codeVerifier,
+    redirect_uri: prov.redirect,
+  };
+  // claude token endpoint 期望带 state 字段;codex (auth.openai.com) 不带
+  if (p.provider === "claude") tokenBody.state = state;
+
+  const tokenRes = await fetch(prov.tokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "authorization_code",
-      client_id: CLAUDE_OAUTH.clientId,
-      code: cleanCode,
-      code_verifier: p.codeVerifier,
-      redirect_uri: CLAUDE_OAUTH.redirect,
-      state,
-    }),
+    body: JSON.stringify(tokenBody),
   });
 
   if (!tokenRes.ok) {
@@ -133,6 +184,19 @@ export async function exchangeClaudeOAuth(
     access_token: tokens.access_token,
     refresh_token: tokens.refresh_token ?? "",
     expires_at: new Date(expiresAtMs).toISOString(),
-    scope: tokens.scope ?? CLAUDE_OAUTH.scopes,
+    scope: tokens.scope ?? prov.scopes,
+    provider: p.provider,
   };
+}
+
+// ---------- 旧 API 兼容(保留导出名,方便单测/旧调用点) ----------
+
+/** @deprecated use startAccountOAuth("claude") */
+export function startClaudeOAuth(): OAuthStartResult {
+  return startAccountOAuth("claude");
+}
+
+/** @deprecated use exchangeAccountOAuth */
+export function exchangeClaudeOAuth(code: string, state: string): Promise<OAuthExchangeResult> {
+  return exchangeAccountOAuth(code, state);
 }

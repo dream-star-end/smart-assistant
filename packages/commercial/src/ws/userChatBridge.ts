@@ -287,6 +287,47 @@ export interface UserChatBridgeDeps {
     uid: bigint,
     role: "user" | "admin",
   ) => Promise<(modelId: string) => boolean>;
+  /**
+   * plan v3 G5/G7 — codex per-account 并发槽 + 严格单飞 acquire/release。
+   *
+   * 调用契约:
+   *   - bridge 在 inbound.message 帧 + effectiveModel 是 codex 类(`gpt-*` 或
+   *     agentImpliedModel='gpt-5.5')时调 `acquire(containerId)`
+   *   - acquire 返回:
+   *     - `null` → 容器是 legacy NULL(`codex_account_id IS NULL`),走 legacy
+   *       `config.auth.codexOAuth` 共享 dir 路径,**不占** per-account 槽(决策 N3)
+   *     - `{account_id}` → 已 inc inflight + 通过 lazy migrate(若需要)+ 写
+   *       per-container auth.json 并 UPDATE codex_account_id;调用方记下此 id 用于
+   *       后续 release
+   *   - acquire 抛 `AccountPoolBusyError` → bridge fast-fail(决策 O):error 帧
+   *     "codex pool busy",**不 fallback 到 legacy**
+   *   - acquire 抛其他 → bridge fast-fail "GPT temporarily unavailable"
+   *   - `release(account_id)` 必须用 acquire 时记录的 account_id(决策 N2 MAJOR 3:
+   *     不重读 row,防 lazy migrate 漂移导致 release 减错账号槽)
+   *
+   * **G7 严格单飞**:bridge 内部维护 per-bridge "已持槽" 状态;新 inbound 命中已持
+   * 状态 → reject "previous codex turn still in progress"(error 帧),不复用 slot
+   * 不并发,frame 不 forward 到容器。
+   *
+   * 未注入 → bridge 不做 codex 并发管控,inbound 透传(测试 / 个人版上下文)。
+   */
+  codexBinding?: CodexBindingHandle;
+}
+
+/**
+ * plan v3 G5/G7 — codex 容器与账号绑定 / per-account 并发槽控制 handle。
+ *
+ * `acquire`:幂等持锁逻辑(决策 N2):查 row.codex_account_id + status,若 active
+ * 则直接 inc inflight slot;若非 active 走 lazy migrate(`pickCodexAccountForBinding`
+ * + FOR UPDATE 持锁直到 atomic rename + UPDATE 持锁内同 tx 提交;失败 ROLLBACK
+ * 自动回滚 codex_account_id);返回最终 acquire 的 account_id(供 release 用)。
+ *
+ * `release`:dec inflight slot(scheduler.releaseCodexSlot),不调 health.onSuccess /
+ * onFailure(决策 J2:bridge 不知道真实 turn 出参,健康分留给 release 层)。幂等。
+ */
+export interface CodexBindingHandle {
+  acquire(containerId: number): Promise<{ account_id: bigint } | null>;
+  release(account_id: bigint): void;
 }
 
 /**
@@ -308,6 +349,25 @@ const ACTIVITY_REFRESH_INTERVAL_MS = 60_000;
  * 临时抖动比授权状态变化更频繁,把已经授权的连接因为一次抖动踢掉会更糟。
  */
 const GRANTS_REFRESH_INTERVAL_MS = 30_000;
+
+/**
+ * plan v3 G6 — codex per-account 槽兜底释放上限(默认 10 分钟)。
+ *
+ * 为什么需要:bridge 是 byte-transparent 的,不解析 outbound SSE 流,因此无法精确
+ * 检测"codex turn 完成"信号(personal-version `event:message_stop` 在容器 ws 帧
+ * 内,跨多帧拼接)。退而求其次:每次 acquire 同时启动一个 setTimeout,到点强制
+ * release。CODEX_SESSION_MAX_MS = 600s 与个人版 codex app-server 单次 turn 实际上限
+ * (~5min stream + buffer)对齐。ws close 也会通过 cleanup 路径释放(更早触发)。
+ *
+ * env `CODEX_SESSION_MAX_MS` 覆盖(测试常用 1000-5000)。
+ */
+const DEFAULT_CODEX_SESSION_MAX_MS = 600_000;
+function readCodexSessionMaxMs(): number {
+  const raw = process.env.CODEX_SESSION_MAX_MS;
+  if (!raw) return DEFAULT_CODEX_SESSION_MAX_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1000 ? n : DEFAULT_CODEX_SESSION_MAX_MS;
+}
 
 /**
  * Agent → 隐含 model 授权映射(plan v3 round-2 finding 1 fix)。
@@ -746,6 +806,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // 周期 refresh modelChecker 的定时器;cleanup() 务必清掉。
     let modelCheckerRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
+    // plan v3 G5/G7 — codex per-account 并发槽:per-bridge 状态。
+    //   acquiredCodexAccountId !== null → 已持槽,新 codex inbound 应被严格单飞拒绝
+    //   codexAcquireInflight = true → acquire promise 在飞,新 codex inbound 拒
+    //   codexLegacyContainer = true → 容器 codex_account_id IS NULL(决策 N3 legacy
+    //     路径),acquire 返回 null 后置位,后续 codex inbound 直接透传不再调 acquire
+    //   codexReleaseTimer → CODEX_SESSION_MAX_MS 兜底释放(决策 G6),防 outbound 丢/
+    //     ws 异常断后槽永久泄漏
+    let acquiredCodexAccountId: bigint | null = null;
+    let codexAcquireInflight = false;
+    let codexLegacyContainer = false;
+    let codexReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+    // plan v3 G6 — outbound 终态早释放(Codex review v2 BLOCKER 1):
+    //   只靠 600s timer + cleanup 释放,正常完成的 turn 会持槽 ≤ 10min,
+    //   单账号 maxConcurrent=10 → 10 个正常 turn 后误判 busy。
+    //   方案:acquire 时记 inbound.peer.id;outbound.message + isFinal:true 或
+    //   outbound.error 且 peer.id 命中 → 立即 release,timer 退化为兜底。
+    //   匹配 peer.id 的原因:同桥可 claude+codex 交错,只看"任意 isFinal"会误释。
+    let codexInboundPeerId: string | null = null;
+
     // 注册到 registry,超额会踢老的
     const conn: Conn = {
       id: connId,
@@ -817,7 +896,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   这条 check **故意没 try/catch** 套整个 if 块:JSON.parse 异常下面已处理,
       //   isAllowed 是纯同步(canUseModel 读 PricingCache cache 命中即返),异常仅
       //   可能来自代码 bug,不该静默吞。
-      if (modelCheckerHandle !== null && !isBinary) {
+      // 把 effectiveModel / 是否 codex 帧 提到外层,后面 codex slot 路径要用
+      let effectiveModelForFrame: string | null = null;
+      let isCodexInboundFrame = false;
+      // plan v3 G6 早释放(BLOCKER 1):codex inbound 帧的 peer.id,acquire 路径捕获后存
+      // codexInboundPeerId,匹配 outbound 终态时用。无 peer.id 即保持 null,降级为 timer 兜底。
+      let inboundPeerIdForFrame: string | null = null;
+      if (!isBinary) {
         let frameStr: string | null = null;
         if (typeof data === "string") frameStr = data;
         else if (Buffer.isBuffer(data)) {
@@ -856,7 +941,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (source === "frame.model" || source === "agentId.implied") {
               lastSeenModelId = effectiveModel;
             }
-            if (effectiveModel !== null && !modelCheckerHandle.isAllowed(effectiveModel)) {
+            if (
+              modelCheckerHandle !== null &&
+              effectiveModel !== null &&
+              !modelCheckerHandle.isAllowed(effectiveModel)
+            ) {
               log?.info("user-chat-bridge: model not authorized", {
                 uid: uid.toString(),
                 modelId: effectiveModel,
@@ -872,13 +961,140 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               cleanup();
               return;
             }
+            effectiveModelForFrame = effectiveModel;
+            // codex 判定:只看 effectiveModel 前缀(`gpt-*`) 即可。agentId='codex' 已通过
+            // AGENT_AUTHZ_IMPLIED_MODEL 把 effectiveModel 设为 'gpt-5.5',下面的判定一样命中。
+            isCodexInboundFrame = effectiveModel !== null && effectiveModel.startsWith("gpt-");
+            // 提取 peer.id(用于 outbound 终态早释放匹配)。codex 帧才需要;非 codex
+            // 帧不影响 acquiredCodexAccountId,捕不捕没用。
+            if (isCodexInboundFrame) {
+              const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
+              const peerIdRaw = peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
+              inboundPeerIdForFrame = typeof peerIdRaw === "string" ? peerIdRaw : null;
+            }
           }
         }
       }
-      // Bridge TTFT 起点:首个 user→container 帧。oversize 拒绝路径不算(已 close)。
+
+      // plan v3 G5/G7 — codex per-account 槽 acquire / 严格单飞:
+      //   - bridge 看到 codex inbound + 有 codexBinding 注入 + 有 containerId
+      //   - 容器 codex_account_id 已知 NULL(legacy)→ 透传不占槽(决策 N3)
+      //   - 已持槽 / acquire 在飞 → reject "previous codex turn still in progress"(G7)
+      //   - 否则:async acquire → 成功 forward;Busy / 其他 fail → fast-fail error 帧
+      //
+      // 非 codex 帧 / 没注入 codexBinding / 没 containerId → 直接走下方原同步 forward
+      if (
+        isCodexInboundFrame &&
+        deps.codexBinding !== undefined &&
+        containerId !== undefined &&
+        !codexLegacyContainer
+      ) {
+        if (acquiredCodexAccountId !== null || codexAcquireInflight) {
+          // G7 严格单飞:不 close bridge,让前端等当前 turn 完成后重发
+          log?.info("user-chat-bridge: codex turn busy, rejecting frame", {
+            uid: uid.toString(),
+            connId,
+          });
+          sendErrorFrame(
+            userWs,
+            "CODEX_TURN_BUSY",
+            "previous codex turn still in progress, wait for completion",
+          );
+          return;
+        }
+        codexAcquireInflight = true;
+        const codexBinding = deps.codexBinding;
+        const cid = containerId;
+        const sessionMaxMs = readCodexSessionMaxMs();
+        // 进 acquire 路径才记 peer.id;G7 拒绝路径(busy)不该覆盖在飞 turn 的 peer.id。
+        const peerIdForAcquire = inboundPeerIdForFrame;
+        void (async () => {
+          try {
+            const acquired = await codexBinding.acquire(cid);
+            if (cleaned) {
+              // bridge 在 acquire 期间被关 — 立即 release 不留泄漏
+              if (acquired !== null) {
+                try { codexBinding.release(acquired.account_id); } catch { /* */ }
+              }
+              return;
+            }
+            if (acquired === null) {
+              // legacy NULL 容器,不占槽,后续 codex 帧也透传
+              codexLegacyContainer = true;
+            } else {
+              acquiredCodexAccountId = acquired.account_id;
+              codexInboundPeerId = peerIdForAcquire;
+              codexReleaseTimer = setTimeout(() => {
+                // 兜底释放:防 outbound 完成信号丢 / ws 异常断 → 槽永久泄漏
+                if (acquiredCodexAccountId !== null) {
+                  try { codexBinding.release(acquiredCodexAccountId); } catch { /* */ }
+                  acquiredCodexAccountId = null;
+                }
+                codexInboundPeerId = null;
+                codexReleaseTimer = null;
+              }, sessionMaxMs);
+              codexReleaseTimer.unref?.();
+            }
+            // 已 acquire 完毕,继续同步 forward 路径(等价于"放行原 frame")。
+            // 走 forwardInboundFrame helper 与下方主路径同义。
+            forwardInboundFrame(data, isBinary, len);
+          } catch (err) {
+            const errName = (err as { name?: string } | null | undefined)?.name ?? "";
+            if (errName === "AccountPoolBusyError") {
+              log?.info("user-chat-bridge: codex pool busy, fast-fail", {
+                uid: uid.toString(),
+                connId,
+              });
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "CODEX_POOL_BUSY",
+                  "codex pool busy, retry shortly",
+                );
+              }
+            } else {
+              log?.warn("user-chat-bridge: codex acquire failed", {
+                uid: uid.toString(),
+                connId,
+                err,
+              });
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "CODEX_UNAVAILABLE",
+                  "GPT temporarily unavailable, retry shortly",
+                );
+              }
+            }
+          } finally {
+            codexAcquireInflight = false;
+          }
+        })();
+        return; // 同步路径不再 forward,等 async 完成后由 forwardInboundFrame 走
+      }
+      // 让 unused-locals 检查放过(future:可能加 outbound 解析用 effectiveModelForFrame)
+      void effectiveModelForFrame;
+      forwardInboundFrame(data, isBinary, len);
+    };
+
+    /**
+     * plan v3 G5 — 把"已通过 authz / codex acquire"的 inbound 帧实际推到容器侧。
+     *
+     * 抽出本函数是因为同一段 forward 逻辑要在两处复用:
+     *   (1) onUserMessage 同步路径(非 codex 帧 / 已知 legacy NULL 容器 / 没注 codexBinding)
+     *   (2) codex acquire async IIFE 成功分支
+     *
+     * 责任:
+     *   - 设置 firstUserFrameAtMs(TTFT 起点;oversize / authz 拒绝路径已 return)
+     *   - 60s debounce 内最多刷一次 last_ws_activity(防 chatty 用户)
+     *   - containerWs OPEN → sendToContainer;否则 push 到 preopenQueue(直到容器 OPEN)
+     *   - preopenQueue 超 maxBufferedBytes → backpressure 关连接
+     *
+     * 不重复 frame size / authz / codex 单飞校验:那些必须在帧到达 onUserMessage 时
+     * 立刻判定(同步上下文),已在调用本函数前完成。本函数只关心"放行后的物理转发"。
+     */
+    function forwardInboundFrame(data: RawData, isBinary: boolean, len: number): void {
       if (firstUserFrameAtMs === null) firstUserFrameAtMs = Date.now();
-      // PR1:client→container 帧才刷活动(container→user 输出 / ping/pong 不算)。
-      // 60s debounce 已在 lastActivityRefreshAt 比较里。markActivity 必须 fire-and-forget。
       if (markActivity && containerId !== undefined) {
         const now = Date.now();
         if (now - lastActivityRefreshAt >= ACTIVITY_REFRESH_INTERVAL_MS) {
@@ -903,7 +1119,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return;
       }
       sendToContainer(data, isBinary, len);
-    };
+    }
 
     const sendToContainer = (data: RawData, isBinary: boolean, len: number): void => {
       try {
@@ -951,6 +1167,55 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (userWs.readyState !== WebSocket.OPEN) {
         // user 已经走了,丢
         return;
+      }
+      // plan v3 G6 early release(BLOCKER 1):outbound.message + isFinal:true 或
+      //   outbound.error,且 peer.id 命中本桥在飞 codex turn 的 inbound peer.id →
+      //   立即 release codex slot,timer 退化为兜底。
+      //   - 必须 acquiredCodexAccountId !== null && codexInboundPeerId !== null:
+      //     未持槽 / 没记 peer.id 走纯透传(timer 兜底)
+      //   - 仅文本帧 + cheap pre-filter 减少 JSON.parse 开销(claude 流是高频)
+      //   - peer.id 严格匹配:claude 流 peer.id 不同 → 不误释
+      //   - 释放在 userWs.send 之前完成,失败回滚靠 cleanup 兜底
+      if (
+        acquiredCodexAccountId !== null &&
+        codexInboundPeerId !== null &&
+        !isBinary &&
+        deps.codexBinding !== undefined
+      ) {
+        let outText: string | null = null;
+        if (typeof data === "string") outText = data;
+        else if (Buffer.isBuffer(data)) {
+          try { outText = data.toString("utf8"); } catch { outText = null; }
+        }
+        if (
+          outText !== null &&
+          (outText.includes('"isFinal":true') || outText.includes('"outbound.error"'))
+        ) {
+          let parsedOut: unknown = null;
+          try { parsedOut = JSON.parse(outText); } catch { /* 非 JSON 透传 */ }
+          if (parsedOut !== null && typeof parsedOut === "object") {
+            const obj = parsedOut as {
+              type?: unknown;
+              isFinal?: unknown;
+              peer?: { id?: unknown };
+            };
+            const peerId = obj.peer && typeof obj.peer === "object"
+              ? (typeof obj.peer.id === "string" ? obj.peer.id : null)
+              : null;
+            const isFinalMsg = obj.type === "outbound.message" && obj.isFinal === true;
+            const isErr = obj.type === "outbound.error";
+            if ((isFinalMsg || isErr) && peerId !== null && peerId === codexInboundPeerId) {
+              const accountId = acquiredCodexAccountId;
+              acquiredCodexAccountId = null;
+              codexInboundPeerId = null;
+              if (codexReleaseTimer !== null) {
+                clearTimeout(codexReleaseTimer);
+                codexReleaseTimer = null;
+              }
+              try { deps.codexBinding.release(accountId); } catch { /* swallow */ }
+            }
+          }
+        }
       }
       // 简单 backpressure:看 userWs.bufferedAmount(ws lib 维护的 socket 待发量)
       if (userWs.bufferedAmount + len > maxBufferedBytes) {
@@ -1116,6 +1381,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         clearInterval(modelCheckerRefreshTimer);
         modelCheckerRefreshTimer = null;
       }
+      // plan v3 G6 — codex 槽兜底释放:bridge 关 = 当前 turn 必然终止(用户 ws / 容器
+      //   ws 任一断都进 cleanup)。清掉 timeout timer 后显式 release。即便 acquire 还在
+      //   飞(codexAcquireInflight=true),acquire 内部已检查 cleaned 标志,acquire 成功
+      //   后会立刻 release 自己,不会泄漏。
+      if (codexReleaseTimer !== null) {
+        clearTimeout(codexReleaseTimer);
+        codexReleaseTimer = null;
+      }
+      if (acquiredCodexAccountId !== null && deps.codexBinding) {
+        try { deps.codexBinding.release(acquiredCodexAccountId); } catch { /* */ }
+        acquiredCodexAccountId = null;
+      }
+      codexInboundPeerId = null;
       try { connectAbort.abort(); } catch { /* */ }
       try {
         // 注意:CLOSING 状态也强 terminate(),不依赖对端 echo,

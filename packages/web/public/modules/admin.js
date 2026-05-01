@@ -325,6 +325,7 @@ const TABS = {
   dashboard: renderDashboardTab,
   users: renderUsersTab,
   accounts: renderAccountsTab,
+  egressProxies: renderEgressProxiesTab,
   containers: renderContainersTab,
   hosts: renderHostsTab,
   ledger: renderLedgerTab,
@@ -403,7 +404,9 @@ let _currentTab = null
 
 function applyHash() {
   // 扩展原正则,支持 #tab=NAME 和 #tab=NAME&k=v&k2=v2 两种形态。
-  const m = /#tab=([a-z]+)(?:&(.+))?$/.exec(window.location.hash)
+  // 字符类用 [A-Za-z0-9_] 而非纯小写 — 历史 bug:tab 名带大写(如 modelGrants)
+  // 时旧 `[a-z]+` 永不匹配,无声 fall-back 到 dashboard。TABS 白名单仍是兜底。
+  const m = /#tab=([A-Za-z0-9_]+)(?:&(.+))?$/.exec(window.location.hash)
   const tab = (m && TABS[m[1]]) ? m[1] : 'dashboard'
   const params = m && m[2] ? new URLSearchParams(m[2]) : null
 
@@ -2114,17 +2117,39 @@ function _readAccountForm(isCreate) {
 
 // 模块级 state:OAuth 拿到的 state 跟 modal 共享
 let _oauthPendingState = null
+// modal 当前选择的 provider —— 'claude' 或 'codex'。oauthStartStep 用,
+// 创建账号时也透传给后端(账号 row.provider 决定后续 token refresh / 容器
+// auth 路径,不可改,见 admin.ts:1148)
+let _oauthSelectedProvider = 'claude'
+
+function _selectedProviderFromRadio() {
+  const checked = document.querySelector('input[name="acc-provider"]:checked')
+  return checked && (checked.value === 'codex') ? 'codex' : 'claude'
+}
 
 function openCreateAccountModal() {
   _oauthPendingState = null
+  _oauthSelectedProvider = 'claude'
   openModal(`
     <h3>新建账号</h3>
+
+    <div class="form-row">
+      <label>provider(创建后不可改)</label>
+      <div style="display:flex;gap:14px">
+        <label style="display:inline-flex;gap:6px;align-items:center">
+          <input type="radio" name="acc-provider" value="claude" checked /> claude
+        </label>
+        <label style="display:inline-flex;gap:6px;align-items:center">
+          <input type="radio" name="acc-provider" value="codex" /> codex (GPT)
+        </label>
+      </div>
+    </div>
 
     <div class="oauth-box" style="
       border:1px solid #6366f1; border-radius:8px;
       padding:14px; margin-bottom:16px; background:rgba(99,102,241,0.08);
     ">
-      <div style="font-weight:600;margin-bottom:8px">🔐 用 Claude 订阅授权 (推荐)</div>
+      <div style="font-weight:600;margin-bottom:8px">🔐 OAuth 授权 (推荐)</div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
         <button class="btn-primary" id="acc-oauth-open" type="button"
                 style="white-space:nowrap">① 打开授权页</button>
@@ -2160,6 +2185,8 @@ function openCreateAccountModal() {
     let body
     try { body = _readAccountForm(true) }
     catch (e) { toast(e.message, 'danger'); return }
+    // 默认 claude(后端兼容历史 caller);codex 时显式传
+    body.provider = _selectedProviderFromRadio()
     await withBtnLoading(ev.currentTarget, async () => {
       try {
         const r = await apiJson('POST', '/api/admin/accounts', body)
@@ -2175,9 +2202,13 @@ function openCreateAccountModal() {
 
 // 步骤一:让后端发 PKCE state、生成 authUrl,新页签打开
 async function oauthStartStep() {
+  // 同步 radio → 模块状态,后端按 provider 返回 claude/codex 的 authUrl
+  _oauthSelectedProvider = _selectedProviderFromRadio()
   let started
   try {
-    started = await apiJson('POST', '/api/admin/accounts/oauth/start', {})
+    started = await apiJson('POST', '/api/admin/accounts/oauth/start', {
+      provider: _oauthSelectedProvider,
+    })
   } catch (e) {
     toast(`OAuth 启动失败: ${e.message}`, 'danger', toastOptsFromError(e))
     return
@@ -2297,6 +2328,213 @@ async function deleteAccount(id, label, btn) {
       await apiJson('DELETE', `/api/admin/accounts/${encodeURIComponent(id)}`)
       toast(`#${id} 已删除`)
       applyHash()
+    } catch (e) {
+      toast(`删除失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
+}
+
+// ─── Tab: Egress Proxies(出口代理池 — 0052/0053) ──────────────────
+//
+// CRUD list — admin 维护一组出口代理 URL,创建/编辑账号时挂到 claude_accounts.egress_proxy_id。
+// 列表只展示 url_masked(后端遮蔽),明文 URL 永远不出库。
+// 删除受 ON DELETE SET NULL 保护:删 proxy 时把绑定的 account.egress_proxy_id 置 NULL,
+// 后端返回 unbound_account_count 让 UI 提示"刚解绑了 N 个账号"。
+
+const EGRESS_PROXY_STATE = {
+  renderSeq: 0,
+  rows: [],
+  filterStatus: '',
+}
+
+async function renderEgressProxiesTab() {
+  const mySeq = ++EGRESS_PROXY_STATE.renderSeq
+  EGRESS_PROXY_STATE.filterStatus = sessionStorage.getItem('admin_ep_status') || ''
+  view().innerHTML = `
+    <div class="panel">
+      <h1 style="margin-top:0">代理池 <small style="color:var(--muted);font-weight:400;font-size:14px" id="ep-count">加载中…</small></h1>
+      <div class="toolbar">
+        <label>状态:
+          <select id="ep-status">
+            <option value="" ${EGRESS_PROXY_STATE.filterStatus === '' ? 'selected' : ''}>全部</option>
+            <option value="active" ${EGRESS_PROXY_STATE.filterStatus === 'active' ? 'selected' : ''}>active</option>
+            <option value="disabled" ${EGRESS_PROXY_STATE.filterStatus === 'disabled' ? 'selected' : ''}>disabled</option>
+          </select>
+        </label>
+        <button class="btn" id="ep-refresh">刷新</button>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="ep-new">+ 新建代理</button>
+      </div>
+      <div id="ep-table-container"><div class="empty">加载中…</div></div>
+    </div>
+  `
+  $('ep-status').addEventListener('change', (e) => {
+    EGRESS_PROXY_STATE.filterStatus = e.target.value
+    sessionStorage.setItem('admin_ep_status', e.target.value)
+    renderEgressProxiesTab()
+  })
+  $('ep-refresh').addEventListener('click', () => renderEgressProxiesTab())
+  $('ep-new').addEventListener('click', openCreateEgressProxyModal)
+
+  const sp = new URLSearchParams({ limit: '500' })
+  if (EGRESS_PROXY_STATE.filterStatus) sp.set('status', EGRESS_PROXY_STATE.filterStatus)
+  let data
+  try {
+    data = await apiGet(`/api/admin/egress-proxies?${sp.toString()}`)
+  } catch (err) {
+    if (mySeq !== EGRESS_PROXY_STATE.renderSeq || _currentTab !== 'egressProxies') return
+    toast(`加载失败:${err.message}`, 'danger', toastOptsFromError(err))
+    const el = $('ep-table-container')
+    if (el) el.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
+    const cnt = $('ep-count'); if (cnt) cnt.textContent = '—'
+    return
+  }
+  if (mySeq !== EGRESS_PROXY_STATE.renderSeq || _currentTab !== 'egressProxies') return
+  const rows = data?.rows ?? []
+  EGRESS_PROXY_STATE.rows = rows
+  const cnt = $('ep-count'); if (cnt) cnt.textContent = `共 ${rows.length} 条`
+  const el = $('ep-table-container')
+  if (rows.length === 0) {
+    el.innerHTML = '<div class="empty">尚无代理</div>'
+    return
+  }
+  el.innerHTML = `
+    <table class="data">
+      <thead><tr>
+        <th>label</th><th>url(已遮蔽)</th><th>status</th><th>notes</th>
+        <th>更新时间</th><th class="actions">操作</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => `
+          <tr>
+            <td>${escapeHtml(r.label)}</td>
+            <td class="mono">${escapeHtml(r.url_masked)}</td>
+            <td>${r.status === 'active'
+              ? '<span class="badge ok">active</span>'
+              : '<span class="badge muted">disabled</span>'}</td>
+            <td>${escapeHtml(r.notes || '')}</td>
+            <td class="mono">${escapeHtml(fmtDate(r.updated_at))}</td>
+            <td class="actions">
+              <button data-act="ep-edit" data-id="${escapeHtml(r.id)}">编辑</button>
+              <button data-act="ep-del" data-id="${escapeHtml(r.id)}" data-label="${escapeHtml(r.label)}">删除</button>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  `
+  for (const b of view().querySelectorAll('button[data-act="ep-edit"]')) {
+    b.addEventListener('click', () => openEditEgressProxyModal(b.dataset.id))
+  }
+  for (const b of view().querySelectorAll('button[data-act="ep-del"]')) {
+    b.addEventListener('click', (ev) => deleteEgressProxy(b.dataset.id, b.dataset.label, ev.currentTarget))
+  }
+}
+
+function openCreateEgressProxyModal() {
+  openModal(`
+    <h3>新建代理</h3>
+    <div class="form-row"><label>label(展示名,唯一)</label>
+      <input type="text" id="ep-label" placeholder="例:tokyo-residential-1" /></div>
+    <div class="form-row"><label>URL(明文,创建后只展示遮蔽串)</label>
+      <input type="text" id="ep-url" placeholder="http://user:pass@host:port 或 socks5://..." /></div>
+    <div class="form-row"><label>status</label>
+      <select id="ep-status-input">
+        <option value="active" selected>active</option>
+        <option value="disabled">disabled</option>
+      </select></div>
+    <div class="form-row"><label>notes(可选)</label>
+      <input type="text" id="ep-notes" placeholder="备注" /></div>
+    <div class="form-actions">
+      <button id="ep-cancel">取消</button>
+      <button class="btn-primary" id="ep-ok">创建</button>
+    </div>
+  `)
+  $('ep-cancel').addEventListener('click', closeModal)
+  $('ep-ok').addEventListener('click', async (ev) => {
+    const label = $('ep-label').value.trim()
+    const url = $('ep-url').value.trim()
+    if (!label) { toast('label 必填', 'warn'); return }
+    if (!url) { toast('url 必填', 'warn'); return }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        const body = {
+          label, url,
+          status: $('ep-status-input').value,
+        }
+        const notes = $('ep-notes').value
+        if (notes !== '') body.notes = notes
+        await apiJson('POST', '/api/admin/egress-proxies', body)
+        toast('已创建')
+        closeModal()
+        renderEgressProxiesTab()
+      } catch (e) {
+        toast(`创建失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  })
+}
+
+async function openEditEgressProxyModal(id) {
+  let row
+  try {
+    const r = await apiGet(`/api/admin/egress-proxies/${encodeURIComponent(id)}`)
+    row = r?.row
+    if (!row) throw new Error('未找到')
+  } catch (e) {
+    toast(`加载失败:${e.message}`, 'danger', toastOptsFromError(e))
+    return
+  }
+  // 编辑窗口出于安全不回显明文 URL — admin 想换就重输,留空表示不改
+  openModal(`
+    <h3>编辑代理 · ${escapeHtml(row.label)}</h3>
+    <div class="form-row"><label>label</label>
+      <input type="text" id="ep-label" value="${escapeHtml(row.label)}" /></div>
+    <div class="form-row"><label>当前 URL(已遮蔽,留空即不改)</label>
+      <input type="text" id="ep-url" placeholder="${escapeHtml(row.url_masked)}" /></div>
+    <div class="form-row"><label>status</label>
+      <select id="ep-status-input">
+        <option value="active" ${row.status === 'active' ? 'selected' : ''}>active</option>
+        <option value="disabled" ${row.status === 'disabled' ? 'selected' : ''}>disabled</option>
+      </select></div>
+    <div class="form-row"><label>notes</label>
+      <input type="text" id="ep-notes" value="${escapeHtml(row.notes || '')}" /></div>
+    <div class="form-actions">
+      <button id="ep-cancel">取消</button>
+      <button class="btn-primary" id="ep-ok">保存</button>
+    </div>
+  `)
+  $('ep-cancel').addEventListener('click', closeModal)
+  $('ep-ok').addEventListener('click', async (ev) => {
+    const label = $('ep-label').value.trim()
+    if (!label) { toast('label 必填', 'warn'); return }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        const patch = {
+          label,
+          status: $('ep-status-input').value,
+          notes: $('ep-notes').value,
+        }
+        const url = $('ep-url').value.trim()
+        if (url) patch.url = url
+        await apiJson('PATCH', `/api/admin/egress-proxies/${encodeURIComponent(id)}`, patch)
+        toast('已保存')
+        closeModal()
+        renderEgressProxiesTab()
+      } catch (e) {
+        toast(`保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  })
+}
+
+async function deleteEgressProxy(id, label, btn) {
+  if (!confirm(`确认删除代理 "${label}"?\n\n绑定它的账号会被自动解绑(egress_proxy_id 置 NULL)。`)) return
+  await withBtnLoading(btn, async () => {
+    try {
+      const r = await apiJson('DELETE', `/api/admin/egress-proxies/${encodeURIComponent(id)}`, null)
+      const n = r?.unbound_account_count ?? 0
+      toast(n > 0 ? `已删除,顺手解绑 ${n} 个账号` : '已删除')
+      renderEgressProxiesTab()
     } catch (e) {
       toast(`删除失败: ${e.message}`, 'danger', toastOptsFromError(e))
     }

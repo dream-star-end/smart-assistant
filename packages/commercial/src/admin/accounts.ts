@@ -29,6 +29,7 @@ import { getPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import {
   ACCOUNT_PLANS,
+  ACCOUNT_PROVIDERS,
   ACCOUNT_STATUSES,
   AccountNotFoundError,
   createAccount as storeCreate,
@@ -37,6 +38,7 @@ import {
   listAccounts as storeList,
   updateAccount as storeUpdate,
   type AccountPlan,
+  type AccountProvider,
   type AccountRow,
   type AccountStatus,
   type CreateAccountInput,
@@ -116,11 +118,13 @@ export function maskEgressProxy(url: string | null): string | null {
 function snapshotForAudit(r: AccountRow): Record<string, unknown> {
   return {
     id: r.id.toString(),
+    provider: r.provider,
     label: r.label,
     plan: r.plan,
     status: r.status,
     health_score: r.health_score,
     egress_proxy: maskEgressProxy(r.egress_proxy),
+    egress_proxy_id: r.egress_proxy_id !== null ? r.egress_proxy_id.toString() : null,
   };
 }
 
@@ -137,6 +141,11 @@ export async function adminGetAccount(id: bigint | string): Promise<AccountRow |
 // ─── Create ────────────────────────────────────────────────────────
 
 export interface AdminCreateAccountInput {
+  /**
+   * V3 provider(默认 'claude' 与 v2 行为一致)。
+   * provider='codex' 必须有 oauth_refresh_token(plan 决策 Q,refresh actor 依赖)。
+   */
+  provider?: AccountProvider;
   label: string;
   plan: AccountPlan;
   oauth_token: string;
@@ -144,6 +153,14 @@ export interface AdminCreateAccountInput {
   oauth_expires_at?: Date | string | null;
   /** 出口代理 URL,如 `http://user:pass@host:port`。null/省略 = 走本机出口 */
   egress_proxy?: string | null;
+  /**
+   * 0053 — 代理池 entry id。与 egress_proxy 文本互斥(决策 R):
+   *   - 同时提供 → 抛 'invalid_egress_proxy_mutex'
+   *   - 只提供 id → store 层落 id,raw 为 null
+   * 后端不在创建路径校验 entry 是否 active(decision R 简化:list dropdown 已只
+   * 出 active,active→disabled 中间态由前端容忍)。
+   */
+  egress_proxy_id?: bigint | string | null;
 }
 
 /** http(s)://[user:pass@]host[:port][/path] —— store.ts 的 validateEgressProxy 同样规则,这里前置 fail-fast */
@@ -158,6 +175,8 @@ export async function adminCreateAccount(
   input: AdminCreateAccountInput,
   ctx: AdminAuditCtx,
 ): Promise<AccountRow> {
+  const provider: AccountProvider = input.provider ?? "claude";
+  if (!ACCOUNT_PROVIDERS.includes(provider)) throw new RangeError("invalid_provider");
   if (!ACCOUNT_PLANS.includes(input.plan)) throw new RangeError("invalid_plan");
   if (typeof input.label !== "string" || input.label.trim().length === 0 || input.label.length > 120) {
     throw new RangeError("invalid_label");
@@ -180,6 +199,10 @@ export async function adminCreateAccount(
   if (refresh !== null && (typeof refresh !== "string" || refresh.length === 0)) {
     throw new RangeError("invalid_oauth_refresh_token");
   }
+  // codex 账号必须有 refresh_token — refresh actor 60s tick 依赖它(plan 决策 Q)
+  if (provider === "codex" && refresh === null) {
+    throw new RangeError("codex_account_requires_refresh_token");
+  }
   let egressProxy: string | null = null;
   if (input.egress_proxy !== undefined && input.egress_proxy !== null) {
     if (typeof input.egress_proxy !== "string" || input.egress_proxy.length === 0) {
@@ -188,23 +211,37 @@ export async function adminCreateAccount(
     validateEgressProxyOrThrow(input.egress_proxy);
     egressProxy = input.egress_proxy;
   }
+  let egressProxyId: string | null = null;
+  if (input.egress_proxy_id !== undefined && input.egress_proxy_id !== null) {
+    egressProxyId = String(input.egress_proxy_id);
+    if (!/^[1-9][0-9]{0,19}$/.test(egressProxyId)) {
+      throw new RangeError("invalid_egress_proxy_id");
+    }
+  }
+  // egress_proxy 与 egress_proxy_id 互斥(决策 R):同一账号只能从一处取代理 URL
+  if (egressProxy !== null && egressProxyId !== null) {
+    throw new RangeError("invalid_egress_proxy_mutex");
+  }
 
   const createInput: CreateAccountInput = {
+    provider,
     label: input.label.trim(),
     plan: input.plan,
     token: input.oauth_token,
     refresh,
     expires_at: expiresAt,
     egress_proxy: egressProxy,
+    egress_proxy_id: egressProxyId,
   };
   const row = await storeCreate(createInput);
 
-  // 0038 — 自动分配 egress host(仅当账号没显式手填 egress_proxy)。
-  // admin 手填代理 → 不动 host 字段(优先级:proxy > host)。
+  // 0038 — 自动分配 egress host(仅当 provider='claude' 且账号没显式 egress_proxy/_id)。
+  // admin 手填代理(raw 或 pool id) → 不动 host 字段(优先级:proxy > host)。
+  // codex 账号:容器内 codex CLI 直连 OpenAI,不走 mTLS forward proxy(决策 U)。
   // 池里没合格 host → 返 null 不报错,账号继续走 master 默认出口。
   // assign 失败不阻塞账号创建,记 best-effort audit。
   let assignedHostId: string | null = null;
-  if (egressProxy === null) {
+  if (provider === "claude" && egressProxy === null && egressProxyId === null) {
     try {
       assignedHostId = await pickAndAssignEgressHost(row.id);
     } catch (err) {
@@ -231,6 +268,11 @@ export async function adminCreateAccount(
 // ─── Patch ────────────────────────────────────────────────────────
 
 export interface AdminPatchAccountInput {
+  /**
+   * provider 不可改 — admin layer 显式拒绝(决策 R);store 层 UpdateAccountPatch
+   * 也未把 provider 列暴露,本字段仅用于让 HTTP 早期 reject。
+   */
+  provider?: never;
   label?: string;
   plan?: AccountPlan;
   status?: AccountStatus;
@@ -240,6 +282,14 @@ export interface AdminPatchAccountInput {
   oauth_expires_at?: Date | string | null;
   /** undefined = 不动;null = 清空(走本机出口);string = 设/换代理 URL。 */
   egress_proxy?: string | null;
+  /**
+   * 0053 引入。undefined = 不动;null = 解绑代理池;bigint/string = 绑指定 entry。
+   * 互斥规则(决策 R):
+   *   - 同时显式提供 egress_proxy 与 egress_proxy_id → 'invalid_egress_proxy_mutex'
+   *   - 只显式提供 egress_proxy_id → 自动把 egress_proxy 清成 null(防残留 raw)
+   *   - 只显式提供 egress_proxy → 自动把 egress_proxy_id 清成 null
+   */
+  egress_proxy_id?: bigint | string | null;
   /**
    * 0038 — 重新分配 egress host。
    *   - undefined = 不动
@@ -287,6 +337,27 @@ export async function adminPatchAccount(
       throw new RangeError("invalid_egress_proxy");
     }
     validateEgressProxyOrThrow(patch.egress_proxy);
+  }
+  let normalizedEgressProxyId: string | null | undefined = undefined;
+  if (patch.egress_proxy_id !== undefined) {
+    if (patch.egress_proxy_id === null) {
+      normalizedEgressProxyId = null;
+    } else {
+      const s = String(patch.egress_proxy_id);
+      if (!/^[1-9][0-9]{0,19}$/.test(s)) {
+        throw new RangeError("invalid_egress_proxy_id");
+      }
+      normalizedEgressProxyId = s;
+    }
+  }
+  // 互斥(决策 R):同时显式提供两者(且都非 null)→ 拒绝
+  if (
+    patch.egress_proxy !== undefined &&
+    patch.egress_proxy !== null &&
+    normalizedEgressProxyId !== undefined &&
+    normalizedEgressProxyId !== null
+  ) {
+    throw new RangeError("invalid_egress_proxy_mutex");
   }
   if (patch.egress_host_uuid !== undefined && patch.egress_host_uuid !== null) {
     if (typeof patch.egress_host_uuid !== "string" || patch.egress_host_uuid.length === 0) {
@@ -344,6 +415,7 @@ export async function adminPatchAccount(
     patch.oauth_token !== undefined ||
     patch.oauth_refresh_token !== undefined ||
     patch.egress_proxy !== undefined ||
+    patch.egress_proxy_id !== undefined ||
     patch.egress_host_uuid !== undefined ||
     expiresAt !== undefined;
   if (!touched) {
@@ -363,6 +435,22 @@ export async function adminPatchAccount(
   if (patch.oauth_token !== undefined) storePatch.token = patch.oauth_token;
   if (patch.oauth_refresh_token !== undefined) storePatch.refresh = patch.oauth_refresh_token;
   if (patch.egress_proxy !== undefined) storePatch.egress_proxy = patch.egress_proxy;
+  if (normalizedEgressProxyId !== undefined) storePatch.egress_proxy_id = normalizedEgressProxyId;
+  // 决策 R:只显式设了 id(非 null)→ 自动清 raw;只显式设了 raw(非 null)→ 自动清 id
+  if (
+    normalizedEgressProxyId !== undefined &&
+    normalizedEgressProxyId !== null &&
+    patch.egress_proxy === undefined
+  ) {
+    storePatch.egress_proxy = null;
+  }
+  if (
+    patch.egress_proxy !== undefined &&
+    patch.egress_proxy !== null &&
+    normalizedEgressProxyId === undefined
+  ) {
+    storePatch.egress_proxy_id = null;
+  }
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;
 
   const after = await storeUpdate(id, storePatch);
@@ -411,6 +499,10 @@ export async function adminPatchAccount(
     changedBefore.egress_proxy = maskEgressProxy(before.egress_proxy);
     changedAfter.egress_proxy = maskEgressProxy(after.egress_proxy);
   }
+  if (patch.egress_proxy_id !== undefined) {
+    changedBefore.egress_proxy_id = before.egress_proxy_id !== null ? before.egress_proxy_id.toString() : null;
+    changedAfter.egress_proxy_id = after.egress_proxy_id !== null ? after.egress_proxy_id.toString() : null;
+  }
   if (patch.egress_host_uuid !== undefined) {
     changedBefore.egress_host_uuid = egressHostBefore ?? null;
     changedAfter.egress_host_uuid = egressHostAfter ?? null;
@@ -455,12 +547,61 @@ export async function adminResetCooldown(
 
 // ─── Delete ──────────────────────────────────────────────────────
 
+/**
+ * 删除被 active per-container codex 容器引用的 codex 账号会让容器进无法访问的
+ * 死状态(plan v3 决策 B / migration 0054 RESTRICT 兜底说明)。
+ * adminDeleteAccount 抛此 Error 时,HTTP 应返 409。
+ */
+export class AccountHasActiveCodexBindingsError extends Error {
+  readonly code = "ACCOUNT_HAS_ACTIVE_CODEX_BINDINGS";
+  readonly active_binding_count: number;
+  constructor(active_binding_count: number) {
+    super(`codex account has ${active_binding_count} active container binding(s); cannot delete`);
+    this.name = "AccountHasActiveCodexBindingsError";
+    this.active_binding_count = active_binding_count;
+  }
+}
+
+/**
+ * Force-cascade: codex 账号 stopped/vanished 容器仍在 agent_containers 表里
+ * 持有 codex_account_id FK(因 RESTRICT FK,直接 DELETE 会 23503)。
+ * force=true 时本函数先把它们的 codex_account_id 置 NULL,再 DELETE。
+ *
+ * **永不 cascade-clear active 容器**:active row 上的 NULL = mount 错位,后续
+ * GPT 请求容器内 codex CLI 找不到 auth → 静默坏。Active count > 0 时仍抛
+ * AccountHasActiveCodexBindingsError;admin 必须先 disable + 等容器 stop。
+ */
 export async function adminDeleteAccount(
   id: bigint | string,
   ctx: AdminAuditCtx,
+  opts: { force?: boolean } = {},
 ): Promise<boolean> {
   const before = await storeGet(id);
   if (!before) return false;
+
+  // 决策 B + migration 0054:codex 账号若有 active 容器绑定,先返 409 阻止
+  if (before.provider === "codex") {
+    const activeCount = await query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c
+       FROM agent_containers
+       WHERE codex_account_id = $1 AND state = 'active'`,
+      [String(id)],
+    );
+    const n = Number(activeCount.rows[0]?.c ?? "0");
+    if (n > 0) {
+      throw new AccountHasActiveCodexBindingsError(n);
+    }
+    // force=true:把 stopped/vanished 容器的 codex_account_id 置 NULL,
+    // 让 RESTRICT FK 不再阻挡 DELETE。
+    if (opts.force === true) {
+      await query(
+        `UPDATE agent_containers
+         SET codex_account_id = NULL
+         WHERE codex_account_id = $1 AND state <> 'active'`,
+        [String(id)],
+      );
+    }
+  }
 
   const deleted = await storeDelete(id);
   if (!deleted) return false;

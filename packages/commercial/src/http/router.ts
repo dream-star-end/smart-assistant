@@ -86,6 +86,11 @@ import {
   handleAdminResetAccountCooldown,
   handleAdminOAuthStart,
   handleAdminOAuthExchange,
+  handleAdminListEgressProxies,
+  handleAdminGetEgressProxy,
+  handleAdminCreateEgressProxy,
+  handleAdminPatchEgressProxy,
+  handleAdminDeleteEgressProxy,
   handleAdminListAgentContainers,
   handleAdminContainersStats,
   handleAdminContainerLogs,
@@ -477,6 +482,13 @@ export function createCommercialHandler(
     { method: 'GET', pathPrefix: '/api/admin/accounts/', handler: handleAdminGetAccount },
     { method: 'PATCH', pathPrefix: '/api/admin/accounts/', handler: handleAdminPatchAccount },
     { method: 'DELETE', pathPrefix: '/api/admin/accounts/', handler: handleAdminDeleteAccount },
+    // V3 — Egress Proxy Pool(决策 P/Q/R)
+    // exact path 在 prefix 之前命中(matchRoute exact-first)
+    { method: 'GET', path: '/api/admin/egress-proxies', handler: handleAdminListEgressProxies },
+    { method: 'POST', path: '/api/admin/egress-proxies', handler: handleAdminCreateEgressProxy },
+    { method: 'GET', pathPrefix: '/api/admin/egress-proxies/', handler: handleAdminGetEgressProxy },
+    { method: 'PATCH', pathPrefix: '/api/admin/egress-proxies/', handler: handleAdminPatchEgressProxy },
+    { method: 'DELETE', pathPrefix: '/api/admin/egress-proxies/', handler: handleAdminDeleteEgressProxy },
     // T-60 超管 Agent 容器
     { method: 'GET', path: '/api/admin/agent-containers', handler: handleAdminListAgentContainers },
     // R4:exact path 在 pathPrefix 之前(matchRoute exact-first)

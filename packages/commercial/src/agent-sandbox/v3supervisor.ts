@@ -56,8 +56,15 @@ import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormal
 import type { Pool, PoolClient } from "pg";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
-import { V3_AGENT_GID } from "./constants.js";
+import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
+import { getCodexTokenSnapshot } from "../account-pool/store.js";
+import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
+import { zeroBuffer } from "../crypto/keys.js";
+import {
+  removeCodexContainerAuthDir,
+  writeCodexContainerAuthFile,
+} from "../codex-auth/codexAuthFile.js";
 
 // ───────────────────────────────────────────────────────────────────────
 // 常量(硬编码,设计有意为之)
@@ -1332,28 +1339,91 @@ export async function provisionV3Container(
       `${volumeNames.projects}:${V3_PROJECTS_MOUNT}:rw`,
     ];
 
-    // Codex auth ro bind-mount(plan v3 §D1)。仅本地 provision 路径挂 ——
+    // Codex auth ro bind-mount(plan v3 §F1/F2/D1)。仅本地 provision 路径挂 ——
     // 远端 host 上无对应目录,跨机同步 auth.json 是后续 task(GPT 模型在远端
     // 容器报未授权,与未 OAuth 路径合并到同一种 fail mode,前端 modelPicker
     // 不会给远端用户出 GPT 选项 / 后端 canUseModel 在执行路径再兜底一次)。
     //
+    // 两种 mount 模式(K/L):
+    //   - codex_account_id NOT NULL → mount per-container `<codexContainerDir>/<row.id>/`
+    //   - codex_account_id NULL(legacy / 池空 / 任一步失败回滚)→ mount 共享
+    //     `<codexContainerDir>/`(对应 master gateway 的 syncCodexAuthFile 路径)
+    //
+    // **mount 不可变 invariant**:启动时定型,运行时永不切换。lazy migrate 只换
+    // account_id 不换 mount;NULL 容器永远锁死在 legacy(决策 K/L/N3)。
+    //
     // 始终挂载:目录由本模块在 provision 前 mkdir(idempotent),即使 host 还没
     // 跑过 codexAuthSync,容器看到的是空目录,codex 启动报无 auth(预期)。
     // host 写入后无需重启容器,mount 是目录而非单文件,新 entry 立即可见。
+    let codexMountSource: string | null = null;
     if (!useRemote) {
       const codexContainerDir = readCodexContainerDirFromEnv();
+      // Phase 2 — 试图从 codex 池挑一个账号给本容器 sticky 绑定。
+      // **关键路径:provision 时立即写 per-container auth.json,首次 GPT 请求
+      // 无需等 refresh actor 即可成功**(plan F1 / Codex BLOCKER 1)。
+      //
+      // 任一步失败(picker 异常 / token 解密失败 / 写文件失败)→ 当作 NULL
+      // 处理走 legacy mount,不打断 provision —— GPT 路径在 bridge 层有兜底。
+      let boundCodexAccountId: bigint | null = null;
       try {
-        // mode 0755:owner=root rwx,其他用户(含容器内 agent uid)只能 r-x。
-        // 防容器内进程往 host 这个目录写,但允许进入查 auth.json。
-        await fsMkdir(codexContainerDir, { recursive: true, mode: 0o755 });
-      } catch (mkErr) {
-        // mkdir 失败不致命:bind-mount 时 docker 自身会报错,SupervisorError
-        // 走标准 wrapDockerError 路径。这里只做日志,不打断 provision。
+        const picked = await pickCodexAccountForBinding(String(row.id), {});
+        if (picked) {
+          let snap: Awaited<ReturnType<typeof getCodexTokenSnapshot>> = null;
+          try {
+            snap = await getCodexTokenSnapshot(picked.account_id);
+            if (snap && snap.token) {
+              await writeCodexContainerAuthFile({
+                rootDir: codexContainerDir,
+                containerId: String(row.id),
+                containerUid: V3_AGENT_UID,
+                containerGid: V3_AGENT_GID,
+                auth: {
+                  accessToken: snap.token.toString("utf8"),
+                  lastRefreshIso: new Date().toISOString(),
+                },
+              });
+              // UPDATE 在同一事务内,COMMIT 时一并落盘;若后续步骤失败 rollback
+              // 自动回滚到 NULL,但 host 文件留在 per-container 子目录是孤儿
+              // —— 由 stopAndRemoveV3Container / volume gc / 重 provision
+              // 的同名 row.id 覆盖兜底(本 PR 接受这层不一致)。
+              await client.query(
+                `UPDATE agent_containers SET codex_account_id = $1, updated_at = NOW() WHERE id = $2`,
+                [String(picked.account_id), String(row.id)],
+              );
+              boundCodexAccountId = picked.account_id;
+            }
+          } finally {
+            if (snap?.token) zeroBuffer(snap.token);
+            if (snap?.refresh) zeroBuffer(snap.refresh);
+          }
+        }
+      } catch (codexErr) {
+        // codex 路径任意失败 → 回退 legacy mount,不挂错。日志保留诊断线索。
+        // eslint-disable-next-line no-console
         console.error(
-          `[v3supervisor] WARN: ensure codex container dir failed: ${(mkErr as Error).message}`,
+          `[v3supervisor] WARN: codex account binding failed; falling back to legacy mount: ${(codexErr as Error).message}`,
         );
       }
-      binds.push(`${codexContainerDir}:${V3_CODEX_CONTAINER_MOUNT}:ro`);
+
+      if (boundCodexAccountId !== null) {
+        // per-container subdir 已由 writeCodexContainerAuthFile 创建(0755)
+        codexMountSource = pathJoin(codexContainerDir, String(row.id));
+      } else {
+        try {
+          // mode 0755:owner=root rwx,其他用户(含容器内 agent uid)只能 r-x。
+          // 防容器内进程往 host 这个目录写,但允许进入查 auth.json。
+          await fsMkdir(codexContainerDir, { recursive: true, mode: 0o755 });
+        } catch (mkErr) {
+          // mkdir 失败不致命:bind-mount 时 docker 自身会报错,SupervisorError
+          // 走标准 wrapDockerError 路径。这里只做日志,不打断 provision。
+          // eslint-disable-next-line no-console
+          console.error(
+            `[v3supervisor] WARN: ensure codex container dir failed: ${(mkErr as Error).message}`,
+          );
+        }
+        codexMountSource = codexContainerDir;
+      }
+      binds.push(`${codexMountSource}:${V3_CODEX_CONTAINER_MOUNT}:ro`);
     }
 
     if (sshUserRunDir) {
@@ -1699,6 +1769,16 @@ export async function stopAndRemoveV3Container(
       containerCleared = true; // 容器已不存在,清理目的达成
     } else {
       failures.push({ stage: "remove", err: wrapDockerError(err) });
+    }
+  }
+  // F3:本地容器的 per-container codex auth 目录最佳清理(best-effort,绝不
+  // 阻塞清理流程)。远端容器没在 master 写过此目录,跳过即可。
+  if (!useRemote) {
+    try {
+      const codexContainerDir = readCodexContainerDirFromEnv();
+      await removeCodexContainerAuthDir(codexContainerDir, String(containerRow.id));
+    } catch {
+      /* swallow */
     }
   }
   // 容器确认已清理 + 之前只有 stop 失败(没有 remove 失败) → 视作完整成功

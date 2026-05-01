@@ -24,7 +24,12 @@ import { AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { query } from '../db/queries.js'
 import type { AccountHealthTracker } from './health.js'
-import { type AccountPlan, getTokenForUse, updateAccount } from './store.js'
+import {
+  type AccountPlan,
+  type AccountProvider,
+  getTokenForUse,
+  updateAccount,
+} from './store.js'
 
 export const ERR_ACCOUNT_POOL_UNAVAILABLE = 'ERR_ACCOUNT_POOL_UNAVAILABLE'
 export const ERR_ACCOUNT_POOL_BUSY = 'ERR_ACCOUNT_POOL_BUSY'
@@ -84,6 +89,16 @@ export interface PickInput {
   sessionId?: string
   /** 为未来 "按模型过滤账号池" 预留,目前不使用。 */
   model?: string
+  /**
+   * V3 provider 分区(默认 'claude' 与 v2 行为一致)。
+   *   - 'claude' → SELECT ... WHERE provider='claude' AND status='active'
+   *   - 'codex'  → SELECT ... WHERE provider='codex'  AND status='active'
+   *
+   * 注意:codex 容器的 sticky 绑定走独立函数 `pickCodexAccountForBinding`(不污染
+   * scheduler 健康分 + 不进 inflight),pick() 只在 claude 路径或未来 codex chat
+   * 真实 API 调用路径上调用。
+   */
+  provider?: AccountProvider
 }
 
 export interface PickResult {
@@ -282,11 +297,13 @@ export class AccountScheduler {
       throw new TypeError(`unknown mode: ${String(input.mode)}`)
     }
 
+    const provider: AccountProvider = input.provider ?? 'claude'
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score
        FROM claude_accounts
-       WHERE status = 'active'
+       WHERE status = 'active' AND provider = $1
        ORDER BY id`,
+      [provider],
     )
     let pool = res.rows
     if (pool.length === 0) {
@@ -394,4 +411,93 @@ export class AccountScheduler {
     }
     // transient_network:已释放 slot,但不扣健康分(见 ReleaseResult 注释)
   }
+
+  /**
+   * 申请一个 codex per-account 并发槽。
+   *
+   * 与 pick() 路径区别:
+   *   - 不解密 token、不读 DB 之外的状态
+   *   - 不调 health tracker(release 也不调)
+   *   - 仅按 maxConcurrent 卡 inflight Map
+   *
+   * 调用契约:
+   *   - 每条 codex inbound 独立成对调用 acquire / release(plan G7 严格单飞)
+   *   - 抛 AccountPoolBusyError → bridge 转 error 帧 fast-fail,不 fallback
+   *
+   * @throws `AccountPoolBusyError` 当 inflight[id] >= maxConcurrent
+   */
+  acquireCodexSlot(account_id: bigint | string): void {
+    const id = String(account_id)
+    const cur = this.inflight.get(id) ?? 0
+    if (cur >= this.maxConcurrent) {
+      throw new AccountPoolBusyError(
+        `codex account ${id} at per-account concurrency cap (max=${this.maxConcurrent})`,
+      )
+    }
+    // 与 pick() 同步块语义一致 —— 当前 fn 是 sync,确实在 await 边界之外完成
+    this.incInflight(id)
+  }
+
+  /**
+   * 释放一个 codex per-account 并发槽(幂等)。
+   *
+   * 不调 health.onSuccess / onFailure(plan 决策 J2:bridge 用真实 turn 出参
+   * 决定健康分,不在这里挂)。
+   */
+  releaseCodexSlot(account_id: bigint | string): void {
+    this.decInflight(String(account_id))
+  }
+}
+
+/**
+ * Codex 容器与账号绑定专用 picker — 不污染 scheduler 健康分 / inflight Map。
+ *
+ * 用于:
+ *   - v3supervisor.provisionV3Container:容器启动时挑账号 → UPDATE
+ *     agent_containers.codex_account_id → 写 per-container auth.json
+ *   - userChatBridge lazy migrate(账号被 disable):重选一个 active codex 账号
+ *
+ * 与 `AccountScheduler.pick({provider:'codex'})` 区别:
+ *   - 不调 getTokenForUse(token 由调用方按需 getCodexTokenSnapshot 单独取)
+ *   - 不 inc inflight(provision 不是真实 API 调用)
+ *   - 不调 health(provision 不算 turn)
+ *   - **每个候选独立循环过滤 AEAD 损坏的账号**(若密文坏 quarantine + 跳过)
+ *
+ * @returns null 当 codex 池空 / 全 disabled(plan 决策 P:走 legacy mount)
+ */
+export interface PickCodexBindingDeps {
+  /** 注入测试 hash;默认 SHA-256 64-bit */
+  hash?: (s: string) => bigint
+}
+
+export async function pickCodexAccountForBinding(
+  sessionId: string,
+  deps: PickCodexBindingDeps = {},
+): Promise<{ account_id: bigint } | null> {
+  if (!sessionId || sessionId.length === 0) {
+    throw new TypeError('sessionId required for pickCodexAccountForBinding')
+  }
+  const hash = deps.hash ?? defaultHash
+
+  const res = await query<{ id: string; plan: AccountPlan; health_score: number }>(
+    `SELECT id::text AS id, plan, health_score
+     FROM claude_accounts
+     WHERE status = 'active' AND provider = 'codex'
+     ORDER BY id`,
+  )
+  if (res.rows.length === 0) return null
+
+  // rendezvous-hash sticky:对每个候选计算 hash(`sessionId:id`),取最大。
+  // 与 pickSticky 同语义,但这里独立函数避免依赖 CandidateRow 私有类型;
+  // 不进 inflight、不解密 token、不调 health。
+  let bestIdx = 0
+  let bestScore = hash(`${sessionId}:${res.rows[0].id}`)
+  for (let i = 1; i < res.rows.length; i += 1) {
+    const s = hash(`${sessionId}:${res.rows[i].id}`)
+    if (s > bestScore) {
+      bestScore = s
+      bestIdx = i
+    }
+  }
+  return { account_id: BigInt(res.rows[bestIdx].id) }
 }
