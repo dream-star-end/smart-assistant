@@ -152,6 +152,23 @@ export interface AgentDef {
   //                 (token-level item/agentMessage/delta streaming).
   // Undefined → 'exec' (default).
   runnerKind?: 'exec' | 'app-server'
+  /**
+   * Optional egress HTTP proxy URL for this agent's external API calls.
+   * Format: full URL with optional credentials, e.g.
+   * `http://user:pass@host:port` or `http://host:port`.
+   *
+   * Currently only honored when `provider === 'codex-native'` — the codex
+   * runner injects HTTPS_PROXY/HTTP_PROXY (and lowercase variants) into the
+   * spawned codex CLI subprocess env. Other runners (CCB / minimax) ignore
+   * this field; their egress is determined by the gateway process env.
+   *
+   * Decision: we deliberately do NOT inherit `process.env.HTTPS_PROXY` —
+   * codex egress is always explicit per-agent so a future system-level
+   * HTTPS_PROXY (e.g. systemd unit) does not silently change codex behavior.
+   *
+   * undefined / "" → no proxy env injected (codex CLI uses default egress).
+   */
+  proxyUrl?: string
   updatedAt?: string // ISO timestamp of last config change
 }
 

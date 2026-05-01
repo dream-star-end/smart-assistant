@@ -1605,12 +1605,42 @@ export class Gateway {
     }
   }
 
+  /**
+   * Redact credentials in an AgentDef before sending to the client.
+   * `proxyUrl` may carry `user:pass` — keep host:port for visibility but mask
+   * the credentials so they never end up in browser history, devtools network
+   * tab, service-worker cache, or shared screenshots. Returns a shallow copy;
+   * the in-memory config is never mutated.
+   */
+  private redactAgentForApi(agent: AgentDef): AgentDef {
+    if (!agent.proxyUrl) return agent
+    let redacted: string
+    try {
+      const u = new URL(agent.proxyUrl)
+      if (u.username || u.password) {
+        u.username = '***'
+        u.password = ''
+        redacted = u.toString()
+      } else {
+        redacted = agent.proxyUrl
+      }
+    } catch {
+      // Malformed URL — fully mask rather than leak structure.
+      redacted = '***'
+    }
+    return { ...agent, proxyUrl: redacted }
+  }
+
   // GET /api/agents         → { agents, default }
   // POST /api/agents        → create { id, model?, persona? }
   private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const cfg = await readAgentsConfig()
     if (req.method === 'GET') {
-      this.sendJson(res, 200, { agents: cfg.agents, default: cfg.default, routes: cfg.routes })
+      this.sendJson(res, 200, {
+        agents: cfg.agents.map((a) => this.redactAgentForApi(a)),
+        default: cfg.default,
+        routes: cfg.routes,
+      })
       return
     }
     if (req.method === 'POST') {
@@ -1647,7 +1677,7 @@ export class Gateway {
       } catch {}
       // 热更新路由
       this.router.reload(cfg)
-      this.sendJson(res, 201, { agent })
+      this.sendJson(res, 201, { agent: this.redactAgentForApi(agent) })
       return
     }
     this.sendError(res, 405, 'method not allowed')
@@ -1666,7 +1696,7 @@ export class Gateway {
     if (idx < 0) return this.sendError(res, 404, 'agent not found')
     const agent = cfg.agents[idx]
     if (req.method === 'GET') {
-      this.sendJson(res, 200, { agent })
+      this.sendJson(res, 200, { agent: this.redactAgentForApi(agent) })
       return
     }
     if (req.method === 'PUT') {
@@ -1685,7 +1715,7 @@ export class Gateway {
       await writeAgentsConfig(cfg)
       this.deps.agentsConfig = cfg
       this.router.reload(cfg)
-      this.sendJson(res, 200, { agent })
+      this.sendJson(res, 200, { agent: this.redactAgentForApi(agent) })
       return
     }
     if (req.method === 'DELETE') {

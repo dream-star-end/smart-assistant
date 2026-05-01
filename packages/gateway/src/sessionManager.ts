@@ -344,6 +344,7 @@ export class SessionManager {
           cwd,
           resumeSessionId: codexResumeId,
           model: codexModel,
+          proxyUrl: opts.agent.proxyUrl,
         }) as unknown as SubprocessRunner
       } else {
         runner = new CodexRunner({
@@ -352,6 +353,7 @@ export class SessionManager {
           cwd,
           resumeSessionId: codexResumeId,
           model: codexModel,
+          proxyUrl: opts.agent.proxyUrl,
         }) as unknown as SubprocessRunner
       }
     } else {

@@ -46,6 +46,10 @@ export interface CodexRunnerOpts {
   /** Agent model id from agents.yaml (e.g. `gpt-5-codex`). When set, added
    *  as `--model` to codex argv so the agent config is honored. */
   model?: string
+  /** Optional egress HTTP proxy URL (per-agent). Forwarded into buildCodexEnv
+   *  → HTTPS_PROXY/HTTP_PROXY (+ lowercase) for the spawned codex subprocess.
+   *  See AgentDef.proxyUrl in storage/config.ts for semantics & rationale. */
+  proxyUrl?: string
 }
 
 /** Max stderr we keep per turn. Codex CLI normally logs only on error, but
@@ -89,22 +93,61 @@ const ENV_SCRUB_KEYS = new Set<string>([
   'GATEWAY_AUTH_TOKEN',
   'MINIMAX_API_KEY',
   'DEEPSEEK_API_KEY',
+  // Proxy keys: explicit-only per-agent injection (see buildCodexEnv docstring).
+  // Strip inherited values from process.env so a future system-level
+  // HTTPS_PROXY (e.g. systemd unit) cannot silently change codex egress.
+  // codex CLI is Rust (reqwest) + Node — both honor ALL_PROXY / NO_PROXY in
+  // addition to HTTPS_PROXY/HTTP_PROXY, so we strip all of them and re-inject
+  // only when AgentDef.proxyUrl is explicitly set.
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+  'NO_PROXY',
+  'no_proxy',
 ])
 const ENV_SCRUB_PREFIXES = ['ANTHROPIC_', 'CLAUDE_CODE_', 'OPENCLAUDE_']
+
+/** Optional per-spawn overrides for buildCodexEnv. */
+export interface BuildCodexEnvOpts {
+  /** Per-agent egress proxy URL. When non-empty, sets HTTPS_PROXY / HTTP_PROXY
+   *  + lowercase variants on the returned env. Empty string / undefined leaves
+   *  the env without any *_PROXY keys (codex CLI then uses default egress).
+   *  We deliberately do NOT inherit process.env.HTTPS_PROXY — see AgentDef
+   *  docstring for the explicit-only decision. */
+  proxyUrl?: string
+}
 
 /**
  * Build the env passed to a codex subprocess. Exported so the app-server runner
  * (which spawns `codex app-server` instead of `codex exec`) can share the same
  * scrubbing rules — both subprocesses are codex's own CLI and have identical
  * env exposure concerns.
+ *
+ * Proxy injection: if opts.proxyUrl is a non-empty string, four env keys are
+ * set on the result (HTTPS_PROXY, HTTP_PROXY, https_proxy, http_proxy) all
+ * pointing at that URL. Different libraries inside codex (Rust reqwest, Node
+ * undici/fetch, plugin shells) honor different cases / variants, so all four
+ * minimizes compatibility risk. Empty string is treated as "not set" — no
+ * proxy key is added, leaving the spawned process with default egress.
  */
-export function buildCodexEnv(): NodeJS.ProcessEnv {
+export function buildCodexEnv(opts?: BuildCodexEnvOpts): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue
     if (ENV_SCRUB_KEYS.has(k)) continue
     if (ENV_SCRUB_PREFIXES.some((p) => k.startsWith(p))) continue
     out[k] = v
+  }
+  // Per-agent proxy override — explicit configuration only, no env fallback.
+  // Both upper- and lower-case keys set for cross-runtime compatibility.
+  if (opts?.proxyUrl !== undefined && opts.proxyUrl !== '') {
+    out.HTTPS_PROXY = opts.proxyUrl
+    out.HTTP_PROXY = opts.proxyUrl
+    out.https_proxy = opts.proxyUrl
+    out.http_proxy = opts.proxyUrl
   }
   return out
 }
@@ -450,7 +493,7 @@ export class CodexRunner extends EventEmitter {
         proc = spawn('codex', args, {
           cwd: this.opts.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
-          env: buildCodexEnv(),
+          env: buildCodexEnv({ proxyUrl: this.opts.proxyUrl }),
         })
       } catch (err) {
         // Sync spawn failure (rare — e.g. invalid args). Node throws rather

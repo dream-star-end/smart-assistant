@@ -55,6 +55,10 @@ export interface CodexAppServerRunnerOpts {
   /** Agent model id from agents.yaml (e.g. `gpt-5-codex`). Forwarded to
    *  thread/start/resume so codex picks the right model. */
   model?: string
+  /** Optional egress HTTP proxy URL (per-agent). Forwarded into buildCodexEnv
+   *  → HTTPS_PROXY/HTTP_PROXY (+ lowercase) for the spawned codex app-server
+   *  subprocess. See AgentDef.proxyUrl in storage/config.ts for semantics. */
+  proxyUrl?: string
 }
 
 interface QueuedTurn {
@@ -329,7 +333,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const proc = spawn('codex', ['app-server', '--listen', 'stdio://'], {
       cwd: this.opts.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: buildCodexEnv(),
+      env: buildCodexEnv({ proxyUrl: this.opts.proxyUrl }),
     })
     this.proc = proc
     proc.stdout.on('data', (chunk: Buffer) => {
