@@ -108,27 +108,40 @@ function schemaMatches(parsed: Record<string, unknown>): boolean {
 }
 
 async function killCodexInContainer(internalId: string): Promise<"killed" | "not_running" | "error"> {
+  // The container image is minimal (no pkill / pgrep / ps), so we walk
+  // /proc directly with a POSIX shell snippet and use the `kill` builtin
+  // (always available). Codex runs under several command forms (legacy
+  // `codex mcp-server`, current `codex app-server --listen stdio://`,
+  // plain CLI), but the kernel-truncated `/proc/<pid>/comm` value is just
+  // `codex` for all of them — exact match on comm is reliable and won't
+  // hit unrelated `codex-foo` siblings.
+  //
+  // Output: "<count>" on stdout. count==0 → no codex was running (fine —
+  // codex re-spawns per-turn from the rewritten file). count>0 → killed.
+  // We don't use the script's exit code; we read stdout and decide.
+  const script =
+    'k=0; for d in /proc/[0-9]*; do ' +
+    'c=$(cat "$d/comm" 2>/dev/null) || continue; ' +
+    '[ "$c" = "codex" ] || continue; ' +
+    'pid=${d##*/}; ' +
+    'kill -9 "$pid" 2>/dev/null && k=$((k+1)); ' +
+    'done; echo "$k"';
   try {
-    // pkill exits 0 if killed something, 1 if no match, >1 on error.
-    // Codex runs in containers under several command forms (legacy MCP server
-    // `codex mcp-server`, current app-server `codex app-server --listen
-    // stdio://`, or short-lived `codex …` CLI). pkill against /proc/*/comm
-    // (the kernel-truncated 15-char process name) reliably matches all of
-    // them as "codex" regardless of argv. Using `-x` ensures we don't kill
-    // unrelated `codex-foo` siblings if any ever appear.
-    const { stdout, stderr } = await execFile("docker", [
+    const { stdout } = await execFile("docker", [
       "exec",
       internalId,
-      "pkill",
-      "-x",
-      "codex",
+      "sh",
+      "-c",
+      script,
     ]);
-    void stdout; void stderr;
-    return "killed";
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & { code?: number; stderr?: string };
-    // child_process exec error: code is the EXIT CODE; pkill exit 1 = nothing matched.
-    if (e.code === 1) return "not_running";
+    const trimmed = stdout.trim();
+    if (!/^\d+$/.test(trimmed)) return "error";
+    const n = parseInt(trimmed, 10);
+    return n > 0 ? "killed" : "not_running";
+  } catch {
+    // docker exec itself failed (container gone / daemon issue). The
+    // auth.json rewrite already succeeded; treat this as a real error so
+    // ops investigates whether the container should be reaped.
     return "error";
   }
 }
