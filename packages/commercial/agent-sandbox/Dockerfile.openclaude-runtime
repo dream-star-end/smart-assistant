@@ -73,9 +73,11 @@ RUN apt-get update \
 # 全局装到 /usr/local/lib/node_modules/@openai/codex,二进制 symlink 在 /usr/local/bin/codex。
 # 容器内 USER=agent 走默认 PATH 即可命中。
 #
-# Auth: codex CLI 默认读 $CODEX_HOME/auth.json(下面 ENV CODEX_HOME 显式 set),
-# host 通过 ro bind-mount 把剥离 refresh_token 的 auth.json 写到 /home/agent/.codex/。
-# 详见 packages/gateway/src/codexAuthSync.ts 的 writeContainerVariant + supervisor mount。
+# Auth: codex CLI 默认读 $CODEX_HOME/auth.json。CODEX_HOME=/home/agent/.codex
+# 在容器内必须可写(codex 启动写 .personality_migration / sqlite / PATH binaries),
+# entrypoint.ts 在 CODEX_HOME 下建 symlink auth.json → /run/oc/codex-auth/auth.json,
+# 后者是 supervisor 把 host 剥离 refresh_token 的 auth.json 目录 ro bind-mount 进来的源。
+# 详见 packages/gateway/src/codexAuthSync.ts + v3supervisor.ts 的 V3_CODEX_AUTH_RO_MOUNT。
 RUN npm install -g @openai/codex@0.125.0 --no-audit --no-fund \
     && npm cache clean --force \
     && rm -rf /root/.npm
@@ -91,8 +93,10 @@ RUN set -eux; \
     groupadd -g 1000 agent; \
     useradd -u 1000 -g 1000 -m -d /home/agent -s /bin/bash agent; \
     # /home/agent/.openclaude: supervisor 会把 oc-v3-data-u<uid> volume 挂到这里
+    # /home/agent/.codex:      CODEX_HOME(可写),entrypoint 在里面建 auth.json
+    #                          symlink 指向 /run/oc/codex-auth/auth.json(ro bind 源)
     # 镜像里建空目录 + chown,首次挂载时 docker 会保留 ownership
-    mkdir -p /home/agent/.openclaude; \
+    mkdir -p /home/agent/.openclaude /home/agent/.codex; \
     chown -R agent:agent /home/agent; \
     chmod 750 /home/agent; \
     # /run/oc/claude-config: CLAUDE_CONFIG_DIR 目标(supervisor --tmpfs 挂)。

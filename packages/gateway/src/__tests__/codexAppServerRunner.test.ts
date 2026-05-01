@@ -41,6 +41,7 @@ async function makeHarness(
   opts: {
     resumeSessionId?: string
     withFakeProc?: boolean
+    model?: string
   } = {},
 ): Promise<Harness> {
   const baseTmp = await mkdtemp(join(tmpdir(), 'codex-aps-'))
@@ -49,6 +50,7 @@ async function makeHarness(
     agentId: 'test',
     cwd: baseTmp,
     resumeSessionId: opts.resumeSessionId,
+    model: opts.model,
   })
   const messages: any[] = []
   const errors: any[] = []
@@ -858,6 +860,23 @@ describe('SubprocessRunner interface parity', () => {
     h.runner.updateConfig({})
     h.runner.setEffortLevel('high')
     assert.equal(h.runner.sendPermissionResponse('req-1', {}), false)
+    await h.cleanup()
+  })
+
+  it('model getter / setModel mutates and never spawns', async () => {
+    // Regression: sessionManager.submit calls session.runner.setModel on every
+    // InboundMessage with model field; missing method = TypeError → turn never
+    // completes → user sees "思考中" forever (witnessed in v3 v1.0.61b prod).
+    const h = await makeHarness({ model: 'gpt-5.5' })
+    assert.equal(h.runner.model, 'gpt-5.5')
+    h.runner.setModel('gpt-5-codex')
+    assert.equal(h.runner.model, 'gpt-5-codex')
+    h.runner.setModel(undefined)
+    assert.equal(h.runner.model, undefined)
+    // Contract parity with SubprocessRunner.setModel: pure setter, no spawn.
+    // Caller (sessionManager) owns restart via shutdown() + next submit.
+    assert.equal((h.runner as any).proc, null)
+    assert.equal(h.spawns.length, 0)
     await h.cleanup()
   })
 

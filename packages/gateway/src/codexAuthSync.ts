@@ -15,7 +15,8 @@ import { dirname, join } from 'node:path'
  *     here so only the gateway main process can refresh.
  *
  *   container file (ro bind-mounted into each per-user container as
- *                   /home/agent/.codex/auth.json)
+ *                   /run/oc/codex-auth/auth.json; entrypoint creates symlink
+ *                   $CODEX_HOME/auth.json -> /run/oc/codex-auth/auth.json)
  *   ─────────────
  *     /var/lib/openclaude-v3/codex-container-auth/auth.json
  *     STRIPPED schema — no refresh_token, no id_token.

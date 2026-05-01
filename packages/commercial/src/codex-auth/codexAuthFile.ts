@@ -6,7 +6,9 @@
  * provider='codex'`), and each user container is sticky-bound to one of those
  * accounts via `agent_containers.codex_account_id`. Each bound container
  * receives its own auth.json under `<codexContainerDir>/<container_id>/`,
- * mounted ro into the container at `/home/agent/.codex/`. The legacy
+ * mounted ro into the container at `/run/oc/codex-auth/` and exposed to
+ * codex CLI via a symlink at `$CODEX_HOME/auth.json` (entrypoint.ts).
+ * The legacy
  * gateway path (`syncCodexAuthFile`) writes a single shared dir from
  * `config.auth.codexOAuth` and is preserved untouched for backward
  * compatibility with NULL-codex_account_id containers.

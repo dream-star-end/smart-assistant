@@ -26,12 +26,22 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
 import { join } from "node:path";
-import * as YAML from "yaml";
 import { isProviderManagedEnvVar } from "/opt/openclaude/claude-code-best/src/utils/managedEnvConstants.ts";
+
+// entrypoint.ts 文件被 Dockerfile COPY 到 /usr/local/lib/openclaude/,而 yaml 模块装在
+// 容器内 /opt/openclaude/node_modules/yaml(npm workspaces 装到根)。Node ESM/require
+// 默认从文件位置沿父链找 node_modules,/usr/local/lib/openclaude/ 父链没 node_modules,
+// 直接 import "yaml" 会 MODULE_NOT_FOUND。createRequire 锚到 /opt/openclaude/package.json
+// 把 resolution 起点显式拉到工作区根。
+const requireFromOC = createRequire("/opt/openclaude/package.json");
+const YAML: typeof import("yaml") = requireFromOC("yaml");
 
 // ───────────────────────────────────────────────
 // 1. 环境变量清洗
@@ -77,14 +87,51 @@ cleanEnv.CLAUDE_CONFIG_DIR = "/run/oc/claude-config";
 // 存在才传,空串视作 undefined。
 cleanEnv.OPENCLAUDE_HOME = "/home/agent/.openclaude";
 
-// Codex CLI 默认从 $CODEX_HOME/auth.json 读 OAuth token。host 把剥离 refresh_token
-// 的 auth.json 通过 ro bind-mount 写到 /home/agent/.codex/(见 v3supervisor.ts 的
-// codex-container-auth 目录挂载),codex 默认路径直接命中。**不要**把这个目录改到
-// 别处,否则 `codex` 二进制找不到 auth → 启动即 fail。
+// Codex CLI 默认从 $CODEX_HOME/auth.json 读 OAuth token。CODEX_HOME 还是 codex CLI 的
+// 状态/日志目录(`.personality_migration` / `logs_*.sqlite` / `state_*.sqlite` /
+// `memories/` / `skills/` / helper PATH binaries 都写在这里),**必须可写**。
 //
-// boss 未 OAuth 时,host 不写 auth.json,但 mount 始终在(空目录),codex 启动报
-// "未授权"是预期行为(GPT 模型在 admin UI 也未发授权,前端 modelPicker 不会出选项)。
+// 早期实现把 host 的 ro auth 源直接挂到 CODEX_HOME → codex 启动写状态/PATH 时
+// `Read-only file system (os error 30)` → exit 1。现拆成两路:
+//
+//   /home/agent/.codex/             ← agent owned 可写(image rootfs upper layer)
+//     auth.json                     ← symlink → /run/oc/codex-auth/auth.json
+//     logs_*.sqlite, state_*.sqlite, memories/, skills/  ← codex 自由写
+//   /run/oc/codex-auth/             ← host bind ro,只放 auth.json
+//     auth.json                     ← host master gateway 通过 atomic rename 写入
+//
+// 用 symlink 而不是 copy:
+//   - host atomic rename 在 source dir 替换 entry,容器侧 /run/oc/codex-auth dirfd
+//     立即可见新 entry,codex 下次读 auth.json 走 symlink → 新 dirent
+//   - copy 路径需要监听刷新 + 重写,复杂且并发不安全
+//
+// 失败模式(全部预期):
+//   - host 未 mount /run/oc/codex-auth(codex 池空 / OAuth 未配)→ symlink dangle
+//     → codex 读 auth.json ENOENT → 报"未授权"(与未 OAuth 等价)
+//
+// 安全边界**保护 host auth 源不被容器改写**(/run/oc/codex-auth 是 RO bind mount);
+// CODEX_HOME 下的 auth.json **symlink 不是安全控制** —— 容器内 agent 本来就能读
+// auth token(mode 0400),改 symlink 最多让自己的 codex 找不到 auth(自伤)。
 cleanEnv.CODEX_HOME = "/home/agent/.codex";
+
+const CODEX_HOME_DIR = "/home/agent/.codex";
+const CODEX_AUTH_SOURCE = "/run/oc/codex-auth/auth.json";
+try {
+  mkdirSync(CODEX_HOME_DIR, { recursive: true });
+  const authLink = join(CODEX_HOME_DIR, "auth.json");
+  // unlink 旧 symlink/file(idempotent — 容器重启会再跑)
+  // 只吞 ENOENT;EACCES / EISDIR / EBUSY 等部署故障必须冒泡到外层 catch 报警
+  try {
+    unlinkSync(authLink);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  symlinkSync(CODEX_AUTH_SOURCE, authLink);
+} catch (e) {
+  console.error(
+    `[entrypoint] WARN: codex auth symlink setup failed: ${(e as Error).message}`,
+  );
+}
 
 // ───────────────────────────────────────────────
 // 2. 个人版 openclaude.json 首次启动 bootstrap

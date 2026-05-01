@@ -6,7 +6,9 @@
 --     1. 容器 provision 时 pickCodexAccountForBinding(sessionId=container_id)
 --        rendezvous-hash sticky 选一个 active codex 账号
 --     2. 立即把该账号 access_token 写到 per-container
---        `<codexContainerDir>/<container_id>/auth.json` (mount 进 /home/agent/.codex)
+--        `<codexContainerDir>/<container_id>/auth.json`
+--        (ro mount 进 /run/oc/codex-auth,容器 entrypoint 把 $CODEX_HOME/auth.json
+--         symlink 到这里;CODEX_HOME 自身可写)
 --     3. 此 container 后续所有 GPT 请求走该账号(sticky 长生命周期)
 --   该列存绑定关系,refresh actor / lazy migrate / per-account 并发槽都依赖此列。
 --

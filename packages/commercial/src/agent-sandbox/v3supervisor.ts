@@ -152,24 +152,31 @@ export const V3_VOLUME_MOUNT = "/home/agent/.openclaude";
 const V3_AGENT_USER = "1000:1000";
 
 /**
- * Codex CLI(GPT 模型走 codex app-server runner)的容器侧 auth 目录挂载点。
+ * Codex CLI(GPT 模型走 codex app-server runner)的容器侧 auth **源**挂载点。
  *
  * **设计要点(plan v3 §D + 风险 #4)**:
- *   - 容器内 codex CLI 默认读 `$CODEX_HOME/auth.json`,entrypoint.ts 已强制
- *     `CODEX_HOME=/home/agent/.codex`,docker bind-mount 把 host 的剥离
- *     refresh_token 版本 auth.json 挂到这里,**ro**。
+ *   - 容器内 `CODEX_HOME=/home/agent/.codex`(entrypoint.ts 显式 set),codex CLI 启动时
+ *     需要在 CODEX_HOME 下写 `.personality_migration` / `logs_*.sqlite` /
+ *     `state_*.sqlite` / `memories/` / `skills/` / helper PATH binaries —— 因此
+ *     **CODEX_HOME 必须可写**(挂 RO 会让 `codex app-server` exit 1)。
+ *   - 本常量是 host auth 源的**独立 RO 挂载点**(不是 CODEX_HOME):docker bind-mount
+ *     把 host 剥离 refresh_token 后的 auth.json 目录挂到 `/run/oc/codex-auth`,**ro**。
+ *     entrypoint.ts 在 CODEX_HOME/auth.json 创建 symlink 指向 `/run/oc/codex-auth/auth.json`。
  *   - **必须挂目录而非单文件**:host atomic rename(`auth.json.tmp.<rand> → auth.json`)
  *     在文件 bind-mount 下绑死旧 inode,容器永远看不到新 token。挂目录后
- *     容器看到的是 dirfd → entry "auth.json",rename 替换 entry 后立即可见。
+ *     容器侧 dirfd → entry "auth.json",rename 替换 entry 后,symlink 解析到新 inode 即可见。
  *   - **永不挂 master 目录**(`codex-master-auth/`)—— 那里有完整 refresh_token,
  *     挂入容器即扩大泄漏面。本常量只引用 container 目录。
- *   - **始终挂载**(boss 未 OAuth 时目录内无 auth.json,codex 启动报"未授权"
- *     是预期行为;前端 modelPicker 在 GPT 未授权时也不会出选项)。
+ *   - **始终挂载**(boss 未 OAuth 时目录内无 auth.json,symlink 解析 ENOENT,codex
+ *     启动报"未授权"是预期行为;前端 modelPicker 在 GPT 未授权时也不会出选项)。
+ *   - **安全边界**:RO 挂载保证 host auth 源不可被容器代码改写。CODEX_HOME 下的
+ *     auth.json **symlink 本身不是安全控制** —— 容器内 agent 已经能读 token,改 symlink
+ *     最多让自己的 codex 找不到 auth(自伤),不影响 host 文件。
  *   - **当前限制**:host 写入由 master gateway 完成,远端 host(useRemote=true)
  *     的容器拿不到 auth.json,GPT 模型仅在 master host 容器可用。跨 host 同步
  *     auth.json 是后续 task,plan v3 范围内不处理。
  */
-export const V3_CODEX_CONTAINER_MOUNT = "/home/agent/.codex";
+export const V3_CODEX_AUTH_RO_MOUNT = "/run/oc/codex-auth";
 
 /**
  * Host 侧容器 auth 目录默认路径。对应 codexAuthSync.writeContainerVariant
@@ -1423,7 +1430,7 @@ export async function provisionV3Container(
         }
         codexMountSource = codexContainerDir;
       }
-      binds.push(`${codexMountSource}:${V3_CODEX_CONTAINER_MOUNT}:ro`);
+      binds.push(`${codexMountSource}:${V3_CODEX_AUTH_RO_MOUNT}:ro`);
     }
 
     if (sshUserRunDir) {

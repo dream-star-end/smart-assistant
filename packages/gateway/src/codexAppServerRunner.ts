@@ -194,6 +194,20 @@ export class CodexAppServerRunner extends EventEmitter {
     // for that path in codex-native — keep parity with CodexRunner no-op.
   }
 
+  // ── model getter / setter (parity with CodexRunner / SubprocessRunner) ──
+  // sessionManager.submit 在 InboundMessage 带 model 且与 runner.model 不同时调
+  // runner.setModel,缺方法 → TypeError → turn 永不 complete → 用户卡 "思考中"。
+  // runTurn 在 ensureSpawned 后 attach 阶段读 `this.opts.model`,塞进 thread/start
+  // 或 thread/resume 的 model 字段,所以 setModel 只改 opts 即可,下次 attach 生效。
+  // 不在这里 spawn / shutdown — caller (sessionManager) 通过 shutdown() 触发
+  // 重启,这是 SubprocessRunner.setModel 既定契约。
+  get model(): string | undefined {
+    return this.opts.model
+  }
+  setModel(model: string | undefined): void {
+    this.opts.model = model
+  }
+
   sendPermissionResponse(_requestId: string, _response: unknown): boolean {
     // Same rationale as CodexRunner: app-server is launched with
     // approvalPolicy=never + sandbox=danger-full-access, so it never asks for
