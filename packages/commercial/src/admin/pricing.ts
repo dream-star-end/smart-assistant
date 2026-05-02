@@ -36,6 +36,11 @@ export interface ModelPricingRowView {
   sort_order: number;
   updated_at: Date;
   updated_by: string | null;
+  // 0049 引入。DB schema 是 NOT NULL DEFAULT 'public',因此非 nullable。
+  // 前端 admin.js mg-tab 用这个字段 filter 受限模型,漏 select 会让所有
+  // visibility=admin/hidden 的模型(gpt-5.5 / claude-haiku-4-5 / deepseek-*)
+  // 在"用户模型授权"页签消失。
+  visibility: 'public' | 'admin' | 'hidden';
 }
 
 const PRICING_COLS = `
@@ -49,7 +54,8 @@ const PRICING_COLS = `
   enabled,
   sort_order,
   updated_at,
-  updated_by::text           AS updated_by
+  updated_by::text           AS updated_by,
+  visibility
 `;
 
 /** model_id 白名单:字母数字 + . + - + _,上限 64 字符。 */
