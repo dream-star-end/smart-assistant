@@ -594,6 +594,7 @@ function serializePricing(r: ModelPricingRowView): Record<string, unknown> {
     sort_order: r.sort_order,
     updated_at: r.updated_at.toISOString(),
     updated_by: r.updated_by,
+    visibility: r.visibility,
   };
 }
 
