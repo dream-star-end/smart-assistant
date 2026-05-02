@@ -33,6 +33,7 @@ import {
 
 export const ERR_ACCOUNT_POOL_UNAVAILABLE = 'ERR_ACCOUNT_POOL_UNAVAILABLE'
 export const ERR_ACCOUNT_POOL_BUSY = 'ERR_ACCOUNT_POOL_BUSY'
+export const ERR_CONTAINER_STALE_BINDING = 'ERR_CONTAINER_STALE_BINDING'
 
 export class AccountPoolUnavailableError extends Error {
   readonly code = ERR_ACCOUNT_POOL_UNAVAILABLE
@@ -54,6 +55,32 @@ export class AccountPoolBusyError extends Error {
   constructor(reason: string) {
     super(`account pool busy: ${reason}`)
     this.name = 'AccountPoolBusyError'
+  }
+}
+
+/**
+ * 容器 codex_account_id IS NULL(legacy 绑定)且池子里有 active codex 账号时抛出。
+ *
+ * 背景:plan v3 K/L invariant — docker bind mount 在 startup 时固定;
+ * NULL 绑定的容器永远 mount 共享 root(`<codexContainerDir>/auth.json`),
+ * 不读 per-container subdir。v3 commercial 没有 master writer 维护这个共享
+ * auth.json,所以 NULL 容器在池子有账号时仍然 401。
+ *
+ * 解法是把容器标 vanished + docker rm,让用户下条 message 触发 ensureRunning
+ * 重 provision,picker 走 active 账号路径产出 per-container mount → 正常工作。
+ *
+ * 该错误由 `codexBinding.acquire` 在判定 stale 后抛出,bridge 应捕获并:
+ *   - 给前端发 CODEX_CONTAINER_RECYCLED error frame
+ *   - 关掉本次 ws 连接
+ *   - 不释放任何 slot / inflight(因为本 turn 还没占任何资源)
+ */
+export class ContainerStaleBindingError extends Error {
+  readonly code = ERR_CONTAINER_STALE_BINDING
+  readonly containerId: number
+  constructor(containerId: number) {
+    super(`container ${containerId} codex binding stale (NULL bind + non-empty pool); recycled`)
+    this.name = 'ContainerStaleBindingError'
+    this.containerId = containerId
   }
 }
 

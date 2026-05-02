@@ -1423,7 +1423,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             forwardInboundFrame(frameForwardData, frameForwardIsBinary, frameForwardLen);
           } catch (err) {
             const errName = (err as { name?: string } | null | undefined)?.name ?? "";
-            if (errName === "AccountPoolBusyError") {
+            if (errName === "ContainerStaleBindingError") {
+              // codexBinding.acquire 探测到 NULL 绑定但池子非空 — 已在 acquire 内
+              // mark vanished + await stopAndRemoveV3Container 把 docker 实体清掉。
+              // 本 turn 还没 acquire 任何 slot / 没注册 inflight billing(都在 try{}
+              // 块里 acquire 之后),因此**不要**调 releaseAcquiredSlotForFailure
+              // (no-op 但语义混淆)。直接通知前端 + 关连接 — 用户重发会触发
+              // ensureRunning 重 provision,picker 落 per-container mount,然后正常工作。
+              log?.info("user-chat-bridge: codex container stale, recycled", {
+                uid: uid.toString(),
+                connId,
+                err: (err as Error)?.message,
+              });
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "CODEX_CONTAINER_RECYCLED",
+                  "GPT 账号配置已变更,容器已自动重建,请刷新页面后重发",
+                );
+                try { userWs.close(CLOSE_BRIDGE.POLICY, "codex_container_recycled"); } catch { /* */ }
+              }
+            } else if (errName === "AccountPoolBusyError") {
               log?.info("user-chat-bridge: codex pool busy, fast-fail", {
                 uid: uid.toString(),
                 connId,

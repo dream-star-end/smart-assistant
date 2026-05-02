@@ -154,7 +154,7 @@ interface BillingRig {
 
 async function startRig(opts: {
   userBalance?: bigint;
-  acquireResult?: "account" | "legacy" | "throw";
+  acquireResult?: "account" | "legacy" | "throw" | "stale";
   drainMs?: number;
 } = {}): Promise<BillingRig> {
   // mock 容器 ws
@@ -178,6 +178,10 @@ async function startRig(opts: {
     async acquire(_containerId: number) {
       bindingState.acquireCalls += 1;
       if (acquireResult === "throw") throw new Error("simulated acquire failure");
+      if (acquireResult === "stale") {
+        const { ContainerStaleBindingError } = await import("../account-pool/scheduler.js");
+        throw new ContainerStaleBindingError(_containerId);
+      }
       if (acquireResult === "legacy") return null;
       return { account_id: 7n };
     },
@@ -648,6 +652,50 @@ describe("userChatBridge / codex billing — legacy NULL container per-turn bill
     }
 
     ws.close();
+  });
+});
+
+describe("userChatBridge / codex acquire — ContainerStaleBindingError recycle path", () => {
+  let rig: BillingRig;
+  before(async () => {
+    rig = await startRig({ userBalance: 1_000_000n, acquireResult: "stale" });
+  });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => { _resetAgentMultiplierCacheForTests(); });
+
+  test("acquire throws ContainerStaleBindingError → bridge sends CODEX_CONTAINER_RECYCLED + closes ws", async () => {
+    const token = await makeJwt("19");
+    const ws = openClient(rig.gatewayPort, token);
+    await waitOpen(ws);
+    // 不预拨 container ws — recycle 路径 acquire 抛错前不会到 forward,
+    // resolveContainerEndpoint 仍会被调一次拿 containerId,但容器 socket 早绑了
+    // listener 通过 wss handler。本 test 关心的是用户侧帧 + close。
+    let closeCode = 0;
+    let closeReason = "";
+    ws.on("close", (code, reason) => {
+      closeCode = code;
+      closeReason = reason.toString("utf8");
+    });
+    ws.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+    }));
+    const errFrame = await waitJsonFrameOfType(ws, "error");
+    assert.equal(errFrame.code, "CODEX_CONTAINER_RECYCLED");
+    assert.match(String(errFrame.message ?? ""), /容器已自动重建/);
+    // 等 ws 真正 close
+    await new Promise<void>((r) => {
+      if (ws.readyState === WebSocket.CLOSED) r();
+      else ws.once("close", () => r());
+    });
+    assert.equal(closeCode, 1008, "policy close code");
+    assert.equal(closeReason, "codex_container_recycled");
+    // 没占 per-account slot,所以 release 也不该被调
+    assert.equal(rig.binding.releaseCalls, 0);
+    // billing 路径根本没进 — 没 INSERT INTO inflight_charges / usage_records
+    const billingInserts = rig.poolCtrl.queries.filter((q) =>
+      /INSERT INTO (inflight_charges|usage_records)/.test(q.sql),
+    );
+    assert.equal(billingInserts.length, 0, "no billing rows on stale recycle");
   });
 });
 

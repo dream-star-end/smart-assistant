@@ -35,6 +35,7 @@ import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
 import {
   AccountScheduler,
+  ContainerStaleBindingError,
   pickCodexAccountForBinding,
 } from "./account-pool/scheduler.js";
 import { getCodexTokenSnapshot } from "./account-pool/store.js";
@@ -61,6 +62,7 @@ import {
 } from "./account-pool/codexAccountActor.js";
 import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
+  stopAndRemoveV3Container,
 } from "./agent-sandbox/v3supervisor.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
 import {
@@ -1151,17 +1153,29 @@ export async function registerCommercial(
   //     未被赋值 → cleanup() 与 G6 timer 都不知道哪个 account 该 release → 永久泄漏。
   //   - release(account_id):dec inflight,幂等。
   //   - v3Deps 未注入(测试 / 早期 boot 路径)→ codexBinding=undefined,bridge 退化为不做并发管控
+  // 闭包外 capture v3Deps 给 stale recycle fire-and-forget 路径用(必须非空)。
+  const v3DepsForCodex = v3Deps;
   const codexBinding: CodexBindingHandle | undefined = v3Deps
     ? {
         async acquire(containerId: number) {
-          // tx 内做"锁 + 查 + 可能 lazy migrate";acquire slot 在 tx 外
-          const result = await tx<{ account_id: bigint } | null>(async (client) => {
+          // tx 内做"锁 + 查 + 可能 lazy migrate / stale recycle";acquire slot / 容器 rm 在 tx 外
+          type AcquireResult =
+            | { kind: "active"; account_id: bigint }
+            | { kind: "stale"; containerInternalId: string | null; hostUuid: string | null }
+            | null;
+          const result: AcquireResult = await tx<AcquireResult>(async (client) => {
             const lookup = await client.query<{
               account_id: string | null;
               account_status: string | null;
+              state: string;
+              container_internal_id: string | null;
+              host_uuid: string | null;
             }>(
               `SELECT ac.codex_account_id::text AS account_id,
-                      ca.status AS account_status
+                      ca.status AS account_status,
+                      ac.state AS state,
+                      ac.container_internal_id AS container_internal_id,
+                      ac.host_uuid AS host_uuid
                FROM agent_containers ac
                LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
                WHERE ac.id = $1
@@ -1174,12 +1188,56 @@ export async function registerCommercial(
               return null;
             }
             const row = lookup.rows[0];
-            if (row.account_id === null) {
-              // 决策 N3:legacy NULL 容器永远不进 acquire / lazy migrate 路径
+            if (row.state !== "active") {
+              // 容器已不再 active(stopped / vanished / removed) — 当 legacy 透传,
+              // 让下游 sendToContainer 路径产出标准错误,不在 acquire 这层造一种新的错。
               return null;
             }
+            if (row.account_id === null) {
+              // legacy NULL 绑定。检查池子里是否有 active codex 账号:
+              //   - 没有 → 真 legacy 路径不变,return null(N3 行为兼容)
+              //   - 有   → 用户 admin 已加账号但容器 mount immutable 永远 401,
+              //            必须 mark vanished + docker rm 让 ensureRunning 重 provision
+              //            重新走 picker 路径产出 per-container mount。
+              // 池子查询条件必须与 pickCodexAccountForBinding 完全一致(provider='codex'
+              // AND status='active'),否则可能误判为"有账号"但 picker 实际拿不到。
+              const poolCount = await client.query<{ cnt: string }>(
+                `SELECT count(*)::text AS cnt
+                   FROM claude_accounts
+                  WHERE provider = 'codex' AND status = 'active'`,
+              );
+              if (Number(poolCount.rows[0]?.cnt ?? "0") === 0) {
+                return null;
+              }
+              // 池子非空 — recycle。同 tx 内把 row 标 vanished,与下面 lazy migrate
+              // 的 UPDATE 同 commit,避免并发 acquirer 看到 state='active' 走错路径。
+              // WHERE state='active' guard 防 race:并发 acquirer/admin/idleSweep
+              // 已经把 state 改了的话本 UPDATE rowCount=0,我们也回 null 让 caller
+              // 当 legacy 透传(那条路径自然产出错误返给前端)。
+              // FOR UPDATE OF ac 已锁住本 row,UPDATE WHERE state='active' 在同 tx
+              // 内应永远 rowCount=1。rowCount=0 = 不变量破坏(只可能是更上层 SELECT
+              // 时 row.state 已经不是 'active' — 但前面 row.state !== 'active' 早已
+              // 拦截)。这里 throw 抬出问题,而不是静默 return null 让 caller 当 legacy
+              // 透传 — 那条路径走旧容器仍会 401,只是把问题往后挪。
+              const upd = await client.query(
+                `UPDATE agent_containers
+                    SET state = 'vanished', updated_at = NOW()
+                  WHERE id = $1 AND state = 'active'`,
+                [containerId],
+              );
+              if ((upd.rowCount ?? 0) === 0) {
+                throw new Error(
+                  `codex stale recycle: UPDATE state=vanished rowCount=0 for container ${containerId} (invariant: FOR UPDATE row was active)`,
+                );
+              }
+              return {
+                kind: "stale",
+                containerInternalId: row.container_internal_id,
+                hostUuid: row.host_uuid,
+              };
+            }
             if (row.account_status === "active") {
-              return { account_id: BigInt(row.account_id) };
+              return { kind: "active", account_id: BigInt(row.account_id) };
             }
             // disabled / quarantined / 任意非 active → lazy migrate
             const picked = await pickCodexAccountForBinding(String(containerId), {});
@@ -1221,13 +1279,37 @@ export async function registerCommercial(
                WHERE id = $2`,
               [String(picked.account_id), containerId],
             );
-            return { account_id: picked.account_id };
+            return { kind: "active", account_id: picked.account_id };
           });
           if (result === null) return null;
+          if (result.kind === "stale") {
+            // tx 已 commit:row.state 已落 vanished。**必须 await** 把 docker 实体清掉
+            // 再返错,否则容器名 oc-v3-u<uid> 是 per-uid 固定,旧实体没 rm 时下条
+            // message 触发 ensureRunning 会撞 docker NameConflict 被卡几秒重试,体
+            // 验上不"自愈"。await 失败也 throw stale(下次 ensureRunning 仍会自己
+            // try stop/remove 旧名字兜底,与今天 orphanReconcile 路径一致),但日志
+            // 留 warn 便于诊断。
+            try {
+              await stopAndRemoveV3Container(v3DepsForCodex!, {
+                id: containerId,
+                container_internal_id: result.containerInternalId,
+                host_uuid: result.hostUuid,
+              });
+            } catch (err) {
+              rootLogger.warn(
+                "[commercial] codex stale recycle: stopAndRemoveV3Container failed (continuing — ensureRunning will retry on next message)",
+                {
+                  containerId,
+                  err: (err as Error)?.message ?? String(err),
+                },
+              );
+            }
+            throw new ContainerStaleBindingError(containerId);
+          }
           // tx 已 commit;现在尝试占 in-process per-account slot。Busy → 抛 AccountPoolBusyError
           // (bridge 转 CODEX_POOL_BUSY)。lazy migrate 已落盘不会回滚,Busy 只影响本 turn。
           scheduler.acquireCodexSlot(result.account_id);
-          return result;
+          return { account_id: result.account_id };
         },
         release(account_id: bigint): void {
           try { scheduler.releaseCodexSlot(account_id); } catch { /* */ }
