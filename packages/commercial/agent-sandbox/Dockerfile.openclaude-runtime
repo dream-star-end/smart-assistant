@@ -83,6 +83,38 @@ RUN npm install -g @openai/codex@0.125.0 --no-audit --no-fund \
     && rm -rf /root/.npm
 
 # ------------------------------------------------------------
+# Codex system skills 预 populate(image_gen / openai-docs / ...)
+# ------------------------------------------------------------
+# codex 0.125 的内建 image_gen 工具是通过 `~/.codex/skills/.system/imagegen/`
+# system skill 暴露的;codex CLI 启动时会从 binary 内嵌资源 populate 这个目录,
+# 实测耗时 1-2 秒。gateway lazy-spawn codex 接到首个 turn 时,populate 还没
+# 完成 → codex enumerate tools 看不到 imagegen → 用户问"画图"时 codex 自答
+# "当前环境没有暴露内置 image_gen 工具" 然后 fallback 到 PIL(2026-05-02 incident)。
+#
+# 解决:build 阶段以 root 跑一次 codex app-server 触发 populate,把生成的
+# skills/ 整体移到镜像内固定路径 /opt/codex-system-skills/(所有人可读),
+# entrypoint 容器启动时 cp 到 /home/agent/.codex/skills/ —— 详见
+# runtime/entrypoint.ts 的 codex skills seed 段。
+#
+# 失败兜底:populate 后的 marker 文件必须存在,否则 build fail(避免发坏镜像)。
+RUN mkdir -p /tmp/_cx/.codex && \
+    HOME=/tmp/_cx CODEX_HOME=/tmp/_cx/.codex bash -c '\
+      codex app-server --listen stdio:// </dev/null >/dev/null 2>&1 & \
+      pid=$!; \
+      for i in 1 2 3 4 5 6 7 8; do \
+        [ -f /tmp/_cx/.codex/skills/.system/.codex-system-skills.marker ] && break; \
+        sleep 1; \
+      done; \
+      kill "$pid" 2>/dev/null || true; \
+      wait "$pid" 2>/dev/null || true; \
+    ' && \
+    test -f /tmp/_cx/.codex/skills/.system/.codex-system-skills.marker && \
+    cp -a /tmp/_cx/.codex/skills /opt/codex-system-skills && \
+    rm -rf /tmp/_cx && \
+    chmod -R a+rX /opt/codex-system-skills && \
+    test -f /opt/codex-system-skills/.system/.codex-system-skills.marker
+
+# ------------------------------------------------------------
 # 账户 agent (uid=1000)
 # ------------------------------------------------------------
 # node:22-slim 自带 uid=1000 的 node 用户;先 userdel 改名 agent,supervisor

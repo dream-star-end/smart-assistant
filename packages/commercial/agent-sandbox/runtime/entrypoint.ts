@@ -23,6 +23,7 @@
 import { spawn } from "node:child_process";
 import {
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -130,6 +131,38 @@ try {
 } catch (e) {
   console.error(
     `[entrypoint] WARN: codex auth symlink setup failed: ${(e as Error).message}`,
+  );
+}
+
+// ── codex system skills seed(image_gen 等内建 tool 必需)──
+// codex 0.125 把 image_gen 等内建工具实现成 `~/.codex/skills/.system/imagegen/`
+// system skill。codex CLI 启动时会 populate 这个目录,但实测耗时 1-2s,
+// gateway lazy-spawn codex 接到首个 turn 时 populate 还没好,enumerate tools
+// 看不到 imagegen → 用户问"画图"时 codex 自答 "没有 image_gen 工具"。
+//
+// build 阶段 Dockerfile 已把 populate 出来的 skills 放到 /opt/codex-system-skills,
+// 这里把它 copy 到 CODEX_HOME/skills/(idempotent — imagegen/SKILL.md 已存在则跳过),
+// 让首个 turn 就能看到 imagegen。
+//
+// 失败 non-fatal — image_gen 不可用不该挂掉容器(用户其它 codex 功能仍可用)。
+const BAKED_SKILLS = "/opt/codex-system-skills";
+const TARGET_SKILLS = join(CODEX_HOME_DIR, "skills");
+try {
+  const targetImagegen = join(TARGET_SKILLS, ".system", "imagegen", "SKILL.md");
+  const bakedMarker = join(
+    BAKED_SKILLS,
+    ".system",
+    ".codex-system-skills.marker",
+  );
+  if (!existsSync(targetImagegen) && existsSync(bakedMarker)) {
+    cpSync(BAKED_SKILLS, TARGET_SKILLS, {
+      recursive: true,
+      preserveTimestamps: true,
+    });
+  }
+} catch (e) {
+  console.error(
+    `[entrypoint] WARN: codex system skills seed failed (non-fatal): ${(e as Error).message}`,
   );
 }
 
