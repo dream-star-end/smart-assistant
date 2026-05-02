@@ -83,8 +83,21 @@ const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_
  * 已下线模型 / 恶意 frame 注入字符串让 CCB --model 拿到非法值导致 spawn 失败 →
  * session 卡死。运行时校验在 server.ts:WS handler 里;export 出来便于 unit test
  * 与未来抽 helper。
+ *
+ * 当前 commercial 暴露集合(2026-05-02 v1.0.68 起):
+ *   - claude-opus-4-7 / claude-sonnet-4-6 — 主力 anthropic 模型
+ *   - gpt-5.5 — codex agent 走 codex JSON-RPC
+ *   - deepseek-v4-flash / deepseek-v4-pro — anthropicProxy 在 master 侧 isDeepseekModel
+ *     命中后切换上游(DEEPSEEK_UPSTREAM_ENDPOINT + DEEPSEEK_API_KEY),
+ *     在 claude-subscription agent 上跑就够,不需要切 agent
  */
-export const ALLOWED_INBOUND_MODELS = new Set(['claude-opus-4-7', 'claude-sonnet-4-6', 'gpt-5.5'])
+export const ALLOWED_INBOUND_MODELS = new Set([
+  'claude-opus-4-7',
+  'claude-sonnet-4-6',
+  'gpt-5.5',
+  'deepseek-v4-flash',
+  'deepseek-v4-pro',
+])
 
 // v3 commercial: shared codex chatgpt OAuth between host gateway and per-user
 // containers requires two host directories — master (refresh_token, never

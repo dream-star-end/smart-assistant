@@ -62,11 +62,18 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.equal(spawned, false, 'setModel must not spawn — caller owns restart via shutdown()')
   })
 
-  it('ALLOWED_INBOUND_MODELS contains the v1.0.4 launch set', () => {
-    // 这俩是 v1.0.4 上线时支持切换的模型;新增其他模型时这个测试要同步更新。
+  it('ALLOWED_INBOUND_MODELS contains the currently exposed model set', () => {
+    // 新增其他模型时这个测试要同步更新。
     // 防止 server.ts WS handler 的静态白名单跟前端 modelPicker 期望的列表漂移。
+    // v1.0.4 launch set:
     assert.ok(ALLOWED_INBOUND_MODELS.has('claude-opus-4-7'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('claude-sonnet-4-6'))
+    // codex agent (gpt-5.5 走 codex JSON-RPC):
+    assert.ok(ALLOWED_INBOUND_MODELS.has('gpt-5.5'))
+    // v1.0.68 起 DeepSeek anthropic-compatible 上游(在 anthropicProxy
+    // isDeepseekModel 命中后切 DEEPSEEK_UPSTREAM_ENDPOINT):
+    assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-flash'))
+    assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-pro'))
   })
 
   it('ALLOWED_INBOUND_MODELS rejects bogus / typo model ids', () => {
