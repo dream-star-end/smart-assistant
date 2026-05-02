@@ -25,6 +25,8 @@ import {
   buildSafeUpstreamHeaders,
   ConcurrencyLimiter,
   extractSessionId,
+  isDeepseekModel,
+  DEEPSEEK_UPSTREAM_ENDPOINT,
   ALLOWED_BETA_VALUES,
   ANTHROPIC_VERSION,
   SIZE_LIMITS,
@@ -701,5 +703,42 @@ describe("extractSessionId — 边界", () => {
 
   test("user_id 为空字符串 → null", () => {
     assert.equal(extractSessionId({ user_id: "" }), null);
+  });
+});
+
+// ─── isDeepseekModel — 2026-05-02 deepseek 接入 ────────────────────────────
+
+describe("isDeepseekModel", () => {
+  test("deepseek-v4-flash → true", () => {
+    assert.equal(isDeepseekModel("deepseek-v4-flash"), true);
+  });
+
+  test("deepseek-v4-pro → true", () => {
+    assert.equal(isDeepseekModel("deepseek-v4-pro"), true);
+  });
+
+  test("`deepseek-` 任意后缀都命中(prefix 语义,无版本/家族 allowlist)", () => {
+    assert.equal(isDeepseekModel("deepseek-v5-ultra"), true);
+    assert.equal(isDeepseekModel("deepseek-coder-x"), true);
+  });
+
+  test("claude / gpt 系列绝不命中", () => {
+    assert.equal(isDeepseekModel("claude-sonnet-4-6"), false);
+    assert.equal(isDeepseekModel("claude-opus-4-6"), false);
+    assert.equal(isDeepseekModel("gpt-5.5"), false);
+    assert.equal(isDeepseekModel("haiku-4-5"), false);
+  });
+
+  test("空字符串 / 仅 'deepseek'(无连字符) → false(防误命中)", () => {
+    assert.equal(isDeepseekModel(""), false);
+    // 'deepseek' 单独一个 token 不带 '-' 不算 —— 我们 model_id 全部带 '-' 后缀
+    assert.equal(isDeepseekModel("deepseek"), false);
+  });
+
+  test("DEEPSEEK_UPSTREAM_ENDPOINT 是官方 anthropic-兼容路径", () => {
+    assert.equal(
+      DEEPSEEK_UPSTREAM_ENDPOINT,
+      "https://api.deepseek.com/anthropic/v1/messages",
+    );
   });
 });

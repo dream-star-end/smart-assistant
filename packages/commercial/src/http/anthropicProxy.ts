@@ -52,6 +52,7 @@ import {
   type ContainerIdentityRepo,
 } from "../auth/containerIdentity.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
+import { canUseModel } from "../billing/authzModels.js";
 import {
   preCheckWithCost,
   releasePreCheck,
@@ -64,6 +65,7 @@ import {
   AccountPoolUnavailableError,
   AccountPoolBusyError,
   type AccountScheduler,
+  type PickResult,
 } from "../account-pool/scheduler.js";
 import {
   checkRateLimit,
@@ -94,6 +96,29 @@ import { recordHostRequest } from "../compute-pool/hostReqCounter.js";
 
 /** 上游 endpoint。可被 deps 覆盖(测试)。 */
 export const DEFAULT_UPSTREAM_ENDPOINT = "https://api.anthropic.com/v1/messages";
+
+/**
+ * DeepSeek 的 anthropic 兼容端点(2026-05-02 接入)。
+ *
+ * 命中条件:`body.model.startsWith('deepseek-')`。命中后:
+ *   - endpoint 切到这里
+ *   - Authorization: Bearer <DEEPSEEK_API_KEY>(deps.deepseekApiKey)
+ *   - 跳过 scheduler.pick / refresh / dispatcher / quota(deepseek 用 API key,无 OAuth 池)
+ *   - **strip anthropic-beta header** — DeepSeek 文档没列支持哪些 anthropic-beta,
+ *     CCB 默认带 effort / task-budgets / redact-thinking 等 ~10 个 beta,strip 避免
+ *     未知 beta 被 strict 拒;后续按 deepseek 实际行为再加白名单
+ *   - **不注入 oauth-2025-04-20**(那是 anthropic OAuth 账号专用)
+ *
+ * 1M context 默认开,output 最大 384K(本期 proxy max_tokens schema 仍 cap 200K,
+ * 不动;CCB 内默认 max_tokens 远低于 200K,实际不会触发)。
+ */
+export const DEEPSEEK_UPSTREAM_ENDPOINT =
+  "https://api.deepseek.com/anthropic/v1/messages";
+
+/** 模型 id 是否走 deepseek 路径。 */
+export function isDeepseekModel(modelId: string): boolean {
+  return modelId.startsWith("deepseek-");
+}
 
 /** anthropic-version 唯一允许值。OAuth 管理账号路径与 v2 / 个人版一致。 */
 export const ANTHROPIC_VERSION = "2023-06-01";
@@ -734,7 +759,18 @@ export interface FinalizeContext {
   requestId: string;
   userId: bigint;
   containerId: bigint;
-  accountId: bigint;
+  /**
+   * Claude 路径:scheduler.pick 选中的 claude_accounts.id,用于:
+   *   - finalize 时 scheduler.release(account_id, result) 回流健康分
+   *   - usage_records.account_id FK 关联(0044 已 nullable)
+   *
+   * **DeepSeek 路径(2026-05-02 接入):accountId=null**。理由:
+   *   - DeepSeek 用 API key,不走 claude_accounts 池,无 account_id 概念
+   *   - finalizer 在 accountId===null 时跳过 scheduler.release(没账号要回流)
+   *   - usage_records.account_id 写 NULL(0044 SET NULL FK 支持)
+   *   - 计费、journal、ledger 全部按 user 维度走,与 accountId 解耦
+   */
+  accountId: bigint | null;
   model: string;
   pricing: ModelPricing;
   precheckCredits: bigint;
@@ -996,16 +1032,20 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
         } catch (e) {
           ctx.log.warn("proxy_release_precheck_failed", { err: errSummary(e) });
         }
-        try {
-          await deps.scheduler.release({
-            account_id: ctx.accountId,
-            result:
-              schedulerResult === "success"
-                ? { kind: "success" }
-                : { kind: "failure", error: schedulerErrMsg },
-          });
-        } catch (e) {
-          ctx.log.warn("proxy_release_scheduler_failed", { err: errSummary(e) });
+        // DeepSeek 路径(accountId===null)无 claude_accounts pool slot 要回流;
+        // 跳过 scheduler.release 以免传 null account_id 进 scheduler 内部。
+        if (ctx.accountId !== null) {
+          try {
+            await deps.scheduler.release({
+              account_id: ctx.accountId,
+              result:
+                schedulerResult === "success"
+                  ? { kind: "success" }
+                  : { kind: "failure", error: schedulerErrMsg },
+            });
+          } catch (e) {
+            ctx.log.warn("proxy_release_scheduler_failed", { err: errSummary(e) });
+          }
         }
         done = out;
         return out;
@@ -1078,7 +1118,11 @@ export async function settleUsageAndLedger(
   pool: Pool,
   args: {
     userId: bigint;
-    accountId: bigint;
+    /**
+     * Claude 路径 = claude_accounts.id;DeepSeek 路径 = null(无账号池概念,
+     * usage_records.account_id 写 NULL,0044 SET NULL FK 支持)。
+     */
+    accountId: bigint | null;
     requestId: string;
     model: string;
     usage: TokenUsage;
@@ -1106,7 +1150,8 @@ export async function settleUsageAndLedger(
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
-          args.accountId.toString(),
+          // accountId === null → SQL NULL(deepseek 路径)
+          args.accountId === null ? null : args.accountId.toString(),
           args.model,
           BigInt(args.usage.input_tokens).toString(),
           BigInt(args.usage.output_tokens).toString(),
@@ -1264,6 +1309,44 @@ export interface AnthropicProxyDeps {
    * 不传 → 扣费仍正常发生,只是前端看到的还是估算 $;deploy 时必须注入。
    */
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
+  /**
+   * 加载用户的模型授权信息(2026-05-02 接入 deepseek 时引入)。
+   *
+   * 必须从**服务端权威源**(DB)读取 role + grants:
+   *   - role:`SELECT role FROM users WHERE id=$1`(0001 init schema 已有)
+   *   - grants:`SELECT model_id FROM model_visibility_grants WHERE user_id=$1`
+   *
+   * 关键不变量:
+   *   - 容器请求**不**传 role / grants(即使 header / body / metadata),容器可伪造
+   *   - 失败 fail-closed:throw → handler 返回 500 INTERNAL,不放行
+   *
+   * 调用时机:取到 pricing 之后、preCheck 之前(放在 preCheck 后会引入 reservation
+   * release 复杂度,且 fail-closed 直接 500 不需要 release)。
+   *
+   * Codex 评审 BLOCKER 修:proxy 历史只校验 `pricing.enabled`,不查 visibility/grants
+   * → 用户拿到容器后可直接 POST `model: deepseek-v4-pro` 绕过前端授权。本 dep 强制
+   * proxy 走 canUseModel 路径,同时收口 gpt-5.5 / haiku-4-5 等 admin/hidden 模型的
+   * 同类越权风险。
+   */
+  loadUserModelAuthz: (
+    uid: bigint,
+  ) => Promise<{
+    role: "user" | "admin";
+    grantedModelIds: ReadonlySet<string>;
+  }>;
+  /**
+   * DeepSeek API key(2026-05-02 接入)。
+   *
+   * 配置时 anthropicProxy 收到 model 命中 isDeepseekModel() 的请求 → forward 到
+   * DEEPSEEK_UPSTREAM_ENDPOINT,Authorization: Bearer <deepseekApiKey>。
+   *
+   * 未配置(undefined)→ 命中 deepseek 模型的请求返回 503 +
+   * reject reason `'deepseek_config'`(独立指标,不混入 claude account_pool)。
+   *
+   * 与 process.env.DEEPSEEK_API_KEY 完全解耦:wiring 在 index.ts 显式从
+   * loadConfig().DEEPSEEK_API_KEY 取并注入,proxy 内不读 process.env。
+   */
+  deepseekApiKey?: string;
 }
 
 /**
@@ -1452,6 +1535,62 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
+      // 5b) 模型授权(2026-05-02 deepseek 接入引入,Codex review BLOCKER 修)。
+      //
+      // 历史:proxy 只校验 pricing.enabled,不查 visibility/grants。结果:
+      //   - 用户拿到容器后可直接 POST { model: 'deepseek-v4-pro' } 绕过前端 modelPicker
+      //     的 admin/hidden 隐藏 → 越权使用 admin 模型(同样影响 gpt-5.5 / haiku-4-5)。
+      //
+      // 修复:取 pricing 后、preCheck 前,从服务端权威源(DB)拿 role + grants,
+      // canUseModel 判定;失败 403。位置选 preCheck 之前是为了避免引入 reservation
+      // release 复杂度 — fail-closed 直接 sendJsonError 退出,无需 release。
+      //
+      // 容器请求**不**传 role / grants(即使 header / body / metadata),容器可伪造。
+      // loadUserModelAuthz throw → 500 INTERNAL,不放行。
+      let authz: { role: "user" | "admin"; grantedModelIds: ReadonlySet<string> };
+      try {
+        authz = await deps.loadUserModelAuthz(uid);
+      } catch (err) {
+        userLog.error("proxy_authz_load_failed", { err: errSummary(err) });
+        sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
+        return;
+      }
+      if (
+        !canUseModel(
+          { pricing: deps.pricing },
+          {
+            role: authz.role,
+            grantedModelIds: authz.grantedModelIds,
+            modelId: body.model,
+          },
+        )
+      ) {
+        userLog.warn("proxy_unauthorized_model", {
+          model: body.model,
+          role: authz.role,
+        });
+        incrAnthropicProxyReject("unauthorized_model");
+        sendJsonError(res, 403, "NOT_AUTHORIZED", "model not authorized", requestId);
+        return;
+      }
+
+      // 5c) 标记 deepseek 路径(2026-05-02)。命中 → 跳过 scheduler.pick / refresh /
+      //     dispatcher / quota,Authorization 用 DEEPSEEK_API_KEY,endpoint 切到
+      //     DEEPSEEK_UPSTREAM_ENDPOINT,strip anthropic-beta。
+      const isDeepseek = isDeepseekModel(body.model);
+      if (isDeepseek && !deps.deepseekApiKey) {
+        userLog.warn("proxy_deepseek_not_configured", { model: body.model });
+        incrAnthropicProxyReject("deepseek_config");
+        sendJsonError(
+          res,
+          503,
+          "DEEPSEEK_NOT_CONFIGURED",
+          "deepseek upstream not configured",
+          requestId,
+        );
+        return;
+      }
+
       // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)
       const inputTokens = estimateInputTokens(body);
       const totalMaxCost = estimateMaxCostBothSides(inputTokens, body.max_tokens, pricing);
@@ -1494,123 +1633,129 @@ export function makeAnthropicProxyHandler(
       }
 
       // 7) 取账号 + (按需)刷 token
-      let pick;
-      try {
-        pick = await deps.scheduler.pick({
-          mode: "chat",
-          sessionId: extractSessionId(body.metadata) ?? undefined,
-          model: body.model,
-        });
-      } catch (err) {
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
-        if (err instanceof AccountPoolBusyError) {
-          userLog.warn("proxy_account_pool_busy", { msg: err.message });
-          incrAnthropicProxyReject("account_pool_busy");
-          sendJsonError(
-            res,
-            429,
-            "ACCOUNT_POOL_BUSY",
-            "all accounts busy, retry later",
-            requestId,
-            { "Retry-After": "5" },
-          );
-          return;
-        }
-        if (err instanceof AccountPoolUnavailableError) {
-          userLog.warn("proxy_account_pool_unavailable", { msg: err.message });
-          incrAnthropicProxyReject("account_pool");
-          sendJsonError(res, 503, "ACCOUNT_POOL_UNAVAILABLE", "account pool unavailable, try again", requestId);
-          return;
-        }
-        throw err;
-      }
-      // 不持有 finalizer 之前,任何后续异常都得手动 release pick + preCheck;
-      // 之后(从 startInflightJournal 起)统一交给 finalize.fail
-      // HIGH#5:同 account 的 chat 与 refresh 必须从同一出口 IP 出去 —— Anthropic
-      // anti-abuse 会把 refresh 与紧随其后的 chat 关联,IP 一变立即触发风控。
-      // 0038:dispatcher 在 plain proxy 与 mTLS forward proxy 之间二选一(plain 优先);
-      // 都缺则 undefined,fetch 走默认出口(master VM)。
-      const accountDispatcher = await getDispatcherForAccount(
-        pick.account_id,
-        pick.egress_proxy,
-        pick.egress_target,
-      );
-      try {
-        if (
-          deps.refreshDeps &&
-          pick.expires_at &&
-          shouldRefresh(pick.expires_at, new Date(), DEFAULT_REFRESH_SKEW_MS)
-        ) {
-          try {
-            const r = await refreshAccountToken(pick.account_id, {
-              ...deps.refreshDeps,
-              // 显式覆盖:即使 caller 在 refreshDeps 里塞了别的 dispatcher,
-              // 也用 account 的固定出口,不让"全局 dispatcher 漏选"破坏稳定 IP。
-              dispatcher: accountDispatcher,
-            });
-            // 释放老 token(零化),用新 token
-            try {
-              pick.token.fill(0);
-            } catch {
-              /* ignore */
-            }
-            try {
-              pick.refresh?.fill(0);
-            } catch {
-              /* ignore */
-            }
-            pick = {
-              account_id: pick.account_id,
-              plan: pick.plan,
-              token: r.token,
-              refresh: r.refresh,
-              expires_at: r.expires_at,
-              egress_proxy: pick.egress_proxy,
-              egress_target: pick.egress_target,
-            };
-          } catch (err) {
-            // refresh 失败:account 已在 RefreshError 内部按规约处理 disable/不 disable;
-            // 调度器层面:
-            //   - network_transient(#H9):纯网络抖动(代理挂 / DNS / TLS)。不扣健康分,
-            //     仅 dec inflight。否则代理一抖全池账号瞬间被连续扣分 → 误判 cooldown/disable。
-            //   - 其它(上游 4xx/5xx / bad_response / persist_error / 未知):按 failure 扣分。
-            const isTransient =
-              err instanceof RefreshError && err.code === "network_transient";
-            userLog.warn("proxy_refresh_failed", {
-              accountId: pick.account_id.toString(),
-              code: err instanceof RefreshError ? err.code : "unknown",
-              msg: err instanceof Error ? err.message : String(err),
-              transient: isTransient,
-            });
-            await deps.scheduler
-              .release({
-                account_id: pick.account_id,
-                result: isTransient
-                  ? { kind: "transient_network", error: errMessageShort(err) }
-                  : { kind: "failure", error: errMessageShort(err) },
-              })
-              .catch(() => {});
-            await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
-            incrAnthropicProxyReject("upstream_auth");
-            sendJsonError(res, 502, "UPSTREAM_AUTH_REFRESH_FAILED", "failed to refresh upstream token", requestId);
+      // 2026-05-02:deepseek 路径不走 OAuth 池,这一整段(scheduler.pick / dispatcher /
+      // refresh)全部跳过,pick 保持 null。后续 makeFinalizer / 写 Authorization /
+      // maybeUpdateAccountQuota 等都用 `pick == null` 判定 deepseek 短路。
+      let pick: PickResult | null = null;
+      let accountDispatcher: Awaited<ReturnType<typeof getDispatcherForAccount>> = undefined;
+      if (!isDeepseek) {
+        try {
+          pick = await deps.scheduler.pick({
+            mode: "chat",
+            sessionId: extractSessionId(body.metadata) ?? undefined,
+            model: body.model,
+          });
+        } catch (err) {
+          await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+          if (err instanceof AccountPoolBusyError) {
+            userLog.warn("proxy_account_pool_busy", { msg: err.message });
+            incrAnthropicProxyReject("account_pool_busy");
+            sendJsonError(
+              res,
+              429,
+              "ACCOUNT_POOL_BUSY",
+              "all accounts busy, retry later",
+              requestId,
+              { "Retry-After": "5" },
+            );
             return;
           }
+          if (err instanceof AccountPoolUnavailableError) {
+            userLog.warn("proxy_account_pool_unavailable", { msg: err.message });
+            incrAnthropicProxyReject("account_pool");
+            sendJsonError(res, 503, "ACCOUNT_POOL_UNAVAILABLE", "account pool unavailable, try again", requestId);
+            return;
+          }
+          throw err;
         }
-      } catch (err) {
+        // 不持有 finalizer 之前,任何后续异常都得手动 release pick + preCheck;
+        // 之后(从 startInflightJournal 起)统一交给 finalize.fail
+        // HIGH#5:同 account 的 chat 与 refresh 必须从同一出口 IP 出去 —— Anthropic
+        // anti-abuse 会把 refresh 与紧随其后的 chat 关联,IP 一变立即触发风控。
+        // 0038:dispatcher 在 plain proxy 与 mTLS forward proxy 之间二选一(plain 优先);
+        // 都缺则 undefined,fetch 走默认出口(master VM)。
+        accountDispatcher = await getDispatcherForAccount(
+          pick.account_id,
+          pick.egress_proxy,
+          pick.egress_target,
+        );
         try {
-          pick.token.fill(0);
-          pick.refresh?.fill(0);
-        } catch {
-          /* ignore */
+          if (
+            deps.refreshDeps &&
+            pick.expires_at &&
+            shouldRefresh(pick.expires_at, new Date(), DEFAULT_REFRESH_SKEW_MS)
+          ) {
+            try {
+              const r = await refreshAccountToken(pick.account_id, {
+                ...deps.refreshDeps,
+                // 显式覆盖:即使 caller 在 refreshDeps 里塞了别的 dispatcher,
+                // 也用 account 的固定出口,不让"全局 dispatcher 漏选"破坏稳定 IP。
+                dispatcher: accountDispatcher,
+              });
+              // 释放老 token(零化),用新 token
+              try {
+                pick.token.fill(0);
+              } catch {
+                /* ignore */
+              }
+              try {
+                pick.refresh?.fill(0);
+              } catch {
+                /* ignore */
+              }
+              pick = {
+                account_id: pick.account_id,
+                plan: pick.plan,
+                token: r.token,
+                refresh: r.refresh,
+                expires_at: r.expires_at,
+                egress_proxy: pick.egress_proxy,
+                egress_target: pick.egress_target,
+              };
+            } catch (err) {
+              // refresh 失败:account 已在 RefreshError 内部按规约处理 disable/不 disable;
+              // 调度器层面:
+              //   - network_transient(#H9):纯网络抖动(代理挂 / DNS / TLS)。不扣健康分,
+              //     仅 dec inflight。否则代理一抖全池账号瞬间被连续扣分 → 误判 cooldown/disable。
+              //   - 其它(上游 4xx/5xx / bad_response / persist_error / 未知):按 failure 扣分。
+              const isTransient =
+                err instanceof RefreshError && err.code === "network_transient";
+              userLog.warn("proxy_refresh_failed", {
+                accountId: pick.account_id.toString(),
+                code: err instanceof RefreshError ? err.code : "unknown",
+                msg: err instanceof Error ? err.message : String(err),
+                transient: isTransient,
+              });
+              await deps.scheduler
+                .release({
+                  account_id: pick.account_id,
+                  result: isTransient
+                    ? { kind: "transient_network", error: errMessageShort(err) }
+                    : { kind: "failure", error: errMessageShort(err) },
+                })
+                .catch(() => {});
+              await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+              incrAnthropicProxyReject("upstream_auth");
+              sendJsonError(res, 502, "UPSTREAM_AUTH_REFRESH_FAILED", "failed to refresh upstream token", requestId);
+              return;
+            }
+          }
+        } catch (err) {
+          try {
+            pick.token.fill(0);
+            pick.refresh?.fill(0);
+          } catch {
+            /* ignore */
+          }
+          await deps.scheduler
+            .release({
+              account_id: pick.account_id,
+              result: { kind: "failure", error: errMessageShort(err) },
+            })
+            .catch(() => {});
+          await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+          throw err;
         }
-        await deps.scheduler
-          .release({
-            account_id: pick.account_id,
-            result: { kind: "failure", error: errMessageShort(err) },
-          })
-          .catch(() => {});
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
-        throw err;
       }
 
       // 8) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
@@ -1623,18 +1768,20 @@ export function makeAnthropicProxyHandler(
           precheckCredits: pre.maxCost,
         });
       } catch (err) {
-        try {
-          pick.token.fill(0);
-          pick.refresh?.fill(0);
-        } catch {
-          /* ignore */
+        if (pick) {
+          try {
+            pick.token.fill(0);
+            pick.refresh?.fill(0);
+          } catch {
+            /* ignore */
+          }
+          await deps.scheduler
+            .release({
+              account_id: pick.account_id,
+              result: { kind: "failure", error: errMessageShort(err) },
+            })
+            .catch(() => {});
         }
-        await deps.scheduler
-          .release({
-            account_id: pick.account_id,
-            result: { kind: "failure", error: errMessageShort(err) },
-          })
-          .catch(() => {});
         await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
         userLog.error("proxy_journal_insert_failed", { err: errSummary(err) });
         sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
@@ -1652,7 +1799,9 @@ export function makeAnthropicProxyHandler(
           requestId,
           userId: uid,
           containerId: containerIdBig,
-          accountId: pick.account_id,
+          // 2026-05-02:deepseek 路径无 OAuth 池,pick=null → accountId=null。
+          // settleUsageAndLedger / runFinalizeAndRelease 已支持 nullable。
+          accountId: pick?.account_id ?? null,
           model: body.model,
           pricing,
           precheckCredits: pre.maxCost,
@@ -1685,13 +1834,20 @@ export function makeAnthropicProxyHandler(
           }
           throw err;
         }
-        safeHeaders.authorization = `Bearer ${pick.token.toString("utf8")}`;
+        if (isDeepseek) {
+          // 2026-05-02:deepseek 用静态 API key,不走 OAuth 刷新,也不需要
+          // anthropic-beta(deepseek 兼容端点不识别该头,某些版本会 400)。
+          // deps.deepseekApiKey 在 5c) 已校验非空,这里直接使用。
+          safeHeaders.authorization = `Bearer ${deps.deepseekApiKey}`;
+          delete safeHeaders["anthropic-beta"];
+        } else {
+          // pick 在 !isDeepseek 分支必非空(scheduler.pick 失败已 return)
+          safeHeaders.authorization = `Bearer ${pick!.token.toString("utf8")}`;
 
-        // 强制注入 oauth-2025-04-20 — 我们所有 claude_accounts 都用 OAuth bearer,
-        // 没这个 beta header Anthropic 会回 401 "OAuth authentication is currently not supported"。
-        // 个人版 ccb 在 isClaudeAISubscriber()=false 时(我们容器内就是这种)不会自己加,
-        // 所以必须在 proxy 侧无条件补上(允许多 token 共存,merge 而不是覆盖)。
-        {
+          // 强制注入 oauth-2025-04-20 — 我们所有 claude_accounts 都用 OAuth bearer,
+          // 没这个 beta header Anthropic 会回 401 "OAuth authentication is currently not supported"。
+          // 个人版 ccb 在 isClaudeAISubscriber()=false 时(我们容器内就是这种)不会自己加,
+          // 所以必须在 proxy 侧无条件补上(允许多 token 共存,merge 而不是覆盖)。
           const existing = (safeHeaders["anthropic-beta"] ?? "").split(",").map(s => s.trim()).filter(Boolean);
           if (!existing.includes("oauth-2025-04-20")) existing.unshift("oauth-2025-04-20");
           safeHeaders["anthropic-beta"] = existing.join(",");
@@ -1714,7 +1870,9 @@ export function makeAnthropicProxyHandler(
         if (accountDispatcher) fetchInit.dispatcher = accountDispatcher;
 
         const fetchStartMs = Date.now();
-        const upstream = await fetchFn(endpoint, fetchInit);
+        // 2026-05-02:deepseek 路径切换到 deepseek anthropic-兼容端点。
+        const fetchEndpoint = isDeepseek ? DEEPSEEK_UPSTREAM_ENDPOINT : endpoint;
+        const upstream = await fetchFn(fetchEndpoint, fetchInit);
         if (upstream.status < 200 || upstream.status >= 300) {
           // 上游 4xx/5xx — 读 body preview 写 log,直接转译成 502
           let preview = "";
@@ -1742,9 +1900,12 @@ export function makeAnthropicProxyHandler(
         // UPDATE accounts。30s 进程内 throttle + SQL WHERE + 全局 cap 32 三层防护,
         // 详见 quota.ts 文件头。maybeUpdateAccountQuota 内部已吞所有错,这里 .catch
         // 仅做最后兜底(理论不会触发),保留以防未来重构破坏内部 swallow 语义。
-        maybeUpdateAccountQuota(deps.pgPool, pick.account_id, upstream.headers).catch((err) => {
-          userLog.warn("proxy_quota_update_failed", { err: errSummary(err) });
-        });
+        // 2026-05-02:deepseek 路径无 account 行可更新,跳过。
+        if (pick) {
+          maybeUpdateAccountQuota(deps.pgPool, pick.account_id, upstream.headers).catch((err) => {
+            userLog.warn("proxy_quota_update_failed", { err: errSummary(err) });
+          });
+        }
         // 写 SSE 响应头,开始 byte-pipe
         res.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
@@ -1832,9 +1993,10 @@ export function makeAnthropicProxyHandler(
       } finally {
         req.off("close", onClose);
         res.off("close", onClose);
+        // 2026-05-02:deepseek 路径 pick=null,跳过 token 零化(本来就没 token)。
         try {
-          pick.token.fill(0);
-          pick.refresh?.fill(0);
+          pick?.token.fill(0);
+          pick?.refresh?.fill(0);
         } catch {
           /* ignore */
         }

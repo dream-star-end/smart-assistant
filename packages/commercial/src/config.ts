@@ -374,6 +374,16 @@ export const commercialConfigSchema = z
     R7_BACKUP_TIMEOUT_SEC: r7BackupTimeoutSec,
     R7_RESTORE_TIMEOUT_SEC: r7RestoreTimeoutSec,
     R7_HELPER_IMAGE: r7HelperImage,
+    /**
+     * DeepSeek API key(2026-05-02 接入)。
+     * - 配置时 anthropicProxy 收到 model.startsWith('deepseek-') 的请求 → forward
+     *   到 https://api.deepseek.com/anthropic/v1/messages,Authorization: Bearer
+     *   <DEEPSEEK_API_KEY>;不占 claude_accounts 池
+     * - 未配置 → 返回 503 + reject reason 'deepseek_config'(独立指标,不混 claude
+     *   account_pool)
+     * - 不入 git;由 systemd EnvironmentFile 注入(commercial-v3 部署侧)
+     */
+    DEEPSEEK_API_KEY: z.string().trim().min(1).max(256).optional(),
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。

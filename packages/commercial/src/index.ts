@@ -609,6 +609,33 @@ export async function registerCommercial(
         // outbound.cost_charged 帧发给用户。bridge 启动顺序在 proxy 之后,
         // 故用 ref 打破先后(构造期调用是 noop,请求期 bridge 必已 wire)。
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+        // 2026-05-02 deepseek 接入:proxy 强制 server-side 校验 model 授权(不再
+        // 信任 modelPicker 前端隐藏)。每请求一次 DB(users.role + grants),
+        // fail-closed:throw → handler 500。dynamic import 避免 boot 期循环依赖。
+        loadUserModelAuthz: async (uid) => {
+          const { query } = await import("./db/queries.js");
+          const { listGrantsForUser } = await import("./admin/modelGrants.js");
+          const r = await query<{ role: string }>(
+            "SELECT role FROM users WHERE id = $1",
+            [uid],
+          );
+          if (r.rows.length === 0) {
+            // user 在 DB 里不存在(理论被 verifyContainerIdentity 截掉,这里是
+            // 防御编程)。fail-closed:认 user role,grants 空集 → 公开 model
+            // 还能用,admin/hidden model 一律拒。
+            return { role: "user", grantedModelIds: new Set<string>() };
+          }
+          const roleRaw = r.rows[0].role;
+          const role: "user" | "admin" = roleRaw === "admin" ? "admin" : "user";
+          const grants = await listGrantsForUser(uid);
+          return {
+            role,
+            grantedModelIds: new Set(grants.map((g) => g.model_id)),
+          };
+        },
+        // 2026-05-02 deepseek 接入:cfg 在外层闭包已 loadConfig() 过(line 379),
+        // 这里直接读取。未配置 → undefined → proxy 命中 deepseek 模型时 503。
+        deepseekApiKey: cfg.DEEPSEEK_API_KEY,
       });
       internalProxyServer = createHttpServer((req, res) => {
         // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,

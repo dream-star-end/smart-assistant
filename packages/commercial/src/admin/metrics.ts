@@ -450,12 +450,14 @@ export type ProxyRejectReason =
   | "account_pool"
   | "account_pool_busy"
   | "unknown_model"
+  | "unauthorized_model"
   | "bad_body"
   | "too_large"
   | "identity"
   | "bad_path"
   | "bad_headers"
-  | "upstream_auth";
+  | "upstream_auth"
+  | "deepseek_config";
 export function incrAnthropicProxyReject(reason: ProxyRejectReason): void {
   anthropicProxyReject.inc({ reason });
 }
