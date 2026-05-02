@@ -145,7 +145,8 @@ var MountRoots = []string{
 	"/var/lib/openclaude/containers", // 容器 workdir 上层
 	"/var/lib/openclaude/skills",
 	"/var/lib/openclaude/user-data",
-	"/var/lib/openclaude/baseline",   // CCB baseline(由 baseline poller 拉到本地,容器 ro 挂载)
+	"/var/lib/openclaude/baseline",                  // CCB baseline(由 baseline poller 拉到本地,容器 ro 挂载)
+	"/var/lib/openclaude-v3/codex-container-auth",   // 远端 codex auth(per-container 子目录,master 通过 PUT /files 写入)
 }
 
 // ─── 请求结构 ──────────────────────────────────────────────────────

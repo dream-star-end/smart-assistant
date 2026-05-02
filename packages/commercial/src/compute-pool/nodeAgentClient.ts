@@ -539,21 +539,48 @@ export async function inspectVolume(
 // ─── File RPC ────────────────────────────────────────────────────────
 
 /**
- * PUT /files?path=<abs>&mode=<octal> body=二进制
- * server 端写到 AllowedRoots 下的 abs 路径;tmp + fsync + chmod + rename 原子替换。
+ * PUT /files?path=<abs>&mode=<octal>[&owner_uid=N&owner_gid=N] body=二进制
+ * server 端写到 AllowedRoots 下的 abs 路径;tmp + fsync + (可选 chown) + chmod
+ * + rename 原子替换。
  * 超过 16 MiB 返 413;路径不在 AllowedRoots 下返 400。
+ *
+ * **owner_uid/owner_gid 严格成对**(v1.0.72,需 node-agent ≥ v1.0.72):
+ * - 同时省略 → server 端不 chown(向后兼容老调用方)
+ * - 同时提供 → server 端在 chmod 之前 chown 到指定 uid/gid(用于让远端容器
+ *   内 codex CLI uid 1000 能读 0o400 的 auth.json)
+ * - 只提供一个或负数 → server 返 400 BAD_OWNER(避免 chown(-1) 隐式语义)
+ *
+ * caller 不传 ownerUid/ownerGid 时 query 不拼 owner_*,与老 server (v1.0.71-)
+ * 完全等价行为 — rollback 安全。
  */
 export async function putFile(
   target: NodeAgentTarget,
   remotePath: string,
   content: Buffer,
   mode: number = 0o600,
+  ownerUid?: number,
+  ownerGid?: number,
 ): Promise<void> {
-  const qs =
+  let qs =
     "?path=" +
     encodeURIComponent(remotePath) +
     "&mode=" +
     encodeURIComponent(mode.toString(8));
+  // 严格:两者必须同时传或同时不传(与 server 端一致)
+  const uidGiven = ownerUid !== undefined;
+  const gidGiven = ownerGid !== undefined;
+  if (uidGiven !== gidGiven) {
+    throw new Error(
+      `putFile: ownerUid and ownerGid must both be set or both omitted (got uid=${ownerUid} gid=${ownerGid})`,
+    );
+  }
+  if (uidGiven) {
+    qs +=
+      "&owner_uid=" +
+      encodeURIComponent(String(ownerUid)) +
+      "&owner_gid=" +
+      encodeURIComponent(String(ownerGid));
+  }
   await rpcCall<void>(target, {
     path: "/files" + qs,
     method: "PUT",

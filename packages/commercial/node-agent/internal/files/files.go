@@ -35,8 +35,13 @@ const MaxFileSize = 16 << 20 // 16 MiB
 var AllowedRoots = []string{
 	"/var/lib/openclaude/baseline",
 	"/var/lib/openclaude/user-data",
+	"/var/lib/openclaude-v3/codex-container-auth",
 	"/run/ccb-ssh",
 }
+
+// osChown 是 os.Chown 的可注入 seam,测试里 override 模拟 chown 失败。
+// 生产路径直接走标准库。
+var osChown = os.Chown
 
 // per-path 互斥
 var perPathMu sync.Map
@@ -103,6 +108,42 @@ func parseMode(raw string) (os.FileMode, error) {
 	return os.FileMode(n) & 0o7777, nil
 }
 
+// parseOwner 解析 owner_uid / owner_gid query。两者必须同时出现或同时缺。
+// 出现时:base=10,非负,<= MaxInt32(防 overflow / chown -1 "保持不变" 语义)。
+// 返回 (uid, gid, hasOwner, err)。hasOwner=false 表示 caller 跳过 chown。
+//
+// 设计:Unix chown(-1, ...) 有"保持当前 owner"的特殊语义。本 endpoint
+// 暴露给 master 跨机调,不允许这种隐式行为 — 严格拒绝负数 / overflow / 缺一参数,
+// caller 必须显式两个都传或都不传。
+func parseOwner(uidRaw, gidRaw string) (uid int, gid int, hasOwner bool, err error) {
+	if uidRaw == "" && gidRaw == "" {
+		return 0, 0, false, nil
+	}
+	if uidRaw == "" || gidRaw == "" {
+		return 0, 0, false, errors.New("owner_uid and owner_gid must both be set or both omitted")
+	}
+	parse := func(name, raw string) (int, error) {
+		// bitSize=32 防 32-bit 系统 overflow;Unix uid_t 是 uint32 但 chown 用 int
+		n, e := strconv.ParseInt(raw, 10, 32)
+		if e != nil {
+			return 0, fmt.Errorf("invalid %s %q: %w", name, raw, e)
+		}
+		if n < 0 {
+			return 0, fmt.Errorf("invalid %s %q: must be non-negative (chown -1 not allowed)", name, raw)
+		}
+		return int(n), nil
+	}
+	uid, err = parse("owner_uid", uidRaw)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	gid, err = parse("owner_gid", gidRaw)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return uid, gid, true, nil
+}
+
 // StatResponse 是 GET /files/stat 的 JSON 响应。
 type StatResponse struct {
 	Exists bool   `json:"exists"`
@@ -151,6 +192,14 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 	mode, err := parseMode(r.URL.Query().Get("mode"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "BAD_MODE", err.Error())
+		return
+	}
+	ownerUID, ownerGID, hasOwner, err := parseOwner(
+		r.URL.Query().Get("owner_uid"),
+		r.URL.Query().Get("owner_gid"),
+	)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "BAD_OWNER", err.Error())
 		return
 	}
 
@@ -207,6 +256,19 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		cleanTmp()
 		writeErr(w, http.StatusInternalServerError, "CLOSE_FAIL", err.Error())
 		return
+	}
+	// chown 必须在 chmod 之前。原因:caller 用 mode=0o400 owner=container_uid:gid
+	// 让容器内 agent 可读;若反过来先 chmod 0o400 再 chown,owner 切换瞬间文件归
+	// 容器 uid 但 mode 已是只读 — 从 root 切到容器 uid 这段时间窗内,host 上以
+	// 容器 uid 跑的进程理论可短暂读到 tmp(虽 NOFOLLOW + tmp 名字不可猜,但纪律
+	// 上避免)。先 chown 后 chmod 整个时间窗内 mode 仍是 0o600 owner=root,host
+	// 上其他 uid 进程无法读;rename 后才完整生效。
+	if hasOwner {
+		if err := osChown(tmp, ownerUID, ownerGID); err != nil {
+			cleanTmp()
+			writeErr(w, http.StatusInternalServerError, "CHOWN_FAIL", err.Error())
+			return
+		}
 	}
 	if err := os.Chmod(tmp, mode); err != nil {
 		cleanTmp()

@@ -41,6 +41,10 @@ import {
 import { getCodexTokenSnapshot } from "./account-pool/store.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
 import { writeCodexContainerAuthFile } from "./codex-auth/codexAuthFile.js";
+import {
+  putRemoteCodexContainerAuth,
+  deleteRemoteCodexContainerAuth,
+} from "./codex-auth/remoteCodexAuth.js";
 import { zeroBuffer } from "./crypto/keys.js";
 import { tx } from "./db/queries.js";
 import { createAgentWsHandler, type AgentWsHandler } from "./ws/agent.js";
@@ -813,6 +817,55 @@ export async function registerCommercial(
         ? {
             containerService: createContainerService(v3Docker),
             selfHostId: selfHostUuid,
+            // v1.0.72 — 远端 codex auth 写/删 helper:统一在此一处做
+            // getHostById → hostRowToTarget → put/delete → finally psk.fill(0)
+            // 三处调用方(provisionV3Container / lazy migrate / stopAndRemove)
+            // 都通过这两个回调,避免泄密 buffer 散落。
+            //
+            // 失败语义:put 抛 → caller fallback NULL bind;delete 抛 → caller
+            // 应吞掉(best-effort,与本地 removeCodexContainerAuthDir 一致)。
+            // 本闭包不做 catch —— 让 caller 决定。
+            putRemoteCodexAuth: async (
+              hostUuid: string,
+              containerId: string,
+              accessToken: string,
+              lastRefreshIso: string,
+            ) => {
+              const row = await computeQueries.getHostById(hostUuid);
+              if (!row) {
+                throw new Error(
+                  `putRemoteCodexAuth: compute_host ${hostUuid} not found`,
+                );
+              }
+              const target = hostRowToTarget(row);
+              try {
+                await putRemoteCodexContainerAuth(
+                  target,
+                  containerId,
+                  accessToken,
+                  lastRefreshIso,
+                );
+              } finally {
+                target.psk?.fill(0);
+              }
+            },
+            deleteRemoteCodexAuth: async (
+              hostUuid: string,
+              containerId: string,
+            ) => {
+              const row = await computeQueries.getHostById(hostUuid);
+              if (!row) {
+                throw new Error(
+                  `deleteRemoteCodexAuth: compute_host ${hostUuid} not found`,
+                );
+              }
+              const target = hostRowToTarget(row);
+              try {
+                await deleteRemoteCodexContainerAuth(target, containerId);
+              } finally {
+                target.psk?.fill(0);
+              }
+            },
           }
         : {}),
     };
@@ -1170,12 +1223,14 @@ export async function registerCommercial(
               state: string;
               container_internal_id: string | null;
               host_uuid: string | null;
+              age_seconds: string;
             }>(
               `SELECT ac.codex_account_id::text AS account_id,
                       ca.status AS account_status,
                       ac.state AS state,
                       ac.container_internal_id AS container_internal_id,
-                      ac.host_uuid AS host_uuid
+                      ac.host_uuid AS host_uuid,
+                      EXTRACT(EPOCH FROM (NOW() - ac.created_at))::text AS age_seconds
                FROM agent_containers ac
                LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
                WHERE ac.id = $1
@@ -1194,23 +1249,16 @@ export async function registerCommercial(
               return null;
             }
             if (row.account_id === null) {
-              // **Host 守护 (v1.0.71 紧急修复)**:provisionV3Container 当 host 是远端
-              // 时跳过 pickCodexAccountForBinding (v3supervisor.ts:1366 `if (!useRemote)`),
-              // 远端 host 上的容器永远是 NULL bind。如果在这种 host 上做 stale recycle,
-              // ensureRunning 重 provision 出来的新容器还是 NULL → 死循环把容器反复重建,
-              // user 7 在 boheyun host 上已经触发 (1347/1348/1349 在 11:00-11:02 连续 stale)。
-              // 仅 self-host 才有自愈条件 (重 provision 才会绑 codex 账号);远端 host 维持
-              // 原 N3 legacy 透传行为。
-              const selfHostId = v3DepsForCodex?.selfHostId ?? null;
-              const containerHostUuid = row.host_uuid;
-              if (
-                selfHostId === null ||
-                containerHostUuid === null ||
-                containerHostUuid !== selfHostId
-              ) {
-                return null;
-              }
-              // legacy NULL 绑定 + self-host。检查池子里是否有 active codex 账号:
+              // v1.0.72:host guard(v1.0.71 临时把"远端 host + NULL bind"硬挡)
+              // 替换为下方 **age 守护**(死循环熔断,见 ageSec < 60 注释)。原因 ——
+              //   v1.0.71 临时 guard 是因为 provisionV3Container 在远端跳过 codex
+              //   绑定,远端 host 上重 provision 仍是 NULL → 死循环。v1.0.72 起远端
+              //   provision 路径已能写 per-container auth.json(v3supervisor 的
+              //   useRemote codex 分支走 deps.putRemoteCodexAuth),正常路径下
+              //   stale recycle + ensureRunning 重 provision 会自然产出 per-container
+              //   mount。但 putRemote 短暂故障(node-agent 抖 / fingerprint 错配)
+              //   仍可能让 row 又留 NULL —— 此时由 age guard 熔断,不再依赖 host 判定。
+              // legacy NULL 绑定 + 任意 host。检查池子里是否有 active codex 账号:
               //   - 没有 → 真 legacy 路径不变,return null(N3 行为兼容)
               //   - 有   → 用户 admin 已加账号但容器 mount immutable 永远 401,
               //            必须 mark vanished + docker rm 让 ensureRunning 重 provision
@@ -1223,6 +1271,27 @@ export async function registerCommercial(
                   WHERE provider = 'codex' AND status = 'active'`,
               );
               if (Number(poolCount.rows[0]?.cnt ?? "0") === 0) {
+                return null;
+              }
+              // **死循环守护(v1.0.72 Codex review High#1)**:
+              // 远端 host 的 putRemoteCodexAuth 短暂故障(node-agent 抖 / fingerprint
+              // 错配 / cert 失效)→ provisionV3Container 写 codex auth 失败 → no-mount
+              // + codex_account_id NULL → 下次 acquire 看池非空 → 又 recycle → 又重 provision
+              // → 又失败 → 死循环烧资源。本地 host 也存在同 case(picker 抛 / write fail),
+              // 只是远端故障频率高。
+              //
+              // 守护:row 才创建 < 60s 又被 stale recycle = 强信号上一轮 provision codex
+              // 绑定失败,**这一轮不再 recycle**,return null 走 legacy 透传(N3 行为)。
+              // 用户 GPT 请求会失败但容器照常用,不会陷入重建循环。运维通过监控 NULL
+              // bind 容器数 + 日志告警感知后,修复 host 后下一轮自然 recycle 自愈
+              // (60s 后行不再"年轻")。
+              const ageSec = Number(row.age_seconds ?? "0");
+              if (Number.isFinite(ageSec) && ageSec < 60) {
+                // eslint-disable-next-line no-console
+                console.warn(
+                  "[codex acquire] skip stale recycle: row too young (likely upstream codex bind failed last provision)",
+                  { containerId, ageSec, hostUuid: row.host_uuid },
+                );
                 return null;
               }
               // 池子非空 — recycle。同 tx 内把 row 标 vanished,与下面 lazy migrate
@@ -1264,6 +1333,18 @@ export async function registerCommercial(
             }
             const codexContainerDir =
               process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
+            // v1.0.72 host 路由:row.host_uuid 决定本次 lazy migrate 写本地还是远端。
+            //   - selfHostId 未注入(单机 monolith)→ 一律本地(没多机能力,行 host_uuid
+            //     非空也当本地写,避免 tx ROLLBACK 把 row stuck 在 NULL 触发 stale 死循环)
+            //   - host_uuid IS NULL(单机 monolith legacy 行)→ 本地 fs 写
+            //   - host_uuid == selfHostId → 本地 fs 写
+            //   - host_uuid != selfHostId → 远端 helper 写
+            //   - 远端但 putRemoteCodexAuth 未注入 → 抛错 → tx ROLLBACK,picker 不消耗
+            const selfHostIdForLazy = v3DepsForCodex?.selfHostId ?? null;
+            const isLocal =
+              selfHostIdForLazy === null
+              || row.host_uuid === null
+              || row.host_uuid === selfHostIdForLazy;
             let snap: Awaited<ReturnType<typeof getCodexTokenSnapshot>> = null;
             try {
               snap = await getCodexTokenSnapshot(picked.account_id);
@@ -1272,16 +1353,29 @@ export async function registerCommercial(
                   `codex token snapshot missing for account ${String(picked.account_id)}`,
                 );
               }
-              await writeCodexContainerAuthFile({
-                rootDir: codexContainerDir,
-                containerId: String(containerId),
-                containerUid: V3_AGENT_UID,
-                containerGid: V3_AGENT_GID,
-                auth: {
-                  accessToken: snap.token.toString("utf8"),
-                  lastRefreshIso: new Date().toISOString(),
-                },
-              });
+              const accessToken = snap.token.toString("utf8");
+              const lastRefreshIso = new Date().toISOString();
+              if (isLocal) {
+                await writeCodexContainerAuthFile({
+                  rootDir: codexContainerDir,
+                  containerId: String(containerId),
+                  containerUid: V3_AGENT_UID,
+                  containerGid: V3_AGENT_GID,
+                  auth: { accessToken, lastRefreshIso },
+                });
+              } else {
+                if (!v3DepsForCodex?.putRemoteCodexAuth) {
+                  throw new Error(
+                    `lazy migrate: remote host ${row.host_uuid} but putRemoteCodexAuth not wired`,
+                  );
+                }
+                await v3DepsForCodex.putRemoteCodexAuth(
+                  row.host_uuid as string,
+                  String(containerId),
+                  accessToken,
+                  lastRefreshIso,
+                );
+              }
             } finally {
               if (snap?.token) zeroBuffer(snap.token);
               if (snap?.refresh) zeroBuffer(snap.refresh);
@@ -1404,10 +1498,15 @@ export async function registerCommercial(
   if (process.env.COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED !== "1") {
     const codexContainerDir =
       process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
+    // v1.0.72 多机:把 v3Deps 上的 putRemoteCodexAuth helper(已含
+    // getHostById → hostRowToTarget → finally psk.fill(0) 三件套)透传给 actor,
+    // actor 自己不持密钥 buffer,泄密面与 lazy migrate / provision 完全一致。
     codexRefreshActor = startCodexRefreshActor({
       codexContainerDir,
       containerUid: V3_AGENT_UID,
       containerGid: V3_AGENT_GID,
+      selfHostId: v3Deps?.selfHostId ?? null,
+      writeRemoteFn: v3Deps?.putRemoteCodexAuth,
     });
   }
 

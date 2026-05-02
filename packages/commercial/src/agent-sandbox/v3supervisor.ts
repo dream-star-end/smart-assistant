@@ -180,10 +180,14 @@ export const V3_CODEX_AUTH_RO_MOUNT = "/run/oc/codex-auth";
 
 /**
  * Host 侧容器 auth 目录默认路径。对应 codexAuthSync.writeContainerVariant
- * 写入的目标目录。env `OC_V3_CODEX_CONTAINER_DIR` 覆盖,与 gateway 端环境
- * 变量保持一致即可(默认值已对齐)。
+ * 写入的目标目录。env `OC_V3_CODEX_CONTAINER_DIR` 覆盖(仅本地 host 有效;
+ * 远端 host 必须用 default,见 codex-auth/constants.ts)。
+ *
+ * v1.0.72:常量挪到 codex-auth/constants 避免循环依赖,这里 re-export
+ * 保持向后兼容(index.ts 等老调用方不变)。
  */
-export const DEFAULT_V3_CODEX_CONTAINER_DIR = "/var/lib/openclaude-v3/codex-container-auth";
+export { DEFAULT_V3_CODEX_CONTAINER_DIR } from "../codex-auth/constants.js";
+import { DEFAULT_V3_CODEX_CONTAINER_DIR } from "../codex-auth/constants.js";
 
 function readCodexContainerDirFromEnv(): string {
   const raw = process.env.OC_V3_CODEX_CONTAINER_DIR;
@@ -649,6 +653,36 @@ export interface V3SupervisorDeps {
    * 不注入 → facade 路径也退化为"一切都是自己"。
    */
   selfHostId?: string;
+  /**
+   * v1.0.72 — 远端 host 的 per-container codex auth.json 写入路由。
+   *
+   * provisionV3Container / lazy migrate 决定要在远端 host 上落 codex
+   * per-container auth 时调用。caller 已选好 hostUuid(必 ≠ selfHostId,
+   * 否则走本地 writeCodexContainerAuthFile);本回调内部:
+   *   1. computeQueries.getHostById(hostUuid) → ComputeHostRow
+   *   2. hostRowToTarget(row) → NodeAgentTarget(含解密的 PSK)
+   *   3. putRemoteCodexContainerAuth(target, containerId, ...)
+   *   4. finally:target.psk?.fill(0) 清密钥 buffer
+   *
+   * 抛 Error → caller 当 codex 绑定失败,fallback 到 NULL bind / no codex
+   * mount(与本地 try/catch fallback 相同语义)。
+   *
+   * 仅在 useRemote 路径有意义;不注入 → useRemote=true 时 codex 绑定退化
+   * 为"无 codex 绑定"(不阻断 provision,GPT 在该容器内不可用)。
+   */
+  putRemoteCodexAuth?(
+    hostUuid: string,
+    containerId: string,
+    accessToken: string,
+    lastRefreshIso: string,
+  ): Promise<void>;
+  /**
+   * v1.0.72 — 远端 host 的 per-container codex auth.json 删除。
+   *
+   * stopAndRemoveV3Container 在容器清理后调用,best-effort,失败不抛
+   * (与本地 removeCodexContainerAuthDir 同语义)。
+   */
+  deleteRemoteCodexAuth?(hostUuid: string, containerId: string): Promise<void>;
 }
 
 /** provision 成功后返回。3D ensureRunning 拿来注入到 userChatBridge */
@@ -1362,15 +1396,28 @@ export async function provisionV3Container(
     // 始终挂载:目录由本模块在 provision 前 mkdir(idempotent),即使 host 还没
     // 跑过 codexAuthSync,容器看到的是空目录,codex 启动报无 auth(预期)。
     // host 写入后无需重启容器,mount 是目录而非单文件,新 entry 立即可见。
+    // Codex per-container auth bind(plan v3 §F1/F2/D1 + v1.0.72 跨 host 同步)。
+    // 本地与远端 host 共享同一 picker + UPDATE,只在"写文件"和"bind source 路径"
+    // 上分流:
+    //   - 本地:writeCodexContainerAuthFile + bind <env-resolvable codexContainerDir>/<row.id>
+    //   - 远端:deps.putRemoteCodexAuth + bind <DEFAULT_V3_CODEX_CONTAINER_DIR>/<row.id>
+    //          (远端路径硬编码,不读 master env;远端 node-agent AllowedRoots 锁同值)
+    //
+    // 任一步失败 → fallback:
+    //   - 本地:legacy shared dir mount(NULL bind),codex CLI 启动报"未授权"
+    //          但容器仍可正常跑非 GPT 流量
+    //   - 远端:不挂 codex mount(MVP D 决策)。远端没有 shared dir 模型 ——
+    //          NULL bind 不存在等价物。codex CLI 启动报"未授权"行为一致。
+    //
+    // **mount 不可变 invariant**(决策 K/L/N3):启动时定型,运行时永不切换。
+    // lazy migrate 只换 account_id 不换 mount;NULL 容器永远锁死在 legacy mount
+    // (本地)或 no-mount(远端)。
     let codexMountSource: string | null = null;
-    if (!useRemote) {
-      const codexContainerDir = readCodexContainerDirFromEnv();
-      // Phase 2 — 试图从 codex 池挑一个账号给本容器 sticky 绑定。
-      // **关键路径:provision 时立即写 per-container auth.json,首次 GPT 请求
-      // 无需等 refresh actor 即可成功**(plan F1 / Codex BLOCKER 1)。
-      //
-      // 任一步失败(picker 异常 / token 解密失败 / 写文件失败)→ 当作 NULL
-      // 处理走 legacy mount,不打断 provision —— GPT 路径在 bridge 层有兜底。
+    {
+      // 远端 host 必须用 DEFAULT 常量(node-agent AllowedRoots 锁住),本地走 env 可覆盖
+      const codexContainerDir = useRemote
+        ? DEFAULT_V3_CODEX_CONTAINER_DIR
+        : readCodexContainerDirFromEnv();
       let boundCodexAccountId: bigint | null = null;
       try {
         const picked = await pickCodexAccountForBinding(String(row.id), {});
@@ -1379,19 +1426,33 @@ export async function provisionV3Container(
           try {
             snap = await getCodexTokenSnapshot(picked.account_id);
             if (snap && snap.token) {
-              await writeCodexContainerAuthFile({
-                rootDir: codexContainerDir,
-                containerId: String(row.id),
-                containerUid: V3_AGENT_UID,
-                containerGid: V3_AGENT_GID,
-                auth: {
-                  accessToken: snap.token.toString("utf8"),
-                  lastRefreshIso: new Date().toISOString(),
-                },
-              });
+              const accessToken = snap.token.toString("utf8");
+              const lastRefreshIso = new Date().toISOString();
+              if (useRemote) {
+                if (!deps.putRemoteCodexAuth) {
+                  throw new Error(
+                    "useRemote=true but deps.putRemoteCodexAuth not wired",
+                  );
+                }
+                // hostId! 安全:useRemote=true 蕴含 typeof hostId === "string"(见 useRemote 定义)
+                await deps.putRemoteCodexAuth(
+                  hostId!,
+                  String(row.id),
+                  accessToken,
+                  lastRefreshIso,
+                );
+              } else {
+                await writeCodexContainerAuthFile({
+                  rootDir: codexContainerDir,
+                  containerId: String(row.id),
+                  containerUid: V3_AGENT_UID,
+                  containerGid: V3_AGENT_GID,
+                  auth: { accessToken, lastRefreshIso },
+                });
+              }
               // UPDATE 在同一事务内,COMMIT 时一并落盘;若后续步骤失败 rollback
-              // 自动回滚到 NULL,但 host 文件留在 per-container 子目录是孤儿
-              // —— 由 stopAndRemoveV3Container / volume gc / 重 provision
+              // 自动回滚到 NULL,但 host 文件(本地或远端)留在 per-container 子目录
+              // 是孤儿 —— 由 stopAndRemoveV3Container / volume gc / 重 provision
               // 的同名 row.id 覆盖兜底(本 PR 接受这层不一致)。
               await client.query(
                 `UPDATE agent_containers SET codex_account_id = $1, updated_at = NOW() WHERE id = $2`,
@@ -1405,17 +1466,18 @@ export async function provisionV3Container(
           }
         }
       } catch (codexErr) {
-        // codex 路径任意失败 → 回退 legacy mount,不挂错。日志保留诊断线索。
+        // codex 路径任意失败 → 回退;不打断 provision。
         // eslint-disable-next-line no-console
         console.error(
-          `[v3supervisor] WARN: codex account binding failed; falling back to legacy mount: ${(codexErr as Error).message}`,
+          `[v3supervisor] WARN: codex account binding failed (useRemote=${useRemote}); falling back: ${(codexErr as Error).message}`,
         );
       }
 
       if (boundCodexAccountId !== null) {
-        // per-container subdir 已由 writeCodexContainerAuthFile 创建(0755)
+        // per-container subdir 由 writeCodexContainerAuthFile / putRemoteCodexAuth 创建
         codexMountSource = pathJoin(codexContainerDir, String(row.id));
-      } else {
+      } else if (!useRemote) {
+        // 本地 fallback:legacy shared dir mount
         try {
           // mode 0755:owner=root rwx,其他用户(含容器内 agent uid)只能 r-x。
           // 防容器内进程往 host 这个目录写,但允许进入查 auth.json。
@@ -1430,7 +1492,11 @@ export async function provisionV3Container(
         }
         codexMountSource = codexContainerDir;
       }
-      binds.push(`${codexMountSource}:${V3_CODEX_AUTH_RO_MOUNT}:ro`);
+      // useRemote && fallback → codexMountSource = null → 跳过下方 binds.push,
+      // 不挂 codex mount(远端没有 shared dir 模型)
+      if (codexMountSource !== null) {
+        binds.push(`${codexMountSource}:${V3_CODEX_AUTH_RO_MOUNT}:ro`);
+      }
     }
 
     if (sshUserRunDir) {
@@ -1778,12 +1844,22 @@ export async function stopAndRemoveV3Container(
       failures.push({ stage: "remove", err: wrapDockerError(err) });
     }
   }
-  // F3:本地容器的 per-container codex auth 目录最佳清理(best-effort,绝不
-  // 阻塞清理流程)。远端容器没在 master 写过此目录,跳过即可。
+  // F3:per-container codex auth 文件 best-effort 清理(绝不阻塞清理流程)。
+  //   - 本地容器:rm <codexContainerDir>/<cid>/auth.json + rmdir 空 parent
+  //   - 远端容器(v1.0.72):RPC DELETE /files?path=<远端 default 路径>;
+  //     deps.deleteRemoteCodexAuth 未注入 → skip;失败 → 吞错。
+  //     远端不 rmdir parent(node-agent 无该 endpoint),留空 <cid>/ 目录,
+  //     与 deleteRemoteCodexContainerAuth 注释一致。
   if (!useRemote) {
     try {
       const codexContainerDir = readCodexContainerDirFromEnv();
       await removeCodexContainerAuthDir(codexContainerDir, String(containerRow.id));
+    } catch {
+      /* swallow */
+    }
+  } else if (deps.deleteRemoteCodexAuth) {
+    try {
+      await deps.deleteRemoteCodexAuth(effectiveHostUuid!, String(containerRow.id));
     } catch {
       /* swallow */
     }

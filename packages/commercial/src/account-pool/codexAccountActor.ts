@@ -68,6 +68,26 @@ export interface CodexRefreshActorDeps {
   refreshFn?: typeof refreshCodexAccountToken
   /** 测试用:覆盖 writeCodexContainerAuthFile(无 fs 单测)。 */
   writeFn?: typeof writeCodexContainerAuthFile
+  /**
+   * v1.0.72 — 本机在 compute_hosts 表的 host_id(UUID)。
+   * 与 `writeRemoteFn` 一起注入用于"row.host_uuid !== selfHostId → 远端写"判定。
+   * 不注入(单机 monolith / 测试)→ 所有行都当本地写,与 v1.0.71 行为一致。
+   */
+  selfHostId?: string | null
+  /**
+   * v1.0.72 — 远端 host 的 per-container auth.json 写入回调。签名与 index.ts
+   * 内 `putRemoteCodexAuth` helper 一致(getHostById → hostRowToTarget →
+   * putRemoteCodexContainerAuth → finally psk.fill(0))。
+   *
+   * 不注入 → 远端容器一律 skip filesFailed 计数,actor 走"本地写"路径;
+   * 配合 selfHostId 注入才生效。详见 writeForOneContainer。
+   */
+  writeRemoteFn?: (
+    hostUuid: string,
+    containerId: string,
+    accessToken: string,
+    lastRefreshIso: string,
+  ) => Promise<void>
 }
 
 export interface CodexRefreshActorHandle {
@@ -102,6 +122,7 @@ interface AccountRow {
 interface ContainerLockRow {
   codex_account_id: string | null
   state: string
+  host_uuid: string | null
 }
 
 /**
@@ -117,6 +138,8 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
   const txFn = deps.txFn ?? tx
   const refreshFn = deps.refreshFn ?? refreshCodexAccountToken
   const writeFn = deps.writeFn ?? writeCodexContainerAuthFile
+  const writeRemoteFn = deps.writeRemoteFn
+  const selfHostId = deps.selfHostId ?? null
 
   let stopped = false
 
@@ -153,10 +176,11 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
         try {
           await writeForOneContainer(cid, accountId, accessTokenStr, refreshed.expires_at, stats)
         } catch (err) {
-          // writeForOneContainer 内部已 ROLLBACK + warn 路径走 stats.filesFailed;
-          // 此 catch 是兜底:txFn 自身抛错(连接断 / unexpected) → 不影响后续容器
-          onError(`unexpected error writing auth for container ${cid}`, err)
+          // 单点 filesFailed 计数(v1.0.72 Codex 反馈):writeForOneContainer 内部
+          // 抛错只触发 tx ROLLBACK,不计 stats;所有失败统一在此 catch 计 + log,
+          // 避免双计。涵盖:本地 fs 写失败 / 远端 RPC 失败 / FOR UPDATE tx 自身 / 连接断
           stats.filesFailed += 1
+          onError(`write per-container auth.json failed for container ${cid}`, err)
         }
       }
     } finally {
@@ -168,7 +192,14 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
     }
   }
 
-  /** 单个容器:持 FOR UPDATE 锁直到 atomic rename 完成,然后 COMMIT。 */
+  /** 单个容器:持 FOR UPDATE 锁直到 atomic rename / 远端 PUT 完成,然后 COMMIT。
+   *
+   * v1.0.72 host 路由(plan v3 §G2 跨 host 同步):
+   *   row.host_uuid IS NULL || == selfHostId  →  本地 writeFn(fs)
+   *   row.host_uuid != selfHostId             →  远端 writeRemoteFn(node-agent RPC)
+   *
+   * **filesFailed 单点计数**(Codex 反馈):内层抛错只重抛,不记 stats —— 由
+   * processAccount 的外层 catch 兜底统一计数,避免双计。 */
   async function writeForOneContainer(
     containerId: string,
     expectedAccountId: bigint,
@@ -179,7 +210,7 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
     await txFn(async (client: PoolClient) => {
       // 锁定行,验证仍 = 本次 actor 锁定的 account_id + state='active'
       const lockRes = await client.query<ContainerLockRow>(
-        `SELECT codex_account_id::text AS codex_account_id, state
+        `SELECT codex_account_id::text AS codex_account_id, state, host_uuid::text AS host_uuid
          FROM agent_containers
          WHERE id = $1
          FOR UPDATE`,
@@ -198,26 +229,41 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
         return
       }
 
-      // 持锁期间:atomic write tmp → chown → 0o400 → rename
-      // writeCodexContainerAuthFile 内部:rename 失败会自动删 tmp 后抛错。
-      // 抛错 → tx 自动 ROLLBACK 持锁(plan 决策 M2 ROLLBACK 路径);
-      // 写成功 → 函数返回 → tx COMMIT(rename 已落盘)
-      try {
+      // host 路由:
+      //   - host_uuid IS NULL(单机 monolith legacy 行)→ 本地
+      //   - selfHostId 未注入(测试 / 单机退化)→ 一律本地(actor 没远端写能力)
+      //   - host_uuid == selfHostId → 本地
+      //   - host_uuid != selfHostId → 远端
+      // 注意:selfHostId 未注入但 host_uuid 非空的行,actor 当本地写。
+      // 行为权衡:相比"按真实 host 路由但 writeRemoteFn 缺失就 fail"更稳 ——
+      // 单机退化场景写到 master fs 是无害(容器在远端看不到该文件),但不会触发
+      // tx ROLLBACK 把行 stuck 在 NULL,符合 actor "永不阻塞 refresh" 的设计。
+      const isLocal =
+        selfHostId === null
+        || row.host_uuid === null
+        || row.host_uuid === selfHostId
+      const lastRefreshIso = new Date().toISOString()
+
+      // 持锁期间:本地 atomic write tmp → chown → 0o400 → rename;
+      //          远端 PUT /files?path=...&owner_uid=...&owner_gid=... + chown by server
+      // 任一失败 → 抛 → tx 自动 ROLLBACK 持锁(plan 决策 M2 ROLLBACK 路径)
+      // 成功 → 函数返回 → tx COMMIT(本地 rename / 远端 server 端 atomic rename 已落盘)
+      if (isLocal) {
         await writeFn({
           rootDir: deps.codexContainerDir,
           containerId,
           containerUid: deps.containerUid,
           containerGid: deps.containerGid,
-          auth: {
-            accessToken,
-            lastRefreshIso: new Date().toISOString(),
-          },
+          auth: { accessToken, lastRefreshIso },
         })
-      } catch (err) {
-        stats.filesFailed += 1
-        // 抛出 → tx 走 ROLLBACK
-        onError(`write per-container auth.json failed for container ${containerId}`, err)
-        throw err
+      } else {
+        if (!writeRemoteFn) {
+          // 远端容器但 actor 未注入 writeRemoteFn(monolith 误装多机行 / 测试场景)
+          throw new Error(
+            `codexAccountActor: container ${containerId} on remote host ${row.host_uuid} but writeRemoteFn not wired`,
+          )
+        }
+        await writeRemoteFn(row.host_uuid as string, containerId, accessToken, lastRefreshIso)
       }
       stats.filesWritten += 1
       // 不消费 expiresAt(只为 last_refresh 戳 isoNow);保留参数以备未来扩展
