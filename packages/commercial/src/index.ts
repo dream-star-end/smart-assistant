@@ -1194,7 +1194,23 @@ export async function registerCommercial(
               return null;
             }
             if (row.account_id === null) {
-              // legacy NULL 绑定。检查池子里是否有 active codex 账号:
+              // **Host 守护 (v1.0.71 紧急修复)**:provisionV3Container 当 host 是远端
+              // 时跳过 pickCodexAccountForBinding (v3supervisor.ts:1366 `if (!useRemote)`),
+              // 远端 host 上的容器永远是 NULL bind。如果在这种 host 上做 stale recycle,
+              // ensureRunning 重 provision 出来的新容器还是 NULL → 死循环把容器反复重建,
+              // user 7 在 boheyun host 上已经触发 (1347/1348/1349 在 11:00-11:02 连续 stale)。
+              // 仅 self-host 才有自愈条件 (重 provision 才会绑 codex 账号);远端 host 维持
+              // 原 N3 legacy 透传行为。
+              const selfHostId = v3DepsForCodex?.selfHostId ?? null;
+              const containerHostUuid = row.host_uuid;
+              if (
+                selfHostId === null ||
+                containerHostUuid === null ||
+                containerHostUuid !== selfHostId
+              ) {
+                return null;
+              }
+              // legacy NULL 绑定 + self-host。检查池子里是否有 active codex 账号:
               //   - 没有 → 真 legacy 路径不变,return null(N3 行为兼容)
               //   - 有   → 用户 admin 已加账号但容器 mount immutable 永远 401,
               //            必须 mark vanished + docker rm 让 ensureRunning 重 provision
