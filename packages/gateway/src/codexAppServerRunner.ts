@@ -61,6 +61,12 @@ interface QueuedTurn {
   prompt: string
   resolve: () => void
   reject: (err: Error) => void
+  /** PR2 v1.0.66 — server-owned per-turn id 从 sessionManager.submit() 透传过来。
+   *  挂在 queue entry 上(不是 runner instance 字段),因为同一 runner 多 turn
+   *  并存于队列,runner global 字段会被后到的 turn 覆盖,导致 emitResult 错关
+   *  错的 inflight 行。runTurn(opts.requestId) 从 closure 拿,emitResult 也从同
+   *  一 closure 拿,不读 instance 字段。 */
+  requestId?: string
 }
 
 interface PendingRequest {
@@ -74,6 +80,10 @@ interface RunnerMessage {
   type: string
   subtype?: string
   session_id?: string | null
+  /** PR2 v1.0.66 — emitResult 透传的 turn requestId,只 codex result 帧带,
+   *  sessionManager 据此识别这是 codex turn 终态,转发到 outbound.codex_billing 帧。
+   *  非 codex 路径 / 非 result 帧均不带。 */
+  requestId?: string
   message?: {
     role?: string
     content?: Array<{
@@ -346,7 +356,11 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emit('spawn', { resumed: this.threadId != null })
   }
 
-  async submit(textOrBlocks: string | Array<{ type: string; text?: string }>): Promise<void> {
+  async submit(
+    textOrBlocks: string | Array<{ type: string; text?: string }>,
+    /** PR2 v1.0.66 — 见 QueuedTurn.requestId 注释。 */
+    requestId?: string,
+  ): Promise<void> {
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
       this.spawnEmitted = true
@@ -354,7 +368,7 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     const prompt = normalisePrompt(textOrBlocks)
     return new Promise((resolve, reject) => {
-      this.queue.push({ prompt, resolve, reject })
+      this.queue.push({ prompt, resolve, reject, requestId })
       void this.drain()
     })
   }
@@ -432,7 +446,7 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!turn) return
     this.processing = true
     try {
-      await this.runTurn(turn.prompt)
+      await this.runTurn(turn.prompt, turn.requestId)
       turn.resolve()
     } catch (err) {
       turn.reject(err as Error)
@@ -877,7 +891,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
   }
 
-  private async runTurn(prompt: string): Promise<void> {
+  private async runTurn(prompt: string, requestId?: string): Promise<void> {
     const startedAt = Date.now()
     log.info('codex app-server turn start', {
       sessionKey: this.opts.sessionKey,
@@ -1004,6 +1018,7 @@ export class CodexAppServerRunner extends EventEmitter {
           ok: true,
           text: this.currentAssistantBuf,
           usage: usagePayload,
+          requestId,
         })
       } else if (status === 'failed') {
         const errMsg = turn?.error?.message ?? 'codex turn failed'
@@ -1018,7 +1033,7 @@ export class CodexAppServerRunner extends EventEmitter {
             delta: { type: 'text_delta', text: `\n\n[turn failed: ${errMsg}]\n` },
           },
         } as unknown as RunnerMessage)
-        this.emitResult({ durationMs, ok: false, error: errMsg, usage: usagePayload })
+        this.emitResult({ durationMs, ok: false, error: errMsg, usage: usagePayload, requestId })
       } else if (status === 'interrupted') {
         // Bill partial work on interrupted turns: codex already charged for
         // tokens before the user hit stop, so emit the delta we observed.
@@ -1027,6 +1042,7 @@ export class CodexAppServerRunner extends EventEmitter {
           ok: false,
           error: 'codex turn interrupted',
           usage: usagePayload,
+          requestId,
         })
       } else {
         this.emitResult({
@@ -1034,6 +1050,7 @@ export class CodexAppServerRunner extends EventEmitter {
           ok: false,
           error: `codex turn unexpected status=${status ?? 'unknown'}`,
           usage: usagePayload,
+          requestId,
         })
       }
     } catch (err) {
@@ -1048,6 +1065,7 @@ export class CodexAppServerRunner extends EventEmitter {
         durationMs,
         ok: false,
         error: `codex app-server: ${(err as Error).message}`,
+        requestId,
       })
       // Do NOT re-throw — drain() catches and rejects the queue entry, but
       // upstream sessionManager handles errors via the result message above.
@@ -1095,6 +1113,8 @@ export class CodexAppServerRunner extends EventEmitter {
       cache_creation_input_tokens?: number
       reasoning_output_tokens?: number
     }
+    /** PR2 v1.0.66 — caller(runTurn)从 closure 拿;不读 instance 字段防 race。 */
+    requestId?: string
   }): void {
     const msg: RunnerMessage = {
       type: 'result',
@@ -1105,6 +1125,7 @@ export class CodexAppServerRunner extends EventEmitter {
       is_error: !opts.ok,
       result: opts.ok ? (opts.text ?? '') : (opts.error ?? 'codex error'),
       usage: opts.usage,
+      requestId: opts.requestId,
     }
     this.emit('message', msg)
   }

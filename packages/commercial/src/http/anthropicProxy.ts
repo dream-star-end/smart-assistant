@@ -791,8 +791,15 @@ interface FinalizeDeps {
  */
 export async function startInflightJournal(
   pool: Pool,
-  ctx: Pick<FinalizeContext, "requestId" | "userId" | "containerId" | "model" | "precheckCredits">,
+  ctx: Pick<FinalizeContext, "requestId" | "userId" | "containerId" | "model" | "precheckCredits"> & {
+    /** PR2 v1.0.66 — codex 路径透传 {agentId, codexAccountId, source} 到 ctx JSONB,
+     *  reconciler 重跑 / 排障可从 journal 复原 codex turn 上下文。anthropic 路径不传,
+     *  保持现状(默认 ctx 只含 model)。**注意**:settle 时不信 ctxJson(以本地 Map
+     *  snapshot 为准),ctxJson 只服务 reconciler / audit。 */
+    ctxJson?: Record<string, unknown>;
+  },
 ): Promise<void> {
+  const journalCtx = { model: ctx.model, ...(ctx.ctxJson ?? {}) };
   await pool.query(
     `INSERT INTO request_finalize_journal
        (request_id, user_id, container_id, state, ctx, precheck_credits)
@@ -802,9 +809,68 @@ export async function startInflightJournal(
       ctx.requestId,
       ctx.userId.toString(),
       ctx.containerId.toString(),
-      JSON.stringify({ model: ctx.model }),
+      JSON.stringify(journalCtx),
       ctx.precheckCredits.toString(),
     ],
+  );
+}
+
+/**
+ * journal CAS:inflight/finalizing → committed,落 final_credits + ledger/usage 关联。
+ *
+ * **PR2 v1.0.66 抽出**:从 makeFinalizer.runCommit 内联 SQL 抽出,
+ * codex finalizer 单 phase(无 finalizing 中间态)直接调用此 helper。
+ *
+ * CAS WHERE state IN (...) 防止 reconciler 已 abort 的行被覆盖回 committed
+ * (虽然 once-flag + reconciler 间隔保证一般不会发生,helper 自防御稳)。
+ */
+export async function finalizeInflightJournal(
+  pool: Pool,
+  ctx: {
+    requestId: string;
+    finalCredits: bigint;
+    ledgerId: bigint | null;
+    usageId: bigint;
+  },
+): Promise<void> {
+  await pool.query(
+    `UPDATE request_finalize_journal
+        SET state='committed',
+            final_credits=$2,
+            ledger_id=$3,
+            usage_id=$4,
+            updated_at=NOW()
+      WHERE request_id=$1
+        AND state IN ('inflight','finalizing')`,
+    [
+      ctx.requestId,
+      ctx.finalCredits.toString(),
+      ctx.ledgerId === null ? null : ctx.ledgerId.toString(),
+      ctx.usageId.toString(),
+    ],
+  );
+}
+
+/**
+ * journal CAS:inflight/finalizing → aborted,落 error_msg + final_credits=0。
+ *
+ * **PR2 v1.0.66 抽出**:从 makeFinalizer.runAbort 内联 SQL 抽出。
+ * 加 CAS state IN (...) guard:already committed 行不被回退到 aborted。
+ */
+export async function abortInflightJournal(
+  pool: Pool,
+  requestId: string,
+  errorMsg: string,
+): Promise<void> {
+  await pool.query(
+    `UPDATE request_finalize_journal
+        SET state='aborted',
+            error_msg=$2,
+            final_credits=0,
+            updated_at=NOW()
+      WHERE request_id=$1
+        AND state IN ('inflight','finalizing')`,
+    [requestId, errorMsg],
   );
 }
 
@@ -858,21 +924,12 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
         status,
         sessionId: ctx.sessionId ?? null,
       });
-      await deps.pgPool.query(
-        `UPDATE request_finalize_journal
-            SET state='committed',
-                final_credits=$2,
-                ledger_id=$3,
-                usage_id=$4,
-                updated_at=NOW()
-          WHERE request_id=$1`,
-        [
-          ctx.requestId,
-          cost_credits.toString(),
-          settled.ledgerId === null ? null : settled.ledgerId.toString(),
-          settled.usageId.toString(),
-        ],
-      );
+      await finalizeInflightJournal(deps.pgPool, {
+        requestId: ctx.requestId,
+        finalCredits: cost_credits,
+        ledgerId: settled.ledgerId,
+        usageId: settled.usageId,
+      });
       ctx.log.info("proxy_finalize_committed", {
         finalCredits: cost_credits.toString(),
         kind: obs.kind,
@@ -909,15 +966,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
   async function runAbort(_obs: UsageObservation, err: unknown): Promise<FinalizeOutcome> {
     const msg = errMessageShort(err);
     try {
-      await deps.pgPool.query(
-        `UPDATE request_finalize_journal
-            SET state='aborted',
-                error_msg=$2,
-                final_credits=0,
-                updated_at=NOW()
-          WHERE request_id=$1`,
-        [ctx.requestId, msg],
-      );
+      await abortInflightJournal(deps.pgPool, ctx.requestId, msg);
     } catch (dbErr) {
       ctx.log.error("proxy_finalize_abort_db_failed", { err: errSummary(dbErr) });
     }
@@ -974,7 +1023,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
   };
 }
 
-interface SettleResult {
+export interface SettleResult {
   usageId: bigint;
   ledgerId: bigint | null;
   /**
@@ -1011,7 +1060,21 @@ interface SettleResult {
  * 幂等:`(user_id, request_id)` 唯一索引保证 usage_records 不会重插。
  * 重复进入 settle 时 INSERT 抛 23505 → 我们 catch 改成 SELECT 取已有行返回。
  */
-async function settleUsageAndLedger(
+/**
+ * **PR2 v1.0.66 — export 供 codex 计费路径复用**(`packages/commercial/src/billing/codexFinalizer.ts`)。
+ *
+ * 单 PG 事务:INSERT usage_records → (status='success' && cost>0) FOR UPDATE users
+ * → INSERT credit_ledger → 反写 usage_records.ledger_id。
+ *
+ * 调用方约束:
+ *   - costCredits 必须 caller 自己用 computeCost(usage, derivedPricing) 算好
+ *     (multiplier 已 apply 进 derivedPricing 了);**这里不重算**
+ *   - status='success' + cost>0 才走 ledger debit;'billing_failed'/'error'/cost=0
+ *     只落 usage_records 不扣费(audit 痕)
+ *   - 重入(同 requestId 二次调用)由 (user_id, request_id) UNIQUE 守门,
+ *     返回的 debitedCredits=null,balanceAfter=null,clamped=false
+ */
+export async function settleUsageAndLedger(
   pool: Pool,
   args: {
     userId: bigint;

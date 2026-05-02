@@ -249,7 +249,12 @@ export class CodexRunner extends EventEmitter {
     this.emit('spawn', { resumed: this.threadId != null })
   }
 
-  async submit(textOrBlocks: string | Array<{ type: string; text?: string }>): Promise<void> {
+  // PR2 v1.0.66 — `_requestId` 形参为兼容 sessionManager.submit 的统一签名;legacy
+  // CodexRunner(`codex exec` 路径)不参与真扣费链路,真扣费走 CodexAppServerRunner。
+  async submit(
+    textOrBlocks: string | Array<{ type: string; text?: string }>,
+    _requestId?: string,
+  ): Promise<void> {
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
       this.spawnEmitted = true

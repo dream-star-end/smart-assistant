@@ -750,8 +750,13 @@ export class SubprocessRunner extends EventEmitter {
 
   // 发送一条 user message。CCB stream-json 输入格式:每行一个 SDK user message JSON
   // content 可以是单个字符串(全文本),也可以是完整的 Anthropic content block 数组(支持图片/多模态)
+  //
+  // PR2 v1.0.66 — `_requestId` 形参为兼容 sessionManager.submit 的统一签名而存在
+  // (CodexAppServerRunner 才真用)。CCB 路径不消费,纯 noop;打前缀下划线表明
+  // 参数有意忽略,不报 unused warning。
   async submit(
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
+    _requestId?: string,
   ): Promise<void> {
     if (!this.proc) await this.start()
     if (!this.proc) throw new Error('failed to start CCB subprocess')

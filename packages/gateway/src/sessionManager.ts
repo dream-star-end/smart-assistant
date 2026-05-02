@@ -613,6 +613,14 @@ export class SessionManager {
      *  与 effortLevel 共用同一把 lock + 同一次 shutdown(若 model 与 effort 都变,
      *  两次 setX 后只 shutdown 一次,避免双 warn 噪声 + 双 race)。 */
     model?: string,
+    /** PR2 v1.0.66 — server-owned requestId(来自 InboundMessage.requestId,master 强制写)。
+     *  仅 codex-native runner 路径消费:CodexAppServerRunner.submit 把它挂在 queue
+     *  entry 上,turn 结束 emitResult 时回带,sessionManager 路由成 'codex_billing'
+     *  SessionStreamEvent → server.ts 发 outbound.codex_billing 帧。
+     *
+     *  其它 runner(claude / minimax / 等)完全不读这个字段,纯透传 noop。
+     *  缺省 / 非 codex agent → 不参与真扣费链路,Anthropic 路径走 anthropicProxy 自己的扣费。 */
+    requestId?: string,
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
@@ -704,7 +712,7 @@ export class SessionManager {
       })
       try {
         await Promise.race([
-          this.runOneTurnWithRetry(session, userTextOrBlocks, onEvent),
+          this.runOneTurnWithRetry(session, userTextOrBlocks, onEvent, requestId),
           livenessPromise,
         ])
       } finally {
@@ -737,6 +745,7 @@ export class SessionManager {
     session: AgentSession,
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     onEvent: (e: SessionStreamEvent) => void,
+    requestId?: string,
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
@@ -745,7 +754,7 @@ export class SessionManager {
     let phantomRetryUsed = false
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        await this._runOneTurn(session, userTextOrBlocks, onEvent)
+        await this._runOneTurn(session, userTextOrBlocks, onEvent, requestId)
         return // success
       } catch (err: any) {
         const msg = err?.message ?? String(err)
@@ -848,6 +857,7 @@ export class SessionManager {
     session: AgentSession,
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     onEvent: (e: SessionStreamEvent) => void,
+    requestId?: string,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -1236,6 +1246,9 @@ export class SessionManager {
               },
               toolCalls: turnToolCallCount,
               durationMs: turnDurationMs,
+              // PR2 v1.0.66 — codex-native turn 把 server-owned requestId 透到这里,
+              // 让 event_log / 异步 audit 能关联到 inflightCodexTurns 行。其它路径 undefined。
+              ...(requestId ? { requestId } : {}),
             }))
 
             // Emit cost.recorded for budget tracking
@@ -1284,6 +1297,67 @@ export class SessionManager {
         // 也会重新 arm,会让旧 turn 的 idle 回调在 30 分钟后被无意义地触发
         // (回调内有 !parser.finalized 守卫所以是 no-op,但还是不要触发更干净)。
         if (!detached) timer.refresh()
+        // PR2 v1.0.66 — codex turn 终态侧信道。CodexAppServerRunner 在 emitResult
+        // 时把 server-owned requestId 挂在 RunnerMessage 上;sessionManager 这里**额外**
+        // 派一帧 'codex_billing' 给 server.ts 路由到 outbound.codex_billing(发给 master
+        // 做真扣费 settle)。parser.parse(msg) 仍照常发 kind:'final' 给前端 UI。
+        //
+        // 守卫:
+        //   - msg.type === 'result':runner result 帧
+        //   - msg.requestId 字符串非空:仅 codex-native runner 透传过来才有
+        //   - !detached:turn 已 idle/error 走完不再 emit(否则可能撞二次 settle 路径)
+        //   只看 msg.requestId 不看 runner 类型 —— 类型识别在 master 不在容器侧;
+        //   container 只对"携带 requestId 的 result"放行,信任 caller(master)
+        //   只在 codex 路径才传。其它 runner 即使被改造支持 requestId,也走得通。
+        if (
+          !detached &&
+          msg &&
+          typeof msg === 'object' &&
+          msg.type === 'result' &&
+          typeof msg.requestId === 'string' &&
+          msg.requestId.length > 0
+        ) {
+          const isOk: boolean = msg.is_error !== true
+          const errReason: string | undefined =
+            !isOk && typeof msg.result === 'string' && msg.result.length > 0
+              ? msg.result
+              : undefined
+          const u = msg.usage as
+            | {
+                input_tokens?: number
+                output_tokens?: number
+                cache_read_input_tokens?: number
+                cache_creation_input_tokens?: number
+                reasoning_output_tokens?: number
+              }
+            | undefined
+          // typeof 防御 → undefined 字段不进 emit,兼容旧帧 / 容器 schema 漂移
+          const usagePayload = u
+            ? {
+                ...(typeof u.input_tokens === 'number' ? { input_tokens: u.input_tokens } : {}),
+                ...(typeof u.output_tokens === 'number' ? { output_tokens: u.output_tokens } : {}),
+                ...(typeof u.cache_read_input_tokens === 'number'
+                  ? { cache_read_input_tokens: u.cache_read_input_tokens }
+                  : {}),
+                ...(typeof u.cache_creation_input_tokens === 'number'
+                  ? { cache_creation_input_tokens: u.cache_creation_input_tokens }
+                  : {}),
+                ...(typeof u.reasoning_output_tokens === 'number'
+                  ? { reasoning_output_tokens: u.reasoning_output_tokens }
+                  : {}),
+              }
+            : undefined
+          // wrappedOnEvent 不动:billing 帧不计 turnBlockCount/turnPermissionCount,
+          // phantom-turn 判定不该把 billing 算成"输出"。直接调 onEvent。
+          onEvent({
+            kind: 'codex_billing',
+            requestId: msg.requestId,
+            status: isOk ? 'success' : 'error',
+            durationMs: typeof msg.duration_ms === 'number' ? msg.duration_ms : 0,
+            ...(usagePayload ? { usage: usagePayload } : {}),
+            ...(errReason ? { errorReason: errReason } : {}),
+          })
+        }
         parser.parse(msg)
       }
       const handleError = (err: Error) => {
@@ -1363,7 +1437,11 @@ export class SessionManager {
       runner.on('telemetry', handleTelemetry)
       runner.on('parse_error', handleParseError)
 
-      runner.submit(userTextOrBlocks).catch((err) => {
+      // PR2 v1.0.66 — runner.submit 现在接 requestId 参数,挂在 queue entry 上,
+      // emitResult 时 codex runner 会回带在 RunnerMessage.requestId。
+      // SubprocessRunner / 其它 runner 的 submit 签名兼容(余数参数被忽略 —— TS
+      // 信任运行时一致性),不影响非 codex 路径。
+      runner.submit(userTextOrBlocks, requestId).catch((err) => {
         onEvent({ kind: 'error', error: String(err) })
         detach()
         settle(() => resolve())

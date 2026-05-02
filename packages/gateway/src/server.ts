@@ -16,7 +16,13 @@ import { type IncomingMessage, type ServerResponse, createServer } from 'node:ht
 import { isIPv4 } from 'node:net'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
-import type { InboundFrame, InboundMessage, OutboundError, OutboundMessage } from '@openclaude/protocol'
+import type {
+  InboundFrame,
+  InboundMessage,
+  OutboundCodexBilling,
+  OutboundError,
+  OutboundMessage,
+} from '@openclaude/protocol'
 import { classifyRunError } from './errorClassify.js'
 import {
   type AgentDef,
@@ -4121,6 +4127,18 @@ export class Gateway {
     // 已在 inferAgentForModel 路由前算过(safeModelForRouting),此处复用避免重复。
     const safeModel: string | undefined = safeModelForRouting
 
+    // PR2 v1.0.66 — 提取 server-owned requestId(master 强制写入)。
+    // 容器侧不验证、不生成、也不回退:不带 → undefined,sessionManager 透传给
+    // CodexAppServerRunner queue entry,emitResult 时若不带 requestId 则不发
+    // codex_billing 帧,master 端没 inflight 行也无所谓(不进入真扣费链路)。
+    // 类型 cast 用 (frame as any),与下方 _frameEffort / _frameModelRaw 同模式 ——
+    // typebox runtime 不在 ws 帧入口跑(JSON cast),用 typeof 防御。
+    const _frameRequestId = (frame as any).requestId
+    const safeRequestId: string | undefined =
+      typeof _frameRequestId === 'string' && _frameRequestId.length > 0
+        ? _frameRequestId
+        : undefined
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
@@ -4627,6 +4645,35 @@ export class Gateway {
             })
           }
         }
+      } else if (e.kind === 'codex_billing') {
+        // PR2 v1.0.66 — codex turn 终态侧信道。CodexAppServerRunner.emitResult 把
+        // server-owned requestId 回带,sessionManager 转成 'codex_billing' 事件,
+        // server.ts 这里发 outbound.codex_billing 帧给 master(走 deliver() 同样路径,
+        // 落到 userChatBridge 的 onContainerMessage,Stage 3 会拦截 settle)。
+        //
+        // 不影响 turn 流式 UX:这帧与 outbound.message/error 并存,前端不识别此 type
+        // 在 default case 静默忽略。master 拦截后不 forward 到 user。
+        //
+        // 用 deliver() 是因为它已经处理 frameSeq + ring + per-peer 路由,我们不该
+        // 在这里手抄一份。带 _userId 让 deliver 路由到正确 peerKey(等同 out 帧)。
+        // 路由三件套从 out 复制(同 OutboundError 模式),deliver() 需要 channel/
+        // peer.id 算 peerKey、需要 sessionKey 落 outbound ring。billing 只去 master,
+        // master 从 requestId 找 inflight,不读这三字段做 settle。
+        const billingFrame: OutboundCodexBilling & { _userId?: string } = {
+          type: 'outbound.codex_billing',
+          sessionKey: out.sessionKey,
+          channel: out.channel,
+          peer: out.peer,
+          requestId: e.requestId,
+          status: e.status,
+          durationMs: e.durationMs,
+          ...(e.usage ? { usage: e.usage } : {}),
+          ...(e.errorReason ? { errorReason: e.errorReason } : {}),
+          ...(((out as OutboundMessage & { _userId?: string })._userId)
+            ? { _userId: (out as OutboundMessage & { _userId?: string })._userId }
+            : {}),
+        }
+        this.deliver(billingFrame as unknown as OutboundMessage, adapter)
       } else if (e.kind === 'error') {
         this._runLog.complete(_run, { status: 'failed', error: e.error })
         // Remove idempotency key on failure to allow client retry
@@ -4662,7 +4709,7 @@ export class Gateway {
           adapter,
         )
       }
-    }, safeEffortLevel, safeModel)
+    }, safeEffortLevel, safeModel, safeRequestId)
   }
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {

@@ -66,6 +66,15 @@ export const InboundMessage = Type.Object({
   // 实际接收方(gateway server.ts)会按静态 allowlist 过滤,无效 model 静默
   // 丢弃 —— 防止用户 prefs 里残留 admin 已 disable 的 model 把 CCB 启不起来。
   model: Type.Optional(Type.String()),
+  // PR2 v1.0.66 — server-owned per-turn 标识。商用版 master 在 inbound 落到容器
+  // **之前**强制写入(忽略 client 提供的值);承担 codex 真扣费的 inflight 关联键:
+  //   master.userChatBridge: ensureRequestIdServerSide → preCheck → 写 inflightCodexTurns[requestId]
+  //   container gateway: 透传到 sessionManager.submit → CodexAppServerRunner queue entry
+  //   container gateway: turn 结束在 outbound.codex_billing 帧里回带这个 requestId
+  //   master.onContainerMessage: 截获 outbound.codex_billing,按 requestId 找 inflight 行 settle
+  // 容器侧不验证、不生成、也不回退 — 不带就跳过 codex 真扣费链路。其它 agent
+  // 路径完全不读这个字段,纯添加项,跟现有协议 100% 向后兼容。
+  requestId: Type.Optional(Type.String()),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>
@@ -307,6 +316,55 @@ export const OutboundError = Type.Object({
 export type OutboundError = Static<typeof OutboundError>
 
 // ───────────────────────────────────────────────
+// OutboundCodexBilling — PR2 v1.0.66 codex 真扣费侧信道。
+//
+// 容器 gateway 在 codex turn 终态时发一帧给 master(只去 master 不去 user);
+// master.userChatBridge.onContainerMessage 拦截后:
+//   1. 按 requestId 查 inflightCodexTurns 取 model/agentId/codexAccountId/journalRowId
+//   2. 走 settleCodexUsageAndLedger(单 PG 事务:usage_records INSERT ON CONFLICT
+//      DO NOTHING + ledger debit + journal CAS UPDATE WHERE state='inflight')
+//   3. 不再 forward 到 user(billing 帧用户不可见;与 outbound.cost_charged 不同
+//      的是后者是 master→user 已落账广播,这是 container→master 的内部协调)
+//
+// **master 不信 frame 里的 model / agentId / codexAccountId**:都从 inflight
+// snapshot 取(B.4 plan)。这帧仅承载使用量 + 终态分类 + requestId 关联键,
+// 防伪造改不了真实账单。
+//
+// status 只能是 success | error(PR2 范围)。partial 路径推到 PR3 不在本帧出现。
+// ───────────────────────────────────────────────
+export const OutboundCodexBilling = Type.Object({
+  type: Type.Literal('outbound.codex_billing'),
+  /** 路由三件套(与 outbound.message / outbound.error 同):container 侧 deliver()
+   *  按 (userId, channel, peer.id) 计算 peerKey 派发 WS,master.userChatBridge 是
+   *  这个 peerKey 上的唯一 ws client(v3 多租户:master ↔ container 单条 WS)。
+   *  master 收到后从 frame.requestId 拿 inflight key,**不依赖**这三字段做 settle。 */
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  /** master 写入的 server-owned id;container 必须原样回带。缺这个字段的帧
+   *  master 会丢弃(无法定位 inflight 行)。 */
+  requestId: Type.String(),
+  /** PR2 范围:codex turn 终态分类。partial 路径在 PR3 加。 */
+  status: Type.Union([Type.Literal('success'), Type.Literal('error')]),
+  /** turn 实际墙钟时长(ms),codex app-server 报告的 durationMs。 */
+  durationMs: Type.Number(),
+  /** Anthropic-shape usage(codex 已映射好);可缺省(空 turn / 模型未调用)→
+   *  master 视为零扣费但仍走 settle 路径关掉 inflight。 */
+  usage: Type.Optional(
+    Type.Object({
+      input_tokens: Type.Optional(Type.Number()),
+      output_tokens: Type.Optional(Type.Number()),
+      cache_read_input_tokens: Type.Optional(Type.Number()),
+      cache_creation_input_tokens: Type.Optional(Type.Number()),
+      reasoning_output_tokens: Type.Optional(Type.Number()),
+    }),
+  ),
+  /** error 状态下的简短原因(故障定位 / journal 落库),不返回给 user。 */
+  errorReason: Type.Optional(Type.String()),
+})
+export type OutboundCodexBilling = Static<typeof OutboundCodexBilling>
+
+// ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
 export const ControlListSessions = Type.Object({
@@ -331,6 +389,7 @@ export const AnyFrame = Type.Union([
   OutboundPermissionSettled,
   OutboundResumeFailed,
   OutboundError,
+  OutboundCodexBilling,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>

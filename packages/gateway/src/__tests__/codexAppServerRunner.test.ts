@@ -1296,3 +1296,174 @@ describe('shutdown — token state cleared (PR1 v1.0.65 A.2)', () => {
     await h.cleanup()
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR2 v1.0.66 — server-owned requestId pass-through.
+//
+// 校验 sessionManager.submit 透传过来的 requestId 在 codex 路径全程不丢:
+//   submit(prompt, requestId) → QueuedTurn.requestId → runTurn(_, requestId)
+//   → emitResult(opts.requestId) → RunnerMessage.requestId
+//
+// 直接测 emitResult 私有方法 + queue 入队结构,不需要真 spawn codex app-server。
+// 多并发 turn 场景测 queue entry-scoped 的隔离(关键决策:不挂 instance 字段)。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('PR2 v1.0.66 — requestId queue-entry transit', () => {
+  it('emitResult success with requestId — RunnerMessage 携带 requestId', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    runner.emitResult({
+      durationMs: 123,
+      ok: true,
+      text: 'hello',
+      usage: { input_tokens: 10, output_tokens: 5 },
+      requestId: 'req-abc',
+    })
+    assert.equal(h.messages.length, 1)
+    const msg = h.messages[0]
+    assert.equal(msg.type, 'result')
+    assert.equal(msg.subtype, 'success')
+    assert.equal(msg.requestId, 'req-abc')
+    assert.equal(msg.is_error, false)
+    assert.equal(msg.duration_ms, 123)
+    assert.deepEqual(msg.usage, { input_tokens: 10, output_tokens: 5 })
+    await h.cleanup()
+  })
+
+  it('emitResult error with requestId — error_during_execution + requestId', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    runner.emitResult({
+      durationMs: 50,
+      ok: false,
+      error: 'codex turn interrupted',
+      usage: { input_tokens: 3 },
+      requestId: 'req-err-1',
+    })
+    assert.equal(h.messages.length, 1)
+    const msg = h.messages[0]
+    assert.equal(msg.subtype, 'error_during_execution')
+    assert.equal(msg.is_error, true)
+    assert.equal(msg.requestId, 'req-err-1')
+    assert.equal(msg.result, 'codex turn interrupted')
+    await h.cleanup()
+  })
+
+  it('emitResult without requestId → RunnerMessage.requestId === undefined', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    // legacy/non-billing path:caller 没传 requestId(personal-edition 或非 codex)
+    runner.emitResult({ durationMs: 1, ok: true, text: '' })
+    assert.equal(h.messages.length, 1)
+    const msg = h.messages[0]
+    assert.equal(msg.requestId, undefined)
+    await h.cleanup()
+  })
+
+  it('submit() — requestId 挂在 queue entry 上,不挂 runner instance', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    // 不让 drain 真跑(没 fake proc 也没 mock ensureSpawned),拦截 drain。
+    runner.processing = true
+    // .catch(noop) 吸收 cleanup 阶段的 reject,避免 Node 把它当 unhandledRejection。
+    const noop = () => {}
+    h.runner.submit('first prompt', 'req-1').catch(noop)
+    h.runner.submit('second prompt', 'req-2').catch(noop)
+    h.runner.submit('third prompt').catch(noop) // 无 requestId 也合法
+    assert.equal(runner.queue.length, 3)
+    assert.equal(runner.queue[0].requestId, 'req-1')
+    assert.equal(runner.queue[0].prompt, 'first prompt')
+    assert.equal(runner.queue[1].requestId, 'req-2')
+    assert.equal(runner.queue[1].prompt, 'second prompt')
+    assert.equal(runner.queue[2].requestId, undefined)
+    assert.equal(runner.queue[2].prompt, 'third prompt')
+    // runner instance 字段不被设置(防 race:多 turn 并发不串)
+    assert.equal(runner.requestId, undefined)
+    // cleanup:reject pending 让 promise 不悬挂
+    for (const q of runner.queue) q.reject(new Error('test cleanup'))
+    runner.queue = []
+    runner.processing = false
+    await h.cleanup()
+  })
+
+  it('drain() 把 queue entry 的 requestId 透传到 runTurn', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    let receivedRequestId: string | undefined
+    let receivedPrompt: string | undefined
+    // stub runTurn 捕获参数
+    runner.runTurn = async (prompt: string, requestId?: string) => {
+      receivedPrompt = prompt
+      receivedRequestId = requestId
+    }
+    await h.runner.submit('hello', 'req-drain-1')
+    assert.equal(receivedPrompt, 'hello')
+    assert.equal(receivedRequestId, 'req-drain-1')
+    await h.cleanup()
+  })
+
+  it('drain() 透传 undefined requestId 给非计费路径', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    let receivedRequestId: string | undefined = 'sentinel-not-overwritten'
+    runner.runTurn = async (_prompt: string, requestId?: string) => {
+      receivedRequestId = requestId
+    }
+    await h.runner.submit('legacy turn')
+    // 关键:我们要的就是 undefined,不是 falsy 'sentinel'
+    assert.equal(receivedRequestId, undefined)
+    await h.cleanup()
+  })
+
+  it('多 turn 并发:每个 turn 拿自己的 requestId(不被后到的覆盖)', async () => {
+    // 关键回归:如果 requestId 挂在 runner instance 字段,第二次 submit
+    // 会把第一次未结束的 turn 的字段覆盖。挂 queue entry 才能隔离。
+    const h = await makeHarness()
+    const runner = h.runner as any
+    const captured: Array<{ prompt: string; rid: string | undefined }> = []
+    // 用预先 resolve 拿出的 fn 控制 turn1 释放,避开 TS 对 callback 内赋值的窄化问题
+    let releaseTurn1: () => void = () => {}
+    const turn1Gate = new Promise<void>((r) => {
+      releaseTurn1 = r
+    })
+    runner.runTurn = async (prompt: string, requestId?: string) => {
+      captured.push({ prompt, rid: requestId })
+      // 第一个 turn 卡住,模拟"前一个 turn 还没结束就来下一个 submit"
+      if (prompt === 't1') {
+        await turn1Gate
+      }
+    }
+    const p1 = h.runner.submit('t1', 'req-1')
+    const p2 = h.runner.submit('t2', 'req-2')
+    // 等到 turn1 已 dequeue 进 runTurn(captured.length === 1)
+    await waitFor(() => captured.length === 1)
+    assert.equal(captured[0].rid, 'req-1')
+    // queue 还剩 turn2,requestId 仍然是 req-2 没被覆盖
+    assert.equal(runner.queue.length, 1)
+    assert.equal(runner.queue[0].requestId, 'req-2')
+    // 放行 turn1,turn2 应进 runTurn 拿到 req-2
+    releaseTurn1()
+    await Promise.all([p1, p2])
+    assert.equal(captured.length, 2)
+    assert.equal(captured[1].rid, 'req-2')
+    await h.cleanup()
+  })
+
+  it('runTurn catch 路径 emitResult 也带 requestId(B.4 要求异常也能 settle)', async () => {
+    // 如果 ensureSpawned 抛(进程启不起来 / EPIPE 等),emitResult 还要回 requestId
+    // 让 master 关掉 inflight 行,否则 60s Redis preCheck 锁悬挂。
+    const h = await makeHarness()
+    const runner = h.runner as any
+    runner.ensureSpawned = async () => {
+      throw new Error('synthetic spawn failure')
+    }
+    // 直接调 runTurn,closure 模式校验 requestId 进 catch 分支
+    await runner.runTurn('hi', 'req-catch')
+    const resultMsg = h.messages.find((m: any) => m.type === 'result')
+    assert.ok(resultMsg, 'emitResult must fire on catch')
+    assert.equal(resultMsg.requestId, 'req-catch')
+    assert.equal(resultMsg.is_error, true)
+    assert.match(resultMsg.result, /synthetic spawn failure/)
+    await h.cleanup()
+  })
+})

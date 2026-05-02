@@ -1239,6 +1239,13 @@ export async function registerCommercial(
     // plan v3 G5/G7 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
     // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
     codexBinding,
+    // PR2 v1.0.66 — codex 真扣费三件套:bridge 内部走 preCheckWithCost / startInflightJournal
+    //   / settleUsageAndLedger 一条龙。pgPool / preCheckRedis / pricing 都是进程级 singleton,
+    //   注入即用。createUserChatBridge entry 已强校验"三件套全有或全无",partial 注入会 throw,
+    //   防生产配错让 codex 免费。codexBinding 已注 → 三件套必须全注(见 createUserChatBridge)。
+    pgPool: getPool(),
+    preCheckRedis,
+    pricing,
   });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
   // 扣费事件会实时推到用户前端。

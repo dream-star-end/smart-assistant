@@ -40,6 +40,24 @@ export type SessionStreamEvent =
     }
   | { kind: 'error'; error: string }
   | { kind: 'permission_request'; request: PermissionRequest }
+  // PR2 v1.0.66 — codex turn 终态侧信道事件,sessionManager 在收到 codex
+  // RunnerMessage{type:'result', requestId} 时**额外**发一帧(parser 仍照常发
+  // kind:'final')。server.ts 把这个 kind 路由到 outbound.codex_billing 帧给 master
+  // 做真扣费 settle。其它 runner 路径不会发这个 kind。
+  | {
+      kind: 'codex_billing'
+      requestId: string
+      status: 'success' | 'error'
+      durationMs: number
+      usage?: {
+        input_tokens?: number
+        output_tokens?: number
+        cache_read_input_tokens?: number
+        cache_creation_input_tokens?: number
+        reasoning_output_tokens?: number
+      }
+      errorReason?: string
+    }
 
 /** Detected tool_use that may need bridging (CronCreate, CronDelete, etc.) */
 export interface DetectedToolUse {

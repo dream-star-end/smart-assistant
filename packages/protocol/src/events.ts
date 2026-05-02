@@ -144,6 +144,9 @@ export const TurnCompletedEvent = Type.Intersect([
     usage: UsageInfo,
     toolCalls: Type.Number({ description: 'Number of tool calls in this turn' }),
     durationMs: Type.Number(),
+    /** PR2 v1.0.66 — server-owned per-turn id;codex-native turn 才有,subprocess
+     *  / 旧 codex exec 路径不带。给 audit / 异步 settle 关联 inflightCodexTurns 用。 */
+    requestId: Type.Optional(Type.String()),
   }),
 ])
 export type TurnCompletedEvent = Static<typeof TurnCompletedEvent>
