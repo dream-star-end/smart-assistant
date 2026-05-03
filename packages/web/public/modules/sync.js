@@ -173,6 +173,71 @@ function _rebindStreamingPointers(sess) {
 }
 
 /**
+ * Decide the `?since=<seq>` cursor for an incremental GET on a session.
+ * Returns 0 (= no `since`, request full payload) when:
+ *   - no local session exists yet
+ *   - `_liveStreamBroken` is set (resume_failed reconcile must see whole tape)
+ *   - `_dirty` is set (defensive — these never reach the fetch path normally)
+ *   - local messages array is empty (nothing to extend)
+ *   - any local message lacks `_seq` (legacy row pre-backfill; server can't
+ *     answer incrementally — fall back to full payload)
+ */
+export function _computeSinceSeqForFetch(localSess) {
+  if (!localSess) return 0
+  if (localSess._liveStreamBroken || localSess._dirty) return 0
+  const messages = Array.isArray(localSess.messages) ? localSess.messages : []
+  if (messages.length === 0) return 0
+  let max = 0
+  for (const m of messages) {
+    const s = m && typeof m._seq === 'number' && Number.isFinite(m._seq) ? m._seq : null
+    if (s === null) return 0  // legacy message without _seq → cannot use incremental
+    if (s > max) max = s
+  }
+  return max
+}
+
+/**
+ * Merge a partial (tail-only) server response into the local messages array.
+ * Returns null if sanity check fails (caller should fall back to full GET).
+ *
+ * Sanity: after appending the tail (with same-id replacement when server
+ * re-assigned `_seq`), the resulting array length and max `_seq` must match
+ * `remote.totalMessageCount` and `remote.maxSeq`. Mismatch indicates client
+ * has a hole the partial protocol can't fill (cross-device delete via legacy
+ * code path, server bug, etc.) — caller retries with full GET.
+ */
+export function _mergePartialTail(localMessages, tail, expectedCount, expectedMaxSeq) {
+  const merged = Array.isArray(localMessages) ? localMessages.slice() : []
+  const idIdx = new Map()
+  for (let i = 0; i < merged.length; i++) {
+    const m = merged[i]
+    if (m && typeof m.id === 'string') idIdx.set(m.id, i)
+  }
+  const tailArr = Array.isArray(tail) ? tail : []
+  for (const m of tailArr) {
+    if (!m || typeof m.id !== 'string') continue
+    if (idIdx.has(m.id)) {
+      // Same-id replacement — server re-allocated `_seq` because the
+      // server-visible content of this message changed (e.g., a server-
+      // authored takeover that mergePreservingServerAuthored substituted in
+      // a previous PUT). Replace in place to keep ordering stable.
+      merged[idIdx.get(m.id)] = m
+    } else {
+      merged.push(m)
+      idIdx.set(m.id, merged.length - 1)
+    }
+  }
+  let mergedMaxSeq = 0
+  for (const m of merged) {
+    const s = m && typeof m._seq === 'number' ? m._seq : 0
+    if (s > mergedMaxSeq) mergedMaxSeq = s
+  }
+  if (merged.length !== expectedCount) return null
+  if (mergedMaxSeq !== expectedMaxSeq) return null
+  return merged
+}
+
+/**
  * Pull session list from server, merge with local IndexedDB.
  * Server wins on conflict (newer updatedAt / lastAt).
  */
@@ -265,12 +330,30 @@ export async function syncSessionsFromServer() {
     }
   }
 
-  // Fetch missing/newer sessions from server (batch, max 10 concurrent)
+  // Fetch missing/newer sessions from server (batch, max 10 concurrent).
+  //
+  // Incremental GET (Plan v3): when local has messages with server-assigned
+  // `_seq`, pass `?since=<maxLocalSeq>` so server returns only the tail
+  // (`isPartial: true`). Rebuilds with merge dedupe + count/maxSeq sanity.
+  // Skip incremental for:
+  //   - `_liveStreamBroken` sessions (force-fetch reconcile must see all msgs)
+  //   - `_dirty` sessions (they never reach here per the merge loop guard,
+  //     but be defensive in case future toFetch logic changes)
+  //   - sessions with no local messages (nothing to incrementally extend)
+  //   - sessions whose local messages lack `_seq` (legacy row; server can't
+  //     incrementally answer until next write triggers backfill)
   const fetched = []
   for (let i = 0; i < toFetch.length; i += 10) {
     const batch = toFetch.slice(i, i + 10)
     const results = await Promise.allSettled(
-      batch.map((id) => apiGet(`/api/sessions/${id}`))
+      batch.map((id) => {
+        const local = state.sessions.get(id)
+        const sinceSeq = _computeSinceSeqForFetch(local)
+        const url = sinceSeq > 0
+          ? `/api/sessions/${id}?since=${sinceSeq}`
+          : `/api/sessions/${id}`
+        return apiGet(url)
+      })
     )
     for (const r of results) {
       if (r.status === 'fulfilled' && r.value?.id) fetched.push(r.value)
@@ -280,9 +363,80 @@ export async function syncSessionsFromServer() {
   // Merge fetched sessions into local state + IDB (skip dirty local sessions)
   let currentSessionUpdated = false
   let fetchedCount = 0
-  for (const remote of fetched) {
+  for (let remote of fetched) {
     if (isDeletePending(remote.id)) continue // locally deleted, pending server confirmation
-    const existingLocal = state.sessions.get(remote.id)
+    let existingLocal = state.sessions.get(remote.id)
+
+    // Incremental partial response (Plan v3): server returned only messages
+    // whose `_seq > sinceSeq`. We must merge tail into local and verify the
+    // full timeline by `totalMessageCount + maxSeq` sanity. On mismatch, fall
+    // back to a full GET (no `since`) and process that response instead.
+    //
+    // Strict ordering: this branch runs AFTER the dirty / liveStreamBroken
+    // pre-conditions are honoured by `_computeSinceSeqForFetch` (which never
+    // emits a `since` for those states). Defensive: if a partial response
+    // somehow arrives for a dirty session (server bug, replay race), skip it
+    // — the caller's later integrity-sync pass will reconcile.
+    if (remote.isPartial === true) {
+      if (!existingLocal) {
+        // Server returned partial but we have no local. Should not happen —
+        // _computeSinceSeqForFetch returns 0 in this case. Fall back to full.
+        try {
+          const full = await apiGet(`/api/sessions/${remote.id}`)
+          if (full?.id) remote = full
+          else continue
+        } catch { continue }
+      } else if (existingLocal._dirty && !existingLocal._liveStreamBroken) {
+        // Defensive (this combination shouldn't fetch with `since` per
+        // _computeSinceSeqForFetch). Drop the partial and let the next sync
+        // tick reconcile via the dirty-skip branch below.
+        continue
+      } else {
+        const merged = _mergePartialTail(
+          existingLocal.messages,
+          remote.messages,
+          typeof remote.totalMessageCount === 'number' ? remote.totalMessageCount : -1,
+          typeof remote.maxSeq === 'number' ? remote.maxSeq : -1,
+        )
+        if (merged === null) {
+          // Sanity failed — local has a hole/extra the partial can't reconcile.
+          // Re-fetch full and re-process; one extra round-trip in the rare
+          // mismatch case is acceptable.
+          try {
+            const full = await apiGet(`/api/sessions/${remote.id}`)
+            if (full?.id) remote = full
+            else continue
+          } catch { continue }
+        } else {
+          // Partial sanity passed: write the merged session and skip the
+          // full-merge logic below.
+          const sess = {
+            id: remote.id,
+            title: remote.title,
+            createdAt: remote.createdAt,
+            lastAt: remote.lastAt,
+            messages: merged,
+            agentId: remote.agentId || 'main',
+            pinned: remote.pinned || false,
+            _syncedAt: remote.updatedAt,
+          }
+          if (existingLocal._sendingInFlight) sess._sendingInFlight = true
+          if (existingLocal._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
+          if (existingLocal._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
+          if (typeof existingLocal._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
+          _rebuildSearchIndex(sess)
+          clearDeleteTombstone(sess.id)
+          state.sessions.set(sess.id, sess)
+          fetchedCount++
+          if (sess.id === state.currentSessionId) currentSessionUpdated = true
+          try { await dbPut({ ...sess, _syncedAt: remote.updatedAt }) } catch {}
+          continue
+        }
+      }
+      // Fell through from a sanity-fail or null-existingLocal retry: refresh
+      // existingLocal so the full-payload merge below sees the latest state.
+      existingLocal = state.sessions.get(remote.id)
+    }
     // Normally we skip overwriting a locally-dirty session to avoid stomping
     // unsynced user edits. The exception is `_liveStreamBroken`: Phase 0.4
     // resume_failed flagged this session's live stream as known-bad and the
