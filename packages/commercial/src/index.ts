@@ -74,6 +74,10 @@ import {
   type SweeperHandle as PendingOrdersExpirerHandle,
 } from "./payment/pendingOrdersExpirer.js";
 import {
+  startOnboardingScheduler,
+  type OnboardingSchedulerHandle,
+} from "./inbox/onboarding.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -1521,6 +1525,15 @@ export async function registerCommercial(
     pendingOrdersExpirer = startPendingOrdersExpirer({ intervalMs });
   }
 
+  // Onboarding inbox scheduler — 由 system_settings.onboarding_enabled 决定是否真发,
+  // 默认 false 上线即静默,boss 显式开启后才触达用户。详见 inbox/onboarding.ts。
+  let onboardingScheduler: OnboardingSchedulerHandle | undefined;
+  if (process.env.COMMERCIAL_ONBOARDING_DISABLED !== "1") {
+    const raw = Number(process.env.COMMERCIAL_ONBOARDING_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 60_000;
+    onboardingScheduler = startOnboardingScheduler({ intervalMs });
+  }
+
   return {
     handle: handler,
     handleWsUpgrade: (req, socket, head) => {
@@ -1565,6 +1578,9 @@ export async function registerCommercial(
       }
       if (pendingOrdersExpirer) {
         try { pendingOrdersExpirer.stop(); } catch { /* ignore */ }
+      }
+      if (onboardingScheduler) {
+        try { onboardingScheduler.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }

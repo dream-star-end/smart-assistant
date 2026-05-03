@@ -62,6 +62,11 @@ export const KEY_SCHEMAS = {
    * 整数,1..10000。窗口固定 24h(无对应 *_window_min)。
    */
   alerts_silent_new_user_threshold: z.number().int().min(1).max(10_000),
+  // ── Onboarding inbox 自动触达(R1..R6;详见 inbox/onboarding.ts)──
+  /** 总开关;false → onboarding 调度器 tick 立即返回,不写任何 inbox。 */
+  onboarding_enabled: z.boolean(),
+  /** dry-run;true → 走完整 SELECT 但事务回滚,不写 inbox(用来观察会触达多少人)。 */
+  onboarding_dry_run: z.boolean(),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -83,6 +88,8 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   alerts_login_failure_spike_threshold: 30,
   alerts_login_failure_window_min: 10,
   alerts_silent_new_user_threshold: 5,
+  onboarding_enabled: false,
+  onboarding_dry_run: false,
 };
 
 /** 给前端做 schema 自描述(admin UI 渲染表单用)。 */
@@ -128,6 +135,8 @@ export const KEY_META: Record<
     kind: "number", min: 1, max: 10000,
     description: "risk.silent_new_user_cohort 阈值:过去 24h 注册但从未发请求的人数 ≥ 此数触发(窗口固定 24h)",
   },
+  onboarding_enabled: { kind: "boolean", description: "用户激活/留存自动 inbox 触达(R1..R6)总开关" },
+  onboarding_dry_run: { kind: "boolean", description: "Onboarding dry-run:走完 SELECT 但事务回滚,不写 inbox" },
 };
 
 export const ALLOWED_KEYS: SystemSettingKey[] =
