@@ -41,6 +41,7 @@ import {
   queryEvents,
   listClientSessions,
   getClientSession,
+  getClientSessionPartial,
   upsertClientSession,
   deleteClientSession,
   listUnclaimedSessions,
@@ -1298,9 +1299,42 @@ export class Gateway {
       const sessId = clientSessMatch[1]
       const userId = this.getUserId(req)
       if (req.method === 'GET') {
-        getClientSession(sessId, userId)
-          .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
-          .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
+        // Incremental sync (Plan v3): client passes `?since=<seq>` to get
+        // only messages whose server-assigned `_seq` exceeds the cursor.
+        // Legacy rows (any message without `_seq`) and missing/invalid
+        // `since` fall back to the full payload via `isPartial: false`.
+        const sinceRaw = url.searchParams.get('since')
+        const sinceSeq = sinceRaw !== null ? Number(sinceRaw) : 0
+        const useIncremental = Number.isFinite(sinceSeq) && sinceSeq > 0
+        if (useIncremental) {
+          getClientSessionPartial(sessId, userId, sinceSeq)
+            .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
+            .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
+        } else {
+          getClientSession(sessId, userId)
+            .then((s) => {
+              if (!s) {
+                this.sendJson(res, 404, { error: 'not found' })
+                return
+              }
+              // Always stamp protocol fields explicitly (Codex review #6 — do
+              // not rely on truthy/falsey of missing keys). `maxSeq` is
+              // computed from messages, not next_seq.
+              const messages = (s.messages as Array<{ _seq?: unknown }>) || []
+              let maxSeq = 0
+              for (const m of messages) {
+                const v = (m as { _seq?: unknown })._seq
+                if (typeof v === 'number' && Number.isFinite(v) && v > maxSeq) maxSeq = v
+              }
+              this.sendJson(res, 200, {
+                ...s,
+                isPartial: false,
+                totalMessageCount: messages.length,
+                maxSeq,
+              })
+            })
+            .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
+        }
         return
       }
       if (req.method === 'PUT') {

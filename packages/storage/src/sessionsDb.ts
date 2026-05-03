@@ -193,6 +193,17 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("UPDATE client_sessions SET message_count = COALESCE(json_array_length(messages), 0)")
     }
   } catch { /* table just created with column already */ }
+  // Migration: per-session monotonic `next_seq` counter for the incremental
+  // GET protocol. Each message in the messages JSON gets a server-assigned
+  // `_seq` field; client passes `?since=<seq>` and server returns only tail.
+  // See normalizeAndAssignSeqs / getClientSessionPartial. Default 1 for fresh
+  // rows; legacy rows are backfilled lazily on the next write path.
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'next_seq')) {
+      db.exec("ALTER TABLE client_sessions ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 1")
+    }
+  } catch { /* table just created with column already */ }
 
   // ── WeChat iLink per-user bindings (multi-tenant) ──
   //   Each OpenClaude user can bind exactly one WeChat bot account via
@@ -667,6 +678,145 @@ export function appendServerAuthoredPure<T extends MessageLike>(
   return { applied: true, messages: next }
 }
 
+// ── _seq monotonic cursor for incremental GET (Plan v3) ──
+
+/**
+ * Fields excluded from message-content equality when judging whether to
+ * inherit an existing `_seq` or assign a fresh one.
+ *
+ * - `_seq` itself MUST be excluded (otherwise compare-on-_seq is circular).
+ * - `status` is a client-only UI flag (`sending`/`queued`/`sent`/`read`) the
+ *   server never authors; flipping it does not represent a server-visible
+ *   message-content change, so we keep the inherited `_seq` to avoid
+ *   spurious tail growth on every PUT.
+ *
+ * NOT excluded (intentionally — these ARE message content):
+ * - `_source` ('server' authoring takeover should produce a fresh `_seq` so
+ *   client incremental GET observes the takeover)
+ * - text / role / childBlocks / agentName / streaming flags (when persisted
+ *   they reflect what the server holds; if any change, client should resync)
+ */
+const _SEQ_CONTENT_IGNORE_FIELDS = new Set(['_seq', 'status'])
+
+function _stableStringifyForSeq(v: unknown): string | null {
+  try {
+    return JSON.stringify(v, (_k, val) => {
+      if (val && typeof val === 'object' && !Array.isArray(val)) {
+        const keys = Object.keys(val).sort().filter((k) => !_SEQ_CONTENT_IGNORE_FIELDS.has(k))
+        const sorted: Record<string, unknown> = {}
+        for (const k of keys) sorted[k] = (val as Record<string, unknown>)[k]
+        return sorted
+      }
+      return val
+    })
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Returns true when the two messages should share a `_seq` — i.e., they
+ * represent the same server-visible content version. See
+ * {@link _SEQ_CONTENT_IGNORE_FIELDS} for excluded fields.
+ *
+ * Conservative: if either side fails to stringify (cycle, non-JSON-safe
+ * values), treat as inequal so caller assigns a fresh `_seq`. Better to
+ * over-deliver than to silently lose a server change.
+ */
+export function _messageContentEqualForSeq(a: MessageLike, b: MessageLike): boolean {
+  const sa = _stableStringifyForSeq(a)
+  const sb = _stableStringifyForSeq(b)
+  if (sa === null || sb === null) return false
+  return sa === sb
+}
+
+/**
+ * Result of normalizing a session's messages array to satisfy the `_seq`
+ * invariant after a write.
+ *
+ * Invariant (post-normalize):
+ *   - Every `messages[i]._seq` is a positive integer.
+ *   - All `_seq` values within a session row are unique.
+ *   - `nextSeq > max(messages[i]._seq)` (next allocation strictly greater).
+ *   - `_seq` reflects server-visible content version: id+content unchanged →
+ *     inherited from `oldMsgs`; id new or content changed → freshly allocated.
+ *
+ * Pure: doesn't mutate inputs; returns a new messages array whose elements
+ * may share references with `finalMsgs` only when no `_seq` change was needed
+ * (kept references reduce GC pressure; not relied on for correctness).
+ */
+export function normalizeAndAssignSeqs<T extends MessageLike>(
+  oldMsgs: readonly T[],
+  finalMsgs: readonly T[],
+  currentNextSeq: number,
+): { messages: T[]; nextSeq: number; maxSeq: number } {
+  // Step 1: legacy backfill on oldMsgs side.
+  // If ANY old message lacks `_seq`, reassign the entire oldMsgs row in
+  // current array order starting from 1; this makes the row "post-migration"
+  // for the rest of this normalization. We deliberately ignore
+  // `currentNextSeq` here because legacy rows have `next_seq = 1` (default
+  // from the migration), which is meaningless until backfill happens.
+  let oldNormalized: Array<T & { _seq: number }>
+  let nextSeq: number
+  const anyOldMissingSeq = oldMsgs.some(
+    (m) => !m || typeof (m as MessageLike)._seq !== 'number' || !Number.isFinite((m as MessageLike)._seq as number),
+  )
+  if (anyOldMissingSeq) {
+    oldNormalized = oldMsgs.map((m, idx) => ({ ...(m as object), _seq: idx + 1 } as T & { _seq: number }))
+    nextSeq = oldMsgs.length + 1
+  } else {
+    oldNormalized = oldMsgs as Array<T & { _seq: number }>
+    // Defensive: even when oldMsgs all have _seq, the persisted next_seq column
+    // may have drifted (e.g., a botched manual SQL edit). Force monotonic.
+    let maxOldSeq = 0
+    for (const m of oldNormalized) if (m._seq > maxOldSeq) maxOldSeq = m._seq
+    nextSeq = Math.max(currentNextSeq, maxOldSeq + 1)
+  }
+  // Build oldById map AFTER normalization so inherited values are post-backfill.
+  const oldById = new Map<string, T & { _seq: number }>()
+  for (const m of oldNormalized) {
+    if (m && typeof m.id === 'string') oldById.set(m.id, m)
+  }
+
+  // Step 2: walk finalMsgs and decide each `_seq`.
+  // - id in oldById && content equal (ignoring _seq + client-only fields)
+  //   → inherit oldById[id]._seq
+  // - id in oldById && content changed (incl. _source flip)
+  //   → allocate fresh _seq
+  // - id new
+  //   → allocate fresh _seq
+  // - id missing on finalMsg → still allocate fresh _seq so the invariant
+  //   holds (caller is supposed to ensure ids, but we don't crash here)
+  const out: T[] = new Array(finalMsgs.length)
+  for (let i = 0; i < finalMsgs.length; i++) {
+    const m = finalMsgs[i] as T & { _seq?: number }
+    const mId = typeof m?.id === 'string' ? m.id : null
+    const old = mId ? oldById.get(mId) : undefined
+    if (old && _messageContentEqualForSeq(m, old)) {
+      // Inherit. Replace `_seq` field even if finalMsg already had one;
+      // oldMsgs is the authoritative source (Codex review #4).
+      if (m._seq === old._seq) {
+        out[i] = m
+      } else {
+        out[i] = { ...(m as object), _seq: old._seq } as T
+      }
+    } else {
+      out[i] = { ...(m as object), _seq: nextSeq } as T
+      nextSeq++
+    }
+  }
+
+  // Step 3: compute maxSeq from the actual messages (Codex review #5: do NOT
+  // trust nextSeq - 1). Also doubles as a defensive sanity for the assignment
+  // logic above.
+  let maxSeq = 0
+  for (const m of out) {
+    const s = (m as MessageLike)._seq
+    if (typeof s === 'number' && s > maxSeq) maxSeq = s
+  }
+  return { messages: out, nextSeq, maxSeq }
+}
+
 /**
  * Returns true if the row was actually inserted/updated, false if rejected.
  * @param baseSyncedAt - client's last known server updated_at (optimistic concurrency).
@@ -686,26 +836,29 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
     const existing = db.prepare(
-      'SELECT messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-    ).get(session.id, session.userId) as { messages: string; updated_at: number } | undefined
+      'SELECT messages, updated_at, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(session.id, session.userId) as { messages: string; updated_at: number; next_seq: number | null } | undefined
 
     // Reject stale writes (same optimistic concurrency check as the pre-transaction version)
     if (existing && existing.updated_at > baseSyncedAt) return false
 
-    let finalMessages: unknown[] = session.messages
+    let oldMsgs: MessageLike[] = []
     if (existing) {
       try {
-        const oldMsgs = JSON.parse(existing.messages) as MessageLike[]
-        if (Array.isArray(oldMsgs)) {
-          const clientMsgs = session.messages as MessageLike[]
-          finalMessages = mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[]
-        }
-      } catch { /* malformed existing messages JSON — fall back to client payload */ }
+        const parsed = JSON.parse(existing.messages)
+        if (Array.isArray(parsed)) oldMsgs = parsed as MessageLike[]
+      } catch { /* malformed existing messages JSON — treat as empty */ }
     }
+    const clientMsgs = session.messages as MessageLike[]
+    const merged = mergePreservingServerAuthored(oldMsgs, clientMsgs) as MessageLike[]
+    const currentNextSeq = existing && typeof existing.next_seq === 'number' && existing.next_seq > 0
+      ? existing.next_seq
+      : 1
+    const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(oldMsgs, merged, currentNextSeq)
 
     const result = db.prepare(`
-      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at)
-      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, @updatedAt)
+      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq)
+      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, @updatedAt, @nextSeq)
       ON CONFLICT(id) DO UPDATE SET
         agent_id = excluded.agent_id,
         title = excluded.title,
@@ -713,7 +866,8 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
         last_at = excluded.last_at,
         messages = excluded.messages,
         message_count = excluded.message_count,
-        updated_at = excluded.updated_at
+        updated_at = excluded.updated_at,
+        next_seq = excluded.next_seq
       WHERE client_sessions.updated_at <= @baseSyncedAt
         AND client_sessions.user_id = @userId
     `).run({
@@ -728,6 +882,7 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
       messageCount: finalMessages.length,
       updatedAt: session.updatedAt,
       baseSyncedAt,
+      nextSeq,
     })
     return result.changes > 0
   })
@@ -762,8 +917,8 @@ export async function appendServerAuthoredMessage(
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
     const row = db.prepare(
-      'SELECT messages FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-    ).get(sessId, userId) as { messages: string } | undefined
+      'SELECT messages, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(sessId, userId) as { messages: string; next_seq: number | null } | undefined
     if (!row) return { applied: false, reason: 'session_not_found' as const }
 
     let msgs: MessageLike[]
@@ -778,10 +933,19 @@ export async function appendServerAuthoredMessage(
     const result = appendServerAuthoredPure(msgs, message as MessageLike & { id: string })
     if (!result.applied) return { applied: false, reason: result.reason }
 
+    // Run the resulting messages through normalizeAndAssignSeqs so the new
+    // server-authored entry receives a fresh `_seq` AND any legacy rows on
+    // this row get backfilled in the same transaction. Without this, a
+    // legacy session (next_seq=1, messages without _seq) would silently get
+    // _seq=1 assigned only to the new message — colliding with the eventual
+    // _seq=1 a later upsert would assign during legacy backfill.
+    const currentNextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
+    const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, result.messages, currentNextSeq)
+
     const now = Date.now()
     db.prepare(
-      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ? WHERE id = ? AND user_id = ?'
-    ).run(JSON.stringify(result.messages), result.messages.length, now, now, sessId, userId)
+      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ? WHERE id = ? AND user_id = ?'
+    ).run(JSON.stringify(finalMessages), finalMessages.length, now, now, nextSeq, sessId, userId)
     return { applied: true }
   })
   return txn()
@@ -1041,6 +1205,86 @@ export async function getClientSession(id: string, userId?: string): Promise<Cli
     lastAt: row.last_at,
     messages: JSON.parse(row.messages),
     updatedAt: row.updated_at,
+  }
+}
+
+export interface ClientSessionPartial extends ClientSession {
+  totalMessageCount: number
+  maxSeq: number
+  isPartial: boolean
+}
+
+/**
+ * Incremental GET for cross-device sync. Returns ONLY messages whose
+ * server-assigned `_seq` is strictly greater than `sinceSeq`.
+ *
+ * Side-effect free: legacy rows (any message lacking `_seq`) are NOT
+ * backfilled here — that requires a write transaction. Instead, this function
+ * returns `isPartial: false` with the FULL messages array (fall back to
+ * legacy behaviour) so client-side incremental optimisation degrades safely.
+ * Once any write path (upsert / appendServerAuthored) runs on the row, the
+ * row enters incremental mode and subsequent GETs honour `since`.
+ *
+ * `maxSeq` is computed from the actual messages array (NOT `next_seq`); per
+ * Codex review #5, `next_seq - 1` may drift in the rare schema-mismatch case.
+ */
+export async function getClientSessionPartial(
+  id: string,
+  userId: string,
+  sinceSeq: number,
+): Promise<ClientSessionPartial | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+  ).get(id, userId) as {
+    id: string; user_id: string; agent_id: string; title: string; pinned: number;
+    created_at: number; last_at: number; messages: string; updated_at: number
+  } | undefined
+  if (!row) return null
+
+  let allMsgs: MessageLike[] = []
+  try {
+    const parsed = JSON.parse(row.messages)
+    if (Array.isArray(parsed)) allMsgs = parsed as MessageLike[]
+  } catch { /* malformed — fall through with empty allMsgs */ }
+
+  // Detect legacy: any message missing a numeric `_seq`. Returning a partial
+  // tail in this state is unsafe (the client's `sinceSeq=0` would slice
+  // arbitrarily). Fall back to full payload; client treats `isPartial:false`
+  // as "use the messages array verbatim".
+  const anyMissingSeq = allMsgs.some(
+    (m) => !m || typeof m._seq !== 'number' || !Number.isFinite(m._seq as number),
+  )
+
+  let messages: MessageLike[]
+  let isPartial: boolean
+  let maxSeq = 0
+  for (const m of allMsgs) {
+    const s = typeof m?._seq === 'number' ? m._seq : 0
+    if (s > maxSeq) maxSeq = s
+  }
+  const sinceIsValid = Number.isFinite(sinceSeq) && sinceSeq > 0
+  if (!anyMissingSeq && sinceIsValid) {
+    messages = allMsgs.filter((m) => typeof m?._seq === 'number' && (m._seq as number) > sinceSeq)
+    isPartial = true
+  } else {
+    messages = allMsgs
+    isPartial = false
+  }
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    agentId: row.agent_id,
+    title: row.title,
+    pinned: row.pinned === 1,
+    createdAt: row.created_at,
+    lastAt: row.last_at,
+    messages,
+    updatedAt: row.updated_at,
+    totalMessageCount: allMsgs.length,
+    maxSeq,
+    isPartial,
   }
 }
 
