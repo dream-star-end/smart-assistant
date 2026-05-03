@@ -14,16 +14,28 @@ if 'browser' in existing_ids:
     cfg['mcpServers'] = [s for s in cfg['mcpServers'] if s['id'] != 'browser']
 
 # Add browser MCP (no provider field = universal)
+# Wrap with `env -u *_PROXY ...` so playwright-mcp + spawned chrome do NOT
+# inherit the residential proxy from /etc/openclaude/secrets.env.
+# Reason: that proxy exists for claude/codex model-call anti-fingerprinting,
+# but Chrome can't auth a URL-embedded user:pass and fails ERR_INVALID_AUTH_CREDENTIALS;
+# also GCE Tokyo direct egress is fine for general browsing — proxying is pure cost here.
 browser_mcp = {
     "id": "browser",
-    "command": "npx",
+    "command": "/usr/bin/env",
     "args": [
-        "@playwright/mcp@latest",
+        "-u", "HTTP_PROXY", "-u", "HTTPS_PROXY",
+        "-u", "http_proxy", "-u", "https_proxy",
+        "-u", "ALL_PROXY", "-u", "all_proxy",
+        "-u", "NO_PROXY", "-u", "no_proxy",
+        "/usr/bin/playwright-mcp",
         "--headless",
+        "--no-sandbox",
+        "--browser", "chrome",
         "--caps", "core,tabs,pdf",
         "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "--init-script", "/root/.openclaude/browser-stealth.js",
-        "--viewport-size", "1280x800"
+        "--viewport-size", "1280x800",
+        "--allow-unrestricted-file-access"
     ],
     "tools": [
         "browser_navigate", "browser_click", "browser_type", "browser_fill_form",
