@@ -1,5 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { paths } from '@openclaude/storage'
 import { _sanitizeThreadId, buildCodexEnv, copyImagePathsToPublicDir } from './codexRunner.js'
 import { createLogger } from './logger.js'
@@ -180,6 +182,14 @@ export class CodexAppServerRunner extends EventEmitter {
    *  imageGeneration savedPath emissions against text the model already
    *  surfaced via deltas. */
   private currentAssistantBuf = ''
+  /** In-flight `handleItemCompleted` promises for the current turn. codex
+   *  emits `item/completed` then `turn/completed` back-to-back; the
+   *  per-item handler is async (file IO for imageGeneration base64 decode,
+   *  copyImagePathsToPublicDir for savedPath, etc.) so without tracking,
+   *  `runTurn` would snapshot `currentAssistantBuf` and emit `result`
+   *  before the handler appends the text_delta / fires emitToolResult.
+   *  Drained in `runTurn` (both happy and catch paths) before emitResult. */
+  private inflightItemHandlers: Set<Promise<void>> = new Set()
 
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
@@ -562,7 +572,37 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (method === 'item/completed') {
-      void this.handleItemCompleted(p.item)
+      // Track the async handler so `runTurn` can drain pending file IO /
+      // emits before snapshotting `currentAssistantBuf` and emitting result.
+      // codex sends item/completed before turn/completed; without this,
+      // imageGeneration's base64 writeFile (or any other async item path)
+      // can race past the result frame, leaving the UI with empty output.
+      const itemUnk = p.item
+      const itemId =
+        itemUnk && typeof itemUnk === 'object'
+          ? typeof (itemUnk as Record<string, unknown>).id === 'string'
+            ? ((itemUnk as Record<string, unknown>).id as string)
+            : '<no-id>'
+          : '<no-id>'
+      const itemType =
+        itemUnk && typeof itemUnk === 'object'
+          ? typeof (itemUnk as Record<string, unknown>).type === 'string'
+            ? ((itemUnk as Record<string, unknown>).type as string)
+            : '<no-type>'
+          : '<no-type>'
+      const p$ = this.handleItemCompleted(itemUnk)
+        .catch((e) => {
+          log.warn('codex item handler failed', {
+            sessionKey: this.opts.sessionKey,
+            itemId,
+            itemType,
+            err: (e as Error).message,
+          })
+        })
+        .finally(() => {
+          this.inflightItemHandlers.delete(p$)
+        })
+      this.inflightItemHandlers.add(p$)
       return
     }
     if (method === 'turn/completed') {
@@ -650,24 +690,61 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (itemType === 'imageGeneration') {
-      // codex's image_gen tool: schema gives savedPath as an absolute path
-      // (AbsolutePathBuf). Copy into FILE_ALLOWED_DIRS-allowed public dir,
-      // then emit the public path as a text_delta so frontend renders it.
-      // This replaces the old fs-baseline-diff trick from CodexRunner.
+      // codex's image_gen tool emits two notification shapes depending on the
+      // upstream auth mode (verified 2026-05-03 via JSON-RPC spike vs codex
+      // 0.125.0):
+      //   - auth_mode=chatgpt (full OAuth + refresh_token): item carries BOTH
+      //     `savedPath` (absolute path under <CODEX_HOME>/generated_images/...)
+      //     AND `result` (base64 PNG bytes).
+      //   - auth_mode=chatgptAuthTokens (commercial pool, token-only): item
+      //     carries `result` only — `savedPath` is absent. Codex still writes
+      //     the PNG to the same on-disk location, but the path is not surfaced
+      //     in the protocol frame.
+      // Without the base64 fallback, commercial-pool users see imageGeneration
+      // stuck at the started event's `status: in_progress`, no image rendered.
       const saved = typeof item.savedPath === 'string' ? item.savedPath : ''
-      if (!saved || !this.threadId) {
+      const resultB64 = typeof item.result === 'string' ? item.result : ''
+      if (!this.threadId || (!saved && !resultB64)) {
         this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
         return
       }
+      let publicPaths: string[] = []
+      let failedNames: string[] = []
       try {
-        const { copied, failedNames } = await copyImagePathsToPublicDir(
-          this.threadId,
-          [saved],
-          paths.generatedDir,
-        )
-        const newEmits = copied
-          .filter(({ publicPath }) => !this.currentAssistantBuf.includes(publicPath))
-          .map((c) => c.publicPath)
+        if (saved) {
+          const { copied, failedNames: f } = await copyImagePathsToPublicDir(
+            this.threadId,
+            [saved],
+            paths.generatedDir,
+          )
+          publicPaths = copied.map((c) => c.publicPath)
+          failedNames = f
+        } else {
+          // Decode base64 PNG bytes from item.result and write to public dir
+          // directly. Mirrors copyImagePathsToPublicDir's naming pattern
+          // (`codex-<sanitizedThreadId>-<basename>`) so the file appears in the
+          // same place as the savedPath path.
+          const safeThread = _sanitizeThreadId(this.threadId)
+          // Sanitize itemId before using as filename — it arrives over the wire
+          // and must not introduce path separators or shell metacharacters even
+          // though codex's observed form is `ig_<hex>`.
+          const safeItemId = itemId.replace(/[^A-Za-z0-9._-]/g, '')
+          const baseName = `${safeItemId || `image-${Date.now()}`}.png`
+          const dst = join(paths.generatedDir, `codex-${safeThread}-${baseName}`)
+          try {
+            await mkdir(paths.generatedDir, { recursive: true })
+            await writeFile(dst, Buffer.from(resultB64, 'base64'))
+            publicPaths = [dst]
+          } catch (err) {
+            log.warn('codex image base64 write failed', {
+              sessionKey: this.opts.sessionKey,
+              dst,
+              err: (err as Error).message,
+            })
+            failedNames = [baseName]
+          }
+        }
+        const newEmits = publicPaths.filter((p) => !this.currentAssistantBuf.includes(p))
         if (newEmits.length > 0) {
           // Surrounding blank lines so frontend's "absolute path on its own
           // line → render attachment" recognizer matches each path.
@@ -703,8 +780,10 @@ export class CodexAppServerRunner extends EventEmitter {
         })
       }
       // Also emit the original tool_result for the imageGeneration card so
-      // the UI's tool-call panel reflects the call.
-      this.emitToolResult(itemId, `imageGeneration → ${saved}`, false)
+      // the UI's tool-call panel reflects the call. Prefer the codex on-disk
+      // path when available, otherwise the public path we just wrote.
+      const summary = saved || publicPaths[0] || '<base64>'
+      this.emitToolResult(itemId, `imageGeneration → ${summary}`, false)
       return
     }
     if (itemType === 'agentMessage' || itemType === 'reasoning') {
@@ -781,6 +860,13 @@ export class CodexAppServerRunner extends EventEmitter {
       this.activeTurnId = turnId
 
       const turn = await completed
+      // Drain any in-flight item/completed handlers (e.g. imageGeneration
+      // base64 decode + writeFile) so emitResult below sees the final
+      // currentAssistantBuf and any tool_results have been fired BEFORE
+      // the result frame closes the turn.
+      if (this.inflightItemHandlers.size > 0) {
+        await Promise.allSettled([...this.inflightItemHandlers])
+      }
       this.activeTurnId = null
 
       const durationMs = Date.now() - startedAt
@@ -822,6 +908,12 @@ export class CodexAppServerRunner extends EventEmitter {
         })
       }
     } catch (err) {
+      // Same drain as the happy path — if a handler is still running when
+      // the turn errors out, let it finish before we clear state, otherwise
+      // it can race onto the next turn's currentAssistantBuf and corrupt it.
+      if (this.inflightItemHandlers.size > 0) {
+        await Promise.allSettled([...this.inflightItemHandlers])
+      }
       this.activeTurnId = null
       this.currentTurnCompleter = null
       const durationMs = Date.now() - startedAt
