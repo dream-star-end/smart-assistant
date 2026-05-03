@@ -283,6 +283,14 @@ export class CodexAppServerRunner extends EventEmitter {
    *  by emitResult on turn/completed; null if no token notifications were
    *  received this turn (codex bug or zero-LLM turn). */
   private currentTurnUsage: CodexTokenBreakdown | null = null
+  /** In-flight `handleItemCompleted` promises for the current turn. codex
+   *  emits `item/completed` then `turn/completed` back-to-back; the
+   *  per-item handler is async (file IO for imageGeneration base64 decode,
+   *  copyImagePathsToPublicDir for savedPath, etc.) so without tracking,
+   *  `runTurn` would snapshot `currentAssistantBuf` and emit `result`
+   *  before the handler appends the text_delta / fires emitToolResult.
+   *  Drained in `runTurn` (both happy and catch paths) before emitResult. */
+  private inflightItemHandlers: Set<Promise<void>> = new Set()
 
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
@@ -702,7 +710,42 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (method === 'item/completed') {
-      void this.handleItemCompleted(p.item)
+      // Track the async handler so `runTurn` can drain pending file IO /
+      // emits before snapshotting `currentAssistantBuf` and emitting result.
+      // codex sends item/completed before turn/completed; without this,
+      // imageGeneration's base64 writeFile (or any other async item path)
+      // can race past the result frame, leaving the UI with empty output.
+      const itemUnk = p.item
+      const itemId =
+        itemUnk && typeof itemUnk === 'object'
+          ? typeof (itemUnk as Record<string, unknown>).id === 'string'
+            ? ((itemUnk as Record<string, unknown>).id as string)
+            : '<no-id>'
+          : '<no-id>'
+      const itemType =
+        itemUnk && typeof itemUnk === 'object'
+          ? typeof (itemUnk as Record<string, unknown>).type === 'string'
+            ? ((itemUnk as Record<string, unknown>).type as string)
+            : '<no-type>'
+          : '<no-type>'
+      const handler = this.handleItemCompleted(itemUnk)
+        .catch((err) => {
+          // Belt + suspenders: handleItemCompleted's per-branch logic already
+          // logs+falls back on business errors (image copy/write failures emit
+          // a "[image copy failed: ...]" note). Anything escaping here is an
+          // unexpected throw — log enough to triage but don't poison runner
+          // state (don't reject the turn, don't disturb the next item).
+          log.warn('codex handleItemCompleted threw', {
+            sessionKey: this.opts.sessionKey,
+            itemType,
+            itemId,
+            err: (err as Error).message,
+          })
+        })
+        .finally(() => {
+          this.inflightItemHandlers.delete(handler)
+        })
+      this.inflightItemHandlers.add(handler)
       return
     }
     if (method === 'turn/completed') {
@@ -1005,6 +1048,21 @@ export class CodexAppServerRunner extends EventEmitter {
       this.activeTurnId = turnId
 
       const turn = await completed
+
+      // Drain any in-flight item-completed handlers (e.g. imageGeneration's
+      // base64 decode + writeFile, copyImagePathsToPublicDir for savedPath)
+      // that are still pending. codex emits item/completed before
+      // turn/completed, so by the time `await completed` resolves all of
+      // this turn's item handlers are already registered in the Set —
+      // a single snapshot Promise.allSettled is sufficient (no loop). Without
+      // this, currentAssistantBuf may snapshot empty for emitResult, and
+      // the handler's text_delta / tool_result frames arrive AFTER the
+      // result frame, by which point ccbMessageParser has already finalized
+      // and the frontend drops or mis-orders them.
+      if (this.inflightItemHandlers.size > 0) {
+        await Promise.allSettled([...this.inflightItemHandlers])
+      }
+
       this.activeTurnId = null
 
       const durationMs = Date.now() - startedAt
@@ -1095,6 +1153,16 @@ export class CodexAppServerRunner extends EventEmitter {
         })
       }
     } catch (err) {
+      // Best-effort drain on the error path too. If turn/start failed
+      // before any item/completed arrived this is a no-op; if codex
+      // crashed mid-turn after firing item/completed, draining keeps
+      // the order of emit calls (their text_delta / tool_result before
+      // our error result frame) consistent with the happy path.
+      // Promise.allSettled never throws, so this can't shadow the
+      // original `err` we're about to surface.
+      if (this.inflightItemHandlers.size > 0) {
+        await Promise.allSettled([...this.inflightItemHandlers])
+      }
       this.activeTurnId = null
       this.currentTurnCompleter = null
       const durationMs = Date.now() - startedAt
