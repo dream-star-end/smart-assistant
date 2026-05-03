@@ -103,6 +103,16 @@ export const sessionCrashesTotal = new Counter()
 
 export const wsConnectionsTotal = new Counter()
 
+// ── Outbound ring buffer observability ──
+// Lets ops watch how often the resume replay path actually rescues a
+// reconnect (hit), how often it has to bail to REST (miss with reason),
+// and how aggressively the ring is being trimmed (evictions by cause).
+// Without these, the only signal was a `log.warn` per miss.
+export const outboundRingReplayHitTotal = new Counter()
+export const outboundRingReplayMissTotal = new Counter() // labels: reason
+export const outboundRingEvictedTotal = new Counter() // labels: cause
+export const outboundRingSizeBytes = { value: 0 } // gauge — total bytes across all sessions
+
 // ── EventBus subscriber ──
 
 let _metricsStarted = false
@@ -154,9 +164,24 @@ export function serializeMetrics(): string {
     costTotal.serialize('oc_cost_usd_total', 'Total cost in USD'),
     sessionCrashesTotal.serialize('oc_session_crashes_total', 'Total session crashes'),
     wsConnectionsTotal.serialize('oc_ws_connections_total', 'Total WebSocket connections'),
+    outboundRingReplayHitTotal.serialize(
+      'oc_outbound_ring_replay_hit_total',
+      'Outbound ring replay served frames after client reconnect',
+    ),
+    outboundRingReplayMissTotal.serialize(
+      'oc_outbound_ring_replay_miss_total',
+      'Outbound ring replay miss by reason — client falls back to REST sync',
+    ),
+    outboundRingEvictedTotal.serialize(
+      'oc_outbound_ring_evicted_total',
+      'Outbound ring frames evicted by cause (entries|age|bytes)',
+    ),
     `# HELP oc_sessions_active Currently active sessions`,
     `# TYPE oc_sessions_active gauge`,
     `oc_sessions_active ${sessionsActive.value}`,
+    `# HELP oc_outbound_ring_size_bytes Outbound ring total bytes across all sessions`,
+    `# TYPE oc_outbound_ring_size_bytes gauge`,
+    `oc_outbound_ring_size_bytes ${outboundRingSizeBytes.value}`,
   ]
   return sections.join('\n\n') + '\n'
 }

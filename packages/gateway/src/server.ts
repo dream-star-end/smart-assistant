@@ -36,10 +36,21 @@ import { parseDocument } from './documentParser.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { createLogger } from './logger.js'
-import { startMetricsCollection, serializeMetrics, httpRequestsTotal, httpRequestDuration, wsConnectionsTotal, sessionsActive } from './metrics.js'
+import {
+  startMetricsCollection,
+  serializeMetrics,
+  httpRequestsTotal,
+  httpRequestDuration,
+  wsConnectionsTotal,
+  sessionsActive,
+  outboundRingReplayHitTotal,
+  outboundRingReplayMissTotal,
+  outboundRingEvictedTotal,
+  outboundRingSizeBytes,
+} from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
-import { OutboundRingBuffer } from './outboundRing.js'
+import { OutboundRingBuffer, DEFAULT_RING_CONFIG, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
@@ -220,13 +231,33 @@ export class Gateway {
   // `autoResumeFromHello(lastFrameSeq)` cursor replay so reconnecting clients
   // can catch up without hitting REST. When the ring can't satisfy a resume,
   // we emit `outbound.resume_failed` so the client escalates to REST sync.
-  private _outboundRing = new OutboundRingBuffer()
+  // Capacity bounds are configurable via `gateway.outboundRing` so personal
+  // instances (long backgrounded sessions) can extend the age window past
+  // the default 10min without rebuilding.
+  private _outboundRing!: OutboundRingBuffer
 
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
     // Wire up auth error handler: force-refresh token when 401 detected (bypass expiry check)
     this.sessions.onAuthError = () => this.refreshClaudeOAuthIfNeeded(true)
+    const ringCfg = deps.config.gateway.outboundRing ?? {}
+    this._outboundRing = new OutboundRingBuffer({
+      maxEntries: ringCfg.maxEntries ?? DEFAULT_RING_CONFIG.maxEntries,
+      maxAgeMs: ringCfg.maxAgeMs ?? DEFAULT_RING_CONFIG.maxAgeMs,
+      maxBytes: ringCfg.maxBytes ?? DEFAULT_RING_CONFIG.maxBytes,
+    })
+  }
+
+  /** Feed `prune()` eviction counts into Prometheus counters. Called from
+   *  every store/peekReplay site so age-on-read pruning is also reflected.
+   *  Also refreshes the ring size gauge — single source of truth for the
+   *  `oc_outbound_ring_size_bytes` value, no separate timer needed. */
+  private _recordRingEvictions(stats: EvictionStats): void {
+    if (stats.entries) outboundRingEvictedTotal.inc({ cause: 'entries' }, stats.entries)
+    if (stats.age) outboundRingEvictedTotal.inc({ cause: 'age' }, stats.age)
+    if (stats.bytes) outboundRingEvictedTotal.inc({ cause: 'bytes' }, stats.bytes)
+    outboundRingSizeBytes.value = this._outboundRing.totalBytes()
   }
 
   async start(): Promise<void> {
@@ -291,6 +322,9 @@ export class Gateway {
             try { await this.sessions.destroySession(k) } catch {}
             this._outboundRing.clear(k)
           }
+          // Refresh size_bytes gauge — without this, a Prometheus scrape after
+          // a wipe still reports the pre-clear bytes until the next store/peek.
+          outboundRingSizeBytes.value = this._outboundRing.totalBytes()
         },
       }
       try {
@@ -2819,8 +2853,25 @@ export class Gateway {
         ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }))
         return
       }
-      // Client-side keepalive ping — just ignore
-      if ((frame as any).type === 'ping') return
+      // Client-side keepalive ping — echo back as pong so the client can use
+      // RTT to detect a half-open ("zombie") socket. iOS Safari can freeze a
+      // backgrounded WS such that readyState stays OPEN locally but no frames
+      // flow; the client uses the absence of a matching pong within a watchdog
+      // window to force-close + reconnect. The optional `id` is echoed so the
+      // client can match the response to the specific ping it sent — without
+      // it, a stale pong queued during iOS resume could falsely satisfy a
+      // fresh probe.
+      if ((frame as any).type === 'ping') {
+        try {
+          const pingId = (frame as any).id
+          ws.send(JSON.stringify({
+            type: 'pong',
+            ...(pingId !== undefined ? { id: pingId } : {}),
+            ts: Date.now(),
+          }))
+        } catch {}
+        return
+      }
 
       // Hello frame: client identifies its sessions so we can auto-resume.
       // We register the WS into clientsByPeer only for peers that have an
@@ -2891,6 +2942,7 @@ export class Gateway {
         // frames around for a now-meaningless sessionKey would be wasteful
         // and could mislead a future reconnect.
         this._outboundRing.clear(sessionKey)
+        outboundRingSizeBytes.value = this._outboundRing.totalBytes()
         this.log.info('reset destroyed session', { sessionKey })
       } else if ((frame as any).type === 'control.session.compact') {
         // Compact: send a compaction request to the agent as a user message
@@ -3209,7 +3261,8 @@ export class Gateway {
     if (sessionKey) {
       const frameSeq = this._outboundRing.nextSeq(sessionKey)
       data = JSON.stringify({ ...wireFrame, ts: now, frameSeq })
-      this._outboundRing.store(sessionKey, frameSeq, now, data)
+      const evicted = this._outboundRing.store(sessionKey, frameSeq, now, data)
+      this._recordRingEvictions(evicted)
     } else {
       data = JSON.stringify({ ...wireFrame, ts: now })
     }
@@ -3468,16 +3521,28 @@ export class Gateway {
       const clientLastSeq = typeof peerRec?.lastFrameSeq === 'number' ? peerRec.lastFrameSeq : 0
       if (clientLastSeq >= 0) {
         const replay = this._outboundRing.peekReplay(sessionKey, clientLastSeq)
+        // Read-path pruning may have evicted age-aged frames — record those
+        // in metrics regardless of hit/miss outcome, otherwise the `age`
+        // cause is severely under-counted for idle sessions whose ring is
+        // only ever pruned on resume.
+        this._recordRingEvictions(replay.evicted)
         if (replay.ok) {
-          for (const f of replay.sent) {
-            try { ws.send(f.data) } catch { break }
-          }
+          // Only count as "hit" when the ring actually rescued frames.
+          // `ok` with empty sent means the client was already caught up
+          // (fromSeq === currentLast) — the ring did nothing useful, and
+          // counting it would inflate hit-rate against ordinary fresh
+          // hellos and skew the replay-effectiveness signal.
           if (replay.sent.length > 0) {
+            outboundRingReplayHitTotal.inc()
+            for (const f of replay.sent) {
+              try { ws.send(f.data) } catch { break }
+            }
             this.log.info('resume replay served', {
               sessionKey, from: clientLastSeq, to: replay.to, sent: replay.sent.length,
             })
           }
         } else {
+          outboundRingReplayMissTotal.inc({ reason: replay.reason })
           try {
             ws.send(JSON.stringify({
               type: 'outbound.resume_failed',
@@ -4127,7 +4192,8 @@ export class Gateway {
     if (sessionKey) {
       const frameSeq = this._outboundRing.nextSeq(sessionKey)
       data = JSON.stringify({ ...wire, ts: now, frameSeq })
-      this._outboundRing.store(sessionKey, frameSeq, now, data)
+      const evicted = this._outboundRing.store(sessionKey, frameSeq, now, data)
+      this._recordRingEvictions(evicted)
     } else {
       data = JSON.stringify({ ...wire, ts: now })
     }

@@ -48,6 +48,18 @@ export interface OpenClaudeConfig {
     port: number // 18789
     accessToken: string
     users?: UserEntry[] // multi-user: login with username+password
+    /**
+     * Per-session outbound frame ring buffer overrides. All fields optional —
+     * any unset field falls back to DEFAULT_RING_CONFIG (2000 entries / 10min /
+     * 5MB). On the personal instance, where `boss` regularly backgrounds the
+     * mobile tab for >10min during long agent runs, raise `maxAgeMs` so the
+     * resume replay path can still serve frames after the default window.
+     */
+    outboundRing?: {
+      maxEntries?: number
+      maxAgeMs?: number
+      maxBytes?: number
+    }
   }
   // 接入方式三选一(实际 token 由 CCB 自己存,这里只记录类型)
   auth: {
