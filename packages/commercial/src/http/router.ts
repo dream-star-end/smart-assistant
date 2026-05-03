@@ -52,6 +52,9 @@ import {
   type RequestContext,
 } from './handlers.js'
 import { containerFileProxy } from './containerFileProxy.js'
+import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
+import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
+import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
 import { handleLinuxdoStart, handleLinuxdoCallback } from './oauthLinuxdo.js'
 import { requireUserVerifyDb } from './requireUser.js'
 import { handleListPlans, handleCreateHupi, handleHupiCallback, handleGetOrder } from './payment.js'
@@ -792,6 +795,10 @@ export function createCommercialHandler(
         }
         const startedAt = Date.now()
         try {
+          // 多 host wiring:selfHostId 从 v3Supervisor.selfHostId 透传(单机 monolith
+          // 时为 undefined,containerFileProxy 自动走本地分支);tunnelDial / getHostById /
+          // capabilityProbe.tunnelFetchHealthz 三件套用 compute-pool 默认实现。
+          const selfHostIdForProxy = deps.v3Supervisor!.selfHostId
           await containerFileProxy(
             req,
             res,
@@ -799,6 +806,16 @@ export function createCommercialHandler(
             {
               v3: deps.v3Supervisor!,
               bridgeSecret: deps.bridgeSecret!,
+              selfHostId: selfHostIdForProxy,
+              getHostById: computePoolGetHostById,
+              tunnelDial: defaultTunnelDial,
+              capabilityProbe: {
+                selfHostId: selfHostIdForProxy,
+                tunnelFetchHealthz: (hostId, cid, timeoutMs) =>
+                  defaultTunnelFetchHealthz(hostId, cid, timeoutMs, {
+                    getHostById: computePoolGetHostById,
+                  }),
+              },
             },
             BigInt(claims.sub),
           )

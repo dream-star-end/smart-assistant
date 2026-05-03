@@ -5,6 +5,11 @@
  * 目标 capability(如 `file-proxy-v1`)。一次 /healthz 命中 → 60s 内不再重复探,
  * 降低每次下载都多一次 RTT 的开销。
  *
+ * **多 host 路由**:
+ *   - status.hostId === selfHostId(或 selfHostId 缺失)→ 直 fetch boundIp:port/healthz
+ *   - status.hostId !== selfHostId → 必须走 node-agent tunnel(`tunnelFetchHealthz`),
+ *     因为 docker bridge IP(172.30.x/16)只在 host 内可达,master 不可路由。
+ *
  * **不含 invalidate**:r6 设计里有"容器 rotate 时主动清 cache",MVP 砍掉 —— 只要
  * TTL ≤ 60s,即便 containerId 复用也最多 1 分钟内返 OUTDATED 一次,用户刷新即恢复。
  * 换来的代码 / 测试量显著下降。
@@ -38,6 +43,18 @@ export type FetchHealthzFn = (
 ) => Promise<HealthzResponse>;
 
 /**
+ * 远端 host healthz fetcher。
+ *
+ * `containerInternalId` 必须是 docker hex ID(node-agent tunnel `{cid}` 段),
+ * 与 V3ContainerStatus.dockerContainerId 一致。
+ */
+export type TunnelFetchHealthzFn = (
+  hostId: string,
+  containerInternalId: string,
+  timeoutMs: number,
+) => Promise<HealthzResponse>;
+
+/**
  * 默认用 node:http 的 `fetch`(Bun / Node 18+ 都原生支持),1s timeout 靠 AbortSignal.timeout。
  * 测试可传 `fetchImpl` 注入 mock 避免开真 TCP。
  */
@@ -56,6 +73,10 @@ async function defaultFetchHealthz(
 
 export interface CapabilityProbeDeps {
   fetchHealthz?: FetchHealthzFn;
+  /** 远端 host 走 node-agent tunnel 的 fetcher;远端容器必须注入,否则视为不可达 */
+  tunnelFetchHealthz?: TunnelFetchHealthzFn;
+  /** 本机 host UUID。缺失 = 单机 monolith,所有容器走本地 fetch 分支 */
+  selfHostId?: string;
   /** 测试钩子:显式传入 "now" 毫秒 */
   nowMs?: () => number;
 }
@@ -64,10 +85,11 @@ export interface CapabilityProbeDeps {
  * 判断 status 指向的容器是否广播了所有 `capsRequired` 能力。
  *
  * - 缓存命中且未过期 → 直接判
- * - 缓存过期或不存在 → 探一次 /healthz,写入缓存;探失败或 containerId 不匹配 → 返 false
+ * - 缓存过期或不存在:按 hostId 选本地 / tunnel 分支探一次 → 写缓存
+ * - 探失败、containerId echo 不匹配、远端但 tunnelFetchHealthz 缺失 → 返 false
  */
 export async function isContainerCapabilityReady(
-  status: Pick<V3ContainerStatus, "containerId" | "boundIp" | "port">,
+  status: Pick<V3ContainerStatus, "containerId" | "boundIp" | "port" | "hostId" | "dockerContainerId">,
   capsRequired: readonly string[],
   deps: CapabilityProbeDeps = {},
 ): Promise<boolean> {
@@ -76,10 +98,27 @@ export async function isContainerCapabilityReady(
   if (hit && hit.exp > now) {
     return capsRequired.every((c) => hit.caps.has(c));
   }
-  const fetchImpl = deps.fetchHealthz ?? defaultFetchHealthz;
+  const isRemote =
+    typeof deps.selfHostId === "string"
+    && typeof status.hostId === "string"
+    && status.hostId !== deps.selfHostId;
+
   let resp: HealthzResponse;
   try {
-    resp = await fetchImpl(status.boundIp, status.port, HEALTHZ_TIMEOUT_MS);
+    if (isRemote) {
+      // 远端必须注入 tunnel fetcher;漏注入 = 配置 bug,fail-closed
+      if (!deps.tunnelFetchHealthz) return false;
+      // dockerContainerId 必须存在;空 = DB 行 inconsistency,fail-closed
+      if (!status.dockerContainerId) return false;
+      resp = await deps.tunnelFetchHealthz(
+        status.hostId!,
+        status.dockerContainerId,
+        HEALTHZ_TIMEOUT_MS,
+      );
+    } else {
+      const fetchImpl = deps.fetchHealthz ?? defaultFetchHealthz;
+      resp = await fetchImpl(status.boundIp, status.port, HEALTHZ_TIMEOUT_MS);
+    }
   } catch {
     return false;
   }

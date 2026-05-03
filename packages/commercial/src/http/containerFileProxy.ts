@@ -5,26 +5,31 @@
  *   1. 查 DB:`getV3ContainerStatus(uid)` → state=running
  *   2. SSRF 白名单:bound_ip ∈ 172.30/16 且 port === 18789
  *   3. capability 探测:/healthz 必须广播 file-proxy-v1 且 containerId echo 匹配
- *   4. 发 GET http://boundIp:18789 + 两个认证头:
+ *   4. 多 host 路由:
+ *        - status.hostId === selfHostId(或 selfHostId 缺失)→ 直 fetch boundIp:port
+ *        - status.hostId !== selfHostId → 走 node-agent tunnel
+ *      两条路径都发 GET + 两个认证头:
  *        X-OpenClaude-Container-Id:<DB id>
  *        X-OpenClaude-Bridge-Nonce:HMAC(rootSecret, id)
  *      附带 Accept-Encoding: identity(禁 gzip 防 Range / Content-Length 对不上)
- *   5. 两段 timer:连接 3s(Node `http.timeout` 语义) → response 到达后
- *      `r.socket.setTimeout(120s)` 切到 idle
+ *   5. 两段 timer:连接 3s → response 到达后 idle 120s
  *   6. 响应头重写:Cache-Control:no-store + Vary + RFC 5987 Content-Disposition
  *   7. per-uid ≤ 4 并发,超限 429
  *
  * **SSRF 深防**(多层布防):
  *   - JWT 校验(上层 router)→ sub ∈ DB users
  *   - `user_id = $sub`(只会查到自己的容器行)
- *   - 172.30/16 白名单 + port 18789(即便 DB 行被污染也防不出 docker 网段)
+ *   - 172.30/16 白名单 + port 18789(本地分支即便 DB 行被污染也防不出 docker
+ *     网段;tunnel 分支由 node-agent {cid} 段做 docker hex 校验 + container
+ *     -id echo 二重 binding)
  *   - containerId 绑定 + HMAC nonce(容器端校验)
  *
- * **per-uid 并发**:`inflight` Map 计数,release 在三种 cleanup 路径都要幂等:
- *   - 正常 end → release
- *   - upstream error → release
- *   - 客户端断连(res.close)→ release
- *   任意一条只做一次(`released` flag 幂等)
+ * **per-uid 并发**:`inflight` Map 计数,release 在 cleanup 路径都要幂等
+ *  (released flag + 顶层 res.close 监听器一加 1 就挂)。
+ *
+ * **多 host 错误分类**:
+ *   - dial 失败 / head 读超时 → 502 BAD_GATEWAY 或 504 GATEWAY_TIMEOUT,
+ *     **不是** CONTAINER_OUTDATED —— 后者专门给 capability 探活返 false 的场景。
  */
 
 import type { ClientRequest, IncomingMessage, ServerResponse } from "node:http";
@@ -32,6 +37,7 @@ import { request as httpRequest } from "node:http";
 import { createHmac } from "node:crypto";
 import { isIPv4 } from "node:net";
 import { basename } from "node:path";
+import type { TLSSocket } from "node:tls";
 import type { RequestContext } from "./handlers.js";
 import type { V3ContainerStatus, V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 import { getV3ContainerStatus } from "../agent-sandbox/v3supervisor.js";
@@ -39,10 +45,14 @@ import {
   isContainerCapabilityReady,
   type CapabilityProbeDeps,
 } from "./capabilityCache.js";
+import { dialTunnelSocket, hostRowToTarget } from "../compute-pool/nodeAgentClient.js";
+import type { ComputeHostRow } from "../compute-pool/types.js";
+import { pipeBodyByContentLength, pipeBodyChunked, readResponseHead } from "./tunnelHttpReader.js";
 
 const CONNECT_MS = 3_000;
 const IDLE_MS = 120_000;
 const PER_UID_MAX = 4;
+const MAX_HEADER_BYTES = 64 * 1024;
 
 /** per-uid 并发计数。key = uid string。release() 幂等。 */
 const inflight = new Map<string, number>();
@@ -111,9 +121,32 @@ const PASSTHROUGH_RESPONSE_HEADERS = [
   "last-modified",
 ] as const;
 
+/**
+ * RFC 7230 hop-by-hop headers。tunnel 分支从容器响应里 strip 这些 ——
+ * 它们是上游 HTTP/1.1 连接级控制信号,转给浏览器只会乱套。
+ */
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
 export interface ContainerFileProxyDeps {
   v3: V3SupervisorDeps;
   bridgeSecret: string;
+  /** 本机 host UUID。未注入 = 单机 monolith,所有容器走本地 fetch 分支 */
+  selfHostId?: string;
+  /** 远端 tunnel dial fn(测试可注入 mock);多 host 模式必须传 */
+  tunnelDial?: typeof dialTunnelSocket;
+  /** 远端 host 行查询 fn;多 host 模式必须传 */
+  getHostById?: (id: string) => Promise<ComputeHostRow | null>;
+  /** 测试钩子:hostRowToTarget 注入(避开 psk 解密) */
+  rowToTarget?: typeof hostRowToTarget;
   /** 测试钩子:注入 status(跳过 DB / docker inspect) */
   getStatus?: (uid: number) => Promise<V3ContainerStatus | null>;
   /** 测试钩子:注入 capability probe */
@@ -176,16 +209,20 @@ export async function containerFileProxy(
   // 不能延到 upstream `response` 事件里才挂 —— 客户端在 DB 查询 / SSRF 白名单 /
   // capability probe / connect / header 任一阶段断开,原实现 release 只能靠
   // timeout/error 兜底,per-uid slot 可能卡到 DB 调用超时(最坏几十秒)。
-  // 另外,DB/probe 的 await 点可能在客户端已断开后仍继续走到 httpRequest(...) 创建
-  // 出站 upstream,下面每个 await 后都 check clientClosed 并 bail,避免 fd/socket
-  // 泄漏。close 回调也把 clientClosed 置真,后续创建的 upstream 会在 else 分支里
-  // 被立即 destroy。
+  // 另外,DB/probe 的 await 点可能在客户端已断开后仍继续走到出站请求创建,下面
+  // 每个 await 后都 check clientClosed 并 bail,避免 fd/socket 泄漏。close 回调也把
+  // clientClosed 置真,后续创建的 upstream / tunnel socket 在 else 分支里会被
+  // 立即 destroy。
   let currentUpstream: ClientRequest | null = null;
+  let currentTunnelSocket: TLSSocket | null = null;
   let clientClosed = false;
   res.on("close", () => {
     clientClosed = true;
     if (currentUpstream && !currentUpstream.destroyed) {
       try { currentUpstream.destroy(); } catch {}
+    }
+    if (currentTunnelSocket && !currentTunnelSocket.destroyed) {
+      try { currentTunnelSocket.destroy(); } catch {}
     }
     release();
   });
@@ -203,7 +240,9 @@ export async function containerFileProxy(
       return;
     }
 
-    // 2. SSRF 白名单
+    // 2. SSRF 白名单 —— 两个分支共享。tunnel 分支不直接连这个 IP,但保留是为了:
+    //    (a) 兜底 DB 行污染(host_uuid 被改但 boundIp 还指向非 bridge 网段也拒)
+    //    (b) 给 logging 一个统一的"奇怪 IP" 触发点
     if (!isBoundIpAllowed(status.boundIp) || status.port !== 18789) {
       ctx.log.warn("container_file_proxy_ssrf_denied", {
         uid: uidStr,
@@ -215,7 +254,7 @@ export async function containerFileProxy(
       return;
     }
 
-    // 3. capability probe
+    // 3. capability probe(自动按 hostId 走本地 fetch / tunnel —— 见 capabilityCache)
     const ready = await isContainerCapabilityReady(
       status,
       ["file-proxy-v1"],
@@ -228,120 +267,25 @@ export async function containerFileProxy(
       return;
     }
 
-    // 4. 构造上游请求
-    const host = req.headers.host ?? "x.invalid";
-    const reqUrl = new URL(req.url ?? "/", `http://${host}`);
-    const isFilePath = reqUrl.pathname === "/api/file";
+    // 4. 路由本地 vs 远端
+    const isRemote =
+      typeof deps.selfHostId === "string"
+      && typeof status.hostId === "string"
+      && status.hostId !== deps.selfHostId;
 
-    const up: Record<string, string | string[]> = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (v === undefined) continue;
-      if (FORWARD_HEADERS.has(k.toLowerCase())) {
-        up[k] = v as string | string[];
-      }
-    }
-    up["X-OpenClaude-Container-Id"] = String(status.containerId);
-    up["X-OpenClaude-Bridge-Nonce"] = createHmac("sha256", deps.bridgeSecret)
-      .update(String(status.containerId))
-      .digest("hex");
-    // 强制 identity:防止未来容器端对 /api/file gzip 后 Range / Content-Length 错配。
-    up["Accept-Encoding"] = "identity";
-
-    const requestImpl = deps.httpRequestImpl ?? httpRequest;
-    const upstream = requestImpl({
-      host: status.boundIp,
-      port: status.port,
-      method: "GET",
-      path: reqUrl.pathname + reqUrl.search,
-      headers: up,
-      family: 4,
-      // Node http.timeout 语义 = socket inactivity。response 前复用于 connect+header;
-      // response 后我们 `r.socket.setTimeout(IDLE_MS)` 切到 body idle。单个 timeout
-      // 事件 handler 即可覆盖两种场景。
-      timeout: CONNECT_MS,
-    });
-    currentUpstream = upstream;
-    // 极晚 bail:upstream 已创建但同步任务 tick 内客户端已断开 —— 顶层 close 回调
-    // 会把 clientClosed 置 true 且 destroy(但只 destroy currentUpstream,我们
-    // 是否已赋值取决于 event loop 时序)。双保险:此处显式检查,主动销毁已创建的
-    // upstream,避免对容器发出一个无人消费的请求。
-    if (clientClosed) {
-      try { upstream.destroy(); } catch {}
-      return;
-    }
-
-    upstream.on("timeout", () => {
-      upstream.destroy(new Error("connect_or_idle_timeout"));
-    });
-    upstream.on("error", (err) => {
-      ctx.log.warn("container_file_proxy_upstream_error", {
-        uid: uidStr,
-        error: (err as Error)?.message ?? String(err),
+    if (isRemote) {
+      await dispatchViaTunnel(req, res, ctx, deps, status, uidStr, {
+        clientClosedRef: () => clientClosed,
+        setCurrentSocket: (s) => { currentTunnelSocket = s; },
+        release,
       });
-      if (!res.headersSent) {
-        sendJsonError(res, 502, "BAD_GATEWAY", "upstream error", ctx.requestId);
-      } else if (!res.writableEnded) {
-        res.destroy();
-      }
-      release();
-    });
-
-    upstream.on("response", (r) => {
-      // 切到 socket idle timeout(涵盖 header 到 body 之间和 body 中的任何 stall)
-      r.socket.setTimeout(IDLE_MS);
-
-      // 文件名:/api/file?path=... 用 path 参数;/api/media/<name> 解 URL 段。
-      let rawName: string;
-      try {
-        rawName = isFilePath
-          ? reqUrl.searchParams.get("path") ?? ""
-          : decodeURIComponent(reqUrl.pathname.replace(/^\/api\/media\//, ""));
-      } catch {
-        // decodeURIComponent URIError(非法百分号)
-        if (!res.headersSent) {
-          sendJsonError(res, 400, "BAD_PATH", "invalid percent-encoding", ctx.requestId);
-        }
-        r.resume();
-        release();
-        return;
-      }
-
-      const fname =
-        basename(rawName)
-          .replace(/[\r\n"\\\x00]/g, "_")
-          .slice(0, 255) || "file";
-
-      const type = String(r.headers["content-type"] ?? "application/octet-stream");
-      const typeBase = (type.split(";")[0] ?? "").trim().toLowerCase();
-      // /api/file 永远 attachment;/api/media 在安全类型列表 + 非活跃类型 → inline
-      const mode =
-        !isFilePath && isSafeInlineType(typeBase) && !ACTIVE_TYPES.has(typeBase)
-          ? "inline"
-          : "attachment";
-
-      const out: Record<string, string | number | string[]> = {
-        "Content-Type": type,
-        "Cache-Control": "no-store",
-        Vary: "Authorization, Cookie",
-        "Content-Disposition": `${mode}; ${rfc5987(fname)}`,
-      };
-      for (const h of PASSTHROUGH_RESPONSE_HEADERS) {
-        const v = r.headers[h];
-        if (v !== undefined) out[h] = v as string | string[];
-      }
-
-      res.writeHead(r.statusCode ?? 502, out);
-
-      // cleanup 路径:r.end / r.error / (顶层已挂 res.close)。release 幂等。
-      r.on("end", () => release());
-      r.on("error", () => {
-        if (!res.writableEnded) res.destroy();
-        release();
+    } else {
+      dispatchViaLocalHttp(req, res, ctx, deps, status, uidStr, {
+        clientClosedRef: () => clientClosed,
+        setCurrentUpstream: (u) => { currentUpstream = u; },
+        release,
       });
-      r.pipe(res);
-    });
-
-    upstream.end();
+    }
   } catch (err) {
     ctx.log.error("container_file_proxy_unhandled", {
       uid: uidStr,
@@ -354,6 +298,345 @@ export async function containerFileProxy(
     }
     release();
   }
+}
+
+/** 共享:浏览器请求头 → 上游请求头白名单 + 三个固定头 */
+function buildUpstreamHeaders(
+  req: IncomingMessage,
+  status: Pick<V3ContainerStatus, "containerId">,
+  bridgeSecret: string,
+): Record<string, string | string[]> {
+  const up: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (v === undefined) continue;
+    if (FORWARD_HEADERS.has(k.toLowerCase())) {
+      up[k] = v as string | string[];
+    }
+  }
+  up["X-OpenClaude-Container-Id"] = String(status.containerId);
+  up["X-OpenClaude-Bridge-Nonce"] = createHmac("sha256", bridgeSecret)
+    .update(String(status.containerId))
+    .digest("hex");
+  up["Accept-Encoding"] = "identity";
+  return up;
+}
+
+/**
+ * 共享:基于上游响应头 + URL,构造给浏览器的最终响应头。
+ *
+ * tunnel 分支没有 `IncomingMessage` 对象,只有 `Record<string, string>`,
+ * 所以 helper 只读 case-insensitive header dict + statusCode。
+ */
+function buildClientResponseHead(
+  upstreamHeaders: Record<string, string | string[] | undefined>,
+  reqUrl: URL,
+  isFilePath: boolean,
+): { out: Record<string, string | number | string[]>; mode: "inline" | "attachment" } | { error: "bad_path" } {
+  let rawName: string;
+  try {
+    rawName = isFilePath
+      ? reqUrl.searchParams.get("path") ?? ""
+      : decodeURIComponent(reqUrl.pathname.replace(/^\/api\/media\//, ""));
+  } catch {
+    // decodeURIComponent URIError(非法百分号)
+    return { error: "bad_path" };
+  }
+
+  const fname =
+    basename(rawName)
+      .replace(/[\r\n"\\\x00]/g, "_")
+      .slice(0, 255) || "file";
+
+  const ctRaw = upstreamHeaders["content-type"];
+  const type = String(Array.isArray(ctRaw) ? ctRaw[0] : ctRaw ?? "application/octet-stream");
+  const typeBase = (type.split(";")[0] ?? "").trim().toLowerCase();
+  const mode =
+    !isFilePath && isSafeInlineType(typeBase) && !ACTIVE_TYPES.has(typeBase)
+      ? "inline"
+      : "attachment";
+
+  const out: Record<string, string | number | string[]> = {
+    "Content-Type": type,
+    "Cache-Control": "no-store",
+    Vary: "Authorization, Cookie",
+    "Content-Disposition": `${mode}; ${rfc5987(fname)}`,
+  };
+  for (const h of PASSTHROUGH_RESPONSE_HEADERS) {
+    const v = upstreamHeaders[h];
+    if (v !== undefined) out[h] = v as string | string[];
+  }
+  return { out, mode };
+}
+
+/** 本地分支:直 httpRequest 到 boundIp:port */
+function dispatchViaLocalHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: ContainerFileProxyDeps,
+  status: V3ContainerStatus,
+  uidStr: string,
+  hooks: {
+    clientClosedRef: () => boolean;
+    setCurrentUpstream: (u: ClientRequest | null) => void;
+    release: () => void;
+  },
+): void {
+  const host = req.headers.host ?? "x.invalid";
+  const reqUrl = new URL(req.url ?? "/", `http://${host}`);
+  const isFilePath = reqUrl.pathname === "/api/file";
+
+  const up = buildUpstreamHeaders(req, status, deps.bridgeSecret);
+
+  const requestImpl = deps.httpRequestImpl ?? httpRequest;
+  const upstream = requestImpl({
+    host: status.boundIp,
+    port: status.port,
+    method: "GET",
+    path: reqUrl.pathname + reqUrl.search,
+    headers: up,
+    family: 4,
+    timeout: CONNECT_MS,
+  });
+  hooks.setCurrentUpstream(upstream);
+  if (hooks.clientClosedRef()) {
+    try { upstream.destroy(); } catch {}
+    return;
+  }
+
+  upstream.on("timeout", () => {
+    upstream.destroy(new Error("connect_or_idle_timeout"));
+  });
+  upstream.on("error", (err) => {
+    ctx.log.warn("container_file_proxy_upstream_error", {
+      uid: uidStr,
+      error: (err as Error)?.message ?? String(err),
+    });
+    if (!res.headersSent) {
+      sendJsonError(res, 502, "BAD_GATEWAY", "upstream error", ctx.requestId);
+    } else if (!res.writableEnded) {
+      res.destroy();
+    }
+    hooks.release();
+  });
+
+  upstream.on("response", (r) => {
+    r.socket.setTimeout(IDLE_MS);
+
+    const built = buildClientResponseHead(r.headers, reqUrl, isFilePath);
+    if ("error" in built) {
+      if (!res.headersSent) {
+        sendJsonError(res, 400, "BAD_PATH", "invalid percent-encoding", ctx.requestId);
+      }
+      r.resume();
+      hooks.release();
+      return;
+    }
+    res.writeHead(r.statusCode ?? 502, built.out);
+
+    r.on("end", () => hooks.release());
+    r.on("error", () => {
+      if (!res.writableEnded) res.destroy();
+      hooks.release();
+    });
+    r.pipe(res);
+  });
+
+  upstream.end();
+}
+
+/** 远端分支:dialTunnelSocket → 手解 status+headers → pipe socket → res */
+async function dispatchViaTunnel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: ContainerFileProxyDeps,
+  status: V3ContainerStatus,
+  uidStr: string,
+  hooks: {
+    clientClosedRef: () => boolean;
+    setCurrentSocket: (s: TLSSocket | null) => void;
+    release: () => void;
+  },
+): Promise<void> {
+  // 多 host 模式必须注入这两个 dep;漏注入 = 配置 bug,fail-closed
+  if (!deps.tunnelDial || !deps.getHostById) {
+    ctx.log.warn("container_file_proxy_tunnel_misconfigured", {
+      uid: uidStr,
+      hostId: status.hostId,
+      hasDial: Boolean(deps.tunnelDial),
+      hasGetHost: Boolean(deps.getHostById),
+    });
+    sendJsonError(res, 502, "BAD_GATEWAY", "remote dispatch unavailable", ctx.requestId);
+    hooks.release();
+    return;
+  }
+  if (!status.dockerContainerId) {
+    // DB inconsistency:host_uuid 是远端但 container_internal_id 空
+    ctx.log.warn("container_file_proxy_no_docker_id", { uid: uidStr });
+    sendJsonError(res, 502, "BAD_GATEWAY", "container not provisioned", ctx.requestId);
+    hooks.release();
+    return;
+  }
+
+  const row = await deps.getHostById(status.hostId!);
+  if (hooks.clientClosedRef()) return;
+  if (!row) {
+    ctx.log.warn("container_file_proxy_host_not_found", { uid: uidStr, hostId: status.hostId });
+    sendJsonError(res, 502, "BAD_GATEWAY", "host not found", ctx.requestId);
+    hooks.release();
+    return;
+  }
+  const target = (deps.rowToTarget ?? hostRowToTarget)(row);
+
+  const host = req.headers.host ?? "x.invalid";
+  const reqUrl = new URL(req.url ?? "/", `http://${host}`);
+  const isFilePath = reqUrl.pathname === "/api/file";
+
+  const headers = buildUpstreamHeaders(req, status, deps.bridgeSecret);
+  // **不**写 Connection: close —— node-agent tunnel 会剥 hop-by-hop header(见
+  // tunnel.go),容器收不到。我们改为 master 侧按 Content-Length / chunked 边界
+  // 主动 destroy socket,让 close 反向 propagate。
+  // tunnel client 协议要求 string 值;flatten array(forward 名单里只有
+  // accept-encoding 之类不会有 array,但防御性 squash)
+  const flatHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    flatHeaders[k] = Array.isArray(v) ? v.join(", ") : String(v);
+  }
+
+  // path+query merging:dialTunnelSocket 走 /tunnel/containers/{cid}/{rest}
+  // —— 我们传的 pathAndQuery 必须包含原 path + 原 query + ?port=18789。用
+  // URLSearchParams 合并避免 caller 自带 path=... 跟我们的 port 拼错。
+  const params = new URLSearchParams(reqUrl.search);
+  params.set("port", String(status.port));
+  const pathAndQuery = `${reqUrl.pathname}?${params.toString()}`;
+
+  let socket: TLSSocket;
+  try {
+    socket = await deps.tunnelDial({
+      target,
+      method: "GET",
+      containerInternalId: status.dockerContainerId,
+      pathAndQuery,
+      headers: flatHeaders,
+      connectTimeoutMs: CONNECT_MS,
+    });
+  } catch (err) {
+    ctx.log.warn("container_file_proxy_tunnel_dial_failed", {
+      uid: uidStr,
+      hostId: status.hostId,
+      error: (err as Error)?.message ?? String(err),
+    });
+    if (!res.headersSent) {
+      sendJsonError(res, 502, "BAD_GATEWAY", "tunnel dial failed", ctx.requestId);
+    }
+    hooks.release();
+    return;
+  }
+  hooks.setCurrentSocket(socket);
+  if (hooks.clientClosedRef()) {
+    try { socket.destroy(); } catch {}
+    return;
+  }
+
+  // 读响应头:用 IDLE_MS 作头超时上限(实际 head 通常 << 1s,IDLE_MS 是兜底防
+  // body 之前长 stall)。head 读失败 → 504 GATEWAY_TIMEOUT,**不**误归 OUTDATED。
+  const head = await readResponseHead(socket, IDLE_MS, MAX_HEADER_BYTES);
+  if (hooks.clientClosedRef()) {
+    try { socket.destroy(); } catch {}
+    return;
+  }
+  if (!head) {
+    ctx.log.warn("container_file_proxy_tunnel_head_failed", {
+      uid: uidStr,
+      hostId: status.hostId,
+    });
+    if (!res.headersSent) {
+      sendJsonError(res, 504, "GATEWAY_TIMEOUT", "upstream head timeout", ctx.requestId);
+    }
+    try { socket.destroy(); } catch {}
+    hooks.release();
+    return;
+  }
+
+  // 切到 socket idle timeout(body 阶段)
+  socket.setTimeout(IDLE_MS, () => {
+    try { socket.destroy(); } catch {}
+  });
+
+  const built = buildClientResponseHead(head.headers, reqUrl, isFilePath);
+  if ("error" in built) {
+    if (!res.headersSent) {
+      sendJsonError(res, 400, "BAD_PATH", "invalid percent-encoding", ctx.requestId);
+    }
+    try { socket.destroy(); } catch {}
+    hooks.release();
+    return;
+  }
+
+  // 防御:不透传 hop-by-hop。buildClientResponseHead 已经只取白名单字段,
+  // 但白名单里若未来加进 hop-by-hop 会出错;此处一遍 strip 防回归。
+  for (const h of HOP_BY_HOP_HEADERS) delete built.out[h];
+
+  // body 路由:必须按 Content-Length / chunked 主动结束,否则永远等不到容器侧
+  // close —— node-agent tunnel hop-by-hop strip + 双向 io.Copy 等 EOF。
+  const cl = head.headers["content-length"];
+  const te = (head.headers["transfer-encoding"] ?? "").toLowerCase();
+  // 防御 NIT:容器若同时返 TE:chunked + CL,CL 是无效字段;走 chunked 解码,
+  // 同时不能把 CL 透传给浏览器,否则浏览器按 CL 提前断定 body 完成。
+  if (te.includes("chunked")) {
+    delete built.out["content-length"];
+    delete built.out["Content-Length" as keyof typeof built.out];
+  }
+
+  res.writeHead(head.statusCode || 502, built.out);
+  const finalize = (why: "ok" | string) => {
+    if (why === "ok") {
+      hooks.release();
+    } else {
+      ctx.log.warn("container_file_proxy_tunnel_body_error", {
+        uid: uidStr,
+        hostId: status.hostId,
+        why,
+      });
+      hooks.release();
+    }
+  };
+
+  if (te.includes("chunked")) {
+    pipeBodyChunked(socket, head.leftover, res, IDLE_MS, /*maxTotalBytes*/ 1024 * 1024 * 1024 /* 1 GB hard cap */, {
+      onDone: () => finalize("ok"),
+      onError: (why) => finalize(why),
+    });
+    return;
+  }
+  if (cl !== undefined) {
+    const expected = Number.parseInt(cl, 10);
+    if (!Number.isFinite(expected) || expected < 0) {
+      ctx.log.warn("container_file_proxy_tunnel_bad_cl", {
+        uid: uidStr,
+        contentLength: cl,
+      });
+      try { socket.destroy(); } catch {}
+      if (!res.writableEnded) try { res.destroy(); } catch {}
+      hooks.release();
+      return;
+    }
+    pipeBodyByContentLength(socket, head.leftover, res, expected, IDLE_MS, {
+      onDone: () => finalize("ok"),
+      onError: (why) => finalize(why),
+    });
+    return;
+  }
+  // 无 Content-Length 也无 chunked:协议异常(我们的容器 server 必发其一)。
+  // bail,不冒险用 socket.pipe 等 close —— node-agent 会卡死。
+  ctx.log.warn("container_file_proxy_tunnel_no_length", {
+    uid: uidStr,
+    hostId: status.hostId,
+  });
+  try { socket.destroy(); } catch {}
+  if (!res.writableEnded) try { res.destroy(); } catch {}
+  hooks.release();
 }
 
 function sendJsonError(
