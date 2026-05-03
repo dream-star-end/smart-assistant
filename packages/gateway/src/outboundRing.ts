@@ -41,9 +41,25 @@ interface SessionRing {
 
 export type ReplayMissReason = 'no_buffer' | 'buffer_miss' | 'sequence_mismatch'
 
+/**
+ * Counts of frames dropped by `prune()`, broken down by which bound forced
+ * the eviction. Returned alongside `store()` / `peekReplay()` so the caller
+ * can feed Prometheus counters without this module importing metrics.
+ *
+ * Cause classification rule: a single dropped entry is attributed to exactly
+ * one cause — whichever bound is checked first in `prune()` (entries → bytes
+ * → age). This avoids double-counting when multiple bounds are simultaneously
+ * exceeded.
+ */
+export interface EvictionStats {
+  entries: number
+  age: number
+  bytes: number
+}
+
 export type ReplayResult =
-  | { ok: true; sent: RingEntry[]; to: number }
-  | { ok: false; sent: never[]; to: number; reason: ReplayMissReason }
+  | { ok: true; sent: RingEntry[]; to: number; evicted: EvictionStats }
+  | { ok: false; sent: never[]; to: number; reason: ReplayMissReason; evicted: EvictionStats }
 
 export class OutboundRingBuffer {
   private rings = new Map<string, SessionRing>()
@@ -66,9 +82,10 @@ export class OutboundRingBuffer {
   /**
    * Store the serialized frame for later replay. `seq` MUST have been
    * obtained from a prior `nextSeq(sessionKey)` call so the ring remains
-   * monotonic. Calls prune() after insertion.
+   * monotonic. Calls prune() after insertion and returns the eviction
+   * cause counts produced by that prune so the caller can feed metrics.
    */
-  store(sessionKey: string, seq: number, now: number, data: string): void {
+  store(sessionKey: string, seq: number, now: number, data: string): EvictionStats {
     let ring = this.rings.get(sessionKey)
     if (!ring) {
       ring = { frames: [], totalBytes: 0 }
@@ -77,7 +94,7 @@ export class OutboundRingBuffer {
     const bytes = Buffer.byteLength(data, 'utf8')
     ring.frames.push({ seq, ts: now, data, bytes })
     ring.totalBytes += bytes
-    this.prune(ring, now)
+    return this.prune(ring, now)
   }
 
   /**
@@ -99,7 +116,7 @@ export class OutboundRingBuffer {
   peekReplay(sessionKey: string, fromSeq: number, now: number = Date.now()): ReplayResult {
     const currentLast = this.lastSeq.get(sessionKey) ?? 0
     const ring = this.rings.get(sessionKey)
-    if (ring) this.prune(ring, now)
+    const evicted: EvictionStats = ring ? this.prune(ring, now) : { entries: 0, age: 0, bytes: 0 }
     if (fromSeq > currentLast) {
       // Client claims to have seen frames we don't know about. If we have
       // no ring for this sessionKey at all, assume the server restarted and
@@ -107,12 +124,12 @@ export class OutboundRingBuffer {
       // If we do have a ring but it ends earlier than fromSeq, the cursor
       // is bogus (different server instance / tampered storage).
       if (!ring || ring.frames.length === 0) {
-        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
+        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer', evicted }
       }
-      return { ok: false, sent: [], to: currentLast, reason: 'sequence_mismatch' }
+      return { ok: false, sent: [], to: currentLast, reason: 'sequence_mismatch', evicted }
     }
     if (fromSeq === currentLast) {
-      return { ok: true, sent: [], to: currentLast }
+      return { ok: true, sent: [], to: currentLast, evicted }
     }
     // P1-3: fromSeq=0 is NOT a valid resume cursor when the server has already
     // emitted frames (currentLast>0). It means the client has either lost its
@@ -131,7 +148,7 @@ export class OutboundRingBuffer {
     // `fromSeq === currentLast` branch when both are 0 — so a new session
     // saying "I've seen nothing" still resolves to ok/[].
     if (fromSeq === 0 && currentLast > 0) {
-      return { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
+      return { ok: false, sent: [], to: currentLast, reason: 'no_buffer', evicted }
     }
     if (!ring || ring.frames.length === 0) {
       // After the fromSeq=0+currentLast>0 guard above, any no-ring state here
@@ -140,20 +157,20 @@ export class OutboundRingBuffer {
       // and never stored frames for this sessionKey). Escalate to no_buffer so
       // the client force-REST-syncs.
       if (fromSeq > 0) {
-        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
+        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer', evicted }
       }
       // Unreachable in the current flow — `fromSeq === currentLast === 0`
       // already returned ok/[] above, and fromSeq=0+currentLast>0 returned
       // no_buffer. Kept as a defensive total-cases guard in case future
       // edits reorder the branches.
-      return { ok: true, sent: [], to: currentLast }
+      return { ok: true, sent: [], to: currentLast, evicted }
     }
     const earliest = ring.frames[0].seq
     if (earliest > fromSeq + 1) {
-      return { ok: false, sent: [], to: currentLast, reason: 'buffer_miss' }
+      return { ok: false, sent: [], to: currentLast, reason: 'buffer_miss', evicted }
     }
     const frames = ring.frames.filter((f) => f.seq > fromSeq)
-    return { ok: true, sent: frames, to: currentLast }
+    return { ok: true, sent: frames, to: currentLast, evicted }
   }
 
   /** Current last-assigned seq for a session, or 0 if none. */
@@ -171,24 +188,41 @@ export class OutboundRingBuffer {
     return this.rings.get(sessionKey)?.totalBytes ?? 0
   }
 
+  /** Sum of buffered bytes across every session ring. Cheap to compute on
+   *  demand (linear in #sessions, not #frames) and used to refresh the
+   *  `oc_outbound_ring_size_bytes` Prom gauge from server.ts. */
+  totalBytes(): number {
+    let n = 0
+    for (const r of this.rings.values()) n += r.totalBytes
+    return n
+  }
+
   /** Drop the ring (but keep lastSeq) for a session — used on session destroy. */
   clear(sessionKey: string): void {
     this.rings.delete(sessionKey)
     this.lastSeq.delete(sessionKey)
   }
 
-  private prune(ring: SessionRing, now: number): void {
+  /** Cause-aware eviction: each dropped frame is attributed to exactly one
+   *  bound. Order is `entries → bytes → age`: if multiple bounds are
+   *  exceeded, the entry counts toward whichever is checked first. This
+   *  prevents one frame from being counted under two causes (which would
+   *  double-count in metrics) while still trimming the ring to satisfy all
+   *  bounds. Returns the per-cause counts so callers can feed Prometheus.
+   */
+  private prune(ring: SessionRing, now: number): EvictionStats {
+    const stats: EvictionStats = { entries: 0, age: 0, bytes: 0 }
     const cutoff = now - this.config.maxAgeMs
-    while (
-      ring.frames.length > 0 &&
-      (
-        ring.frames.length > this.config.maxEntries ||
-        ring.totalBytes > this.config.maxBytes ||
-        ring.frames[0].ts < cutoff
-      )
-    ) {
+    while (ring.frames.length > 0) {
+      let cause: keyof EvictionStats | null = null
+      if (ring.frames.length > this.config.maxEntries) cause = 'entries'
+      else if (ring.totalBytes > this.config.maxBytes) cause = 'bytes'
+      else if (ring.frames[0].ts < cutoff) cause = 'age'
+      if (!cause) break
       const dropped = ring.frames.shift()
       if (dropped) ring.totalBytes -= dropped.bytes
+      stats[cause]++
     }
+    return stats
   }
 }

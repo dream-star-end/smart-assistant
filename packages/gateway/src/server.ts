@@ -53,10 +53,21 @@ import { parseDocument } from './documentParser.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { createLogger } from './logger.js'
-import { startMetricsCollection, serializeMetrics, httpRequestsTotal, httpRequestDuration, wsConnectionsTotal, sessionsActive } from './metrics.js'
+import {
+  startMetricsCollection,
+  serializeMetrics,
+  httpRequestsTotal,
+  httpRequestDuration,
+  wsConnectionsTotal,
+  sessionsActive,
+  outboundRingReplayHitTotal,
+  outboundRingReplayMissTotal,
+  outboundRingEvictedTotal,
+  outboundRingSizeBytes,
+} from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
-import { OutboundRingBuffer } from './outboundRing.js'
+import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
@@ -320,19 +331,41 @@ export class Gateway {
   // `autoResumeFromHello(lastFrameSeq)` cursor replay so reconnecting clients
   // can catch up without hitting REST. When the ring can't satisfy a resume,
   // we emit `outbound.resume_failed` so the client escalates to REST sync.
-  private _outboundRing = new OutboundRingBuffer()
+  private _outboundRing!: OutboundRingBuffer
 
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
     // Wire up auth error handler: force-refresh token when 401 detected (bypass expiry check)
     this.sessions.onAuthError = () => this.refreshClaudeOAuthIfNeeded(true)
+    // Optional config override for ring bounds: lets `boss` raise maxAgeMs on
+    // commercial hosts where mobile users keep tabs backgrounded for >10min.
+    const ringCfg = deps.config.gateway.outboundRing ?? {}
+    this._outboundRing = new OutboundRingBuffer({
+      maxEntries: ringCfg.maxEntries ?? DEFAULT_RING_CONFIG.maxEntries,
+      maxAgeMs: ringCfg.maxAgeMs ?? DEFAULT_RING_CONFIG.maxAgeMs,
+      maxBytes: ringCfg.maxBytes ?? DEFAULT_RING_CONFIG.maxBytes,
+    })
     // 2026-04-21 Medium#G1:被 sessionManager 内部驱逐/shutdown 的 sessionKey
     // 由此 callback 统一走 outboundRing.clear,防 ring 内存长期泄漏。server.ts
     // 其他已有的 destroySession 调用点仍然显式 clear(幂等 double-clear 无副作用)。
     this.sessions.onSessionDestroyed = (sessionKey) => {
-      try { this._outboundRing.clear(sessionKey) } catch {}
+      try {
+        this._outboundRing.clear(sessionKey)
+        outboundRingSizeBytes.value = this._outboundRing.totalBytes()
+      } catch {}
     }
+  }
+
+  /** Feed `prune()` eviction counts into Prometheus counters. Called from
+   *  every store/peekReplay site so age-on-read pruning is also reflected.
+   *  Also refreshes the ring size gauge — single source of truth for the
+   *  `oc_outbound_ring_size_bytes` value. */
+  private _recordRingEvictions(stats: EvictionStats): void {
+    if (stats.entries) outboundRingEvictedTotal.inc({ cause: 'entries' }, stats.entries)
+    if (stats.age) outboundRingEvictedTotal.inc({ cause: 'age' }, stats.age)
+    if (stats.bytes) outboundRingEvictedTotal.inc({ cause: 'bytes' }, stats.bytes)
+    outboundRingSizeBytes.value = this._outboundRing.totalBytes()
   }
 
   async start(): Promise<void> {
@@ -426,6 +459,10 @@ export class Gateway {
             try { await this.sessions.destroySession(k) } catch {}
             this._outboundRing.clear(k)
           }
+          // Refresh size_bytes gauge — without this, a Prometheus scrape
+          // after a wipe still reports the pre-clear bytes until the next
+          // store/peek path runs.
+          outboundRingSizeBytes.value = this._outboundRing.totalBytes()
         },
       }
       try {
@@ -3231,8 +3268,23 @@ export class Gateway {
         ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }))
         return
       }
-      // Client-side keepalive ping — just ignore
-      if ((frame as any).type === 'ping') return
+      // Client-side application-level ping. Echo a pong (preserving the
+      // optional id) so the client's watchdog can distinguish a live socket
+      // from one that's still readyState=1 but frozen by an iOS Safari
+      // backgrounded-tab.  Old clients that don't carry `id` get a plain
+      // `{type:'pong', ts}` and silently ignore it; new clients require
+      // matching id to clear their pending probe.
+      if ((frame as any).type === 'ping') {
+        try {
+          const pingId = (frame as any).id
+          ws.send(JSON.stringify({
+            type: 'pong',
+            ...(pingId !== undefined ? { id: pingId } : {}),
+            ts: Date.now(),
+          }))
+        } catch {}
+        return
+      }
 
       // Hello frame: client identifies its sessions so we can auto-resume.
       // We register the WS into clientsByPeer only for peers that have an
@@ -3303,6 +3355,7 @@ export class Gateway {
         // frames around for a now-meaningless sessionKey would be wasteful
         // and could mislead a future reconnect.
         this._outboundRing.clear(sessionKey)
+        outboundRingSizeBytes.value = this._outboundRing.totalBytes()
         this.log.info('reset destroyed session', { sessionKey })
       } else if ((frame as any).type === 'control.session.compact') {
         // Compact: send a compaction request to the agent as a user message
@@ -3591,14 +3644,47 @@ export class Gateway {
       answers?: Record<string, string>
     },
   ): void {
-    const clients = this.clientsByPeer.get(peerKey)
-    if (!clients || clients.size === 0) return
-    const frame = JSON.stringify({
+    // Route through the stamped session-frame helper so the settlement is
+    // recorded in the outbound ring buffer keyed by sessionKey. A reconnecting
+    // tab that missed the live broadcast (e.g. iOS Safari suspended its WS)
+    // can then receive the settled frame via ring replay and update the
+    // inline permission card from "Waiting" to "Allowed/Denied".
+    this._sendStampedSessionFrame(payload.sessionKey, peerKey, {
       type: 'outbound.permission_settled',
       ...payload,
     })
-    for (const ws of clients) {
-      try { ws.send(frame) } catch {}
+  }
+
+  /** Send a session-scoped wire frame to all WS clients at a peerKey, stamping
+   *  it with `frameSeq` + `ts` and storing it in `_outboundRing` so a later
+   *  `autoResumeFromHello` reconnect can replay it. WS-only equivalent of
+   *  `deliver()` for non-message frames (permission_request / permission_settled).
+   *  Adapter dispatch is not applicable — these frames are interactive-only.
+   *
+   *  When `sessionKey` is empty (legacy fallback path with no server-side
+   *  pending entry to look up), we skip ring storage and only broadcast — the
+   *  same `else` branch deliver() uses for frames without a sessionKey. */
+  private _sendStampedSessionFrame(
+    sessionKey: string,
+    peerKey: string,
+    wireFrame: Record<string, unknown>,
+  ): void {
+    const now = Date.now()
+    let data: string
+    if (sessionKey) {
+      const frameSeq = this._outboundRing.nextSeq(sessionKey)
+      data = JSON.stringify({ ...wireFrame, ts: now, frameSeq })
+      const evicted = this._outboundRing.store(sessionKey, frameSeq, now, data)
+      this._recordRingEvictions(evicted)
+    } else {
+      data = JSON.stringify({ ...wireFrame, ts: now })
+    }
+    const set = this.clientsByPeer.get(peerKey)
+    if (!set) return
+    for (const ws of set) {
+      try {
+        ws.send(data)
+      } catch {}
     }
   }
 
@@ -3848,16 +3934,28 @@ export class Gateway {
       const clientLastSeq = typeof peerRec?.lastFrameSeq === 'number' ? peerRec.lastFrameSeq : 0
       if (clientLastSeq >= 0) {
         const replay = this._outboundRing.peekReplay(sessionKey, clientLastSeq)
+        // Read-path pruning may have evicted age-aged frames — record those
+        // in metrics regardless of hit/miss outcome, otherwise the `age`
+        // cause is severely under-counted for idle sessions whose ring is
+        // only ever pruned on resume.
+        this._recordRingEvictions(replay.evicted)
         if (replay.ok) {
-          for (const f of replay.sent) {
-            try { ws.send(f.data) } catch { break }
-          }
+          // Only count as "hit" when the ring actually rescued frames.
+          // `ok` with empty sent means the client was already caught up
+          // (fromSeq===currentLast) — the ring did nothing useful, and
+          // counting it would inflate hit-rate against ordinary fresh
+          // hellos and skew the replay-effectiveness signal.
           if (replay.sent.length > 0) {
+            outboundRingReplayHitTotal.inc()
+            for (const f of replay.sent) {
+              try { ws.send(f.data) } catch { break }
+            }
             this.log.info('resume replay served', {
               sessionKey, from: clientLastSeq, to: replay.to, sent: replay.sent.length,
             })
           }
         } else {
+          outboundRingReplayMissTotal.inc({ reason: replay.reason })
           try {
             ws.send(JSON.stringify({
               type: 'outbound.resume_failed',
@@ -4645,10 +4743,11 @@ export class Gateway {
               peer: frame.peer,
               expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
             })
-            const data = JSON.stringify(permFrame)
-            for (const ws of clients) {
-              try { ws.send(data) } catch {}
-            }
+            // Stamp + store in outbound ring so a reconnecting client (e.g. iOS
+            // Safari restored a suspended tab) can replay the request via
+            // autoResumeFromHello. Without ring storage the modal would never
+            // re-fire after a disconnect window.
+            this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
           } else {
             // No connected client — auto-deny
             session.runner.sendPermissionResponse(e.request.requestId, {
@@ -4764,7 +4863,8 @@ export class Gateway {
     if (sessionKey) {
       const frameSeq = this._outboundRing.nextSeq(sessionKey)
       data = JSON.stringify({ ...wire, ts: now, frameSeq })
-      this._outboundRing.store(sessionKey, frameSeq, now, data)
+      const evicted = this._outboundRing.store(sessionKey, frameSeq, now, data)
+      this._recordRingEvictions(evicted)
     } else {
       data = JSON.stringify({ ...wire, ts: now })
     }
