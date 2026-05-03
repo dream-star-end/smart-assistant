@@ -22,7 +22,15 @@
 import type { V3ContainerStatus } from "../agent-sandbox/v3supervisor.js";
 
 const CACHE_TTL_MS = 60_000;
-const HEALTHZ_TIMEOUT_MS = 1_000;
+// 单次 healthz 探活超时。同时用作 connect / head read / body read 三段 budget
+// (每段独立计时 — 不是总和)。
+//
+// 历史:v1.0.73 初版 1s,本机容器 (loopback fetch) 完全够;但 v1.0.75 实测远端
+// host (master GCE Tokyo → boheyun-1 中国) 跨境 mTLS handshake 单独就 600-1200ms,
+// head + body 后续各段共享 1s budget 时频繁 race 失败,导致 file-proxy 503 风暴。
+// 改 5s — 本机容器 healthz 通常 <5ms 立即 resolve(timer 永不到期),无副作用;
+// 远端容器 budget 充裕,handshake + head + body 各段独立 5s 远超实测峰值。
+const HEALTHZ_TIMEOUT_MS = 5_000;
 
 interface CacheEntry {
   caps: Set<string>;
