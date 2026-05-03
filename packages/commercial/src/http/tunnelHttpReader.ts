@@ -508,6 +508,139 @@ export function pipeBodyChunked(
  * readBodyByContentLength —— 它不需要 Connection: close 配合(node-agent
  * 会 strip 这个 hop-by-hop header)。
  */
+/**
+ * 按 Transfer-Encoding: chunked 解码并 collect body 到 Buffer。
+ *
+ * 用于 healthz probe 这种小响应场景:JSON 服务端常用 keep-alive + chunked,
+ * 不能用 readBodyCapped(等 close 永远 hang)也不能用 readBodyByContentLength
+ * (没 CL header)。
+ *
+ * State machine 跟 pipeBodyChunked 一致:
+ *   - 'size': 累积直到 \r\n,parse hex(忽略 ; chunk extension)
+ *   - 'data': 累积 N bytes
+ *   - 'crlf-after-data': skip 2 bytes (\r\n after chunk data)
+ *   - size=0 → 'trailer': skip 直到空行 \r\n\r\n
+ *   - 任何阶段 maxBytes 超限或 timeout → null
+ *
+ * 不处理:non-hex size、负 size、size > maxBytes。任何这些 → 视为非法 → null。
+ */
+export function readBodyChunked(
+  socket: Duplex,
+  initial: Buffer,
+  timeoutMs: number,
+  maxBytes: number,
+): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    let buf = initial.length > 0 ? Buffer.from(initial) : Buffer.alloc(0);
+    const out: Buffer[] = [];
+    let outBytes = 0;
+    type State = "size" | "data" | "crlf-after-data" | "trailer" | "done";
+    let state: State = "size";
+    let dataRemaining = 0;
+    let settled = false;
+
+    const cleanup = (): void => {
+      try { socket.removeListener("data", onData); } catch { /* */ }
+      try { socket.removeListener("error", onErr); } catch { /* */ }
+      try { socket.removeListener("close", onClose); } catch { /* */ }
+      clearTimeout(timer);
+    };
+    const finish = (v: Buffer | null): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    const drive = (): void => {
+      while (!settled) {
+        if (state === "size") {
+          const idx = buf.indexOf("\r\n");
+          if (idx < 0) return; // 等更多数据
+          const line = buf.subarray(0, idx).toString("utf8");
+          buf = buf.subarray(idx + 2);
+          // 去掉 chunk extension(`; key=val`)
+          const semi = line.indexOf(";");
+          const sizeHex = (semi >= 0 ? line.slice(0, semi) : line).trim();
+          if (!/^[0-9a-fA-F]+$/.test(sizeHex)) {
+            finish(null);
+            return;
+          }
+          const sz = Number.parseInt(sizeHex, 16);
+          if (!Number.isFinite(sz) || sz < 0) {
+            finish(null);
+            return;
+          }
+          if (sz === 0) {
+            state = "trailer";
+            continue;
+          }
+          if (outBytes + sz > maxBytes) {
+            finish(null);
+            return;
+          }
+          dataRemaining = sz;
+          state = "data";
+          continue;
+        }
+        if (state === "data") {
+          if (buf.length === 0) return;
+          const take = Math.min(dataRemaining, buf.length);
+          out.push(buf.subarray(0, take));
+          outBytes += take;
+          buf = buf.subarray(take);
+          dataRemaining -= take;
+          if (dataRemaining === 0) state = "crlf-after-data";
+          continue;
+        }
+        if (state === "crlf-after-data") {
+          if (buf.length < 2) return;
+          // 严格点:这两字节必须是 \r\n。否则视为协议异常。
+          if (buf[0] !== 0x0d || buf[1] !== 0x0a) {
+            finish(null);
+            return;
+          }
+          buf = buf.subarray(2);
+          state = "size";
+          continue;
+        }
+        if (state === "trailer") {
+          // 找 \r\n\r\n(空 trailer 头部) 或 \r\n(无 trailer,直接结束)
+          // RFC 7230 §4.1.2: trailer 之后是 last-chunk 的最终 CRLF。
+          // 简化:只要见到 \r\n 就认为结束(常见服务端 0\r\n\r\n)。
+          if (buf.length < 2) return;
+          if (buf[0] === 0x0d && buf[1] === 0x0a) {
+            state = "done";
+            finish(Buffer.concat(out, outBytes));
+            return;
+          }
+          // 有 trailer header → 找下个 \r\n 跳过它
+          const idx = buf.indexOf("\r\n");
+          if (idx < 0) return;
+          buf = buf.subarray(idx + 2);
+          continue;
+        }
+        return; // done
+      }
+    };
+
+    const onErr = (): void => finish(null);
+    const onClose = (): void => finish(null); // chunked 不该靠 close 收尾
+    const onData = (chunk: Buffer): void => {
+      buf = Buffer.concat([buf, chunk]);
+      drive();
+    };
+
+    socket.on("data", onData);
+    socket.on("error", onErr);
+    socket.on("close", onClose);
+
+    // initial buffer 可能已经包含完整 chunked body
+    drive();
+  });
+}
+
 export function readBodyCapped(
   socket: Duplex,
   initial: Buffer,

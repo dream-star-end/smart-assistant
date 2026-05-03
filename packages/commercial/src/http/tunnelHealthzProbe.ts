@@ -23,7 +23,7 @@
 import type { ComputeHostRow } from "../compute-pool/types.js";
 import { dialTunnelSocket, hostRowToTarget } from "../compute-pool/nodeAgentClient.js";
 import { V3_CONTAINER_PORT } from "../agent-sandbox/v3supervisor.js";
-import { readBodyByContentLength, readBodyCapped, readResponseHead } from "./tunnelHttpReader.js";
+import { readBodyByContentLength, readBodyCapped, readBodyChunked, readResponseHead } from "./tunnelHttpReader.js";
 import type { HealthzResponse } from "./capabilityCache.js";
 
 /** healthz response body 大小上限。/healthz 极小,8KB 远高于任何合理值 */
@@ -77,6 +77,7 @@ export async function defaultTunnelFetchHealthz(
       throw new Error(`tunnelFetchHealthz: status=${head.statusCode}`);
     }
     const clRaw = head.headers["content-length"];
+    const teRaw = head.headers["transfer-encoding"];
     let body: Buffer | null;
     if (clRaw !== undefined) {
       const cl = Number.parseInt(clRaw, 10);
@@ -84,10 +85,15 @@ export async function defaultTunnelFetchHealthz(
         throw new Error(`tunnelFetchHealthz: invalid content-length=${clRaw}`);
       }
       body = await readBodyByContentLength(socket, head.leftover, cl, timeoutMs);
+    } else if (typeof teRaw === "string" && teRaw.toLowerCase().includes("chunked")) {
+      // Node http.Server 对 res.end(jsonString) 在 keep-alive + 不显式设 CL 时,
+      // 默认走 chunked encoding(实测容器内 /healthz 即此分支)。必须 chunked
+      // decode,否则 readBodyCapped 等 close 永远 hang —— node-agent 对小响应
+      // 通常不主动 close,且 Connection: close 是 hop-by-hop 被剥(tunnel.go)。
+      body = await readBodyChunked(socket, head.leftover, timeoutMs, HEALTHZ_BODY_CAP);
     } else {
-      // 无 Content-Length:fallback 到 readBodyCapped(等 close)。可能因 node-agent
-      // hop-by-hop strip 而 hang 直到 timeoutMs;视为容器协议不规范,本就该 fail
-      // (caller catch → false)。
+      // 无 CL 也无 chunked:协议不规范。fallback readBodyCapped(等 close),
+      // 大概率因 keep-alive 而 timeout → caller catch → false。
       body = await readBodyCapped(socket, head.leftover, timeoutMs, HEALTHZ_BODY_CAP);
     }
     if (!body) throw new Error("tunnelFetchHealthz: body read failed (timeout or > cap)");
