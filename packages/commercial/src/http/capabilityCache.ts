@@ -107,9 +107,16 @@ export async function isContainerCapabilityReady(
   try {
     if (isRemote) {
       // 远端必须注入 tunnel fetcher;漏注入 = 配置 bug,fail-closed
-      if (!deps.tunnelFetchHealthz) return false;
+      if (!deps.tunnelFetchHealthz) {
+        // diag: 临时排查 v1.0.73 上线后 user 7 持续 503 — 是否 wiring 没注入
+        console.warn(JSON.stringify({ msg: "capability_probe_no_tunnel_fetch", containerId: status.containerId, hostId: status.hostId, selfHostId: deps.selfHostId }));
+        return false;
+      }
       // dockerContainerId 必须存在;空 = DB 行 inconsistency,fail-closed
-      if (!status.dockerContainerId) return false;
+      if (!status.dockerContainerId) {
+        console.warn(JSON.stringify({ msg: "capability_probe_no_docker_id", containerId: status.containerId, hostId: status.hostId }));
+        return false;
+      }
       resp = await deps.tunnelFetchHealthz(
         status.hostId!,
         status.dockerContainerId,
@@ -119,11 +126,13 @@ export async function isContainerCapabilityReady(
       const fetchImpl = deps.fetchHealthz ?? defaultFetchHealthz;
       resp = await fetchImpl(status.boundIp, status.port, HEALTHZ_TIMEOUT_MS);
     }
-  } catch {
+  } catch (err) {
+    console.warn(JSON.stringify({ msg: "capability_probe_throw", containerId: status.containerId, hostId: status.hostId, isRemote, err: (err as Error)?.message ?? String(err) }));
     return false;
   }
   // containerId echo 匹配:防 bridge IP 复用给另一个容器
   if (String(resp.containerId ?? "") !== String(status.containerId)) {
+    console.warn(JSON.stringify({ msg: "capability_probe_id_mismatch", expected: status.containerId, got: resp.containerId, hostId: status.hostId }));
     return false;
   }
   const caps = new Set<string>(

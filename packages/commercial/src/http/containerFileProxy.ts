@@ -235,6 +235,15 @@ export async function containerFileProxy(
       : await getV3ContainerStatus(deps.v3, uidNum);
     if (clientClosed) return;
     if (!status || status.state !== "running") {
+      // diag: v1.0.73 上线后 user 7 持续 503,确认 status 字段值
+      ctx.log.warn("container_file_proxy_not_running", {
+        uid: uidStr,
+        statusNull: !status,
+        state: status?.state,
+        containerId: status?.containerId,
+        hostId: status?.hostId,
+        dockerContainerId: status?.dockerContainerId ? `${status.dockerContainerId.slice(0, 12)}...` : null,
+      });
       sendJsonError(res, 503, "CONTAINER_NOT_RUNNING", "container is not running", ctx.requestId);
       release();
       return;
@@ -262,6 +271,14 @@ export async function containerFileProxy(
     );
     if (clientClosed) return;
     if (!ready) {
+      // diag: 配合 capabilityCache console.warn 看具体 reason
+      ctx.log.warn("container_file_proxy_outdated", {
+        uid: uidStr,
+        containerId: status.containerId,
+        hostId: status.hostId,
+        selfHostId: deps.selfHostId,
+        isRemote: typeof deps.selfHostId === "string" && typeof status.hostId === "string" && status.hostId !== deps.selfHostId,
+      });
       sendJsonError(res, 503, "CONTAINER_OUTDATED", "container missing file-proxy-v1 capability", ctx.requestId);
       release();
       return;
