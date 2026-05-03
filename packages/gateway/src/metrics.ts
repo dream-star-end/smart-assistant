@@ -103,6 +103,20 @@ export const sessionCrashesTotal = new Counter()
 
 export const wsConnectionsTotal = new Counter()
 
+// ── Outbound ring (Phase 0.3 replay buffer) ──
+// hit:    replay actually rescued one or more frames after a reconnect.
+//         Caught-up hello (fromSeq===currentLast) is intentionally excluded
+//         so the metric reflects ring-effectiveness, not connection volume.
+// miss:   replay couldn't satisfy the cursor; client falls back to REST sync.
+//         Labels constrained to ReplayMissReason: no_buffer|buffer_miss|sequence_mismatch
+// evicted: frames pruned by store/peekReplay, classified entries|age|bytes
+//         (one frame counts as exactly one cause per the prune ordering).
+// size_bytes: total live bytes across all session rings.
+export const outboundRingReplayHitTotal = new Counter()
+export const outboundRingReplayMissTotal = new Counter()
+export const outboundRingEvictedTotal = new Counter()
+export const outboundRingSizeBytes = { value: 0 }
+
 // ── EventBus subscriber ──
 
 let _metricsStarted = false
@@ -157,6 +171,21 @@ export function serializeMetrics(): string {
     `# HELP oc_sessions_active Currently active sessions`,
     `# TYPE oc_sessions_active gauge`,
     `oc_sessions_active ${sessionsActive.value}`,
+    outboundRingReplayHitTotal.serialize(
+      'oc_outbound_ring_replay_hit_total',
+      'Outbound ring replay served frames after client reconnect',
+    ),
+    outboundRingReplayMissTotal.serialize(
+      'oc_outbound_ring_replay_miss_total',
+      'Outbound ring replay miss by reason — client falls back to REST sync',
+    ),
+    outboundRingEvictedTotal.serialize(
+      'oc_outbound_ring_evicted_total',
+      'Outbound ring frames evicted by cause (entries|age|bytes)',
+    ),
+    `# HELP oc_outbound_ring_size_bytes Outbound ring total bytes across all sessions`,
+    `# TYPE oc_outbound_ring_size_bytes gauge`,
+    `oc_outbound_ring_size_bytes ${outboundRingSizeBytes.value}`,
   ]
   return sections.join('\n\n') + '\n'
 }

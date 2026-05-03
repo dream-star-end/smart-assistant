@@ -226,3 +226,57 @@ describe('OutboundRingBuffer pruning', () => {
     assert.equal(r.nextSeq('s1'), 1)
   })
 })
+
+describe('OutboundRingBuffer eviction stats', () => {
+  it('store() reports `entries` cause when ring exceeds maxEntries', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 2, maxAgeMs: 1e9, maxBytes: 1e9 })
+    const s1 = r.nextSeq('s1'); assert.deepEqual(r.store('s1', s1, 1000, frame(s1)), { entries: 0, age: 0, bytes: 0 })
+    const s2 = r.nextSeq('s1'); assert.deepEqual(r.store('s1', s2, 1001, frame(s2)), { entries: 0, age: 0, bytes: 0 })
+    // Third frame triggers entry eviction (drops one frame).
+    const s3 = r.nextSeq('s1'); const ev = r.store('s1', s3, 1002, frame(s3))
+    assert.equal(ev.entries, 1, 'one frame evicted by entries cap')
+    assert.equal(ev.age, 0)
+    assert.equal(ev.bytes, 0)
+  })
+
+  it('store() reports `bytes` cause when ring exceeds maxBytes', () => {
+    // Set bytes cap so storing later frames forces eviction.
+    const r = new OutboundRingBuffer({ maxEntries: 100, maxAgeMs: 1e9, maxBytes: 80 })
+    let totalEvictions = 0
+    for (let i = 1; i <= 5; i++) {
+      const s = r.nextSeq('s1')
+      const ev = r.store('s1', s, 1000 + i, frame(s))
+      totalEvictions += ev.bytes
+      assert.equal(ev.entries, 0, 'entries cap untouched')
+      assert.equal(ev.age, 0, 'age cutoff untouched')
+    }
+    assert.ok(totalEvictions > 0, 'bytes evictions accumulated across stores')
+    assert.ok(r.bytes('s1') <= 80)
+  })
+
+  it('peekReplay() reports `age` cause when read-path prune evicts stale frames', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
+    for (let i = 1; i <= 3; i++) {
+      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+    }
+    // Long idle: peekReplay at now=2000 evicts all 3 (cutoff 1900 > all ts).
+    const rep = r.peekReplay('s1', 0, 2000)
+    assert.equal(rep.ok, false)
+    assert.equal(rep.evicted.age, 3, 'all three frames evicted by age on read')
+    assert.equal(rep.evicted.entries, 0)
+    assert.equal(rep.evicted.bytes, 0)
+  })
+
+  it('totalBytes() sums across all sessions', () => {
+    const r = new OutboundRingBuffer()
+    const a = r.nextSeq('s1'); r.store('s1', a, 1000, frame(a))
+    const b = r.nextSeq('s2'); r.store('s2', b, 1000, frame(b))
+    assert.equal(r.totalBytes(), r.bytes('s1') + r.bytes('s2'))
+  })
+
+  it('happy-path store() returns zero evictions', () => {
+    const r = new OutboundRingBuffer()
+    const s = r.nextSeq('s1')
+    assert.deepEqual(r.store('s1', s, 1000, frame(s)), { entries: 0, age: 0, bytes: 0 })
+  })
+})
