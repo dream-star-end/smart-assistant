@@ -41,9 +41,22 @@ interface SessionRing {
 
 export type ReplayMissReason = 'no_buffer' | 'buffer_miss' | 'sequence_mismatch'
 
+/** Counts of frames dropped by `prune()`, broken down by which bound forced
+ *  the eviction. Returned alongside `store()` / `peekReplay()` so the caller
+ *  can feed Prometheus counters without making this module import metrics.
+ *  Age-based pruning happens on BOTH paths (eviction stats from peekReplay
+ *  matter — without them the `age` cause is severely under-counted). */
+export interface EvictionStats {
+  entries: number
+  age: number
+  bytes: number
+}
+
 export type ReplayResult =
-  | { ok: true; sent: RingEntry[]; to: number }
-  | { ok: false; sent: never[]; to: number; reason: ReplayMissReason }
+  | { ok: true; sent: RingEntry[]; to: number; evicted: EvictionStats }
+  | { ok: false; sent: never[]; to: number; reason: ReplayMissReason; evicted: EvictionStats }
+
+const ZERO_EVICTION: EvictionStats = { entries: 0, age: 0, bytes: 0 }
 
 export class OutboundRingBuffer {
   private rings = new Map<string, SessionRing>()
@@ -66,9 +79,10 @@ export class OutboundRingBuffer {
   /**
    * Store the serialized frame for later replay. `seq` MUST have been
    * obtained from a prior `nextSeq(sessionKey)` call so the ring remains
-   * monotonic. Calls prune() after insertion.
+   * monotonic. Calls prune() after insertion. Returns counts of frames
+   * evicted by this call so the caller can feed metrics.
    */
-  store(sessionKey: string, seq: number, now: number, data: string): void {
+  store(sessionKey: string, seq: number, now: number, data: string): EvictionStats {
     let ring = this.rings.get(sessionKey)
     if (!ring) {
       ring = { frames: [], totalBytes: 0 }
@@ -77,7 +91,7 @@ export class OutboundRingBuffer {
     const bytes = Buffer.byteLength(data, 'utf8')
     ring.frames.push({ seq, ts: now, data, bytes })
     ring.totalBytes += bytes
-    this.prune(ring, now)
+    return this.prune(ring, now)
   }
 
   /**
@@ -99,7 +113,7 @@ export class OutboundRingBuffer {
   peekReplay(sessionKey: string, fromSeq: number, now: number = Date.now()): ReplayResult {
     const currentLast = this.lastSeq.get(sessionKey) ?? 0
     const ring = this.rings.get(sessionKey)
-    if (ring) this.prune(ring, now)
+    const evicted: EvictionStats = ring ? this.prune(ring, now) : { ...ZERO_EVICTION }
     if (fromSeq > currentLast) {
       // Client claims to have seen frames we don't know about. If we have
       // no ring for this sessionKey at all, assume the server restarted and
@@ -107,12 +121,12 @@ export class OutboundRingBuffer {
       // If we do have a ring but it ends earlier than fromSeq, the cursor
       // is bogus (different server instance / tampered storage).
       if (!ring || ring.frames.length === 0) {
-        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
+        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer', evicted }
       }
-      return { ok: false, sent: [], to: currentLast, reason: 'sequence_mismatch' }
+      return { ok: false, sent: [], to: currentLast, reason: 'sequence_mismatch', evicted }
     }
     if (fromSeq === currentLast) {
-      return { ok: true, sent: [], to: currentLast }
+      return { ok: true, sent: [], to: currentLast, evicted }
     }
     if (!ring || ring.frames.length === 0) {
       // Distinguish three cases:
@@ -126,16 +140,16 @@ export class OutboundRingBuffer {
       //                              authoritative state from REST instead
       //                              of trusting an empty replay.
       if (fromSeq > 0 || currentLast > 0) {
-        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer' }
+        return { ok: false, sent: [], to: currentLast, reason: 'no_buffer', evicted }
       }
-      return { ok: true, sent: [], to: currentLast }
+      return { ok: true, sent: [], to: currentLast, evicted }
     }
     const earliest = ring.frames[0].seq
     if (earliest > fromSeq + 1) {
-      return { ok: false, sent: [], to: currentLast, reason: 'buffer_miss' }
+      return { ok: false, sent: [], to: currentLast, reason: 'buffer_miss', evicted }
     }
     const frames = ring.frames.filter((f) => f.seq > fromSeq)
-    return { ok: true, sent: frames, to: currentLast }
+    return { ok: true, sent: frames, to: currentLast, evicted }
   }
 
   /** Current last-assigned seq for a session, or 0 if none. */
@@ -153,24 +167,37 @@ export class OutboundRingBuffer {
     return this.rings.get(sessionKey)?.totalBytes ?? 0
   }
 
+  /** Sum of bytes across all sessions — feed `oc_outbound_ring_size_bytes`. */
+  totalBytes(): number {
+    let total = 0
+    for (const ring of this.rings.values()) total += ring.totalBytes
+    return total
+  }
+
   /** Drop the ring (but keep lastSeq) for a session — used on session destroy. */
   clear(sessionKey: string): void {
     this.rings.delete(sessionKey)
     this.lastSeq.delete(sessionKey)
   }
 
-  private prune(ring: SessionRing, now: number): void {
-    const cutoff = now - this.config.maxAgeMs
-    while (
-      ring.frames.length > 0 &&
-      (
-        ring.frames.length > this.config.maxEntries ||
-        ring.totalBytes > this.config.maxBytes ||
-        ring.frames[0].ts < cutoff
-      )
-    ) {
+  /** Returns counts of evictions by cause so the caller can update metrics.
+   *  Order of checks matters when multiple bounds fire simultaneously: we
+   *  classify by the FIRST bound exceeded (entries → bytes → age) — picking
+   *  one prevents double-counting a single dropped frame. */
+  private prune(ring: SessionRing, now: number): EvictionStats {
+    const stats: EvictionStats = { entries: 0, age: 0, bytes: 0 }
+    while (ring.frames.length > 0) {
+      let cause: 'entries' | 'bytes' | 'age' | null = null
+      if (ring.frames.length > this.config.maxEntries) cause = 'entries'
+      else if (ring.totalBytes > this.config.maxBytes) cause = 'bytes'
+      else if (ring.frames[0].ts < now - this.config.maxAgeMs) cause = 'age'
+      if (!cause) break
       const dropped = ring.frames.shift()
-      if (dropped) ring.totalBytes -= dropped.bytes
+      if (dropped) {
+        ring.totalBytes -= dropped.bytes
+        stats[cause]++
+      }
     }
+    return stats
   }
 }

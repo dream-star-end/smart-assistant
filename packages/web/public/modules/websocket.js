@@ -55,6 +55,59 @@ const OFFLINE_LATCH_GRACE_MS = 60_000
 // can fire visibilitychange rapidly and we don't want to spam connect().
 let _lastVisibilityReconnectAt = 0
 const VISIBILITY_RECONNECT_COOLDOWN_MS = 2000
+
+// ── Application-layer ping/pong watchdog ──
+// iOS Safari (and some mobile carrier proxies) can leave a backgrounded WS in
+// a half-open state where readyState stays OPEN but no frames flow. The
+// browser's protocol-level ping/pong is opaque to JS, so we run a JSON
+// `{type:"ping", id}` ↔ `{type:"pong", id}` handshake on top: the client
+// times the round-trip and force-closes a socket that misses pong within a
+// per-call window. The id is essential — without it, a stale pong queued
+// during iOS resume could falsely satisfy a fresh probe.
+//
+// At most one ping is in-flight at a time. Subsequent probes during the
+// window are no-ops (the existing watchdog will close the socket if no pong
+// arrives). This keeps visibility/focus/pageshow + keepalive timer overlap
+// from stacking watchdogs.
+let _pingNonce = 0
+let _pendingPing = null // { id, ws, timeoutId, label } when a probe is in flight
+const PROBE_TIMEOUT_VISIBILITY_MS = 5000
+const PROBE_TIMEOUT_KEEPALIVE_MS = 10000
+
+/**
+ * Send `{type:"ping", id}` and arm a watchdog that calls `ws.close()` if no
+ * matching pong arrives within `timeoutMs`. No-op when a probe is already in
+ * flight, when the socket is not OPEN, or when ws has been replaced. Does NOT
+ * track lastPongAt as a side effect — the pong handler in `onmessage` clears
+ * `_pendingPing` directly when its id matches.
+ */
+function _probeWsAlive(ws, timeoutMs, label) {
+  if (!ws || ws.readyState !== 1) return
+  if (state.ws !== ws) return
+  if (_pendingPing) return // already probing — let existing watchdog finish
+  const id = ++_pingNonce
+  try {
+    ws.send(JSON.stringify({ type: 'ping', id }))
+  } catch {
+    return // send failed; onclose will trigger reconnect on its own
+  }
+  const timeoutId = setTimeout(() => {
+    // Watchdog fired. Only act if THIS probe is still the pending one
+    // (a matching pong would have cleared it) AND nothing has replaced the
+    // socket. Closing with a 4xxx code skips the e.code===1008 token-failure
+    // path in onclose; reconnect proceeds normally with backoff.
+    if (!_pendingPing || _pendingPing.id !== id) return
+    _pendingPing = null
+    if (state.ws !== ws) return
+    if (ws.readyState !== 1) return
+    // 4000 = visibility/pageshow/focus probe timeout
+    // 4001 = idle keepalive probe timeout
+    const code = label === 'keepalive' ? 4001 : 4000
+    try { ws.close(code, `${label} ping timeout`) } catch {}
+  }, timeoutMs)
+  _pendingPing = { id, ws, timeoutId, label }
+}
+
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
 
 // ── Per-session thinking safety timer ──
@@ -663,16 +716,27 @@ export function notifyNetworkOnline() {
 // avoids the user waiting out residual backoff on return. We preserve
 // `_reconnectAttempts` so subsequent failures continue the current backoff
 // ladder rather than hammering the server.
+//
+// When the WS still appears OPEN we cannot trust readyState — iOS Safari
+// freezes backgrounded sockets in a half-open state. Send an application-
+// layer ping; if no matching pong returns within
+// PROBE_TIMEOUT_VISIBILITY_MS, the watchdog force-closes the socket and the
+// onclose handler triggers reconnect via the standard backoff path.
 export function notifyTabVisible() {
   if (!state.token) return
   if (!_isBrowserOnline) return
-  if (state.ws && state.ws.readyState < 2) return
-  const now = Date.now()
-  if (now - _lastVisibilityReconnectAt < VISIBILITY_RECONNECT_COOLDOWN_MS) return
-  _lastVisibilityReconnectAt = now
-  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
-  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
-  connect()
+  // ws is closed/closing → fall through to the legacy direct-connect path.
+  if (!state.ws || state.ws.readyState >= 2) {
+    const now = Date.now()
+    if (now - _lastVisibilityReconnectAt < VISIBILITY_RECONNECT_COOLDOWN_MS) return
+    _lastVisibilityReconnectAt = now
+    if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+    if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+    connect()
+    return
+  }
+  // ws OPEN but possibly half-open — probe to be sure.
+  _probeWsAlive(state.ws, PROBE_TIMEOUT_VISIBILITY_MS, 'visibility')
 }
 
 export function connect() {
@@ -783,16 +847,25 @@ export function connect() {
       }, 3000)
     }
   }
-  // Client-side keepalive: prevent mobile browser from killing WS during long tasks
+  // Client-side keepalive + half-open detection. Every 30s we send an
+  // application-layer ping with a watchdog: if no matching pong returns
+  // within PROBE_TIMEOUT_KEEPALIVE_MS, _probeWsAlive force-closes the
+  // socket, triggering the standard onclose → reconnect path. This catches
+  // zombie sockets even on tabs that stay foregrounded (laptop sleep/resume,
+  // VPN flaps) without waiting for OS-level TCP timeout.
   const _wsKeepAlive = setInterval(() => {
-    if (ws.readyState === 1)
-      try {
-        ws.send('{"type":"ping"}')
-      } catch {}
+    _probeWsAlive(ws, PROBE_TIMEOUT_KEEPALIVE_MS, 'keepalive')
   }, 30000)
 
   ws.onclose = (e) => {
     clearInterval(_wsKeepAlive)
+    // Drop any in-flight probe that targeted this socket — its watchdog
+    // would otherwise fire harmlessly (the readyState!==1 guard handles it)
+    // but leaving a stale _pendingPing blocks the next socket's first probe.
+    if (_pendingPing && _pendingPing.ws === ws) {
+      clearTimeout(_pendingPing.timeoutId)
+      _pendingPing = null
+    }
     // Guard: ignore close events from stale sockets (a newer connect() may have replaced state.ws)
     if (state.ws !== ws) return
     if (state._offlineDrainTimer) { clearTimeout(state._offlineDrainTimer); state._offlineDrainTimer = null }
@@ -875,6 +948,18 @@ export function connect() {
     if (state.ws !== ws) return
     try {
       const f = JSON.parse(ev.data)
+      // ── Application-layer pong: clear watchdog if id matches the in-flight
+      // probe. Must run before the frameSeq dedupe (pong frames don't carry
+      // frameSeq and must not be dropped by it). An unmatched id is a stale
+      // pong from a previous probe — ignore it so it can't satisfy a fresh
+      // watchdog by accident.
+      if (f.type === 'pong') {
+        if (_pendingPing && _pendingPing.ws === ws && _pendingPing.id === f.id) {
+          clearTimeout(_pendingPing.timeoutId)
+          _pendingPing = null
+        }
+        return
+      }
       // ── Pre-dispatch frameSeq cursor ──
       // Advance `sess._lastFrameSeq` for ANY stamped outbound frame, not just
       // `outbound.message`. Permission frames now also flow through the

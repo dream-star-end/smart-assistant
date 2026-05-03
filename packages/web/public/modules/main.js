@@ -281,8 +281,21 @@ document.addEventListener('visibilitychange', () => {
   }
 })
 // Window focus on desktop (covers alt-tab / click-back-to-window without a
-// hidden→visible transition). Same pull semantics.
+// hidden→visible transition). Same pull semantics. Also probe WS health —
+// a foregrounded tab whose socket went zombie during sleep wouldn't trigger
+// visibilitychange but DOES fire focus on resume.
 window.addEventListener('focus', () => {
+  notifyTabVisible()
+  maybeSyncNow({ onResult: _applySyncResult })
+})
+// iOS Safari restores tabs from BFCache without firing visibilitychange —
+// `pageshow` is the canonical event for "page is visible again" after
+// background. Persisted=true means BFCache restore (the WS we held may be a
+// zombie). Persisted=false fires once on initial load too — notifyTabVisible
+// no-ops cleanly when ws is null/connecting, and the inner connect-path
+// debounce + ping single-flight keep the duplicate-with-init() safe.
+window.addEventListener('pageshow', () => {
+  notifyTabVisible()
   maybeSyncNow({ onResult: _applySyncResult })
 })
 // Network recovery: force a pull regardless of throttle — we want the latest
