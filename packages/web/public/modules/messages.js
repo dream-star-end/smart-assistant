@@ -1,20 +1,20 @@
 // OpenClaude — Message rendering and display
-import { _openTopupModal } from './billing.js?v=56cf7e69'
-import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=56cf7e69'
-import { getEffortForSubmit } from './effortMode.js?v=56cf7e69'
-import { exportMessageDocx } from './export-docx.js?v=56cf7e69'
-import { exportMessageTex } from './export-tex.js?v=56cf7e69'
+import { _openTopupModal } from './billing.js?v=f0a16ecb'
+import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=f0a16ecb'
+import { getEffortForSubmit } from './effortMode.js?v=f0a16ecb'
+import { exportMessageDocx } from './export-docx.js?v=f0a16ecb'
+import { exportMessageTex } from './export-tex.js?v=f0a16ecb'
 import {
   clearChartInstances,
   embedMediaUrls,
   processRichBlocks,
   renderMarkdown,
   renderStreamingMarkdown,
-} from './markdown.js?v=56cf7e69'
-import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=56cf7e69'
-import { toast } from './ui.js?v=56cf7e69'
-import { msgTimeLabel, shortTime } from './util.js?v=56cf7e69'
-import { safeWsSend, _resetTurnBillingState } from './websocket.js?v=56cf7e69'
+} from './markdown.js?v=f0a16ecb'
+import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=f0a16ecb'
+import { toast } from './ui.js?v=f0a16ecb'
+import { msgTimeLabel, shortTime } from './util.js?v=f0a16ecb'
+import { safeWsSend, _resetTurnBillingState } from './websocket.js?v=f0a16ecb'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
