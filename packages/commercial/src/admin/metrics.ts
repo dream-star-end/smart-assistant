@@ -428,6 +428,36 @@ export const wsBridgeTtft = new Histogram(
   TTFT_BRIDGE_BUCKETS,
 );
 
+/**
+ * V3 server-authored sink 持久化结果计数。每次容器 → master
+ * `/internal/v3/server-authored-message` 触发。outcome 闭集合:
+ *   - ok                       persist 成功(applied=true)
+ *   - deduped                  msgId 已写过(idempotent retry,applied=false reason=already_exists)
+ *   - reject_session_missing   master 无 (sessionId, userId) 行(404,容器侧 TTL 重试)
+ *   - reject_unauthorized      容器双因子失败(401)
+ *   - reject_bad_body          schema parse 失败 / payload 过大(400/413)
+ *   - error                    storage_throw / row malformed (5xx)
+ * 防截断回归监控:`oc_v3_sink_persist_total{outcome="ok"}` 应随容器 chat 流量同步增长。
+ * 持续为 0 + 用户报截断 → image capability 检查。
+ * `reject_session_missing` 偶发是正常(前端 PUT 与首 turn 端竞争);持续 / 占比 > 5% → 调查。
+ */
+export const v3SinkPersist = new Counter({
+  name: "oc_v3_sink_persist_total",
+  help: "V3 commercial container→master server-authored sink persist outcome",
+  labelNames: ["outcome"],
+});
+
+export type V3SinkPersistOutcome =
+  | "ok"
+  | "deduped"
+  | "reject_session_missing"
+  | "reject_unauthorized"
+  | "reject_bad_body"
+  | "error";
+export function incrV3SinkPersist(outcome: V3SinkPersistOutcome): void {
+  v3SinkPersist.inc({ outcome });
+}
+
 // ─── 便捷 incr / observe helpers ────────────────────────────────────
 
 export function observeAnthropicProxyTtft(model: string, seconds: number): void {
@@ -593,6 +623,7 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   wsBridgeSessionDuration.render(out);
   containerEnsureDuration.render(out);
   wsBridgeTtft.render(out);
+  v3SinkPersist.render(out);
   // gauges 走 collector
   accountPoolHealth.render(out);
   agentRunning.render(out);
@@ -617,6 +648,7 @@ export function resetMetricsForTest(): void {
   wsBridgeSessionDuration.reset();
   containerEnsureDuration.reset();
   wsBridgeTtft.reset();
+  v3SinkPersist.reset();
 }
 
 /** 给 alerts.ts 读取 account health / agent running 的 snapshot(避免双查)。 */

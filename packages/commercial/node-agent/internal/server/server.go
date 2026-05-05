@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -113,6 +114,7 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("/containers/run", s.handleRun)
 	mux.HandleFunc("/containers", s.handleList)
 	mux.HandleFunc("/containers/", s.handleContainerSub) // /containers/{cid}/{op}
+	mux.HandleFunc("/image/inspect", s.handleImageInspect)
 	mux.HandleFunc("/volumes/create", s.handleVolumeCreate)
 	mux.HandleFunc("/volumes/", s.handleVolumeSub) // GET/DELETE /volumes/{name}
 	mux.HandleFunc("/files", s.files.ServeHTTP)    // PUT/DELETE /files?path=
@@ -306,6 +308,53 @@ func (s *Server) handleContainerSub(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// handleImageInspect — POST /image/inspect { tag } → {id, repoTags, labels}
+//
+// 给 master 侧 v3-sink 截断防护用:rollout 后 master 通过这条 endpoint 拿
+// host 上实际加载的 image id + capability labels,只有 (id == desired_image_id)
+// AND (labels.oc.runtime.features 含 v3-sink token) 才 setLoadedImage 并清
+// image-mismatch quarantine。
+//
+// 4xx vs 5xx 语义:
+//   - 400 BAD_BODY:tag 缺失 / 不合法格式
+//   - 404 IMAGE_NOT_FOUND:host 上没这个 tag(典型分发未完成 / docker GC 把它清了)
+//   - 500 INSPECT_FAIL:docker daemon 不可达 / parse 异常
+func (s *Server) handleImageInspect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"code":"BAD_BODY","error":"`+escape(err.Error())+`"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Tag == "" {
+		http.Error(w, `{"code":"BAD_BODY","error":"tag required"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	ii, err := s.runner.InspectImage(ctx, req.Tag)
+	if err != nil {
+		// validateImageTag 的错误也是 invalid input,400 比 500 合适
+		// (caller 通常 master 内部代码,不会拿到 raw 用户输入,但 defense-in-depth)
+		if errors.Is(err, containers.ErrImageNotFound) {
+			http.Error(w, `{"code":"IMAGE_NOT_FOUND","error":"image not found on this host"}`, http.StatusNotFound)
+			return
+		}
+		// 其它 — daemon 不可达 / parse fail / validation fail
+		// validation fail 走 INSPECT_FAIL 而非 BAD_BODY 是工程妥协 — 已在 r.URL.Body
+		// 解码后,400 vs 500 划分上沿不锐利;反正 master 侧 caller 看到非 200 就 quarantine。
+		http.Error(w, fmt.Sprintf(`{"code":"INSPECT_FAIL","error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ii)
 }
 
 // handleVolumeCreate — POST /volumes/create  {name}

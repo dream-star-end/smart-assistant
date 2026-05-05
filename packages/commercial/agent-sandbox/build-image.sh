@@ -185,7 +185,19 @@ echo "[build-image] build context ready: ${CTX_MB} MiB at $BUILD_CTX"
 # 2. docker build
 # ───────────────────────────────────────────────
 echo "[build-image] docker build → $IMAGE_FULL"
+# Capability labels (2026-05-05) — 让 master/supervisor 在 ensure-create 路径
+# 通过 nodeAgent /image/inspect 验证 host 上加载的镜像具备 v3-sink 能力,
+# 防 master sink call sites + 容器镜像版本错位的复发(症状:server-authored
+# 文本截断,因为容器内 gateway 没有调 sink 的代码)。
+#
+# - oc.runtime.features: whitespace-separated token list。supervisor 用
+#   case-sensitive 精确 token split 匹配("v3-sink" 命中,"V3-Sink" /
+#   "v3sink" 不命中)
+# - oc.runtime.git_sha: 与 v3 仓 HEAD 短 sha 一致($TAG 默认就是这个值,
+#   上方 TAG 计算分支已 cd 到 SANDBOX_DIR 里 git rev-parse)
 docker build \
+  --label "oc.runtime.features=v3-sink" \
+  --label "oc.runtime.git_sha=$TAG" \
   -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \
   -t "$IMAGE_FULL" \
   "$BUILD_CTX"

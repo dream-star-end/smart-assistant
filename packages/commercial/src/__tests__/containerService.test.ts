@@ -25,7 +25,11 @@ import {
   type ContainerInspect,
 } from "../compute-pool/containerService.js";
 import { SupervisorError } from "../agent-sandbox/types.js";
-import type { ComputeHostRow, ComputeHostStatus } from "../compute-pool/types.js";
+import type {
+  AgentImageInspect,
+  ComputeHostRow,
+  ComputeHostStatus,
+} from "../compute-pool/types.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
 
 // ───────────────────────────────────────────────────────────────────────
@@ -68,7 +72,7 @@ function mkHost(id: string, name: string, status: ComputeHostStatus = "ready"): 
 //  Fake backends —— 记录调用目标以验证路由
 // ───────────────────────────────────────────────────────────────────────
 
-interface Call { method: string; hostId?: string; name?: string; cid?: string; }
+interface Call { method: string; hostId?: string; name?: string; cid?: string; tag?: string; }
 
 function makeLocalFake(): {
   backend: {
@@ -79,6 +83,7 @@ function makeLocalFake(): {
     stop: (cid: string) => Promise<void>;
     remove: (cid: string) => Promise<void>;
     inspect: (cid: string) => Promise<ContainerInspect>;
+    inspectImage: (tag: string) => Promise<AgentImageInspect | null>;
   };
   calls: Call[];
 } {
@@ -94,6 +99,11 @@ function makeLocalFake(): {
       calls.push({ method: "local.inspect", cid });
       return { Id: cid, State: { Status: "running", Running: true, ExitCode: 0 } } as unknown as ContainerInspect;
     },
+    async inspectImage(tag: string): Promise<AgentImageInspect | null> {
+      calls.push({ method: "local.inspectImage", tag });
+      if (tag === "absent:tag") return null;
+      return { id: "sha256:local", repoTags: [tag], labels: { "oc.runtime.features": "v3-sink" } };
+    },
   };
   return { backend, calls };
 }
@@ -107,6 +117,7 @@ function makeRemoteFake(): {
     stop: (hostId: string, cid: string) => Promise<void>;
     remove: (hostId: string, cid: string) => Promise<void>;
     inspect: (hostId: string, cid: string) => Promise<ContainerInspect>;
+    inspectImage: (hostId: string, tag: string) => Promise<AgentImageInspect | null>;
   };
   calls: Call[];
 } {
@@ -121,6 +132,11 @@ function makeRemoteFake(): {
     async inspect(hostId: string, cid: string): Promise<ContainerInspect> {
       calls.push({ method: "remote.inspect", hostId, cid });
       return { Id: cid, State: { Status: "running", Running: true, ExitCode: 0 } } as unknown as ContainerInspect;
+    },
+    async inspectImage(hostId: string, tag: string): Promise<AgentImageInspect | null> {
+      calls.push({ method: "remote.inspectImage", hostId, tag });
+      if (tag === "absent:tag") return null;
+      return { id: "sha256:remote", repoTags: [tag], labels: { "oc.runtime.features": "v3-sink" } };
     },
   };
   return { backend, calls };
@@ -233,5 +249,26 @@ describe("HostAwareContainerService routing", () => {
     const { svc } = makeSvc(fp);
     assert.equal(await svc.isRemote("self-id"), false);
     assert.equal(await svc.isRemote("tk-id"), true);
+  });
+
+  test("inspectImage routes by host.name and returns backend payload", async () => {
+    const { svc, local, remote } = makeSvc(fp);
+    const selfRes = await svc.inspectImage("self-id", "openclaude/openclaude-runtime:v1.0.83");
+    assert.deepEqual(local.map((c) => c.method), ["local.inspectImage"]);
+    assert.equal(local[0]!.tag, "openclaude/openclaude-runtime:v1.0.83");
+    assert.equal(remote.length, 0);
+    assert.equal(selfRes?.id, "sha256:local");
+    assert.equal(selfRes?.labels["oc.runtime.features"], "v3-sink");
+
+    const remoteRes = await svc.inspectImage("tk-id", "openclaude/openclaude-runtime:v1.0.83");
+    assert.deepEqual(remote.map((c) => c.method), ["remote.inspectImage"]);
+    assert.equal(remote[0]!.hostId, "tk-id");
+    assert.equal(remoteRes?.id, "sha256:remote");
+  });
+
+  test("inspectImage propagates null from either backend (image absent)", async () => {
+    const { svc } = makeSvc(fp);
+    assert.equal(await svc.inspectImage("self-id", "absent:tag"), null);
+    assert.equal(await svc.inspectImage("tk-id", "absent:tag"), null);
   });
 });

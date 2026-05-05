@@ -523,3 +523,89 @@ func (r *Runner) InspectRaw(ctx context.Context, cid string) (boundIp string, er
 	}
 	return ii.BoundIP, nil
 }
+
+// ImageInspectResponse 对应 master 侧 nodeAgentClient inspectImage()。字段名与
+// `docker image inspect` 部分对齐(.Id / .RepoTags / .Config.Labels),只暴露
+// master 侧 capability 校验需要的子集。Labels 永不为 nil(空 map 即 no labels)。
+type ImageInspectResponse struct {
+	ID       string            `json:"id"`
+	RepoTags []string          `json:"repoTags"`
+	Labels   map[string]string `json:"labels"`
+}
+
+// reImageTag 比 reImage 略严格 — 不接受 @ digest(防注入 docker CLI 时的歧义),
+// 也不允许 host 路径风格的 source。:tag 部分 docker 自身允许的字符即可。
+// master 侧 inspectImage 永远从 OC_RUNTIME_IMAGE / setDesiredImage 取值,这条
+// 主要防御内网 noisy neighbor 直连 nodeAgent。
+var reImageTag = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*:[a-zA-Z0-9._-]+$`)
+
+// validateImageTag 接受 `repo:tag` 形式,如 `openclaude/openclaude-runtime:abc123def456`。
+// 不允许 @sha256: digest 形式 — image rollout 路径只用 tag,sha 走 setLoadedImage。
+func validateImageTag(tag string) error {
+	if !reImageTag.MatchString(tag) {
+		return fmt.Errorf("invalid image tag: %q", tag)
+	}
+	return nil
+}
+
+// InspectImage 调 `docker image inspect <tag>` 拿 image id + repoTags + labels。
+// 给 master 侧 capability 校验(rollout 时必须确认远端 host 加载的镜像与 master
+// desired_image_id 一致 且 labels 含 v3-sink token,见 v3-sink 截断回归防护)。
+//
+// 返回结果中:
+//   - ID:`sha256:...` 完整 image config id;master 用这个跟 desiredImageId 比对
+//   - RepoTags:可能为空(historical untagged manifest);非空才信
+//   - Labels:image build 时打的 OCI labels(`oc.runtime.features` /
+//     `oc.runtime.git_sha`);master 用 case-sensitive token split 来 parse
+//
+// 不抛 detail stderr — 不存在 / docker daemon 不可达都映射成 ImageNotFound 错误,
+// HTTP 层翻译成 404。其他 transient 错误返 500。
+func (r *Runner) InspectImage(ctx context.Context, tag string) (*ImageInspectResponse, error) {
+	if err := validateImageTag(tag); err != nil {
+		return nil, err
+	}
+
+	release := acquire()
+	defer release()
+
+	out, err := r.exec(ctx, "image", "inspect", tag)
+	if err != nil {
+		// docker image inspect on missing tag exits 1 with "Error: No such image".
+		// Caller (HTTP layer) maps this to 404; other errors stay as 500 via err.
+		if strings.Contains(err.Error(), "No such image") {
+			return nil, ErrImageNotFound
+		}
+		return nil, err
+	}
+	var arr []struct {
+		ID       string   `json:"Id"`
+		RepoTags []string `json:"RepoTags"`
+		Config   struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+	}
+	if err := json.Unmarshal([]byte(out), &arr); err != nil {
+		return nil, fmt.Errorf("parse image inspect: %w", err)
+	}
+	if len(arr) == 0 {
+		return nil, ErrImageNotFound
+	}
+	i := arr[0]
+	labels := i.Config.Labels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	repoTags := i.RepoTags
+	if repoTags == nil {
+		repoTags = []string{}
+	}
+	return &ImageInspectResponse{
+		ID:       i.ID,
+		RepoTags: repoTags,
+		Labels:   labels,
+	}, nil
+}
+
+// ErrImageNotFound 表示 `docker image inspect <tag>` 未命中(image 不存在 /
+// docker daemon 不可达且 stderr 含 No such image)。HTTP 层翻成 404。
+var ErrImageNotFound = errors.New("image not found")

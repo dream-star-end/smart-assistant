@@ -36,11 +36,14 @@ import {
   stopContainer as agentStopContainer,
   removeContainer as agentRemoveContainer,
   inspectContainer as agentInspectContainer,
+  inspectImage as agentInspectImage,
   hostRowToTarget,
+  AgentAppError,
   type NodeAgentTarget,
 } from "./nodeAgentClient.js";
 import type {
   AgentContainerInspect,
+  AgentImageInspect,
   AgentRunContainerRequest,
   ComputeHostRow,
 } from "./types.js";
@@ -140,6 +143,14 @@ export interface ContainerService {
   ): Promise<void>;
   /** inspect 容器;missing 抛 statusCode=404。 */
   inspect(hostId: string, containerInternalId: string): Promise<ContainerInspect>;
+  /**
+   * docker image inspect by tag。
+   *   - 200 → image info(id / repoTags / labels)
+   *   - image absent on a capable backend → null
+   *   - 网络 / TLS / auth / 旧 agent 无此路由 → 抛错(caller 据此区分版本未升级
+   *     vs 真 image absent,不能把所有 404 一律视为 absent)
+   */
+  inspectImage(hostId: string, tag: string): Promise<AgentImageInspect | null>;
   /** host 是否远端(非 self)。路由/baseline 路径选取用。 */
   isRemote(hostId: string): Promise<boolean>;
   /** host 上 baseline 挂载源路径;self=repo,remote=/var/lib/openclaude/baseline。 */
@@ -296,6 +307,30 @@ export class LocalDockerBackend {
       boundIp,
     };
   }
+
+  /**
+   * docker image inspect — image absent → null;其它错误透传(daemon down 等)。
+   *
+   * dockerode 给 image inspect 时 Labels 落在 `Config.Labels`(image config 层),
+   * 这里 normalize 成 AgentImageInspect.labels;RepoTags 可能是 null/缺失,统一空数组。
+   */
+  async inspectImage(tag: string): Promise<AgentImageInspect | null> {
+    try {
+      const info = (await this.docker.getImage(tag).inspect()) as {
+        Id?: string;
+        RepoTags?: string[] | null;
+        Config?: { Labels?: Record<string, string> | null };
+      };
+      return {
+        id: typeof info.Id === "string" ? info.Id : "",
+        repoTags: Array.isArray(info.RepoTags) ? info.RepoTags : [],
+        labels: info.Config?.Labels ?? {},
+      };
+    } catch (err) {
+      if (isDockerNotFound(err)) return null;
+      throw err;
+    }
+  }
 }
 
 function normalizeLocalState(
@@ -419,6 +454,32 @@ export class RemoteNodeAgentBackend {
 
   async inspect(hostId: string, cid: string): Promise<ContainerInspect> {
     return this.withTarget(hostId, (t) => agentInspectContainer(t, cid));
+  }
+
+  /**
+   * 远端 image inspect。404 必须**同时**满足 httpStatus===404 与 agentErrCode===
+   * "IMAGE_NOT_FOUND" 才视为 image absent;否则一律抛错。
+   *
+   * 这条约束防版本未升级被静默掩盖:旧 nodeAgent 没 /image/inspect 路由时,
+   * Go 默认 mux 返回的是 plain text "404 page not found",rpcCall 解析失败 →
+   * agentErrCode 为 null。Stage 3/4 必须把这种"路由不存在"显式抛出来,让 Stage 5
+   * 的 attest 直接 quarantine 这台 host(image-mismatch),而非误判 image absent。
+   */
+  async inspectImage(hostId: string, tag: string): Promise<AgentImageInspect | null> {
+    return this.withTarget(hostId, async (t) => {
+      try {
+        return await agentInspectImage(t, tag);
+      } catch (err) {
+        if (
+          err instanceof AgentAppError &&
+          err.httpStatus === 404 &&
+          err.agentErrCode === "IMAGE_NOT_FOUND"
+        ) {
+          return null;
+        }
+        throw err;
+      }
+    });
   }
 }
 
@@ -546,6 +607,13 @@ export class HostAwareContainerService implements ContainerService {
       return this.remote.inspect(hostId, cid);
     }
     return this.local.inspect(cid);
+  }
+
+  async inspectImage(hostId: string, tag: string): Promise<AgentImageInspect | null> {
+    if (await this.isRemote(hostId)) {
+      return this.remote.inspectImage(hostId, tag);
+    }
+    return this.local.inspectImage(tag);
   }
 }
 

@@ -58,6 +58,10 @@ import {
   verifyContainerIdentity,
   type ContainerIdentityRepo,
 } from "../auth/containerIdentity.js";
+import {
+  incrV3SinkPersist,
+  type V3SinkPersistOutcome,
+} from "../admin/metrics.js";
 
 /** Master persists assistant messages no larger than this. Conservative — a
  *  single chat turn rarely exceeds 64 KB; cap at 256 KB to leave headroom for
@@ -108,6 +112,10 @@ export interface ServerAuthoredHandlerDeps {
   logger?: Logger;
   /** Override only for tests; real callers use Date.now via default. */
   now?: () => number;
+  /** Override only for tests so unit tests can assert metric outcome without
+   *  touching the module-level Counter state. Real callers omit; default
+   *  bridges to {@link incrV3SinkPersist}. */
+  metric?: (outcome: V3SinkPersistOutcome) => void;
 }
 
 /** Same ctx shape as `AnthropicProxyHandler` — derived by listener wiring. */
@@ -129,6 +137,7 @@ export function makeServerAuthoredHandler(
     subsys: "internalServerAuthored",
   });
   const now = deps.now ?? (() => Date.now());
+  const metric = deps.metric ?? incrV3SinkPersist;
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
@@ -144,6 +153,8 @@ export function makeServerAuthoredHandler(
 
     // 0) Method whitelist — caller's path router has already matched the path.
     if (req.method !== "POST") {
+      // Method violations are caller-routing bugs, not container persist
+      // attempts. Don't pollute the persist metric.
       sendJsonError(res, 405, "METHOD_NOT_ALLOWED", "POST required", requestId);
       return;
     }
@@ -159,6 +170,7 @@ export function makeServerAuthoredHandler(
     } catch (err) {
       if (err instanceof ContainerIdentityError) {
         reqLog.warn("identity_failed", { errcode: err.code });
+        metric("reject_unauthorized");
         sendJsonError(
           res,
           401,
@@ -184,12 +196,15 @@ export function makeServerAuthoredHandler(
       const parsed = BodySchema.safeParse(raw);
       if (!parsed.success) {
         userLog.warn("bad_body", { issues: parsed.error.issues });
+        metric("reject_bad_body");
         sendJsonError(res, 400, "INVALID_BODY", "body schema rejected", requestId);
         return;
       }
       body = parsed.data;
     } catch (err) {
       if (err instanceof HttpError) {
+        // 400/413 from readBoundedJson — bad body family.
+        metric("reject_bad_body");
         sendJsonError(res, err.status, err.code, err.message, requestId);
         return;
       }
@@ -223,17 +238,20 @@ export function makeServerAuthoredHandler(
         turnIndex: body.turnIndex,
         err: err as Error,
       });
+      metric("error");
       sendJsonError(res, 500, "STORAGE_ERROR", "storage write failed", requestId);
       return;
     }
 
     if (result.applied) {
+      metric("ok");
       sendJsonOk(res, 200, { ok: true }, requestId);
       return;
     }
     if (result.reason === "already_exists") {
       // Idempotent retry — first call succeeded, this one is a no-op. Return
       // 200 so the sender drops the entry from its queue.
+      metric("deduped");
       sendJsonOk(res, 200, { ok: true, idempotent: true }, requestId);
       return;
     }
@@ -243,6 +261,7 @@ export function makeServerAuthoredHandler(
         sessionId: body.sessionId,
         turnIndex: body.turnIndex,
       });
+      metric("reject_session_missing");
       sendJsonError(
         res,
         404,
@@ -260,6 +279,7 @@ export function makeServerAuthoredHandler(
       sessionId: body.sessionId,
       turnIndex: body.turnIndex,
     });
+    metric("error");
     sendJsonError(res, 500, "ROW_MALFORMED", "master row data corrupt", requestId);
   };
 }

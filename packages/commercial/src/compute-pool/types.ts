@@ -308,6 +308,22 @@ export interface AgentContainerInspect {
   boundIp: string;
 }
 
+/**
+ * /image/inspect 响应 — Go ImageInspectResponse 的 TS 镜像。
+ *
+ * 用于 Stage 5 image-attest 与 Stage 9 supervisor v3-sink 能力守门:
+ * master 拿到 host 上 docker image 的 config Id + 原始 labels(含 oc.runtime.features
+ * / oc.runtime.git_sha),与 desired_image_id 和本地 git sha 比对,通过才允许调度。
+ */
+export interface AgentImageInspect {
+  /** docker image config Id, sha256:... full hex */
+  id: string;
+  /** docker RepoTags(e.g. `["openclaude/openclaude-runtime:v1.0.83"]`);可能为空数组 */
+  repoTags: string[];
+  /** 原始 docker labels(含 oc.runtime.features / oc.runtime.git_sha 等) */
+  labels: Record<string, string>;
+}
+
 export const COMPUTE_POOL_ERR = {
   POOL_UNAVAILABLE: "NODE_POOL_UNAVAILABLE",
   POOL_BUSY: "NODE_POOL_BUSY",

@@ -2,6 +2,41 @@ package containers
 
 import "testing"
 
+func TestValidateImageTag(t *testing.T) {
+	// master 侧 nodeAgentClient.inspectImage 永远从 OC_RUNTIME_IMAGE / setDesiredImage
+	// 取值,但 defense-in-depth — 内网直连或 master 内代码 bug 把意外 input 推过来时,
+	// 这条 regex 仍然要把 shell-meta / @sha digest / 未带 tag 的 image 全挡。
+	ok := []string{
+		"openclaude/openclaude-runtime:v1.0.83",
+		"openclaude/openclaude-runtime:abc123def456",
+		"foo:bar",
+		"foo.bar/baz:qux",
+		"foo:1.2.3",
+	}
+	for _, s := range ok {
+		if err := validateImageTag(s); err != nil {
+			t.Errorf("validateImageTag(%q) should pass, got: %v", s, err)
+		}
+	}
+
+	bad := []string{
+		"",
+		"openclaude/openclaude-runtime",                      // no tag
+		"openclaude/openclaude-runtime@sha256:abc",           // digest form rejected
+		"openclaude/openclaude-runtime:abc; rm -rf /",        // shell injection attempt
+		"-leading-dash:tag",
+		":tag",                                               // no repo
+		"repo:",                                              // empty tag
+		"repo:has spaces",                                    // whitespace
+		"repo:tag\nnewline",                                  // newline injection
+	}
+	for _, s := range bad {
+		if err := validateImageTag(s); err == nil {
+			t.Errorf("validateImageTag(%q) should fail but passed", s)
+		}
+	}
+}
+
 func TestValidateVolumeName(t *testing.T) {
 	// 必须跟 master TS 侧 v3VolumeNameFor / v3ProjectsVolumeNameFor 对齐:
 	// `oc-v3-data-u<uid>` / `oc-v3-proj-u<uid>`,uid 正整数无前导 0。

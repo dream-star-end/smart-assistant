@@ -29,6 +29,7 @@ import {
   type ServerAuthoredStorage,
   type ServerAuthoredHandlerCtx,
 } from "../http/internalServerAuthored.js";
+import type { V3SinkPersistOutcome } from "../admin/metrics.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
 
 // ─── tiny test fixtures ─────────────────────────────────────────────────
@@ -316,5 +317,142 @@ describe("internalServerAuthored handler — storage outcome mapping", () => {
     const { res, rec } = makeRes();
     await h(authed(validBody), res, CTX);
     assert.equal(rec.status, 500);
+  });
+});
+
+describe("internalServerAuthored handler — sink persist metric outcomes", () => {
+  // Why per-outcome here: ops dashboards use oc_v3_sink_persist_total to detect
+  // post-deploy regression (boss-mandated root-cause monitoring for the
+  // 2026-05-05 codex truncation incident — capability label drift between
+  // master sink call sites and stale container image silently zeroes 'ok').
+  // If a future refactor renames an outcome label string or moves a return
+  // path, these assertions break loudly instead of dashboards going silent.
+  function captureMetric(): {
+    calls: V3SinkPersistOutcome[];
+    metric: (o: V3SinkPersistOutcome) => void;
+  } {
+    const calls: V3SinkPersistOutcome[] = [];
+    return { calls, metric: (o) => calls.push(o) };
+  }
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+  const validBody = JSON.stringify({
+    sessionId: "sess12345",
+    turnIndex: 1,
+    status: "completed",
+    text: "hi",
+  });
+
+  test("ok on applied:true", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    await h(authed(validBody), res, CTX);
+    assert.deepEqual(m.calls, ["ok"]);
+  });
+
+  test("deduped on already_exists", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: false, reason: "already_exists" })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    await h(authed(validBody), res, CTX);
+    assert.deepEqual(m.calls, ["deduped"]);
+  });
+
+  test("reject_session_missing on session_not_found", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: false, reason: "session_not_found" })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    await h(authed(validBody), res, CTX);
+    assert.deepEqual(m.calls, ["reject_session_missing"]);
+  });
+
+  test("reject_unauthorized on identity failure", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    // No auth header → identity verification fails before any storage call.
+    await h(makeReq({ body: validBody }), res, CTX);
+    assert.deepEqual(m.calls, ["reject_unauthorized"]);
+  });
+
+  test("reject_bad_body on schema rejection", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    await h(authed("{not-json"), res, CTX);
+    assert.deepEqual(m.calls, ["reject_bad_body"]);
+  });
+
+  test("reject_bad_body on payload too large (413)", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    const giant = Buffer.alloc(256 * 1024 + 1024).fill(0x61).toString("ascii");
+    await h(authed(giant), res, CTX);
+    assert.deepEqual(m.calls, ["reject_bad_body"]);
+  });
+
+  test("error on malformed master row", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: false, reason: "malformed" })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    await h(authed(validBody), res, CTX);
+    assert.deepEqual(m.calls, ["error"]);
+  });
+
+  test("error when storage throws", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => {
+        throw new Error("disk full");
+      }),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    await h(authed(validBody), res, CTX);
+    assert.deepEqual(m.calls, ["error"]);
+  });
+
+  test("non-POST does not pollute persist metric (405 path skips counter)", async () => {
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    await h(makeReq({ method: "GET" }), res, CTX);
+    assert.deepEqual(m.calls, []);
   });
 });

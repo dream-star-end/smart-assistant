@@ -43,6 +43,7 @@ import {
   COMPUTE_POOL_ERR,
   type AgentContainerInspect,
   type AgentHealthResponse,
+  type AgentImageInspect,
   type AgentRunContainerRequest,
   type AgentRunContainerResponse,
   type ComputeHostRow,
@@ -430,6 +431,32 @@ export async function inspectContainer(
   return rpcCall<AgentContainerInspect>(target, {
     path: `/containers/${encodeURIComponent(containerInternalId)}/inspect`,
     method: "GET",
+  });
+}
+
+/**
+ * POST /image/inspect — host 上 docker image inspect by tag。
+ *
+ * Stage 3+9 v3-sink 能力守门用:caller 拿到 (id, repoTags, labels) 后比对
+ * `oc.runtime.features` / `oc.runtime.git_sha` 与 desired image Id。
+ *
+ * 错误形状(rpcCall 已统一处理,不在本函数内特殊化):
+ *   - 200 → AgentImageInspect
+ *   - 404 with body `{"code":"IMAGE_NOT_FOUND",...}` → AgentAppError(httpStatus=404,
+ *     agentErrCode="IMAGE_NOT_FOUND") — caller 区分"image absent" vs "route absent
+ *     /版本未升级"。注意旧 nodeAgent 没这条 handler 时,Go 默认 mux 404 是 plain
+ *     text,JSON.parse 失败 → agentErrCode === null,需要 caller 拒绝转 null。
+ *   - 其它非 2xx → AgentAppError;网络/TLS → AgentUnreachableError/CertVerifyError
+ */
+export async function inspectImage(
+  target: NodeAgentTarget,
+  tag: string,
+): Promise<AgentImageInspect> {
+  return rpcCall<AgentImageInspect>(target, {
+    path: "/image/inspect",
+    method: "POST",
+    body: { tag },
+    timeoutMs: 15_000,
   });
 }
 
