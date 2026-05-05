@@ -192,6 +192,10 @@ export class Gateway {
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
   private _pendingPermissionSweepTimer: ReturnType<typeof setInterval> | null = null
   private _stopEviction: (() => void) | null = null
+  /** v3 master sink retry queue stop hook — set when sink is wired in
+   *  start(); called in shutdown stage 2 to cancel the periodic drain
+   *  timer. null when v3 sink isn't configured (personal version). */
+  private _stopV3RetryDrainer: (() => void) | null = null
   private _shuttingDown = false
   private _shutdownPromise: Promise<void> | null = null
 
@@ -385,6 +389,59 @@ export class Gateway {
       }
     } catch (err) {
       this.log.error('msg-outbox replay failed (continuing startup)', undefined, err as Error)
+    }
+
+    // V3 commercial: container → master sink for server-authored messages.
+    // Wire only if env is configured (set by v3supervisor when spawning
+    // commercial containers). Personal version + dev sandbox don't set
+    // these envs and the sink stays null — sessionManager falls back to
+    // the legacy local-SQLite durable path. This block is no-op for
+    // non-commercial deployments.
+    //
+    // Order matters:
+    //   1. read config (env-driven; null → skip).
+    //   2. create retry queue WITHOUT a sink reference (queue calls a
+    //      function we'll close over).
+    //   3. create sink with queue injected.
+    //   4. wire the queue's attemptSend to call sink.attemptOnce.
+    //   5. set the global getter so sessionManager picks it up before
+    //      any turn-end callback fires.
+    //   6. kick a drain pass + start periodic timer so any entries
+    //      from a prior gateway crash get retried.
+    try {
+      const { makeV3MasterSink, readV3MasterSinkConfig, setV3MasterSinkSingleton } =
+        await import('./v3MasterSink.js')
+      const { makeV3MasterRetryQueue } = await import('./v3MasterRetryQueue.js')
+      const sinkCfg = readV3MasterSinkConfig()
+      if (sinkCfg) {
+        // Two-phase wire to break the cycle: queue.attemptSend wants the
+        // sink's single-attempt path, sink.persistOrQueue wants the queue
+        // for fallback. Box `sinkRef` so the queue can call it via late-
+        // binding when sink is constructed below.
+        let sinkAttemptOnce: ((p: import('./v3MasterSink.js').V3MasterSinkPayload) => Promise<void>) | null = null
+        const queue = makeV3MasterRetryQueue({
+          attemptSend: async (p) => {
+            if (!sinkAttemptOnce) {
+              throw new Error('v3MasterRetryQueue: drainer fired before sink wired (impossible)')
+            }
+            return sinkAttemptOnce(p)
+          },
+        })
+        const sink = makeV3MasterSink({ config: sinkCfg, retryQueue: queue })
+        sinkAttemptOnce = (p) => sink.attemptOnce(p)
+        setV3MasterSinkSingleton(sink)
+        // Boot drain — best-effort, never blocks listen().
+        queue.kick()
+        queue.startPeriodic()
+        this._stopV3RetryDrainer = () => queue.stopPeriodic()
+        this.log.info('v3 master sink wired', { baseUrl: sinkCfg.baseUrl })
+      }
+    } catch (err) {
+      // Non-fatal — fall back to legacy local durable path. Ops will see
+      // turn texts going to local SQLite (which is permanently empty in
+      // v3 commercial) so the symptom is "client_sessions empty" — same
+      // as pre-fix; loud enough to detect via dashboards.
+      this.log.error('v3 master sink wire failed (falling back to legacy path)', undefined, err as Error)
     }
 
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
@@ -875,6 +932,21 @@ export class Gateway {
     } catch (err) {
       this.log.warn('cron stop error', undefined, err)
     }
+    // v3 master sink retry queue periodic timer ONLY here. The sink
+    // singleton itself MUST stay set until after sessions.shutdownAll()
+    // drains turn-end / handleExit-flush callbacks (stage 4) — clearing
+    // it now would send late partial-flush writes through the legacy
+    // local SQLite path that's permanently empty in v3 commercial,
+    // recreating the original data-loss bug. Stopping the periodic timer
+    // is fine: it's purely additive (drains entries already on disk
+    // from prior boot), and `kick()` is idempotent.
+    // Codex R2 BLOCK-2.
+    try {
+      this._stopV3RetryDrainer?.()
+    } catch (err) {
+      this.log.warn('v3 retry drainer stop error', undefined, err)
+    }
+    this._stopV3RetryDrainer = null
 
     // ── Stage 3: drain channel adapters (Telegram etc.) ──
     for (const ch of this.channels.values()) {
@@ -904,6 +976,20 @@ export class Gateway {
       await this.sessions.awaitResumeMapFlush()
     } catch (err) {
       this.log.warn('resume map flush error', undefined, err)
+    }
+
+    // ── Stage 4.5: clear v3 master sink singleton ──
+    // shutdownAll above internally awaits awaitPendingPersistence(), so
+    // every turn-end / handleExit-flush has either landed on master via
+    // the sink HTTP POST or has been durably enqueued on disk for
+    // retry-on-next-boot. Now safe to disable the write path.
+    // Codex R2 BLOCK-2 — kept the kill-switch out of stage 2 and put it
+    // here after sessions are fully drained.
+    try {
+      const { setV3MasterSinkSingleton } = await import('./v3MasterSink.js')
+      setV3MasterSinkSingleton(null)
+    } catch (err) {
+      this.log.warn('v3 master sink singleton clear error', undefined, err)
     }
 
     // ── Stage 5: force-close remaining sockets ──

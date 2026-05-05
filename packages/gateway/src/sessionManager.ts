@@ -17,6 +17,7 @@ import {
 } from './telemetryChannel.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
+import { getV3MasterSinkOrNull, type V3MasterSinkPayload } from './v3MasterSink.js'
 import { SubprocessRunner } from './subprocessRunner.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
 import { CodexRunner } from './codexRunner.js'
@@ -108,6 +109,149 @@ export interface CronBridgeEvent {
   id?: string
 }
 
+/**
+ * Persist the authoritative server-authored assistant text for a turn.
+ *
+ * Two-mode dispatch:
+ *
+ *   1. v3 commercial (container has OPENCLAUDE_V3_MASTER_BASE_URL +
+ *      OPENCLAUDE_V3_CONTAINER_TOKEN env): send via the container→master
+ *      sink (V3MasterSink). Master writes to its own SQLite where the
+ *      authoritative session row lives. On transient/session_missing the
+ *      sink enqueues durable retry; on fatal it drops with a structured
+ *      warn. **userId is irrelevant on this path** — master derives it
+ *      from the verified container identity, so we don't even bother
+ *      looking it up here.
+ *
+ *   2. personal version / dev (no v3 sink configured): legacy path —
+ *      `appendServerAuthoredMessageDurable` writes to the local SQLite
+ *      with the local outbox fallback for DB-unavailable transients.
+ *      Needs a userId because client_sessions is keyed (id, user_id) and
+ *      the local DB IS authoritative for personal mode. Falls back to
+ *      `getClientSession` lookup when the AgentSession didn't carry
+ *      userId (cron pre-warm, legacy webchat callers).
+ *
+ * Returns Promise<void> that always resolves (errors are logged
+ * internally — never rejects). Callers MUST track it so shutdown can
+ * await pending writes via SessionManager.awaitPendingPersistence();
+ * a process exit before the durable enqueue lands on disk would
+ * silently lose the turn (Codex R2 BLOCK-1, the original bug we're
+ * fixing — we cannot close the loop with fire-and-forget here).
+ * Turn-end accounting paths (eventBus emits, FTS5 indexing) still
+ * don't `await` it — they continue in parallel; the pending-set is
+ * what makes shutdown wait, not the call sites.
+ */
+function persistServerAuthoredTurn(args: {
+  sessionKey: string
+  peerId: string
+  /** From AgentSession.userId. Undefined on legacy/cron-pre-warm paths.
+   *  Ignored on the v3 sink path (master derives it from identity). */
+  userId: string | undefined
+  turnIndex: number
+  text: string
+  status: 'completed' | 'interrupted' | 'crashed'
+}): Promise<void> {
+  const sink = getV3MasterSinkOrNull()
+  if (sink) {
+    const payload: V3MasterSinkPayload = {
+      sessionId: args.peerId,
+      turnIndex: args.turnIndex,
+      status: args.status,
+      text: args.text,
+      createdAt: Date.now(),
+    }
+    return sink
+      .persistOrQueue(payload)
+      .then((outcome) => {
+        if (outcome.ok) return
+        if (outcome.queued) {
+          // Already info-logged inside the sink; nothing to do here.
+          return
+        }
+        // dropped — fatal classification (4xx schema/method on our side).
+        // Surface at warn so ops sees the contract violation but not as
+        // an error spike (fatal here means we have a bug, not a runtime
+        // glitch the system can recover from).
+        log.warn('v3 sink dropped server-authored payload', {
+          sessionKey: args.sessionKey,
+          peerId: args.peerId,
+          turnIndex: args.turnIndex,
+          status: args.status,
+          reason: outcome.droppedReason,
+        })
+      })
+      .catch((err) => {
+        // makeV3MasterSink.persistOrQueue is supposed to swallow all
+        // sink errors and only throw on retry-queue I/O failures
+        // (disk full, ENOSPC). That's still not the assistant-text's
+        // fault — log error so the metric path can pick it up but
+        // don't crash the turn-end flow.
+        log.error(
+          'v3 sink persistOrQueue threw',
+          {
+            sessionKey: args.sessionKey,
+            peerId: args.peerId,
+            turnIndex: args.turnIndex,
+            status: args.status,
+          },
+          err,
+        )
+      })
+  }
+  // Legacy / personal-version path — local SQLite is authoritative.
+  const messageId = `srv-${args.peerId}-t${args.turnIndex}`
+  const directWrite = async () => {
+    const uid = args.userId ?? ((await getClientSession(args.peerId))?.userId)
+    if (!uid) return undefined // cron-style pre-UI, no owner — skip.
+    return appendServerAuthoredMessageDurable(args.peerId, uid, {
+      id: messageId,
+      role: 'assistant',
+      text: args.text,
+      ts: Date.now(),
+      status: args.status,
+    })
+  }
+  return directWrite()
+    .then((r) => {
+      if (!r) return
+      if (r.applied) return
+      if (r.reason === 'already_exists') return
+      if (r.reason === 'queued_to_outbox') {
+        // 'queued_to_outbox' is an expected degraded-mode outcome
+        // (DB unavailable); log as warn not error so we don't spam
+        // error aggregators when disk/SQLite has a hiccup. The replay
+        // loop will pick it up on next restart.
+        log.warn('server-authored message queued to outbox (DB unavailable)', {
+          sessionKey: args.sessionKey,
+          peerId: args.peerId,
+          turnIndex: args.turnIndex,
+          status: args.status,
+          error: r.error,
+        })
+        return
+      }
+      log.warn('server-authored message not persisted', {
+        sessionKey: args.sessionKey,
+        peerId: args.peerId,
+        turnIndex: args.turnIndex,
+        status: args.status,
+        reason: r.reason,
+      })
+    })
+    .catch((err) => {
+      log.error(
+        'appendServerAuthoredMessage failed',
+        {
+          sessionKey: args.sessionKey,
+          peerId: args.peerId,
+          turnIndex: args.turnIndex,
+          status: args.status,
+        },
+        err as Error,
+      )
+    })
+}
+
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
   private maxIdleMsCron = 30 * 60 * 1000 // 30 min for cron/task sessions
@@ -156,6 +300,42 @@ export class SessionManager {
   private _remoteTargetController?: RemoteTargetController
   setRemoteTargetController(ctrl: RemoteTargetController | undefined): void {
     this._remoteTargetController = ctrl
+  }
+
+  // ── Server-authored turn persistence tracking ──────────────────────────
+  // Each `persistServerAuthoredTurn(...)` call returns a Promise<void> that
+  // settles once the durable enqueue (sink → retry queue file write) lands
+  // on disk. We add the promise to this set on dispatch and remove on
+  // settle. Shutdown drains the set before clearing the v3 sink singleton
+  // so a process exit cannot lose the turn between "callback fired" and
+  // "file written" (Codex R2 BLOCK-1).
+  //
+  // The set is Promise-keyed not entry-keyed: turn-end + crash-flush can
+  // both fire for the same (sessionKey, turnIndex), and idempotency lives
+  // in the master's UPSERT keyed by msgId — we don't dedup on the client.
+  private _pendingPersistence = new Set<Promise<void>>()
+
+  private _trackPersistence(p: Promise<void>): void {
+    this._pendingPersistence.add(p)
+    // Two-handler `.then` instead of `.finally` so a rejected `p`
+    // doesn't propagate through the chain and trigger an
+    // unhandledRejection. `persistServerAuthoredTurn` itself never
+    // rejects (its catches absorb sink/storage errors into log lines),
+    // but this is belt-and-braces — a future call site swapping in a
+    // different awaitable shouldn't be able to crash the gateway.
+    const cleanup = (): void => { this._pendingPersistence.delete(p) }
+    p.then(cleanup, cleanup)
+  }
+
+  /** Wait for every in-flight server-authored turn persistence promise
+   *  registered via `_trackPersistence` to settle. Always resolves;
+   *  individual rejections are absorbed (the helper itself never rejects,
+   *  but Promise.allSettled is the belt-and-braces version). Called from
+   *  `shutdownAll` after subprocess kill so handleExit's setTimeout-150ms
+   *  flush gets to land before the sink singleton is cleared. */
+  async awaitPendingPersistence(): Promise<void> {
+    if (this._pendingPersistence.size === 0) return
+    await Promise.allSettled([...this._pendingPersistence])
   }
 
   // Resume map: sessionKey → ccbSessionId (survives gateway restart)
@@ -1180,55 +1360,14 @@ export class SessionManager {
               // dropping when the client's debounced PUT hasn't landed yet.
               // Fall back to `getClientSession` lookup for legacy code paths
               // that didn't carry userId (cron pre-warm, old webchat calls).
-              const directWrite = async () => {
-                if (session.userId) {
-                  const messageId = `srv-${peerId}-t${turnIndex}`
-                  return appendServerAuthoredMessageDurable(peerId, session.userId, {
-                    id: messageId,
-                    role: 'assistant',
-                    text: assistantText,
-                    ts: Date.now(),
-                    status: 'completed',
-                  })
-                }
-                const existing = await getClientSession(peerId)
-                if (!existing) return undefined // cron-style pre-UI, no owner
-                const messageId = `srv-${peerId}-t${turnIndex}`
-                return appendServerAuthoredMessageDurable(peerId, existing.userId, {
-                  id: messageId,
-                  role: 'assistant',
-                  text: assistantText,
-                  ts: Date.now(),
-                  status: 'completed',
-                })
-              }
-              directWrite().then((r) => {
-                if (r && !r.applied && r.reason !== 'already_exists') {
-                  // 'queued_to_outbox' is an expected degraded-mode outcome
-                  // (DB unavailable); log as warn not error so we don't spam
-                  // error aggregators when disk/SQLite has a hiccup. The
-                  // replay loop will pick it up on next restart.
-                  if (r.reason === 'queued_to_outbox') {
-                    log.warn('server-authored message queued to outbox (DB unavailable)', {
-                      sessionKey: session.sessionKey, peerId, turnIndex,
-                      error: r.error,
-                    })
-                  } else {
-                    log.warn('server-authored message not persisted', {
-                      sessionKey: session.sessionKey,
-                      peerId,
-                      turnIndex,
-                      reason: r.reason,
-                    })
-                  }
-                }
-              }).catch((err) => {
-                log.error('appendServerAuthoredMessage failed', {
-                  sessionKey: session.sessionKey,
-                  peerId,
-                  turnIndex,
-                }, err)
-              })
+              this._trackPersistence(persistServerAuthoredTurn({
+                sessionKey: session.sessionKey,
+                peerId,
+                userId: session.userId,
+                turnIndex,
+                text: assistantText,
+                status: 'completed',
+              }))
             }
 
             // Emit turn.completed event (triggers event_log + usage_log persistence)
@@ -1369,56 +1508,67 @@ export class SessionManager {
       // Listen for subprocess crash mid-turn. Defer slightly to let remaining
       // stdout data drain (exit can fire before stdout 'end' in Node.js).
       const handleExit = (info: { code: number | null; signal: string | null; crashed: boolean }) => {
-        setTimeout(() => {
-          if (!parser.finalized) {
-            const reason = info.signal
-              ? `子进程被信号 ${info.signal} 终止`
-              : info.code
-                ? `子进程异常退出 (code ${info.code})`
-                : '子进程意外退出'
-            // ── Phase 0.2: persist partial assistant text on interrupt/crash ──
-            // CCB was streaming into parser.assistantBuf when it died / was
-            // interrupted. Without this flush the partial text is only in RAM
-            // + whatever frames the ws client already received. If the client
-            // is backgrounded we lose it entirely. Persist with status marker
-            // 'interrupted' (user stop / SIGINT / idle-timeout signal) vs
-            // 'crashed' (unexpected exit code) so the UI can render a clear
-            // "[was interrupted]" trailer rather than showing a complete-
-            // looking bubble.
-            const partial = parser.assistantBuf
-            if (session.channel === 'webchat' && partial && partial.length > 0) {
-              const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
-              const peerId = session.peerId
-              const turnIndex = session.turns + 1 // turn hasn't been counted yet
-              // Same P1-3 treatment as handleResult: prefer session.userId so
-              // a pre-PUT crash still reaches the outbox; fall back to
-              // getClientSession for legacy code paths.
-              const flushPartial = async () => {
-                const uid = session.userId
-                  ?? ((await getClientSession(peerId))?.userId)
-                if (!uid) return undefined // no owner, nothing to persist to
-                return appendServerAuthoredMessageDurable(peerId, uid, {
-                  id: `srv-${peerId}-t${turnIndex}`,
-                  role: 'assistant',
-                  text: partial,
-                  ts: Date.now(),
-                  status,
-                })
+        // The setTimeout body is wrapped in `flushP` and registered with the
+        // pending-persistence set IMMEDIATELY (synchronously, on this exit
+        // event). That way `SessionManager.awaitPendingPersistence` — called
+        // from `shutdownAll` after `runner.shutdown()` resolves — already
+        // sees the promise and waits for the 150ms drain window + the sink
+        // enqueue inside it to land on disk. If we instead added the
+        // persist promise inside the setTimeout body, shutdown could race
+        // past awaitPendingPersistence (set still empty) and clear the
+        // sink singleton before the setTimeout fires, sending the partial
+        // through the legacy data-loss path. Codex R2 BLOCK-1.
+        const flushP = new Promise<void>((resolveFlush) => {
+          setTimeout(async () => {
+            try {
+              if (!parser.finalized) {
+                const reason = info.signal
+                  ? `子进程被信号 ${info.signal} 终止`
+                  : info.code
+                    ? `子进程异常退出 (code ${info.code})`
+                    : '子进程意外退出'
+                // ── Phase 0.2: persist partial assistant text on interrupt/crash ──
+                // CCB was streaming into parser.assistantBuf when it died / was
+                // interrupted. Without this flush the partial text is only in RAM
+                // + whatever frames the ws client already received. If the client
+                // is backgrounded we lose it entirely. Persist with status marker
+                // 'interrupted' (user stop / SIGINT / idle-timeout signal) vs
+                // 'crashed' (unexpected exit code) so the UI can render a clear
+                // "[was interrupted]" trailer rather than showing a complete-
+                // looking bubble.
+                const partial = parser.assistantBuf
+                if (session.channel === 'webchat' && partial && partial.length > 0) {
+                  const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
+                  const peerId = session.peerId
+                  const turnIndex = session.turns + 1 // turn hasn't been counted yet
+                  // Same P1-3 treatment as handleResult: prefer session.userId so
+                  // a pre-PUT crash still reaches the outbox; fall back to
+                  // getClientSession for legacy code paths.
+                  // Awaited here so flushP settles only after the durable
+                  // enqueue (or persistOrQueue resolution) — that's the
+                  // promise the pending-persistence set is gating shutdown on.
+                  await persistServerAuthoredTurn({
+                    sessionKey: session.sessionKey,
+                    peerId,
+                    userId: session.userId,
+                    turnIndex,
+                    text: partial,
+                    status,
+                  })
+                }
+                onEvent({ kind: 'error', error: reason })
+                detach()
+                settle(() => resolve())
               }
-              flushPartial().catch((err) => {
-                log.error('partial assistant flush failed', {
-                  sessionKey: session.sessionKey, peerId, turnIndex, status,
-                }, err as Error)
-              })
+              // Cost-tracker reset is handled by the `spawn` listener installed in
+              // createSession — it fires synchronously when the next submit() spawns
+              // a fresh CCB, with no timer-vs-new-process race.
+            } finally {
+              resolveFlush()
             }
-            onEvent({ kind: 'error', error: reason })
-            detach()
-            settle(() => resolve())
-          }
-          // Cost-tracker reset is handled by the `spawn` listener installed in
-          // createSession — it fires synchronously when the next submit() spawns
-          // a fresh CCB, with no timer-vs-new-process race.
-        }, 150)
+          }, 150)
+        })
+        this._trackPersistence(flushP)
       }
 
       // Replace any prior turn's stdout listener (kept attached across turn
@@ -1635,6 +1785,12 @@ export class SessionManager {
     }
     await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
     await Promise.all(muxReleases.map((fn) => fn()))
+    // Drain server-authored persistence promises (turn-end fan-outs +
+    // handleExit setTimeout-150ms partial flushes registered while the
+    // runners were being torn down). Must complete before server.ts
+    // clears the v3 sink singleton, otherwise late writes fall through
+    // to the legacy local SQLite path that's permanently empty in v3.
+    await this.awaitPendingPersistence()
     this.sessions.clear()
     for (const k of keysToClear) {
       try { this.onSessionDestroyed?.(k) } catch {}

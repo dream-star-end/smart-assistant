@@ -1298,6 +1298,20 @@ export async function provisionV3Container(
       // baseline mount 本身若缺失/OPTIONAL=1,SkillStore 构造期会抛 → mcp-memory
       // catch 后 warn+fallback user-only,不影响容器启动。
       `OPENCLAUDE_BASELINE_SKILLS_DIR=${V3_CONFIG_TMPFS_PATH}/skills`,
+      // v3 server-authored sink:容器内 sessionManager turn-end 把权威 assistant
+      // 文本 POST 到 master 的 /internal/v3/server-authored-message。复用同一条
+      // 出站通道(self-host plain 18791,远端 mTLS 18443),route splitter 按
+      // path 分流(见 packages/commercial/src/index.ts dispatchInternal)。
+      //   - URL 与 ANTHROPIC_BASE_URL 同根,但解耦命名:gateway 代码不应看
+      //     "anthropic" 字眼判断 sink 走向。
+      //   - Bearer 与 ANTHROPIC_AUTH_TOKEN 同值(都是 oc-v3.<id>.<secret> 容器身份),
+      //     但 sink 模块只读 OPENCLAUDE_V3_CONTAINER_TOKEN,不复用 anthropic env。
+      // 两个 env 均缺失 → gateway 检测到 sink 未配置,直接走旧 durable 路径
+      // (容器 SQLite,在 v3 表里永远 session_not_found 然后失败),即回到
+      // 修复前的丢消息行为。**生产必须有这两个 env;personal 版没有它们,
+      // V3MasterSink getter 返回 null,旧路径继续工作。**
+      `OPENCLAUDE_V3_MASTER_BASE_URL=${internalProxyUrl}`,
+      `OPENCLAUDE_V3_CONTAINER_TOKEN=${token}`,
       // 商用版容器:跳过 personal-version 默认 cron jobs(daily-reflection /
       // weekly-curation / skill-check / heartbeat)的首次 seed。这些 job 每天会触发
       // ~11 次自动 agent 调用,过 anthropicProxy 扣 users.credits。商用用户没主动

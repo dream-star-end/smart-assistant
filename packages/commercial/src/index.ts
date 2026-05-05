@@ -81,6 +81,12 @@ import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
+import {
+  makeServerAuthoredHandler,
+  SERVER_AUTHORED_PATH,
+  type ServerAuthoredHandler,
+} from "./http/internalServerAuthored.js";
+import { appendServerAuthoredMessage } from "@openclaude/storage";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import {
   createUserChatBridge,
@@ -572,6 +578,10 @@ export async function registerCommercial(
   let internalProxyAddress: { host: string; port: number } | undefined;
   let externalMtlsServer: HttpsServer | undefined;
   let externalMtlsAddress: { host: string; port: number } | undefined;
+  // 2026-05-05 v3 commercial server-authored persistence:18791 plain + 18443 mTLS
+  // 共享同一个 dispatcher,按 url path 分流到 anthropicProxy 或 internalServerAuthored。
+  // 在 internalProxyHandler 构造完毕后赋值;mTLS listener 读它而不是 internalProxyHandler。
+  let dispatchInternal: AnthropicProxyHandler | undefined;
   // 前向引用占位:userChatBridge 在下方创建,但 anthropicProxy 在这里就要它的 broadcastToUser。
   // 给 proxy 的 dep 是稳定的闭包(总是调 bridgeBroadcastRef.current),创建 bridge 后赋值。
   // 在 bridge 初始化完成前到达的 cost_charged broadcast 会走到 noop,不 throw 也不落盘(前端
@@ -647,21 +657,40 @@ export async function registerCommercial(
         // 这里直接读取。未配置 → undefined → proxy 命中 deepseek 模型时 503。
         deepseekApiKey: cfg.DEEPSEEK_API_KEY,
       });
+      // 2026-05-05 v3 commercial server-authored persistence — 复用 18791/18443
+      // 同一个 listener,新加 POST /internal/v3/server-authored-message。
+      // 路由由 dispatchInternal 按 url path 分流;仅 path 完全匹配 SERVER_AUTHORED_PATH
+      // 才进新 handler,其它路径仍透到 anthropicProxy(其内部还有 /v1/messages 白名单)。
+      // 新 handler 与 anthropicProxy 共用 (hostUuid, boundIp) ctx 与 verifyContainerIdentity 双因子。
+      // 详见 packages/commercial/src/http/internalServerAuthored.ts。
+      const serverAuthoredHandler: ServerAuthoredHandler = makeServerAuthoredHandler({
+        identityRepo,
+        storage: { appendServerAuthoredMessage },
+      });
+      dispatchInternal = (req, res, ctx) => {
+        const path = (req.url ?? "/").split("?")[0];
+        if (path === SERVER_AUTHORED_PATH) {
+          return serverAuthoredHandler(req, res, ctx);
+        }
+        return internalProxyHandler!(req, res, ctx);
+      };
       internalProxyServer = createHttpServer((req, res) => {
         // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,
         // hostUuid 固定 = selfHostUuid(本机容器不需要也不可能带 mTLS cert)。
         // selfHostUuid 在外层闭包已取,保证非 undefined(否则根本走不到 createHttpServer 这行)。
         const peerIp = req.socket.remoteAddress ?? "";
+        // dispatchInternal 在外层闭包已被赋值;TS 不能静态证明 closure 内非 undefined,
+        // 但 createHttpServer 只能在赋值之后被回调触发,故 ! 安全。
         Promise.resolve(
-          internalProxyHandler!(req, res, { hostUuid: selfHostUuid!, boundIp: peerIp }),
+          dispatchInternal!(req, res, { hostUuid: selfHostUuid!, boundIp: peerIp }),
         ).catch((err) => {
           // eslint-disable-next-line no-console
-          console.error("[commercial] anthropicProxy handler threw:", err);
+          console.error("[commercial] internal listener handler threw:", err);
           if (!res.headersSent) {
             try {
               res.statusCode = 500;
               res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: { code: "INTERNAL", message: "proxy error" } }));
+              res.end(JSON.stringify({ error: { code: "INTERNAL", message: "internal listener error" } }));
             } catch { /* socket gone */ }
           } else {
             try { res.end(); } catch { /* */ }
@@ -688,6 +717,7 @@ export async function registerCommercial(
       internalProxyServer = undefined;
       internalProxyHandler = undefined;
       internalProxyAddress = undefined;
+      dispatchInternal = undefined;
     }
   } else if (!options.skipInternalProxy) {
     // eslint-disable-next-line no-console
@@ -705,6 +735,7 @@ export async function registerCommercial(
   // 关掉 / 配不齐 / 监听失败 → 单边降级,remote host 出不来但 self host 不受影响。
   if (
     internalProxyHandler &&
+    dispatchInternal &&
     cfg.EXTERNAL_MTLS_ENABLED &&
     cfg.EXTERNAL_MTLS_BIND &&
     cfg.EXTERNAL_MTLS_PORT !== undefined
@@ -716,7 +747,10 @@ export async function registerCommercial(
       const masterLeaf = await ensureMasterLeaf();
       const caPem = await fs.promises.readFile(caMat.caCertPath, "utf8");
       const masterKey = await fs.promises.readFile(masterLeaf.keyPath, "utf8");
-      const capturedHandler = internalProxyHandler;
+      // 2026-05-05: 用 dispatchInternal 而不是 internalProxyHandler,这样
+      // remote-host 容器也能命中 /internal/v3/server-authored-message 路径,
+      // 与 self-host 路径行为一致(同一 dispatcher 共享 path 分流逻辑)。
+      const capturedHandler = dispatchInternal;
       externalMtlsServer = createHttpsServer(
         {
           key: masterKey,
