@@ -820,6 +820,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return;
         }
 
+        // EARLY 'error' handler:ws 在 CONNECTING 阶段被 .terminate()(line ~831
+        // earlyClose 路径)时,内部会在 socket 'connect' 异步回调里 throw
+        // "WebSocket was closed before the connection was established" 等。
+        // startBridge 内部的正式 'error' handler 此时还没挂,无人接 → 升 fatal
+        // uncaughtException。挂这个 named handler 兜底;移交 startBridge 时 .off
+        // 掉避免双日志,但 earlyClose return 路径保留它直到 ws 自然清理。
+        const onEarlyContainerWsError = (err: Error): void => {
+          log?.warn("user-chat-bridge: container ws error during connect", {
+            uid: uid.toString(),
+            tunnel: !!endpoint.tunnel,
+            host: endpoint.host,
+            port: endpoint.port,
+            err: String((err as { message?: string })?.message ?? err),
+          });
+        };
+        containerWs.on("error", onEarlyContainerWsError);
+
         // 4) 把"早到帧"解绑 + 检查客户端是否已撤,再交给 startBridge
         ws.off("message", onEarlyMessage);
         ws.off("close", onEarlyClose);
@@ -828,10 +845,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           log?.info("user-chat-bridge: client closed during ensure", {
             uid: uid.toString(),
           });
+          // 故意不 .off(onEarlyContainerWsError):terminate() 触发的 async error
+          // 仍需被这个 handler 接住。listener 会随 ws 关闭被 GC 清理。
           try { containerWs.terminate(); } catch { /* */ }
           try { connectAbort.abort(); } catch { /* */ }
           return;
         }
+
+        // 移交 startBridge:它会在 line ~1807 挂自己的 'error' handler 接管
+        // 容器 ws 生命周期。先解绑 early handler 避免双日志。
+        containerWs.off("error", onEarlyContainerWsError);
 
         startBridge(
           ws,

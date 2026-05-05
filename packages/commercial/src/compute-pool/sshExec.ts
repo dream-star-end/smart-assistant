@@ -130,6 +130,18 @@ async function spawnWithPassword(
         detached: false,
       },
     );
+    // SIGKILL/EPIPE 后 child stdio pipes (stdout/stderr/stdin/fd3) 会触发 'error'
+    // 事件 (常见 ECONNRESET on read side / EPIPE on write side)。Node 把无监听的
+    // stream 'error' 升级到 uncaughtException 拖崩进程。我们对这些错误没有控制流
+    // 依赖 —— 真正的退出信号来自 child 'close' 的 exit code (-1/137 表示被 kill)
+    // 加 stderrTail。挂 noop listener 静默吞掉,放在所有写操作之前避免 race。
+    const swallowStreamError = (s: NodeJS.EventEmitter | null | undefined): void => {
+      s?.on("error", () => { /* see comment above */ });
+    };
+    swallowStreamError(child.stdout);
+    swallowStreamError(child.stderr);
+    swallowStreamError(child.stdin);
+    swallowStreamError(child.stdio[3] as NodeJS.EventEmitter | undefined);
     // 写密码到 fd=3,随后关闭,避免 ssh 等待更多输入
     const fd3 = child.stdio[3];
     if (!fd3 || !("write" in fd3)) {

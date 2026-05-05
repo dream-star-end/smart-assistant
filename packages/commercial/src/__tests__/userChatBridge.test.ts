@@ -18,6 +18,7 @@
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as http from "node:http";
+import * as net from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import { signAccess } from "../auth/jwt.js";
 import {
@@ -894,6 +895,65 @@ describe("userChatBridge — model authorization", () => {
       assert.equal(closed.code, CLOSE_BRIDGE.POLICY);
     } finally {
       await stopRig(rig);
+    }
+  });
+});
+
+// ------- regression: containerWs CONNECTING + earlyClose 不冒 fatal --------
+//
+// 历史:client 在 ensureRunning / resolve 慢 async 期间关闭后,bridge 走到
+// handleUpgrade 的 earlyClose !== null 分支调 `containerWs.terminate()`。如果
+// 此时 containerWs 还在 CONNECTING(socket 已连 TCP 但 ws handshake 没完成),
+// ws lib 会在异步回调里 throw "WebSocket was closed before the connection was
+// established" — 而 startBridge 里的正式 'error' handler 此时还没挂上,error
+// 升级成 process uncaughtException,把 v3 master gateway 整个搞崩。
+// 生产线上 /var/log/openclaude.log 自 2026-04-26 起累计 10 次同类崩溃。
+// 修复:在 createContainerSocket 之后立刻挂 named early 'error' handler。
+
+describe("userChatBridge — earlyClose during CONNECTING containerWs (regression)", () => {
+  test("client closes during slow resolve → containerWs.terminate() 不冒 uncaughtException", async () => {
+    // blackhole TCP server:接受 TCP 但永远不发 HTTP/ws upgrade 响应,让 ws
+    // 客户端无限期卡在 CONNECTING 状态(精确复现"CONNECTING 阶段 .terminate")。
+    const blackhole = await new Promise<net.Server>((resolve) => {
+      const s = net.createServer();
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const blackholePort = (blackhole.address() as net.AddressInfo).port;
+
+    // resolve 慢 200ms,留出窗口让 client 在 await 期间 close
+    const rig = await startRig({
+      resolve: async () => {
+        await new Promise((r) => setTimeout(r, 200));
+        return { host: "127.0.0.1", port: blackholePort };
+      },
+    });
+
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown): void => { uncaught.push(err); };
+    process.prependListener("uncaughtException", onUncaught);
+
+    try {
+      const token = await makeJwt("9999");
+      const ws = openClient(rig.gatewayPort, token);
+      // client open 后立刻 close,触发 onEarlyClose 写 earlyClose
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      ws.close();
+
+      // 等 resolve 完成(200ms) + createContainerSocket 创建 ws + earlyClose
+      // 路径调 .terminate() + ws 异步抛 "closed before connection established"
+      // + 错误事件派发 + 修复后的 named handler 接住。给足 600ms。
+      await new Promise((r) => setTimeout(r, 600));
+
+      assert.equal(
+        uncaught.length, 0,
+        `expected no uncaughtException, got: ${uncaught
+          .map((e) => (e as { message?: string })?.message ?? String(e))
+          .join(", ")}`,
+      );
+    } finally {
+      process.removeListener("uncaughtException", onUncaught);
+      await stopRig(rig);
+      await new Promise<void>((r) => blackhole.close(() => r()));
     }
   });
 });
