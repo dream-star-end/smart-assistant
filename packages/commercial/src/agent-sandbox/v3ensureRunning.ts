@@ -427,6 +427,53 @@ export function makeV3EnsureRunning(
         }
         throw new ContainerUnreadyError(RETRY_AFTER_IMAGE_MISSING_SEC, "image_missing");
       }
+      // v1.0.84 PR #4 — image label guard:image 在该 host 是有的(否则就是
+      // ImageNotFound 路径),但 labels 里缺 oc.runtime.features=v3-sink token。
+      // 行为镜像 ImageNotFound:critical alert + setQuarantined(image-mismatch
+      // hard reason),但**不**触发 promoteOnce —— 自动 promote 会重分发同一份
+      // 错 label 镜像,只会让告警更难排错;修复必须 ops 重 build & push。
+      if (err instanceof SupervisorError && err.code === "ImageOutdated") {
+        const hostId = placement?.hostId ?? "unknown-host";
+        let hostName: string = hostId;
+        if (placement?.hostId) {
+          try {
+            const row = await getHostById(placement.hostId);
+            if (row?.name) hostName = row.name;
+          } catch {
+            /* hostName fallback ok */
+          }
+        }
+        const imageRef = deps.image;
+        safeEnqueueAlert({
+          event_type: EVENTS.CONTAINER_PROVISION_FAILED,
+          severity: "critical",
+          title: `容器 provision 失败 — 镜像 label 过期 [${hostName}]`,
+          body:
+            `uid=${uid} 在 host=${hostName}(${hostId})上 provision 被 image guard 拒绝:` +
+            `${err.message}。需要 ops 重 build & push 包含 oc.runtime.features=v3-sink 的镜像。`,
+          payload: {
+            uid,
+            reason: "image_outdated",
+            host_id: hostId,
+            host_name: hostName,
+            image: imageRef,
+          },
+          dedupe_key: `container.provision_failed:image_outdated:${hostId}:${imageRef}:${new Date().toISOString().slice(0, 13)}`,
+        });
+        if (placement?.hostId) {
+          const operationId = randomUUID();
+          await setQuarantined(placement.hostId, {
+            reason: "image-mismatch",
+            detail: `image guard: ${err.message}`,
+            operationId,
+            actor: "system:v3ensureRunning",
+          }).catch(() => {
+            /* 静默吞;quarantine 失败不改控制流 */
+          });
+          // 故意不调 promoteOnce —— 见函数顶部注释。
+        }
+        throw new ContainerUnreadyError(RETRY_AFTER_IMAGE_MISSING_SEC, "image_outdated");
+      }
       // Codex R2 fix:CcbBaselineMissing 同为部署级故障 — baseline rsync 漏了
       // 或权限被改。走长重试避免风暴,留给运维修基线。
       if (err instanceof SupervisorError && err.code === "CcbBaselineMissing") {

@@ -197,6 +197,15 @@ type DockerBehavior = {
   inspectState?: "running" | "stopped" | "missing";
   /** 第 N 个 createContainer 抛(模拟 image missing) */
   createContainerThrow?: Error;
+  /**
+   * v1.0.84 PR #4 image guard:控制 `docker.getImage(tag).inspect()` 返回。
+   *   - undefined(默认)→ labels 含 `v3-sink` token,guard 透传
+   *   - {kind:"labels", labels} → 自定义 labels(放进 Config.Labels)
+   *   - {kind:"missing"}        → 抛 statusCode=404(image absent → guard 放行)
+   */
+  imageInspect?:
+    | { kind: "labels"; labels: Record<string, string> }
+    | { kind: "missing" };
 };
 
 type DockerCaptured = {
@@ -231,6 +240,24 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
         },
       }),
       remove: async () => { /* noop */ },
+    }),
+    // v1.0.84 PR #4 image guard:provisionV3Container 早于 BEGIN 调
+    // `docker.getImage(image).inspect()` 校验 oc.runtime.features=v3-sink。
+    // 默认 labels 含 v3-sink → 现有 ensureRunning 测试零修改穿透 guard。
+    getImage: (tag: string) => ({
+      inspect: async () => {
+        const beh = behavior.imageInspect;
+        if (beh?.kind === "missing") throw httpError(404, "No such image");
+        const labels =
+          beh?.kind === "labels"
+            ? beh.labels
+            : { "oc.runtime.features": "file-proxy-v1 v3-sink" };
+        return {
+          Id: "sha256:fakeimage",
+          RepoTags: [tag],
+          Config: { Labels: labels },
+        };
+      },
     }),
     createContainer: async () => {
       if (behavior.createContainerThrow) throw behavior.createContainerThrow;
@@ -435,6 +462,44 @@ describe("makeV3EnsureRunning", () => {
       assert.strictEqual(err.retryAfterSec, 300);
       return true;
     });
+  });
+
+  test("provision 失败(image guard ImageOutdated)→ ContainerUnreadyError('image_outdated', 300s) 且不发起 docker create", async () => {
+    // v1.0.84 PR #4 — caller-side contract lock(Codex code-review round-1 建议)。
+    // image labels 缺 oc.runtime.features=v3-sink → supervisor 抛 ImageOutdated;
+    // ensureRunning 翻成 reason='image_outdated' + 300s 长退避(对齐 image_missing 的
+    // 部署级故障语义,避免 5s 风暴)。同时 guard 在 BEGIN/createContainer 之前拒绝 →
+    // 不留 docker 副作用。setQuarantined / safeEnqueueAlert 是 best-effort fire-and-forget,
+    // 与 image_missing 测试一致不在此 unit 层 assert(归 integ)。
+    const pool = new FakePool();
+    const { docker, captured } = makeDocker({
+      imageInspect: { kind: "labels", labels: { "oc.runtime.features": "file-proxy-v1" } },
+    });
+    // 显式 enforce 防止 env 串扰
+    const prev = process.env.OC_V3_IMAGE_GUARD;
+    process.env.OC_V3_IMAGE_GUARD = "enforce";
+    try {
+      const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+        probeHealthz: async () => true,
+        probeWsUpgrade: async () => true,
+        sleep: noSleep,
+        now: fixedNow,
+      });
+
+      await assert.rejects(ensureRunning(212n), (err) => {
+        assert.ok(err instanceof ContainerUnreadyError);
+        assert.strictEqual(err.reason, "image_outdated");
+        assert.strictEqual(err.retryAfterSec, 300);
+        return true;
+      });
+      // guard 早于 docker create / BEGIN —— 不应有 docker 副作用,也不应留 active 行
+      assert.strictEqual(captured.containersCreated, 0);
+      assert.strictEqual(captured.started, 0);
+      assert.strictEqual(pool.rows.length, 0);
+    } finally {
+      if (prev === undefined) delete process.env.OC_V3_IMAGE_GUARD;
+      else process.env.OC_V3_IMAGE_GUARD = prev;
+    }
   });
 
   test("provision 失败(其他错)→ ContainerUnreadyError('provisioning', 5s)", async () => {

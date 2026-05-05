@@ -154,4 +154,9 @@ export type SupervisorErrorCode =
   // —— 协议违约。守门后 ROLLBACK 防止 agent_containers 行 commit 时 container_internal_id
   // 为 NULL,继而被 getV3ContainerStatus 视作 "stopped" 卡住用户死循环重连。
   | "RemoteContractViolation"
+  // v1.0.84 PR #4(image guard):provision 前置校验 image labels 缺
+  // `oc.runtime.features=v3-sink`(supply-chain guard,防 label 错的镜像被 spawn
+  // 后悄悄丢 server-authored 文本)。v3ensureRunning 翻成 setQuarantined
+  // (image-mismatch hard) + ContainerUnreadyError("image_outdated") + critical alert。
+  | "ImageOutdated"
   | "Unknown";

@@ -59,6 +59,8 @@ type DockerCaptured = {
   stopped: number;
   removed: number;
   inspected: number;
+  /** v1.0.84 PR #4 image guard:统计 docker.getImage(tag).inspect() 调用次数(monolith fallback 路径)。 */
+  imageInspected: number;
 };
 
 type DockerBehavior = {
@@ -66,6 +68,19 @@ type DockerBehavior = {
   startFails?: boolean;
   inspectMissing?: boolean;
   inspectRunning?: boolean;
+  /**
+   * v1.0.84 PR #4 image guard 测试用:控制 monolith fallback 路径下
+   * `docker.getImage(tag).inspect()` 的返回值。
+   *   - undefined(默认)→ 返回 `{Config:{Labels:{"oc.runtime.features":"file-proxy-v1 v3-sink"}}}`,
+   *     让所有不显式关心 guard 的现有测试默认通过校验
+   *   - {kind:"labels", labels} → 返指定 labels(放进 Config.Labels)
+   *   - {kind:"missing"}        → 抛 statusCode=404(模拟 image absent)
+   *   - {kind:"throw", err}     → 抛指定错误(模拟 daemon down)
+   */
+  imageInspect?:
+    | { kind: "labels"; labels: Record<string, string> }
+    | { kind: "missing" }
+    | { kind: "throw"; err: Error };
 };
 
 function httpError(code: number, msg: string): Error {
@@ -82,6 +97,7 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
     stopped: 0,
     removed: 0,
     inspected: 0,
+    imageInspected: 0,
   };
 
   const createVolume = async (opts: { Name?: string; Labels?: Record<string, string>; Driver?: string }) => {
@@ -135,11 +151,34 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
     },
   });
 
+  // v1.0.84 PR #4 image guard:provisionV3Container 在 BEGIN 前会调
+  // `docker.getImage(image).inspect()`(facade 未注入时的 monolith fallback)。
+  // 默认 labels 包含 v3-sink → 现有测试零修改即通过 guard;behavior.imageInspect
+  // 显式给定 → 单测精确控制 guard 走哪个分支。
+  const getImage = (_tag: string) => ({
+    inspect: async () => {
+      captured.imageInspected++;
+      const beh = behavior.imageInspect;
+      if (beh?.kind === "throw") throw beh.err;
+      if (beh?.kind === "missing") throw httpError(404, "No such image");
+      const labels =
+        beh?.kind === "labels"
+          ? beh.labels
+          : { "oc.runtime.features": "file-proxy-v1 v3-sink" };
+      return {
+        Id: "sha256:fakeimage",
+        RepoTags: [_tag],
+        Config: { Labels: labels },
+      } as unknown as Awaited<ReturnType<ReturnType<Docker["getImage"]>["inspect"]>>;
+    },
+  });
+
   const docker = {
     createVolume,
     getVolume: getVolume as unknown as Docker["getVolume"],
     createContainer,
     getContainer,
+    getImage: getImage as unknown as Docker["getImage"],
   } as unknown as Docker;
 
   return { docker, captured };
@@ -852,6 +891,13 @@ describe("stopAndRemoveV3Container", () => {
         calls.push({ op: "remove", hostId, cid });
       },
       inspect: async () => { throw new Error("inspect should not be called"); },
+      // v1.0.84 PR #4 image guard:facade 默认返带 v3-sink token,let stopAndRemove
+      // 系列测试不被 guard 拦下来(本 helper 给 stopAndRemove 路径用,not provision)。
+      inspectImage: async () => ({
+        id: "sha256:fakeimage",
+        repoTags: ["openclaude/openclaude-runtime:test"],
+        labels: { "oc.runtime.features": "file-proxy-v1 v3-sink" },
+      }),
       isRemote: async () => true,
       resolveBaselinePaths: async () => ({ baseDir: "/tmp/baseline-not-used" }),
     };
@@ -2215,6 +2261,13 @@ describe("provisionV3Container — RemoteContractViolation 守门(v1.0.8)", () =
       inspect: async () => {
         throw new Error("unused in test");
       },
+      // v1.0.84 PR #4 image guard:默认 labels 含 v3-sink → 这些 RemoteContractViolation
+      // 用例不被 guard 拦,继续验证原 createAndStart 协议。
+      inspectImage: async () => ({
+        id: "sha256:fakeimage",
+        repoTags: [TEST_IMAGE],
+        labels: { "oc.runtime.features": "file-proxy-v1 v3-sink" },
+      }),
       isRemote: async () => true,
       resolveBaselinePaths: async () => ({
         claudeMdHostPath: "/var/lib/openclaude/baseline/CLAUDE.md",
@@ -2367,6 +2420,13 @@ describe("provisionV3Container — per-host bridge gateway env injection", () =>
       inspect: async () => {
         throw new Error("unused in test");
       },
+      // v1.0.84 PR #4 image guard:默认 labels 含 v3-sink → remote-spec 测试不被
+      // guard 拦,继续验证 ContainerSpec 装配。
+      inspectImage: async () => ({
+        id: "sha256:fakeimage",
+        repoTags: [TEST_IMAGE],
+        labels: { "oc.runtime.features": "file-proxy-v1 v3-sink" },
+      }),
       isRemote: async () => true,
       resolveBaselinePaths: async () => ({
         claudeMdHostPath: "/var/lib/openclaude/baseline/CLAUDE.md",
@@ -2511,5 +2571,467 @@ describe("provisionV3Container — per-host bridge gateway env injection", () =>
     // 不能进到 createAndStart
     assert.equal(captured.spec, undefined);
     assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  v1.0.84 PR #4 — image label guard(supply-chain check before docker create)
+//
+//  覆盖目的:guard 进 BEGIN 前必须 inspectImage,labels 缺
+//  oc.runtime.features=v3-sink 直接拒 provision。模式 enforce/warn/off。
+//  错误归一化契约:inspectImage 自身抛 → wrapDockerError;ImageOutdated
+//  SupervisorError pass-through 到 v3ensureRunning。
+// ───────────────────────────────────────────────────────────────────────
+
+describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
+  let pool: FakePool;
+  let prevOptional: string | undefined;
+  let prevGuard: string | undefined;
+
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
+
+  beforeEach(() => {
+    pool = new FakePool();
+    prevGuard = process.env.OC_V3_IMAGE_GUARD;
+  });
+
+  function restoreGuardEnv() {
+    if (prevGuard === undefined) delete process.env.OC_V3_IMAGE_GUARD;
+    else process.env.OC_V3_IMAGE_GUARD = prevGuard;
+  }
+
+  /** 简化的 facade stub:只关心 inspectImage 行为,其它方法没用上。 */
+  function makeFacadeWithInspectImage(
+    impl: () => Promise<{ id: string; repoTags: string[]; labels: Record<string, string> } | null>,
+    counters: { inspectImageCalls: number },
+  ) {
+    return {
+      ensureVolume: async () => undefined,
+      removeVolume: async () => undefined,
+      inspectVolume: async () => ({ exists: true }),
+      createAndStart: async () => ({ containerInternalId: "remote-cid-x" }),
+      stop: async () => undefined,
+      remove: async () => undefined,
+      inspect: async () => {
+        throw new Error("inspect should not be called by guard");
+      },
+      inspectImage: async () => {
+        counters.inspectImageCalls++;
+        return impl();
+      },
+      isRemote: async () => true,
+      resolveBaselinePaths: async () => ({
+        claudeMdHostPath: "/var/lib/openclaude/baseline/CLAUDE.md",
+        skillsDirHostPath: "/var/lib/openclaude/baseline/skills",
+      }),
+    };
+  }
+
+  // ─── monolith fallback 路径(deps.containerService 未注入时走 docker.getImage)──
+
+  test("monolith fallback + features 含 v3-sink → provision 正常,docker.getImage 被调 1 次", async () => {
+    try {
+      const { docker, captured } = makeDocker({
+        imageInspect: { kind: "labels", labels: { "oc.runtime.features": "file-proxy-v1 v3-sink" } },
+      });
+      delete process.env.OC_V3_IMAGE_GUARD; // 默认 enforce
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          randomIp: () => "172.30.7.1",
+          randomSecret: fixedSecret("a".repeat(64)),
+        },
+        9001,
+      );
+      assert.equal(captured.imageInspected, 1, "guard 必须 inspect image 一次");
+      assert.equal(captured.containersCreated.length, 1, "image 合规 → docker create 走通");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("enforce + features 缺 v3-sink → SupervisorError code=ImageOutdated;无 BEGIN/INSERT/createContainer 副作用", async () => {
+    try {
+      const { docker, captured } = makeDocker({
+        imageInspect: { kind: "labels", labels: { "oc.runtime.features": "file-proxy-v1" } },
+      });
+      delete process.env.OC_V3_IMAGE_GUARD;
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          {
+            docker,
+            pool: pool as unknown as Pool,
+            image: TEST_IMAGE,
+            randomIp: () => "172.30.7.2",
+            randomSecret: fixedSecret("b".repeat(64)),
+          },
+          9002,
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught, "expected ImageOutdated throw");
+      assert.ok(caught instanceof SupervisorError);
+      assert.equal((caught as SupervisorError).code, "ImageOutdated");
+      // detail 必须含 image / 实际 features 值,方便运维定位
+      assert.match(caught!.message, /image=openclaude\/openclaude-runtime:test/);
+      assert.match(caught!.message, /v3-sink/);
+      // 副作用:guard 抛在 BEGIN 之前,pool.connect 都没被调
+      assert.equal(pool.clientLog.length, 0, "guard 必须早于 BEGIN,pool 不应有事务记录");
+      assert.equal(captured.volumesCreated.length, 0, "无 volume 创建");
+      assert.equal(captured.containersCreated.length, 0, "无 container 创建");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("enforce + 完全无 oc.runtime.features key → ImageOutdated", async () => {
+    try {
+      const { docker } = makeDocker({
+        imageInspect: { kind: "labels", labels: {} },
+      });
+      delete process.env.OC_V3_IMAGE_GUARD;
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.3", randomSecret: fixedSecret("c".repeat(64)) },
+          9003,
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught instanceof SupervisorError);
+      assert.equal((caught as SupervisorError).code, "ImageOutdated");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("enforce + features 是 v3-sink-extra(子串非 token)→ ImageOutdated", async () => {
+    try {
+      const { docker } = makeDocker({
+        imageInspect: { kind: "labels", labels: { "oc.runtime.features": "v3-sink-extra" } },
+      });
+      delete process.env.OC_V3_IMAGE_GUARD;
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.4", randomSecret: fixedSecret("d".repeat(64)) },
+          9004,
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught instanceof SupervisorError);
+      assert.equal((caught as SupervisorError).code, "ImageOutdated", "v3-sink-extra 是子串,token 整体匹配应拒绝");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("enforce + getImage().inspect() 抛 statusCode=404(image absent)→ guard 放行;后续撞 ImageNotFound 走原路径", async () => {
+    try {
+      const { docker } = makeDocker({
+        imageMissing: true, // createContainer 那条线也会抛 404
+        imageInspect: { kind: "missing" }, // guard 这条线也得到 404
+      });
+      delete process.env.OC_V3_IMAGE_GUARD;
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.5", randomSecret: fixedSecret("e".repeat(64)) },
+          9005,
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught instanceof SupervisorError);
+      assert.equal(
+        (caught as SupervisorError).code,
+        "ImageNotFound",
+        "guard 不抢 ImageNotFound 路径",
+      );
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("enforce + getImage().inspect() 抛 generic Error → 透 wrapDockerError,非 ImageOutdated", async () => {
+    try {
+      const { docker, captured } = makeDocker({
+        imageInspect: { kind: "throw", err: new Error("daemon down") },
+      });
+      delete process.env.OC_V3_IMAGE_GUARD;
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.6", randomSecret: fixedSecret("f".repeat(64)) },
+          9006,
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      // round-2 Codex 建议:不硬绑具体 code,锁住 SupervisorError + 非 ImageOutdated。
+      assert.ok(caught instanceof SupervisorError, "generic Error 必须被 wrapDockerError 归一化");
+      assert.notEqual(
+        (caught as SupervisorError).code,
+        "ImageOutdated",
+        "daemon down 不应被误标成 ImageOutdated",
+      );
+      assert.equal(captured.containersCreated.length, 0);
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("warn 模式 + features 缺 v3-sink → console.warn 一次,provision 仍成功", async () => {
+    try {
+      const { docker, captured } = makeDocker({
+        imageInspect: { kind: "labels", labels: { "oc.runtime.features": "file-proxy-v1" } },
+      });
+      process.env.OC_V3_IMAGE_GUARD = "warn";
+
+      const warns: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (...args: unknown[]) => {
+        warns.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+      };
+      try {
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.7", randomSecret: fixedSecret("0".repeat(64)) },
+          9007,
+        );
+      } finally {
+        console.warn = origWarn;
+      }
+      // 别的路径(codex account binding 等)也会触发 console.warn,只筛 guard 相关一条。
+      const guardWarns = warns.filter((w) => /image guard FAIL but mode=warn/.test(w));
+      assert.equal(guardWarns.length, 1, "warn 模式应触发一次 image-guard 专属 console.warn");
+      assert.match(guardWarns[0]!, /image=openclaude\/openclaude-runtime:test/);
+      assert.match(guardWarns[0]!, /file-proxy-v1/);
+      assert.equal(captured.containersCreated.length, 1, "warn 模式必须放行 provision");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("off 模式 → guard 完全 short-circuit,docker.getImage 不被调", async () => {
+    try {
+      const { docker, captured } = makeDocker({
+        // 故意给一个 guard 会拒的 labels — off 模式下根本不应被读
+        imageInspect: { kind: "labels", labels: { "oc.runtime.features": "file-proxy-v1" } },
+      });
+      process.env.OC_V3_IMAGE_GUARD = "off";
+      await provisionV3Container(
+        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.8", randomSecret: fixedSecret("1".repeat(64)) },
+        9008,
+      );
+      assert.equal(captured.imageInspected, 0, "off 模式不应触发 docker.getImage");
+      assert.equal(captured.containersCreated.length, 1, "provision 应通过");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("默认值(env 未设)= enforce → 缺 v3-sink 仍抛 ImageOutdated", async () => {
+    try {
+      const { docker } = makeDocker({
+        imageInspect: { kind: "labels", labels: { "oc.runtime.features": "file-proxy-v1" } },
+      });
+      delete process.env.OC_V3_IMAGE_GUARD;
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.9", randomSecret: fixedSecret("2".repeat(64)) },
+          9009,
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught instanceof SupervisorError);
+      assert.equal((caught as SupervisorError).code, "ImageOutdated");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("非法值(env=garbage)走 enforce 默认 → 缺 v3-sink 抛 ImageOutdated", async () => {
+    try {
+      const { docker } = makeDocker({
+        imageInspect: { kind: "labels", labels: { "oc.runtime.features": "file-proxy-v1" } },
+      });
+      process.env.OC_V3_IMAGE_GUARD = "yes-please-skip";
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.10", randomSecret: fixedSecret("3".repeat(64)) },
+          9010,
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught instanceof SupervisorError);
+      assert.equal((caught as SupervisorError).code, "ImageOutdated", "非法 env 必须 fail-closed");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  // ─── facade 路径(useRemote=true,走 containerService.inspectImage)────
+
+  const SELF_HOST = "00000000-0000-0000-0000-00000000aaaa";
+  const REMOTE_HOST = "00000000-0000-0000-0000-00000000bbbb";
+
+  test("facade 路径 + features 含 v3-sink → 走 containerService.inspectImage,docker.getImage 不被触", async () => {
+    try {
+      const { docker, captured } = makeDocker();
+      const counters = { inspectImageCalls: 0 };
+      const cs = makeFacadeWithInspectImage(
+        async () => ({
+          id: "sha256:remote-fake",
+          repoTags: [TEST_IMAGE],
+          labels: { "oc.runtime.features": "file-proxy-v1 v3-sink" },
+        }),
+        counters,
+      );
+      delete process.env.OC_V3_IMAGE_GUARD;
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          containerService: cs as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+          selfHostId: SELF_HOST,
+          randomIp: () => "172.30.42.1",
+          randomSecret: fixedSecret("4".repeat(64)),
+        },
+        9011,
+        REMOTE_HOST,
+        undefined,
+        "172.30.42.0/24",
+      );
+      assert.equal(counters.inspectImageCalls, 1, "facade 路径应调 containerService.inspectImage 一次");
+      assert.equal(captured.imageInspected, 0, "facade 路径绝不能 fallback 到本机 docker.getImage");
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("facade 路径 + features 缺 v3-sink → ImageOutdated;detail 含 resolved hostId(非 'self')", async () => {
+    try {
+      const { docker, captured } = makeDocker();
+      const counters = { inspectImageCalls: 0 };
+      const cs = makeFacadeWithInspectImage(
+        async () => ({
+          id: "sha256:remote-fake",
+          repoTags: [TEST_IMAGE],
+          labels: { "oc.runtime.features": "file-proxy-v1" },
+        }),
+        counters,
+      );
+      delete process.env.OC_V3_IMAGE_GUARD;
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          {
+            docker,
+            pool: pool as unknown as Pool,
+            image: TEST_IMAGE,
+            containerService: cs as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+            selfHostId: SELF_HOST,
+            randomIp: () => "172.30.42.2",
+            randomSecret: fixedSecret("5".repeat(64)),
+          },
+          9012,
+          REMOTE_HOST,
+          undefined,
+          "172.30.42.0/24",
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught instanceof SupervisorError);
+      assert.equal((caught as SupervisorError).code, "ImageOutdated");
+      // round-2 Codex 建议:detail 用 resolved host id(传入的 hostId,非 selfHostId)
+      assert.match(caught!.message, new RegExp(`host=${REMOTE_HOST}`));
+      assert.equal(captured.containersCreated.length, 0);
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("facade 路径 + inspectImage 返 null(image absent)→ guard 放行(不抢 ImageNotFound)", async () => {
+    try {
+      const { docker } = makeDocker();
+      const counters = { inspectImageCalls: 0 };
+      const cs = makeFacadeWithInspectImage(async () => null, counters);
+      delete process.env.OC_V3_IMAGE_GUARD;
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          containerService: cs as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+          selfHostId: SELF_HOST,
+          randomIp: () => "172.30.42.3",
+          randomSecret: fixedSecret("6".repeat(64)),
+        },
+        9013,
+        REMOTE_HOST,
+        undefined,
+        "172.30.42.0/24",
+      );
+      assert.equal(counters.inspectImageCalls, 1);
+      assert.ok(pool.clientLog.includes("BEGIN"));
+      assert.ok(pool.clientLog.includes("COMMIT"));
+    } finally {
+      restoreGuardEnv();
+    }
+  });
+
+  test("facade 路径 + inspectImage 抛 generic Error → wrapDockerError,非 ImageOutdated", async () => {
+    try {
+      const { docker, captured } = makeDocker();
+      const counters = { inspectImageCalls: 0 };
+      const cs = makeFacadeWithInspectImage(async () => {
+        throw new Error("agent connection refused");
+      }, counters);
+      delete process.env.OC_V3_IMAGE_GUARD;
+      let caught: Error | undefined;
+      try {
+        await provisionV3Container(
+          {
+            docker,
+            pool: pool as unknown as Pool,
+            image: TEST_IMAGE,
+            containerService: cs as unknown as Parameters<typeof provisionV3Container>[0]["containerService"],
+            selfHostId: SELF_HOST,
+            randomIp: () => "172.30.42.4",
+            randomSecret: fixedSecret("7".repeat(64)),
+          },
+          9014,
+          REMOTE_HOST,
+          undefined,
+          "172.30.42.0/24",
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught instanceof SupervisorError);
+      assert.notEqual((caught as SupervisorError).code, "ImageOutdated");
+      assert.equal(captured.containersCreated.length, 0);
+    } finally {
+      restoreGuardEnv();
+    }
   });
 });

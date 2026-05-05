@@ -885,6 +885,110 @@ export function wrapDockerError(err: unknown): SupervisorError {
   return new SupervisorError("Unknown", message, { statusCode, message });
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// v1.0.84 PR #4 — image label guard(supply-chain check before docker create)
+// ───────────────────────────────────────────────────────────────────────
+
+/**
+ * 镜像 label 必含的 feature token。runtime gateway 若没把 server-authored 文本
+ * 的 HTTP sink 编进去(`v3MasterSink.ts` 模块缺失或被 build 漏选),容器表面正常
+ * 跑但每个 codex turn 的权威文本都会通过老 durable session 路径丢失。该 label
+ * 由 image build 时显式打入(scripts/v3-image-attest.ts 校验也用同一 token),
+ * provision 前 inspect image 校验 → guard 闭环。
+ */
+const V3_RUNTIME_REQUIRED_FEATURE = "v3-sink";
+
+type V3ImageGuardMode = "enforce" | "warn" | "off";
+
+function readV3ImageGuardMode(): V3ImageGuardMode {
+  const raw = (process.env.OC_V3_IMAGE_GUARD ?? "").trim().toLowerCase();
+  if (raw === "warn") return "warn";
+  if (raw === "off") return "off";
+  // 默认 + 任何非法值 → enforce(fail-closed)。
+  return "enforce";
+}
+
+/**
+ * provision 前置 guard:确保即将 spawn 的 image 带 oc.runtime.features=v3-sink。
+ *
+ * 错误归一化契约(round-1 Codex 锁定):
+ *   - label 缺 token → throw `SupervisorError("ImageOutdated", …)`。caller 在
+ *     v3ensureRunning 按 code 分流,setQuarantined(host, image-mismatch) +
+ *     ContainerUnreadyError("image_outdated")。
+ *   - inspectImage 抛(daemon down / mTLS / 旧 agent 无路由)→ 透 wrapDockerError,
+ *     行为与"docker create 撞同样故障"一致。wrapDockerError 已 SupervisorError
+ *     pass-through,所以本函数自己抛 ImageOutdated 也会原样穿出。
+ *   - inspectImage 返 null(image 真不存在)→ guard 放行,后续 docker create
+ *     撞 ImageNotFound 走原 runtime-image-missing 路径,本 guard 不抢。
+ *
+ * 调用时机:`provisionV3Container` 内,**早于** `deps.pool.connect()` / BEGIN /
+ * 任何 docker 副作用。早 fail 避免持 per-uid + host-cap 双锁。
+ *
+ * 模式由 env `OC_V3_IMAGE_GUARD` 控制:
+ *   - `enforce`(默认 / 任何非法值)→ 缺 token 抛错
+ *   - `warn`     → 缺 token console.warn 后放行,留给 ops 跟进
+ *   - `off`      → guard 完全 short-circuit(本机 dev 或一次性绕过)
+ */
+async function assertImageHasV3Sink(
+  deps: V3SupervisorDeps,
+  hostId: string | undefined,
+  image: string,
+): Promise<void> {
+  const mode = readV3ImageGuardMode();
+  if (mode === "off") return;
+
+  // resolve 出实际拿来 inspect / 写日志的 host 标识,保证 inspect 与 detail 文案
+  // 永远引用同一个值(round-2 Codex 建议:避免日志里 inspect host 跟报错 host 错位)。
+  const resolvedHost = hostId ?? deps.selfHostId ?? "self";
+
+  let labels: Record<string, string> | null;
+  try {
+    if (deps.containerService) {
+      // facade 路由(remote/self 都走它,内部按 isRemote 分流)
+      const inspected = await deps.containerService.inspectImage(resolvedHost, image);
+      labels = inspected === null ? null : (inspected.labels ?? {});
+    } else {
+      // 无 facade(纯单机 dev / 单测无 pool 路径)→ 直接 dockerode
+      try {
+        const info = (await deps.docker.getImage(image).inspect()) as {
+          Config?: { Labels?: Record<string, string> | null };
+        };
+        labels = info.Config?.Labels ?? {};
+      } catch (err) {
+        if ((err as { statusCode?: number } | null)?.statusCode === 404) {
+          labels = null;
+        } else {
+          throw err;
+        }
+      }
+    }
+  } catch (err) {
+    throw wrapDockerError(err);
+  }
+  if (labels === null) return; // image absent — 让 ImageNotFound 路径接管
+
+  const featuresRaw = (labels["oc.runtime.features"] ?? "").trim();
+  const features = featuresRaw ? featuresRaw.split(/\s+/) : [];
+  if (features.includes(V3_RUNTIME_REQUIRED_FEATURE)) return;
+
+  const detail =
+    `image=${image} host=${resolvedHost} ` +
+    `oc.runtime.features=${JSON.stringify(featuresRaw)} ` +
+    `(need token=${V3_RUNTIME_REQUIRED_FEATURE})`;
+
+  if (mode === "warn") {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[v3supervisor] image guard FAIL but mode=warn, allowing provision: ${detail}`,
+    );
+    return;
+  }
+  throw new SupervisorError(
+    "ImageOutdated",
+    `runtime image missing required feature label: ${detail}`,
+  );
+}
+
 function isNotFound(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   // dockerode 抛 `{ statusCode: 404 }`;远端 RemoteNodeAgentBackend 走
@@ -1187,6 +1291,11 @@ export async function provisionV3Container(
       && deps.maxRunningContainers > 0
       ? deps.maxRunningContainers
       : readMaxRunningContainersFromEnv();
+
+  // v1.0.84 PR #4 — supply-chain guard:provision 之前先 inspect image labels,
+  // 缺 v3-sink token 直接抛 ImageOutdated。早于 BEGIN / docker create,失败不留
+  // 半事务和 docker 副作用。模式 OC_V3_IMAGE_GUARD ∈ enforce/warn/off,缺省 enforce。
+  await assertImageHasV3Sink(deps, hostId, deps.image);
 
   const client = await deps.pool.connect();
   let row: { id: number; boundIp: string };
