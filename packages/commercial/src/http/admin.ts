@@ -1248,7 +1248,8 @@ export async function handleAdminDeleteAccount(
 }
 
 // ─── POST /api/admin/accounts/:id/reset-cooldown (R3) ─────────────
-// 清空 cooldown_until + last_error;status 不动(见 accounts.ts 说明)。
+// status='cooldown' 时把账号恢复到 active+health=50,清 cooldown_until +
+// last_error;其他 status 只清 cooldown_until + last_error(详见 accounts.ts)。
 export async function handleAdminResetAccountCooldown(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1256,6 +1257,9 @@ export async function handleAdminResetAccountCooldown(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  if (!deps.accountHealth) {
+    throw new HttpError(503, "ACCOUNT_HEALTH_NOT_CONFIGURED", "accountHealth not injected");
+  }
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   // URL 形如 /api/admin/accounts/:id/reset-cooldown;把 ":id" 抠出来
   const m = url.pathname.match(/^\/api\/admin\/accounts\/([1-9][0-9]{0,19})\/reset-cooldown$/);
@@ -1264,7 +1268,7 @@ export async function handleAdminResetAccountCooldown(
   try {
     const a = await adminResetCooldown(id, {
       adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent,
-    });
+    }, deps.accountHealth);
     const poolLabels = await fetchEgressProxyLabels([a]);
     sendJson(res, 200, { account: serializeAccount(a, poolLabels) });
   } catch (err) {

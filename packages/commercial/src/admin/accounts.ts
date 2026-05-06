@@ -50,6 +50,7 @@ import { incrAdminAuditWriteFailure } from "./metrics.js";
 import {
   reassignEgressHost,
 } from "../account-pool/egressAssignment.js";
+import type { AccountHealthTracker } from "../account-pool/health.js";
 
 // getPool 已在文件顶部 import,不重复
 
@@ -456,33 +457,72 @@ export async function adminPatchAccount(
 
 // ─── Reset cooldown ───────────────────────────────────────────────
 //
-// R3:accounts tab 快捷动作。把 `cooldown_until` + `last_error` 清掉,让
-// scheduler 下一轮能重新选择该账号。不动 status、不动 oauth_token;如果 status
-// 也需要从 'cooldown' 回到 'active',admin 需要另走 patch(故意不偷偷改 status,
-// 避免 "reset cooldown" 无感恢复已被人工 disabled 的账号)。
+// R3:accounts tab 快捷动作。语义"释放冷却",目标:让 scheduler 下一轮能重新
+// 选到这个账号。
 //
-// 审计:action='account.reset_cooldown',before 记旧 cooldown_until + last_error。
+// 历史 bug(2026-05-06):旧版只清 `cooldown_until` + `last_error`,**故意不动
+// status**(担心覆盖人工 disabled 的账号)。但这造成了 `status='cooldown' ∧
+// cooldown_until=NULL` 的不可恢复中间态 —— halfOpen 的 SQL 有 `cooldown_until
+// IS NOT NULL` 守卫,永远扫不到这种行,scheduler 又只选 `status='active'`,
+// 账号永久卡死。
+//
+// 修复:**只在 status='cooldown' 时,把 status 一并恢复成 active**,通过
+// `health.recoverFromCooldown(id)` 复用 halfOpen 同款语义(active+health=50,
+// Redis healthKey=50+failKey 清)。disabled / banned / 已是 active 的账号原样
+// 保留 status,只清 cooldown_until + last_error —— 守住"不偷偷救人工 disabled"
+// 的原意,同时关掉永久卡死路径。
+//
+// 审计:action='account.reset_cooldown',before/after 只记**实际改了的**字段
+// (cooldown_until / last_error 总是带,status / health_score 仅在 cooldown 分支带)。
 export async function adminResetCooldown(
   id: bigint | string,
   ctx: AdminAuditCtx,
+  health: AccountHealthTracker,
 ): Promise<AccountRow> {
   const before = await storeGet(id);
   if (!before) throw new AccountNotFoundError(id);
-  const after = await storeUpdate(id, { cooldown_until: null, last_error: null });
+
+  let after: AccountRow | null;
+  if (before.status === "cooldown") {
+    // recoverFromCooldown 内部已 SET status='active' + health_score=50 +
+    // cooldown_until=NULL + 写 Redis;再补一发 storeUpdate 单清 last_error
+    // (recoverFromCooldown 不动 last_error,语义更纯)。
+    const recovered = await health.recoverFromCooldown(id);
+    if (!recovered) {
+      // 极少:before/recover 之间状态被改,例如另一管理员同时 patch 成 disabled。
+      // 退回原"只清两字段"路径,保留对方变更;语义=幂等。
+      after = await storeUpdate(id, { cooldown_until: null, last_error: null });
+    } else {
+      after = await storeUpdate(id, { last_error: null });
+    }
+  } else {
+    after = await storeUpdate(id, { cooldown_until: null, last_error: null });
+  }
   if (!after) throw new AccountNotFoundError(id);
+
+  const auditBefore: Record<string, unknown> = {
+    cooldown_until: before.cooldown_until?.toISOString() ?? null,
+    last_error: before.last_error,
+  };
+  const auditAfter: Record<string, unknown> = {
+    cooldown_until: null,
+    last_error: null,
+  };
+  if (before.status !== after.status) {
+    auditBefore.status = before.status;
+    auditAfter.status = after.status;
+  }
+  if (before.health_score !== after.health_score) {
+    auditBefore.health_score = before.health_score;
+    auditAfter.health_score = after.health_score;
+  }
 
   await bestEffortAudit(
     ctx,
     "account.reset_cooldown",
     `account:${String(id)}`,
-    {
-      cooldown_until: before.cooldown_until?.toISOString() ?? null,
-      last_error: before.last_error,
-    },
-    {
-      cooldown_until: null,
-      last_error: null,
-    },
+    auditBefore,
+    auditAfter,
   );
   return after;
 }

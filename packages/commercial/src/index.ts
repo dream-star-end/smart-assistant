@@ -1104,6 +1104,10 @@ export async function registerCommercial(
     pricing,
     // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
     preCheckRedis,
+    // 2026-05-06:admin reset-cooldown 修 bug 时新接的依赖。adminResetCooldown
+    // 在 status='cooldown' 时调 health.recoverFromCooldown 把账号一并 active+50
+    // (避免 cooldown_until=NULL ∧ status='cooldown' 的永久卡死)。
+    accountHealth: healthTracker,
     hupijiao,
     hupijiaoConfig,
     agentRuntime,

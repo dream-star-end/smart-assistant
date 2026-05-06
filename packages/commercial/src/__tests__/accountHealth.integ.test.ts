@@ -36,6 +36,7 @@ import {
   InMemoryHealthRedis,
   healthKey,
   failKey,
+  type HealthRedis,
 } from "../account-pool/health.js";
 
 const TEST_DB_URL =
@@ -296,6 +297,129 @@ describe("halfOpen", () => {
     assert.equal(r1.length, 1);
     const r2 = await tracker.halfOpen();
     assert.equal(r2.length, 0);
+  });
+});
+
+describe("recoverFromCooldown", () => {
+  test("status='cooldown' + cooldown_until=future → active+50 + Redis 写入 + failKey 清", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await freshAccount();
+    await updateAccount(id, {
+      status: "cooldown",
+      health_score: 30,
+      cooldown_until: new Date(Date.now() + 60_000),
+      last_error: "kept",
+    }, keyFn);
+    const redis = new InMemoryHealthRedis();
+    await redis.set(failKey(id), "9"); // 旧脏 fail counter
+    const tracker = new AccountHealthTracker({ redis });
+    const h = await tracker.recoverFromCooldown(id);
+    assert.ok(h);
+    assert.equal(h.status, "active");
+    assert.equal(h.health_score, 50);
+    assert.equal(h.cooldown_until, null);
+    const a = await getAccount(id);
+    assert.equal(a!.status, "active");
+    assert.equal(a!.health_score, 50);
+    assert.equal(a!.cooldown_until, null);
+    // 不动 last_error,留给 admin 层显式清
+    assert.equal(a!.last_error, "kept");
+    assert.equal(await redis.get(healthKey(id)), "50");
+    assert.equal(await redis.get(failKey(id)), null);
+  });
+
+  test("事故复现 — status='cooldown' + cooldown_until=NULL → active+50(halfOpen 救不回的卡死状态)", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await freshAccount();
+    // 模拟旧 adminResetCooldown 留下的卡死状态
+    await updateAccount(id, {
+      status: "cooldown",
+      health_score: 50,
+      cooldown_until: null,
+    }, keyFn);
+    // halfOpen 永远扫不到这种行
+    const redis = new InMemoryHealthRedis();
+    const tracker = new AccountHealthTracker({ redis });
+    assert.deepEqual(await tracker.halfOpen(), []);
+    // recoverFromCooldown 必须救得回
+    const h = await tracker.recoverFromCooldown(id);
+    assert.ok(h);
+    assert.equal(h.status, "active");
+    assert.equal(h.health_score, 50);
+    const a = await getAccount(id);
+    assert.equal(a!.status, "active");
+    assert.equal(await redis.get(healthKey(id)), "50");
+  });
+
+  test("status='active' → 返 null,无副作用(DB + Redis 不变)", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await freshAccount();
+    const redis = new InMemoryHealthRedis();
+    await redis.set(healthKey(id), "77");
+    const tracker = new AccountHealthTracker({ redis });
+    const h = await tracker.recoverFromCooldown(id);
+    assert.equal(h, null);
+    const a = await getAccount(id);
+    assert.equal(a!.status, "active");
+    assert.equal(a!.health_score, 100);
+    assert.equal(await redis.get(healthKey(id)), "77"); // 不被 set 覆盖成 50
+  });
+
+  test("status='disabled' → 返 null,status / cooldown_until / health 都不变", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await freshAccount();
+    await updateAccount(id, {
+      status: "disabled",
+      health_score: 0,
+      cooldown_until: new Date(Date.now() + 60_000),
+    }, keyFn);
+    const redis = new InMemoryHealthRedis();
+    const tracker = new AccountHealthTracker({ redis });
+    const h = await tracker.recoverFromCooldown(id);
+    assert.equal(h, null);
+    const a = await getAccount(id);
+    assert.equal(a!.status, "disabled");
+    assert.equal(a!.health_score, 0);
+    assert.notEqual(a!.cooldown_until, null);
+    assert.equal(await redis.get(healthKey(id)), null); // 不被写
+  });
+
+  test("不存在的 id → 返 null,Redis 不被写", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const redis = new InMemoryHealthRedis();
+    const tracker = new AccountHealthTracker({ redis });
+    const h = await tracker.recoverFromCooldown(999_999n);
+    assert.equal(h, null);
+    assert.deepEqual(redis.snapshot(), {});
+  });
+
+  test("Redis 写入失败时 best-effort 不抛(DB 状态权威,避免 admin 重试卡 active 分支)", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await freshAccount();
+    await updateAccount(id, {
+      status: "cooldown",
+      health_score: 30,
+      cooldown_until: new Date(Date.now() + 60_000),
+    }, keyFn);
+    // 模拟 Redis 整体不可用 — set + del 都抛
+    const redis: HealthRedis = {
+      async get() { return null; },
+      async set() { throw new Error("redis down"); },
+      async incr() { return 1; },
+      async expire() { /* */ },
+      async del() { throw new Error("redis down"); },
+    };
+    const tracker = new AccountHealthTracker({ redis });
+    // 关键断言:不抛
+    const h = await tracker.recoverFromCooldown(id);
+    assert.ok(h);
+    assert.equal(h.status, "active");
+    assert.equal(h.health_score, 50);
+    // DB 状态确实落了
+    const a = await getAccount(id);
+    assert.equal(a!.status, "active");
+    assert.equal(a!.health_score, 50);
+    assert.equal(a!.cooldown_until, null);
   });
 });
 

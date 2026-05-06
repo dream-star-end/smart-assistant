@@ -253,6 +253,59 @@ export class AccountHealthTracker {
   }
 
   /**
+   * 把 status='cooldown' 的账号强制恢复到 active(等价 halfOpen 对单账号的处理):
+   *   status='active' + health_score=50 + cooldown_until=NULL,
+   *   并写 Redis healthKey=50 + 清 failKey。
+   *
+   * 与 halfOpen 的区别:不要求 cooldown_until 已过期(也允许 cooldown_until IS NULL),
+   * 用于 admin "重置冷却" 路径 —— halfOpen 的 SQL 守卫(`cooldown_until IS NOT NULL
+   * AND < NOW()`)对 cooldown_until=NULL 的账号无效,会让 admin 之前清空 cooldown_until
+   * 但 status 仍 'cooldown' 的账号永久卡死,本方法专门兜底这类状态。
+   *
+   * 与 manualEnable 的区别:manualEnable 把 health 拉到 100 + 清 last_error,
+   * 含义是"超管认定账号完全没问题";本方法只把 health 拉到 50,语义是"从冷却恢复观察",
+   * 与 halfOpen 一致,且不动 last_error(留给调用方按需清)。
+   *
+   * 行为:
+   *   - 仅在 status='cooldown' 时生效;disabled / banned / active 一律返 null,无副作用
+   *   - rowCount=0(账号不在 cooldown,或 id 不存在)→ 返 null,不写 Redis
+   *
+   * Redis 写入是 best-effort:DB 已是权威状态(`status='active'`),Redis 失败不应让
+   * 整个 admin 操作 throw。否则会陷入"DB 已恢复 → 异常 → admin 重试看到 status='active'
+   * → 走非 cooldown 分支 → 永远不再清 stale failKey"的死局,而 stale failKey 会让下
+   * 一次失败立即重新熔断。失败时仅 console.warn 留痕,不影响调用方。
+   */
+  async recoverFromCooldown(
+    accountId: bigint | string,
+  ): Promise<AccountHealth | null> {
+    const id = String(accountId);
+    const res = await query<RawHealthRow>(
+      `UPDATE claude_accounts
+       SET status = 'active',
+           health_score = 50,
+           cooldown_until = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'cooldown'
+       RETURNING id::text AS id, status, health_score, cooldown_until`,
+      [id],
+    );
+    if (res.rowCount === 0) return null;
+    const h = parseHealth(res.rows[0]);
+    try {
+      await this.redis.set(healthKey(id), String(h.health_score), {
+        exSec: this.healthTtlSec,
+      });
+      await this.redis.del(failKey(id));
+    } catch (err) {
+      console.warn(
+        `[recoverFromCooldown] Redis cleanup best-effort failed for account ${id}:`,
+        err,
+      );
+    }
+    return h;
+  }
+
+  /**
    * 超管手工启用账号(status='active' + health=100 + 清 cooldown_until + 清 last_error)。
    */
   async manualEnable(accountId: bigint | string): Promise<AccountHealth | null> {

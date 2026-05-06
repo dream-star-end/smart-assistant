@@ -32,7 +32,13 @@ import {
   adminListAccounts,
   adminPatchAccount,
   adminDeleteAccount,
+  adminResetCooldown,
 } from "../admin/accounts.js";
+import {
+  AccountHealthTracker,
+  InMemoryHealthRedis,
+} from "../account-pool/health.js";
+import { updateAccount as storeUpdate } from "../account-pool/store.js";
 import { createEgressProxy } from "../admin/egressProxies.js";
 import { listLedger } from "../admin/ledger.js";
 import { adminAdjust } from "../billing/ledger.js";
@@ -283,6 +289,135 @@ describe("admin accounts — DB 层", () => {
     assert.equal(await adminDeleteAccount(999999n, { adminId: admin }), false);
     const a = await listAdminAudit({});
     assert.equal(a.rows.length, 0);
+  });
+});
+
+// ============================================================
+// adminResetCooldown — DB 层
+// ============================================================
+
+describe("adminResetCooldown — DB 层", () => {
+  test("status='cooldown' + cooldown_until=future → status active+health=50,清 last_error,审计带 status+health_score", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    const created = await adminCreateAccount(
+      { label: "rc-1", plan: "pro", oauth_token: "T", egress_proxy_id: epid },
+      { adminId: admin },
+    );
+    // 模拟熔断结果状态
+    await storeUpdate(created.id, {
+      status: "cooldown",
+      health_score: 30,
+      cooldown_until: new Date(Date.now() + 60_000),
+      last_error: "boom",
+    });
+
+    const tracker = new AccountHealthTracker({ redis: new InMemoryHealthRedis() });
+    const after = await adminResetCooldown(created.id, { adminId: admin }, tracker);
+    assert.equal(after.status, "active");
+    assert.equal(after.health_score, 50);
+    assert.equal(after.cooldown_until, null);
+    assert.equal(after.last_error, null);
+
+    const audits = await listAdminAudit({});
+    const reset = audits.rows.find((r) => r.action === "account.reset_cooldown");
+    assert.ok(reset, "reset_cooldown audit 必须落");
+    const before = reset!.before as Record<string, unknown>;
+    const afterAudit = reset!.after as Record<string, unknown>;
+    // status + health_score 都改了 → 必须出现在 audit
+    assert.equal(before.status, "cooldown");
+    assert.equal(afterAudit.status, "active");
+    assert.equal(before.health_score, 30);
+    assert.equal(afterAudit.health_score, 50);
+    assert.equal(before.last_error, "boom");
+    assert.equal(afterAudit.last_error, null);
+  });
+
+  test("事故复现 — status='cooldown' + cooldown_until=NULL(旧 reset 留下的卡死)→ active+50", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    const created = await adminCreateAccount(
+      { label: "rc-stuck", plan: "max", oauth_token: "T", egress_proxy_id: epid },
+      { adminId: admin },
+    );
+    await storeUpdate(created.id, {
+      status: "cooldown",
+      health_score: 50,
+      cooldown_until: null,
+      last_error: null,
+    });
+
+    const tracker = new AccountHealthTracker({ redis: new InMemoryHealthRedis() });
+    const after = await adminResetCooldown(created.id, { adminId: admin }, tracker);
+    assert.equal(after.status, "active");
+    assert.equal(after.health_score, 50);
+  });
+
+  test("status='disabled' + cooldown_until=future → status 仍 disabled,只清 cooldown_until + last_error,health_score 不变", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    const created = await adminCreateAccount(
+      { label: "rc-2", plan: "pro", oauth_token: "T", egress_proxy_id: epid },
+      { adminId: admin },
+    );
+    await storeUpdate(created.id, {
+      status: "disabled",
+      health_score: 0,
+      cooldown_until: new Date(Date.now() + 60_000),
+      last_error: "err",
+    });
+
+    const tracker = new AccountHealthTracker({ redis: new InMemoryHealthRedis() });
+    const after = await adminResetCooldown(created.id, { adminId: admin }, tracker);
+    assert.equal(after.status, "disabled"); // 不偷偷 active
+    assert.equal(after.health_score, 0);     // 不被重置成 50
+    assert.equal(after.cooldown_until, null);
+    assert.equal(after.last_error, null);
+
+    const audits = await listAdminAudit({});
+    const reset = audits.rows.find((r) => r.action === "account.reset_cooldown");
+    assert.ok(reset);
+    const before = reset!.before as Record<string, unknown>;
+    const afterAudit = reset!.after as Record<string, unknown>;
+    // status / health_score 没改 → 不进 audit
+    assert.ok(!("status" in before));
+    assert.ok(!("status" in afterAudit));
+    assert.ok(!("health_score" in before));
+    assert.ok(!("health_score" in afterAudit));
+  });
+
+  test("status='active' + cooldown_until=future(异常状态)→ status 仍 active,只清 cooldown_until + last_error,health_score 不变", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    const created = await adminCreateAccount(
+      { label: "rc-3", plan: "pro", oauth_token: "T", egress_proxy_id: epid },
+      { adminId: admin },
+    );
+    await storeUpdate(created.id, {
+      cooldown_until: new Date(Date.now() + 60_000),
+      last_error: "stale",
+    });
+
+    const tracker = new AccountHealthTracker({ redis: new InMemoryHealthRedis() });
+    const after = await adminResetCooldown(created.id, { adminId: admin }, tracker);
+    assert.equal(after.status, "active");
+    assert.equal(after.health_score, 100); // 不被重置成 50
+    assert.equal(after.cooldown_until, null);
+    assert.equal(after.last_error, null);
+  });
+
+  test("不存在 id → AccountNotFoundError", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const tracker = new AccountHealthTracker({ redis: new InMemoryHealthRedis() });
+    await assert.rejects(
+      () => adminResetCooldown(999_999n, { adminId: admin }, tracker),
+      (err: Error) => err.name === "AccountNotFoundError",
+    );
   });
 });
 

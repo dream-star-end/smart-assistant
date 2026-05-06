@@ -36,6 +36,7 @@ import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.
 import type { AgentHttpDeps } from "./agent.js";
 import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 import type { RemoteHostTester } from "../remoteHosts/service.js";
+import type { AccountHealthTracker } from "../account-pool/health.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -145,6 +146,13 @@ export interface CommercialHttpDeps {
    * `POST /api/remote-hosts/:id/test` 返 503 TESTER_NOT_CONFIGURED。
    */
   remoteHostTester?: RemoteHostTester;
+  /**
+   * Claude 账号池 health tracker。`/api/admin/accounts/:id/reset-cooldown`
+   * 需要它来把 status='cooldown' 的账号一并恢复到 active(避免历史
+   * `cooldown_until=NULL ∧ status='cooldown'` 永久卡死状态)。未注入 →
+   * 该路由返 503 ACCOUNT_HEALTH_NOT_CONFIGURED;其他路由不受影响。
+   */
+  accountHealth?: AccountHealthTracker;
 }
 
 export interface RequestContext {
