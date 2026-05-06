@@ -38,27 +38,19 @@ const SAFE_INT_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const DEFAULT_RESERVATION_TTL_SEC = 300;
 
 /**
- * 单笔请求允许的"平台软超扣窗口"(分)。¥5 = 500.
- *
- * 2026-04-26 v1.0.3:之前 preCheck 用最坏 max_tokens × output 单价做 reservation,
- * 余额 < 估算 cost 一律 402。结果"注册赠送 ¥2 的用户连一句'你好'都发不出"
- * (60K max_tokens × opus 4.7 估算 ≈ ¥3 > ¥2)。
- *
- * 改成"放行 cost 在 (balance + ceiling) 以内的请求"+ "把 reservation cap 到 balance",
- * 让用户能把账户用到 0;真实 cost 由 finalize 阶段已有的 clamp 路径吃掉
+ * 2026-05-06:**移除估算 ceiling**。线上事故:用户 ¥12 余额 + Opus 4.7 + 文件附件,
+ * `estimateMaxCostBothSides` 把 base64 附件 chars 也按 output 单价估,maxCost 飙到
+ * ¥17+,卡过原 ¥5 ceiling 被拒;实际真扣才 ¥1 量级。boss 决策:**只要余额 > 0 就放,
+ * 不预估**,真实 cost 由 finalize 阶段已有的 clamp 路径吃掉
  * (settleUsageAndLedger:1052,debit = min(balance, cost),balance_after=0,'clamped' memo)。
  *
- * 数值选 500 的依据:
- *   - opus 4.7 默认 max_tokens=64K 估算 ~¥3 < ¥5 → boss 实测场景过
- *   - 200K max_tokens 估算 ~¥10 > ¥5 → 余额 < ¥5 的用户会被拒,不让一笔吃穿
- *
- * 不变量(soft 一致性,非强保证):
- *   - per-request 放行窗口:input.maxCost ≤ snapshot_balance + ¥5,严格阈值
- *   - per-request 实际 overage:受 PG/Redis 边界窗口影响 + per-uid 并发 4(DEFAULT_MAX_CONCURRENT_PER_UID),
- *     最坏放大 4× ≈ ¥20。个人级 SaaS 量级可承受。
- *   - balance ≤ 0 hard reject 不受 race 影响(PG 单点权威)
+ * 当前不变量:
+ *   - balance ≤ 0 hard reject(PG 单点权威)
+ *   - balance > 0 → 放行,reservation cap 到 balance(Lua atomicReserve 仍 enforce
+ *     `balance ≥ total + needed`,同 uid 并发第二笔会被拒)
+ *   - per-request 实际 overage 上限 ≈ Anthropic 端 max_tokens 限定的 LLM 真实 cost,
+ *     受 per-uid 并发(默认 4)放大 — 个人级 SaaS 可承受,boss 已对齐 trade-off
  */
-export const PRECHECK_OVERAGE_CEILING_CENTS = 500n;
 
 /** 把用户 id 归一为字符串(支持 bigint/number/string)。 */
 function uidToStr(uid: bigint | number | string): string {
@@ -181,10 +173,9 @@ export interface PreCheckResult {
   /**
    * true = 估算 cost 超过余额,reservation 已被 cap 到 balance。
    *
-   * 调用方据此打 metric / log 观察 cap 触发率。
-   * 注:相对 preCheck snapshot 的"放行窗口"受 ceiling 限制;实际 overage 受
-   * PG/Redis 边界窗口与 per-uid 并发(默认 4)放大,严格 hard limit 不成立 — 详见
-   * PRECHECK_OVERAGE_CEILING_CENTS 注释里的"soft 一致性"不变量段。
+   * 调用方据此打 metric / log 观察 cap 触发率。balance > 0 + cap-to-balance 是
+   * 当前唯一放行路径(2026-05-06 移除 ceiling 后);overage 受真实 LLM cost 上限 +
+   * per-uid 并发放大,严格 hard limit 不成立。
    */
   capped: boolean;
   /** 调用方传入的原始估算 cost(分),用于对照 maxCost 看 cap 幅度。 */
@@ -277,17 +268,10 @@ export async function preCheckWithCost(
   }
   assertSafeBigInt("balance", balance);
 
-  // 单笔请求估算 cost 超出 (余额 + ceiling) → 拒,把单笔超扣面 bound 在 ceiling 内。
-  // 例:balance=¥0.10、估算=¥10 → 拒(差 ¥9.9 远超 ¥5 ceiling);
-  //     balance=¥2、估算=¥3 → 放行(差 ¥1 < ¥5)。
-  if (input.maxCost > balance + PRECHECK_OVERAGE_CEILING_CENTS) {
-    throw new InsufficientCreditsError(balance, input.maxCost);
-  }
-
-  // 放行:把 reservation cap 到 balance,确保 Lua check 必过(`balance ≥ total + needed`)。
-  // 真实 cost 由 finalize 阶段已有的 clamp 路径处理(settleUsageAndLedger);
-  // 实际 overage 是 soft 一致性,受 PG/Redis 边界窗口 + per-uid 并发放大,详见
-  // PRECHECK_OVERAGE_CEILING_CENTS 注释里的不变量段。
+  // balance > 0 即放行:reservation cap 到 balance,确保 Lua check 必过
+  // (`balance ≥ total + needed`)。真实 cost 由 finalize 阶段已有的 clamp 路径
+  // 处理(settleUsageAndLedger);实际 overage 是 soft 一致性,受 PG/Redis 边界窗口
+  // + per-uid 并发放大。
   const capped = input.maxCost > balance;
   const effectiveMaxCost = capped ? balance : input.maxCost;
 

@@ -1,14 +1,14 @@
 /**
- * v1.0.3 集成:preCheckWithCost 的 cap-to-balance 行为(drain-to-zero)。
+ * 集成:preCheckWithCost 的 cap-to-balance 行为(drain-to-zero)。
+ *
+ * 2026-05-06 移除 ceiling 后:balance > 0 即放行,reservation 始终 cap 到 balance。
  *
  * 覆盖:
  *   1. balance ≤ 0 → InsufficientCreditsError(hard reject,不调 atomicReserve)
- *   2. balance > 0, maxCost > balance + ceiling → 拒(单笔超扣面 bound)
- *   3. balance > 0, maxCost ∈ (balance, balance+ceiling] → 放行,reservation = balance,capped=true
- *   4. balance > 0, maxCost ≤ balance → 正常路径,reservation = maxCost,capped=false
- *   5. 同一 uid 并发:第一笔 capped=true 占满 balance,第二笔被 Lua 拒
- *   6. boss 实测场景:balance=200 (cap 算法回归基线 — v1.0.4 起注册赠送已升至 ¥3=300,但
- *      此用例固定 200 / 300 数字不动,继续验证 maxCost ∈ (balance, balance+ceiling] 路径)
+ *   2. balance > 0, maxCost > balance(任意大)→ 放行,reservation = balance,capped=true
+ *   3. balance > 0, maxCost ≤ balance → 正常路径,reservation = maxCost,capped=false
+ *   4. 同一 uid 并发:第一笔 capped=true 占满 balance,第二笔被 Lua 拒
+ *   5. boss 实测场景:balance=200 + maxCost=300 → 放行 cap 到 200(回归基线)
  */
 
 import { describe, test, before, after, beforeEach } from "node:test";
@@ -21,7 +21,6 @@ import {
   releasePreCheck,
   InMemoryPreCheckRedis,
   InsufficientCreditsError,
-  PRECHECK_OVERAGE_CEILING_CENTS,
 } from "../billing/preCheck.js";
 
 const TEST_DB_URL =
@@ -149,22 +148,7 @@ describe("preCheckWithCost cap-to-balance (v1.0.3)", () => {
     );
   });
 
-  test("maxCost > balance + ceiling → 拒(超 ceiling)", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const uid = await createUser("over-ceiling@example.com", 100n);
-    const redis = new InMemoryPreCheckRedis();
-    // 100 + 500 = 600,1000 > 600 → 拒
-    await assert.rejects(
-      () => preCheckWithCost(redis, { userId: uid, requestId: "req-1", maxCost: 1000n }),
-      (err: unknown) =>
-        err instanceof InsufficientCreditsError &&
-        err.balance === 100n &&
-        err.required === 1000n,
-    );
-    assert.equal(redis.totalLocked(uid), 0n);
-  });
-
-  test("maxCost > balance 但 ≤ balance + ceiling → 放行,cap 到 balance", async (t) => {
+  test("maxCost > balance → 放行,reservation cap 到 balance", async (t) => {
     if (skipIfNoPg(t)) return;
     const uid = await createUser("cap-ok@example.com", 200n);
     const redis = new InMemoryPreCheckRedis();
@@ -180,18 +164,22 @@ describe("preCheckWithCost cap-to-balance (v1.0.3)", () => {
     assert.equal(redis.totalLocked(uid), 200n);
   });
 
-  test("maxCost = balance + ceiling 边界 → 放行(`>` 判定)", async (t) => {
+  test("maxCost 远大于 balance(任意大)→ 放行,cap 到 balance(2026-05-06 移除 ceiling 后回归)", async (t) => {
     if (skipIfNoPg(t)) return;
-    const uid = await createUser("ceiling-edge@example.com", 100n);
+    // 事故修复回归:¥12 余额 + 文件附件估算飙到 ¥17+ 的场景。原 ceiling=¥5 时被拒,
+    // 现在余额 > 0 即放行,reservation cap 到 balance,真扣由 finalize clamp 兜底。
+    const uid = await createUser("huge-estimate@example.com", 1213n);
     const redis = new InMemoryPreCheckRedis();
-    // 边界:maxCost = balance + ceiling = 100 + 500 = 600
     const r = await preCheckWithCost(redis, {
       userId: uid,
       requestId: "req-1",
-      maxCost: 100n + PRECHECK_OVERAGE_CEILING_CENTS,
+      maxCost: 100_000n, // ≈ ¥1000,远超 balance + 任何 ceiling
     });
-    assert.equal(r.maxCost, 100n);
+    assert.equal(r.balance, 1213n);
+    assert.equal(r.maxCost, 1213n, "reservation capped to balance");
     assert.equal(r.capped, true);
+    assert.equal(r.originalMaxCost, 100_000n);
+    assert.equal(redis.totalLocked(uid), 1213n);
   });
 
   test("maxCost ≤ balance → 正常路径,reservation = maxCost,capped=false", async (t) => {

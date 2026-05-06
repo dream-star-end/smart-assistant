@@ -337,8 +337,9 @@ export function extractSessionId(
  * 估算 input token 数(保守口径,宁可高估)。
  *
  * MVP 不引入完整 tokenizer(`@anthropic-ai/tokenizer` 增加依赖体积),用
- * "JSON.stringify(messages + system + tools).length / 4" 兜底;开 prompt cache
- * 的高级用户最坏只是 preCheck 数字偏大,影响是更早 402,符合"安全方向"。
+ * "JSON.stringify(messages + system + tools).length / 4" 兜底。2026-05-06 移除
+ * preCheck ceiling 之后,估算偏大不再导致 402;只影响 PreCheckResult.originalMaxCost
+ * 字段值(metric/log 用)和 cap-to-balance 的 capped 标记判定。
  *
  * 字符数除以 4 是社区经验值(英文偏低估;中文偏高估,反正都向上对我们安全)。
  */
@@ -1654,7 +1655,8 @@ export function makeAnthropicProxyHandler(
       try {
         // 走 preCheckWithCost(已知 maxCost,跳过 estimateMaxCost 重算)。
         // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
-        // 余额 < 估算 cost 时 cap 到 balance(drain-to-zero,详见 PRECHECK_OVERAGE_CEILING_CENTS)。
+        // balance > 0 即放行;余额 < 估算 cost 时 cap 到 balance(drain-to-zero by cap-to-balance)。
+        // 真实 cost 由 finalize 阶段已有的 clamp 路径吃(settleUsageAndLedger)。
         pre = await preCheckWithCost(deps.preCheckRedis, {
           userId: uid,
           requestId,

@@ -435,10 +435,11 @@ const AGENT_AUTHZ_IMPLIED_MODEL: Record<string, string> = {
  *
  * codex inbound 帧不带 max_tokens 字段(由 codex app-server 内部决定),master 估
  * preCheck 上限只能拍脑袋。64K 是 codex app-server 0.125 默认 max output tokens
- * 的近似上限(实际 32-64K 视模型),配 PRECHECK_OVERAGE_CEILING_CENTS=500 cents
- * 兜底超扣边界,极端 case 下用户单 turn 多扣不超 ¥5。
+ * 的近似上限(实际 32-64K 视模型)。
  *
- * 真实扣费由 finalizer 拿真 usage 重算 — 这只是预扣阶段的保护估算。
+ * 2026-05-06:preCheck 已移除 ceiling 拒,balance > 0 即放行,reservation cap 到
+ * balance — 这个估算只影响 originalMaxCost / capped metric,不再决定放/拒。
+ * 真实扣费由 finalizer 拿真 usage 重算。
  */
 const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000;
 
