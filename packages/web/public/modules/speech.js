@@ -1,7 +1,7 @@
 // OpenClaude — Speech Recognition
-import { $ } from './dom.js?v=3e76e88d'
-import { state } from './state.js?v=3e76e88d'
-import { toast } from './ui.js?v=3e76e88d'
+import { $ } from './dom.js?v=6659556c'
+import { state } from './state.js?v=6659556c'
+import { toast } from './ui.js?v=6659556c'
 
 // autoResize lives in app.js (not yet extracted); injected via setAutoResize()
 let autoResize = () => {}
