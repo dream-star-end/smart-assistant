@@ -61,6 +61,7 @@ import {
 import {
   incrV3SinkPersist,
   type V3SinkPersistOutcome,
+  type V3SinkPersistRole,
 } from "../admin/metrics.js";
 
 /** Master persists assistant messages no larger than this. Conservative — a
@@ -72,17 +73,31 @@ const MAX_BODY_BYTES = 256 * 1024;
  *  self-host listener and the mTLS remote-host listener. */
 export const SERVER_AUTHORED_PATH = "/internal/v3/server-authored-message";
 
-/** Request body — strict, unknown keys rejected. peerId / userId / id are NOT
- *  accepted from the wire to keep the trust boundary tight. */
+/** Request body — strict, unknown keys rejected. peerId / userId / id / role
+ *  are NOT accepted from the wire to keep the trust boundary tight.
+ *
+ *  `text` may be empty when the turn is thinking-only (Sonnet 4.6 ran out of
+ *  output tokens before producing assistant text). The cross-field refine
+ *  guarantees at least one of (text, thinkingText) is non-empty so we never
+ *  write an empty assistant row. */
 const BodySchema = z
   .object({
     sessionId: z.string().min(8).max(50),
     turnIndex: z.number().int().min(0),
     status: z.enum(["completed", "interrupted", "crashed"]),
     text: z.string().max(MAX_BODY_BYTES),
+    /** Optional reasoning text for the same turn (capped client-side at
+     *  MAX_THINKING_BUFFER_BYTES = 8 KB). Persisted as a separate
+     *  `_source: 'server'` message with `role: 'thinking'`, ts = baseTs - 1
+     *  so it sorts immediately before the assistant message. */
+    thinkingText: z.string().min(1).max(MAX_BODY_BYTES).optional(),
     createdAt: z.number().int().positive().optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (v) => v.text.length > 0 || v.thinkingText !== undefined,
+    { message: "either text or thinkingText must be non-empty" },
+  );
 
 export type ServerAuthoredBody = z.infer<typeof BodySchema>;
 
@@ -95,7 +110,10 @@ export interface ServerAuthoredStorage {
     userId: string,
     message: {
       id: string;
-      role: "assistant";
+      /** 'thinking' for Phase 0.4 reasoning persistence; 'assistant' for
+       *  the user-visible turn text. Same idempotency / session_not_found
+       *  semantics for both. */
+      role: "assistant" | "thinking";
       text: string;
       ts: number;
       status: "completed" | "interrupted" | "crashed";
@@ -114,8 +132,12 @@ export interface ServerAuthoredHandlerDeps {
   now?: () => number;
   /** Override only for tests so unit tests can assert metric outcome without
    *  touching the module-level Counter state. Real callers omit; default
-   *  bridges to {@link incrV3SinkPersist}. */
-  metric?: (outcome: V3SinkPersistOutcome) => void;
+   *  bridges to {@link incrV3SinkPersist}.
+   *
+   *  `role` is undefined for pre-role rejects (`reject_unauthorized` /
+   *  `reject_bad_body` / `reject_method`) where the body hasn't been parsed
+   *  yet, and either 'thinking' or 'assistant' for per-row outcomes. */
+  metric?: (outcome: V3SinkPersistOutcome, role?: V3SinkPersistRole) => void;
 }
 
 /** Same ctx shape as `AnthropicProxyHandler` — derived by listener wiring. */
@@ -212,56 +234,189 @@ export function makeServerAuthoredHandler(
     }
 
     // 3) Persist
+    //
+    // Decision matrix (Phase 0.4 thinking durability):
+    //   thinking-only (text empty, thinkingText present):
+    //     - thinking applied        → 200 ok
+    //     - thinking already_exists → 200 idempotent
+    //     - thinking session_n_f   → 404 (sink retries under TTL)
+    //     - thinking storage_threw → 500 (sink retries; thinking is the
+    //                                     only data so we cannot drop it)
+    //     - thinking malformed     → 500 (master-side data issue)
+    //   has assistant (text non-empty, thinkingText optional):
+    //     - thinking write best-effort: storage_threw is logged + metric
+    //       'error'/thinking but does NOT block assistant write. degrade
+    //       to "thinking dropped, assistant preserved" — same body that
+    //       the sink already submitted; retrying the whole turn would
+    //       just hit assistant `already_exists` and re-fail thinking.
+    //     - assistant outcome decides HTTP status:
+    //         applied        → 200 ok
+    //         already_exists → 200 idempotent
+    //         session_n_f    → 404
+    //         storage_threw  → 500
+    //         malformed      → 500
+    const baseTs = body.createdAt ?? now();
+    const thinkingTs = baseTs - 1;
+    const assistantTs = baseTs;
     const messageId = `srv-${body.sessionId}-t${body.turnIndex}`;
-    const ts = body.createdAt ?? now();
-    let result: Awaited<
+    const thinkingMessageId = `srv-${body.sessionId}-t${body.turnIndex}-thinking`;
+
+    const hasAssistant = body.text.length > 0;
+    const hasThinking =
+      body.thinkingText !== undefined && body.thinkingText.length > 0;
+
+    // ── Write thinking first (if present) so its ts < assistant ts ──
+    type StorageResult = Awaited<
       ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>
     >;
+    let thinkingResult: StorageResult | null = null;
+    let thinkingThrew = false;
+    if (hasThinking) {
+      try {
+        thinkingResult = await deps.storage.appendServerAuthoredMessage(
+          body.sessionId,
+          userId,
+          {
+            id: thinkingMessageId,
+            role: "thinking",
+            text: body.thinkingText!,
+            ts: thinkingTs,
+            status: body.status,
+          },
+        );
+      } catch (err) {
+        thinkingThrew = true;
+        userLog.error("thinking_storage_threw", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+          err: err as Error,
+        });
+      }
+    }
+
+    /** Emit the per-role thinking metric exactly once per request. Pull-out
+     *  helper so all 9+ exit paths in this handler can call it consistently. */
+    const emitThinkingMetric = (): void => {
+      if (!hasThinking) return;
+      if (thinkingThrew) {
+        metric("error", "thinking");
+        return;
+      }
+      const r = thinkingResult!;
+      if (r.applied) metric("ok", "thinking");
+      else if (r.reason === "already_exists") metric("deduped", "thinking");
+      else if (r.reason === "session_not_found")
+        metric("reject_session_missing", "thinking");
+      else metric("error", "thinking"); // malformed
+    };
+
+    // ── Branch A: thinking-only — HTTP status driven by thinking result ──
+    if (!hasAssistant) {
+      // Schema refine guarantees hasThinking here.
+      if (thinkingThrew) {
+        metric("error", "thinking");
+        sendJsonError(
+          res,
+          500,
+          "STORAGE_ERROR",
+          "storage write failed",
+          requestId,
+        );
+        return;
+      }
+      const r = thinkingResult!;
+      if (r.applied) {
+        metric("ok", "thinking");
+        sendJsonOk(res, 200, { ok: true }, requestId);
+        return;
+      }
+      if (r.reason === "already_exists") {
+        metric("deduped", "thinking");
+        sendJsonOk(res, 200, { ok: true, idempotent: true }, requestId);
+        return;
+      }
+      if (r.reason === "session_not_found") {
+        userLog.info("thinking_session_not_found", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+        });
+        metric("reject_session_missing", "thinking");
+        sendJsonError(
+          res,
+          404,
+          "SESSION_NOT_FOUND",
+          "no client_sessions row for sessionId+userId",
+          requestId,
+        );
+        return;
+      }
+      // malformed
+      userLog.error("master_row_malformed_thinking", {
+        sessionId: body.sessionId,
+        turnIndex: body.turnIndex,
+      });
+      metric("error", "thinking");
+      sendJsonError(
+        res,
+        500,
+        "ROW_MALFORMED",
+        "master row data corrupt",
+        requestId,
+      );
+      return;
+    }
+
+    // ── Branch B: has assistant (with optional thinking) ──
+    let assistantResult: StorageResult;
     try {
-      result = await deps.storage.appendServerAuthoredMessage(
+      assistantResult = await deps.storage.appendServerAuthoredMessage(
         body.sessionId,
         userId,
         {
           id: messageId,
           role: "assistant",
           text: body.text,
-          ts,
+          ts: assistantTs,
           status: body.status,
         },
       );
     } catch (err) {
-      // Storage layer threw — likely disk-full / SQLITE_BUSY / corruption.
-      // Returning 5xx makes the container queue this for retry, which is
-      // exactly what we want.
-      userLog.error("storage_threw", {
+      userLog.error("assistant_storage_threw", {
         sessionId: body.sessionId,
         turnIndex: body.turnIndex,
         err: err as Error,
       });
-      metric("error");
-      sendJsonError(res, 500, "STORAGE_ERROR", "storage write failed", requestId);
+      emitThinkingMetric();
+      metric("error", "assistant");
+      sendJsonError(
+        res,
+        500,
+        "STORAGE_ERROR",
+        "storage write failed",
+        requestId,
+      );
       return;
     }
 
-    if (result.applied) {
-      metric("ok");
+    if (assistantResult.applied) {
+      emitThinkingMetric();
+      metric("ok", "assistant");
       sendJsonOk(res, 200, { ok: true }, requestId);
       return;
     }
-    if (result.reason === "already_exists") {
-      // Idempotent retry — first call succeeded, this one is a no-op. Return
-      // 200 so the sender drops the entry from its queue.
-      metric("deduped");
+    if (assistantResult.reason === "already_exists") {
+      emitThinkingMetric();
+      metric("deduped", "assistant");
       sendJsonOk(res, 200, { ok: true, idempotent: true }, requestId);
       return;
     }
-    if (result.reason === "session_not_found") {
-      // Retryable on container side under TTL — not a permanent drop.
+    if (assistantResult.reason === "session_not_found") {
       userLog.info("session_not_found", {
         sessionId: body.sessionId,
         turnIndex: body.turnIndex,
       });
-      metric("reject_session_missing");
+      emitThinkingMetric();
+      metric("reject_session_missing", "assistant");
       sendJsonError(
         res,
         404,
@@ -271,15 +426,14 @@ export function makeServerAuthoredHandler(
       );
       return;
     }
-    // 'malformed' — master row's messages JSON is corrupt. This is a master-
-    // side data issue, not a container bug; surface as 500 so the entry is
-    // queued for retry (in case this is transient parser misbehavior; if it
-    // persists, the entry will TTL out and ops will see it in the metrics).
+    // 'malformed' — master row's messages JSON is corrupt. Master-side data
+    // issue, not a container bug; 500 so the entry is queued for retry.
     userLog.error("master_row_malformed", {
       sessionId: body.sessionId,
       turnIndex: body.turnIndex,
     });
-    metric("error");
+    emitThinkingMetric();
+    metric("error", "assistant");
     sendJsonError(res, 500, "ROW_MALFORMED", "master row data corrupt", requestId);
   };
 }

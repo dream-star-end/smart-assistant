@@ -198,6 +198,107 @@ describe("attemptSend — status classification", () => {
   });
 });
 
+// ─── body cap shrink (Phase 0.4 thinking durability) ────────────────────
+describe("attemptSend — body cap shrink", () => {
+  // Capture the actual JSON body that fetcher saw, so we can assert the
+  // shrink branch fired.
+  function makeCapturingFetcher(): {
+    fetcher: typeof import("undici").request;
+    captures: Array<{ url: string; body: string }>;
+  } {
+    const captures: Array<{ url: string; body: string }> = [];
+    const fn = async (url: string, init: any) => {
+      captures.push({ url, body: typeof init?.body === "string" ? init.body : "" });
+      return {
+        statusCode: 200,
+        headers: {},
+        trailers: {},
+        opaque: undefined,
+        context: {},
+        body: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from('{"ok":true}', "utf8");
+          },
+          text: async () => '{"ok":true}',
+        } as any,
+      };
+    };
+    return { fetcher: fn as unknown as typeof import("undici").request, captures };
+  }
+
+  test("combined-over-cap drops thinkingText and preserves assistant (request body excludes thinkingText)", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    // Assistant alone fits (< 256 KB), but assistant + thinking exceeds cap.
+    const oversizedThinking: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "x".repeat(200 * 1024), // 200 KB assistant alone (under cap)
+      thinkingText: "y".repeat(80 * 1024), // pushes combined over 256 KB
+    };
+    await attemptSend(oversizedThinking, { config: CFG, fetcher });
+    assert.equal(captures.length, 1);
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal(sent.text, "x".repeat(200 * 1024));
+    assert.equal(
+      sent.thinkingText,
+      undefined,
+      "thinkingText should be stripped when combined exceeds body cap",
+    );
+  });
+
+  test("combined-over-cap with assistant alone still over cap → fatal", async () => {
+    const { fetcher } = makeCapturingFetcher();
+    const giant: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "x".repeat(280 * 1024), // assistant alone over 256 KB
+      thinkingText: "y".repeat(8 * 1024),
+    };
+    await assert.rejects(
+      () => attemptSend(giant, { config: CFG, fetcher }),
+      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "fatal",
+    );
+  });
+
+  test("thinking-only over cap → fatal (parser cap leaked)", async () => {
+    const { fetcher } = makeCapturingFetcher();
+    // Empty assistant, thinking-only, over cap. Parser is supposed to cap
+    // thinking at 8 KB so this branch should never fire in production —
+    // but if it does we must NOT silently drop the only piece of data.
+    const thinkingOnly: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "",
+      thinkingText: "z".repeat(300 * 1024),
+    };
+    await assert.rejects(
+      () => attemptSend(thinkingOnly, { config: CFG, fetcher }),
+      (err: unknown) =>
+        err instanceof V3SinkError &&
+        (err as V3SinkError).errorClass === "fatal" &&
+        err.message.includes("thinking-only"),
+    );
+  });
+
+  test("under-cap body with thinkingText is forwarded as-is", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const small: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "answer",
+      thinkingText: "reasoning",
+    };
+    await attemptSend(small, { config: CFG, fetcher });
+    assert.equal(captures.length, 1);
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal(sent.text, "answer");
+    assert.equal(sent.thinkingText, "reasoning");
+  });
+
+  test("payload without thinkingText omits the key entirely (not null/empty)", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    await attemptSend(PAYLOAD, { config: CFG, fetcher }); // no thinkingText set
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("thinkingText" in sent, false);
+  });
+});
+
 // ─── persistOrQueue orchestration ────────────────────────────────────────
 
 describe("makeV3MasterSink.persistOrQueue", () => {

@@ -3,9 +3,14 @@
  * Tests the CCB stream-json message parsing logic in isolation.
  * Run: npx tsx --test packages/gateway/src/__tests__/ccbMessageParser.test.ts
  */
+import { Buffer } from 'node:buffer'
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { CcbMessageParser, type SessionStreamEvent } from '../ccbMessageParser.js'
+import {
+  CcbMessageParser,
+  MAX_THINKING_BUFFER_BYTES,
+  type SessionStreamEvent,
+} from '../ccbMessageParser.js'
 
 function createParser(opts?: { onToolUse?: (t: any) => void }) {
   const events: SessionStreamEvent[] = []
@@ -71,6 +76,113 @@ describe('CcbMessageParser: text streaming', () => {
     if (events[0].kind === 'block') {
       assert.equal(events[0].block.kind, 'thinking')
     }
+  })
+})
+
+// ── Thinking accumulation (Phase 0.4 server-authored persistence) ──
+describe('CcbMessageParser: thinking accumulation', () => {
+  function emitThinking(parser: CcbMessageParser, text: string, parentToolUseId?: string) {
+    parser.parse({
+      type: 'stream_event',
+      ...(parentToolUseId ? { parent_tool_use_id: parentToolUseId } : {}),
+      event: {
+        type: 'content_block_delta',
+        delta: { type: 'thinking_delta', thinking: text },
+      },
+    } as any)
+  }
+
+  it('concatenates main-agent thinking_delta into thinkingBuf', () => {
+    const { parser } = createParser()
+    emitThinking(parser, 'Step 1. ')
+    emitThinking(parser, 'Step 2. ')
+    emitThinking(parser, 'Step 3.')
+    assert.equal(parser.thinkingBuf, 'Step 1. Step 2. Step 3.')
+  })
+
+  it('excludes subagent thinking from thinkingBuf', () => {
+    const { parser } = createParser()
+    emitThinking(parser, 'main agent thinks')
+    emitThinking(parser, 'child thinks too', 'toolu_subagent')
+    // Only the main-agent delta is captured; subagent thinking is UI-only.
+    assert.equal(parser.thinkingBuf, 'main agent thinks')
+  })
+
+  it('caps thinkingBuf at MAX_THINKING_BUFFER_BYTES with truncation tail', () => {
+    const { parser } = createParser()
+    // Generate 16KB of ASCII (well over the 8KB cap)
+    const giant = 'a'.repeat(16 * 1024)
+    emitThinking(parser, giant)
+    const bufBytes = Buffer.byteLength(parser.thinkingBuf, 'utf8')
+    assert.ok(bufBytes <= MAX_THINKING_BUFFER_BYTES, `bufBytes ${bufBytes} <= cap ${MAX_THINKING_BUFFER_BYTES}`)
+    assert.ok(parser.thinkingBuf.endsWith('…[truncated]'), 'tail marker present')
+  })
+
+  it('truncated flag is sticky: subsequent deltas are dropped', () => {
+    const { parser } = createParser()
+    emitThinking(parser, 'a'.repeat(16 * 1024))
+    const lenAfter1 = parser.thinkingBuf.length
+    emitThinking(parser, 'should be ignored')
+    emitThinking(parser, 'also ignored')
+    assert.equal(parser.thinkingBuf.length, lenAfter1, 'no growth after first truncation')
+  })
+
+  it('UTF-8 multi-byte boundary safe (does not split CJK characters)', () => {
+    const { parser } = createParser()
+    // Each Chinese char is 3 bytes in UTF-8. Build a string that lands the
+    // cap cut squarely inside a multi-byte sequence to verify we walk back
+    // to a leading byte instead of producing U+FFFD.
+    const cjk = '中' // 3 bytes
+    // Use enough '中' to push us well past the cap on a sub-byte alignment.
+    const giant = cjk.repeat(4096) // 12 KB total
+    emitThinking(parser, giant)
+    // Decode round-trip should produce no replacement character before tail.
+    const beforeTail = parser.thinkingBuf.replace(/…\[truncated\]$/u, '')
+    assert.ok(!beforeTail.includes('\uFFFD'), 'no replacement character in truncated buffer')
+    // Every preserved byte triplet must form a valid CJK char.
+    for (const ch of beforeTail) {
+      assert.equal(ch, '中', `unexpected char ${ch.codePointAt(0)?.toString(16)}`)
+    }
+  })
+
+  it('UTF-8 4-byte sequence boundary safe (does not split emoji)', () => {
+    // Emoji like 😀 (U+1F600) is 4 bytes in UTF-8 and surfaces as a JS
+    // surrogate pair. The slice-back loop must walk all 3 continuation
+    // bytes back to the lead byte for a clean cut. Failing to do so would
+    // leave an orphan high surrogate or invalid byte sequence.
+    const { parser } = createParser()
+    const emoji = '😀' // 4 bytes UTF-8, 2 JS code units (surrogate pair)
+    const giant = emoji.repeat(2200) // ≈ 8800 bytes — over the 8KB cap
+    emitThinking(parser, giant)
+    const beforeTail = parser.thinkingBuf.replace(/…\[truncated\]$/u, '')
+    assert.ok(!beforeTail.includes('\uFFFD'), 'no replacement char in truncated buffer')
+    // Every code point must be the full emoji (not an orphan surrogate).
+    for (const ch of beforeTail) {
+      assert.equal(ch, emoji, `unexpected code point 0x${ch.codePointAt(0)?.toString(16)}`)
+    }
+    // Bytes still under cap.
+    const bufBytes = Buffer.byteLength(parser.thinkingBuf, 'utf8')
+    assert.ok(bufBytes <= MAX_THINKING_BUFFER_BYTES, `bufBytes ${bufBytes} <= cap`)
+  })
+
+  it('thinkingText is forwarded into TurnResult on result event', () => {
+    const { parser, getResult } = createParser()
+    emitThinking(parser, 'Reasoning A')
+    emitThinking(parser, 'Reasoning B')
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+    const r = getResult()
+    assert.equal(r.thinkingText, 'Reasoning AReasoning B')
+  })
+
+  it('empty thinkingBuf when no thinking_delta seen', () => {
+    const { parser, getResult } = createParser()
+    parser.parse({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'plain answer' } },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+    assert.equal(parser.thinkingBuf, '')
+    assert.equal(getResult().thinkingText, '')
   })
 })
 
@@ -182,19 +294,21 @@ describe('CcbMessageParser: tool_result', () => {
     assert.equal(events.length, 1, 'should emit only once')
   })
 
-  it('truncates long previews to 500 chars', () => {
+  it('truncates long previews to 3000 chars', () => {
     const { parser, events, toolUseIdToName } = createParser()
     toolUseIdToName.set('tu_6', 'Bash')
 
     parser.parse({
       type: 'user',
       message: {
-        content: [{ type: 'tool_result', tool_use_id: 'tu_6', content: 'x'.repeat(1000) }],
+        content: [{ type: 'tool_result', tool_use_id: 'tu_6', content: 'x'.repeat(5000) }],
       },
     } as any)
 
+    assert.equal(events.length, 1)
     if (events[0].kind === 'block' && events[0].block.kind === 'tool_result') {
-      assert.ok((events[0].block as any).preview.length <= 501) // 500 + '…'
+      assert.ok((events[0].block as any).preview.length <= 3001) // 3000 + '…'
+      assert.ok((events[0].block as any).preview.length > 3000)
     }
   })
 })

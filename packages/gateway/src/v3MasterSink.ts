@@ -89,7 +89,19 @@ export interface V3MasterSinkPayload {
   sessionId: string
   turnIndex: number
   status: 'completed' | 'interrupted' | 'crashed'
+  /** Assistant text — the user-visible content. Always written if non-empty.
+   *  Empty string is allowed when this is a thinking-only turn (Sonnet 4.6
+   *  adaptive thinking that ran out of tokens before producing text). */
   text: string
+  /** Optional reasoning/thinking text accumulated by ccbMessageParser
+   *  during the same turn (capped at MAX_THINKING_BUFFER_BYTES = 8 KB,
+   *  UTF-8 safe with `…[truncated]` tail). Master persists this as a
+   *  separate `_source: 'server'` message with `role: 'thinking'` and
+   *  ts = assistantTs - 1 so it sorts immediately before the assistant
+   *  message of the same turn. Body-cap policy: if combined body exceeds
+   *  MAX_BODY_BYTES, we drop thinkingText first to preserve assistant —
+   *  thinking is auxiliary debug content, assistant is the conversation. */
+  thinkingText?: string
   /** Optional client-supplied wall-clock ms; master uses this for the
    *  message ts so all clients see the same timestamp regardless of
    *  retry timing. Defaults to Date.now() at master if omitted. */
@@ -154,18 +166,55 @@ export async function attemptSend(
   const fetcher = deps.fetcher ?? undiciRequest
   const timeoutMs = deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS
 
-  const body = JSON.stringify({
+  const bodyObj: Record<string, unknown> = {
     sessionId: payload.sessionId,
     turnIndex: payload.turnIndex,
     status: payload.status,
     text: payload.text,
     ...(payload.createdAt !== undefined ? { createdAt: payload.createdAt } : {}),
-  })
-  if (Buffer.byteLength(body, 'utf8') > MAX_BODY_BYTES) {
-    // Local sanity: master would reject with 413 anyway. Classify as
-    // fatal so caller drops rather than enqueues — the body won't shrink
-    // under retry. This is the only client-side schema check we do.
-    throw new V3SinkError('payload exceeds master body cap', 'fatal')
+  }
+  if (payload.thinkingText && payload.thinkingText.length > 0) {
+    bodyObj.thinkingText = payload.thinkingText
+  }
+  let body = JSON.stringify(bodyObj)
+  let bodyBytes = Buffer.byteLength(body, 'utf8')
+  if (bodyBytes > MAX_BODY_BYTES) {
+    const hasAssistant = (bodyObj.text as string).length > 0
+    const hasThinking = bodyObj.thinkingText !== undefined
+    if (hasAssistant && hasThinking) {
+      // Combined over cap — drop thinkingText to preserve assistant. Thinking
+      // is auxiliary debug content; the conversation can survive without it.
+      log.warn('v3 sink dropped thinkingText to fit body cap', {
+        sessionId: payload.sessionId,
+        turnIndex: payload.turnIndex,
+        originalBytes: bodyBytes,
+      })
+      delete bodyObj.thinkingText
+      body = JSON.stringify(bodyObj)
+      bodyBytes = Buffer.byteLength(body, 'utf8')
+      if (bodyBytes > MAX_BODY_BYTES) {
+        // Assistant alone still over cap — fatal. Master's contract caps at
+        // MAX_BODY_BYTES; sending invalid body would just 413 with retry.
+        throw new V3SinkError('assistant-only payload exceeds master body cap', 'fatal')
+      }
+    } else if (hasThinking && !hasAssistant) {
+      // Thinking-only over cap. Parser-side MAX_THINKING_BUFFER_BYTES = 8 KB
+      // should prevent this; if we hit it, log loudly because it indicates
+      // the parser cap leaked. Don't strip thinkingText — that would yield
+      // a schema-invalid body (master refines text>0 || thinkingText present).
+      log.error(
+        'v3 sink thinking-only payload exceeds body cap (parser cap should have prevented this)',
+        {
+          sessionId: payload.sessionId,
+          turnIndex: payload.turnIndex,
+          bodyBytes,
+        },
+      )
+      throw new V3SinkError('thinking-only payload exceeds master body cap', 'fatal')
+    } else {
+      // Assistant alone over cap (no thinkingText to drop).
+      throw new V3SinkError('assistant-only payload exceeds master body cap', 'fatal')
+    }
   }
 
   const controller = new AbortController()

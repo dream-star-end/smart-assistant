@@ -26,6 +26,14 @@ const srv = (id: string, ts: number, text = ''): Msg => ({
   _source: 'server',
 })
 
+const srvThinking = (id: string, ts: number, text = ''): Msg => ({
+  id,
+  role: 'thinking',
+  text,
+  ts,
+  _source: 'server',
+})
+
 const cli = (id: string, ts: number, role = 'user', text = ''): Msg => ({
   id,
   role,
@@ -295,6 +303,118 @@ describe('mergePreservingServerAuthored', () => {
     ]
     const out = mergePreservingServerAuthored(server, client)
     assert.equal(out, client, 'fast path: identical reference, no dedupe')
+  })
+
+  // ── Phase 0.4: thinking phantom dedupe ──────────────────────────────────
+  // Sonnet 4.6 emits thinking blocks before the assistant text. Server
+  // persists thinking and assistant as two separate rows (role='thinking'
+  // ts=baseTs-1; role='assistant' ts=baseTs). Mobile-bg can leave the
+  // client with phantom thinking-only entries that must be dropped when
+  // the server's thinking row arrives.
+
+  it('Phase 0.4: drops client phantom thinking when server thinking lands', () => {
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srvThinking('srv-1-thinking', 199, 'server reasoning'),
+      srv('srv-1', 200, 'server answer'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      { id: 'm-think-1', ts: 150, role: 'thinking', text: 'partial thinking' } as Msg,
+      { id: 'm-asst-1', ts: 180, role: 'assistant', text: 'partial answer' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'srv-1-thinking', 'srv-1'],
+      'both phantom thinking + phantom assistant dropped, server pair kept',
+    )
+  })
+
+  it('Phase 0.4: independent role flags — drops phantom thinking but keeps client assistant when server has thinking-only', () => {
+    // Edge case: server persisted thinking but assistant write threw and
+    // sink dropped the assistant frame (extreme storage failure). Client
+    // assistant phantom must be preserved (no server rival), thinking
+    // phantom must be dropped.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srvThinking('srv-1-thinking', 199, 'server reasoning'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      { id: 'm-think-1', ts: 150, role: 'thinking', text: 'partial thinking' } as Msg,
+      { id: 'm-asst-1', ts: 200, role: 'assistant', text: 'client answer' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'srv-1-thinking', 'm-asst-1'],
+      'phantom thinking dropped, client assistant preserved (no server rival)',
+    )
+  })
+
+  it('Phase 0.4: independent role flags — drops phantom assistant but keeps client thinking when server has assistant-only', () => {
+    // Server-authored assistant only (no thinking emitted by model).
+    // Client got a phantom from a different code path (e.g. tool-use
+    // reflection that landed as role=thinking). Symmetry test for the
+    // independent-flag design.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srv('srv-1', 200, 'server answer'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      { id: 'm-think-1', ts: 150, role: 'thinking', text: 'client thinking' } as Msg,
+      { id: 'm-asst-1', ts: 180, role: 'assistant', text: 'partial' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'm-think-1', 'srv-1'],
+      'phantom assistant dropped, client thinking preserved (no server rival)',
+    )
+  })
+
+  it('Phase 0.4: thinking dedupe stays within turn group — different turns are independent', () => {
+    // Turn 1 has server-authored thinking → drop client phantom thinking.
+    // Turn 2 has only client thinking (still in-progress) → preserve it.
+    const server: Msg[] = [
+      cli('u-1', 100, 'user'),
+      srvThinking('srv-1-thinking', 199, 'turn1 reasoning'),
+      srv('srv-1', 200, 'turn1 answer'),
+      cli('u-2', 300, 'user'),
+    ]
+    const client: Msg[] = [
+      cli('u-1', 100, 'user'),
+      { id: 'm-think-1', ts: 150, role: 'thinking', text: 'turn1 partial' } as Msg,
+      cli('u-2', 300, 'user'),
+      { id: 'm-think-2', ts: 350, role: 'thinking', text: 'turn2 thinking' } as Msg,
+      { id: 'm-asst-2', ts: 400, role: 'assistant', text: 'turn2 answer' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-1', 'srv-1-thinking', 'srv-1', 'u-2', 'm-think-2', 'm-asst-2'],
+      'turn1 phantom thinking dropped, turn2 client thinking preserved',
+    )
+  })
+
+  it('Phase 0.4: replaces client thinking with server thinking when ids match', () => {
+    // Mobile-bg may have streamed partial thinking and stored it under the
+    // server's id (reconnection raced with server frame). Server-wins:
+    // server's full text replaces the client truncated text.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srvThinking('srv-1-thinking', 199, 'full server reasoning'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      { id: 'srv-1-thinking', ts: 199, role: 'thinking', text: 'truncated' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    const found = out.find((m) => m.id === 'srv-1-thinking')!
+    assert.equal(found.text, 'full server reasoning', 'server text replaces client truncated')
+    assert.equal(found._source, 'server')
   })
 })
 

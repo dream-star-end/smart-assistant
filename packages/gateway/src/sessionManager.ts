@@ -149,6 +149,14 @@ function persistServerAuthoredTurn(args: {
   userId: string | undefined
   turnIndex: number
   text: string
+  /** Optional reasoning/thinking text for the same turn (capped at
+   *  MAX_THINKING_BUFFER_BYTES = 8 KB by the parser). Persisted as a
+   *  separate `_source: 'server'` message with `role: 'thinking'`,
+   *  ts = assistantTs - 1. v3 sink path: passed through to master in the
+   *  same POST body; master writes both rows in two storage calls.
+   *  Legacy/personal path: thinking is best-effort (its write is wrapped
+   *  in try/catch, failures don't block the assistant write). */
+  thinkingText?: string
   status: 'completed' | 'interrupted' | 'crashed'
 }): Promise<void> {
   const sink = getV3MasterSinkOrNull()
@@ -158,6 +166,9 @@ function persistServerAuthoredTurn(args: {
       turnIndex: args.turnIndex,
       status: args.status,
       text: args.text,
+      ...(args.thinkingText && args.thinkingText.length > 0
+        ? { thinkingText: args.thinkingText }
+        : {}),
       createdAt: Date.now(),
     }
     return sink
@@ -200,16 +211,56 @@ function persistServerAuthoredTurn(args: {
   }
   // Legacy / personal-version path — local SQLite is authoritative.
   const messageId = `srv-${args.peerId}-t${args.turnIndex}`
+  const thinkingMessageId = `srv-${args.peerId}-t${args.turnIndex}-thinking`
   const directWrite = async () => {
     const uid = args.userId ?? ((await getClientSession(args.peerId))?.userId)
     if (!uid) return undefined // cron-style pre-UI, no owner — skip.
-    return appendServerAuthoredMessageDurable(args.peerId, uid, {
-      id: messageId,
-      role: 'assistant',
-      text: args.text,
-      ts: Date.now(),
-      status: args.status,
-    })
+    const baseTs = Date.now()
+    // Best-effort thinking write: doesn't block assistant. Failures are
+    // logged at warn (not error) because thinking is auxiliary debug
+    // content; losing it is degraded but acceptable. Assistant text is
+    // first-class and gets the structured outer .then result handling.
+    if (args.thinkingText && args.thinkingText.length > 0) {
+      try {
+        const r = await appendServerAuthoredMessageDurable(args.peerId, uid, {
+          id: thinkingMessageId,
+          role: 'thinking',
+          text: args.thinkingText,
+          ts: baseTs - 1,
+          status: args.status,
+        })
+        if (r && !r.applied && r.reason !== 'already_exists') {
+          log.warn('legacy thinking persist degraded', {
+            sessionKey: args.sessionKey,
+            peerId: args.peerId,
+            turnIndex: args.turnIndex,
+            reason: r.reason,
+          })
+        }
+      } catch (err) {
+        log.warn(
+          'legacy thinking persist threw — continuing assistant',
+          {
+            sessionKey: args.sessionKey,
+            peerId: args.peerId,
+            turnIndex: args.turnIndex,
+          },
+          err,
+        )
+      }
+    }
+    if (args.text && args.text.length > 0) {
+      return appendServerAuthoredMessageDurable(args.peerId, uid, {
+        id: messageId,
+        role: 'assistant',
+        text: args.text,
+        ts: baseTs,
+        status: args.status,
+      })
+    }
+    // thinking-only legacy turn — already logged inside the try/catch above.
+    // Return undefined so outer .then's `if (!r) return` short-circuits.
+    return undefined
   }
   return directWrite()
     .then((r) => {
@@ -1350,9 +1401,17 @@ export class SessionManager {
             // turns are not routed to a per-user client session and thus
             // skip this path — they're tracked via sessions_meta / event_log
             // instead, and will be addressed in Phase 1 (channel broadcast).
-            if (session.channel === 'webchat' && result.assistantText && result.assistantText.length > 0) {
+            const completedHasAssistant =
+              !!result.assistantText && result.assistantText.length > 0
+            const completedHasThinking =
+              !!result.thinkingText && result.thinkingText.length > 0
+            if (
+              session.channel === 'webchat' &&
+              (completedHasAssistant || completedHasThinking)
+            ) {
               const peerId = session.peerId
-              const assistantText = result.assistantText
+              const assistantText = result.assistantText ?? ''
+              const thinkingText = result.thinkingText ?? ''
               const turnIndex = session.turns
               // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
               // we have it — this lets `appendServerAuthoredMessageDurable`
@@ -1360,12 +1419,21 @@ export class SessionManager {
               // dropping when the client's debounced PUT hasn't landed yet.
               // Fall back to `getClientSession` lookup for legacy code paths
               // that didn't carry userId (cron pre-warm, old webchat calls).
+              //
+              // thinkingText is forwarded too (Phase 0.4 thinking durability):
+              // server-wins overwrite path was discarding the streaming-only
+              // thinking buffer; persisting it as `_source: 'server'` keeps it
+              // through merge-preserving-server-authored & through phantom
+              // dedupe. Threshold extended to "thinking-only" turns (Sonnet
+              // 4.6 adaptive thinking that runs out of tokens before producing
+              // assistant text) so those don't disappear either.
               this._trackPersistence(persistServerAuthoredTurn({
                 sessionKey: session.sessionKey,
                 peerId,
                 userId: session.userId,
                 turnIndex,
                 text: assistantText,
+                ...(completedHasThinking ? { thinkingText } : {}),
                 status: 'completed',
               }))
             }
@@ -1537,7 +1605,14 @@ export class SessionManager {
                 // "[was interrupted]" trailer rather than showing a complete-
                 // looking bubble.
                 const partial = parser.assistantBuf
-                if (session.channel === 'webchat' && partial && partial.length > 0) {
+                const partialThinking = parser.thinkingBuf
+                const hasPartial = !!partial && partial.length > 0
+                const hasPartialThinking =
+                  !!partialThinking && partialThinking.length > 0
+                if (
+                  session.channel === 'webchat' &&
+                  (hasPartial || hasPartialThinking)
+                ) {
                   const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
                   const peerId = session.peerId
                   const turnIndex = session.turns + 1 // turn hasn't been counted yet
@@ -1547,12 +1622,15 @@ export class SessionManager {
                   // Awaited here so flushP settles only after the durable
                   // enqueue (or persistOrQueue resolution) — that's the
                   // promise the pending-persistence set is gating shutdown on.
+                  // thinkingText forwarded so partial reasoning isn't lost
+                  // on crash/interrupt (Phase 0.4 thinking durability).
                   await persistServerAuthoredTurn({
                     sessionKey: session.sessionKey,
                     peerId,
                     userId: session.userId,
                     turnIndex,
-                    text: partial,
+                    text: partial ?? '',
+                    ...(hasPartialThinking ? { thinkingText: partialThinking } : {}),
                     status,
                   })
                 }

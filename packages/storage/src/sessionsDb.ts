@@ -586,11 +586,20 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   }
   merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
 
-  // Phantom-assistant dedupe (rule 3): partition merged[] into turns on
-  // user/system messages (which act as turn boundaries — the model never
-  // produces those client-side on its own). Within each partition, if any
-  // server-authored assistant exists, drop ALL non-server-authored
-  // assistants in that partition (they are phantoms of the same turn).
+  // Phantom dedupe (rule 3): partition merged[] into turns on user/system
+  // messages (turn boundaries — the model never produces those client-side
+  // on its own). Within each partition, dedupe two roles independently:
+  //   - assistant: if a server-authored assistant exists in the group, drop
+  //     all non-server-authored assistants in that group.
+  //   - thinking: same rule, but for role==='thinking' messages.
+  //
+  // Why two independent role flags (vs one combined): server writes a
+  // thinking row with role==='thinking' and an assistant row with
+  // role==='assistant'. They share a turn group. A client streaming buffer
+  // may produce a phantom thinking-only message but NOT a phantom assistant
+  // (or vice versa). Treating them independently lets us drop just the
+  // role that has a server counterpart, preserving the other role's client
+  // version when there's no server counterpart yet (mid-streaming snapshot).
   //
   // This is broader than a simple adjacency check because tool-use turns
   // end up with MULTIPLE client-side assistant segments separated by
@@ -600,55 +609,58 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   // adjacency would leave earlier client segments orphaned.
   //
   // Never drops a server-authored message; never drops a client message
-  // that is not an assistant (tool, tool_result, user, thinking, etc. are
+  // that is not an assistant or thinking (tool, tool_result, user, etc.
   // always preserved). Also tolerates both ts-sort orders of the server
   // row relative to client segments (server clock earlier or later).
+  //
+  // Subagent thinking lives inside `childBlocks.kind: 'thinking'` of an
+  // assistant message — it is NOT a top-level role==='thinking' message,
+  // so this dedupe does not touch it.
   const deduped: T[] = []
   const isAssistant = (m: T) => (m as { role?: string }).role === 'assistant'
+  const isThinking = (m: T) => (m as { role?: string }).role === 'thinking'
   const isTurnBoundary = (m: T) => {
     const role = (m as { role?: string }).role
     return role === 'user' || role === 'system'
   }
   // First pass: compute per-index turn group id, and whether that group has
-  // any server-authored assistant. We need this because the decision to
-  // drop a phantom depends on the ENTIRE partition, not just its neighbours.
+  // any server-authored assistant or thinking message.
   const turnGroup: number[] = new Array(merged.length)
   const groupHasServerAsst: boolean[] = []
+  const groupHasServerThinking: boolean[] = []
   let groupId = 0
-  let currentGroupHasServer = false
+  let curGroupServerAsst = false
+  let curGroupServerThinking = false
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (cur && isTurnBoundary(cur)) {
-      // Close previous group, open a new one. The boundary itself belongs
-      // to the starting group of what follows (a user message opens a new
-      // turn; we tag it with the new groupId so any dedupe scan after it
-      // lands in the right bucket).
-      groupHasServerAsst.push(currentGroupHasServer)
+      // Close previous group, open a new one.
+      groupHasServerAsst.push(curGroupServerAsst)
+      groupHasServerThinking.push(curGroupServerThinking)
       groupId++
-      currentGroupHasServer = false
+      curGroupServerAsst = false
+      curGroupServerThinking = false
     }
     turnGroup[i] = groupId
-    if (cur && isAssistant(cur) && cur._source === 'server') {
-      currentGroupHasServer = true
+    if (cur && cur._source === 'server') {
+      if (isAssistant(cur)) curGroupServerAsst = true
+      else if (isThinking(cur)) curGroupServerThinking = true
     }
   }
-  groupHasServerAsst.push(currentGroupHasServer)
+  groupHasServerAsst.push(curGroupServerAsst)
+  groupHasServerThinking.push(curGroupServerThinking)
 
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (!cur) { deduped.push(cur); continue }
-    // Keep server-authored messages, non-assistant messages, and assistants
-    // in a partition that has no server-authored counterpart.
-    if (!isAssistant(cur) || cur._source === 'server') {
+    // Keep server-authored messages and non-(assistant|thinking) messages.
+    if (cur._source === 'server' || (!isAssistant(cur) && !isThinking(cur))) {
       deduped.push(cur)
       continue
     }
     const g = turnGroup[i]
-    if (groupHasServerAsst[g]) {
-      // This client-assistant lives in a turn that the server re-authored.
-      // Drop as phantom.
-      continue
-    }
+    if (isAssistant(cur) && groupHasServerAsst[g]) continue
+    if (isThinking(cur) && groupHasServerThinking[g]) continue
     deduped.push(cur)
   }
   return deduped
@@ -912,7 +924,17 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
 export async function appendServerAuthoredMessage(
   sessId: string,
   userId: string,
-  message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
+  message: {
+    id: string
+    /** 'thinking' added to support v3 server-authored thinking persistence
+     *  (mobile-stream durability for Sonnet 4.6 adaptive thinking). Same
+     *  storage path as 'assistant'; phantom-dedupe applies independently
+     *  to each role inside `mergePreservingServerAuthored`. */
+    role: 'assistant' | 'user' | 'system' | 'thinking'
+    text?: string
+    ts?: number
+    [k: string]: unknown
+  },
 ): Promise<{ applied: boolean; reason?: 'session_not_found' | 'already_exists' | 'malformed' }> {
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
@@ -968,7 +990,7 @@ export interface QueuedMessage {
   userId: string
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system'
+    role: 'assistant' | 'user' | 'system' | 'thinking'
     text?: string
     ts?: number
     status?: 'completed' | 'interrupted' | 'crashed'
@@ -1036,7 +1058,13 @@ export async function queueMessageToOutbox(entry: QueuedMessage): Promise<void> 
 export async function appendServerAuthoredMessageDurable(
   sessId: string,
   userId: string,
-  message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
+  message: {
+    id: string
+    role: 'assistant' | 'user' | 'system' | 'thinking'
+    text?: string
+    ts?: number
+    [k: string]: unknown
+  },
 ): Promise<
   | { applied: true }
   | { applied: false; reason: 'already_exists' | 'malformed' }

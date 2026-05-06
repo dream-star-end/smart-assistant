@@ -29,7 +29,7 @@ import {
   type ServerAuthoredStorage,
   type ServerAuthoredHandlerCtx,
 } from "../http/internalServerAuthored.js";
-import type { V3SinkPersistOutcome } from "../admin/metrics.js";
+import type { V3SinkPersistOutcome, V3SinkPersistRole } from "../admin/metrics.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
 
 // ─── tiny test fixtures ─────────────────────────────────────────────────
@@ -454,5 +454,266 @@ describe("internalServerAuthored handler — sink persist metric outcomes", () =
     const { res } = makeRes();
     await h(makeReq({ method: "GET" }), res, CTX);
     assert.deepEqual(m.calls, []);
+  });
+});
+
+// ─── Phase 0.4: thinking durability — dual-write paths ──────────────────
+describe("internalServerAuthored handler — thinking durability", () => {
+  type Call = [V3SinkPersistOutcome, V3SinkPersistRole | undefined];
+  function captureMetricRich(): { calls: Call[]; metric: (o: V3SinkPersistOutcome, r?: V3SinkPersistRole) => void } {
+    const calls: Call[] = [];
+    return { calls, metric: (o, r) => calls.push([o, r]) };
+  }
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+
+  // Storage that records role + id of every call so we can assert the
+  // double-write semantics (thinking row first, assistant row second).
+  function recordingStorage(): {
+    storage: ServerAuthoredStorage;
+    rows: Array<{ role: string; id: string; ts: number; text: string }>;
+    setNextResult: (r: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>, role?: "thinking" | "assistant") => void;
+    setNextThrow: (e: Error, role?: "thinking" | "assistant") => void;
+  } {
+    const rows: Array<{ role: string; id: string; ts: number; text: string }> = [];
+    const overrides: Record<string, Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>> = {};
+    const throwers: Record<string, Error> = {};
+    return {
+      rows,
+      setNextResult(r, role) {
+        if (role) overrides[role] = r;
+        else { overrides["thinking"] = r; overrides["assistant"] = r; }
+      },
+      setNextThrow(e, role) {
+        if (role) throwers[role] = e;
+        else { throwers["thinking"] = e; throwers["assistant"] = e; }
+      },
+      storage: {
+        async appendServerAuthoredMessage(_sessId, _userId, msg) {
+          rows.push({ role: msg.role, id: msg.id, ts: msg.ts, text: msg.text });
+          if (throwers[msg.role]) throw throwers[msg.role];
+          return overrides[msg.role] ?? { applied: true };
+        },
+      },
+    };
+  }
+
+  // ─ thinking-only paths (Branch A) ─
+
+  test("thinking-only applied → 200 ok, single thinking metric", async () => {
+    const rec = recordingStorage();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    const body = JSON.stringify({
+      sessionId: "sess12345",
+      turnIndex: 1,
+      status: "completed",
+      text: "",
+      thinkingText: "reasoning here",
+    });
+    await h(authed(body), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows.length, 1);
+    assert.equal(rec.rows[0].role, "thinking");
+    assert.equal(rec.rows[0].id, "srv-sess12345-t1-thinking");
+    assert.deepEqual(m.calls, [["ok", "thinking"]]);
+  });
+
+  test("thinking-only already_exists → 200 idempotent, deduped/thinking", async () => {
+    const rec = recordingStorage();
+    rec.setNextResult({ applied: false, reason: "already_exists" }, "thinking");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed", text: "", thinkingText: "x",
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const parsed = JSON.parse(resRec.body) as { ok: boolean; idempotent?: boolean };
+    assert.equal(parsed.idempotent, true);
+    assert.deepEqual(m.calls, [["deduped", "thinking"]]);
+  });
+
+  test("thinking-only session_not_found → 404, reject_session_missing/thinking", async () => {
+    const rec = recordingStorage();
+    rec.setNextResult({ applied: false, reason: "session_not_found" }, "thinking");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed", text: "", thinkingText: "x",
+    })), res, CTX);
+    assert.equal(resRec.status, 404);
+    assert.deepEqual(m.calls, [["reject_session_missing", "thinking"]]);
+  });
+
+  test("thinking-only storage throws → 500 (sink retries; can't drop the only data)", async () => {
+    const rec = recordingStorage();
+    rec.setNextThrow(new Error("disk full"), "thinking");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed", text: "", thinkingText: "x",
+    })), res, CTX);
+    assert.equal(resRec.status, 500);
+    assert.deepEqual(m.calls, [["error", "thinking"]]);
+  });
+
+  test("thinking-only malformed → 500, error/thinking", async () => {
+    const rec = recordingStorage();
+    rec.setNextResult({ applied: false, reason: "malformed" }, "thinking");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed", text: "", thinkingText: "x",
+    })), res, CTX);
+    assert.equal(resRec.status, 500);
+    assert.deepEqual(m.calls, [["error", "thinking"]]);
+  });
+
+  // ─ both fields (Branch B) ─
+
+  test("both fields, both applied → 200 ok, two metrics (thinking then assistant), thinking ts=baseTs-1, assistant ts=baseTs", async () => {
+    const rec = recordingStorage();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 2, status: "completed",
+      text: "answer", thinkingText: "reasoning", createdAt: 5_000,
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    // Two storage rows: thinking first (lower ts), assistant second.
+    assert.equal(rec.rows.length, 2);
+    assert.equal(rec.rows[0].role, "thinking");
+    assert.equal(rec.rows[0].ts, 4_999);
+    assert.equal(rec.rows[0].id, "srv-sess12345-t2-thinking");
+    assert.equal(rec.rows[1].role, "assistant");
+    assert.equal(rec.rows[1].ts, 5_000);
+    assert.equal(rec.rows[1].id, "srv-sess12345-t2");
+    // Two metrics in order: thinking, then assistant
+    assert.deepEqual(m.calls, [["ok", "thinking"], ["ok", "assistant"]]);
+  });
+
+  test("both fields, thinking already_exists, assistant applied → 200, deduped/thinking + ok/assistant", async () => {
+    const rec = recordingStorage();
+    rec.setNextResult({ applied: false, reason: "already_exists" }, "thinking");
+    rec.setNextResult({ applied: true }, "assistant");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 2, status: "completed",
+      text: "answer", thinkingText: "reasoning",
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.deepEqual(m.calls, [["deduped", "thinking"], ["ok", "assistant"]]);
+  });
+
+  test("DEGRADE: thinking storage throws, assistant applied → 200 ok (thinking dropped, assistant preserved)", async () => {
+    const rec = recordingStorage();
+    rec.setNextThrow(new Error("disk full"), "thinking");
+    rec.setNextResult({ applied: true }, "assistant");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 3, status: "completed",
+      text: "answer", thinkingText: "reasoning",
+    })), res, CTX);
+    // Assistant succeeded → 200 (degrade gracefully, thinking lost but
+    // conversation flows). Both metrics emitted: error/thinking + ok/assistant.
+    assert.equal(resRec.status, 200);
+    assert.deepEqual(m.calls, [["error", "thinking"], ["ok", "assistant"]]);
+  });
+
+  test("DEGRADE: thinking applied, assistant session_not_found → 404 (sink retries; assistant decides HTTP)", async () => {
+    const rec = recordingStorage();
+    rec.setNextResult({ applied: true }, "thinking");
+    rec.setNextResult({ applied: false, reason: "session_not_found" }, "assistant");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 4, status: "completed",
+      text: "answer", thinkingText: "reasoning",
+    })), res, CTX);
+    assert.equal(resRec.status, 404);
+    assert.deepEqual(m.calls, [["ok", "thinking"], ["reject_session_missing", "assistant"]]);
+  });
+
+  test("assistant-only (no thinkingText key) → single assistant metric, no thinking row", async () => {
+    const rec = recordingStorage();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 5, status: "completed", text: "answer",
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows.length, 1);
+    assert.equal(rec.rows[0].role, "assistant");
+    assert.deepEqual(m.calls, [["ok", "assistant"]]);
+  });
+
+  test("schema rejects empty text + empty/missing thinkingText (refine: at least one field)", async () => {
+    const rec = recordingStorage();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 6, status: "completed", text: "",
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.equal(rec.rows.length, 0, "no storage call when schema rejects");
+    assert.deepEqual(m.calls, [["reject_bad_body", undefined]]);
   });
 });

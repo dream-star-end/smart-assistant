@@ -104,6 +104,80 @@ describe("enqueueDurable", () => {
     const files = await listJsonFiles();
     assert.equal(files.length, 5);
   });
+
+  // ── Phase 0.4: thinkingText durability through retry queue ──
+  test("thinkingText round-trips through enqueue + transient rewrite + successful drain", async () => {
+    // Three-step lifecycle to lock in the durability invariant:
+    //   1. enqueue → on-disk JSON includes thinkingText
+    //   2. drain with transient throw → rewrite still contains thinkingText
+    //   3. drain with success → attemptSend receives thinkingText from disk
+    let stage: "transient" | "success" = "transient";
+    let lastSeen: string | undefined;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async (p) => {
+        lastSeen = p.thinkingText;
+        if (stage === "transient")
+          throw new V3SinkError("master 502", "transient", 502);
+        // success path
+      },
+    });
+
+    const payload = basePayload({
+      thinkingText: "step 1. think. step 2. answer.",
+    });
+    await writeEntryDirect(entry(payload));
+
+    // Stage 1: assert raw file carries thinkingText
+    const filesBefore = await listJsonFiles();
+    const beforeRaw = JSON.parse(
+      await readFile(join(dir, filesBefore[0]), "utf8"),
+    ) as V3MasterRetryEntry;
+    assert.equal(beforeRaw.payload.thinkingText, "step 1. think. step 2. answer.");
+
+    // Stage 2: transient retry preserves thinkingText after rewrite
+    await q.drainOnce();
+    const filesAfter = await listJsonFiles();
+    assert.equal(filesAfter.length, 1, "transient leaves entry on disk");
+    const afterRaw = JSON.parse(
+      await readFile(join(dir, filesAfter[0]), "utf8"),
+    ) as V3MasterRetryEntry;
+    assert.equal(afterRaw.attempts, 2, "attempts bumped");
+    assert.equal(
+      afterRaw.payload.thinkingText,
+      "step 1. think. step 2. answer.",
+      "thinkingText preserved through rewrite",
+    );
+
+    // Stage 3: success drain — attemptSend sees thinkingText
+    stage = "success";
+    await q.drainOnce();
+    assert.equal(lastSeen, "step 1. think. step 2. answer.");
+    const filesEnd = await listJsonFiles();
+    assert.equal(filesEnd.length, 0, "successful drain unlinked");
+  });
+
+  test("thinking-only payload (text='') round-trips through retry queue", async () => {
+    // Edge case: Sonnet 4.6 turn that produced thinking but ran out of
+    // tokens before assistant text. The retry queue must not drop this
+    // entry just because text is empty.
+    let received: { text: string; thinkingText?: string } | undefined;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async (p) => {
+        received = { text: p.text, thinkingText: p.thinkingText };
+      },
+    });
+    await writeEntryDirect(
+      entry(basePayload({ text: "", thinkingText: "thinking-only reasoning" })),
+    );
+    const stats = await q.drainOnce();
+    assert.equal(stats.drained, 1);
+    assert.deepEqual(received, {
+      text: "",
+      thinkingText: "thinking-only reasoning",
+    });
+  });
 });
 
 // ─── drainOnce: success path ─────────────────────────────────────────────

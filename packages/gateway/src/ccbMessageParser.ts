@@ -6,8 +6,43 @@
  * message parsing from session orchestration concerns.
  */
 import { performance } from 'node:perf_hooks'
+import { Buffer } from 'node:buffer'
 import type { OutboundContentBlock } from '@openclaude/protocol'
 import type { SdkMessage } from './subprocessRunner.js'
+
+/** Hard cap on accumulated main-agent thinking bytes per turn. Sonnet 4.6
+ *  adaptive thinking can exceed 100 KB on complex turns; we don't want to
+ *  hold that much in process memory or pump it through the v3 sink. 8 KB
+ *  is enough for a "what was the model reasoning" snippet and keeps body
+ *  well under the 256 KB sink cap when combined with assistant text.
+ *
+ *  Truncation guarantees:
+ *    - UTF-8 code-point safe: we never split a multi-byte sequence (would
+ *      produce U+FFFD on decode).
+ *    - NOT grapheme-cluster safe: ZWJ family sequences (e.g., 👨‍👩‍👧)
+ *      may be truncated mid-cluster, leaving a visually incomplete but
+ *      valid Unicode string. Acceptable for a debug snippet.
+ *    - Tail marker `…[truncated]` is always within the hard cap because
+ *      we manage `MAX_THINKING_CONTENT_BYTES = MAX - tailBytes` separately. */
+export const MAX_THINKING_BUFFER_BYTES = 8 * 1024
+const THINKING_TRUNCATE_TAIL = '…[truncated]'
+const THINKING_TAIL_BYTES = Buffer.byteLength(THINKING_TRUNCATE_TAIL, 'utf8')
+const MAX_THINKING_CONTENT_BYTES = MAX_THINKING_BUFFER_BYTES - THINKING_TAIL_BYTES
+
+/**
+ * Truncate `s` to at most `maxBytes` UTF-8 bytes WITHOUT splitting a multi-
+ * byte sequence. Walks back from the byte budget to the last UTF-8 leading
+ * byte (continuation bytes are 0x80-0xBF). Handles 4-byte sequences (emoji,
+ * Han Extended) correctly because they're contiguous at the byte level.
+ */
+function sliceUtf8Safe(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, 'utf8')
+  if (buf.length <= maxBytes) return s
+  let end = maxBytes
+  // buf[end] safely indexable: end < buf.length (since buf.length > maxBytes >= end)
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--
+  return buf.subarray(0, end).toString('utf8')
+}
 
 /** Permission request from CCB (via stdio control_request protocol) */
 export interface PermissionRequest {
@@ -87,6 +122,14 @@ export interface TurnResult {
   cacheReadTokens: number
   cacheCreationTokens: number
   assistantText: string
+  /** Main-agent thinking text accumulated this turn from thinking_delta
+   *  events, capped at MAX_THINKING_BUFFER_BYTES. Empty string when the
+   *  model didn't emit any thinking blocks (most non-Sonnet/non-extended-
+   *  thinking turns). Subagent thinking is excluded — same rule as
+   *  assistantText. Used by sessionManager.persistServerAuthoredTurn to
+   *  pass thinking through the v3 sink so it survives mobile-bg recovery
+   *  and server-wins overwrites. */
+  thinkingText: string
   /** True if CCB marked the result as an error (e.g. API failure) */
   isError: boolean
   /** Anthropic API stop_reason from CCB's result row; null if CCB didn't
@@ -125,6 +168,19 @@ export class CcbMessageParser {
   public pendingToolCalls = 0
   /** Assistant text accumulated in this turn */
   public assistantBuf = ''
+  /** Main-agent thinking text accumulated in this turn from thinking_delta
+   *  events. Capped at MAX_THINKING_BUFFER_BYTES with a `…[truncated]` tail.
+   *  Subagent thinking (parentToolUseId set) is excluded — it lives inside
+   *  child block rendering, not in the parent turn's authoritative buffer. */
+  public thinkingBuf = ''
+  /** Running byte count of the CONTENT in thinkingBuf (excludes the tail
+   *  marker). Capped at MAX_THINKING_CONTENT_BYTES so adding the tail later
+   *  is guaranteed to fit under the hard cap. */
+  private thinkingBufBytes = 0
+  /** Once true, all subsequent thinking_delta events for this turn skip
+   *  accumulation. The tail marker is appended exactly once on the first
+   *  delta that pushes us over the content budget. */
+  private thinkingTruncated = false
   /** Whether this turn has been finalized */
   public finalized = false
   /** Accumulated turn result (set when finalized) */
@@ -349,6 +405,30 @@ export class CcbMessageParser {
       } else if (delta.type === 'thinking_delta' && delta.thinking) {
         const thinkStr =
           typeof delta.thinking === 'string' ? delta.thinking : JSON.stringify(delta.thinking)
+        // Accumulate main-agent thinking into thinkingBuf for v3 server-
+        // authored persistence. Subagent thinking (parentToolUseId set) is
+        // streamed to UI only — never merged into the parent's stored turn.
+        // Truncation: hard 8 KB cap with UTF-8 code-point-safe slice + tail
+        // marker. UI streams the FULL delta unchanged regardless of cap state;
+        // only the persisted buffer is bounded.
+        if (!parentToolUseId && !this.thinkingTruncated) {
+          const deltaBytes = Buffer.byteLength(thinkStr, 'utf8')
+          if (this.thinkingBufBytes + deltaBytes <= MAX_THINKING_CONTENT_BYTES) {
+            this.thinkingBuf += thinkStr
+            this.thinkingBufBytes += deltaBytes
+          } else {
+            const remaining = MAX_THINKING_CONTENT_BYTES - this.thinkingBufBytes
+            if (remaining > 0) {
+              const partial = sliceUtf8Safe(thinkStr, remaining)
+              this.thinkingBuf += partial
+              this.thinkingBufBytes += Buffer.byteLength(partial, 'utf8')
+            }
+            // thinkingBufBytes ≤ MAX_THINKING_CONTENT_BYTES guaranteed, so
+            // total bytes after appending tail ≤ MAX_THINKING_BUFFER_BYTES.
+            this.thinkingBuf += THINKING_TRUNCATE_TAIL
+            this.thinkingTruncated = true
+          }
+        }
         this.onEvent({ kind: 'block', block: withParent({ kind: 'thinking', text: thinkStr }) })
       } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
         const toolId = this.indexToToolId.get(ev.index as number)
@@ -577,6 +657,7 @@ export class CcbMessageParser {
       cacheReadTokens: usage.cache_read_input_tokens ?? 0,
       cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
       assistantText: this.assistantBuf,
+      thinkingText: this.thinkingBuf,
       isError: !!(msg as any).is_error,
       stopReason,
       numTurns,

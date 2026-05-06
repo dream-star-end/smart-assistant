@@ -444,7 +444,7 @@ export const wsBridgeTtft = new Histogram(
 export const v3SinkPersist = new Counter({
   name: "oc_v3_sink_persist_total",
   help: "V3 commercial container→master server-authored sink persist outcome",
-  labelNames: ["outcome"],
+  labelNames: ["outcome", "role"],
 });
 
 export type V3SinkPersistOutcome =
@@ -454,8 +454,23 @@ export type V3SinkPersistOutcome =
   | "reject_unauthorized"
   | "reject_bad_body"
   | "error";
-export function incrV3SinkPersist(outcome: V3SinkPersistOutcome): void {
-  v3SinkPersist.inc({ outcome });
+
+export type V3SinkPersistRole = "thinking" | "assistant";
+
+/** Increment v3 sink persist counter.
+ *
+ * The optional `role` label distinguishes thinking-row persistence from
+ * assistant-row persistence (Phase 0.4 thinking durability). Pre-role
+ * outcomes (`reject_unauthorized` / `reject_bad_body` etc. — fired before
+ * we've parsed the body and know which role(s) it carries) pass `undefined`
+ * and surface as an empty string label. Use PromQL `{role!=""}` to filter
+ * out the pre-role rejects when summing per-role rates.
+ */
+export function incrV3SinkPersist(
+  outcome: V3SinkPersistOutcome,
+  role?: V3SinkPersistRole,
+): void {
+  v3SinkPersist.inc({ outcome, role: role ?? "" });
 }
 
 // ─── 便捷 incr / observe helpers ────────────────────────────────────
