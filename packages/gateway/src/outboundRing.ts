@@ -98,6 +98,44 @@ export class OutboundRingBuffer {
   }
 
   /**
+   * Idempotent store for callers that already own the frameSeq stamp upstream
+   * (instead of allocating one via `nextSeq()`). Used by the v3 commercial
+   * bridge: containers stamp `frameSeq` themselves, the bridge can only
+   * observe and persist the stamped value — re-stamping would diverge from
+   * what the client cursor expects.
+   *
+   * Idempotency: when multiple bridge instances share a process-singleton
+   * ring (multi-tab fan-out, where the container broadcasts the same wire
+   * frame down each open WS), they each call `storeStamped` with the same
+   * `(sessionKey, seq)`. `seq <= prevLast` is treated as a duplicate write
+   * and skipped — `lastSeq` is **not** demoted, the existing ring entry is
+   * **not** replaced, and no eviction stats are produced.
+   *
+   * Container lifecycle reset is handled by the caller embedding a
+   * lifecycle discriminator (e.g. containerId) into `sessionKey`, so a
+   * post-restart frame seq=1 lands in a fresh namespace and never collides
+   * with the previous container's seq=1. This keeps `storeStamped` purely
+   * idempotent — no in-band reset detection.
+   */
+  storeStamped(sessionKey: string, seq: number, now: number, data: string): EvictionStats {
+    const prevLast = this.lastSeq.get(sessionKey) ?? 0
+    if (seq <= prevLast) {
+      // Multi-bridge duplicate or upstream-bug retransmit. Skip silently.
+      return { entries: 0, age: 0, bytes: 0 }
+    }
+    this.lastSeq.set(sessionKey, seq)
+    let ring = this.rings.get(sessionKey)
+    if (!ring) {
+      ring = { frames: [], totalBytes: 0 }
+      this.rings.set(sessionKey, ring)
+    }
+    const bytes = Buffer.byteLength(data, 'utf8')
+    ring.frames.push({ seq, ts: now, data, bytes })
+    ring.totalBytes += bytes
+    return this.prune(ring, now)
+  }
+
+  /**
    * Compute replay decision for a client cursor. Does NOT actually call
    * ws.send — returns the frames to send (or a miss reason) so the caller
    * can wire it to whatever transport it owns.
@@ -201,6 +239,38 @@ export class OutboundRingBuffer {
   clear(sessionKey: string): void {
     this.rings.delete(sessionKey)
     this.lastSeq.delete(sessionKey)
+  }
+
+  /**
+   * Background sweep across every stored sessionKey: prune by all three bounds,
+   * then drop ring entries that age out completely. Intended to be called by
+   * a low-frequency timer (e.g. once per minute) in long-lived multi-tenant
+   * gateways — without it, lazy on-touch pruning leaves stale namespaces from
+   * old container lifecycles in memory indefinitely (v3 commercial bridge
+   * stamps storeKey with `${uid}:${containerId}:...`; a recycled container
+   * gets a fresh storeKey and the old one is never accessed again).
+   *
+   * `lastSeq` is intentionally retained even after `frames` empties: the
+   * `peekReplay` no_buffer/sequence_mismatch contract distinguishes "session
+   * never had frames" (lastSeq=0) from "session had frames, ring pruned"
+   * (lastSeq>0). Dropping lastSeq would silently flip a real out-of-window
+   * cursor into a fresh-session ok/[]. The lastSeq Map entry itself costs
+   * <100 bytes and grows slowly relative to ring frame memory.
+   */
+  pruneAll(now: number): EvictionStats {
+    const total: EvictionStats = { entries: 0, age: 0, bytes: 0 }
+    for (const [key, ring] of this.rings) {
+      const ev = this.prune(ring, now)
+      total.entries += ev.entries
+      total.age += ev.age
+      total.bytes += ev.bytes
+      if (ring.frames.length === 0) {
+        // Empty ring: drop the SessionRing struct so the rings Map doesn't
+        // grow without bound across container lifecycles. lastSeq survives.
+        this.rings.delete(key)
+      }
+    }
+    return total
   }
 
   /** Cause-aware eviction: each dropped frame is attributed to exactly one

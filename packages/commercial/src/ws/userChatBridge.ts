@@ -63,6 +63,7 @@ import {
   type CodexFinalizeHandle,
 } from "../billing/codexFinalizer.js";
 import type { TokenUsage } from "../billing/calculator.js";
+import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 
 // ---------- 协议 / 常量 -----------------------------------------------------
 
@@ -604,6 +605,46 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes });
 
   /**
+   * Phase 0.4 — bridge-layer outbound ring buffer (process-singleton).
+   *
+   * Personal-master ports its `outboundRing` here so that v3-commercial bridges
+   * can serve `inbound.hello.lastFrameSeq` replays close to the client without
+   * relying on the embedded container's ring (which sees a different WS socket
+   * after every reconnect and has no privileged view of cross-tab state).
+   *
+   * Storage key:    `${uid}:${containerId}:${sessionKey}`
+   *   - `uid` isolates tenants (multiple users share one bridge process)
+   *   - `containerId` namespaces a container's lifetime — a fresh container
+   *     gets a fresh slot, so seq=1 from a restarted container never collides
+   *     with the previous container's seq=1 (no in-band reset signal needed)
+   *   - `sessionKey` is the wire-stamped key the personal-master gateway
+   *     embedded into the outbound frame (verbatim, NOT recomputed)
+   *
+   * Container ring still receives hello and may also serve replay; client-side
+   * frameSeq dedupe (websocket.js handleOutbound) absorbs any duplicate frames.
+   */
+  const outboundRing = new OutboundRingBuffer(DEFAULT_RING_CONFIG);
+
+  /**
+   * 周期性 lazy prune 兜底。
+   *
+   * OutboundRingBuffer 的 store / peekReplay 只在被 touch 的 key 上做 prune;
+   * 当 containerId 变了之后,旧 `${uid}:${oldCid}:${sessionKey}` 的 key 不再
+   * 被任何路径访问,frames 残留 + rings Map entry 不释放,会随容器生命周期累积。
+   *
+   * 60s 跑一次 pruneAll(now): 对所有 ring 应用 TTL/cap 驱逐,空 ring 从 Map 删除。
+   * lastSeq Map 不动 —— 删了会破坏"上次有过 frameSeq>0 但都过期了"的语义,
+   * 让冷 tab/state-reset 后 hello cursor=0 + currentLast>0 的 client 拿到
+   * ok+[](静默不丢)而不是 resume_failed(no_buffer)→ REST 强同步。
+   * lastSeq entry 不带 frame data,单 entry 内存代价 <100B,慢漏可接受。
+   */
+  const ringPruneTimer: NodeJS.Timeout = setInterval(
+    () => { outboundRing.pruneAll(Date.now()); },
+    60_000,
+  );
+  ringPruneTimer.unref?.();
+
+  /**
    * uid(string) → 该用户当前持有的所有正在正常桥接中的 user WS 集合。
    *
    * 为什么单独维护一份而不用 ConnectionRegistry:
@@ -1065,6 +1106,72 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         if (frameStr !== null) {
           let parsed: unknown = null;
           try { parsed = JSON.parse(frameStr); } catch { /* 非 JSON 帧透传 */ }
+          // Phase 0.4 — inbound.hello → bridge ring replay.
+          //
+          // Each peer in the hello carries `lastFrameSeq` (last outbound seq
+          // the tab successfully processed). We peekReplay against the
+          // bridge-layer ring; if it satisfies, push the missed frames over
+          // userWs. If it can't, emit `outbound.resume_failed` so the client
+          // escalates to REST sync (matches personal-master server.ts
+          // autoResumeFromHello envelope verbatim — same shape as what the
+          // container would have emitted).
+          //
+          // We do NOT return here: hello must still reach the container so
+          // its embedded gateway registers `bridge.containerWs` into
+          // `clientsByPeer` for live delivery. Container's own peekReplay
+          // may also fire — duplicate frames are deduped client-side via
+          // the frameSeq cursor in websocket.js handleOutbound.
+          if (
+            parsed !== null &&
+            typeof parsed === "object" &&
+            (parsed as { type?: unknown }).type === "inbound.hello" &&
+            containerId !== undefined
+          ) {
+            const helloPeers = (parsed as { peers?: unknown }).peers;
+            const peers = Array.isArray(helloPeers) ? helloPeers : [];
+            const cidStr = containerId.toString();
+            const uidStr = uid.toString();
+            for (const p of peers) {
+              if (typeof p !== "object" || p === null) continue;
+              const peer = p as {
+                peerId?: unknown;
+                agentId?: unknown;
+                lastFrameSeq?: unknown;
+              };
+              if (typeof peer.peerId !== "string") continue;
+              const aid =
+                typeof peer.agentId === "string" && peer.agentId !== ""
+                  ? peer.agentId
+                  : "main";
+              // Match openclaude/packages/gateway server.ts L3459-3460
+              // sanitisation verbatim — same regex, same default kind=dm.
+              const safeId = peer.peerId.replace(/[^a-zA-Z0-9_-]/g, "_");
+              const sessionKey = `agent:${aid}:webchat:dm:${safeId}`;
+              const storeKey = `${uidStr}:${cidStr}:${sessionKey}`;
+              const cursor =
+                typeof peer.lastFrameSeq === "number" ? peer.lastFrameSeq : 0;
+              const replay = outboundRing.peekReplay(storeKey, cursor);
+              if (replay.ok) {
+                for (const f of replay.sent) {
+                  try { userWs.send(f.data); } catch { break; }
+                }
+              } else {
+                try {
+                  userWs.send(JSON.stringify({
+                    type: "outbound.resume_failed",
+                    sessionKey,
+                    channel: "webchat",
+                    peer: { id: peer.peerId, kind: "dm" },
+                    from: cursor,
+                    to: replay.to,
+                    reason: replay.reason,
+                    ts: Date.now(),
+                  }));
+                } catch { /* swallow — userWs may be closing */ }
+              }
+            }
+            // Fall through to forwardInboundFrame below.
+          }
           if (
             parsed !== null &&
             typeof parsed === "object" &&
@@ -1713,8 +1820,52 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
+      // Phase 0.4 — bridge ring write for stamped outbound frames.
+      //
+      // Containers stamp `sessionKey + frameSeq` on outbound frames inside
+      // the embedded personal-master gateway (see openclaude/packages/gateway
+      // server.ts deliver()). We capture that stamp here for late-reconnect
+      // replay. Crucially this MUST run before the userWs.readyState gate
+      // below — the whole point of buffering is to keep the frame around
+      // while the client is briefly absent.
+      //
+      // Idempotency: when the same user has multiple tabs, the container's
+      // deliver() iterates clientsByPeer and broadcasts the same frame to
+      // each tab's bridge.containerWs. Each bridge instance shares this
+      // process-singleton ring, so we'd see the same `(storeKey, seq)` write
+      // multiple times. `storeStamped` skips silently when `seq <= prevLast`.
+      //
+      // Container reset: a recycled container gets a fresh `containerId`
+      // from the supervisor — the storeKey namespace is fresh, so the
+      // restarted container's seq=1 never collides with the previous
+      // container's seq=1. Old namespaces age out via the 10min TTL.
+      if (containerId !== undefined && !isBinary) {
+        let frameStr: string | null = null;
+        if (typeof data === "string") frameStr = data;
+        else if (Buffer.isBuffer(data)) {
+          try { frameStr = data.toString("utf8"); } catch { frameStr = null; }
+        }
+        if (frameStr !== null) {
+          let parsedOut: unknown = null;
+          try { parsedOut = JSON.parse(frameStr); } catch { /* non-JSON: skip */ }
+          if (parsedOut !== null && typeof parsedOut === "object") {
+            const wire = parsedOut as { sessionKey?: unknown; frameSeq?: unknown };
+            if (
+              typeof wire.sessionKey === "string" &&
+              typeof wire.frameSeq === "number" &&
+              wire.frameSeq > 0
+            ) {
+              const storeKey = `${uid.toString()}:${containerId.toString()}:${wire.sessionKey}`;
+              outboundRing.storeStamped(storeKey, wire.frameSeq, Date.now(), frameStr);
+            }
+          }
+        }
+      }
       if (userWs.readyState !== WebSocket.OPEN) {
         // user 已经走了 — billing 帧已在上面分支处理,这里是非 billing 容器帧,丢
+        // Note: ring write above ALREADY captured the frame for late-reconnect
+        // replay, so dropping the live forward here is the intended behavior
+        // (was previously a silent-drop bug because there was no ring layer).
         return;
       }
       // plan v3 G6 early release(BLOCKER 1):outbound.message + isFinal:true 或
@@ -2133,6 +2284,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   }
 
   async function shutdown(reason = "server shutting down"): Promise<void> {
+    clearInterval(ringPruneTimer);
     registry.closeAll(reason);
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }

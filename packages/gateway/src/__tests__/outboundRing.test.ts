@@ -280,3 +280,195 @@ describe('OutboundRingBuffer eviction stats', () => {
     assert.deepEqual(r.store('s1', s, 1000, frame(s)), { entries: 0, age: 0, bytes: 0 })
   })
 })
+
+describe('OutboundRingBuffer.storeStamped', () => {
+  // storeStamped is the v3 commercial bridge entry point: containers stamp
+  // frameSeq inside the embedded gateway's deliver() call, and the bridge can
+  // only observe + persist the already-stamped value (re-stamping would
+  // diverge from the client cursor expectation). Coverage focus:
+  //   1. monotonic accept (happy path)
+  //   2. multi-bridge fan-out idempotency (same seq twice → second call is no-op)
+  //   3. stale retransmit silently rejected (seq < lastSeq)
+  //   4. lastSeq is preserved (not demoted) across rejected writes
+  //   5. cross-key independence (containerId namespace isolation)
+  //   6. mixed with peekReplay → replay continues to behave correctly
+  it('accepts the first stamped seq and bumps lastSeq', () => {
+    const r = new OutboundRingBuffer()
+    const ev = r.storeStamped('s1', 5, 1000, frame(5))
+    assert.deepEqual(ev, { entries: 0, age: 0, bytes: 0 })
+    assert.equal(r.lastFrameSeq('s1'), 5, 'lastSeq jumps to stamped value (no nextSeq pre-call needed)')
+    assert.equal(r.size('s1'), 1)
+  })
+
+  it('accepts strictly-increasing stamped seqs', () => {
+    const r = new OutboundRingBuffer()
+    r.storeStamped('s1', 5, 1000, frame(5))
+    r.storeStamped('s1', 6, 1001, frame(6))
+    r.storeStamped('s1', 10, 1002, frame(10))
+    assert.equal(r.lastFrameSeq('s1'), 10)
+    assert.equal(r.size('s1'), 3)
+  })
+
+  it('idempotent on duplicate seq (multi-tab fan-out): same (key, seq) pair is a no-op', () => {
+    // Production scenario: container.deliver() iterates clientsByPeer and
+    // broadcasts the same stamped frame down each open WS. Each connected
+    // bridge instance sees the frame and calls storeStamped on the shared
+    // process-singleton ring. Without idempotency the second call would
+    // either falsely "reset" or duplicate-append.
+    const r = new OutboundRingBuffer()
+    r.storeStamped('s1', 7, 1000, frame(7))
+    assert.equal(r.size('s1'), 1)
+    assert.equal(r.lastFrameSeq('s1'), 7)
+    const ev2 = r.storeStamped('s1', 7, 1001, frame(7))
+    assert.deepEqual(ev2, { entries: 0, age: 0, bytes: 0 }, 'duplicate is a silent no-op, no eviction')
+    assert.equal(r.size('s1'), 1, 'no extra frame appended on duplicate')
+    assert.equal(r.lastFrameSeq('s1'), 7, 'lastSeq unchanged')
+  })
+
+  it('drops stale-retransmit (seq < lastSeq) without demoting lastSeq', () => {
+    // Production scenario: out-of-order delivery / upstream retry in which
+    // the bridge sees seq=3 after already accepting seq=10. Must NOT demote
+    // lastSeq=10 back to 3 (would break monotonic invariant assumed by
+    // peekReplay sequence_mismatch detection).
+    const r = new OutboundRingBuffer()
+    r.storeStamped('s1', 10, 1000, frame(10))
+    const ev = r.storeStamped('s1', 3, 1001, frame(3))
+    assert.deepEqual(ev, { entries: 0, age: 0, bytes: 0 })
+    assert.equal(r.lastFrameSeq('s1'), 10, 'lastSeq must not be demoted by a stale write')
+    assert.equal(r.size('s1'), 1, 'late frame not appended (would re-order the ring)')
+  })
+
+  it('does not pollute nextSeq() callers — the two paths are independent', () => {
+    // The nextSeq path is for personal-master deliver() (allocates server-side).
+    // storeStamped is for v3-commercial bridge (caller already owns the seq).
+    // Both update the SAME lastSeq map (so peekReplay sees the right
+    // currentLast no matter which path stamped) — but mixing must not
+    // corrupt either side.
+    const r = new OutboundRingBuffer()
+    r.storeStamped('s1', 100, 1000, frame(100))
+    // Subsequent nextSeq must continue from 101, not from 1.
+    assert.equal(r.nextSeq('s1'), 101, 'nextSeq picks up after stamped lastSeq')
+  })
+
+  it('storeKey namespace isolation: separate keys do not interfere', () => {
+    // Production scenario: containerId discriminator. After a container
+    // recycle, supervisor returns a fresh containerId; bridge writes under
+    // a fresh storeKey (`uid:containerId':sessionKey`). Old key's seq=120
+    // and new key's seq=1 must be independent.
+    const r = new OutboundRingBuffer()
+    r.storeStamped('1:cA:k', 120, 1000, frame(120))
+    r.storeStamped('1:cB:k', 1, 1001, frame(1))
+    assert.equal(r.lastFrameSeq('1:cA:k'), 120)
+    assert.equal(r.lastFrameSeq('1:cB:k'), 1)
+    assert.equal(r.size('1:cA:k'), 1)
+    assert.equal(r.size('1:cB:k'), 1)
+  })
+
+  it('peekReplay over a storeStamped-populated ring serves the right tail', () => {
+    // End-to-end: stamped writes then a hello-style cursor query — the
+    // bridge's main runtime path. Use ts close to `now` so the read-side
+    // age prune (defaults to 10min) doesn't evict the test frames.
+    const r = new OutboundRingBuffer()
+    r.storeStamped('s1', 50, 1000, frame(50))
+    r.storeStamped('s1', 51, 1001, frame(51))
+    r.storeStamped('s1', 52, 1002, frame(52))
+    const rep = r.peekReplay('s1', 50, 1002)
+    assert.equal(rep.ok, true)
+    if (!rep.ok) return
+    assert.deepEqual(rep.sent.map((f) => f.seq), [51, 52])
+    assert.equal(rep.to, 52)
+  })
+})
+
+describe('OutboundRingBuffer.pruneAll', () => {
+  it('age-prunes every ring and drops empty SessionRing structs from rings Map', () => {
+    // 验证 v3 commercial 兜底语义:周期 prune 释放过期 frames + 释放空 ring 容器,
+    // 防止 containerId 切换后 stale storeKey 永久驻留 rings Map。
+    const r = new OutboundRingBuffer({
+      maxEntries: 2000,
+      maxAgeMs: 1000,         // 1s age window
+      maxBytes: 5 * 1024 * 1024,
+    })
+    const s1 = r.nextSeq('uid:cid_old:k1'); r.store('uid:cid_old:k1', s1, 0, frame(s1))
+    const s2 = r.nextSeq('uid:cid_old:k2'); r.store('uid:cid_old:k2', s2, 0, frame(s2))
+    const s3 = r.nextSeq('uid:cid_new:k1'); r.store('uid:cid_new:k1', s3, 0, frame(s3))
+    assert.equal(r.size('uid:cid_old:k1'), 1)
+    assert.equal(r.size('uid:cid_old:k2'), 1)
+    assert.equal(r.size('uid:cid_new:k1'), 1)
+
+    // Advance "now" past the age window for all three. pruneAll should evict
+    // every frame and drop the SessionRing entries from the internal rings Map.
+    const stats = r.pruneAll(5_000)
+    assert.equal(stats.age, 3, 'all three frames attributed to age cause')
+    assert.equal(stats.entries, 0)
+    assert.equal(stats.bytes, 0)
+
+    // Per-key probes: rings should report 0 size (and bytes=0), reflecting empty.
+    assert.equal(r.size('uid:cid_old:k1'), 0)
+    assert.equal(r.size('uid:cid_old:k2'), 0)
+    assert.equal(r.size('uid:cid_new:k1'), 0)
+  })
+
+  it('preserves lastSeq across pruneAll so cursor=0 still escalates to no_buffer (not silent ok+[])', () => {
+    // 关键不变量:pruneAll 必须保留 lastSeq。
+    //
+    // 反例(若误删 lastSeq):一个真实跑过帧的 session 在 idle 老化后,client 用
+    // cursor=0(冷 tab / state reset)hello,会落到 fromSeq===currentLast===0
+    // 的 ok+[] 分支 —— 静默丢帧。保留 lastSeq=N>0 后,fromSeq=0+currentLast>0
+    // 的 guard 把它升级为 no_buffer,client 触发 REST 强同步。
+    const r = new OutboundRingBuffer({
+      maxEntries: 2000,
+      maxAgeMs: 1000,
+      maxBytes: 5 * 1024 * 1024,
+    })
+    const s = r.nextSeq('s1'); r.store('s1', s, 0, frame(s))
+    assert.equal(r.lastFrameSeq('s1'), 1)
+
+    // pruneAll 在远未来执行,把唯一一帧老化掉
+    const stats = r.pruneAll(5_000)
+    assert.equal(stats.age, 1)
+    assert.equal(r.size('s1'), 0)
+
+    // lastSeq 必须存活
+    assert.equal(r.lastFrameSeq('s1'), 1)
+
+    // 关键断言:cursor=0 + currentLast=1 → no_buffer(若 lastSeq 被删则会 ok+[])
+    const repZero = r.peekReplay('s1', 0, 6_000)
+    assert.equal(repZero.ok, false, 'expected resume_failed, not silent ok')
+    if (repZero.ok) return
+    assert.equal(repZero.reason, 'no_buffer')
+  })
+
+  it('returns zero stats and no-op when there are no rings', () => {
+    const r = new OutboundRingBuffer()
+    const stats = r.pruneAll(10_000)
+    assert.deepEqual(stats, { entries: 0, age: 0, bytes: 0 })
+  })
+
+  it('leaves still-fresh frames intact and only sweeps idle stale rings', () => {
+    // 多 ring 混合:一个 idle stale(过期未被 store 重新 prune),一个 fresh。
+    // pruneAll 应只动 stale ring,保留 fresh ring 的 frame 与 lastSeq。
+    const r = new OutboundRingBuffer({
+      maxEntries: 2000,
+      maxAgeMs: 1000,
+      maxBytes: 5 * 1024 * 1024,
+    })
+    // s1: 一帧 ts=0,之后 idle —— store 路径不会再触发它的 prune。
+    const sStale = r.nextSeq('s1'); r.store('s1', sStale, 0, frame(sStale))
+    // s2: 两帧都在 ts=5000(在 prune 时仍在 age window 内,cutoff=4500)。
+    const sFresh1 = r.nextSeq('s2'); r.store('s2', sFresh1, 5_000, frame(sFresh1))
+    const sFresh2 = r.nextSeq('s2'); r.store('s2', sFresh2, 5_000, frame(sFresh2))
+
+    const stats = r.pruneAll(5_500)
+    assert.equal(stats.age, 1, 'stale s1 frame evicted')
+    assert.equal(r.size('s1'), 0, 's1 ring emptied & dropped from rings Map')
+    assert.equal(r.size('s2'), 2, 's2 fresh frames survive')
+    assert.equal(r.lastFrameSeq('s2'), 2, 's2 lastSeq intact')
+
+    // s2 cursor=1 → 仍可 replay frame 2(验证 frame data 完整保留)
+    const rep = r.peekReplay('s2', 1, 5_500)
+    assert.equal(rep.ok, true)
+    if (!rep.ok) return
+    assert.deepEqual(rep.sent.map((f) => f.seq), [2])
+  })
+})

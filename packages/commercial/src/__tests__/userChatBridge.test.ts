@@ -910,6 +910,295 @@ describe("userChatBridge — model authorization", () => {
 // 生产线上 /var/log/openclaude.log 自 2026-04-26 起累计 10 次同类崩溃。
 // 修复:在 createContainerSocket 之后立刻挂 named early 'error' handler。
 
+// ──────────── Phase 0.4 — bridge ring replay (inbound.hello → outbound replay) ────────────
+//
+// 桥接层 outbound ring buffer:容器侧的 personal-master gateway 给每个 outbound
+// 帧打 sessionKey + frameSeq,bridge 抓住转发的同时丢一份进 ring;客户端重连
+// 发 inbound.hello.lastFrameSeq 时 bridge 直接回放 ring 内的尾部帧,miss 则发
+// outbound.resume_failed 让客户端 REST force-sync。
+//
+// 测试焦点:
+//   1. 命中:bridge 在 hello 后立即推 ring 里 seq>cursor 的帧
+//   2. miss:cursor>0 + ring 空 → resume_failed reason="no_buffer"
+//   3. 容器重启(cid 变更)→ 新 namespace,旧 cid 的帧不漏给新 cid
+//   4. binary 帧不进 ring(只解析 JSON 文本帧)
+//   5. 没 sessionKey / frameSeq 的 outbound 帧不进 ring(向后兼容旧帧)
+//   6. hello 转发到容器(byte-transparent),不被吞
+describe("userChatBridge — Phase 0.4 ring replay", () => {
+  test("replays missed stamped frames on hello reconnect", async () => {
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 42,
+      }),
+    });
+    portRef.p = rig.containerPort;
+
+    try {
+      // Tab1: 容器 emit 一个 stamped frame seq=5,tab1 收到后关
+      const containerOpen1 = waitNextContainerSocket(rig);
+      const token = await makeJwt("700");
+      const ws1 = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws1.once("open", () => r()));
+      const containerWs1 = await containerOpen1;
+      const recvP1 = waitMessage(ws1);
+      const stamped = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:peerX",
+        frameSeq: 5,
+        blocks: [],
+      });
+      containerWs1.send(stamped);
+      const recv1 = await recvP1;
+      assert.equal(JSON.parse(recv1.data.toString()).frameSeq, 5);
+      ws1.close();
+      await waitClose(ws1);
+
+      // Tab2: reconnect,hello.lastFrameSeq=4 (一帧没看见)
+      const containerOpen2 = waitNextContainerSocket(rig);
+      const ws2 = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws2.once("open", () => r()));
+      await containerOpen2;
+      const recvP2 = waitMessage(ws2);
+      ws2.send(JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "peerX", agentId: "main", lastFrameSeq: 4 }],
+      }));
+      const recv2 = await recvP2;
+      const replayed = JSON.parse(recv2.data.toString());
+      assert.equal(replayed.frameSeq, 5, "ring replay 必须把 seq=5 推下来");
+      assert.equal(replayed.sessionKey, "agent:main:webchat:dm:peerX");
+
+      ws2.close();
+      await waitClose(ws2);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("hello with cursor>0 + empty ring → resume_failed reason=no_buffer", async () => {
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 50,
+      }),
+    });
+    portRef.p = rig.containerPort;
+
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const token = await makeJwt("701");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      await containerOpen;
+      const recvP = waitMessage(ws);
+      ws.send(JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "peerY", agentId: "main", lastFrameSeq: 100 }],
+      }));
+      const recv = await recvP;
+      const frame = JSON.parse(recv.data.toString());
+      assert.equal(frame.type, "outbound.resume_failed");
+      assert.equal(frame.reason, "no_buffer");
+      assert.equal(frame.peer.id, "peerY");
+      assert.equal(frame.peer.kind, "dm");
+      assert.equal(frame.channel, "webchat");
+      assert.equal(frame.from, 100, "from 必须是 client 报的 cursor");
+      assert.equal(frame.to, 0, "to 必须是 ring currentLast (=0 因 ring 空)");
+
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("container restart (different containerId) → fresh namespace, no cross-pollination", async () => {
+    const portRef = { p: 0 };
+    let cid = 100;
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: cid,
+      }),
+    });
+    portRef.p = rig.containerPort;
+
+    try {
+      // cid=100: 存 seq=3
+      const containerOpen1 = waitNextContainerSocket(rig);
+      const token = await makeJwt("702");
+      const ws1 = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws1.once("open", () => r()));
+      const containerWs1 = await containerOpen1;
+      const recvP1 = waitMessage(ws1);
+      containerWs1.send(JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:peerZ",
+        frameSeq: 3,
+      }));
+      await recvP1;
+      ws1.close();
+      await waitClose(ws1);
+
+      // 容器重启 → cid=200,新 storeKey namespace 空
+      cid = 200;
+      const containerOpen2 = waitNextContainerSocket(rig);
+      const ws2 = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws2.once("open", () => r()));
+      await containerOpen2;
+      const recvP2 = waitMessage(ws2);
+      ws2.send(JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "peerZ", agentId: "main", lastFrameSeq: 2 }],
+      }));
+      const recv = await recvP2;
+      const frame = JSON.parse(recv.data.toString());
+      assert.equal(frame.type, "outbound.resume_failed",
+        "新 cid namespace 空 + cursor>0 → resume_failed,绝不能漏 seq=3 给新生命周期");
+      assert.equal(frame.reason, "no_buffer");
+
+      ws2.close();
+      await waitClose(ws2);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("non-stamped outbound frames (无 sessionKey/frameSeq) 不进 ring", async () => {
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 60,
+      }),
+    });
+    portRef.p = rig.containerPort;
+
+    try {
+      // Tab1: 容器 emit 一个无 frameSeq 的帧(legacy outbound,旧版 master 没打戳)
+      const containerOpen1 = waitNextContainerSocket(rig);
+      const token = await makeJwt("703");
+      const ws1 = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws1.once("open", () => r()));
+      const containerWs1 = await containerOpen1;
+      const recvP1 = waitMessage(ws1);
+      containerWs1.send(JSON.stringify({
+        type: "outbound.message",
+        // 故意不带 sessionKey/frameSeq
+        blocks: [],
+      }));
+      await recvP1;
+      ws1.close();
+      await waitClose(ws1);
+
+      // Tab2: hello with cursor=0 — 不该 replay 任何东西(ring 应该是空的)
+      // 但 cursor=0 + currentLast=0 → ok+[](正常 fresh session)
+      const containerOpen2 = waitNextContainerSocket(rig);
+      const ws2 = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws2.once("open", () => r()));
+      await containerOpen2;
+      let firstMsg: string | null = null;
+      const t = setTimeout(() => { /* timeout — 期望无消息 */ }, 200);
+      ws2.once("message", (data) => { firstMsg = data.toString(); });
+      ws2.send(JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "peerW", agentId: "main", lastFrameSeq: 0 }],
+      }));
+      await new Promise<void>((r) => setTimeout(r, 250));
+      clearTimeout(t);
+      assert.equal(firstMsg, null,
+        "无 stamped 的 outbound 不进 ring + cursor=0 + currentLast=0 → 不发 replay 也不发 resume_failed");
+
+      ws2.close();
+      await waitClose(ws2);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("hello 仍透传到容器(byte-transparent — container 也要 register WS)", async () => {
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 70,
+      }),
+    });
+    portRef.p = rig.containerPort;
+
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const token = await makeJwt("704");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      await containerOpen;
+
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "peerH", agentId: "main", lastFrameSeq: 0 }],
+      });
+      ws.send(helloFrame);
+      // 等容器侧记到这条帧
+      await new Promise<void>((r) => setTimeout(r, 100));
+      const containerSawHello = rig.containerSeen.find((m) => {
+        const s = typeof m.data === "string" ? m.data : m.data.toString("utf8");
+        return s === helloFrame;
+      });
+      assert.ok(containerSawHello,
+        "hello 必须 byte-exact 透传到容器(container's autoResumeFromHello 要 set.add(ws) 给后续 deliver 用)");
+
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("binary container 帧不解析 JSON / 不进 ring(对 binary 透明)", async () => {
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 80,
+      }),
+    });
+    portRef.p = rig.containerPort;
+
+    try {
+      const containerOpen1 = waitNextContainerSocket(rig);
+      const token = await makeJwt("705");
+      const ws1 = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws1.once("open", () => r()));
+      const containerWs1 = await containerOpen1;
+      const recvP1 = waitMessage(ws1);
+      // binary 帧 — 即便里面 ASCII 看起来像 JSON 也不该被当 JSON 解析
+      const bin = Buffer.from('{"sessionKey":"x","frameSeq":99}');
+      containerWs1.send(bin, { binary: true });
+      const recv1 = await recvP1;
+      assert.equal(recv1.isBinary, true, "binary 帧透传保 isBinary 标志");
+      ws1.close();
+      await waitClose(ws1);
+
+      // Tab2: cursor=98 — 期望 no_buffer(binary 不进 ring)
+      const containerOpen2 = waitNextContainerSocket(rig);
+      const ws2 = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws2.once("open", () => r()));
+      await containerOpen2;
+      const recvP2 = waitMessage(ws2);
+      ws2.send(JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "x", agentId: "main", lastFrameSeq: 98 }],
+      }));
+      const recv2 = await recvP2;
+      const f = JSON.parse(recv2.data.toString());
+      assert.equal(f.type, "outbound.resume_failed",
+        "binary 帧不能进 ring,所以 cursor>0 时必须 miss");
+
+      ws2.close();
+      await waitClose(ws2);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
 describe("userChatBridge — earlyClose during CONNECTING containerWs (regression)", () => {
   test("client closes during slow resolve → containerWs.terminate() 不冒 uncaughtException", async () => {
     // blackhole TCP server:接受 TCP 但永远不发 HTTP/ws upgrade 响应,让 ws
