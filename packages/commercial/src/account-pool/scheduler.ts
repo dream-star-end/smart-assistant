@@ -149,16 +149,23 @@ export interface PickResult {
  * 请求释放结果。
  *
  * - `success`:请求正常完成。onSuccess → 健康分恢复
- * - `failure`:上游显式报错(4xx / 5xx / 解析失败 / 显式业务失败)。onFailure → 扣健康分
+ * - `failure`:上游显式报错(5xx / 解析失败 / 显式业务失败 / 401 / 403 / 429 等
+ *   账号相关 4xx)。onFailure → 扣健康分
  * - `transient_network`:纯网络层抖动(DNS / TCP / TLS / proxy 不通),**不扣健康分**,
  *   仅 dec 并发槽位。设计动机:账号配 egress_proxy 后,代理一抖等于一次性把整池账号
  *   全扣分 → 误判 cooldown / disable。网络抖动应由连续多次 http_error(上游)体现,
  *   而非把纯网络失败算到具体账号头上。
+ * - `client_error`:用户/客户端侧错误(上游 400 invalid_request_error 如 thinking
+ *   block signature 损坏 / 参数非法,或客户端主动断流 ac.abort)。**不扣健康分**,
+ *   仅 dec 并发槽位。设计动机:用户客户端 bug 反复发坏请求会把账号反复打到 cooldown
+ *   (boss 自己 thinking signature broken 反复触发 d1 cooldown 实例),账号本身没问题,
+ *   不应代为受过。
  */
 export type ReleaseResult =
   | { kind: 'success' }
   | { kind: 'failure'; error?: string | null }
   | { kind: 'transient_network'; error?: string | null }
+  | { kind: 'client_error'; error?: string | null }
 
 export interface ReleaseInput {
   account_id: bigint | string
@@ -436,7 +443,7 @@ export class AccountScheduler {
     } else if (input.result.kind === 'failure') {
       await this.health.onFailure(input.account_id, input.result.error ?? null)
     }
-    // transient_network:已释放 slot,但不扣健康分(见 ReleaseResult 注释)
+    // transient_network / client_error:已释放 slot,但不扣健康分(见 ReleaseResult 注释)
   }
 
   /**

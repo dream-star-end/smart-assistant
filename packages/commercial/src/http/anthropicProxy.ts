@@ -66,6 +66,7 @@ import {
   AccountPoolBusyError,
   type AccountScheduler,
   type PickResult,
+  type ReleaseResult,
 } from "../account-pool/scheduler.js";
 import {
   checkRateLimit,
@@ -753,6 +754,50 @@ class ProxyAbortError extends Error {
   }
 }
 
+/**
+ * 判断上游 4xx body 是不是 Anthropic `invalid_request_error` —— 用户/客户端
+ * 输入参数损坏(典型:thinking block signature 不合法 / messages 序列乱)。
+ * 这类错误反复重试也只会同样失败,**与账号本身无关**,scheduler 应走 client_error
+ * 不扣健康分,避免 boss 自己客户端 bug 反复打到账号 cooldown。
+ *
+ * Anthropic 错误响应格式:`{ "type": "error", "error": { "type": "...", "message": "..." } }`。
+ * 任何解析失败 / 字段缺失视为 false,保守走 failure。
+ */
+export function isAnthropicInvalidRequestError(bodyPreview: string): boolean {
+  if (!bodyPreview) return false;
+  try {
+    const obj = JSON.parse(bodyPreview);
+    const t = obj?.error?.type;
+    return typeof t === "string" && t === "invalid_request_error";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 客户端断流识别 —— 仅看 err 形状,**不看** ac.signal.aborted。
+ *
+ * 理由:我们自己 `res.end()` 完会触发 `res.on('close')` → `ac.abort()`,所以
+ * pipe 后 ac.signal.aborted 可能已是 true,如果用 signalAborted 参与判定会把
+ * 所有 mid-stream 错误误判成 client abort(Codex v2 review MAJOR)。
+ *
+ * 真正的客户端断流场景下 err 一定带特征:
+ *   - pipeStreamWithUsageCapture 在 signal.aborted 时抛 `ProxyAbortError`
+ *   - fetch() 在 signal.aborted 时抛 `Error{name:'AbortError'}` 或 undici
+ *     `Error{code:'ABORT_ERR'}`
+ * 上游 socket reset / TLS 错 / DNS 抖等 err 形状不会撞这些类型,会归到 fail
+ * 路径(扣健康分),与 transient_network 选择正交。
+ */
+export function isClientAbort(err: unknown): boolean {
+  if (err instanceof ProxyAbortError) return true;
+  if (err instanceof Error) {
+    if (err.name === "AbortError") return true;
+    // undici / DOMException 兼容
+    if ((err as { code?: string }).code === "ABORT_ERR") return true;
+  }
+  return false;
+}
+
 // ─── finalizer(single-shot + journal) ────────────────────────────────────
 
 export interface FinalizeContext {
@@ -927,6 +972,12 @@ export async function abortInflightJournal(
 export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
   commit: (obs: UsageObservation) => Promise<FinalizeOutcome>;
   fail: (obs: UsageObservation, err: unknown) => Promise<FinalizeOutcome>;
+  /**
+   * 与 fail 同写库 + 写 abort journal,但 scheduler.release 走 client_error,
+   * 不调 health.onFailure → 不扣账号健康分。用于上游 400 invalid_request_error
+   * (用户参数损坏)与 ac.abort 客户端主动断流场景。
+   */
+  failClient: (obs: UsageObservation, err: unknown) => Promise<FinalizeOutcome>;
 } {
   let done: FinalizeOutcome | null = null;
   let inflight: Promise<FinalizeOutcome> | null = null;
@@ -1018,7 +1069,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
 
   async function runFinalizeAndRelease(
     runner: () => Promise<FinalizeOutcome>,
-    schedulerResult: "success" | "failure",
+    schedulerResult: "success" | "failure" | "client_error",
     schedulerErrMsg: string | null,
   ): Promise<FinalizeOutcome> {
     if (done) return done;
@@ -1036,12 +1087,15 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
         // 跳过 scheduler.release 以免传 null account_id 进 scheduler 内部。
         if (ctx.accountId !== null) {
           try {
+            const releaseResult: ReleaseResult =
+              schedulerResult === "success"
+                ? { kind: "success" }
+                : schedulerResult === "client_error"
+                  ? { kind: "client_error", error: schedulerErrMsg }
+                  : { kind: "failure", error: schedulerErrMsg };
             await deps.scheduler.release({
               account_id: ctx.accountId,
-              result:
-                schedulerResult === "success"
-                  ? { kind: "success" }
-                  : { kind: "failure", error: schedulerErrMsg },
+              result: releaseResult,
             });
           } catch (e) {
             ctx.log.warn("proxy_release_scheduler_failed", { err: errSummary(e) });
@@ -1060,6 +1114,8 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): {
     commit: (obs) => runFinalizeAndRelease(() => runCommit(obs), "success", null),
     fail: (obs, err) =>
       runFinalizeAndRelease(() => runAbort(obs, err), "failure", errMessageShort(err)),
+    failClient: (obs, err) =>
+      runFinalizeAndRelease(() => runAbort(obs, err), "client_error", errMessageShort(err)),
   };
 }
 
@@ -1884,7 +1940,20 @@ export function makeAnthropicProxyHandler(
           const err = new Error(
             `upstream returned ${upstream.status}: ${preview}`,
           );
-          await finalize.fail(observed, err);
+          // 上游 400 invalid_request_error = 客户端 body 损坏(典型:thinking
+          // signature 不合法)。账号本身没问题,走 client_error 不扣健康分,
+          // 防止 boss 自己客户端 bug 反复打到账号 cooldown。
+          const isClientBadRequest =
+            upstream.status === 400 && isAnthropicInvalidRequestError(preview);
+          if (isClientBadRequest) {
+            userLog.warn("proxy_upstream_invalid_request", {
+              status: upstream.status,
+              preview: preview.slice(0, 200),
+            });
+            await finalize.failClient(observed, err);
+          } else {
+            await finalize.fail(observed, err);
+          }
           incrAnthropicProxySettle("aborted");
           sendJsonError(res, 502, "UPSTREAM_ERROR", `upstream returned ${upstream.status}`, requestId);
           return;
@@ -1931,10 +2000,18 @@ export function makeAnthropicProxyHandler(
         } catch {
           /* ignore */
         }
-        // 中途断流(result.error != null)走 fail,但 observation 已捕获 partial 状态
+        // 中途断流(result.error != null)走 fail,但 observation 已捕获 partial 状态。
+        // 客户端主动断流(req/res close → ac.abort → pipeStream 抛 ProxyAbortError /
+        // fetch 抛 AbortError)不该扣账号健康分:走 failClient(client_error)。
+        // 注意:不能看 ac.signal.aborted,res.end() 自身会触发 close → abort,
+        // 那时 signal 已为 true,会把所有 mid-stream 错都误判成 client(Codex MAJOR)。
         let outcome: FinalizeOutcome;
         if (result.error !== null) {
-          outcome = await finalize.fail(observed, result.error);
+          if (isClientAbort(result.error)) {
+            outcome = await finalize.failClient(observed, result.error);
+          } else {
+            outcome = await finalize.fail(observed, result.error);
+          }
         } else {
           outcome = await finalize.commit(observed);
         }
@@ -1978,7 +2055,13 @@ export function makeAnthropicProxyHandler(
         else if (observed.kind === "partial") incrAnthropicProxySettle("partial");
         else incrAnthropicProxySettle("aborted");
       } catch (err) {
-        await finalize.fail(observed, err);
+        // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
+        // 仅按 err 形状判定,见 isClientAbort 注释。
+        if (isClientAbort(err)) {
+          await finalize.failClient(observed, err);
+        } else {
+          await finalize.fail(observed, err);
+        }
         incrAnthropicProxySettle("aborted");
         // 字节是否已 flush 决定怎么发错误
         if (!res.headersSent) {

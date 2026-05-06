@@ -332,6 +332,34 @@ describe('release', () => {
     const row = await getAccount(a.id)
     assert.equal(row!.last_error, 'previous')
   })
+
+  test('client_error → 不扣健康分,不增 fail_count(类比 transient_network)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const a = await createAccount(
+      { label: 'r4', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const { tracker, redis } = mkTracker()
+    const s = mkScheduler(tracker)
+    // 先 pick 占 inflight,再 release 验 dec 路径
+    const p = await s.pick({ mode: 'chat' })
+    assert.equal(s.getInflight(a.id), 1)
+    p.token.fill(0)
+    await s.release({
+      account_id: a.id,
+      result: { kind: 'client_error', error: 'invalid_request_error: thinking signature' },
+    })
+    const row = await getAccount(a.id)
+    // health 不变(默认 100),fail_count 不增
+    assert.equal(row!.fail_count, 0n)
+    assert.equal(row!.success_count, 0n)
+    assert.equal(row!.health_score, 100)
+    assert.equal(row!.last_error, null)
+    // inflight slot 被 dec
+    assert.equal(s.getInflight(a.id), 0)
+    // Redis health 也没被改写到 onFailure 路径
+    assert.equal(await redis.get(healthKey(a.id)), null)
+  })
 })
 
 describe('并发/边界', () => {

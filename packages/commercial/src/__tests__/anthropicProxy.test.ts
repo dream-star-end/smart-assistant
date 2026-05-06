@@ -26,6 +26,9 @@ import {
   ConcurrencyLimiter,
   extractSessionId,
   isDeepseekModel,
+  isAnthropicInvalidRequestError,
+  isClientAbort,
+  makeFinalizer,
   DEEPSEEK_UPSTREAM_ENDPOINT,
   ALLOWED_BETA_VALUES,
   ANTHROPIC_VERSION,
@@ -33,6 +36,7 @@ import {
   _UsageObserver,
   type ProxyBody,
 } from "../http/anthropicProxy.js";
+import { rootLogger } from "../logging/logger.js";
 import { HttpError } from "../http/util.js";
 import type { ModelPricing } from "../billing/pricing.js";
 
@@ -740,5 +744,167 @@ describe("isDeepseekModel", () => {
       DEEPSEEK_UPSTREAM_ENDPOINT,
       "https://api.deepseek.com/anthropic/v1/messages",
     );
+  });
+});
+
+// ─── isAnthropicInvalidRequestError — d1 cooldown 防御 ────────────────────
+
+describe("isAnthropicInvalidRequestError", () => {
+  test("典型 thinking signature 错误 → true", () => {
+    const body = JSON.stringify({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message:
+          "messages.13.content.0: Invalid `signature` in `thinking` block.",
+      },
+    });
+    assert.equal(isAnthropicInvalidRequestError(body), true);
+  });
+
+  test("authentication_error → false(账号问题,该扣分)", () => {
+    const body = JSON.stringify({
+      type: "error",
+      error: { type: "authentication_error", message: "invalid x-api-key" },
+    });
+    assert.equal(isAnthropicInvalidRequestError(body), false);
+  });
+
+  test("permission_error / rate_limit_error / overloaded → false", () => {
+    for (const t of [
+      "permission_error",
+      "rate_limit_error",
+      "overloaded_error",
+      "api_error",
+    ]) {
+      const body = JSON.stringify({ type: "error", error: { type: t } });
+      assert.equal(isAnthropicInvalidRequestError(body), false, `${t} should not match`);
+    }
+  });
+
+  test("空串 / 非 JSON / 缺 error.type → false(保守降级)", () => {
+    assert.equal(isAnthropicInvalidRequestError(""), false);
+    assert.equal(isAnthropicInvalidRequestError("not json"), false);
+    assert.equal(isAnthropicInvalidRequestError("{}"), false);
+    assert.equal(isAnthropicInvalidRequestError('{"error":{}}'), false);
+    assert.equal(
+      isAnthropicInvalidRequestError('{"error":{"type":1234}}'),
+      false,
+    );
+  });
+});
+
+// ─── isClientAbort — req/res close 不该扣账号分 ──────────────────────────
+
+describe("isClientAbort", () => {
+  test("AbortError(标准 DOMException 风格)→ true", () => {
+    const err = new Error("This operation was aborted");
+    err.name = "AbortError";
+    assert.equal(isClientAbort(err), true);
+  });
+
+  test("undici code='ABORT_ERR' → true", () => {
+    const err = Object.assign(new Error("abort"), { code: "ABORT_ERR" });
+    assert.equal(isClientAbort(err), true);
+  });
+
+  test("普通 Error / 没 abort 痕迹 → false", () => {
+    assert.equal(isClientAbort(new Error("ECONNRESET")), false);
+    assert.equal(isClientAbort(new Error("upstream returned 500")), false);
+    assert.equal(
+      isClientAbort(new Error("socket hang up")),
+      false,
+    );
+    assert.equal(isClientAbort("string err"), false);
+    assert.equal(isClientAbort(null), false);
+    assert.equal(isClientAbort(undefined), false);
+  });
+
+  test("不依赖 ac.signal.aborted —— 只看 err 形状(Codex MAJOR 修复)", () => {
+    // 模拟"我们自己 res.end() 后 ac.signal.aborted=true、但 err 是真实上游 5xx"
+    // 的场景:helper 必须返回 false 让其走 fail(扣账号分),而不是被 signal flag
+    // 误判成 client_error。
+    const err = new Error("upstream returned 502: socket reset mid-stream");
+    assert.equal(isClientAbort(err), false);
+  });
+});
+
+// ─── makeFinalizer.failClient — handler 级行为(Codex MEDIUM #3) ─────────
+
+describe("makeFinalizer.failClient → scheduler.release 走 client_error", () => {
+  test("fail vs failClient:同样写 abort journal,但 release.kind 区分", async () => {
+    type ReleaseCall = { account_id: bigint | string; kind: string; error?: string | null };
+    const releaseCalls: ReleaseCall[] = [];
+    const queriedSql: string[] = [];
+
+    const stubScheduler = {
+      release: async (input: { account_id: bigint | string; result: { kind: string; error?: string | null } }) => {
+        releaseCalls.push({
+          account_id: input.account_id,
+          kind: input.result.kind,
+          error: input.result.error ?? null,
+        });
+      },
+    };
+
+    const stubPool = {
+      query: async (sql: string, _params?: unknown[]) => {
+        queriedSql.push(sql);
+        return { rows: [], rowCount: 0 } as never;
+      },
+    };
+
+    const stubRedis = {
+      releaseReservation: async () => true,
+    };
+
+    const baseCtx = {
+      requestId: "req-test-failclient",
+      userId: 1n,
+      containerId: 0n,
+      accountId: 42n,
+      model: "claude-sonnet-4-6",
+      pricing: sonnet,
+      precheckCredits: 100n,
+      preCheckReservation: { userId: "u1", requestId: "req-test-failclient" },
+      log: rootLogger,
+      sessionId: null,
+    };
+
+    // 1) failClient → release.kind === 'client_error'
+    const f1 = makeFinalizer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
+      baseCtx,
+    );
+    const out1 = await f1.failClient({ kind: "none" }, new Error("invalid_request_error: thinking"));
+    assert.equal(out1.state, "aborted");
+    assert.equal(out1.finalCredits, 0n);
+    assert.equal(releaseCalls.length, 1);
+    assert.equal(releaseCalls[0].kind, "client_error");
+    assert.equal(releaseCalls[0].account_id, 42n);
+
+    // 2) fail (control) → release.kind === 'failure'
+    const f2 = makeFinalizer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
+      { ...baseCtx, requestId: "req-test-fail" },
+    );
+    await f2.fail({ kind: "none" }, new Error("upstream 502"));
+    assert.equal(releaseCalls.length, 2);
+    assert.equal(releaseCalls[1].kind, "failure");
+
+    // 3) accountId=null (DeepSeek path) → 不调 scheduler.release
+    const f3 = makeFinalizer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
+      { ...baseCtx, requestId: "req-test-deepseek", accountId: null },
+    );
+    await f3.failClient({ kind: "none" }, new Error("client closed"));
+    assert.equal(releaseCalls.length, 2, "accountId=null 时跳过 scheduler.release");
+
+    // 4) journal abort SQL 被两条 fail/failClient 都写到了
+    const abortSqlCount = queriedSql.filter((s) => s.includes("SET state='aborted'")).length;
+    assert.equal(abortSqlCount, 3, "三次 fail/failClient 都写了 abort journal");
   });
 });
