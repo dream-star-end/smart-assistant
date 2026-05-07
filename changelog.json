@@ -1,4 +1,16 @@
 {
-  "currentVersion": "v1.0.90",
-  "releases": []
+  "currentVersion": "v1.0.91",
+  "releases": [
+    {
+      "version": "v1.0.91",
+      "date": "2026-05-07",
+      "title": "会话可挂载 GitHub 仓库",
+      "items": [
+        "- 新增 GitHub 账号连接(顶部 composer 多了「仓库」入口)",
+        "- 每个会话可单独选定一个仓库 + 分支,容器内自动克隆,Claude 可读写并代为 push",
+        "- 切会话时仓库 pill 自动同步状态(克隆中 / 已就绪 / 失败)",
+        "- 解绑账号会一键清空所有会话的仓库选择"
+      ]
+    }
+  ]
 }

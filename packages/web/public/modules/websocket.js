@@ -1,17 +1,17 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
-import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js?v=e8618f7f'
+import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js?v=723555a4'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=e8618f7f'
-import { dbPut } from './db.js?v=e8618f7f'
-import { $, htmlSafeEscape } from './dom.js?v=e8618f7f'
-import { maybeNotify, setTitleBusy } from './notifications.js?v=e8618f7f'
-import { _clearStoredAccessToken, getSession, state } from './state.js?v=e8618f7f'
-import { maybeSyncNow } from './sync.js?v=e8618f7f'
-import { toast } from './ui.js?v=e8618f7f'
+import { clearSessionCookie } from './auth.js?v=723555a4'
+import { dbPut } from './db.js?v=723555a4'
+import { $, htmlSafeEscape } from './dom.js?v=723555a4'
+import { maybeNotify, setTitleBusy } from './notifications.js?v=723555a4'
+import { _clearStoredAccessToken, getSession, state } from './state.js?v=723555a4'
+import { maybeSyncNow } from './sync.js?v=723555a4'
+import { toast } from './ui.js?v=723555a4'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance, _openTopupModal } from './billing.js?v=e8618f7f'
+import { refreshBalance, _openTopupModal } from './billing.js?v=723555a4'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -835,6 +835,33 @@ export function stopCurrentTurn() {
   localStopTeardown(sess)
   toast('已发送停止指令')
 }
+
+// ── Phase 5/6 GitHub repo binding control frames ──
+// 唯一发送入口,github.js 调这两个 export(单向 web→ws,无循环)。
+// peer.id = sessionId(per Phase 5 contract);agentId 必须查 *目标 sessionId* 的 agent
+// (用户可能在 modal 打开 session A、切换到 B、再点确认),不能用当前 session 的 agent。
+// safeWsSend 失败时返 false → caller 决定是否 toast(目前 UI 在 pending/cleared 本地态,
+// 等 reconnect/auto-rebind 兜底)。
+export function sendRepoBindFrame(sessionId, selectionVersion) {
+  if (!state.ws || state.ws.readyState !== 1) return false
+  const targetSess = state.sessions?.get?.(sessionId)
+  return safeWsSend(state.ws, JSON.stringify({
+    type: 'inbound.control.session_repo_bind',
+    sessionId,
+    selectionVersion,
+    peer: { id: sessionId, kind: 'dm' },
+    agentId: targetSess?.agentId || state.defaultAgentId,
+    channel: 'webchat',
+  }))
+}
+export function sendRepoUnbindFrame(sessionId, selectionVersion) {
+  if (!state.ws || state.ws.readyState !== 1) return false
+  return safeWsSend(state.ws, JSON.stringify({
+    type: 'inbound.control.session_repo_unbind',
+    sessionId,
+    selectionVersion,
+  }))
+}
 // Network transition: browser reports we've gone offline. Cancel any pending
 // backoff timer and show an offline status. We do NOT schedule a new timer —
 // the browser will fire `online` when connectivity is back and
@@ -1337,6 +1364,15 @@ export function connect() {
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
       else if (f.type === 'outbound.cost_charged') handleCostCharged(f)
       else if (f.type === 'sys.cold_start') handleColdStart(f)
+      else if (f.type === 'outbound.control.session_repo_status') {
+        // Phase 5/6:容器 repo workspace 状态推送(cloning/ready/failed)。
+        // github.js 注入 _deps.handleRepoStatusFrame 后路由;未注入时静默丢(模块未载)。
+        _deps.handleRepoStatusFrame?.(f)
+      }
+      else if (f.type === 'outbound.control.session_repo_bind_error') {
+        // Phase 5/6:bridge 校验失败(GITHUB_NOT_LINKED / STALE_OR_MISSING / 等)。
+        _deps.handleRepoBindErrorFrame?.(f)
+      }
       else if (f.type === 'outbound.ack' && f.deduplicated) {
         // Server already processed this message; clear drain state so queue continues
         if (state._offlineDrainingCurrent) {
