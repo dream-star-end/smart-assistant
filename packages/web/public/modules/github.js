@@ -50,22 +50,51 @@ export function githubErrorText(code) {
 
 /**
  * 把 selection 状态翻译成 pill label + dot state。
- * - 未绑定 → "仓库" + state none
- * - cloning → "octo/demo @ main · 克隆中" + state cloning
- * - ready → "octo/demo @ main" + state ready
- * - failed → "octo/demo @ main · 失败" + state failed
- * - pending → "octo/demo @ main · 准备中" + state pending
+ * 状态文字(准备中/克隆中/进度%)已移到 #repo-progress-banner,pill 只剩
+ * 仓库名 + 颜色点。
+ * - 未绑定:label = "仓库", dot = "none"
+ * - 已绑定:label = "owner/repo @ branch", dot = status (pending/cloning/ready/failed)
  */
 export function formatRepoLabel(sel) {
   if (!sel || !sel.selected) return { label: '仓库', dot: 'none' }
   const base = `${sel.owner}/${sel.repo} @ ${sel.branch}`
+  const status = sel.status
+  const dot = (status === 'ready' || status === 'cloning' || status === 'failed') ? status : 'pending'
+  return { label: base, dot }
+}
+
+/**
+ * 把 selection 翻译成 banner 渲染用的状态 bag。null = 不显示 banner。
+ * - 未绑定 → null
+ * - pending → { phase:'pending', text:'准备中…', name, showProgress:false }
+ * - cloning → { phase:'cloning', text:'克隆中', name, showProgress:true }
+ * - ready  → { phase:'ready',   text:'已就绪',  name, showProgress:false }
+ * - failed → { phase:'failed',  text:'克隆失败', name, showProgress:false }
+ * 未知 status 视为 pending fallback。
+ */
+export function formatBannerState(sel) {
+  if (!sel || !sel.selected) return null
+  const name = `${sel.owner}/${sel.repo} @ ${sel.branch}`
   switch (sel.status) {
-    case 'ready':   return { label: base, dot: 'ready' }
-    case 'cloning': return { label: `${base} · 克隆中`, dot: 'cloning' }
-    case 'failed':  return { label: `${base} · 失败`, dot: 'failed' }
+    case 'ready':   return { phase: 'ready',   text: '已就绪',  name, showProgress: false }
+    case 'cloning': return { phase: 'cloning', text: '克隆中',  name, showProgress: true }
+    case 'failed':  return { phase: 'failed',  text: '克隆失败', name, showProgress: false }
     case 'pending':
-    default:        return { label: `${base} · 准备中`, dot: 'pending' }
+    default:        return { phase: 'pending', text: '准备中…', name, showProgress: false }
   }
+}
+
+/**
+ * 克隆进度估算曲线。后端不报 git clone 真实百分比,前端按 30s 期望窗口
+ * 跑一条缓动曲线,封顶 90%(留 10% 给真正的 ready 帧)。
+ *   pct = 90 * (1 - exp(-2.2 * t))   t = elapsed / 30000
+ * t=0 → 0%;t=0.5(15s) → 60%;t=1(30s) → 80%;t=2(60s) → 89%。
+ * 之后真实 ready 帧会跳到 100% + 自隐。
+ */
+export function estimateCloningProgress(startTime, now) {
+  if (!Number.isFinite(startTime) || !Number.isFinite(now)) return 0
+  const t = Math.max(0, (now - startTime) / 30000)
+  return Math.min(90, Math.round(90 * (1 - Math.exp(-2.2 * t))))
 }
 
 // ── Module-private state ──────────────────────────────────────────
@@ -93,6 +122,58 @@ function _bumpKnownVersion(sid, ver) {
   const cur = _getKnownVersion(sid)
   if (cur === Number.POSITIVE_INFINITY) return // 已 unbind 哨兵不被普通版本回退
   if (ver > cur) _knownVersion.set(sid, ver)
+}
+
+// ── Per-session banner 进度计时器 ───────────────────────────────
+// _knownVersion 只存版本号 —— 切 session 回来时不能恢复"这个 session
+// 的克隆已经跑了 12s"。因此独立 Map 持久化 startTime + interval。
+// 切 session 时 timer 不停(后端仍在 clone),只是 tick 早 return DOM 更新;
+// 切回来时复用同一 startTime 继续算 elapsed,曲线不被重置。
+const _repoProgressBySid = new Map()       // sid -> { startTime: number, timer: number }
+const _repoReadyHideTimerBySid = new Map() // sid -> number(setTimeout id)
+
+function _clearProgressTimer(sid) {
+  const entry = _repoProgressBySid.get(sid)
+  if (entry && entry.timer) clearInterval(entry.timer)
+  _repoProgressBySid.delete(sid)
+}
+function _clearReadyHideTimer(sid) {
+  const t = _repoReadyHideTimerBySid.get(sid)
+  if (t) clearTimeout(t)
+  _repoReadyHideTimerBySid.delete(sid)
+}
+function _startProgressTimer(sid) {
+  // 已有则不重启 —— 保留累计 elapsed,避免切 session 来回时进度被重置。
+  if (_repoProgressBySid.has(sid)) return
+  const startTime = Date.now()
+  const tick = () => {
+    const cur = getSession()?.id
+    if (cur !== sid) return // 不在当前 session,timer 继续跑但不动 DOM
+    const pct = estimateCloningProgress(startTime, Date.now())
+    _renderBannerProgress(pct)
+  }
+  tick()
+  const timer = setInterval(tick, 200)
+  _repoProgressBySid.set(sid, { startTime, timer })
+}
+
+/** banner DOM 进度刷新(纯渲染,不动 timer 状态)。 */
+function _renderBannerProgress(pct) {
+  const trackEl = $('repo-banner-progress')
+  if (trackEl) {
+    trackEl.setAttribute('aria-valuenow', String(pct))
+    const fillEl = trackEl.querySelector('.repo-banner-progress-fill')
+    if (fillEl) fillEl.style.width = `${pct}%`
+  }
+  const banner = $('repo-progress-banner')
+  const pctEl = banner ? banner.querySelector('.repo-banner-progress-pct') : null
+  if (pctEl) pctEl.textContent = `${pct}%`
+}
+
+/** 只隐藏 banner DOM,timer 状态不动 —— 用在 ready 自隐 / unbind / no-selection。 */
+function _hideBannerOnly() {
+  const banner = $('repo-progress-banner')
+  if (banner) banner.hidden = true
 }
 
 // ── Modal 入口 ────────────────────────────────────────────────────
@@ -320,15 +401,17 @@ export async function confirmSelectRepo() {
     // WS bind 帧。失败也不阻塞 UX —— bridge 在下次 reconnect 自动重发。
     sendRepoBindFrame(_currentSid, res.selection_version)
     closeModal('github-modal')
-    // 立即用本地态更新 pill(避免等 status 帧),后端推 cloning/ready 时再覆盖
-    applyPillFromSelection({
+    // 立即用本地态更新 pill + banner(避免等 status 帧),后端推 cloning/ready 时再覆盖
+    const localSel = {
       selected: true,
       owner: res.owner,
       repo: res.repo,
       branch: res.branch,
       status: res.status || 'pending',
       selection_version: res.selection_version,
-    }, _currentSid)
+    }
+    applyPillFromSelection(localSel, _currentSid)
+    applyBannerFromState(localSel, _currentSid)
   } catch (err) {
     toast(String(err?.message || err), 'error', toastOptsFromError(err))
   } finally {
@@ -350,12 +433,13 @@ export async function unbindCurrent() {
     _knownVersion.set(_currentSid, Number.POSITIVE_INFINITY)
     closeModal('github-modal')
     applyPillFromSelection({ selected: false }, _currentSid)
+    applyBannerFromState({ selected: false }, _currentSid)
   } catch (err) {
     toast(String(err?.message || err), 'error', toastOptsFromError(err))
   }
 }
 
-// ── Pill state 管理 ───────────────────────────────────────────────
+// ── Pill / banner state 管理 ──────────────────────────────────────
 
 /** Phase 6:把 selection 落到 #github-trigger 的 label + dot。 */
 function applyPillFromSelection(sel, sid) {
@@ -369,13 +453,82 @@ function applyPillFromSelection(sel, sid) {
   if (dotEl) dotEl.dataset.state = dot
 }
 
-/** 切 session / boot 时调:从后端拉一次 selection 来渲染 pill。 */
+/**
+ * 把 selection 应用到 #repo-progress-banner。Timer 状态(进度 / ready 自隐)
+ * 即便 sid !== current session 也要更新 —— 否则不在前台的 cloning timer
+ * 会泄漏。DOM 更新仅在 sid === current 时执行。
+ *
+ * opts.suppressReadyShow:初始 GET / 切 session 时已是 ready 不显示 banner
+ *                         (避免每次开页面闪一下"已就绪")。
+ */
+function applyBannerFromState(sel, sid, opts) {
+  const suppressReadyShow = !!(opts && opts.suppressReadyShow)
+  const st = formatBannerState(sel)
+  const cur = getSession()?.id
+  const isCurrent = !!(sid && cur && sid === cur) || (!sid && cur)
+  const banner = $('repo-progress-banner')
+
+  // ── Timer 状态机(无视 isCurrent,泄漏防护)──
+  if (!st) {
+    _clearProgressTimer(sid)
+    _clearReadyHideTimer(sid)
+  } else if (st.phase === 'cloning') {
+    _clearReadyHideTimer(sid)
+    _startProgressTimer(sid) // 已有则 noop
+  } else {
+    _clearProgressTimer(sid)
+    if (st.phase === 'ready' && !suppressReadyShow) {
+      _clearReadyHideTimer(sid)
+      const t = setTimeout(() => {
+        _repoReadyHideTimerBySid.delete(sid)
+        const cur2 = getSession()?.id
+        if (cur2 === sid) _hideBannerOnly()
+      }, 3000)
+      _repoReadyHideTimerBySid.set(sid, t)
+    } else {
+      // pending / failed / suppressed-ready:无 ready 自隐计时
+      _clearReadyHideTimer(sid)
+    }
+  }
+
+  // ── DOM 更新(仅当前 session)──
+  if (!isCurrent || !banner) return
+  if (!st || (st.phase === 'ready' && suppressReadyShow)) {
+    banner.hidden = true
+    return
+  }
+  banner.hidden = false
+  banner.dataset.state = st.phase
+  const iconEl = banner.querySelector('.repo-banner-icon')
+  const nameEl = banner.querySelector('.repo-banner-name')
+  const statusEl = banner.querySelector('.repo-banner-status')
+  const progressEl = banner.querySelector('.repo-banner-progress')
+  if (iconEl) iconEl.dataset.state = st.phase
+  if (nameEl) nameEl.textContent = st.name
+  if (statusEl) statusEl.textContent = st.text
+  if (progressEl) progressEl.hidden = !st.showProgress
+  if (st.phase === 'ready') {
+    _renderBannerProgress(100)
+  } else if (!st.showProgress) {
+    _renderBannerProgress(0)
+  }
+  // cloning 的进度由 timer.tick 自己刷新,这里不动
+}
+
+/** 切 session / boot 时调:从后端拉一次 selection 来渲染 pill + banner。 */
 export async function refreshGithubPill(sessionId) {
   const sid = sessionId || getSession()?.id
   if (!sid) {
     applyPillFromSelection({ selected: false }, sid)
+    applyBannerFromState({ selected: false }, sid)
     return
   }
+  // 切 session race:若新 session 是当前 session,先**同步**隐藏 banner DOM,
+  // 避免在 await GET 期间用户看到上个 session 的状态(克隆中 65% 这种)。
+  // 注意只动 DOM 不清 timer —— 上个 session 的 cloning timer 仍可能存活,
+  // 走它自己的 sid 路径;本 session 的 timer 还没建立,这里也无可清。
+  const cur = getSession()?.id
+  if (sid === cur) _hideBannerOnly()
   try {
     const sel = await apiGet(`/api/me/sessions/${encodeURIComponent(sid)}/github-selection`)
     if (sel && sel.selected && typeof sel.selection_version === 'number') {
@@ -386,9 +539,12 @@ export async function refreshGithubPill(sessionId) {
       _knownVersion.set(sid, Number.POSITIVE_INFINITY)
     }
     applyPillFromSelection(sel || { selected: false }, sid)
+    // 初次 / 切回:已是 ready 直接收 banner,不闪"已就绪"
+    applyBannerFromState(sel || { selected: false }, sid, { suppressReadyShow: true })
   } catch (err) {
     // 401/404 等都视为未绑定;不打 toast 避免每次切 session 都骚扰
     applyPillFromSelection({ selected: false }, sid)
+    applyBannerFromState({ selected: false }, sid)
   }
 }
 
@@ -405,19 +561,22 @@ export function handleRepoStatusFrame(frame) {
   const known = _getKnownVersion(sid)
   if (known > ver) return
   _bumpKnownVersion(sid, ver)
-  // 只更新当前 session 的 pill;其他 session 的状态在切换时再 refresh。
-  const cur = getSession()?.id
-  if (sid !== cur) return
-  applyPillFromSelection({
+  const sel = {
     selected: true,
     owner: frame.owner || _existingSelection?.owner || '',
     repo: frame.repo || _existingSelection?.repo || '',
     branch: frame.branch || _existingSelection?.branch || '',
     status: frame.status,
     selection_version: ver,
-  }, sid)
+  }
+  // Pill 仅当前 session 才更新;banner timer 状态对所有 session 都要更新
+  // (否则 cloning timer 会泄漏)。applyBannerFromState 内部会按 isCurrent 决定
+  // 是否动 DOM。
+  applyPillFromSelection(sel, sid)
+  applyBannerFromState(sel, sid)
   if (frame.status === 'failed' && frame.errorCode) {
-    toast(githubErrorText(frame.errorCode), 'error')
+    const cur = getSession()?.id
+    if (sid === cur) toast(githubErrorText(frame.errorCode), 'error')
   }
 }
 
@@ -430,12 +589,16 @@ export function handleRepoBindErrorFrame(frame) {
   const ver = typeof frame.selectionVersion === 'number' ? frame.selectionVersion : -1
   const known = _getKnownVersion(sid)
   if (known > ver) return
-  toast(githubErrorText(frame.errorCode), 'error')
-  // 当前 session 失败时清空 pill(后端已 cleared / 拒绝)
   const cur = getSession()?.id
-  if (sid === cur) {
-    applyPillFromSelection({ selected: false }, sid)
-  }
+  if (sid === cur) toast(githubErrorText(frame.errorCode), 'error')
+  // 失败时清空 pill + banner 状态(后端已 cleared / 拒绝)。
+  // 关键:把 _knownVersion 升到 +Infinity 哨兵 —— status 帧 version-gate
+  // 用 `known > ver`(同版本接受多次以支持 pending→cloning→ready),所以
+  // 不升哨兵的话,同 selection_version 的延迟 status 帧会"复活"已清的 UI。
+  // 直到下一次 PUT/GET 用真实新版本号覆盖哨兵为止。
+  _knownVersion.set(sid, Number.POSITIVE_INFINITY)
+  applyPillFromSelection({ selected: false }, sid)
+  applyBannerFromState({ selected: false }, sid)
 }
 
 /** boot 时如果 URL 带 ?github_linked=1 / ?github_error=...,toast + 清 query。 */

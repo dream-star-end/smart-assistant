@@ -612,6 +612,29 @@
       <span class="provisioning-banner-text">环境初始化中,首次启动约 5-10 秒…</span>
     </div>
 
+    <!-- Phase 6 GitHub 仓库克隆 banner:绑定后 pending → cloning(显进度) → ready(秒级自隐)/ failed。
+         Pill 只剩 dot + 仓库名;状态/进度全在这里。aria-live=polite 仅落在 .repo-banner-status,
+         避免 200ms 进度刷新轰炸读屏。Track 上 role=progressbar + aria-valuenow,百分比文字 aria-hidden。 -->
+    <div id="repo-progress-banner" class="repo-banner" hidden>
+      <span class="repo-banner-icon" data-state="pending" aria-hidden="true"></span>
+      <span class="repo-banner-name"></span>
+      <span class="repo-banner-status" role="status" aria-live="polite">准备中…</span>
+      <span class="repo-banner-progress" hidden>
+        <span
+          id="repo-banner-progress"
+          class="repo-banner-progress-track"
+          role="progressbar"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="0"
+          aria-label="仓库克隆进度"
+        >
+          <span class="repo-banner-progress-fill"></span>
+        </span>
+        <span class="repo-banner-progress-pct" aria-hidden="true">0%</span>
+      </span>
+    </div>
+
     <footer class="composer">
       <div class="composer-inner">
         <div id="attachments" class="attachments" hidden></div>

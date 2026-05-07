@@ -67,6 +67,10 @@ const DYNAMIC_IDS = new Set([
   // 后续用 document.getElementById('permission-modal') 查;index.html 没有
   // 静态 stub。
   'permission-modal',
+  // Phase 6 GitHub: github.js renderAccountBar() 把 #github-link-btn /
+  // #github-unlink-btn 注入 #github-account-bar.innerHTML,然后立即绑 onclick
+  'github-link-btn',
+  'github-unlink-btn',
 ])
 
 // ── Template-literal dynamic IDs: $(`prefix-${var}`) ──

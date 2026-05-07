@@ -3522,6 +3522,45 @@ a:hover {
   transform: rotate(180deg);
 }
 
+/* ── Phase 6 GitHub repo pill 状态点 ── */
+.repo-status-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-left: 2px;
+  flex-shrink: 0;
+  background: transparent;
+  transition: background var(--transition-fast);
+}
+.repo-status-dot[data-state='none']    { background: transparent; }
+.repo-status-dot[data-state='pending'] { background: var(--fg-muted); }
+.repo-status-dot[data-state='cloning'] { background: var(--accent); animation: repo-dot-pulse 1.2s ease-in-out infinite; }
+.repo-status-dot[data-state='ready']   { background: #22c55e; }
+.repo-status-dot[data-state='failed']  { background: var(--danger, #ef4444); }
+@keyframes repo-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+/* GitHub modal 内仓库 / 分支列表行 */
+.github-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--fg);
+  transition: background var(--transition-fast);
+}
+.github-row:hover { background: var(--bg-hover, var(--bg-muted)); }
+.github-row[aria-selected='true'] { background: var(--accent); color: #fff; }
+.github-row[aria-selected='true'] .github-row-sub { color: rgba(255, 255, 255, 0.85); }
+.github-row-name { font-weight: 500; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.github-row-sub { color: var(--fg-muted); font-size: var(--text-xs); flex-shrink: 0; }
+
 /* ── 思考深度弹出菜单 ── */
 .effort-menu {
   position: absolute;
@@ -6431,6 +6470,124 @@ body.body-landing {
     padding: 6px 12px;
     min-height: 36px;
     font-size: 12.5px;
+  }
+}
+
+/* ─────────────────────────────────────────────
+   Phase 6 GitHub 仓库克隆 banner — composer 上方,
+   pending / cloning(带进度条) / ready(秒级自隐) / failed。
+   结构镜像 .provisioning-banner;新增 progress track + fill。
+   ───────────────────────────────────────────── */
+.repo-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 16px 8px;
+  padding: 8px 14px;
+  min-height: 36px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.4;
+  animation: provisioning-banner-in 180ms ease-out;
+}
+.repo-banner[hidden] { display: none; }
+.repo-banner[data-state='failed'] {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+.repo-banner[data-state='ready'] {
+  background: rgba(34, 197, 94, 0.08);
+  border-color: rgba(34, 197, 94, 0.4);
+}
+
+.repo-banner-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+}
+.repo-banner-icon[data-state='pending'],
+.repo-banner-icon[data-state='cloning'] {
+  border: 2px solid var(--accent-border);
+  border-top-color: var(--accent);
+  animation: sync-orbit 0.9s linear infinite;
+}
+.repo-banner-icon[data-state='ready']  { background: #22c55e; border: 0; }
+.repo-banner-icon[data-state='failed'] { background: var(--danger, #ef4444); border: 0; }
+
+/* repo 名:可省略;不要 flex:1,免得吃光进度条空间 */
+.repo-banner-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  color: var(--fg);
+}
+.repo-banner-status {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+}
+.repo-banner[data-state='failed'] .repo-banner-status { color: var(--danger, #ef4444); }
+.repo-banner[data-state='ready']  .repo-banner-status { color: #16a34a; }
+
+.repo-banner-progress {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.repo-banner-progress[hidden] { display: none; }
+
+.repo-banner-progress-track {
+  flex: 1 1 auto;
+  display: inline-block;
+  height: 6px;
+  min-width: 60px;
+  max-width: 240px;
+  background: var(--accent-border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.repo-banner-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  width: 0%;
+  transition: width 220ms ease-out;
+}
+.repo-banner-progress-pct {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  min-width: 36px;
+  text-align: right;
+}
+
+/* 移动端:同 .provisioning-banner 收缩;进度条窄一点,百分比仍可读 */
+@media (max-width: 640px) {
+  .repo-banner {
+    margin: 0 12px 6px;
+    padding: 6px 12px;
+    min-height: 36px;
+    font-size: 12.5px;
+    gap: 8px;
+  }
+  .repo-banner-progress { gap: 6px; }
+  .repo-banner-progress-track {
+    min-width: 40px;
+    max-width: 160px;
+  }
+  .repo-banner-progress-pct {
+    min-width: 32px;
+    font-size: 11.5px;
   }
 }
 
