@@ -19,7 +19,11 @@ import { apiGet, apiJson } from './api.js?v=5e6fd2ac'
 import { $, htmlSafeEscape } from './dom.js?v=5e6fd2ac'
 import { getSession, state } from './state.js?v=5e6fd2ac'
 import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=5e6fd2ac'
-import { sendRepoBindFrame, sendRepoUnbindFrame } from './websocket.js?v=5e6fd2ac'
+import {
+  clearRepoBindQueue,
+  queueRepoBindFrame,
+  sendRepoUnbindFrame,
+} from './websocket.js?v=5e6fd2ac'
 
 // ── Pure helpers (testable) ───────────────────────────────────────
 
@@ -398,8 +402,9 @@ export async function confirmSelectRepo() {
     }
     // PUT 成功 = 后端权威新版本,直接 set 覆盖任何 +Infinity 哨兵(unbind→rebind 同一 tab)。
     _knownVersion.set(_currentSid, res.selection_version)
-    // WS bind 帧。失败也不阻塞 UX —— bridge 在下次 reconnect 自动重发。
-    sendRepoBindFrame(_currentSid, res.selection_version)
+    // v1.0.94:走待确认队列,内部立即尝试一次,失败/卡顿由 onopen flush + 30s GET 兜底,
+    // 直到收到 cloning/ready/failed/bind_error 才清队列。
+    queueRepoBindFrame(_currentSid, res.selection_version)
     closeModal('github-modal')
     // 立即用本地态更新 pill + banner(避免等 status 帧),后端推 cloning/ready 时再覆盖
     const localSel = {
@@ -426,6 +431,8 @@ export async function unbindCurrent() {
   const ver = _existingSelection.selection_version
   try {
     await apiJson('DELETE', `/api/me/sessions/${encodeURIComponent(_currentSid)}/github-selection`)
+    // v1.0.94:DELETE 之后先清待确认队列,避免后续 status 帧迟到时 stale entry 被错配。
+    clearRepoBindQueue(_currentSid)
     sendRepoUnbindFrame(_currentSid, ver)
     // unbind 后任何延迟到达的旧版本 status/error 帧都不该再生效。
     // 后端 DELETE 不返回新版本号 —— 用 +Infinity 哨兵把已知版本封顶,

@@ -2105,6 +2105,9 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
       // 2026-04-27 v1.0.16:补 renderModelPill,v1.0.4 加 modelPicker 时漏写。
       renderModePills()
       renderModelPill()
+      // 2026-05-07 v1.0.94 — login 后第一次 sync 拿到 currentSessionId 时也刷一次
+      // GitHub repo pill,避免新登录看到空 pill 直到用户手动切会话。
+      refreshGithubPill(state.currentSessionId)
     })
     .catch(() => {})
   checkUnclaimedSessions()
@@ -2635,6 +2638,11 @@ async function init() {
     // Without this, users would see a blank window until ws.onopen fires
     // (websocket.js:423 only restores state for the then-current session).
     restoreCurrentSessionInFlightUI()
+    // 2026-05-07 v1.0.94 — 冷启动同步当前会话的 GitHub repo pill / banner。
+    // sessions.js 的 selectSession 只在用户点击侧栏切会话时调用 refreshGithubPill,
+    // 浏览器刷新没有那次点击 → 之前 pill 永远空。调一次让 pill 反映当前 session
+    // 在 server 上的真实 selection。sid 为空时 refreshGithubPill 内部会清空 pill。
+    refreshGithubPill(state.currentSessionId)
     connect()
     reloadAgents()
     loadChangelog()
@@ -2668,6 +2676,12 @@ async function init() {
           restoreCurrentSessionInFlightUI()
         }
         renderSidebar()
+        // 2026-05-08 v1.0.94 — 冷启动 server sync 也补一次 refreshGithubPill。
+        // 跨设备场景:tab A 选了仓库,tab B 冷启动 IDB 里没有这条 selection,
+        // server sync 后 currentSessionId 换到 A,但 init() 早调过的
+        // refreshGithubPill 用的是 IDB 旧 sid → pill 仍是空。无条件刷一次。
+        // GET 成本低,与 login 路径(runPostLoginPipeline)语义对齐。
+        refreshGithubPill(state.currentSessionId)
       })
       .catch(() => {})
   } else {

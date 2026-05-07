@@ -64,6 +64,16 @@ import {
 } from "../billing/codexFinalizer.js";
 import type { TokenUsage } from "../billing/calculator.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
+import type { GithubSelectionRow } from "../github/sessionWorkspaces.js";
+import {
+  applyStatusFrame,
+  buildAutoRebindFrames,
+  enrichBindRequest,
+  fetchActiveSelectionsForRebind,
+  parseBindRequest,
+  parseStatusFrame,
+  parseUnbindRequest,
+} from "./sessionRepoBindBridge.js";
 
 // ---------- 协议 / 常量 -----------------------------------------------------
 
@@ -1015,6 +1025,78 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //   匹配 peer.id 的原因:同桥可 claude+codex 交错,只看"任意 isFinal"会误释。
     let codexInboundPeerId: string | null = null;
 
+    // Phase 4 — GitHub session-repo auto-rebind:bridge 实例级 cache。
+    //   containerWs.on('open') 时 fetch active selections 进 map(无 token);
+    //   inbound.hello 到达时记录 peerIds,然后调 flush:对 peers 取交集,async
+    //   富化 token + 推 bind 帧。
+    //   key = sessionId;value = DB row。bridge close 时随 closure GC,无需手动清。
+    //
+    //   Codex Phase 4.7 #2 修:flush 必须从两边触发(hello 到达 + open-fetch 完成),
+    //   否则 hello 先于 fetch 完成时 map 是空,fetch 之后没人触发,active 选择
+    //   永远不会 rebind。pendingRebindMap 存"需 rebind 的 row",
+    //   lastHelloPeerIds 存"最近 hello 见到的 peers",flush 时取交集。
+    const pendingRebindMap = new Map<string, GithubSelectionRow>();
+    let lastHelloPeerIds: Set<string> | null = null;
+    let autoRebindFetchDone = false;
+    let autoRebindFlushInFlight = false;
+    /**
+     * 双触发 flush:hello 到达 + fetch 完成 都调一次,真正的工作只在两边都就绪时
+     * 发生。重入保护(autoRebindFlushInFlight)防止两端同一 tick 都触发时 doublework。
+     */
+    const tryAutoRebindFlush = (): void => {
+      if (!deps.pgPool) return;
+      if (lastHelloPeerIds === null || lastHelloPeerIds.size === 0) return;
+      if (!autoRebindFetchDone) return;
+      if (pendingRebindMap.size === 0) return;
+      if (autoRebindFlushInFlight) return;
+      autoRebindFlushInFlight = true;
+      const pgPoolBound = deps.pgPool;
+      const peers = Array.from(lastHelloPeerIds);
+      ;(async () => {
+        try {
+          const built = await buildAutoRebindFrames(
+            pgPoolBound,
+            Number(uid),
+            peers,
+            pendingRebindMap,
+          );
+          for (const sid of built.matchedSessionIds) pendingRebindMap.delete(sid);
+          for (const f of built.frames) {
+            const buf = Buffer.from(JSON.stringify(f), "utf8");
+            forwardInboundFrame(buf, false, buf.length);
+            // v1.0.94 — 诊断 instrument。auto-rebind 路径在容器重连后自动重发 bind,
+            // 与显式 bind 路径用同一日志体便于 grep。
+            log?.info("user-chat-bridge: repo_bind_auto_rebind_forwarded", {
+              uid: uid.toString(),
+              connId,
+              sessionId: f.sessionId,
+              selectionVersion: f.selectionVersion,
+              agentId: f.agentId,
+            });
+          }
+          if (built.errors.length > 0 && userWs.readyState === WebSocket.OPEN) {
+            for (const e of built.errors) {
+              try { userWs.send(JSON.stringify(e)); } catch { /* */ }
+            }
+          }
+        } catch (err) {
+          log?.warn("user-chat-bridge: auto-rebind flush failed", {
+            uid: uid.toString(), connId, err,
+          });
+        } finally {
+          autoRebindFlushInFlight = false;
+          // 若 flush 期间又有新 hello peers / 新 fetch row 进来,再触发一轮
+          if (
+            lastHelloPeerIds !== null &&
+            lastHelloPeerIds.size > 0 &&
+            pendingRebindMap.size > 0
+          ) {
+            tryAutoRebindFlush();
+          }
+        }
+      })();
+    };
+
     // PR2 v1.0.66 — codex 真扣费 per-bridge inflight Map + drain 状态。
     //   inflightCodexTurns: requestId → snapshot (finalizer + model)
     //     - 由 codex acquire IIFE 在成功路径 set
@@ -1122,6 +1204,95 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         if (frameStr !== null) {
           let parsed: unknown = null;
           try { parsed = JSON.parse(frameStr); } catch { /* 非 JSON 帧透传 */ }
+
+          // Phase 4 — GitHub session-repo bind 帧:bridge 富化 + forward
+          //   inbound 帧只带 sessionId/version/peer/agentId/channel(token 不在前端);
+          //   bridge 用 deps.pgPool 查 selection + link,组装完整 bind 帧再推容器。
+          //   错误(stale / link revoked / DB 故障)→ outbound.control.session_repo_bind_error
+          //   发回 userWs,**不**转发给容器(防止容器陷在 pending)。
+          //   pgPool 未注入(测试)→ skip 富化,**不**透传(防泄漏 raw bind 请求帧到
+          //   容器,容器没 token 也处理不了)。
+          if (parsed !== null && typeof parsed === "object") {
+            const ftype = (parsed as { type?: unknown }).type;
+            if (ftype === "inbound.control.session_repo_bind") {
+              const bindReq = parseBindRequest(parsed);
+              if (bindReq === null) {
+                if (userWs.readyState === WebSocket.OPEN) {
+                  try {
+                    userWs.send(JSON.stringify({
+                      type: "outbound.control.session_repo_bind_error",
+                      sessionId: typeof (parsed as { sessionId?: unknown }).sessionId === "string"
+                        ? (parsed as { sessionId: string }).sessionId
+                        : "",
+                      selectionVersion: 0,
+                      errorCode: "INVALID_BIND_PAYLOAD",
+                      errorMessage: "bind frame schema invalid",
+                    }));
+                  } catch { /* */ }
+                }
+                return;
+              }
+              const pgPool = deps.pgPool;
+              if (!pgPool) {
+                // 生产环境 pgPool 必注入;走到这只能是测试 mock,丢弃且不透传。
+                return;
+              }
+              // async 富化;不阻塞主循环。富化期间 main message 帧可能继续走,
+              // bind 因 DB query 抢晚到容器是可接受的(plan v3 修 #4 — 容器侧 bind/
+              // message 乱序处理)。
+              ;(async () => {
+                try {
+                  const result = await enrichBindRequest(pgPool, Number(uid), bindReq);
+                  if (result.type === "outbound.control.session_repo_bind_error") {
+                    if (userWs.readyState === WebSocket.OPEN) {
+                      try { userWs.send(JSON.stringify(result)); } catch { /* */ }
+                    }
+                    return;
+                  }
+                  // 富化成功 → forward enriched 到容器
+                  const enrichedJson = JSON.stringify(result);
+                  const buf = Buffer.from(enrichedJson, "utf8");
+                  forwardInboundFrame(buf, false, buf.length);
+                  // v1.0.94 — 诊断 instrument。bind 帧是关键侧信道,4 个 hop
+                  // (前端 → master bridge → 容器 → workspace)只有任一段沉默都会让
+                  // 用户卡在「准备中…」。这里记录 bridge → 容器这一段是否真的发出。
+                  log?.info("user-chat-bridge: repo_bind_forwarded", {
+                    uid: uid.toString(),
+                    connId,
+                    sessionId: result.sessionId,
+                    selectionVersion: result.selectionVersion,
+                    agentId: result.agentId,
+                  });
+                } catch (err) {
+                  log?.warn("user-chat-bridge: enrich bind failed", {
+                    uid: uid.toString(), connId, err,
+                  });
+                  if (userWs.readyState === WebSocket.OPEN) {
+                    try {
+                      userWs.send(JSON.stringify({
+                        type: "outbound.control.session_repo_bind_error",
+                        sessionId: bindReq.sessionId,
+                        selectionVersion: bindReq.selectionVersion,
+                        errorCode: "BRIDGE_ENRICH_FAILED",
+                        errorMessage: "internal error during bind enrichment",
+                      }));
+                    } catch { /* */ }
+                  }
+                }
+              })();
+              return; // 同步路径不再 forward 原始帧;async 完成后才推富化版
+            }
+            if (ftype === "inbound.control.session_repo_unbind") {
+              const unbindReq = parseUnbindRequest(parsed);
+              if (unbindReq === null) {
+                // schema 错 → 静默丢(没必要给前端报错,unbind 是用户操作不应失败)
+                return;
+              }
+              // unbind 不需要富化,直接透传(走 forwardInboundFrame 后续逻辑)
+              // fall through to forwardInboundFrame below
+            }
+          }
+
           // Phase 0.4 — inbound.hello → bridge ring replay.
           //
           // Each peer in the hello carries `lastFrameSeq` (last outbound seq
@@ -1186,6 +1357,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 } catch { /* swallow — userWs may be closing */ }
               }
             }
+            // Phase 4 — auto-rebind:记录 hello peers,触发 flush(可能等 fetch 完成)。
+            //   双触发设计:hello 端记 peer 集合 → tryAutoRebindFlush;
+            //   open 端 fetch 完成 → tryAutoRebindFlush。两边都就绪才真 flush。
+            //   Codex Phase 4.7 #2 修:旧实现只在 hello 时同步看 map,fetch 慢于 hello
+            //   时 active 选择永不 rebind。
+            const helloPeerIds = new Set<string>();
+            for (const p of peers) {
+              if (typeof p === "object" && p !== null) {
+                const pid = (p as { peerId?: unknown }).peerId;
+                if (typeof pid === "string") helloPeerIds.add(pid);
+              }
+            }
+            // 多次 hello(reconnect 重发)合并 peer 集合,不丢之前 hello 见过的 peer
+            if (lastHelloPeerIds === null) lastHelloPeerIds = helloPeerIds;
+            else for (const id of helloPeerIds) lastHelloPeerIds.add(id);
+            tryAutoRebindFlush();
             // Fall through to forwardInboundFrame below.
           }
           if (
@@ -1853,6 +2040,63 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
+      // Phase 4 — outbound.control.session_repo_status 侧信道(容器→master→user):
+      //   master 须**先**落 DB(applyStatusFrame:更新 status / token_invalid 触发
+      //   revoke + clear sessions),再让帧流到 userWs 让前端 UI 反映状态。
+      //
+      //   设计要点:
+      //   - **不进 outbound ring**:status 帧不带 sessionKey/frameSeq,自然通不过下方
+      //     ring 写入条件;且重连重放无意义(状态以 DB 为权威源)。
+      //   - 与 codex_billing 不同,status 帧**要**透传给 userWs(用户需看到
+      //     "cloning" / "ready" / "error" 进度);所以这里只 side-effect,不 return。
+      //   - DB 写失败(stale ack 等)→ updateGithubWorkspaceStatusIfVersion 返回
+      //     {updated:false},applyStatusFrame swallow,状态帧仍透传(用户至少能看到
+      //     "已被新版本覆盖"的语义,不会卡住)。
+      //   - cheap pre-filter 同 billing,不解 JSON 影响热路径。
+      if (!isBinary) {
+        let statusPeek: string | null = null;
+        if (typeof data === "string") statusPeek = data;
+        else if (Buffer.isBuffer(data)) {
+          try { statusPeek = data.toString("utf8"); } catch { statusPeek = null; }
+        }
+        if (
+          statusPeek !== null &&
+          statusPeek.includes('"outbound.control.session_repo_status"')
+        ) {
+          let parsedStatus: unknown = null;
+          try { parsedStatus = JSON.parse(statusPeek); } catch { /* 非 JSON 跳过 */ }
+          if (parsedStatus !== null && typeof parsedStatus === "object") {
+            const statusFrame = parseStatusFrame(parsedStatus);
+            if (statusFrame !== null && deps.pgPool) {
+              const pgPoolBound = deps.pgPool;
+              // fire-and-forget:DB 写后 status 帧仍透传给 userWs(下方 send 路径)。
+              ;(async () => {
+                try {
+                  const r = await applyStatusFrame(pgPoolBound, Number(uid), statusFrame);
+                  // v1.0.94 — 诊断 instrument。状态帧从容器到 user 这段也要可见,
+                  // 才能区分「容器没推 status」和「bridge 推了但 user 没收到」。
+                  log?.info("user-chat-bridge: repo_status_forwarded", {
+                    uid: uid.toString(),
+                    connId,
+                    sessionId: statusFrame.sessionId,
+                    selectionVersion: statusFrame.selectionVersion,
+                    status: statusFrame.status,
+                    errorCode: statusFrame.errorCode,
+                    dbUpdated: r.dbUpdated,
+                    revoked: r.revoked,
+                  });
+                } catch (err) {
+                  log?.warn("user-chat-bridge: applyStatusFrame failed", {
+                    uid: uid.toString(), connId,
+                    sessionId: statusFrame.sessionId, err,
+                  });
+                }
+              })();
+            }
+            // 不 return — status 帧继续走透传路径让前端 UI 看到状态变化
+          }
+        }
+      }
       // Phase 0.4 — bridge ring write for stamped outbound frames.
       //
       // Containers stamp `sessionKey + frameSeq` on outbound frames inside
@@ -2007,6 +2251,33 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       preopenQueue.length = 0;
       bufferedUC = 0;
       metrics.onBufferedBytes?.(uid, "user_to_container", 0);
+      // Phase 4 — auto-rebind active GitHub selections after container restart.
+      //   触发场景:supervisor 重启容器后,新容器内 git workspace 已丢,但 DB 里
+      //   还留着 ready/cloning/pending 的 selection。这里 open 时只 fetch row
+      //   (无 token),token 留到 hello 阶段才取(覆盖 open→hello 之间 revoke 风险)。
+      //   双触发:fetch 完成后调 tryAutoRebindFlush — 若 hello 已先到记 peers 那
+      //   边就是真 flush;若还没到,等 hello 来再触发。
+      //   pgPool 未注入(测试)→ 仍标记 fetchDone(避免 flush 永远等)。
+      if (deps.pgPool) {
+        const pgPoolBound = deps.pgPool;
+        ;(async () => {
+          try {
+            const rows = await fetchActiveSelectionsForRebind(pgPoolBound, Number(uid));
+            for (const row of rows) {
+              pendingRebindMap.set(row.sessionId, row);
+            }
+          } catch (err) {
+            log?.warn("user-chat-bridge: fetch active selections failed", {
+              uid: uid.toString(), connId, err,
+            });
+          } finally {
+            autoRebindFetchDone = true;
+            tryAutoRebindFlush();
+          }
+        })();
+      } else {
+        autoRebindFetchDone = true; // 测试 / 无 pg 路径:不阻塞 flush 语义
+      }
     });
 
     containerWs.on("message", onContainerMessage);

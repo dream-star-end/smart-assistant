@@ -6474,39 +6474,55 @@ body.body-landing {
 }
 
 /* ─────────────────────────────────────────────
-   Phase 6 GitHub 仓库克隆 banner — composer 上方,
-   pending / cloning(带进度条) / ready(秒级自隐) / failed。
-   结构镜像 .provisioning-banner;新增 progress track + fill。
+   Phase 6 v1.0.94 GitHub repo bar — composer 紧上方一行。
+   左:#github-trigger(沿用 .mode-pill 视觉,语义"打开仓库选择 modal")
+   右:#repo-progress-banner(只在 pending/cloning/failed 时展开为 status 条;
+        ready 后秒级自隐 → 只剩按钮的 dot 指示已绑定)
+   关键约束:不再全宽 / 不再用 accent-soft 橙色背景,跟 composer-modes 视觉权重持平。
    ───────────────────────────────────────────── */
-.repo-banner {
+.repo-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-  margin: 0 16px 8px;
-  padding: 8px 14px;
-  min-height: 36px;
-  border-radius: 10px;
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-border);
-  color: var(--fg);
-  font-size: 13px;
-  line-height: 1.4;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  margin-bottom: var(--space-2);
+}
+.repo-bar-trigger { flex: 0 0 auto; }
+
+.repo-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  min-height: 28px;
+  border-radius: var(--radius-full);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.35;
   animation: provisioning-banner-in 180ms ease-out;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
 }
 .repo-banner[hidden] { display: none; }
 .repo-banner[data-state='failed'] {
-  background: rgba(239, 68, 68, 0.08);
-  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.06);
+  border-color: rgba(239, 68, 68, 0.28);
+  color: var(--fg);
 }
 .repo-banner[data-state='ready'] {
-  background: rgba(34, 197, 94, 0.08);
-  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.06);
+  border-color: rgba(34, 197, 94, 0.28);
+  color: var(--fg);
 }
 
 .repo-banner-icon {
   flex: 0 0 auto;
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
 }
 .repo-banner-icon[data-state='pending'],
@@ -6527,11 +6543,12 @@ body.body-landing {
   white-space: nowrap;
   font-weight: 500;
   color: var(--fg);
+  max-width: 14ch;
 }
 .repo-banner-status {
   flex: 0 0 auto;
   color: var(--fg-muted);
-  font-size: 12.5px;
+  font-size: 12px;
 }
 .repo-banner[data-state='failed'] .repo-banner-status { color: var(--danger, #ef4444); }
 .repo-banner[data-state='ready']  .repo-banner-status { color: #16a34a; }
@@ -6548,11 +6565,11 @@ body.body-landing {
 .repo-banner-progress-track {
   flex: 1 1 auto;
   display: inline-block;
-  height: 6px;
-  min-width: 60px;
-  max-width: 240px;
+  height: 4px;
+  min-width: 48px;
+  max-width: 160px;
   background: var(--accent-border);
-  border-radius: 3px;
+  border-radius: 2px;
   overflow: hidden;
 }
 .repo-banner-progress-fill {
@@ -6571,24 +6588,30 @@ body.body-landing {
   text-align: right;
 }
 
-/* 移动端:同 .provisioning-banner 收缩;进度条窄一点,百分比仍可读 */
+/* 移动端:repo-bar 紧凑化,进度条窄一点,百分比仍可读 */
 @media (max-width: 640px) {
+  .repo-bar {
+    padding: 0 var(--space-2);
+    gap: var(--space-1);
+    margin-bottom: var(--space-1);
+  }
   .repo-banner {
-    margin: 0 12px 6px;
-    padding: 6px 12px;
-    min-height: 36px;
-    font-size: 12.5px;
-    gap: 8px;
+    padding: 3px 8px;
+    min-height: 26px;
+    font-size: 11.5px;
+    gap: 6px;
   }
   .repo-banner-progress { gap: 6px; }
   .repo-banner-progress-track {
-    min-width: 40px;
-    max-width: 160px;
+    min-width: 32px;
+    max-width: 100px;
+    height: 3px;
   }
   .repo-banner-progress-pct {
-    min-width: 32px;
-    font-size: 11.5px;
+    min-width: 28px;
+    font-size: 11px;
   }
+  .repo-banner-name { max-width: 8ch; }
 }
 
 /* ─── V3 commercial: 站内信(in-app inbox)─── */

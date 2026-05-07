@@ -1,5 +1,5 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
-import { abortInflightRefresh, clearProactiveRefresh, silentRefresh } from './api.js?v=5e6fd2ac'
+import { abortInflightRefresh, apiGet, clearProactiveRefresh, silentRefresh } from './api.js?v=5e6fd2ac'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
 import { clearSessionCookie } from './auth.js?v=5e6fd2ac'
@@ -837,22 +837,167 @@ export function stopCurrentTurn() {
 }
 
 // ── Phase 5/6 GitHub repo binding control frames ──
-// 唯一发送入口,github.js 调这两个 export(单向 web→ws,无循环)。
 // peer.id = sessionId(per Phase 5 contract);agentId 必须查 *目标 sessionId* 的 agent
 // (用户可能在 modal 打开 session A、切换到 B、再点确认),不能用当前 session 的 agent。
-// safeWsSend 失败时返 false → caller 决定是否 toast(目前 UI 在 pending/cleared 本地态,
-// 等 reconnect/auto-rebind 兜底)。
-export function sendRepoBindFrame(sessionId, selectionVersion) {
-  if (!state.ws || state.ws.readyState !== 1) return false
+//
+// v1.0.94 Bug② 修:bind 帧加"待确认"队列。
+// 协议本身缺 ACK,WS 抖动 / 短暂断连时 send 容易丢帧,且 bridge auto-rebind 只在 reconnect
+// 时按 hello.peers 重发,无法覆盖"用户选完不切会话"的场景,DB 永远卡 pending。
+//
+// 队列语义:
+//   - 入口 queueRepoBindFrame(sid, ver):立即尝试一次,失败也不算 attempt,
+//     起 30s timer GET selection 状态,仍 pending 才重发(attempts 只按实际发出累加)。
+//   - confirmRepoBindCleared(sid, ver):收到同/更新 version 的 cloning/ready/failed
+//     status 帧,或 bind_error 帧时清队列(stale 老版本忽略)。
+//   - clearRepoBindQueue(sid):unbind/DELETE 路径主动清。
+//   - WS onopen hello 发完后 flush 一次(覆盖"PUT 时 ws 未就绪"场景)。
+const _pendingRepoBindMap = new Map() // sid -> {version, attempts, lastSendAt, timer}
+const REPO_BIND_RETRY_MS = 30_000
+const REPO_BIND_MAX_ATTEMPTS = 3
+const REPO_BIND_MIN_GAP_MS = 1500 // 防 reconnect 抖动短时间多次 flush 同一 entry
+
+function _buildBindFrame(sessionId, selectionVersion) {
   const targetSess = state.sessions?.get?.(sessionId)
-  return safeWsSend(state.ws, JSON.stringify({
+  return JSON.stringify({
     type: 'inbound.control.session_repo_bind',
     sessionId,
     selectionVersion,
     peer: { id: sessionId, kind: 'dm' },
     agentId: targetSess?.agentId || state.defaultAgentId,
     channel: 'webchat',
-  }))
+  })
+}
+
+// 实际发送一次 bind attempt。仅在 ws.OPEN 且距上次 send >= MIN_GAP 时计 attempt。
+// 返回 'sent' / 'skipped_gap' / 'skipped_offline'。
+function _sendBindAttemptInternal(sid, version) {
+  if (!state.ws || state.ws.readyState !== 1) return 'skipped_offline'
+  const entry = _pendingRepoBindMap.get(sid)
+  const now = Date.now()
+  if (entry && now - entry.lastSendAt < REPO_BIND_MIN_GAP_MS) return 'skipped_gap'
+  const ok = safeWsSend(state.ws, _buildBindFrame(sid, version))
+  if (!ok) return 'skipped_offline'
+  if (entry) {
+    entry.attempts += 1
+    entry.lastSendAt = now
+  }
+  return 'sent'
+}
+
+function _scheduleBindRetry(sid) {
+  const entry = _pendingRepoBindMap.get(sid)
+  if (!entry) return
+  if (entry.timer) clearTimeout(entry.timer)
+  entry.timer = setTimeout(() => {
+    _runBindRetry(sid).catch((err) => {
+      console.warn('[ws] repo bind retry failed', { sid, err: err?.message || String(err) })
+    })
+  }, REPO_BIND_RETRY_MS)
+}
+
+async function _runBindRetry(sid) {
+  const entry = _pendingRepoBindMap.get(sid)
+  if (!entry) return
+  if (entry.attempts >= REPO_BIND_MAX_ATTEMPTS) {
+    _pendingRepoBindMap.delete(sid)
+    try { toast('GitHub 仓库挂载长时间未就绪,可能网络抖动,可解绑后重试', 'warn') } catch {}
+    return
+  }
+  // ws 未 open 时不打 GET / 不计 attempt,等 onopen flush 接管;timer 续一轮
+  if (!state.ws || state.ws.readyState !== 1) {
+    _scheduleBindRetry(sid)
+    return
+  }
+  // GET 当前 selection,如已脱离 pending / 版本被覆盖 / 不再 selected → 清
+  let sel = null
+  try {
+    sel = await apiGet(`/api/me/sessions/${encodeURIComponent(sid)}/github-selection`)
+  } catch {
+    // GET 失败不 toast,下一轮重试
+    _scheduleBindRetry(sid)
+    return
+  }
+  const cur = _pendingRepoBindMap.get(sid)
+  if (!cur || cur !== entry) return // 已被替换 / 清掉
+  if (!sel || sel.selected !== true) {
+    _pendingRepoBindMap.delete(sid)
+    return
+  }
+  if (typeof sel.selection_version !== 'number' || sel.selection_version !== entry.version) {
+    _pendingRepoBindMap.delete(sid)
+    return
+  }
+  if (sel.status && sel.status !== 'pending') {
+    _pendingRepoBindMap.delete(sid)
+    return
+  }
+  // 仍是同 version pending → 再发一次
+  _sendBindAttemptInternal(sid, entry.version)
+  _scheduleBindRetry(sid)
+}
+
+// 公开入口:github.js submitSelection PUT 成功后调用。
+export function queueRepoBindFrame(sessionId, selectionVersion) {
+  if (typeof sessionId !== 'string' || !sessionId) return
+  if (typeof selectionVersion !== 'number' || !Number.isSafeInteger(selectionVersion) || selectionVersion <= 0) return
+  const existing = _pendingRepoBindMap.get(sessionId)
+  if (existing) {
+    if (existing.version === selectionVersion) {
+      // 相同 entry,刷下尝试节奏即可
+      if (existing.timer) clearTimeout(existing.timer)
+      _sendBindAttemptInternal(sessionId, selectionVersion)
+      _scheduleBindRetry(sessionId)
+      return
+    }
+    if (existing.timer) clearTimeout(existing.timer)
+  }
+  _pendingRepoBindMap.set(sessionId, {
+    version: selectionVersion,
+    attempts: 0,
+    lastSendAt: 0,
+    timer: null,
+  })
+  _sendBindAttemptInternal(sessionId, selectionVersion)
+  _scheduleBindRetry(sessionId)
+}
+
+// status frame / bind_error 到达时调用清队列。
+// version 语义(Codex 审定):
+//   - version === entry.version: 清
+//   - version > entry.version: 清(后端版本已超前,旧 pending entry 失效)
+//   - version < entry.version: 忽略(stale 帧不能清新 entry)
+export function confirmRepoBindCleared(sessionId, selectionVersion) {
+  if (typeof sessionId !== 'string' || !sessionId) return
+  const entry = _pendingRepoBindMap.get(sessionId)
+  if (!entry) return
+  if (typeof selectionVersion !== 'number' || !Number.isSafeInteger(selectionVersion)) return
+  if (selectionVersion < entry.version) return
+  if (entry.timer) clearTimeout(entry.timer)
+  _pendingRepoBindMap.delete(sessionId)
+}
+
+// unbind / DELETE 路径主动清。
+export function clearRepoBindQueue(sessionId) {
+  const entry = _pendingRepoBindMap.get(sessionId)
+  if (!entry) return
+  if (entry.timer) clearTimeout(entry.timer)
+  _pendingRepoBindMap.delete(sessionId)
+}
+
+// onopen hello 发完之后调用:flush 所有 pending entry 一次。
+function _flushPendingRepoBinds() {
+  if (_pendingRepoBindMap.size === 0) return
+  for (const [sid, entry] of _pendingRepoBindMap) {
+    _sendBindAttemptInternal(sid, entry.version)
+    _scheduleBindRetry(sid)
+  }
+}
+
+// 兼容老 API(github.js 老路径已迁到 queueRepoBindFrame,但内部仍可用)。
+// 单次发送,无队列 / 无重试。返回 send 是否成功。
+export function sendRepoBindFrame(sessionId, selectionVersion) {
+  if (!state.ws || state.ws.readyState !== 1) return false
+  return safeWsSend(state.ws, _buildBindFrame(sessionId, selectionVersion))
 }
 export function sendRepoUnbindFrame(sessionId, selectionVersion) {
   if (!state.ws || state.ws.readyState !== 1) return false
@@ -1091,6 +1236,9 @@ export function connect() {
       // onopen 瞬间 bufferedAmount 必为 0,safeWsSend 只是保持统一入口
       safeWsSend(ws, JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
     } catch {}
+    // v1.0.94 Bug② 修:hello 发完后 flush 任何待确认 bind 帧。
+    // 覆盖"PUT 时 ws 未 OPEN 丢帧 + 用户不切会话/不刷新"导致的永久 pending。
+    try { _flushPendingRepoBinds() } catch {}
     // Flush offline queue — delay drain start to let hello/resume isFinals arrive first.
     // This prevents a resumed turn's isFinal from being mistaken for a drain response.
     if (state._offlineDrainTimer) clearTimeout(state._offlineDrainTimer)
@@ -1367,10 +1515,15 @@ export function connect() {
       else if (f.type === 'outbound.control.session_repo_status') {
         // Phase 5/6:容器 repo workspace 状态推送(cloning/ready/failed)。
         // github.js 注入 _deps.handleRepoStatusFrame 后路由;未注入时静默丢(模块未载)。
+        // v1.0.94:任意非 pending 状态都视为容器已确认收到 bind,清待确认队列。
+        // version 比对在 confirmRepoBindCleared 内做(stale 旧版本不会清新 entry)。
+        if (typeof f?.sessionId === 'string') confirmRepoBindCleared(f.sessionId, f.selectionVersion)
         _deps.handleRepoStatusFrame?.(f)
       }
       else if (f.type === 'outbound.control.session_repo_bind_error') {
         // Phase 5/6:bridge 校验失败(GITHUB_NOT_LINKED / STALE_OR_MISSING / 等)。
+        // bind_error 也是终态,清待确认队列(用户需要走解绑→重选流程)。
+        if (typeof f?.sessionId === 'string') confirmRepoBindCleared(f.sessionId, f.selectionVersion)
         _deps.handleRepoBindErrorFrame?.(f)
       }
       else if (f.type === 'outbound.ack' && f.deduplicated) {
