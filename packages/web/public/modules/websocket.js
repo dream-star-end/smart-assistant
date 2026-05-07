@@ -485,9 +485,30 @@ function _appendSubagentBlock(sess, groupMsg, block, blockText) {
   }
 }
 
-export function setMeta(sess, msg, metaText) {
-  msg.metaText = metaText
-  if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
+// 2026-05-06 §4.5 改动 9 — setMeta 退役为 setUsage。
+// 历史:setMeta(sess, msg, metaText) 把已格式化字符串塞 msg.metaText,渲染层读字串。
+// 新版:setUsage(sess, msg, usagePartial) 在 msg 上 in-place 合并结构化 usage,
+// 渲染层调 formatMeta(msg) 现算字串(读 msg.usage)。这样 server-authored merge /
+// IDB load / cost_charged broadcast 三路写到同一字段(msg.usage),前端单一权威源。
+//
+// usagePartial 形状 = { inputTokens, outputTokens, cacheReadTokens, costCredits, turn, ... }。
+// 多次调用累积合并;只有显式传入的 key 覆盖,缺省 key 保留原值。
+//
+// DOM trigger 走 _deps.updateMsgMetaEl(msg) — 仅更新 .msg-meta 元素(轻量),
+// 不动 .msg 气泡 innerHTML(避免 token 行更新触发整条消息 Markdown re-render
+// 带来的 caret 跳动 / scroll jitter)。
+export function setUsage(sess, msg, usagePartial) {
+  if (!msg) return
+  if (!usagePartial || typeof usagePartial !== 'object') return
+  msg.usage = { ...(msg.usage || {}), ...usagePartial }
+  if (sess && sess.id === state.currentSessionId) {
+    if (_deps.updateMsgMetaEl) {
+      _deps.updateMsgMetaEl(msg)
+    } else if (_deps.updateMessageEl) {
+      // Late-binding 兜底:setWsDeps 还没注入 updateMsgMetaEl 时退回 updateMessageEl
+      _deps.updateMessageEl(msg)
+    }
+  }
 }
 
 // ── Message status rendering ──
@@ -511,18 +532,37 @@ const _STATUS_LABEL = {
   replied: '已回复',
 }
 
-export function updateMsgStatus(msg) {
-  if (msg.role !== 'user' || !msg.status) return
+// 2026-05-06 §4.6 改动 13 — updateMsgStatus 接 sess 参数走派生状态。
+// 历史:msg.status 单字段(包含 'replied')驱动展示。
+// 新版:'replied' 不再持久化字段,改为 messages.js _deriveUserMsgStatus 现算
+//      (扫消息序列,看本 user 之后是否有 server-authored completed assistant)。
+//      显式 'sending'/'queued'/'sent'/'read' 仍直读 msg.status。
+//
+// sess 参数可选;不传则查 state.sessions 取当前会话(绝大多数调用方就是当前会话)。
+// 派生函数通过 _deps.deriveUserMsgStatus 注入,setWsDeps 还没就绪时 fallback 到
+// 直读 msg.status(旧行为,'replied' 显示不上但其他状态正常)。
+export function updateMsgStatus(msg, sess) {
+  if (!msg || msg.role !== 'user') return
   const el = document.querySelector(`[data-msg-id="${msg.id}"]`)
   if (!el) return
+  const targetSess = sess || (state.currentSessionId ? state.sessions.get(state.currentSessionId) : null)
+  let displayStatus = msg.status
+  if (targetSess && Array.isArray(targetSess.messages) && _deps.deriveUserMsgStatus) {
+    const idx = targetSess.messages.findIndex((x) => x && x.id === msg.id)
+    if (idx >= 0) {
+      const derived = _deps.deriveUserMsgStatus(targetSess.messages, idx)
+      if (derived) displayStatus = derived
+    }
+  }
+  if (!displayStatus) return
   let statusEl = el.querySelector('.msg-status')
   if (!statusEl) {
     statusEl = document.createElement('div')
     statusEl.className = 'msg-status'
     el.appendChild(statusEl)
   }
-  statusEl.className = `msg-status ${msg.status || ''}`
-  statusEl.innerHTML = `${_STATUS_SVG[msg.status] || ''}<span>${_STATUS_LABEL[msg.status] || ''}</span>`
+  statusEl.className = `msg-status ${displayStatus}`
+  statusEl.innerHTML = `${_STATUS_SVG[displayStatus] || ''}<span>${_STATUS_LABEL[displayStatus] || ''}</span>`
 }
 
 // ── Offline queue draining (race-safe, no ws.onmessage monkey-patching) ──
@@ -606,7 +646,7 @@ function _drainNextOfflineItem() {
     const msg = sess.messages.find((m) => m.id === item.msgId)
     if (msg) {
       msg.status = 'sent'
-      updateMsgStatus(msg)
+      updateMsgStatus(msg, sess)
     }
     sess._sendingInFlight = true
     // 新 turn 开始:防御性清理上一 turn 的 cost-charged 归因状态。
@@ -1315,25 +1355,31 @@ export function connect() {
     }
   }
 }
-export function formatMeta(m) {
-  if (!m) return ''
+// 2026-05-06 §4.5 改动 8 — formatMeta(msg) 入参语义切换。
+// 旧:formatMeta(rawMeta) 接 frame.meta 风格的扁平对象,写入 msg.metaText 字符串。
+// 新:formatMeta(msg) 接消息对象本身,从 msg.usage 取结构化字段;
+//     无 usage 时回退 msg._rawMeta(老 IDB row 兼容,见 db.js _normalizeLoadedSession);
+//     再无则把 msg 本身当扁平对象(handleOutbound 仍以 frame.meta 形式调用本函数
+//     做"是否非空"探测的兼容路径)。
+//
+// 字段集与历史 metaText 对齐:costCredits(优先,formatCreditsInline 转积分/¥) +
+// inputTokens / outputTokens / cacheReadTokens / turn。
+// 旧的 m.cost($X.XXXX 估算) / totalCost / cacheCreationTokens 已删:v3 商用版上线后
+// 全部消息都有 costCredits 权威值,$X.XXXX 估算只让 boss 误以为账单口径不一致。
+export function formatMeta(msg) {
+  if (!msg) return ''
+  const u = msg.usage || msg._rawMeta || msg
+  if (!u || typeof u !== 'object') return ''
   const parts = []
-  // 商用版 claudeai.chat:后端扣费完成后会推一帧 outbound.cost_charged 给前端,
-  // 前端会把 costCredits(bigint string,单位=分=积分)塞进 msg._rawMeta 再 re-format。
-  // 这里优先显示真实扣费积分,容器的 m.cost($ 估算)作 fallback。
-  // 约定:m.costCredits 存在且 ≥ 0 → 走积分;缺失 → 走旧的 $ 估算。
-  if (m.costCredits !== undefined && m.costCredits !== null) {
-    parts.push(formatCreditsInline(m.costCredits))
-  } else if (typeof m.cost === 'number') {
-    parts.push(`$${m.cost.toFixed(4)}`)
+  if (u.costCredits !== undefined && u.costCredits !== null) {
+    const credits = formatCreditsInline(u.costCredits)
+    if (credits) parts.push(credits)
   }
-  if (typeof m.totalCost === 'number' && m.totalCost !== m.cost && m.costCredits === undefined)
-    parts.push(`total $${m.totalCost.toFixed(4)}`)
-  if (typeof m.inputTokens === 'number') parts.push(`in ${m.inputTokens}`)
-  if (typeof m.outputTokens === 'number') parts.push(`out ${m.outputTokens}`)
-  if (m.cacheReadTokens > 0) parts.push(`cache-r ${m.cacheReadTokens}`)
-  if (m.cacheCreationTokens > 0) parts.push(`cache-w ${m.cacheCreationTokens}`)
-  if (typeof m.turn === 'number') parts.push(`T${m.turn}`)
+  if (typeof u.inputTokens === 'number') parts.push(`in ${u.inputTokens}`)
+  if (typeof u.outputTokens === 'number') parts.push(`out ${u.outputTokens}`)
+  if (typeof u.cacheReadTokens === 'number' && u.cacheReadTokens > 0)
+    parts.push(`cache-r ${u.cacheReadTokens}`)
+  if (typeof u.turn === 'number') parts.push(`T${u.turn}`)
   return parts.join(' · ')
 }
 
@@ -1546,7 +1592,7 @@ export function handleOutbound(frame) {
       _targetMsg.status !== 'replied'
     ) {
       _targetMsg.status = 'read'
-      updateMsgStatus(_targetMsg)
+      updateMsgStatus(_targetMsg, sess)
     }
     if (frame.isFinal) {
       // Stale-final frames were already dropped at the top of handleOutbound
@@ -1677,8 +1723,17 @@ export function handleOutbound(frame) {
           })
         }
       }
-      _targetMsg.status = 'replied'
-      updateMsgStatus(_targetMsg)
+      // 2026-05-06 §4.6 改动 13 — 显式 _targetMsg.status='replied' 写入路径退役。
+      // 角标改由 messages.js _deriveUserMsgStatus 在 render 时按"后续是否有
+      // server-authored completed assistant"派生。这避免 'replied' 状态被持久化
+      // 到 IDB / server,以及 server-wins merge 后 client 单独保留 'replied' 字段
+      // 跟权威源(server messages 数组)语义不一致的问题(boss 复现的 bug 根因)。
+      // 仍触发一次 updateMsgStatus(传 sess 走派生路径)让 DOM 显示及时同步;
+      // 注:isFinal 时 server-authored assistant 通常还没落进 sess.messages,
+      // 派生会返回 'read';真正的 'replied' 切换发生在 maybeSyncNow 拉到
+      // server-authored row 后的 renderMessages 重渲(websocket.js 已在 isFinal
+      // 末尾调 maybeSyncNow)。
+      updateMsgStatus(_targetMsg, sess)
       resetReplyTracker(sess)
     }
   }
@@ -1924,25 +1979,24 @@ export function handleOutbound(frame) {
   }
   sess.lastAt = Date.now()
   if (frame.isFinal) {
-    const metaText = formatMeta(frame.meta)
-    if (metaText && sess._streamingAssistant) {
-      // 把原始 meta 存到消息上,这样后续 outbound.cost_charged 帧到达时可以把
-      // 容器口径的 $0.xxxx 改写成真实扣费积分再 re-format。没有这一手,cost_charged
-      // 只能拿到它自己的 costCredits 但丢掉 in/out/cache 字段。
-      sess._streamingAssistant._rawMeta = { ...frame.meta }
+    if (frame.meta && sess._streamingAssistant) {
+      // 2026-05-06 §4.5 改动 9 — 把 frame.meta 结构化合入 _streamingAssistant.usage,
+      // 渲染层 formatMeta(msg) 现算字串。本路径同时 drain 早到的 cost_charged:
+      //
       // ── 早到 cost_charged 的 drain ──
       // anthropicProxy.commit 在 pipeStream 完成后立即 broadcast cost_charged,
       // 而 gateway 的 isFinal 还要等 CCB 处理 result、emit message_stop。多 API
-      // 调用 turn 里,前几次的 cost_charged 几乎一定**早于** 本帧到达,
-      // handleCostCharged 找不到 target(_rawMeta 还没设)只能 enqueue。这里把
-      // 累加的 pending 总和塞进 costCredits,formatMeta 后续看到字段存在就会
-      // 显示真实积分而不是 $0.xxxx 估算。
+      // 调用 turn 里,前几次的 cost_charged 几乎一定**早于**本帧到达,
+      // handleCostCharged 找不到 target.usage(还没建)只能 enqueue 到
+      // sess._pendingCostCredits;这里把累加的 pending 总和合入 usagePatch.costCredits
+      // 一并写到 msg.usage。formatMeta 看到 costCredits 即显示真实积分。
       // _pendingCostCredits 是字符串("0" 或正整数串),不是 BigInt:sync.js
-      // 持久化 stringify 不会序列化 BigInt。
+      // 持久化 stringify 不能序列化 BigInt。
+      const usagePatch = { ...frame.meta }
       try {
         const pending = BigInt(sess._pendingCostCredits || '0')
         if (pending > 0n) {
-          sess._streamingAssistant._rawMeta.costCredits = pending.toString()
+          usagePatch.costCredits = pending.toString()
           sess._pendingCostCredits = '0'
         }
       } catch {
@@ -1952,7 +2006,7 @@ export function handleOutbound(frame) {
         })
         sess._pendingCostCredits = '0'
       }
-      setMeta(sess, sess._streamingAssistant, formatMeta(sess._streamingAssistant._rawMeta))
+      setUsage(sess, sess._streamingAssistant, usagePatch)
       // 锚定本 turn assistant id,让 isFinal 后晚到的 cost_charged 能找回来。
       // 60s TTL(handleCostCharged 内判定),防止久远孤儿帧贴到无关消息。
       sess._lastFinaledAssistantId = sess._streamingAssistant.id
@@ -2214,9 +2268,9 @@ export function _resetTurnBillingState(sess, reason) {
 //      早到的 cost_charged 错贴到上一 turn,Codex 抓的归因黑洞)
 //
 //   action — 累加而不是覆盖(治多 API 调用 turn):
-//     - target 有 _rawMeta:BigInt 累加到 costCredits
-//     - target 无 _rawMeta(turn 进行中,isFinal 还没到):enqueue 到
-//       sess._pendingCostCredits,等 isFinal 时 drain
+//     - target.usage 已建(isFinal 后):BigInt 累加到 usage.costCredits(via setUsage)
+//     - target.usage 未建(turn 进行中,isFinal 还没到):enqueue 到
+//       sess._pendingCostCredits,等 isFinal 时 drain 进首次 setUsage 的 patch
 //
 // 跨 turn 状态(_lastFinaledAssistantId / _lastFinaledAt / _pendingCostCredits)
 // 在新 turn 开始时(websocket.js:541 ACK 路径 + messages.js:1451 regen 路径)
@@ -2273,10 +2327,10 @@ function handleCostCharged(frame) {
     return
   }
 
-  // target 存在但还没 _rawMeta — turn 进行中且 isFinal 还没到。
-  // 这只可能在 _streamingAssistant 路径(lastFinal 命中的 target 必有 _rawMeta)。
-  // enqueue 到 _pendingCostCredits,等 isFinal 时 drain。
-  if (!target._rawMeta) {
+  // target 存在但还没 usage — turn 进行中且 isFinal 还没到。
+  // 这只可能在 _streamingAssistant 路径(lastFinal 命中的 target 必有 usage,
+  // 因为 isFinal 已经 setUsage)。enqueue 到 _pendingCostCredits,等 isFinal 时 drain。
+  if (!target.usage) {
     if (add !== null) {
       try {
         const cur = BigInt(sess._pendingCostCredits || '0')
@@ -2292,22 +2346,22 @@ function handleCostCharged(frame) {
     return
   }
 
-  // target 命中且有 _rawMeta — 累加 costCredits,re-format meta。
+  // target 命中且 usage 已就位 — 累加 costCredits,re-format meta。
   // 多 API 调用 turn 内多次 cost_charged 都进这里,逐次累加得到总扣费。
+  // 2026-05-06 §4.5 改动 10:不再写 _rawMeta 副本,只动 msg.usage。
   if (add !== null) {
     let cur = 0n
-    if (target._rawMeta.costCredits !== undefined && target._rawMeta.costCredits !== null) {
+    if (target.usage.costCredits !== undefined && target.usage.costCredits !== null) {
       try {
-        cur = BigInt(target._rawMeta.costCredits)
+        cur = BigInt(target.usage.costCredits)
       } catch {
         console.warn('[billing] target costCredits poisoned, restarting from 0', {
           sess: sess.id,
-          val: target._rawMeta.costCredits,
+          val: target.usage.costCredits,
         })
       }
     }
-    target._rawMeta.costCredits = (cur + add).toString()
-    setMeta(sess, target, formatMeta(target._rawMeta))
+    setUsage(sess, target, { costCredits: (cur + add).toString() })
   }
   // 同步刷新左上角余额气泡 —— 不被解析失败吞掉,balance 是单独字段。
   if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) {

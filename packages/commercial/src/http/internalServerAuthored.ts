@@ -92,36 +92,105 @@ const BodySchema = z
      *  so it sorts immediately before the assistant message. */
     thinkingText: z.string().min(1).max(MAX_BODY_BYTES).optional(),
     createdAt: z.number().int().positive().optional(),
+    /** Plan §4.3 改动 6 — assistant write only. Composite key with userId
+     *  into `server_authored_request_map` so a deferred `appendCostCredits`
+     *  call can find this row and patch `usage.costCredits` in-place.
+     *
+     *  Required when text is non-empty (assistant turn). Schema-level
+     *  refine below skips the requirement on thinking-only turns. */
+    requestId: z.string().min(8).max(128).optional(),
+    /** Plan §4.3 改动 6 — token usage from gateway-side stream-finalizer.
+     *  Persisted into `messages[i].usage`. costCredits joins later via
+     *  `appendCostCredits` patch (which mutates this same usage object). */
+    usage: z
+      .object({
+        inputTokens: z.number().int().min(0).optional(),
+        outputTokens: z.number().int().min(0).optional(),
+        cacheReadTokens: z.number().int().min(0).optional(),
+        cacheCreationTokens: z.number().int().min(0).optional(),
+        model: z.string().max(128).optional(),
+        turn: z.number().int().min(0).optional(),
+      })
+      .strict()
+      .optional(),
+    /** Plan §4.3 改动 6 — turn was truncated (max_tokens etc.). Renders the
+     *  red "已截断" pill on the assistant message after a refresh. */
+    truncated: z.boolean().optional(),
+    /** Plan §4.3 改动 6 — short error code for refresh-stable error pill
+     *  (e.g. 'overloaded_error', 'service_unavailable'). Joins
+     *  `_errorDetail` for the long form. */
+    errorCode: z.string().max(64).optional(),
+    errorDetail: z.string().max(2048).optional(),
   })
   .strict()
   .refine(
     (v) => v.text.length > 0 || v.thinkingText !== undefined,
     { message: "either text or thinkingText must be non-empty" },
+  )
+  .refine(
+    // requestId is required for assistant writes (text non-empty); on
+    // thinking-only turns the cost path doesn't fire and requestId is
+    // unused, so we relax the requirement there.
+    (v) => v.text.length === 0 || typeof v.requestId === "string",
+    { message: "requestId is required when text is non-empty", path: ["requestId"] },
   );
 
 export type ServerAuthoredBody = z.infer<typeof BodySchema>;
 
-/** Storage interface — narrowed to just the call we need so unit tests can
- *  inject a memory implementation. Real wiring uses
- *  `appendServerAuthoredMessage` from `@openclaude/storage`. */
+/** Server-authored message shape submitted to storage. Assistant writes may
+ *  carry usage/_truncated/_errorCode/_errorDetail; thinking writes never do.
+ *  All fields except `id`, `role`, `text`, `ts` are optional and merged into
+ *  the persisted message blob as-is. */
+export type ServerAuthoredMessageInput = {
+  id: string;
+  /** 'thinking' for Phase 0.4 reasoning persistence; 'assistant' for the
+   *  user-visible turn text. Same idempotency / session_not_found semantics
+   *  for both. */
+  role: "assistant" | "thinking";
+  text: string;
+  ts: number;
+  status: "completed" | "interrupted" | "crashed";
+  /** Token usage from gateway-side stream finalizer. costCredits joins
+   *  later via storage's `appendCostCredits` patch. */
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+    model?: string;
+    turn?: number;
+  };
+  _truncated?: boolean;
+  _errorCode?: string;
+  _errorDetail?: string;
+};
+
+export type ServerAuthoredStorageResult = {
+  applied: boolean;
+  reason?: "session_not_found" | "already_exists" | "malformed";
+};
+
+/** Storage interface — narrowed to just the calls we need so unit tests can
+ *  inject a memory implementation. Real wiring uses both
+ *  `appendServerAuthoredMessage` (thinking-only path, no requestId
+ *  association) and `appendServerAuthoredMessageForRequest` (assistant path,
+ *  drains pending costCredits + records request_map for late patches) from
+ *  `@openclaude/storage`. */
 export interface ServerAuthoredStorage {
   appendServerAuthoredMessage(
     sessId: string,
     userId: string,
-    message: {
-      id: string;
-      /** 'thinking' for Phase 0.4 reasoning persistence; 'assistant' for
-       *  the user-visible turn text. Same idempotency / session_not_found
-       *  semantics for both. */
-      role: "assistant" | "thinking";
-      text: string;
-      ts: number;
-      status: "completed" | "interrupted" | "crashed";
-    },
-  ): Promise<{
-    applied: boolean;
-    reason?: "session_not_found" | "already_exists" | "malformed";
-  }>;
+    message: ServerAuthoredMessageInput,
+  ): Promise<ServerAuthoredStorageResult>;
+  appendServerAuthoredMessageForRequest(
+    requestId: string,
+    sessId: string,
+    userId: string,
+    message: ServerAuthoredMessageInput,
+  ): Promise<
+    | { applied: true }
+    | { applied: false; reason: "session_not_found" | "already_exists" | "malformed" }
+  >;
 }
 
 export interface ServerAuthoredHandlerDeps {
@@ -367,18 +436,31 @@ export function makeServerAuthoredHandler(
     }
 
     // ── Branch B: has assistant (with optional thinking) ──
-    let assistantResult: StorageResult;
+    //
+    // Plan §4.3 改动 6:assistant write goes through the *ForRequest variant
+    // so the storage layer can drain pending costCredits + record the
+    // request_map row in a single SQLite transaction. requestId is required
+    // by schema refine when text is non-empty, so the `!` is sound here.
+    const assistantMsg: ServerAuthoredMessageInput = {
+      id: messageId,
+      role: "assistant",
+      text: body.text,
+      ts: assistantTs,
+      status: body.status,
+      ...(body.usage ? { usage: body.usage } : {}),
+      ...(body.truncated ? { _truncated: true } : {}),
+      ...(body.errorCode ? { _errorCode: body.errorCode } : {}),
+      ...(body.errorDetail ? { _errorDetail: body.errorDetail } : {}),
+    };
+    let assistantResult: Awaited<
+      ReturnType<ServerAuthoredStorage["appendServerAuthoredMessageForRequest"]>
+    >;
     try {
-      assistantResult = await deps.storage.appendServerAuthoredMessage(
+      assistantResult = await deps.storage.appendServerAuthoredMessageForRequest(
+        body.requestId!,
         body.sessionId,
         userId,
-        {
-          id: messageId,
-          role: "assistant",
-          text: body.text,
-          ts: assistantTs,
-          status: body.status,
-        },
+        assistantMsg,
       );
     } catch (err) {
       userLog.error("assistant_storage_threw", {

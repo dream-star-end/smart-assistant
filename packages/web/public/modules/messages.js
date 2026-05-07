@@ -14,7 +14,7 @@ import {
 import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=f45af1a8'
 import { toast } from './ui.js?v=f45af1a8'
 import { msgTimeLabel, shortTime } from './util.js?v=f45af1a8'
-import { safeWsSend, _resetTurnBillingState } from './websocket.js?v=f45af1a8'
+import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=f45af1a8'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
@@ -122,6 +122,60 @@ const _STATUS_LABEL = {
   sent: '已发送',
   read: '已读',
   replied: '已回复',
+}
+
+// 2026-05-06 §4.6 改动 13 — user msg 角标改为派生:
+// 'sending' / 'queued' / 'sent' / 'read' 仍由 client UI 显式写 msg.status;
+// 'replied' 永远不持久化字段,在 render 时按"本 user 之后(到下一 user 之前)
+// 是否有 server-authored && status:'completed' 的 assistant"现算。
+//
+// 严格条件(Codex R1 收紧后):
+//   - thinking-only turn 不算 'replied'(只思考没回复)
+//   - interrupted/crashed assistant 不算 'replied'(渲染 'sent' 让 boss 看到没回完)
+//   - 历史 m.status === 'replied' 在 dbGetAll 阶段被 strip(db.js _normalizeLoadedSession)
+//
+// 行为:
+//   1) 显式 sending/queued 优先返回(客户端发送中态,不能被派生覆盖)
+//   2) 扫 [idx+1, ...] 至下一 user 边界:
+//      - role === 'assistant' && _source === 'server' && status === 'completed' → 'replied'
+//   3) 默认回退 m.status || 'sent'
+export function _deriveUserMsgStatus(messages, idx) {
+  if (!Array.isArray(messages)) return null
+  const m = messages[idx]
+  if (!m || m.role !== 'user') return null
+  if (m.status === 'sending' || m.status === 'queued') return m.status
+  for (let j = idx + 1; j < messages.length; j++) {
+    const next = messages[j]
+    if (!next) continue
+    if (next.role === 'user') break
+    if (next.role !== 'assistant') continue
+    if (next._source !== 'server') continue
+    if (next.status === 'completed') return 'replied'
+    // interrupted / crashed / 其他:不返 'replied',继续扫(虽然下一个一般不会再有 completed)
+  }
+  return m.status || 'sent'
+}
+
+// 2026-05-06 §4.5 改动 10 — 仅更新 .msg-meta 元素的轻量 DOM 路径。
+// setUsage(websocket.js)合入 msg.usage 后调本函数,避免触发 .msg 气泡 innerHTML
+// 全量 re-render(后者会让 streaming caret 跳动 / Markdown 重排闪烁)。
+// 找不到 .msg-meta 时按需 append;formatMeta(msg) 返空时移除现有 .msg-meta。
+export function updateMsgMetaEl(msg) {
+  if (!msg || !msg.id) return
+  const el = document.querySelector(`[data-msg-id="${msg.id}"]`)
+  if (!el) return
+  const text = formatMeta(msg)
+  let meta = el.querySelector('.msg-meta')
+  if (!text) {
+    if (meta) meta.remove()
+    return
+  }
+  if (!meta) {
+    meta = document.createElement('div')
+    meta.className = 'msg-meta'
+    el.appendChild(meta)
+  }
+  renderMetaInto(meta, text)
 }
 
 // ═══════════════ RENDERING ═══════════════
@@ -1798,11 +1852,17 @@ export function _buildMessageEl(msg) {
     })
     el.appendChild(actions)
     _applyTruncatedBanner(el, msg)
-    if (msg.metaText) {
-      const meta = document.createElement('div')
-      meta.className = 'msg-meta'
-      renderMetaInto(meta, msg.metaText)
-      el.appendChild(meta)
+    // 2026-05-06 §4.6 改动 12 — meta 字串现算:formatMeta(msg) 读 msg.usage,
+    // 替代历史 msg.metaText 字串字段。usage 字段由 server-authored merge / IDB load /
+    // cost_charged broadcast 三路写入,server 是权威源(client PUT 时被 strip)。
+    {
+      const metaTxt = formatMeta(msg)
+      if (metaTxt) {
+        const meta = document.createElement('div')
+        meta.className = 'msg-meta'
+        renderMetaInto(meta, metaTxt)
+        el.appendChild(meta)
+      }
     }
     // Absolute timestamp. For assistant messages we prefer `completedAt`
     // (set on final frame / when streaming hands off to a tool) so the
@@ -1847,11 +1907,22 @@ export function _buildMessageEl(msg) {
     const safeHtml = htmlSafeEscape(msg.text || '').replace(/\n/g, '<br>')
     body.innerHTML = embedMediaUrls(safeHtml)
     el.appendChild(body)
-    // Status indicator for user messages
-    if (msg.status) {
+    // 2026-05-06 §4.6 改动 13 — 角标状态走派生:
+    // 'sending'/'queued' 显式;'replied' 现算(后续有 server-authored completed assistant);
+    // 其余('sent'/'read')沿用 msg.status。
+    // 找到本 msg 在 sess.messages 里的 idx — getSession() 在当前会话渲染上下文里
+    // 必命中(renderMessages / load-more 都遍历当前 session messages)。
+    const sess = getSession()
+    let displayStatus = null
+    if (sess && Array.isArray(sess.messages)) {
+      const idx = sess.messages.indexOf(msg)
+      if (idx >= 0) displayStatus = _deriveUserMsgStatus(sess.messages, idx)
+    }
+    if (!displayStatus) displayStatus = msg.status || null
+    if (displayStatus) {
       const statusEl = document.createElement('div')
-      statusEl.className = `msg-status ${msg.status}`
-      statusEl.innerHTML = `${_STATUS_SVG[msg.status] || ''}<span>${_STATUS_LABEL[msg.status] || ''}</span>`
+      statusEl.className = `msg-status ${displayStatus}`
+      statusEl.innerHTML = `${_STATUS_SVG[displayStatus] || ''}<span>${_STATUS_LABEL[displayStatus] || ''}</span>`
       el.appendChild(statusEl)
     }
     _appendMsgTime(el, msg.ts)
@@ -1943,14 +2014,23 @@ export function updateMessageEl(msg, streaming) {
       }
     }
     _applyTruncatedBanner(el, msg)
-    if (msg.metaText) {
-      let meta = el.querySelector('.msg-meta')
-      if (!meta) {
-        meta = document.createElement('div')
-        meta.className = 'msg-meta'
-        el.appendChild(meta)
+    // 2026-05-06 §4.6 改动 12 — 同上,meta 字串现算 formatMeta(msg)。
+    {
+      const metaTxt = formatMeta(msg)
+      if (metaTxt) {
+        let meta = el.querySelector('.msg-meta')
+        if (!meta) {
+          meta = document.createElement('div')
+          meta.className = 'msg-meta'
+          el.appendChild(meta)
+        }
+        renderMetaInto(meta, metaTxt)
+      } else {
+        // usage 缺失 → 移除现有 meta(防止持久化时移除 metaText/usage 字段后
+        // 屏幕仍残留旧字串)
+        const meta = el.querySelector('.msg-meta')
+        if (meta) meta.remove()
       }
-      renderMetaInto(meta, msg.metaText)
     }
     // Refresh msg-time when completedAt has been set (isFinal / tool handoff).
     // The initial _buildMessageEl append shows ts (first token) while streaming;

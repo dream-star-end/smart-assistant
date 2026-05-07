@@ -107,19 +107,62 @@ export function openDB() {
   return _openPromise
 }
 
+// Conditional cleanup of historical IDB rows polluted by old client versions.
+//
+// Pre-fieldization the client wrote `metaText` (display string), `_rawMeta`
+// (proxy for usage), and a sticky `status:'replied'` on user messages — all of
+// which are now derived/server-authored. Old rows persist these stale values
+// in IDB; without normalization they would shadow the newly server-authored
+// `usage` and the derived 'replied' status, recreating the very bug we're
+// fixing.
+//
+// Cleanup rules:
+//   • ephemeral fields (_partial, _completed, output, error, bashTail,
+//     inputJson, inputPreview) — always strip; these were never meant to be
+//     persisted and their presence breaks the server-as-authority invariant.
+//   • status === 'replied' on user messages — always strip; this is now
+//     derived at render time from a server-authored completed assistant tail
+//     scan.
+//   • metaText / _rawMeta — only strip when `usage` is present. Without this
+//     guard, a revert that reverses the field migration would lose the only
+//     surviving meta source on already-loaded sessions. Once `usage` is in
+//     place, formatMeta reads from it and the legacy fields are pure pollution.
+export function _normalizeLoadedSession(sess) {
+  if (!sess || !Array.isArray(sess.messages)) return sess
+  for (const m of sess.messages) {
+    if (!m || typeof m !== 'object') continue
+    delete m._partial
+    delete m._completed
+    delete m.output
+    delete m.error
+    delete m.bashTail
+    delete m.inputJson
+    delete m.inputPreview
+    if (m.role === 'user' && m.status === 'replied') delete m.status
+    if (m.usage) {
+      delete m.metaText
+      delete m._rawMeta
+    }
+  }
+  return sess
+}
+
 export async function dbGetAll() {
-  if (_initState === 'unavailable') return [..._memoryStore.values()]
+  if (_initState === 'unavailable') {
+    return [..._memoryStore.values()].map(_normalizeLoadedSession)
+  }
   try {
     const db = await openDB()
-    return await new Promise((res, rej) => {
+    const rows = await new Promise((res, rej) => {
       const tx = db.transaction('sessions', 'readonly')
       const req = tx.objectStore('sessions').getAll()
       req.onsuccess = () => res(req.result || [])
       req.onerror = () => rej(req.error)
     })
+    return rows.map(_normalizeLoadedSession)
   } catch {
     // openDB failed or transaction errored — fall back to whatever is in memory
-    return [..._memoryStore.values()]
+    return [..._memoryStore.values()].map(_normalizeLoadedSession)
   }
 }
 

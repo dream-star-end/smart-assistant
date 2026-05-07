@@ -1367,6 +1367,28 @@ export interface AnthropicProxyDeps {
    */
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
   /**
+   * Persist costCredits into master's `client_sessions.messages[i].usage.costCredits`
+   * via the storage `appendCostCredits` helper. Called immediately before
+   * `broadcastToUser({ type: 'outbound.cost_charged', ... })` — the broadcast is
+   * still the in-page fast-path, but persistence is what survives a refresh.
+   *
+   * Signature is intentionally minimal (just requestId + userId + costCredits) —
+   * the storage layer owns the (sessionId, msgId) lookup via
+   * `server_authored_request_map`, and falls back to `pending_usage_patches`
+   * when the assistant row hasn't been sunk yet. See plan §4.1 改动 3.
+   *
+   * Failure mode: throw is caught, logged, metric'd; broadcast still fires.
+   * Pending GC sweep eventually reports stragglers.
+   *
+   * Not injected → persistence is a no-op (broadcast still works). deploy
+   * must inject; tests MAY omit.
+   */
+  appendCostCredits?: (
+    requestId: string,
+    userId: string,
+    costCredits: string,
+  ) => Promise<unknown>;
+  /**
    * 加载用户的模型授权信息(2026-05-02 接入 deepseek 时引入)。
    *
    * 必须从**服务端权威源**(DB)读取 role + grants:
@@ -2027,25 +2049,46 @@ export function makeAnthropicProxyHandler(
         //     必须发实际扣款值,否则用户面板看到的 meta 和左上角余额对不上
         //   - 23505 重入路径 debitedCredits=null → 跳过广播,前端靠 refreshBalance 兜底
         if (
-          deps.broadcastToUser
-          && outcome.state === "committed"
+          outcome.state === "committed"
           && outcome.debitedCredits !== null
           && outcome.debitedCredits > 0n
         ) {
-          try {
-            deps.broadcastToUser(uid, {
-              type: "outbound.cost_charged",
-              requestId,
-              // credits 用字符串序列化,保留 BigInt 精度,避免 JS Number 53bit 边界。
-              // (虽然单笔不太可能上亿积分,但 balance_after 累计可能。)
-              costCredits: outcome.debitedCredits.toString(),
-              balanceAfter: outcome.balanceAfter === null
-                ? null
-                : outcome.balanceAfter.toString(),
-              sessionId: extractSessionId(body.metadata),
-            });
-          } catch (err) {
-            userLog.warn("proxy_broadcast_cost_failed", { err: errSummary(err) });
+          // 1) Durable persist FIRST — refresh-after-reply must show the
+          //    same number the broadcast carries. Failure here is logged but
+          //    does NOT block the broadcast: in-page UX still updates, and
+          //    `pending_usage_patches` GC sweep will surface the straggler.
+          if (deps.appendCostCredits) {
+            try {
+              await deps.appendCostCredits(
+                requestId,
+                uid.toString(),
+                outcome.debitedCredits.toString(),
+              );
+            } catch (err) {
+              userLog.warn("proxy_persist_costcredits_failed", {
+                err: errSummary(err),
+                requestId,
+              });
+            }
+          }
+          // 2) Broadcast — in-page fast-path. Stays fire-and-broadcast even
+          //    when persistence fails (see comment above).
+          if (deps.broadcastToUser) {
+            try {
+              deps.broadcastToUser(uid, {
+                type: "outbound.cost_charged",
+                requestId,
+                // credits 用字符串序列化,保留 BigInt 精度,避免 JS Number 53bit 边界。
+                // (虽然单笔不太可能上亿积分,但 balance_after 累计可能。)
+                costCredits: outcome.debitedCredits.toString(),
+                balanceAfter: outcome.balanceAfter === null
+                  ? null
+                  : outcome.balanceAfter.toString(),
+                sessionId: extractSessionId(body.metadata),
+              });
+            } catch (err) {
+              userLog.warn("proxy_broadcast_cost_failed", { err: errSummary(err) });
+            }
           }
         }
         // settle 三态(2I-2 codex 审核结论:partial 必须基于 observed.kind 判断,

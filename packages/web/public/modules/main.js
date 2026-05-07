@@ -171,6 +171,7 @@ import {
 // ── Messages ──
 import {
   _buildMessageEl,
+  _deriveUserMsgStatus,
   ensureInner,
   initMessagesListeners,
   isAtBottom,
@@ -180,6 +181,7 @@ import {
   scrollBottom,
   setMessageDeps,
   updateMessageEl,
+  updateMsgMetaEl,
   updateSessionSub,
 } from './messages.js?v=f45af1a8'
 
@@ -202,7 +204,6 @@ import {
   resetReplyTracker,
   resetThinkingSafety,
   safeWsSend,
-  setMeta,
   setProvisioningBanner,
   setStatus,
   setWsDeps,
@@ -273,6 +274,11 @@ setWsDeps({
   scheduleSave,
   renderMessage,
   updateMessageEl,
+  // 2026-05-06 §4.5/§4.6 — meta 字段化 + status 派生:
+  // updateMsgMetaEl 用于 setUsage 的轻量 .msg-meta 更新;
+  // deriveUserMsgStatus 用于 updateMsgStatus 角标渲染派生。
+  updateMsgMetaEl,
+  deriveUserMsgStatus: _deriveUserMsgStatus,
   scrollBottom,
   ensureInner,
   renderSidebar,

@@ -96,7 +96,17 @@ function makeRes(): { res: ServerResponse; rec: RecordedRes } {
 const CTX: ServerAuthoredHandlerCtx = { hostUuid: VALID_HOST, boundIp: VALID_IP };
 
 function fakeStorage(impl: ServerAuthoredStorage["appendServerAuthoredMessage"]): ServerAuthoredStorage {
-  return { appendServerAuthoredMessage: impl };
+  return {
+    appendServerAuthoredMessage: impl,
+    // Mirror to assistant *ForRequest path so existing assistant-text tests keep
+    // passing without re-wiring requestId. Tests that exercise the request_map
+    // semantics directly use a custom storage mock (recordingStorage below).
+    async appendServerAuthoredMessageForRequest(_requestId, sessId, userId, msg) {
+      const r = await impl(sessId, userId, msg);
+      if (r.applied) return { applied: true };
+      return { applied: false, reason: r.reason ?? "malformed" };
+    },
+  };
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────
@@ -238,7 +248,7 @@ describe("internalServerAuthored handler — userId/msgId derivation", () => {
     const { res, rec } = makeRes();
     await h(
       makeReq({
-        body: JSON.stringify({ sessionId: "sess12345", turnIndex: 3, status: "completed", text: "hi" }),
+        body: JSON.stringify({ sessionId: "sess12345", turnIndex: 3, status: "completed", text: "hi", requestId: "req-12345abc" }),
         auth: `Bearer ${VALID_TOKEN}`,
       }),
       res,
@@ -259,6 +269,7 @@ describe("internalServerAuthored handler — storage outcome mapping", () => {
     turnIndex: 1,
     status: "completed",
     text: "hi",
+    requestId: "req-12345abc",
   });
 
   test("200 ok on applied:true", async () => {
@@ -342,6 +353,7 @@ describe("internalServerAuthored handler — sink persist metric outcomes", () =
     turnIndex: 1,
     status: "completed",
     text: "hi",
+    requestId: "req-12345abc",
   });
 
   test("ok on applied:true", async () => {
@@ -495,6 +507,16 @@ describe("internalServerAuthored handler — thinking durability", () => {
           if (throwers[msg.role]) throw throwers[msg.role];
           return overrides[msg.role] ?? { applied: true };
         },
+        // Plan §4.3 改动 6 — assistant write goes through *ForRequest. Mirror to
+        // appendServerAuthoredMessage for these tests so the per-row recording
+        // and override/throw matrices keep working unchanged. Tests that need
+        // to assert the *ForRequest contract specifically (see usageAggregation
+        // suite in storage package) cover the storage-layer behavior directly.
+        async appendServerAuthoredMessageForRequest(_requestId, sessId, userId, msg) {
+          const r = await this.appendServerAuthoredMessage(sessId, userId, msg);
+          if (r.applied) return { applied: true };
+          return { applied: false, reason: r.reason ?? "malformed" };
+        },
       },
     };
   }
@@ -609,6 +631,7 @@ describe("internalServerAuthored handler — thinking durability", () => {
     await h(authed(JSON.stringify({
       sessionId: "sess12345", turnIndex: 2, status: "completed",
       text: "answer", thinkingText: "reasoning", createdAt: 5_000,
+      requestId: "req-12345abc",
     })), res, CTX);
     assert.equal(resRec.status, 200);
     // Two storage rows: thinking first (lower ts), assistant second.
@@ -636,7 +659,7 @@ describe("internalServerAuthored handler — thinking durability", () => {
     const { res, rec: resRec } = makeRes();
     await h(authed(JSON.stringify({
       sessionId: "sess12345", turnIndex: 2, status: "completed",
-      text: "answer", thinkingText: "reasoning",
+      text: "answer", thinkingText: "reasoning", requestId: "req-12345abc",
     })), res, CTX);
     assert.equal(resRec.status, 200);
     assert.deepEqual(m.calls, [["deduped", "thinking"], ["ok", "assistant"]]);
@@ -655,7 +678,7 @@ describe("internalServerAuthored handler — thinking durability", () => {
     const { res, rec: resRec } = makeRes();
     await h(authed(JSON.stringify({
       sessionId: "sess12345", turnIndex: 3, status: "completed",
-      text: "answer", thinkingText: "reasoning",
+      text: "answer", thinkingText: "reasoning", requestId: "req-12345abc",
     })), res, CTX);
     // Assistant succeeded → 200 (degrade gracefully, thinking lost but
     // conversation flows). Both metrics emitted: error/thinking + ok/assistant.
@@ -676,7 +699,7 @@ describe("internalServerAuthored handler — thinking durability", () => {
     const { res, rec: resRec } = makeRes();
     await h(authed(JSON.stringify({
       sessionId: "sess12345", turnIndex: 4, status: "completed",
-      text: "answer", thinkingText: "reasoning",
+      text: "answer", thinkingText: "reasoning", requestId: "req-12345abc",
     })), res, CTX);
     assert.equal(resRec.status, 404);
     assert.deepEqual(m.calls, [["ok", "thinking"], ["reject_session_missing", "assistant"]]);
@@ -693,6 +716,7 @@ describe("internalServerAuthored handler — thinking durability", () => {
     const { res, rec: resRec } = makeRes();
     await h(authed(JSON.stringify({
       sessionId: "sess12345", turnIndex: 5, status: "completed", text: "answer",
+      requestId: "req-12345abc",
     })), res, CTX);
     assert.equal(resRec.status, 200);
     assert.equal(rec.rows.length, 1);

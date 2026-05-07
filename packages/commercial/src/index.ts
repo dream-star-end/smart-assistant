@@ -86,7 +86,11 @@ import {
   SERVER_AUTHORED_PATH,
   type ServerAuthoredHandler,
 } from "./http/internalServerAuthored.js";
-import { appendServerAuthoredMessage } from "@openclaude/storage";
+import {
+  appendCostCredits,
+  appendServerAuthoredMessage,
+  appendServerAuthoredMessageForRequest,
+} from "@openclaude/storage";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import {
   createUserChatBridge,
@@ -629,6 +633,12 @@ export async function registerCommercial(
         // outbound.cost_charged 帧发给用户。bridge 启动顺序在 proxy 之后,
         // 故用 ref 打破先后(构造期调用是 noop,请求期 bridge 必已 wire)。
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+        // Plan §4.2 改动 4 — durable persist of debited costCredits into
+        // master's `client_sessions.messages[i].usage.costCredits`. Storage
+        // owns the (sessionId, msgId) lookup via `server_authored_request_map`
+        // and falls back to `pending_usage_patches` when the assistant sink
+        // POST hasn't landed yet.
+        appendCostCredits,
         // 2026-05-02 deepseek 接入:proxy 强制 server-side 校验 model 授权(不再
         // 信任 modelPicker 前端隐藏)。每请求一次 DB(users.role + grants),
         // fail-closed:throw → handler 500。dynamic import 避免 boot 期循环依赖。
@@ -665,7 +675,10 @@ export async function registerCommercial(
       // 详见 packages/commercial/src/http/internalServerAuthored.ts。
       const serverAuthoredHandler: ServerAuthoredHandler = makeServerAuthoredHandler({
         identityRepo,
-        storage: { appendServerAuthoredMessage },
+        storage: {
+          appendServerAuthoredMessage,
+          appendServerAuthoredMessageForRequest,
+        },
       });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
@@ -1507,6 +1520,10 @@ export async function registerCommercial(
     pgPool: getPool(),
     preCheckRedis,
     pricing,
+    // Plan §4.2 改动 4a — codex billing commit 路径同样把 debit 持久化进
+    // master's `client_sessions.messages[i].usage.costCredits`。与 anthropicProxy
+    // 走同一个 storage helper,签名一致。
+    appendCostCredits,
   });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
   // 扣费事件会实时推到用户前端。

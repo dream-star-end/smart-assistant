@@ -106,6 +106,33 @@ export interface V3MasterSinkPayload {
    *  message ts so all clients see the same timestamp regardless of
    *  retry timing. Defaults to Date.now() at master if omitted. */
   createdAt?: number
+  /** Plan §4.4 改动 7 — required when text is non-empty. Joins this
+   *  assistant message with the eventual `appendCostCredits` patch via
+   *  master's `server_authored_request_map` table. Caller propagates this
+   *  from the upstream proxy `x-openclaude-request-id` header captured at
+   *  stream begin, so master and gateway agree on a single key. */
+  requestId?: string
+  /** Plan §4.4 改动 7 — token usage gathered by the gateway-side stream
+   *  finalizer at `message_stop`. Persisted into `messages[i].usage`;
+   *  costCredits joins later via `appendCostCredits`. Snake-case JSON
+   *  field names (matching master schema in `internalServerAuthored.ts`)
+   *  are camelCased here for TS hygiene. */
+  usage?: {
+    inputTokens?: number
+    outputTokens?: number
+    cacheReadTokens?: number
+    cacheCreationTokens?: number
+    model?: string
+    turn?: number
+  }
+  /** Plan §4.4 改动 7 — turn was truncated (max_tokens / stop_reason
+   *  diverged from `end_turn`). Renders the red "已截断" pill on the
+   *  assistant message after a refresh. */
+  truncated?: boolean
+  /** Plan §4.4 改动 7 — short error code for refresh-stable error pill
+   *  (e.g. 'overloaded_error'). Joins `errorDetail` for the long form. */
+  errorCode?: string
+  errorDetail?: string
 }
 
 export type V3SinkErrorClass = 'transient' | 'session_missing' | 'fatal'
@@ -172,6 +199,15 @@ export async function attemptSend(
     status: payload.status,
     text: payload.text,
     ...(payload.createdAt !== undefined ? { createdAt: payload.createdAt } : {}),
+    // Plan §4.4 改动 7 — extra fields. All optional on the wire; master's
+    // schema refine requires `requestId` only when text is non-empty (i.e.
+    // assistant write). We forward them as-is (null/empty values are
+    // dropped by the spread guard below).
+    ...(payload.requestId !== undefined ? { requestId: payload.requestId } : {}),
+    ...(payload.usage !== undefined ? { usage: payload.usage } : {}),
+    ...(payload.truncated ? { truncated: true } : {}),
+    ...(payload.errorCode !== undefined ? { errorCode: payload.errorCode } : {}),
+    ...(payload.errorDetail !== undefined ? { errorDetail: payload.errorDetail } : {}),
   }
   if (payload.thinkingText && payload.thinkingText.length > 0) {
     bodyObj.thinkingText = payload.thinkingText

@@ -604,6 +604,60 @@ export async function syncSessionsFromServer() {
 }
 
 /**
+ * 2026-05-06 §4.5 改动 11 — messages 内 ephemeral / server-authoritative 字段
+ * strip。pushSessionToServer 已经 strip 了 session 级 ephemeral 字段,但消息
+ * 内的 _rawMeta / _partial / _completed / output / error / bashTail / inputJson /
+ * inputPreview / metaText 一直没清,会跟着 PUT body 上服务器,污染权威源。
+ *
+ * 双层防御:server 端 storage.upsertClientSession 也 strip(allowlist 模式,
+ * 见 packages/storage/src/sessionsDb.ts clientPutStrip 路径);本函数是客户端
+ * 第一层防御,降低无谓上行流量同时让本地代码意图明确。
+ *
+ * 同时禁掉若干 server-authoritative 字段从 client 写出去:
+ *   - _seq:server-allocated monotonic;client 上行的话会被 server 端 strip 但
+ *     提前删可避免 round-trip 浪费。
+ *   - _source:'server':client 不应自称 server-authored。
+ *   - usage:server-authored row 的字段;client 没权威能力写。但 client 在
+ *     msg.usage 里展示 cost_charged broadcast 推来的 costCredits,这部分
+ *     不持久化(由 server 通过 appendCostCredits 落 SQL),故 strip 安全。
+ *   - status === 'replied':派生字段,不持久化。
+ *   - _truncated / _errorCode / _errorDetail:server-authored 写入(见 4.3 schema)。
+ *
+ * 输入数组不可变;返回新数组(浅拷贝消息对象,删 ephemeral keys)。
+ */
+const _MSG_EPHEMERAL_KEYS = [
+  '_rawMeta',
+  '_partial',
+  '_completed',
+  'output',
+  'error',
+  'bashTail',
+  'inputJson',
+  'inputPreview',
+  'metaText',
+]
+const _MSG_SERVER_AUTHORITATIVE_KEYS = [
+  '_seq',
+  '_source',
+  'usage',
+  '_truncated',
+  '_errorCode',
+  '_errorDetail',
+]
+export function _stripMessageEphemeral(messages) {
+  if (!Array.isArray(messages)) return messages
+  return messages.map((m) => {
+    if (!m || typeof m !== 'object') return m
+    const cleaned = { ...m }
+    for (const k of _MSG_EPHEMERAL_KEYS) delete cleaned[k]
+    for (const k of _MSG_SERVER_AUTHORITATIVE_KEYS) delete cleaned[k]
+    // 'replied' 派生不持久化;其他 status 沿用
+    if (cleaned.status === 'replied') delete cleaned.status
+    return cleaned
+  })
+}
+
+/**
  * Push a single session to server (best-effort). Marks _syncedAt on success.
  */
 export function pushSessionToServer(sess) {
@@ -611,6 +665,10 @@ export function pushSessionToServer(sess) {
   const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, ...clean } = sess
   // Include baseSyncedAt for optimistic concurrency — server rejects if row is newer
   clean._baseSyncedAt = _syncedAt || 0
+  // 2026-05-06 §4.5 改动 11 — messages 内 strip(双层防御第一层)。
+  if (Array.isArray(clean.messages)) {
+    clean.messages = _stripMessageEphemeral(clean.messages)
+  }
   const preFlightLastAt = sess.lastAt // snapshot BEFORE PUT for 409 conflict detection
   return apiFetch(`/api/sessions/${sess.id}`, {
     method: 'PUT',
@@ -663,6 +721,52 @@ export function pushSessionToServer(sess) {
           // If the user was simultaneously editing metadata locally,
           // scheduleSaveFromUserEdit has bumped live.lastAt since
           // preFlightLastAt — we detect that below and keep local meta.
+          //
+          // 2026-05-06 §4.5 改动 13 (Codex review round 1+2) — server-authoritative
+          // 字段 overlay。"local dominates" 历史语义只覆盖文本扩展(streaming
+          // 前缀延伸),没考虑 server 端可能在 client 没更新 text 的情况下独立
+          // patch 了 usage / _seq / _truncated 等权威字段(见 commercial
+          // pending_usage_patches 异步合入路径)。本 PR 把 usage 权威化后,如果
+          // 不在这里把 server 同 id 消息的权威字段 overlay 到 local,会出现:
+          //   1) live.messages 内存版无 usage → UI token 行空
+          //   2) dbPut({...target}) 把无 usage 的版本写进 IDB
+          //   3) 强刷从 IDB 加载 → 短暂闪烁(空 token 行直到下一次 GET)
+          //
+          // overlay 字段集分两类:
+          //   _OVERLAY_KEYS_BASE — 任何同 id 消息都 overlay(usage/_seq/_source/
+          //     _truncated/_errorCode/_errorDetail 是 server-authored row 才会
+          //     有的字段,client 同 id 消息持有它们 == server 权威值,overlay 安全)
+          //   status — 仅当 server 端是 server-authored(_source='server')时 overlay。
+          //     user 消息 status 由 client 维持(sending/sent/read,storage 端 strip),
+          //     不能被 overlay 覆盖。assistant message status 在新方案里只有
+          //     server-authored row 才会带(server 写 'completed'/'interrupted' 终态),
+          //     这正是 _deriveUserMsgStatus 派生 'replied' 的依据。如果不 overlay status,
+          //     强刷场景从 IDB 加载会 token 行回来但"已回复"角标仍空。流式结束**不**
+          //     由 assistant.status 控制,而是 sess._streamingAssistant / _sendingInFlight /
+          //     isFinal 帧 — 所以 overlay 终态 status 不会让 client 误以为流结束。
+          //
+          // **不**覆盖 text/role/ts:这些字段在 _localDominates 判定时 local 已胜出
+          // (否则不会进 local-dominates 分支),overlay 会破坏 streaming 扩展。
+          const _OVERLAY_KEYS_BASE = ['_seq', '_source', 'usage', '_truncated', '_errorCode', '_errorDetail']
+          if (Array.isArray(server.messages) && Array.isArray(target.messages)) {
+            const liveById = new Map()
+            for (const m of target.messages) if (m?.id) liveById.set(m.id, m)
+            for (const sm of server.messages) {
+              if (!sm?.id) continue
+              const lm = liveById.get(sm.id)
+              if (!lm) continue
+              for (const k of _OVERLAY_KEYS_BASE) {
+                if (sm[k] !== undefined) lm[k] = sm[k]
+              }
+              // status 单独处理:仅 server-authored 消息才 overlay,避免把 server
+              // 端缺省的 user.status 覆盖 client 的 sending/sent/read,也避免把
+              // client-mirrored assistant(非 server-authored)误标终态。
+              if (sm._source === 'server' && sm.status !== undefined) {
+                lm.status = sm.status
+              }
+            }
+          }
+
           target._syncedAt = server.updatedAt
 
           // Metadata merge: server-wins UNLESS a local user edit beat the

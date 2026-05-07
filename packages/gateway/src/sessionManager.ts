@@ -158,6 +158,26 @@ function persistServerAuthoredTurn(args: {
    *  in try/catch, failures don't block the assistant write). */
   thinkingText?: string
   status: 'completed' | 'interrupted' | 'crashed'
+  /** Plan §4.4 改动 7 — server-owned requestId (commercial proxy emits via
+   *  `x-openclaude-request-id`; sessionManager forwards verbatim). v3 sink
+   *  path requires this for assistant writes (master schema refine).
+   *  Legacy / personal path ignores it. */
+  requestId?: string
+  /** Plan §4.4 改动 7 — token usage gathered at message_stop. Wire-only on
+   *  the v3 sink path; legacy persists usage via the
+   *  `outputs/usage_log` table separately. */
+  usage?: {
+    inputTokens?: number
+    outputTokens?: number
+    cacheReadTokens?: number
+    cacheCreationTokens?: number
+    model?: string
+    turn?: number
+  }
+  /** Plan §4.4 改动 7 — refresh-stable status pills. */
+  truncated?: boolean
+  errorCode?: string
+  errorDetail?: string
 }): Promise<void> {
   const sink = getV3MasterSinkOrNull()
   if (sink) {
@@ -170,6 +190,16 @@ function persistServerAuthoredTurn(args: {
         ? { thinkingText: args.thinkingText }
         : {}),
       createdAt: Date.now(),
+      // Plan §4.4 改动 7 — propagate requestId/usage/truncated/errorCode/
+      // errorDetail to master. Master schema treats requestId as required
+      // when text is non-empty (assistant write), optional otherwise
+      // (thinking-only). Caller is responsible for supplying requestId on
+      // the assistant path; we don't synthesize one here.
+      ...(args.requestId !== undefined ? { requestId: args.requestId } : {}),
+      ...(args.usage !== undefined ? { usage: args.usage } : {}),
+      ...(args.truncated ? { truncated: true } : {}),
+      ...(args.errorCode !== undefined ? { errorCode: args.errorCode } : {}),
+      ...(args.errorDetail !== undefined ? { errorDetail: args.errorDetail } : {}),
     }
     return sink
       .persistOrQueue(payload)
@@ -1435,6 +1465,26 @@ export class SessionManager {
                 text: assistantText,
                 ...(completedHasThinking ? { thinkingText } : {}),
                 status: 'completed',
+                // Plan §4.4 改动 7 — wire telemetry into the sink so master
+                // can persist `usage` + render refresh-stable truncated pill.
+                // requestId may be absent on non-codex / non-master paths;
+                // master schema only requires it when text is non-empty,
+                // and we already gate the persist call on completedHasAssistant
+                // OR completedHasThinking. The v3 sink schema enforces
+                // requestId for assistant writes; the gateway is run only
+                // by master in v3 commercial, so requestId is always present
+                // there. When absent (personal-version dev), the legacy
+                // path is taken (sink is null) and requestId is ignored.
+                ...(requestId ? { requestId } : {}),
+                usage: {
+                  inputTokens: result.inputTokens,
+                  outputTokens: result.outputTokens,
+                  cacheReadTokens: result.cacheReadTokens,
+                  cacheCreationTokens: result.cacheCreationTokens,
+                  ...(session.model ? { model: session.model } : {}),
+                  turn: turnIndex,
+                },
+                ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
               }))
             }
 
@@ -1632,6 +1682,15 @@ export class SessionManager {
                     text: partial ?? '',
                     ...(hasPartialThinking ? { thinkingText: partialThinking } : {}),
                     status,
+                    // Plan §4.4 改动 7 — propagate requestId so master can
+                    // still wire pending costCredits onto the partial turn
+                    // on the rare interrupt-after-cost-charged path.
+                    // No usage/truncated on the interrupt path: usage isn't
+                    // computed yet (parser hadn't run handleResult), and
+                    // 'truncated' specifically means stop_reason=max_tokens
+                    // — distinct from interrupt/crash which use the `status`
+                    // field instead.
+                    ...(requestId ? { requestId } : {}),
                   })
                 }
                 onEvent({ kind: 'error', error: reason })

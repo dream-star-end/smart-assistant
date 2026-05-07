@@ -353,6 +353,21 @@ export interface UserChatBridgeDeps {
   pgPool?: Pool;
   preCheckRedis?: PreCheckRedis;
   pricing?: PricingCache;
+  /**
+   * Persist costCredits into master's `client_sessions` blob via storage's
+   * `appendCostCredits` helper. Mirror of the same dep on
+   * `AnthropicProxyDeps`: bridge in-line持久化 codex 模式扣费,fail-open if
+   * not injected. See plan §4.2 改动 4a.
+   *
+   * Called only on the codex billing commit success branch (debit > 0).
+   * Optional in the same way as `appendCostCredits` on anthropicProxy:
+   * tests omit, deploy injects.
+   */
+  appendCostCredits?: (
+    requestId: string,
+    userId: string,
+    costCredits: string,
+  ) => Promise<unknown>;
 }
 
 /**
@@ -1796,6 +1811,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   result.debitedCredits !== null &&
                   result.debitedCredits > 0n
                 ) {
+                  // Plan §4.2 改动 4a: persist FIRST so refresh-after-reply
+                  // shows the same value the broadcast carries. Failure is
+                  // metric-only — broadcast still fires.
+                  if (deps.appendCostCredits) {
+                    try {
+                      await deps.appendCostCredits(
+                        reqId,
+                        uid.toString(),
+                        result.debitedCredits.toString(),
+                      );
+                    } catch (err) {
+                      log?.warn("user-chat-bridge: codex persist costCredits threw", {
+                        uid: uid.toString(), connId, requestId: reqId,
+                        err: (err as Error)?.message,
+                      });
+                    }
+                  }
                   broadcastToUser(uid, {
                     type: "outbound.cost_charged",
                     requestId: reqId,

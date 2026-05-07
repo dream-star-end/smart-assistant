@@ -232,6 +232,46 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_wechat_bindings_status ON wechat_bindings(status);
   `)
 
+  // ── Usage aggregation: server-authored requestId index + pending cost patches ──
+  //
+  // Two tables coordinate the timing-invariant single-writer aggregation of
+  // assistant `usage` info into `client_sessions.messages`. See plan
+  // §4.1 改动 3 for the design rationale.
+  //
+  //   server_authored_request_map: index from requestId → (sessionId, msgId)
+  //     populated by appendServerAuthoredMessageForRequest. Lets a late
+  //     appendCostCredits call locate the message it must patch.
+  //
+  //   pending_usage_patches: where appendCostCredits parks a costCredits
+  //     value when the corresponding server-authored message hasn't been
+  //     written yet. Drained inside appendServerAuthoredMessageForRequest's
+  //     transaction.
+  //
+  // Both tables use composite PK (request_id, user_id) so a malformed or
+  // forged requestId cannot collide across users (Codex R4 defense-in-depth).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS server_authored_request_map (
+      request_id  TEXT NOT NULL,
+      user_id     TEXT NOT NULL,
+      session_id  TEXT NOT NULL,
+      msg_id      TEXT NOT NULL,
+      written_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)*1000),
+      PRIMARY KEY (request_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sarm_session ON server_authored_request_map(session_id, msg_id);
+    CREATE INDEX IF NOT EXISTS idx_sarm_written ON server_authored_request_map(written_at);
+
+    CREATE TABLE IF NOT EXISTS pending_usage_patches (
+      request_id   TEXT NOT NULL,
+      user_id      TEXT NOT NULL,
+      session_id   TEXT,
+      cost_credits TEXT NOT NULL,
+      created_at   INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)*1000),
+      PRIMARY KEY (request_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pup_created ON pending_usage_patches(created_at);
+  `)
+
   _db = db
   return db
 }
@@ -527,6 +567,114 @@ export type MessageLike = {
   ts?: number
   _source?: string
   [k: string]: unknown
+}
+
+// ── Client PUT field strip ──
+//
+// `upsertClientSession` is the only place the wire-format message blob enters
+// the SQLite messages JSON, and the wire is *partially* trusted. Our defense
+// model is:
+//   1. CLIENT_PUT_ALLOWED_FIELDS (allow-list) — pass-through unchanged.
+//   2. CLIENT_PUT_ALLOWED_STATUSES — `status` may only carry these values.
+//      In particular `'replied'` is REJECTED here because it is now derived at
+//      render time from "any subsequent server-authored assistant exists in
+//      this turn". Letting client-supplied `'replied'` survive a PUT would let
+//      the persisted blob disagree with the derivation.
+//   3. SERVER_AUTHORITATIVE_FIELDS (deny-list) — fields whose only legal
+//      author is the storage layer itself (via `appendServerAuthoredMessage*`
+//      helpers). Hitting one of these from a client PUT is either a bug or an
+//      attack; we drop the value AND increment a counter so prod can catch
+//      drift.
+//   4. Anything else (metaText, _rawMeta, _partial, output, …) → silent drop.
+//      These are ephemeral or derived and have no legitimate role in the
+//      persisted blob.
+//
+// `appendServerAuthoredMessage*` paths bypass this strip entirely — they are
+// the single trusted writers of the deny-listed fields.
+
+const CLIENT_PUT_ALLOWED_FIELDS: ReadonlySet<string> = new Set<string>([
+  // identity / content
+  'id', 'role', 'text', 'ts', 'createdAt', 'completedAt',
+  // child blocks (subagent groupings, thinking inside assistants, etc.)
+  'childBlocks', 'agentName', 'agentId',
+  // tool messages
+  'toolName', 'toolIcon', 'toolInput', 'toolUseId', 'parentToolUseId',
+  // empty-turn / cron metadata
+  '_emptyTurn', '_emptyTurnSoft', '_emptyTurnStopReason', 'cronJob',
+  // client-persistent private fields (server treats opaquely)
+  '_media', '_modelText',
+])
+
+const CLIENT_PUT_ALLOWED_STATUSES: ReadonlySet<string> = new Set<string>([
+  'sending', 'queued', 'sent', 'read',
+])
+
+const SERVER_AUTHORITATIVE_FIELDS: ReadonlySet<string> = new Set<string>([
+  '_source', '_seq', 'usage',
+  '_truncated', '_errorCode', '_errorDetail',
+])
+
+/**
+ * Module-level counter of fields rejected from client PUT bodies. Keyed by
+ * field name. Read by `getClientPutBlockedFieldCounts()` for tests / metrics
+ * scrape; reset by `_resetClientPutBlockedFieldCountsForTest()`.
+ *
+ * Plain object, not a class — counters are append-only, no concurrent
+ * writers in single-process gateway.
+ */
+const _clientPutBlockedFieldCounts: Record<string, number> = Object.create(null)
+
+/** Returns a snapshot copy of the blocked-field counter. */
+export function getClientPutBlockedFieldCounts(): Record<string, number> {
+  return { ..._clientPutBlockedFieldCounts }
+}
+
+/** Tests only — clear the counter between cases. */
+export function _resetClientPutBlockedFieldCountsForTest(): void {
+  for (const k of Object.keys(_clientPutBlockedFieldCounts)) {
+    delete _clientPutBlockedFieldCounts[k]
+  }
+}
+
+/**
+ * Strip a single message coming in via CLIENT PUT to the allow-list.
+ * Returns null if the input is structurally invalid (non-object).
+ *
+ * Pure: doesn't mutate input.
+ */
+export function _stripClientPutMessage(msg: unknown): MessageLike | null {
+  if (!msg || typeof msg !== 'object') return null
+  const src = msg as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const k of Object.keys(src)) {
+    if (CLIENT_PUT_ALLOWED_FIELDS.has(k)) {
+      out[k] = src[k]
+    } else if (k === 'status') {
+      const v = src[k]
+      if (typeof v === 'string' && CLIENT_PUT_ALLOWED_STATUSES.has(v)) {
+        out.status = v
+      }
+      // 'replied' or any other value → drop (derived at render time).
+    } else if (SERVER_AUTHORITATIVE_FIELDS.has(k)) {
+      _clientPutBlockedFieldCounts[k] = (_clientPutBlockedFieldCounts[k] ?? 0) + 1
+      // value dropped
+    }
+    // unknown / ephemeral fields (metaText, _rawMeta, _partial, output, …) → silent drop.
+  }
+  return out as MessageLike
+}
+
+/**
+ * Strip an entire `messages` array from a client PUT to the allow-list.
+ * Returns a new array with malformed entries removed.
+ */
+export function _stripClientPutMessages(messages: readonly unknown[]): MessageLike[] {
+  const out: MessageLike[] = []
+  for (const m of messages) {
+    const cleaned = _stripClientPutMessage(m)
+    if (cleaned !== null) out.push(cleaned)
+  }
+  return out
 }
 
 /**
@@ -861,7 +1009,11 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
         if (Array.isArray(parsed)) oldMsgs = parsed as MessageLike[]
       } catch { /* malformed existing messages JSON — treat as empty */ }
     }
-    const clientMsgs = session.messages as MessageLike[]
+    // Strip the incoming client PUT to the allow-list BEFORE merge. This is
+    // the single chokepoint for `_source/_seq/usage/_truncated/_errorCode/
+    // _errorDetail/status='replied'/_rawMeta/...` rejection. See
+    // _stripClientPutMessage above for the full deny/ephemeral matrix.
+    const clientMsgs = _stripClientPutMessages(session.messages as unknown[])
     const merged = mergePreservingServerAuthored(oldMsgs, clientMsgs) as MessageLike[]
     const currentNextSeq = existing && typeof existing.next_seq === 'number' && existing.next_seq > 0
       ? existing.next_seq
@@ -921,6 +1073,64 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
  * should ensure the client has created it first) or when a message with the
  * same id already exists.
  */
+export type ServerAuthoredAppendResult =
+  | { applied: true }
+  | { applied: false; reason: 'session_not_found' | 'already_exists' | 'malformed' }
+
+/**
+ * Synchronous core: append a server-authored message to a client session.
+ * MUST be called inside a `db.transaction(() => …)` wrapper that the caller
+ * controls. Used directly by `appendServerAuthoredMessage` (single-turn
+ * write) and by `appendServerAuthoredMessageForRequest` (which atomically
+ * combines this write with `pending_usage_patches` drain + request-map
+ * insert in one transaction).
+ *
+ * Why a sync core instead of nested `db.transaction()` calls: better-sqlite3
+ * doesn't support passing a transaction handle into other functions; nesting
+ * `db.transaction(...)` calls just opens a savepoint, which is fine for
+ * correctness but harder to reason about. The cleanest factoring is one
+ * top-level transaction in each public API and a private sync core they
+ * share.
+ */
+function _appendServerAuthoredCore(
+  db: Database.Database,
+  sessId: string,
+  userId: string,
+  message: MessageLike & { id: string },
+): ServerAuthoredAppendResult {
+  const row = db.prepare(
+    'SELECT messages, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+  ).get(sessId, userId) as { messages: string; next_seq: number | null } | undefined
+  if (!row) return { applied: false, reason: 'session_not_found' }
+
+  let msgs: MessageLike[]
+  try {
+    const parsed = JSON.parse(row.messages)
+    if (!Array.isArray(parsed)) return { applied: false, reason: 'malformed' }
+    msgs = parsed as MessageLike[]
+  } catch {
+    return { applied: false, reason: 'malformed' }
+  }
+
+  const result = appendServerAuthoredPure(msgs, message)
+  if (!result.applied) return { applied: false, reason: result.reason }
+
+  // Run the resulting messages through normalizeAndAssignSeqs so the new
+  // server-authored entry receives a fresh `_seq` AND any legacy rows on
+  // this row get backfilled in the same transaction. Without this, a
+  // legacy session (next_seq=1, messages without _seq) would silently get
+  // _seq=1 assigned only to the new message — colliding with the eventual
+  // _seq=1 a later upsert would assign during legacy backfill.
+  const currentNextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
+  const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, result.messages, currentNextSeq)
+
+  const now = Date.now()
+  db.prepare(
+    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ? WHERE id = ? AND user_id = ?'
+  ).run(JSON.stringify(finalMessages), finalMessages.length, now, now, nextSeq, sessId, userId)
+  return { applied: true }
+}
+
 export async function appendServerAuthoredMessage(
   sessId: string,
   userId: string,
@@ -937,38 +1147,262 @@ export async function appendServerAuthoredMessage(
   },
 ): Promise<{ applied: boolean; reason?: 'session_not_found' | 'already_exists' | 'malformed' }> {
   const db = await getSessionsDb()
-  const txn = db.transaction(() => {
-    const row = db.prepare(
-      'SELECT messages, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-    ).get(sessId, userId) as { messages: string; next_seq: number | null } | undefined
-    if (!row) return { applied: false, reason: 'session_not_found' as const }
+  const txn = db.transaction((): ServerAuthoredAppendResult => {
+    return _appendServerAuthoredCore(db, sessId, userId, message as MessageLike & { id: string })
+  })
+  const r = txn()
+  return r.applied ? { applied: true } : { applied: false, reason: r.reason }
+}
 
-    let msgs: MessageLike[]
-    try {
-      const parsed = JSON.parse(row.messages)
-      if (!Array.isArray(parsed)) return { applied: false, reason: 'malformed' as const }
-      msgs = parsed as MessageLike[]
-    } catch {
-      return { applied: false, reason: 'malformed' as const }
+// ── Usage aggregation: requestId-keyed APIs (Codex R3+R4 design) ──
+//
+// `appendServerAuthoredMessageForRequest` is the single-writer entry point
+// for assistant messages that carry (or will carry) a `usage` field. It
+// atomically:
+//   1. Drains a pending costCredits patch keyed by (requestId, userId), if
+//      any. The drained costCredits is merged into msg.usage before write.
+//   2. Calls `_appendServerAuthoredCore` to perform the actual messages
+//      blob update + `_seq` allocation.
+//   3. Inserts a row into `server_authored_request_map` so a late-arriving
+//      `appendCostCredits(requestId, userId, …)` can locate this exact
+//      message and patch its usage in-place.
+//   4. Deletes the drained pending row to keep the table small.
+//
+// `appendCostCredits` is the single-writer for cost-only patches. It:
+//   1. Looks up `server_authored_request_map` by (requestId, userId).
+//   2a. If hit: in-place patch `messages[i].usage.costCredits` (idempotent —
+//       same value returns 'noop' so commit retries don't bump _seq).
+//   2b. If miss: park the costCredits in `pending_usage_patches` keyed by
+//       (requestId, userId), to be drained by a future
+//       `appendServerAuthoredMessageForRequest`.
+//
+// The composite primary key (request_id, user_id) is the cross-user
+// defense: a forged or re-routed requestId from user X cannot pollute user
+// Y's pending state nor block Y's eventual map insert. Codex R4 audit fixed
+// the original single-PK design which had this leak.
+//
+// All failures throw — callers (anthropicProxy / userChatBridge) are
+// expected to log + metric and continue (broadcast still fires; pending
+// alarm catches stragglers).
+
+export type AppendForRequestResult =
+  | { applied: true }
+  | { applied: false; reason: 'session_not_found' | 'already_exists' | 'malformed' }
+
+/**
+ * Append a server-authored message that may need a costCredits patch
+ * applied. Coordinates with `appendCostCredits` via two SQLite tables.
+ *
+ * Idempotency: same (requestId, userId, sessId, msgId) replayed → message
+ * write returns `already_exists`; map insert is `ON CONFLICT DO NOTHING`;
+ * pending drain is a no-op. Caller-visible result is identical for first
+ * and subsequent calls (with `applied: false, reason: 'already_exists'`).
+ */
+export async function appendServerAuthoredMessageForRequest(
+  requestId: string,
+  sessId: string,
+  userId: string,
+  message: MessageLike & { id: string },
+): Promise<AppendForRequestResult> {
+  const db = await getSessionsDb()
+  const txn = db.transaction((): AppendForRequestResult => {
+    // 1. Drain pending costCredits if commit arrived first.
+    const pending = db.prepare(
+      'SELECT cost_credits FROM pending_usage_patches WHERE request_id = ? AND user_id = ?'
+    ).get(requestId, userId) as { cost_credits: string } | undefined
+
+    let msgToWrite: MessageLike & { id: string } = message
+    if (pending) {
+      const existingUsage = (message.usage && typeof message.usage === 'object')
+        ? message.usage as Record<string, unknown>
+        : {}
+      msgToWrite = {
+        ...message,
+        usage: { ...existingUsage, costCredits: pending.cost_credits },
+      }
     }
 
-    const result = appendServerAuthoredPure(msgs, message as MessageLike & { id: string })
-    if (!result.applied) return { applied: false, reason: result.reason }
+    // 2. Append message via shared core.
+    const r = _appendServerAuthoredCore(db, sessId, userId, msgToWrite)
+    if (!r.applied) return r
 
-    // Run the resulting messages through normalizeAndAssignSeqs so the new
-    // server-authored entry receives a fresh `_seq` AND any legacy rows on
-    // this row get backfilled in the same transaction. Without this, a
-    // legacy session (next_seq=1, messages without _seq) would silently get
-    // _seq=1 assigned only to the new message — colliding with the eventual
-    // _seq=1 a later upsert would assign during legacy backfill.
-    const currentNextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
-    const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, result.messages, currentNextSeq)
-
-    const now = Date.now()
+    // 3. Record (requestId, userId) → (sessionId, msgId). Composite PK
+    //    means a late commit from another user with the same requestId
+    //    inserts a separate row instead of being silently dropped.
     db.prepare(
-      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ? WHERE id = ? AND user_id = ?'
-    ).run(JSON.stringify(finalMessages), finalMessages.length, now, now, nextSeq, sessId, userId)
+      `INSERT INTO server_authored_request_map (request_id, user_id, session_id, msg_id)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (request_id, user_id) DO NOTHING`
+    ).run(requestId, userId, sessId, message.id)
+
+    // 4. Pending row drained — clear it.
+    if (pending) {
+      db.prepare(
+        'DELETE FROM pending_usage_patches WHERE request_id = ? AND user_id = ?'
+      ).run(requestId, userId)
+    }
+
     return { applied: true }
+  })
+  return txn()
+}
+
+export type AppendCostCreditsResult =
+  | { applied: 'patched' }
+  | { applied: 'pending' }
+  | { applied: 'noop' }
+
+/**
+ * Apply a costCredits value to the assistant message keyed by (requestId,
+ * userId). Behaviour:
+ *   - If the request_map already has the message: patch
+ *     `messages[i].usage.costCredits` in-place AND bump `_seq` so client
+ *     incremental GET observes the change. **Idempotent**: if the existing
+ *     value equals the new value, returns `'noop'` and does NOT bump
+ *     `_seq`. This protects retries from inflating the per-session seq
+ *     space and triggering spurious tail reloads.
+ *   - If the message hasn't been written yet (sink POST in flight, or
+ *     race): UPSERT a row in `pending_usage_patches`. The next call to
+ *     `appendServerAuthoredMessageForRequest(requestId, ...)` will drain
+ *     it.
+ *   - All keyed by composite (requestId, userId) — see Codex R4.
+ *
+ * Returns `'noop'` on idempotent retry so callers can observe the
+ * different paths in metrics if useful.
+ */
+export async function appendCostCredits(
+  requestId: string,
+  userId: string,
+  costCredits: string,
+): Promise<AppendCostCreditsResult> {
+  const db = await getSessionsDb()
+  const txn = db.transaction((): AppendCostCreditsResult => {
+    const mapRow = db.prepare(
+      'SELECT session_id, msg_id FROM server_authored_request_map WHERE request_id = ? AND user_id = ?'
+    ).get(requestId, userId) as { session_id: string; msg_id: string } | undefined
+
+    if (mapRow) {
+      const sess = db.prepare(
+        'SELECT messages, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+      ).get(mapRow.session_id, userId) as { messages: string; next_seq: number | null } | undefined
+      if (sess) {
+        let msgs: MessageLike[]
+        try {
+          const parsed = JSON.parse(sess.messages)
+          if (!Array.isArray(parsed)) {
+            // Malformed sessions blob — fall through to pending so the
+            // value isn't lost; admin can fix the blob and the next sink
+            // POST will drain.
+            msgs = []
+          } else {
+            msgs = parsed as MessageLike[]
+          }
+        } catch {
+          msgs = []
+        }
+        const idx = msgs.findIndex(
+          (m) => m && m.id === mapRow.msg_id && m._source === 'server',
+        )
+        if (idx >= 0) {
+          const existing = msgs[idx] as MessageLike & { usage?: Record<string, unknown> }
+          const prevCost = existing.usage?.costCredits
+          if (typeof prevCost === 'string' && prevCost === costCredits) {
+            // Idempotent retry — no-op, do NOT bump _seq.
+            return { applied: 'noop' }
+          }
+          const currentNextSeq = typeof sess.next_seq === 'number' && sess.next_seq > 0
+            ? sess.next_seq
+            : 1
+          const patched: MessageLike = {
+            ...existing,
+            _seq: currentNextSeq,
+            usage: { ...(existing.usage ?? {}), costCredits },
+          }
+          const next: MessageLike[] = [...msgs]
+          next[idx] = patched
+          const nowMs = Date.now()
+          db.prepare(
+            'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1 WHERE id = ? AND user_id = ?'
+          ).run(
+            JSON.stringify(next),
+            nowMs,
+            nowMs,
+            mapRow.session_id,
+            userId,
+          )
+          return { applied: 'patched' }
+        }
+        // map says the message exists but we can't find it — likely
+        // deleted/edited out-of-band. Fall through to pending so a
+        // potential resurrected row can still pick up the cost.
+      }
+    }
+
+    db.prepare(
+      `INSERT INTO pending_usage_patches (request_id, user_id, session_id, cost_credits)
+       VALUES (?, ?, NULL, ?)
+       ON CONFLICT (request_id, user_id) DO UPDATE SET
+         cost_credits = excluded.cost_credits,
+         created_at = (CAST(strftime('%s','now') AS INTEGER)*1000)`
+    ).run(requestId, userId, costCredits)
+    return { applied: 'pending' }
+  })
+  return txn()
+}
+
+// ── Pending / map GC sweeps (Codex R3 windowing) ──
+//
+// `pending_usage_patches`: 1h triggers metric `pending_usage_patches_aging`
+// (alert), 24h triggers hard delete + metric `pending_usage_patches_expired`.
+// 24h gives plenty of room for legitimate slow recovery (gateway/master
+// restart + outbox replay) without permanently leaking rows.
+//
+// `server_authored_request_map`: 7d hard delete. The map only exists to
+// give a late `appendCostCredits` a target; after a week the assistant
+// message is settled.
+//
+// `sweepUsageAggregationGc()` is called by cron / periodic timer; pure
+// helper so tests can pass `now` and assert deterministically.
+
+export interface UsageAggregationGcStats {
+  pendingAging: number
+  pendingExpired: number
+  mapExpired: number
+}
+
+const PENDING_AGING_MS = 60 * 60_000           // 1h alarm
+const PENDING_HARD_DELETE_MS = 24 * 60 * 60_000  // 24h GC
+const MAP_HARD_DELETE_MS = 7 * 24 * 60 * 60_000  // 7d GC
+
+export async function sweepUsageAggregationGc(
+  now: number = Date.now(),
+): Promise<UsageAggregationGcStats> {
+  const db = await getSessionsDb()
+  const txn = db.transaction((): UsageAggregationGcStats => {
+    const agingThreshold = now - PENDING_AGING_MS
+    const expiredThreshold = now - PENDING_HARD_DELETE_MS
+    const mapThreshold = now - MAP_HARD_DELETE_MS
+
+    // Count rows aged 1h ≤ row < 24h (haven't been hard-deleted yet).
+    const aging = db.prepare(
+      `SELECT COUNT(*) AS n FROM pending_usage_patches
+       WHERE created_at <= ? AND created_at > ?`
+    ).get(agingThreshold, expiredThreshold) as { n: number }
+
+    // Hard-delete rows older than 24h.
+    const delPending = db.prepare(
+      'DELETE FROM pending_usage_patches WHERE created_at <= ?'
+    ).run(expiredThreshold)
+
+    const delMap = db.prepare(
+      'DELETE FROM server_authored_request_map WHERE written_at <= ?'
+    ).run(mapThreshold)
+
+    return {
+      pendingAging: aging.n,
+      pendingExpired: delPending.changes,
+      mapExpired: delMap.changes,
+    }
   })
   return txn()
 }

@@ -412,7 +412,28 @@ describe('_localDominates — local clean-superset judge', () => {
 // This way we exercise the real production code path without pulling in
 // the browser-global deps in sync.js's own imports.
 
+// 2026-05-06 §4.6 改动 12 — pushSessionToServer 在 PUT 前调 _stripMessageEphemeral
+// 把客户端不该写的字段(_seq/_source/usage/_truncated/_errorCode/_errorDetail/
+// _rawMeta/_partial/_completed/output/error/bashTail/inputJson/inputPreview/metaText
+// + status='replied')剥掉。这是模块级 export 函数,在 makePush 的 new Function 闭包
+// 里看不到 — 必须显式 extract 进 src bundle,否则 pushSessionToServer 一调就 ReferenceError。
+// _MSG_EPHEMERAL_KEYS / _MSG_SERVER_AUTHORITATIVE_KEYS 是 module-level const 数组,
+// 同样需要镜像到闭包。下面用正则从 SYNC_SRC 抓 const 块。
+const _MSG_EPHEMERAL_KEYS_SRC =
+  /const\s+_MSG_EPHEMERAL_KEYS\s*=\s*\[[\s\S]*?\]/.exec(SYNC_SRC)?.[0] ?? ''
+const _MSG_SERVER_AUTHORITATIVE_KEYS_SRC =
+  /const\s+_MSG_SERVER_AUTHORITATIVE_KEYS\s*=\s*\[[\s\S]*?\]/.exec(SYNC_SRC)?.[0] ?? ''
+if (!_MSG_EPHEMERAL_KEYS_SRC) {
+  throw new Error('_MSG_EPHEMERAL_KEYS const not found in sync.js source')
+}
+if (!_MSG_SERVER_AUTHORITATIVE_KEYS_SRC) {
+  throw new Error('_MSG_SERVER_AUTHORITATIVE_KEYS const not found in sync.js source')
+}
+
 const _pushFnSrc =
+  _MSG_EPHEMERAL_KEYS_SRC + '\n' +
+  _MSG_SERVER_AUTHORITATIVE_KEYS_SRC + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_stripMessageEphemeral') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_stableStringify') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localDominates') + '\n' +
@@ -663,6 +684,231 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     assert.equal(sess.pinned, true)
     assert.equal(sess.agentId, 'local-agent')
     assert.equal(sess.lastAt, 2500)
+  })
+
+  // 2026-05-06 §4.5 改动 13(Codex review fix)— server-authoritative overlay 防御。
+  //
+  // 历史:local-dominates 分支只 adopt server session metadata,不 overlay server
+  // 同 id 消息上的权威字段 → live.messages 内存版本可能缺 usage / _seq 等字段,
+  // dbPut 写出去的 IDB 也缺这些字段 → 强刷瞬间 token 行空白(直到下一次 GET 修复)。
+  //
+  // 本 PR 把 usage 权威化后,server 可能在 client text 没动的窗口里通过
+  // pending_usage_patches 异步 patch 了 usage(commercial 改动 4-6 路径)→
+  // 这正是该修复要 catch 的"client 没新 text 但 server 多了权威字段"场景。
+  it('overlays server-authoritative fields (usage/_seq/_source/_truncated/_errorCode/_errorDetail) onto local same-id messages', async () => {
+    const sessId = 'sess-overlay'
+    const userMsg = { id: 'u1', role: 'user', text: 'hi' }
+    // Server 端权威字段都齐(typical 异步 patch 后场景)
+    const serverAsst = {
+      id: 'a1',
+      role: 'assistant',
+      text: 'partial', // server text 仍是流式中段
+      _source: 'server',
+      _seq: 7,
+      usage: { costCredits: '850', inputTokens: 13178, outputTokens: 142, turn: 1 },
+      _truncated: false,
+    }
+    // Local 端 streaming 已经 extend 了文本,但 usage / _seq / _source 都没拿到
+    const localAsst: any = {
+      id: 'a1',
+      role: 'assistant',
+      text: 'partial extension complete',
+    }
+
+    const sess: any = {
+      id: sessId,
+      title: 't',
+      messages: [userMsg, localAsst],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
+    }
+
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId, title: 't',
+        messages: [userMsg, serverAsst],
+        lastAt: 1100, pinned: false, agentId: 'a',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps)(sess)
+
+    // 文本 — local 胜出(streaming 扩展不丢)
+    assert.equal(sess.messages[1].text, 'partial extension complete')
+    // server-authoritative 字段 overlay 进来
+    assert.deepEqual(sess.messages[1].usage, {
+      costCredits: '850',
+      inputTokens: 13178,
+      outputTokens: 142,
+      turn: 1,
+    })
+    assert.equal(sess.messages[1]._seq, 7)
+    assert.equal(sess.messages[1]._source, 'server')
+    assert.equal(sess.messages[1]._truncated, false)
+    // dbPut 持久化的 row 也含 usage(防强刷闪烁)
+    assert.equal(deps.dbCalls.length, 1)
+    const persistedRow = deps.dbCalls[0]
+    assert.deepEqual(persistedRow.messages[1].usage, serverAsst.usage)
+    assert.equal(persistedRow.messages[1]._seq, 7)
+  })
+
+  // 2026-05-06 §4.5 改动 13(Codex round-2 feedback)— status overlay 必须发生。
+  //
+  // 历史(round-1):担心 overlay status 会让 client 误以为流结束,所以排除 status。
+  // Codex round-2 反驳:
+  //   - 流式结束**不由** assistant.status 决定,而由 _streamingAssistant /
+  //     _sendingInFlight / isFinal 帧控制。
+  //   - status 字段唯一消费者是 _deriveUserMsgStatus(扫描 completed assistant tail
+  //     派生 user message 的 'replied' 角标)。
+  //   - 不 overlay status 会让 token 行恢复但"已回复"角标永远空白 — 制造一个新
+  //     的 server↔client drift,正是本 PR 要消除的那一类。
+  // 解决:对 _source === 'server' 的同 id 消息 overlay status。
+  // user 消息没 _source='server',其 client-maintained sending/sent/read 不被覆盖。
+  it('overlay 把 server-authored assistant 终态 status 写进 local (覆盖 _deriveUserMsgStatus 派生)', async () => {
+    const sessId = 'sess-status-overlay'
+    const serverAsst = {
+      id: 'a1',
+      role: 'assistant',
+      text: 'partial',
+      _source: 'server',
+      status: 'completed', // server 已标完成
+      usage: { costCredits: '100' },
+    }
+    const localAsst: any = {
+      id: 'a1',
+      role: 'assistant',
+      text: 'partial extending',
+      // local 没 status,流式中本地状态由 _streamingAssistant 决定,不是 status 字段
+    }
+    const sess: any = {
+      id: sessId, title: 't', lastAt: 1000, pinned: false, agentId: 'a',
+      messages: [{ id: 'u1', role: 'user', text: 'hi' }, localAsst],
+      _dirty: true, _syncedAt: 500,
+    }
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId, title: 't',
+        messages: [{ id: 'u1', role: 'user', text: 'hi' }, serverAsst],
+        lastAt: 1100, pinned: false, agentId: 'a', updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+    await makePush(deps)(sess)
+
+    // usage overlay 进来(round-1 已覆盖)
+    assert.deepEqual(sess.messages[1].usage, { costCredits: '100' })
+    assert.equal(sess.messages[1]._source, 'server')
+    // status 也 overlay — 这是 round-2 修复的核心:_deriveUserMsgStatus 才能扫到
+    // completed assistant tail,user 消息上的"已回复"角标才能在强刷后回来。
+    assert.equal(
+      sess.messages[1].status,
+      'completed',
+      'server-authored assistant 终态 status 必须 overlay,_deriveUserMsgStatus 依赖它',
+    )
+    // 文本仍然是 local 胜出(local-dominates 分支保留 streaming 扩展)
+    assert.equal(sess.messages[1].text, 'partial extending')
+    // dbPut 写出去的也带 status
+    assert.equal(deps.dbCalls.length, 1)
+    assert.equal(deps.dbCalls[0].messages[1].status, 'completed')
+  })
+
+  it('overlay 不覆盖非 _source="server" 消息的 status (保护 client user.status)', async () => {
+    // 反向场景:server 端的 user message 没 _source='server'(因为 user
+    // message 在新方案里不是 server-authored — server 只 stamp 自己写的 row),
+    // 即使它带 status 字段(理论上不应该,但作为防御性测试),也不应 overlay 到
+    // client 的 user message 上,因为 client 维护的 sending/sent/read 是权威的。
+    const sessId = 'sess-user-status-protect'
+    const serverUserMsg = {
+      id: 'u1',
+      role: 'user',
+      text: 'hi',
+      // 没 _source: 'server'(user message 不是 server-authored)
+      status: 'replied' as any, // 理论上 server 不会发,但即便发了也不该被 overlay
+    }
+    const localUserMsg: any = {
+      id: 'u1',
+      role: 'user',
+      text: 'hi',
+      status: 'sending', // client 流式中维护的状态
+    }
+    const localAsst: any = {
+      id: 'a1', role: 'assistant', text: 'partial extending',
+    }
+    const serverAsst = {
+      id: 'a1', role: 'assistant', text: 'partial',
+      _source: 'server', usage: { costCredits: '50' },
+    }
+    const sess: any = {
+      id: sessId, title: 't', lastAt: 1000, pinned: false, agentId: 'a',
+      messages: [localUserMsg, localAsst],
+      _dirty: true, _syncedAt: 500,
+    }
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId, title: 't',
+        messages: [serverUserMsg, serverAsst],
+        lastAt: 1100, pinned: false, agentId: 'a', updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+    await makePush(deps)(sess)
+
+    // user.status 保留 client 的 'sending'(server 没标 _source='server',不进 overlay)
+    assert.equal(
+      sess.messages[0].status,
+      'sending',
+      'user 消息没 _source="server",client status 必须保留',
+    )
+    // assistant 的 usage 还是正常 overlay
+    assert.deepEqual(sess.messages[1].usage, { costCredits: '50' })
+  })
+
+  it('overlay 跳过 server 端独有 id 消息(只处理同 id)', async () => {
+    // local 不持有 id='a-server-only',overlay 时不应误植入。
+    const sessId = 'sess-disjoint'
+    const serverOnlyAsst = {
+      id: 'a-server-only',
+      role: 'assistant',
+      text: '',
+      _source: 'server',
+      _seq: 9,
+      usage: { costCredits: '5' },
+    }
+    const localAsst = {
+      id: 'a1', role: 'assistant', text: 'something',
+    }
+    const sess: any = {
+      id: sessId, title: 't', lastAt: 1000, pinned: false, agentId: 'a',
+      messages: [{ id: 'u1', role: 'user', text: 'hi' }, localAsst],
+      _dirty: true, _syncedAt: 500,
+    }
+    // server.messages.length > local.messages.length → _localDominates 返回 false → 走 server-wins,
+    // 不再走 local-dominates overlay 路径。这个 case 仅断言 overlay 不会误把 server-only 的字段
+    // 塞进 local id 不同的项。
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId, title: 't',
+        messages: [{ id: 'u1', role: 'user', text: 'hi' }, localAsst, serverOnlyAsst],
+        lastAt: 1100, pinned: false, agentId: 'a', updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+    await makePush(deps)(sess)
+
+    // 走 server-wins 分支:整体替换 messages
+    assert.equal(sess.messages.length, 3)
+    assert.equal(sess.messages[2].id, 'a-server-only')
+    // 这里 sess.messages[1] 现在是 server.messages[1] 的引用 — 验证 server-wins 路径(非 overlay)
+    assert.equal(deps.conflictCb[0].mode, 'server-wins')
   })
 })
 
