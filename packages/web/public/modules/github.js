@@ -15,11 +15,11 @@
 //
 // 错误帧 outbound.control.session_repo_bind_error 任意时刻可能来,
 // 翻译表见 GITHUB_ERROR_TEXT。
-import { apiGet, apiJson } from './api.js?v=723555a4'
-import { $, htmlSafeEscape } from './dom.js?v=723555a4'
-import { getSession, state } from './state.js?v=723555a4'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=723555a4'
-import { sendRepoBindFrame, sendRepoUnbindFrame } from './websocket.js?v=723555a4'
+import { apiGet, apiJson } from './api.js?v=47a41001'
+import { $, htmlSafeEscape } from './dom.js?v=47a41001'
+import { getSession, state } from './state.js?v=47a41001'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=47a41001'
+import { sendRepoBindFrame, sendRepoUnbindFrame } from './websocket.js?v=47a41001'
 
 // ── Pure helpers (testable) ───────────────────────────────────────
 
@@ -173,9 +173,9 @@ function renderAccountBar(link) {
 export async function linkGithub() {
   try {
     const res = await apiJson('POST', '/api/auth/github/start', {})
-    if (res && res.redirect) {
+    if (res && res.authorizeUrl) {
       // 让浏览器跳到 GitHub 授权页;回跳后会带 ?github_linked=1 或 ?github_error=
-      window.location.href = res.redirect
+      window.location.href = res.authorizeUrl
     } else {
       toast('启动 GitHub 授权失败', 'error')
     }

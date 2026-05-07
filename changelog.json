@@ -1,6 +1,14 @@
 {
-  "currentVersion": "v1.0.91",
+  "currentVersion": "v1.0.92",
   "releases": [
+    {
+      "version": "v1.0.92",
+      "date": "2026-05-07",
+      "title": "修复 GitHub 授权按钮",
+      "items": [
+        "- 修「连接 GitHub」点击后 toast「启动 GitHub 授权失败」的 bug(前端读错字段名,后端返 authorizeUrl 但前端找 redirect)"
+      ]
+    },
     {
       "version": "v1.0.91",
       "date": "2026-05-07",
