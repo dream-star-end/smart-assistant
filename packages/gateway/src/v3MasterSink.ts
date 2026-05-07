@@ -49,6 +49,10 @@
  *   - 200 ok / 200 idempotent → success, drop entry.
  *   - 404 SESSION_NOT_FOUND → SessionMissing (retryable under TTL —
  *     frontend's debounced PUT may still be in flight).
+ *   - 410 SESSION_DELETED → Fatal (master row was soft-deleted; terminal —
+ *     retrying for 24h achieves nothing and just floods logs. Drop on
+ *     first response, both for the live persistOrQueue path and for the
+ *     drainer replaying a stale durable-queue entry).
  *   - 5xx → Transient.
  *   - Network error / timeout / DNS / TCP RST → Transient.
  *   - 401/403 → Transient (auth misconfig is operationally recoverable;
@@ -295,6 +299,15 @@ export async function attemptSend(
   }
   if (status === 404) {
     throw new V3SinkError(`session_not_found: ${truncateForLog(bodyText)}`, 'session_missing', 404)
+  }
+  if (status === 410) {
+    // Master row was soft-deleted. Terminal — retrying is pointless and
+    // generates 24h-TTL log spam (historical incident: ~190K log lines from
+    // one user across 7 successive container replacements draining the same
+    // dead session). The bare-4xx fallback below would also classify this
+    // as fatal, but an explicit branch makes the contract self-documenting
+    // and gives a clearer error message.
+    throw new V3SinkError(`session_deleted: ${truncateForLog(bodyText)}`, 'fatal', 410)
   }
   if (status >= 500 && status < 600) {
     throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)

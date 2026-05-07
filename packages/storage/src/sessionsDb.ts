@@ -1075,7 +1075,7 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
  */
 export type ServerAuthoredAppendResult =
   | { applied: true }
-  | { applied: false; reason: 'session_not_found' | 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' }
 
 /**
  * Synchronous core: append a server-authored message to a client session.
@@ -1091,6 +1091,16 @@ export type ServerAuthoredAppendResult =
  * correctness but harder to reason about. The cleanest factoring is one
  * top-level transaction in each public API and a private sync core they
  * share.
+ *
+ * Result triage (single SELECT, three terminal states):
+ *   - row absent           → 'session_not_found' (frontend's debounced PUT
+ *                            may still be in flight; durable wrapper queues
+ *                            this to the outbox so a later replay can land
+ *                            it after the row materialises)
+ *   - row.deleted_at != null → 'session_deleted' (terminal; user/admin soft-
+ *                              deleted the session, retrying will never make
+ *                              it writeable again)
+ *   - row present, not deleted → proceed with messages/_seq write
  */
 function _appendServerAuthoredCore(
   db: Database.Database,
@@ -1098,10 +1108,16 @@ function _appendServerAuthoredCore(
   userId: string,
   message: MessageLike & { id: string },
 ): ServerAuthoredAppendResult {
+  // Single SELECT without `deleted_at IS NULL` filter so we can disambiguate
+  // "row never existed" from "row exists but soft-deleted" — the two states
+  // map to different HTTP statuses (404 vs 410) and different sink retry
+  // semantics (retry-under-TTL vs fatal-drop). Conflating them caused
+  // 24h-TTL retry storms on soft-deleted sessions.
   const row = db.prepare(
-    'SELECT messages, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-  ).get(sessId, userId) as { messages: string; next_seq: number | null } | undefined
+    'SELECT messages, next_seq, deleted_at FROM client_sessions WHERE id = ? AND user_id = ?'
+  ).get(sessId, userId) as { messages: string; next_seq: number | null; deleted_at: number | null } | undefined
   if (!row) return { applied: false, reason: 'session_not_found' }
+  if (row.deleted_at !== null) return { applied: false, reason: 'session_deleted' }
 
   let msgs: MessageLike[]
   try {
@@ -1125,9 +1141,23 @@ function _appendServerAuthoredCore(
   const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, result.messages, currentNextSeq)
 
   const now = Date.now()
-  db.prepare(
-    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ? WHERE id = ? AND user_id = ?'
+  // Belt-and-braces: the SELECT above already gated on `deleted_at !== null`
+  // inside the same BEGIN IMMEDIATE transaction, so a concurrent soft-delete
+  // can't race in. Keeping `deleted_at IS NULL` on the UPDATE is a storage
+  // invariant guard against future call-path changes (e.g. a refactor that
+  // moves the SELECT/UPDATE into separate transactions). If it fails the
+  // SELECT/UPDATE invariant, `changes` will be 0 and we surface session_deleted
+  // instead of silently writing into a tombstone.
+  const update = db.prepare(
+    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
   ).run(JSON.stringify(finalMessages), finalMessages.length, now, now, nextSeq, sessId, userId)
+  if (update.changes !== 1) {
+    // Race: row was deleted between SELECT and UPDATE within the same txn.
+    // Should be unreachable under BEGIN IMMEDIATE, but if SQLite's transaction
+    // mode ever changes, we'd rather surface the terminal state than silently
+    // resurrect a tombstone.
+    return { applied: false, reason: 'session_deleted' }
+  }
   return { applied: true }
 }
 
@@ -1145,7 +1175,7 @@ export async function appendServerAuthoredMessage(
     ts?: number
     [k: string]: unknown
   },
-): Promise<{ applied: boolean; reason?: 'session_not_found' | 'already_exists' | 'malformed' }> {
+): Promise<{ applied: boolean; reason?: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' }> {
   const db = await getSessionsDb()
   const txn = db.transaction((): ServerAuthoredAppendResult => {
     return _appendServerAuthoredCore(db, sessId, userId, message as MessageLike & { id: string })
@@ -1187,7 +1217,7 @@ export async function appendServerAuthoredMessage(
 
 export type AppendForRequestResult =
   | { applied: true }
-  | { applied: false; reason: 'session_not_found' | 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' }
 
 /**
  * Append a server-authored message that may need a costCredits patch
@@ -1224,7 +1254,20 @@ export async function appendServerAuthoredMessageForRequest(
 
     // 2. Append message via shared core.
     const r = _appendServerAuthoredCore(db, sessId, userId, msgToWrite)
-    if (!r.applied) return r
+    if (!r.applied) {
+      // session_deleted is terminal: no future retry will ever drain this
+      // pending row, so it would sit until the 24h aging sweep and add
+      // observable noise (pending-pending_age dashboards, alerting). Clear it
+      // here. session_not_found is intentionally NOT cleared — the frontend's
+      // debounced PUT may still land, after which a retry of this request
+      // will succeed and need the pending value.
+      if (pending && r.reason === 'session_deleted') {
+        db.prepare(
+          'DELETE FROM pending_usage_patches WHERE request_id = ? AND user_id = ?'
+        ).run(requestId, userId)
+      }
+      return r
+    }
 
     // 3. Record (requestId, userId) → (sessionId, msgId). Composite PK
     //    means a late commit from another user with the same requestId
@@ -1483,11 +1526,15 @@ export async function queueMessageToOutbox(entry: QueuedMessage): Promise<void> 
  *
  * Return shape:
  *   { applied: true }                                      — row updated
- *   { applied: false, reason: 'session_not_found' }        — caller bug
+ *   { applied: false, reason: 'session_deleted' }          — terminal: row
+ *     was soft-deleted; not queued because outbox replay would just hit the
+ *     same terminal state on every startup
  *   { applied: false, reason: 'already_exists' }           — idempotent skip
  *   { applied: false, reason: 'malformed' }                — bad row data
- *   { applied: false, reason: 'queued_to_outbox', error } — DB failure,
- *     message safely persisted to outbox and will be retried on startup.
+ *   { applied: false, reason: 'queued_to_outbox', error } — either the row
+ *     doesn't exist yet (first-turn PUT race; outbox replay will succeed
+ *     once the client PUT lands) OR the DB write itself threw (disk full,
+ *     BUSY, corrupt — replayed on startup).
  */
 export async function appendServerAuthoredMessageDurable(
   sessId: string,
@@ -1501,7 +1548,7 @@ export async function appendServerAuthoredMessageDurable(
   },
 ): Promise<
   | { applied: true }
-  | { applied: false; reason: 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'already_exists' | 'malformed' | 'session_deleted' }
   | { applied: false; reason: 'queued_to_outbox'; error: string }
 > {
   try {
@@ -1525,10 +1572,18 @@ export async function appendServerAuthoredMessageDurable(
       })
       return { applied: false, reason: 'queued_to_outbox', error: 'session_not_found' }
     }
+    // session_deleted is a terminal state: the row exists and the user/admin
+    // has soft-deleted it. Outbox replay would just hit the same terminal
+    // state on every startup, so we drop here instead of queueing. (The
+    // upstream caller — durable sink / userChatBridge — logs this at info.)
+    if (r.reason === 'session_deleted') {
+      return { applied: false, reason: 'session_deleted' }
+    }
     // Upstream's signature types `reason` as optional, but every applied:false
-    // branch above sets one of {'session_not_found','already_exists','malformed'}.
-    // We've handled 'session_not_found'; the rest fall through here. Default
-    // to 'malformed' if reason is somehow missing (unreachable in practice).
+    // branch above sets one of {'session_not_found','session_deleted',
+    // 'already_exists','malformed'}. We've handled 'session_not_found' and
+    // 'session_deleted'; the rest fall through here. Default to 'malformed'
+    // if reason is somehow missing (unreachable in practice).
     return { applied: false, reason: r.reason ?? 'malformed' }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -1559,8 +1614,10 @@ export async function appendServerAuthoredMessageDurable(
  *      gateway itself ever writes to it).
  *   2. For each parseable entry, attempt `appendServerAuthoredMessage`.
  *   3. Entries that succeed or are permanent no-ops (`session_not_found` —
- *      session was deleted while queued; `already_exists` — duplicate from
- *      a prior partial replay) are dropped.
+ *      session row STILL doesn't exist (the original first-turn PUT race
+ *      never resolved); `session_deleted` — row exists but was soft-deleted
+ *      while queued, terminal; `already_exists` — duplicate from a prior
+ *      partial replay) are dropped.
  *   4. Entries whose DB write still throws are kept in the file for a
  *      future retry.
  *   5. After processing, atomically rewrite the file with survivors (or
@@ -1601,7 +1658,15 @@ export async function replayMsgOutbox(): Promise<{
       const r = await appendServerAuthoredMessage(entry.sessId, entry.userId, entry.message)
       if (r.applied) {
         applied++
-      } else if (r.reason === 'already_exists' || r.reason === 'session_not_found' || r.reason === 'malformed') {
+      } else if (
+        r.reason === 'already_exists' ||
+        r.reason === 'session_not_found' ||
+        r.reason === 'session_deleted' ||
+        r.reason === 'malformed'
+      ) {
+        // session_deleted is a terminal state same as session_not_found
+        // post-replay (the row exists but is soft-deleted, so retrying
+        // forever is pointless — drop and move on).
         dropped++
       } else {
         survivors.push(queuedMessageToLine(entry).trimEnd())

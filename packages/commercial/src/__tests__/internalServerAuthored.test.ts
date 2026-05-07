@@ -308,6 +308,23 @@ describe("internalServerAuthored handler — storage outcome mapping", () => {
     assert.equal(rec.status, 404);
   });
 
+  test("410 on session_deleted (soft-deleted row, terminal — sink fatal-drops)", async () => {
+    // Why a separate code from 404: soft-deleted is terminal (the row exists
+    // but tombstoned), whereas 404 may be a first-turn race that resolves
+    // after the frontend's debounced PUT lands. v3MasterSink classifies 410
+    // as 'fatal' to prevent a 24h durable retry storm against a stable
+    // tombstone (the original §1 root cause for user c:66).
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: false, reason: "session_deleted" })),
+    });
+    const { res, rec } = makeRes();
+    await h(authed(validBody), res, CTX);
+    assert.equal(rec.status, 410);
+    const parsed = JSON.parse(rec.body) as { error: { code: string } };
+    assert.equal(parsed.error.code, "SESSION_DELETED");
+  });
+
   test("500 on malformed", async () => {
     const h = makeServerAuthoredHandler({
       identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
@@ -390,6 +407,22 @@ describe("internalServerAuthored handler — sink persist metric outcomes", () =
     const { res } = makeRes();
     await h(authed(validBody), res, CTX);
     assert.deepEqual(m.calls, ["reject_session_missing"]);
+  });
+
+  test("reject_session_deleted on session_deleted (distinct from session_missing)", async () => {
+    // Pinning a separate metric label so dashboards can distinguish:
+    //   reject_session_missing → recoverable race (frontend PUT in flight)
+    //   reject_session_deleted → terminal tombstone (stop retrying)
+    // Conflating them masks user-c:66-class storms.
+    const m = captureMetric();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: false, reason: "session_deleted" })),
+      metric: m.metric,
+    });
+    const { res } = makeRes();
+    await h(authed(validBody), res, CTX);
+    assert.deepEqual(m.calls, ["reject_session_deleted"]);
   });
 
   test("reject_unauthorized on identity failure", async () => {
@@ -583,6 +616,23 @@ describe("internalServerAuthored handler — thinking durability", () => {
     assert.deepEqual(m.calls, [["reject_session_missing", "thinking"]]);
   });
 
+  test("thinking-only session_deleted → 410, reject_session_deleted/thinking (terminal)", async () => {
+    const rec = recordingStorage();
+    rec.setNextResult({ applied: false, reason: "session_deleted" }, "thinking");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed", text: "", thinkingText: "x",
+    })), res, CTX);
+    assert.equal(resRec.status, 410);
+    assert.deepEqual(m.calls, [["reject_session_deleted", "thinking"]]);
+  });
+
   test("thinking-only storage throws → 500 (sink retries; can't drop the only data)", async () => {
     const rec = recordingStorage();
     rec.setNextThrow(new Error("disk full"), "thinking");
@@ -703,6 +753,49 @@ describe("internalServerAuthored handler — thinking durability", () => {
     })), res, CTX);
     assert.equal(resRec.status, 404);
     assert.deepEqual(m.calls, [["ok", "thinking"], ["reject_session_missing", "assistant"]]);
+  });
+
+  test("DEGRADE: thinking applied, assistant session_deleted → 410 (sink fatal-drops; terminal)", async () => {
+    // Subtle but important: thinking row landed (race-window: thinking write
+    // happened *before* the soft-delete commit, or against a different row
+    // state), but by the time the assistant write runs, the row is tombstoned.
+    // The handler still emits both metrics in order so dashboards see the
+    // partial-success and the terminal reject. HTTP status follows the
+    // assistant outcome — 410 fatal — so the sink stops retrying.
+    const rec = recordingStorage();
+    rec.setNextResult({ applied: true }, "thinking");
+    rec.setNextResult({ applied: false, reason: "session_deleted" }, "assistant");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 4, status: "completed",
+      text: "answer", thinkingText: "reasoning", requestId: "req-12345abc",
+    })), res, CTX);
+    assert.equal(resRec.status, 410);
+    assert.deepEqual(m.calls, [["ok", "thinking"], ["reject_session_deleted", "assistant"]]);
+  });
+
+  test("assistant-only session_deleted → 410, reject_session_deleted/assistant", async () => {
+    const rec = recordingStorage();
+    rec.setNextResult({ applied: false, reason: "session_deleted" }, "assistant");
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 5, status: "completed", text: "answer",
+      requestId: "req-12345abc",
+    })), res, CTX);
+    assert.equal(resRec.status, 410);
+    assert.deepEqual(m.calls, [["reject_session_deleted", "assistant"]]);
   });
 
   test("assistant-only (no thinkingText key) → single assistant metric, no thinking row", async () => {

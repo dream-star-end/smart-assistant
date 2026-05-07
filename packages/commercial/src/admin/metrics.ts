@@ -434,12 +434,16 @@ export const wsBridgeTtft = new Histogram(
  *   - ok                       persist 成功(applied=true)
  *   - deduped                  msgId 已写过(idempotent retry,applied=false reason=already_exists)
  *   - reject_session_missing   master 无 (sessionId, userId) 行(404,容器侧 TTL 重试)
+ *   - reject_session_deleted   master 行存在但被软删(410,容器侧 fatal-drop,终态)
  *   - reject_unauthorized      容器双因子失败(401)
  *   - reject_bad_body          schema parse 失败 / payload 过大(400/413)
  *   - error                    storage_throw / row malformed (5xx)
  * 防截断回归监控:`oc_v3_sink_persist_total{outcome="ok"}` 应随容器 chat 流量同步增长。
  * 持续为 0 + 用户报截断 → image capability 检查。
  * `reject_session_missing` 偶发是正常(前端 PUT 与首 turn 端竞争);持续 / 占比 > 5% → 调查。
+ * `reject_session_deleted` 偶发也是正常(用户/管理员删 session 时正巧有 in-flight turn);
+ *   持续高速增长 → 检查是否有 retry queue 上残留的 stale entry 在反复触发(本来该
+ *   一次 fatal-drop 就清掉),或前端有"删后还在 sink"的 bug。
  */
 export const v3SinkPersist = new Counter({
   name: "oc_v3_sink_persist_total",
@@ -451,6 +455,7 @@ export type V3SinkPersistOutcome =
   | "ok"
   | "deduped"
   | "reject_session_missing"
+  | "reject_session_deleted"
   | "reject_unauthorized"
   | "reject_bad_body"
   | "error";

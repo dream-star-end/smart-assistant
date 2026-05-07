@@ -128,6 +128,22 @@ describe("attemptSend — status classification", () => {
     );
   });
 
+  test("410 → V3SinkError(fatal)  // soft-deleted master row is terminal — retry won't resurrect it", async () => {
+    // Why fatal not session_missing: 404 is a recoverable race (frontend's
+    // debounced PUT may still land), but 410 is a stable tombstone — the
+    // master row exists with deleted_at != NULL. Classifying as fatal stops
+    // the 24h durable retry storm that was the original c:66 root cause.
+    await assert.rejects(
+      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 410, body: '{"error":"session_deleted"}' }) }),
+      (err: unknown) => {
+        assert.ok(err instanceof V3SinkError);
+        assert.equal((err as V3SinkError).errorClass, "fatal");
+        assert.equal((err as V3SinkError).httpStatus, 410);
+        return true;
+      },
+    );
+  });
+
   test("500 → V3SinkError(transient)", async () => {
     await assert.rejects(
       () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 500, body: "boom" }) }),
@@ -375,6 +391,28 @@ describe("makeV3MasterSink.persistOrQueue", () => {
     if (out.queued) return;
     assert.match(out.droppedReason, /400/);
     assert.equal(queue.enqueued.length, 0);
+  });
+
+  test("dropped on 410 session_deleted (fatal) — does NOT enqueue", async () => {
+    // Pinning the end-to-end behavior at persistOrQueue: a 410 from master
+    // must short-circuit to drop, not queue. Otherwise replay loops would
+    // hammer the same tombstoned row for 24h (ENTRY_TTL_MS), exactly the
+    // pathology Plan A is designed to remove.
+    const queue = fakeQueue();
+    const sink = makeV3MasterSink({
+      config: CFG,
+      retryQueue: queue,
+      attemptSendImpl: async () => {
+        throw new V3SinkError("master 410 session_deleted", "fatal", 410);
+      },
+    });
+    const out = await sink.persistOrQueue(PAYLOAD);
+    assert.equal(out.ok, false);
+    if (out.ok) return;
+    assert.equal(out.queued, false);
+    if (out.queued) return;
+    assert.match(out.droppedReason, /410|session_deleted/);
+    assert.equal(queue.enqueued.length, 0, "tombstoned row must not enqueue — terminal");
   });
 
   test("unexpected (non-V3SinkError) throw → defensively queued as transient", async () => {

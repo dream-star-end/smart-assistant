@@ -34,13 +34,20 @@
  *   `{ ok: true, idempotent: true }` so retries-after-late-success are
  *   benign at the container side.
  *
- * 404 semantics:
- *   When master has no row for (sessionId, userId), we return HTTP 404 with
- *   body `{ error: 'session_not_found' }`. Container side classifies this as
- *   `session_missing` and retries under a TTL — the frontend's debounced PUT
- *   may still be in flight when the first turn-end arrives, especially when
- *   a backgrounded tab wakes up. Eventually the PUT lands and the next retry
- *   succeeds; if it hasn't landed by the TTL expiry the entry is dropped.
+ * 404 vs 410 semantics (split on 2026-05-07):
+ *   - HTTP 404 SESSION_NOT_FOUND: master has NO row for (sessionId, userId).
+ *     Container classifies this as `session_missing` and retries under a TTL —
+ *     the frontend's debounced PUT may still be in flight when the first
+ *     turn-end arrives, especially when a backgrounded tab wakes up.
+ *     Eventually the PUT lands and the next retry succeeds; if it hasn't
+ *     landed by the TTL expiry the entry is dropped.
+ *   - HTTP 410 SESSION_DELETED: master HAS a row but it is soft-deleted
+ *     (`deleted_at IS NOT NULL`). This is terminal: the user/admin removed
+ *     the session, retrying will never make it writeable again. Container
+ *     classifies this as `fatal` and drops the entry on first response,
+ *     preventing 24h-TTL retry storms on stale durable-queue entries
+ *     (historical incident: ~190K log lines from one user across 7
+ *     successive container replacements draining the same dead session).
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -167,7 +174,7 @@ export type ServerAuthoredMessageInput = {
 
 export type ServerAuthoredStorageResult = {
   applied: boolean;
-  reason?: "session_not_found" | "already_exists" | "malformed";
+  reason?: "session_not_found" | "session_deleted" | "already_exists" | "malformed";
 };
 
 /** Storage interface — narrowed to just the calls we need so unit tests can
@@ -189,7 +196,7 @@ export interface ServerAuthoredStorage {
     message: ServerAuthoredMessageInput,
   ): Promise<
     | { applied: true }
-    | { applied: false; reason: "session_not_found" | "already_exists" | "malformed" }
+    | { applied: false; reason: "session_not_found" | "session_deleted" | "already_exists" | "malformed" }
   >;
 }
 
@@ -304,14 +311,16 @@ export function makeServerAuthoredHandler(
 
     // 3) Persist
     //
-    // Decision matrix (Phase 0.4 thinking durability):
+    // Decision matrix (Phase 0.4 thinking durability + 2026-05-07
+    // session_deleted split):
     //   thinking-only (text empty, thinkingText present):
-    //     - thinking applied        → 200 ok
-    //     - thinking already_exists → 200 idempotent
-    //     - thinking session_n_f   → 404 (sink retries under TTL)
-    //     - thinking storage_threw → 500 (sink retries; thinking is the
-    //                                     only data so we cannot drop it)
-    //     - thinking malformed     → 500 (master-side data issue)
+    //     - thinking applied         → 200 ok
+    //     - thinking already_exists  → 200 idempotent
+    //     - thinking session_n_f     → 404 (sink retries under TTL)
+    //     - thinking session_deleted → 410 (sink fatal-drops; terminal)
+    //     - thinking storage_threw   → 500 (sink retries; thinking is the
+    //                                       only data so we cannot drop it)
+    //     - thinking malformed       → 500 (master-side data issue)
     //   has assistant (text non-empty, thinkingText optional):
     //     - thinking write best-effort: storage_threw is logged + metric
     //       'error'/thinking but does NOT block assistant write. degrade
@@ -319,11 +328,12 @@ export function makeServerAuthoredHandler(
     //       the sink already submitted; retrying the whole turn would
     //       just hit assistant `already_exists` and re-fail thinking.
     //     - assistant outcome decides HTTP status:
-    //         applied        → 200 ok
-    //         already_exists → 200 idempotent
-    //         session_n_f    → 404
-    //         storage_threw  → 500
-    //         malformed      → 500
+    //         applied         → 200 ok
+    //         already_exists  → 200 idempotent
+    //         session_n_f     → 404 (retryable race)
+    //         session_deleted → 410 (terminal, sink fatal-drops)
+    //         storage_threw   → 500
+    //         malformed       → 500
     const baseTs = body.createdAt ?? now();
     const thinkingTs = baseTs - 1;
     const assistantTs = baseTs;
@@ -376,6 +386,8 @@ export function makeServerAuthoredHandler(
       else if (r.reason === "already_exists") metric("deduped", "thinking");
       else if (r.reason === "session_not_found")
         metric("reject_session_missing", "thinking");
+      else if (r.reason === "session_deleted")
+        metric("reject_session_deleted", "thinking");
       else metric("error", "thinking"); // malformed
     };
 
@@ -415,6 +427,21 @@ export function makeServerAuthoredHandler(
           404,
           "SESSION_NOT_FOUND",
           "no client_sessions row for sessionId+userId",
+          requestId,
+        );
+        return;
+      }
+      if (r.reason === "session_deleted") {
+        userLog.info("thinking_session_deleted", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+        });
+        metric("reject_session_deleted", "thinking");
+        sendJsonError(
+          res,
+          410,
+          "SESSION_DELETED",
+          "client_sessions row is soft-deleted",
           requestId,
         );
         return;
@@ -504,6 +531,22 @@ export function makeServerAuthoredHandler(
         404,
         "SESSION_NOT_FOUND",
         "no client_sessions row for sessionId+userId",
+        requestId,
+      );
+      return;
+    }
+    if (assistantResult.reason === "session_deleted") {
+      userLog.info("session_deleted", {
+        sessionId: body.sessionId,
+        turnIndex: body.turnIndex,
+      });
+      emitThinkingMetric();
+      metric("reject_session_deleted", "assistant");
+      sendJsonError(
+        res,
+        410,
+        "SESSION_DELETED",
+        "client_sessions row is soft-deleted",
         requestId,
       );
       return;
