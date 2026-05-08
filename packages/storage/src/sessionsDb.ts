@@ -1224,14 +1224,39 @@ function _appendServerAuthoredCore(
   const result = appendServerAuthoredPure(msgs, message)
   if (!result.applied) return { applied: false, reason: result.reason }
 
+  // Phantom-dedupe symmetric with the client-PUT path (upsertClientSession
+  // line 1093). Without this, server-authored tool/assistant/thinking rows
+  // arriving at turn-end coexist with their client-authored streaming
+  // counterparts (matching blockId / turn group, but different ids — server
+  // uses `srv-${sessId}-t${turnIndex}-tool-${blockId}` while client uses
+  // `m-${ts}-${rand}`). The cleanup would only happen on the NEXT client
+  // PUT — meaning an F5 in the gap between server-authored append and
+  // next PUT shows duplicate tool cards (one stripped legacy + one rich).
+  //
+  // Calling `mergePreservingServerAuthored(arr, arr)` reuses the same
+  // dedupe logic as the PUT path. After `appendServerAuthoredPure` stamped
+  // `_source: 'server'`, the server-authored set in the merge is non-empty,
+  // so dedupe runs (early-return on size===0 is unreachable here).
+  // Same-array passing is safe: every id is in clientIds, so the loop at
+  // line 779 adds no duplicates; the merged array equals result.messages
+  // pre-phantom-dedupe, then the phantom-dedupe pass at lines 814-890
+  // drops orphan client rows.
+  const dedupedMessages = mergePreservingServerAuthored(
+    result.messages,
+    result.messages,
+  ) as MessageLike[]
+
   // Run the resulting messages through normalizeAndAssignSeqs so the new
   // server-authored entry receives a fresh `_seq` AND any legacy rows on
   // this row get backfilled in the same transaction. Without this, a
   // legacy session (next_seq=1, messages without _seq) would silently get
   // _seq=1 assigned only to the new message — colliding with the eventual
   // _seq=1 a later upsert would assign during legacy backfill.
+  // Note: phantom-dedupe may drop rows that had `_seq` assigned previously;
+  // the dropped seqs simply disappear. _seq invariants only require
+  // uniqueness and monotonic allocation among RETAINED messages.
   const currentNextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
-  const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, result.messages, currentNextSeq)
+  const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, dedupedMessages, currentNextSeq)
 
   // Size guard — see MAX_SESSION_BYTES. Without this, a session that has
   // already grown past the budget (e.g. via legacy oversized rows that
