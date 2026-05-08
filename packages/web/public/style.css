@@ -6168,6 +6168,59 @@ body.body-landing {
   transition: color 120ms ease;
 }
 .landing-footer-meta a:hover { color: var(--fg); }
+/* footer "联系我们" — <button> 与同级 <a> 视觉对齐(无背景、无边框、纯文字色) */
+.landing-meta-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+.landing-meta-btn:hover { color: var(--fg); }
+.landing-meta-btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Contact modal */
+.contact-intro {
+  margin: 0 0 16px 0;
+  color: var(--fg-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+.contact-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+.contact-row:last-child { border-bottom: 1px solid var(--border); }
+.contact-label {
+  flex: 0 0 56px;
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+.contact-value {
+  flex: 1;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 14px;
+  color: var(--fg);
+  word-break: break-all;
+}
+.contact-email {
+  text-decoration: none;
+  color: var(--fg);
+}
+.contact-email:hover { text-decoration: underline; }
+.contact-copy {
+  flex: 0 0 auto;
+}
 
 /* ── Brand-luxe CTAs (hero + CTA band primary buttons + login submit) ── */
 .landing .landing-btn-lg.btn-primary,
