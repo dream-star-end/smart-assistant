@@ -3,7 +3,7 @@
 // This file exports nothing; it IS the application.
 
 // ── DOM utilities ──
-import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=41a956ee'
+import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=06b646cf'
 
 // ── Pure utilities ──
 import {
@@ -15,7 +15,7 @@ import {
   sessionGroup,
   shortTime,
   uuid,
-} from './util.js?v=41a956ee'
+} from './util.js?v=06b646cf'
 
 // ── App state ──
 import {
@@ -27,7 +27,7 @@ import {
   setSending,
   state,
   tryEnqueueOffline,
-} from './state.js?v=41a956ee'
+} from './state.js?v=06b646cf'
 
 // ── API layer ──
 import {
@@ -42,16 +42,16 @@ import {
   scheduleProactiveRefresh,
   silentRefresh,
   snapshotDiagnostics,
-} from './api.js?v=41a956ee'
+} from './api.js?v=06b646cf'
 
 // ── IndexedDB ──
-import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js?v=41a956ee'
+import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js?v=06b646cf'
 
 // ── Cross-device sync ──
-import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=41a956ee'
+import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=06b646cf'
 
 // ── Theme ──
-import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js?v=41a956ee'
+import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js?v=06b646cf'
 
 // ── Markdown / rich rendering ──
 import {
@@ -61,7 +61,7 @@ import {
   localPathToUrl,
   processRichBlocks,
   renderMarkdown,
-} from './markdown.js?v=41a956ee'
+} from './markdown.js?v=06b646cf'
 
 // ── UI helpers ──
 import {
@@ -71,7 +71,7 @@ import {
   openModal,
   toast,
   toastOptsFromError,
-} from './ui.js?v=41a956ee'
+} from './ui.js?v=06b646cf'
 
 // ── Attachments ──
 import {
@@ -81,10 +81,10 @@ import {
   fileToText,
   removeAttachment,
   renderAttachments,
-} from './attachments.js?v=41a956ee'
+} from './attachments.js?v=06b646cf'
 
 // ── Speech recognition ──
-import { initSpeech, setAutoResize, toggleVoice } from './speech.js?v=41a956ee'
+import { initSpeech, setAutoResize, toggleVoice } from './speech.js?v=06b646cf'
 
 // ── Notifications ──
 import {
@@ -92,7 +92,7 @@ import {
   refreshDocumentTitle,
   requestNotifyPermission,
   setTitleBusy,
-} from './notifications.js?v=41a956ee'
+} from './notifications.js?v=06b646cf'
 
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
@@ -103,30 +103,30 @@ import {
   mintSessionCookie,
   setMode as setAuthMode,
   onLoginSuccess as setAuthSuccessHandler,
-} from './auth.js?v=41a956ee'
-// ?v=41a956ee bust: websocket.js now imports billing.js for refreshBalance() after
+} from './auth.js?v=06b646cf'
+// ?v=06b646cf bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=41a956ee'
-import { startInbox, stopInbox } from './inbox.js?v=41a956ee'
-import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=41a956ee'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=06b646cf'
+import { startInbox, stopInbox } from './inbox.js?v=06b646cf'
+import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=06b646cf'
 // ── OAuth ──
-import { initOAuthListeners, openOAuthModal } from './oauth.js?v=41a956ee'
+import { initOAuthListeners, openOAuthModal } from './oauth.js?v=06b646cf'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { initUsageStats, openUsageModal } from './usageStats.js?v=41a956ee'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=06b646cf'
 import {
   clearUserPrefsCache,
   initUserPrefs,
   loadUserPrefs,
   openPrefsModal,
   setOnPrefsChanged,
-} from './userPrefs.js?v=41a956ee'
-import { initWechatListeners, openWechatModal } from './wechat.js?v=41a956ee'
+} from './userPrefs.js?v=06b646cf'
+import { initWechatListeners, openWechatModal } from './wechat.js?v=06b646cf'
 
 // ── Memory & Skills ──
-import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=41a956ee'
+import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=06b646cf'
 
 // ── Phase 6 GitHub repo binding ──
 import {
@@ -136,7 +136,7 @@ import {
   openGithubModal,
   refreshGithubPill,
   wireGithubModalButtons,
-} from './github.js?v=41a956ee'
+} from './github.js?v=06b646cf'
 
 // ── Scheduled tasks ──
 import {
@@ -145,7 +145,7 @@ import {
   loadExecLog,
   openTasksModal,
   switchTasksTab,
-} from './tasks.js?v=41a956ee'
+} from './tasks.js?v=06b646cf'
 
 // ── Agents ──
 import {
@@ -154,7 +154,7 @@ import {
   renderAgentDropdown,
   renderAgentsManagementList,
   setRenderModelPill,
-} from './agents.js?v=41a956ee' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=06b646cf' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
@@ -176,7 +176,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=41a956ee'
+} from './sessions.js?v=06b646cf'
 
 // ── Messages ──
 import {
@@ -193,7 +193,7 @@ import {
   updateMessageEl,
   updateMsgMetaEl,
   updateSessionSub,
-} from './messages.js?v=41a956ee'
+} from './messages.js?v=06b646cf'
 
 // ── WebSocket ──
 import {
@@ -222,7 +222,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=41a956ee'
+} from './websocket.js?v=06b646cf'
 
 // ── Slash commands ──
 import {
@@ -235,18 +235,18 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=41a956ee'
+} from './commands.js?v=06b646cf'
 import {
   clearEffortOnLogout,
   getEffortForSubmit,
   initModePills,
   renderModePills,
-} from './effortMode.js?v=41a956ee'
-import { initModelPicker, renderModelPill } from './modelPicker.js?v=41a956ee'
+} from './effortMode.js?v=06b646cf'
+import { initModelPicker, renderModelPill } from './modelPicker.js?v=06b646cf'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
-// deploy where main.js?v=41a956ee imports a bare-URL state.js that CF still serves
+// deploy where main.js?v=06b646cf imports a bare-URL state.js that CF still serves
 // old), this line is never reached → watchdog fires at T+15s and self-heals.
 window.__ocBooted = true
 
@@ -1365,6 +1365,10 @@ function _syncPath(target, { replace = false } = {}) {
 
 function showLogin() {
   _syncPath('/login')
+  // Close landing-only modals (contact) — view 切换时 modal-backdrop 仍是顶层
+  // fixed,不随 landing-view hidden 消失,会卡在新 view 上面。无脑调安全(closeModal
+  // 内部 short-circuit 已关闭的 modal)。
+  closeModal('contact-modal')
   $('login-view').hidden = false
   $('app-view').hidden = true
   if ($('landing-view')) $('landing-view').hidden = true
@@ -1460,6 +1464,8 @@ async function showApp() {
   // going back from a logged-in session should land on wherever the user
   // came from (landing), not on a login form they no longer need.
   _syncPath('/', { replace: true })
+  // 关闭 landing-only modals(同 showLogin 里的注释)。
+  closeModal('contact-modal')
   $('login-view').hidden = true
   $('app-view').hidden = false
   if ($('landing-view')) $('landing-view').hidden = true
@@ -1637,6 +1643,34 @@ function _wireLandingButtons() {
     try {
       cycleTheme()
     } catch {}
+  })
+  // 联系我们 modal — footer 「联系我们」 弹窗,展示微信/邮箱
+  $('landing-contact-btn')?.addEventListener('click', () => {
+    openModal('contact-modal')
+  })
+  // 复制按钮 — 文本走 dataset.copyText,navigator.clipboard 失败回退 fallbackCopy。
+  // 只在 contact modal 内有 .contact-copy,不会污染其他模块。
+  // mobile WebView / 非安全上下文 / 权限拒绝时 fallbackCopy 也会失败 —
+  // 必须读返回值,否则 toast 假报"已复制"误导用户,公开客服联系方式场景下
+  // 直接影响用户能否拿到联系方式。
+  document.querySelectorAll('.contact-copy').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const text = btn.dataset.copyText || ''
+      if (!text) return
+      const ok = (msg) => toast(msg || '已复制', 'success')
+      const fail = () => toast('复制失败，请长按手动复制', 'error')
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(text)
+          ok()
+          return
+        } catch {
+          // fallthrough to execCommand fallback
+        }
+      }
+      if (fallbackCopy(text)) ok()
+      else fail()
+    })
   })
 }
 
@@ -2614,7 +2648,30 @@ async function init() {
     // 真 cookie 丢了才走 _forceLogout。
     const nowSec = Math.floor(Date.now() / 1000)
     if (!state.tokenExp || state.tokenExp - nowSec < 60) {
-      await silentRefresh().catch(() => false)
+      const refreshed = await silentRefresh().catch(() => false)
+      // 2026-05-08:silentRefresh 失败 = HttpOnly oc_rt cookie 也丢了(过期 / 浏览器
+      // 清站点数据 / 隐私窗口 / 跨设备 cookie 不在场)。原代码失败被吞,继续往下
+      // 闯 mintSessionCookie → showApp → refreshBalance/syncSessionsFromServer/connect
+      // 时全 401,apiFetch 兜底再 refresh 仍失败 → _notifyAuthExpired 误弹
+      // 「登录已过期」 toast (此时用户其实还在 landing/app 切换中,从未"在用"过会话)。
+      // 架构层修复:refresh 失败立即清残留 + showLanding + return,不进 app boot,
+      // 也不 publishLogout(冷启检测到旧 token 已死,不需要风暴广播给同源 tab —
+      // 它们各自冷启同样会走到这条早退)。
+      if (!refreshed) {
+        abortInflightRefresh()
+        clearProactiveRefresh()
+        _clearStoredAccessToken()
+        try {
+          localStorage.removeItem('openclaude_refresh_token')
+          localStorage.removeItem('openclaude_token')
+        } catch {}
+        state.token = ''
+        state.refreshToken = ''
+        state.tokenExp = 0
+        state.authEpoch = (state.authEpoch || 0) + 1
+        showLanding()
+        return
+      }
     }
     // V3 file-proxy:冷启动 state.token 从 localStorage 恢复,但 oc_session cookie
     // 可能已过期(或跨浏览器清理),renderMessages 里 <img src="/api/file?..."> 会
