@@ -416,6 +416,226 @@ describe('mergePreservingServerAuthored', () => {
     assert.equal(found.text, 'full server reasoning', 'server text replaces client truncated')
     assert.equal(found._source, 'server')
   })
+
+  // ── Phase 1: tool phantom dedupe (rule 6) ───────────────────────────────
+  // Server's v3 sink writes one `_source:'server'` row per completed top-level
+  // tool call with stable id `srv-${sessionId}-t${turnIndex}-tool-${blockId}`.
+  // Client's `m-*` tool rows share the same `blockId` but different ids, so
+  // id-based dedupe (rule 1) doesn't catch them. Rule 6 dedupes by blockId
+  // within the same turn group.
+
+  const srvTool = (id: string, ts: number, blockId: string, toolName: string, output = ''): Msg => ({
+    id,
+    role: 'tool',
+    text: output,
+    ts,
+    _source: 'server',
+    blockId,
+    toolName,
+    output,
+    _completed: true,
+  } as Msg)
+
+  const cliTool = (id: string, ts: number, blockId: string, toolName: string): Msg => ({
+    id,
+    role: 'tool',
+    text: toolName,
+    ts,
+    blockId,
+    toolName,
+  } as Msg)
+
+  it('Phase 1: drops client tool when server tool with same blockId exists in same turn group', () => {
+    // After turn-end the sink wrote rich srv tool row; client's bare m-* tool
+    // row (post-PUT-strip) is still in IDB. Same blockId → dedupe.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srvTool('srv-1-tool-blk-A', 198, 'blk-A', 'Bash', 'hello\n'),
+      srv('srv-1', 200, 'all done'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      cliTool('m-tool-1', 150, 'blk-A', 'Bash'),
+      { id: 'm-asst-1', ts: 180, role: 'assistant', text: 'partial' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'srv-1-tool-blk-A', 'srv-1'],
+      'client phantom tool dropped, server tool kept; phantom assistant also dropped (rule 3)',
+    )
+    const tool = out.find((m) => m.id === 'srv-1-tool-blk-A')!
+    assert.equal(tool.output, 'hello\n')
+    assert.equal(tool._source, 'server')
+    assert.equal(tool._completed, true)
+  })
+
+  it('Phase 1: keeps client tool when server tool has different blockId (different call)', () => {
+    // Two tool calls in same turn; server only persisted blk-A but blk-B
+    // somehow lacks a server row (race / cap drop). Client tool blk-B must
+    // survive — it is the only record of that call. Output is ts-sorted, so
+    // m-tool-B (ts=160) precedes the later server row (ts=198).
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srvTool('srv-1-tool-blk-A', 198, 'blk-A', 'Bash', 'A out'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      cliTool('m-tool-A', 150, 'blk-A', 'Bash'),
+      cliTool('m-tool-B', 160, 'blk-B', 'Read'),
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'm-tool-B', 'srv-1-tool-blk-A'],
+      'blk-A client tool deduped; blk-B client tool preserved (no server rival)',
+    )
+  })
+
+  it('Phase 1: dedupe stays within turn group — same blockId in different turns is independent', () => {
+    // Pathological but defendable: same blockId reused across turns. Server
+    // only wrote blk-A in turn 1; turn 2 client tool with blk-A must be kept.
+    const server: Msg[] = [
+      cli('u-1', 100, 'user'),
+      srvTool('srv-1-tool-blk-A', 198, 'blk-A', 'Bash', 'turn1 out'),
+      srv('srv-1', 200, 'turn1 done'),
+      cli('u-2', 300, 'user'),
+    ]
+    const client: Msg[] = [
+      cli('u-1', 100, 'user'),
+      cliTool('m-tool-1', 150, 'blk-A', 'Bash'),
+      cli('u-2', 300, 'user'),
+      cliTool('m-tool-2', 350, 'blk-A', 'Bash'),
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-1', 'srv-1-tool-blk-A', 'srv-1', 'u-2', 'm-tool-2'],
+      'turn1 client tool deduped; turn2 client tool preserved (different group)',
+    )
+  })
+
+  it('Phase 1: keeps client tool with no blockId (legacy / pre-allowlist row)', () => {
+    // Pre-Phase-1 PUTs stripped blockId, so legacy IDB rows lack it. We can't
+    // dedupe these — better to render a doubled card on rare legacy data
+    // than to silently drop user-visible content wholesale. ts-sorted output
+    // places legacy (ts=150) before the server row (ts=198).
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srvTool('srv-1-tool-blk-A', 198, 'blk-A', 'Bash', 'out'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      // Legacy row: no blockId field
+      { id: 'm-legacy', ts: 150, role: 'tool', text: 'Bash', toolName: 'Bash' } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'm-legacy', 'srv-1-tool-blk-A'],
+      'legacy client tool preserved (no blockId to match)',
+    )
+  })
+
+  it('Phase 1: never drops a server-authored tool entry', () => {
+    // Defensive: even if there's a (theoretically impossible) duplicate
+    // server-authored tool in the same group, both stay. Server is
+    // authoritative — the merge must never silently lose its data.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srvTool('srv-1-tool-A1', 197, 'blk-A', 'Bash', 'first'),
+      srvTool('srv-1-tool-A2', 198, 'blk-A', 'Bash', 'second'),
+    ]
+    const client: Msg[] = [cli('u-ask', 100, 'user')]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'srv-1-tool-A1', 'srv-1-tool-A2'],
+      'both server tool entries preserved (rule 1 wins; rule 6 only drops client)',
+    )
+  })
+
+  it('Phase 1: dedupe is idempotent (replay yields same result)', () => {
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      srvTool('srv-1-tool-blk-A', 198, 'blk-A', 'Bash', 'out'),
+      srv('srv-1', 200, 'done'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      cliTool('m-tool-1', 150, 'blk-A', 'Bash'),
+      { id: 'm-asst-1', ts: 180, role: 'assistant', text: 'partial' } as Msg,
+    ]
+    const once = mergePreservingServerAuthored(server, client) as Msg[]
+    const twice = mergePreservingServerAuthored(server, once) as Msg[]
+    assert.deepEqual(twice.map((m) => m.id), once.map((m) => m.id))
+  })
+
+  it('Phase 1: server tool wins over client tool with conflicting status (server is authoritative)', () => {
+    // Real-world conflict: client recorded tool as failed (status='error',
+    // isError-style ephemeral) before tool_result arrived; server's durable
+    // copy carries the actual outcome (success). Rule 6 must drop the
+    // client row regardless of status field, so the user sees the
+    // server-authoritative outcome on refresh — not a stale failure.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      // Server's durable: success
+      srvTool('srv-1-tool-blk-A', 198, 'blk-A', 'Bash', 'success output'),
+      srv('srv-1', 200, 'done'),
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      // Client's optimistic row: marked as failed
+      {
+        id: 'm-tool-A',
+        ts: 150,
+        role: 'tool',
+        text: 'Bash',
+        blockId: 'blk-A',
+        toolName: 'Bash',
+        status: 'error',
+        error: 'transient client view',
+      } as Msg,
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-ask', 'srv-1-tool-blk-A', 'srv-1'],
+      'client error-status row deduped; server success row authoritative',
+    )
+    const tool = out.find((m) => m.id === 'srv-1-tool-blk-A')!
+    assert.equal(tool.output, 'success output')
+    assert.equal(tool._source, 'server')
+    // Client's status='error' must NOT leak onto the server row
+    assert.equal((tool as Msg & { status?: string }).status, undefined)
+    assert.equal((tool as Msg & { error?: string }).error, undefined)
+  })
+
+  it('Phase 1: ignores server tool entries with empty/non-string blockId (defensive)', () => {
+    // Pathological server data (corrupt blob, future schema). The dedupe
+    // key registration tolerates this and falls through — affected client
+    // tools render normally.
+    const server: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      // empty blockId
+      { id: 'srv-bad-1', role: 'tool', text: '', ts: 198, _source: 'server', blockId: '' } as Msg,
+      // non-string blockId
+      { id: 'srv-bad-2', role: 'tool', text: '', ts: 199, _source: 'server', blockId: 42 } as Msg,
+    ]
+    const client: Msg[] = [
+      cli('u-ask', 100, 'user'),
+      cliTool('m-tool-1', 150, '', 'Bash'),
+      cliTool('m-tool-2', 160, 'blk-B', 'Read'),
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    // Server entries always win (rule 1). Client tools survive because
+    // server has no matchable blockId for them.
+    const ids = out.map((m) => m.id)
+    assert.ok(ids.includes('srv-bad-1'))
+    assert.ok(ids.includes('srv-bad-2'))
+    assert.ok(ids.includes('m-tool-1'))
+    assert.ok(ids.includes('m-tool-2'))
+  })
 })
 
 describe('appendServerAuthoredPure', () => {

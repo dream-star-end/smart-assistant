@@ -313,6 +313,156 @@ describe("attemptSend — body cap shrink", () => {
     const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
     assert.equal("thinkingText" in sent, false);
   });
+
+  // ── Phase 1: tools[] drop precedes thinkingText drop ────────────────────
+  // Why: tools[] is durable redundancy of the live-streamed tool rows the
+  // client already has. Dropping it degrades refresh-recovery only. thinkingText
+  // is auxiliary debug content that has no other persistence — drop it last,
+  // before going fatal. Tests pin this priority order so a future cap refactor
+  // can't silently invert it.
+
+  function bigTool(blockId: string, payloadKb: number): import("../ccbMessageParser.js").TurnToolEntry {
+    return {
+      toolUseId: blockId,
+      blockId,
+      toolName: "Bash",
+      inputJson: { cmd: "x".repeat(payloadKb * 1024) },
+      inputPreview: "preview",
+      output: "y".repeat(payloadKb * 1024),
+      isError: false,
+      durationMs: 1,
+      ts: 1_000_000,
+    };
+  }
+
+  test("oversized tools[] alone → drops tools[] only, thinkingText preserved", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "small assistant",
+      thinkingText: "small reasoning",
+      // Two big tools — together ~280 KB — push body over 256 KB cap.
+      tools: [bigTool("blk-A", 70), bigTool("blk-B", 70)],
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    assert.equal(captures.length, 1);
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("tools" in sent, false, "tools[] dropped to fit cap");
+    assert.equal(sent.thinkingText, "small reasoning", "thinking preserved");
+    assert.equal(sent.text, "small assistant", "assistant preserved");
+  });
+
+  test("tools[] + thinking together exceed cap → tools[] dropped first; if still over, thinkingText dropped second", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      // 200 KB assistant alone (under cap)
+      text: "x".repeat(200 * 1024),
+      // 50 KB thinking + 50 KB tools combined push to ~300 KB.
+      thinkingText: "y".repeat(50 * 1024),
+      tools: [bigTool("blk-A", 50)],
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    // Step 1: tools dropped → body ≈ 250 KB. Step 2 not needed (< cap).
+    assert.equal("tools" in sent, false, "tools dropped (step 1)");
+    assert.equal(sent.thinkingText, "y".repeat(50 * 1024), "thinking still present");
+  });
+
+  test("tools[] + thinking + assistant all together still over cap → drops tools, then thinking, sends assistant", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      // 200 KB assistant
+      text: "x".repeat(200 * 1024),
+      // 80 KB thinking → assistant + thinking alone ~280 KB > cap
+      thinkingText: "y".repeat(80 * 1024),
+      tools: [bigTool("blk-A", 50)], // adds another 50 KB
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    // Step 1: tools dropped (~330 → ~280, still > cap).
+    // Step 2: thinking dropped (~280 → ~200, < cap).
+    assert.equal("tools" in sent, false);
+    assert.equal("thinkingText" in sent, false);
+    assert.equal((sent.text as string).length, 200 * 1024, "assistant preserved");
+  });
+
+  test("under-cap with tools[] is forwarded as-is", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "answer",
+      thinkingText: "reasoning",
+      tools: [bigTool("blk-A", 1)], // tiny
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    const tools = sent.tools as Array<Record<string, unknown>>;
+    assert.equal(Array.isArray(tools), true);
+    assert.equal(tools.length, 1);
+    assert.equal(tools[0].blockId, "blk-A");
+  });
+
+  test("payload without tools[] omits the key entirely (not [] / null)", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    await attemptSend(PAYLOAD, { config: CFG, fetcher }); // no tools set
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("tools" in sent, false);
+  });
+
+  test("empty tools[] array is also omitted (treated as no tools)", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = { ...PAYLOAD, tools: [] };
+    await attemptSend(payload, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("tools" in sent, false, "spread guard skips empty array");
+  });
+
+  // Count cap (must precede byte cap): master rejects > 50 tools with 400
+  // INVALID_BODY which classifier marks as fatal — that would also drop
+  // assistant text. Sink-side count cap drops the durable tool snapshot
+  // so the primary assistant write still goes through.
+  function tinyTool(blockId: string): import("../ccbMessageParser.js").TurnToolEntry {
+    return {
+      toolUseId: blockId,
+      blockId,
+      toolName: "Bash",
+      inputJson: { cmd: "ls" },
+      inputPreview: "ls",
+      output: "ok",
+      isError: false,
+      durationMs: 1,
+      ts: 1_000_000,
+    };
+  }
+
+  test("51 tiny tools (under byte cap, over master count cap) → drops tools[], assistant preserved", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const tools = Array.from({ length: 51 }, (_, i) => tinyTool(`blk-${i}`));
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "answer",
+      thinkingText: "reasoning",
+      tools,
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    assert.equal(captures.length, 1, "POST proceeds (no fatal throw)");
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("tools" in sent, false, "tools[] dropped by count cap");
+    assert.equal(sent.thinkingText, "reasoning", "thinking preserved");
+    assert.equal(sent.text, "answer", "assistant preserved");
+  });
+
+  test("exactly 50 tools (at master count cap) → tools[] forwarded as-is", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const tools = Array.from({ length: 50 }, (_, i) => tinyTool(`blk-${i}`));
+    const payload: V3MasterSinkPayload = { ...PAYLOAD, text: "ok", tools };
+    await attemptSend(payload, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal(Array.isArray(sent.tools), true, "tools[] preserved at boundary");
+    assert.equal((sent.tools as unknown[]).length, 50);
+  });
 });
 
 // ─── persistOrQueue orchestration ────────────────────────────────────────

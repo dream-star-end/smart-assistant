@@ -456,11 +456,12 @@ export type V3SinkPersistOutcome =
   | "deduped"
   | "reject_session_missing"
   | "reject_session_deleted"
+  | "reject_oversized"
   | "reject_unauthorized"
   | "reject_bad_body"
   | "error";
 
-export type V3SinkPersistRole = "thinking" | "assistant";
+export type V3SinkPersistRole = "thinking" | "assistant" | "tool";
 
 /** Increment v3 sink persist counter.
  *

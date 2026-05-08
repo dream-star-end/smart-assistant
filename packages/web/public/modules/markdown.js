@@ -590,10 +590,65 @@ if (window.marked) {
   })
 }
 
+// Synchronously fill math placeholders in `html` from items pushed onto
+// `pendingMath` during the current marked.parse() pass. Items are matched by
+// the placeholder id (`<div class="math-block" id="math-XXXX"></div>` or the
+// span variant). When KaTeX is loaded we splice the rendered HTML back in
+// place, eliminating the empty-placeholder window that caused the
+// streaming → final 0-height collapse + iOS Safari paint lag.
+//
+// KaTeX output is NOT routed through DOMPurify — it carries inline `style`
+// and `aria-hidden` attributes that DOMPurify would strip, breaking the
+// rendered formula. Trust boundary: KaTeX is invoked with
+// `{ throwOnError:false, trust:false, strict:'ignore', output:'html' }` so the
+// generated HTML is bounded to KaTeX's own (non-script) markup; the input
+// `tex` came from the user-visible message body that was already sanitized by
+// the tokenizer above.
+//
+// `splicedItems` are removed from `pendingMath`. Items left in the queue
+// (e.g. KaTeX not loaded, or extracted by an older non-fillable caller) fall
+// through to processRichBlocks() async fill — same legacy behaviour, but the
+// fast path eliminates the visible 0-height frame.
+function _fillMathPlaceholdersSync(html, items) {
+  if (!items.length || !window.katex) return html
+  let out = html
+  for (const { id, tex, display } of items) {
+    let katexHtml
+    try {
+      katexHtml = window.katex.renderToString(tex, {
+        displayMode: display,
+        throwOnError: false,
+        output: 'html',
+        strict: 'ignore',
+        trust: false,
+      })
+    } catch (err) {
+      const cls = display ? 'math-block math-error' : 'math-inline math-error'
+      const tag = display ? 'div' : 'span'
+      katexHtml = `<${tag} class="${cls}">KaTeX error: ${htmlSafeEscape(err?.message || String(err))}</${tag}>`
+    }
+    // The tokenizers above emit fixed-shape placeholder strings; using
+    // split/join is safe (substring match, not regex) and is O(n) on the
+    // sanitized HTML. id is `math-XXXXXXXX` from Math.random().toString(36).
+    const blockMarker = `<div class="math-block" id="${id}"></div>`
+    const inlineMarker = `<span class="math-inline" id="${id}"></span>`
+    if (display) {
+      out = out.split(blockMarker).join(katexHtml)
+    } else {
+      out = out.split(inlineMarker).join(katexHtml)
+    }
+  }
+  return out
+}
+
 export function renderMarkdown(text) {
   if (!text) return ''
   if (!window.marked) return embedMediaUrls(htmlSafeEscape(text).replace(/\n/g, '<br>'))
   _codexDisplayMathDead = false
+  // Snapshot pendingMath length so we can splice exactly the items pushed by
+  // this parse call (and not race with anything queued by a prior streaming
+  // pass that hasn't been drained yet).
+  const mathBefore = pendingMath.length
   try {
     const html = marked.parse(text)
     if (!window.DOMPurify) {
@@ -612,7 +667,14 @@ export function renderMarkdown(text) {
         'data-img-src',
       ],
     })
-    return embedMediaUrls(sanitized)
+    // Sync-fill math placeholders before embedMediaUrls so we don't pay the
+    // cost of rescanning KaTeX-emitted markup for media-looking tokens.
+    let withMath = sanitized
+    if (window.katex && pendingMath.length > mathBefore) {
+      const items = pendingMath.splice(mathBefore)
+      withMath = _fillMathPlaceholdersSync(sanitized, items)
+    }
+    return embedMediaUrls(withMath)
   } catch {
     return htmlSafeEscape(text)
   }

@@ -834,3 +834,516 @@ describe("internalServerAuthored handler — thinking durability", () => {
     assert.deepEqual(m.calls, [["reject_bad_body", undefined]]);
   });
 });
+
+// ─── Phase 1: tool durability — wire schema + handler write order ───────
+describe("internalServerAuthored handler — tool durability", () => {
+  type Call = [V3SinkPersistOutcome, V3SinkPersistRole | undefined];
+  function captureMetricRich(): { calls: Call[]; metric: (o: V3SinkPersistOutcome, r?: V3SinkPersistRole) => void } {
+    const calls: Call[] = [];
+    return { calls, metric: (o, r) => calls.push([o, r]) };
+  }
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+
+  /** A minimal valid tool entry; tests override individual fields. */
+  function tool(over: Partial<{
+    toolUseId: string;
+    blockId: string;
+    toolName: string;
+    inputJson: unknown;
+    inputPreview: string;
+    output: string;
+    isError: boolean;
+    durationMs: number;
+    ts: number;
+    inputTruncated: boolean;
+    outputTruncated: boolean;
+  }> = {}): Record<string, unknown> {
+    return {
+      toolUseId: over.toolUseId ?? "tu-A",
+      blockId: over.blockId ?? "blk-A",
+      toolName: over.toolName ?? "Bash",
+      inputJson: over.inputJson ?? { command: "echo hi" },
+      inputPreview: over.inputPreview ?? "echo hi",
+      output: over.output ?? "hi\n",
+      isError: over.isError ?? false,
+      durationMs: over.durationMs ?? 12,
+      ts: over.ts ?? 100,
+      ...(over.inputTruncated !== undefined ? { inputTruncated: over.inputTruncated } : {}),
+      ...(over.outputTruncated !== undefined ? { outputTruncated: over.outputTruncated } : {}),
+    };
+  }
+
+  /** Recording storage keyed by role + blockId for tool-aware overrides. */
+  function recStore(): {
+    storage: ServerAuthoredStorage;
+    rows: Array<{ role: string; id: string; ts: number; text: string; blockId?: string; toolName?: string; inputJson?: unknown; output?: string; error?: boolean; _completed?: boolean; inputTruncated?: boolean; outputTruncated?: boolean }>;
+    setToolResult: (blockId: string, r: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>) => void;
+    setToolThrow: (blockId: string, e: Error) => void;
+    setAssistantResult: (r: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>) => void;
+    setAssistantThrow: (e: Error) => void;
+    setThinkingResult: (r: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>) => void;
+  } {
+    const rows: Array<{ role: string; id: string; ts: number; text: string; blockId?: string; toolName?: string; inputJson?: unknown; output?: string; error?: boolean; _completed?: boolean; inputTruncated?: boolean; outputTruncated?: boolean }> = [];
+    const toolOverrides = new Map<string, Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>>();
+    const toolThrowers = new Map<string, Error>();
+    let assistantOverride: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>> | undefined;
+    let assistantThrow: Error | undefined;
+    let thinkingOverride: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>> | undefined;
+    return {
+      rows,
+      setToolResult(b, r) { toolOverrides.set(b, r); },
+      setToolThrow(b, e) { toolThrowers.set(b, e); },
+      setAssistantResult(r) { assistantOverride = r; },
+      setAssistantThrow(e) { assistantThrow = e; },
+      setThinkingResult(r) { thinkingOverride = r; },
+      storage: {
+        async appendServerAuthoredMessage(_sessId, _userId, msg) {
+          // Check throw conditions BEFORE recording so a "row never persisted"
+          // assertion can distinguish thrown writes from successful ones —
+          // mirrors real storage behavior where a thrown insert leaves no row.
+          if (msg.role === "tool") {
+            const b = msg.blockId ?? "";
+            const t = toolThrowers.get(b);
+            if (t) throw t;
+          } else if (msg.role === "assistant" && assistantThrow) {
+            throw assistantThrow;
+          }
+          rows.push({
+            role: msg.role, id: msg.id, ts: msg.ts, text: msg.text,
+            blockId: msg.blockId, toolName: msg.toolName, inputJson: msg.inputJson,
+            output: msg.output, error: msg.error, _completed: msg._completed,
+            inputTruncated: msg.inputTruncated, outputTruncated: msg.outputTruncated,
+          });
+          if (msg.role === "tool") {
+            const b = msg.blockId ?? "";
+            return toolOverrides.get(b) ?? { applied: true };
+          }
+          if (msg.role === "thinking") return thinkingOverride ?? { applied: true };
+          return assistantOverride ?? { applied: true };
+        },
+        async appendServerAuthoredMessageForRequest(_requestId, sessId, userId, msg) {
+          // Assistant goes through *ForRequest in branch B; mirror to direct
+          // path so the rows[] recording and override matrix work uniformly.
+          const r = await this.appendServerAuthoredMessage(sessId, userId, msg);
+          if (r.applied) return { applied: true };
+          return { applied: false, reason: r.reason ?? "malformed" };
+        },
+      },
+    };
+  }
+
+  // ── Schema rejection ─────────────────────────────────────────────────────
+
+  test("schema rejects unknown tool field (.strict() on ToolEntry)", async () => {
+    // The tool entry schema is `.strict()` so a typo or future-only field
+    // surfaces as 400 rather than being silently dropped — keeps the
+    // master/container contract tight (caught the 'isError' vs 'error' wire
+    // confusion during Phase 1 dev).
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    const badTool = { ...tool(), wat: "nope" };
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed",
+      text: "answer", requestId: "req-12345abc", tools: [badTool],
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.equal(rec.rows.length, 0);
+    assert.deepEqual(m.calls, [["reject_bad_body", undefined]]);
+  });
+
+  test("schema rejects oversized inputJson (post-encode > cap)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    // 17 KB string > SCHEMA_TOOL_INPUT_JSON_MAX_CHARS (16 KB)
+    const huge = "x".repeat(17 * 1024);
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed",
+      text: "answer", requestId: "req-12345abc",
+      tools: [tool({ inputJson: { payload: huge } })],
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.equal(rec.rows.length, 0);
+    assert.deepEqual(m.calls, [["reject_bad_body", undefined]]);
+  });
+
+  test("schema rejects empty blockId (min(1))", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed",
+      text: "answer", requestId: "req-12345abc",
+      tools: [tool({ blockId: "" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.deepEqual(m.calls, [["reject_bad_body", undefined]]);
+  });
+
+  test("schema rejects oversized output (> SCHEMA_TOOL_OUTPUT_MAX_CHARS)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    // 9 KB > 8 KB output cap
+    const out = "y".repeat(9 * 1024);
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed",
+      text: "answer", requestId: "req-12345abc",
+      tools: [tool({ output: out })],
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.deepEqual(m.calls, [["reject_bad_body", undefined]]);
+  });
+
+  test("schema rejects tools[] > SCHEMA_TOOLS_MAX_LEN (50)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    const tools51 = Array.from({ length: 51 }, (_, i) => tool({ blockId: `blk-${i}`, toolUseId: `tu-${i}` }));
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed",
+      text: "answer", requestId: "req-12345abc", tools: tools51,
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.deepEqual(m.calls, [["reject_bad_body", undefined]]);
+  });
+
+  // ── Tools-only path (Branch A, !hasAssistant && !hasThinking) ─────────
+
+  test("tools-only: single tool applied → 200 ok, ts = baseTs - 1 + 0, correct id and stored fields", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 7, status: "completed",
+      text: "", createdAt: 5_000,
+      tools: [tool({ blockId: "blk-A", output: "out-A", isError: false, inputTruncated: true })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows.length, 1);
+    const r = rec.rows[0]!;
+    assert.equal(r.role, "tool");
+    assert.equal(r.id, "srv-sess12345-t7-tool-blk-A");
+    // toolsCount=1, baseTs - toolsCount + i = 5000 - 1 + 0 = 4999
+    assert.equal(r.ts, 4_999);
+    assert.equal(r.blockId, "blk-A");
+    assert.equal(r.toolName, "Bash");
+    assert.equal(r.output, "out-A");
+    assert.equal(r.text, "out-A", "msg.text mirrors output for legacy renderers");
+    assert.equal(r.error, false, "wire isError=false → stored error=false");
+    assert.equal(r._completed, true);
+    assert.equal(r.inputTruncated, true);
+    assert.deepEqual(m.calls, [["ok", "tool"]]);
+  });
+
+  test("tools-only: multi-tool ts ordering — baseTs - N + i for i=0..N-1", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 7, status: "completed",
+      text: "", createdAt: 5_000,
+      tools: [
+        tool({ blockId: "blk-0", toolUseId: "tu-0", output: "0" }),
+        tool({ blockId: "blk-1", toolUseId: "tu-1", output: "1" }),
+        tool({ blockId: "blk-2", toolUseId: "tu-2", output: "2" }),
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows.length, 3);
+    assert.equal(rec.rows[0].ts, 4_997, "i=0: 5000-3+0");
+    assert.equal(rec.rows[1].ts, 4_998, "i=1: 5000-3+1");
+    assert.equal(rec.rows[2].ts, 4_999, "i=2: 5000-3+2");
+    assert.deepEqual(m.calls, [["ok", "tool"], ["ok", "tool"], ["ok", "tool"]]);
+  });
+
+  test("tools-only: first tool storage_threw → 500, error/tool metric, remaining tools still attempted (best-effort)", async () => {
+    const rec = recStore();
+    rec.setToolThrow("blk-0", new Error("disk full"));
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 7, status: "completed", text: "",
+      tools: [
+        tool({ blockId: "blk-0", toolUseId: "tu-0" }),
+        tool({ blockId: "blk-1", toolUseId: "tu-1" }),
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 500);
+    // blk-0 threw before push; blk-1 still attempted (best-effort) so its row lands.
+    assert.equal(rec.rows.length, 1);
+    assert.equal(rec.rows[0].blockId, "blk-1");
+    // Per-tool metrics: error for blk-0, ok for blk-1.
+    assert.deepEqual(m.calls, [["error", "tool"], ["ok", "tool"]]);
+  });
+
+  test("tools-only: first tool already_exists → 200 idempotent", async () => {
+    const rec = recStore();
+    rec.setToolResult("blk-0", { applied: false, reason: "already_exists" });
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 7, status: "completed", text: "",
+      tools: [tool({ blockId: "blk-0" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const parsed = JSON.parse(resRec.body) as { ok: boolean; idempotent?: boolean };
+    assert.equal(parsed.idempotent, true);
+    assert.deepEqual(m.calls, [["deduped", "tool"]]);
+  });
+
+  test("tools-only: first tool session_deleted → 410 (terminal)", async () => {
+    const rec = recStore();
+    rec.setToolResult("blk-0", { applied: false, reason: "session_deleted" });
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 7, status: "completed", text: "",
+      tools: [tool({ blockId: "blk-0" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 410);
+    assert.deepEqual(m.calls, [["reject_session_deleted", "tool"]]);
+  });
+
+  test("tools-only: first tool session_not_found → 404", async () => {
+    const rec = recStore();
+    rec.setToolResult("blk-0", { applied: false, reason: "session_not_found" });
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 7, status: "completed", text: "",
+      tools: [tool({ blockId: "blk-0" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 404);
+    assert.deepEqual(m.calls, [["reject_session_missing", "tool"]]);
+  });
+
+  test("tools-only: first tool malformed → 500, error/tool", async () => {
+    const rec = recStore();
+    rec.setToolResult("blk-0", { applied: false, reason: "malformed" });
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 7, status: "completed", text: "",
+      tools: [tool({ blockId: "blk-0" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 500);
+    const parsed = JSON.parse(resRec.body) as { error: { code: string } };
+    assert.equal(parsed.error.code, "ROW_MALFORMED");
+    assert.deepEqual(m.calls, [["error", "tool"]]);
+  });
+
+  // ── Branch B: assistant + tools (with optional thinking) ─────────────
+
+  test("both fields: thinking → tools → assistant write order (ts strictly increasing)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 9, status: "completed",
+      text: "answer", thinkingText: "reasoning", createdAt: 10_000,
+      requestId: "req-12345abc",
+      tools: [
+        tool({ blockId: "blk-0", toolUseId: "tu-0", output: "out-0" }),
+        tool({ blockId: "blk-1", toolUseId: "tu-1", output: "out-1" }),
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    // 4 storage rows: thinking, tool[0], tool[1], assistant.
+    assert.equal(rec.rows.length, 4);
+    assert.equal(rec.rows[0].role, "thinking");
+    assert.equal(rec.rows[0].ts, 9_997, "thinkingTs = baseTs - toolsCount - 1 = 10000 - 2 - 1");
+    assert.equal(rec.rows[1].role, "tool");
+    assert.equal(rec.rows[1].ts, 9_998);
+    assert.equal(rec.rows[1].blockId, "blk-0");
+    assert.equal(rec.rows[2].role, "tool");
+    assert.equal(rec.rows[2].ts, 9_999);
+    assert.equal(rec.rows[2].blockId, "blk-1");
+    assert.equal(rec.rows[3].role, "assistant");
+    assert.equal(rec.rows[3].ts, 10_000);
+    // ts strictly increasing
+    for (let i = 1; i < rec.rows.length; i++) {
+      assert.ok(rec.rows[i].ts > rec.rows[i - 1].ts, `row ${i} ts must be > prev`);
+    }
+    // metrics: thinking + per-tool + assistant
+    assert.deepEqual(m.calls, [
+      ["ok", "thinking"],
+      ["ok", "tool"],
+      ["ok", "tool"],
+      ["ok", "assistant"],
+    ]);
+  });
+
+  test("DEGRADE: assistant primary + tool storage_threw → 200 ok (tool best-effort, assistant decides)", async () => {
+    const rec = recStore();
+    rec.setToolThrow("blk-0", new Error("disk full"));
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 9, status: "completed",
+      text: "answer", requestId: "req-12345abc",
+      tools: [tool({ blockId: "blk-0" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    // Assistant landed; tool threw before push → only assistant row.
+    assert.equal(rec.rows.length, 1);
+    assert.equal(rec.rows[0].role, "assistant");
+    assert.deepEqual(m.calls, [["error", "tool"], ["ok", "assistant"]]);
+  });
+
+  test("assistant primary fails (storage_threw) but tool applied → 500 (assistant decides), tool metric still emitted", async () => {
+    const rec = recStore();
+    rec.setAssistantThrow(new Error("disk full"));
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 9, status: "completed",
+      text: "answer", requestId: "req-12345abc",
+      tools: [tool({ blockId: "blk-0" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 500);
+    // Tool row was attempted before assistant → it landed.
+    assert.equal(rec.rows.length, 1);
+    assert.equal(rec.rows[0].role, "tool");
+    assert.deepEqual(m.calls, [["ok", "tool"], ["error", "assistant"]]);
+  });
+
+  test("assistant primary session_deleted with tools → 410, both per-tool and assistant metrics still emitted", async () => {
+    const rec = recStore();
+    rec.setAssistantResult({ applied: false, reason: "session_deleted" });
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 9, status: "completed",
+      text: "answer", requestId: "req-12345abc",
+      tools: [tool({ blockId: "blk-0" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 410);
+    assert.deepEqual(m.calls, [["ok", "tool"], ["reject_session_deleted", "assistant"]]);
+  });
+
+  test("isError=true on wire → error=true on stored row (rendering pill)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 9, status: "completed", text: "",
+      tools: [tool({ blockId: "blk-A", isError: true, output: "boom\n" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows[0].error, true);
+    assert.deepEqual(m.calls, [["ok", "tool"]]);
+  });
+
+  test("inputTruncated/outputTruncated propagate only when true (avoid bloat on common case)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 9, status: "completed", text: "",
+      tools: [
+        tool({ blockId: "blk-A", inputTruncated: false, outputTruncated: false }),
+        tool({ blockId: "blk-B", inputTruncated: true, outputTruncated: true }),
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    // Spread guard: handler only sets the field when t.inputTruncated is true.
+    assert.equal(rec.rows[0].inputTruncated, undefined);
+    assert.equal(rec.rows[0].outputTruncated, undefined);
+    assert.equal(rec.rows[1].inputTruncated, true);
+    assert.equal(rec.rows[1].outputTruncated, true);
+  });
+});

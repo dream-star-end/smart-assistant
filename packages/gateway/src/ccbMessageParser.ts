@@ -29,6 +29,16 @@ const THINKING_TRUNCATE_TAIL = '…[truncated]'
 const THINKING_TAIL_BYTES = Buffer.byteLength(THINKING_TRUNCATE_TAIL, 'utf8')
 const MAX_THINKING_CONTENT_BYTES = MAX_THINKING_BUFFER_BYTES - THINKING_TAIL_BYTES
 
+/** Per-tool budget for the persisted tool snapshot that's piped through the
+ *  v3 sink as part of the server-authored turn payload. These caps are
+ *  intentionally tight — sink body cap is 256 KB and one turn can have many
+ *  tool calls. Output is the most variable (Bash stdout, Grep results, file
+ *  reads), inputJson is usually small but Edit/Write can carry large strings,
+ *  inputPreview is a debug-friendly truncated string. */
+const PARSER_TOOL_OUTPUT_MAX_BYTES = 4 * 1024
+const PARSER_TOOL_INPUT_JSON_MAX_BYTES = 8 * 1024
+const PARSER_TOOL_INPUT_PREVIEW_MAX_CHARS = 500
+
 /**
  * Truncate `s` to at most `maxBytes` UTF-8 bytes WITHOUT splitting a multi-
  * byte sequence. Walks back from the byte budget to the last UTF-8 leading
@@ -114,6 +124,36 @@ export interface DetectedToolResult {
   inputPreview?: string
 }
 
+/** Snapshot of one completed top-level tool call within a turn. Captured by
+ *  the parser so SessionManager can hand it to v3MasterSink, which writes it
+ *  as a server-authored 'tool' message — the durable copy that survives
+ *  refresh / mobile-bg recovery. Subagent-issued tools (parentToolUseId set)
+ *  are intentionally excluded; their durability is owned by the parent
+ *  Agent card and tracked separately (Phase 2). */
+export interface TurnToolEntry {
+  /** Anthropic tool_use_id — also serves as the stable client blockId */
+  toolUseId: string
+  /** Same value as toolUseId, kept as a separate field so server-authored
+   *  payloads can refer to it by an explicit name without overloading
+   *  toolUseId across protocol layers. */
+  blockId: string
+  toolName: string
+  /** Possibly-capped tool input. May be a structured object or a JSON-encoded
+   *  string when the original exceeded PARSER_TOOL_INPUT_JSON_MAX_BYTES. */
+  inputJson: unknown
+  /** Truncated string preview of the input for compact rendering */
+  inputPreview: string
+  /** Tool stdout / textual output, capped to PARSER_TOOL_OUTPUT_MAX_BYTES */
+  output: string
+  isError: boolean
+  /** ms between tool_use finalization and tool_result arrival; 0 if unknown */
+  durationMs: number
+  /** Wall-clock timestamp (Date.now ms) when the tool_result arrived */
+  ts: number
+  inputTruncated?: boolean
+  outputTruncated?: boolean
+}
+
 /** Accumulated turn result stats */
 export interface TurnResult {
   cost: number
@@ -144,6 +184,74 @@ export interface TurnResult {
    *  stale entry from resume-map so the next submit() starts a fresh session
    *  instead of perpetually re-requesting the same non-existent conversation. */
   staleResumeId: boolean
+  /** Top-level (parentToolUseId-empty) tool calls that completed within this
+   *  turn, in order of tool_result arrival. Subagent-issued tools are NOT
+   *  included; their durability is the Agent card's responsibility. Empty
+   *  array when the turn made no tool calls. SessionManager passes this to
+   *  v3MasterSink so the sink can write each as a server-authored 'tool'
+   *  message — the durable record that survives refresh. */
+  tools: TurnToolEntry[]
+}
+
+/** Apply per-tool byte/char caps for the persisted tool snapshot. Mutates a
+ *  fresh shallow copy of the entry — caller passes raw values, gets back the
+ *  capped version with `inputTruncated` / `outputTruncated` flags set when
+ *  truncation actually happened. UTF-8 code-point safe. */
+function _capToolEntry(raw: {
+  toolUseId: string
+  blockId: string
+  toolName: string
+  inputJson: unknown
+  inputPreview: string
+  output: string
+  isError: boolean
+  durationMs: number
+  ts: number
+}): TurnToolEntry {
+  let inputJson = raw.inputJson
+  let inputTruncated = false
+  // inputJson cap: serialize, measure, if too big keep as truncated string.
+  // Avoid mutating user-visible structure beyond the cap — sending the full
+  // JSON-encoded string with a sentinel suffix is the simplest way for the
+  // frontend to render "this was too big" without per-field heuristics.
+  try {
+    const serialized = typeof inputJson === 'string' ? inputJson : JSON.stringify(inputJson)
+    if (Buffer.byteLength(serialized, 'utf8') > PARSER_TOOL_INPUT_JSON_MAX_BYTES) {
+      inputJson = sliceUtf8Safe(serialized, PARSER_TOOL_INPUT_JSON_MAX_BYTES) + '…[truncated]'
+      inputTruncated = true
+    }
+  } catch {
+    // Unserializable input (cycles / BigInt) — drop to a sentinel string.
+    inputJson = '[unserializable]'
+    inputTruncated = true
+  }
+
+  let inputPreview = raw.inputPreview
+  if (inputPreview.length > PARSER_TOOL_INPUT_PREVIEW_MAX_CHARS) {
+    inputPreview = inputPreview.slice(0, PARSER_TOOL_INPUT_PREVIEW_MAX_CHARS) + '…'
+  }
+
+  let output = raw.output
+  let outputTruncated = false
+  if (Buffer.byteLength(output, 'utf8') > PARSER_TOOL_OUTPUT_MAX_BYTES) {
+    output = sliceUtf8Safe(output, PARSER_TOOL_OUTPUT_MAX_BYTES) + '…[truncated]'
+    outputTruncated = true
+  }
+
+  const entry: TurnToolEntry = {
+    toolUseId: raw.toolUseId,
+    blockId: raw.blockId,
+    toolName: raw.toolName,
+    inputJson,
+    inputPreview,
+    output,
+    isError: raw.isError,
+    durationMs: raw.durationMs,
+    ts: raw.ts,
+  }
+  if (inputTruncated) entry.inputTruncated = true
+  if (outputTruncated) entry.outputTruncated = true
+  return entry
 }
 
 /**
@@ -162,6 +270,20 @@ export class CcbMessageParser {
   private indexToToolId = new Map<number, string>()
   /** tool_use id → timing/preview captured at finalization (for tool.called metrics) */
   private toolUseMeta = new Map<string, { startAt: number; inputPreview?: string }>()
+  /** Top-level tool_use snapshots awaiting their matching tool_result. Keyed
+   *  by tool_use id. Populated in `_handleAssistant` only when parentToolUseId
+   *  is empty (main agent), drained in `_handleUser` when a tool_result with
+   *  the same id arrives. Subagent tools never enter this map. */
+  private pendingToolUses = new Map<
+    string,
+    { toolName: string; inputJson: unknown; inputPreview: string; inputTruncated: boolean }
+  >()
+  /** Top-level tools that have completed (both tool_use and tool_result seen)
+   *  within this turn, in arrival order of the tool_result. Surfaced in the
+   *  TurnResult.tools field at turn end so SessionManager can persist them
+   *  via the v3 sink. Public so the interrupt/crash path in SessionManager
+   *  can flush whatever completed before CCB died. */
+  public completedTools: TurnToolEntry[] = []
   /** De-duplicate emitted tool_results within a turn */
   private emittedToolResultIds = new Set<string>()
   /** Count of tool_use blocks sent but not yet matched by a tool_result */
@@ -519,6 +641,19 @@ export class CcbMessageParser {
             inputPreview: inputStr.slice(0, 500),
           })
         }
+        // Snapshot the input for the durable server-authored tool record.
+        // Only top-level (main agent) tools are tracked for persistence —
+        // subagent tools are owned by their parent Agent card and persisted
+        // separately in Phase 2. Skip if id collides with an existing pending
+        // entry (defensive — keep first observation as authoritative).
+        if (!parentToolUseId && !this.pendingToolUses.has(c.id)) {
+          this.pendingToolUses.set(c.id, {
+            toolName: c.name ?? 'unknown',
+            inputJson,
+            inputPreview: inputStr.slice(0, 500),
+            inputTruncated: inputStr.length > 8000,
+          })
+        }
         const streamed = this.streamingToolUses.get(c.id)
         const block: Record<string, unknown> = {
           kind: 'tool_use',
@@ -590,20 +725,41 @@ export class CcbMessageParser {
         // Notify about completed tool results for bridging + metrics.
         // Subagent tool_results must not fire host bridges or record
         // main-agent metrics — same reasoning as _handleAssistant.
-        if (!parentToolUseId && this.onToolResult && useId) {
+        if (!parentToolUseId && useId) {
           const meta = this.toolUseMeta.get(useId)
           // Monotonic-clock diff; round to int ms for clean histogram buckets.
           // 0 when meta is missing (stale result / cross-turn tool_use unseen by this parser).
           const durationMs = meta ? Math.max(0, Math.round(performance.now() - meta.startAt)) : 0
           if (meta) this.toolUseMeta.delete(useId)
-          this.onToolResult({
-            toolUseId: useId,
-            toolName,
-            preview,
-            isError: !!c.is_error,
-            durationMs,
-            inputPreview: meta?.inputPreview,
-          })
+          // Finalize the durable tool snapshot. Pull pending input captured
+          // from _handleAssistant; if absent (e.g. a tool_result for a
+          // tool_use we never saw — stale cross-turn), fall back to empty
+          // input. This is rare but we still want to record the result.
+          const pending = this.pendingToolUses.get(useId)
+          if (pending) this.pendingToolUses.delete(useId)
+          this.completedTools.push(
+            _capToolEntry({
+              toolUseId: useId,
+              blockId: useId,
+              toolName,
+              inputJson: pending?.inputJson ?? {},
+              inputPreview: pending?.inputPreview ?? '',
+              output: preview,
+              isError: !!c.is_error,
+              durationMs,
+              ts: Date.now(),
+            }),
+          )
+          if (this.onToolResult) {
+            this.onToolResult({
+              toolUseId: useId,
+              toolName,
+              preview,
+              isError: !!c.is_error,
+              durationMs,
+              inputPreview: meta?.inputPreview,
+            })
+          }
         }
       }
     }
@@ -662,6 +818,7 @@ export class CcbMessageParser {
       stopReason,
       numTurns,
       staleResumeId,
+      tools: [...this.completedTools],
     }
 
     this.finalized = true

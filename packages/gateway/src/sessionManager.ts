@@ -10,7 +10,11 @@ import {
   paths,
   upsertSessionMeta,
 } from '@openclaude/storage'
-import { CcbMessageParser, type SessionStreamEvent } from './ccbMessageParser.js'
+import {
+  CcbMessageParser,
+  type SessionStreamEvent,
+  type TurnToolEntry,
+} from './ccbMessageParser.js'
 import {
   TelemetryChannel,
   type OcTelemetryEvent,
@@ -26,6 +30,7 @@ import {
   type RemoteTargetController,
   RemoteTargetUnavailableError,
 } from './remoteTarget.js'
+import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -178,6 +183,12 @@ function persistServerAuthoredTurn(args: {
   truncated?: boolean
   errorCode?: string
   errorDetail?: string
+  /** Top-level tool calls completed during this turn, captured by
+   *  CcbMessageParser. v3 sink path: master writes each as a server-authored
+   *  'tool' message so the durable copy survives refresh. Legacy/personal
+   *  path ignores this field — local SQLite preserves client-authored tool
+   *  rows already (no overwrite happens locally). */
+  tools?: TurnToolEntry[]
 }): Promise<void> {
   const sink = getV3MasterSinkOrNull()
   if (sink) {
@@ -200,6 +211,7 @@ function persistServerAuthoredTurn(args: {
       ...(args.truncated ? { truncated: true } : {}),
       ...(args.errorCode !== undefined ? { errorCode: args.errorCode } : {}),
       ...(args.errorDetail !== undefined ? { errorDetail: args.errorDetail } : {}),
+      ...(args.tools && args.tools.length > 0 ? { tools: args.tools } : {}),
     }
     return sink
       .persistOrQueue(payload)
@@ -356,6 +368,120 @@ export class SessionManager {
    * 都在 server.ts 的 WS handler 内,移动代价比暴露一个清理 hook 大得多。
    */
   public onSessionDestroyed?: (sessionKey: string) => void
+
+  // ── Phase 5: GitHub session repo wiring ──
+  /**
+   * SessionRepoWorkspaceManager.getRepoSnapshot 的 provider(由 server.ts
+   * setRepoSnapshotProvider 注入)。SubprocessRunner.start() 用此读当前 repo
+   * 状态决定 effective addDir + _boundRepoBinding。
+   * 未注入时保持 undefined,传给 SubprocessRunner 后等同"未绑定"。
+   */
+  private _getRepoSnapshot: ((sessionId: string) => RepoSnapshot | null) | undefined
+
+  /**
+   * peer (= sessionId) → sessionKey 反查索引。recycle 入口拿 sessionKey 用,
+   * 从而调 session.lock 串行化 shutdown。getOrCreate 时 set,clean/close 时 delete。
+   * 同 sessionKey 唯一 — 协议约定 peerId === sessionId,sessionKey 包含 peerId,
+   * 所以一对一,Map<sessionId, sessionKey>。
+   */
+  private _sessionIdToKey = new Map<string, string>()
+
+  /**
+   * 由 server.ts 在 Gateway 构造器里调,把 _repoWorkspace.getRepoSnapshot 注入。
+   * 必须在第一个 SubprocessRunner 创建之前调,否则首批 runner 会拿不到 snapshot。
+   */
+  setRepoSnapshotProvider(fn: (sessionId: string) => RepoSnapshot | null): void {
+    this._getRepoSnapshot = fn
+  }
+
+  /**
+   * Phase 5:repo selection 版本变化时 recycle 该 session 的 runner。
+   * 决策表(配合 SubprocessRunner.getBoundRepoBinding):
+   *   binding=null & snap=ready              → SHUTDOWN(让下次 spawn 拿 repo cwd)
+   *   binding=null & snap=cloning|failed     → NOOP(addDir 始终 agentBaseDir)
+   *   binding=v_x & snap=ready & x===snap.v  → NOOP
+   *   binding=v_x & snap=ready & x!==snap.v  → SHUTDOWN
+   *   binding=v_x & snap=cloning|failed      → NOOP(让 CCB 继续在旧 v_x dir 工作)
+   *
+   * lock 内进行,与 submit() 互斥。runner.shutdown 后下次 submit 自动 spawn,
+   * 拿当时的 repo snapshot(getRepoSnapshot provider 取自 _repoWorkspace.states)。
+   */
+  async recyclePeerForRepoChange(
+    sessionId: string,
+    newSnapshot: RepoSnapshot | null,
+  ): Promise<void> {
+    const sessionKey = this._sessionIdToKey.get(sessionId)
+    if (!sessionKey) return
+    const session = this.sessions.get(sessionKey)
+    if (!session) return
+    if (!session.runner.isRunning) return // 没活进程,下次 submit 会自然读最新 snapshot
+
+    const binding = session.runner.getBoundRepoBinding()
+    let shouldShutdown = false
+    if (newSnapshot === null) {
+      // null 走 unbind 路径,不该到这里;safety only
+      shouldShutdown = binding !== null
+    } else if (newSnapshot.status === 'ready') {
+      shouldShutdown =
+        !binding || binding.selectionVersion !== newSnapshot.selectionVersion
+    } else {
+      // cloning / failed / pending → 让 CCB 继续在旧 binding(若有)dir 工作
+      shouldShutdown = false
+    }
+
+    if (!shouldShutdown) return
+
+    // 串行化 shutdown:与 submit() 互斥,避免本 turn 中途被打断
+    const prev = session.lock
+    let release!: () => void
+    session.lock = new Promise<void>((r) => (release = r))
+    try {
+      await prev
+      try {
+        await session.runner.shutdown()
+      } catch (err) {
+        log.warn(
+          'recycle-for-repo-change shutdown failed',
+          { sessionKey: session.sessionKey, sessionId },
+          err,
+        )
+      }
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * Phase 5:repo unbind(用户 DELETE selection / link revoke)时 recycle 该 session。
+   * 调用前 caller(server.ts _handleSessionRepoUnbind)必须先 _repoWorkspace.unbind
+   * (短锁内删 states[sessionId]),保证排队 submit 启动时 getRepoSnapshot 返 null。
+   * 总是无条件 shutdown(若 isRunning):因为 unbind 后 addDir 必须切回 agentBaseDir。
+   */
+  async recyclePeerForRepoUnbind(sessionId: string): Promise<void> {
+    const sessionKey = this._sessionIdToKey.get(sessionId)
+    if (!sessionKey) return
+    const session = this.sessions.get(sessionKey)
+    if (!session) return
+    if (!session.runner.isRunning) return
+
+    const prev = session.lock
+    let release!: () => void
+    session.lock = new Promise<void>((r) => (release = r))
+    try {
+      await prev
+      try {
+        await session.runner.shutdown()
+      } catch (err) {
+        log.warn(
+          'recycle-for-repo-unbind shutdown failed',
+          { sessionKey: session.sessionKey, sessionId },
+          err,
+        )
+      }
+    } finally {
+      release()
+    }
+  }
 
   private resumeMapPath = join(paths.home, 'resume-map.json')
 
@@ -719,7 +845,7 @@ export class SessionManager {
       runner = new SubprocessRunner({
         sessionKey: opts.sessionKey,
         agentId: opts.agent.id,
-        cwd,
+        agentBaseDir: cwd,
         config: this.config,
         persona,
         model: opts.agent.model ?? this.config.defaults.model,
@@ -733,6 +859,10 @@ export class SessionManager {
         // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
         resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
         effortLevel: initialEffort,
+        // Phase 5:peerId 即 sessionId(协议约定);getRepoSnapshot 由 Gateway 构造器
+        // 注入 _repoWorkspace.getRepoSnapshot,sessionManager 透传给 runner。
+        sessionId: opts.peerId,
+        getRepoSnapshot: this._getRepoSnapshot,
       })
     }
     const now = Date.now()
@@ -849,6 +979,13 @@ export class SessionManager {
       }
     })
     this.sessions.set(opts.sessionKey, session)
+    // Phase 5:peer (= sessionId) → sessionKey 反查索引,recyclePeerForRepo* 入口用。
+    // peerId === sessionId 是协议约定;同 peerId 应只有一条活 session,理论上不会 overwrite。
+    // opts.peerId 可空(cron/webhook 等无 peer 调用)→ 用 session.peerId(已 fallback 'unknown')。
+    // 'unknown' 是 fallback 占位,GitHub repo 流程只走 webchat,该路径必有真 peerId。
+    if (opts.peerId) {
+      this._sessionIdToKey.set(opts.peerId, opts.sessionKey)
+    }
     return session
   }
 
@@ -1435,9 +1572,16 @@ export class SessionManager {
               !!result.assistantText && result.assistantText.length > 0
             const completedHasThinking =
               !!result.thinkingText && result.thinkingText.length > 0
+            // Tools-only turn is rare but real: a turn that emits tool_use
+            // blocks, runs them, and ends without producing further assistant
+            // text or thinking. We still need to persist the tool snapshots
+            // so refresh recovery has something to render. Without this,
+            // tool rows would only land when assistantText|thinkingText is
+            // also non-empty — losing the durability fix in the rare case.
+            const completedHasTools = !!result.tools && result.tools.length > 0
             if (
               session.channel === 'webchat' &&
-              (completedHasAssistant || completedHasThinking)
+              (completedHasAssistant || completedHasThinking || completedHasTools)
             ) {
               const peerId = session.peerId
               const assistantText = result.assistantText ?? ''
@@ -1485,6 +1629,7 @@ export class SessionManager {
                   turn: turnIndex,
                 },
                 ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
+                ...(completedHasTools ? { tools: result.tools } : {}),
               }))
             }
 
@@ -1656,12 +1801,14 @@ export class SessionManager {
                 // looking bubble.
                 const partial = parser.assistantBuf
                 const partialThinking = parser.thinkingBuf
+                const partialTools = parser.completedTools
                 const hasPartial = !!partial && partial.length > 0
                 const hasPartialThinking =
                   !!partialThinking && partialThinking.length > 0
+                const hasPartialTools = partialTools.length > 0
                 if (
                   session.channel === 'webchat' &&
-                  (hasPartial || hasPartialThinking)
+                  (hasPartial || hasPartialThinking || hasPartialTools)
                 ) {
                   const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
                   const peerId = session.peerId
@@ -1691,6 +1838,10 @@ export class SessionManager {
                     // — distinct from interrupt/crash which use the `status`
                     // field instead.
                     ...(requestId ? { requestId } : {}),
+                    // Tools that completed before the crash/interrupt — they
+                    // produced real outputs and deserve durable persistence
+                    // alongside the partial text.
+                    ...(hasPartialTools ? { tools: [...partialTools] } : {}),
                   })
                 }
                 onEvent({ kind: 'error', error: reason })
@@ -1876,6 +2027,8 @@ export class SessionManager {
           )
       }
       this.sessions.delete(sessionKey)
+      // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目让后续 recycle 找到死 session)。
+      this._sessionIdToKey.delete(s.peerId)
     }
     // Always clear resume-map (handles both live and evicted sessions)
     if (this._resumeMap.has(sessionKey)) {
@@ -1929,6 +2082,8 @@ export class SessionManager {
     // to the legacy local SQLite path that's permanently empty in v3.
     await this.awaitPendingPersistence()
     this.sessions.clear()
+    // Phase 5:整体清空时同步清反查索引。
+    this._sessionIdToKey.clear()
     for (const k of keysToClear) {
       try { this.onSessionDestroyed?.(k) } catch {}
     }
@@ -2000,6 +2155,8 @@ export class SessionManager {
                 .catch((err) => log.warn('evict releaseMux failed', { key, err: String(err) }))
             }
             this.sessions.delete(key)
+            // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目)。
+            this._sessionIdToKey.delete(s.peerId)
             if (!key.includes(':webchat:')) {
               this._resumeMap.delete(key)
               this._resumeMapTimestamps.delete(key)

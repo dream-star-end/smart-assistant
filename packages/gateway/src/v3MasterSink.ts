@@ -69,6 +69,7 @@
 import { request as undiciRequest } from 'undici'
 
 import { createLogger } from './logger.js'
+import type { TurnToolEntry } from './ccbMessageParser.js'
 import type { V3MasterRetryQueue, V3MasterRetryEntry } from './v3MasterRetryQueue.js'
 
 const log = createLogger({ module: 'v3MasterSink' })
@@ -83,6 +84,21 @@ export const SERVER_AUTHORED_PATH = '/internal/v3/server-authored-message'
 /** Body cap for one POST. Mirrors master's MAX_BODY_BYTES so the
  *  payload sanity check matches what master will accept. 256 KB. */
 const MAX_BODY_BYTES = 256 * 1024
+
+/** Mirrors master's `SCHEMA_TOOLS_MAX_LEN` in
+ *  `commercial/src/http/internalServerAuthored.ts`. Master rejects the
+ *  whole POST with 400 INVALID_BODY if `tools.length` exceeds this — and
+ *  4xx is classified as fatal here, which means a 51st tiny tool would
+ *  drop the *entire* payload including the assistant text. We enforce
+ *  the same count policy on this side and drop tools[] (best-effort
+ *  durability) to preserve the primary assistant write.
+ *
+ *  Truncate-to-50 was rejected: if tools.length > 50 we have no signal
+ *  on which 50 to keep, and the durable copy is already a redundancy of
+ *  what the client streamed. Dropping the whole array is simpler and
+ *  preserves the more important invariant (assistant-never-cut). The
+ *  parser-side per-tool caps still apply; only the count gate fires here. */
+const MAX_TOOLS_PER_PAYLOAD = 50
 
 /** HTTP timeout per single attempt — short enough that a hung master
  *  doesn't pile up turn callbacks; long enough that a slow first SQLite
@@ -103,8 +119,10 @@ export interface V3MasterSinkPayload {
    *  separate `_source: 'server'` message with `role: 'thinking'` and
    *  ts = assistantTs - 1 so it sorts immediately before the assistant
    *  message of the same turn. Body-cap policy: if combined body exceeds
-   *  MAX_BODY_BYTES, we drop thinkingText first to preserve assistant —
-   *  thinking is auxiliary debug content, assistant is the conversation. */
+   *  MAX_BODY_BYTES, we drop tools[] first (durable tool snapshot is
+   *  redundant with the live stream), then thinkingText, to preserve
+   *  assistant — thinking is auxiliary debug content, assistant is the
+   *  conversation. */
   thinkingText?: string
   /** Optional client-supplied wall-clock ms; master uses this for the
    *  message ts so all clients see the same timestamp regardless of
@@ -137,6 +155,17 @@ export interface V3MasterSinkPayload {
    *  (e.g. 'overloaded_error'). Joins `errorDetail` for the long form. */
   errorCode?: string
   errorDetail?: string
+  /** Top-level tool calls completed in this turn (parser already capped
+   *  per-tool: output ≤4KB, inputJson ≤8KB, inputPreview ≤500 chars).
+   *  Master persists each as a separate `_source: 'server'` message with
+   *  `role: 'tool'` between thinking and assistant of the same turn — that
+   *  durable copy is what survives a refresh, replacing the ephemeral
+   *  client-authored tool rows whose details are stripped on persist.
+   *  Body-cap policy (see attemptSend): tools[] is dropped before
+   *  thinkingText, because losing tool details is more recoverable than
+   *  losing the thinking trace (tools can be re-inferred from result text
+   *  in a degraded UI; thinking can't be reconstructed). */
+  tools?: TurnToolEntry[]
 }
 
 export type V3SinkErrorClass = 'transient' | 'session_missing' | 'fatal'
@@ -216,8 +245,47 @@ export async function attemptSend(
   if (payload.thinkingText && payload.thinkingText.length > 0) {
     bodyObj.thinkingText = payload.thinkingText
   }
+  if (payload.tools && payload.tools.length > 0) {
+    // Count cap (must precede byte cap): master rejects > MAX_TOOLS_PER_PAYLOAD
+    // with 400 INVALID_BODY which our classifier marks fatal — that would
+    // drop the assistant text too. Drop the durable tool snapshot here so
+    // the primary assistant write still goes through. Live streamed tool
+    // blocks are unaffected; only refresh-recovery durability degrades.
+    if (payload.tools.length > MAX_TOOLS_PER_PAYLOAD) {
+      log.warn('v3 sink dropped tools[] to fit master count cap', {
+        sessionId: payload.sessionId,
+        turnIndex: payload.turnIndex,
+        toolCount: payload.tools.length,
+        cap: MAX_TOOLS_PER_PAYLOAD,
+      })
+    } else {
+      bodyObj.tools = payload.tools
+    }
+  }
   let body = JSON.stringify(bodyObj)
   let bodyBytes = Buffer.byteLength(body, 'utf8')
+  if (bodyBytes > MAX_BODY_BYTES) {
+    const hasTools = bodyObj.tools !== undefined
+    // Truncation order (most-droppable first):
+    //   1. tools[]       — durable redundancy of streaming tool rows; client
+    //                      already has the bare tool_use/result blocks from
+    //                      the live stream, so dropping the durable copy
+    //                      degrades refresh-recovery only (no live impact).
+    //   2. thinkingText  — auxiliary debug content; conversation survives.
+    //   3. else fatal    — assistant text alone over 256 KB is a CCB bug
+    //                      worth surfacing rather than silently truncating.
+    if (hasTools) {
+      log.warn('v3 sink dropped tools[] to fit body cap', {
+        sessionId: payload.sessionId,
+        turnIndex: payload.turnIndex,
+        originalBytes: bodyBytes,
+        toolCount: (payload.tools ?? []).length,
+      })
+      delete bodyObj.tools
+      body = JSON.stringify(bodyObj)
+      bodyBytes = Buffer.byteLength(body, 'utf8')
+    }
+  }
   if (bodyBytes > MAX_BODY_BYTES) {
     const hasAssistant = (bodyObj.text as string).length > 0
     const hasThinking = bodyObj.thinkingText !== undefined

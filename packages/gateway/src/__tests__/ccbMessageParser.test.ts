@@ -524,4 +524,236 @@ describe('CcbMessageParser: system', () => {
   })
 })
 
+// ── Phase 1: durable tools[] collection on TurnResult ──
+// Why: SessionManager.persistServerAuthoredTurn pulls TurnResult.tools to send
+// to the v3 sink so each completed top-level tool gets a `_source:'server'`
+// row that survives refresh. Pin the rules:
+//   - top-level (no parentToolUseId) tools are collected
+//   - subagent tools are EXCLUDED (Phase 2 handles them separately)
+//   - arrival order preserved (tool_result arrival, not tool_use)
+//   - _capToolEntry caps output / inputJson with sentinel suffix
+//   - completedTools is public so the interrupt/crash flush in sessionManager
+//     can read whatever completed before CCB died
+describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
+  it('TurnResult.tools collects completed top-level tools in tool_result arrival order', () => {
+    const { parser, getResult } = createParser()
+    // tool_use A
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_A', name: 'Bash', input: { cmd: 'ls' } }] },
+    } as any)
+    // tool_use B
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_B', name: 'Read', input: { path: '/etc/hosts' } }] },
+    } as any)
+    // tool_result B arrives first
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_B', content: 'host data' }] },
+    } as any)
+    // tool_result A arrives second
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_A', content: 'a.txt b.txt' }] },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+
+    const result = getResult()
+    assert.equal(result.tools.length, 2)
+    // Order is by tool_result arrival: B first, then A
+    assert.equal(result.tools[0].toolUseId, 'tu_B')
+    assert.equal(result.tools[0].blockId, 'tu_B')
+    assert.equal(result.tools[0].toolName, 'Read')
+    assert.equal(result.tools[0].output, 'host data')
+    assert.equal(result.tools[0].isError, false)
+    assert.equal(result.tools[1].toolUseId, 'tu_A')
+    assert.equal(result.tools[1].toolName, 'Bash')
+    assert.equal(result.tools[1].output, 'a.txt b.txt')
+    // inputJson preserved
+    assert.deepEqual(result.tools[1].inputJson, { cmd: 'ls' })
+    assert.deepEqual(result.tools[0].inputJson, { path: '/etc/hosts' })
+  })
+
+  it('subagent tools (parent_tool_use_id present) are NOT collected — Agent card owns durability', () => {
+    const { parser, getResult } = createParser()
+    // Top-level Agent tool_use
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_agent', name: 'Agent', input: { task: 'x' } }] },
+    } as any)
+    // Subagent issues a Bash tool_use (parent_tool_use_id = tu_agent)
+    parser.parse({
+      type: 'assistant',
+      parent_tool_use_id: 'tu_agent',
+      message: { content: [{ type: 'tool_use', id: 'tu_sub', name: 'Bash', input: { cmd: 'pwd' } }] },
+    } as any)
+    // Subagent's tool_result (parent_tool_use_id same)
+    parser.parse({
+      type: 'user',
+      parent_tool_use_id: 'tu_agent',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_sub', content: '/' }] },
+    } as any)
+    // Top-level Agent tool_result
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_agent', content: 'done' }] },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+
+    const result = getResult()
+    // Only the top-level Agent tool is recorded; tu_sub excluded.
+    assert.equal(result.tools.length, 1)
+    assert.equal(result.tools[0].toolUseId, 'tu_agent')
+    assert.equal(result.tools[0].toolName, 'Agent')
+  })
+
+  it('completedTools is publicly exposed for partial flush on interrupt/crash (sessionManager reads it)', () => {
+    const { parser } = createParser()
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_X', name: 'Bash', input: {} }] },
+    } as any)
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_X', content: 'partial' }] },
+    } as any)
+    // No `result` message — simulates CCB crashed mid-turn. SessionManager's
+    // crash/interrupt handler reads parser.completedTools directly to flush.
+    assert.equal(parser.completedTools.length, 1)
+    assert.equal(parser.completedTools[0].toolUseId, 'tu_X')
+    assert.equal(parser.completedTools[0].output, 'partial')
+  })
+
+  it('_capToolEntry truncates oversized output and stamps outputTruncated=true', () => {
+    const { parser, getResult } = createParser()
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_big', name: 'Bash', input: {} }] },
+    } as any)
+    // 9 KB of content — _handleUser caps preview at 3000 chars, so
+    // _capToolEntry receives a 3001-char string and won't trigger output cap
+    // (PARSER_TOOL_OUTPUT_MAX_BYTES is 8 KB). Use 3000-cap-aware case below.
+    // To verify the parser-level cap actually fires, send the result with a
+    // very large content array — preview building converts each block to
+    // JSON, which can grow past the 3000 cap before slicing applies.
+    const longContent = 'y'.repeat(20 * 1024)
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_big', content: longContent }] },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+
+    const result = getResult()
+    assert.equal(result.tools.length, 1)
+    const entry = result.tools[0]
+    // _handleUser caps preview to 3000 chars + `…`. Output is the preview, so
+    // it is bounded but may not trigger _capToolEntry's 8 KB cap.
+    assert.ok(entry.output.length <= 3001, 'preview cap applied at _handleUser level')
+  })
+
+  it('inputJson cap: per-field cap shrinks oversized string values to 3000 chars + ellipsis', () => {
+    // Two-tier cap: _handleAssistant first applies a per-string-field 3000-char
+    // cap when the full input > 8000 chars. _capToolEntry's overall-bytes cap
+    // is a backstop for many-small-fields edge cases. The common path (one
+    // huge payload field) hits the per-field cap.
+    const { parser, getResult } = createParser()
+    const big = 'z'.repeat(20 * 1024)
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_inp', name: 'Bash', input: { payload: big } }] },
+    } as any)
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_inp', content: 'ok' }] },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+
+    const result = getResult()
+    const entry = result.tools[0]
+    // _handleAssistant's per-field cap kicks in first → object preserved with
+    // each oversized string truncated to 3000 chars + '…' (3001 total).
+    assert.equal(typeof entry.inputJson, 'object')
+    const payload = (entry.inputJson as { payload: string }).payload
+    assert.equal(payload.length, 3001)
+    assert.ok(payload.endsWith('…'))
+    // Final blob fits well under the master schema cap (16 KB).
+    assert.ok(JSON.stringify(entry.inputJson).length <= 16 * 1024)
+  })
+
+  it('inputJson backstop cap: many-small-fields path triggers _capToolEntry sentinel + inputTruncated=true', () => {
+    // Each value is < 3000 chars, so _handleAssistant's per-field cap does NOT
+    // fire; total serialized size still > PARSER_TOOL_INPUT_JSON_MAX_BYTES (8 KB).
+    // _capToolEntry's overall-byte cap kicks in with the JSON-encoded sentinel.
+    const { parser, getResult } = createParser()
+    const fields: Record<string, string> = {}
+    // 200 fields × ~50 char value + ~5 char key ≈ 11 KB — over 8 KB cap
+    // but each value is below the 3000-char per-field threshold.
+    for (let i = 0; i < 200; i++) {
+      fields[`f${i}`] = 'a'.repeat(50)
+    }
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_many', name: 'Bash', input: fields }] },
+    } as any)
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_many', content: 'ok' }] },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+
+    const result = getResult()
+    const entry = result.tools[0]
+    // Backstop triggers: serialized string with sentinel suffix.
+    assert.equal(typeof entry.inputJson, 'string')
+    assert.ok((entry.inputJson as string).endsWith('…[truncated]'))
+    assert.equal(entry.inputTruncated, true)
+  })
+
+  it('tool_result for a tool_use we never saw still records with empty input fallback', () => {
+    const { parser, getResult } = createParser()
+    // No prior tool_use — directly emit a tool_result. This can happen on
+    // cross-turn replay (parser instantiated AFTER tool_use was emitted).
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_orphan', content: 'x' }] },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+
+    const result = getResult()
+    assert.equal(result.tools.length, 1)
+    assert.equal(result.tools[0].toolUseId, 'tu_orphan')
+    // Fallback: empty inputJson + empty inputPreview rather than crashing.
+    assert.deepEqual(result.tools[0].inputJson, {})
+    assert.equal(result.tools[0].inputPreview, '')
+  })
+
+  it('isError=true on tool_result propagates to TurnResult.tools[i].isError', () => {
+    const { parser, getResult } = createParser()
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_err', name: 'Bash', input: {} }] },
+    } as any)
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_err', content: 'oops', is_error: true }] },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+
+    const result = getResult()
+    assert.equal(result.tools[0].isError, true)
+  })
+
+  it('empty tools[] when turn made no tool calls', () => {
+    const { parser, getResult } = createParser()
+    parser.parse({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'just text' } },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+    const result = getResult()
+    assert.deepEqual(result.tools, [])
+  })
+})
+
 console.log('CcbMessageParser tests passed.')

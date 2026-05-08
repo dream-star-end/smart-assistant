@@ -117,9 +117,14 @@ export function openDB() {
 // fixing.
 //
 // Cleanup rules:
-//   • ephemeral fields (_partial, _completed, output, error, bashTail,
-//     inputJson, inputPreview) — always strip; these were never meant to be
-//     persisted and their presence breaks the server-as-authority invariant.
+//   • `_partial` and `bashTail` — always strip; these are intra-stream
+//     transient state that should never survive a turn.
+//   • `_completed` / `output` / `error` / `inputJson` / `inputPreview` — strip
+//     ONLY from non-server-authored rows. Phase 1 (tool durability) makes
+//     the server the authoritative author of these fields on `role: 'tool'`
+//     rows (`_source: 'server'`); stripping them there would erase exactly
+//     the detail we just persisted. Client-authored rows still need stripping
+//     so a stale local cache doesn't shadow the server's view.
 //   • status === 'replied' on user messages — always strip; this is now
 //     derived at render time from a server-authored completed assistant tail
 //     scan.
@@ -132,12 +137,14 @@ export function _normalizeLoadedSession(sess) {
   for (const m of sess.messages) {
     if (!m || typeof m !== 'object') continue
     delete m._partial
-    delete m._completed
-    delete m.output
-    delete m.error
     delete m.bashTail
-    delete m.inputJson
-    delete m.inputPreview
+    if (m._source !== 'server') {
+      delete m._completed
+      delete m.output
+      delete m.error
+      delete m.inputJson
+      delete m.inputPreview
+    }
     if (m.role === 'user' && m.status === 'replied') delete m.status
     if (m.usage) {
       delete m.metaText

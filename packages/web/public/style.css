@@ -3325,6 +3325,16 @@ a:hover {
   overflow-x: auto;
   overflow-y: hidden;
   text-align: center;
+  /* Defense-in-depth: if KaTeX hasn't loaded yet (CDN slow / failed) the
+   * placeholder must not collapse to height:0. The streaming → final swap
+   * in messages.js used to flip from text-rendered LaTeX to empty placeholder
+   * before processRichBlocks() async-filled it, leaving a 0-height frame
+   * the iOS Safari overflow-y:auto + aria-live container failed to repaint
+   * until a scroll event. renderMarkdown() now sync-fills via
+   * katex.renderToString(); this min-height is the fallback for that fast
+   * path's failure modes (KaTeX not loaded, fallback text, error pill). */
+  min-height: 1.6em;
+  contain-intrinsic-size: auto 1.6em;
 }
 .math-block .katex-display {
   margin: 0;
@@ -3332,6 +3342,10 @@ a:hover {
 .math-inline {
   display: inline-block;
   vertical-align: baseline;
+  /* Same rationale as .math-block above — keeps inline placeholder height
+   * stable when KaTeX is still loading. */
+  min-width: 1ch;
+  min-height: 1em;
 }
 .math-fallback {
   font-family: var(--font-mono);

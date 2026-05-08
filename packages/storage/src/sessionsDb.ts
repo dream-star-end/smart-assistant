@@ -569,6 +569,33 @@ export type MessageLike = {
   [k: string]: unknown
 }
 
+/**
+ * Hard cap on the serialized `messages` JSON blob inside a single
+ * `client_sessions` row, in bytes. Writes that would push the blob past this
+ * limit are rejected with the `'oversized'` outcome BEFORE the SQLite
+ * transaction commits. The cap is the primary defence against the
+ * 2026-05-08 incident: a single 8MB+ row caused every PUT/append to spin
+ * the Node main thread on `JSON.parse` → `db.transaction()` → `JSON.stringify`,
+ * blocking the event loop until the watchdog killed the process.
+ *
+ * Sized at 4MB so a typical heavy session (long thread + a few small
+ * inline images) fits comfortably while no single session can ever again
+ * starve the event loop. Wire-level body limit (gateway PUT) is set to
+ * 2MB so the per-PUT overhead can never exceed half this budget; existing
+ * append-only writers (server-authored thinking/assistant/tool rows)
+ * contribute under 64KB per turn.
+ */
+export const MAX_SESSION_BYTES = 4 * 1024 * 1024
+
+/**
+ * Outcome of `upsertClientSession`. Replaces the older boolean return so
+ * the gateway can map oversized writes to HTTP 413 without colliding with
+ * the legitimate stale-write 409 path. `'applied'` is the only success
+ * state; the two failure modes (`'rejected_stale'`, `'oversized'`) carry
+ * distinct retry semantics and MUST stay distinguishable upstream.
+ */
+export type UpsertClientSessionResult = 'applied' | 'rejected_stale' | 'oversized'
+
 // ── Client PUT field strip ──
 //
 // `upsertClientSession` is the only place the wire-format message blob enters
@@ -599,6 +626,14 @@ const CLIENT_PUT_ALLOWED_FIELDS: ReadonlySet<string> = new Set<string>([
   'childBlocks', 'agentName', 'agentId',
   // tool messages
   'toolName', 'toolIcon', 'toolInput', 'toolUseId', 'parentToolUseId',
+  // Phase 1 tool durability — `blockId` is the per-turn stable identifier
+  // (== Anthropic tool_use_id) the client streams set on each tool message.
+  // Allowed-listing it here lets `mergePreservingServerAuthored` dedupe
+  // client tool rows against server-authored tool rows by blockId within
+  // the same turn group. Without this, the field is silently dropped on
+  // every PUT and the merge loses its dedupe key, leaving doubled bare-
+  // label tool cards next to the rich server-authored ones after refresh.
+  'blockId',
   // empty-turn / cron metadata
   '_emptyTurn', '_emptyTurnSoft', '_emptyTurnStopReason', 'cronJob',
   // client-persistent private fields (server treats opaquely)
@@ -705,6 +740,18 @@ export function _stripClientPutMessages(messages: readonly unknown[]): MessageLi
  *   5. If there are zero server-authored entries, `clientMsgs` is returned
  *      verbatim (no copy, same reference) — callers rely on this as a fast
  *      path.
+ *   6. **Phantom-tool dedupe** (Phase 1 tool durability fix): client and
+ *      server use independent tool message IDs (client uses `m-*`; server
+ *      writes `srv-${sessionId}-t${turnIndex}-tool-${blockId}`) but share
+ *      the same `blockId` (== Anthropic tool_use_id). After turn-end the
+ *      sink persists rich server-authored tool rows; the client's bare
+ *      tool rows (post-PUT-strip: only id/role/text/toolName/blockId/ts
+ *      survive) are still in the array. We drop the client tool row when
+ *      there is a server-authored tool row with the same blockId in the
+ *      same turn group. Never drops a server-authored entry. Without this
+ *      rule the user sees doubled tool cards on refresh — one rich, one
+ *      bare. Tools inside `childBlocks` (subagent tools, Phase 2) are
+ *      untouched because they are nested, not top-level merged[] entries.
  */
 export function mergePreservingServerAuthored<T extends MessageLike>(
   serverSideMsgs: readonly T[],
@@ -767,48 +814,77 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   const deduped: T[] = []
   const isAssistant = (m: T) => (m as { role?: string }).role === 'assistant'
   const isThinking = (m: T) => (m as { role?: string }).role === 'thinking'
+  const isTool = (m: T) => (m as { role?: string }).role === 'tool'
   const isTurnBoundary = (m: T) => {
     const role = (m as { role?: string }).role
     return role === 'user' || role === 'system'
   }
   // First pass: compute per-index turn group id, and whether that group has
-  // any server-authored assistant or thinking message.
+  // any server-authored assistant / thinking message + the set of server-
+  // authored tool blockIds in that group (rule 6, Phase 1 tool durability).
   const turnGroup: number[] = new Array(merged.length)
   const groupHasServerAsst: boolean[] = []
   const groupHasServerThinking: boolean[] = []
+  const groupServerToolBlockIds: Array<Set<string>> = []
   let groupId = 0
   let curGroupServerAsst = false
   let curGroupServerThinking = false
+  let curGroupServerToolBlockIds = new Set<string>()
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (cur && isTurnBoundary(cur)) {
       // Close previous group, open a new one.
       groupHasServerAsst.push(curGroupServerAsst)
       groupHasServerThinking.push(curGroupServerThinking)
+      groupServerToolBlockIds.push(curGroupServerToolBlockIds)
       groupId++
       curGroupServerAsst = false
       curGroupServerThinking = false
+      curGroupServerToolBlockIds = new Set<string>()
     }
     turnGroup[i] = groupId
     if (cur && cur._source === 'server') {
       if (isAssistant(cur)) curGroupServerAsst = true
       else if (isThinking(cur)) curGroupServerThinking = true
+      else if (isTool(cur)) {
+        const bid = (cur as { blockId?: unknown }).blockId
+        if (typeof bid === 'string' && bid.length > 0) {
+          curGroupServerToolBlockIds.add(bid)
+        }
+      }
     }
   }
   groupHasServerAsst.push(curGroupServerAsst)
   groupHasServerThinking.push(curGroupServerThinking)
+  groupServerToolBlockIds.push(curGroupServerToolBlockIds)
 
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (!cur) { deduped.push(cur); continue }
-    // Keep server-authored messages and non-(assistant|thinking) messages.
-    if (cur._source === 'server' || (!isAssistant(cur) && !isThinking(cur))) {
+    // Keep server-authored messages and non-(assistant|thinking|tool) messages.
+    if (
+      cur._source === 'server' ||
+      (!isAssistant(cur) && !isThinking(cur) && !isTool(cur))
+    ) {
       deduped.push(cur)
       continue
     }
     const g = turnGroup[i]
     if (isAssistant(cur) && groupHasServerAsst[g]) continue
     if (isThinking(cur) && groupHasServerThinking[g]) continue
+    if (isTool(cur)) {
+      // Drop client tool only when a server tool with matching blockId
+      // exists in the same group. Tools without blockId (legacy, or post-
+      // PUT-strip from a pre-allow-list deploy) are kept — better to show
+      // a doubled card on rare legacy data than to drop user-visible
+      // detail wholesale.
+      const bid = (cur as { blockId?: unknown }).blockId
+      if (
+        typeof bid === 'string' &&
+        bid.length > 0 &&
+        groupServerToolBlockIds[g].has(bid)
+      ) continue
+    }
     deduped.push(cur)
   }
   return deduped
@@ -992,15 +1068,15 @@ export function normalizeAndAssignSeqs<T extends MessageLike>(
  * delegate merging to {@link mergePreservingServerAuthored} so the policy is
  * testable in isolation.
  */
-export async function upsertClientSession(session: ClientSession, baseSyncedAt = 0): Promise<boolean> {
+export async function upsertClientSession(session: ClientSession, baseSyncedAt = 0): Promise<UpsertClientSessionResult> {
   const db = await getSessionsDb()
-  const txn = db.transaction(() => {
+  const txn = db.transaction((): UpsertClientSessionResult => {
     const existing = db.prepare(
       'SELECT messages, updated_at, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
     ).get(session.id, session.userId) as { messages: string; updated_at: number; next_seq: number | null } | undefined
 
     // Reject stale writes (same optimistic concurrency check as the pre-transaction version)
-    if (existing && existing.updated_at > baseSyncedAt) return false
+    if (existing && existing.updated_at > baseSyncedAt) return 'rejected_stale'
 
     let oldMsgs: MessageLike[] = []
     if (existing) {
@@ -1019,6 +1095,19 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
       ? existing.next_seq
       : 1
     const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(oldMsgs, merged, currentNextSeq)
+
+    // Size guard — see MAX_SESSION_BYTES. Reject BEFORE the INSERT so an
+    // oversized incoming PUT can never grow the row, and so subsequent reads
+    // never have to JSON.parse a blob big enough to stall the event loop.
+    // The check uses Buffer.byteLength so multi-byte UTF-8 characters
+    // (Chinese text, emoji) count against the same budget the disk row will
+    // occupy. JSON.stringify is unavoidable here — it's the only way to
+    // know the post-merge blob size — but since we already had to compute
+    // it for the INSERT below, this adds no new serialization overhead.
+    const finalJson = JSON.stringify(finalMessages)
+    if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
+      return 'oversized'
+    }
 
     const result = db.prepare(`
       INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq)
@@ -1042,13 +1131,17 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
       pinned: session.pinned ? 1 : 0,
       createdAt: session.createdAt,
       lastAt: session.lastAt,
-      messages: JSON.stringify(finalMessages),
+      messages: finalJson,
       messageCount: finalMessages.length,
       updatedAt: session.updatedAt,
       baseSyncedAt,
       nextSeq,
     })
-    return result.changes > 0
+    // result.changes === 0 happens when the ON CONFLICT WHERE filter rejected
+    // the UPDATE because client_sessions.updated_at > @baseSyncedAt — i.e. a
+    // racing concurrent write committed between our SELECT (above) and this
+    // INSERT. Surface as the same stale outcome so the gateway returns 409.
+    return result.changes > 0 ? 'applied' : 'rejected_stale'
   })
   return txn()
 }
@@ -1075,7 +1168,7 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
  */
 export type ServerAuthoredAppendResult =
   | { applied: true }
-  | { applied: false; reason: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' | 'oversized' }
 
 /**
  * Synchronous core: append a server-authored message to a client session.
@@ -1140,6 +1233,17 @@ function _appendServerAuthoredCore(
   const currentNextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
   const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, result.messages, currentNextSeq)
 
+  // Size guard — see MAX_SESSION_BYTES. Without this, a session that has
+  // already grown past the budget (e.g. via legacy oversized rows that
+  // pre-date this guard) would let the sink keep appending forever. We
+  // reject before the UPDATE so the row never gets larger; the caller's
+  // durable wrapper / replay treats `'oversized'` as terminal so the
+  // outbox doesn't loop forever on the same row.
+  const finalJson = JSON.stringify(finalMessages)
+  if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
+    return { applied: false, reason: 'oversized' }
+  }
+
   const now = Date.now()
   // Belt-and-braces: the SELECT above already gated on `deleted_at !== null`
   // inside the same BEGIN IMMEDIATE transaction, so a concurrent soft-delete
@@ -1150,7 +1254,7 @@ function _appendServerAuthoredCore(
   // instead of silently writing into a tombstone.
   const update = db.prepare(
     'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-  ).run(JSON.stringify(finalMessages), finalMessages.length, now, now, nextSeq, sessId, userId)
+  ).run(finalJson, finalMessages.length, now, now, nextSeq, sessId, userId)
   if (update.changes !== 1) {
     // Race: row was deleted between SELECT and UPDATE within the same txn.
     // Should be unreachable under BEGIN IMMEDIATE, but if SQLite's transaction
@@ -1170,12 +1274,12 @@ export async function appendServerAuthoredMessage(
      *  (mobile-stream durability for Sonnet 4.6 adaptive thinking). Same
      *  storage path as 'assistant'; phantom-dedupe applies independently
      *  to each role inside `mergePreservingServerAuthored`. */
-    role: 'assistant' | 'user' | 'system' | 'thinking'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
     text?: string
     ts?: number
     [k: string]: unknown
   },
-): Promise<{ applied: boolean; reason?: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' }> {
+): Promise<{ applied: boolean; reason?: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' | 'oversized' }> {
   const db = await getSessionsDb()
   const txn = db.transaction((): ServerAuthoredAppendResult => {
     return _appendServerAuthoredCore(db, sessId, userId, message as MessageLike & { id: string })
@@ -1217,7 +1321,7 @@ export async function appendServerAuthoredMessage(
 
 export type AppendForRequestResult =
   | { applied: true }
-  | { applied: false; reason: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'session_not_found' | 'session_deleted' | 'already_exists' | 'malformed' | 'oversized' }
 
 /**
  * Append a server-authored message that may need a costCredits patch
@@ -1255,13 +1359,13 @@ export async function appendServerAuthoredMessageForRequest(
     // 2. Append message via shared core.
     const r = _appendServerAuthoredCore(db, sessId, userId, msgToWrite)
     if (!r.applied) {
-      // session_deleted is terminal: no future retry will ever drain this
-      // pending row, so it would sit until the 24h aging sweep and add
-      // observable noise (pending-pending_age dashboards, alerting). Clear it
-      // here. session_not_found is intentionally NOT cleared — the frontend's
-      // debounced PUT may still land, after which a retry of this request
-      // will succeed and need the pending value.
-      if (pending && r.reason === 'session_deleted') {
+      // session_deleted / oversized are both terminal: no future retry will
+      // ever drain this pending row, so it would sit until the 24h aging
+      // sweep and add observable noise (pending-pending_age dashboards,
+      // alerting). Clear it here. session_not_found is intentionally NOT
+      // cleared — the frontend's debounced PUT may still land, after which
+      // a retry of this request will succeed and need the pending value.
+      if (pending && (r.reason === 'session_deleted' || r.reason === 'oversized')) {
         db.prepare(
           'DELETE FROM pending_usage_patches WHERE request_id = ? AND user_id = ?'
         ).run(requestId, userId)
@@ -1363,11 +1467,28 @@ export async function appendCostCredits(
           }
           const next: MessageLike[] = [...msgs]
           next[idx] = patched
+          // Size guard — same MAX_SESSION_BYTES rule as upsert / append paths.
+          // costCredits patch is small (16 chars typical) so this almost
+          // never fires in practice, but a row that's already past the cap
+          // would still grow by the `_seq` bump and a new key in `usage`.
+          // Refusing the in-place UPDATE means the cost value is "lost" for
+          // this row, but the alternative — letting an already-oversized row
+          // grow further — is worse: it perpetuates the same JSON.parse
+          // stall this fix targets. We do NOT fall through to pending in
+          // this branch because the map row already pinpointed this
+          // session+message; pending is a "haven't found target yet"
+          // mechanism, not a "target full" one. Drop with a noop result
+          // and rely on observability (no metric here yet — the caller
+          // logs the unexpected outcome).
+          const nextJson = JSON.stringify(next)
+          if (Buffer.byteLength(nextJson, 'utf8') > MAX_SESSION_BYTES) {
+            return { applied: 'noop' }
+          }
           const nowMs = Date.now()
           db.prepare(
             'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1 WHERE id = ? AND user_id = ?'
           ).run(
-            JSON.stringify(next),
+            nextJson,
             nowMs,
             nowMs,
             mapRow.session_id,
@@ -1467,7 +1588,7 @@ export interface QueuedMessage {
   userId: string
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system' | 'thinking'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
     text?: string
     ts?: number
     status?: 'completed' | 'interrupted' | 'crashed'
@@ -1531,6 +1652,10 @@ export async function queueMessageToOutbox(entry: QueuedMessage): Promise<void> 
  *     same terminal state on every startup
  *   { applied: false, reason: 'already_exists' }           — idempotent skip
  *   { applied: false, reason: 'malformed' }                — bad row data
+ *   { applied: false, reason: 'oversized' }                — terminal: the
+ *     post-write blob would exceed MAX_SESSION_BYTES. Same drop-don't-queue
+ *     reasoning as session_deleted: replay will hit the same cap forever
+ *     until the row is downsized by the A.3 admin script.
  *   { applied: false, reason: 'queued_to_outbox', error } — either the row
  *     doesn't exist yet (first-turn PUT race; outbox replay will succeed
  *     once the client PUT lands) OR the DB write itself threw (disk full,
@@ -1541,14 +1666,14 @@ export async function appendServerAuthoredMessageDurable(
   userId: string,
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system' | 'thinking'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
     text?: string
     ts?: number
     [k: string]: unknown
   },
 ): Promise<
   | { applied: true }
-  | { applied: false; reason: 'already_exists' | 'malformed' | 'session_deleted' }
+  | { applied: false; reason: 'already_exists' | 'malformed' | 'session_deleted' | 'oversized' }
   | { applied: false; reason: 'queued_to_outbox'; error: string }
 > {
   try {
@@ -1579,11 +1704,19 @@ export async function appendServerAuthoredMessageDurable(
     if (r.reason === 'session_deleted') {
       return { applied: false, reason: 'session_deleted' }
     }
+    // oversized is also terminal: the row already exceeds MAX_SESSION_BYTES
+    // and any further append would push it further past the cap. Replay
+    // would re-hit the cap on every startup. Drop here; admin must run the
+    // A.3 strip-attachments script to bring the row back under budget.
+    if (r.reason === 'oversized') {
+      return { applied: false, reason: 'oversized' }
+    }
     // Upstream's signature types `reason` as optional, but every applied:false
     // branch above sets one of {'session_not_found','session_deleted',
-    // 'already_exists','malformed'}. We've handled 'session_not_found' and
-    // 'session_deleted'; the rest fall through here. Default to 'malformed'
-    // if reason is somehow missing (unreachable in practice).
+    // 'already_exists','malformed','oversized'}. We've handled the three
+    // terminal-with-special-handling reasons explicitly; the rest
+    // ('already_exists' | 'malformed') fall through here. Default to
+    // 'malformed' if reason is somehow missing (unreachable in practice).
     return { applied: false, reason: r.reason ?? 'malformed' }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -1617,7 +1750,8 @@ export async function appendServerAuthoredMessageDurable(
  *      session row STILL doesn't exist (the original first-turn PUT race
  *      never resolved); `session_deleted` — row exists but was soft-deleted
  *      while queued, terminal; `already_exists` — duplicate from a prior
- *      partial replay) are dropped.
+ *      partial replay; `oversized` — row past MAX_SESSION_BYTES, replay
+ *      can't shrink it) are dropped.
  *   4. Entries whose DB write still throws are kept in the file for a
  *      future retry.
  *   5. After processing, atomically rewrite the file with survivors (or
@@ -1662,11 +1796,15 @@ export async function replayMsgOutbox(): Promise<{
         r.reason === 'already_exists' ||
         r.reason === 'session_not_found' ||
         r.reason === 'session_deleted' ||
-        r.reason === 'malformed'
+        r.reason === 'malformed' ||
+        r.reason === 'oversized'
       ) {
         // session_deleted is a terminal state same as session_not_found
         // post-replay (the row exists but is soft-deleted, so retrying
-        // forever is pointless — drop and move on).
+        // forever is pointless — drop and move on). 'oversized' is
+        // similarly terminal: blob already past MAX_SESSION_BYTES, replay
+        // can never make it smaller — drop and rely on A.3 admin strip
+        // to bring the row back under budget.
         dropped++
       } else {
         survivors.push(queuedMessageToLine(entry).trimEnd())

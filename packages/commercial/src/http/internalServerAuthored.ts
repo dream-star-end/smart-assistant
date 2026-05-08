@@ -80,6 +80,56 @@ const MAX_BODY_BYTES = 256 * 1024;
  *  self-host listener and the mTLS remote-host listener. */
 export const SERVER_AUTHORED_PATH = "/internal/v3/server-authored-message";
 
+/** Per-tool field caps. Container-side `_capToolEntry` already enforces
+ *  these by UTF-8 byte budget; the schema caps are slightly looser char
+ *  budgets to accommodate the trailing `…[truncated]` sentinel that
+ *  pushes the encoded length a few chars past the byte cap. */
+const SCHEMA_TOOL_OUTPUT_MAX_CHARS = 8 * 1024;
+const SCHEMA_TOOL_INPUT_JSON_MAX_CHARS = 16 * 1024;
+const SCHEMA_TOOL_INPUT_PREVIEW_MAX_CHARS = 2_000;
+/** Defensive upper bound on number of tool entries one turn can carry. A
+ *  Sonnet 4.6 turn realistically tops out around 12-15 tools (parallel
+ *  Read/Grep fan-outs + a few Edits); 50 leaves plenty of headroom. */
+const SCHEMA_TOOLS_MAX_LEN = 50;
+
+/** One completed tool call within the turn. Mirrors the gateway-side
+ *  `TurnToolEntry` shape. Master persists each as a server-authored row
+ *  with `role: 'tool'`, sandwiched between thinking and assistant by ts. */
+const ToolEntrySchema = z
+  .object({
+    toolUseId: z.string().min(1).max(128),
+    blockId: z.string().min(1).max(128),
+    toolName: z.string().min(1).max(128),
+    /** Tool input — structured object preferred; string allowed when the
+     *  client's `_capToolEntry` truncated to a JSON-encoded sentinel string. */
+    inputJson: z.unknown(),
+    inputPreview: z.string().max(SCHEMA_TOOL_INPUT_PREVIEW_MAX_CHARS),
+    output: z.string().max(SCHEMA_TOOL_OUTPUT_MAX_CHARS),
+    isError: z.boolean(),
+    durationMs: z.number().int().min(0),
+    ts: z.number().int().min(0),
+    inputTruncated: z.boolean().optional(),
+    outputTruncated: z.boolean().optional(),
+  })
+  .strict()
+  .refine(
+    (v) => {
+      // inputJson size cap (post-decode). We're more lenient here than at
+      // the parser side — the client already bounded UTF-8 bytes; we just
+      // refuse anything wildly larger that would inflate the messages JSON
+      // blob disproportionately.
+      try {
+        const s = typeof v.inputJson === "string"
+          ? v.inputJson
+          : JSON.stringify(v.inputJson ?? {});
+        return s.length <= SCHEMA_TOOL_INPUT_JSON_MAX_CHARS;
+      } catch {
+        return false;
+      }
+    },
+    { message: "inputJson exceeds size cap or is unserializable", path: ["inputJson"] },
+  );
+
 /** Request body — strict, unknown keys rejected. peerId / userId / id / role
  *  are NOT accepted from the wire to keep the trust boundary tight.
  *
@@ -128,16 +178,25 @@ const BodySchema = z
      *  `_errorDetail` for the long form. */
     errorCode: z.string().max(64).optional(),
     errorDetail: z.string().max(2048).optional(),
+    /** Top-level tool calls completed in this turn. Each persists as a
+     *  separate `_source: 'server'` message with `role: 'tool'` between
+     *  thinking and assistant of the same turn (ts < assistantTs). The
+     *  durable copy is what survives refresh — replacing the ephemeral
+     *  client-authored tool rows whose details are stripped on persist. */
+    tools: z.array(ToolEntrySchema).max(SCHEMA_TOOLS_MAX_LEN).optional(),
   })
   .strict()
   .refine(
-    (v) => v.text.length > 0 || v.thinkingText !== undefined,
-    { message: "either text or thinkingText must be non-empty" },
+    (v) =>
+      v.text.length > 0 ||
+      v.thinkingText !== undefined ||
+      (v.tools !== undefined && v.tools.length > 0),
+    { message: "either text, thinkingText, or tools[] must be non-empty" },
   )
   .refine(
     // requestId is required for assistant writes (text non-empty); on
-    // thinking-only turns the cost path doesn't fire and requestId is
-    // unused, so we relax the requirement there.
+    // thinking-only / tools-only turns the cost path doesn't fire and
+    // requestId is unused, so we relax the requirement there.
     (v) => v.text.length === 0 || typeof v.requestId === "string",
     { message: "requestId is required when text is non-empty", path: ["requestId"] },
   );
@@ -145,20 +204,22 @@ const BodySchema = z
 export type ServerAuthoredBody = z.infer<typeof BodySchema>;
 
 /** Server-authored message shape submitted to storage. Assistant writes may
- *  carry usage/_truncated/_errorCode/_errorDetail; thinking writes never do.
- *  All fields except `id`, `role`, `text`, `ts` are optional and merged into
+ *  carry usage/_truncated/_errorCode/_errorDetail; thinking writes never do;
+ *  tool writes carry the toolName/blockId/inputJson/output/error/durationMs
+ *  cluster aligned with the frontend's `_buildToolCard` field reads. All
+ *  fields except `id`, `role`, `text`, `ts` are optional and merged into
  *  the persisted message blob as-is. */
 export type ServerAuthoredMessageInput = {
   id: string;
   /** 'thinking' for Phase 0.4 reasoning persistence; 'assistant' for the
-   *  user-visible turn text. Same idempotency / session_not_found semantics
-   *  for both. */
-  role: "assistant" | "thinking";
+   *  user-visible turn text; 'tool' for refresh-durable tool details
+   *  (Phase 1 — replaces the ephemeral client-stripped tool rows). */
+  role: "assistant" | "thinking" | "tool";
   text: string;
   ts: number;
   status: "completed" | "interrupted" | "crashed";
   /** Token usage from gateway-side stream finalizer. costCredits joins
-   *  later via storage's `appendCostCredits` patch. */
+   *  later via storage's `appendCostCredits` patch. Assistant role only. */
   usage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -170,11 +231,28 @@ export type ServerAuthoredMessageInput = {
   _truncated?: boolean;
   _errorCode?: string;
   _errorDetail?: string;
+  // ── role: 'tool' fields ────────────────────────────────────────────
+  // Field names align with the frontend's `_buildToolCard` reads
+  // (msg.toolName / msg.blockId / msg.inputJson / msg.output / msg.error /
+  // msg.durationMs / msg._completed). The wire schema uses `isError`
+  // (Anthropic protocol convention); we translate to `error` here so the
+  // stored blob renders identically to a client-authored tool message
+  // after merge.
+  toolName?: string;
+  blockId?: string;
+  inputJson?: unknown;
+  inputPreview?: string;
+  output?: string;
+  error?: boolean;
+  durationMs?: number;
+  inputTruncated?: boolean;
+  outputTruncated?: boolean;
+  _completed?: boolean;
 };
 
 export type ServerAuthoredStorageResult = {
   applied: boolean;
-  reason?: "session_not_found" | "session_deleted" | "already_exists" | "malformed";
+  reason?: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized";
 };
 
 /** Storage interface — narrowed to just the calls we need so unit tests can
@@ -196,7 +274,7 @@ export interface ServerAuthoredStorage {
     message: ServerAuthoredMessageInput,
   ): Promise<
     | { applied: true }
-    | { applied: false; reason: "session_not_found" | "session_deleted" | "already_exists" | "malformed" }
+    | { applied: false; reason: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized" }
   >;
 }
 
@@ -312,30 +390,43 @@ export function makeServerAuthoredHandler(
     // 3) Persist
     //
     // Decision matrix (Phase 0.4 thinking durability + 2026-05-07
-    // session_deleted split):
-    //   thinking-only (text empty, thinkingText present):
-    //     - thinking applied         → 200 ok
-    //     - thinking already_exists  → 200 idempotent
-    //     - thinking session_n_f     → 404 (sink retries under TTL)
-    //     - thinking session_deleted → 410 (sink fatal-drops; terminal)
-    //     - thinking storage_threw   → 500 (sink retries; thinking is the
-    //                                       only data so we cannot drop it)
-    //     - thinking malformed       → 500 (master-side data issue)
-    //   has assistant (text non-empty, thinkingText optional):
-    //     - thinking write best-effort: storage_threw is logged + metric
-    //       'error'/thinking but does NOT block assistant write. degrade
-    //       to "thinking dropped, assistant preserved" — same body that
-    //       the sink already submitted; retrying the whole turn would
-    //       just hit assistant `already_exists` and re-fail thinking.
-    //     - assistant outcome decides HTTP status:
-    //         applied         → 200 ok
-    //         already_exists  → 200 idempotent
-    //         session_n_f     → 404 (retryable race)
-    //         session_deleted → 410 (terminal, sink fatal-drops)
-    //         storage_threw   → 500
-    //         malformed       → 500
+    // session_deleted split + Phase 1 tool durability):
+    //
+    //   Three optional sections per turn: thinking, tools[], assistant.
+    //   Schema refine guarantees at least one is non-empty. Write order:
+    //     thinking → tools[] → assistant
+    //   so that ts ordering naturally sorts the same way (thinking ts <
+    //   each tool ts < assistant ts), matching how the live stream shows
+    //   them and what merge-preserving-server-authored expects.
+    //
+    //   Best-effort vs primary:
+    //     - When hasAssistant: assistant write decides HTTP outcome;
+    //       thinking + tools are best-effort (storage_threw logged +
+    //       metric, never block assistant).
+    //     - When !hasAssistant && hasThinking: thinking decides HTTP;
+    //       tools are best-effort.
+    //     - When !hasAssistant && !hasThinking (tools-only): first tool
+    //       write decides HTTP; remaining tools are best-effort.
+    //
+    //   Outcomes (per primary section):
+    //     - applied         → 200 ok
+    //     - already_exists  → 200 idempotent
+    //     - session_n_f     → 404 (sink retries under TTL — frontend's
+    //                              debounced PUT may still be in flight)
+    //     - session_deleted → 410 (sink fatal-drops; terminal)
+    //     - storage_threw   → 500 (sink retries)
+    //     - malformed       → 500 (master-side data issue)
+    //
+    // ts policy: assistantTs = body.createdAt ?? now(). Tools go at
+    // `assistantTs - tools.length + i` (i = 0..N-1) so they sort
+    // before assistant in arrival order. Thinking goes at
+    // `assistantTs - tools.length - 1` so it sorts before all tools.
+    // SQLite ts is integer ms; subtracting integer offsets keeps that
+    // invariant (no decimal drift).
     const baseTs = body.createdAt ?? now();
-    const thinkingTs = baseTs - 1;
+    const tools = body.tools ?? [];
+    const toolsCount = tools.length;
+    const thinkingTs = baseTs - toolsCount - 1;
     const assistantTs = baseTs;
     const messageId = `srv-${body.sessionId}-t${body.turnIndex}`;
     const thinkingMessageId = `srv-${body.sessionId}-t${body.turnIndex}-thinking`;
@@ -343,8 +434,9 @@ export function makeServerAuthoredHandler(
     const hasAssistant = body.text.length > 0;
     const hasThinking =
       body.thinkingText !== undefined && body.thinkingText.length > 0;
+    const hasTools = toolsCount > 0;
 
-    // ── Write thinking first (if present) so its ts < assistant ts ──
+    // ── Write thinking first (if present) so its ts < tool ts < assistant ts ──
     type StorageResult = Awaited<
       ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>
     >;
@@ -374,7 +466,7 @@ export function makeServerAuthoredHandler(
     }
 
     /** Emit the per-role thinking metric exactly once per request. Pull-out
-     *  helper so all 9+ exit paths in this handler can call it consistently. */
+     *  helper so all exit paths in this handler can call it consistently. */
     const emitThinkingMetric = (): void => {
       if (!hasThinking) return;
       if (thinkingThrew) {
@@ -388,14 +480,206 @@ export function makeServerAuthoredHandler(
         metric("reject_session_missing", "thinking");
       else if (r.reason === "session_deleted")
         metric("reject_session_deleted", "thinking");
+      else if (r.reason === "oversized")
+        metric("reject_oversized", "thinking");
       else metric("error", "thinking"); // malformed
     };
 
-    // ── Branch A: thinking-only — HTTP status driven by thinking result ──
+    // ── Write tools after thinking, before assistant ──
+    //
+    // Each tool gets a stable per-turn id `srv-${sessionId}-t${turnIndex}-tool-${blockId}`
+    // (turnIndex included to avoid collision when the same blockId is
+    // reused across turns, e.g. when a runner generates non-globally-unique
+    // ids). When tools-only (!hasAssistant && !hasThinking), the first
+    // tool's outcome is the primary; remaining are best-effort. Otherwise
+    // ALL tool writes are best-effort.
+    //
+    // We always run all writes sequentially — parallel would need separate
+    // SQLite transactions and risks `next_seq` contention; the per-write
+    // latency is dominated by the messages JSON serialization, so a small
+    // N-tool turn finishes in under ~5ms total.
+    const toolResults: (StorageResult | null)[] = new Array(toolsCount).fill(null);
+    const toolThrew: boolean[] = new Array(toolsCount).fill(false);
+    const toolsOnlyDecidesHttp = !hasAssistant && !hasThinking && hasTools;
+    for (let i = 0; i < toolsCount; i++) {
+      const t = tools[i]!;
+      const toolMessageId = `srv-${body.sessionId}-t${body.turnIndex}-tool-${t.blockId}`;
+      const toolTs = baseTs - toolsCount + i;
+      try {
+        toolResults[i] = await deps.storage.appendServerAuthoredMessage(
+          body.sessionId,
+          userId,
+          {
+            id: toolMessageId,
+            role: "tool",
+            // Storage stores `text` as a top-level field; mirror output here so
+            // legacy renderers that fall back to msg.text still see content.
+            // Frontend tool card prefers msg.output (set just below).
+            text: t.output,
+            ts: toolTs,
+            status: body.status,
+            toolName: t.toolName,
+            blockId: t.blockId,
+            inputJson: t.inputJson,
+            inputPreview: t.inputPreview,
+            output: t.output,
+            // Wire field is `isError` (Anthropic convention); stored field is
+            // `error` (matches frontend's `msg.error` reads in _buildToolCard).
+            error: t.isError,
+            durationMs: t.durationMs,
+            ...(t.inputTruncated ? { inputTruncated: true } : {}),
+            ...(t.outputTruncated ? { outputTruncated: true } : {}),
+            _completed: true,
+          },
+        );
+      } catch (err) {
+        toolThrew[i] = true;
+        userLog.error("tool_storage_threw", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+          toolBlockId: t.blockId,
+          toolName: t.toolName,
+          err: err as Error,
+        });
+        // First-tool throw on tools-only path — remaining writes still
+        // attempted so we get them in best-effort, but HTTP outcome will
+        // surface 500 below.
+      }
+    }
+
+    /** Emit per-tool metrics once per request, mirroring emitThinkingMetric. */
+    const emitToolsMetric = (): void => {
+      for (let i = 0; i < toolsCount; i++) {
+        if (toolThrew[i]) {
+          metric("error", "tool");
+          continue;
+        }
+        const r = toolResults[i];
+        if (!r) {
+          metric("error", "tool");
+          continue;
+        }
+        if (r.applied) metric("ok", "tool");
+        else if (r.reason === "already_exists") metric("deduped", "tool");
+        else if (r.reason === "session_not_found")
+          metric("reject_session_missing", "tool");
+        else if (r.reason === "session_deleted")
+          metric("reject_session_deleted", "tool");
+        else if (r.reason === "oversized")
+          metric("reject_oversized", "tool");
+        else metric("error", "tool"); // malformed
+      }
+    };
+
+    // ── Branch A: no-assistant path — thinking-only, tools-only, or both ──
+    //
+    // HTTP outcome priority:
+    //   hasThinking → thinking decides HTTP, tools are best-effort.
+    //   tools-only  → first tool decides HTTP, remaining tools best-effort.
     if (!hasAssistant) {
-      // Schema refine guarantees hasThinking here.
-      if (thinkingThrew) {
+      // Schema refine guarantees hasThinking || hasTools here.
+      if (hasThinking) {
+        if (thinkingThrew) {
+          metric("error", "thinking");
+          emitToolsMetric();
+          sendJsonError(
+            res,
+            500,
+            "STORAGE_ERROR",
+            "storage write failed",
+            requestId,
+          );
+          return;
+        }
+        const r = thinkingResult!;
+        if (r.applied) {
+          metric("ok", "thinking");
+          emitToolsMetric();
+          sendJsonOk(res, 200, { ok: true }, requestId);
+          return;
+        }
+        if (r.reason === "already_exists") {
+          metric("deduped", "thinking");
+          emitToolsMetric();
+          sendJsonOk(res, 200, { ok: true, idempotent: true }, requestId);
+          return;
+        }
+        if (r.reason === "session_not_found") {
+          userLog.info("thinking_session_not_found", {
+            sessionId: body.sessionId,
+            turnIndex: body.turnIndex,
+          });
+          metric("reject_session_missing", "thinking");
+          emitToolsMetric();
+          sendJsonError(
+            res,
+            404,
+            "SESSION_NOT_FOUND",
+            "no client_sessions row for sessionId+userId",
+            requestId,
+          );
+          return;
+        }
+        if (r.reason === "session_deleted") {
+          userLog.info("thinking_session_deleted", {
+            sessionId: body.sessionId,
+            turnIndex: body.turnIndex,
+          });
+          metric("reject_session_deleted", "thinking");
+          emitToolsMetric();
+          sendJsonError(
+            res,
+            410,
+            "SESSION_DELETED",
+            "client_sessions row is soft-deleted",
+            requestId,
+          );
+          return;
+        }
+        if (r.reason === "oversized") {
+          // Master row is already past MAX_SESSION_BYTES; appending this
+          // thinking row would push it further. Terminal — admin must run
+          // the strip-attachments script before this turn can be persisted.
+          // 413 (vs 500) so the container's anthropicProxy treats it as a
+          // give-up-don't-retry signal and drops the entry from its sink
+          // queue rather than spinning on a row it can never write.
+          userLog.warn("thinking_session_oversized", {
+            sessionId: body.sessionId,
+            turnIndex: body.turnIndex,
+          });
+          metric("reject_oversized", "thinking");
+          emitToolsMetric();
+          sendJsonError(
+            res,
+            413,
+            "SESSION_OVERSIZED",
+            "client_sessions row exceeds MAX_SESSION_BYTES; admin must strip before further writes",
+            requestId,
+          );
+          return;
+        }
+        // malformed
+        userLog.error("master_row_malformed_thinking", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+        });
         metric("error", "thinking");
+        emitToolsMetric();
+        sendJsonError(
+          res,
+          500,
+          "ROW_MALFORMED",
+          "master row data corrupt",
+          requestId,
+        );
+        return;
+      }
+
+      // tools-only path — first tool's outcome decides HTTP. Remaining
+      // tools' outcomes are still emitted via emitToolsMetric (which
+      // covers index 0 too — counted exactly once).
+      if (toolThrew[0]) {
+        emitToolsMetric();
         sendJsonError(
           res,
           500,
@@ -405,23 +689,23 @@ export function makeServerAuthoredHandler(
         );
         return;
       }
-      const r = thinkingResult!;
-      if (r.applied) {
-        metric("ok", "thinking");
-        sendJsonOk(res, 200, { ok: true }, requestId);
+      const r0 = toolResults[0]!;
+      if (r0.applied || r0.reason === "already_exists") {
+        emitToolsMetric();
+        sendJsonOk(
+          res,
+          200,
+          r0.applied ? { ok: true } : { ok: true, idempotent: true },
+          requestId,
+        );
         return;
       }
-      if (r.reason === "already_exists") {
-        metric("deduped", "thinking");
-        sendJsonOk(res, 200, { ok: true, idempotent: true }, requestId);
-        return;
-      }
-      if (r.reason === "session_not_found") {
-        userLog.info("thinking_session_not_found", {
+      if (r0.reason === "session_not_found") {
+        userLog.info("tools_only_session_not_found", {
           sessionId: body.sessionId,
           turnIndex: body.turnIndex,
         });
-        metric("reject_session_missing", "thinking");
+        emitToolsMetric();
         sendJsonError(
           res,
           404,
@@ -431,12 +715,12 @@ export function makeServerAuthoredHandler(
         );
         return;
       }
-      if (r.reason === "session_deleted") {
-        userLog.info("thinking_session_deleted", {
+      if (r0.reason === "session_deleted") {
+        userLog.info("tools_only_session_deleted", {
           sessionId: body.sessionId,
           turnIndex: body.turnIndex,
         });
-        metric("reject_session_deleted", "thinking");
+        emitToolsMetric();
         sendJsonError(
           res,
           410,
@@ -446,12 +730,27 @@ export function makeServerAuthoredHandler(
         );
         return;
       }
+      if (r0.reason === "oversized") {
+        userLog.warn("tools_only_session_oversized", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+        });
+        emitToolsMetric();
+        sendJsonError(
+          res,
+          413,
+          "SESSION_OVERSIZED",
+          "client_sessions row exceeds MAX_SESSION_BYTES; admin must strip before further writes",
+          requestId,
+        );
+        return;
+      }
       // malformed
-      userLog.error("master_row_malformed_thinking", {
+      userLog.error("master_row_malformed_tool", {
         sessionId: body.sessionId,
         turnIndex: body.turnIndex,
       });
-      metric("error", "thinking");
+      emitToolsMetric();
       sendJsonError(
         res,
         500,
@@ -496,6 +795,7 @@ export function makeServerAuthoredHandler(
         err: err as Error,
       });
       emitThinkingMetric();
+      emitToolsMetric();
       metric("error", "assistant");
       sendJsonError(
         res,
@@ -509,12 +809,14 @@ export function makeServerAuthoredHandler(
 
     if (assistantResult.applied) {
       emitThinkingMetric();
+      emitToolsMetric();
       metric("ok", "assistant");
       sendJsonOk(res, 200, { ok: true }, requestId);
       return;
     }
     if (assistantResult.reason === "already_exists") {
       emitThinkingMetric();
+      emitToolsMetric();
       metric("deduped", "assistant");
       sendJsonOk(res, 200, { ok: true, idempotent: true }, requestId);
       return;
@@ -525,6 +827,7 @@ export function makeServerAuthoredHandler(
         turnIndex: body.turnIndex,
       });
       emitThinkingMetric();
+      emitToolsMetric();
       metric("reject_session_missing", "assistant");
       sendJsonError(
         res,
@@ -541,12 +844,30 @@ export function makeServerAuthoredHandler(
         turnIndex: body.turnIndex,
       });
       emitThinkingMetric();
+      emitToolsMetric();
       metric("reject_session_deleted", "assistant");
       sendJsonError(
         res,
         410,
         "SESSION_DELETED",
         "client_sessions row is soft-deleted",
+        requestId,
+      );
+      return;
+    }
+    if (assistantResult.reason === "oversized") {
+      userLog.warn("session_oversized", {
+        sessionId: body.sessionId,
+        turnIndex: body.turnIndex,
+      });
+      emitThinkingMetric();
+      emitToolsMetric();
+      metric("reject_oversized", "assistant");
+      sendJsonError(
+        res,
+        413,
+        "SESSION_OVERSIZED",
+        "client_sessions row exceeds MAX_SESSION_BYTES; admin must strip before further writes",
         requestId,
       );
       return;
@@ -558,6 +879,7 @@ export function makeServerAuthoredHandler(
       turnIndex: body.turnIndex,
     });
     emitThinkingMetric();
+    emitToolsMetric();
     metric("error", "assistant");
     sendJsonError(res, 500, "ROW_MALFORMED", "master row data corrupt", requestId);
   };
