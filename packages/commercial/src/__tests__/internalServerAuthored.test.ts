@@ -260,6 +260,135 @@ describe("internalServerAuthored handler — userId/msgId derivation", () => {
   });
 });
 
+describe("internalServerAuthored handler — requestId dispatch (cost-late-patch routing)", () => {
+  // Why this section exists:
+  //   master schema dropped the "requestId required when text non-empty"
+  //   refine because non-codex (ccb-spawn) paths legitimately have no late-
+  //   cost-patch consumer — gateway finalizes token usage inline. Handler
+  //   now dispatches assistant writes by `body.requestId` presence:
+  //     - present → appendServerAuthoredMessageForRequest (drains pending
+  //       costCredits + records server_authored_request_map row)
+  //     - absent  → appendServerAuthoredMessage (plain, no map row)
+  //   These tests pin that exactly one of the two storage methods is hit
+  //   per turn; the existing `fakeStorage` mirror would mask which path ran.
+  //   Historical bug 2026-05-08~05-09: every DeepSeek V4 Pro turn was
+  //   400-rejected, fatal-dropped at the sink, refresh-recovery saw zero
+  //   server-authored data.
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+  function spyStorage(): {
+    plainCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }>;
+    forRequestCalls: Array<{ requestId: string; sessId: string; userId: string; msgId: string; role: string }>;
+    storage: ServerAuthoredStorage;
+  } {
+    const plainCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }> = [];
+    const forRequestCalls: Array<{ requestId: string; sessId: string; userId: string; msgId: string; role: string }> = [];
+    const storage: ServerAuthoredStorage = {
+      async appendServerAuthoredMessage(sessId, userId, msg) {
+        plainCalls.push({ sessId, userId, msgId: msg.id, role: msg.role });
+        return { applied: true };
+      },
+      async appendServerAuthoredMessageForRequest(requestId, sessId, userId, msg) {
+        forRequestCalls.push({ requestId, sessId, userId, msgId: msg.id, role: msg.role });
+        return { applied: true };
+      },
+    };
+    return { plainCalls, forRequestCalls, storage };
+  }
+
+  test("assistant text + requestId → routes to appendServerAuthoredMessageForRequest", async () => {
+    const spy = spyStorage();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: spy.storage,
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345",
+        turnIndex: 0,
+        status: "completed",
+        text: "answer",
+        requestId: "req-12345abc",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.equal(spy.forRequestCalls.length, 1);
+    assert.equal(spy.forRequestCalls[0].requestId, "req-12345abc");
+    assert.equal(spy.forRequestCalls[0].role, "assistant");
+    // Plain path MUST NOT fire for the assistant write — that would skip the
+    // cost-late-patch protocol entirely on codex turns.
+    assert.equal(
+      spy.plainCalls.filter((c) => c.role === "assistant").length,
+      0,
+    );
+  });
+
+  test("assistant text + missing requestId → routes to appendServerAuthoredMessage (200 ok)", async () => {
+    // The pre-fix bug: this exact body shape triggered "requestId is required
+    // when text is non-empty" and got 400-rejected → fatal-drop at sink → all
+    // server-authored data lost for every DeepSeek V4 Pro turn.
+    const spy = spyStorage();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: spy.storage,
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345",
+        turnIndex: 0,
+        status: "completed",
+        text: "answer",
+        // requestId intentionally omitted — ccb-spawn path
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.equal(spy.forRequestCalls.length, 0);
+    const assistantPlain = spy.plainCalls.filter((c) => c.role === "assistant");
+    assert.equal(assistantPlain.length, 1);
+    assert.equal(assistantPlain[0].msgId, "srv-sess12345-t0");
+    assert.equal(assistantPlain[0].userId, "c:42");
+  });
+
+  test("assistant text + missing requestId + tools[] → both go through plain append", async () => {
+    // Tools were always plain-append (best-effort, no requestId join even on
+    // codex turns). Pin that the assistant write joining them on the plain
+    // path doesn't accidentally route tools to *ForRequest.
+    const spy = spyStorage();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: spy.storage,
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345",
+        turnIndex: 0,
+        status: "completed",
+        text: "answer",
+        tools: [{
+          toolUseId: "tu1", blockId: "blk1", toolName: "Read",
+          inputJson: { path: "/tmp/x" }, inputPreview: "Read /tmp/x",
+          output: "ok", isError: false, durationMs: 10, ts: 1700000000000,
+        }],
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.equal(spy.forRequestCalls.length, 0);
+    // Expect two plain calls: one tool, one assistant.
+    const roles = spy.plainCalls.map((c) => c.role).sort();
+    assert.deepEqual(roles, ["assistant", "tool"]);
+  });
+});
+
 describe("internalServerAuthored handler — storage outcome mapping", () => {
   function authed(body: string) {
     return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });

@@ -149,12 +149,24 @@ const BodySchema = z
      *  so it sorts immediately before the assistant message. */
     thinkingText: z.string().min(1).max(MAX_BODY_BYTES).optional(),
     createdAt: z.number().int().positive().optional(),
-    /** Plan §4.3 改动 6 — assistant write only. Composite key with userId
-     *  into `server_authored_request_map` so a deferred `appendCostCredits`
-     *  call can find this row and patch `usage.costCredits` in-place.
+    /** Plan §4.3 改动 6 — composite key with userId into
+     *  `server_authored_request_map` so a deferred `appendCostCredits` call
+     *  can find this row and patch `usage.costCredits` in-place.
      *
-     *  Required when text is non-empty (assistant turn). Schema-level
-     *  refine below skips the requirement on thinking-only turns. */
+     *  Always optional on the wire. Two semantics by presence:
+     *   - Provided (codex billing path / anthropicProxy path): handler routes
+     *     the assistant write through `appendServerAuthoredMessageForRequest`
+     *     to drain pending costCredits + record the request_map row.
+     *   - Absent (ccb-spawn path: DeepSeek / non-codex Claude / etc.):
+     *     gateway has already finalized token usage inline in `body.usage`;
+     *     no late-cost-patch consumer exists, so the handler routes through
+     *     plain `appendServerAuthoredMessage` (no map row, no pending drain).
+     *
+     *  This is asymmetric on purpose: only the codex/anthropic paths use
+     *  `appendCostCredits`, so requiring requestId for non-codex assistant
+     *  writes would just gate-fail valid payloads (historical bug 2026-05-08
+     *  → 05-09: every DeepSeek V4 Pro turn was 400-rejected, fatal-dropped at
+     *  the sink, and lost — refresh-recovery saw zero server-authored data). */
     requestId: z.string().min(8).max(128).optional(),
     /** Plan §4.3 改动 6 — token usage from gateway-side stream-finalizer.
      *  Persisted into `messages[i].usage`. costCredits joins later via
@@ -192,13 +204,6 @@ const BodySchema = z
       v.thinkingText !== undefined ||
       (v.tools !== undefined && v.tools.length > 0),
     { message: "either text, thinkingText, or tools[] must be non-empty" },
-  )
-  .refine(
-    // requestId is required for assistant writes (text non-empty); on
-    // thinking-only / tools-only turns the cost path doesn't fire and
-    // requestId is unused, so we relax the requirement there.
-    (v) => v.text.length === 0 || typeof v.requestId === "string",
-    { message: "requestId is required when text is non-empty", path: ["requestId"] },
   );
 
 export type ServerAuthoredBody = z.infer<typeof BodySchema>;
@@ -763,10 +768,21 @@ export function makeServerAuthoredHandler(
 
     // ── Branch B: has assistant (with optional thinking) ──
     //
-    // Plan §4.3 改动 6:assistant write goes through the *ForRequest variant
-    // so the storage layer can drain pending costCredits + record the
-    // request_map row in a single SQLite transaction. requestId is required
-    // by schema refine when text is non-empty, so the `!` is sound here.
+    // Dispatch on requestId presence:
+    //   - body.requestId set (codex billing path / anthropicProxy path):
+    //     route through `appendServerAuthoredMessageForRequest`, which drains
+    //     pending costCredits + records the request_map row so a deferred
+    //     `appendCostCredits(requestId, userId, ...)` call can patch
+    //     `messages[i].usage.costCredits` in-place.
+    //   - body.requestId absent (ccb-spawn path: DeepSeek V4 Pro and other
+    //     non-codex models): gateway already finalized token usage inline in
+    //     `body.usage`; no `appendCostCredits` consumer ever fires for these
+    //     turns, so the request_map row would be a dead key. Plain
+    //     `appendServerAuthoredMessage` keeps the table small and the code
+    //     symmetric with thinking/tools writes.
+    //
+    // Both paths write the same `assistantMsg` shape; the only difference is
+    // whether we record the cost-late-patch join key.
     const assistantMsg: ServerAuthoredMessageInput = {
       id: messageId,
       role: "assistant",
@@ -782,12 +798,23 @@ export function makeServerAuthoredHandler(
       ReturnType<ServerAuthoredStorage["appendServerAuthoredMessageForRequest"]>
     >;
     try {
-      assistantResult = await deps.storage.appendServerAuthoredMessageForRequest(
-        body.requestId!,
-        body.sessionId,
-        userId,
-        assistantMsg,
-      );
+      if (body.requestId !== undefined) {
+        assistantResult = await deps.storage.appendServerAuthoredMessageForRequest(
+          body.requestId,
+          body.sessionId,
+          userId,
+          assistantMsg,
+        );
+      } else {
+        const r = await deps.storage.appendServerAuthoredMessage(
+          body.sessionId,
+          userId,
+          assistantMsg,
+        );
+        assistantResult = r.applied
+          ? { applied: true }
+          : { applied: false, reason: r.reason! };
+      }
     } catch (err) {
       userLog.error("assistant_storage_threw", {
         sessionId: body.sessionId,
