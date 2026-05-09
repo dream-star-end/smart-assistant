@@ -15,7 +15,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { paths } from '@openclaude/storage'
-import { CodexAppServerRunner, _classifyJsonRpcLine } from '../codexAppServerRunner.js'
+import {
+  CodexAppServerRunner,
+  _classifyJsonRpcLine,
+  _codexUsageToAnthropicShape,
+} from '../codexAppServerRunner.js'
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -1709,6 +1713,58 @@ describe('PR2 v1.0.66 — requestId queue-entry transit', () => {
     assert.equal(captured.length, 2)
     assert.equal(captured[1].rid, 'req-2')
     await h.cleanup()
+  })
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Issue C — codex inputTokens contains cached portion (OpenAI shape) but
+  // calculator.computeCost expects Anthropic disjoint shape. Without subtracting
+  // cached at the boundary, billing double-charges the cached portion.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it('_codexUsageToAnthropicShape: subtracts cachedInputTokens to keep input_tokens disjoint', () => {
+    // Typical cache-hit turn: 1000 total prompt tokens, 600 served from cache.
+    // Anthropic-shape: input_tokens=400 (non-cached), cache_read=600. Adding
+    // them in calculator.computeCost gives the original 1000 — correct.
+    const usage = _codexUsageToAnthropicShape({
+      cachedInputTokens: 600,
+      inputTokens: 1000,
+      outputTokens: 200,
+      reasoningOutputTokens: 50,
+      totalTokens: 1850,
+    })
+    assert.equal(usage.input_tokens, 400)
+    assert.equal(usage.cache_read_input_tokens, 600)
+    assert.equal(usage.cache_creation_input_tokens, 0)
+    assert.equal(usage.output_tokens, 200)
+    assert.equal(usage.reasoning_output_tokens, 50)
+  })
+
+  it('_codexUsageToAnthropicShape: clamps to 0 when cached > input (defense)', () => {
+    // Shouldn't happen per OpenAI semantics (non_cached_input = max(0, input - cached))
+    // but if a stale baseline / out-of-order frame produces this, prefer 0
+    // over a negative input_tokens that would either crash math or under-bill.
+    const usage = _codexUsageToAnthropicShape({
+      cachedInputTokens: 1000,
+      inputTokens: 600,
+      outputTokens: 50,
+      reasoningOutputTokens: 0,
+      totalTokens: 1650,
+    })
+    assert.equal(usage.input_tokens, 0)
+    assert.equal(usage.cache_read_input_tokens, 1000)
+  })
+
+  it('_codexUsageToAnthropicShape: zero-cache turn passes inputTokens through unchanged', () => {
+    // Cold turn: no cache hit. input_tokens should equal inputTokens verbatim.
+    const usage = _codexUsageToAnthropicShape({
+      cachedInputTokens: 0,
+      inputTokens: 800,
+      outputTokens: 300,
+      reasoningOutputTokens: 0,
+      totalTokens: 1100,
+    })
+    assert.equal(usage.input_tokens, 800)
+    assert.equal(usage.cache_read_input_tokens, 0)
   })
 
   it('runTurn catch 路径 emitResult 也带 requestId(B.4 要求异常也能 settle)', async () => {

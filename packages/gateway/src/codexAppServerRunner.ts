@@ -231,6 +231,38 @@ function _subtractTokenBreakdown(
   }
 }
 
+/** Convert a codex turn-delta breakdown to the Anthropic-shaped `usage` object
+ *  that ccbMessageParser._handleResult and downstream billing.calculator read.
+ *
+ *  Token-shape gotcha that bit production billing (Issue C):
+ *    - Codex `inputTokens` is the **total** prompt counted by OpenAI,
+ *      cached + non-cached. Reference: openai/codex `non_cached_input =
+ *      input_tokens - cached_input_tokens` in `protocol/src/protocol.rs`.
+ *    - Anthropic `input_tokens` is **disjoint** from `cache_read_input_tokens`.
+ *    - calculator.computeCost adds them, so passing raw codex inputTokens
+ *      double-charges the cached portion.
+ *  Subtract here at the boundary so the rest of the pipeline can trust the
+ *  Anthropic-shape contract.
+ *
+ *  _coerceTokenBreakdown already guarantees both fields are finite ≥ 0, so
+ *  Math.max(0, ...) on the subtraction is sufficient (covers any rare frame
+ *  where cached > input, e.g. stale-baseline edge after self-heal). */
+export function _codexUsageToAnthropicShape(turn: CodexTokenBreakdown): {
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens: number
+  cache_creation_input_tokens: number
+  reasoning_output_tokens: number
+} {
+  return {
+    input_tokens: Math.max(0, turn.inputTokens - turn.cachedInputTokens),
+    output_tokens: turn.outputTokens,
+    cache_read_input_tokens: turn.cachedInputTokens,
+    cache_creation_input_tokens: 0,
+    reasoning_output_tokens: turn.reasoningOutputTokens,
+  }
+}
+
 /** ThreadItem.type values that are server-internal echoes (not real tool
  *  invocations) and therefore must not surface in the UI. `userMessage` is
  *  the codex echoing back what we just sent; `hookPrompt` is a system hook
@@ -1334,19 +1366,7 @@ export class CodexAppServerRunner extends EventEmitter {
           : {}),
       })
 
-      const usagePayload = turnUsage
-        ? {
-            // Map codex breakdown → Anthropic-shaped usage that
-            // ccbMessageParser._handleResult reads. Reasoning tokens are
-            // surfaced as a separate field so PR2 billing can decide whether
-            // to fold them into output_tokens (current default) or split.
-            input_tokens: turnUsage.inputTokens,
-            output_tokens: turnUsage.outputTokens,
-            cache_read_input_tokens: turnUsage.cachedInputTokens,
-            cache_creation_input_tokens: 0,
-            reasoning_output_tokens: turnUsage.reasoningOutputTokens,
-          }
-        : undefined
+      const usagePayload = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
 
       if (status === 'completed') {
         this.emitResult({

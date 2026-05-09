@@ -1711,7 +1711,7 @@ async function renderAccountsTab() {
         <button class="btn btn-primary" id="acc-new">+ 新建账号</button>
       </div>
 
-      <div id="acc-table-container"><div class="empty">加载中…</div></div>
+      <div class="table-scroll"><div id="acc-table-container"><div class="empty">加载中…</div></div></div>
     </div>
   `
   // 先绑事件,避免首次拉数据期间切换/筛选延迟
@@ -1805,7 +1805,9 @@ function _renderAccountsTable() {
           <th class="num">累计 ok/fail</th>
           <th>OAuth 到期</th>
           <th class="num" title="近 5 小时利用率(被动从上游响应头采集)">5h%</th>
+          <th class="num" title="5 小时配额重置时间(剩余时间;tooltip 显示绝对时间)">5h 重置</th>
           <th class="num" title="近 7 天利用率(被动从上游响应头采集)">7d%</th>
+          <th class="num" title="7 天配额重置时间(剩余时间;tooltip 显示绝对时间)">7d 重置</th>
           <th>冷却至</th>
           <th>最近使用</th>
           <th>egress</th>
@@ -1947,11 +1949,12 @@ function _accountWarningChips(a) {
 
 // M9 — 渲染 5h / 7d 配额单元格。
 //   pct: number | null (0-100)
-//   resetsAt: ISO string | null
 //   updatedAt: ISO string | null  (整个账号的 quota_updated_at,共用)
 // 陈旧数据 (>1h) → 灰色 chip(不再着色,但仍显示 % 数值)。
 // 5h/7d 共用 quota_updated_at,prod 假设两组 header 同步返(见 quota.ts 注释)。
-function _renderQuotaCell(pct, resetsAt, updatedAt) {
+// 重置时间(resetsAt)由独立的 _renderResetCell 渲染到相邻列,boss 要求显式可见
+// 而非藏在 tooltip 里(Issue B)。
+function _renderQuotaCell(pct, updatedAt) {
   if (pct === null || pct === undefined) return '<span class="muted">—</span>'
   const num = Number(pct)
   if (!Number.isFinite(num)) return '<span class="muted">—</span>'
@@ -1960,11 +1963,35 @@ function _renderQuotaCell(pct, resetsAt, updatedAt) {
   const stale = ageMs > 60 * 60 * 1000
   const cls = stale ? 'chip-muted' : (num >= 95 ? 'chip-danger' : num >= 80 ? 'chip-warn' : '')
   const label = `${num.toFixed(0)}%`
-  const titleParts = []
-  if (resetsAt) titleParts.push(`重置: ${fmtDate(resetsAt)}`)
-  if (updatedAt) titleParts.push(`更新: ${fmtDate(updatedAt)}${stale ? ' (陈旧)' : ''}`)
-  const title = titleParts.length ? ` title="${escapeHtml(titleParts.join(' · '))}"` : ''
+  const title = updatedAt ? ` title="${escapeHtml(`更新: ${fmtDate(updatedAt)}${stale ? ' (陈旧)' : ''}`)}"` : ''
   return cls ? `<span class="chip ${cls}"${title}>${label}</span>` : `<span${title}>${label}</span>`
+}
+
+// Issue B (Codex review #019e0b90) — 5h / 7d 配额重置时间单元格。
+//   resetsAt: ISO string | null
+// 显示策略,跟同表的"冷却至"列对齐(line ~1992):
+//   - null / 解析失败 → "—"
+//   - 已过(diff ≤ 0) → "已过"(灰)+ tooltip 绝对时间 — 与"无数据"区分
+//   - <60m → "Xm"(向上取整,避免比实际更快重置的错觉)
+//   - <24h → "Xh"(向上取整)
+//   - 否则 → 月-日 格式 (如 "12-25")
+// 完整时间放 tooltip。窄列友好。
+function _renderResetCell(resetsAt) {
+  if (!resetsAt) return '<span class="muted">—</span>'
+  const ms = new Date(resetsAt).getTime()
+  if (Number.isNaN(ms)) return '<span class="muted">—</span>'
+  const diff = ms - Date.now()
+  if (diff <= 0) return `<span class="muted" title="${escapeHtml(fmtDate(resetsAt))}">已过</span>`
+  let label
+  if (diff < 60 * 60 * 1000) {
+    label = `${Math.max(1, Math.ceil(diff / 60000))}m`
+  } else if (diff < 24 * 60 * 60 * 1000) {
+    label = `${Math.ceil(diff / (60 * 60 * 1000))}h`
+  } else {
+    const d = new Date(resetsAt)
+    label = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  }
+  return `<span class="mono" title="${escapeHtml(fmtDate(resetsAt))}">${label}</span>`
 }
 
 function _renderAccountRow(a) {
@@ -1998,8 +2025,11 @@ function _renderAccountRow(a) {
   const showReset = !!a.cooldown_until
   // 5h / 7d 配额单元格(M9)。utilization 0-100 number|null。
   // quota_updated_at 早于 1h 显灰(陈旧),≥ 95 红 / ≥ 80 黄 / 否则常态。
-  const cell5h = _renderQuotaCell(a.quota_5h_pct, a.quota_5h_resets_at, a.quota_updated_at)
-  const cell7d = _renderQuotaCell(a.quota_7d_pct, a.quota_7d_resets_at, a.quota_updated_at)
+  const cell5h = _renderQuotaCell(a.quota_5h_pct, a.quota_updated_at)
+  const cell7d = _renderQuotaCell(a.quota_7d_pct, a.quota_updated_at)
+  // Issue B — 配额重置时间独立列,boss 要求显式可见。
+  const cell5hReset = _renderResetCell(a.quota_5h_resets_at)
+  const cell7dReset = _renderResetCell(a.quota_7d_resets_at)
   return `
     <tr>
       <td class="mono">${escapeHtml(a.id)}</td>
@@ -2011,7 +2041,9 @@ function _renderAccountRow(a) {
       <td class="num">${okN}/${failN}${failRateChip}</td>
       <td class="mono">${fmtDate(a.oauth_expires_at)}</td>
       <td class="num">${cell5h}</td>
+      <td class="num">${cell5hReset}</td>
       <td class="num">${cell7d}</td>
+      <td class="num">${cell7dReset}</td>
       <td class="mono">${cdChip}</td>
       <td class="mono">${fmtRelative(a.last_used_at)}</td>
       <td class="mono" title="${escapeHtml(a.egress_proxy_pool_label || '')}">${escapeHtml(a.egress_proxy_pool_label || '—')}</td>
