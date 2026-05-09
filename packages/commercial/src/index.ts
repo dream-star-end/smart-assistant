@@ -30,7 +30,8 @@ import { createCommercialHandler, type CommercialHandler } from "./http/router.j
 import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
-import { PricingCache } from "./billing/pricing.js";
+import { PricingCache, createModelHintProvider } from "./billing/pricing.js";
+import { setModelHintProvider } from "@openclaude/gateway";
 import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
 import {
@@ -461,6 +462,14 @@ export async function registerCommercial(
     // eslint-disable-next-line no-console
     console.error("[commercial] pricing LISTEN setup failed:", err);
   }
+
+  // 0060 — 把 per-model extra_system_prompt 注入到 gateway promptSlots。
+  // gateway 不依赖 commercial(personal 版没这一行);commercial 启动时把 cache 反向暴露。
+  // canonicalize 责任在 provider 层(plan):传入 firstParty 带日期 alias 也能命中 DB 短名。
+  // PricingCache 缓存空(initial load 失败)时 get() 自然返 null → buildModelHintSlot 落 null,
+  // 不会影响 prompt 构建。
+  // canonical id 直接取 PricingCache 命中行的 model_id(详见 createModelHintProvider 注释)。
+  setModelHintProvider(createModelHintProvider(pricing));
 
   // T-24 虎皮椒:三件套齐全 → 生产 client;否则 undefined(handler 会 503)
   let hupijiao: HupijiaoClient | undefined;
@@ -1805,6 +1814,9 @@ export async function registerCommercial(
           } catch { resolve(); }
         });
       }
+      // 0060 — 清空 model hint provider,避免 shutdown 后还有人持 stale closure
+      // (用于测试热重启场景:同一进程多次 register/shutdown 不能让旧 cache 被新 cache 引用)
+      try { setModelHintProvider(null); } catch { /* ignore */ }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closePool();

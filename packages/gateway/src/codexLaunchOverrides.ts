@@ -32,7 +32,11 @@
  */
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { createLogger } from './logger.js'
+import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
+
+const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
 
 // ── Codex-specific preamble ──
 //
@@ -268,15 +272,32 @@ export async function buildCodexLaunchOverrides(
   // because that file is provider-agnostic and shouldn't carry adapter
   // concerns — keeping it here means promptSlots stays clean and the codex
   // adapter can evolve without touching the slot pipeline.
-  const platformContext = await buildPromptContext({
+  const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     persona: ctx.persona,
     provider: ctx.provider,
     model: ctx.model,
     effortLevel: ctx.effortLevel,
   })
-  const instructionsContent = `${CODEX_PREAMBLE}${platformContext}`
+  const instructionsContent = `${CODEX_PREAMBLE}${platformResult.content}`
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
+
+  // observability:per-model 行为补丁注入(MODEL_HINT)→ structured log + prom counter。
+  // 不打 prompt 原文,只 sha256[:8] + bytes;subprocessRunner 同款。
+  const hint = platformResult.applied.find((s) => s.name === 'MODEL_HINT')
+  const canonicalModelId = hint?.meta?.model_id
+  if (hint && canonicalModelId) {
+    // 同 subprocessRunner:label/log 字段都只用 canonical id,不带 raw ctx.model,
+    // 防止外部可控字符串污染 Prom 基数 / 日志后端字段索引(详见对端注释)。
+    overridesLog.info('model_hint_applied', {
+      agentId: ctx.agentId,
+      model_id: canonicalModelId,
+      backend: 'codex',
+      hint_bytes: hint.bytes,
+      hint_sha256: hint.sha256.slice(0, 8),
+    })
+    modelHintAppliedTotal.inc({ model_id: canonicalModelId, backend: 'codex' })
+  }
 
   const argvOverrides: string[] = [
     '-c',

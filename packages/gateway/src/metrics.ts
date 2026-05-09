@@ -117,6 +117,12 @@ export const outboundRingReplayMissTotal = new Counter()
 export const outboundRingEvictedTotal = new Counter()
 export const outboundRingSizeBytes = { value: 0 }
 
+// ── Model hint slot (per-model extra system prompt injection) ──
+// 每次 spawn 时 buildPromptContext 命中 MODEL_HINT slot 就 +1。
+// label 用 canonical model_id(已被 PricingCache 命中且非空文案才会 fire),
+// 基数受 model_pricing 表行数约束(目前 6 行,不会爆)。
+export const modelHintAppliedTotal = new Counter()
+
 // ── EventBus subscriber ──
 
 let _metricsStarted = false
@@ -186,6 +192,10 @@ export function serializeMetrics(): string {
     `# HELP oc_outbound_ring_size_bytes Outbound ring total bytes across all sessions`,
     `# TYPE oc_outbound_ring_size_bytes gauge`,
     `oc_outbound_ring_size_bytes ${outboundRingSizeBytes.value}`,
+    modelHintAppliedTotal.serialize(
+      'oc_model_hint_applied_total',
+      'Per-model extra_system_prompt injected at CCB/codex spawn (labelled by canonical model_id)',
+    ),
   ]
   return sections.join('\n\n') + '\n'
 }

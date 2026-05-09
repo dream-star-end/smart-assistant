@@ -595,6 +595,7 @@ function serializePricing(r: ModelPricingRowView): Record<string, unknown> {
     updated_at: r.updated_at.toISOString(),
     updated_by: r.updated_by,
     visibility: r.visibility,
+    extra_system_prompt: r.extra_system_prompt,
   };
 }
 
@@ -667,6 +668,14 @@ export async function handleAdminPatchPricing(
       throw new HttpError(400, "VALIDATION", "enabled must be boolean");
     }
     patch.enabled = b.enabled;
+  }
+  // 0060 — extra_system_prompt:undefined→不改;null/string→交给 normalizeExtraSystemPrompt 收口。
+  // 这里只挡明显的非法类型(数组/对象/数字),细粒度长度校验在 normalize 层抛 RangeError → translateRangeError。
+  if (b.extra_system_prompt !== undefined) {
+    if (b.extra_system_prompt !== null && typeof b.extra_system_prompt !== "string") {
+      throw new HttpError(400, "VALIDATION", "extra_system_prompt must be string or null");
+    }
+    patch.extra_system_prompt = b.extra_system_prompt;
   }
 
   try {

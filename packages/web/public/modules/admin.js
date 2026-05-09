@@ -3496,7 +3496,8 @@ async function renderPricingTab() {
                 <td class="actions">
                   <button data-act="edit-pricing" data-id="${escapeHtml(p.model_id)}"
                           data-mult="${escapeHtml(p.multiplier)}"
-                          data-enabled="${p.enabled ? '1' : '0'}">编辑</button>
+                          data-enabled="${p.enabled ? '1' : '0'}"
+                          data-extra="${escapeHtml(p.extra_system_prompt ?? '')}">编辑</button>
                 </td>
               </tr>`).join('')}
           </tbody>
@@ -3504,11 +3505,12 @@ async function renderPricingTab() {
     </div>
   `
   for (const b of view().querySelectorAll('button[data-act="edit-pricing"]')) {
-    b.addEventListener('click', () => openEditPricingModal(b.dataset.id, b.dataset.mult, b.dataset.enabled === '1'))
+    b.addEventListener('click', () =>
+      openEditPricingModal(b.dataset.id, b.dataset.mult, b.dataset.enabled === '1', b.dataset.extra ?? ''))
   }
 }
 
-function openEditPricingModal(modelId, multiplier, enabled) {
+function openEditPricingModal(modelId, multiplier, enabled, extraSystemPrompt) {
   openModal(`
     <h3>编辑定价 · ${escapeHtml(modelId)}</h3>
     <div class="form-row">
@@ -3517,6 +3519,12 @@ function openEditPricingModal(modelId, multiplier, enabled) {
     </div>
     <div class="form-row">
       <label><input type="checkbox" id="p-enabled" ${enabled ? 'checked' : ''} /> 启用</label>
+    </div>
+    <div class="form-row">
+      <label>extra_system_prompt(per-model 行为补丁)</label>
+      <textarea id="p-extra" rows="4" maxlength="4096"
+                placeholder="留空=不注入。例:完成一个步骤后,不要 yield,继续推进至全部目标完成">${escapeHtml(extraSystemPrompt)}</textarea>
+      <small class="muted">作为 system prompt 注入到 extra-prompt.md 末尾,与 persona/tools/research 冲突时以后置优先级为准。修改仅对<b>新 spawn</b>的 CCB/codex 生效,运行中的会话不会被换文案。上限 4096 字。</small>
     </div>
     <div class="form-actions">
       <button id="p-cancel">取消</button>
@@ -3527,10 +3535,13 @@ function openEditPricingModal(modelId, multiplier, enabled) {
   $('p-ok').addEventListener('click', async (ev) => {
     const m = $('p-mult').value.trim()
     if (!/^\d+(\.\d{1,3})?$/.test(m)) { toast('multiplier 格式不对', 'danger'); return }
+    // extra_system_prompt:trim 后空 → 显式发 null(清空);非空 → 原文(后端再 trim)
+    const extraRaw = $('p-extra').value
+    const extra = extraRaw.trim() === '' ? null : extraRaw
     await withBtnLoading(ev.currentTarget, async () => {
       try {
         await apiJson('PATCH', `/api/admin/pricing/${encodeURIComponent(modelId)}`,
-          { multiplier: m, enabled: $('p-enabled').checked })
+          { multiplier: m, enabled: $('p-enabled').checked, extra_system_prompt: extra })
         toast('已保存')
         closeModal()
         applyHash()

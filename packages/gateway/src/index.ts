@@ -14,3 +14,7 @@ export * from './logger.js'
 export * from './metrics.js'
 export * from './outboundRing.js'
 export * from './rateLimit.js'
+// Per-model extra system prompt 注入钩子 — commercial 启动时 setModelHintProvider(...)
+// 注册查询函数(查 PricingCache.extra_system_prompt)。Personal 不调即 noop。
+// 仅 export setter + 类型,不暴露 promptSlots 内部 helper,避免被外部误依赖。
+export { setModelHintProvider, type ModelHintProvider } from './promptSlots.js'

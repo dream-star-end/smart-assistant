@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import {
   PricingCache,
   canonicalizeModelId,
+  createModelHintProvider,
   perKtokCredits,
   type ModelPricing,
 } from "../billing/pricing.js";
@@ -28,6 +29,7 @@ const haiku: ModelPricing = {
   enabled: true,
   sort_order: 110,
   visibility: "admin",
+  extra_system_prompt: null,
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
@@ -42,6 +44,7 @@ const sonnet: ModelPricing = {
   enabled: true,
   sort_order: 100,
   visibility: "public",
+  extra_system_prompt: null,
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
@@ -57,6 +60,7 @@ const opus: ModelPricing = {
   enabled: true,
   sort_order: 90,
   visibility: "public",
+  extra_system_prompt: null,
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
@@ -71,6 +75,7 @@ const disabled: ModelPricing = {
   enabled: false,
   sort_order: 200,
   visibility: "public",
+  extra_system_prompt: null,
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
@@ -86,6 +91,7 @@ const gpt55: ModelPricing = {
   enabled: true,
   sort_order: 110,
   visibility: "admin",
+  extra_system_prompt: null,
   updated_at: new Date("2026-04-29T00:00:00Z"),
 };
 
@@ -102,6 +108,7 @@ const hiddenModel: ModelPricing = {
   enabled: true,
   sort_order: 999,
   visibility: "hidden",
+  extra_system_prompt: null,
   updated_at: new Date("2026-04-29T00:00:00Z"),
 };
 
@@ -336,6 +343,23 @@ describe("PricingCache.listForUser (visibility OR grants)", () => {
     assert.deepEqual(ids, []);
   });
 
+  test("get carries extra_system_prompt verbatim (null + populated)", () => {
+    // 0060 — PricingCache 必须把 extra_system_prompt 原样透传到调用方,
+    // 不在缓存层做 trim/normalize(那是 commercial provider lambda 的职责)。
+    const p = new PricingCache();
+    const tweaked: ModelPricing = {
+      ...sonnet,
+      model_id: "deepseek-v4-pro",
+      extra_system_prompt: "  完成步骤后不要 yield  ",
+    };
+    p._setForTests([sonnet, tweaked]);
+    assert.equal(p.get("claude-sonnet-4-6")?.extra_system_prompt, null);
+    assert.equal(
+      p.get("deepseek-v4-pro")?.extra_system_prompt,
+      "  完成步骤后不要 yield  ",
+    );
+  });
+
   test("get rejects garbage prefix even when haiku row exists", () => {
     // 真实入口行为锁定:即便 DB 里有 haiku 这一条,前缀垃圾也不能命中。
     // canonicalizeModelId 单独有同样的拒绝测试,这里再多覆盖 PricingCache.get
@@ -415,5 +439,85 @@ describe("canonicalizeModelId (边界层防御)", () => {
       canonicalizeModelId("CLAUDE-HAIKU-4-5-20251001"),
       "claude-haiku-4-5",
     );
+  });
+});
+
+describe("createModelHintProvider — cardinality-DoS 防线", () => {
+  // 关键不变量:gateway 拿到的 canonical id 永远来自 PricingCache row,
+  // 不会被 spawn 入参的 raw model 污染 — 详见 createModelHintProvider 注释。
+
+  test("命中 row + extra_system_prompt 非空 → 返 { row.model_id, text }", () => {
+    const opusWithHint: ModelPricing = {
+      ...opus,
+      extra_system_prompt: "完成一个步骤后,不要 yield",
+    };
+    const cache = new PricingCache();
+    cache._setForTests([opusWithHint]);
+    const provider = createModelHintProvider(cache);
+    assert.deepEqual(provider("claude-opus-4-7"), {
+      id: "claude-opus-4-7",
+      text: "完成一个步骤后,不要 yield",
+    });
+  });
+
+  test("raw 入参带 evil suffix(canonicalize 命中)→ canonical id 仍来自 row,不是 raw 串", () => {
+    // 这就是 BLOCKER 防的攻击面:claude-opus-4-7 在 CANONICAL_MODEL_IDS 白名单里,
+    // 任意后缀都会被 canonicalizeModelId 归一到短名,从而命中 extra_system_prompt 行。
+    // 必须保证返回的 id == row.model_id,而不是 raw 入参 — 否则 gateway
+    // modelHintAppliedTotal{model_id=...} 的基数会被外部撑爆。
+    const opusWithHint: ModelPricing = {
+      ...opus,
+      extra_system_prompt: "rule X",
+    };
+    const cache = new PricingCache();
+    cache._setForTests([opusWithHint]);
+    const provider = createModelHintProvider(cache);
+    const evilSuffix =
+      "claude-opus-4-7-20260315-evil-suffix-AAAAAAAAAAAAAAAAAAAAAAAA";
+    const result = provider(evilSuffix);
+    assert.ok(result, "命中后应返非 null(canonicalize 把后缀吃掉了)");
+    assert.equal(
+      result!.id,
+      "claude-opus-4-7",
+      "id 必须是 row.model_id,不能是 raw 入参 — 否则 Prom label 会被外部基数攻击",
+    );
+    assert.equal(result!.text, "rule X");
+  });
+
+  test("命中 row 但 extra_system_prompt 为 null → 返 null", () => {
+    // 行存在但管理员没配 patch:不应该注入任何 hint slot。
+    const cache = new PricingCache();
+    cache._setForTests([opus]); // extra_system_prompt: null
+    const provider = createModelHintProvider(cache);
+    assert.equal(provider("claude-opus-4-7"), null);
+  });
+
+  test("命中 row + extra_system_prompt 为空白 → provider 透传(由 gateway buildModelHintSlot 最终落 null)", () => {
+    // 防御 DB 里残留空白字符串(虽然 patchPricing helper 会归一为 null,但 SQL 直插可绕)。
+    const cache = new PricingCache();
+    cache._setForTests([{ ...opus, extra_system_prompt: "   \n  " } as ModelPricing]);
+    const provider = createModelHintProvider(cache);
+    // 当前职责划分:provider 不 trim,gateway 那侧 buildModelHintSlot 会再 trim 后判空
+    // → 整条链路最终对外效果仍是"空白等同未配"(slot 落 null)。这条 test 只是钉
+    // 住"空白处理在 gateway 闭合,不在 provider"这一边界,如果未来想把 trim 提前到
+    // provider,改测试同时改实现。
+    const r = provider("claude-opus-4-7");
+    assert.ok(r);
+    assert.equal(r!.id, "claude-opus-4-7");
+    assert.equal(r!.text, "   \n  ");
+  });
+
+  test("未命中 row(unknown model)→ 返 null,不抛", () => {
+    const cache = new PricingCache();
+    cache._setForTests([opus]);
+    const provider = createModelHintProvider(cache);
+    assert.equal(provider("gpt-5-fictional"), null);
+  });
+
+  test("空 cache(初始化失败兜底)→ 返 null", () => {
+    const cache = new PricingCache();
+    cache._setForTests([]);
+    const provider = createModelHintProvider(cache);
+    assert.equal(provider("claude-opus-4-7"), null);
   });
 });

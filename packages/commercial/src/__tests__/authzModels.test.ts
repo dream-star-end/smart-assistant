@@ -32,6 +32,7 @@ const opusPublic: ModelPricing = {
   enabled: true,
   sort_order: 90,
   visibility: 'public',
+  extra_system_prompt: null,
   updated_at: new Date('2026-04-01T00:00:00Z'),
 }
 
@@ -46,6 +47,7 @@ const gpt55Admin: ModelPricing = {
   enabled: true,
   sort_order: 110,
   visibility: 'admin',
+  extra_system_prompt: null,
   updated_at: new Date('2026-04-29T00:00:00Z'),
 }
 
@@ -60,6 +62,7 @@ const internalHidden: ModelPricing = {
   enabled: true,
   sort_order: 999,
   visibility: 'hidden',
+  extra_system_prompt: null,
   updated_at: new Date('2026-04-01T00:00:00Z'),
 }
 
@@ -74,6 +77,7 @@ const disabledPublic: ModelPricing = {
   enabled: false,
   sort_order: 200,
   visibility: 'public',
+  extra_system_prompt: null,
   updated_at: new Date('2026-04-01T00:00:00Z'),
 }
 

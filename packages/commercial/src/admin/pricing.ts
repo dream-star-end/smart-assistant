@@ -18,6 +18,7 @@
  * "倍率改了但审计没记"或反之。
  */
 
+import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
@@ -41,6 +42,12 @@ export interface ModelPricingRowView {
   // visibility=admin/hidden 的模型(gpt-5.5 / claude-haiku-4-5 / deepseek-*)
   // 在"用户模型授权"页签消失。
   visibility: 'public' | 'admin' | 'hidden';
+  /**
+   * 0060 引入 — Per-model 行为补丁文案。
+   * NULL/空白 → 不注入(provider 端 trim 后判空过滤)。
+   * 上限 4096 字符,DB CHECK 约束兜底。
+   */
+  extra_system_prompt: string | null;
 }
 
 const PRICING_COLS = `
@@ -55,8 +62,12 @@ const PRICING_COLS = `
   sort_order,
   updated_at,
   updated_by::text           AS updated_by,
-  visibility
+  visibility,
+  extra_system_prompt
 `;
+
+/** extra_system_prompt 长度上限,与 0060 migration 的 CHECK 约束对齐。 */
+export const EXTRA_SYSTEM_PROMPT_MAX_LEN = 4096;
 
 /** model_id 白名单:字母数字 + . + - + _,上限 64 字符。 */
 const MODEL_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -73,6 +84,13 @@ export async function listPricing(): Promise<ModelPricingRowView[]> {
 export interface PatchPricingInput {
   multiplier?: string | number;
   enabled?: boolean;
+  /**
+   * 0060 — Per-model extra_system_prompt。
+   * - undefined:不改
+   * - null 或空白字串:清空(DB 写 NULL)
+   * - 非空字串:trim 后存(长度 ≤ EXTRA_SYSTEM_PROMPT_MAX_LEN,否则 RangeError)
+   */
+  extra_system_prompt?: string | null;
 }
 
 export interface PatchPricingCtx {
@@ -111,6 +129,37 @@ export function normalizeMultiplier(v: unknown): string {
 }
 
 /**
+ * 0060 — 把 extra_system_prompt 输入归一化:
+ *   - null / "" / 纯空白 → null(DB 写 NULL,等同清空)
+ *   - 非空字串 → trim 后存(头尾空白对模型行为无意义,避免幽灵差异)
+ *   - 非 string 非 null → RangeError("invalid_extra_system_prompt")
+ *   - trim 后长度 > EXTRA_SYSTEM_PROMPT_MAX_LEN → RangeError("extra_system_prompt_too_long")
+ *
+ * DB CHECK 约束(0060)是兜底,这里先于 SQL 给出明确错误码,前端 UX 更准。
+ */
+export function normalizeExtraSystemPrompt(v: unknown): string | null {
+  if (v === null) return null;
+  if (typeof v !== "string") throw new RangeError("invalid_extra_system_prompt");
+  const trimmed = v.trim();
+  if (trimmed === "") return null;
+  if (trimmed.length > EXTRA_SYSTEM_PROMPT_MAX_LEN) {
+    throw new RangeError("extra_system_prompt_too_long");
+  }
+  return trimmed;
+}
+
+/**
+ * 审计摘要 — 不落明文。返回 { len, sha256, preview }(null 时返 null)。
+ * preview 取前 40 个 code unit(.slice(0,40))再加 "…",肉眼对照足够。
+ */
+export function summarizeExtraPrompt(v: string | null): null | { len: number; sha256: string; preview: string } {
+  if (v === null) return null;
+  const sha256 = createHash("sha256").update(v, "utf8").digest("hex");
+  const preview = v.length > 40 ? `${v.slice(0, 40)}…` : v;
+  return { len: v.length, sha256, preview };
+}
+
+/**
  * 修改单个模型的 multiplier / enabled。同事务写 admin_audit。
  * 空 patch → 直接返当前行(不写 audit)。
  */
@@ -121,7 +170,10 @@ export async function patchPricing(
 ): Promise<ModelPricingRowView> {
   if (!MODEL_ID_RE.test(modelId)) throw new RangeError("invalid_model_id");
 
-  const touched = (patch.multiplier !== undefined) || (patch.enabled !== undefined);
+  const touched =
+    patch.multiplier !== undefined ||
+    patch.enabled !== undefined ||
+    patch.extra_system_prompt !== undefined;
   if (!touched) {
     const cur = await query<ModelPricingRowView>(
       `SELECT ${PRICING_COLS} FROM model_pricing WHERE model_id = $1`, [modelId],
@@ -133,6 +185,14 @@ export async function patchPricing(
   let multiplierNorm: string | null = null;
   if (patch.multiplier !== undefined) {
     multiplierNorm = normalizeMultiplier(patch.multiplier);
+  }
+
+  // extra_system_prompt 归一化:undefined→不改;null/空白→DB NULL;非空→trim 后存。
+  // 用 sentinel symbol 区分 "未提供" 与 "显式清空(null)" 两态。
+  const EXTRA_UNSET = Symbol("extra_unset");
+  let extraNorm: string | null | typeof EXTRA_UNSET = EXTRA_UNSET;
+  if (patch.extra_system_prompt !== undefined) {
+    extraNorm = normalizeExtraSystemPrompt(patch.extra_system_prompt);
   }
 
   return tx(async (client: PoolClient) => {
@@ -149,6 +209,7 @@ export async function patchPricing(
     };
     if (multiplierNorm !== null) push("multiplier", multiplierNorm);
     if (patch.enabled !== undefined) push("enabled", patch.enabled);
+    if (extraNorm !== EXTRA_UNSET) push("extra_system_prompt", extraNorm);
     sets.push("updated_at = NOW()");
     params.push(String(ctx.adminId));
     sets.push(`updated_by = $${params.length}::bigint`);
@@ -165,6 +226,13 @@ export async function patchPricing(
     const changedAfter: Record<string, unknown> = {};
     if (multiplierNorm !== null) { changedBefore.multiplier = b.multiplier; changedAfter.multiplier = a.multiplier; }
     if (patch.enabled !== undefined) { changedBefore.enabled = b.enabled; changedAfter.enabled = a.enabled; }
+    // 审计 extra_system_prompt:**不**写明文(可能含敏感措辞或被人当 leak 渠道),
+    // 而是 {len, sha256, preview} 三件:len 看尺寸变化,sha256 防篡改对照,preview 看头 40 字符
+    // 让 admin 一眼分辨"是不是我刚刚改的那条"。
+    if (extraNorm !== EXTRA_UNSET) {
+      changedBefore.extra_system_prompt = summarizeExtraPrompt(b.extra_system_prompt);
+      changedAfter.extra_system_prompt = summarizeExtraPrompt(a.extra_system_prompt);
+    }
 
     await writeAdminAudit(client, {
       adminId: ctx.adminId,

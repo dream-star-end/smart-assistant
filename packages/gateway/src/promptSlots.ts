@@ -365,15 +365,133 @@ export function buildRepoSlot(ctx: PromptSlotContext): PromptSlot | null {
   return null
 }
 
+// ── MODEL_HINT slot — per-model behavioral patch ──
+//
+// 设计要点:
+// - 模型行为补丁(如 DeepSeek "完成一步不要早 yield")是模型层面属性,不是
+//   runner 层面 — CCB 和 codex backend 走同一条 buildPromptContext,所以
+//   都会被注入。某模型不需要补丁就在其 source 处返 null/空字串即可。
+// - Gateway 对 commercial 包**零编译期依赖**:用模块级 provider 钩子注入。
+//   commercial 启动时调 setModelHintProvider 注册查询函数;personal 不调
+//   就 noop。不能在这里直接 import @openclaude/commercial。
+// - Provider 抛错 / 返非法形状 → 当作 null,只 log warn,不让 prompt 构建失败。
+// - 实际 source-of-truth 在 commercial 的 model_pricing.extra_system_prompt;
+//   admin 改了 → PricingCache NOTIFY reload → 下次 spawn 立即生效。
+//
+// 返回 `{ id, text }`:
+// - `text` 是要注入到 prompt 的文案
+// - `id` 是 provider 已经做完归一化的 **canonical model id**(例:任意
+//   `deepseek-v4-pro-XXX` 都返 'deepseek-v4-pro')。runner 用这个 id 作为
+//   `oc_model_hint_applied_total` 的 label,基数严格受 model_pricing 表行数
+//   约束;如果直接用 spawn 入参的 raw model 当 label,外部可控字符串能把
+//   Prom counter cardinality 打爆,等同观测面 DoS。
+export interface ModelHintResult {
+  id: string
+  text: string
+}
+export type ModelHintProvider = (modelId: string) => ModelHintResult | null | undefined
+
+let _modelHintProvider: ModelHintProvider | null = null
+
+/**
+ * 注入/清除 model hint provider。
+ * - commercial 启动时调一次注入;shutdown 时调 setModelHintProvider(null) 清理。
+ * - 测试中务必在 afterEach 里 setModelHintProvider(null),避免 cross-test 污染。
+ */
+export function setModelHintProvider(p: ModelHintProvider | null): void {
+  _modelHintProvider = p
+}
+
+/**
+ * 内部用 — buildModelHintSlot 的返回带额外 `canonicalId`,供 buildPromptContext
+ * 把 id 传入 PromptSlotApplied.meta。外部直接调 buildModelHintSlot 时也能拿到。
+ */
+export interface ModelHintSlot extends PromptSlot {
+  /** Provider 已归一化的 canonical model id,运行时用作 metric label。 */
+  canonicalId: string
+}
+
+export function buildModelHintSlot(ctx: PromptSlotContext): ModelHintSlot | null {
+  if (!ctx.model || !_modelHintProvider) return null
+  let raw: ModelHintResult | null | undefined
+  try {
+    raw = _modelHintProvider(ctx.model)
+  } catch (err) {
+    // 不让 hint provider 异常拖死整个 prompt 构建
+    // eslint-disable-next-line no-console
+    console.warn('[promptSlots] modelHintProvider threw, treating as null:', err)
+    return null
+  }
+  // 防御外部脏数据:必须是 { id: string, text: string } 形状,id 非空,text trim 后非空。
+  // 任何不符合的输入都退化为 null(等同未配置)。这里挡的是开发期错把旧 string 接口接进来,
+  // 真实 commercial provider 总返合规对象。
+  if (raw === null || raw === undefined) return null
+  if (typeof raw !== 'object') return null
+  const id = (raw as { id: unknown }).id
+  const text = (raw as { text: unknown }).text
+  if (typeof id !== 'string' || id === '') return null
+  if (typeof text !== 'string') return null
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  return {
+    name: 'MODEL_HINT',
+    canonicalId: id,
+    content: [
+      '# 模型行为补丁',
+      '',
+      '以下规则用于修正当前模型的默认行为,不要在回答中复述。',
+      '',
+      trimmed,
+    ].join('\n'),
+  }
+}
+
 // ── Unified builder ──
 
 const SEPARATOR = '\n\n---\n\n'
 
 /**
- * Build the complete extra-prompt by assembling all slots in order.
- * Returns the merged string ready to write to extra-prompt.md.
+ * 一个 slot 的"应用"摘要,供 caller 用作 observability(打 metric/log)。
+ * 不包含原文 — 防止把可能的敏感引导写到日志里。
  */
-export async function buildPromptContext(ctx: PromptSlotContext): Promise<string> {
+export interface PromptSlotApplied {
+  name: string
+  /** UTF-8 字节长度 */
+  bytes: number
+  /** content 的 sha256(完整十六进制),caller 可截短 */
+  sha256: string
+  /**
+   * 可选:供 caller 打 metric/log 用的 bounded label 集合。
+   * 目前只 MODEL_HINT 用,带 `model_id`(canonical id,基数受 model_pricing 表行数约束),
+   * 防止 raw 入参 model 被外部污染后撑爆 Prom counter cardinality。
+   */
+  meta?: Record<string, string>
+}
+
+export interface PromptContextResult {
+  /** 拼好的 prompt 文本(写到 extra-prompt.md 的内容) */
+  content: string
+  /** 命中的 slot 列表(按拼装顺序) */
+  applied: PromptSlotApplied[]
+}
+
+async function sha256Hex(s: string): Promise<string> {
+  const data = new TextEncoder().encode(s)
+  const buf = await crypto.subtle.digest('SHA-256', data)
+  const arr = new Uint8Array(buf)
+  let out = ''
+  for (let i = 0; i < arr.length; i++) {
+    out += arr[i].toString(16).padStart(2, '0')
+  }
+  return out
+}
+
+/**
+ * Build the complete extra-prompt by assembling all slots in order.
+ * Returns the merged string + per-slot applied metadata so callers can emit
+ * observability without re-parsing the prompt.
+ */
+export async function buildPromptContext(ctx: PromptSlotContext): Promise<PromptContextResult> {
   const slots: PromptSlot[] = []
 
   // Layer 1: Static identity
@@ -397,15 +515,38 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<string
   const tools = buildToolsSlot()
   slots.push(tools)
 
-  // Layer 4: 用户显式选中的模式(科研模式等)。放最后,离 user 消息最近,
-  // 提升 agent 对"本会话约束"的遵循度。不选就不注入。
+  // Layer 4: per-model 行为补丁。位于 TOOLS 之后、RESEARCH 之前 —
+  // 比工具说明更靠后(更"贴近"user message,不被工具说明稀释),
+  // 但低于 RESEARCH(用户显式选择"科研模式"应优先级最高)。
+  // ModelHintSlot 携带 canonicalId,稍后塞进 PromptSlotApplied.meta 给 runner 打 metric。
+  const modelHint = buildModelHintSlot(ctx)
+  if (modelHint) slots.push(modelHint)
+
+  // Layer 5: 用户显式选中的模式(科研模式等)。放在模型补丁之后,
+  // 体现 user-explicit > model-default 的优先级。不选就不注入。
   const research = buildResearchSlot(ctx)
   if (research) slots.push(research)
 
-  // Layer 5(Phase 5): 当前会话的 GitHub repo 绑定状态。放在 RESEARCH 之后,
+  // Layer 6(Phase 5): 当前会话的 GitHub repo 绑定状态。放在 RESEARCH 之后,
   // 是离 user 消息最近的一段,确保 agent 能强感知 "Bash 工具的 cwd 在哪"。
   const repo = buildRepoSlot(ctx)
   if (repo) slots.push(repo)
 
-  return slots.map((s) => s.content).join(SEPARATOR)
+  const content = slots.map((s) => s.content).join(SEPARATOR)
+  const applied: PromptSlotApplied[] = await Promise.all(
+    slots.map(async (s) => {
+      const base: PromptSlotApplied = {
+        name: s.name,
+        bytes: Buffer.byteLength(s.content, 'utf-8'),
+        sha256: await sha256Hex(s.content),
+      }
+      // MODEL_HINT slot 带 canonicalId(provider 已归一化),透传到 meta.model_id
+      // 让 runner 用作 bounded Prom label。其它 slot 不需要 meta。
+      if ((s as ModelHintSlot).canonicalId !== undefined) {
+        base.meta = { model_id: (s as ModelHintSlot).canonicalId }
+      }
+      return base
+    }),
+  )
+  return { content, applied }
 }

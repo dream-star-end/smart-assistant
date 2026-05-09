@@ -43,6 +43,16 @@ export interface ModelPricing {
    * - hidden:仅在 model_visibility_grants 里(连 admin 默认也看不到)
    */
   visibility: ModelVisibility;
+  /**
+   * 0060 引入。Per-model extra_system_prompt — 拼接到 CCB/codex extra-prompt.md 末尾,
+   * 用于纠正特定模型的默认行为(例:DeepSeek V4 Pro 看到 "explicit success signals"
+   * 后会过早 yield,通过这一段告诉它"不要 yield,继续推进")。
+   *
+   * - NULL / 空字串 / 纯空白 → 不注入(等同未设置)
+   * - 长度上限 4096 字符,DB CHECK 约束 + admin patch normalize 双重防御
+   * - 修改后**仅对新 spawn 生效**;运行中的 CCB/codex subprocess 不会被换文案
+   */
+  extra_system_prompt: string | null;
   updated_at: Date;
 }
 
@@ -74,6 +84,7 @@ type RawRow = {
   enabled: boolean;
   sort_order: number;
   visibility: string;
+  extra_system_prompt: string | null;
   updated_at: Date;
 };
 
@@ -91,6 +102,7 @@ function rowToPricing(r: RawRow): ModelPricing {
     enabled: r.enabled,
     sort_order: r.sort_order,
     visibility: vis,
+    extra_system_prompt: r.extra_system_prompt,
     updated_at: r.updated_at,
   };
 }
@@ -196,7 +208,7 @@ export class PricingCache {
               cache_read_per_mtok::text  AS cache_read_per_mtok,
               cache_write_per_mtok::text AS cache_write_per_mtok,
               multiplier::text           AS multiplier,
-              enabled, sort_order, visibility, updated_at
+              enabled, sort_order, visibility, extra_system_prompt, updated_at
          FROM model_pricing`,
     );
     const next = new Map<string, ModelPricing>();
@@ -328,4 +340,29 @@ export class PricingCache {
       .sort((a, b) => a.sort_order - b.sort_order)
       .map(this.toPublicModel);
   }
+}
+
+/**
+ * 0060 — 给 gateway promptSlots 用的 ModelHintProvider 工厂。
+ *
+ * 抽出为独立函数(而不是把 lambda 内联在 commercial bootstrap 里),只为一个目的:
+ * 让"raw model 入参 → canonical id 来自 DB row"这条 cardinality-DoS 防线
+ * 能被单测直接覆盖,而不必启 commercial 整套 app。
+ *
+ * 行为契约:
+ *   - 命中且 extra_system_prompt 非空 → { id: row.model_id, text: row.extra_system_prompt }
+ *   - 未命中 / 字段为 null → null
+ *   - canonical id 永远是 PricingCache row 的 model_id —— 不是 spawn 入参,
+ *     由此严格约束 gateway modelHintAppliedTotal label 的 cardinality 上界
+ *     为 model_pricing 表行数,挡住外部 raw 串投毒(详见 promptSlots.ts 注释)。
+ */
+export function createModelHintProvider(
+  cache: PricingCache,
+): (modelId: string) => { id: string; text: string } | null {
+  return (modelId) => {
+    const p = cache.get(modelId);
+    const text = p?.extra_system_prompt ?? null;
+    if (!text) return null;
+    return { id: p!.model_id, text };
+  };
 }

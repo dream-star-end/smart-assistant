@@ -6,6 +6,7 @@ import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { resolveMcpMemoryEntry } from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
+import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -864,7 +865,7 @@ export class SubprocessRunner extends EventEmitter {
 
     // Build merged extra system prompt via structured prompt slots
     try {
-      const promptContent = await buildPromptContext({
+      const promptResult = await buildPromptContext({
         agentId: this.opts.agentId,
         persona: this.opts.persona,
         provider: this.opts.agentProvider ?? this.opts.config.provider,
@@ -875,10 +876,29 @@ export class SubprocessRunner extends EventEmitter {
         // Phase 5:GitHub repo 当前快照(none / cloning / ready / failed) — 决定是否注入 REPO slot。
         repoSnapshot,
       })
-      if (promptContent) {
+      if (promptResult.content) {
         const path = resolve(sessionDir, 'extra-prompt.md')
-        writeFileSync(path, promptContent)
+        writeFileSync(path, promptResult.content)
         out.extraPromptFile = path
+      }
+      // observability:MODEL_HINT 命中(per-model 行为补丁注入)→ structured log + prom counter。
+      // 不打 prompt 原文(可能含敏感引导),只记 sha256[:8] + bytes。
+      // 关键安全约束:label 与 log 字段都只用 hint.meta.model_id(provider 已 canonicalize),
+      // 不携带 spawn 入参的 raw model — 后者外部可控,用作 label 会撑爆 Prom counter
+      // cardinality(观测面 DoS),作为日志字段同样会污染按字段建索引的日志后端。
+      // 需要 raw → canonical 的对应关系时,用 sessionKey/agentId 与上下文 launch log 关联。
+      const hint = promptResult.applied.find((s) => s.name === 'MODEL_HINT')
+      const canonicalModelId = hint?.meta?.model_id
+      if (hint && canonicalModelId) {
+        runnerLog.info('model_hint_applied', {
+          sessionKey: this.opts.sessionKey,
+          agentId: this.opts.agentId,
+          model_id: canonicalModelId,
+          backend: 'ccb',
+          hint_bytes: hint.bytes,
+          hint_sha256: hint.sha256.slice(0, 8),
+        })
+        modelHintAppliedTotal.inc({ model_id: canonicalModelId, backend: 'ccb' })
       }
     } catch (err) {
       runnerLog.warn(

@@ -41,6 +41,7 @@ const PRICING: ModelPricing = {
   enabled: true,
   sort_order: 0,
   visibility: "public",
+  extra_system_prompt: null,
   updated_at: new Date(0),
 };
 
