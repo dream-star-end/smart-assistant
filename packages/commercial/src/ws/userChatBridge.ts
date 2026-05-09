@@ -1058,6 +1058,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const pgPoolBound = deps.pgPool;
       const peers = Array.from(lastHelloPeerIds);
       ;(async () => {
+        // v1.0.119 — 微任务死循环根因修复。
+        //   旧实现:finally 里只判 size > 0 就同步递归调 tryAutoRebindFlush。
+        //   触发条件:hello peers 与 pendingRebindMap.sessionIds 不交集时
+        //   buildAutoRebindFrames 返回 matchedSessionIds=[],没消化任何 row,
+        //   pendingRebindMap.size 不变,finally 立即再次自调 → V8 microtask
+        //   永远 spin(strace 100% getpid),event loop 拿不回控制权 → healthz
+        //   timeout → wedge。生产 2026-05-09 多次复发由此 bug 触发。
+        //   修复:仅在本轮"取得进展"(至少消化一行 pending row)时才再触发。
+        //   未取得进展 = 当前 hello peers 与 map 不重叠,继续 flush 也是 no-op,
+        //   等下一次外部信号(新 hello / 新 fetch)即可。
+        let progressMade = false;
         try {
           const built = await buildAutoRebindFrames(
             pgPoolBound,
@@ -1065,6 +1076,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             peers,
             pendingRebindMap,
           );
+          if (built.matchedSessionIds.length > 0) progressMade = true;
           for (const sid of built.matchedSessionIds) pendingRebindMap.delete(sid);
           for (const f of built.frames) {
             const buf = Buffer.from(JSON.stringify(f), "utf8");
@@ -1090,8 +1102,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           });
         } finally {
           autoRebindFlushInFlight = false;
-          // 若 flush 期间又有新 hello peers / 新 fetch row 进来,再触发一轮
+          // 仅在本轮真消化了 row(progressMade)时才再触发,否则当前 hello peers
+          // 与 pendingRebindMap 不交集,继续 flush 是 no-op 死循环。
           if (
+            progressMade &&
             lastHelloPeerIds !== null &&
             lastHelloPeerIds.size > 0 &&
             pendingRebindMap.size > 0
