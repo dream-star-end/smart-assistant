@@ -10,14 +10,18 @@
  *       4. 失败 → throw RefreshError(code 不同),账号是否禁用看错误类型
  *
  * 失败都通过 `RefreshError` 抛,调用方据 `code` 分类。
- * **禁用策略**(Codex review 1bacae8 收紧):
+ * **禁用策略**(Codex review 1bacae8 收紧 → 2026-05-09 round 2 BLOCKER#1 再细化):
  *   - `account_not_found` — 读账号返 null(也许被并发删了),不禁(无可禁)
  *   - `no_refresh_token` — DB 里没 refresh_token,**禁用**(永久无法自救)
- *   - `network_transient` — fetch 抛(底层网络/DNS/TLS/代理不通)→ **不禁用**;
+ *   - `network_transient` — 底层网络异常(fetch throw / DNS / TLS / 代理不通)
+ *     **或** 上游响应 5xx / 408 / 425 / 429 → **不禁用**;
  *     按账号 egress_proxy 后,代理一抖等于全池烧光,代价过大;
+ *     5xx 同理 — Cloudflare / 上游 OAuth gateway 抖一次不该把整池烧掉。
  *     上层 scheduler.release 按 `kind:"transient_network"` 处理(H9):
- *     dec inflight slot 但**不扣健康分**,避免代理一抖就把整池账号连环 cooldown/disable
- *   - `http_error` — 上游返 4xx/5xx → **禁用**(显式服务端拒绝,通常是 token 真坏)
+ *     dec inflight slot 但**不扣健康分**。
+ *     transient 列表见 `isTransientHttpStatus()`。
+ *   - `http_error` — 上游返非 transient 4xx(400/401/403/404 等明确拒绝)→
+ *     **禁用**(token 已 invalid_grant / refresh_token revoked / client 被吊销)
  *   - `bad_response` — 2xx 但 JSON 解析失败 / 缺 access_token,**禁用**
  *   - `persist_error` — 远端 refresh 成功了,但本地 updateAccount 抛了;
  *     为避免"本地仍是旧 token 但账号还 active"的失控场面,**一律禁用**并抛
@@ -33,12 +37,7 @@ import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import type { AccountHealthTracker } from './health.js'
 import { recordRefreshEvent } from './refreshEvents.js'
-import {
-  type AccountPlan,
-  getCodexTokenSnapshot,
-  getTokenForUse,
-  updateAccount,
-} from './store.js'
+import { type AccountPlan, getCodexTokenSnapshot, getTokenForUse, updateAccount } from './store.js'
 
 /**
  * Fire-and-forget refresh-event 落库。失败仅 console.warn,不打断主流程。
@@ -195,6 +194,32 @@ interface OAuthRefreshJson {
   expires_in?: unknown
   expires_at?: unknown
   token_type?: unknown
+}
+
+/**
+ * HTTP 状态码是否应视作 transient(短暂故障)而非永久拒绝。
+ *
+ * **设计意图**:OAuth refresh 端点上游(Anthropic / OpenAI gateway / Cloudflare)
+ * 可能瞬时返 5xx 或 429 — 这是基础设施抖动,不是 token 真坏。如果一律按
+ * `http_error` + `disableOnFailure` 处理,代理 / upstream 抖一次就把整池
+ * 账号烧光,代价过大。
+ *
+ * **判定**:
+ *   - 408 Request Timeout
+ *   - 425 Too Early
+ *   - 429 Too Many Requests
+ *   - 500/502/503/504 等所有 5xx
+ *   → 视作 transient,抛 `network_transient`,**不 disable**;调度器层按
+ *     `kind:"transient_network"` 释放。
+ *
+ *   - 其它 4xx(400/401/403/404 等):服务端明确拒绝(invalid_grant /
+ *     refresh_token revoked / 客户端被吊销),按 `http_error` + disable。
+ *
+ * 与 codex review 2026-05-09 的反馈一致(round 2 BLOCKER#1)。
+ */
+export function isTransientHttpStatus(status: number): boolean {
+  if (status >= 500) return true
+  return status === 408 || status === 425 || status === 429
 }
 
 function computeExpiresAt(parsed: OAuthRefreshJson, now: Date): Date {
@@ -360,6 +385,14 @@ async function refreshAccountTokenInner(
   }
 
   if (result.status < 200 || result.status >= 300) {
+    if (isTransientHttpStatus(result.status)) {
+      // 5xx / 408 / 425 / 429:upstream / gateway / 限流抖动 — 不 disable,
+      // 上游 scheduler.release 按 kind:"transient_network" 处理(同网络异常)。
+      safeRecordRefreshEvent(accountId, false, 'network_transient', `HTTP ${result.status}`)
+      throw new RefreshError('network_transient', `refresh endpoint transient ${result.status}`, {
+        status: result.status,
+      })
+    }
     await disableOnFailure(deps, accountId, `refresh_http_${result.status}`)
     // err_msg 仅含 status 整数 — 安全(非敏感)。不写 result.body 避免泄露 token 残片。
     safeRecordRefreshEvent(accountId, false, 'http_error', `HTTP ${result.status}`)
@@ -539,6 +572,15 @@ async function refreshCodexAccountTokenInner(
   }
 
   if (result.status < 200 || result.status >= 300) {
+    if (isTransientHttpStatus(result.status)) {
+      // codex (auth.openai.com) 同样可能瞬时 5xx/429 — 走 transient 不 disable
+      safeRecordRefreshEvent(accountId, false, 'network_transient', `HTTP ${result.status}`)
+      throw new RefreshError(
+        'network_transient',
+        `codex refresh endpoint transient ${result.status}`,
+        { status: result.status },
+      )
+    }
     await disableOnFailure(deps as RefreshDeps, accountId, `refresh_http_${result.status}`)
     safeRecordRefreshEvent(accountId, false, 'http_error', `HTTP ${result.status}`)
     throw new RefreshError('http_error', `codex refresh endpoint returned ${result.status}`, {
