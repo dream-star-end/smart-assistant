@@ -1763,6 +1763,31 @@ export class SessionManager {
                   : {}),
               }
             : undefined
+          // Issue A v1.0.108 — codex `account/rateLimits/updated` snapshot piggy-back。
+          // CodexAppServerRunner.runTurn 在 emitResult 时把最新已知 rateLimits 挂在
+          // msg.rateLimits;sessionManager 这里**透传**到 codex_billing 事件,server.ts
+          // 再写到 OutboundCodexBilling.rateLimits 帧给 master.userChatBridge 落库。
+          // typeof 防御保持与 usage 同样宽松,容器旧版本不会带本字段。
+          const rl = (msg as { rateLimits?: unknown }).rateLimits
+          const rateLimitsPayload =
+            rl && typeof rl === 'object'
+              ? (() => {
+                  const r = rl as Record<string, unknown>
+                  const out: {
+                    util5h?: number
+                    reset5h?: string
+                    util7d?: number
+                    reset7d?: string
+                  } = {}
+                  // Codex review MINOR:边界层用 Number.isFinite 拒掉 NaN/Infinity,
+                  // 否则会被 JSON 序列化成 null 进 wire,下游 quota.ts 行为不可预测。
+                  if (typeof r.util5h === 'number' && Number.isFinite(r.util5h)) out.util5h = r.util5h
+                  if (typeof r.reset5h === 'string') out.reset5h = r.reset5h
+                  if (typeof r.util7d === 'number' && Number.isFinite(r.util7d)) out.util7d = r.util7d
+                  if (typeof r.reset7d === 'string') out.reset7d = r.reset7d
+                  return Object.keys(out).length > 0 ? out : undefined
+                })()
+              : undefined
           // wrappedOnEvent 不动:billing 帧不计 turnBlockCount/turnPermissionCount,
           // phantom-turn 判定不该把 billing 算成"输出"。直接调 onEvent。
           onEvent({
@@ -1772,6 +1797,7 @@ export class SessionManager {
             durationMs: typeof msg.duration_ms === 'number' ? msg.duration_ms : 0,
             ...(usagePayload ? { usage: usagePayload } : {}),
             ...(errReason ? { errorReason: errReason } : {}),
+            ...(rateLimitsPayload ? { rateLimits: rateLimitsPayload } : {}),
           })
         }
         parser.parse(msg)

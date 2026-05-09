@@ -63,6 +63,7 @@ import {
   type CodexFinalizeHandle,
 } from "../billing/codexFinalizer.js";
 import type { TokenUsage } from "../billing/calculator.js";
+import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import type { GithubSelectionRow } from "../github/sessionWorkspaces.js";
 import {
@@ -505,6 +506,10 @@ interface CodexTurnSnapshot {
   requestId: string;
   /** preCheck 时取的 model id(audit / log)。 */
   model: string;
+  /** Issue A v1.0.108 — billing 帧的 codex_billing 分支需要根据账号 id 把
+   *  rateLimits 落到 claude_accounts.quota_*(maybeUpdateAccountQuotaCodex)。
+   *  bigint 0n = legacy 无关联账号(quota writer 内部跳过)。 */
+  accountId: bigint;
 }
 
 export interface UserChatBridgeHandler {
@@ -1716,6 +1721,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 finalizer,
                 requestId,
                 model: effectiveModel,
+                // Issue A v1.0.108 — codex_billing 分支落 quota 用,与 finalizer
+                // closure 里的 accountIdForLedger 同源。
+                accountId: accountIdForLedger,
               });
 
               // Frame rewrite:server-owned requestId 覆盖 client 任意值。容器侧
@@ -1960,6 +1968,38 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // _done 守门只防 ledger 重复 debit,但两个 IIFE 各自 await commit 后
             // 都会读 result.debitedCredits>0 各广播一次 — 用 Map.delete 早断。
             inflightCodexTurns.delete(reqId);
+            // Issue A v1.0.108 — codex `account/rateLimits/updated` 通知 piggy-back
+            // 到 billing 帧的 rateLimits 字段(runner 已转 Anthropic-shape)。
+            // 与 ledger commit 解耦走独立 fire-and-forget,理由:
+            //   - quota 是 best-effort 可见性,不应被 ledger commit 结果阻塞
+            //   - 写在 commit 之前,避免 commit IIFE swallow exception 时 quota 也被吞
+            //   - quota.ts 内部对 accountId === 0n / "0" 跳过(legacy 无关联账号)
+            //   - quota.ts 30s SQL+JS 双层 throttle 兜底重复写
+            const billingRl = (parsedBilling as { rateLimits?: unknown }).rateLimits;
+            if (
+              billingRl &&
+              typeof billingRl === "object" &&
+              deps.pgPool
+            ) {
+              const r = billingRl as {
+                util5h?: number;
+                reset5h?: string;
+                util7d?: number;
+                reset7d?: string;
+              };
+              void maybeUpdateAccountQuotaCodex(
+                deps.pgPool,
+                snap.accountId,
+                r,
+              ).catch((err) => {
+                log?.debug("user-chat-bridge: codex quota write failed", {
+                  uid: uid.toString(),
+                  connId,
+                  requestId: reqId,
+                  err: (err as Error)?.message,
+                });
+              });
+            }
             const codexStatus: "success" | "error" =
               billing.status === "error" ? "error" : "success";
             const errorReason = typeof billing.errorReason === "string"

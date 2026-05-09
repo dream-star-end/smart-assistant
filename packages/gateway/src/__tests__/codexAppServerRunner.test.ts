@@ -16,6 +16,9 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { paths } from '@openclaude/storage'
 import {
+  _CODEX_5H_WINDOW_MINS,
+  _CODEX_7D_WINDOW_MINS,
+  _parseCodexRateLimits,
   CodexAppServerRunner,
   _classifyJsonRpcLine,
   _codexUsageToAnthropicShape,
@@ -1765,6 +1768,235 @@ describe('PR2 v1.0.66 — requestId queue-entry transit', () => {
     })
     assert.equal(usage.input_tokens, 800)
     assert.equal(usage.cache_read_input_tokens, 0)
+  })
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Issue A v1.0.108 — codex `account/rateLimits/updated` 通知解析 + 落到
+  // emitResult.rateLimits → outbound.codex_billing.rateLimits → quota DB。
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it('_parseCodexRateLimits: 双窗口带 windowDurationMins 路由到正确桶', () => {
+    const rl = {
+      primary: { usedPercent: 42, resetsAt: 1714425600, windowDurationMins: _CODEX_5H_WINDOW_MINS },
+      secondary: { usedPercent: 17, resetsAt: 1714512000, windowDurationMins: _CODEX_7D_WINDOW_MINS },
+    }
+    const out = _parseCodexRateLimits(rl)
+    assert.ok(out, 'should parse')
+    assert.equal(out!.util5h, 42)
+    assert.equal(out!.util7d, 17)
+    assert.equal(out!.reset5h, new Date(1714425600 * 1000).toISOString())
+    assert.equal(out!.reset7d, new Date(1714512000 * 1000).toISOString())
+  })
+
+  it('_parseCodexRateLimits: 7d-only plan 即使无 windowDurationMins,带 duration 仍精确路由', () => {
+    const rl = {
+      secondary: { usedPercent: 60, resetsAt: 1714512000, windowDurationMins: _CODEX_7D_WINDOW_MINS },
+    }
+    const out = _parseCodexRateLimits(rl)
+    assert.ok(out)
+    assert.equal(out!.util7d, 60)
+    assert.equal(out!.util5h, undefined)
+    assert.equal(out!.reset5h, undefined)
+  })
+
+  it('_parseCodexRateLimits: 单窗口且无 windowDurationMins → 拒绝写入(NEEDS-FIX 1)', () => {
+    // free / usage-based plan 可能只发一个窗口且无 duration 标识 — 不能强行
+    // 当成 5h 写,会污染 admin UI。
+    const rl = { primary: { usedPercent: 80, resetsAt: 1714425600 } }
+    const out = _parseCodexRateLimits(rl)
+    assert.equal(out, null)
+  })
+
+  it('_parseCodexRateLimits: 双窗口都无 windowDurationMins → fallback primary=5h secondary=7d', () => {
+    // 双窗口都缺 duration:plus/pro plan 早期版本观察到的形态;允许 fallback。
+    const rl = {
+      primary: { usedPercent: 30, resetsAt: 1714425600 },
+      secondary: { usedPercent: 12, resetsAt: 1714512000 },
+    }
+    const out = _parseCodexRateLimits(rl)
+    assert.ok(out)
+    assert.equal(out!.util5h, 30)
+    assert.equal(out!.util7d, 12)
+  })
+
+  it('_parseCodexRateLimits: clamp usedPercent to 0..100', () => {
+    const rl = {
+      primary: { usedPercent: 150, windowDurationMins: _CODEX_5H_WINDOW_MINS },
+      secondary: { usedPercent: -5, windowDurationMins: _CODEX_7D_WINDOW_MINS },
+    }
+    const out = _parseCodexRateLimits(rl)
+    assert.ok(out)
+    assert.equal(out!.util5h, 100)
+    assert.equal(out!.util7d, 0)
+  })
+
+  it('_parseCodexRateLimits: resetsAt 缺失 / null → 只更 util 不更 reset', () => {
+    const rl = {
+      primary: { usedPercent: 22, windowDurationMins: _CODEX_5H_WINDOW_MINS },
+    }
+    const out = _parseCodexRateLimits(rl)
+    assert.ok(out)
+    assert.equal(out!.util5h, 22)
+    assert.equal(out!.reset5h, undefined)
+  })
+
+  it('_parseCodexRateLimits: 全空 snapshot → null', () => {
+    assert.equal(_parseCodexRateLimits({}), null)
+    assert.equal(_parseCodexRateLimits(null), null)
+    assert.equal(_parseCodexRateLimits('not-an-object'), null)
+  })
+
+  it('_parseCodexRateLimits: resetsAt 已是毫秒 (>1e12) 不再 *1000', () => {
+    // 防御性兼容:如果哪天 codex 改成 ms epoch,我们不会得到 1715... 年
+    const ms = Date.now()
+    const rl = {
+      primary: { usedPercent: 50, resetsAt: ms, windowDurationMins: _CODEX_5H_WINDOW_MINS },
+    }
+    const out = _parseCodexRateLimits(rl)
+    assert.ok(out)
+    assert.equal(out!.reset5h, new Date(ms).toISOString())
+  })
+
+  it('handleNotification("account/rateLimits/updated") 写入 latestRateLimits;runTurn emitResult 带上', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    // 注入一个最小化 ensureSpawned + drain stub 让 runTurn 能完整跑过 emitResult
+    runner.ensureSpawned = async () => {}
+    runner.attached = true
+    runner.threadId = 'thread-test'
+    runner.sendRequest = async (method: string) => {
+      if (method === 'turn/start') return { turn: { id: 'turn-1' } }
+      return undefined
+    }
+
+    // 模拟先收到 account/rateLimits/updated(turn 还没开始也可以 — 不 clear at turn start)
+    runner.handleNotification('account/rateLimits/updated', {
+      rateLimits: {
+        primary: { usedPercent: 33, resetsAt: 1714425600, windowDurationMins: _CODEX_5H_WINDOW_MINS },
+        secondary: { usedPercent: 8, resetsAt: 1714512000, windowDurationMins: _CODEX_7D_WINDOW_MINS },
+      },
+    })
+    assert.deepEqual(runner.latestRateLimits, {
+      util5h: 33,
+      reset5h: new Date(1714425600 * 1000).toISOString(),
+      util7d: 8,
+      reset7d: new Date(1714512000 * 1000).toISOString(),
+    })
+
+    // 触发 turn/completed 让 runTurn 走到 emitResult
+    setTimeout(() => {
+      runner.handleNotification('turn/completed', {
+        turnId: 'turn-1',
+        turn: { id: 'turn-1', status: 'completed', durationMs: 5 },
+      })
+    }, 1)
+    await runner.runTurn('hi', 'req-rl-1')
+
+    const resultMsg = h.messages.find((m: any) => m.type === 'result' && m.requestId === 'req-rl-1')
+    assert.ok(resultMsg, 'emitResult must fire')
+    assert.deepEqual(resultMsg.rateLimits, {
+      util5h: 33,
+      reset5h: new Date(1714425600 * 1000).toISOString(),
+      util7d: 8,
+      reset7d: new Date(1714512000 * 1000).toISOString(),
+    })
+    await h.cleanup()
+  })
+
+  it('handleNotification("account/rateLimits/updated") top-level snapshot fallback 兼容', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    // 容器旧版本可能直接把 snapshot 放 params 顶层(无 rateLimits 包装)
+    runner.handleNotification('account/rateLimits/updated', {
+      primary: { usedPercent: 7, windowDurationMins: _CODEX_5H_WINDOW_MINS },
+    })
+    assert.equal(runner.latestRateLimits?.util5h, 7)
+    await h.cleanup()
+  })
+
+  it('latestRateLimits 粘性 + dedup:同值仅首次 emit 带,变更后再 emit', async () => {
+    // round-2 dedup(Codex review NEEDS-FIX 2):latestRateLimits 不在 turn 边界
+    // clear,但 emitResult 现场对比上次发出的 JSON 序列化 — 相同 → 不带,
+    // 避免下游 quota_updated_at 假刷新。
+    const h = await makeHarness()
+    const runner = h.runner as any
+    runner.ensureSpawned = async () => {}
+    runner.attached = true
+    runner.threadId = 'thread-multi'
+    runner.sendRequest = async (method: string) => {
+      if (method === 'turn/start') {
+        return { turn: { id: `turn-${runner._turnCounter++}` } }
+      }
+      return undefined
+    }
+    runner._turnCounter = 1
+
+    // 先收一帧 rateLimits
+    runner.handleNotification('account/rateLimits/updated', {
+      rateLimits: {
+        primary: { usedPercent: 15, windowDurationMins: _CODEX_5H_WINDOW_MINS },
+      },
+    })
+
+    // turn1 — 第一次 emit,带 rateLimits
+    setTimeout(() => {
+      runner.handleNotification('turn/completed', {
+        turnId: 'turn-1',
+        turn: { id: 'turn-1', status: 'completed', durationMs: 1 },
+      })
+    }, 1)
+    await runner.runTurn('first', 'req-1')
+
+    // turn2,无新 notification — dedup 应让 result 不带 rateLimits
+    setTimeout(() => {
+      runner.handleNotification('turn/completed', {
+        turnId: 'turn-2',
+        turn: { id: 'turn-2', status: 'completed', durationMs: 1 },
+      })
+    }, 1)
+    await runner.runTurn('second', 'req-2')
+
+    // turn3,**收到新 notification**(util 改 15→25)— 应再带
+    runner.handleNotification('account/rateLimits/updated', {
+      rateLimits: {
+        primary: { usedPercent: 25, windowDurationMins: _CODEX_5H_WINDOW_MINS },
+      },
+    })
+    setTimeout(() => {
+      runner.handleNotification('turn/completed', {
+        turnId: 'turn-3',
+        turn: { id: 'turn-3', status: 'completed', durationMs: 1 },
+      })
+    }, 1)
+    await runner.runTurn('third', 'req-3')
+
+    const r1 = h.messages.find((m: any) => m.type === 'result' && m.requestId === 'req-1')
+    const r2 = h.messages.find((m: any) => m.type === 'result' && m.requestId === 'req-2')
+    const r3 = h.messages.find((m: any) => m.type === 'result' && m.requestId === 'req-3')
+    assert.equal(r1?.rateLimits?.util5h, 15, 'turn1 first emit carries snapshot')
+    assert.equal(r2?.rateLimits, undefined, 'turn2 dedup skips identical snapshot')
+    assert.equal(r3?.rateLimits?.util5h, 25, 'turn3 carries newly observed snapshot')
+    await h.cleanup()
+  })
+
+  it('_parseCodexRateLimits: resetsAt 越界(>Date 范围)→ util 仍写,reset 丢弃不抛', () => {
+    // Codex review NEEDS-FIX:容器侧 JSON-RPC 任意输入,Date max ≈ ±8.64e15 ms。
+    // 超出后 toISOString 会 RangeError;实现用 d.getTime() finite 检查规避。
+    const rl = {
+      primary: {
+        usedPercent: 50,
+        // 1e16 sec → 1e19 ms,远超 Date 上界 8.64e15 ms
+        resetsAt: 1e16,
+        windowDurationMins: _CODEX_5H_WINDOW_MINS,
+      },
+    }
+    let out: ReturnType<typeof _parseCodexRateLimits> | undefined
+    assert.doesNotThrow(() => {
+      out = _parseCodexRateLimits(rl)
+    })
+    assert.ok(out)
+    assert.equal(out!.util5h, 50, 'util still written even when reset invalid')
+    assert.equal(out!.reset5h, undefined, 'invalid Date silently dropped')
   })
 
   it('runTurn catch 路径 emitResult 也带 requestId(B.4 要求异常也能 settle)', async () => {

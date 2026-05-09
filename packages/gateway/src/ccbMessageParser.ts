@@ -102,6 +102,15 @@ export type SessionStreamEvent =
         reasoning_output_tokens?: number
       }
       errorReason?: string
+      // Issue A v1.0.108 — codex account/rateLimits/updated 快照,piggy-back 到 billing
+      // 终态帧让 master.userChatBridge 落库到 claude_accounts。utilization 0..100,
+      // resetsAt ISO8601(runner 已把 epoch sec 转 ISO,bridge 不再二次解析)。
+      rateLimits?: {
+        util5h?: number
+        reset5h?: string
+        util7d?: number
+        reset7d?: string
+      }
     }
 
 /** Detected tool_use that may need bridging (CronCreate, CronDelete, etc.) */

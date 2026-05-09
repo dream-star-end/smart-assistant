@@ -5494,6 +5494,10 @@ export class Gateway {
           durationMs: e.durationMs,
           ...(e.usage ? { usage: e.usage } : {}),
           ...(e.errorReason ? { errorReason: e.errorReason } : {}),
+          // Issue A v1.0.108 — codex rateLimits 快照,master.userChatBridge 落库到
+          // claude_accounts.quota_*。container/runtime 与 master 协议层都已扩 schema,
+          // optional 字段缺省时自然不带,与旧版本 master 向后兼容。
+          ...(e.rateLimits ? { rateLimits: e.rateLimits } : {}),
           ...(((out as OutboundMessage & { _userId?: string })._userId)
             ? { _userId: (out as OutboundMessage & { _userId?: string })._userId }
             : {}),

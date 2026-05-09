@@ -171,6 +171,10 @@ interface RunnerMessage {
     cache_creation_input_tokens?: number
     reasoning_output_tokens?: number
   }
+  /** Issue A v1.0.108 — codex `account/rateLimits/updated` 快照(0..100% pct + ISO
+   *  reset)。仅 codex result 帧带,sessionManager 透传到 outbound.codex_billing
+   *  的 rateLimits 字段,master.userChatBridge 落库 claude_accounts.quota_*。 */
+  rateLimits?: RuntimeRateLimits
   event?: unknown
 }
 
@@ -269,6 +273,94 @@ export function _codexUsageToAnthropicShape(turn: CodexTokenBreakdown): {
  *  (e.g. session-init scaffolding). Either one as a tool card produces the
  *  ugly "CODEX:USERMESSAGE" dump boss flagged. */
 const _SUPPRESSED_ITEM_TYPES = new Set<string>(['userMessage', 'hookPrompt'])
+
+/** Issue A v1.0.108 — Anthropic-shape 配额快照(0..100% + ISO8601 reset)。
+ *  落到 OutboundCodexBilling.rateLimits 字段,master.userChatBridge 直接传 quota.ts。
+ *  字段全 optional,允许 plan 类型只有单窗口的情况(e.g. free 只发 7d)。 */
+export interface RuntimeRateLimits {
+  util5h?: number
+  reset5h?: string
+  util7d?: number
+  reset7d?: string
+}
+
+/** codex 5h 窗口对应 windowDurationMins 值(5 * 60)。schema:int64 minutes。 */
+export const _CODEX_5H_WINDOW_MINS = 300
+/** codex 7d 窗口对应 windowDurationMins 值(7 * 24 * 60)。 */
+export const _CODEX_7D_WINDOW_MINS = 10080
+
+/** 解析 codex `account/rateLimits/updated` 通知的 RateLimitSnapshot。
+ *
+ *  schema(/tmp/codex-protocol/v2/AccountRateLimitsUpdatedNotification.json):
+ *    RateLimitSnapshot { credits?, limitId?, limitName?, planType?,
+ *                        primary?: RateLimitWindow, rateLimitReachedType?,
+ *                        secondary?: RateLimitWindow }
+ *    RateLimitWindow { usedPercent: int, resetsAt?: int64 epoch sec,
+ *                      windowDurationMins?: int64 }
+ *
+ *  桶路由:
+ *   - `windowDurationMins === 300` → 5h
+ *   - `windowDurationMins === 10080` → 7d
+ *   - 双窗口都缺 duration 时 fallback `primary=5h secondary=7d`
+ *     (实测 plus/pro 双窗口 plan 上 codex 这个顺序稳定)
+ *   - **单窗口且无 duration 时拒绝写入**(Codex review NEEDS-FIX 1):
+ *     免费/usage-based plan 可能只有 1 个窗口,语义不明,宁可不写也不要写错桶
+ *
+ *  Returns null 当 snapshot 完全无可用窗口。 */
+export function _parseCodexRateLimits(rl: unknown): RuntimeRateLimits | null {
+  if (!rl || typeof rl !== 'object') return null
+  const r = rl as Record<string, unknown>
+  const primary = r.primary && typeof r.primary === 'object' ? (r.primary as Record<string, unknown>) : null
+  const secondary = r.secondary && typeof r.secondary === 'object' ? (r.secondary as Record<string, unknown>) : null
+
+  // 提取每个 window 的 duration(可缺/可 null)
+  const primaryMins = primary && typeof primary.windowDurationMins === 'number' ? primary.windowDurationMins : null
+  const secondaryMins = secondary && typeof secondary.windowDurationMins === 'number' ? secondary.windowDurationMins : null
+
+  // Codex review NEEDS-FIX 1:fallback 仅在双窗口都存在且都无 duration 时启用。
+  // 单窗口 + 无 duration:返回 null,避免把 7d-only plan 错写成 5h。
+  const eligibleFallback =
+    primary !== null && secondary !== null && primaryMins === null && secondaryMins === null
+
+  const out: RuntimeRateLimits = {}
+  const writeWindow = (win: Record<string, unknown>, bucket: '5h' | '7d'): void => {
+    const usedPercent = typeof win.usedPercent === 'number' && Number.isFinite(win.usedPercent) ? win.usedPercent : null
+    const resetsAt = typeof win.resetsAt === 'number' && Number.isFinite(win.resetsAt) && win.resetsAt > 0 ? win.resetsAt : null
+    if (usedPercent !== null) {
+      const clamped = Math.max(0, Math.min(100, usedPercent))
+      if (bucket === '5h') out.util5h = clamped
+      else out.util7d = clamped
+    }
+    if (resetsAt !== null) {
+      // schema 单位 epoch seconds(int64);> 1e12 视为已经是 ms(防御性兼容)
+      const ms = resetsAt >= 1e12 ? resetsAt : resetsAt * 1000
+      // Codex review NEEDS-FIX:容器侧 JSON-RPC 任意输入,Date 越界(>±8.64e15 ms)
+      // 会让 toISOString 抛 RangeError。new Date(invalid) 的 getTime() 返 NaN,
+      // 用此判定避免崩 — 不可解析就丢这个 reset 字段(util 仍写)。
+      const d = new Date(ms)
+      if (Number.isFinite(d.getTime())) {
+        const iso = d.toISOString()
+        if (bucket === '5h') out.reset5h = iso
+        else out.reset7d = iso
+      }
+    }
+  }
+
+  for (const [slot, win, mins] of [
+    ['primary', primary, primaryMins] as const,
+    ['secondary', secondary, secondaryMins] as const,
+  ]) {
+    if (!win) continue
+    let bucket: '5h' | '7d' | null = null
+    if (mins === _CODEX_5H_WINDOW_MINS) bucket = '5h'
+    else if (mins === _CODEX_7D_WINDOW_MINS) bucket = '7d'
+    else if (mins === null && eligibleFallback) bucket = slot === 'primary' ? '5h' : '7d'
+    if (bucket === null) continue
+    writeWindow(win, bucket)
+  }
+
+  return Object.keys(out).length === 0 ? null : out
+}
 
 type JsonRpcLine =
   | {
@@ -371,6 +463,17 @@ export class CodexAppServerRunner extends EventEmitter {
    *  by emitResult on turn/completed; null if no token notifications were
    *  received this turn (codex bug or zero-LLM turn). */
   private currentTurnUsage: CodexTokenBreakdown | null = null
+  /** Issue A v1.0.108 — 最新 codex `account/rateLimits/updated` 快照,piggy-back
+   *  到下一个 emitResult。**故意不在 turn 边界 clear**:让 init 阶段 / 上一 turn
+   *  完成后 / 任意时刻收到的最新值粘住。
+   *  后发 race(turn/completed 之后才到 notification)落到下一 turn 的 billing 帧。 */
+  private latestRateLimits: RuntimeRateLimits | null = null
+  /** Issue A v1.0.108 round-2 — 上次 emitResult 真正带出去的快照 JSON 序列化。
+   *  emitResult 现场对比 latestRateLimits 是否与已发出的相等,相等则**不带 rateLimits**,
+   *  避免下游 quota.ts 在 30s 后把同一份旧数据再 UPDATE 一遍把 quota_updated_at 假刷新
+   *  成 NOW(admin UI 误以为 Codex 刚刚观测过)。
+   *  仅当 latestRateLimits 真正改变(收到新的 account/rateLimits/updated 通知)才带。 */
+  private lastEmittedRateLimitsJson: string | null = null
   /** In-flight `handleItemCompleted` promises for the current turn. codex
    *  emits `item/completed` then `turn/completed` back-to-back; the
    *  per-item handler is async (file IO for imageGeneration base64 decode,
@@ -1018,6 +1121,21 @@ export class CodexAppServerRunner extends EventEmitter {
       this.activeTurnTotal = total
       return
     }
+    if (method === 'account/rateLimits/updated') {
+      // Issue A v1.0.108 — schema 强制 params.rateLimits = RateLimitSnapshot;
+      // 兼容早期 codex 版本可能把 snapshot 直接放在 params 顶层(spike 实测见过),
+      // hit 顶层 fallback 时 debug log 一次方便后续协议漂移诊断(Codex review MINOR 5)。
+      let rl: unknown = p.rateLimits
+      if ((!rl || typeof rl !== 'object') && (p.primary || p.secondary)) {
+        rl = p
+        log.debug('codex account/rateLimits/updated: top-level snapshot fallback', {
+          sessionKey: this.opts.sessionKey,
+        })
+      }
+      const parsed = _parseCodexRateLimits(rl)
+      if (parsed) this.latestRateLimits = parsed
+      return
+    }
     // Other notifications (turn/started, plan/delta, config-warning, etc.)
     // are dropped — they are observability/UI hints that don't gate the
     // turn lifecycle.
@@ -1367,6 +1485,13 @@ export class CodexAppServerRunner extends EventEmitter {
       })
 
       const usagePayload = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
+      // Issue A v1.0.108 — snapshot 当前最新已知 rateLimits piggy-back 到 billing 帧。
+      // **故意不 clear** this.latestRateLimits:让快照粘在 runner instance 上,后到
+      // notification 也能被下一 turn 带出。
+      // round-2 dedup(Codex review NEEDS-FIX 2):若与上次真正发出的快照相等(JSON 序列化对比),
+      // 则不带 rateLimits — 避免下游 quota.ts 在 30s throttle 过期后把同一份旧值再写一次,
+      // 把 quota_updated_at 假刷新成 NOW 误导 admin UI 以为 Codex 刚观测过。
+      const rateLimitsPayload = this._consumeRateLimitsForEmit()
 
       if (status === 'completed') {
         this.emitResult({
@@ -1375,6 +1500,7 @@ export class CodexAppServerRunner extends EventEmitter {
           text: this.currentAssistantBuf,
           usage: usagePayload,
           requestId,
+          rateLimits: rateLimitsPayload,
         })
       } else if (status === 'failed') {
         const errMsg = turn?.error?.message ?? 'codex turn failed'
@@ -1389,7 +1515,14 @@ export class CodexAppServerRunner extends EventEmitter {
             delta: { type: 'text_delta', text: `\n\n[turn failed: ${errMsg}]\n` },
           },
         } as unknown as RunnerMessage)
-        this.emitResult({ durationMs, ok: false, error: errMsg, usage: usagePayload, requestId })
+        this.emitResult({
+          durationMs,
+          ok: false,
+          error: errMsg,
+          usage: usagePayload,
+          requestId,
+          rateLimits: rateLimitsPayload,
+        })
       } else if (status === 'interrupted') {
         // Bill partial work on interrupted turns: codex already charged for
         // tokens before the user hit stop, so emit the delta we observed.
@@ -1399,6 +1532,7 @@ export class CodexAppServerRunner extends EventEmitter {
           error: 'codex turn interrupted',
           usage: usagePayload,
           requestId,
+          rateLimits: rateLimitsPayload,
         })
       } else {
         this.emitResult({
@@ -1407,6 +1541,7 @@ export class CodexAppServerRunner extends EventEmitter {
           error: `codex turn unexpected status=${status ?? 'unknown'}`,
           usage: usagePayload,
           requestId,
+          rateLimits: rateLimitsPayload,
         })
       }
     } catch (err) {
@@ -1432,6 +1567,9 @@ export class CodexAppServerRunner extends EventEmitter {
         ok: false,
         error: `codex app-server: ${(err as Error).message}`,
         requestId,
+        // Issue A v1.0.108 — catch 路径也走 dedup helper(notification 与 turn 异常
+        // 不耦合,init 阶段可能已经收到过快照,但若上一 turn 已发同值就别再发)。
+        rateLimits: this._consumeRateLimitsForEmit(),
       })
       // Do NOT re-throw — drain() catches and rejects the queue entry, but
       // upstream sessionManager handles errors via the result message above.
@@ -1467,6 +1605,21 @@ export class CodexAppServerRunner extends EventEmitter {
     } satisfies RunnerMessage)
   }
 
+  /** Issue A v1.0.108 round-2 — 决定本次 emitResult 是否带 rateLimits。
+   *  规则:latestRateLimits 为 null → 没快照,返 undefined。
+   *  否则与 lastEmittedRateLimitsJson 比较:
+   *   - 不同(包括首次)→ 带,且更新 lastEmittedRateLimitsJson 记忆
+   *   - 相同 → 不带(避免下游 quota_updated_at 假刷新)
+   *  JSON 序列化对比要求 _parseCodexRateLimits 输出 key 顺序稳定 — 当前实现按
+   *  primary→secondary、字段按写入顺序固定,序列化稳定。 */
+  private _consumeRateLimitsForEmit(): RuntimeRateLimits | undefined {
+    if (this.latestRateLimits === null) return undefined
+    const json = JSON.stringify(this.latestRateLimits)
+    if (json === this.lastEmittedRateLimitsJson) return undefined
+    this.lastEmittedRateLimitsJson = json
+    return this.latestRateLimits
+  }
+
   private emitResult(opts: {
     durationMs: number
     ok: boolean
@@ -1481,6 +1634,9 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     /** PR2 v1.0.66 — caller(runTurn)从 closure 拿;不读 instance 字段防 race。 */
     requestId?: string
+    /** Issue A v1.0.108 — runTurn 在 emitResult 现场从 instance 字段拿最新已知
+     *  rateLimits 快照传进来。null/undefined → 不带本字段。 */
+    rateLimits?: RuntimeRateLimits
   }): void {
     const msg: RunnerMessage = {
       type: 'result',
@@ -1492,6 +1648,7 @@ export class CodexAppServerRunner extends EventEmitter {
       result: opts.ok ? (opts.text ?? '') : (opts.error ?? 'codex error'),
       usage: opts.usage,
       requestId: opts.requestId,
+      ...(opts.rateLimits ? { rateLimits: opts.rateLimits } : {}),
     }
     this.emit('message', msg)
   }

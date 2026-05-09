@@ -93,32 +93,30 @@ export function _quotaOutstanding(): number {
 // ─── 主入口 ───────────────────────────────────────────────────────
 
 /**
- * 从 headers 解析配额并尝试 UPDATE 账号。
+ * 内部共享 core writer — Anthropic header 路径与 codex notification 路径都走这里,
+ * 保证两个入口共享 lastAttempt + outstanding 模块状态(防止双写同一账号)。
  *
- * **fire-and-forget 语义**:返 Promise<void>,失败 → resolve(swallow);
- * 调用方 `.catch(() => {})` 兜一下也无所谓。永远不抛。
+ * 调用前已经把 raw 输入解析成 number(0..100)/Date/null,本函数只负责:
+ *  1) 全 null 早返
+ *  2) 进程内 30s throttle(per accountId)
+ *  3) 全局 outstanding cap 检查
+ *  4) SQL UPDATE(自带 WHERE 兜底节流)
+ *  5) outstanding 计数 finally 恢复
  *
- * @param pool       PG 池(与结算路径共用,所以本函数刻意 best-effort)
- * @param accountId  bigint,内部 toString 走 ::bigint cast
- * @param headers    fetch Response.headers / 任何 .get(name) 接口
- * @param now        测试可注入(默认 Date.now())
+ * 永不抛(catch swallow),调用方 .catch(() => {}) 兜底也无副作用。
  */
-export async function maybeUpdateAccountQuota(
+async function _writeQuotaCore(
   pool: Pool,
-  accountId: bigint | string,
-  headers: HeaderGetter,
-  now: () => number = Date.now,
+  key: string,
+  util5h: number | null,
+  reset5h: Date | null,
+  util7d: number | null,
+  reset7d: Date | null,
+  now: () => number,
 ): Promise<void> {
-  // 解析 4 个 header — 全 null 直接 return,不算失败。
-  const util5h = parseUtil(headers.get('anthropic-ratelimit-unified-5h-utilization'))
-  const reset5h = parseResetEpoch(headers.get('anthropic-ratelimit-unified-5h-reset'))
-  const util7d = parseUtil(headers.get('anthropic-ratelimit-unified-7d-utilization'))
-  const reset7d = parseResetEpoch(headers.get('anthropic-ratelimit-unified-7d-reset'))
   if (util5h === null && reset5h === null && util7d === null && reset7d === null) {
     return
   }
-
-  const key = String(accountId)
 
   // 第一层:进程内 30s throttle
   const t = now()
@@ -144,6 +142,9 @@ export async function maybeUpdateAccountQuota(
     // 偶发只返一组 header,UI 会把"未刷新的另一组"误当 fresh。
     // 当前 prod Anthropic 行为是两组 header 永远同时返,该假设成立;
     // 若未来出现 partial 模式,改为拆 quota_5h_updated_at / quota_7d_updated_at。
+    //
+    // codex 路径(Issue A v1.0.108)上单窗口 plan 会 partial 写,COALESCE 让另一组
+    // 沿用旧值,但 quota_updated_at 仍刷新 — 同 Anthropic partial 假设,目前可接受。
     await pool.query(
       `UPDATE claude_accounts
           SET quota_5h_pct       = COALESCE($2::numeric, quota_5h_pct),
@@ -162,4 +163,76 @@ export async function maybeUpdateAccountQuota(
   } finally {
     outstanding--
   }
+}
+
+/**
+ * 从 headers 解析配额并尝试 UPDATE 账号。
+ *
+ * **fire-and-forget 语义**:返 Promise<void>,失败 → resolve(swallow);
+ * 调用方 `.catch(() => {})` 兜一下也无所谓。永远不抛。
+ *
+ * @param pool       PG 池(与结算路径共用,所以本函数刻意 best-effort)
+ * @param accountId  bigint,内部 toString 走 ::bigint cast
+ * @param headers    fetch Response.headers / 任何 .get(name) 接口
+ * @param now        测试可注入(默认 Date.now())
+ */
+export async function maybeUpdateAccountQuota(
+  pool: Pool,
+  accountId: bigint | string,
+  headers: HeaderGetter,
+  now: () => number = Date.now,
+): Promise<void> {
+  // legacy/无关联账号防御:bigint 0n / 字符串 "0" 是 anthropicProxy 在没 per-account
+  // 关联时塞的占位值,SQL 无 id=0 的行,跳过避免无意义 throttle 占位。
+  const key = String(accountId)
+  if (key === '0') return
+
+  const util5h = parseUtil(headers.get('anthropic-ratelimit-unified-5h-utilization'))
+  const reset5h = parseResetEpoch(headers.get('anthropic-ratelimit-unified-5h-reset'))
+  const util7d = parseUtil(headers.get('anthropic-ratelimit-unified-7d-utilization'))
+  const reset7d = parseResetEpoch(headers.get('anthropic-ratelimit-unified-7d-reset'))
+  await _writeQuotaCore(pool, key, util5h, reset5h, util7d, reset7d, now)
+}
+
+/**
+ * Issue A v1.0.108 — codex `account/rateLimits/updated` 通知 → claude_accounts 配额。
+ *
+ * 入参 snap 已经在 gateway/codexAppServerRunner._parseCodexRateLimits 解析为
+ * Anthropic-shape(util 0..100 number, reset ISO8601 string),本函数只校验类型 +
+ * 转换为 _writeQuotaCore 期望的 (number|null, Date|null) 后委派。
+ *
+ * 与 maybeUpdateAccountQuota 共享模块级 lastAttempt + outstanding,
+ * 同账号双路径都打不会两边 30s 各刷一次。
+ *
+ * fire-and-forget 语义、永不抛 — 与 header 路径一致。
+ */
+export async function maybeUpdateAccountQuotaCodex(
+  pool: Pool,
+  accountId: bigint | string,
+  snap: {
+    util5h?: number
+    reset5h?: string
+    util7d?: number
+    reset7d?: string
+  },
+  now: () => number = Date.now,
+): Promise<void> {
+  // legacy/无关联账号防御(Codex review NEEDS-FIX 3):0n 在 ledger 路径表示
+  // "无 per-account 关联",写 quota 没意义且会污染 lastAttempt Map。
+  const key = String(accountId)
+  if (key === '0') return
+
+  const validUtil = (v: unknown): number | null =>
+    typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : null
+  const validReset = (v: unknown): Date | null => {
+    if (typeof v !== 'string' || v.length === 0) return null
+    const t = Date.parse(v)
+    return Number.isFinite(t) ? new Date(t) : null
+  }
+
+  const util5h = validUtil(snap.util5h)
+  const reset5h = validReset(snap.reset5h)
+  const util7d = validUtil(snap.util7d)
+  const reset7d = validReset(snap.reset7d)
+  await _writeQuotaCore(pool, key, util5h, reset5h, util7d, reset7d, now)
 }

@@ -361,6 +361,26 @@ export const OutboundCodexBilling = Type.Object({
   ),
   /** error 状态下的简短原因(故障定位 / journal 落库),不返回给 user。 */
   errorReason: Type.Optional(Type.String()),
+  /** Issue A v1.0.108 — codex `account/rateLimits/updated` 通知 piggy-back 到本帧
+   *  让 master.userChatBridge 落库到 claude_accounts.quota_5h_pct/quota_5h_resets_at/
+   *  quota_7d_pct/quota_7d_resets_at,与 Anthropic 路径(M9 quota.ts)字段对齐。
+   *
+   *  字段语义:
+   *    util5h/util7d  — 0..100 number(usedPercent),与 Anthropic header parseUtil 输出对齐
+   *    reset5h/reset7d — ISO8601 string(epoch sec → toISOString 在 runner 完成),
+   *                     bridge 不再二次解析
+   *
+   *  缺省语义:整体 Optional → 当前 turn 没有新 rateLimits notification 不带本字段;
+   *  内部所有子字段也 Optional,允许只更新 5h 或只更新 7d(单窗口 plan 的常态)。
+   *  下游 quota.ts COALESCE 兜底未传字段沿用旧值。 */
+  rateLimits: Type.Optional(
+    Type.Object({
+      util5h: Type.Optional(Type.Number()),
+      reset5h: Type.Optional(Type.String()),
+      util7d: Type.Optional(Type.Number()),
+      reset7d: Type.Optional(Type.String()),
+    }),
+  ),
 })
 export type OutboundCodexBilling = Static<typeof OutboundCodexBilling>
 
