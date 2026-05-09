@@ -14,7 +14,7 @@
  *
  * 合同:
  *   - ContainerSpec 只携带"因容器而异"的字段;所有 v3 容器必须的硬化选项
- *     (CapDrop NET_RAW+NET_ADMIN、no-new-privileges、User=1000:1000、Tmpfs
+ *     (CapDrop NET_RAW+NET_ADMIN、User=1000:1000、Tmpfs
  *     /run/oc/claude-config、MemorySwap=Memory、Swappiness=0、NetworkMode=
  *     openclaude-v3-net、IPAMConfig.IPv4Address=boundIp、UsernsMode=""、
  *     ShmSize=64MB、RestartPolicy=no)由 backend 内部固定
@@ -232,7 +232,9 @@ export class LocalDockerBackend {
           CapDrop: ["NET_RAW", "NET_ADMIN"],
           CapAdd: [],
           Privileged: false,
-          SecurityOpt: ["no-new-privileges"],
+          // SecurityOpt: ["no-new-privileges"] 已于 2026-05-09 (D1) 移除 —
+          // 见 v3supervisor.ts 同位置详细注释。两条本机路径必须一致。
+          SecurityOpt: [],
           Tmpfs: {
             [V3_CONFIG_TMPFS_PATH]:
               "rw,nosuid,nodev,size=4m,mode=0700,uid=1000,gid=1000",

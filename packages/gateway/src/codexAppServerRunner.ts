@@ -97,6 +97,42 @@ interface PendingRequest {
   method: string
 }
 
+/** Structured error produced by `sendRequest` when codex replies with a
+ *  JSON-RPC error frame. Callers can branch on `rpcCode` / `rpcMessage` /
+ *  `rpcMethod` without re-parsing `message`; the human-readable `message`
+ *  is preserved (`"<method> -> <code>: <message>"`) for log/UI use. */
+export interface JsonRpcCallError extends Error {
+  rpcCode: number
+  rpcMessage: string
+  rpcMethod: string
+}
+
+/** Detect codex's "thread/resume against a thread whose rollout is no longer
+ *  on disk" failure mode. Triggered when v3 commercial containers idle-rebuild
+ *  and their `~/.codex/sessions/...` JSONL is wiped while master gateway still
+ *  holds the old `thread_id` in resume-map.json. The fix is a transparent
+ *  thread/start fallback (see runTurn attach block).
+ *
+ *  Three guards (Codex review #019e0b72 BLOCKER 1):
+ *   - `rpcMethod === 'thread/resume'` — only this method can produce the
+ *     missing-rollout case; other methods returning -32600 mean something else.
+ *   - `rpcCode === -32600` — JSON-RPC "Invalid Request" code that codex 0.125
+ *     reuses for missing rollout (verified via spike).
+ *   - `/no rollout found/i` — text guard so a future codex release that
+ *     repurposes -32600 for protocol/schema drift (e.g. param shape change)
+ *     won't be silently downgraded into "start a fresh thread". Drift should
+ *     surface as a hard error instead. */
+export function isMissingRolloutError(err: unknown): err is JsonRpcCallError {
+  if (!(err instanceof Error)) return false
+  const e = err as Partial<JsonRpcCallError>
+  return (
+    e.rpcMethod === 'thread/resume' &&
+    e.rpcCode === -32600 &&
+    typeof e.rpcMessage === 'string' &&
+    /no rollout found/i.test(e.rpcMessage)
+  )
+}
+
 /** Runner message shape used by sessionManager.ts (subset of SdkMessage). */
 interface RunnerMessage {
   type: string
@@ -772,7 +808,20 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       this.pending.delete(numId)
       if (msg.error) {
-        p.reject(new Error(`${p.method} -> ${msg.error.code}: ${msg.error.message}`))
+        // Structured reject: keep the human message for log/UI use, but also
+        // attach `rpcCode` / `rpcMessage` / `rpcMethod` so callers can branch
+        // on protocol-level fields without re-parsing the message string. The
+        // self-heal in runTurn (attach → thread/resume → -32600 "no rollout
+        // found") relies on these fields to avoid swallowing unrelated
+        // -32600 Invalid Request errors (e.g. schema/protocol drift) as a
+        // missing-rollout case (Codex review #019e0b72 BLOCKER 1).
+        const err = new Error(
+          `${p.method} -> ${msg.error.code}: ${msg.error.message}`,
+        ) as JsonRpcCallError
+        err.rpcCode = msg.error.code
+        err.rpcMessage = msg.error.message
+        err.rpcMethod = p.method
+        p.reject(err)
       } else {
         p.resolve(msg.result)
       }
@@ -1114,6 +1163,41 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
   }
 
+  /** Spawn a brand-new codex thread and wire its id into runner state +
+   *  resume-map. Used both for the "first ever turn" path and the "old
+   *  thread_id has no rollout, transparently restart" self-heal. Caller is
+   *  responsible for setting `this.attached = true` after this resolves —
+   *  attach state is per-proc, not per-thread.
+   *
+   *  v3 token usage reset (Codex review #019e0b90 BLOCKER 1): on the self-heal
+   *  path the runner instance has been alive across the dead thread, so the
+   *  thread-scoped token-usage baselines (`priorTurnTotal`/`activeTurnTotal`/
+   *  `currentTurnUsage`) carry stale totals from the old thread. The new
+   *  thread's first `thread/tokenUsage/updated` frame would otherwise be
+   *  diffed against the old thread's baseline → underbilling or clamp-to-zero.
+   *  Resetting all three here is a no-op on the cold-start path (they're
+   *  already null on construction) and load-bearing on the self-heal path. */
+  private async _startNewThread(): Promise<void> {
+    const res = (await this.sendRequest('thread/start', {
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      cwd: this.opts.cwd,
+      ...(this.opts.model ? { model: this.opts.model } : {}),
+    })) as { thread?: { id?: string } } | undefined
+    const tid = res?.thread?.id
+    if (typeof tid !== 'string' || !tid) {
+      throw new Error('thread/start did not return thread.id')
+    }
+    this.threadId = tid
+    this.priorTurnTotal = null
+    this.activeTurnTotal = null
+    this.currentTurnUsage = null
+    // sessionManager listens for this and writes the new id (+ provider tag)
+    // to resume-map.json, so the *next* turn against this sessionKey resumes
+    // against the fresh thread instead of looping back into -32600.
+    this.emit('session_id', tid)
+  }
+
   private async runTurn(prompt: string, requestId?: string): Promise<void> {
     const startedAt = Date.now()
     log.info('codex app-server turn start', {
@@ -1142,26 +1226,40 @@ export class CodexAppServerRunner extends EventEmitter {
       //      thread/resume against the captured threadId.
       if (!this.attached) {
         if (!this.threadId) {
-          const res = (await this.sendRequest('thread/start', {
-            approvalPolicy: 'never',
-            sandbox: 'danger-full-access',
-            cwd: this.opts.cwd,
-            ...(this.opts.model ? { model: this.opts.model } : {}),
-          })) as { thread?: { id?: string } } | undefined
-          const tid = res?.thread?.id
-          if (typeof tid !== 'string' || !tid) {
-            throw new Error('thread/start did not return thread.id')
-          }
-          this.threadId = tid
-          this.emit('session_id', tid)
+          await this._startNewThread()
         } else {
-          await this.sendRequest('thread/resume', {
-            threadId: this.threadId,
-            approvalPolicy: 'never',
-            sandbox: 'danger-full-access',
-            cwd: this.opts.cwd,
-            ...(this.opts.model ? { model: this.opts.model } : {}),
-          })
+          try {
+            await this.sendRequest('thread/resume', {
+              threadId: this.threadId,
+              approvalPolicy: 'never',
+              sandbox: 'danger-full-access',
+              cwd: this.opts.cwd,
+              ...(this.opts.model ? { model: this.opts.model } : {}),
+            })
+          } catch (err) {
+            // Self-heal "no rollout found for thread id" (-32600). Caused by
+            // master sessionManager persisting `thread_id` across container
+            // rebuilds while the codex `~/.codex/sessions/...` rollout JSONL
+            // lives only in the per-container ephemeral layer. Without this,
+            // every fresh container's first GPT turn ended in a 31ms empty
+            // result frame and the user saw "未收到回复" (Codex review
+            // #019e0b72 BLOCKER 1, root cause confirmed by user).
+            //
+            // Trade-off: we lose conversation context for that one turn since
+            // the rollout really is gone. emit('session_id') feeds the new
+            // tid back into sessionManager → resume-map, so subsequent turns
+            // recover normally. Any other thread/resume error (proc died,
+            // schema drift, etc.) re-throws so the outer catch surfaces it
+            // as ok=false rather than masking it with a fresh thread.
+            if (!isMissingRolloutError(err)) throw err
+            log.warn('codex thread/resume missing rollout — restarting fresh', {
+              sessionKey: this.opts.sessionKey,
+              staleThreadId: this.threadId,
+              rpcMessage: (err as JsonRpcCallError).rpcMessage,
+            })
+            this.threadId = null
+            await this._startNewThread()
+          }
         }
         this.attached = true
       }

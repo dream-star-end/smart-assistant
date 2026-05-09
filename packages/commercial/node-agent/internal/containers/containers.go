@@ -220,8 +220,12 @@ func (r *Runner) exec(ctx context.Context, args ...string) (string, error) {
 }
 
 // Run 创建并启动容器。docker run args 跟 master LocalDockerBackend 的 HostConfig
-// 严格一致(硬化选项:User 1000:1000、CapDrop NET_RAW/NET_ADMIN、no-new-privileges、
+// 严格一致(硬化选项:User 1000:1000、CapDrop NET_RAW/NET_ADMIN、
 // MemorySwap=Memory、Swappiness=0、Tmpfs /run/oc/claude-config、ShmSize 64m)。
+//
+// `--security-opt no-new-privileges` 已于 2026-05-09 (D1) 移除,见 master
+// containerService.ts / v3supervisor.ts 同位置注释。两端必须一致,否则
+// remote host 上的容器跟本机硬化策略不一致。
 func (r *Runner) Run(ctx context.Context, req *RunRequest) (*RunResponse, error) {
 	if err := ValidateContainerName(req.Name); err != nil {
 		return nil, err
@@ -287,7 +291,8 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest) (*RunResponse, error)
 		"--restart", "no",
 		"--cap-drop", "NET_RAW",
 		"--cap-drop", "NET_ADMIN",
-		"--security-opt", "no-new-privileges",
+		// "--security-opt no-new-privileges" 已于 2026-05-09 (D1) 移除 —
+		// agent 用户配 NOPASSWD ALL sudo,no-new-privileges 会禁掉 setuid。
 		"--memory", fmt.Sprintf("%db", req.MemoryBytes),
 		"--memory-swap", fmt.Sprintf("%db", req.MemoryBytes), // 禁 swap
 		"--memory-swappiness", "0",

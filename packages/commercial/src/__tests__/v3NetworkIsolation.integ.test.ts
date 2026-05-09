@@ -12,7 +12,7 @@ import { statSync } from "node:fs";
  *
  * 这里只验证容器侧的运行时安全契约(独立于 supervisor / PG / readiness)。
  * 直接 docker.createContainer({...}) 用与 v3supervisor 同款的 HostConfig 安全标志
- * (NET_RAW/NET_ADMIN drop + no-new-privileges + non-root + 固定 --ip),
+ * (NET_RAW/NET_ADMIN drop + non-root + 固定 --ip),
  * 然后从容器内部探测以下三件事:
  *
  *   1. CapBnd 不含 NET_RAW(bit 13)/NET_ADMIN(bit 12) — kernel 真的接受了 cap-drop
@@ -135,7 +135,10 @@ before(async () => {
         CapDrop: ["NET_RAW", "NET_ADMIN"],
         CapAdd: [],
         Privileged: false,
-        SecurityOpt: ["no-new-privileges"],
+        // 2026-05-09 (D1): no-new-privileges 移除。这里跟着生产路径(见
+        // v3supervisor.ts / containerService.ts)保持一致,否则 integ
+        // 容器跟生产容器硬化策略不同会让测试失去代表性。
+        SecurityOpt: [],
         RestartPolicy: { Name: "no", MaximumRetryCount: 0 },
         ShmSize: 64 * 1024 * 1024,
       },

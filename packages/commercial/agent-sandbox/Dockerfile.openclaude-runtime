@@ -46,8 +46,14 @@ ENV TZ=Asia/Shanghai \
 #   - ripgrep / jq: 个人版 grep tool / 通用 shell 工具链
 #   - tini: PID 1 转发 SIGTERM 给 entrypoint,避免 zombie
 #   - bash: entrypoint.sh 用 bash
-# 不装: sudo / su / vim / python3(用户不应在容器内开 shell;agent 需要
-# 时由 ccb 子进程通过 Bash tool 执行,直接走 bash + apt 在 ccb 上下文里装)
+#   - sudo: 见下方 sudoers 段。agent 用户 NOPASSWD ALL,因为 codex 频繁需要
+#     `sudo apt install`、`sudo systemctl ...` 之类的系统操作,过去缺 sudo 时
+#     会被 codex 误以为"环境受限"放弃任务(2026-05-09 boss 反馈)。
+#   - python3 / python3-pip / python3-venv: codex 频繁跑 pip install + .py
+#     脚本 + 数据分析,缺 python 时要么放弃要么走 sudo apt install 当场补,
+#     每次新容器都装一遍纯属浪费。venv 让 pip 在 PEP-668 限制下不报错。
+#     不装 build-essential / python3-dev — 200MB+ 占用,确实需要时通过 sudo
+#     apt install 当场补足够。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git \
@@ -57,9 +63,21 @@ RUN apt-get update \
         jq \
         tini \
         bash \
+        sudo \
+        python3 \
+        python3-pip \
+        python3-venv \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
-    # 清掉 setuid/setgid 二进制(05-SEC §13 精神,减少本地提权面)
-    && find / -xdev -perm -4000 -type f 2>/dev/null | xargs -r chmod u-s \
+    # 清掉 setuid/setgid 二进制(05-SEC §13 精神,减少本地提权面)。
+    # **例外**: 保留 /usr/bin/sudo 的 setuid bit — sudo 二进制必须 setuid root
+    # 才能切换权限,否则 NOPASSWD ALL 会失效。这是 D1 设计上的 trade-off:
+    # 我们接受"容器内 root 可达"的风险,因为外层 docker namespaces + uid=1000
+    # 强制(supervisor User=1000:1000)+ no-new-privileges 移除(见 v3supervisor.ts)
+    # 共同构成隔离边界。配套验证:容器启动后 `sudo -n true` 必须成功(见
+    # entrypoint smoke 验证,如果将来加的话)。
+    && find / -xdev -perm -4000 -type f 2>/dev/null \
+        | grep -v '^/usr/bin/sudo$' \
+        | xargs -r chmod u-s \
     && find / -xdev -perm -2000 -type f 2>/dev/null | xargs -r chmod g-s
 
 # ------------------------------------------------------------
@@ -69,7 +87,17 @@ RUN apt-get update \
 # v3 容器复用同一份 codex CLI 二进制,gateway 选到 gpt-5.5 时,sessionManager 通过
 # `runnerKind:'app-server'` 路由到 CodexAppServerRunner,长驻一个 codex app-server 子进程。
 #
-# 版本 pin 0.125.0:与个人版生产环境一致,避免 daily build 引入 protocol 漂移。
+# 版本 pin 0.130.0(2026-05-09 升级,从 0.125 → 0.130):codex 当前最新 stable。
+# 升级原因:同 commit 修了 thread/resume 缺 rollout 的空回复故障(见
+# codexAppServerRunner.ts 自愈逻辑),顺带升版本拿 0.126-0.130 之间的 bug fix。
+# Protocol 兼容性: 已审查 release notes + JSON-RPC schema(涉及 thread/start
+# + thread/resume + turn/start 三个 method,commandExecution / fileChange /
+# imageGeneration / agentMessage / reasoning 五种 item type),0.125 → 0.130
+# 之间未见 breaking change。**真正 e2e 行为验证是发布门槛**: 镜像 build 完
+# 后必须在 dev 环境跑一次 GPT 5.5 真 turn(包含 image_gen 调用,因为本文件
+# 下方的 system-skill seed 段当初是按 0.125 行为写的)再 ship 生产。出现
+# 协议漂移则把版本回滚到 0.125 并重 build。
+#
 # 全局装到 /usr/local/lib/node_modules/@openai/codex,二进制 symlink 在 /usr/local/bin/codex。
 # 容器内 USER=agent 走默认 PATH 即可命中。
 #
@@ -78,7 +106,7 @@ RUN apt-get update \
 # entrypoint.ts 在 CODEX_HOME 下建 symlink auth.json → /run/oc/codex-auth/auth.json,
 # 后者是 supervisor 把 host 剥离 refresh_token 的 auth.json 目录 ro bind-mount 进来的源。
 # 详见 packages/gateway/src/codexAuthSync.ts + v3supervisor.ts 的 V3_CODEX_AUTH_RO_MOUNT。
-RUN npm install -g @openai/codex@0.125.0 --no-audit --no-fund \
+RUN npm install -g @openai/codex@0.130.0 --no-audit --no-fund \
     && npm cache clean --force \
     && rm -rf /root/.npm
 
@@ -141,7 +169,49 @@ RUN set -eux; \
     mkdir -p /run/oc/claude-config/projects; \
     chown -R agent:agent /run/oc/claude-config; \
     chmod 0700 /run/oc/claude-config; \
-    chmod 0700 /run/oc/claude-config/projects
+    chmod 0700 /run/oc/claude-config/projects; \
+    # ── D1 (2026-05-09): agent NOPASSWD ALL sudo ────────────────────────
+    # Codex 在容器内执行系统级操作(apt install / chown / systemctl)时
+    # 频繁需要 sudo。过去缺 sudo 时 codex 会误认为环境受限放弃任务。
+    #
+    # 安全权衡(全套配套): 此 sudoers + 保留 /usr/bin/sudo setuid bit + 移除
+    #   v3supervisor.ts SecurityOpt no-new-privileges 共同生效。容器内 agent
+    #   可升级到 root,**但仍受**:
+    #     - docker namespace 隔离(pid/mount/uts/ipc/net 都独立),即使 root
+    #       也不能直接访问宿主进程或文件系统
+    #     - capabilities 集合: docker 默认 root 保留 CHOWN / DAC_OVERRIDE /
+    #       FOWNER / SETUID / SETGID / NET_BIND_SERVICE 等,**但默认不含
+    #       CAP_SYS_ADMIN**,所以 mount / setns / pivot_root 等 namespace
+    #       级操作仍受限。我们 cap-drop 又把 NET_RAW / NET_ADMIN 也去掉了,
+    #       raw socket / 改路由 / iptables 都不行
+    #     - cgroups 资源限制(memory/cpus/pids)
+    #     - bridge net 隔离(走单独子网 + supervisor 强制 bound_ip)
+    #     - supervisor 启动进程 User=1000:1000(以 agent 起,要 sudo 才提权)
+    #     - host volume 绝不挂敏感路径,只挂 named volume + codex-auth ro bind
+    #
+    # 已知风险:
+    #   - 容器内 root 可改本容器 named volume 的 ownership/mode,可能造成持久化
+    #     状态投毒(自家用户的数据,只影响该用户自己)
+    #   - 未开 userns-remap 时,容器 uid 0 直接映射到 host uid 0(同一 uid
+    #     namespace);capabilities 仍受 namespace 约束所以**不等同**于宿主
+    #     普通 root 进程,但若存在 docker daemon / runc / kernel breakout
+    #     CVE,影响面会比开了 userns-remap 大。建议中长期评估 userns-remap。
+    #
+    # validate 用 visudo -c 防止语法错把 sudo 整体废掉,build 即 fail。
+    echo 'agent ALL=(ALL:ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent; \
+    chmod 0440 /etc/sudoers.d/agent; \
+    visudo -cf /etc/sudoers.d/agent; \
+    # ── Build-time smoke gate (Codex review #019e0b72 round 2 必修 #2) ─
+    # visudo -cf 只校验 sudoers 语法,catch 不到:
+    #   - sudo 二进制 setuid bit 被前面 strip 误删(应被 grep -v 排除)
+    #   - sudo 路径不在 /usr/bin/sudo(Debian slim 实际位置)
+    #   - 容器外 SecurityOpt no-new-privileges 残留(虽然 build 时无法测,
+    #     但 setuid + 静态 sudoers 的本地 sudo 必须能过)
+    # 用 `runuser` 切到 agent 跑 `sudo -n true` 真实模拟运行时升权。如果
+    # any of (setuid stripped / sudoers wrong / sudo path off) 发生,
+    # 这一行会 exit ≠0 → docker build fail-fast。
+    test -u /usr/bin/sudo || (echo "FATAL: /usr/bin/sudo lost setuid bit" && exit 1); \
+    runuser -u agent -- sudo -n true || (echo "FATAL: agent sudo -n true failed at build" && exit 1)
 
 # ------------------------------------------------------------
 # Personal-version 源码 + npm install

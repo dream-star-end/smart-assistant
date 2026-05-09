@@ -1739,9 +1739,39 @@ export async function provisionV3Container(
             // §9.3 cap-drop NET_RAW + NET_ADMIN(防 raw socket 伪造源 IP / 改路由)
             CapDrop: ["NET_RAW", "NET_ADMIN"],
             CapAdd: [],
-            // 禁 privileged + 禁 setuid/setgid 提权
+            // 禁 privileged
             Privileged: false,
-            SecurityOpt: ["no-new-privileges"],
+            // SecurityOpt: ["no-new-privileges"] 已于 2026-05-09 (D1) 移除。
+            //
+            // 移除原因: codex 频繁需要 sudo apt install / 系统级配置, 镜像
+            // 已为 agent (uid=1000) 配 NOPASSWD ALL sudoers (见 Dockerfile
+            // /etc/sudoers.d/agent)。`no-new-privileges` 内核标记会阻止 exec
+            // 继承新权限, sudo 即使保留 setuid bit 也无效。
+            //
+            // 配套兜底:
+            //   - docker namespace (pid/mount/uts/ipc/net) 隔离,容器 root
+            //     不能直接访问宿主进程/文件系统
+            //   - capabilities: docker 默认 root 保留 CHOWN / DAC_OVERRIDE /
+            //     FOWNER / SETUID / SETGID 等, **但默认不含 CAP_SYS_ADMIN**,
+            //     mount/setns/pivot_root 等 namespace 级操作仍受限。CapDrop
+            //     又去掉 NET_RAW + NET_ADMIN, raw socket / 路由改写 / iptables
+            //     即使 root 也不行
+            //   - cgroups 资源限制 (Memory/NanoCpus/PidsLimit)
+            //   - bridge net 单独子网, 走 supervisor 的 bound_ip 入站策略
+            //   - 任何 host 敏感路径都没挂进容器, 只挂 named volume +
+            //     codex-auth ro bind
+            //   - supervisor 启动 User=1000:1000, 进程默认以 agent 起,
+            //     必须主动 sudo 才提权
+            //
+            // 已知风险扩展面:
+            //   - 容器内 root 可改本容器 named volume ownership/mode -> 用户
+            //     自家状态投毒 (只伤自己)
+            //   - 未开 userns-remap 时容器 uid 0 直接映射 host uid 0 (同一
+            //     uid namespace), capabilities 仍受容器 namespace 约束所以
+            //     **不等同**宿主普通 root, 但若有 docker daemon / runc /
+            //     kernel breakout CVE 风险面更大。中长期评估 userns-remap。
+            // 安全权衡详见 Dockerfile.openclaude-runtime sudoers 段注释。
+            SecurityOpt: [],
             // CLAUDE_CONFIG_DIR tmpfs(防 ~/.claude/settings.json 残留)
             // uid/gid=1000 必须显式给 — 容器跑 agent (1000:1000),tmpfs 默认 root:root
             // 0700 会让 ccb 子进程 EACCES 读写 settings.json,表现为静默 exit 0(踩雷于 2026-04-21)

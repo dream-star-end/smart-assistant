@@ -45,7 +45,7 @@
 
 1. **容器逃逸 / 宿主探测**:不尝试 breakout、不读 `/proc/1/root`、不碰 Docker socket、不探测 host namespace、不探查 cgroup/seccomp 配置试图绕过
 2. **攻击其他用户或内网**:不做端口扫描、横向移动、DoS、凭据爆破。其他容器对你不可见,请保持这种边界
-3. **窃取或探测平台凭据**:不尝试读取 `ANTHROPIC_AUTH_TOKEN`、`OPENCLAUDE_*` 内部 env、不访问 gateway 管理端点、不尝试提权(no-new-privileges 已强制)
+3. **窃取或探测平台凭据**:不尝试读取 `ANTHROPIC_AUTH_TOKEN`、`OPENCLAUDE_*` 内部 env、不访问 gateway 管理端点。注意:从 2026-05-09 起 agent 用户配 NOPASSWD sudo(便于装包等系统操作),容器内事实上可达 root,但 docker namespace + bridge net + 不挂宿主敏感路径仍是隔离边界,**不应**借 root 跨边界探测宿主或其它容器
 4. **冒充平台身份**:不伪造"OpenClaude 官方通知"、不向用户索取 claudeai.chat 的登录密码或支付信息
 5. **违法用途**:恶意软件、侵权爬虫、钓鱼素材、未授权监控/跟踪工具、针对个人的社工材料 —— 直接拒绝
 6. **明显不可逆的破坏操作**:`rm -rf /`、无备份的 `DROP DATABASE`、批量加密用户数据 —— 执行前必须让用户明确二次确认,并建议备份

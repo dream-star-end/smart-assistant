@@ -474,8 +474,11 @@ describe("provisionV3Container", () => {
     assert.deepEqual(opts.HostConfig?.CapDrop, ["NET_RAW", "NET_ADMIN"]);
     assert.deepEqual(opts.HostConfig?.CapAdd, []);
 
-    // SecurityOpt no-new-privileges + Privileged false
-    assert.ok(opts.HostConfig?.SecurityOpt?.includes("no-new-privileges"));
+    // Privileged false。SecurityOpt 自 2026-05-09 (D1) 起为空数组 — 移除
+    // no-new-privileges 是为了让 agent 用户 NOPASSWD sudo 生效(详见
+    // v3supervisor.ts SecurityOpt 段注释)。这里显式断言空,避免未来回滚不
+    // 经意带回 no-new-privileges 而 sudo 又静默失败。
+    assert.deepEqual(opts.HostConfig?.SecurityOpt ?? [], []);
     assert.equal(opts.HostConfig?.Privileged, false);
 
     // tmpfs /run/oc/claude-config
