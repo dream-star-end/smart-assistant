@@ -1445,10 +1445,11 @@ export function connect() {
     //   - provisioning: NameConflict / IP 池满等 catch-all
     //   - starting:     provision 后等 healthz / running+healthz timeout
     //                   (首登冷启 5-10s 最常见的路径)
-    //   - stopped:      容器停了等 idle sweep + 下次 ws 重连 provision
     // host_gone 故意排除:hosts 行被外部删除,容器 row 还指向已不存在的
     //   host_id,5s 短重试无法自恢复,banner 文案会误导用户期望。
-    const PROVISIONING_REASONS = ['provisioning', 'starting', 'stopped']
+    // 'stopped' 已废弃(v1.0.117 起后端 stopped/missing 直接走 stopAndRemove +
+    //   reprovision,落到 'provisioning' reason,前端无需再单独识别 stopped)。
+    const PROVISIONING_REASONS = ['provisioning', 'starting']
     let isProvisioning = false
     if ((e.code === 4503 || e.code === 4504) && typeof e.reason === 'string' && e.reason.length > 0) {
       try {

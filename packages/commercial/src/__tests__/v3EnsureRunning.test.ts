@@ -4,8 +4,11 @@
  * 覆盖:
  *   - active+running+healthz ok → 返 {host, port}
  *   - active+running+healthz timeout → ContainerUnreadyError("starting")
- *   - active+stopped → ContainerUnreadyError("stopped", retryAfter=3)
+ *   - active+stopped → stopAndRemove + provision + waitHealthz → 成功(v1.0.117)
+ *   - active+stopped + stopAndRemove 失败 → ContainerUnreadyError("supervisor_error")
+ *   - active+stopped(orphan: container_internal_id=NULL, age<15s)→ vanished + reprovision 成功
  *   - active+missing → stopAndRemove + provision + waitHealthz → 成功
+ *   - 并发 ensureRunning 输家保护(uniq_ac_user_id_active)留 integ 覆盖(FakePool 当前只模拟 bound_ip uniq)
  *   - 无 active 行 → provision + waitHealthz → 成功
  *   - provision 抛(NameConflict / IP 池满)→ ContainerUnreadyError("provisioning")
  *   - getV3ContainerStatus 抛 → ContainerUnreadyError("supervisor_error")
@@ -370,25 +373,99 @@ describe("makeV3EnsureRunning", () => {
     });
   });
 
-  test("active + stopped → ContainerUnreadyError('stopped', retryAfter=3)", async () => {
+  test("active + stopped(docker exited)→ stopAndRemove(标 vanished) + provision 新容器 + ok (v1.0.117)", async () => {
+    // v1.0.117:stopped 与 missing 同走 stopAndRemove + reprovision 路径,
+    // 消除原 ContainerUnreadyError("stopped") 死循环(boss 2026-05-09 实测被卡几分钟)。
     const pool = new FakePool();
     pool.preInsertActive(9, "172.30.1.3", "dockerid-pre-9");
     const { docker, captured } = makeDocker({ inspectState: "stopped" });
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
-      probeHealthz: async () => true,  // 不应被调到
+      probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
       sleep: noSleep,
       now: fixedNow,
     });
 
-    await assert.rejects(ensureRunning(9n), (err) => {
+    const ep = await ensureRunning(9n);
+    assert.strictEqual(ep.host, "172.30.5.42");  // randomIp 注入值(新分配)
+    assert.strictEqual(ep.port, V3_CONTAINER_PORT);
+    assert.strictEqual(ep.coldStart, true);  // 走 provision 分支
+    // 老行已 vanished
+    const oldRow = pool.rows.find((r) => r.id === 1);
+    assert.strictEqual(oldRow?.state, "vanished");
+    // 新行已 active
+    const newRow = pool.rows.find((r) => r.id === 2);
+    assert.strictEqual(newRow?.state, "active");
+    assert.strictEqual(newRow?.user_id, 9);
+    // docker create + start 各一次(新容器)
+    assert.strictEqual(captured.containersCreated, 1);
+    assert.strictEqual(captured.started, 1);
+  });
+
+  test("active + stopped + stopAndRemove(UPDATE)抛 → ContainerUnreadyError('supervisor_error')", async () => {
+    // 与 missing 分支语义一致:stopAndRemoveV3Container 抛 → caller 短重试。
+    const pool = new FakePool();
+    pool.preInsertActive(91, "172.30.1.31", "dockerid-pre-91");
+    const { docker, captured } = makeDocker({ inspectState: "stopped" });
+    // 拦截 UPDATE state='vanished'(stopAndRemove 第一步)让它抛
+    const origQuery = pool.query.bind(pool);
+    pool.query = (async (sql: string, params?: unknown[]) => {
+      if (typeof sql === "string" && /UPDATE agent_containers/i.test(sql) && /SET state='vanished'/i.test(sql)) {
+        throw new Error("simulated DB outage during stopAndRemove");
+      }
+      return origQuery(sql, params);
+    }) as typeof pool.query;
+    const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+      probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
+      sleep: noSleep,
+      now: fixedNow,
+    });
+
+    await assert.rejects(ensureRunning(91n), (err) => {
       assert.ok(err instanceof ContainerUnreadyError);
-      assert.strictEqual(err.reason, "stopped");
-      assert.strictEqual(err.retryAfterSec, ENSURE_RUNNING_DEFAULTS.RETRY_AFTER_STOPPED_SEC);
+      assert.strictEqual(err.reason, "supervisor_error");
+      assert.strictEqual(err.retryAfterSec, ENSURE_RUNNING_DEFAULTS.RETRY_AFTER_PROVISIONING_SEC);
       return true;
     });
-    // MVP 不主动 start 已 stopped 的容器
-    assert.strictEqual(captured.started, 0);
+    // 没创建新容器 — provision 没机会跑
     assert.strictEqual(captured.containersCreated, 0);
+  });
+
+  // 注:并发 ensureRunning 输家保护(uniq_ac_user_id_active)依赖 PG 真索引,
+  //     FakePool 当前只模拟 uniq_ac_bound_ip_active(走 retry-on-conflict 路径,
+  //     不会冒出来给 ensureRunning),要专测 user_id 并发冲突需扩 FakePool。
+  //     这条留 integ 测试覆盖,本文件不加(Codex 提的"建议补",非阻塞)。
+
+  test("active + stopped(orphan: container_internal_id=NULL, age<15s)→ vanished + reprovision (v1.0.117)", async () => {
+    // 边界:provisionV3Container 中途崩了留下的 orphan row(container_internal_id IS NULL)。
+    // getV3ContainerStatus 在 age<15s 时返 state='stopped' + dockerContainerId=""。
+    // 旧行为:ContainerUnreadyError("stopped") 死循环(因为容器并不存在所以永远不会转 running)。
+    // 新行为:统一走 stopAndRemove(对 NULL container_internal_id 提前 return,只翻 row state='vanished')
+    //         然后 fall through provision 重建。uniq_ac_user_id_active 防止留两份 active row。
+    const pool = new FakePool();
+    pool.preInsertActive(92, "172.30.1.32", null);  // container_internal_id=NULL
+    // age<15s:preInsertActive 默认 created_at=now,直接满足
+    const { docker, captured } = makeDocker({ inspectState: "running" });  // 不会被调到(getStatus 不走 inspect)
+    const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+      probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
+      sleep: noSleep,
+      now: fixedNow,
+    });
+
+    const ep = await ensureRunning(92n);
+    assert.strictEqual(ep.host, "172.30.5.42");
+    assert.strictEqual(ep.coldStart, true);
+    // 老 orphan row 已 vanished
+    const oldRow = pool.rows.find((r) => r.id === 1);
+    assert.strictEqual(oldRow?.state, "vanished");
+    // 新 active row
+    const newRow = pool.rows.find((r) => r.user_id === 92 && r.state === "active");
+    assert.ok(newRow, "应有一条新 active row");
+    // docker create + start 各 1 次
+    assert.strictEqual(captured.containersCreated, 1);
+    assert.strictEqual(captured.started, 1);
   });
 
   test("active + missing → stopAndRemove(标 vanished) + provision 新容器 + ok", async () => {

@@ -9,10 +9,10 @@
  *                      │
  *                      ├─ 1. status = getV3ContainerStatus(uid)
  *                      ├─ 2. if status == null  → provisionV3Container(uid)
- *                      ├─ 2. if status.state == 'missing' → stopAndRemove + provision
- *                      ├─ 2. if status.state == 'stopped' → 抛 ContainerUnreadyError(5,"stopped")
- *                      │     (3F idle sweep 会走 stopAndRemove,3D MVP 不主动 startStopped;
- *                      │      MVP 先把"已 stop 的 active 行"当成异常,等 3F 把它清掉)
+ *                      ├─ 2. if status.state == 'stopped'/'missing' → stopAndRemove + provision
+ *                      │     (v1.0.117:stopped 与 missing 合并走 reprovision —— 原 MVP 行为
+ *                      │      "stopped 抛 ContainerUnreadyError 等 3F idle sweep" 实测会让用户在
+ *                      │      docker exit / SIGKILL 等场景死循环重连几分钟;现统一直接清旧 row 重 provision)
  *                      ├─ 3. await waitHealthz(boundIp, port)  (默认 10s 超时,200ms 间隔)
  *                      └─ 4. return { host: boundIp, port }
  *
@@ -76,9 +76,6 @@ const RETRY_AFTER_PROVISIONING_SEC = 5;
  *   - 太长会压沉一台 host(集群只 3 台时尤其明显);60s 给两次重连机会
  */
 const TRANSIENT_HOST_FAULT_COOLDOWN_MS = 60_000;
-
-/** 前端 retry-after 提示秒数(stopped — 等 3F 清理)。短一点,避免用户等久。 */
-const RETRY_AFTER_STOPPED_SEC = 3;
 
 /**
  * V3 Phase 3I — host 容器达 MAX_RUNNING_CONTAINERS 的前端重试秒数。
@@ -232,8 +229,7 @@ export function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerRea
  * 行为分支(bridge 看到的结果):
  *   - active + running + healthz ok        → return {host, port}
  *   - active + running + healthz timeout   → throw ContainerUnreadyError(5, "starting")
- *   - active + stopped                     → throw ContainerUnreadyError(3, "stopped")
- *                                            (3F idle sweep 会清,前端短重试)
+ *   - active + stopped(docker exited)     → stopAndRemove (vanished) + provision + waitHealthz
  *   - active + missing(docker 容器消失)   → stopAndRemove (vanished) + provision + waitHealthz
  *   - 无 active 行                         → provision + waitHealthz
  *   - provision 抛 NameConflict / IP 池满  → ContainerUnreadyError(5, "provisioning")
@@ -241,6 +237,9 @@ export function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerRea
  * 设计取舍:
  *   - 不做 retry / backoff(bridge 自己 close 4503,前端按 retryAfter 重连)
  *   - 不做 lock / mutex(单 host 单进程,DB uniq + INSERT race 已经够;P1 多 host 才需要)
+ *   - stopped/missing 一视同仁(v1.0.117 起):原本 stopped 走 ContainerUnreadyError("stopped")
+ *     等 idleSweep 清,实测会让用户在 docker exit / SIGKILL 等场景下卡几分钟。现在统一
+ *     直接清旧 row 重 provision,体感冷启 5-8s,且当前 deps.image 重建保证滚动升级生效。
  */
 export function makeV3EnsureRunning(
   deps: V3SupervisorDeps,
@@ -321,15 +320,28 @@ export function makeV3EnsureRunning(
       };
     }
 
-    // 2b) stopped(active 行 + container_internal_id 已写但容器没 Running)
-    //     MVP 不主动 start;让 3F idle sweep 走 stopAndRemove + 用户下次 ws 重连时 provision
-    if (status && status.state === "stopped") {
-      throw new ContainerUnreadyError(RETRY_AFTER_STOPPED_SEC, "stopped");
-    }
-
-    // 2c) missing(active 行,但 docker inspect 404 — 容器被外力删了)
-    //     必须先把行标 vanished(stopAndRemove 内部会做),再走 provision 路径
-    if (status && status.state === "missing") {
+    // 2b) stopped / missing —— DB row 仍 'active' 但容器不 Running:
+    //       - stopped: docker exited(典型场景:gateway 进程被 SIGKILL 时容器一起被
+    //         tear down / OOM kill / docker daemon restart / 容器内 OpenClaude 自杀)
+    //       - missing: docker inspect 404(容器被外力删了)
+    //     两态无差别处理:stopAndRemoveV3Container 把 row 翻 vanished + best-effort
+    //     docker stop+remove(stop 对 stopped 容器拿 304 / not-modified 吞掉,对
+    //     missing 容器吞 404),然后 fall through 到 (3) provision 用当前 deps.image
+    //     重建。这样保证滚动升级时旧镜像容器自然被替换成新版,且消除"stopped 永远等
+    //     idleSweep"的死锁(原 MVP 行为 — boss 2026-05-09 实测被卡几分钟才靠手动
+    //     docker start 救活)。用户多等一次冷启 (~5-8s) 但能立刻可用,而非 3s 死循环
+    //     重连等到 idleSweep。
+    //
+    //     User named volumes(主数据 / projects volume / codex auth volume 等)由
+    //     stopAndRemove **不删**,provision 复用 — 数据不丢。IP 立即被 vanished
+    //     释放,新 provision 能拿到同 host 上的新 slot(advisory lock + uniq_ac_user_id_active
+    //     防止并发 ensureRunning 留两条 active 行)。
+    //
+    //     注:此分支也覆盖 getV3ContainerStatus 中的 `container_internal_id IS NULL &&
+    //     age<15s` 边界(provision 事务刚 COMMIT 的极短窗口)。原本那也归 'stopped'
+    //     让用户 3s 重试,但实际容器并不存在所以怎么也不会转 running,旧行为反而是
+    //     死循环。新逻辑直接清掉重建,uniq + lock 保证不会留多份 active row。
+    if (status && (status.state === "stopped" || status.state === "missing")) {
       try {
         await stopAndRemoveV3Container(deps, {
           id: status.containerId,
@@ -561,7 +573,6 @@ export const ENSURE_RUNNING_DEFAULTS = Object.freeze({
   HEALTHZ_PROBE_MS: DEFAULT_HTTP_PROBE_MS,
   WS_PROBE_MS: DEFAULT_WS_PROBE_MS,
   RETRY_AFTER_PROVISIONING_SEC,
-  RETRY_AFTER_STOPPED_SEC,
   RETRY_AFTER_HOST_FULL_SEC,
   RETRY_AFTER_IMAGE_MISSING_SEC,
   RETRY_AFTER_BASELINE_MISSING_SEC,
