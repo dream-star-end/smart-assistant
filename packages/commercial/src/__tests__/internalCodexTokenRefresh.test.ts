@@ -179,6 +179,7 @@ interface WriterCalls {
   local: number
   remote: number
   throwLocal?: Error
+  throwRemote?: Error
 }
 
 function makeWriter(c: WriterCalls): CodexTokenRefreshFileWriter {
@@ -189,6 +190,7 @@ function makeWriter(c: WriterCalls): CodexTokenRefreshFileWriter {
     },
     async writeRemote() {
       c.remote += 1
+      if (c.throwRemote) throw c.throwRemote
     },
   }
 }
@@ -620,5 +622,151 @@ describe('internalCodexTokenRefresh — drift under FOR UPDATE', () => {
     await h(makeReq({ body: '{}', auth: `Bearer ${VALID_TOKEN}` }), res, CTX)
     assert.equal(rec.status, 409)
     assert.equal(writer.local, 0)
+  })
+})
+
+// ─── post-tx ordering (v1.0.116 wedge fix) ──────────────────────────────────
+//
+// v1.0.115 wrote auth.json INSIDE the FOR UPDATE callback, which serialized
+// 60s remote node-agent PUTs on PG pool clients and wedged the master under
+// codex 401 bursts. v1.0.116 moves the file write OUT of the tx callback.
+// These tests pin the new ordering so a future regression cannot silently
+// re-enter-tx without breaking the suite.
+
+describe('internalCodexTokenRefresh — post-tx ordering (file write outside FOR UPDATE)', () => {
+  function makeOrderingDb(state: DbStubState, events: string[]): CodexTokenRefreshDb {
+    return {
+      async readContainerAccount() {
+        events.push('readContainerAccount')
+        return state.initialRow
+      },
+      async txWithLock(_cid, fn) {
+        events.push('tx:begin')
+        const row = state.lockedRow !== undefined ? state.lockedRow : state.initialRow
+        const result = await fn(null as never, row)
+        events.push('tx:commit')
+        return result
+      },
+    }
+  }
+
+  function makeOrderingWriter(
+    events: string[],
+    opts?: { throwRemote?: Error },
+  ): CodexTokenRefreshFileWriter {
+    return {
+      async writeLocal() {
+        events.push('writeLocal')
+      },
+      async writeRemote() {
+        events.push('writeRemote')
+        if (opts?.throwRemote) throw opts.throwRemote
+      },
+    }
+  }
+
+  test('writeLocal happens AFTER tx:commit (not inside FOR UPDATE callback)', async () => {
+    const events: string[] = []
+    const dbState: DbStubState = {
+      initialRow: {
+        codexAccountId: ACCOUNT_ID,
+        userId: USER_ID,
+        state: 'active',
+        hostUuid: VALID_HOST,
+        accountStatus: 'active',
+      },
+    }
+    const h = makeCodexTokenRefreshHandler(
+      makeDeps({
+        db: makeOrderingDb(dbState, events),
+        fileWriter: makeOrderingWriter(events),
+      }),
+    )
+    const { res, rec } = makeRes()
+    await h(makeReq({ body: '{}', auth: `Bearer ${VALID_TOKEN}` }), res, CTX)
+    assert.equal(rec.status, 200)
+    // Critical: writeLocal must come AFTER tx:commit, not between begin/commit.
+    assert.deepEqual(events, ['readContainerAccount', 'tx:begin', 'tx:commit', 'writeLocal'])
+  })
+
+  test('writeRemote happens AFTER tx:commit when host_uuid != self', async () => {
+    const events: string[] = []
+    const dbState: DbStubState = {
+      initialRow: {
+        codexAccountId: ACCOUNT_ID,
+        userId: USER_ID,
+        state: 'active',
+        hostUuid: 'other-host-uuid',
+        accountStatus: 'active',
+      },
+    }
+    const h = makeCodexTokenRefreshHandler(
+      makeDeps({
+        db: makeOrderingDb(dbState, events),
+        fileWriter: makeOrderingWriter(events),
+      }),
+    )
+    const { res, rec } = makeRes()
+    await h(makeReq({ body: '{}', auth: `Bearer ${VALID_TOKEN}` }), res, CTX)
+    assert.equal(rec.status, 200)
+    assert.deepEqual(events, ['readContainerAccount', 'tx:begin', 'tx:commit', 'writeRemote'])
+  })
+
+  test('500 FILE_WRITE_FAILED when writeRemote rejects — tx already committed', async () => {
+    const events: string[] = []
+    const dbState: DbStubState = {
+      initialRow: {
+        codexAccountId: ACCOUNT_ID,
+        userId: USER_ID,
+        state: 'active',
+        hostUuid: 'other-host-uuid',
+        accountStatus: 'active',
+      },
+    }
+    const h = makeCodexTokenRefreshHandler(
+      makeDeps({
+        db: makeOrderingDb(dbState, events),
+        fileWriter: makeOrderingWriter(events, {
+          throwRemote: new Error('node-agent unreachable'),
+        }),
+      }),
+    )
+    const { res, rec } = makeRes()
+    await h(makeReq({ body: '{}', auth: `Bearer ${VALID_TOKEN}` }), res, CTX)
+    assert.equal(rec.status, 500)
+    assert.equal(JSON.parse(rec.body).error.code, 'FILE_WRITE_FAILED')
+    // tx must have committed before writeRemote ran (so no PG client is
+    // held while the remote PUT is in-flight).
+    assert.deepEqual(events, ['readContainerAccount', 'tx:begin', 'tx:commit', 'writeRemote'])
+  })
+
+  test('drift short-circuits before any writer call (tx commits, writer never runs)', async () => {
+    const events: string[] = []
+    const dbState: DbStubState = {
+      initialRow: {
+        codexAccountId: ACCOUNT_ID,
+        userId: USER_ID,
+        state: 'active',
+        hostUuid: VALID_HOST,
+        accountStatus: 'active',
+      },
+      lockedRow: {
+        codexAccountId: ACCOUNT_ID + 1n, // rebound under lock
+        userId: USER_ID,
+        state: 'active',
+        hostUuid: VALID_HOST,
+        accountStatus: 'active',
+      },
+    }
+    const h = makeCodexTokenRefreshHandler(
+      makeDeps({
+        db: makeOrderingDb(dbState, events),
+        fileWriter: makeOrderingWriter(events),
+      }),
+    )
+    const { res, rec } = makeRes()
+    await h(makeReq({ body: '{}', auth: `Bearer ${VALID_TOKEN}` }), res, CTX)
+    assert.equal(rec.status, 409)
+    assert.deepEqual(events, ['readContainerAccount', 'tx:begin', 'tx:commit'])
   })
 })

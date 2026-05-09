@@ -31,7 +31,7 @@
  *     `previousAccountId` (codex protocol param) is purely informational; we
  *     log it but do not use it for routing.
  *
- * Race-safety (BLOCKER from Codex plan review):
+ * Race-safety:
  *   Container identity proves the request comes from the *current* active
  *   container. It does NOT prove the codex_account_id observed at request
  *   start is still the binding when we go to write auth.json. Lazy migrate
@@ -42,17 +42,40 @@
  *        account to refresh).
  *     2. Refresh that account (no lock — refresh.ts has its own dedup +
  *        DB persist).
- *     3. BEGIN; SELECT ... FOR UPDATE recheck:
+ *     3. BEGIN; SELECT ... FOR UPDATE recheck → return a Decision:
  *          state must still be 'active'
  *          codex_account_id must still equal what we refreshed
+ *          account_status must still be 'active'
  *          user_id must still equal identity.userId (defense in depth — if
  *            container row was somehow rebound to another user, abort)
- *     4. While holding the lock, write the per-container auth.json (local fs
- *        or remote node-agent PUT depending on host_uuid).
- *     5. COMMIT.
+ *          isLocal/hostUuid (route hint captured under lock).
+ *        COMMIT.
+ *     4. AFTER tx commit, write the per-container auth.json (local fs or
+ *        remote node-agent PUT depending on the captured host_uuid).
+ *
+ *   ⚠ The file write is intentionally OUTSIDE the tx. v1.0.115 wrote it
+ *   inside FOR UPDATE which serialized a 60s remote node-agent HTTP PUT on
+ *   a PG pool client + the `agent_containers` row lock. Under codex 401
+ *   bursts that drained the pg pool and wedged the entire master event loop
+ *   (handlers stuck on pool.connect()). v1.0.116 moved the IO out.
+ *
  *   Drift at step 3 → 409 CONTAINER_BINDING_CHANGED. The next codex retry
  *   will pick up the new binding's already-fresh token via the file (which
  *   the migrating writer wrote synchronously under the same FOR UPDATE).
+ *
+ *   New race window introduced by step 4 being post-tx: if the container row
+ *   is rebound between commit and our writeRemote completing (~ms-s), we
+ *   could write a soon-stale token to the (still by container id) auth.json.
+ *   This is acceptable because (a) access_token is 1h max, (b) acquire/lazy
+ *   migrate writes auth.json under its own FOR UPDATE next turn, (c) we
+ *   have no admin path that rebinds a running container today (commit
+ *   ad0a7fa1 noted host migration is "future-proof" only).
+ *
+ *   ⚠ FUTURE: when a host_uuid migration / container rebind path is added,
+ *   this endpoint MUST gain a fence (e.g. node-agent receipt validates
+ *   expected (containerId, accountId) matches a label / generation) — until
+ *   then, that future feature MUST first deactivate the row before
+ *   migration so this endpoint hits the 'drift' branch.
  *
  * In-flight refresh dedup:
  *   `refreshCodexAccountToken` already holds a per-accountId in-flight Map.
@@ -452,18 +475,22 @@ export function makeCodexTokenRefreshHandler(
       accessTokenStr = refreshed.token.toString('utf8')
       chatgptAccountId = extractChatGptAccountId(accessTokenStr)
 
-      // 6) FOR UPDATE recheck + write file in same tx.
-      type WriteOutcome =
-        | { kind: 'ok' }
+      // 6) FOR UPDATE recheck — tx returns a Decision, no IO held under lock.
+      //    File write happens AFTER commit (step 7) to avoid serializing
+      //    60s remote node-agent PUTs on PG pool clients (v1.0.115 regression
+      //    that wedged the master event loop under codex 401 bursts).
+      type Decision =
+        | { kind: 'ok'; isLocal: true }
+        | { kind: 'ok'; isLocal: false; hostUuid: string }
         | { kind: 'drift'; why: string }
         | { kind: 'vanished' }
         | { kind: 'user_mismatch' }
 
-      let outcome: WriteOutcome
+      let decision: Decision
       try {
-        outcome = await deps.db.txWithLock(
+        decision = await deps.db.txWithLock(
           identity.containerId,
-          async (_client, row): Promise<WriteOutcome> => {
+          async (_client, row): Promise<Decision> => {
             if (!row) return { kind: 'vanished' }
             if (row.state !== 'active') {
               return { kind: 'drift', why: `state=${row.state}` }
@@ -488,48 +515,28 @@ export function makeCodexTokenRefreshHandler(
             if (row.userId !== BigInt(uid)) {
               return { kind: 'user_mismatch' }
             }
-            // Decide local vs remote based on row.host_uuid (recheck under lock —
-            // host_uuid could in theory be migrated, though we don't have that
-            // path today; future-proof).
+            // Decide local vs remote based on row.host_uuid (snapshot under
+            // lock — see the file-header race note about future host
+            // migration paths).
             const isLocal =
               deps.selfHostId === null || row.hostUuid === null || row.hostUuid === deps.selfHostId
-            const lastRefreshIso = new Date().toISOString()
-            if (isLocal) {
-              await deps.fileWriter.writeLocal({
-                rootDir: deps.codexContainerDir,
-                containerId: String(identity.containerId),
-                containerUid: deps.containerUid,
-                containerGid: deps.containerGid,
-                auth: { accessToken: accessTokenStr, lastRefreshIso },
-              })
-            } else {
-              if (!deps.fileWriter.writeRemote) {
-                throw new Error(
-                  `internalCodexTokenRefresh: container ${identity.containerId} on remote host ${row.hostUuid} but writeRemote not wired`,
-                )
-              }
-              await deps.fileWriter.writeRemote(
-                row.hostUuid as string,
-                String(identity.containerId),
-                accessTokenStr,
-                lastRefreshIso,
-              )
-            }
-            return { kind: 'ok' }
+            if (isLocal) return { kind: 'ok', isLocal: true }
+            // isLocal=false ⇒ row.hostUuid is non-null and differs from selfHostId.
+            return { kind: 'ok', isLocal: false, hostUuid: row.hostUuid as string }
           },
         )
       } catch (err) {
-        accountLog.error('file_write_or_tx_threw', { err: err as Error })
-        sendJsonError(res, 500, 'FILE_WRITE_FAILED', 'auth.json write failed; retry', requestId)
+        accountLog.error('tx_recheck_threw', { err: err as Error })
+        sendJsonError(res, 500, 'INTERNAL', 'binding recheck failed', requestId)
         return
       }
 
-      if (outcome.kind === 'vanished') {
+      if (decision.kind === 'vanished') {
         accountLog.warn('container_row_vanished_under_lock')
         sendJsonError(res, 409, 'CONTAINER_BINDING_CHANGED', 'container row vanished', requestId)
         return
       }
-      if (outcome.kind === 'user_mismatch') {
+      if (decision.kind === 'user_mismatch') {
         // identity passed step 1 + initial-row gate; if user_id changes
         // under the lock, the binding has effectively been re-pointed to
         // another tenant (extremely rare — would imply admin tooling
@@ -546,8 +553,8 @@ export function makeCodexTokenRefreshHandler(
         )
         return
       }
-      if (outcome.kind === 'drift') {
-        accountLog.warn('binding_drift_under_lock', { why: outcome.why })
+      if (decision.kind === 'drift') {
+        accountLog.warn('binding_drift_under_lock', { why: decision.why })
         sendJsonError(
           res,
           409,
@@ -555,6 +562,37 @@ export function makeCodexTokenRefreshHandler(
           'container binding changed during refresh',
           requestId,
         )
+        return
+      }
+
+      // 6b) Write per-container auth.json — OUTSIDE the tx. See file-header
+      //     race note for why this is safe.
+      const lastRefreshIso = new Date().toISOString()
+      try {
+        if (decision.isLocal) {
+          await deps.fileWriter.writeLocal({
+            rootDir: deps.codexContainerDir,
+            containerId: String(identity.containerId),
+            containerUid: deps.containerUid,
+            containerGid: deps.containerGid,
+            auth: { accessToken: accessTokenStr, lastRefreshIso },
+          })
+        } else {
+          if (!deps.fileWriter.writeRemote) {
+            throw new Error(
+              `internalCodexTokenRefresh: container ${identity.containerId} on remote host ${decision.hostUuid} but writeRemote not wired`,
+            )
+          }
+          await deps.fileWriter.writeRemote(
+            decision.hostUuid,
+            String(identity.containerId),
+            accessTokenStr,
+            lastRefreshIso,
+          )
+        }
+      } catch (err) {
+        accountLog.error('post_tx_write_failed', { err: err as Error })
+        sendJsonError(res, 500, 'FILE_WRITE_FAILED', 'auth.json write failed; retry', requestId)
         return
       }
 
