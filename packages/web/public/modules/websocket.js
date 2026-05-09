@@ -868,13 +868,55 @@ function _buildBindFrame(sessionId, selectionVersion) {
   })
 }
 
+// v1.0.111:hello 帧构造统一入口。onopen 首次 hello 与 bind 前的"刷新 hello"
+// 共用同一份 peers 构造逻辑,避免两处漂移。包含全量 state.sessions,带
+// lastFrameSeq 字段以维持 _recentHelloPeers grace window 的全量覆盖。
+//
+// includeInFlight 区分两种用途:
+//   - true  (onopen 默认):reconnect 语义,gateway autoResumeFromHello 会按
+//           inFlight=true && !runner.isRunning 推 synthetic 中断 isFinal。
+//   - false (bind 前刷新):同一 ws 上的"补登 peer 注册",纯 registration
+//           side effect,不应触发任何中断 isFinal。把所有 inFlight 强制为
+//           false,gateway L4669 的 (peerInFlight && ...) 永远 false → 无 synthetic。
+function _buildHelloFrame({ includeInFlight = true } = {}) {
+  const peers = []
+  for (const [pid, s] of state.sessions) {
+    peers.push({
+      peerId: pid,
+      agentId: s.agentId || state.defaultAgentId,
+      inFlight: includeInFlight ? !!s._sendingInFlight : false,
+      lastFrameSeq: s._lastFrameSeq || 0,
+    })
+  }
+  return JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers })
+}
+
+// safeWsSend hello 帧到给定 ws,失败返回 false。
+// onopen 走 includeInFlight=true(reconnect 语义);bind 前刷新走 false。
+function _sendHelloFrame(ws, opts) {
+  if (!ws || ws.readyState !== 1) return false
+  return safeWsSend(ws, _buildHelloFrame(opts))
+}
+
 // 实际发送一次 bind attempt。仅在 ws.OPEN 且距上次 send >= MIN_GAP 时计 attempt。
 // 返回 'sent' / 'skipped_gap' / 'skipped_offline'。
+//
+// v1.0.111 修 SESSION_NOT_REGISTERED race:bind 前先发一次 hello,把当前
+// state.sessions 全量 peers 注册进 gateway 的 _recentHelloPeers 5s grace
+// window。覆盖"用户新建会话后立即 bind GitHub"这种 sessionId 既不在最初
+// hello peers 也不在 clientsByPeer (没发过 message) 的 race。
+// 服务端对重复 hello 幂等(autoResumeFromHello/clientsByPeer 用 Set 去重,
+// _recentHelloPeers.set 覆盖即更新 grace 起点)。同一 ws.send 队列 FIFO 保证
+// hello 先于 bind 抵达 gateway。
 function _sendBindAttemptInternal(sid, version) {
   if (!state.ws || state.ws.readyState !== 1) return 'skipped_offline'
   const entry = _pendingRepoBindMap.get(sid)
   const now = Date.now()
   if (entry && now - entry.lastSendAt < REPO_BIND_MIN_GAP_MS) return 'skipped_gap'
+  // hello 先发,失败则 bind 也别发(相同 socket,任何 send 失败都说明 ws 不健康)。
+  // includeInFlight=false:这是 registration 用途,不能让 gateway 误判成 reconnect
+  // 而对其他 stale-inFlight 会话推 synthetic 中断 isFinal(server.ts L4663-4691)。
+  if (!_sendHelloFrame(state.ws, { includeInFlight: false })) return 'skipped_offline'
   const ok = safeWsSend(state.ws, _buildBindFrame(sid, version))
   if (!ok) return 'skipped_offline'
   if (entry) {
@@ -1223,18 +1265,10 @@ export function connect() {
     // Phase 0.4: include lastFrameSeq per peer so gateway can replay buffered
     // outbound frames the client missed during the disconnect window. 0 means
     // "I've never received a frameSeq'd frame" (fresh tab or legacy client).
+    // v1.0.111:抽到 _buildHelloFrame() helper,bind 前刷新 hello 复用同一份逻辑。
     try {
-      const peers = []
-      for (const [id, s] of state.sessions) {
-        peers.push({
-          peerId: id,
-          agentId: s.agentId || state.defaultAgentId,
-          inFlight: !!s._sendingInFlight,
-          lastFrameSeq: s._lastFrameSeq || 0,
-        })
-      }
       // onopen 瞬间 bufferedAmount 必为 0,safeWsSend 只是保持统一入口
-      safeWsSend(ws, JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
+      _sendHelloFrame(ws)
     } catch {}
     // v1.0.94 Bug② 修:hello 发完后 flush 任何待确认 bind 帧。
     // 覆盖"PUT 时 ws 未 OPEN 丢帧 + 用户不切会话/不刷新"导致的永久 pending。
