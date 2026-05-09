@@ -35,24 +35,44 @@ export function fileToText(file) {
   })
 }
 
+// 文本扩展名白名单 — 必须明确命中才走 'text' inline 分支,否则当 binary 'file' 上传。
+// 用于限定 classifyFile 的 'text' 出口。删 accept 白名单后,默认必须 'file' 而不是 'text',
+// 否则用户传 .bin/.epub/.apk 等 ≤64KB 二进制小文件会被 fileToText 当文本读出乱码塞进 messages JSON。
+const TEXT_EXTS = /\.(txt|md|json|yaml|yml|csv|log|xml|html|js|ts|tsx|py|go|rs|java|c|cpp|h|sh|sql)$/i
+
+// 压缩档扩展名 — 浏览器给的 MIME(如 application/x-rar-compressed / x-7z-compressed /
+// x-tar / gzip)不在后端 UPLOAD_MIME_PREFIXES 白名单内会 415;_uploadOne 对这类
+// 文件主动把 content-type 降级为 application/octet-stream(后端显式 fallback)。
+// 注意:这里不含 .zip — application/zip 后端原生接受,无需降级,降级反而会让落盘
+// 文件变成 .octetstream 失去扩展名信息(server.ts uploadExtForMime 用 ctype 决定后缀)。
+// 也不含 .exe/.apk/.jar/.dmg/.iso/.msi — 这类可执行/安装包浏览器多半给空 MIME 或
+// application/octet-stream,后端两者都接受,实际能上传成功;少数浏览器会给具体 MIME
+// (.exe → application/x-msdownload, .jar → application/java-archive)那种情况会 415。
+// 不为它们主动降级是出于谨慎:product/security 上 boss 没明确要放开,我们让浏览器
+// 默认行为决定;若未来要明确允许或拒绝可执行文件,需在前端或后端加 denylist/allowlist。
+const ARCHIVE_EXTS_OCTET_FALLBACK = /\.(rar|7z|tar|gz|tgz|bz2|xz|zst)$/i
+
 export function classifyFile(file) {
-  const t = file.type || ''
+  const t = (file.type || '').toLowerCase()
+  const name = (file.name || '').toLowerCase()
   if (t.startsWith('image/')) return 'image'
   if (t.startsWith('audio/')) return 'audio'
   if (t.startsWith('video/')) return 'video'
-  // Binary document types → 'file' kind (sent as base64)
-  const binExts = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z)$/i
+  // 明确文本判定 — MIME 是 text/* 或常见文本 application/* 或扩展名命中文本白名单
   if (
-    binExts.test(file.name) ||
-    t === 'application/pdf' ||
-    t.includes('officedocument') ||
-    t.includes('msword') ||
-    t.includes('ms-excel') ||
-    t.includes('ms-powerpoint')
+    t.startsWith('text/') ||
+    t === 'application/json' ||
+    t === 'application/xml' ||
+    t === 'application/javascript' ||
+    t === 'text/javascript' ||
+    TEXT_EXTS.test(name)
   ) {
-    return 'file'
+    return 'text'
   }
-  return 'text' // fallback: treat as text
+  // 其余一律 'file' — 包括已知文档(.pdf/.docx/...)、压缩档(.zip/.rar/.7z/...)、
+  // 可执行/安装包(.exe/.apk/.jar/...)以及任何浏览器没识别出 MIME 的未知二进制。
+  // 后端 isUploadMimeAllowed 决定哪些 MIME 通得过;_uploadOne 对压缩档做 octet-stream 兜底。
+  return 'file'
 }
 
 // 上传单个附件到 /api/uploads。出错或被 abort 时把 att 从 state.attachments 里摘掉
@@ -61,10 +81,21 @@ async function _uploadOne(att, file) {
   try {
     const ctrl = new AbortController()
     att._abort = ctrl
+    // 决定上传请求的 content-type:
+    //   - 压缩档(.rar/.7z/.tar/.gz/.tgz/.bz2/.xz/.zst)→ 显式 application/octet-stream
+    //     绕过后端 UPLOAD_MIME_PREFIXES 拒绝。att.type 仍保留(messages JSON 用)。
+    //   - 其他文件 → 用浏览器给的真实 MIME(空时 fallback 到 octet-stream,后端也接受)。
+    //   保持真实 MIME 对于 PDF/DOCX/ZIP 等"后端原生支持"的格式很重要 —
+    //   server.ts uploadExtForMime(ctype) 用 content-type 决定落盘扩展名,降级会丢类型。
+    const name = (att.name || '').toLowerCase()
+    const isArchive = att.kind === 'file' && ARCHIVE_EXTS_OCTET_FALLBACK.test(name)
+    const uploadCtype = isArchive
+      ? 'application/octet-stream'
+      : (att.type || 'application/octet-stream')
     const resp = await fetch('/api/uploads', {
       method: 'POST',
       headers: {
-        'content-type': att.type || 'application/octet-stream',
+        'content-type': uploadCtype,
         'x-filename': encodeURIComponent(att.name || 'file'),
       },
       body: file,

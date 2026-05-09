@@ -820,6 +820,60 @@ describe('T09: buildToolUseLabel — tool use display', () => {
   })
 })
 
+// ── T-CLASSIFY: classifyFile (attachments.js, 2026-05-09 删 accept 白名单) ──
+//
+// classifyFile 引用 module-level TEXT_EXTS 常量,直接 makeCallable 会 ReferenceError。
+// 沿用 _stripMessageEphemeral 的"显式注入"模式 — 把当前实现的正则注入闭包,如果
+// attachments.js 里改了 TEXT_EXTS 但忘了同步这里,下面的 case 会立刻失败。
+const _TEXT_EXTS_RE_TEST = /\.(txt|md|json|yaml|yml|csv|log|xml|html|js|ts|tsx|py|go|rs|java|c|cpp|h|sh|sql)$/i
+{
+  const m = appJs.match(/const\s+TEXT_EXTS\s*=\s*(\/[^\n]+\/i)/)
+  if (m && m[1] !== _TEXT_EXTS_RE_TEST.toString()) {
+    throw new Error(
+      `TEXT_EXTS in attachments.js drifted; update _TEXT_EXTS_RE_TEST. ` +
+        `actual=${m[1]} test=${_TEXT_EXTS_RE_TEST.toString()}`,
+    )
+  }
+}
+const _classifyFileSrc = extractFunction(appJs, 'classifyFile')
+const classifyFile = new Function(
+  `const TEXT_EXTS = ${_TEXT_EXTS_RE_TEST.toString()};
+   ${_classifyFileSrc};
+   return classifyFile;`,
+)() as (file: { type?: string; name?: string }) => string
+
+describe('T-CLASSIFY: classifyFile — 删 accept 白名单后默认应该是 file 而不是 text', () => {
+  // 媒体类:MIME 命中 image/audio/video → 对应 kind
+  it('image/png → image', () => assert.equal(classifyFile({ type: 'image/png', name: 'a.png' }), 'image'))
+  it('audio/mpeg → audio', () => assert.equal(classifyFile({ type: 'audio/mpeg', name: 'a.mp3' }), 'audio'))
+  it('video/mp4 → video', () => assert.equal(classifyFile({ type: 'video/mp4', name: 'a.mp4' }), 'video'))
+
+  // 明确文本:MIME 是 text/* 或常见文本 application/* 或扩展名命中 → text
+  it('text/plain → text', () => assert.equal(classifyFile({ type: 'text/plain', name: 'a.txt' }), 'text'))
+  it('application/json → text', () => assert.equal(classifyFile({ type: 'application/json', name: 'a.json' }), 'text'))
+  it('.md 空 MIME → text (按扩展名)', () => assert.equal(classifyFile({ type: '', name: 'README.md' }), 'text'))
+  it('.py 空 MIME → text', () => assert.equal(classifyFile({ type: '', name: 'app.py' }), 'text'))
+
+  // 文档/压缩档:走 file 分支(messages JSON 不内联,_uploadOne 上传)
+  it('application/pdf → file', () => assert.equal(classifyFile({ type: 'application/pdf', name: 'a.pdf' }), 'file'))
+  it('application/zip → file', () => assert.equal(classifyFile({ type: 'application/zip', name: 'a.zip' }), 'file'))
+  it('.rar application/x-rar-compressed → file',
+    () => assert.equal(classifyFile({ type: 'application/x-rar-compressed', name: 'a.rar' }), 'file'))
+  it('.7z application/x-7z-compressed → file',
+    () => assert.equal(classifyFile({ type: 'application/x-7z-compressed', name: 'a.7z' }), 'file'))
+
+  // 关键回归保护:删 accept 白名单后,未知/空 MIME 必须默认 file 而不是 text。
+  // 否则 ≤64KB 的 .bin/.exe/.apk 等会被 fileToText 当文本读出乱码塞进 messages JSON。
+  it('未知扩展名 + 空 MIME → file (default, not text)',
+    () => assert.equal(classifyFile({ type: '', name: 'firmware.bin' }), 'file'))
+  it('.exe 空 MIME → file',
+    () => assert.equal(classifyFile({ type: '', name: 'installer.exe' }), 'file'))
+  it('.apk vendor MIME → file',
+    () => assert.equal(classifyFile({ type: 'application/vnd.android.package-archive', name: 'app.apk' }), 'file'))
+  it('完全未知格式 .xyz → file',
+    () => assert.equal(classifyFile({ type: '', name: 'mystery.xyz' }), 'file'))
+})
+
 // ── T-MED: parseYuanToCents (admin.js, 2026-04-21 安全审计 单位语义统一) ──
 //
 // admin /api/admin/users/:id/credits 后端 delta 是「分」整数;UI 输入 ¥
