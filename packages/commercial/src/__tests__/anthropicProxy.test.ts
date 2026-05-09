@@ -29,6 +29,7 @@ import {
   isAnthropicInvalidRequestError,
   isClientAbort,
   makeFinalizer,
+  stripMalformedThinkingBlocks,
   DEEPSEEK_UPSTREAM_ENDPOINT,
   ALLOWED_BETA_VALUES,
   ANTHROPIC_VERSION,
@@ -906,5 +907,257 @@ describe("makeFinalizer.failClient → scheduler.release 走 client_error", () =
     // 4) journal abort SQL 被两条 fail/failClient 都写到了
     const abortSqlCount = queriedSql.filter((s) => s.includes("SET state='aborted'")).length;
     assert.equal(abortSqlCount, 3, "三次 fail/failClient 都写了 abort journal");
+  });
+});
+
+// ─── stripMalformedThinkingBlocks ─────────────────────────────────────────
+
+describe("stripMalformedThinkingBlocks", () => {
+  // 阈值是 16,Anthropic 实际 signature 远长于此,这里用 32 字节的合法占位
+  const VALID_SIG = "a".repeat(32);
+  const VALID_DATA = "b".repeat(32);
+
+  test("合法 thinking block 不被剔除", () => {
+    const messages = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "let me think", signature: VALID_SIG },
+          { type: "text", text: "result" },
+        ],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 0);
+    assert.equal(r.redactedThinkingStripped, 0);
+    assert.strictEqual(r.messages, messages, "无改动时返回原数组引用");
+  });
+
+  test("thinking block signature 缺失 → 整块剔除,其它 block 保留", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "..." }, // 缺 signature
+          { type: "text", text: "answer" },
+        ],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 1);
+    assert.equal(r.redactedThinkingStripped, 0);
+    const newAssistant = (r.messages[1] as { content: unknown[] });
+    assert.equal(newAssistant.content.length, 1);
+    assert.deepEqual(newAssistant.content[0], { type: "text", text: "answer" });
+  });
+
+  test("thinking block signature 空字符串 → 剔除", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "x", signature: "" }] },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 1);
+  });
+
+  test("thinking block signature 短字符串(< 16) → 剔除", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "x", signature: "tiny" }] },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 1);
+  });
+
+  test("redacted_thinking 合法 data → 保留", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      {
+        role: "assistant",
+        content: [
+          { type: "redacted_thinking", data: VALID_DATA },
+          { type: "text", text: "ok" },
+        ],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 0);
+    assert.equal(r.redactedThinkingStripped, 0);
+    assert.strictEqual(r.messages, messages);
+  });
+
+  test("redacted_thinking 缺 data / 短 data / 空 data → 剔除并计入 redactedThinkingStripped", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      {
+        role: "assistant",
+        content: [
+          { type: "redacted_thinking" }, // 缺 data
+          { type: "redacted_thinking", data: "" }, // 空
+          { type: "redacted_thinking", data: "abc" }, // 短
+          { type: "text", text: "ok" },
+        ],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 0);
+    assert.equal(r.redactedThinkingStripped, 3);
+    const c = (r.messages[1] as { content: unknown[] }).content;
+    assert.equal(c.length, 1);
+    assert.deepEqual(c[0], { type: "text", text: "ok" });
+  });
+
+  test("thinking + redacted_thinking 各坏一个 → 计数分别 +1", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "x", signature: "" },
+          { type: "redacted_thinking", data: "" },
+          { type: "text", text: "kept" },
+        ],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 1);
+    assert.equal(r.redactedThinkingStripped, 1);
+  });
+
+  test("content 为字符串 → 不动(含 string content 的 assistant 历史保留)", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      { role: "assistant", content: "plain text response" },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 0);
+    assert.equal(r.redactedThinkingStripped, 0);
+    assert.strictEqual(r.messages, messages);
+  });
+
+  test("user message 中混入 thinking block → 不动(只清 assistant 历史)", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "thinking", thinking: "x", signature: "" }, // bad sig 但在 user 里
+          { type: "text", text: "q" },
+        ],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 0);
+    assert.equal(r.redactedThinkingStripped, 0);
+    assert.strictEqual(r.messages, messages);
+  });
+
+  test("非 record block(null / 字符串 / 数字 / 数组)→ 原样保留,helper 不抛", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      {
+        role: "assistant",
+        content: [
+          null,
+          "stringy",
+          123,
+          ["nested-array"],
+          { type: "text", text: "kept" },
+        ],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 0);
+    assert.equal(r.redactedThinkingStripped, 0);
+    assert.strictEqual(r.messages, messages);
+  });
+
+  test("assistant 唯一 thinking block 被剔除 → content 替换为 [thinking block removed] 占位", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "x", signature: "" }] },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 1);
+    const c = (r.messages[1] as { content: unknown[] }).content;
+    assert.equal(c.length, 1);
+    assert.deepEqual(c[0], { type: "text", text: "[thinking block removed]" });
+  });
+
+  test("多条 message,只有部分被改 → 未改的 message 引用相等(===)", () => {
+    const userMsg = { role: "user", content: "q" };
+    const cleanAssistant = { role: "assistant", content: [{ type: "text", text: "first" }] };
+    const dirtyAssistant = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "x", signature: "" }, // 坏
+        { type: "text", text: "second" },
+      ],
+    };
+    const messages = [userMsg, cleanAssistant, { role: "user", content: "q2" }, dirtyAssistant];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 1);
+    assert.notStrictEqual(r.messages, messages, "外层数组应换新");
+    assert.strictEqual(r.messages[0], userMsg);
+    assert.strictEqual(r.messages[1], cleanAssistant);
+    assert.strictEqual(r.messages[2], messages[2]);
+    assert.notStrictEqual(r.messages[3], dirtyAssistant);
+  });
+
+  test("原 messages 数组 / 原 message 对象不被 mutate", () => {
+    const messages = [
+      { role: "user", content: "q" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "x", signature: "" },
+          { type: "text", text: "kept" },
+        ],
+      },
+    ];
+    const before = JSON.stringify(messages);
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 1);
+    assert.equal(JSON.stringify(messages), before, "原对象未被 mutate");
+  });
+
+  test("边界:length === 16 的 signature / data 应保留(防 < 被改成 <= 的回归)", () => {
+    const exact16Sig = "x".repeat(16);
+    const exact16Data = "y".repeat(16);
+    assert.equal(exact16Sig.length, 16);
+    assert.equal(exact16Data.length, 16);
+    const messages = [
+      { role: "user", content: "q" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "x", signature: exact16Sig },
+          { type: "redacted_thinking", data: exact16Data },
+        ],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 0);
+    assert.equal(r.redactedThinkingStripped, 0);
+    assert.strictEqual(r.messages, messages);
+  });
+
+  test("设计取舍:长但伪造的 signature(>= 16) 被保留,网关不做 HMAC 验证", () => {
+    // 这是一个明确记录的局限性:网关无 HMAC 密钥,无法识别"长度合法但 HMAC
+    // 错"的伪造 signature。这种情况由 Anthropic 上游自行拒绝。本用例确保
+    // 未来维护者不要把这里的启发式当成"签名真实性校验"。
+    const fakedSig = "this-is-fake-but-long-enough-to-pass-the-heuristic";
+    assert.ok(fakedSig.length >= 16);
+    const messages = [
+      { role: "user", content: "q" },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "fake reasoning", signature: fakedSig }],
+      },
+    ];
+    const r = stripMalformedThinkingBlocks(messages);
+    assert.equal(r.thinkingStripped, 0, "长但伪造 signature 不被本规则剔除");
+    assert.equal(r.redactedThinkingStripped, 0);
   });
 });

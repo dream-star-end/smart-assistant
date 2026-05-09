@@ -799,6 +799,113 @@ export function isClientAbort(err: unknown): boolean {
   return false;
 }
 
+/**
+ * thinking / redacted_thinking block 的 opaque 字段最小启发式长度。
+ *
+ * **这不是 signature 校验** —— 网关无 HMAC 密钥,无法验证 Anthropic signature
+ * 的真实性。本阈值仅用于挡住"明显损坏"的形态(空字符串、缺失、明显截断的伪
+ * 值),典型来源:CCB(claude-code-best)`services/api/claude.ts` 在 stream
+ * 起步时把 signature 初始化为空串(`signature: ''`),如果上游(例如 DeepSeek
+ * anthropic-兼容端点)不发 `signature_delta` 事件,CCB 就把空串持久化进 history。
+ *
+ * 长但伪造的 signature(例如 DeepSeek 主动塞了 64 字节假签名)本规则**挡不住**,
+ * 那种情况 Anthropic 上游会自行拒绝。这是网关层的固有局限,不打算在此模拟
+ * 签名学验证。
+ */
+const MIN_THINKING_OPAQUE_LEN = 16;
+
+/**
+ * 在转发到 Anthropic 上游前,从 messages history 里剔除"明显损坏"的 thinking /
+ * redacted_thinking block。
+ *
+ * 触发场景(已观测,日志全量 89 次):用户在同一会话先用 DeepSeek 模型,然后切
+ * 回 Claude。CCB 把 DeepSeek 兼容端点回的 assistant message 整条存进 history,
+ * 其中 thinking block 的 `signature` 字段是 CCB 默认初始化的空串(DeepSeek 不
+ * 可能签 Anthropic HMAC)。CCB 重发整段 history 给 Anthropic,Anthropic 校验
+ * 第一条 assistant message 的 thinking signature → 400 invalid_request_error
+ * "Invalid signature in thinking block"。
+ *
+ * 规则(只动 `role === "assistant"` 的 message):
+ *   - thinking          : 要求 `signature` 是非空字符串且长度 >= MIN_THINKING_OPAQUE_LEN
+ *   - redacted_thinking : 要求 `data` 是非空字符串且长度 >= MIN_THINKING_OPAQUE_LEN
+ *   - 其它 type 原样保留
+ *   - 一条 assistant message 的 content 在 sanitize 后变空 → 替换为
+ *     `[{ type: "text", text: "[thinking block removed]" }]`(Anthropic 拒空
+ *     content 数组,且 messages 必须 user/assistant 交替,直接整条删除会触发
+ *     另一类 400)
+ *
+ * **不做的事**:
+ *   - 不对 user message 做处理(只清 assistant 历史)
+ *   - 不验 signature 真实性(网关无 HMAC 密钥;长伪造由 Anthropic 自拒)
+ *   - 不递归进 tool_result / image / 其它 block 内部
+ *
+ * 性能:大多数 message 走 fast-path 直返原引用;仅在某条 message 实际被改时
+ * 才克隆该 message 与外层数组。原 messages 数组与原 message 对象不被 mutate
+ * (调用方在 sanitize 后还会读 body / estimateInputTokens 等)。
+ */
+export function stripMalformedThinkingBlocks(messages: unknown[]): {
+  messages: unknown[];
+  thinkingStripped: number;
+  redactedThinkingStripped: number;
+} {
+  let thinkingStripped = 0;
+  let redactedThinkingStripped = 0;
+  let outer: unknown[] | null = null;
+
+  const isRecord = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!isRecord(msg)) continue;
+    if (msg.role !== "assistant") continue;
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+
+    let kept: unknown[] | null = null;
+    for (let j = 0; j < content.length; j++) {
+      const block = content[j];
+      let drop = false;
+      if (isRecord(block)) {
+        if (block.type === "thinking") {
+          const sig = block.signature;
+          if (typeof sig !== "string" || sig.length < MIN_THINKING_OPAQUE_LEN) {
+            drop = true;
+            thinkingStripped++;
+          }
+        } else if (block.type === "redacted_thinking") {
+          const data = block.data;
+          if (typeof data !== "string" || data.length < MIN_THINKING_OPAQUE_LEN) {
+            drop = true;
+            redactedThinkingStripped++;
+          }
+        }
+      }
+      if (drop) {
+        if (kept === null) kept = content.slice(0, j);
+      } else if (kept !== null) {
+        kept.push(block);
+      }
+    }
+
+    if (kept === null) continue; // 此 message 未改
+
+    // content 全被剔除 → 占位非空 text(空字符串 Anthropic 也可能拒)
+    if (kept.length === 0) {
+      kept = [{ type: "text", text: "[thinking block removed]" }];
+    }
+    const newMsg = { ...msg, content: kept };
+    if (outer === null) outer = messages.slice();
+    outer[i] = newMsg;
+  }
+
+  return {
+    messages: outer ?? messages,
+    thinkingStripped,
+    redactedThinkingStripped,
+  };
+}
+
 // ─── finalizer(single-shot + journal) ────────────────────────────────────
 
 export interface FinalizeContext {
@@ -1934,7 +2041,26 @@ export function makeAnthropicProxyHandler(
         }
 
         // body 强制 stream:true
-        const upstreamBodyJson = JSON.stringify({ ...body, stream: true });
+        // 仅在 Anthropic 上游路径上 sanitize:DeepSeek 兼容端点不校验 Anthropic
+        // signature,strip 在该路径无收益,也可能影响 DeepSeek 自身的 reasoning
+        // 续轮。详见 stripMalformedThinkingBlocks 的 JSDoc。
+        let upstreamMessages: unknown[] = body.messages;
+        if (!isDeepseek) {
+          const r = stripMalformedThinkingBlocks(body.messages);
+          upstreamMessages = r.messages;
+          if (r.thinkingStripped + r.redactedThinkingStripped > 0) {
+            userLog.warn("proxy_malformed_thinking_blocks_stripped", {
+              model: body.model,
+              thinking: r.thinkingStripped,
+              redactedThinking: r.redactedThinkingStripped,
+            });
+          }
+        }
+        const upstreamBodyJson = JSON.stringify({
+          ...body,
+          messages: upstreamMessages,
+          stream: true,
+        });
 
         const fetchInit: RequestInit & { dispatcher?: unknown } = {
           method: "POST",
