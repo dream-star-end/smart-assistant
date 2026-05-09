@@ -1,20 +1,20 @@
 // OpenClaude — Slash Commands
-import { apiGet } from './api.js?v=edee9988'
+import { apiGet } from './api.js?v=d1211d0f'
 // `?v=...` 必须跟 main.js / websocket.js 的 billing import 用同一版本,不然
 // 浏览器把 `./billing.js` 和 `./billing.js?v=...` 当两个独立 ES module 实例,
 // `_hostAgentAdmin` 模块状态不共享,admin 登录后本模块永远读到 false。
 // 版本号由 scripts/deploy-v3.sh 跟其它 ?v= 一起 bump。
-import { isHostAgentAdmin } from './billing.js?v=edee9988'
-import { $, _mod } from './dom.js?v=edee9988'
-import { getSession, state } from './state.js?v=edee9988'
-import { toast } from './ui.js?v=edee9988'
+import { isHostAgentAdmin } from './billing.js?v=d1211d0f'
+import { $, _mod } from './dom.js?v=d1211d0f'
+import { getSession, state } from './state.js?v=d1211d0f'
+import { toast } from './ui.js?v=d1211d0f'
 import {
   addSystemMessage,
   localStopTeardown,
   nudgeDrain,
   resetReplyTracker,
   safeWsSend,
-} from './websocket.js?v=edee9988'
+} from './websocket.js?v=d1211d0f'
 
 // V3 商用版多租户安全 PR2:这批 slash 命令打开的是 host-scope 单例端点
 // (/api/agents/:id/memory/*、/api/agents/:id/skills、/api/agents/:id、
