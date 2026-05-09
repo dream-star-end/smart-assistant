@@ -831,6 +831,15 @@ export class SessionManager {
           cwd,
           resumeSessionId: codexResumeId,
           model: codexModel,
+          // ── Phase 1 platform context (master a88419ba ported to v3) ──
+          // Wires SOUL/USER/AGENTS/SKILLS/MEMORY/TOOLS/RESEARCH slots into
+          // codex via `-c model_instructions_file=...` and gives codex the
+          // openclaude_memory MCP server for archival/skill/recall tools.
+          persona,
+          agentProvider: opts.agent.provider,
+          effortLevel: initialEffort,
+          config: this.config,
+          delegationDepth: opts.delegationDepth,
         }) as unknown as SubprocessRunner
       } else {
         runner = new CodexRunner({
@@ -839,6 +848,11 @@ export class SessionManager {
           cwd,
           resumeSessionId: codexResumeId,
           model: codexModel,
+          persona,
+          agentProvider: opts.agent.provider,
+          effortLevel: initialEffort,
+          config: this.config,
+          delegationDepth: opts.delegationDepth,
         }) as unknown as SubprocessRunner
       }
     } else {

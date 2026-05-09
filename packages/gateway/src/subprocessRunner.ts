@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
+import { resolveMcpMemoryEntry } from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
 import { buildPromptContext } from './promptSlots.js'
 import type { ExecutionTarget } from './remoteTarget.js'
@@ -893,20 +894,12 @@ export class SubprocessRunner extends EventEmitter {
       const mcpServers: Record<string, any> = {}
 
       // ── Built-in: openclaude-memory (L1/L2/L3 learning loop) ──
-      const mcpServerEntry = resolve(
-        new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:'),
-        '../../mcp-memory/src/index.ts',
-      )
-      const candidates = [
-        mcpServerEntry,
-        resolve(process.cwd(), 'packages/mcp-memory/src/index.ts'),
-        resolve(
-          this.opts.config.auth.claudeCodePath,
-          '..',
-          'openclaude/packages/mcp-memory/src/index.ts',
-        ),
-      ]
-      const mcpEntry = candidates.find((p) => existsSync(p))
+      // Path resolution shared with codexLaunchOverrides so ccb / codex / app-server
+      // all point npx at the same bundled entry. Note: env construction below
+      // is intentionally NOT shared (v3 subprocessRunner has tighter
+      // OPENCLAUDE_HOME semantics — only forward when host process actually
+      // set it; codex side passes empty-string default).
+      const mcpEntry = resolveMcpMemoryEntry(this.opts.config.auth.claudeCodePath)
       if (mcpEntry) {
         mcpServers['openclaude-memory'] = {
           type: 'stdio',

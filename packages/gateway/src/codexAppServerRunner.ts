@@ -1,8 +1,17 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+// Test-only override of the spawn used to launch `codex app-server`. See
+// codexRunner.ts `__setCodexSpawnForTests` for rationale; same pattern here.
+let _spawnFn: typeof spawn = spawn
+export function __setCodexAppServerSpawnForTests(fn: typeof spawn | null): void {
+  _spawnFn = fn ?? spawn
+}
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { paths } from '@openclaude/storage'
+import { type OpenClaudeConfig, paths } from '@openclaude/storage'
+import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from './codexLaunchOverrides.js'
 import { _sanitizeThreadId, buildCodexEnv, copyImagePathsToPublicDir } from './codexRunner.js'
 import { createLogger } from './logger.js'
 
@@ -57,6 +66,17 @@ export interface CodexAppServerRunnerOpts {
   /** Agent model id from agents.yaml (e.g. `gpt-5-codex`). Forwarded to
    *  thread/start/resume so codex picks the right model. */
   model?: string
+  // ── Platform context injection (parity with SubprocessRunner / CodexRunner) ──
+  /** Path to agent's persona file (CLAUDE.md / SOUL.md). */
+  persona?: string
+  /** Effective provider for `buildPromptContext` provider-keyed slot logic. */
+  agentProvider?: string
+  /** Initial effort level for the RESEARCH slot activation. */
+  effortLevel?: string
+  /** Gateway config; required for platform context injection. */
+  config?: OpenClaudeConfig
+  /** Forwarded to mcp-memory env so delegate_task can enforce recursion caps. */
+  delegationDepth?: number
 }
 
 interface QueuedTurn {
@@ -292,6 +312,14 @@ export class CodexAppServerRunner extends EventEmitter {
    *  Drained in `runTurn` (both happy and catch paths) before emitResult. */
   private inflightItemHandlers: Set<Promise<void>> = new Set()
 
+  /** mkdtempSync'd dir holding the per-spawn `extra-prompt.md`. Created lazily
+   *  in `ensureSpawned()` whenever a fresh app-server process needs platform
+   *  context, cleaned on `shutdown()` and on proc close. */
+  private sessionDir: string | null = null
+  /** Cached overrides for the lifetime of the current proc. Cleared together
+   *  with `sessionDir` so the next post-shutdown spawn lazy-rebuilds. */
+  private cachedOverrides: CodexLaunchOverrides | null = null
+
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
   public effortLevel: string | undefined = undefined
@@ -300,13 +328,22 @@ export class CodexAppServerRunner extends EventEmitter {
     return this.proc != null || this.processing
   }
 
-  updateConfig(_config: unknown): void {
-    // codex doesn't read gateway config; no-op.
+  updateConfig(config: OpenClaudeConfig): void {
+    // codex itself doesn't read gateway config, but the platform-context
+    // injection path does. Accept the new config and invalidate the cached
+    // overrides so the NEXT spawn (after a shutdown/respawn cycle) rebuilds
+    // with the new values. A currently-running mcp-memory child has the old
+    // token baked in; full propagation requires the codex proc to respawn.
+    this.opts = { ...this.opts, config }
+    this.cachedOverrides = null
   }
 
-  setEffortLevel(_level: string | undefined): void {
-    // We could pass `effort` on turn/start but there's no immediate caller
-    // for that path in codex-native — keep parity with CodexRunner no-op.
+  setEffortLevel(level: string | undefined): void {
+    // codex CLI manages its own effort flag; we don't pass it to thread/start.
+    // We DO record it on the runner so a subsequent ensureLaunchOverrides()
+    // (after shutdown clears the cache) reflects the new value when
+    // buildPromptContext renders the RESEARCH slot.
+    this.effortLevel = level
   }
 
   // ── model getter / setter (parity with CodexRunner / SubprocessRunner) ──
@@ -353,9 +390,82 @@ export class CodexAppServerRunner extends EventEmitter {
   constructor(private opts: CodexAppServerRunnerOpts) {
     super()
     this.threadId = opts.resumeSessionId ?? null
+    this.effortLevel = opts.effortLevel
     // attached is intentionally false on construction even if we have a
     // resumed threadId — the first turn must explicitly thread/resume into
     // the freshly spawned proc.
+  }
+
+  /** Lazy-build codex launch overrides for the next `app-server` spawn. The
+   *  overrides outlive a single turn (the proc is long-lived), so the cache
+   *  is only invalidated in `shutdown()` / proc close / `updateConfig()`.
+   *  Returns null when `opts.config` is missing (legacy "naked codex" path). */
+  private async ensureLaunchOverrides(): Promise<CodexLaunchOverrides | null> {
+    if (!this.opts.config) return null
+    if (this.cachedOverrides && this.sessionDir) return this.cachedOverrides
+    // Cache miss with an existing sessionDir means updateConfig invalidated
+    // cachedOverrides while the dir was still bound. ensureLaunchOverrides is
+    // only called from ensureSpawned (proc===null guard), so by the time we
+    // reach this point the previous proc has exited.
+    if (this.sessionDir) {
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch (err) {
+        log.warn('codex app-server stale sessionDir cleanup failed', {
+          sessionDir: this.sessionDir,
+          err: (err as Error).message,
+        })
+      }
+      this.sessionDir = null
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'oc-codex-app-'))
+    try {
+      const overrides = await buildCodexLaunchOverrides({
+        agentId: this.opts.agentId,
+        persona: this.opts.persona,
+        provider: this.opts.agentProvider,
+        model: this.opts.model,
+        effortLevel: this.effortLevel,
+        sessionDir: dir,
+        claudeCodePath: this.opts.config.auth.claudeCodePath,
+        gatewayPort: this.opts.config.gateway.port,
+        gatewayToken: this.opts.config.gateway.accessToken,
+        delegationDepth: this.opts.delegationDepth,
+      })
+      writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
+      // v3 hardening — see codexRunner.ts for rationale (token never in argv).
+      if (overrides.tokenFile && overrides.tokenContent !== null) {
+        writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
+      }
+      this.sessionDir = dir
+      this.cachedOverrides = overrides
+      return overrides
+    } catch (err) {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* swallow */
+      }
+      throw err
+    }
+  }
+
+  /** Cleanup helper shared by `shutdown()` and the proc close handler so
+   *  override teardown happens regardless of which path tears the proc down
+   *  first. Idempotent. */
+  private cleanupLaunchOverrides(): void {
+    if (this.sessionDir) {
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch (err) {
+        log.warn('codex app-server session dir cleanup failed', {
+          sessionDir: this.sessionDir,
+          err: (err as Error).message,
+        })
+      }
+      this.sessionDir = null
+    }
+    this.cachedOverrides = null
   }
 
   async start(): Promise<void> {
@@ -444,6 +554,11 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     this.activeTurnTotal = null
     this.currentTurnUsage = null
+    // Tear down the per-spawn launch overrides so the next post-shutdown
+    // submit() rebuilds against a fresh sessionDir. Re-using a stale
+    // overrides reference after we rmSync the dir would point codex at a
+    // deleted file on respawn.
+    this.cleanupLaunchOverrides()
     this.emit('exit', { code: 0, signal: null, crashed: false })
     this.shuttingDown = false
   }
@@ -478,11 +593,29 @@ export class CodexAppServerRunner extends EventEmitter {
     // get prepended to the new proc's first stdout chunk and corrupt the
     // initialize response.
     this.stdoutBuf = ''
-    const proc = spawn('codex', ['app-server', '--listen', 'stdio://'], {
+    // Build platform context overrides BEFORE spawn so the long-lived
+    // app-server proc has model_instructions_file + mcp-memory available
+    // from its very first turn. Failure here is non-fatal — fall back to
+    // naked launch (same graceful-degradation stance as subprocessRunner's
+    // "skip built-in MCP" branch).
+    let argvOverrides: string[] = []
+    try {
+      const overrides = await this.ensureLaunchOverrides()
+      if (overrides) argvOverrides = overrides.argvOverrides
+    } catch (err) {
+      log.warn('codex app-server launch overrides build failed; spawning without platform context', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
+    }
+    // `codex app-server` accepts `-c key=value` overrides. They must precede
+    // `--listen` so clap's positional/option parser sees the stdio:// last.
+    const args = ['app-server', ...argvOverrides, '--listen', 'stdio://']
+    const proc = _spawnFn('codex', args, {
       cwd: this.opts.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildCodexEnv(),
-    })
+    }) as ChildProcessWithoutNullStreams
     this.proc = proc
     proc.stdout.on('data', (chunk: Buffer) => {
       // Identity guard (Codex review #019dde20 BLOCKER round 2): a stale
@@ -567,6 +700,12 @@ export class CodexAppServerRunner extends EventEmitter {
       // Clear stdoutBuf so the next proc's first response isn't prepended
       // with a partial line residue from this dying proc.
       this.stdoutBuf = ''
+      // Drop the launch overrides cache too — the dir contents are tied to
+      // the dead proc, and the next ensureSpawned() will lazy-rebuild a
+      // fresh dir. Not strictly required (shutdown already covers the
+      // explicit-stop path) but matches the symmetry "proc gone → context
+      // regenerated" so a crash-respawn can't reuse a stale path.
+      this.cleanupLaunchOverrides()
       this.emit('exit', {
         code: code ?? 0,
         signal,

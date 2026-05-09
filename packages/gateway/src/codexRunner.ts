@@ -1,7 +1,20 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+// Test-only override of the spawn used to launch `codex exec`. Production
+// always reads the binding through `_spawnFn` so a test can inject a stub
+// that captures args without forking a real subprocess. `__setCodexSpawnForTests`
+// is the documented hook; calling it with `null` restores the default. Never
+// call this from production code.
+let _spawnFn: typeof spawn = spawn
+export function __setCodexSpawnForTests(fn: typeof spawn | null): void {
+  _spawnFn = fn ?? spawn
+}
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { copyFile, mkdir } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
+import type { OpenClaudeConfig } from '@openclaude/storage'
+import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'codexRunner' })
@@ -108,6 +121,51 @@ export interface CodexRunnerOpts {
   /** Agent model id from agents.yaml (e.g. `gpt-5-codex`). When set, added
    *  as `--model` to codex argv so the agent config is honored. */
   model?: string
+  // ── Platform context injection (parity with SubprocessRunner / ccb) ──
+  // When `config` is provided, the runner builds an `extra-prompt.md` from
+  // `buildPromptContext()` and an mcp-memory MCP server entry, then passes
+  // them to codex via `-c model_instructions_file=...` and
+  // `-c mcp_servers.openclaude_memory.*=...`. Omit `config` to keep the
+  // legacy "naked codex" launch (no platform context) — used by tests.
+  /** Path to agent's persona file (CLAUDE.md / SOUL.md). */
+  persona?: string
+  /** Effective provider for `buildPromptContext` provider-keyed slot logic. */
+  agentProvider?: string
+  /** Initial effort level for the RESEARCH slot activation. */
+  effortLevel?: string
+  /** Gateway config; required for platform context injection. */
+  config?: OpenClaudeConfig
+  /** Forwarded to mcp-memory env so delegate_task can enforce recursion caps. */
+  delegationDepth?: number
+}
+
+/**
+ * Build codex `exec` argv. Module-level export so tests / overrides can drive
+ * the same builder the runner uses internally without poking at private
+ * `buildArgs`. v3 keeps `--full-auto` + `-c approval_policy="never"` (codex
+ * resume rejects bare `--sandbox`); platform context overrides are sliced in
+ * BEFORE the trailing positional (`threadId` / `-`) so codex's clap parser
+ * still sees the stdin sentinel last.
+ */
+export function buildCodexCliArgs(opts: {
+  model?: string
+  threadId?: string | null
+  /** Extra `-c key=value` argv pairs from `buildCodexLaunchOverrides()`. */
+  extraConfig?: string[]
+}): string[] {
+  const base = [
+    '--json',
+    '--skip-git-repo-check',
+    '--full-auto',
+    '-c',
+    'approval_policy="never"',
+  ]
+  if (opts.model) base.push('--model', opts.model)
+  const extra = opts.extraConfig ?? []
+  if (opts.threadId) {
+    return ['exec', 'resume', ...base, ...extra, opts.threadId, '-']
+  }
+  return ['exec', ...base, ...extra, '-']
 }
 
 /** Max stderr we keep per turn. Codex CLI normally logs only on error, but
@@ -190,6 +248,16 @@ export class CodexRunner extends EventEmitter {
   private queue: QueuedTurn[] = []
   private spawnEmitted = false
 
+  /** mkdtempSync'd dir holding the per-spawn `extra-prompt.md`. Created lazily
+   *  on the first turn that needs platform context, cleaned in `shutdown()`.
+   *  Null when overrides have never been built (no config) or were just
+   *  cleaned and not yet rebuilt. */
+  private sessionDir: string | null = null
+  /** Cached overrides for the current session lifetime. Cleared in `shutdown()`
+   *  alongside `sessionDir` so the next post-shutdown spawn rebuilds against a
+   *  fresh dir — re-using a stale entry would point codex at a deleted file. */
+  private cachedOverrides: CodexLaunchOverrides | null = null
+
   // ── Interface parity with SubprocessRunner ──
   // These are referenced by sessionManager / server and must exist even if
   // they are no-ops for the codex backend.
@@ -200,12 +268,40 @@ export class CodexRunner extends EventEmitter {
     return this.proc != null || this.processing
   }
 
-  updateConfig(_config: unknown): void {
-    // codex doesn't read gateway config; no-op
+  updateConfig(config: OpenClaudeConfig): void {
+    // codex itself doesn't read gateway config, but the platform-context
+    // injection path does (gateway port/token, claudeCodePath). Accept the
+    // new config and invalidate the cached overrides so the NEXT spawn
+    // rebuilds with the new values. A long-lived spawned mcp-memory child
+    // has the old token baked into its env at spawn time — config rotation
+    // only fully propagates after the codex proc respawns.
+    this.opts = { ...this.opts, config }
+    this.cachedOverrides = null
+    // Hygiene: if the runner is idle (no active proc, no in-flight turn),
+    // proactively rmSync the old sessionDir so the stale 0600 gateway-token
+    // file does not linger on disk longer than necessary after a token
+    // rotation. The next ensureLaunchOverrides() will mkdtemp afresh. We do
+    // NOT rmSync while a proc is running because mcp-memory still holds the
+    // file open through the env path it captured at spawn time.
+    if (!this.proc && !this.processing && this.sessionDir) {
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch (err) {
+        log.warn('codex updateConfig sessionDir cleanup failed', {
+          sessionDir: this.sessionDir,
+          err: (err as Error).message,
+        })
+      }
+      this.sessionDir = null
+    }
   }
 
-  setEffortLevel(_level: string | undefined): void {
-    // codex CLI manages its own effort; we don't map CCB effort here
+  setEffortLevel(level: string | undefined): void {
+    // codex CLI manages its own effort flag; we don't pass it through to the
+    // codex argv. But we DO record it on the runner so a subsequent
+    // ensureLaunchOverrides() (after shutdown clears the cache) reflects the
+    // new value when buildPromptContext renders the RESEARCH slot.
+    this.effortLevel = level
   }
 
   // ── model getter / setter (parity with SubprocessRunner; 2026-04-26) ──
@@ -239,6 +335,65 @@ export class CodexRunner extends EventEmitter {
   constructor(private opts: CodexRunnerOpts) {
     super()
     this.threadId = opts.resumeSessionId ?? null
+    this.effortLevel = opts.effortLevel
+  }
+
+  /** Lazy-build codex launch overrides (instructions file + mcp-memory config)
+   *  and cache the result for the lifetime of the current proc. Cleared in
+   *  `shutdown()` and `updateConfig()` so the next spawn rebuilds. Returns
+   *  null when `opts.config` is not provided (legacy "naked codex" path). */
+  private async ensureLaunchOverrides(): Promise<CodexLaunchOverrides | null> {
+    if (!this.opts.config) return null
+    if (this.cachedOverrides && this.sessionDir) return this.cachedOverrides
+    // Cache miss with an existing sessionDir means updateConfig (or some other
+    // invalidator) cleared `cachedOverrides` while the dir was still bound.
+    // CodexRunner queue is serial so by the time we re-run the previous turn's
+    // proc has exited; clean before mkdtemp v2 to avoid orphan tmp dirs on
+    // token rotation / config swaps.
+    if (this.sessionDir) {
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch (err) {
+        log.warn('codex stale sessionDir cleanup failed', {
+          sessionDir: this.sessionDir,
+          err: (err as Error).message,
+        })
+      }
+      this.sessionDir = null
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'oc-codex-'))
+    try {
+      const overrides = await buildCodexLaunchOverrides({
+        agentId: this.opts.agentId,
+        persona: this.opts.persona,
+        provider: this.opts.agentProvider,
+        model: this.opts.model,
+        effortLevel: this.effortLevel,
+        sessionDir: dir,
+        claudeCodePath: this.opts.config.auth.claudeCodePath,
+        gatewayPort: this.opts.config.gateway.port,
+        gatewayToken: this.opts.config.gateway.accessToken,
+        delegationDepth: this.opts.delegationDepth,
+      })
+      writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
+      // v3 hardening: write the gateway token to a 0600 file in sessionDir so
+      // mcp-memory can read it via OPENCLAUDE_GATEWAY_TOKEN_FILE without ever
+      // having the token literal in codex argv (`ps -ef` exposed). The file
+      // dies with the dir on shutdown / cache invalidation.
+      if (overrides.tokenFile && overrides.tokenContent !== null) {
+        writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
+      }
+      this.sessionDir = dir
+      this.cachedOverrides = overrides
+      return overrides
+    } catch (err) {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* swallow — primary error is what we care about */
+      }
+      throw err
+    }
   }
 
   async start(): Promise<void> {
@@ -296,6 +451,22 @@ export class CodexRunner extends EventEmitter {
     const pending = this.queue
     this.queue = []
     for (const q of pending) q.reject(new Error('CodexRunner shutdown'))
+    // Tear down the lazy-built launch overrides so the next post-shutdown
+    // submit() lazy-rebuilds against a fresh sessionDir. Re-using a stale
+    // overrides reference after we rmSync the dir would point codex at a
+    // deleted file. force:true tolerates the dir already missing.
+    if (this.sessionDir) {
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch (err) {
+        log.warn('codex session dir cleanup failed', {
+          sessionDir: this.sessionDir,
+          err: (err as Error).message,
+        })
+      }
+      this.sessionDir = null
+    }
+    this.cachedOverrides = null
     this.emit('exit', { code: 0, signal: null, crashed: false })
     // 允许后续 submit 再次拉起 proc。SessionManager 在 shutdown() 完成后
     // (effort 切换分支)会继续 submit —— 我们必须在这里开闸。
@@ -320,35 +491,44 @@ export class CodexRunner extends EventEmitter {
     }
   }
 
-  private buildArgs(): string[] {
+  private buildArgs(extraConfig?: string[]): string[] {
     // approval_policy=never prevents codex from ever asking for approval
     // (we have no UI path to answer — sendPermissionResponse is a no-op).
     // --full-auto is codex's alias for `--sandbox workspace-write` AND is
     // the only sandbox-setting flag accepted by both `codex exec` and
     // `codex exec resume` (resume rejects `--sandbox` outright, which
     // silently broke every multi-turn codex conversation with code=2).
-    // Model comes from agents.yaml.
-    const base = [
-      '--json',
-      '--skip-git-repo-check',
-      '--full-auto',
-      '-c',
-      'approval_policy="never"',
-    ]
-    if (this.opts.model) base.push('--model', this.opts.model)
-    if (this.threadId) {
-      return ['exec', 'resume', ...base, this.threadId, '-']
-    }
-    return ['exec', ...base, '-']
+    // Platform context overrides are sliced before the trailing positional.
+    return buildCodexCliArgs({
+      model: this.opts.model,
+      threadId: this.threadId,
+      extraConfig,
+    })
   }
 
-  private runTurn(prompt: string): Promise<void> {
+  private async runTurn(prompt: string): Promise<void> {
     const startedAt = Date.now()
-    const args = this.buildArgs()
+    // Build platform context overrides BEFORE spawn so the codex process sees
+    // model_instructions_file + mcp-memory from its first interaction. If
+    // override generation fails (mcp-memory entry resolution etc.) we still
+    // proceed without overrides — same graceful-degradation stance as
+    // subprocessRunner's "skip built-in MCP, log warn" branch.
+    let argvOverrides: string[] = []
+    try {
+      const overrides = await this.ensureLaunchOverrides()
+      if (overrides) argvOverrides = overrides.argvOverrides
+    } catch (err) {
+      log.warn('codex launch overrides build failed; spawning without platform context', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
+    }
+    const args = this.buildArgs(argvOverrides)
     log.info('codex turn start', {
       sessionKey: this.opts.sessionKey,
       resumed: this.threadId != null,
       promptChars: prompt.length,
+      hasOverrides: argvOverrides.length > 0,
     })
 
     return new Promise<void>((resolve) => {
@@ -361,11 +541,11 @@ export class CodexRunner extends EventEmitter {
 
       let proc: ChildProcessWithoutNullStreams
       try {
-        proc = spawn('codex', args, {
+        proc = _spawnFn('codex', args, {
           cwd: this.opts.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           env: buildCodexEnv(),
-        })
+        }) as ChildProcessWithoutNullStreams
       } catch (err) {
         // Sync spawn failure (rare — e.g. invalid args). Node throws rather
         // than emitting 'error' for some errno classes. ENOENT itself

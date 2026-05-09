@@ -19,6 +19,7 @@
  * Protocol: MCP stdio transport, official @modelcontextprotocol/sdk.
  */
 
+import { readFileSync } from 'node:fs'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -46,6 +47,43 @@ import {
 } from '@openclaude/storage'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
+
+/**
+ * Read the gateway access token used to authenticate callbacks from this
+ * mcp-memory subprocess into the parent gateway HTTP API
+ * (`/api/agents/.../message`, `/api/cron`, `/api/...`).
+ *
+ * Two delivery channels, file-first:
+ *
+ *   1. `OPENCLAUDE_GATEWAY_TOKEN_FILE` — absolute path to a file containing
+ *      the token. v3 codex spawn paths use this so the token is NOT exposed
+ *      via the codex argv `-c mcp_servers.openclaude_memory.env={...}`
+ *      injection (which would land the token in `ps -ef` / `/proc/<pid>/cmdline`).
+ *      The file is written 0600 inside an mkdtemp'd sessionDir owned by the
+ *      runner that spawned us, and torn down on shutdown.
+ *
+ *   2. `OPENCLAUDE_GATEWAY_TOKEN` — direct env var. ccb's subprocessRunner
+ *      sets the env via execve (no argv exposure), so it can keep using this
+ *      simpler path. master/personal codex paths also still use this.
+ *
+ * If the file path is set but unreadable we fall back to the env var rather
+ * than crash — keeps the agent partially functional (auth-protected calls
+ * will fail upstream with 401, which is observable). If neither is set, return
+ * empty string and let the gateway reject the unauthenticated call.
+ */
+function readGatewayToken(): string {
+  const file = process.env.OPENCLAUDE_GATEWAY_TOKEN_FILE
+  if (file) {
+    try {
+      return readFileSync(file, 'utf8').trim()
+    } catch (err: any) {
+      process.stderr.write(
+        `[mcp-memory] OPENCLAUDE_GATEWAY_TOKEN_FILE unreadable (${file}), falling back to env: ${err?.message ?? err}\n`,
+      )
+    }
+  }
+  return process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
+}
 
 const memory = new MemoryStore(AGENT_ID)
 await memory.load()
@@ -673,7 +711,7 @@ async function handleArchivalDelete(args: { id: string }) {
 // ─────────────────────────────────────────────────────────────
 async function handleSendToAgent(args: { agentId: string; message: string }) {
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
+  const gatewayToken = readGatewayToken()
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
   try {
     const res = await fetch(
@@ -710,7 +748,7 @@ async function handleDelegateTask(args: {
   toolsets?: string[]
 }) {
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
+  const gatewayToken = readGatewayToken()
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
   const targetAgent = args.agentId || 'main'
   try {
@@ -754,7 +792,7 @@ async function handleCreateReminder(args: {
 }) {
   // Call the gateway's /api/cron endpoint to create the reminder
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
+  const gatewayToken = readGatewayToken()
   try {
     const res = await fetch(`http://127.0.0.1:${gatewayPort}/api/cron`, {
       method: 'POST',

@@ -855,9 +855,12 @@ describe('SubprocessRunner interface parity', () => {
     await h.cleanup()
   })
 
-  it('updateConfig / setEffortLevel / sendPermissionResponse are callable no-ops', async () => {
+  it('updateConfig / setEffortLevel / sendPermissionResponse are callable', async () => {
+    // Phase 1 (master a88419ba ported): updateConfig/setEffortLevel are no
+    // longer no-ops — they invalidate launch-overrides cache and record
+    // effort respectively. Test still asserts they don't throw.
     const h = await makeHarness()
-    h.runner.updateConfig({})
+    h.runner.updateConfig({} as any)
     h.runner.setEffortLevel('high')
     assert.equal(h.runner.sendPermissionResponse('req-1', {}), false)
     await h.cleanup()
