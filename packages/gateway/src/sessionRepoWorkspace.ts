@@ -284,6 +284,15 @@ export class SessionRepoWorkspaceManager {
       return { kind: 'fresh', newState }
     })
 
+    // v1.0.95 诊断 instrument:看 bind() 的 decision 走哪条路径
+    // (noop / maybe-hydrate / hydrate-from-disk / fresh)。"noop" 路径
+    // 不发任何 status 帧 — 如果反复看到 noop 就解释了 status 卡 pending。
+    this.log.info('repo_workspace_bind_decision', {
+      sessionId: frame.sessionId,
+      selectionVersion: frame.selectionVersion,
+      kind: decision.kind,
+    })
+
     if (decision.kind === 'noop') return
 
     // ── maybe-hydrate 路径 ──
@@ -728,6 +737,15 @@ export class SessionRepoWorkspaceManager {
     sendStatus: (s: SessionRepoStatusOut) => void,
   ): Promise<void> {
     const { sessionId, selectionVersion, owner, repo, branch, accessToken } = frame
+
+    // v1.0.95 诊断 instrument:runClone 真启动 — git spawn 之前
+    this.log.info('repo_workspace_clone_start', {
+      sessionId,
+      selectionVersion,
+      owner,
+      repo,
+      branch,
+    })
 
     // 检查 1:开 work 之前
     if (!this.aliveAndCurrent(sessionId, selectionVersion, state.abort)) return

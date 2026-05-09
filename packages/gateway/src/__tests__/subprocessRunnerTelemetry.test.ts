@@ -19,7 +19,7 @@ function createRunner(): SubprocessRunner {
   return new SubprocessRunner({
     sessionKey: 'test',
     agentId: 'test',
-    cwd: '/tmp',
+    agentBaseDir: '/tmp',
     config: {} as any,
   } as any)
 }

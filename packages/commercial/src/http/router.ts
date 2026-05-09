@@ -56,6 +56,16 @@ import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
 import { handleLinuxdoStart, handleLinuxdoCallback } from './oauthLinuxdo.js'
+import { handleGithubStart, handleGithubCallback } from './oauthGithub.js'
+import {
+  handleGetMyGithub,
+  handleDeleteMyGithub,
+  handleListMyGithubRepos,
+  handleListMyGithubBranches,
+  handleGetSessionGithubSelection,
+  handlePutSessionGithubSelection,
+  handleDeleteSessionGithubSelection,
+} from './githubApi.js'
 import { requireUserVerifyDb } from './requireUser.js'
 import { handleListPlans, handleCreateHupi, handleHupiCallback, handleGetOrder } from './payment.js'
 import { handleAgentOpen, handleAgentStatus, handleAgentCancel } from './agent.js'
@@ -407,6 +417,12 @@ export function createCommercialHandler(
     //   失败一律 302 → /?login=1&oauth_error=<code>(SPA 接管 toast)
     { method: 'GET', path: '/api/auth/linuxdo/start', handler: handleLinuxdoStart },
     { method: 'GET', path: '/api/auth/linuxdo/callback', handler: handleLinuxdoCallback },
+    // GitHub OAuth 账号关联 —— 已登录用户将本地账号与 GitHub 账号绑定
+    //   start:POST(需 Bearer JWT),返回 JSON { authorizeUrl, state } + Set-Cookie state
+    //   callback:GET(GitHub 回跳),落库 github_links + 302 → /?github_linked=1
+    //   失败一律 302 → /?github_error=<code>(SPA 接管 toast)
+    { method: 'POST', path: '/api/auth/github/start', handler: handleGithubStart },
+    { method: 'GET', path: '/api/auth/github/callback', handler: handleGithubCallback },
     // v3 file proxy: 用 Bearer access token 换一个 HttpOnly `oc_session` cookie,
     // 让 `<a href>` / `<img>` 等原生下载链接能携带身份(见 handlers.ts 详注)
     { method: 'POST', path: '/api/auth/session', handler: handleCreateSession },
@@ -664,6 +680,19 @@ export function createCommercialHandler(
     //   POST /api/me/messages/:id/read           → 标记单条已读(handler 自己 regex 抠 :id)
     //   POST /api/me/messages/read_all           → 一次清完
     //   exact 排在 pathPrefix 前(matchRoute exact-first),:id/read 走 prefix 兜底
+    // GitHub 集成 — link 元信息 + repos/branches 列表 + per-session 选择
+    //   exact path 排在 prefix 之前(matchRoute exact-first)
+    //   /api/me/github          → link meta(GET / DELETE)
+    //   /api/me/github/repos    → 列 repos(GET exact)
+    //   /api/me/github/repos/:owner/:repo/branches → 列 branches(GET prefix,handler 内 regex)
+    //   /api/me/sessions/:sid/github-selection     → session 选择(GET / PUT / DELETE,prefix + handler regex)
+    { method: 'GET', path: '/api/me/github', handler: handleGetMyGithub },
+    { method: 'DELETE', path: '/api/me/github', handler: handleDeleteMyGithub },
+    { method: 'GET', path: '/api/me/github/repos', handler: handleListMyGithubRepos },
+    { method: 'GET', pathPrefix: '/api/me/github/repos/', handler: handleListMyGithubBranches },
+    { method: 'GET', pathPrefix: '/api/me/sessions/', handler: handleGetSessionGithubSelection },
+    { method: 'PUT', pathPrefix: '/api/me/sessions/', handler: handlePutSessionGithubSelection },
+    { method: 'DELETE', pathPrefix: '/api/me/sessions/', handler: handleDeleteSessionGithubSelection },
     { method: 'GET', path: '/api/me/messages', handler: handleListMyInbox },
     { method: 'GET', path: '/api/me/messages/unread_count', handler: handleCountMyInboxUnread },
     { method: 'POST', path: '/api/me/messages/read_all', handler: handleReadAllInbox },

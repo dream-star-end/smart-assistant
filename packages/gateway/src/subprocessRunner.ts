@@ -7,6 +7,7 @@ import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/
 import { createLogger } from './logger.js'
 import { buildPromptContext } from './promptSlots.js'
 import type { ExecutionTarget } from './remoteTarget.js'
+import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
@@ -70,7 +71,10 @@ function buildRemoteTargetEnv(target: ExecutionTarget | undefined): Record<strin
 export interface SubprocessRunnerOpts {
   sessionKey: string
   agentId: string
-  cwd: string
+  /** Phase 5 重命名(原 `cwd`):agent 的项目基础目录 = 没绑定 GitHub repo 时
+   *  CCB 的 --add-dir / Docker workspaceHostDir。绑了 ready repo 时,本字段
+   *  会被 effectiveAddDir(由 getRepoSnapshot 返的 workspaceDir)覆盖。 */
+  agentBaseDir: string
   config: OpenClaudeConfig
   persona?: string // 注入 system prompt 的文件
   model?: string
@@ -94,6 +98,16 @@ export interface SubprocessRunnerOpts {
    * 后需要 shutdown() 让下次 submit 触发重启才能生效 —— 与 setEffortLevel 同构。
    */
   executionTarget?: ExecutionTarget
+  /** Phase 5:peerId / sessionId(用于 getRepoSnapshot 查询当前 repo 状态)。
+   *  理论上 sessionKey 已经能推出 sessionId,但为避免重复解析串错,显式传。
+   *  null/undefined → 不查 repo snapshot(Codex / 旧调用兼容)。 */
+  sessionId?: string
+  /** Phase 5:读 SessionRepoWorkspaceManager 的 RepoSnapshot(单进程下即权威 state)。
+   *  在 start() 内调用一次,用于:
+   *    1) 决定 effective addDir(ready 时切到 workspaceDir,其它情况 fall-back agentBaseDir)
+   *    2) 写 _boundRepoBinding(只有 ready 状态才记)
+   *  undefined 或返 null → 等同于"未绑定",addDir = agentBaseDir。 */
+  getRepoSnapshot?: (sessionId: string) => RepoSnapshot | null
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -340,6 +354,16 @@ export class SubprocessRunner extends EventEmitter {
     this.opts.executionTarget = target
   }
 
+  /** Phase 5:本进程启动时是否绑定到 ready repo workspace。
+   *  null = 未 ready-bound(未绑 / cloning / failed / 还没 start);
+   *  非 null = 本 runner 当前活跃进程在 spawn 时拿到的 ready snapshot,
+   *  recycle 决策(sessionManager.recyclePeerForRepoChange)用此字段比版本。 */
+  private _boundRepoBinding: { selectionVersion: number; workspaceDir: string } | null = null
+
+  getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null {
+    return this._boundRepoBinding
+  }
+
   /** True if the subprocess is currently alive or being started */
   get isRunning(): boolean {
     return (this.proc !== null && !this.closed) || this.starting
@@ -390,12 +414,45 @@ export class SubprocessRunner extends EventEmitter {
     const entry = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
     const runtime = config.auth.claudeCodeRuntime ?? 'bun'
 
+    // ─── Phase 5: read repo snapshot ONCE before learning context + spawn args ──
+    // ready 时切到 repo workspaceDir,其它情况(null / cloning / failed)fall-back agentBaseDir。
+    // _boundRepoBinding 只在 ready 时记录,recycle 决策(sessionManager.recyclePeerForRepoChange)
+    // 据此判断是否 cwd-version 错位。
+    let repoSnapshot: RepoSnapshot | null = null
+    if (this.opts.sessionId && this.opts.getRepoSnapshot) {
+      try {
+        repoSnapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
+      } catch (err) {
+        runnerLog.warn(
+          'getRepoSnapshot threw; treating as no-bind',
+          { sessionKey: this.opts.sessionKey },
+          err,
+        )
+        repoSnapshot = null
+      }
+    }
+    const effectiveAddDir =
+      repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir
+        ? repoSnapshot.workspaceDir
+        : this.opts.agentBaseDir
+    if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir) {
+      this._boundRepoBinding = {
+        selectionVersion: repoSnapshot.selectionVersion,
+        workspaceDir: repoSnapshot.workspaceDir,
+      }
+    } else {
+      this._boundRepoBinding = null
+    }
+
     // ─── L1/L2/L3: prepare learning-loop context for the subprocess ───
-    let learningContext: Awaited<ReturnType<typeof this.buildLearningContext>>
+    let learningContext: { extraPromptFile?: string; mcpConfigFile?: string }
     try {
-      learningContext = await this.buildLearningContext()
+      learningContext = await this.buildLearningContext(repoSnapshot)
     } catch (err) {
       this.starting = false
+      // _boundRepoBinding 已在 439-444 落字段;start() 抛错没真正 spawn,清掉
+      // 避免 isRunning=false + binding!=null 的不变量割裂。
+      this._boundRepoBinding = null
       throw err
     }
 
@@ -406,7 +463,7 @@ export class SubprocessRunner extends EventEmitter {
       permissionMode: this.opts.permissionMode,
       extraPromptFile: learningContext.extraPromptFile,
       mcpConfigFile: learningContext.mcpConfigFile,
-      addDir: this.opts.cwd,
+      addDir: effectiveAddDir,
       resumeSessionId: this.currentSessionId,
       // v3 商业版用户容器判定。双信号 OR 兜底:
       //  - OC_CONTAINER_ID:私有 env,v3supervisor 仅在 bridgeSecret 就位时注入(语义最清晰)。
@@ -474,8 +531,10 @@ export class SubprocessRunner extends EventEmitter {
       proc = backend.spawn({
         command: runtime,
         args,
-        cwd: ccbDir,
-        agentCwd: this.opts.cwd, // agent's real working directory (for Docker volume mount)
+        ccbBinaryDir: ccbDir,
+        // Docker /workspace mount + Local --add-dir 内容统一用 effectiveAddDir;
+        // ready 时是 repo workspaceDir,其它情况 = agentBaseDir。
+        workspaceHostDir: effectiveAddDir,
         env: {
           ...process.env,
           ...providerEnv,
@@ -509,6 +568,8 @@ export class SubprocessRunner extends EventEmitter {
       })
     } catch (err) {
       this.starting = false
+      // 见 449 catch 同理:spawn 抛错时 binding 字段已置位,清掉保不变量。
+      this._boundRepoBinding = null
       throw err
     }
 
@@ -549,6 +610,10 @@ export class SubprocessRunner extends EventEmitter {
     proc.on('exit', (code, signal) => {
       this.proc = null
       this.closed = true
+      // Phase 5:进程死了,清 binding。下次 start 会按当时 repo state 重新评估。
+      // 哪怕本次是 graceful (recycle),session.lock 已经在 caller 那边持有,
+      // 不存在 stale binding 被中间状态读到的窗口;但写下来语义更对称。
+      this._boundRepoBinding = null
       // Use explicit shuttingDown flag (set by shutdown()) to distinguish
       // graceful shutdown from crash. Exit code alone is unreliable:
       // - SIGSEGV/SIGKILL → code=null but NOT graceful
@@ -782,7 +847,7 @@ export class SubprocessRunner extends EventEmitter {
   // Writes temp files under /tmp/openclaude-<sessionKey>-XXXXXX/:
   //   extra-prompt.md   — USER.md content + skill metadata digest
   //   mcp-config.json   — MCP server pointing at @openclaude/mcp-memory
-  private async buildLearningContext(): Promise<{
+  private async buildLearningContext(repoSnapshot: RepoSnapshot | null = null): Promise<{
     extraPromptFile?: string
     mcpConfigFile?: string
   }> {
@@ -806,6 +871,8 @@ export class SubprocessRunner extends EventEmitter {
         // 把当前 effort 传进 slot builder 决定是否注入"科研模式守则"。
         // effort 切换本就会 recycle subprocess,新 runner 启动时会重建 extra-prompt.md。
         effortLevel: this.opts.effortLevel,
+        // Phase 5:GitHub repo 当前快照(none / cloning / ready / failed) — 决定是否注入 REPO slot。
+        repoSnapshot,
       })
       if (promptContent) {
         const path = resolve(sessionDir, 'extra-prompt.md')
@@ -991,6 +1058,9 @@ export class SubprocessRunner extends EventEmitter {
     // Always clean up the session directory, even if there is no live process
     // (failed starts, already-exited runners, crash paths).
     if (!this.proc) {
+      // Phase 5:无活进程,binding 也跟着清。否则 start 在 starting 中 throw 后留下
+      // stale binding,下次 isRunning=false 但 binding 还在,sessionManager 决策表会读错。
+      this._boundRepoBinding = null
       this.cleanupSessionDir()
       return
     }
@@ -1019,6 +1089,8 @@ export class SubprocessRunner extends EventEmitter {
     })
     this.proc = null
     this.closed = true
+    // Phase 5:本进程已死,清掉 ready binding。下次 start() 会按当时 repo state 重新评估。
+    this._boundRepoBinding = null
     this.cleanupSessionDir()
   }
 }

@@ -14,6 +14,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { MemoryStore, SkillStore, paths, readAgentsConfig } from '@openclaude/storage'
+import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 export interface PromptSlotContext {
   agentId: string
@@ -24,6 +25,9 @@ export interface PromptSlotContext {
    *  仅在 Opus 4.7 + 用户在"思考深度"菜单里选到 xhigh/max 档位时才会是这两个值
    *  (UI 入口见 packages/web/public/modules/effortMode.js)。 */
   effortLevel?: string
+  /** Phase 5 — 当前会话的 GitHub repo 绑定快照(来自 SessionRepoWorkspaceManager.getRepoSnapshot(sessionId))。
+   *  null = 没绑定;否则按 status 三态生成 repo slot。 */
+  repoSnapshot?: RepoSnapshot | null
 }
 
 export interface PromptSlot {
@@ -305,6 +309,62 @@ export function buildResearchSlot(ctx: PromptSlotContext): PromptSlot | null {
   }
 }
 
+// ── Phase 5: Session GitHub repo slot ──
+//
+// 三态(none → 不进 slots[]):
+//   - cloning: 克隆中,提示不要写 repo 内文件
+//   - ready:  workspaceDir + headSha 给 CCB,提示 Bash cwd 已就位
+//   - failed: errorCode + 中性化文本(不指挥用户怎么做,只陈述事实)
+//
+// 注入位置:在 RESEARCH slot 之后(=最后一段),离 user 消息最近,提升 agent 对
+// "本会话仓库约束"的遵循度。
+export function buildRepoSlot(ctx: PromptSlotContext): PromptSlot | null {
+  const snap = ctx.repoSnapshot
+  if (!snap) return null
+  const { owner, repo, branch, status } = snap
+
+  if (status === 'cloning' || status === 'pending') {
+    return {
+      name: 'REPO',
+      content: [
+        '# 当前会话 GitHub 仓库',
+        '',
+        `仓库:\`${owner}/${repo}\` 分支 \`${branch}\``,
+        '状态:正在克隆,工作目录尚未就绪。本轮回答中**不要**对仓库内文件执行写操作。',
+      ].join('\n'),
+    }
+  }
+
+  if (status === 'ready' && snap.workspaceDir) {
+    const headShort = snap.headSha ? snap.headSha.slice(0, 7) : '?'
+    return {
+      name: 'REPO',
+      content: [
+        '# 当前会话 GitHub 仓库',
+        '',
+        `仓库:\`${owner}/${repo}\` 分支 \`${branch}\` HEAD \`${headShort}\``,
+        `本地工作目录:\`${snap.workspaceDir}\``,
+        'Bash 工具默认 cwd 已指向该目录;`git status` / `git diff` / `git push` 均可使用,',
+        'push 时 git credential helper 会自动用 GitHub token 鉴权。',
+      ].join('\n'),
+    }
+  }
+
+  if (status === 'failed') {
+    return {
+      name: 'REPO',
+      content: [
+        '# 当前会话 GitHub 仓库',
+        '',
+        `仓库:\`${owner}/${repo}\` 分支 \`${branch}\` 克隆失败:\`${snap.errorCode ?? 'unknown'}\``,
+        '当前没有可用的仓库工作目录。',
+      ].join('\n'),
+    }
+  }
+
+  return null
+}
+
 // ── Unified builder ──
 
 const SEPARATOR = '\n\n---\n\n'
@@ -341,6 +401,11 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<string
   // 提升 agent 对"本会话约束"的遵循度。不选就不注入。
   const research = buildResearchSlot(ctx)
   if (research) slots.push(research)
+
+  // Layer 5(Phase 5): 当前会话的 GitHub repo 绑定状态。放在 RESEARCH 之后,
+  // 是离 user 消息最近的一段,确保 agent 能强感知 "Bash 工具的 cwd 在哪"。
+  const repo = buildRepoSlot(ctx)
+  if (repo) slots.push(repo)
 
   return slots.map((s) => s.content).join(SEPARATOR)
 }

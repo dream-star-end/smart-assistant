@@ -20,7 +20,7 @@ function createRunner(initial: Partial<{ model: string; effortLevel: string }> =
   return new SubprocessRunner({
     sessionKey: 'test',
     agentId: 'test',
-    cwd: '/tmp',
+    agentBaseDir: '/tmp',
     config: {} as any,
     ...initial,
   } as any)

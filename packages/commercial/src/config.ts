@@ -384,6 +384,13 @@ export const commercialConfigSchema = z
      * - 不入 git;由 systemd EnvironmentFile 注入(commercial-v3 部署侧)
      */
     DEEPSEEK_API_KEY: z.string().trim().min(1).max(256).optional(),
+    /**
+     * GitHub OAuth App 配置(GitHub OAuth 关联功能)。
+     * 全部 optional — 缺失时 /api/auth/github/* 返 503,启动不阻断。
+     */
+    GITHUB_OAUTH_CLIENT_ID: z.string().min(1).optional(),
+    GITHUB_OAUTH_CLIENT_SECRET: z.string().min(1).optional(),
+    GITHUB_OAUTH_REDIRECT_URI: z.string().url().optional(),
   })
   .superRefine((cfg, ctx) => {
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。
