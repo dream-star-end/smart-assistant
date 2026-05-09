@@ -310,12 +310,18 @@ export const _CODEX_7D_WINDOW_MINS = 10080
 export function _parseCodexRateLimits(rl: unknown): RuntimeRateLimits | null {
   if (!rl || typeof rl !== 'object') return null
   const r = rl as Record<string, unknown>
-  const primary = r.primary && typeof r.primary === 'object' ? (r.primary as Record<string, unknown>) : null
-  const secondary = r.secondary && typeof r.secondary === 'object' ? (r.secondary as Record<string, unknown>) : null
+  const primary =
+    r.primary && typeof r.primary === 'object' ? (r.primary as Record<string, unknown>) : null
+  const secondary =
+    r.secondary && typeof r.secondary === 'object' ? (r.secondary as Record<string, unknown>) : null
 
   // 提取每个 window 的 duration(可缺/可 null)
-  const primaryMins = primary && typeof primary.windowDurationMins === 'number' ? primary.windowDurationMins : null
-  const secondaryMins = secondary && typeof secondary.windowDurationMins === 'number' ? secondary.windowDurationMins : null
+  const primaryMins =
+    primary && typeof primary.windowDurationMins === 'number' ? primary.windowDurationMins : null
+  const secondaryMins =
+    secondary && typeof secondary.windowDurationMins === 'number'
+      ? secondary.windowDurationMins
+      : null
 
   // Codex review NEEDS-FIX 1:fallback 仅在双窗口都存在且都无 duration 时启用。
   // 单窗口 + 无 duration:返回 null,避免把 7d-only plan 错写成 5h。
@@ -324,8 +330,14 @@ export function _parseCodexRateLimits(rl: unknown): RuntimeRateLimits | null {
 
   const out: RuntimeRateLimits = {}
   const writeWindow = (win: Record<string, unknown>, bucket: '5h' | '7d'): void => {
-    const usedPercent = typeof win.usedPercent === 'number' && Number.isFinite(win.usedPercent) ? win.usedPercent : null
-    const resetsAt = typeof win.resetsAt === 'number' && Number.isFinite(win.resetsAt) && win.resetsAt > 0 ? win.resetsAt : null
+    const usedPercent =
+      typeof win.usedPercent === 'number' && Number.isFinite(win.usedPercent)
+        ? win.usedPercent
+        : null
+    const resetsAt =
+      typeof win.resetsAt === 'number' && Number.isFinite(win.resetsAt) && win.resetsAt > 0
+        ? win.resetsAt
+        : null
     if (usedPercent !== null) {
       const clamped = Math.max(0, Math.min(100, usedPercent))
       if (bucket === '5h') out.util5h = clamped
@@ -774,10 +786,13 @@ export class CodexAppServerRunner extends EventEmitter {
       const overrides = await this.ensureLaunchOverrides()
       if (overrides) argvOverrides = overrides.argvOverrides
     } catch (err) {
-      log.warn('codex app-server launch overrides build failed; spawning without platform context', {
-        sessionKey: this.opts.sessionKey,
-        err: (err as Error).message,
-      })
+      log.warn(
+        'codex app-server launch overrides build failed; spawning without platform context',
+        {
+          sessionKey: this.opts.sessionKey,
+          err: (err as Error).message,
+        },
+      )
     }
     // `codex app-server` accepts `-c key=value` overrides. They must precede
     // `--listen` so clap's positional/option parser sees the stdio:// last.
@@ -904,6 +919,123 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
+  /**
+   * Forward codex's `account/chatgptAuthTokens/refresh` reverse-RPC to the
+   * v3 master HTTP endpoint.
+   *
+   * V3 commercial topology: each container's gateway has no DB / KMS /
+   * refresh_token. Refresh state lives on master. Container env carries:
+   *   - OPENCLAUDE_V3_MASTER_BASE_URL = e.g. http://172.30.0.1:18791 (self-host)
+   *     or https://commercial-v3.host:18443 (remote-host with mTLS — but in
+   *     v3 the container always reaches its own host, so plain http loopback)
+   *   - OPENCLAUDE_V3_CONTAINER_TOKEN = `oc-v3.<containerId>.<secret>` bearer
+   *
+   * Both env are required. Missing either → reply -32601 (matches the legacy
+   * "not implemented" semantics so codex's failure path is unchanged on
+   * non-v3 setups). Real failures (HTTP non-2xx, network) → -32603 internal
+   * error so codex / container log clearly distinguish "not wired" from
+   * "wired but broken".
+   *
+   * Response body shape from master matches codex's
+   * `ChatgptAuthTokensRefreshResponse` schema 1:1
+   * (`accessToken`, `chatgptAccountId`, `chatgptPlanType?`).
+   */
+  private async _handleChatgptAuthTokensRefresh(
+    id: string | number,
+    params: unknown,
+  ): Promise<void> {
+    const baseUrl = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+    const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+    if (!baseUrl || !token) {
+      // Not running under v3 commercial — preserve legacy "not implemented"
+      // semantics so personal-version codex paths fail the same way.
+      this.writeRaw(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32601,
+            message:
+              "method 'account/chatgptAuthTokens/refresh' not implemented by openclaude-gateway",
+          },
+        }),
+      )
+      return
+    }
+    const url = `${baseUrl.replace(/\/+$/, '')}/internal/v3/codex/token-refresh`
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(params ?? {}),
+      })
+      const text = await resp.text()
+      if (resp.status >= 200 && resp.status < 300) {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(text)
+        } catch (err) {
+          log.warn('codex token refresh: master 2xx but body not JSON', {
+            sessionKey: this.opts.sessionKey,
+            status: resp.status,
+            err: (err as Error).message,
+          })
+          this.writeRaw(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id,
+              error: {
+                code: -32603,
+                message: 'codex token refresh: master returned non-JSON body',
+              },
+            }),
+          )
+          return
+        }
+        // Pass through — master already shaped to ChatgptAuthTokensRefreshResponse.
+        this.writeRaw(JSON.stringify({ jsonrpc: '2.0', id, result: parsed }))
+        return
+      }
+      // Non-2xx — surface master's error code/message for log diagnosis but
+      // collapse to JSON-RPC -32603. Codex will treat this as a hard refresh
+      // failure (turn fails); the container's next attempt will hit master
+      // anew (no caching here).
+      log.warn('codex token refresh: master returned non-2xx', {
+        sessionKey: this.opts.sessionKey,
+        status: resp.status,
+        body: text.slice(0, 512),
+      })
+      this.writeRaw(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32603,
+            message: `codex token refresh failed: master returned ${resp.status}`,
+          },
+        }),
+      )
+    } catch (err) {
+      log.warn('codex token refresh: master fetch threw', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
+      this.writeRaw(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32603,
+            message: `codex token refresh failed: ${(err as Error).message}`,
+          },
+        }),
+      )
+    }
+  }
+
   private writeRaw(line: string): void {
     if (!this.proc || this.proc.killed) return
     try {
@@ -963,9 +1095,19 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (msg.kind === 'server-request') {
-      // Server-initiated requests (e.g. permission prompts, MCP elicitations)
-      // are not handled because we run with approvalPolicy=never. Reply
-      // method-not-found per JSON-RPC spec so codex doesn't hang.
+      // Two reverse-RPC methods we recognize:
+      //   - `account/chatgptAuthTokens/refresh` (codex 401-recovery): forward
+      //     to v3 master HTTP endpoint, reply with the new token. Without
+      //     this every codex 401 fails the turn.
+      //   - All others (permission prompts, MCP elicitations, etc.) — reply
+      //     -32601 method-not-found because we run approvalPolicy=never and
+      //     have no UI back-channel.
+      if (msg.method === 'account/chatgptAuthTokens/refresh') {
+        // Async fire-and-forget; we reply to codex in the callback. Errors
+        // here become a JSON-RPC error frame back to codex.
+        void this._handleChatgptAuthTokensRefresh(msg.id, msg.params)
+        return
+      }
       this.writeRaw(
         JSON.stringify({
           jsonrpc: '2.0',

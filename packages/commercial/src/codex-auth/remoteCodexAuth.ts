@@ -20,12 +20,12 @@
  * fallback 到 NULL bind / skip / 重试,本模块不吞错。
  */
 
-import { join as pathJoin } from "node:path";
+import { join as pathJoin } from 'node:path'
 
-import { V3_AGENT_GID, V3_AGENT_UID } from "../agent-sandbox/constants.js";
-import { putFile, deleteFile, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
-import { buildPerContainerAuthJson } from "./codexAuthFile.js";
-import { DEFAULT_V3_CODEX_CONTAINER_DIR } from "./constants.js";
+import { V3_AGENT_GID, V3_AGENT_UID } from '../agent-sandbox/constants.js'
+import { type NodeAgentTarget, deleteFile, putFile } from '../compute-pool/nodeAgentClient.js'
+import { buildPerContainerAuthJson } from './codexAuthFile.js'
+import { DEFAULT_V3_CODEX_CONTAINER_DIR } from './constants.js'
 
 /**
  * 拼远端 host 上 per-container auth.json 绝对路径。
@@ -37,9 +37,9 @@ import { DEFAULT_V3_CODEX_CONTAINER_DIR } from "./constants.js";
  */
 function resolveRemotePath(containerId: string): string {
   if (!/^\d+$/.test(containerId)) {
-    throw new Error(`remoteCodexAuth: invalid containerId (must be digits): ${containerId}`);
+    throw new Error(`remoteCodexAuth: invalid containerId (must be digits): ${containerId}`)
   }
-  return pathJoin(DEFAULT_V3_CODEX_CONTAINER_DIR, containerId, "auth.json");
+  return pathJoin(DEFAULT_V3_CODEX_CONTAINER_DIR, containerId, 'auth.json')
 }
 
 /**
@@ -53,12 +53,16 @@ export async function putRemoteCodexContainerAuth(
   accessToken: string,
   lastRefreshIso: string,
 ): Promise<void> {
-  const remotePath = resolveRemotePath(containerId);
-  const body = Buffer.from(
-    buildPerContainerAuthJson({ accessToken, lastRefreshIso }),
-    "utf8",
-  );
-  await putFile(target, remotePath, body, 0o400, V3_AGENT_UID, V3_AGENT_GID);
+  const remotePath = resolveRemotePath(containerId)
+  const body = Buffer.from(buildPerContainerAuthJson({ accessToken, lastRefreshIso }), 'utf8')
+  // body 携带 access_token 明文,完成 putFile 后必须显式清零(JS 字符串无法
+  // 真正清零,但显式 Buffer 应清 — 与 refresh.ts 的 token Buffer 清零规约对齐;
+  // codex round 2 BLOCKER#3 修复)。
+  try {
+    await putFile(target, remotePath, body, 0o400, V3_AGENT_UID, V3_AGENT_GID)
+  } finally {
+    body.fill(0)
+  }
 }
 
 /**
@@ -81,7 +85,7 @@ export async function deleteRemoteCodexContainerAuth(
   target: NodeAgentTarget,
   containerId: string,
 ): Promise<void> {
-  if (!/^\d+$/.test(containerId)) return;
-  const remotePath = resolveRemotePath(containerId);
-  await deleteFile(target, remotePath);
+  if (!/^\d+$/.test(containerId)) return
+  const remotePath = resolveRemotePath(containerId)
+  await deleteFile(target, remotePath)
 }

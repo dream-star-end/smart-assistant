@@ -65,6 +65,10 @@ import {
   type CodexRefreshActorHandle,
 } from "./account-pool/codexAccountActor.js";
 import {
+  startCooldownRecoveryActor,
+  type CooldownRecoveryActorHandle,
+} from "./account-pool/cooldownRecoveryActor.js";
+import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
   stopAndRemoveV3Container,
 } from "./agent-sandbox/v3supervisor.js";
@@ -86,6 +90,11 @@ import {
   SERVER_AUTHORED_PATH,
   type ServerAuthoredHandler,
 } from "./http/internalServerAuthored.js";
+import {
+  CODEX_TOKEN_REFRESH_PATH,
+  makeCodexTokenRefreshHandler,
+  type CodexTokenRefreshHandler,
+} from "./http/internalCodexTokenRefresh.js";
 import {
   appendCostCredits,
   appendServerAuthoredMessage,
@@ -680,10 +689,131 @@ export async function registerCommercial(
           appendServerAuthoredMessageForRequest,
         },
       });
+      // Codex reverse-RPC `account/chatgptAuthTokens/refresh` over HTTP.
+      // Container's gateway forwards 401-recovery refresh asks here; we read
+      // the bound codex_account, refresh upstream, persist to DB + per-container
+      // auth.json under FOR UPDATE, and return the new token. Without this
+      // path every codex 401 fails the turn (-32601 method-not-found).
+      const codexContainerDirForRefresh =
+        process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
+      const codexTokenRefreshHandler: CodexTokenRefreshHandler = makeCodexTokenRefreshHandler({
+        identityRepo,
+        rateLimitRedis,
+        codexContainerDir: codexContainerDirForRefresh,
+        containerUid: V3_AGENT_UID,
+        containerGid: V3_AGENT_GID,
+        // selfHostId 取自外层闭包 selfHostUuid;此分支已 guard 它非空。
+        selfHostId: selfHostUuid,
+        // refreshDeps 注入 healthTracker — 保持与 anthropicProxy 一致(失败走
+        // health.manualDisable 路径)。
+        refreshDeps: { health: healthTracker },
+        db: {
+          // 注:两处都 LEFT JOIN claude_accounts 取 ca.status,以让 handler
+          // 拒刷 disabled/quarantined/已删 账号 — 见 codex round 2 BLOCKER#2。
+          // FOR UPDATE 仍只锁 agent_containers(`OF ac` 显式收窄,避免锁
+          // claude_accounts 行,与 lazy migrate 的 `FOR UPDATE OF ac` 兼容)。
+          async readContainerAccount(containerId) {
+            const r = await getPool().query<{
+              codex_account_id: string | null;
+              user_id: string;
+              state: string;
+              host_uuid: string | null;
+              account_status: string | null;
+            }>(
+              `SELECT ac.codex_account_id::text AS codex_account_id,
+                      ac.user_id::text AS user_id,
+                      ac.state,
+                      ac.host_uuid::text AS host_uuid,
+                      ca.status AS account_status
+                 FROM agent_containers ac
+                 LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
+                WHERE ac.id = $1`,
+              [containerId],
+            );
+            if (r.rows.length === 0) return null;
+            const row = r.rows[0];
+            return {
+              codexAccountId: row.codex_account_id === null ? null : BigInt(row.codex_account_id),
+              userId: BigInt(row.user_id),
+              state: row.state,
+              hostUuid: row.host_uuid,
+              accountStatus: row.account_status,
+            };
+          },
+          async txWithLock(containerId, fn) {
+            return await tx(async (client) => {
+              const lockRes = await client.query<{
+                codex_account_id: string | null;
+                user_id: string;
+                state: string;
+                host_uuid: string | null;
+                account_status: string | null;
+              }>(
+                `SELECT ac.codex_account_id::text AS codex_account_id,
+                        ac.user_id::text AS user_id,
+                        ac.state,
+                        ac.host_uuid::text AS host_uuid,
+                        ca.status AS account_status
+                   FROM agent_containers ac
+                   LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
+                  WHERE ac.id = $1
+                    FOR UPDATE OF ac`,
+                [containerId],
+              );
+              const row =
+                lockRes.rows.length === 0
+                  ? null
+                  : {
+                      codexAccountId:
+                        lockRes.rows[0].codex_account_id === null
+                          ? null
+                          : BigInt(lockRes.rows[0].codex_account_id),
+                      userId: BigInt(lockRes.rows[0].user_id),
+                      state: lockRes.rows[0].state,
+                      hostUuid: lockRes.rows[0].host_uuid,
+                      accountStatus: lockRes.rows[0].account_status,
+                    };
+              return await fn(client, row);
+            });
+          },
+        },
+        fileWriter: {
+          async writeLocal(args) {
+            await writeCodexContainerAuthFile(args);
+          },
+          // Remote write — same getHostById → hostRowToTarget → putRemote →
+          // finally psk.fill(0) shape as v3Deps.putRemoteCodexAuth (line ~883).
+          // Constructed inline because v3Deps is initialized *after* this
+          // dispatchInternal block; we don't want to depend on declaration
+          // order. The handler only invokes this when row.host_uuid !== self.
+          async writeRemote(hostUuid, containerId, accessToken, lastRefreshIso) {
+            const row = await computeQueries.getHostById(hostUuid);
+            if (!row) {
+              throw new Error(
+                `internalCodexTokenRefresh.writeRemote: compute_host ${hostUuid} not found`,
+              );
+            }
+            const target = hostRowToTarget(row);
+            try {
+              await putRemoteCodexContainerAuth(
+                target,
+                containerId,
+                accessToken,
+                lastRefreshIso,
+              );
+            } finally {
+              target.psk?.fill(0);
+            }
+          },
+        },
+      });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (path === SERVER_AUTHORED_PATH) {
           return serverAuthoredHandler(req, res, ctx);
+        }
+        if (path === CODEX_TOKEN_REFRESH_PATH) {
+          return codexTokenRefreshHandler(req, res, ctx);
         }
         return internalProxyHandler!(req, res, ctx);
       };
@@ -1569,6 +1699,19 @@ export async function registerCommercial(
     });
   }
 
+  // 账号池 cooldown 半开恢复 actor —— 周期扫 cooldown_until 已过期的账号 → active。
+  // 默认 5min tick(下限 1s 防 typo)。
+  // 关闭:`COMMERCIAL_COOLDOWN_RECOVERY_DISABLED=1`(测试 / 应急)。
+  let cooldownRecoveryActor: CooldownRecoveryActorHandle | undefined;
+  if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
+    const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5 * 60_000;
+    cooldownRecoveryActor = startCooldownRecoveryActor({
+      tracker: healthTracker,
+      intervalMs,
+    });
+  }
+
   // A1 — pending 订单 expirer(默认 60s tick,部署即 boot 跑一次清历史脏单)。
   // markOrderPaid 不在事务内对 expires_at 做硬防线(避免用户超时几秒扫码就硬失败
   // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
@@ -1630,6 +1773,9 @@ export async function registerCommercial(
       }
       if (codexRefreshActor) {
         try { codexRefreshActor.stop(); } catch { /* ignore */ }
+      }
+      if (cooldownRecoveryActor) {
+        try { cooldownRecoveryActor.stop(); } catch { /* ignore */ }
       }
       if (pendingOrdersExpirer) {
         try { pendingOrdersExpirer.stop(); } catch { /* ignore */ }

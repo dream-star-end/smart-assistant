@@ -26,8 +26,8 @@ import {
   recordRefreshEvent,
 } from '../account-pool/refreshEvents.js'
 import { createAccount, deleteAccount } from '../account-pool/store.js'
-import { KMS_KEY_BYTES } from '../crypto/keys.js'
 import { encrypt } from '../crypto/aead.js'
+import { KMS_KEY_BYTES } from '../crypto/keys.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
@@ -371,12 +371,35 @@ describe('refresh.ts 落事件 — err_msg 固定字符串', () => {
     assert.ok(!evs[0].err_msg!.includes('CONNECT_TIMEOUT'))
   })
 
-  test("http_error → err_msg='HTTP 502'(只含 status,无 body)", async (t) => {
+  // 政策更新(2026-05-09 codex round 2 BLOCKER#1):上游 5xx/408/425/429 已不再
+  // 当 http_error,改记 network_transient(不 disable 账号);err_msg 仍只含 status。
+  test("network_transient (HTTP 502) → err_msg='HTTP 502'(只含 status,无 body)", async (t) => {
     if (skipIfNoDb(t)) return
-    const id = await makeAccount('ev-http')
+    const id = await makeAccount('ev-http-transient')
     const http = mockHttp({
       status: 502,
       body: '{"err":"upstream","leaked_token":"sk-ant-secret-deadbeef"}',
+    })
+    await assert.rejects(
+      refreshAccountToken(id, { http, keyFn }),
+      (e: unknown) => e instanceof RefreshError && e.code === 'network_transient',
+    )
+    await new Promise((r) => setTimeout(r, 50))
+    const evs = await listRefreshEvents(id)
+    assert.equal(evs.length, 1)
+    assert.equal(evs[0].err_code, 'network_transient')
+    assert.equal(evs[0].err_msg, 'HTTP 502')
+    // 关键:不含 response body 里的 token 残片
+    assert.ok(!evs[0].err_msg!.includes('sk-ant-secret'))
+    assert.ok(!evs[0].err_msg!.includes('upstream'))
+  })
+
+  test("http_error (HTTP 400) → err_msg='HTTP 400'(只含 status,无 body)", async (t) => {
+    if (skipIfNoDb(t)) return
+    const id = await makeAccount('ev-http-perm')
+    const http = mockHttp({
+      status: 400,
+      body: '{"error":"invalid_grant","secret":"sk-ant-leak"}',
     })
     await assert.rejects(
       refreshAccountToken(id, { http, keyFn }),
@@ -386,10 +409,10 @@ describe('refresh.ts 落事件 — err_msg 固定字符串', () => {
     const evs = await listRefreshEvents(id)
     assert.equal(evs.length, 1)
     assert.equal(evs[0].err_code, 'http_error')
-    assert.equal(evs[0].err_msg, 'HTTP 502')
-    // 关键:不含 response body 里的 token 残片
-    assert.ok(!evs[0].err_msg!.includes('sk-ant-secret'))
-    assert.ok(!evs[0].err_msg!.includes('upstream'))
+    assert.equal(evs[0].err_msg, 'HTTP 400')
+    // 关键:不含 response body 里的密钥残片
+    assert.ok(!evs[0].err_msg!.includes('sk-ant-leak'))
+    assert.ok(!evs[0].err_msg!.includes('invalid_grant'))
   })
 
   test("bad_response (invalid JSON) → err_msg='invalid JSON'", async (t) => {
@@ -428,7 +451,13 @@ describe('refresh.ts 落事件 — err_msg 固定字符串', () => {
   test("no_refresh_token → err_msg='no refresh_token on record'", async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
-      { label: 'ev-nort', plan: 'pro', token: 'X', refresh: null, egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      {
+        label: 'ev-nort',
+        plan: 'pro',
+        token: 'X',
+        refresh: null,
+        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+      },
       keyFn,
     )
     const http = mockHttp({ status: 200, body: '{}' })
