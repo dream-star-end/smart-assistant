@@ -621,10 +621,9 @@
            aria-live=polite 仅落在 .repo-banner-status,避免 200ms 进度刷新轰炸读屏。
            Track 上 role=progressbar + aria-valuenow,百分比文字 aria-hidden。
 
-           v1.0.109 admin-only UI gate:默认 hidden,billing.js refreshBalance() 在
-           user.role==='admin' 时移除属性触发显示。靠 style.css line 157 的全局
-           `[hidden] { display:none !important; }` 兜底,无需局部冗余规则。
-           非安全边界 — devtools 强解仍能触发,但服务端是真实权限边界。 -->
+           默认 hidden,billing.js refreshBalance() 在登录用户 /api/me 成功时移除属性
+           触发显示。靠 style.css line 157 的全局 `[hidden] { display:none !important; }`
+           兜底,无需局部冗余规则。 -->
       <div id="repo-bar" class="repo-bar" hidden>
         <button
           type="button"

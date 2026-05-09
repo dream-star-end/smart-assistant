@@ -6555,7 +6555,7 @@ body.body-landing {
   /* v1.0.110 跟 .composer-inner 同形居中限宽,使 #github-trigger 视觉左缘与
      .composer-modes 内的 mode-pill 对齐。padding-left 计算:模拟 .composer-inner
      的 1px border + .composer-modes 的 var(--space-3) padding-left。
-     v1.0.109 admin-only UI gate 的 hidden 属性靠全局 `[hidden] { display:none !important }`
+     hidden 属性靠全局 `[hidden] { display:none !important }`
      (style.css line 157)兜底,不需局部冗余规则。 */
   --composer-border-width: 1px;
   max-width: 780px;
