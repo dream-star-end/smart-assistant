@@ -30,6 +30,9 @@ export {
   v3ContainerNameFor,
   v3VolumeNameFor,
   v3ProjectsVolumeNameFor,
+  v3CodexVolumeNameFor,
+  v3UserLocalVolumeNameFor,
+  v3UserConfigVolumeNameFor,
   V3_NETWORK_NAME,
   V3_SUBNET_CIDR,
   V3_GATEWAY_IP,
@@ -39,6 +42,9 @@ export {
   V3_CONFIG_TMPFS_PATH,
   V3_VOLUME_MOUNT,
   V3_PROJECTS_MOUNT,
+  V3_CODEX_HOME_MOUNT,
+  V3_USER_LOCAL_MOUNT,
+  V3_USER_CONFIG_MOUNT,
   // V3 Phase 3I — instance cap + image preheat
   DEFAULT_MAX_RUNNING_CONTAINERS,
   preheatV3Image,
@@ -50,7 +56,7 @@ export {
   type ProvisionedV3Container,
   type V3ContainerStatus,
   type V3ImagePreheatResult,
-  type V3VolumePair,
+  type V3VolumeBundle,
 } from "./v3supervisor.js";
 
 // V3 Phase 3D — bridge(/ws/user-chat-bridge)resolveContainerEndpoint 实现

@@ -134,6 +134,55 @@ try {
   );
 }
 
+// ── D2 持久化(2026-05-09): bootstrap 用户级 npm / pip 配置 ──
+// 目标:让用户在容器内的 npm install -g / pip install --user / pipx 行为
+// 跨容器重启保留(配 supervisor 5-volume 全套持久化)。
+//
+// 设计要点:
+//   - 文件落 ~/.config/npm/npmrc + ~/.config/pip/pip.conf,~/.config 已是
+//     持久化 volume → 跨容器保留。Dockerfile 已设 NPM_CONFIG_USERCONFIG 指
+//     这个文件,所以 npm 会直接读它而不是 ~/.npmrc(/home/agent/.npmrc 在
+//     overlay 不持久化)。
+//   - "if !existsSync" 幂等模式:首次启动 bootstrap 默认值,用户后续手动改
+//     prefix / registry / authToken / 任何 pip 配置都不被覆盖。
+//   - npm prefix 默认 = /home/agent/.local → npm install -g foo 落到 ~/.local
+//     (持久化)。配 Dockerfile PATH=~/.local/bin:... 后立即可用。
+//   - pip 不强制 user=true(那会破坏 venv 内 pip install);只放
+//     break-system-packages=true,绕开 Debian PEP-668 拦截。用户用
+//     `pip install --user foo` 仍落 ~/.local 持久化。
+//   - 失败 non-fatal:bootstrap 出错不该挂掉容器(用户自己装 pip/npm 仍能
+//     自己解决,只是首次少了便利)。
+const npmConfDir = "/home/agent/.config/npm";
+const npmConfPath = join(npmConfDir, "npmrc");
+try {
+  mkdirSync(npmConfDir, { recursive: true });
+  if (!existsSync(npmConfPath)) {
+    // 0600 — npm 7+ 的 _authToken / userconfig 可能落进这个文件,缺省紧权限防护。
+    writeFileSync(npmConfPath, "prefix=/home/agent/.local\n", { mode: 0o600 });
+  }
+} catch (e) {
+  console.error(
+    `[entrypoint] WARN: bootstrap ~/.config/npm/npmrc failed (non-fatal): ${(e as Error).message}`,
+  );
+}
+const pipConfDir = "/home/agent/.config/pip";
+const pipConfPath = join(pipConfDir, "pip.conf");
+try {
+  mkdirSync(pipConfDir, { recursive: true });
+  if (!existsSync(pipConfPath)) {
+    // 0600 — pip.conf 也可能放 index-url 含 token 的私有镜像配置,缺省紧权限。
+    writeFileSync(
+      pipConfPath,
+      "[install]\nbreak-system-packages = true\n",
+      { mode: 0o600 },
+    );
+  }
+} catch (e) {
+  console.error(
+    `[entrypoint] WARN: bootstrap ~/.config/pip/pip.conf failed (non-fatal): ${(e as Error).message}`,
+  );
+}
+
 // ── codex system skills seed(image_gen 等内建 tool 必需)──
 // codex 0.125 把 image_gen 等内建工具实现成 `~/.codex/skills/.system/imagegen/`
 // system skill。codex CLI 启动时会 populate 这个目录,但实测耗时 1-2s,

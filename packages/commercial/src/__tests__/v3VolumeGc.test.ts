@@ -202,6 +202,21 @@ function daysAgo(n: number): Date {
   return new Date(Date.now() - n * 86_400_000);
 }
 
+/**
+ * 给定 uid,返回 removeV3Volume 内部按顺序删 5 个 volume 的预期名字数组。
+ * 顺序与 v3supervisor.removeV3Volume 实现严格一致(D2 持久化方案):
+ *   data → proj → codex → userlocal → userconfig
+ */
+function expectedVolumes(uid: number): string[] {
+  return [
+    `oc-v3-data-u${uid}`,
+    `oc-v3-proj-u${uid}`,
+    `oc-v3-codex-u${uid}`,
+    `oc-v3-userlocal-u${uid}`,
+    `oc-v3-userconfig-u${uid}`,
+  ];
+}
+
 // ───────────────────────────────────────────────────────────────────────
 //  runVolumeGcTick
 // ───────────────────────────────────────────────────────────────────────
@@ -236,8 +251,8 @@ describe("runVolumeGcTick", () => {
     assert.equal(r.scanned, 1);
     assert.equal(r.removed, 1);
     assert.equal(r.errors.length, 0);
-    // removeV3Volume 一跳删掉 data + projects 两个 volume
-    assert.deepEqual(captured.removed, ["oc-v3-data-u100", "oc-v3-proj-u100"]);
+    // removeV3Volume 一跳删掉 5 个 volume(D2)
+    assert.deepEqual(captured.removed, expectedVolumes(100));
     assert.deepEqual(pool.hasActiveCalls, [100]);
   });
 
@@ -256,7 +271,7 @@ describe("runVolumeGcTick", () => {
     });
     assert.equal(r.scanned, 1);
     assert.equal(r.removed, 1);
-    assert.deepEqual(captured.removed, ["oc-v3-data-u200", "oc-v3-proj-u200"]);
+    assert.deepEqual(captured.removed, expectedVolumes(200));
   });
 
   test("banned 用户但有 active 容器行 → skip,不删 volume", async () => {
@@ -291,7 +306,7 @@ describe("runVolumeGcTick", () => {
     });
     assert.equal(r.scanned, 1);
     assert.equal(r.removed, 1);
-    assert.deepEqual(captured.removed, ["oc-v3-data-u350", "oc-v3-proj-u350"]);
+    assert.deepEqual(captured.removed, expectedVolumes(350));
   });
 
   test("banned 5d(< 7d)→ 不命中", async () => {
@@ -357,17 +372,17 @@ describe("runVolumeGcTick", () => {
     assert.equal(r.errors[0]!.uid, 700);
     assert.equal(r.errors[0]!.reason, "banned");
     assert.match(r.errors[0]!.error, /remove failed/);
-    // u700 的 data 抛后 removeV3Volume 整体抛,projects 不会被 touch;
-    // u701 正常删 data + projects
-    assert.deepEqual(captured.removed, ["oc-v3-data-u701", "oc-v3-proj-u701"]);
+    // u700 的 data 抛后 removeV3Volume 整体抛,后续 4 个 volume(proj/codex/
+    // userLocal/userConfig)不会被 touch;u701 正常删 5 个 volume
+    assert.deepEqual(captured.removed, expectedVolumes(701));
   });
 
   test("missing volume(404)→ 不算错误,removed 计数加 1", async () => {
     const pool = new FakePool();
     pool.seedUser({ id: 800, status: "banned", updated_at: daysAgo(10), created_at: daysAgo(60) });
     const { docker, captured } = makeDocker({
-      // data + projects 两个 volume 都 404(模拟已被手工清掉的场景)
-      missing: new Set(["oc-v3-data-u800", "oc-v3-proj-u800"]),
+      // 5 个 volume 全 404(模拟已被手工清掉的场景)
+      missing: new Set(expectedVolumes(800)),
     });
     const r = await runVolumeGcTick({
       docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
@@ -376,7 +391,7 @@ describe("runVolumeGcTick", () => {
     assert.equal(r.scanned, 1);
     assert.equal(r.removed, 1);
     assert.equal(r.errors.length, 0);
-    assert.equal(captured.removed.length, 0); // 两个都走 missing branch,captured 空
+    assert.equal(captured.removed.length, 0); // 全部走 missing branch,captured 空
   });
 
   test("banned + no-login 同时命中同 uid → 去重,只 GC 一次(banned 优先)", async () => {
@@ -394,12 +409,7 @@ describe("runVolumeGcTick", () => {
     assert.equal(r.removed, 2);
     assert.deepEqual(
       captured.removed.sort(),
-      [
-        "oc-v3-data-u900",
-        "oc-v3-proj-u900",
-        "oc-v3-data-u901",
-        "oc-v3-proj-u901",
-      ].sort(),
+      [...expectedVolumes(900), ...expectedVolumes(901)].sort(),
     );
   });
 
@@ -417,12 +427,7 @@ describe("runVolumeGcTick", () => {
     assert.equal(r.removed, 2);
     assert.deepEqual(
       captured.removed.sort(),
-      [
-        "oc-v3-data-u1000",
-        "oc-v3-proj-u1000",
-        "oc-v3-data-u1001",
-        "oc-v3-proj-u1001",
-      ].sort(),
+      [...expectedVolumes(1000), ...expectedVolumes(1001)].sort(),
     );
   });
 
@@ -439,11 +444,13 @@ describe("runVolumeGcTick", () => {
     // halfLimit = max(1, 2/2) = 1 → banned 取最老 1 个;noLoginLimit = max(1, 2-1) = 1 → no-login 取 1 个
     assert.equal(r.scanned, 2);
     assert.equal(r.removed, 2);
-    // banned 取 updated_at ASC 最老的 1101(30d)— data + projects 双删
-    assert.ok(captured.removed.includes("oc-v3-data-u1101"));
-    assert.ok(captured.removed.includes("oc-v3-proj-u1101"));
-    assert.ok(captured.removed.includes("oc-v3-data-u1102"));
-    assert.ok(captured.removed.includes("oc-v3-proj-u1102"));
+    // banned 取 updated_at ASC 最老的 1101(30d)— 5 volume 全删
+    for (const name of expectedVolumes(1101)) {
+      assert.ok(captured.removed.includes(name), `missing ${name}`);
+    }
+    for (const name of expectedVolumes(1102)) {
+      assert.ok(captured.removed.includes(name), `missing ${name}`);
+    }
   });
 });
 
@@ -477,7 +484,7 @@ describe("startVolumeGcScheduler", () => {
       const r = await sched.runOnce();
       assert.equal(r.scanned, 1);
       assert.equal(r.removed, 1);
-      assert.deepEqual(captured.removed, ["oc-v3-data-u1200", "oc-v3-proj-u1200"]);
+      assert.deepEqual(captured.removed, expectedVolumes(1200));
     } finally {
       await sched.stop();
     }
@@ -515,6 +522,6 @@ describe("startVolumeGcScheduler", () => {
     });
     await ticked;
     assert.deepEqual(observed, { scanned: 1, removed: 1 });
-    assert.deepEqual(captured.removed, ["oc-v3-data-u1300", "oc-v3-proj-u1300"]);
+    assert.deepEqual(captured.removed, expectedVolumes(1300));
   });
 });

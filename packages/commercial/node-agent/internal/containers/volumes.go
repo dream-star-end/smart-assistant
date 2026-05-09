@@ -18,10 +18,18 @@ import (
 	"sync"
 )
 
-// reVolumeName 必须和 master TS 侧 v3VolumeNameFor / v3ProjectsVolumeNameFor
+// reVolumeName 必须和 master TS 侧 v3VolumeNameFor / v3ProjectsVolumeNameFor /
+// v3CodexVolumeNameFor / v3UserLocalVolumeNameFor / v3UserConfigVolumeNameFor
 // 保持一致(packages/commercial/src/agent-sandbox/v3supervisor.ts)。
 // uid 在 TS 侧是正整数,不会有前导 0,这里也收紧到 [1-9][0-9]{0,15}。
-var reVolumeName = regexp.MustCompile(`^oc-v3-(data|proj)-u[1-9][0-9]{0,15}$`)
+//
+// 5 个前缀对应的容器内挂载点(D2 持久化方案,2026-05-09):
+//   - data       → /home/agent/.openclaude (个人版状态目录)
+//   - proj       → /run/oc/claude-config/projects (CCB session JSONL)
+//   - codex      → /home/agent/.codex (codex CLI 状态 + MCP 配置 + user skills)
+//   - userlocal  → /home/agent/.local (pip --user / npm prefix 用户级)
+//   - userconfig → /home/agent/.config (XDG configs)
+var reVolumeName = regexp.MustCompile(`^oc-v3-(data|proj|codex|userlocal|userconfig)-u[1-9][0-9]{0,15}$`)
 
 // per-volume 互斥(防止同名 create/rm 竞争)
 var perVolumeMu sync.Map

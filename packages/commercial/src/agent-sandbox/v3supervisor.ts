@@ -148,6 +148,43 @@ export const V3_PROJECTS_MOUNT = "/run/oc/claude-config/projects";
 /** 容器内单个 named volume 的挂载点(对应个人版 ~/.openclaude) */
 export const V3_VOLUME_MOUNT = "/home/agent/.openclaude";
 
+/**
+ * 容器内 codex CLI HOME 持久化挂载点(D2 方案,2026-05-09)。
+ *
+ * 解决问题:用户 `codex mcp add` / 安装 plugin / 自定义 skill 全部写在 ~/.codex
+ * 下的 config.toml + skills/。早期 ~/.codex 在 image overlay → 容器重启全丢。
+ * Boss 要求"在正常环境使用一模一样,不阉割"。
+ *
+ * 共生关系:
+ *   - V3_CODEX_AUTH_RO_MOUNT (`/run/oc/codex-auth`) 是独立 RO 目录,放 host 写
+ *     的 auth.json。entrypoint.ts 在 ~/.codex/auth.json 建 symlink → /run/oc/codex-auth/auth.json
+ *     新挂的 codex volume 与该 RO bind 不重叠。
+ *   - codex system skills(image_gen 等)由 entrypoint.ts cpSync 从
+ *     /opt/codex-system-skills 种子到 ~/.codex/skills/.system/。volume 首次挂载
+ *     是空目录 → seed 一次 → marker 落 volume → 后续 restart skip。用户后加的
+ *     ~/.codex/skills/<name>/ 不被 seed 覆盖。
+ */
+export const V3_CODEX_HOME_MOUNT = "/home/agent/.codex";
+
+/**
+ * 容器内 ~/.local 持久化挂载点(pip --user / npm prefix / pipx / uv tool)。
+ *
+ * 配套 Dockerfile 的 ENV PATH=/home/agent/.local/bin:... 与 ENV
+ * NPM_CONFIG_USERCONFIG=/home/agent/.config/npm/npmrc(npmrc 内 prefix 指
+ * /home/agent/.local),让用户级 npm install -g 落到这里持久化。
+ */
+export const V3_USER_LOCAL_MOUNT = "/home/agent/.local";
+
+/**
+ * 容器内 ~/.config 持久化挂载点(XDG configs)。
+ *
+ * 包括:gh / git scoped / npm userconfig (NPM_CONFIG_USERCONFIG 指向)/ pip /
+ * vscode-server / 用户自定义 dotfile 等。entrypoint.ts 在此目录 bootstrap
+ * `npm/npmrc`(prefix=/home/agent/.local)+ `pip/pip.conf`(break-system-packages=true)
+ * 两个文件,idempotent — 用户后续手动改不被覆盖。
+ */
+export const V3_USER_CONFIG_MOUNT = "/home/agent/.config";
+
 /** 容器内 entrypoint 跑的非 root 用户(uid:gid),与 Dockerfile USER 一致 */
 const V3_AGENT_USER = "1000:1000";
 
@@ -746,7 +783,7 @@ export function v3VolumeNameFor(uid: number): string {
  * uid → CCB projects(session JSONL)持久化 volume 名。`oc-v3-proj-u<uid>`。
  *
  * 独立于主 volume,专用于 `/run/oc/claude-config/projects` 挂载点。
- * 主 volume 死了这个也要一起死(GC / reconcile 成对操作),两者生命周期绑定。
+ * 主 volume 死了这个也要一起死(GC / reconcile 成对操作),全 5 volume 生命周期绑定。
  */
 export function v3ProjectsVolumeNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
@@ -755,12 +792,60 @@ export function v3ProjectsVolumeNameFor(uid: number): string {
   return `oc-v3-proj-u${uid}`;
 }
 
-/** 双 volume 名的打包返回值 */
-export interface V3VolumePair {
+/**
+ * uid → codex HOME 持久化 volume 名。`oc-v3-codex-u<uid>`(D2)。
+ * 挂 /home/agent/.codex,持久化用户 MCP 配置 / plugins / 自定义 skills。
+ */
+export function v3CodexVolumeNameFor(uid: number): string {
+  if (!Number.isInteger(uid) || uid <= 0) {
+    throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
+  }
+  return `oc-v3-codex-u${uid}`;
+}
+
+/**
+ * uid → ~/.local 持久化 volume 名。`oc-v3-userlocal-u<uid>`(D2)。
+ * 挂 /home/agent/.local,持久化 pip --user / npm prefix / pipx / uv tool 安装。
+ */
+export function v3UserLocalVolumeNameFor(uid: number): string {
+  if (!Number.isInteger(uid) || uid <= 0) {
+    throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
+  }
+  return `oc-v3-userlocal-u${uid}`;
+}
+
+/**
+ * uid → ~/.config 持久化 volume 名。`oc-v3-userconfig-u<uid>`(D2)。
+ * 挂 /home/agent/.config,持久化 XDG configs(gh / git / npm userconfig / pip 等)。
+ */
+export function v3UserConfigVolumeNameFor(uid: number): string {
+  if (!Number.isInteger(uid) || uid <= 0) {
+    throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
+  }
+  return `oc-v3-userconfig-u${uid}`;
+}
+
+/**
+ * 5 volume 名的打包返回值(D2 持久化方案)。
+ *
+ * 历史:v1.0.0 ~ 1.0.27 只有 data 一个 volume → v1.0.28 加 projects 成 V3VolumePair
+ * → v1.0.105 (D2) 加 codex / userLocal / userConfig 凑齐用户级持久化全套
+ * (Boss 要求"在容器里像普通 Linux 一样装 MCP / 插件 / pip / npm 不丢")。
+ *
+ * 5 个 volume 生命周期严格绑定:ensureV3Volumes 一起建,removeV3Volume 一起删。
+ * 任一 volume 创建失败直接抛,不尝试部分接管。
+ */
+export interface V3VolumeBundle {
   /** 主数据 volume(挂 /home/agent/.openclaude) */
   data: string;
   /** CCB projects volume(挂 /run/oc/claude-config/projects) */
   projects: string;
+  /** codex CLI HOME volume(挂 /home/agent/.codex)— D2 */
+  codex: string;
+  /** ~/.local volume(挂 /home/agent/.local)— D2 */
+  userLocal: string;
+  /** ~/.config volume(挂 /home/agent/.config)— D2 */
+  userConfig: string;
 }
 
 /** 在 172.30.0.0/16 内挑一个 IP(默认实现) */
@@ -1022,7 +1107,7 @@ async function ensureSingleV3Volume(
   docker: Docker,
   uid: number,
   name: string,
-  purpose: "data" | "projects",
+  purpose: "data" | "projects" | "codex" | "userLocal" | "userConfig",
 ): Promise<void> {
   await docker.createVolume({
     Name: name,
@@ -1063,29 +1148,60 @@ async function ensureSingleV3Volume(
 }
 
 /**
- * 幂等创建用户两个 volume:
- *   - 主 volume(`oc-v3-data-u<uid>`)→ /home/agent/.openclaude
- *   - projects volume(`oc-v3-proj-u<uid>`)→ /run/oc/claude-config/projects
+ * 幂等创建用户全部 5 个 volume(D2 持久化方案):
+ *   - 主 volume       (`oc-v3-data-u<uid>`)       → /home/agent/.openclaude
+ *   - projects volume (`oc-v3-proj-u<uid>`)       → /run/oc/claude-config/projects
+ *   - codex volume    (`oc-v3-codex-u<uid>`)      → /home/agent/.codex
+ *   - userLocal volume(`oc-v3-userlocal-u<uid>`)  → /home/agent/.local
+ *   - userConfig volume(`oc-v3-userconfig-u<uid>`)→ /home/agent/.config
  *
- * 两个 volume 的生命周期绑定:ensureV3Volumes 一起建,removeV3Volumes 一起删。
+ * 5 个 volume 的生命周期绑定:ensureV3Volumes 一起建,removeV3Volume 一起删。
  * 任一 volume 被 label 守护拒绝 → 直接抛,不尝试部分接管(语义更清晰)。
+ *
+ * **purpose 标签** 串复用 ensureSingleV3Volume 的诊断用 enum;新增 codex /
+ * userLocal / userConfig 三类只为出错时人能看懂哪个挂载点 fail,不落 label,
+ * 与既有 data / projects 一致(靠名字前缀就能唯一区分)。
  */
-async function ensureV3Volumes(docker: Docker, uid: number): Promise<V3VolumePair> {
+async function ensureV3Volumes(docker: Docker, uid: number): Promise<V3VolumeBundle> {
   const data = v3VolumeNameFor(uid);
   const projects = v3ProjectsVolumeNameFor(uid);
+  const codex = v3CodexVolumeNameFor(uid);
+  const userLocal = v3UserLocalVolumeNameFor(uid);
+  const userConfig = v3UserConfigVolumeNameFor(uid);
   await ensureSingleV3Volume(docker, uid, data, "data");
   await ensureSingleV3Volume(docker, uid, projects, "projects");
-  return { data, projects };
+  await ensureSingleV3Volume(docker, uid, codex, "codex");
+  await ensureSingleV3Volume(docker, uid, userLocal, "userLocal");
+  await ensureSingleV3Volume(docker, uid, userConfig, "userConfig");
+  return { data, projects, codex, userLocal, userConfig };
 }
 
 /**
  * 删 user volume(stop+remove 容器后才能删,否则 docker 409)。missing → noop。
  *
- * 两个 volume 都删。任一抛错都直接抛;部分失败场景由 volumeGc / orphan
+ * 5 个 volume 全删。任一抛错都直接抛;部分失败场景由 volumeGc / orphan
  * reconcile 下一跳自愈(GC 会重新 SELECT 尚未删的候选)。
+ *
+ * KNOWN LIMITATION(D2 之前就存在,2026-05-09 D2 接入审计明确标注):
+ *   本函数只删本机 docker volume。如果用户最近 active 容器跑在远端 host,
+ *   远端那台 host 上的 5 个 oc-v3-* volume 不会被这次调用清理,会泄漏。
+ *   v3volumeGc / orphan reconcile 调本函数时同样受这个语义限制。
+ *
+ *   修复方向(独立 P1 ticket 跟进,不在 D2 范围):
+ *     - gcSingleUidLocked 内查询用户最近/权威 data host(类似 ensureRunning
+ *       的 placement 逻辑,从 agent_containers / compute_hosts 推断);
+ *     - 远端时通过 deps.containerService.removeVolume(hostId, name) 路由,
+ *       按同样 5-name 顺序删。
+ *   D2 仅扩泄漏面(2 → 5 个 volume),未引入新的语义错误。
  */
 export async function removeV3Volume(docker: Docker, uid: number): Promise<void> {
-  const names = [v3VolumeNameFor(uid), v3ProjectsVolumeNameFor(uid)];
+  const names = [
+    v3VolumeNameFor(uid),
+    v3ProjectsVolumeNameFor(uid),
+    v3CodexVolumeNameFor(uid),
+    v3UserLocalVolumeNameFor(uid),
+    v3UserConfigVolumeNameFor(uid),
+  ];
   for (const name of names) {
     try {
       await docker.getVolume(name).remove();
@@ -1301,7 +1417,7 @@ export async function provisionV3Container(
   let row: { id: number; boundIp: string };
   let secret: string;
   let secretHash: Buffer;
-  let volumeNames: V3VolumePair;
+  let volumeNames: V3VolumeBundle;
   let createdDockerId = "";
   try {
     await client.query("BEGIN");
@@ -1332,12 +1448,26 @@ export async function provisionV3Container(
     // ensureV3Volumes 必须在持 per-uid lock 期间调,防 GC race(见函数 doc)
     try {
       if (useRemote) {
-        // 远端路径:label 守护由 node-agent 侧负责;这里只确保两个 volume 存在。
+        // 远端路径:label 守护由 node-agent 侧负责;这里只确保 5 个 volume 存在。
+        // 顺序与 ensureV3Volumes 本地路径保持一致(diagnostic 一致性,部分失败时
+        // master log 与本地路径同形态 — data → proj → codex → userLocal → userConfig)。
         const dataName = v3VolumeNameFor(uid);
         const projectsName = v3ProjectsVolumeNameFor(uid);
+        const codexName = v3CodexVolumeNameFor(uid);
+        const userLocalName = v3UserLocalVolumeNameFor(uid);
+        const userConfigName = v3UserConfigVolumeNameFor(uid);
         await deps.containerService!.ensureVolume(hostId!, dataName);
         await deps.containerService!.ensureVolume(hostId!, projectsName);
-        volumeNames = { data: dataName, projects: projectsName };
+        await deps.containerService!.ensureVolume(hostId!, codexName);
+        await deps.containerService!.ensureVolume(hostId!, userLocalName);
+        await deps.containerService!.ensureVolume(hostId!, userConfigName);
+        volumeNames = {
+          data: dataName,
+          projects: projectsName,
+          codex: codexName,
+          userLocal: userLocalName,
+          userConfig: userConfigName,
+        };
       } else {
         volumeNames = await ensureV3Volumes(deps.docker, uid);
       }
@@ -1501,6 +1631,12 @@ export async function provisionV3Container(
     const binds: string[] = [
       `${volumeNames.data}:${V3_VOLUME_MOUNT}:rw`,
       `${volumeNames.projects}:${V3_PROJECTS_MOUNT}:rw`,
+      // D2 持久化(2026-05-09):codex / ~/.local / ~/.config 全 per-user 持久化,
+      // 让 codex mcp add / pip --user / npm 用户级 install / XDG configs 跨重启保留。
+      // 详见三个 V3_*_MOUNT 常量上的 docstring。
+      `${volumeNames.codex}:${V3_CODEX_HOME_MOUNT}:rw`,
+      `${volumeNames.userLocal}:${V3_USER_LOCAL_MOUNT}:rw`,
+      `${volumeNames.userConfig}:${V3_USER_CONFIG_MOUNT}:rw`,
     ];
 
     // Codex auth ro bind-mount(plan v3 §F1/F2/D1)。仅本地 provision 路径挂 ——

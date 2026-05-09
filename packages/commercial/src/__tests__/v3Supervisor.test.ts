@@ -35,6 +35,9 @@ import {
   v3ContainerNameFor,
   v3VolumeNameFor,
   v3ProjectsVolumeNameFor,
+  v3CodexVolumeNameFor,
+  v3UserLocalVolumeNameFor,
+  v3UserConfigVolumeNameFor,
   resolveCcbBaselineMounts,
   V3_CCB_BASELINE_SKILL_NAMES,
   V3_NETWORK_NAME,
@@ -45,6 +48,9 @@ import {
   V3_CONFIG_TMPFS_PATH,
   V3_VOLUME_MOUNT,
   V3_PROJECTS_MOUNT,
+  V3_CODEX_HOME_MOUNT,
+  V3_USER_LOCAL_MOUNT,
+  V3_USER_CONFIG_MOUNT,
   SupervisorError,
 } from "../agent-sandbox/index.js";
 
@@ -368,17 +374,24 @@ function fixedIps(ips: string[]): () => string {
 //  纯名字函数
 // ───────────────────────────────────────────────────────────────────────
 
-describe("v3ContainerNameFor / v3VolumeNameFor / v3ProjectsVolumeNameFor", () => {
+describe("v3ContainerNameFor / v3VolumeNameFor / v3ProjectsVolumeNameFor / v3{Codex,UserLocal,UserConfig}VolumeNameFor", () => {
   test("happy path", () => {
     assert.equal(v3ContainerNameFor(42), "oc-v3-u42");
     assert.equal(v3VolumeNameFor(42), "oc-v3-data-u42");
     assert.equal(v3ProjectsVolumeNameFor(42), "oc-v3-proj-u42");
+    // D2 — 3 个新持久化 volume
+    assert.equal(v3CodexVolumeNameFor(42), "oc-v3-codex-u42");
+    assert.equal(v3UserLocalVolumeNameFor(42), "oc-v3-userlocal-u42");
+    assert.equal(v3UserConfigVolumeNameFor(42), "oc-v3-userconfig-u42");
   });
   test("rejects bad uid", () => {
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       assert.throws(() => v3ContainerNameFor(bad as number), SupervisorError);
       assert.throws(() => v3VolumeNameFor(bad as number), SupervisorError);
       assert.throws(() => v3ProjectsVolumeNameFor(bad as number), SupervisorError);
+      assert.throws(() => v3CodexVolumeNameFor(bad as number), SupervisorError);
+      assert.throws(() => v3UserLocalVolumeNameFor(bad as number), SupervisorError);
+      assert.throws(() => v3UserConfigVolumeNameFor(bad as number), SupervisorError);
     }
   });
 });
@@ -419,16 +432,20 @@ describe("provisionV3Container", () => {
     assert.equal(result.token, `oc-v3.${result.containerId}.${SECRET}`);
     assert.ok(result.dockerContainerId.length > 0);
 
-    // volume 落 label(data + projects 两个,顺序按 ensureV3Volumes 内部)
-    assert.equal(captured.volumesCreated.length, 2);
-    const dataVol = captured.volumesCreated.find((v) => v.Name === "oc-v3-data-u777");
-    const projVol = captured.volumesCreated.find((v) => v.Name === "oc-v3-proj-u777");
-    assert.ok(dataVol, "oc-v3-data-u777 must be created");
-    assert.ok(projVol, "oc-v3-proj-u777 must be created");
-    assert.equal(dataVol!.Labels?.["com.openclaude.v3.managed"], "1");
-    assert.equal(dataVol!.Labels?.["com.openclaude.v3.uid"], "777");
-    assert.equal(projVol!.Labels?.["com.openclaude.v3.managed"], "1");
-    assert.equal(projVol!.Labels?.["com.openclaude.v3.uid"], "777");
+    // volume 落 label(D2 全套 5 个:data + projects + codex + userlocal + userconfig)
+    assert.equal(captured.volumesCreated.length, 5);
+    for (const expectedName of [
+      "oc-v3-data-u777",
+      "oc-v3-proj-u777",
+      "oc-v3-codex-u777",
+      "oc-v3-userlocal-u777",
+      "oc-v3-userconfig-u777",
+    ]) {
+      const v = captured.volumesCreated.find((x) => x.Name === expectedName);
+      assert.ok(v, `${expectedName} must be created`);
+      assert.equal(v!.Labels?.["com.openclaude.v3.managed"], "1");
+      assert.equal(v!.Labels?.["com.openclaude.v3.uid"], "777");
+    }
 
     // container 参数
     assert.equal(captured.containersCreated.length, 1);
@@ -488,10 +505,18 @@ describe("provisionV3Container", () => {
     assert.match(tmp, /nodev/);
     assert.match(tmp, /mode=0700/);
 
-    // 双 volume: data → /home/agent/.openclaude; projects → /run/oc/claude-config/projects
+    // 5 volume binds(D2 持久化方案):
+    //   data       → /home/agent/.openclaude
+    //   projects   → /run/oc/claude-config/projects
+    //   codex      → /home/agent/.codex
+    //   userlocal  → /home/agent/.local
+    //   userconfig → /home/agent/.config
     assert.deepEqual(opts.HostConfig?.Binds, [
       `oc-v3-data-u777:${V3_VOLUME_MOUNT}:rw`,
       `oc-v3-proj-u777:${V3_PROJECTS_MOUNT}:rw`,
+      `oc-v3-codex-u777:${V3_CODEX_HOME_MOUNT}:rw`,
+      `oc-v3-userlocal-u777:${V3_USER_LOCAL_MOUNT}:rw`,
+      `oc-v3-userconfig-u777:${V3_USER_CONFIG_MOUNT}:rw`,
     ]);
 
     // restart no
@@ -2179,7 +2204,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
     assert.equal(captured.containersCreated.length, 0);
   });
 
-  test("baseline 缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn 并继续(2 条 Binds)", async () => {
+  test("baseline 缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn 并继续(5 条 volume Binds)", async () => {
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
     const { docker, captured } = makeDocker();
     await provisionV3Container(
@@ -2194,14 +2219,17 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
       124,
     );
     const opts = captured.containersCreated[0]!;
-    // 只有 data + projects 两条 volume bind(没追加 baseline ro)
+    // D2 全套 5 条 volume bind(没追加 baseline ro)
     assert.deepEqual(opts.HostConfig?.Binds, [
       `oc-v3-data-u124:${V3_VOLUME_MOUNT}:rw`,
       `oc-v3-proj-u124:${V3_PROJECTS_MOUNT}:rw`,
+      `oc-v3-codex-u124:${V3_CODEX_HOME_MOUNT}:rw`,
+      `oc-v3-userlocal-u124:${V3_USER_LOCAL_MOUNT}:rw`,
+      `oc-v3-userconfig-u124:${V3_USER_CONFIG_MOUNT}:rw`,
     ]);
   });
 
-  test("(root only) baseline 齐全 → 4 条 Binds(2 volume + CLAUDE.md + skills 父目录)", async () => {
+  test("(root only) baseline 齐全 → 7 条 Binds(5 volume + CLAUDE.md + skills 父目录)", async () => {
     const b = makeFakeBaseline();
     if (!b) return; // 非 root 跳过
     try {
@@ -2221,6 +2249,9 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
       assert.deepEqual(opts.HostConfig?.Binds, [
         `oc-v3-data-u125:${V3_VOLUME_MOUNT}:rw`,
         `oc-v3-proj-u125:${V3_PROJECTS_MOUNT}:rw`,
+        `oc-v3-codex-u125:${V3_CODEX_HOME_MOUNT}:rw`,
+        `oc-v3-userlocal-u125:${V3_USER_LOCAL_MOUNT}:rw`,
+        `oc-v3-userconfig-u125:${V3_USER_CONFIG_MOUNT}:rw`,
         `${pathJoin(b.dir, "CLAUDE.md")}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
         // 挂 skills/ 整目录;父目录 ro 一次性覆盖所有基线 skill,
         // 新增基线 skill 不改这里,只加一条 V3_CCB_BASELINE_SKILL_NAMES 即可。

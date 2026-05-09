@@ -38,12 +38,15 @@ func TestValidateImageTag(t *testing.T) {
 }
 
 func TestValidateVolumeName(t *testing.T) {
-	// 必须跟 master TS 侧 v3VolumeNameFor / v3ProjectsVolumeNameFor 对齐:
-	// `oc-v3-data-u<uid>` / `oc-v3-proj-u<uid>`,uid 正整数无前导 0。
+	// 必须跟 master TS 侧 5 个 v3*VolumeNameFor 对齐(D2 持久化方案):
+	// `oc-v3-{data|proj|codex|userlocal|userconfig}-u<uid>`,uid 正整数无前导 0。
 	ok := []string{
 		"oc-v3-data-u1",
 		"oc-v3-data-u22",
 		"oc-v3-proj-u22",
+		"oc-v3-codex-u22",
+		"oc-v3-userlocal-u22",
+		"oc-v3-userconfig-u22",
 		"oc-v3-data-u9999999999999999",
 	}
 	for _, name := range ok {
@@ -59,7 +62,8 @@ func TestValidateVolumeName(t *testing.T) {
 		"oc-v3-data-u01",                // leading zero
 		"oc-v3-data-",                   // no uid
 		"oc-v3-data-uabc",               // non-digit
-		"oc-v3-cache-u1",                // unknown category
+		"oc-v3-cache-u1",                // unknown category(.cache 故意不持久化,见 D2 设计)
+		"oc-v3-USERLOCAL-u1",            // 大写
 		"oc-v3-data-u1 ; rm -rf /",      // shell injection attempt
 		"oc-v3-data-u12345678901234567", // >16 digits
 		"OC-V3-DATA-U1",                 // uppercase
@@ -109,10 +113,17 @@ func TestValidateContainerName(t *testing.T) {
 }
 
 func TestIsNamedVolumeSource(t *testing.T) {
-	yes := []string{"oc-v3-data-u22", "oc-v3-proj-u1"}
+	yes := []string{
+		"oc-v3-data-u22",
+		"oc-v3-proj-u1",
+		"oc-v3-codex-u22",
+		"oc-v3-userlocal-u22",
+		"oc-v3-userconfig-u22",
+	}
 	no := []string{
 		"/var/lib/openclaude/baseline/skills", // abs path
 		"oc-v3-data-u0",                       // regex rejects zero uid
+		"oc-v3-cache-u1",                      // .cache 故意不持久化
 		"",
 		"../foo",        // relative
 		"foo-v3-data-u1",// wrong prefix

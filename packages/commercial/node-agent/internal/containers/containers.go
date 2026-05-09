@@ -59,7 +59,8 @@ var (
 	reImage     = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/@-]{0,255}$`)
 	reLabelKey  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 	reEnvKey    = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,63}$`)
-	reVolumeSrc = regexp.MustCompile(`^oc-v3-(data|proj)-u[1-9][0-9]{0,15}$`)
+	// 与 volumes.go reVolumeName 严格同步;5 个前缀对应 D2 全套持久化 volume。
+	reVolumeSrc = regexp.MustCompile(`^oc-v3-(data|proj|codex|userlocal|userconfig)-u[1-9][0-9]{0,15}$`)
 )
 
 // ValidateCid 接受 master 传来的 name (oc-v3-*) 或 docker 内部 id (hex)。

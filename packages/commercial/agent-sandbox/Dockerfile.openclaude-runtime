@@ -39,7 +39,16 @@ ENV TZ=Asia/Shanghai \
     DEBIAN_FRONTEND=noninteractive \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
     NPM_CONFIG_FUND=false \
-    NPM_CONFIG_AUDIT=false
+    NPM_CONFIG_AUDIT=false \
+    # D2 持久化(2026-05-09): npm userconfig 指到 ~/.config/npm/npmrc(已是
+    # per-user volume 持久化目录),让用户改 prefix / registry / authToken 跨容器保留。
+    # entrypoint.ts 在 ~/.config/npm/npmrc bootstrap 默认值 `prefix=/home/agent/.local`,
+    # 让 `npm install -g foo` 落到 ~/.local/lib/node_modules/foo,跟下方 PATH 配套。
+    NPM_CONFIG_USERCONFIG=/home/agent/.config/npm/npmrc \
+    # PATH 显式指定:~/.local/bin 放最前(D2 持久化的 user-level npm/pip/pipx
+    # binary 优先于系统级)。完整列出 Debian 默认路径,避免 base image 升级
+    # 漂移导致顺序错乱。
+    PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 必装工具(精挑,避免镜像膨胀):
 #   - git / curl / ca-certificates: 个人版 ccb subprocess + 网络请求基本依赖
@@ -152,13 +161,26 @@ RUN set -eux; \
     if id -u node >/dev/null 2>&1; then userdel -r node; fi; \
     groupadd -g 1000 agent; \
     useradd -u 1000 -g 1000 -m -d /home/agent -s /bin/bash agent; \
-    # /home/agent/.openclaude: supervisor 会把 oc-v3-data-u<uid> volume 挂到这里
-    # /home/agent/.codex:      CODEX_HOME(可写),entrypoint 在里面建 auth.json
-    #                          symlink 指向 /run/oc/codex-auth/auth.json(ro bind 源)
-    # 镜像里建空目录 + chown,首次挂载时 docker 会保留 ownership
-    mkdir -p /home/agent/.openclaude /home/agent/.codex; \
+    # /home/agent/.openclaude: supervisor 挂 oc-v3-data-u<uid>
+    # /home/agent/.codex:      CODEX_HOME(可写,D2 持久化 oc-v3-codex-u<uid>);
+    #                          entrypoint 在里面建 auth.json symlink 指向
+    #                          /run/oc/codex-auth/auth.json(ro bind 源)
+    # /home/agent/.local:      D2 持久化 oc-v3-userlocal-u<uid>;pip --user / npm prefix /
+    #                          pipx / uv tool 落地点,PATH 已含 ~/.local/bin
+    # /home/agent/.config:     D2 持久化 oc-v3-userconfig-u<uid>;XDG configs
+    #                          (npm userconfig / pip / gh / git scoped 等)
+    # 镜像里建空目录 + chown,docker 首次挂 named volume 时会从 image 复制目录
+    # 内容并保留 ownership(0750 agent:agent)→ 用户进容器后即拥有可写持久化目录。
+    mkdir -p /home/agent/.openclaude \
+             /home/agent/.codex \
+             /home/agent/.local \
+             /home/agent/.config; \
     chown -R agent:agent /home/agent; \
     chmod 750 /home/agent; \
+    # .codex 存 Codex OAuth/refresh token(auth.json + chatgpt-managed creds)
+    # — 仅 owner 可读,防同容器内未来其他用户 sidecar 偷读。/home/agent 0750
+    # 已在容器边界做了一层隔离,这里 0700 是子目录纵深。
+    chmod 0700 /home/agent/.codex; \
     # /run/oc/claude-config: CLAUDE_CONFIG_DIR 目标(supervisor --tmpfs 挂)。
     # 镜像里建空目录,本地 build smoke 测试时若没挂 tmpfs 退到 root fs 也能跑。
     #
