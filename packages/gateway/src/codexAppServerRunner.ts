@@ -1,8 +1,17 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+// Test-only override of the spawn used to launch `codex app-server`. See
+// codexRunner.ts `__setCodexSpawnForTests` for rationale; same pattern here.
+let _spawnFn: typeof spawn = spawn
+export function __setCodexAppServerSpawnForTests(fn: typeof spawn | null): void {
+  _spawnFn = fn ?? spawn
+}
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { paths } from '@openclaude/storage'
+import { type OpenClaudeConfig, paths } from '@openclaude/storage'
+import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from './codexLaunchOverrides.js'
 import { _sanitizeThreadId, buildCodexEnv, copyImagePathsToPublicDir } from './codexRunner.js'
 import { createLogger } from './logger.js'
 
@@ -61,6 +70,26 @@ export interface CodexAppServerRunnerOpts {
    *  → HTTPS_PROXY/HTTP_PROXY (+ lowercase) for the spawned codex app-server
    *  subprocess. See AgentDef.proxyUrl in storage/config.ts for semantics. */
   proxyUrl?: string
+  // ── Platform context injection (parity with SubprocessRunner / CodexRunner) ──
+  // When `config` is provided, the runner builds an `extra-prompt.md` from
+  // `buildPromptContext()` and an mcp-memory MCP server entry, then passes
+  // them to `codex app-server` via `-c model_instructions_file=...` and
+  // `-c mcp_servers.openclaude_memory.*=...`. Omit `config` to keep the
+  // legacy "naked codex" launch (no platform context) — used by tests.
+  /** Path to agent's persona file (CLAUDE.md / SOUL.md). Forwarded to
+   *  `buildPromptContext` to render the SOUL slot. */
+  persona?: string
+  /** Effective provider for `buildPromptContext` provider-keyed slot logic.
+   *  For codex-native agents this is usually 'codex-native'. */
+  agentProvider?: string
+  /** Initial effort level passed through to `buildPromptContext` for the
+   *  RESEARCH slot activation. */
+  effortLevel?: string
+  /** Gateway config; required for platform context injection. When omitted,
+   *  the runner skips override generation entirely (legacy behavior). */
+  config?: OpenClaudeConfig
+  /** Forwarded to mcp-memory env so delegate_task can enforce recursion caps. */
+  delegationDepth?: number
 }
 
 interface QueuedTurn {
@@ -191,6 +220,15 @@ export class CodexAppServerRunner extends EventEmitter {
    *  Drained in `runTurn` (both happy and catch paths) before emitResult. */
   private inflightItemHandlers: Set<Promise<void>> = new Set()
 
+  /** mkdtempSync'd dir holding the per-spawn `extra-prompt.md`. Created lazily
+   *  in `ensureSpawned()` whenever a fresh app-server process needs platform
+   *  context, cleaned on `shutdown()` and on proc close. Null when overrides
+   *  have never been built (no config) or were just cleaned. */
+  private sessionDir: string | null = null
+  /** Cached overrides for the lifetime of the current proc. Cleared together
+   *  with `sessionDir` so the next post-shutdown spawn lazy-rebuilds. */
+  private cachedOverrides: CodexLaunchOverrides | null = null
+
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
   public effortLevel: string | undefined = undefined
@@ -199,13 +237,23 @@ export class CodexAppServerRunner extends EventEmitter {
     return this.proc != null || this.processing
   }
 
-  updateConfig(_config: unknown): void {
-    // codex doesn't read gateway config; no-op.
+  updateConfig(config: OpenClaudeConfig): void {
+    // codex itself doesn't read gateway config, but the platform-context
+    // injection path does. Accept the new config and invalidate the cached
+    // overrides so the NEXT spawn (after a shutdown/respawn cycle) rebuilds
+    // with the new values. Same caveat as CodexRunner.updateConfig: a
+    // currently-running mcp-memory child has the old token baked in; full
+    // propagation requires the codex proc to respawn.
+    this.opts = { ...this.opts, config }
+    this.cachedOverrides = null
   }
 
-  setEffortLevel(_level: string | undefined): void {
-    // We could pass `effort` on turn/start but there's no immediate caller
-    // for that path in codex-native — keep parity with CodexRunner no-op.
+  setEffortLevel(level: string | undefined): void {
+    // codex CLI manages its own effort flag; we don't pass it to thread/start.
+    // We DO record it on the runner so a subsequent ensureLaunchOverrides()
+    // (after shutdown clears the cache) reflects the new value when
+    // buildPromptContext renders the RESEARCH slot.
+    this.effortLevel = level
   }
 
   sendPermissionResponse(_requestId: string, _response: unknown): boolean {
@@ -238,9 +286,85 @@ export class CodexAppServerRunner extends EventEmitter {
   constructor(private opts: CodexAppServerRunnerOpts) {
     super()
     this.threadId = opts.resumeSessionId ?? null
+    this.effortLevel = opts.effortLevel
     // attached is intentionally false on construction even if we have a
     // resumed threadId — the first turn must explicitly thread/resume into
     // the freshly spawned proc.
+  }
+
+  /** Lazy-build codex launch overrides for the next `app-server` spawn. The
+   *  overrides outlive a single turn (the proc is long-lived), so the cache
+   *  is only invalidated in `shutdown()` / proc close / `updateConfig()`.
+   *  Returns null when `opts.config` is missing (legacy "naked codex" path
+   *  used by tests).
+   *
+   *  Failure rollback: same shape as CodexRunner — on any error, rmSync the
+   *  partially-prepared dir before rethrowing so we never leak a tmp dir
+   *  whose path is no longer remembered. */
+  private async ensureLaunchOverrides(): Promise<CodexLaunchOverrides | null> {
+    if (!this.opts.config) return null
+    if (this.cachedOverrides && this.sessionDir) return this.cachedOverrides
+    // Cache miss with an existing sessionDir means updateConfig invalidated
+    // cachedOverrides while the dir was still bound. ensureLaunchOverrides is
+    // only called from ensureSpawned (proc===null guard), so by the time we
+    // reach this point the previous proc has exited and no live mcp-memory
+    // child references the old extra-prompt.md. Clean it before mkdtemp v2
+    // so config swaps don't accumulate orphaned tmp dirs.
+    if (this.sessionDir) {
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch (err) {
+        log.warn('codex app-server stale sessionDir cleanup failed', {
+          sessionDir: this.sessionDir,
+          err: (err as Error).message,
+        })
+      }
+      this.sessionDir = null
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'oc-codex-app-'))
+    try {
+      const overrides = await buildCodexLaunchOverrides({
+        agentId: this.opts.agentId,
+        persona: this.opts.persona,
+        provider: this.opts.agentProvider,
+        model: this.opts.model,
+        effortLevel: this.effortLevel,
+        sessionDir: dir,
+        claudeCodePath: this.opts.config.auth.claudeCodePath,
+        gatewayPort: this.opts.config.gateway.port,
+        gatewayToken: this.opts.config.gateway.accessToken,
+        delegationDepth: this.opts.delegationDepth,
+      })
+      writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
+      this.sessionDir = dir
+      this.cachedOverrides = overrides
+      return overrides
+    } catch (err) {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* swallow */
+      }
+      throw err
+    }
+  }
+
+  /** Cleanup helper shared by `shutdown()` and the proc close handler so
+   *  override teardown happens regardless of which path tears the proc down
+   *  first. Idempotent. */
+  private cleanupLaunchOverrides(): void {
+    if (this.sessionDir) {
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch (err) {
+        log.warn('codex app-server session dir cleanup failed', {
+          sessionDir: this.sessionDir,
+          err: (err as Error).message,
+        })
+      }
+      this.sessionDir = null
+    }
+    this.cachedOverrides = null
   }
 
   async start(): Promise<void> {
@@ -306,6 +430,11 @@ export class CodexAppServerRunner extends EventEmitter {
     this.attached = false
     this.proc = null
     this.stdoutBuf = ''
+    // Tear down the per-spawn launch overrides so the next post-shutdown
+    // submit() rebuilds against a fresh sessionDir. Re-using a stale
+    // overrides reference after we rmSync the dir would point codex at a
+    // deleted file on respawn.
+    this.cleanupLaunchOverrides()
     this.emit('exit', { code: 0, signal: null, crashed: false })
     this.shuttingDown = false
   }
@@ -340,11 +469,31 @@ export class CodexAppServerRunner extends EventEmitter {
     // get prepended to the new proc's first stdout chunk and corrupt the
     // initialize response.
     this.stdoutBuf = ''
-    const proc = spawn('codex', ['app-server', '--listen', 'stdio://'], {
+    // Build platform context overrides BEFORE spawn so the long-lived
+    // app-server proc has model_instructions_file + mcp-memory available
+    // from its very first turn. Failure here is non-fatal — fall back to
+    // naked launch (same graceful-degradation stance as subprocessRunner's
+    // "skip built-in MCP" branch), so the agent at least responds even if
+    // platform context can't be assembled.
+    let argvOverrides: string[] = []
+    try {
+      const overrides = await this.ensureLaunchOverrides()
+      if (overrides) argvOverrides = overrides.argvOverrides
+    } catch (err) {
+      log.warn('codex app-server launch overrides build failed; spawning without platform context', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
+    }
+    // `codex app-server` accepts `-c key=value` overrides (verified via
+    // `codex app-server --help`). They must precede `--listen` to keep
+    // clap's positional/option parser happy.
+    const args = ['app-server', ...argvOverrides, '--listen', 'stdio://']
+    const proc = _spawnFn('codex', args, {
       cwd: this.opts.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildCodexEnv({ proxyUrl: this.opts.proxyUrl }),
-    })
+    }) as ChildProcessWithoutNullStreams
     this.proc = proc
     proc.stdout.on('data', (chunk: Buffer) => {
       // Identity guard (Codex review #019dde20 BLOCKER round 2): a stale
@@ -429,6 +578,13 @@ export class CodexAppServerRunner extends EventEmitter {
       // Clear stdoutBuf so the next proc's first response isn't prepended
       // with a partial line residue from this dying proc.
       this.stdoutBuf = ''
+      // Drop the launch overrides cache too — the dir contents are tied to
+      // the dead proc, and the next ensureSpawned() will lazy-rebuild a
+      // fresh dir + instructions file. Not strictly required (shutdown
+      // already covers the explicit-stop path) but matches the symmetry
+      // "proc gone → context regenerated" so a crash-respawn can't reuse a
+      // stale path that was rmSync'd by a concurrent shutdown.
+      this.cleanupLaunchOverrides()
       this.emit('exit', {
         code: code ?? 0,
         signal,

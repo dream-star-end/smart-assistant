@@ -337,6 +337,12 @@ export class SessionManager {
       // Only resume if the persisted id was produced by a codex-native runner —
       // feeding a CCB session_id to either codex backend would make codex reject
       // the id or attach to a nonexistent thread.
+      // Platform context injection (parity with the ccb subprocessRunner
+      // branch below): forward persona / config / claudeCodePath / etc. so
+      // the codex runner can build extra-prompt.md + mount mcp-memory via
+      // `-c` overrides. Without these the codex agent would launch "naked"
+      // with no awareness of OpenClaude's slot pipeline (SOUL/USER/SKILLS/
+      // MEMORY/AGENTS/TOOLS/RESEARCH).
       if (opts.agent.runnerKind === 'app-server') {
         runner = new CodexAppServerRunner({
           sessionKey: opts.sessionKey,
@@ -345,6 +351,11 @@ export class SessionManager {
           resumeSessionId: codexResumeId,
           model: codexModel,
           proxyUrl: opts.agent.proxyUrl,
+          persona,
+          agentProvider: opts.agent.provider,
+          effortLevel: initialEffort,
+          config: this.config,
+          delegationDepth: opts.delegationDepth,
         }) as unknown as SubprocessRunner
       } else {
         runner = new CodexRunner({
@@ -354,6 +365,11 @@ export class SessionManager {
           resumeSessionId: codexResumeId,
           model: codexModel,
           proxyUrl: opts.agent.proxyUrl,
+          persona,
+          agentProvider: opts.agent.provider,
+          effortLevel: initialEffort,
+          config: this.config,
+          delegationDepth: opts.delegationDepth,
         }) as unknown as SubprocessRunner
       }
     } else {

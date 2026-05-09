@@ -52,6 +52,39 @@ describe('buildCodexCliArgs', () => {
     )
   })
 
+  it('extraConfig argv splices BEFORE positional args (threadId / stdin sentinel)', () => {
+    // Platform context injection appends `-c key=value` pairs that must
+    // precede the positional args clap parses last (threadId for resume,
+    // `-` for stdin). If a future refactor moves them after the positional,
+    // codex's resume parser would mis-attribute them.
+    const args = buildCodexCliArgs({
+      threadId: 'thr_x',
+      extraConfig: ['-c', 'model_instructions_file="/tmp/x.md"'],
+    })
+    const dashIdx = args.indexOf('-')
+    const tidIdx = args.indexOf('thr_x')
+    const cIdx = args.indexOf('-c')
+    assert.ok(cIdx >= 0 && tidIdx >= 0 && dashIdx >= 0, `expected all positions, got ${args.join(' ')}`)
+    assert.ok(cIdx < tidIdx, '-c override must precede threadId')
+    assert.ok(tidIdx < dashIdx, 'threadId must precede stdin sentinel')
+  })
+
+  it('extraConfig argv splices BEFORE the `-` stdin sentinel on fresh exec', () => {
+    const args = buildCodexCliArgs({ extraConfig: ['-c', 'k=v'] })
+    const dashIdx = args.indexOf('-')
+    const cIdx = args.indexOf('-c')
+    assert.ok(cIdx >= 0 && dashIdx >= 0)
+    assert.ok(cIdx < dashIdx, '-c override must precede stdin sentinel')
+  })
+
+  it('extraConfig empty/undefined produces same argv as omitted', () => {
+    const a = buildCodexCliArgs({})
+    const b = buildCodexCliArgs({ extraConfig: [] })
+    const c = buildCodexCliArgs({ extraConfig: undefined })
+    assert.deepEqual(a, b)
+    assert.deepEqual(a, c)
+  })
+
   it('never emits --full-auto or approval_policy override (replaced by bypass)', () => {
     for (const opts of [{}, { threadId: 't1' }, { model: 'gpt-5.5' }, { model: 'x', threadId: 'y' }]) {
       const args = buildCodexCliArgs(opts)

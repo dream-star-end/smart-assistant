@@ -853,9 +853,12 @@ describe('SubprocessRunner interface parity', () => {
     await h.cleanup()
   })
 
-  it('updateConfig / setEffortLevel / sendPermissionResponse are callable no-ops', async () => {
+  it('updateConfig / setEffortLevel / sendPermissionResponse are callable', async () => {
     const h = await makeHarness()
-    h.runner.updateConfig({})
+    // updateConfig now mutates opts + clears cachedOverrides (Phase 1 platform
+    // context plumbing); it's no longer a strict no-op but must remain callable
+    // through the SubprocessRunner-shaped interface.
+    h.runner.updateConfig({} as any)
     h.runner.setEffortLevel('high')
     assert.equal(h.runner.sendPermissionResponse('req-1', {}), false)
     await h.cleanup()
