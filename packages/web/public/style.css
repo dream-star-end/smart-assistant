@@ -6555,12 +6555,11 @@ body.body-landing {
   padding: 0 var(--space-3);
   margin-bottom: var(--space-2);
 }
-/* HIDE-GITHUB v1.0.97 — 临时藏 GitHub 仓库绑定入口(button + status banner)。
-   原因:容器侧 OLD 镜像没 _handleSessionRepoBind handler,bind 帧静默 fallthrough
-   导致 banner 卡"准备中…"。Master 已升 v1.0.95-h1,新 reprovision 用 NEW 镜像
-   有 handler。等所有 active 容器循环到 NEW + UX 验证后,删本规则即恢复。
-   完全可逆:删此 rule + bump cache 即恢复。 */
-.repo-bar { display: none !important; }
+/* v1.0.109 admin-only UI gate: HTML5 [hidden] 默认是 UA stylesheet 的 display:none,
+   会被 author rule `.repo-bar { display:flex }` 和 `@media .repo-bar` 覆盖,所以
+   显式补一条 author 级规则把 hidden 锁死。billing.js refreshBalance() 在
+   user.role==='admin' 时移除 hidden 属性触发显示。 */
+#repo-bar[hidden] { display: none !important; }
 .repo-bar-trigger { flex: 0 0 auto; }
 
 .repo-banner {

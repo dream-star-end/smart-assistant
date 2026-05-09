@@ -184,6 +184,7 @@ export async function refreshBalance() {
     state.userCreatedAt = typeof user.created_at === 'string' ? user.created_at : null
     _setAdminLinkVisible(user.role === 'admin')
     _setHostAgentEntriesVisible(user.role === 'admin')
+    _setRepoBarVisible(user.role === 'admin')
     _hostAgentAdmin = user.role === 'admin'
     return { shown: true, credits: String(credits), role: user.role || null }
   } catch (err) {
@@ -191,6 +192,7 @@ export async function refreshBalance() {
     _showPill(false)
     _setAdminLinkVisible(false)
     _setHostAgentEntriesVisible(false)
+    _setRepoBarVisible(false)
     _hostAgentAdmin = false
     if (_commercialMode === null) _commercialMode = false
     return { shown: false, credits: null, role: null }
@@ -224,6 +226,21 @@ function _setHostAgentEntriesVisible(visible) {
     if (visible) el.removeAttribute('hidden')
     else el.setAttribute('hidden', '')
   }
+}
+
+/**
+ * v1.0.109 GitHub 仓库绑定入口 admin-only:跟 _setHostAgentEntriesVisible 同档次的
+ * UX 层 gate。`.repo-bar` 在 HTML 默认 hidden + style.css 里有
+ * `#repo-bar[hidden] { display:none !important }` 兜住优先级,refreshBalance
+ * 拉到 user.role==='admin' 时才移除属性显示。这只是 UX 层 —— 服务端 GitHub bind /
+ * selection 接口本身没 admin 校验,devtools 强解仍能触发,但其他用户走自己的
+ * GitHub OAuth,无权限提升风险。boss 测试期 admin 自用模式。
+ */
+function _setRepoBarVisible(visible) {
+  const el = $('repo-bar')
+  if (!el) return
+  if (visible) el.removeAttribute('hidden')
+  else el.setAttribute('hidden', '')
 }
 
 // ── Host-scope admin 权限快照(命令面板 / 斜杠命令读取)───────────────

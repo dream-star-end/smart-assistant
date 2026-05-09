@@ -618,7 +618,11 @@
          作为 footer.composer 的视觉同伴出现在对话框上方,而不是占据整个屏幕宽度。
          aria-live=polite 仅落在 .repo-banner-status,避免 200ms 进度刷新轰炸读屏。
          Track 上 role=progressbar + aria-valuenow,百分比文字 aria-hidden。 -->
-    <div class="repo-bar">
+    <!-- v1.0.109 admin-only UI gate: 默认 hidden,billing.js refreshBalance() 成功且
+         user.role==='admin' 时移除 hidden 属性。CSS 规则 `#repo-bar[hidden]` 兜住
+         priority(否则 `.repo-bar { display:flex }` author rule 会覆盖 UA hidden)。
+         非安全边界 — devtools 强解仍能触发,但服务端是真实权限边界。 -->
+    <div id="repo-bar" class="repo-bar" hidden>
       <button
         type="button"
         id="github-trigger"
