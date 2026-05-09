@@ -213,6 +213,19 @@ async function hasActiveContainerLocked(
 }
 
 /**
+ * v1.0.106 P1:把 removeV3Volume 抛出的 `AggregateError` flatten 成单行字符串,
+ * 便于 GC 错误日志一行 grep 出 `host=...volume=...` 细节。其他 Error 走标准
+ * `.message`。
+ */
+function formatRemoveError(err: unknown): string {
+  if (err instanceof AggregateError) {
+    const subs = err.errors.map((e) => (e instanceof Error ? e.message : String(e)));
+    return `${err.message}: ${subs.join("; ")}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
  * Codex round 1 FAIL #3 修复:GC 单 uid 处理事务化。
  *
  * 流程:
@@ -258,13 +271,15 @@ async function gcSingleUidLocked(
         return { kind: "skipped" };
       }
       try {
-        await removeV3Volume(deps.docker, uid);
+        await removeV3Volume(deps, uid);
       } catch (err) {
-        // docker 失败 — PG 没动,直接 COMMIT 释放 lock,把错往上抛聚合
+        // docker / node-agent 失败 — PG 没动,直接 COMMIT 释放 lock,把错往上抛聚合。
+        // v1.0.106 起 removeV3Volume 跨 host fan-out,失败时抛 AggregateError 聚合
+        // 各 host 的子错误;flatten 进 outcome.error 便于排障定位到具体 host+volume。
         await client.query("COMMIT");
         return {
           kind: "failed",
-          error: err instanceof Error ? err.message : String(err),
+          error: formatRemoveError(err),
         };
       }
       await client.query("COMMIT");

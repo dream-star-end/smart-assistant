@@ -56,6 +56,8 @@ import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormal
 import type { Pool, PoolClient } from "pg";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
+import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js";
+import type { ComputeHostRow } from "../compute-pool/types.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
@@ -720,6 +722,15 @@ export interface V3SupervisorDeps {
    * (与本地 removeCodexContainerAuthDir 同语义)。
    */
   deleteRemoteCodexAuth?(hostUuid: string, containerId: string): Promise<void>;
+  /**
+   * v1.0.106 — 测试钩子:覆盖 `listAllHosts`(P1 远端 GC 路由用)。
+   *
+   * `removeV3Volume` 在多 host 场景下需要把 5 个 volume 在所有 ready/draining
+   * host 上 fan-out 删一遍(banned/no-login user 已无 active 容器,无法定位
+   * 权威 host;fan-out 是最可靠的兜底)。生产留空走 `queries.listAllHosts`,
+   * 测试可注入 fake 列表精确控制 host 维度。
+   */
+  listAllHosts?: () => Promise<ComputeHostRow[]>;
 }
 
 /** provision 成功后返回。3D ensureRunning 拿来注入到 userChatBridge */
@@ -1179,22 +1190,26 @@ async function ensureV3Volumes(docker: Docker, uid: number): Promise<V3VolumeBun
 /**
  * 删 user volume(stop+remove 容器后才能删,否则 docker 409)。missing → noop。
  *
- * 5 个 volume 全删。任一抛错都直接抛;部分失败场景由 volumeGc / orphan
- * reconcile 下一跳自愈(GC 会重新 SELECT 尚未删的候选)。
+ * v1.0.106 P1:多 host fan-out。banned/no-login user 已无 active container 行,
+ * 无法直接查权威 host;改成对所有 ready+draining host fan-out 调
+ * `containerService.removeVolume(hostId, name)`(self 走本地 dockerode,remote
+ * 走 node-agent HTTPS DELETE /volumes/{name},node-agent 端幂等返 204)。
  *
- * KNOWN LIMITATION(D2 之前就存在,2026-05-09 D2 接入审计明确标注):
- *   本函数只删本机 docker volume。如果用户最近 active 容器跑在远端 host,
- *   远端那台 host 上的 5 个 oc-v3-* volume 不会被这次调用清理,会泄漏。
- *   v3volumeGc / orphan reconcile 调本函数时同样受这个语义限制。
+ * 错误聚合策略:
+ *   - per-host 并行,per-name 串行(同 docker daemon 内不并发删避免锁抢)
+ *   - not-found(本地 statusCode=404 / 远端 httpStatus=404)→ silent continue
+ *   - 任一非 not-found 错误 → 收集到 errors[],继续删本 host 后续 volume
+ *     最大化清理进度,避免误标 cleanup 成功后永久泄漏
+ *   - errors.length > 0 → 抛 AggregateError,caller(gcSingleUidLocked)聚合
+ *     到 outcome.failed,下轮 GC tick 重新 SELECT 重试
  *
- *   修复方向(独立 P1 ticket 跟进,不在 D2 范围):
- *     - gcSingleUidLocked 内查询用户最近/权威 data host(类似 ensureRunning
- *       的 placement 逻辑,从 agent_containers / compute_hosts 推断);
- *     - 远端时通过 deps.containerService.removeVolume(hostId, name) 路由,
- *       按同样 5-name 顺序删。
- *   D2 仅扩泄漏面(2 → 5 个 volume),未引入新的语义错误。
+ * Fallback:`deps.containerService` 未注入(测试 / 单机 MVP 场景)→ 退化为
+ * 仅本机 dockerode 删除,保留向后兼容。
+ *
+ * 5 个 volume 全删,语义"哪个 host 上有就删哪个,没有跳过"。生命周期绑定:
+ * ensureV3Volumes 一起建,本函数一起删(host 维度独立但 name 集合恒定 5 个)。
  */
-export async function removeV3Volume(docker: Docker, uid: number): Promise<void> {
+export async function removeV3Volume(deps: V3SupervisorDeps, uid: number): Promise<void> {
   const names = [
     v3VolumeNameFor(uid),
     v3ProjectsVolumeNameFor(uid),
@@ -1202,13 +1217,46 @@ export async function removeV3Volume(docker: Docker, uid: number): Promise<void>
     v3UserLocalVolumeNameFor(uid),
     v3UserConfigVolumeNameFor(uid),
   ];
-  for (const name of names) {
-    try {
-      await docker.getVolume(name).remove();
-    } catch (err) {
-      if (isNotFound(err)) continue;
-      throw wrapDockerError(err);
+
+  // 单机 MVP / 无 facade 测试:退化为本机 dockerode 直删(保留旧行为)。
+  if (!deps.containerService) {
+    for (const name of names) {
+      try {
+        await deps.docker.getVolume(name).remove();
+      } catch (err) {
+        if (isNotFound(err)) continue;
+        throw wrapDockerError(err);
+      }
     }
+    return;
+  }
+
+  const listFn = deps.listAllHosts ?? defaultListAllHosts;
+  const hosts = await listFn();
+  // ready: 当前可承接 placement 的 host;draining: 不接新 placement 但仍可能
+  // 持泄漏 volume,必须清。bootstrapping/quarantined/broken 跳过 — 删不了也没风险。
+  const targets = hosts.filter(
+    (h) => h.status === "ready" || h.status === "draining",
+  );
+
+  const errors: Error[] = [];
+  await Promise.all(
+    targets.map(async (host) => {
+      for (const name of names) {
+        try {
+          await deps.containerService!.removeVolume(host.id, name);
+        } catch (err) {
+          if (isNotFound(err)) continue;
+          const detail = err instanceof Error ? err.message : String(err);
+          errors.push(new Error(`host=${host.id}(${host.name}) volume=${name}: ${detail}`));
+          // 继续删本 host 后续 volume:保最大清理面,避免单 volume 失败拖整 host。
+        }
+      }
+    }),
+  );
+
+  if (errors.length > 0) {
+    throw new AggregateError(errors, `removeV3Volume failed for uid=${uid}`);
   }
 }
 
