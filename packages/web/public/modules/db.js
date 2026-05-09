@@ -150,6 +150,21 @@ export function _normalizeLoadedSession(sess) {
       delete m.metaText
       delete m._rawMeta
     }
+    // Plan B 自愈 (2026-05-09):老 _media[i].base64 数据 — 历史上把 base64 直接
+    // 塞进 messages JSON,把会话撑到 8MB+ 是 prod 雪崩的根因。Plan B 后所有附件
+    // 走独立 /api/uploads 拿 url 引用,不再 base64。这里在 IDB load 时把残留的
+    // base64/dataUrl 字段抹掉,只保留 url + filename + mimeType + kind 这种纯
+    // 元数据。已上传过的老消息(有 url)还能正常渲染;未上传的老消息(只有 base64)
+    // 这次会失去附件视图,但消息文本本身还在,且后续不会再把这条消息的 8MB JSON
+    // 写回 IDB / 推回 server。
+    if (Array.isArray(m._media)) {
+      for (const md of m._media) {
+        if (md && typeof md === 'object') {
+          if ('base64' in md) delete md.base64
+          if ('dataUrl' in md) delete md.dataUrl
+        }
+      }
+    }
   }
   return sess
 }

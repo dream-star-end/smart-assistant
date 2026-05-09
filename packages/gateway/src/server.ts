@@ -3,13 +3,18 @@ import {
   constants as fsConstants,
   closeSync,
   createReadStream,
+  createWriteStream,
   existsSync,
   fstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   statSync,
+  unlink,
+  unlinkSync,
 } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
@@ -71,6 +76,11 @@ import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
+import {
+  SessionRepoWorkspaceManager,
+  type SessionRepoBindFrame,
+  type SessionRepoStatusOut,
+} from './sessionRepoWorkspace.js'
 import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
 import { syncCodexAuthFiles } from './codexAuthSync.js'
@@ -338,11 +348,41 @@ export class Gateway {
   // we emit `outbound.resume_failed` so the client escalates to REST sync.
   private _outboundRing!: OutboundRingBuffer
 
+  // ── Phase 4 GitHub workspace: per-WS recent hello peers cache + pending binds ──
+  // bind 帧到达时,sessionId 必须出现在 clientsByPeer 注册表 OR 该 ws 最近 5s 内
+  // 收到的 hello peers。否则入 pending 队列(5s timeout 后 fail)。
+  // Map keyed by ws → { peerIds: Set<sessionId>, recordedAt: ms }
+  private _recentHelloPeers = new WeakMap<
+    WebSocket,
+    { peerIds: Set<string>; recordedAt: number }
+  >()
+  private _pendingRepoBinds = new Map<
+    string /* sessionId|version */,
+    {
+      ws: WebSocket
+      frame: SessionRepoBindFrame
+      timer: ReturnType<typeof setTimeout>
+    }
+  >()
+  private static readonly REPO_BIND_HELLO_GRACE_MS = 5_000
+  private static readonly REPO_BIND_PENDING_TIMEOUT_MS = 5_000
+  private _repoWorkspace = new SessionRepoWorkspaceManager({
+    info: (msg, fields) => this.log.info(msg, fields),
+    warn: (msg, fields) => this.log.warn(msg, fields),
+    error: (msg, fields) => this.log.error(msg, undefined, fields ? new Error(JSON.stringify(fields)) : undefined),
+  })
+
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
     // Wire up auth error handler: force-refresh token when 401 detected (bypass expiry check)
     this.sessions.onAuthError = () => this.refreshClaudeOAuthIfNeeded(true)
+    // Phase 5:把 _repoWorkspace 的 getRepoSnapshot 当 provider 注入。
+    // 单进程架构下 workspace.states Map 就是权威源,SubprocessRunner.start()
+    // 通过它读 ready repo 的 workspaceDir,作为 CCB 的 --add-dir。
+    this.sessions.setRepoSnapshotProvider(
+      this._repoWorkspace.getRepoSnapshot.bind(this._repoWorkspace),
+    )
     // Optional config override for ring bounds: lets `boss` raise maxAgeMs on
     // commercial hosts where mobile users keep tabs backgrounded for >10min.
     const ringCfg = deps.config.gateway.outboundRing ?? {}
@@ -442,6 +482,33 @@ export class Gateway {
       // v3 commercial) so the symptom is "client_sessions empty" — same
       // as pre-fix; loud enough to detect via dashboards.
       this.log.error('v3 master sink wire failed (falling back to legacy path)', undefined, err as Error)
+    }
+
+    // Plan B (2026-05-09): clean up orphan `.tmp-*` files left in uploadsDir
+    // by handleUpload runs that crashed mid-stream (or were aborted by the
+    // client and the cleanup unlink raced past us). One-shot at startup —
+    // intentionally no periodic sweep; abort/error paths in handleUpload
+    // already unlink eagerly. Codex Plan B v2 review confirmed.
+    try {
+      mkdirSync(paths.uploadsDir, { recursive: true })
+      const baseReal = realpathSync(paths.uploadsDir)
+      const cutoff = Date.now() - 60 * 60 * 1000 // 1h
+      let cleaned = 0
+      for (const fname of readdirSync(baseReal)) {
+        if (!fname.startsWith('.tmp-')) continue
+        try {
+          const st = statSync(join(baseReal, fname))
+          if (st.mtimeMs < cutoff) {
+            unlinkSync(join(baseReal, fname))
+            cleaned++
+          }
+        } catch {}
+      }
+      if (cleaned > 0) this.log.info('upload .tmp orphan cleanup', { cleaned })
+    } catch (err) {
+      // Non-fatal — uploads will fail later if dir is truly broken, surfacing
+      // a clear error per request.
+      this.log.warn('upload .tmp orphan cleanup failed', undefined, err)
     }
 
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
@@ -1424,10 +1491,39 @@ export class Gateway {
         return
       }
       if (req.method === 'PUT') {
-        this.readBody(req).then(async (body) => {
-          const data = JSON.parse(body)
+        // Wire-level body cap = 2MB. Set BELOW the storage layer's
+        // MAX_SESSION_BYTES (4MB) so a single PUT can never be the sole
+        // cause of pushing a row past the storage cap; lets clients still
+        // send moderate-size sessions while preventing the 2026-05-08
+        // 8MB-PUT incident from recurring at the gateway boundary. Errors
+        // from each stage are routed to distinct status codes:
+        //   413 — body or post-merge blob too large (terminal, client must
+        //         shrink session before retry)
+        //   400 — malformed JSON
+        //   409 — stale write (existing.updated_at > _baseSyncedAt OR
+        //         concurrent racer beat us to the UPDATE)
+        ;(async () => {
+          let body: string
+          try {
+            body = await this.readBody(req, 2 * 1024 * 1024)
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            if (msg === 'body too large') {
+              this.sendJson(res, 413, { error: 'request body too large', maxBytes: 2 * 1024 * 1024 })
+            } else {
+              this.sendJson(res, 400, { error: 'invalid body' })
+            }
+            return
+          }
+          let data: { agentId?: string; title?: string; pinned?: unknown; createdAt?: number; lastAt?: number; messages?: unknown; _baseSyncedAt?: number }
+          try {
+            data = JSON.parse(body)
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
           const updatedAt = Date.now()
-          const applied = await upsertClientSession({
+          const result = await upsertClientSession({
             id: sessId,
             userId,
             agentId: data.agentId || 'main',
@@ -1435,15 +1531,23 @@ export class Gateway {
             pinned: !!data.pinned,
             createdAt: data.createdAt || Date.now(),
             lastAt: data.lastAt || Date.now(),
-            messages: data.messages || [],
+            messages: (data.messages as unknown[]) || [],
             updatedAt,
           }, data._baseSyncedAt || 0)
-          if (!applied) {
+          if (result === 'oversized') {
+            // Distinct from request-body 413 (which fires before parse).
+            // The post-merge blob would push the on-disk row past
+            // MAX_SESSION_BYTES — client should drop attachments / split
+            // the session before retrying. Returning 409 here would
+            // collide with the stale-write retry loop and recreate the
+            // event-loop stall this fix was written to eliminate.
+            this.sendJson(res, 413, { error: 'session too large', reason: 'oversized' })
+          } else if (result === 'rejected_stale') {
             this.sendJson(res, 409, { error: 'conflict' })
           } else {
             this.sendJson(res, 200, { ok: true, applied: true, updatedAt })
           }
-        }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+        })().catch(() => this.sendJson(res, 500, { error: 'put failed' }))
         return
       }
       if (req.method === 'DELETE') {
@@ -1693,6 +1797,17 @@ export class Gateway {
       return
     }
 
+    // ── Streaming upload endpoint (Plan B 2026-05-09) ──
+    // Single-file raw-binary POST. Body streams directly to disk, sha256-named.
+    // Replaces sending base64 inside the WS frame's `_media[i].base64` — that
+    // path bloated `client_sessions.messages` JSON and triggered the 2026-05-08
+    // event-loop stall incident. See feedback memo
+    // v3_attachments_independent_channel.md.
+    if (url.pathname === '/api/uploads' && req.method === 'POST') {
+      this.handleUpload(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+
     // ── Media file serving ──
     // Serve user-uploaded and MCP-generated media files for inline rendering.
     const mediaMatch = url.pathname.match(/^\/api\/media\/(.+)$/)
@@ -1712,12 +1827,21 @@ export class Gateway {
         return
       }
       // Search in uploads first, then generated. Resolve via realpath so a
-      // symlink inside uploads/ cannot escape the directory.
+      // symlink inside uploads/ cannot escape the directory. baseReal also
+      // goes through realpathSync — without that, uploadsDir being a symlink
+      // (rare but possible in some deployments) would fail the startsWith
+      // check after the candidate's realpath resolves to the symlink target.
       const dirs = [paths.uploadsDir, paths.generatedDir]
       let realPath: string | null = null
       for (const dir of dirs) {
-        const baseReal = resolve(dir)
-        const candidate = resolve(dir, filename)
+        let baseReal: string
+        try {
+          baseReal = realpathSync(dir)
+        } catch {
+          // Directory may not exist yet (e.g. fresh install with no uploads).
+          continue
+        }
+        const candidate = resolve(baseReal, filename)
         if (!candidate.startsWith(baseReal + '/') && candidate !== baseReal) continue
         try {
           const r = realpathSync(candidate)
@@ -2209,6 +2333,193 @@ export class Gateway {
     } catch {
       throw new Error('invalid json body')
     }
+  }
+
+  /**
+   * POST /api/uploads — streaming single-file upload (Plan B 2026-05-09).
+   *
+   * Body is the raw file bytes. Required headers:
+   *   - Content-Type: file MIME type (validated against UPLOAD_MIME_PREFIXES)
+   * Optional:
+   *   - Content-Length: when present, used for early reject (saves bandwidth);
+   *     when absent, streaming guard rejects mid-stream if bytes > MAX_UPLOAD_SINGLE.
+   *   - X-Filename: URL-encoded original filename (display only; doesn't affect storage).
+   *
+   * Response: 200 { url, digest, size, mimeType }
+   * Errors: 400 / 413 (too large) / 415 (mime) / 500 (write failed)
+   *
+   * Storage: streams to `<uploadsDir>/.tmp-<random>` while computing sha256;
+   * on success atomically renames to `<digest>.<ext>`. If a file with the
+   * same digest already exists, dedups (tmp removed, existing path returned).
+   */
+  private async handleUpload(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // ── 1. MIME validation ──
+    const ctype = (req.headers['content-type'] || '').toString().split(';')[0].trim().toLowerCase()
+    if (!ctype) {
+      this.sendError(res, 400, 'missing content-type')
+      req.destroy()
+      return
+    }
+    if (!isUploadMimeAllowed(ctype)) {
+      this.sendError(res, 415, `unsupported mime: ${ctype}`)
+      req.destroy()
+      return
+    }
+
+    // ── 2. Content-Length early reject (when present) ──
+    const declared = req.headers['content-length']
+    if (declared !== undefined) {
+      const n = Number(declared)
+      if (!Number.isFinite(n) || n < 0 || !/^\d+$/.test(String(declared))) {
+        this.sendError(res, 400, 'invalid content-length')
+        req.destroy()
+        return
+      }
+      if (n > MAX_UPLOAD_SINGLE) {
+        this.sendError(res, 413, `file exceeds ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB`)
+        req.destroy()
+        return
+      }
+    }
+
+    // ── 3. Resolve uploadsDir realpath after ensuring it exists ──
+    // Don't depend on startup sequence; create-then-realpath here.
+    let baseReal: string
+    try {
+      mkdirSync(paths.uploadsDir, { recursive: true })
+      baseReal = realpathSync(paths.uploadsDir)
+    } catch (err) {
+      this.log.error('handleUpload: uploadsDir setup failed', undefined, err)
+      this.sendError(res, 500, 'storage unavailable')
+      req.destroy()
+      return
+    }
+
+    // ── 4. Open .tmp + streaming write + sha256 ──
+    //
+    // Architecture (Codex B1 review fix v2):
+    //   • Single state-machine variable `settled` resolves the await Promise
+    //     exactly once. Every termination path calls `finish(ok)`.
+    //   • We DO NOT listen for `req.close` — it fires on both normal completion
+    //     and abnormal disconnect, and tends to fire BEFORE `ws.finish`. Using
+    //     it for cleanup mis-deletes successful uploads. Instead we rely on
+    //     `ws.finish` / `ws.error` / `req.error` / `req.aborted` only.
+    //   • `cleanupTmp()` is the single place that destroys ws (with an Error
+    //     to ensure ws.error fires) and unlinks the .tmp file. Idempotent via
+    //     `cleaned` flag.
+    const tmpName = `.tmp-${randomBytes(16).toString('hex')}`
+    const tmpPath = join(baseReal, tmpName)
+    const ws = createWriteStream(tmpPath)
+    const hash = createHash('sha256')
+    let received = 0
+    let cleaned = false
+    let settled = false
+    let resolveWrite: (ok: boolean) => void = () => {}
+    const writeDone = new Promise<boolean>((resolveP) => {
+      resolveWrite = resolveP
+    })
+    const finish = (ok: boolean) => {
+      if (settled) return
+      settled = true
+      resolveWrite(ok)
+    }
+
+    const cleanupTmp = (cause?: Error) => {
+      if (cleaned) return
+      cleaned = true
+      try { ws.destroy(cause ?? new Error('upload cleanup')) } catch {}
+      unlink(tmpPath, () => {})
+    }
+
+    req.on('aborted', () => {
+      cleanupTmp(new Error('client aborted'))
+      finish(false)
+    })
+    req.on('error', (err) => {
+      this.log.warn('handleUpload: req error', undefined, err)
+      cleanupTmp(err)
+      finish(false)
+    })
+    ws.on('error', (err) => {
+      // Triggered either by upstream cleanupTmp() destroying us, or by a real
+      // disk write failure. Either way, we're done.
+      this.log.warn('handleUpload: write stream error', undefined, err)
+      cleanupTmp(err)
+      if (!res.headersSent) {
+        this.sendError(res, 500, 'write failed')
+      }
+      finish(false)
+    })
+    ws.on('finish', () => {
+      // Only "happy path" terminator. Note: ws emits 'finish' AFTER the file
+      // is fully flushed, so it's safe to rename in the await-then block.
+      finish(true)
+    })
+
+    let exceededLimit = false
+    req.on('data', (chunk: Buffer) => {
+      if (exceededLimit) return
+      received += chunk.length
+      if (received > MAX_UPLOAD_SINGLE) {
+        exceededLimit = true
+        if (!res.headersSent) {
+          this.sendError(res, 413, `file exceeds ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB`)
+        }
+        // Order matters: unpipe BEFORE destroying req, so any in-flight data
+        // doesn't trigger a write on the destroyed ws (and the corresponding
+        // ws.error path which is already handled by cleanupTmp).
+        try { req.unpipe(ws) } catch {}
+        cleanupTmp(new Error('upload exceeded MAX_UPLOAD_SINGLE'))
+        try { req.destroy() } catch {}
+        finish(false)
+        return
+      }
+      hash.update(chunk)
+    })
+
+    // Pipe data into the write stream. ws.finish / ws.error / req.error /
+    // req.aborted / size-limit overflow each call finish() exactly once.
+    req.pipe(ws)
+    const writeOk = await writeDone
+
+    if (!writeOk || cleaned || exceededLimit) {
+      // Some error path already responded (413, 500, or req-aborted with no
+      // headers). If somehow none has, send a generic abort.
+      cleanupTmp()
+      if (!res.headersSent && !res.writableEnded) {
+        this.sendError(res, 400, 'upload aborted')
+      }
+      return
+    }
+
+    // ── 5. Compute final name + atomic rename ──
+    const digest = hash.digest('hex')
+    const ext = uploadExtForMime(ctype)
+    const finalName = `${digest}.${ext}`
+    const finalPath = join(baseReal, finalName)
+
+    if (existsSync(finalPath)) {
+      // Dedup: same content already on disk. Drop the tmp.
+      try { unlinkSync(tmpPath) } catch {}
+    } else {
+      try {
+        renameSync(tmpPath, finalPath)
+      } catch (err) {
+        this.log.error('handleUpload: rename failed', undefined, err)
+        // best-effort cleanup; if rename failed mid-way the tmp may or may
+        // not still exist. unlink ignores ENOENT.
+        try { unlinkSync(tmpPath) } catch {}
+        this.sendError(res, 500, 'rename failed')
+        return
+      }
+    }
+
+    this.sendJson(res, 200, {
+      url: `/api/media/${finalName}`,
+      digest,
+      size: received,
+      mimeType: ctype,
+    })
   }
 
   // GET /api/agents         → { agents, default }
@@ -3379,6 +3690,15 @@ export class Gateway {
 
     this.wsClients.add(ws)
     ws.once('close', () => this.wsClients.delete(ws))
+    // Phase 4 — ws close 时清 pending bind 队列(WeakMap recentHelloPeers 自动 GC)
+    ws.once('close', () => {
+      for (const [key, entry] of this._pendingRepoBinds) {
+        if (entry.ws === ws) {
+          clearTimeout(entry.timer)
+          this._pendingRepoBinds.delete(key)
+        }
+      }
+    })
     ws.on('message', async (raw) => {
       try {
       let frame: InboundFrame
@@ -3415,10 +3735,34 @@ export class Gateway {
         // this tab successfully processed before the disconnect. 0 = never
         // received one (first connect / localStorage wiped / legacy client).
         const peers: Array<{ peerId: string; agentId: string; inFlight?: boolean; lastFrameSeq?: number }> = hello.peers || []
+        // Phase 4 — 把这些 peerId 记下来,bind 帧用 5s grace window 校验
+        const peerIdSet = new Set<string>()
+        for (const p of peers) {
+          if (typeof p?.peerId === 'string') peerIdSet.add(p.peerId)
+        }
+        this._recentHelloPeers.set(ws, { peerIds: peerIdSet, recordedAt: Date.now() })
         // Auto-resume: check if any peer has a resumable session that is NOT already active
         this.autoResumeFromHello(peers, ws).catch((err) =>
           this.log.error('auto-resume failed', undefined, err),
         )
+        // 检查 pending bind 队列:有匹配 sessionId 的就 dequeue 处理
+        this._flushPendingRepoBinds(ws, peerIdSet)
+        return
+      }
+
+      // Phase 4 — GitHub session repo bind/unbind 控制帧
+      if ((frame as any).type === 'inbound.control.session_repo_bind') {
+        // v1.0.95 诊断 instrument:确认容器 gateway 真收到了 master forward 来的 bind 帧
+        this.log.info('repo_bind_received', {
+          sessionId: (frame as any).sessionId,
+          selectionVersion: (frame as any).selectionVersion,
+          userId: this.getWsUserId(ws),
+        })
+        await this._handleSessionRepoBind(ws, frame as any)
+        return
+      }
+      if ((frame as any).type === 'inbound.control.session_repo_unbind') {
+        await this._handleSessionRepoUnbind(ws, frame as any)
         return
       }
 
@@ -3532,6 +3876,228 @@ export class Gateway {
         } catch { /* ws may already be closed */ }
       }
     })
+  }
+
+  /**
+   * Phase 4 — 校验 sessionId 在该 ws 的注册集合或最近 hello peers(grace window)。
+   * 三种 outcome:
+   *   - 'authorized':立即处理
+   *   - 'queued':入 pending,等 hello/message 注册
+   *   - 'rejected':硬拒(sessionId 不合法)
+   */
+  private _checkRepoBindSession(ws: WebSocket, sessionId: string): 'authorized' | 'queued' {
+    const userId = this.getWsUserId(ws)
+    // grace window:hello 后 5s 内,任何 bind 帧引用其 peerIds 视作 authorized。
+    // 帮 race:bind 在 hello 之后但 message 注册之前到达。
+    const recent = this._recentHelloPeers.get(ws)
+    if (recent && Date.now() - recent.recordedAt <= Gateway.REPO_BIND_HELLO_GRACE_MS) {
+      if (recent.peerIds.has(sessionId)) return 'authorized'
+    }
+    // 直查 clientsByPeer:Codex Phase 4.7 #1 — makePeerKey 是 `userId:channel:peerId`
+    // (3 parts),不是 4 parts。直接构造预期 key 避免格式漂移 bug。
+    // sessionId 已通过 caller 的 SAFE_GIT_REF / SESSION_ID_RE 校验,sanitizePeerId
+    // 后等于自身;仍走 sanitize 与 dispatch 路径(L3459-3460)的 makePeerKey 保持一致。
+    const sanitizedSid = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_')
+    const expectedKey = Gateway.makePeerKey(userId, 'webchat', sanitizedSid)
+    const set = this.clientsByPeer.get(expectedKey)
+    if (set?.has(ws)) return 'authorized'
+    return 'queued'
+  }
+
+  /** Phase 4 — bind 帧处理 */
+  private async _handleSessionRepoBind(
+    ws: WebSocket,
+    frame: SessionRepoBindFrame,
+  ): Promise<void> {
+    // 基础 schema 校验(master bridge 已做严格校验,这里兜底)。
+    // Codex Phase 5 review P1:owner/repo/branch typeof + selectionVersion safe-int 必须显式
+    // 校验,否则 manager 里 regex.test(undefined) 会把 'undefined' 字符串通过,
+    // version 被 NaN/Infinity/小数/负数 污染会进路径和 pending key。
+    const isSafePositiveInt =
+      typeof frame.selectionVersion === 'number' &&
+      Number.isSafeInteger(frame.selectionVersion) &&
+      frame.selectionVersion > 0
+    const isNonEmptyStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0
+    if (
+      !isNonEmptyStr(frame.sessionId) ||
+      !/^[A-Za-z0-9_-]+$/.test(frame.sessionId) ||
+      !isSafePositiveInt ||
+      !isNonEmptyStr(frame.accessToken) ||
+      !isNonEmptyStr(frame.owner) ||
+      !isNonEmptyStr(frame.repo) ||
+      !isNonEmptyStr(frame.branch)
+    ) {
+      this._sendStatusFrame(ws, {
+        type: 'outbound.control.session_repo_status',
+        sessionId: String(frame?.sessionId ?? ''),
+        selectionVersion: isSafePositiveInt ? frame.selectionVersion : 0,
+        status: 'failed',
+        errorCode: 'INVALID_BIND_FRAME',
+        errorMessage: 'bind frame schema invalid',
+      })
+      return
+    }
+    const auth = this._checkRepoBindSession(ws, frame.sessionId)
+    // v1.0.95 诊断 instrument:确认 auth 走了哪条路径(authorized / queued)
+    this.log.info('repo_bind_auth_decision', {
+      sessionId: frame.sessionId,
+      selectionVersion: frame.selectionVersion,
+      auth,
+    })
+    if (auth === 'queued') {
+      // 入 pending 5s 队列
+      const key = `${frame.sessionId}|${frame.selectionVersion}`
+      // 同 key 已在 pending → 覆盖(用最新 frame)
+      const old = this._pendingRepoBinds.get(key)
+      if (old) clearTimeout(old.timer)
+      const timer = setTimeout(() => {
+        this._pendingRepoBinds.delete(key)
+        // v1.0.95 诊断 instrument:5s grace 没等到 hello 注册 → 走 fail 路径
+        this.log.warn('repo_bind_pending_timeout', {
+          sessionId: frame.sessionId,
+          selectionVersion: frame.selectionVersion,
+        })
+        this._sendStatusFrame(ws, {
+          type: 'outbound.control.session_repo_status',
+          sessionId: frame.sessionId,
+          selectionVersion: frame.selectionVersion,
+          status: 'failed',
+          errorCode: 'SESSION_NOT_REGISTERED',
+          errorMessage: 'session not registered with this WS within grace window',
+        })
+      }, Gateway.REPO_BIND_PENDING_TIMEOUT_MS)
+      this._pendingRepoBinds.set(key, { ws, frame, timer })
+      return
+    }
+    // authorized → 立即处理
+    await this._repoWorkspace.bind(frame, this._buildStatusCallback(ws, frame.sessionId))
+  }
+
+  /**
+   * Phase 5:bind status 回调统一 wrapper。两个路径共用(立即处理 / pending flush)。
+   * 顺序:先 forward 给 ws → 再读 _repoWorkspace 当前 snapshot 触发 recycle。
+   * 单进程下 status callback 是 _repoWorkspace 短锁内 commit 后才调,
+   * getRepoSnapshot 此时已是最新值,recycle 决策按最新 snapshot 走。
+   */
+  private _buildStatusCallback(
+    ws: WebSocket,
+    sessionId: string,
+  ): (frame: SessionRepoStatusOut) => void {
+    return (statusFrame) => {
+      this._sendStatusFrame(ws, statusFrame)
+      const snap = this._repoWorkspace.getRepoSnapshot(sessionId)
+      this.sessions
+        .recyclePeerForRepoChange(sessionId, snap)
+        .catch((err) =>
+          this.log.warn('recycle_for_repo_change_failed', {
+            sessionId,
+            err: err instanceof Error ? err.message : String(err),
+          }),
+        )
+    }
+  }
+
+  /**
+   * Phase 4 — unbind 帧处理(Phase 5 加版本化)。
+   *
+   * 顺序(关键):
+   *   1. _repoWorkspace.unbind(sessionId, version)  短锁内 state.delete
+   *      → 之后 getRepoSnapshot 返 null
+   *   2. recyclePeerForRepoUnbind(sessionId)        进 session.lock,shutdown runner
+   *      → 排队的 submit 拿到 lock 时读 null snapshot,addDir 回 agentBaseDir
+   *
+   * 没有 selectionVersion 的 unbind 帧:rejected(理论不该发生,前端必带版本号;
+   * 没版本的话 workspaceMgr 的 tombstone-too-old 保护就失效)。
+   */
+  private async _handleSessionRepoUnbind(
+    ws: WebSocket,
+    frame: { sessionId: string; selectionVersion?: number },
+  ): Promise<void> {
+    if (typeof frame?.sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(frame.sessionId)) return
+    if (
+      typeof frame.selectionVersion !== 'number' ||
+      !Number.isSafeInteger(frame.selectionVersion) ||
+      frame.selectionVersion <= 0
+    ) {
+      this.log.warn('repo_unbind_invalid_version', {
+        sessionId: frame.sessionId,
+        selectionVersion: frame.selectionVersion,
+      })
+      return
+    }
+    // unbind 不要求 ws 注册校验:用户主动清空,任何路径来都允许。
+    // Codex Phase 5 review P0:unbind 返 boolean,只在真删 state 时 recycle。
+    // stale tombstone(workspace 已被新 version 替换)被 manager ignore 时 caller
+    // 必须不 kill runner — 否则旧 v_x runner 被错杀,新 v_y 还在 cloning,下次
+    // spawn 读 ready snapshot 走 v_y workspaceDir 而非 v_x。
+    const deleted = await this._repoWorkspace.unbind(frame.sessionId, frame.selectionVersion)
+    if (!deleted) {
+      this.log.info('repo_unbind_skipped_no_recycle', {
+        sessionId: frame.sessionId,
+        selectionVersion: frame.selectionVersion,
+      })
+      return
+    }
+    await this.sessions.recyclePeerForRepoUnbind(frame.sessionId).catch((err) =>
+      this.log.warn('recycle_for_repo_unbind_failed', {
+        sessionId: frame.sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    )
+    // 不发 status 帧 — DELETE 已经在 master DB 写 cleared
+  }
+
+  /** Phase 4 — hello 到达后,看 pending 队列里有没有匹配的 bind 可以处理 */
+  private _flushPendingRepoBinds(ws: WebSocket, peerIds: Set<string>): void {
+    if (this._pendingRepoBinds.size === 0) return
+    for (const [key, entry] of this._pendingRepoBinds) {
+      if (entry.ws !== ws) continue
+      if (!peerIds.has(entry.frame.sessionId)) continue
+      clearTimeout(entry.timer)
+      this._pendingRepoBinds.delete(key)
+      // async 处理(不阻塞 hello 转发后续)
+      // 用同一个 _buildStatusCallback wrapper:既 forward 给 ws,也触发 recycle。
+      this._repoWorkspace
+        .bind(entry.frame, this._buildStatusCallback(ws, entry.frame.sessionId))
+        .catch((err) =>
+          this.log.warn('flush_pending_bind_failed', {
+            err: err instanceof Error ? err.message : String(err),
+          }),
+        )
+    }
+  }
+
+  /** Phase 4 — send outbound.control.session_repo_status to a single ws,容错 closed/error。 */
+  private _sendStatusFrame(ws: WebSocket, frame: SessionRepoStatusOut): void {
+    try {
+      if (ws.readyState !== ws.OPEN) {
+        // v1.0.95 诊断 instrument:这是最可能的 silent swallow 点 — 容器侧
+        // emit 了 status 但 ws 已闪断,master 永远收不到。Codex NIT:统一字段。
+        this.log.warn('repo_status_send_swallowed_ws_closed', {
+          sessionId: frame.sessionId,
+          selectionVersion: frame.selectionVersion,
+          status: frame.status,
+          readyState: ws.readyState,
+        })
+        return
+      }
+      ws.send(JSON.stringify(frame))
+      // v1.0.95 诊断 instrument:status 帧成功推到 ws.send;若 master log 看到这个
+      // 但没看到 repo_status_forwarded,根因就在 mTLS tunnel / master bridge 解析侧。
+      this.log.info('repo_status_sent', {
+        sessionId: frame.sessionId,
+        selectionVersion: frame.selectionVersion,
+        status: frame.status,
+        readyState: ws.readyState,
+      })
+    } catch (err) {
+      this.log.warn('send_repo_status_failed', {
+        sessionId: frame.sessionId,
+        selectionVersion: frame.selectionVersion,
+        status: frame.status,
+        err: err instanceof Error ? err.message : String(err),
+      })
+    }
   }
 
   private async handleStop(frame: {
@@ -4408,15 +4974,16 @@ export class Gateway {
     const text = frame.content.text ?? ''
     const media = frame.content.media ?? []
 
-    // Server-side upload validation
-    const MAX_SINGLE_FILE = 200 * 1024 * 1024 // 200MB
-    const MAX_TOTAL_MEDIA = 300 * 1024 * 1024 // 300MB total
+    // Server-side upload validation. Constants live at module level
+    // (UPLOAD_MIME_PREFIXES / MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL) so they
+    // stay in sync with handleUpload (POST /api/uploads).
+    const MAX_FILES_PER_FRAME = 5
     // text-kind attachments 在前端 buildMessageText() 阶段就拼进 content.text,
     // 绕过了下面基于 m.base64 的 per-file 校验。给 content.text 整体上限兜底,
     // 防止 (a) 绕前端构造巨 text 帧 (b) 大 text 附件 + 大正文叠加超 300 MB 契约。
     const textByteLen = Buffer.byteLength(text, 'utf8')
-    if (textByteLen > MAX_TOTAL_MEDIA) {
-      const errMsg = `消息文本超过 ${MAX_TOTAL_MEDIA / 1024 / 1024}MB 限制 (${(textByteLen / 1024 / 1024).toFixed(1)}MB)`
+    if (textByteLen > MAX_UPLOAD_TOTAL) {
+      const errMsg = `消息文本超过 ${MAX_UPLOAD_TOTAL / 1024 / 1024}MB 限制 (${(textByteLen / 1024 / 1024).toFixed(1)}MB)`
       this.log.warn('upload rejected: text too large', { reason: errMsg, textByteLen, sessionKey })
       this.deliver(
         {
@@ -4431,98 +4998,48 @@ export class Gateway {
       )
       return
     }
-    const ALLOWED_MIME_PREFIXES = [
-      'image/', 'audio/', 'video/', 'application/pdf', 'text/',
-      'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
-      'application/vnd.ms-',                            // doc, xls, ppt
-      'application/msword',                             // .doc
-      'application/zip', 'application/x-zip',           // zip archives
-      'application/json',                               // json files
-      'application/xml',                                // xml files
-    ]
+    const rejectFrame = (reason: string, ctx?: Record<string, unknown>) => {
+      this.log.warn('upload rejected', { reason, sessionKey, ...ctx })
+      this.deliver(
+        {
+          type: 'outbound.message',
+          sessionKey: sessionKey!,
+          channel: frame.channel,
+          peer: frame.peer,
+          blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${reason}` }],
+          isFinal: true,
+        },
+        adapter,
+      )
+    }
+    if (media.length > MAX_FILES_PER_FRAME) {
+      rejectFrame(`附件数量超过 ${MAX_FILES_PER_FRAME} 个限制 (${media.length})`)
+      return
+    }
     let totalMediaSize = 0
+    // First pass — validate base64 (legacy) entries the same way as before so
+    // old web bundles still get correct 4xx-style WS error frames.
     for (const m of media) {
       if (!m.base64) continue
       const rawLen = m.base64.length
       const byteLen = Math.ceil(rawLen * 0.75) // base64 → bytes approx
-      if (byteLen > MAX_SINGLE_FILE) {
-        const errMsg = `附件超过 ${MAX_SINGLE_FILE / 1024 / 1024}MB 限制 (${(byteLen / 1024 / 1024).toFixed(1)}MB)`
-        this.log.warn('upload rejected', { reason: errMsg, byteLen, sessionKey })
-        this.deliver(
-          {
-            type: 'outbound.message',
-            sessionKey: sessionKey!,
-            channel: frame.channel,
-            peer: frame.peer,
-            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
-            isFinal: true,
-          },
-          adapter,
+      if (byteLen > MAX_UPLOAD_SINGLE) {
+        rejectFrame(
+          `附件超过 ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB 限制 (${(byteLen / 1024 / 1024).toFixed(1)}MB)`,
+          { byteLen },
         )
         return
       }
       totalMediaSize += byteLen
-      if (totalMediaSize > MAX_TOTAL_MEDIA) {
-        const errMsg = `总附件超过 ${MAX_TOTAL_MEDIA / 1024 / 1024}MB 限制`
-        this.log.warn('upload rejected', { reason: errMsg, totalMediaSize, sessionKey })
-        this.deliver(
-          {
-            type: 'outbound.message',
-            sessionKey: sessionKey!,
-            channel: frame.channel,
-            peer: frame.peer,
-            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
-            isFinal: true,
-          },
-          adapter,
-        )
+      if (totalMediaSize > MAX_UPLOAD_TOTAL) {
+        rejectFrame(`总附件超过 ${MAX_UPLOAD_TOTAL / 1024 / 1024}MB 限制`, { totalMediaSize })
         return
       }
       const mime = m.mimeType || ''
-      if (
-        mime &&
-        !ALLOWED_MIME_PREFIXES.some((p) => mime.startsWith(p)) &&
-        mime !== 'application/octet-stream'
-      ) {
-        const errMsg = `不支持的文件类型: ${mime}`
-        this.log.warn('upload rejected: disallowed MIME', { mime, sessionKey })
-        this.deliver(
-          {
-            type: 'outbound.message',
-            sessionKey: sessionKey!,
-            channel: frame.channel,
-            peer: frame.peer,
-            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
-            isFinal: true,
-          },
-          adapter,
-        )
+      if (mime && !isUploadMimeAllowed(mime)) {
+        rejectFrame(`不支持的文件类型: ${mime}`, { mime })
         return
       }
-    }
-
-    // MIME → extension lookup (expanded to cover all media types)
-    const mimeToExt: Record<string, string> = {
-      'image/jpeg': 'jpg',
-      'image/png': 'png',
-      'image/gif': 'gif',
-      'image/webp': 'webp',
-      'image/bmp': 'bmp',
-      'image/svg+xml': 'svg',
-      'audio/mpeg': 'mp3',
-      'audio/wav': 'wav',
-      'audio/ogg': 'ogg',
-      'audio/aac': 'aac',
-      'audio/flac': 'flac',
-      'audio/mp4': 'm4a',
-      'video/mp4': 'mp4',
-      'video/webm': 'webm',
-      'video/quicktime': 'mov',
-      'application/pdf': 'pdf',
-      'application/msword': 'doc',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-      'application/vnd.ms-excel': 'xls',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
     }
 
     type SavedMedia = {
@@ -4533,14 +5050,91 @@ export class Gateway {
       sizeHint: string
     }
     const savedMedia: SavedMedia[] = []
+
+    // Resolve uploadsDir realpath once, after ensuring it exists. Any url-only
+    // resolution must land inside this canonical path (symlink escape guard).
+    let baseReal: string | null = null
+    try {
+      await mkdir(paths.uploadsDir, { recursive: true })
+      baseReal = realpathSync(paths.uploadsDir)
+    } catch (err) {
+      this.log.error('dispatchInbound: uploadsDir setup failed', undefined, err)
+      rejectFrame('存储目录不可用')
+      return
+    }
+
     for (const m of media) {
+      // ── New url-only path (Plan B) ──
+      if (!m.base64 && m.url) {
+        const match = m.url.match(/^\/api\/media\/(.+)$/)
+        if (!match) { rejectFrame(`非法媒体引用: ${m.url}`); return }
+        let filename: string
+        try {
+          filename = decodeURIComponent(match[1])
+        } catch {
+          rejectFrame('媒体引用编码错误')
+          return
+        }
+        if (filename.includes('..') || filename.startsWith('/') || filename.startsWith('\\')) {
+          rejectFrame('非法媒体路径')
+          return
+        }
+        const candidate = resolve(baseReal, filename)
+        if (!candidate.startsWith(baseReal + '/') && candidate !== baseReal) {
+          rejectFrame('媒体路径越界')
+          return
+        }
+        let realPath: string
+        try {
+          realPath = realpathSync(candidate)
+        } catch {
+          rejectFrame('媒体不存在或不可读')
+          return
+        }
+        if (!realPath.startsWith(baseReal + '/')) {
+          rejectFrame('媒体路径越界')
+          return
+        }
+        let stat: ReturnType<typeof statSync>
+        try {
+          stat = statSync(realPath)
+        } catch {
+          rejectFrame('媒体不可读')
+          return
+        }
+        // Codex B1 review fix: ensure it's a regular file. uploadsDir could
+        // theoretically contain directories, fifos, sockets, or device nodes
+        // (e.g. if an admin extracted a tarball there). Same guard the GET
+        // /api/media path applies via fstatSync().isFile().
+        if (!stat.isFile()) {
+          rejectFrame('媒体类型非文件')
+          return
+        }
+        // Aggregate against MAX_UPLOAD_TOTAL — same budget the legacy base64
+        // path uses, so a malicious frame referencing many already-uploaded
+        // /api/media URLs can't bypass the per-frame ceiling.
+        totalMediaSize += stat.size
+        if (totalMediaSize > MAX_UPLOAD_TOTAL) {
+          rejectFrame(`总附件超过 ${MAX_UPLOAD_TOTAL / 1024 / 1024}MB 限制`, { totalMediaSize })
+          return
+        }
+        const mimeType = m.mimeType || mimeFor(realPath) || 'application/octet-stream'
+        savedMedia.push({
+          kind: m.kind,
+          path: realPath,
+          name: m.filename ?? basename(realPath),
+          mimeType,
+          sizeHint: `${(stat.size / 1024).toFixed(1)}KB`,
+        })
+        continue
+      }
+      // ── Legacy base64 path (compat window for old web bundles) ──
       let base64 = m.base64 ?? ''
-      if (!base64 && m.url) continue // external URL — don't save, just reference
+      if (!base64) continue
       const prefixMatch = base64.match(/^data:([^;]+);base64,(.*)$/)
       const mimeType = prefixMatch ? prefixMatch[1] : (m.mimeType ?? 'application/octet-stream')
       if (prefixMatch) base64 = prefixMatch[2]
-      const ext =
-        mimeToExt[mimeType] ?? mimeType.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
+      const ext = uploadExtForMime(mimeType)
       const defaultName =
         m.kind === 'image'
           ? 'image'
@@ -4551,9 +5145,8 @@ export class Gateway {
               : 'file'
       const safeBase = (m.filename ?? defaultName).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 40)
       const fname = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeBase}.${ext}`
-      const fpath = join(paths.uploadsDir, fname)
+      const fpath = join(baseReal, fname)
       try {
-        await mkdir(paths.uploadsDir, { recursive: true })
         await writeFile(fpath, Buffer.from(base64, 'base64'))
         const sizeKb = (Buffer.byteLength(base64, 'base64') / 1024).toFixed(1)
         savedMedia.push({
@@ -5203,7 +5796,19 @@ export function isFileBlocked(resolvedPath: string): boolean {
   return FILE_BLOCKED_PATTERNS.some((p) => p.test(resolvedPath))
 }
 
-export const UPLOAD_MIME_PREFIXES = ['image/', 'audio/', 'video/', 'application/pdf', 'text/']
+// ── Upload constants — single source of truth ──
+// Plan B (2026-05-09): both POST /api/uploads (handleUpload) and dispatchInbound's
+// legacy base64 path import these. Used to live in two places (one trimmed list
+// here for tests, a richer list inlined in dispatchInbound) — fixed now.
+export const UPLOAD_MIME_PREFIXES = [
+  'image/', 'audio/', 'video/', 'application/pdf', 'text/',
+  'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
+  'application/vnd.ms-',                            // doc, xls, ppt
+  'application/msword',                             // .doc
+  'application/zip', 'application/x-zip',           // zip archives
+  'application/json',                               // json files
+  'application/xml',                                // xml files
+]
 export const MAX_UPLOAD_SINGLE = 200 * 1024 * 1024
 export const MAX_UPLOAD_TOTAL = 300 * 1024 * 1024
 
@@ -5211,6 +5816,43 @@ export const MAX_UPLOAD_TOTAL = 300 * 1024 * 1024
 export function isUploadMimeAllowed(mime: string): boolean {
   if (!mime) return true
   return UPLOAD_MIME_PREFIXES.some((p) => mime.startsWith(p)) || mime === 'application/octet-stream'
+}
+
+/** MIME → file extension. Used by dispatchInbound (legacy base64 path) and
+ *  handleUpload (new streaming endpoint). Kept module-level so both paths
+ *  agree on what `<digest>.<ext>` should be. */
+export const UPLOAD_MIME_TO_EXT: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/bmp': 'bmp',
+  'image/svg+xml': 'svg',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/aac': 'aac',
+  'audio/flac': 'flac',
+  'audio/mp4': 'm4a',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+}
+
+/** Resolve a MIME type to a safe extension. Falls back to the second
+ *  segment of the MIME (sanitized) and finally `bin`. Same logic the
+ *  legacy dispatchInbound used inline. */
+export function uploadExtForMime(mime: string): string {
+  return (
+    UPLOAD_MIME_TO_EXT[mime] ??
+    mime.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ??
+    'bin'
+  )
 }
 
 const MIME_MAP: Record<string, string> = {

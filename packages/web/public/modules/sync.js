@@ -18,10 +18,19 @@ let _onConflictResolved = null
 // dbPut retry budget — retry is not a user edit.
 let _onRequestRetryPush = null
 let _onSyncStatusChange = null
-export function setSyncDeps({ onConflictResolved, onRequestRetryPush, onSyncStatusChange }) {
+// Dep-injected: fired the FIRST time a session's PUT comes back 413 (server
+// rejected the row as oversized — see MAX_SESSION_BYTES on the storage
+// side). UI should toast the user with actionable guidance ("delete
+// attachments / start a new session") since further auto-PUT attempts on
+// this session are now disabled. Re-fired only when sess._oversized
+// transitions false→true, so a session that ping-pongs across reloads
+// won't keep flooding the toast queue.
+let _onSessionOversized = null
+export function setSyncDeps({ onConflictResolved, onRequestRetryPush, onSyncStatusChange, onSessionOversized }) {
   _onConflictResolved = onConflictResolved
   _onRequestRetryPush = onRequestRetryPush
   _onSyncStatusChange = onSyncStatusChange
+  _onSessionOversized = onSessionOversized
 }
 
 function _emitSyncStatus(status) {
@@ -662,7 +671,14 @@ export function _stripMessageEphemeral(messages) {
  */
 export function pushSessionToServer(sess) {
   if (!sess?.id || !state.token) return Promise.resolve()
-  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, ...clean } = sess
+  // Oversized sessions (received a 413 from a previous PUT) are PUT-disabled
+  // for the rest of the page lifetime. Any subsequent PUT would just cost
+  // request bytes + DB JSON.parse cycles and 413 again. The flag is
+  // intentionally NOT persisted to IDB: a page reload or admin-side
+  // session strip should give us a fresh chance, and we re-detect oversized
+  // on the next PUT attempt without needing to manually unstick the flag.
+  if (sess._oversized) return Promise.resolve()
+  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, _oversized, ...clean } = sess
   // Include baseSyncedAt for optimistic concurrency — server rejects if row is newer
   clean._baseSyncedAt = _syncedAt || 0
   // 2026-05-06 §4.5 改动 11 — messages 内 strip(双层防御第一层)。
@@ -670,10 +686,35 @@ export function pushSessionToServer(sess) {
     clean.messages = _stripMessageEphemeral(clean.messages)
   }
   const preFlightLastAt = sess.lastAt // snapshot BEFORE PUT for 409 conflict detection
+  // 2026-05-08 incident response: real preflight body-size check.
+  // The per-file attachment cap (1.25MB, attachments.js) is upload-time UX
+  // only; this is the authoritative gate that mirrors the gateway's 2MB
+  // PUT body cap. Catches all the cases the per-file cap can't see:
+  //   • aggregated message text on long sessions
+  //   • multiple under-cap attachments stacking past the body budget
+  //   • legacy oversized sessions loaded from IDB
+  // Trigger _oversized via the same path as a 413 response so UI/state is
+  // consistent regardless of whether the rejection happened client-side
+  // (here) or after the request hit the wire. Slightly tighter than the
+  // server's 2MB to leave room for HTTP headers + chunked-encoding overhead.
+  const PREFLIGHT_MAX_BYTES = 1.9 * 1024 * 1024
+  const body = JSON.stringify(clean)
+  const bodyBytes = new TextEncoder().encode(body).length
+  if (bodyBytes > PREFLIGHT_MAX_BYTES) {
+    const live = state.sessions.get(sess.id) || sess
+    const wasOversized = live._oversized
+    live._oversized = true
+    live._dirty = false
+    live._conflictRetryCount = 0
+    if (!wasOversized) {
+      try { _onSessionOversized?.(live.id) } catch {}
+    }
+    return Promise.resolve()
+  }
   return apiFetch(`/api/sessions/${sess.id}`, {
     method: 'PUT',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify(clean),
+    body,
   }).then(async (res) => {
     if (res.ok) {
       const resp = await res.json()
@@ -681,6 +722,34 @@ export function pushSessionToServer(sess) {
         sess._syncedAt = resp.updatedAt
         sess._dirty = false
         sess._conflictRetryCount = 0  // successful PUT clears 409 retry cap
+      }
+    } else if (res.status === 413) {
+      // Oversized — server rejected because either the request body is
+      // larger than the gateway PUT cap (2MB) or the post-merge messages
+      // blob would exceed MAX_SESSION_BYTES (4MB). Either way auto-retry
+      // would re-trigger the same rejection forever (the 2026-05-08
+      // event-loop-stall incident). Mark the session and surface to the
+      // user; they can manually start a new session or wait for admin
+      // strip. The live in-memory object is the authoritative target
+      // (sess may be a detached dbGetAll snapshot).
+      //
+      // _oversized is intentionally session-runtime ONLY — it is stripped
+      // out of the IDB persist set in sessions.js _doSave and cleared on
+      // any scheduleSaveFromUserEdit. That gives the user a clean recovery
+      // path: page reload OR deleting attachments both re-arm the next
+      // PUT attempt. Without those two unsticks, a single 413 would
+      // permanently brick the session for that browser.
+      const live = state.sessions.get(sess.id) || sess
+      const wasOversized = live._oversized
+      live._oversized = true
+      live._dirty = false  // suppress auto-retry; user must take action
+      live._conflictRetryCount = 0
+      // No dbPut here: the runtime-only flag would only be persisted
+      // accidentally if we wrote to IDB now. The next legitimate _doSave
+      // (after user edit clears the flag) will persist any other state
+      // changes; until then there's nothing IDB-worthy to record.
+      if (!wasOversized) {
+        try { _onSessionOversized?.(live.id) } catch {}
       }
     } else if (res.status === 409) {
       // Conflict: server has a newer version. Two resolution paths:

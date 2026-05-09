@@ -1,3 +1,4 @@
+import { clearAttachments } from './attachments.js?v=a4fc2fb7'
 import { dbDelete, dbPut } from './db.js?v=a4fc2fb7'
 // OpenClaude — Session management, sidebar, context menu
 import { $, htmlSafeEscape } from './dom.js?v=a4fc2fb7'
@@ -35,6 +36,10 @@ export function setSessionUIDeps(deps) {
 
 // ═══════════════ SESSIONS ═══════════════
 export function createSession(agentId) {
+  // Plan B (2026-05-09):新建会话前必须清掉 composer 上未发送的附件 + abort
+  // 进行中的上传。否则切到新会话后,旧会话选的附件还挂在 state.attachments 上,
+  // 用户点发送会把上一会话的图片/文件带到新会话里。
+  clearAttachments()
   const id = uuid()
   const s = {
     id,
@@ -52,6 +57,10 @@ export function createSession(agentId) {
 
 export function switchSession(id) {
   if (!state.sessions.has(id)) return
+  // Plan B (2026-05-09):切会话前必须清掉 composer 上未发送的附件 + abort 进行
+  // 中的上传 — 这些资源属于上一会话的语义,带到新会话发出去会成"图片串号"。
+  // 仅当 id 真切了才清:点同一个会话不应丢用户刚选的附件。
+  if (id !== state.currentSessionId) clearAttachments()
   // Restore UI from new session's persisted turn-state. Do NOT write global
   // `state.sendingInFlight` back onto `oldSess._sendingInFlight` — the session
   // flag is the source of truth (mutated by send/isFinal/safety-timer in
@@ -113,6 +122,10 @@ export async function deleteSession(id) {
   } catch {}
   deleteSessionFromServer(id)
   if (state.currentSessionId === id) {
+    // Plan B (2026-05-09):删除当前会话也属于"切会话"的语义,composer 上挂的附件
+    // 归属被删除的会话,必须 abort 上传 + 清掉。这条路径不走 switchSession()
+    // (下面是直接赋 currentSessionId 或 createSession),所以必须显式清。
+    clearAttachments()
     const arr = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
     if (arr.length > 0) state.currentSessionId = arr[0].id
     else createSession()
@@ -196,6 +209,13 @@ export function scheduleSaveFromUserEdit(s, immediate) {
   if (!sess) return
   _clearSaveRetry(sess.id)
   sess._conflictRetryCount = 0  // reset 409 local-dominates auto-retry cap
+  // 2026-05-08 incident response: clearing _oversized lets the user recover
+  // by deleting attachments / pruning the session. Without this, a session
+  // that hit 413 once would stay PUT-disabled until page reload even after
+  // the user trims it down. Clearing on user edit specifically (not on
+  // automatic _enqueueSave) keeps streaming/sync paths from accidentally
+  // retrying an oversized row that nothing structurally changed.
+  sess._oversized = false
   scheduleSave(sess, immediate)
 }
 
@@ -294,7 +314,7 @@ async function _doSave(sess) {
   // _turnStartedAt, _lastFrameAt) is intentionally PRESERVED so a page
   // refresh can restore the in-flight UI and correctly signal inFlight=true
   // in the next hello frame. Staleness is handled at load time.
-  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, ...persist } = sess
+  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, _oversized, ...persist } = sess
   // Expose a dbPut-only checkpoint promise to deleteSession(). Registered
   // BEFORE awaiting dbPut so a concurrent deleteSession() synchronously sees
   // an in-flight local write and can await it before calling dbDelete().

@@ -77,6 +77,7 @@ import {
 import {
   addFiles,
   classifyFile,
+  clearAttachments,
   fileToDataURL,
   fileToText,
   removeAttachment,
@@ -861,6 +862,12 @@ function send() {
       return
     }
   }
+  // Plan B (2026-05-09):上传中的附件不能发送 — _uploadOne 还没拿到 url,发出去
+  // server 端 dispatchInbound 拒收。让用户等几百 ms 再点。
+  if (state.attachments.some((a) => a._uploading)) {
+    toast('附件还在上传中，请稍候', 'warning')
+    return
+  }
   const sess = getSession()
   if (!sess) return
   const displayText =
@@ -869,11 +876,14 @@ function send() {
       ? `\n\n📎 ${state.attachments.map((a) => a.name).join(', ')}`
       : '')
   const modelText = buildMessageText(text, state.attachments)
+  // Plan B:_media 里只放 url,不再放 base64。url 来自 _uploadOne 的服务端响应。
+  // server.ts dispatchInbound 的 url 分支会做 traversal/realpath 校验后落到
+  // savedMedia,落库的 messages JSON 永远只包含 url 引用,不再有 base64。
   const media = state.attachments
     .filter((a) => a.kind !== 'text')
     .map((a) => ({
       kind: a.kind,
-      base64: a.dataUrl,
+      url: a.url,
       mimeType: a.type,
       filename: a.name,
     }))
@@ -942,8 +952,7 @@ function send() {
       updateMsgStatus(userMsg)
       toast(`离线缓冲已满 (${MAX_OFFLINE_QUEUE} 条),请恢复网络后重试`, 'danger')
       $('input').value = ''
-      state.attachments = []
-      renderAttachments()
+      clearAttachments()
       autoResize()
       scheduleSaveFromUserEdit(sess)
       renderSidebar()
@@ -956,8 +965,7 @@ function send() {
     }
   }
   $('input').value = ''
-  state.attachments = []
-  renderAttachments()
+  clearAttachments()
   autoResize()
   scheduleSaveFromUserEdit(sess)
   renderSidebar()
@@ -1309,8 +1317,7 @@ async function _forceLogout({ serverLogout, broadcast = Boolean(serverLogout) } 
   state._offlineDrainingCurrent = null
   state._offlineQueueDraining = false
   state.sendingInFlight = false
-  state.attachments = []
-  renderAttachments()
+  clearAttachments()
   hideTypingIndicator()
   // 2026-04-27:容器初始化 banner 是上一身份的 ws 容器状态信号,logout 后必须清,
   // 否则跳到 landing 还闪着"环境初始化中…"完全不合语义。
@@ -1411,8 +1418,7 @@ function showLogin() {
   state._offlineDrainingCurrent = null
   state._offlineQueueDraining = false
   state.sendingInFlight = false
-  state.attachments = []
-  renderAttachments()
+  clearAttachments()
   hideTypingIndicator()
   setTitleBusy(false)
   // Clear composer draft
@@ -2225,6 +2231,15 @@ async function init() {
     // enqueueSaveForRetry chains one extra _doSave without touching
     // lastAt or retry budget (retry is not a user edit).
     onRequestRetryPush: (sessId) => enqueueSaveForRetry(sessId),
+    // 413 oversized: server rejected the row as too large to persist.
+    // Auto-PUT for this session is now disabled (sync.js sets sess._oversized).
+    // Surface a single actionable toast — repeat 413s on the same session do
+    // NOT re-fire because sync.js gates on the false→true transition.
+    onSessionOversized: (sessId) => {
+      const s = state.sessions.get(sessId)
+      const title = s?.title || sessId
+      toast(`会话 "${title}" 体积过大，已停止自动同步。删除附件或开启新会话后可恢复。`, 'danger')
+    },
   })
   // Sidebar search
   let _searchDebounce = null
