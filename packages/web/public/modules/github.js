@@ -48,6 +48,11 @@ export function githubErrorText(code) {
     INVALID_VERSION: '版本号异常',
     token_invalid: 'GitHub token 已失效,会话已自动解绑',
     token_write_failed: '写入凭证失败,请重试',
+    // OAuth callback 阶段的错误码 — 来自 oauthGithub.ts githubErrorRedirect()
+    state_mismatch: 'OAuth 回调状态不匹配,请重新连接',
+    exchange_failed: 'GitHub 授权码兑换失败,请重新连接',
+    account_already_linked: '该 GitHub 账号已绑定到另一个 OpenClaude 账号。请先在原账号解绑,或改用其他 GitHub 账号。',
+    server_error: 'GitHub 连接服务异常,请稍后重试',
   }
   return dict[code] || code || '未知错误'
 }

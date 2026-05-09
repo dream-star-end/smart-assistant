@@ -6552,14 +6552,16 @@ body.body-landing {
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
-  padding: 0 var(--space-3);
-  margin-bottom: var(--space-2);
+  /* v1.0.110 跟 .composer-inner 同形居中限宽,使 #github-trigger 视觉左缘与
+     .composer-modes 内的 mode-pill 对齐。padding-left 计算:模拟 .composer-inner
+     的 1px border + .composer-modes 的 var(--space-3) padding-left。
+     v1.0.109 admin-only UI gate 的 hidden 属性靠全局 `[hidden] { display:none !important }`
+     (style.css line 157)兜底,不需局部冗余规则。 */
+  --composer-border-width: 1px;
+  max-width: 780px;
+  margin: 0 auto var(--space-2);
+  padding: 0 calc(var(--space-3) + var(--composer-border-width));
 }
-/* v1.0.109 admin-only UI gate: HTML5 [hidden] 默认是 UA stylesheet 的 display:none,
-   会被 author rule `.repo-bar { display:flex }` 和 `@media .repo-bar` 覆盖,所以
-   显式补一条 author 级规则把 hidden 锁死。billing.js refreshBalance() 在
-   user.role==='admin' 时移除 hidden 属性触发显示。 */
-#repo-bar[hidden] { display: none !important; }
 .repo-bar-trigger { flex: 0 0 auto; }
 
 .repo-banner {
@@ -6663,9 +6665,12 @@ body.body-landing {
 /* 移动端:repo-bar 紧凑化,进度条窄一点,百分比仍可读 */
 @media (max-width: 640px) {
   .repo-bar {
-    padding: 0 var(--space-2);
+    /* 跟非 mobile 同形:复用 --composer-border-width(在 .repo-bar 上声明)对齐
+       composer-inner 1px border + composer-modes 紧凑 padding-left。 */
+    padding-left: calc(var(--space-2) + var(--composer-border-width));
+    padding-right: calc(var(--space-2) + var(--composer-border-width));
     gap: var(--space-1);
-    margin-bottom: var(--space-1);
+    margin: 0 auto var(--space-1);
   }
   .repo-banner {
     padding: 3px 8px;
