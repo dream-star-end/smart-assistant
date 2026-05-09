@@ -770,8 +770,15 @@ esac
       await writeFile(askpassPath, askpassContent, { mode: 0o700 })
       await chmod(askpassPath, 0o700)
 
-      // 临时 clone 目录
-      tmpRepoDir = await mkdtemp(path.join(tmpdir(), 'oc-clone-'))
+      // 临时 clone 目录:必须和 finalDir 同 FS,否则 rename(2) 跨 device 会 EXDEV。
+      // 容器内 /tmp 是 overlay layer,/home/agent/.openclaude 是 named volume bind
+      // mount,跨 device。把 tmp 落进 sessionRepoRoot 下用 hidden 前缀,既避免 EXDEV
+      // 又借用同一目录的清理路径(进程崩残留也只在 session 范围内)。
+      // `.tmp-clone-` 不会和 numeric version subdir 冲突(cleanupVersionsThrough 只删
+      // Number.isSafeInteger 的子项,L554-555),自然被 contract 排除。
+      const sessionRepoRoot = path.join(REPOS_ROOT, sessionId)
+      await mkdir(sessionRepoRoot, { recursive: true })
+      tmpRepoDir = await mkdtemp(path.join(sessionRepoRoot, '.tmp-clone-'))
 
       // 检查 2:spawn 之前
       if (!this.aliveAndCurrent(sessionId, selectionVersion, state.abort)) return
@@ -877,10 +884,9 @@ esac
       // 检查 4:rename 之前
       if (!this.aliveAndCurrent(sessionId, selectionVersion, state.abort)) return
 
-      // mkdir 父目录,删旧 version 同名 dir(if any),原子 rename
-      const finalDir = path.join(REPOS_ROOT, sessionId, String(selectionVersion))
-      const sessionRepoRoot = path.join(REPOS_ROOT, sessionId)
-      await mkdir(sessionRepoRoot, { recursive: true })
+      // 删旧 version 同名 dir(if any),同 FS 原子 rename。sessionRepoRoot 已在
+      // mkdtemp 之前创建好,无需重复 mkdir。
+      const finalDir = path.join(sessionRepoRoot, String(selectionVersion))
       // 同名 finalDir 通常不存在(version 单调递增);若残留(进程崩 + 重 bind),先删
       await rm(finalDir, { recursive: true, force: true }).catch(() => {})
       await rename(tmpRepoDir, finalDir)
