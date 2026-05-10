@@ -304,12 +304,20 @@ async function reconcileDbOrphans(
         : await deps.docker.getContainer(cid).inspect();
       // inspect ok → 容器仍存在,direction B 不动它(不管 running 与否,
       // running 由 idle sweep 管;stopped 等 ensureRunning 触发 missing 路径)
-      if (info.State) {
+      // info 是 ContainerInspectInfo (docker, 大写 .State) 或 AgentContainerInspect (remote, 小写 .state) 联合
+      if ("State" in info && info.State) {
         log?.debug?.("[v3/orphanReconcile] db row alive", {
           containerId: row.id,
           docker: cid,
           host_uuid: row.host_uuid,
           running: Boolean(info.State.Running),
+        });
+      } else if ("state" in info) {
+        log?.debug?.("[v3/orphanReconcile] db row alive", {
+          containerId: row.id,
+          docker: cid,
+          host_uuid: row.host_uuid,
+          running: info.state === "running",
         });
       }
     } catch (err) {

@@ -1034,10 +1034,10 @@ export function normalizeAndAssignSeqs<T extends MessageLike>(
       if (m._seq === old._seq) {
         out[i] = m
       } else {
-        out[i] = { ...(m as object), _seq: old._seq } as T
+        out[i] = { ...m, _seq: old._seq }
       }
     } else {
-      out[i] = { ...(m as object), _seq: nextSeq } as T
+      out[i] = { ...m, _seq: nextSeq }
       nextSeq++
     }
   }

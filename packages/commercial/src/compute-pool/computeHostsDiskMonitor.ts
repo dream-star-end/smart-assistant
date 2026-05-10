@@ -185,8 +185,9 @@ export function startComputeHostDiskMonitor(
     opts.localExecFn ??
     (async (cmd: string, timeoutMs: number) => {
       // 与 sshRun 返回签名对齐(只取 stdout)。bash -c 是为了 ; 串接命令统一行为。
+      // exec 重载在新 @types/node 把 stdout 类型推为 string,String() 兜底防 null/undefined
       const r = await exec(cmd, { timeout: timeoutMs, shell: "/bin/bash" });
-      return { stdout: typeof r.stdout === "string" ? r.stdout : r.stdout.toString("utf8") };
+      return { stdout: String(r.stdout ?? "") };
     });
   const logger = opts.logger ?? rootLogger.child({ mod: "compute-metrics-monitor" });
   const listAllHostsFn = opts._deps?.listAllHosts ?? _listAllHosts;

@@ -1,0 +1,13 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/protocol" },
+    { "path": "./packages/storage" },
+    { "path": "./packages/plugin-sdk" },
+    { "path": "./packages/mcp-memory" },
+    { "path": "./packages/gateway" },
+    { "path": "./packages/channels/wechat" },
+    { "path": "./packages/commercial" },
+    { "path": "./packages/cli" }
+  ]
+}

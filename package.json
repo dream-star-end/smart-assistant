@@ -34,7 +34,9 @@
     "test:evals": "npx tsx --test --test-force-exit evals/run.test.ts",
     "test": "npm run test:gateway && npm run test:web && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
-    "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/storage/tsconfig.json && tsc --noEmit -p packages/gateway/tsconfig.json && tsc --noEmit -p packages/mcp-memory/tsconfig.json && tsc --noEmit -p packages/cli/tsconfig.json && tsc --noEmit -p packages/commercial/tsconfig.json",
+    "typecheck": "tsc --build",
+    "typecheck:clean": "tsc --build --clean",
+    "typecheck:watch": "tsc --build --watch",
     "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run typecheck && npm run test"
   },
   "devDependencies": {

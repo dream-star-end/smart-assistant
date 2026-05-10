@@ -15,6 +15,10 @@
 export type { WechatChannelConfig } from './manager.js'
 export { wechatChannelFactory } from './manager.js'
 export * from './pairing.js'
+// iLink low-level API — re-exported so cross-package consumers (commercial
+// admin alert worker) go through the package boundary, not via deep relative
+// path. Required by S12a composite project boundary.
+export * from './iLink.js'
 
 // Re-export storage types for convenience in callers
 export type { WechatBinding } from '@openclaude/storage'

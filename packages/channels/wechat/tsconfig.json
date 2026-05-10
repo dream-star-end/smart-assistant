@@ -1,13 +1,13 @@
 {
-  "extends": "../../tsconfig.base.json",
+  "extends": "../../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist-types",
     "tsBuildInfoFile": "dist-types/.tsbuildinfo"
   },
   "include": ["src"],
   "references": [
-    { "path": "../protocol" },
-    { "path": "../plugin-sdk" },
-    { "path": "../storage" }
+    { "path": "../../protocol" },
+    { "path": "../../plugin-sdk" },
+    { "path": "../../storage" }
   ]
 }

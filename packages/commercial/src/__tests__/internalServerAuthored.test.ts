@@ -78,7 +78,7 @@ function makeRes(): { res: ServerResponse; rec: RecordedRes } {
   const res = {
     headersSent: false,
     setHeader(k: string, v: string | number) { rec.headers[String(k).toLowerCase()] = v; },
-    writeHead(status: number, headers: Record<string, string | number>) {
+    writeHead(this: { headersSent: boolean }, status: number, headers: Record<string, string | number>) {
       rec.status = status;
       for (const [k, v] of Object.entries(headers)) {
         rec.headers[String(k).toLowerCase()] = v;

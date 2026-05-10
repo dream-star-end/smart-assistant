@@ -71,6 +71,12 @@ function fakeRow(over: Partial<ComputeHostRow> = {}): ComputeHostRow {
     last_uplink_at: null,
     last_egress_probe_ok: null,
     last_egress_probe_at: null,
+    // 0045 metrics — 测试夹具默认 null,与 schema "NULL = 从未采集成功" 一致
+    disk_pct: null,
+    mem_pct: null,
+    load1: null,
+    cpu_count: null,
+    metrics_at: null,
     created_at: now,
     updated_at: now,
     ...over,

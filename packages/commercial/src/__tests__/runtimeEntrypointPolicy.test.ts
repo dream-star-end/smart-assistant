@@ -21,7 +21,6 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isProviderManagedEnvVar } from "../../../../claude-code-best/src/utils/managedEnvConstants.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -34,6 +33,45 @@ const ENTRYPOINT_TS_PATH = join(
   "runtime",
   "entrypoint.ts",
 );
+
+/**
+ * personal-version 的 PROVIDER_MANAGED_ENV_VARS 源码 — 跨仓引用 .ts 源码会让 commercial
+ * composite TS project 把外部源码纳入编译图,触发 rootDir/include 边界问题(S12a 三审 MAJOR 2)。
+ * 改成读源码字符串解析:同已有 readRetainKeysFromSource() 模式,纯运行时,无编译期耦合。
+ */
+const MANAGED_ENV_CONSTANTS_PATH = join(
+  __dirname,
+  "..",
+  "..",
+  "..",
+  "..",
+  "claude-code-best",
+  "src",
+  "utils",
+  "managedEnvConstants.ts",
+);
+
+/** 从 managedEnvConstants.ts 源码里抽 PROVIDER_MANAGED_ENV_VARS Set + PREFIXES list 的内容 */
+function loadManagedEnvVarsFromSource(): { exact: Set<string>; prefixes: string[] } {
+  const src = readFileSync(MANAGED_ENV_CONSTANTS_PATH, "utf-8");
+  const setMatch = src.match(/PROVIDER_MANAGED_ENV_VARS\s*=\s*new Set\(\[([\s\S]*?)\]\)/);
+  if (!setMatch) throw new Error("PROVIDER_MANAGED_ENV_VARS not found in managedEnvConstants.ts");
+  const exact = new Set<string>();
+  for (const lit of setMatch[1]!.matchAll(/['"]([A-Z0-9_]+)['"]/g)) exact.add(lit[1]!);
+  const prefixMatch = src.match(/PROVIDER_MANAGED_ENV_PREFIXES\s*=\s*\[([\s\S]*?)\]/);
+  const prefixes: string[] = [];
+  if (prefixMatch) {
+    for (const lit of prefixMatch[1]!.matchAll(/['"]([A-Z0-9_]+)['"]/g)) prefixes.push(lit[1]!);
+  }
+  return { exact, prefixes };
+}
+
+const MANAGED = loadManagedEnvVarsFromSource();
+
+function isProviderManagedEnvVar(key: string): boolean {
+  const upper = key.toUpperCase();
+  return MANAGED.exact.has(upper) || MANAGED.prefixes.some((p) => upper.startsWith(p));
+}
 
 /** 从 entrypoint.ts 源码里抽 RETAIN_ENV_KEYS Set 的内容 */
 function readRetainKeysFromSource(): Set<string> {

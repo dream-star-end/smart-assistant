@@ -1,4 +1,13 @@
 {
   "extends": "../../tsconfig.base.json",
-  "include": ["src"]
+  "compilerOptions": {
+    "outDir": "dist-types",
+    "tsBuildInfoFile": "dist-types/.tsbuildinfo"
+  },
+  "include": ["src", "scripts"],
+  "references": [
+    { "path": "../gateway" },
+    { "path": "../storage" },
+    { "path": "../channels/wechat" }
+  ]
 }

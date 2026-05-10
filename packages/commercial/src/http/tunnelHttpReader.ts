@@ -24,7 +24,8 @@
  * 主动 destroy socket(下面 pipeBodyByContentLength / pipeBodyChunked)。
  */
 
-import type { Duplex, Writable } from "node:stream";
+import type { Writable } from "node:stream";
+import type { Socket } from "node:net";
 
 /**
  * 接受 res 的鸭子类型 —— write/end/destroy/writableEnded + drain 事件订阅,
@@ -71,7 +72,7 @@ export interface TunnelResponseHead {
  * 可以重新挂上(file-proxy 会重新挂以驱动 pipe)。
  */
 export function readResponseHead(
-  socket: Duplex,
+  socket: Socket,
   timeoutMs: number,
   maxHeaderBytes = 64 * 1024,
 ): Promise<TunnelResponseHead | null> {
@@ -163,7 +164,7 @@ function parseHead(text: string): Omit<TunnelResponseHead, "leftover"> | null {
  * - timeoutMs / error / 提前 close → resolve null
  */
 export function readBodyByContentLength(
-  socket: Duplex,
+  socket: Socket,
   initial: Buffer,
   expectedBytes: number,
   timeoutMs: number,
@@ -227,7 +228,7 @@ export function readBodyByContentLength(
  * 拿生命周期信号。
  */
 export function pipeBodyByContentLength(
-  socket: Duplex,
+  socket: Socket,
   initial: Buffer,
   res: ResWritable,
   expectedBytes: number,
@@ -254,7 +255,7 @@ export function pipeBodyByContentLength(
     if (settled) return;
     settled = true;
     cleanupSocket();
-    try { (socket as Duplex).destroy(); } catch { /* */ }
+    try { socket.destroy(); } catch { /* */ }
     if (!res.writableEnded) try { res.end(); } catch { /* */ }
     callbacks.onDone();
   };
@@ -262,7 +263,7 @@ export function pipeBodyByContentLength(
     if (settled) return;
     settled = true;
     cleanupSocket();
-    try { (socket as Duplex).destroy(); } catch { /* */ }
+    try { socket.destroy(); } catch { /* */ }
     if (!res.writableEnded && res.destroy) try { res.destroy(); } catch { /* */ }
     callbacks.onError(why);
   };
@@ -332,14 +333,14 @@ export function pipeBodyByContentLength(
  * size <= maxChunkBytes,累计 <= maxTotalBytes,超即 onError。
  */
 export function pipeBodyChunked(
-  socket: Duplex,
+  socket: Socket,
   initial: Buffer,
   res: ResWritable,
   idleTimeoutMs: number,
   maxTotalBytes: number,
   callbacks: { onDone: () => void; onError: (why: string) => void },
 ): void {
-  let buf = Buffer.alloc(0);
+  let buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let totalBody = 0;
   let settled = false;
   let paused = false;
@@ -361,7 +362,7 @@ export function pipeBodyChunked(
     if (settled) return;
     settled = true;
     cleanup();
-    try { (socket as Duplex).destroy(); } catch { /* */ }
+    try { socket.destroy(); } catch { /* */ }
     if (!res.writableEnded) try { res.end(); } catch { /* */ }
     callbacks.onDone();
   };
@@ -369,7 +370,7 @@ export function pipeBodyChunked(
     if (settled) return;
     settled = true;
     cleanup();
-    try { (socket as Duplex).destroy(); } catch { /* */ }
+    try { socket.destroy(); } catch { /* */ }
     if (!res.writableEnded && res.destroy) try { res.destroy(); } catch { /* */ }
     callbacks.onError(why);
   };
@@ -525,13 +526,13 @@ export function pipeBodyChunked(
  * 不处理:non-hex size、负 size、size > maxBytes。任何这些 → 视为非法 → null。
  */
 export function readBodyChunked(
-  socket: Duplex,
+  socket: Socket,
   initial: Buffer,
   timeoutMs: number,
   maxBytes: number,
 ): Promise<Buffer | null> {
   return new Promise((resolve) => {
-    let buf = initial.length > 0 ? Buffer.from(initial) : Buffer.alloc(0);
+    let buf: Buffer<ArrayBufferLike> = initial.length > 0 ? Buffer.from(initial) : Buffer.alloc(0);
     const out: Buffer[] = [];
     let outBytes = 0;
     type State = "size" | "data" | "crlf-after-data" | "trailer" | "done";
@@ -642,7 +643,7 @@ export function readBodyChunked(
 }
 
 export function readBodyCapped(
-  socket: Duplex,
+  socket: Socket,
   initial: Buffer,
   timeoutMs: number,
   maxBytes: number,

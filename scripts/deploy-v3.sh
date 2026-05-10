@@ -458,6 +458,9 @@ RSYNC_OPTS=(
   --exclude=/.claude
   --exclude=/.codex
   --exclude=/claude-code-best
+  # S12a — TS composite emit (rsync doesn't read .gitignore; explicit exclude)
+  --exclude='dist-types/'
+  --exclude='*.tsbuildinfo'
 )
 if [[ $DRY_RUN -eq 1 ]]; then
   RSYNC_OPTS+=(--dry-run -v)

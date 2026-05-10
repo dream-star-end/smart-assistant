@@ -1031,9 +1031,10 @@ describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKE
     await new Promise((r) => setImmediate(r))
     assert.ok(err instanceof Error)
     assert.match(err.message, /thread\/resume -> -32600: no rollout found/)
-    assert.equal(err.rpcCode, -32600)
-    assert.equal(err.rpcMessage, 'no rollout found for thread id xyz')
-    assert.equal(err.rpcMethod, 'thread/resume')
+    const e = err as Error & { rpcCode: number; rpcMessage: string; rpcMethod: string }
+    assert.equal(e.rpcCode, -32600)
+    assert.equal(e.rpcMessage, 'no rollout found for thread id xyz')
+    assert.equal(e.rpcMethod, 'thread/resume')
     await h.cleanup()
   })
 })

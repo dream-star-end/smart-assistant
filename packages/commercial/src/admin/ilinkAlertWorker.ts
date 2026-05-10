@@ -24,7 +24,7 @@ import {
   sendIlinkText,
   extractIlinkText,
   ILINK_SESSION_EXPIRED,
-} from '../../../channels/wechat/src/iLink.js'
+} from '@openclaude/channel-wechat'
 import {
   listDispatchableChannels,
   loadChannelSecrets,
@@ -444,4 +444,4 @@ export {
   fetchIlinkQrcode,
   pollIlinkQrcodeStatus,
   extractConfirmed,
-} from '../../../channels/wechat/src/iLink.js'
+} from '@openclaude/channel-wechat'
