@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from './codexLaunchOverrides.js'
+import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { _sanitizeThreadId, buildCodexEnv, copyImagePathsToPublicDir } from './codexRunner.js'
 import { createLogger } from './logger.js'
 
@@ -77,6 +78,16 @@ export interface CodexAppServerRunnerOpts {
   config?: OpenClaudeConfig
   /** Forwarded to mcp-memory env so delegate_task can enforce recursion caps. */
   delegationDepth?: number
+  // ── Phase 5 GitHub session repo workspace integration ──
+  /** Session id (peerId)。和 SubprocessRunner.opts.sessionId 同语义,被 runner
+   *  作为 key 反查 `getRepoSnapshot()`,得到当前 turn 应该绑定的 repo workspace。
+   *  legacy caller(测试或没 sessionManager 的代码路径)可不传,此时整个 repo 绑
+   *  定能力关闭,行为退回 v1.0.0 老样:cwd 永远 = opts.cwd,REPO slot 不注入。 */
+  sessionId?: string
+  /** snapshot provider。由 SessionManager 注入(`this._getRepoSnapshot`),
+   *  内部读 `_repoWorkspace.getRepoSnapshot(sessionId)`。返 null = 无绑定;
+   *  返 ready = 已绑定可用;返 cloning/failed/pending = 不可用,运行时回退 opts.cwd。 */
+  getRepoSnapshot?: (sessionId: string) => RepoSnapshot | null
 }
 
 interface QueuedTurn {
@@ -503,6 +514,13 @@ export class CodexAppServerRunner extends EventEmitter {
    *  with `sessionDir` so the next post-shutdown spawn lazy-rebuilds. */
   private cachedOverrides: CodexLaunchOverrides | null = null
 
+  // ── Phase 5 GitHub session repo binding(parity with SubprocessRunner)──
+  /** ready 状态下记录当前生效的 repo binding — selectionVersion 给
+   *  sessionManager.recyclePeerForRepoChange 用作版本对比依据;workspaceDir 仅
+   *  做诊断/日志(真用作 cwd 的是 runTurn 顶部一次取的 effectiveCwd)。
+   *  非 ready / 无 binding / 无 sessionId 注入 = null。 */
+  private _boundRepoBinding: { selectionVersion: number; workspaceDir: string } | null = null
+
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
   public effortLevel: string | undefined = undefined
@@ -541,6 +559,70 @@ export class CodexAppServerRunner extends EventEmitter {
   }
   setModel(model: string | undefined): void {
     this.opts.model = model
+  }
+
+  // ── Phase 5 GitHub session repo binding (parity with SubprocessRunner) ──
+
+  /** Public getter consumed by sessionManager.recyclePeerForRepoChange:
+   *  比对 selectionVersion 决定是否需要 shutdown+reset。null = 当前没有 ready
+   *  绑定(从未绑定 / 绑定 cloning|failed / sessionId 未注入)。 */
+  getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null {
+    return this._boundRepoBinding
+  }
+
+  /** Forget per-thread / per-spawn cached state so the next turn rebuilds from
+   *  scratch。Used by sessionManager.recyclePeerForRepoChange when repo binding
+   *  version changes:
+   *    - threadId:next spawn must walk fresh `thread/start` rather than
+   *      `thread/resume` against a thread whose context belongs to the
+   *      *previous* repo.
+   *    - 三个 token usage baselines:不清,新 thread 的第一个
+   *      `thread/tokenUsage/updated` 会减去旧 thread 的 totals → underbilling
+   *      或 clamp-to-zero。
+   *    - sessionDir + cachedOverrides:不清,recycle 在 isRunning=true 路径上
+   *      shutdown() 会顺手清,但 isRunning=false 路径(proc 已死 / 未起)上
+   *      sessionManager 跳过 shutdown,旧 instructions 文件仍被缓存为下一轮
+   *      spawn 的 REPO slot 来源,导致物理 cwd 与系统提示分裂(本次修复要
+   *      根治的就是这个)。这里直接复用现成的 cleanupLaunchOverrides() helper。
+   *
+   *  接口名 / 语义与 SubprocessRunner.clearSessionId 对齐(symmetric polymorphism)。 */
+  clearSessionId(): void {
+    this.threadId = null
+    this.priorTurnTotal = null
+    this.activeTurnTotal = null
+    this.currentTurnUsage = null
+    this.cleanupLaunchOverrides()
+  }
+
+  /** 读当前 session 的 repo snapshot。turn 顶部一次取,贯穿 ensureSpawned /
+   *  thread/start / thread/resume / launch overrides 四个消费点,避免它们各自取
+   *  的瞬间不一致(撕裂窗口)。 */
+  private _currentRepoSnapshot(): RepoSnapshot | null {
+    if (!this.opts.sessionId || !this.opts.getRepoSnapshot) return null
+    try {
+      return this.opts.getRepoSnapshot(this.opts.sessionId)
+    } catch (err) {
+      log.warn(
+        'getRepoSnapshot threw; treating as no-bind',
+        { sessionKey: this.opts.sessionKey, err: (err as Error).message },
+      )
+      return null
+    }
+  }
+
+  /** 把 snapshot 折算成本 turn 的有效 cwd,顺手更新 _boundRepoBinding。
+   *  ready+workspaceDir → 用 workspaceDir + 记录 binding;其它 → 回退 opts.cwd
+   *  + binding=null。返回值是 spawn / thread/start / thread/resume 都用的 cwd。 */
+  private _applyRepoBindingFromSnapshot(snap: RepoSnapshot | null): string {
+    if (snap?.status === 'ready' && snap.workspaceDir) {
+      this._boundRepoBinding = {
+        selectionVersion: snap.selectionVersion,
+        workspaceDir: snap.workspaceDir,
+      }
+      return snap.workspaceDir
+    }
+    this._boundRepoBinding = null
+    return this.opts.cwd
   }
 
   sendPermissionResponse(_requestId: string, _response: unknown): boolean {
@@ -582,8 +664,13 @@ export class CodexAppServerRunner extends EventEmitter {
   /** Lazy-build codex launch overrides for the next `app-server` spawn. The
    *  overrides outlive a single turn (the proc is long-lived), so the cache
    *  is only invalidated in `shutdown()` / proc close / `updateConfig()`.
-   *  Returns null when `opts.config` is missing (legacy "naked codex" path). */
-  private async ensureLaunchOverrides(): Promise<CodexLaunchOverrides | null> {
+   *  Returns null when `opts.config` is missing (legacy "naked codex" path).
+   *
+   *  `repoSnap` 由 caller(`ensureSpawned`)从 turn 顶部的单一 snapshot 透传过来,
+   *  保证 launch overrides 的 REPO slot 与 spawn cwd / thread/start.cwd 用同一份。 */
+  private async ensureLaunchOverrides(
+    repoSnap: RepoSnapshot | null,
+  ): Promise<CodexLaunchOverrides | null> {
     if (!this.opts.config) return null
     if (this.cachedOverrides && this.sessionDir) return this.cachedOverrides
     // Cache miss with an existing sessionDir means updateConfig invalidated
@@ -614,6 +701,9 @@ export class CodexAppServerRunner extends EventEmitter {
         gatewayPort: this.opts.config.gateway.port,
         gatewayToken: this.opts.config.gateway.accessToken,
         delegationDepth: this.opts.delegationDepth,
+        // Phase 5:把 turn 顶部的 snapshot 一路透传到 buildPromptContext 的 REPO slot,
+        // 让 codex 系统提示中带上仓库元信息(parity with SubprocessRunner)。
+        repoSnapshot: repoSnap,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
       // v3 hardening — see codexRunner.ts for rationale (token never in argv).
@@ -764,7 +854,10 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  private async ensureSpawned(): Promise<void> {
+  private async ensureSpawned(
+    repoSnap: RepoSnapshot | null,
+    effectiveCwd: string,
+  ): Promise<void> {
     if (this.proc && !this.proc.killed && this.initialized) return
     if (this.proc && !this.proc.killed && !this.initialized) {
       // Spawn happened but initialize is in flight — caller will await.
@@ -781,9 +874,12 @@ export class CodexAppServerRunner extends EventEmitter {
     // from its very first turn. Failure here is non-fatal — fall back to
     // naked launch (same graceful-degradation stance as subprocessRunner's
     // "skip built-in MCP" branch).
+    //
+    // Phase 5:repoSnap 来自 runTurn 顶部一次取的 snapshot,贯穿到
+    // buildCodexLaunchOverrides 内 buildPromptContext 的 REPO slot。
     let argvOverrides: string[] = []
     try {
-      const overrides = await this.ensureLaunchOverrides()
+      const overrides = await this.ensureLaunchOverrides(repoSnap)
       if (overrides) argvOverrides = overrides.argvOverrides
     } catch (err) {
       log.warn(
@@ -797,8 +893,11 @@ export class CodexAppServerRunner extends EventEmitter {
     // `codex app-server` accepts `-c key=value` overrides. They must precede
     // `--listen` so clap's positional/option parser sees the stdio:// last.
     const args = ['app-server', ...argvOverrides, '--listen', 'stdio://']
+    // Phase 5:spawn cwd 用 effectiveCwd(ready 时 = repo workspaceDir,其它 = opts.cwd)。
+    // 虽然 codex app-server 本质是个 JSON-RPC 服务,proc 自身 cwd 大多数子命令不直接用,
+    // 但保持与 thread/start.cwd 一致避免任何"哪边是真值"的混淆。
     const proc = _spawnFn('codex', args, {
-      cwd: this.opts.cwd,
+      cwd: effectiveCwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildCodexEnv(),
     }) as ChildProcessWithoutNullStreams
@@ -1469,11 +1568,13 @@ export class CodexAppServerRunner extends EventEmitter {
    *  diffed against the old thread's baseline → underbilling or clamp-to-zero.
    *  Resetting all three here is a no-op on the cold-start path (they're
    *  already null on construction) and load-bearing on the self-heal path. */
-  private async _startNewThread(): Promise<void> {
+  private async _startNewThread(effectiveCwd: string): Promise<void> {
+    // Phase 5:effectiveCwd 由 runTurn 顶部一次取的 snapshot 折算而来,
+    // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
     const res = (await this.sendRequest('thread/start', {
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
-      cwd: this.opts.cwd,
+      cwd: effectiveCwd,
       ...(this.opts.model ? { model: this.opts.model } : {}),
     })) as { thread?: { id?: string } } | undefined
     const tid = res?.thread?.id
@@ -1492,10 +1593,17 @@ export class CodexAppServerRunner extends EventEmitter {
 
   private async runTurn(prompt: string, requestId?: string): Promise<void> {
     const startedAt = Date.now()
+    // Phase 5:turn 顶部一次性取 snapshot,贯穿 ensureSpawned / thread/start /
+    // thread/resume / launch overrides 四个消费点。任何中途读 snapshot 的写法
+    // 都会出现撕裂窗口(spawn cwd 用了 ready,attach cwd 拿到 cloning 之类)。
+    const repoSnap = this._currentRepoSnapshot()
+    const effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
     log.info('codex app-server turn start', {
       sessionKey: this.opts.sessionKey,
       resumed: this.threadId != null,
       promptChars: prompt.length,
+      effectiveCwd,
+      repoBound: this._boundRepoBinding != null,
     })
     this.currentAssistantBuf = ''
     // Per-turn token state: cleared at turn-start so a partial state from a
@@ -1507,7 +1615,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.currentTurnUsage = null
 
     try {
-      await this.ensureSpawned()
+      await this.ensureSpawned(repoSnap, effectiveCwd)
 
       // Each fresh app-server proc must explicitly attach a thread before
       // turn/start. `attached` is per-proc (cleared on close/error), so this
@@ -1518,14 +1626,14 @@ export class CodexAppServerRunner extends EventEmitter {
       //      thread/resume against the captured threadId.
       if (!this.attached) {
         if (!this.threadId) {
-          await this._startNewThread()
+          await this._startNewThread(effectiveCwd)
         } else {
           try {
             await this.sendRequest('thread/resume', {
               threadId: this.threadId,
               approvalPolicy: 'never',
               sandbox: 'danger-full-access',
-              cwd: this.opts.cwd,
+              cwd: effectiveCwd,
               ...(this.opts.model ? { model: this.opts.model } : {}),
             })
           } catch (err) {
@@ -1550,7 +1658,7 @@ export class CodexAppServerRunner extends EventEmitter {
               rpcMessage: (err as JsonRpcCallError).rpcMessage,
             })
             this.threadId = null
-            await this._startNewThread()
+            await this._startNewThread(effectiveCwd)
           }
         }
         this.attached = true

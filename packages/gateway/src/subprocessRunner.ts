@@ -413,7 +413,13 @@ export class SubprocessRunner extends EventEmitter {
         `Claude Code path not found: ${ccbDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
       )
     }
-    const entry = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
+    const entryRaw = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
+    // Phase 5:子进程 cwd 即将切到 effectiveAddDir(repo workspaceDir 或 agentBaseDir),
+    // 不再是 ccbBinaryDir。entry 若是相对路径(默认 'src/entrypoints/cli.tsx'),
+    // 在新 cwd 下会找不到文件。这里相对于 ccbBinaryDir 解析成绝对路径,无论
+    // 是 'bun run /abs/cli.tsx' 还是 'node --experimental-strip-types /abs/cli.tsx'
+    // 都能正确加载。已经是绝对路径(用户在 openclaude.json 自定义)的就直传。
+    const entry = isAbsolute(entryRaw) ? entryRaw : resolve(ccbDir, entryRaw)
     const runtime = config.auth.claudeCodeRuntime ?? 'bun'
 
     // ─── Phase 5: read repo snapshot ONCE before learning context + spawn args ──
@@ -537,6 +543,11 @@ export class SubprocessRunner extends EventEmitter {
         // Docker /workspace mount + Local --add-dir 内容统一用 effectiveAddDir;
         // ready 时是 repo workspaceDir,其它情况 = agentBaseDir。
         workspaceHostDir: effectiveAddDir,
+        // Phase 5:Local 模式子进程的真 cwd。Docker 模式 backend 忽略此字段
+        // (容器 cwd 由 -w /workspace 控制,与 workspaceHostDir 同源)。
+        // 这样 CCB 启动后 process.cwd() 就直接指向项目目录,STATE.cwd
+        // 与 Bash 工具的 working directory 都跟系统提示对齐。
+        subprocessCwd: effectiveAddDir,
         env: {
           ...process.env,
           ...providerEnv,

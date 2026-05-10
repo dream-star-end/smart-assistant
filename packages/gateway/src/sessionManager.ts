@@ -97,6 +97,19 @@ export interface AgentSession {
   // emitted after the turn's `result` keeps flowing through parser ->
   // onEvent -> deliver. destroySession/shutdownAll explicitly off().
   _currentMessageListener?: ((msg: any) => void) | null
+  /**
+   * Phase 5 G.0:`SessionManager.providerTag(agent.provider)` 的固化结果
+   *  ('ccb' / 'codex-native')。recyclePeerForRepoChange 用它判断是否走
+   *  "codex per-turn 也要清线程态" 分支(避免 instanceof,见 Plan v3 G.0)。
+   */
+  providerTag: string
+  /**
+   * Phase 5 G.0:agent.provider 原始值('claude-subscription' /
+   *  'codex-native' / 'minimax' 等)。诊断日志用,辅助排查 recycle 行为
+   *  与 provider 路由是否对齐;不参与判断逻辑(判断逻辑用 providerTag)。
+   *  agents.yaml 允许 provider 字段缺省,所以这里也允许 undefined。
+   */
+  agentProvider?: string
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -414,37 +427,76 @@ export class SessionManager {
     if (!sessionKey) return
     const session = this.sessions.get(sessionKey)
     if (!session) return
-    if (!session.runner.isRunning) return // 没活进程,下次 submit 会自然读最新 snapshot
 
-    const binding = session.runner.getBoundRepoBinding()
-    let shouldShutdown = false
-    if (newSnapshot === null) {
-      // null 走 unbind 路径,不该到这里;safety only
-      shouldShutdown = binding !== null
-    } else if (newSnapshot.status === 'ready') {
-      shouldShutdown =
-        !binding || binding.selectionVersion !== newSnapshot.selectionVersion
-    } else {
-      // cloning / failed / pending → 让 CCB 继续在旧 binding(若有)dir 工作
-      shouldShutdown = false
+    // Phase 5 G.1:codex-native 哪怕 runner.isRunning=false 也不能短路 —
+    //   CodexRunner 是 per-turn `codex exec`,turn 结束后子进程退出(isRunning=false),
+    //   但 runner 仍保留 threadId、session 仍保留 ccbSessionId、_resumeMap*
+    //   仍含上一轮 thread id;repo 变了下一轮 turn 必须重置否则 codex 会 attach
+    //   到旧 repo 对应的 thread,污染 LLM 上下文(Plan v3 Codex Round 3 BLOCKER)。
+    //   CCB(SubprocessRunner)是 long-running:!isRunning ⇒ 进程已死,
+    //   下次 submit() 会读最新 snapshot 起一个新 spawn,无需重置任何 in-memory 状态。
+    const isCodex = session.providerTag === 'codex-native'
+    if (!session.runner.isRunning && !isCodex) {
+      return // 没活进程且非 codex,下次 submit 会自然读最新 snapshot
     }
 
-    if (!shouldShutdown) return
+    const binding = session.runner.getBoundRepoBinding()
+    let shouldRecycle = false
+    if (newSnapshot === null) {
+      // null 走 unbind 路径,不该到这里;safety only
+      shouldRecycle = binding !== null
+    } else if (newSnapshot.status === 'ready') {
+      shouldRecycle =
+        !binding || binding.selectionVersion !== newSnapshot.selectionVersion
+    } else {
+      // cloning / failed / pending → 让 runner 继续在旧 binding(若有)dir 工作
+      shouldRecycle = false
+    }
 
-    // 串行化 shutdown:与 submit() 互斥,避免本 turn 中途被打断
+    if (!shouldRecycle) return
+
+    log.info('recycle-for-repo-change triggered', {
+      sessionKey: session.sessionKey,
+      sessionId,
+      providerTag: session.providerTag,
+      isRunning: session.runner.isRunning,
+      bindingVersion: binding?.selectionVersion ?? null,
+      newSnapshotVersion:
+        newSnapshot && newSnapshot.status === 'ready' ? newSnapshot.selectionVersion : null,
+    })
+
+    // 串行化 recycle:与 submit() 互斥,避免本 turn 中途被打断
     const prev = session.lock
     let release!: () => void
     session.lock = new Promise<void>((r) => (release = r))
     try {
       await prev
-      try {
-        await session.runner.shutdown()
-      } catch (err) {
-        log.warn(
-          'recycle-for-repo-change shutdown failed',
-          { sessionKey: session.sessionKey, sessionId },
-          err,
-        )
+      // Phase 5 G.2:codex-native 必须在 shutdown 之前清掉所有 thread / resume 残留。
+      //   原因:CodexRunner 即便 isRunning=false 也会保留 in-memory threadId,
+      //   且 _saveResumeMap 会从 live session.ccbSessionId 反推回 _resumeMap —
+      //   只清 _resumeMap 不够,必须同时清 session.ccbSessionId + 调 runner.clearSessionId
+      //   再 _saveResumeMap()。setExecutionTarget 已经是这套模式(Codex Round 2 BLOCKER)。
+      if (isCodex) {
+        this._resumeMap.delete(sessionKey)
+        this._resumeMapTimestamps.delete(sessionKey)
+        this._resumeMapProvider.delete(sessionKey)
+        this._resumeMapLastCost.delete(sessionKey)
+        session.ccbSessionId = null
+        session.runner.clearSessionId?.()
+        this._saveResumeMap()
+      }
+      // shutdown 只在子进程实际存活时调;codex per-turn 在 turn 间 isRunning=false
+      // 是常态,这里不应再 shutdown(否则 stop() 会试图 kill 一个不存在的 pid 浪费日志)。
+      if (session.runner.isRunning) {
+        try {
+          await session.runner.shutdown()
+        } catch (err) {
+          log.warn(
+            'recycle-for-repo-change shutdown failed',
+            { sessionKey: session.sessionKey, sessionId },
+            err,
+          )
+        }
       }
     } finally {
       release()
@@ -840,6 +892,11 @@ export class SessionManager {
           effortLevel: initialEffort,
           config: this.config,
           delegationDepth: opts.delegationDepth,
+          // Phase 5:与 SubprocessRunner 对称 — peerId(== sessionId)+
+          // 全局 snapshot provider。runner 在每轮 turn 顶部 capture 一次,
+          // 决定 thread/start.cwd / thread/resume.cwd / spawn cwd。
+          sessionId: opts.peerId,
+          getRepoSnapshot: this._getRepoSnapshot,
         }) as unknown as SubprocessRunner
       } else {
         runner = new CodexRunner({
@@ -853,6 +910,10 @@ export class SessionManager {
           effortLevel: initialEffort,
           config: this.config,
           delegationDepth: opts.delegationDepth,
+          // Phase 5:同上(per-turn `codex exec` 也需要按 repo binding
+          // 切 spawn cwd)。
+          sessionId: opts.peerId,
+          getRepoSnapshot: this._getRepoSnapshot,
         }) as unknown as SubprocessRunner
       }
     } else {
@@ -914,6 +975,10 @@ export class SessionManager {
       model: opts.agent.model ?? this.config.defaults.model,
       toolUseIdToName: new Map(),
       executionTarget: { kind: 'local' },
+      // Phase 5 G.0:固化 provider 路由信息,recyclePeerForRepoChange 用 providerTag
+      //   走 codex 专属重置分支(避免 instanceof / runner.constructor.name)。
+      providerTag,
+      agentProvider: opts.agent.provider,
     }
     runner.on('session_id', (id: string) => {
       session.ccbSessionId = id

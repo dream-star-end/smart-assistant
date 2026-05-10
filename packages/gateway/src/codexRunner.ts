@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from './codexLaunchOverrides.js'
+import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'codexRunner' })
@@ -137,6 +138,13 @@ export interface CodexRunnerOpts {
   config?: OpenClaudeConfig
   /** Forwarded to mcp-memory env so delegate_task can enforce recursion caps. */
   delegationDepth?: number
+  // ── Phase 5 GitHub session repo workspace integration ──
+  /** Session id (peerId)。和 SubprocessRunner.opts.sessionId 同语义,被 runner 作为 key
+   *  反查 `getRepoSnapshot()`,得到当前 turn 应该绑定的 repo workspace。Legacy caller
+   *  不传 → 整个 repo 绑定能力关闭。 */
+  sessionId?: string
+  /** snapshot provider — 由 SessionManager 注入(`this._getRepoSnapshot`)。 */
+  getRepoSnapshot?: (sessionId: string) => RepoSnapshot | null
 }
 
 /**
@@ -258,6 +266,11 @@ export class CodexRunner extends EventEmitter {
    *  fresh dir — re-using a stale entry would point codex at a deleted file. */
   private cachedOverrides: CodexLaunchOverrides | null = null
 
+  // ── Phase 5 GitHub session repo binding (parity with SubprocessRunner) ──
+  /** ready 时记录 selectionVersion+workspaceDir;recyclePeerForRepoChange 据此版本对比。
+   *  非 ready / 无 binding / 无 sessionId = null。 */
+  private _boundRepoBinding: { selectionVersion: number; workspaceDir: string } | null = null
+
   // ── Interface parity with SubprocessRunner ──
   // These are referenced by sessionManager / server and must exist even if
   // they are no-ops for the codex backend.
@@ -315,6 +328,76 @@ export class CodexRunner extends EventEmitter {
     this.opts.model = model
   }
 
+  // ── Phase 5 GitHub session repo binding (parity with SubprocessRunner) ──
+
+  /** Public getter consumed by sessionManager.recyclePeerForRepoChange。 */
+  getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null {
+    return this._boundRepoBinding
+  }
+
+  /** Forget per-thread / per-spawn cached state so the next turn rebuilds
+   *  from scratch。Used by sessionManager.recyclePeerForRepoChange when repo
+   *  binding version changes;recycle 在 isRunning=false 的 per-turn idle 窗口
+   *  (turn 间隔)不会调 shutdown(),所以这里必须自带"把缓存的 launch overrides
+   *  也作废"的语义,否则:
+   *    - threadId 清了,但 cachedOverrides 仍是旧 repo 的 instructions 文件,
+   *      ensureLaunchOverrides() 命中缓存直接返,新 turn 的 spawn cwd 切到新
+   *      repo,但 -c model_instructions_file 还是旧 repo 的 REPO slot。
+   *      物理 cwd 与系统提示里的 REPO 又分裂(本次修复要根治的就是这个)。
+   *
+   *  清理动作(对齐 CodexAppServerRunner.clearSessionId):
+   *    - threadId(下次 buildArgs 走 fresh `codex exec`,不带 `resume` 子命令)
+   *    - sessionDir + cachedOverrides(下次 ensureLaunchOverrides() rebuild
+   *      against 当前 repo snapshot)
+   *
+   *  注意:CodexRunner 没有 token-usage baseline 状态(per-turn exec 不维护
+   *  cumulative),所以 vs CodexAppServerRunner.clearSessionId 少 3 个 baseline
+   *  字段重置。 */
+  clearSessionId(): void {
+    this.threadId = null
+    if (this.sessionDir) {
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch (err) {
+        log.warn('codex clearSessionId sessionDir cleanup failed', {
+          sessionDir: this.sessionDir,
+          err: (err as Error).message,
+        })
+      }
+      this.sessionDir = null
+    }
+    this.cachedOverrides = null
+  }
+
+  /** 读当前 session 的 repo snapshot(turn 顶部一次取,贯穿 spawn cwd / launch overrides
+   *  REPO slot 两个消费点)。 */
+  private _currentRepoSnapshot(): RepoSnapshot | null {
+    if (!this.opts.sessionId || !this.opts.getRepoSnapshot) return null
+    try {
+      return this.opts.getRepoSnapshot(this.opts.sessionId)
+    } catch (err) {
+      log.warn('getRepoSnapshot threw; treating as no-bind', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
+      return null
+    }
+  }
+
+  /** 同 codexAppServerRunner 同名方法。ready+workspaceDir → 用 workspaceDir + 记 binding;
+   *  否则回退 opts.cwd + binding=null。 */
+  private _applyRepoBindingFromSnapshot(snap: RepoSnapshot | null): string {
+    if (snap?.status === 'ready' && snap.workspaceDir) {
+      this._boundRepoBinding = {
+        selectionVersion: snap.selectionVersion,
+        workspaceDir: snap.workspaceDir,
+      }
+      return snap.workspaceDir
+    }
+    this._boundRepoBinding = null
+    return this.opts.cwd
+  }
+
   sendPermissionResponse(_requestId: string, _response: unknown): boolean {
     // codex has its own sandbox approval flow (workspace-write) — gateway
     // permission prompts are never emitted by this runner, so nothing to
@@ -341,8 +424,13 @@ export class CodexRunner extends EventEmitter {
   /** Lazy-build codex launch overrides (instructions file + mcp-memory config)
    *  and cache the result for the lifetime of the current proc. Cleared in
    *  `shutdown()` and `updateConfig()` so the next spawn rebuilds. Returns
-   *  null when `opts.config` is not provided (legacy "naked codex" path). */
-  private async ensureLaunchOverrides(): Promise<CodexLaunchOverrides | null> {
+   *  null when `opts.config` is not provided (legacy "naked codex" path).
+   *
+   *  `repoSnap` 由 caller(`runTurn`)从 turn 顶部的单一 snapshot 透传过来,贯穿
+   *  spawn cwd 与 REPO slot 两个消费点。 */
+  private async ensureLaunchOverrides(
+    repoSnap: RepoSnapshot | null,
+  ): Promise<CodexLaunchOverrides | null> {
     if (!this.opts.config) return null
     if (this.cachedOverrides && this.sessionDir) return this.cachedOverrides
     // Cache miss with an existing sessionDir means updateConfig (or some other
@@ -374,6 +462,8 @@ export class CodexRunner extends EventEmitter {
         gatewayPort: this.opts.config.gateway.port,
         gatewayToken: this.opts.config.gateway.accessToken,
         delegationDepth: this.opts.delegationDepth,
+        // Phase 5:repoSnap 透传 → buildPromptContext 的 REPO slot,系统提示带仓库元信息。
+        repoSnapshot: repoSnap,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
       // v3 hardening: write the gateway token to a 0600 file in sessionDir so
@@ -508,6 +598,10 @@ export class CodexRunner extends EventEmitter {
 
   private async runTurn(prompt: string): Promise<void> {
     const startedAt = Date.now()
+    // Phase 5:turn 顶部一次取 snapshot,贯穿 spawn cwd 与 launch overrides REPO slot
+    // 两个消费点。任何中途取的写法都会出现撕裂窗口。
+    const repoSnap = this._currentRepoSnapshot()
+    const effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
     // Build platform context overrides BEFORE spawn so the codex process sees
     // model_instructions_file + mcp-memory from its first interaction. If
     // override generation fails (mcp-memory entry resolution etc.) we still
@@ -515,7 +609,7 @@ export class CodexRunner extends EventEmitter {
     // subprocessRunner's "skip built-in MCP, log warn" branch.
     let argvOverrides: string[] = []
     try {
-      const overrides = await this.ensureLaunchOverrides()
+      const overrides = await this.ensureLaunchOverrides(repoSnap)
       if (overrides) argvOverrides = overrides.argvOverrides
     } catch (err) {
       log.warn('codex launch overrides build failed; spawning without platform context', {
@@ -529,6 +623,8 @@ export class CodexRunner extends EventEmitter {
       resumed: this.threadId != null,
       promptChars: prompt.length,
       hasOverrides: argvOverrides.length > 0,
+      effectiveCwd,
+      repoBound: this._boundRepoBinding != null,
     })
 
     return new Promise<void>((resolve) => {
@@ -542,7 +638,7 @@ export class CodexRunner extends EventEmitter {
       let proc: ChildProcessWithoutNullStreams
       try {
         proc = _spawnFn('codex', args, {
-          cwd: this.opts.cwd,
+          cwd: effectiveCwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           env: buildCodexEnv(),
         }) as ChildProcessWithoutNullStreams

@@ -9,16 +9,20 @@
  *
  * Phase 5 字段语义(三个 dir 的角色,易混要点):
  *   - ccbBinaryDir   : CCB(claude-code-best)二进制 / 入口文件所在目录。
- *                      Local 模式 = 子进程真 cwd(node/bun 启动时的 working dir);
+ *                      Local 模式回退 cwd(若 caller 未给 subprocessCwd 时);
  *                      Docker 模式挂为 /opt/ccb,容器内进程从这里读 entry 文件。
  *   - workspaceHostDir: 项目工作目录(host 上的绝对路径)。
- *                      Local 模式不直接用作 cwd(子进程 cwd 仍是 ccbBinaryDir),
- *                      但通过 CCB 的 --add-dir / --workspace 参数被识别为项目根;
  *                      Docker 模式挂为 /workspace 并设为容器内默认 -w 目录。
+ *                      Local 模式 caller 通常会同时把它作为 subprocessCwd 传入。
+ *   - subprocessCwd  : (Phase 5 v1.0.x 新增)Local 模式子进程的真 cwd。
+ *                      caller(SubprocessRunner / Codex 系 runner)负责按 repo
+ *                      binding ready/未 ready 决定该值是 workspaceDir 还是
+ *                      agentBaseDir。缺省回退 ccbBinaryDir(老行为)。
+ *                      Docker 模式忽略此字段(容器 cwd 由 -w 控制)。
  *
- * 注:CCB 进程本身的实际 cwd 在 Local 模式下并不指向项目目录,所以"项目目录的语义"
- * 是通过 CLI args (--add-dir) 传给 CCB,而不是通过 process.cwd() 推断的。这是
- * 既有行为,Phase 5 不改动。
+ * 历史遗留:旧版 LocalBackend 把 cwd 硬编码为 ccbBinaryDir,导致 CCB / codex
+ * 子进程的 process.cwd() 永远指向二进制所在目录,与系统提示中"Bash 默认 cwd
+ * 已指向项目目录"自相矛盾。Phase 5 通过 subprocessCwd 字段修正这个语义错位。
  */
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { createLogger } from './logger.js'
@@ -50,8 +54,12 @@ export interface SpawnOpts {
   stdio: ['pipe', 'pipe', 'pipe']
   detached?: boolean
   /** 项目工作目录(host 路径)。Docker 挂为 /workspace + -w。Local 模式由 CCB
-   *  通过 --add-dir 等 CLI 参数识别为项目根,不直接用作子进程 cwd。 */
+   *  通过 --add-dir 等 CLI 参数识别为项目根,本身不作为 cwd(见 subprocessCwd)。 */
   workspaceHostDir?: string
+  /** Local 模式子进程的真 cwd(host 路径)。caller 负责按 repo binding
+   *  ready/未 ready 选择 workspaceDir 或 agentBaseDir。缺省 = ccbBinaryDir
+   *  (老行为)。Docker 模式忽略(容器 cwd 由 -w 控制)。 */
+  subprocessCwd?: string
 }
 
 export interface TerminalBackend {
@@ -62,8 +70,10 @@ export interface TerminalBackend {
 
 export class LocalBackend implements TerminalBackend {
   spawn(opts: SpawnOpts): ChildProcessWithoutNullStreams {
+    // subprocessCwd 优先(Phase 5 caller 显式指定项目目录);缺省退回 ccbBinaryDir
+    // 保持老行为,避免不传 subprocessCwd 的 caller(若有)出现意外破坏。
     return spawn(opts.command, opts.args, {
-      cwd: opts.ccbBinaryDir,
+      cwd: opts.subprocessCwd ?? opts.ccbBinaryDir,
       env: opts.env,
       stdio: opts.stdio,
       detached: opts.detached,

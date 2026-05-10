@@ -35,6 +35,7 @@ import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
+import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
 
@@ -213,6 +214,12 @@ export interface CodexLaunchOverridesContext {
   /** Optional override of OPENCLAUDE_HOME for the mcp-memory child. Defaults
    *  to `process.env.OPENCLAUDE_HOME ?? ''` (matching subprocessRunner). */
   openclaudeHome?: string
+  /** Phase 5:GitHub session repo binding 快照。caller 在 spawn 前一次性取出,
+   *  和 effectiveCwd 用同一份 snapshot,避免 launch overrides 与 spawn cwd 撕裂。
+   *  ready 状态时,promptSlots 的 REPO slot 会注入仓库路径与基本元信息,让 codex
+   *  从系统提示中就知道当前绑定到哪个项目;非 ready / null 时 REPO slot 不输出。
+   *  无 sessionId 注入(legacy 路径)的 caller 直接传 undefined。 */
+  repoSnapshot?: RepoSnapshot | null
 }
 
 export interface CodexLaunchOverrides {
@@ -278,6 +285,10 @@ export async function buildCodexLaunchOverrides(
     provider: ctx.provider,
     model: ctx.model,
     effortLevel: ctx.effortLevel,
+    // Phase 5:repo binding 信息透传给 REPO slot。SubprocessRunner 已通过
+    // buildLearningContext(repoSnapshot) → buildPromptContext 走通,这里给两个
+    // codex 路径补齐,让 codex 子进程也看到 REPO slot(系统提示里的仓库元信息)。
+    repoSnapshot: ctx.repoSnapshot ?? undefined,
   })
   const instructionsContent = `${CODEX_PREAMBLE}${platformResult.content}`
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
