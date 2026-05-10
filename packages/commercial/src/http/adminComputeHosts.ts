@@ -39,7 +39,7 @@ import {
   adminDistributeImageToHost,
 } from "../admin/computeHosts.js";
 import { listContainers } from "../admin/containers.js";
-import { serializeContainer } from "./admin.js";
+import { serializeContainer } from "./admin/containers.js";
 import * as queries from "../compute-pool/queries.js";
 import { mapRowToHost } from "../compute-pool/types.js";
 import { listAuditEventsForHost } from "../compute-pool/audit.js";

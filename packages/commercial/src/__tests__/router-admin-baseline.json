@@ -1,0 +1,476 @@
+[
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/agent-audit",
+    "handler": "handleAdminAgentAudit"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/users",
+    "handler": "handleAdminListUsers"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/users/stats",
+    "handler": "handleAdminUsersStats"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/users/",
+    "handler": "handleAdminAdjustCredits"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/users/",
+    "handler": "handleAdminGetUser"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/users/",
+    "handler": "handleAdminPatchUser"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/users/",
+    "handler": "handleAdminRemoveUserModelGrant"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/audit",
+    "handler": "handleAdminListAudit"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/pricing",
+    "handler": "handleAdminListPricing"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/pricing/",
+    "handler": "handleAdminPatchPricing"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/plans",
+    "handler": "handleAdminListPlans"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/plans/",
+    "handler": "handleAdminPatchPlan"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts",
+    "handler": "handleAdminListAccounts"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts",
+    "handler": "handleAdminCreateAccount"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts/stats",
+    "handler": "handleAdminAccountsStats"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts/refresh-events",
+    "handler": "handleAdminListRefreshEvents"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts/oauth/start",
+    "handler": "handleAdminOAuthStart"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts/oauth/exchange",
+    "handler": "handleAdminOAuthExchange"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/",
+    "handler": "handleAdminResetAccountCooldown"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/",
+    "handler": "handleAdminGetAccount"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/",
+    "handler": "handleAdminPatchAccount"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/",
+    "handler": "handleAdminDeleteAccount"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/egress-proxies",
+    "handler": "handleAdminListEgressProxies"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/egress-proxies",
+    "handler": "handleAdminCreateEgressProxy"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/egress-proxies/",
+    "handler": "handleAdminGetEgressProxy"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/egress-proxies/",
+    "handler": "handleAdminPatchEgressProxy"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/egress-proxies/",
+    "handler": "handleAdminDeleteEgressProxy"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/agent-containers",
+    "handler": "handleAdminListAgentContainers"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/agent-containers/stats",
+    "handler": "handleAdminContainersStats"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/agent-containers/",
+    "handler": "handleAdminContainerLogs"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/agent-containers/",
+    "handler": "handleAdminAgentContainerAction"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/ledger.csv",
+    "handler": "handleAdminExportLedgerCsv"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/ledger",
+    "handler": "handleAdminListLedger"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/users.csv",
+    "handler": "handleAdminExportUsersCsv"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/orders.csv",
+    "handler": "handleAdminExportOrdersCsv"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/diagnostics",
+    "handler": "handleAdminDiagnostics"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/metrics",
+    "handler": "handleAdminMetrics"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/dau",
+    "handler": "handleAdminStatsDau"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/revenue-by-day",
+    "handler": "handleAdminStatsRevenueByDay"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/signups-by-day",
+    "handler": "handleAdminStatsSignupsByDay"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/funnel",
+    "handler": "handleAdminStatsFunnel"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/request-series",
+    "handler": "handleAdminStatsRequestSeries"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/alerts-summary",
+    "handler": "handleAdminStatsAlertsSummary"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/account-pool",
+    "handler": "handleAdminStatsAccountPool"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/hosts-utilization",
+    "handler": "handleAdminStatsHostsUtilization"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/stats/alert-events-7d",
+    "handler": "handleAdminStatsAlertEvents7d"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/settings",
+    "handler": "handleAdminListSettings"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/settings/",
+    "handler": "handleAdminGetSetting"
+  },
+  {
+    "method": "PUT",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/settings/",
+    "handler": "handleAdminPutSetting"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/events",
+    "handler": "handleAdminAlertsListEvents"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/events/coverage",
+    "handler": "handleListEventCoverage"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/channels",
+    "handler": "handleAdminAlertsListChannels"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/ilink/qrcode",
+    "handler": "handleAdminAlertsIlinkQrcode"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/ilink/poll",
+    "handler": "handleAdminAlertsIlinkPoll"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/outbox",
+    "handler": "handleAdminAlertsListOutbox"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/silences",
+    "handler": "handleAdminAlertsListSilences"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/silences",
+    "handler": "handleAdminAlertsCreateSilence"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/rule-states",
+    "handler": "handleAdminAlertsListRuleStates"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/alerts/outbox/",
+    "handler": "handleAdminAlertsRetryOutbox"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/alerts/rules/",
+    "handler": "handleAdminAlertsAckRule"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/channels/telegram",
+    "handler": "handleAdminAlertsCreateTelegramChannel"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/alerts/channels/",
+    "handler": "handleAdminAlertsPatchChannel"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/alerts/channels/",
+    "handler": "handleAdminAlertsDeleteChannel"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/alerts/channels/",
+    "handler": "handleAdminAlertsTestChannel"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/alerts/silences/",
+    "handler": "handleAdminAlertsDeleteSilence"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/v3/compute-hosts",
+    "handler": "handleAdminListComputeHosts"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/v3/compute-hosts/add",
+    "handler": "handleAdminAddComputeHost"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/v3/baseline-version",
+    "handler": "handleAdminBaselineVersion"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/v3/distribute-image",
+    "handler": "handleAdminDistributeImageToAllHosts"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/v3/compute-hosts/",
+    "handler": "handleAdminComputeHostGetSubresource"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/v3/compute-hosts/",
+    "handler": "handleAdminComputeHostAction"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/orders",
+    "handler": "handleAdminListOrders"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/orders/kpi",
+    "handler": "handleAdminOrdersKpi"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/orders/",
+    "handler": "handleAdminGetOrder"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/feedback",
+    "handler": "handleAdminListFeedback"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/feedback/",
+    "handler": "handleAdminAckFeedback"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/messages",
+    "handler": "handleAdminListInbox"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/messages",
+    "handler": "handleAdminCreateInbox"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/messages/",
+    "handler": "handleAdminDeleteInbox"
+  }
+]

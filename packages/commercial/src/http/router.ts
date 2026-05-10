@@ -78,17 +78,24 @@ import {
   handleRemoteHostAction,
 } from './remoteHosts.js'
 import { handleAdminAgentAudit } from './adminAudit.js'
+// S3 §6.2 终局:admin handler 直接从各拆分文件 import,admin.ts barrel 已删。
 import {
   handleAdminListUsers,
   handleAdminUsersStats,
   handleAdminGetUser,
   handleAdminPatchUser,
   handleAdminAdjustCredits,
-  handleAdminListAudit,
+} from './admin/users.js'
+import { handleAdminListAudit } from './admin/audit.js'
+import {
   handleAdminListPricing,
   handleAdminPatchPricing,
+} from './admin/pricing.js'
+import {
   handleAdminListPlans,
   handleAdminPatchPlan,
+} from './admin/plans.js'
+import {
   handleAdminListAccounts,
   handleAdminAccountsStats,
   handleAdminListRefreshEvents,
@@ -99,33 +106,47 @@ import {
   handleAdminResetAccountCooldown,
   handleAdminOAuthStart,
   handleAdminOAuthExchange,
+} from './admin/accounts.js'
+import {
   handleAdminListEgressProxies,
   handleAdminGetEgressProxy,
   handleAdminCreateEgressProxy,
   handleAdminPatchEgressProxy,
   handleAdminDeleteEgressProxy,
+} from './admin/egressProxies.js'
+import {
   handleAdminListAgentContainers,
   handleAdminContainersStats,
   handleAdminContainerLogs,
   handleAdminAgentContainerAction,
-  handleAdminListLedger,
+} from './admin/containers.js'
+import { handleAdminListLedger } from './admin/ledger.js'
+import {
   handleAdminExportLedgerCsv,
   handleAdminExportUsersCsv,
   handleAdminExportOrdersCsv,
-  handleAdminMetrics,
+} from './admin/export.js'
+import { handleAdminMetrics } from './admin/metrics.js'
+import {
   handleAdminListSettings,
   handleAdminGetSetting,
   handleAdminPutSetting,
+} from './admin/settings.js'
+import {
   handleAdminListOrders,
   handleAdminOrdersKpi,
   handleAdminGetOrder,
+} from './admin/orders.js'
+import {
   handleAdminListFeedback,
   handleAdminAckFeedback,
+} from './admin/feedback.js'
+import {
   handleAdminListInbox,
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
-  handleAdminRemoveUserModelGrant,
-} from './admin.js'
+} from './admin/inbox.js'
+import { handleAdminRemoveUserModelGrant } from './admin/modelGrants.js'
 import {
   handleAdminStatsDau,
   handleAdminStatsRevenueByDay,
