@@ -4982,6 +4982,23 @@ a:hover {
   border: 1px solid color-mix(in srgb, var(--accent, #7c3aed) 24%, transparent);
 }
 
+/* 充值模态底部的客服联系方式 — 三个 stage 通用,刻意低调避免喧宾夺主。 */
+.topup-support {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  margin: var(--space-4) 0 0;
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--border);
+  text-align: center;
+}
+.topup-support-id {
+  font-family: var(--mono, monospace);
+  color: var(--fg);
+  font-weight: 600;
+  user-select: all;
+  margin-left: 4px;
+}
+
 .topup-qr-wrap {
   display: flex;
   flex-direction: column;
