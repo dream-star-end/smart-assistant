@@ -11,7 +11,12 @@ claude-code-best/node_modules/
 claude-code-best/dist/
 
 # 编译产物,不进 git(rsync 仍会推到部署目标)
-packages/commercial/node-agent/node-agent
+# 通配也覆盖临时编译产物(如 node-agent.new)
+packages/commercial/node-agent/node-agent*
+
+# .claude/ 仅跟踪 CLAUDE.md,本地工作笔记/计划草稿一律忽略
+.claude/*
+!.claude/CLAUDE.md
 
 # S12a — TypeScript composite emit (only .d.ts since emitDeclarationOnly:true)
 # Use ** so 嵌套 workspace 包(如 packages/channels/wechat/)也覆盖
