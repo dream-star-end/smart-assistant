@@ -1246,3 +1246,62 @@ describe("userChatBridge — earlyClose during CONNECTING containerWs (regressio
     }
   });
 });
+
+// ─── tryAutoRebindFlush — wedge regression tripwire (v1.0.119) ────────────
+//
+// 真根因 (2026-05-09 prod wedge):tryAutoRebindFlush finally 块仅判
+// pendingRebindMap.size > 0 就同步递归调自己。当 hello peers 与
+// pendingRebindMap.sessionIds 不交集时,buildAutoRebindFrames 返回
+// matchedSessionIds=[],没消化任何 row,size 不变,finally 立即再次自调,
+// V8 microtask 永远 spin → healthz timeout → systemd watchdog SIGKILL → wedge。
+//
+// 修复:加 `progressMade` 门控,只在本轮真消化了 row 时才再触发。
+//
+// 该函数是 upgrade handler 闭包内的局部函数,无法直接单测。这里用静态属性
+// tripwire — 扫 userChatBridge.ts 源码确保 progressMade 门控存在,防止有人
+// 未来把 bug 改回去。配套 docs/v3/code-review-checklist.md §1。
+describe("tryAutoRebindFlush regression tripwire", () => {
+  test("source contains progressMade gate in finally block", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = path.dirname(url.fileURLToPath(import.meta.url));
+    const raw = fs.readFileSync(
+      path.resolve(here, "..", "ws", "userChatBridge.ts"),
+      "utf8",
+    );
+    // 剥块注释 + 行注释,防 comment-only false positive
+    // (注释里带 "progressMade" 文案不能蒙混过关)
+    const src = raw
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "");
+
+    // 1) 闭包里有 progressMade 标志
+    assert.match(
+      src,
+      /let\s+progressMade\s*=\s*false/,
+      "tryAutoRebindFlush 必须声明 progressMade=false (wedge 修复 v1.0.119)",
+    );
+    // 2) try 块里 matchedSessionIds.length > 0 时置位
+    assert.match(
+      src,
+      /matchedSessionIds\.length\s*>\s*0\s*\)\s*progressMade\s*=\s*true/,
+      "progressMade 必须在 matchedSessionIds.length > 0 时置 true",
+    );
+    // 3) finally 块里再触发 tryAutoRebindFlush 的 if 条件中必须包含 progressMade。
+    //    bug 还原:`if (pendingRebindMap.size > 0) tryAutoRebindFlush();` 同步递归 →
+    //    V8 microtask 死循环。修复:`if (progressMade && ...) tryAutoRebindFlush()`。
+    //    匹配 finally{...} 块里的 `if ( ... progressMade ... ) ... tryAutoRebindFlush(`,
+    //    确保是真实代码条件而非注释。
+    const finallyBlock = src.match(
+      /finally\s*\{[\s\S]*?autoRebindFlushInFlight\s*=\s*false[\s\S]*?\}/,
+    );
+    assert.ok(finallyBlock, "找不到 tryAutoRebindFlush 的 finally 块");
+    assert.match(
+      finallyBlock![0],
+      /if\s*\([^)]*progressMade[\s\S]*?tryAutoRebindFlush\s*\(/,
+      "finally 块里再触发 tryAutoRebindFlush 的 if 条件必须包含 progressMade," +
+        "不能只看 size > 0 (会触发 V8 microtask 死循环 — 见 v1.0.119 复盘)",
+    );
+  });
+});
