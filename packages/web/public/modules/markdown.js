@@ -405,9 +405,134 @@ export function embedMediaUrls(html) {
   return html
 }
 
+// ── Codex/KaTeX delimiter extensions (\(...\) and \[...\]) ──
+// Codex (and ChatGPT) emit math with LaTeX-standard delimiters \(...\) and \[...\],
+// not the $...$ / $$...$$ that mathBlock/mathInline recognize. marked treats `\[`
+// and `\(` as escaped ASCII punctuation — the backslash gets eaten and only a bare
+// `[` / `(` remains, leaving raw TeX visible to the user.
+//
+// We register two dedicated marked extensions that recognize these delimiters
+// directly, bypassing any $/$$ middleman. An earlier approach normalized to $/$$
+// pre-parse, but mathInline's word-boundary heuristics rejected digit-prefix
+// inputs like `\(2x\)` even with ZWS sentinel padding. The fix is to stop
+// piggy-backing on mathInline's rules and emit our own tokens.
+//
+// Math body scanner — `\\X` (any X) skip-2 handles TeX backslash escapes
+// (`\\\\` line break, `\)` literal closer-paren in body, etc.). Multi-line
+// allowed for display, line-bound for inline. Returned shape:
+//   { closer: idx, dead: false } — found `\${closeChar}` at idx
+//   { closer: -1, dead: true }   — display: scanned EOF, no closer in entire src
+//   { closer: -1, dead: false }  — inline: hit newline; display: shouldn't occur
+//
+// Pulled out of the extension closures so pureFunctions.test.ts can test it
+// (the marked extension code itself depends on `marked` + `pendingMath` + DOM).
+function _scanCodexMathBody(src, start, closeChar, allowNewline) {
+  const n = src.length
+  let p = start
+  while (p < n) {
+    const c = src[p]
+    if (c === '\n' && !allowNewline) {
+      return { closer: -1, dead: false }
+    }
+    if (c === '\\') {
+      const next = src[p + 1]
+      if (next === closeChar) {
+        return { closer: p, dead: false }
+      }
+      if (next === '\\') {
+        p += 2
+        continue
+      }
+      p++
+      continue
+    }
+    p++
+  }
+  // EOF reached — only "dead" if multi-line scan (= unclosed display math
+  // means no `\]` exists anywhere from `start` onwards in src).
+  return { closer: -1, dead: allowNewline }
+}
+
+// Module-level dead flag — set by codexDisplayMath tokenizer when a scan reaches
+// EOF without finding `\]`. Subsequent openers in the same parse fast-fail in
+// `start()`, preventing O(n²) on inputs with many unclosed `\[` openers. Reset
+// at the entry of renderMarkdown / renderStreamingMarkdown so each render call
+// gets a fresh budget.
+let _codexDisplayMathDead = false
+
+if (window.marked) {
+  marked.use({
+    extensions: [
+      {
+        name: 'codexDisplayMath',
+        level: 'block',
+        start(src) {
+          if (_codexDisplayMathDead) return undefined
+          // \[ at start of src OR right after a \n (block-level: line-anchored)
+          const m = /(?:^|\n)\\\[/.exec(src)
+          if (!m) return undefined
+          return src[m.index] === '\\' ? m.index : m.index + 1
+        },
+        tokenizer(src) {
+          // marked may call tokenizer with the full remaining src on its first
+          // try; guard that we're actually positioned on `\[`. (Same pattern as
+          // mathInline above.)
+          if (src[0] !== '\\' || src[1] !== '[') return
+          const result = _scanCodexMathBody(src, 2, ']', true)
+          if (result.dead) {
+            _codexDisplayMathDead = true
+            return
+          }
+          if (result.closer < 0) return
+          const tex = src.slice(2, result.closer).trim()
+          if (!tex) return
+          const raw = src.slice(0, result.closer + 2)
+          return { type: 'codexDisplayMath', raw, text: tex }
+        },
+        renderer(token) {
+          if (_isStreamingParse) {
+            return `<p>${htmlSafeEscape(`\\[${token.text}\\]`)}</p>`
+          }
+          const id = `math-${Math.random().toString(36).slice(2, 10)}`
+          pendingMath.push({ id, tex: token.text, display: true })
+          return `<div class="math-block" id="${id}"></div>`
+        },
+      },
+      {
+        name: 'codexInlineMath',
+        level: 'inline',
+        start(src) {
+          // No need for word-boundary check — `\(` is unambiguous in Markdown
+          // (marked normally would interpret it as escaped `(`, that's the bug).
+          const idx = src.indexOf('\\(')
+          return idx < 0 ? undefined : idx
+        },
+        tokenizer(src) {
+          if (src[0] !== '\\' || src[1] !== '(') return
+          const result = _scanCodexMathBody(src, 2, ')', false)
+          if (result.closer < 0) return
+          const tex = src.slice(2, result.closer).trim()
+          if (!tex) return
+          const raw = src.slice(0, result.closer + 2)
+          return { type: 'codexInlineMath', raw, text: tex }
+        },
+        renderer(token) {
+          if (_isStreamingParse) {
+            return htmlSafeEscape(`\\(${token.text}\\)`)
+          }
+          const id = `math-${Math.random().toString(36).slice(2, 10)}`
+          pendingMath.push({ id, tex: token.text, display: false })
+          return `<span class="math-inline" id="${id}"></span>`
+        },
+      },
+    ],
+  })
+}
+
 export function renderMarkdown(text) {
   if (!text) return ''
   if (!window.marked) return embedMediaUrls(htmlSafeEscape(text).replace(/\n/g, '<br>'))
+  _codexDisplayMathDead = false
   try {
     const html = marked.parse(text)
     if (!window.DOMPurify) {
@@ -477,6 +602,7 @@ export function renderStreamingMarkdown(text) {
   if (!text) return ''
   const renderer = _getStreamingRenderer()
   if (!renderer || !window.marked) return htmlSafeEscape(text).replace(/\n/g, '<br>')
+  _codexDisplayMathDead = false
   _isStreamingParse = true
   try {
     const html = marked.parse(text, { renderer })

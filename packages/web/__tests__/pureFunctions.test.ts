@@ -284,6 +284,151 @@ describe('T09: buildToolUseLabel — tool use display', () => {
   })
 })
 
+// ── T-LATEX: _scanCodexMathBody (markdown.js, 2026-05-05 Codex \[...\] 渲染修复) ──
+//
+// Codex/ChatGPT 输出 LaTeX 公式默认用 \(...\) 和 \[...\] 分隔符,marked 把 `\[`/`\(`
+// 当 ASCII 标点 escape 吞反斜杠 → 用户看到裸 `[`/`(`。修法:在 markdown.js 注册两个
+// 专用 marked extension(`codexDisplayMath` block-level / `codexInlineMath` inline-
+// level),直接消化 \[..\] / \(..\),不再走 $...$ 中转(老方案的 ZWS sentinel 还是
+// 卡在 mathInline 拒绝 digit-prefix `\(2x\)` 的边界规则上)。
+//
+// 这里测试的是从 closure 里抽出的内部 scanner — 给定 src/start/closeChar 找到 `\X`
+// 闭合并跳过 `\\X`(TeX 反斜杠 escape,含 `\\\\` 行末换行)。dead 标记仅 multi-line
+// scan 才会置位,用来在主 marked 入口短路 1000 个未闭合 `\[` 的 O(n²) 退化场景。
+//
+// 完整渲染(extension → marked.parse → KaTeX placeholder)需要浏览器环境的 marked
+// + DOMPurify,不能在纯函数测试里跑。这里只断言 scanner 的契约。
+type ScanResult = { closer: number; dead: boolean }
+const _scanCodexMathBody = makeCallable<
+  (src: string, start: number, closeChar: string, allowNewline: boolean) => ScanResult
+>(extractFunction(appJs, '_scanCodexMathBody'))
+
+describe('T-LATEX: _scanCodexMathBody — Codex/KaTeX 分隔符 body scanner', () => {
+  it('inline body: simple closer at index', () => {
+    // 'x\)' — index 1 is the `\` of `\)` closer
+    const r = _scanCodexMathBody('x\\)', 0, ')', false)
+    assert.deepEqual(r, { closer: 1, dead: false })
+  })
+  it('display body: simple closer at index', () => {
+    const r = _scanCodexMathBody('x\\]', 0, ']', true)
+    assert.deepEqual(r, { closer: 1, dead: false })
+  })
+  it('inline body: TeX \\\\ escape skipped (does not close at the second \\)', () => {
+    // 'a \\ b\)' — middle `\\` is TeX line break (skip 2), must not be confused
+    // for closer. 8 chars total: a, space, \, \, space, b, \, ). Closer `\` at idx 6.
+    const r = _scanCodexMathBody('a \\\\ b\\)', 0, ')', false)
+    assert.equal(r.closer, 6)
+    assert.equal(r.dead, false)
+  })
+  it('display body: TeX \\\\ escape skipped', () => {
+    const r = _scanCodexMathBody('a \\\\ b\\]', 0, ']', true)
+    assert.equal(r.closer, 6)
+    assert.equal(r.dead, false)
+  })
+  it('inline body: hits newline → no closer, NOT dead', () => {
+    const r = _scanCodexMathBody('x\nbar\\)', 0, ')', false)
+    assert.deepEqual(r, { closer: -1, dead: false })
+  })
+  it('display body: newline allowed, closer found across lines', () => {
+    const r = _scanCodexMathBody('x\nbar\\]', 0, ']', true)
+    assert.equal(r.closer, 5)
+    assert.equal(r.dead, false)
+  })
+  it('inline body: EOF without closer → no closer, NOT dead (line-bound budget)', () => {
+    const r = _scanCodexMathBody('x bar', 0, ')', false)
+    assert.deepEqual(r, { closer: -1, dead: false })
+  })
+  it('display body: EOF without closer → DEAD (no `\\]` in remaining doc)', () => {
+    const r = _scanCodexMathBody('x bar', 0, ']', true)
+    assert.deepEqual(r, { closer: -1, dead: true })
+  })
+  it('display body: empty input', () => {
+    const r = _scanCodexMathBody('', 0, ']', true)
+    assert.deepEqual(r, { closer: -1, dead: true })
+  })
+  it('inline body: empty input → no closer, NOT dead', () => {
+    const r = _scanCodexMathBody('', 0, ')', false)
+    assert.deepEqual(r, { closer: -1, dead: false })
+  })
+  it('inline body: closer at very start (\\) at idx 0)', () => {
+    const r = _scanCodexMathBody('\\)', 0, ')', false)
+    assert.deepEqual(r, { closer: 0, dead: false })
+  })
+  it('inline body: lone trailing backslash at EOF does not crash', () => {
+    const r = _scanCodexMathBody('x\\', 0, ')', false)
+    assert.deepEqual(r, { closer: -1, dead: false })
+  })
+  it('display body: \\) inside body does not match \\] closer', () => {
+    const r = _scanCodexMathBody('a\\)b\\]', 0, ']', true)
+    assert.equal(r.closer, 4)
+    assert.equal(r.dead, false)
+  })
+  it('inline body: \\] inside body does not match \\) closer', () => {
+    const r = _scanCodexMathBody('a\\]b\\)', 0, ')', false)
+    assert.equal(r.closer, 4)
+    assert.equal(r.dead, false)
+  })
+  it('digit-prefix body \\(2x\\): scanner finds closer (the bug that ZWS approach failed)', () => {
+    const r = _scanCodexMathBody('2x\\)', 0, ')', false)
+    assert.equal(r.closer, 2)
+    assert.equal(r.dead, false)
+  })
+  it('regression: original Codex bug-report display formula body scans cleanly', () => {
+    const formula = '\\eta_\\varphi = \\frac{1}{N}+\\left(1-\\frac{1}{N}\\right)e^{-\\sigma_\\varphi^2}'
+    const src = `${formula}\\]`
+    const r = _scanCodexMathBody(src, 0, ']', true)
+    assert.equal(r.closer, src.length - 2)
+    assert.equal(r.dead, false)
+    assert.equal(src.slice(0, r.closer), formula)
+  })
+  it('start offset: skip leading chars', () => {
+    const r = _scanCodexMathBody('garbage x\\)', 8, ')', false)
+    assert.equal(r.closer, 9)
+    assert.equal(r.dead, false)
+  })
+  it('many-unclosed-\\[ pathological: single scan still linear (≪ 500ms)', () => {
+    const big = '\\['.repeat(1000) + 'no closer'
+    const start = Date.now()
+    const r = _scanCodexMathBody(big, 0, ']', true)
+    const elapsed = Date.now() - start
+    assert.equal(r.closer, -1)
+    assert.equal(r.dead, true)
+    assert.ok(elapsed < 500, `single scan took ${elapsed}ms (expected ≪ 500ms)`)
+  })
+})
+
+// ── T-LATEX-INTEGRATION: confirm extensions are registered (string-level) ──
+describe('T-LATEX-INTEGRATION: codexDisplayMath / codexInlineMath wiring', () => {
+  it('codexDisplayMath extension registered', () => {
+    assert.ok(
+      appJs.includes("name: 'codexDisplayMath'"),
+      'codexDisplayMath extension missing from markdown.js',
+    )
+  })
+  it('codexInlineMath extension registered', () => {
+    assert.ok(
+      appJs.includes("name: 'codexInlineMath'"),
+      'codexInlineMath extension missing from markdown.js',
+    )
+  })
+  it('renderMarkdown resets _codexDisplayMathDead at entry', () => {
+    assert.ok(
+      /renderMarkdown[\s\S]*?_codexDisplayMathDead\s*=\s*false/.test(appJs),
+      'renderMarkdown must reset _codexDisplayMathDead = false',
+    )
+  })
+  it('renderStreamingMarkdown resets _codexDisplayMathDead at entry', () => {
+    assert.ok(
+      /renderStreamingMarkdown[\s\S]*?_codexDisplayMathDead\s*=\s*false/.test(appJs),
+      'renderStreamingMarkdown must reset _codexDisplayMathDead = false',
+    )
+  })
+  it('extensions push to pendingMath with display flag', () => {
+    assert.ok(appJs.includes('pendingMath.push({ id, tex: token.text, display: true })'))
+    assert.ok(appJs.includes('pendingMath.push({ id, tex: token.text, display: false })'))
+  })
+})
+
 // ── T10: Function extractor sanity ──
 describe('T10: Function extractor sanity checks', () => {
   it('can extract _basename source', () => {
