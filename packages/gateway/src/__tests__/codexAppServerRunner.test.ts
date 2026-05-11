@@ -770,6 +770,197 @@ describe('runTurn re-attach after respawn (Codex review #019dde20 BLOCKER 1)', (
   })
 })
 
+describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKER 1)', () => {
+  // These tests cover the v3 commercial container "stale thread_id" failure:
+  // master sessionManager persists codex thread_id across container rebuilds,
+  // but codex's `~/.codex/sessions/...` rollout JSONL lives on the container's
+  // ephemeral layer. After idle-stop + docker rm, the resume-map still feeds
+  // the old thread_id to the runner, which calls thread/resume → JSON-RPC
+  // error -32600 "no rollout found for thread id ...". The runner used to
+  // emit ok=false directly (29-1188ms empty result frames, "未收到回复"
+  // banner). Self-heal: detect missing-rollout via structured rpcCode/method/
+  // message guards, transparently restart with thread/start, and re-emit the
+  // new session_id so the next turn doesn't loop.
+
+  /** Wait for the runner to write the next JSON-RPC line (poll the harness's
+   *  written buffer). Throws if no new line appears within 50 microtasks. */
+  async function waitForNextWritten(written: string[], prevLen: number): Promise<any> {
+    for (let i = 0; i < 50; i++) {
+      if (written.length > prevLen) return JSON.parse(written[written.length - 1])
+      await new Promise((r) => setImmediate(r))
+    }
+    throw new Error(
+      `runner never wrote a new line (prevLen=${prevLen}, total=${written.length})`,
+    )
+  }
+
+  it('thread/resume returns -32600 "no rollout found" → restart with thread/start, threadId updated, session_id re-emitted', async () => {
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-stale' })
+    const runner = h.runner as any
+    assert.equal(runner.threadId, 'thr-stale')
+    assert.equal(runner.attached, false)
+
+    // Drive runTurn — don't await; we need to pump replies in.
+    const turnPromise = runner.runTurn('hello')
+
+    // Step 1: runner writes thread/resume against the stale id.
+    const req1 = await waitForNextWritten(h.written, 0)
+    assert.equal(req1.method, 'thread/resume')
+    assert.equal(req1.params.threadId, 'thr-stale')
+
+    // Reply with the codex 0.125 missing-rollout shape.
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: req1.id,
+      error: { code: -32600, message: 'no rollout found for thread id thr-stale' },
+    })
+
+    // Step 2: runner self-heals → thread/start.
+    const req2 = await waitForNextWritten(h.written, 1)
+    assert.equal(req2.method, 'thread/start')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: req2.id,
+      result: { thread: { id: 'thr-NEW' } },
+    })
+
+    // Step 3: runner proceeds to turn/start with the NEW threadId.
+    const req3 = await waitForNextWritten(h.written, 2)
+    assert.equal(req3.method, 'turn/start')
+    assert.equal(req3.params.threadId, 'thr-NEW')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: req3.id,
+      result: { turn: { id: 't-1' } },
+    })
+
+    // Step 4: turn/completed notification settles runTurn.
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: { threadId: 'thr-NEW', turn: { id: 't-1', status: 'completed', durationMs: 5 } },
+    })
+
+    await turnPromise
+
+    // Post-conditions
+    assert.equal(runner.threadId, 'thr-NEW', 'threadId must be updated to fresh id')
+    assert.equal(runner.attached, true, 'attached must be true after successful self-heal')
+    assert.deepEqual(h.sessionIds, ['thr-NEW'], 'session_id must be emitted exactly once for the new thread')
+
+    // The runTurn should have emitted a result message with ok=true.
+    const resultMsg = h.messages.find((m) => m.type === 'result')
+    assert.ok(resultMsg, 'expected a result message after self-heal')
+    assert.equal(resultMsg.is_error, false)
+
+    await h.cleanup()
+  })
+
+  it('thread/resume returns -32600 with non-missing-rollout message → does NOT self-heal, surfaces as ok=false', async () => {
+    // Guards against future codex releases repurposing -32600 for protocol/
+    // schema drift. We must NOT silently restart in that case — the user
+    // would lose context with no error surface.
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-stale-2' })
+    const runner = h.runner as any
+
+    const turnPromise = runner.runTurn('hello')
+
+    const req1 = await waitForNextWritten(h.written, 0)
+    assert.equal(req1.method, 'thread/resume')
+
+    // -32600 but NOT "no rollout found" — e.g. param schema drift.
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: req1.id,
+      error: { code: -32600, message: 'invalid params: sandbox value not recognized' },
+    })
+
+    await turnPromise
+
+    // No second JSON-RPC request written — runner must NOT have started a
+    // fresh thread.
+    assert.equal(
+      h.written.length,
+      1,
+      `expected only 1 request (thread/resume), got ${h.written.length}: ${h.written.join(' | ')}`,
+    )
+    assert.equal(runner.threadId, 'thr-stale-2', 'threadId must NOT be cleared')
+    assert.equal(runner.attached, false, 'attached must remain false on hard failure')
+    assert.deepEqual(h.sessionIds, [], 'session_id must NOT be re-emitted')
+
+    // result message should be ok=false, surfacing the original error.
+    const resultMsg = h.messages.find((m) => m.type === 'result')
+    assert.ok(resultMsg, 'expected a result message for the failed turn')
+    assert.equal(resultMsg.is_error, true)
+
+    await h.cleanup()
+  })
+
+  it('thread/resume self-heals, but thread/start subsequently fails → attached stays false, threadId cleared, ok=false', async () => {
+    // Edge case: missing-rollout detected, thread/start fired, but the
+    // restart itself fails (e.g. codex proc crashed mid-restart). attached
+    // must NOT be set to true — otherwise the next runTurn would skip the
+    // attach block and call turn/start against an unattached proc.
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-stale-3' })
+    const runner = h.runner as any
+
+    const turnPromise = runner.runTurn('hello')
+
+    // Reject thread/resume with missing-rollout
+    const req1 = await waitForNextWritten(h.written, 0)
+    assert.equal(req1.method, 'thread/resume')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: req1.id,
+      error: { code: -32600, message: 'no rollout found for thread id thr-stale-3' },
+    })
+
+    // Reject thread/start with a generic codex error
+    const req2 = await waitForNextWritten(h.written, 1)
+    assert.equal(req2.method, 'thread/start')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: req2.id,
+      error: { code: -32603, message: 'internal error during thread/start' },
+    })
+
+    await turnPromise
+
+    assert.equal(runner.attached, false, 'attached must stay false when self-heal fails')
+    assert.equal(runner.threadId, null, 'threadId must be cleared during self-heal even on failure')
+    assert.equal(h.written.length, 2, 'no turn/start expected (attach failed)')
+
+    const resultMsg = h.messages.find((m) => m.type === 'result')
+    assert.ok(resultMsg, 'expected a result message')
+    assert.equal(resultMsg.is_error, true)
+
+    await h.cleanup()
+  })
+
+  it('sendRequest reject preserves rpcCode / rpcMessage / rpcMethod fields', async () => {
+    // Sanity: the structured-error refactor must keep both the human message
+    // shape (existing test asserts) AND the new fields used by
+    // isMissingRolloutError.
+    const h = await makeHarness({ withFakeProc: true })
+    let err: any
+    ;(h.runner as any).sendRequest('thread/resume', {}).catch((e: any) => {
+      err = e
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: 1,
+      error: { code: -32600, message: 'no rollout found for thread id xyz' },
+    })
+    await new Promise((r) => setImmediate(r))
+    assert.ok(err instanceof Error)
+    assert.match(err.message, /thread\/resume -> -32600: no rollout found/)
+    assert.equal(err.rpcCode, -32600)
+    assert.equal(err.rpcMessage, 'no rollout found for thread id xyz')
+    assert.equal(err.rpcMethod, 'thread/resume')
+    await h.cleanup()
+  })
+})
+
 describe('interrupt', () => {
   it('returns false when no active turn', async () => {
     const h = await makeHarness({ withFakeProc: true })
