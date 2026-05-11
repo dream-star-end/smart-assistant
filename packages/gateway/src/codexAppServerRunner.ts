@@ -78,6 +78,16 @@ export interface CodexAppServerRunnerOpts {
   config?: OpenClaudeConfig
   /** Forwarded to mcp-memory env so delegate_task can enforce recursion caps. */
   delegationDepth?: number
+  /** V3 S12e CG8 telemetry — turn-level trace id stash,parity with
+   *  SubprocessRunnerOpts.traceId。Codex app-server 是长驻进程,这个值当前
+   *  **不**透传给子进程(env 未注入,JSON-RPC 协议也没 trace 字段);仅用于满足
+   *  `sessionManager.submit()` 调 `runner.setTraceId(traceId)` 的 contract,
+   *  避免 codex 路径 `TypeError: setTraceId is not a function`。getter 让
+   *  调用方/单测能回读最近一次 stash 的 trace。如果未来要把 trace 注入 codex
+   *  环境,改在 `ensureSpawned()` 拼 spawn env 处加 `OPENCLAUDE_TRACE_ID`(或给
+   *  `buildCodexEnv()` 扩参)即可;`ensureLaunchOverrides()` 管的是 argv /
+   *  config / token files,不是子进程 env。 */
+  traceId?: string
   // ── Phase 5 GitHub session repo workspace integration ──
   /** Session id (peerId)。和 SubprocessRunner.opts.sessionId 同语义,被 runner
    *  作为 key 反查 `getRepoSnapshot()`,得到当前 turn 应该绑定的 repo workspace。
@@ -559,6 +569,20 @@ export class CodexAppServerRunner extends EventEmitter {
   }
   setModel(model: string | undefined): void {
     this.opts.model = model
+  }
+
+  // ── traceId getter / setter (parity with SubprocessRunner; V3 S12e CG8) ──
+  // sessionManager.submit() L1131 在 traceId 非空时硬调 `runner.setTraceId(traceId)`。
+  // 缺方法 → TypeError → turn 永不 complete → 用户卡 "思考中"(2026-05-11 v1.0.123 复现)。
+  // 这是 setModel 同型 bug 第二次踩坑;若再加第三个 sessionManager-side 必调 mutator,
+  // runnerContractParity.test.ts 会先把谁漏 parity 暴露出来。
+  // codex app-server 是长驻进程,trace id 当前不透传给子进程,只做 opts stash —
+  // SubprocessRunner 那条 OPENCLAUDE_TRACE_ID env 注入路径并不适用。
+  get traceId(): string | undefined {
+    return this.opts.traceId
+  }
+  setTraceId(traceId: string | undefined): void {
+    this.opts.traceId = traceId
   }
 
   // ── Phase 5 GitHub session repo binding (parity with SubprocessRunner) ──
