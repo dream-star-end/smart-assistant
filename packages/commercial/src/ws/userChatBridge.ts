@@ -65,6 +65,11 @@ import {
 import type { TokenUsage } from "../billing/calculator.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
+import {
+  newTraceId,
+  parseTraceIdCandidate,
+  type TraceIdIssue,
+} from "@openclaude/protocol";
 import type { GithubSelectionRow } from "../github/sessionWorkspaces.js";
 import {
   applyStatusFrame,
@@ -284,6 +289,15 @@ export interface UserChatBridgeDeps {
     tunnel: { hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget },
     containerPort: number,
     signal: AbortSignal,
+    /**
+     * S12e CG4(合同 A):connection-level trace id,bridge 持有的 `connId = randomUUID()`
+     * 直传。工厂内部写到 outgoing tunnel WS upgrade 的 `X-Connection-Trace-Id` header,
+     * node-agent / in-container gateway 据此关联整条 connection 的 log。
+     *
+     * 必传 string —— 调用方在 startBridge 一定已经生成 connId(line ~999);测试 mock
+     * 也必须传(传 `_connId` 之类参数承接即可)。
+     */
+    connectionTraceId: string,
   ) => Promise<WebSocket>;
   /**
    * 可选:每收到一帧 client→container 消息时调用,用于刷 last_ws_activity。
@@ -510,6 +524,13 @@ interface CodexTurnSnapshot {
    *  rateLimits 落到 claude_accounts.quota_*(maybeUpdateAccountQuotaCodex)。
    *  bigint 0n = legacy 无关联账号(quota writer 内部跳过)。 */
   accountId: bigint;
+  /** CG2c — turn 的 canonical traceId(master 在 inbound.message 入口生成,
+   *  与本 snapshot 的 requestId 同源固定)。outbound.codex_billing settle 路径用它
+   *  派生 billingLog + 注入 outbound.cost_charged 广播帧,实现
+   *  inbound→outbound→ledger→broadcast 的 trace 贯穿。
+   *  **服务端 trust source**:settle 决策永远只信本字段,不解析 outbound 帧的
+   *  frame.traceId(防容器侧伪造影响计费观测)。 */
+  traceId: string;
 }
 
 export interface UserChatBridgeHandler {
@@ -716,6 +737,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       ws.on("message", onEarlyMessage);
       ws.on("close", onEarlyClose);
 
+      // S12e CG4:connection-scoped trace id 在 handleUpgrade 早期生成。
+      // 历史上这行 `randomUUID()` 在 startBridge 顶上(L1008),但 tunnel factory
+      // 调用(L896-900,在 startBridge 之前)也需要这个值塞进 X-Connection-Trace-Id
+      // 头。把生成挪到 IIFE 起点,保证 tunnel pre-dial / bridge log / 后续 child
+      // (turnLog 等)共享同一 UUID;startBridge 内 connId 参数直接收。
+      const connId = randomUUID();
+
       void (async () => {
         // 1) JWT 验证 — token 来源只接受:
         //    Sec-WebSocket-Protocol "bearer, <token>" > Authorization Bearer
@@ -876,6 +904,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               endpoint.tunnel,
               endpoint.port,
               connectAbort.signal,
+              // S12e CG4:connection-level trace 透传,headers 写 X-Connection-Trace-Id
+              connId,
             );
           } else {
             containerWs = createContainerSocket(endpoint.host, endpoint.port, connectAbort.signal);
@@ -937,6 +967,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           containerWs,
           connectAbort,
           modelCheckerHandle,
+          connId,
         );
       })().catch((err: unknown) => {
         log?.error("user-chat-bridge: upgrade pipeline threw", { err });
@@ -983,8 +1014,34 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           refresh: () => Promise<void>;
         }
       | null,
+    /**
+     * S12e CG4:caller(handleUpgrade)早期生成的 connection-scoped trace。
+     * 移到 caller 的原因:tunnel factory 在 startBridge 之前调,需要同一个值
+     * 写 outgoing `X-Connection-Trace-Id` 头与 bridge log connection 字段共享。
+     * 36 char UUID(`randomUUID()`),过 TRACE_ID_REGEX。
+     */
+    connId: string,
   ): void {
-    const connId = randomUUID();
+    // CG2b/CG4 — connection-scoped logger:把 uid + connection-level trace 钉进 bindings,
+    // 后续 startBridge 内所有 log call 不必手写这两个字段。turn-scoped(traceId)再从
+    // bridgeLog.child 派生。
+    //
+    // 字段命名(plan §3.5 合同 A):
+    // - `connectionTraceId`(camelCase)= 当前 connection 的 connId(UUID),与 node-agent /
+    //   in-container gateway 共享同一名字,跨进程 grep 一条 line 就能拿到整个 connection 日志
+    // - `connId` 保留为字段别名(behavioral compat:既有 alert / metric 查询基于此名)
+    // - **不绑 agentId**:v3 commercial bridge 是 connection-scoped(一用户一容器,not per-agent),
+    //   `resolveContainerEndpoint` 也不返 agentId;agentId 是 per-frame 字段,turn 入口
+    //   再 child 进去。Plan §3.5 row A.1 列了 agentId 是文档对 connection 概念的笔误
+    //   (Codex 同意,见 plan v3 review)。
+    //
+    // 此 logger 不能用在 broadcastToUser(跨多 ws,不属于单一 connection),也不用在
+    // handshake 阶段(那里 connId 已经存在,但 uid 还没解出来)。
+    const bridgeLog = log?.child({
+      uid: uid.toString(),
+      connId,
+      connectionTraceId: connId,
+    }) ?? null;
     const startedAt = Date.now();
     // PR1:debounced last_ws_activity 刷新窗口。
     // 初始化为 0 → 第一帧 client→container 一定刷一次。
@@ -1083,9 +1140,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             forwardInboundFrame(buf, false, buf.length);
             // v1.0.94 — 诊断 instrument。auto-rebind 路径在容器重连后自动重发 bind,
             // 与显式 bind 路径用同一日志体便于 grep。
-            log?.info("user-chat-bridge: repo_bind_auto_rebind_forwarded", {
-              uid: uid.toString(),
-              connId,
+            bridgeLog?.info("user-chat-bridge: repo_bind_auto_rebind_forwarded", {
               sessionId: f.sessionId,
               selectionVersion: f.selectionVersion,
               agentId: f.agentId,
@@ -1097,9 +1152,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
           }
         } catch (err) {
-          log?.warn("user-chat-bridge: auto-rebind flush failed", {
-            uid: uid.toString(), connId, err,
-          });
+          bridgeLog?.warn("user-chat-bridge: auto-rebind flush failed", { err });
         } finally {
           autoRebindFlushInFlight = false;
           // 仅在本轮真消化了 row(progressMade)时才再触发,否则当前 hello peers
@@ -1155,8 +1208,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // 连接超时:N ms 内 containerWs 没 OPEN → 取消 + 关 user
     const connectTimer = setTimeout(() => {
       if (containerWs.readyState !== WebSocket.OPEN) {
-        log?.warn("user-chat-bridge: container connect timeout", {
-          uid: uid.toString(), connId, host: endpoint.host, port: endpoint.port,
+        bridgeLog?.warn("user-chat-bridge: container connect timeout", {
+          host: endpoint.host, port: endpoint.port,
         });
         try { connectAbort.abort(); } catch { /* */ }
         try { containerWs.terminate(); } catch { /* */ }
@@ -1214,6 +1267,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   inboundAgentIdForFrame:agent_cost_overrides 查 multiplier 时用,缺省回退 'codex'
       let inboundParsedFrame: Record<string, unknown> | null = null;
       let inboundAgentIdForFrame: string | null = null;
+      // CG2a — 强制 canonical trace。inbound.message 命中时由 master 生成,后续 codex IIFE /
+      // 非 codex forwardInboundFrame 共同读注入到 frame.traceId。其他帧(hello / repo_bind /
+      // 非 JSON / binary)保持 null,走原 raw 透传(不 rewrite)。
+      let turnTraceIdForFrame: string | null = null;
+      // CG2b — turn-scoped logger:inbound.message 命中时基于 bridgeLog 派生(child binding 加
+      // traceId)。同步与 turnTraceIdForFrame 一起 set / 一起 null,codex IIFE / 非 codex
+      // forwardInboundFrame 内的 log call 都用它,不必手写 uid/connId/traceId。
+      let turnLogForFrame: Logger | null = null;
       if (!isBinary) {
         let frameStr: string | null = null;
         if (typeof data === "string") frameStr = data;
@@ -1275,17 +1336,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   // v1.0.94 — 诊断 instrument。bind 帧是关键侧信道,4 个 hop
                   // (前端 → master bridge → 容器 → workspace)只有任一段沉默都会让
                   // 用户卡在「准备中…」。这里记录 bridge → 容器这一段是否真的发出。
-                  log?.info("user-chat-bridge: repo_bind_forwarded", {
-                    uid: uid.toString(),
-                    connId,
+                  bridgeLog?.info("user-chat-bridge: repo_bind_forwarded", {
                     sessionId: result.sessionId,
                     selectionVersion: result.selectionVersion,
                     agentId: result.agentId,
                   });
                 } catch (err) {
-                  log?.warn("user-chat-bridge: enrich bind failed", {
-                    uid: uid.toString(), connId, err,
-                  });
+                  bridgeLog?.warn("user-chat-bridge: enrich bind failed", { err });
                   if (userWs.readyState === WebSocket.OPEN) {
                     try {
                       userWs.send(JSON.stringify({
@@ -1429,8 +1486,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               effectiveModel !== null &&
               !modelCheckerHandle.isAllowed(effectiveModel)
             ) {
-              log?.info("user-chat-bridge: model not authorized", {
-                uid: uid.toString(),
+              bridgeLog?.info("user-chat-bridge: model not authorized", {
                 modelId: effectiveModel,
                 source,
               });
@@ -1454,11 +1510,39 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
               const peerIdRaw = peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
               inboundPeerIdForFrame = typeof peerIdRaw === "string" ? peerIdRaw : null;
-              // PR2 v1.0.66 — 把 parsed 对象 + agentId 提到外层供 codex billing IIFE 用
-              // (rewrite frame 塞 server requestId / 查 agent_cost_overrides multiplier)。
-              inboundParsedFrame = parsed as Record<string, unknown>;
+              // PR2 v1.0.66 — 把 agentId 提到外层供 codex billing IIFE 用
+              // (查 agent_cost_overrides multiplier)。
               inboundAgentIdForFrame = frameAgentId;
             }
+            // CG2a — canonical trace 生成 + client observation。
+            // 任何 inbound.message(codex / 非 codex)都强制注入 master canonical;
+            // client 提供的 clientTraceId 仅 observation:
+            //   - 合法 → 进 log
+            //   - 非法且 raw !== undefined → 只记 issue 不带 raw(MAJOR 2 防 log injection)
+            //     且从 forward 给容器的 frame 中 **strip 掉**(防 raw 进入下游 logger)
+            turnTraceIdForFrame = newTraceId();
+            const rawClientTrace = (parsed as { clientTraceId?: unknown }).clientTraceId;
+            const clientHint = parseTraceIdCandidate(rawClientTrace);
+            const clientTraceFields: {
+              clientTraceId?: string;
+              clientTraceIdIssue?: TraceIdIssue;
+            } = {};
+            if (clientHint.ok) {
+              clientTraceFields.clientTraceId = clientHint.traceId;
+            } else if (rawClientTrace !== undefined) {
+              clientTraceFields.clientTraceIdIssue = clientHint.issue;
+            }
+            // sanitize:非法 clientTraceId 不透传给 container — 合法 / undefined 保留原 parsed
+            let sanitizedParsed = parsed as Record<string, unknown>;
+            if (rawClientTrace !== undefined && !clientHint.ok) {
+              const { clientTraceId: _drop, ...rest } = sanitizedParsed;
+              void _drop;
+              sanitizedParsed = rest;
+            }
+            inboundParsedFrame = sanitizedParsed;
+            // CG2b — turnLog 派生:traceId 钉进 bindings,后续 turn 内 log 自动带上
+            turnLogForFrame = bridgeLog?.child({ traceId: turnTraceIdForFrame }) ?? null;
+            turnLogForFrame?.info("user-chat-bridge: inbound turn start", clientTraceFields);
           }
         }
       }
@@ -1480,10 +1564,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       ) {
         if (acquiredCodexAccountId !== null || codexAcquireInflight) {
           // G7 严格单飞:不 close bridge,让前端等当前 turn 完成后重发
-          log?.info("user-chat-bridge: codex turn busy, rejecting frame", {
-            uid: uid.toString(),
-            connId,
-          });
+          turnLogForFrame?.info("user-chat-bridge: codex turn busy, rejecting frame");
           sendErrorFrame(
             userWs,
             "CODEX_TURN_BUSY",
@@ -1517,8 +1598,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const effectiveModelCapture = effectiveModelForFrame;
         const inboundAgentIdCapture = inboundAgentIdForFrame;
         const inboundParsedCapture = inboundParsedFrame;
+        // CG2a — capture canonical traceId 给 IIFE 局部用。inbound.message ⇒ isCodexInboundFrame=true
+        // 路径强保证 turnTraceIdForFrame 非 null(invariant 由 IIFE 起手处显式校验)。
+        const turnTraceIdCapture = turnTraceIdForFrame;
+        // CG2b — capture turn-scoped logger;同步 set 一并 capture。
+        const turnLogCapture = turnLogForFrame;
         void (async () => {
           try {
+            // CG2a invariant — codex inbound 必经 inbound.message 分支 ⇒ trace + parsed 必非 null。
+            // 这里前置校验(acquire 之前),invariant 破坏 → close 1011,无需 release。
+            // 若放 acquire 之后再校验,要多一份 releaseAcquiredSlotForFailure() 清理负担。
+            if (turnTraceIdCapture === null || inboundParsedCapture === null) {
+              // invariant 命中时 turnLogCapture 也必为 null(同步生成),用 bridgeLog 兜底
+              bridgeLog?.error("user-chat-bridge: codex frame missing trace invariant");
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated");
+                try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
+              }
+              return;
+            }
             const acquired = await codexBinding.acquire(cid);
             if (cleaned) {
               // bridge 在 acquire 期间被关 — 立即 release 不留泄漏
@@ -1550,11 +1648,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             //   inflightCodexTurns Map 注册 → frame rewrite 注入 server-owned requestId
             //   → forward。失败任一步:释放已 acquire 的资源 + close ws 关连接。
             //
-            //   codexBillingEnabled=false(测试 / 个人版上下文,三件套未注入)→ 跳过
-            //   billing 直接 forward(同 PR2 之前行为)。
-            let frameForwardData: RawData = data;
-            let frameForwardIsBinary = isBinary;
-            let frameForwardLen = len;
+            //   codexBillingEnabled=false(测试 / 个人版上下文,三件套未注入)→ 走
+            //   下方 else 分支:仍 rewrite 注入 traceId(CG2a 合同硬门),只是不动 requestId。
+            let frameForwardData: RawData;
+            const frameForwardIsBinary = false;
+            let frameForwardLen: number;
             if (codexBillingEnabled) {
               // 三件套全注入(createUserChatBridge entry 已强校验)→ non-null assert 安全
               const pgPool = deps.pgPool!;
@@ -1563,9 +1661,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
               if (effectiveModelCapture === null) {
                 // 不该发生(isCodexInboundFrame=true 蕴含 effectiveModel 非空)
-                log?.error("user-chat-bridge: codex billing without effective model", {
-                  uid: uid.toString(), connId,
-                });
+                turnLogCapture?.error("user-chat-bridge: codex billing without effective model");
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                   sendErrorFrame(userWs, "CODEX_BILLING", "codex billing internal");
                   try { userWs.close(CLOSE_BRIDGE.INTERNAL, "codex billing"); } catch { /* */ }
@@ -1579,8 +1675,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (!modelPricing) {
                 // pricing 缓存 miss(authz 通过但 cache 未含此 model — race 窗口
                 // / DB 配置漂移)。fail-closed:不放行 codex turn,免漏扣。
-                log?.error("user-chat-bridge: codex pricing missing", {
-                  uid: uid.toString(), connId, model: effectiveModel,
+                turnLogCapture?.error("user-chat-bridge: codex pricing missing", {
+                  model: effectiveModel,
                 });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                   sendErrorFrame(userWs, "CODEX_BILLING", `pricing missing for ${effectiveModel}`);
@@ -1597,8 +1693,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               try {
                 agentMul = await getAgentCostMultiplier(pgPool, agentForCharge);
               } catch (err) {
-                log?.error("user-chat-bridge: getAgentCostMultiplier failed", {
-                  uid: uid.toString(), connId, agentId: agentForCharge, err,
+                turnLogCapture?.error("user-chat-bridge: getAgentCostMultiplier failed", {
+                  agentId: agentForCharge, err,
                 });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                   sendErrorFrame(userWs, "CODEX_BILLING", "billing config unavailable");
@@ -1623,9 +1719,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               try {
                 maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
               } catch (err) {
-                log?.error("user-chat-bridge: estimateMaxCost failed", {
-                  uid: uid.toString(), connId, err,
-                });
+                turnLogCapture?.error("user-chat-bridge: estimateMaxCost failed", { err });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                   sendErrorFrame(userWs, "CODEX_BILLING", "billing internal");
                   try { userWs.close(CLOSE_BRIDGE.INTERNAL, "billing internal"); } catch { /* */ }
@@ -1643,8 +1737,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 });
               } catch (err) {
                 if (err instanceof InsufficientCreditsError) {
-                  log?.info("user-chat-bridge: codex preCheck insufficient credits", {
-                    uid: uid.toString(), connId,
+                  turnLogCapture?.info("user-chat-bridge: codex preCheck insufficient credits", {
                     balance: err.balance.toString(),
                     required: err.required.toString(),
                   });
@@ -1657,9 +1750,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     try { userWs.close(CLOSE_BRIDGE.POLICY, "insufficient_credits"); } catch { /* */ }
                   }
                 } else {
-                  log?.error("user-chat-bridge: preCheckWithCost failed", {
-                    uid: uid.toString(), connId, err,
-                  });
+                  turnLogCapture?.error("user-chat-bridge: preCheckWithCost failed", { err });
                   if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                     sendErrorFrame(userWs, "CODEX_BILLING", "preCheck unavailable");
                     try { userWs.close(CLOSE_BRIDGE.INTERNAL, "preCheck unavailable"); } catch { /* */ }
@@ -1697,8 +1788,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   },
                 });
               } catch (err) {
-                log?.error("user-chat-bridge: startInflightJournal failed", {
-                  uid: uid.toString(), connId, requestId, err,
+                turnLogCapture?.error("user-chat-bridge: startInflightJournal failed", {
+                  requestId, err,
                 });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                   sendErrorFrame(userWs, "CODEX_BILLING", "journal unavailable");
@@ -1738,20 +1829,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // Issue A v1.0.108 — codex_billing 分支落 quota 用,与 finalizer
                 // closure 里的 accountIdForLedger 同源。
                 accountId: accountIdForLedger,
+                // CG2c — IIFE 起手 invariant 已校验 turnTraceIdCapture !== null,
+                // 这里读出来 TS 推断为 string。本 turn 整个生命周期内固定不可变。
+                traceId: turnTraceIdCapture,
               });
 
               // Frame rewrite:server-owned requestId 覆盖 client 任意值。容器侧
               // 把这个 requestId 透传到 outbound.codex_billing,master 用它从
               // inflightCodexTurns Map 找回 finalizer 落账。
-              const baseObj = inboundParsedCapture ?? {};
-              const rewrittenObj = { ...baseObj, requestId };
+              // CG2a — 同时注入 master canonical traceId(IIFE 起手 invariant 保证非 null)
+              const rewrittenObj = {
+                ...inboundParsedCapture,
+                requestId,
+                traceId: turnTraceIdCapture,
+              };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
               if (rewrittenLen > maxFrameBytes) {
-                // rewriting 只加 ~50 bytes(`,"requestId":"<32hex>"`) — 几乎不可能
-                // 越界。命中 = 用户帧本来就贴边,fail finalizer + close ws。
-                log?.error("user-chat-bridge: rewritten codex frame too big", {
-                  uid: uid.toString(), connId, rewrittenLen, max: maxFrameBytes,
+                // rewriting 只加 ~100 bytes(`,"requestId":"<32hex>","traceId":"<32hex>"`)
+                // — 几乎不可能越界。命中 = 用户帧本来就贴边,fail finalizer + close ws。
+                turnLogCapture?.error("user-chat-bridge: rewritten codex frame too big", {
+                  rewrittenLen, max: maxFrameBytes,
                 });
                 inflightCodexTurns.delete(requestId);
                 finalizer.fail("rewritten_frame_too_big").catch(() => {});
@@ -1769,12 +1867,37 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // ws lib RawData = Buffer | ArrayBuffer | Buffer[];string 不匹配。
               // 转 Buffer 走文本帧(isBinary=false)— 接收端 .toString() 行为一致。
               frameForwardData = Buffer.from(rewrittenStr, "utf8");
-              frameForwardIsBinary = false;
+              frameForwardLen = rewrittenLen;
+            } else {
+              // CG2a — billing 未启用(legacy NULL 容器无三件套 / 测试)路径仍要 rewrite
+              // 注入 traceId(合同硬门);不动 requestId(client 提供的 requestId 保留 raw)。
+              const rewrittenObj = {
+                ...inboundParsedCapture,
+                traceId: turnTraceIdCapture,
+              };
+              const rewrittenStr = JSON.stringify(rewrittenObj);
+              const rewrittenLen = Buffer.byteLength(rewrittenStr);
+              if (rewrittenLen > maxFrameBytes) {
+                turnLogCapture?.error("user-chat-bridge: rewritten codex frame too big (no billing)", {
+                  rewrittenLen, max: maxFrameBytes,
+                });
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(
+                    userWs,
+                    "ERR_FRAME_TOO_BIG",
+                    `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
+                  );
+                  try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              frameForwardData = Buffer.from(rewrittenStr, "utf8");
               frameForwardLen = rewrittenLen;
             }
 
             // 已 acquire(+ billing 注册若启用)完毕,继续同步 forward 路径
-            // (等价于"放行 frame")。billing 关闭路径下 frameForward* = 原 data。
+            // (等价于"放行 frame")。两条分支都已 rewrite 注入 traceId(CG2a 合同)。
             forwardInboundFrame(frameForwardData, frameForwardIsBinary, frameForwardLen);
           } catch (err) {
             const errName = (err as { name?: string } | null | undefined)?.name ?? "";
@@ -1785,9 +1908,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 块里 acquire 之后),因此**不要**调 releaseAcquiredSlotForFailure
               // (no-op 但语义混淆)。直接通知前端 + 关连接 — 用户重发会触发
               // ensureRunning 重 provision,picker 落 per-container mount,然后正常工作。
-              log?.info("user-chat-bridge: codex container stale, recycled", {
-                uid: uid.toString(),
-                connId,
+              turnLogCapture?.info("user-chat-bridge: codex container stale, recycled", {
                 err: (err as Error)?.message,
               });
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
@@ -1799,10 +1920,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 try { userWs.close(CLOSE_BRIDGE.POLICY, "codex_container_recycled"); } catch { /* */ }
               }
             } else if (errName === "AccountPoolBusyError") {
-              log?.info("user-chat-bridge: codex pool busy, fast-fail", {
-                uid: uid.toString(),
-                connId,
-              });
+              turnLogCapture?.info("user-chat-bridge: codex pool busy, fast-fail");
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                 sendErrorFrame(
                   userWs,
@@ -1811,11 +1929,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 );
               }
             } else {
-              log?.warn("user-chat-bridge: codex acquire failed", {
-                uid: uid.toString(),
-                connId,
-                err,
-              });
+              turnLogCapture?.warn("user-chat-bridge: codex acquire failed", { err });
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                 sendErrorFrame(
                   userWs,
@@ -1832,6 +1946,37 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       // 让 unused-locals 检查放过(future:可能加 outbound 解析用 effectiveModelForFrame)
       void effectiveModelForFrame;
+      // CG2a — 非 codex 路径(claude-* 文本 / hello / repo_bind / 普通透传):若本帧是
+      // inbound.message(已 sanitize parsed + 生成 canonical),把 traceId 注入再 forward;
+      // 其他帧(非 JSON / binary / 非 inbound.message)turnTraceIdForFrame === null →
+      // 不 rewrite,走原 raw 透传。
+      // CG2b — 注意:trace 注入是契约,不能因为 deps.logger 缺失而失效。turnLogForFrame
+      // 只用作 best-effort 日志(optional chain),不参与 trace gate;真正的 gate 仍是
+      // inboundParsedFrame !== null && turnTraceIdForFrame !== null 这对同步生成的双胞胎。
+      if (inboundParsedFrame !== null && turnTraceIdForFrame !== null) {
+        const rewrittenObj = {
+          ...inboundParsedFrame,
+          traceId: turnTraceIdForFrame,
+        };
+        const rewrittenStr = JSON.stringify(rewrittenObj);
+        const rewrittenLen = Buffer.byteLength(rewrittenStr);
+        if (rewrittenLen > maxFrameBytes) {
+          turnLogForFrame?.error("user-chat-bridge: rewritten inbound frame too big", {
+            rewrittenLen, max: maxFrameBytes,
+          });
+          if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+            sendErrorFrame(
+              userWs,
+              "ERR_FRAME_TOO_BIG",
+              `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
+            );
+            try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+          }
+          return;
+        }
+        forwardInboundFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+        return;
+      }
       forwardInboundFrame(data, isBinary, len);
     };
 
@@ -1883,17 +2028,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       try {
         containerWs.send(data, { binary: isBinary }, (err) => {
           if (err) {
-            log?.warn("user-chat-bridge: container send error", {
-              uid: uid.toString(), connId, err,
-            });
+            bridgeLog?.warn("user-chat-bridge: container send error", { err });
           }
         });
         bytesUC += len;
         metrics.onUserFrame?.(uid, len, isBinary);
       } catch (err) {
-        log?.warn("user-chat-bridge: container send threw", {
-          uid: uid.toString(), connId, err,
-        });
+        bridgeLog?.warn("user-chat-bridge: container send threw", { err });
         try { userWs.close(CLOSE_BRIDGE.INTERNAL, "agent send failed"); } catch { /* */ }
         // 容器 send 抛 = 容器 socket 已不可用,billing 帧也来不了 → force final
         cleanup("container_error", true);
@@ -1905,8 +2046,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const onContainerMessage = (data: RawData, isBinary: boolean): void => {
       const len = rawDataLen(data);
       if (len > maxFrameBytes) {
-        log?.warn("user-chat-bridge: container frame too big", {
-          uid: uid.toString(), connId, len, max: maxFrameBytes,
+        bridgeLog?.warn("user-chat-bridge: container frame too big", {
+          len, max: maxFrameBytes,
         });
         sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG",
           `container frame ${len} > max ${maxFrameBytes}`);
@@ -1959,9 +2100,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             };
             const reqId = typeof billing.requestId === "string" ? billing.requestId : null;
             if (reqId === null) {
-              log?.warn("user-chat-bridge: codex_billing missing requestId", {
-                uid: uid.toString(), connId,
-              });
+              bridgeLog?.warn("user-chat-bridge: codex_billing missing requestId");
               return;
             }
             const snap = inflightCodexTurns.get(reqId);
@@ -1972,8 +2111,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               //   - turn 已 settle 后容器又重发(retry / 误重)
               //   - bridge 已 finalCleanup 把 Map 清空 → fail 路径已 abort journal
               //   - 跨桥 misroute(理论不存在,容器只连一个 master 桥)
-              log?.info("user-chat-bridge: codex_billing for unknown turn", {
-                uid: uid.toString(), connId, requestId: reqId,
+              bridgeLog?.info("user-chat-bridge: codex_billing for unknown turn", {
+                requestId: reqId,
               });
               return;
             }
@@ -1982,6 +2121,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // _done 守门只防 ledger 重复 debit,但两个 IIFE 各自 await commit 后
             // 都会读 result.debitedCredits>0 各广播一次 — 用 Map.delete 早断。
             inflightCodexTurns.delete(reqId);
+            // CG2c — billing settle 路径的 log 钉到 turn 的 server-owned trace。
+            // child 一次,后续 quota / commit / persist 三个分支都用 billingLog;
+            // requestId 经 binding 提供,call-site 不再手写。**只读 snap.traceId,
+            // 不解析 frame.traceId** —— 防容器侧伪造影响计费观测。
+            const billingLog = bridgeLog?.child({
+              traceId: snap.traceId,
+              requestId: reqId,
+            }) ?? null;
             // Issue A v1.0.108 — codex `account/rateLimits/updated` 通知 piggy-back
             // 到 billing 帧的 rateLimits 字段(runner 已转 Anthropic-shape)。
             // 与 ledger commit 解耦走独立 fire-and-forget,理由:
@@ -2006,10 +2153,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 snap.accountId,
                 r,
               ).catch((err) => {
-                log?.debug("user-chat-bridge: codex quota write failed", {
-                  uid: uid.toString(),
-                  connId,
-                  requestId: reqId,
+                billingLog?.debug("user-chat-bridge: codex quota write failed", {
                   err: (err as Error)?.message,
                 });
               });
@@ -2063,15 +2207,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         result.debitedCredits.toString(),
                       );
                     } catch (err) {
-                      log?.warn("user-chat-bridge: codex persist costCredits threw", {
-                        uid: uid.toString(), connId, requestId: reqId,
+                      billingLog?.warn("user-chat-bridge: codex persist costCredits threw", {
                         err: (err as Error)?.message,
                       });
                     }
                   }
+                  // CG2c — broadcast 帧带 traceId 让 outboundRing audit / 前端 trace
+                  // 关联到 inbound canonical。snap.traceId 是 server-owned 唯一可信源。
                   broadcastToUser(uid, {
                     type: "outbound.cost_charged",
                     requestId: reqId,
+                    traceId: snap.traceId,
                     model: snap.model,
                     costCredits: result.costCredits.toString(),
                     debitedCredits: result.debitedCredits.toString(),
@@ -2082,8 +2228,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   });
                 }
               } catch (err) {
-                log?.error("user-chat-bridge: codex finalizer commit threw", {
-                  uid: uid.toString(), connId, requestId: reqId,
+                billingLog?.error("user-chat-bridge: codex finalizer commit threw", {
                   err: (err as Error)?.message,
                 });
               } finally {
@@ -2129,9 +2274,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   const r = await applyStatusFrame(pgPoolBound, Number(uid), statusFrame);
                   // v1.0.94 — 诊断 instrument。状态帧从容器到 user 这段也要可见,
                   // 才能区分「容器没推 status」和「bridge 推了但 user 没收到」。
-                  log?.info("user-chat-bridge: repo_status_forwarded", {
-                    uid: uid.toString(),
-                    connId,
+                  bridgeLog?.info("user-chat-bridge: repo_status_forwarded", {
                     sessionId: statusFrame.sessionId,
                     selectionVersion: statusFrame.selectionVersion,
                     status: statusFrame.status,
@@ -2140,8 +2283,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     revoked: r.revoked,
                   });
                 } catch (err) {
-                  log?.warn("user-chat-bridge: applyStatusFrame failed", {
-                    uid: uid.toString(), connId,
+                  bridgeLog?.warn("user-chat-bridge: applyStatusFrame failed", {
                     sessionId: statusFrame.sessionId, err,
                   });
                 }
@@ -2250,8 +2392,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       // 简单 backpressure:看 userWs.bufferedAmount(ws lib 维护的 socket 待发量)
       if (userWs.bufferedAmount + len > maxBufferedBytes) {
-        log?.warn("user-chat-bridge: user-side backpressure", {
-          uid: uid.toString(), connId,
+        bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
           buffered: userWs.bufferedAmount, len,
         });
         sendErrorFrame(userWs, "ERR_BACKPRESSURE", "client slow");
@@ -2264,9 +2405,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       try {
         userWs.send(data, { binary: isBinary }, (err) => {
           if (err) {
-            log?.warn("user-chat-bridge: user send error", {
-              uid: uid.toString(), connId, err,
-            });
+            bridgeLog?.warn("user-chat-bridge: user send error", { err });
           }
         });
         bytesCU += len;
@@ -2274,9 +2413,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         metrics.onContainerFrame?.(uid, len, isBinary);
         metrics.onBufferedBytes?.(uid, "container_to_user", bufferedCU);
       } catch (err) {
-        log?.warn("user-chat-bridge: user send threw", {
-          uid: uid.toString(), connId, err,
-        });
+        bridgeLog?.warn("user-chat-bridge: user send threw", { err });
         try { userWs.close(CLOSE_BRIDGE.INTERNAL, "user send failed"); } catch { /* */ }
         // user-WS send 抛但 container 还在 — billing 帧仍可能到,走 drain 让 ledger
         // debit 落账(broadcast 因 user-WS 死会 no-op,但 settle 不能漏)
@@ -2288,8 +2425,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     containerWs.on("open", () => {
       clearTimeout(connectTimer);
-      log?.debug("user-chat-bridge: container connected", {
-        uid: uid.toString(), connId, host: endpoint.host, port: endpoint.port,
+      bridgeLog?.debug("user-chat-bridge: container connected", {
+        host: endpoint.host, port: endpoint.port,
       });
       // V3 cold-start UX 提示:本次 ensureRunning 走了 provision 分支 → 给前端发
       // 一帧 sidecar,前端把 typing indicator 文案换成"首次加载上下文较慢"。
@@ -2321,9 +2458,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               pendingRebindMap.set(row.sessionId, row);
             }
           } catch (err) {
-            log?.warn("user-chat-bridge: fetch active selections failed", {
-              uid: uid.toString(), connId, err,
-            });
+            bridgeLog?.warn("user-chat-bridge: fetch active selections failed", { err });
           } finally {
             autoRebindFetchDone = true;
             tryAutoRebindFlush();
@@ -2337,9 +2472,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     containerWs.on("message", onContainerMessage);
 
     containerWs.on("error", (err: Error) => {
-      log?.warn("user-chat-bridge: container ws error", {
-        uid: uid.toString(), connId, err,
-      });
+      bridgeLog?.warn("user-chat-bridge: container ws error", { err });
       sendErrorFrame(userWs, "ERR_CONTAINER", err.message);
       try { userWs.close(CLOSE_BRIDGE.INTERNAL, "agent error"); } catch { /* */ }
       // 容器 ws error → 容器侧已不可达,billing 也来不了 → force final
@@ -2362,9 +2495,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     userWs.on("message", onUserMessage);
     userWs.on("error", (err) => {
-      log?.warn("user-chat-bridge: user ws error", {
-        uid: uid.toString(), connId, err,
-      });
+      bridgeLog?.warn("user-chat-bridge: user ws error", { err });
     });
 
     // ---------- 心跳(HIGH#5) ----------
@@ -2382,9 +2513,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         if (userWs.readyState !== WebSocket.OPEN) return;
         const idleMs = Date.now() - lastAliveAt;
         if (idleMs > heartbeatTimeoutMs) {
-          log?.info("user-chat-bridge: heartbeat timeout, terminating", {
-            uid: uid.toString(), connId, idleMs,
-          });
+          bridgeLog?.info("user-chat-bridge: heartbeat timeout, terminating", { idleMs });
           try { userWs.terminate(); } catch { /* */ }
           // heartbeat 超时 = 用户失联,但容器仍可能在跑 codex turn,billing 帧还会
           // 到 → 走 drain(force=false),checkDrainComplete / drain timeout 兜底
@@ -2470,8 +2599,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           triggerCause === "container_error" ||
           triggerCause === "shutdown"
         ) {
-          log?.info("user-chat-bridge: drain pre-empt", {
-            uid: uid.toString(), connId,
+          bridgeLog?.info("user-chat-bridge: drain pre-empt", {
             triggerCause, leftover: inflightCodexTurns.size,
           });
           finalCleanup(triggerCause);
@@ -2499,13 +2627,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 进 drain 路径(只有 user 主动 close + 有 codex inflight 才会)
       drainCause = triggerCause;
       detachUserSide(triggerCause);
-      log?.info("user-chat-bridge: enter drain", {
-        uid: uid.toString(), connId,
+      bridgeLog?.info("user-chat-bridge: enter drain", {
         inflightCount: inflightCodexTurns.size,
       });
       drainTimer = setTimeout(() => {
-        log?.warn("user-chat-bridge: drain timeout", {
-          uid: uid.toString(), connId,
+        bridgeLog?.warn("user-chat-bridge: drain timeout", {
           leftover: inflightCodexTurns.size,
         });
         finalCleanup(drainCause ?? "client_close");
@@ -2633,8 +2759,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         bytesContainerToUser: bytesCU,
         cause: finalCause,
       });
-      log?.info("user-chat-bridge: closed", {
-        uid: uid.toString(), connId,
+      bridgeLog?.info("user-chat-bridge: closed", {
         durationMs: Date.now() - startedAt,
         bytesUC, bytesCU, cause: finalCause,
       });

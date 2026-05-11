@@ -25,6 +25,7 @@ import (
 	"github.com/openclaude/node-agent/internal/renew"
 	"github.com/openclaude/node-agent/internal/selfprobe"
 	"github.com/openclaude/node-agent/internal/sshmux"
+	"github.com/openclaude/node-agent/internal/trace"
 	"github.com/openclaude/node-agent/internal/tunnel"
 )
 
@@ -135,7 +136,11 @@ func (s *Server) buildMux() http.Handler {
 			http.Error(w, "authmw init failed", http.StatusInternalServerError)
 		})
 	}
-	return mw.Wrap(mux)
+	// V3 S12e CG5:authmw 外层 → trace 内层 → mux。认证失败的请求不进 trace
+	// (避免污染日志 / 给攻击者扩大日志面),通过认证的请求才进入 trace 注入。
+	// trace.HTTPMW 按路径 prefix 分派:/tunnel/containers/* 读 X-Connection-Trace-Id,
+	// 其它读 X-Openclaude-Trace-Id,fallback NewTraceID() 兜底 + warn issue。
+	return mw.Wrap(trace.HTTPMW(mux))
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {

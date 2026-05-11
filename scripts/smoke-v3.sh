@@ -8,7 +8,15 @@
 #   4. GET /admin.html → 200 + body contains <title>
 #   5. GET /api/changelog → 200 + JSON.currentVersion === EXPECTED_TAG
 #
-# Any failure → print rollback hint and exit non-zero. Never auto-rollback.
+# V3 S12e CG9 — additionally (warn-mode, never fails the deploy):
+#   - all 5 checks above inject `X-Trace-Id: ${SMOKE_TRACE}`
+#   - verify_trace_propagation() hits 3 router.ts-routed probes
+#     (/api/public/config, /api/public/models, /api/models) then sshes to
+#     commercial-v3 to grep journalctl for ≥3 log lines tagged with
+#     SMOKE_TRACE. Below threshold = warn only.
+#
+# Any failure of checks 1-5 → print rollback hint and exit non-zero. Never auto-rollback.
+# verify_trace_propagation has no abort path (warn-only, plan D6).
 #
 # Usage:
 #   scripts/smoke-v3.sh <EXPECTED_TAG> [BASE_URL]
@@ -26,6 +34,19 @@ if [[ -z "$EXPECTED_TAG" ]]; then
   echo "usage: $0 <EXPECTED_TAG> [BASE_URL]" >&2
   exit 2
 fi
+
+# V3 S12e CG9 — contract D (deploy smoke) trace id. Built once at the top:
+#   RAW_TAG  = strip non-[A-Za-z0-9_-] chars from EXPECTED_TAG (so non-ascii
+#              tags don't break TRACE_ID_REGEX `^[A-Za-z0-9_-]{16,64}$`)
+#   SAFE_TAG = fallback "smoke" if RAW_TAG empty (NIT 1: avoid "smoke--<hex>"
+#              ugly format from all-stripped tag); truncate to 24 chars to
+#              keep total under 64 even for unusually long debug tags
+#   SMOKE_TRACE = "smoke-${SAFE_TAG}-<32-hex>"  (matches TRACE_ID_REGEX)
+RAW_TAG="${EXPECTED_TAG//[^A-Za-z0-9_-]/}"
+SAFE_TAG="${RAW_TAG:-smoke}"
+SAFE_TAG="${SAFE_TAG:0:24}"
+TRACE_HEX="$(openssl rand -hex 16)"
+SMOKE_TRACE="smoke-${SAFE_TAG}-${TRACE_HEX}"
 
 PASS=0
 FAIL=0
@@ -60,27 +81,33 @@ check() {
   fi
 }
 
-echo "=== smoke-v3 → $BASE_URL  expected tag: $EXPECTED_TAG ==="
+echo "=== smoke-v3 → $BASE_URL  expected tag: $EXPECTED_TAG  trace: $SMOKE_TRACE ==="
+
+# Every existing check injects `X-Trace-Id: ${SMOKE_TRACE}` (V3 S12e CG9). The
+# 5 contract checks below currently fall through gateway (not router.ts), so
+# the trace header is future-proofing for when gateway gains traceId logging
+# (S11c). verify_trace_propagation() below runs 3 dedicated probes against
+# router.ts-matched routes to guarantee ≥3 reqLog emissions.
 
 # 1. healthz
 check "healthz 200" \
-  bash -c "curl -sSf --max-time 5 -o /dev/null '$BASE_URL/healthz'"
+  bash -c "curl -sSf --max-time 5 -H 'X-Trace-Id: $SMOKE_TRACE' -o /dev/null '$BASE_URL/healthz'"
 
 # 2. /version.tag matches
 check "/version.tag === $EXPECTED_TAG" \
   bash -c "
-    body=\$(curl -sSf --max-time 5 '$BASE_URL/version') || exit 1
+    body=\$(curl -sSf --max-time 5 -H 'X-Trace-Id: $SMOKE_TRACE' '$BASE_URL/version') || exit 1
     tag=\$(echo \"\$body\" | sed -n 's/.*\"tag\":\"\\([^\"]*\\)\".*/\\1/p')
     [[ \"\$tag\" == '$EXPECTED_TAG' ]] || { echo \"got tag=\$tag\" >&2; exit 1; }
   "
 
 # 3. index.html shell
 check "/ has <title>" \
-  bash -c "curl -sSf --max-time 5 '$BASE_URL/' | grep -q '<title>'"
+  bash -c "curl -sSf --max-time 5 -H 'X-Trace-Id: $SMOKE_TRACE' '$BASE_URL/' | grep -q '<title>'"
 
 # 4. admin.html shell
 check "/admin.html has <title>" \
-  bash -c "curl -sSf --max-time 5 '$BASE_URL/admin.html' | grep -q '<title>'"
+  bash -c "curl -sSf --max-time 5 -H 'X-Trace-Id: $SMOKE_TRACE' '$BASE_URL/admin.html' | grep -q '<title>'"
 
 # 5. /api/changelog.currentVersion matches
 # Unauthenticated callers may get 401 here — /api/changelog requires auth.
@@ -88,7 +115,7 @@ check "/admin.html has <title>" \
 # (Goal is to catch changelog drift, not re-test auth.)
 check "/api/changelog.currentVersion === $EXPECTED_TAG (or 401)" \
   bash -c "
-    status=\$(curl -s --max-time 5 -o /tmp/smoke-cl.out -w '%{http_code}' '$BASE_URL/api/changelog')
+    status=\$(curl -s --max-time 5 -H 'X-Trace-Id: $SMOKE_TRACE' -o /tmp/smoke-cl.out -w '%{http_code}' '$BASE_URL/api/changelog')
     if [[ \"\$status\" == '401' ]]; then
       exit 0
     fi
@@ -98,6 +125,54 @@ check "/api/changelog.currentVersion === $EXPECTED_TAG (or 401)" \
     ver=\$(sed -n 's/.*\"currentVersion\":\"\\([^\"]*\\)\".*/\\1/p' /tmp/smoke-cl.out)
     [[ \"\$ver\" == '$EXPECTED_TAG' ]] || { echo \"got currentVersion=\$ver\" >&2; exit 1; }
   "
+
+# V3 S12e CG9 — contract D verify trace propagation (warn-mode, never fails)
+# Proves master HTTP segment reqLog `traceId` child-binding works end-to-end.
+# Scope: ONLY master HTTP segment. WS/node-agent/container deferred to S11a.
+verify_trace_propagation() {
+  local expected_min=3
+  local since='5 min ago'
+
+  # 3 trace-only probes against routes guaranteed to hit router.ts reqLog
+  # (verified against router.ts prefix list 2026-05-11: /api/public/*,
+  # /api/models). They don't contribute to PASS/FAIL — they exist purely so
+  # the journalctl grep below has known log-line targets. Each gets the same
+  # SMOKE_TRACE so a single grep captures all 3.
+  for probe_path in /api/public/config /api/public/models /api/models; do
+    curl -s --max-time 5 -o /dev/null \
+      -H "X-Trace-Id: ${SMOKE_TRACE}" \
+      "${BASE_URL}${probe_path}" || true
+  done
+
+  # Give journald a tiny buffer to flush. systemd journal usually writes
+  # within ~10ms, but on a busy box with concurrent log volume the per-line
+  # disk write can lag a few hundred ms. 1s is generous slack.
+  sleep 1
+
+  # Single SSH call. Remote: `grep -c ... || true` ensures zero matches exit
+  # 0 (not the grep-c convention of exit 1). Local: capture exit separately
+  # so a real ssh failure is distinguishable from "count = 0".
+  local count
+  if ! count=$(ssh -o BatchMode=yes -o ConnectTimeout=5 commercial-v3 \
+    "journalctl -u openclaude --since '$since' --no-pager 2>/dev/null | grep -c '${SMOKE_TRACE}' || true" 2>/dev/null); then
+    echo "   ⚠ trace propagation: ssh commercial-v3 journalctl unavailable — skipping verify (deploy unaffected)" >&2
+    return 0
+  fi
+
+  # Strip any whitespace; default to 0 if ssh returned an empty body.
+  count="${count//[^0-9]/}"
+  count="${count:-0}"
+
+  if (( count >= expected_min )); then
+    echo "   ✓ trace propagation OK (found $count log lines with trace=$SMOKE_TRACE, threshold=$expected_min)"
+  else
+    echo "   ⚠ trace propagation BELOW THRESHOLD: found $count, expected ≥$expected_min (warn-only, deploy NOT aborted)" >&2
+    echo "     master HTTP logger may have lost traceId child-binding — investigate after deploy completes." >&2
+  fi
+  return 0
+}
+
+verify_trace_propagation
 
 echo ""
 echo "=== smoke-v3 summary: $PASS passed / $FAIL failed ==="

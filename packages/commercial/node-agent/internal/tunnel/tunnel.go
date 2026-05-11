@@ -28,7 +28,7 @@ import (
 	"time"
 
 	"github.com/openclaude/node-agent/internal/containers"
-	"github.com/openclaude/node-agent/internal/logging"
+	"github.com/openclaude/node-agent/internal/trace"
 )
 
 type Handler struct {
@@ -110,11 +110,75 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := net.JoinHostPort(boundIp, strconv.Itoa(port))
+
+	// V3 S12e CG5:把 cid 绑进 trace logger,downstream proxy() 用 LoggerFromContext
+	// 拿到带 connectionTraceId + cid 的复合 logger;tunnel opened/closed/error 日志
+	// 自动带 trace + cid 字段。
+	l := trace.LoggerFromContext(r.Context()).With("cid", cid)
+	r = r.WithContext(trace.WithLogger(r.Context(), l))
+
 	h.proxy(w, r, target, upstreamPath)
 }
 
+// buildUpstreamRequest 构造 hijack 之后写到 upstream 的 raw HTTP/1.1 request 头部
+// (request-line + Host + 转发 headers + CRLF terminator)。
+//
+// 抽出为 unexported pure helper 的两个原因:
+//   - 单测可覆盖 X-Connection-Trace-Id 转发(plan §3.2 A.2 隐式契约)而无需拉 docker
+//   - hop-by-hop 列表 / CRLF 防护是安全敏感逻辑,seam 后改动可见性更高
+//
+// 行为细节:
+//   - hop-by-hop drop 仅在非 WS 路径触发;WS upgrade 保留 Connection + Upgrade
+//   - validHeaderValue 不合规(含 CR/LF)的 header value 被**整条丢弃**而非 strip
+//     (与历史一致;若改成 strip 会改变语义,且 CRLF 注入用 strip 兜底反而留隐患)
+//   - X-Connection-Trace-Id / X-Openclaude-Trace-Id 不在 hop-by-hop 列表 → 透传给上游容器
+func buildUpstreamRequest(
+	method, upstreamPath, host string,
+	headers http.Header,
+	isWs bool,
+) []byte {
+	hop := map[string]bool{
+		"Connection":          true,
+		"Keep-Alive":          true,
+		"Proxy-Authenticate":  true,
+		"Proxy-Authorization": true,
+		"Te":                  true,
+		"Trailers":            true,
+		"Transfer-Encoding":   true,
+		"Upgrade":             true,
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, singleLine(upstreamPath)))
+	sb.WriteString("Host: " + singleLine(host) + "\r\n")
+	for k, vs := range headers {
+		if hop[http.CanonicalHeaderKey(k)] && !isWs {
+			continue
+		}
+		for _, v := range vs {
+			if !validHeaderValue(v) {
+				// CRLF 注入防御:含 CR/LF 的 value 整条丢弃(不 strip)
+				continue
+			}
+			sb.WriteString(k + ": " + v + "\r\n")
+		}
+	}
+	if isWs {
+		// 保证 Connection: Upgrade 存在(若客户端的 Connection 头不是 upgrade,补一行)
+		if !strings.EqualFold(headers.Get("Connection"), "upgrade") {
+			sb.WriteString("Connection: Upgrade\r\n")
+		}
+	}
+	sb.WriteString("\r\n")
+	return []byte(sb.String())
+}
+
 // proxy hijack 之后手写 HTTP 并做 bi-di copy。
+//
+// V3 S12e CG5:logger 从 r.Context() 取(trace 包注入 connectionTraceId + cid),
+// "tunnel opened" log 在 upstream header write + buffered flush 都 OK 后才打,
+// "tunnel closed" log 在 bi-di copy 两端都收回后打,保证日志反映真实数据面状态。
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, target, upstreamPath string) {
+	l := trace.LoggerFromContext(r.Context())
 	// WS 需要 hijack;普通 HTTP 也走 hijack 简化实现
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -131,67 +195,34 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, target, upstream
 	clientConn, clientRw, err := hj.Hijack()
 	if err != nil {
 		_ = upstream.Close()
-		logging.L().Error("hijack failed", "err", err.Error())
+		l.Error("hijack failed", "err", err.Error())
 		return
 	}
 	defer clientConn.Close()
 	defer upstream.Close()
 
-	// 构造上游 request line + headers
-	// 去掉 hop-by-hop headers
-	hop := map[string]bool{
-		"Connection":          true,
-		"Keep-Alive":          true,
-		"Proxy-Authenticate":  true,
-		"Proxy-Authorization": true,
-		"Te":                  true,
-		"Trailers":            true,
-		"Transfer-Encoding":   true,
-		"Upgrade":             true,
-	}
 	isWs := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
-
-	// 重建 request
-	reqLine := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, singleLine(upstreamPath))
 	host := r.Host
 	if host == "" {
 		host = target
 	}
-	var sb strings.Builder
-	sb.WriteString(reqLine)
-	sb.WriteString("Host: " + singleLine(host) + "\r\n")
-	for k, vs := range r.Header {
-		if hop[http.CanonicalHeaderKey(k)] && !isWs {
-			continue
-		}
-		// WS 需要保留 Upgrade/Connection
-		for _, v := range vs {
-			if !validHeaderValue(v) {
-				continue
-			}
-			sb.WriteString(k + ": " + v + "\r\n")
-		}
-	}
-	if isWs {
-		// 确保 Connection: Upgrade 和 Upgrade: websocket 存在
-		if !strings.EqualFold(r.Header.Get("Connection"), "upgrade") {
-			sb.WriteString("Connection: Upgrade\r\n")
-		}
-	}
-	sb.WriteString("\r\n")
+	upstreamReq := buildUpstreamRequest(r.Method, upstreamPath, host, r.Header, isWs)
 
-	if _, err := upstream.Write([]byte(sb.String())); err != nil {
-		logging.L().Error("upstream write header failed", "err", err.Error())
+	if _, err := upstream.Write(upstreamReq); err != nil {
+		l.Error("upstream write header failed", "err", err.Error())
 		return
 	}
 
 	// 如果 client 已有 buffered bytes(hijack 从 bufio.Reader 拿的),先 flush 到 upstream
 	if clientRw != nil && clientRw.Reader.Buffered() > 0 {
 		if _, err := io.CopyN(upstream, clientRw.Reader, int64(clientRw.Reader.Buffered())); err != nil {
-			logging.L().Warn("flush buffered failed", "err", err.Error())
+			l.Warn("flush buffered failed", "err", err.Error())
 			return
 		}
 	}
+
+	// 数据面真正打通,此时才算 "tunnel opened"。
+	l.Info("tunnel opened", "target", target, "isWs", isWs)
 
 	// bi-di copy
 	errc := make(chan error, 2)
@@ -212,6 +243,10 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, target, upstream
 	}()
 	<-errc
 	<-errc
+
+	// 两端都收回后才打 closed,defer 的触发顺序不能保证落在 bi-di 完成之后,
+	// 显式放在末尾比 defer 更准确。
+	l.Info("tunnel closed", "target", target)
 }
 
 // deniedPorts:明确列出的常见管理 / 数据库 / 缓存 / search / mail 端口。

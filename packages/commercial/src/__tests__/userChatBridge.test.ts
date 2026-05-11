@@ -21,6 +21,7 @@ import * as http from "node:http";
 import * as net from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import { signAccess } from "../auth/jwt.js";
+import type { Logger } from "../logging/logger.js";
 import {
   createUserChatBridge,
   ContainerUnreadyError,
@@ -57,6 +58,7 @@ async function startRig(opts: {
     uid: bigint,
     role: "user" | "admin",
   ) => Promise<(modelId: string) => boolean>;
+  logger?: Logger;
 } = {}): Promise<TestRig> {
   // 1) mock 容器 ws server
   const containerSeen: Array<{ data: string | Buffer; isBinary: boolean }> = [];
@@ -89,6 +91,7 @@ async function startRig(opts: {
     containerConnectTimeoutMs: 1500,
     markContainerActivity: opts.markContainerActivity,
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
+    logger: opts.logger,
   });
 
   // 3) gateway HTTP server,只挂 bridge upgrade
@@ -640,6 +643,9 @@ describe("userChatBridge — tunnel routing (regression)", () => {
     let directDialed = false;
     const tunnelCalls: Array<{
       hostId: string; containerInternalId: string; port: number;
+      // S12e CG4:bridge 应把 connId(server-side randomUUID)透传到 tunnel 工厂的
+      // 第 4 形参,用于 outgoing WS upgrade 的 X-Connection-Trace-Id 头。
+      connectionTraceId: string;
     }> = [];
 
     const fakeNodeAgent = {
@@ -670,12 +676,13 @@ describe("userChatBridge — tunnel routing (regression)", () => {
         // 返回一个不会 connect 的 ws,避免污染 mock 容器
         return new WebSocket(`ws://127.0.0.1:1/__should-not-be-called__`);
       },
-      // tunnel 工厂:实际就连本地 mock 容器 ws,把 hostId/cid/port 记下来给断言
-      createTunnelContainerSocket: async (tunnel, port, _signal) => {
+      // tunnel 工厂:实际就连本地 mock 容器 ws,把 hostId/cid/port/connectionTraceId 记下来给断言
+      createTunnelContainerSocket: async (tunnel, port, _signal, connectionTraceId) => {
         tunnelCalls.push({
           hostId: tunnel.hostId,
           containerInternalId: tunnel.containerInternalId,
           port,
+          connectionTraceId,
         });
         return new WebSocket(`ws://127.0.0.1:${containerPort}/ws`);
       },
@@ -713,6 +720,14 @@ describe("userChatBridge — tunnel routing (regression)", () => {
       assert.equal(tunnelCalls[0]!.hostId, "host-remote");
       assert.equal(tunnelCalls[0]!.port, 18789);
       assert.ok(tunnelCalls[0]!.containerInternalId.startsWith("deadbeef"));
+      // S12e CG4:bridge 必须把 connId(randomUUID)透传到 tunnel 工厂第 4 形参,
+      // 用于 outgoing tunnel WS upgrade 的 X-Connection-Trace-Id 头。本断言只校验
+      // 格式(36-char UUID),具体值由 bridge 内部生成,不需要测试可预测。
+      assert.match(
+        tunnelCalls[0]!.connectionTraceId,
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+        "connectionTraceId 应是 36-char UUID(randomUUID),用作 connection-level trace",
+      );
       assert.equal(containerSeen.length, 1, "用户帧应通过 tunnel 工厂的 ws 传到容器");
 
       ws.close();
@@ -842,7 +857,12 @@ describe("userChatBridge — model authorization", () => {
       ws.send(JSON.stringify({ type: "inbound.message", model: "claude-opus-4-7" }));
       const got = await seenP;
       const text = typeof got.data === "string" ? got.data : got.data.toString("utf8");
-      assert.deepEqual(JSON.parse(text), { type: "inbound.message", model: "claude-opus-4-7" });
+      // CG2a:inbound.message 现在会被 master 注入 traceId(32-hex)— 验类型 + model 透传 +
+      // traceId 存在,但不绑定具体值(每 turn 随机)。
+      const forwarded = JSON.parse(text) as Record<string, unknown>;
+      assert.equal(forwarded.type, "inbound.message");
+      assert.equal(forwarded.model, "claude-opus-4-7");
+      assert.match(forwarded.traceId as string, /^[a-f0-9]{32}$/);
 
       ws.close();
       await waitClose(ws);
@@ -1303,5 +1323,267 @@ describe("tryAutoRebindFlush regression tripwire", () => {
       "finally 块里再触发 tryAutoRebindFlush 的 if 条件必须包含 progressMade," +
         "不能只看 size > 0 (会触发 V8 microtask 死循环 — 见 v1.0.119 复盘)",
     );
+  });
+});
+
+// ------- CG2a: master canonical traceId 注入 + clientTraceId observation ---
+//
+// plan §3.6 测试 3 用例:
+//   (a) 无 clientTraceId → frame.traceId 是 32-hex 新生成,不等于 connId;
+//                          logger 含 traceId 字段,不含 clientTraceId/Issue
+//   (b) 合法 clientTraceId → frame.traceId 是新 canonical(不复用 clientTraceId);
+//                            logger 含 clientTraceId 原值,不含 clientTraceIdIssue
+//   (c) 非法 charset → canonical 仍生成;logger 只有 clientTraceIdIssue:'bad-charset';
+//                      **mock 容器收到的 frame 不含 clientTraceId 字段**(MAJOR 1 sanitize)
+//   (d) 超长 → logger clientTraceIdIssue:'too-long';frame strip clientTraceId
+//   (e) 同 connection 多 turn → 两次 frame.traceId 不同,均 32-hex,均不复用 clientTraceId
+
+interface CapturedLog {
+  level: "info" | "warn" | "error" | "debug" | "trace";
+  msg: string;
+  fields?: Record<string, unknown>;
+}
+
+function makeCaptureLogger(): { log: Logger; logs: CapturedLog[] } {
+  const logs: CapturedLog[] = [];
+  // CG2b — child 返回累计 bindings 的子 logger;emit 时 spread base+fields 到 logs。
+  // 这样 turnLog/connLog 的 child bindings(uid/connId/traceId)能进 fields,便于断言。
+  function makeLogger(base: Record<string, unknown>): Logger {
+    const mk = (level: CapturedLog["level"]) =>
+      (msg: string, fields?: Record<string, unknown>) => {
+        logs.push({ level, msg, fields: { ...base, ...fields } });
+      };
+    const self: Logger = {
+      trace: mk("trace"),
+      debug: mk("debug"),
+      info: mk("info"),
+      warn: mk("warn"),
+      error: mk("error"),
+      child: (bindings) => makeLogger({ ...base, ...bindings }),
+    };
+    return self;
+  }
+  return { log: makeLogger({}), logs };
+}
+
+/** 等容器侧收到 1 条 message frame 的工具。 */
+async function waitContainerMessage(
+  rig: TestRig,
+  containerWs: WebSocket,
+  timeoutMs = 1500,
+): Promise<Record<string, unknown>> {
+  void rig;
+  return new Promise<Record<string, unknown>>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("container did not receive frame in time")), timeoutMs);
+    containerWs.once("message", (data) => {
+      clearTimeout(t);
+      const text = typeof data === "string"
+        ? data
+        : Buffer.isBuffer(data)
+          ? data.toString("utf8")
+          : Buffer.concat(data as Buffer[]).toString("utf8");
+      try { resolve(JSON.parse(text) as Record<string, unknown>); }
+      catch (e) { reject(e as Error); }
+    });
+  });
+}
+
+const TRACE_ID_REGEX = /^[A-Za-z0-9_-]{16,64}$/;
+const TURN_START_MSG = "user-chat-bridge: inbound turn start";
+
+describe("userChatBridge — CG2a canonical traceId injection", () => {
+  let rig: TestRig;
+  let logs: CapturedLog[];
+
+  before(async () => {
+    const capture = makeCaptureLogger();
+    logs = capture.logs;
+    rig = await startRig({ logger: capture.log });
+  });
+  after(async () => { await stopRig(rig); });
+
+  test("(a) inbound.message 无 clientTraceId → frame.traceId 是新 32-hex,logger 无 client 字段", async () => {
+    logs.length = 0;
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("9001");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    const containerWs = await containerOpenP;
+
+    const recvP = waitContainerMessage(rig, containerWs);
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "peer-a", kind: "dm" },
+      channel: "webchat",
+      content: { text: "hi" },
+    }));
+    const frame = await recvP;
+
+    assert.equal(typeof frame.traceId, "string", "frame 必须含 traceId");
+    assert.match(frame.traceId as string, /^[a-f0-9]{32}$/, "32-hex from randomBytes");
+    assert.ok(!("clientTraceId" in frame), "无 clientTraceId 字段(未传)");
+    // V3 S12e CG10 — Contract 5a 私字段-absence 回归保护:bridge inbound
+    // forward 路径绝不能把任何 `_`-prefix routing 字段(_userId / _traceId /
+    // _connectionTraceId 等)stamp 到过线的 wire frame 上。私字段只属于
+    // gateway-side stash,跨进程 leak 会破坏 contract A/B 的私公分离。
+    const privateKeys = Object.keys(frame).filter((k) => k.startsWith("_"));
+    assert.deepEqual(
+      privateKeys, [],
+      `wire frame must not carry _-prefixed private fields; got: ${privateKeys.join(",")}`,
+    );
+
+    const turnLog = logs.find((l) => l.msg === TURN_START_MSG);
+    assert.ok(turnLog, "找不到 turn start log");
+    // CG2b — uid/connId/traceId 三件套均从 connLog→turnLog child bindings 注入。
+    assert.equal(turnLog!.fields?.uid, "9001", "uid 经 connLog binding 注入");
+    assert.equal(typeof turnLog!.fields?.connId, "string", "connId 经 connLog binding 注入");
+    assert.equal(turnLog!.fields?.traceId, frame.traceId);
+    assert.ok(!("clientTraceId" in (turnLog!.fields ?? {})), "无 clientTraceId");
+    assert.ok(!("clientTraceIdIssue" in (turnLog!.fields ?? {})), "无 clientTraceIdIssue");
+
+    ws.close();
+    await waitClose(ws);
+  });
+
+  test("(b) 合法 clientTraceId → frame.traceId 独立 canonical,logger 含 clientTraceId 原值", async () => {
+    logs.length = 0;
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("9002");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    const containerWs = await containerOpenP;
+
+    const legalClientTrace = "client-1234567890abcdef";
+    const recvP = waitContainerMessage(rig, containerWs);
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "peer-b", kind: "dm" },
+      channel: "webchat",
+      content: { text: "hi" },
+      clientTraceId: legalClientTrace,
+    }));
+    const frame = await recvP;
+
+    assert.equal(typeof frame.traceId, "string");
+    assert.notEqual(frame.traceId, legalClientTrace, "canonical 必须独立生成,不复用 client 值");
+    assert.match(frame.traceId as string, /^[a-f0-9]{32}$/);
+    // 合法 clientTraceId 应保留透传(plan §3.5)
+    assert.equal(frame.clientTraceId, legalClientTrace, "合法 clientTraceId 透传");
+
+    const turnLog = logs.find((l) => l.msg === TURN_START_MSG);
+    assert.ok(turnLog);
+    assert.equal(turnLog!.fields?.clientTraceId, legalClientTrace);
+    assert.ok(!("clientTraceIdIssue" in (turnLog!.fields ?? {})));
+
+    ws.close();
+    await waitClose(ws);
+  });
+
+  test("(c) 非法 charset clientTraceId → logger 只记 issue,frame strip clientTraceId", async () => {
+    logs.length = 0;
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("9003");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    const containerWs = await containerOpenP;
+
+    const recvP = waitContainerMessage(rig, containerWs);
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "peer-c", kind: "dm" },
+      channel: "webchat",
+      content: { text: "hi" },
+      clientTraceId: "../etc/passwd_abc",
+    }));
+    const frame = await recvP;
+
+    assert.match(frame.traceId as string, TRACE_ID_REGEX, "canonical 仍生成");
+    assert.ok(!("clientTraceId" in frame), "非法 clientTraceId 必须从 forward frame strip");
+
+    const turnLog = logs.find((l) => l.msg === TURN_START_MSG);
+    assert.ok(turnLog);
+    assert.equal(turnLog!.fields?.clientTraceIdIssue, "bad-charset");
+    assert.ok(!("clientTraceId" in (turnLog!.fields ?? {})),
+      "MAJOR 2:非法 raw 值禁止进入 logger");
+
+    ws.close();
+    await waitClose(ws);
+  });
+
+  test("(d) 超长 clientTraceId → logger 只记 too-long,frame strip", async () => {
+    logs.length = 0;
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("9004");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    const containerWs = await containerOpenP;
+
+    const recvP = waitContainerMessage(rig, containerWs);
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "peer-d", kind: "dm" },
+      channel: "webchat",
+      content: { text: "hi" },
+      clientTraceId: "a".repeat(65),
+    }));
+    const frame = await recvP;
+
+    assert.match(frame.traceId as string, TRACE_ID_REGEX);
+    assert.ok(!("clientTraceId" in frame), "超长值必须 strip(防超长字符串撑大下游 log)");
+
+    const turnLog = logs.find((l) => l.msg === TURN_START_MSG);
+    assert.ok(turnLog);
+    assert.equal(turnLog!.fields?.clientTraceIdIssue, "too-long");
+    assert.ok(!("clientTraceId" in (turnLog!.fields ?? {})));
+
+    ws.close();
+    await waitClose(ws);
+  });
+
+  test("(e) 同 connection 多 turn → 两次 traceId 不同,均 canonical", async () => {
+    logs.length = 0;
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("9005");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    const containerWs = await containerOpenP;
+
+    const recvP1 = waitContainerMessage(rig, containerWs);
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "peer-e", kind: "dm" },
+      channel: "webchat",
+      content: { text: "turn 1" },
+    }));
+    const frame1 = await recvP1;
+
+    const recvP2 = waitContainerMessage(rig, containerWs);
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "peer-e", kind: "dm" },
+      channel: "webchat",
+      content: { text: "turn 2" },
+    }));
+    const frame2 = await recvP2;
+
+    assert.match(frame1.traceId as string, /^[a-f0-9]{32}$/);
+    assert.match(frame2.traceId as string, /^[a-f0-9]{32}$/);
+    assert.notEqual(frame1.traceId, frame2.traceId,
+      "每个 turn canonical 必须独立生成,不可复用上一 turn");
+
+    const turnStartLogs = logs.filter((l) => l.msg === TURN_START_MSG);
+    assert.equal(turnStartLogs.length, 2);
+    assert.notEqual(turnStartLogs[0]!.fields?.traceId, turnStartLogs[1]!.fields?.traceId);
+    // CG2b — 两个 turn 共享同一 connId(从 connLog 派生),uid 也都为 "9005"
+    assert.equal(turnStartLogs[0]!.fields?.uid, "9005");
+    assert.equal(turnStartLogs[1]!.fields?.uid, "9005");
+    assert.equal(
+      turnStartLogs[0]!.fields?.connId,
+      turnStartLogs[1]!.fields?.connId,
+      "同 connection 两 turn 必共享 connId binding",
+    );
+
+    ws.close();
+    await waitClose(ws);
   });
 });

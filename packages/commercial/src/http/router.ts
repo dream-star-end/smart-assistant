@@ -192,6 +192,10 @@ import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { writeAdminAudit } from '../admin/audit.js'
 import { getPool } from '../db/index.js'
 import { isInMaintenance, isActiveAdmin } from '../middleware/maintenanceMode.js'
+// V3 S12e CG9 — contract D (deploy smoke) trace-id child binding on HTTP
+// request logger. master HTTP segment is the ONLY commercial path that reads
+// X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
+import { parseTraceIdCandidate, newTraceId } from '@openclaude/protocol'
 
 /**
  * **P0 — v3 multi-tenant leak firewall** (2026-04-22)
@@ -979,11 +983,22 @@ export function createCommercialHandler(
     // V3 2I-1:在 dispatch 前派生 per-request logger,挂进 ctx;
     // 任何下游 handler / preCheck / proxy / finalize 都通过 ctx.log 派生子 logger,
     // requestId 自然贯穿,且基底 binding(route/method/clientIp)一次性写明
+    //
+    // V3 S12e CG9 — extract X-Trace-Id header (turn-level trace, contract D
+    // smoke canary). master-canonical fallback: if the client sent garbage,
+    // newTraceId() so reqLog ALWAYS has a traceId binding — that's what
+    // verify_trace_propagation in smoke-v3.sh greps for. Plan §510 spec.
+    const rawTrace = req.headers['x-trace-id']
+    const traceCand = parseTraceIdCandidate(
+      Array.isArray(rawTrace) ? rawTrace[0] : rawTrace,
+    )
+    const traceId = traceCand.ok ? traceCand.traceId : newTraceId()
     const reqLog: Logger = httpLogger.child({
       requestId,
       route: labelRoute,
       method,
       clientIp: clientIpOf(req),
+      traceId,
     })
 
     const ctx: RequestContext = {

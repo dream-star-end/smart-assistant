@@ -1,6 +1,16 @@
 import { type Static, Type } from '@sinclair/typebox'
 
 // ───────────────────────────────────────────────
+// V3 S12e — trace id schema fragment
+// ───────────────────────────────────────────────
+// 同源真值在 `./traceId.ts` 的 TRACE_ID_REGEX。这里复用同一 pattern 字符串
+// 让 TypeBox `Value.Check` 在 frames schema 测试里能拒非法值;运行时实际
+// 校验全部走 `parseTraceIdCandidate()`(schema check 不在热路径上)。
+// pattern 字段是 TypeBox 透传给 JSON Schema 的 `pattern`,Value.Check 会真校验。
+const TRACE_ID_PATTERN = '^[A-Za-z0-9_-]{16,64}$'
+const TraceIdString = Type.String({ pattern: TRACE_ID_PATTERN })
+
+// ───────────────────────────────────────────────
 // Common
 // ───────────────────────────────────────────────
 export const Peer = Type.Object({
@@ -75,6 +85,11 @@ export const InboundMessage = Type.Object({
   // 容器侧不验证、不生成、也不回退 — 不带就跳过 codex 真扣费链路。其它 agent
   // 路径完全不读这个字段,纯添加项,跟现有协议 100% 向后兼容。
   requestId: Type.Optional(Type.String()),
+  // V3 S12e — 客户端可选 observation。master 收到后 `parseTraceIdCandidate`,
+  // 合法值进 logger context 作 client 自有 trace 关联键(不影响 canonical),
+  // 非法值 strip 后只记 `clientTraceIdIssue` 枚举(防 log injection)。
+  // 不参与 turn-level canonical:master 永远 `newTraceId()` 重新生成。
+  clientTraceId: Type.Optional(TraceIdString),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>
@@ -183,6 +198,10 @@ export const OutboundMessage = Type.Object({
   peer: Peer,
   blocks: Type.Array(OutboundContentBlock),
   isFinal: Type.Boolean(),
+  // V3 S12e — per-turn canonical 由 master 生成、container gateway
+  // `dispatchInbound` 在 wire 发送前 stamp 到 frame。Optional 是给老路径
+  // (cron / control / 非 turn deliver)留向后兼容口子,这些路径走 S11c。
+  traceId: Type.Optional(TraceIdString),
   meta: Type.Optional(
     Type.Object({
       cost: Type.Optional(Type.Number()),
@@ -214,6 +233,9 @@ export const OutboundPermissionRequest = Type.Object({
   toolUseId: Type.Optional(Type.String()),
   inputPreview: Type.Optional(Type.String()),
   inputJson: Type.Optional(Type.Unknown()),
+  // V3 S12e — 由 dispatchInbound stamp,标记触发本次 permission 的 turn。
+  // permission_settled 是 cross-turn lifecycle 帧,**不在** S12e 范围。
+  traceId: Type.Optional(TraceIdString),
 })
 export type OutboundPermissionRequest = Static<typeof OutboundPermissionRequest>
 
@@ -312,6 +334,8 @@ export const OutboundError = Type.Object({
   detail: Type.Optional(Type.String()),
   /** 故意 false:本帧不是 turn 终止器,后续紧跟一帧 outbound.message isFinal=true。 */
   isFinal: Type.Literal(false),
+  // V3 S12e — 跟随 outbound.message 同 turn 的 trace。
+  traceId: Type.Optional(TraceIdString),
 })
 export type OutboundError = Static<typeof OutboundError>
 
@@ -381,6 +405,10 @@ export const OutboundCodexBilling = Type.Object({
       reset7d: Type.Optional(Type.String()),
     }),
   ),
+  // V3 S12e — billing 帧标记触发 codex turn 的 trace,允许 master settleCodexUsageAndLedger
+  // 把扣费日志 join 到同 turn 链路上(inflight 行已携同 trace,本字段更多是 redundant
+  // 防丢观察值)。
+  traceId: Type.Optional(TraceIdString),
 })
 export type OutboundCodexBilling = Static<typeof OutboundCodexBilling>
 

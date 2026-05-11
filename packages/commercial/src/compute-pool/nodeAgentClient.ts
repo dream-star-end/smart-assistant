@@ -50,8 +50,55 @@ import {
 } from "./types.js";
 import { decryptAgentPsk, isSelfPlaceholder } from "./crypto.js";
 import { promises as fs } from "node:fs";
+import {
+  TRACE_ID_HEADER,
+  newTraceId,
+  parseTraceIdCandidate,
+} from "@openclaude/protocol";
 
 const log = rootLogger.child({ subsys: "node-agent-client" });
+
+/**
+ * CG3 helper — 把 opts.traceId 解成将要写到 `x-openclaude-trace-id` 头上的最终 trace id。
+ *
+ * 行为表:
+ * | opts.traceId        | 返回                  | 副作用                |
+ * | ------------------- | --------------------- | --------------------- |
+ * | undefined           | newTraceId() ephemeral | (无)                  |
+ * | 合法 string         | opts.traceId 原样     | (无)                  |
+ * | 非法(非 string / 长度越界 / 字符集错) | newTraceId() ephemeral | console.warn(不打 raw) |
+ *
+ * 设计动机:
+ * - 非 turn-bound caller(cert renew、baseline poller)不持 turn 上下文 → undefined 不算
+ *   错误,ephemeral 即可;不发 warn 避免噪音。
+ * - 非法值是 programmer error 或上游被污染数据 → 必须告警,但**不**带 raw 值入日志
+ *   (攻击者可能控制该字符串,防 log injection / 撑大字段)。issue 枚举来自
+ *   `parseTraceIdCandidate`,与 Go ParseTraceIDCandidate 共享 fixture(CG10)。
+ *
+ * 用 `console.warn` 而非 logger.warn:这是 client 模块的低频 programmer-error 路径,
+ * 引入 module-level logger 注入会让 pure RPC client 变得复杂,不划算。事件名稳定
+ * 字符串 "trace-id-invalid" 便于 grep / Loki 告警。
+ *
+ * 导出供单测使用(`_` 前缀 = 模块内部 seam,业务代码不应直接调用)。
+ */
+export function _resolveEffectiveTraceId(
+  rawTraceId: string | undefined,
+  hostId: string,
+  path: string,
+): string {
+  if (rawTraceId === undefined) return newTraceId();
+  const parsed = parseTraceIdCandidate(rawTraceId);
+  if (parsed.ok) return parsed.traceId;
+  const fresh = newTraceId();
+  console.warn("node-agent-client: invalid trace id, regenerated", {
+    event: "trace-id-invalid",
+    hostId,
+    path,
+    issue: parsed.issue,
+    // 故意不打 raw 值;不打 fresh 以避免 log 污染语义(fresh 是 ephemeral,无追溯意义)
+  });
+  return fresh;
+}
 
 /** 单请求默认超时,秒。tunnel socket 不走这条路径,不受限。 */
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -252,6 +299,17 @@ interface RpcOptions {
   rawContentType?: string;
   /** 覆盖默认 30s。 */
   timeoutMs?: number;
+  /**
+   * CG3: 透传给 node-agent 的 trace id。
+   *
+   * - 合法(parseTraceIdCandidate ok)→ 原样写到 `x-openclaude-trace-id` 头
+   * - 非法或缺失 → rpcCall 内生成 ephemeral trace(newTraceId)+ console.warn
+   *
+   * 调用方契约:caller 应该传 turn-level 或 connection-level canonical traceId;
+   * undefined 在控制平面里通常是 "non-turn-bound" 路径(certRenew / baseline poller)
+   * — 这些 caller 不持有 turn 上下文,接受 ephemeral fallback 即可,不算错误。
+   */
+  traceId?: string;
 }
 
 async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T> {
@@ -276,6 +334,8 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
     headers["content-type"] = bodyContentType!;
     headers["content-length"] = bodyBuf.length;
   }
+  // CG3: trace id 头注入,跨 master → node-agent 边界。详见 _resolveEffectiveTraceId。
+  headers[TRACE_ID_HEADER] = _resolveEffectiveTraceId(opts.traceId, target.hostId, opts.path);
   if (target.psk) {
     headers["authorization"] = `Bearer ${target.psk.toString("hex")}`;
   }
@@ -391,6 +451,7 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
 export async function runContainer(
   target: NodeAgentTarget,
   spec: AgentRunContainerRequest,
+  opts?: { traceId?: string },
 ): Promise<AgentRunContainerResponse> {
   return rpcCall<AgentRunContainerResponse>(target, {
     path: "/containers/run",
@@ -398,17 +459,20 @@ export async function runContainer(
     body: spec,
     // 启容器包含 docker pull 等可能变慢,拉长到 120s
     timeoutMs: 120_000,
+    traceId: opts?.traceId,
   });
 }
 
 export async function stopContainer(
   target: NodeAgentTarget,
   containerInternalId: string,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall(target, {
     path: `/containers/${encodeURIComponent(containerInternalId)}/stop`,
     method: "POST",
     timeoutMs: 60_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -416,21 +480,25 @@ export async function removeContainer(
   target: NodeAgentTarget,
   containerInternalId: string,
   force = true,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall(target, {
     path: `/containers/${encodeURIComponent(containerInternalId)}/remove?force=${force ? 1 : 0}`,
     method: "POST",
     timeoutMs: 60_000,
+    traceId: opts?.traceId,
   });
 }
 
 export async function inspectContainer(
   target: NodeAgentTarget,
   containerInternalId: string,
+  opts?: { traceId?: string },
 ): Promise<AgentContainerInspect> {
   return rpcCall<AgentContainerInspect>(target, {
     path: `/containers/${encodeURIComponent(containerInternalId)}/inspect`,
     method: "GET",
+    traceId: opts?.traceId,
   });
 }
 
@@ -451,41 +519,49 @@ export async function inspectContainer(
 export async function inspectImage(
   target: NodeAgentTarget,
   tag: string,
+  opts?: { traceId?: string },
 ): Promise<AgentImageInspect> {
   return rpcCall<AgentImageInspect>(target, {
     path: "/image/inspect",
     method: "POST",
     body: { tag },
     timeoutMs: 15_000,
+    traceId: opts?.traceId,
   });
 }
 
 export async function listContainers(
   target: NodeAgentTarget,
+  opts?: { traceId?: string },
 ): Promise<AgentContainerInspect[]> {
   return rpcCall<AgentContainerInspect[]>(target, {
     path: "/containers",
     method: "GET",
+    traceId: opts?.traceId,
   });
 }
 
 export async function healthCheck(
   target: NodeAgentTarget,
+  opts?: { traceId?: string },
 ): Promise<AgentHealthResponse> {
   return rpcCall<AgentHealthResponse>(target, {
     path: "/health",
     method: "GET",
     timeoutMs: 5_000,
+    traceId: opts?.traceId,
   });
 }
 
 export async function bootstrapVerify(
   target: NodeAgentTarget,
+  opts?: { traceId?: string },
 ): Promise<{ ok: boolean; checks: Record<string, boolean>; message?: string }> {
   return rpcCall(target, {
     path: "/bootstrap/verify",
     method: "POST",
     timeoutMs: 20_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -497,12 +573,14 @@ export async function bootstrapVerify(
 export async function requestRenewCert(
   target: NodeAgentTarget,
   nonce: string,
+  opts?: { traceId?: string },
 ): Promise<{ csrPem: string }> {
   return rpcCall(target, {
     path: "/renew-cert",
     method: "POST",
     body: { nonce },
     timeoutMs: 20_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -510,12 +588,14 @@ export async function deliverRenewedCert(
   target: NodeAgentTarget,
   nonce: string,
   certPem: string,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall(target, {
     path: "/renew-cert/deliver",
     method: "POST",
     body: { nonce, certPem },
     timeoutMs: 15_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -525,12 +605,14 @@ export async function deliverRenewedCert(
 export async function createVolume(
   target: NodeAgentTarget,
   name: string,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall<void>(target, {
     path: "/volumes/create",
     method: "POST",
     body: { name },
     timeoutMs: 30_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -538,11 +620,13 @@ export async function createVolume(
 export async function removeVolume(
   target: NodeAgentTarget,
   name: string,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall<void>(target, {
     path: `/volumes/${encodeURIComponent(name)}`,
     method: "DELETE",
     timeoutMs: 30_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -555,11 +639,13 @@ export interface AgentVolumeInspect {
 export async function inspectVolume(
   target: NodeAgentTarget,
   name: string,
+  opts?: { traceId?: string },
 ): Promise<AgentVolumeInspect> {
   return rpcCall<AgentVolumeInspect>(target, {
     path: `/volumes/${encodeURIComponent(name)}`,
     method: "GET",
     timeoutMs: 15_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -587,6 +673,7 @@ export async function putFile(
   mode: number = 0o600,
   ownerUid?: number,
   ownerGid?: number,
+  opts?: { traceId?: string },
 ): Promise<void> {
   let qs =
     "?path=" +
@@ -614,6 +701,7 @@ export async function putFile(
     rawBody: content,
     rawContentType: "application/octet-stream",
     timeoutMs: 60_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -621,11 +709,13 @@ export async function putFile(
 export async function deleteFile(
   target: NodeAgentTarget,
   remotePath: string,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall<void>(target, {
     path: "/files?path=" + encodeURIComponent(remotePath),
     method: "DELETE",
     timeoutMs: 15_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -640,11 +730,13 @@ export interface AgentFileStat {
 export async function statFile(
   target: NodeAgentTarget,
   remotePath: string,
+  opts?: { traceId?: string },
 ): Promise<AgentFileStat> {
   return rpcCall<AgentFileStat>(target, {
     path: "/files/stat?path=" + encodeURIComponent(remotePath),
     method: "GET",
     timeoutMs: 15_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -678,12 +770,14 @@ export interface SshMuxStartArgs {
 export async function startSshControlMaster(
   target: NodeAgentTarget,
   args: SshMuxStartArgs,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall<void>(target, {
     method: "POST",
     path: "/sshmux/start",
     body: args,
     timeoutMs: 30_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -691,12 +785,14 @@ export async function stopSshControlMaster(
   target: NodeAgentTarget,
   uid: number,
   hid: string,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall<void>(target, {
     method: "POST",
     path: "/sshmux/stop",
     body: { uid, hid },
     timeoutMs: 15_000,
+    traceId: opts?.traceId,
   });
 }
 
@@ -708,27 +804,31 @@ export async function stopSshControlMaster(
  */
 export async function triggerBaselineRefresh(
   target: NodeAgentTarget,
+  opts?: { traceId?: string },
 ): Promise<void> {
   await rpcCall<void>(target, {
     path: "/baseline/refresh",
     method: "POST",
     // 节点 ForceRefresh 内部 2min 预算,master 侧给 150s 富余
     timeoutMs: 150_000,
+    traceId: opts?.traceId,
   });
 }
 
 /**
  * GET /baseline/version → {version}。poller 禁用时返 503。
  * opts.timeoutMs 可覆盖默认 10s;admin 聚合查询用更短 timeout 防慢 host 拖累响应。
+ * opts.traceId 透传 trace id 头(CG3)。
  */
 export async function getBaselineVersion(
   target: NodeAgentTarget,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; traceId?: string },
 ): Promise<string> {
   const r = await rpcCall<{ version: string }>(target, {
     path: "/baseline/version",
     method: "GET",
     timeoutMs: opts?.timeoutMs ?? 10_000,
+    traceId: opts?.traceId,
   });
   return r.version ?? "";
 }

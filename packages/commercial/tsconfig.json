@@ -8,6 +8,7 @@
   "references": [
     { "path": "../gateway" },
     { "path": "../storage" },
-    { "path": "../channels/wechat" }
+    { "path": "../channels/wechat" },
+    { "path": "../protocol" }
   ]
 }

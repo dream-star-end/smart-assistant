@@ -38,6 +38,45 @@ export interface CreateTunnelContainerSocketOpts {
   maxFrameBytes: number;
   /** WS upgrade 握手超时 ms,默认 5000。connect 已经在 dial 阶段完成,这只算 ws 自身 handshake。 */
   handshakeTimeoutMs?: number;
+  /**
+   * S12e CG4:connection-level trace id(合同 A),写入 outgoing `X-Connection-Trace-Id`
+   * header。**必传** —— caller(userChatBridge)传 server-side 生成的 `connId`(randomUUID),
+   * 不是不可信外部输入,所以本函数不调用 parseTraceIdCandidate / 不做格式校验:
+   * - undefined 落到 headers 让 ws 库抛错比静默兜底好(程序员错应立即可见)
+   * - 合法 UUID(32 hex+4 dash = 36 char)落在 TRACE_ID_REGEX 兼容范围内
+   *
+   * 与 CG3 `nodeAgentClient.rpcCall(opts.traceId)` 区分:
+   * - CG3 控制面 RPC,caller 可能在调用栈深处 / undefined / 任意 string → 必须 parse+fallback
+   * - CG4 数据面 tunnel,caller 单一固定(bridge connId),server-trusted → 直写
+   */
+  connectionTraceId: string;
+}
+
+/**
+ * S12e CG4 test seam — pure helper 用于构造 tunnel WS upgrade 的 headers。
+ *
+ * 抽出来的原因:tunnelContainerSocket.ts 用 static ESM import 拉 ws + dialNodeAgentVerifiedTls,
+ * Node 20.20.2 没有稳定的 module mock 机制(`t.mock.module()` Node 22.3+ experimental),
+ * 整体函数难单测;把 headers 构造抽成 pure helper 是最小风险的可单测边界。
+ *
+ * 副作用边界:Buffer.fill(0)(psk 清零)仍在 caller,本 helper 只处理字符串,纯函数。
+ *
+ * 参数语义:
+ * - `pskHex === null` 或空串 → 不写 Authorization 头(无 PSK 场景,虽然 production 不该发生
+ *   但保留行为兼容 — 防 `Bearer ` 空值头被中间层 reject)
+ * - `connectionTraceId` 必须是 server 生成的合法值;helper 不校验
+ */
+export function _buildTunnelHeaders(
+  pskHex: string | null,
+  connectionTraceId: string,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "X-Connection-Trace-Id": connectionTraceId,
+  };
+  if (pskHex !== null && pskHex.length > 0) {
+    headers["Authorization"] = `Bearer ${pskHex}`;
+  }
+  return headers;
 }
 
 /**
@@ -129,11 +168,15 @@ export async function createTunnelContainerSocket(
   // 拷贝完立即 fill(0) 清原 Buffer:hex 字符串还在 ws 内部 headers 对象里,但
   // 那是 V8 string,无法主动清(GC 回收)。匹配 readiness 的 finally fill(0) 模式,
   // 缩短 Buffer 在堆里的可见窗口,降低 heap-dump 时 PSK 暴露面。
-  const headers: Record<string, string> = {};
+  //
+  // S12e CG4:headers 构造抽到 `_buildTunnelHeaders` pure helper(同文件 export)以便
+  // 单测覆盖 X-Connection-Trace-Id 写入。Buffer 清零仍在本层保留原顺序(helper 不动 Buffer)。
+  let pskHex: string | null = null;
   if (target.psk) {
-    headers["Authorization"] = `Bearer ${target.psk.toString("hex")}`;
+    pskHex = target.psk.toString("hex");
     try { target.psk.fill(0); } catch { /* */ }
   }
+  const headers = _buildTunnelHeaders(pskHex, opts.connectionTraceId);
 
   // 防御:new WebSocket 同步抛错(URL 异常 / options 校验失败)→ preDialed
   // 还没移交给 ws 库,必须自己 destroy,避免 socket 半开 + listener 泄漏。

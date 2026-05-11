@@ -17,16 +17,19 @@ import {
   unlinkSync,
 } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
+import { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import { isIPv4 } from 'node:net'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
-import type {
-  InboundFrame,
-  InboundMessage,
-  OutboundCodexBilling,
-  OutboundError,
-  OutboundMessage,
+import {
+  type InboundFrame,
+  type InboundMessage,
+  type OutboundCodexBilling,
+  type OutboundError,
+  type OutboundMessage,
+  type Peer,
+  newTraceId,
+  parseTraceIdCandidate,
 } from '@openclaude/protocol'
 import { classifyRunError } from './errorClassify.js'
 import {
@@ -58,7 +61,7 @@ import { CronScheduler } from './cron.js'
 import { parseDocument } from './documentParser.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
-import { createLogger } from './logger.js'
+import { createLogger, type Logger } from './logger.js'
 import {
   startMetricsCollection,
   serializeMetrics,
@@ -3678,9 +3681,16 @@ export class Gateway {
     // users happen to share the same client-generated peerId (see makePeerKey
     // helper). Legacy-token auth returns 'default'.
     ;(ws as any)._userId = this.getUserId(req)
+    // V3 S12e CG6 — connection-level trace stash. Read X-Connection-Trace-Id
+    // upgrade header(由 master 在 mTLS WS dial 时写入,CG4),失败 fallback
+    // newTraceId() + warn(不含 raw value 防 log injection)。Stash 到 ws 上
+    // 供 CG7 后续 dispatchInbound stamp 4 类 outbound 使用,以及 ws.connect /
+    // disconnect log 关联。
+    const connectionTraceId = _parseConnectionTraceIdFromUpgrade(req.headers, this.log)
+    ;(ws as any)._connectionTraceId = connectionTraceId
     wsConnectionsTotal.inc()
-    this.log.info('ws.connect')
-    ws.once('close', () => this.log.debug('ws.disconnect'))
+    this.log.info('ws.connect', { connectionTraceId })
+    ws.once('close', () => this.log.debug('ws.disconnect', { connectionTraceId }))
 
     // Keepalive pong tracking
     ;(ws as any)._isAlive = true
@@ -4355,15 +4365,21 @@ export class Gateway {
     peerKey: string,
     wireFrame: Record<string, unknown>,
   ): void {
+    // V3 S12e CG7 — strip private routing fields before WS broadcast / ring
+    // store. Mirrors what `deliver()` does, so `_inheritOutboundRouting(out)`
+    // callers(e.g. permFrame builder)can safely include private stamps like
+    // `_userId` without leaking on wire. Audit pair with `_stripPrivateRoutingFields`
+    // in deliver() — both paths converge through the same known-fields helper.
+    const { wire } = _stripPrivateRoutingFields(wireFrame)
     const now = Date.now()
     let data: string
     if (sessionKey) {
       const frameSeq = this._outboundRing.nextSeq(sessionKey)
-      data = JSON.stringify({ ...wireFrame, ts: now, frameSeq })
+      data = JSON.stringify({ ...wire, ts: now, frameSeq })
       const evicted = this._outboundRing.store(sessionKey, frameSeq, now, data)
       this._recordRingEvictions(evicted)
     } else {
-      data = JSON.stringify({ ...wireFrame, ts: now })
+      data = JSON.stringify({ ...wire, ts: now })
     }
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
@@ -4735,6 +4751,17 @@ export class Gateway {
       return
     }
 
+    // ── V3 S12e CG7 — mint per-turn trace id ──
+    // Placed AFTER duplicate idempotency return(dup doesn't open a new turn → no
+    // turnTraceId concept)but BEFORE rate-limit so that the rate-limit early-
+    // return outbound also carries this turn's trace id. The helper also returns
+    // a parsed `clientTraceId`(observation-only echo)but CG7 scope does not yet
+    // wire it into any log/frame — left for follow-up CG.
+    const { traceId: turnTraceId } = _buildTurnTraceContext(
+      (frame as any).clientTraceId,
+      this.log,
+    )
+
     // ── Rate limiting: per-peer sliding window ──
     // Only non-duplicate messages consume rate-limit budget
     if (!this.rateLimiter.check(frame.peer.id, frame.channel)) {
@@ -4747,6 +4774,7 @@ export class Gateway {
         peer: frame.peer,
         blocks: [{ kind: 'text' as const, text: '请求过于频繁，请稍后再试。' }],
         isFinal: true,
+        traceId: turnTraceId,
         _userId: rlUserId,
       }
       // Route WebSocket broadcast through deliver() so ts-stamp is consistent
@@ -4820,6 +4848,7 @@ export class Gateway {
             },
           ],
           isFinal: true,
+          traceId: turnTraceId,
           _userId: _errUserId,
         }
         // 不要泄漏 decision.reason 内文(可能含 agent provider 等内部线索),
@@ -4879,6 +4908,7 @@ export class Gateway {
           },
         ],
         isFinal: true,
+        traceId: turnTraceId,
         _userId: _errUserId,
       }
       this.log.warn('codex-native agent invoked without explicit model — rejected', {
@@ -4959,6 +4989,11 @@ export class Gateway {
       peer: frame.peer,
       blocks: [],
       isFinal: false,
+      // V3 S12e CG7 — turn-level trace id. Stamped on the main `out` so every
+      // streamed block / final frame derived from `out` carries it; derived
+      // frames(error / permission_request / codex_billing)copy it via
+      // `_inheritOutboundRouting(out)`.
+      traceId: turnTraceId,
     }
     // Private userId stamp for deliver() — must be stripped before sending.
     // Fixed in deliver() via destructure so this never reaches the wire.
@@ -4993,6 +5028,7 @@ export class Gateway {
           peer: frame.peer,
           blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
           isFinal: true,
+          traceId: turnTraceId,
         },
         adapter,
       )
@@ -5008,6 +5044,7 @@ export class Gateway {
           peer: frame.peer,
           blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${reason}` }],
           isFinal: true,
+          traceId: turnTraceId,
         },
         adapter,
       )
@@ -5340,18 +5377,15 @@ export class Gateway {
           if (_cls.code !== 'unknown') {
             _apiErrorIntercepted = true
             _apiErrorText = _b0.text
+            // CG7 — derived frame copies routing + traceId from main `out` via
+            // `_inheritOutboundRouting`, type-specific fields stay explicit.
             const errFrame: OutboundError & { _userId?: string } = {
               type: 'outbound.error',
-              sessionKey: out.sessionKey,
-              channel: out.channel,
-              peer: out.peer,
+              ..._inheritOutboundRouting(out),
               code: _cls.code,
               message: _cls.message,
               detail: _b0.text,
               isFinal: false,
-              ...(((out as OutboundMessage & { _userId?: string })._userId)
-                ? { _userId: (out as OutboundMessage & { _userId?: string })._userId }
-                : {}),
             }
             this.deliver(errFrame as unknown as OutboundMessage, adapter)
             return
@@ -5422,11 +5456,15 @@ export class Gateway {
         const dispatchUserId: string =
           typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
         const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
+        // CG7 — derived frame inherits routing + traceId from main `out`.
+        // Note: legacy code wrote `sessionKey`(local var)= main `out.sessionKey`
+        // and `frame.channel/peer`= main `out.channel/peer`. The helper unifies
+        // both to read from `out`, which is correct: `out` is the source of
+        // truth for this turn's routing tuple after model-routing has settled
+        // any agent-override sessionKey.
         const permFrame = {
           type: 'outbound.permission_request' as const,
-          sessionKey,
-          channel: frame.channel,
-          peer: frame.peer,
+          ..._inheritOutboundRouting(out),
           requestId: e.request.requestId,
           toolName: e.request.toolName,
           toolUseId: e.request.toolUseId,
@@ -5484,11 +5522,14 @@ export class Gateway {
         // 路由三件套从 out 复制(同 OutboundError 模式),deliver() 需要 channel/
         // peer.id 算 peerKey、需要 sessionKey 落 outbound ring。billing 只去 master,
         // master 从 requestId 找 inflight,不读这三字段做 settle。
+        // CG7 — derived frame copies routing + traceId from main `out`. Note
+        // billing carries the same `traceId` as the turn's outbound.message
+        // (intentional — codex_billing settles in master.userChatBridge keyed
+        // by requestId, but having traceId on it lets trace queries pivot from
+        // billing rows to the turn that produced them).
         const billingFrame: OutboundCodexBilling & { _userId?: string } = {
           type: 'outbound.codex_billing',
-          sessionKey: out.sessionKey,
-          channel: out.channel,
-          peer: out.peer,
+          ..._inheritOutboundRouting(out),
           requestId: e.requestId,
           status: e.status,
           durationMs: e.durationMs,
@@ -5498,9 +5539,6 @@ export class Gateway {
           // claude_accounts.quota_*。container/runtime 与 master 协议层都已扩 schema,
           // optional 字段缺省时自然不带,与旧版本 master 向后兼容。
           ...(e.rateLimits ? { rateLimits: e.rateLimits } : {}),
-          ...(((out as OutboundMessage & { _userId?: string })._userId)
-            ? { _userId: (out as OutboundMessage & { _userId?: string })._userId }
-            : {}),
         }
         this.deliver(billingFrame as unknown as OutboundMessage, adapter)
       } else if (e.kind === 'error') {
@@ -5512,20 +5550,16 @@ export class Gateway {
         // 抑制重复气泡,旧客户端无视 outbound.error,只看到 [error] 文本降级 UX)。
         const cls = classifyRunError(e.error)
         if (cls.code !== 'unknown') {
-          // 注意:errFrame 必须含 _userId 才能让 deliver() 路由到正确 peerKey,
-          // 与 out 同源(out 已带 _userId 走过 dispatchInbound 全程)。
+          // CG7 — derived frame copies routing + traceId from main `out` via
+          // `_inheritOutboundRouting`(replaces the prior hand-spread of
+          // sessionKey/channel/peer + conditional _userId).
           const errFrame: OutboundError & { _userId?: string } = {
             type: 'outbound.error',
-            sessionKey: out.sessionKey,
-            channel: out.channel,
-            peer: out.peer,
+            ..._inheritOutboundRouting(out),
             code: cls.code,
             message: cls.message,
             detail: e.error,
             isFinal: false,
-            ...(((out as OutboundMessage & { _userId?: string })._userId)
-              ? { _userId: (out as OutboundMessage & { _userId?: string })._userId }
-              : {}),
           }
           this.deliver(errFrame as unknown as OutboundMessage, adapter)
         }
@@ -5538,18 +5572,19 @@ export class Gateway {
           adapter,
         )
       }
-    }, safeEffortLevel, safeModel, safeRequestId)
+    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId)
   }
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {
-    // Strip the private `_userId` stamp up-front so BOTH adapter and WS
-    // branches only ever see the clean wire shape. Keeping the stripped
-    // value locally lets the WS branch still route per-user. Stripping
-    // here (rather than only just before ws.send) prevents future adapters
-    // / debug logs from accidentally leaking internal routing fields.
-    const { _userId: stampedUserId, ...wire } = out as OutboundMessage & {
-      _userId?: string
-    }
+    // V3 S12e CG6 — strip ALL private routing fields up-front (`_userId`,
+    // `_traceId`, `_connectionTraceId`, `_peerId`)so BOTH adapter and WS
+    // branches only ever see the clean wire shape. CG7 will start writing
+    // `_traceId` / `_connectionTraceId` on outbound frames in
+    // dispatchInbound stamp; doing the strip via a shared helper now
+    // (rather than only `_userId`)means CG7 doesn't have to revisit this
+    // strip site every time it adds a new private field. Keeping stripped
+    // values locally lets WS branch still route per-user.
+    const { wire, userId: stampedUserId } = _stripPrivateRoutingFields(out)
     if (adapter) {
       adapter.send(wire as OutboundMessage).catch((err) =>
         this.log.error('adapter send failed', { channel: adapter.name }, err),
@@ -5592,6 +5627,175 @@ export class Gateway {
         ws.send(data)
       } catch {}
     }
+  }
+}
+
+// ── V3 S12e CG6 — connection-level trace helpers ──
+
+/**
+ * Parse the connection-level trace id from the WS upgrade request headers.
+ *
+ * Contract:
+ *   - `headers` must be a Node `IncomingMessage.headers` value
+ *     (keys already lowercased, values `string | string[] | undefined`). We do
+ *     NOT case-insensitive match — runtime Node http already canonicalises,
+ *     and the symmetric Go side(node-agent CG5)uses CanonicalMIMEHeaderKey
+ *     against the *upper-case* header constant for the same reason.
+ *   - Multi-value headers(`string[]`)take the first value, matching the Go
+ *     ParseHeader "first value unwrap" rule(see protocol/testdata fixture).
+ *   - On any `parseTraceIdCandidate` failure we synthesise a fresh
+ *     `newTraceId()` so WS upgrade never blocks on bad header — and emit a
+ *     `warn` carrying ONLY the issue enum, never the raw header value
+ *     (anti-log-injection / log-size DoS).
+ *
+ * Returns: always a valid trace id string(either the client-supplied one or
+ * a fresh fallback).
+ *
+ * Exported as `_` prefixed test seam — single-call-site internal helper, the
+ * underscore signals "do not import from outside gateway".
+ */
+export function _parseConnectionTraceIdFromUpgrade(
+  headers: IncomingHttpHeaders,
+  log: Logger,
+): string {
+  const raw = headers['x-connection-trace-id']
+  const candidate = Array.isArray(raw) ? raw[0] : raw
+  const result = parseTraceIdCandidate(candidate)
+  if (result.ok) return result.traceId
+  log.warn('ws.upgrade.connection_trace_invalid', { issue: result.issue })
+  return newTraceId()
+}
+
+/**
+ * Strip the private routing-only fields from any outbound-shaped frame,
+ * returning the wire-safe frame and the stripped values.
+ *
+ * Private fields(all underscore-prefixed):
+ *   - `_userId`           — caller-stamped, used by deliver() to scope peerKey
+ *   - `_traceId`          — CG7 will stamp(turn-level trace)
+ *   - `_connectionTraceId`— CG7 will stamp(connection-level trace)
+ *   - `_peerId`           — legacy routing helper(some callers stash this)
+ *
+ * Why explicit destructure(not a blacklist loop): the field set is small,
+ * fixed, and each one has clear ownership.  An explicit destructure creates
+ * a single audit point for known private fields — adding a new private field
+ * forces an update here, which is the moment we want to review it. (A
+ * future typo'd field name on the producer side still requires its own care;
+ * this helper is the *known fields* audit point, not a typo shield.)
+ *
+ * Type-honest generic: returns `Omit<T, '_userId' | ...>` so callers see the
+ * private fields removed in the type system, not just at runtime. Two callers
+ * use this:
+ *   - `deliver()` for `OutboundMessage`-shaped frames(adapter + WS branches)
+ *   - `_sendStampedSessionFrame()` for `outbound.permission_request` /
+ *     `outbound.permission_settled` direct-send paths — these frames extend
+ *     the same routing tuple but aren't typed as `OutboundMessage`, so we widen
+ *     the input to any `Record<string, unknown>` superset.
+ */
+type PrivateRoutingFields = {
+  _userId?: string
+  _traceId?: string
+  _connectionTraceId?: string
+  _peerId?: string
+}
+export function _stripPrivateRoutingFields<
+  T extends Record<string, unknown>,
+>(
+  out: T,
+): {
+  wire: Omit<T, '_userId' | '_traceId' | '_connectionTraceId' | '_peerId'>
+  userId?: string
+  traceId?: string
+  connectionTraceId?: string
+  peerId?: string
+} {
+  const {
+    _userId,
+    _traceId,
+    _connectionTraceId,
+    _peerId,
+    ...wire
+  } = out as T & PrivateRoutingFields
+  return {
+    wire: wire as Omit<
+      T,
+      '_userId' | '_traceId' | '_connectionTraceId' | '_peerId'
+    >,
+    userId: _userId,
+    traceId: _traceId,
+    connectionTraceId: _connectionTraceId,
+    peerId: _peerId,
+  }
+}
+
+// ── V3 S12e CG7 — turn-level trace helpers ──
+
+/**
+ * Compute the per-turn trace context at dispatchInbound entry.
+ *
+ * Contract B(control plane / turn level):
+ *   - The **master** is the canonical authority — it always mints a fresh
+ *     `traceId` via `newTraceId()` for every turn that survives the duplicate
+ *     idempotency check. This is the trace id stamped on every outbound frame
+ *     of the turn.
+ *   - The client MAY provide a `clientTraceId` for observation only. If it
+ *     parses cleanly it is echoed in the returned `clientTraceId` field so
+ *     submit-layer logs can correlate; otherwise we warn with the issue enum
+ *     and proceed with master's fresh trace id.
+ *
+ * Anti-log-injection: warn ctx carries only the `issue` enum, never the raw
+ * candidate value.
+ */
+export function _buildTurnTraceContext(
+  clientRaw: unknown,
+  log: Logger,
+): { traceId: string; clientTraceId?: string } {
+  if (clientRaw !== undefined) {
+    const parsed = parseTraceIdCandidate(clientRaw)
+    if (parsed.ok) {
+      return { traceId: newTraceId(), clientTraceId: parsed.traceId }
+    }
+    log.warn('inbound.client_trace_invalid', { issue: parsed.issue })
+  }
+  return { traceId: newTraceId() }
+}
+
+/**
+ * Copy the routing tuple(+ public traceId)from the main `out` frame onto a
+ * derived outbound frame(outbound.error / outbound.permission_request /
+ * outbound.codex_billing).
+ *
+ * **Explicit field list — not a spread.** We deliberately do NOT
+ * `...out` here, because future additions to `out` that are *not* routing
+ * fields(e.g. block accumulators, per-turn meta)would otherwise leak into
+ * every derived frame. This helper is the single audit point for known
+ * routing fields:
+ *
+ *   - `sessionKey` / `channel` / `peer` — public schema fields used by
+ *     `deliver()` to compute peerKey + ring slot.
+ *   - `traceId`                        — CG7 public schema field.
+ *   - `_userId`                        — private routing stamp consumed by
+ *     `_stripPrivateRoutingFields` inside `deliver()`.
+ *
+ * Adding a new routing field requires updating this helper explicitly. That
+ * is the desired property — accidental drift between main and derived frames
+ * is the failure mode CG7 is closing.
+ */
+export function _inheritOutboundRouting(
+  out: OutboundMessage & { _userId?: string },
+): {
+  sessionKey: string
+  channel: string
+  peer: Peer
+  _userId?: string
+  traceId?: string
+} {
+  return {
+    sessionKey: out.sessionKey,
+    channel: out.channel,
+    peer: out.peer,
+    ...(out._userId ? { _userId: out._userId } : {}),
+    ...(out.traceId ? { traceId: out.traceId } : {}),
   }
 }
 

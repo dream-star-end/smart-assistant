@@ -153,10 +153,43 @@ interface BillingRig {
   binding: { acquireCalls: number; releaseCalls: number };
 }
 
+// CG2c — 测试用最小 logger,记 fields(含 child 累计 bindings)。
+interface CapturedLog {
+  level: "info" | "warn" | "error" | "debug" | "trace";
+  msg: string;
+  fields?: Record<string, unknown>;
+}
+import type { Logger } from "../logging/logger.js";
+
+function makeCaptureLogger(): { log: Logger; logs: CapturedLog[] } {
+  const logs: CapturedLog[] = [];
+  function makeLogger(base: Record<string, unknown>): Logger {
+    const mk = (level: CapturedLog["level"]) =>
+      (msg: string, fields?: Record<string, unknown>) => {
+        logs.push({ level, msg, fields: { ...base, ...fields } });
+      };
+    const self: Logger = {
+      trace: mk("trace"),
+      debug: mk("debug"),
+      info: mk("info"),
+      warn: mk("warn"),
+      error: mk("error"),
+      child: (bindings) => makeLogger({ ...base, ...bindings }),
+    };
+    return self;
+  }
+  return { log: makeLogger({}), logs };
+}
+
 async function startRig(opts: {
   userBalance?: bigint;
   acquireResult?: "account" | "legacy" | "throw" | "stale";
   drainMs?: number;
+  logger?: Logger;
+  // CG2c — 注入 deps.appendCostCredits,可用于触发 billingLog.warn 路径(persist 抛错)。
+  appendCostCredits?: (
+    requestId: string, userId: string, debited: string,
+  ) => Promise<void>;
 } = {}): Promise<BillingRig> {
   // mock 容器 ws
   const containerSockets: WebSocket[] = [];
@@ -205,6 +238,8 @@ async function startRig(opts: {
     preCheckRedis,
     pricing,
     codexBinding,
+    logger: opts.logger,
+    appendCostCredits: opts.appendCostCredits,
   });
 
   const gateway = http.createServer((_, res) => res.end());
@@ -697,6 +732,138 @@ describe("userChatBridge / codex acquire — ContainerStaleBindingError recycle 
       /INSERT INTO (inflight_charges|usage_records)/.test(q.sql),
     );
     assert.equal(billingInserts.length, 0, "no billing rows on stale recycle");
+  });
+});
+
+// ------- CG2c: outbound trace 贯穿 codex billing 链 -------------------------
+//
+// 验证三件事:
+//   1. inbound.message → 容器收到的 frame.traceId(master canonical 32-hex)
+//      与 outbound.cost_charged 广播帧的 traceId 相同 — server-owned trace 贯穿
+//   2. 容器伪造 frame.traceId(发 "0".repeat(32))→ 广播仍用 snapshot 的 traceId
+//      — 证明 snap.traceId 是计费观测的唯一可信源,不解析帧字段
+//   3. billingLog binding(traceId + requestId)落到 persist-throw 路径 —
+//      appendCostCredits 故意 throw 触发 billingLog.warn,断言日志带 turn trace
+
+describe("userChatBridge / codex billing — CG2c outbound trace 贯穿", () => {
+  let rig: BillingRig;
+  let logs: CapturedLog[];
+
+  before(async () => {
+    const capture = makeCaptureLogger();
+    logs = capture.logs;
+    rig = await startRig({
+      userBalance: 1_000_000n,
+      logger: capture.log,
+      // 强制 appendCostCredits 抛错 → 触发 billingLog.warn 路径,断言 traceId binding
+      appendCostCredits: async () => {
+        throw new Error("simulated persist failure");
+      },
+    });
+  });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    logs.length = 0;
+  });
+
+  test("inbound.traceId 经 snap.traceId 贯穿到 outbound.cost_charged", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("21");
+    const ws = openClient(rig.gatewayPort, token);
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      agentId: "codex",
+      model: "gpt-5.5",
+      content: "trace me",
+    }));
+
+    const frameToContainer = await waitContainerNextFrame(containerWs);
+    const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+    const serverReqId = parsed.requestId as string;
+    const inboundTraceId = parsed.traceId as string;
+    assert.match(inboundTraceId, /^[0-9a-f]{32}$/, "inbound 必须含 32-hex canonical traceId");
+
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: serverReqId,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    }));
+
+    const cost = await waitJsonFrameOfType(ws, "outbound.cost_charged");
+    assert.equal(cost.requestId, serverReqId);
+    assert.equal(
+      cost.traceId,
+      inboundTraceId,
+      "broadcast.traceId 必须等于 inbound canonical(snap.traceId 贯穿)",
+    );
+
+    // appendCostCredits 抛错 → billingLog.warn("codex persist costCredits threw")
+    // 必须有 traceId binding(snap.traceId)+ requestId(serverReqId)
+    const warn = logs.find(
+      (l) => l.msg === "user-chat-bridge: codex persist costCredits threw",
+    );
+    assert.ok(warn, "appendCostCredits 抛错应触发 billingLog.warn");
+    assert.equal(
+      warn!.fields?.traceId,
+      inboundTraceId,
+      "billingLog.warn 必须带 turn 的 canonical traceId(child binding)",
+    );
+    assert.equal(
+      warn!.fields?.requestId,
+      serverReqId,
+      "billingLog.warn 必须带 requestId(child binding)",
+    );
+
+    ws.close();
+  });
+
+  test("容器伪造 frame.traceId → broadcast 仍用 snap.traceId(trust source)", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("22");
+    const ws = openClient(rig.gatewayPort, token);
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      agentId: "codex",
+      model: "gpt-5.5",
+      content: "trust source",
+    }));
+    const frameToContainer = await waitContainerNextFrame(containerWs);
+    const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+    const serverReqId = parsed.requestId as string;
+    const inboundTraceId = parsed.traceId as string;
+
+    // 容器伪造一个完全不同的 traceId 塞到 billing 帧顶层 — bridge 必须忽略
+    const forgedTraceId = "0".repeat(32);
+    assert.notEqual(forgedTraceId, inboundTraceId, "前置:伪造值必须 ≠ 真值,否则测试无效");
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: serverReqId,
+      traceId: forgedTraceId,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    }));
+
+    const cost = await waitJsonFrameOfType(ws, "outbound.cost_charged");
+    assert.equal(
+      cost.traceId,
+      inboundTraceId,
+      "broadcast.traceId 必须用 snap.traceId,**不**采纳容器侧伪造帧字段",
+    );
+    assert.notEqual(
+      cost.traceId,
+      forgedTraceId,
+      "伪造的 frame.traceId 绝不应进 broadcast(防容器侧污染计费观测)",
+    );
+
+    ws.close();
   });
 });
 

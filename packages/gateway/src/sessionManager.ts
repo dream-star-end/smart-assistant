@@ -1098,6 +1098,15 @@ export class SessionManager {
      *  其它 runner(claude / minimax / 等)完全不读这个字段,纯透传 noop。
      *  缺省 / 非 codex agent → 不参与真扣费链路,Anthropic 路径走 anthropicProxy 自己的扣费。 */
     requestId?: string,
+    /** V3 S12e CG7 — master-authoritative turn-level trace id(Contract B).
+     *  Currently consumed only by submit-layer warn/error logs(effort/model-
+     *  change shutdown failure, idle-timeout interrupt)so an operator grepping
+     *  on traceId can correlate gateway-side submit failures with the turn's
+     *  outbound frames. _runOneTurn / runOneTurnWithRetry internal logs
+     *  (phantom/auth/transient/parse_error)are NOT in CG7 scope — they'll be
+     *  threaded in CG8 together with the subprocessRunner env injection so
+     *  the whole turn-internal log path lands as one coherent step. */
+    traceId?: string,
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
@@ -1111,6 +1120,15 @@ export class SessionManager {
     session.lock = new Promise<void>((r) => (release = r))
     try {
       await prev
+      // V3 S12e CG8 — contract C(best-effort)stash latest turn trace on runner
+      // so that ANY re-spawn triggered inside this turn — effort/model change
+      // shutdown(下方 effortChanged/modelChanged 分支)、phantom restart
+      // (runOneTurnWithRetry)、auth refresh restart — picks it up via
+      // `OPENCLAUDE_TRACE_ID` env at next spawn time. No effect on a long-lived
+      // CCB process(env is read at fork); 后续 turn CCB 内部 trace 接收待 S11c
+      // stdin JSON-RPC 扩展。Lock 保证 setTraceId 与并发 submit() 串行,不会
+      // 跨 turn 互踩。
+      if (traceId !== undefined) session.runner.setTraceId(traceId)
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn
       //   - 本 turn 之后:env / cli args 已被 CCB 启动时读完,改也无效
@@ -1135,7 +1153,10 @@ export class SessionManager {
         } catch (err) {
           log.warn(
             'effort/model-change shutdown failed',
-            { sessionKey: session.sessionKey, effortChanged, modelChanged },
+            // CG7 — traceId tagged so submit-layer failures join the turn's
+            // outbound trace; ...(traceId ? ... : {}) keeps legacy callers
+            // (no traceId arg) from inserting a `traceId: undefined` key.
+            { sessionKey: session.sessionKey, effortChanged, modelChanged, ...(traceId ? { traceId } : {}) },
             err,
           )
         }
@@ -1189,7 +1210,7 @@ export class SessionManager {
       })
       try {
         await Promise.race([
-          this.runOneTurnWithRetry(session, userTextOrBlocks, onEvent, requestId),
+          this.runOneTurnWithRetry(session, userTextOrBlocks, onEvent, requestId, traceId),
           livenessPromise,
         ])
       } finally {
@@ -1209,7 +1230,11 @@ export class SessionManager {
           kind: 'error',
           error: `子进程${detail},已中断。请重试。`,
         })
-        log.error('idle timeout, interrupted', { sessionKey: session.sessionKey }, err)
+        log.error(
+          'idle timeout, interrupted',
+          { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
+          err,
+        )
       } else {
         throw err
       }
@@ -1223,6 +1248,12 @@ export class SessionManager {
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     onEvent: (e: SessionStreamEvent) => void,
     requestId?: string,
+    /** V3 S12e CG8 — turn-level trace id propagated from submit(). Tagged on
+     *  all turn-internal warn/error logs(phantom/auth/transient/parse_error/
+     *  staleResume/skipped/willCallApi/FTS5/verification verdict)so an
+     *  operator grepping on traceId sees the entire turn's gateway-side trail.
+     *  Sub-30 minute lifetime — scoped to this turn's retry budget. */
+    traceId?: string,
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
@@ -1231,7 +1262,7 @@ export class SessionManager {
     let phantomRetryUsed = false
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        await this._runOneTurn(session, userTextOrBlocks, onEvent, requestId)
+        await this._runOneTurn(session, userTextOrBlocks, onEvent, requestId, traceId)
         return // success
       } catch (err: any) {
         const msg = err?.message ?? String(err)
@@ -1242,6 +1273,7 @@ export class SessionManager {
           log.warn('phantom turn detected, restarting subprocess', {
             sessionKey: session.sessionKey,
             phantomRetryUsed,
+            ...(traceId ? { traceId } : {}),
           })
           // shutdown → 下次 submit() 会自动 respawn 一个干净的 CCB 进程。
           // 子进程重启时 runner 的 'spawn' 事件会自动把 _lastCcbCumulativeCost 归零。
@@ -1275,12 +1307,18 @@ export class SessionManager {
         // Auth error (401): refresh credentials and restart subprocess
         if (/AUTH_ERROR/i.test(msg)) {
           log.warn('auth error, refreshing credentials and restarting subprocess', {
-            sessionKey: session.sessionKey, attempt: attempt + 1,
+            sessionKey: session.sessionKey,
+            attempt: attempt + 1,
+            ...(traceId ? { traceId } : {}),
           })
           // Trigger immediate token refresh via gateway callback
           if (this.onAuthError) {
             try { await this.onAuthError() } catch (e) {
-              log.error('onAuthError callback failed', { sessionKey: session.sessionKey }, e as Error)
+              log.error(
+                'onAuthError callback failed',
+                { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
+                e as Error,
+              )
             }
           }
           // Shutdown subprocess — next submit() auto-restarts with fresh config.
@@ -1301,7 +1339,14 @@ export class SessionManager {
         const isTransient = /529|503|502|504|ECONNRESET|ETIMEDOUT|rate.limit|overloaded|AbortError|operation was aborted|timed?\s*out/i.test(msg)
         if (!isTransient || attempt >= MAX_RETRIES) throw err
         const delay = BASE_DELAY * 2 ** attempt + Math.random() * 1000
-        log.warn('transient error, retrying', { sessionKey: session.sessionKey, attempt: attempt + 1, maxRetries: MAX_RETRIES, delayS: Math.round(delay / 1000), error: msg })
+        log.warn('transient error, retrying', {
+          sessionKey: session.sessionKey,
+          attempt: attempt + 1,
+          maxRetries: MAX_RETRIES,
+          delayS: Math.round(delay / 1000),
+          error: msg,
+          ...(traceId ? { traceId } : {}),
+        })
         onEvent({
           kind: 'block',
           block: {
@@ -1335,6 +1380,11 @@ export class SessionManager {
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     onEvent: (e: SessionStreamEvent) => void,
     requestId?: string,
+    /** V3 S12e CG8 — turn trace id propagated from runOneTurnWithRetry. Spread
+     *  into every turn-scoped log statement's ctx via `...(traceId ? { traceId } : {})`
+     *  so undefined values don't insert a `traceId: undefined` key. See parent
+     *  fn JSDoc for the full log-tagging inventory. */
+    traceId?: string,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -1395,6 +1445,7 @@ export class SessionManager {
           sessionKey: session.sessionKey,
           msg: err?.message,
           sample: payload.line?.slice(0, 200),
+          ...(traceId ? { traceId } : {}),
         })
       }
 
@@ -1483,6 +1534,7 @@ export class SessionManager {
             log.warn('stale --resume session id detected, will clear resume-map entry', {
               sessionKey: session.sessionKey,
               staleId: session.ccbSessionId,
+              ...(traceId ? { traceId } : {}),
             })
             session._pendingStaleResumeClear = true
             session.totalCostUSD = prevCostUSD
@@ -1534,6 +1586,7 @@ export class SessionManager {
               log.info('turn.skipped (telemetry)', {
                 sessionKey: session.sessionKey,
                 reason: signals.skipReason,
+                ...(traceId ? { traceId } : {}),
               })
               isPhantomTurn = false
               break
@@ -1560,6 +1613,7 @@ export class SessionManager {
                   apiRespStopReason: apiResp?.data.stopReason,
                   lastToolPreUse: lastTool?.data.toolName,
                   toolErrorCount: telemetry.getToolErrors().length,
+                  ...(traceId ? { traceId } : {}),
                 })
               }
               break
@@ -1591,6 +1645,7 @@ export class SessionManager {
               sessionKey: session.sessionKey,
               turnIndex: session.turns + 1,
               durationMs: Date.now() - turnStartTime,
+              ...(traceId ? { traceId } : {}),
             })
             settle(() => reject(new Error('PHANTOM_TURN: CCB returned empty result')))
             return
@@ -1628,7 +1683,13 @@ export class SessionManager {
                 totalCostUSD: session.totalCostUSD,
               }),
               indexTurn(sessId, session.turns, session.currentUserText ?? '', result.assistantText),
-            ]).catch((err) => log.error('FTS5 index failed', { sessionKey: session.sessionKey }, err))
+            ]).catch((err) =>
+              log.error(
+                'FTS5 index failed',
+                { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
+                err,
+              ),
+            )
 
             // ── Phase 0.1: persist server-authored assistant message ──
             // Write the authoritative assistant text into the client_sessions
@@ -1761,6 +1822,7 @@ export class SessionManager {
                 verdict: verdict.verdict,
                 checks: verdict.evidence.length,
                 passed: verdict.passed,
+                ...(traceId ? { traceId } : {}),
               })
             }
           }

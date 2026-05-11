@@ -7,7 +7,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./frames": "./src/frames.ts",
-    "./sessionKey": "./src/sessionKey.ts"
+    "./sessionKey": "./src/sessionKey.ts",
+    "./traceId": "./src/traceId.ts"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"

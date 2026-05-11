@@ -1,0 +1,28 @@
+{
+  "_comment": "V3 S12e shared fixture for trace id helper equivalence. Consumed by TS parseTraceIdCandidate test (packages/protocol/src/__tests__/traceId.test.ts) and Go ParseTraceIDCandidate test (packages/commercial/node-agent/internal/trace/parse_test.go). Adding cases here MUST keep both sides green. rawType discriminator drives Go json.RawMessage dispatch; TS can ignore it since unknown is native.",
+  "parseCases": [
+    { "name": "null (covers JS undefined too — both → missing)", "rawType": "null", "raw": null, "expectOk": false, "expectIssue": "missing" },
+    { "name": "number 123 → wrong-type", "rawType": "number", "raw": 123, "expectOk": false, "expectIssue": "wrong-type" },
+    { "name": "boolean true → wrong-type", "rawType": "boolean", "raw": true, "expectOk": false, "expectIssue": "wrong-type" },
+    { "name": "empty object → wrong-type", "rawType": "object", "raw": {}, "expectOk": false, "expectIssue": "wrong-type" },
+    { "name": "array fed directly (no unwrap) → wrong-type", "rawType": "array", "raw": ["valid-hex-1234567890ab"], "expectOk": false, "expectIssue": "wrong-type" },
+    { "name": "empty string", "rawType": "string", "raw": "", "expectOk": false, "expectIssue": "empty" },
+    { "name": "whitespace-only 3 spaces → bad-charset (space not in regex)", "rawType": "string", "raw": "   ", "expectOk": false, "expectIssue": "bad-charset" },
+    { "name": "short 5 chars", "rawType": "string", "raw": "short", "expectOk": false, "expectIssue": "too-short" },
+    { "name": "boundary 15 chars (just under min)", "rawType": "string", "raw": "aaaaaaaaaaaaaaa", "expectOk": false, "expectIssue": "too-short" },
+    { "name": "boundary 16 chars (min ok)", "rawType": "string", "raw": "aaaaaaaaaaaaaaaa", "expectOk": true },
+    { "name": "boundary 64 chars (max ok)", "rawType": "string", "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expectOk": true },
+    { "name": "boundary 65 chars (just over max)", "rawType": "string", "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expectOk": false, "expectIssue": "too-long" },
+    { "name": "16-char alnum valid", "rawType": "string", "raw": "abc123def456789a", "expectOk": true },
+    { "name": "32-hex newTraceId shape", "rawType": "string", "raw": "0123456789abcdef0123456789abcdef", "expectOk": true },
+    { "name": "UUID-ish with hyphens", "rawType": "string", "raw": "connection-uuid-format-1234567890ab", "expectOk": true },
+    { "name": "underscore separator valid", "rawType": "string", "raw": "valid_trace_id_underscore_ok_1", "expectOk": true },
+    { "name": "path traversal chars (./) → bad-charset", "rawType": "string", "raw": "../etc/passwd_abc", "expectOk": false, "expectIssue": "bad-charset" },
+    { "name": "unicode 中文 mix → bad-charset", "rawType": "string", "raw": "hello 中文 1234567890", "expectOk": false, "expectIssue": "bad-charset" }
+  ],
+  "headerArrayCases": [
+    { "name": "first valid, second ignored", "raw": ["valid-hex-1234567890ab", "ignored"], "expectOk": true },
+    { "name": "first bad-charset, second valid-but-ignored", "raw": ["bad/charset/here_1234", "valid-hex-1234567890ab"], "expectOk": false, "expectIssue": "bad-charset" },
+    { "name": "empty array → first is undefined → missing", "raw": [], "expectOk": false, "expectIssue": "missing" }
+  ]
+}

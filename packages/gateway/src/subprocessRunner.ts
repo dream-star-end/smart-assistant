@@ -52,6 +52,30 @@ function buildRemoteTargetEnv(target: ExecutionTarget | undefined): Record<strin
   }
 }
 
+/**
+ * V3 S12e CG8 — contract C 段(best-effort)spawn-time trace env.
+ *
+ * 返回单 key 的 env overlay,固定 spread 到 backend.spawn({env}) 后段,**always
+ * 覆盖**任何上游进程 env 上可能继承下来的 OPENCLAUDE_TRACE_ID(故采空串而非
+ * key-omission)。
+ *
+ * 设计要点:
+ *   - **空串而非省略**:env 块以 `...process.env` 起,如果省 key,gateway 自身
+ *     process.env 里若意外有 `OPENCLAUDE_TRACE_ID` 会被 CCB 继承,语义错位。
+ *     固定写 `''` 等同显式"本 spawn 无 trace stash"。
+ *   - **单 key 形状**:与 `buildRemoteTargetEnv` 平行,放在同一处方便审计。
+ *   - **首次 spawn / 重启 spawn 都用此 helper**:opts.traceId 是 sessionManager
+ *     在 lock 内 mutate 的最新值,任何 re-spawn 通过 `this.opts.traceId` 读到当前
+ *     trace。
+ *
+ * 见 docs/V3_S12e_PLAN_2026-05-11.md §492-497(contract C 段)。
+ */
+export function _buildCcbSpawnTraceEnv(
+  traceId: string | undefined,
+): { OPENCLAUDE_TRACE_ID: string } {
+  return { OPENCLAUDE_TRACE_ID: traceId ?? '' }
+}
+
 // ───────────────────────────────────────────────
 // SubprocessRunner
 //
@@ -110,6 +134,19 @@ export interface SubprocessRunnerOpts {
    *    2) 写 _boundRepoBinding(只有 ready 状态才记)
    *  undefined 或返 null → 等同于"未绑定",addDir = agentBaseDir。 */
   getRepoSnapshot?: (sessionId: string) => RepoSnapshot | null
+  /** V3 S12e CG8 — contract C(best-effort)turn trace stash for env injection.
+   *  当 spawn 发生时通过 `OPENCLAUDE_TRACE_ID` env 注入,CCB 子进程内部如何使用是
+   *  CCB 仓事,gateway 端不验证(S12e 不算贯通硬门)。
+   *
+   *  生命周期与 `effortLevel` / `model` / `executionTarget` 同构:
+   *    - 缓存在 opts 上,**只在 spawn 时被读**;长驻进程内 setTraceId() 不影响当前
+   *      子进程,需触发 shutdown() / 等下次 submit() 自动 respawn 才生效。
+   *    - 后续 turn 的 traceId 物理上无法 refresh 到已 spawn 的 env(env 在 fork
+   *      时确定);完整 per-turn CCB trace 接收要走 stdin JSON-RPC 扩展,留 S11c。
+   *
+   *  通过 `setTraceId()` 在 sessionManager.submit() 的 lock 内 mutate;无 side
+   *  effect(不主动 restart),与现有 setEffortLevel/setModel 同步。 */
+  traceId?: string
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -356,6 +393,21 @@ export class SubprocessRunner extends EventEmitter {
     this.opts.executionTarget = target
   }
 
+  /** V3 S12e CG8 — current trace id stash(opts-only, no in-flight effect).
+   *  See SubprocessRunnerOpts.traceId JSDoc for lifecycle. */
+  get traceId(): string | undefined {
+    return this.opts.traceId
+  }
+
+  /** V3 S12e CG8 — update trace id stash. Caller is responsible for the
+   *  restart-on-effort/model-change path; on its own this is a pure mutator
+   *  with NO subprocess side effects(parallel to setEffortLevel / setModel).
+   *  The new value will land in `OPENCLAUDE_TRACE_ID` env at the *next* spawn
+   *  (or re-spawn triggered elsewhere in this submit's lock). */
+  setTraceId(traceId: string | undefined): void {
+    this.opts.traceId = traceId
+  }
+
   /** Phase 5:本进程启动时是否绑定到 ready repo workspace。
    *  null = 未 ready-bound(未绑 / cloning / failed / 还没 start);
    *  非 null = 本 runner 当前活跃进程在 spawn 时拿到的 ready snapshot,
@@ -575,6 +627,10 @@ export class SubprocessRunner extends EventEmitter {
           // 因此这里把 hostMeta.controlPath/knownHostsPath 的 `/u<uid>` 部分
           // 剥掉后注入(substitute 宿主路径为容器内视图)。
           ...buildRemoteTargetEnv(this.opts.executionTarget),
+          // V3 S12e CG8 — contract C 段 trace env(best-effort,放最末永远覆盖
+          // process.env 继承)。空串 = "本 spawn 无 trace stash",见
+          // `_buildCcbSpawnTraceEnv` JSDoc。
+          ..._buildCcbSpawnTraceEnv(this.opts.traceId),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: true, // create process group so shutdown() can kill all children
