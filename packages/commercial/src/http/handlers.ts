@@ -153,6 +153,19 @@ export interface CommercialHttpDeps {
    * 该路由返 503 ACCOUNT_HEALTH_NOT_CONFIGURED;其他路由不受影响。
    */
   accountHealth?: AccountHealthTracker;
+  /**
+   * 2026-05-12:邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm。
+   * 用"验证 → 首消息"的 p50=215s 间隔覆盖 docker run 冷启(5-8s),
+   * 让用户首条消息直接命中 running 容器,无等待。
+   *
+   * 装配:v3Deps 配齐时由 `makePrewarmContainer` 包装 `makeV3EnsureRunning(v3Deps)`
+   * 注入(见 commercial/src/index.ts)。v3Deps 未配 → undefined,
+   * handler 端 `deps.prewarmContainer?.()` 变 no-op。
+   *
+   * 约定:此函数同步 return void,**绝不抛**(任何错误内部 swallow + log)。
+   * handler 调用方不需要 try/catch。详见 agent-sandbox/v3prewarm.ts JSDoc。
+   */
+  prewarmContainer?: (uid: bigint) => void;
 }
 
 export interface RequestContext {
@@ -587,6 +600,13 @@ export async function handleVerifyEmail(
   await enforceRateLimit(deps, emailCfg, hashEmailForRateLimit(email));
   try {
     const r = await verifyEmail(email, code);
+    // 2026-05-12:首次验证成功 → fire-and-forget 触发 v3 容器 pre-warm。
+    // 用"验证 → 首消息"的 p50=215s 间隔覆盖 docker run 冷启,首条消息无等待。
+    // `prewarmContainer` 装配层已保证同步 return void / 绝不抛(见 v3prewarm.ts);
+    // 未装配(v3Deps 缺)时 optional chain 变 no-op。
+    if (r.newly_verified) {
+      deps.prewarmContainer?.(BigInt(r.user_id));
+    }
     sendJson(res, 200, { user_id: r.user_id, newly_verified: r.newly_verified });
   } catch (err) {
     if (err instanceof VerifyError) {

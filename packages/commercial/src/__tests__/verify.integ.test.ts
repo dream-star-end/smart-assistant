@@ -172,13 +172,14 @@ describe("auth.verify.verifyEmail (integ)", () => {
     );
     assert.notEqual(ev.rows[0].used_at, null, "code must be marked used");
 
-    // 2026-04-29 反薅羊毛改造:¥3 赠金在 verifyEmail 时刻发,不在 register。
-    // 验证后 users.credits=300,credit_ledger 出 1 行 promotion + ref_type='signup_bonus'。
+    // 2026-04-29 反薅羊毛改造:赠金在 verifyEmail 时刻发,不在 register。
+    // 2026-05-12:金额从 ¥3 → ¥5(SIGNUP_BONUS_CENTS=500n)。
+    // 验证后 users.credits=500,credit_ledger 出 1 行 promotion + ref_type='signup_bonus'。
     const cred = await query<{ credits: string }>(
       "SELECT credits::text AS credits FROM users WHERE id = $1",
       [userId],
     );
-    assert.equal(cred.rows[0].credits, "300", "verifyEmail 应发放 ¥3 注册赠金");
+    assert.equal(cred.rows[0].credits, "500", "verifyEmail 应发放 ¥5 注册赠金");
     const led = await query<{
       delta: string;
       balance_after: string;
@@ -192,8 +193,8 @@ describe("auth.verify.verifyEmail (integ)", () => {
       [userId],
     );
     assert.equal(led.rows.length, 1, "应只有 1 条赠送 ledger 行");
-    assert.equal(led.rows[0].delta, "300");
-    assert.equal(led.rows[0].balance_after, "300");
+    assert.equal(led.rows[0].delta, "500");
+    assert.equal(led.rows[0].balance_after, "500");
     assert.equal(led.rows[0].reason, "promotion");
     assert.equal(led.rows[0].ref_type, "signup_bonus");
     assert.match(led.rows[0].memo ?? "", /邮箱验证赠送/);
@@ -223,7 +224,7 @@ describe("auth.verify.verifyEmail (integ)", () => {
       "SELECT credits::text AS credits FROM users WHERE id = $1",
       [userId],
     );
-    assert.equal(cred.rows[0].credits, "300", "credits 不应被重复发放");
+    assert.equal(cred.rows[0].credits, "500", "credits 不应被重复发放");
     const led = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1 AND reason = 'promotion'",
       [userId],

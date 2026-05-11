@@ -115,6 +115,7 @@ import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
   DEFAULT_V3_CCB_BASELINE_DIR,
   resolveCcbBaselineMounts,
+  makePrewarmContainer,
   makeV3EnsureRunning,
   preheatV3Image,
   startIdleSweepScheduler,
@@ -1240,6 +1241,19 @@ export async function registerCommercial(
   // eslint-disable-next-line no-console
   console.log("[commercial] sshMux remote deps wired");
 
+  // 2026-05-12:邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm。
+  // 用"验证 → 首消息"的 p50=215s 间隔覆盖 docker run 冷启,首条消息无等待。
+  // v3Deps 未配 → undefined → handler 端 deps.prewarmContainer?.() 变 no-op。
+  // wrapper 由 makePrewarmContainer 保证同步 return void / 绝不抛(见 v3prewarm.ts)。
+  // 注:这里独立调一次 makeV3EnsureRunning(v3Deps),与下方 resolveContainerEndpoint
+  // 用的 ensureRunning 是各自闭包,无共享可变状态,语义上等价。
+  const prewarmContainer: ((uid: bigint) => void) | undefined = v3Deps
+    ? makePrewarmContainer(
+        makeV3EnsureRunning(v3Deps),
+        rootLogger.child({ subsys: "v3/prewarm" }),
+      )
+    : undefined;
+
   const handler = createCommercialHandler({
     jwtSecret,
     mailer,
@@ -1265,6 +1279,7 @@ export async function registerCommercial(
     agentRuntime,
     // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
     v3Supervisor: v3Deps,
+    prewarmContainer,
     // v3 file proxy:root secret 给 containerFileProxy 签 per-request nonce;
     // feature flag 控制 router 是否把 /api/file / /api/media/* 从 BLOCKED 拉进 PROXY 分支
     bridgeSecret,

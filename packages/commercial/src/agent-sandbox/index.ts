@@ -137,3 +137,6 @@ export {
   type HandleContainerEventDeps,
   type OomInspectFn,
 } from "./v3containerEvents.js";
+
+// 邮箱验证后 fire-and-forget 容器 pre-warm helper
+export { makePrewarmContainer } from "./v3prewarm.js";

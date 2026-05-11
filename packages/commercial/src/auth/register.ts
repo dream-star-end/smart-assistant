@@ -85,16 +85,17 @@ export const VERIFY_EMAIL_TTL_SECONDS = 30 * 60;
  *
  * 2026-04-29 反薅羊毛改造:**赠金从 register 时刻延后到 verifyEmail 时刻发放**。
  *   - register 不再写 credits / ledger,users.credits 默认 0
- *   - verify.ts:verifyEmail 在 email_verified false→true 这一刻发 ¥3
+ *   - verify.ts:verifyEmail 在 email_verified false→true 这一刻发 SIGNUP_BONUS_CENTS
  *     + 同 user 任意 reason='promotion' ledger 行存在则跳过(幂等)
  *   - 拦截"批量注册一次性邮箱拿赠金不读邮件"路径,攻击者必须真能收信验证才有钱
  *   - LDC SSO(socialLogin.ts)走合成 email,不进 verifyEmail,**单独保持原状**
  *
- * 2026-04-26 boss 决策:每个新注册用户首登即送 ¥3 / 300 积分(v1.0.4 从 ¥2 加码)。
+ * 2026-04-26 boss 决策:每个新注册用户首登即送积分(v1.0.4 从 ¥2 加码到 ¥3)。
+ * 2026-05-12 boss 决策:¥3 → ¥5(降低 D1→D3 留存悬崖,让用户活到 cache 命中)。
  *
  * 已注册用户不补送 —— admin 手动补,见 admin/accounts UI 的"调整积分"。
  */
-export const SIGNUP_BONUS_CENTS = 300n;
+export const SIGNUP_BONUS_CENTS = 500n;
 
 export interface RegisterDeps {
   mailer: Mailer;

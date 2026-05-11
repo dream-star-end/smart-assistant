@@ -190,14 +190,15 @@ export async function verifyEmail(
       evId,
     ])
     if (!already_verified) {
-      // 反薅羊毛改造(2026-04-29):注册 ¥3 赠金从 register 移到这里发放,
-      // 攻击者必须真能收到验证邮件 + 输码才能拿到积分。
+      // 反薅羊毛改造(2026-04-29):注册赠金从 register 移到这里发放,
+      // 攻击者必须真能收到验证邮件 + 输码才能拿到积分。金额走
+      // SIGNUP_BONUS_CENTS 常量(2026-05-12 由 ¥3 调到 ¥5)。
       //
       // 幂等:同 user 已有任何 reason='promotion' 行 → 跳过加钱。
       // 兼容三种历史 ledger 形态:
       //   (a) 旧用户已 verified:不会进本分支(already_verified=true)
-      //   (b) 旧用户未 verified 但 register 时已发了 ¥3(ref_type IS NULL):
-      //       该 user 已有 promotion 行 → 跳过 → credits 维持 300
+      //   (b) 旧用户未 verified 但 register 时已发了赠金(ref_type IS NULL):
+      //       该 user 已有 promotion 行 → 跳过 → credits 维持历史金额
       //   (c) 新用户(本次 fix 之后注册):无 promotion 行 → 发新行
       //       (ref_type='signup_bonus' 标记新策略)
       //
@@ -230,7 +231,7 @@ export async function verifyEmail(
             userId,
             SIGNUP_BONUS_CENTS.toString(),
             upd.rows[0].credits,
-            '邮箱验证赠送 ¥3',
+            '邮箱验证赠送 ¥5',
           ],
         )
       } else {
