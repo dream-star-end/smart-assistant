@@ -21,12 +21,22 @@ set -euo pipefail
 # ───────────────────────────────────────────────
 # 常量(硬编码,有意为之 — 不做"可配置")
 # ───────────────────────────────────────────────
-# v3 仓库本身包含完整个人版代码树 (packages/{channels,cli,gateway,mcp-memory,plugin-sdk,protocol,storage,web} + claude-code-best)
-# 外加 v3 专属的 packages/commercial/。从 v3 构建可以拿到所有 v3-only 的 gateway 修复
-# (CCB 401、OAuth refresh、resume_failed 系列),不会再被 memory feedback_v3_image_built_from_master
-# 里描述的"重建镜像丢 v3 修复"坑炸。rsync 时排除 packages/commercial/ 即可避免容器
-# 里混入商用版代码。
-PERSONAL_SRC="/opt/openclaude/openclaude-v3"
+# PERSONAL_SRC = master 服务实际运行的源码树,deploy-v3.sh 把 45.32 上的 v3 仓 rsync
+# 到这里 (commercial-v3:/opt/openclaude/openclaude/) 后,本机所有运行物 — gateway
+# systemd 单元、compute-pool 模块、build-image 取的源 — 必须**唯一权威**地指向它,
+# 才能保证 "deploy 推什么,image 也 bake 什么"。
+#
+# 历史:之前一段时间 PERSONAL_SRC 指向 commercial-v3:/opt/openclaude/openclaude-v3/,
+# 那是一棵孤立 source tree,.git 是个递归坏 worktree (gitdir 指向
+# /opt/openclaude/openclaude/.git/worktrees/openclaude-v3 — 该路径不存在,git pull
+# 直接 fatal),deploy-v3.sh 不同步它。结果每次 deploy 推到 ./openclaude/,build 却
+# 从孤立 ./openclaude-v3/ 取源,image 长期 N 个 commit 落后 master。2026-05-11 v1.0.124
+# hot fix (codex runner setTraceId no-op) 就是踩这条坑:fix push 到 master,build 出
+# 来的 image 还是 stale → boss 容器继续报 `runner.setTraceId is not a function`。
+#
+# 改回单一权威源后,通过 rsync exclude packages/commercial/ 继续保留 "runtime image
+# 不含商用版代码" 这条不变量。
+PERSONAL_SRC="/opt/openclaude/openclaude"
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # 本脚本所在目录(agent-sandbox/)
 BUILD_CTX="/tmp/oc-runtime-build"
 IMAGE_REPO="openclaude/openclaude-runtime"
@@ -67,6 +77,15 @@ if [ ! -d "$PERSONAL_SRC" ]; then
   exit 1
 fi
 
+# 取源指纹,让 ops 一眼确认 build 取的是 deploy 后的最新源,而不是某棵 stale 树。
+# deploy-v3.sh 在 $PERSONAL_SRC/VERSION.json 写 {tag, commit, builtAt};没有(本地 dev
+# / 首次 bootstrap)就回退到 mtime,信息少一些但不致命。
+if [ -f "$PERSONAL_SRC/VERSION.json" ]; then
+  echo "[build-image] source: $PERSONAL_SRC  ($(cat "$PERSONAL_SRC/VERSION.json"))"
+else
+  echo "[build-image] source: $PERSONAL_SRC  (VERSION.json missing; mtime=$(stat -c '%y' "$PERSONAL_SRC"))"
+fi
+
 if [ ! -f "$SANDBOX_DIR/Dockerfile.openclaude-runtime" ]; then
   echo "[build-image] FATAL: Dockerfile 不存在: $SANDBOX_DIR/Dockerfile.openclaude-runtime" >&2
   exit 1
@@ -89,13 +108,19 @@ mkdir -p "$BUILD_CTX/personal-version"
 # 0. **预构建 claude-code-best dist** (容器内只有 node,没有 bun,需 prebuild)
 #    build.ts 走 Bun.build target=bun,后处理 import.meta.require → node 兼容
 #    产物 node dist/cli.js 直接可跑(MACRO defines 已烤进产物)
+#
+#    `--ignore-scripts`:跳过 ccb 的 `prepare` (git config core.hooksPath .githooks)。
+#    那条 hook 是给本地 dev 装的,build 完全不需要,而且 deploy-v3.sh rsync `.git/`
+#    exclude 把 ccb 子目录 .git 也排除了,跑 prepare 会向上找到根 .git(deploy 树
+#    根 .git 是个递归坏 worktree)→ fatal 128 → 整个 build 挂掉。跳过 install
+#    scripts 是 build env idiomatic 做法。
 if ! command -v bun >/dev/null 2>&1; then
   echo "[build-image] FATAL: 没 bun (~/.bun/bin/bun) — 无法 prebuild claude-code-best/dist" >&2
   exit 1
 fi
 if [ -d "$PERSONAL_SRC/claude-code-best" ]; then
   echo "[build-image] prebuild $PERSONAL_SRC/claude-code-best/dist (bun)"
-  ( cd "$PERSONAL_SRC/claude-code-best" && bun install --silent && bun run build ) \
+  ( cd "$PERSONAL_SRC/claude-code-best" && bun install --silent --ignore-scripts && bun run build ) \
     || { echo "[build-image] FATAL: ccb prebuild 失败" >&2; exit 1; }
   if [ ! -f "$PERSONAL_SRC/claude-code-best/dist/cli.js" ]; then
     echo "[build-image] FATAL: prebuild 完成但 dist/cli.js 不存在" >&2

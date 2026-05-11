@@ -13,7 +13,13 @@
 #   7. Snapshot remote /opt/openclaude/openclaude/ → /opt/openclaude/openclaude.prev.1/
 #      (rotates .prev.1..5/ ctime-ordered; oldest dropped). Legacy single-gen
 #      .prev/ (if present) is migrated to .prev.1/ once on first new deploy.
-#   8. rsync /opt/openclaude/openclaude-v3/ → commercial-v3:/opt/openclaude/openclaude/.
+#   8. rsync /opt/openclaude/openclaude-v3/ (local, on 45.32 master) →
+#      commercial-v3:/opt/openclaude/openclaude/. After this step, that remote
+#      path is the **single authoritative source** for everything that runs on
+#      commercial-v3 — gateway systemd unit, compute-pool, build-image.sh PERSONAL_SRC,
+#      etc. The legacy commercial-v3:/opt/openclaude/openclaude-v3/ tree is stale
+#      / orphan-git (recursive bad worktree) and must NOT be referenced by any
+#      runtime path — see build-image.sh header for historical context.
 #   9. Write VERSION.json on remote (atomic: scp → ssh mv).
 #  10. rsync repo changelog.json → commercial-v3:/root/.openclaude/changelog.json
 #      (because /api/changelog reads paths.home, not code dir). Failure aborts.
