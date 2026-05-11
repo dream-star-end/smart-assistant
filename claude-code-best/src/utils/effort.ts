@@ -66,6 +66,13 @@ export function modelSupportsMaxEffort(model: string): boolean {
   if (lower.includes('opus-4-6') || lower.includes('opus-4-7')) {
     return true
   }
+  // 2026-05-11: DeepSeek V4 anthropic-compat endpoint accepts effort='max'
+  // (api-docs.deepseek.com/guides/anthropic_api: output_config.effort 支持 high/max;
+  // low/medium 自动映射 high,xhigh 映射 max)。exact-match flash/pro,与 commercial v3
+  // anthropicProxy ALLOWED_INBOUND_MODELS 一致,不放过未来未声明的 deepseek 变体。
+  if (/^deepseek-v4-(flash|pro)$/.test(lower)) {
+    return true
+  }
   if (process.env.USER_TYPE === 'ant' && resolveAntModel(model)) {
     return true
   }

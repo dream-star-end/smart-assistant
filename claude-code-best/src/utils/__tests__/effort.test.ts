@@ -26,14 +26,17 @@ const {
   convertEffortValueToLevel,
   getEffortLevelDescription,
   resolvePickerEffortPersistence,
+  modelSupportsMaxEffort,
+  resolveAppliedEffort,
   EFFORT_LEVELS,
 } = await import("src/utils/effort.js");
 
 // ─── EFFORT_LEVELS constant ────────────────────────────────────────────
 
 describe("EFFORT_LEVELS", () => {
-  test("contains the four canonical levels", () => {
-    expect(EFFORT_LEVELS).toEqual(["low", "medium", "high", "max"]);
+  test("contains the five canonical levels", () => {
+    // 'xhigh' added in commit 4bcf507 (Opus 4.7 + xhigh effort 等级)
+    expect(EFFORT_LEVELS).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 });
 
@@ -194,8 +197,14 @@ describe("convertEffortValueToLevel", () => {
       expect(convertEffortValueToLevel(100)).toBe("high");
     });
 
-    test("value > 100 maps to 'max'", () => {
-      expect(convertEffortValueToLevel(101)).toBe("max");
+    test("value 101-150 maps to 'xhigh'", () => {
+      // commit 4bcf507: 101-150 → xhigh (Opus 4.7), >150 → max
+      expect(convertEffortValueToLevel(101)).toBe("xhigh");
+      expect(convertEffortValueToLevel(150)).toBe("xhigh");
+    });
+
+    test("value > 150 maps to 'max'", () => {
+      expect(convertEffortValueToLevel(151)).toBe("max");
       expect(convertEffortValueToLevel(200)).toBe("max");
     });
   });
@@ -251,5 +260,67 @@ describe("resolvePickerEffortPersistence", () => {
   test("returns undefined picked value when no explicit and matches default", () => {
     const result = resolvePickerEffortPersistence(undefined, "high" as any, undefined, false);
     expect(result).toBeUndefined();
+  });
+});
+
+// ─── DeepSeek V4 max effort support (2026-05-11) ───────────────────────
+// commercial v3 接入 deepseek-v4 后,前端"思考深度"菜单要能让用户选 max。
+// modelSupportsMaxEffort 必须放行 deepseek-v4-flash/pro,否则 resolveAppliedEffort
+// 会把 max 降级成 high,proxy 出向 body 实际只有 effort='high'。
+
+describe("modelSupportsMaxEffort - DeepSeek V4", () => {
+  test("returns true for deepseek-v4-flash (exact)", () => {
+    expect(modelSupportsMaxEffort("deepseek-v4-flash")).toBe(true);
+  });
+
+  test("returns true for deepseek-v4-pro (exact)", () => {
+    expect(modelSupportsMaxEffort("deepseek-v4-pro")).toBe(true);
+  });
+
+  test("returns true case-insensitive", () => {
+    expect(modelSupportsMaxEffort("DeepSeek-V4-Pro")).toBe(true);
+  });
+
+  test("returns false for future variants (not whitelisted)", () => {
+    // 防止未来 deepseek 出 v4-pro-extra / v5-* 自动被放行 max
+    expect(modelSupportsMaxEffort("deepseek-v4-pro-extra")).toBe(false);
+    expect(modelSupportsMaxEffort("deepseek-v4-flash-128k")).toBe(false);
+    expect(modelSupportsMaxEffort("deepseek-v5-pro")).toBe(false);
+    expect(modelSupportsMaxEffort("deepseek-chat")).toBe(false);
+    expect(modelSupportsMaxEffort("deepseek-reasoner")).toBe(false);
+  });
+});
+
+describe("resolveAppliedEffort - DeepSeek V4", () => {
+  // 关键回归:确保 max 不被静默降级成 high
+  test("'max' on deepseek-v4-pro does not downgrade", () => {
+    const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    expect(resolveAppliedEffort("deepseek-v4-pro", "max")).toBe("max");
+    if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
+  });
+
+  test("'max' on deepseek-v4-flash does not downgrade", () => {
+    const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    expect(resolveAppliedEffort("deepseek-v4-flash", "max")).toBe("max");
+    if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
+  });
+
+  // xhigh 仍降级 — 我们刻意不动 modelSupportsXhighEffort
+  // (deepseek 前端菜单不暴露 xhigh,即便误传也走 high 兜底,跟 deepseek
+  // 上游 docs xhigh→max 映射不冲突,Opus 4.7 仍然是唯一 xhigh 模型)
+  test("'xhigh' on deepseek-v4-pro still downgrades to 'high'", () => {
+    const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    expect(resolveAppliedEffort("deepseek-v4-pro", "xhigh")).toBe("high");
+    if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
+  });
+
+  test("'high' on deepseek-v4-pro stays 'high'", () => {
+    const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    expect(resolveAppliedEffort("deepseek-v4-pro", "high")).toBe("high");
+    if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
   });
 });

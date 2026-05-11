@@ -1,33 +1,53 @@
-// OpenClaude — 思考深度选择器(Opus 4.7 专属)
+// OpenClaude — 思考深度选择器
 //
-// 过去这里有两个独立 pill(编码模式 / 科研模式),只能开 xhigh 或 max。2026-04-22
-// 重构为一个带弹出菜单的选择器,覆盖五档 (low / medium / high / xhigh / max)。
-// 当前显示策略与旧版一致:仅 Opus 4.7 agent 展示入口。注意这是 commercial v3
-// 的**产品 UI 策略**,不是协议限制 —— 后端/协议 low/medium/high 对所有模型都
-// 支持(见 packages/protocol/src/frames.ts:48-57)。
+// 历史:
+//  - 2026-04-22 重构为一个带弹出菜单的选择器,覆盖 Opus 4.7 五档
+//    (low / medium / high / xhigh / max)。
+//  - 2026-04-26 v1.0.4 去掉"默认 / 由模型决定"档位 — 显示控件的会话永远显式
+//    向 gateway 发具体档位。
+//  - 2026-05-11 加 DeepSeek V4 接入 — 同一选择器覆盖 deepseek-v4-flash/pro 两档
+//    (high / max)。后端口径见 api-docs.deepseek.com/guides/anthropic_api:
+//    `output_config.effort` 支持 high/max;low/medium 自动映射 high,xhigh 映射 max。
+//    我们前端不暴露 deepseek 的 xhigh/low/medium,避免给用户"伪选项"。
 //
-// 2026-04-26 v1.0.4 起去掉"默认 / 由模型决定"档位:Opus 4.7 会话默认就是
-// 'medium',永远向 gateway 显式发 effortLevel(不再发 null)。理由:产品要给
-// 用户稳定可预期的体验,'让模型自决' 在不同模型/不同时段有歧义,新用户难以
-// 理解。store 里旧的 ''(empty,代表旧"默认"档)在 getCurrentEffort 中自动
-// fallback 到 DEFAULT_EFFORT。
+// 协议契约:
+//  - 后端 `InboundMessage.effortLevel`(`packages/protocol/src/frames.ts:48-57`)
+//    接受 low/medium/high/xhigh/max 五档。改动时同步更新两处。
+//  - 哪个模型支持哪些档位是**前端产品决策**,通过 `getEffortOptionsForModel`
+//    集中维护;`modelSupportsExtraEffort` 是"是否展示选择器"的 UI 开关。
 //
-// pill 状态按 agent 持久化在 localStorage,page reload 后复原。store 缺失或
-// 含非法值 → 视为 DEFAULT_EFFORT。
+// 持久化契约(agent-scoped,Codex 2026-05-11 复核确认):
+//  - localStorage `STORAGE_KEY` 按 agentId 存,**不区分 model**。
+//  - 相同合法值跨模型共享(例如 Opus 选 high 切到 DeepSeek 仍是 high);
+//  - 非法值(例如 Opus 选 low 切到 DeepSeek)只在 UI/submit 层兜底
+//    (`getLegalCurrentEffort`),不清 store,切回原模型恢复;
+//  - 只有用户在菜单显式点选时(`setCurrentEffort`)才按当前 agent 的
+//    "模型默认值"决定写入还是删除 store entry。
+//  - 这条契约不支持"严格 model-scoped 独立记忆":Opus 选 low → 切 DeepSeek
+//    点高(=deepseek default)→ 切回 Opus,Opus 退回 medium。接受。第三个支持
+//    effort 的模型接入时建议升级到模型元数据 / model-scoped store。
+
 import { $ } from './dom.js?v=9e5818e5'
 import { getSession, state } from './state.js?v=9e5818e5'
 
 const STORAGE_KEY = 'openclaude_effort_by_agent'
 
+// 协议合法 effort 全集。`setCurrentEffort` 用这个挡住非法输入(防止注入)。
 // 与 protocol/frames.ts InboundMessage.effortLevel 严格一一对应。
-// 改动时同步更新两处。
 const VALID = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 
-// 默认档位:store 缺失或被清掉时显示的值。v1.0.4 从"由模型决定"改成 medium。
-const DEFAULT_EFFORT = 'medium'
+// ── 模型 → 档位映射 ─────────────────────────────────────────────────
 
-// 菜单渲染顺序 + 文案。v1.0.4 移除首项"默认 / 由模型决定" — 永远落到具体档位。
-const MENU_OPTIONS = [
+function isOpus47Model(modelId) {
+  return /opus[-_]?4[-_]?7/i.test(modelId || '')
+}
+function isDeepseekModel(modelId) {
+  // exact-match flash/pro(与 commercial v3 anthropicProxy ALLOWED_INBOUND_MODELS 一致),
+  // 不放过未来未声明的 deepseek 变体。
+  return /^deepseek-v4-(flash|pro)$/i.test(modelId || '')
+}
+
+const OPUS_47_OPTIONS = [
   { value: 'low', label: '低', hint: '快速响应' },
   { value: 'medium', label: '中', hint: '均衡(默认)' },
   { value: 'high', label: '高', hint: '更彻底' },
@@ -35,19 +55,46 @@ const MENU_OPTIONS = [
   { value: 'max', label: '最高', hint: '深度推理(token 消耗显著上升)' },
 ]
 
-/** 协议能力:当前 model 是否支持 xhigh/max(仅 Opus 4.7)。
+// DeepSeek 真实只有 high / max 两档(其他档位自动映射,见上方注释)。
+// 默认 high(对齐 DeepSeek docs:常规请求默认 high)。
+const DEEPSEEK_OPTIONS = [
+  { value: 'high', label: '高', hint: '标准推理(默认)' },
+  { value: 'max', label: '最高', hint: '深度推理' },
+]
+
+/** 返回该 model 在菜单里要展示的档位列表(顺序就是渲染顺序)。
+ *  不支持思考深度选择的 model 返回空数组(由 `shouldShowEffortControl` 隐藏控件)。 */
+function getEffortOptionsForModel(modelId) {
+  if (isDeepseekModel(modelId)) return DEEPSEEK_OPTIONS
+  if (isOpus47Model(modelId)) return OPUS_47_OPTIONS
+  return []
+}
+
+/** 该 model 在该会话冷启动 / store 缺失时的默认档位。 */
+function getDefaultEffortForModel(modelId) {
+  if (isDeepseekModel(modelId)) return 'high'
+  return 'medium' // Opus 4.7 现状
+}
+
+function getAllowedEffortsForModel(modelId) {
+  return new Set(getEffortOptionsForModel(modelId).map((o) => o.value))
+}
+
+/** 协议能力:当前 model 是否支持额外的思考深度档位(即应展示选择器)。
  *  容忍模型 ID 大小写、preset / 自定义命名(如 anthropic/claude-opus-4-7)。 */
 export function modelSupportsExtraEffort(modelId) {
   if (!modelId || typeof modelId !== 'string') return false
-  return /opus[-_]?4[-_]?7/i.test(modelId)
+  return isOpus47Model(modelId) || isDeepseekModel(modelId)
 }
 
 /** commercial v3 产品策略:当前 agent 是否应显示"思考深度"选择器。
- *  与 modelSupportsExtraEffort 区分,后者是协议能力。现阶段二者等价(Opus 4.7),
- *  若未来产品决定对其他模型也开放入口,改这一处即可,不动协议判断。 */
+ *  现阶段与 `modelSupportsExtraEffort` 等价 — 若未来产品决定对支持 effort 的
+ *  模型暂不展示入口,改这一处即可,不动协议判断。 */
 function shouldShowEffortControl(modelId) {
   return modelSupportsExtraEffort(modelId)
 }
+
+// ── localStorage IO ────────────────────────────────────────────────
 
 function readStore() {
   try {
@@ -68,11 +115,16 @@ function writeStore(obj) {
   }
 }
 
-/** 取当前会话 agent 当前选中的 effort('low' | 'medium' | 'high' | 'xhigh' | 'max')。
- *  v1.0.4 起:store 缺失 / 旧版 '' / 非法值 全部 fallback 到 DEFAULT_EFFORT('medium'),
- *  不再返回 undefined。session 缺失时(冷启动 race)仍返回 undefined,让调用方跳过 UI。
+// ── current effort 读写 ────────────────────────────────────────────
+
+/** 取当前会话 agent 在 store 里写过的 effort(可能是任何协议合法值)。
+ *  session 缺失(冷启动 race)返回 undefined,让调用方跳过 UI。
+ *  store 缺失 / 旧版 '' / 非法值 → 用 `getDefaultEffortForModel(effectiveModel)`
+ *  作 fallback,**不写 store**(避免把临时 fallback 物化成显式偏好)。
  *
- *  自愈:store 里如果留有非法值或旧版 '',顺手清掉,下次读直接 fallback。 */
+ *  自愈:store 里如果留有协议非法值或旧版 '',顺手清掉,下次读直接 fallback。
+ *  注:这只清协议非法值;对"协议合法但当前 model 不支持"的值(如 Opus 'low'
+ *  切到 DeepSeek)不清,跨模型保留语义见顶部契约说明。 */
 export function getCurrentEffort() {
   const sess = getSession()
   if (!sess) return undefined
@@ -81,39 +133,51 @@ export function getCurrentEffort() {
   const store = readStore()
   const v = store[agentId]
   if (VALID.has(v)) return v
-  // store 缺失 / 旧版 '' / 非法值 — 清理(若有)并 fallback 到默认
   if (v !== undefined) {
     delete store[agentId]
     writeStore(store)
   }
-  return DEFAULT_EFFORT
+  return getDefaultEffortForModel(getEffectiveModel())
 }
 
-/** 决定 inbound.message.effortLevel 的取值:
- *    - 字符串 ∈ VALID:当前 agent 是 Opus 4.7 → 永远发具体档位(默认 medium)
- *    - undefined:不传字段 — 当前 agent 不支持扩展 effort,完全不参与 effort 协商
+/** 取"当前 effective model 下合法化"后的 effort。
+ *  store 里的值如果是当前 model 不支持的档位(如 Opus 选 low 切到 DeepSeek),
+ *  返回该 model 的默认值。submit / UI 显示统一走这个,确保我们永远不发非法值。 */
+function getLegalCurrentEffort() {
+  const model = getEffectiveModel()
+  const cur = getCurrentEffort()
+  const allowed = getAllowedEffortsForModel(model)
+  if (cur && allowed.has(cur)) return cur
+  return getDefaultEffortForModel(model)
+}
+
+/** 决定 `inbound.message.effortLevel` 的取值:
+ *    - 字符串 ∈ 当前 model 合法档位:发出
+ *    - undefined:不传字段 — 当前 model 不支持选择器,完全不参与 effort 协商
  *
- *  v1.0.4 起不再返回 null:'让模型自决' 档位被废,Opus 4.7 永远显式带 effort。 */
+ *  v1.0.4 起不再返回 null:'让模型自决' 档位被废,支持选择器的 model 永远显式带 effort。 */
 export function getEffortForSubmit() {
-  // v1.0.4 改读"effective model"(state.userPrefs.default_model 优先);否则
-  // 切到 Sonnet 但还按 agent.model=Opus 4.7 算,会发出 effortLevel='medium' →
-  // 后端虽然能 accept,但产品语义上 Sonnet 不该带这字段。
-  if (!modelSupportsExtraEffort(getEffectiveModel())) return undefined
-  return getCurrentEffort() ?? DEFAULT_EFFORT
+  const model = getEffectiveModel()
+  if (!modelSupportsExtraEffort(model)) return undefined
+  return getLegalCurrentEffort()
 }
 
 /** 设置当前会话 agent 的 effort。
- *  - 传 DEFAULT_EFFORT:delete store entry — 缺失语义就是 medium,免无意义写
- *  - 传其他 VALID 值:写入 store
- *  - 传非法值:静默忽略 */
+ *  - 协议非法值:静默忽略
+ *  - 等于当前 effective model 的默认值:delete store entry(缺失语义就是该默认值)
+ *  - 其他合法值:写入 store
+ *
+ *  注意:这里用 effective model 的默认值判定 delete,而不是固定 'medium'。
+ *  所以 DeepSeek 用户选"高"会 delete entry,Opus 用户选"中"也会 delete entry。 */
 function setCurrentEffort(level) {
   const sess = getSession()
   if (!sess) return
   const agentId = sess.agentId || state.defaultAgentId
   if (!agentId) return
   if (!VALID.has(level)) return
+  const modelDefault = getDefaultEffortForModel(getEffectiveModel())
   const store = readStore()
-  if (level === DEFAULT_EFFORT) {
+  if (level === modelDefault) {
     delete store[agentId]
   } else {
     store[agentId] = level
@@ -130,9 +194,9 @@ function getCurrentAgentModel() {
   return a?.model || ''
 }
 
-/** 当前生效模型 id:state.userPrefs.default_model 优先,否则 agent.model。
- *  注意 state.userPrefs===null 表示尚未拉取 — 调用方应单独处理(返回空串
- *  让 shouldShowEffortControl 判 false,但 renderModePills 会显式隐藏避免闪烁)。 */
+/** 当前生效模型 id:`state.userPrefs.default_model` 优先,否则 agent.model。
+ *  注意 `state.userPrefs===null` 表示尚未拉取 — 调用方应单独处理(返回空串
+ *  让 `shouldShowEffortControl` 判 false,但 `renderModePills` 会显式隐藏避免闪烁)。 */
 function getEffectiveModel() {
   const pref = state.userPrefs?.default_model
   if (typeof pref === 'string' && pref) return pref
@@ -189,10 +253,10 @@ function openMenu(focusFirst = false) {
   positionMenu()
   menu.hidden = false
   trigger.setAttribute('aria-expanded', 'true')
-  // roving tabindex:标记选中项(或首项)为可 tab,其余 -1。
+  // roving tabindex:标记当前合法化后的选中项(或首项)为可 tab,其余 -1。
   const items = Array.from(menu.querySelectorAll('[role="option"]'))
   if (items.length > 0) {
-    const current = getCurrentEffort() ?? DEFAULT_EFFORT
+    const current = getLegalCurrentEffort()
     const target = items.find((el) => el.dataset.effort === current) || items[0]
     for (const it of items) it.setAttribute('tabindex', it === target ? '0' : '-1')
     // 只在键盘触发(focusFirst=true)时主动 .focus(),避免 mobile tap 触发
@@ -268,10 +332,22 @@ function detachGlobalListeners() {
 // ── Render ─────────────────────────────────────────────────────────
 
 function labelForCurrent() {
-  const cur = getCurrentEffort() ?? DEFAULT_EFFORT
-  const opt = MENU_OPTIONS.find((o) => o.value === cur)
-  const which = opt ? opt.label : '中'
-  return `思考深度: ${which}`
+  const model = getEffectiveModel()
+  const cur = getLegalCurrentEffort()
+  const opt = getEffortOptionsForModel(model).find((o) => o.value === cur)
+  return `思考深度: ${opt?.label || '高'}`
+}
+
+/** 模块级:上次渲染菜单 DOM 时用的 options 集合 key。
+ *  Opus 5 档与 DeepSeek 2 档切换时必须重建 DOM,不能复用旧 DOM。
+ *  Values 集合作为 key 当前够用(Opus="low,medium,high,xhigh,max" vs
+ *  DeepSeek="high,max")。未来若两个 model values 相同但 label/hint 不同,
+ *  需要把 label 也纳入 key。 */
+let _lastRenderedOptionsKey = ''
+function _optionsKey(model) {
+  return getEffortOptionsForModel(model)
+    .map((o) => o.value)
+    .join(',')
 }
 
 /** 根据当前会话 agent 的 model 决定 effort-trigger 自身的可见性,并同步 trigger
@@ -281,7 +357,10 @@ function labelForCurrent() {
  *
  *  v1.0.4 起:此函数只控制 effort-trigger + effort-menu 自身,不再 hide
  *  整个 composer-modes 容器(那由 modelPicker.renderModelPill 控制)。
- *  切到不展示控件的 agent 时强制关闭菜单,避免"pop-open 后切 agent 留幽灵弹出"。 */
+ *  切到不展示控件的 agent 时强制关闭菜单,避免"pop-open 后切 agent 留幽灵弹出"。
+ *
+ *  2026-05-11 起:菜单 DOM 按 options key 重建,跨支持 effort 的 model 切换
+ *  (Opus 4.7 ↔ DeepSeek)时不复用旧 DOM。 */
 export function renderModePills() {
   const trigger = getTrigger()
   const menu = getMenu()
@@ -304,16 +383,19 @@ export function renderModePills() {
     return
   }
 
-  const current = getCurrentEffort() ?? DEFAULT_EFFORT
-  // trigger:仅非默认档位(medium)pressed
-  trigger.setAttribute('aria-pressed', current !== DEFAULT_EFFORT ? 'true' : 'false')
+  const current = getLegalCurrentEffort()
+  const modelDefault = getDefaultEffortForModel(model)
+  // trigger:仅非该 model 默认档位时 pressed
+  trigger.setAttribute('aria-pressed', current !== modelDefault ? 'true' : 'false')
   const labelEl = $('effort-label')
   if (labelEl) labelEl.textContent = labelForCurrent()
 
-  // 懒渲染菜单选项(幂等:重复调不会重复 append)
-  if (menu.childElementCount === 0) {
+  // 按模型重建菜单 DOM(首次渲染或 options 集合变化时)
+  const key = _optionsKey(model)
+  if (menu.childElementCount === 0 || _lastRenderedOptionsKey !== key) {
+    menu.replaceChildren()
     const frag = document.createDocumentFragment()
-    for (const opt of MENU_OPTIONS) {
+    for (const opt of getEffortOptionsForModel(model)) {
       const btn = document.createElement('button')
       btn.type = 'button'
       btn.className = 'effort-menu-item'
@@ -326,8 +408,9 @@ export function renderModePills() {
       frag.appendChild(btn)
     }
     menu.appendChild(frag)
+    _lastRenderedOptionsKey = key
   }
-  // 同步 aria-selected + roving tabindex
+  // 同步 aria-selected + 选中项样式
   const items = menu.querySelectorAll('[role="option"]')
   for (const it of items) {
     const sel = it.dataset.effort === current
