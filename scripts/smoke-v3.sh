@@ -131,12 +131,11 @@ check "/api/changelog.currentVersion === $EXPECTED_TAG (or 401)" \
 # Scope: ONLY master HTTP segment. WS/node-agent/container deferred to S11a.
 verify_trace_propagation() {
   local expected_min=3
-  local since='5 min ago'
 
   # 3 trace-only probes against routes guaranteed to hit router.ts reqLog
   # (verified against router.ts prefix list 2026-05-11: /api/public/*,
   # /api/models). They don't contribute to PASS/FAIL — they exist purely so
-  # the journalctl grep below has known log-line targets. Each gets the same
+  # the grep below has known log-line targets. Each gets the same
   # SMOKE_TRACE so a single grep captures all 3.
   for probe_path in /api/public/config /api/public/models /api/models; do
     curl -s --max-time 5 -o /dev/null \
@@ -144,18 +143,21 @@ verify_trace_propagation() {
       "${BASE_URL}${probe_path}" || true
   done
 
-  # Give journald a tiny buffer to flush. systemd journal usually writes
-  # within ~10ms, but on a busy box with concurrent log volume the per-line
-  # disk write can lag a few hundred ms. 1s is generous slack.
+  # Tiny buffer for the appender to flush. The log target is a plain file
+  # (StandardOutput=append:/var/log/openclaude.log per the systemd unit), so
+  # disk writes are usually <10ms but 1s gives slack under concurrent load.
   sleep 1
 
-  # Single SSH call. Remote: `grep -c ... || true` ensures zero matches exit
-  # 0 (not the grep-c convention of exit 1). Local: capture exit separately
-  # so a real ssh failure is distinguishable from "count = 0".
+  # v1.0.122 fix — the systemd unit writes app logs to /var/log/openclaude.log
+  # (StandardOutput=append:...), NOT journalctl. Earlier v1.0.122 deploy showed
+  # 0 hits via journalctl while the file had all 3. Grep the file directly.
+  # Remote: `grep -c ... || true` ensures zero matches exit 0 (not grep-c's
+  # default exit 1). Local: capture exit separately so a real ssh failure is
+  # distinguishable from "count = 0".
   local count
   if ! count=$(ssh -o BatchMode=yes -o ConnectTimeout=5 commercial-v3 \
-    "journalctl -u openclaude --since '$since' --no-pager 2>/dev/null | grep -c '${SMOKE_TRACE}' || true" 2>/dev/null); then
-    echo "   ⚠ trace propagation: ssh commercial-v3 journalctl unavailable — skipping verify (deploy unaffected)" >&2
+    "tail -n 5000 /var/log/openclaude.log 2>/dev/null | grep -c '${SMOKE_TRACE}' || true" 2>/dev/null); then
+    echo "   ⚠ trace propagation: ssh commercial-v3 log read unavailable — skipping verify (deploy unaffected)" >&2
     return 0
   fi
 
