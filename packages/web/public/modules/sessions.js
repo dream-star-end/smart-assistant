@@ -52,6 +52,11 @@ export function createSession(agentId) {
   state.sessions.set(id, s)
   state.currentSessionId = id
   scheduleSave(s)
+  // 与 switchSession() 末尾对称:任何"创建新 session"路径都必须把 GitHub
+  // pill / banner 同步到新 sid。否则用户点"新建会话"后 pill 上还残留上一
+  // 会话的 repo binding,直到下次刷新页面才被 boot 路径的 refreshGithubPill
+  // 纠正。新 sid 在 server 上没 selection,这次 GET 等价于"清空 pill"。
+  refreshGithubPill(id)
   return s
 }
 
@@ -127,8 +132,15 @@ export async function deleteSession(id) {
     // (下面是直接赋 currentSessionId 或 createSession),所以必须显式清。
     clearAttachments()
     const arr = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
-    if (arr.length > 0) state.currentSessionId = arr[0].id
-    else createSession()
+    if (arr.length > 0) {
+      state.currentSessionId = arr[0].id
+      // 这条分支既不走 switchSession 也不走 createSession,currentSessionId
+      // 静默改了但 GitHub pill 还停留在已删除会话的 binding 上 —— 与 createSession
+      // 内置 refreshGithubPill 对称,这里也必须显式同步。
+      refreshGithubPill(state.currentSessionId)
+    } else {
+      createSession()
+    }
     _renderMessages()
   }
   renderSidebar()
