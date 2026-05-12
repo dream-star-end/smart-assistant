@@ -123,11 +123,11 @@ import {
   markV3ContainerActivity,
   startV3ContainerEventsWorker,
   startVolumeGcScheduler,
-  createUserUploadsResolver,
-  isUserVolumeUploadsPath,
+  createUserMediaResolver,
+  isUserVolumeMediaPath,
   type IdleSweepScheduler,
   type OrphanReconcileScheduler,
-  type UserUploadsLocation,
+  type UserMediaLocation,
   type V3ContainerEventsWorker,
   type V3SupervisorDeps,
   type VolumeGcScheduler,
@@ -236,32 +236,36 @@ export interface RegisterCommercialResult {
   /**
    * V3 multi-tenant `/api/uploads` 写入与 `/api/media` 读取的存储路径解析器。
    *
-   * 把 `c:<uid>` 形式的 userId 映射到这台 master 上**用户 docker volume 的宿主路径**
-   * (`/var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads/`)。容器侧 dispatchInbound
-   * 通过相同的 volume mount 看到的就是 `/home/agent/.openclaude/uploads/`,从而消除
-   * "master 写到自己 paths.uploadsDir / 容器读自己 paths.uploadsDir" 的双视图 bug。
+   * 把 `c:<uid>` 形式的 userId 映射到这台 master 上**用户 docker volume 宿主路径**
+   * 的 uploads / generated **两个子目录**(同一 docker volume,一次 inspect 同时
+   * 确认两 dir 可用)。容器侧 dispatchInbound / codex `image_gen` 通过相同的
+   * volume mount 分别看到 `/home/agent/.openclaude/(uploads|generated)/`,从而
+   * 消除 "master 写到自己 paths.{uploads,generated}Dir / 容器读自己同名 dir"
+   * 的双视图 bug(两次同型回归:2026-05-09 uploads + 2026-05-12 generated)。
    *
    * 装配条件:agentRuntime 起得来(有 docker client)+ pool 已建立。两者任一缺失
    * (e.g. AGENT_IMAGE 没配),resolver 为 undefined,gateway 自动回退到旧的
-   * `paths.uploadsDir`(personal/单租户兼容)。
+   * `paths.uploadsDir` / `paths.generatedDir`(personal/单租户兼容)。
    *
    * fail-closed:DB 查无 active container → not-ready;远程 host → remote-host;
    * 多条 active → ambiguous;volume 不存在 → volume-missing。gateway 转译为对应
    * HTTP 4xx/5xx,不做静默回退。
    */
-  resolveUserUploadsDir?: (userId: string) => Promise<UserUploadsLocation>;
+  resolveUserMediaDirs?: (userId: string) => Promise<UserMediaLocation>;
   /**
-   * V3 multi-tenant 通用谓词:判定一个 resolvedPath 是否落在
-   * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/uploads[/<file>]` 形式下。
+   * V3 multi-tenant **textual** 谓词:判定一个 resolvedPath 是否长得像
+   * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)[/<file>]`。
    *
-   * gateway 的 `/api/file` allowlist 用它放行 docker volume 路径的 file-by-abs-path
-   * 请求 —— 否则 isFileAllowed 只匹配 paths.uploadsDir(= /root/.openclaude/uploads,
-   * 多租户下并不存在用户文件),所有 abs-path 请求都会被 403。
+   * **不是 user-scoped** —— 只检查路径形态,不验证 uid 等于当前请求 userId。
+   * gateway HTTP allowlist **不能**用它(会引入 cross-tenant IDOR:用户 A 拿到
+   * 用户 B 的绝对路径就能读)。allowlist 的 user-scoped predicate 应该用
+   * `resolveUserMediaDirs(userId)` 解析出当前用户的 `{uploads, generated}` 后
+   * 自己 closure。
    *
-   * **纯文本判定**,不防 TOCTOU;调用方必须自己 realpathSync 后再调它(gateway 的
-   * openFileHardened 已经按 "先 realpath 后判定" 的顺序调用)。
+   * 唯一合法用途:启动时 `.tmp-*` orphan sweep(无 userId 上下文,只想匹配
+   * docker volumes 根下的 user volume 目录壳子)。
    */
-  isUserVolumeUploadsPath?: (resolvedPath: string) => boolean;
+  isUserVolumeMediaPath?: (resolvedPath: string) => boolean;
 }
 
 // ─── D.1b: 18443 mTLS 反代前置校验 ─────────────────────────────────────────
@@ -1878,18 +1882,18 @@ export async function registerCommercial(
     externalMtlsAddress,
     // 已规范化为 ≥32 byte Uint8Array,gateway 可直接喂 createHmac
     jwtSecret: secretToKey(jwtSecret),
-    // V3 multi-tenant uploads resolver — 只有 agentRuntime 起得来(docker client 在手)
-    // 才注入;否则 gateway 自动回退 paths.uploadsDir(单租户兼容)。详见 RegisterCommercialResult 注释。
-    resolveUserUploadsDir: agentRuntime
-      ? createUserUploadsResolver({
+    // V3 multi-tenant media resolver — 只有 agentRuntime 起得来(docker client 在手)
+    // 才注入;否则 gateway 自动回退 paths.{uploads,generated}Dir(单租户兼容)。
+    // 详见 RegisterCommercialResult 注释。
+    resolveUserMediaDirs: agentRuntime
+      ? createUserMediaResolver({
           pool: getPool(),
           docker: agentRuntime.docker,
         })
       : undefined,
-    // 静态谓词,无依赖,始终暴露 —— gateway isFileAllowed 调用时不需要先判 agentRuntime 是否在。
-    // (commercial 加载即意味着多租户;路径规则在 personal 版本里压根不会出现,所以即使 personal
-    // 误用也不会有副作用 —— 没有任何 /var/lib/docker/volumes/oc-v3-data-u<n> 会被 realpath 出来。)
-    isUserVolumeUploadsPath,
+    // textual 谓词,无依赖,始终暴露 —— 仅供 orphan sweep 启动时按目录壳子
+    // 迭代 user volumes 用。**不要**给 HTTP allowlist 用(cross-tenant IDOR)。
+    isUserVolumeMediaPath,
   };
 }
 

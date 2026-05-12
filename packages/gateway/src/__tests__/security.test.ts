@@ -171,11 +171,15 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
     assert.ok(!isFileAllowed(resolve('/root/.openclaude/generatedEVIL/file.txt')))
   })
 
-  // V3 multi-tenant per-user uploads volume: gateway is wired to call
-  // isFileAllowed with `commercial.isUserVolumeUploadsPath` as the
-  // `extraAllowedPredicate`. The function-as-data signature is the contract;
-  // these tests pin the 3-arg shape so adding/removing the predicate axis
-  // can't silently break the per-user uploads allowlist.
+  // V3 multi-tenant per-user media volume: gateway constructs a
+  // **user-scoped** predicate per request via `makeUserScopedMediaPredicate`
+  // (which closes over the CURRENT request's resolved {uploads, generated}
+  // dirs) and passes it as `extraAllowedPredicate`. This closes the
+  // cross-tenant IDOR — a global textual "any user volume" predicate would
+  // let user A read user B's media by absolute path.
+  // The function-as-data signature is the contract; these tests pin the
+  // 3-arg shape so adding/removing the predicate axis can't silently break
+  // the per-user media allowlist.
   it('extraAllowedPredicate=true → allows path even when no static dir matches', () => {
     const userVolPath =
       '/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/abc.png'
@@ -192,6 +196,42 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
     assert.ok(isFileAllowed(resolve('/root/.openclaude/uploads/photo.jpg')))
     // Static deny still denies without 3rd arg.
     assert.ok(!isFileAllowed(resolve('/etc/passwd')))
+  })
+
+  // V3 commercial cross-tenant IDOR hard gate: paths matching the per-user
+  // docker volume media shape MUST go through the user-scoped predicate.
+  // Static dirs / temp / agent-cwd branches MUST NOT be able to authorize.
+  describe('IDOR gate: /var/lib/docker/volumes/oc-v3-data-u<n>/_data/(uploads|generated)', () => {
+    const uA = '/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/x.png'
+    const uB = '/var/lib/docker/volumes/oc-v3-data-u99/_data/uploads/x.png'
+    const gB = '/var/lib/docker/volumes/oc-v3-data-u99/_data/generated/y.png'
+    it('denies user-volume media path when no predicate provided', () => {
+      assert.ok(!isFileAllowed(uA))
+    })
+    it('denies cross-tenant access even when agent CWD overlaps the user-B volume', () => {
+      // Hypothetical attack: agent cwd misconfigured to point at user B's
+      // _data dir. Without the gate, the agent-cwd branch's `MEDIA_EXTENSIONS`
+      // shortcut would authorize uB. The gate must override.
+      const attackCwd = '/var/lib/docker/volumes/oc-v3-data-u99/_data'
+      assert.ok(!isFileAllowed(uB, [attackCwd]))
+      assert.ok(!isFileAllowed(gB, [attackCwd]))
+    })
+    it('denies cross-tenant access even when user-A predicate accepts user-A path but not user-B', () => {
+      // Predicate scoped to user A's uploads — should reject user B's path.
+      const userAPredicate = (p: string) =>
+        p === '/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads' ||
+        p.startsWith('/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/')
+      assert.ok(isFileAllowed(uA, undefined, userAPredicate))
+      assert.ok(!isFileAllowed(uB, undefined, userAPredicate))
+    })
+    it('gate does not affect non-volume paths', () => {
+      // Sanity: the gate only triggers on the textual shape, not e.g. a
+      // similarly-named directory elsewhere.
+      const lookalike = '/var/lib/not-docker/volumes/oc-v3-data-u42/_data/uploads/x.png'
+      // Without predicate, this falls through to the rest of isFileAllowed
+      // (which denies because no static/cwd match).
+      assert.ok(!isFileAllowed(lookalike))
+    })
   })
 })
 

@@ -1,5 +1,5 @@
 /**
- * v3 commercial multi-tenant uploads routing.
+ * v3 commercial multi-tenant media routing.
  *
  * Plan B (2026-05-09) `/api/uploads` shipped a single-tenant assumption:
  * master writes to its own `paths.uploadsDir` (= `/root/.openclaude/uploads/`).
@@ -8,20 +8,32 @@
  * `paths.uploadsDir` (= `/home/agent/.openclaude/uploads/`). Different
  * physical paths → `rejectFrame('媒体不存在或不可读')` regression.
  *
- * This resolver moves the storage authority to the user's docker data volume:
+ * 2026-05-12 同型问题在 `generated/` 子目录复现:codex `image_gen` 在容器内
+ * 写到 `paths.generatedDir` (= 容器视图 `/home/agent/.openclaude/generated/`,
+ * 即 user volume `_data/generated/`),但 master gateway 的 `/api/media` 读
+ * `paths.generatedDir` (= master 视图 `/root/.openclaude/generated/`),那里
+ * 是空的 → 404。
  *
- *   master view  : /var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads/<digest>.<ext>
- *   container view: /home/agent/.openclaude/uploads/<digest>.<ext>   (same inode)
+ * 本模块把存储权威源搬到用户 docker volume 的宿主路径,**两个子目录用同一次
+ * 一致性检查**(DB active container + docker getVolume inspect)绑定:
  *
- * Both paths reference the SAME physical directory via the docker volume
- * mount that v3supervisor already establishes (`oc-v3-data-u<uid>` →
- * `/home/agent/.openclaude`). No new mount or sync mechanism needed.
+ *   master view  : /var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads/<file>
+ *                  /var/lib/docker/volumes/oc-v3-data-u<uid>/_data/generated/<file>
+ *   container view: /home/agent/.openclaude/uploads/<file>   (同 inode)
+ *                   /home/agent/.openclaude/generated/<file>  (同 inode)
  *
- * The resolver is consumed by gateway via `CommercialHook.resolveUserUploadsDir`.
- * It is the SINGLE authoritative function for this mapping — both the upload
- * write path (handleUpload) and the read path (`/api/media` GET) call it.
+ * 同一 docker volume,所以一次 inspect 就能确认两个 dir 都"可用",避免
+ * `/api/media` 一次请求双查 DB+docker。
  *
- * Fail-closed branches (no silent fallback):
+ * 被 gateway 通过 `CommercialHook.resolveUserMediaDirs` 消费;它是 master
+ * gateway 多租户路径路由的**唯一权威源**:
+ *   - 写路径(handleUpload)用 `result.uploads`
+ *   - 读路径(handleMediaGet)在 `[uploads, generated]` 两 dir 中查找
+ *   - allowlist 用 closure 把 `(p) => p in uploads∪generated` 作为 user-scoped
+ *     extraAllowedPredicate 传给 isFileAllowed(避免上一版 textual 全局谓词
+ *     被 cross-tenant 滥用的 IDOR 风险)
+ *
+ * Fail-closed 分支(无 silent fallback):
  *   - invalid-uid    : userId not in `c:<digits>` shape (1-19 digit positive)
  *   - not-ready      : user has no active container yet (provisioning window)
  *   - remote-host    : container is on a non-self compute host (deferred to
@@ -36,44 +48,59 @@ import type Docker from "dockerode";
 import type { Pool } from "pg";
 import { v3VolumeNameFor } from "./v3supervisor.js";
 
-/** Per-user uploads dir prefix on master (docker volume host path). */
-export const USER_VOLUME_UPLOADS_HOST_PREFIX = "/var/lib/docker/volumes";
+/** Per-user media dir prefix on master (docker volume host path). */
+export const USER_VOLUME_MEDIA_HOST_PREFIX = "/var/lib/docker/volumes";
 
-/** Suffix appended after `<volume-name>/_data/` to land inside the uploads subdir. */
+/** Subpath under `<volume-name>/` for uploads. */
 export const USER_VOLUME_UPLOADS_SUBPATH = "_data/uploads";
 
+/** Subpath under `<volume-name>/` for codex/agent generated output. */
+export const USER_VOLUME_GENERATED_SUBPATH = "_data/generated";
+
 /**
- * Strict canonical regex for the master-side host path of a user's uploads
- * directory. Public + exported so the gateway TOCTOU/allowlist check
- * (`isUserVolumeUploadsPath`) can reuse the same source of truth.
+ * Discriminates the two media subdirs that live in the same user docker volume.
+ * Keep this enum small — adding a third kind means adding a new subpath
+ * constant + extending the regex below.
+ */
+export type MediaKind = "uploads" | "generated";
+
+/**
+ * Strict canonical regex for the master-side host path of a user's media
+ * directory (either subdir). Public + exported so the gateway can reuse the
+ * same source of truth when iterating user volumes for orphan sweeps.
  *
- *   /var/lib/docker/volumes/oc-v3-data-u<digits>/_data/uploads
+ *   /var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)
  *
  * No trailing slash, no trailing junk — callers should `realpathSync` first,
  * which strips trailing slashes. Digits = 1-19 positive (matches
  * v3VolumeNameFor's `Number.isInteger && >0` invariant, since 2^63 fits in
  * 19 digits).
  */
-export const USER_VOLUME_UPLOADS_DIR_REGEX =
-  /^\/var\/lib\/docker\/volumes\/oc-v3-data-u([1-9][0-9]{0,18})\/_data\/uploads$/;
+export const USER_VOLUME_MEDIA_DIR_REGEX =
+  /^\/var\/lib\/docker\/volumes\/oc-v3-data-u([1-9][0-9]{0,18})\/_data\/(uploads|generated)$/;
 
 /** Strict regex over the trailing component (uid + filename) under the dir. */
-export const USER_VOLUME_UPLOADS_FILE_REGEX =
-  /^\/var\/lib\/docker\/volumes\/oc-v3-data-u([1-9][0-9]{0,18})\/_data\/uploads\/[^/]+$/;
+export const USER_VOLUME_MEDIA_FILE_REGEX =
+  /^\/var\/lib\/docker\/volumes\/oc-v3-data-u([1-9][0-9]{0,18})\/_data\/(uploads|generated)\/[^/]+$/;
 
 /**
- * Build the master-side host path for a user's uploads directory.
+ * Build the master-side host path for a user's media subdirectory.
  * Synchronous + pure (no I/O); validates uid format. Throws on invalid uid.
  *
- *   buildUserUploadsHostDir(42) === "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads"
+ *   buildUserMediaHostDir(42, 'uploads')   === "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads"
+ *   buildUserMediaHostDir(42, 'generated') === "/var/lib/docker/volumes/oc-v3-data-u42/_data/generated"
  *
  * NOTE: This does NOT verify the docker volume exists. Callers that need
  * the volume to exist (= active container path) should use the full
- * `createUserUploadsResolver` resolver which adds docker volume inspect.
+ * `createUserMediaResolver` resolver which adds docker volume inspect.
  */
-export function buildUserUploadsHostDir(uid: number): string {
+export function buildUserMediaHostDir(uid: number, kind: MediaKind): string {
   const volume = v3VolumeNameFor(uid); // validates uid > 0, integer
-  return `${USER_VOLUME_UPLOADS_HOST_PREFIX}/${volume}/${USER_VOLUME_UPLOADS_SUBPATH}`;
+  const subpath =
+    kind === "uploads"
+      ? USER_VOLUME_UPLOADS_SUBPATH
+      : USER_VOLUME_GENERATED_SUBPATH;
+  return `${USER_VOLUME_MEDIA_HOST_PREFIX}/${volume}/${subpath}`;
 }
 
 /**
@@ -116,8 +143,8 @@ export function parseCommercialUid(userId: string): number | null {
   return uid;
 }
 
-export type UserUploadsLocation =
-  | { kind: "ok"; uid: number; dir: string }
+export type UserMediaLocation =
+  | { kind: "ok"; uid: number; uploads: string; generated: string }
   | {
       kind: "fail";
       reason:
@@ -163,16 +190,20 @@ export interface DockerLike {
  * about pg.Pool or dockerode. Returns a closure capturing the deps so we can
  * inject test stubs cleanly.
  *
- *   const resolve = createUserUploadsResolver({ pool, docker });
+ *   const resolve = createUserMediaResolver({ pool, docker });
  *   const loc = await resolve('c:42');
+ *   // loc.kind === 'ok' → loc.uploads, loc.generated 都可用(同一 volume)
+ *
+ * 单次 DB + docker inspect 解决两个子目录的一致性检查 —— 避免 /api/media
+ * 一次请求双查。如果 uploads 通过那 generated 也必然通过(同一 volume)。
  */
-export function createUserUploadsResolver(deps: {
+export function createUserMediaResolver(deps: {
   pool: PoolLike;
   docker: DockerLike;
-}): (userId: string) => Promise<UserUploadsLocation> {
-  return async function resolveUserUploadsDir(
+}): (userId: string) => Promise<UserMediaLocation> {
+  return async function resolveUserMediaDirs(
     userId: string,
-  ): Promise<UserUploadsLocation> {
+  ): Promise<UserMediaLocation> {
     const uid = parseCommercialUid(userId);
     if (uid === null) {
       // Note: 'default' (legacy single-token) is NOT routed here — the gateway
@@ -269,26 +300,30 @@ export function createUserUploadsResolver(deps: {
     return {
       kind: "ok",
       uid,
-      dir: buildUserUploadsHostDir(uid),
+      uploads: buildUserMediaHostDir(uid, "uploads"),
+      generated: buildUserMediaHostDir(uid, "generated"),
     };
   };
 }
 
 /**
- * Predicate: does this resolved path belong to a per-user uploads volume?
- * Used by the gateway file-allowlist (`isFileAllowed`) so /api/file requests
- * for paths inside any user's uploads dir are permitted without each call
- * having to enumerate the per-user prefix.
+ * Predicate: does this resolved path belong to ANY user's media volume?
+ *
+ * **Caveat — not user-scoped**: 只判定路径形态,不判定 uid 是否等于调用方。
+ * 当前唯一合法用途是启动时 `.tmp-*` orphan sweep(那里无 userId 上下文,只想
+ * 匹配目录壳子)。gateway HTTP handler **不要**用它做 allowlist,会引入
+ * cross-tenant IDOR(用户 A 拿到用户 B 的绝对路径就能读) —— 那里应该用
+ * resolver 拿到的当前用户 `{uploads, generated}` 两 dir 自己 closure。
  *
  * Strict — only matches paths of the exact shape
- * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/uploads[/<file>]`.
+ * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)[/<file>]`.
  * Callers are still responsible for verifying the path via realpathSync
  * before opening; this is a textual gate, not a TOCTOU defense.
  */
-export function isUserVolumeUploadsPath(resolvedPath: string): boolean {
+export function isUserVolumeMediaPath(resolvedPath: string): boolean {
   return (
-    USER_VOLUME_UPLOADS_DIR_REGEX.test(resolvedPath) ||
-    USER_VOLUME_UPLOADS_FILE_REGEX.test(resolvedPath)
+    USER_VOLUME_MEDIA_DIR_REGEX.test(resolvedPath) ||
+    USER_VOLUME_MEDIA_FILE_REGEX.test(resolvedPath)
   );
 }
 

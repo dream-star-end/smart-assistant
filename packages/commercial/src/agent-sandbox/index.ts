@@ -141,19 +141,23 @@ export {
 // 邮箱验证后 fire-and-forget 容器 pre-warm helper
 export { makePrewarmContainer } from "./v3prewarm.js";
 
-// V3 multi-tenant uploads resolver — gateway 用它把 `/api/uploads` 的写入路径
-// 路由到具体用户的 docker volume host path,避免 master/container 单租户 paths.uploadsDir
-// 假设造成的 "媒体不存在或不可读" 双视图 bug。详见 userUploads.ts 头注释。
+// V3 multi-tenant media resolver — gateway 用它把 `/api/uploads` 写路径 +
+// `/api/media` 读路径(同时覆盖 codex image_gen 输出的 generated/ 子目录)
+// 路由到具体用户的 docker volume host path,避免 master/container 单租户
+// paths.uploadsDir / paths.generatedDir 假设造成的 "媒体不存在或不可读" /
+// "图像 404" 双视图 bug。详见 userMedia.ts 头注释。
 export {
-  createUserUploadsResolver,
-  buildUserUploadsHostDir,
+  createUserMediaResolver,
+  buildUserMediaHostDir,
   parseCommercialUid,
-  isUserVolumeUploadsPath,
-  USER_VOLUME_UPLOADS_HOST_PREFIX,
+  isUserVolumeMediaPath,
+  USER_VOLUME_MEDIA_HOST_PREFIX,
   USER_VOLUME_UPLOADS_SUBPATH,
-  USER_VOLUME_UPLOADS_DIR_REGEX,
-  USER_VOLUME_UPLOADS_FILE_REGEX,
-  type UserUploadsLocation,
-  type PoolLike as UserUploadsPoolLike,
-  type DockerLike as UserUploadsDockerLike,
-} from "./userUploads.js";
+  USER_VOLUME_GENERATED_SUBPATH,
+  USER_VOLUME_MEDIA_DIR_REGEX,
+  USER_VOLUME_MEDIA_FILE_REGEX,
+  type MediaKind,
+  type UserMediaLocation,
+  type PoolLike as UserMediaPoolLike,
+  type DockerLike as UserMediaDockerLike,
+} from "./userMedia.js";
