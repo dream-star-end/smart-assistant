@@ -170,6 +170,29 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
     // e.g. /root/.openclaude/generatedEVIL/file should NOT match generatedDir
     assert.ok(!isFileAllowed(resolve('/root/.openclaude/generatedEVIL/file.txt')))
   })
+
+  // V3 multi-tenant per-user uploads volume: gateway is wired to call
+  // isFileAllowed with `commercial.isUserVolumeUploadsPath` as the
+  // `extraAllowedPredicate`. The function-as-data signature is the contract;
+  // these tests pin the 3-arg shape so adding/removing the predicate axis
+  // can't silently break the per-user uploads allowlist.
+  it('extraAllowedPredicate=true → allows path even when no static dir matches', () => {
+    const userVolPath =
+      '/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/abc.png'
+    // Without predicate: denied.
+    assert.ok(!isFileAllowed(resolve(userVolPath)))
+    // With predicate accepting: allowed.
+    assert.ok(isFileAllowed(resolve(userVolPath), undefined, () => true))
+  })
+  it('extraAllowedPredicate=false → still denies', () => {
+    assert.ok(!isFileAllowed(resolve('/etc/passwd'), undefined, () => false))
+  })
+  it('extraAllowedPredicate undefined → behaves like 2-arg call (backward compat)', () => {
+    // Static allow still works without the 3rd arg.
+    assert.ok(isFileAllowed(resolve('/root/.openclaude/uploads/photo.jpg')))
+    // Static deny still denies without 3rd arg.
+    assert.ok(!isFileAllowed(resolve('/etc/passwd')))
+  })
 })
 
 // ── T02: Upload MIME validation — tests the REAL isUploadMimeAllowed function ──

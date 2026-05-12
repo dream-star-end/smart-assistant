@@ -1,17 +1,19 @@
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
 import {
   constants as fsConstants,
+  chmodSync,
+  chownSync,
   closeSync,
   createReadStream,
   createWriteStream,
   existsSync,
   fstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   realpathSync,
-  renameSync,
   statSync,
   unlink,
   unlinkSync,
@@ -166,6 +168,21 @@ function getCodexAuthDirs(): {
  * 故意不 import @openclaude/commercial — 保持 gateway 包对商业化模块零编译期依赖,
  * cli launcher 负责 dynamic import + 注入。
  */
+/**
+ * V3 multi-tenant uploads 路由结果。
+ *
+ * 故意结构化(kind discriminator + logCtx),不抛错。gateway 自己决定 HTTP 状态码 +
+ * 客户端可见 message。这里的字段命名与 commercial/userUploads.ts 的 `UserUploadsLocation`
+ * 完全一致 —— 类型在 gateway 端本地重复声明只是为了避免 gateway 反向 import commercial。
+ */
+export type UserUploadsLocationLike =
+  | { kind: 'ok'; uid: number; dir: string }
+  | {
+      kind: 'fail'
+      reason: 'invalid-uid' | 'not-ready' | 'remote-host' | 'volume-missing' | 'ambiguous' | 'daemon-error'
+      logCtx: Record<string, unknown>
+    }
+
 export interface CommercialHook {
   handle: (req: IncomingMessage, res: ServerResponse) => boolean | Promise<boolean>
   handleWsUpgrade: (req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => boolean
@@ -177,6 +194,24 @@ export interface CommercialHook {
    * /api/agents、/api/sessions/* 等 personal-version 端点。
    */
   jwtSecret?: Uint8Array
+  /**
+   * V3 multi-tenant `/api/uploads` 写入 + `/api/media` 读取的路径解析器。
+   * 把 `c:<uid>` 的 userId 映射到该用户 docker volume 的宿主路径
+   * (`/var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads/`)。
+   *
+   * 注入时表明商用模块在多租户模式 —— gateway 必须按用户路由,不再使用全局
+   * `paths.uploadsDir`(那个目录在多租户下不存在用户文件,会触发
+   * dispatchInbound 端"媒体不存在或不可读")。
+   */
+  resolveUserUploadsDir?: (userId: string) => Promise<UserUploadsLocationLike>
+  /**
+   * 纯文本谓词:判定 `resolvedPath` 是否落在
+   * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/uploads[/<file>]` 形式下。
+   * 给 isFileAllowed 用作 dynamic 扩展(由 Gateway._extraAllowedPredicate 桥接)。
+   *
+   * 调用方必须先 realpathSync,这里不防 TOCTOU。
+   */
+  isUserVolumeUploadsPath?: (resolvedPath: string) => boolean
 }
 
 export interface GatewayDeps {
@@ -492,26 +527,68 @@ export class Gateway {
     // client and the cleanup unlink raced past us). One-shot at startup —
     // intentionally no periodic sweep; abort/error paths in handleUpload
     // already unlink eagerly. Codex Plan B v2 review confirmed.
+    //
+    // V3 multi-tenant extension (2026-05-12): handleUpload writes land in
+    // per-user docker volume host paths, not the global paths.uploadsDir.
+    // We sweep both:
+    //   1. paths.uploadsDir (personal-version / legacy 'default' uploads)
+    //   2. /var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads/* (commercial)
+    // Each block is wrapped in its own try/catch so a docker host without
+    // `/var/lib/docker/volumes` (e.g. dev box) doesn't fail the legacy sweep.
+    const cutoff = Date.now() - 60 * 60 * 1000 // 1h
+    const sweepTmpInDir = (dir: string): number => {
+      let cleaned = 0
+      try {
+        const baseReal = realpathSync(dir)
+        for (const fname of readdirSync(baseReal)) {
+          if (!fname.startsWith('.tmp-')) continue
+          try {
+            const st = statSync(join(baseReal, fname))
+            if (st.mtimeMs < cutoff) {
+              unlinkSync(join(baseReal, fname))
+              cleaned++
+            }
+          } catch {}
+        }
+      } catch {
+        // Directory missing or unreadable — caller decides whether to log.
+        return -1
+      }
+      return cleaned
+    }
     try {
       mkdirSync(paths.uploadsDir, { recursive: true })
-      const baseReal = realpathSync(paths.uploadsDir)
-      const cutoff = Date.now() - 60 * 60 * 1000 // 1h
-      let cleaned = 0
-      for (const fname of readdirSync(baseReal)) {
-        if (!fname.startsWith('.tmp-')) continue
-        try {
-          const st = statSync(join(baseReal, fname))
-          if (st.mtimeMs < cutoff) {
-            unlinkSync(join(baseReal, fname))
-            cleaned++
-          }
-        } catch {}
-      }
-      if (cleaned > 0) this.log.info('upload .tmp orphan cleanup', { cleaned })
+      const cleaned = sweepTmpInDir(paths.uploadsDir)
+      if (cleaned > 0) this.log.info('upload .tmp orphan cleanup', { cleaned, dir: 'legacy' })
     } catch (err) {
-      // Non-fatal — uploads will fail later if dir is truly broken, surfacing
-      // a clear error per request.
-      this.log.warn('upload .tmp orphan cleanup failed', undefined, err)
+      this.log.warn('upload .tmp orphan cleanup (legacy) failed', undefined, err)
+    }
+    if (this.deps.commercial?.isUserVolumeUploadsPath) {
+      // Multi-tenant mode — iterate /var/lib/docker/volumes/oc-v3-data-u*.
+      // No DB lookup needed; we accept stale uid dirs (e.g. volume deleted)
+      // because readdirSync skips them naturally.
+      try {
+        const volsRoot = '/var/lib/docker/volumes'
+        let totalCleaned = 0
+        let dirsSwept = 0
+        for (const entry of readdirSync(volsRoot)) {
+          if (!/^oc-v3-data-u[1-9][0-9]{0,18}$/.test(entry)) continue
+          const userUploads = join(volsRoot, entry, '_data', 'uploads')
+          const r = sweepTmpInDir(userUploads)
+          if (r >= 0) {
+            dirsSwept++
+            totalCleaned += r
+          }
+        }
+        if (totalCleaned > 0 || dirsSwept > 0) {
+          this.log.info('upload .tmp orphan cleanup', { cleaned: totalCleaned, dirsSwept, dir: 'per-user' })
+        }
+      } catch (err) {
+        // /var/lib/docker/volumes typically requires root (gateway runs as
+        // root in v3 commercial); ENOENT just means docker isn't installed
+        // (CI / dev). Log warn but don't fail startup.
+        this.log.warn('upload .tmp orphan cleanup (per-user) failed', undefined, err)
+      }
     }
 
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
@@ -1813,93 +1890,17 @@ export class Gateway {
 
     // ── Media file serving ──
     // Serve user-uploaded and MCP-generated media files for inline rendering.
+    // Async because v3 commercial uploads dir resolution touches PG + docker.
+    // Use the same dispatch pattern as /api/uploads to keep handleHttp sync.
     const mediaMatch = url.pathname.match(/^\/api\/media\/(.+)$/)
     if (mediaMatch) {
-      let filename: string
-      try {
-        filename = decodeURIComponent(mediaMatch[1])
-      } catch {
-        res.writeHead(400)
-        res.end('bad request')
-        return
-      }
-      // Reject path traversal attempts (../ or absolute paths)
-      if (filename.includes('..') || filename.startsWith('/') || filename.startsWith('\\')) {
-        res.writeHead(400)
-        res.end('bad request')
-        return
-      }
-      // Search in uploads first, then generated. Resolve via realpath so a
-      // symlink inside uploads/ cannot escape the directory. baseReal also
-      // goes through realpathSync — without that, uploadsDir being a symlink
-      // (rare but possible in some deployments) would fail the startsWith
-      // check after the candidate's realpath resolves to the symlink target.
-      const dirs = [paths.uploadsDir, paths.generatedDir]
-      let realPath: string | null = null
-      for (const dir of dirs) {
-        let baseReal: string
-        try {
-          baseReal = realpathSync(dir)
-        } catch {
-          // Directory may not exist yet (e.g. fresh install with no uploads).
-          continue
+      this.handleMediaGet(req, res, mediaMatch[1]).catch((err) => {
+        if (!res.headersSent) {
+          this.sendError(res, 500, String(err))
+        } else {
+          try { res.end() } catch { /* socket gone */ }
         }
-        const candidate = resolve(baseReal, filename)
-        if (!candidate.startsWith(baseReal + '/') && candidate !== baseReal) continue
-        try {
-          const r = realpathSync(candidate)
-          if (r.startsWith(baseReal + '/')) {
-            realPath = r
-            break
-          }
-        } catch {}
-      }
-      if (!realPath) {
-        res.writeHead(404)
-        res.end('not found')
-        return
-      }
-      const agentCwds = this.deps.agentsConfig.agents
-        .map((a) => a.cwd)
-        .filter((c): c is string => !!c)
-      // After realpath resolution, the path is already inside uploads/ or
-      // generated/; both are static FILE_ALLOWED_DIRS entries, so
-      // isFileAllowed returns true unconditionally. But do the blocklist
-      // check — someone could drop a .env into uploads/.
-      if (isFileBlocked(realPath)) {
-        res.writeHead(403)
-        res.end('access denied')
-        return
-      }
-      const fd = this.openFileHardened(res, realPath, agentCwds)
-      if (fd === null) return
-      let mediaStat: ReturnType<typeof fstatSync>
-      try {
-        mediaStat = fstatSync(fd)
-      } catch {
-        closeSync(fd)
-        res.writeHead(404)
-        res.end('not found')
-        return
-      }
-      if (!mediaStat.isFile()) {
-        closeSync(fd)
-        res.writeHead(404)
-        res.end('not found')
-        return
-      }
-      const mediaContentType = mimeFor(realPath)
-      // C3: Force download for active content types to prevent same-origin script execution
-      const mediaHeaders: Record<string, string | number> = {
-        'Content-Type': mediaContentType,
-        'Content-Length': mediaStat.size,
-        'Cache-Control': 'private, max-age=3600',
-      }
-      if (isActiveContentType(mediaContentType)) {
-        mediaHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(realPath) || 'file')}"`
-      }
-      res.writeHead(200, mediaHeaders)
-      createReadStream(null as unknown as string, { fd, autoClose: true }).pipe(res)
+      })
       return
     }
 
@@ -1935,7 +1936,11 @@ export class Gateway {
       const agentCwds = this.deps.agentsConfig.agents
         .map((a) => a.cwd)
         .filter((c): c is string => !!c)
-      if (!isFileAllowed(realPath, agentCwds)) {
+      // V3 multi-tenant: also allow per-user docker volume upload paths
+      // so the UI can render attachments referenced by absolute path
+      // (e.g. agent tool outputs that name an upload path).
+      const extraAllowed = this.deps.commercial?.isUserVolumeUploadsPath
+      if (!isFileAllowed(realPath, agentCwds, extraAllowed)) {
         this.log.warn('api/file denied (not in allowlist)', { path: realPath })
         res.writeHead(403)
         res.end('access denied')
@@ -2175,7 +2180,12 @@ export class Gateway {
       res.end('not found')
       return null
     }
-    if (fdReal !== realPath || !isFileAllowed(fdReal, agentCwds) || isFileBlocked(fdReal)) {
+    // Re-check via fd realpath: same v3 commercial multi-tenant carveout as
+    // the upstream isFileAllowed call. Without `extraAllowed`, an absolute
+    // path inside a user's docker volume uploads dir would pass the upstream
+    // check but fail here (TOCTOU defense), 403ing legitimate accesses.
+    const extraAllowed = this.deps.commercial?.isUserVolumeUploadsPath
+    if (fdReal !== realPath || !isFileAllowed(fdReal, agentCwds, extraAllowed) || isFileBlocked(fdReal)) {
       closeSync(fd)
       res.writeHead(403)
       res.end('access denied')
@@ -2195,6 +2205,104 @@ export class Gateway {
     const cm = this.verifyCommercialJwt(t)
     if (cm) return `c:${cm.sub}`
     return 'default'
+  }
+
+  /**
+   * Resolve the uploads directory for a given authenticated user.
+   *
+   * Returns `{ kind: 'legacy' }` for personal-version flows (no commercial
+   * hook, or commercial hook with no resolver — e.g. agentRuntime didn't
+   * come up). Caller falls back to `paths.uploadsDir`.
+   *
+   * Otherwise delegates to `commercial.resolveUserUploadsDir` which returns
+   * the structured `{ kind: 'ok', dir }` / `{ kind: 'fail', reason }`. Gateway
+   * never silently falls back from a `fail` to legacy path — that would
+   * re-introduce the same single-tenant split-brain that this whole change
+   * exists to fix.
+   *
+   * Status mapping (caller-side):
+   *   not-ready    → 503 + Retry-After (provisioning window)
+   *   remote-host  → 503 (deferred remote-volume push, see TODO)
+   *   volume-missing/ambiguous/daemon-error → 500 (data corruption / docker err)
+   *   invalid-uid  → 401 (token has bad sub form; shouldn't happen post-getUserId)
+   */
+  private async _resolveUploadsDir(
+    userId: string,
+  ): Promise<
+    | { kind: 'legacy'; dir: string }
+    | { kind: 'ok'; uid: number; dir: string }
+    | {
+        kind: 'fail'
+        reason: 'invalid-uid' | 'not-ready' | 'remote-host' | 'volume-missing' | 'ambiguous' | 'daemon-error'
+        logCtx: Record<string, unknown>
+      }
+  > {
+    // No commercial hook OR resolver not injected (agentRuntime not ready) →
+    // legacy single-tenant write path. `default` always falls here regardless
+    // of commercial hook presence (personal-version single-token auth).
+    const resolver = this.deps.commercial?.resolveUserUploadsDir
+    if (!resolver || userId === 'default') {
+      return { kind: 'legacy', dir: paths.uploadsDir }
+    }
+    // Commercial JWT user → delegate. Any `c:` userId not parseable by the
+    // resolver lands as `kind: 'fail', reason: 'invalid-uid'`.
+    const loc = await resolver(userId)
+    return loc
+  }
+
+  /**
+   * Translate a `_resolveUploadsDir` failure into an HTTP response and log.
+   * Returns true if the caller should stop (response already sent), false if
+   * it can keep going (currently never returns false — branches always send).
+   *
+   * Centralized so handleUpload and /api/media keep the same status mapping.
+   */
+  private _sendUploadsResolveError(
+    res: ServerResponse,
+    fail: {
+      reason: 'invalid-uid' | 'not-ready' | 'remote-host' | 'volume-missing' | 'ambiguous' | 'daemon-error'
+      logCtx: Record<string, unknown>
+    },
+    context: 'upload' | 'media',
+  ): void {
+    switch (fail.reason) {
+      case 'invalid-uid':
+        // Reached only when a commercial JWT user has a bad sub; getUserId
+        // already rejects unverifiable tokens. Treat as auth failure.
+        this.log.warn(`${context}: invalid-uid`, fail.logCtx)
+        this.sendError(res, 401, 'invalid auth')
+        return
+      case 'not-ready':
+        // User has no active container yet (provisioning window). Frontend
+        // re-tries on a backoff — surface 503 + Retry-After so UI/proxy
+        // honors it.
+        this.log.info(`${context}: container not ready`, fail.logCtx)
+        res.setHeader('Retry-After', '5')
+        this.sendError(res, 503, 'container not ready, please retry shortly')
+        return
+      case 'remote-host':
+        // User is currently placed on a remote compute host. Plan B doesn't
+        // yet push uploads to remote-host volumes; deferred. Surface 503
+        // rather than guess.
+        this.log.warn(`${context}: remote-host placement (deferred)`, fail.logCtx)
+        this.sendError(res, 503, 'uploads on remote-host placement not supported yet')
+        return
+      case 'volume-missing':
+        // DB says active but docker volume gone. Data corruption / GC race.
+        this.log.error(`${context}: docker volume missing despite active state`, fail.logCtx)
+        this.sendError(res, 500, 'storage layout inconsistent — admin investigating')
+        return
+      case 'ambiguous':
+        // Multiple active rows for one user. Data corruption.
+        this.log.error(`${context}: ambiguous active containers`, fail.logCtx)
+        this.sendError(res, 500, 'storage layout inconsistent — admin investigating')
+        return
+      case 'daemon-error':
+        // PG query error or docker daemon error (non-404).
+        this.log.error(`${context}: resolver daemon error`, fail.logCtx)
+        this.sendError(res, 500, 'storage layer unavailable')
+        return
+    }
   }
 
   /**
@@ -2339,6 +2447,115 @@ export class Gateway {
   }
 
   /**
+   * GET /api/media/<filename> — fetch a previously uploaded or generated file.
+   *
+   * V3 multi-tenant: uploads lookup is scoped to the **caller's** per-user
+   * docker volume host path; generated/ stays global (master-side rendering
+   * output). Personal/legacy mode falls back to paths.uploadsDir.
+   *
+   * Note: also closes a pre-existing IDOR — previously any authed user could
+   * fetch any digest known to them via /api/media/<digest>.<ext>. Per-user
+   * dir routing now restricts cross-user access.
+   */
+  private async handleMediaGet(
+    req: IncomingMessage,
+    res: ServerResponse,
+    rawFilename: string,
+  ): Promise<void> {
+    let filename: string
+    try {
+      filename = decodeURIComponent(rawFilename)
+    } catch {
+      res.writeHead(400)
+      res.end('bad request')
+      return
+    }
+    // Reject path traversal attempts (../ or absolute paths)
+    if (filename.includes('..') || filename.startsWith('/') || filename.startsWith('\\')) {
+      res.writeHead(400)
+      res.end('bad request')
+      return
+    }
+    const userIdForMedia = this.getUserId(req)
+    const mediaLocation = await this._resolveUploadsDir(userIdForMedia)
+    if (mediaLocation.kind === 'fail') {
+      this._sendUploadsResolveError(res, mediaLocation, 'media')
+      return
+    }
+    // Search in uploads first, then generated. Resolve via realpath so a
+    // symlink inside uploads/ cannot escape the directory. baseReal also
+    // goes through realpathSync — without that, uploadsDir being a symlink
+    // (rare but possible in some deployments) would fail the startsWith
+    // check after the candidate's realpath resolves to the symlink target.
+    const dirs = [mediaLocation.dir, paths.generatedDir]
+    let realPath: string | null = null
+    for (const dir of dirs) {
+      let baseReal: string
+      try {
+        baseReal = realpathSync(dir)
+      } catch {
+        // Directory may not exist yet (e.g. fresh install with no uploads).
+        continue
+      }
+      const candidate = resolve(baseReal, filename)
+      if (!candidate.startsWith(baseReal + '/') && candidate !== baseReal) continue
+      try {
+        const r = realpathSync(candidate)
+        if (r.startsWith(baseReal + '/')) {
+          realPath = r
+          break
+        }
+      } catch {}
+    }
+    if (!realPath) {
+      res.writeHead(404)
+      res.end('not found')
+      return
+    }
+    const agentCwds = this.deps.agentsConfig.agents
+      .map((a) => a.cwd)
+      .filter((c): c is string => !!c)
+    // After realpath resolution, the path is already inside uploads/ or
+    // generated/; both are static FILE_ALLOWED_DIRS entries, so
+    // isFileAllowed returns true unconditionally. But do the blocklist
+    // check — someone could drop a .env into uploads/.
+    if (isFileBlocked(realPath)) {
+      res.writeHead(403)
+      res.end('access denied')
+      return
+    }
+    const fd = this.openFileHardened(res, realPath, agentCwds)
+    if (fd === null) return
+    let mediaStat: ReturnType<typeof fstatSync>
+    try {
+      mediaStat = fstatSync(fd)
+    } catch {
+      closeSync(fd)
+      res.writeHead(404)
+      res.end('not found')
+      return
+    }
+    if (!mediaStat.isFile()) {
+      closeSync(fd)
+      res.writeHead(404)
+      res.end('not found')
+      return
+    }
+    const mediaContentType = mimeFor(realPath)
+    // C3: Force download for active content types to prevent same-origin script execution
+    const mediaHeaders: Record<string, string | number> = {
+      'Content-Type': mediaContentType,
+      'Content-Length': mediaStat.size,
+      'Cache-Control': 'private, max-age=3600',
+    }
+    if (isActiveContentType(mediaContentType)) {
+      mediaHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(realPath) || 'file')}"`
+    }
+    res.writeHead(200, mediaHeaders)
+    createReadStream(null as unknown as string, { fd, autoClose: true }).pipe(res)
+  }
+
+  /**
    * POST /api/uploads — streaming single-file upload (Plan B 2026-05-09).
    *
    * Body is the raw file bytes. Required headers:
@@ -2385,14 +2602,29 @@ export class Gateway {
       }
     }
 
-    // ── 3. Resolve uploadsDir realpath after ensuring it exists ──
+    // ── 3a. Resolve per-user uploads directory ──
+    // V3 multi-tenant: writes land in the user's docker volume host path so
+    // the container side dispatchInbound (running inside oc-v3-u<uid>) reads
+    // the same physical file via its `/home/agent/.openclaude/uploads/` mount.
+    // Personal / legacy `default` users fall to paths.uploadsDir unchanged.
+    const userId = this.getUserId(req)
+    const locationResult = await this._resolveUploadsDir(userId)
+    if (locationResult.kind === 'fail') {
+      this._sendUploadsResolveError(res, locationResult, 'upload')
+      req.destroy()
+      return
+    }
+    const uploadsDir = locationResult.dir
+    const isPerUser = locationResult.kind === 'ok'
+
+    // ── 3b. Resolve uploadsDir realpath after ensuring it exists ──
     // Don't depend on startup sequence; create-then-realpath here.
     let baseReal: string
     try {
-      mkdirSync(paths.uploadsDir, { recursive: true })
-      baseReal = realpathSync(paths.uploadsDir)
+      mkdirSync(uploadsDir, { recursive: true })
+      baseReal = realpathSync(uploadsDir)
     } catch (err) {
-      this.log.error('handleUpload: uploadsDir setup failed', undefined, err)
+      this.log.error('handleUpload: uploadsDir setup failed', { uploadsDir }, err)
       this.sendError(res, 500, 'storage unavailable')
       req.destroy()
       return
@@ -2495,27 +2727,60 @@ export class Gateway {
       return
     }
 
-    // ── 5. Compute final name + atomic rename ──
+    // ── 5. Compute final name + per-user prep + atomic publish ──
     const digest = hash.digest('hex')
     const ext = uploadExtForMime(ctype)
     const finalName = `${digest}.${ext}`
     const finalPath = join(baseReal, finalName)
 
-    if (existsSync(finalPath)) {
-      // Dedup: same content already on disk. Drop the tmp.
-      try { unlinkSync(tmpPath) } catch {}
-    } else {
+    // 5a. Per-user mode: chmod 0644 + chown to agent uid (1000:1000) BEFORE
+    // publishing. tmp inode 此时只有一个 dirent,任何失败都只影响我们自己的 tmp,
+    // 不会污染并发其他请求已 publish 的 finalPath。
+    //
+    // Files written by master (running as root in v3 commercial) into a
+    // docker volume host path land as root:root. The container's agent
+    // process is uid=1000 / gid=1000 (Dockerfile USER agent). Without
+    // chown the container can still read (0644 is world-readable), but
+    // ownership matches files written by the agent itself, avoiding
+    // confusing future cleanup heuristics. chmod 0644 explicitly covers
+    // the case where master's umask differs from default.
+    //
+    // Personal-mode (legacy) writes still go to /root/.openclaude/uploads,
+    // same uid as the master process — chown would be no-op; skip.
+    if (isPerUser) {
       try {
-        renameSync(tmpPath, finalPath)
+        chmodSync(tmpPath, 0o644)
+        chownSync(tmpPath, 1000, 1000)
       } catch (err) {
-        this.log.error('handleUpload: rename failed', undefined, err)
-        // best-effort cleanup; if rename failed mid-way the tmp may or may
-        // not still exist. unlink ignores ENOENT.
+        this.log.error('handleUpload: pre-publish chown/chmod failed', {
+          tmpPath,
+          userId,
+        }, err)
         try { unlinkSync(tmpPath) } catch {}
-        this.sendError(res, 500, 'rename failed')
+        this.sendError(res, 500, 'storage prep failed')
         return
       }
     }
+
+    // 5b. Atomic publish via no-overwrite hardlink. linkSync 是原子的,EEXIST
+    // 立即给我们一个 race-free 的 dedup 信号。对比之前 existsSync + renameSync
+    // 模式:rename 会静默覆盖,并发同 digest 上传 + chown 失败时的 unlink finalPath
+    // 会清掉别人刚 publish 的成功文件。
+    try {
+      linkSync(tmpPath, finalPath)
+    } catch (err) {
+      const code = (err as { code?: string })?.code
+      if (code !== 'EEXIST') {
+        this.log.error('handleUpload: link failed', undefined, err)
+        try { unlinkSync(tmpPath) } catch {}
+        this.sendError(res, 500, 'storage write failed')
+        return
+      }
+      // dedup hit: 既有 finalPath 是先前同 digest 上传 publish 出来的,owner 已
+      // 是 agent uid(per-user 模式)或 master uid(personal 模式)。语义正确。
+    }
+    // 不论是新 link 还是 dedup,tmpPath 都不再需要。drop it.
+    try { unlinkSync(tmpPath) } catch {}
 
     this.sendJson(res, 200, {
       url: `/api/media/${finalName}`,
@@ -5947,8 +6212,19 @@ const MEDIA_EXTENSIONS = new Set([
  * Returns true if the resolved absolute path falls within the allowlist.
  * Checked BEFORE the blocklist — if this returns false, the file is denied
  * regardless of blocklist status.
+ *
+ * `extraAllowedPredicate` is the multi-tenant escape hatch — in v3 commercial,
+ * gateway passes `commercial.isUserVolumeUploadsPath` so per-user docker
+ * volume host paths (`/var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads/`)
+ * are allowed without polluting the static FILE_ALLOWED_DIRS list (those user
+ * dirs are not known at module load time and would otherwise let arbitrary
+ * /var/lib/docker traversal through).
  */
-export function isFileAllowed(resolvedPath: string, agentCwds?: string[]): boolean {
+export function isFileAllowed(
+  resolvedPath: string,
+  agentCwds?: string[],
+  extraAllowedPredicate?: (p: string) => boolean,
+): boolean {
   // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
   for (const dir of FILE_ALLOWED_DIRS) {
     if (resolvedPath.startsWith(dir + '/') || resolvedPath === dir) return true
@@ -5971,6 +6247,10 @@ export function isFileAllowed(resolvedPath: string, agentCwds?: string[]): boole
       }
     }
   }
+  // 4. Extra allowed predicate (e.g. commercial.isUserVolumeUploadsPath for
+  //    v3 multi-tenant docker volume paths). Called LAST so failure here
+  //    doesn't shortcut earlier static-allowlist matches.
+  if (extraAllowedPredicate && extraAllowedPredicate(resolvedPath)) return true
   return false
 }
 
