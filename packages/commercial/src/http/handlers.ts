@@ -7,12 +7,16 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
+import { resolve as resolvePath } from "node:path";
 import {
   HttpError,
   readJsonBody,
   sendJson,
   clientIpOf,
   userAgentOf,
+  ensureRequestId,
+  setSecurityHeaders,
+  REQUEST_ID_HEADER,
 } from "./util.js";
 import {
   setRefreshCookie,
@@ -26,6 +30,19 @@ import { requireAuth } from "./auth.js";
 import { query } from "../db/queries.js";
 import { insertFeedback } from "../admin/feedback.js";
 import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
+import { requireUserVerifyDb } from "./requireUser.js";
+import {
+  buildSignedUrl,
+  verifySignedUrl,
+  normalizeSignBatchInput,
+  DEFAULT_SIGN_TTL_MS,
+} from "./mediaSign.js";
+import { containerFileProxy } from "./containerFileProxy.js";
+import { defaultTunnelFetchHealthz } from "./tunnelHealthzProbe.js";
+import { getHostById as computePoolGetHostById } from "../compute-pool/queries.js";
+import { dialTunnelSocket as defaultTunnelDial } from "../compute-pool/nodeAgentClient.js";
+import type { UserMediaLocation } from "../agent-sandbox/userMedia.js";
+import { makeUserScopedMediaPredicate } from "@openclaude/gateway";
 import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLimitRedis } from "../middleware/rateLimit.js";
 import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
@@ -177,6 +194,29 @@ export interface CommercialHttpDeps {
    * 透传给 adminPatchAccount 的 AdminAuditCtx.triggerCodexDisableFanout。
    */
   triggerCodexDisableFanout?: (accountId: bigint) => void;
+  /**
+   * v3 signed-URL media key —— HKDF-SHA256 派生自 bridgeSecret(见 mediaSign.ts)。
+   *
+   * 注入条件:`bridgeSecret` 加载成功 + `fileProxyEnabled=true`。任一缺失 →
+   * 未注入,signed URL endpoints (`/api/media-sign`, `/api/media-signed`)
+   * 返 503 SIGN_DISABLED。**没有 cookie fallback**:前端拿到 null 后保持占位
+   * (透明 1x1 PNG / 空 src),不会偷偷退回 `<img src="/api/file?path=...">` ——
+   * 那条 path 正是 iOS Safari 丢 cookie 的破图根因。
+   *
+   * key rotation:重启进程即重新派生(bridgeSecret 不变则 key 不变)。要强制
+   * rotate 改 `mediaSign.ts` 的 HKDF_INFO,旧 URL 全部失效。
+   */
+  mediaSignKey?: Buffer;
+  /**
+   * v3 multi-tenant `c:<uid>` → user docker volume {uploads, generated} 解析。
+   *
+   * 与 `RegisterCommercialResult.resolveUserMediaDirs` 同一函数,这里仅在
+   * `/api/media-sign` / `/api/media-signed` 内部用作 user-scoped path predicate
+   * 的输入(等价 gateway server.ts 的 `_resolveMediaDirs` 调用)。
+   *
+   * 未注入 → signed URL endpoints 返 503 SIGN_DISABLED。
+   */
+  resolveUserMediaDirs?: (userId: string) => Promise<UserMediaLocation>;
 }
 
 export interface RequestContext {
@@ -1438,6 +1478,285 @@ export async function handleReadAllInbox(
   const { readAll } = await import("../inbox/inbox.js");
   const r = await readAll(user.id);
   sendJson(res, 200, { ok: true, inserted: r.inserted });
+}
+
+// ─── /api/media-sign + /api/media-signed (v3 signed URL) ───────────────────
+//
+// 背景:iOS Safari + Cloudflare CDN + SameSite=Strict 场景下,`<img src>` 原生
+// 不带 Authorization 头,只能靠 HttpOnly `oc_session` cookie。但 CF edge
+// cross-hop 经常 drop 这个 cookie,导致 codex 生成的图片在手机端显示破图。
+//
+// 业界标准:S3/GCS 风格的 signed URL —— URL 自带 HMAC 签名 + 过期戳 + 用户标识,
+// 无需 cookie/Bearer 即可访问。
+//
+// 路径分工:
+//   - `POST /api/media-sign`(Bearer JWT 鉴权) → 输入路径数组,输出 path→signedUrl map
+//   - `GET  /api/media-signed?p=&u=&e=&s=` → 验签 + DB active + user-scoped predicate
+//     → req.url 改成 /api/file?path= + 调 containerFileProxy
+//
+// 维护期:两个路由都已加入 router.ts `prefixes` 数组,maintenance 闸门正常生效。
+
+const MEDIA_SIGN_LOG_USER_RE = /^[1-9]\d{0,18}$/;
+
+/**
+ * 从 raw request URL 抽指定 query param 的**未解码**字面值。
+ *
+ * 用途:`/api/media-signed` 的 `p=...` 是 percent-encoded 路径,
+ * `verifySignedUrl` 内部会 `decodeURIComponent` 一次。如果再走 URLSearchParams.get,
+ * 等于双解码,会破坏对含字面 `%` 的路径(`100%.png` → 解码错误抛 URIError)
+ * 与含字面 `%2F` 的路径(`a%2Fb.png` → `/` 被解出来)的签名 canonicalization。
+ *
+ * 实现按 `&` 分割原 query string,逐 token 前缀匹配 `<name>=`,返回剩余字符串(不 decode)。
+ * 缺失 / 重复 / 空值 → null。
+ */
+export function extractRawQueryParam(requestUrl: string, name: string): string | null {
+  const qi = requestUrl.indexOf("?");
+  if (qi < 0) return null;
+  // 把 fragment 剥掉(server 通常拿不到 fragment,但稳妥起见)
+  const hi = requestUrl.indexOf("#", qi);
+  const rawQuery = hi < 0 ? requestUrl.slice(qi + 1) : requestUrl.slice(qi + 1, hi);
+  if (rawQuery.length === 0) return null;
+  const prefix = `${name}=`;
+  let found: string | null = null;
+  for (const kv of rawQuery.split("&")) {
+    if (kv.startsWith(prefix)) {
+      if (found !== null) return null; // duplicated `name=` → 拒绝(防签名走私)
+      found = kv.slice(prefix.length);
+    } else if (kv === name) {
+      // bare `name`(无 `=`)也算重复 — 仍占用一次出现
+      if (found !== null) return null;
+      found = "";
+    }
+  }
+  // 空值统一返 null(missing-param 与 empty 在 verifySignedUrl 那一层等价,
+  // 但 raw extract 层面把 "" 收敛成 null 让 contract 干净 —— `extractRawQueryParam`
+  // 返回的非 null 都意味"实际拿到了字符)。
+  return found === "" ? null : found;
+}
+
+/**
+ * POST /api/media-sign
+ *
+ * 鉴权:Bearer JWT(同 /api/me)+ requireUserVerifyDb(DB role='user' ∧ status='active')。
+ * 入参 body: `{ paths: string[] }`(最多 32 条,见 normalizeSignBatchInput)。
+ * 出参: `{ urls: Record<path, signedUrl>, expMs: number }`。
+ *
+ * 谓词不通过的 path **从 response map 里 drop**,不抛 403 —— 前端按 cache miss
+ * 处理。这避免单条非法 path 让整个 batch 失败(媒体 URL 渲染应尽可能优雅)。
+ */
+export async function handleMediaSign(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  if (!deps.mediaSignKey || !deps.resolveUserMediaDirs) {
+    throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
+  }
+  if (!deps.v3Supervisor) {
+    // requireUserVerifyDb 需要 pool;v3Supervisor 未装配 = 整 v3 还没起,503 更准确
+    throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
+  }
+
+  const authHeader = req.headers.authorization ?? "";
+  const m = authHeader.match(/^Bearer\s+(.+)$/);
+  if (!m) {
+    throw new HttpError(401, "UNAUTHORIZED", "bearer token required");
+  }
+  const token = m[1]!.trim();
+  if (!token) {
+    throw new HttpError(401, "UNAUTHORIZED", "bearer token required");
+  }
+  const claims = verifyCommercialJwtSync(token, deps.jwtSecret);
+  if (!claims) {
+    throw new HttpError(401, "UNAUTHORIZED", "invalid or expired token");
+  }
+  if (claims.role !== "user") {
+    // admin 不该用 signed URL(自有 oc_session 走 BLOCKED admin bypass);
+    // 拒绝避免给后台越权制造 signed URL 的途径。
+    throw new HttpError(403, "FORBIDDEN", "signed URL only for user role");
+  }
+
+  // DB double-check user is still active (JWT 没过期但用户已被 ban 时 sign 也拒)
+  const verified = await requireUserVerifyDb(claims.sub, deps.v3Supervisor.pool);
+  if (!verified) {
+    throw new HttpError(403, "FORBIDDEN", "user account not active");
+  }
+
+  const body = (await readJsonBody(req)) as { paths?: unknown } | undefined;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "body must be a JSON object");
+  }
+  const norm = normalizeSignBatchInput(body.paths);
+  if (!norm.ok) {
+    throw new HttpError(400, "VALIDATION", norm.message);
+  }
+
+  // 解析当前用户的 uploads / generated dir
+  const userId = `c:${claims.sub}`;
+  const loc = await deps.resolveUserMediaDirs(userId);
+  if (loc.kind !== "ok") {
+    // not-ready / volume-missing / ambiguous / remote-host / daemon-error
+    // 前端拿到空 urls map 即按 cache miss / fallback 处理,不暴露内部状态。
+    sendJson(res, 200, { urls: {}, expMs: Date.now() });
+    return;
+  }
+  const allowed = makeUserScopedMediaPredicate(loc.uploads, loc.generated);
+
+  const expMs = Date.now() + DEFAULT_SIGN_TTL_MS;
+  const urls: Record<string, string> = {};
+  for (const p of norm.paths) {
+    // realpath 不可用(handler 不该 stat 用户路径,谓词只做文本前缀)。直接 resolve
+    // 后用 predicate 做 user-scoped 闸门 —— 与 server.ts handleApiFile / handleMediaGet
+    // 一致(predicate 在 isFileAllowed 内是 textual scope,不替代 realpath open)。
+    let resolved: string;
+    try {
+      resolved = resolvePath(p);
+    } catch {
+      continue;
+    }
+    if (!allowed(resolved)) continue;
+    // sign 用 raw path(handler 端 decoded 后做 HMAC,verify 端 decodeURIComponent
+    // 后再算 HMAC,canonicalization 一致)
+    const { url } = buildSignedUrl(deps.mediaSignKey, p, userId, DEFAULT_SIGN_TTL_MS);
+    urls[p] = url;
+  }
+  sendJson(res, 200, { urls, expMs });
+}
+
+/**
+ * GET /api/media-signed?p=&u=&e=&s=
+ *
+ * 公开端点(无需 cookie / Bearer),由 HMAC 签名 + 过期戳自证身份。
+ * 验签通过 → 当作 `/api/file?path=<decodedPath>` 走 containerFileProxy。
+ *
+ * 不查 DB?——查。即使 JWT 没过期,用户可能被 ban → 不能因 signed URL 还在 TTL
+ * 内就漏放。`requireUserVerifyDb(sub, pool)` 检验 role=user ∧ status=active。
+ *
+ * Cache-Control:仅当上游容器返 200/206 + 签名未过期 → public, max-age=剩余 TTL。
+ * 4xx/5xx 维持 no-store(避免 CDN 缓存错误响应导致 token rotate 后无法刷新)。
+ */
+export async function handleMediaSigned(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  if (!deps.mediaSignKey || !deps.resolveUserMediaDirs) {
+    throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
+  }
+  if (!deps.v3Supervisor || !deps.bridgeSecret) {
+    // file proxy 整体未装配 → signed URL 没意义,503 更准确
+    throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
+  }
+
+  // **Canonicalization 关键**:`p` 必须从 raw query string 抽,**不能**走 URLSearchParams.get,
+  // 否则会被 once-decoded —— verifySignedUrl 还会再 decodeURIComponent 一次 → 双解码,
+  // 对于含有字面 `%` / `%2F` 的合法文件名(`100%.png`、`a%2Fb.png`)签名/验签会错位 / 抛错。
+  //
+  // u/e/s 是 ASCII 安全字段(`c:<digits>`、十进制毫秒戳、hex sig),once-decoded 后形态
+  // 不变,继续用 URLSearchParams 取无副作用。
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const u = url.searchParams.get("u");
+  const e = url.searchParams.get("e");
+  const s = url.searchParams.get("s");
+  const pRaw = extractRawQueryParam(req.url ?? "", "p");
+
+  const result = verifySignedUrl(deps.mediaSignKey, { pRaw, u, e, s });
+  switch (result.kind) {
+    case "bad-request":
+      throw new HttpError(400, "BAD_REQUEST", `signed URL: ${result.reason}`);
+    case "forbidden":
+      throw new HttpError(403, "FORBIDDEN", "signed URL signature invalid");
+    case "gone":
+      throw new HttpError(410, "GONE", "signed URL expired");
+    case "ok":
+      break;
+  }
+  const { userId, expMs, decodedPath } = result;
+
+  // userId 形 `c:<digits>`(USER_ID_RE 已守护)→ sub 是 digits
+  const sub = userId.slice(2);
+  if (!MEDIA_SIGN_LOG_USER_RE.test(sub)) {
+    throw new HttpError(400, "BAD_REQUEST", "signed URL: bad-user-id");
+  }
+
+  // DB double-check user still active(签 URL 时是 active,签后被 ban → 现在拒)
+  const verified = await requireUserVerifyDb(sub, deps.v3Supervisor.pool);
+  if (!verified) {
+    throw new HttpError(403, "FORBIDDEN", "user account not active");
+  }
+
+  // user-scoped predicate:即便签名有效,路径也必须仍在此用户的 volume 里。
+  // resolve(decodedPath) → 比较 uploads/generated 前缀。失败一律 403(不暴露 volume
+  // 是否存在的差异)。
+  const loc = await deps.resolveUserMediaDirs(userId);
+  if (loc.kind !== "ok") {
+    throw new HttpError(403, "FORBIDDEN", "signed URL path not authorized");
+  }
+  const allowed = makeUserScopedMediaPredicate(loc.uploads, loc.generated);
+  let resolved: string;
+  try {
+    resolved = resolvePath(decodedPath);
+  } catch {
+    throw new HttpError(400, "BAD_REQUEST", "signed URL: bad-path");
+  }
+  if (!allowed(resolved)) {
+    throw new HttpError(403, "FORBIDDEN", "signed URL path not authorized");
+  }
+
+  // 调 containerFileProxy:它内部从 req.url 解析 path → 我们必须把 req.url 改成
+  // `/api/file?path=<encoded decoded path>`,proxy 看到的 pathname 必须是 /api/file
+  // (它按 pathname === '/api/file' 走 isFilePath 分支)。try/finally 恢复原值
+  // (虽然请求结束后 req 不再用,但符合 hygiene)。
+  const log = (_ctx).log;
+  const requestId = _ctx.requestId;
+  const ctxForProxy: RequestContext = {
+    requestId,
+    clientIp: _ctx.clientIp,
+    authBoundIp: _ctx.authBoundIp,
+    userAgent: _ctx.userAgent,
+    log,
+  };
+  const originalUrl = req.url;
+  const newPath = `/api/file?path=${encodeURIComponent(decodedPath)}`;
+  req.url = newPath;
+  try {
+    const selfHostIdForProxy = deps.v3Supervisor.selfHostId;
+    // Cache-Control 覆盖:仅 200/206 → public, max-age = min(剩余 TTL, 240s)。
+    // 240 上限避免 expMs 离现在仍很远时 CDN 大段缓存(虽然签名 TTL 由 sign 端
+    // 控制 5min,这里再 clamp 一遍是 defense-in-depth)。
+    const cacheControlOverride = (upstreamStatus: number): string | null => {
+      if (upstreamStatus !== 200 && upstreamStatus !== 206) return null;
+      const remainSec = Math.max(0, Math.floor((expMs - Date.now()) / 1000));
+      const ageSec = Math.min(240, remainSec);
+      if (ageSec <= 0) return null;
+      return `public, max-age=${ageSec}`;
+    };
+    await containerFileProxy(
+      req,
+      res,
+      ctxForProxy,
+      {
+        v3: deps.v3Supervisor,
+        bridgeSecret: deps.bridgeSecret,
+        selfHostId: selfHostIdForProxy,
+        getHostById: computePoolGetHostById,
+        tunnelDial: defaultTunnelDial,
+        capabilityProbe: {
+          selfHostId: selfHostIdForProxy,
+          tunnelFetchHealthz: (hostId, cid, timeoutMs) =>
+            defaultTunnelFetchHealthz(hostId, cid, timeoutMs, {
+              getHostById: computePoolGetHostById,
+            }),
+        },
+        responseCacheControlOverride: cacheControlOverride,
+      },
+      BigInt(sub),
+    );
+  } finally {
+    req.url = originalUrl;
+  }
 }
 
 // helper for tests / 其他 module

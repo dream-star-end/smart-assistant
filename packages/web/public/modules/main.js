@@ -4,6 +4,7 @@
 
 // ── DOM utilities ──
 import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=cad22388'
+import { invalidateSignCache, signMediaPath } from './mediaSign.js?v=cad22388'
 
 // ── Pure utilities ──
 import {
@@ -111,8 +112,8 @@ import {
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
 import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=cad22388'
-import { startInbox, stopInbox } from './inbox.js?v=cad22388'
 import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=cad22388'
+import { startInbox, stopInbox } from './inbox.js?v=cad22388'
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js?v=cad22388'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
@@ -731,6 +732,157 @@ document.addEventListener('keydown', (e) => {
 
 // ── Messages: scroll-tracking listener ──
 initMessagesListeners()
+
+// ── Media signed URL 替换 + 过期重签 ──
+// 后端 v3 /api/media-signed 走 S3 风格 HMAC URL,绕过 iOS Safari + CF CDN 丢
+// cookie 的破图问题(详见 packages/commercial/src/http/mediaSign.ts)。
+//
+// 渲染期:markdown.js `_renderLocalMedia` 给本地媒体节点打 `data-pending-sign-path`
+// + `data-sign-target`,初始 src 是占位(透明 PNG / 空字符串)。这里负责把它们
+// 异步换成真签名 URL。
+//
+// 状态机(在 dataset 上):
+//   - 无 / `data-sign-state` 缺失 → 待解析
+//   - `inflight`                  → 正在签名,跳过
+//   - `resolved`                  → 已替换 src(可能后续过期触发 error retry)
+//   - `failed`                    → 一次签名失败,放弃(等下次 scroll/error 触发)
+//
+// 设计权衡:
+//   1. 不删 `data-pending-sign-path` —— 保留作为 "this path's identity" 给 error
+//      retry 用(`<img onerror>` 时拿回原 path 重签)。
+//   2. 状态标记 `data-sign-state` 单字段管理,避免多 flag 互相打架。
+//   3. MutationObserver 只关心 addedNodes —— 我们对 resolved 节点改 src 不会
+//      触发"removed/added",所以不会自递归。
+//   4. signMediaPath 永远 resolve(不 reject),失败 → null,转 failed 状态,
+//      让 UI 保持占位而非 churning。
+function _resolveSignTarget(el) {
+  if (!el || el.nodeType !== 1) return
+  const state = el.dataset.signState
+  if (state === 'inflight' || state === 'resolved') return
+  const absPath = el.dataset.pendingSignPath
+  const target = el.dataset.signTarget === 'href' ? 'href' : 'src'
+  if (!absPath) return
+  el.dataset.signState = 'inflight'
+  signMediaPath(absPath).then((url) => {
+    if (!url) {
+      el.dataset.signState = 'failed'
+      return
+    }
+    try {
+      el[target] = url
+      // <img> 同 wrap 内的 copy/download/open 按钮要用真 URL —— 同步更新它们的
+      // data-img-src,否则用户点 "下载" 还在下占位 PNG。
+      const wrap = el.closest?.('.media-wrap')
+      if (wrap) {
+        wrap.querySelectorAll('[data-img-src]').forEach((btn) => {
+          btn.dataset.imgSrc = url
+        })
+      }
+      el.dataset.signState = 'resolved'
+    } catch {
+      el.dataset.signState = 'failed'
+    }
+  })
+}
+
+function _scanAndResolveSigns(root) {
+  if (!root || !root.querySelectorAll) return
+  const list = root.querySelectorAll('[data-pending-sign-path]')
+  for (const el of list) _resolveSignTarget(el)
+}
+
+function _installMediaSignResolver() {
+  const root = $('messages')
+  if (!root) return
+  // boot-time backfill:已经渲染好的历史消息(从 IDB / sessions)需要立刻签
+  _scanAndResolveSigns(root)
+  const obs = new MutationObserver((muts) => {
+    for (const m of muts) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType !== 1) continue
+        if (node.matches?.('[data-pending-sign-path]')) {
+          _resolveSignTarget(node)
+        }
+        if (node.querySelectorAll) {
+          const list = node.querySelectorAll('[data-pending-sign-path]')
+          for (const el of list) _resolveSignTarget(el)
+        }
+      }
+    }
+  })
+  obs.observe(root, { childList: true, subtree: true })
+}
+
+// `<img onerror>` 路径:签名 URL 形如 `/api/media-signed?...&e=<expMs>...`,过期(e ≤ now)
+// 或 410 时浏览器触发 error。失效缓存 + 重签 + 替换 src。
+//
+// 区别于 _installMediaErrorRetry(line 1835 那个老的 cookie-retry 路径):
+//   - 老的:监听 `/api/file` / `/api/media`(不含 `-signed`)失败 → _ensureSessionCookie + cache-bust
+//   - 这里:监听 `/api/media-signed?...` 失败 → invalidateSignCache + signMediaPath 重签
+// 两者作用 URL pattern 不重叠,可并存。命名也用不同前缀以避免 noRedeclare。
+//
+// 防无限重试:同一节点 5s 内不重试(`data-sign-retry-at` ms 戳)。
+function _installSignedMediaErrorRetry() {
+  const root = $('messages')
+  if (!root) return
+  // error 事件不冒泡,必须 capture 拦截
+  root.addEventListener(
+    'error',
+    (e) => {
+      const t = e.target
+      if (!t || t.nodeType !== 1) return
+      const tag = t.tagName
+      if (tag !== 'IMG' && tag !== 'AUDIO' && tag !== 'VIDEO' && tag !== 'A') return
+      const absPath = t.dataset?.pendingSignPath
+      if (!absPath) return
+      // 只重试签名 URL(/api/media-signed?...);其他错误(网络断、CORS 等)放过。
+      //
+      // 关键:`<img>.currentSrc/src` 是 **absolute** URL(浏览器序列化),形如
+      // `https://claudeai.chat/api/media-signed?...`。**不能**用 `^\/api\/media-signed\?`
+      // 这种相对路径前缀来匹配 —— 实测会全部 miss → 重试永不触发。改成 `new URL()`
+      // 解析,比对 pathname + origin(同源校验防止外站 URL 偶然触发我们重签)。
+      const target = t.dataset.signTarget === 'href' ? 'href' : 'src'
+      const cur = target === 'href' ? t.getAttribute('href') || '' : t.currentSrc || t.src || ''
+      if (!cur) return
+      let parsed
+      try {
+        parsed = new URL(cur, location.href)
+      } catch {
+        return
+      }
+      if (parsed.origin !== location.origin) return
+      if (parsed.pathname !== '/api/media-signed') return
+      const now = Date.now()
+      const lastRetry = Number(t.dataset.signRetryAt || '0')
+      if (lastRetry && now - lastRetry < 5000) return
+      t.dataset.signRetryAt = String(now)
+      invalidateSignCache(absPath)
+      t.dataset.signState = 'inflight'
+      signMediaPath(absPath).then((url) => {
+        if (!url) {
+          t.dataset.signState = 'failed'
+          return
+        }
+        try {
+          t[target] = url
+          const wrap = t.closest?.('.media-wrap')
+          if (wrap) {
+            wrap.querySelectorAll('[data-img-src]').forEach((btn) => {
+              btn.dataset.imgSrc = url
+            })
+          }
+          t.dataset.signState = 'resolved'
+        } catch {
+          t.dataset.signState = 'failed'
+        }
+      })
+    },
+    true,
+  )
+}
+
+_installMediaSignResolver()
+_installSignedMediaErrorRetry()
 
 // ── Tasks: tab switching + add-task wiring ──
 initTasksListeners()
@@ -2118,7 +2270,8 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
   loadChangelog()
   refreshBalance()
     .then((r) => {
-      if (r?.shown) startInbox(); else stopInbox()
+      if (r?.shown) startInbox()
+      else stopInbox()
       // 2026-04-30 v1.0.54 — welcome modal 必须在 refreshBalance 后调用:
       // userId / userCreatedAt 由 refreshBalance 写入 state,放 .then 里能保证
       // gating 字段已就位,不会因 race 漏弹/误弹。
@@ -2720,7 +2873,8 @@ async function init() {
     loadChangelog()
     refreshBalance()
       .then((r) => {
-        if (r?.shown) startInbox(); else stopInbox()
+        if (r?.shown) startInbox()
+        else stopInbox()
         // 冷启动也走一遍欢迎判定。已弹过的 localStorage 标志会拦下重复弹窗。
         maybeShowWelcomeModal()
       })

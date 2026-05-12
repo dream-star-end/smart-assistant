@@ -27,6 +27,7 @@ import { loadConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
+import { deriveMediaSignKey } from "./http/mediaSign.js";
 import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
@@ -1042,6 +1043,29 @@ export async function registerCommercial(
     bridgeSecret = undefined;
   }
 
+  // v3 signed-URL media key —— HKDF(bridgeSecret, info="oc-media-sign-v1") 派生
+  // 32-byte 子 key,与 bridgeSecret 同生命周期。bridgeSecret 缺失时 mediaSignKey 也
+  // undefined,signed URL endpoints 自动 503 SIGN_DISABLED。
+  //
+  // **没有 cookie fallback**:前端拿到 503/null 后媒体保持占位(透明 1x1 / 空 src),
+  // 不会偷偷退回 `<img src="/api/file?path=...">` —— 那条路径正是 iOS Safari 丢
+  // cookie 的根因,绕回去等于把 bug 重新放出来。bridgeSecret 缺失通常意味整个
+  // file proxy 都没装配(单租户 personal 版),本来也用不到 commercial 媒体渲染。
+  let mediaSignKey: Buffer | undefined;
+  if (bridgeSecret) {
+    try {
+      mediaSignKey = deriveMediaSignKey(bridgeSecret);
+      // eslint-disable-next-line no-console
+      console.log("[commercial] v3 media signing key derived");
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[commercial] media sign key derivation failed; signed URL DISABLED", {
+        error: (err as Error)?.message ?? String(err),
+      });
+      mediaSignKey = undefined;
+    }
+  }
+
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
@@ -1341,6 +1365,19 @@ export async function registerCommercial(
       )
     : undefined;
 
+  // V3 multi-tenant media resolver(`c:<uid>` → user volume {uploads, generated})
+  // 一处创建,供两处复用:
+  //   1. 暴露给 gateway(`RegisterCommercialResult.resolveUserMediaDirs`,装配 _resolveMediaDirs)
+  //   2. 注入 handleMediaSign/handleMediaSigned(签 URL / 验签后做 user-scoped predicate)
+  // 装配条件同旧:agentRuntime 起得来(docker client 在手)。其他 fail-closed 分支
+  // 由 resolver 自己返 kind='fail' + reason。
+  const userMediaResolver = agentRuntime
+    ? createUserMediaResolver({
+        pool: getPool(),
+        docker: agentRuntime.docker,
+      })
+    : undefined;
+
   const handler = createCommercialHandler({
     jwtSecret,
     mailer,
@@ -1371,6 +1408,12 @@ export async function registerCommercial(
     // feature flag 控制 router 是否把 /api/file / /api/media/* 从 BLOCKED 拉进 PROXY 分支
     bridgeSecret,
     fileProxyEnabled: cfg.FILE_PROXY_ENABLED,
+    // v3 signed media URL —— HKDF 派生的 32-byte key + user-scoped predicate
+    // 所需的 resolver。任一缺失 → /api/media-sign 与 /api/media-signed 返 503,
+    // 前端拿到 null 即保持占位(透明 PNG / 空 src);**不退回 cookie 路径**,
+    // 那条 path 正是 iOS Safari 丢 cookie 的根因。详见上面 mediaSignKey 注释。
+    mediaSignKey,
+    resolveUserMediaDirs: userMediaResolver,
     // v1.0.120 feat/codex-disable-rebind:透传给 admin/accounts handler 的
     // adminPatchAccount ctx,active→disabled 转移触发 fanout actor。
     triggerCodexDisableFanout,
@@ -1928,12 +1971,9 @@ export async function registerCommercial(
     // V3 multi-tenant media resolver — 只有 agentRuntime 起得来(docker client 在手)
     // 才注入;否则 gateway 自动回退 paths.{uploads,generated}Dir(单租户兼容)。
     // 详见 RegisterCommercialResult 注释。
-    resolveUserMediaDirs: agentRuntime
-      ? createUserMediaResolver({
-          pool: getPool(),
-          docker: agentRuntime.docker,
-        })
-      : undefined,
+    // **同 closure 也注入了 createCommercialHandler.resolveUserMediaDirs**,
+    // 让 /api/media-sign / /api/media-signed handler 拿到同一 resolver。
+    resolveUserMediaDirs: userMediaResolver,
     // textual 谓词,无依赖,始终暴露 —— 仅供 orphan sweep 启动时按目录壳子
     // 迭代 user volumes 用。**不要**给 HTTP allowlist 用(cross-tenant IDOR)。
     isUserVolumeMediaPath,

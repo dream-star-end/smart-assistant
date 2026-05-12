@@ -153,6 +153,26 @@ export interface ContainerFileProxyDeps {
   capabilityProbe?: CapabilityProbeDeps;
   /** 测试钩子:注入 http.request(避开真 TCP)。签名与 node:http.request 兼容。 */
   httpRequestImpl?: typeof httpRequest;
+  /**
+   * 可选:覆盖 success 响应的 `Cache-Control` 头。
+   *
+   * 用于 `/api/media-signed`(自带 HMAC 过期戳的签名 URL)允许 CDN 在过期前
+   * 短暂 public cache,绕开 iOS Safari + CF SameSite=Strict cookie drop 问题。
+   *
+   * 入参:**上游容器返回的 HTTP statusCode**(2xx / 3xx / 4xx / 5xx)。
+   * 返回:
+   *   - 字符串 → 用它作为 `Cache-Control` 值(典型 `public, max-age=...`)
+   *   - `null` / `undefined` → 沿用默认 `no-store`(失败/错误统一保守)
+   *
+   * 调用方约定(handler 层强制):
+   *   - **只在 statusCode === 200 || 206 时返回 public cache**;其余状态返 null,
+   *     避免 CDN 缓存 4xx/5xx 错误响应导致 token 过期/路径变更后无法刷新。
+   *   - 一并被 proxy 自身错误路径(429 / 502 / 504 / 500 等 sendJsonError)忽略 ——
+   *     这些路径根本不调 buildClientResponseHead,默认就是 `no-store`。
+   *
+   * 不注入(personal version / 普通 /api/file 路径)→ 维持 `no-store`(原行为)。
+   */
+  responseCacheControlOverride?: (upstreamStatus: number) => string | null;
 }
 
 /**
@@ -348,6 +368,8 @@ function buildClientResponseHead(
   upstreamHeaders: Record<string, string | string[] | undefined>,
   reqUrl: URL,
   isFilePath: boolean,
+  upstreamStatus: number,
+  cacheControlOverride?: (upstreamStatus: number) => string | null,
 ): { out: Record<string, string | number | string[]>; mode: "inline" | "attachment" } | { error: "bad_path" } {
   let rawName: string;
   try {
@@ -372,9 +394,20 @@ function buildClientResponseHead(
       ? "inline"
       : "attachment";
 
+  // Cache-Control:默认 no-store。仅当 caller 注入 override **且** 上游返回成功
+  // (200/206 由 handler 端 enforce)→ 用 override 返回值(典型 `public, max-age=...`)。
+  // override 返回 null → 维持 no-store(handler 已对 4xx/5xx 返 null)。
+  let cacheControl = "no-store";
+  if (cacheControlOverride) {
+    const overridden = cacheControlOverride(upstreamStatus);
+    if (typeof overridden === "string" && overridden.length > 0) {
+      cacheControl = overridden;
+    }
+  }
+
   const out: Record<string, string | number | string[]> = {
     "Content-Type": type,
-    "Cache-Control": "no-store",
+    "Cache-Control": cacheControl,
     Vary: "Authorization, Cookie",
     "Content-Disposition": `${mode}; ${rfc5987(fname)}`,
   };
@@ -440,7 +473,13 @@ function dispatchViaLocalHttp(
   upstream.on("response", (r) => {
     r.socket.setTimeout(IDLE_MS);
 
-    const built = buildClientResponseHead(r.headers, reqUrl, isFilePath);
+    const built = buildClientResponseHead(
+      r.headers,
+      reqUrl,
+      isFilePath,
+      r.statusCode ?? 502,
+      deps.responseCacheControlOverride,
+    );
     if ("error" in built) {
       if (!res.headersSent) {
         sendJsonError(res, 400, "BAD_PATH", "invalid percent-encoding", ctx.requestId);
@@ -581,7 +620,13 @@ async function dispatchViaTunnel(
     try { socket.destroy(); } catch {}
   });
 
-  const built = buildClientResponseHead(head.headers, reqUrl, isFilePath);
+  const built = buildClientResponseHead(
+    head.headers,
+    reqUrl,
+    isFilePath,
+    head.statusCode || 502,
+    deps.responseCacheControlOverride,
+  );
   if ("error" in built) {
     if (!res.headersSent) {
       sendJsonError(res, 400, "BAD_PATH", "invalid percent-encoding", ctx.requestId);

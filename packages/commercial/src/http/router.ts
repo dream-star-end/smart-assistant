@@ -43,6 +43,8 @@ import {
   handleGetMyUsage,
   handleCreateSession,
   handleClearSession,
+  handleMediaSign,
+  handleMediaSigned,
   handleSubmitFeedback,
   handleListMyInbox,
   handleCountMyInboxUnread,
@@ -452,6 +454,12 @@ export function createCommercialHandler(
     // 让 `<a href>` / `<img>` 等原生下载链接能携带身份(见 handlers.ts 详注)
     { method: 'POST', path: '/api/auth/session', handler: handleCreateSession },
     { method: 'POST', path: '/api/auth/session/logout', handler: handleClearSession },
+    // v3 signed media URL —— iOS Safari + CF SameSite=Strict cookie drop 修复
+    //   /api/media-sign  (POST, Bearer)  → 把绝对路径数组换成 signed URL map
+    //   /api/media-signed (GET, anon)    → HMAC + DB active 校验后转发到容器
+    // 详见 handlers.ts handleMediaSign / handleMediaSigned 注释。
+    { method: 'POST', path: '/api/media-sign', handler: handleMediaSign },
+    { method: 'GET', path: '/api/media-signed', handler: handleMediaSigned },
     { method: 'GET', path: '/api/me', handler: handleMe },
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
     { method: 'GET', path: '/api/me/preferences', handler: handleGetMyPreferences },
@@ -744,6 +752,10 @@ export function createCommercialHandler(
     // P1-2 (2026-04-25):commercial 接管 /api/feedback POST,阻止 fall through
     // 到 gateway/server.ts:1325 的文件落盘 handler
     '/api/feedback',
+    // v3 signed media URL —— 同样商业化管,维护期闸门必须覆盖到,否则维护期
+    // 用户仍能通过签好的 URL drain 容器文件
+    '/api/media-sign',
+    '/api/media-signed',
   ]
 
   return async function commercialHandler(req, res): Promise<boolean> {

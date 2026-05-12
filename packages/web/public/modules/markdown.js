@@ -1,5 +1,6 @@
 // OpenClaude — Markdown rendering, media embedding, rich blocks
 import { htmlSafeEscape } from './dom.js?v=cad22388'
+import { TRANSPARENT_PIXEL_DATA_URL, getCachedSignedUrl } from './mediaSign.js?v=cad22388'
 import { effectiveTheme } from './theme.js?v=cad22388'
 import { _basename } from './util.js?v=cad22388'
 
@@ -34,7 +35,10 @@ async function ensureMermaid() {
       const s = document.createElement('script')
       s.src = '/vendor/mermaid.min.js'
       s.onload = _doInit
-      s.onerror = (err) => { _mermaidLoadPromise = null; reject(err) }
+      s.onerror = (err) => {
+        _mermaidLoadPromise = null
+        reject(err)
+      }
       document.head.appendChild(s)
     }
   })
@@ -247,7 +251,14 @@ function _safeAttr(url) {
   return htmlSafeEscape(rawSafe)
 }
 
-export function _imgHtml(url, title) {
+// `pendingPath`(可选):本地绝对路径,用于 signed URL 异步替换。
+//   - 传入 → 渲染 `data-pending-sign-path` + `data-sign-target="src"`,由
+//     main.js MutationObserver + mediaSign.js 负责把 src/data-img-src 改成签名 URL。
+//   - 不传 → 行为不变,直接用 url 当 src(用于 HTTP URL / 已签名 URL / 占位图)。
+//
+// **设计动机**:`<img src="/api/file?...">` 在 iOS Safari CDN 多跳场景偶发丢
+// HttpOnly cookie。S3 风格 HMAC signed URL 在 URL 里自带身份,绕过 cookie。
+export function _imgHtml(url, title, pendingPath) {
   const rawSafeUrl = _safeMediaUrl(url)
   if (!rawSafeUrl) return `<span>[blocked image: unsafe URL]</span>`
   // 2026-04-21 安全审计 Medium#F3:_safeMediaUrl 只做协议白名单,但拿到的字符串
@@ -263,29 +274,50 @@ export function _imgHtml(url, title) {
   const svgOpen =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>'
   const t = title ? ` title="${htmlSafeEscape(title)}"` : ''
-  return `<div class="media-wrap"><img class="inline-img" src="${safeUrl}" loading="lazy"${t}><div class="img-actions"><button data-img-action="copy" data-img-src="${safeUrl}" title="复制图片">${svgCopy}</button><button data-img-action="download" data-img-src="${safeUrl}" title="下载">${svgDl}</button><button data-img-action="open" data-img-src="${safeUrl}" title="新标签页打开">${svgOpen}</button></div></div>`
+  const pendAttr =
+    typeof pendingPath === 'string' && pendingPath
+      ? ` data-pending-sign-path="${htmlSafeEscape(pendingPath)}" data-sign-target="src"`
+      : ''
+  return `<div class="media-wrap"><img class="inline-img" src="${safeUrl}" loading="lazy"${t}${pendAttr}><div class="img-actions"><button data-img-action="copy" data-img-src="${safeUrl}" title="复制图片">${svgCopy}</button><button data-img-action="download" data-img-src="${safeUrl}" title="下载">${svgDl}</button><button data-img-action="open" data-img-src="${safeUrl}" title="新标签页打开">${svgOpen}</button></div></div>`
 }
 
 export function _renderLocalMedia(filePath) {
-  // I9: 统一走 _safeAttr。localPathToUrl 出来的虽然 encodeURIComponent 过,理论无危险
-  // 字符,但 defense-in-depth —— 所有 src=/href= 都经过同一个 helper,未来万一 localPathToUrl
-  // 逻辑被改也不会意外漏防线。
-  const url = _safeAttr(localPathToUrl(filePath))
+  // 本地路径 → signed URL 流程:
+  //   - 缓存命中 → 直接拿签名 URL 当 src(无闪烁,SSR-style)
+  //   - 缓存未命中 → 占位 src(透明 1x1 PNG for <img>, 空 src for audio/video/anchor)
+  //     + `data-pending-sign-path` + `data-sign-target` 属性,
+  //     main.js MutationObserver 用 mediaSign.signMediaPath() 异步替换。
+  //
+  // **没有 cookie fallback**:老的 `<img src="/api/file?path=...">` cookie-auth 路径
+  // 正是 iOS Safari + CF CDN 偶发丢 `oc_session` 的破图根因 —— 签不到就保持占位,
+  // 不退回那条 path,否则等于把 bug 重新放出来。`localPathToUrl` 已经从 _renderLocalMedia
+  // 的渲染路径里彻底移除。
   const name = _basename(filePath) || 'file'
   const safeName = htmlSafeEscape(name)
+  const safePending = htmlSafeEscape(filePath)
+  const cached = getCachedSignedUrl(filePath)
+
   if (_IMG_EXTS.test(filePath)) {
-    return _imgHtml(localPathToUrl(filePath), name)
+    // _imgHtml 内部已能处理"cached 命中走 url、未命中走占位 + pendingPath"两路 —
+    // 命中 → url = signed URL, pendingPath = filePath(也带上,过期后 onerror 还能 retry)
+    // 未命中 → url = 1x1 PNG,pendingPath = filePath
+    const initialUrl = cached || TRANSPARENT_PIXEL_DATA_URL
+    return _imgHtml(initialUrl, name, filePath)
   }
   if (_AUD_EXTS.test(filePath)) {
-    return `<div class="media-wrap"><audio controls preload="none" src="${url}"></audio><div class="media-filename">${safeName}</div></div>`
+    const srcAttr = cached ? ` src="${htmlSafeEscape(cached)}"` : ''
+    return `<div class="media-wrap"><audio controls preload="none"${srcAttr} data-pending-sign-path="${safePending}" data-sign-target="src"></audio><div class="media-filename">${safeName}</div></div>`
   }
   if (_VID_EXTS.test(filePath)) {
-    return `<div class="media-wrap"><video class="inline-video" controls preload="metadata" src="${url}"></video><div class="media-filename">${safeName}</div></div>`
+    const srcAttr = cached ? ` src="${htmlSafeEscape(cached)}"` : ''
+    return `<div class="media-wrap"><video class="inline-video" controls preload="metadata"${srcAttr} data-pending-sign-path="${safePending}" data-sign-target="src"></video><div class="media-filename">${safeName}</div></div>`
   }
   if (_PDF_EXTS.test(filePath)) {
-    return `<a class="doc-card" href="${url}" target="_blank" rel="noopener"><span class="doc-card-icon">📄</span><span class="doc-card-name">${safeName}</span></a>`
+    const hrefAttr = cached ? ` href="${htmlSafeEscape(cached)}"` : ''
+    return `<a class="doc-card"${hrefAttr} target="_blank" rel="noopener" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📄</span><span class="doc-card-name">${safeName}</span></a>`
   }
-  return `<a class="doc-card" href="${url}" target="_blank" rel="noopener" download="${safeName}"><span class="doc-card-icon">📎</span><span class="doc-card-name">${safeName}</span></a>`
+  const hrefAttr = cached ? ` href="${htmlSafeEscape(cached)}"` : ''
+  return `<a class="doc-card"${hrefAttr} target="_blank" rel="noopener" download="${safeName}" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📎</span><span class="doc-card-name">${safeName}</span></a>`
 }
 
 export function embedMediaUrls(html) {
@@ -346,18 +378,15 @@ export function embedMediaUrls(html) {
   // <code> 包裹的路径同样由 step 1 的 <code> 分支只处理媒体,这里再加 <code> 版本
   // 的 fallback 保持两条分支一致。
   const _PUB_PREFIX = '(?:/home/agent|/root)/\\.openclaude/[^\\s<"\'`>]+?\\.[A-Za-z0-9]{1,10}'
-  html = html.replace(
-    new RegExp(`<code>(${_PUB_PREFIX})</code>`, 'g'),
-    (match, rawPath) => {
-      const filePath = rawPath
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&#39;/g, "'")
-        .replace(/&quot;/g, '"')
-      return _renderLocalMedia(filePath)
-    },
-  )
+  html = html.replace(new RegExp(`<code>(${_PUB_PREFIX})</code>`, 'g'), (match, rawPath) => {
+    const filePath = rawPath
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+    return _renderLocalMedia(filePath)
+  })
   html = html.replace(
     new RegExp(`((?:^|[\\s>])(${_PUB_PREFIX}))`, 'g'),
     (match, full, filePath, offset) => {
@@ -378,6 +407,23 @@ export function embedMediaUrls(html) {
     if (/(?:src|href|poster)\s*=\s*["']?\s*$/i.test(before)) return match
     if (before.endsWith('>') && /src=/.test(html.substring(Math.max(0, offset - 80), offset)))
       return match
+
+    // `/api/file?path=<absPath>` 是历史 cookie-auth 链接,iOS Safari + CF CDN 会丢
+    // cookie → 改走 signed URL 流程。从 query 拿出 path,交给 _renderLocalMedia
+    // (内部按扩展名 + cache 命中分发,统一加 data-pending-sign-path)。
+    // `/api/media-signed?...` / `/api/media-sign` / 其他 /api/media* 不在此分支:
+    // 它们要么已签名,要么不是用户可见 URL,保持原样。
+    const fileApiMatch = url.match(/^\/api\/file\?path=([^&]+)/)
+    if (fileApiMatch) {
+      try {
+        const absPath = decodeURIComponent(fileApiMatch[1])
+        if (absPath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(absPath)) {
+          return _renderLocalMedia(absPath)
+        }
+      } catch {
+        // fall through
+      }
+    }
 
     let decodedForExt = url
     try {
@@ -415,7 +461,19 @@ export function embedMediaUrls(html) {
   html = html.replace(
     /<img\s+([^>]*)src=["']([^"']+)["']([^>]*)>/gi,
     (match, before, src, after) => {
-      // Skip if already a proper URL (http/https/data/blob) or already /api/
+      // `/api/file?path=<absPath>` → cookie-auth 链接,iOS 会丢 → 抽出 path 转 signed URL
+      const fileApi = src.match(/^\/api\/file\?path=([^&]+)/i)
+      if (fileApi) {
+        try {
+          const absPath = decodeURIComponent(fileApi[1])
+          if (absPath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(absPath)) {
+            return _renderLocalMedia(absPath)
+          }
+        } catch {
+          // fall through
+        }
+      }
+      // 已签名 / http(s) / data / blob → 原样
       if (/^(?:https?:|data:|blob:|\/api\/)/i.test(src)) return match
       // Extract the path — handle relative paths, file?path=..., and absolute paths
       let absPath = src
@@ -443,6 +501,17 @@ export function embedMediaUrls(html) {
   html = html.replace(
     /<a\s+[^>]*href=["']([^"']+\.(?:mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|pdf))["'][^>]*>.*?<\/a>/gi,
     (match, src) => {
+      const fileApi = src.match(/^\/api\/file\?path=([^&]+)/i)
+      if (fileApi) {
+        try {
+          const absPath = decodeURIComponent(fileApi[1])
+          if (absPath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(absPath)) {
+            return _renderLocalMedia(absPath)
+          }
+        } catch {
+          // fall through
+        }
+      }
       if (/^(?:https?:|data:|blob:|\/api\/)/i.test(src)) return match
       let absPath = src
       if (src.includes('/') && !src.startsWith('/')) {
@@ -658,14 +727,7 @@ export function renderMarkdown(text) {
     const sanitized = DOMPurify.sanitize(html, {
       // NOTE: iframe/srcdoc/sandbox NOT allowed here — htmlpreview iframes are created
       // separately in processRichBlocks() with fixed sandbox="allow-scripts"
-      ADD_ATTR: [
-        'loading',
-        'controls',
-        'preload',
-        'autoplay',
-        'data-img-action',
-        'data-img-src',
-      ],
+      ADD_ATTR: ['loading', 'controls', 'preload', 'autoplay', 'data-img-action', 'data-img-src'],
     })
     // Sync-fill math placeholders before embedMediaUrls so we don't pay the
     // cost of rescanning KaTeX-emitted markup for media-looking tokens.
@@ -715,7 +777,8 @@ function _getStreamingRenderer() {
   // Images: render as text placeholder during streaming to avoid broken 404 requests
   // (embedMediaUrls rewrites local paths, but is only called on final render)
   _streamingRenderer.image = (hrefOrObj, title, text) => {
-    const alt = typeof hrefOrObj === 'object' ? (hrefOrObj.text || hrefOrObj.title || '') : (title || text || '')
+    const alt =
+      typeof hrefOrObj === 'object' ? hrefOrObj.text || hrefOrObj.title || '' : title || text || ''
     return `<span class="streaming-img-placeholder">[图片: ${htmlSafeEscape(alt || '...')}]</span>`
   }
   return _streamingRenderer
@@ -753,7 +816,9 @@ export function clearChartInstances() {
 
 export async function processRichBlocks() {
   if (pendingMermaid.length > 0) {
-    try { await ensureMermaid() } catch {}
+    try {
+      await ensureMermaid()
+    } catch {}
   }
   while (pendingMermaid.length > 0) {
     const { id, code } = pendingMermaid.shift()
