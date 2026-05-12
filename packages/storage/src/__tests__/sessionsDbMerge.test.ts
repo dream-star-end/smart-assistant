@@ -717,4 +717,89 @@ describe('appendServerAuthoredPure', () => {
       ['srv-1', 'u1', 'u2'],
     )
   })
+
+  // ── v7 takeover overlay (2026-05-12) ──
+  // Same-id collision with a client-placeholder row (no `_source: 'server'`)
+  // must REPLACE the placeholder at its position with the server-authored
+  // version. Pre-v7 this branch returned `already_exists` (which still applies
+  // for true server-authored idempotent replays).
+
+  it('TAKEOVER: replaces client-placeholder row at same id with server-authored version', () => {
+    // Client streaming placeholder PUT'd to client_sessions before turn-end
+    // takeover lands. Same canonical srv-* id, but no _source flag and
+    // partial text.
+    const placeholder: Msg = {
+      id: 'srv-peer1-t1',
+      role: 'assistant',
+      text: 'streaming…',
+      ts: 200,
+    }
+    const existing: Msg[] = [cli('u1', 100), placeholder]
+    const takeover: Msg = {
+      id: 'srv-peer1-t1',
+      role: 'assistant',
+      text: 'final canonical text',
+      ts: 200,
+    }
+    const result = appendServerAuthoredPure(existing, takeover)
+    assert.equal(result.applied, true, 'applied (not already_exists)')
+    if (!result.applied) return
+    assert.equal(result.messages.length, 2, 'no duplicate row')
+    const replaced = result.messages.find((m) => m.id === 'srv-peer1-t1')!
+    assert.equal(replaced._source, 'server', 'stamped with server _source')
+    assert.equal(replaced.text, 'final canonical text', 'text replaced by takeover')
+  })
+
+  it('TAKEOVER: preserves placeholder ts when takeover ts is missing', () => {
+    // Server-authored message lacks ts (e.g. defaulted). Stamping logic
+    // should fall back to existing placeholder ts so the canonical row
+    // stays in its original chronological position.
+    const placeholder: Msg = {
+      id: 'srv-peer1-t2',
+      role: 'assistant',
+      text: 'placeholder',
+      ts: 333,
+    }
+    const existing: Msg[] = [cli('u1', 100), placeholder, cli('u2', 500)]
+    const takeover = { id: 'srv-peer1-t2', role: 'assistant', text: 'final' } as Msg
+    const result = appendServerAuthoredPure(existing, takeover, /* now */ 999_999)
+    assert.equal(result.applied, true)
+    if (!result.applied) return
+    const replaced = result.messages.find((m) => m.id === 'srv-peer1-t2')!
+    assert.equal(replaced.ts, 333, 'inherited placeholder ts (not now)')
+    // Order maintained: u1 (100), srv-... (333), u2 (500)
+    assert.deepEqual(result.messages.map((m) => m.id), ['u1', 'srv-peer1-t2', 'u2'])
+  })
+
+  it('TAKEOVER: still idempotent against true server-authored same-id row', () => {
+    // Distinguishing case: existing row IS server-authored. Treat as
+    // already_exists (no clobber of canonical authoritative content).
+    const existing: Msg[] = [cli('u1', 100), srv('srv-peer1-t1', 200, 'canonical')]
+    const replay: Msg = {
+      id: 'srv-peer1-t1',
+      role: 'assistant',
+      text: 'duplicate write attempt',
+      ts: 999,
+    }
+    const result = appendServerAuthoredPure(existing, replay)
+    assert.equal(result.applied, false, 'still rejects true server-authored duplicate')
+    if (result.applied) return
+    assert.equal(result.reason, 'already_exists')
+  })
+
+  it('TAKEOVER: does not mutate existing array on overlay path', () => {
+    const placeholder: Msg = {
+      id: 'srv-peer1-t1',
+      role: 'assistant',
+      text: 'streaming',
+      ts: 200,
+    }
+    const existing: Msg[] = [cli('u1', 100), placeholder]
+    const snap = JSON.stringify(existing)
+    appendServerAuthoredPure(existing, {
+      id: 'srv-peer1-t1', role: 'assistant', text: 'final', ts: 200,
+    } as Msg)
+    assert.equal(JSON.stringify(existing), snap, 'existing untouched')
+    assert.equal(existing[1].text, 'streaming', 'placeholder unchanged in place')
+  })
 })

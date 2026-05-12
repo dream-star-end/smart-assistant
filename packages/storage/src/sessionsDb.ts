@@ -891,22 +891,59 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
 }
 
 /**
- * Idempotent append of a server-authored message to an existing messages
- * array. Returns `{ applied: false, reason: 'already_exists' }` if a
- * message with the same id already exists, else returns a new sorted
- * array with the stamped message included.
+ * Idempotent append / takeover overlay of a server-authored message into
+ * an existing messages array.
  *
- * Pure: doesn't mutate `existing`. `message._source` is always stamped
- * to `'server'` in the returned copy, and `ts` defaults to `now` if
- * missing so subsequent sort is well-defined.
+ *   - Same id, existing row has `_source: 'server'` → no-op (idempotent
+ *     replay of a takeover that already landed).
+ *   - Same id, existing row is a CLIENT placeholder (no `_source: 'server'`)
+ *     → REPLACE at position. Required by v7 architecture: client streaming
+ *     row now uses canonical `srv-${peerId}-t${turnIndex}` id and may PUT
+ *     its placeholder into `client_sessions.messages` BEFORE Phase 0.1
+ *     turn-end takeover runs. Pre-v7 this could not happen — only the
+ *     server ever wrote `srv-*` ids — so a same-id collision implied a
+ *     duplicate server write. Post-v7 the same-id case can also mean
+ *     "server-authored canonical version is overtaking the client's
+ *     streaming placeholder", and we must overlay rather than skip.
+ *   - No same id → append.
+ *
+ * On takeover, server-authored ts wins; falls back to existing placeholder
+ * ts; final fallback `now`. `_seq` reassignment downstream is handled by
+ * `normalizeAndAssignSeqs` — the takeover bumps `_source: 'server'`, which
+ * is NOT in `_SEQ_CONTENT_IGNORE_FIELDS`, so the row gets a fresh `_seq`
+ * and client incremental GET observes the takeover.
+ *
+ * `applied: true` covers BOTH new-append and takeover-overlay. Callers that
+ * care to distinguish can inspect the returned messages array; this keeps
+ * the type stable and avoids forcing every caller to branch on a new
+ * outcome variant.
+ *
+ * Pure: doesn't mutate `existing`.
  */
 export function appendServerAuthoredPure<T extends MessageLike>(
   existing: readonly T[],
   message: T & { id: string },
   now: number = Date.now(),
 ): { applied: true; messages: T[] } | { applied: false; reason: 'already_exists' } {
-  if (existing.some((m) => m && m.id === message.id)) {
-    return { applied: false, reason: 'already_exists' }
+  const idx = existing.findIndex((m) => m && m.id === message.id)
+  if (idx >= 0) {
+    const cur = existing[idx] as (T & { _source?: string }) | undefined
+    // True idempotent: a server-authored row with this id already exists.
+    // Re-applying would either be a no-op (same content → no _seq churn) or
+    // would clobber a later authoritative write; either way, refuse.
+    if (cur && cur._source === 'server') {
+      return { applied: false, reason: 'already_exists' }
+    }
+    // Takeover overlay: client placeholder gives way to server-authored.
+    const stamped = {
+      ...message,
+      _source: 'server',
+      ts: message.ts ?? cur?.ts ?? now,
+    } as T
+    const next = existing.slice()
+    next[idx] = stamped
+    next.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+    return { applied: true, messages: next }
   }
   const stamped = { ...message, _source: 'server', ts: message.ts ?? now } as T
   const next = [...existing, stamped]

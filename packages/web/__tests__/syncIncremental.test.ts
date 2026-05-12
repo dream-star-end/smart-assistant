@@ -40,10 +40,11 @@ function extractTopLevelFn(source: string, name: string): string {
 
 // _mergePartialTail depends transitively on _localMessageSupersedes (which
 // itself uses _stableStringify), _overlayServerAuthoritative (with its
-// _SERVER_AUTH_KEYS const), and _mergeServerAuthoredIntoLocal (which step 3
-// delegates to for streaming-tail preservation + phantom dedupe).
-// We extract the full dependency closure so the Function() body can resolve
-// them all at runtime — same pattern used by syncConflictMerge.test.ts.
+// _SERVER_AUTH_KEYS const), _mergeServerAuthoredIntoLocal (which step 3
+// delegates to for streaming-tail preservation + legacy-row backstop), and
+// _dropLegacyClientStreamRows (v7 strict migration backstop called by the
+// merger). We extract the full dependency closure so the Function() body
+// can resolve them all at runtime.
 const _SERVER_AUTH_KEYS_DECL =
   "const _SERVER_AUTH_KEYS = ['_seq', '_source', 'usage', '_truncated', '_errorCode', '_errorDetail'];"
 
@@ -55,6 +56,8 @@ const _combined =
   extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes') +
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_overlayServerAuthoritative') +
+  '\n' +
+  extractTopLevelFn(SYNC_SRC, '_dropLegacyClientStreamRows') +
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_mergeServerAuthoredIntoLocal') +
   '\n' +

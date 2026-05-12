@@ -1260,9 +1260,40 @@ export class SessionManager {
     // PHANTOM_TURN 用独立计数器,不和 transient 共用 attempt budget。
     // 第 0 次 phantom → 重启子进程 + retry 1 次;第 1 次还是 phantom → 终态 error,不再重试。
     let phantomRetryUsed = false
+
+    // V3 v7 — Canonical assistant/thinking message ids for this user turn.
+    // Computed ONCE here and shared by:
+    //   1. CcbMessageParser (stamps text/thinking blocks emitted by the model)
+    //   2. retry/auth/transient status text emits below (so they don't claim
+    //      a separate m-* row that would later prevent canonical id adoption)
+    //   3. Phase 0.1 turn-end takeover (sessionManager.ts:~1729 + master
+    //      internalServerAuthored.ts:436 use identical formula
+    //      `srv-${peerId}-t${turnIndex}` and `${...}-thinking`)
+    //
+    // `session.turns` at this point is the count of COMPLETED turns; the
+    // turn we're about to start is `session.turns + 1` (1-indexed, matching
+    // turn.completed semantics — see line 1516 / 1729 where
+    // `turnIndex = session.turns + 1` and `= session.turns` post-increment
+    // both resolve to the same value at persist time).
+    //
+    // Retry attempts within this loop SHARE these ids: a user turn that
+    // gets retried for phantom/auth/transient errors is still one logical
+    // assistant message from the user's perspective.
+    const projectedTurnIndex = session.turns + 1
+    const assistantMessageId = `srv-${session.peerId}-t${projectedTurnIndex}`
+    const thinkingMessageId = `srv-${session.peerId}-t${projectedTurnIndex}-thinking`
+
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        await this._runOneTurn(session, userTextOrBlocks, onEvent, requestId, traceId)
+        await this._runOneTurn(
+          session,
+          userTextOrBlocks,
+          onEvent,
+          requestId,
+          traceId,
+          assistantMessageId,
+          thinkingMessageId,
+        )
         return // success
       } catch (err: any) {
         const msg = err?.message ?? String(err)
@@ -1294,6 +1325,11 @@ export class SessionManager {
             block: {
               kind: 'text',
               text: '\n\n🔄 CCB 子进程返回空响应(未调模型),已重启子进程并自动重试...\n',
+              // V3 v7 — stamp canonical id so this status text lands in the
+              // same client row that the upcoming retry's model text will
+              // populate, instead of forcing client to mint a separate m-*
+              // placeholder that would block canonical-id adoption.
+              messageId: assistantMessageId,
             },
           })
           // Don't consume transient-retry budget on a phantom retry. The for-loop's
@@ -1330,6 +1366,7 @@ export class SessionManager {
             block: {
               kind: 'text',
               text: '\n\n🔄 认证已过期,正在刷新凭据并重试...\n',
+              messageId: assistantMessageId, // see phantom-retry rationale above
             },
           })
           continue
@@ -1352,6 +1389,7 @@ export class SessionManager {
           block: {
             kind: 'text',
             text: `\n\n⚠️ 遇到临时错误,${Math.round(delay / 1000)}秒后自动重试 (${attempt + 1}/${MAX_RETRIES})...\n`,
+            messageId: assistantMessageId, // see phantom-retry rationale above
           },
         })
         await new Promise((r) => setTimeout(r, delay))
@@ -1385,6 +1423,13 @@ export class SessionManager {
      *  so undefined values don't insert a `traceId: undefined` key. See parent
      *  fn JSDoc for the full log-tagging inventory. */
     traceId?: string,
+    /** V3 v7 — canonical assistant/thinking message ids computed once by
+     *  runOneTurnWithRetry and shared across retries within this user turn.
+     *  Passed into CcbMessageParser so every main-agent text/thinking block
+     *  emitted to the client carries `messageId: srv-${peerId}-t${turnIndex}`.
+     *  See runOneTurnWithRetry comment for full rationale. */
+    assistantMessageId?: string,
+    thinkingMessageId?: string,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -1473,6 +1518,11 @@ export class SessionManager {
       const parser = new CcbMessageParser({
         toolUseIdToName: session.toolUseIdToName,
         onEvent: wrappedOnEvent,
+        // V3 v7 — canonical id stamper inputs (undefined for personal-version
+        // legacy paths). Parser passes them through to every main-agent
+        // text/thinking block.
+        assistantMessageId,
+        thinkingMessageId,
         onToolUse: (tool) => {
           turnToolCallCount++
           // Bridge CCB CronCreate/CronDelete via EventBus

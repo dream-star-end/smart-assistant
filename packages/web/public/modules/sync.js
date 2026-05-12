@@ -209,85 +209,52 @@ export function _overlayServerAuthoritative(localMsg, serverMsg) {
  * client-side sync convergence point: full sync, partial-tail sync,
  * 409 local-dominates, 409 server-wins.
  *
- * Server is authoritative for "what exists at all" — a row that was
- * previously server-confirmed (carries `_seq`) but is absent from the
- * current server response was deleted on another tab/device. Local rows
- * without `_seq` are pending/in-flight (never confirmed by server) and
- * must survive every sync until the next PUT lands.
+ * **v7 (2026-05-12) — single-id-authority architecture**
  *
- * 2026-05-12 v6 — supersedes v5 which incorrectly preserved ALL local-only
- * rows. v5 had two regressions (Codex round 2 review):
- *   (R1) Cross-tab delete resurrected: tab A delete → server timeline
- *        shorter → tab B's GET → v5 kept local row missing from server
- *        forever, even though it had `_seq` proving server once knew it.
- *   (R2) Cross-tab user interleave dropped active stream: ts-sort put
- *        local in-flight `m-asst` (turn-a) into the SAME positional group
- *        as cross-tab `srv-asst-b` (turn-b) → group dedupe killed m-asst,
- *        re-introducing the mobile flash-and-loss bug class this whole
- *        fix targets.
+ * The dual-id problem (client `m-${ts36}-${rand}` + server `srv-${peerId}-tN`
+ * for the same logical assistant message) used to force this merger to
+ * do anchor-keyed turn-group phantom dedupe, _seq-based "did server once
+ * know this row" discrimination, and a streaming-tail-grace heuristic.
+ * Each of these papered over a different symptom of the underlying
+ * "same row has two different ids on the two tapes" disease, and the
+ * v5 / v6 mobile flash-and-loss bug kept re-emerging in new forms.
  *
- * Five-step algorithm:
+ * v7 fixes it at the source:
+ *   - Gateway mints `srv-${peerId}-t${turnIndex}` once per turn and stamps
+ *     it on every outbound text/thinking block via `messageId` (see
+ *     packages/protocol/src/frames.ts, packages/gateway/src/ccbMessageParser.ts).
+ *   - Client websocket.js adopts that id as the streaming row id from the
+ *     first frame (modules/websocket.js:2002 text / :2043 thinking).
+ *   - Master Phase 0.1 takeover writes the final canonical row under the
+ *     SAME id (packages/storage/src/sessionsDb.ts:903 `appendServerAuthoredPure`
+ *     overlay branch).
  *
- *   1. **Pre-compute turn anchors** — for each row in BOTH inputs, find
- *      the id of the preceding user/system message in that input's
- *      natural order. This captures "which turn the row belongs to" from
- *      that side's perspective. Stored in side-Maps keyed by id;
- *      inputs not mutated.
+ * With ids aligned on both tapes, the merger collapses to id-based union
+ * with server-authored overlay:
  *
- *   2. **Overlay by id, append server-only** — for each local row:
- *      - same-id server row exists: `_localMessageSupersedes(lm, sm)`
- *        → overlay server-auth fields onto local (preserves WeakMap-keyed
- *        DOM reconcile fast path); else → take server's row.
- *      - no same-id server row + local has finite `_seq` → DROP (server-
- *        side delete from another tab).
- *      - no same-id server row + local has NO `_seq` → PRESERVE
- *        (in-flight streaming tail / unpushed user msg).
- *      Then append server rows whose id wasn't consumed.
+ *   1. For each local row with a same-id server counterpart: overlay
+ *      server-authoritative fields onto local (see _overlayServerAuthoritative
+ *      — preserves WeakMap-keyed DOM reconcile fast path when nothing
+ *      differs, returns fresh ref when at least one auth field changes).
+ *   2. For each local row with no server counterpart: keep as-is.
+ *      This covers in-flight streaming rows (server takeover not yet
+ *      written), client-only empty-turn notices, and queued user msgs.
+ *   3. Append server-only rows (ids the client hasn't seen yet — cross-
+ *      tab user messages, cross-device additions).
+ *   4. ts-sort for display order.
+ *   5. Legacy IDB migration backstop (see `_dropLegacyClientStreamRows`):
+ *      drop pre-v7 `m-*` assistant/thinking rows that have a matching
+ *      `srv-*` server row in the same turn. Strict predicate, scheduled
+ *      for removal post v1.0.140 + 14 days.
  *
- *   3. **Chronological sort by ts** — display order is by timestamp.
- *      Ties keep insertion order (local-overlay first, then server-only
- *      appended), giving a stable result.
- *
- *   4. **Compute effective anchor per merged row** — id-membership lookup,
- *      NOT object identity (Codex v6 constraint):
- *        - id in serverById → server anchor (server's view authoritative)
- *        - id only in local → local anchor
- *        - id-less defensive row → positional fallback (preceding
- *          user/system in merged)
- *
- *   5. **Turn-group phantom dedupe by effective anchor** —
- *      anchor-keyed (not positional) `hasServerAsst` / `hasServerThinking` /
- *      `serverToolBlockIds`. Drop client-authored assistant/thinking
- *      phantoms whose effective anchor's group has a server counterpart.
- *      Drop client tool only when a server tool with same `blockId`
- *      shares the same effective anchor. Tools without `blockId` (legacy
- *      rows) are kept — better doubled card than dropped detail.
- *
- * Naturally derived behaviors:
- *   - **In-flight streaming preserved** — `m-asst` (no _seq) survives every
- *     server response until Phase 0.1 takeover (`srv-asst` with
- *     `_source: 'server'`) lands in the SAME turn anchor's group.
- *   - **Takeover convergence drops phantoms** — server mints `srv-…` for
- *     the assistant/thinking/tool rows of the just-finished turn; step 5
- *     finds them via anchor lookup and drops the matching client `m-…`.
- *   - **Cross-tab user message lands chronologically** — appended in step 2,
- *     sorted into ts order in step 3.
- *   - **Cross-tab user does NOT split an in-flight turn** — local m-asst
- *     keeps its LOCAL anchor (the user msg it was replying to). srv-asst
- *     for the cross-tab user has a DIFFERENT anchor → different group →
- *     m-asst preserved.
- *   - **Cross-device delete drops orphans** — local row with `_seq` not in
- *     server response is treated as server-deleted.
- *
- * Invariants the algorithm relies on:
- *   - All PERSISTED messages have a string `id`. Server never serializes
- *     id-less rows; client may transiently hold one mid-frame, in which
- *     case it passes through with a positional fallback anchor.
- *   - `_seq` is server-stamped only. WS streaming does NOT write `_seq` on
- *     client rows. Once a row's `_seq` is set, it has been confirmed by
- *     server at some past moment (verified by grep over modules/).
- *   - `_source === 'server'` marks server-authored rows. Phase 0.1 HTTP
- *     path (commercial/internalServerAuthored.ts) is the only writer.
+ * **Trade-off explicitly accepted (was 5-step anchor algorithm's job)**:
+ *   - Cross-tab DELETE: tab A deletes a row → server timeline shorter →
+ *     tab B's GET → tab B's id-union keeps the local row as a ghost
+ *     until the user refreshes. The previous _seq-based discriminator
+ *     was the only thing handling this; bringing it back would resurrect
+ *     the symptom-patching mode this rewrite exits. Cross-tab delete is
+ *     rare and reversible; flash-and-loss on streaming is high-frequency
+ *     and breaks user trust. Explicit trade.
  *
  * @param serverMsgs server-side authoritative timeline (from REST GET)
  * @param localMsgs current local messages (may contain streaming tail)
@@ -296,184 +263,149 @@ export function _overlayServerAuthoritative(localMsg, serverMsg) {
 export function _mergeServerAuthoredIntoLocal(serverMsgs, localMsgs) {
   const serverArr = Array.isArray(serverMsgs) ? serverMsgs : []
   const localArr = Array.isArray(localMsgs) ? localMsgs : []
-  // Fast path: nothing on server (e.g. empty session, or first server
-  // response while local is being primed). Return a fresh slice so the
-  // caller can safely mutate without aliasing local. Skipping the ts-sort
-  // also avoids reordering a local-only array against insertion order
-  // when caller hasn't yet stamped ts (Codex v5 constraint 1).
+  // Fast path: nothing on server. Return a fresh slice so the caller can
+  // mutate without aliasing local. Skipping ts-sort also avoids reordering
+  // a local-only array against insertion order when caller hasn't yet
+  // stamped ts on every row.
   if (serverArr.length === 0) return localArr.slice()
 
-  // Step 1: pre-compute turn anchors on each side. Side-effect free —
-  // we never mutate input rows; lookups go through these Maps keyed by id.
-  // An anchor is the id of the most recent preceding user/system message
-  // in that side's natural order; user/system rows are their own anchor.
-  const anchorByLocalId = new Map()
-  {
-    let cur = null
-    for (const m of localArr) {
-      if (!m || typeof m.id !== 'string') continue
-      if (m.role === 'user' || m.role === 'system') cur = m.id
-      anchorByLocalId.set(m.id, cur)
-    }
-  }
-  const anchorByServerId = new Map()
   const serverById = new Map()
-  {
-    let cur = null
-    for (const m of serverArr) {
-      if (!m || typeof m.id !== 'string') continue
-      if (m.role === 'user' || m.role === 'system') cur = m.id
-      anchorByServerId.set(m.id, cur)
-      serverById.set(m.id, m)
-    }
+  for (const sm of serverArr) {
+    if (sm && typeof sm.id === 'string') serverById.set(sm.id, sm)
   }
 
-  // Step 2: overlay by id, drop cross-tab-deleted local rows, append server-only.
-  const consumedFromServer = new Set()
   const merged = []
+  const consumedFromServer = new Set()
   for (const lm of localArr) {
-    if (!lm || typeof lm.id !== 'string') {
-      // Defensive: id-less local rows have no canonical key. Pass through
-      // unchanged. All PERSISTED messages have string ids — this branch
-      // only covers transient mid-frame state (Codex v5 constraint 2).
+    if (!lm) continue
+    if (typeof lm.id !== 'string') {
+      // Defensive: id-less local rows. All persisted rows have string ids;
+      // this branch only catches transient mid-frame state.
       merged.push(lm)
       continue
     }
     const sm = serverById.get(lm.id)
-    if (!sm) {
-      // Local-only row. Cross-device delete discriminator:
-      //   - has finite `_seq` → server-confirmed at some past moment; its
-      //     absence from current server response means server deleted it
-      //     (cross-tab `splice(...)` + PUT) → DROP.
-      //   - no `_seq` → pending/in-flight (streaming asst, just-typed user
-      //     not yet PUT'd, etc.) → PRESERVE so streaming UX stays intact.
-      //
-      // Known residual-risk (Codex v6 round 3 note): legacy/backfill local
-      // rows from IDB pre-`_seq` schema also have no `_seq`. If another tab
-      // deleted such a row server-side and we receive the shorter response
-      // here, this helper would keep the row as "pending". `_computeSinceSeqForFetch`
-      // detects "any local row lacks _seq" and forces a full GET — that path
-      // still hits this branch and still preserves the legacy row. Acceptable
-      // by design: legacy rows are a vanishing population (every PUT round-trip
-      // stamps _seq onto them), and silently dropping them on a sync would be
-      // worse UX than the rare delete-not-propagated case.
-      const hasSeq = typeof lm._seq === 'number' && Number.isFinite(lm._seq)
-      if (!hasSeq) merged.push(lm)
-      // else: drop — server is authoritative for "exists at all"
-      continue
-    }
-    consumedFromServer.add(lm.id)
-    if (_localMessageSupersedes(lm, sm)) {
-      merged.push(_overlayServerAuthoritative(lm, sm))
+    if (sm) {
+      consumedFromServer.add(lm.id)
+      // Direction: _localMessageSupersedes decides who wins on TEXT.
+      //   - Layer 1 equality OR Layer 2 streaming-prefix extension → local
+      //     wins, overlay server-authored fields (_seq/_source/usage/...)
+      //     onto it. Preserves WeakMap-keyed DOM reconcile fast path.
+      //   - Otherwise (server has genuinely different text — e.g. Phase 0.1
+      //     takeover wrote canonical text replacing client's partial, or a
+      //     stale post-reload client) → server wins outright.
+      // This isn't the anchor/turn-group machinery v5/v6 layered on top;
+      // it's the same per-row text adjudication v6 used as its step 2,
+      // unchanged. v7 only removes the WHOLE-TIMELINE phantom-dedupe
+      // (anchor map / _seq cross-tab discriminator), not this same-id
+      // direction choice — which is independent of id authority.
+      if (_localMessageSupersedes(lm, sm)) {
+        merged.push(_overlayServerAuthoritative(lm, sm))
+      } else {
+        merged.push(sm)
+      }
     } else {
-      merged.push(sm)
+      // Local-only row: streaming tail (server takeover not yet written),
+      // empty-turn notice (`m-*` no server counterpart by design), or a
+      // user msg the client hasn't PUT'd yet. All must survive.
+      merged.push(lm)
     }
   }
-  // Append server rows whose id wasn't consumed by overlay above.
-  // Includes non-`_source==='server'` rows like cross-tab user messages —
-  // those carry no `_source` flag but are still authoritative content the
-  // local cache hasn't seen yet.
   for (const sm of serverArr) {
     if (!sm || typeof sm.id !== 'string') continue
-    if (consumedFromServer.has(sm.id)) continue
-    merged.push(sm)
+    if (!consumedFromServer.has(sm.id)) merged.push(sm)
   }
-
-  // Step 3: chronological sort by ts. Display order only — turn ownership
-  // for dedupe comes from anchors computed in step 1 (anchor-aware
-  // dedupe in step 5), NOT from this positional ordering.
   merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
 
-  // Step 4: compute effective anchor for each merged row.
-  // Codex v6 constraint: id-membership lookup (NOT which side the object
-  // ref came from). `_overlayServerAuthoritative` may return a local-shaped
-  // object after applying server fields, but the ROW is still server-known
-  // (id in serverById), so it must use server anchor.
-  const effectiveAnchor = new Array(merged.length)
-  let positionalFallback = null
+  return _dropLegacyClientStreamRows(merged)
+}
+
+/**
+ * Legacy IDB migration backstop. **Technical debt** — slated for removal
+ * once v1.0.134+ (the v7 cutover) has been live 14 days
+ * (`_LEGACY_DROP_REMOVAL_TRIGGER` below).
+ *
+ * Problem this solves: a user who was on v1.0.132 or earlier may have
+ * `m-${ts36}-${rand}` assistant/thinking rows in IDB from a streaming
+ * turn that completed under the old dual-id regime. After upgrade,
+ * server's `mergePreservingServerAuthored` already added a canonical
+ * `srv-${peerId}-tN` row for the same logical message — id-union would
+ * keep BOTH in the merged output. UI would show duplicate assistant
+ * cards for one turn.
+ *
+ * Strict predicate (narrow on purpose — must NOT accidentally drop any
+ * row outside the documented v6→v7 upgrade case):
+ *
+ *   Drop merged row R iff ALL of:
+ *     (a) R.role === 'assistant' || R.role === 'thinking'
+ *     (b) typeof R.id === 'string' && R.id.startsWith('m-')
+ *     (c) R._source !== 'server'  — i.e. R is a client placeholder, not a
+ *         canonical server row
+ *     (d) The same turn group (bounded by the next user/system row
+ *         walking forward, or end-of-array) contains a peer row R2 with:
+ *           - R2.role === R.role
+ *           - typeof R2.id === 'string' && R2.id.startsWith('srv-')
+ *           - For thinking: R2.id endsWith '-thinking'; for assistant:
+ *             R2.id does NOT endsWith '-thinking'
+ *     Otherwise: keep.
+ *
+ * Anything that fails any of (a)-(d) is kept — including:
+ *   - Empty-turn notice rows (no srv-* counterpart → kept)
+ *   - In-flight streaming rows whose id is already `srv-*` (fail (b))
+ *   - Tool rows (fail (a))
+ *   - User rows (fail (a))
+ *   - Server-authored rows themselves (fail (c))
+ *
+ * Walk is single-pass: collect turn boundaries from the merged array
+ * order (ts-sorted by caller). Per turn, build sets of "has srv-asst"
+ * / "has srv-thinking", then second pass drops legacy `m-*` rows whose
+ * group has the matching counterpart.
+ */
+// _LEGACY_DROP_REMOVAL_TRIGGER: "remove after v1.0.134 has been live 14 days"
+function _dropLegacyClientStreamRows(merged) {
+  // Phase 1: walk merged once, assigning each row a numeric turn-group
+  // index. Each user/system row starts a new group (its own index).
+  // Rows before the first user/system get group 0.
+  const groupOf = new Array(merged.length)
+  let group = 0
   for (let i = 0; i < merged.length; i++) {
-    const cur = merged[i]
-    if (!cur) { effectiveAnchor[i] = null; continue }
-    const role = cur.role
-    // Update positional fallback as we walk (for id-less defensive rows).
-    if ((role === 'user' || role === 'system') && typeof cur.id === 'string') {
-      positionalFallback = cur.id
-    }
-    if (typeof cur.id !== 'string') {
-      effectiveAnchor[i] = positionalFallback
-      continue
-    }
-    // ID-membership lookup: server-known id → server anchor (authoritative);
-    // local-only id → local anchor (preserves in-flight turn affinity).
-    if (serverById.has(cur.id)) {
-      const a = anchorByServerId.get(cur.id)
-      effectiveAnchor[i] = a !== undefined ? a : positionalFallback
-    } else {
-      const a = anchorByLocalId.get(cur.id)
-      effectiveAnchor[i] = a !== undefined ? a : positionalFallback
+    const m = merged[i]
+    if (m && (m.role === 'user' || m.role === 'system')) group += 1
+    groupOf[i] = group
+  }
+
+  // Phase 2: per group, record whether a srv-* assistant / thinking
+  // counterpart exists.
+  const hasSrvAsst = new Map()      // group → true
+  const hasSrvThinking = new Map()  // group → true
+  for (let i = 0; i < merged.length; i++) {
+    const m = merged[i]
+    if (!m || typeof m.id !== 'string') continue
+    if (!m.id.startsWith('srv-')) continue
+    if (m.role === 'assistant' && !m.id.endsWith('-thinking')) {
+      hasSrvAsst.set(groupOf[i], true)
+    } else if (m.role === 'thinking' && m.id.endsWith('-thinking')) {
+      hasSrvThinking.set(groupOf[i], true)
     }
   }
 
-  // Step 5: anchor-keyed phantom dedupe. We collect server-authored
-  // counterparts per anchor, then drop client phantoms whose effective
-  // anchor has a matching server counterpart.
-  const anchorHasServerAsst = new Map()
-  const anchorHasServerThinking = new Map()
-  const anchorServerToolBlockIds = new Map()
+  // Phase 3: drop the strict legacy rows.
+  const out = []
   for (let i = 0; i < merged.length; i++) {
-    const cur = merged[i]
-    if (!cur || cur._source !== 'server') continue
-    const role = cur.role
-    const a = effectiveAnchor[i]
-    if (role === 'assistant') anchorHasServerAsst.set(a, true)
-    else if (role === 'thinking') anchorHasServerThinking.set(a, true)
-    else if (role === 'tool') {
-      const bid = cur.blockId
-      if (typeof bid === 'string' && bid.length > 0) {
-        let set = anchorServerToolBlockIds.get(a)
-        if (!set) {
-          set = new Set()
-          anchorServerToolBlockIds.set(a, set)
-        }
-        set.add(bid)
-      }
+    const m = merged[i]
+    if (!m) { out.push(m); continue }
+    const role = m.role
+    if ((role === 'assistant' || role === 'thinking') &&
+        typeof m.id === 'string' &&
+        m.id.startsWith('m-') &&
+        m._source !== 'server') {
+      const g = groupOf[i]
+      if (role === 'assistant' && hasSrvAsst.get(g)) continue
+      if (role === 'thinking' && hasSrvThinking.get(g)) continue
     }
+    out.push(m)
   }
-
-  const deduped = []
-  for (let i = 0; i < merged.length; i++) {
-    const cur = merged[i]
-    if (!cur) { deduped.push(cur); continue }
-    const role = cur.role
-    // Keep server-authored rows and any non-(assistant|thinking|tool) row.
-    if (
-      cur._source === 'server' ||
-      (role !== 'assistant' && role !== 'thinking' && role !== 'tool')
-    ) {
-      deduped.push(cur)
-      continue
-    }
-    const a = effectiveAnchor[i]
-    if (role === 'assistant' && anchorHasServerAsst.get(a)) continue
-    if (role === 'thinking' && anchorHasServerThinking.get(a)) continue
-    if (role === 'tool') {
-      // Drop client tool ONLY when a server tool with matching blockId
-      // shares the same effective anchor. Tools without blockId (legacy /
-      // pre-allowlist-strip rows) are kept to avoid losing user-visible
-      // detail. Anchor-aware so cross-tab tool collisions on different
-      // turns don't accidentally dedupe each other.
-      const bid = cur.blockId
-      const bids = anchorServerToolBlockIds.get(a)
-      if (
-        typeof bid === 'string' &&
-        bid.length > 0 &&
-        bids &&
-        bids.has(bid)
-      ) continue
-    }
-    deduped.push(cur)
-  }
-  return deduped
+  return out
 }
 
 /**

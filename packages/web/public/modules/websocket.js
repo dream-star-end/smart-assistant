@@ -341,6 +341,43 @@ export function hideTypingIndicator() {
 }
 
 // ═══════════════ MESSAGES ═══════════════
+
+/**
+ * v7 multi-text-block-per-turn rebind helper.
+ *
+ * The gateway stamps ONE canonical `messageId` per turn on every text /
+ * thinking block (text → tool_use → text again). When the tool_use branch
+ * cleared `sess._streamingAssistant`, the next text delta arrives with the
+ * SAME id. Naively creating a new row → duplicate row with identical id →
+ * poisons `appendServerAuthoredPure` takeover (which replaces only the
+ * first match) and breaks the "one logical message = one canonical id"
+ * invariant. Mirrors the server's storage model where `assistantBuf`
+ * concatenates all text segments across tool boundaries into one row.
+ *
+ * Behavior:
+ *   - If `messageId` is given AND a row with that id+role exists in
+ *     sess.messages → return it (caller rebinds streaming pointer).
+ *   - Otherwise call `_create(extraIdOverride)` and return the new row,
+ *     stamping the id only when messageId is set.
+ *
+ * Returns the row to bind the streaming pointer to.
+ *
+ * @param {{messages: any[]}} sess
+ * @param {'assistant'|'thinking'} role
+ * @param {string|undefined} messageId  canonical id from block.messageId
+ * @param {(extra: object) => object} create  factory that calls addMessage and returns the row
+ */
+export function _findOrCreateStreamingRow(sess, role, messageId, create) {
+  if (messageId) {
+    const existing = sess.messages.find(
+      (m) => m && m.id === messageId && m.role === role,
+    )
+    if (existing) return existing
+  }
+  const extraIdOverride = messageId ? { id: messageId } : {}
+  return create(extraIdOverride)
+}
+
 export function addMessage(sess, role, text, extra) {
   extra = extra || {}
   const msg = Object.assign({ id: _deps.msgId(), role, text: text || '', ts: Date.now() }, extra)
@@ -2002,11 +2039,16 @@ export function handleOutbound(frame) {
     if (block.kind === 'text') {
       sess._streamingThinking = null
       if (!sess._streamingAssistant) {
-        sess._streamingAssistant = addMessage(
-          sess,
-          'assistant',
-          '',
-          isCronPush ? { cronPush: true, cronLabel: frame.cronJob?.label } : {},
+        // v7: adopt server-minted canonical id when frame carries one + rebind
+        // to an existing same-id row (multi-text-block-per-turn case). See
+        // `_findOrCreateStreamingRow` docstring for rationale.
+        sess._streamingAssistant = _findOrCreateStreamingRow(
+          sess, 'assistant', block.messageId,
+          (idOverride) => {
+            const extra = isCronPush ? { cronPush: true, cronLabel: frame.cronJob?.label } : {}
+            Object.assign(extra, idOverride)
+            return addMessage(sess, 'assistant', '', extra)
+          },
         )
       }
       sess._streamingAssistant.text += blockText
@@ -2040,7 +2082,15 @@ export function handleOutbound(frame) {
         }
       }
     } else if (block.kind === 'thinking') {
-      if (!sess._streamingThinking) sess._streamingThinking = addMessage(sess, 'thinking', '')
+      if (!sess._streamingThinking) {
+        // v7: same canonical-id adoption + multi-block rebind for thinking.
+        // Gateway stamps a SEPARATE thinking id (`srv-${peerId}-t${turn}-thinking`)
+        // but reuses it across all thinking blocks in the same turn.
+        sess._streamingThinking = _findOrCreateStreamingRow(
+          sess, 'thinking', block.messageId,
+          (idOverride) => addMessage(sess, 'thinking', '', idOverride),
+        )
+      }
       sess._streamingThinking.text += blockText
       sess._streamingThinking.completedAt = Date.now()  // see assistant branch rationale
       if (!sess._thinkRafPending) {

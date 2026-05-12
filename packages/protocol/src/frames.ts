@@ -141,6 +141,14 @@ export const OutboundContentBlock = Type.Union([
     kind: Type.Literal('text'),
     text: Type.String(),
     parentToolUseId: Type.Optional(Type.String()),
+    // V3 v7 — canonical assistant row id minted server-side at turn start
+    // (`srv-${peerId}-t${turnIndex}`). Stamped on main-agent text blocks
+    // (parentToolUseId empty) so client + server tape agree on row id
+    // from the first chunk on, eliminating the m-* / srv-* dual-authority
+    // pain that v5/v6 tried to paper over. Subagent text omits this field
+    // — subagent content lives inside Agent card childBlocks, not as a
+    // top-level row.
+    messageId: Type.Optional(Type.String()),
   }),
   Type.Object({
     kind: Type.Literal('tool_use'),
@@ -168,6 +176,11 @@ export const OutboundContentBlock = Type.Union([
     kind: Type.Literal('thinking'),
     text: Type.String(),
     parentToolUseId: Type.Optional(Type.String()),
+    // V3 v7 — canonical thinking row id minted server-side at turn start
+    // (`srv-${peerId}-t${turnIndex}-thinking`). Same rationale as the text
+    // variant's `messageId` field. Subagent thinking omits this — it goes
+    // into Agent card childBlocks not a top-level thinking row.
+    messageId: Type.Optional(Type.String()),
   }),
   // Snapshot of a long-running bash command's tail output. Snapshot
   // semantics: the consumer REPLACES its prior tail buffer with `tail`

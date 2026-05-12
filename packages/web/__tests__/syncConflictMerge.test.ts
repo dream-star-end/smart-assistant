@@ -451,6 +451,9 @@ const _pushFnSrc =
   extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localDominates') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_overlayServerAuthoritative') + '\n' +
+  // _mergeServerAuthoredIntoLocal calls _dropLegacyClientStreamRows (v7
+  // migration backstop) — must be in the same closure or merge throws.
+  extractTopLevelFn(SYNC_SRC, '_dropLegacyClientStreamRows') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_mergeServerAuthoredIntoLocal') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_rebuildBlockMaps') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers') + '\n' +
@@ -960,8 +963,11 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     //   - step 4 turn-group dedupe 发现 group 内有 server takeover,丢掉 client
     //     phantom m-a1。最终保留 [u1, a-server-only]。
     const sessId = 'sess-disjoint'
+    // v7 migration backstop: legacy `m-*` client phantom + new `srv-*` server
+    // takeover in the same turn group → phantom dropped by
+    // `_dropLegacyClientStreamRows`.
     const serverOnlyAsst = {
-      id: 'a-server-only',
+      id: 'srv-peer1-t1',
       role: 'assistant',
       text: '',
       _source: 'server',
@@ -970,7 +976,7 @@ describe('pushSessionToServer — 409 local-dominates', () => {
       ts: 1050,
     }
     const localAsst = {
-      id: 'a1', role: 'assistant', text: 'something', ts: 1010,
+      id: 'm-a1', role: 'assistant', text: 'something', ts: 1010,
     }
     const sess: any = {
       id: sessId, title: 't', lastAt: 1000, pinned: false, agentId: 'a',
@@ -992,10 +998,10 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     deps.state.sessions.set(sessId, sess)
     await makePush(deps)(sess)
 
-    // 走 server-wins 分支,merger 应用 takeover dedupe:
+    // 走 server-wins 分支,merger 应用 v7 migration backstop:
     assert.equal(sess.messages.length, 2)
     assert.equal(sess.messages[0].id, 'u1')
-    assert.equal(sess.messages[1].id, 'a-server-only')
+    assert.equal(sess.messages[1].id, 'srv-peer1-t1')
     // 关键反例:overlay 没有把 server-only 行的字段(_seq=9 / usage)
     // 写到不同 id 的 local 行身上 — u1 上不应出现 _seq=9。
     assert.equal(sess.messages[0]._seq, undefined, 'overlay 不应把 server-only 字段错位到不同 id')
@@ -1014,7 +1020,9 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     // 最终 sess.messages = [a-new]。_streamingAssistant 原指向 a-old → 不再在
     // 数组里 → 由 _rebindStreamingPointers 清空。
     const sessId = 'sess-sw'
-    const oldLocalAsst = { id: 'a-old', role: 'assistant', text: 'local regen', ts: 1000 }
+    // v7 migration backstop: legacy `m-*` client phantom + new `srv-*` server
+    // takeover → phantom dropped on server-wins.
+    const oldLocalAsst = { id: 'm-a-old', role: 'assistant', text: 'local regen', ts: 1000 }
     const sess: any = {
       id: sessId,
       title: 'local title',
@@ -1025,12 +1033,12 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
       _dirty: true,
       _syncedAt: 500,
       _streamingAssistant: oldLocalAsst,  // points at the soon-to-be-replaced obj
-      _blockIdToMsgId: new Map([['b', 'a-old']]),
+      _blockIdToMsgId: new Map([['b', 'm-a-old']]),
       _agentGroups: new Map(),
     }
 
     const serverAsst = {
-      id: 'a-new', role: 'assistant', text: 'server side answer',
+      id: 'srv-peer1-t1', role: 'assistant', text: 'server side answer',
       _source: 'server', _seq: 7, ts: 1100,
     }
     const deps = baseDeps({
@@ -1052,7 +1060,7 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     // Adopted server state
     assert.equal(sess.title, 'server title')
     assert.equal(sess.messages.length, 1, 'turn-group dedupe should drop m-a-old phantom')
-    assert.equal(sess.messages[0].id, 'a-new')
+    assert.equal(sess.messages[0].id, 'srv-peer1-t1')
     assert.equal(sess.agentId, 'a2')
     assert.equal(sess._dirty, false)
     assert.equal(sess._syncedAt, 2000)
@@ -1120,14 +1128,16 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     // 出现 server-authored assistant) 应该丢 m-orphan;`_rebindStreamingPointers`
     // 发现 _replyingToMsgId='orphan' 已不在 messages 里 → 清空 pointer + turn 计数。
     const sessId = 'sess-rpl'
+    // v7 migration backstop: legacy `m-*` orphan + new `srv-*` server takeover
+    // → orphan dropped, _rebindStreamingPointers clears _replyingToMsgId.
     const sess: any = {
       id: sessId, title: 't',
       messages: [
         { id: 'u1', role: 'user', text: 'hi', ts: 1000 },
-        { id: 'orphan', role: 'assistant', text: 'gone', ts: 1010 },
+        { id: 'm-orphan', role: 'assistant', text: 'gone', ts: 1010 },
       ],
       lastAt: 1000, pinned: false, agentId: 'a', _dirty: true, _syncedAt: 500,
-      _replyingToMsgId: 'orphan',
+      _replyingToMsgId: 'm-orphan',
       _currentTurnBlockCount: 7,
     }
 
@@ -1136,11 +1146,11 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
       _apiGetImpl: () => ({
         id: sessId, title: 't',
         // 让 _localDominates 返回 false (server 长度 != local 末端 prefix):server
-        // 用 srv-asst 替代 orphan,id 不同 → 走 server-wins 路径。
+        // 用 srv-peer1-t1 替代 m-orphan,id 不同 → 走 server-wins 路径。
         messages: [
           { id: 'u1', role: 'user', text: 'hi', ts: 1000 },
           {
-            id: 'srv-asst', role: 'assistant', text: 'real reply',
+            id: 'srv-peer1-t1', role: 'assistant', text: 'real reply',
             _source: 'server', _seq: 2, ts: 1050,
           },
         ],
@@ -1151,9 +1161,9 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
 
     await makePush(deps)(sess)
 
-    // orphan 被 turn-group dedupe 丢掉 → rebindStreamingPointers 清 _replyingToMsgId
+    // m-orphan 被 v7 migration backstop 丢掉 → rebindStreamingPointers 清 _replyingToMsgId
     assert.equal(sess.messages.length, 2)
-    assert.deepEqual(sess.messages.map((m: any) => m.id), ['u1', 'srv-asst'])
+    assert.deepEqual(sess.messages.map((m: any) => m.id), ['u1', 'srv-peer1-t1'])
     assert.equal(sess._replyingToMsgId, null)
     assert.equal(sess._currentTurnBlockCount, 0)
   })

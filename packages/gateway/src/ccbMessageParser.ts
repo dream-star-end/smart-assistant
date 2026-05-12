@@ -322,6 +322,17 @@ export class CcbMessageParser {
   private onToolResult?: (result: DetectedToolResult) => void
   private onFinish: (result: TurnResult | null) => void
 
+  /** V3 v7 — canonical assistant row id for this turn, minted server-side
+   *  as `srv-${peerId}-t${turnIndex}` and shared with the Phase 0.1 turn-end
+   *  takeover. Stamped on every main-agent text block emitted by this parser
+   *  (parentToolUseId empty) so client + server tape agree on row id from
+   *  the first chunk on. Undefined for non-v7 callers / personal-version
+   *  paths — client falls back to legacy `m-*` mint. */
+  public assistantMessageId?: string
+  /** Same as `assistantMessageId` but for thinking rows
+   *  (`srv-${peerId}-t${turnIndex}-thinking`). */
+  public thinkingMessageId?: string
+
   constructor(opts: {
     toolUseIdToName: Map<string, string>
     onEvent: (e: SessionStreamEvent) => void
@@ -340,6 +351,10 @@ export class CcbMessageParser {
       turns: number
       _lastCcbCumulativeCost: number
     }
+    /** V3 v7 — canonical assistant/thinking message ids minted by caller
+     *  (`runOneTurnWithRetry`) once per user turn. See field-level docs. */
+    assistantMessageId?: string
+    thinkingMessageId?: string
   }) {
     this.toolUseIdToName = opts.toolUseIdToName
     this.onEvent = opts.onEvent
@@ -347,6 +362,8 @@ export class CcbMessageParser {
     this.onToolResult = opts.onToolResult
     this.onFinish = opts.onFinish
     this._sessionTotals = opts.sessionTotals
+    this.assistantMessageId = opts.assistantMessageId
+    this.thinkingMessageId = opts.thinkingMessageId
   }
 
   private _sessionTotals: {
@@ -503,6 +520,15 @@ export class CcbMessageParser {
     const withParent = <T extends Record<string, unknown>>(block: T): T =>
       parentToolUseId ? ({ ...block, parentToolUseId } as T) : block
 
+    // V3 v7 — canonical-id stamper for main-agent text/thinking blocks.
+    // Returns block unchanged when (a) this is a subagent block, or
+    // (b) the parser was constructed without canonical ids (personal-version
+    // legacy path) — old client behavior preserved.
+    const stampMainAgentId = <T extends Record<string, unknown>>(
+      block: T,
+      id: string | undefined,
+    ): T => (parentToolUseId || !id ? block : ({ ...block, messageId: id } as T))
+
     if (ev.type === 'content_block_start') {
       const cb = ev.content_block
       if (cb?.type === 'tool_use' && cb.id && cb.name) {
@@ -532,7 +558,13 @@ export class CcbMessageParser {
         // Only accumulate main-agent text into assistantBuf; subagent text
         // must not pollute the parent turn's stored assistant message.
         if (!parentToolUseId) this.assistantBuf += textStr
-        this.onEvent({ kind: 'block', block: withParent({ kind: 'text', text: textStr }) })
+        this.onEvent({
+          kind: 'block',
+          block: stampMainAgentId(
+            withParent({ kind: 'text', text: textStr }),
+            this.assistantMessageId,
+          ),
+        })
       } else if (delta.type === 'thinking_delta' && delta.thinking) {
         const thinkStr =
           typeof delta.thinking === 'string' ? delta.thinking : JSON.stringify(delta.thinking)
@@ -560,7 +592,13 @@ export class CcbMessageParser {
             this.thinkingTruncated = true
           }
         }
-        this.onEvent({ kind: 'block', block: withParent({ kind: 'thinking', text: thinkStr }) })
+        this.onEvent({
+          kind: 'block',
+          block: stampMainAgentId(
+            withParent({ kind: 'thinking', text: thinkStr }),
+            this.thinkingMessageId,
+          ),
+        })
       } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
         const toolId = this.indexToToolId.get(ev.index as number)
         const tool = toolId ? this.streamingToolUses.get(toolId) : undefined
@@ -687,6 +725,10 @@ export class CcbMessageParser {
         if (!parentToolUseId) this.assistantBuf += c.text
         const textBlock: Record<string, unknown> = { kind: 'text', text: c.text }
         if (parentToolUseId) textBlock.parentToolUseId = parentToolUseId
+        // V3 v7 — stamp canonical id on main-agent text (synthetic-error
+        // path included; client treats it as part of the same row that
+        // streaming text would have populated).
+        else if (this.assistantMessageId) textBlock.messageId = this.assistantMessageId
         this.onEvent({ kind: 'block', block: textBlock as any })
       }
       // text / thinking (non-error snapshots): already emitted via stream_event
