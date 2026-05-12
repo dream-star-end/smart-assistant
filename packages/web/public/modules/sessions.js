@@ -1,16 +1,16 @@
-import { clearAttachments } from './attachments.js?v=099de746'
-import { dbDelete, dbPut } from './db.js?v=099de746'
+import { clearAttachments } from './attachments.js?v=d323d7f8'
+import { dbDelete, dbPut } from './db.js?v=d323d7f8'
 // OpenClaude — Session management, sidebar, context menu
-import { $, htmlSafeEscape } from './dom.js?v=099de746'
-import { exportSessionDocx } from './export-docx.js?v=099de746'
-import { exportSessionTex } from './export-tex.js?v=099de746'
-import { refreshGithubPill } from './github.js?v=099de746'
-import { setTitleBusy } from './notifications.js?v=099de746'
-import { getSession, state } from './state.js?v=099de746'
-import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=099de746'
-import { toast } from './ui.js?v=099de746'
-import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=099de746'
-import { nudgeDrain } from './websocket.js?v=099de746'
+import { $, htmlSafeEscape } from './dom.js?v=d323d7f8'
+import { exportSessionDocx } from './export-docx.js?v=d323d7f8'
+import { exportSessionTex } from './export-tex.js?v=d323d7f8'
+import { refreshGithubPill } from './github.js?v=d323d7f8'
+import { setTitleBusy } from './notifications.js?v=d323d7f8'
+import { getSession, state } from './state.js?v=d323d7f8'
+import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=d323d7f8'
+import { toast } from './ui.js?v=d323d7f8'
+import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=d323d7f8'
+import { nudgeDrain } from './websocket.js?v=d323d7f8'
 
 // Late-bound references set by main.js
 let _renderMessages
