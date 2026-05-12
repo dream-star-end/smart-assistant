@@ -60,6 +60,51 @@ export const MEDIA_SIGN_BATCH_MAX = 32
 export const DEFAULT_SIGN_TTL_MS = 5 * 60 * 1000
 
 /**
+ * v3 commercial 容器 HOME 前缀。signed URL 接受的 path 必须以此开头。
+ *
+ * 所有 v3 commercial 容器都按 `agent` user 启动,HOME=`/home/agent`。codex CLI 写
+ * `/home/agent/.codex/generated_images/...`、`/api/uploads` 走 `/home/agent/.openclaude/
+ * uploads/...`、gateway 生图走 `/home/agent/.openclaude/generated/...` —— 都在此前缀下。
+ *
+ * 也覆盖 admin role:admin 用户在 v3 也有 agent_containers 行(确认 user id=1 active),
+ * 走同一容器 HOME 空间。
+ */
+const CONTAINER_HOME_PREFIX = '/home/agent/'
+
+/**
+ * 路径 sanity check —— **不是 ACL**,只挡明显扫描类路径。
+ *
+ * 真正访问授权由**容器内** `handleApiFile` 做(realpathSync + agentCwds + blocklist +
+ * fd recheck);master 端 predicate 把白名单收敛到 v3 容器 HOME 空间,避免攻击者通过
+ * 大量"明显非法路径"(`/etc/passwd` / `/var/log/...` / `/proc/...`)消耗 sign 配额 +
+ * proxy 转发资源。
+ *
+ * 接受:
+ *   - `/home/agent/...`(必须有后续路径,不能仅是目录 prefix)
+ *   - 不含 `..`(防路径 traversal,与 normalizeSignBatchInput 一致)
+ *   - 不含 NUL / control chars(`\x00-\x1F` + `\x7F`)—— signed URL、日志、proxy path
+ *     都不该承载这类字节,Codex 审计 round 3 建议补
+ *
+ * 拒绝:`/etc/...`、`/var/...`、`/proc/...`、`/root/...`、`/tmp/...`、`/home/agent`(无 slash)、
+ * `/home/agent/../etc/passwd`、`/home/agent/...png\0` 等。
+ *
+ * **路径空间约定**:此函数判定的是**容器内部**路径(不是 master host volume 路径)。
+ * 与上一版基于 `makeUserScopedMediaPredicate(loc.uploads, loc.generated)` 的 host-path
+ * 检查不同 —— 那一版把 host volume 路径塞进 container-side 数据通路,语义错位 →
+ * codex 合法路径全 drop。该 helper 是修正路径空间错位的根因 fix。
+ */
+export function isContainerPathAllowed(p: string): boolean {
+  if (!p.startsWith(CONTAINER_HOME_PREFIX)) return false
+  if (p.includes('..')) return false
+  // 拒绝 NUL/control chars(`\x00-\x1F` + DEL `\x7F`)—— 路径若含这类字节会成为
+  // log/header smuggling 与 fs API 兼容性陷阱。biome 误判正则中的控制字符为可疑,
+  // 这里就是要显式匹配它们,加 ignore。
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control-char screen
+  if (/[\x00-\x1F\x7F]/.test(p)) return false
+  return true
+}
+
+/**
  * 从 bridgeSecret (64-char lowercase hex, see bridgeSecret.ts)派生 MEDIA_SIGN_KEY。
  *
  * 调用方在 registerCommercial 中算一次,把返回的 Buffer 作为 deps 喂给 handlers。
@@ -175,7 +220,8 @@ export function verifySignedUrl(key: Buffer, input: VerifySignatureInput): Verif
  * 用 path + userId + ttlMs 构造一个 signed URL(URL-encoded p 形式,直接可作为 `<img src>`)。
  *
  * 调用方负责确保:
- *   - path 已经过 user-scoped predicate(本函数只做密码学层,不做路径授权)
+ *   - path 已经过容器路径 sanity check(`isContainerPathAllowed`)或等价的 caller-side
+ *     授权;本函数只做密码学层,不做路径授权 —— 真正 ACL 由容器内 handleApiFile 兜
  *   - userId 是 `c:<digits>` 形式
  */
 export function buildSignedUrl(
@@ -196,7 +242,7 @@ export function buildSignedUrl(
  * 校验 input paths array 的 shape —— 给 /api/media-sign handler 用。
  *
  * 返回 normalized + deduped 数组,或失败原因(handler 直接 400)。
- * 不做 user-scoped 谓词(那是 handler 在拿到 resolver 后做)。
+ * 不做容器路径前缀检查(那是 handler 在循环里调 `isContainerPathAllowed` 做的)。
  */
 export interface NormalizePathsResult {
   ok: true

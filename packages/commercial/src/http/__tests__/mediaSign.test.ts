@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { describe, test } from 'node:test'
+import { extractRawQueryParam } from '../handlers.js'
 import {
   MEDIA_SIGN_BATCH_MAX,
   buildSignedUrl,
   computeSignature,
   deriveMediaSignKey,
+  isContainerPathAllowed,
   normalizeSignBatchInput,
   verifySignedUrl,
 } from '../mediaSign.js'
-import { extractRawQueryParam } from '../handlers.js'
 
 const VALID_BRIDGE_SECRET = randomBytes(32).toString('hex') // 64-char lowercase hex
 const ALT_BRIDGE_SECRET = randomBytes(32).toString('hex')
@@ -56,7 +57,9 @@ describe('buildSignedUrl + verifySignedUrl roundtrip', () => {
   const key = deriveMediaSignKey(VALID_BRIDGE_SECRET)
 
   test('plain path roundtrip → ok', () => {
-    const { url, expMs } = buildSignedUrl(key, '/root/.openclaude/uploads/x.png', 'c:42')
+    // v1.0.131 起前端发的是容器内路径(`/home/agent/...`),master 不再做
+    // user-scoped host-volume ACL,签名 HMAC 本身对 abs path 形态不挑。
+    const { url, expMs } = buildSignedUrl(key, '/home/agent/.openclaude/uploads/x.png', 'c:42')
     const q = parseSignedQuery(url)
     // URLSearchParams auto-decodes values; check that the raw URL string contains
     // the percent-encoded form, and the decoded value matches.
@@ -68,12 +71,12 @@ describe('buildSignedUrl + verifySignedUrl roundtrip', () => {
     if (r.kind === 'ok') {
       assert.equal(r.userId, 'c:42')
       assert.equal(r.expMs, expMs)
-      assert.equal(r.decodedPath, '/root/.openclaude/uploads/x.png')
+      assert.equal(r.decodedPath, '/home/agent/.openclaude/uploads/x.png')
     }
   })
 
   test('path with special chars (spaces, unicode, &) → roundtrip ok', () => {
-    const path = '/root/.openclaude/generated/中文 & 空格 ?#.png'
+    const path = '/home/agent/.codex/generated_images/中文 & 空格 ?#.png'
     const { url } = buildSignedUrl(key, path, 'c:7')
     // Raw URL must percent-encode `&` to `%26`, else the query would split into
     // multiple params. We check the raw URL string before URLSearchParams parsing.
@@ -436,5 +439,62 @@ describe('extractRawQueryParam (no double-decode)', () => {
     })
     assert.equal(r.kind, 'ok')
     if (r.kind === 'ok') assert.equal(r.decodedPath, decodedPath)
+  })
+})
+
+// v1.0.131:server-side sanity check 取代 makeUserScopedMediaPredicate。
+// 这层故意粗:只挡明显扫描类路径(`/etc/passwd` / `/proc/...` / `..` traversal /
+// 控制字符注入),真正 ACL 由容器内 handleApiFile 把权威(realpathSync + agentCwds
+// + isFileAllowed)。详见 mediaSign.ts::isContainerPathAllowed 注释。
+describe('isContainerPathAllowed', () => {
+  test('allows /home/agent/.codex/generated_images/...', () => {
+    assert.equal(isContainerPathAllowed('/home/agent/.codex/generated_images/abc.png'), true)
+  })
+
+  test('allows /home/agent/.openclaude/uploads/...', () => {
+    assert.equal(isContainerPathAllowed('/home/agent/.openclaude/uploads/foo.jpg'), true)
+  })
+
+  test('rejects outside /home/agent/ prefix', () => {
+    assert.equal(isContainerPathAllowed('/etc/passwd'), false)
+    assert.equal(isContainerPathAllowed('/var/log/syslog'), false)
+    assert.equal(isContainerPathAllowed('/proc/self/environ'), false)
+    assert.equal(isContainerPathAllowed('/root/.ssh/id_rsa'), false)
+    // Host volume path 也应被拒 —— 旧版的 host path 不再合法
+    assert.equal(
+      isContainerPathAllowed('/var/lib/docker/volumes/oc-v3-data-u1/_data/uploads/x.png'),
+      false,
+    )
+  })
+
+  test('rejects /home/agent (no trailing slash) and /home/agent2/...', () => {
+    // Prefix 必须含尾 `/`,否则 `/home/agent2/...` 等会蒙混过关。
+    assert.equal(isContainerPathAllowed('/home/agent'), false)
+    assert.equal(isContainerPathAllowed('/home/agent2/x.png'), false)
+  })
+
+  test('rejects parent-traversal `..`', () => {
+    assert.equal(isContainerPathAllowed('/home/agent/../etc/passwd'), false)
+    assert.equal(isContainerPathAllowed('/home/agent/.codex/..'), false)
+    // 即使 traversal 被 resolvePath 折叠,我们仍然在折叠前的字面值里拒,
+    // defense-in-depth 不依赖 resolvePath 形态。
+    assert.equal(isContainerPathAllowed('/home/agent/..'), false)
+  })
+
+  test('rejects NUL / control-char injection', () => {
+    // log injection / header smuggling 类。Codex round 2 catch:即便 resolvePath
+    // 通过,也不应把 `\x00` / `\n` 等带到下游 fs / log。
+    assert.equal(isContainerPathAllowed('/home/agent/.codex/x\x00.png'), false)
+    assert.equal(isContainerPathAllowed('/home/agent/.codex/x\n.png'), false)
+    assert.equal(isContainerPathAllowed('/home/agent/.codex/x\r.png'), false)
+    assert.equal(isContainerPathAllowed('/home/agent/.codex/x\x1f.png'), false)
+    assert.equal(isContainerPathAllowed('/home/agent/.codex/x\x7f.png'), false)
+  })
+
+  test('rejects relative / empty / non-/home paths', () => {
+    assert.equal(isContainerPathAllowed(''), false)
+    assert.equal(isContainerPathAllowed('foo.png'), false)
+    assert.equal(isContainerPathAllowed('./home/agent/x.png'), false)
+    assert.equal(isContainerPathAllowed('home/agent/x.png'), false)
   })
 })

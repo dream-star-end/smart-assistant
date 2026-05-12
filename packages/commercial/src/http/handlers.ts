@@ -30,19 +30,18 @@ import { requireAuth } from "./auth.js";
 import { query } from "../db/queries.js";
 import { insertFeedback } from "../admin/feedback.js";
 import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
-import { requireUserVerifyDb } from "./requireUser.js";
+import { requireActiveAccountVerifyDb } from "./requireUser.js";
 import {
   buildSignedUrl,
   verifySignedUrl,
   normalizeSignBatchInput,
+  isContainerPathAllowed,
   DEFAULT_SIGN_TTL_MS,
 } from "./mediaSign.js";
 import { containerFileProxy } from "./containerFileProxy.js";
 import { defaultTunnelFetchHealthz } from "./tunnelHealthzProbe.js";
 import { getHostById as computePoolGetHostById } from "../compute-pool/queries.js";
 import { dialTunnelSocket as defaultTunnelDial } from "../compute-pool/nodeAgentClient.js";
-import type { UserMediaLocation } from "../agent-sandbox/userMedia.js";
-import { makeUserScopedMediaPredicate } from "@openclaude/gateway";
 import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLimitRedis } from "../middleware/rateLimit.js";
 import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
@@ -207,16 +206,6 @@ export interface CommercialHttpDeps {
    * rotate 改 `mediaSign.ts` 的 HKDF_INFO,旧 URL 全部失效。
    */
   mediaSignKey?: Buffer;
-  /**
-   * v3 multi-tenant `c:<uid>` → user docker volume {uploads, generated} 解析。
-   *
-   * 与 `RegisterCommercialResult.resolveUserMediaDirs` 同一函数,这里仅在
-   * `/api/media-sign` / `/api/media-signed` 内部用作 user-scoped path predicate
-   * 的输入(等价 gateway server.ts 的 `_resolveMediaDirs` 调用)。
-   *
-   * 未注入 → signed URL endpoints 返 503 SIGN_DISABLED。
-   */
-  resolveUserMediaDirs?: (userId: string) => Promise<UserMediaLocation>;
 }
 
 export interface RequestContext {
@@ -1491,8 +1480,9 @@ export async function handleReadAllInbox(
 //
 // 路径分工:
 //   - `POST /api/media-sign`(Bearer JWT 鉴权) → 输入路径数组,输出 path→signedUrl map
-//   - `GET  /api/media-signed?p=&u=&e=&s=` → 验签 + DB active + user-scoped predicate
-//     → req.url 改成 /api/file?path= + 调 containerFileProxy
+//   - `GET  /api/media-signed?p=&u=&e=&s=` → 验签 + DB active(user/admin)+ 容器路径
+//     sanity check(isContainerPathAllowed) → req.url 改成 /api/file?path= + 调
+//     containerFileProxy(真正 ACL 由容器内 handleApiFile 把权威)
 //
 // 维护期:两个路由都已加入 router.ts `prefixes` 数组,maintenance 闸门正常生效。
 
@@ -1537,7 +1527,7 @@ export function extractRawQueryParam(requestUrl: string, name: string): string |
 /**
  * POST /api/media-sign
  *
- * 鉴权:Bearer JWT(同 /api/me)+ requireUserVerifyDb(DB role='user' ∧ status='active')。
+ * 鉴权:Bearer JWT(同 /api/me)+ requireActiveAccountVerifyDb(DB role∈{user,admin} ∧ status='active')。
  * 入参 body: `{ paths: string[] }`(最多 32 条,见 normalizeSignBatchInput)。
  * 出参: `{ urls: Record<path, signedUrl>, expMs: number }`。
  *
@@ -1550,11 +1540,11 @@ export async function handleMediaSign(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  if (!deps.mediaSignKey || !deps.resolveUserMediaDirs) {
+  if (!deps.mediaSignKey) {
     throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
   }
   if (!deps.v3Supervisor) {
-    // requireUserVerifyDb 需要 pool;v3Supervisor 未装配 = 整 v3 还没起,503 更准确
+    // requireActiveAccountVerifyDb 需要 pool;v3Supervisor 未装配 = 整 v3 还没起,503 更准确
     throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
   }
 
@@ -1571,16 +1561,18 @@ export async function handleMediaSign(
   if (!claims) {
     throw new HttpError(401, "UNAUTHORIZED", "invalid or expired token");
   }
-  if (claims.role !== "user") {
-    // admin 不该用 signed URL(自有 oc_session 走 BLOCKED admin bypass);
-    // 拒绝避免给后台越权制造 signed URL 的途径。
-    throw new HttpError(403, "FORBIDDEN", "signed URL only for user role");
-  }
 
-  // DB double-check user is still active (JWT 没过期但用户已被 ban 时 sign 也拒)
-  const verified = await requireUserVerifyDb(claims.sub, deps.v3Supervisor.pool);
+  // user 和 admin 都允许 sign:cookie-free signed URL 的核心动机就是 iOS Safari +
+  // CF CDN 丢 oc_session;admin 在那个环境同样会丢 cookie,以前那条 "admin 走
+  // cookie bypass" 假设把 admin 直接锁出。admin/users 共用 active container 流程
+  // (id=1 admin DB 验过有 agent_containers active 行),路径空间一致。
+  const verified = await requireActiveAccountVerifyDb(
+    claims.sub,
+    ["user", "admin"],
+    deps.v3Supervisor.pool,
+  );
   if (!verified) {
-    throw new HttpError(403, "FORBIDDEN", "user account not active");
+    throw new HttpError(403, "FORBIDDEN", "account not active");
   }
 
   const body = (await readJsonBody(req)) as { paths?: unknown } | undefined;
@@ -1592,32 +1584,25 @@ export async function handleMediaSign(
     throw new HttpError(400, "VALIDATION", norm.message);
   }
 
-  // 解析当前用户的 uploads / generated dir
+  // 路径空间:**容器内部**(`/home/agent/...`),与 containerFileProxy 的 path
+  // forward 语义对齐。**不再**用 host-volume predicate —— 那一版把 master 的
+  // `/var/lib/docker/volumes/...` 路径塞进 container-side 数据通路,导致 codex
+  // 合法路径(`/home/agent/.codex/generated_images/...`)被全 drop。真正 ACL
+  // 由容器内 handleApiFile(realpathSync + agentCwds + blocklist + fd recheck)做。
   const userId = `c:${claims.sub}`;
-  const loc = await deps.resolveUserMediaDirs(userId);
-  if (loc.kind !== "ok") {
-    // not-ready / volume-missing / ambiguous / remote-host / daemon-error
-    // 前端拿到空 urls map 即按 cache miss / fallback 处理,不暴露内部状态。
-    sendJson(res, 200, { urls: {}, expMs: Date.now() });
-    return;
-  }
-  const allowed = makeUserScopedMediaPredicate(loc.uploads, loc.generated);
 
   const expMs = Date.now() + DEFAULT_SIGN_TTL_MS;
   const urls: Record<string, string> = {};
   for (const p of norm.paths) {
-    // realpath 不可用(handler 不该 stat 用户路径,谓词只做文本前缀)。直接 resolve
-    // 后用 predicate 做 user-scoped 闸门 —— 与 server.ts handleApiFile / handleMediaGet
-    // 一致(predicate 在 isFileAllowed 内是 textual scope,不替代 realpath open)。
     let resolved: string;
     try {
       resolved = resolvePath(p);
     } catch {
       continue;
     }
-    if (!allowed(resolved)) continue;
-    // sign 用 raw path(handler 端 decoded 后做 HMAC,verify 端 decodeURIComponent
-    // 后再算 HMAC,canonicalization 一致)
+    if (!isContainerPathAllowed(resolved)) continue;
+    // sign 用 raw 输入 path(handler 端 decoded 后做 HMAC,verify 端
+    // decodeURIComponent 后再算 HMAC,canonicalization 一致)
     const { url } = buildSignedUrl(deps.mediaSignKey, p, userId, DEFAULT_SIGN_TTL_MS);
     urls[p] = url;
   }
@@ -1630,8 +1615,9 @@ export async function handleMediaSign(
  * 公开端点(无需 cookie / Bearer),由 HMAC 签名 + 过期戳自证身份。
  * 验签通过 → 当作 `/api/file?path=<decodedPath>` 走 containerFileProxy。
  *
- * 不查 DB?——查。即使 JWT 没过期,用户可能被 ban → 不能因 signed URL 还在 TTL
- * 内就漏放。`requireUserVerifyDb(sub, pool)` 检验 role=user ∧ status=active。
+ * 不查 DB?——查。即使签 URL 时是 active,签后可能被 ban → 不能因 signed URL 还
+ * 在 TTL 内就漏放。`requireActiveAccountVerifyDb(sub, ['user','admin'], pool)`
+ * 双检 role 与 status=active。
  *
  * Cache-Control:仅当上游容器返 200/206 + 签名未过期 → public, max-age=剩余 TTL。
  * 4xx/5xx 维持 no-store(避免 CDN 缓存错误响应导致 token rotate 后无法刷新)。
@@ -1642,7 +1628,7 @@ export async function handleMediaSigned(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  if (!deps.mediaSignKey || !deps.resolveUserMediaDirs) {
+  if (!deps.mediaSignKey) {
     throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
   }
   if (!deps.v3Supervisor || !deps.bridgeSecret) {
@@ -1681,27 +1667,27 @@ export async function handleMediaSigned(
     throw new HttpError(400, "BAD_REQUEST", "signed URL: bad-user-id");
   }
 
-  // DB double-check user still active(签 URL 时是 active,签后被 ban → 现在拒)
-  const verified = await requireUserVerifyDb(sub, deps.v3Supervisor.pool);
+  // DB double-check user/admin still active(签 URL 时是 active,签后被 ban → 现在拒)
+  const verified = await requireActiveAccountVerifyDb(
+    sub,
+    ["user", "admin"],
+    deps.v3Supervisor.pool,
+  );
   if (!verified) {
-    throw new HttpError(403, "FORBIDDEN", "user account not active");
+    throw new HttpError(403, "FORBIDDEN", "account not active");
   }
 
-  // user-scoped predicate:即便签名有效,路径也必须仍在此用户的 volume 里。
-  // resolve(decodedPath) → 比较 uploads/generated 前缀。失败一律 403(不暴露 volume
-  // 是否存在的差异)。
-  const loc = await deps.resolveUserMediaDirs(userId);
-  if (loc.kind !== "ok") {
-    throw new HttpError(403, "FORBIDDEN", "signed URL path not authorized");
-  }
-  const allowed = makeUserScopedMediaPredicate(loc.uploads, loc.generated);
+  // Path sanity check —— **不是 ACL**,真正访问控制由容器内 handleApiFile 做
+  // (realpathSync + agentCwds + blocklist + fd recheck)。这里只挡明显扫描类路径
+  // (`/etc/passwd` / `/var/log/...` / `/proc/...`),粗白名单到 `/home/agent/...`。
+  // 详见 mediaSign.ts::isContainerPathAllowed 注释。
   let resolved: string;
   try {
     resolved = resolvePath(decodedPath);
   } catch {
     throw new HttpError(400, "BAD_REQUEST", "signed URL: bad-path");
   }
-  if (!allowed(resolved)) {
+  if (!isContainerPathAllowed(resolved)) {
     throw new HttpError(403, "FORBIDDEN", "signed URL path not authorized");
   }
 

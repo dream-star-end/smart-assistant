@@ -1366,9 +1366,14 @@ export async function registerCommercial(
     : undefined;
 
   // V3 multi-tenant media resolver(`c:<uid>` → user volume {uploads, generated})
-  // 一处创建,供两处复用:
-  //   1. 暴露给 gateway(`RegisterCommercialResult.resolveUserMediaDirs`,装配 _resolveMediaDirs)
-  //   2. 注入 handleMediaSign/handleMediaSigned(签 URL / 验签后做 user-scoped predicate)
+  // 仅暴露给 gateway(`RegisterCommercialResult.resolveUserMediaDirs`,装配
+  // _resolveMediaDirs 用于 /api/uploads 写路径)。
+  //
+  // v1.0.131 起 media-sign handler 不再用此 resolver:签 URL / 验签的路径都是
+  // 容器内 `/home/agent/...` 命名空间,master 侧只做 `isContainerPathAllowed`
+  // sanity check,真正 ACL 由 containerFileProxy 转发到容器内 handleApiFile
+  // (走 agentCwds + realpathSync + isFileAllowed) 把权威。
+  //
   // 装配条件同旧:agentRuntime 起得来(docker client 在手)。其他 fail-closed 分支
   // 由 resolver 自己返 kind='fail' + reason。
   const userMediaResolver = agentRuntime
@@ -1408,12 +1413,17 @@ export async function registerCommercial(
     // feature flag 控制 router 是否把 /api/file / /api/media/* 从 BLOCKED 拉进 PROXY 分支
     bridgeSecret,
     fileProxyEnabled: cfg.FILE_PROXY_ENABLED,
-    // v3 signed media URL —— HKDF 派生的 32-byte key + user-scoped predicate
-    // 所需的 resolver。任一缺失 → /api/media-sign 与 /api/media-signed 返 503,
-    // 前端拿到 null 即保持占位(透明 PNG / 空 src);**不退回 cookie 路径**,
-    // 那条 path 正是 iOS Safari 丢 cookie 的根因。详见上面 mediaSignKey 注释。
+    // v3 signed media URL —— HKDF 派生的 32-byte key。
+    // 缺失 → /api/media-sign 与 /api/media-signed 返 503,前端拿到 null 即保持占位
+    // (透明 PNG / 空 src);**不退回 cookie 路径**,那条 path 正是 iOS Safari 丢
+    // cookie 的根因。详见上面 mediaSignKey 注释。
+    //
+    // 旧版还往这里注入 resolveUserMediaDirs(把 container 路径反解到 host volume
+    // 路径再用 makeUserScopedMediaPredicate 做 ACL),v1.0.131 起删除:容器路径与
+    // 主机路径同时存在导致两侧语义错位,真正 ACL 由容器内 handleApiFile (走
+    // agentCwds + realpathSync + isFileAllowed) 把权威,master 侧只做 sanity check
+    // (isContainerPathAllowed)。
     mediaSignKey,
-    resolveUserMediaDirs: userMediaResolver,
     // v1.0.120 feat/codex-disable-rebind:透传给 admin/accounts handler 的
     // adminPatchAccount ctx,active→disabled 转移触发 fanout actor。
     triggerCodexDisableFanout,
@@ -1971,8 +1981,10 @@ export async function registerCommercial(
     // V3 multi-tenant media resolver — 只有 agentRuntime 起得来(docker client 在手)
     // 才注入;否则 gateway 自动回退 paths.{uploads,generated}Dir(单租户兼容)。
     // 详见 RegisterCommercialResult 注释。
-    // **同 closure 也注入了 createCommercialHandler.resolveUserMediaDirs**,
-    // 让 /api/media-sign / /api/media-signed handler 拿到同一 resolver。
+    //
+    // 注:v1.0.131 起 createCommercialHandler 不再消费此 resolver(media-sign 改用
+    // 容器内 ACL),所以唯一消费者是 gateway 自己的 /api/uploads 写路径(由 gateway
+    // 持有这个 closure 调 _resolveMediaDirs)。
     resolveUserMediaDirs: userMediaResolver,
     // textual 谓词,无依赖,始终暴露 —— 仅供 orphan sweep 启动时按目录壳子
     // 迭代 user volumes 用。**不要**给 HTTP allowlist 用(cross-tenant IDOR)。

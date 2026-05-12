@@ -176,10 +176,17 @@ export interface ContainerFileProxyDeps {
 }
 
 /**
- * 主入口。调用方(router)确保:
+ * 主入口。调用方确保:
  *   - url.pathname ∈ {/api/file, /api/media/*}
  *   - method === GET
- *   - JWT 已验过 + sub === uid + role === 'user' + DB status === 'active'
+ *   - 调用者(身份 = `uid`)已在 DB `status === 'active'`
+ *   - role:取决于上游 caller —
+ *       * router.ts 的 PROXY 分支只放 role === 'user'(admin fall-through 到 BLOCKED bypass)
+ *       * handleMediaSigned 直接调本函数,role ∈ {'user', 'admin'} —— signed URL 既给
+ *         user 用也给 admin 用,uid 就是 token 内 sub,真正 ACL 由容器内 handleApiFile
+ *         (realpathSync + agentCwds + isFileAllowed) 把权威。
+ *   - 不同 path/role 矩阵的具体收口由各调用方 (router/handleMediaSigned) 各自闭合,
+ *     本函数只信任传入的 `uid` 是已认证身份。
  */
 export async function containerFileProxy(
   req: IncomingMessage,
