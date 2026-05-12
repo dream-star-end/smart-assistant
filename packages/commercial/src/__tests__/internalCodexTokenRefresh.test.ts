@@ -223,6 +223,18 @@ function makeDeps(
       expires_at: new Date(Date.now() + 3600_000),
       plan: 'pro',
     }),
+    // v1.0.120 feat/codex-disable-rebind:M1 in-turn rebind 默认 stub。
+    // 多数旧 case 走"happy refreshFn"分支(accountStatus='active'),不会触发
+    // M1 路径,这两个 stub 只在 status!=active 的新 case 才会被调用。
+    // 默认返 pool_empty —— 保留旧 case "非 active → 422 ACCOUNT_NOT_ACTIVE"
+    // 的可观察结果(老测试用例只断 status code,与新语义"pool 空"匹配)。
+    acquireAndPickInTxFn: async () => ({ kind: 'pool_empty' }) as const,
+    commitCodexRebindInTxFn: async () => { /* not reached when pool_empty */ },
+    fetchSnapshotAndWriteContainerAuthFn: async () => ({
+      accessToken: FRESH_ACCESS_TOKEN,
+      chatgptAccountId: null,
+      lastRefreshIso: new Date().toISOString(),
+    }),
     ...overrides,
   }
 }

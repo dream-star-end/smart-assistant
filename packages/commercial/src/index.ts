@@ -37,16 +37,23 @@ import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } fr
 import {
   AccountScheduler,
   ContainerStaleBindingError,
-  pickCodexAccountForBinding,
+  pickCodexAccountForBindingInTx,
 } from "./account-pool/scheduler.js";
-import { getCodexTokenSnapshot } from "./account-pool/store.js";
+import {
+  type WriteAuthDeps,
+  commitCodexRebindInTx,
+  fetchSnapshotAndWriteContainerAuth,
+} from "./account-pool/codexLazyMigrate.js";
+import {
+  type CodexDisableFanoutDeps,
+  enqueueCodexDisableFanout,
+} from "./account-pool/codexDisableFanout.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
 import { writeCodexContainerAuthFile } from "./codex-auth/codexAuthFile.js";
 import {
   putRemoteCodexContainerAuth,
   deleteRemoteCodexContainerAuth,
 } from "./codex-auth/remoteCodexAuth.js";
-import { zeroBuffer } from "./crypto/keys.js";
 import { tx } from "./db/queries.js";
 import { createAgentWsHandler, type AgentWsHandler } from "./ws/agent.js";
 import {
@@ -648,6 +655,17 @@ export async function registerCommercial(
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
   };
+  // v1.0.120 feat/codex-disable-rebind:fanoutDeps 依赖 v3Deps.putRemoteCodexAuth,
+  // 必须在 v3Deps 装配后(line ~1067)才能赋值;但 proxy / codex token refresh
+  // handler / commercialHttpDeps 在更早就要拿到 trigger 闭包,故用 ref 打破先后。
+  //
+  // 装配前到达的事件(理论不可能,proxy 接请求前 v3Deps 已就绪)走 noop。
+  const triggerCodexDisableFanoutRef: { current: (accountId: bigint) => void } = {
+    current: () => { /* fanoutDeps 还没装好,静默丢弃 */ },
+  };
+  const triggerCodexDisableFanout = (accountId: bigint): void => {
+    triggerCodexDisableFanoutRef.current(accountId);
+  };
   // D.1b: self host uuid 取失败只降级多机路径(proxy / v3Deps.containerService /
   // baselineServer),不牵连整个 commercial 启动。多处共用,提前一次性取。
   let selfHostUuid: string | undefined;
@@ -683,7 +701,9 @@ export async function registerCommercial(
         //   `deps.refreshDeps && pick.expires_at && shouldRefresh(...)` 永远 false,
         // OAuth token 过期后不会自动 refresh,结果上游直接 401。
         // health 注入进来是为了 refresh 失败时按规约走 health.manualDisable。
-        refreshDeps: { health: healthTracker },
+        // v1.0.120:triggerCodexDisableFanout 注入 — disableOnFailure 内部
+        // 按 provider 二次过滤,claude 账号 refresh 失败不会误触发 codex fanout。
+        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
         // 真实扣费积分推送 —— proxy 在 finalize.commit 后调,通过 bridge 把
         // outbound.cost_charged 帧发给用户。bridge 启动顺序在 proxy 之后,
         // 故用 ref 打破先后(构造期调用是 noop,请求期 bridge 必已 wire)。
@@ -752,7 +772,9 @@ export async function registerCommercial(
         selfHostId: selfHostUuid,
         // refreshDeps 注入 healthTracker — 保持与 anthropicProxy 一致(失败走
         // health.manualDisable 路径)。
-        refreshDeps: { health: healthTracker },
+        // v1.0.120:triggerCodexDisableFanout — codex token refresh 失败 disable
+        // 后立刻 fanout rebind 其他活跃容器,避免老 token 仍被 codex CLI 沿用。
+        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
         db: {
           // 注:两处都 LEFT JOIN claude_accounts 取 ca.status,以让 handler
           // 拒刷 disabled/quarantined/已删 账号 — 见 codex round 2 BLOCKER#2。
@@ -1195,6 +1217,35 @@ export async function registerCommercial(
     );
   }
 
+  // v1.0.120 feat/codex-disable-rebind:fanoutDeps 装配 —— admin disable codex
+  // 账号 / refresh.ts 401 自动 disable 后触发后台 actor,把仍绑该账号的容器
+  // rebind 到新 active 账号(M2 强一致路径)。
+  //
+  // 单机 / v3Deps 未装(测试 / 无 docker)时 putRemoteCodexAuth 为 undefined,
+  // 走本地 fs 写;若实际 row.host_uuid 是远端但 helper 未注入,
+  // fetchSnapshotAndWriteContainerAuth 会抛错 → tx ROLLBACK,符合强一致语义。
+  {
+    const codexContainerDirForFanout =
+      process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
+    const fanoutDeps: CodexDisableFanoutDeps = {
+      writeAuth: {
+        selfHostId: v3Deps?.selfHostId ?? null,
+        containerUid: V3_AGENT_UID,
+        containerGid: V3_AGENT_GID,
+        codexContainerDir: codexContainerDirForFanout,
+        putRemoteCodexAuth: v3Deps?.putRemoteCodexAuth,
+      },
+      concurrency: 4,
+      logger: rootLogger.child({
+        subsys: "commercial",
+        module: "codexDisableFanout",
+      }),
+    };
+    triggerCodexDisableFanoutRef.current = (accountId: bigint) => {
+      enqueueCodexDisableFanout(accountId, fanoutDeps);
+    };
+  }
+
   // V3 多机路由:启动 BaselineServer,给远端 node-agent 提供
   // /internal/v3/baseline-{version,tarball} 端点。只在 v3Deps + selfHostUuid
   // 都就绪时起(多机 wiring 前置条件),失败不阻断 gateway —— remote host 拉
@@ -1320,6 +1371,9 @@ export async function registerCommercial(
     // feature flag 控制 router 是否把 /api/file / /api/media/* 从 BLOCKED 拉进 PROXY 分支
     bridgeSecret,
     fileProxyEnabled: cfg.FILE_PROXY_ENABLED,
+    // v1.0.120 feat/codex-disable-rebind:透传给 admin/accounts handler 的
+    // adminPatchAccount ctx,active→disabled 转移触发 fanout actor。
+    triggerCodexDisableFanout,
   });
 
   // T-52 /ws/agent:仅在 agent runtime 就绪时启用。
@@ -1570,7 +1624,29 @@ export async function registerCommercial(
               return { kind: "active", account_id: BigInt(row.account_id) };
             }
             // disabled / quarantined / 任意非 active → lazy migrate
-            const picked = await pickCodexAccountForBinding(String(containerId), {});
+            //
+            // v1.0.120 feat/codex-disable-rebind:把"pick + snapshot + write +
+            // UPDATE"这一段 inlined IO 抽到 `codexLazyMigrate` 模块,与 M1
+            // (`internalCodexTokenRefresh` in-turn 自愈)+ M2(`codexDisableFanout`
+            // 后台 actor)共享同一组 helper。三条路径都靠 `acquireAndPickInTx` 做
+            // FOR UPDATE 锁 + 决策,`commitCodexRebindInTx` 做 UPDATE,
+            // `fetchSnapshotAndWriteContainerAuth` 做"读 token snapshot + 本地或
+            // 远端写 per-container auth.json"。
+            //
+            // acquire 仍走**强一致**(tx 内 pick + write + UPDATE 一同 COMMIT):
+            //   - acquire 是用户 inbound 触发,单容器单流,不像 reverse-RPC 那样
+            //     burst,持锁 IO 开销可接受
+            //   - 写失败 → tx ROLLBACK → row 仍指 disabled 账号 → 下次 inbound 再 acquire
+            //     重试,与本次失败前状态一致(无孤儿 auth.json,因为是先写后 UPDATE
+            //     的强一致,但 helper 顺序是 fetch+write → UPDATE,write 成功 → UPDATE
+            //     失败极少,失败时 auth.json 是已落盘的新 token 孤儿。**新版顺序略
+            //     变**:之前是 write → UPDATE 同 tx;现在是 helper write(物理文件 IO,
+            //     非 PG)→ commitCodexRebindInTx UPDATE → tx COMMIT。物理文件 IO 之前
+            //     与之后整体语义不变,孤儿 auth.json 行为同 v1.0.72 注释)
+            //   - 持锁的 60s remote PUT 风险 v1.0.115 出现过:但当时是
+            //     internalCodexTokenRefresh burst,acquire 路径单容器单流不重复;
+            //     accept 同型权衡
+            const picked = await pickCodexAccountForBindingInTx(client, String(containerId));
             if (!picked) {
               throw new Error(
                 `codex pool empty during lazy migrate for container ${containerId}`,
@@ -1578,62 +1654,29 @@ export async function registerCommercial(
             }
             const codexContainerDir =
               process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
-            // v1.0.72 host 路由:row.host_uuid 决定本次 lazy migrate 写本地还是远端。
-            //   - selfHostId 未注入(单机 monolith)→ 一律本地(没多机能力,行 host_uuid
-            //     非空也当本地写,避免 tx ROLLBACK 把 row stuck 在 NULL 触发 stale 死循环)
-            //   - host_uuid IS NULL(单机 monolith legacy 行)→ 本地 fs 写
-            //   - host_uuid == selfHostId → 本地 fs 写
-            //   - host_uuid != selfHostId → 远端 helper 写
-            //   - 远端但 putRemoteCodexAuth 未注入 → 抛错 → tx ROLLBACK,picker 不消耗
-            const selfHostIdForLazy = v3DepsForCodex?.selfHostId ?? null;
-            const isLocal =
-              selfHostIdForLazy === null
-              || row.host_uuid === null
-              || row.host_uuid === selfHostIdForLazy;
-            let snap: Awaited<ReturnType<typeof getCodexTokenSnapshot>> = null;
-            try {
-              snap = await getCodexTokenSnapshot(picked.account_id);
-              if (!snap || !snap.token) {
-                throw new Error(
-                  `codex token snapshot missing for account ${String(picked.account_id)}`,
-                );
-              }
-              const accessToken = snap.token.toString("utf8");
-              const lastRefreshIso = new Date().toISOString();
-              if (isLocal) {
-                await writeCodexContainerAuthFile({
-                  rootDir: codexContainerDir,
-                  containerId: String(containerId),
-                  containerUid: V3_AGENT_UID,
-                  containerGid: V3_AGENT_GID,
-                  auth: { accessToken, lastRefreshIso },
-                });
-              } else {
-                if (!v3DepsForCodex?.putRemoteCodexAuth) {
-                  throw new Error(
-                    `lazy migrate: remote host ${row.host_uuid} but putRemoteCodexAuth not wired`,
-                  );
-                }
-                await v3DepsForCodex.putRemoteCodexAuth(
-                  row.host_uuid as string,
-                  String(containerId),
-                  accessToken,
-                  lastRefreshIso,
-                );
-              }
-            } finally {
-              if (snap?.token) zeroBuffer(snap.token);
-              if (snap?.refresh) zeroBuffer(snap.refresh);
-            }
+            // v1.0.72 host 路由由 helper 内部决定(完全同 selfHostId / host_uuid / putRemote
+            // 三选一逻辑,见 codexLazyMigrate.fetchSnapshotAndWriteContainerAuth);
+            // 远端 helper 未注入抛错 → tx ROLLBACK,与之前行为一致。
+            const writeAuthDeps: WriteAuthDeps = {
+              selfHostId: v3DepsForCodex?.selfHostId ?? null,
+              containerUid: V3_AGENT_UID,
+              containerGid: V3_AGENT_GID,
+              codexContainerDir,
+              putRemoteCodexAuth: v3DepsForCodex?.putRemoteCodexAuth,
+            };
+            // 用 client 传入 helper → 走 in-tx snapshot,**不**申请第二个 PG client
+            // (避免 burst 时撑大 pool 占用)。
+            await fetchSnapshotAndWriteContainerAuth({
+              accountId: picked.account_id,
+              containerId,
+              hostUuidUnderLock: row.host_uuid,
+              deps: writeAuthDeps,
+              client,
+            });
             // FOR UPDATE 持锁内 UPDATE,COMMIT 时一同落盘。失败 → tx 抛出 → ROLLBACK
             // (写入的 auth.json 是孤儿,由 stopAndRemoveV3Container / volume gc / 同
             //  containerId 重 provision 覆盖兜底,与 v3supervisor provision 路径同处理)
-            await client.query(
-              `UPDATE agent_containers
-               SET codex_account_id = $1, updated_at = NOW()
-               WHERE id = $2`,
-              [String(picked.account_id), containerId],
-            );
+            await commitCodexRebindInTx(client, containerId, picked.account_id);
             return { kind: "active", account_id: picked.account_id };
           });
           if (result === null) return null;

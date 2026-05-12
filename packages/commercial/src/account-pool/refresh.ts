@@ -158,6 +158,18 @@ export interface RefreshDeps {
    * 否则走默认出口。chat orchestrator 应该按账号 egress_proxy 构造后透传进来。
    */
   dispatcher?: unknown
+  /**
+   * v1.0.120 feat/codex-disable-rebind:`disableOnFailure` 把账号标 disabled
+   * 之后,异步触发 fanout actor —— 把仍绑该账号的容器主动 rebind 到新 active
+   * 账号(否则容器要等下条 user inbound 才会触发 acquire 的 lazy migrate)。
+   *
+   * fire-and-forget;trigger 函数内部自己 swallow 错误。
+   * 未注入(单测 / 早期 boot)= 静默忽略,acquire / M1 兜底。
+   *
+   * 注:trigger 不区分 provider — 只在 codex 路径(`refreshCodexAccountToken`
+   * 失败)被调,refresh.ts 内部已经隔离了 codex/anthropic 调用路径。
+   */
+  triggerCodexDisableFanout?: (accountId: bigint) => void
 }
 
 /**
@@ -250,22 +262,38 @@ async function disableOnFailure(
     // 同一 reason + 同一分钟 → 合并
     dedupe_key: `account_pool.token_refresh_failed:${reason}:${new Date().toISOString().slice(0, 16)}`,
   })
+  let disabled = false
   if (deps.health) {
     try {
       await deps.health.manualDisable(accountId, reason)
+      disabled = true
     } catch {
       /* 禁用尽力而为,不要把 refresh 的原错误覆盖掉 */
     }
-    return
+  } else {
+    try {
+      await updateAccount(
+        accountId,
+        { status: 'disabled', last_error: reason },
+        deps.keyFn ?? loadKmsKey,
+      )
+      disabled = true
+    } catch {
+      /* 同理 */
+    }
   }
-  try {
-    await updateAccount(
-      accountId,
-      { status: 'disabled', last_error: reason },
-      deps.keyFn ?? loadKmsKey,
-    )
-  } catch {
-    /* 同理 */
+
+  // v1.0.120 feat/codex-disable-rebind:disable 落库后 fire-and-forget 触发
+  // fanout actor。fanout actor 内部用 `WHERE provider = 'codex'` 做二次确认,
+  // claude 账号传进来也只是查一下 DB → 立刻 return,无副作用。
+  // disable 自身失败(上面两个 catch)就不 fanout —— 状态没变,fanout 也没意义。
+  if (disabled && deps.triggerCodexDisableFanout !== undefined) {
+    try {
+      deps.triggerCodexDisableFanout(BigInt(accountId))
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[refresh] triggerCodexDisableFanout threw:', err)
+    }
   }
 }
 
@@ -493,6 +521,10 @@ export interface RefreshCodexDeps {
   health?: AccountHealthTracker
   /** 出口 dispatcher;codex 账号也可走 ProxyAgent 走代理(本 PR codex 暂不接,见 plan 决策 U)。 */
   dispatcher?: unknown
+  /** v1.0.120 feat/codex-disable-rebind:同 RefreshDeps.triggerCodexDisableFanout
+   *  —— refresh 失败 disableOnFailure 后触发 fanout actor rebind 仍绑该账号的活跃
+   *  容器(见 refresh.ts disableOnFailure 实现)。 */
+  triggerCodexDisableFanout?: (accountId: bigint) => void
 }
 
 const refreshCodexInflight = new Map<string, Promise<RefreshedTokens>>()

@@ -166,6 +166,17 @@ export interface CommercialHttpDeps {
    * handler 调用方不需要 try/catch。详见 agent-sandbox/v3prewarm.ts JSDoc。
    */
   prewarmContainer?: (uid: bigint) => void;
+  /**
+   * v1.0.120 feat/codex-disable-rebind:admin 把 codex 账号从 active 改成
+   * disabled 时,主动触发 fanout actor —— 把仍绑该账号的活跃容器 rebind 到
+   * 新 active 账号。
+   *
+   * 装配:`registerCommercial` 启动期闭包 fanoutDeps 后注入。未注入 = 单测 /
+   * 早期 boot,acquire / M1 自愈兜底。
+   *
+   * 透传给 adminPatchAccount 的 AdminAuditCtx.triggerCodexDisableFanout。
+   */
+  triggerCodexDisableFanout?: (accountId: bigint) => void;
 }
 
 export interface RequestContext {

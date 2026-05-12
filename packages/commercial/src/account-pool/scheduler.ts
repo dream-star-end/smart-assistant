@@ -19,9 +19,10 @@
  */
 
 import { createHash } from 'node:crypto'
-import type { QueryResultRow } from 'pg'
+import type { PoolClient, QueryResultRow } from 'pg'
 import { AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
+import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
 import type { AccountHealthTracker } from './health.js'
 import {
@@ -504,16 +505,39 @@ export interface PickCodexBindingDeps {
   hash?: (s: string) => bigint
 }
 
-export async function pickCodexAccountForBinding(
+/**
+ * pickCodexAccountForBinding 的返回值。
+ *
+ * v3 plan(feat/codex-disable-rebind):返回值含 `plan` —— M1 in-turn 自愈
+ * 后要在响应里塞 `chatgptPlanType`,picker SQL 本就查了 plan,顺手带出避免
+ * caller 再查一次。
+ */
+export interface PickedCodexBinding {
+  account_id: bigint
+  plan: AccountPlan
+}
+
+/**
+ * In-tx 版本 —— 用调用方持有的 `PoolClient` 跑 SELECT,**不申请第二个 pool
+ * client**。callers:
+ *   - `userChatBridge.codexBinding.acquire` 的 tx
+ *   - M1 `internalCodexTokenRefresh` 的 in-turn lazy migrate tx
+ *   - M2 `codexDisableFanout` 的 migrate tx
+ *
+ * 旧的 `pickCodexAccountForBinding(sessionId)` 改为 thin wrapper,保留给
+ * provision-time(无 tx 上下文)用。
+ */
+export async function pickCodexAccountForBindingInTx(
+  client: PoolClient,
   sessionId: string,
   deps: PickCodexBindingDeps = {},
-): Promise<{ account_id: bigint } | null> {
+): Promise<PickedCodexBinding | null> {
   if (!sessionId || sessionId.length === 0) {
-    throw new TypeError('sessionId required for pickCodexAccountForBinding')
+    throw new TypeError('sessionId required for pickCodexAccountForBindingInTx')
   }
   const hash = deps.hash ?? defaultHash
 
-  const res = await query<{ id: string; plan: AccountPlan; health_score: number }>(
+  const res = await client.query<{ id: string; plan: AccountPlan; health_score: number }>(
     `SELECT id::text AS id, plan, health_score
      FROM claude_accounts
      WHERE status = 'active' AND provider = 'codex'
@@ -533,5 +557,24 @@ export async function pickCodexAccountForBinding(
       bestIdx = i
     }
   }
-  return { account_id: BigInt(res.rows[bestIdx].id) }
+  return {
+    account_id: BigInt(res.rows[bestIdx].id),
+    plan: res.rows[bestIdx].plan,
+  }
+}
+
+/**
+ * Thin wrapper —— 不在 tx 上下文中(如 provisionV3Container)使用。
+ * 自申请 pool client、释放。tx 内绝不要调用此函数,改用 `pickCodexAccountForBindingInTx`。
+ */
+export async function pickCodexAccountForBinding(
+  sessionId: string,
+  deps: PickCodexBindingDeps = {},
+): Promise<PickedCodexBinding | null> {
+  const client = await getPool().connect()
+  try {
+    return await pickCodexAccountForBindingInTx(client, sessionId, deps)
+  } finally {
+    client.release()
+  }
 }

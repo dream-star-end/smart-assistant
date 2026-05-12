@@ -60,6 +60,18 @@ export interface AdminAuditCtx {
   userAgent?: string | null;
   /** 可选:审计写失败回调(生产应挂监控)。默认 stderr。 */
   onAuditError?: (err: unknown) => void;
+  /**
+   * v1.0.120 feat/codex-disable-rebind:codex 账号被 admin 改成 disabled
+   * 时主动触发 fanout actor —— 把仍绑该账号的活跃容器 rebind 到新 active 账号。
+   *
+   * 不在本模块直接 import `enqueueCodexDisableFanout` 是为了避免 admin 包反向
+   * 依赖 account-pool 的运行时单例(fanout 依赖 selfHostId / putRemoteCodexAuth
+   * 这些只能在 `registerCommercial` 启动期组装的 deps)。改由 index.ts wiring
+   * 阶段闭包注入。
+   *
+   * 未注入 = 静默忽略(测试 / 单进程小型部署),由 acquire / M1 兜底。
+   */
+  triggerCodexDisableFanout?: (accountId: bigint) => void;
 }
 
 function defaultAuditErrorLog(err: unknown): void {
@@ -402,6 +414,33 @@ export async function adminPatchAccount(
 
   const after = await storeUpdate(id, storePatch);
   if (!after) throw new AccountNotFoundError(id);
+
+  // v1.0.120 feat/codex-disable-rebind:status active→disabled 且 provider='codex'
+  // → 触发 fanout actor 把绑该账号的容器 rebind。
+  //
+  // 触发条件刻意收紧到 active→disabled(非 disabled→任意 / cooldown→disabled 等):
+  //   - active→disabled 是"用户主动停用"的语义信号,需要主动 fanout
+  //   - cooldown/banned→disabled 不需要(账号本来就不可用,acquire/M1 已在兜底)
+  //   - 重复 disabled→disabled 不触发(idempotent 保护)
+  //
+  // 仅 codex provider —— claude 账号 disable 后 anthropic 直连路径有自己的 retry
+  // + scheduler 重选机制,不需要主动 fanout。
+  //
+  // ctx.triggerCodexDisableFanout 未注入(单测 / 早期 boot)→ 静默 skip。
+  if (
+    after.provider === "codex"
+    && patch.status === "disabled"
+    && before.status === "active"
+    && ctx.triggerCodexDisableFanout !== undefined
+  ) {
+    try {
+      ctx.triggerCodexDisableFanout(after.id);
+    } catch (err) {
+      // 严格 fire-and-forget — 触发失败不能影响 admin patch 主流程
+      // eslint-disable-next-line no-console
+      console.warn("[admin/accounts] triggerCodexDisableFanout threw:", err);
+    }
+  }
 
   // 0038 — egress_host_uuid 在 storeUpdate 之后(独立 SQL 不进 store.ts patch 路径)。
   // 显式 UUID 的 eligibility 已在前文预校验,此处只剩极低概率 race(校验后 host

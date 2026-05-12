@@ -24,7 +24,8 @@
  *   - 本模块只管 CRUD + 加密/解密
  */
 
-import type { QueryResultRow } from "pg";
+import type { PoolClient, QueryResultRow } from "pg";
+import { getPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { encrypt, decryptToBuffer, AeadError } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
@@ -735,11 +736,22 @@ interface RawCodexSecretRow extends QueryResultRow {
   oauth_expires_at: Date | null;
 }
 
-export async function getCodexTokenSnapshot(
+/**
+ * In-tx 版本 —— 用调用方持有的 `PoolClient` 跑 SELECT,**不申请第二个 pool
+ * client**。callers:
+ *   - M2 `codexDisableFanout` 的 migrate tx(tx 内 snapshot + write + UPDATE
+ *     强一致路径,N=4 限流,可接受持锁 IO)
+ *
+ * 旧的 `getCodexTokenSnapshot(id)` 改为 thin wrapper,保留给 tx 外路径
+ * (provision / refresh actor / M1 in-turn lazy migrate 的 post-commit
+ * fetch)使用。
+ */
+export async function getCodexTokenSnapshotInTx(
+  client: PoolClient,
   id: bigint | string,
   keyFn: () => Buffer = loadKmsKey,
 ): Promise<CodexTokenSnapshot | null> {
-  const res = await query<RawCodexSecretRow>(
+  const res = await client.query<RawCodexSecretRow>(
     `SELECT id::text AS id, provider,
        oauth_token_enc, oauth_nonce,
        oauth_refresh_enc, oauth_refresh_nonce,
@@ -780,5 +792,21 @@ export async function getCodexTokenSnapshot(
     throw err instanceof AeadError ? err : new AeadError("decryption failed", { cause: err });
   } finally {
     zeroBuffer(key);
+  }
+}
+
+/**
+ * Thin wrapper —— 不在 tx 上下文中使用。自申请 pool client、释放。
+ * tx 内绝不要调用此函数,改用 `getCodexTokenSnapshotInTx`。
+ */
+export async function getCodexTokenSnapshot(
+  id: bigint | string,
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<CodexTokenSnapshot | null> {
+  const client = await getPool().connect();
+  try {
+    return await getCodexTokenSnapshotInTx(client, id, keyFn);
+  } finally {
+    client.release();
   }
 }

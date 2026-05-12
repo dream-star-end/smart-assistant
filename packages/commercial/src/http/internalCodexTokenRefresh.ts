@@ -118,6 +118,13 @@ import type { PoolClient } from 'pg'
 import { z } from 'zod'
 
 import {
+  type LazyMigrateOutcome,
+  type WriteAuthDeps,
+  acquireAndPickInTx,
+  commitCodexRebindInTx,
+  fetchSnapshotAndWriteContainerAuth,
+} from '../account-pool/codexLazyMigrate.js'
+import {
   type RefreshCodexDeps,
   RefreshError,
   refreshCodexAccountToken,
@@ -232,6 +239,12 @@ export interface CodexTokenRefreshHandlerDeps {
   logger?: Logger
   /** Date.now override for tests. */
   now?: () => number
+  /** v1.0.120 feat/codex-disable-rebind:M1 in-turn rebind 三 helper 注入点。
+   *  生产用默认 import,单测 stub 出来避免 `client.query(null)`(test fake 的
+   *  txWithLock 通常传 null client)。 */
+  acquireAndPickInTxFn?: typeof acquireAndPickInTx
+  commitCodexRebindInTxFn?: typeof commitCodexRebindInTx
+  fetchSnapshotAndWriteContainerAuthFn?: typeof fetchSnapshotAndWriteContainerAuth
 }
 
 export interface CodexTokenRefreshHandlerCtx {
@@ -252,6 +265,10 @@ export function makeCodexTokenRefreshHandler(
     subsys: 'internalCodexTokenRefresh',
   })
   const refreshFn = deps.refreshFn ?? refreshCodexAccountToken
+  const acquireAndPickInTxFn = deps.acquireAndPickInTxFn ?? acquireAndPickInTx
+  const commitCodexRebindInTxFn = deps.commitCodexRebindInTxFn ?? commitCodexRebindInTx
+  const fetchAndWriteFn =
+    deps.fetchSnapshotAndWriteContainerAuthFn ?? fetchSnapshotAndWriteContainerAuth
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res)
@@ -354,29 +371,193 @@ export function makeCodexTokenRefreshHandler(
       sendJsonError(res, 404, 'NO_BOUND_ACCOUNT', 'container has no codex account bound', requestId)
       return
     }
+    // `accountId` is the account we'll proceed to refresh + write for.
+    // Default is the bound account from initialRow; M1 in-turn rebind may
+    // override it below (already_active fall-through). `let` (not `const`)
+    // for that reason.
+    let accountId: bigint = initialRow.codexAccountId
+
     if (initialRow.accountStatus !== 'active') {
-      // Bound account is disabled / quarantined / vanished. Refusing here
-      // closes the loophole that would let reverse-refresh keep updating an
-      // already-disabled account's auth.json, bypassing lazy-migrate's
-      // rebind-on-non-active rule (acquire() in index.ts:1497).
-      // Surfacing 422 ACCOUNT_NOT_ACTIVE → codex retries on next turn → the
-      // turn enters acquire() → lazy migrate picks an active account → new
-      // auth.json is written under acquire's own FOR UPDATE.
-      userLog.warn('account_not_active', {
+      // M1 in-turn self-heal (plan v3 feat/codex-disable-rebind):
+      //
+      // Previously this returned 422 ACCOUNT_NOT_ACTIVE and relied on the
+      // next user inbound to trigger acquire()'s lazy migrate. But when the
+      // disable comes from admin (DB-only — OpenAI still honors the old
+      // token), codex CLI never sees a 401 → never re-issues this RPC →
+      // acquire path doesn't run between turns → user's current turn just
+      // fails. So we now actively pick a fresh active account here.
+      //
+      // Consistency model is **weak** (M1): tx-inner pick + UPDATE; tx-outer
+      // fetch+write. Write failure leaves row=new, auth=old; the next 401
+      // burst hits the happy refreshFn path (row.status now active) and
+      // self-heals auth.json. We accept this trade for not holding a PG row
+      // lock through a 60s remote node-agent PUT (v1.0.115 wedge).
+      //
+      // The strong-consistency counterpart is M2 codexDisableFanout: that
+      // runs as a background N=4 actor when the account disable event
+      // fires, so it can safely keep the file write inside the tx.
+      userLog.warn('account_not_active_attempt_inturn_rebind', {
         codexAccountId: String(initialRow.codexAccountId),
         accountStatus: initialRow.accountStatus ?? '(null)',
         previousAccountId: bodyCtx.previousAccountId ?? null,
       })
-      sendJsonError(
-        res,
-        422,
-        'ACCOUNT_NOT_ACTIVE',
-        'bound codex account is not active; container will be migrated on next turn',
-        requestId,
-      )
-      return
+
+      let outcome: LazyMigrateOutcome
+      try {
+        outcome = await deps.db.txWithLock(
+          identity.containerId,
+          async (client, _row) => {
+            // `_row` from txWithLock is ignored — acquireAndPickInTx does
+            // its own SELECT ... FOR UPDATE OF ac. Re-locking the same row
+            // in the same tx is a no-op in PG (already held), so the second
+            // SELECT is just a cheap re-read with the latest visible state.
+            const o = await acquireAndPickInTxFn(client, identity.containerId, BigInt(uid))
+            if (o.kind === 'rebound') {
+              await commitCodexRebindInTxFn(client, identity.containerId, o.newAccountId)
+            }
+            return o
+          },
+        )
+      } catch (err) {
+        userLog.error('inturn_rebind_tx_threw', { err: err as Error })
+        sendJsonError(res, 500, 'INTERNAL', 'in-turn lazy migrate tx failed', requestId)
+        return
+      }
+
+      switch (outcome.kind) {
+        case 'pool_empty':
+          // No active codex account anywhere — same observable outcome as the
+          // old 422 path, but log distinct so ops can tell "pool empty"
+          // from "transient drift".
+          userLog.warn('inturn_rebind_pool_empty')
+          sendJsonError(
+            res,
+            422,
+            'ACCOUNT_NOT_ACTIVE',
+            'codex account pool empty; no active account to migrate to',
+            requestId,
+          )
+          return
+        case 'vanished':
+          userLog.warn('inturn_rebind_container_vanished_under_lock')
+          sendJsonError(
+            res,
+            409,
+            'CONTAINER_BINDING_CHANGED',
+            'container row vanished during in-turn migrate',
+            requestId,
+          )
+          return
+        case 'state_inactive':
+          userLog.warn('inturn_rebind_state_inactive_under_lock')
+          sendJsonError(
+            res,
+            409,
+            'CONTAINER_BINDING_CHANGED',
+            'container state changed during in-turn migrate',
+            requestId,
+          )
+          return
+        case 'user_mismatch':
+          // Same semantics as happy-path step 6: a userId change under the
+          // lock is treated as binding drift, not as an auth failure.
+          userLog.error('inturn_rebind_user_mismatch_under_lock')
+          sendJsonError(
+            res,
+            409,
+            'CONTAINER_BINDING_CHANGED',
+            'container user_id changed during in-turn migrate',
+            requestId,
+          )
+          return
+        case 'no_bound_account':
+          // codex_account_id became NULL between the unlocked initial read
+          // and the FOR UPDATE — extremely rare admin race. Match the
+          // earlier-in-handler null-bound path.
+          userLog.warn('inturn_rebind_no_bound_account_under_lock')
+          sendJsonError(
+            res,
+            404,
+            'NO_BOUND_ACCOUNT',
+            'container codex_account_id became NULL during in-turn migrate',
+            requestId,
+          )
+          return
+        case 'rebound': {
+          // tx already committed row.codex_account_id = newAccountId.
+          // Now write per-container auth.json OUTSIDE the tx — same reason
+          // as the happy path step 6b (v1.0.115 wedge: don't pin a PG row
+          // lock through remote node-agent IO).
+          const writeAuthDeps: WriteAuthDeps = {
+            selfHostId: deps.selfHostId,
+            containerUid: deps.containerUid,
+            containerGid: deps.containerGid,
+            codexContainerDir: deps.codexContainerDir,
+            putRemoteCodexAuth: deps.fileWriter.writeRemote,
+            writeLocalFn: deps.fileWriter.writeLocal,
+          }
+          let written: Awaited<ReturnType<typeof fetchSnapshotAndWriteContainerAuth>>
+          try {
+            written = await fetchAndWriteFn({
+              accountId: outcome.newAccountId,
+              containerId: identity.containerId,
+              hostUuidUnderLock: outcome.hostUuidUnderLock,
+              deps: writeAuthDeps,
+            })
+          } catch (err) {
+            // row has been committed to newAccountId already; auth.json is
+            // still the old token. Next OpenAI 401 → reverse-refresh hits
+            // this endpoint again → initialRow.accountStatus = 'active'
+            // (new account) → happy refreshFn path → auth.json gets the new
+            // token. User's CURRENT turn fails; they may need to manually
+            // resend. Plan v3 accepts this as the M1 weak-consistency
+            // self-heal trade-off.
+            userLog.error('inturn_rebind_write_failed', {
+              err: err as Error,
+              newAccountId: String(outcome.newAccountId),
+            })
+            sendJsonError(
+              res,
+              500,
+              'FILE_WRITE_FAILED',
+              'auth.json write failed after in-turn rebind; retry',
+              requestId,
+            )
+            return
+          }
+          userLog.info('inturn_rebind_ok', {
+            newAccountId: String(outcome.newAccountId),
+            chatgptAccountId: written.chatgptAccountId ?? '(unparseable)',
+            plan: outcome.plan,
+          })
+          sendJsonOk(
+            res,
+            200,
+            {
+              accessToken: written.accessToken,
+              // codex protocol marks chatgptAccountId as required string;
+              // empty fallback matches the happy-path's same fallback.
+              chatgptAccountId: written.chatgptAccountId ?? '',
+              chatgptPlanType: outcome.plan,
+            },
+            requestId,
+          )
+          return
+        }
+        case 'already_active': {
+          // A concurrent path (M2 fanout / another acquire) already migrated
+          // the row to an active account between our initial unlocked read
+          // and this FOR UPDATE. Fall through to the happy refresh path,
+          // targeting that new account.
+          userLog.info('inturn_rebind_already_active_concurrent', {
+            newAccountId: String(outcome.currentAccountId),
+          })
+          accountId = outcome.currentAccountId
+          break
+        }
+      }
     }
-    const accountId = initialRow.codexAccountId
+
     const accountLog = userLog.child({
       codexAccountId: String(accountId),
       reason: bodyCtx.reason,
