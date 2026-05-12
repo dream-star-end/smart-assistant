@@ -1972,6 +1972,11 @@ function _refreshMsgTime(el, msg) {
 export function renderMessage(msg, skipRichBlocks = false) {
   const main = ensureInner()
   const el = _buildMessageEl(msg)
+  // Register in the keyed-reconcile WeakMap so a subsequent
+  // renderMessages() (e.g., after sync) sees this row as already
+  // mounted and skips rebuilding it. Without this, every streaming
+  // append + sync cycle would still flash on this row.
+  _renderedMsgEls.set(msg, el)
   // Keep the typing indicator pinned at the bottom — if it is currently visible,
   // insert new messages above it instead of appending after it.
   const typing = main.querySelector('.typing-indicator')
@@ -2088,20 +2093,184 @@ export function renderMetaInto(container, metaText) {
   }
 }
 
+// ── DOM reconcile state for renderMessages() ─────────────────────────────
+// `_renderedMsgEls` is the keyed-reconcile bookkeeping for the messages
+// pane: it maps the in-memory msg object reference to its rendered DOM
+// element. We use object identity (not msg.id) as the key intentionally:
+//
+//  - Phase 1 sync.js's `_mergeServerWithLocalSuperset` returns the SAME
+//    reference for any msg the server delivered with identical content
+//    (via `_overlayServerAuthoritative`'s no-change fast path). So when
+//    a sync replaces `sess.messages`, msg refs that didn't actually
+//    change are preserved → `_renderedMsgEls.get(msg)` finds the
+//    existing DOM node and we skip the rebuild entirely (no flash).
+//  - When server-authoritative fields DID change (usage backfill,
+//    truncated flag, etc.) the merger returns a NEW object — same id,
+//    different ref. WeakMap miss → we look up by `[data-msg-id]` and
+//    patch in-place via `updateMessageEl()`.
+//  - When a brand-new msg appears (cross-device, server-only row)
+//    nothing in the WeakMap or DOM matches → we `_buildMessageEl()`
+//    and insert.
+//
+// WeakMap means entries are GC'd automatically when a msg object goes
+// out of scope (e.g., session deleted, conversation truncated by the
+// PUT strip path), so we don't need explicit cleanup.
+let _renderedMsgEls = new WeakMap()
+// Track session-id and overflow-pagination boundary so we can fall back
+// to full wipe-and-rebuild on transitions where reconcile semantics
+// would be wrong (different session = different msg-id namespace; load-
+// more closure captures msgs array → stale after reconcile).
+let _renderedSessionId = null
+let _renderedHadOverflow = false
+let _renderedWasEmpty = false
+
+const _RENDER_MAX_INITIAL = 100
+
+// Reset reconcile state — called when we know the DOM is being wiped
+// outside of the normal renderMessages() flow (e.g., session switch
+// via main.js, or test resets).
+export function _resetRenderReconcile() {
+  _renderedMsgEls = new WeakMap()
+  _renderedSessionId = null
+  _renderedHadOverflow = false
+  _renderedWasEmpty = false
+}
+
+// Diff the desired msg list against current DOM children of `.messages-inner`.
+// Reuses elements by `_renderedMsgEls` (same ref → no work) or by
+// `[data-msg-id]` (same id, different ref → updateMessageEl). Walks once
+// in desired order, moving / inserting / building as needed; then removes
+// any stale msg elements that didn't match a desired msg.
+//
+// Returns `true` if any DOM mutation occurred (caller may need to refresh
+// rich blocks). Returns `false` if every desired msg matched an existing
+// element by ref (a true no-op pass — common when sync replaces the
+// messages array with the same refs everywhere).
+function _reconcileMessages(inner, desired) {
+  // Index current msg-id DOM children once for the by-id fallback path.
+  const idToEl = new Map()
+  for (const child of inner.children) {
+    const id = child.dataset?.msgId
+    if (id) idToEl.set(id, child)
+  }
+  let mutated = false
+  // Track which DOM elements survived this pass; everything else
+  // (with a data-msg-id) is a candidate for removal at the end.
+  const kept = new Set()
+  // Anchor walks forward through inner.children, matching the desired
+  // order. When the current anchor matches the desired element we
+  // advance; otherwise we insertBefore the desired and leave anchor
+  // pointing at the same node (so the next desired msg compares against
+  // it again).
+  let anchor = inner.firstChild
+  // Skip non-msg leading children (load-more button, typing-indicator
+  // is normally at the end but be defensive).
+  while (anchor && !anchor.dataset?.msgId) anchor = anchor.nextSibling
+  for (const msg of desired) {
+    let el = _renderedMsgEls.get(msg)
+    if (el && el.parentNode !== inner) el = null  // stale GC artifact
+    if (!el) {
+      const existing = idToEl.get(msg.id)
+      if (existing) {
+        // Same id, different ref → server-authoritative fields changed
+        // or streaming-tail content shifted. Patch in place rather than
+        // wholesale rebuild so collapsed-tool-card state and any
+        // scroll position inside long messages are preserved.
+        // Bind the new ref to the existing DOM BEFORE updateMessageEl
+        // so any inner querySelector by msg-id continues to work.
+        _renderedMsgEls.set(msg, existing)
+        try {
+          updateMessageEl(msg, false)
+          el = existing
+          // updateMessageEl mutated the DOM (text/blocks/status). Surface that
+          // through `mutated` so the caller's scrollBottom-on-wasAtBottom and
+          // processRichBlocks() both fire — a same-id patch can still change
+          // message height, e.g. streaming overlay added a token or
+          // _overlayServerAuthoritative attached a usage row.
+          mutated = true
+        } catch (err) {
+          console.warn('[renderMessages] updateMessageEl failed during reconcile, falling back to rebuild', err)
+          // Patch failed — replace wholesale. If existing was the
+          // current anchor, advance anchor to a stable sibling BEFORE
+          // detaching it, so the position-walk below can still find
+          // its bearings without dereferencing a detached node.
+          el = _buildMessageEl(msg)
+          if (anchor === existing) anchor = existing.nextSibling
+          existing.replaceWith(el)
+          _renderedMsgEls.set(msg, el)
+          mutated = true
+        }
+      } else {
+        // Brand-new row.
+        el = _buildMessageEl(msg)
+        _renderedMsgEls.set(msg, el)
+        mutated = true
+      }
+    }
+    kept.add(el)
+    // Position: if anchor === el, advance. Else insert/move el before anchor.
+    if (anchor === el) {
+      anchor = anchor.nextSibling
+      while (anchor && !anchor.dataset?.msgId) anchor = anchor.nextSibling
+    } else {
+      inner.insertBefore(el, anchor)
+      mutated = true
+      // Don't advance anchor — we want the next desired msg compared
+      // against the same DOM node again (which is now after `el`).
+    }
+  }
+  // Remove leftover msg children that weren't matched. Non-msg children
+  // (typing-indicator, load-more button) are skipped by the dataset
+  // guard, preserving them.
+  for (const child of [...inner.children]) {
+    if (!child.dataset?.msgId) continue
+    if (kept.has(child)) continue
+    child.remove()
+    mutated = true
+  }
+  return mutated
+}
+
 export function renderMessages() {
-  // Cleanup Chart.js instances before DOM wipe
-  clearChartInstances()
   const main = $('messages')
-  main.innerHTML = ''
   const s = getSession()
   if (!s) {
+    // No active session: wipe and reset reconcile state.
+    clearChartInstances()
+    main.innerHTML = ''
+    _resetRenderReconcile()
     $('session-title').textContent = '无会话'
     $('session-sub').textContent = ''
     return
   }
+  const isEmpty = s.messages.length === 0
+  const hasOverflow = s.messages.length > _RENDER_MAX_INITIAL
+  // Decide whether reconcile or full rebuild applies. Full rebuild is
+  // required when:
+  //   - session id changed (different msg-id namespace; reconcile would
+  //     leak stale DOM from prior chat),
+  //   - we're entering or leaving empty-state (the empty-state branding
+  //     card is structurally different from the messages-inner tree),
+  //   - we're entering or leaving overflow mode (the load-more closure
+  //     captures `msgs` at render time; on reconcile the captured
+  //     reference would be stale).
+  // `.messages-inner` may be missing on first render after a hard
+  // navigation — treat that as full rebuild too.
+  const inner = main.querySelector('.messages-inner')
+  const needsFullRebuild =
+    !inner ||
+    _renderedSessionId !== s.id ||
+    _renderedWasEmpty !== isEmpty ||
+    _renderedHadOverflow !== hasOverflow
   $('session-title').textContent = s.title
   updateSessionSub(s)
-  if (s.messages.length === 0) {
+  if (isEmpty) {
+    // Empty-state path is always a full wipe — the empty starter-card
+    // tree is structurally different from `.messages-inner` and there's
+    // nothing reconcilable here anyway (zero messages).
+    clearChartInstances()
+    main.innerHTML = ''
+    _resetRenderReconcile()
     const empty = document.createElement('div')
     empty.className = 'empty-state'
     const _ai = state.agentsList.find((a) => a.id === (s.agentId || state.defaultAgentId))
@@ -2145,64 +2314,139 @@ export function renderMessages() {
     }
     empty.appendChild(grid)
     main.appendChild(empty)
+    _renderedSessionId = s.id
+    _renderedHadOverflow = hasOverflow
+    _renderedWasEmpty = isEmpty
     return
   }
-  const inner = document.createElement('div')
-  inner.className = 'messages-inner'
-  main.appendChild(inner)
-  // Performance: only render last 100 messages; show "load more" for older ones
-  const MAX_INITIAL = 100
-  const msgs = s.messages
-  if (msgs.length > MAX_INITIAL) {
-    const LOAD_BATCH = 50
-    let _loadedUpTo = msgs.length - MAX_INITIAL // index: messages before this are not yet rendered
-    const loadMore = document.createElement('button')
-    loadMore.className = 'load-more-btn'
-    loadMore.textContent = `加载更早的 ${_loadedUpTo} 条消息`
-    const _doLoadMore = () => {
-      const batchStart = Math.max(0, _loadedUpTo - LOAD_BATCH)
-      const batchEnd = _loadedUpTo
-      if (batchStart >= batchEnd) return
-      const scrollBefore = main.scrollHeight
-      const frag = document.createDocumentFragment()
-      for (let i = batchStart; i < batchEnd; i++) {
+  // Non-empty path.
+  if (needsFullRebuild) {
+    // Tear down: Chart.js needs explicit cleanup before innerHTML wipe,
+    // and we must invalidate the WeakMap because surviving msg refs
+    // would otherwise point at orphan DOM nodes.
+    clearChartInstances()
+    main.innerHTML = ''
+    _renderedMsgEls = new WeakMap()
+    const innerNew = document.createElement('div')
+    innerNew.className = 'messages-inner'
+    main.appendChild(innerNew)
+    const msgs = s.messages
+    if (hasOverflow) {
+      // Overflow path: explicit "load older messages" pagination.
+      // Full rebuild only fires when the overflow boundary is crossed
+      // (≤MAX_INITIAL ↔ >MAX_INITIAL). Steady-state overflow→overflow
+      // renders take the reconcile branch below. The load-more
+      // `_doLoadMore` closure captures the `msgs` array at THIS render
+      // — Phase 1 sync's ref-preserving merger means older msg refs
+      // (which load-more re-renders) stay valid across syncs unless
+      // server-authoritative fields changed, in which case the WeakMap
+      // entry is updated on reconcile and the next load-more click
+      // would still find the correct DOM via _renderedMsgEls. Worst
+      // case (server replaced an older msg ref): user clicks load-more
+      // and sees the stale content for that one row until next full
+      // rebuild — acceptable trade-off.
+      const LOAD_BATCH = 50
+      let _loadedUpTo = msgs.length - _RENDER_MAX_INITIAL
+      const loadMore = document.createElement('button')
+      loadMore.className = 'load-more-btn'
+      loadMore.textContent = `加载更早的 ${_loadedUpTo} 条消息`
+      const _doLoadMore = () => {
+        const batchStart = Math.max(0, _loadedUpTo - LOAD_BATCH)
+        const batchEnd = _loadedUpTo
+        if (batchStart >= batchEnd) return
+        const scrollBefore = main.scrollHeight
+        const frag = document.createDocumentFragment()
+        for (let i = batchStart; i < batchEnd; i++) {
+          const el = _buildMessageEl(msgs[i])
+          _renderedMsgEls.set(msgs[i], el)
+          frag.appendChild(el)
+        }
+        _loadedUpTo = batchStart
+        if (_loadedUpTo > 0) {
+          loadMore.textContent = `加载更早的 ${_loadedUpTo} 条消息`
+          loadMore.after(frag)
+        } else {
+          loadMore.replaceWith(frag)
+        }
+        processRichBlocks()
+        main.scrollTop += main.scrollHeight - scrollBefore
+      }
+      loadMore.onclick = _doLoadMore
+      if (window.IntersectionObserver) {
+        const obs = new IntersectionObserver(
+          ([entry]) => {
+            if (entry.isIntersecting) {
+              obs.disconnect()
+              _doLoadMore()
+            }
+          },
+          { root: main },
+        )
+        obs.observe(loadMore)
+      }
+      innerNew.appendChild(loadMore)
+      for (let i = msgs.length - _RENDER_MAX_INITIAL; i < msgs.length; i++) {
         const el = _buildMessageEl(msgs[i])
-        frag.appendChild(el)
+        _renderedMsgEls.set(msgs[i], el)
+        innerNew.appendChild(el)
       }
-      _loadedUpTo = batchStart
-      if (_loadedUpTo > 0) {
-        // Still more to load -- update button text and keep it
-        loadMore.textContent = `加载更早的 ${_loadedUpTo} 条消息`
-        loadMore.after(frag)
-      } else {
-        // All loaded -- remove button
-        loadMore.replaceWith(frag)
+    } else {
+      for (const m of msgs) {
+        const el = _buildMessageEl(m)
+        _renderedMsgEls.set(m, el)
+        innerNew.appendChild(el)
       }
-      processRichBlocks()
-      main.scrollTop += main.scrollHeight - scrollBefore
     }
-    loadMore.onclick = _doLoadMore
-    // Auto-load when scrolled to top (IntersectionObserver)
-    if (window.IntersectionObserver) {
-      const obs = new IntersectionObserver(
-        ([entry]) => {
-          if (entry.isIntersecting) {
-            obs.disconnect()
-            _doLoadMore()
-          }
-        },
-        { root: main },
-      )
-      obs.observe(loadMore)
-    }
-    inner.appendChild(loadMore)
-    for (let i = msgs.length - MAX_INITIAL; i < msgs.length; i++) renderMessage(msgs[i], true)
+    processRichBlocks()
+    // Full rebuild wiped the user's scroll position; bring them back to
+    // the bottom (the conversational expectation after a re-render).
+    scrollBottom(true)
   } else {
-    for (const m of msgs) renderMessage(m, true)
+    // Reconcile path — same session, same overflow / empty mode.
+    // Compute the desired msg list. For ≤MAX_INITIAL it's the whole
+    // array; for overflow we preserve whatever load-more revealed
+    // (=current DOM-resident msg ids) plus the trailing window.
+    const msgs = s.messages
+    let desired
+    if (hasOverflow) {
+      // Build desired = (msgs already in DOM, in their original
+      // s.messages order) ∪ (trailing window). Anything beyond what
+      // load-more had revealed stays hidden; the latest tail still
+      // gets included.
+      const visibleIds = new Set()
+      for (const child of inner.children) {
+        const id = child.dataset?.msgId
+        if (id) visibleIds.add(id)
+      }
+      const tailStart = msgs.length - _RENDER_MAX_INITIAL
+      desired = []
+      for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i]
+        if (!m?.id) continue
+        if (i >= tailStart || visibleIds.has(m.id)) desired.push(m)
+      }
+    } else {
+      desired = msgs
+    }
+    // Capture scroll-anchor before reconcile so we can decide whether
+    // to keep position or auto-scroll. Mobile streaming-end flash is
+    // partly because the wipe-and-rebuild forced scrollBottom; in
+    // reconcile we want to respect where the user is reading.
+    const wasAtBottom = isAtBottom()
+    const mutated = _reconcileMessages(inner, desired)
+    if (mutated) {
+      processRichBlocks()
+      // Only re-anchor to bottom if the user was already there (or if
+      // a turn is streaming and they haven't manually scrolled up —
+      // scrollBottom's internal guard handles that). Crucially we do
+      // NOT force-scroll here: the whole point of reconcile is to
+      // preserve the visual frame across sync events.
+      if (wasAtBottom) scrollBottom(false)
+    }
   }
-  // Batch process all rich blocks once instead of per-message
-  processRichBlocks()
-  scrollBottom(true)
+  _renderedSessionId = s.id
+  _renderedHadOverflow = hasOverflow
+  _renderedWasEmpty = isEmpty
 }
 
 export function updateSessionSub(s) {

@@ -430,13 +430,37 @@ if (!_MSG_SERVER_AUTHORITATIVE_KEYS_SRC) {
   throw new Error('_MSG_SERVER_AUTHORITATIVE_KEYS const not found in sync.js source')
 }
 
+// 2026-05-12 §3.x — pushSessionToServer 409 分支改走
+// _mergeServerWithLocalSuperset + _rebuildBlockMaps 而不是原地 overlay,
+// 这两个 helper(及它们的传递依赖 _overlayServerAuthoritative /
+// _isStreamingTail / 两个常量)也必须 extract 进闭包,否则集成测试一进
+// 409 路径就 ReferenceError。常量是 module-level const,跟
+// _MSG_EPHEMERAL_KEYS 同样模式抓。
+const _SERVER_AUTH_KEYS_SRC =
+  /const\s+_SERVER_AUTH_KEYS\s*=\s*\[[\s\S]*?\]/.exec(SYNC_SRC)?.[0] ?? ''
+const _STREAMING_TAIL_GRACE_MS_SRC =
+  /const\s+STREAMING_TAIL_GRACE_MS\s*=\s*\d+/.exec(SYNC_SRC)?.[0] ?? ''
+if (!_SERVER_AUTH_KEYS_SRC) {
+  throw new Error('_SERVER_AUTH_KEYS const not found in sync.js source')
+}
+if (!_STREAMING_TAIL_GRACE_MS_SRC) {
+  throw new Error('STREAMING_TAIL_GRACE_MS const not found in sync.js source')
+}
+
 const _pushFnSrc =
   _MSG_EPHEMERAL_KEYS_SRC + '\n' +
   _MSG_SERVER_AUTHORITATIVE_KEYS_SRC + '\n' +
+  _SERVER_AUTH_KEYS_SRC + '\n' +
+  _STREAMING_TAIL_GRACE_MS_SRC + '\n' +
   extractTopLevelFn(SYNC_SRC, '_stripMessageEphemeral') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_stableStringify') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localDominates') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_overlayServerAuthoritative') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_isStreamingTail') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_mergeServerWithLocalSuperset') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_rebuildBlockMaps') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_overlayServerOntoLocalDominant') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers') + '\n' +
   extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')
 
@@ -560,16 +584,78 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     assert.equal(sess._syncedAt, 2000)
     // Callbacks
     assert.equal(deps.conflictCb.length, 1)
-    // local-dominates tag tells the UI to SKIP renderMessages() — local
-    // messages are preserved in this branch (the whole point of the fix),
-    // so only sidebar re-render is needed. Regressing this tag repaints
-    // the whole messages pane on every 409 and flickers the UI during
-    // long streaming turns that legitimately hit multiple 409s in a row.
+    // local-dominates tag tells the UI which resolver branch fired. main.js
+    // now calls renderMessages() unconditionally (WeakMap reconcile makes
+    // that cheap on unchanged sessions and is required to surface the
+    // _overlayServerAuthoritative fresh-ref usage/_seq overlays). The tag
+    // is preserved for telemetry / future divergent UI behavior.
     assert.equal(deps.conflictCb[0].mode, 'local-dominates')
     assert.equal(deps.retryCb.length, 1)
     assert.equal(deps.retryCb[0], sessId)
     // dbPut persisted
     assert.equal(deps.dbCalls.length, 1)
+  })
+
+  // ── Codex round 1 regression (2026-05-12) ──
+  // Bug: the 409 local-dominates branch was calling _mergeServerWithLocalSuperset
+  // (server timeline + fresh-streaming-tail only), which dropped any local
+  // suffix row that wasn't role=assistant/thinking within 5s grace. That meant
+  // user messages, tool rows, and old assistant rows beyond server's last
+  // index would silently vanish, then dbPut() persisted the truncated transcript.
+  // Fix: dedicated _overlayServerOntoLocalDominant that preserves the full
+  // local suffix and only overlays server-auth metadata on the matching prefix.
+  it('preserves non-streaming local suffix (user/tool rows) through 409 resolution', async () => {
+    const sessId = 'sess-suffix'
+    const userMsg1 = { id: 'u1', role: 'user', text: 'first' }
+    const sharedAsst = { id: 'a1', role: 'assistant', text: 'reply' }
+    // Local suffix: a stale-ts user + a tool row. Neither would survive
+    // _isStreamingTail (wrong role) — must NOT be dropped on local-dominates.
+    const localUserSuffix = { id: 'u2', role: 'user', text: 'follow-up question' }
+    const localToolSuffix = { id: 't1', role: 'tool', text: 'tool output' }
+
+    const sess: any = {
+      id: sessId,
+      title: 't',
+      messages: [userMsg1, sharedAsst, localUserSuffix, localToolSuffix],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
+    }
+
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId,
+        title: 't',
+        // Server only knows the first two — local has just appended u2 + t1
+        // and hadn't yet pushed them when the 409 fired.
+        messages: [userMsg1, { id: 'a1', role: 'assistant', text: 'reply', _seq: 2 }],
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'a',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps)(sess)
+
+    // The mode must be local-dominates (local IS a superset)
+    assert.equal(deps.conflictCb[0].mode, 'local-dominates')
+    // ALL four local rows preserved — this is the bug-fix assertion
+    assert.equal(sess.messages.length, 4, 'local suffix u2 + t1 must NOT be dropped')
+    assert.deepEqual(
+      sess.messages.map((m: any) => m.id),
+      ['u1', 'a1', 'u2', 't1'],
+    )
+    assert.equal(sess.messages[2].text, 'follow-up question')
+    assert.equal(sess.messages[3].text, 'tool output')
+    // Prefix overlay: a1 got server's _seq
+    assert.equal(sess.messages[1]._seq, 2)
+    // _dirty stays true so the follow-up retry PUT pushes u2 + t1 up
+    assert.equal(sess._dirty, true)
   })
 
   it('retry cap: after 3 retries, 4th 409 does NOT trigger another retry', async () => {
@@ -955,9 +1041,13 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     assert.equal(sess._syncedAt, 2000)
     // Streaming pointer: old ref was a-old which is NOT in new messages → cleared
     assert.equal(sess._streamingAssistant, null, 'orphan streaming pointer must be cleared')
-    // Runtime maps invalidated
-    assert.equal(sess._blockIdToMsgId, null)
-    assert.equal(sess._agentGroups, null)
+    // Runtime maps eagerly rebuilt to match the new server messages
+    // (the old behavior was to null them out; superset-merge now keeps them
+    //  in lockstep so downstream code never sees a stale or null map).
+    assert.ok(sess._blockIdToMsgId instanceof Map, '_blockIdToMsgId must be rebuilt')
+    assert.equal(sess._blockIdToMsgId.size, 0, 'no blocks in server msg → empty map')
+    assert.ok(sess._agentGroups instanceof Map, '_agentGroups must be rebuilt')
+    assert.equal(sess._agentGroups.size, 0)
     // Retry cap reset on server-wins
     assert.equal(sess._conflictRetryCount, 0)
     // Search index rebuilt & conflict callback fired

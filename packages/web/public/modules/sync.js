@@ -158,6 +158,237 @@ export function _localDominates(serverMessages, localMessages) {
   return true
 }
 
+// Server-authored fields that may be patched on the server independently
+// of message text (usage backfill via pending_usage_patches, _seq re-allocation
+// when a server-authored row was substituted by Phase 0.1 takeover, etc.).
+// When local-supersedes wins on text, we still overlay these from server.
+const _SERVER_AUTH_KEYS = ['_seq', '_source', 'usage', '_truncated', '_errorCode', '_errorDetail']
+
+/**
+ * Overlay server-authoritative metadata onto a local message that won
+ * the supersede check on text. Returns the original `localMsg` reference
+ * unchanged when no field differs (so WeakMap-keyed DOM reconcile can
+ * detect "no content change" and skip an `updateMessageEl()` re-render),
+ * or a fresh `{ ...localMsg, ...changedFields }` when at least one field
+ * differs (so reconcile detects ref change and re-renders).
+ *
+ * Why returning the same ref when unchanged matters: messages.js's
+ * incremental render reconcile uses object identity (WeakMap) as its
+ * "is this DOM node still up-to-date" signal. Always allocating a new
+ * object would defeat the optimization, churning DOM for unchanged rows.
+ *
+ * Why `status` is gated on `_source==='server'`: same rationale as the
+ * legacy 409 in-place overlay at sync.js:~819 — `user` and client-mirrored
+ * assistant statuses (sending/sent/read) are client-owned UI flags; only
+ * server-authored rows carry authoritative terminal status (completed,
+ * interrupted) that should overlay.
+ */
+export function _overlayServerAuthoritative(localMsg, serverMsg) {
+  if (!localMsg || !serverMsg) return localMsg
+  let changed = false
+  let overlay = null
+  for (const k of _SERVER_AUTH_KEYS) {
+    if (serverMsg[k] !== undefined && serverMsg[k] !== localMsg[k]) {
+      if (!overlay) overlay = {}
+      overlay[k] = serverMsg[k]
+      changed = true
+    }
+  }
+  if (serverMsg._source === 'server' &&
+      serverMsg.status !== undefined &&
+      serverMsg.status !== localMsg.status) {
+    if (!overlay) overlay = {}
+    overlay.status = serverMsg.status
+    changed = true
+  }
+  return changed ? { ...localMsg, ...overlay } : localMsg
+}
+
+/**
+ * Grace window (ms) for retaining a local-only trailing assistant/thinking
+ * message that the server tape hasn't acknowledged yet. WS deltas land in
+ * the client typically sub-second before the server-side tape write
+ * finalizes; 5s comfortably covers slow tape or transient backlog while
+ * letting truly stale (cross-device-deleted, page-reload-revived) tails
+ * fall through to server-wins on the next sync.
+ *
+ * Tuned with `msg.completedAt || msg.ts` (both populated by addMessage /
+ * the per-frame stamp at websocket.js:~2021), so no new field is needed
+ * and IDB persistence is naturally self-healing: a stale tail loaded from
+ * IDB has `completedAt` minutes/hours old → first sync immediately drops it.
+ */
+const STREAMING_TAIL_GRACE_MS = 5000
+
+export function _isStreamingTail(msg, now) {
+  if (!msg) return false
+  if (msg.role !== 'assistant' && msg.role !== 'thinking') return false
+  const hasContent =
+    (typeof msg.text === 'string' && msg.text.length > 0) ||
+    (Array.isArray(msg.childBlocks) && msg.childBlocks.length > 0)
+  if (!hasContent) return false
+  const ts =
+    typeof msg.completedAt === 'number' ? msg.completedAt :
+    typeof msg.ts === 'number' ? msg.ts : 0
+  return (now - ts) < STREAMING_TAIL_GRACE_MS
+}
+
+/**
+ * Merge `serverMsgs` and `localMsgs` per-row, producing a new array that
+ * preserves the "client streaming tail" extension while otherwise keeping
+ * server-wins semantics. The output replaces the result of the legacy
+ * `messages: server.messages || []` overwrite at the three sync paths
+ * (full fetch, partial fetch, 409 resolution).
+ *
+ * Algorithm:
+ *
+ *   1. For each server message s (in server order):
+ *      - If local has same-id `l` AND `_localMessageSupersedes(l, s)` →
+ *        push `_overlayServerAuthoritative(l, s)` (keeps local text/ref
+ *        when both equal, else returns a fresh object so the DOM
+ *        reconcile picks up the server-auth metadata change).
+ *      - Else → push `s` (server-wins on this row).
+ *
+ *   2. Local-only rows: walked in local order, but only **trailing**
+ *      assistant/thinking rows that pass `_isStreamingTail` survive.
+ *      "Trailing" means: contiguous from the end of the local array,
+ *      after the last id that also appeared in serverMsgs.
+ *
+ *      Rationale for trailing-only:
+ *      - mid-array local-only id can only mean "another device deleted
+ *        it" (Phase 0.1 server-authored rows can't materialize on
+ *        client without the server first seeing them).
+ *      - end-of-array local-only id with fresh `completedAt` is the
+ *        "WS delta delivered, tape not yet flushed" case we want to
+ *        preserve.
+ *      - end-of-array local-only id with stale `completedAt` (page
+ *        reload, cross-device delete just propagated) falls through
+ *        the grace window and gets dropped.
+ *
+ *   3. Tool/agent-group rows go through Layer 1 stable-equality only
+ *      (per `_localMessageSupersedes` whitelist). Local-only tool/
+ *      agent-group rows are NOT preserved by step 2 — the grace tail
+ *      filter rejects them by role. This is intentional: tool result
+ *      structure (output/error/_completed) cannot be reconstructed by
+ *      the client alone, so server-wins is the only safe choice.
+ *
+ * @param serverMsgs server-side message array (authoritative ordering)
+ * @param localMsgs current local message array (may contain streaming tail)
+ * @param now Date.now() at call time (injectable for tests)
+ */
+export function _mergeServerWithLocalSuperset(serverMsgs, localMsgs, now = Date.now()) {
+  const server = Array.isArray(serverMsgs) ? serverMsgs : []
+  const local = Array.isArray(localMsgs) ? localMsgs : []
+  const localById = new Map()
+  for (const m of local) if (m?.id) localById.set(m.id, m)
+  const out = []
+  const seenServerIds = new Set()
+  for (const s of server) {
+    if (!s?.id) continue
+    seenServerIds.add(s.id)
+    const l = localById.get(s.id)
+    if (l && _localMessageSupersedes(l, s)) {
+      out.push(_overlayServerAuthoritative(l, s))
+    } else {
+      out.push(s)
+    }
+  }
+  // Walk local from the end backward, collecting trailing local-only rows
+  // that satisfy the streaming-tail criteria, until we hit a row that is
+  // either already covered by server or fails the grace check.
+  const trailing = []
+  for (let i = local.length - 1; i >= 0; i--) {
+    const m = local[i]
+    if (!m?.id) continue
+    if (seenServerIds.has(m.id)) break
+    if (!_isStreamingTail(m, now)) break
+    trailing.push(m)
+  }
+  trailing.reverse()
+  for (const m of trailing) out.push(m)
+  return out
+}
+
+/**
+ * Rebuild `_blockIdToMsgId` and `_agentGroups` runtime maps from the
+ * current sess.messages array. Used after a sync replaces sess.messages
+ * (full fetch / partial / 409 adoption): naive `null`-then-lazy-init at
+ * the next WS frame had a race where an inbound tool_result for a
+ * `partial=true` tool_use card would fail to find its parent map entry
+ * if the new server messages didn't include the partial row.
+ *
+ * Mirrors the lazy-init at websocket.js:~1693 (including the
+ * subagent grand-child handling) so both code paths build the same map
+ * shape.
+ */
+export function _rebuildBlockMaps(sess) {
+  const blockIdToMsg = new Map()
+  const agentGroups = new Map()
+  for (const m of sess?.messages || []) {
+    if (!m) continue
+    if (m.blockId) blockIdToMsg.set(m.blockId, m.id)
+    if (m.role === 'agent-group' && m.blockId) {
+      agentGroups.set(m.blockId, m.id)
+      if (Array.isArray(m.childBlocks)) {
+        for (const ch of m.childBlocks) {
+          if (
+            ch &&
+            ch.kind === 'tool_use' &&
+            ch.blockId &&
+            /^Agent$/i.test(ch.toolName || '')
+          ) {
+            agentGroups.set(ch.blockId, m.id)
+          }
+        }
+      }
+    }
+  }
+  sess._blockIdToMsgId = blockIdToMsg
+  sess._agentGroups = agentGroups
+}
+
+/**
+ * Overlay server-authoritative metadata onto the matching prefix of a
+ * local-dominant message array, preserving the entire local suffix verbatim.
+ *
+ * Caller MUST have already verified `_localDominates(serverMsgs, localMsgs)`
+ * — that guarantees `localMsgs.length >= serverMsgs.length` and id-positional
+ * alignment over `[0, serverMsgs.length)`. The local suffix
+ * `[serverMsgs.length, localMsgs.length)` is local-only content the server
+ * hasn't yet seen (e.g. user messages typed between the preflight PUT and
+ * the 409, or assistant rows the next PUT will push).
+ *
+ * Why this isn't `_mergeServerWithLocalSuperset`: that helper's contract is
+ * "server timeline + fresh streaming tail only" — it drops any local suffix
+ * row that doesn't pass `_isStreamingTail` (assistant/thinking in 5s grace).
+ * Using it on local-dominates would silently truncate user messages and
+ * tool/agent-group rows, then `target._dirty=true; dbPut()` would persist
+ * the truncation. Real data loss.
+ *
+ * Why a non-mutating overlay (vs the pre-2026-05-12 in-place `lm[k]=sm[k]`):
+ * messages.js WeakMap-keyed DOM reconcile uses message object identity as
+ * its "DOM up-to-date" signal. In-place mutation leaves identity stable,
+ * so usage/status/_seq overlays would never reach the DOM. This helper
+ * returns the SAME ref when nothing differs (fast path; reconcile skips
+ * the node) and a FRESH ref when a server-auth field actually changed
+ * (reconcile detects mismatch and calls updateMessageEl).
+ */
+export function _overlayServerOntoLocalDominant(localMsgs, serverMsgs) {
+  if (!Array.isArray(localMsgs)) return Array.isArray(serverMsgs) ? serverMsgs.slice() : []
+  const server = Array.isArray(serverMsgs) ? serverMsgs : []
+  const out = new Array(localMsgs.length)
+  for (let i = 0; i < localMsgs.length; i++) {
+    const lm = localMsgs[i]
+    if (i < server.length && lm && server[i] && lm.id === server[i].id) {
+      out[i] = _overlayServerAuthoritative(lm, server[i])
+    } else {
+      // Local suffix (i >= server.length) OR positional mismatch (should not
+      // happen post-_localDominates; defensive). Keep local row as-is.
+      out[i] = lm
+    }
+  }
+  return out
+}
+
 /**
  * After sess.messages is replaced (server-wins 409 resolution), streaming
  * pointers may reference orphan message objects that no longer appear in
@@ -209,41 +440,97 @@ export function _computeSinceSeqForFetch(localSess) {
  * Merge a partial (tail-only) server response into the local messages array.
  * Returns null if sanity check fails (caller should fall back to full GET).
  *
- * Sanity: after appending the tail (with same-id replacement when server
- * re-assigned `_seq`), the resulting array length and max `_seq` must match
- * `remote.totalMessageCount` and `remote.maxSeq`. Mismatch indicates client
- * has a hole the partial protocol can't fill (cross-device delete via legacy
- * code path, server bug, etc.) — caller retries with full GET.
+ * Three-step protocol (the order matters — see Codex review thread for
+ * blocking-comment trail):
+ *
+ *   1. Build the **server-visible** merged array: walk local rows in
+ *      order, replacing/appending from `tail` by id. On same-id rows
+ *      that pass `_localMessageSupersedes`, retain local but overlay
+ *      server-authoritative metadata via `_overlayServerAuthoritative`
+ *      so `_seq` lines up with what the server sees. Local-only rows
+ *      that the partial-tail protocol cannot describe (no `_seq` —
+ *      i.e. client streaming tails) are EXCLUDED from this step.
+ *
+ *   2. Sanity check the server-visible merged array against the server's
+ *      reported `totalMessageCount` / `maxSeq`. Any mismatch means the
+ *      partial protocol cannot reconcile (cross-device delete, server
+ *      bug, hole in local timeline) — return null so caller falls back
+ *      to full GET. Doing this BEFORE appending client-only tail is
+ *      critical: counting client-only rows in the sanity check would
+ *      always fail when local has a fresh streaming tail.
+ *
+ *   3. Append eligible client-only trailing rows (5s grace window per
+ *      `_isStreamingTail`). These rows have no `_seq` and don't affect
+ *      `expectedCount/maxSeq`, which is server-visible-only.
+ *
+ * Why we can keep local with overlay (step 1) instead of forcing server
+ * replacement: server-visible rows that local-supersedes either equal
+ * server (Layer 1) or extend it (Layer 2 streaming prefix). Both cases
+ * leave the timeline correct; overlay restores `_seq/usage/...` so the
+ * sanity arithmetic still works.
  */
-export function _mergePartialTail(localMessages, tail, expectedCount, expectedMaxSeq) {
-  const merged = Array.isArray(localMessages) ? localMessages.slice() : []
-  const idIdx = new Map()
-  for (let i = 0; i < merged.length; i++) {
-    const m = merged[i]
-    if (m && typeof m.id === 'string') idIdx.set(m.id, i)
-  }
+export function _mergePartialTail(localMessages, tail, expectedCount, expectedMaxSeq, now = Date.now()) {
+  const local = Array.isArray(localMessages) ? localMessages : []
   const tailArr = Array.isArray(tail) ? tail : []
+  const tailById = new Map()
   for (const m of tailArr) {
-    if (!m || typeof m.id !== 'string') continue
-    if (idIdx.has(m.id)) {
-      // Same-id replacement — server re-allocated `_seq` because the
-      // server-visible content of this message changed (e.g., a server-
-      // authored takeover that mergePreservingServerAuthored substituted in
-      // a previous PUT). Replace in place to keep ordering stable.
-      merged[idIdx.get(m.id)] = m
+    if (m && typeof m.id === 'string') tailById.set(m.id, m)
+  }
+  // Step 1: build server-visible merged array, excluding client-only tail.
+  const serverVisible = []
+  const placedIds = new Set()
+  for (const l of local) {
+    if (!l || typeof l.id !== 'string') continue
+    const t = tailById.get(l.id)
+    if (t) {
+      // Same-id present in partial response. Decide local-vs-server per
+      // supersede; overlay server-auth fields on the winning local.
+      if (_localMessageSupersedes(l, t)) {
+        serverVisible.push(_overlayServerAuthoritative(l, t))
+      } else {
+        serverVisible.push(t)
+      }
+      placedIds.add(l.id)
     } else {
-      merged.push(m)
-      idIdx.set(m.id, merged.length - 1)
+      // Local-only row from the prefix that the partial response doesn't
+      // describe (server already had it; partial only carries the tail).
+      // Keep as-is — it's part of the server-visible timeline already.
+      // BUT: defensively exclude rows that look like client streaming
+      // tail (no `_seq`) — those will be re-appended in step 3 and we
+      // don't want them double-counted.
+      if (typeof l._seq === 'number') {
+        serverVisible.push(l)
+      }
     }
   }
-  let mergedMaxSeq = 0
-  for (const m of merged) {
-    const s = m && typeof m._seq === 'number' ? m._seq : 0
-    if (s > mergedMaxSeq) mergedMaxSeq = s
+  // Append tail rows that local didn't have at all.
+  for (const t of tailArr) {
+    if (!t || typeof t.id !== 'string') continue
+    if (placedIds.has(t.id)) continue
+    serverVisible.push(t)
   }
-  if (merged.length !== expectedCount) return null
-  if (mergedMaxSeq !== expectedMaxSeq) return null
-  return merged
+  // Step 2: sanity check against server's reported totals.
+  if (serverVisible.length !== expectedCount) return null
+  let serverVisibleMaxSeq = 0
+  for (const m of serverVisible) {
+    const s = m && typeof m._seq === 'number' ? m._seq : 0
+    if (s > serverVisibleMaxSeq) serverVisibleMaxSeq = s
+  }
+  if (serverVisibleMaxSeq !== expectedMaxSeq) return null
+  // Step 3: append eligible client-only streaming tail.
+  const serverVisibleIds = new Set()
+  for (const m of serverVisible) if (m?.id) serverVisibleIds.add(m.id)
+  const trailing = []
+  for (let i = local.length - 1; i >= 0; i--) {
+    const m = local[i]
+    if (!m?.id) continue
+    if (serverVisibleIds.has(m.id)) break
+    if (!_isStreamingTail(m, now)) break
+    trailing.push(m)
+  }
+  trailing.reverse()
+  for (const m of trailing) serverVisible.push(m)
+  return serverVisible
 }
 
 /**
@@ -433,6 +720,13 @@ export async function syncSessionsFromServer() {
           if (existingLocal._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
           if (existingLocal._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
           if (typeof existingLocal._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
+          // _mergePartialTail may have preserved local refs (streaming
+          // tail rows, supersede-winning tool-overlay rows). Rebuild the
+          // block-id maps from the merged messages so subsequent WS
+          // frames route correctly; rebind streaming pointers in case
+          // their target rows changed identity through overlay.
+          _rebuildBlockMaps(sess)
+          _rebindStreamingPointers(sess)
           _rebuildSearchIndex(sess)
           clearDeleteTombstone(sess.id)
           state.sessions.set(sess.id, sess)
@@ -515,12 +809,23 @@ export async function syncSessionsFromServer() {
     } else if (existingLocal?._dirty && !existingLocal?._liveStreamBroken) {
       continue
     }
+    // When the _liveStreamBroken+_dirty branch above already produced a
+    // `mergedMessages`, use that (it preserves pending-user-msg ordering).
+    // Otherwise route the server payload through the per-message merger
+    // that keeps the WS streaming tail (5s grace) while otherwise
+    // accepting server state. Pre-2026-05-12 this was a bare
+    // `remote.messages || []` and lost the trailing assistant text when
+    // visibilitychange/focus/pageshow fired in the brief window between
+    // a turn ending and the server-side tape catching up.
     const sess = {
       id: remote.id,
       title: remote.title,
       createdAt: remote.createdAt,
       lastAt: remote.lastAt,
-      messages: mergedMessages || remote.messages || [],
+      messages: mergedMessages || _mergeServerWithLocalSuperset(
+        remote.messages || [],
+        existingLocal?.messages || [],
+      ),
       agentId: remote.agentId || 'main',
       pinned: remote.pinned || false,
       _syncedAt: remote.updatedAt,
@@ -550,6 +855,15 @@ export async function syncSessionsFromServer() {
     // "new" frames and would be appended again. Keep the cursor aligned to
     // whatever we had last processed so dedupe stays authoritative.
     if (typeof existingLocal?._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
+    // The merger above may keep local refs (streaming-tail rows, supersede-
+    // winning tool/agent rows). Rebuild block-id maps from the resulting
+    // messages so subsequent WS frames find their parent cards; rebind
+    // streaming pointers in case server overlay returned new object refs
+    // for the same id.
+    if (existingLocal) {
+      _rebuildBlockMaps(sess)
+      _rebindStreamingPointers(sess)
+    }
     _rebuildSearchIndex(sess)
     clearDeleteTombstone(sess.id) // Allow saving if session was previously deleted locally
     state.sessions.set(sess.id, sess)
@@ -816,25 +1130,26 @@ export function pushSessionToServer(sess) {
           //
           // **不**覆盖 text/role/ts:这些字段在 _localDominates 判定时 local 已胜出
           // (否则不会进 local-dominates 分支),overlay 会破坏 streaming 扩展。
-          const _OVERLAY_KEYS_BASE = ['_seq', '_source', 'usage', '_truncated', '_errorCode', '_errorDetail']
-          if (Array.isArray(server.messages) && Array.isArray(target.messages)) {
-            const liveById = new Map()
-            for (const m of target.messages) if (m?.id) liveById.set(m.id, m)
-            for (const sm of server.messages) {
-              if (!sm?.id) continue
-              const lm = liveById.get(sm.id)
-              if (!lm) continue
-              for (const k of _OVERLAY_KEYS_BASE) {
-                if (sm[k] !== undefined) lm[k] = sm[k]
-              }
-              // status 单独处理:仅 server-authored 消息才 overlay,避免把 server
-              // 端缺省的 user.status 覆盖 client 的 sending/sent/read,也避免把
-              // client-mirrored assistant(非 server-authored)误标终态。
-              if (sm._source === 'server' && sm.status !== undefined) {
-                lm.status = sm.status
-              }
-            }
-          }
+          //
+          // 2026-05-12 §3.x — overlay 改走 _overlayServerOntoLocalDominant。
+          // 之前是 in-place mutation (`lm[k] = sm[k]`),对象引用未变,
+          // WeakMap-keyed DOM reconcile 检测不到字段变化,usage/status/_truncated
+          // 在 DOM 上不刷新。_overlayServerAuthoritative 在有字段差异时返回新对象,
+          // 无差异时返回原 ref —— 既修了 reconcile 漏更新,又保留 fast-path。
+          //
+          // 关键:这里**不能**用 _mergeServerWithLocalSuperset。后者的契约是
+          // "server 时间线 + 仅保留 _isStreamingTail 通过的尾行",会丢弃 local
+          // 的 user / tool / 老 assistant 等非 streaming suffix → 然后 _dirty=true
+          // 持久化截断的 transcript,真正的数据丢失。_localDominates 已保证
+          // server 是 local 的 id-positional prefix,这里只需在该 prefix 上做
+          // server-auth overlay,完整保留 [server.length, local.length) 的 local
+          // suffix(那是 client 刚追加、下一轮 PUT 要推上去的内容)。
+          target.messages = _overlayServerOntoLocalDominant(
+            target.messages || [],
+            server.messages || [],
+          )
+          _rebuildBlockMaps(target)
+          _rebindStreamingPointers(target)
 
           target._syncedAt = server.updatedAt
 
@@ -860,11 +1175,12 @@ export function pushSessionToServer(sess) {
           if (titleChanged) _rebuildSearchIndex(target)
 
           try { await dbPut({ ...target }) } catch {}
-          // Pass 'local-dominates' so the UI can skip renderMessages() — local
-          // messages are preserved in this branch, only sidebar metadata may
-          // have shifted. Without this tag, every 409 in a long streaming
-          // session redrew the whole messages pane (innerHTML='' + 100-row
-          // rebuild) and the user saw a flicker per 409.
+          // Pass 'local-dominates' so callbacks can distinguish the two
+          // resolver branches if they care. main.js now calls renderMessages()
+          // for both modes (the WeakMap-keyed reconcile makes that cheap on
+          // unchanged sessions and correctly surfaces _overlayServerAuthoritative
+          // fresh-ref overlays). The mode tag is still useful for telemetry
+          // / retry decisions / future divergent UI behavior.
           try { _onConflictResolved?.(target.id, 'local-dominates') } catch {}
 
           if (target._conflictRetryCount <= CONFLICT_RETRY_MAX && _onRequestRetryPush) {
@@ -886,18 +1202,28 @@ export function pushSessionToServer(sess) {
         // and server really has data we don't.
         if (live._dirty && live.lastAt > preFlightLastAt) return
 
+        // Merge with local streaming-tail superset rather than blind replace.
+        // Even in "server wins" branch, an in-flight assistant tail can be
+        // racing ahead of server tape persistence; dropping it causes the
+        // mobile flash-and-loss bug. _mergeServerWithLocalSuperset keeps
+        // client-only messages in the 5s grace window and overlays server
+        // authoritative fields onto the server-visible prefix.
         Object.assign(target, {
           title: server.title,
-          messages: server.messages || [],
+          messages: _mergeServerWithLocalSuperset(
+            server.messages || [],
+            target.messages || [],
+          ),
           lastAt: server.lastAt,
           pinned: server.pinned,
           agentId: server.agentId,
           _syncedAt: server.updatedAt,
           _dirty: false,
         })
-        // Invalidate runtime maps so they get rebuilt from new messages on next handleOutbound
-        target._blockIdToMsgId = null
-        target._agentGroups = null
+        // Rebuild runtime maps eagerly from the merged messages so streaming
+        // state (tool blocks, agent groups) stays intact instead of being
+        // nuked and lazy-rebuilt from a potentially-truncated server view.
+        _rebuildBlockMaps(target)
         target._conflictRetryCount = 0  // server-wins adoption resets the cap
         _rebindStreamingPointers(target)
         _rebuildSearchIndex(target)

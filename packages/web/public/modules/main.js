@@ -2338,35 +2338,18 @@ async function init() {
   // sync tick.
   //
   // `mode` ('local-dominates' | 'server-wins') distinguishes the two resolver
-  // branches in sync.js.
-  //   - server-wins: sess.messages was overwritten → full renderMessages().
-  //   - local-dominates: sess.messages is PRESERVED; only title / pinned /
-  //     agentId / lastAt may have been adopted from server. Doing a full
-  //     renderMessages() here is both wasted work and a visible flicker on
-  //     long streaming turns (a single turn can legitimately fire several
-  //     409s in a row). Instead, refresh just the stale metadata surfaces:
-  //     pane header title + subtitle (both normally set inside renderMessages),
-  //     plus the agent dropdown (reflects sess.agentId).
+  // branches in sync.js. Pre-2026-05-12 we skipped renderMessages() on
+  // local-dominates to avoid the innerHTML='' flicker. After the WeakMap-keyed
+  // reconcile landed (messages.js Phase 2), renderMessages() on an unchanged
+  // session is O(walk DOM, all WeakMap hits) → no DOM mutation. So we now
+  // always call it: it correctly surfaces server-auth overlays (usage / status /
+  // _seq / _truncated) that _overlayServerOntoLocalDominant produced as fresh
+  // object refs on the matching prefix, without flicker.
   setSyncDeps({
     onSyncStatusChange: updateSyncIndicator,
-    onConflictResolved: (sessId, mode) => {
+    onConflictResolved: (sessId, _mode) => {
       if (sessId === state.currentSessionId) {
-        const s = state.sessions.get(sessId)
-        // Empty-state branding (messages.js:1653) is rendered only when
-        // s.messages.length === 0 and depends on s.agentId. _localDominates
-        // returns true for two empty arrays, so empty sessions CAN reach
-        // local-dominates with an adopted agentId. Fall back to a full
-        // renderMessages() in that case — no flicker concern because empty
-        // sessions don't stream.
-        const isEmpty = !s || s.messages.length === 0
-        if (mode === 'server-wins' || isEmpty) {
-          renderMessages()
-        } else {
-          // local-dominates with non-empty messages: patch header without
-          // wiping the messages pane DOM (messages.js:1638).
-          $('session-title').textContent = s.title
-          updateSessionSub(s)
-        }
+        renderMessages()
         // Agent selector / mode pills / research tools only refresh via
         // renderAgentDropdown() (agents.js:21). Every branch here may have
         // adopted s.agentId from the server (both server-wins and
