@@ -2098,7 +2098,7 @@ export function renderMetaInto(container, metaText) {
 // pane: it maps the in-memory msg object reference to its rendered DOM
 // element. We use object identity (not msg.id) as the key intentionally:
 //
-//  - Phase 1 sync.js's `_mergeServerWithLocalSuperset` returns the SAME
+//  - sync.js's `_mergeServerAuthoredIntoLocal` returns the SAME
 //    reference for any msg the server delivered with identical content
 //    (via `_overlayServerAuthoritative`'s no-change fast path). So when
 //    a sync replaces `sess.messages`, msg refs that didn't actually

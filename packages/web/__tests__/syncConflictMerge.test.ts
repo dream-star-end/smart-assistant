@@ -431,36 +431,28 @@ if (!_MSG_SERVER_AUTHORITATIVE_KEYS_SRC) {
 }
 
 // 2026-05-12 §3.x — pushSessionToServer 409 分支改走
-// _mergeServerWithLocalSuperset + _rebuildBlockMaps 而不是原地 overlay,
-// 这两个 helper(及它们的传递依赖 _overlayServerAuthoritative /
-// _isStreamingTail / 两个常量)也必须 extract 进闭包,否则集成测试一进
-// 409 路径就 ReferenceError。常量是 module-level const,跟
-// _MSG_EPHEMERAL_KEYS 同样模式抓。
+// _mergeServerAuthoredIntoLocal + _rebuildBlockMaps(替代历史的 in-place overlay /
+// _overlayServerOntoLocalDominant / _mergeServerWithLocalSuperset 三套实现),
+// 这个 helper 及其传递依赖 _overlayServerAuthoritative + _SERVER_AUTH_KEYS 常量
+// 都必须 extract 进闭包,否则集成测试一进 409 路径就 ReferenceError。常量是
+// module-level const,跟 _MSG_EPHEMERAL_KEYS 同样模式抓。
 const _SERVER_AUTH_KEYS_SRC =
   /const\s+_SERVER_AUTH_KEYS\s*=\s*\[[\s\S]*?\]/.exec(SYNC_SRC)?.[0] ?? ''
-const _STREAMING_TAIL_GRACE_MS_SRC =
-  /const\s+STREAMING_TAIL_GRACE_MS\s*=\s*\d+/.exec(SYNC_SRC)?.[0] ?? ''
 if (!_SERVER_AUTH_KEYS_SRC) {
   throw new Error('_SERVER_AUTH_KEYS const not found in sync.js source')
-}
-if (!_STREAMING_TAIL_GRACE_MS_SRC) {
-  throw new Error('STREAMING_TAIL_GRACE_MS const not found in sync.js source')
 }
 
 const _pushFnSrc =
   _MSG_EPHEMERAL_KEYS_SRC + '\n' +
   _MSG_SERVER_AUTHORITATIVE_KEYS_SRC + '\n' +
   _SERVER_AUTH_KEYS_SRC + '\n' +
-  _STREAMING_TAIL_GRACE_MS_SRC + '\n' +
   extractTopLevelFn(SYNC_SRC, '_stripMessageEphemeral') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_stableStringify') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localDominates') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_overlayServerAuthoritative') + '\n' +
-  extractTopLevelFn(SYNC_SRC, '_isStreamingTail') + '\n' +
-  extractTopLevelFn(SYNC_SRC, '_mergeServerWithLocalSuperset') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_mergeServerAuthoredIntoLocal') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_rebuildBlockMaps') + '\n' +
-  extractTopLevelFn(SYNC_SRC, '_overlayServerOntoLocalDominant') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers') + '\n' +
   extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')
 
@@ -957,8 +949,16 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     assert.deepEqual(sess.messages[1].usage, { costCredits: '50' })
   })
 
-  it('overlay 跳过 server 端独有 id 消息(只处理同 id)', async () => {
-    // local 不持有 id='a-server-only',overlay 时不应误植入。
+  it('server-wins 合并:同 group 出现 server takeover 时 client phantom 被丢掉,server-only id 引入', async () => {
+    // 场景:local 有 [u1, m-a1] (m-* 是客户端流式产物),server PUT 返回的快照
+    // 里同一 turn group 多了一条 srv-* 的 server takeover (`_source: 'server'`)。
+    // _localDominates 返回 false (server 比 local 长) → 走 server-wins 合并路径。
+    // 新的 _mergeServerAuthoredIntoLocal:
+    //   - step 1 overlay 只看同 id (这里 u1, a1 都同 id) → 不会把 a-server-only 的
+    //     `_seq` / `usage` 误植入 local 别的行。
+    //   - step 2 把 server-only id (a-server-only) append 进来。
+    //   - step 4 turn-group dedupe 发现 group 内有 server takeover,丢掉 client
+    //     phantom m-a1。最终保留 [u1, a-server-only]。
     const sessId = 'sess-disjoint'
     const serverOnlyAsst = {
       id: 'a-server-only',
@@ -967,41 +967,54 @@ describe('pushSessionToServer — 409 local-dominates', () => {
       _source: 'server',
       _seq: 9,
       usage: { costCredits: '5' },
+      ts: 1050,
     }
     const localAsst = {
-      id: 'a1', role: 'assistant', text: 'something',
+      id: 'a1', role: 'assistant', text: 'something', ts: 1010,
     }
     const sess: any = {
       id: sessId, title: 't', lastAt: 1000, pinned: false, agentId: 'a',
-      messages: [{ id: 'u1', role: 'user', text: 'hi' }, localAsst],
+      messages: [{ id: 'u1', role: 'user', text: 'hi', ts: 1000 }, localAsst],
       _dirty: true, _syncedAt: 500,
     }
-    // server.messages.length > local.messages.length → _localDominates 返回 false → 走 server-wins,
-    // 不再走 local-dominates overlay 路径。这个 case 仅断言 overlay 不会误把 server-only 的字段
-    // 塞进 local id 不同的项。
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
         id: sessId, title: 't',
-        messages: [{ id: 'u1', role: 'user', text: 'hi' }, localAsst, serverOnlyAsst],
+        messages: [
+          { id: 'u1', role: 'user', text: 'hi', ts: 1000 },
+          localAsst,
+          serverOnlyAsst,
+        ],
         lastAt: 1100, pinned: false, agentId: 'a', updatedAt: 2000,
       }),
     } as any)
     deps.state.sessions.set(sessId, sess)
     await makePush(deps)(sess)
 
-    // 走 server-wins 分支:整体替换 messages
-    assert.equal(sess.messages.length, 3)
-    assert.equal(sess.messages[2].id, 'a-server-only')
-    // 这里 sess.messages[1] 现在是 server.messages[1] 的引用 — 验证 server-wins 路径(非 overlay)
+    // 走 server-wins 分支,merger 应用 takeover dedupe:
+    assert.equal(sess.messages.length, 2)
+    assert.equal(sess.messages[0].id, 'u1')
+    assert.equal(sess.messages[1].id, 'a-server-only')
+    // 关键反例:overlay 没有把 server-only 行的字段(_seq=9 / usage)
+    // 写到不同 id 的 local 行身上 — u1 上不应出现 _seq=9。
+    assert.equal(sess.messages[0]._seq, undefined, 'overlay 不应把 server-only 字段错位到不同 id')
     assert.equal(deps.conflictCb[0].mode, 'server-wins')
   })
 })
 
 describe('pushSessionToServer — 409 server-wins fallback', () => {
   it('adopts server state when local does NOT dominate, rebinds _streamingAssistant', async () => {
+    // 场景:local 留着 m-a-old (客户端流式产物未确认),server 已经为同一个 turn
+    // 写了 srv-a-new (server takeover,`_source: 'server'`)。新的 server-wins merger:
+    //   - step 1 overlay: a-old 与 a-new id 不同 → 两者都进 merged
+    //   - step 2: 无 server-only id 漏网
+    //   - step 4 turn-group dedupe: 同一 group (无 user/system 边界,合并成 group 0)
+    //     里有 server-authored assistant → 丢掉 client phantom m-a-old
+    // 最终 sess.messages = [a-new]。_streamingAssistant 原指向 a-old → 不再在
+    // 数组里 → 由 _rebindStreamingPointers 清空。
     const sessId = 'sess-sw'
-    const oldLocalAsst = { id: 'a-old', role: 'assistant', text: 'local regen' }
+    const oldLocalAsst = { id: 'a-old', role: 'assistant', text: 'local regen', ts: 1000 }
     const sess: any = {
       id: sessId,
       title: 'local title',
@@ -1016,7 +1029,10 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
       _agentGroups: new Map(),
     }
 
-    const serverAsst = { id: 'a-new', role: 'assistant', text: 'server side answer' }
+    const serverAsst = {
+      id: 'a-new', role: 'assistant', text: 'server side answer',
+      _source: 'server', _seq: 7, ts: 1100,
+    }
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
@@ -1035,6 +1051,7 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
 
     // Adopted server state
     assert.equal(sess.title, 'server title')
+    assert.equal(sess.messages.length, 1, 'turn-group dedupe should drop m-a-old phantom')
     assert.equal(sess.messages[0].id, 'a-new')
     assert.equal(sess.agentId, 'a2')
     assert.equal(sess._dirty, false)
@@ -1059,21 +1076,31 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
   })
 
   it('rebinds _streamingAssistant to the fresh object when same id still present', async () => {
+    // local 端 a1 是流式中途版本;server 端同 id 已被 takeover (`_source: 'server'`,
+    // 文本更全),并多了一条 u-extra。新 merger 把 server 端 a1 直接替换进 merged
+    // (同 id step 1),u-extra 走 step 2 append。按 ts 排序后 u-extra(更早) 在 0、
+    // server-a1 在 1。pointer 重新绑到新 a1 对象。
     const sessId = 'sess-reb'
-    const oldRef = { id: 'a1', role: 'assistant', text: 'old-local' }
+    const oldRef = { id: 'a1', role: 'assistant', text: 'old-local', ts: 1100 }
     const sess: any = {
       id: sessId, title: 't', messages: [oldRef], lastAt: 1000,
       pinned: false, agentId: 'a', _dirty: true, _syncedAt: 500,
       _streamingAssistant: oldRef,
     }
-    const serverAsst = { id: 'a1', role: 'assistant', text: 'brand new answer' }
+    const serverAsst = {
+      id: 'a1', role: 'assistant', text: 'brand new answer',
+      _source: 'server', _seq: 3, ts: 1100,
+    }
 
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
         id: sessId, title: 't',
         // New server snapshot has EXTRA message + same id a1 → doesn't dominate
-        messages: [{ id: 'u-extra', role: 'user', text: 'someone else asked' }, serverAsst],
+        messages: [
+          { id: 'u-extra', role: 'user', text: 'someone else asked', ts: 1050 },
+          serverAsst,
+        ],
         lastAt: 1100, pinned: false, agentId: 'a', updatedAt: 2000,
       }),
     } as any)
@@ -1088,10 +1115,17 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
   })
 
   it('clears _replyingToMsgId and _currentTurnBlockCount when that msg vanishes from server', async () => {
+    // server 端为本 turn 写了 srv-asst (takeover,`_source: 'server'`),local 仍
+    // 抱着 m-orphan 这条 client phantom。新 merger 的 turn-group dedupe (同 group
+    // 出现 server-authored assistant) 应该丢 m-orphan;`_rebindStreamingPointers`
+    // 发现 _replyingToMsgId='orphan' 已不在 messages 里 → 清空 pointer + turn 计数。
     const sessId = 'sess-rpl'
     const sess: any = {
       id: sessId, title: 't',
-      messages: [{ id: 'u1', role: 'user', text: 'hi' }, { id: 'orphan', role: 'assistant', text: 'gone' }],
+      messages: [
+        { id: 'u1', role: 'user', text: 'hi', ts: 1000 },
+        { id: 'orphan', role: 'assistant', text: 'gone', ts: 1010 },
+      ],
       lastAt: 1000, pinned: false, agentId: 'a', _dirty: true, _syncedAt: 500,
       _replyingToMsgId: 'orphan',
       _currentTurnBlockCount: 7,
@@ -1101,11 +1135,14 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
         id: sessId, title: 't',
-        // Server snapshot has a user msg local doesn't (cross-device add) —
-        // forces server-wins fallback. And no 'orphan' → pointer clears.
+        // 让 _localDominates 返回 false (server 长度 != local 末端 prefix):server
+        // 用 srv-asst 替代 orphan,id 不同 → 走 server-wins 路径。
         messages: [
-          { id: 'u1', role: 'user', text: 'hi' },
-          { id: 'u2-other-device', role: 'user', text: 'from phone' },
+          { id: 'u1', role: 'user', text: 'hi', ts: 1000 },
+          {
+            id: 'srv-asst', role: 'assistant', text: 'real reply',
+            _source: 'server', _seq: 2, ts: 1050,
+          },
         ],
         lastAt: 1100, pinned: false, agentId: 'a', updatedAt: 2000,
       }),
@@ -1114,6 +1151,9 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
 
     await makePush(deps)(sess)
 
+    // orphan 被 turn-group dedupe 丢掉 → rebindStreamingPointers 清 _replyingToMsgId
+    assert.equal(sess.messages.length, 2)
+    assert.deepEqual(sess.messages.map((m: any) => m.id), ['u1', 'srv-asst'])
     assert.equal(sess._replyingToMsgId, null)
     assert.equal(sess._currentTurnBlockCount, 0)
   })

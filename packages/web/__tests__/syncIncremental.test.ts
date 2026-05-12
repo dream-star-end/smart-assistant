@@ -40,17 +40,15 @@ function extractTopLevelFn(source: string, name: string): string {
 
 // _mergePartialTail depends transitively on _localMessageSupersedes (which
 // itself uses _stableStringify), _overlayServerAuthoritative (with its
-// _SERVER_AUTH_KEYS const), and _isStreamingTail (with STREAMING_TAIL_GRACE_MS).
+// _SERVER_AUTH_KEYS const), and _mergeServerAuthoredIntoLocal (which step 3
+// delegates to for streaming-tail preservation + phantom dedupe).
 // We extract the full dependency closure so the Function() body can resolve
 // them all at runtime — same pattern used by syncConflictMerge.test.ts.
 const _SERVER_AUTH_KEYS_DECL =
   "const _SERVER_AUTH_KEYS = ['_seq', '_source', 'usage', '_truncated', '_errorCode', '_errorDetail'];"
-const _GRACE_DECL = 'const STREAMING_TAIL_GRACE_MS = 5000;'
 
 const _combined =
   _SERVER_AUTH_KEYS_DECL +
-  '\n' +
-  _GRACE_DECL +
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_stableStringify') +
   '\n' +
@@ -58,7 +56,7 @@ const _combined =
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_overlayServerAuthoritative') +
   '\n' +
-  extractTopLevelFn(SYNC_SRC, '_isStreamingTail') +
+  extractTopLevelFn(SYNC_SRC, '_mergeServerAuthoredIntoLocal') +
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_computeSinceSeqForFetch') +
   '\n' +
@@ -73,7 +71,6 @@ const _helpers = new Function(
     tail: any[],
     expectedCount: number,
     expectedMaxSeq: number,
-    now?: number,
   ) => any[] | null
 }
 const _computeSinceSeqForFetch = _helpers._computeSinceSeqForFetch
@@ -226,51 +223,63 @@ describe('_mergePartialTail', () => {
   })
 
   // ── Step 3 (2026-05-12 mobile flash-and-loss fix) ──
-  // The partial-tail merger must preserve client-only streaming-tail
-  // rows (no `_seq`, fresh `completedAt`) AFTER passing sanity check.
-  // The sanity check itself must operate on server-visible rows ONLY —
-  // counting client tail would always fail server's totalMessageCount.
+  // The partial-tail merger delegates step 3 to _mergeServerAuthoredIntoLocal.
+  // That helper preserves client-only rows as local-only entries (until
+  // server-authored takeover lands in a future sync), and drops phantoms
+  // via turn-group dedupe. The sanity check (step 2) operates on
+  // server-visible rows ONLY — counting client tail would always fail
+  // server's totalMessageCount.
 
-  it('STEP 3: preserves fresh client-only streaming-tail (no _seq)', () => {
+  it('STEP 3: preserves client-only streaming-tail when server has no takeover', () => {
     const NOW = 1_700_000_000_000
     const local = [
-      m('u', 1),  // user, _seq=1, with text=''
-      // Client streaming tail: no _seq, fresh completedAt → must survive.
-      { id: 'a_stream', role: 'assistant', text: 'streaming…', completedAt: NOW - 500 },
+      m('u', 1),  // user, _seq=1
+      // Client streaming tail: no _seq → must survive into merged result.
+      { id: 'a_stream', role: 'assistant', text: 'streaming…', ts: NOW + 1 },
     ]
     // Server tape has the user message only — assistant not yet flushed.
     const tail = [m('u', 1)]
     // Server says totalMessageCount=1, maxSeq=1 (only the user row).
-    const merged = _mergePartialTail(local, tail, 1, 1, NOW)
+    const merged = _mergePartialTail(local, tail, 1, 1)
     assert.notEqual(merged, null, 'sanity passes because step 1 excludes tail-without-_seq')
     assert.deepEqual(merged!.map((x: any) => x.id), ['u', 'a_stream'])
   })
 
-  it('STEP 3: drops STALE client-only tail (beyond 5s grace)', () => {
+  it('STEP 3: drops client phantom when server takeover (server-authored asst) exists', () => {
     const NOW = 1_700_000_000_000
     const local = [
       m('u', 1),
-      // Old completedAt (e.g. revived from IDB across a page reload)
-      { id: 'a_stale', role: 'assistant', text: 'stale partial', completedAt: NOW - 60_000 },
+      // Client phantom assistant from in-flight stream
+      { id: 'm-stream', role: 'assistant', text: 'partial', ts: NOW + 1 },
     ]
-    const tail = [m('u', 1)]
-    const merged = _mergePartialTail(local, tail, 1, 1, NOW)
+    // Server's tail brings in srv-…-t0 server-authored row for the turn.
+    const tail = [
+      {
+        id: 'srv-asst', role: 'assistant', text: 'final canonical',
+        ts: NOW + 2, _seq: 2, _source: 'server',
+      },
+    ]
+    // Server view: count=2 (u + srv-asst), maxSeq=2
+    const merged = _mergePartialTail(local, tail, 2, 2)
     assert.notEqual(merged, null)
-    assert.deepEqual(merged!.map((x: any) => x.id), ['u'])
+    // Turn-group dedupe drops m-stream because srv-asst exists in same group.
+    assert.deepEqual(merged!.map((x: any) => x.id), ['u', 'srv-asst'])
   })
 
-  it('STEP 3: drops client-only tool/user rows (only assistant/thinking pass grace)', () => {
+  it('STEP 3: client-only user message kept (no role-based filter anymore)', () => {
+    // Pre-fix the old `_isStreamingTail` filter rejected client-only user rows.
+    // New algorithm preserves any local-only row whose id is not in server.
+    // This is correct for the (rare) case where a user message gets typed
+    // locally between two PUT cycles and lands in IDB before its push.
     const NOW = 1_700_000_000_000
     const local = [
       m('u1', 1),
-      // No-_seq trailing rows of the wrong role for grace — drop.
-      { id: 'u_extra', role: 'user', text: 'fresh-but-user', ts: NOW },
-      { id: 't_extra', role: 'tool', text: 'output', ts: NOW },
+      { id: 'u_local', role: 'user', text: 'just typed', ts: NOW + 1 },
     ]
     const tail = [m('u1', 1)]
-    const merged = _mergePartialTail(local, tail, 1, 1, NOW)
+    const merged = _mergePartialTail(local, tail, 1, 1)
     assert.notEqual(merged, null)
-    assert.deepEqual(merged!.map((x: any) => x.id), ['u1'])
+    assert.deepEqual(merged!.map((x: any) => x.id), ['u1', 'u_local'])
   })
 
   it('STEP 3 + STEP 1 interaction: sanity passes when count matches server-visible only', () => {
@@ -278,13 +287,13 @@ describe('_mergePartialTail', () => {
     const local = [
       m('a', 1),
       m('b', 2),
-      // Fresh streaming tail with no _seq — must NOT be counted by sanity.
-      { id: 's', role: 'thinking', text: 'thinking…', completedAt: NOW - 200 },
+      // Client thinking tail with no _seq — must NOT be counted by sanity.
+      { id: 's', role: 'thinking', text: 'thinking…', ts: NOW },
     ]
     const tail = [m('c', 3)]
     // Server reports count=3 (a, b, c) and maxSeq=3 — the streaming tail
     // is invisible to the server, so sanity must exclude it.
-    const merged = _mergePartialTail(local, tail, 3, 3, NOW)
+    const merged = _mergePartialTail(local, tail, 3, 3)
     assert.notEqual(merged, null, 'sanity must not double-count the streaming tail')
     assert.deepEqual(merged!.map((x: any) => x.id), ['a', 'b', 'c', 's'])
   })

@@ -205,107 +205,275 @@ export function _overlayServerAuthoritative(localMsg, serverMsg) {
 }
 
 /**
- * Grace window (ms) for retaining a local-only trailing assistant/thinking
- * message that the server tape hasn't acknowledged yet. WS deltas land in
- * the client typically sub-second before the server-side tape write
- * finalizes; 5s comfortably covers slow tape or transient backlog while
- * letting truly stale (cross-device-deleted, page-reload-revived) tails
- * fall through to server-wins on the next sync.
+ * Merge a server-authored timeline into local messages. Used at every
+ * client-side sync convergence point: full sync, partial-tail sync,
+ * 409 local-dominates, 409 server-wins.
  *
- * Tuned with `msg.completedAt || msg.ts` (both populated by addMessage /
- * the per-frame stamp at websocket.js:~2021), so no new field is needed
- * and IDB persistence is naturally self-healing: a stale tail loaded from
- * IDB has `completedAt` minutes/hours old → first sync immediately drops it.
+ * Server is authoritative for "what exists at all" — a row that was
+ * previously server-confirmed (carries `_seq`) but is absent from the
+ * current server response was deleted on another tab/device. Local rows
+ * without `_seq` are pending/in-flight (never confirmed by server) and
+ * must survive every sync until the next PUT lands.
+ *
+ * 2026-05-12 v6 — supersedes v5 which incorrectly preserved ALL local-only
+ * rows. v5 had two regressions (Codex round 2 review):
+ *   (R1) Cross-tab delete resurrected: tab A delete → server timeline
+ *        shorter → tab B's GET → v5 kept local row missing from server
+ *        forever, even though it had `_seq` proving server once knew it.
+ *   (R2) Cross-tab user interleave dropped active stream: ts-sort put
+ *        local in-flight `m-asst` (turn-a) into the SAME positional group
+ *        as cross-tab `srv-asst-b` (turn-b) → group dedupe killed m-asst,
+ *        re-introducing the mobile flash-and-loss bug class this whole
+ *        fix targets.
+ *
+ * Five-step algorithm:
+ *
+ *   1. **Pre-compute turn anchors** — for each row in BOTH inputs, find
+ *      the id of the preceding user/system message in that input's
+ *      natural order. This captures "which turn the row belongs to" from
+ *      that side's perspective. Stored in side-Maps keyed by id;
+ *      inputs not mutated.
+ *
+ *   2. **Overlay by id, append server-only** — for each local row:
+ *      - same-id server row exists: `_localMessageSupersedes(lm, sm)`
+ *        → overlay server-auth fields onto local (preserves WeakMap-keyed
+ *        DOM reconcile fast path); else → take server's row.
+ *      - no same-id server row + local has finite `_seq` → DROP (server-
+ *        side delete from another tab).
+ *      - no same-id server row + local has NO `_seq` → PRESERVE
+ *        (in-flight streaming tail / unpushed user msg).
+ *      Then append server rows whose id wasn't consumed.
+ *
+ *   3. **Chronological sort by ts** — display order is by timestamp.
+ *      Ties keep insertion order (local-overlay first, then server-only
+ *      appended), giving a stable result.
+ *
+ *   4. **Compute effective anchor per merged row** — id-membership lookup,
+ *      NOT object identity (Codex v6 constraint):
+ *        - id in serverById → server anchor (server's view authoritative)
+ *        - id only in local → local anchor
+ *        - id-less defensive row → positional fallback (preceding
+ *          user/system in merged)
+ *
+ *   5. **Turn-group phantom dedupe by effective anchor** —
+ *      anchor-keyed (not positional) `hasServerAsst` / `hasServerThinking` /
+ *      `serverToolBlockIds`. Drop client-authored assistant/thinking
+ *      phantoms whose effective anchor's group has a server counterpart.
+ *      Drop client tool only when a server tool with same `blockId`
+ *      shares the same effective anchor. Tools without `blockId` (legacy
+ *      rows) are kept — better doubled card than dropped detail.
+ *
+ * Naturally derived behaviors:
+ *   - **In-flight streaming preserved** — `m-asst` (no _seq) survives every
+ *     server response until Phase 0.1 takeover (`srv-asst` with
+ *     `_source: 'server'`) lands in the SAME turn anchor's group.
+ *   - **Takeover convergence drops phantoms** — server mints `srv-…` for
+ *     the assistant/thinking/tool rows of the just-finished turn; step 5
+ *     finds them via anchor lookup and drops the matching client `m-…`.
+ *   - **Cross-tab user message lands chronologically** — appended in step 2,
+ *     sorted into ts order in step 3.
+ *   - **Cross-tab user does NOT split an in-flight turn** — local m-asst
+ *     keeps its LOCAL anchor (the user msg it was replying to). srv-asst
+ *     for the cross-tab user has a DIFFERENT anchor → different group →
+ *     m-asst preserved.
+ *   - **Cross-device delete drops orphans** — local row with `_seq` not in
+ *     server response is treated as server-deleted.
+ *
+ * Invariants the algorithm relies on:
+ *   - All PERSISTED messages have a string `id`. Server never serializes
+ *     id-less rows; client may transiently hold one mid-frame, in which
+ *     case it passes through with a positional fallback anchor.
+ *   - `_seq` is server-stamped only. WS streaming does NOT write `_seq` on
+ *     client rows. Once a row's `_seq` is set, it has been confirmed by
+ *     server at some past moment (verified by grep over modules/).
+ *   - `_source === 'server'` marks server-authored rows. Phase 0.1 HTTP
+ *     path (commercial/internalServerAuthored.ts) is the only writer.
+ *
+ * @param serverMsgs server-side authoritative timeline (from REST GET)
+ * @param localMsgs current local messages (may contain streaming tail)
+ * @returns new merged array (never the same ref as either input)
  */
-const STREAMING_TAIL_GRACE_MS = 5000
+export function _mergeServerAuthoredIntoLocal(serverMsgs, localMsgs) {
+  const serverArr = Array.isArray(serverMsgs) ? serverMsgs : []
+  const localArr = Array.isArray(localMsgs) ? localMsgs : []
+  // Fast path: nothing on server (e.g. empty session, or first server
+  // response while local is being primed). Return a fresh slice so the
+  // caller can safely mutate without aliasing local. Skipping the ts-sort
+  // also avoids reordering a local-only array against insertion order
+  // when caller hasn't yet stamped ts (Codex v5 constraint 1).
+  if (serverArr.length === 0) return localArr.slice()
 
-export function _isStreamingTail(msg, now) {
-  if (!msg) return false
-  if (msg.role !== 'assistant' && msg.role !== 'thinking') return false
-  const hasContent =
-    (typeof msg.text === 'string' && msg.text.length > 0) ||
-    (Array.isArray(msg.childBlocks) && msg.childBlocks.length > 0)
-  if (!hasContent) return false
-  const ts =
-    typeof msg.completedAt === 'number' ? msg.completedAt :
-    typeof msg.ts === 'number' ? msg.ts : 0
-  return (now - ts) < STREAMING_TAIL_GRACE_MS
-}
-
-/**
- * Merge `serverMsgs` and `localMsgs` per-row, producing a new array that
- * preserves the "client streaming tail" extension while otherwise keeping
- * server-wins semantics. The output replaces the result of the legacy
- * `messages: server.messages || []` overwrite at the three sync paths
- * (full fetch, partial fetch, 409 resolution).
- *
- * Algorithm:
- *
- *   1. For each server message s (in server order):
- *      - If local has same-id `l` AND `_localMessageSupersedes(l, s)` →
- *        push `_overlayServerAuthoritative(l, s)` (keeps local text/ref
- *        when both equal, else returns a fresh object so the DOM
- *        reconcile picks up the server-auth metadata change).
- *      - Else → push `s` (server-wins on this row).
- *
- *   2. Local-only rows: walked in local order, but only **trailing**
- *      assistant/thinking rows that pass `_isStreamingTail` survive.
- *      "Trailing" means: contiguous from the end of the local array,
- *      after the last id that also appeared in serverMsgs.
- *
- *      Rationale for trailing-only:
- *      - mid-array local-only id can only mean "another device deleted
- *        it" (Phase 0.1 server-authored rows can't materialize on
- *        client without the server first seeing them).
- *      - end-of-array local-only id with fresh `completedAt` is the
- *        "WS delta delivered, tape not yet flushed" case we want to
- *        preserve.
- *      - end-of-array local-only id with stale `completedAt` (page
- *        reload, cross-device delete just propagated) falls through
- *        the grace window and gets dropped.
- *
- *   3. Tool/agent-group rows go through Layer 1 stable-equality only
- *      (per `_localMessageSupersedes` whitelist). Local-only tool/
- *      agent-group rows are NOT preserved by step 2 — the grace tail
- *      filter rejects them by role. This is intentional: tool result
- *      structure (output/error/_completed) cannot be reconstructed by
- *      the client alone, so server-wins is the only safe choice.
- *
- * @param serverMsgs server-side message array (authoritative ordering)
- * @param localMsgs current local message array (may contain streaming tail)
- * @param now Date.now() at call time (injectable for tests)
- */
-export function _mergeServerWithLocalSuperset(serverMsgs, localMsgs, now = Date.now()) {
-  const server = Array.isArray(serverMsgs) ? serverMsgs : []
-  const local = Array.isArray(localMsgs) ? localMsgs : []
-  const localById = new Map()
-  for (const m of local) if (m?.id) localById.set(m.id, m)
-  const out = []
-  const seenServerIds = new Set()
-  for (const s of server) {
-    if (!s?.id) continue
-    seenServerIds.add(s.id)
-    const l = localById.get(s.id)
-    if (l && _localMessageSupersedes(l, s)) {
-      out.push(_overlayServerAuthoritative(l, s))
-    } else {
-      out.push(s)
+  // Step 1: pre-compute turn anchors on each side. Side-effect free —
+  // we never mutate input rows; lookups go through these Maps keyed by id.
+  // An anchor is the id of the most recent preceding user/system message
+  // in that side's natural order; user/system rows are their own anchor.
+  const anchorByLocalId = new Map()
+  {
+    let cur = null
+    for (const m of localArr) {
+      if (!m || typeof m.id !== 'string') continue
+      if (m.role === 'user' || m.role === 'system') cur = m.id
+      anchorByLocalId.set(m.id, cur)
     }
   }
-  // Walk local from the end backward, collecting trailing local-only rows
-  // that satisfy the streaming-tail criteria, until we hit a row that is
-  // either already covered by server or fails the grace check.
-  const trailing = []
-  for (let i = local.length - 1; i >= 0; i--) {
-    const m = local[i]
-    if (!m?.id) continue
-    if (seenServerIds.has(m.id)) break
-    if (!_isStreamingTail(m, now)) break
-    trailing.push(m)
+  const anchorByServerId = new Map()
+  const serverById = new Map()
+  {
+    let cur = null
+    for (const m of serverArr) {
+      if (!m || typeof m.id !== 'string') continue
+      if (m.role === 'user' || m.role === 'system') cur = m.id
+      anchorByServerId.set(m.id, cur)
+      serverById.set(m.id, m)
+    }
   }
-  trailing.reverse()
-  for (const m of trailing) out.push(m)
-  return out
+
+  // Step 2: overlay by id, drop cross-tab-deleted local rows, append server-only.
+  const consumedFromServer = new Set()
+  const merged = []
+  for (const lm of localArr) {
+    if (!lm || typeof lm.id !== 'string') {
+      // Defensive: id-less local rows have no canonical key. Pass through
+      // unchanged. All PERSISTED messages have string ids — this branch
+      // only covers transient mid-frame state (Codex v5 constraint 2).
+      merged.push(lm)
+      continue
+    }
+    const sm = serverById.get(lm.id)
+    if (!sm) {
+      // Local-only row. Cross-device delete discriminator:
+      //   - has finite `_seq` → server-confirmed at some past moment; its
+      //     absence from current server response means server deleted it
+      //     (cross-tab `splice(...)` + PUT) → DROP.
+      //   - no `_seq` → pending/in-flight (streaming asst, just-typed user
+      //     not yet PUT'd, etc.) → PRESERVE so streaming UX stays intact.
+      //
+      // Known residual-risk (Codex v6 round 3 note): legacy/backfill local
+      // rows from IDB pre-`_seq` schema also have no `_seq`. If another tab
+      // deleted such a row server-side and we receive the shorter response
+      // here, this helper would keep the row as "pending". `_computeSinceSeqForFetch`
+      // detects "any local row lacks _seq" and forces a full GET — that path
+      // still hits this branch and still preserves the legacy row. Acceptable
+      // by design: legacy rows are a vanishing population (every PUT round-trip
+      // stamps _seq onto them), and silently dropping them on a sync would be
+      // worse UX than the rare delete-not-propagated case.
+      const hasSeq = typeof lm._seq === 'number' && Number.isFinite(lm._seq)
+      if (!hasSeq) merged.push(lm)
+      // else: drop — server is authoritative for "exists at all"
+      continue
+    }
+    consumedFromServer.add(lm.id)
+    if (_localMessageSupersedes(lm, sm)) {
+      merged.push(_overlayServerAuthoritative(lm, sm))
+    } else {
+      merged.push(sm)
+    }
+  }
+  // Append server rows whose id wasn't consumed by overlay above.
+  // Includes non-`_source==='server'` rows like cross-tab user messages —
+  // those carry no `_source` flag but are still authoritative content the
+  // local cache hasn't seen yet.
+  for (const sm of serverArr) {
+    if (!sm || typeof sm.id !== 'string') continue
+    if (consumedFromServer.has(sm.id)) continue
+    merged.push(sm)
+  }
+
+  // Step 3: chronological sort by ts. Display order only — turn ownership
+  // for dedupe comes from anchors computed in step 1 (anchor-aware
+  // dedupe in step 5), NOT from this positional ordering.
+  merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+
+  // Step 4: compute effective anchor for each merged row.
+  // Codex v6 constraint: id-membership lookup (NOT which side the object
+  // ref came from). `_overlayServerAuthoritative` may return a local-shaped
+  // object after applying server fields, but the ROW is still server-known
+  // (id in serverById), so it must use server anchor.
+  const effectiveAnchor = new Array(merged.length)
+  let positionalFallback = null
+  for (let i = 0; i < merged.length; i++) {
+    const cur = merged[i]
+    if (!cur) { effectiveAnchor[i] = null; continue }
+    const role = cur.role
+    // Update positional fallback as we walk (for id-less defensive rows).
+    if ((role === 'user' || role === 'system') && typeof cur.id === 'string') {
+      positionalFallback = cur.id
+    }
+    if (typeof cur.id !== 'string') {
+      effectiveAnchor[i] = positionalFallback
+      continue
+    }
+    // ID-membership lookup: server-known id → server anchor (authoritative);
+    // local-only id → local anchor (preserves in-flight turn affinity).
+    if (serverById.has(cur.id)) {
+      const a = anchorByServerId.get(cur.id)
+      effectiveAnchor[i] = a !== undefined ? a : positionalFallback
+    } else {
+      const a = anchorByLocalId.get(cur.id)
+      effectiveAnchor[i] = a !== undefined ? a : positionalFallback
+    }
+  }
+
+  // Step 5: anchor-keyed phantom dedupe. We collect server-authored
+  // counterparts per anchor, then drop client phantoms whose effective
+  // anchor has a matching server counterpart.
+  const anchorHasServerAsst = new Map()
+  const anchorHasServerThinking = new Map()
+  const anchorServerToolBlockIds = new Map()
+  for (let i = 0; i < merged.length; i++) {
+    const cur = merged[i]
+    if (!cur || cur._source !== 'server') continue
+    const role = cur.role
+    const a = effectiveAnchor[i]
+    if (role === 'assistant') anchorHasServerAsst.set(a, true)
+    else if (role === 'thinking') anchorHasServerThinking.set(a, true)
+    else if (role === 'tool') {
+      const bid = cur.blockId
+      if (typeof bid === 'string' && bid.length > 0) {
+        let set = anchorServerToolBlockIds.get(a)
+        if (!set) {
+          set = new Set()
+          anchorServerToolBlockIds.set(a, set)
+        }
+        set.add(bid)
+      }
+    }
+  }
+
+  const deduped = []
+  for (let i = 0; i < merged.length; i++) {
+    const cur = merged[i]
+    if (!cur) { deduped.push(cur); continue }
+    const role = cur.role
+    // Keep server-authored rows and any non-(assistant|thinking|tool) row.
+    if (
+      cur._source === 'server' ||
+      (role !== 'assistant' && role !== 'thinking' && role !== 'tool')
+    ) {
+      deduped.push(cur)
+      continue
+    }
+    const a = effectiveAnchor[i]
+    if (role === 'assistant' && anchorHasServerAsst.get(a)) continue
+    if (role === 'thinking' && anchorHasServerThinking.get(a)) continue
+    if (role === 'tool') {
+      // Drop client tool ONLY when a server tool with matching blockId
+      // shares the same effective anchor. Tools without blockId (legacy /
+      // pre-allowlist-strip rows) are kept to avoid losing user-visible
+      // detail. Anchor-aware so cross-tab tool collisions on different
+      // turns don't accidentally dedupe each other.
+      const bid = cur.blockId
+      const bids = anchorServerToolBlockIds.get(a)
+      if (
+        typeof bid === 'string' &&
+        bid.length > 0 &&
+        bids &&
+        bids.has(bid)
+      ) continue
+    }
+    deduped.push(cur)
+  }
+  return deduped
 }
 
 /**
@@ -344,49 +512,6 @@ export function _rebuildBlockMaps(sess) {
   }
   sess._blockIdToMsgId = blockIdToMsg
   sess._agentGroups = agentGroups
-}
-
-/**
- * Overlay server-authoritative metadata onto the matching prefix of a
- * local-dominant message array, preserving the entire local suffix verbatim.
- *
- * Caller MUST have already verified `_localDominates(serverMsgs, localMsgs)`
- * — that guarantees `localMsgs.length >= serverMsgs.length` and id-positional
- * alignment over `[0, serverMsgs.length)`. The local suffix
- * `[serverMsgs.length, localMsgs.length)` is local-only content the server
- * hasn't yet seen (e.g. user messages typed between the preflight PUT and
- * the 409, or assistant rows the next PUT will push).
- *
- * Why this isn't `_mergeServerWithLocalSuperset`: that helper's contract is
- * "server timeline + fresh streaming tail only" — it drops any local suffix
- * row that doesn't pass `_isStreamingTail` (assistant/thinking in 5s grace).
- * Using it on local-dominates would silently truncate user messages and
- * tool/agent-group rows, then `target._dirty=true; dbPut()` would persist
- * the truncation. Real data loss.
- *
- * Why a non-mutating overlay (vs the pre-2026-05-12 in-place `lm[k]=sm[k]`):
- * messages.js WeakMap-keyed DOM reconcile uses message object identity as
- * its "DOM up-to-date" signal. In-place mutation leaves identity stable,
- * so usage/status/_seq overlays would never reach the DOM. This helper
- * returns the SAME ref when nothing differs (fast path; reconcile skips
- * the node) and a FRESH ref when a server-auth field actually changed
- * (reconcile detects mismatch and calls updateMessageEl).
- */
-export function _overlayServerOntoLocalDominant(localMsgs, serverMsgs) {
-  if (!Array.isArray(localMsgs)) return Array.isArray(serverMsgs) ? serverMsgs.slice() : []
-  const server = Array.isArray(serverMsgs) ? serverMsgs : []
-  const out = new Array(localMsgs.length)
-  for (let i = 0; i < localMsgs.length; i++) {
-    const lm = localMsgs[i]
-    if (i < server.length && lm && server[i] && lm.id === server[i].id) {
-      out[i] = _overlayServerAuthoritative(lm, server[i])
-    } else {
-      // Local suffix (i >= server.length) OR positional mismatch (should not
-      // happen post-_localDominates; defensive). Keep local row as-is.
-      out[i] = lm
-    }
-  }
-  return out
 }
 
 /**
@@ -459,9 +584,12 @@ export function _computeSinceSeqForFetch(localSess) {
  *      critical: counting client-only rows in the sanity check would
  *      always fail when local has a fresh streaming tail.
  *
- *   3. Append eligible client-only trailing rows (5s grace window per
- *      `_isStreamingTail`). These rows have no `_seq` and don't affect
- *      `expectedCount/maxSeq`, which is server-visible-only.
+ *   3. Run `_mergeServerAuthoredIntoLocal(serverVisible, local)` to produce
+ *      the final array. This re-applies the symmetric union+turn-group-
+ *      dedupe semantics, preserving in-flight client streaming tails while
+ *      dropping phantoms once server takeover landed. Mirrors the algorithm
+ *      used at the full-sync and 409-resolution paths — single source of
+ *      truth for "server timeline + local streaming tail" convergence.
  *
  * Why we can keep local with overlay (step 1) instead of forcing server
  * replacement: server-visible rows that local-supersedes either equal
@@ -469,7 +597,7 @@ export function _computeSinceSeqForFetch(localSess) {
  * leave the timeline correct; overlay restores `_seq/usage/...` so the
  * sanity arithmetic still works.
  */
-export function _mergePartialTail(localMessages, tail, expectedCount, expectedMaxSeq, now = Date.now()) {
+export function _mergePartialTail(localMessages, tail, expectedCount, expectedMaxSeq) {
   const local = Array.isArray(localMessages) ? localMessages : []
   const tailArr = Array.isArray(tail) ? tail : []
   const tailById = new Map()
@@ -517,20 +645,13 @@ export function _mergePartialTail(localMessages, tail, expectedCount, expectedMa
     if (s > serverVisibleMaxSeq) serverVisibleMaxSeq = s
   }
   if (serverVisibleMaxSeq !== expectedMaxSeq) return null
-  // Step 3: append eligible client-only streaming tail.
-  const serverVisibleIds = new Set()
-  for (const m of serverVisible) if (m?.id) serverVisibleIds.add(m.id)
-  const trailing = []
-  for (let i = local.length - 1; i >= 0; i--) {
-    const m = local[i]
-    if (!m?.id) continue
-    if (serverVisibleIds.has(m.id)) break
-    if (!_isStreamingTail(m, now)) break
-    trailing.push(m)
-  }
-  trailing.reverse()
-  for (const m of trailing) serverVisible.push(m)
-  return serverVisible
+  // Step 3: apply the canonical server-authored merger over the
+  // serverVisible view + the full local array. This brings back any client-
+  // only streaming tail (local rows without _seq that weren't included in
+  // serverVisible) and runs the turn-group dedupe that drops client phantoms
+  // when server takeover already exists. Symmetric with full-sync and
+  // 409-resolution code paths.
+  return _mergeServerAuthoredIntoLocal(serverVisible, local)
 }
 
 /**
@@ -811,18 +932,20 @@ export async function syncSessionsFromServer() {
     }
     // When the _liveStreamBroken+_dirty branch above already produced a
     // `mergedMessages`, use that (it preserves pending-user-msg ordering).
-    // Otherwise route the server payload through the per-message merger
-    // that keeps the WS streaming tail (5s grace) while otherwise
-    // accepting server state. Pre-2026-05-12 this was a bare
-    // `remote.messages || []` and lost the trailing assistant text when
-    // visibilitychange/focus/pageshow fired in the brief window between
-    // a turn ending and the server-side tape catching up.
+    // Otherwise route the server payload through `_mergeServerAuthoredIntoLocal`,
+    // which mirrors the server-side `mergePreservingServerAuthored`: client
+    // streaming tail is kept as a local-only row until server's Phase 0.1
+    // takeover lands, at which point the turn-group dedupe drops the phantom.
+    // Pre-2026-05-12 this was a bare `remote.messages || []` and lost the
+    // trailing assistant text when visibilitychange/focus/pageshow fired in
+    // the brief window between a turn ending and the server-side tape
+    // catching up.
     const sess = {
       id: remote.id,
       title: remote.title,
       createdAt: remote.createdAt,
       lastAt: remote.lastAt,
-      messages: mergedMessages || _mergeServerWithLocalSuperset(
+      messages: mergedMessages || _mergeServerAuthoredIntoLocal(
         remote.messages || [],
         existingLocal?.messages || [],
       ),
@@ -1131,22 +1254,21 @@ export function pushSessionToServer(sess) {
           // **不**覆盖 text/role/ts:这些字段在 _localDominates 判定时 local 已胜出
           // (否则不会进 local-dominates 分支),overlay 会破坏 streaming 扩展。
           //
-          // 2026-05-12 §3.x — overlay 改走 _overlayServerOntoLocalDominant。
-          // 之前是 in-place mutation (`lm[k] = sm[k]`),对象引用未变,
-          // WeakMap-keyed DOM reconcile 检测不到字段变化,usage/status/_truncated
-          // 在 DOM 上不刷新。_overlayServerAuthoritative 在有字段差异时返回新对象,
-          // 无差异时返回原 ref —— 既修了 reconcile 漏更新,又保留 fast-path。
-          //
-          // 关键:这里**不能**用 _mergeServerWithLocalSuperset。后者的契约是
-          // "server 时间线 + 仅保留 _isStreamingTail 通过的尾行",会丢弃 local
-          // 的 user / tool / 老 assistant 等非 streaming suffix → 然后 _dirty=true
-          // 持久化截断的 transcript,真正的数据丢失。_localDominates 已保证
-          // server 是 local 的 id-positional prefix,这里只需在该 prefix 上做
-          // server-auth overlay,完整保留 [server.length, local.length) 的 local
-          // suffix(那是 client 刚追加、下一轮 PUT 要推上去的内容)。
-          target.messages = _overlayServerOntoLocalDominant(
-            target.messages || [],
+          // 2026-05-12 §3.x — overlay 改走 _mergeServerAuthoredIntoLocal。
+          // 之前是 in-place mutation (`lm[k] = sm[k]`) 然后是
+          // `_overlayServerOntoLocalDominant`,两者都假设 server 必然是 local 的
+          // id-positional prefix。`_mergeServerAuthoredIntoLocal` 用 id-based
+          // overlay + 末尾追加 + ts-sort + turn-group dedupe,语义对所有分支
+          // 一致(full sync / partial / 409 local-dominates / 409 server-wins
+          // 都走同一份算法),不再分裂出"prefix 模式 vs server-timeline 模式"
+          // 两套实现。`_localDominates` 已保证 [0, server.length) 上 id 对齐 +
+          // local 胜过 server,merger 在这段上做 `_overlayServerAuthoritative`
+          // (有差异返回新对象,无差异返回原 ref);[server.length, local.length)
+          // 上 local-only 行原样保留(turn-group dedupe 只对在同 group 内有 server
+          // 权威对应行的 client phantom 起作用,与本场景无冲突)。
+          target.messages = _mergeServerAuthoredIntoLocal(
             server.messages || [],
+            target.messages || [],
           )
           _rebuildBlockMaps(target)
           _rebindStreamingPointers(target)
@@ -1202,15 +1324,16 @@ export function pushSessionToServer(sess) {
         // and server really has data we don't.
         if (live._dirty && live.lastAt > preFlightLastAt) return
 
-        // Merge with local streaming-tail superset rather than blind replace.
+        // Merge via `_mergeServerAuthoredIntoLocal` rather than blind replace.
         // Even in "server wins" branch, an in-flight assistant tail can be
         // racing ahead of server tape persistence; dropping it causes the
-        // mobile flash-and-loss bug. _mergeServerWithLocalSuperset keeps
-        // client-only messages in the 5s grace window and overlays server
-        // authoritative fields onto the server-visible prefix.
+        // mobile flash-and-loss bug. The merger keeps client-only rows as
+        // local-only when server has no takeover counterpart, and runs the
+        // turn-group phantom dedupe to drop client `m-…` rows once server's
+        // `srv-…` takeover row exists in the same group.
         Object.assign(target, {
           title: server.title,
-          messages: _mergeServerWithLocalSuperset(
+          messages: _mergeServerAuthoredIntoLocal(
             server.messages || [],
             target.messages || [],
           ),

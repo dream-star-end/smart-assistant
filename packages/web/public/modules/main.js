@@ -2343,7 +2343,7 @@ async function init() {
   // reconcile landed (messages.js Phase 2), renderMessages() on an unchanged
   // session is O(walk DOM, all WeakMap hits) → no DOM mutation. So we now
   // always call it: it correctly surfaces server-auth overlays (usage / status /
-  // _seq / _truncated) that _overlayServerOntoLocalDominant produced as fresh
+  // _seq / _truncated) that _mergeServerAuthoredIntoLocal produces as fresh
   // object refs on the matching prefix, without flicker.
   setSyncDeps({
     onSyncStatusChange: updateSyncIndicator,
