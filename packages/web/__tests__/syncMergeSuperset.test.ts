@@ -436,16 +436,123 @@ describe('_dropLegacyClientStreamRows (migration backstop)', () => {
     assert.deepEqual(out.map((m: any) => m.id), ['m-user-msg', 'srv-peer1-t1'])
   })
 
-  it('KEEPS tool rows regardless (predicate role-gated to asst/thinking)', () => {
+  // v1.0.135: predicate extended to include tool rows whose blockId matches
+  // a server-authored tool peer in the same turn group. The previous "tools
+  // out of scope" guarantee is intentionally dropped — keeping the legacy
+  // `m-*` tool placeholder caused the post-completion duplicate-card flash
+  // boss reported after v1.0.134.
+  it('KEEPS m-tool row when NO server-authored tool peer matches blockId', () => {
     const input = [
       M('u1', 'user', 'q', { ts: T0 }),
-      M('m-tool-old', 'tool', 'output', { ts: T1, blockId: 'b1' }),
+      M('m-tool-orphan', 'tool', 'output', { ts: T1, blockId: 'b1' }),
       M('srv-peer1-t1', 'assistant', 'reply', { ts: T2, _source: 'server' }),
     ]
     const out = _dropLegacyClientStreamRows(input)
     assert.deepEqual(out.map((m: any) => m.id),
-      ['u1', 'm-tool-old', 'srv-peer1-t1'],
-      'tool rows out of scope of legacy backstop')
+      ['u1', 'm-tool-orphan', 'srv-peer1-t1'],
+      'no server-tool peer (any blockId) in same group → m-tool preserved')
+  })
+
+  it('drops legacy m-tool row when server-authored tool with same blockId exists in same turn', () => {
+    const input = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('m-tool-legacy', 'tool', 'Bash', { ts: T1, blockId: 'tu_xyz' }),
+      M('srv-peer1-t1-tool-tu_xyz', 'tool', 'Bash',
+        { ts: T2, _source: 'server', _seq: 1, blockId: 'tu_xyz' }),
+      M('srv-peer1-t1', 'assistant', 'reply', { ts: T3, _source: 'server' }),
+    ]
+    const out = _dropLegacyClientStreamRows(input)
+    assert.deepEqual(out.map((m: any) => m.id),
+      ['u1', 'srv-peer1-t1-tool-tu_xyz', 'srv-peer1-t1'],
+      'legacy m-tool deduped against server tool with same blockId')
+  })
+
+  it('KEEPS m-tool row when server-authored tool with DIFFERENT blockId exists in same turn', () => {
+    // Cross-blockId no-op: the predicate is keyed on blockId equality. A
+    // server tool for blockId B does NOT shadow a client m-tool for blockId A.
+    const input = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('m-tool-a', 'tool', 'Bash', { ts: T1, blockId: 'A' }),
+      M('srv-peer1-t1-tool-B', 'tool', 'Read',
+        { ts: T2, _source: 'server', blockId: 'B' }),
+    ]
+    const out = _dropLegacyClientStreamRows(input)
+    assert.deepEqual(out.map((m: any) => m.id),
+      ['u1', 'm-tool-a', 'srv-peer1-t1-tool-B'],
+      'blockId mismatch → both kept')
+  })
+
+  it('KEEPS m-tool row when its server-authored peer is in a DIFFERENT turn group', () => {
+    // Strict false-negative we accept: if a server tool's ts somehow lands in
+    // the NEXT turn group (rare — master writes tool ts ≈ turn-end which is
+    // normally before the next user message), the user-boundary partition
+    // assigns them different groups and the predicate refuses to dedupe.
+    // Preferring a lingering duplicate over an accidental drop is the
+    // documented trade-off in the docstring.
+    const input = [
+      M('u1', 'user', 'q1', { ts: T0 }),
+      M('m-tool-turn1', 'tool', 'Bash', { ts: T1, blockId: 'tu_q1' }),
+      M('u2', 'user', 'q2', { ts: T2 }),
+      M('srv-peer1-t2-tool-tu_q1', 'tool', 'Bash',
+        { ts: T3, _source: 'server', blockId: 'tu_q1' }),
+    ]
+    const out = _dropLegacyClientStreamRows(input)
+    assert.deepEqual(out.map((m: any) => m.id),
+      ['u1', 'm-tool-turn1', 'u2', 'srv-peer1-t2-tool-tu_q1'],
+      'cross-group → strict no-dedupe (accepted false-negative)')
+  })
+
+  it('KEEPS m-tool row that lacks blockId entirely (predicate guard)', () => {
+    // Defensive: m-* rows that somehow miss the blockId field can never be
+    // matched against a server peer. The predicate's `typeof blockId ===
+    // string && blockId.length > 0` guard prevents accidental drops.
+    const input = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('m-tool-no-bid', 'tool', 'output', { ts: T1 }), // no blockId
+      M('srv-peer1-t1-tool-X', 'tool', 'Bash',
+        { ts: T2, _source: 'server', blockId: 'X' }),
+    ]
+    const out = _dropLegacyClientStreamRows(input)
+    assert.deepEqual(out.map((m: any) => m.id),
+      ['u1', 'm-tool-no-bid', 'srv-peer1-t1-tool-X'],
+      'missing blockId → kept')
+  })
+
+  it('KEEPS agent-group row even with matching blockId server tool (role !== tool)', () => {
+    // The Agent tool is intentionally NOT persisted server-side (parser filter
+    // in ccbMessageParser excludes Agent from completedTools), so a server-
+    // authored `role: tool` row with the agent's blockId shouldn't exist. But
+    // defense in depth: the predicate is role-gated to `tool`, so any
+    // pathological cross-role match is still safe.
+    const input = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('m-agent-group', 'agent-group', 'Agent',
+        { ts: T1, blockId: 'tu_agent', childBlocks: [{ kind: 'text', text: 'sub' }] }),
+      // Pathological server tool with matching blockId — must NOT trigger drop.
+      M('srv-peer1-t1-tool-tu_agent', 'tool', 'Agent',
+        { ts: T2, _source: 'server', blockId: 'tu_agent' }),
+    ]
+    const out = _dropLegacyClientStreamRows(input)
+    // m-agent-group preserved because role !== 'tool'. The pathological
+    // server tool stays too (predicate doesn't touch _source==='server' rows).
+    assert.deepEqual(out.map((m: any) => m.id),
+      ['u1', 'm-agent-group', 'srv-peer1-t1-tool-tu_agent'],
+      'role guard protects agent-group')
+  })
+
+  it('KEEPS m-tool row when peer carries blockId but _source !== "server" (defensive)', () => {
+    // Predicate ONLY counts `_source === 'server'` rows as canonical peers.
+    // A client-authored tool row (even with same blockId) shouldn't dedupe
+    // another client-authored row.
+    const input = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('m-tool-a', 'tool', 'Bash', { ts: T1, blockId: 'X' }),
+      M('m-tool-b', 'tool', 'Bash', { ts: T2, blockId: 'X' }), // also client
+    ]
+    const out = _dropLegacyClientStreamRows(input)
+    assert.deepEqual(out.map((m: any) => m.id),
+      ['u1', 'm-tool-a', 'm-tool-b'],
+      'no _source: server peer → no dedupe')
   })
 
   it('KEEPS m-* assistant if it already carries _source==="server" (defensive)', () => {

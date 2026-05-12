@@ -1282,6 +1282,12 @@ export class SessionManager {
     const projectedTurnIndex = session.turns + 1
     const assistantMessageId = `srv-${session.peerId}-t${projectedTurnIndex}`
     const thinkingMessageId = `srv-${session.peerId}-t${projectedTurnIndex}-thinking`
+    // V3 v7.1 — canonical tool row id factory. Same lifecycle as the
+    // assistant / thinking ids above (one per user turn, shared across
+    // retries). Format matches master's `internalServerAuthored.ts:511`
+    // so client + server tape agree on tool row id from frame 1.
+    const toolMessageIdFactory = (blockId: string): string =>
+      `srv-${session.peerId}-t${projectedTurnIndex}-tool-${blockId}`
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -1293,6 +1299,7 @@ export class SessionManager {
           traceId,
           assistantMessageId,
           thinkingMessageId,
+          toolMessageIdFactory,
         )
         return // success
       } catch (err: any) {
@@ -1430,6 +1437,12 @@ export class SessionManager {
      *  See runOneTurnWithRetry comment for full rationale. */
     assistantMessageId?: string,
     thinkingMessageId?: string,
+    /** V3 v7.1 — canonical tool row id factory. Same minting scope as the
+     *  assistant/thinking ids above (one factory per user turn, shared with
+     *  master's `internalServerAuthored` writer via the
+     *  `srv-${peerId}-t${turnIndex}-tool-${blockId}` format). Undefined for
+     *  personal-version legacy callers. */
+    toolMessageIdFactory?: (blockId: string) => string,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -1523,6 +1536,10 @@ export class SessionManager {
         // text/thinking block.
         assistantMessageId,
         thinkingMessageId,
+        // V3 v7.1 — tool row id factory (same lifecycle as the assistant /
+        // thinking ids above). Stamped on every main-agent top-level tool_use
+        // block emitted by this parser so client and master agree on row id.
+        toolMessageIdFactory,
         onToolUse: (tool) => {
           turnToolCallCount++
           // Bridge CCB CronCreate/CronDelete via EventBus

@@ -576,6 +576,12 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
   })
 
   it('subagent tools (parent_tool_use_id present) are NOT collected — Agent card owns durability', () => {
+    // v1.0.135: the top-level Agent tool itself is ALSO excluded from
+    // completedTools — the client renders it as `role: 'agent-group'`, and
+    // persisting a parallel `srv-*-tool-*` row would collide on canonical
+    // id with role mismatch (see ccbMessageParser.ts:832 docstring +
+    // ccbMessageParserMessageId.test.ts "Agent tool" suite). Subagent tools
+    // (parent_tool_use_id set) are also excluded — pre-v1.0.135 behavior.
     const { parser, getResult } = createParser()
     // Top-level Agent tool_use
     parser.parse({
@@ -602,10 +608,9 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
     parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
 
     const result = getResult()
-    // Only the top-level Agent tool is recorded; tu_sub excluded.
-    assert.equal(result.tools.length, 1)
-    assert.equal(result.tools[0].toolUseId, 'tu_agent')
-    assert.equal(result.tools[0].toolName, 'Agent')
+    // Both subagent (tu_sub) AND top-level Agent (tu_agent) are excluded.
+    assert.equal(result.tools.length, 0,
+      'Agent excluded by name filter; subagent tools excluded by parentToolUseId guard')
   })
 
   it('completedTools is publicly exposed for partial flush on interrupt/crash (sessionManager reads it)', () => {

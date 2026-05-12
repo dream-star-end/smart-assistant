@@ -322,46 +322,57 @@ export function _mergeServerAuthoredIntoLocal(serverMsgs, localMsgs) {
 
 /**
  * Legacy IDB migration backstop. **Technical debt** — slated for removal
- * once v1.0.134+ (the v7 cutover) has been live 14 days
- * (`_LEGACY_DROP_REMOVAL_TRIGGER` below).
+ * once v1.0.135+ (the v7 cutover + v7.1 tool-row alignment) has been
+ * live 14 days (`_LEGACY_DROP_REMOVAL_TRIGGER` below).
  *
- * Problem this solves: a user who was on v1.0.132 or earlier may have
- * `m-${ts36}-${rand}` assistant/thinking rows in IDB from a streaming
- * turn that completed under the old dual-id regime. After upgrade,
- * server's `mergePreservingServerAuthored` already added a canonical
- * `srv-${peerId}-tN` row for the same logical message — id-union would
- * keep BOTH in the merged output. UI would show duplicate assistant
- * cards for one turn.
+ * Problem this solves:
+ *  - v6 (≤ v1.0.132): m-${ts36}-${rand} assistant/thinking client rows
+ *    coexisted with srv-* server-authored rows for the same logical
+ *    message. After v7 cutover id-union would keep BOTH.
+ *  - v7.0 (v1.0.134): tool_use rows missed the canonical-id treatment —
+ *    client created `m-*` tool rows during streaming while master
+ *    persisted `srv-${peerId}-tN-tool-${blockId}` server-authored tool
+ *    rows. id-union kept both, server tool ts > client tool ts after
+ *    sort → server tool cards visually rendered AFTER assistant text
+ *    (the "post-completion flash" boss observed).
  *
  * Strict predicate (narrow on purpose — must NOT accidentally drop any
- * row outside the documented v6→v7 upgrade case):
+ * row outside the documented upgrade cases):
  *
  *   Drop merged row R iff ALL of:
- *     (a) R.role === 'assistant' || R.role === 'thinking'
+ *     (a) R.role ∈ {assistant, thinking, tool}
  *     (b) typeof R.id === 'string' && R.id.startsWith('m-')
- *     (c) R._source !== 'server'  — i.e. R is a client placeholder, not a
+ *     (c) R._source !== 'server'  — R is a client placeholder, not a
  *         canonical server row
  *     (d) The same turn group (bounded by the next user/system row
- *         walking forward, or end-of-array) contains a peer row R2 with:
- *           - R2.role === R.role
- *           - typeof R2.id === 'string' && R2.id.startsWith('srv-')
- *           - For thinking: R2.id endsWith '-thinking'; for assistant:
- *             R2.id does NOT endsWith '-thinking'
+ *         walking forward) contains a counterpart R2:
+ *           - assistant: R2.role === 'assistant' && R2.id startsWith 'srv-' && !endsWith '-thinking'
+ *           - thinking:  R2.role === 'thinking'  && R2.id startsWith 'srv-' && endsWith '-thinking'
+ *           - tool:      R2.role === 'tool' && R2._source === 'server' && R2.blockId === R.blockId
  *     Otherwise: keep.
  *
  * Anything that fails any of (a)-(d) is kept — including:
  *   - Empty-turn notice rows (no srv-* counterpart → kept)
  *   - In-flight streaming rows whose id is already `srv-*` (fail (b))
- *   - Tool rows (fail (a))
  *   - User rows (fail (a))
  *   - Server-authored rows themselves (fail (c))
+ *   - Tool rows whose blockId doesn't match any server tool (fail (d))
+ *
+ * **Known false-negative (accepted strict-predicate trade-off)**: if a
+ * legacy server-authored tool row's `ts` lands AFTER the next user
+ * message (rare — master writes tool ts = `baseTs - N + i` ~= turn-end,
+ * which is normally before the next user msg), the user-boundary group
+ * partition will place it in the NEXT turn group from its counterpart
+ * `m-*` client tool, and (d) will not match. Result: a single duplicate
+ * tool card lingers for that turn. Strict false-negative > strict
+ * false-positive (we never want to drop unrelated rows).
  *
  * Walk is single-pass: collect turn boundaries from the merged array
- * order (ts-sorted by caller). Per turn, build sets of "has srv-asst"
- * / "has srv-thinking", then second pass drops legacy `m-*` rows whose
- * group has the matching counterpart.
+ * order (ts-sorted by caller). Per turn, build sets of "has srv-asst" /
+ * "has srv-thinking" / "set of server-tool blockIds", then second pass
+ * drops legacy `m-*` rows whose group has the matching counterpart.
  */
-// _LEGACY_DROP_REMOVAL_TRIGGER: "remove after v1.0.134 has been live 14 days"
+// _LEGACY_DROP_REMOVAL_TRIGGER: "remove after v1.0.135 has been live 14 days"
 function _dropLegacyClientStreamRows(merged) {
   // Phase 1: walk merged once, assigning each row a numeric turn-group
   // index. Each user/system row starts a new group (its own index).
@@ -374,18 +385,32 @@ function _dropLegacyClientStreamRows(merged) {
     groupOf[i] = group
   }
 
-  // Phase 2: per group, record whether a srv-* assistant / thinking
-  // counterpart exists.
-  const hasSrvAsst = new Map()      // group → true
-  const hasSrvThinking = new Map()  // group → true
+  // Phase 2: per group, record whether srv-* assistant / thinking
+  // counterparts exist, and gather the set of server-authored tool
+  // blockIds. Tool predicate keys on `_source === 'server'` + matching
+  // `blockId` rather than id-prefix because (a) tool ids may come from
+  // master as `srv-${sessionId}-t${turnIndex}-tool-${blockId}` AND
+  // (b) the canonical authority signal for tools is `_source === 'server'`
+  // — same as storage's `mergePreservingServerAuthored:875-887`.
+  const hasSrvAsst = new Map()           // group → true
+  const hasSrvThinking = new Map()       // group → true
+  const groupServerToolBids = new Map()  // group → Set<blockId>
   for (let i = 0; i < merged.length; i++) {
     const m = merged[i]
-    if (!m || typeof m.id !== 'string') continue
-    if (!m.id.startsWith('srv-')) continue
-    if (m.role === 'assistant' && !m.id.endsWith('-thinking')) {
-      hasSrvAsst.set(groupOf[i], true)
-    } else if (m.role === 'thinking' && m.id.endsWith('-thinking')) {
-      hasSrvThinking.set(groupOf[i], true)
+    if (!m) continue
+    if (typeof m.id === 'string' && m.id.startsWith('srv-')) {
+      if (m.role === 'assistant' && !m.id.endsWith('-thinking')) {
+        hasSrvAsst.set(groupOf[i], true)
+      } else if (m.role === 'thinking' && m.id.endsWith('-thinking')) {
+        hasSrvThinking.set(groupOf[i], true)
+      }
+    }
+    if (m.role === 'tool' && m._source === 'server' &&
+        typeof m.blockId === 'string' && m.blockId.length > 0) {
+      const g = groupOf[i]
+      let set = groupServerToolBids.get(g)
+      if (!set) { set = new Set(); groupServerToolBids.set(g, set) }
+      set.add(m.blockId)
     }
   }
 
@@ -395,13 +420,17 @@ function _dropLegacyClientStreamRows(merged) {
     const m = merged[i]
     if (!m) { out.push(m); continue }
     const role = m.role
-    if ((role === 'assistant' || role === 'thinking') &&
+    if ((role === 'assistant' || role === 'thinking' || role === 'tool') &&
         typeof m.id === 'string' &&
         m.id.startsWith('m-') &&
         m._source !== 'server') {
       const g = groupOf[i]
       if (role === 'assistant' && hasSrvAsst.get(g)) continue
       if (role === 'thinking' && hasSrvThinking.get(g)) continue
+      if (role === 'tool' &&
+          typeof m.blockId === 'string' &&
+          m.blockId.length > 0 &&
+          groupServerToolBids.get(g)?.has(m.blockId)) continue
     }
     out.push(m)
   }

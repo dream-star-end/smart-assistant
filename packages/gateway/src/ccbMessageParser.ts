@@ -332,6 +332,20 @@ export class CcbMessageParser {
   /** Same as `assistantMessageId` but for thinking rows
    *  (`srv-${peerId}-t${turnIndex}-thinking`). */
   public thinkingMessageId?: string
+  /** V3 v7.1 — factory for canonical tool row ids minted server-side:
+   *  `srv-${peerId}-t${turnIndex}-tool-${blockId}`. Stamped on every
+   *  main-agent top-level tool_use block this parser emits (partial start,
+   *  input_json_delta partials, and the finalized snapshot in _handleAssistant).
+   *  Matches master's id format in internalServerAuthored.ts so client +
+   *  server tape agree on tool row id from frame 1, eliminating the
+   *  duplicate-tool-row bug that surfaced after v1.0.134's v7 cutover
+   *  (text/thinking aligned but tool rows missed → server-tool ts > client-
+   *  tool ts after sort, server tools appeared AFTER assistant text).
+   *  Subagent tool_use omits this — subagent content lives inside an
+   *  Agent card's childBlocks. Undefined for non-v7 callers (personal /
+   *  legacy paths) — block.messageId stays undefined and client falls
+   *  back to legacy `m-*` mint. */
+  public toolMessageIdFactory?: (blockId: string) => string
 
   constructor(opts: {
     toolUseIdToName: Map<string, string>
@@ -355,6 +369,8 @@ export class CcbMessageParser {
      *  (`runOneTurnWithRetry`) once per user turn. See field-level docs. */
     assistantMessageId?: string
     thinkingMessageId?: string
+    /** V3 v7.1 — see `toolMessageIdFactory` field-level docs. */
+    toolMessageIdFactory?: (blockId: string) => string
   }) {
     this.toolUseIdToName = opts.toolUseIdToName
     this.onEvent = opts.onEvent
@@ -364,6 +380,7 @@ export class CcbMessageParser {
     this._sessionTotals = opts.sessionTotals
     this.assistantMessageId = opts.assistantMessageId
     this.thinkingMessageId = opts.thinkingMessageId
+    this.toolMessageIdFactory = opts.toolMessageIdFactory
   }
 
   private _sessionTotals: {
@@ -529,6 +546,18 @@ export class CcbMessageParser {
       id: string | undefined,
     ): T => (parentToolUseId || !id ? block : ({ ...block, messageId: id } as T))
 
+    // V3 v7.1 — canonical-id stamper for main-agent top-level tool_use blocks.
+    // Mirrors `stampMainAgentId` but pulls the id from the factory (parser
+    // doesn't know blockId at construction). Same skip conditions: subagent
+    // tool_use (parentToolUseId set), no factory configured, or no blockId.
+    const stampToolUseId = <T extends Record<string, unknown>>(
+      block: T,
+      blockId: string | undefined,
+    ): T => {
+      if (parentToolUseId || !this.toolMessageIdFactory || !blockId) return block
+      return { ...block, messageId: this.toolMessageIdFactory(blockId) } as T
+    }
+
     if (ev.type === 'content_block_start') {
       const cb = ev.content_block
       if (cb?.type === 'tool_use' && cb.id && cb.name) {
@@ -537,13 +566,16 @@ export class CcbMessageParser {
         if (typeof ev.index === 'number') this.indexToToolId.set(ev.index, cb.id)
         this.onEvent({
           kind: 'block',
-          block: withParent({
-            kind: 'tool_use',
-            blockId: cb.id,
-            toolName: cb.name,
-            inputPreview: '',
-            partial: true,
-          }),
+          block: stampToolUseId(
+            withParent({
+              kind: 'tool_use',
+              blockId: cb.id,
+              toolName: cb.name,
+              inputPreview: '',
+              partial: true,
+            }),
+            cb.id,
+          ),
         })
       }
       return
@@ -606,13 +638,16 @@ export class CcbMessageParser {
           tool.partialJson += delta.partial_json
           this.onEvent({
             kind: 'block',
-            block: withParent({
-              kind: 'tool_use',
-              blockId: toolId!,
-              toolName: tool.name,
-              inputPreview: tool.partialJson.slice(0, 400),
-              partial: true,
-            }),
+            block: stampToolUseId(
+              withParent({
+                kind: 'tool_use',
+                blockId: toolId!,
+                toolName: tool.name,
+                inputPreview: tool.partialJson.slice(0, 400),
+                partial: true,
+              }),
+              toolId!,
+            ),
           })
         }
       }
@@ -711,6 +746,12 @@ export class CcbMessageParser {
           partial: false,
         }
         if (parentToolUseId) block.parentToolUseId = parentToolUseId
+        // V3 v7.1 — stamp canonical tool row id on main-agent finalized
+        // snapshot. Same gating as `stampToolUseId` in _handleStreamEvent:
+        // skip when subagent or factory absent.
+        else if (this.toolMessageIdFactory && c.id) {
+          block.messageId = this.toolMessageIdFactory(c.id)
+        }
         this.onEvent({ kind: 'block', block: block as any })
         if (streamed) streamed.done = true
       } else if (
@@ -788,19 +829,34 @@ export class CcbMessageParser {
           // input. This is rare but we still want to record the result.
           const pending = this.pendingToolUses.get(useId)
           if (pending) this.pendingToolUses.delete(useId)
-          this.completedTools.push(
-            _capToolEntry({
-              toolUseId: useId,
-              blockId: useId,
-              toolName,
-              inputJson: pending?.inputJson ?? {},
-              inputPreview: pending?.inputPreview ?? '',
-              output: preview,
-              isError: !!c.is_error,
-              durationMs,
-              ts: Date.now(),
-            }),
-          )
+          // V3 v7.1 — exclude the `Agent` tool from the durable server-authored
+          // snapshot. The web client renders Agent tools as `role: 'agent-group'`
+          // cards owning a `childBlocks` tree (subagent text / thinking /
+          // tool_use), not a flat `role: 'tool'` row. Persisting them as
+          // `srv-*-tool-*` rows server-side would (a) duplicate the agent
+          // card after refresh (server row coexists with client `m-* agent-group`),
+          // (b) fight back through `_localMessageSupersedes` (role mismatch
+          // → server wins, blowing away the childBlocks tree). Agent card
+          // durability is the client PUT path's responsibility (the full
+          // session including `agent-group` rows lands in `client_sessions.messages`).
+          // Regex match is case-insensitive to mirror the web side's
+          // `/^Agent$/i.test(...)` discriminator and stay aligned if CCB
+          // ever varies the casing.
+          if (!/^Agent$/i.test(toolName || '')) {
+            this.completedTools.push(
+              _capToolEntry({
+                toolUseId: useId,
+                blockId: useId,
+                toolName,
+                inputJson: pending?.inputJson ?? {},
+                inputPreview: pending?.inputPreview ?? '',
+                output: preview,
+                isError: !!c.is_error,
+                durationMs,
+                ts: Date.now(),
+              }),
+            )
+          }
           if (this.onToolResult) {
             this.onToolResult({
               toolUseId: useId,

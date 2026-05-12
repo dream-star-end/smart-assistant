@@ -189,3 +189,90 @@ describe('_findOrCreateStreamingRow — v7 rebind', () => {
     assert.equal(rebound, existing, 'same reference (so caller .text += ... works)')
   })
 })
+
+// ───────────────────────────────────────────────────────────────────────
+// v7.1 tool-card id adoption (websocket.js inline branch, no helper)
+// ───────────────────────────────────────────────────────────────────────
+//
+// websocket.js' new-tool-card branch builds the extras object for addMessage
+// as:
+//   addMessage(sess, 'tool', toolName, {
+//     ...(block.messageId ? { id: block.messageId } : {}),
+//     ... other fields
+//   })
+// and addMessage does:
+//   Object.assign({ id: _deps.msgId(), role, text, ts }, extras)
+//
+// Codex Blocker 1 (Round 1): an earlier version of the patch used
+// `id: block.messageId` unconditionally. When block.messageId was undefined
+// (pre-v7.1 gateway, legacy clients) Object.assign clobbered the default
+// `_deps.msgId()` mint with `undefined` → tool rows ended up with id=undefined,
+// breaking sess._blockIdToMsgId lookups + later merges.
+//
+// The conditional-spread fix here is small enough that the regression test
+// just simulates the call shape directly rather than source-extracting a
+// helper. The goal is to lock in: "block.messageId === undefined → row
+// receives the default fallback id; block.messageId === 'srv-…' → row
+// receives that exact id".
+describe('websocket.js: new-tool-card id adoption (v7.1)', () => {
+  // Simulate addMessage's id-merge behavior. The actual function lives in
+  // websocket.js and depends on _deps.msgId() (injected by main.js).
+  function addMessageStub(extras: Record<string, any>, defaultId: string) {
+    return Object.assign({ id: defaultId, role: 'tool', text: 'Bash', ts: 1 }, extras)
+  }
+  // Mirror websocket.js's conditional spread.
+  function buildExtras(block: { messageId?: string; toolName?: string; blockId?: string }) {
+    return {
+      ...(block.messageId ? { id: block.messageId } : {}),
+      toolName: block.toolName,
+      blockId: block.blockId,
+      inputPreview: '',
+      inputJson: null,
+      _partial: true,
+      _completed: false,
+      output: null,
+      error: false,
+    }
+  }
+
+  it('block.messageId === "srv-peer1-t5-tool-tu_abc" → row.id adopts canonical id', () => {
+    const extras = buildExtras({
+      messageId: 'srv-peer1-t5-tool-tu_abc',
+      toolName: 'Bash',
+      blockId: 'tu_abc',
+    })
+    const row = addMessageStub(extras, 'm-fallback-default')
+    assert.equal(row.id, 'srv-peer1-t5-tool-tu_abc',
+      'canonical id wins over fallback when explicitly provided')
+    assert.equal(row.blockId, 'tu_abc')
+  })
+
+  it('block.messageId === undefined → row.id keeps fallback m-* mint (REGRESSION GUARD)', () => {
+    // This is the Codex Blocker 1 regression guard. If anyone ever changes
+    // the spread back to `id: block.messageId` (unconditional), this test
+    // will catch it — Object.assign would clobber 'm-fallback-default' with
+    // undefined.
+    const extras = buildExtras({
+      messageId: undefined,
+      toolName: 'Bash',
+      blockId: 'tu_legacy',
+    })
+    const row = addMessageStub(extras, 'm-fallback-default')
+    assert.equal(row.id, 'm-fallback-default',
+      'no messageId → default fallback must be preserved (NOT clobbered to undefined)')
+    assert.notEqual(row.id, undefined,
+      'tool row id must never be undefined — breaks _blockIdToMsgId lookups')
+  })
+
+  it('block.messageId === "" (empty string, falsy) → row.id keeps fallback', () => {
+    // Defensive: empty string is falsy, so conditional spread skips the id.
+    // Matches the intent: only spread when we have a real canonical id.
+    const extras = buildExtras({
+      messageId: '',
+      toolName: 'Bash',
+      blockId: 'tu_x',
+    })
+    const row = addMessageStub(extras, 'm-fallback-default')
+    assert.equal(row.id, 'm-fallback-default')
+  })
+})

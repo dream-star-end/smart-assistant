@@ -161,6 +161,14 @@ export const OutboundContentBlock = Type.Union([
     // streaming: false | true — if true, a follow-up update with final input is coming
     partial: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),
+    // V3 v7.1 — canonical tool row id minted server-side at turn start:
+    // `srv-${peerId}-t${turnIndex}-tool-${blockId}`. Stamped on main-agent
+    // top-level tool_use blocks (parentToolUseId empty) so client + server
+    // tape agree on row id from the first partial onwards. Matches the id
+    // format master writes via packages/commercial/src/http/internalServerAuthored.ts.
+    // Subagent tool_use omits this — subagent tools live inside an Agent
+    // card's childBlocks, not as a top-level row.
+    messageId: Type.Optional(Type.String()),
   }),
   Type.Object({
     kind: Type.Literal('tool_result'),

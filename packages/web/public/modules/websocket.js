@@ -2157,8 +2157,18 @@ export function handleOutbound(frame) {
           }
         }
       } else {
-        // Create new tool card with structured data
+        // Create new tool card with structured data.
+        // v7.1: adopt server-minted canonical id (`srv-${peerId}-tN-tool-${blockId}`)
+        // when frame carries one, so master's `internalServerAuthored.ts:511`
+        // server-authored tool row lands on the SAME id at turn end (no
+        // duplicate row, no late-ts reorder past assistant text — the bug
+        // boss saw post-v1.0.134). Backwards-compat: addMessage merges
+        // extras over `{ id: _deps.msgId(), ... }` with Object.assign, so
+        // we MUST conditionally spread — passing `id: undefined` would
+        // clobber the default mint with undefined. Pre-v7.1 gateway omits
+        // messageId → fall through to legacy `m-*` mint, same as v1.0.134.
         const m = addMessage(sess, 'tool', block.toolName || 'unknown', {
+          ...(block.messageId ? { id: block.messageId } : {}),
           toolName: block.toolName,
           blockId: block.blockId,
           inputPreview: block.inputPreview || '',
