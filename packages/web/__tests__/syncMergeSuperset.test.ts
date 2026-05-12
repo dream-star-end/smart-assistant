@@ -253,15 +253,16 @@ describe('_mergeServerAuthoredIntoLocal (v7 id-union)', () => {
     const merged = _mergeServerAuthoredIntoLocal(server, local)
     assert.equal(merged.length, 2, 'no duplicate row — same id collapsed')
     assert.deepEqual(merged.map((m: any) => m.id), ['u1', 'srv-peer1-t1'])
-    // Overlay path: server fields (_source/_seq/usage) on top of local;
-    // since local text 'partial' is shorter than server's 'final canonical text',
-    // `_localMessageSupersedes` returns false at the overlay step — but the
-    // merger v7 calls `_overlayServerAuthoritative` directly on the local row
-    // regardless. Let's verify the merged row has BOTH server-auth fields AND
-    // some text:
+    // local 'partial' is shorter than server's 'final canonical text' AND
+    // not a prefix of it → `_localMessageSupersedes` Layer 2 returns false →
+    // server-wins branch. v7.2: server content wins but local ts is
+    // preserved as the visual sort key (here both sides have ts T1, so
+    // the ts value is unchanged; the invariant still applies).
+    assert.equal(merged[1].text, 'final canonical text')
     assert.equal(merged[1]._seq, 1)
     assert.equal(merged[1]._source, 'server')
     assert.equal(merged[1].usage.in, 5)
+    assert.equal(merged[1].ts, T1, 'local ts (==server ts here) preserved')
   })
 
   // ── Server-only rows (cross-tab additions) ──
@@ -348,6 +349,166 @@ describe('_mergeServerAuthoredIntoLocal (v7 id-union)', () => {
     ]
     const merged = _mergeServerAuthoredIntoLocal([], local)
     assert.deepEqual(merged.map((m: any) => m.id), ['b', 'a'])
+  })
+
+  // ── v7.2 (2026-05-13) ts-preservation invariant ──
+  // For any row whose id appears on BOTH client (streamed) and server
+  // (persisted), local `ts` wins as the visual sort key. Server still wins
+  // on CONTENT when `_localMessageSupersedes` is false, but the row's
+  // position in the timeline belongs to whoever saw it first. Fixes the
+  // v1.0.135 regression where master's post-stream `body.createdAt` ts
+  // for tool rows landed AFTER client's assistant ts, sorting tool cards
+  // below the assistant text.
+
+  it('v7.2 SAME-ID + server-wins-content: preserves local ts (tool role)', () => {
+    // Tool role is NOT in `_localMessageSupersedes` Layer 2 whitelist;
+    // Layer 1 deep-equal fails on server's `_seq` / `_source` / `status`
+    // → server-wins branch. Without the v7.2 fix, server's late ts would
+    // sort the tool below the assistant text.
+    const local = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('srv-peer1-t1-tool-blockA', 'tool', 'Bash', {
+        ts: T1,  // client streaming arrival — BEFORE assistant
+        toolName: 'Bash',
+        blockId: 'blockA',
+        _completed: true,
+        output: 'tool output',
+      }),
+      M('srv-peer1-t1', 'assistant', 'response text', { ts: T2 }),
+    ]
+    const server = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('srv-peer1-t1-tool-blockA', 'tool', 'Bash', {
+        ts: T4,  // server's post-stream baseTs - 1 ≈ persist time, AFTER assistant
+        toolName: 'Bash',
+        blockId: 'blockA',
+        _source: 'server',
+        _seq: 2,
+        status: 'completed',
+        output: 'tool output',
+      }),
+      M('srv-peer1-t1', 'assistant', 'response text', {
+        ts: T2,
+        _source: 'server',
+        _seq: 3,
+      }),
+    ]
+    const merged = _mergeServerAuthoredIntoLocal(server, local)
+    // After fix: tool row has server content (_seq, _source, status) but
+    // LOCAL ts T1, so it sorts BETWEEN user (T0) and assistant (T2).
+    assert.deepEqual(
+      merged.map((m: any) => m.id),
+      ['u1', 'srv-peer1-t1-tool-blockA', 'srv-peer1-t1'],
+      'tool keeps streaming position (above assistant), not server post-stream position',
+    )
+    const tool = merged[1]
+    assert.equal(tool.ts, T1, 'local ts preserved as visual sort key')
+    assert.equal(tool._source, 'server', 'server content fields applied')
+    assert.equal(tool._seq, 2)
+    assert.equal(tool.status, 'completed')
+  })
+
+  it('v7.2 SAME-ID + server-wins-content: preserves local ts (assistant role, role-independent)', () => {
+    // Force server-wins on an assistant row by making texts diverge in a
+    // way Layer 2 streaming-prefix-extension can't reconcile (server
+    // strictly shorter and not a prefix of local — wouldn't normally
+    // happen, but documents that the invariant is role-independent and
+    // not a tool-only patch).
+    const local = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('srv-peer1-t1', 'assistant', 'client-diverged text', { ts: T2 }),
+    ]
+    const server = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('srv-peer1-t1', 'assistant', 'authoritative final', {
+        ts: T4,  // server's post-stream ts > local ts
+        _source: 'server',
+        _seq: 5,
+      }),
+    ]
+    const merged = _mergeServerAuthoredIntoLocal(server, local)
+    assert.equal(merged[1].ts, T2, 'local ts kept even when server wins content')
+    assert.equal(merged[1].text, 'authoritative final', 'server content applied')
+    assert.equal(merged[1]._seq, 5)
+  })
+
+  it('v7.2 SERVER-ONLY row (no local counterpart) keeps server ts unchanged', () => {
+    // Cross-tab / cross-device addition: client never saw this row stream,
+    // server ts is the only source for its position.
+    const local = [M('u1', 'user', 'q', { ts: T0 })]
+    const server = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('cross-tab-msg', 'user', 'from other tab', { ts: T3 }),
+    ]
+    const merged = _mergeServerAuthoredIntoLocal(server, local)
+    const crossTab = merged.find((m: any) => m.id === 'cross-tab-msg')
+    assert.equal(crossTab.ts, T3, 'server-only row keeps server ts')
+  })
+
+  it('v7.2 SAME-ID + server-wins + local.ts undefined → fallback to server.ts (no NaN)', () => {
+    // Defensive: a malformed local row missing ts shouldn't poison the
+    // sort key. `lm.ts ?? sm.ts` falls back to server's ts.
+    const local = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      { id: 'srv-peer1-t1-tool-x', role: 'tool', text: 'Bash' },  // no ts
+    ]
+    const server = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('srv-peer1-t1-tool-x', 'tool', 'Bash', {
+        ts: T2,
+        _source: 'server',
+        _seq: 1,
+      }),
+    ]
+    const merged = _mergeServerAuthoredIntoLocal(server, local)
+    const tool = merged.find((m: any) => m.id === 'srv-peer1-t1-tool-x')
+    assert.equal(tool.ts, T2, 'fallback to server ts when local ts missing')
+    assert.ok(Number.isFinite(tool.ts), 'no NaN')
+  })
+
+  it('v7.2 multi-row turn preserves streaming order across server post-stream ts', () => {
+    // The core scenario from the bug report: a turn with thinking + tool +
+    // assistant. Client streamed them in order at T1 < T2 < T3. Server
+    // persists with baseTs ≈ T4 (post-stream): thinkingTs = T4-2,
+    // toolTs = T4-1, assistantTs = T4. Without v7.2, tool gets server ts
+    // T4-1 > T3 and renders below assistant.
+    const local = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('srv-peer1-t1-thinking', 'thinking', 'thinking...', { ts: T1 }),
+      M('srv-peer1-t1-tool-blockA', 'tool', 'Skill', {
+        ts: T2,
+        toolName: 'Skill',
+        blockId: 'blockA',
+        _completed: true,
+        output: 'skill result',
+      }),
+      M('srv-peer1-t1', 'assistant', 'final response', { ts: T3 }),
+    ]
+    const server = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('srv-peer1-t1-thinking', 'thinking', 'thinking...', {
+        ts: T4 - 2, _source: 'server', _seq: 1,
+      }),
+      M('srv-peer1-t1-tool-blockA', 'tool', 'Skill', {
+        ts: T4 - 1, _source: 'server', _seq: 2,
+        toolName: 'Skill', blockId: 'blockA', status: 'completed',
+      }),
+      M('srv-peer1-t1', 'assistant', 'final response', {
+        ts: T4, _source: 'server', _seq: 3,
+      }),
+    ]
+    const merged = _mergeServerAuthoredIntoLocal(server, local)
+    // Visual order: user → thinking → tool → assistant (streaming order).
+    assert.deepEqual(
+      merged.map((m: any) => m.id),
+      [
+        'u1',
+        'srv-peer1-t1-thinking',
+        'srv-peer1-t1-tool-blockA',
+        'srv-peer1-t1',
+      ],
+      'streaming order preserved despite server post-stream ts',
+    )
   })
 })
 

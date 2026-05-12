@@ -302,7 +302,23 @@ export function _mergeServerAuthoredIntoLocal(serverMsgs, localMsgs) {
       if (_localMessageSupersedes(lm, sm)) {
         merged.push(_overlayServerAuthoritative(lm, sm))
       } else {
-        merged.push(sm)
+        // v7.2 (2026-05-13) — INVARIANT: for any row whose id appears on
+        // both client (streamed) and server (persisted), the client's
+        // `ts` is the authoritative visual SORT key — it captures the
+        // actual arrival order the user saw render. Server's content
+        // (text/output/inputJson/_seq/usage/status) stays authoritative;
+        // only the visual POSITION belongs to whoever saw the row first.
+        //
+        // Why this matters (the v1.0.135 tool-row regression):
+        //   Server ts comes from `body.createdAt = Date.now()` at
+        //   `persistServerAuthoredTurn` invocation — POST-stream. For
+        //   tool rows, `_localMessageSupersedes` returns false here
+        //   (tool role not in Layer 2 whitelist; Layer 1 stableStringify
+        //   fails on `_seq`/`_source`/`status` divergence) → server
+        //   wins. Without this ts preservation, tool ts ≈ baseTs - 1 >
+        //   client's assistant ts T3, sorting the tool card BELOW the
+        //   assistant text the user already saw render above it.
+        merged.push({ ...sm, ts: lm.ts ?? sm.ts })
       }
     } else {
       // Local-only row: streaming tail (server takeover not yet written),
@@ -873,7 +889,13 @@ export async function syncSessionsFromServer() {
         if (!local?.id) continue
         const server = serverById.get(local.id)
         if (server) {
-          out.push(server)
+          // v7.2 — same invariant as `_mergeServerAuthoredIntoLocal`'s
+          // server-wins branch: server content is authoritative, but
+          // local ts wins as the visual sort key for any row the client
+          // saw stream in. Without this, this resume_failed recovery
+          // path would resurrect the post-stream server ts and put
+          // tool/thinking cards below the assistant text.
+          out.push({ ...server, ts: local.ts ?? server.ts })
           usedServerIds.add(local.id)
         } else if (local.role === 'user' && PENDING_SEND_STATUSES.has(local.status)) {
           out.push(local)
