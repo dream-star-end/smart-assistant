@@ -1351,6 +1351,179 @@ describe('T-MATH-FILL-CONTRACT: replacement works regardless of attribute order'
   })
 })
 
+// ── T-DOLLAR-DISPLAY: _scanDollarDisplayBody (markdown.js, 2026-05-13 表格单元格 $$ 修复) ──
+//
+// `mathBlock` (level: 'block') 用行首 `$$` 触发,marked 在表格单元格 / 列表项 inline
+// 上下文里只跑 inline 词法器,block-level 扩展从不触发;同时 `mathInline.tokenizer`
+// 第一行就 `if (src[0] !== '$' || src[1] === '$') return` 拒绝 `$$` 开头 —— 结果是
+// `$$..$$` 在 inline 上下文里没人接手,原样作为文本透出。
+//
+// 修法:新增 `mathDisplayInline` (level: 'inline') 扩展,直接消化 inline 上下文的
+// `$$..$$`,占位符用 `<span>`(不是 `<div>`,否则 `<td>`/`<p>` 内会被 HTML 解析
+// 器外提)。本测试覆盖底层 body scanner `_scanDollarDisplayBody` 的契约。
+const _scanDollarDisplayBody = makeCallable<(src: string, start: number) => ScanResult>(
+  extractFunction(appJs, '_scanDollarDisplayBody'),
+)
+
+describe('T-DOLLAR-DISPLAY: _scanDollarDisplayBody — inline $$..$$ body scanner', () => {
+  it('finds closer at end of body: `$$x$$` start=2 → closer=3', () => {
+    // src = '$$x$$', start=2 跳过开头 `$$`。closer 指向闭合 `$$` 的第一个 `$`,
+    // 即 idx 3。Body 是 src.slice(2, 3) = 'x'。
+    const r = _scanDollarDisplayBody('$$x$$', 2)
+    assert.deepEqual(r, { closer: 3, dead: false })
+  })
+  it('no closer in remaining src: `$$x` start=2 → closer=-1', () => {
+    const r = _scanDollarDisplayBody('$$x', 2)
+    assert.deepEqual(r, { closer: -1, dead: false })
+  })
+  it('TeX `\\\\` line break inside body is skipped (does not close on first `$` after `\\`)', () => {
+    // 关键反例:body 含 `\\` (TeX 行末换行)+ 之后的 `$$` 是真闭合。scanner 必须
+    // skip-2 跳过 `\\` 不把它当成单 `\` + 啥的 → 反斜杠引擎正确处理 TeX escape。
+    // src = '$$x\\\\$$y$$' 即 `$$x\\$$y$$`(7 字符 body 后才有真闭合):
+    //   idx 0,1: `$$` 开头
+    //   idx 2: `x`
+    //   idx 3: `\`        ← scanner 看到 `\`,skip 2 → 跳到 idx 5
+    //   idx 4: `\`           (被跳过,这就是 TeX `\\` 行末换行的左半边)
+    //   idx 5: `$`        ← 检查 src[5]='$' && src[6]='$' → true,closer=5
+    //   idx 6,7,8: '$y$$'
+    // 注意 idx 5 的 `$` 其实是 `\\` 后面紧跟的 `$`,跟 idx 6 的 `$` 组成闭合
+    const r = _scanDollarDisplayBody('$$x\\\\$$y$$', 2)
+    assert.equal(r.closer, 5)
+    assert.equal(r.dead, false)
+  })
+  it('escaped `\\$` in body does NOT close: `$$a\\$b$$` start=2 → closer at the real `$$`', () => {
+    // src = '$$a\\$b$$',`\$` 是字面 dollar 不应触发闭合。scanner 看到 `\` skip 2
+    // 跳过 `\$`,然后扫到 idx 6 = `$`,src[6]='$' && src[7]='$' → closer=6。
+    const r = _scanDollarDisplayBody('$$a\\$b$$', 2)
+    assert.equal(r.closer, 6)
+    assert.equal(r.dead, false)
+  })
+  it('newline aborts scan (single-line inline display): `$$x\\ny$$` start=2 → no closer', () => {
+    // Inline display 不允许跨行;遇 `\n` 立即 closer=-1。block-level mathBlock
+    // 负责多行 case。
+    const r = _scanDollarDisplayBody('$$x\ny$$', 2)
+    assert.deepEqual(r, { closer: -1, dead: false })
+  })
+  it('empty body but closer immediately: `$$$$` start=2 → closer=2', () => {
+    // start=2 时 src[2]='$' && src[3]='$' → closer=2。Body=src.slice(2,2)=空,
+    // 调用方(tokenizer)需在 trim 后独立拒绝空 body。
+    const r = _scanDollarDisplayBody('$$$$', 2)
+    assert.deepEqual(r, { closer: 2, dead: false })
+  })
+  it('start offset > 0: scanner begins where caller specifies', () => {
+    // 模拟 marked 没切干净:src=`prefix$$body$$`,start=8(跳过 `prefix$$`)。
+    const r = _scanDollarDisplayBody('prefix$$body$$', 8)
+    assert.equal(r.closer, 12) // src[12]='$' && src[13]='$'
+    assert.equal(r.dead, false)
+  })
+  it('lone trailing backslash at EOF (skip-2 past EOF) safely returns no closer', () => {
+    // `\` 后无字符,skip-2 把 p 推到 n+1,while 循环退出。不应抛。
+    const r = _scanDollarDisplayBody('$$x\\', 2)
+    assert.deepEqual(r, { closer: -1, dead: false })
+  })
+  it('dead flag is always false for inline display (no whole-render abort semantics)', () => {
+    // 跟 _scanCodexMathBody 不一样:codex display 是 multi-line,EOF 没闭合就置
+    // dead=true 让后续 `\[` 短路。inline `$$` 单行扫描,每次开新 scan,没有
+    // 全局 dead 概念,永远 false。
+    const r1 = _scanDollarDisplayBody('$$noclose', 2)
+    assert.equal(r1.dead, false)
+    const r2 = _scanDollarDisplayBody('$$crosses\nlines', 2)
+    assert.equal(r2.dead, false)
+  })
+})
+
+// ── T-INLINE-DISPLAY: confirm inline-level display extensions are wired ──
+describe('T-INLINE-DISPLAY: mathDisplayInline / codexDisplayInline wiring', () => {
+  it('mathDisplayInline extension registered', () => {
+    assert.ok(
+      appJs.includes("name: 'mathDisplayInline'"),
+      'mathDisplayInline missing — `$$..$$` in table cells will leak as raw text',
+    )
+  })
+  it('mathDisplayInline declared level: inline', () => {
+    // Block-level wouldn't fire in table cells; the whole point of this ext is
+    // to be inline. Regress check: catch refactors that flip it to block.
+    assert.ok(
+      /name:\s*['"]mathDisplayInline['"][\s\S]{0,200}level:\s*['"]inline['"]/.test(appJs),
+      "mathDisplayInline must declare level: 'inline'",
+    )
+  })
+  it('codexDisplayInline extension registered', () => {
+    assert.ok(
+      appJs.includes("name: 'codexDisplayInline'"),
+      'codexDisplayInline missing — `\\[..\\]` in table cells will leak as raw text',
+    )
+  })
+  it('codexDisplayInline declared level: inline', () => {
+    assert.ok(
+      /name:\s*['"]codexDisplayInline['"][\s\S]{0,200}level:\s*['"]inline['"]/.test(appJs),
+      "codexDisplayInline must declare level: 'inline'",
+    )
+  })
+  it('mathDisplayInline placeholder is <span> (NOT <div>)', () => {
+    // `<div>` inside `<td>`/`<p>` gets reparented by the HTML parser and breaks
+    // the table/paragraph structure. KaTeX displayMode output is `<span class=
+    // "katex-display">` so a span placeholder is correct + valid.
+    const block =
+      appJs.match(/name:\s*['"]mathDisplayInline['"][\s\S]*?renderer\([\s\S]*?\}\s*,?\s*\}/)?.[0] ||
+      ''
+    assert.ok(block.length > 0, 'could not locate mathDisplayInline renderer block')
+    assert.ok(
+      /<span\s+class="math-inline"\s+id="\$\{id\}">/.test(block),
+      'mathDisplayInline must emit <span class="math-inline" id="..."> placeholder',
+    )
+    assert.ok(
+      !/<div\s+class="math-block"\s+id="\$\{id\}">/.test(block),
+      'mathDisplayInline must NOT emit a <div> placeholder (would break <td>/<p> nesting)',
+    )
+  })
+  it('codexDisplayInline placeholder is <span> (NOT <div>)', () => {
+    const block =
+      appJs.match(/name:\s*['"]codexDisplayInline['"][\s\S]*?renderer\([\s\S]*?\}\s*,?\s*\}/)?.[0] ||
+      ''
+    assert.ok(block.length > 0, 'could not locate codexDisplayInline renderer block')
+    assert.ok(
+      /<span\s+class="math-inline"\s+id="\$\{id\}">/.test(block),
+      'codexDisplayInline must emit <span class="math-inline" id="..."> placeholder',
+    )
+    assert.ok(
+      !/<div\s+class="math-block"\s+id="\$\{id\}">/.test(block),
+      'codexDisplayInline must NOT emit a <div> placeholder',
+    )
+  })
+  it('both inline-display extensions push display:true to pendingMath', () => {
+    // 占位符即使是 span,KaTeX 仍按 displayMode:true 渲染(katex-display 包装)。
+    // 这条断言锁死"占位符 inline-shape ≠ 渲染 display-mode"的分离。
+    const mathBlock =
+      appJs.match(/name:\s*['"]mathDisplayInline['"][\s\S]*?renderer\([\s\S]*?\}\s*,?\s*\}/)?.[0] ||
+      ''
+    const codexBlock =
+      appJs.match(/name:\s*['"]codexDisplayInline['"][\s\S]*?renderer\([\s\S]*?\}\s*,?\s*\}/)?.[0] ||
+      ''
+    assert.ok(
+      /pendingMath\.push\(\{\s*id,\s*tex:\s*token\.text,\s*display:\s*true/.test(mathBlock),
+      'mathDisplayInline must push pendingMath with display:true',
+    )
+    assert.ok(
+      /pendingMath\.push\(\{\s*id,\s*tex:\s*token\.text,\s*display:\s*true/.test(codexBlock),
+      'codexDisplayInline must push pendingMath with display:true',
+    )
+  })
+  it('codexDisplayInline reuses _scanCodexMathBody with allowNewline=false', () => {
+    // 单行扫描跟 mathDisplayInline 对齐(`\]` 多行 case 留给 block-level
+    // codexDisplayMath)。第三个参数必须是 false。
+    const block =
+      appJs.match(
+        /name:\s*['"]codexDisplayInline['"][\s\S]*?tokenizer\(src\)\s*\{[\s\S]*?\},/,
+      )?.[0] || ''
+    assert.ok(block.length > 0, 'could not locate codexDisplayInline tokenizer block')
+    assert.ok(
+      /_scanCodexMathBody\(src,\s*2,\s*['"]\]['"],\s*false\)/.test(block),
+      'codexDisplayInline must call _scanCodexMathBody(src, 2, "]", false) for single-line scan',
+    )
+  })
+})
+
 // ── T10: Function extractor sanity ──
 describe('T10: Function extractor sanity checks', () => {
   it('can extract _basename source', () => {

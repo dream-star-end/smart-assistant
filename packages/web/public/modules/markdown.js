@@ -121,6 +121,14 @@ if (window.marked) {
   //   - Closing $ must NOT be followed by a word character (letter/digit)
   //   - Backslash escapes (e.g. \$) inside are skipped
   // No regex lookbehind is used, for Safari <16.4 compatibility.
+  //
+  // Inline-context display math: "$$...$$" (and "\[...\]" further below) inside
+  // a markdown table cell / list item / paragraph-internal inline run. marked
+  // routes those contexts through the **inline** lexer, where block-level
+  // mathBlock/codexDisplayMath never fire and mathInline/codexInlineMath
+  // explicitly reject the `$$`/`\[` delimiters. Without an inline-level handler
+  // for display math, raw `$$...$$` leaks out as text. The symmetric fix is to
+  // register inline-level siblings of the block-level display extensions.
   marked.use({
     extensions: [
       {
@@ -217,8 +225,81 @@ if (window.marked) {
           return `<span class="math-inline" id="${id}"></span>`
         },
       },
+      {
+        // Inline-level "$$...$$" — only matters in inline contexts (table cell,
+        // mid-paragraph) where block-level mathBlock cannot fire. mathInline
+        // never reports `$$` (right-OK check rejects `$` next char) and its
+        // tokenizer rejects `$$` opening too, so we own this delimiter here
+        // without contention.
+        name: 'mathDisplayInline',
+        level: 'inline',
+        start(src) {
+          const idx = src.indexOf('$$')
+          return idx < 0 ? undefined : idx
+        },
+        tokenizer(src) {
+          // marked may call tokenizer with full remaining src on first try
+          // (before honoring start()) — guard that we're actually on `$$`.
+          if (src[0] !== '$' || src[1] !== '$') return
+          const result = _scanDollarDisplayBody(src, 2)
+          if (result.closer < 0) return
+          const tex = src.slice(2, result.closer).trim()
+          if (!tex) return
+          const raw = src.slice(0, result.closer + 2)
+          return { type: 'mathDisplayInline', raw, text: tex }
+        },
+        renderer(token) {
+          if (_isStreamingParse) {
+            return htmlSafeEscape(`$$${token.text}$$`)
+          }
+          const id = `math-${Math.random().toString(36).slice(2, 10)}`
+          // displayMode KaTeX renders to `<span class="katex-display">`, so a
+          // `<span>` placeholder is the only HTML-valid choice inside `<td>` /
+          // `<p>` (a `<div>` would get reparented out by the HTML parser).
+          pendingMath.push({ id, tex: token.text, display: true })
+          return `<span class="math-inline" id="${id}"></span>`
+        },
+      },
     ],
   })
+}
+
+// `$$..$$` inline-context body scanner — single-line, TeX-backslash aware.
+// Mirrors `_scanCodexMathBody` for the dollar-double delimiter. Hoisted out of
+// the marked extension so pureFunctions.test.ts can lock its behavior without a
+// browser/marked dependency.
+//
+// Args:
+//   src   — full remaining source the tokenizer sees (must already start with `$$`)
+//   start — index to begin scanning the body from (caller passes 2 to skip `$$`)
+//
+// Returns:
+//   { closer:  i, dead: false } — `$$` closer found, src[i]==='$' && src[i+1]==='$'
+//   { closer: -1, dead: false } — newline hit OR EOF without closer (single-line)
+//
+// `dead` always false for inline scans — no whole-render abort semantics (those
+// belong to codexDisplayMath block-level dead-flag, where unclosed `\[`
+// poisons all subsequent `\[` openers to avoid O(n²)).
+function _scanDollarDisplayBody(src, start) {
+  const n = src.length
+  let p = start
+  while (p < n) {
+    const c = src[p]
+    // Inline display math is single-line: newline aborts the scan, leaves
+    // multiline display math to block-level mathBlock.
+    if (c === '\n') return { closer: -1, dead: false }
+    // TeX escape: `\\` (line break), `\$` (literal $), etc. — skip 2 chars so
+    // an escaped `$` inside the body never falsely closes the delimiter.
+    if (c === '\\') {
+      p += 2
+      continue
+    }
+    if (c === '$' && src[p + 1] === '$') {
+      return { closer: p, dead: false }
+    }
+    p++
+  }
+  return { closer: -1, dead: false }
 }
 
 // ── Media URL auto-detection and inline embedding ──
@@ -652,6 +733,37 @@ if (window.marked) {
           }
           const id = `math-${Math.random().toString(36).slice(2, 10)}`
           pendingMath.push({ id, tex: token.text, display: false })
+          return `<span class="math-inline" id="${id}"></span>`
+        },
+      },
+      {
+        // Inline-level "\[...\]" — symmetric sibling of codexDisplayMath, fires
+        // when `\[` appears inside an inline run (table cell, mid-paragraph)
+        // where the block-level extension never gets a chance.
+        name: 'codexDisplayInline',
+        level: 'inline',
+        start(src) {
+          const idx = src.indexOf('\\[')
+          return idx < 0 ? undefined : idx
+        },
+        tokenizer(src) {
+          if (src[0] !== '\\' || src[1] !== '[') return
+          // Single-line scan for inline context (mirrors mathDisplayInline);
+          // multiline `\[..\]` stays the block extension's domain.
+          const result = _scanCodexMathBody(src, 2, ']', false)
+          if (result.closer < 0) return
+          const tex = src.slice(2, result.closer).trim()
+          if (!tex) return
+          const raw = src.slice(0, result.closer + 2)
+          return { type: 'codexDisplayInline', raw, text: tex }
+        },
+        renderer(token) {
+          if (_isStreamingParse) {
+            return htmlSafeEscape(`\\[${token.text}\\]`)
+          }
+          const id = `math-${Math.random().toString(36).slice(2, 10)}`
+          pendingMath.push({ id, tex: token.text, display: true })
+          // span placeholder (not div) — see mathDisplayInline for rationale.
           return `<span class="math-inline" id="${id}"></span>`
         },
       },
