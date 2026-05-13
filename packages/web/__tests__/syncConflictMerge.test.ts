@@ -454,7 +454,6 @@ const _pushFnSrc =
   // _mergeServerAuthoredIntoLocal calls _dropLegacyClientStreamRows (v7
   // migration backstop) — must be in the same closure or merge throws.
   extractTopLevelFn(SYNC_SRC, '_dropLegacyClientStreamRows') + '\n' +
-  extractTopLevelFn(SYNC_SRC, '_enforceTurnGroupOrder') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_mergeServerAuthoredIntoLocal') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_rebuildBlockMaps') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers') + '\n' +

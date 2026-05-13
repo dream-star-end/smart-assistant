@@ -7,7 +7,7 @@ import { dbPut } from './db.js?v=720e1d08'
 import { $, htmlSafeEscape } from './dom.js?v=720e1d08'
 import { maybeNotify, setTitleBusy } from './notifications.js?v=720e1d08'
 import { _clearStoredAccessToken, getSession, state } from './state.js?v=720e1d08'
-import { maybeSyncNow } from './sync.js?v=720e1d08'
+import { maybeSyncNow } from './sync.js?v=28bbdea3'
 import { toast } from './ui.js?v=720e1d08'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。

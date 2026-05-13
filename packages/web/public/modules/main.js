@@ -49,7 +49,7 @@ import {
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js?v=720e1d08'
 
 // ── Cross-device sync ──
-import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=720e1d08'
+import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=28bbdea3'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js?v=720e1d08'
