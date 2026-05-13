@@ -59,6 +59,8 @@ const _combined =
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_dropLegacyClientStreamRows') +
   '\n' +
+  extractTopLevelFn(SYNC_SRC, '_enforceTurnGroupOrder') +
+  '\n' +
   extractTopLevelFn(SYNC_SRC, '_mergeServerAuthoredIntoLocal') +
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_computeSinceSeqForFetch') +

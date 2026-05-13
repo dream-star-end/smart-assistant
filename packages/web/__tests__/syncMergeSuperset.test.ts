@@ -63,6 +63,8 @@ const _combined =
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_dropLegacyClientStreamRows') +
   '\n' +
+  extractTopLevelFn(SYNC_SRC, '_enforceTurnGroupOrder') +
+  '\n' +
   extractTopLevelFn(SYNC_SRC, '_mergeServerAuthoredIntoLocal') +
   '\n' +
   extractTopLevelFn(SYNC_SRC, '_rebuildBlockMaps')
@@ -72,6 +74,7 @@ const _helpers = new Function(
     _overlayServerAuthoritative,
     _mergeServerAuthoredIntoLocal,
     _dropLegacyClientStreamRows,
+    _enforceTurnGroupOrder,
     _rebuildBlockMaps,
     _localMessageSupersedes,
   };`,
@@ -79,6 +82,7 @@ const _helpers = new Function(
   _overlayServerAuthoritative: (l: any, s: any) => any
   _mergeServerAuthoredIntoLocal: (s: any[], l: any[]) => any[]
   _dropLegacyClientStreamRows: (merged: any[]) => any[]
+  _enforceTurnGroupOrder: (merged: any[]) => any[]
   _rebuildBlockMaps: (sess: any) => void
   _localMessageSupersedes: (l: any, s: any) => boolean
 }
@@ -86,6 +90,7 @@ const {
   _overlayServerAuthoritative,
   _mergeServerAuthoredIntoLocal,
   _dropLegacyClientStreamRows,
+  _enforceTurnGroupOrder,
   _rebuildBlockMaps,
 } = _helpers
 
@@ -510,6 +515,50 @@ describe('_mergeServerAuthoredIntoLocal (v7 id-union)', () => {
       'streaming order preserved despite server post-stream ts',
     )
   })
+
+  it('v7.3 preamble-pattern: assistant text streamed BEFORE tool_use → tool still rendered ABOVE assistant', () => {
+    // Real-world ccb-agent regression (DeepSeek "Let me check..." → Bash):
+    // client receives text delta first (creates assistant row id=srv-X-t1,
+    // ts=T2), then tool_use block start (creates tool row id=srv-X-t1-tool-A,
+    // ts=T3 > T2). v7.2 alone (preserve client ts) sorts assistant ABOVE
+    // tool — wrong. v7.3 _enforceTurnGroupOrder fixes within-turn order by
+    // canonical-id kind regardless of arrival ts.
+    const local = [
+      M('u1', 'user', 'q', { ts: T0 }),
+      M('srv-peer1-t1-thinking', 'thinking', 'analyzing', { ts: T1 }),
+      M('srv-peer1-t1', 'assistant', 'Let me check...', { ts: T2 }),
+      M('srv-peer1-t1-tool-blockA', 'tool', 'Bash', { ts: T3, toolName: 'Bash' }),
+    ]
+    // Server post-stream takeover writes canonical rows with its own ts
+    // (master policy: tool ts < assistant ts). _localMessageSupersedes
+    // returns false for tool/thinking → server wins on content; v7.2
+    // preserves client ts; v7.3 then enforces kind ordering.
+    const baseTs = T0 + 1000
+    const server = [
+      M('u1', 'user', 'q', { ts: T0, _seq: 1 }),
+      M('srv-peer1-t1-thinking', 'thinking', 'analyzing', {
+        ts: baseTs - 2, _source: 'server', _seq: 2,
+      }),
+      M('srv-peer1-t1-tool-blockA', 'tool', 'Bash', {
+        ts: baseTs - 1, _source: 'server', _seq: 3,
+        toolName: 'Bash', output: 'ok', _completed: true,
+      }),
+      M('srv-peer1-t1', 'assistant', 'Let me check... done.', {
+        ts: baseTs, _source: 'server', _seq: 4,
+      }),
+    ]
+    const merged = _mergeServerAuthoredIntoLocal(server, local)
+    assert.deepEqual(
+      merged.map((m: any) => m.id),
+      [
+        'u1',
+        'srv-peer1-t1-thinking',
+        'srv-peer1-t1-tool-blockA',
+        'srv-peer1-t1',
+      ],
+      'preamble-pattern: tool card rendered ABOVE assistant text',
+    )
+  })
 })
 
 // ═══════════════════════════════════════════════════════════════════
@@ -825,5 +874,187 @@ describe('_rebuildBlockMaps', () => {
     _rebuildBlockMaps(sess)
     assert.equal(sess._blockIdToMsgId.size, 0)
     assert.equal(sess._agentGroups.size, 0)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// _enforceTurnGroupOrder (v7.3 — canonical-id within-turn sort)
+// ═══════════════════════════════════════════════════════════════════
+
+describe('_enforceTurnGroupOrder (v7.3)', () => {
+  const T0 = 1_700_000_000_000
+
+  it('reorders preamble-pattern turn: assistant ts < tool ts → tool above assistant', () => {
+    // Bug reproduction: agent emitted text BEFORE tool_use within one turn.
+    // Client arrival order (already sorted by ts): user → thinking → asst → tool.
+    // Expected after enforce: user → thinking → tool → asst.
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q', ts: T0 },
+      { id: 'srv-s-t1-thinking', role: 'thinking', text: 'h', ts: T0 + 10 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'preamble', ts: T0 + 20 },
+      { id: 'srv-s-t1-tool-x', role: 'tool', text: 'Bash', ts: T0 + 30 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'srv-s-t1-thinking', 'srv-s-t1-tool-x', 'srv-s-t1'],
+    )
+  })
+
+  it('leaves natural codex order untouched: thinking → tool → asst already correct', () => {
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q', ts: T0 },
+      { id: 'srv-s-t1-thinking', role: 'thinking', text: 'h', ts: T0 + 10 },
+      { id: 'srv-s-t1-tool-x', role: 'tool', text: 'Bash', ts: T0 + 20 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'reply', ts: T0 + 30 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'srv-s-t1-thinking', 'srv-s-t1-tool-x', 'srv-s-t1'],
+    )
+  })
+
+  it('preserves relative order of multiple same-kind rows by ts', () => {
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q', ts: T0 },
+      { id: 'srv-s-t1-thinking', role: 'thinking', text: 'h', ts: T0 + 10 },
+      { id: 'srv-s-t1-tool-a', role: 'tool', text: 'Bash1', ts: T0 + 20 },
+      { id: 'srv-s-t1-tool-b', role: 'tool', text: 'Bash2', ts: T0 + 30 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'reply', ts: T0 + 40 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'srv-s-t1-thinking', 'srv-s-t1-tool-a', 'srv-s-t1-tool-b', 'srv-s-t1'],
+    )
+  })
+
+  it('does NOT swap srv rows across user/system boundary', () => {
+    // Stale/server-only late-arrival case: srv-s-t1 assistant and
+    // srv-s-t1-tool-x bracketed by user2. The earlier algorithm would
+    // swap them; this version must keep both in their own segments.
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q1', ts: T0 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'preamble', ts: T0 + 100 },
+      { id: 'u2', role: 'user', text: 'q2', ts: T0 + 200 },
+      { id: 'srv-s-t1-tool-x', role: 'tool', text: 'late tool', ts: T0 + 300 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'srv-s-t1', 'u2', 'srv-s-t1-tool-x'],
+      'cross-boundary swap forbidden',
+    )
+  })
+
+  it('reorders each segment independently (multi-turn timeline)', () => {
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q1', ts: T0 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'r1 preamble', ts: T0 + 10 },
+      { id: 'srv-s-t1-tool-a', role: 'tool', text: 'B1', ts: T0 + 20 },
+      { id: 'u2', role: 'user', text: 'q2', ts: T0 + 100 },
+      { id: 'srv-s-t2-thinking', role: 'thinking', text: 'h', ts: T0 + 110 },
+      { id: 'srv-s-t2', role: 'assistant', text: 'r2 preamble', ts: T0 + 120 },
+      { id: 'srv-s-t2-tool-b', role: 'tool', text: 'B2', ts: T0 + 130 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      [
+        'u1',
+        'srv-s-t1-tool-a',
+        'srv-s-t1',
+        'u2',
+        'srv-s-t2-thinking',
+        'srv-s-t2-tool-b',
+        'srv-s-t2',
+      ],
+    )
+  })
+
+  it('leaves agent-group / m-* rows in place (known limitation)', () => {
+    // agent-group has m-* id, no canonical turnKey — parser returns null
+    // for it, so it is NOT in any turnGroup. The two srv rows are still
+    // reordered among themselves at THEIR indices; agent-group stays put.
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q', ts: T0 },
+      { id: 'srv-s-t1-thinking', role: 'thinking', text: 'h', ts: T0 + 10 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'preamble', ts: T0 + 20 },
+      { id: 'm-agentgrp', role: 'agent-group', text: 'sub', ts: T0 + 30 },
+      { id: 'srv-s-t1-tool-x', role: 'tool', text: 'Bash', ts: T0 + 40 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    // srv rows reorder at their indices 1,2,4 (skipping agent-group at idx 3):
+    // sorted by kind → thinking, tool, asst → placed at indices 1, 2, 4.
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'srv-s-t1-thinking', 'srv-s-t1-tool-x', 'm-agentgrp', 'srv-s-t1'],
+    )
+  })
+
+  it('classifies tool id with blockId ending in -thinking as tool (parser defense)', () => {
+    // Defensive ordering: a hypothetical blockId ending in "-thinking" must
+    // be parsed as tool, not as a thinking row.
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q', ts: T0 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'p', ts: T0 + 10 },
+      { id: 'srv-s-t1-tool-toolu_abc-thinking', role: 'tool', text: 'Bash', ts: T0 + 20 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'srv-s-t1-tool-toolu_abc-thinking', 'srv-s-t1'],
+      'tool with -thinking-suffixed blockId still classified as tool',
+    )
+  })
+
+  it('handles single-row turn (no-op)', () => {
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q', ts: T0 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'r', ts: T0 + 10 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'srv-s-t1'],
+    )
+  })
+
+  it('handles thinking-only turn', () => {
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q', ts: T0 },
+      { id: 'srv-s-t1-thinking', role: 'thinking', text: 'h', ts: T0 + 10 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'srv-s-t1-thinking'],
+    )
+  })
+
+  it('handles empty array', () => {
+    const merged: any[] = []
+    _enforceTurnGroupOrder(merged)
+    assert.deepEqual(merged, [])
+  })
+
+  it('handles m-* legacy assistant + srv-* same turn (parser ignores m-*)', () => {
+    // m-* row is not in any turnGroup, stays in its ts-sorted position.
+    // _dropLegacyClientStreamRows (called after _enforceTurnGroupOrder in
+    // the real flow) handles dropping the m-* duplicate; this test isolates
+    // the ordering layer.
+    const merged = [
+      { id: 'u1', role: 'user', text: 'q', ts: T0 },
+      { id: 'm-old-a', role: 'assistant', text: 'legacy', ts: T0 + 10 },
+      { id: 'srv-s-t1', role: 'assistant', text: 'preamble', ts: T0 + 20 },
+      { id: 'srv-s-t1-tool-x', role: 'tool', text: 'Bash', ts: T0 + 30 },
+    ]
+    _enforceTurnGroupOrder(merged)
+    // srv rows at indices 2,3 swap (tool kind=1 < asst kind=2); m-* at idx 1 untouched.
+    assert.deepEqual(
+      merged.map((m) => m.id),
+      ['u1', 'm-old-a', 'srv-s-t1-tool-x', 'srv-s-t1'],
+    )
   })
 })

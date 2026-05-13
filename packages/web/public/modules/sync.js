@@ -333,7 +333,94 @@ export function _mergeServerAuthoredIntoLocal(serverMsgs, localMsgs) {
   }
   merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
 
-  return _dropLegacyClientStreamRows(merged)
+  return _dropLegacyClientStreamRows(_enforceTurnGroupOrder(merged))
+}
+
+/**
+ * v7.3 (2026-05-13): Enforce within-turn visual ordering by canonical
+ * srv-id structure, not arrival ts.
+ *
+ * Why ts can't be the visual-order authority: ts is arrival time. When
+ * an agent emits preamble text before tool_use (e.g., DeepSeek "Let me
+ * check..." → Bash), the client creates the assistant row first
+ * (ts=T1) and the tool row later (ts=T2 > T1). v7.2 preserves client
+ * arrival ts on srv-stamped rows, so the post-sort visual order would
+ * be assistant ABOVE tool — wrong (expected: thinking → tool →
+ * assistant within a turn).
+ *
+ * Canonical id `srv-${sessionId}-t${N}[-thinking|-tool-${blockId}]`
+ * already encodes the desired logical position. This pass reorders
+ * same-turn srv rows by kind: thinking(0) < tool(1) < assistant(2).
+ *
+ * Scope of the reorder: only WITHIN one inter-`user`/`system`
+ * boundary segment. Server-only / stale / late-arriving srv rows may
+ * have ts drifted past the next user message; swapping them across a
+ * user boundary would break causality. The segment scan bounds the
+ * reorder so cross-boundary positioning stays controlled by ts and
+ * the existing legacy/drop predicates.
+ *
+ * Known limitation: `agent-group` rows (m-* id, no canonical turnKey)
+ * are not reordered. If a turn emits preamble text then invokes the
+ * Agent tool, the assistant card may still visually land above the
+ * agent-group card. Follow-up if observed; this fix scope intentionally
+ * targets canonical srv-* rows only (no m-* turn-membership inference).
+ */
+function _enforceTurnGroupOrder(merged) {
+  function parseTurn(m) {
+    if (!m) return null
+    const id = m.id
+    if (typeof id !== 'string' || !id.startsWith('srv-')) return null
+    // Tool first (defensive ordering): a hypothetical blockId ending
+    // in '-thinking' would otherwise be misclassified as a thinking row.
+    const toolMarkerIdx = id.lastIndexOf('-tool-')
+    if (toolMarkerIdx > 0) {
+      const prefix = id.slice(0, toolMarkerIdx)
+      if (/-t\d+$/.test(prefix)) return { turnKey: prefix, kind: 1 }
+    }
+    // Thinking: srv-...-tN-thinking
+    if (id.endsWith('-thinking')) {
+      const turnKey = id.slice(0, -'-thinking'.length)
+      if (/-t\d+$/.test(turnKey)) return { turnKey, kind: 0 }
+      return null
+    }
+    // Assistant: srv-...-tN
+    if (/-t\d+$/.test(id)) return { turnKey: id, kind: 2 }
+    return null
+  }
+  function enforceRange(start, end) {
+    const turnGroups = new Map()
+    for (let i = start; i < end; i++) {
+      const p = parseTurn(merged[i])
+      if (!p) continue
+      let entry = turnGroups.get(p.turnKey)
+      if (!entry) {
+        entry = []
+        turnGroups.set(p.turnKey, entry)
+      }
+      entry.push({ idx: i, kind: p.kind, ts: merged[i].ts ?? 0, row: merged[i] })
+    }
+    for (const entries of turnGroups.values()) {
+      if (entries.length <= 1) continue
+      const indices = entries.map((e) => e.idx).sort((a, b) => a - b)
+      const sortedRows = entries.slice().sort((a, b) => {
+        if (a.kind !== b.kind) return a.kind - b.kind
+        return a.ts - b.ts
+      })
+      for (let j = 0; j < indices.length; j++) {
+        merged[indices[j]] = sortedRows[j].row
+      }
+    }
+  }
+  let start = 0
+  for (let end = 0; end <= merged.length; end++) {
+    const atEnd = end === merged.length
+    const isBoundary = !atEnd && (merged[end]?.role === 'user' || merged[end]?.role === 'system')
+    if (atEnd || isBoundary) {
+      if (end > start) enforceRange(start, end)
+      start = end + (isBoundary ? 1 : 0)
+    }
+  }
+  return merged
 }
 
 /**
@@ -909,7 +996,13 @@ export async function syncSessionsFromServer() {
       for (const s of remote.messages || []) {
         if (s?.id && !usedServerIds.has(s.id)) out.push(s)
       }
-      mergedMessages = out
+      // v7.3 (2026-05-13): canonicalize within-turn srv-row ordering here
+      // too. This branch walks local ordering (not sort-by-ts), so a
+      // preamble-pattern turn that locally arrived as
+      // [..., asst(srv-tN), tool(srv-tN-tool-X)] would otherwise survive
+      // the recovery with assistant above tool. Same helper, same
+      // boundary-segment scope.
+      mergedMessages = _enforceTurnGroupOrder(out)
     } else if (existingLocal?._dirty && !existingLocal?._liveStreamBroken) {
       continue
     }
