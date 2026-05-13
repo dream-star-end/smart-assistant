@@ -12,6 +12,10 @@ import { toast } from './ui.js?v=4d8754d4'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
 import { refreshBalance, _openTopupModal } from './billing.js?v=4d8754d4'
+// Diagnostic trace for the WS → IndexedDB → server PUT persistence chain.
+// trace() is a no-side-effect ring writer; flushTrace happens off the
+// critical path (sessions.js _doSave finally + isFinal+1500ms backup).
+import { trace, flushTrace } from './trace.js?v=4d8754d4'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -383,6 +387,7 @@ export function addMessage(sess, role, text, extra) {
   const msg = Object.assign({ id: _deps.msgId(), role, text: text || '', ts: Date.now() }, extra)
   sess.messages.push(msg)
   sess.lastAt = Date.now()
+  trace('msg.add', { sess: sess.id, role, id: msg.id, textLen: (text || '').length })
   if (role === 'user') {
     const userCount = sess.messages.filter((m) => m.role === 'user').length
     if (userCount === 1) {
@@ -1613,6 +1618,19 @@ export function connect() {
           keys: f && typeof f === 'object' ? Object.keys(f).slice(0, 16) : [],
         })
       } catch {}
+      // Diagnostic trace: dispatch exception is one of the fault paths the
+      // "已读但无回复" instrumentation must cover. Without this, handleOutbound
+      // could record `ws.frame.in` and then throw before reaching addMessage /
+      // turn.final / save.schedule, leaving an unflushed ring that none of the
+      // three regular triggers (_doSave finally / isFinal+1500ms / unload) can
+      // pick up — exactly the kind of silent gap we're chasing. Both calls are
+      // best-effort: trace() & flushTrace() each swallow their own errors.
+      try { trace('ws.dispatch.err', {
+        sess: f?.peer?.id ?? null,
+        type: typeof f?.type === 'string' ? f.type : null,
+        msg: String(e?.message ?? e).slice(0, 120),
+      }) } catch {}
+      try { flushTrace({ sessId: f?.peer?.id ?? null }) } catch {}
     }
   }
 }
@@ -1676,6 +1694,12 @@ export function buildToolUseLabel(block) {
 export function handleOutbound(frame) {
   const peerId = frame.peer?.id
   let sess = peerId ? state.sessions.get(peerId) : null
+  trace('ws.frame.in', {
+    sess: sess?.id ?? peerId ?? null,
+    seq: frame.frameSeq ?? null,
+    isFinal: !!frame.isFinal,
+    blocks: Array.isArray(frame.blocks) ? frame.blocks.length : 0,
+  })
   if (!sess) {
     if (frame.cronJob) {
       // Cron/task push for unknown peer: show in current session with cron badge
@@ -1689,6 +1713,7 @@ export function handleOutbound(frame) {
     } else {
       // Unknown peerId: silently ignore
       console.warn('[ws] Ignoring frame for unknown peer:', peerId)
+      trace('ws.frame.drop', { sess: peerId, reason: 'unknown_peer' })
       return
     }
   }
@@ -1701,6 +1726,7 @@ export function handleOutbound(frame) {
   if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
     const last = sess._lastFrameSeq || 0
     if (frame.frameSeq <= last) {
+      trace('ws.frame.drop', { sess: sess.id, reason: 'dedupe', seq: frame.frameSeq, lastSeq: last })
       return // already processed — drop silently
     }
     sess._lastFrameSeq = frame.frameSeq
@@ -1778,6 +1804,7 @@ export function handleOutbound(frame) {
           frameTs: frame.ts,
           targetTs: boundMsg.ts,
         })
+        trace('ws.frame.drop', { sess: sess.id, reason: 'stale_final_predates_user_msg' })
         return
       }
     } else if (
@@ -1789,6 +1816,7 @@ export function handleOutbound(frame) {
         frameTs: frame.ts,
         trackerResetAt: sess._trackerResetAt,
       })
+      trace('ws.frame.drop', { sess: sess.id, reason: 'stale_final_predates_tracker_reset' })
       return
     }
   }
@@ -1796,9 +1824,15 @@ export function handleOutbound(frame) {
   if (sess._sendingInFlight && !frame.isFinal) _resetThinkingSafety(sess.id)
   if (frame.isFinal) _clearThinkingSafety(sess.id)
   // Ignore late frames from before an agent switch — prevents cross-agent contamination
-  if (sess._agentSwitchedAt && frame.ts && frame.ts < sess._agentSwitchedAt) return
+  if (sess._agentSwitchedAt && frame.ts && frame.ts < sess._agentSwitchedAt) {
+    trace('ws.frame.drop', { sess: sess.id, reason: 'agent_switched_late_frame' })
+    return
+  }
   // Also ignore non-final frames if they arrive within 2s of an agent switch and we're not sending
-  if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) return
+  if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) {
+    trace('ws.frame.drop', { sess: sess.id, reason: 'agent_switched_window' })
+    return
+  }
   // Track last frame time for staleness detection (AFTER agent-switch filtering)
   if (frame.blocks?.length > 0 || frame.isFinal) markFrameReceived(sess)
   // Any streaming output proves this turn is alive — remove from reconnect safety set
@@ -2397,10 +2431,64 @@ export function handleOutbound(frame) {
     }
   }
   if (sess.id === state.currentSessionId) _deps.updateSessionSub(sess)
+  // Diagnostic trace: snapshot at isFinal + record save scheduling intent. Both
+  // event lines sit immediately BEFORE scheduleSave so that even if
+  // scheduleSave/_doSave never fires (one of our active suspect paths), the
+  // 1500ms backup flush below picks them up and pin-points the gap.
+  if (frame.isFinal) {
+    // Anchor on the user msg the frame was actually bound to (_targetMsg, set
+    // at L1848 before resetReplyTracker wiped sess._replyingToMsgId at L2019).
+    // Codex SHOULD #1: for the d1193355375 scenario the tail of sess.messages
+    // is multiple consecutive user 'read' rows — walking backward from tail
+    // would mis-anchor to a later pending user, faking `producedContent=false`
+    // / wrong textLen. _targetMsg is the authoritative bind, so we use it as
+    // primary; fall back to tail walk only when no tracker was ever set
+    // (e.g. server-initiated cron / repo-status final frames).
+    let _targetIdx = -1
+    if (_targetMsg) {
+      _targetIdx = sess.messages.indexOf(_targetMsg)
+    }
+    if (_targetIdx < 0) {
+      for (let i = sess.messages.length - 1; i >= 0; i--) {
+        if (sess.messages[i].role === 'user') { _targetIdx = i; break }
+      }
+    }
+    let _producedContent = false
+    let _lastAssistantTextLen = null
+    if (_targetIdx >= 0) {
+      for (let i = _targetIdx + 1; i < sess.messages.length; i++) {
+        const m = sess.messages[i]
+        if (m.role === 'assistant' || m.role === 'thinking' || m.role === 'tool' ||
+            m.role === 'agent-group' || m.role === 'permission') {
+          _producedContent = true
+        }
+        if (m.role === 'assistant' && typeof m.text === 'string') {
+          _lastAssistantTextLen = m.text.length
+        }
+      }
+    }
+    trace('turn.final', {
+      sess: sess.id,
+      targetMsgId: _targetMsg?.id ?? null,
+      targetIdx: _targetIdx,
+      blockCount: sess._currentTurnBlockCount ?? 0,
+      msgCount: sess.messages.length,
+      lastAssistantTextLen: _lastAssistantTextLen,
+      producedContent: _producedContent,
+    })
+    trace('save.schedule', { sess: sess.id, immediate: true, msgCount: sess.messages.length })
+  }
   // Save immediately on isFinal to prevent data loss on refresh; debounce during streaming
   _deps.scheduleSave(sess, !!frame.isFinal)
   // Only rebuild sidebar on final message (not every streaming delta)
-  if (frame.isFinal) _deps.renderSidebar()
+  if (frame.isFinal) {
+    _deps.renderSidebar()
+    // Backup flush: covers fault paths where scheduleSave→_doSave doesn't run
+    // (the primary flush trigger lives in _doSave's finally block). 1500ms
+    // gives a normal _doSave time to drain the ring first; when it does, this
+    // call hits an empty ring and exits early (no redundant POST).
+    setTimeout(() => { try { flushTrace({ sessId: sess.id }) } catch {} }, 1500)
+  }
 }
 
 // ── Phase 0.4: gateway-initiated resume failure ──
@@ -2432,6 +2520,7 @@ function handleResumeFailed(frame) {
   // indicates a genuine server restart (currentLast wiped); frameTo>0 means
   // the server still has forward progress we need to honor on reconnect.
   const frameTo = typeof frame.to === 'number' ? frame.to : 0
+  trace('ws.resume_failed', { sess: peerId ?? null, frameTo, reason: frame.reason ?? null })
   if (peerId) {
     const sess = state.sessions.get(peerId)
     if (sess) {

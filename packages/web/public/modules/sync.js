@@ -6,6 +6,7 @@ import { apiFetch, apiGet, apiJson, authHeaders } from './api.js?v=4d8754d4'
 import { dbGetAll, dbPut, dbDelete } from './db.js?v=4d8754d4'
 import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=4d8754d4'
 import { state } from './state.js?v=4d8754d4'
+import { trace } from './trace.js?v=4d8754d4'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
 // resolve it (either by taking server state, or by detecting local-dominates
@@ -1125,14 +1126,20 @@ export function _stripMessageEphemeral(messages) {
  * Push a single session to server (best-effort). Marks _syncedAt on success.
  */
 export function pushSessionToServer(sess) {
-  if (!sess?.id || !state.token) return Promise.resolve()
+  if (!sess?.id || !state.token) {
+    trace('save.push.skip', { sess: sess?.id ?? null, reason: !sess?.id ? 'no_sess_id' : 'no_token' })
+    return Promise.resolve()
+  }
   // Oversized sessions (received a 413 from a previous PUT) are PUT-disabled
   // for the rest of the page lifetime. Any subsequent PUT would just cost
   // request bytes + DB JSON.parse cycles and 413 again. The flag is
   // intentionally NOT persisted to IDB: a page reload or admin-side
   // session strip should give us a fresh chance, and we re-detect oversized
   // on the next PUT attempt without needing to manually unstick the flag.
-  if (sess._oversized) return Promise.resolve()
+  if (sess._oversized) {
+    trace('save.push.skip', { sess: sess.id, reason: 'already_oversized' })
+    return Promise.resolve()
+  }
   const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, _oversized, ...clean } = sess
   // Include baseSyncedAt for optimistic concurrency — server rejects if row is newer
   clean._baseSyncedAt = _syncedAt || 0
@@ -1164,6 +1171,12 @@ export function pushSessionToServer(sess) {
     if (!wasOversized) {
       try { _onSessionOversized?.(live.id) } catch {}
     }
+    trace('save.push.skip', {
+      sess: sess.id,
+      reason: 'preflight_oversized',
+      bytes: bodyBytes,
+      maxBytes: PREFLIGHT_MAX_BYTES,
+    })
     return Promise.resolve()
   }
   return apiFetch(`/api/sessions/${sess.id}`, {
@@ -1178,7 +1191,9 @@ export function pushSessionToServer(sess) {
         sess._dirty = false
         sess._conflictRetryCount = 0  // successful PUT clears 409 retry cap
       }
+      trace('save.push.ok', { sess: sess.id, status: res.status, applied: !!resp?.applied, bytes: bodyBytes })
     } else if (res.status === 413) {
+      trace('save.push.fail', { sess: sess.id, status: 413, bytes: bodyBytes })
       // Oversized — server rejected because either the request body is
       // larger than the gateway PUT cap (2MB) or the post-merge messages
       // blob would exceed MAX_SESSION_BYTES (4MB). Either way auto-retry
@@ -1207,6 +1222,7 @@ export function pushSessionToServer(sess) {
         try { _onSessionOversized?.(live.id) } catch {}
       }
     } else if (res.status === 409) {
+      trace('save.push.fail', { sess: sess.id, status: 409, bytes: bodyBytes })
       // Conflict: server has a newer version. Two resolution paths:
       //   (a) local-dominates: local messages form a clean superset of
       //       server. Keep local, refresh _syncedAt, trigger one retry
@@ -1375,9 +1391,17 @@ export function pushSessionToServer(sess) {
         // 'server-wins' tag tells the UI to fully re-render messages because
         // sess.messages was just overwritten.
         try { _onConflictResolved?.(target.id, 'server-wins') } catch {}
-      } catch {}
+      } catch (e) {
+        trace('save.push.409_resolve_err', { sess: sess.id, msg: String(e?.message ?? e).slice(0, 120) })
+      }
+    } else {
+      // Unhandled status — log so future divergence (gateway adding new
+      // failure modes) surfaces in trace rather than fall through silently.
+      trace('save.push.fail', { sess: sess.id, status: res.status, bytes: bodyBytes })
     }
-  }).catch(() => {})
+  }).catch((e) => {
+    trace('save.push.fail', { sess: sess.id, network: true, msg: String(e?.message ?? e).slice(0, 120) })
+  })
 }
 
 /**

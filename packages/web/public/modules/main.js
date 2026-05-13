@@ -51,6 +51,9 @@ import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js?v=4
 // ── Cross-device sync ──
 import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=4d8754d4'
 
+// ── Diagnostic trace (d1193355375 "已读但无回复" instrumentation) ──
+import { flushTrace } from './trace.js?v=4d8754d4'
+
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js?v=4d8754d4'
 
@@ -349,12 +352,19 @@ window.addEventListener('blur', () => {
 // will eventually catch up.
 window.addEventListener('beforeunload', () => {
   flushPendingSaves()
+  // Diagnostic trace ring → sendBeacon (best-effort; survives navigation).
+  // Cookie auth carries the request since trace.js uses credentials:same-origin.
+  try { flushTrace({ beacon: true }) } catch {}
 })
 window.addEventListener('pagehide', () => {
   flushPendingSaves()
+  try { flushTrace({ beacon: true }) } catch {}
 })
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) flushPendingSaves()
+  if (document.hidden) {
+    flushPendingSaves()
+    try { flushTrace({ beacon: true }) } catch {}
+  }
 })
 // ── Progressive reconnect safety ──
 // `online`/`offline`: browser-reported network status. Pausing reconnect

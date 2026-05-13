@@ -11,6 +11,7 @@ import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=4d8754
 import { toast } from './ui.js?v=4d8754d4'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=4d8754d4'
 import { nudgeDrain } from './websocket.js?v=4d8754d4'
+import { trace, flushTrace } from './trace.js?v=4d8754d4'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -62,6 +63,9 @@ export function createSession(agentId) {
 
 export function switchSession(id) {
   if (!state.sessions.has(id)) return
+  if (id !== state.currentSessionId) {
+    trace('sess.switch', { from: state.currentSessionId ?? null, to: id })
+  }
   // Plan B (2026-05-09):切会话前必须清掉 composer 上未发送的附件 + abort 进行
   // 中的上传 — 这些资源属于上一会话的语义,带到新会话发出去会成"图片串号"。
   // 仅当 id 真切了才清:点同一个会话不应丢用户刚选的附件。
@@ -320,56 +324,75 @@ function _clearSaveRetry(id) {
 }
 
 async function _doSave(sess) {
-  // Guard: don't write back if session was deleted between scheduling and execution
-  if (!state.sessions.has(sess.id) || _deletedIds.has(sess.id)) return
-  // Strip ephemeral runtime-only fields. Turn-state (_sendingInFlight,
-  // _turnStartedAt, _lastFrameAt) is intentionally PRESERVED so a page
-  // refresh can restore the in-flight UI and correctly signal inFlight=true
-  // in the next hello frame. Staleness is handled at load time.
-  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, _oversized, ...persist } = sess
-  // Expose a dbPut-only checkpoint promise to deleteSession(). Registered
-  // BEFORE awaiting dbPut so a concurrent deleteSession() synchronously sees
-  // an in-flight local write and can await it before calling dbDelete().
-  let resolveDbDone
-  const dbDone = new Promise((r) => { resolveDbDone = r })
-  _saveInFlight.set(sess.id, dbDone)
-  let putError = null
+  // Trace: covers the full save path. The `try { ... } finally { flushTrace }`
+  // wrapper guarantees that every early-return below (deleted-or-gone, quota,
+  // retry-scheduled) still drains the ring to /api/web-trace. Without this,
+  // failures along the persistence chain would be diagnosable only via the
+  // backup isFinal+1500ms flush in websocket.js, which has its own gaps
+  // (no save.* events to correlate with).
+  trace('save.start', { sess: sess.id, msgCount: sess.messages?.length ?? 0 })
   try {
-    await dbPut(persist)
-  } catch (e) {
-    putError = e
-    console.warn('dbPut', e)
-  }
-  resolveDbDone()
-  if (_saveInFlight.get(sess.id) === dbDone) _saveInFlight.delete(sess.id)
-  // Re-check after async dbPut: session may have been deleted while we were writing
-  if (_deletedIds.has(sess.id)) {
-    _clearSaveRetry(sess.id)
-    return
-  }
-  if (putError) {
-    if (_isQuotaError(putError)) {
-      // Quota is a user-actionable condition — don't retry, surface once.
-      if (!_saveFatalReported.has(sess.id)) {
-        _saveFatalReported.add(sess.id)
-        toast('浏览器存储已满，请清理旧会话后重试')
-      }
+    // Guard: don't write back if session was deleted between scheduling and execution
+    if (!state.sessions.has(sess.id) || _deletedIds.has(sess.id)) {
+      trace('save.skip', { sess: sess.id, reason: 'deleted_or_gone' })
       return
     }
-    _scheduleSaveRetry(sess)
-    return
+    // Strip ephemeral runtime-only fields. Turn-state (_sendingInFlight,
+    // _turnStartedAt, _lastFrameAt) is intentionally PRESERVED so a page
+    // refresh can restore the in-flight UI and correctly signal inFlight=true
+    // in the next hello frame. Staleness is handled at load time.
+    const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, _oversized, ...persist } = sess
+    // Expose a dbPut-only checkpoint promise to deleteSession(). Registered
+    // BEFORE awaiting dbPut so a concurrent deleteSession() synchronously sees
+    // an in-flight local write and can await it before calling dbDelete().
+    let resolveDbDone
+    const dbDone = new Promise((r) => { resolveDbDone = r })
+    _saveInFlight.set(sess.id, dbDone)
+    let putError = null
+    try {
+      await dbPut(persist)
+      trace('save.db.ok', { sess: sess.id })
+    } catch (e) {
+      putError = e
+      console.warn('dbPut', e)
+      trace('save.db.err', { sess: sess.id, name: e?.name ?? null, msg: String(e?.message ?? e).slice(0, 120) })
+    }
+    resolveDbDone()
+    if (_saveInFlight.get(sess.id) === dbDone) _saveInFlight.delete(sess.id)
+    // Re-check after async dbPut: session may have been deleted while we were writing
+    if (_deletedIds.has(sess.id)) {
+      trace('save.skip', { sess: sess.id, reason: 'deleted_after_db' })
+      _clearSaveRetry(sess.id)
+      return
+    }
+    if (putError) {
+      if (_isQuotaError(putError)) {
+        // Quota is a user-actionable condition — don't retry, surface once.
+        if (!_saveFatalReported.has(sess.id)) {
+          _saveFatalReported.add(sess.id)
+          toast('浏览器存储已满，请清理旧会话后重试')
+        }
+        return
+      }
+      _scheduleSaveRetry(sess)
+      return
+    }
+    // Success — clear retry bookkeeping for this session
+    _clearSaveRetry(sess.id)
+    // Sync to server for cross-device access (best-effort).
+    //
+    // MUST await: _enqueueSave chains on _chainTail so the next _doSave starts
+    // only after this PUT completes. Without the await, PUTs run in parallel
+    // against a stale `sess._syncedAt`, triggering a 409 storm during streaming.
+    // deleteSession() no longer awaits this promise — it awaits _saveInFlight
+    // (the dbPut-only checkpoint above) — so a slow PUT can't stall delete.
+    // pushSessionToServer swallows its own errors, so awaiting can't reject.
+    await pushSessionToServer(sess)
+  } finally {
+    // Best-effort: failures inside flushTrace (network, body too large, etc.)
+    // never propagate. flushTrace itself catches its own errors.
+    try { flushTrace({ sessId: sess.id }) } catch {}
   }
-  // Success — clear retry bookkeeping for this session
-  _clearSaveRetry(sess.id)
-  // Sync to server for cross-device access (best-effort).
-  //
-  // MUST await: _enqueueSave chains on _chainTail so the next _doSave starts
-  // only after this PUT completes. Without the await, PUTs run in parallel
-  // against a stale `sess._syncedAt`, triggering a 409 storm during streaming.
-  // deleteSession() no longer awaits this promise — it awaits _saveInFlight
-  // (the dbPut-only checkpoint above) — so a slow PUT can't stall delete.
-  // pushSessionToServer swallows its own errors, so awaiting can't reject.
-  await pushSessionToServer(sess)
 }
 
 /**

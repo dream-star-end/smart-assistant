@@ -43,6 +43,7 @@ const SHELL = [
   '/modules/messages.js',
   '/modules/websocket.js',
   '/modules/commands.js',
+  '/modules/trace.js',
   '/modules/wechat.js',
   '/modules/inbox.js',
   '/modules/export-docx.js',

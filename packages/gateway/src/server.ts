@@ -1375,6 +1375,43 @@ export class Gateway {
       return
     }
 
+    // Frontend diagnostic trace sink — receives ring-buffer events from
+    // packages/web/public/modules/trace.js for diagnosing the "已读但无回复"
+    // class of bug (assistant frame delivered by gateway but never landed in
+    // client_sessions.messages). NO database write — pino structured log only,
+    // queryable via journalctl/grep. 50KB body cap defends the endpoint from
+    // accidental flood (RING_MAX*compact entries fits well under).
+    if (url.pathname === '/api/web-trace' && req.method === 'POST') {
+      const userId = this.getUserId(req)
+      this.readBody(req, 50 * 1024)
+        .then((body) => {
+          let payload: unknown
+          try {
+            payload = JSON.parse(body)
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid json' })
+            return
+          }
+          const events = (payload as { events?: unknown })?.events
+          if (!Array.isArray(events)) {
+            this.sendJson(res, 400, { error: 'events array required' })
+            return
+          }
+          this.log.info('web-trace', { userId, count: events.length, events })
+          res.writeHead(204)
+          res.end()
+        })
+        .catch((err) => {
+          const tooLarge = String(err?.message ?? err).includes('body too large')
+          if (tooLarge) {
+            this.sendJson(res, 413, { error: 'body too large' })
+          } else {
+            this.sendJson(res, 400, { error: 'read failed' })
+          }
+        })
+      return
+    }
+
     if (url.pathname === '/healthz') {
       // V3 2H: /healthz 增加 commercial 模块状态(供运维快速判断 v2/v3 实例形态)
       const c = this.deps.commercial
