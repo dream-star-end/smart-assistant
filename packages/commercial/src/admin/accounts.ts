@@ -164,6 +164,12 @@ export interface AdminCreateAccountInput {
   oauth_refresh_token?: string | null;
   oauth_expires_at?: Date | string | null;
   /**
+   * 0064 — Anthropic 订阅周期到期日(可选,管理员手填)。
+   *   - undefined / null → 不设置(列保持 NULL,scheduler 按中性 1.0 对待)
+   *   - Date / ISO string → 解析后写入
+   */
+  subscription_end_at?: Date | string | null;
+  /**
    * 0055 — 代理池 entry id(必填)。boss 强约束:每个账号必须关联池条目,
    * raw `egress_proxy` 文本字段已不再支持。
    * 校验:格式 `^[1-9][0-9]{0,19}$` + 存在性预检(SELECT FROM egress_proxies)。
@@ -207,6 +213,14 @@ export async function adminCreateAccount(
     if (Number.isNaN(d.getTime())) throw new RangeError("invalid_oauth_expires_at");
     expiresAt = d;
   }
+  let subscriptionEndAt: Date | null = null;
+  if (input.subscription_end_at !== undefined && input.subscription_end_at !== null) {
+    const d = typeof input.subscription_end_at === "string"
+      ? new Date(input.subscription_end_at)
+      : input.subscription_end_at;
+    if (Number.isNaN(d.getTime())) throw new RangeError("invalid_subscription_end_at");
+    subscriptionEndAt = d;
+  }
   const refresh =
     input.oauth_refresh_token === null || input.oauth_refresh_token === undefined
       ? null
@@ -236,6 +250,7 @@ export async function adminCreateAccount(
     token: input.oauth_token,
     refresh,
     expires_at: expiresAt,
+    subscription_end_at: subscriptionEndAt,
     egress_proxy_id: egressProxyId,
   };
   const row = await storeCreate(createInput);
@@ -272,6 +287,13 @@ export interface AdminPatchAccountInput {
   oauth_token?: string;
   oauth_refresh_token?: string | null;
   oauth_expires_at?: Date | string | null;
+  /**
+   * 0064 — 订阅周期到期日。
+   *   - undefined → 不动
+   *   - Date / ISO string → 解析后写入
+   *   - null → 显式清空
+   */
+  subscription_end_at?: Date | string | null;
   /**
    * 0055 — undefined = 不动;bigint/string = 换池 entry id。
    * 不接受 null:CHECK constraint 要求账号生命周期内 egress_proxy_id 永远 NOT NULL。
@@ -382,6 +404,18 @@ export async function adminPatchAccount(
       expiresAt = d;
     }
   }
+  let subscriptionEndAt: Date | null | undefined = undefined;
+  if (patch.subscription_end_at !== undefined) {
+    if (patch.subscription_end_at === null) {
+      subscriptionEndAt = null;
+    } else {
+      const d = typeof patch.subscription_end_at === "string"
+        ? new Date(patch.subscription_end_at)
+        : patch.subscription_end_at;
+      if (Number.isNaN(d.getTime())) throw new RangeError("invalid_subscription_end_at");
+      subscriptionEndAt = d;
+    }
+  }
 
   const touched =
     patch.label !== undefined ||
@@ -392,7 +426,8 @@ export async function adminPatchAccount(
     patch.oauth_refresh_token !== undefined ||
     patch.egress_proxy_id !== undefined ||
     patch.egress_host_uuid !== undefined ||
-    expiresAt !== undefined;
+    expiresAt !== undefined ||
+    subscriptionEndAt !== undefined;
   if (!touched) {
     const cur = await storeGet(id);
     if (!cur) throw new AccountNotFoundError(id);
@@ -411,6 +446,7 @@ export async function adminPatchAccount(
   if (patch.oauth_refresh_token !== undefined) storePatch.refresh = patch.oauth_refresh_token;
   if (normalizedEgressProxyId !== undefined) storePatch.egress_proxy_id = normalizedEgressProxyId;
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;
+  if (subscriptionEndAt !== undefined) storePatch.subscription_end_at = subscriptionEndAt;
 
   const after = await storeUpdate(id, storePatch);
   if (!after) throw new AccountNotFoundError(id);
@@ -480,6 +516,10 @@ export async function adminPatchAccount(
   if (expiresAt !== undefined) {
     changedBefore.oauth_expires_at = before.oauth_expires_at?.toISOString() ?? null;
     changedAfter.oauth_expires_at = after.oauth_expires_at?.toISOString() ?? null;
+  }
+  if (subscriptionEndAt !== undefined) {
+    changedBefore.subscription_end_at = before.subscription_end_at?.toISOString() ?? null;
+    changedAfter.subscription_end_at = after.subscription_end_at?.toISOString() ?? null;
   }
   if (patch.egress_proxy_id !== undefined) {
     changedBefore.egress_proxy_id = before.egress_proxy_id !== null ? before.egress_proxy_id.toString() : null;

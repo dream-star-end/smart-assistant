@@ -1804,6 +1804,7 @@ function _renderAccountsTable() {
           <th class="num">今日 / 错误率</th>
           <th class="num">累计 ok/fail</th>
           <th>OAuth 到期</th>
+          <th title="Anthropic 订阅周期到期日(管理员手填;留空 = 未知,调度器按中性看待)">订阅到期</th>
           <th class="num" title="近 5 小时利用率(被动从上游响应头采集)">5h%</th>
           <th class="num" title="5 小时配额重置时间(剩余时间;tooltip 显示绝对时间)">5h 重置</th>
           <th class="num" title="近 7 天利用率(被动从上游响应头采集)">7d%</th>
@@ -1944,6 +1945,22 @@ function _accountWarningChips(a) {
       chips.push(`<span class="chip chip-warn">冷却中</span>`)
     }
   }
+  // 订阅到期 chip:管理员手填字段(subscription_end_at),NULL = 未维护不显示。
+  // 阈值与 scheduler.ts subscriptionFactor 保持一致(<2d / <7d / 已过)。
+  if (a.subscription_end_at) {
+    const subMs = new Date(a.subscription_end_at).getTime()
+    if (!Number.isNaN(subMs)) {
+      const days = (subMs - now) / (24 * 3600 * 1000)
+      const tipDate = escapeHtml(fmtDate(a.subscription_end_at))
+      if (days <= 0) {
+        chips.push(`<span class="chip chip-danger" title="${tipDate}">订阅已过期</span>`)
+      } else if (days < 2) {
+        chips.push(`<span class="chip chip-danger" title="${tipDate}">订阅 ${Math.ceil(days * 24)}h 内到期</span>`)
+      } else if (days < 7) {
+        chips.push(`<span class="chip chip-warn" title="${tipDate}">订阅 ${Math.ceil(days)}d 内到期</span>`)
+      }
+    }
+  }
   return chips.length > 0 ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:3px">${chips.join('')}</div>` : ''
 }
 
@@ -2040,6 +2057,7 @@ function _renderAccountRow(a) {
       <td class="num">${todayReq}${todayChip}</td>
       <td class="num">${okN}/${failN}${failRateChip}</td>
       <td class="mono">${fmtDate(a.oauth_expires_at)}</td>
+      <td class="mono" title="${escapeHtml(a.subscription_end_at ? fmtDate(a.subscription_end_at) : '未填(调度器中性看待)')}">${a.subscription_end_at ? escapeHtml(fmtDate(a.subscription_end_at)) : '<span class="muted">—</span>'}</td>
       <td class="num">${cell5h}</td>
       <td class="num">${cell5hReset}</td>
       <td class="num">${cell7d}</td>
@@ -2132,6 +2150,12 @@ function _accountFormFields(prefill, activeProxies = []) {
              value="${escapeHtml(a.oauth_expires_at || '')}" />
     </div>
     <div class="form-row">
+      <label>subscription_end_at ${isCreate ? '(可选;Anthropic 订阅到期日)' : '(留空不动;输入 NULL 清空)'}</label>
+      <input type="text" id="acc-sub-end" placeholder="如 2026-12-31 或 2026-12-31T00:00:00Z 或 NULL"
+             value="${escapeHtml(a.subscription_end_at || '')}" />
+      <small style="color:var(--muted)">管理员手填字段(Anthropic OAuth/API 不暴露)。NULL = 未知,调度器按中性 1.0 看待;否则参与 WRH 权重(临期账号自动降权)。</small>
+    </div>
+    <div class="form-row">
       <label>egress 代理池条目${isCreate ? '(必选)' : '(必选;不可清空)'}</label>
       <select id="acc-egress-id">${epidOptions}</select>
       <small style="color:var(--muted)">从"代理池"页维护可用条目;此处仅显示 active 项${
@@ -2151,6 +2175,7 @@ function _readAccountForm(isCreate, prefillEpid = '') {
   const tokenRaw = $('acc-token').value.trim()
   const refreshRaw = $('acc-refresh').value.trim()
   const expiresRaw = $('acc-expires').value.trim()
+  const subEndRaw = $('acc-sub-end').value.trim()
   const egressIdRaw = $('acc-egress-id').value.trim()
   const isNull = (v) => v.toUpperCase() === 'NULL'
 
@@ -2163,12 +2188,14 @@ function _readAccountForm(isCreate, prefillEpid = '') {
     body.oauth_token = tokenRaw
     if (refreshRaw) body.oauth_refresh_token = isNull(refreshRaw) ? null : refreshRaw
     if (expiresRaw) body.oauth_expires_at = isNull(expiresRaw) ? null : expiresRaw
+    if (subEndRaw) body.subscription_end_at = isNull(subEndRaw) ? null : subEndRaw
     body.egress_proxy_id = egressIdRaw
   } else {
     body.status = $('acc-status-edit').value
     if (tokenRaw) body.oauth_token = tokenRaw
     if (refreshRaw) body.oauth_refresh_token = isNull(refreshRaw) ? null : refreshRaw
     if (expiresRaw) body.oauth_expires_at = isNull(expiresRaw) ? null : expiresRaw
+    if (subEndRaw) body.subscription_end_at = isNull(subEndRaw) ? null : subEndRaw
     if (!egressIdRaw) throw new Error('egress 代理池条目 不可清空')
     if (egressIdRaw !== String(prefillEpid || '')) body.egress_proxy_id = egressIdRaw
   }

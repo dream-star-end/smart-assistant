@@ -79,6 +79,8 @@ function serializeAccount(
     health_score: a.health_score,
     cooldown_until: a.cooldown_until?.toISOString() ?? null,
     oauth_expires_at: a.oauth_expires_at?.toISOString() ?? null,
+    /** 0064 — 管理员手填的订阅周期到期日;scheduler WRH 权重因子之一。NULL 中性。 */
+    subscription_end_at: a.subscription_end_at?.toISOString() ?? null,
     last_used_at: a.last_used_at?.toISOString() ?? null,
     last_error: a.last_error,
     success_count: a.success_count.toString(),
@@ -364,6 +366,12 @@ export async function handleAdminCreateAccount(
     }
     input.oauth_expires_at = b.oauth_expires_at as string | null;
   }
+  if (b.subscription_end_at !== undefined) {
+    if (b.subscription_end_at !== null && typeof b.subscription_end_at !== "string") {
+      throw new HttpError(400, "VALIDATION", "subscription_end_at must be ISO string or null");
+    }
+    input.subscription_end_at = b.subscription_end_at as string | null;
+  }
 
   try {
     const a = await adminCreateAccount(input, {
@@ -428,6 +436,12 @@ export async function handleAdminPatchAccount(
       throw new HttpError(400, "VALIDATION", "oauth_expires_at must be ISO string or null");
     }
     patch.oauth_expires_at = b.oauth_expires_at as string | null;
+  }
+  if (b.subscription_end_at !== undefined) {
+    if (b.subscription_end_at !== null && typeof b.subscription_end_at !== "string") {
+      throw new HttpError(400, "VALIDATION", "subscription_end_at must be ISO string or null");
+    }
+    patch.subscription_end_at = b.subscription_end_at as string | null;
   }
   // 0055: 拒绝 legacy raw egress_proxy 字段。
   if (b.egress_proxy !== undefined) {

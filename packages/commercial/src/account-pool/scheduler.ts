@@ -1,13 +1,22 @@
 /**
  * T-32 — 账号池调度器。
  *
- * 规约(见 01-SPEC F-6.4):
- *   - `mode=agent` sticky: 按 sessionId 哈希取候选账号里 rendezvous-hash 最大的一个。
- *     账号上/下线时,只有 O(1/N) 的 session 会迁移到其他账号,满足 prompt cache 稳定性。
- *   - `mode=chat` 加权随机: 权重 = max(1, health_score)。health=0 的账号仍有 weight=1 用于
- *     探活 —— 避免所有 active 账号 health=0 时 picker 陷入死锁。
- *   - 没有 active 账号(或遇上全部 cooldown/disabled/banned)→ 抛 `AccountPoolUnavailableError`
- *     (code=ERR_ACCOUNT_POOL_UNAVAILABLE,503 语义)
+ * v3 0064(2026-05-13)起改用 **Weighted Rendezvous Hashing (WRH)** 单一算法:
+ *
+ *   - sessionId 存在 → 同 key + 同候选 + 同 weight 选同账号(强 sticky)
+ *     候选上下线或 weight 变化只导致 O(Δ/总和) 比例的 session 迁移
+ *     (Thaler-Ravishankar HRW 性质,见 https://en.wikipedia.org/wiki/Rendezvous_hashing)
+ *   - sessionId 缺失 → 用一次性 random key 退化为加权随机 (历史 chat 模式行为)
+ *
+ *   `mode` 字段保留只作为 metric label(`scheduler_pick{mode=chat|agent}`),
+ *   行为不分支 —— 简化 future readers 心智负担。
+ *
+ *   权重 = max(1, health_score) * f_quota(5h) * f_quota(7d) * f_subscription
+ *   各因子 NULL 输入返回中性 1.0(详见 computeAccountWeight 注释)。
+ *
+ * 错误语义:
+ *   - 无 active 账号 / 全 cooldown / 全 vanished → AccountPoolUnavailableError(503)
+ *   - 所有 active 到达 per-account in-flight 上限 → AccountPoolBusyError(429)
  *
  * release 语义:
  *   - `success` → `health.onSuccess(id)` 恢复健康度
@@ -18,7 +27,7 @@
  *   - 本模块只做 "从 active 池子挑一个 account" 这一件事。
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
@@ -112,8 +121,20 @@ function sanitizeMaxConcurrent(n: number | undefined): number {
 }
 
 export interface PickInput {
+  /**
+   * `mode` 字段只作 metric label,真实选号算法全部走 WRH(见文件头注释)。
+   * 历史上 `chat` 走加权随机、`agent` 走 rendezvous-hash sticky,v3 0064 起统一。
+   *
+   * 行为:
+   *   - mode=agent + 缺 sessionId → TypeError(保留旧契约,防 caller 漏传)
+   *   - mode=chat  + 缺 sessionId → 生成临时 randomUUID(退化为加权随机分布)
+   *   - 任一 mode + 有 sessionId → 同 key + 同 weight 选同账号(强 sticky)
+   */
   mode: 'chat' | 'agent'
-  /** agent 模式必传;chat 可选(若传也会作为加权采样的 PRNG seed,保留方便) */
+  /**
+   * WRH 的稳定 key。mode=agent 时必传;mode=chat 可选 — 不传则用 randomUUID
+   * 作一次性 key,统计上仍按 weight 加权分布(与旧 chat 行为兼容)。
+   */
   sessionId?: string
   /** 为未来 "按模型过滤账号池" 预留,目前不使用。 */
   model?: string
@@ -177,10 +198,15 @@ export interface SchedulerDeps {
   health: AccountHealthTracker
   /** 注入测试 key fn;默认 loadKmsKey */
   keyFn?: () => Buffer
-  /** 注入 PRNG;默认 Math.random */
-  random?: () => number
   /** 注入 hash(用于测试;默认 SHA-256 64-bit) */
   hash?: (s: string) => bigint
+  /**
+   * 注入 sessionId 缺省时的"临时 WRH key"生成器;默认 `crypto.randomUUID()`。
+   * 测试用此 dep 可让 mode=chat 无 sessionId 路径变得确定。
+   */
+  ephemeralKey?: () => string
+  /** 注入"当前时间"(用于测试 subscription_end_at 因子);默认 `() => new Date()` */
+  now?: () => Date
   /**
    * 单账号同时 in-flight 请求上限。未传则读 `CLAUDE_ACCOUNT_MAX_CONCURRENT`,
    * 再 fallback `DEFAULT_MAX_CONCURRENT_PER_ACCOUNT`(10)。
@@ -188,10 +214,19 @@ export interface SchedulerDeps {
   maxConcurrent?: number
 }
 
-interface CandidateRow extends QueryResultRow {
+/**
+ * pick() SELECT 出来的候选行 — 含 WRH weight 因子全部输入。
+ */
+export interface CandidateRow extends QueryResultRow {
   id: string
   plan: AccountPlan
   health_score: number
+  /** Anthropic 5h 配额已用百分比(0-100);NULL = 未知,按中性看待 */
+  quota_5h_pct: number | null
+  /** Anthropic 7d 配额已用百分比(0-100);NULL = 未知,按中性看待 */
+  quota_7d_pct: number | null
+  /** Anthropic 订阅周期到期日(管理员手填;NULL = 未知,按中性看待) */
+  subscription_end_at: Date | null
 }
 
 /** 默认哈希:SHA-256,截前 8B 作 64-bit 无符号整数。 */
@@ -200,59 +235,118 @@ export function defaultHash(s: string): bigint {
   return h.readBigUInt64BE(0)
 }
 
+/** 用于把 64-bit 哈希映射到 (0,1) 开区间(避免 ln(0)/ln(1) 极端值)。 */
+const TWO_64 = 2n ** 64n
+
 /**
- * Rendezvous(Highest Random Weight)哈希:
- *   对每个候选 id 计算 hash(`sessionId:id`),取最大。
+ * 单账号综合权重 = max(1, health) × f_quota(5h) × f_quota(7d) × f_subscription.
  *
- * 这比朴素 `hash(sessionId) % N` 更稳:
- *   账号加入/退出只影响被 "抢走" / "让出" 的那一小部分 session,
- *   不会让全量 session 重哈希。
+ * 设计要点(boss 决策 + Codex review 反馈):
+ *   1. **NULL 全部按中性 1.0 处理** — 字段未维护不应隐式降权。新加因子不能把
+ *      老账号一夜踢出池子(KISS + 渐进维护友好)。
+ *   2. **配额因子 f_quota 用线性插值**而非阶梯函数:配额 header 每 5min 抖几下都
+ *      不该触发整池 session 重洗。50% 以下中性,50→95% 线性 1.0→0.05,95% 以上钳到
+ *      0.05(保留一点点 weight 让上层 fallback 可选,而不是直接踢出池子让 503)。
+ *   3. **订阅因子 f_subscription 用阶梯**:管理员手填字段、变更频率极低
+ *      (~一月一次),阶梯反而更直观,且边界附近 weight 跳变不会触发反复迁移。
+ *      ≤0 天(已过期)= 0.1;<2 天(将过期)= 0.3;<7 天(临期)= 0.7;≥7 天 = 1.0。
+ *   4. **永不返回 0**:全局保底 0.05 — health=0、quota=100、subscription 过期的
+ *      "残废账号" 也保留极小机会被探活,以便健康分恢复路径不死锁。
+ *
+ * @param now 注入"当前时间",方便测试 subscription 阶梯;默认调用方传 new Date()
  */
-export function pickSticky(
+export function computeAccountWeight(c: CandidateRow, now: Date): number {
+  const wHealth = Math.max(1, c.health_score)
+  const wQuota5h = quotaFactor(c.quota_5h_pct)
+  const wQuota7d = quotaFactor(c.quota_7d_pct)
+  const wSub = subscriptionFactor(c.subscription_end_at, now)
+  const w = wHealth * wQuota5h * wQuota7d * wSub
+  // 极小 floor:避免 0/负数(ln(0)=-inf → WRH 数值崩)。0.05 仍允许探活但极不被偏好。
+  return Math.max(0.05, w)
+}
+
+/**
+ * 配额因子 f_quota(util)。
+ *   - null(quota_*_pct 未上报) → 1.0
+ *   - util ≤ 50              → 1.0
+ *   - 50 < util < 95         → 线性 1.0 → 0.05
+ *   - util ≥ 95              → 0.05
+ *
+ * NaN / 负数等异常值统一回退 1.0(防御性兜底)。
+ */
+function quotaFactor(util: number | null): number {
+  if (util == null || Number.isNaN(util) || util < 0) return 1.0
+  if (util <= 50) return 1.0
+  if (util >= 95) return 0.05
+  // 50 < util < 95:线性插值 1.0 → 0.05
+  const t = (util - 50) / 45 // ∈ (0, 1)
+  return 1.0 - t * 0.95
+}
+
+/**
+ * 订阅因子 f_subscription(end, now)。
+ *   - end IS NULL          → 1.0(未维护,中性)
+ *   - days ≤ 0(已过期)     → 0.1
+ *   - days < 2(即将过期)    → 0.3
+ *   - days < 7(临期)        → 0.7
+ *   - days ≥ 7             → 1.0
+ */
+function subscriptionFactor(end: Date | null, now: Date): number {
+  if (end == null) return 1.0
+  const ms = end.getTime() - now.getTime()
+  if (Number.isNaN(ms)) return 1.0
+  const days = ms / (24 * 60 * 60 * 1000)
+  if (days <= 0) return 0.1
+  if (days < 2) return 0.3
+  if (days < 7) return 0.7
+  return 1.0
+}
+
+/**
+ * Weighted Rendezvous Hashing (Thaler-Ravishankar) — 同 key + 同候选 + 同 weight
+ * 必选同账号;候选/weight 变化只迁移 O(Δ/总和) 比例的 key。
+ *
+ * 数学:
+ *   - 对每个候选 i:取 hash64 高 53 bit(BigInt.asUintN(64, h) >> 11n 转 Number 不丢精度),
+ *     计算 u_i = (h53 + 0.5) / 2^53,均匀分布于 (0,1) 开区间
+ *   - score_i = -ln(u_i) / weight_i,服从 Exp(weight_i)
+ *   - **argmin** score_i ⇒ 选 weight 最大那个的概率正比于 weight_i / Σ weight_j
+ *
+ * 实现细节:不用 `Number(h)/2^64` —— `Number(2^64-1)` 会舍入到 2^64 让 u=1、-ln(u)=0,
+ * 违背开区间承诺。改用 53-bit safe mapping 后 u 严格在 (0,1)。
+ *
+ * (常见错误:argmax → 会选 weight 最小的!Codex review 已经卡掉过一次。)
+ *
+ * @throws AccountPoolUnavailableError 候选为空
+ */
+export function pickWRH(
   candidates: ReadonlyArray<CandidateRow>,
-  sessionId: string,
+  key: string,
+  now: Date,
   hash: (s: string) => bigint = defaultHash,
 ): CandidateRow {
   if (candidates.length === 0) {
-    throw new AccountPoolUnavailableError('no candidates for sticky')
+    throw new AccountPoolUnavailableError('no candidates for WRH')
   }
   let bestIdx = 0
-  let bestScore = hash(`${sessionId}:${candidates[0].id}`)
-  for (let i = 1; i < candidates.length; i += 1) {
-    const s = hash(`${sessionId}:${candidates[i].id}`)
-    if (s > bestScore) {
-      bestScore = s
+  let bestScore = Number.POSITIVE_INFINITY
+  for (let i = 0; i < candidates.length; i += 1) {
+    const c = candidates[i]
+    const h = hash(`${key}:${c.id}`)
+    // u ∈ (0, 1):加 0.5 保证既不 0 也不 1,避免 ln 极端值
+    // 用 53-bit 安全映射 — Number(2^64-1) 会舍入到 2^64 让 u=1,违背开区间承诺
+    const h53 = Number(BigInt.asUintN(64, h) >> 11n)
+    const u = (h53 + 0.5) / 2 ** 53
+    const w = computeAccountWeight(c, now)
+    // score 越小越优:w 越大 ⇒ 期望 score 越小(选中概率正比 w)。
+    // 同样 u(给定 key+id 确定),w 越大 ⇒ score 越小,故 argmin 优先 w 大者。
+    const score = -Math.log(u) / w
+    if (score < bestScore) {
+      bestScore = score
       bestIdx = i
     }
   }
   return candidates[bestIdx]
-}
-
-/**
- * 按 health_score 加权随机。权重 floor 1,保证 health=0 的账号也有机会被探活。
- */
-export function pickWeighted(
-  candidates: ReadonlyArray<CandidateRow>,
-  random: () => number = Math.random,
-): CandidateRow {
-  if (candidates.length === 0) {
-    throw new AccountPoolUnavailableError('no candidates for weighted')
-  }
-  let total = 0
-  const weights: number[] = []
-  for (const c of candidates) {
-    const w = Math.max(1, c.health_score)
-    weights.push(w)
-    total += w
-  }
-  const r = random() * total
-  let acc = 0
-  for (let i = 0; i < candidates.length; i += 1) {
-    acc += weights[i]
-    if (r < acc) return candidates[i]
-  }
-  // 浮点误差兜底:取最后一个。
-  return candidates[candidates.length - 1]
 }
 
 /**
@@ -265,8 +359,9 @@ export function pickWeighted(
 export class AccountScheduler {
   private readonly health: AccountHealthTracker
   private readonly keyFn: () => Buffer
-  private readonly random: () => number
   private readonly hash: (s: string) => bigint
+  private readonly ephemeralKey: () => string
+  private readonly now: () => Date
   /**
    * 单账号 in-flight 计数。pick() 选中并准备返 token 之前 inc,
    * release() 时 dec;归 0 就 delete 避免 Map 无限膨胀。
@@ -274,9 +369,9 @@ export class AccountScheduler {
    * 一致性边界:本字段是进程内状态,只在同一 AccountScheduler 实例内严格
    * 满足 inflight[id] ≤ maxConcurrent。多进程部署不会自动汇总。
    *
-   * TOCTOU 安全:`filter → pickSticky/pickWeighted → inc` 在 pick() 循环内
-   * 的一个同步块里完成,中间没有 await —— Node 单线程协作调度下两个并发
-   * pick() 只能在 await 边界交错,因此硬上限成立。
+   * TOCTOU 安全:`filter → pickWRH → inc` 在 pick() 循环内的一个同步块里完成,
+   * 中间没有 await —— Node 单线程协作调度下两个并发 pick() 只能在 await 边界
+   * 交错,因此硬上限成立。
    */
   private readonly inflight = new Map<string, number>()
   /** 单账号同时 in-flight 请求上限。 */
@@ -285,8 +380,9 @@ export class AccountScheduler {
   constructor(deps: SchedulerDeps) {
     this.health = deps.health
     this.keyFn = deps.keyFn ?? loadKmsKey
-    this.random = deps.random ?? Math.random
     this.hash = deps.hash ?? defaultHash
+    this.ephemeralKey = deps.ephemeralKey ?? randomUUID
+    this.now = deps.now ?? (() => new Date())
     this.maxConcurrent = sanitizeMaxConcurrent(deps.maxConcurrent)
   }
 
@@ -334,7 +430,8 @@ export class AccountScheduler {
 
     const provider: AccountProvider = input.provider ?? 'claude'
     const res = await query<CandidateRow>(
-      `SELECT id::text AS id, plan, health_score
+      `SELECT id::text AS id, plan, health_score,
+              quota_5h_pct, quota_7d_pct, subscription_end_at
        FROM claude_accounts
        WHERE status = 'active' AND provider = $1
        ORDER BY id`,
@@ -345,26 +442,29 @@ export class AccountScheduler {
       throw new AccountPoolUnavailableError('no active accounts')
     }
 
+    // WRH key:有 sessionId 走强 sticky;没有则生成一次性 randomUUID(分布上仍按
+    // weight 加权,等价旧 chat 模式语义)。**整个 pick() 调用共享同一个 key**,
+    // 这样下面重选循环(vanish/AEAD quarantine)在剩余候选集里仍是稳定的。
+    const wrhKey = input.sessionId && input.sessionId.length > 0
+      ? input.sessionId
+      : this.ephemeralKey()
+    const now = this.now()
+
     // 最多重选 N 轮(N = 候选数)。每次选中账号若解密时发现已不存在,
-    // 剔除后从剩余候选再选一次 —— sticky 的 rendezvous-hash 对剩余集
-    // 仍是稳定的,只是换到次优选择。
+    // 剔除后从剩余候选再选一次 —— WRH 对剩余集仍是稳定的,只是换到次优选择。
     //
     // 并发上限:每轮先按 `inflight < maxConcurrent` 过滤出 under-cap 账号;
     // filter → pick → incInflight 同一 sync 块内完成(无 await),保证硬上限。
-    // 若 active 池非空但 under-cap 为空 → AccountPoolBusyError(429);
-    // 若池子最终因 vanish/AEAD 被耗尽但曾经过至少一个 under-cap 账号 → Unavailable(503)。
+    // 退出后区分两种状态:
+    //   - pool.length > 0 但 under-cap 为空 → AccountPoolBusyError(可重试 429);
+    //   - pool.length === 0(vanish/AEAD 把池子掏空) → AccountPoolUnavailableError(503)。
     let vanished = 0
     let quarantined = 0
-    let sawAvailableCandidate = false
     while (pool.length > 0) {
       const available = pool.filter((c) => (this.inflight.get(c.id) ?? 0) < this.maxConcurrent)
       if (available.length === 0) break
-      sawAvailableCandidate = true
 
-      const chosen =
-        input.mode === 'agent'
-          ? pickSticky(available, input.sessionId!, this.hash)
-          : pickWeighted(available, this.random)
+      const chosen = pickWRH(available, wrhKey, now, this.hash)
       // 同步 reserve 槽位 —— 必须在下一个 await(getTokenForUse)之前完成
       this.incInflight(chosen.id)
       try {
@@ -405,11 +505,18 @@ export class AccountScheduler {
         throw err
       }
     }
-    if (!sawAvailableCandidate) {
+    if (pool.length > 0) {
+      // 还有 active 账号但全部命中 inflight cap — 是可重试的 busy 状态
+      // (无论之前有没有 vanish/aead 剔除,只要剩余池非空就代表"重试可解")
+      const drained =
+        vanished + quarantined > 0
+          ? ` (after vanished=${vanished} aead_quarantined=${quarantined})`
+          : ''
       throw new AccountPoolBusyError(
-        `all ${pool.length} active account(s) at per-account concurrency cap (max=${this.maxConcurrent})`,
+        `all ${pool.length} remaining active account(s) at per-account concurrency cap (max=${this.maxConcurrent})${drained}`,
       )
     }
+    // 池子真被掏空 — 全部 vanish/AEAD,无可重试目标
     throw new AccountPoolUnavailableError(
       `candidate pool drained while pick()ing: vanished=${vanished} (deleted between SELECT and readToken), ` +
         `aead_quarantined=${quarantined} (decryption failed → auto-disabled)`,
@@ -546,8 +653,10 @@ export async function pickCodexAccountForBindingInTx(
   if (res.rows.length === 0) return null
 
   // rendezvous-hash sticky:对每个候选计算 hash(`sessionId:id`),取最大。
-  // 与 pickSticky 同语义,但这里独立函数避免依赖 CandidateRow 私有类型;
-  // 不进 inflight、不解密 token、不调 health。
+  // 故意不带 weight 因子 — codex 容器与账号绑定是 provision-once 的物理关系,
+  // 应该稳定;weight(health/quota/subscription)的"软"波动不该把已绑定容器迁
+  // 到别处。容器侧只在账号被显式 disable 时通过独立 codexDisableFanout 路径
+  // 触发重新绑定。这里不进 inflight、不解密 token、不调 health。
   let bestIdx = 0
   let bestScore = hash(`${sessionId}:${res.rows[0].id}`)
   for (let i = 1; i < res.rows.length; i += 1) {

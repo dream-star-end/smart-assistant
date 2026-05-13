@@ -61,6 +61,15 @@ export interface AccountRow {
   health_score: number;
   cooldown_until: Date | null;
   oauth_expires_at: Date | null;
+  /**
+   * 0064 — Anthropic 订阅周期到期日。管理员在 admin UI 手填(Anthropic OAuth/API
+   * 未暴露此信息)。NULL = 未维护,WRH 权重函数按"中性 1.0"看待,不让"字段未填"
+   * 成为隐式降权。
+   *
+   * 注意:此字段跟 oauth_expires_at(OAuth access token 1h 刷新)语义完全无关。
+   * 前者刻画"账号本身的订阅生命周期",后者刻画"当前持有 token 的可用窗口"。
+   */
+  subscription_end_at: Date | null;
   last_used_at: Date | null;
   last_error: string | null;
   success_count: bigint;
@@ -160,6 +169,11 @@ export interface CreateAccountInput {
   refresh?: string | null;
   expires_at?: Date | null;
   /**
+   * 0064 — 订阅到期日(可选)。undefined / null = 不设置(列保持 NULL)。
+   * 解析由 admin layer 完成,store 层只透传 Date | null。
+   */
+  subscription_end_at?: Date | null;
+  /**
    * 0055 — 必须引用 egress_proxies 池条目(boss 决策,强约束)。raw text 列
    * (0010)在 0055 CHECK constraint 下必须 NULL,store 层不再暴露其 setter。
    * 不再可空:store 层守门,缺省 → throw TypeError。entry 存在性校验在
@@ -190,6 +204,13 @@ export interface UpdateAccountPatch {
   quota_remaining?: number | null;
   health_score?: number;
   oauth_expires_at?: Date | null;
+  /**
+   * 0064 — 订阅到期日。
+   *   - undefined → 不动
+   *   - Date → 写入
+   *   - null  → 显式清空(设回 NULL)
+   */
+  subscription_end_at?: Date | null;
   token?: string;
   refresh?: string | null;
   /**
@@ -222,6 +243,7 @@ const META_COLUMNS = `
   health_score,
   cooldown_until,
   oauth_expires_at,
+  subscription_end_at,
   last_used_at,
   last_error,
   success_count::text AS success_count,
@@ -249,6 +271,7 @@ interface RawMetaRow extends QueryResultRow {
   health_score: number;
   cooldown_until: Date | null;
   oauth_expires_at: Date | null;
+  subscription_end_at: Date | null;
   last_used_at: Date | null;
   last_error: string | null;
   success_count: string;
@@ -308,6 +331,7 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     health_score: row.health_score,
     cooldown_until: row.cooldown_until,
     oauth_expires_at: row.oauth_expires_at,
+    subscription_end_at: row.subscription_end_at,
     last_used_at: row.last_used_at,
     last_error: row.last_error,
     success_count: BigInt(row.success_count),
@@ -375,9 +399,10 @@ export async function createAccount(
          oauth_token_enc, oauth_nonce,
          oauth_refresh_enc, oauth_refresh_nonce,
          oauth_expires_at,
+         subscription_end_at,
          egress_proxy, egress_proxy_id
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -388,6 +413,7 @@ export async function createAccount(
         refEnc,
         refNonce,
         input.expires_at ?? null,
+        input.subscription_end_at ?? null,
         egressProxyId,
       ],
     );
@@ -628,6 +654,10 @@ export async function updateAccount(
     push("health_score", patch.health_score);
   }
   if (patch.oauth_expires_at !== undefined) push("oauth_expires_at", patch.oauth_expires_at);
+  if (patch.subscription_end_at !== undefined) {
+    // 0064:undefined = 不动;Date / null 直传 — null 显式清空。
+    push("subscription_end_at", patch.subscription_end_at);
+  }
   if (patch.egress_proxy_id !== undefined) {
     // 0055:NULL 不再接受(CHECK constraint 与生命周期强约束)。类型已锁住,
     // 这里 runtime 兜底防 JS 调用方绕过 TS。

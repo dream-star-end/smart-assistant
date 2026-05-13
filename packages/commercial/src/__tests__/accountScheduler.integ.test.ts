@@ -129,12 +129,17 @@ function mkTracker(): { tracker: AccountHealthTracker; redis: InMemoryHealthRedi
 
 function mkScheduler(
   tracker: AccountHealthTracker,
-  overrides: { random?: () => number; maxConcurrent?: number } = {},
+  overrides: {
+    ephemeralKey?: () => string
+    maxConcurrent?: number
+    hash?: (s: string) => bigint
+  } = {},
 ): AccountScheduler {
   return new AccountScheduler({
     health: tracker,
     keyFn,
-    random: overrides.random,
+    ephemeralKey: overrides.ephemeralKey,
+    hash: overrides.hash,
     maxConcurrent: overrides.maxConcurrent,
   })
 }
@@ -241,28 +246,29 @@ describe('pick — mode=agent sticky', () => {
   })
 })
 
-describe('pick — mode=chat weighted', () => {
-  test('注入固定 random → 落到确定性账号', async (t) => {
+describe('pick — mode=chat WRH', () => {
+  test('注入 hash → 让 id 最大的 candidate u≈1 → score 最小 → 必选它', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount({ label: 'w1', plan: 'pro', token: 'T-1', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const b = await createAccount({ label: 'w2', plan: 'pro', token: 'T-2', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const c = await createAccount({ label: 'w3', plan: 'pro', token: 'T-3', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const { tracker } = mkTracker()
-    // 三个账号都 health=100 → 总权重 300;random=0 → 选 ORDER BY id ASC 首个
-    const s0 = mkScheduler(tracker, { random: () => 0 })
-    const p0 = await s0.pick({ mode: 'chat' })
-    assert.equal(p0.account_id, a.id)
-    p0.token.fill(0)
-    // random=0.999 → 选最后
-    const s2 = mkScheduler(tracker, { random: () => 0.9999 })
-    const p2 = await s2.pick({ mode: 'chat' })
-    assert.equal(p2.account_id, c.id)
-    p2.token.fill(0)
-    // 中间:random=0.5 → acc 走到 200(第二个),选 b
-    const s1 = mkScheduler(tracker, { random: () => 0.5 })
-    const p1 = await s1.pick({ mode: 'chat' })
-    assert.equal(p1.account_id, b.id)
-    p1.token.fill(0)
+    // 让 b 的 hash 极大(u 接近 1 → -ln(u) ≈ 0 → score 最小)
+    const hashFavor = (id: bigint): ((s: string) => bigint) => {
+      return (s) => (s.endsWith(`:${id}`) ? (1n << 64n) - 1n : 1n)
+    }
+    const sa = mkScheduler(tracker, { hash: hashFavor(a.id), ephemeralKey: () => 'k' })
+    const pa = await sa.pick({ mode: 'chat' })
+    assert.equal(pa.account_id, a.id)
+    pa.token.fill(0)
+    const sb = mkScheduler(tracker, { hash: hashFavor(b.id), ephemeralKey: () => 'k' })
+    const pb = await sb.pick({ mode: 'chat' })
+    assert.equal(pb.account_id, b.id)
+    pb.token.fill(0)
+    const sc = mkScheduler(tracker, { hash: hashFavor(c.id), ephemeralKey: () => 'k' })
+    const pc = await sc.pick({ mode: 'chat' })
+    assert.equal(pc.account_id, c.id)
+    pc.token.fill(0)
   })
 
   test('mode 非法 → TypeError', async (t) => {
@@ -282,7 +288,8 @@ describe('pick — token 解密正确', () => {
       keyFn,
     )
     const { tracker } = mkTracker()
-    const s = mkScheduler(tracker, { random: () => 0 })
+    // 只有一个账号 — 不需要控制选号,WRH 唯一候选必选
+    const s = mkScheduler(tracker)
     const p = await s.pick({ mode: 'chat' })
     assert.equal(p.account_id, a.id)
     assert.equal(p.plan, 'max')
@@ -402,16 +409,21 @@ describe('per-account 并发上限', () => {
     p2.token.fill(0)
   })
 
-  test('首选账号满员 → 自动 fallback 到未满账号(chat weighted)', async (t) => {
+  test('首选账号满员 → 自动 fallback 到未满账号(chat WRH)', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount({ label: 'w-a', plan: 'pro', token: 'T-A', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const b = await createAccount({ label: 'w-b', plan: 'pro', token: 'T-B', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const { tracker } = mkTracker()
-    // random=0 一贯选第一个(按 ORDER BY id 是 a)
-    const s = mkScheduler(tracker, { random: () => 0, maxConcurrent: 1 })
+    // 注入 hash 让 a 必胜(u≈1 → score 最小)
+    const hashFavorA = (s: string): bigint => (s.endsWith(`:${a.id}`) ? (1n << 64n) - 1n : 1n)
+    const s = mkScheduler(tracker, {
+      hash: hashFavorA,
+      ephemeralKey: () => 'k',
+      maxConcurrent: 1,
+    })
     const p1 = await s.pick({ mode: 'chat' })
     assert.equal(p1.account_id, a.id)
-    // a 到 cap=1 后,即使 random=0 也必须 fallback 到 b
+    // a 到 cap=1 后必须 fallback 到 b
     const p2 = await s.pick({ mode: 'chat' })
     assert.equal(p2.account_id, b.id)
     p1.token.fill(0)

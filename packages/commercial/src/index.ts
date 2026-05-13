@@ -2120,8 +2120,8 @@ export {
   ERR_ACCOUNT_POOL_BUSY,
   DEFAULT_MAX_CONCURRENT_PER_ACCOUNT,
   parseMaxConcurrentEnv,
-  pickSticky,
-  pickWeighted,
+  pickWRH,
+  computeAccountWeight,
   defaultHash,
 } from "./account-pool/scheduler.js";
 export type {
@@ -2130,6 +2130,7 @@ export type {
   ReleaseInput,
   ReleaseResult,
   SchedulerDeps,
+  CandidateRow,
 } from "./account-pool/scheduler.js";
 // T-33 账号池 refresh + proxy
 export {
