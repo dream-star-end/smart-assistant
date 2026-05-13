@@ -661,27 +661,52 @@ if (window.marked) {
 
 // Synchronously fill math placeholders in `html` from items pushed onto
 // `pendingMath` during the current marked.parse() pass. Items are matched by
-// the placeholder id (`<div class="math-block" id="math-XXXX"></div>` or the
-// span variant). When KaTeX is loaded we splice the rendered HTML back in
-// place, eliminating the empty-placeholder window that caused the
-// streaming → final 0-height collapse + iOS Safari paint lag.
+// the placeholder id via DOM lookup (not string match — see below). When KaTeX
+// is loaded we splice the rendered HTML back in place, eliminating the empty-
+// placeholder window that caused the streaming → final 0-height collapse +
+// iOS Safari paint lag (bd0486b6).
 //
-// KaTeX output is NOT routed through DOMPurify — it carries inline `style`
-// and `aria-hidden` attributes that DOMPurify would strip, breaking the
-// rendered formula. Trust boundary: KaTeX is invoked with
-// `{ throwOnError:false, trust:false, strict:'ignore', output:'html' }` so the
-// generated HTML is bounded to KaTeX's own (non-script) markup; the input
-// `tex` came from the user-visible message body that was already sanitized by
-// the tokenizer above.
+// **Why DOM-based replacement, not string split/join**: the old implementation
+// used literal markers like `<div class="math-block" id="${id}"></div>` and
+// `out.split(marker).join(katexHtml)`. But `DOMPurify.sanitize` runs the HTML
+// through the browser's native parser+serializer, which normalizes attribute
+// order — `<span class="math-inline" id="X"></span>` comes out as
+// `<span id="X" class="math-inline"></span>`. The literal split markers had 0
+// hits, and since `renderMarkdown` already spliced the items out of
+// `pendingMath` before calling here, the async `processRichBlocks()` fallback
+// also couldn't see them → both KaTeX-render and `$$x$$` text-fallback paths
+// were unreachable → users saw permanent blank placeholders for any message
+// containing `$..$` / `$$..$$` / `\(..\)` / `\[..\]`.
 //
-// `splicedItems` are removed from `pendingMath`. Items left in the queue
-// (e.g. KaTeX not loaded, or extracted by an older non-fillable caller) fall
-// through to processRichBlocks() async fill — same legacy behaviour, but the
-// fast path eliminates the visible 0-height frame.
+// DOM-based replacement is attribute-order/quote/whitespace agnostic.
+//
+// **Trust boundary** — KaTeX HTML is NOT routed through DOMPurify (DOMPurify
+// would strip the inline `style` and `aria-hidden` attributes that the formula
+// rendering depends on). Safety comes from KaTeX's own HTML generator with
+// `{ trust:false, throwOnError:false, strict:'ignore', output:'html' }`, which
+// bounds output to KaTeX's non-script markup vocabulary. The TeX input is NOT
+// HTML — it's a separate language KaTeX parses, so we're not "trusting
+// pre-sanitized user HTML"; we're trusting KaTeX's generator with explicit
+// `trust:false`.
 function _fillMathPlaceholdersSync(html, items) {
   if (!items.length || !window.katex) return html
-  let out = html
+  // `CSS.escape` is the canonical way to escape an id for a `#selector`. id is
+  // currently `math-[a-z0-9]+` (Math.random().toString(36).slice(2, 10)) — entirely
+  // selector-safe today, so the helper is effectively a noop. The fallback only
+  // escapes `"` and `\` (enough for *this* controlled id space when an old
+  // browser lacks `CSS.escape`); it is NOT a general CSS-identifier escape.
+  const escapeSel = window.CSS?.escape || ((s) => s.replace(/["\\]/g, '\\$&'))
+  const container = document.createElement('div')
+  container.innerHTML = html
   for (const { id, tex, display } of items) {
+    const el = container.querySelector(`#${escapeSel(id)}`)
+    // If the placeholder is missing (DOMPurify dropped the node, or some
+    // other transformation removed it) we silently skip — the item has
+    // already been spliced from `pendingMath` by the caller, so there's no
+    // async fallback. This is strictly stricter than the old behaviour, but
+    // DOMPurify default config keeps `id` on `div`/`span`, so a miss here is
+    // a real bug to investigate rather than silently fall through.
+    if (!el) continue
     let katexHtml
     try {
       katexHtml = window.katex.renderToString(tex, {
@@ -696,18 +721,13 @@ function _fillMathPlaceholdersSync(html, items) {
       const tag = display ? 'div' : 'span'
       katexHtml = `<${tag} class="${cls}">KaTeX error: ${htmlSafeEscape(err?.message || String(err))}</${tag}>`
     }
-    // The tokenizers above emit fixed-shape placeholder strings; using
-    // split/join is safe (substring match, not regex) and is O(n) on the
-    // sanitized HTML. id is `math-XXXXXXXX` from Math.random().toString(36).
-    const blockMarker = `<div class="math-block" id="${id}"></div>`
-    const inlineMarker = `<span class="math-inline" id="${id}"></span>`
-    if (display) {
-      out = out.split(blockMarker).join(katexHtml)
-    } else {
-      out = out.split(inlineMarker).join(katexHtml)
-    }
+    // outerHTML replacement detaches `el`; the other placeholder nodes
+    // remain reachable via container.querySelector on subsequent loop
+    // iterations. KaTeX output is parsed by the browser as a new subtree
+    // (no DOMPurify pass — see trust-boundary note above).
+    el.outerHTML = katexHtml
   }
-  return out
+  return container.innerHTML
 }
 
 export function renderMarkdown(text) {

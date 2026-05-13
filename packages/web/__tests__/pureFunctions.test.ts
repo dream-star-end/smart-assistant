@@ -1101,6 +1101,256 @@ describe('T-LATEX-INTEGRATION: codexDisplayMath / codexInlineMath wiring', () =>
   })
 })
 
+// ── T-MATH-FILL: _fillMathPlaceholdersSync (markdown.js, 2026-05-13 DOMPurify 重排 fix) ──
+//
+// Old impl used literal-string split/join on `<div class="math-block" id="X"></div>` /
+// `<span class="math-inline" id="X"></span>`. But DOMPurify.sanitize runs the HTML
+// through the browser parser+serializer, which normalizes attribute order to
+// `id` first → marker had 0 hits, items were already spliced from pendingMath,
+// async processRichBlocks fallback also couldn't see them → users saw permanent
+// blank `$..$` / `$$..$$` placeholders for any math-bearing message.
+//
+// Fix: DOM-based replacement (createElement+querySelector+outerHTML), agnostic
+// to attribute order/quote/whitespace. These tests pin (a) the implementation
+// can't regress to string split/join, and (b) the contract: replacement works
+// for both `class id` and `id class` placeholder orderings.
+
+// Structural assertions — regress if anyone reverts the implementation strategy.
+describe('T-MATH-FILL-STRUCTURAL: _fillMathPlaceholdersSync source shape', () => {
+  const fillSrc = extractFunction(appJs, '_fillMathPlaceholdersSync')
+
+  it('does NOT use literal `<div class="math-block" id="` substring', () => {
+    // The exact string that failed against DOMPurify-reordered output. If this
+    // ever comes back, the bug returns immediately for any math-bearing reply.
+    assert.ok(
+      !fillSrc.includes('<div class="math-block" id="'),
+      'must not use class-first literal marker (DOMPurify reorders to id-first → 0 hits)',
+    )
+  })
+  it('does NOT use literal `<span class="math-inline" id="` substring', () => {
+    assert.ok(
+      !fillSrc.includes('<span class="math-inline" id="'),
+      'must not use class-first literal marker (DOMPurify reorders to id-first → 0 hits)',
+    )
+  })
+  it('uses createElement for DOM-based parse', () => {
+    assert.ok(
+      fillSrc.includes('createElement'),
+      'must build a detached container via document.createElement',
+    )
+  })
+  it('uses querySelector for placeholder lookup (attribute-order agnostic)', () => {
+    assert.ok(
+      fillSrc.includes('querySelector'),
+      'must find placeholders via querySelector("#id"), not string substring',
+    )
+  })
+  it('uses outerHTML for replacement (preserves KaTeX inline style+aria-hidden)', () => {
+    assert.ok(
+      fillSrc.includes('outerHTML'),
+      'must replace placeholders via el.outerHTML — string concatenation would re-introduce serialization fragility',
+    )
+  })
+  it('keeps window.katex early-return guard (no crash when KaTeX not loaded)', () => {
+    assert.ok(
+      /!\s*window\.katex/.test(fillSrc),
+      'must early-return when KaTeX is missing — async processRichBlocks fallback covers that case',
+    )
+  })
+  it('keeps katex.renderToString call (sync render path is the whole point)', () => {
+    assert.ok(
+      fillSrc.includes('renderToString'),
+      'must call katex.renderToString synchronously — otherwise we degrade back to async-fill 0-height frame (iOS Safari paint lag)',
+    )
+  })
+  it('renderMarkdown still splices items out of pendingMath before sync-fill', () => {
+    // If splice is removed, sync fill + async processRichBlocks would both
+    // render the same item → KaTeX HTML duplicated, or one overwriting the
+    // other. The splice is load-bearing.
+    const renderSrc = extractFunction(appJs, 'renderMarkdown')
+    assert.ok(
+      /pendingMath\.splice\(/.test(renderSrc),
+      'renderMarkdown must splice items from pendingMath before handing them to sync-fill',
+    )
+  })
+})
+
+// Behavioural contract — mini DOM stub satisfies just the four surfaces
+// `_fillMathPlaceholdersSync` touches (document.createElement,
+// container.innerHTML, container.querySelector, element.outerHTML). NOT a full
+// DOM impl — only what's needed to prove attribute-order independence.
+describe('T-MATH-FILL-CONTRACT: replacement works regardless of attribute order', () => {
+  // Mini DOM stub. Strategy:
+  //   - container is a plain object with an `_html` string backing store
+  //   - innerHTML get/set reads/writes the backing store
+  //   - querySelector('#id') scans `_html` with a regex that matches an empty
+  //     `<div|span ...></div|span>` carrying `id="id"` in ANY attribute slot
+  //     → returns a stub element whose `outerHTML` setter splices the new
+  //     HTML into `_html` over the original empty-element substring.
+  //
+  // Critical: this regex deliberately accepts both attribute orderings (and
+  // the single-`id` no-class case) so the contract test really proves that
+  // the production impl doesn't care about ordering.
+  function makeStubContainer() {
+    const container: { _html: string; querySelector: (sel: string) => unknown; innerHTML: string } =
+      {
+        _html: '',
+        querySelector(selector: string) {
+          if (!selector.startsWith('#')) return null
+          const id = selector.slice(1)
+          // Match `<div|span ANY-ATTRS-INCLUDING id="ID"-ANYWHERE ANY-ATTRS></div|span>`
+          // Reject any non-`>` chars between `<tag` and `>` other than whitespace+attrs.
+          const re = new RegExp(
+            `<(div|span)\\b((?:\\s+[a-zA-Z-]+=(?:"[^"]*"|'[^']*'))*\\s+id="${id.replace(/[-]/g, '\\$&')}"(?:\\s+[a-zA-Z-]+=(?:"[^"]*"|'[^']*'))*)?\\s*></\\1>`,
+          )
+          const m = re.exec(this._html)
+          if (!m) return null
+          const fullMatch = m[0]
+          const self = this
+          const el = {
+            _fullMatch: fullMatch,
+            set outerHTML(newHtml: string) {
+              // Use split/join — `fullMatch` is unique per id in our test inputs.
+              self._html = self._html.split(this._fullMatch).join(newHtml)
+            },
+          }
+          return el
+        },
+        get innerHTML() {
+          return this._html
+        },
+        set innerHTML(v: string) {
+          this._html = v
+        },
+      }
+    return container
+  }
+  function makeStubDocument() {
+    return {
+      createElement(tagName: string) {
+        if (tagName !== 'div') throw new Error(`stub only supports <div>, got <${tagName}>`)
+        return makeStubContainer()
+      },
+    }
+  }
+
+  // Extract production source and bind it to the stub globals via new Function.
+  // We inject: window (with .katex + optionally .CSS), document, htmlSafeEscape.
+  const _fillSrc = extractFunction(appJs, '_fillMathPlaceholdersSync')
+  type FillSig = (html: string, items: Array<{ id: string; tex: string; display: boolean }>) => string
+  function makeFill(mockWindow: any, mockDocument: any, mockHtmlSafeEscape: (s: string) => string) {
+    return new Function(
+      'window',
+      'document',
+      'htmlSafeEscape',
+      `${_fillSrc}; return _fillMathPlaceholdersSync;`,
+    )(mockWindow, mockDocument, mockHtmlSafeEscape) as FillSig
+  }
+  // Stand-in for the imported `htmlSafeEscape` from './dom.js' — minimal but
+  // covers what the KaTeX-error path will throw at it (`<`, `>`, `&`).
+  function stubHtmlSafeEscape(s: string) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+  function stubKatex() {
+    return {
+      renderToString(tex: string, opts: { displayMode: boolean }) {
+        return `<span class="katex-html" data-display="${opts.displayMode}">${tex}</span>`
+      },
+    }
+  }
+
+  it('DOMPurify-reordered placeholder (id first) gets replaced', () => {
+    // This is the exact failure mode from the live bug.
+    const win = { katex: stubKatex() }
+    const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
+    const html = '<p>foo <span id="math-abc12345" class="math-inline"></span> bar</p>'
+    const out = fill(html, [{ id: 'math-abc12345', tex: 'f(x)', display: false }])
+    assert.ok(out.includes('katex-html'), `expected KaTeX HTML in output, got: ${out}`)
+    assert.ok(out.includes('f(x)'), 'expected tex content in output')
+    assert.ok(!out.includes('<span id="math-abc12345"'), 'placeholder must be gone')
+  })
+  it('marked-original placeholder (class first) gets replaced', () => {
+    // Sanity: even before DOMPurify, this is what marked emits. Both orderings
+    // must work because either could land in the input depending on caller.
+    const win = { katex: stubKatex() }
+    const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
+    const html = '<p>foo <span class="math-inline" id="math-abc12345"></span> bar</p>'
+    const out = fill(html, [{ id: 'math-abc12345', tex: 'f(x)', display: false }])
+    assert.ok(out.includes('katex-html'), `expected KaTeX HTML in output, got: ${out}`)
+  })
+  it('display math (div) — id-first ordering, display:true', () => {
+    const win = { katex: stubKatex() }
+    const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
+    const html = 'prefix<div id="math-xy789" class="math-block"></div>suffix'
+    const out = fill(html, [{ id: 'math-xy789', tex: 'E=mc^2', display: true }])
+    assert.ok(out.includes('katex-html'), 'expected KaTeX HTML')
+    assert.ok(out.includes('data-display="true"'), 'displayMode must be propagated')
+    assert.ok(out.includes('E=mc^2'), 'expected tex content')
+  })
+  it('mixed batch (class-first + id-first) — both replaced in same call', () => {
+    const win = { katex: stubKatex() }
+    const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
+    const html =
+      '<p><span class="math-inline" id="math-aaa11"></span> and <span id="math-bbb22" class="math-inline"></span></p>'
+    const out = fill(html, [
+      { id: 'math-aaa11', tex: 'x', display: false },
+      { id: 'math-bbb22', tex: 'y', display: false },
+    ])
+    assert.ok(out.includes('>x<'), 'first placeholder replaced')
+    assert.ok(out.includes('>y<'), 'second placeholder replaced')
+    assert.ok(!out.includes('math-aaa11') && !out.includes('math-bbb22'), 'no placeholders remain')
+  })
+  it('KaTeX not loaded (window.katex undefined) → input html returned unchanged', () => {
+    // This path must early-return so the async processRichBlocks() fallback
+    // can pick the items up later.
+    const win = {} // no katex
+    const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
+    const html = '<span id="math-x" class="math-inline"></span>'
+    const out = fill(html, [{ id: 'math-x', tex: 't', display: false }])
+    assert.equal(out, html, 'must return input unchanged when KaTeX missing')
+  })
+  it('empty items array → input html returned unchanged (fast path)', () => {
+    const win = { katex: stubKatex() }
+    const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
+    const html = '<p>nothing to do</p>'
+    const out = fill(html, [])
+    assert.equal(out, html)
+  })
+  it('querySelector finds nothing for an id → item is skipped, rest still replaced', () => {
+    // Simulates DOMPurify (somehow) dropping a placeholder node. The function
+    // must not throw, and must still process the other items.
+    const win = { katex: stubKatex() }
+    const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
+    const html = '<p>only <span id="math-here" class="math-inline"></span></p>'
+    const out = fill(html, [
+      { id: 'math-gone', tex: 'g', display: false }, // not in html
+      { id: 'math-here', tex: 'h', display: false }, // in html
+    ])
+    assert.ok(out.includes('>h<'), 'present placeholder must still be replaced')
+    assert.ok(!out.includes('math-here'), 'present placeholder gone')
+    // 'math-gone' simply has no effect — no throw, no stray markup.
+  })
+  it('KaTeX throws → error placeholder with htmlSafeEscape-d message', () => {
+    // The catch branch must (a) not propagate the throw, (b) emit math-error
+    // class, (c) htmlSafeEscape the error message so `<bad>` from the
+    // exception can't break out of the inserted markup.
+    const win = {
+      katex: {
+        renderToString() {
+          throw new Error('boom <bad>')
+        },
+      },
+    }
+    const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
+    const html = '<span id="math-err1" class="math-inline"></span>'
+    const out = fill(html, [{ id: 'math-err1', tex: 'broken', display: false }])
+    assert.ok(out.includes('math-error'), 'must mark with math-error class')
+    assert.ok(out.includes('&lt;bad&gt;'), 'error message must be htmlSafeEscape-d')
+    assert.ok(!out.includes('<bad>'), 'raw `<bad>` must not appear in output')
+    assert.ok(!out.includes('math-err1'), 'placeholder must be replaced (with error markup)')
+  })
+})
+
 // ── T10: Function extractor sanity ──
 describe('T10: Function extractor sanity checks', () => {
   it('can extract _basename source', () => {
