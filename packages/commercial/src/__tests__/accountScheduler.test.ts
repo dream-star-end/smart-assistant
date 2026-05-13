@@ -102,31 +102,40 @@ describe('computeAccountWeight', () => {
     assert.equal(computeAccountWeight(r2, NOW), 100)
   })
 
-  test('subscription 30 天后 → 中性 1.0', () => {
+  // subscription 因子 — 收益最大化方向:**快到期加权,远期让路**
+  test('subscription 远期 60 天 → 因子 0.8(让路给快到期的)', () => {
     const r = mkRow({
       health_score: 100,
-      subscription_end_at: new Date(NOW.getTime() + 30 * 86_400_000),
+      subscription_end_at: new Date(NOW.getTime() + 60 * 86_400_000),
+    })
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 80) < 1e-9)
+  })
+
+  test('subscription 月内 15 天 → 因子 1.0(中性)', () => {
+    const r = mkRow({
+      health_score: 100,
+      subscription_end_at: new Date(NOW.getTime() + 15 * 86_400_000),
     })
     assert.equal(computeAccountWeight(r, NOW), 100)
   })
 
-  test('subscription <7 天 → 因子 0.7', () => {
+  test('subscription <7 天 (5d) → 因子 1.5(优先吃)', () => {
     const r = mkRow({
       health_score: 100,
       subscription_end_at: new Date(NOW.getTime() + 5 * 86_400_000),
     })
-    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 70) < 1e-9)
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 150) < 1e-9)
   })
 
-  test('subscription <2 天 → 因子 0.3', () => {
+  test('subscription <2 天 (1.5d) → 因子 2.0(紧急榨)', () => {
     const r = mkRow({
       health_score: 100,
       subscription_end_at: new Date(NOW.getTime() + 1.5 * 86_400_000),
     })
-    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 30) < 1e-9)
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 200) < 1e-9)
   })
 
-  test('subscription 已过期 → 因子 0.1', () => {
+  test('subscription 已过期 → 因子 0.1(belt+suspenders;health 系统应 disable)', () => {
     const r = mkRow({
       health_score: 100,
       subscription_end_at: new Date(NOW.getTime() - 86_400_000),
@@ -134,7 +143,15 @@ describe('computeAccountWeight', () => {
     assert.ok(Math.abs(computeAccountWeight(r, NOW) - 10) < 1e-9)
   })
 
-  test('subscription 边界刚好 7 天 → 因子 1.0(下闭上开:days < 7 → 0.7,days ≥ 7 → 1.0)', () => {
+  test('subscription 边界刚好 30 天 → 因子 0.8(下闭上开:days < 30 → 1.0,days ≥ 30 → 0.8)', () => {
+    const r = mkRow({
+      health_score: 100,
+      subscription_end_at: new Date(NOW.getTime() + 30 * 86_400_000),
+    })
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 80) < 1e-9)
+  })
+
+  test('subscription 边界刚好 7 天 → 因子 1.0(下闭上开:days < 7 → 1.5,days ≥ 7 → 1.0)', () => {
     const r = mkRow({
       health_score: 100,
       subscription_end_at: new Date(NOW.getTime() + 7 * 86_400_000),
@@ -142,23 +159,23 @@ describe('computeAccountWeight', () => {
     assert.equal(computeAccountWeight(r, NOW), 100)
   })
 
-  test('subscription 边界刚好 2 天 → 因子 0.7(下闭上开:days < 2 → 0.3,days ≥ 2 → 0.7)', () => {
+  test('subscription 边界刚好 2 天 → 因子 1.5(下闭上开:days < 2 → 2.0,days ≥ 2 → 1.5)', () => {
     const r = mkRow({
       health_score: 100,
       subscription_end_at: new Date(NOW.getTime() + 2 * 86_400_000),
     })
-    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 70) < 1e-9)
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 150) < 1e-9)
   })
 
-  test('多因子组合:health=80 + quota_5h=70 + sub<7d → 80 × ~0.578 × 0.7', () => {
+  test('多因子组合:health=80 + quota_5h=70 (≈0.578) + sub<7d (1.5) → ≈69.34', () => {
     const r = mkRow({
       health_score: 80,
       quota_5h_pct: 70,
       subscription_end_at: new Date(NOW.getTime() + 5 * 86_400_000),
     })
     // quota: (70-50)/45 = 0.444..,1 - 0.444*0.95 = 0.5778
-    // 80 * 0.5778 * 0.7 ≈ 32.356
-    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 32.356) < 0.1)
+    // 80 * 0.5778 * 1.5 ≈ 69.336
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 69.336) < 0.1)
   })
 
   test('极端劣:health=0 + quota=100 + sub 过期 → floor 0.05', () => {
@@ -170,6 +187,17 @@ describe('computeAccountWeight', () => {
     })
     // 1 × 0.05 × 0.05 × 0.1 = 0.00025 → floor 0.05
     assert.equal(computeAccountWeight(r, NOW), 0.05)
+  })
+
+  test('快到期+触顶矛盾:sub<2d (2.0) × quota_7d=90% (≈0.156) → 31.11 (合理折中,不 override quota)', () => {
+    const r = mkRow({
+      health_score: 100,
+      quota_7d_pct: 90,
+      subscription_end_at: new Date(NOW.getTime() + 1 * 86_400_000),
+    })
+    // q7d: (90-50)/45 = 0.8889, 1 - 0.8889*0.95 = 0.1556
+    // 100 * 0.1556 * 2.0 ≈ 31.11 — 想榨干但不能为榨干撞 rate limit
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 31.11) < 0.5)
   })
 })
 
@@ -261,7 +289,7 @@ describe('pickWRH', () => {
     assert.equal(pickWRH(cands, 'anything', NOW, fake).id, '2')
   })
 
-  test('注入低 weight 影响分布:weight 高的胜出概率高', () => {
+  test('注入低 weight 影响分布:weight 高的胜出概率高(sub 过期 0.1 vs 中性 1.0)', () => {
     // 用 subscription 因子拉低 id=2 的 weight(过期),id=1 中性 1.0
     const cands: CandidateRow[] = [
       mkRow({ id: '1', health_score: 100 }),
@@ -282,6 +310,25 @@ describe('pickWRH', () => {
     // weight 比 100:10 → 10:1
     const ratio = count1 / count2
     assert.ok(ratio > 7 && ratio < 14, `ratio ${ratio} out of bounds`)
+  })
+
+  test('收益最大化方向:sub<2d (factor 2.0) 比中性 (factor 1.0) 优先 ~2:1', () => {
+    // 业务语义验证 — 订阅快到期的账号应该优先吃流量榨干额度
+    const cands: CandidateRow[] = [
+      mkRow({ id: 'urgent', health_score: 100, subscription_end_at: new Date(NOW.getTime() + 86_400_000) }), // 1d → 2.0
+      mkRow({ id: 'normal', health_score: 100, subscription_end_at: new Date(NOW.getTime() + 15 * 86_400_000) }), // 15d → 1.0
+    ]
+    let urgent = 0
+    let normal = 0
+    const N = 10_000
+    for (let i = 0; i < N; i += 1) {
+      const p = pickWRH(cands, `seed-${i}`, NOW)
+      if (p.id === 'urgent') urgent += 1
+      else normal += 1
+    }
+    // weight 比 200:100 → 2:1
+    const ratio = urgent / normal
+    assert.ok(ratio > 1.7 && ratio < 2.4, `urgent/normal ratio=${ratio} expected ~2.0`)
   })
 })
 
@@ -436,8 +483,12 @@ describe('WRH drift properties', () => {
   // T4 不是 WRH 漂移定理测试,而是 scheduler.pick 的 inflight cap 集成行为。
   // 集成测试在 accountScheduler.integ.test.ts 已覆盖(需 PG fixture),此处不重复。
 
-  test('T5: subscription 7d → 7d-1s 跨阶跃边界 → 比例符合 weight 比,非目标 session 不漂移', () => {
-    // 5 候选,id=1 是目标,其余 4 个 sub=NOW+7d 锁在 factor=1.0
+  test('T5: subscription 7d → 7d-1s 跨阶跃边界(1.0→1.5 上升)→ 目标命中 superset 单调性', () => {
+    // 收益最大化方向反转后,跨过 7d 边界进入"<7d 优先"档,目标 weight 由 1.0 升到 1.5。
+    // WRH 性质:weight 上升 → 目标 winner 集合是原集合的 superset。
+    //   - 原本在目标的 session:100% 仍在
+    //   - 原本不在目标的 session:只能保持原 winner 或迁移到目标(不能从 B 漂到 C)
+    //   - n2 >= n1
     const sub7d = new Date(NOW.getTime() + 7 * 86_400_000)
     const sub7dMinus1s = new Date(NOW.getTime() + 7 * 86_400_000 - 1000)
 
@@ -448,9 +499,9 @@ describe('WRH drift properties', () => {
       c.id === '1' ? { ...c, subscription_end_at: sub7dMinus1s } : c,
     )
 
-    // 边界 weight 验证: 7d → factor=1.0, 7d-1s → factor=0.7
+    // 边界 weight 验证: 7d → factor=1.0 → weight=100;7d-1s → factor=1.5 → weight=150
     assert.equal(computeAccountWeight(before[0], NOW), 100)
-    assert.ok(Math.abs(computeAccountWeight(after[0], NOW) - 70) < 1e-9)
+    assert.ok(Math.abs(computeAccountWeight(after[0], NOW) - 150) < 1e-9)
 
     const w1 = pickOver(before, SESSIONS)
     const w2 = pickOver(after, SESSIONS)
@@ -460,16 +511,65 @@ describe('WRH drift properties', () => {
     for (let i = 0; i < SESSIONS.length; i += 1) {
       if (w1[i] === '1') n1 += 1
       if (w2[i] === '1') n2 += 1
-      // 单调性:目标 weight 下降,原本不在目标的 session 不可能改投目标
-      if (w1[i] !== '1') {
-        assert.equal(w2[i], w1[i], `非目标 session winner 异常漂移`)
+      // 单调性 superset:原在目标必须仍在目标;原不在目标只能保持原 winner 或漂到目标。
+      // 不允许 B → C 这种非目标之间的漂移(因为只有目标 score 变好,其他相对关系不变)
+      if (w1[i] === '1') {
+        assert.equal(w2[i], '1', `原在目标的 session ${SESSIONS[i]} 不应离开目标`)
+      } else {
+        const allowed = w2[i] === w1[i] || w2[i] === '1'
+        assert.ok(
+          allowed,
+          `原非目标 session ${SESSIONS[i]} 异常漂移:before=${w1[i]} after=${w2[i]} (只允许保持或迁移到目标)`,
+        )
       }
     }
-    // 理论: n1 = 1000 * 100/500 = 200, n2 = 1000 * 70/470 ≈ 149,比例 ≈ 0.745
+    assert.ok(n2 >= n1, `n2=${n2} must be ≥ n1=${n1} (目标 weight 上升只能增加命中)`)
+    // 理论: n1 = 1000 * 100/500 = 200, n2 = 1000 * 150/550 ≈ 273,ratio ≈ 1.364
     const ratio = n2 / n1
     assert.ok(
-      ratio >= 0.65 && ratio <= 0.85,
-      `subscription 7d→7d-1s drift ratio=${ratio.toFixed(3)}, expected ~0.745 ±0.08`,
+      ratio >= 1.2 && ratio <= 1.55,
+      `subscription 7d→7d-1s drift ratio=${ratio.toFixed(3)}, expected ~1.36 [1.2,1.55]`,
+    )
+  })
+
+  test('T6: subscription 2d → 2d-1s 跨阶跃边界(1.5→2.0 二次上升)→ superset 单调性仍成立', () => {
+    // 再跨一档:从"<7d 优先(1.5)"进入"<2d 紧急(2.0)",weight 100*1.5=150 升到 100*2.0=200
+    const sub2d = new Date(NOW.getTime() + 2 * 86_400_000)
+    const sub2dMinus1s = new Date(NOW.getTime() + 2 * 86_400_000 - 1000)
+
+    const before = Array.from({ length: 5 }, (_, i) =>
+      mkRow({ id: String(i + 1), health_score: 100, subscription_end_at: sub2d }),
+    )
+    const after = before.map((c) =>
+      c.id === '1' ? { ...c, subscription_end_at: sub2dMinus1s } : c,
+    )
+
+    assert.ok(Math.abs(computeAccountWeight(before[0], NOW) - 150) < 1e-9)
+    assert.ok(Math.abs(computeAccountWeight(after[0], NOW) - 200) < 1e-9)
+
+    const w1 = pickOver(before, SESSIONS)
+    const w2 = pickOver(after, SESSIONS)
+
+    let n1 = 0
+    let n2 = 0
+    for (let i = 0; i < SESSIONS.length; i += 1) {
+      if (w1[i] === '1') n1 += 1
+      if (w2[i] === '1') n2 += 1
+      if (w1[i] === '1') {
+        assert.equal(w2[i], '1', `原在目标的 session 不应离开目标`)
+      } else {
+        const allowed = w2[i] === w1[i] || w2[i] === '1'
+        assert.ok(allowed, `非目标 session 异常漂移(超出 superset 边界)`)
+      }
+    }
+    assert.ok(n2 >= n1, `n2=${n2} must be ≥ n1=${n1}`)
+    // 理论: before 全 sub2d → 5 个候选 weight 都是 150,总 750,target 期望 1000*150/750=200
+    //       after  其他 4 个仍 150,target 升到 200,总 800,target 期望 1000*200/800=250
+    //       ratio = 250/200 = 1.25
+    const ratio = n2 / n1
+    assert.ok(
+      ratio >= 1.1 && ratio <= 1.4,
+      `subscription 2d→2d-1s drift ratio=${ratio.toFixed(3)}, expected ~1.25 [1.1,1.4]`,
     )
   })
 })

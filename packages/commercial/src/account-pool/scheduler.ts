@@ -247,9 +247,11 @@ const TWO_64 = 2n ** 64n
  *   2. **配额因子 f_quota 用线性插值**而非阶梯函数:配额 header 每 5min 抖几下都
  *      不该触发整池 session 重洗。50% 以下中性,50→95% 线性 1.0→0.05,95% 以上钳到
  *      0.05(保留一点点 weight 让上层 fallback 可选,而不是直接踢出池子让 503)。
- *   3. **订阅因子 f_subscription 用阶梯**:管理员手填字段、变更频率极低
- *      (~一月一次),阶梯反而更直观,且边界附近 weight 跳变不会触发反复迁移。
- *      ≤0 天(已过期)= 0.1;<2 天(将过期)= 0.3;<7 天(临期)= 0.7;≥7 天 = 1.0。
+ *   3. **订阅因子 f_subscription 反向加权**:跟 quota 方向相反 — quota 是触顶风险
+ *      (用得多减权),subscription 是月度付费的沉没成本(到期前没用完就白付钱),
+ *      所以**快到期反而加权**优先榨干额度。阶梯阈值:≤0 天(已过期)= 0.1(belt+
+ *      suspenders);<2 天 = 2.0(紧急榨);<7 天 = 1.5(优先用);<30 天 = 1.0
+ *      (中性);≥30 天 = 0.8(远期让路)。管理员手填字段、变更频率极低,阶梯 OK。
  *   4. **永不返回 0**:全局保底 0.05 — health=0、quota=100、subscription 过期的
  *      "残废账号" 也保留极小机会被探活,以便健康分恢复路径不死锁。
  *
@@ -284,12 +286,22 @@ function quotaFactor(util: number | null): number {
 }
 
 /**
- * 订阅因子 f_subscription(end, now)。
- *   - end IS NULL          → 1.0(未维护,中性)
- *   - days ≤ 0(已过期)     → 0.1
- *   - days < 2(即将过期)    → 0.3
- *   - days < 7(临期)        → 0.7
- *   - days ≥ 7             → 1.0
+ * 订阅因子 f_subscription(end, now) — **收益最大化** 方向。
+ *
+ * 业务语义:Anthropic 订阅按月付费,到期前没用完的额度白白浪费。所以**快到期的账号
+ * 反而要优先吃流量,把额度榨干**。这跟 quota_5h/7d 是相反的两件事:
+ *   - quota = 滚动窗口 rate limit,触顶被 ban → 用得越多越减权(避免触顶)
+ *   - subscription = 月度付费,过期就白付钱 → 越临近到期越加权(榨干额度)
+ *
+ *   - end IS NULL          → 1.0  中性(admin 没填,语义不明)
+ *   - days ≤ 0(已过期)     → 0.1  belt+suspenders;真正过期 health 系统会 disable
+ *   - days < 2(紧急)        → 2.0  急用!2 天内到期猛吃
+ *   - days < 7(临期)        → 1.5  优先吃额度
+ *   - days < 30(月内)       → 1.0  中性
+ *   - days ≥ 30(远期)       → 0.8  让快到期的先消化,远期账号慢慢用
+ *
+ * 阶跃 vs 平滑:admin 手填字段、改动频率极低,阶跃 OK(不会因为时间分秒变化产生 session
+ * 漂移);quota 用线性是因为 5h header 自动 refresh 容易在 50-95% 平滑过渡。
  */
 function subscriptionFactor(end: Date | null, now: Date): number {
   if (end == null) return 1.0
@@ -297,9 +309,10 @@ function subscriptionFactor(end: Date | null, now: Date): number {
   if (Number.isNaN(ms)) return 1.0
   const days = ms / (24 * 60 * 60 * 1000)
   if (days <= 0) return 0.1
-  if (days < 2) return 0.3
-  if (days < 7) return 0.7
-  return 1.0
+  if (days < 2) return 2.0
+  if (days < 7) return 1.5
+  if (days < 30) return 1.0
+  return 0.8
 }
 
 /**

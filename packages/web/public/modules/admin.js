@@ -16,9 +16,9 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { _clearStoredAccessToken, state } from './state.js?v=c69e9de1'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=c69e9de1'
-import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=c69e9de1'
+import { _clearStoredAccessToken, state } from './state.js?v=patch'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=patch'
+import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=patch'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
@@ -1804,7 +1804,7 @@ function _renderAccountsTable() {
           <th class="num">今日 / 错误率</th>
           <th class="num">累计 ok/fail</th>
           <th>OAuth 到期</th>
-          <th title="Anthropic 订阅周期到期日(管理员手填;留空 = 未知,调度器按中性看待)">订阅到期</th>
+          <th title="Anthropic 订阅周期到期日(管理员手填;留空 = 未知,调度器按中性看待;快到期账号 WRH 自动加权优先吃流量榨干额度)">订阅到期</th>
           <th class="num" title="近 5 小时利用率(被动从上游响应头采集)">5h%</th>
           <th class="num" title="5 小时配额重置时间(剩余时间;tooltip 显示绝对时间)">5h 重置</th>
           <th class="num" title="近 7 天利用率(被动从上游响应头采集)">7d%</th>
@@ -2153,7 +2153,7 @@ function _accountFormFields(prefill, activeProxies = []) {
       <label>subscription_end_at ${isCreate ? '(可选;Anthropic 订阅到期日)' : '(留空不动;输入 NULL 清空)'}</label>
       <input type="text" id="acc-sub-end" placeholder="如 2026-12-31 或 2026-12-31T00:00:00Z 或 NULL"
              value="${escapeHtml(a.subscription_end_at || '')}" />
-      <small style="color:var(--muted)">管理员手填字段(Anthropic OAuth/API 不暴露)。NULL = 未知,调度器按中性 1.0 看待;否则参与 WRH 权重(临期账号自动降权)。</small>
+      <small style="color:var(--muted)">管理员手填字段(Anthropic OAuth/API 不暴露)。NULL = 未知,调度器按中性 1.0 看待;否则参与 WRH 权重 — <strong>快到期账号自动加权(收益最大化:订阅到期前榨干额度)</strong>。</small>
     </div>
     <div class="form-row">
       <label>egress 代理池条目${isCreate ? '(必选)' : '(必选;不可清空)'}</label>
