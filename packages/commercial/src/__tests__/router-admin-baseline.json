@@ -462,6 +462,12 @@
     "handler": "handleAdminListInbox"
   },
   {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/messages/email-config",
+    "handler": "handleAdminGetInboxEmailConfig"
+  },
+  {
     "method": "POST",
     "pathKind": "path",
     "pathValue": "/api/admin/messages",
@@ -472,5 +478,11 @@
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/messages/",
     "handler": "handleAdminDeleteInbox"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/sessions/",
+    "handler": "handleAdminGetSession"
   }
 ]

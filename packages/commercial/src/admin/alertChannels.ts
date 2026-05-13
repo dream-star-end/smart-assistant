@@ -147,7 +147,9 @@ const SELECT_COLUMNS = `
 /** 列出所有通道(admin UI 用;不分 admin,超管能看全部以便运维协作)。 */
 export async function listAlertChannels(): Promise<AlertChannelRow[]> {
   const r = await query<Record<string, unknown>>(
-    `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels ORDER BY id DESC`,
+    // ORDER BY admin_alert_channels.id —— SELECT_COLUMNS 含 \`id::text AS id\`,
+    // qualify 列名避免按 text 排(channels 行数现在虽小,同型 bug 一律封死)。
+    `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels ORDER BY admin_alert_channels.id DESC`,
   )
   return r.rows.map(rowToView)
 }

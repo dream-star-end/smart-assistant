@@ -91,6 +91,10 @@ import {
   type OnboardingSchedulerHandle,
 } from "./inbox/onboarding.js";
 import {
+  startInboxEmailScheduler,
+  type InboxEmailSchedulerHandle,
+} from "./inbox/email.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -1892,6 +1896,21 @@ export async function registerCommercial(
     onboardingScheduler = startOnboardingScheduler({ intervalMs });
   }
 
+  // Plan C — inbox 站内信邮件推送 worker.
+  // 由 admin 创建消息时勾选「同时发邮件」触发,inbox_email_jobs 表持久化,
+  // 本 scheduler 周期 drain;启动时一次 stale cleanup(sending>5min → interrupted).
+  // 关闭:COMMERCIAL_INBOX_EMAIL_DISABLED=1.默认 30s tick / 50 条/batch / 600ms 间隔.
+  // mailer 走 stub 也能跑(打 stdout),只有禁用 worker 时不跑.
+  let inboxEmailScheduler: InboxEmailSchedulerHandle | undefined;
+  if (process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== "1") {
+    const raw = Number(process.env.COMMERCIAL_INBOX_EMAIL_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 30_000;
+    inboxEmailScheduler = startInboxEmailScheduler({
+      mailer,
+      intervalMs,
+    });
+  }
+
   return {
     handle: handler,
     handleWsUpgrade: (req, socket, head) => {
@@ -1942,6 +1961,9 @@ export async function registerCommercial(
       }
       if (onboardingScheduler) {
         try { onboardingScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (inboxEmailScheduler) {
+        try { inboxEmailScheduler.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }

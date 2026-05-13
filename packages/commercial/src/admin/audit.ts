@@ -177,9 +177,11 @@ export async function listAdminAudit(input: ListAdminAuditInput): Promise<ListAd
            created_at
       FROM admin_audit
       ${whereClause}
-     ORDER BY id DESC
+     ORDER BY admin_audit.id DESC
      LIMIT $${params.length}
   `;
+  // ORDER BY admin_audit.id —— 同型 bug 防御:SELECT 里 \`id::text AS id\`,
+  // PG simple-name 排序会取 text 别名(数百行后 "999">"1000")。
   const r = await query<AdminAuditRowView>(sql, params);
   const rows = r.rows;
   const nextBefore = rows.length === limit ? rows[rows.length - 1].id : null;

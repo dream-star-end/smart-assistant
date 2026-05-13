@@ -235,6 +235,22 @@ describe("buildUsersCsv", () => {
       (err: unknown) => err instanceof RangeError && err.message === "invalid_status",
     );
   });
+
+  // 防回归 — buildUsersCsv 与 listUsers 都有 `id::text AS id` + ORDER BY 的同型陷阱,
+  // 但 SQL 是各自独立的(行 279 vs 715),修一处不等于修另一处。
+  test("buildUsersCsv: 110 行 id 按数值 DESC(防 text 排序回归)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    for (let i = 1; i <= 110; i++) {
+      await ensureUser(`csvsort${i}@test.local`);
+    }
+    const r = await buildUsersCsv();
+    assert.equal(r.rowCount, 110);
+    const lines = r.csv.split("\r\n").filter((l) => l.length > 0);
+    // 跳过 header,取首 3 行的 id 列(逗号分隔第 0 列)
+    const top3 = lines.slice(1, 4).map((l) => Number(l.split(",")[0]));
+    assert.deepEqual(top3, [110, 109, 108],
+      "CSV 首 3 行 id 必须是 110/109/108,bug 状态下会是 99/98/97");
+  });
 });
 
 // ─── buildOrdersCsv ─────────────────────────────────────────────────

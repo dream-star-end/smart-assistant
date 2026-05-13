@@ -574,7 +574,7 @@ async function collectGauges(deps: CollectDeps): Promise<{
   let accountHealth: Array<{ account_id: string; health_score: number; status: string }> = [];
   try {
     const r = await query<{ id: string; health_score: number; status: string }>(
-      "SELECT id::text AS id, health_score, status FROM claude_accounts ORDER BY id",
+      "SELECT id::text AS id, health_score, status FROM claude_accounts ORDER BY claude_accounts.id",
     );
     accountHealth = r.rows.map((row) => ({
       account_id: row.id,

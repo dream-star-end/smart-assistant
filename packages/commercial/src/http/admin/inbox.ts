@@ -43,6 +43,18 @@ function serializeAdminInboxMessage(
   };
 }
 
+/** Plan C — 序列化邮件字段(create 返回 / list 行都要). */
+function serializeEmailFields(
+  m: Partial<import("../../inbox/inbox.js").InboxEmailFields>,
+): Record<string, unknown> {
+  return {
+    notify_email: m.notify_email === true,
+    email_send_status: m.email_send_status ?? null,
+    email_sent_at: m.email_sent_at ?? null,
+    email_summary: m.email_summary ?? null,
+  };
+}
+
 /** audit 用的精简 snapshot —— 不写 body_md(可能 16KB)。 */
 function inboxAuditSnapshot(
   m: import("../../inbox/inbox.js").InboxMessage,
@@ -70,7 +82,7 @@ export async function handleAdminCreateInbox(
     throw new HttpError(400, "VALIDATION", "request body must be JSON object");
   }
   const { createInboxMessage, InboxError } = await import("../../inbox/inbox.js");
-  let created: import("../../inbox/inbox.js").InboxMessage;
+  let created: import("../../inbox/inbox.js").CreatedInboxMessage;
   try {
     created = await createInboxMessage(admin.id, body);
   } catch (err) {
@@ -90,19 +102,52 @@ export async function handleAdminCreateInbox(
     }
     throw err;
   }
-  // best-effort audit
+  // best-effort audit —— after 不带 body_md / 不带 email_summary 明细(jobs 表本身就是审计源)
   try {
     await writeAdminAudit(getPool(), {
       adminId: admin.id,
       action: "inbox.create",
       target: `message:${created.id}`,
       before: null,
-      after: inboxAuditSnapshot(created),
+      after: {
+        ...inboxAuditSnapshot(created),
+        notify_email: created.notify_email,
+        // Plan C:写 audit 时只记 total + 初始 status,后续 worker drain 状态变化不补审计
+        // (按需求"3 不留痕"语义,jobs 表已是完整审计源,不重复)
+        email_initial_total: created.email_summary?.total ?? 0,
+        email_initial_status: created.email_send_status,
+      },
       ip: ctx.clientIp ?? null,
       userAgent: ctx.userAgent ?? null,
     });
   } catch { /* best-effort */ }
-  sendJson(res, 201, { message: serializeAdminInboxMessage(created) });
+  sendJson(res, 201, {
+    message: {
+      ...serializeAdminInboxMessage(created),
+      ...serializeEmailFields(created),
+    },
+  });
+}
+
+/**
+ * GET /api/admin/messages/email-config
+ *
+ * 前端创建消息时探测:邮件 worker 是否启用 + 用哪个 provider.
+ *   - provider='resend' → 真发邮件
+ *   - provider='stub'   → 打 stdout(dev/test);admin 看 UI 上提示「当前邮件走 stub」
+ *
+ * 不写审计、不限速:轻量配置探测.
+ */
+export async function handleAdminGetInboxEmailConfig(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const provider = process.env.RESEND_API_KEY?.trim() ? "resend" : "stub";
+  const enabled = process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== "1";
+  sendJson(res, 200, { enabled, provider });
 }
 
 export async function handleAdminListInbox(
@@ -123,6 +168,7 @@ export async function handleAdminListInbox(
       ...serializeAdminInboxMessage(m),
       read_count: m.read_count,
       recipients: m.recipients,
+      ...serializeEmailFields(m),
     })),
     total: r.total,
   });

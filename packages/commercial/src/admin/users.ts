@@ -274,9 +274,14 @@ export async function listUsers(input: ListUsersInput = {}): Promise<ListUsersRe
   const limitIdx = params.length;
   params.push(offset);
   const offsetIdx = params.length;
+  // ORDER BY users.id —— qualified column 必须的:USER_COLUMNS 里有 `id::text AS id`,
+  // PG 对 ORDER BY simple name 优先解析为 SELECT 输出列别名(与 GROUP BY 相反),
+  // 没限定就会按 text 降序排("99">"100"),100+ 用户被排到 1 后面 + 9 出现在 90/89 之间。
+  // 同型陷阱在仓内多处:agentAudit/audit/alertChannels/alertOutbox/account-pool/store
+  // 都已一并 qualify。
   const r = await query<AdminUserRowView>(
     `SELECT ${USER_COLUMNS} FROM users ${whereClause}
-     ORDER BY id DESC
+     ORDER BY users.id DESC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params,
   );
@@ -710,9 +715,11 @@ export async function buildUsersCsv(input: BuildUsersCsvInput = {}): Promise<Bui
   });
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
   params.push(USERS_CSV_MAX_ROWS);
+  // ORDER BY users.id —— 同上,USER_COLUMNS 含 `id::text AS id` 必须 qualify
+  // 避免按 text 排,CSV 导出与列表 UI 看到的顺序保持一致。
   const r = await query<AdminUserRowView>(
     `SELECT ${USER_COLUMNS} FROM users ${whereClause}
-     ORDER BY id DESC
+     ORDER BY users.id DESC
      LIMIT $${params.length}`,
     params,
   );

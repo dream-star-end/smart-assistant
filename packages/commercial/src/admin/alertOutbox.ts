@@ -436,12 +436,14 @@ export async function listOutbox(input: ListOutboxInput): Promise<ListOutboxResu
   params.push(limit);
 
   const r = await query<Record<string, unknown>>(
+    // ORDER BY admin_alert_outbox.id —— SELECT 有 \`id::text AS id\`,qualify 避免
+    // PG 按 text 别名排(同型 bug 在 users.ts 暴露过)。
     `SELECT id::text AS id, event_type, severity, status, title, body, payload,
             channel_id::text AS channel_id, attempts, last_error,
             next_attempt_at, created_at, sent_at
        FROM admin_alert_outbox
        ${whereClause}
-      ORDER BY id DESC
+      ORDER BY admin_alert_outbox.id DESC
       LIMIT $${params.length}`,
     params,
   );
@@ -587,10 +589,12 @@ export async function listSilences(): Promise<SilenceRowView[]> {
     created_by: string | null;
     created_at: Date;
   }>(
+    // ORDER BY admin_alert_silences.id —— SELECT 有 \`id::text AS id\`,qualify
+    // 避免按 text 别名排(同型 bug 防御)。
     `SELECT id::text AS id, matcher, starts_at, ends_at, reason,
             created_by::text AS created_by, created_at
        FROM admin_alert_silences
-       ORDER BY id DESC LIMIT 200`,
+       ORDER BY admin_alert_silences.id DESC LIMIT 200`,
   );
   const now = Date.now();
   return r.rows.map((r) => ({

@@ -133,9 +133,11 @@ export async function listAgentAudit(input: ListAgentAuditInput): Promise<ListAg
            created_at
       FROM agent_audit
       ${whereClause}
-     ORDER BY id DESC
+     ORDER BY agent_audit.id DESC
      LIMIT $${params.length}
   `;
+  // ORDER BY agent_audit.id —— SELECT 里有 \`id::text AS id\`,PG 对 ORDER BY
+  // simple name 优先取输出列别名(text),qualified column 强制按 bigint 实排。
 
   const r = await query<AgentAuditRowView>(sql, params);
   const rows = r.rows;

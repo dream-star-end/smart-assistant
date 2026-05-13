@@ -247,6 +247,32 @@ describe("admin users — DB layer", () => {
       (err) => err instanceof RangeError && err.message === "invalid_user_id",
     );
   });
+
+  // 防回归 — admin/users.ts:279 的 `ORDER BY id DESC` 在 USER_COLUMNS 含
+  // `id::text AS id` 时,PG 优先解析为输出列别名 → 按 text 降序排
+  // ("99">"100"),100+ 用户被排到 1 后面 + 9 出现在 90/89 之间。
+  // qualified column (`users.id`) 才走 bigint 实排。
+  test("listUsers: 110 用户场景 id 必须按数值 DESC(防 text 排序回归)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    // 顺序插入,DB 给的 id 严格 1..110(beforeEach RESTART IDENTITY)
+    for (let i = 1; i <= 110; i++) {
+      await createUser(`u${i}@x.com`);
+    }
+    const page1 = await listUsers({ limit: 20 });
+    assert.equal(page1.rows.length, 20);
+    // 期望:110, 109, ..., 91。bug 状态下会是 "99","98",...,"81" 之类
+    const ids1 = page1.rows.map((r) => Number(r.id));
+    assert.deepEqual(ids1, Array.from({ length: 20 }, (_, i) => 110 - i),
+      "首页必须是数值降序 110..91,不能按 text 降序");
+    assert.equal(page1.next_cursor, "91", "cursor = 末行 id (=91)");
+
+    // cursor 续翻 → 必须 90..71(数值连续,跳过 9)
+    const page2 = await listUsers({ limit: 20, cursor: page1.next_cursor! });
+    assert.equal(page2.rows.length, 20);
+    const ids2 = page2.rows.map((r) => Number(r.id));
+    assert.deepEqual(ids2, Array.from({ length: 20 }, (_, i) => 90 - i),
+      "第二页必须是 90..71,bug 状态下会插入 id=9");
+  });
 });
 
 // ============================================================

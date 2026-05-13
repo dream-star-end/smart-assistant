@@ -19,7 +19,7 @@
  */
 
 import { z } from "zod";
-import { query } from "../db/queries.js";
+import { query, tx } from "../db/queries.js";
 
 // ─── 公共类型 ────────────────────────────────────────────────────────
 
@@ -43,6 +43,34 @@ export interface InboxMessageView extends InboxMessage {
   read: boolean;
 }
 
+/** Plan C — 邮件群发状态汇总(jsonb).每条 inbox_messages 一份. */
+export interface EmailSummary {
+  /** 创建时锁定的快照行数(后续注册的用户不会补) */
+  total: number;
+  sent: number;
+  failed: number;
+  /** 进程崩前卡 sending,启动清扫后归入此项 */
+  interrupted: number;
+  /** worker 跑时发现 email 为空/账号被删/被禁等异常,主动跳过 */
+  dropped: number;
+}
+
+/** inbox_messages.email_send_status 状态机. NULL = 未启用邮件推送. */
+export type EmailSendStatus =
+  | null
+  | "queued"
+  | "done"
+  | "partial"
+  | "interrupted";
+
+/** Admin 列表 / 创建返回中带 email 字段的扩展(普通用户读 inbox 不暴露邮件状态). */
+export interface InboxEmailFields {
+  notify_email: boolean;
+  email_send_status: EmailSendStatus;
+  email_sent_at: string | null;
+  email_summary: EmailSummary | null;
+}
+
 export class InboxError extends Error {
   constructor(
     public code: "VALIDATION" | "NOT_FOUND" | "USER_NOT_FOUND",
@@ -64,6 +92,9 @@ const createSchema = z
     body_md: z.string().min(1).max(16384),
     level: z.enum(["info", "notice", "promo", "warning"]).optional(),
     expires_at: z.string().datetime({ offset: true }).optional(),
+    // Plan C:勾选后同事务给 audience 对应的 active+email_verified 用户写
+    // inbox_email_jobs 快照,worker drain 后异步发邮件。详见 0065 migration 注释。
+    notify_email: z.boolean().optional(),
   })
   .strict()
   .superRefine((v, ctx) => {
@@ -275,22 +306,38 @@ export async function readAll(userId: string | bigint): Promise<{ inserted: numb
 
 // ─── Admin 侧:create / list / delete ─────────────────────────────
 
+/** createInboxMessage 返回 — 总是带 email 字段,未启用 notify_email 时全部置零/null. */
+export type CreatedInboxMessage = InboxMessage & InboxEmailFields;
+
 /**
  * Admin 创建消息。校验后写入(audience='all' 时 user_id 强制为 null)。
- * 返回新建消息(包含 id)。
+ * 返回新建消息(包含 id 与邮件汇总字段)。
  *
  * audience='user' 时 verify 收件人存在且 status='active',否则 USER_NOT_FOUND。
+ *
+ * notify_email=true 路径(Plan C):
+ *   1) tx() 内 INSERT message;
+ *   2) 同事务 INSERT...SELECT 写 inbox_email_jobs(audience='user' → 单收件人 / 'all'
+ *      → 创建时刻 status='active' AND email_verified=TRUE AND deleted_at IS NULL
+ *      的全量 users 快照,锁定那一刻的列表);
+ *   3) UPDATE message 设 notify_email=TRUE / email_send_status='queued'(若快照 0 行
+ *      则直接 'done',避免空 jobs 永久卡在 queued)/ email_summary={total,...}。
+ *
+ * 所有写在一个 tx 中:任何一步失败 → 整体回滚,**不会出现"消息写了但 jobs 没写"
+ * 或反过来**的半套状态。这是替代 fire-and-forget 设计的根因 —— 上线/部署/进程
+ * 崩在创建中间一刻不会丢失收件人快照。
  */
 export async function createInboxMessage(
   adminId: string | bigint,
   input: unknown,
-): Promise<InboxMessage> {
+): Promise<CreatedInboxMessage> {
   const parsed = createSchema.safeParse(input);
   if (!parsed.success) {
     throw new InboxError("VALIDATION", parsed.error.message, { issues: parsed.error.issues });
   }
   const v = parsed.data;
   const userId = v.audience === "user" ? String(v.user_id) : null;
+  const notifyEmail = v.notify_email === true;
 
   if (userId !== null) {
     // 校验收件人存在且活跃
@@ -302,43 +349,145 @@ export async function createInboxMessage(
     }
   }
 
-  const r = await query<{
-    id: string;
-    audience: Audience;
-    user_id: string | null;
-    title: string;
-    body_md: string;
-    level: Level;
-    created_by: string;
-    created_at: Date;
-    expires_at: Date | null;
-  }>(
-    `INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by, expires_at)
-     VALUES ($1, $2::bigint, $3, $4, COALESCE($5, 'info'), $6::bigint, $7::timestamptz)
-     RETURNING id::text AS id, audience, user_id::text AS user_id, title, body_md, level,
-               created_by::text AS created_by, created_at, expires_at`,
-    [
-      v.audience,
-      userId,
-      v.title,
-      v.body_md,
-      v.level ?? null,
-      String(adminId),
-      v.expires_at ?? null,
-    ],
-  );
-  const row = r.rows[0];
-  return {
-    id: row.id,
-    audience: row.audience,
-    user_id: row.user_id,
-    title: row.title,
-    body_md: row.body_md,
-    level: row.level,
-    created_by: row.created_by,
-    created_at: row.created_at.toISOString(),
-    expires_at: row.expires_at ? row.expires_at.toISOString() : null,
-  };
+  // 不开启邮件推送:走老路径(单 INSERT,不开 tx,与历史行为字节等价)
+  if (!notifyEmail) {
+    const r = await query<{
+      id: string;
+      audience: Audience;
+      user_id: string | null;
+      title: string;
+      body_md: string;
+      level: Level;
+      created_by: string;
+      created_at: Date;
+      expires_at: Date | null;
+    }>(
+      `INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by, expires_at)
+       VALUES ($1, $2::bigint, $3, $4, COALESCE($5, 'info'), $6::bigint, $7::timestamptz)
+       RETURNING id::text AS id, audience, user_id::text AS user_id, title, body_md, level,
+                 created_by::text AS created_by, created_at, expires_at`,
+      [
+        v.audience,
+        userId,
+        v.title,
+        v.body_md,
+        v.level ?? null,
+        String(adminId),
+        v.expires_at ?? null,
+      ],
+    );
+    const row = r.rows[0];
+    return {
+      id: row.id,
+      audience: row.audience,
+      user_id: row.user_id,
+      title: row.title,
+      body_md: row.body_md,
+      level: row.level,
+      created_by: row.created_by,
+      created_at: row.created_at.toISOString(),
+      expires_at: row.expires_at ? row.expires_at.toISOString() : null,
+      notify_email: false,
+      email_send_status: null,
+      email_sent_at: null,
+      email_summary: null,
+    };
+  }
+
+  // notify_email=true:tx() 包住 message 写入 + 收件人快照 + summary 回填
+  return tx(async (client) => {
+    const r = await client.query<{
+      id: string;
+      audience: Audience;
+      user_id: string | null;
+      title: string;
+      body_md: string;
+      level: Level;
+      created_by: string;
+      created_at: Date;
+      expires_at: Date | null;
+    }>(
+      // notify_email 先置 TRUE,但 email_send_status 等快照行数定下来再 UPDATE,
+      // 避免快照 0 行时仍残留 'queued' 状态(worker 永远不可能命中)
+      `INSERT INTO inbox_messages
+         (audience, user_id, title, body_md, level, created_by, expires_at, notify_email)
+       VALUES ($1, $2::bigint, $3, $4, COALESCE($5, 'info'), $6::bigint, $7::timestamptz, TRUE)
+       RETURNING id::text AS id, audience, user_id::text AS user_id, title, body_md, level,
+                 created_by::text AS created_by, created_at, expires_at`,
+      [
+        v.audience,
+        userId,
+        v.title,
+        v.body_md,
+        v.level ?? null,
+        String(adminId),
+        v.expires_at ?? null,
+      ],
+    );
+    const row = r.rows[0];
+
+    // 收件人快照:`u.email <> ''` 防 NOT NULL 但空串(0001 schema 只有 UNIQUE 没 CHECK)
+    // 这一刻 INSERT...SELECT 的行集 = 该 message 永久邮件收件人(后续注册或改邮箱不补)。
+    const jobSql =
+      v.audience === "user"
+        ? `INSERT INTO inbox_email_jobs (message_id, user_id, email)
+           SELECT $1::bigint, u.id, u.email
+             FROM users u
+            WHERE u.id = $2::bigint
+              AND u.status = 'active'
+              AND u.email_verified = TRUE
+              AND u.deleted_at IS NULL
+              AND u.email IS NOT NULL
+              AND u.email <> ''`
+        : `INSERT INTO inbox_email_jobs (message_id, user_id, email)
+           SELECT $1::bigint, u.id, u.email
+             FROM users u
+            WHERE u.status = 'active'
+              AND u.email_verified = TRUE
+              AND u.deleted_at IS NULL
+              AND u.email IS NOT NULL
+              AND u.email <> ''`;
+    const jobParams: unknown[] = v.audience === "user" ? [row.id, userId] : [row.id];
+    const jobsRes = await client.query(jobSql, jobParams);
+    const total = jobsRes.rowCount ?? 0;
+
+    // 快照 0 行 → status='done',email_sent_at=now;>0 → 'queued',等 worker drain。
+    const initialStatus: EmailSendStatus = total === 0 ? "done" : "queued";
+    const summary: EmailSummary = {
+      total,
+      sent: 0,
+      failed: 0,
+      interrupted: 0,
+      dropped: 0,
+    };
+    const finUpd = await client.query<{ email_sent_at: Date | null }>(
+      `UPDATE inbox_messages
+          SET email_send_status = $2,
+              email_summary = $3::jsonb,
+              email_sent_at = CASE WHEN $4::int = 0 THEN NOW() ELSE NULL END
+        WHERE id = $1::bigint
+       RETURNING email_sent_at`,
+      [row.id, initialStatus, JSON.stringify(summary), total],
+    );
+
+    return {
+      id: row.id,
+      audience: row.audience,
+      user_id: row.user_id,
+      title: row.title,
+      body_md: row.body_md,
+      level: row.level,
+      created_by: row.created_by,
+      created_at: row.created_at.toISOString(),
+      expires_at: row.expires_at ? row.expires_at.toISOString() : null,
+      notify_email: true,
+      email_send_status: initialStatus,
+      email_sent_at: finUpd.rows[0]?.email_sent_at
+        ? finUpd.rows[0].email_sent_at.toISOString()
+        : null,
+      email_summary: summary,
+    };
+  });
 }
 
 export interface AdminListInput {
@@ -346,7 +495,7 @@ export interface AdminListInput {
   offset?: number;
 }
 
-export interface AdminInboxRow extends InboxMessage {
+export interface AdminInboxRow extends InboxMessage, InboxEmailFields {
   read_count: number;
   recipients: number;
 }
@@ -354,6 +503,21 @@ export interface AdminInboxRow extends InboxMessage {
 export interface AdminListResult {
   messages: AdminInboxRow[];
   total: number;
+}
+
+/** EmailSummary 校验 / 容错:DB 返 jsonb 可能是任意形状,缺字段补 0。 */
+function normalizeEmailSummary(raw: unknown): EmailSummary | null {
+  if (raw == null || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const n = (k: string): number =>
+    typeof o[k] === "number" && Number.isFinite(o[k] as number) ? (o[k] as number) : 0;
+  return {
+    total: n("total"),
+    sent: n("sent"),
+    failed: n("failed"),
+    interrupted: n("interrupted"),
+    dropped: n("dropped"),
+  };
 }
 
 /**
@@ -364,6 +528,9 @@ export interface AdminListResult {
  *   - audience='all'  → 该消息发出时 active 用户总数(创建时间 ≥ users.created_at 的人)
  *
  * 注:recipients 走子查询(N+1),量起来再做汇总缓存。
+ *
+ * Plan C 补:同步返 notify_email / email_send_status / email_sent_at / email_summary,
+ * 前端列表渲染状态徽章直接读主表(不 N+1 jobs).
  */
 export async function adminListInbox(input: AdminListInput): Promise<AdminListResult> {
   const limit = Math.min(Math.max(input.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT);
@@ -381,6 +548,10 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
     expires_at: Date | null;
     read_count: number;
     recipients: number;
+    notify_email: boolean;
+    email_send_status: EmailSendStatus;
+    email_sent_at: Date | null;
+    email_summary: unknown;
   }>(
     `SELECT m.id::text AS id,
             m.audience,
@@ -391,6 +562,10 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
             m.created_by::text AS created_by,
             m.created_at,
             m.expires_at,
+            m.notify_email,
+            m.email_send_status,
+            m.email_sent_at,
+            m.email_summary,
             COALESCE((SELECT COUNT(*)::int FROM inbox_message_reads r WHERE r.message_id = m.id), 0) AS read_count,
             CASE WHEN m.audience = 'user' THEN 1
                  ELSE COALESCE(
@@ -418,6 +593,10 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
       expires_at: row.expires_at ? row.expires_at.toISOString() : null,
       read_count: row.read_count,
       recipients: row.recipients,
+      notify_email: row.notify_email === true,
+      email_send_status: row.email_send_status,
+      email_sent_at: row.email_sent_at ? row.email_sent_at.toISOString() : null,
+      email_summary: normalizeEmailSummary(row.email_summary),
     })),
     total: totalRes.rows[0]?.n ?? 0,
   };

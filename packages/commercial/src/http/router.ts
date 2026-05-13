@@ -147,7 +147,9 @@ import {
   handleAdminListInbox,
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
+  handleAdminGetInboxEmailConfig,
 } from './admin/inbox.js'
+import { handleAdminGetSession } from './admin/sessions.js'
 import { handleAdminRemoveUserModelGrant } from './admin/modelGrants.js'
 import {
   handleAdminStatsDau,
@@ -731,12 +733,25 @@ export function createCommercialHandler(
     { method: 'POST', path: '/api/me/messages/read_all', handler: handleReadAllInbox },
     { method: 'POST', pathPrefix: '/api/me/messages/', handler: handleMarkInboxRead },
     // 站内信 admin 侧
-    //   GET    /api/admin/messages          → 列表(只读 requireAdmin)
-    //   POST   /api/admin/messages          → 创建(requireAdminVerifyDb)
-    //   DELETE /api/admin/messages/:id      → 删除(requireAdminVerifyDb)
+    //   GET    /api/admin/messages              → 列表(只读 requireAdmin)
+    //   POST   /api/admin/messages              → 创建(requireAdminVerifyDb)
+    //   DELETE /api/admin/messages/:id          → 删除(requireAdminVerifyDb)
+    //   GET    /api/admin/messages/email-config → 邮件 worker 状态探测(Plan C)
+    //                                              **必须在 DELETE prefix 之前注册**
+    //                                              否则 GET /messages/email-config 匹配不上.
+    //                                              注:GET /api/admin/messages/email-config 走
+    //                                              path 完全匹配,不是 prefix,所以独立项即可.
     { method: 'GET', path: '/api/admin/messages', handler: handleAdminListInbox },
+    { method: 'GET', path: '/api/admin/messages/email-config', handler: handleAdminGetInboxEmailConfig },
     { method: 'POST', path: '/api/admin/messages', handler: handleAdminCreateInbox },
     { method: 'DELETE', pathPrefix: '/api/admin/messages/', handler: handleAdminDeleteInbox },
+
+    // ── /api/admin/sessions/:id —— admin 只读看用户对话内容 ────────────────
+    //   GET /api/admin/sessions/:id[?user_id=:userId]
+    //   - rendering session_id 是 TEXT(UUID/nanoid),handler 自带正则校验
+    //   - 不写 admin_audit("3 不留痕")
+    //   - 详见 admin/sessions.ts header comment
+    { method: 'GET', pathPrefix: '/api/admin/sessions/', handler: handleAdminGetSession },
   ]
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [

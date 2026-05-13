@@ -474,11 +474,14 @@ export async function listAccounts(
   const limitIdx = params.length;
   params.push(offset);
   const offsetIdx = params.length;
+  // ORDER BY claude_accounts.id —— META_COLUMNS 含 \`id::text AS id\`,PG 对
+  // ORDER BY simple-name 优先解析为输出列别名(text);qualify 列名强制按 bigint 实排
+  // 同型 bug 见 admin/users.ts:279(账号池一旦超 99 条会出现 99>100 错位)。
   const res = await query<RawMetaRow>(
     `SELECT ${META_COLUMNS}
      FROM claude_accounts
      ${where}
-     ORDER BY id DESC
+     ORDER BY claude_accounts.id DESC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params,
   );

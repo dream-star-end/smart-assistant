@@ -1642,18 +1642,32 @@ async function openUserDetailModal(userId) {
        </table>`
 
   // 最近会话(最多 10 条;90 天窗口)
+  //
+  // 每行可折叠:点击 ▸/▾ 切换展开;第一次展开懒加载完整 messages
+  // (GET /api/admin/sessions/:id?user_id=:userId)。
+  // 加载结果按 session_id 缓存到 modal 生命周期内的 Map。
   const sessTbl = sess.length === 0
     ? '<div class="empty">90 天内暂无会话</div>'
     : `<table class="data" style="width:100%;font-size:13px;">
-        <thead><tr><th>session_id</th><th>最早</th><th>最近</th><th>请求数</th><th>cost</th></tr></thead>
-        <tbody>${sess.map((s) => `
-          <tr>
-            <td class="mono">${escapeHtml(String(s.session_id || '').slice(0, 16))}</td>
+        <thead><tr><th style="width:18px;"></th><th>session_id</th><th>最早</th><th>最近</th><th>请求数</th><th>cost</th></tr></thead>
+        <tbody>${sess.map((s) => {
+          const sid = String(s.session_id || '')
+          const sidEsc = escapeHtml(sid)
+          return `
+          <tr class="ud-sess-row" data-sid="${sidEsc}" style="cursor:pointer;">
+            <td class="mono"><span class="ud-sess-toggle" data-sid="${sidEsc}">▸</span></td>
+            <td class="mono" title="${sidEsc}">${escapeHtml(sid.slice(0, 16))}</td>
             <td class="mono">${escapeHtml(fmtDate(s.first_at))}</td>
             <td class="mono">${escapeHtml(fmtDate(s.last_at))}</td>
             <td class="num">${Number(s.request_count || 0).toLocaleString()}</td>
             <td class="num">${fmtCents(s.total_cost_credits || 0)}</td>
-          </tr>`).join('')}</tbody>
+          </tr>
+          <tr class="ud-sess-detail" data-sid="${sidEsc}" style="display:none;">
+            <td></td>
+            <td colspan="5" class="ud-sess-detail-body"
+                style="background:var(--bg-2);padding:var(--s-2);"></td>
+          </tr>`
+        }).join('')}</tbody>
        </table>`
 
   body.innerHTML = `
@@ -1661,6 +1675,162 @@ async function openUserDetailModal(userId) {
     <div style="margin-top:var(--s-2);"><h4 style="margin:0 0 var(--s-1) 0;font-size:13px;">最近充值(${topups.length})</h4>${topupsTbl}</div>
     <div style="margin-top:var(--s-3);"><h4 style="margin:0 0 var(--s-1) 0;font-size:13px;">最近请求(${reqs.length})</h4>${reqsTbl}</div>
     <div style="margin-top:var(--s-3);"><h4 style="margin:0 0 var(--s-1) 0;font-size:13px;">最近会话 · 90 天(${sess.length})</h4>${sessTbl}</div>`
+
+  _bindSessionRowToggles(body, userId)
+}
+
+/**
+ * Bind row-click toggles for the session detail table in user-detail modal.
+ *
+ * - 每个 session row 可点击展开/折叠下方 detail row
+ * - 第一次展开时懒加载 /api/admin/sessions/:id?user_id=:userId
+ * - 结果缓存到 modal lifetime 的 Map(modal 关闭后丢弃 → 重开走新 fetch)
+ * - 404 显示"会话不可用或已删除",其它错误显示错误信息
+ */
+function _bindSessionRowToggles(scope, userId) {
+  // modal lifetime cache: key = session_id, value = ClientSession payload or { __error: msg }
+  const cache = new Map()
+  const rows = scope.querySelectorAll('tr.ud-sess-row')
+  rows.forEach((row) => {
+    row.addEventListener('click', async (ev) => {
+      // 忽略 row 上选中文字等情况
+      if (window.getSelection && String(window.getSelection())) return
+      const sid = row.getAttribute('data-sid') || ''
+      if (!sid) return
+      const detail = scope.querySelector(
+        `tr.ud-sess-detail[data-sid="${CSS.escape(sid)}"]`
+      )
+      const toggle = row.querySelector('.ud-sess-toggle')
+      if (!detail) return
+      const isOpen = detail.style.display !== 'none'
+      if (isOpen) {
+        detail.style.display = 'none'
+        if (toggle) toggle.textContent = '▸'
+        return
+      }
+      detail.style.display = ''
+      if (toggle) toggle.textContent = '▾'
+      const bodyCell = detail.querySelector('.ud-sess-detail-body')
+      if (!bodyCell) return
+      if (cache.has(sid)) {
+        bodyCell.innerHTML = _renderSessionDetail(cache.get(sid))
+        _bindSessionMessageMoreButtons(bodyCell)
+        return
+      }
+      bodyCell.innerHTML = '<div class="empty">加载中…</div>'
+      try {
+        const r = await apiGet(
+          `/api/admin/sessions/${encodeURIComponent(sid)}?user_id=${encodeURIComponent(userId)}`
+        )
+        cache.set(sid, r.session)
+        bodyCell.innerHTML = _renderSessionDetail(r.session)
+        _bindSessionMessageMoreButtons(bodyCell)
+      } catch (e) {
+        const msg = (e && e.status === 404)
+          ? '会话不可用或已删除'
+          : `加载失败:${e && e.message ? e.message : String(e)}`
+        const payload = { __error: msg }
+        cache.set(sid, payload)
+        bodyCell.innerHTML = _renderSessionDetail(payload)
+      }
+      ev.stopPropagation()
+    })
+  })
+}
+
+/** 把每条 message 末尾的"展开全部"按钮接上 click handler。 */
+function _bindSessionMessageMoreButtons(scope) {
+  const btns = scope.querySelectorAll('button.ud-sess-msg-more')
+  btns.forEach((btn) => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation()
+      const wrapper = btn.parentElement
+      if (!wrapper) return
+      const rest = wrapper.querySelector('.ud-sess-msg-rest')
+      if (rest) rest.style.display = ''
+      btn.remove()
+    })
+  })
+}
+
+/** 渲染单个 session 的展开详情。messages 可能含 tool_use / tool_result blocks。 */
+function _renderSessionDetail(s) {
+  if (!s) return '<div class="empty">无数据</div>'
+  if (s.__error) return `<div class="empty" style="color:var(--danger)">${escapeHtml(s.__error)}</div>`
+  const msgs = Array.isArray(s.messages) ? s.messages : []
+  if (msgs.length === 0) return '<div class="empty">该会话暂无消息</div>'
+  const meta = `<div class="muted" style="font-size:12px;margin-bottom:var(--s-2);">
+    <strong>${escapeHtml(s.title || '(无标题)')}</strong>
+    · agent=${escapeHtml(s.agent_id || '')}
+    · ${msgs.length} 条消息
+    · 更新 ${escapeHtml(fmtDate(s.updated_at))}
+  </div>`
+  const items = msgs.map((m, i) => _renderSessionMessage(m, i)).join('')
+  return `${meta}<div class="ud-sess-msglist" style="display:flex;flex-direction:column;gap:var(--s-2);">${items}</div>`
+}
+
+/** 渲染单条 message。容忍 wire-format 多变:string / array content / 缺字段。 */
+function _renderSessionMessage(m, idx) {
+  const role = String((m && m.role) || 'unknown')
+  const roleCls = role === 'user' ? 'ok' : role === 'assistant' ? 'warn' : 'muted'
+  const text = _extractMessageText(m)
+  const FOLD = 2000
+  const folded = text.length > FOLD
+  const visible = folded ? text.slice(0, FOLD) : text
+  const tools = _extractToolUseNames(m)
+  const toolsLine = tools.length
+    ? `<div class="muted" style="font-size:12px;margin-top:4px;">工具:${tools.map((t) => escapeHtml(t)).join(', ')}</div>`
+    : ''
+  // 展开按钮通过事件委托绑定到 .ud-sess-msg-more,id 不必唯一
+  const moreBlock = folded
+    ? `<span class="ud-sess-msg-rest" style="display:none;">${escapeHtml(text.slice(FOLD))}</span> <button type="button" class="link ud-sess-msg-more" style="font-size:12px;">展开全部(剩 ${text.length - FOLD} 字)</button>`
+    : ''
+  return `<div class="ud-sess-msg" style="border-left:3px solid var(--border);padding-left:var(--s-2);">
+    <div style="display:flex;align-items:center;gap:var(--s-1);margin-bottom:4px;">
+      <span class="badge ${roleCls}">${escapeHtml(role)}</span>
+      <span class="muted" style="font-size:12px;">#${idx + 1}</span>
+    </div>
+    <div class="mono" style="white-space:pre-wrap;word-break:break-word;font-size:12px;">${escapeHtml(visible)}${moreBlock}</div>
+    ${toolsLine}
+  </div>`.replace(/^[ \t]+/gm, '') // strip leading whitespace to keep DOM compact
+}
+
+/** 从一条 wire-format message 提取文本(剥离 tool_use args / tool_result blob)。 */
+function _extractMessageText(m) {
+  if (!m) return ''
+  const c = m.content
+  if (typeof c === 'string') return c
+  if (!Array.isArray(c)) return ''
+  const parts = []
+  for (const block of c) {
+    if (!block || typeof block !== 'object') continue
+    if (block.type === 'text' && typeof block.text === 'string') {
+      parts.push(block.text)
+    } else if (block.type === 'tool_use') {
+      parts.push(`[tool_use: ${block.name || ''}]`)
+    } else if (block.type === 'tool_result') {
+      // content 可能是 string 或 array;只显示前 200 字概览
+      const tr = typeof block.content === 'string'
+        ? block.content
+        : (Array.isArray(block.content)
+            ? block.content.map((b) => (b && typeof b.text === 'string') ? b.text : '').join('')
+            : '')
+      parts.push(`[tool_result] ${tr.slice(0, 200)}${tr.length > 200 ? '…' : ''}`)
+    }
+  }
+  return parts.join('\n')
+}
+
+/** 抽出 message 里的 tool_use 名字列表(诊断用)。 */
+function _extractToolUseNames(m) {
+  if (!m || !Array.isArray(m.content)) return []
+  const out = []
+  for (const block of m.content) {
+    if (block && block.type === 'tool_use' && typeof block.name === 'string') {
+      out.push(block.name)
+    }
+  }
+  return out
 }
 
 // ─── Tab: Accounts(CRUD)───────────────────────────────────────────
@@ -4174,6 +4344,16 @@ async function renderInboxTab() {
         <input type="datetime-local" id="im-expires" />
         <small style="color:var(--muted);margin-left:8px">可选;留空则永不过期</small>
       </div>
+      <div class="form-row" id="im-email-row">
+        <label>邮件推送</label>
+        <div>
+          <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="im-notify-email" />
+            <span>同时发邮件到用户邮箱(快照创建时刻 active+已验证 的用户)</span>
+          </label>
+          <div id="im-email-hint" style="margin-top:4px;font-size:12px;color:var(--muted)">加载中…</div>
+        </div>
+      </div>
       <div class="form-row">
         <button class="btn btn-primary" id="im-send">发送</button>
       </div>
@@ -4186,7 +4366,40 @@ async function renderInboxTab() {
 
   $('im-audience').addEventListener('change', _toggleInboxUserRow)
   $('im-send').addEventListener('click', _onInboxSend)
+  // 探测邮件 worker 状态 —— 失败也继续渲染,只是 checkbox 不允许勾
+  _probeInboxEmailConfig().catch(() => {})
   await _loadInboxList()
+}
+
+/**
+ * 探测 /api/admin/messages/email-config,决定 checkbox 是否可勾 + 提示文案.
+ * 后端 worker 关闭或 provider=stub 时显式提示,避免误以为已发真邮件.
+ */
+async function _probeInboxEmailConfig() {
+  const cb = $('im-notify-email')
+  const hint = $('im-email-hint')
+  if (!cb || !hint) return
+  try {
+    const cfg = await apiGet('/api/admin/messages/email-config')
+    if (cfg.enabled === false) {
+      cb.disabled = true
+      cb.checked = false
+      hint.textContent = '邮件 worker 已禁用(COMMERCIAL_INBOX_EMAIL_DISABLED=1)。勾选无效。'
+      hint.style.color = 'var(--danger)'
+    } else if (cfg.provider === 'stub') {
+      cb.disabled = false
+      hint.textContent = '当前为 stub mailer(未配 RESEND_API_KEY),邮件只打日志,不真发出。'
+      hint.style.color = 'var(--warn, #d97706)'
+    } else {
+      cb.disabled = false
+      hint.textContent = `已启用,provider=${cfg.provider}。勾选后同事务锁定快照,异步发送。`
+      hint.style.color = 'var(--muted)'
+    }
+  } catch (e) {
+    cb.disabled = true
+    hint.textContent = `探测邮件配置失败:${e.message || String(e)}`
+    hint.style.color = 'var(--danger)'
+  }
 }
 
 function _toggleInboxUserRow() {
@@ -4217,12 +4430,21 @@ async function _onInboxSend(ev) {
     if (Number.isNaN(d.getTime())) { toast('过期时间格式不对', 'danger'); return }
     payload.expires_at = d.toISOString()
   }
+  const notifyEmailCb = $('im-notify-email')
+  if (notifyEmailCb && notifyEmailCb.checked && !notifyEmailCb.disabled) {
+    payload.notify_email = true
+  }
 
   try {
-    await withBtnLoading(ev.currentTarget, () =>
+    const r = await withBtnLoading(ev.currentTarget, () =>
       apiJson('POST', '/api/admin/messages', payload))
-    toast('已发送', 'ok')
-    // 清表单(audience / level / user_id 保留方便连发)
+    if (r?.message?.notify_email) {
+      const t = r.message.email_summary?.total ?? 0
+      toast(`已发送,邮件 worker 将异步发出 ${t} 封`, 'ok')
+    } else {
+      toast('已发送', 'ok')
+    }
+    // 清表单(audience / level / user_id / notify_email 保留方便连发)
     $('im-title').value = ''
     $('im-body').value = ''
     $('im-expires').value = ''
@@ -4263,6 +4485,7 @@ async function _loadInboxList() {
           <th>标题</th>
           <th>过期</th>
           <th>已读 / 收件人</th>
+          <th>邮件</th>
           <th class="actions">操作</th>
         </tr>
       </thead>
@@ -4284,6 +4507,7 @@ async function _loadInboxList() {
               <td title="${escapeHtml(r.title)}" style="max-width:300px">${titlePreview}</td>
               <td class="mono" style="font-size:12px">${expLabel}</td>
               <td class="mono">${escapeHtml(String(r.read_count))} / ${escapeHtml(String(r.recipients))}</td>
+              <td>${_renderInboxEmailChip(r)}</td>
               <td class="actions">
                 <button data-act="view-inbox" data-id="${escapeHtml(r.id)}">查看</button>
                 <button data-act="del-inbox" data-id="${escapeHtml(r.id)}" class="btn-danger">删除</button>
@@ -4313,6 +4537,36 @@ async function _loadInboxList() {
   }
 }
 
+/**
+ * 列表里的邮件状态徽章 — 紧凑显示 status + sent/total + tooltip 显示完整 summary.
+ * 未启用 notify_email → "—" 静默.
+ */
+function _renderInboxEmailChip(r) {
+  if (!r.notify_email) {
+    return '<span style="opacity:0.4">—</span>'
+  }
+  const s = r.email_summary || { total: 0, sent: 0, failed: 0, interrupted: 0, dropped: 0 }
+  const status = r.email_send_status || 'queued'
+  const labelMap = {
+    queued: { text: '排队中', color: '#3b82f6' },
+    done: { text: '已发完', color: 'var(--ok, #16a34a)' },
+    partial: { text: '部分失败', color: 'var(--warn, #d97706)' },
+    interrupted: { text: '中断', color: 'var(--danger)' },
+  }
+  const lab = labelMap[status] || { text: status, color: 'var(--muted)' }
+  const tip = [
+    `total=${s.total}`,
+    `sent=${s.sent}`,
+    s.failed > 0 ? `failed=${s.failed}` : null,
+    s.interrupted > 0 ? `interrupted=${s.interrupted}` : null,
+    s.dropped > 0 ? `dropped=${s.dropped}` : null,
+    r.email_sent_at ? `at=${r.email_sent_at}` : null,
+  ].filter(Boolean).join(' / ')
+  return `<span class="badge" title="${escapeHtml(tip)}" style="background:${lab.color};color:#fff">
+    ${escapeHtml(lab.text)} ${escapeHtml(String(s.sent))}/${escapeHtml(String(s.total))}
+  </span>`
+}
+
 function _openInboxDetail(r) {
   if (!r) return
   openModal(`
@@ -4338,6 +4592,18 @@ function _openInboxDetail(r) {
       <label>已读 / 收件人</label>
       <div class="mono">${escapeHtml(String(r.read_count))} / ${escapeHtml(String(r.recipients))}</div>
     </div>
+    ${r.notify_email ? `
+    <div class="form-row">
+      <label>邮件推送</label>
+      <div>
+        ${_renderInboxEmailChip(r)}
+        <div class="mono" style="font-size:12px;margin-top:4px;opacity:0.7">
+          status=${escapeHtml(r.email_send_status || 'queued')}
+          ${r.email_sent_at ? '· sent_at=' + escapeHtml(fmtDate(r.email_sent_at)) : ''}
+        </div>
+      </div>
+    </div>
+    ` : ''}
     <div class="form-row">
       <label>标题</label>
       <div>${escapeHtml(r.title)}</div>

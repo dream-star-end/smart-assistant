@@ -165,7 +165,7 @@ export async function listEgressProxies(
             created_at, updated_at
      FROM egress_proxies
      ${where}
-     ORDER BY id ASC
+     ORDER BY egress_proxies.id ASC
      LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params,
   );
