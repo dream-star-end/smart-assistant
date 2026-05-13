@@ -142,7 +142,14 @@ export const OutboundContentBlock = Type.Union([
     text: Type.String(),
     parentToolUseId: Type.Optional(Type.String()),
     // V3 v7 — canonical assistant row id minted server-side at turn start
-    // (`srv-${peerId}-t${turnIndex}`). Stamped on main-agent text blocks
+    // (`srv-${peerId}-${agentId}-t${turnIndex}` on v3 commercial container
+    // sink path; legacy/personal path keeps `srv-${peerId}-t${turnIndex}`).
+    // The agentId segment was added 2026-05-13 to fix a pre-existing
+    // namespace collision: a chat that switches model mid-conversation
+    // routes turn N+1 to a *different* AgentSession (e.g. codex → main),
+    // whose `session.turns` independently starts at 0, so both agents
+    // would stamp `t1` and the client would merge two answers into a
+    // single message row. Stamped on main-agent text blocks
     // (parentToolUseId empty) so client + server tape agree on row id
     // from the first chunk on, eliminating the m-* / srv-* dual-authority
     // pain that v5/v6 tried to paper over. Subagent text omits this field
@@ -162,7 +169,11 @@ export const OutboundContentBlock = Type.Union([
     partial: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),
     // V3 v7.1 — canonical tool row id minted server-side at turn start:
-    // `srv-${peerId}-t${turnIndex}-tool-${blockId}`. Stamped on main-agent
+    // `srv-${peerId}-${agentId}-t${turnIndex}-tool-${blockId}` on the v3
+    // commercial sink path; legacy/personal path keeps
+    // `srv-${peerId}-t${turnIndex}-tool-${blockId}`. AgentId segment
+    // added 2026-05-13 (see kind:'text' messageId rationale for the
+    // mid-chat model-switch collision this fixes). Stamped on main-agent
     // top-level tool_use blocks (parentToolUseId empty) so client + server
     // tape agree on row id from the first partial onwards. Matches the id
     // format master writes via packages/commercial/src/http/internalServerAuthored.ts.
@@ -184,9 +195,12 @@ export const OutboundContentBlock = Type.Union([
     kind: Type.Literal('thinking'),
     text: Type.String(),
     parentToolUseId: Type.Optional(Type.String()),
-    // V3 v7 — canonical thinking row id minted server-side at turn start
-    // (`srv-${peerId}-t${turnIndex}-thinking`). Same rationale as the text
-    // variant's `messageId` field. Subagent thinking omits this — it goes
+    // V3 v7 — canonical thinking row id minted server-side at turn start:
+    // `srv-${peerId}-${agentId}-t${turnIndex}-thinking` on v3 commercial
+    // sink path; legacy/personal path keeps
+    // `srv-${peerId}-t${turnIndex}-thinking`. Same rationale as the text
+    // variant's `messageId` field (agentId added 2026-05-13 to disambiguate
+    // mid-chat model switches). Subagent thinking omits this — it goes
     // into Agent card childBlocks not a top-level thinking row.
     messageId: Type.Optional(Type.String()),
   }),

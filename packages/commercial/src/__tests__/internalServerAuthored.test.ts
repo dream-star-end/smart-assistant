@@ -260,6 +260,354 @@ describe("internalServerAuthored handler — userId/msgId derivation", () => {
   });
 });
 
+// ─── agentId fold-in (Fix A, 2026-05-13) ─────────────────────────────────
+//
+// Why this exists:
+//   A single chat (peerId) can rotate across multiple AgentSessions when the
+//   user switches model mid-conversation. Each AgentSession's `session.turns`
+//   restarts at 0, so both `codex` and `main` would mint
+//   `srv-${sessionId}-t1` — same id, two distinct answers → client merges
+//   them, only one ever shows. Fix A passes `agentId` from the container
+//   gateway; when present, master folds it into the persisted message id so
+//   each agent's turn gets its own row.
+//
+// Wire-optional rationale:
+//   On a rolling container-image deploy, master is upgraded before container
+//   images, so the upgraded master must still accept pre-Fix-A bodies (no
+//   `agentId` field). The legacy id format is preserved for that case so
+//   in-flight turns from old containers persist cleanly.
+
+describe("internalServerAuthored handler — agentId schema validation", () => {
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+  const handlerWithStorage = (storage: ServerAuthoredStorage) =>
+    makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage,
+    });
+
+  test("accepts valid agentId 'main'", async () => {
+    const h = handlerWithStorage(fakeStorage(async () => ({ applied: true })));
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 0, status: "completed", text: "hi",
+        agentId: "main", requestId: "req-12345abc",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+  });
+
+  test("accepts valid agentId 'codex'", async () => {
+    const h = handlerWithStorage(fakeStorage(async () => ({ applied: true })));
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 0, status: "completed", text: "hi",
+        agentId: "codex", requestId: "req-12345abc",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+  });
+
+  test("accepts boundary lengths: 1 char + 64 chars", async () => {
+    const h = handlerWithStorage(fakeStorage(async () => ({ applied: true })));
+    for (const agentId of ["a", "A".repeat(64), "_-Az09"]) {
+      const { res, rec } = makeRes();
+      await h(
+        authed(JSON.stringify({
+          sessionId: "sess12345", turnIndex: 0, status: "completed", text: "hi",
+          agentId, requestId: "req-12345abc",
+        })),
+        res,
+        CTX,
+      );
+      assert.equal(rec.status, 200, `agentId=${agentId} should pass`);
+    }
+  });
+
+  test("400 when agentId contains illegal char (.)", async () => {
+    // Personal-version-style ids like `minimax2.7` would fail master charset
+    // even if they somehow reached this endpoint. Wider charset on master =
+    // wider attack surface for log/URL injection in derived messageIds.
+    const h = handlerWithStorage(fakeStorage(async () => ({ applied: true })));
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 0, status: "completed", text: "hi",
+        agentId: "minimax2.7",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 400);
+  });
+
+  test("400 when agentId is empty string", async () => {
+    const h = handlerWithStorage(fakeStorage(async () => ({ applied: true })));
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 0, status: "completed", text: "hi",
+        agentId: "",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 400);
+  });
+
+  test("400 when agentId exceeds 64 chars", async () => {
+    const h = handlerWithStorage(fakeStorage(async () => ({ applied: true })));
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 0, status: "completed", text: "hi",
+        agentId: "a".repeat(65),
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 400);
+  });
+
+  test("400 when agentId is not a string (number)", async () => {
+    const h = handlerWithStorage(fakeStorage(async () => ({ applied: true })));
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 0, status: "completed", text: "hi",
+        agentId: 42,
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 400);
+  });
+});
+
+describe("internalServerAuthored handler — agentId fold-in derives unique msgId", () => {
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+
+  test("agentId present → assistant msgId = srv-<sessionId>-<agentId>-t<turn>", async () => {
+    let capturedMsgId: string | null = null;
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async (_sessId, _userId, msg) => {
+        capturedMsgId = msg.id;
+        return { applied: true };
+      }),
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 1, status: "completed", text: "hi",
+        agentId: "codex", requestId: "req-12345abc",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.equal(capturedMsgId, "srv-sess12345-codex-t1");
+  });
+
+  test("agentId absent → assistant msgId falls back to legacy srv-<sessionId>-t<turn>", async () => {
+    // Critical compatibility check: pre-Fix-A container images that haven't
+    // been redeployed yet send no agentId, and master MUST accept them at
+    // the legacy id (rolling-deploy safety).
+    let capturedMsgId: string | null = null;
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async (_sessId, _userId, msg) => {
+        capturedMsgId = msg.id;
+        return { applied: true };
+      }),
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 1, status: "completed", text: "hi",
+        requestId: "req-12345abc",
+        // agentId intentionally omitted
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.equal(capturedMsgId, "srv-sess12345-t1");
+  });
+
+  test("two agentIds at same (sessionId, turnIndex) produce distinct msgIds — regression for 2026-05-13 model-switch merge bug", async () => {
+    // The exact bug shape: user types in a chat, codex (agentId=codex) answers
+    // turn 1. User switches to deepseek (agentId=main, fresh AgentSession with
+    // session.turns=0 → projected turnIndex=1). Both turns hit master with the
+    // same (sessionId, turnIndex). Without agentId disambiguation they collide
+    // at `srv-<sessionId>-t1`; with it they're `-codex-t1` vs `-main-t1`.
+    const capturedIds: string[] = [];
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async (_sessId, _userId, msg) => {
+        capturedIds.push(msg.id);
+        return { applied: true };
+      }),
+    });
+    // Call 1 — codex turn 1.
+    {
+      const { res } = makeRes();
+      await h(
+        authed(JSON.stringify({
+          sessionId: "sess12345", turnIndex: 1, status: "completed", text: "codex answer",
+          agentId: "codex", requestId: "req-codex-1",
+        })),
+        res,
+        CTX,
+      );
+    }
+    // Call 2 — main turn 1 (after the user switched models).
+    {
+      const { res } = makeRes();
+      await h(
+        authed(JSON.stringify({
+          sessionId: "sess12345", turnIndex: 1, status: "completed", text: "deepseek answer",
+          agentId: "main", requestId: "req-main-1",
+        })),
+        res,
+        CTX,
+      );
+    }
+    assert.equal(capturedIds.length, 2);
+    assert.equal(capturedIds[0], "srv-sess12345-codex-t1");
+    assert.equal(capturedIds[1], "srv-sess12345-main-t1");
+    assert.notEqual(capturedIds[0], capturedIds[1], "msgIds must differ (regression guard)");
+  });
+
+  test("agentId present + thinkingText → thinking msgId = srv-<sessionId>-<agentId>-t<turn>-thinking", async () => {
+    const captured: Array<{ role: string; id: string }> = [];
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async (_sessId, _userId, msg) => {
+        captured.push({ role: msg.role, id: msg.id });
+        return { applied: true };
+      }),
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 2, status: "completed",
+        text: "answer", thinkingText: "reasoning",
+        agentId: "codex", requestId: "req-12345abc",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    // Order: thinking row written first (ts = baseTs - 1), then assistant.
+    const thinking = captured.find((c) => c.role === "thinking");
+    const assistant = captured.find((c) => c.role === "assistant");
+    assert.ok(thinking);
+    assert.ok(assistant);
+    assert.equal(thinking.id, "srv-sess12345-codex-t2-thinking");
+    assert.equal(assistant.id, "srv-sess12345-codex-t2");
+  });
+
+  test("agentId absent + thinkingText → thinking msgId falls back to legacy srv-<sessionId>-t<turn>-thinking", async () => {
+    const captured: Array<{ role: string; id: string }> = [];
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async (_sessId, _userId, msg) => {
+        captured.push({ role: msg.role, id: msg.id });
+        return { applied: true };
+      }),
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 2, status: "completed",
+        text: "answer", thinkingText: "reasoning",
+        requestId: "req-12345abc",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    const thinking = captured.find((c) => c.role === "thinking");
+    const assistant = captured.find((c) => c.role === "assistant");
+    assert.ok(thinking);
+    assert.ok(assistant);
+    assert.equal(thinking.id, "srv-sess12345-t2-thinking");
+    assert.equal(assistant.id, "srv-sess12345-t2");
+  });
+
+  test("agentId present + tools[] → tool msgId = srv-<sessionId>-<agentId>-t<turn>-tool-<blockId>", async () => {
+    const captured: Array<{ role: string; id: string }> = [];
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async (_sessId, _userId, msg) => {
+        captured.push({ role: msg.role, id: msg.id });
+        return { applied: true };
+      }),
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 3, status: "completed",
+        text: "answer",
+        agentId: "codex", requestId: "req-12345abc",
+        tools: [
+          { toolUseId: "tu1", blockId: "blkA", toolName: "Read",
+            inputJson: { path: "/x" }, inputPreview: "Read /x",
+            output: "ok", isError: false, durationMs: 10, ts: 1700000000000 },
+        ],
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    const tool = captured.find((c) => c.role === "tool");
+    const assistant = captured.find((c) => c.role === "assistant");
+    assert.ok(tool);
+    assert.ok(assistant);
+    assert.equal(tool.id, "srv-sess12345-codex-t3-tool-blkA");
+    assert.equal(assistant.id, "srv-sess12345-codex-t3");
+  });
+
+  test("agentId absent + tools[] → tool msgId falls back to legacy srv-<sessionId>-t<turn>-tool-<blockId>", async () => {
+    const captured: Array<{ role: string; id: string }> = [];
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async (_sessId, _userId, msg) => {
+        captured.push({ role: msg.role, id: msg.id });
+        return { applied: true };
+      }),
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345", turnIndex: 3, status: "completed",
+        text: "answer", requestId: "req-12345abc",
+        tools: [
+          { toolUseId: "tu1", blockId: "blkA", toolName: "Read",
+            inputJson: { path: "/x" }, inputPreview: "Read /x",
+            output: "ok", isError: false, durationMs: 10, ts: 1700000000000 },
+        ],
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    const tool = captured.find((c) => c.role === "tool");
+    assert.ok(tool);
+    assert.equal(tool.id, "srv-sess12345-t3-tool-blkA");
+  });
+});
+
 describe("internalServerAuthored handler — requestId dispatch (cost-late-patch routing)", () => {
   // Why this section exists:
   //   master schema dropped the "requestId required when text non-empty"

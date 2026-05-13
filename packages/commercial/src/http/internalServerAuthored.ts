@@ -22,8 +22,19 @@
  *   - userId is ALWAYS derived as `c:${identity.userId}` here. Body-supplied
  *     userId is rejected at the schema level (not present in schema). This
  *     prevents a compromised container from poisoning another user's session.
- *   - msgId is ALWAYS derived as `srv-${sessionId}-t${turnIndex}` here. We
- *     do not accept client-controlled message ids.
+ *   - msgId is derived from `(sessionId, agentId, turnIndex)`:
+ *       agentId present →  `srv-${sessionId}-${agentId}-t${turnIndex}`
+ *       agentId absent  →  `srv-${sessionId}-t${turnIndex}` (legacy fallback)
+ *     We do not accept client-controlled message ids. AgentId was added
+ *     2026-05-13: a chat that switches model mid-conversation (e.g. codex
+ *     → main) routes turn N+1 to a different AgentSession whose
+ *     `session.turns` independently restarts at 0; without agentId, both
+ *     agents would stamp `srv-${sessionId}-t1` and the client merges two
+ *     answers into one row. AgentId remains optional on the wire to keep
+ *     pre-Fix-A container images draining cleanly during the rolling
+ *     upgrade — those images send no agentId and master falls back to the
+ *     legacy id format for them. Charset is constrained to
+ *     `[A-Za-z0-9_-]{1,64}` so the derived id is URL/log safe.
  *   - sessionId+userId scope is enforced by the SQL `WHERE id=? AND user_id=?`
  *     inside `appendServerAuthoredMessage`. Cross-tenant access is impossible
  *     from this endpoint.
@@ -140,6 +151,28 @@ const ToolEntrySchema = z
 const BodySchema = z
   .object({
     sessionId: z.string().min(8).max(50),
+    /** Disambiguator added 2026-05-13 to fix the mid-chat-model-switch
+     *  collision (codex → main both stamping `srv-${sessionId}-t1`). When
+     *  present, folded into the derived messageId as
+     *  `srv-${sessionId}-${agentId}-t${turnIndex}`. Optional on the wire to
+     *  keep pre-Fix-A container images sending no agentId drainable during
+     *  rolling deploy — the handler falls back to the legacy id format
+     *  (`srv-${sessionId}-t${turnIndex}`) when absent so those entries
+     *  persist cleanly.
+     *
+     *  Charset `[A-Za-z0-9_-]{1,64}` so the embedded id stays URL/log safe
+     *  and bounded; v3 commercial only runs agent ids `main` / `codex`
+     *  today, well within this charset. Personal-version agent ids that
+     *  use richer characters (e.g. `minimax2.7`) never hit this endpoint —
+     *  they take the legacy local-SQLite path inside the gateway. */
+    agentId: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z0-9_-]+$/, {
+        message: "agentId must match [A-Za-z0-9_-]{1,64}",
+      })
+      .optional(),
     turnIndex: z.number().int().min(0),
     status: z.enum(["completed", "interrupted", "crashed"]),
     text: z.string().max(MAX_BODY_BYTES),
@@ -433,8 +466,22 @@ export function makeServerAuthoredHandler(
     const toolsCount = tools.length;
     const thinkingTs = baseTs - toolsCount - 1;
     const assistantTs = baseTs;
-    const messageId = `srv-${body.sessionId}-t${body.turnIndex}`;
-    const thinkingMessageId = `srv-${body.sessionId}-t${body.turnIndex}-thinking`;
+    // 2026-05-13 — agentId disambiguator: a chat that switches model
+    // mid-conversation has TWO AgentSessions (e.g. codex + main), each
+    // tracking `session.turns` independently from 0. Without agentId,
+    // turn 1 of codex and turn 1 of main both serialize to
+    // `srv-${sessionId}-t1` and the SQLite UPSERT path merges them into
+    // one row. Fold agentId into the id when present. Absent agentId
+    // means a pre-Fix-A container image is talking to us (rolling
+    // deploy window) — fall back to the legacy id so those entries
+    // still persist cleanly; once all containers are upgraded, every
+    // request will carry agentId. Charset is enforced at the schema
+    // level (BodySchema.agentId regex) so the id is safe to embed.
+    const idPart = body.agentId
+      ? `${body.sessionId}-${body.agentId}`
+      : body.sessionId;
+    const messageId = `srv-${idPart}-t${body.turnIndex}`;
+    const thinkingMessageId = `srv-${idPart}-t${body.turnIndex}-thinking`;
 
     const hasAssistant = body.text.length > 0;
     const hasThinking =
@@ -508,7 +555,9 @@ export function makeServerAuthoredHandler(
     const toolsOnlyDecidesHttp = !hasAssistant && !hasThinking && hasTools;
     for (let i = 0; i < toolsCount; i++) {
       const t = tools[i]!;
-      const toolMessageId = `srv-${body.sessionId}-t${body.turnIndex}-tool-${t.blockId}`;
+      // Same agentId fold-in as the assistant/thinking id above — see the
+      // long comment near `idPart` for rationale.
+      const toolMessageId = `srv-${idPart}-t${body.turnIndex}-tool-${t.blockId}`;
       const toolTs = baseTs - toolsCount + i;
       try {
         toolResults[i] = await deps.storage.appendServerAuthoredMessage(

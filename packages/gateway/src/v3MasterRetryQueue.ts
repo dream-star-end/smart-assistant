@@ -56,7 +56,7 @@ import { paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
 import {
   V3SinkError,
-  type V3MasterSinkPayload,
+  type V3MasterSinkWirePayload,
   type V3SinkErrorClass,
 } from './v3MasterSink.js'
 
@@ -81,7 +81,12 @@ export function defaultQueueDir(): string {
 
 export interface V3MasterRetryEntry {
   schemaVersion: 1
-  payload: V3MasterSinkPayload & { createdAt: number }
+  /** Wire payload shape — agentId optional so legacy on-disk entries
+   *  (pre-2026-05-13, before the agentId disambiguator was added) can
+   *  still be drained after a gateway upgrade. New entries always carry
+   *  agentId because live callers in sessionManager use the strict
+   *  V3MasterSinkPayload variant that requires it. */
+  payload: V3MasterSinkWirePayload & { createdAt: number }
   firstSeenAt: number
   attempts: number
   lastErrorClass?: V3SinkErrorClass
@@ -116,8 +121,10 @@ export interface V3MasterRetryQueue {
 export interface MakeV3MasterRetryQueueDeps {
   /** Where to put files. Defaults to defaultQueueDir(). */
   dir?: string
-  /** The single-attempt sender. The queue calls this to drain entries. */
-  attemptSend: (payload: V3MasterSinkPayload) => Promise<void>
+  /** The single-attempt sender. The queue calls this to drain entries.
+   *  Accepts the wire shape (agentId optional) so legacy entries written
+   *  by a pre-Fix-A gateway image can still be drained. */
+  attemptSend: (payload: V3MasterSinkWirePayload) => Promise<void>
   /** Override only for tests. */
   now?: () => number
   /** Override only for tests. */
@@ -380,6 +387,18 @@ function isV3MasterRetryEntry(v: unknown): v is V3MasterRetryEntry {
   if (p.status !== 'completed' && p.status !== 'interrupted' && p.status !== 'crashed') return false
   if (typeof p.text !== 'string') return false
   if (typeof p.createdAt !== 'number' || !Number.isFinite(p.createdAt)) return false
+  // agentId added 2026-05-13 — optional for legacy on-disk entries. When
+  // present it must match the master-side charset
+  // (`[A-Za-z0-9_-]{1,64}`) so the resulting messageId is safely embeddable
+  // in URLs/log fields and matches what master's BodySchema will accept.
+  // A malformed agentId on disk would just get rejected by master with 400
+  // INVALID_BODY (fatal classification → drop), so we screen it here to
+  // avoid that round trip and the misleading fatal-warn log line.
+  if (p.agentId !== undefined) {
+    if (typeof p.agentId !== 'string') return false
+    if (p.agentId.length === 0 || p.agentId.length > 64) return false
+    if (!/^[A-Za-z0-9_-]+$/.test(p.agentId)) return false
+  }
   return true
 }
 

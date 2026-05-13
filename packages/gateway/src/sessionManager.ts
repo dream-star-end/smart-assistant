@@ -162,6 +162,16 @@ export interface CronBridgeEvent {
 function persistServerAuthoredTurn(args: {
   sessionKey: string
   peerId: string
+  /** AgentSession.agentId — the agent that produced this turn (e.g. 'main',
+   *  'codex', 'minimax2.7'). Folded into the persisted messageId so a chat
+   *  that switches model mid-conversation doesn't collide on
+   *  `srv-${peerId}-t1` (each AgentSession tracks its own `session.turns`
+   *  starting at 0, so without this disambiguator turn 1 of codex and turn
+   *  1 of main both stamp t1 and the client merges them — root cause of
+   *  the 2026-05-13 "switched to deepseek, only thinking visible" bug).
+   *  Required: every live caller is inside SessionManager and holds a
+   *  populated `session.agentId`. */
+  agentId: string
   /** From AgentSession.userId. Undefined on legacy/cron-pre-warm paths.
    *  Ignored on the v3 sink path (master derives it from identity). */
   userId: string | undefined
@@ -207,6 +217,7 @@ function persistServerAuthoredTurn(args: {
   if (sink) {
     const payload: V3MasterSinkPayload = {
       sessionId: args.peerId,
+      agentId: args.agentId,
       turnIndex: args.turnIndex,
       status: args.status,
       text: args.text,
@@ -265,8 +276,16 @@ function persistServerAuthoredTurn(args: {
       })
   }
   // Legacy / personal-version path — local SQLite is authoritative.
-  const messageId = `srv-${args.peerId}-t${args.turnIndex}`
-  const thinkingMessageId = `srv-${args.peerId}-t${args.turnIndex}-thinking`
+  //
+  // agentId is folded into the messageId for the same reason as the v3 sink
+  // path (see args.agentId doc): a personal-version chat that rotates across
+  // agents mid-conversation would otherwise collide on `srv-${peerId}-t1`.
+  // No backward-compat shim needed: historical rows in SQLite keep their
+  // pre-Fix-A ids; new rows use the disambiguated format. Client/server
+  // agree because the same formula stamps OutboundContentBlock.messageId
+  // at the runOneTurnWithRetry mint site below.
+  const messageId = `srv-${args.peerId}-${args.agentId}-t${args.turnIndex}`
+  const thinkingMessageId = `srv-${args.peerId}-${args.agentId}-t${args.turnIndex}-thinking`
   const directWrite = async () => {
     const uid = args.userId ?? ((await getClientSession(args.peerId))?.userId)
     if (!uid) return undefined // cron-style pre-UI, no owner — skip.
@@ -1266,9 +1285,9 @@ export class SessionManager {
     //   1. CcbMessageParser (stamps text/thinking blocks emitted by the model)
     //   2. retry/auth/transient status text emits below (so they don't claim
     //      a separate m-* row that would later prevent canonical id adoption)
-    //   3. Phase 0.1 turn-end takeover (sessionManager.ts:~1729 + master
-    //      internalServerAuthored.ts:436 use identical formula
-    //      `srv-${peerId}-t${turnIndex}` and `${...}-thinking`)
+    //   3. Phase 0.1 turn-end takeover (persistServerAuthoredTurn legacy
+    //      path + master internalServerAuthored.ts handler use the identical
+    //      formula `srv-${peerId}-${agentId}-t${turnIndex}` and `${...}-thinking`)
     //
     // `session.turns` at this point is the count of COMPLETED turns; the
     // turn we're about to start is `session.turns + 1` (1-indexed, matching
@@ -1276,18 +1295,26 @@ export class SessionManager {
     // `turnIndex = session.turns + 1` and `= session.turns` post-increment
     // both resolve to the same value at persist time).
     //
+    // 2026-05-13 — agentId segment added to disambiguate mid-chat model
+    // switches. A chat that flips from codex to main keeps the same
+    // peerId, but server creates a new AgentSession whose `session.turns`
+    // restarts at 0; without agentId, turn 1 of codex and turn 1 of main
+    // both stamp `srv-${peerId}-t1` and the client merges two answers
+    // into one row. AgentId is part of sessionKey already so each
+    // AgentSession naturally has its own agentId in scope here.
+    //
     // Retry attempts within this loop SHARE these ids: a user turn that
     // gets retried for phantom/auth/transient errors is still one logical
     // assistant message from the user's perspective.
     const projectedTurnIndex = session.turns + 1
-    const assistantMessageId = `srv-${session.peerId}-t${projectedTurnIndex}`
-    const thinkingMessageId = `srv-${session.peerId}-t${projectedTurnIndex}-thinking`
+    const assistantMessageId = `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}`
+    const thinkingMessageId = `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}-thinking`
     // V3 v7.1 — canonical tool row id factory. Same lifecycle as the
     // assistant / thinking ids above (one per user turn, shared across
-    // retries). Format matches master's `internalServerAuthored.ts:511`
-    // so client + server tape agree on tool row id from frame 1.
+    // retries). Format matches master's `internalServerAuthored.ts` tool
+    // id branch so client + server tape agree on tool row id from frame 1.
     const toolMessageIdFactory = (blockId: string): string =>
-      `srv-${session.peerId}-t${projectedTurnIndex}-tool-${blockId}`
+      `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}-tool-${blockId}`
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -1433,15 +1460,17 @@ export class SessionManager {
     /** V3 v7 — canonical assistant/thinking message ids computed once by
      *  runOneTurnWithRetry and shared across retries within this user turn.
      *  Passed into CcbMessageParser so every main-agent text/thinking block
-     *  emitted to the client carries `messageId: srv-${peerId}-t${turnIndex}`.
-     *  See runOneTurnWithRetry comment for full rationale. */
+     *  emitted to the client carries
+     *  `messageId: srv-${peerId}-${agentId}-t${turnIndex}` (agentId segment
+     *  added 2026-05-13 to disambiguate mid-chat model switches; see
+     *  runOneTurnWithRetry comment for full rationale). */
     assistantMessageId?: string,
     thinkingMessageId?: string,
     /** V3 v7.1 — canonical tool row id factory. Same minting scope as the
      *  assistant/thinking ids above (one factory per user turn, shared with
      *  master's `internalServerAuthored` writer via the
-     *  `srv-${peerId}-t${turnIndex}-tool-${blockId}` format). Undefined for
-     *  personal-version legacy callers. */
+     *  `srv-${peerId}-${agentId}-t${turnIndex}-tool-${blockId}` format).
+     *  Undefined for personal-version legacy callers. */
     toolMessageIdFactory?: (blockId: string) => string,
   ): Promise<void> {
     const { runner } = session
@@ -1811,6 +1840,7 @@ export class SessionManager {
               this._trackPersistence(persistServerAuthoredTurn({
                 sessionKey: session.sessionKey,
                 peerId,
+                agentId: session.agentId,
                 userId: session.userId,
                 turnIndex,
                 text: assistantText,
@@ -2058,6 +2088,7 @@ export class SessionManager {
                   await persistServerAuthoredTurn({
                     sessionKey: session.sessionKey,
                     peerId,
+                    agentId: session.agentId,
                     userId: session.userId,
                     turnIndex,
                     text: partial ?? '',

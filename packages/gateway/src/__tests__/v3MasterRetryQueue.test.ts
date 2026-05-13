@@ -24,7 +24,10 @@ import {
   makeV3MasterRetryQueue,
   type V3MasterRetryEntry,
 } from "../v3MasterRetryQueue.js";
-import { V3SinkError, type V3MasterSinkPayload } from "../v3MasterSink.js";
+import {
+  V3SinkError,
+  type V3MasterSinkWirePayload,
+} from "../v3MasterSink.js";
 
 let dir: string;
 
@@ -47,12 +50,16 @@ beforeEach(async () => {
   await mkdir(dir, { recursive: true });
 });
 
-function basePayload(overrides: Partial<V3MasterSinkPayload> = {}): V3MasterSinkPayload & { createdAt: number } {
+function basePayload(overrides: Partial<V3MasterSinkWirePayload> = {}): V3MasterSinkWirePayload & { createdAt: number } {
+  // Default to wire-shape with agentId set — matches what a post-Fix-A
+  // (2026-05-13) gateway enqueues. Tests that want to exercise the
+  // pre-Fix-A legacy on-disk shape can override `agentId: undefined`.
   return {
     sessionId: "sess12345",
     turnIndex: 1,
     status: "completed",
     text: "hello",
+    agentId: "main",
     createdAt: Date.now(),
     ...overrides,
   };
@@ -177,6 +184,132 @@ describe("enqueueDurable", () => {
       text: "",
       thinkingText: "thinking-only reasoning",
     });
+  });
+});
+
+// ─── agentId wire compatibility (Fix A, 2026-05-13) ─────────────────────
+//
+// The retry queue must accept BOTH legacy on-disk entries (written by a
+// pre-Fix-A gateway image, no agentId on disk) AND new entries (with
+// agentId). Drainer compatibility is what makes rolling deploys safe:
+// upgrading the container image must not orphan entries that the previous
+// image wrote.
+
+describe("agentId wire compatibility", () => {
+  test("legacy and new entries coexist in one drain pass; each forwards its own agentId verbatim", async () => {
+    // Two entries on disk:
+    //   - Legacy: no `agentId` key. Drainer hands payload to attemptSend
+    //     with `agentId === undefined`. Master falls back to legacy
+    //     `srv-${sessionId}-t${turnIndex}` id format on the receive side.
+    //   - New: `agentId: "codex"`. Drainer forwards verbatim.
+    // Both must drain successfully and reach attemptSend with the exact
+    // shape they were stored with.
+    const received: Array<{ sessionId: string; agentId?: string }> = [];
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async (p) => {
+        received.push({ sessionId: p.sessionId, agentId: p.agentId });
+      },
+    });
+    // Order matters: filenames are lex-sorted in drainOnce, so write
+    // legacy first (older ts in filename via writeEntryDirect's counter).
+    await writeEntryDirect(
+      entry(basePayload({ sessionId: "sess-legacy", agentId: undefined })),
+    );
+    await writeEntryDirect(
+      entry(basePayload({ sessionId: "sess-new", agentId: "codex" })),
+    );
+    const stats = await q.drainOnce();
+    assert.equal(stats.considered, 2);
+    assert.equal(stats.drained, 2);
+    // Both reached attemptSend with their stored shape — legacy with no
+    // agentId, new with "codex".
+    assert.equal(received.length, 2);
+    const legacy = received.find((r) => r.sessionId === "sess-legacy");
+    const fresh = received.find((r) => r.sessionId === "sess-new");
+    assert.ok(legacy, "legacy entry drained");
+    assert.ok(fresh, "new entry drained");
+    assert.equal(legacy.agentId, undefined, "legacy on-disk entry has no agentId");
+    assert.equal(fresh.agentId, "codex", "new entry forwarded its agentId");
+    const files = await listJsonFiles();
+    assert.equal(files.length, 0, "both unlinked after success");
+  });
+
+  test("malformed agentId on disk → entry rejected as schema mismatch + unlinked", async () => {
+    // Writing a malformed agentId (e.g. with a `.` which would fail master's
+    // regex anyway) onto disk would otherwise round-trip to master and earn
+    // a 400 INVALID_BODY → fatal classification → drop. Screening here saves
+    // the round trip and produces a clearer "malformed entry" log line
+    // instead of a confusing "master rejected 400" one.
+    let attemptCalls = 0;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => { attemptCalls++; },
+    });
+    // Hand-craft a JSON file with an invalid agentId — bypasses the type
+    // system that would otherwise refuse it. This is what an in-the-wild
+    // corrupt entry would look like.
+    const malformed = {
+      schemaVersion: 1,
+      payload: {
+        sessionId: "sess-bad",
+        turnIndex: 0,
+        status: "completed",
+        text: "x",
+        // `.` is not in [A-Za-z0-9_-]; minimax2.7-style ids are valid only
+        // on the personal version, which uses the legacy local-SQLite path
+        // and never reaches this queue. A v3-commercial container with a
+        // `.` in agentId on disk indicates corruption or wire-format drift.
+        agentId: "minimax2.7",
+        createdAt: Date.now(),
+      },
+      firstSeenAt: Date.now(),
+      attempts: 1,
+    };
+    await writeFile(
+      join(dir, `${Date.now()}-99999999.json`),
+      JSON.stringify(malformed),
+      "utf8",
+    );
+    const stats = await q.drainOnce();
+    assert.equal(stats.fatalDropped, 1, "rejected as schema mismatch");
+    assert.equal(attemptCalls, 0, "attemptSend never invoked");
+    const files = await listJsonFiles();
+    assert.equal(files.length, 0, "malformed entry unlinked");
+  });
+
+  test("agentId exceeding 64 chars on disk → rejected as schema mismatch + unlinked", async () => {
+    // Boundary check: master's BodySchema caps at 64 chars; our defense-in-
+    // depth check here mirrors it so we don't round-trip oversized ids.
+    let attemptCalls = 0;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => { attemptCalls++; },
+    });
+    const tooLong = "a".repeat(65);
+    const malformed = {
+      schemaVersion: 1,
+      payload: {
+        sessionId: "sess-bad",
+        turnIndex: 0,
+        status: "completed",
+        text: "x",
+        agentId: tooLong,
+        createdAt: Date.now(),
+      },
+      firstSeenAt: Date.now(),
+      attempts: 1,
+    };
+    await writeFile(
+      join(dir, `${Date.now()}-88888888.json`),
+      JSON.stringify(malformed),
+      "utf8",
+    );
+    const stats = await q.drainOnce();
+    assert.equal(stats.fatalDropped, 1);
+    assert.equal(attemptCalls, 0);
+    const files = await listJsonFiles();
+    assert.equal(files.length, 0);
   });
 });
 

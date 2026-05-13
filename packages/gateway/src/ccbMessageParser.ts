@@ -323,17 +323,19 @@ export class CcbMessageParser {
   private onFinish: (result: TurnResult | null) => void
 
   /** V3 v7 — canonical assistant row id for this turn, minted server-side
-   *  as `srv-${peerId}-t${turnIndex}` and shared with the Phase 0.1 turn-end
-   *  takeover. Stamped on every main-agent text block emitted by this parser
-   *  (parentToolUseId empty) so client + server tape agree on row id from
-   *  the first chunk on. Undefined for non-v7 callers / personal-version
-   *  paths — client falls back to legacy `m-*` mint. */
+   *  as `srv-${peerId}-${agentId}-t${turnIndex}` (agentId segment added
+   *  2026-05-13 to disambiguate mid-chat model switches; see
+   *  sessionManager.runOneTurnWithRetry for the full rationale) and shared
+   *  with the Phase 0.1 turn-end takeover. Stamped on every main-agent
+   *  text block emitted by this parser (parentToolUseId empty) so client +
+   *  server tape agree on row id from the first chunk on. Undefined for
+   *  non-v7 callers — client falls back to legacy `m-*` mint. */
   public assistantMessageId?: string
   /** Same as `assistantMessageId` but for thinking rows
-   *  (`srv-${peerId}-t${turnIndex}-thinking`). */
+   *  (`srv-${peerId}-${agentId}-t${turnIndex}-thinking`). */
   public thinkingMessageId?: string
   /** V3 v7.1 — factory for canonical tool row ids minted server-side:
-   *  `srv-${peerId}-t${turnIndex}-tool-${blockId}`. Stamped on every
+   *  `srv-${peerId}-${agentId}-t${turnIndex}-tool-${blockId}`. Stamped on every
    *  main-agent top-level tool_use block this parser emits (partial start,
    *  input_json_delta partials, and the finalized snapshot in _handleAssistant).
    *  Matches master's id format in internalServerAuthored.ts so client +

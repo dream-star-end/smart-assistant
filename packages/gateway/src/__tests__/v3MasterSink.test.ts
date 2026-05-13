@@ -32,6 +32,7 @@ import type { V3MasterRetryQueue } from "../v3MasterRetryQueue.js";
 
 const PAYLOAD: V3MasterSinkPayload = {
   sessionId: "sess12345",
+  agentId: "main",
   turnIndex: 1,
   status: "completed",
   text: "hello world",
@@ -462,6 +463,95 @@ describe("attemptSend — body cap shrink", () => {
     const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
     assert.equal(Array.isArray(sent.tools), true, "tools[] preserved at boundary");
     assert.equal((sent.tools as unknown[]).length, 50);
+  });
+});
+
+// ─── agentId wire field (2026-05-13 mid-chat-model-switch fix) ──────────
+//
+// agentId is what disambiguates two AgentSessions that share a peerId
+// (chat-level identity) but each track session.turns from 0 — without it,
+// turn 1 of codex and turn 1 of main both stamp `srv-${peerId}-t1` and
+// master would UPSERT them into a single row, merging the two answers
+// the user actually saw as separate bubbles. Master folds agentId into
+// the persisted messageId; these tests pin that gateway puts it on the
+// wire in the right shape so master can do its part.
+describe("attemptSend — agentId wire shape", () => {
+  function makeCapturingFetcher(): {
+    fetcher: typeof import("undici").request;
+    captures: Array<{ url: string; body: string }>;
+  } {
+    const captures: Array<{ url: string; body: string }> = [];
+    const fn = async (url: string, init: any) => {
+      captures.push({ url, body: typeof init?.body === "string" ? init.body : "" });
+      return {
+        statusCode: 200,
+        headers: {},
+        trailers: {},
+        opaque: undefined,
+        context: {},
+        body: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from('{"ok":true}', "utf8");
+          },
+          text: async () => '{"ok":true}',
+        } as any,
+      };
+    };
+    return { fetcher: fn as unknown as typeof import("undici").request, captures };
+  }
+
+  test("agentId from V3MasterSinkPayload is forwarded verbatim on the wire", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    await attemptSend(
+      { ...PAYLOAD, agentId: "codex" },
+      { config: CFG, fetcher },
+    );
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal(sent.agentId, "codex");
+  });
+
+  test("two payloads with same sessionId/turnIndex but different agentId both serialize their own id (no merge)", async () => {
+    // Regression: prior to 2026-05-13 these two POSTs would have arrived
+    // with byte-identical bodies (agentId field didn't exist), causing
+    // master to UPSERT both into `srv-${sessionId}-t1`. The gateway-side
+    // contribution to the fix is just making sure the bodies actually
+    // differ — master's idPart fold handles the messageId derivation.
+    const { fetcher, captures } = makeCapturingFetcher();
+    await attemptSend(
+      { ...PAYLOAD, agentId: "codex", text: "codex answer" },
+      { config: CFG, fetcher },
+    );
+    await attemptSend(
+      { ...PAYLOAD, agentId: "main", text: "main answer" },
+      { config: CFG, fetcher },
+    );
+    assert.equal(captures.length, 2);
+    const a = JSON.parse(captures[0].body) as Record<string, unknown>;
+    const b = JSON.parse(captures[1].body) as Record<string, unknown>;
+    assert.equal(a.agentId, "codex");
+    assert.equal(b.agentId, "main");
+    assert.equal(a.sessionId, b.sessionId, "same chat-level identity");
+    assert.equal(a.turnIndex, b.turnIndex, "same turn index pre-disambig");
+    assert.notEqual(a.agentId, b.agentId, "disambiguation key differs");
+  });
+
+  test("legacy wire payload without agentId omits the key entirely (drainer back-compat)", async () => {
+    // The retry queue may hold pre-Fix-A entries (written before 2026-05-13
+    // by a now-replaced container image). Those entries have no agentId
+    // on disk. The drainer calls attemptSend with that legacy shape; we
+    // must not synthesize an agentId, and must not include the key as
+    // null/empty — master's schema accepts the optional but enforces
+    // charset when present, so a null would 400 fatal-drop the entry.
+    const { fetcher, captures } = makeCapturingFetcher();
+    const legacy: import("../v3MasterSink.js").V3MasterSinkWirePayload = {
+      sessionId: "sess12345",
+      turnIndex: 1,
+      status: "completed",
+      text: "legacy",
+    };
+    await attemptSend(legacy, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("agentId" in sent, false, "agentId omitted, not nulled");
   });
 });
 

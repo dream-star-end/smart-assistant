@@ -105,7 +105,31 @@ const MAX_TOOLS_PER_PAYLOAD = 50
  *  write under contention won't false-trip. 10s. */
 const ATTEMPT_TIMEOUT_MS = 10_000
 
-export interface V3MasterSinkPayload {
+/**
+ * Wire-shape payload. Mirrors what attemptSend serializes to the master.
+ *
+ * `agentId` is the disambiguator that joins (peerId, agentId, turnIndex)
+ * into a globally unique messageId: a single chat (peerId) can rotate
+ * across multiple AgentSessions (e.g. user switches model mid-chat,
+ * codex → main), each tracking its own `session.turns` counter starting
+ * at 0. Without `agentId` the resulting `srv-${peerId}-t1` collides and
+ * the client merges two distinct answers into one row (root cause of the
+ * 2026-05-13 "switched to deepseek, only thinking visible" bug). Master
+ * folds it into the persisted message id (`srv-${peerId}-${agentId}-t${n}`)
+ * so refresh-recovery from SQLite recovers the disambiguated row too.
+ *
+ * Wire optional vs live required: the on-disk retry queue may carry
+ * entries written by a pre-Fix-A gateway image (no `agentId` field) —
+ * the drainer must be able to deserialize them. So this wire shape
+ * marks `agentId?: string`. Live callers in sessionManager use the
+ * stricter {@link V3MasterSinkPayload} that requires `agentId`.
+ */
+export interface V3MasterSinkWirePayload {
+  /** Agent that produced this turn. Optional on the wire ONLY to allow
+   *  the retry queue to deserialize legacy on-disk entries. New live
+   *  callers always set this; absence implies "old queue entry, fall
+   *  back to peerId-only messageId on the master side". */
+  agentId?: string
   sessionId: string
   turnIndex: number
   status: 'completed' | 'interrupted' | 'crashed'
@@ -168,6 +192,18 @@ export interface V3MasterSinkPayload {
   tools?: TurnToolEntry[]
 }
 
+/**
+ * Live caller payload — required by sessionManager.persistServerAuthoredTurn
+ * and the V3MasterSink interface. Tightens {@link V3MasterSinkWirePayload}
+ * by making `agentId` non-optional, matching the in-process invariant that
+ * any live turn-end has a known agentId (AgentSession.agentId is set at
+ * getOrCreate time). The wire variant exists ONLY so the retry queue can
+ * deserialize pre-Fix-A disk entries.
+ */
+export interface V3MasterSinkPayload extends V3MasterSinkWirePayload {
+  agentId: string
+}
+
 export type V3SinkErrorClass = 'transient' | 'session_missing' | 'fatal'
 
 /** Base class so callers can `instanceof V3SinkError` to gate fallback. */
@@ -217,9 +253,35 @@ export interface AttemptSendDeps {
  * NEVER logs the bearer; only the path + status code on the failure log
  * line. Body is logged at debug only when classification is fatal (so
  * ops can see what schema we sent that master rejected).
+ *
+ * Wire-format rolling-deploy invariant (2026-05-13 Fix A):
+ *   New live gateway always sends `agentId` (V3MasterSinkPayload requires
+ *   it; sessionManager call sites pass `session.agentId`). The retry
+ *   queue can ALSO call this with `V3MasterSinkWirePayload` for pre-Fix-A
+ *   on-disk entries that have no agentId.
+ *
+ *   The supported rollout direction is master-first: `scripts/deploy-v3.sh`
+ *   updates the master host (rsync + `systemctl restart openclaude`) and
+ *   does NOT touch per-host container images. Container image
+ *   build/distribution is a separate manual step (`build-image.sh` +
+ *   `scripts/distribute-image-explicit.ts`). Therefore live traffic during
+ *   any normal upgrade is "old-container → new-master" (handled by the
+ *   agentId-optional schema on master, falling back to the legacy
+ *   `srv-${sessionId}-t${turnIndex}` id) and after distribution
+ *   "new-container → new-master".
+ *
+ *   "new-container → old-master" can only arise from operator-coordinated
+ *   master rollback after container image rollout. That is operationally
+ *   out-of-contract for any wire-format change; rolling master back must
+ *   either pause user traffic or roll containers back together. The
+ *   sink intentionally does NOT carry a fallback retry without agentId —
+ *   doing so would (a) reintroduce the exact id collision Fix A removes
+ *   on rollback, (b) mask legitimate INVALID_BODY ops signals, and (c)
+ *   couple the sink to wire-format versioning that belongs in deploy
+ *   tooling.
  */
 export async function attemptSend(
-  payload: V3MasterSinkPayload,
+  payload: V3MasterSinkWirePayload,
   deps: AttemptSendDeps,
 ): Promise<void> {
   const url = `${deps.config.baseUrl}${SERVER_AUTHORED_PATH}`
@@ -231,6 +293,11 @@ export async function attemptSend(
     turnIndex: payload.turnIndex,
     status: payload.status,
     text: payload.text,
+    // agentId is optional on the wire to keep legacy retry-queue entries
+    // (written by pre-Fix-A gateway images) drainable. Master folds it
+    // into the persisted messageId when present; absence falls back to
+    // the pre-Fix-A `srv-${sessionId}-t${turnIndex}` format.
+    ...(payload.agentId !== undefined ? { agentId: payload.agentId } : {}),
     ...(payload.createdAt !== undefined ? { createdAt: payload.createdAt } : {}),
     // Plan §4.4 改动 7 — extra fields. All optional on the wire; master's
     // schema refine requires `requestId` only when text is non-empty (i.e.
@@ -421,11 +488,15 @@ function truncateForLog(s: string): string {
 
 export interface V3MasterSink {
   /** Try once. On transient / session_missing → enqueue durable. On
-   *  fatal → log + drop. Returns the outcome so callers can metric. */
+   *  fatal → log + drop. Returns the outcome so callers can metric.
+   *  Live caller path — payload must include `agentId`. */
   persistOrQueue(payload: V3MasterSinkPayload): Promise<PersistOutcome>
   /** Single-attempt for the drainer to call directly without going
-   *  through enqueue. */
-  attemptOnce(payload: V3MasterSinkPayload): Promise<void>
+   *  through enqueue. Accepts the wire shape (agentId optional) so the
+   *  retry queue can drain pre-Fix-A on-disk entries that were written
+   *  before the agentId field existed. Master tolerates the absence by
+   *  falling back to the legacy `srv-${sessionId}-t${turnIndex}` id. */
+  attemptOnce(payload: V3MasterSinkWirePayload): Promise<void>
 }
 
 export type PersistOutcome =
@@ -445,7 +516,7 @@ export function makeV3MasterSink(deps: MakeV3MasterSinkDeps): V3MasterSink {
   const attempt = deps.attemptSendImpl ?? attemptSend
   const now = deps.now ?? (() => Date.now())
 
-  const attemptOnce = (payload: V3MasterSinkPayload): Promise<void> =>
+  const attemptOnce = (payload: V3MasterSinkWirePayload): Promise<void> =>
     attempt(payload, { config: deps.config })
 
   const persistOrQueue = async (payload: V3MasterSinkPayload): Promise<PersistOutcome> => {

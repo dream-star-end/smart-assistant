@@ -504,7 +504,7 @@ export class Gateway {
         // sink's single-attempt path, sink.persistOrQueue wants the queue
         // for fallback. Box `sinkRef` so the queue can call it via late-
         // binding when sink is constructed below.
-        let sinkAttemptOnce: ((p: import('./v3MasterSink.js').V3MasterSinkPayload) => Promise<void>) | null = null
+        let sinkAttemptOnce: ((p: import('./v3MasterSink.js').V3MasterSinkWirePayload) => Promise<void>) | null = null
         const queue = makeV3MasterRetryQueue({
           attemptSend: async (p) => {
             if (!sinkAttemptOnce) {
