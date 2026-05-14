@@ -204,6 +204,20 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("ALTER TABLE client_sessions ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 1")
     }
   } catch { /* table just created with column already */ }
+  // Migration: origin_channel — marks rows authored by a non-webchat channel
+  // (currently only 'wechat' via the broker). NULL = legacy/webchat (default).
+  // The wechat broker's reconcile path scopes its orphan-detection sweep to
+  // `origin_channel = 'wechat'` so it never touches rows owned by other
+  // channels. See packages/commercial/src/wechat/broker.ts + design.md §3.
+  //
+  // ALTER TABLE ADD COLUMN with default NULL is metadata-only and fast on
+  // SQLite (brief schema/write lock; no row rewrite).
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'origin_channel')) {
+      db.exec("ALTER TABLE client_sessions ADD COLUMN origin_channel TEXT DEFAULT NULL")
+    }
+  } catch { /* table just created with column already */ }
 
   // ── WeChat iLink per-user bindings (multi-tenant) ──
   //   Each OpenClaude user can bind exactly one WeChat bot account via
@@ -2079,6 +2093,98 @@ export async function listUnclaimedSessions(): Promise<Array<{
       messageCount: r.msg_count, summary,
     }
   })
+}
+
+/**
+ * List all live broker-owned wechat sessions:
+ *   - `id GLOB 'wsess-[0-9a-f]{16}'`  (Codex R5: precise 16-hex shape)
+ *   - `origin_channel = 'wechat'`     (slice 7a: explicit channel tag)
+ *   - `deleted_at IS NULL`            (alive)
+ *
+ * Returned `{id, userId, createdAt}` (createdAt = epoch ms). Consumer
+ * (commercial v3 broker.reconcile) takes a single snapshot per tick and diffs
+ * against PG `wechat_session_pointer.current_session_id` to find orphan rows;
+ * `userId` is required to call `softDeleteMasterSession(sessionId, userId)`
+ * with tenancy scoping.
+ *
+ * **Why precise 16-hex GLOB** (Codex R5 BLOCKER): bare `wsess-*` would also
+ * match `wsess-manual`, `wsess-x`, etc. — but the broker-owned namespace is
+ * exactly `^wsess-[0-9a-f]{16}$`. The literal prefix still lets SQLite walk
+ * the PK index range; the 16 char-class brackets enforce shape.
+ *
+ * **Why also filter origin_channel='wechat'** (slice 7a + Codex 7a PASS): the
+ * GLOB is namespace-correct, but `origin_channel` makes the dispatcher contract
+ * real, keeps storage aligned with design.md §3, and avoids dead params.
+ */
+export async function allMasterWsessRows(): Promise<Array<{
+  id: string
+  userId: string
+  createdAt: number
+}>> {
+  const db = await getSessionsDb()
+  const rows = db.prepare(`
+    SELECT id, user_id AS userId, created_at AS createdAt
+    FROM client_sessions
+    WHERE id GLOB 'wsess-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+      AND origin_channel = 'wechat'
+      AND deleted_at IS NULL
+  `).all() as Array<{ id: string; userId: string; createdAt: number }>
+  return rows
+}
+
+/**
+ * Broker-only insert for a fresh master client_sessions row owned by a
+ * non-webchat channel (currently wechat). Used by the dispatcher's Step 2
+ * (after Step 1 wrote `wechat_session_pointer` in PG, before Step 3 forwards
+ * into the container).
+ *
+ * **Plain INSERT by design; duplicate id must throw for dispatcher
+ * compensation.** (Codex 7a PASS) — for this path collision is exceptional
+ * (16-hex namespace, fresh per dispatch). When it does happen, the dispatcher
+ * needs the SQLITE_CONSTRAINT to bubble so it can produce a `step2_failed`
+ * outcome and run the compensation chain (rollback the pointer row in PG).
+ * Do NOT add `INSERT OR IGNORE` / `ON CONFLICT DO UPDATE` here.
+ *
+ * `messages` / `message_count` / `next_seq` / `deleted_at` rely on the
+ * column DEFAULTs ('[]' / 0 / 1 / NULL). `pinned` is also omitted (default 0).
+ * Downstream PUT path goes through `upsertClientSession` like any other row.
+ */
+export async function upsertMasterClientSession(input: {
+  sessionId: string
+  userId: string
+  agentId: string
+  originChannel: 'wechat'
+  title: string
+  createdAt: number
+  lastAt: number
+}): Promise<void> {
+  const db = await getSessionsDb()
+  db.prepare(`
+    INSERT INTO client_sessions
+      (id, user_id, agent_id, title, created_at, last_at, updated_at, origin_channel)
+    VALUES
+      (@sessionId, @userId, @agentId, @title, @createdAt, @lastAt, @lastAt, @originChannel)
+  `).run({
+    sessionId: input.sessionId,
+    userId: input.userId,
+    agentId: input.agentId,
+    title: input.title,
+    createdAt: input.createdAt,
+    lastAt: input.lastAt,
+    originChannel: input.originChannel,
+  })
+}
+
+/**
+ * Broker-only soft-delete wrapper. Tenant-scoped on `(sessionId, userId)` —
+ * same semantics as `deleteClientSession(id, userId)` so wechat reconcile
+ * never crosses tenants when removing an orphan row.
+ */
+export async function softDeleteMasterSession(
+  sessionId: string,
+  userId: string,
+): Promise<boolean> {
+  return deleteClientSession(sessionId, userId)
 }
 
 /** Claim an unclaimed session: atomically change user_id from 'default' to the target userId.

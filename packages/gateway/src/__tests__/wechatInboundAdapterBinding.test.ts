@@ -1,0 +1,142 @@
+/**
+ * P1.7 slice 7c — `handleWechatInbound` ↔ v3-wechat-outbound adapter 装配契约
+ * 的结构化回归断言。
+ *
+ * Codex 在 7c-10 review 发现的 bug:`handleWechatInbound` 之前调
+ * `dispatchInbound(frame)` 不传 adapter → `deliver()` 走 WS 广播分支
+ * (server.ts:6314+),容器侧没 WS 客户端订阅 wechat peerKey → assistant 帧
+ * 静默落进 outboundRing,master 假阳性 200,broker retry queue 不会兜底 →
+ * 出口黑洞化。
+ *
+ * 修复:显式 `channels.get('v3-wechat-outbound')` 取容器侧出口 adapter,
+ * 不存在则 503 fail-closed 让 broker retry queue 感知配置错误;存在则
+ * `dispatchInbound(frame, adapter)` 把出口绑死。
+ *
+ * **测试形态决策(static source scan vs runtime)**:
+ *
+ * 这层"是否取 adapter + 是否传给 dispatchInbound"的契约,跑端到端 integ 要
+ * 构造完整 Gateway(config / agentsConfig / web / ccb subprocess / agents.yaml…)
+ * 才能让 dispatchInbound 真跑通,代价巨大且测试本身 brittle 概率高。
+ *
+ * **该 repo 现有先例**:`dispatchInboundTraceStamp.test.ts`(CG7 turn-level
+ * trace 校验)处理同型问题就是用"scan method body 源码 + 正则断言模式"。
+ * Codex 当时(plan v3)接受这种形式,理由是:能直接锁住"新增分支忘了 stamp /
+ * 忘了 lookup"的 regression — 比"半假执行 + spy 调用次数"更直接。
+ *
+ * 本测试沿用同一范式,scan 三件套:
+ *   1. handleWechatInbound 含 `channels.get('v3-wechat-outbound')`
+ *   2. handleWechatInbound 含 503 + 'V3_WECHAT_OUTBOUND_NOT_WIRED' 早返块
+ *   3. handleWechatInbound 把 lookup 结果作为 dispatchInbound 的 2nd 实参
+ *   4. 三个 pattern 的出现顺序:lookup → fail-closed → dispatch
+ *   5. peerOut 构造保留 displayName(senderId carrier 完整性 — Codex 7c review
+ *      的额外 ask,防止修复时顺手破坏 broker 经 displayName 携带 senderId 的契约)
+ *
+ * Run: npx tsx --test packages/gateway/src/__tests__/wechatInboundAdapterBinding.test.ts
+ */
+
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const SERVER_TS = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
+
+/**
+ * 抽取 handleWechatInbound 方法体源码(从 `private async handleWechatInbound`
+ * 起,到下一个 method 起始之前)。
+ *
+ * 找下一个 method 用 `^  private` / `^  public` / `^  protected` / `^  async`
+ * 起首的下一行(class 内 method 缩进固定 2 空格)。
+ */
+function extractMethodBody(source: string, methodName: string): string {
+  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\b`, 'm')
+  const startMatch = startRe.exec(source)
+  if (!startMatch) {
+    throw new Error(`method ${methodName} not found in source`)
+  }
+  const startIdx = startMatch.index
+  // 在 startIdx 之后找下一个 method 起始
+  const rest = source.slice(startIdx + startMatch[0].length)
+  const nextRe = /^  (private|public|protected|async|static)\b/m
+  const nextMatch = nextRe.exec(rest)
+  const endIdx = nextMatch ? startIdx + startMatch[0].length + nextMatch.index : source.length
+  return source.slice(startIdx, endIdx)
+}
+
+const handleWechatInbound = extractMethodBody(SERVER_TS, 'handleWechatInbound')
+
+// ── 基础前置:method 抽出来非空、且包含必要 keyword ──
+test('extractMethodBody finds handleWechatInbound and includes core skeleton', () => {
+  assert.ok(handleWechatInbound.length > 200, 'method body must be non-trivial')
+  assert.match(handleWechatInbound, /private async handleWechatInbound/)
+  assert.match(handleWechatInbound, /dispatchInbound\(/)
+})
+
+// ── 主断言:adapter lookup 出现 + 用 'v3-wechat-outbound' literal ──
+test("handleWechatInbound looks up channels.get('v3-wechat-outbound')", () => {
+  // 单/双引号都接受;但 literal name 必须严格匹配
+  assert.match(
+    handleWechatInbound,
+    /channels\.get\(\s*['"]v3-wechat-outbound['"]\s*\)/,
+    "v3 broker inbound 必须显式查 v3-wechat-outbound adapter,不能依赖 dispatchInbound 默认无 adapter 兜底",
+  )
+})
+
+// ── 主断言:adapter 缺失 → 503 V3_WECHAT_OUTBOUND_NOT_WIRED fail-closed ──
+test('handleWechatInbound returns 503 V3_WECHAT_OUTBOUND_NOT_WIRED when adapter missing', () => {
+  // sendJson(res, 503, ...) 调用
+  assert.match(
+    handleWechatInbound,
+    /sendJson\(\s*res\s*,\s*503\s*,/,
+    '503 fail-closed 必须出现在 handleWechatInbound — adapter 缺失时不能默默 200',
+  )
+  // error code literal — broker retry/fatal 分类按 HTTP status(503=transient),
+  // code 字面只用于日志/观测(grep "V3_WECHAT_OUTBOUND_NOT_WIRED" 定位配置错误)。
+  // lock 死 literal 是为了让 ops grep 稳定,不是分类逻辑依赖。
+  assert.match(
+    handleWechatInbound,
+    /V3_WECHAT_OUTBOUND_NOT_WIRED/,
+    'error.code 字面必须是 V3_WECHAT_OUTBOUND_NOT_WIRED(observability 用,broker 分类走 status code)',
+  )
+})
+
+// ── 主断言:dispatchInbound 把 adapter 作为 2nd 实参传入 ──
+test('handleWechatInbound passes the v3 outbound adapter as the 2nd arg to dispatchInbound', () => {
+  // 形如 `this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter)` —
+  // 第二个实参是引用 lookup 结果的标识符。允许命名是 v3OutboundAdapter /
+  // adapter / 任意 [A-Za-z_][A-Za-z0-9_]* — 但必须非空。
+  assert.match(
+    handleWechatInbound,
+    /this\.dispatchInbound\(\s*frame\s+as\s+InboundFrame\s*,\s*[A-Za-z_][A-Za-z0-9_]*\s*\)/,
+    'dispatchInbound 必须显式接收 adapter 参数,不能空调(空调会走 WS 广播 → 容器无 client → 输出黑洞)',
+  )
+})
+
+// ── 顺序断言:lookup → 503 fail-closed → dispatchInbound ──
+test('handleWechatInbound: lookup precedes the 503 guard, which precedes dispatchInbound', () => {
+  const idxLookup = handleWechatInbound.search(/channels\.get\(\s*['"]v3-wechat-outbound['"]/)
+  const idxGuard = handleWechatInbound.search(/V3_WECHAT_OUTBOUND_NOT_WIRED/)
+  const idxDispatch = handleWechatInbound.search(
+    /this\.dispatchInbound\(\s*frame\s+as\s+InboundFrame\s*,/,
+  )
+  assert.ok(idxLookup >= 0 && idxGuard >= 0 && idxDispatch >= 0,
+    'all three patterns must occur in handleWechatInbound')
+  assert.ok(idxLookup < idxGuard,
+    'adapter lookup must precede the 503 fail-closed block — otherwise the guard reads an undefined variable')
+  assert.ok(idxGuard < idxDispatch,
+    'the 503 fail-closed block must precede dispatchInbound — otherwise dispatch fires before the guard')
+})
+
+// ── 副断言:peer.displayName carrier 完整性(slice 7c senderId 通过 peer.displayName 携带)──
+test('handleWechatInbound preserves peer.displayName on the outbound frame', () => {
+  // peerOut 构造分支必须把 peerDisplayName(来自 body.peer.displayName)
+  // 透传到 frame.peer.displayName — broker 通过该字段携带 senderId,
+  // inboundDispatcher 反解出 senderId 写入 origin。
+  assert.match(
+    handleWechatInbound,
+    /peerOut\.displayName\s*=\s*peerDisplayName/,
+    'peer.displayName carrier 必须被透传(broker senderId 协议依赖此字段)',
+  )
+})

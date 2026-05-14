@@ -24,11 +24,33 @@
  *   - 首次挂载后 `/var/lib/openclaude` 已是 root:root 0700
  */
 
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const DEFAULT_BRIDGE_SECRET_PATH = "/var/lib/openclaude/.v3-bridge-secret";
+
+/**
+ * **WeChat broker inbound 通道 nonce 派生**(D3d HMAC 派生方案 B')。
+ *
+ * 与 file-proxy 反向(file-proxy 是 master 反代回容器,HMAC 输入 = 纯 containerId,hex 64);
+ * inbound 是 master broker 主动 POST 到容器 `/internal/v3/wechat-inbound`,HMAC 输入加 `inbound:`
+ * 前缀做 **domain separation**:即便有人拿到一个 file-proxy nonce 也无法当 inbound nonce 用,
+ * 反之亦然 —— 两份输出落在 HMAC 不同子域,空间不重叠。
+ *
+ * **编码差异**:file-proxy 历史落地是 hex 64(32 byte * 2 chars),inbound 故意改成 base64url
+ * 32B(43 chars,无 padding)。差异是 *signal*:env 名 `OPENCLAUDE_INBOUND_NONCE` 与
+ * `OC_BRIDGE_NONCE` 一眼可区分,运维 / log grep 时不会混淆;同时避免容器侧任何"复用 file-proxy
+ * 校验函数"的捷径冲动。Codex r4 note 2 明确禁止两个 nonce 共用编码。
+ *
+ * 入参 containerId 可以是 number 或 string(supervisor 那边 row.id 是 number,但调用方多 String()
+ * 化以保字面一致)— 内部统一 String() 后喂给 HMAC,避免 buffer/number 模糊。
+ */
+export function computeInboundNonce(secret: string, containerId: number | string): string {
+  return createHmac("sha256", secret)
+    .update(`inbound:${String(containerId)}`)
+    .digest("base64url");
+}
 
 /**
  * Codex R1/R2 SHOULD-4:启动时 self-check `/var/lib/openclaude` 的 owner/mode/symlink。

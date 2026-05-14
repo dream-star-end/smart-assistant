@@ -58,6 +58,7 @@ import type { ContainerService, ContainerSpec } from "../compute-pool/containerS
 import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
 import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js";
 import type { ComputeHostRow } from "../compute-pool/types.js";
+import { computeInboundNonce } from "../bridgeSecret.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
@@ -1611,6 +1612,11 @@ export async function provisionV3Container(
     // 容器内 gateway 靠这两个 env 做 bridge bypass 校验 + /healthz capability 广播。
     // 缺失(deps.bridgeSecret 未注入)→ 容器不广播 file-proxy-v1,HOST 代理探测到
     // CONTAINER_OUTDATED 自动降级。
+    //
+    // 同一把 bridgeSecret 同时给 WeChat broker → 容器 inbound 通道签 nonce
+    // (`OPENCLAUDE_INBOUND_NONCE`,见 docs/v3/wechat-broker-design.md D3d)。
+    // 编码 base64url 故意与 file-proxy 的 hex 不同 —— 输入域也加了 "inbound:" 前缀,
+    // 两条通道在 HMAC 输出空间正交,不会出现 nonce cross-replay。
     if (deps.bridgeSecret) {
       env.push(`OC_CONTAINER_ID=${String(row.id)}`);
       env.push(
@@ -1618,6 +1624,7 @@ export async function provisionV3Container(
           .update(String(row.id))
           .digest("hex")}`,
       );
+      env.push(`OPENCLAUDE_INBOUND_NONCE=${computeInboundNonce(deps.bridgeSecret, row.id)}`);
     }
 
     // CCB 基线只读挂载。**fail-closed 默认**:基线缺失/校验失败 → 抛

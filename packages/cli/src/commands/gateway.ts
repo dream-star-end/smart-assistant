@@ -1,6 +1,12 @@
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Gateway, log, type CommercialHook } from '@openclaude/gateway'
+import {
+  Gateway,
+  log,
+  makeV3WechatOutboundAdapter,
+  readV3WechatOutboundConfig,
+  type CommercialHook,
+} from '@openclaude/gateway'
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
 import { type OpenClaudeConfig, readAgentsConfig, readConfig } from '@openclaude/storage'
 
@@ -100,15 +106,51 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
 
   const channelFactories: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter> = []
 
+  // V3 Phase 2 Task 2H: 仅当 COMMERCIAL_ENABLED=1 时挂商业化模块。
+  // dynamic-import 是为了让 personal 部署不背负 commercial 包的副作用 import(pg/redis/dockerode)。
+  //
+  // P1.7 slice 7c — commercial 必须先于 wechatChannelFactory 完成 register,
+  // 因为 wechat manager 的 `onInboundOverride` 需要把 `commercial.wechatBroker.onInbound`
+  // 透传进去(broker 替代 ctx.dispatch 路径,见 RFC §4.1)。两者顺序倒过来就会
+  // 出现"commercial 还未 ready 时 wechat worker 已开始长轮询"的窗口:这段时间
+  // 的 inbound 会走 legacy ctx.dispatch 进 personal-OC session 命名空间,而不是
+  // broker 的 wsess-* 命名空间 —— session 串场无法回退。
+  let commercial: CommercialHook | undefined
+  if (process.env.COMMERCIAL_ENABLED === '1') {
+    try {
+      const mod = await import('@openclaude/commercial')
+      commercial = await mod.registerCommercial(null)
+      console.log('[cli] commercial module registered (v3 mode)')
+    } catch (err) {
+      console.error('[cli] COMMERCIAL_ENABLED=1 但 registerCommercial 失败:', err)
+      process.exit(1)
+    }
+  }
+
   // WeChat (iLink): enabled when channels.wechat.enabled = true.
   // Bindings are per-user and live in the wechat_bindings table — no static
   // config token. The manager picks them up on init() + reconcile interval.
+  //
+  // P1.7 slice 7c — commercial.wechatBroker 存在时,把 broker.onInbound 作为
+  // override hook 注入 manager;由 broker 接管 inbound 并按 wsess-* 命名空间
+  // 走自己的 dispatcher → container 链路。broker 未启用(WECHAT_BROKER_ENABLED!=1
+  // / personal / commercial 未挂)时 override 为 undefined,manager 走 legacy
+  // ctx.dispatch 原路径,行为不变。
   const wxCfg = (config.channels as any).wechat
   if (wxCfg?.enabled) {
     try {
       const mod = await import('@openclaude/channel-wechat')
-      channelFactories.push(() => mod.wechatChannelFactory({}))
-      console.log('[cli] wechat (iLink) channel wired up')
+      const broker = commercial?.wechatBroker
+      channelFactories.push(() =>
+        mod.wechatChannelFactory({
+          onInboundOverride: broker ? (evt) => broker.onInbound(evt) : undefined,
+        }),
+      )
+      console.log(
+        broker
+          ? '[cli] wechat (iLink) channel wired up (broker override active)'
+          : '[cli] wechat (iLink) channel wired up',
+      )
     } catch (err) {
       console.error('[cli] failed to load @openclaude/channel-wechat:', err)
     }
@@ -138,18 +180,20 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     }
   }
 
-  // V3 Phase 2 Task 2H: 仅当 COMMERCIAL_ENABLED=1 时挂商业化模块。
-  // dynamic-import 是为了让 personal 部署不背负 commercial 包的副作用 import(pg/redis/dockerode)。
-  let commercial: CommercialHook | undefined
-  if (process.env.COMMERCIAL_ENABLED === '1') {
-    try {
-      const mod = await import('@openclaude/commercial')
-      commercial = await mod.registerCommercial(null)
-      console.log('[cli] commercial module registered (v3 mode)')
-    } catch (err) {
-      console.error('[cli] COMMERCIAL_ENABLED=1 但 registerCommercial 失败:', err)
-      process.exit(1)
-    }
+  // P1.7 slice 7c — 容器侧 WeChat outbound 适配器。
+  //
+  // 仅当 OPENCLAUDE_V3_MASTER_BASE_URL + OPENCLAUDE_V3_CONTAINER_TOKEN 同时存在
+  // (即本进程是 v3 commercial 容器)时挂载;此 adapter 把 ChannelMessage.channel='wechat'
+  // 的 OutboundMessage 通过 POST /internal/v3/wechat-outbound 回传给 master broker,
+  // master 再走 manager.send → iLink。
+  //
+  // personal / dev / master 进程缺这两个 env,readV3WechatOutboundConfig 返回 null,
+  // 不挂载;adapter id = "v3-wechat-outbound",与 master 侧 wechatChannelFactory 的
+  // "wechat" 共存不冲突(channel 字段决定路由,但 master 容器内同时只有一个)。
+  const v3WxOut = readV3WechatOutboundConfig(process.env)
+  if (v3WxOut) {
+    channelFactories.push(() => makeV3WechatOutboundAdapter({ config: v3WxOut }))
+    console.log('[cli] v3 wechat outbound adapter wired (container mode)')
   }
 
   gw = new Gateway({ config, agentsConfig, webRoot, channelFactories, commercial })

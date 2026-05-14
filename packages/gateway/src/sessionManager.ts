@@ -35,6 +35,20 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
+/**
+ * 触发 v3MasterSink server-authored 持久化的 channel 白名单。
+ *
+ * 历史上只有 'webchat' 走 master→client_sessions 写回路径(Phase 0.1 落地的 mobile
+ * durability 修复)。'wechat' 在 v3 commercial 接 iLink broker 后,inbound 直接从
+ * /internal/v3/wechat-inbound 喂 dispatchInbound,**peer.id 由 broker 解析为 client_sessions.id**
+ * (即 wechat_session_pointer.current_session_id),所以走和 webchat 一模一样的"per-user
+ * client_sessions 行 + master 端 appendServerAuthoredMessage"的写回路径,允许放行。
+ *
+ * 其它 channel(telegram / cron / webhook / delegate)peerId 不是 client_sessions.id —
+ * master 端 WHERE id=? AND user_id=? 永远命不中,落 outbox 死信浪费 IO,故不放行。
+ */
+const MASTER_SINK_PERSIST_CHANNELS: ReadonlySet<string> = new Set(['webchat', 'wechat'])
+
 // 一个 sessionKey 对应一个 SubprocessRunner + 一把 Mutex(同 session 串行)。
 // 跨 session 完全并行。
 export interface AgentSession {
@@ -1826,12 +1840,13 @@ export class SessionManager {
             // persisted the assistant text to the user-visible messages
             // array. See docs/MOBILE_STREAM_DURABILITY_PLAN.md.
             //
-            // Only applies to webchat sessions whose peerId matches a
-            // client_sessions row (i.e., the UI created the session before
-            // dispatching the first turn). Cron/webhook/telegram/delegate
-            // turns are not routed to a per-user client session and thus
-            // skip this path — they're tracked via sessions_meta / event_log
-            // instead, and will be addressed in Phase 1 (channel broadcast).
+            // Only applies to channels whose peerId resolves to a client_sessions
+            // row id —— 当前是 webchat(UI 创建会话拿到 id 后才 dispatch 第一条)
+            // 和 wechat(broker 用 wechat_session_pointer.current_session_id 当 peer.id
+            // 喂 dispatchInbound,语义等价)。telegram/cron/webhook/delegate 的 peerId
+            // 不是 client_sessions.id,master 端 WHERE id=? 永远命不中,只会浪费 outbox
+            // 死信 IO,所以由 MASTER_SINK_PERSIST_CHANNELS 拒。它们的 turn 跟踪走
+            // sessions_meta / event_log 路径(已存在,不在本 if 内)。
             const completedHasAssistant =
               !!result.assistantText && result.assistantText.length > 0
             const completedHasThinking =
@@ -1844,7 +1859,7 @@ export class SessionManager {
             // also non-empty — losing the durability fix in the rare case.
             const completedHasTools = !!result.tools && result.tools.length > 0
             if (
-              session.channel === 'webchat' &&
+              MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
               (completedHasAssistant || completedHasThinking || completedHasTools)
             ) {
               const peerId = session.peerId
@@ -2099,7 +2114,7 @@ export class SessionManager {
                   !!partialThinking && partialThinking.length > 0
                 const hasPartialTools = partialTools.length > 0
                 if (
-                  session.channel === 'webchat' &&
+                  MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
                   (hasPartial || hasPartialThinking || hasPartialTools)
                 ) {
                   const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'

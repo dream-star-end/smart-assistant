@@ -112,7 +112,21 @@ import {
   appendCostCredits,
   appendServerAuthoredMessage,
   appendServerAuthoredMessageForRequest,
+  // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
+  upsertMasterClientSession,
+  softDeleteMasterSession,
+  allMasterWsessRows,
+  getWechatBindingByUserId,
 } from "@openclaude/storage";
+import {
+  WECHAT_OUTBOUND_PATH,
+  makeOutboundReceiverHandler,
+} from "./wechat/outboundReceiver.js";
+import { makeInboundDispatcher } from "./wechat/inboundDispatcher.js";
+import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
+import { makeIlinkSendAdapter } from "./wechat/ilinkSendAdapter.js";
+import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
+import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import {
   createUserChatBridge,
@@ -278,6 +292,29 @@ export interface RegisterCommercialResult {
    * docker volumes 根下的 user volume 目录壳子)。
    */
   isUserVolumeMediaPath?: (resolvedPath: string) => boolean;
+  /**
+   * P1.7 slice 7c — WeChat broker 入站入口。
+   *
+   * 装配条件:
+   *   - cfg.WECHAT_BROKER_ENABLED === true (env WECHAT_BROKER_ENABLED=1)
+   *   - selfHostUuid / dispatchInternal 等基础设施已就绪
+   *
+   * gateway 不 import commercial 类型 — 这里只暴露 broker.onInbound 的最小投影
+   * (结构对齐 gateway 的 `CommercialHook.wechatBroker.onInbound` 形状)。返回
+   * `unknown` 让 caller 不感知 BrokerInboundOutcome 内部 union;broker 自己
+   * never-throw,caller 不需要 try/catch。
+   */
+  wechatBroker?: {
+    onInbound(evt: {
+      bindingUserId: string;
+      senderId: string;
+      text: string;
+      idempotencyKey: string;
+      receivedAt: number;
+      channel?: "wechat";
+      agentId?: string;
+    }): Promise<unknown>;
+  };
 }
 
 // ─── D.1b: 18443 mTLS 反代前置校验 ─────────────────────────────────────────
@@ -660,6 +697,12 @@ export async function registerCommercial(
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
   };
+  // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
+  // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖
+  // resolveContainerEndpoint(line ~1529)装配完才能 makeInboundDispatcher → makeWechatBroker。
+  // 这层 ref 把"路由表"(dispatchInternal)与"broker 实例"装配顺序解耦,与
+  // bridgeBroadcastRef 同型:proxy 闭包总读 ref.current,broker 未就绪时短路 404 不 throw。
+  const wechatBrokerRef: { current: WechatBroker | null } = { current: null };
   // v1.0.120 feat/codex-disable-rebind:fanoutDeps 依赖 v3Deps.putRemoteCodexAuth,
   // 必须在 v3Deps 装配后(line ~1067)才能赋值;但 proxy / codex token refresh
   // handler / commercialHttpDeps 在更早就要拿到 trigger 闭包,故用 ref 打破先后。
@@ -887,6 +930,22 @@ export async function registerCommercial(
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
           return codexTokenRefreshHandler(req, res, ctx);
+        }
+        if (path === WECHAT_OUTBOUND_PATH) {
+          // P1.7 slice 7c — wechat broker outbound 接收点
+          // broker 自带 brokerEnabled() 短路 403,无需在此重判 cfg.WECHAT_BROKER_ENABLED;
+          // 未装配(ref.current=null)时显式 404,避免 caller container 把缺失误读为 503/超时
+          // (回 retry,污染 retryQueue)— 404 在 v3WechatOutbound 端被分类为 fatal,直接 drop。
+          const broker = wechatBrokerRef.current;
+          if (!broker) {
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({
+              error: { code: "WECHAT_BROKER_NOT_ASSEMBLED", message: "wechat broker not assembled" },
+            }));
+            return Promise.resolve();
+          }
+          return broker.outboundHandler(req, res, ctx);
         }
         return internalProxyHandler!(req, res, ctx);
       };
@@ -1533,6 +1592,84 @@ export async function registerCommercial(
       : async (_uid: bigint) => {
         throw new ContainerUnreadyError(5, "supervisor_not_wired");
       });
+
+  // ─── P1.7 slice 7c — WeChat broker 装配 ───────────────────────────────────
+  //
+  // 装配条件:WECHAT_BROKER_ENABLED=1 + bridgeSecret 已加载(对称要求 — broker 给
+  // container 发 inbound 时 HMAC 来自这个 root secret)。两者任一缺失 →
+  // broker 全程 disabled,wechatBrokerRef.current 保持 null,
+  // /internal/v3/wechat-outbound 永远 404、外部 onInbound 也未暴露。
+  //
+  // 装配后:broker 自带 brokerEnabled() 短路;但本侧已经 gate 过整个装配链
+  // (没装就没 onInbound 也没 outboundHandler),所以 callback 直接 () => true。
+  // 这样后续若加 ConfigService 热重载,把 callback 换成 ConfigService.get 即可,
+  // 不动 broker.ts。
+  let wechatBroker: WechatBroker | undefined;
+  if (cfg.WECHAT_BROKER_ENABLED && bridgeSecret) {
+    // ─ 依赖装配(自下而上):transport → dispatcher → outboundReceiver →
+    //   sendText → broker
+    const wechatLog = rootLogger.child({ subsys: "wechatBrokerAssembly" });
+    const containerTransport = makeNodeHttpContainerTransport();
+    const ilinkSendText = makeIlinkSendAdapter();
+
+    const inboundDispatcher = makeInboundDispatcher({
+      pgPool: getPool(),
+      resolveContainerEndpoint,
+      bridgeSecret,
+      // dispatcher Step 2a / 2b — 走 storage helper 写 master sqlite client_sessions。
+      upsertMasterClientSession,
+      // dispatcher Step 2b 失败 + broker reconcile 共用同一个 soft-delete
+      // (返 boolean,broker.softDeleteMasterSession 期待 Promise<void> — 包一层吞掉返回值)
+      softDeleteMasterSession: async (sessionId, userId) => {
+        await softDeleteMasterSession(sessionId, userId);
+      },
+      transport: containerTransport,
+    });
+
+    const identityRepo = createPgIdentityRepo();
+    const rateLimitRedis = wrapIoredis(redis);
+    void rateLimitRedis; // P1 占位:noop limiter;P3 真实滑窗时切回 rateLimitRedis 依赖
+    const outboundReceiver = makeOutboundReceiverHandler({
+      identityRepo,
+      pool: getPool(),
+      rateLimiter: createNoopRateLimiter(),
+    });
+
+    wechatBroker = makeWechatBroker({
+      pgPool: getPool(),
+      dispatcher: inboundDispatcher,
+      outboundReceiver,
+      // broker reconcile 一次性读全集 wsess 行,然后内部 diff 出孤儿。
+      allMasterWsessRows,
+      softDeleteMasterSession: async (sessionId, userId) => {
+        await softDeleteMasterSession(sessionId, userId);
+      },
+      sendText: ilinkSendText,
+      // 读 master sqlite wechat_bindings 拿 botToken + contextTokens 给 outboxWorker。
+      // 失败 / 不存在 → 返 null,worker 该 row 走 permanent(无可恢复 token)。
+      getBinding: async (bindingUserId) => {
+        const b = await getWechatBindingByUserId(bindingUserId);
+        if (!b) return null;
+        return { botToken: b.botToken, contextTokens: b.contextTokens };
+      },
+      brokerEnabled: () => true, // 装配链已 gate 过整体开关
+    });
+    wechatBroker.start();
+    wechatBrokerRef.current = wechatBroker;
+    wechatLog.info("wechat_broker_assembled");
+    // eslint-disable-next-line no-console
+    console.log("[commercial] wechat broker assembled + started");
+  } else {
+    // eslint-disable-next-line no-console
+    if (cfg.WECHAT_BROKER_ENABLED && !bridgeSecret) {
+      console.warn(
+        "[commercial] WECHAT_BROKER_ENABLED=1 but bridgeSecret missing; broker NOT assembled",
+      );
+    } else {
+      console.log("[commercial] wechat broker disabled (WECHAT_BROKER_ENABLED!=1)");
+    }
+  }
+
   // V3 2I-2:把 buffered_bytes / session_duration 接到 prometheus histogram。
   // 单帧 / per-uid 字节数不进 metrics —— 标签基数太大。
   const bridgeMetrics: BridgeMetricSink = {
@@ -1920,6 +2057,13 @@ export async function registerCommercial(
       return false;
     },
     shutdown: async () => {
+      // P1.7 slice 7c — broker 先停。它会清 reconcile / housekeeping timer +
+      // stop outboxWorker;放在 listener 关之前是为了:进行中的 outbox flush
+      // 还能借 listener 把已经 admitted 的 outbound 完成最后一搏;同样 broker
+      // 内部 fire-and-forget reflection 也能在 listener 拆掉前发送完。
+      if (wechatBroker) {
+        try { await wechatBroker.stop(); } catch { /* ignore */ }
+      }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
       if (agentWsHandler) {
         try { await agentWsHandler.shutdown(); } catch { /* ignore */ }
@@ -2011,6 +2155,18 @@ export async function registerCommercial(
     // textual 谓词,无依赖,始终暴露 —— 仅供 orphan sweep 启动时按目录壳子
     // 迭代 user volumes 用。**不要**给 HTTP allowlist 用(cross-tenant IDOR)。
     isUserVolumeMediaPath,
+    // P1.7 slice 7c — broker 装配成功(WECHAT_BROKER_ENABLED=1 + bridgeSecret 齐)
+    // 才暴露。gateway cli 把 commercial.wechatBroker 作为 onInboundOverride 透传给
+    // wechat manager;manager 命中普通文本路径时把 evt 喂给 broker.onInbound,
+    // broker 自己 never-throw 并按 wsess-* 命名空间走 dispatcher → container 链路。
+    //
+    // 类型上只暴露 onInbound 的最小投影(不导出 BrokerInboundOutcome 等内部 union)—
+    // gateway 不需要也不应消费 outcome 字段,broker 内部已做必要的 log。
+    wechatBroker: wechatBroker
+      ? {
+          onInbound: (evt) => wechatBroker!.onInbound(evt),
+        }
+      : undefined,
   };
 }
 

@@ -20,10 +20,45 @@ import type { WechatBinding } from '@openclaude/storage'
 import { listActiveWechatBindings } from '@openclaude/storage'
 import { WechatWorker, type InboundEvent } from './worker.js'
 
+/**
+ * Optional hook event delivered to `onInboundOverride`(P1.7 slice 7c)。
+ *
+ * Mirrors the dispatcher's `InboundEvent` shape *just enough* for the broker
+ * `onInbound(evt)` call site. We re-export the minimal carrier rather than
+ * importing commercial's type — channels/wechat must stay commercial-free.
+ */
+export interface WechatInboundOverrideEvent {
+  bindingUserId: string
+  senderId: string
+  text: string
+  /** Stable per-message dedup key: `wechat:${bindingUserId}:${senderId}:${messageId}` */
+  idempotencyKey: string
+  /** ms since epoch; sourced from gateway clock at receive time (not Tencent's `CreateTime`) */
+  receivedAt: number
+  /** Literal "wechat" — broker.onInbound 用它做 channel guard;不写 `string` 以免
+   *  让消费者(gateway CommercialHook.wechatBroker)和 broker InboundEvent 类型对不上。 */
+  channel?: 'wechat'
+  agentId?: string
+}
+
 export interface WechatChannelConfig {
   // Interval (ms) between DB reconciliation passes. Picks up newly added
   // bindings and applies token/status updates without restarting the gateway.
   reconcileIntervalMs?: number
+  /**
+   * P1.7 slice 7c — broker override hook。当 commercial WeChat broker 装配后,
+   * 网关侧把 `(evt) => commercial.wechatBroker.onInbound(evt)` 透传给 manager。
+   * 命中时 handleInbound **替换** `ctx.dispatch` 路径,把事件交给 broker 走自己
+   * 的 client_sessions 命名空间 + dispatcher → container 链路(详见 RFC §4.1)。
+   *
+   * 不影响 `/status` / `/new` 等用户面板命令 —— 这些保持走 manager 本地处理,
+   * 不进 broker(boss 的诊断 / reset 操作必须始终能用,即使 broker 故障)。
+   *
+   * 抛错语义:override **不允许抛**;若它内部失败,broker 的 tryCompensation 应
+   * 在 master 侧落 compensate;manager 这层只 log 不重抛 —— 重抛会让 worker
+   * 的 long-poll loop 误判事件流不可恢复而停摆,影响其他 binding 的 inbound。
+   */
+  onInboundOverride?: (evt: WechatInboundOverrideEvent) => Promise<unknown> | unknown
 }
 
 const DEFAULT_RECONCILE_MS = 30_000
@@ -64,58 +99,15 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
 
   async function handleInbound(evt: InboundEvent): Promise<void> {
     if (!ctx) return
-    const { binding, senderId, text, messageId } = evt
-
-    // No sender gating — anyone who can reach the bound bot is trusted. The
-    // OC owner wants the bot fully open; access control is the WeChat-side
-    // friend relationship, not something we replicate here.
-
-    // ── /status — report current binding state to the WeChat user ──
-    if (/^\s*\/status\s*$/.test(text)) {
-      const w = workers.get(binding.userId)
-      const lastEvt = binding.lastEventAt
-        ? new Date(binding.lastEventAt).toISOString().slice(0, 19).replace('T', ' ')
-        : '(无)'
-      const msg =
-        `OC bot status\n` +
-        `account: ${binding.accountId}\n` +
-        `status: ${binding.status}\n` +
-        `最近事件: ${lastEvt}\n` +
-        `活跃 worker: ${workers.size}`
-      if (w) w.sendText(senderId, msg).catch(() => {})
-      return
-    }
-
-    // ── /new — start a fresh OpenClaude session for this sender ──
-    if (/^\s*\/new\s*$/.test(text)) {
-      const peerId = `${binding.userId}:${senderId}`
-      try {
-        if (ctx.resetSession) await ctx.resetSession('wechat', peerId, 'dm')
-        const w = workers.get(binding.userId)
-        if (w) w.sendText(senderId, '已开启新会话。下一条消息将由全新的 agent 处理。').catch(() => {})
-      } catch (err: any) {
-        const w = workers.get(binding.userId)
-        if (w) w.sendText(senderId, `/new 失败: ${err?.message || err}`).catch(() => {})
-      }
-      return
-    }
-
-    // peer.id embeds the OC user binding so routes and session keys can not
-    // collide across users who happen to share a WeChat sender id.
-    const peerId = `${binding.userId}:${senderId}`
-    const idempotencyKey = `wechat:${binding.userId}:${senderId}:${messageId}`
-
-    ctx.dispatch({
-      type: 'inbound.message',
-      idempotencyKey,
-      channel: 'wechat',
-      peer: {
-        id: peerId,
-        kind: 'dm',
-        displayName: senderId,
+    await routeWechatInbound(evt, {
+      ctx,
+      workersCount: workers.size,
+      sendText: (uid, sid, msg) => {
+        const w = workers.get(uid)
+        if (w) w.sendText(sid, msg).catch(() => {})
       },
-      content: { text },
-      ts: Date.now(),
+      onInboundOverride: cfg.onInboundOverride,
+      now: () => Date.now(),
     })
   }
 
@@ -248,6 +240,114 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
   // 检查变钝,漏掉 ChannelAdapter 本体成员的类型错误。网关侧依然通过 duck-typing
   // (`{ isWorkerRunning?: ... }`) 读取,不污染 plugin-sdk 的公共契约。
   return adapter
+}
+
+/**
+ * Pure inbound router(P1.7 slice 7c)。Extracted from `wechatChannelFactory.handleInbound`
+ * so the override-vs-dispatch routing logic can be unit-tested without standing
+ * up a real `WechatWorker` long-poll loop.
+ *
+ * **Invariants**(测试套件 wechatChannelOverride.test.ts 断言):
+ *   1. `/status` 命中 → 只调用 `sendText`(本地控制面板),**不**进 override / dispatch
+ *   2. `/new` 命中 → 调用 `ctx.resetSession` + `sendText` 反馈,**不**进 override / dispatch
+ *   3. 普通文本 + `onInboundOverride` 已注入 → **只**调 override,**不**调 `ctx.dispatch`
+ *   4. 普通文本 + `onInboundOverride` 未注入 → 走原 `ctx.dispatch` 路径
+ *   5. override 抛错 → catch + log,**不**重抛(避免污染 worker long-poll loop),
+ *      也**不**回落到 `ctx.dispatch`(broker 失败应由 master tryCompensation 兜底,
+ *      不能让消息走两套不同的 session 命名空间造成串场)
+ */
+export interface WechatInboundRouterDeps {
+  ctx: ChannelContext
+  /** 当前活跃 worker 数(用于 /status 的"活跃 worker"行) */
+  workersCount: number
+  /** 发文本到 WeChat;manager 内部走 `workers.get(uid)?.sendText`,测试可注入 spy */
+  sendText: (userId: string, senderId: string, msg: string) => void
+  onInboundOverride?: (evt: WechatInboundOverrideEvent) => Promise<unknown> | unknown
+  /** clock 注入便于断言 `ts` / `receivedAt` 字段稳定 */
+  now: () => number
+}
+
+export async function routeWechatInbound(
+  evt: InboundEvent,
+  deps: WechatInboundRouterDeps,
+): Promise<void> {
+  const { ctx, workersCount, sendText, onInboundOverride, now } = deps
+  const { binding, senderId, text, messageId } = evt
+
+  // No sender gating — anyone who can reach the bound bot is trusted. The
+  // OC owner wants the bot fully open; access control is the WeChat-side
+  // friend relationship, not something we replicate here.
+
+  // ── /status — report current binding state to the WeChat user ──
+  if (/^\s*\/status\s*$/.test(text)) {
+    const lastEvt = binding.lastEventAt
+      ? new Date(binding.lastEventAt).toISOString().slice(0, 19).replace('T', ' ')
+      : '(无)'
+    const msg =
+      `OC bot status\n` +
+      `account: ${binding.accountId}\n` +
+      `status: ${binding.status}\n` +
+      `最近事件: ${lastEvt}\n` +
+      `活跃 worker: ${workersCount}`
+    sendText(binding.userId, senderId, msg)
+    return
+  }
+
+  // ── /new — start a fresh OpenClaude session for this sender ──
+  if (/^\s*\/new\s*$/.test(text)) {
+    const peerId = `${binding.userId}:${senderId}`
+    try {
+      if (ctx.resetSession) await ctx.resetSession('wechat', peerId, 'dm')
+      sendText(binding.userId, senderId, '已开启新会话。下一条消息将由全新的 agent 处理。')
+    } catch (err: any) {
+      sendText(binding.userId, senderId, `/new 失败: ${err?.message || err}`)
+    }
+    return
+  }
+
+  // peer.id embeds the OC user binding so routes and session keys can not
+  // collide across users who happen to share a WeChat sender id.
+  const peerId = `${binding.userId}:${senderId}`
+  const idempotencyKey = `wechat:${binding.userId}:${senderId}:${messageId}`
+  const receivedAt = now()
+
+  // P1.7 slice 7c — broker override 路径(commercial 装配 + WECHAT_BROKER_ENABLED=1 时
+  // 注入)。命中后整条 inbound 改走 broker → dispatcher → container 链路,**不**
+  // 再调 ctx.dispatch —— 否则 master 侧 personal-OC session 会和 broker 的
+  // wsess-* client_sessions 命名空间打架,boss-self-binding 灰度的会话隔离失效。
+  // /status /new 在上面已经 return,这里到不了,broker 不会被这些控制命令污染。
+  if (onInboundOverride) {
+    try {
+      await onInboundOverride({
+        bindingUserId: binding.userId,
+        senderId,
+        text,
+        idempotencyKey,
+        receivedAt,
+        channel: 'wechat',
+      })
+    } catch (err: any) {
+      // 不重抛:worker long-poll loop 不应因 broker 失败而停摆;compensate
+      // 由 master 侧 broker.tryCompensation 兜底(参 RFC §4.5)。
+      // 不回落 ctx.dispatch —— 否则同一条消息会走两套 session 命名空间,
+      // 灰度阶段把 boss 自己的 personal-OC 会话和 broker 的 wsess-* 会话搅在一起。
+      ctx.log.error(`[wechat] broker override err for user=${binding.userId} sender=${senderId}: ${err?.message || err}`)
+    }
+    return
+  }
+
+  ctx.dispatch({
+    type: 'inbound.message',
+    idempotencyKey,
+    channel: 'wechat',
+    peer: {
+      id: peerId,
+      kind: 'dm',
+      displayName: senderId,
+    },
+    content: { text },
+    ts: receivedAt,
+  })
 }
 
 /**

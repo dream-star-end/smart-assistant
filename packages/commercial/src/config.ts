@@ -331,6 +331,22 @@ const r7BackupTimeoutSec = positiveInt(3600);
 const r7RestoreTimeoutSec = positiveInt(3600);
 const r7HelperImage = z.string().trim().min(1).max(256).optional();
 
+/**
+ * WeChat broker feature flag(P1.7 slice 7c)。OFF(默认)→
+ * commercial 不装配 `makeWechatBroker`,`/internal/v3/wechat-outbound` 路径走
+ * `internalProxyHandler`(返 404,因为 anthropicProxy 只接受 `/v1/messages`),
+ * 容器→master 出站静默失败。ON → broker 装配 + 路由生效。
+ *
+ * 不与 `channels.wechat.enabled`(per-instance openclaude.json,master gateway iLink
+ * 长轮询开关)混淆 — 那是 master 侧 channel adapter 开关。本 flag 是 broker 这条
+ * 跨层架构(manager → broker → dispatcher → container → outbox → iLink)的总
+ * 开关,broker 失败不影响 master 长轮询正常工作。
+ *
+ * Codex slice 7c plan PASS:flag 当前实装等价启动期开关(zod parse 一次),broker.ts
+ * 的 `brokerEnabled` callback 提供未来 ConfigService 热重载注入点 — P1 不接,记 TODO。
+ */
+const wechatBrokerEnabled = z.enum(["0", "1"]).optional().transform((v) => v === "1");
+
 export const commercialConfigSchema = z
   .object({
     DATABASE_URL: databaseUrl,
@@ -374,6 +390,10 @@ export const commercialConfigSchema = z
     R7_BACKUP_TIMEOUT_SEC: r7BackupTimeoutSec,
     R7_RESTORE_TIMEOUT_SEC: r7RestoreTimeoutSec,
     R7_HELPER_IMAGE: r7HelperImage,
+    /**
+     * WeChat broker P1.7 slice 7c feature flag。详见上方 `wechatBrokerEnabled` 定义。
+     */
+    WECHAT_BROKER_ENABLED: wechatBrokerEnabled,
     /**
      * DeepSeek API key(2026-05-02 接入)。
      * - 配置时 anthropicProxy 收到 model.startsWith('deepseek-') 的请求 → forward

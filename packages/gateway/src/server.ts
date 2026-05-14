@@ -220,6 +220,29 @@ export interface CommercialHook {
    * docker volumes 根下的 user volume 目录壳子)。
    */
   isUserVolumeMediaPath?: (resolvedPath: string) => boolean
+  /**
+   * **P1.7 slice 7c — WeChat broker 入口**。
+   *
+   * 当 commercial 模块启用 wechat broker (WECHAT_BROKER_ENABLED=1) 时注入。
+   * gateway 把它**通过 wechatChannelFactory 的 `onInboundOverride`** 透传给
+   * `routeWechatInbound`,broker 由此接管 inbound 事件(替代 ctx.dispatch),
+   * 并把目标用户的 outbound 容器 endpoint 暂存,供其 v3WechatOutbound 适配器
+   * 按 wsess-* session → bindingUserId → senderId 反查回传。
+   *
+   * **结构类型 (structural)**:gateway 不 import commercial 的具体类——保持
+   * gateway → commercial 单向依赖。
+   */
+  wechatBroker?: {
+    onInbound(evt: {
+      bindingUserId: string
+      senderId: string
+      text: string
+      idempotencyKey: string
+      receivedAt: number
+      channel?: 'wechat'
+      agentId?: string
+    }): Promise<unknown>
+  }
 }
 
 export interface GatewayDeps {
@@ -1375,6 +1398,58 @@ export class Gateway {
       return
     }
 
+    // v3 WeChat broker → 容器 inbound 通道(D3d:HMAC-derived nonce 鉴权)。
+    // master 侧 broker 经 docker bridge gateway 主动 POST 把 WeChat 收到的消息塞进
+    // 容器的 dispatchInbound() 路径,等价于"模拟一条 WS inbound.message"。
+    //
+    // 鉴权完全靠 checkInboundBypass —— **不接受任何 JWT / 旧 token,也不允许 host loopback**;
+    // env(OPENCLAUDE_TRUST_BRIDGE_IP/OC_CONTAINER_ID/OPENCLAUDE_INBOUND_NONCE)缺失 / 形态错
+    // 一律 false,fail-closed。401 时只回最小 JSON,不暴露原因(防 oracle)。
+    //
+    // 端点放到 needsAuth 块之前并提前 return —— 防 `/internal/*` 之类未来路由意外
+    // 被 needsAuth 漏判公开化(/internal/ 不在 needsAuth 当前的 prefix 列表里)。
+    if (url.pathname === '/internal/v3/wechat-inbound' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleWechatInbound(req, res).catch((err) => {
+        this.log.error('wechat-inbound handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    // 容器侧 WeChat inbound 补偿端点。master broker 的 inboundDispatcher Step 2
+    // 失败时调本端点撤销 Step 1 写入的 client_sessions row。
+    //
+    //   - 鉴权同 /wechat-inbound:走 checkInboundBypass(已支持 /internal/v3/* 前缀)
+    //   - **idempotent + always-200**:dispatcher 视任何 500 / 非-200 都为 "compensation
+    //     failed",而 reconcile 30s 才兜底。always-200 + `deleted` 字段把"行不存在 / 已
+    //     删 / 真删了"三种状态显式化,避免 dispatcher 把 idempotent no-op 错记成 error
+    //   - 真 DB 错也照 200 返(body 内带 errMessage 让 broker log 观测,但 dispatcher
+    //     不重试 — 重试同一条 compensation 也不会成,reconcile 会兜底清孤儿)
+    if (url.pathname === '/internal/v3/wechat-inbound-compensate' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleWechatInboundCompensate(req, res).catch((err) => {
+        this.log.error('wechat-inbound-compensate handler crashed', undefined, err)
+        if (!res.headersSent) {
+          // crash 路径也照 200 返 — dispatcher 永远不该 retry compensation
+          try { this.sendJson(res, 200, { ok: true, deleted: false, errMessage: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
     // Frontend diagnostic trace sink — receives ring-buffer events from
     // packages/web/public/modules/trace.js for diagnosing the "已读但无回复"
     // class of bug (assistant frame delivered by gateway but never landed in
@@ -2127,6 +2202,301 @@ export class Gateway {
     } catch {
       return false
     }
+  }
+
+  /**
+   * v3 WeChat broker → container inbound 通道(D3d HMAC 派生方案 B')。
+   *
+   * Master broker 通过 docker bridge gateway 主动 POST 到容器 gateway 的
+   * `/internal/v3/wechat-inbound`。**与 checkBridgeBypass 严格不同**:
+   *
+   *   | 维度          | bridge bypass(file proxy)    | inbound bypass(broker → 容器) |
+   *   | ------------- | ---------------------------- | --------------------------- |
+   *   | 方向          | host → 容器(file/media 反代)  | host broker → 容器           |
+   *   | path          | /api/file, /api/media/*       | /internal/v3/wechat-inbound  |
+   *   | method        | GET / HEAD                    | POST                         |
+   *   | nonce HMAC 域 | HMAC(s, containerId)           | HMAC(s, "inbound:" + cid)    |
+   *   | env           | OC_BRIDGE_NONCE(hex 64)        | OPENCLAUDE_INBOUND_NONCE(b64url 43)|
+   *   | header        | X-OpenClaude-Bridge-Nonce     | X-OpenClaude-Inbound-Nonce  |
+   *
+   * **故意编码不同**(hex vs base64url):env 名 / log / grep 一眼能区分两类 nonce,
+   * 避免任何"复用同一校验函数 / 同一 header"的捷径让两条通道粘合。Codex r4 note 2 明确
+   * 要求两条通道的 nonce 在 HMAC 输入域 + 编码上同时正交。
+   *
+   * TRUST_BRIDGE_IP / OC_CONTAINER_ID 与 file-proxy 共用;两个值同时缺/形态不对都直接
+   * 拒(同 healthz capability 广播逻辑,避免 healthz advertise 但 bypass 失败的哑锁)。
+   * 与 file-proxy 一样 fail-closed:env 缺一即恒 false。
+   */
+  private checkInboundBypass(req: IncomingMessage, url: URL): boolean {
+    const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
+    const OC_CONTAINER_ID = process.env.OC_CONTAINER_ID || ''
+    const INBOUND_NONCE = process.env.OPENCLAUDE_INBOUND_NONCE || ''
+    if (!TRUST_BRIDGE_IP || !OC_CONTAINER_ID || !INBOUND_NONCE) return false
+    if (!isIPv4(TRUST_BRIDGE_IP)) return false
+    if (!/^[1-9][0-9]{0,18}$/.test(OC_CONTAINER_ID)) return false
+    // base64url(32B) → 43 chars,无 padding,字符集 [A-Za-z0-9_-]
+    if (!/^[A-Za-z0-9_-]{43}$/.test(INBOUND_NONCE)) return false
+    const remoteIp = req.socket.remoteAddress || ''
+    if (remoteIp !== TRUST_BRIDGE_IP && remoteIp !== `::ffff:${TRUST_BRIDGE_IP}`) return false
+    if ((req.method || '') !== 'POST') return false
+    // Phase 1 只用一个端点,但前缀放开方便后续 broker → 容器扩控制面(notify-user 等)。
+    // 任何不以 /internal/v3/ 开头的路径直接拒,确保 bypass 不会泄到其它路由。
+    if (!url.pathname.startsWith('/internal/v3/')) return false
+    const hdrId = String(req.headers['x-openclaude-container-id'] ?? '').trim()
+    if (hdrId !== OC_CONTAINER_ID) return false
+    const hdrNonce = String(req.headers['x-openclaude-inbound-nonce'] ?? '').trim()
+    if (!/^[A-Za-z0-9_-]{43}$/.test(hdrNonce)) return false
+    if (hdrNonce.length !== INBOUND_NONCE.length) return false
+    try {
+      return timingSafeEqual(
+        Buffer.from(hdrNonce, 'base64url'),
+        Buffer.from(INBOUND_NONCE, 'base64url'),
+      )
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * v3 WeChat broker → 容器 dispatchInbound 桥。
+   *
+   * 调用前必须先过 checkInboundBypass(在 route 入口处已校验)。这里负责:
+   *  1. 读 body(256KB 上限,与 internalServerAuthored 对齐;wechat 单消息远小于此,
+   *     但 attachments 可能拼大;给个稳妥上限)
+   *  2. 轻量手写 schema 校验(gateway 没 zod 依赖,不为单条路由引入新 dep)
+   *  3. 构造 InboundFrame 直接喂 this.dispatchInbound —— 复用 line 5181-5190
+   *     lazy-session 路径(channel='wechat',peer.id 由 broker 解析为 client_sessions.id,
+   *     即 RFC v4 中 sessionPointer.current_session_id)。**不要走** inbound.hello/
+   *     inbound.bind 任何模板 —— 那些是 WS-only 控制帧,跟 HTTP inbound 无关。
+   *  4. 200 回 { ok, sessionKey };400/413 严守语义,broker outbox 端可按 status
+   *     class 决定 fatal vs retry(参见 wechat-broker-design.md §4.8)
+   *
+   * **trust 模型**:body.userId 由 broker 自行决定(它持有 wechat_bindings 行),
+   * 容器层不再二次校验 c:NN 跟容器 owner 的对齐 —— 容器只服务一个用户,broker 错配
+   * 整段消息走错容器属于上游路由 bug,跟 dispatchInbound 收到一条 WS frame 信任
+   * _userId 是同一信任模型(checkInboundBypass 已确认 caller = master broker)。
+   */
+  private async handleWechatInbound(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const MAX_INBOUND_BODY = 256 * 1024
+    let raw: string
+    try {
+      raw = await this.readBody(req, MAX_INBOUND_BODY)
+    } catch (err) {
+      const tooLarge = String((err as Error)?.message ?? err).includes('body too large')
+      this.sendJson(res, tooLarge ? 413 : 400, { error: tooLarge ? 'body too large' : 'read failed' })
+      return
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      this.sendJson(res, 400, { error: 'invalid json' })
+      return
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      this.sendJson(res, 400, { error: 'body must be a JSON object' })
+      return
+    }
+    const body = parsed as Record<string, unknown>
+
+    // ── Schema validation(手写,精度等价 zod minimum,但零 dep)──
+    const userId = body.userId
+    if (typeof userId !== 'string' || !/^c:[1-9][0-9]{0,18}$/.test(userId)) {
+      this.sendJson(res, 400, { error: 'userId must match c:<uid>' })
+      return
+    }
+    const peerRaw = body.peer as Record<string, unknown> | undefined
+    if (!peerRaw || typeof peerRaw !== 'object') {
+      this.sendJson(res, 400, { error: 'peer required' })
+      return
+    }
+    const peerKind = peerRaw.kind
+    const peerId = peerRaw.id
+    // Phase 1 只支持 DM。group 留给 future phase(WeChat group bot 是另一套 API)。
+    if (peerKind !== 'dm') {
+      this.sendJson(res, 400, { error: 'peer.kind must be dm in P1' })
+      return
+    }
+    if (typeof peerId !== 'string' || peerId.length === 0 || peerId.length > 256) {
+      this.sendJson(res, 400, { error: 'peer.id required (1..256 chars)' })
+      return
+    }
+    const peerDisplayName = peerRaw.displayName
+    if (peerDisplayName !== undefined && (typeof peerDisplayName !== 'string' || peerDisplayName.length > 256)) {
+      this.sendJson(res, 400, { error: 'peer.displayName must be string ≤256' })
+      return
+    }
+    const agentId = body.agentId
+    if (agentId !== undefined && (typeof agentId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(agentId))) {
+      this.sendJson(res, 400, { error: 'agentId charset/length invalid' })
+      return
+    }
+    const contentRaw = body.content as Record<string, unknown> | undefined
+    if (!contentRaw || typeof contentRaw !== 'object') {
+      this.sendJson(res, 400, { error: 'content required' })
+      return
+    }
+    const text = contentRaw.text
+    if (typeof text !== 'string') {
+      this.sendJson(res, 400, { error: 'content.text required (P1 text-only)' })
+      return
+    }
+    // 单条 text 上限:与 protocol 默认一致(_capToolEntry 类似 64 KB UTF-8 budget),
+    // 但 inbound 是用户消息,容许大点(WeChat 长截图描述 / 用户粘贴);256KB body
+    // cap 已经是硬上限,这里只做 schema-level 防御。
+    if (text.length > 65536) {
+      this.sendJson(res, 400, { error: 'content.text too long (>65536 chars)' })
+      return
+    }
+    const idempotencyKey = body.idempotencyKey
+    if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0 || idempotencyKey.length > 128) {
+      this.sendJson(res, 400, { error: 'idempotencyKey required (1..128 chars)' })
+      return
+    }
+    const tsRaw = body.ts
+    let ts: number
+    if (tsRaw === undefined) {
+      ts = Date.now()
+    } else if (typeof tsRaw === 'number' && Number.isFinite(tsRaw) && tsRaw >= 0 && tsRaw <= Number.MAX_SAFE_INTEGER) {
+      ts = Math.floor(tsRaw)
+    } else {
+      this.sendJson(res, 400, { error: 'ts must be non-negative finite number' })
+      return
+    }
+
+    // ── 构造 InboundFrame 并喂 dispatchInbound ──
+    // 不模拟 inbound.hello / inbound.bind 任何控制帧,直接命中 line 5181-5190
+    // lazy-session 路径。peer.id === sessionId(broker 保证),sessionKey 由
+    // dispatchInbound 用 agent.id+channel+peer.kind+peer.id 派生 —— 跟 webchat
+    // 路径完全同形,sessionManager.handleResult 处的 client_sessions 写回路径自然命中
+    // (channel='wechat' 由 P1.4 sink gate 放行)。
+    const peerOut: { kind: 'dm'; id: string; displayName?: string } = {
+      kind: 'dm',
+      id: peerId,
+    }
+    if (typeof peerDisplayName === 'string') peerOut.displayName = peerDisplayName
+    const frame = {
+      type: 'inbound.message' as const,
+      idempotencyKey,
+      channel: 'wechat',
+      peer: peerOut,
+      ...(typeof agentId === 'string' ? { agentId } : {}),
+      content: { text },
+      ts,
+    }
+    // _userId 私有 stash,与 WS path(line 4163)同语义:dispatchInbound 内部读
+    // (frame as any)._userId 决定 peerKey 命名空间和 client_sessions 归属。
+    ;(frame as any)._userId = userId
+
+    // V3 broker → 容器 outbound 回路。
+    //
+    // dispatchInbound 不带 adapter 会走 WS 广播路径(server.ts deliver() line 6314+),
+    // 但容器侧没有 WS 客户端订阅这条 wechat peerKey,assistant 帧只会落进
+    // outboundRing 等到永不发生的 hello-resume —— master 这边却收到 200,
+    // broker retry queue 不会兜底 → assistant 静默丢失。
+    //
+    // 显式查 v3-wechat-outbound adapter 把 outbound 出口绑死;adapter 在容器进程
+    // 装配时由 cli/gateway.ts 注册(env OPENCLAUDE_V3_MASTER_BASE_URL +
+    // OPENCLAUDE_V3_CONTAINER_TOKEN 同时存在),adapter.send 通过
+    // POST /internal/v3/wechat-outbound 回送到 master broker。
+    //
+    // adapter 缺失 = 容器装配错误,broker 不该 POST 到没装 adapter 的容器:
+    // 503 fail-closed 让 broker retry queue 视为 transient + 让运维看 log 找到
+    // "adapter not registered"。不修改 dispatchInbound 通用行为,其他 channel 不受影响。
+    const v3OutboundAdapter = this.channels.get('v3-wechat-outbound')
+    if (!v3OutboundAdapter) {
+      this.log.error(
+        'handleWechatInbound: v3-wechat-outbound adapter not registered; refusing dispatch',
+        { userId, peerId, idempotencyKey },
+      )
+      this.sendJson(res, 503, {
+        error: {
+          code: 'V3_WECHAT_OUTBOUND_NOT_WIRED',
+          message: 'container missing v3-wechat-outbound adapter; outbound cannot return to master',
+        },
+      })
+      return
+    }
+    await this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter)
+
+    // sessionKey 派生(与 server.ts:5185 一致)便于 broker 关联 log / metric。
+    const safePeerId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
+    const sessionKey =
+      typeof agentId === 'string'
+        ? `agent:${agentId}:wechat:dm:${safePeerId}`
+        : null
+    this.sendJson(res, 200, {
+      ok: true,
+      ...(sessionKey ? { sessionKey } : {}),
+    })
+  }
+
+  /**
+   * v3 WeChat broker → 容器 inbound 补偿端点。
+   *
+   * 调用前已过 checkInboundBypass(在 route 入口处校验);body 是 dispatcher
+   * tryCompensation 构造的 `{sessionId, bindingUserId, reason, traceId?}` JSON。
+   *
+   * **idempotent + always-200**:
+   *   - 行存在且未 soft-deleted → 调 deleteClientSession,200 `{ok:true, deleted:true}`
+   *   - 行已 soft-deleted / 不存在 / 跨 tenant userId mismatch → 200 `{ok:true, deleted:false}`
+   *   - schema 错 → 400(语义是 caller 出错,不是 compensation 失败 — 跟 idempotent 语义不冲突)
+   *   - body 过大 → 413(同 handleWechatInbound 风格)
+   *   - DB 异常 → 200 `{ok:true, deleted:false, errMessage}`(dispatcher 不该 retry 同条
+   *     compensation;reconcile 30s 兜底)
+   *
+   * `userId` 通过 `c:` + `bindingUserId` 派生,与 master sqlite Step 2a 写入的
+   * `MASTER_USER_PREFIX + bindingUserId` 字节级一致 — deleteClientSession 内部的
+   * `WHERE id=? AND user_id=?` 自带 tenant scope 防御。
+   */
+  private async handleWechatInboundCompensate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const MAX_COMPENSATE_BODY = 8 * 1024
+    let raw: string
+    try {
+      raw = await this.readBody(req, MAX_COMPENSATE_BODY)
+    } catch (err) {
+      const tooLarge = String((err as Error)?.message ?? err).includes('body too large')
+      this.sendJson(res, tooLarge ? 413 : 400, { error: tooLarge ? 'body too large' : 'read failed' })
+      return
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      this.sendJson(res, 400, { error: 'invalid json' })
+      return
+    }
+
+    const v = validateWechatInboundCompensateBody(parsed)
+    if (!v.ok) {
+      this.sendJson(res, 400, { error: v.error })
+      return
+    }
+    const { sessionId, bindingUserId, reason, traceId } = v.payload
+
+    const userId = `c:${bindingUserId}`
+    let deleted = false
+    let errMessage: string | undefined
+    try {
+      deleted = await deleteClientSession(sessionId, userId)
+    } catch (err) {
+      errMessage = (err as Error)?.message ?? String(err)
+      this.log.error('wechat-inbound-compensate db error', { sessionId, userId, reason, traceId, errMessage })
+    }
+
+    this.log.info('wechat-inbound-compensate', {
+      sessionId,
+      userId,
+      reason,
+      ...(traceId ? { traceId } : {}),
+      deleted,
+      ...(errMessage ? { errMessage } : {}),
+    })
+    this.sendJson(res, 200, {
+      ok: true,
+      deleted,
+      ...(errMessage ? { errMessage } : {}),
+    })
   }
 
   /**
@@ -6457,6 +6827,75 @@ export const FILE_BLOCKED_PATTERNS = [
 /** Returns true if the resolved path matches any sensitive-file pattern. */
 export function isFileBlocked(resolvedPath: string): boolean {
   return FILE_BLOCKED_PATTERNS.some((p) => p.test(resolvedPath))
+}
+
+// ── v3 WeChat broker inbound-compensate payload validation ──
+// Pure validator used by handleWechatInboundCompensate (line ~2399). Exposed
+// for unit testing without standing up a full Gateway. Returns either the
+// typed payload or the 400-error string the route surfaces back to the
+// broker dispatcher.
+
+/** Shape of `/internal/v3/wechat-inbound-compensate` JSON body after validation. */
+export interface WechatInboundCompensatePayload {
+  /** `wsess-[0-9a-f]{16}` — broker-owned client_sessions row id from Step 2a write. */
+  sessionId: string
+  /** Decimal string of `wechat_bindings.user_id`. Container derives `c:<id>` for tenant scope. */
+  bindingUserId: string
+  /** Which dispatcher step failed; reason gets logged but doesn't affect deletion semantics. */
+  reason: 'step2a_failed' | 'step2b_failed'
+  /** Optional broker-side trace id (≤64 chars). */
+  traceId?: string
+}
+
+export type WechatInboundCompensateValidation =
+  | { ok: true; payload: WechatInboundCompensatePayload }
+  | { ok: false; error: string }
+
+const COMPENSATE_SESSION_ID_RE = /^wsess-[0-9a-f]{16}$/
+const COMPENSATE_BINDING_USER_ID_RE = /^[1-9][0-9]{0,18}$/
+const COMPENSATE_TRACE_ID_MAX_LEN = 64
+
+/**
+ * Validate a parsed `wechat-inbound-compensate` body. Caller is responsible
+ * for `JSON.parse` + body-size cap upstream — this function only deals with
+ * a `unknown` value that resulted from successful parse.
+ *
+ * Error strings are stable: `handleWechatInboundCompensate` returns them
+ * verbatim to the broker, so changing wording is a contract change.
+ */
+export function validateWechatInboundCompensateBody(
+  parsed: unknown,
+): WechatInboundCompensateValidation {
+  if (!parsed || typeof parsed !== 'object') {
+    return { ok: false, error: 'body must be a JSON object' }
+  }
+  const body = parsed as Record<string, unknown>
+  const sessionId = body.sessionId
+  if (typeof sessionId !== 'string' || !COMPENSATE_SESSION_ID_RE.test(sessionId)) {
+    return { ok: false, error: 'sessionId must match wsess-[0-9a-f]{16}' }
+  }
+  const bindingUserId = body.bindingUserId
+  if (typeof bindingUserId !== 'string' || !COMPENSATE_BINDING_USER_ID_RE.test(bindingUserId)) {
+    return { ok: false, error: 'bindingUserId must be a positive integer string' }
+  }
+  const reason = body.reason
+  if (reason !== 'step2a_failed' && reason !== 'step2b_failed') {
+    return { ok: false, error: "reason must be 'step2a_failed' or 'step2b_failed'" }
+  }
+  // traceId 可选;cap 64 chars 防 log 注入膨胀
+  const traceId = body.traceId
+  if (traceId !== undefined && (typeof traceId !== 'string' || traceId.length > COMPENSATE_TRACE_ID_MAX_LEN)) {
+    return { ok: false, error: 'traceId must be string ≤64' }
+  }
+  return {
+    ok: true,
+    payload: {
+      sessionId,
+      bindingUserId,
+      reason,
+      ...(traceId !== undefined ? { traceId: traceId as string } : {}),
+    },
+  }
 }
 
 // ── Upload constants — single source of truth ──
