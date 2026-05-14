@@ -5050,6 +5050,49 @@ a:hover {
   color: var(--fg);
 }
 
+/* 二维码下方的手机端付款指引 — 醒目 accent 卡片。
+   背景:很大一部分付款失败是手机用户落到桌面 QR 分支(UA 未匹配 _isMobileUA
+   regex,例如 HarmonyOS / 横屏平板 / 桌面浏览器假装 desktop 实际人在手机)。
+   同一台手机上浏览器+微信无法互相扫码,用户不知道要"保存图片→微信扫一扫
+   →相册"的路径就放弃。这块比之前那行灰色小字提示明显得多,见 boss 2026-05
+   关于充值漏斗的反馈。 */
+.topup-pay-guide {
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  background: color-mix(in srgb, var(--accent, #7c3aed) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent, #7c3aed) 30%, transparent);
+  border-left: 3px solid var(--accent, #7c3aed);
+  border-radius: var(--radius-md);
+}
+.topup-pay-guide-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-sm);
+  font-weight: 700;
+  color: var(--fg);
+  margin-bottom: var(--space-2);
+}
+.topup-pay-guide-badge { font-size: 16px; }
+.topup-pay-guide-steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: var(--text-sm);
+  color: var(--fg);
+  line-height: 1.6;
+}
+.topup-pay-guide-steps li { margin-bottom: 2px; }
+.topup-pay-guide-steps li strong {
+  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
+}
+.topup-pay-guide-desktop {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px dashed color-mix(in srgb, var(--accent, #7c3aed) 25%, transparent);
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
+
 /* ─── V3 commercial: user preferences modal (Phase 4C) ─── */
 
 /* 修复 .form-row input { width:100%; min-height:44px; ... } 对 checkbox/radio 的污染。

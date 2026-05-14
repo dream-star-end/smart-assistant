@@ -1204,7 +1204,18 @@
             <div id="topup-expiry" class="topup-expiry"></div>
           </div>
         </div>
-        <p style="color:var(--fg-muted);font-size:var(--text-xs);margin:var(--space-3) 0 0">提示:用微信扫描二维码后完成支付,本页面会自动刷新到账状态。</p>
+        <div class="topup-pay-guide">
+          <div class="topup-pay-guide-title">
+            <span class="topup-pay-guide-badge">📱</span>
+            如果你在手机上看到二维码
+          </div>
+          <ol class="topup-pay-guide-steps">
+            <li><strong>长按二维码</strong>保存到相册(或截图)</li>
+            <li>打开 <strong>微信</strong> → 右上角「+」→ <strong>扫一扫</strong></li>
+            <li>点击右下角 <strong>「相册」</strong> → 选中刚保存的图片完成付款</li>
+          </ol>
+          <div class="topup-pay-guide-desktop">💻 桌面端:用手机微信「扫一扫」屏幕上的二维码即可,付款后本页自动刷新到账状态</div>
+        </div>
       </div>
       <!-- Stage C: 完成 -->
       <div id="topup-stage-done" hidden>
