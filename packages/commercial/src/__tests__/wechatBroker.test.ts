@@ -546,6 +546,96 @@ describe("wechatBroker — onInbound", () => {
     }
   })
 
+  // ── bindingUserId 归一(commercial canonical `c:N` → dispatcher raw `N`) ──
+  //
+  // 这条契约的两侧:
+  //   - dispatcher 期待 raw digit(BigInt() + MASTER_USER_PREFIX + bindingUserId
+  //     的内部使用、gateway compensate handler 的 ^[1-9][0-9]{0,18}$ regex)
+  //   - reflection 经 getBinding 查 master sqlite wechat_bindings.user_id,
+  //     该列 v3 commercial 存 `c:N` canonical 形式
+  //
+  // broker 在 onInbound 中做翻译:dispatch 路径用 raw,reflection 路径用 canonical。
+  // 这俩测试同时锁住这两边契约,任何一边走样都会触发。
+  test("bindingUserId 归一:'c:1' → dispatcher 收到 '1',reflection getBinding 收到 'c:1'", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    // dispatcher 命令短路 → 走 command_echo,触发 reflection 路径
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "command_echo",
+      reply: "echo",
+    })
+    const { getBinding, spy: getBindingSpy } = makeGetBinding({
+      botToken: "tok",
+      contextTokens: { "wx-sender-1": "ctx-1" },
+    })
+    const broker = makeWechatBroker(
+      makeDeps({ dispatcher, sendText, getBinding }),
+    )
+    const r = await broker.onInbound(makeEvent({ bindingUserId: "c:1" }))
+    assert.equal(r.kind, "command_echo")
+    await flushMicrotasks()
+    // dispatcher 看到的是 normalized raw digit
+    assert.equal(dispSpy.calls.length, 1)
+    assert.equal(
+      dispSpy.calls[0]!.bindingUserId,
+      "1",
+      "dispatcher 必须收到 raw digit(c: 前缀被 broker 剥掉)",
+    )
+    // reflection 看到的是 canonical c:N(用于 sqlite getBinding 主键)
+    assert.deepEqual(
+      getBindingSpy.calls,
+      ["c:1"],
+      "getBinding 必须收到 commercial canonical 形式(c:1),与 wechat_bindings.user_id 主键对齐",
+    )
+    // 反射 sendText 走出去
+    assert.equal(sendSpy.calls.length, 1)
+  })
+
+  test("bindingUserId 归一:裸 '42'(无 c: 前缀)幂等透传给 dispatcher 和 reflection", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "command_echo",
+      reply: "echo",
+    })
+    const { getBinding, spy: getBindingSpy } = makeGetBinding({
+      botToken: "tok",
+      contextTokens: { "wx-sender-1": "ctx-1" },
+    })
+    const broker = makeWechatBroker(
+      makeDeps({ dispatcher, sendText, getBinding }),
+    )
+    const r = await broker.onInbound(makeEvent({ bindingUserId: "42" }))
+    assert.equal(r.kind, "command_echo")
+    await flushMicrotasks()
+    assert.equal(dispSpy.calls[0]!.bindingUserId, "42", "无前缀输入幂等")
+    assert.deepEqual(
+      getBindingSpy.calls,
+      ["42"],
+      "无前缀输入下 reflection 也传 raw digit(测试 fixture / personal-OC 历史路径)",
+    )
+    assert.equal(sendSpy.calls.length, 1)
+  })
+
+  test("bindingUserId 非法形式(如 'c:abc')→ broker_failed,dispatcher 不被触", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "command_echo",
+      reply: "echo",
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher }))
+    const r = await broker.onInbound(makeEvent({ bindingUserId: "c:abc" }))
+    assert.equal(r.kind, "broker_failed")
+    if (r.kind === "broker_failed") {
+      assert.ok(
+        r.errMessage.includes("invalid bindingUserId"),
+        "errMessage 应明确指向非法 bindingUserId",
+      )
+    }
+    assert.equal(
+      dispSpy.calls.length,
+      0,
+      "非法形式必须在 broker 入口拦截,不能让 dispatcher BigInt() 抛",
+    )
+  })
+
   test("dispatcher → dispatched outcome 透传,不触 sendText", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher } = makeDispatcher({

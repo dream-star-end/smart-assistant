@@ -65,6 +65,43 @@ const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
 /** Housekeeping 周期默认值。RFC §4.6 + outboxWorker.runHousekeeping。 */
 const DEFAULT_HOUSEKEEPING_INTERVAL_MS = 5 * 60 * 1000
 
+/**
+ * v3 commercial canonical user id 接受形式:`c:<digit>` 或裸 `<digit>`。
+ * - `c:<digit>`     — 生产路径(wechat_bindings.user_id / JWT identity / master sqlite
+ *                    client_sessions.user_id 全是这个形式)
+ * - `<digit>`       — 测试 fixture / 历史 personal-OC 路径 / 已归一化的输入(幂等)
+ *
+ * 任何其他形式视为非法。`c:abc` 会在这里被 reject,而不是被推迟到 dispatcher
+ * `BigInt()` 抛出 — broker 层 log 直接看到原值,可观测性更好(Codex r-pass 建议)。
+ */
+const COMMERCIAL_BINDING_USER_ID_RE = /^(c:)?[1-9][0-9]{0,18}$/
+
+/**
+ * 把 commercial canonical user id 归一为 dispatcher 契约要求的 raw digit。
+ *
+ * **为什么 broker 层做归一**:
+ * - channels-wechat 是 generic 包,personal-OC 也复用,不能感知 `c:` 这种
+ *   commercial-only 约定 → 不在 manager 侧剥
+ * - dispatcher / gateway wechat-inbound-compensate handler 的 wire 契约都是
+ *   raw digit(`COMPENSATE_BINDING_USER_ID_RE = /^[1-9][0-9]{0,18}$/`、
+ *   `BigInt(evt.bindingUserId)`、`MASTER_USER_PREFIX + evt.bindingUserId`)
+ *   → 不在 dispatcher 改契约,因为那要连测试 + gateway compensate handler 一起改
+ * - broker 是 commercial-specific 层,在这里翻译"外部 canonical → 内部 raw"
+ *   是最清晰的层级边界
+ *
+ * **不归一的路径**:reflection 经 `deps.getBinding(evt.bindingUserId)` 查
+ * master sqlite `wechat_bindings.user_id`(主键存的是 `c:<digit>` canonical 形式)
+ * — 反射继续用原始 evt,**只有 dispatch 路径**用归一后的 raw digit。
+ */
+function normalizeDispatcherBindingUserId(input: string): string {
+  if (!COMMERCIAL_BINDING_USER_ID_RE.test(input)) {
+    throw new Error(
+      `invalid bindingUserId: ${JSON.stringify(input)}; expected "c:<digit>" or raw digit`,
+    )
+  }
+  return input.startsWith("c:") ? input.slice(2) : input
+}
+
 // ─── 公开类型 ──────────────────────────────────────────────────────────────
 
 /**
@@ -244,9 +281,30 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     if (!isEnabled()) {
       return { kind: "broker_disabled", reason: "feature_flag_off" }
     }
+    // 归一 bindingUserId → dispatcher 契约的 raw digit。
+    // 见模块上方 normalizeDispatcherBindingUserId 的注释:reflection 路径继续用
+    // 原始 evt(canonical `c:<digit>` 形式,匹配 sqlite getBinding 主键),只有
+    // dispatch 路径走归一形式。
+    let dispatchBindingUserId: string
+    try {
+      dispatchBindingUserId = normalizeDispatcherBindingUserId(evt.bindingUserId)
+    } catch (err) {
+      const errMessage = (err as Error)?.message ?? String(err)
+      log.error("invalid_binding_user_id", {
+        bindingUserId: evt.bindingUserId,
+        idempotencyKey: evt.idempotencyKey,
+        errMessage,
+      })
+      return { kind: "broker_failed", errMessage }
+    }
+    const dispatchEvt: InboundEvent =
+      dispatchBindingUserId === evt.bindingUserId
+        ? evt
+        : { ...evt, bindingUserId: dispatchBindingUserId }
+
     let outcome: DispatchOutcome
     try {
-      outcome = await deps.dispatcher.dispatch(evt)
+      outcome = await deps.dispatcher.dispatch(dispatchEvt)
     } catch (err) {
       const errMessage = (err as Error)?.message ?? String(err)
       log.error("dispatcher_threw", {
