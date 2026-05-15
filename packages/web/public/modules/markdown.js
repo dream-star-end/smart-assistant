@@ -393,12 +393,17 @@ export function _renderLocalMedia(filePath) {
     const srcAttr = cached ? ` src="${htmlSafeEscape(cached)}"` : ''
     return `<div class="media-wrap"><video class="inline-video" controls preload="metadata"${srcAttr} data-pending-sign-path="${safePending}" data-sign-target="src"></video><div class="media-filename">${safeName}</div></div>`
   }
+  // 容器内文件(包括 PDF)统一走"当前页 attachment 下载",不开新 tab —
+  // 1. target="_blank" 在异步签名 await 后丢失 user gesture,被 popup blocker 拦
+  // 2. 当前页 + Content-Disposition: attachment(下面 download attr 同源强制覆盖
+  //    服务端的 inline)→ 浏览器原生下载 dialog,不离开对话页,WS / 输入框状态全保留
+  // 这两条让 PDF 跟 tar.gz 体验一致:点 → 下载到本地 → 系统 PDF viewer 打开
   if (_PDF_EXTS.test(filePath)) {
     const hrefAttr = cached ? ` href="${htmlSafeEscape(cached)}"` : ''
-    return `<a class="doc-card"${hrefAttr} target="_blank" rel="noopener" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📄</span><span class="doc-card-name">${safeName}</span></a>`
+    return `<a class="doc-card"${hrefAttr} rel="noopener" download="${safeName}" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📄</span><span class="doc-card-name">${safeName}</span></a>`
   }
   const hrefAttr = cached ? ` href="${htmlSafeEscape(cached)}"` : ''
-  return `<a class="doc-card"${hrefAttr} target="_blank" rel="noopener" download="${safeName}" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📎</span><span class="doc-card-name">${safeName}</span></a>`
+  return `<a class="doc-card"${hrefAttr} rel="noopener" download="${safeName}" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📎</span><span class="doc-card-name">${safeName}</span></a>`
 }
 
 export function embedMediaUrls(html) {
@@ -434,7 +439,7 @@ export function embedMediaUrls(html) {
   // Match bare absolute paths: /path/file.ext or C:\path\file.ext
   html = html.replace(
     new RegExp(
-      `((?:^|[\\s>])((?:(?:/|[A-Za-z]:[\\\\\\\\])[^\\s<"\'\`>]+?\\.(?:${_MEDIA_EXTS}))))`,
+      `((?:^|[\\s>])((?:(?:/|[A-Za-z]:[\\\\\\\\])[^\\s<"\'\`>]+\\.(?:${_MEDIA_EXTS}))))`,
       'gi',
     ),
     (match, full, filePath, offset) => {
@@ -458,7 +463,11 @@ export function embedMediaUrls(html) {
   // 名单也会拦,但前端不显示成链接更干净。
   // <code> 包裹的路径同样由 step 1 的 <code> 分支只处理媒体,这里再加 <code> 版本
   // 的 fallback 保持两条分支一致。
-  const _PUB_PREFIX = '(?:/home/agent|/root)/\\.openclaude/[^\\s<"\'`>]+?\\.[A-Za-z0-9]{1,10}'
+  // 贪婪 `+` 配合后面 `\.\w{1,10}` 的回溯能正确覆盖多 dot 文件名(.tar.gz / .v2.txt
+  // / .json.bak / .d.ts 等):贪婪先吃整段,回溯让最右边的 `. + 短串` 满足扩展名。
+  // **不要**改回非贪婪 `+?` —— 那会停在第一个扩展名:research_v7.2_20260515.tar.gz
+  // 被截到 research_v7.2,后半段漂出 anchor,渲染坏链。
+  const _PUB_PREFIX = '(?:/home/agent|/root)/\\.openclaude/[^\\s<"\'`>]+\\.[A-Za-z0-9]{1,10}'
   html = html.replace(new RegExp(`<code>(${_PUB_PREFIX})</code>`, 'g'), (match, rawPath) => {
     const filePath = rawPath
       .replace(/&amp;/g, '&')

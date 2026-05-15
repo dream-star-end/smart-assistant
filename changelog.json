@@ -1,4 +1,14 @@
 {
-  "currentVersion": "v1.0.147",
-  "releases": []
+  "currentVersion": "v1.0.148",
+  "releases": [
+    {
+      "version": "PENDING",
+      "date": "",
+      "title": "对话体验优化",
+      "items": [
+        "AI 生成的文件现在可以直接点击下载,支持 PDF、压缩包等各种格式",
+        "长思考任务的状态提示更友好,等待过程不再显示警告样式"
+      ]
+    }
+  ]
 }

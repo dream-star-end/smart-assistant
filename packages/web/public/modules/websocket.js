@@ -259,8 +259,12 @@ const _notifSound = (() => {
 })()
 
 // ═══════════════ TYPING INDICATOR ═══════════════
-const STALE_WARN_MS = 60_000   // Show warning after 60s without any frame
-const STALE_DANGER_MS = 180_000 // Show "likely stuck" after 3 min
+// Long-thinking thresholds. We can't distinguish "truly stuck" from "deep
+// reasoning with no streamed tokens yet" at the WS layer, so the label is
+// always positive/neutral. Real stuckness is caught by THINKING_SAFETY_MS
+// (10min) and gateway idle timeout.
+const STALE_WARN_MS = 90_000    // Switch to "深度思考中" after 90s
+const STALE_DANGER_MS = 300_000 // Switch to "处理时间较长,仍在思考中" after 5min
 
 // Per-session frame tracking (stored on sess object: sess._lastFrameAt, sess._turnStartedAt)
 export function markFrameReceived(sess) {
@@ -313,15 +317,20 @@ export function showTypingIndicator() {
     const label = el.querySelector('.typing-label')
     if (!label) return
     const silenceMs = Date.now() - lastFrame
-    // stale-warn / stale-danger 时不带 cold-hint(信息已饱和,再加冗长后缀只会噪声)。
-    // 仅 "正常思考中" 文案保留 hint —— 这是 cold-start 起首几秒最需要的窗口。
+    // 长思考态(stale-warn / stale-danger)不拼 cold-hint —— 信息已饱和,
+    // 再加冗长后缀只会噪声。hint 仅在 "正常思考中" 文案出现。
     const hint = _coldHintSuffix(_sess)
+    // 文案中性化(不再"可能已卡住"红字),但保留"无新数据时长"诊断指标 ——
+    // tool-use 5-10min 静默时 silence 数值是用户判断"真在工作 vs 真断流"的
+    // 唯一前端线索,删了就只能等 gateway idle timeout 兜底,诊断盲区太长。
     if (silenceMs >= STALE_DANGER_MS) {
-      label.textContent = `${name} 可能已卡住 (${secs}s · 已 ${Math.round(silenceMs / 1000)}s 无响应)`
+      const sil = Math.round(silenceMs / 1000)
+      label.textContent = `${name} 处理时间较长,仍在思考中 (${secs}s · ${sil}s 无新数据)`
       el.classList.add('stale-danger')
       el.classList.remove('stale-warn')
     } else if (silenceMs >= STALE_WARN_MS) {
-      label.textContent = `${name} 思考中 (${secs}s · ${Math.round(silenceMs / 1000)}s 无新数据)`
+      const sil = Math.round(silenceMs / 1000)
+      label.textContent = `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`
       el.classList.add('stale-warn')
       el.classList.remove('stale-danger')
     } else if (secs >= 5) {
@@ -1840,9 +1849,9 @@ export function handleOutbound(frame) {
     state._reconnectInFlightSet.delete(sess.id)
   }
   // NOTE: typing indicator stays visible throughout the whole turn (only hidden on isFinal
-  // below). This lets staleness detection kick in during mid-stream stalls — e.g. when the
-  // model emits an initial thinking/tool_use/text block and then goes silent for minutes,
-  // the indicator shows a "N秒无新数据" warning instead of the UI appearing to be working.
+  // below). This lets the long-thinking label kick in during mid-stream stalls — e.g. when
+  // the model emits an initial thinking/tool_use/text block and then goes silent for minutes,
+  // the indicator switches to "深度思考中" / "处理时间较长,仍在思考中" instead of looking idle.
   // Update user message status: find the most recent user msg in THIS session
   // that is still pending (sent/read but not replied). Only update one msg per turn.
   // Also track a per-turn content-block counter so we can detect "empty turn"
@@ -2777,7 +2786,7 @@ function handleColdStart(_frame) {
   if (!el) return
   const label = el.querySelector('.typing-label')
   if (!label) return
-  // 已渲染情况下 stale-warn / stale-danger 已带统计后缀,不打扰;只有正常状态才覆盖。
+  // 已进入长思考态(stale-warn / stale-danger)时文案已有自己的语义,不再叠 cold-hint。
   if (el.classList.contains('stale-warn') || el.classList.contains('stale-danger')) return
   const agentInfo = state.agentsList.find((a) => a.id === (sess.agentId || state.defaultAgentId))
   const name = agentInfo?.displayName || sess.agentId || 'AI'

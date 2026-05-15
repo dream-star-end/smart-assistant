@@ -80,7 +80,10 @@ const TEMPLATE_DYNAMIC_EXPANSIONS: Record<string, readonly string[]> = {
   'tasks-tab-': ['cron', 'bg', 'log'],
   // V3 Phase 4A 多模态认证: $(`auth-mode-${m}`) / $(`auth-tab-${m}`)
   'auth-mode-': ['login', 'register', 'forgot', 'reset', 'verify'],
-  'auth-tab-': ['login', 'register', 'forgot'],
+  // login 是 default view,不存在独立 auth-tab-login 入口(auth.js:428 的
+  // `$('auth-tab-login')?.addEventListener(...)` 用 optional chain 保护,是
+  // 历史死代码 — 仅 register/forgot 是切换目标)
+  'auth-tab-': ['register', 'forgot'],
   // V3 Phase 4B 充值 + 微信:三段式 stage / 三态 wechat-state
   'topup-stage-': ['plans', 'qr', 'done'],
   'wechat-state-': ['unbound', 'pairing', 'bound'],
@@ -185,7 +188,6 @@ describe('T04: Critical IDs always present', () => {
     'auth-login-email',
     'auth-login-password',
     'auth-login-btn',
-    'auth-tab-login',
     'auth-tab-register',
     'sidebar',
     'messages',

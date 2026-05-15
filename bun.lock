@@ -74,7 +74,9 @@
       "version": "0.1.0",
       "dependencies": {
         "@google-cloud/storage": "^7.19.0",
+        "@openclaude/channel-wechat": "*",
         "@openclaude/gateway": "*",
+        "@openclaude/protocol": "*",
         "@openclaude/storage": "*",
         "argon2": "^0.44.0",
         "dockerode": "^4.0.10",

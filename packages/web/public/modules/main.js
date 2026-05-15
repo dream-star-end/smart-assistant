@@ -717,6 +717,45 @@ document.addEventListener('click', (e) => {
   }
 })
 
+// ── doc-card 点击 race 拦截 ──
+// 容器文件 doc-card 走异步签名(markdown.js _renderLocalMedia + main.js
+// _resolveSignTarget)。卡片刚渲染时 href 还没填,用户秒点会"无反应"。
+// 这里在 capture 阶段拦截:未 resolved 时阻止默认 + await 签名 → 写回 card.href
+// → 再 .click() 触发一次同步事件,第二次进 handler 命中 resolved 分支放行,走
+// native anchor navigation(`<a download>` same-origin 强制下载,无 popup blocker
+// 顾虑因为这是 current-page navigation 不开新 tab)。
+document.addEventListener(
+  'click',
+  async (e) => {
+    const card = e.target.closest?.('.doc-card[data-pending-sign-path]')
+    if (!card) return
+    // href 已就位 → native anchor 自己跑,按 card 上的 download attr 行为
+    if (card.dataset.signState === 'resolved' && card.getAttribute('href')) return
+
+    e.preventDefault()
+    const absPath = card.dataset.pendingSignPath
+    if (!absPath) return
+
+    card.classList.add('doc-card-pending')
+    try {
+      const url = await signMediaPath(absPath)
+      if (!url) {
+        toast('下载链接获取失败,请重试')
+        return
+      }
+      card.href = url
+      card.dataset.signState = 'resolved'
+      // 同步 .click() 触发新 click event:capture handler 第二次进入命中 resolved
+      // 分支 return,native anchor 按 download attr 行为下载(不开新 tab,无 popup
+      // 拦截),对话页保留不离开
+      card.click()
+    } finally {
+      card.classList.remove('doc-card-pending')
+    }
+  },
+  true,
+)
+
 // ── Escape key: close modals, lightbox, palette ──
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {

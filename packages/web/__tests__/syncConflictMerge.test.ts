@@ -442,7 +442,12 @@ if (!_SERVER_AUTH_KEYS_SRC) {
   throw new Error('_SERVER_AUTH_KEYS const not found in sync.js source')
 }
 
+// pushSessionToServer 体内调用 `trace(...)`(来自 sync.js 顶部 `import { trace }`),
+// 但 new Function 闭包没有这个 binding。注入一个 no-op 让 eval'd 代码不爆。
+const _TRACE_STUB_SRC = 'const trace = () => {};'
+
 const _pushFnSrc =
+  _TRACE_STUB_SRC + '\n' +
   _MSG_EPHEMERAL_KEYS_SRC + '\n' +
   _MSG_SERVER_AUTHORITATIVE_KEYS_SRC + '\n' +
   _SERVER_AUTH_KEYS_SRC + '\n' +

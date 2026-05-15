@@ -449,19 +449,24 @@ describe('T19: dbGetAll → _normalizeLoadedSession — 三类历史污染 row',
     const u = loaded.messages[0]
     const a = loaded.messages[1]
     assert.equal(u.status, undefined)
-    assert.equal(u.inputPreview, undefined, 'ephemeral 字段总是 strip,无视 role')
-    // assistant ephemeral 全清
+    // ephemeral 字段 inputPreview: client-authored user 行被 strip;_partial/bashTail 始终 strip
+    assert.equal(u.inputPreview, undefined)
+    // _partial / bashTail 始终清(包括 server-authored)
     assert.equal(a._partial, undefined)
-    assert.equal(a._completed, undefined)
-    assert.equal(a.output, undefined)
-    assert.equal(a.error, undefined)
     assert.equal(a.bashTail, undefined)
-    assert.equal(a.inputJson, undefined)
-    assert.equal(a.inputPreview, undefined)
-    // 因为 usage 在,metaText/_rawMeta 也被 strip
+    // Phase 1 tool durability 语义(db.js:122-127):server-authored 行的
+    // `_completed / output / error / inputJson / inputPreview` 必须保留 —
+    // 否则会把 server-authoritative tool 字段也抹掉。本 row `_source: 'server'`
+    // 命中保留分支。
+    assert.equal(a._completed, false)
+    assert.equal(a.output, 'partial')
+    assert.equal(a.error, 'oops')
+    assert.equal(a.inputJson, '{}')
+    assert.equal(a.inputPreview, 'pv')
+    // 因为 usage 在,metaText/_rawMeta 仍被 strip(usage 在场即清,不分 _source)
     assert.equal(a.metaText, undefined)
     assert.equal(a._rawMeta, undefined)
-    // 但 server-authoritative 全保留
+    // 其余 server-authoritative 全保留
     assert.equal(a._source, 'server')
     assert.equal(a.status, 'completed')
     assert.deepEqual(a.usage, { costCredits: '500', inputTokens: 200, turn: 1 })

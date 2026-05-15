@@ -2723,14 +2723,10 @@ a:hover {
   }
 }
 
-/* Typing indicator staleness warnings */
-.typing-indicator.stale-warn .typing-label { color: var(--warning, #e5a00d); font-weight: 500; }
-.typing-indicator.stale-warn .typing-dots span { background: var(--warning, #e5a00d); }
-.typing-indicator.stale-danger .typing-label { color: var(--danger, #e53e3e); font-weight: 600; }
-.typing-indicator.stale-danger .typing-dots span {
-  background: var(--danger, #e53e3e);
-  animation: dot-bounce 2s infinite ease-in-out; /* slower animation = feels stuck */
-}
+/* Typing indicator long-thinking states — softened (no warn/danger color, no
+ * "feels stuck" animation). Class names retained for compatibility. */
+.typing-indicator.stale-warn .typing-label { color: var(--fg-muted); font-weight: 500; }
+.typing-indicator.stale-danger .typing-label { color: var(--fg-muted); font-weight: 600; }
 
 /* Meta line under assistant message */
 .msg-meta {
@@ -2842,6 +2838,13 @@ a:hover {
 }
 .doc-card:hover {
   background: var(--bg-hover);
+}
+/* doc-card 签名 URL 异步注入期间的"准备中"反馈 — main.js click handler 加 class,
+   pointer-events:none 防用户连点重复触发 signMediaPath */
+.doc-card-pending {
+  opacity: 0.6;
+  cursor: wait;
+  pointer-events: none;
 }
 .doc-card-icon {
   font-size: 20px;
