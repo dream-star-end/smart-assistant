@@ -1641,7 +1641,12 @@ async function openUserDetailModal(userId) {
           </tr>`).join('')}</tbody>
        </table>`
 
-  // 最近会话(最多 10 条;90 天窗口)
+  // 最近会话(最多 10 条;90 天窗口,按 last_at)
+  //
+  // 数据源:master SQLite `client_sessions`(web 前端 PUT /api/sessions/:id 写入),
+  // 与详情接口 GET /api/admin/sessions/:id 同源 —— 避免历史 bug:列表用
+  // usage_records.session_id (CCB metadata UUID)、详情用 client_sessions.id,
+  // 两套命名空间不交叉导致 100% 404。
   //
   // 每行可折叠:点击 ▸/▾ 切换展开;第一次展开懒加载完整 messages
   // (GET /api/admin/sessions/:id?user_id=:userId)。
@@ -1649,7 +1654,7 @@ async function openUserDetailModal(userId) {
   const sessTbl = sess.length === 0
     ? '<div class="empty">90 天内暂无会话</div>'
     : `<table class="data" style="width:100%;font-size:13px;">
-        <thead><tr><th style="width:18px;"></th><th>session_id</th><th>最早</th><th>最近</th><th>请求数</th><th>cost</th></tr></thead>
+        <thead><tr><th style="width:18px;"></th><th>session_id</th><th>title</th><th>agent</th><th>msgs</th><th>创建</th><th>最近</th><th>更新</th></tr></thead>
         <tbody>${sess.map((s) => {
           const sid = String(s.session_id || '')
           const sidEsc = escapeHtml(sid)
@@ -1657,14 +1662,16 @@ async function openUserDetailModal(userId) {
           <tr class="ud-sess-row" data-sid="${sidEsc}" style="cursor:pointer;">
             <td class="mono"><span class="ud-sess-toggle" data-sid="${sidEsc}">▸</span></td>
             <td class="mono" title="${sidEsc}">${escapeHtml(sid.slice(0, 16))}</td>
-            <td class="mono">${escapeHtml(fmtDate(s.first_at))}</td>
+            <td title="${escapeHtml(s.title || '')}">${escapeHtml((s.title || '').slice(0, 40))}</td>
+            <td class="mono">${escapeHtml(s.agent_id || '')}</td>
+            <td class="num">${Number(s.message_count || 0).toLocaleString()}</td>
+            <td class="mono">${escapeHtml(fmtDate(s.created_at))}</td>
             <td class="mono">${escapeHtml(fmtDate(s.last_at))}</td>
-            <td class="num">${Number(s.request_count || 0).toLocaleString()}</td>
-            <td class="num">${fmtCents(s.total_cost_credits || 0)}</td>
+            <td class="mono">${escapeHtml(fmtDate(s.updated_at))}</td>
           </tr>
           <tr class="ud-sess-detail" data-sid="${sidEsc}" style="display:none;">
             <td></td>
-            <td colspan="5" class="ud-sess-detail-body"
+            <td colspan="7" class="ud-sess-detail-body"
                 style="background:var(--bg-2);padding:var(--s-2);"></td>
           </tr>`
         }).join('')}</tbody>

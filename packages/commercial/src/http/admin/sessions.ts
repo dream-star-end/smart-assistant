@@ -16,8 +16,12 @@
  *
  * user_id scope:
  *   - 不带 ?user_id= → admin override,任何 session 都能拿
- *   - 带 ?user_id=N → cross-check sessionUserId === N,不匹配返回 404
+ *   - 带 ?user_id=N → cross-check sessionUserId === `c:N`,不匹配返回 404
  *     (避免前端从用户详情页点 row 却显示别人的会话,混淆)
+ *   注意:URL 上 user_id 是裸 bigint(例如 ?user_id=1),内部转 `c:1` 再喂
+ *   storage 层 —— commercial namespace 在 master SQLite 里始终带 c: 前缀
+ *   (见 handlers.ts:1592 / internalServerAuthored.ts:400 的同款 inline 约定)。
+ *   忘加前缀会让 session_id 即便对了 user_id 也永远 0 行 → 404。
  *
  * 返回完整 messages 含 tool_use / tool_result blocks:
  *   - admin = boss 本人(single-admin personal platform),诊断需要完整对话脉络
@@ -56,9 +60,12 @@ export async function handleAdminGetSession(
   await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const sessionId = parseSessionIdFromUrl(url);
-  // 可选 user_id scope —— 带就走 cross-check 路径(避免点 A 用户行看到 B 用户 session)
+  // 可选 user_id scope —— 带就走 cross-check 路径(避免点 A 用户行看到 B 用户 session)。
+  // 注意 namespace:URL 接收裸 bigint,内部拼 `c:${id}` 喂 storage(避免 `c:undefined`,
+  // 不带 user_id 仍走 admin override = getClientSession 的 userId 形参 undefined 分支)。
   const userId = parseBigintIdParam(url.searchParams.get("user_id"), "user_id");
-  const s = await getClientSession(sessionId, userId);
+  const scopedUserId = userId ? `c:${userId}` : undefined;
+  const s = await getClientSession(sessionId, scopedUserId);
   if (!s) throw new HttpError(404, "NOT_FOUND", "session not found");
   sendJson(res, 200, {
     session: {

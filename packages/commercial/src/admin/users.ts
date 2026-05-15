@@ -25,6 +25,7 @@ import { writeAdminAudit } from "./audit.js";
 import { safeEnqueueAlert } from "./alertOutbox.js";
 import { EVENTS } from "./alertEvents.js";
 import { csvEscapeCell } from "./csvHelper.js";
+import { listClientSessions } from "@openclaude/storage";
 
 export const USER_STATUSES = ["active", "banned", "deleting", "deleted"] as const;
 export type UserStatus = (typeof USER_STATUSES)[number];
@@ -411,13 +412,22 @@ export async function getUser(id: bigint | string): Promise<AdminUserRowView | n
 //
 // 一个请求拿到 admin 详情 modal 需要的全部数据。语义边界:
 //   - 主行 user 走 getUser
-//   - 4 条独立 SQL 并行(Promise.all)各自走索引,绝不 union/CTE 让 PG 选错 plan
-//   - lifecycle / topups / recent_requests 全时段;recent_sessions **限 90 天**
-//     避免重度用户全量 GROUP BY(权衡:超 90 天会话 admin 用 recent_requests
-//     翻页拼出来即可)
+//   - 3 条 PG 查询并行 + 1 条 SQLite client_sessions 查询(Promise.all)
+//   - lifecycle / topups / recent_requests 全时段(PG);recent_sessions **限 90 天**
+//     (按 last_at,JS 端过滤)。超 90 天会话 admin 用 recent_requests 翻页拼出来即可
+//
+// 数据源选择:
+//   recent_sessions 走 master SQLite `client_sessions`,**不是** PG
+//   `usage_records.session_id`。原因:usage_records.session_id 是 CCB 进程的
+//   metadata UUID,与 web 前端 PUT /api/sessions/:id 写入的 client_sessions.id
+//   不在同一命名空间;混用会导致 admin "查看会话内容" 100% 命中 404
+//   (历史 bug,2026-05 修复)。
+//
 // 索引依赖:
-//   credit_ledger.idx_cl_user_topup  (0027 partial WHERE reason='topup' AND delta>0)
-//   usage_records.idx_ur_user_time   ((user_id, created_at DESC),0002)
+//   credit_ledger.idx_cl_user_topup        (0027 partial WHERE reason='topup' AND delta>0)
+//   usage_records.idx_ur_user_time         ((user_id, created_at DESC),0002)
+//   client_sessions.idx_client_sessions_user  (user_id) — 当前规模(用户 ~百行 session)足够;
+//     未来若单用户上万,可升级到复合 (user_id, last_at DESC)
 
 export interface AdminUserTopupRow {
   id: string;
@@ -434,11 +444,19 @@ export interface AdminUserRequestRow {
   created_at: string; // ISO
 }
 export interface AdminUserSessionRow {
+  /**
+   * client_sessions.id (web 前端写入的 session id,例如 web-* / wsess-*)。
+   * 直接用作 GET /api/admin/sessions/:id 的查询键 —— 与详情接口同源,
+   * 避免历史 bug:列表用 usage_records.session_id (CCB metadata UUID)、
+   * 详情用 client_sessions.id,两套命名空间不交叉导致 100% 404。
+   */
   session_id: string;
-  request_count: number;
-  first_at: string; // ISO
+  title: string;
+  agent_id: string;
+  message_count: number;
+  created_at: string; // ISO
   last_at: string; // ISO
-  total_cost_credits: string; // cents
+  updated_at: string; // ISO
 }
 export interface AdminUserDetailResult {
   user: AdminUserRowView;
@@ -501,27 +519,12 @@ export async function getUserDetail(
         LIMIT 30`,
       [idStr],
     ),
-    query<{
-      session_id: string;
-      request_count: string;
-      first_at: Date;
-      last_at: Date;
-      total_cost_credits: string;
-    }>(
-      `SELECT session_id,
-              COUNT(*)::text                              AS request_count,
-              MIN(created_at)                             AS first_at,
-              MAX(created_at)                             AS last_at,
-              COALESCE(SUM(cost_credits), 0)::text        AS total_cost_credits
-         FROM usage_records
-        WHERE user_id = $1::bigint
-          AND session_id IS NOT NULL
-          AND created_at > NOW() - INTERVAL '90 days'
-        GROUP BY session_id
-        ORDER BY MAX(created_at) DESC
-        LIMIT 10`,
-      [idStr],
-    ),
+    // 第 4 项:client_sessions(SQLite)。注意 namespace:commercial 用户在
+    // master SQLite 里 user_id 始终带 `c:` 前缀(见 handlers.ts:1592 /
+    // internalServerAuthored.ts:400 的 inline 约定)。90 天窗口 + LIMIT 10
+    // 走 JS 端过滤,因为 listClientSessions 不接受 since/limit 参数,且当前
+    // 单用户数据量(< 千行)用 idx_client_sessions_user 索引扫足够快。
+    listClientSessions(`c:${idStr}`),
   ]);
 
   const lc = lifecycleRes.rows[0];
@@ -546,14 +549,50 @@ export async function getUserDetail(
       session_id: r.session_id,
       created_at: r.created_at.toISOString(),
     })),
-    recent_sessions: sessionsRes.rows.map((r) => ({
-      session_id: r.session_id,
-      request_count: Number(r.request_count),
-      first_at: r.first_at.toISOString(),
-      last_at: r.last_at.toISOString(),
-      total_cost_credits: r.total_cost_credits,
-    })),
+    recent_sessions: projectRecentSessions(sessionsRes, Date.now()),
   };
+}
+
+/**
+ * 把 `listClientSessions` 返回的元数据投影成 admin 详情 modal 用的 schema。
+ *
+ * 抽成独立导出仅为可测性 —— 90 天 cutoff / 排序保留 / ISO 转换是产品语义,
+ * 单测覆盖比集成测试便宜得多(无需 SQLite + PG fixture)。
+ *
+ * 规则:
+ *   - 时间口径按 `lastAt`(对话活动维度,不是 `updatedAt` —— 后者会被 title
+ *     rename 等纯 metadata 写入污染,导致"最近活跃"误判)
+ *   - 排序信赖上游 `listClientSessions` 已 ORDER BY last_at DESC,本函数只
+ *     做 filter + slice,不再排序(保持调用方语义)
+ *   - 最多 10 条,与 UI 表头 "最近会话 · 90 天(N)" 的 N 对齐
+ *
+ * @param nowMs 注入 epoch ms 让 unit test 可控时间,生产传 `Date.now()`
+ */
+export function projectRecentSessions(
+  sessions: readonly {
+    id: string;
+    agentId: string;
+    title: string;
+    createdAt: number;
+    lastAt: number;
+    updatedAt: number;
+    messageCount: number;
+  }[],
+  nowMs: number,
+): AdminUserSessionRow[] {
+  const cutoff = nowMs - 90 * 24 * 60 * 60 * 1000;
+  return sessions
+    .filter((s) => s.lastAt >= cutoff)
+    .slice(0, 10)
+    .map((s) => ({
+      session_id: s.id,
+      title: s.title,
+      agent_id: s.agentId,
+      message_count: s.messageCount,
+      created_at: new Date(s.createdAt).toISOString(),
+      last_at: new Date(s.lastAt).toISOString(),
+      updated_at: new Date(s.updatedAt).toISOString(),
+    }));
 }
 
 // ─── Patch ─────────────────────────────────────────────────────────
