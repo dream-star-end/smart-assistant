@@ -132,16 +132,27 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   it('allows /tmp/openclaude-* temp files', () => {
     assert.ok(isFileAllowed(resolve('/tmp/openclaude-abc123/output.png')))
   })
-  // Should ALLOW — known project roots
-  it('allows files under /opt/openclaude/openclaude', () => {
-    assert.ok(isFileAllowed(resolve('/opt/openclaude/openclaude/packages/gateway/src/server.ts')))
+  // Should DENY — project source roots are NOT in the static allowlist
+  // (AGENT_CWD_ROOTS 显式留空: "intentionally empty — broad source dirs removed")
+  // 这两条把"源码目录不许 /api/file 读"作为契约钉死,防止未来误把
+  // /opt/openclaude/openclaude 等再塞回 AGENT_CWD_ROOTS 导致回归。
+  it('denies project source files under /opt/openclaude/openclaude (no agent cwd allowlist)', () => {
+    assert.ok(!isFileAllowed(resolve('/opt/openclaude/openclaude/packages/gateway/src/server.ts')))
   })
-  it('allows files under /opt/openclaude/claude-code-best', () => {
-    assert.ok(isFileAllowed(resolve('/opt/openclaude/claude-code-best/src/main.tsx')))
+  it('denies project source files under /opt/openclaude/claude-code-best', () => {
+    assert.ok(!isFileAllowed(resolve('/opt/openclaude/claude-code-best/src/main.tsx')))
   })
-  // Should ALLOW — dynamic agent cwds
-  it('allows files under a dynamic agent cwd', () => {
-    assert.ok(isFileAllowed(resolve('/home/user/project/build/result.html'), ['/home/user/project']))
+  // Should ALLOW — dynamic agent cwds 限制为白名单媒体扩展名。html/ts 等可执行
+  // 文件类型即使在 cwd 下也不允许,只允许 MEDIA_EXTENSIONS 集合(png/jpg/mp4/pdf/log 等)
+  it('allows media file (.png) under a dynamic agent cwd', () => {
+    assert.ok(isFileAllowed(resolve('/home/user/project/build/screenshot.png'), ['/home/user/project']))
+  })
+  it('denies non-media file (.html) under a dynamic agent cwd', () => {
+    assert.ok(!isFileAllowed(resolve('/home/user/project/build/result.html'), ['/home/user/project']))
+  })
+  // generated/ 和 uploads/ 在 cwd 下无条件允许(任何扩展名),区别于裸 cwd 限媒体扩展
+  it('allows any extension under <cwd>/generated/', () => {
+    assert.ok(isFileAllowed(resolve('/home/user/project/generated/code.py'), ['/home/user/project']))
   })
 
   // Should DENY — outside all allowed dirs
