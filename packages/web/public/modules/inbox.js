@@ -13,10 +13,10 @@
 //
 // 个人版无 /api/me → 401/403/404 → 静默,铃铛保持 hidden。
 
-import { apiGet, apiJson } from './api.js?v=f84b3eda'
-import { $ } from './dom.js?v=f84b3eda'
-import { openModal, closeModal, toast, toastOptsFromError } from './ui.js?v=f84b3eda'
-import { renderMarkdown } from './markdown.js?v=f84b3eda'
+import { apiGet, apiJson } from './api.js?v=436bc9ae'
+import { $ } from './dom.js?v=436bc9ae'
+import { openModal, closeModal, toast, toastOptsFromError } from './ui.js?v=436bc9ae'
+import { renderMarkdown } from './markdown.js?v=436bc9ae'
 
 const POLL_INTERVAL_MS = 60_000
 let _pollTimer = null
