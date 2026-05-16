@@ -80,9 +80,18 @@ func dirMatchesAllowedRegex(dir string) bool {
 	return false
 }
 
-// osChown 是 os.Chown 的可注入 seam,测试里 override 模拟 chown 失败。
-// 生产路径直接走标准库。
-var osChown = os.Chown
+// chownFile / chmodFile / renameFile 是可注入 seam,测试里 override 模拟失败
+// 或验证 post-rename PATH_DIVERGED 分支(rename 把 tmp 移到白名单外的场景在
+// 真实文件系统下没法稳定复现 race,只能 mock)。生产路径直接走标准库。
+//
+// 关键设计:chown/chmod 走 fd 而非路径。原因:rename 之前 tmp 文件已落地,
+// 此时 attacker 若把 parent 换成 symlink → /etc,os.Chown("/parent/file.tmp",
+// container_uid, ...) 会按当前 parent 路径解析,把 /etc/某文件的 owner 改成
+// 容器 uid —— 这是真的提权路径(root 主动改 /etc 文件 owner)。f.Chown(uid,
+// gid) 直接对 fd 引用的 inode 操作,完全绕开路径再解析。
+var chownFile = func(f *os.File, uid, gid int) error { return f.Chown(uid, gid) }
+var chmodFile = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
+var renameFile = os.Rename
 
 // per-path 互斥
 var perPathMu sync.Map
@@ -172,6 +181,12 @@ func pathInAllowedTree(clean string) bool {
 	return false
 }
 
+// readFdRealPath 读 /proc/self/fd/<n> 返回 kernel 视角下 fd 的真实路径。
+// 用于 verifyFdTarget,以及未来其他需要"fd 真身"判定的场景。
+func readFdRealPath(fd uintptr) (string, error) {
+	return os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+}
+
 // verifyFdTarget 在 Open 之后再用 /proc/self/fd/<fd> 反查 fd 的 kernel 视角真实
 // 路径,确认它仍落在 AllowedRoots / AllowedDirRegexes 内。
 //
@@ -187,7 +202,7 @@ func pathInAllowedTree(clean string) bool {
 //
 // Linux-only(依赖 procfs)。node-agent 部署平台明确为 Linux 容器宿主。
 func verifyFdTarget(fd uintptr) error {
-	realTarget, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	realTarget, err := readFdRealPath(fd)
 	if err != nil {
 		return fmt.Errorf("readlink fd: %w", err)
 	}
@@ -338,12 +353,32 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "OPEN_TMP_FAIL", err.Error())
 		return
 	}
-	// 失败时清理 tmp
-	cleanTmp := func() { _ = os.Remove(tmp) }
+
+	// Codex review(短期 hardening,与 GET 对齐):open 后立刻 /proc/self/fd
+	// 反查 fd 真实路径,挡 resolveParentNoSymlink → OpenFile 之间 parent 被
+	// 换成 symlink 的 race 窗口。失败时只关 fd、不做 path-based remove ——
+	// 此时 tmp 文本路径已不可信,os.Remove(tmp) 可能误删 attacker 控制下的
+	// 同名文件。
+	if err := verifyFdTarget(f.Fd()); err != nil {
+		_ = f.Close()
+		writeErr(w, http.StatusBadRequest, "PATH_DIVERGED", err.Error())
+		return
+	}
+
+	// post-open failure 一律不做 path-based cleanup(Codex review)。原因:
+	//   - readlink + Remove 两步之间仍有 race window,attacker 可以在判定
+	//     "fd == tmpPath"通过后再换 parent,让 Remove 走偏。
+	//   - 唯一闭环的清理需要 fd-based unlinkat,Linux 用户态没现成 API。
+	//   - 接受 .tmp 残留:fd 在 open 时 verifyFdTarget 已确认落在 safe parent
+	//     下,root-owned 0600,无攻击面;下次同名 PUT 走 O_TRUNC 会覆盖,
+	//     不构成磁盘累积问题。
+	// 因此 close 时只关 fd,不再 Remove。中期由 openat2 + unlinkat(dirfd) 根治。
+	failClose := func() {
+		_ = f.Close()
+	}
 
 	if _, err := io.Copy(f, r.Body); err != nil {
-		_ = f.Close()
-		cleanTmp()
+		failClose()
 		// MaxBytesError → 413
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
@@ -355,37 +390,55 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		cleanTmp()
+		failClose()
 		writeErr(w, http.StatusInternalServerError, "FSYNC_FAIL", err.Error())
 		return
 	}
-	if err := f.Close(); err != nil {
-		cleanTmp()
-		writeErr(w, http.StatusInternalServerError, "CLOSE_FAIL", err.Error())
-		return
-	}
-	// chown 必须在 chmod 之前。原因:caller 用 mode=0o400 owner=container_uid:gid
+	// chown/chmod 必须在 Close 之前,且通过 fd 而非 tmp 文本路径。原因:
+	// 路径式 os.Chown(tmp, container_uid, ...) 在 attacker race 后会按当前
+	// parent 解析,可能把 /etc/某文件 的 owner 改成容器 uid —— root 主动给
+	// 出宿主关键文件的 ownership,是真的提权路径。f.Chown / f.Chmod 直接
+	// 对 fd 引用的 inode 操作,不经路径解析,attacker 无法欺骗。
+	//
+	// chown 仍必须在 chmod 之前。原因:caller 用 mode=0o400 owner=container_uid:gid
 	// 让容器内 agent 可读;若反过来先 chmod 0o400 再 chown,owner 切换瞬间文件归
 	// 容器 uid 但 mode 已是只读 — 从 root 切到容器 uid 这段时间窗内,host 上以
-	// 容器 uid 跑的进程理论可短暂读到 tmp(虽 NOFOLLOW + tmp 名字不可猜,但纪律
-	// 上避免)。先 chown 后 chmod 整个时间窗内 mode 仍是 0o600 owner=root,host
-	// 上其他 uid 进程无法读;rename 后才完整生效。
+	// 容器 uid 跑的进程理论可短暂读到 tmp。先 chown 后 chmod 整个时间窗内 mode
+	// 仍是 0o600 owner=root,host 上其他 uid 进程无法读;rename 后才完整生效。
 	if hasOwner {
-		if err := osChown(tmp, ownerUID, ownerGID); err != nil {
-			cleanTmp()
+		if err := chownFile(f, ownerUID, ownerGID); err != nil {
+			failClose()
 			writeErr(w, http.StatusInternalServerError, "CHOWN_FAIL", err.Error())
 			return
 		}
 	}
-	if err := os.Chmod(tmp, mode); err != nil {
-		cleanTmp()
+	if err := chmodFile(f, mode); err != nil {
+		failClose()
 		writeErr(w, http.StatusInternalServerError, "CHMOD_FAIL", err.Error())
 		return
 	}
-	if err := os.Rename(tmp, p); err != nil {
-		cleanTmp()
+	// Close / Rename 失败后 fd 已无效,无法 safeCleanTmp。接受 .tmp 残留在
+	// open 时验证过的 safe parent 下(root-owned 0600,无攻击面);下次同
+	// 名 PUT 走 O_TRUNC 会覆盖。
+	if err := f.Close(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "CLOSE_FAIL", err.Error())
+		return
+	}
+	if err := renameFile(tmp, p); err != nil {
 		writeErr(w, http.StatusInternalServerError, "RENAME_FAIL", err.Error())
+		return
+	}
+	// Codex review(post-rename guard):Rename 本身仍是按文本路径解析,如果
+	// attacker 恰在 Rename 那一刻把 parent 换成 symlink → 白名单外,文件会落
+	// 到外部目录。再做一次 resolveParentNoSymlink(p) 兜底:p 的 parent 真身
+	// 必须仍在白名单内。pathInAllowedTree(纯文本)不够 —— parent 是 symlink
+	// 时文本判定仍会通过。
+	//
+	// 失败时不 os.Remove(p):此时 parent 不 safe,Remove 操作的路径不可信(可
+	// 能误删非自己写入的文件)。让 master 收到 500 + log 后人工处置。
+	if err := resolveParentNoSymlink(p); err != nil {
+		writeErr(w, http.StatusInternalServerError, "PATH_DIVERGED",
+			fmt.Sprintf("post-rename parent unsafe: %v", err))
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -402,6 +455,22 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
 	defer lk.Unlock()
 	release := acquire()
 	defer release()
+
+	// parent 真身校验,与 PUT/GET/STAT 对齐:挡 user-data symlink 逃逸让
+	// Remove 落到 /etc 之类。
+	// parent 不存在(ENOENT)语义等价"文件不存在",返 204 幂等 —— 与下方 Lstat
+	// ErrNotExist 分支一致,保持 sshMux / remoteCodexAuth 等调用方"删除不存在
+	// 视为成功"的预期。
+	// unlink syscall 没有 fd,无法做 verifyFdTarget post-check;接受 race window
+	// 残留极小(中期由 openat2 一次性根治,见 audit-file-toctou.md)。
+	if err := resolveParentNoSymlink(p); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "PARENT_UNSAFE", err.Error())
+		return
+	}
 
 	// Lstat 防御:若 p 是 symlink,拒删(避免 master 误以为删的是真文件)。
 	// 不存在 → 幂等成功。
@@ -437,6 +506,20 @@ func (h *Handler) handleStat(w http.ResponseWriter, r *http.Request) {
 	release := acquire()
 	defer release()
 
+	// 与 handleGet 对齐:先 parent 真身校验,挡 user-data symlink 逃逸。
+	// parent 不存在(ENOENT)语义等价"文件不存在",返 {exists:false} —— 不能升级
+	// 为 500,master 侧 statFile 调用方(nodeBootstrap 查 baseline VERSION)按
+	// "文件缺失"处理这条分支。
+	if err := resolveParentNoSymlink(p); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(StatResponse{Exists: false})
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "PARENT_UNSAFE", err.Error())
+		return
+	}
+
 	// Lstat 代替 Stat:symlink 指向白名单外的目标不应当被当作普通文件 stat。
 	st, err := os.Lstat(p)
 	if err != nil {
@@ -461,12 +544,26 @@ func (h *Handler) handleStat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 流式算 sha256,O_NOFOLLOW 防御在 stat 与 open 之间被替换成 symlink
+	// 流式算 sha256,O_NOFOLLOW 防御在 stat 与 open 之间被替换成 symlink。
+	// verifyFdTarget 与 handleGet 对齐:open 后 /proc/self/fd 反查 fd 真实路径,
+	// 关掉 resolveParentNoSymlink → OpenFile 之间的最后一道 race window。
+	// 拒绝时返 400 PATH_DIVERGED 而非 {exists:false} —— 这意味着真有 attacker
+	// race,应让 master 看见错误而不是被误导成"文件缺失"。
+	//
+	// OpenFile 失败保留原 best-effort 语义:digest 留空,仍返 {exists:true}(对
+	// 应权限/ACL/EBUSY 等不该升级为 500 的瞬时错);verifyFdTarget 才是 hard
+	// fail 边界。
 	digest := ""
-	if f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0); err == nil {
-		h := sha256.New()
-		if _, copyErr := io.Copy(h, io.LimitReader(f, MaxFileSize+1)); copyErr == nil {
-			digest = hex.EncodeToString(h.Sum(nil))
+	f, openErr := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if openErr == nil {
+		if err := verifyFdTarget(f.Fd()); err != nil {
+			_ = f.Close()
+			writeErr(w, http.StatusBadRequest, "PATH_DIVERGED", err.Error())
+			return
+		}
+		hasher := sha256.New()
+		if _, copyErr := io.Copy(hasher, io.LimitReader(f, MaxFileSize+1)); copyErr == nil {
+			digest = hex.EncodeToString(hasher.Sum(nil))
 		}
 		_ = f.Close()
 	}

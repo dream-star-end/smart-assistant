@@ -9,6 +9,7 @@ package files
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -77,20 +78,27 @@ func withTempAllowedRoot(t *testing.T, dir string) func() {
 }
 
 func TestHandlePut_OwnerChown_Success(t *testing.T) {
-	// 测试 mock:override osChown 记录调用参数。返回 nil(成功)。
+	// 测试 mock:override chownFile 记录调用参数。返回 nil(成功)。
 	// 真实 chown 在非 root 跑测试时会 EPERM,所以必须 mock。
-	var gotPath string
+	//
+	// 关键 assertion(防退回 path-based chown):验证 fd 指向的真实路径是
+	// tmp(即 target+".tmp"),不是任何 attacker-swapped 路径。/proc/self/fd
+	// readlink 是 kernel 视角的 fd→inode→path 反查。
+	var gotFdPath string
 	var gotUID, gotGID int
 	var chownCalled bool
-	osChownOrig := osChown
-	osChown = func(name string, uid, gid int) error {
+	chownOrig := chownFile
+	chownFile = func(f *os.File, uid, gid int) error {
 		chownCalled = true
-		gotPath = name
+		// readlink 拿 fd 真实路径,验 fd-based 语义生效(参数是 fd 不是路径)
+		if p, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); err == nil {
+			gotFdPath = p
+		}
 		gotUID = uid
 		gotGID = gid
 		return nil
 	}
-	defer func() { osChown = osChownOrig }()
+	defer func() { chownFile = chownOrig }()
 
 	tmpDir := t.TempDir()
 	cleanup := withTempAllowedRoot(t, tmpDir)
@@ -111,11 +119,11 @@ func TestHandlePut_OwnerChown_Success(t *testing.T) {
 		t.Fatalf("status: want 204 got %d body=%q", rec.Code, rec.Body.String())
 	}
 	if !chownCalled {
-		t.Fatalf("osChown not called")
+		t.Fatalf("chownFile not called")
 	}
-	// chown 在 chmod 前调用,作用对象是 tmp(p+".tmp");rename 后才是 p
-	if gotPath != target+".tmp" {
-		t.Fatalf("chown path: want %q got %q", target+".tmp", gotPath)
+	// chown 在 chmod 前调用,作用对象是 tmp 的 fd(p+".tmp");rename 后才是 p
+	if gotFdPath != target+".tmp" {
+		t.Fatalf("chown fd path: want %q got %q", target+".tmp", gotFdPath)
 	}
 	if gotUID != 1000 || gotGID != 1001 {
 		t.Fatalf("chown uid/gid: want 1000/1001 got %d/%d", gotUID, gotGID)
@@ -138,12 +146,12 @@ func TestHandlePut_OwnerChown_Success(t *testing.T) {
 func TestHandlePut_NoOwner_SkipsChown(t *testing.T) {
 	// 老 master 不发 owner 参数 — 必须不调 chown(向后兼容)
 	var chownCalled bool
-	osChownOrig := osChown
-	osChown = func(name string, uid, gid int) error {
+	chownOrig := chownFile
+	chownFile = func(f *os.File, uid, gid int) error {
 		chownCalled = true
 		return nil
 	}
-	defer func() { osChown = osChownOrig }()
+	defer func() { chownFile = chownOrig }()
 
 	tmpDir := t.TempDir()
 	cleanup := withTempAllowedRoot(t, tmpDir)
@@ -166,12 +174,17 @@ func TestHandlePut_NoOwner_SkipsChown(t *testing.T) {
 	}
 }
 
-func TestHandlePut_ChownFails_500AndTmpCleaned(t *testing.T) {
-	osChownOrig := osChown
-	osChown = func(name string, uid, gid int) error {
+func TestHandlePut_ChownFails_500_FinalNotCreated(t *testing.T) {
+	// chown 失败 → 500 CHOWN_FAIL + 最终文件不应创建。
+	// 注:.tmp 残留是预期行为(Codex review 阻塞点修法:post-open failure 不
+	// 做 path-based cleanup,避免 race-swap 后误删白名单外文件)。.tmp 在
+	// verified-safe parent 下 root-owned 0600,无攻击面;下次同名 PUT 走
+	// O_TRUNC 覆盖。
+	chownOrig := chownFile
+	chownFile = func(f *os.File, uid, gid int) error {
 		return os.ErrPermission
 	}
-	defer func() { osChown = osChownOrig }()
+	defer func() { chownFile = chownOrig }()
 
 	tmpDir := t.TempDir()
 	cleanup := withTempAllowedRoot(t, tmpDir)
@@ -194,13 +207,17 @@ func TestHandlePut_ChownFails_500AndTmpCleaned(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "CHOWN_FAIL") {
 		t.Fatalf("body should contain CHOWN_FAIL, got %q", rec.Body.String())
 	}
-	// tmp 已清理
-	if _, err := os.Stat(target + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("tmp should be cleaned, stat err=%v", err)
-	}
 	// 最终文件不应该存在(chown 失败 → 不 rename)
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("final file should not exist, stat err=%v", err)
+	}
+	// tmp 残留是预期(见函数 docstring,非安全契约,仅运维卫式)。本测试用
+	// body=[]byte("x"),tmp 体积应当 ≤ 几字节;断个宽松上界防未来意外大泄漏。
+	// 若改测试 body 体积需相应放宽此上界,这条不视为安全契约一部分。
+	if st, err := os.Stat(target + ".tmp"); err == nil {
+		if st.Size() > 1024 {
+			t.Fatalf("tmp residue unexpectedly large: %d bytes (sanity guard, not security)", st.Size())
+		}
 	}
 }
 
@@ -474,12 +491,12 @@ func TestPathInAllowedTree(t *testing.T) {
 }
 
 func TestHandlePut_BadOwner_400(t *testing.T) {
-	osChownOrig := osChown
-	osChown = func(name string, uid, gid int) error {
-		t.Fatalf("osChown must not be called when owner is invalid")
+	chownOrig := chownFile
+	chownFile = func(f *os.File, uid, gid int) error {
+		t.Fatalf("chownFile must not be called when owner is invalid")
 		return nil
 	}
-	defer func() { osChown = osChownOrig }()
+	defer func() { chownFile = chownOrig }()
 
 	tmpDir := t.TempDir()
 	cleanup := withTempAllowedRoot(t, tmpDir)
@@ -508,5 +525,478 @@ func TestHandlePut_BadOwner_400(t *testing.T) {
 				t.Fatalf("body should contain BAD_OWNER, got %q", rec.Body.String())
 			}
 		})
+	}
+}
+
+// ── handleStat handler-level 覆盖(2026-05-16 hardening Part B)──────
+//
+// 短期 hardening 前 handleStat 没有 handler-level 测试,只能靠 validatePath
+// 间接验路径。boss 要求"覆盖正常使用"补齐 happy path / 各类失败语义。
+
+func TestHandleStat_HappyPath_ExistsTrue(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	payload := []byte("stat-me-please")
+	target := filepath.Join(tmpDir, "file.bin")
+	if err := os.WriteFile(target, payload, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", target)
+	req := httptest.NewRequest(http.MethodGet, "/files/stat?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleStat(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// exists=true 与 size + sha256 + mtime 字段必出现
+	if !strings.Contains(body, `"exists":true`) {
+		t.Fatalf("body missing exists=true: %s", body)
+	}
+	if !strings.Contains(body, fmt.Sprintf(`"size":%d`, len(payload))) {
+		t.Fatalf("body missing correct size: %s", body)
+	}
+	if !strings.Contains(body, `"sha256":"`) {
+		t.Fatalf("body missing sha256: %s", body)
+	}
+	if !strings.Contains(body, `"mtime":"`) {
+		t.Fatalf("body missing mtime: %s", body)
+	}
+}
+
+func TestHandleStat_FileNotFound_ExistsFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	q := url.Values{}
+	q.Set("path", filepath.Join(tmpDir, "no-such-file.bin"))
+	req := httptest.NewRequest(http.MethodGet, "/files/stat?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleStat(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"exists":false`) {
+		t.Fatalf("body should have exists=false, got %s", rec.Body.String())
+	}
+}
+
+func TestHandleStat_ParentNotExist_ExistsFalse(t *testing.T) {
+	// 锁定新加 resolveParentNoSymlink 在 parent ENOENT 时返 {exists:false}
+	// 的语义 —— 等价文件不存在,不升级为 500。master nodeBootstrap 依赖此契约。
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	q := url.Values{}
+	q.Set("path", filepath.Join(tmpDir, "no-such-subdir", "file.bin"))
+	req := httptest.NewRequest(http.MethodGet, "/files/stat?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleStat(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"exists":false`) {
+		t.Fatalf("body should have exists=false, got %s", rec.Body.String())
+	}
+}
+
+func TestHandleStat_Directory_400(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	subdir := filepath.Join(tmpDir, "i-am-a-dir")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", subdir)
+	req := httptest.NewRequest(http.MethodGet, "/files/stat?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleStat(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "NOT_REGULAR_FILE") {
+		t.Fatalf("body should contain NOT_REGULAR_FILE, got %q", rec.Body.String())
+	}
+}
+
+func TestHandleStat_OutsideAllowlist_400(t *testing.T) {
+	// 不挂临时 AllowedRoots → /etc 系统文件在白名单外
+	q := url.Values{}
+	q.Set("path", "/etc/hostname")
+	req := httptest.NewRequest(http.MethodGet, "/files/stat?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleStat(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "BAD_PATH") {
+		t.Fatalf("body should contain BAD_PATH, got %q", rec.Body.String())
+	}
+}
+
+func TestHandleStat_ParentSymlinkEscape_400(t *testing.T) {
+	// 锁定 resolveParentNoSymlink 防御:parent 是 symlink 指向白名单外,拒。
+	//
+	// 拓扑(参考 Codex review):
+	//   allowedRoot = tmpDir
+	//   tmpDir/link -> evilOutside
+	//   path = tmpDir/link/file
+	// validatePath 文本判定通过(在 tmpDir 下);resolveParentNoSymlink EvalSymlinks
+	// parent(= tmpDir/link)真身解到 evilOutside,evilOutside 不在白名单,拒。
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	evilOutside := t.TempDir() // 系统 /tmp/xxx,不在白名单
+	if err := os.WriteFile(filepath.Join(evilOutside, "secret"), []byte("secret"), 0o600); err != nil {
+		t.Fatalf("seed evil: %v", err)
+	}
+	if err := os.Symlink(evilOutside, filepath.Join(tmpDir, "link")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", filepath.Join(tmpDir, "link", "secret"))
+	req := httptest.NewRequest(http.MethodGet, "/files/stat?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleStat(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "PARENT_UNSAFE") {
+		t.Fatalf("body should contain PARENT_UNSAFE, got %q", rec.Body.String())
+	}
+}
+
+// ── handleDelete handler-level 覆盖 ──────
+
+func TestHandleDelete_HappyPath_Removed(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	target := filepath.Join(tmpDir, "doomed.bin")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", target)
+	req := httptest.NewRequest(http.MethodDelete, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleDelete(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status: want 204 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("file should be removed, stat err=%v", err)
+	}
+}
+
+func TestHandleDelete_FileNotFound_204Idempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	q := url.Values{}
+	q.Set("path", filepath.Join(tmpDir, "never-existed.bin"))
+	req := httptest.NewRequest(http.MethodDelete, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleDelete(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status: want 204 got %d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleDelete_ParentNotExist_204Idempotent(t *testing.T) {
+	// 锁定新加 resolveParentNoSymlink 在 parent ENOENT 时返 204 幂等,
+	// 与 "file 不存在" 分支一致 —— 不破坏 sshMux/remoteCodexAuth 的预期。
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	q := url.Values{}
+	q.Set("path", filepath.Join(tmpDir, "no-such-subdir", "file.bin"))
+	req := httptest.NewRequest(http.MethodDelete, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleDelete(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status: want 204 got %d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleDelete_Symlink_400(t *testing.T) {
+	// p 本身是 symlink → 拒(避免误以为删的是真文件)
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	realTarget := filepath.Join(tmpDir, "real.bin")
+	if err := os.WriteFile(realTarget, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	link := filepath.Join(tmpDir, "link.bin")
+	if err := os.Symlink(realTarget, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", link)
+	req := httptest.NewRequest(http.MethodDelete, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleDelete(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "IS_SYMLINK") {
+		t.Fatalf("body should contain IS_SYMLINK, got %q", rec.Body.String())
+	}
+	// 文件仍应存在(没被误删)
+	if _, err := os.Stat(realTarget); err != nil {
+		t.Fatalf("real target should still exist, stat err=%v", err)
+	}
+}
+
+func TestHandleDelete_OutsideAllowlist_400(t *testing.T) {
+	q := url.Values{}
+	q.Set("path", "/etc/hostname")
+	req := httptest.NewRequest(http.MethodDelete, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleDelete(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "BAD_PATH") {
+		t.Fatalf("body should contain BAD_PATH, got %q", rec.Body.String())
+	}
+}
+
+func TestHandleDelete_ParentSymlinkEscape_400(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	evilOutside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(evilOutside, "secret"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed evil: %v", err)
+	}
+	if err := os.Symlink(evilOutside, filepath.Join(tmpDir, "link")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", filepath.Join(tmpDir, "link", "secret"))
+	req := httptest.NewRequest(http.MethodDelete, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleDelete(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "PARENT_UNSAFE") {
+		t.Fatalf("body should contain PARENT_UNSAFE, got %q", rec.Body.String())
+	}
+	// evilOutside/secret 仍存在 —— 没被误删
+	if _, err := os.Stat(filepath.Join(evilOutside, "secret")); err != nil {
+		t.Fatalf("evil file should still exist (defense worked), stat err=%v", err)
+	}
+}
+
+// ── handlePut 补强测试 ──────
+
+func TestHandlePut_HappyPath_NoOwner_BodyAndModeApplied(t *testing.T) {
+	// 完整 happy path:无 owner 参数,正常写入,验证 body + mode 都落地。
+	// (原 TestHandlePut_NoOwner_SkipsChown 只验 chown 没被调,没读回 body。)
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	target := filepath.Join(tmpDir, "happy.bin")
+	payload := []byte("happy-path-content-12345")
+	q := url.Values{}
+	q.Set("path", target)
+	q.Set("mode", "0644")
+
+	req := httptest.NewRequest(http.MethodPut, "/files?"+q.Encode(), bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	(&Handler{}).handlePut(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status: want 204 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read final: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("body mismatch: want %q got %q", payload, got)
+	}
+	st, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if st.Mode().Perm() != 0o644 {
+		t.Fatalf("mode: want 0644 got %o", st.Mode().Perm())
+	}
+}
+
+func TestHandlePut_BodyExceedsMax_413(t *testing.T) {
+	// MaxBytesReader 在 MaxFileSize+1 字节时切断 → 413 FILE_TOO_LARGE。
+	// 不真生成 200 MiB,用一个 contentLength 故意比 cap 大的 body —— MaxBytesReader
+	// 看 Content-Length 与 cap 比较时也会拒,但更可靠的是真发超过 cap 的字节流。
+	// 用 io.LimitReader 模拟:body 实际写入 MaxFileSize+128 字节,读到 cap+1 时
+	// MaxBytesReader 会返 MaxBytesError。
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	target := filepath.Join(tmpDir, "too-large.bin")
+
+	// 用一个无限 reader,MaxBytesReader 会在 MaxFileSize+1 字节时切断
+	body := &infiniteByteReader{ch: 'A'}
+	q := url.Values{}
+	q.Set("path", target)
+	q.Set("mode", "0644")
+
+	req := httptest.NewRequest(http.MethodPut, "/files?"+q.Encode(), body)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handlePut(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: want 413 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "FILE_TOO_LARGE") {
+		t.Fatalf("body should contain FILE_TOO_LARGE, got %q", rec.Body.String())
+	}
+	// 最终文件不应存在(写入未到 rename 阶段)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("final file should not exist, stat err=%v", err)
+	}
+	// .tmp 残留是预期(Codex review:post-open failure 不做 path-based unlink);
+	// io.Copy 中断后,tmp 内容应在 MaxFileSize 上下(MaxBytesReader 切断点)。
+}
+
+// infiniteByteReader 永远返回同一个字节,用于 MaxBytesReader 切断测试。
+// 不用 bytes.Repeat 一次性分配 200MB,内存友好。
+type infiniteByteReader struct{ ch byte }
+
+func (r *infiniteByteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = r.ch
+	}
+	return len(p), nil
+}
+
+func TestHandlePut_ParentSymlinkEscape_400(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	evilOutside := t.TempDir()
+	if err := os.Symlink(evilOutside, filepath.Join(tmpDir, "link")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", filepath.Join(tmpDir, "link", "newfile"))
+	q.Set("mode", "0644")
+
+	req := httptest.NewRequest(http.MethodPut, "/files?"+q.Encode(), bytes.NewReader([]byte("x")))
+	rec := httptest.NewRecorder()
+	(&Handler{}).handlePut(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "PARENT_UNSAFE") {
+		t.Fatalf("body should contain PARENT_UNSAFE, got %q", rec.Body.String())
+	}
+	// evilOutside 下不应被写入新文件
+	if _, err := os.Stat(filepath.Join(evilOutside, "newfile")); !os.IsNotExist(err) {
+		t.Fatalf("evil outside should not have new file (defense worked), stat err=%v", err)
+	}
+}
+
+func TestHandlePut_PostRenameParentUnsafe_500_PathDiverged(t *testing.T) {
+	// 锁定 A.3 post-rename guard:用 renameFile seam 模拟 rename 把 tmp 移到
+	// 白名单外的路径(真实文件系统下无法稳定复现 race,只能 mock)。
+	//
+	// 场景:tmp 写完后,renameFile 走 fake,把 tmp rename 到 evilOutside/file。
+	// 之后 handlePut 调 resolveParentNoSymlink(p) — p 是 tmpDir/file(在白名单
+	// 内,parent 是 tmpDir 本身正常),但此时 attacker 已把 tmpDir 换成 symlink
+	// 指向 evilOutside —— 这部分我们用 symlink 物理模拟:
+	//   - 先把 tmpDir 加白名单
+	//   - rename 把 tmp 实际放进 evilOutside
+	//   - 再把 tmpDir 换成 symlink → evilOutside,这样 resolveParentNoSymlink(p)
+	//     的 parent EvalSymlinks 会拿到 evilOutside,不在白名单,触发 PATH_DIVERGED
+	//
+	// 注意 t.TempDir() 在 /tmp/xxx,evilOutside 也在 /tmp/xxx,两个互不嵌套。
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	evilOutside := t.TempDir()
+
+	// p 文本在 tmpDir 下;rename 完成后我们把 tmpDir 换成 symlink → evilOutside
+	target := filepath.Join(tmpDir, "victim.bin")
+
+	renameOrig := renameFile
+	renameFile = func(src, dst string) error {
+		// 真正把 tmp rename 到 evilOutside,模拟 attacker 在 rename 那瞬间
+		// 让 parent 解析到外部
+		evilDst := filepath.Join(evilOutside, filepath.Base(dst))
+		if err := os.Rename(src, evilDst); err != nil {
+			return err
+		}
+		// 接着把 tmpDir 替换成 symlink → evilOutside,这样后续的
+		// resolveParentNoSymlink(p=tmpDir/victim.bin) 解 parent 拿到 evilOutside
+		if err := os.RemoveAll(tmpDir); err != nil {
+			return err
+		}
+		if err := os.Symlink(evilOutside, tmpDir); err != nil {
+			return err
+		}
+		return nil
+	}
+	defer func() {
+		renameFile = renameOrig
+		// 清理:把 tmpDir symlink 干掉,让 t.TempDir 的 cleanup 别报错
+		_ = os.Remove(tmpDir)
+	}()
+
+	q := url.Values{}
+	q.Set("path", target)
+	q.Set("mode", "0644")
+
+	req := httptest.NewRequest(http.MethodPut, "/files?"+q.Encode(), bytes.NewReader([]byte("payload")))
+	rec := httptest.NewRecorder()
+	(&Handler{}).handlePut(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status: want 500 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "PATH_DIVERGED") {
+		t.Fatalf("body should contain PATH_DIVERGED, got %q", rec.Body.String())
 	}
 }
