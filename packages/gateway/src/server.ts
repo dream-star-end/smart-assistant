@@ -7,6 +7,8 @@ import {
   createReadStream,
   createWriteStream,
   existsSync,
+  fchmodSync,
+  fchownSync,
   fstatSync,
   linkSync,
   mkdirSync,
@@ -125,6 +127,29 @@ export const ALLOWED_INBOUND_MODELS = new Set([
   'deepseek-v4-flash',
   'deepseek-v4-pro',
 ])
+
+// ─── handleUpload TOCTOU hardening test seam (v3 commercial v1.0.155) ───────
+//
+// Production calls fchmod / fchown / link via `_uploadFsOps.*` so unit tests
+// can simulate failure modes (EPERM on fchown, EXDEV on link, etc.) without
+// spinning up real containers or root-side filesystem state. `null` restores
+// defaults. Production code MUST NOT call __setUploadFsOpsForTests.
+//
+// Only operations whose TOCTOU semantics matter for the contract are wrapped
+// — openSync / realpathSync / closeSync / fstatSync / unlinkSync remain
+// direct because their failure-injection isn't needed by current tests.
+//
+// Pattern mirrors `__setCodexSpawnForTests` in codexRunner.ts.
+type UploadFsOps = {
+  fchmodSync: typeof fchmodSync
+  fchownSync: typeof fchownSync
+  linkSync: typeof linkSync
+}
+const defaultUploadFsOps: UploadFsOps = { fchmodSync, fchownSync, linkSync }
+let _uploadFsOps: UploadFsOps = defaultUploadFsOps
+export function __setUploadFsOpsForTests(overrides: Partial<UploadFsOps> | null): void {
+  _uploadFsOps = overrides ? { ...defaultUploadFsOps, ...overrides } : defaultUploadFsOps
+}
 
 // v3 commercial: shared codex chatgpt OAuth between host gateway and per-user
 // containers requires two host directories — master (refresh_token, never
@@ -3323,7 +3348,23 @@ export class Gateway {
       return
     }
 
-    // ── 4. Open .tmp + streaming write + sha256 ──
+    // ── 4. Open .tmp fd-first + streaming write + sha256 ──
+    //
+    // TOCTOU hardening (v1.0.155):
+    //   1. openSync(O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0o600) — atomic create,
+    //      fail-closed if last component is a symlink or already exists.
+    //   2. realpathSync(/proc/self/fd/<n>) === tmpPath — parent-symlink race
+    //      defense (mirrors openFileHardened on the read path). If parent dir
+    //      was rename-swapped to a symlink in the window between baseReal
+    //      resolve and openSync, our fd lives outside the upload root and we
+    //      fail closed.
+    //   3. createWriteStream(..., { fd, autoClose: false }) — we own fd
+    //      lifetime via the outer try/finally; ws.destroy() does NOT close it.
+    //   4. fchmod/fchown on the fd (not path) — immune to attacker rename
+    //      between TOCTOU validate and chmod.
+    //   5. Post-link verify (fd realpath + dev/ino fstat compare) — guarantees
+    //      finalPath is the inode we just created, not an attacker-planted
+    //      collision.
     //
     // Architecture (Codex B1 review fix v2):
     //   • Single state-machine variable `settled` resolves the await Promise
@@ -3333,205 +3374,365 @@ export class Gateway {
     //     it for cleanup mis-deletes successful uploads. Instead we rely on
     //     `ws.finish` / `ws.error` / `req.error` / `req.aborted` only.
     //   • `cleanupTmp()` is the single place that destroys ws (with an Error
-    //     to ensure ws.error fires) and unlinks the .tmp file. Idempotent via
-    //     `cleaned` flag.
+    //     to ensure ws.error fires) and unlinks the .tmp dirent. Idempotent
+    //     via `cleaned` flag. fd is closed by the outer try/finally
+    //     (`closeTmpFd`), not by cleanupTmp — keeps fd lifetime in one place.
     const tmpName = `.tmp-${randomBytes(16).toString('hex')}`
     const tmpPath = join(baseReal, tmpName)
-    const ws = createWriteStream(tmpPath)
-    const hash = createHash('sha256')
-    let received = 0
-    let cleaned = false
-    let settled = false
-    let resolveWrite: (ok: boolean) => void = () => {}
-    const writeDone = new Promise<boolean>((resolveP) => {
-      resolveWrite = resolveP
-    })
-    const finish = (ok: boolean) => {
-      if (settled) return
-      settled = true
-      resolveWrite(ok)
+
+    let tmpFd: number | null = null
+    const closeTmpFd = (): void => {
+      if (tmpFd === null) return
+      try { closeSync(tmpFd) } catch {}
+      tmpFd = null
     }
 
-    const cleanupTmp = (cause?: Error) => {
-      if (cleaned) return
-      cleaned = true
-      try { ws.destroy(cause ?? new Error('upload cleanup')) } catch {}
-      unlink(tmpPath, () => {})
-    }
-
-    req.on('aborted', () => {
-      cleanupTmp(new Error('client aborted'))
-      finish(false)
-    })
-    req.on('error', (err) => {
-      this.log.warn('handleUpload: req error', undefined, err)
-      cleanupTmp(err)
-      finish(false)
-    })
-    ws.on('error', (err) => {
-      // Triggered either by upstream cleanupTmp() destroying us, or by a real
-      // disk write failure. Either way, we're done.
-      this.log.warn('handleUpload: write stream error', undefined, err)
-      cleanupTmp(err)
-      if (!res.headersSent) {
-        this.sendError(res, 500, 'write failed')
-      }
-      finish(false)
-    })
-    ws.on('finish', () => {
-      // Only "happy path" terminator. Note: ws emits 'finish' AFTER the file
-      // is fully flushed, so it's safe to rename in the await-then block.
-      finish(true)
-    })
-
-    let exceededLimit = false
-    req.on('data', (chunk: Buffer) => {
-      if (exceededLimit) return
-      received += chunk.length
-      if (received > MAX_UPLOAD_SINGLE) {
-        exceededLimit = true
-        if (!res.headersSent) {
-          this.sendError(res, 413, `file exceeds ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB`)
-        }
-        // Order matters: unpipe BEFORE destroying req, so any in-flight data
-        // doesn't trigger a write on the destroyed ws (and the corresponding
-        // ws.error path which is already handled by cleanupTmp).
-        try { req.unpipe(ws) } catch {}
-        cleanupTmp(new Error('upload exceeded MAX_UPLOAD_SINGLE'))
-        try { req.destroy() } catch {}
-        finish(false)
-        return
-      }
-      hash.update(chunk)
-    })
-
-    // Pipe data into the write stream. ws.finish / ws.error / req.error /
-    // req.aborted / size-limit overflow each call finish() exactly once.
-    req.pipe(ws)
-    const writeOk = await writeDone
-
-    if (!writeOk || cleaned || exceededLimit) {
-      // Some error path already responded (413, 500, or req-aborted with no
-      // headers). If somehow none has, send a generic abort.
-      cleanupTmp()
-      if (!res.headersSent && !res.writableEnded) {
-        this.sendError(res, 400, 'upload aborted')
-      }
-      return
-    }
-
-    // ── 5. Compute final name + per-user prep + atomic publish ──
-    const digest = hash.digest('hex')
-    const ext = uploadExtForMime(ctype)
-    const finalName = `${digest}.${ext}`
-    const finalPath = join(baseReal, finalName)
-
-    // 5-remote. Remote-host placement: bytes are still on master's local tmp;
-    // ship them to the remote node-agent /files which writes into the user's
-    // docker volume on that host. node-agent end does chown(1000:1000)+chmod
-    // 0644 via owner_uid/owner_gid/mode query params (equivalent to the local
-    // self-host branch below). On success we drop the local staging file.
-    //
-    // Dedup is intentionally not optimized here (no preflight stat) — the
-    // remote node-agent's PUT is tmp+fsync+rename, so re-pushing the same
-    // digest is safe and the bandwidth cost is bounded by MAX_UPLOAD_SINGLE.
-    if (remoteUpload) {
-      let content: Buffer
+    try {
       try {
-        content = await readFile(tmpPath)
-      } catch (err) {
-        this.log.error('handleUpload: read local tmp for remote push failed', {
+        tmpFd = openSync(
           tmpPath,
-          userId,
-        }, err)
-        try { unlinkSync(tmpPath) } catch {}
-        this.sendError(res, 500, 'storage read failed')
+          fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+          0o600,
+        )
+      } catch (err) {
+        this.log.error('handleUpload: tmp open failed', { tmpPath }, err)
+        this.sendError(res, 500, 'storage open failed')
+        req.destroy()
         return
       }
-      const remotePath = `${remoteUpload.remoteUploadsDir}/${finalName}`
+      // Verify the fd actually points to our intended path (parent-symlink
+      // race defense). If divergent, the file was created somewhere outside
+      // our upload root via a swapped parent symlink — best-effort unlink
+      // the bogus dirent via its REAL path (not tmpPath, which now points
+      // somewhere else entirely) and fail closed. Disk-leak DoS in the
+      // worst case if the unlink races again; not a security boundary
+      // violation. Documented in docs/audit-file-toctou.md.
+      let tmpFdReal: string
       try {
-        await this.deps.commercial!.pushRemoteHostUpload!({
-          hostUuid: remoteUpload.hostUuid,
-          remotePath,
-          content,
+        tmpFdReal = realpathSync(`/proc/self/fd/${tmpFd}`)
+      } catch (err) {
+        this.log.error('handleUpload: tmp fd realpath failed', { tmpPath }, err)
+        try { unlinkSync(tmpPath) } catch {}
+        this.sendError(res, 500, 'storage verify failed')
+        req.destroy()
+        return
+      }
+      if (tmpFdReal !== tmpPath) {
+        this.log.warn('handleUpload: tmp fd diverged from intended path', {
+          tmpPath,
+          tmpFdReal,
         })
-      } catch (err) {
-        this.log.error('handleUpload: push to remote host failed', {
-          hostUuid: remoteUpload.hostUuid,
-          remotePath,
-          userId,
-        }, err)
-        try { unlinkSync(tmpPath) } catch {}
-        // 502 — upstream (node-agent) failure, distinct from master's own
-        // storage failure (500). Frontend retry on this is reasonable.
-        this.sendError(res, 502, 'remote storage push failed')
+        try { unlinkSync(tmpFdReal) } catch {}
+        this.sendError(res, 500, 'storage path diverged')
+        req.destroy()
         return
       }
-      try { unlinkSync(tmpPath) } catch {}
-      this.sendJson(res, 200, {
-        url: `/api/media/${finalName}`,
-        digest,
-        size: received,
-        mimeType: ctype,
-      })
-      return
-    }
 
-    // 5a. Per-user mode: chmod 0644 + chown to agent uid (1000:1000) BEFORE
-    // publishing. tmp inode 此时只有一个 dirent,任何失败都只影响我们自己的 tmp,
-    // 不会污染并发其他请求已 publish 的 finalPath。
-    //
-    // Files written by master (running as root in v3 commercial) into a
-    // docker volume host path land as root:root. The container's agent
-    // process is uid=1000 / gid=1000 (Dockerfile USER agent). Without
-    // chown the container can still read (0644 is world-readable), but
-    // ownership matches files written by the agent itself, avoiding
-    // confusing future cleanup heuristics. chmod 0644 explicitly covers
-    // the case where master's umask differs from default.
-    //
-    // Personal-mode (legacy) writes still go to /root/.openclaude/uploads,
-    // same uid as the master process — chown would be no-op; skip.
-    if (isPerUser) {
+      const ws = createWriteStream(null as unknown as string, { fd: tmpFd, autoClose: false })
+      const hash = createHash('sha256')
+      let received = 0
+      let cleaned = false
+      let settled = false
+      let resolveWrite: (ok: boolean) => void = () => {}
+      const writeDone = new Promise<boolean>((resolveP) => {
+        resolveWrite = resolveP
+      })
+      const finish = (ok: boolean) => {
+        if (settled) return
+        settled = true
+        resolveWrite(ok)
+      }
+
+      const cleanupTmp = (cause?: Error) => {
+        if (cleaned) return
+        cleaned = true
+        try { ws.destroy(cause ?? new Error('upload cleanup')) } catch {}
+        unlink(tmpPath, () => {})
+      }
+
+      req.on('aborted', () => {
+        cleanupTmp(new Error('client aborted'))
+        finish(false)
+      })
+      req.on('error', (err) => {
+        this.log.warn('handleUpload: req error', undefined, err)
+        cleanupTmp(err)
+        finish(false)
+      })
+      ws.on('error', (err) => {
+        // Triggered either by upstream cleanupTmp() destroying us, or by a real
+        // disk write failure. Either way, we're done.
+        this.log.warn('handleUpload: write stream error', undefined, err)
+        cleanupTmp(err)
+        if (!res.headersSent) {
+          this.sendError(res, 500, 'write failed')
+        }
+        finish(false)
+      })
+      ws.on('finish', () => {
+        // Only "happy path" terminator. Note: ws emits 'finish' AFTER the file
+        // is fully flushed, so it's safe to fchmod/link in the await-then block.
+        finish(true)
+      })
+
+      let exceededLimit = false
+      req.on('data', (chunk: Buffer) => {
+        if (exceededLimit) return
+        received += chunk.length
+        if (received > MAX_UPLOAD_SINGLE) {
+          exceededLimit = true
+          if (!res.headersSent) {
+            this.sendError(res, 413, `file exceeds ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB`)
+          }
+          // Order matters: unpipe BEFORE destroying req, so any in-flight data
+          // doesn't trigger a write on the destroyed ws (and the corresponding
+          // ws.error path which is already handled by cleanupTmp).
+          try { req.unpipe(ws) } catch {}
+          cleanupTmp(new Error('upload exceeded MAX_UPLOAD_SINGLE'))
+          try { req.destroy() } catch {}
+          finish(false)
+          return
+        }
+        hash.update(chunk)
+      })
+
+      // Pipe data into the write stream. ws.finish / ws.error / req.error /
+      // req.aborted / size-limit overflow each call finish() exactly once.
+      req.pipe(ws)
+      const writeOk = await writeDone
+
+      if (!writeOk || cleaned || exceededLimit) {
+        // Some error path already responded (413, 500, or req-aborted with no
+        // headers). If somehow none has, send a generic abort.
+        cleanupTmp()
+        if (!res.headersSent && !res.writableEnded) {
+          this.sendError(res, 400, 'upload aborted')
+        }
+        return
+      }
+
+      // ── 5. Compute final name + per-user prep + atomic publish ──
+      const digest = hash.digest('hex')
+      const ext = uploadExtForMime(ctype)
+      const finalName = `${digest}.${ext}`
+      const finalPath = join(baseReal, finalName)
+
+      // 5-remote. Remote-host placement: bytes are still on master's local tmp;
+      // ship them to the remote node-agent /files which writes into the user's
+      // docker volume on that host. node-agent end does chown(1000:1000)+chmod
+      // 0644 via owner_uid/owner_gid/mode query params (equivalent to the local
+      // self-host branch below). On success we drop the local staging file.
+      //
+      // Path-based readFile here is safe: our tmpFd was verified to point at
+      // tmpPath above, and remote write is to a root-owned destination that
+      // re-validates with node-agent's own AllowedRoots. Worst case if attacker
+      // races a parent swap right now: readFile fails or returns attacker
+      // content (signed by digest we already computed — would diverge → push
+      // succeeds but client sees mismatched bytes, no privilege escalation).
+      //
+      // Dedup is intentionally not optimized here (no preflight stat) — the
+      // remote node-agent's PUT is tmp+fsync+rename, so re-pushing the same
+      // digest is safe and the bandwidth cost is bounded by MAX_UPLOAD_SINGLE.
+      if (remoteUpload) {
+        let content: Buffer
+        try {
+          content = await readFile(tmpPath)
+        } catch (err) {
+          this.log.error('handleUpload: read local tmp for remote push failed', {
+            tmpPath,
+            userId,
+          }, err)
+          try { unlinkSync(tmpPath) } catch {}
+          this.sendError(res, 500, 'storage read failed')
+          return
+        }
+        const remotePath = `${remoteUpload.remoteUploadsDir}/${finalName}`
+        try {
+          await this.deps.commercial!.pushRemoteHostUpload!({
+            hostUuid: remoteUpload.hostUuid,
+            remotePath,
+            content,
+          })
+        } catch (err) {
+          this.log.error('handleUpload: push to remote host failed', {
+            hostUuid: remoteUpload.hostUuid,
+            remotePath,
+            userId,
+          }, err)
+          try { unlinkSync(tmpPath) } catch {}
+          // 502 — upstream (node-agent) failure, distinct from master's own
+          // storage failure (500). Frontend retry on this is reasonable.
+          this.sendError(res, 502, 'remote storage push failed')
+          return
+        }
+        try { unlinkSync(tmpPath) } catch {}
+        this.sendJson(res, 200, {
+          url: `/api/media/${finalName}`,
+          digest,
+          size: received,
+          mimeType: ctype,
+        })
+        return
+      }
+
+      // 5a. fd-based mode/owner prep — TOCTOU-safe.
+      //
+      //   • fchmod 0o644 unconditionally: tmp was opened 0o600; published
+      //     files need world-read (served via /api/media stream, but also
+      //     read by per-user docker container's agent uid). Behavior delta
+      //     vs old path-based code: personal mode previously inherited
+      //     createWriteStream default 0o666 - umask (~0o644 with default
+      //     umask 0o022); now explicit. Same end-state in 99% of cases.
+      //   • fchown to agent uid (1000:1000) only for per-user docker volumes.
+      //     Personal mode: same uid as master, chown would be no-op + risk
+      //     EPERM on non-root local dev → skip.
+      //
+      // Routed through `_uploadFsOps.*` for failure-injection in unit tests
+      // (see `__setUploadFsOpsForTests`). Failure here only affects our
+      // private tmp fd (still pre-link, single dirent), so cleanup unlinks
+      // the tmp and the finally closes the fd; no concurrent publisher's
+      // file can be touched.
       try {
-        chmodSync(tmpPath, 0o644)
-        chownSync(tmpPath, 1000, 1000)
+        _uploadFsOps.fchmodSync(tmpFd, 0o644)
+        if (isPerUser) {
+          _uploadFsOps.fchownSync(tmpFd, 1000, 1000)
+        }
       } catch (err) {
-        this.log.error('handleUpload: pre-publish chown/chmod failed', {
+        this.log.error('handleUpload: pre-publish fchmod/fchown failed', {
           tmpPath,
+          isPerUser,
           userId,
         }, err)
         try { unlinkSync(tmpPath) } catch {}
         this.sendError(res, 500, 'storage prep failed')
         return
       }
-    }
 
-    // 5b. Atomic publish via no-overwrite hardlink. linkSync 是原子的,EEXIST
-    // 立即给我们一个 race-free 的 dedup 信号。对比之前 existsSync + renameSync
-    // 模式:rename 会静默覆盖,并发同 digest 上传 + chown 失败时的 unlink finalPath
-    // 会清掉别人刚 publish 的成功文件。
-    try {
-      linkSync(tmpPath, finalPath)
-    } catch (err) {
-      const code = (err as { code?: string })?.code
-      if (code !== 'EEXIST') {
-        this.log.error('handleUpload: link failed', undefined, err)
-        try { unlinkSync(tmpPath) } catch {}
-        this.sendError(res, 500, 'storage write failed')
-        return
+      // 5b. Atomic publish via no-overwrite hardlink. linkSync is atomic +
+      // fail-closed on EEXIST (race-free dedup signal). We verify post-link
+      // that finalPath actually points to OUR tmp inode (not an attacker-
+      // planted collision via parent-symlink swap on finalPath's side).
+      let eexistDedup = false
+      try {
+        _uploadFsOps.linkSync(tmpPath, finalPath)
+      } catch (err) {
+        const code = (err as { code?: string })?.code
+        if (code !== 'EEXIST') {
+          this.log.error('handleUpload: link failed', undefined, err)
+          try { unlinkSync(tmpPath) } catch {}
+          this.sendError(res, 500, 'storage write failed')
+          return
+        }
+        // dedup hit: 既有 finalPath 是先前同 digest 上传 publish 出来的,owner 已
+        // 是 agent uid(per-user 模式)或 master uid(personal 模式)。语义正确。
+        eexistDedup = true
       }
-      // dedup hit: 既有 finalPath 是先前同 digest 上传 publish 出来的,owner 已
-      // 是 agent uid(per-user 模式)或 master uid(personal 模式)。语义正确。
-    }
-    // 不论是新 link 还是 dedup,tmpPath 都不再需要。drop it.
-    try { unlinkSync(tmpPath) } catch {}
 
-    this.sendJson(res, 200, {
-      url: `/api/media/${finalName}`,
-      digest,
-      size: received,
-      mimeType: ctype,
-    })
+      // 5c. Post-link verify: parent-symlink defense on finalPath's side,
+      // applied to BOTH the just-linked and EEXIST-dedup cases.
+      //
+      //   (i)   openSync(finalPath, O_RDONLY|O_NOFOLLOW) — last-component
+      //         symlink defense (matches openFileHardened).
+      //   (ii)  realpathSync(/proc/self/fd/<finalFd>) === finalPath — parent-
+      //         symlink race defense (parent swapped between our linkSync
+      //         and the open here, or between a prior publish and now).
+      //   (iii) fstat(tmpFd).dev/ino === fstat(finalFd).dev/ino — additional
+      //         proof for **new** publishes that the link landed on OUR
+      //         bytes. Skipped for dedup — by definition dedup means the
+      //         inode at finalPath is from a prior request, not our tmpFd.
+      //
+      // Why dedup also needs (i)+(ii) (Codex 2026-05-16 review fix): without
+      // them an attacker could parent-swap finalPath's dir to a controlled
+      // location with a pre-placed `<digest>.<ext>` → our linkSync sees
+      // EEXIST → we return 200 without ever validating the inode lives under
+      // the legitimate upload root. Read-path openFileHardened would later
+      // 404 the bogus URL, but we'd have lied to the client about success.
+      //
+      // Cleanup of finalPath on verify failure:
+      //   • new-link path: we just created this inode at finalPath → safe to
+      //     best-effort unlinkSync (residual race documented).
+      //   • dedup path: we don't own the inode (could be prior legitimate
+      //     publish OR attacker plant in attacker-controlled location). Do
+      //     NOT unlink — leave the artifact alone, fail closed.
+      let finalFd: number | null = null
+      try {
+        try {
+          finalFd = openSync(
+            finalPath,
+            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+          )
+        } catch (err) {
+          this.log.error('handleUpload: post-link open failed', { finalPath, eexistDedup }, err)
+          if (!eexistDedup) {
+            try { unlinkSync(finalPath) } catch {}
+          }
+          try { unlinkSync(tmpPath) } catch {}
+          this.sendError(res, 500, 'storage publish verify failed')
+          return
+        }
+        let finalReal: string
+        try {
+          finalReal = realpathSync(`/proc/self/fd/${finalFd}`)
+        } catch (err) {
+          this.log.error('handleUpload: post-link realpath failed', { finalPath, eexistDedup }, err)
+          if (!eexistDedup) {
+            try { unlinkSync(finalPath) } catch {}
+          }
+          try { unlinkSync(tmpPath) } catch {}
+          this.sendError(res, 500, 'storage publish verify failed')
+          return
+        }
+        if (finalReal !== finalPath) {
+          this.log.error('handleUpload: post-link parent swap detected', {
+            finalPath,
+            finalReal,
+            eexistDedup,
+          })
+          if (!eexistDedup) {
+            try { unlinkSync(finalPath) } catch {}
+          }
+          try { unlinkSync(tmpPath) } catch {}
+          this.sendError(res, 500, 'storage publish diverged')
+          return
+        }
+        if (!eexistDedup) {
+          const tmpStat = fstatSync(tmpFd)
+          const finalStat = fstatSync(finalFd)
+          if (tmpStat.dev !== finalStat.dev || tmpStat.ino !== finalStat.ino) {
+            this.log.error('handleUpload: post-link inode mismatch', {
+              finalPath,
+              tmpDev: tmpStat.dev,
+              tmpIno: tmpStat.ino,
+              finalDev: finalStat.dev,
+              finalIno: finalStat.ino,
+            })
+            try { unlinkSync(finalPath) } catch {}
+            try { unlinkSync(tmpPath) } catch {}
+            this.sendError(res, 500, 'storage publish diverged')
+            return
+          }
+        }
+      } finally {
+        if (finalFd !== null) {
+          try { closeSync(finalFd) } catch {}
+        }
+      }
+
+      // Drop tmp dirent. The inode is kept alive by finalPath's hardlink (new
+      // publish) or by the prior publisher's dirent (dedup). Our tmpFd stays
+      // open until the outer finally; that's fine — unlinked-but-open is
+      // standard Unix semantics.
+      try { unlinkSync(tmpPath) } catch {}
+
+      this.sendJson(res, 200, {
+        url: `/api/media/${finalName}`,
+        digest,
+        size: received,
+        mimeType: ctype,
+      })
+    } finally {
+      closeTmpFd()
+    }
   }
 
   // GET /api/agents         → { agents, default }

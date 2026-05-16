@@ -10,6 +10,53 @@ Phase 2 (v1.0.151) 上线时,为 `handleGet` 加了 fd-realpath 后置校验 (�
 
 ---
 
+## 2026-05-16 范围扩展:gateway master 进程的 self-host 写路径
+
+`node-agent` 当前实际部署形态是 dormant 代码(self host 不跑 node-agent,
+boheyun 已废弃 → 0 实例)。**真正的攻击面在 gateway 主进程内的 self-host
+文件 IO 上**,具体是 `server.ts: handleUpload` 这个写路径 —— 它 PUT 进
+docker 命名卷的 host-side mountpoint,而 baseline 镜像把
+`/home/agent/.openclaude` 设 `agent:agent`,所以 host 侧 `uploads/`
+`generated/` 目录 owner = uid 1000 = 容器可写。攻击者可 `rename` 这两个目录
+本身、或在 parent (`_data/`) 也是 uid 1000 时直接 swap 成 symlink。
+
+修复(v1.0.155):
+
+- **fd-first open**:`openSync(tmpPath, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0o600)`,
+  原子创建 + 最后一段 symlink 防御。
+- **post-open verify**:`realpathSync('/proc/self/fd/<n>') === tmpPath`,关掉
+  parent-symlink race window(对齐 `openFileHardened` 模式)。
+- **fd-based chmod/chown**:之前 `chmodSync(path)` / `chownSync(path)` 可被
+  rename-swap 把 root 的 chown 转到 `/etc/某文件`;改成 `fchmodSync(fd)` /
+  `fchownSync(fd, 1000, 1000)` 完全规避。
+- **post-link triple verify**:`linkSync` 之后再次 `openSync(finalPath, NOFOLLOW)`
+  + `realpathSync(/proc/self/fd)` + `fstat(tmpFd).dev/ino === fstat(finalFd).dev/ino`,
+  确保 finalPath 指向我们刚生成的 inode 而非攻击者塞入的碰撞。
+- **try/finally fd 生命周期**:外层 `closeTmpFd` 在所有错误路径都关 fd,
+  避免 fd 泄漏。`ws` 用 `{ fd, autoClose: false }` 让 fd lifetime 集中管理。
+- **测试 seam**:`__setUploadFsOpsForTests` 包装 fchmod/fchown/link,future
+  unit test 可注入 EPERM / EXDEV 而无需 root 或 docker。
+
+剩余风险(未根治):
+- `unlinkSync(tmpFdReal)` 和 `unlinkSync(finalPath)` 这两个错误清理路径仍是
+  path-based,理论上可被二次 swap 让 unlink 删错文件 → 但攻击者要先成功
+  发起一次 parent-symlink swap,此时清理失败最多是磁盘泄漏 DoS,不会扩大
+  权限边界。同 handleGet/handlePut 的剩余 race 等价。
+- `remoteUpload` 分支的 `readFile(tmpPath)` 是 path-based,可被并发 swap
+  污染。但目标是 root-owned 的远程目录(node-agent 自己再 validate),且
+  内容已 hash → digest 已下发给客户端,内容篡改会被客户端发现 sha 不符。
+  无权限提升,接受现状。
+- 中期方案:用 `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)` 在 syscall
+  层一次性根治。Node 无内置绑定,需 native addon 或 ffi-napi,工作量
+  4-8 小时,排进 backlog。
+
+---
+
+## 以下章节为原 node-agent 层审计(2026-05-16 上半部分),保留供参考。
+**node-agent 当前不在生产环境运行;改这块代码无运行时收益**。
+
+---
+
 ## 攻击者模型
 
 ```
@@ -155,3 +202,20 @@ fd, err := unix.Openat2(dirfd, relPath, how)
 - [ ] 短期 hardening 三件套 (我现在动手)
 - [ ] 中期 openat2 一次性重构 (排进 backlog)
 - [ ] 三选其它组合 (你说)
+
+---
+
+## 2026-05-16 实际选型 + 后续
+
+boss 选了"只动 v3 commercial 真攻击面" → 上面整段 gateway master 进程
+self-host 写路径 hardening 在 **v1.0.155** 一次性落地(commit
+`fix(gateway): handleUpload TOCTOU hardening`)。node-agent 这部分代码仍保留
+现状,排进 backlog 等 boheyun-style remote host 重新上线再统一收。
+
+Backlog:
+1. `openat2(RESOLVE_BENEATH)` 一次性根治(self-host + remote-host 都受益)。
+   需 native addon / ffi-napi。
+2. node-agent /files handlePut / handleStat / handleDelete 应用同款
+   fd-realpath verify(只有 remote host 重新上线后才有意义)。
+3. handleUpload 错误清理路径 path-based unlink 的剩余 race 用 openat/unlinkat
+   收尾(同 1 一起做)。
