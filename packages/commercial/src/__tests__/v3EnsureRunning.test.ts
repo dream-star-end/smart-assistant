@@ -67,13 +67,27 @@ class FakePool {
   insertCount = 0;
   /** test 钩子:第 N 次 INSERT 强制 23505 */
   forceUniqConflictOnInserts = new Set<number>();
+  /**
+   * V3 Phase 3I per-host cap:模拟 compute_hosts.max_containers。
+   * `setHostMax(uuid, null)` 显式模拟 "compute_hosts 行 missing"。
+   * 未配置 host_uuid → DEFAULT_TEST_HOST_MAX = 999(单测默认不踩 cap)。
+   */
+  hostMax: Map<string, number | null> = new Map();
+  setHostMax(hostUuid: string, max: number | null): void {
+    this.hostMax.set(hostUuid, max);
+  }
 
-  preInsertActive(uid: number, boundIp: string, dockerId: string | null = "dockerid-pre"): FakeRow {
+  preInsertActive(
+    uid: number,
+    boundIp: string,
+    dockerId: string | null = "dockerid-pre",
+    hostUuid: string = TEST_HOST,
+  ): FakeRow {
     const now = new Date();
     const row: FakeRow = {
       id: this.nextId++,
       user_id: uid,
-      host_uuid: null,
+      host_uuid: hostUuid,
       bound_ip: boundIp,
       secret_hash: Buffer.alloc(32, 0xaa),
       state: "active",
@@ -186,10 +200,25 @@ class FakePool {
         }],
       };
     }
-    // V3 Phase 3I — provision 内部 active count cap query
-    if (/SELECT COUNT\(\*\)::text AS active/i.test(trimmed) && /state = 'active'/i.test(trimmed)) {
-      const active = this.rows.filter((x) => x.state === "active").length;
-      return { rowCount: 1, rows: [{ active: String(active) }] };
+    // V3 Phase 3I — per-host admission gate(provisionV3Container 内事务):
+    //   SELECT (SELECT COUNT(*) ... WHERE state='active' AND host_uuid=$1)::text AS active,
+    //          (SELECT max_containers FROM compute_hosts WHERE id=$1) AS max_containers
+    if (
+      /SELECT COUNT\(\*\) FROM agent_containers/i.test(trimmed)
+      && /AS active/i.test(trimmed)
+      && /max_containers FROM compute_hosts/i.test(trimmed)
+    ) {
+      const hostUuid = String(params![0]);
+      const active = this.rows.filter(
+        (x) => x.state === "active" && x.host_uuid === hostUuid,
+      ).length;
+      const max = this.hostMax.has(hostUuid)
+        ? this.hostMax.get(hostUuid)
+        : DEFAULT_TEST_HOST_MAX;
+      return {
+        rowCount: 1,
+        rows: [{ active: String(active), max_containers: max }],
+      };
     }
     throw new Error(`FakePool: unhandled SQL: ${trimmed.slice(0, 200)}`);
   }
@@ -295,6 +324,12 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
   return { docker, captured };
 }
 
+// V3 Phase 3I per-host cap:provisionV3Container 现在强制 effectiveHostUuid
+// (hostId || deps.selfHostId)非空且 canonical UUID,所以测试 deps 必须给
+// selfHostId。FakePool 默认对此 host 应用 DEFAULT_TEST_HOST_MAX=999(不踩 cap)。
+const TEST_HOST = "11111111-1111-1111-1111-111111111111";
+const DEFAULT_TEST_HOST_MAX = 999;
+
 function makeDeps(
   docker: Docker,
   pool: Pool,
@@ -304,6 +339,7 @@ function makeDeps(
     docker,
     pool,
     image: "openclaude/openclaude-runtime:test",
+    selfHostId: TEST_HOST,
     randomIp: () => "172.30.5.42",
     randomSecret: () => "a".repeat(64),
     ...overrides,
@@ -766,17 +802,23 @@ describe("makeV3EnsureRunning", () => {
     });
   });
 
-  // V3 Phase 3I: provision 撞 cap → SupervisorError("HostFull") 必须翻成
-  // ContainerUnreadyError("host_full", retryAfter=10),前端按 retryAfter 提示"系统繁忙"。
-  test("provision 时 host 满 cap → ContainerUnreadyError('host_full', retryAfter=10)", async () => {
+  // V3 Phase 3I: provision 撞 per-host max_containers → SupervisorError("HostFull")
+  // 必须翻成 ContainerUnreadyError("host_full", retryAfter=10),前端按 retryAfter 提示
+  // "系统繁忙",下次 pickHost 自然换台。
+  //
+  // 设计变更(v1.0.x — 全局 cap → per-host cap):
+  //   - deps.maxRunningContainers 已删,权威源是 compute_hosts.max_containers(admin UI 管理)
+  //   - cap 检查现在 BEGIN 后、acquire host-cap lock 后做(事务内),撞 cap 走 ROLLBACK
+  //   - HostFull 分支不再 safeEnqueueAlert(单 host 满是正常调度压力,不告警);
+  //     "全集群无可用 host" 语义由 NodePoolUnavailableError 分支承担
+  test("provision 时 host 满 per-host cap → ContainerUnreadyError('host_full', retryAfter=10)", async () => {
     const pool = new FakePool();
-    // 塞满 maxRunningContainers=2,uid=18 没有 active 行 → 走 provision → cap 拒
+    // 模拟 admin UI 把 TEST_HOST 的 max_containers 设到 2,DB 已 active 2 个 → 撞 cap
+    pool.setHostMax(TEST_HOST, 2);
     pool.preInsertActive(101, "172.30.1.101", "dockerid-101");
     pool.preInsertActive(102, "172.30.1.102", "dockerid-102");
     const { docker, captured } = makeDocker();
-    const deps = makeDeps(docker, pool as unknown as Pool, {
-      maxRunningContainers: 2,
-    });
+    const deps = makeDeps(docker, pool as unknown as Pool);
     const ensureRunning = makeV3EnsureRunning(deps, {
       probeHealthz: async () => true,
       probeWsUpgrade: async () => true,
@@ -790,9 +832,11 @@ describe("makeV3EnsureRunning", () => {
       assert.strictEqual(err.retryAfterSec, ENSURE_RUNNING_DEFAULTS.RETRY_AFTER_HOST_FULL_SEC);
       return true;
     });
-    // cap 在事务前直接拒 → 不 createContainer / 不 start
+    // cap 在事务内拒 → 不 createContainer / 不 start
     assert.strictEqual(captured.containersCreated, 0);
     assert.strictEqual(captured.started, 0);
+    // 行数不变(事务回滚) — uid=18 没有遗留 row
+    assert.strictEqual(pool.rows.some((r) => r.user_id === 18), false);
   });
 
   // V1.0.53 — buildReadinessOpts 不再 eager 填 timeoutMs(留给 waitContainerReady

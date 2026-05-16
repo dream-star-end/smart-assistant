@@ -376,18 +376,11 @@ export function makeV3EnsureRunning(
         placement?.bridgeCidr,
       );
     } catch (err) {
-      // V3 Phase 3I — host 满 cap 走专用 reason + 长 retryAfter,前端显示"系统繁忙"
+      // 单 host 达 per-host max_containers — 正常调度压力,不告警。
+      // 观测口径已由 provisionV3Container 内 log.info("v3 per-host cap hit", ...) 承担;
+      // "全集群无可用 host"语义在上面 NodePoolUnavailableError 分支处理(同 reason 翻译,
+      // 不在此处兜底)。前端按 10s retryAfter 长重试,下次 pickHost 自然换台。
       if (err instanceof SupervisorError && err.code === "HostFull") {
-        // 告警:host 达 MAX_RUNNING_CONTAINERS — 容量规划问题,critical。
-        // dedupe 按分钟桶避免风暴;运维扩容后自然解除。
-        safeEnqueueAlert({
-          event_type: EVENTS.CONTAINER_PROVISION_FAILED,
-          severity: "critical",
-          title: "容器 provision 失败 — 宿主容量满",
-          body: `uid=${uid} provision 被拒:宿主达到 MAX_RUNNING_CONTAINERS。需扩容或触发 idle sweep。`,
-          payload: { uid, reason: "host_full" },
-          dedupe_key: `container.provision_failed:host_full:${new Date().toISOString().slice(0, 16)}`,
-        });
         throw new ContainerUnreadyError(RETRY_AFTER_HOST_FULL_SEC, "host_full");
       }
       // Codex round 1 FAIL #4 fix:ImageNotFound 是部署级故障 — 5s 重试只会风暴

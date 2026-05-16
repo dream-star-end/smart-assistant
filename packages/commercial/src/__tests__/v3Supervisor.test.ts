@@ -223,6 +223,16 @@ class FakePool {
    */
   forceConflictConstraintName: Map<number, string> = new Map();
   insertCount = 0;
+  /**
+   * v3 per-host cap admission test hook —— mock compute_hosts.max_containers。
+   * 未配置 host_uuid → 走 DEFAULT_TEST_HOST_MAX(999,默认不踩 cap)。
+   * 通过 setHostMax(uuid, n) 覆盖单 host 的上限,模拟 admin UI 改 max。
+   * 设为 null 模拟 compute_hosts 行 missing(应触发 InvalidArgument)。
+   */
+  hostMax: Map<string, number | null> = new Map();
+  setHostMax(hostUuid: string, max: number | null): void {
+    this.hostMax.set(hostUuid, max);
+  }
 
   async connect(): Promise<PoolClient> {
     const log = this.clientLog;
@@ -330,10 +340,29 @@ class FakePool {
             }],
           };
         }
-        // V3 Phase 3I — provisionV3Container 在事务前查 active count 做 cap 检查
-        if (/SELECT COUNT\(\*\)::text AS active/i.test(trimmed) && /state = 'active'/i.test(trimmed)) {
-          const active = self.rows.filter((x) => x.state === "active").length;
-          return { rowCount: 1, rows: [{ active: String(active) }] };
+        // v3 per-host cap admission gate —— provisionV3Container 在 BEGIN 后
+        // 拿 per-host advisory lock 后,同事务读 per-host active count + per-host
+        // compute_hosts.max_containers。SQL 形态:
+        //   SELECT
+        //     (SELECT COUNT(*) FROM agent_containers
+        //       WHERE state='active' AND host_uuid=$1::uuid)::text AS active,
+        //     (SELECT max_containers FROM compute_hosts WHERE id=$1::uuid) AS max_containers
+        if (
+          /SELECT COUNT\(\*\) FROM agent_containers/i.test(trimmed)
+          && /AS active/i.test(trimmed)
+          && /max_containers FROM compute_hosts/i.test(trimmed)
+        ) {
+          const hostUuid = String(params![0]);
+          const active = self.rows.filter(
+            (x) => x.state === "active" && x.host_uuid === hostUuid,
+          ).length;
+          const max = self.hostMax.has(hostUuid)
+            ? self.hostMax.get(hostUuid)
+            : DEFAULT_TEST_HOST_MAX;
+          return {
+            rowCount: 1,
+            rows: [{ active: String(active), max_containers: max }],
+          };
         }
         throw new Error(`FakePool: unhandled SQL: ${trimmed.slice(0, 200)}`);
       },
@@ -360,6 +389,15 @@ class FakePool {
 // ───────────────────────────────────────────────────────────────────────
 
 const TEST_IMAGE = "openclaude/openclaude-runtime:test";
+
+/**
+ * 默认测试用 selfHostId / hostId。canonical 36-char lowercase UUID,与
+ * provisionV3Container 内的 HOST_UUID_CANONICAL_RE 严格校验对齐。
+ * FakePool 默认对此 host 应用 `DEFAULT_TEST_HOST_MAX` = 999(单测不踩 cap)。
+ */
+const TEST_HOST = "11111111-1111-1111-1111-111111111111";
+const TEST_HOST_ALT = "22222222-2222-2222-2222-222222222222";
+const DEFAULT_TEST_HOST_MAX = 999;
 
 function fixedSecret(s: string): () => string {
   return () => s;
@@ -422,7 +460,7 @@ describe("provisionV3Container", () => {
     const SECRET = "a".repeat(64);
     const IP = "172.30.5.42";
     const result = await provisionV3Container(
-      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => IP, randomSecret: fixedSecret(SECRET) },
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => IP, randomSecret: fixedSecret(SECRET) },
       777,
     );
 
@@ -543,7 +581,7 @@ describe("provisionV3Container", () => {
       {
         const { docker, captured } = makeDocker();
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.9.1", randomSecret: fixedSecret("c".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.9.1", randomSecret: fixedSecret("c".repeat(64)) },
           901,
         );
         const hc = captured.containersCreated[0]!.HostConfig!;
@@ -560,7 +598,7 @@ describe("provisionV3Container", () => {
       {
         const { docker, captured } = makeDocker();
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.9.2", randomSecret: fixedSecret("d".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.9.2", randomSecret: fixedSecret("d".repeat(64)) },
           902,
         );
         const hc = captured.containersCreated[0]!.HostConfig!;
@@ -580,7 +618,7 @@ describe("provisionV3Container", () => {
     const { docker, captured } = makeDocker();
     const SECRET = "b".repeat(64);
     const result = await provisionV3Container(
-      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.7", randomSecret: fixedSecret(SECRET) },
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.7", randomSecret: fixedSecret(SECRET) },
       11,
     );
     assert.equal(pool.rows.length, 1);
@@ -606,7 +644,7 @@ describe("provisionV3Container", () => {
     pool.forceUniqConflictOnInserts.add(1); // 第二次也失败
     const ips = fixedIps(["172.30.0.10", "172.30.0.11", "172.30.0.12"]);
     const result = await provisionV3Container(
-      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: ips, randomSecret: fixedSecret("c".repeat(64)) },
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: ips, randomSecret: fixedSecret("c".repeat(64)) },
       55,
     );
     // 第三次 INSERT 才成功
@@ -626,7 +664,7 @@ describe("provisionV3Container", () => {
     pool.forceConflictConstraintName.set(1, "idx_ac_host_bound_ip_active");
     const ips = fixedIps(["172.30.0.10", "172.30.0.11", "172.30.0.12"]);
     const result = await provisionV3Container(
-      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: ips, randomSecret: fixedSecret("c".repeat(64)) },
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: ips, randomSecret: fixedSecret("c".repeat(64)) },
       56,
     );
     assert.equal(result.boundIp, "172.30.0.12");
@@ -638,7 +676,7 @@ describe("provisionV3Container", () => {
     const { docker } = makeDocker({ imageMissing: true });
     await assert.rejects(
       provisionV3Container(
-        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.1.1", randomSecret: fixedSecret("d".repeat(64)) },
+        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.1.1", randomSecret: fixedSecret("d".repeat(64)) },
         9,
       ),
       (err: Error) => err instanceof SupervisorError && err.code === "ImageNotFound",
@@ -653,7 +691,7 @@ describe("provisionV3Container", () => {
     const { docker, captured } = makeDocker({ startFails: true });
     await assert.rejects(
       provisionV3Container(
-        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.2.2", randomSecret: fixedSecret("e".repeat(64)) },
+        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.2.2", randomSecret: fixedSecret("e".repeat(64)) },
         9,
       ),
       (err: Error) => err instanceof SupervisorError,
@@ -680,7 +718,7 @@ describe("provisionV3Container", () => {
     const { docker } = makeDocker();
     await assert.rejects(
       provisionV3Container(
-        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.3.3", randomSecret: () => "short" },
+        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.3.3", randomSecret: () => "short" },
         7,
       ),
       (err: Error) => err instanceof SupervisorError && err.code === "InvalidArgument",
@@ -707,7 +745,7 @@ describe("stopAndRemoveV3Container", () => {
     const pool = new FakePool();
     // 先 provision 一个,再 stop
     const r = await provisionV3Container(
-      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.9.9", randomSecret: fixedSecret("f".repeat(64)) },
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.9.9", randomSecret: fixedSecret("f".repeat(64)) },
       33,
     );
     assert.equal(pool.rows[0]!.state, "active");
@@ -1222,7 +1260,7 @@ describe("getV3ContainerStatus", () => {
     const { docker } = makeDocker({ inspectRunning: true });
     const pool = new FakePool();
     const provisioned = await provisionV3Container(
-      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.10.10", randomSecret: fixedSecret("a".repeat(64)) },
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.10.10", randomSecret: fixedSecret("a".repeat(64)) },
       77,
     );
     const r = await getV3ContainerStatus(
@@ -1315,10 +1353,11 @@ describe("getV3ContainerStatus", () => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-//  V3 Phase 3I — MAX_RUNNING_CONTAINERS cap
+//  V3 Phase 3I — per-host max_containers cap(原 MAX_RUNNING_CONTAINERS 全局 cap 已删,
+//  权威源现在是 compute_hosts.max_containers,admin UI 管理,per-host 各自独立)
 // ───────────────────────────────────────────────────────────────────────
 
-describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
+describe("provisionV3Container — per-host max_containers cap (3I)", () => {
   let pool: FakePool;
   let prevOptional: string | undefined;
   before(() => {
@@ -1334,18 +1373,18 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
   });
 
   /** 塞 N 个 active 行进 FakePool,模拟 host 已经满负荷 */
-  function seedActiveRows(n: number): void {
+  function seedActiveRows(n: number, hostUuid: string = TEST_HOST): void {
     for (let i = 0; i < n; i++) {
       const now = new Date();
       pool.rows.push({
         id: pool.nextId++,
-        user_id: 1000 + i,
-        host_uuid: null,
-        bound_ip: `172.30.100.${i + 1}`,
+        user_id: 1000 + pool.nextId,
+        host_uuid: hostUuid,
+        bound_ip: `172.30.100.${pool.nextId}`,
         secret_hash: Buffer.alloc(32),
         state: "active",
         port: V3_CONTAINER_PORT,
-        container_internal_id: `seed-${i}`,
+        container_internal_id: `seed-${pool.nextId}`,
         last_ws_activity: now,
         created_at: now,
         updated_at: now,
@@ -1353,28 +1392,33 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
     }
   }
 
-  test("active < cap → 正常 provision(deps.maxRunningContainers 注入 = 3,2 active)", async () => {
+  test("active < cap → 正常 provision(host max=3,2 active)", async () => {
     const { docker } = makeDocker();
+    pool.setHostMax(TEST_HOST, 3);
     seedActiveRows(2);
     const r = await provisionV3Container(
       {
         docker,
         pool: pool as unknown as Pool,
         image: TEST_IMAGE,
+        selfHostId: TEST_HOST,
         randomIp: () => "172.30.50.1",
         randomSecret: fixedSecret("0".repeat(64)),
-        maxRunningContainers: 3,
       },
       777,
     );
     assert.ok(r.containerId > 0);
     assert.equal(r.boundIp, "172.30.50.1");
     // 第三行成功落了
-    assert.equal(pool.rows.filter((x) => x.state === "active").length, 3);
+    assert.equal(
+      pool.rows.filter((x) => x.state === "active" && x.host_uuid === TEST_HOST).length,
+      3,
+    );
   });
 
   test("active = cap → 抛 SupervisorError('HostFull') 在事务内 + 不动 docker", async () => {
     const { docker, captured } = makeDocker();
+    pool.setHostMax(TEST_HOST, 3);
     seedActiveRows(3);
     await assert.rejects(
       provisionV3Container(
@@ -1382,16 +1426,15 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
           docker,
           pool: pool as unknown as Pool,
           image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
           randomIp: () => "172.30.50.99",
           randomSecret: fixedSecret("1".repeat(64)),
-          maxRunningContainers: 3,
         },
         9001,
       ),
       (err: Error) => err instanceof SupervisorError && err.code === "HostFull",
     );
-    // codex round 1 FAIL #2 修复 — cap 检查现在在事务内,与 host-cap 锁串行,
-    // 撞 cap 时 BEGIN 已经发生但走 ROLLBACK,docker 一字未动
+    // cap 检查在事务内,与 host-cap 锁串行,撞 cap 时 BEGIN 已经发生但走 ROLLBACK,docker 一字未动
     assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
     assert.equal(captured.containersCreated.length, 0);
     assert.equal(captured.volumesCreated.length, 0);
@@ -1401,6 +1444,7 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
 
   test("active > cap(运维手动塞了多)→ 仍然 HostFull,不会绕过", async () => {
     const { docker } = makeDocker();
+    pool.setHostMax(TEST_HOST, 3);
     seedActiveRows(5);
     await assert.rejects(
       provisionV3Container(
@@ -1408,9 +1452,9 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
           docker,
           pool: pool as unknown as Pool,
           image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
           randomIp: () => "172.30.51.1",
           randomSecret: fixedSecret("2".repeat(64)),
-          maxRunningContainers: 3,
         },
         9002,
       ),
@@ -1420,6 +1464,7 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
 
   test("vanished 行不计入 cap(已死容器不占容量)", async () => {
     const { docker } = makeDocker();
+    pool.setHostMax(TEST_HOST, 3);
     seedActiveRows(2);
     // 再塞 5 个 vanished 行,模拟 idle sweep / orphan reconcile 已经清掉
     for (let i = 0; i < 5; i++) {
@@ -1427,7 +1472,7 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
       pool.rows.push({
         id: pool.nextId++,
         user_id: 8000 + i,
-        host_uuid: null,
+        host_uuid: TEST_HOST,
         bound_ip: `172.30.200.${i + 1}`,
         secret_hash: Buffer.alloc(32),
         state: "vanished",
@@ -1444,92 +1489,313 @@ describe("provisionV3Container — MAX_RUNNING_CONTAINERS cap (3I)", () => {
         docker,
         pool: pool as unknown as Pool,
         image: TEST_IMAGE,
+        selfHostId: TEST_HOST,
         randomIp: () => "172.30.50.55",
         randomSecret: fixedSecret("3".repeat(64)),
-        maxRunningContainers: 3,
       },
       9003,
     );
     assert.ok(r.containerId > 0);
   });
 
-  test("env OC_MAX_RUNNING_CONTAINERS 兜底 + deps.maxRunningContainers 优先级更高", async () => {
+  test("两个 host 各自独立 cap(hostA 满,hostB 空 → hostB 仍可 provision)", async () => {
     const { docker } = makeDocker();
-    seedActiveRows(2);
-    const original = process.env.OC_MAX_RUNNING_CONTAINERS;
-    try {
-      // env 设的 cap 低,但 deps 注入更高 → deps 赢
-      process.env.OC_MAX_RUNNING_CONTAINERS = "1";
-      const r = await provisionV3Container(
+    // hostA cap=2,塞满 2 个 active
+    pool.setHostMax(TEST_HOST, 2);
+    seedActiveRows(2, TEST_HOST);
+    // hostB cap=2,空
+    pool.setHostMax(TEST_HOST_ALT, 2);
+
+    // hostA 再 provision 应该被 HostFull 挡
+    await assert.rejects(
+      provisionV3Container(
         {
           docker,
           pool: pool as unknown as Pool,
           image: TEST_IMAGE,
-          randomIp: () => "172.30.52.1",
-          randomSecret: fixedSecret("4".repeat(64)),
-          maxRunningContainers: 5,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.30.60.1",
+          randomSecret: fixedSecret("a".repeat(64)),
         },
-        9004,
-      );
-      assert.ok(r.containerId > 0);
-    } finally {
-      if (original === undefined) delete process.env.OC_MAX_RUNNING_CONTAINERS;
-      else process.env.OC_MAX_RUNNING_CONTAINERS = original;
-    }
+        9101,
+      ),
+      (err: Error) => err instanceof SupervisorError && err.code === "HostFull",
+    );
+
+    // hostB 不受影响
+    const r = await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        selfHostId: TEST_HOST_ALT,
+        randomIp: () => "172.30.60.2",
+        randomSecret: fixedSecret("b".repeat(64)),
+      },
+      9102,
+    );
+    assert.ok(r.containerId > 0);
+    // 校验落在 hostB
+    const inserted = pool.rows.find((x) => x.user_id === 9102);
+    assert.ok(inserted);
+    assert.equal(inserted!.host_uuid, TEST_HOST_ALT);
+    // hostA 行数没变
+    assert.equal(
+      pool.rows.filter((x) => x.state === "active" && x.host_uuid === TEST_HOST).length,
+      2,
+    );
   });
 
-  test("env OC_MAX_RUNNING_CONTAINERS 生效(deps 不注入时回落到 env)", async () => {
+  test("effectiveHostUuid 缺失(无 hostId 也无 selfHostId)→ InvalidArgument fail-closed", async () => {
     const { docker, captured } = makeDocker();
-    seedActiveRows(2);
+    pool.setHostMax(TEST_HOST, 10);
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          // 故意不给 selfHostId,也不传 hostId
+          randomIp: () => "172.30.61.1",
+          randomSecret: fixedSecret("c".repeat(64)),
+        },
+        9103,
+      ),
+      (err: Error) =>
+        err instanceof SupervisorError && err.code === "InvalidArgument",
+    );
+    // 没碰 docker / 没插行
+    assert.equal(captured.containersCreated.length, 0);
+    assert.equal(pool.rows.length, 0);
+  });
+
+  test("compute_hosts 行 missing(max_containers IS NULL)→ InvalidArgument", async () => {
+    const { docker } = makeDocker();
+    // 显式置 null,模拟 compute_hosts 里没有这个 host 的行
+    pool.setHostMax(TEST_HOST, null);
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.30.62.1",
+          randomSecret: fixedSecret("d".repeat(64)),
+        },
+        9104,
+      ),
+      (err: Error) =>
+        err instanceof SupervisorError && err.code === "InvalidArgument",
+    );
+    // 事务起了又回滚
+    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+    assert.equal(pool.rows.length, 0);
+  });
+
+  test("非 canonical UUID(大写/缺位/带空格)→ InvalidArgument fail-closed", async () => {
+    const { docker } = makeDocker();
+    pool.setHostMax(TEST_HOST, 10);
+    // 大写 — canonical 必须全小写
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: "11111111-1111-1111-1111-11111111111A",
+          randomIp: () => "172.30.63.1",
+          randomSecret: fixedSecret("e".repeat(64)),
+        },
+        9105,
+      ),
+      (err: Error) =>
+        err instanceof SupervisorError && err.code === "InvalidArgument",
+    );
+    // 短一位
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: "11111111-1111-1111-1111-11111111111",
+          randomIp: () => "172.30.63.2",
+          randomSecret: fixedSecret("f".repeat(64)),
+        },
+        9106,
+      ),
+      (err: Error) =>
+        err instanceof SupervisorError && err.code === "InvalidArgument",
+    );
+    // multi-host 路径(containerService 存在 + hostId ≠ selfHostId)+ 非 canonical hostId
+    // → 必须在 assertImageHasV3Sink 之前 fail-closed,inspectImage 不能被触
+    // (否则错误形态会被 facade 改写成 "unknown hostId" / PG cast 失败,不再统一)。
+    let inspectImageCalls = 0;
+    const cs = {
+      ensureVolume: async () => {},
+      removeVolume: async () => {},
+      inspectVolume: async () => ({ exists: false }),
+      createAndStart: async () => ({ containerInternalId: "" }),
+      stop: async () => {},
+      remove: async () => {},
+      inspect: async () => { throw new Error("not used"); },
+      inspectImage: async () => {
+        inspectImageCalls++;
+        return { id: "sha256:x", repoTags: [], labels: {} };
+      },
+      isRemote: async () => true,
+      resolveBaselinePaths: async () => ({ baseDir: "/tmp/x" }),
+    };
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          // biome-ignore lint/suspicious/noExplicitAny: containerService stub
+          containerService: cs as any,
+          randomIp: () => "172.30.63.3",
+          randomSecret: fixedSecret("a".repeat(64)),
+        },
+        9107,
+        "NOT-A-UUID", // hostId 非法,但 ≠ selfHostId → 会走 useRemote 路径
+      ),
+      (err: Error) =>
+        err instanceof SupervisorError && err.code === "InvalidArgument",
+    );
+    assert.equal(
+      inspectImageCalls,
+      0,
+      "canonical 校验必须早于 assertImageHasV3Sink — inspectImage 不应被触发",
+    );
+  });
+
+  test('hostId="" + selfHostId 合法 → InvalidArgument (拒绝静默退化为 selfHostId)', async () => {
+    // 守 effectiveHostUuid SSOT 不被 `||` 短路吃掉空串:
+    // 旧实现 `(typeof hostId === "string" ? hostId : "") || selfHostId` 会让 hostId=""
+    // 静默退化到 selfHostId,但 raw hostId 又会驱动 useRemote 走远端路径,
+    // 形成"lock/cap 用 selfHostId、docker 操作用 ''"双源错位。
+    const { docker } = makeDocker();
+    pool.setHostMax(TEST_HOST, 10);
+    let inspectImageCalls = 0;
+    const cs = {
+      ensureVolume: async () => {},
+      removeVolume: async () => {},
+      inspectVolume: async () => ({ exists: false }),
+      createAndStart: async () => ({ containerInternalId: "" }),
+      stop: async () => {},
+      remove: async () => {},
+      inspect: async () => { throw new Error("not used"); },
+      inspectImage: async () => {
+        inspectImageCalls++;
+        return { id: "sha256:x", repoTags: [], labels: {} };
+      },
+      isRemote: async () => true,
+      resolveBaselinePaths: async () => ({ baseDir: "/tmp/x" }),
+    };
+    await assert.rejects(
+      provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          // biome-ignore lint/suspicious/noExplicitAny: containerService stub
+          containerService: cs as any,
+          randomIp: () => "172.30.63.4",
+          randomSecret: fixedSecret("b".repeat(64)),
+        },
+        9108,
+        "", // 空串 hostId — 必须被 fail-closed 拒,不能静默退化到 selfHostId
+      ),
+      (err: Error) =>
+        err instanceof SupervisorError && err.code === "InvalidArgument",
+    );
+    assert.equal(inspectImageCalls, 0, "空 hostId 必须早于任何外部副作用拒绝");
+    assert.equal(
+      pool.rows.length,
+      0,
+      "空 hostId 不能让 selfHostId 兜底 → 无 INSERT 副作用",
+    );
+  });
+
+  test("env OC_MAX_RUNNING_CONTAINERS 已废弃 → no-op,只看 compute_hosts.max_containers", async () => {
+    const { docker } = makeDocker();
     const original = process.env.OC_MAX_RUNNING_CONTAINERS;
     try {
-      process.env.OC_MAX_RUNNING_CONTAINERS = "2";
-      await assert.rejects(
-        provisionV3Container(
-          {
-            docker,
-            pool: pool as unknown as Pool,
-            image: TEST_IMAGE,
-            randomIp: () => "172.30.52.99",
-            randomSecret: fixedSecret("5".repeat(64)),
-            // 故意不注入 maxRunningContainers,让代码走 readMaxRunningContainersFromEnv
-          },
-          9005,
-        ),
-        (err: Error) => err instanceof SupervisorError && err.code === "HostFull",
+      // 故意把 env 设到 1(老语义会挡),但权威源是 compute_hosts.max_containers=5
+      process.env.OC_MAX_RUNNING_CONTAINERS = "1";
+      pool.setHostMax(TEST_HOST, 5);
+      seedActiveRows(2);
+      const r = await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.30.64.1",
+          randomSecret: fixedSecret("9".repeat(64)),
+        },
+        9107,
       );
-      assert.equal(captured.containersCreated.length, 0);
+      // env=1 没生效,host max=5 放行 → 3 个 active
+      assert.ok(r.containerId > 0);
+      assert.equal(
+        pool.rows.filter((x) => x.state === "active" && x.host_uuid === TEST_HOST).length,
+        3,
+      );
     } finally {
       if (original === undefined) delete process.env.OC_MAX_RUNNING_CONTAINERS;
       else process.env.OC_MAX_RUNNING_CONTAINERS = original;
     }
   });
 
-  test("env OC_MAX_RUNNING_CONTAINERS=非法值 → 回落默认 50(2 active 不挡)", async () => {
+  test("INSERT 行的 host_uuid = effectiveHostUuid(selfHostId 兜底时)", async () => {
     const { docker } = makeDocker();
-    seedActiveRows(2);
-    const original = process.env.OC_MAX_RUNNING_CONTAINERS;
-    try {
-      // "abc" / "0" / "-5" / "1.5" / "" 全都视为非法 → DEFAULT_MAX_RUNNING_CONTAINERS=50,
-      // 2 active < 50 → 直接放行;只跑一次 provision 验证就行(多次会 IP 撞)。
-      process.env.OC_MAX_RUNNING_CONTAINERS = "abc";
-      const r = await provisionV3Container(
-        {
-          docker,
-          pool: pool as unknown as Pool,
-          image: TEST_IMAGE,
-          randomIp: () => "172.30.53.50",
-          randomSecret: fixedSecret("6".repeat(64)),
-          // 故意不注入 deps cap → 走 env → 非法 → 50 默认
-        },
-        9100,
-      );
-      assert.ok(r.containerId > 0);
-      assert.equal(pool.rows.filter((x) => x.state === "active").length, 3);
-    } finally {
-      if (original === undefined) delete process.env.OC_MAX_RUNNING_CONTAINERS;
-      else process.env.OC_MAX_RUNNING_CONTAINERS = original;
-    }
+    pool.setHostMax(TEST_HOST_ALT, 10);
+    const r = await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        selfHostId: TEST_HOST_ALT,
+        // 不传 hostId,走 selfHostId 兜底
+        randomIp: () => "172.30.65.1",
+        randomSecret: fixedSecret("7".repeat(64)),
+      },
+      9108,
+    );
+    assert.equal(r.hostId, TEST_HOST_ALT);
+    const inserted = pool.rows.find((x) => x.user_id === 9108);
+    assert.ok(inserted);
+    assert.equal(inserted!.host_uuid, TEST_HOST_ALT);
+  });
+
+  test("INSERT 行的 host_uuid = effectiveHostUuid(hostId 优先于 selfHostId)", async () => {
+    const { docker } = makeDocker();
+    // 注意:hostId !== selfHostId 时 useRemote 会激活(若 containerService 存在);
+    // 这里不传 containerService → useRemote=false → 走单机路径,effectiveHostUuid=hostId,
+    // 行落到 TEST_HOST_ALT
+    pool.setHostMax(TEST_HOST_ALT, 10);
+    const r = await provisionV3Container(
+      {
+        docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        // selfHostId 是 TEST_HOST,但显式传 hostId=TEST_HOST_ALT,后者赢
+        selfHostId: TEST_HOST,
+        randomIp: () => "172.30.65.2",
+        randomSecret: fixedSecret("8".repeat(64)),
+      },
+      9109,
+      TEST_HOST_ALT, // hostId(positional 3rd arg)
+    );
+    assert.equal(r.hostId, TEST_HOST_ALT);
+    const inserted = pool.rows.find((x) => x.user_id === 9109);
+    assert.ok(inserted);
+    assert.equal(inserted!.host_uuid, TEST_HOST_ALT);
   });
 });
 
@@ -2191,7 +2457,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
         {
           docker,
           pool: pool as unknown as Pool,
-          image: TEST_IMAGE,
+          image: TEST_IMAGE, selfHostId: TEST_HOST,
           randomIp: () => "172.30.6.6",
           randomSecret: fixedSecret("a".repeat(64)),
           ccbBaselineDir: "/definitely/not/a/baseline/dir",
@@ -2211,7 +2477,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
       {
         docker,
         pool: pool as unknown as Pool,
-        image: TEST_IMAGE,
+        image: TEST_IMAGE, selfHostId: TEST_HOST,
         randomIp: () => "172.30.6.7",
         randomSecret: fixedSecret("b".repeat(64)),
         ccbBaselineDir: "/definitely/not/a/baseline/dir",
@@ -2238,7 +2504,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
         {
           docker,
           pool: pool as unknown as Pool,
-          image: TEST_IMAGE,
+          image: TEST_IMAGE, selfHostId: TEST_HOST,
           randomIp: () => "172.30.6.8",
           randomSecret: fixedSecret("c".repeat(64)),
           ccbBaselineDir: b.dir,
@@ -2477,7 +2743,7 @@ describe("provisionV3Container — per-host bridge gateway env injection", () =>
       {
         docker,
         pool: pool as unknown as Pool,
-        image: TEST_IMAGE,
+        image: TEST_IMAGE, selfHostId: TEST_HOST,
         randomIp: () => "172.30.0.42",
         randomSecret: fixedSecret("a".repeat(64)),
       },
@@ -2680,7 +2946,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
         {
           docker,
           pool: pool as unknown as Pool,
-          image: TEST_IMAGE,
+          image: TEST_IMAGE, selfHostId: TEST_HOST,
           randomIp: () => "172.30.7.1",
           randomSecret: fixedSecret("a".repeat(64)),
         },
@@ -2705,7 +2971,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
           {
             docker,
             pool: pool as unknown as Pool,
-            image: TEST_IMAGE,
+            image: TEST_IMAGE, selfHostId: TEST_HOST,
             randomIp: () => "172.30.7.2",
             randomSecret: fixedSecret("b".repeat(64)),
           },
@@ -2738,7 +3004,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       let caught: Error | undefined;
       try {
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.3", randomSecret: fixedSecret("c".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.3", randomSecret: fixedSecret("c".repeat(64)) },
           9003,
         );
       } catch (e) {
@@ -2760,7 +3026,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       let caught: Error | undefined;
       try {
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.4", randomSecret: fixedSecret("d".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.4", randomSecret: fixedSecret("d".repeat(64)) },
           9004,
         );
       } catch (e) {
@@ -2783,7 +3049,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       let caught: Error | undefined;
       try {
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.5", randomSecret: fixedSecret("e".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.5", randomSecret: fixedSecret("e".repeat(64)) },
           9005,
         );
       } catch (e) {
@@ -2809,7 +3075,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       let caught: Error | undefined;
       try {
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.6", randomSecret: fixedSecret("f".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.6", randomSecret: fixedSecret("f".repeat(64)) },
           9006,
         );
       } catch (e) {
@@ -2842,7 +3108,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       };
       try {
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.7", randomSecret: fixedSecret("0".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.7", randomSecret: fixedSecret("0".repeat(64)) },
           9007,
         );
       } finally {
@@ -2867,7 +3133,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       });
       process.env.OC_V3_IMAGE_GUARD = "off";
       await provisionV3Container(
-        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.8", randomSecret: fixedSecret("1".repeat(64)) },
+        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.8", randomSecret: fixedSecret("1".repeat(64)) },
         9008,
       );
       assert.equal(captured.imageInspected, 0, "off 模式不应触发 docker.getImage");
@@ -2886,7 +3152,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       let caught: Error | undefined;
       try {
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.9", randomSecret: fixedSecret("2".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.9", randomSecret: fixedSecret("2".repeat(64)) },
           9009,
         );
       } catch (e) {
@@ -2908,7 +3174,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       let caught: Error | undefined;
       try {
         await provisionV3Container(
-          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, randomIp: () => "172.30.7.10", randomSecret: fixedSecret("3".repeat(64)) },
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.10", randomSecret: fixedSecret("3".repeat(64)) },
           9010,
         );
       } catch (e) {

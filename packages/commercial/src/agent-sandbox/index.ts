@@ -45,8 +45,8 @@ export {
   V3_CODEX_HOME_MOUNT,
   V3_USER_LOCAL_MOUNT,
   V3_USER_CONFIG_MOUNT,
-  // V3 Phase 3I — instance cap + image preheat
-  DEFAULT_MAX_RUNNING_CONTAINERS,
+  // V3 image preheat(per-host cap admission 现在直接读 compute_hosts.max_containers,
+  // 无全局 cap 常量需要 re-export)
   preheatV3Image,
   // CCB 平台基线(只读注入容器的身份/守则/自省 skill)
   DEFAULT_V3_CCB_BASELINE_DIR,

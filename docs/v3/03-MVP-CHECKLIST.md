@@ -54,7 +54,7 @@
 | **3F** | tickIdleSweep(idle 30min stop+remove,**单轨只回收 ephemeral,删 mode 字段**) | 3C, 3E | ✅ | f044bd5 |
 | **3G** | volume GC(banned 7d / no-login 90d)— 1h tick,有 active 容器跳过 | 3F | ✅ | 2e40f8c |
 | **3H** | gateway 启动时 reconcile + 每 1h 跑 orphan 清理:比对 docker `ps -a` 与 `agent_containers` 表,孤儿容器 stop+rm,数据库孤儿标 vanished | 3F | ✅ | 8aea6cd |
-| **3I** | `MAX_RUNNING_CONTAINERS=N`(默认 50)硬限 + 启动时 `docker pull` 预热 | 3F | ✅ | f0c9724 |
+| **3I** | **per-host** `compute_hosts.max_containers` 硬限(admin UI 管理,默认 50,旧 env 全局 cap 已删,见 2026-05-16 log)+ 启动时 `docker pull` 预热 | 3F | ✅ | f0c9724 |
 | **3J** | 容器侧网络隔离 e2e:`cap-drop NET_RAW/NET_ADMIN` 校验 + 容器内 spoof 别 IP 调内部代理必须 401 + `/internal/*` 公网无法访问 | 3C, 3E, 2J-1 | ✅ | fcedc06 |
 | **3M** | `agent_containers` reader audit:**只保 R6.7 (a) 显式 state filter 一条 lint 规则**,删 R6.11 (b)/(c)/(d) 二选一 + RECONCILER_WHITELIST + 负例 fixture(都是为 multi-host 服务的) | 3F | ✅ | a584a20 |
 
@@ -95,6 +95,7 @@
 
 ## 决策日志(跨会话接力用)
 
+- **2026-05-16** Task 3I 修订(per-host cap):删 `DEFAULT_MAX_RUNNING_CONTAINERS=50` + `readMaxRunningContainersFromEnv` + `V3SupervisorDeps.maxRunningContainers`(env `OC_MAX_RUNNING_CONTAINERS` 整路 no-op,部署后删)+ `agent-sandbox/index.ts` 的 `DEFAULT_MAX_RUNNING_CONTAINERS` re-export。`provisionV3Container` 把权威源切到 **per-host** `compute_hosts.max_containers`(admin UI 管理):effectiveHostUuid = hostId ?? deps.selfHostId,fail-closed 无 host context 抛 InvalidArgument;`acquireHostCapLock` 改 per-host advisory lock(canonical 36-char lowercase UUID 严格校验 + FNV-1a hash subkey);同事务双子查询 `(active count WHERE host_uuid=$1) + (max_containers FROM compute_hosts WHERE id=$1)`,撞 cap 走 ROLLBACK 抛 `SupervisorError("HostFull", {hostId, active, max})` + `log.info("v3 per-host cap hit", ...)`(单 host 满是正常调度压力,不告警)。`v3ensureRunning.ts` HostFull 分支删 `safeEnqueueAlert(CONTAINER_PROVISION_FAILED)` 只翻 `ContainerUnreadyError("host_full", retryAfter=10)`;"全集群无可用 host" 语义由 `NodePoolUnavailableError` 分支承担。**根因**:148 用户 active 占 1,但全局 cap 被运维误设 `OC_MAX_RUNNING_CONTAINERS=3` 限到 3,1 + 1 个抢容器的新 chat 一冲就 HostFull,boss 报障"8 秒后重连"。补 cap 是症状治理,根治是把权威源从 env 全局 cap 改成 admin UI 管理的 per-host。原 task 3I 注释里就留了 "P1 多机加 host_id 过滤" TODO,本次一次性还掉。新增 9 个 supervisor 单测(per-host independence / canonical UUID 校验 / compute_hosts row missing → InvalidArgument / env no-op 回归 / INSERT host_uuid = effectiveHostUuid 等)+ 1 个 ensureRunning HostFull 翻译测试(per-host 重写)。107 → 111 supervisor unit tests / 21 ensureRunning all green;4 个 supervisor pre-existing failure(Binds 数组 + CcbBaselineMissing)非本次引入(git stash 验证)。docs/v3/02-DEVELOPMENT-PLAN.md §9.3 Task 3I + §10.2 风险表同步改 per-host 口径。
 - **2026-04-20** 创建本文件,基于 02-DEVELOPMENT-PLAN.md R6.11.y(codex 第二十四轮 APPROVE)。剪枝结论 boss 已授权"按你想法搞,直到部署上线"。开始 Phase 2 实施。
 - **2026-04-20** Task 2B 完成(45f26ac):0011_user_preferences / 0012_agent_containers_v3(双因子 + state 单轨)/ 0015_request_finalize_journal 三张迁移;0013-0014 跳号说明已写在 migrate.ts 整数序列校验中。dry-run 干净。
 - **2026-04-20** Task 2A 完成(de87712):4 个 v2 chat 源文件 + 5 个测试 + 11 处 index.ts/router.ts/handlers.ts 引用全部清理。tsc 0 error,bun test pass 数量减少完全归因于 5 个删除的测试文件(523 vs 543 = -20 chat 测试)。account-pool 全套保留(2D anthropicProxy 复用)。下一步:2I-1 requestId middleware + pino schema。
