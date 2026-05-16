@@ -2,8 +2,8 @@
   "currentVersion": "v1.0.148",
   "releases": [
     {
-      "version": "PENDING",
-      "date": "",
+      "version": "v1.0.148",
+      "date": "2026-05-16",
       "title": "对话体验优化",
       "items": [
         "AI 生成的文件现在可以直接点击下载,支持 PDF、压缩包等各种格式",
