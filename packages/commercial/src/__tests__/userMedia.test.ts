@@ -52,10 +52,18 @@ import {
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
-function makePool(rows: Array<{ host_name: string; container_id: string }>): PoolLike {
+function makePool(
+  rows: Array<{ host_name: string; container_id: string; host_uuid?: string }>,
+): PoolLike {
+  // 默认填充一个合法 host_uuid,避免每个测试都写;远端分支会显式覆盖,
+  // self 分支不读 host_uuid,所以 placeholder 安全。
+  const enriched = rows.map((r) => ({
+    host_uuid: r.host_uuid ?? "00000000-0000-0000-0000-000000000001",
+    ...r,
+  }));
   return {
     async query() {
-      return { rows: rows as never };
+      return { rows: enriched as never };
     },
   };
 }
@@ -250,17 +258,60 @@ describe("createUserMediaResolver — DB/docker 分支", () => {
     }
   });
 
-  test("remote-host:host_name !== 'self'", async () => {
+  test("remote-host:host_name !== 'self' → 携带 hostUuid + uploads/generated 双 dir", async () => {
     const resolve = createUserMediaResolver({
-      pool: makePool([{ host_name: "boheyun-1", container_id: "111" }]),
+      pool: makePool([
+        {
+          host_name: "boheyun-1",
+          host_uuid: "b0edbda1-20eb-4613-af28-8de4a1fbe041",
+          container_id: "111",
+        },
+      ]),
       docker: makeDockerOk(),
     });
     const r = await resolve("c:42");
     assert.equal(r.kind, "fail");
-    if (r.kind === "fail") {
-      assert.equal(r.reason, "remote-host");
+    if (r.kind === "fail" && r.reason === "remote-host") {
+      assert.equal(r.uid, 42);
+      assert.equal(r.hostUuid, "b0edbda1-20eb-4613-af28-8de4a1fbe041");
+      assert.equal(
+        r.uploads,
+        "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads",
+      );
+      assert.equal(
+        r.generated,
+        "/var/lib/docker/volumes/oc-v3-data-u42/_data/generated",
+      );
       assert.equal(r.logCtx.host, "boheyun-1");
+      assert.equal(
+        r.logCtx.hostUuid,
+        "b0edbda1-20eb-4613-af28-8de4a1fbe041",
+      );
+    } else {
+      assert.fail(`expected remote-host fail, got ${JSON.stringify(r)}`);
     }
+  });
+
+  test("remote-host:docker inspect 不被调用(volume 在远端,master 无该卷)", async () => {
+    let inspected = false;
+    const docker: DockerLike = {
+      getVolume() {
+        return {
+          inspect: async () => {
+            inspected = true;
+            return {};
+          },
+        };
+      },
+    };
+    const resolve = createUserMediaResolver({
+      pool: makePool([
+        { host_name: "boheyun-1", container_id: "111" },
+      ]),
+      docker,
+    });
+    await resolve("c:42");
+    assert.equal(inspected, false, "remote-host should short-circuit docker inspect");
   });
 
   test("volume-missing:docker getVolume 抛 404", async () => {

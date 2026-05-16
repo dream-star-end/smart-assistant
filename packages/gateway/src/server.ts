@@ -182,7 +182,17 @@ export type UserMediaLocationLike =
   | { kind: 'ok'; uid: number; uploads: string; generated: string }
   | {
       kind: 'fail'
-      reason: 'invalid-uid' | 'not-ready' | 'remote-host' | 'volume-missing' | 'ambiguous' | 'daemon-error'
+      reason: 'remote-host'
+      /** 与 'ok' 分支同语义,gateway upload 推远端 host 时透传给 hook。 */
+      uid: number
+      hostUuid: string
+      uploads: string
+      generated: string
+      logCtx: Record<string, unknown>
+    }
+  | {
+      kind: 'fail'
+      reason: 'invalid-uid' | 'not-ready' | 'volume-missing' | 'ambiguous' | 'daemon-error'
       logCtx: Record<string, unknown>
     }
 
@@ -208,6 +218,26 @@ export interface CommercialHook {
    * 用户文件,会触发 dispatchInbound 端"媒体不存在或不可读" / 图像 404)。
    */
   resolveUserMediaDirs?: (userId: string) => Promise<UserMediaLocationLike>
+  /**
+   * **V3 remote-host 上传桥**(2026-05-16)。把 master 收到的上传文件推到远端
+   * compute host 上的用户 docker volume 宿主路径。
+   *
+   * 仅当 `resolveUserMediaDirs` 返回 `{kind:'fail', reason:'remote-host', ...}`
+   * 时由 `handleUpload` 调用 —— 此时 master 物理上不持有用户的 volume,本机
+   * tmp+rename 路径不可用。
+   *
+   * 实现侧(commercial):查 compute_hosts 表解出 NodeAgentTarget,经 mTLS
+   * PUT `/files?path=<remotePath>&mode=0644&owner_uid=1000&owner_gid=1000` 上传。
+   * node-agent 端 AllowedDirRegexes 严格匹配 v3 用户卷形态;mode+owner 与 self
+   * host 上 chmod/chown 完全等价(让远端容器内 agent uid 1000 可读)。
+   *
+   * 错误语义:throw 表示推送失败(网络/证书/agent app err);gateway 转 5xx。
+   */
+  pushRemoteHostUpload?: (args: {
+    hostUuid: string
+    remotePath: string
+    content: Buffer
+  }) => Promise<void>
   /**
    * **textual** 谓词:判定 `resolvedPath` 是否长得像
    * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)[/<file>]`。
@@ -2596,7 +2626,16 @@ export class Gateway {
     | { kind: 'ok'; uid: number; uploads: string; generated: string }
     | {
         kind: 'fail'
-        reason: 'invalid-uid' | 'not-ready' | 'remote-host' | 'volume-missing' | 'ambiguous' | 'daemon-error'
+        reason: 'remote-host'
+        uid: number
+        hostUuid: string
+        uploads: string
+        generated: string
+        logCtx: Record<string, unknown>
+      }
+    | {
+        kind: 'fail'
+        reason: 'invalid-uid' | 'not-ready' | 'volume-missing' | 'ambiguous' | 'daemon-error'
         logCtx: Record<string, unknown>
       }
   > {
@@ -3092,15 +3131,42 @@ export class Gateway {
     // Personal / legacy `default` users fall to paths.uploadsDir unchanged.
     // (generated dir is co-resolved but unused on the write path — we only
     // care that the volume exists, which the single resolve call confirms.)
+    //
+    // V3 remote-host (2026-05-16): when the user's container is on a non-self
+    // compute host, master cannot write to a local docker volume — we stage
+    // the upload under master's own paths.uploadsDir (just for hashing) and
+    // then push the bytes via `pushRemoteHostUpload` (mTLS node-agent /files
+    // PUT) to the **remote** volume host path. The final URL still resolves
+    // through /api/media but read-back over the wire is Phase 2; this patch
+    // unblocks the write path so the in-container agent can see the file.
     const userId = this.getUserId(req)
     const locationResult = await this._resolveMediaDirs(userId)
+    let remoteUpload: {
+      hostUuid: string
+      remoteUploadsDir: string
+    } | null = null
+    let uploadsDir: string
+    let isPerUser = false
     if (locationResult.kind === 'fail') {
-      this._sendMediaResolveError(res, locationResult, 'upload')
-      req.destroy()
-      return
+      if (locationResult.reason === 'remote-host' && this.deps.commercial?.pushRemoteHostUpload) {
+        // Stage locally; we push to remote after we have the final bytes + digest.
+        // Use master's own paths.uploadsDir for the .tmp- staging file — it's
+        // already mode 0755 root:root and the orphan sweep cleans .tmp-* there.
+        remoteUpload = {
+          hostUuid: locationResult.hostUuid,
+          remoteUploadsDir: locationResult.uploads,
+        }
+        uploadsDir = paths.uploadsDir
+        isPerUser = false
+      } else {
+        this._sendMediaResolveError(res, locationResult, 'upload')
+        req.destroy()
+        return
+      }
+    } else {
+      uploadsDir = locationResult.uploads
+      isPerUser = locationResult.kind === 'ok'
     }
-    const uploadsDir = locationResult.uploads
-    const isPerUser = locationResult.kind === 'ok'
 
     // ── 3b. Resolve uploadsDir realpath after ensuring it exists ──
     // Don't depend on startup sequence; create-then-realpath here.
@@ -3217,6 +3283,57 @@ export class Gateway {
     const ext = uploadExtForMime(ctype)
     const finalName = `${digest}.${ext}`
     const finalPath = join(baseReal, finalName)
+
+    // 5-remote. Remote-host placement: bytes are still on master's local tmp;
+    // ship them to the remote node-agent /files which writes into the user's
+    // docker volume on that host. node-agent end does chown(1000:1000)+chmod
+    // 0644 via owner_uid/owner_gid/mode query params (equivalent to the local
+    // self-host branch below). On success we drop the local staging file.
+    //
+    // Dedup is intentionally not optimized here (no preflight stat) — the
+    // remote node-agent's PUT is tmp+fsync+rename, so re-pushing the same
+    // digest is safe and the bandwidth cost is bounded by MAX_UPLOAD_SINGLE.
+    if (remoteUpload) {
+      let content: Buffer
+      try {
+        content = await readFile(tmpPath)
+      } catch (err) {
+        this.log.error('handleUpload: read local tmp for remote push failed', {
+          tmpPath,
+          userId,
+        }, err)
+        try { unlinkSync(tmpPath) } catch {}
+        this.sendError(res, 500, 'storage read failed')
+        return
+      }
+      const remotePath = `${remoteUpload.remoteUploadsDir}/${finalName}`
+      try {
+        await this.deps.commercial!.pushRemoteHostUpload!({
+          hostUuid: remoteUpload.hostUuid,
+          remotePath,
+          content,
+        })
+      } catch (err) {
+        this.log.error('handleUpload: push to remote host failed', {
+          hostUuid: remoteUpload.hostUuid,
+          remotePath,
+          userId,
+        }, err)
+        try { unlinkSync(tmpPath) } catch {}
+        // 502 — upstream (node-agent) failure, distinct from master's own
+        // storage failure (500). Frontend retry on this is reasonable.
+        this.sendError(res, 502, 'remote storage push failed')
+        return
+      }
+      try { unlinkSync(tmpPath) } catch {}
+      this.sendJson(res, 200, {
+        url: `/api/media/${finalName}`,
+        digest,
+        size: received,
+        mimeType: ctype,
+      })
+      return
+    }
 
     // 5a. Per-user mode: chmod 0644 + chown to agent uid (1000:1000) BEFORE
     // publishing. tmp inode 此时只有一个 dirent,任何失败都只影响我们自己的 tmp,

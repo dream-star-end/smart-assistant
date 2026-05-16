@@ -293,6 +293,28 @@ export interface RegisterCommercialResult {
    */
   isUserVolumeMediaPath?: (resolvedPath: string) => boolean;
   /**
+   * 2026-05-16 hotfix — remote-host upload push hook。
+   *
+   * 当 `resolveUserMediaDirs(userId)` 返回 `{kind:"fail", reason:"remote-host",
+   * hostUuid, uploads, generated}` 时,gateway 把本地暂存好的字节(stream→
+   * digest 校验完成)通过这个 hook 推到 host 上的 docker volume:
+   *   `${uploads}/${digest}.${ext}` 或 `${generated}/${name}`
+   *
+   * 实现:getHostById(hostUuid) → hostRowToTarget → nodeAgentPutFile(target,
+   * remotePath, content, 0o644, 1000, 1000) → finally psk.fill(0)。
+   *
+   * 错误语义:任意阶段失败(row 不存在 / agent 不可达 / HTTP >=400)直接抛,
+   * gateway 转 502 "remote storage push failed";frontend 重试合理。
+   *
+   * 装配条件同 `resolveUserMediaDirs`(agentRuntime 在手),为简化保持总是
+   * 装配 —— closure 内部自己用 pool,与上面的 resolver 一致。
+   */
+  pushRemoteHostUpload?: (args: {
+    hostUuid: string;
+    remotePath: string;
+    content: Buffer;
+  }) => Promise<void>;
+  /**
    * P1.7 slice 7c — WeChat broker 入站入口。
    *
    * 装配条件:
@@ -2155,6 +2177,41 @@ export async function registerCommercial(
     // textual 谓词,无依赖,始终暴露 —— 仅供 orphan sweep 启动时按目录壳子
     // 迭代 user volumes 用。**不要**给 HTTP allowlist 用(cross-tenant IDOR)。
     isUserVolumeMediaPath,
+    // remote-host media push hook(2026-05-16 hotfix):用户容器调度到 remote
+    // compute host 时,master 收到 /api/uploads → 本地暂存 → 调本 hook 把字节
+    // 推到 host 上的 docker volume(/var/lib/docker/volumes/oc-v3-data-u<uid>/
+    // _data/uploads/<digest>.<ext>)。node-agent 的 AllowedDirRegexes 已经放行
+    // 这一路径形态(files.go 同 hotfix),mode 0o644 + owner 1000:1000 与
+    // self-host 分支等价(容器内 agent uid=1000,确保可读)。
+    //
+    // 错误语义:row 不存在/agent 不可达/HTTP >=400 都直接抛,gateway 自己
+    // 转成 502 "remote storage push failed"。PSK buffer 在 finally 里 fill(0)
+    // 清零,与 putRemoteCodexAuth 同纪律。
+    pushRemoteHostUpload: async (args: {
+      hostUuid: string;
+      remotePath: string;
+      content: Buffer;
+    }) => {
+      const row = await computeQueries.getHostById(args.hostUuid);
+      if (!row) {
+        throw new Error(
+          `pushRemoteHostUpload: compute_host ${args.hostUuid} not found`,
+        );
+      }
+      const target = hostRowToTarget(row);
+      try {
+        await nodeAgentPutFile(
+          target,
+          args.remotePath,
+          args.content,
+          0o644,
+          1000,
+          1000,
+        );
+      } finally {
+        target.psk?.fill(0);
+      }
+    },
     // P1.7 slice 7c — broker 装配成功(WECHAT_BROKER_ENABLED=1 + bridgeSecret 齐)
     // 才暴露。gateway cli 把 commercial.wechatBroker 作为 onInboundOverride 透传给
     // wechat manager;manager 命中普通文本路径时把 evt 喂给 broker.onInbound,

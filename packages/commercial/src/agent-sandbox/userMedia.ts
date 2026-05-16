@@ -143,14 +143,40 @@ export function parseCommercialUid(userId: string): number | null {
   return uid;
 }
 
+/**
+ * remote-host 失败枝携带的额外字段。
+ *
+ * 与其他 fail 原因不同,'remote-host' 不是"读不到"的硬错误 —— 容器存在且健康,
+ * 只是物理上落在非 self compute host 上。gateway handleUpload 拿到这个分支后,
+ * 用 `hostUuid` + `uploads` 经由 node-agent /files PUT 把上传文件推到远端 volume
+ * 宿主路径(remote-host master view 与 self master view 卷布局完全一致 —— 都是
+ * docker named volume,默认 mountpoint `/var/lib/docker/volumes/<name>/_data/`)。
+ *
+ * 其它 caller(读路径 handleMediaGet / handleApiFile)目前仍把 'remote-host'
+ * 当作软失败,通过 _sendMediaResolveError 返 503;Phase 2 才打通读侧的 pull。
+ */
+export type UserMediaRemoteHostFail = {
+  kind: "fail";
+  reason: "remote-host";
+  /** 与 'ok' 分支同语义:用户的数字 uid(parseCommercialUid 结果)。 */
+  uid: number;
+  /** compute_hosts.id —— 用于查 host 行解 NodeAgentTarget。 */
+  hostUuid: string;
+  /** 远端 master view 卷路径,等同 self host 上 buildUserMediaHostDir(uid, 'uploads')。 */
+  uploads: string;
+  /** 同上,generated 子目录。 */
+  generated: string;
+  logCtx: Record<string, unknown>;
+};
+
 export type UserMediaLocation =
   | { kind: "ok"; uid: number; uploads: string; generated: string }
+  | UserMediaRemoteHostFail
   | {
       kind: "fail";
       reason:
         | "invalid-uid"
         | "not-ready"
-        | "remote-host"
         | "volume-missing"
         | "ambiguous"
         | "daemon-error";
@@ -160,6 +186,8 @@ export type UserMediaLocation =
 interface ActiveContainerRow {
   /** compute_hosts.name — `'self'` only allowed; anything else → remote-host. */
   hostName: string;
+  /** compute_hosts.id —— remote-host 分支推 node-agent /files 时用。 */
+  hostUuid: string;
   containerId: string | number;
 }
 
@@ -222,13 +250,14 @@ export function createUserMediaResolver(deps: {
     // state='active' is the same filter v3supervisor uses for "user-owned
     // live container". Multiple active rows = data corruption; fail-closed
     // because picking one arbitrarily would let split-brain hide.
-    let rows: { host_name: string; container_id: string }[];
+    let rows: { host_name: string; host_uuid: string; container_id: string }[];
     try {
       const res = await deps.pool.query<{
         host_name: string;
+        host_uuid: string;
         container_id: string;
       }>(
-        `SELECT h.name AS host_name, c.id::text AS container_id
+        `SELECT h.name AS host_name, h.id::text AS host_uuid, c.id::text AS container_id
            FROM agent_containers c
            JOIN compute_hosts h ON c.host_uuid = h.id
           WHERE c.user_id = $1 AND c.state = 'active'`,
@@ -260,13 +289,28 @@ export function createUserMediaResolver(deps: {
 
     const row: ActiveContainerRow = {
       hostName: rows[0].host_name,
+      hostUuid: rows[0].host_uuid,
       containerId: rows[0].container_id,
     };
     if (row.hostName !== "self") {
+      // remote-host:返回 hostUuid + 两 dir,让 gateway 用 node-agent /files PUT
+      // 把上传文件推到远端 volume 宿主路径。卷布局在 self/remote 完全一致(同样
+      // 是 docker named volume `oc-v3-data-u<uid>`,默认 mountpoint
+      // `/var/lib/docker/volumes/<name>/_data/`)—— 所以 master view 路径直接
+      // 复用 buildUserMediaHostDir。
       return {
         kind: "fail",
         reason: "remote-host",
-        logCtx: { uid, host: row.hostName, containerId: row.containerId },
+        uid,
+        hostUuid: row.hostUuid,
+        uploads: buildUserMediaHostDir(uid, "uploads"),
+        generated: buildUserMediaHostDir(uid, "generated"),
+        logCtx: {
+          uid,
+          host: row.hostName,
+          hostUuid: row.hostUuid,
+          containerId: row.containerId,
+        },
       };
     }
 
