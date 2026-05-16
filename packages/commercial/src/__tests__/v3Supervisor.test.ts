@@ -480,9 +480,9 @@ describe("provisionV3Container", () => {
     const epc = opts.NetworkingConfig?.EndpointsConfig?.[V3_NETWORK_NAME];
     assert.equal(epc?.IPAMConfig?.IPv4Address, IP);
 
-    // 资源硬限额:默认 2GB / 1 核 / 1024 pids(env 未设,走 DEFAULT_V3_*)
-    assert.equal(opts.HostConfig?.Memory, 2048 * 1024 * 1024);
-    assert.equal(opts.HostConfig?.MemorySwap, 2048 * 1024 * 1024, "MemorySwap 必须 == Memory 禁 swap");
+    // 资源硬限额:默认 4GB / 1 核 / 1024 pids(env 未设,走 DEFAULT_V3_*)
+    assert.equal(opts.HostConfig?.Memory, 4096 * 1024 * 1024);
+    assert.equal(opts.HostConfig?.MemorySwap, 4096 * 1024 * 1024, "MemorySwap 必须 == Memory 禁 swap");
     assert.equal(opts.HostConfig?.MemorySwappiness, 0);
     assert.equal(opts.HostConfig?.NanoCpus, 1_000_000_000, "1.0 CPU = 1e9 ns");
     assert.equal(opts.HostConfig?.PidsLimit, 1024);
@@ -547,7 +547,7 @@ describe("provisionV3Container", () => {
           901,
         );
         const hc = captured.containersCreated[0]!.HostConfig!;
-        assert.equal(hc.Memory, 2048 * 1024 * 1024, "floor 后 <1 必须回退 DEFAULT_V3_MEMORY_MB,不能传 0");
+        assert.equal(hc.Memory, 4096 * 1024 * 1024, "floor 后 <1 必须回退 DEFAULT_V3_MEMORY_MB,不能传 0");
         assert.equal(hc.NanoCpus, 1_000_000_000, "floor 后 <1 ns 必须回退 DEFAULT_V3_CPUS");
         assert.equal(hc.PidsLimit, 1024, "floor 后 <1 必须回退 DEFAULT_V3_PIDS_LIMIT");
       }

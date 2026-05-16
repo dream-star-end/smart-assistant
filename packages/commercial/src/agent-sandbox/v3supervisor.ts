@@ -489,7 +489,10 @@ const V3_IP_ALLOC_MAX_ATTEMPTS = 30;
 /**
  * V3 Phase 3I — 实例级 active 容器硬限。
  *
- * 默认 50,经验值(单 host 32GB / 50 容器 ≈ 每容器 600MB working set 余量)。
+ * 默认 50 — **仅按 v3 早期 32GB / 600MB working set 经验设的上限保险丝**,
+ * 已经不是真实容量模型:DEFAULT_V3_MEMORY_MB 升到 4096(2026-05 修 OOM)后,
+ * 真实容量需按 host 实际 RAM / 单容器 4 GiB 重新算,生产用 env
+ * `OC_MAX_RUNNING_CONTAINERS` 显式收紧(如 15GB host 上设 3)。
  * env `OC_MAX_RUNNING_CONTAINERS` 整数覆盖;V3SupervisorDeps.maxRunningContainers
  * 优先级更高(测试 / 多机分配)。打到 cap → SupervisorError("HostFull"),
  * v3ensureRunning 翻成 ContainerUnreadyError(10, "host_full"),前端按 retryAfter
@@ -507,12 +510,13 @@ export const DEFAULT_MAX_RUNNING_CONTAINERS = 50;
  *   - OC_V3_PIDS_LIMIT  → DEFAULT_V3_PIDS_LIMIT
  *
  * 非法值(NaN / 非数字 / ≤0 / floor 后 <1)一律回退默认,不抛。选值理由:
- *   - Memory 2048 MB:v3 容器内跑 CCB + node + streaming + 用户工具 + skill 基线,
- *     v2 的 384MB 对 v3 场景不够;2GB 给大模型上下文与编译留余量
+ *   - Memory 4096 MB:v3 容器内跑 CCB + node + streaming + 用户工具 + skill 基线,
+ *     v2 的 384MB 对 v3 场景不够;Opus 4.7 长上下文 + 多图附件实测峰值破 2GB
+ *     被 cgroup OOM 反复杀(uid=1/4/75 多次记录),4GB 给上下文 + 编译 + 缓存留余量
  *   - CPUs 1.0 核:交互式 agent 够用;峰值由 idle sweep 30min 回收兜底
  *   - PidsLimit 1024:防 fork bomb;正常进程树 < 100,1024 有 10× 缓冲
  */
-export const DEFAULT_V3_MEMORY_MB = 2048;
+export const DEFAULT_V3_MEMORY_MB = 4096;
 export const DEFAULT_V3_CPUS = 1.0;
 export const DEFAULT_V3_PIDS_LIMIT = 1024;
 
