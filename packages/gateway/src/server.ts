@@ -239,6 +239,24 @@ export interface CommercialHook {
     content: Buffer
   }) => Promise<void>
   /**
+   * **V3 remote-host 读路径桥**(2026-05-16 Phase 2)。`pushRemoteHostUpload`
+   * 的对称端 —— 当 `resolveUserMediaDirs` 返回 `remote-host`,gateway 用本 hook
+   * 从远端 user docker volume 拉文件回 master,由 master 服给 HTTP 终端。
+   *
+   * 仅在 `handleMediaGet` / `handleApiFile` 命中 remote-host 时调用,自 self-host
+   * 路径无关。`remotePath` 必须在 node-agent AllowedDirRegexes 之内(uploads/
+   * generated 子目录),否则 node-agent 直接 400 BAD_PATH。
+   *
+   * 返:
+   *   - `Buffer` → 拉到字节(可能为空文件)
+   *   - `null`   → 远端 404,gateway 可选择尝试另一目录或最终 404 给用户
+   *   - throw   → 网络/mTLS/auth/agent app err,gateway 转 502
+   */
+  pullRemoteHostMedia?: (args: {
+    hostUuid: string
+    remotePath: string
+  }) => Promise<Buffer | null>
+  /**
    * **textual** 谓词:判定 `resolvedPath` 是否长得像
    * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)[/<file>]`。
    *
@@ -2890,10 +2908,68 @@ export class Gateway {
     // /root/openclaude.json would pass isFileAllowed (text startsWith check)
     // and leak the config.
     const resolved = resolve(filePath)
+    const userId = this.getUserId(req)
+    const mediaLoc = await this._resolveMediaDirs(userId)
     let realPath: string
     try {
       realPath = realpathSync(resolved)
     } catch {
+      // 2026-05-16 Phase 2:本地 realpathSync 失败时,若该路径文本上属于 remote-host
+      // 用户的 docker volume uploads/generated 子目录(master 本机物理上没这个
+      // volume — 用户被调度到远端 compute host),走 node-agent /files GET 拉远端
+      // 字节回服。否则维持原 404 行为。
+      //
+      // 安全:复用 makeUserScopedMediaPredicate 做边界安全前缀判定(`p === dir ||
+      // p.startsWith(dir + '/')`),不裸 startsWith(防 `uploads-evil/x` 误中)。
+      // 拉到字节后仍走 isFileBlocked + active MIME→attachment + inline/attachment
+      // 双模,与本地分支完全对称(Codex review 2:remote 安全语义不能降级)。
+      if (
+        mediaLoc.kind === 'fail' &&
+        mediaLoc.reason === 'remote-host' &&
+        this.deps.commercial?.pullRemoteHostMedia
+      ) {
+        const remoteScoped = makeUserScopedMediaPredicate(mediaLoc.uploads, mediaLoc.generated)
+        if (remoteScoped(resolved)) {
+          let buf: Buffer | null = null
+          try {
+            buf = await this.deps.commercial.pullRemoteHostMedia({
+              hostUuid: mediaLoc.hostUuid,
+              remotePath: resolved,
+            })
+          } catch (err) {
+            this.log.error(
+              'api/file: remote-host pull failed',
+              { hostUuid: mediaLoc.hostUuid, remotePath: resolved, ...mediaLoc.logCtx },
+              err as Error,
+            )
+            this.sendError(res, 502, 'remote storage pull failed')
+            return
+          }
+          if (buf === null) {
+            // Codex review #1 (Phase 2): null 表示远端 404;空 Buffer(0 字节文件)
+            // 是合法命中,不能被 falsy 吞掉。
+            res.writeHead(404)
+            res.end('not found')
+            return
+          }
+          if (isFileBlocked(resolved)) {
+            this.log.warn('api/file: remote hit blocked by sensitive deny-list', { path: resolved })
+            res.writeHead(403)
+            res.end('access denied')
+            return
+          }
+          const remoteFileContentType = mimeFor(resolved)
+          const remoteFileDispositionMode = isActiveContentType(remoteFileContentType) ? 'attachment' : 'inline'
+          res.writeHead(200, {
+            'Content-Type': remoteFileContentType,
+            'Content-Length': buf.length,
+            'Cache-Control': 'private, max-age=3600',
+            'Content-Disposition': `${remoteFileDispositionMode}; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
+          })
+          res.end(buf)
+          return
+        }
+      }
       res.writeHead(404)
       res.end('not found')
       return
@@ -2914,8 +2990,6 @@ export class Gateway {
     // degradation. (Returning 503 here would break personal-version flows
     // running side-by-side and confuse tool-output rendering for users
     // whose container is mid-provisioning.)
-    const userId = this.getUserId(req)
-    const mediaLoc = await this._resolveMediaDirs(userId)
     const userScopedAllowed = mediaLoc.kind === 'fail'
       ? undefined
       : makeUserScopedMediaPredicate(mediaLoc.uploads, mediaLoc.generated)
@@ -2996,6 +3070,74 @@ export class Gateway {
     const userIdForMedia = this.getUserId(req)
     const mediaLocation = await this._resolveMediaDirs(userIdForMedia)
     if (mediaLocation.kind === 'fail') {
+      // 2026-05-16 Phase 2:remote-host 用户走 node-agent /files GET 拉远端 user
+      // volume 文件回服。其余 fail 原因(not-ready / volume-missing / 等)继续
+      // 走 _sendMediaResolveError 既有语义。
+      //
+      // 与本地分支的安全/响应头**完全对称**(Codex review 2:确保 isFileBlocked /
+      // active MIME → attachment / Cache-Control / Content-Length 都跟本地一致,
+      // 不能"远端走捷径"):
+      //   - mimeFor 用 filename(无 realpath 可言,filename 经 traversal 校验)
+      //   - 命中前查 isFileBlocked(防 `.env` 等 deny-list)
+      //   - active content 强制 attachment + filename
+      //   - Content-Length 取 buffer.length(node-agent 已校 MaxFileSize)
+      if (
+        mediaLocation.reason === 'remote-host' &&
+        this.deps.commercial?.pullRemoteHostMedia
+      ) {
+        const remoteCandidates = [
+          `${mediaLocation.uploads}/${filename}`,
+          `${mediaLocation.generated}/${filename}`,
+        ]
+        let buf: Buffer | null = null
+        let hitPath: string | null = null
+        for (const remotePath of remoteCandidates) {
+          try {
+            const result = await this.deps.commercial.pullRemoteHostMedia({
+              hostUuid: mediaLocation.hostUuid,
+              remotePath,
+            })
+            if (result !== null) {
+              buf = result
+              hitPath = remotePath
+              break
+            }
+          } catch (err) {
+            this.log.error(
+              'media: remote-host pull failed',
+              { hostUuid: mediaLocation.hostUuid, remotePath, ...mediaLocation.logCtx },
+              err as Error,
+            )
+            this.sendError(res, 502, 'remote storage pull failed')
+            return
+          }
+        }
+        if (buf === null || hitPath === null) {
+          // Codex review #1 (Phase 2):空 Buffer(0 字节文件)是合法命中,
+          // 必须用严格 === null 判定,不能用 falsy。
+          res.writeHead(404)
+          res.end('not found')
+          return
+        }
+        if (isFileBlocked(hitPath)) {
+          this.log.warn('media: remote hit blocked by sensitive deny-list', { hitPath })
+          res.writeHead(403)
+          res.end('access denied')
+          return
+        }
+        const remoteContentType = mimeFor(hitPath)
+        const remoteHeaders: Record<string, string | number> = {
+          'Content-Type': remoteContentType,
+          'Content-Length': buf.length,
+          'Cache-Control': 'private, max-age=3600',
+        }
+        if (isActiveContentType(remoteContentType)) {
+          remoteHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(hitPath) || 'file')}"`
+        }
+        res.writeHead(200, remoteHeaders)
+        res.end(buf)
+        return
+      }
       this._sendMediaResolveError(res, mediaLocation, 'media')
       return
     }

@@ -446,6 +446,131 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
   });
 }
 
+/**
+ * rpcCallBinary — rpcCall 的二进制响应变体。
+ *
+ * 与 rpcCall 共享一切(mTLS/CA pinning/SPIFFE 验/auth/超时/trace 头),只在
+ * 成功响应路径返回 raw Buffer 而非 JSON.parse。错误路径仍尝试把 body 当 JSON
+ * 解出 agent code(node-agent 错误响应固定 application/json {code,error}),
+ * 与 JSON RPC 的 AgentAppError 体验对齐。
+ *
+ * 设计:为 GET /files binary 流量量身定制。复制 rpcCall 主体而非加 flag,
+ * 是为了把"JSON RPC"和"byte RPC"的契约钉死在函数边界 — 类型签名 Buffer
+ * 而非 unknown,调用者编译期 type-safe;未来加 streaming RPC 不会污染 JSON 路径。
+ *
+ * 受限 RpcOptions:
+ *   - body / rawBody 仍互斥(GET 通常无 body,允许 caller 自由)
+ *   - 不接受 expectBinary 等额外配置(就一个"返 Buffer"用途,无配置面)
+ */
+async function rpcCallBinary(target: NodeAgentTarget, opts: RpcOptions): Promise<Buffer> {
+  const master = await getMasterTls();
+  if (opts.body !== undefined && opts.rawBody !== undefined) {
+    throw new Error("rpcCallBinary: body and rawBody are mutually exclusive");
+  }
+  let bodyBuf: Buffer | null = null;
+  let bodyContentType: string | null = null;
+  if (opts.rawBody !== undefined) {
+    bodyBuf = opts.rawBody;
+    bodyContentType = opts.rawContentType ?? "application/octet-stream";
+  } else if (opts.body !== undefined) {
+    bodyBuf = Buffer.from(JSON.stringify(opts.body), "utf8");
+    bodyContentType = "application/json";
+  }
+
+  const headers: OutgoingHttpHeaders = {
+    // 关键差异:这里期望 binary body,告诉 server 偏好 octet-stream
+    accept: "application/octet-stream",
+  };
+  if (bodyBuf) {
+    headers["content-type"] = bodyContentType!;
+    headers["content-length"] = bodyBuf.length;
+  }
+  headers[TRACE_ID_HEADER] = _resolveEffectiveTraceId(opts.traceId, target.hostId, opts.path);
+  if (target.psk) {
+    headers["authorization"] = `Bearer ${target.psk.toString("hex")}`;
+  }
+
+  return new Promise<Buffer>((resolve, reject) => {
+    let settled = false;
+    const settle = (err: Error | null, val?: Buffer): void => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve(val as Buffer);
+    };
+
+    const req = httpsRequest(
+      {
+        host: target.host,
+        port: target.agentPort,
+        method: opts.method ?? (bodyBuf ? "POST" : "GET"),
+        path: opts.path,
+        headers,
+        ca: master.ca,
+        cert: master.cert,
+        key: master.key,
+        rejectUnauthorized: true,
+        checkServerIdentity: () => undefined,
+        servername: "node-agent",
+        timeout: opts.timeoutMs ?? REQUEST_TIMEOUT_MS,
+        agent: false,
+      },
+      (res) => {
+        const sock = res.socket as TLSSocket | null;
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", async () => {
+          const status = res.statusCode ?? 0;
+          if (!sock) {
+            settle(new CertVerifyError(`tls socket unavailable at response for ${target.hostId}`));
+            return;
+          }
+          try {
+            await verifyServerCert(sock, target.hostId, target.expectedFingerprint);
+          } catch (e) {
+            settle(e instanceof Error ? e : new Error(String(e)));
+            return;
+          }
+          if (status === 401 || status === 403) {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            settle(new AgentAuthError(target.hostId, status, `agent auth failed: ${raw.slice(0, 200)}`));
+            return;
+          }
+          if (status >= 400) {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let agentCode: string | null = null;
+            try {
+              const parsed = JSON.parse(raw) as { code?: string; error?: string };
+              if (parsed && typeof parsed.code === "string") agentCode = parsed.code;
+            } catch { /* raw stays */ }
+            settle(new AgentAppError(
+              target.hostId,
+              status,
+              agentCode,
+              `agent returned ${status}: ${raw.slice(0, 4000)}`,
+            ));
+            return;
+          }
+          settle(null, Buffer.concat(chunks));
+        });
+        res.on("error", (e) => settle(e));
+      },
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      settle(new AgentUnreachableError(target.hostId, `request timeout to ${target.host}:${target.agentPort}${opts.path}`));
+    });
+    req.on("error", (err) => {
+      settle(new AgentUnreachableError(
+        target.hostId,
+        `request to ${target.host}:${target.agentPort}${opts.path} failed: ${err.message}`,
+      ));
+    });
+    if (bodyBuf) req.end(bodyBuf);
+    else req.end();
+  });
+}
+
 // ─── 高层 API ────────────────────────────────────────────────────────
 
 export async function runContainer(
@@ -738,6 +863,42 @@ export async function statFile(
     timeoutMs: 15_000,
     traceId: opts?.traceId,
   });
+}
+
+/**
+ * GET /files?path=<abs> → 二进制文件 body(application/octet-stream)。
+ * 2026-05-16 hotfix:remote-host 用户场景下 master 读取远端 user docker volume
+ * 的 uploads/generated 文件(写镜像 = putFile)。
+ *
+ * 错误语义:
+ *   - 远端 200 + body → 返 Buffer(可能为空文件 = 0 长)
+ *   - 远端 404 NOT_FOUND → 返 null(caller 据此 fallback 到另一 dir 或 404 给前端)
+ *   - 其他失败(网络/握手/auth/413/parent 防御命中等)→ throw,caller 转 502/500
+ *
+ * 选 rpcCallBinary 而不是 rpcCall<Buffer> + expectBinary flag:协议契约清晰,
+ * 调用者 type-safe;mTLS/cert verify/auth/超时等核心逻辑通过共享 helper 复用。
+ *
+ * 200MB Buffer 一次性加载到内存与 putFile 的 readFile(tmpPath)对称 — Phase 2 内
+ * 不做 streaming 重构,留作后续观察项(p95 / 内存峰值)。
+ */
+export async function getFile(
+  target: NodeAgentTarget,
+  remotePath: string,
+  opts?: { traceId?: string },
+): Promise<Buffer | null> {
+  try {
+    return await rpcCallBinary(target, {
+      path: "/files?path=" + encodeURIComponent(remotePath),
+      method: "GET",
+      timeoutMs: 60_000,
+      traceId: opts?.traceId,
+    });
+  } catch (err) {
+    if (err instanceof AgentAppError && err.httpStatus === 404) {
+      return null;
+    }
+    throw err;
+  }
 }
 
 // ─── SSH ControlMaster RPC (C.1 stub → C.2 impl) ────────────────────

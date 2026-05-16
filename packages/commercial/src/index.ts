@@ -173,6 +173,7 @@ import {
   stopSshControlMaster,
   putFile as nodeAgentPutFile,
   deleteFile as nodeAgentDeleteFile,
+  getFile as nodeAgentGetFile,
 } from "./compute-pool/nodeAgentClient.js";
 import { createContainerService } from "./compute-pool/containerService.js";
 import { getHealthPoller, type HealthPoller } from "./compute-pool/nodeHealth.js";
@@ -314,6 +315,30 @@ export interface RegisterCommercialResult {
     remotePath: string;
     content: Buffer;
   }) => Promise<void>;
+  /**
+   * 2026-05-16 hotfix Phase 2 — remote-host **读路径**对称 hook。
+   *
+   * 当 `resolveUserMediaDirs(userId)` 返回 `remote-host` 失败,gateway 的
+   * `handleMediaGet` / `handleApiFile` 通过本 hook 从远端 node-agent /files GET
+   * 拉用户卷下的文件回 master,由 master 服给浏览器/API 客户端。
+   *
+   * 实现:getHostById(hostUuid) → hostRowToTarget → nodeAgentGetFile(target,
+   * remotePath) → finally psk.fill(0)。
+   *
+   * 返回:
+   *   - `Buffer` (含空 Buffer = 0 字节文件,合法):远端命中
+   *   - `null`:远端 404(node-agent 明确不存在,gateway 可选择 fallback 到另一
+   *     目录或最终 404 给用户)
+   *
+   * 错误:任意阶段失败(row 不存在 / agent 不可达 / mTLS / HTTP >=400 非 404)
+   *   直接抛 → gateway 转 502 "remote storage pull failed";frontend 重试合理。
+   *
+   * 装配条件、psk 清零纪律与 `pushRemoteHostUpload` 完全对称。
+   */
+  pullRemoteHostMedia?: (args: {
+    hostUuid: string;
+    remotePath: string;
+  }) => Promise<Buffer | null>;
   /**
    * P1.7 slice 7c — WeChat broker 入站入口。
    *
@@ -2208,6 +2233,26 @@ export async function registerCommercial(
           1000,
           1000,
         );
+      } finally {
+        target.psk?.fill(0);
+      }
+    },
+    // 2026-05-16 hotfix Phase 2 — remote-host 读路径对称 closure。
+    // 与 pushRemoteHostUpload 同纪律(psk 清零)与同错误语义(throw → gateway 502)。
+    // node-agent 404 → 返 null,让 gateway 决定 fallback 还是终态 404。
+    pullRemoteHostMedia: async (args: {
+      hostUuid: string;
+      remotePath: string;
+    }) => {
+      const row = await computeQueries.getHostById(args.hostUuid);
+      if (!row) {
+        throw new Error(
+          `pullRemoteHostMedia: compute_host ${args.hostUuid} not found`,
+        );
+      }
+      const target = hostRowToTarget(row);
+      try {
+        return await nodeAgentGetFile(target, args.remotePath);
       } finally {
         target.psk?.fill(0);
       }
