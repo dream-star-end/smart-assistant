@@ -204,6 +204,64 @@ func TestHandlePut_ChownFails_500AndTmpCleaned(t *testing.T) {
 	}
 }
 
+// ── AllowedDirRegexes(v3 user-volume media)的 validatePath 行为 ──────
+//
+// 该 regex 允许 PUT/DELETE/STAT 命中
+// /var/lib/docker/volumes/oc-v3-data-u<uid>/_data/(uploads|generated)/<file>
+// 这一动态路径(per-user docker volume)。覆盖 accept / reject 两侧边界。
+func TestValidatePath_V3UserVolumeMedia(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		// accept
+		{"uploads 下文件", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/abc.txt", false},
+		{"generated 下文件", "/var/lib/docker/volumes/oc-v3-data-u42/_data/generated/img.png", false},
+		{"uid=1 小数字", "/var/lib/docker/volumes/oc-v3-data-u1/_data/uploads/a.bin", false},
+		{"uid=19 位 (MAX_SAFE_INT 范围)", "/var/lib/docker/volumes/oc-v3-data-u9007199254740991/_data/uploads/a", false},
+		{"含 dedup-style 文件名 (digest.ext)", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/deadbeef.jpg", false},
+
+		// reject — 目录本身不接受(规避对 dynamic root 目录的直接操作)
+		{"目录本身(uploads)", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads", true},
+		{"目录本身(generated)", "/var/lib/docker/volumes/oc-v3-data-u42/_data/generated", true},
+
+		// reject — 嵌套子目录(uploads/sub/file)
+		{"uploads 嵌套子目录", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/sub/x.txt", true},
+
+		// reject — 非 uploads/generated 子目录
+		{"其他子目录(projects)", "/var/lib/docker/volumes/oc-v3-data-u42/_data/projects/x.txt", true},
+		{"其他子目录(skills)", "/var/lib/docker/volumes/oc-v3-data-u42/_data/skills/x.txt", true},
+
+		// reject — uid 形态不合法
+		{"uid=0", "/var/lib/docker/volumes/oc-v3-data-u0/_data/uploads/x", true},
+		{"uid 前导 0", "/var/lib/docker/volumes/oc-v3-data-u042/_data/uploads/x", true},
+		{"uid 含非数字", "/var/lib/docker/volumes/oc-v3-data-uabc/_data/uploads/x", true},
+		{"uid 含负号", "/var/lib/docker/volumes/oc-v3-data-u-1/_data/uploads/x", true},
+		{"uid 超长 20 位", "/var/lib/docker/volumes/oc-v3-data-u12345678901234567890/_data/uploads/x", true},
+		{"卷名前缀不对(proj 而非 data)", "/var/lib/docker/volumes/oc-v3-proj-u42/_data/uploads/x", true},
+		{"docker volumes 根下其它卷", "/var/lib/docker/volumes/random-vol/_data/uploads/x", true},
+
+		// reject — 路径穿越
+		{"含 ..", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/../../etc/passwd", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validatePath(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestHandlePut_BadOwner_400(t *testing.T) {
 	osChownOrig := osChown
 	osChown = func(name string, uid, gid int) error {

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,17 +27,57 @@ import (
 )
 
 // MaxFileSize 是单次 PUT body 的上限。超过会返 413。
-const MaxFileSize = 16 << 20 // 16 MiB
+//
+// 2026-05-16:从 16 MiB 提到 200 MiB 与 master gateway MAX_UPLOAD_SINGLE 对齐。
+// 远端 host 用户上传 ≤200MB 文件直接走 master → node-agent /files PUT 推到 user
+// volume(/var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads),否则 master
+// 端要先在自己 paths.uploadsDir 暂存再推送时 16MiB 上限会成为新瓶颈。
+const MaxFileSize = 200 << 20 // 200 MiB
 
-// AllowedRoots 定义 PUT/DELETE/STAT 允许操作的根目录前缀。
+// AllowedRoots 定义 PUT/DELETE/STAT 允许操作的固定根目录前缀。
 //
 // 设计:路径经 filepath.Clean 后必须等于某 root 或以 root + '/' 开头。
 // 不允许相对路径 / 不允许 `..` 穿越(Clean 会解掉)。
+//
+// 动态根目录(per-user docker volume)由 AllowedDirRegexes 单独管理 —— 该机制
+// 不走前缀匹配,而是匹配文件的 parent dir 是否符合 v3 用户卷的规范形态。
 var AllowedRoots = []string{
 	"/var/lib/openclaude/baseline",
 	"/var/lib/openclaude/user-data",
 	"/var/lib/openclaude-v3/codex-container-auth",
 	"/run/ccb-ssh",
+}
+
+// AllowedDirRegexes 定义"父目录"必须匹配的严格正则集合 —— 用于允许操作那些
+// 名字带 per-user 序号(uid)的动态目录,典型即 v3 commercial 用户 docker volume
+// 下的 uploads/generated 子目录:
+//
+//	/var/lib/docker/volumes/oc-v3-data-u<uid>/_data/(uploads|generated)
+//
+// 匹配方式:对清洗后的文件路径取 filepath.Dir(),与每个正则尝试。任一命中即视
+// 为合法。
+//
+// 严格性:
+//   - uid 必须是 1-19 位正整数,不允许前导 0、负号、非数字
+//   - 仅允许 uploads / generated 两个子目录(与 commercial userMedia.ts 中
+//     MediaKind 严格同步;新增 kind 需同时更新这里)
+//   - 不允许目录之下再嵌套子目录(文件直接落在 uploads/generated 之下)
+//
+// 安全:resolveParentNoSymlink 会先 EvalSymlinks parent 真身,再用本组正则匹配,
+// 防御 user-data symlink 逃逸到此动态根。
+var AllowedDirRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`^/var/lib/docker/volumes/oc-v3-data-u[1-9][0-9]{0,18}/_data/(uploads|generated)$`),
+}
+
+// dirMatchesAllowedRegex 检查 dir(已 Clean)是否命中 AllowedDirRegexes 任一项。
+// 抽出供 validatePath + resolveParentNoSymlink 共用。
+func dirMatchesAllowedRegex(dir string) bool {
+	for _, re := range AllowedDirRegexes {
+		if re.MatchString(dir) {
+			return true
+		}
+	}
+	return false
 }
 
 // osChown 是 os.Chown 的可注入 seam,测试里 override 模拟 chown 失败。
@@ -60,6 +101,12 @@ func acquire() func() {
 }
 
 // validatePath 返清洗后的绝对路径;校验在白名单之内。
+//
+// 通过条件(任一):
+//  1. clean 等于 AllowedRoots 任一项或在其下
+//  2. clean 的 parent dir 命中 AllowedDirRegexes(即 per-user docker volume
+//     的 uploads/generated 子目录);此分支只接受"文件"(parent ≠ clean),
+//     不接受目录本身 —— 操作 dynamic root 目录本身没有合法用途。
 func validatePath(raw string) (string, error) {
 	if raw == "" {
 		return "", errors.New("path required")
@@ -74,11 +121,22 @@ func validatePath(raw string) (string, error) {
 			return clean, nil
 		}
 	}
+	parent := filepath.Dir(clean)
+	if parent != clean && dirMatchesAllowedRegex(parent) {
+		return clean, nil
+	}
 	return "", fmt.Errorf("path %q not under any allowed root", clean)
 }
 
-// resolveParentNoSymlink EvalSymlinks parent 目录,校验真身仍在某个 AllowedRoot 下。
-// 防御:容器通过 user-data bind mount 在 AllowedRoots 内植入 symlink 逃到 /etc 等路径。
+// resolveParentNoSymlink EvalSymlinks parent 目录,校验真身仍在某个 AllowedRoot
+// 或 AllowedDirRegexes 命中的动态根之下。
+//
+// 防御:容器通过 user-data bind mount 在 AllowedRoots 内植入 symlink 逃到 /etc
+// 等路径。AllowedDirRegexes 同样要求 EvalSymlinks 后真身仍匹配正则 —— 否则恶意
+// container 可在 /var/lib/docker/volumes/oc-v3-data-uX/_data/uploads/ 下放
+// symlink 指向 /etc/shadow,validatePath(只看 textual 路径)会放过,但 parent
+// 已被替换。
+//
 // 仅对已存在的 parent 有意义;parent 不存在直接返 error,要求调用方先 MkdirAll。
 func resolveParentNoSymlink(p string) error {
 	parent := filepath.Dir(p)
@@ -91,6 +149,9 @@ func resolveParentNoSymlink(p string) error {
 		if real == r || strings.HasPrefix(real, r+string(filepath.Separator)) {
 			return nil
 		}
+	}
+	if dirMatchesAllowedRegex(real) {
+		return nil
 	}
 	return fmt.Errorf("parent %q resolved to %q outside allowed roots", parent, real)
 }
