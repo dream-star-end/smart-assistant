@@ -144,16 +144,60 @@ func resolveParentNoSymlink(p string) error {
 	if err != nil {
 		return fmt.Errorf("resolve parent: %w", err)
 	}
+	if !pathInAllowedTree(real) {
+		return fmt.Errorf("parent %q resolved to %q outside allowed roots", parent, real)
+	}
+	return nil
+}
+
+// pathInAllowedTree 纯文本判断 clean 路径是否落在 AllowedRoots 之下或其 parent
+// 命中 AllowedDirRegexes。要求输入已是 absolute + cleaned —— 不做 symlink 解析。
+//
+// 抽出供 resolveParentNoSymlink + verifyFdTarget 共用,保证 PUT 写校验和 GET fd
+// 后置校验用的是同一套"什么算合法位置"判定。
+func pathInAllowedTree(clean string) bool {
+	if !filepath.IsAbs(clean) {
+		return false
+	}
 	for _, root := range AllowedRoots {
 		r := filepath.Clean(root)
-		if real == r || strings.HasPrefix(real, r+string(filepath.Separator)) {
-			return nil
+		if clean == r || strings.HasPrefix(clean, r+string(filepath.Separator)) {
+			return true
 		}
 	}
-	if dirMatchesAllowedRegex(real) {
-		return nil
+	parent := filepath.Dir(clean)
+	if parent != clean && dirMatchesAllowedRegex(parent) {
+		return true
 	}
-	return fmt.Errorf("parent %q resolved to %q outside allowed roots", parent, real)
+	return false
+}
+
+// verifyFdTarget 在 Open 之后再用 /proc/self/fd/<fd> 反查 fd 的 kernel 视角真实
+// 路径,确认它仍落在 AllowedRoots / AllowedDirRegexes 内。
+//
+// 用途:关掉 resolveParentNoSymlink → OpenFile 之间最后的 TOCTOU race window。
+// 即便 PUT 时 parent 被检查过、O_NOFOLLOW 防住了最终项 symlink,attacker 仍可
+// 在 EvalSymlinks 通过 → OpenFile 之间瞬间把 parent 换成 symlink 指向白名单外
+// 路径,让 fd 拿到一个外部 inode。读 /proc/self/fd 拿 kernel 解析后的真实路径
+// 是最直接的事后裁决。
+//
+// 同时拒 " (deleted)" 后缀:那意味着 dentry 已被 unlink,继续读会返回一个 doomed
+// inode 的旧内容 — 攻击场景:create file → open → unlink → readlink shows
+// "<path> (deleted)" → 即使 path 在白名单,该 inode 也已和文件系统脱钩,不可信。
+//
+// Linux-only(依赖 procfs)。node-agent 部署平台明确为 Linux 容器宿主。
+func verifyFdTarget(fd uintptr) error {
+	realTarget, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return fmt.Errorf("readlink fd: %w", err)
+	}
+	if strings.HasSuffix(realTarget, " (deleted)") {
+		return fmt.Errorf("fd target marked deleted: %q", realTarget)
+	}
+	if !pathInAllowedTree(realTarget) {
+		return fmt.Errorf("fd target %q outside allowed roots", realTarget)
+	}
+	return nil
 }
 
 // parseMode 解析 octal mode 字符串(如 "0600" / "600"),默认 0600。
@@ -224,6 +268,7 @@ func New() *Handler {
 //
 //	PUT    /files?path=...&mode=... body
 //	DELETE /files?path=...
+//	GET    /files?path=...               (流式 body,Content-Type=application/octet-stream)
 //	GET    /files/stat?path=...
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
@@ -231,6 +276,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handlePut(w, r)
 	case r.Method == http.MethodDelete && r.URL.Path == "/files":
 		h.handleDelete(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/files":
+		h.handleGet(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/files/stat":
 		h.handleStat(w, r)
 	default:
@@ -430,4 +477,90 @@ func (h *Handler) handleStat(w http.ResponseWriter, r *http.Request) {
 		Mtime:  st.ModTime().UTC().Format(time.RFC3339),
 		Sha256: digest,
 	})
+}
+
+// handleGet 流式回送 AllowedRoots 下的普通文件。
+//
+// 2026-05-16:用于 master gateway "/api/media + /api/file" 在 remote-host
+// 用户场景下从远端 docker volume 拉文件回服(读路径,与 PUT 镜像)。
+//
+// 防御链(对齐 PUT,避免本地读路径强度低于本地写路径):
+//   - validatePath: 文本层白名单(AllowedRoots 或 AllowedDirRegexes)
+//   - resolveParentNoSymlink: parent 真身仍在白名单(挡 user-data symlink 逃逸)
+//   - O_NOFOLLOW open: 最终项不允许是 symlink
+//   - fd.Stat (而非先 Lstat 再 Open): 关掉 TOCTOU 窗口 + 屏蔽 FIFO/设备/dir
+//   - size 上限 MaxFileSize: 与 master upload limit 对齐
+//
+// Content-Length / Content-Type 是协议必要;master 自己再按真实 MIME 设头给
+// HTTP 终端用户,本端给的 octet-stream 只是 RPC 信道默认。
+func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
+	p, err := validatePath(r.URL.Query().Get("path"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "BAD_PATH", err.Error())
+		return
+	}
+	lk := pathLock(p)
+	lk.Lock()
+	defer lk.Unlock()
+	release := acquire()
+	defer release()
+
+	// Codex review #2 (Phase 2):pre-check parent 真身 → 再 Open。
+	// 顺序原因:post-open check 不能证明 fd 来源安全 — attacker 可能在
+	// "parent 暂时换成外部目录 → Open → parent 换回安全位" 的窗口中让 fd 指向
+	// 外部 inode。pre-check + Open 把窗口收窄到 EvalSymlinks → Open 之间,远小于
+	// 之前。注意 parent 不存在时 EvalSymlinks 返 err,这里要把"父目录不存在"
+	// 同样 map 成 404(语义上等价于"文件不存在")。
+	if err := resolveParentNoSymlink(p); err != nil {
+		// EvalSymlinks 在 parent 不存在时返 *os.PathError(syscall=ENOENT)
+		if errors.Is(err, os.ErrNotExist) {
+			writeErr(w, http.StatusNotFound, "NOT_FOUND", "parent does not exist")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "PARENT_UNSAFE", err.Error())
+		return
+	}
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeErr(w, http.StatusNotFound, "NOT_FOUND", "file does not exist")
+			return
+		}
+		// O_NOFOLLOW 命中 symlink 时,Linux 返 ELOOP;包成 BAD_PATH
+		writeErr(w, http.StatusBadRequest, "OPEN_FAIL", err.Error())
+		return
+	}
+	defer f.Close()
+
+	// Codex review #3 (Phase 2):resolveParentNoSymlink + O_NOFOLLOW 仍留有
+	// "parent 在 EvalSymlinks 与 Open 之间被换成 symlink → 外部目录" 的窗口
+	// (NOFOLLOW 只防最终项,parent 路径分量已是 symlink 不算)。读 /proc/self/fd
+	// 拿 fd 真实路径再过一次白名单,把这道缝缝严。
+	if err := verifyFdTarget(f.Fd()); err != nil {
+		writeErr(w, http.StatusBadRequest, "PATH_DIVERGED", err.Error())
+		return
+	}
+
+	st, err := f.Stat()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "STAT_FAIL", err.Error())
+		return
+	}
+	if !st.Mode().IsRegular() {
+		writeErr(w, http.StatusBadRequest, "NOT_REGULAR_FILE",
+			fmt.Sprintf("mode=%s not a regular file", st.Mode()))
+		return
+	}
+	if st.Size() > MaxFileSize {
+		writeErr(w, http.StatusRequestEntityTooLarge, "FILE_TOO_LARGE",
+			fmt.Sprintf("size %d exceeds %d", st.Size(), MaxFileSize))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
+	w.WriteHeader(http.StatusOK)
+	// io.Copy 走 sendfile fast path(Linux);流式不占额外内存。
+	// 即便 client 中途断,err 不致命 — master 那侧会自己处理 truncated body。
+	_, _ = io.Copy(w, f)
 }

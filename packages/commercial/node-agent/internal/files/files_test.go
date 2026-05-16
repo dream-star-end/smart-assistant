@@ -262,6 +262,217 @@ func TestValidatePath_V3UserVolumeMedia(t *testing.T) {
 	}
 }
 
+// handleGet 覆盖(2026-05-16 Phase 2):master 通过这个 endpoint 拉远端 user
+// volume 文件。锁定四件事:
+//   - 正常存在的普通文件 → 200 + 完整 body + 正确 Content-Length
+//   - 不存在 → 404 NOT_FOUND(让 master 区分 fallback 与 502)
+//   - 目录而非普通文件 → 400 NOT_REGULAR_FILE(挡 dir/FIFO/device)
+//   - 白名单外路径 → 400 BAD_PATH(validatePath gate)
+func TestHandleGet_RegularFile_200(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	payload := []byte("hello-from-remote-host-1234567890")
+	target := filepath.Join(tmpDir, "img.png")
+	if err := os.WriteFile(target, payload, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", target)
+	req := httptest.NewRequest(http.MethodGet, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleGet(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Fatalf("Content-Type: want application/octet-stream got %q", got)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "33" {
+		t.Fatalf("Content-Length: want 33 got %q", got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body mismatch: want %q got %q", payload, rec.Body.Bytes())
+	}
+}
+
+func TestHandleGet_NotFound_404(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	q := url.Values{}
+	q.Set("path", filepath.Join(tmpDir, "missing.png"))
+	req := httptest.NewRequest(http.MethodGet, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleGet(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status: want 404 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "NOT_FOUND") {
+		t.Fatalf("body should contain NOT_FOUND, got %q", rec.Body.String())
+	}
+}
+
+func TestHandleGet_Directory_400(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	subdir := filepath.Join(tmpDir, "sub")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", subdir)
+	req := httptest.NewRequest(http.MethodGet, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleGet(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "NOT_REGULAR_FILE") {
+		t.Fatalf("body should contain NOT_REGULAR_FILE, got %q", rec.Body.String())
+	}
+}
+
+func TestHandleGet_OutsideAllowlist_400(t *testing.T) {
+	// 不调 withTempAllowedRoot → /tmp 不在白名单
+	tmpFile, err := os.CreateTemp("", "outside-*.dat")
+	if err != nil {
+		t.Fatalf("tmp: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	q := url.Values{}
+	q.Set("path", tmpFile.Name())
+	req := httptest.NewRequest(http.MethodGet, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleGet(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "BAD_PATH") {
+		t.Fatalf("body should contain BAD_PATH, got %q", rec.Body.String())
+	}
+}
+
+// verifyFdTarget(Phase 2 Codex review #3 补丁):/proc/self/fd 反查 fd 真实路径,
+// 关掉"parent 在 check 和 open 之间被换成 symlink"的最后一道 race window。
+//
+// 测三件事:
+//  1. 正常 open 一个白名单内文件 → verifyFdTarget 通过
+//  2. open 之后 unlink 文件 → readlink 看到 " (deleted)" → 拒
+//  3. open 一个白名单外文件(如 /etc/hostname 这种宿主静态文件)→ 拒
+//
+// 真正的 race(EvalSymlinks 通过 → 攻击者换 parent → Open)无法稳定复现 — 该
+// 测试覆盖的是 verifyFdTarget 的判定逻辑,即"拿到一个外部目标的 fd 后能不能识
+// 别"。在真实 race 发生时同一段代码会拒掉 attacker 得到的 fd。
+func TestVerifyFdTarget_InsideAllowed_OK(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	target := filepath.Join(tmpDir, "ok.bin")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f, err := os.Open(target)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	if err := verifyFdTarget(f.Fd()); err != nil {
+		t.Fatalf("expected pass, got %v", err)
+	}
+}
+
+func TestVerifyFdTarget_Deleted_Rejected(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	target := filepath.Join(tmpDir, "doomed.bin")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f, err := os.Open(target)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	// unlink while fd still open — kernel marks /proc/self/fd/<n> 路径以
+	// " (deleted)" 结尾
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	err = verifyFdTarget(f.Fd())
+	if err == nil {
+		t.Fatalf("expected error on deleted fd, got nil")
+	}
+	if !strings.Contains(err.Error(), "deleted") {
+		t.Fatalf("error should mention deleted, got %q", err.Error())
+	}
+}
+
+func TestVerifyFdTarget_OutsideAllowed_Rejected(t *testing.T) {
+	// 不挂临时 AllowedRoots → /etc 系统文件天然在白名单外
+	f, err := os.Open("/etc/hostname")
+	if err != nil {
+		t.Skipf("skip: /etc/hostname not readable: %v", err)
+	}
+	defer f.Close()
+
+	err = verifyFdTarget(f.Fd())
+	if err == nil {
+		t.Fatalf("expected error for /etc/hostname, got nil")
+	}
+	if !strings.Contains(err.Error(), "outside allowed roots") {
+		t.Fatalf("error should mention outside allowed roots, got %q", err.Error())
+	}
+}
+
+// pathInAllowedTree 是 verifyFdTarget 调用的纯文本白名单判定,锁定它的边界:
+//   - AllowedRoots 下 / 等于 root → 通过
+//   - AllowedDirRegexes 命中的 parent + 文件 → 通过
+//   - 相对路径 / 白名单外路径 → 拒
+//   - "前缀污染"(/var/lib/openclaude/baseline-evil/...)→ 拒
+func TestPathInAllowedTree(t *testing.T) {
+	cases := []struct {
+		name string
+		p    string
+		want bool
+	}{
+		{"AllowedRoot 下文件", "/var/lib/openclaude/baseline/foo.txt", true},
+		{"AllowedRoot 自身", "/var/lib/openclaude/baseline", true},
+		{"AllowedDirRegex uploads 下", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/a.png", true},
+		{"AllowedDirRegex generated 下", "/var/lib/docker/volumes/oc-v3-data-u42/_data/generated/a.png", true},
+		// 反例
+		{"相对路径", "etc/passwd", false},
+		{"/etc/passwd", "/etc/passwd", false},
+		{"baseline-evil 前缀污染", "/var/lib/openclaude/baseline-evil/x", false},
+		{"uploads 嵌套子目录", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/sub/x", false},
+		{"uploads-evil 后缀污染", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads-evil/x.png", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pathInAllowedTree(tc.p); got != tc.want {
+				t.Fatalf("want %v got %v for %q", tc.want, got, tc.p)
+			}
+		})
+	}
+}
+
 func TestHandlePut_BadOwner_400(t *testing.T) {
 	osChownOrig := osChown
 	osChown = func(name string, uid, gid int) error {

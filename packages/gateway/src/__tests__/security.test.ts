@@ -15,6 +15,7 @@ import {
   isFileAllowed,
   isFileBlocked,
   isUploadMimeAllowed,
+  makeUserScopedMediaPredicate,
 } from '../server.js'
 
 // ── T01: /api/file blacklist — tests the REAL isFileBlocked function ──
@@ -231,6 +232,45 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
       // Without predicate, this falls through to the rest of isFileAllowed
       // (which denies because no static/cwd match).
       assert.ok(!isFileAllowed(lookalike))
+    })
+  })
+
+  // 2026-05-16 Phase 2:remote-host `/api/file` 分支用 makeUserScopedMediaPredicate
+  // 直接判定 textual path 是否落在用户当前请求的 uploads/generated 之内,然后再决
+  // 定调 pullRemoteHostMedia。这条 predicate 是新增的安全边界 — 单测锁定其
+  // boundary 严格性,防止有人退化成裸 startsWith 引入 `uploads-evil/x` 旁路。
+  describe('makeUserScopedMediaPredicate — boundary safety (Phase 2 remote-host gate)', () => {
+    const uploads = '/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads'
+    const generated = '/var/lib/docker/volumes/oc-v3-data-u42/_data/generated'
+    const pred = makeUserScopedMediaPredicate(uploads, generated)
+    it('accepts file directly under uploads', () => {
+      assert.ok(pred(`${uploads}/abc.png`))
+    })
+    it('accepts file directly under generated', () => {
+      assert.ok(pred(`${generated}/codex-out.png`))
+    })
+    it('accepts the dir itself (parity with FILE_ALLOWED_DIRS semantics)', () => {
+      assert.ok(pred(uploads))
+      assert.ok(pred(generated))
+    })
+    it('rejects sibling dir whose name is a prefix superset (uploads-evil/x.png)', () => {
+      // 真正的边界:naive startsWith 会误认 `/uploads-evil/x` 命中 `/uploads`。
+      // makeUserScopedMediaPredicate 要求 `=== dir || startsWith(dir + '/')`,
+      // 把这种 prefix 攻击挡掉。
+      const evil = '/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads-evil/x.png'
+      assert.ok(!pred(evil))
+    })
+    it('rejects sibling dir whose name is a prefix superset (generatedEVIL/x.png)', () => {
+      const evil = '/var/lib/docker/volumes/oc-v3-data-u42/_data/generatedEVIL/x.png'
+      assert.ok(!pred(evil))
+    })
+    it('rejects cross-tenant absolute path (different uid even if same shape)', () => {
+      const other = '/var/lib/docker/volumes/oc-v3-data-u99/_data/uploads/x.png'
+      assert.ok(!pred(other))
+    })
+    it('rejects paths outside docker volumes entirely', () => {
+      assert.ok(!pred('/etc/passwd'))
+      assert.ok(!pred('/root/.ssh/id_rsa'))
     })
   })
 })
