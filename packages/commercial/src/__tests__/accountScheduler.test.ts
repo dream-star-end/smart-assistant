@@ -31,6 +31,9 @@ function mkRow(overrides: Partial<CandidateRow> = {}): CandidateRow {
     quota_5h_pct: overrides.quota_5h_pct ?? null,
     quota_7d_pct: overrides.quota_7d_pct ?? null,
     subscription_end_at: overrides.subscription_end_at ?? null,
+    pinned_user_id:
+      overrides.pinned_user_id ??
+      '0'.repeat(63) + ((Number(overrides.id ?? '1') % 16).toString(16)),
   }
 }
 
