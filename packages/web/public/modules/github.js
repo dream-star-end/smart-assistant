@@ -15,15 +15,15 @@
 //
 // 错误帧 outbound.control.session_repo_bind_error 任意时刻可能来,
 // 翻译表见 GITHUB_ERROR_TEXT。
-import { apiGet, apiJson } from './api.js?v=436bc9ae'
-import { $, htmlSafeEscape } from './dom.js?v=436bc9ae'
-import { getSession, state } from './state.js?v=436bc9ae'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=436bc9ae'
+import { apiGet, apiJson } from './api.js?v=0aa9ee08'
+import { $, htmlSafeEscape } from './dom.js?v=0aa9ee08'
+import { getSession, state } from './state.js?v=0aa9ee08'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=0aa9ee08'
 import {
   clearRepoBindQueue,
   queueRepoBindFrame,
   sendRepoUnbindFrame,
-} from './websocket.js?v=436bc9ae'
+} from './websocket.js?v=0aa9ee08'
 
 // ── Pure helpers (testable) ───────────────────────────────────────
 
