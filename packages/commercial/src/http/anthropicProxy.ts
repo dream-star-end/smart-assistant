@@ -334,6 +334,51 @@ export function extractSessionId(
 }
 
 /**
+ * 把 `metadata.user_id` 这个 SDK 标准字段(CCB 那侧 jsonStringify 的 JSON 串)里的
+ * `device_id` 改写为选号账号的 `pinned_user_id`。
+ *
+ * 反风控背景:CCB 在 `claude-code-best/src/services/api/claude.ts:501` 构造
+ * `metadata.user_id = JSON.stringify({device_id, account_uuid, session_id, ...})`,
+ * 其中 `device_id` 来自容器内 `~/.claude.json` userID(每个新容器随机生成 64 hex)。
+ * 这条字符串随 POST body 直达 Anthropic 网关日志(`metadata` 是 Anthropic SDK 一级
+ * 字段)。容器按需短命 → 同一 OAuth account_uuid 关联大量短命 device_id → 典型
+ * 号商指纹。
+ *
+ * 修复策略:在 master 反代层把 device_id 锚定到账号身份(`pinned_user_id`, 0067
+ * migration 注入 schema DEFAULT + NOT NULL + CHECK + UNIQUE),让 Anthropic 看到
+ * "account_uuid ↔ device_id" 1:1 永久绑定。
+ *
+ * 行为(fail-open 全部场景保留可用性,不抹掉账号已有的 account_uuid/session_id):
+ *   - `userIdStr` 为 undefined/空串 → 返回 `{"device_id": pinnedUserId}` 的最小 JSON
+ *   - 合法 JSON plain object → 注入/覆盖 device_id,保留其他字段(account_uuid/session_id/extras)
+ *   - 合法 JSON 但非 plain object(数组/primitive)→ 保持原值不动(对齐
+ *     `extractSessionId` 既有口径,见本文件 line 311-334)
+ *   - 非法 JSON → 保持原值不动(避免把诡异输入推到 Anthropic 网关引发新风控)
+ */
+export function rewriteMetadataDeviceId(
+  userIdStr: string | undefined,
+  pinnedUserId: string,
+): string {
+  if (!userIdStr) {
+    return JSON.stringify({ device_id: pinnedUserId });
+  }
+  try {
+    const parsed: unknown = JSON.parse(userIdStr);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return JSON.stringify({
+        ...(parsed as Record<string, unknown>),
+        device_id: pinnedUserId,
+      });
+    }
+    // 不是 plain object(含数组、primitive):保持原值不改
+    return userIdStr;
+  } catch {
+    // 非 JSON:保持原值
+    return userIdStr;
+  }
+}
+
+/**
  * 估算 input token 数(保守口径,宁可高估)。
  *
  * MVP 不引入完整 tokenizer(`@anthropic-ai/tokenizer` 增加依赖体积),用
@@ -1898,6 +1943,7 @@ export function makeAnthropicProxyHandler(
                 expires_at: r.expires_at,
                 egress_proxy: pick.egress_proxy,
                 egress_target: pick.egress_target,
+                pinned_user_id: pick.pinned_user_id,
               };
             } catch (err) {
               // refresh 失败:account 已在 RefreshError 内部按规约处理 disable/不 disable;
@@ -2053,6 +2099,32 @@ export function makeAnthropicProxyHandler(
               model: body.model,
               thinking: r.thinkingStripped,
               redactedThinking: r.redactedThinkingStripped,
+            });
+          }
+        }
+        // 反风控:把客户端上报的 metadata.user_id.device_id 锚定到账号的 pinned_user_id,
+        // 让 Anthropic 网关看到 account_uuid ↔ device_id 1:1 永久绑定。详见
+        // `rewriteMetadataDeviceId` 的文档注释。
+        //
+        // deepseek 路径不需要此修复(deepseek 不做 Anthropic 风控),pick === null 时
+        // 自动跳过。
+        //
+        // pinned_user_id 由 0067 migration 落 schema 强约束(DEFAULT + NOT NULL +
+        // CHECK ^[0-9a-f]{64}$ + UNIQUE),正常路径不会落到 else 分支。一旦落到说明
+        // schema 已被绕过(脏数据/旧应用版本/测试桩不全),走 fail-open + userLog.warn:
+        // 不阻塞用户请求,但记录强告警等运维介入(账号级问题,影响范围有限)。
+        if (pick) {
+          const pinned = pick.pinned_user_id;
+          if (typeof pinned === "string" && /^[0-9a-f]{64}$/.test(pinned)) {
+            body.metadata ??= {};
+            body.metadata.user_id = rewriteMetadataDeviceId(
+              body.metadata.user_id,
+              pinned,
+            );
+          } else {
+            userLog.warn("pinned_user_id_invariant_breach", {
+              account_id: pick.account_id.toString(),
+              pinned_type: typeof pinned,
             });
           }
         }

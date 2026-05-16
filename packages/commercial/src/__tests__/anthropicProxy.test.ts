@@ -29,6 +29,7 @@ import {
   isAnthropicInvalidRequestError,
   isClientAbort,
   makeFinalizer,
+  rewriteMetadataDeviceId,
   stripMalformedThinkingBlocks,
   DEEPSEEK_UPSTREAM_ENDPOINT,
   ALLOWED_BETA_VALUES,
@@ -1160,5 +1161,66 @@ describe("stripMalformedThinkingBlocks", () => {
     const r = stripMalformedThinkingBlocks(messages);
     assert.equal(r.thinkingStripped, 0, "长但伪造 signature 不被本规则剔除");
     assert.equal(r.redactedThinkingStripped, 0);
+  });
+});
+
+// ─── rewriteMetadataDeviceId(反风控:device_id 锚定到账号 pinned_user_id)──
+//
+// 详见 anthropicProxy.ts 中 `rewriteMetadataDeviceId` 的文档注释。这些是纯函数
+// 单测;真 PG schema 回归测试在 accountPinnedUserId.integ.test.ts。
+
+describe("rewriteMetadataDeviceId", () => {
+  // 用一个合法 64 字符小写 hex 作为 pinned_user_id 测试桩,跟 0067 migration
+  // CHECK 约束(^[0-9a-f]{64}$)对齐。
+  const PINNED = "a".repeat(64);
+
+  test("覆盖既有 device_id 为 pinned_user_id", () => {
+    const input = JSON.stringify({
+      device_id: "old-random-from-container",
+      account_uuid: "acc-uuid-1",
+      session_id: "sess-1",
+    });
+    const out = rewriteMetadataDeviceId(input, PINNED);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.device_id, PINNED);
+  });
+
+  test("metadata.user_id 缺失 → 注入最小 {device_id} JSON", () => {
+    const out = rewriteMetadataDeviceId(undefined, PINNED);
+    assert.deepEqual(JSON.parse(out), { device_id: PINNED });
+  });
+
+  test("保留 account_uuid / session_id / extras 等非 device_id 字段", () => {
+    const input = JSON.stringify({
+      device_id: "old",
+      account_uuid: "acc-uuid-1",
+      session_id: "sess-1",
+      extra_telemetry_kv: "x",
+    });
+    const out = rewriteMetadataDeviceId(input, PINNED);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.device_id, PINNED);
+    assert.equal(parsed.account_uuid, "acc-uuid-1");
+    assert.equal(parsed.session_id, "sess-1");
+    assert.equal(parsed.extra_telemetry_kv, "x");
+  });
+
+  test("非法 JSON → 保持原值不动(fail-open,不把诡异输入推到 Anthropic 网关)", () => {
+    const original = "not-a-json-string";
+    const out = rewriteMetadataDeviceId(original, PINNED);
+    assert.equal(out, original);
+  });
+
+  test("user_id 是 JSON 数组 → 保持原值(对齐 extractSessionId 拒绝数组的口径)", () => {
+    const original = "[]";
+    const out = rewriteMetadataDeviceId(original, PINNED);
+    assert.equal(out, original);
+  });
+
+  test("user_id 是 JSON primitive(string/number/null)→ 保持原值", () => {
+    for (const original of ['"plain-string"', "42", "null", "true"]) {
+      const out = rewriteMetadataDeviceId(original, PINNED);
+      assert.equal(out, original, `primitive ${original} should be preserved`);
+    }
   });
 });

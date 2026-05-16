@@ -165,6 +165,13 @@ export interface PickResult {
    * egressDispatcher 优先级:egress_proxy > egress_target > 默认。
    */
   egress_target: import('./store.js').AccountToken['egress_target']
+  /**
+   * 反风控锚定:该账号永久绑定的客户端 device_id(64 字符小写 hex)。
+   * 由 0067 migration 注入 schema DEFAULT + NOT NULL + CHECK + UNIQUE。
+   * anthropicProxy 选号后用此值重写出站 body.metadata.user_id.device_id,
+   * 让 Anthropic 网关看到稳定的 "account_uuid ↔ device_id" 一对一绑定。
+   */
+  pinned_user_id: string
 }
 
 /**
@@ -227,6 +234,11 @@ export interface CandidateRow extends QueryResultRow {
   quota_7d_pct: number | null
   /** Anthropic 订阅周期到期日(管理员手填;NULL = 未知,按中性看待) */
   subscription_end_at: Date | null
+  /**
+   * 反风控锚定:该账号永久绑定的客户端 device_id(64 字符小写 hex)。
+   * 来自 claude_accounts.pinned_user_id 列(0067 migration)。
+   */
+  pinned_user_id: string
 }
 
 /** 默认哈希:SHA-256,截前 8B 作 64-bit 无符号整数。 */
@@ -444,7 +456,8 @@ export class AccountScheduler {
     const provider: AccountProvider = input.provider ?? 'claude'
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score,
-              quota_5h_pct, quota_7d_pct, subscription_end_at
+              quota_5h_pct, quota_7d_pct, subscription_end_at,
+              pinned_user_id
        FROM claude_accounts
        WHERE status = 'active' AND provider = $1
        ORDER BY id`,
@@ -491,6 +504,7 @@ export class AccountScheduler {
             expires_at: tok.expires_at,
             egress_proxy: tok.egress_proxy,
             egress_target: tok.egress_target,
+            pinned_user_id: chosen.pinned_user_id,
           }
         }
         // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选
