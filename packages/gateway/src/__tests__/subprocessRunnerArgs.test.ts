@@ -149,8 +149,33 @@ describe('buildCcbCliArgs', () => {
       '--mcp-config',
       '--add-dir',
       '--resume',
+      '--workload',
     ]) {
       assert.equal(args.includes(flag), false, `${flag} must be omitted when unset`)
+    }
+  })
+
+  it('passes --workload <tag> when workload is provided (cron path)', () => {
+    // cron.ts sets workload:'cron' on getOrCreate so CCB writes
+    // `cc_workload=cron;` into the attribution billing-header — the
+    // tag Anthropic reads to deprioritize scheduled-job traffic.
+    const args = buildCcbCliArgs({ ...BASE, workload: 'cron' })
+    assert.ok(
+      hasFlagWithValue(args, '--workload', 'cron'),
+      '--workload cron must be passed through to CCB',
+    )
+    // Placeholder still trails — workload sits before the positional.
+    assert.equal(args[args.length - 1], '')
+  })
+
+  it('omits --workload entirely when workload is null/undefined/empty', () => {
+    for (const w of [null, undefined, '']) {
+      const args = buildCcbCliArgs({ ...BASE, workload: w as string | undefined })
+      assert.equal(
+        args.includes('--workload'),
+        false,
+        `workload=${String(w)} should not produce --workload`,
+      )
     }
   })
 
