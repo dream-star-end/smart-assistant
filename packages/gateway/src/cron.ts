@@ -345,6 +345,13 @@ export class CronScheduler {
       channel: 'cron',
       peerId: job.id,
       title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
+      // Tag this run as a cron workload so CCB stamps
+      // `cc_workload=cron;` into the attribution billing-header.
+      // Lets Anthropic serve scheduled jobs at lower QoS and keeps
+      // automation traffic from competing with interactive turns for
+      // the user's rate-limit headroom — directly mitigates the
+      // "automation abuse" ban trigger documented in the Feishu doc.
+      workload: 'cron',
     })
     let output = ''
     try {

@@ -875,6 +875,17 @@ export class SessionManager {
      *  既存 session 的 effort 切换走 submit(effortLevel) — 在那里和 turn 入队
      *  原子串行,避免 getOrCreate→submit 之间的窗口期被另一条并发消息覆盖。 */
     effortLevel?: string | null
+    /**
+     * Workload tag → CCB `--workload <tag>` → `cc_workload=<tag>` in the
+     * billing-header attribution block. Set this to `'cron'` for
+     * cron-initiated sessions so Anthropic can serve them at lower QoS and
+     * keep automated traffic from competing with interactive calls for
+     * rate-limit headroom.
+     *
+     * Runner creation-time attribute — read only on fresh-spawn, ignored on
+     * existing-session reuse. CCB sanitizer requires `[a-z0-9_-]{0,32}`.
+     */
+    workload?: string
   }): Promise<AgentSession> {
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
@@ -972,6 +983,7 @@ export class SessionManager {
         // 注入 _repoWorkspace.getRepoSnapshot,sessionManager 透传给 runner。
         sessionId: opts.peerId,
         getRepoSnapshot: this._getRepoSnapshot,
+        workload: opts.workload,
       })
     }
     const now = Date.now()
