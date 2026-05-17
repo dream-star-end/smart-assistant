@@ -3,6 +3,7 @@
 // 走 POST /api/uploads → 服务端 sha256-named 落盘 → 拿到 url。message 里只存 url 引用。
 // Text 仍按阈值二分:≤64KB 内联为 kind:'text'(走 buildMessageText),>64KB 重分类为
 // 'file' 同样上传。任何 _media[i].base64 字段都不应再产生。
+import { apiFetch, authHeaders } from './api.js?v=32bea265'
 import { $ } from './dom.js?v=32bea265'
 import { state } from './state.js?v=32bea265'
 import { toast } from './ui.js?v=32bea265'
@@ -92,12 +93,19 @@ async function _uploadOne(att, file) {
     const uploadCtype = isArchive
       ? 'application/octet-stream'
       : (att.type || 'application/octet-stream')
-    const resp = await fetch('/api/uploads', {
+    // 走 apiFetch + authHeaders(Bearer):2026-05-17 同 mediaSign 一起修的"首次入会
+    // 站长链路上传失败"。raw fetch 只靠 oc_session cookie 做 auth,manage flow 里
+    // /api/auth/session 的 mint 跟 JS-initiated upload 是并发关系,初次 login/refresh
+    // 后 cookie 还没落地时 _uploadOne 就 401。改 apiFetch 走 Authorization Bearer:
+    //   - state.token 同步可读,首发不依赖 cookie
+    //   - 401 时 apiFetch 内部 silentRefresh + 重写 Authorization 后重试
+    //   - file (Blob) 可被 fetch 重读,retry 安全
+    const resp = await apiFetch('/api/uploads', {
       method: 'POST',
-      headers: {
+      headers: authHeaders({
         'content-type': uploadCtype,
         'x-filename': encodeURIComponent(att.name || 'file'),
-      },
+      }),
       body: file,
       signal: ctrl.signal,
     })
