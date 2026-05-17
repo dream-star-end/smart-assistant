@@ -29,7 +29,10 @@ import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.
 import { requireAuth } from "./auth.js";
 import { query } from "../db/queries.js";
 import { insertFeedback } from "../admin/feedback.js";
-import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
+import {
+  verifyCommercialJwtSync,
+  verifyCommercialJwtSyncDetailed,
+} from "../auth/jwtSync.js";
 import { requireActiveAccountVerifyDb } from "./requireUser.js";
 import {
   buildSignedUrl,
@@ -1525,6 +1528,65 @@ export function extractRawQueryParam(requestUrl: string, name: string): string |
 }
 
 /**
+ * 诊断埋点 helper(2026-05-17 v1.0.158):handleMediaSign verify 失败时写
+ * 结构化日志,定位 d1193355375 case 的 "retry-after-refresh 仍 401" 根因。
+ *
+ * 字段约定:
+ *   - reason: jwtSync detailed 返回的失败阶段
+ *   - token_sub/role/iat/exp: 已 sanitize(只保留 scalar / finite number)
+ *   - server_now / clock_skew_sec: 排查时钟漂移(B 假设)
+ *   - is_client_retry: x-oc-debug-retry header 标记 retry 路径
+ *   - secret_fp: sha256(jwtSecret).slice(0,8) —— 每次现算,捕捉多实例 / rotate
+ *   - instance_pid: 区分多 process(单实例不变,多 pod 会差异化)
+ *
+ * **不写公开 message,reason 不向 client 暴露。** 详情仅进 server 结构化日志。
+ */
+function _sanitizeClaimScalar(v: unknown): string | number | boolean | null {
+  if (v === null) return null;
+  const t = typeof v;
+  if (t === "string" || t === "number" || t === "boolean") {
+    return v as string | number | boolean;
+  }
+  return "[non-scalar]";
+}
+function _sanitizeClaimNumber(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+function _logMediaSignAuthFail(
+  ctx: RequestContext,
+  req: IncomingMessage,
+  result: Extract<
+    ReturnType<typeof verifyCommercialJwtSyncDetailed>,
+    { ok: false }
+  >,
+  jwtSecret: string | Uint8Array,
+): void {
+  const parsed = result.parsedClaims;
+  const tokenExp = _sanitizeClaimNumber(parsed?.exp);
+  const tokenIat = _sanitizeClaimNumber(parsed?.iat);
+  const now = Math.floor(Date.now() / 1000);
+  const secretFp = createHash("sha256")
+    .update(jwtSecret as Buffer | string)
+    .digest("hex")
+    .slice(0, 8);
+  const retryHeader = req.headers["x-oc-debug-retry"];
+  const isRetry =
+    (Array.isArray(retryHeader) ? retryHeader[0] : retryHeader) === "1";
+  ctx.log.warn("media_sign_auth_fail", {
+    reason: result.reason,
+    token_sub: _sanitizeClaimScalar(parsed?.sub),
+    token_role: _sanitizeClaimScalar(parsed?.role),
+    token_iat: tokenIat,
+    token_exp: tokenExp,
+    server_now: now,
+    clock_skew_sec: tokenExp !== null ? tokenExp - now : null,
+    is_client_retry: isRetry,
+    secret_fp: secretFp,
+    instance_pid: process.pid,
+  });
+}
+
+/**
  * POST /api/media-sign
  *
  * 鉴权:Bearer JWT(同 /api/me)+ requireActiveAccountVerifyDb(DB role∈{user,admin} ∧ status='active')。
@@ -1537,7 +1599,7 @@ export function extractRawQueryParam(requestUrl: string, name: string): string |
 export async function handleMediaSign(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
   if (!deps.mediaSignKey) {
@@ -1557,10 +1619,17 @@ export async function handleMediaSign(
   if (!token) {
     throw new HttpError(401, "UNAUTHORIZED", "bearer token required");
   }
-  const claims = verifyCommercialJwtSync(token, deps.jwtSecret);
-  if (!claims) {
+  // 2026-05-17 诊断埋点(v1.0.158):用 detailed 版拿 reason + parsedClaims,
+  // 失败时把 reason、token 内容、时钟偏移、retry 标记、secret 指纹一起写结构化
+  // 日志,定位 d1193355375 case 的 retry-after-refresh 仍 401 根因。
+  // **对外 message 不变**(仍 "invalid or expired token"),reason 不暴露给 client。
+  // 详情见 jwtSync.ts 顶部 doc。
+  const verifyResult = verifyCommercialJwtSyncDetailed(token, deps.jwtSecret);
+  if (!verifyResult.ok) {
+    _logMediaSignAuthFail(ctx, req, verifyResult, deps.jwtSecret);
     throw new HttpError(401, "UNAUTHORIZED", "invalid or expired token");
   }
+  const claims = verifyResult.claims;
 
   // user 和 admin 都允许 sign:cookie-free signed URL 的核心动机就是 iOS Safari +
   // CF CDN 丢 oc_session;admin 在那个环境同样会丢 cookie,以前那条 "admin 走

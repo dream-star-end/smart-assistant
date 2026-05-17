@@ -177,11 +177,17 @@ async function _flushOne() {
         if (ok) {
           const newToken = state.token || ''
           if (newToken) {
+            // 2026-05-17 诊断埋点(v1.0.158):retry-after-refresh 的标记 header。
+            // 服务端 handleMediaSign 在 verify 失败时把这个 flag 跟 token claims
+            // 一起写到结构化日志,用来区分 "首次 401" vs "interactive retry 后
+            // 仍 401" 两条路径 —— 后者是当前 d1193355375 case 的根因待诊断点。
+            // 仅添加 header,不改其他逻辑。
             res = await fetch('/api/media-sign', {
               method: 'POST',
               headers: {
                 Authorization: `Bearer ${newToken}`,
                 'Content-Type': 'application/json',
+                'x-oc-debug-retry': '1',
               },
               body: JSON.stringify({ paths: batch }),
             })

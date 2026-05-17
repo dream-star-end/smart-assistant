@@ -72,3 +72,109 @@ export function verifyCommercialJwtSync(
   if (p.role !== "user" && p.role !== "admin") return null;
   return { sub: p.sub, role: p.role, exp: p.exp };
 }
+
+/**
+ * Detailed 版校验 —— 失败时带 reason + parsedClaims,**仅诊断用**(2026-05-17 起,
+ * v1.0.158 加入)。
+ *
+ * 与 `verifyCommercialJwtSync` 的关系:**判断顺序、最终 ok/fail 结论完全等价**。
+ * 区别在于 fail 路径不返回 null,而是 `{ ok: false, reason, parsedClaims? }`:
+ *   - reason 标识在哪一步失败,便于结构化日志区分根因
+ *   - parsedClaims 仅当 payload base64url + JSON.parse 成功后才有(即便后续
+ *     exp/sub/role 校验失败也带 —— 这是诊断 token 长啥样的关键)
+ *
+ * 调用方约束(避免外溢):
+ *   - 当前**只**给 `handleMediaSign` 用,目的是把 401 日志做出区分度
+ *   - **不要**把这个函数推广到 `router.ts` 的 hot path —— 那条路径是 deny-by-default
+ *     拦截,需要 silent null,引入 reason 通道反而增加判断负担
+ *   - 公开错误 message 仍按 401 "invalid or expired token",不把 reason 暴露给 client
+ */
+export type VerifyDetailedResult =
+  | { ok: true; claims: CommercialJwtClaims }
+  | {
+      ok: false;
+      reason:
+        | "no-token"
+        | "shape"
+        | "header-parse"
+        | "alg"
+        | "sig-decode"
+        | "sig"
+        | "payload-parse"
+        | "payload-shape"
+        | "expired"
+        | "sub-bad"
+        | "role-bad";
+      /** 只在 payload JSON.parse 成功后才带 —— shape/header-parse/sig 等阶段必然缺席。 */
+      parsedClaims?: {
+        sub?: unknown;
+        role?: unknown;
+        exp?: unknown;
+        iat?: unknown;
+      };
+    };
+
+export function verifyCommercialJwtSyncDetailed(
+  token: string,
+  jwtSecret: string | Uint8Array,
+): VerifyDetailedResult {
+  if (!token || !jwtSecret) return { ok: false, reason: "no-token" };
+  const parts = token.split(".");
+  if (parts.length !== 3) return { ok: false, reason: "shape" };
+  const [headerB64, payloadB64, sigB64] = parts;
+  let header: unknown;
+  try {
+    header = JSON.parse(Buffer.from(headerB64, "base64url").toString());
+  } catch {
+    return { ok: false, reason: "header-parse" };
+  }
+  if (
+    typeof header !== "object" ||
+    header === null ||
+    (header as { alg?: unknown }).alg !== "HS256"
+  ) {
+    return { ok: false, reason: "alg" };
+  }
+  let actualSig: Buffer;
+  try {
+    actualSig = Buffer.from(sigB64, "base64url");
+  } catch {
+    return { ok: false, reason: "sig-decode" };
+  }
+  const expectedSig = createHmac("sha256", jwtSecret as Buffer | string)
+    .update(`${headerB64}.${payloadB64}`)
+    .digest();
+  if (expectedSig.length !== actualSig.length) {
+    return { ok: false, reason: "sig" };
+  }
+  if (!timingSafeEqual(expectedSig, actualSig)) {
+    return { ok: false, reason: "sig" };
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString());
+  } catch {
+    return { ok: false, reason: "payload-parse" };
+  }
+  if (typeof payload !== "object" || payload === null) {
+    return { ok: false, reason: "payload-shape" };
+  }
+  const p = payload as {
+    sub?: unknown;
+    role?: unknown;
+    exp?: unknown;
+    iat?: unknown;
+  };
+  const parsedClaims = { sub: p.sub, role: p.role, exp: p.exp, iat: p.iat };
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof p.exp !== "number" || p.exp <= now) {
+    return { ok: false, reason: "expired", parsedClaims };
+  }
+  if (typeof p.sub !== "string" || p.sub.length === 0) {
+    return { ok: false, reason: "sub-bad", parsedClaims };
+  }
+  if (p.role !== "user" && p.role !== "admin") {
+    return { ok: false, reason: "role-bad", parsedClaims };
+  }
+  return { ok: true, claims: { sub: p.sub, role: p.role, exp: p.exp } };
+}
