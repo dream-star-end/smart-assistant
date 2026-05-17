@@ -17,9 +17,18 @@
 // retry/refresh 这条复杂路径污染图片签名 — 签名失败就 fail-silent(签不到原样
 // 透明占位),而不是触发"会话过期"全屏跳转。会话过期由其他正常 API 调用先触发。
 //
-// 单 path → URL 的 dedupe 在 in-flight queue 里做(同一 path 不会发两次请求)。
+// 单 path → URL 的 dedupe 在 pending queue 里做:同一 path 在被 flush 之前的
+// 50ms 窗口内不会发两次请求。已 flush 进 inflight 的 batch 不再合并新 caller,
+// 后者会另起下一批 —— 这是 batching 的边界,不是 bug。
+//
+// 2026-05-17 interactive 双入口:背景预签(默认 interactive=false)沿用 fail-silent;
+// 用户点击下载等主动操作传 `{ interactive: true }`,token 缺 / 401 时主动一次
+// `silentRefresh()` 兜底,刷新失败再 fail-silent。批次内只要有一个 interactive
+// waiter,refresh 路径就启用(同 path 的 non-interactive waiter 搭车成功 —— 良性)。
+// 预签**单独**运行时零回归。
 
 import { state } from './state.js'
+import { silentRefresh } from './api.js?v=7d0ad463'
 
 /** 服务端 batch 上限(packages/commercial/src/http/mediaSign.ts MEDIA_SIGN_BATCH_MAX) */
 const MAX_BATCH_PATHS = 32
@@ -90,8 +99,11 @@ export function invalidateSignCache(absPath) {
 }
 
 // ── 批处理 queue ──
-// pending: Map<absPath, Array<{ resolve, reject }>>
+// pending: Map<absPath, Array<{ resolve, interactive }>>
 // 同一 path 多 caller dedupe — resolve 同一份 URL,不重复打 RTT。
+// `interactive` 标志记每个 waiter 的来源,批次内 OR(只要 1 个 interactive 就升级
+// 该批为"值得 refresh"路径)。注意 dedupe 仅在同一 pending 窗口(本次 flush 前)
+// 内成立 —— 跨已 flush 的 inflight 不合并,会另起下一批。
 const _pending = new Map()
 let _flushTimer = null
 let _inflightCount = 0
@@ -114,10 +126,17 @@ async function _flushOne() {
   }
   // 取出一批,至多 MAX_BATCH_PATHS
   const batch = []
-  const waiters = new Map() // path → array of {resolve,reject}
+  const waiters = new Map() // path → array of {resolve, interactive}
+  let batchInteractive = false
   for (const [path, list] of _pending) {
     batch.push(path)
     waiters.set(path, list)
+    for (const w of list) {
+      if (w.interactive) {
+        batchInteractive = true
+        break
+      }
+    }
     if (batch.length >= MAX_BATCH_PATHS) break
   }
   for (const p of batch) _pending.delete(p)
@@ -129,12 +148,20 @@ async function _flushOne() {
   let data = null
   let httpErr = null
   try {
-    const token = state.token || ''
+    let token = state.token || ''
+    // interactive 路径:token 缺 → 主动一次 silentRefresh 兜底。background 路径
+    // 保持原行为(token 缺直接 fail-silent,会话过期由其他 API 触发)。
+    if (!token && batchInteractive) {
+      try {
+        const ok = await silentRefresh()
+        if (ok) token = state.token || ''
+      } catch {}
+    }
     if (!token) {
-      // 未登录时签不出来,只能 reject 全部 — markdown 已 fail-silent
+      // 仍无 token — 真未登录或 refresh 失败,fail-silent
       throw new Error('no-token')
     }
-    const res = await fetch('/api/media-sign', {
+    let res = await fetch('/api/media-sign', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -142,6 +169,26 @@ async function _flushOne() {
       },
       body: JSON.stringify({ paths: batch }),
     })
+    // interactive 路径:401 → silentRefresh + 重试一次。仍 401 / 失败 → fail-silent。
+    // 网络异常不重试(refresh 救不了链路;用户重点一下行为一致)。
+    if (res.status === 401 && batchInteractive) {
+      try {
+        const ok = await silentRefresh()
+        if (ok) {
+          const newToken = state.token || ''
+          if (newToken) {
+            res = await fetch('/api/media-sign', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${newToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ paths: batch }),
+            })
+          }
+        }
+      } catch {}
+    }
     if (!res.ok) {
       httpErr = new Error(`media-sign HTTP ${res.status}`)
     } else {
@@ -154,7 +201,8 @@ async function _flushOne() {
   }
 
   if (httpErr || !data || typeof data !== 'object' || !data.urls) {
-    // 全员 reject(null) — markdown 端把 null 当 fail-silent,保持占位图
+    // 全员 resolve(null) — markdown 端把 null 当 fail-silent,保持占位图;
+    // interactive caller(main.js doc-card click handler)拿到 null 弹 toast 提示重试
     for (const [, list] of waiters) {
       for (const w of list) w.resolve(null)
     }
@@ -179,21 +227,29 @@ async function _flushOne() {
  * - 缓存未命中:加入批 queue,50ms 后合并请求,resolve 成 URL 或 null(失败)
  *
  * **永远 resolve,不 reject** — 调用方按返回值判:`url ? 替换 : 保持占位`。
+ *
+ * @param {string} absPath  容器内绝对路径(e.g. `/home/agent/.openclaude/...`)
+ * @param {{ interactive?: boolean }} [opts]
+ *   - `interactive=false`(默认):背景预签,token 缺 / 401 → fail-silent
+ *   - `interactive=true`:用户主动操作(如 doc-card click),token 缺 / 401 时
+ *     主动一次 `silentRefresh()` 兜底再重试;批次内只要有 1 个 interactive
+ *     waiter,refresh 路径就启用(同 path 的 non-interactive waiter 搭车成功)。
  */
-export function signMediaPath(absPath) {
+export function signMediaPath(absPath, opts) {
   if (!absPath || typeof absPath !== 'string') {
     return Promise.resolve(null)
   }
   const cached = _cacheGet(absPath)
   if (cached) return Promise.resolve(cached)
 
+  const interactive = opts?.interactive === true
   return new Promise((resolve) => {
     let list = _pending.get(absPath)
     if (!list) {
       list = []
       _pending.set(absPath, list)
     }
-    list.push({ resolve })
+    list.push({ resolve, interactive })
     _scheduleFlush()
   })
 }

@@ -738,7 +738,9 @@ document.addEventListener(
 
     card.classList.add('doc-card-pending')
     try {
-      const url = await signMediaPath(absPath)
+      // interactive:用户主动操作,token 缺 / 401 时让 signMediaPath 主动一次
+      // silentRefresh 兜底,避免登录后首次点击窄窗口落 toast(2026-05-17 修复)
+      const url = await signMediaPath(absPath, { interactive: true })
       if (!url) {
         toast('下载链接获取失败,请重试')
         return
