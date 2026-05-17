@@ -49,6 +49,22 @@ export interface SubprocessRunnerOpts {
   // CCB recognises in EFFORT_LEVELS — currently 'low'|'medium'|'high'|'xhigh'|'max'.
   // Source-of-truth lives in claude-code-best/src/utils/effort.ts.
   effortLevel?: string
+  /**
+   * Workload tag threaded to CCB's `--workload <tag>` flag, which CCB writes
+   * into `x-anthropic-billing-header` as `cc_workload=<tag>`. Anthropic uses
+   * it to route e.g. cron-initiated traffic to a lower-QoS pool, keeping
+   * automated background calls from competing with interactive user calls
+   * for rate-limit headroom.
+   *
+   * Runner creation-time attribute — fixed for the life of the subprocess.
+   * Don't try to mutate per-turn: CCB consumes the value through
+   * `runWithWorkload(cmd.workload ?? options.workload, ...)` in print.ts and
+   * `options.workload` is set once at process startup.
+   *
+   * CCB sanitizer accepts lowercase `[a-z0-9_-]{0,32}` only — callers should
+   * pass values matching that shape (currently only `'cron'`).
+   */
+  workload?: string
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -96,6 +112,13 @@ export interface CcbCliArgsInput {
   mcpConfigFile?: string
   addDir?: string
   resumeSessionId?: string | null
+  /**
+   * Workload tag → CCB `--workload <tag>` → `cc_workload=<tag>` in the
+   * attribution header. CCB sanitizer rejects anything outside
+   * `[a-z0-9_-]{0,32}`, so pass only lowercase short tags
+   * (currently only `'cron'`).
+   */
+  workload?: string
 }
 
 /**
@@ -123,6 +146,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     mcpConfigFile,
     addDir,
     resumeSessionId,
+    workload,
   } = input
   const args: string[] = [
     runtime === 'bun' ? 'run' : '--experimental-strip-types',
@@ -153,6 +177,12 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   if (mcpConfigFile) args.push('--mcp-config', mcpConfigFile)
   if (addDir) args.push('--add-dir', addDir)
   if (resumeSessionId) args.push('--resume', resumeSessionId)
+  // CCB `--workload <tag>` is a hidden CLI flag intended for SDK daemon
+  // callers that spawn CCB for background work (cron / scheduled tasks).
+  // The tag is wrapped around every turn via runWithWorkload() in print.ts
+  // and surfaces as `cc_workload=<tag>` in x-anthropic-billing-header,
+  // letting Anthropic route the traffic at a lower QoS.
+  if (workload) args.push('--workload', workload)
   // 必须给一个 prompt placeholder,CCB stream-json 会从 stdin 接管
   args.push('')
   return args
@@ -312,6 +342,7 @@ export class SubprocessRunner extends EventEmitter {
       mcpConfigFile: learningContext.mcpConfigFile,
       addDir: this.opts.cwd,
       resumeSessionId: this.currentSessionId,
+      workload: this.opts.workload,
     })
 
     // ── Provider-aware auth injection ──
