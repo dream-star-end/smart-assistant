@@ -28,7 +28,7 @@
 // 预签**单独**运行时零回归。
 
 import { state } from './state.js'
-import { silentRefresh } from './api.js?v=7d0ad463'
+import { silentRefresh } from './api.js?v=32bea265'
 
 /** 服务端 batch 上限(packages/commercial/src/http/mediaSign.ts MEDIA_SIGN_BATCH_MAX) */
 const MAX_BATCH_PATHS = 32
