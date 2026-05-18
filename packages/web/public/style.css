@@ -427,13 +427,25 @@ a:hover {
   height: 14px;
   cursor: pointer;
 }
-.login-row-between a {
+/* a11y 波次 6: 把 <a role=button> 改成原生 button。先用 all:unset 清掉 UA 默认
+   padding/border/background/font,再让下方共用规则套上跟原 <a> 一致的视觉 */
+.login-row-between button {
+  all: unset;
+}
+.login-row-between a,
+.login-row-between button {
   color: var(--accent);
   cursor: pointer;
   text-decoration: none;
   font-weight: 500;
 }
-.login-row-between a:hover { text-decoration: underline; }
+.login-row-between a:hover,
+.login-row-between button:hover { text-decoration: underline; }
+/* all:unset 把全局 :focus-visible box-shadow 一并清掉了 → 显式补回焦点环 */
+.login-row-between button:focus-visible {
+  box-shadow: var(--ring);
+  border-radius: var(--radius-sm);
+}
 
 /* Bottom toggle link */
 .login-toggle {
@@ -442,13 +454,25 @@ a:hover {
   margin-top: 2px;
   color: var(--fg-muted);
 }
-.login-toggle a {
+/* a11y 波次 6: 同 .login-row-between button — 把 button UA 默认 padding/border/background/font
+   清掉,让 button 视觉与原 <a> 一致 */
+.login-toggle button {
+  all: unset;
+}
+.login-toggle a,
+.login-toggle button {
   color: var(--accent);
   cursor: pointer;
   font-weight: 600;
   text-decoration: none;
 }
-.login-toggle a:hover { text-decoration: underline; }
+.login-toggle a:hover,
+.login-toggle button:hover { text-decoration: underline; }
+/* 同上,显式补回 :focus-visible 焦点环 */
+.login-toggle button:focus-visible {
+  box-shadow: var(--ring);
+  border-radius: var(--radius-sm);
+}
 
 /* "或" divider — separates email-password form and SSO buttons */
 .login-or-divider {

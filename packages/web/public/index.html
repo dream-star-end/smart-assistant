@@ -345,7 +345,7 @@
       </div>
       <div class="login-row-between muted">
         <label><input id="auth-login-remember" type="checkbox" checked /> 记住我</label>
-        <a id="auth-tab-forgot" role="button" tabindex="0">忘记密码?</a>
+        <button id="auth-tab-forgot" type="button">忘记密码?</button>
       </div>
       <div id="turnstile-login" class="login-turnstile"></div>
       <button id="auth-login-btn" type="submit" class="btn btn-primary btn-lg btn-full login-submit">登录 →</button>
@@ -353,7 +353,7 @@
         <button id="auth-resend-verify-btn" type="button" class="btn btn-ghost btn-sm">重发验证邮件</button>
         <div id="auth-login-resend-status" hidden class="login-resend-status"></div>
       </div>
-      <div class="login-toggle muted">还没有账号? <a id="auth-tab-register" role="button" tabindex="0">立即注册</a></div>
+      <div class="login-toggle muted">还没有账号? <button id="auth-tab-register" type="button">立即注册</button></div>
       <!-- LDC SSO: 顶层 GET 导航走 302,不能用 fetch — server 要 Set-Cookie + Location -->
       <div class="login-or-divider"><span>或</span></div>
       <a class="btn btn-linuxdo btn-lg btn-full" href="/api/auth/linuxdo/start" rel="nofollow">
@@ -388,7 +388,7 @@
         <span id="auth-register-success-email" hidden></span>
         <button id="auth-register-back-btn" type="button" hidden>返回登录</button>
       </div>
-      <div class="login-toggle muted">已有账号? <a id="auth-tab-login-from-register" role="button" tabindex="0">直接登录</a></div>
+      <div class="login-toggle muted">已有账号? <button id="auth-tab-login-from-register" type="button">直接登录</button></div>
       <div class="login-or-divider"><span>或</span></div>
       <a class="btn btn-linuxdo btn-lg btn-full" href="/api/auth/linuxdo/start" rel="nofollow">
         使用 LINUX DO 账号登录
@@ -414,7 +414,7 @@
         </p>
         <button id="auth-forgot-success-back-btn" type="button" class="btn btn-ghost btn-sm login-success-back">返回登录</button>
       </div>
-      <div class="login-toggle muted"><a id="auth-forgot-back-btn" role="button" tabindex="0">← 返回登录</a></div>
+      <div class="login-toggle muted"><button id="auth-forgot-back-btn" type="button">← 返回登录</button></div>
     </div>
 
     <!-- ── Mode: confirm reset (URL-driven) ── -->
@@ -461,10 +461,10 @@
       <button id="auth-verify-submit-btn" type="button" class="btn btn-primary btn-lg btn-full login-submit">验证邮箱 →</button>
       <p id="auth-verify-status" class="login-success-desc" hidden></p>
       <div class="login-row-between muted login-resend-row">
-        <a id="auth-verify-resend-btn" role="button" tabindex="0">重发验证码</a>
+        <button id="auth-verify-resend-btn" type="button">重发验证码</button>
         <span id="auth-verify-resend-status" hidden class="login-resend-status"></span>
       </div>
-      <div class="login-toggle muted"><a id="auth-verify-back-btn" role="button" tabindex="0">← 返回登录</a></div>
+      <div class="login-toggle muted"><button id="auth-verify-back-btn" type="button">← 返回登录</button></div>
     </div>
 
     <div class="login-foot">
@@ -726,7 +726,7 @@
       <div id="agents-list-wrap"></div>
       <hr class="agents-divider" />
       <div class="form-row">
-        <label>新建 Agent</label>
+        <label for="new-agent-id">新建 Agent</label>
         <input id="new-agent-id" placeholder="agent id (只能 a-z 0-9 _ -)" maxlength="48" />
       </div>
     </div>
@@ -748,16 +748,16 @@
       <div class="persona-section-label">身份</div>
       <div style="display:grid;grid-template-columns:1fr 72px;gap:var(--space-3);margin-bottom:var(--space-3)">
         <div class="form-row" style="margin:0">
-          <label>显示名称</label>
+          <label for="persona-display-name">显示名称</label>
           <input id="persona-display-name" placeholder="如: 小克、Aria" maxlength="20" />
         </div>
         <div class="form-row" style="margin:0">
-          <label>头像</label>
+          <label for="persona-avatar-emoji">头像</label>
           <input id="persona-avatar-emoji" placeholder="🤖" maxlength="2" style="text-align:center;font-size:20px" />
         </div>
       </div>
       <div class="form-row">
-        <label>问候语</label>
+        <label for="persona-greeting">问候语</label>
         <input id="persona-greeting" placeholder="新会话时自动发送的第一条消息" />
       </div>
       <!-- Model & Provider -->
@@ -769,7 +769,7 @@
            的客户端会撞上 "Cannot set properties of null (setting 'value')"。 -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
         <div class="form-row" style="margin:0">
-          <label>预设</label>
+          <label for="persona-model-preset">预设</label>
           <select id="persona-model-preset" onchange="if(this.value){document.getElementById('persona-model').value=this.value}">
             <option value="">自定义</option>
             <!-- 静态兜底: 缓存了旧 agents.js 的客户端不会调 /api/models,
@@ -780,7 +780,7 @@
           </select>
         </div>
         <div class="form-row" style="margin:0">
-          <label>Model ID</label>
+          <label for="persona-model">Model ID</label>
           <input id="persona-model" placeholder="自定义模型" />
         </div>
       </div>
@@ -791,7 +791,7 @@
       <!-- Behavior -->
       <div class="persona-section-label">行为</div>
       <div class="form-row">
-        <label>权限模式</label>
+        <label for="persona-permission">权限模式</label>
         <select id="persona-permission">
           <option value="default">默认 — 工具调用时询问</option>
           <option value="acceptEdits">自动接受 — 文件编辑自动通过</option>
@@ -801,11 +801,11 @@
         </select>
       </div>
       <div class="form-row">
-        <label>工作目录</label>
+        <label for="persona-cwd">工作目录</label>
         <input id="persona-cwd" placeholder="如: /home/user/projects (留空使用默认)" />
       </div>
       <div class="form-row">
-        <label>工具集</label>
+        <label for="persona-toolsets">工具集</label>
         <input id="persona-toolsets" placeholder="如: research,coding,browser (逗号分隔,留空=全部)" />
       </div>
       <!-- Persona -->
@@ -948,8 +948,8 @@
       <button class="modal-close" data-close-modal="add-task-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body">
-      <div class="form-row"><label>提醒内容</label><input id="task-message" placeholder="如: 喝水、开会、检查邮件" /></div>
-      <div class="form-row"><label>Cron 表达式</label><input id="task-cron" placeholder="分 时 日 月 周, 如: 0 9 * * *" /></div>
+      <div class="form-row"><label for="task-message">提醒内容</label><input id="task-message" placeholder="如: 喝水、开会、检查邮件" /></div>
+      <div class="form-row"><label for="task-cron">Cron 表达式</label><input id="task-cron" placeholder="分 时 日 月 周, 如: 0 9 * * *" /></div>
       <div class="form-row" style="flex-direction:row;align-items:center;gap:8px">
         <label style="margin:0"><input type="checkbox" id="task-oneshot" checked /> 一次性 (执行后自动删除)</label>
       </div>
@@ -971,7 +971,7 @@
     <div class="modal-body">
       <div id="oauth-step1">
         <div class="form-row" style="margin:0 0 var(--space-3)">
-          <label>选择服务商</label>
+          <label for="oauth-provider">选择服务商</label>
           <select id="oauth-provider" style="width:100%">
             <option value="claude">Claude.ai (Anthropic 订阅)</option>
             <option value="codex">OpenAI Codex</option>
@@ -1151,7 +1151,7 @@
     </div>
     <div class="modal-body">
       <div class="form-row">
-        <label>类别</label>
+        <label for="feedback-category">类别</label>
         <select id="feedback-category">
           <option value="bug">Bug 报告</option>
           <option value="feature">功能建议</option>
@@ -1160,7 +1160,7 @@
         </select>
       </div>
       <div class="form-row">
-        <label>描述</label>
+        <label for="feedback-desc">描述</label>
         <textarea id="feedback-desc" placeholder="请详细描述你遇到的问题或建议&#10;&#10;好的反馈包含：&#10;- 发生了什么 / 期望什么&#10;- 复现步骤&#10;- 相关截图或上下文" style="min-height:140px"></textarea>
       </div>
       <div id="feedback-clarify" class="feedback-clarify" hidden>
@@ -1251,8 +1251,8 @@
         <p class="prefs-hint">新建会话时默认选用。「跟随会话默认」= 由当前 agent / 会话决定。</p>
       </div>
       <div class="form-row">
-        <label>默认 effort</label>
-        <div id="prefs-effort-radios" class="prefs-effort-radios"></div>
+        <label id="prefs-effort-label">默认 effort</label>
+        <div id="prefs-effort-radios" class="prefs-effort-radios" role="radiogroup" aria-labelledby="prefs-effort-label"></div>
         <p class="prefs-hint">控制思考强度;effort 越高响应越深入但消耗也更多。选择「超高」会切到 Opus 4.7。</p>
       </div>
       <div class="form-row">
@@ -1459,7 +1459,7 @@
 <script src="/vendor/chart.umd.min.js" async></script>
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 <script type="module" src="/modules/main.js?v=e149dc7a"></script>
 </body>
 </html>
