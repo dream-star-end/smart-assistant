@@ -3,8 +3,8 @@
 // This file exports nothing; it IS the application.
 
 // ── DOM utilities ──
-import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=10a2497b'
-import { invalidateSignCache, signMediaPath } from './mediaSign.js?v=10a2497b'
+import { $, _isMac, _isMobileUA, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=10a2497b'
+import { getLastFlushDiagForPath, invalidateSignCache, signMediaPath } from './mediaSign.js?v=10a2497b'
 
 // ── Pure utilities ──
 import { formatSize, msgId, shortTime } from './util.js?v=10a2497b'
@@ -42,7 +42,7 @@ import { dbDelete, dbGetAll, onIdbUnavailable } from './db.js?v=10a2497b'
 import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=10a2497b'
 
 // ── Diagnostic trace (d1193355375 "已读但无回复" instrumentation) ──
-import { flushTrace } from './trace.js?v=10a2497b'
+import { flushTrace, trace } from './trace.js?v=10a2497b'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, setToastFn } from './theme.js?v=10a2497b'

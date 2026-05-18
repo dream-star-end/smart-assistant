@@ -293,6 +293,17 @@ echo "=== deploy-v3 → tag $TAG  branch $BRANCH ==="
 # ── 1. Remote safety check ──
 remote_safety_check
 
+# ── 1b. Static guard: undefined identifier references in web modules ──
+# Catches the class of bug where a name is used in packages/web/public/modules/*.js
+# but never imported / declared (e.g. v1.0.160 `_isMobileUA is not defined` —
+# import line lost in a `-X theirs` merge resolution). Biome's preset doesn't
+# enable noUndeclaredVariables; this is our cheap browser-side guard.
+echo "-- checking web modules for undefined references --"
+if ! npx tsx "$REPO_ROOT/scripts/check-undefined-refs.ts"; then
+  echo "ERROR: web modules contain undefined references. See scripts/check-undefined-refs.ts." >&2
+  exit 1
+fi
+
 # ── 2. Changelog boss-approval gate (post 2026-04-27) ──
 # Boss requires explicit approval for any user-facing changelog content. Two
 # layered checks:
