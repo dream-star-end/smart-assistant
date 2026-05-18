@@ -59,6 +59,12 @@ import { getHostById as computePoolGetHostById } from '../compute-pool/queries.j
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
 import { handleLinuxdoStart, handleLinuxdoCallback } from './oauthLinuxdo.js'
 import { handleGithubStart, handleGithubCallback } from './oauthGithub.js'
+// V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC API key 的管理面 endpoints。
+import {
+  handleListMyApiKeys,
+  handleCreateMyApiKey,
+  handleRevokeMyApiKey,
+} from './apiKeyAdmin.js'
 import {
   handleGetMyGithub,
   handleDeleteMyGithub,
@@ -468,6 +474,15 @@ export function createCommercialHandler(
     { method: 'PATCH', path: '/api/me/preferences', handler: handlePatchMyPreferences },
     // 使用消耗统计(含 summary / sessions 分页 / ledger 分页 / savings)
     { method: 'GET', path: '/api/me/usage', handler: handleGetMyUsage },
+    // V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC 外接 API key 的管理面。
+    //   GET    /api/me/api-keys           → list 未撤销 key(无 secret)
+    //   POST   /api/me/api-keys { label } → 创建,**返完整明文一次**
+    //   DELETE /api/me/api-keys/:id       → 软撤销
+    // DELETE 用 pathPrefix + handler 内 regex 抠 :id(同 /api/me/messages/:id/read 范本)。
+    // exact path 注册在 prefix 之前(matchRoute exact-first),不会冲突。
+    { method: 'GET', path: '/api/me/api-keys', handler: handleListMyApiKeys },
+    { method: 'POST', path: '/api/me/api-keys', handler: handleCreateMyApiKey },
+    { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },
     { method: 'GET', path: '/api/public/config', handler: handleGetPublicConfig },
     { method: 'GET', path: '/api/public/models', handler: handleListPublicModels },
     // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler
