@@ -385,3 +385,28 @@ export function setSecurityHeaders(res: ServerResponse): void {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
 }
+
+// ─── 通用类型卫 + 错误摘要 helpers ────────────────────────────────────────
+//
+// 从 anthropicProxy.ts 物理下沉(Phase 1 — 切分 billing 子模块时为了消除
+// anthropicProxy ↔ proxyBilling 双向 value import 形成的 runtime cycle)。
+// 行为与原版逐字一致,只是搬家;两边都从 util.ts import,自然变成 DAG。
+
+/** type guard:object(非 null)。注意不排除数组,与 anthropicProxy.ts 原始定义一致。 */
+export function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+/** Error 摘要给 log:Error → { name, message, stack };其他 → { value: String(err) }。 */
+export function errSummary(err: unknown): Record<string, unknown> {
+  if (err instanceof Error) {
+    return { name: err.name, message: err.message, stack: err.stack };
+  }
+  return { value: String(err) };
+}
+
+/** 短 Error 文案 ≤500 char,给 scheduler.release 的 result.error 用。 */
+export function errMessageShort(err: unknown): string {
+  if (err instanceof Error) return `${err.name}: ${err.message}`.slice(0, 500);
+  return String(err).slice(0, 500);
+}

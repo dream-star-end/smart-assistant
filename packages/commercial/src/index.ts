@@ -128,6 +128,7 @@ import { makeIlinkSendAdapter } from "./wechat/ilinkSendAdapter.js";
 import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
 import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
+import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
 import {
   createUserChatBridge,
   ContainerUnreadyError,
@@ -785,33 +786,13 @@ export async function registerCommercial(
       const identityRepo = createPgIdentityRepo();
       // proxy 模块需要 RateLimitRedis;wrapIoredis 已经满足 incr/expire/ttl 三方法
       const rateLimitRedis = wrapIoredis(redis);
-      internalProxyHandler = makeAnthropicProxyHandler({
-        pgPool: getPool(),
+      // V3 Phase 2(2026-05-18 anthropicProxy 拆分):身份层 strategy。
+      // 把 verify + recordHostRequest + loadUserModelAuthz + canUseModel 收口到
+      // IdentityStrategy 单一注入点。loadUserModelAuthz 闭包形状不变(从权威源 DB
+      // 读 role + grants,fail-closed throw → handler 500)。
+      const identityStrategy = makeContainerIdentityStrategy({
+        repo: identityRepo,
         pricing,
-        preCheckRedis,
-        scheduler,
-        identityRepo,
-        rateLimitRedis,
-        // HOTFIX 2026-04-21: 不传 refreshDeps 导致 anthropicProxy 里
-        //   `deps.refreshDeps && pick.expires_at && shouldRefresh(...)` 永远 false,
-        // OAuth token 过期后不会自动 refresh,结果上游直接 401。
-        // health 注入进来是为了 refresh 失败时按规约走 health.manualDisable。
-        // v1.0.120:triggerCodexDisableFanout 注入 — disableOnFailure 内部
-        // 按 provider 二次过滤,claude 账号 refresh 失败不会误触发 codex fanout。
-        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
-        // 真实扣费积分推送 —— proxy 在 finalize.commit 后调,通过 bridge 把
-        // outbound.cost_charged 帧发给用户。bridge 启动顺序在 proxy 之后,
-        // 故用 ref 打破先后(构造期调用是 noop,请求期 bridge 必已 wire)。
-        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-        // Plan §4.2 改动 4 — durable persist of debited costCredits into
-        // master's `client_sessions.messages[i].usage.costCredits`. Storage
-        // owns the (sessionId, msgId) lookup via `server_authored_request_map`
-        // and falls back to `pending_usage_patches` when the assistant sink
-        // POST hasn't landed yet.
-        appendCostCredits,
-        // 2026-05-02 deepseek 接入:proxy 强制 server-side 校验 model 授权(不再
-        // 信任 modelPicker 前端隐藏)。每请求一次 DB(users.role + grants),
-        // fail-closed:throw → handler 500。dynamic import 避免 boot 期循环依赖。
         loadUserModelAuthz: async (uid) => {
           const { query } = await import("./db/queries.js");
           const { listGrantsForUser } = await import("./admin/modelGrants.js");
@@ -833,6 +814,33 @@ export async function registerCommercial(
             grantedModelIds: new Set(grants.map((g) => g.model_id)),
           };
         },
+        // recordHostRequest 不显式注入,strategy 内部走模块级 default
+        // (../compute-pool/hostReqCounter.recordHostRequest)。
+      });
+      internalProxyHandler = makeAnthropicProxyHandler({
+        pgPool: getPool(),
+        pricing,
+        preCheckRedis,
+        scheduler,
+        identity: identityStrategy,
+        rateLimitRedis,
+        // HOTFIX 2026-04-21: 不传 refreshDeps 导致 anthropicProxy 里
+        //   `deps.refreshDeps && pick.expires_at && shouldRefresh(...)` 永远 false,
+        // OAuth token 过期后不会自动 refresh,结果上游直接 401。
+        // health 注入进来是为了 refresh 失败时按规约走 health.manualDisable。
+        // v1.0.120:triggerCodexDisableFanout 注入 — disableOnFailure 内部
+        // 按 provider 二次过滤,claude 账号 refresh 失败不会误触发 codex fanout。
+        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
+        // 真实扣费积分推送 —— proxy 在 finalize.commit 后调,通过 bridge 把
+        // outbound.cost_charged 帧发给用户。bridge 启动顺序在 proxy 之后,
+        // 故用 ref 打破先后(构造期调用是 noop,请求期 bridge 必已 wire)。
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+        // Plan §4.2 改动 4 — durable persist of debited costCredits into
+        // master's `client_sessions.messages[i].usage.costCredits`. Storage
+        // owns the (sessionId, msgId) lookup via `server_authored_request_map`
+        // and falls back to `pending_usage_patches` when the assistant sink
+        // POST hasn't landed yet.
+        appendCostCredits,
         // 2026-05-02 deepseek 接入:cfg 在外层闭包已 loadConfig() 过(line 379),
         // 这里直接读取。未配置 → undefined → proxy 命中 deepseek 模型时 503。
         deepseekApiKey: cfg.DEEPSEEK_API_KEY,
@@ -2478,6 +2486,18 @@ export type {
   ContainerIdentity,
   ContainerIdentityRepo,
 } from "./auth/containerIdentity.js";
+// V3 anthropicProxy 拆分 Phase 2(2026-05-18):身份层 strategy 物理切出
+export {
+  makeContainerIdentityStrategy,
+  IdentityError,
+  AuthzLoadError,
+  AuthzDeniedError,
+} from "./auth/proxyIdentity.js";
+export type {
+  IdentityStrategy,
+  ProxyIdentity,
+  ContainerIdentityStrategyDeps,
+} from "./auth/proxyIdentity.js";
 // V3 Phase 2 Task 2D: 内部 Anthropic 中央代理(monolith)
 export {
   makeAnthropicProxyHandler,
@@ -2488,8 +2508,6 @@ export {
   buildSafeUpstreamHeaders,
   ConcurrencyLimiter,
   pipeStreamWithUsageCapture,
-  startInflightJournal,
-  makeFinalizer,
   DEFAULT_UPSTREAM_ENDPOINT,
   ANTHROPIC_VERSION,
   ALLOWED_BETA_VALUES,
@@ -2507,9 +2525,34 @@ export type {
   ProxyBody,
   UsageObservation,
   PipeStreamResult,
+} from "./http/anthropicProxy.js";
+// V3 Phase 1 split: billing 子模块(从 anthropicProxy.ts L956-1485 物理切出)
+export {
+  startInflightJournal,
+  makeFinalizer,
+} from "./billing/proxyBilling.js";
+export type {
   FinalizeContext,
   FinalizeOutcome,
-} from "./http/anthropicProxy.js";
+  FinalizerHandle,
+} from "./billing/proxyBilling.js";
+// V3 Phase 4 split: upstream round-trip 子模块(从 anthropicProxy.ts L1421-1639 物理切出)
+export { runUpstreamRoundTrip } from "./http/proxy/core.js";
+export type { RoundTripCtx } from "./http/proxy/core.js";
+// V3 Phase 3 split: upstream session 子模块(从 anthropicProxy.ts §3.4 物理切出)
+export {
+  selectUpstreamRoute,
+  validateUpstreamConfig,
+  pickUpstream,
+  releaseUpstreamSession,
+} from "./http/proxy/upstream.js";
+export type {
+  UpstreamRoute,
+  ConfigError,
+  PreparedUpstreamSession,
+  PickError,
+  PickUpstreamDeps,
+} from "./http/proxy/upstream.js";
 // V3 Phase 2 Task 2E: 用户 WS ↔ 容器 WS 桥接
 export {
   createUserChatBridge,

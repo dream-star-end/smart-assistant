@@ -57,7 +57,7 @@ import {
 import {
   startInflightJournal,
   abortInflightJournal,
-} from "../http/anthropicProxy.js";
+} from "../billing/proxyBilling.js";
 import {
   makeCodexFinalizer,
   type CodexFinalizeHandle,

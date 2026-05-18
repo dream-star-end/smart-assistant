@@ -62,7 +62,7 @@ import {
   finalizeInflightJournal,
   settleUsageAndLedger,
   type SettleResult,
-} from "../http/anthropicProxy.js";
+} from "./proxyBilling.js";
 
 export interface CodexFinalizeContext {
   pgPool: Pool;
