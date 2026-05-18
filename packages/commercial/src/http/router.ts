@@ -771,6 +771,12 @@ export function createCommercialHandler(
     // 用户仍能通过签好的 URL drain 容器文件
     '/api/media-sign',
     '/api/media-signed',
+    // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
+    // `POST /api/anthropic/v1/messages`。必须列在这里,让:
+    //   - maintenance gate(L802 起)能把维护期请求统一 503;
+    //   - 末尾 isOurs 兜底命中,无 route 命中时返 404 而非 fall through 给 gateway。
+    // 实际 dispatch 由 pre-route adapter 处理(见下方 `CC 外接 endpoint` 块)。
+    '/api/anthropic/',
   ]
 
   return async function commercialHandler(req, res): Promise<boolean> {
@@ -821,6 +827,79 @@ export function createCommercialHandler(
         incrGatewayRequest('__maintenance__', method, res.statusCode)
         return true
       }
+    }
+
+    // ── CC 外接 endpoint(V3 CC 外接 plan Phase 3,2026-05-18)─────────────
+    //
+    // **精确 match POST /api/anthropic/v1/messages**;其它路径/方法 fall through,
+    // 最终走 BLOCKED / isOurs / 404 兜底 —— 不让任何非法 path/method 借 url 重写
+    // 渗进 anthropic proxy handler。
+    //
+    // 为什么是 `/api/anthropic/` 命名空间:`BLOCKED_FOR_USER_RULES` 里 `/^\/v1\/.+$/`
+    // 已经把所有 bare /v1/* 公网请求 403,直接暴露 `/v1/messages` 会被自己的护栏拦。
+    // 命名空间映射对 CC CLI 透明:`ANTHROPIC_BASE_URL=https://.../api/anthropic` →
+    // CLI 拼出 `.../api/anthropic/v1/messages`。
+    //
+    // adapter 职责(纯 router 层 url 重写,**不**污染 handler 抽象):
+    //   1. method + path 双精确;命中才接管,否则继续往后
+    //   2. `req.url` 从 `/api/anthropic/v1/messages` 改写成 `/v1/messages`,
+    //      让 handler 内部硬编码的 `url.pathname === "/v1/messages"` 白名单照过
+    //   3. 合成 ctx:`{ hostUuid: "external-api-key", boundIp: "external-api-key" }`
+    //      —— 两个字段都是 sentinel,跟容器路径的真实 (UUID, IP) 形态显式区分。
+    //      ApiKeyIdentityStrategy 内部不调 recordHostRequest(plan §4 invariant #6),
+    //      hostUuid 仅进 log child;boundIp 在公网链路一般是 Caddy/loopback,既不
+    //      参与安全也不指示访客来源 —— 用 sentinel 明确表态"此路径无容器绑定 IP"
+    //      (Codex Phase 3 plan-review MINOR 2 采纳)。
+    //
+    // **装配失败语义**(Codex Phase 3 plan-review MINOR 1 采纳):
+    //   - `deps.externalApiKeyProxy` 注入 → 正常分发
+    //   - 未注入 → 同一精确路径返 **503 EXTERNAL_PROXY_UNAVAILABLE** + log + metric
+    //     而**不是** 404。部署故障不该伪装成"用户 URL 写错了",保留运维可见性。
+    if (method === 'POST' && path === '/api/anthropic/v1/messages') {
+      setSecurityHeaders(res)
+      const requestId = ensureRequestId(req)
+      res.setHeader(REQUEST_ID_HEADER, requestId)
+      const ccLog = (options.logger ?? rootLogger.child({ subsys: 'commercial' })).child({
+        requestId,
+        route: '__cc_external__',
+        method,
+        path,
+        clientIp: clientIpOf(req),
+      })
+      if (!deps.externalApiKeyProxy) {
+        ccLog.error('cc_external_proxy_not_assembled')
+        sendError(
+          res,
+          503,
+          'EXTERNAL_PROXY_UNAVAILABLE',
+          'external api key endpoint not available',
+          requestId,
+        )
+        incrGatewayRequest('__cc_external__', method, res.statusCode)
+        return true
+      }
+      // url 重写:handler 内部白名单只认 "/v1/messages"。保留 query string
+      // (anthropic CLI 不带 query,但稳妥起见处理)。
+      const original = req.url ?? '/api/anthropic/v1/messages'
+      const qIdx = original.indexOf('?')
+      req.url = qIdx >= 0 ? `/v1/messages${original.slice(qIdx)}` : '/v1/messages'
+      // requestId 贯通:proxy handler 内部会再调一次 ensureRequestId。若入站没有
+      // x-request-id,router 这里生成的 id 与 proxy 内部又生成的 id 不一致,
+      // log/response header 会被劈成两半。把 router 的 id 写回 req.headers 让
+      // proxy 内部的 ensureRequestId 直接复用,保证一次请求一个 id(Codex Phase 3
+      // 代码审查 MINOR 采纳)。
+      req.headers[REQUEST_ID_HEADER] = requestId
+      try {
+        await deps.externalApiKeyProxy(req, res, {
+          hostUuid: 'external-api-key',
+          boundIp: 'external-api-key',
+        })
+      } catch (err) {
+        // handler 内部已 catch + sendJsonError,到这只能是真异常
+        handleError(err, res, requestId, ccLog)
+      }
+      incrGatewayRequest('__cc_external__', method, res.statusCode)
+      return true
     }
 
     // ── v3 file proxy PROXY 路径(Stage 4 feature flag ON 时启用)──

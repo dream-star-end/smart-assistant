@@ -129,6 +129,8 @@ import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
 import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
+import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
+import { makeApiKeyIdentityStrategy } from "./auth/apiKeyIdentity.js";
 import {
   createUserChatBridge,
   ContainerUnreadyError,
@@ -776,6 +778,41 @@ export async function registerCommercial(
     // selfHostUuid 保持 undefined;下面 proxy / v3Deps / baselineServer 全部靠 guard 跳过
   }
 
+  // V3 CC 外接 plan Phase 3(2026-05-18):rateLimitRedis 与 loadUserModelAuthz
+  // 都提到 internal 块外作为外层 const,让 container strategy(私有 18791/18443)
+  // 和 api-key strategy(公网 /api/anthropic/v1/messages)共享同一份依赖闭包,
+  // 避免两份同型实现长出漂移(Codex Phase 3 plan-review NIT 采纳)。
+  //
+  // 注:rateLimitRedis 仅在两条 proxy strategy 中消费;放在外层不会额外占资源
+  // (redis 客户端是同一个,wrapIoredis 只是 typed-method 投影)。
+  const sharedRateLimitRedis = wrapIoredis(redis);
+  const loadUserModelAuthz = async (
+    uid: bigint,
+  ): Promise<{
+    role: "user" | "admin";
+    grantedModelIds: ReadonlySet<string>;
+  }> => {
+    const { query } = await import("./db/queries.js");
+    const { listGrantsForUser } = await import("./admin/modelGrants.js");
+    const r = await query<{ role: string }>(
+      "SELECT role FROM users WHERE id = $1",
+      [uid],
+    );
+    if (r.rows.length === 0) {
+      // user 在 DB 里不存在(理论被 verifyContainerIdentity 截掉,这里是
+      // 防御编程)。fail-closed:认 user role,grants 空集 → 公开 model
+      // 还能用,admin/hidden model 一律拒。
+      return { role: "user", grantedModelIds: new Set<string>() };
+    }
+    const roleRaw = r.rows[0].role;
+    const role: "user" | "admin" = roleRaw === "admin" ? "admin" : "user";
+    const grants = await listGrantsForUser(uid);
+    return {
+      role,
+      grantedModelIds: new Set(grants.map((g) => g.model_id)),
+    };
+  };
+
   if (
     !options.skipInternalProxy &&
     proxyBind &&
@@ -784,36 +821,18 @@ export async function registerCommercial(
   ) {
     try {
       const identityRepo = createPgIdentityRepo();
-      // proxy 模块需要 RateLimitRedis;wrapIoredis 已经满足 incr/expire/ttl 三方法
-      const rateLimitRedis = wrapIoredis(redis);
+      const rateLimitRedis = sharedRateLimitRedis;
       // V3 Phase 2(2026-05-18 anthropicProxy 拆分):身份层 strategy。
       // 把 verify + recordHostRequest + loadUserModelAuthz + canUseModel 收口到
       // IdentityStrategy 单一注入点。loadUserModelAuthz 闭包形状不变(从权威源 DB
       // 读 role + grants,fail-closed throw → handler 500)。
+      //
+      // V3 CC 外接 plan Phase 3:loadUserModelAuthz 已提到外层共享(见上方注释),
+      // 这里直接传引用,与 api-key strategy 走同一份业务规则。
       const identityStrategy = makeContainerIdentityStrategy({
         repo: identityRepo,
         pricing,
-        loadUserModelAuthz: async (uid) => {
-          const { query } = await import("./db/queries.js");
-          const { listGrantsForUser } = await import("./admin/modelGrants.js");
-          const r = await query<{ role: string }>(
-            "SELECT role FROM users WHERE id = $1",
-            [uid],
-          );
-          if (r.rows.length === 0) {
-            // user 在 DB 里不存在(理论被 verifyContainerIdentity 截掉,这里是
-            // 防御编程)。fail-closed:认 user role,grants 空集 → 公开 model
-            // 还能用,admin/hidden model 一律拒。
-            return { role: "user", grantedModelIds: new Set<string>() };
-          }
-          const roleRaw = r.rows[0].role;
-          const role: "user" | "admin" = roleRaw === "admin" ? "admin" : "user";
-          const grants = await listGrantsForUser(uid);
-          return {
-            role,
-            grantedModelIds: new Set(grants.map((g) => g.model_id)),
-          };
-        },
+        loadUserModelAuthz,
         // recordHostRequest 不显式注入,strategy 内部走模块级 default
         // (../compute-pool/hostReqCounter.recordHostRequest)。
       });
@@ -1054,6 +1073,61 @@ export async function registerCommercial(
     console.log(
       "[commercial] internal anthropic proxy disabled; missing INTERNAL_PROXY_BIND / INTERNAL_PROXY_PORT",
     );
+  }
+
+  // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
+  // `POST /api/anthropic/v1/messages` 的第二个 AnthropicProxyHandler 实例。
+  //
+  // 与 internalProxyHandler 平行装配,**不**依赖 INTERNAL_PROXY_BIND/PORT/selfHostUuid
+  // —— external 不监听端口、不需要 selfHostUuid,直接挂在公网 commercialHandler 的
+  // pre-route adapter 上(见 http/router.ts 的 `CC 外接 endpoint` 块)。
+  //
+  // 两实例的唯一差异是 IdentityStrategy:
+  //   - internal:`makeContainerIdentityStrategy`(容器双因子 + recordHostRequest)
+  //   - external:`makeApiKeyIdentityStrategy`(Bearer `oc-cc.*` token,无 recordHostRequest)
+  // 其它依赖(pricing / preCheckRedis / scheduler / refreshDeps / 计费 / 广播)完全
+  // 共享 —— 计费 / 账号池 / 上游路由语义两路必须一致,唯一分歧是身份维度。
+  //
+  // 装配失败语义(Codex Phase 3 plan-review MINOR 1):catch + undefined,router
+  // 见 undefined 走 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404(部署故障不该伪装成
+  // "用户 URL 写错")。
+  let externalApiKeyProxy: AnthropicProxyHandler | undefined;
+  if (!options.skipInternalProxy) {
+    try {
+      const apiKeyRepo = makePgApiKeyRepo(getPool());
+      const apiKeyStrategy = makeApiKeyIdentityStrategy({
+        repo: apiKeyRepo,
+        pricing,
+        loadUserModelAuthz,
+        logger: rootLogger.child({ subsys: "apiKeyIdentity" }),
+      });
+      externalApiKeyProxy = makeAnthropicProxyHandler({
+        pgPool: getPool(),
+        pricing,
+        preCheckRedis,
+        scheduler,
+        identity: apiKeyStrategy,
+        rateLimitRedis: sharedRateLimitRedis,
+        // 与 internal 同型:OAuth refresh 走 health + codex disable fanout。
+        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
+        // bridge broadcastToUser 同型 ref 闭包;externalApiKeyProxy 装配于
+        // bridge 之前是正常顺序(请求期 bridge 必已就绪)。
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+        appendCostCredits,
+        deepseekApiKey: cfg.DEEPSEEK_API_KEY,
+      });
+      // eslint-disable-next-line no-console
+      console.log(
+        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages)",
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[commercial] external api-key proxy failed to assemble; endpoint will return 503:",
+        err,
+      );
+      externalApiKeyProxy = undefined;
+    }
   }
 
   // V3 D.1b: 18443 mTLS listener。remote-host node-agent 走 L7 反代过来,master 这边
@@ -1545,6 +1619,9 @@ export async function registerCommercial(
     // v1.0.120 feat/codex-disable-rebind:透传给 admin/accounts handler 的
     // adminPatchAccount ctx,active→disabled 转移触发 fanout actor。
     triggerCodexDisableFanout,
+    // V3 CC 外接 plan Phase 3:公网 `POST /api/anthropic/v1/messages` 的 handler
+    // 实例。undefined 时 router 该路径返 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404。
+    externalApiKeyProxy,
   });
 
   // T-52 /ws/agent:仅在 agent runtime 就绪时启用。

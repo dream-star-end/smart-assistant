@@ -53,6 +53,7 @@ import type { AgentHttpDeps } from "./agent.js";
 import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 import type { RemoteHostTester } from "../remoteHosts/service.js";
 import type { AccountHealthTracker } from "../account-pool/health.js";
+import type { AnthropicProxyHandler } from "./proxy/shared.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -206,6 +207,25 @@ export interface CommercialHttpDeps {
    * rotate 改 `mediaSign.ts` 的 HKDF_INFO,旧 URL 全部失效。
    */
   mediaSignKey?: Buffer;
+  /**
+   * V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
+   * `POST /api/anthropic/v1/messages` 的 anthropic proxy handler。
+   *
+   * 与 `internalProxyHandler`(私有 18791/18443,容器流量)是**平行实例**;
+   * 两者只在 IdentityStrategy 上分歧:
+   *   - internal:`ContainerIdentityStrategy`(容器双因子 + recordHostRequest)
+   *   - external:`ApiKeyIdentityStrategy`(Bearer `oc-cc.*` + 无 recordHostRequest)
+   * 其它依赖(pgPool / pricing / scheduler / refreshDeps / 计费 / 广播)完全共享。
+   *
+   * **装配失败语义**(Codex Phase 3 plan-review MINOR 1 采纳):
+   *   - 装配成功 → router 命中精确 `POST /api/anthropic/v1/messages` 时分发
+   *   - 装配失败 / 未注入 → router 同一路径返 **503 EXTERNAL_PROXY_UNAVAILABLE**
+   *     而**不是** 404。部署故障不应伪装成"用户 URL 写错了"。
+   *
+   * router 通过 url 重写 + 合成 ctx 调用本 handler;请求体白名单仍由 handler
+   * 内部维护(`/v1/messages`),命名空间映射是 router 职责。
+   */
+  externalApiKeyProxy?: AnthropicProxyHandler;
 }
 
 export interface RequestContext {
