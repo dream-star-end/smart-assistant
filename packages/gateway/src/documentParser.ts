@@ -19,14 +19,15 @@ const log = createLogger({ module: 'documentParser' })
 
 const MAX_PARSED_CHARS = 200_000 // 截断阈值;200KB 文本 ~ 50K tokens 量级
 // 不同解析器有不同的"合理超时":
-//   - mammoth: extractRawText 是同步流式 unzip,本地 .docx 几乎都能 1s 内完成。
-//     5s 用来兜超大文档(几百页技术规范)。
+//   - mammoth: extractRawText 是同步流式 unzip,普通 .docx 1s 内完成。但科研用户
+//     的几十 MB 技术报告(嵌大量图片 + 复杂样式)抽完要 10s+,5s 直接超时让 agent
+//     回退到 Read 二进制乱码,体验严重降级。2026-05-18 对齐 pdf 改成 30s。
 //   - pdf-parse v2: load() 调 pdfjs.getDocument(),底层是 worker。一篇 10MB 论文
 //     冷启动约 8~15s。给 30s 余量,**仍然不够时承认"放弃等待"** —— 因为 v2 API
 //     的 destroy() 只能 destroy 已 load 的 doc,不能真正 cancel loadingTask
 //     (worker 会自己跑完再 GC,不是我们能精确控制的)。我们用页数上限 + 超时
 //     限两道闸,worst case 是 worker 多挂 10s 直到自然退出,这是可接受的。
-const DOCX_TIMEOUT_MS = 5_000
+const DOCX_TIMEOUT_MS = 30_000
 const PDF_TIMEOUT_MS = 30_000
 // 页数上限:常见科研论文 6~25 页,会议长文 30~50 页,书的章节 30~80 页。
 // 60 页足以覆盖 95% 的科研用例。超过的 PDF 用户通常会自己截章节而不是丢整本。

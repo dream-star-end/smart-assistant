@@ -319,8 +319,8 @@ describe('T02: isUploadMimeAllowed — upload type filtering', () => {
 
 // ── T03: Upload size limits ──
 describe('T03: Upload size limits', () => {
-  it('MAX_UPLOAD_SINGLE is 200MB', () => {
-    assert.equal(MAX_UPLOAD_SINGLE, 200 * 1024 * 1024)
+  it('MAX_UPLOAD_SINGLE is 100MB (aligned to Cloudflare Free/Pro body cap)', () => {
+    assert.equal(MAX_UPLOAD_SINGLE, 100 * 1024 * 1024)
   })
   it('MAX_UPLOAD_TOTAL is 300MB', () => {
     assert.equal(MAX_UPLOAD_TOTAL, 300 * 1024 * 1024)

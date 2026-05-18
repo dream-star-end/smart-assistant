@@ -10,8 +10,12 @@ import { toast } from './ui.js?v=c0e8730c'
 import { _basename, formatSize } from './util.js?v=c0e8730c'
 
 // 与 gateway server.ts 的 MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL 对齐。
-// 单文件 200MB,会话内总附件预算 300MB(服务端 dispatchInbound 也按这个聚合校验)。
-const MAX_FILE_SIZE = 200 * 1024 * 1024
+// 单文件 100MB,会话内总附件预算 300MB(服务端 dispatchInbound 也按这个聚合校验)。
+// 2026-05-18:从 200MB → 100MB。Cloudflare Free/Pro 计划 request body cap = 100MB,
+// 任何 >100MB 的请求都被 CF 边缘 413 拦掉,根本到不了我们后端 —— 前端 cap 必须
+// 对齐 CF 现实,否则用户看到的是一坨 CF HTML 错误页而不是有意义的提示。
+// 如未来升级 CF Business(500MB)或上 chunked/直传方案,再放开。
+const MAX_FILE_SIZE = 100 * 1024 * 1024
 const MAX_TOTAL_SIZE = 300 * 1024 * 1024
 const MAX_FILES = 5
 // ≤64KB 文本走 messages JSON 内联;超出则当 'file' 上传走 /api/uploads。

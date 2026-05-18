@@ -7371,7 +7371,10 @@ export const UPLOAD_MIME_PREFIXES = [
   'application/json',                               // json files
   'application/xml',                                // xml files
 ]
-export const MAX_UPLOAD_SINGLE = 200 * 1024 * 1024
+// 2026-05-18:从 200MB → 100MB。前端 attachments.js 同步;Cloudflare Free/Pro
+// request body cap = 100MB,后端写 200MB 是个永远摸不到的虚上限。前后端对齐到
+// CF 现实让 413 在前端直接拦,而不是被 CF 边缘 HTML 错误页吞掉。
+export const MAX_UPLOAD_SINGLE = 100 * 1024 * 1024
 export const MAX_UPLOAD_TOTAL = 300 * 1024 * 1024
 
 /** Returns true if the MIME type is allowed for upload. */
