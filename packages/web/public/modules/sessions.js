@@ -623,9 +623,9 @@ export function _buildSessionItem(s) {
     ])
   }
 
-  // Mobile long-press
+  // Mobile long-press — passive listeners so sidebar scroll on touch isn't blocked
   let _lpt = null
-  item.ontouchstart = (e) => {
+  item.addEventListener('touchstart', (e) => {
     _lpt = setTimeout(() => {
       const touch = e.touches[0]
       showContextMenu(touch.clientX, touch.clientY, [
@@ -652,9 +652,9 @@ export function _buildSessionItem(s) {
         },
       ])
     }, 600)
-  }
-  item.ontouchend = () => clearTimeout(_lpt)
-  item.ontouchmove = () => clearTimeout(_lpt)
+  }, { passive: true })
+  item.addEventListener('touchend', () => clearTimeout(_lpt), { passive: true })
+  item.addEventListener('touchmove', () => clearTimeout(_lpt), { passive: true })
 
   return item
 }

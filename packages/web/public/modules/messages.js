@@ -235,8 +235,9 @@ export function initMessagesListeners() {
   const msgEl = $('messages')
   if (!msgEl) return
   // Listen to wheel (desktop), touchmove (mobile), and generic scroll (scrollbar drag, keyboard)
-  msgEl.addEventListener('wheel', _handleUserScroll)
-  msgEl.addEventListener('touchmove', _handleUserScroll)
+  // All listeners are passive: handler only reads state + sets timeout, never preventDefault
+  msgEl.addEventListener('wheel', _handleUserScroll, { passive: true })
+  msgEl.addEventListener('touchmove', _handleUserScroll, { passive: true })
   msgEl.addEventListener('scroll', _handleUserScroll, { passive: true })
 }
 
