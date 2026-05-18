@@ -157,7 +157,14 @@ export function makeAnthropicProxyHandler(
     }
     const uid = identity.uid;
     const containerIdBig = identity.containerId;
-    const userLog = reqLog.child({ uid: uid.toString(), containerId: containerIdBig.toString() });
+    // 2026-05-18 CC 外接 plan Phase 0:containerId 可为 null(非容器 strategy 如 API key)。
+    // 结构化日志字段保留真值类型:null 维持 ID-or-null 形状,不引入 sentinel string,
+    // 避免聚合/筛选时字段类型从 "ID 或 null" 漂成 "ID 或标签"。未来若需区分路径,
+    // 走独立 `identityKind` 字段(Phase 1 ApiKeyIdentityStrategy 引入)。
+    const userLog = reqLog.child({
+      uid: uid.toString(),
+      containerId: containerIdBig === null ? null : containerIdBig.toString(),
+    });
 
     // 2) 限流(per-uid 滑动固定窗口)
     try {

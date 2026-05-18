@@ -36,8 +36,18 @@ import { recordHostRequest as defaultRecordHostRequest } from "../compute-pool/h
 export interface ProxyIdentity {
   /** users.id,后续 rate-limit / preCheck / authz / log child 全部使用 */
   uid: bigint;
-  /** agent_containers.id;strategy-specific(future API key strategy 这里放 api_key_id) */
-  containerId: bigint;
+  /**
+   * agent_containers.id,**为 null 表示非容器 strategy**(如 ApiKeyIdentityStrategy)。
+   *
+   * SQL 层(`request_finalize_journal.container_id BIGINT REFERENCES agent_containers(id)
+   *  ON DELETE SET NULL`,见 0015)早已 nullable;TS 这里只是把语义对齐 SQL 真实约束。
+   * usage_records / credit_ledger 本就没有 container_id 列,只按 user 维度计费。
+   *
+   * 历史(2026-05-18 CC 外接 plan §5 决策):此前注释写 "future API key strategy
+   * 这里放 api_key_id";已废弃 —— 不要把 api_key_id 塞进 containerId 字段(语义错位)。
+   * 未来若需 per-key 维度审计,新增独立 `apiKeyId?: bigint` 字段贯穿至 journal。
+   */
+  containerId: bigint | null;
 }
 
 /**

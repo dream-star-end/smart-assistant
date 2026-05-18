@@ -51,7 +51,14 @@ import type { UsageObservation } from "../http/proxy/shared.js";
 export interface FinalizeContext {
   requestId: string;
   userId: bigint;
-  containerId: bigint;
+  /**
+   * agent_containers.id;**为 null 表示非容器 strategy**(如 API key 外接入口)。
+   *
+   * SQL 层 0015 `request_finalize_journal.container_id BIGINT REFERENCES ... NULL`
+   * 早已允许 NULL,startInflightJournal 在 bind 时把 null 透传(见下方 SQL bind)。
+   * settle 路径(usage_records / credit_ledger)本就不消费此字段,只按 user 维度。
+   */
+  containerId: bigint | null;
   /**
    * Claude 路径:scheduler.pick 选中的 claude_accounts.id,用于:
    *   - finalize 时 scheduler.release(account_id, result) 回流健康分
@@ -137,7 +144,9 @@ export async function startInflightJournal(
     [
       ctx.requestId,
       ctx.userId.toString(),
-      ctx.containerId.toString(),
+      // 2026-05-18 CC 外接 plan Phase 0:containerId 可为 null(API key strategy),
+      // SQL 列允许 NULL(0015 SET NULL FK),pg bind null 即写 NULL。
+      ctx.containerId === null ? null : ctx.containerId.toString(),
       JSON.stringify(journalCtx),
       ctx.precheckCredits.toString(),
     ],
