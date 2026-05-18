@@ -1552,6 +1552,31 @@ function _sanitizeClaimScalar(v: unknown): string | number | boolean | null {
 function _sanitizeClaimNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
+
+/** 取第一个 header value(string),Array 取首段,否则 null。 */
+function _firstHeader(v: string | string[] | undefined): string | null {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v) && typeof v[0] === "string") return v[0];
+  return null;
+}
+
+/**
+ * Sanitize `x-oc-diag-id` header(前端 `crypto.randomUUID()` 或 fallback
+ * `f-<ts>-<rand>` 形态)。允许 `[0-9a-zA-Z-]` 仅 ASCII,1..64 字符,否则 null。
+ * 不做 UUID 严格校验,fallback 形式也得过(避免老 Chromium 浏览器 diag 全空)。
+ */
+function _sanitizeDiagId(raw: string | null): string | null {
+  if (!raw) return null;
+  if (raw.length === 0 || raw.length > 64) return null;
+  if (!/^[0-9a-zA-Z-]+$/.test(raw)) return null;
+  return raw;
+}
+
+/** sec-ch-ua-mobile 白名单 — 只接 `?0` / `?1` / null,其余视作日志噪音丢掉。 */
+function _sanitizeSecChUaMobile(raw: string | null): "?0" | "?1" | null {
+  return raw === "?0" || raw === "?1" ? raw : null;
+}
+
 function _logMediaSignAuthFail(
   ctx: RequestContext,
   req: IncomingMessage,
@@ -1572,6 +1597,17 @@ function _logMediaSignAuthFail(
   const retryHeader = req.headers["x-oc-debug-retry"];
   const isRetry =
     (Array.isArray(retryHeader) ? retryHeader[0] : retryHeader) === "1";
+  // 2026-05-18 v1.0.158 device-side diag —— 与前端 `media_sign_fail` web-trace
+  // 用同一个 diag_id join。user_agent 走 ctx.userAgent(已经 truncate 512),
+  // accept-language 取首段 truncate 128,sec-ch-ua-mobile 白名单到 ?0/?1。
+  // 这些字段全部已经在 RequestContext / req.headers 里,**零额外成本**。
+  const acceptLangRaw = _firstHeader(req.headers["accept-language"]);
+  const acceptLanguage =
+    acceptLangRaw === null ? null : acceptLangRaw.slice(0, 128);
+  const secChUaMobile = _sanitizeSecChUaMobile(
+    _firstHeader(req.headers["sec-ch-ua-mobile"]),
+  );
+  const diagId = _sanitizeDiagId(_firstHeader(req.headers["x-oc-diag-id"]));
   ctx.log.warn("media_sign_auth_fail", {
     reason: result.reason,
     token_sub: _sanitizeClaimScalar(parsed?.sub),
@@ -1583,6 +1619,11 @@ function _logMediaSignAuthFail(
     is_client_retry: isRetry,
     secret_fp: secretFp,
     instance_pid: process.pid,
+    // 2026-05-18 v1.0.158 device-side join fields
+    diag_id: diagId,
+    user_agent: ctx.userAgent,
+    accept_language: acceptLanguage,
+    sec_ch_ua_mobile: secChUaMobile,
   });
 }
 

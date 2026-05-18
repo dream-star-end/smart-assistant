@@ -3,8 +3,8 @@
 // This file exports nothing; it IS the application.
 
 // ── DOM utilities ──
-import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=cfaa0e5d'
-import { invalidateSignCache, signMediaPath } from './mediaSign.js?v=cfaa0e5d'
+import { $, _isMac, _isMobileUA, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=cfaa0e5d'
+import { getLastFlushDiagForPath, invalidateSignCache, signMediaPath } from './mediaSign.js?v=cfaa0e5d'
 
 // ── Pure utilities ──
 import {
@@ -52,7 +52,7 @@ import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js?v=c
 import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=cfaa0e5d'
 
 // ── Diagnostic trace (d1193355375 "已读但无回复" instrumentation) ──
-import { flushTrace } from './trace.js?v=cfaa0e5d'
+import { flushTrace, trace } from './trace.js?v=cfaa0e5d'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js?v=cfaa0e5d'
@@ -717,6 +717,69 @@ document.addEventListener('click', (e) => {
   }
 })
 
+// ── v1.0.158 device fingerprint (doc-card 下载失败诊断) ──
+// 仅在 doc-card click 失败终态时调用一次。**绝不**写 token / 消息内容 / 完整路径,
+// 只读 navigator.* 公开属性 + 显式 storage 探测。字段集合是 Codex review pass
+// 的版本(收敛了无诊断价值的 platform/vendor/languages/tz_offset)。
+//
+// `stored_access_token_local_present` / `stored_access_token_session_present`
+// 只探测 storage 中 token key 是否存在,**不读 token 值**,用来区分:
+//   - state.token=false && storage 也空 → 真未登录
+//   - state.token=false 但 storage 有 token → hydrate / state 装载时序问题
+// 注意:storage 参数走 thunk(`() => localStorage`)而不是直接传 `localStorage`。
+// 受限 webview(file://、Cookie 关闭、隐私模式 Safari)下 **访问 `window.localStorage`
+// 这一步本身**会抛 SecurityError,如果在 helper 之外的实参位置就求值,异常发生
+// 在 helper 进入前,外层 try-catch 会把整条 trace 吞掉 —— 正好伤到最想诊断的
+// 浏览器环境(Codex round-2 BLOCKING)。thunk 让属性访问发生在 helper 内 try 内。
+function _safeStorageWritable(getStorage) {
+  try {
+    const s = getStorage()
+    const k = '_oc_probe_'
+    s.setItem(k, '1')
+    s.removeItem(k)
+    return true
+  } catch {
+    return false
+  }
+}
+function _safeStorageHasKey(getStorage, key) {
+  try {
+    const s = getStorage()
+    return !!s.getItem(key)
+  } catch {
+    return false
+  }
+}
+function _collectDeviceFingerprint() {
+  const ua = navigator.userAgent || ''
+  return {
+    ua: ua.length > 512 ? ua.slice(0, 512) : ua,
+    uahint_mobile: navigator.userAgentData?.mobile ?? null,
+    is_huawei_browser: /HuaweiBrowser/i.test(ua),
+    is_mobile_ua: _isMobileUA(),
+    language: navigator.language || null,
+    screen: {
+      w: screen.width || null,
+      h: screen.height || null,
+      dpr: window.devicePixelRatio || 1,
+    },
+    viewport: { w: window.innerWidth, h: window.innerHeight },
+    online: navigator.onLine,
+    cookie_enabled: navigator.cookieEnabled,
+    sw_active: !!navigator.serviceWorker?.controller,
+    storage_local_writable: _safeStorageWritable(() => localStorage),
+    storage_session_writable: _safeStorageWritable(() => sessionStorage),
+    stored_access_token_local_present: _safeStorageHasKey(
+      () => localStorage,
+      'openclaude_access_token',
+    ),
+    stored_access_token_session_present: _safeStorageHasKey(
+      () => sessionStorage,
+      'openclaude_access_token',
+    ),
+  }
+}
+
 // ── doc-card 点击 race 拦截 ──
 // 容器文件 doc-card 走异步签名(markdown.js _renderLocalMedia + main.js
 // _resolveSignTarget)。卡片刚渲染时 href 还没填,用户秒点会"无反应"。
@@ -742,6 +805,24 @@ document.addEventListener(
       // silentRefresh 兜底,避免登录后首次点击窄窗口落 toast(2026-05-17 修复)
       const url = await signMediaPath(absPath, { interactive: true })
       if (!url) {
+        // ── v1.0.158 step diag —— 失败终态上报 ──
+        // 把 mediaSign 这一批的步骤快照(diag_id / step outcomes / failure_path)
+        // 跟 device 指纹一起打 trace,立刻 flush 到 /api/web-trace pino log。
+        // 服务端 media_sign_auth_fail 用同一个 diag_id join 前后端日志。
+        // 失败用户在这一刻 cookie 大概率仍有效;真无效时 /api/web-trace 也不会
+        // 401(端点不做 auth gate,只 getUserId 退 'default')。
+        try {
+          const diag = getLastFlushDiagForPath(absPath)
+          trace('media_sign_fail', {
+            ...(diag || { diag_id: null, failure_path: 'no_snapshot' }),
+            has_token_at_click: !!state.token,
+            device: _collectDeviceFingerprint(),
+          })
+          // flushTrace 内部 try-catch + 5xx requeue,不抛;.catch 仅兜后续 await chain
+          flushTrace().catch(() => {})
+        } catch {
+          // 诊断埋点失败绝不阻塞用户可见 toast — 永远继续走 toast
+        }
         toast('下载链接获取失败,请重试')
         return
       }
