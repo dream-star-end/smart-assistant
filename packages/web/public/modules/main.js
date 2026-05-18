@@ -801,8 +801,9 @@ document.addEventListener(
 
     card.classList.add('doc-card-pending')
     try {
-      // interactive:用户主动操作,token 缺 / 401 时让 signMediaPath 主动一次
-      // silentRefresh 兜底,避免登录后首次点击窄窗口落 toast(2026-05-17 修复)
+      // v1.0.159:`interactive` 参数已 inert(cookie-first 后没有 silentRefresh
+      // retry 这条路径,签名失败即返)。保留 call-site `interactive: true` 仅为
+      // 兼容 signMediaPath 签名,不影响行为。详见 mediaSign.js JSDoc。
       const url = await signMediaPath(absPath, { interactive: true })
       if (!url) {
         // ── v1.0.158 step diag —— 失败终态上报 ──

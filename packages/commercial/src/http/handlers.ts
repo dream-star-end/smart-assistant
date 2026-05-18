@@ -32,6 +32,7 @@ import { insertFeedback } from "../admin/feedback.js";
 import {
   verifyCommercialJwtSync,
   verifyCommercialJwtSyncDetailed,
+  type CommercialJwtClaims,
 } from "../auth/jwtSync.js";
 import { requireActiveAccountVerifyDb } from "./requireUser.js";
 import {
@@ -42,6 +43,7 @@ import {
   DEFAULT_SIGN_TTL_MS,
 } from "./mediaSign.js";
 import { containerFileProxy } from "./containerFileProxy.js";
+import { getBearerToken, getSessionCookieToken } from "./authHelpers.js";
 import { defaultTunnelFetchHealthz } from "./tunnelHealthzProbe.js";
 import { getHostById as computePoolGetHostById } from "../compute-pool/queries.js";
 import { dialTunnelSocket as defaultTunnelDial } from "../compute-pool/nodeAgentClient.js";
@@ -1585,6 +1587,7 @@ function _logMediaSignAuthFail(
     { ok: false }
   >,
   jwtSecret: string | Uint8Array,
+  source: "bearer" | "cookie",
 ): void {
   const parsed = result.parsedClaims;
   const tokenExp = _sanitizeClaimNumber(parsed?.exp);
@@ -1610,6 +1613,9 @@ function _logMediaSignAuthFail(
   const diagId = _sanitizeDiagId(_firstHeader(req.headers["x-oc-diag-id"]));
   ctx.log.warn("media_sign_auth_fail", {
     reason: result.reason,
+    // v1.0.159 dual verify:同一个 req 可能记两次 fail(bearer + cookie 都败),
+    // source 字段区分,便于 jq 分流统计。
+    source,
     token_sub: _sanitizeClaimScalar(parsed?.sub),
     token_role: _sanitizeClaimScalar(parsed?.role),
     token_iat: tokenIat,
@@ -1628,9 +1634,49 @@ function _logMediaSignAuthFail(
 }
 
 /**
+ * 双凭证 mismatch 告警 —— cookie + bearer 都 verify 通过但 `sub` 不一致
+ * (e.g. 多 tab 切账号 race / 旧 Bearer 在 storage 没清干净)。本次架构决定
+ * cookie 是浏览器会话权威,**按 cookie 走**,把 bearer 的 sub 记到日志里追踪。
+ */
+function _logMediaSignSubjectMismatch(
+  ctx: RequestContext,
+  req: IncomingMessage,
+  cookieSub: string,
+  bearerSub: string,
+): void {
+  const diagId = _sanitizeDiagId(_firstHeader(req.headers["x-oc-diag-id"]));
+  ctx.log.warn("media_sign_subject_mismatch", {
+    chosen: "cookie",
+    cookie_sub: cookieSub,
+    bearer_sub: bearerSub,
+    diag_id: diagId,
+    user_agent: ctx.userAgent,
+    instance_pid: process.pid,
+  });
+}
+
+/**
  * POST /api/media-sign
  *
- * 鉴权:Bearer JWT(同 /api/me)+ requireActiveAccountVerifyDb(DB role∈{user,admin} ∧ status='active')。
+ * 鉴权(v1.0.159 起):**Cookie 优先 + Bearer 兜底 + dual verify**。
+ *   1. 读 `oc_session` cookie 和 `Authorization: Bearer ...` 两份凭证
+ *   2. cookie 有 → 先 verify cookie;通过即用 cookie 的 claims
+ *   3. cookie 无 / 不通过 → verify bearer;通过即用 bearer 的 claims
+ *   4. 两者都无 / 都不通过 → 401
+ *   5. 两者都通过但 sub 不同 → 选 cookie + 写 mismatch 告警日志
+ * 加 `requireActiveAccountVerifyDb` (DB role∈{user,admin} ∧ status='active')。
+ *
+ * **为什么 cookie 优先**:HttpOnly `oc_session` 是浏览器会话权威源 ——
+ *   - JS 不能读/改它,跟 access_token in-memory desync 解耦(d1193355375 v1.0.158 case
+ *     正是 state.token 75min 不切但 cookie 始终 fresh)
+ *   - mintSessionCookie 跟随每次 refresh 自动更新,生命周期跟 access JWT 绑死
+ *   - 跨 tab race 时 cookie 是 last-write-wins,跟当前用户身份对齐更可靠
+ *
+ * **保留 Bearer 兜底**:API 调用者 / 未冷启动(no cookie)的 webview / curl 脚本
+ *   仍走 Bearer。**老 v1.0.158 前端(已部署到用户浏览器)**继续发 stale Bearer +
+ *   fresh cookie —— cookie-first 让这种 tab 的 media-sign 立即恢复(本次架构修
+ *   存量 stale-Bearer tab 的关键路径)。
+ *
  * 入参 body: `{ paths: string[] }`(最多 32 条,见 normalizeSignBatchInput)。
  * 出参: `{ urls: Record<path, signedUrl>, expMs: number }`。
  *
@@ -1651,26 +1697,56 @@ export async function handleMediaSign(
     throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
   }
 
-  const authHeader = req.headers.authorization ?? "";
-  const m = authHeader.match(/^Bearer\s+(.+)$/);
-  if (!m) {
-    throw new HttpError(401, "UNAUTHORIZED", "bearer token required");
+  // 2026-05-18 v1.0.159:cookie 优先 + Bearer 兜底 + dual verify。详见上方 doc。
+  // 任一通过即放行;两者都通过但 sub 不同 → 选 cookie(权威源)并打 mismatch warn。
+  const cookieToken = getSessionCookieToken(req);
+  const bearerToken = getBearerToken(req);
+
+  // 走 detailed 版:失败时把 reason / parsedClaims 一并写结构化日志,定位
+  // d1193355375 案这类 401 根因(token 漂移 / clock skew / secret rotate)。
+  // 对外 message 始终 "invalid or expired token",reason 不暴露给 client。
+  // 详见 jwtSync.ts 顶部 doc。
+  let claims: CommercialJwtClaims | null = null;
+  let chosenSource: "cookie" | "bearer" | null = null;
+
+  // Step 1: cookie 优先
+  if (cookieToken) {
+    const r = verifyCommercialJwtSyncDetailed(cookieToken, deps.jwtSecret);
+    if (r.ok) {
+      claims = r.claims;
+      chosenSource = "cookie";
+    } else {
+      _logMediaSignAuthFail(ctx, req, r, deps.jwtSecret, "cookie");
+    }
   }
-  const token = m[1]!.trim();
-  if (!token) {
-    throw new HttpError(401, "UNAUTHORIZED", "bearer token required");
+
+  // Step 2: cookie 没过 → 试 Bearer。如果 bearer === cookieToken(浏览器同源场景常见),
+  // 跳过避免重复验签 + 重复 fail 日志。
+  if (!chosenSource && bearerToken && bearerToken !== cookieToken) {
+    const r = verifyCommercialJwtSyncDetailed(bearerToken, deps.jwtSecret);
+    if (r.ok) {
+      claims = r.claims;
+      chosenSource = "bearer";
+    } else {
+      _logMediaSignAuthFail(ctx, req, r, deps.jwtSecret, "bearer");
+    }
   }
-  // 2026-05-17 诊断埋点(v1.0.158):用 detailed 版拿 reason + parsedClaims,
-  // 失败时把 reason、token 内容、时钟偏移、retry 标记、secret 指纹一起写结构化
-  // 日志,定位 d1193355375 case 的 retry-after-refresh 仍 401 根因。
-  // **对外 message 不变**(仍 "invalid or expired token"),reason 不暴露给 client。
-  // 详情见 jwtSync.ts 顶部 doc。
-  const verifyResult = verifyCommercialJwtSyncDetailed(token, deps.jwtSecret);
-  if (!verifyResult.ok) {
-    _logMediaSignAuthFail(ctx, req, verifyResult, deps.jwtSecret);
+
+  if (!claims || !chosenSource) {
     throw new HttpError(401, "UNAUTHORIZED", "invalid or expired token");
   }
-  const claims = verifyResult.claims;
+
+  // Step 3: 两者都通过但 sub 不同 → 已选 cookie,记 mismatch warn。
+  // 只在 cookie 通过(chosenSource==='cookie')且 bearer 不同 token 时查;
+  // cookie 没过则 chosenSource==='bearer',无 mismatch 概念。
+  // bearer verify fail 的 case 不写 mismatch(那是常规 stale-Bearer migration,
+  // 会刷屏);只有 bearer verify ok 但 sub 不同,才是真"多 tab 切账号"信号。
+  if (chosenSource === "cookie" && bearerToken && bearerToken !== cookieToken) {
+    const br = verifyCommercialJwtSyncDetailed(bearerToken, deps.jwtSecret);
+    if (br.ok && br.claims.sub !== claims.sub) {
+      _logMediaSignSubjectMismatch(ctx, req, claims.sub, br.claims.sub);
+    }
+  }
 
   // user 和 admin 都允许 sign:cookie-free signed URL 的核心动机就是 iOS Safari +
   // CF CDN 丢 oc_session;admin 在那个环境同样会丢 cookie,以前那条 "admin 走
