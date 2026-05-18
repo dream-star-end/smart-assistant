@@ -66,15 +66,9 @@ describe('波次 4 — IME composition guards', () => {
       /document\.addEventListener\('keydown'\s*,\s*\(e\)\s*=>\s*\{[\s\S]{0,200}if\s*\(\s*e\.isComposing\s*\)\s*return/,
       '全局 Escape handler 顶部必须有 isComposing early-return',
     )
-    // 同时 lightbox-specific Escape listener 也应有守卫
-    const lightboxIdx = MAIN.indexOf('// Lightbox-specific Escape')
-    assert.ok(lightboxIdx >= 0, 'Lightbox-specific Escape listener 注释应存在')
-    const lightboxRegion = stripLineComments(MAIN.slice(lightboxIdx, lightboxIdx + 400))
-    assert.match(
-      lightboxRegion,
-      /document\.addEventListener\('keydown'\s*,\s*\(e\)\s*=>\s*\{[\s\S]{0,200}if\s*\(\s*e\.isComposing\s*\)\s*return/,
-      'Lightbox-specific Escape listener 顶部必须有 isComposing early-return',
-    )
+    // 注:原 lightbox-specific Escape listener 已在波次 7 (PR #8) 作为死代码删除
+    // (主 Escape handler 已先处理 lightbox 分支),它的 isComposing guard
+    // 测试条款也随之失效,无需再断言。
   })
 
   it('C. sessions.js rename input onkeydown 的 Enter + Escape 两支都带 `!e.isComposing`', () => {
