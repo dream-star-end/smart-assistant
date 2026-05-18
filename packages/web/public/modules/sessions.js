@@ -1,17 +1,17 @@
-import { clearAttachments } from './attachments.js?v=cfaa0e5d'
-import { dbDelete, dbPut } from './db.js?v=cfaa0e5d'
+import { clearAttachments } from './attachments.js?v=e149dc7a'
+import { dbDelete, dbPut } from './db.js?v=e149dc7a'
 // OpenClaude — Session management, sidebar, context menu
-import { $, htmlSafeEscape } from './dom.js?v=cfaa0e5d'
-import { exportSessionDocx } from './export-docx.js?v=cfaa0e5d'
-import { exportSessionTex } from './export-tex.js?v=cfaa0e5d'
-import { refreshGithubPill } from './github.js?v=cfaa0e5d'
-import { setTitleBusy } from './notifications.js?v=cfaa0e5d'
-import { getSession, state } from './state.js?v=cfaa0e5d'
-import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=cfaa0e5d'
-import { toast } from './ui.js?v=cfaa0e5d'
-import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=cfaa0e5d'
-import { nudgeDrain } from './websocket.js?v=cfaa0e5d'
-import { trace, flushTrace } from './trace.js?v=cfaa0e5d'
+import { $, htmlSafeEscape } from './dom.js?v=e149dc7a'
+import { exportSessionDocx } from './export-docx.js?v=e149dc7a'
+import { exportSessionTex } from './export-tex.js?v=e149dc7a'
+import { refreshGithubPill } from './github.js?v=e149dc7a'
+import { setTitleBusy } from './notifications.js?v=e149dc7a'
+import { getSession, state } from './state.js?v=e149dc7a'
+import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=e149dc7a'
+import { toast } from './ui.js?v=e149dc7a'
+import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=e149dc7a'
+import { nudgeDrain } from './websocket.js?v=e149dc7a'
+import { trace, flushTrace } from './trace.js?v=e149dc7a'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -623,9 +623,9 @@ export function _buildSessionItem(s) {
     ])
   }
 
-  // Mobile long-press
+  // Mobile long-press — passive listeners so sidebar scroll on touch isn't blocked
   let _lpt = null
-  item.ontouchstart = (e) => {
+  item.addEventListener('touchstart', (e) => {
     _lpt = setTimeout(() => {
       const touch = e.touches[0]
       showContextMenu(touch.clientX, touch.clientY, [
@@ -652,9 +652,9 @@ export function _buildSessionItem(s) {
         },
       ])
     }, 600)
-  }
-  item.ontouchend = () => clearTimeout(_lpt)
-  item.ontouchmove = () => clearTimeout(_lpt)
+  }, { passive: true })
+  item.addEventListener('touchend', () => clearTimeout(_lpt), { passive: true })
+  item.addEventListener('touchmove', () => clearTimeout(_lpt), { passive: true })
 
   return item
 }
