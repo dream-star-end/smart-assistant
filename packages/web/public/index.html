@@ -769,8 +769,8 @@
            的客户端会撞上 "Cannot set properties of null (setting 'value')"。 -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
         <div class="form-row" style="margin:0">
-          <label for="persona-model-preset">预设</label>
-          <select id="persona-model-preset" onchange="if(this.value){document.getElementById('persona-model').value=this.value}">
+          <label>预设</label>
+          <select id="persona-model-preset">
             <option value="">自定义</option>
             <!-- 静态兜底: 缓存了旧 agents.js 的客户端不会调 /api/models,
                  没这些 option 的话下拉会一直停在"加载中"。新 agents.js
@@ -1459,7 +1459,7 @@
 <script src="/vendor/chart.umd.min.js" async></script>
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
-<div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="toast" class="toast"></div>
 <script type="module" src="/modules/main.js?v=e149dc7a"></script>
 </body>
 </html>

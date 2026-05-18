@@ -7,16 +7,7 @@ import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=e149dc
 import { invalidateSignCache, signMediaPath } from './mediaSign.js?v=e149dc7a'
 
 // ── Pure utilities ──
-import {
-  GROUP_ORDER,
-  _basename,
-  _cronHuman,
-  formatSize,
-  msgId,
-  sessionGroup,
-  shortTime,
-  uuid,
-} from './util.js?v=e149dc7a'
+import { formatSize, msgId, shortTime } from './util.js?v=e149dc7a'
 
 // ── App state ──
 import {
@@ -24,7 +15,6 @@ import {
   _clearStoredAccessToken,
   _writeStoredAccessToken,
   getSession,
-  isSending,
   setSending,
   state,
   tryEnqueueOffline,
@@ -46,7 +36,7 @@ import {
 } from './api.js?v=e149dc7a'
 
 // ── IndexedDB ──
-import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js?v=e149dc7a'
+import { dbDelete, dbGetAll, onIdbUnavailable } from './db.js?v=e149dc7a'
 
 // ── Cross-device sync ──
 import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=e149dc7a'
@@ -55,17 +45,10 @@ import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=e
 import { flushTrace } from './trace.js?v=e149dc7a'
 
 // ── Theme ──
-import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js?v=e149dc7a'
+import { applyTheme, cycleTheme, setToastFn } from './theme.js?v=e149dc7a'
 
 // ── Markdown / rich rendering ──
-import {
-  _imgHtml,
-  _renderLocalMedia,
-  embedMediaUrls,
-  localPathToUrl,
-  processRichBlocks,
-  renderMarkdown,
-} from './markdown.js?v=e149dc7a'
+import { _renderLocalMedia, processRichBlocks, renderMarkdown } from './markdown.js?v=e149dc7a'
 
 // ── UI helpers ──
 import {
@@ -78,26 +61,13 @@ import {
 } from './ui.js?v=e149dc7a'
 
 // ── Attachments ──
-import {
-  addFiles,
-  classifyFile,
-  clearAttachments,
-  fileToDataURL,
-  fileToText,
-  removeAttachment,
-  renderAttachments,
-} from './attachments.js?v=e149dc7a'
+import { addFiles, clearAttachments } from './attachments.js?v=e149dc7a'
 
 // ── Speech recognition ──
-import { initSpeech, setAutoResize, toggleVoice } from './speech.js?v=e149dc7a'
+import { setAutoResize, toggleVoice } from './speech.js?v=e149dc7a'
 
 // ── Notifications ──
-import {
-  maybeNotify,
-  refreshDocumentTitle,
-  requestNotifyPermission,
-  setTitleBusy,
-} from './notifications.js?v=e149dc7a'
+import { refreshDocumentTitle, setTitleBusy } from './notifications.js?v=e149dc7a'
 
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
@@ -144,33 +114,22 @@ import {
 } from './github.js?v=e149dc7a'
 
 // ── Scheduled tasks ──
-import {
-  initTasksListeners,
-  loadBgTasks,
-  loadExecLog,
-  openTasksModal,
-  switchTasksTab,
-} from './tasks.js?v=e149dc7a'
+import { initTasksListeners, openTasksModal } from './tasks.js?v=e149dc7a'
 
 // ── Agents ──
 import {
   openPersonaEditor,
   reloadAgents,
   renderAgentDropdown,
-  renderAgentsManagementList,
   setRenderModelPill,
 } from './agents.js?v=e149dc7a' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
-  _buildSessionItem,
   _rebuildSearchIndex,
   createSession,
-  deleteSession,
   enqueueSaveForRetry,
-  exportSessionMd,
   flushPendingSaves,
-  hideContextMenu,
   renderSidebar,
   restoreCurrentSessionInFlightUI,
   sanitizeLoadedTurnState,
@@ -178,21 +137,16 @@ import {
   scheduleSaveFromUserEdit,
   setSessionDeps,
   setSessionUIDeps,
-  showContextMenu,
-  startInlineRename,
   switchSession,
 } from './sessions.js?v=e149dc7a'
 
 // ── Messages ──
 import {
-  _buildMessageEl,
   _deriveUserMsgStatus,
   ensureInner,
   initMessagesListeners,
-  isAtBottom,
   renderMessage,
   renderMessages,
-  renderMetaInto,
   scrollBottom,
   setMessageDeps,
   updateMessageEl,
@@ -203,12 +157,9 @@ import {
 // ── WebSocket ──
 import {
   _renderTasksPanel,
-  addBgTask,
   addMessage,
   addSystemMessage,
-  buildToolUseLabel,
   clearTurnTiming,
-  completeBgTask,
   connect,
   formatMeta,
   handleOutbound,
@@ -220,11 +171,9 @@ import {
   resetThinkingSafety,
   safeWsSend,
   setProvisioningBanner,
-  setStatus,
   setWsDeps,
   showTypingIndicator,
   stopCurrentTurn,
-  updateMessage,
   updateMsgStatus,
   updateSendEnabled,
 } from './websocket.js?v=e149dc7a'
@@ -854,15 +803,6 @@ document.addEventListener('keydown', (e) => {
     // Close any open modal via closeModal (handles focus trap cleanup)
     document.querySelectorAll('.modal-backdrop.open').forEach((el) => closeModal(el.id))
     document.querySelectorAll('.palette-backdrop.open').forEach((el) => el.classList.remove('open'))
-  }
-})
-
-// Lightbox-specific Escape (separate listener that can stopPropagation)
-document.addEventListener('keydown', (e) => {
-  if (e.isComposing) return
-  if (e.key === 'Escape' && !$('lightbox').hidden) {
-    closeLightbox()
-    e.stopPropagation()
   }
 })
 

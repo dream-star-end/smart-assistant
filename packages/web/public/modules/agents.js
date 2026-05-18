@@ -198,3 +198,19 @@ export async function openPersonaEditor(agentId) {
     toast(String(err), 'error', toastOptsFromError(err))
   }
 }
+
+// persona-model-preset 下拉变化 → 同步到 #persona-model 输入框。
+// 原 inline onchange 移到这里:CSP 收紧 'unsafe-inline' 时仍可工作。
+// 模块顶层一次性绑定 — element 是 index.html 静态节点,ES module deferred
+// 加载时 DOM 已完整解析,无时序问题、无累积绑定。
+{
+  const _preset = document.getElementById('persona-model-preset')
+  if (_preset) {
+    _preset.addEventListener('change', () => {
+      const v = _preset.value
+      if (!v) return
+      const model = document.getElementById('persona-model')
+      if (model) model.value = v
+    })
+  }
+}
