@@ -103,6 +103,30 @@ export function setMessageDeps(deps) {
   _resetReplyTracker = deps.resetReplyTracker
 }
 
+// ── Closure-stale msg ref helpers (sync server-wins guard) ──
+// Background: when sync.js's 409 server-wins path overwrites sess.messages
+// (sync.js:1392 "sess.messages was just overwritten"), DOM event handlers
+// that captured `msg` in a closure at build time become orphans —
+// `sess.messages.indexOf(msg)` returns -1. Click → silent no-op (regen/del)
+// or stale-content read (copy/save/tts). _findMsgIdx resolves a fresh idx
+// by id; live-resolved msg is then used for both array ops and content reads.
+export function _findMsgIdx(sess, msg) {
+  if (!sess || !Array.isArray(sess.messages) || !msg) return -1
+  let idx = sess.messages.indexOf(msg)
+  if (idx >= 0) return idx
+  if (msg.id) idx = sess.messages.findIndex((m) => m && m.id === msg.id)
+  return idx
+}
+
+// Undo helper: re-insert the live `removedMsg` at the position anchored by
+// the predecessor msg's id (captured at delete time). If the predecessor was
+// also removed by a concurrent sync, append at end (rare race).
+export function _computeUndoInsertIdx(messages, prevMsgId) {
+  if (!prevMsgId) return 0
+  const pi = messages.findIndex((m) => m && m.id === prevMsgId)
+  return pi >= 0 ? pi + 1 : messages.length
+}
+
 // ── Message status rendering ──
 const _STATUS_SVG = {
   sending:
@@ -1501,7 +1525,9 @@ export function _buildMessageEl(msg) {
         const sess = getSession()
         if (!sess) return
         if (btn.dataset.action === 'copy') {
-          const raw = msg.text || ''
+          const _idx = _findMsgIdx(sess, msg)
+          const liveMsg = _idx >= 0 ? sess.messages[_idx] : msg
+          const raw = liveMsg.text || ''
           if (navigator.clipboard?.writeText) {
             navigator.clipboard.writeText(raw).catch(() => fallbackCopy(raw))
           } else fallbackCopy(raw)
@@ -1558,7 +1584,9 @@ export function _buildMessageEl(msg) {
             btn.innerHTML = _svgCopy
           }, 1500)
         }
-        const raw = msg.text || ''
+        const _idx = _findMsgIdx(sess, msg)
+        const liveMsg = _idx >= 0 ? sess.messages[_idx] : msg
+        const raw = liveMsg.text || ''
         const html = `<div style="font-family:sans-serif;line-height:1.6">${_renderCleanHtml(raw)}</div>`
         // Rich copy: HTML (for Word/Docs) + plain text (Markdown source)
         if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
@@ -1628,10 +1656,12 @@ export function _buildMessageEl(msg) {
             const savBtn = ev.target.closest('[data-save]')
             if (!savBtn) return
             const fmt = savBtn.dataset.save
-            const raw = msg.text || ''
+            const _idx = _findMsgIdx(sess, msg)
+            const liveMsg = _idx >= 0 ? sess.messages[_idx] : msg
+            const raw = liveMsg.text || ''
             if (fmt === 'md') _exportMd(raw)
-            else if (fmt === 'docx') exportMessageDocx(msg, { title: getSession()?.title || 'openclaude' })
-            else if (fmt === 'tex') exportMessageTex(msg, { title: getSession()?.title || 'openclaude' })
+            else if (fmt === 'docx') exportMessageDocx(liveMsg, { title: getSession()?.title || 'openclaude' })
+            else if (fmt === 'tex') exportMessageTex(liveMsg, { title: getSession()?.title || 'openclaude' })
             else if (fmt === 'pdf') _exportPdf(raw)
             menu.remove()
             actions.classList.remove('menu-open')
@@ -1688,7 +1718,7 @@ export function _buildMessageEl(msg) {
           _setTitleBusy(false)
         }
         // Find the last user message before this assistant message
-        const idx = sess.messages.indexOf(msg)
+        const idx = _findMsgIdx(sess, msg)
         if (idx < 0) return
         let lastUserMsg = null
         for (let i = idx - 1; i >= 0; i--) {
@@ -1803,7 +1833,9 @@ export function _buildMessageEl(msg) {
         btn.dataset.action = 'tts'
       } else if (action === 'tts') {
         // Use Web Speech API for quick read-aloud
-        const text = (msg.text || '').replace(/[#*`>_~\[\]()]/g, '').slice(0, 2000)
+        const _idx = _findMsgIdx(sess, msg)
+        const liveMsg = _idx >= 0 ? sess.messages[_idx] : msg
+        const text = (liveMsg.text || '').replace(/[#*`>_~\[\]()]/g, '').slice(0, 2000)
         if (!text) return
         if (window.speechSynthesis) {
           window.speechSynthesis.cancel()
@@ -1823,10 +1855,16 @@ export function _buildMessageEl(msg) {
           toast('浏览器不支持语音合成', 'error')
         }
       } else if (action === 'del') {
-        const idx = sess.messages.indexOf(msg)
+        const idx = _findMsgIdx(sess, msg)
         if (idx < 0) return
-        // Soft delete with undo toast
-        sess.messages.splice(idx, 1)
+        // Capture the predecessor's id before splice so undo can re-anchor
+        // by id (idx-based reinsert breaks after a concurrent sync that
+        // rewrites sess.messages or its length).
+        const prevMsgId = idx > 0 ? sess.messages[idx - 1]?.id || null : null
+        // Capture the LIVE row from splice, not the closure `msg` — after a
+        // server-wins sync, `msg` may be an orphan with stale fields while
+        // sess.messages[idx] is the authoritative server-merged object.
+        const removedMsg = sess.messages.splice(idx, 1)[0]
         el.style.display = 'none'
         const undoToast = document.createElement('div')
         undoToast.className = 'toast show'
@@ -1836,7 +1874,13 @@ export function _buildMessageEl(msg) {
         let undone = false
         undoToast.querySelector('.undo-btn').onclick = () => {
           undone = true
-          sess.messages.splice(idx, 0, msg)
+          // Duplicate guard: if a concurrent sync re-introduced the same-id
+          // msg (server hadn't seen our DELETE PUT yet), skip reinsert.
+          const alreadyHas = sess.messages.some((m) => m && m.id === removedMsg.id)
+          if (!alreadyHas) {
+            const insertIdx = _computeUndoInsertIdx(sess.messages, prevMsgId)
+            sess.messages.splice(insertIdx, 0, removedMsg)
+          }
           el.style.display = ''
           undoToast.remove()
           _scheduleSaveFromUserEdit(sess)
@@ -1915,7 +1959,7 @@ export function _buildMessageEl(msg) {
     const sess = getSession()
     let displayStatus = null
     if (sess && Array.isArray(sess.messages)) {
-      const idx = sess.messages.indexOf(msg)
+      const idx = _findMsgIdx(sess, msg)
       if (idx >= 0) displayStatus = _deriveUserMsgStatus(sess.messages, idx)
     }
     if (!displayStatus) displayStatus = msg.status || null
