@@ -676,10 +676,11 @@ export function startInlineRename(titleEl, sess) {
   }
   input.onblur = finish
   input.onkeydown = (e) => {
-    if (e.key === 'Enter') {
+    // IME 期放行,避免 Enter/Esc 半成品 commit 或误回滚标题
+    if (e.key === 'Enter' && !e.isComposing) {
       e.preventDefault()
       input.blur()
-    } else if (e.key === 'Escape') {
+    } else if (e.key === 'Escape' && !e.isComposing) {
       input.value = sess.title
       input.blur()
     }

@@ -246,10 +246,16 @@ function positionMenu() {
   menu.style.top = 'auto'
 }
 
+const POPUP_SOURCE = 'effort'
+
 function openMenu(focusFirst = false) {
   const trigger = getTrigger()
   const menu = getMenu()
   if (!trigger || !menu) return
+  // 通知 composer 同栏其他 popup(modelPicker)先关闭,避免双开重叠
+  document.dispatchEvent(
+    new CustomEvent('composer-popup-opening', { detail: { source: POPUP_SOURCE } }),
+  )
   positionMenu()
   menu.hidden = false
   trigger.setAttribute('aria-expanded', 'true')
@@ -482,6 +488,10 @@ export function initModePills() {
         closeMenu(true)
       }
     }
+  })
+  // 同栏其他 popup 打开时,关闭本菜单(B4 dual menu 修复)
+  document.addEventListener('composer-popup-opening', (e) => {
+    if (e.detail?.source !== POPUP_SOURCE && isMenuOpen()) closeMenu(false)
   })
   menuEventsBound = true
   renderModePills()

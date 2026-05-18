@@ -842,6 +842,8 @@ document.addEventListener(
 
 // ── Escape key: close modals, lightbox, palette ──
 document.addEventListener('keydown', (e) => {
+  // IME 期 Esc 优先让给输入法取消候选,避免误关 palette/modal
+  if (e.isComposing) return
   if (e.key === 'Escape') {
     // Lightbox takes priority
     if (!$('lightbox').hidden) {
@@ -857,6 +859,7 @@ document.addEventListener('keydown', (e) => {
 
 // Lightbox-specific Escape (separate listener that can stopPropagation)
 document.addEventListener('keydown', (e) => {
+  if (e.isComposing) return
   if (e.key === 'Escape' && !$('lightbox').hidden) {
     closeLightbox()
     e.stopPropagation()
@@ -2681,7 +2684,8 @@ async function init() {
   // Input events -- single keydown handler for both slash popup and send
   $('input').addEventListener('keydown', (e) => {
     // Slash popup navigation takes priority when visible
-    if (slashPopupVisible) {
+    // IME 期(e.isComposing)放行到默认 / IME 处理,避免抢走 ↑↓/Tab/Enter
+    if (slashPopupVisible && !e.isComposing) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
         setSlashSelected(Math.min(getSlashSelected() + 1, getSlashMatches().length - 1))
@@ -2808,6 +2812,8 @@ async function init() {
     renderPalette()
   })
   $('palette-input').addEventListener('keydown', (e) => {
+    // IME 期放行,避免抢走 ↑↓/Enter
+    if (e.isComposing) return
     if (e.key === 'ArrowDown') {
       e.preventDefault()
       if (paletteItems.length) {
