@@ -1,21 +1,21 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
-import { abortInflightRefresh, apiGet, clearProactiveRefresh, silentRefresh } from './api.js?v=d02d9c63'
+import { abortInflightRefresh, apiGet, clearProactiveRefresh, silentRefresh } from './api.js?v=e149dc7a'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=d02d9c63'
-import { dbPut } from './db.js?v=d02d9c63'
-import { $, htmlSafeEscape } from './dom.js?v=d02d9c63'
-import { maybeNotify, setTitleBusy } from './notifications.js?v=d02d9c63'
-import { _clearStoredAccessToken, getSession, state } from './state.js?v=d02d9c63'
-import { maybeSyncNow } from './sync.js?v=d02d9c63'
-import { toast } from './ui.js?v=d02d9c63'
+import { clearSessionCookie } from './auth.js?v=e149dc7a'
+import { dbPut } from './db.js?v=e149dc7a'
+import { $, htmlSafeEscape } from './dom.js?v=e149dc7a'
+import { maybeNotify, setTitleBusy } from './notifications.js?v=e149dc7a'
+import { _clearStoredAccessToken, getSession, state } from './state.js?v=e149dc7a'
+import { maybeSyncNow } from './sync.js?v=e149dc7a'
+import { toast } from './ui.js?v=e149dc7a'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance, _openTopupModal } from './billing.js?v=d02d9c63'
+import { refreshBalance, _openTopupModal } from './billing.js?v=e149dc7a'
 // Diagnostic trace for the WS → IndexedDB → server PUT persistence chain.
 // trace() is a no-side-effect ring writer; flushTrace happens off the
 // critical path (sessions.js _doSave finally + isFinal+1500ms backup).
-import { trace, flushTrace } from './trace.js?v=d02d9c63'
+import { trace, flushTrace } from './trace.js?v=e149dc7a'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
@@ -621,6 +621,33 @@ export function updateMsgStatus(msg, sess) {
 // check this to avoid re-entering after disconnect/reconnect started a new drain.
 let _drainGeneration = 0
 
+// onopen 初始 status pill 决策(纯函数,测试友好)
+// offlineQueue 非空时不能立刻 promote 到"已连接" —— drain 还没启动,
+// 用户看到的"已连接"会让他们误以为新消息能即时发,实际进入 queue 路径。
+// 返回 [label, klass]。
+export function _onopenSetInitialStatus(offlineQueueLen) {
+  if (offlineQueueLen > 0) {
+    return [`补发离线消息… (${offlineQueueLen})`, 'connecting']
+  }
+  return ['已连接', 'connected']
+}
+
+// drain 真终态判定。5 条全成立才把 status pill 升回"已连接":
+//   1. ws 还活着
+//   2. offlineQueue 没有未启动的项
+//   3. _offlineQueuePending 已空
+//   4. _offlineDrainingCurrent 已清(已收到 isFinal / timeout 放弃 / ack)
+//   5. _offlineQueueDraining flag 已 false
+// 任何一条不成立都说明 drain 仍未真正完成。
+export function _maybePromoteToConnected() {
+  if (!state.ws || state.ws.readyState !== 1) return
+  if (state.offlineQueue?.length > 0) return
+  if (state._offlineQueuePending?.length > 0) return
+  if (state._offlineDrainingCurrent) return
+  if (state._offlineQueueDraining) return
+  setStatus('已连接', 'connected')
+}
+
 // Exported: called by /clear and deleteSession after clearing _offlineDrainingCurrent
 // to advance the drain to the next item if there are pending items remaining.
 export function nudgeDrain() {
@@ -630,6 +657,42 @@ export function nudgeDrain() {
     setTimeout(_drainNextOfflineItem, 500)
   } else {
     state._offlineQueueDraining = false
+    // drain 自然终态(deduplicated ack 路径) → promote status pill
+    _maybePromoteToConnected()
+  }
+}
+
+// 120s safety timeout callback for an in-flight drain item.
+// 抽成独立函数(而不是 inline arrow)是为了让 timeout else 分支接到
+// _maybePromoteToConnected 这条接线能在 wsDrainPromoteStatus.test.ts 里被
+// 机械验证 — 否则未来如果有人误改 inline 体,只能靠人工 review。
+// 不 export:测试走 source-extract 模式(new Function 加载),不需要真实 import。
+function _handleDrainTimeout(item) {
+  if (state._offlineDrainingCurrent !== item) return
+  console.warn('[ws] Drain isFinal timeout for session', item.sessId)
+  // Clear stale sending state for this session
+  const stuckSess = state.sessions.get(item.sessId)
+  if (stuckSess) {
+    stuckSess._sendingInFlight = false
+    clearTurnTiming(stuckSess)
+    // Drain timeout is abandoning this turn; drop the reply tracker so a
+    // belated isFinal can't flag the user message as empty or attach to
+    // the next turn that the user kicks off.
+    resetReplyTracker(stuckSess)
+    if (stuckSess.id === state.currentSessionId) {
+      state.sendingInFlight = false
+      updateSendEnabled()
+      hideTypingIndicator()
+      setTitleBusy(false)
+    }
+  }
+  state._offlineDrainingCurrent = null
+  if (state._offlineQueuePending?.length > 0) {
+    _drainNextOfflineItem()
+  } else {
+    state._offlineQueueDraining = false
+    // drain 自然终态(最后一项 120s timeout 放弃) → promote status pill
+    _maybePromoteToConnected()
   }
 }
 
@@ -639,6 +702,8 @@ function _drainNextOfflineItem() {
   if (!queue || queue.length === 0) {
     state._offlineQueueDraining = false
     state._offlineDrainingCurrent = null
+    // drain 自然终态(队尾入口) → promote status pill
+    _maybePromoteToConnected()
     return
   }
   const item = queue[0]  // Peek first, don't shift yet
@@ -713,34 +778,11 @@ function _drainNextOfflineItem() {
       setTitleBusy(true)
     }
   }
-  // Safety timeout: if no isFinal arrives in 120s, advance the drain to prevent wedge
-  state._drainTimeout = setTimeout(() => {
-    if (state._offlineDrainingCurrent === item) {
-      console.warn('[ws] Drain isFinal timeout for session', item.sessId)
-      // Clear stale sending state for this session
-      const stuckSess = state.sessions.get(item.sessId)
-      if (stuckSess) {
-        stuckSess._sendingInFlight = false
-        clearTurnTiming(stuckSess)
-        // Drain timeout is abandoning this turn; drop the reply tracker so a
-        // belated isFinal can't flag the user message as empty or attach to
-        // the next turn that the user kicks off.
-        resetReplyTracker(stuckSess)
-        if (stuckSess.id === state.currentSessionId) {
-          state.sendingInFlight = false
-          updateSendEnabled()
-          hideTypingIndicator()
-          setTitleBusy(false)
-        }
-      }
-      state._offlineDrainingCurrent = null
-      if (state._offlineQueuePending?.length > 0) {
-        _drainNextOfflineItem()
-      } else {
-        state._offlineQueueDraining = false
-      }
-    }
-  }, 120000)
+  // Safety timeout: if no isFinal arrives in 120s, advance the drain to prevent wedge.
+  // 抽成 _handleDrainTimeout(item) 是为了让 timeout else 分支可独立单测 — inline
+  // arrow 没法 source-extract,会导致 "_maybePromoteToConnected 真的被接到这里没"
+  // 的回归无法机械锁住。
+  state._drainTimeout = setTimeout(() => _handleDrainTimeout(item), 120000)
   // If no more items, we're done after this response (handleOutbound will clear the flag)
   if (queue.length === 0) state._offlineQueueDraining = false
 }
@@ -1264,7 +1306,14 @@ export function connect() {
     // 容器初始化 banner —— onopen 是"WS 实际可用"的唯一可信信号,任何 4503 残留
     // 都在这里清掉。若后续 server 又以 4503 close,onclose 分支会再 set true。
     setProvisioningBanner(false)
-    setStatus('已连接', 'connected')
+    // offlineQueue 非空时不能立刻 promote 到"已连接" —— drain 还要等 3s 延迟启动,
+    // 启动后还要逐条等 isFinal,中间窗口期 status 应反映"补发中"。drain 终态由
+    // _maybePromoteToConnected() 在 4 个收口点(nudgeDrain else / _drainNextOfflineItem
+    // 入口空 / 120s timeout else / handleOutbound isFinal)负责升回"已连接"。
+    {
+      const [_lbl, _cls] = _onopenSetInitialStatus(state.offlineQueue?.length || 0)
+      setStatus(_lbl, _cls)
+    }
     // Restore UI state for the current session if it was mid-turn before disconnect
     const _currentSess = getSession()
     if (_currentSess?._sendingInFlight) {
@@ -2426,6 +2475,10 @@ export function handleOutbound(frame) {
       } else {
         state._offlineQueueDraining = false
       }
+      // drain 自然终态(isFinal 收到) → promote status pill。放在 if-else 块结束
+      // 之后而非 _offlineDrainingCurrent=null 之后,这样 pending 非空时(下一轮
+      // drain 已 setTimeout)helper 内部的 draining flag check 会自然挡回。
+      _maybePromoteToConnected()
     }
     // Complete any bg tasks linked to this session's last user message
     const lastUser = [...sess.messages].reverse().find((m) => m.role === 'user')
