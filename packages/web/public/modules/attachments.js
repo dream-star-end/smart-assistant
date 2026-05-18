@@ -100,6 +100,14 @@ async function _uploadOne(att, file) {
     //   - state.token 同步可读,首发不依赖 cookie
     //   - 401 时 apiFetch 内部 silentRefresh + 重写 Authorization 后重试
     //   - file (Blob) 可被 fetch 重读,retry 安全
+    // 大文件上传 timeout:apiFetch 默认 30s,200MB 单文件 + 慢网下根本不够,
+    // 表现为 toast "上传 X 失败: Request timeout"。按文件大小给出线性 timeout,
+    // 下限 5min,上限 30min(对应约 50KB/s 的悲观下行带宽)。
+    const sizeMb = (file.size || 0) / (1024 * 1024)
+    const uploadTimeoutMs = Math.min(
+      30 * 60 * 1000,
+      Math.max(5 * 60 * 1000, Math.ceil((sizeMb / 50) * 60 * 1000)),
+    )
     const resp = await apiFetch('/api/uploads', {
       method: 'POST',
       headers: authHeaders({
@@ -108,6 +116,7 @@ async function _uploadOne(att, file) {
       }),
       body: file,
       signal: ctrl.signal,
+      timeout: uploadTimeoutMs,
     })
     if (!resp.ok) {
       const text = await resp.text().catch(() => '')

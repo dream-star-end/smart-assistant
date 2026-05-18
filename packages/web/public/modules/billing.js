@@ -34,6 +34,7 @@
 //                          返回 Promise<{ shown: boolean, credits: string|null }>
 
 import { apiGet, apiJson } from './api.js?v=12c501c2'
+import { _isMobileUA } from './dom.js?v=12c501c2'
 import { closeModal, openModal, toast } from './ui.js?v=12c501c2'
 import { state } from './state.js?v=12c501c2'
 
