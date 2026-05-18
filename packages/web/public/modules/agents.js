@@ -1,9 +1,9 @@
-import { apiGet, apiJson } from './api.js?v=cfaa0e5d'
+import { apiGet, apiJson } from './api.js?v=12c501c2'
 // OpenClaude — Agents
-import { $, htmlSafeEscape } from './dom.js?v=cfaa0e5d'
-import { renderModePills } from './effortMode.js?v=cfaa0e5d'
-import { getSession, state } from './state.js?v=cfaa0e5d'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=cfaa0e5d'
+import { $, htmlSafeEscape } from './dom.js?v=12c501c2'
+import { renderModePills } from './effortMode.js?v=12c501c2'
+import { getSession, state } from './state.js?v=12c501c2'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=12c501c2'
 
 // modelPicker.renderModelPill 的 late-binding setter — 避免 modelPicker.js
 // (依赖本模块的 reloadAgents)与本模块互相 import 形成循环。
@@ -196,5 +196,21 @@ export async function openPersonaEditor(agentId) {
     openModal('persona-modal')
   } catch (err) {
     toast(String(err), 'error', toastOptsFromError(err))
+  }
+}
+
+// persona-model-preset 下拉变化 → 同步到 #persona-model 输入框。
+// 原 inline onchange 移到这里:CSP 收紧 'unsafe-inline' 时仍可工作。
+// 模块顶层一次性绑定 — element 是 index.html 静态节点,ES module deferred
+// 加载时 DOM 已完整解析,无时序问题、无累积绑定。
+{
+  const _preset = document.getElementById('persona-model-preset')
+  if (_preset) {
+    _preset.addEventListener('change', () => {
+      const v = _preset.value
+      if (!v) return
+      const model = document.getElementById('persona-model')
+      if (model) model.value = v
+    })
   }
 }

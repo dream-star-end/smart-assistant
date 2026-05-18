@@ -28,14 +28,14 @@
 //   - 个人版 (master) 不带 commercial 路由 — /api/me 会 404,balance pill 自动保持隐藏。
 //
 // 模块外部接口(在 main.js 的 init 中调一次):
-//   import { initBilling, refreshBalance } from './billing.js?v=cfaa0e5d'
+//   import { initBilling, refreshBalance } from './billing.js?v=12c501c2'
 //   initBilling()        — 一次性 wire 静态 DOM 事件
 //   refreshBalance()     — 拉一次 /api/me,更新 pill;失败静默(commercial 未启用时)
 //                          返回 Promise<{ shown: boolean, credits: string|null }>
 
-import { apiGet, apiJson } from './api.js?v=cfaa0e5d'
-import { closeModal, openModal, toast } from './ui.js?v=cfaa0e5d'
-import { state } from './state.js?v=cfaa0e5d'
+import { apiGet, apiJson } from './api.js?v=12c501c2'
+import { closeModal, openModal, toast } from './ui.js?v=12c501c2'
+import { state } from './state.js?v=12c501c2'
 
 // ── 常量 ───────────────────────────────────────────────────────────
 const POLL_INTERVAL_MS = 3000
@@ -62,19 +62,6 @@ let _expiryCountdownTimer = null
 
 // ── 工具 ────────────────────────────────────────────────────────────
 function $(id) { return document.getElementById(id) }
-
-/**
- * 粗略判断当前设备是否应走"H5 拉起微信支付"路径而不是扫码。
- * 虎皮椒返回的 `mobile_url` 是 wap 收银台 H5,手机浏览器 `location.href=` 过去会触发
- * "调起微信" 流程,用户无需截图/长按识别二维码(且微信内置浏览器本身禁止识别页面二维码)。
- * 判定保守:只认 iPhone / iPad / Android Mobile,其它(Windows/macOS/平板 landscape)
- * 仍走 PC 二维码。误判 PC 为 mobile 会把用户带到 H5 → 体验退化;误判 mobile 为 PC
- * 用户还能截图扫,但微信内浏览器无法识别。两害相权,保守一点没有实际损失。
- */
-function _isMobileUA() {
-  const ua = navigator.userAgent || ''
-  return /iPhone|iPad|iPod|Android.*Mobile/i.test(ua)
-}
 
 /**
  * 校验上游 mobile_url 只允许 http(s) + 虎皮椒域名。失败返回 null,调用方必须 fallback。

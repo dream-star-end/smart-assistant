@@ -54,6 +54,7 @@ import {
   type RequestContext,
 } from './handlers.js'
 import { containerFileProxy } from './containerFileProxy.js'
+import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
 import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
@@ -382,20 +383,26 @@ export type CommercialHandler = (req: IncomingMessage, res: ServerResponse) => P
  * 都是 HTTP REST,没有 WS upgrade。
  *
  * 导出给 middleware/maintenanceMode 复用(同一 token 提取逻辑,避免漂移)。
+ *
+ * **策略**:Bearer header 优先,缺则回落到 `oc_session` cookie。这是 WS auth /
+ * maintenanceMode / 普通 REST 的默认。v1.0.159 起,`/api/media-sign` 因 boss
+ * 把 HttpOnly cookie 定为浏览器会话权威源(消除 split-brain),走自己的 **cookie
+ * 优先 + Bearer 兜底 + dual verify** 策略,不复用本 helper —— 见 handleMediaSign。
+ *
+ * 实现细节:Bearer / Cookie 各自的字面量解析下放到 `authHelpers.ts`,本函数只
+ * 拼策略 + bearer-first 默认。
+ *
+ * **行为微调(v1.0.159)**:旧 inline 实现 `Authorization` 非空就直接当 token 用
+ * (含 `Basic xxx` / 其他 scheme),后续 verify 必然失败 → 等同 401。新版 `getBearerToken`
+ * 只在严格匹配 `^Bearer\s+` 时返回 token,其他 scheme → 空 → 回落 cookie 再试一次。
+ * 不构成安全漏洞(cookie 自身仍走 verify),也跟"Bearer 兜底"语义更对齐。
+ * 注:此 helper 跟 `/api/media-sign` 的 cookie-first 策略**反向**,两条路径各自
+ * doc 自洽,不互相覆盖。
  */
 export function extractTokenFromReq(req: IncomingMessage): string {
-  const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, '') ?? ''
-  if (authHeader) return authHeader
-  const cookieHeader = req.headers.cookie ?? ''
-  const cookies = cookieHeader.split(';').reduce(
-    (acc, c) => {
-      const [k, ...v] = c.trim().split('=')
-      if (k) acc[k] = v.join('=')
-      return acc
-    },
-    {} as Record<string, string>,
-  )
-  return cookies.oc_session || ''
+  const bearer = getBearerToken(req)
+  if (bearer) return bearer
+  return getSessionCookieToken(req)
 }
 
 type RouteHandler = (

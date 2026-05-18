@@ -13,22 +13,44 @@
 //   5. `invalidateSignCache(absPath)` 用于 `<img onerror>` 路径检测到签名过期时
 //      主动失效,触发重签
 //
-// **不依赖 `apiFetch`**:故意走原生 `fetch` + `Authorization: Bearer`,避免 401
-// retry/refresh 这条复杂路径污染图片签名 — 签名失败就 fail-silent(签不到原样
-// 透明占位),而不是触发"会话过期"全屏跳转。会话过期由其他正常 API 调用先触发。
+// **2026-05-18 v1.0.159 架构修复**(d1193355375 华为浏览器 case):服务端
+// `handleMediaSign` 现 cookie-first + Bearer 兜底 + dual verify。前端**双带**:
+//   - `credentials: 'same-origin'` —— 浏览器自动带 HttpOnly `oc_session` cookie
+//     (权威源,生命周期跟 access JWT 绑死,通过 mintSessionCookie 自动续)
+//   - `Authorization: Bearer ${state.token}`(if state.token 非空)—— 兜底通道,
+//     给"cookie 还没 mint 到位 / 浏览器丢 cookie"窄窗口
+//
+// 任一通过即放行。这消除了之前 "state.token 在内存里漂移导致 75min Bearer 全
+// stale" 的 split-brain(`/api/file` 是 cookie 直链,本来就免疫;现在 media-sign
+// 也跟过来,走同一份浏览器权威 auth state)。
+//
+// **不再做** silentRefresh 兜底 / 401 retry —— cookie 是浏览器原生,JS 救不了
+// 它失效;cookie 真过期了说明 access JWT 也过期,其他高频 API(WS / refreshBalance /
+// syncSessionsFromServer)会先触发全局 silentRefresh,cookie 跟着更新。
+// media-sign 自己 retry 救不了"全局都没 refresh"的 case,fail-silent + toast
+// 提示用户重试即可。
 //
 // 单 path → URL 的 dedupe 在 pending queue 里做:同一 path 在被 flush 之前的
 // 50ms 窗口内不会发两次请求。已 flush 进 inflight 的 batch 不再合并新 caller,
 // 后者会另起下一批 —— 这是 batching 的边界,不是 bug。
 //
-// 2026-05-17 interactive 双入口:背景预签(默认 interactive=false)沿用 fail-silent;
-// 用户点击下载等主动操作传 `{ interactive: true }`,token 缺 / 401 时主动一次
-// `silentRefresh()` 兜底,刷新失败再 fail-silent。批次内只要有一个 interactive
-// waiter,refresh 路径就启用(同 path 的 non-interactive waiter 搭车成功 —— 良性)。
-// 预签**单独**运行时零回归。
+// `signMediaPath(absPath, opts)` 的 `opts.interactive` 参数**保留但 inert**:
+// 历史上(v1.0.156)用来区分背景预签 vs 用户点击,以便后者触发 silentRefresh
+// 兜底。v1.0.159 改双带 cookie 后两路逻辑一致,但接口签名保留以避免 call-site
+// (main.js doc-card / markdown 渲染)同步改动。下个版本可清理。
+//
+// **2026-05-18 v1.0.158 step diag**(保留):每个 batch 生成 `diagId`,以
+// `x-oc-diag-id` header 传到服务端,服务端 `media_sign_auth_fail` log 用同一 ID
+// join。本地写 `_lastFlushDiag` LRU(瘦身字段:`diag_id` / `outcome` /
+// `http_status` / `failure_path`),main.js doc-card click handler 通过
+// `getLastFlushDiagForPath(absPath)` 取快照,连同 device 字段打 `trace('media_sign_fail')`。
+//
+// **不变量**:diag 快照必须在 `resolve(null)` / `resolve(url)` 调用**之前**
+// 同步落 `_lastFlushDiag`。这样 click handler 紧跟 await 恢复就能读到这一批
+// 自己的快照,不会赌 race。
 
 import { state } from './state.js'
-import { silentRefresh } from './api.js?v=cfaa0e5d'
+import { silentRefresh } from './api.js?v=12c501c2'
 
 /** 服务端 batch 上限(packages/commercial/src/http/mediaSign.ts MEDIA_SIGN_BATCH_MAX) */
 const MAX_BATCH_PATHS = 32
@@ -109,6 +131,65 @@ let _flushTimer = null
 let _inflightCount = 0
 const _MAX_INFLIGHT_BATCHES = 4 // 同时最多 4 个批次飞,避免突发"100 张图"压塌
 
+// ── 诊断快照 (v1.0.158 step diag, v1.0.159 字段瘦身) ──
+// _lastFlushDiag: Map<absPath, DiagSnapshot> — 一个 batch 完成时把该 batch 的
+// 步骤快照 link 到所有 paths(同一引用),按 LRU 保留最近 _MAX_DIAG_HISTORY 个
+// path 的快照。供 main.js doc-card click 失败分支查询。
+//
+// **不存 token / claims / 任何 PII** —— 只存 outcome / http_status / failure_path。
+// path 本身不入快照(已经是 key)。
+//
+// **容量 = 2 × MAX_BATCH_PATHS(32)= 64**:单批 32 path 写入后立刻 prune 到 16
+// 会自驱逐本批前半 path 的快照,click handler 读到 no_snapshot。容量必须 ≥ batch
+// 上限,加倍兜下"用户点击发生在下一批 flush 完之后"的窄窗。
+//
+// **v1.0.159 字段变更**:cookie-first 架构落地后,initial_token_present /
+// preflight_refresh_* / retry_* 等字段语义消失(没有 silentRefresh / retry 路径
+// 了),删掉。保留 diag_id / outcome / http_status / failure_path 四元组,与
+// 服务端 media_sign_auth_fail 日志通过 diag_id join 仍有效。
+const _MAX_DIAG_HISTORY = 64
+const _lastFlushDiag = new Map()
+
+function _newDiagId() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID()
+    }
+  } catch {}
+  // 老 Chromium 内核(华为浏览器 / 小程序 webview 等)可能没有 randomUUID。
+  // 不写"伪 UUID"形态,显式 `f-` 前缀让日志一眼看出这是 fallback,避免诊断时
+  // 误以为是真 UUID。
+  return `f-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+function _saveDiagForBatch(batch, snapshot) {
+  for (const path of batch) {
+    if (_lastFlushDiag.has(path)) _lastFlushDiag.delete(path)
+    _lastFlushDiag.set(path, snapshot)
+  }
+  while (_lastFlushDiag.size > _MAX_DIAG_HISTORY) {
+    const oldestKey = _lastFlushDiag.keys().next().value
+    if (oldestKey === undefined) break
+    _lastFlushDiag.delete(oldestKey)
+  }
+}
+
+/**
+ * 取这个 path 最近一次 batch flush 的诊断快照(可能为 null 如果 path 没经过
+ * flush,或被 LRU 挤掉)。main.js doc-card click 失败分支用此 join trace 上报。
+ *
+ * 快照字段(v1.0.159 瘦身后,全部 nullable):
+ *   - diag_id      `x-oc-diag-id` 同一 ID,与服务端 media_sign_auth_fail log join
+ *   - outcome      'ok' | 'http' | 'network_err'
+ *   - http_status  HTTP status code(network_err 时 null)
+ *   - failure_path 'http_401' | 'http_other' | 'network' | 'bad_json'
+ *                  | 'missing_urls' | null(成功)
+ */
+export function getLastFlushDiagForPath(absPath) {
+  if (!absPath || typeof absPath !== 'string') return null
+  return _lastFlushDiag.get(absPath) ?? null
+}
+
 function _scheduleFlush() {
   if (_flushTimer !== null) return
   _flushTimer = setTimeout(() => {
@@ -127,16 +208,9 @@ async function _flushOne() {
   // 取出一批,至多 MAX_BATCH_PATHS
   const batch = []
   const waiters = new Map() // path → array of {resolve, interactive}
-  let batchInteractive = false
   for (const [path, list] of _pending) {
     batch.push(path)
     waiters.set(path, list)
-    for (const w of list) {
-      if (w.interactive) {
-        batchInteractive = true
-        break
-      }
-    }
     if (batch.length >= MAX_BATCH_PATHS) break
   }
   for (const p of batch) _pending.delete(p)
@@ -145,60 +219,65 @@ async function _flushOne() {
   if (_pending.size > 0) _scheduleFlush()
 
   _inflightCount++
+  // v1.0.158 step diag(v1.0.159 字段瘦身) —— 整批共享一份快照(同一引用),
+  // flush 完成时按 LRU 落到 _lastFlushDiag。失败时填 failure_path,成功留 null。
+  const diagId = _newDiagId()
+  const diag = {
+    diag_id: diagId,
+    outcome: null, // 'ok' | 'http' | 'network_err'
+    http_status: null,
+    failure_path: null,
+  }
   let data = null
   let httpErr = null
   try {
-    let token = state.token || ''
-    // interactive 路径:token 缺 → 主动一次 silentRefresh 兜底。background 路径
-    // 保持原行为(token 缺直接 fail-silent,会话过期由其他 API 触发)。
-    if (!token && batchInteractive) {
-      try {
-        const ok = await silentRefresh()
-        if (ok) token = state.token || ''
-      } catch {}
+    // v1.0.159 双带:cookie(`credentials: 'same-origin'` 自动带 oc_session)+
+    // Bearer(if state.token 非空,兜底通道,给"cookie 还没 mint 到位 / 浏览器
+    // 丢 cookie"窄窗)。任一过即服务端 200。state.token 即使是 stale,服务端
+    // cookie-first 策略会先验 cookie,Bearer 只在 cookie 不通过时兜底。
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-oc-diag-id': diagId,
     }
-    if (!token) {
-      // 仍无 token — 真未登录或 refresh 失败,fail-silent
-      throw new Error('no-token')
-    }
-    let res = await fetch('/api/media-sign', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ paths: batch }),
-    })
-    // interactive 路径:401 → silentRefresh + 重试一次。仍 401 / 失败 → fail-silent。
-    // 网络异常不重试(refresh 救不了链路;用户重点一下行为一致)。
-    if (res.status === 401 && batchInteractive) {
-      try {
-        const ok = await silentRefresh()
-        if (ok) {
-          const newToken = state.token || ''
-          if (newToken) {
-            res = await fetch('/api/media-sign', {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${newToken}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({ paths: batch }),
-            })
-          }
-        }
-      } catch {}
+    const token = state.token || ''
+    if (token) headers.Authorization = `Bearer ${token}`
+    let res
+    try {
+      res = await fetch('/api/media-sign', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers,
+        body: JSON.stringify({ paths: batch }),
+      })
+      diag.http_status = res.status
+      diag.outcome = res.ok ? 'ok' : 'http'
+    } catch (e) {
+      diag.outcome = 'network_err'
+      diag.failure_path = 'network'
+      throw e
     }
     if (!res.ok) {
+      diag.failure_path = res.status === 401 ? 'http_401' : 'http_other'
       httpErr = new Error(`media-sign HTTP ${res.status}`)
     } else {
       data = await res.json().catch(() => null)
+      if (!data || typeof data !== 'object') {
+        diag.failure_path = 'bad_json'
+      } else if (!data.urls) {
+        diag.failure_path = 'missing_urls'
+      }
     }
   } catch (e) {
     httpErr = e
+    if (!diag.failure_path) diag.failure_path = 'network' // 兜底未分类
   } finally {
     _inflightCount--
   }
+
+  // **不变量(Codex SHOULD)**:diag 必须在 resolve waiters 之前同步落到
+  // _lastFlushDiag,这样 click handler `await signMediaPath()` 恢复时按事件
+  // 循环顺序保证读到这一批自己的快照。
+  _saveDiagForBatch(batch, diag)
 
   if (httpErr || !data || typeof data !== 'object' || !data.urls) {
     // 全员 resolve(null) — markdown 端把 null 当 fail-silent,保持占位图;
@@ -230,10 +309,10 @@ async function _flushOne() {
  *
  * @param {string} absPath  容器内绝对路径(e.g. `/home/agent/.openclaude/...`)
  * @param {{ interactive?: boolean }} [opts]
- *   - `interactive=false`(默认):背景预签,token 缺 / 401 → fail-silent
- *   - `interactive=true`:用户主动操作(如 doc-card click),token 缺 / 401 时
- *     主动一次 `silentRefresh()` 兜底再重试;批次内只要有 1 个 interactive
- *     waiter,refresh 路径就启用(同 path 的 non-interactive waiter 搭车成功)。
+ *   `interactive` 参数 **v1.0.159 起 inert**(签名保留,call-site 不动)。
+ *   历史上(v1.0.156)区分背景预签 vs 用户点击,后者会触发 silentRefresh 兜底。
+ *   v1.0.159 改"cookie 优先 + Bearer 兜底"双带方案后,服务端能直接靠浏览器
+ *   权威 cookie 验签,前端不再需要 refresh 兜底,两路逻辑一致。下个版本清理。
  */
 export function signMediaPath(absPath, opts) {
   if (!absPath || typeof absPath !== 'string') {
@@ -242,6 +321,8 @@ export function signMediaPath(absPath, opts) {
   const cached = _cacheGet(absPath)
   if (cached) return Promise.resolve(cached)
 
+  // interactive 仍读但不再分叉走 silentRefresh 路径。waiter 上仍记 flag,留给
+  // 未来 diag/observability 用(成本 0)。
   const interactive = opts?.interactive === true
   return new Promise((resolve) => {
     let list = _pending.get(absPath)

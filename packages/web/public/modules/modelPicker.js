@@ -20,12 +20,12 @@
 // 之前的 PUT /api/agents/:id { model } 路径被 v3 多租户防火墙 BLOCKED_FOR_USER
 // 拦截(只有 host admin 能改 agent 配置),因此切换不到这条路。
 
-import { apiJson } from './api.js?v=cfaa0e5d'
-import { $ } from './dom.js?v=cfaa0e5d'
-import { renderModePills } from './effortMode.js?v=cfaa0e5d'
-import { getSession, state } from './state.js?v=cfaa0e5d'
-import { toast, toastOptsFromError } from './ui.js?v=cfaa0e5d'
-import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=cfaa0e5d'
+import { apiJson } from './api.js?v=12c501c2'
+import { $ } from './dom.js?v=12c501c2'
+import { renderModePills } from './effortMode.js?v=12c501c2'
+import { getSession, state } from './state.js?v=12c501c2'
+import { toast, toastOptsFromError } from './ui.js?v=12c501c2'
+import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=12c501c2'
 
 // ── 当前选择(prefs 优先,否则 agent.model)─────────────────────────
 
@@ -142,10 +142,16 @@ function detachGlobalListeners() {
   }
 }
 
+const POPUP_SOURCE = 'model'
+
 async function openMenu(focusFirst = false) {
   const trigger = getTrigger()
   const menu = getMenu()
   if (!trigger || !menu) return
+  // 通知 composer 同栏其他 popup(effortMode)先关闭,避免双开重叠
+  document.dispatchEvent(
+    new CustomEvent('composer-popup-opening', { detail: { source: POPUP_SOURCE } }),
+  )
   await ensureMenuRendered()
   positionMenu()
   menu.hidden = false
@@ -338,6 +344,10 @@ export function initModelPicker(_opts = {}) {
         }
       }
     }
+  })
+  // 同栏其他 popup 打开时,关闭本菜单(B4 dual menu 修复)
+  document.addEventListener('composer-popup-opening', (e) => {
+    if (e.detail?.source !== POPUP_SOURCE && isMenuOpen()) closeMenu(false)
   })
   _wired = true
   renderModelPill()

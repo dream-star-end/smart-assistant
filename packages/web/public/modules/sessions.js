@@ -1,17 +1,17 @@
-import { clearAttachments } from './attachments.js?v=cfaa0e5d'
-import { dbDelete, dbPut } from './db.js?v=cfaa0e5d'
+import { clearAttachments } from './attachments.js?v=12c501c2'
+import { dbDelete, dbPut } from './db.js?v=12c501c2'
 // OpenClaude — Session management, sidebar, context menu
-import { $, htmlSafeEscape } from './dom.js?v=cfaa0e5d'
-import { exportSessionDocx } from './export-docx.js?v=cfaa0e5d'
-import { exportSessionTex } from './export-tex.js?v=cfaa0e5d'
-import { refreshGithubPill } from './github.js?v=cfaa0e5d'
-import { setTitleBusy } from './notifications.js?v=cfaa0e5d'
-import { getSession, state } from './state.js?v=cfaa0e5d'
-import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=cfaa0e5d'
-import { toast } from './ui.js?v=cfaa0e5d'
-import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=cfaa0e5d'
-import { nudgeDrain } from './websocket.js?v=cfaa0e5d'
-import { trace, flushTrace } from './trace.js?v=cfaa0e5d'
+import { $, htmlSafeEscape } from './dom.js?v=12c501c2'
+import { exportSessionDocx } from './export-docx.js?v=12c501c2'
+import { exportSessionTex } from './export-tex.js?v=12c501c2'
+import { refreshGithubPill } from './github.js?v=12c501c2'
+import { setTitleBusy } from './notifications.js?v=12c501c2'
+import { getSession, state } from './state.js?v=12c501c2'
+import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=12c501c2'
+import { toast } from './ui.js?v=12c501c2'
+import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=12c501c2'
+import { nudgeDrain } from './websocket.js?v=12c501c2'
+import { trace, flushTrace } from './trace.js?v=12c501c2'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -623,9 +623,9 @@ export function _buildSessionItem(s) {
     ])
   }
 
-  // Mobile long-press
+  // Mobile long-press — passive listeners so sidebar scroll on touch isn't blocked
   let _lpt = null
-  item.ontouchstart = (e) => {
+  item.addEventListener('touchstart', (e) => {
     _lpt = setTimeout(() => {
       const touch = e.touches[0]
       showContextMenu(touch.clientX, touch.clientY, [
@@ -652,9 +652,9 @@ export function _buildSessionItem(s) {
         },
       ])
     }, 600)
-  }
-  item.ontouchend = () => clearTimeout(_lpt)
-  item.ontouchmove = () => clearTimeout(_lpt)
+  }, { passive: true })
+  item.addEventListener('touchend', () => clearTimeout(_lpt), { passive: true })
+  item.addEventListener('touchmove', () => clearTimeout(_lpt), { passive: true })
 
   return item
 }
@@ -676,10 +676,11 @@ export function startInlineRename(titleEl, sess) {
   }
   input.onblur = finish
   input.onkeydown = (e) => {
-    if (e.key === 'Enter') {
+    // IME 期放行,避免 Enter/Esc 半成品 commit 或误回滚标题
+    if (e.key === 'Enter' && !e.isComposing) {
       e.preventDefault()
       input.blur()
-    } else if (e.key === 'Escape') {
+    } else if (e.key === 'Escape' && !e.isComposing) {
       input.value = sess.title
       input.blur()
     }

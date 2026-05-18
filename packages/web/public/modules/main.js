@@ -3,20 +3,11 @@
 // This file exports nothing; it IS the application.
 
 // ── DOM utilities ──
-import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=cfaa0e5d'
-import { invalidateSignCache, signMediaPath } from './mediaSign.js?v=cfaa0e5d'
+import { $, _isMac, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=12c501c2'
+import { invalidateSignCache, signMediaPath } from './mediaSign.js?v=12c501c2'
 
 // ── Pure utilities ──
-import {
-  GROUP_ORDER,
-  _basename,
-  _cronHuman,
-  formatSize,
-  msgId,
-  sessionGroup,
-  shortTime,
-  uuid,
-} from './util.js?v=cfaa0e5d'
+import { formatSize, msgId, shortTime } from './util.js?v=12c501c2'
 
 // ── App state ──
 import {
@@ -24,11 +15,10 @@ import {
   _clearStoredAccessToken,
   _writeStoredAccessToken,
   getSession,
-  isSending,
   setSending,
   state,
   tryEnqueueOffline,
-} from './state.js?v=cfaa0e5d'
+} from './state.js?v=12c501c2'
 
 // ── API layer ──
 import {
@@ -43,29 +33,22 @@ import {
   scheduleProactiveRefresh,
   silentRefresh,
   snapshotDiagnostics,
-} from './api.js?v=cfaa0e5d'
+} from './api.js?v=12c501c2'
 
 // ── IndexedDB ──
-import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js?v=cfaa0e5d'
+import { dbDelete, dbGetAll, onIdbUnavailable } from './db.js?v=12c501c2'
 
 // ── Cross-device sync ──
-import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=cfaa0e5d'
+import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=12c501c2'
 
 // ── Diagnostic trace (d1193355375 "已读但无回复" instrumentation) ──
-import { flushTrace } from './trace.js?v=cfaa0e5d'
+import { flushTrace } from './trace.js?v=12c501c2'
 
 // ── Theme ──
-import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js?v=cfaa0e5d'
+import { applyTheme, cycleTheme, setToastFn } from './theme.js?v=12c501c2'
 
 // ── Markdown / rich rendering ──
-import {
-  _imgHtml,
-  _renderLocalMedia,
-  embedMediaUrls,
-  localPathToUrl,
-  processRichBlocks,
-  renderMarkdown,
-} from './markdown.js?v=cfaa0e5d'
+import { _renderLocalMedia, processRichBlocks, renderMarkdown } from './markdown.js?v=12c501c2'
 
 // ── UI helpers ──
 import {
@@ -75,29 +58,16 @@ import {
   openModal,
   toast,
   toastOptsFromError,
-} from './ui.js?v=cfaa0e5d'
+} from './ui.js?v=12c501c2'
 
 // ── Attachments ──
-import {
-  addFiles,
-  classifyFile,
-  clearAttachments,
-  fileToDataURL,
-  fileToText,
-  removeAttachment,
-  renderAttachments,
-} from './attachments.js?v=cfaa0e5d'
+import { addFiles, clearAttachments } from './attachments.js?v=12c501c2'
 
 // ── Speech recognition ──
-import { initSpeech, setAutoResize, toggleVoice } from './speech.js?v=cfaa0e5d'
+import { setAutoResize, toggleVoice } from './speech.js?v=12c501c2'
 
 // ── Notifications ──
-import {
-  maybeNotify,
-  refreshDocumentTitle,
-  requestNotifyPermission,
-  setTitleBusy,
-} from './notifications.js?v=cfaa0e5d'
+import { refreshDocumentTitle, setTitleBusy } from './notifications.js?v=12c501c2'
 
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
@@ -108,30 +78,30 @@ import {
   mintSessionCookie,
   setMode as setAuthMode,
   onLoginSuccess as setAuthSuccessHandler,
-} from './auth.js?v=cfaa0e5d'
-// ?v=cfaa0e5d bust: websocket.js now imports billing.js for refreshBalance() after
+} from './auth.js?v=12c501c2'
+// ?v=12c501c2 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=cfaa0e5d'
-import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=cfaa0e5d'
-import { startInbox, stopInbox } from './inbox.js?v=cfaa0e5d'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=12c501c2'
+import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=12c501c2'
+import { startInbox, stopInbox } from './inbox.js?v=12c501c2'
 // ── OAuth ──
-import { initOAuthListeners, openOAuthModal } from './oauth.js?v=cfaa0e5d'
+import { initOAuthListeners, openOAuthModal } from './oauth.js?v=12c501c2'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { initUsageStats, openUsageModal } from './usageStats.js?v=cfaa0e5d'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=12c501c2'
 import {
   clearUserPrefsCache,
   initUserPrefs,
   loadUserPrefs,
   openPrefsModal,
   setOnPrefsChanged,
-} from './userPrefs.js?v=cfaa0e5d'
-import { initWechatListeners, openWechatModal } from './wechat.js?v=cfaa0e5d'
+} from './userPrefs.js?v=12c501c2'
+import { initWechatListeners, openWechatModal } from './wechat.js?v=12c501c2'
 
 // ── Memory & Skills ──
-import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=cfaa0e5d'
+import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=12c501c2'
 
 // ── Phase 6 GitHub repo binding ──
 import {
@@ -141,36 +111,25 @@ import {
   openGithubModal,
   refreshGithubPill,
   wireGithubModalButtons,
-} from './github.js?v=cfaa0e5d'
+} from './github.js?v=12c501c2'
 
 // ── Scheduled tasks ──
-import {
-  initTasksListeners,
-  loadBgTasks,
-  loadExecLog,
-  openTasksModal,
-  switchTasksTab,
-} from './tasks.js?v=cfaa0e5d'
+import { initTasksListeners, openTasksModal } from './tasks.js?v=12c501c2'
 
 // ── Agents ──
 import {
   openPersonaEditor,
   reloadAgents,
   renderAgentDropdown,
-  renderAgentsManagementList,
   setRenderModelPill,
-} from './agents.js?v=cfaa0e5d' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=12c501c2' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
-  _buildSessionItem,
   _rebuildSearchIndex,
   createSession,
-  deleteSession,
   enqueueSaveForRetry,
-  exportSessionMd,
   flushPendingSaves,
-  hideContextMenu,
   renderSidebar,
   restoreCurrentSessionInFlightUI,
   sanitizeLoadedTurnState,
@@ -178,37 +137,29 @@ import {
   scheduleSaveFromUserEdit,
   setSessionDeps,
   setSessionUIDeps,
-  showContextMenu,
-  startInlineRename,
   switchSession,
-} from './sessions.js?v=cfaa0e5d'
+} from './sessions.js?v=12c501c2'
 
 // ── Messages ──
 import {
-  _buildMessageEl,
   _deriveUserMsgStatus,
   ensureInner,
   initMessagesListeners,
-  isAtBottom,
   renderMessage,
   renderMessages,
-  renderMetaInto,
   scrollBottom,
   setMessageDeps,
   updateMessageEl,
   updateMsgMetaEl,
   updateSessionSub,
-} from './messages.js?v=cfaa0e5d'
+} from './messages.js?v=12c501c2'
 
 // ── WebSocket ──
 import {
   _renderTasksPanel,
-  addBgTask,
   addMessage,
   addSystemMessage,
-  buildToolUseLabel,
   clearTurnTiming,
-  completeBgTask,
   connect,
   formatMeta,
   handleOutbound,
@@ -220,14 +171,12 @@ import {
   resetThinkingSafety,
   safeWsSend,
   setProvisioningBanner,
-  setStatus,
   setWsDeps,
   showTypingIndicator,
   stopCurrentTurn,
-  updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=cfaa0e5d'
+} from './websocket.js?v=12c501c2'
 
 // ── Slash commands ──
 import {
@@ -240,18 +189,18 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=cfaa0e5d'
+} from './commands.js?v=12c501c2'
 import {
   clearEffortOnLogout,
   getEffortForSubmit,
   initModePills,
   renderModePills,
-} from './effortMode.js?v=cfaa0e5d'
-import { initModelPicker, renderModelPill } from './modelPicker.js?v=cfaa0e5d'
+} from './effortMode.js?v=12c501c2'
+import { initModelPicker, renderModelPill } from './modelPicker.js?v=12c501c2'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
-// deploy where main.js?v=cfaa0e5d imports a bare-URL state.js that CF still serves
+// deploy where main.js?v=12c501c2 imports a bare-URL state.js that CF still serves
 // old), this line is never reached → watchdog fires at T+15s and self-heals.
 window.__ocBooted = true
 
@@ -717,6 +666,69 @@ document.addEventListener('click', (e) => {
   }
 })
 
+// ── v1.0.158 device fingerprint (doc-card 下载失败诊断) ──
+// 仅在 doc-card click 失败终态时调用一次。**绝不**写 token / 消息内容 / 完整路径,
+// 只读 navigator.* 公开属性 + 显式 storage 探测。字段集合是 Codex review pass
+// 的版本(收敛了无诊断价值的 platform/vendor/languages/tz_offset)。
+//
+// `stored_access_token_local_present` / `stored_access_token_session_present`
+// 只探测 storage 中 token key 是否存在,**不读 token 值**,用来区分:
+//   - state.token=false && storage 也空 → 真未登录
+//   - state.token=false 但 storage 有 token → hydrate / state 装载时序问题
+// 注意:storage 参数走 thunk(`() => localStorage`)而不是直接传 `localStorage`。
+// 受限 webview(file://、Cookie 关闭、隐私模式 Safari)下 **访问 `window.localStorage`
+// 这一步本身**会抛 SecurityError,如果在 helper 之外的实参位置就求值,异常发生
+// 在 helper 进入前,外层 try-catch 会把整条 trace 吞掉 —— 正好伤到最想诊断的
+// 浏览器环境(Codex round-2 BLOCKING)。thunk 让属性访问发生在 helper 内 try 内。
+function _safeStorageWritable(getStorage) {
+  try {
+    const s = getStorage()
+    const k = '_oc_probe_'
+    s.setItem(k, '1')
+    s.removeItem(k)
+    return true
+  } catch {
+    return false
+  }
+}
+function _safeStorageHasKey(getStorage, key) {
+  try {
+    const s = getStorage()
+    return !!s.getItem(key)
+  } catch {
+    return false
+  }
+}
+function _collectDeviceFingerprint() {
+  const ua = navigator.userAgent || ''
+  return {
+    ua: ua.length > 512 ? ua.slice(0, 512) : ua,
+    uahint_mobile: navigator.userAgentData?.mobile ?? null,
+    is_huawei_browser: /HuaweiBrowser/i.test(ua),
+    is_mobile_ua: _isMobileUA(),
+    language: navigator.language || null,
+    screen: {
+      w: screen.width || null,
+      h: screen.height || null,
+      dpr: window.devicePixelRatio || 1,
+    },
+    viewport: { w: window.innerWidth, h: window.innerHeight },
+    online: navigator.onLine,
+    cookie_enabled: navigator.cookieEnabled,
+    sw_active: !!navigator.serviceWorker?.controller,
+    storage_local_writable: _safeStorageWritable(() => localStorage),
+    storage_session_writable: _safeStorageWritable(() => sessionStorage),
+    stored_access_token_local_present: _safeStorageHasKey(
+      () => localStorage,
+      'openclaude_access_token',
+    ),
+    stored_access_token_session_present: _safeStorageHasKey(
+      () => sessionStorage,
+      'openclaude_access_token',
+    ),
+  }
+}
+
 // ── doc-card 点击 race 拦截 ──
 // 容器文件 doc-card 走异步签名(markdown.js _renderLocalMedia + main.js
 // _resolveSignTarget)。卡片刚渲染时 href 还没填,用户秒点会"无反应"。
@@ -738,10 +750,29 @@ document.addEventListener(
 
     card.classList.add('doc-card-pending')
     try {
-      // interactive:用户主动操作,token 缺 / 401 时让 signMediaPath 主动一次
-      // silentRefresh 兜底,避免登录后首次点击窄窗口落 toast(2026-05-17 修复)
+      // v1.0.159:`interactive` 参数已 inert(cookie-first 后没有 silentRefresh
+      // retry 这条路径,签名失败即返)。保留 call-site `interactive: true` 仅为
+      // 兼容 signMediaPath 签名,不影响行为。详见 mediaSign.js JSDoc。
       const url = await signMediaPath(absPath, { interactive: true })
       if (!url) {
+        // ── v1.0.158 step diag —— 失败终态上报 ──
+        // 把 mediaSign 这一批的步骤快照(diag_id / step outcomes / failure_path)
+        // 跟 device 指纹一起打 trace,立刻 flush 到 /api/web-trace pino log。
+        // 服务端 media_sign_auth_fail 用同一个 diag_id join 前后端日志。
+        // 失败用户在这一刻 cookie 大概率仍有效;真无效时 /api/web-trace 也不会
+        // 401(端点不做 auth gate,只 getUserId 退 'default')。
+        try {
+          const diag = getLastFlushDiagForPath(absPath)
+          trace('media_sign_fail', {
+            ...(diag || { diag_id: null, failure_path: 'no_snapshot' }),
+            has_token_at_click: !!state.token,
+            device: _collectDeviceFingerprint(),
+          })
+          // flushTrace 内部 try-catch + 5xx requeue,不抛;.catch 仅兜后续 await chain
+          flushTrace().catch(() => {})
+        } catch {
+          // 诊断埋点失败绝不阻塞用户可见 toast — 永远继续走 toast
+        }
         toast('下载链接获取失败,请重试')
         return
       }
@@ -760,6 +791,8 @@ document.addEventListener(
 
 // ── Escape key: close modals, lightbox, palette ──
 document.addEventListener('keydown', (e) => {
+  // IME 期 Esc 优先让给输入法取消候选,避免误关 palette/modal
+  if (e.isComposing) return
   if (e.key === 'Escape') {
     // Lightbox takes priority
     if (!$('lightbox').hidden) {
@@ -770,14 +803,6 @@ document.addEventListener('keydown', (e) => {
     // Close any open modal via closeModal (handles focus trap cleanup)
     document.querySelectorAll('.modal-backdrop.open').forEach((el) => closeModal(el.id))
     document.querySelectorAll('.palette-backdrop.open').forEach((el) => el.classList.remove('open'))
-  }
-})
-
-// Lightbox-specific Escape (separate listener that can stopPropagation)
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('lightbox').hidden) {
-    closeLightbox()
-    e.stopPropagation()
   }
 })
 
@@ -2599,7 +2624,8 @@ async function init() {
   // Input events -- single keydown handler for both slash popup and send
   $('input').addEventListener('keydown', (e) => {
     // Slash popup navigation takes priority when visible
-    if (slashPopupVisible) {
+    // IME 期(e.isComposing)放行到默认 / IME 处理,避免抢走 ↑↓/Tab/Enter
+    if (slashPopupVisible && !e.isComposing) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
         setSlashSelected(Math.min(getSlashSelected() + 1, getSlashMatches().length - 1))
@@ -2726,6 +2752,8 @@ async function init() {
     renderPalette()
   })
   $('palette-input').addEventListener('keydown', (e) => {
+    // IME 期放行,避免抢走 ↑↓/Enter
+    if (e.isComposing) return
     if (e.key === 'ArrowDown') {
       e.preventDefault()
       if (paletteItems.length) {
