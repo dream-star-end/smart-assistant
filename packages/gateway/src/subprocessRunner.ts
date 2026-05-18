@@ -707,7 +707,7 @@ export class SubprocessRunner extends EventEmitter {
 
     // Build merged extra system prompt via structured prompt slots
     try {
-      const promptContent = await buildPromptContext({
+      const promptResult = await buildPromptContext({
         agentId: this.opts.agentId,
         persona: this.opts.persona,
         provider: this.opts.agentProvider ?? this.opts.config.provider,
@@ -716,9 +716,9 @@ export class SubprocessRunner extends EventEmitter {
         // effort 切换本就会 recycle subprocess,新 runner 启动时会重建 extra-prompt.md。
         effortLevel: this.opts.effortLevel,
       })
-      if (promptContent) {
+      if (promptResult.content) {
         const path = resolve(sessionDir, 'extra-prompt.md')
-        writeFileSync(path, promptContent)
+        writeFileSync(path, promptResult.content)
         out.extraPromptFile = path
       }
     } catch (err) {

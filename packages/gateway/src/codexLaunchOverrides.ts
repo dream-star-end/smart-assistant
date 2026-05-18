@@ -4,7 +4,7 @@
  * Why this exists:
  *   ccb (Claude Code) goes through `subprocessRunner.ts`, which builds an
  *   `extra-prompt.md` from `buildPromptContext()` (SOUL/USER/AGENTS/SKILLS/
- *   MEMORY/TOOLS/RESEARCH slots) and an `mcp-config.json` mounting the
+ *   MEMORY/TOOLS/MODEL_HINT/RESEARCH/REPO slots) and an `mcp-config.json` mounting the
  *   `openclaude-memory` MCP server. Codex spawn paths (`codexRunner.ts`,
  *   `codexAppServerRunner.ts`) historically had **none** of that — naked
  *   codex CLI with only the user prompt. That made codex blind to the
@@ -250,19 +250,19 @@ export interface CodexLaunchOverrides {
 export async function buildCodexLaunchOverrides(
   ctx: CodexLaunchOverridesContext,
 ): Promise<CodexLaunchOverrides> {
-  // Build the platform context (same 7-slot pipeline ccb uses), prepend the
+  // Build the platform context (same 9-slot pipeline ccb uses), prepend the
   // codex-specific preamble. We do NOT add the preamble inside promptSlots
   // because that file is provider-agnostic and shouldn't carry adapter
   // concerns — keeping it here means promptSlots stays clean and the codex
   // adapter can evolve without touching the slot pipeline.
-  const platformContext = await buildPromptContext({
+  const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     persona: ctx.persona,
     provider: ctx.provider,
     model: ctx.model,
     effortLevel: ctx.effortLevel,
   })
-  const instructionsContent = `${CODEX_PREAMBLE}${platformContext}`
+  const instructionsContent = `${CODEX_PREAMBLE}${platformResult.content}`
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
 
   const argvOverrides: string[] = [
