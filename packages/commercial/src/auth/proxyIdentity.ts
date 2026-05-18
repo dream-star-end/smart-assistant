@@ -6,8 +6,13 @@
  * proxy handler 只通过 `deps.identity.resolve()` / `deps.identity.authorize()` 与之交互,
  * 不再直接 import containerIdentity / authzModels / hostReqCounter。
  *
- * 当前唯一实现:`makeContainerIdentityStrategy`(容器 token 双因子 + 容器宿主流量计数)。
- * 未来如接入 API-Key 类 strategy,只需新建一个 factory 返回同 IdentityStrategy 形状。
+ * 当前实现:
+ *   - `makeContainerIdentityStrategy`(本文件)— 容器 token 双因子 + 容器宿主流量计数
+ *   - `makeApiKeyIdentityStrategy`(`./apiKeyIdentity.ts`)— 2026-05-18 CC 外接 plan
+ *     Phase 2:Bearer `oc-cc.<prefix>.<secret>` token + `containerId: null` 路径
+ *
+ * 两者通过 `authorizeProxyIdentity`(本文件)共享同一份模型授权业务规则,
+ * 避免身份维度长出"两套 authz"。未来新增 strategy 也走同一函数。
  *
  * 行为等价性(原 anthropicProxy.ts 1124-1145 + 1152 + 1252-1277):
  *   - verify 失败 → IdentityError(code=原 ContainerIdentityError.code) → handler 401
@@ -138,6 +143,60 @@ export class AuthzDeniedError extends Error {
   }
 }
 
+/**
+ * 共享 authz 业务规则:不论身份从哪条 strategy 来(容器双因子 / API key),
+ * "uid 是否被授权使用 model" 的判定逻辑必须**完全一致**。
+ *
+ * 抽出独立函数(2026-05-18 CC 外接 plan Phase 2,Codex MINOR 命名采纳):
+ *   - 命名不叫 `defaultAuthorize` — 这不是"默认实现",而是两种 strategy
+ *     必须共享的业务规则;命名要体现这一点。
+ *   - 任何 future identity strategy 接入,都应直接调本函数,确保 authz
+ *     语义不分裂。这是消除"一类问题"的抽象,不是炫技。
+ *
+ * 行为契约:
+ *   - `loadUserModelAuthz` throw → `AuthzLoadError(cause)` → handler 500
+ *   - `canUseModel` false → `AuthzDeniedError(model, role)` → handler 403
+ *   - 成功 → void
+ *
+ * 注意:`pricing` 参数当前不被 canUseModel 直接消费(它内部走 deps.pricing
+ * 重新查表 + canonicalize)。保留参数贴合 IdentityStrategy.authorize 签名,
+ * 让"authorize 显式收 pricing"的契约在两个 strategy 里保持一致(Phase 2
+ * Codex 反馈)。
+ */
+export interface SharedAuthorizeDeps {
+  pricing: PricingCache;
+  loadUserModelAuthz: (
+    uid: bigint,
+  ) => Promise<{
+    role: "user" | "admin";
+    grantedModelIds: ReadonlySet<string>;
+  }>;
+}
+
+export async function authorizeProxyIdentity(
+  deps: SharedAuthorizeDeps,
+  identity: ProxyIdentity,
+  model: string,
+): Promise<void> {
+  let authz;
+  try {
+    authz = await deps.loadUserModelAuthz(identity.uid);
+  } catch (err) {
+    throw new AuthzLoadError(err);
+  }
+  const ok = canUseModel(
+    { pricing: deps.pricing },
+    {
+      role: authz.role,
+      grantedModelIds: authz.grantedModelIds,
+      modelId: model,
+    },
+  );
+  if (!ok) {
+    throw new AuthzDeniedError(model, authz.role);
+  }
+}
+
 export interface ContainerIdentityStrategyDeps {
   /** 容器身份双因子查询入口(默认 createPgIdentityRepo()) */
   repo: ContainerIdentityRepo;
@@ -203,23 +262,13 @@ export function makeContainerIdentityStrategy(
       };
     },
     async authorize(identity, _pricing, model) {
-      let authz;
-      try {
-        authz = await deps.loadUserModelAuthz(identity.uid);
-      } catch (err) {
-        throw new AuthzLoadError(err);
-      }
-      const ok = canUseModel(
-        { pricing: deps.pricing },
-        {
-          role: authz.role,
-          grantedModelIds: authz.grantedModelIds,
-          modelId: model,
-        },
+      // 共享 authz 业务规则(2026-05-18 CC 外接 plan Phase 2):任何 strategy
+      // 都走同一份 loadUserModelAuthz + canUseModel,避免身份维度的 authz 分裂。
+      await authorizeProxyIdentity(
+        { pricing: deps.pricing, loadUserModelAuthz: deps.loadUserModelAuthz },
+        identity,
+        model,
       );
-      if (!ok) {
-        throw new AuthzDeniedError(model, authz.role);
-      }
     },
   };
 }

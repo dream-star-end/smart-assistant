@@ -147,13 +147,16 @@ function generateApiKeySecret(): { prefix: string; secretHex: string; plaintext:
 }
 
 /**
- * Hash secret 入库。
+ * Hash secret — 入库(create)和 verify(Phase 2 strategy)都走这一个函数。
  *
  * **必须**对 `Buffer.from(secretHex, "hex")`(24 字节 raw)做 SHA-256,
  * **绝不**对 UTF-8 hex 字符串做 hash — 跟容器实现 `auth/containerIdentity.ts:111`
- * `hashSecret` 同型。Phase 2 verify 走同一函数。
+ * `hashSecret` 同型;两者必须一致,否则容器/外接两条认证路径会长出不一致行为。
+ *
+ * 暴露为命名 export(Phase 2 起):apiKeyIdentity strategy verify 时复用同函数,
+ * 让 "存入的 hash" 和 "验签算的 hash" 永远走同一代码路径,杜绝实现漂移。
  */
-function hashApiKeySecret(secretHex: string): Buffer {
+export function hashApiKeySecret(secretHex: string): Buffer {
   return createHash("sha256").update(Buffer.from(secretHex, "hex")).digest();
 }
 
