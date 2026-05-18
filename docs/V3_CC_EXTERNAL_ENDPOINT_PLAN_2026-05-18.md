@@ -138,7 +138,7 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 - exact match `path === '/api/anthropic/v1/messages'`(**不**用 `startsWith`)→ adapter:`req.url = "/v1/messages"`,合成 ctx,调 `apiKeyProxyHandler(req, res, syntheticCtx)`
 - `/api/anthropic/` namespace 下其他任何 path(`/v1/messages/foo`、`/v1/messages/`、`/v1/some-other`、`/`、`/foo`)→ router 兜底返 404 **不进** anthropicProxy handler。
 - handler 内部 path 白名单 `/v1/messages` 不动 — adapter 先做 path rewrite 再传给 handler。
-- `syntheticCtx = { hostUuid: "external-api-key", boundIp: clientIp }`(`hostUuid` 是固定串而非 SELF_HOST_UUID,便于 metric/log 区分流量来源;ApiKey 路径**不调** `recordHostRequest`,见 invariant #6)
+- `syntheticCtx = { hostUuid: "external-api-key", boundIp: "external-api-key" }`(两字段均为 sentinel string;`hostUuid` 用于 log/metric 区分流量来源,`boundIp` 改 sentinel 而非 clientIp —— ApiKey 路径无容器双因子绑定 IP 概念,sentinel 显式表明"无 IP 安全语义",避免误读;ApiKey 路径**不调** `recordHostRequest`,见 invariant #6 / Codex Phase 3 plan-review MINOR 2 采纳)
 
 **为什么不直接让 handler 白名单加 `/api/anthropic/v1/messages`?**
 - 加白名单意味着 anthropicProxy handler 知道自己暴露在 `/api` 前缀下,但实际它只在乎"是不是 messages 请求"
@@ -188,7 +188,7 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 - `auth/proxyIdentity.ts:39` 注释 `(future API key strategy 这里放 api_key_id)` 同步清理为 `containerId 为 null 表示非容器 strategy(如 ApiKeyIdentityStrategy)`(原注释跟本决策互斥,Codex MINOR #1 命中)
 - `billing/proxyBilling.ts:54` — `FinalizeContext.containerId`
 - `billing/proxyBilling.ts:140` — `startInflightJournal` SQL bind:`ctx.containerId === null ? null : ctx.containerId.toString()`
-- `http/proxy/index.ts` — handler 透传 + userLog 标签:`{ containerId: containerId?.toString() ?? "<api-key>" }`
+- `http/proxy/index.ts` — handler 透传 + userLog 标签直接保留真 `null`(`containerId === null ? null : containerId.toString()`);**不**用 `"<api-key>"` sentinel string 替换 —— 让结构化日志字段类型保持"ID 或 null",不漂成"ID 或 label",未来若需区分路径走独立 `identityKind` 字段(最终实现采纳此型,与 plan 早期草稿"<api-key>" 不同)
 
 **为什么不是补丁**:
 - 走"哨兵容器 ID" 是把 SQL FK 假数据塞进核心表,语义混乱,未来增删 strategy 都会绊倒人。
@@ -254,7 +254,7 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 
 - **router prefixes 数组扩展**(`http/router.ts:757-774`):新增 `'/api/anthropic/'`(注意**带尾斜杠**,namespace 而非单条 path)— **不加这一步,后续 exact route 永远走不到**(Codex v2 MAJOR #1);**namespace 而非单条 exact**,让 sibling path 也由本 router 兜底 404(Codex v3 MAJOR #1)
 - commercial router 内部 exact-match `path === '/api/anthropic/v1/messages'` → adapter(**非**前缀,invariant #5)
-- adapter:`req.url = "/v1/messages"` + 合成 ctx 注入(`hostUuid="external-api-key"`, `boundIp=clientIp`)
+- adapter:`req.url = "/v1/messages"` + 合成 ctx 注入(`hostUuid="external-api-key"`, `boundIp="external-api-key"` — 两字段均 sentinel,见 §3.2 / Codex Phase 3 plan-review MINOR 2)
 - 第二个 handler instance(deps.identity = ApiKeyIdentityStrategy)
 - integ test 模拟整链:
   - 正例:发送 valid API key → 走完 handler → 验 journal 写入(`container_id IS NULL`)+ SSE 返回
