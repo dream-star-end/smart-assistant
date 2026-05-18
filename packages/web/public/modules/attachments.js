@@ -3,7 +3,7 @@
 // 走 POST /api/uploads → 服务端 sha256-named 落盘 → 拿到 url。message 里只存 url 引用。
 // Text 仍按阈值二分:≤64KB 内联为 kind:'text'(走 buildMessageText),>64KB 重分类为
 // 'file' 同样上传。任何 _media[i].base64 字段都不应再产生。
-import { apiFetch, authHeaders } from './api.js?v=89a378f3'
+import { notifyAuthExpired, silentRefresh } from './api.js?v=89a378f3'
 import { $ } from './dom.js?v=89a378f3'
 import { state } from './state.js?v=89a378f3'
 import { toast } from './ui.js?v=89a378f3'
@@ -80,61 +80,177 @@ export function classifyFile(file) {
   return 'file'
 }
 
+// rAF / setTimeout-based throttle for progress-driven renders. A single 100MB
+// upload fires `xhr.upload.onprogress` ~30Hz; 5 parallel = 150 calls/s, each
+// of which would otherwise rebuild every chip's DOM. 100ms is the sweet spot:
+// CSS `transition: width 100ms linear` on the fill keeps motion smooth, and
+// the percentage text refresh rate matches what users can actually read.
+//
+// Terminal states (success / fail / abort) bypass the throttle and call
+// renderAttachments() directly — those must not be delayed past 100ms.
+let _renderThrottleTimer = null
+function _scheduleProgressRender() {
+  if (_renderThrottleTimer) return
+  _renderThrottleTimer = setTimeout(() => {
+    _renderThrottleTimer = null
+    renderAttachments()
+  }, 100)
+}
+
 // 上传单个附件到 /api/uploads。出错或被 abort 时把 att 从 state.attachments 里摘掉
 // 并 toast 用户。成功时把返回的 url/serverPath 写回 att,清掉 _uploading + _objectUrl。
+//
+// XHR (not fetch) is mandatory here: fetch API has no native upload progress
+// event, only download stream progress. To show a real percentage to the user
+// we need `xhr.upload.onprogress` — see plan note for v1.0.163+.
+//
+// Stable upload handle pattern: `att._abort` exposes a single `abort()` method
+// that's safe to call at any time, including DURING `await silentRefresh()`
+// when no XHR is in flight. The handle holds `canceled` + `currentXhr`; every
+// xhr event entry-point and the post-completion writeback path re-check
+// `handle.canceled` to make sure a stale response that finished after the
+// user clicked × can't resurrect a removed attachment.
 async function _uploadOne(att, file) {
-  try {
-    const ctrl = new AbortController()
-    att._abort = ctrl
-    // 决定上传请求的 content-type:
-    //   - 压缩档(.rar/.7z/.tar/.gz/.tgz/.bz2/.xz/.zst)→ 显式 application/octet-stream
-    //     绕过后端 UPLOAD_MIME_PREFIXES 拒绝。att.type 仍保留(messages JSON 用)。
-    //   - 其他文件 → 用浏览器给的真实 MIME(空时 fallback 到 octet-stream,后端也接受)。
-    //   保持真实 MIME 对于 PDF/DOCX/ZIP 等"后端原生支持"的格式很重要 —
-    //   server.ts uploadExtForMime(ctype) 用 content-type 决定落盘扩展名,降级会丢类型。
-    const name = (att.name || '').toLowerCase()
-    const isArchive = att.kind === 'file' && ARCHIVE_EXTS_OCTET_FALLBACK.test(name)
-    const uploadCtype = isArchive
-      ? 'application/octet-stream'
-      : (att.type || 'application/octet-stream')
-    // 走 apiFetch + authHeaders(Bearer):2026-05-17 同 mediaSign 一起修的"首次入会
-    // 站长链路上传失败"。raw fetch 只靠 oc_session cookie 做 auth,manage flow 里
-    // /api/auth/session 的 mint 跟 JS-initiated upload 是并发关系,初次 login/refresh
-    // 后 cookie 还没落地时 _uploadOne 就 401。改 apiFetch 走 Authorization Bearer:
-    //   - state.token 同步可读,首发不依赖 cookie
-    //   - 401 时 apiFetch 内部 silentRefresh + 重写 Authorization 后重试
-    //   - file (Blob) 可被 fetch 重读,retry 安全
-    // 大文件上传 timeout:apiFetch 默认 30s,200MB 单文件 + 慢网下根本不够,
-    // 表现为 toast "上传 X 失败: Request timeout"。按文件大小给出线性 timeout,
-    // 下限 5min,上限 30min(对应约 50KB/s 的悲观下行带宽)。
-    const sizeMb = (file.size || 0) / (1024 * 1024)
-    const uploadTimeoutMs = Math.min(
-      30 * 60 * 1000,
-      Math.max(5 * 60 * 1000, Math.ceil((sizeMb / 50) * 60 * 1000)),
-    )
-    const resp = await apiFetch('/api/uploads', {
-      method: 'POST',
-      headers: authHeaders({
-        'content-type': uploadCtype,
-        'x-filename': encodeURIComponent(att.name || 'file'),
-      }),
-      body: file,
-      signal: ctrl.signal,
-      timeout: uploadTimeoutMs,
-    })
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => '')
-      throw new Error(`HTTP ${resp.status}: ${text || resp.statusText}`)
+  // 决定上传请求的 content-type:
+  //   - 压缩档(.rar/.7z/.tar/.gz/.tgz/.bz2/.xz/.zst)→ 显式 application/octet-stream
+  //     绕过后端 UPLOAD_MIME_PREFIXES 拒绝。att.type 仍保留(messages JSON 用)。
+  //   - 其他文件 → 用浏览器给的真实 MIME(空时 fallback 到 octet-stream,后端也接受)。
+  //   保持真实 MIME 对于 PDF/DOCX/ZIP 等"后端原生支持"的格式很重要 —
+  //   server.ts uploadExtForMime(ctype) 用 content-type 决定落盘扩展名,降级会丢类型。
+  const name = (att.name || '').toLowerCase()
+  const isArchive = att.kind === 'file' && ARCHIVE_EXTS_OCTET_FALLBACK.test(name)
+  const uploadCtype = isArchive
+    ? 'application/octet-stream'
+    : (att.type || 'application/octet-stream')
+  // 大文件上传 timeout 按文件大小给出线性 timeout,下限 5min,上限 30min
+  // (对应约 50KB/s 的悲观下行带宽)。XHR 的原生 timeout 触发 xhr.ontimeout。
+  const sizeMb = (file.size || 0) / (1024 * 1024)
+  const uploadTimeoutMs = Math.min(
+    30 * 60 * 1000,
+    Math.max(5 * 60 * 1000, Math.ceil((sizeMb / 50) * 60 * 1000)),
+  )
+
+  // Stable cancel handle; survives across silentRefresh + retry boundary.
+  const handle = { canceled: false, currentXhr: null }
+  att._abort = {
+    abort() {
+      handle.canceled = true
+      const xhr = handle.currentXhr
+      if (xhr) {
+        try { xhr.abort() } catch {}
+      }
+    },
+  }
+
+  // One HTTP attempt. Resolves with { status, body } on completion (any HTTP
+  // code), rejects only on network/timeout/abort. Caller decides whether a
+  // non-2xx status warrants a retry (currently: only 401 → refresh + retry).
+  const attempt = () => new Promise((resolve, reject) => {
+    if (handle.canceled) {
+      reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      return
     }
-    const data = await resp.json()
+    // Fresh attempt → reset progress (silentRefresh retry restarts the
+    // upload from 0% on the new connection; show that honestly).
+    att._progress = 0
+    const xhr = new XMLHttpRequest()
+    handle.currentXhr = xhr
+    xhr.open('POST', '/api/uploads')
+    xhr.setRequestHeader('content-type', uploadCtype)
+    xhr.setRequestHeader('x-filename', encodeURIComponent(att.name || 'file'))
+    // state.token may have been refreshed since attempt() was scheduled;
+    // re-read at send time, not closure-capture at attempt construction.
+    if (state.token) {
+      xhr.setRequestHeader('Authorization', `Bearer ${state.token}`)
+    }
+    xhr.timeout = uploadTimeoutMs
+
+    xhr.upload.onprogress = (e) => {
+      if (handle.canceled || !e.lengthComputable || !e.total) return
+      const ratio = e.loaded / e.total
+      // Clamp to [0,1] defensively — some browsers can momentarily report
+      // loaded > total when content-length differs from raw byte count.
+      att._progress = ratio < 0 ? 0 : ratio > 1 ? 1 : ratio
+      _scheduleProgressRender()
+    }
+    xhr.onload = () => {
+      if (handle.canceled) return
+      handle.currentXhr = null
+      resolve({ status: xhr.status, body: xhr.responseText || '' })
+    }
+    xhr.onerror = () => {
+      if (handle.canceled) return
+      handle.currentXhr = null
+      reject(new Error('network error'))
+    }
+    xhr.ontimeout = () => {
+      if (handle.canceled) return
+      handle.currentXhr = null
+      // Keep the wording aligned with the previous apiFetch path
+      // ("Request timeout") so operational diagnostics see one language.
+      reject(new Error('Request timeout'))
+    }
+    xhr.onabort = () => {
+      handle.currentXhr = null
+      reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+    }
+    xhr.send(file)
+  })
+
+  try {
+    let result = await attempt()
+
+    // 401 + silentRefresh + single retry. Mirrors apiFetch's behavior so
+    // that the "first upload right after login/refresh, cookie not landed
+    // yet" race (the v1.0.160 era fix) stays handled on the XHR path.
+    if (result.status === 401 && !handle.canceled) {
+      const refreshed = await silentRefresh()
+      if (handle.canceled) {
+        throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+      }
+      if (refreshed) {
+        result = await attempt()
+      }
+      // else: refresh failed — fall through; the post-loop 401 check below
+      // fires notifyAuthExpired() once for either failure mode (refresh-failed
+      // OR refresh-OK-but-retry-still-401), matching apiFetch's combined
+      // `_attemptedRefresh && status===401` path.
+    }
+
+    // Final state still 401 → propagate the global "auth expired" semantics
+    // that apiFetch fires from inside its _attemptedRefresh + retry branch.
+    // Without this the global UI never sees that the user's session is gone;
+    // the upload just dies with a local toast and other apiFetch calls remain
+    // in a half-expired limbo until the next 401 from somewhere else trips it.
+    if (result.status === 401) {
+      try { notifyAuthExpired() } catch {}
+    }
+
+    if (result.status < 200 || result.status >= 300) {
+      throw new Error(`HTTP ${result.status}: ${result.body || ''}`)
+    }
+    let data
+    try {
+      data = JSON.parse(result.body)
+    } catch {
+      throw new Error('upload response not JSON')
+    }
     if (!data || typeof data.url !== 'string') {
       throw new Error('upload response missing url')
     }
+
+    // Re-check cancellation right before writeback — a × click between
+    // xhr.onload and the JSON parse must NOT resurrect this attachment.
+    if (handle.canceled || !state.attachments.includes(att)) {
+      throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+    }
+
     // 成功:把 url 装回 att,释放 transient objectURL,清掉 _uploading 标志
     att.url = data.url
     if (data.serverPath) att.serverPath = data.serverPath
     if (data.size) att.size = data.size
     att._uploading = false
+    att._progress = 1
     att._abort = null
     if (att._objectUrl) {
       try { URL.revokeObjectURL(att._objectUrl) } catch {}
@@ -280,11 +396,21 @@ export function renderAttachments() {
     size.textContent = formatSize(a.size)
     item.appendChild(size)
     if (a._uploading) {
-      const spin = document.createElement('span')
-      spin.className = 'attach-spinner'
-      spin.textContent = '⏳'
-      spin.title = '上传中…'
-      item.appendChild(spin)
+      // 数字百分比回答"到哪了",底部细条回答"是否在动"。两个不同信息维度,
+      // 大文件上传几分钟里两者都值。`tabular-nums` 防止数字跳动时 chip 宽度抖。
+      const pct = Math.round(Math.max(0, Math.min(1, a._progress || 0)) * 100)
+      const txt = document.createElement('span')
+      txt.className = 'attach-progress-text'
+      txt.textContent = `${pct}%`
+      txt.title = '上传中…'
+      item.appendChild(txt)
+      const bar = document.createElement('div')
+      bar.className = 'attach-progress-bar'
+      const fill = document.createElement('div')
+      fill.className = 'attach-progress-fill'
+      fill.style.width = `${pct}%`
+      bar.appendChild(fill)
+      item.appendChild(bar)
     }
     const rm = document.createElement('button')
     rm.className = 'attach-remove'

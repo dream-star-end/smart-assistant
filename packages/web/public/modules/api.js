@@ -308,6 +308,16 @@ export function silentRefresh(opts) {
   return _silentRefresh(opts)
 }
 
+// Non-fetch callers (e.g. XHR upload path in attachments.js) need a public
+// hook to trigger the same "auth expired" UI handler that apiFetch invokes
+// after a 401 + failed silentRefresh. Without this, parallel paths drift:
+// a 401 in apiFetch logs the user out, but a 401 in a manual XHR just
+// throws "HTTP 401" toast and leaves global auth state in a half-expired
+// limbo. Thin idempotent re-export of the same fire-once helper.
+export function notifyAuthExpired() {
+  _notifyAuthExpired()
+}
+
 // ── Proactive refresh timer ──
 //
 // 2026-04-23:手机浏览器长时间后台回来被踢登录问题。原架构是反应式——等 401/WS 1008
