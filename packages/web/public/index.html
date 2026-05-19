@@ -236,74 +236,83 @@
                 <span class="landing-demo-window-title">claudeai.chat · session</span>
                 <span class="landing-demo-window-live"><span class="landing-demo-live-dot"></span>实时执行</span>
               </div>
-              <div class="landing-demo-window-body landing-demo-toolchain">
+              <div class="landing-demo-window-body landing-demo-chat">
 
-                <!-- 工具链时间线 6 个步骤 -->
-                <div class="landing-demo-tool-step" data-step="1">
-                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">1</span></div>
-                  <div class="landing-demo-tool-body">
-                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-chat">Chat</span><span class="landing-demo-tool-action">理解命题 · 设计章节链</span></div>
-                    <div class="landing-demo-tool-line">10 章 / 65 节大纲就位,195 条公式占位、14 张图清单</div>
+                <!-- 对话回放 6 节点:用户 → Agent 拆解 → Write outline → Write tex → Bash sim → Agent 总结 -->
+                <div class="landing-demo-chat-node landing-demo-chat-user" data-step="1">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-user">U</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-user">
+                    帮我写一份分布式雷达 P 波段相参合成的完整研究报告,从第一性原理推到工程参数,要可复现仿真。
                   </div>
                 </div>
 
-                <div class="landing-demo-tool-step" data-step="2">
-                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">2</span></div>
-                  <div class="landing-demo-tool-body">
-                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-tex">XeLaTeX</span><span class="landing-demo-tool-action">从第一性原理推演 · 写 .tex</span></div>
-                    <pre class="landing-demo-code"><span class="cm">% 相位结构函数 → Allan 方差 → 振荡器选型</span>
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="2">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    已拆解为 10 章 / 65 节大纲,核心链:<em>相位结构函数 → Allan 方差 → 振荡器选型</em>。先落 outline.md,再按节写 .tex,最后跑仿真出 14 张矢量图。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="3">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Write</span>
+                      <span class="landing-demo-chat-tool-path">outline.md</span>
+                      <span class="landing-demo-chat-tool-status">✓ 4.2 KB</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm"># 分布式雷达 P 波段相参合成</span>
+<span class="cm">## 1. 引言与命题边界</span>
+<span class="cm">## 2. 第一性原理:相位结构函数</span>
+<span class="cm">## 3. 频率预算 / Allan 方差 / 振荡器选型</span>
+<span class="cm">## 4. Ruze 公式与孔径相位误差</span>
+<span class="cm">## 5. MRC 幅度合成与三增益对照</span>
+<span class="kw">...</span> <span class="cm"># 共 10 章 / 65 节</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="4">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Write</span>
+                      <span class="landing-demo-chat-tool-path">section_first_principles_v3.tex</span>
+                      <span class="landing-demo-chat-tool-status">✓ 18.7 KB</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">% 相位结构函数 → Allan 方差</span>
 \begin{equation}
   D_\varphi(\tau) = \langle [\varphi(t+\tau)-\varphi(t)]^2 \rangle
   \label{eq:phase_struct}
-\end{equation}</pre>
+\end{equation}
+<span class="cm">% 对应到 Allan 方差 σ_y²(τ)</span>
+\sigma_y^2(\tau) = \frac{1}{2(2\pi\nu_0\tau)^2} D_\varphi(\tau)</pre>
                   </div>
                 </div>
 
-                <div class="landing-demo-tool-step" data-step="3">
-                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">3</span></div>
-                  <div class="landing-demo-tool-body">
-                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-py">Python</span><span class="landing-demo-tool-action">写仿真 · 固定种子可复现</span></div>
-                    <pre class="landing-demo-code"><span class="kw">def</span> <span class="fn">fig_errchain_pd</span>():  <span class="cm"># 误差链 → 检测概率</span>
-<span class="kw">def</span> <span class="fn">fig_ruze_loss</span>():     <span class="cm"># Ruze 公式相位损耗</span>
-<span class="kw">def</span> <span class="fn">fig_mrc_amplitude</span>(): <span class="cm"># MRC 幅度合成增益</span>
-np.random.<span class="fn">seed</span>(<span class="num">20260515</span>)</pre>
-                  </div>
-                </div>
-
-                <div class="landing-demo-tool-step" data-step="4">
-                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">4</span></div>
-                  <div class="landing-demo-tool-body">
-                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-plot">matplotlib</span><span class="landing-demo-tool-action">输出矢量图 · PDF + PNG 双格式</span></div>
-                    <div class="landing-demo-figs">
-                      <span class="landing-demo-fig" title="fig_errchain_pd.pdf"></span>
-                      <span class="landing-demo-fig" title="fig_freq_budget.pdf"></span>
-                      <span class="landing-demo-fig" title="fig_ruze_loss.pdf"></span>
-                      <span class="landing-demo-fig" title="fig_mrc_amplitude.pdf"></span>
-                      <span class="landing-demo-fig" title="fig_iono_impact.pdf"></span>
-                      <span class="landing-demo-fig" title="fig_motion_comp.pdf"></span>
-                      <span class="landing-demo-fig" title="fig_three_gains.pdf"></span>
-                      <span class="landing-demo-fig landing-demo-fig-more">+7</span>
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="5">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Bash</span>
+                      <span class="landing-demo-chat-tool-path">python sim/sim_run.py --all</span>
+                      <span class="landing-demo-chat-tool-status">✓ 47.3s</span>
                     </div>
+                    <pre class="landing-demo-code"><span class="cm">[sim] seed = 20260515 (locked for reproducibility)</span>
+<span class="cm">[sim] saved figures/fig_errchain_pd.pdf</span>
+<span class="cm">[sim] saved figures/fig_freq_budget.pdf</span>
+<span class="cm">[sim] saved figures/fig_ruze_loss.pdf</span>
+<span class="cm">[sim] saved figures/fig_mrc_amplitude.pdf</span>
+<span class="kw">...</span>
+<span class="cm">[done] exported 14 vector figures (PDF + PNG)</span></pre>
                   </div>
                 </div>
 
-                <div class="landing-demo-tool-step" data-step="5">
-                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">5</span></div>
-                  <div class="landing-demo-tool-body">
-                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-pandoc">pandoc</span><span class="landing-demo-tool-action">LaTeX → DOCX 公式 OMML 化</span></div>
-                    <div class="landing-demo-tool-line">
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="6">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    报告就绪:59 页 PDF + DOCX(公式 OMML 化),14 张矢量图,19 张表,6,000+ 行 LaTeX 已自检引用闭环。
+                    <div class="landing-demo-chat-files">
                       <span class="landing-demo-pill">main.pdf · 1.1 MB</span>
                       <span class="landing-demo-pill">main.docx · 1.5 MB</span>
                       <span class="landing-demo-pill">sim_run.py · 一键复现</span>
                     </div>
-                  </div>
-                </div>
-
-                <div class="landing-demo-tool-step" data-step="6">
-                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">6</span></div>
-                  <div class="landing-demo-tool-body">
-                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-review">Review</span><span class="landing-demo-tool-action">同行评审自检 · 自修 14 条</span></div>
-                    <div class="landing-demo-tool-line">扫描 \label / \ref / \cite · 单位量纲贯通 · 数值自洽核算</div>
                   </div>
                 </div>
 
