@@ -56,6 +56,7 @@
     </a>
     <nav class="landing-nav-links">
       <a href="#features">特性</a>
+      <a href="#demo">演示</a>
       <a href="#benchmarks">评测</a>
       <a href="#models">模型</a>
       <a href="#pricing">价格</a>
@@ -93,6 +94,10 @@
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
         </button>
         <button type="button" id="landing-hero-login-btn" class="btn btn-ghost landing-btn-lg">已有账号 → 登录</button>
+        <a href="#demo" id="landing-hero-demo-btn" class="btn btn-ghost landing-btn-lg landing-btn-demo">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+          查看演示
+        </a>
       </div>
       <div class="landing-hero-meta">
         <span><strong>¥1 = 100 积分 ≈ $1 美元</strong> token 额度</span>
@@ -134,6 +139,257 @@
         <p>Anthropic 官方旗舰 Opus 4.7 满血上线,完整 thinking budget、不阉割上下文、不锁工具调用。Opus 4.7 推理深度可调到极限,Sonnet 4.6 按需切换。</p>
       </div>
     </div>
+  </section>
+
+  <!-- ═══════════════ DEMO SECTION (云 Agent vs 普通 AI 聊天 实战演示) ═══════════════ -->
+  <section id="demo" class="landing-section landing-demo">
+    <div class="landing-section-head">
+      <span class="landing-section-tag">实战演示</span>
+      <h2 class="landing-section-title">云 Agent 不只是会聊天</h2>
+      <p class="landing-section-sub">同一句需求,普通 AI 聊天给你一段建议;OpenClaude 云 Agent 在一个对话内串起<strong>推演 → 仿真 → 交付</strong>,跑通 LaTeX / Python / matplotlib / pandoc 全套工具链,直接产出可复现成果。</p>
+    </div>
+
+    <!-- 板块切换 segmented control -->
+    <div class="landing-demo-tabs" role="tablist" aria-label="演示板块">
+      <button type="button" role="tab" id="demo-tab-research" class="landing-demo-tab is-active" aria-selected="true" aria-controls="demo-panel-research" data-demo-tab="research">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2v6L3 22h18L15 8V2"/><path d="M7.5 14h9"/></svg>
+        科研
+      </button>
+      <button type="button" role="tab" id="demo-tab-coding" class="landing-demo-tab" aria-selected="false" aria-controls="demo-panel-coding" data-demo-tab="coding">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+        编程
+      </button>
+    </div>
+
+    <!-- ── 科研板块 panel ── -->
+    <div id="demo-panel-research" class="landing-demo-panel" role="tabpanel" aria-labelledby="demo-tab-research">
+
+      <!-- 案例摘要顶卡 -->
+      <div class="landing-demo-case">
+        <div class="landing-demo-case-eyebrow">
+          <span class="landing-demo-case-badge">真实案例 · 2026-05</span>
+          <span class="landing-demo-case-source">基于会话 f5f72c3a · 全过程可复核</span>
+        </div>
+        <h3 class="landing-demo-case-title">4 个工作日,从一句话长出 59 页《分布式雷达相参》研究报告</h3>
+        <div class="landing-demo-case-stats">
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val" data-count-to="4">0</span><span class="landing-demo-stat-unit">工作日</span><span class="landing-demo-stat-label">命题 → 终稿</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val" data-count-to="59">0</span><span class="landing-demo-stat-unit">页</span><span class="landing-demo-stat-label">PDF 主稿</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val" data-count-to="14">0</span><span class="landing-demo-stat-unit">张</span><span class="landing-demo-stat-label">矢量图</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val" data-count-to="19">0</span><span class="landing-demo-stat-unit">张</span><span class="landing-demo-stat-label">公式表格</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val" data-count-to="6000">0</span><span class="landing-demo-stat-unit">行+</span><span class="landing-demo-stat-label">LaTeX 源码</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val" data-count-to="195">0</span><span class="landing-demo-stat-unit">条</span><span class="landing-demo-stat-label">公式交叉引用</span></div>
+        </div>
+      </div>
+
+      <!-- 左右对比双栏 -->
+      <div class="landing-demo-split">
+
+        <!-- 同一句 prompt 顶部 -->
+        <div class="landing-demo-prompt">
+          <div class="landing-demo-prompt-label"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg> 同一句需求</div>
+          <div class="landing-demo-prompt-text">「P 波段分布式雷达相参,以合作信号为主。误差要素分解形成误差链,核心论点提供仿真支撑,50 页左右,PDF+Word,带参考文献。」</div>
+        </div>
+
+        <div class="landing-demo-split-grid">
+
+          <!-- 左侧:普通 AI 聊天 -->
+          <article class="landing-demo-col landing-demo-col-plain">
+            <header class="landing-demo-col-head">
+              <span class="landing-demo-col-tag">普通 AI 聊天</span>
+              <h4>停在"建议层"</h4>
+            </header>
+            <div class="landing-demo-window landing-demo-window-plain">
+              <div class="landing-demo-window-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="landing-demo-window-title">chat</span></div>
+              <div class="landing-demo-window-body">
+                <p class="landing-demo-plain-text">
+                  你可以从以下几个方向展开研究:
+                </p>
+                <ul class="landing-demo-plain-list">
+                  <li>相位 / 频率 / 时间同步的工程约束</li>
+                  <li>通道一致性与运动补偿建议</li>
+                  <li>大气传播的影响因素</li>
+                  <li>建议参考 Skolnik、IEEE 相关综述</li>
+                </ul>
+                <p class="landing-demo-plain-cursor">_</p>
+              </div>
+            </div>
+            <div class="landing-demo-col-foot">
+              <span class="landing-demo-col-foot-icon">✕</span>
+              <ul class="landing-demo-col-cons">
+                <li>不会写 LaTeX 公式,不会编译 PDF</li>
+                <li>不会跑 Python 仿真验证</li>
+                <li>不会画矢量图,只能给文字描述</li>
+                <li>交叉引用 / 单位量纲 / 审稿自检全部缺失</li>
+              </ul>
+            </div>
+          </article>
+
+          <!-- 右侧:云 Agent · 工具链工作台时间线 -->
+          <article class="landing-demo-col landing-demo-col-agent">
+            <header class="landing-demo-col-head">
+              <span class="landing-demo-col-tag landing-demo-col-tag-accent">OpenClaude 云 Agent</span>
+              <h4>一个对话连完整工具链</h4>
+            </header>
+            <div class="landing-demo-window landing-demo-window-agent">
+              <div class="landing-demo-window-bar">
+                <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                <span class="landing-demo-window-title">claudeai.chat · session</span>
+                <span class="landing-demo-window-live"><span class="landing-demo-live-dot"></span>实时执行</span>
+              </div>
+              <div class="landing-demo-window-body landing-demo-toolchain">
+
+                <!-- 工具链时间线 6 个步骤 -->
+                <div class="landing-demo-tool-step" data-step="1">
+                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">1</span></div>
+                  <div class="landing-demo-tool-body">
+                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-chat">Chat</span><span class="landing-demo-tool-action">理解命题 · 设计章节链</span></div>
+                    <div class="landing-demo-tool-line">10 章 / 65 节大纲就位,195 条公式占位、14 张图清单</div>
+                  </div>
+                </div>
+
+                <div class="landing-demo-tool-step" data-step="2">
+                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">2</span></div>
+                  <div class="landing-demo-tool-body">
+                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-tex">XeLaTeX</span><span class="landing-demo-tool-action">从第一性原理推演 · 写 .tex</span></div>
+                    <pre class="landing-demo-code"><span class="cm">% 相位结构函数 → Allan 方差 → 振荡器选型</span>
+\begin{equation}
+  D_\varphi(\tau) = \langle [\varphi(t+\tau)-\varphi(t)]^2 \rangle
+  \label{eq:phase_struct}
+\end{equation}</pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-tool-step" data-step="3">
+                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">3</span></div>
+                  <div class="landing-demo-tool-body">
+                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-py">Python</span><span class="landing-demo-tool-action">写仿真 · 固定种子可复现</span></div>
+                    <pre class="landing-demo-code"><span class="kw">def</span> <span class="fn">fig_errchain_pd</span>():  <span class="cm"># 误差链 → 检测概率</span>
+<span class="kw">def</span> <span class="fn">fig_ruze_loss</span>():     <span class="cm"># Ruze 公式相位损耗</span>
+<span class="kw">def</span> <span class="fn">fig_mrc_amplitude</span>(): <span class="cm"># MRC 幅度合成增益</span>
+np.random.<span class="fn">seed</span>(<span class="num">20260515</span>)</pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-tool-step" data-step="4">
+                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">4</span></div>
+                  <div class="landing-demo-tool-body">
+                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-plot">matplotlib</span><span class="landing-demo-tool-action">输出矢量图 · PDF + PNG 双格式</span></div>
+                    <div class="landing-demo-figs">
+                      <span class="landing-demo-fig" title="fig_errchain_pd.pdf"></span>
+                      <span class="landing-demo-fig" title="fig_freq_budget.pdf"></span>
+                      <span class="landing-demo-fig" title="fig_ruze_loss.pdf"></span>
+                      <span class="landing-demo-fig" title="fig_mrc_amplitude.pdf"></span>
+                      <span class="landing-demo-fig" title="fig_iono_impact.pdf"></span>
+                      <span class="landing-demo-fig" title="fig_motion_comp.pdf"></span>
+                      <span class="landing-demo-fig" title="fig_three_gains.pdf"></span>
+                      <span class="landing-demo-fig landing-demo-fig-more">+7</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="landing-demo-tool-step" data-step="5">
+                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">5</span></div>
+                  <div class="landing-demo-tool-body">
+                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-pandoc">pandoc</span><span class="landing-demo-tool-action">LaTeX → DOCX 公式 OMML 化</span></div>
+                    <div class="landing-demo-tool-line">
+                      <span class="landing-demo-pill">main.pdf · 1.1 MB</span>
+                      <span class="landing-demo-pill">main.docx · 1.5 MB</span>
+                      <span class="landing-demo-pill">sim_run.py · 一键复现</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="landing-demo-tool-step" data-step="6">
+                  <div class="landing-demo-tool-rail"><span class="landing-demo-tool-marker">6</span></div>
+                  <div class="landing-demo-tool-body">
+                    <div class="landing-demo-tool-head"><span class="landing-demo-tool-name landing-demo-tool-review">Review</span><span class="landing-demo-tool-action">同行评审自检 · 自修 14 条</span></div>
+                    <div class="landing-demo-tool-line">扫描 \label / \ref / \cite · 单位量纲贯通 · 数值自洽核算</div>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+            <div class="landing-demo-col-foot">
+              <span class="landing-demo-col-foot-icon landing-demo-check">✓</span>
+              <ul class="landing-demo-col-pros">
+                <li><strong>零上下文切换:</strong>LaTeX / Python / matplotlib / pandoc 全在一个对话</li>
+                <li><strong>第一性原理:</strong>从基本方程推导,而非套话拼接</li>
+                <li><strong>可复现仿真:</strong>固定种子,一脚本复现全部 14 张图</li>
+                <li><strong>科研合伙人:</strong>主动设计章节链 + 自检引用 + 审稿模式</li>
+              </ul>
+            </div>
+          </article>
+
+        </div>
+      </div>
+
+      <!-- 加速比对比表 -->
+      <div class="landing-demo-bench">
+        <h4 class="landing-demo-bench-title">从命题到完整初稿:传统 vs 云 Agent</h4>
+        <table class="landing-demo-bench-table">
+          <thead>
+            <tr>
+              <th scope="col">任务</th>
+              <th scope="col">传统工作流</th>
+              <th scope="col">OpenClaude 云 Agent</th>
+              <th scope="col">加速</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>30 个章节 LaTeX 撰写 + 编译调试</td><td>2-3 周</td><td class="landing-demo-bench-us">2-3 天</td><td class="landing-demo-bench-x">5-10×</td></tr>
+            <tr><td>14 张矢量图绘制 (反复调参)</td><td>5-7 天</td><td class="landing-demo-bench-us">半天</td><td class="landing-demo-bench-x">10×</td></tr>
+            <tr><td>LaTeX → DOCX 公式转换</td><td>1-2 天 (常返工)</td><td class="landing-demo-bench-us">30 分钟</td><td class="landing-demo-bench-x">20×</td></tr>
+            <tr><td>全文交叉引用核对</td><td>半天</td><td class="landing-demo-bench-us">秒级</td><td class="landing-demo-bench-x">∞</td></tr>
+            <tr class="landing-demo-bench-total"><td><strong>命题 → 完整初稿</strong></td><td><strong>4-6 周</strong></td><td class="landing-demo-bench-us"><strong>3-4 天</strong></td><td class="landing-demo-bench-x"><strong>≈10×</strong></td></tr>
+          </tbody>
+        </table>
+        <p class="landing-demo-bench-foot">数据基于 OpenClaude 真实会话 <code>f5f72c3a</code>(2026-05-15 ~ 2026-05-18),全程可在该会话源码包中复核。研究者负责科学判断 / 边界设定 / 术语校正,Agent 把研究者从工具链摩擦中解放出来。</p>
+      </div>
+    </div>
+
+    <!-- ── 编程板块 panel ── -->
+    <div id="demo-panel-coding" class="landing-demo-panel" role="tabpanel" aria-labelledby="demo-tab-coding" hidden>
+      <div class="landing-demo-coding-preview">
+        <div class="landing-demo-coding-eyebrow">
+          <span class="landing-demo-case-badge">编程板块</span>
+          <span class="landing-demo-case-source">完整案例制作中,先看核心能力</span>
+        </div>
+        <h3 class="landing-demo-case-title">把一个想法跑通到上线,在同一个对话内</h3>
+        <p class="landing-demo-coding-sub">云 Agent 在沙箱内拥有完整开发工具链:克隆仓库、跑测试、生成代码、跑构建、起本地服务、跨文件重构、提交 PR 全部可以在对话里完成。</p>
+        <div class="landing-demo-coding-grid">
+          <div class="landing-demo-coding-card">
+            <div class="landing-demo-coding-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16v4H4zM4 12h16v4H4zM4 20h10v0"/><circle cx="7" cy="6" r="0.8" fill="currentColor"/><circle cx="7" cy="14" r="0.8" fill="currentColor"/></svg>
+            </div>
+            <h5>真沙箱执行</h5>
+            <p>独立容器内跑 bun / node / python / git,长任务挂云端,断电不丢。</p>
+          </div>
+          <div class="landing-demo-coding-card">
+            <div class="landing-demo-coding-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12 18 8M22 12l-4 4M2 12l4-4M2 12l4 4"/><path d="M14 4l-4 16"/></svg>
+            </div>
+            <h5>跨文件重构</h5>
+            <p>跨数十文件改命名 / 抽接口 / 升级框架,Agent 自己 grep + 编辑 + 跑 lint。</p>
+          </div>
+          <div class="landing-demo-coding-card">
+            <div class="landing-demo-coding-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+            </div>
+            <h5>测试驱动</h5>
+            <p>先写复现测试再修 bug,Agent loop 到测试通过为止,而非"写完拍脑袋"。</p>
+          </div>
+          <div class="landing-demo-coding-card">
+            <div class="landing-demo-coding-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 9v8a3 3 0 0 0 3 3h6"/></svg>
+            </div>
+            <h5>GitHub 集成</h5>
+            <p>授权后直接拉仓库、开分支、跑 CI、推 PR,代码评审有完整 diff 上下文。</p>
+          </div>
+        </div>
+        <p class="landing-demo-coding-foot">完整编程实战演示制作中。当前可 <button type="button" id="landing-demo-coding-register" class="landing-demo-coding-link">立即注册</button> 后直接试用,沙箱里跑你自己的项目。</p>
+      </div>
+    </div>
+
   </section>
 
   <section id="benchmarks" class="landing-section">
