@@ -9,14 +9,15 @@
  *   2. USER              — User identity & preferences (USER.md), rarely changes
  *   3. AGENTS            — Platform capabilities, agent list, provider tips (semi-static)
  *   4. SKILLS            — Agent 自有 skill summaries (semi-static)
- *   5. SKILLS_LITERATURE — 平台供给文献检索能力 (commercial 反向钩子注入,personal 不出现)
+ *   5. SKILLS_LITERATURE — 平台供给文献检索能力 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
  *   6. MEMORY            — Agent notes (MEMORY.md), changes frequently
  *   7. TOOLS             — Tool usage hints, learning system instructions (static reference)
- *   8. MODEL_HINT        — per-model 行为补丁 (commercial 反向钩子注入)
+ *   8. MODEL_HINT        — per-model 行为补丁 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
  *   9. RESEARCH          — 用户显式选中的科研模式守则 (effortLevel='max')
  *   10. REPO             — 当前会话 GitHub repo 绑定快照 (离 user 消息最近)
  */
 import { existsSync, readFileSync } from 'node:fs'
+import { request as undiciRequest } from 'undici'
 import { MemoryStore, SkillStore, paths, readAgentsConfig } from '@openclaude/storage'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
@@ -499,6 +500,190 @@ export async function buildLiteratureSkillSlot(): Promise<PromptSlot | null> {
   return { name, content: trimmed }
 }
 
+// ── V3 commercial remote platform slot source ──
+//
+// 背景:v3 容器镜像 build 时 `--exclude='packages/commercial/'`,容器进程内没有
+// commercial,setLiteratureSkillProvider / setModelHintProvider 永远不被调,模块级
+// _literatureSkillProvider / _modelHintProvider 在容器进程内恒为 null。结果
+// SKILLS_LITERATURE 与 MODEL_HINT 在容器里**结构性不出现**。
+//
+// 修法:v3 supervisor 已经在 spawn 容器时注入两个 env(`OPENCLAUDE_V3_MASTER_BASE_URL`
+// + `OPENCLAUDE_V3_CONTAINER_TOKEN`,见 v3supervisor.ts:1661 — 原本给 v3MasterSink 用),
+// 容器 gateway 在 buildPromptContext 时 GET master 的
+// `/internal/v3/platform-prompt-slots`,拿到 master 现算的两个 slot,合并进
+// extra-prompt.md。
+//
+// 两条路径互斥(env 决定):
+//   - 两个 env 都齐 → 走 remote fetch(v3 容器场景),**完全跳过** provider hook
+//     调用。这一点重要:即使将来某个意外把 commercial 误装进容器,也不会双重注入。
+//   - 任一缺 → 走旧的 provider hook(personal 45.32 单进程场景)。
+//
+// fail-soft:env 齐但 fetch 失败 / shape 不合规 → 返 `[]`(两个 slot 都不出现),
+// **不回退** provider hook —— 在 v3 容器里 hook 注定是 dead code,回退只会制造
+// "某些异常环境双重注入" 的错觉。
+
+export const PLATFORM_PROMPT_SLOTS_PATH = '/internal/v3/platform-prompt-slots'
+
+/** v3 supervisor 注入的两个 env。命名故意与 v3MasterSink 一致 —— 是同一条出站通道。 */
+const ENV_MASTER_URL = 'OPENCLAUDE_V3_MASTER_BASE_URL'
+const ENV_CONTAINER_TOKEN = 'OPENCLAUDE_V3_CONTAINER_TOKEN'
+
+/** Fetch master 时的超时上限。slot 失败用户不会有明显感知(extra-prompt.md 还是会写,
+ *  只是少两个增强段),但 5s 已经能覆盖 GCE bridge 偶发抖动。比 v3MasterSink 短:
+ *  那里是写路径不能丢消息,这里是 spawn 路径用户在等,fail 早一点更好。 */
+const PLATFORM_SLOTS_TIMEOUT_MS = 5_000
+
+/** 允许容器接受的 slot name 白名单。master 加新 slot 时,旧容器看到不识别的 name
+ *  应静默忽略而不是错误地落到 SOUL/USER 之间。 */
+const PLATFORM_SLOT_WHITELIST = new Set(['SKILLS_LITERATURE', 'MODEL_HINT'])
+
+/**
+ * 容器从 master fetch 回来的单个 slot。`canonicalModelId` 仅 MODEL_HINT 出现,
+ * gateway 把它透传到 PromptSlotApplied.meta.model_id —— 保持
+ * modelHintAppliedTotal 的 cardinality 受 master pricing 表行数约束这条不变量。
+ */
+export interface RemotePlatformSlot {
+  name: string
+  content: string
+  canonicalModelId?: string
+}
+
+export interface FetchPlatformSlotsDeps {
+  /** 测试用:覆盖 undici.request。生产走默认。 */
+  fetcher?: typeof undiciRequest
+  /** 测试用:覆盖 process.env。生产走默认。 */
+  env?: NodeJS.ProcessEnv
+  /** 测试用:覆盖超时。生产用 PLATFORM_SLOTS_TIMEOUT_MS。 */
+  timeoutMs?: number
+}
+
+/**
+ * 从 master 拉取平台级 prompt slot。
+ *
+ * 返回语义:
+ *   - `null`         → env 不齐,personal 场景,**走 provider hook 路径**
+ *   - `[]`           → env 齐但 fetch / 解析失败,**跳过两个 slot**(不回退 hook)
+ *   - `[{name,..}]`  → master 返回的(已 trim、已过滤白名单)slot 列表
+ *
+ * 不抛错:外层 buildPromptContext 不能因为 master 不通就让整段 system prompt
+ * 构建失败 —— 容器其他 slot 还得照样出。
+ */
+export async function fetchPlatformSlotsFromMaster(
+  ctx: PromptSlotContext,
+  deps: FetchPlatformSlotsDeps = {},
+): Promise<RemotePlatformSlot[] | null> {
+  const env = deps.env ?? process.env
+  const baseUrl = env[ENV_MASTER_URL]
+  const bearer = env[ENV_CONTAINER_TOKEN]
+  if (!baseUrl || !bearer) return null
+  const normalized = baseUrl.replace(/\/+$/, '')
+
+  const fetcher = deps.fetcher ?? undiciRequest
+  const timeoutMs = deps.timeoutMs ?? PLATFORM_SLOTS_TIMEOUT_MS
+
+  let url = `${normalized}${PLATFORM_PROMPT_SLOTS_PATH}`
+  if (ctx.model) {
+    url += `?model=${encodeURIComponent(ctx.model)}`
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let status: number
+  let bodyText: string
+  try {
+    const res = await fetcher(url, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${bearer}` },
+      signal: controller.signal,
+    })
+    status = res.statusCode
+    bodyText = await readBoundedText(res.body, 256 * 1024)
+  } catch (err) {
+    // 网络 / DNS / abort —— 容器 spawn 期间 master 出问题,fail-soft 返 [],
+    // 主流程照常推进。warn 不 error:slot 缺席不影响功能正确性。
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[promptSlots] platform slot fetch failed, returning empty',
+      err instanceof Error ? err.message : String(err),
+    )
+    return []
+  } finally {
+    clearTimeout(timer)
+  }
+
+  if (status !== 200) {
+    // 401/403 = 容器 token 不对或 bound_ip 不匹配(env 注错 / 容器迁移),
+    // 5xx = master 本身出问题。两种都不在 spawn 路径上做花式重试。
+    // eslint-disable-next-line no-console
+    console.warn('[promptSlots] platform slot fetch non-200', { status })
+    return []
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(bodyText)
+  } catch {
+    // eslint-disable-next-line no-console
+    console.warn('[promptSlots] platform slot response JSON parse failed')
+    return []
+  }
+
+  // 防御性 shape 校验:必须是 `{ slots: [...] }`。
+  if (
+    parsed === null ||
+    typeof parsed !== 'object' ||
+    !Array.isArray((parsed as { slots: unknown }).slots)
+  ) {
+    return []
+  }
+
+  const out: RemotePlatformSlot[] = []
+  for (const raw of (parsed as { slots: unknown[] }).slots) {
+    if (raw === null || typeof raw !== 'object') continue
+    const r = raw as Record<string, unknown>
+    const name = typeof r.name === 'string' ? r.name : null
+    const content = typeof r.content === 'string' ? r.content : null
+    if (!name || !PLATFORM_SLOT_WHITELIST.has(name)) continue
+    if (content === null) continue
+    const trimmed = content.trim()
+    if (!trimmed) continue
+    // MODEL_HINT 必须带 canonicalModelId(provider 已 canonicalize 的 model id),
+    // 否则容器侧 metric label 防线会失效 —— 直接丢弃这条 slot 比注入但缺 meta 安全。
+    if (name === 'MODEL_HINT') {
+      const cid =
+        typeof r.canonicalModelId === 'string' ? r.canonicalModelId : null
+      if (!cid || cid.length === 0) continue
+      out.push({ name, content: trimmed, canonicalModelId: cid })
+    } else {
+      out.push({ name, content: trimmed })
+    }
+  }
+  return out
+}
+
+async function readBoundedText(
+  body: { [Symbol.asyncIterator](): AsyncIterableIterator<Buffer | Uint8Array | string> },
+  maxBytes: number,
+): Promise<string> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of body) {
+    const buf =
+      typeof chunk === 'string'
+        ? Buffer.from(chunk, 'utf-8')
+        : Buffer.isBuffer(chunk)
+          ? chunk
+          : Buffer.from(chunk)
+    total += buf.byteLength
+    if (total > maxBytes) {
+      // 超过 cap 直接丢全部 —— master 不会发这么大,继续读没意义
+      return ''
+    }
+    chunks.push(buf)
+  }
+  return Buffer.concat(chunks).toString('utf-8')
+}
+
 // ── Unified builder ──
 
 const SEPARATOR = '\n\n---\n\n'
@@ -543,9 +728,21 @@ async function sha256Hex(s: string): Promise<string> {
  * Build the complete extra-prompt by assembling all slots in order.
  * Returns the merged string + per-slot applied metadata so callers can emit
  * observability without re-parsing the prompt.
+ *
+ * 两条 commercial-owned slot(SKILLS_LITERATURE / MODEL_HINT)的注入来源由
+ * env 决定:
+ *   - v3 容器场景(env 齐) → fetchPlatformSlotsFromMaster 拉 master,跳过 hook
+ *   - personal 场景(env 缺) → 继续走 setLiteratureSkillProvider /
+ *     setModelHintProvider 模块级 hook
+ * 详见同文件 "V3 commercial remote platform slot source" 注释段。
  */
 export async function buildPromptContext(ctx: PromptSlotContext): Promise<PromptContextResult> {
   const slots: PromptSlot[] = []
+
+  // 在 build 早期就触发 remote fetch,放到与其他静态 slot 计算并行 —— 不阻塞
+  // SOUL/USER 之类的本地 I/O,fetch 5s timeout 同时 SOUL/USER 5ms 内就好了,
+  // 一般而言两者在 fetch 返回前都早完成。
+  const remotePlatformSlotsPromise = fetchPlatformSlotsFromMaster(ctx)
 
   // Layer 1: Static identity
   const soul = buildSoulSlot(ctx)
@@ -561,11 +758,22 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const skills = await buildSkillsSlot(ctx)
   if (skills) slots.push(skills)
 
-  // 平台级技能(commercial 注入):文献检索。SKILLS 之后、MEMORY 之前 ——
-  // 与 agent 自有 skills 在认知上同层,但属于"平台供给"标记位,分段清晰。
-  // Personal 没注册 provider → null,该 slot 永远不出现。
-  const literature = await buildLiteratureSkillSlot()
-  if (literature) slots.push(literature)
+  // 等 remote 决策。null = personal 路径,数组 = v3 路径(可空)。
+  const remotePlatformSlots = await remotePlatformSlotsPromise
+
+  // 平台级技能(SKILLS_LITERATURE):SKILLS 之后、MEMORY 之前。
+  //   - remote 路径:在 master 返回的数组里找 name === 'SKILLS_LITERATURE'
+  //   - hook 路径:调 setLiteratureSkillProvider 注册的 provider
+  // 没找到 / hook 返 null → slot 不出现。
+  if (remotePlatformSlots === null) {
+    const literature = await buildLiteratureSkillSlot()
+    if (literature) slots.push(literature)
+  } else {
+    const literature = remotePlatformSlots.find((s) => s.name === 'SKILLS_LITERATURE')
+    if (literature) {
+      slots.push({ name: 'SKILLS_LITERATURE', content: literature.content })
+    }
+  }
 
   // Layer 3: Dynamic context
   const memory = await buildMemorySlot(ctx)
@@ -578,7 +786,23 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   // 比工具说明更靠后(更"贴近"user message,不被工具说明稀释),
   // 但低于 RESEARCH(用户显式选择"科研模式"应优先级最高)。
   // ModelHintSlot 携带 canonicalId,稍后塞进 PromptSlotApplied.meta 给 runner 打 metric。
-  const modelHint = buildModelHintSlot(ctx)
+  //
+  // 同样按 env 决定来源。remote 路径下 canonicalModelId 直接来自 master 的 pricing
+  // row,fetchPlatformSlotsFromMaster 已确保 MODEL_HINT slot 必带该字段。
+  let modelHint: ModelHintSlot | null
+  if (remotePlatformSlots === null) {
+    modelHint = buildModelHintSlot(ctx)
+  } else {
+    const remote = remotePlatformSlots.find((s) => s.name === 'MODEL_HINT')
+    modelHint =
+      remote && remote.canonicalModelId
+        ? {
+            name: 'MODEL_HINT',
+            canonicalId: remote.canonicalModelId,
+            content: remote.content,
+          }
+        : null
+  }
   if (modelHint) slots.push(modelHint)
 
   // Layer 5: 用户显式选中的模式(科研模式等)。放在模型补丁之后,
