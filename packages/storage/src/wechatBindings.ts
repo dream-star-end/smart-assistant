@@ -36,10 +36,30 @@ interface Row {
   last_event_at: number | null
 }
 
+// Lazy migration: 老行的 context_tokens key 形态是 iLink wire 的
+// `<base64url>@im.wechat`,新代码全程按 canonical base64url 写入 + 查询。
+// 在 row → binding 边界剥后缀,worker 后续 cursor flush 会把 canonical
+// 形态原样写回 DB,无需一次性 ALTER 迁移。
+//
+// 这里**不**从 @openclaude/channel-wechat 导入 canonicalSenderId — storage
+// 是 channels/wechat 的上游依赖,反向引用会造成包层级倒挂。规则只一行,
+// 重复在此符合本次修复范围。
+const IM_WECHAT_SUFFIX = '@im.wechat'
+function stripImWechatSuffix(key: string): string {
+  return key.endsWith(IM_WECHAT_SUFFIX) ? key.slice(0, -IM_WECHAT_SUFFIX.length) : key
+}
+function canonicalizeContextTokens(raw: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw)) {
+    out[stripImWechatSuffix(k)] = v
+  }
+  return out
+}
+
 function rowToBinding(r: Row): WechatBinding {
   let ctx: Record<string, string> = {}
   let wl: string[] = []
-  try { ctx = JSON.parse(r.context_tokens || '{}') } catch {}
+  try { ctx = canonicalizeContextTokens(JSON.parse(r.context_tokens || '{}')) } catch {}
   try { wl = JSON.parse(r.whitelist || '[]') } catch {}
   const st = (r.status === 'disabled' || r.status === 'expired') ? r.status : 'active'
   return {

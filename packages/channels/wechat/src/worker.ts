@@ -18,12 +18,65 @@ import {
   updateWechatBindingCursor,
   updateWechatBindingStatus,
 } from '@openclaude/storage'
+import { canonicalSenderId } from './canonicalSenderId.js'
 import {
   extractIlinkText,
   getIlinkUpdates,
   ILINK_SESSION_EXPIRED,
   sendIlinkText,
 } from './iLink.js'
+
+/**
+ * Pure decoder:把 iLink getupdates msg 项变成 worker loop 处理所需的归一
+ * 字段;senderId 在此处剥 `@im.wechat` 后缀(上游 SENDER_ID_RE 校验 base64url
+ * 字符集,从源头归一避免 broker / dispatcher / v3WechatOutbound 各处补丁)。
+ *
+ * 返回:
+ *   - { kind: 'ok', senderId, contextToken, text, messageId } — 可继续 onInbound
+ *   - { kind: 'drop_no_sender_or_ctx' } — sender 或 contextToken 缺,worker
+ *     原本就 silent continue,这里把决策外化便于单测
+ *   - { kind: 'drop_no_id', senderId } — sender 在但缺 stable id,worker
+ *     原本 log+continue,senderId 字段供调用方拼 log 文案
+ *
+ * 导出仅供单测(worker loop 是唯一生产 caller)。
+ */
+export type ProcessedIlinkMessage =
+  | {
+      kind: 'ok'
+      senderId: string
+      contextToken: string
+      text: string
+      messageId: string
+    }
+  | { kind: 'drop_no_sender_or_ctx' }
+  | {
+      // 即便缺稳定 id,sender + contextToken 仍要回供 worker 更新缓存
+      // (否则 reply 路径就丢这个 sender 的 token)。
+      kind: 'drop_no_id'
+      senderId: string
+      contextToken: string
+    }
+
+export function processIlinkMessageForWorker(msg: any): ProcessedIlinkMessage {
+  const rawSenderId = String(msg?.from_user_id || '').trim()
+  const senderId = canonicalSenderId(rawSenderId)
+  const contextToken = String(msg?.context_token || '').trim()
+  const text = extractIlinkText(msg)
+  if (!senderId || !contextToken) {
+    return { kind: 'drop_no_sender_or_ctx' }
+  }
+  const idSrc = msg?.seq ?? msg?.message_id ?? msg?.client_id
+  if (idSrc === undefined || idSrc === null || String(idSrc).trim() === '') {
+    return { kind: 'drop_no_id', senderId, contextToken }
+  }
+  return {
+    kind: 'ok',
+    senderId,
+    contextToken,
+    text,
+    messageId: String(idSrc),
+  }
+}
 
 export interface InboundEvent {
   binding: WechatBinding
@@ -205,36 +258,35 @@ export class WechatWorker {
 
       let ctxDirty = false
       for (const msg of msgs) {
-        const senderId = String(msg?.from_user_id || '').trim()
-        const contextToken = String(msg?.context_token || '').trim()
-        const text = extractIlinkText(msg)
-        if (contextToken && senderId) {
-          if (this.contextTokens[senderId] !== contextToken) {
-            this.contextTokens[senderId] = contextToken
-            ctxDirty = true
-          }
-        }
-        if (!senderId || !contextToken) continue
+        const result = processIlinkMessageForWorker(msg)
+        if (result.kind === 'drop_no_sender_or_ctx') continue
 
-        // Idempotency key must be STABLE across retries — if iLink gives us
-        // no seq/message_id/client_id we have no way to deduplicate, so drop
-        // the message rather than fabricate a Date.now() id that would let
-        // the gateway dispatch the same user text twice on redelivery.
-        const idSrc = msg?.seq ?? msg?.message_id ?? msg?.client_id
-        if (idSrc === undefined || idSrc === null || String(idSrc).trim() === '') {
+        // 在 idSrc 检查前先更新 context_token 缓存:即使本条 msg 因
+        // 缺稳定 id 被 drop,context_token 仍要落 in-memory + DB,否则
+        // 未来 reply 这个 sender 的路径就没 token 可用了。
+        if (this.contextTokens[result.senderId] !== result.contextToken) {
+          this.contextTokens[result.senderId] = result.contextToken
+          ctxDirty = true
+        }
+
+        if (result.kind === 'drop_no_id') {
+          // Idempotency key must be STABLE across retries — if iLink gives us
+          // no seq/message_id/client_id we have no way to deduplicate, so drop
+          // the message rather than fabricate a Date.now() id that would let
+          // the gateway dispatch the same user text twice on redelivery.
           this.ctx.log.error(
-            `[wechat:${this.userId}] drop msg with no stable id from=${senderId}`,
+            `[wechat:${this.userId}] drop msg with no stable id from=${result.senderId}`,
           )
           continue
         }
-        const messageId = String(idSrc)
+
         try {
           await this.onInbound({
             binding: this.binding,
-            senderId,
-            text,
-            contextToken,
-            messageId,
+            senderId: result.senderId,
+            text: result.text,
+            contextToken: result.contextToken,
+            messageId: result.messageId,
             raw: msg,
           })
         } catch (err: any) {
