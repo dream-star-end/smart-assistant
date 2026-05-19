@@ -595,6 +595,10 @@
             <button class="settings-item" data-settings="theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>切换主题</button>
             <!-- V3 商用版: 移除 OAuth 认证 / 查看配置 入口(2026-04-21 boss 反馈) -->
             <button class="settings-item" data-settings="wechat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/><path d="M21 12a9 9 0 1 0-3.39 7.06l3.06.94-.94-3.06A8.96 8.96 0 0 0 21 12z"/></svg>微信绑定</button>
+            <!-- V3 CC 外接 Phase 6: API Key 管理(admin-only 临时门控,见 plan §3.4)
+                 沿用 #admin-console-link 范式:HTML 默认 hidden,refreshBalance
+                 拿 role==='admin' 时由 billing.js _setApiKeysLinkVisible 翻转。 -->
+            <button id="api-keys-entry-btn" class="settings-item" data-settings="api-keys" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="3.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>API Key 管理</button>
             <!-- V3 Phase 4E: 超管控制台入口(role=admin 时由 refreshBalance 取消 hidden) -->
             <button id="admin-console-link" class="settings-item" data-settings="admin" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 4v6c0 5-3.5 9.5-9 10-5.5-.5-9-5-9-10V6l9-4z"/><path d="M9 12l2 2 4-4"/></svg>超管控制台</button>
             <button class="settings-item danger" data-settings="logout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>退出登录</button>
@@ -1272,6 +1276,56 @@
     <div class="modal-foot">
       <button class="btn btn-ghost" data-close-modal="prefs-modal" type="button">取消</button>
       <button id="prefs-save-btn" class="btn btn-primary" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- V3 CC 外接 Phase 6:API Key 管理 modal(admin-only 临时门控,plan §3.4)
+     主体三个互斥 panel:list / create / secret。secret panel 的 plaintext 由
+     apiKeys.js MutationObserver 在 .open class 被移除时清空,覆盖所有 close 路径。 -->
+<div id="api-keys-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="API Key 管理">
+  <div class="modal" style="max-width:620px">
+    <div class="modal-head">
+      <h3>API Key 管理</h3>
+      <button class="modal-close" data-close-modal="api-keys-modal" aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body" style="max-height:520px;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.5;background:var(--bg-secondary);padding:10px 12px;border-radius:var(--radius);border:1px solid var(--border)">
+        用于 Claude Code 客户端外接调用:配置 <code style="font-family:var(--font-mono,ui-monospace,monospace)">ANTHROPIC_BASE_URL=https://claudeai.chat/api/anthropic</code> +
+        <code style="font-family:var(--font-mono,ui-monospace,monospace)">ANTHROPIC_API_KEY=&lt;此处生成&gt;</code>。
+        <br><strong style="color:var(--accent-danger,#d33)">⚠️ 新建后明文仅显示一次,请立即妥善保管。</strong>
+      </div>
+
+      <!-- Panel A:列表态 -->
+      <div id="api-keys-list-panel">
+        <div id="api-keys-list" style="display:flex;flex-direction:column;gap:8px"></div>
+        <div id="api-keys-empty" style="text-align:center;color:var(--text-secondary);padding:24px 0;font-size:13px" hidden>暂无 API Key,点底部"新建"创建一个</div>
+      </div>
+
+      <!-- Panel B:创建态(input label + 创建/取消) -->
+      <div id="api-keys-create-panel" hidden style="display:flex;flex-direction:column;gap:10px;padding:14px;border:1px dashed var(--border);border-radius:var(--radius)">
+        <label style="font-size:12px;color:var(--text-secondary)" for="api-keys-create-input">标签(用于区分 key 用途,1-80 字符):</label>
+        <input id="api-keys-create-input" type="text" maxlength="80" autocomplete="off" spellcheck="false" placeholder="例如:笔记本 / dev 环境 / CI 流水线" style="padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:13px">
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button id="api-keys-create-cancel" type="button" class="btn btn-ghost" style="font-size:12px">取消</button>
+          <button id="api-keys-create-submit" type="button" class="btn btn-primary" style="font-size:12px">创建</button>
+        </div>
+      </div>
+
+      <!-- Panel C:secret 一次性展示态 -->
+      <div id="api-keys-secret-panel" hidden style="display:flex;flex-direction:column;gap:10px;padding:14px;border:2px solid var(--accent-danger,#d33);border-radius:var(--radius);background:var(--bg-secondary)">
+        <div style="font-size:13px;font-weight:600">已创建:<span id="api-keys-secret-label" style="font-weight:400;color:var(--text-secondary)"></span></div>
+        <div style="font-size:12px;color:var(--accent-danger,#d33);font-weight:600">⚠️ 该明文仅此一次显示,关闭后将无法再次获取。请立即复制保存。</div>
+        <input id="api-keys-secret-input" type="text" readonly autocomplete="off" spellcheck="false" style="padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-family:var(--font-mono,ui-monospace,monospace);font-size:12px;word-break:break-all">
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button id="api-keys-secret-copy" type="button" class="btn btn-secondary" style="font-size:12px">复制</button>
+          <button id="api-keys-secret-done" type="button" class="btn btn-primary" style="font-size:12px">我已保存</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot" style="justify-content:space-between">
+      <button id="api-keys-new-btn" type="button" class="btn btn-primary" style="font-size:13px">+ 新建 API Key</button>
+      <button class="btn btn-ghost" data-close-modal="api-keys-modal" type="button">关闭</button>
     </div>
   </div>
 </div>

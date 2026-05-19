@@ -90,6 +90,7 @@ import { startInbox, stopInbox } from './inbox.js?v=21313bd0'
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js?v=21313bd0'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
+import { openApiKeysModal } from './apiKeys.js?v=auto'
 import { initUsageStats, openUsageModal } from './usageStats.js?v=21313bd0'
 import {
   clearUserPrefsCache,
@@ -2572,6 +2573,7 @@ async function init() {
     else if (action === 'wechat') openWechatModal()
     else if (action === 'prefs') openPrefsModal()
     else if (action === 'usage') openUsageModal()
+    else if (action === 'api-keys') openApiKeysModal()
     else if (action === 'admin') {
       // V3 Phase 4E:打开超管控制台。新窗口避免覆盖正在进行的对话。
       // 后端 /api/admin/* + 前端 admin.js 都会再校验一次 role,这里只是入口。

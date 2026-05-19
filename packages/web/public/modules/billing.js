@@ -171,6 +171,7 @@ export async function refreshBalance() {
     // welcome 自然不弹。
     state.userCreatedAt = typeof user.created_at === 'string' ? user.created_at : null
     _setAdminLinkVisible(user.role === 'admin')
+    _setApiKeysLinkVisible(user.role === 'admin')
     _setHostAgentEntriesVisible(user.role === 'admin')
     _setRepoBarVisible(true)
     _hostAgentAdmin = user.role === 'admin'
@@ -179,6 +180,7 @@ export async function refreshBalance() {
     // 个人版无此接口;商用版 401 已被 api.js 处理,此处其它失败一律静默。
     _showPill(false)
     _setAdminLinkVisible(false)
+    _setApiKeysLinkVisible(false)
     _setHostAgentEntriesVisible(false)
     _setRepoBarVisible(false)
     _hostAgentAdmin = false
@@ -189,6 +191,16 @@ export async function refreshBalance() {
 
 function _setAdminLinkVisible(visible) {
   const el = $('admin-console-link')
+  if (!el) return
+  if (visible) el.removeAttribute('hidden')
+  else el.setAttribute('hidden', '')
+}
+
+// 与 _setAdminLinkVisible 同型:settings dropdown 里的 "API Key 管理" 入口默认
+// hidden,只在 refreshBalance 拿到 user.role === 'admin' 时翻显。Phase 6
+// admin-only:后端 /api/me/api-keys POST/DELETE 也是 403 ADMIN_ONLY。
+function _setApiKeysLinkVisible(visible) {
+  const el = $('api-keys-entry-btn')
   if (!el) return
   if (visible) el.removeAttribute('hidden')
   else el.setAttribute('hidden', '')
