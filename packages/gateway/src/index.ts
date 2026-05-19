@@ -25,3 +25,7 @@ export {
 // 注册查询函数(查 PricingCache.extra_system_prompt)。Personal 不调即 noop。
 // 仅 export setter + 类型,不暴露 promptSlots 内部 helper,避免被外部误依赖。
 export { setModelHintProvider, type ModelHintProvider } from './promptSlots.js'
+// Literature skill 注入钩子 — commercial 启动时 setLiteratureSkillProvider(...)
+// 注册"读 DB → 返渲染好的 SKILLS_LITERATURE slot"查询函数。Personal 不调即 noop。
+// 仅 export setter + 类型,不暴露内部 helper,避免外部误依赖 buildLiteratureSkillSlot()。
+export { setLiteratureSkillProvider, type LiteratureSkillProvider } from './promptSlots.js'

@@ -101,6 +101,11 @@ import {
   handleAdminPatchPricing,
 } from './admin/pricing.js'
 import {
+  handleAdminGetLiterature,
+  handleAdminPatchLiterature,
+  handleAdminTestLiterature,
+} from './admin/literature.js'
+import {
   handleAdminListPlans,
   handleAdminPatchPlan,
 } from './admin/plans.js'
@@ -530,6 +535,10 @@ export function createCommercialHandler(
     // T-60 超管定价
     { method: 'GET', path: '/api/admin/pricing', handler: handleAdminListPricing },
     { method: 'PATCH', pathPrefix: '/api/admin/pricing/', handler: handleAdminPatchPricing },
+    // DeepXiv 文献检索(平台级,单例) — exact-path 在 test 子资源之前
+    { method: 'GET', path: '/api/admin/literature', handler: handleAdminGetLiterature },
+    { method: 'PATCH', path: '/api/admin/literature', handler: handleAdminPatchLiterature },
+    { method: 'POST', path: '/api/admin/literature/test', handler: handleAdminTestLiterature },
     // T-60 超管充值套餐
     { method: 'GET', path: '/api/admin/plans', handler: handleAdminListPlans },
     { method: 'PATCH', pathPrefix: '/api/admin/plans/', handler: handleAdminPatchPlan },

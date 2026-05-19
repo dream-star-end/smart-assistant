@@ -4,13 +4,17 @@
  * Each slot has a fixed role, source, and priority. The slots are assembled
  * in cache-friendly order: static content first (rarely changes), dynamic last.
  *
- * Slot order:
- *   1. SOUL    — Agent persona (CLAUDE.md / SOUL.md), rarely changes
- *   2. USER    — User identity & preferences (USER.md), rarely changes
- *   3. AGENTS  — Platform capabilities, agent list, provider tips (semi-static)
- *   4. SKILLS  — Skill summaries (semi-static, changes when skills are added)
- *   5. MEMORY  — Agent notes (MEMORY.md), changes frequently
- *   6. TOOLS   — Tool usage hints, learning system instructions (static reference)
+ * Slot order(实际生效顺序;按 cache-friendly 静态在前、动态在后排):
+ *   1. SOUL              — Agent persona (CLAUDE.md / SOUL.md), rarely changes
+ *   2. USER              — User identity & preferences (USER.md), rarely changes
+ *   3. AGENTS            — Platform capabilities, agent list, provider tips (semi-static)
+ *   4. SKILLS            — Agent 自有 skill summaries (semi-static)
+ *   5. SKILLS_LITERATURE — 平台供给文献检索能力 (commercial 反向钩子注入,personal 不出现)
+ *   6. MEMORY            — Agent notes (MEMORY.md), changes frequently
+ *   7. TOOLS             — Tool usage hints, learning system instructions (static reference)
+ *   8. MODEL_HINT        — per-model 行为补丁 (commercial 反向钩子注入)
+ *   9. RESEARCH          — 用户显式选中的科研模式守则 (effortLevel='max')
+ *   10. REPO             — 当前会话 GitHub repo 绑定快照 (离 user 消息最近)
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { MemoryStore, SkillStore, paths, readAgentsConfig } from '@openclaude/storage'
@@ -446,6 +450,55 @@ export function buildModelHintSlot(ctx: PromptSlotContext): ModelHintSlot | null
   }
 }
 
+// ── SKILLS_LITERATURE slot — platform-managed literature search skill ──
+//
+// 设计要点(与 MODEL_HINT 同型):
+// - Gateway 对 commercial **零编译期依赖**。commercial 启动时调
+//   setLiteratureSkillProvider(...) 注入"读 DB 算出 enabled+token_set+default_size →
+//   返渲染好的 markdown"函数;personal 不调就 noop,该 slot 永远不出现。
+// - Provider 抛错 / 返非法形状 → 当作 null,只 log warn,不阻塞 prompt 构建。
+//   commercial 实现要 fail-soft(DB 暂时挂时返 null,不抛),master DB 闪断不应导致
+//   容器整段 system prompt 构建失败。
+// - 不在这里持任何 cache:每次容器 spawn 都会重 build prompt,DB 读一次就够。
+//   不引入 LISTEN/NOTIFY 避免继承 PricingCache 已知 listener-no-reconnect 技术债。
+// - 注入位置:在 SKILLS slot 之后 / MEMORY slot 之前 —— 与"agent 可用技能"在
+//   认知上同层,但属于平台供给(不是 agent 自学的),分段更清晰。
+export type LiteratureSkillProvider = () => Promise<PromptSlot | null>
+
+let _literatureSkillProvider: LiteratureSkillProvider | null = null
+
+/**
+ * 注入/清除 literature skill provider。
+ * - commercial 启动时调一次;shutdown 时调 setLiteratureSkillProvider(null)。
+ * - 测试 afterEach 务必 setLiteratureSkillProvider(null) 避免 cross-test 污染。
+ */
+export function setLiteratureSkillProvider(p: LiteratureSkillProvider | null): void {
+  _literatureSkillProvider = p
+}
+
+export async function buildLiteratureSkillSlot(): Promise<PromptSlot | null> {
+  if (!_literatureSkillProvider) return null
+  let raw: PromptSlot | null
+  try {
+    raw = (await _literatureSkillProvider()) ?? null
+  } catch (err) {
+    // 不让 provider 异常拖死整个 prompt 构建
+    // eslint-disable-next-line no-console
+    console.warn('[promptSlots] literatureSkillProvider threw, treating as null:', err)
+    return null
+  }
+  if (raw === null) return null
+  // 防御外部脏数据:必须 { name: string, content: string },content trim 后非空。
+  if (typeof raw !== 'object') return null
+  const name = (raw as { name: unknown }).name
+  const content = (raw as { content: unknown }).content
+  if (typeof name !== 'string' || name === '') return null
+  if (typeof content !== 'string') return null
+  const trimmed = content.trim()
+  if (!trimmed) return null
+  return { name, content: trimmed }
+}
+
 // ── Unified builder ──
 
 const SEPARATOR = '\n\n---\n\n'
@@ -507,6 +560,12 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
 
   const skills = await buildSkillsSlot(ctx)
   if (skills) slots.push(skills)
+
+  // 平台级技能(commercial 注入):文献检索。SKILLS 之后、MEMORY 之前 ——
+  // 与 agent 自有 skills 在认知上同层,但属于"平台供给"标记位,分段清晰。
+  // Personal 没注册 provider → null,该 slot 永远不出现。
+  const literature = await buildLiteratureSkillSlot()
+  if (literature) slots.push(literature)
 
   // Layer 3: Dynamic context
   const memory = await buildMemorySlot(ctx)

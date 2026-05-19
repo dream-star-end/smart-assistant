@@ -32,7 +32,9 @@ import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
 import { PricingCache, createModelHintProvider } from "./billing/pricing.js";
-import { setModelHintProvider } from "@openclaude/gateway";
+import { setModelHintProvider, setLiteratureSkillProvider } from "@openclaude/gateway";
+import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
+import { renderLiteratureSkillContent } from "./literatureSkill.js";
 import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
 import {
@@ -122,6 +124,11 @@ import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
 } from "./wechat/outboundReceiver.js";
+import {
+  LITERATURE_SEARCH_PATH,
+  makeLiteratureProxyHandler,
+  type LiteratureProxyHandler,
+} from "./literatureProxy.js";
 import { makeInboundDispatcher } from "./wechat/inboundDispatcher.js";
 import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
 import { makeIlinkSendAdapter } from "./wechat/ilinkSendAdapter.js";
@@ -607,6 +614,28 @@ export async function registerCommercial(
   // canonical id 直接取 PricingCache 命中行的 model_id(详见 createModelHintProvider 注释)。
   setModelHintProvider(createModelHintProvider(pricing));
 
+  // 0069 — SKILLS_LITERATURE slot 反向钩子:容器 spawn 重建 system prompt 时读窄配置,
+  // admin 改完下次 spawn 自然生效(无 cache / 无 LISTEN/NOTIFY,见 0069 migration 注释)。
+  // 关键最小权限分流:这里**只**调 getLiteratureSkillConfig()(不解密 token),bearer
+  // plaintext 只在 proxy 路径(getLiteratureConfig(false))才会出现。
+  // fail-soft:DB 抖动 → 返 null + warn,prompt 构建照样推进。
+  setLiteratureSkillProvider(async () => {
+    try {
+      const cfg = await getLiteratureSkillConfig();
+      if (!cfg.enabled || !cfg.token_set) return null;
+      return {
+        name: "SKILLS_LITERATURE",
+        content: renderLiteratureSkillContent(cfg),
+      };
+    } catch (err) {
+      // 单行 DB 读失败就跳过 slot,不要让 master DB 闪断拖垮容器系统 prompt 构建。
+      // 选 warn 不 error:这条 slot 是增强非必需,日志噪声压低。
+      // eslint-disable-next-line no-console
+      console.warn("[commercial] literatureSkillProvider read failed, skipping slot:", err);
+      return null;
+    }
+  });
+
   // T-24 虎皮椒:三件套齐全 → 生产 client;否则 undefined(handler 会 503)
   let hupijiao: HupijiaoClient | undefined;
   let hupijiaoConfig: Pick<HupijiaoConfig, "appId" | "appSecret"> | undefined;
@@ -997,10 +1026,20 @@ export async function registerCommercial(
           },
         },
       });
+      // /v3/literature/search — DeepXiv 文献检索 proxy。复用 identityRepo
+      // (同 anthropicProxy 的双因子身份),token 留在 master,容器只走 mTLS 内部 proxy。
+      // GET-then-INCR Lua 配额 + per-container 60req/5min in-memory limiter。
+      const literatureProxyHandler: LiteratureProxyHandler = makeLiteratureProxyHandler({
+        identityRepo,
+        redis,
+      });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (path === SERVER_AUTHORED_PATH) {
           return serverAuthoredHandler(req, res, ctx);
+        }
+        if (path === LITERATURE_SEARCH_PATH) {
+          return literatureProxyHandler(req, res, ctx);
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
           return codexTokenRefreshHandler(req, res, ctx);
@@ -2266,6 +2305,9 @@ export async function registerCommercial(
       // 0060 — 清空 model hint provider,避免 shutdown 后还有人持 stale closure
       // (用于测试热重启场景:同一进程多次 register/shutdown 不能让旧 cache 被新 cache 引用)
       try { setModelHintProvider(null); } catch { /* ignore */ }
+      // 0069 — 同理清空 literature skill provider(同进程热重启场景,且 closure 持
+      // pg pool 句柄,留着会阻止 closePool 释放最后引用)
+      try { setLiteratureSkillProvider(null); } catch { /* ignore */ }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closePool();

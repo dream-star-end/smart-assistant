@@ -62,6 +62,24 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/literature",
+    "handler": "handleAdminGetLiterature"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "path",
+    "pathValue": "/api/admin/literature",
+    "handler": "handleAdminPatchLiterature"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/literature/test",
+    "handler": "handleAdminTestLiterature"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/plans",
     "handler": "handleAdminListPlans"
   },
