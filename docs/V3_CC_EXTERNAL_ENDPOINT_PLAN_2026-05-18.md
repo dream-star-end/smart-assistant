@@ -186,15 +186,16 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 1. 删 `apiKeyAdmin.ts` 中 `requireAdmin` 函数 + 3 处调用(Layer 1)
 2. 删 `apiKeyIdentity.ts` `resolve` 内 `Phase 6 admin-only rollout gate` 注释块内代码(Layer 2)
 3. 测试中默认 role 改回 `user`、删除 Phase 6 describe blocks
-4. **无外部 API 变化**(错误码、URL、token 形态、SQL schema 均不变)
+4. 同步删/改文档:本节(§3.4)、§4 invariant #9、§7 Phase 6 行、§8 Phase 6 临时性标注,以及代码内 `Phase 6` 注释块(`apiKeyAdmin.ts` / `apiKeyIdentity.ts` 文件头与 inline 注释)
+5. **无外部 API 变化**(错误码、URL、token 形态、SQL schema 均不变)
 
 ---
 
-## 4. 8 个硬不变量(测试必须锁定)
+## 4. 9 个硬不变量(测试必须锁定)
 
 复用 anthropicProxy split plan §6.1 的 5 个 handler baseline invariants(release 4-stage / abort err.shape / commit→broadcast 顺序 / DeepSeek noop / model gate fail-closed —— 本任务**不重复列也不再写测试**,只引用)。
 
-本任务新增 8 条(原 v1 6 条 + Codex v1 MAJOR #3 新增 #7 #8):
+本任务新增 9 条(原 v1 6 条 + Codex v1 MAJOR #3 新增 #7 #8 + Phase 6 临时门控 #9):
 
 1. **API key 无明文存储** — repo.create 返完整 secret,**之后任何查询都不能返 secret**(只返 prefix + hash 比对的接口)。test: `findByPrefix(prefix)` 返回的 row 没有 secret 字段。
 2. **撤销立即生效** — `revoked_at IS NOT NULL` 的 key 在下一次 `resolve` 即 401。test: revoke 后第二次 request 拿到 401。
@@ -208,7 +209,7 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
    - Layer 1(管理面 HTTP):非 admin JWT 进 GET/POST/DELETE `/api/me/api-keys*` 一律 403 ADMIN_ONLY,user_api_keys 表**完全不被触达**(repo spy 调用次数为 0)。Admin gate 在 path regex **之前**,malformed path 也得 403 而非 404。
    - Layer 2(strategy.resolve):**顺序锁** — unknown prefix / revoked / secret-mismatch 三种 secret 未验对的情况下 `touchLastUsed` spy 必须为 0;**secret 验对 + role 非 admin** 时 `touchLastUsed` spy 必须 = 1(让 ops 通过 last_used_at 看到非 admin 试用),随后 throw `API_KEY_INVALID` → handler 401 UNAUTHORIZED + **preCheck / scheduler / journal / usage_records / credit_ledger 任意 SQL 都不能触达**。
    - 反枚举:Layer 2 的 `API_KEY_INVALID` 与 unknown/revoked/mismatch 同码,客户端无法靠错误码区分。
-   - fail-closed:`loadUserModelAuthz` 自身 throw 直接透传给 proxy/index.ts catch-all → 500 INTERNAL(不静默放行)。
+   - fail-closed:`loadUserModelAuthz` 自身 throw 不被这里 catch,透传给 proxy/index.ts identity 阶段(非 `IdentityError` 继续抛出)→ 由 commercial router 的统一 `handleError` 映成 500 INTERNAL(不静默放行)。
 
 > **注意 400 vs 403 边界**(Codex v2 修正):未知 model / `pricing.get(model)==null` / `enabled=false` 走 **400 `UNKNOWN_MODEL`** 在 `authorize` 之前,属 split plan §6.1 baseline #5 覆盖范围,本任务**不重复**测,只 reference;invariant #8 严格限定在"model 存在且 enabled,只是当前 uid 无 role/grants"的 authz 真路径。
 >

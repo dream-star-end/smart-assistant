@@ -207,8 +207,9 @@ export function makeApiKeyIdentityStrategy(
       // 未来 staff 协助创建仍可能绕过)也兜底拒绝。
       //
       // 错误码 `API_KEY_INVALID`:与 unknown/revoked/secret-mismatch 同型,
-      // anti-enumeration 一致。loadUserModelAuthz throw 直接透传给 handler
-      // (现行行为:proxy/index.ts 把未识别异常映成 500 INTERNAL,fail-closed)。
+      // anti-enumeration 一致。loadUserModelAuthz 自身 throw 不被这里 catch,
+      // 透传给 proxy/index.ts identity 阶段(non-IdentityError 继续抛出)→ 由
+      // commercial router 的统一 handleError 映成 500 INTERNAL,fail-closed。
       //
       // **去 gate**:删除以下整块 if 即可,无外部 API 变化。
       const authz = await deps.loadUserModelAuthz(row.userId);
