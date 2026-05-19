@@ -32,7 +32,9 @@
 
 -- ── 表 1:binding → current session 指针 ─────────────────────────────────────
 CREATE TABLE wechat_session_pointer (
-  binding_user_id    TEXT   PRIMARY KEY,        -- = wechat_bindings.user_id (master SQLite),逻辑 FK
+  binding_user_id    TEXT   PRIMARY KEY,        -- PG-side raw digit form(同 users.id / agent_containers.user_id);
+                                                 -- 写 master sqlite wechat_bindings 时 broker/dispatcher 会 prepend `c:`,
+                                                 -- 见 packages/commercial/src/wechat/userIds.ts
   current_session_id TEXT   NOT NULL,           -- = client_sessions.session_id
   updated_at         BIGINT NOT NULL,           -- epoch ms;每次 switch / new / inbound 触发即 stamp
   CONSTRAINT wsp_binding_user_id_chk CHECK (length(binding_user_id) BETWEEN 1 AND 64),
@@ -44,7 +46,7 @@ CREATE TABLE wechat_session_pointer (
 CREATE INDEX idx_wsp_current_session ON wechat_session_pointer(current_session_id);
 
 COMMENT ON TABLE wechat_session_pointer IS
-  'binding(微信 bot 绑定的 OC 用户)→ 当前 session 指针。P1 schema;P3 增加 lru_stack JSONB 列。binding_user_id 逻辑引用 master SQLite wechat_bindings.user_id,无 PG 级 FK。';
+  'binding(微信 bot 绑定的 OC 用户)→ 当前 session 指针。P1 schema;P3 增加 lru_stack JSONB 列。binding_user_id 是 PG-side raw digit(对应 users.id);跨 master sqlite 读 wechat_bindings 时 prepend `c:`,见 wechat/userIds.ts。';
 
 -- ── 表 2:iLink sendText 重试队列 + 跨重启幂等 tombstone ────────────────────
 --
