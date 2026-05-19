@@ -475,6 +475,10 @@ RSYNC_OPTS=(
   --exclude=/.claude
   --exclude=/.codex
   --exclude=/claude-code-best
+  # /packages/desktop 是 Electron 桌面端构建工件(本地 7G+,prod 历史已存在 409M
+  # dist/dist-ccb/dist-installer)。明确双向 exclude:既跳过源也避免 --delete-after
+  # 把 prod 现存版删掉。
+  --exclude=/packages/desktop
   # S12a — TS composite emit (rsync doesn't read .gitignore; explicit exclude)
   --exclude='dist-types/'
   --exclude='*.tsbuildinfo'
