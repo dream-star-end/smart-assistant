@@ -335,6 +335,7 @@ const TABS = {
   modelGrants: renderModelGrantsTab,
   feedback: renderFeedbackTab,
   inbox: renderInboxTab,
+  literature: renderLiteratureTab,
   settings: renderSettingsTab,
   audit: renderAuditTab,
   health: renderHealthTab,
@@ -4735,6 +4736,239 @@ async function saveSetting(key, btn) {
       applyHash()
     } catch (e) {
       toast(`${key} 保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
+}
+
+// ─── Tab: Literature (DeepXiv) ─────────────────────────────────────
+//
+// 平台级单例配置(literature_deepxiv_config id=1)。后端三个端点:
+//   GET    /api/admin/literature        → { config: { enabled, base_url, token_set,
+//                                                     token_hint, daily_cap, default_size,
+//                                                     timeout_sec, updated_at, updated_by } }
+//   PATCH  /api/admin/literature        → 局部更新;token 用显式 action 协议:
+//                                          { action: 'keep' | 'set' | 'clear', value? }
+//   POST   /api/admin/literature/test   → 真发 transformers/size=1 探测一次
+//                                          { result: { ok, status, result_count,
+//                                                     elapsed_ms, error? } }
+//
+// UI 策略:单页内联表单(非 modal),token 用 radio 三态显式区分,避免 mask 回显歧义。
+// 保存时只把 form 当前值打包成 PATCH(等同"覆盖式"),后端 normalize 时同样的 patch
+// 输入对当前 DB 没变的字段不会写 audit(等效 no-op),前端不做 diff。
+
+async function renderLiteratureTab() {
+  const data = await apiGet('/api/admin/literature')
+  const c = data?.config ?? {}
+  view().innerHTML = `
+    <div class="panel">
+      <h2>文献检索 (DeepXiv) <small>平台级单例配置 · 改完点保存立即生效</small></h2>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:12px">
+        启用后,容器 LLM 系统 prompt 会注入 <code>SKILLS_LITERATURE</code> 段,
+        引导其调用 <code>POST /v3/literature/search</code>;同时 admin 自检按钮可绕过
+        daily_cap 真发一次 transformers&amp;size=1 探测上游。token 在 DB 端 AEAD 加密,
+        本页永远只显示 <code>****last4</code> 掩码,不回显明文。
+      </div>
+      <div style="display:flex;flex-direction:column;gap:14px;max-width:680px">
+        <div>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:500">
+            <input type="checkbox" id="lit-enabled" ${c.enabled ? 'checked' : ''} />
+            启用文献检索
+          </label>
+          <small style="color:var(--muted)">关闭时 <code>/v3/literature/search</code>
+            直接 503,容器侧 prompt 不注入 SKILLS_LITERATURE 段。</small>
+        </div>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px">
+            base_url
+          </label>
+          <input type="text" id="lit-base"
+                 value="${escapeHtml(c.base_url ?? '')}"
+                 style="width:100%;max-width:480px"
+                 placeholder="https://data.rag.ac.cn" />
+          <small style="color:var(--muted)">纯 origin(scheme + host + 可选 port),
+            不允许 path/query/fragment/userinfo。proxy 拼路径时自动加
+            <code>/arxiv/?type=retrieve&amp;...</code>。</small>
+        </div>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px">
+            Token <small style="color:var(--muted)">(AEAD 加密存储,永不明文回显)</small>
+          </label>
+          <div style="margin-bottom:6px">
+            当前: <code id="lit-token-hint">${
+              c.token_set
+                ? escapeHtml(c.token_hint ?? '****????')
+                : '<span class="badge muted">未设置</span>'
+            }</code>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:4px">
+            <label style="display:flex;align-items:center;gap:6px">
+              <input type="radio" name="lit-token-action" value="keep" checked />
+              保持不变
+            </label>
+            <label style="display:flex;align-items:center;gap:6px">
+              <input type="radio" name="lit-token-action" value="set" />
+              写入新值
+              <input type="password" id="lit-token-new"
+                     placeholder="新 token(8..256 可见 ASCII)"
+                     style="flex:1;min-width:240px" disabled />
+            </label>
+            <label style="display:flex;align-items:center;gap:6px">
+              <input type="radio" name="lit-token-action" value="clear" />
+              清空 token(等同关闭文献检索能力)
+            </label>
+          </div>
+        </div>
+        <div style="display:flex;gap:24px;flex-wrap:wrap">
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px">
+              daily_cap
+            </label>
+            <input type="number" id="lit-cap" min="1" max="1000000" step="1"
+                   value="${escapeHtml(String(c.daily_cap ?? 10000))}"
+                   style="width:140px" />
+            <small style="display:block;color:var(--muted)">UTC 日上限,1..1000000</small>
+          </div>
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px">
+              default_size
+            </label>
+            <input type="number" id="lit-size" min="1" max="100" step="1"
+                   value="${escapeHtml(String(c.default_size ?? 10))}"
+                   style="width:140px" />
+            <small style="display:block;color:var(--muted)">LLM 缺省条数,1..100</small>
+          </div>
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px">
+              timeout_sec
+            </label>
+            <input type="number" id="lit-timeout" min="3" max="120" step="1"
+                   value="${escapeHtml(String(c.timeout_sec ?? 20))}"
+                   style="width:140px" />
+            <small style="display:block;color:var(--muted)">upstream 超时,3..120</small>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn-primary" id="lit-save">保存</button>
+          <button class="btn" id="lit-test">测试连接</button>
+        </div>
+        <div id="lit-test-result" style="margin-top:4px;min-height:20px"></div>
+        <div style="color:var(--muted);font-size:12px">
+          最后更新: ${c.updated_at ? escapeHtml(fmtDate(c.updated_at)) : '—'}
+          ${c.updated_by ? `by <span class="mono">${escapeHtml(c.updated_by)}</span>` : ''}
+        </div>
+      </div>
+    </div>
+  `
+
+  // Token radio:set 时启用 password 输入,其他状态 disabled 并清空(避免误传 stale 值)
+  const tokenNewInput = $('lit-token-new')
+  for (const r of view().querySelectorAll('input[name="lit-token-action"]')) {
+    r.addEventListener('change', () => {
+      if (r.checked && r.value === 'set') {
+        tokenNewInput.disabled = false
+        tokenNewInput.focus()
+      } else if (r.checked) {
+        tokenNewInput.disabled = true
+        tokenNewInput.value = ''
+      }
+    })
+  }
+
+  $('lit-save').addEventListener('click', (ev) => saveLiterature(ev.currentTarget))
+  $('lit-test').addEventListener('click', (ev) => testLiterature(ev.currentTarget))
+}
+
+function _readLiteratureTokenPatch() {
+  // radio 默认 checked=keep,前端永远会有一个选中(form 渲染时硬编码 checked),
+  // querySelector(':checked') 失败时 fail-soft 返 keep(等同不改),不抛 toast 阻断保存。
+  const checked = view().querySelector('input[name="lit-token-action"]:checked')
+  const action = checked?.value ?? 'keep'
+  if (action === 'set') {
+    const value = $('lit-token-new').value
+    // 客户端只做"非空"检查,不在浏览器复刻 server 的 [\x21-\x7e]{8,256} 字符集校验 ——
+    // 避免双源校验漂移,server normalize 抛 RangeError 时通过 toast 暴露给 admin。
+    if (value === '') {
+      throw new Error('token 不能为空(选了"写入新值"但未填)')
+    }
+    return { action: 'set', value }
+  }
+  if (action === 'clear') return { action: 'clear' }
+  return { action: 'keep' }
+}
+
+async function saveLiterature(btn) {
+  let tokenPatch
+  try {
+    tokenPatch = _readLiteratureTokenPatch()
+  } catch (e) {
+    toast(e.message, 'danger')
+    return
+  }
+  // 数值字段:空串/NaN 直接挡掉,不发请求 —— 与 saveSetting 同型守则。
+  // 注意 Number('') === 0 且 Number.isFinite(0) === true,必须先 trim 空串再 Number,
+  // 否则清空字段会绕过前端守门,靠后端 range 报错走出非预期 UX。
+  const capRaw = $('lit-cap').value.trim()
+  const sizeRaw = $('lit-size').value.trim()
+  const timeoutRaw = $('lit-timeout').value.trim()
+  if (capRaw === '' || sizeRaw === '' || timeoutRaw === '') {
+    toast('daily_cap / default_size / timeout_sec 不能为空', 'danger')
+    return
+  }
+  const cap = Number(capRaw)
+  const size = Number(sizeRaw)
+  const timeout = Number(timeoutRaw)
+  // 客户端只 finite check,整数 + 范围校验交给 server normalize(避双源漂移);
+  // 非整数走到 server 会用 RangeError → "invalid_daily_cap" 等,toast 给 admin 看
+  if (!Number.isFinite(cap) || !Number.isFinite(size) || !Number.isFinite(timeout)) {
+    toast('数值字段必须是有效数字', 'danger')
+    return
+  }
+  const patch = {
+    enabled: $('lit-enabled').checked,
+    base_url: $('lit-base').value.trim(),
+    token: tokenPatch,
+    daily_cap: cap,
+    default_size: size,
+    timeout_sec: timeout,
+  }
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('PATCH', '/api/admin/literature', patch)
+      toast('文献检索配置已保存')
+      applyHash()
+    } catch (e) {
+      toast(`保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
+}
+
+async function testLiterature(btn) {
+  const resultEl = $('lit-test-result')
+  resultEl.innerHTML = '<small style="color:var(--muted)">探测中…</small>'
+  await withBtnLoading(btn, async () => {
+    try {
+      const data = await apiJson('POST', '/api/admin/literature/test', {})
+      const r = data?.result ?? {}
+      if (r.ok) {
+        resultEl.innerHTML = `
+          <span class="badge ok">ok</span>
+          status=<code>${escapeHtml(String(r.status ?? ''))}</code>
+          result_count=<code>${escapeHtml(String(r.result_count ?? ''))}</code>
+          elapsed=<code>${escapeHtml(String(r.elapsed_ms ?? ''))}ms</code>
+        `
+      } else {
+        resultEl.innerHTML = `
+          <span class="badge muted">failed</span>
+          error=<code>${escapeHtml(String(r.error ?? 'unknown'))}</code>
+          ${r.status !== null && r.status !== undefined
+            ? `status=<code>${escapeHtml(String(r.status))}</code>` : ''}
+          elapsed=<code>${escapeHtml(String(r.elapsed_ms ?? ''))}ms</code>
+        `
+      }
+    } catch (e) {
+      resultEl.innerHTML = `<span class="badge muted">error</span> ${escapeHtml(e.message)}`
+      // 429 冷却 / 401 鉴权这类要再用 toast 提示,resultEl 旁路只是 inline 摘要
+      toast(`测试失败: ${e.message}`, 'danger', toastOptsFromError(e))
     }
   })
 }
