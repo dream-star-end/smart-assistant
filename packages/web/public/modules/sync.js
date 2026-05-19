@@ -1072,7 +1072,8 @@ export async function syncSessionsFromServer() {
  * 2026-05-06 §4.5 改动 11 — messages 内 ephemeral / server-authoritative 字段
  * strip。pushSessionToServer 已经 strip 了 session 级 ephemeral 字段,但消息
  * 内的 _rawMeta / _partial / _completed / output / error / bashTail / inputJson /
- * inputPreview / metaText 一直没清,会跟着 PUT body 上服务器,污染权威源。
+ * inputPreview / partialJson / metaText 一直没清,会跟着 PUT body 上服务器,
+ * 污染权威源。
  *
  * 双层防御:server 端 storage.upsertClientSession 也 strip(allowlist 模式,
  * 见 packages/storage/src/sessionsDb.ts clientPutStrip 路径);本函数是客户端
@@ -1090,6 +1091,10 @@ export async function syncSessionsFromServer() {
  *
  * 输入数组不可变;返回新数组(浅拷贝消息对象,删 ephemeral keys)。
  */
+// `partialJson` is the gateway-streamed `input_json_delta` accumulator,
+// useful only while a tool_use block is still open; never persisted.
+// Note: comments INSIDE the array literal would be misparsed by
+// pureFunctions.test.ts's contract self-check regex — keep them out.
 const _MSG_EPHEMERAL_KEYS = [
   '_rawMeta',
   '_partial',
@@ -1099,6 +1104,7 @@ const _MSG_EPHEMERAL_KEYS = [
   'bashTail',
   'inputJson',
   'inputPreview',
+  'partialJson',
   'metaText',
 ]
 const _MSG_SERVER_AUTHORITATIVE_KEYS = [

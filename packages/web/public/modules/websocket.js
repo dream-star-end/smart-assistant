@@ -2234,16 +2234,49 @@ export function handleOutbound(frame) {
         const existing = sess.messages.find((m) => m.id === mid)
         if (existing) {
           existing.inputPreview = block.inputPreview || existing.inputPreview
+          // partialJson is the cumulative `input_json_delta` buffer (≤ 64 KiB,
+          // dropped beyond cap; see ccbMessageParser.PARTIAL_JSON_FRAME_MAX_CHARS).
+          // It drives partial Edit/Write body diff rendering via parsePartialJson.
+          if (typeof block.partialJson === 'string') existing.partialJson = block.partialJson
           if (block.inputJson) existing.inputJson = block.inputJson
           existing._partial = !!block.partial
+          // State-correctness: clear the stream buffer the moment the block
+          // becomes final, regardless of whether this session is currently
+          // visible. If we only cleared inside the render gate below,
+          // background sessions would keep a stale `partialJson` on the
+          // message and `_safeInput` could render the half-parsed mid-stream
+          // view when the user later switched to that session. Normally
+          // `inputJson` is now authoritative, but for truncated / errored /
+          // schema-shifted final frames lacking `inputJson` we must NOT fall
+          // back to the stale buffer — the renderer should `inputPreview` →
+          // null, not paint the wrong content.
+          if (!block.partial) {
+            delete existing.partialJson
+            existing._partialRafPending = false
+          }
           if (sess.id === state.currentSessionId) {
             if (block.partial) {
-              // Partial streaming: lightweight summary-only update (avoid full DOM rebuild)
-              const el = document.querySelector(`[data-msg-id="${existing.id}"]`)
-              const sumEl = el?.querySelector('.tool-card-summary')
-              if (sumEl) sumEl.textContent = buildToolUseLabel(block).slice(block.toolName?.length || 0)
+              // Partial streaming: full re-render of the tool card body so the
+              // Edit/Write diff/content streams character-by-character. Coalesce
+              // back-to-back partial frames via a single rAF — Anthropic SSE can
+              // fire many `input_json_delta`s per frame, but the user only
+              // perceives one paint per rAF tick anyway.
+              if (!existing._partialRafPending) {
+                existing._partialRafPending = true
+                requestAnimationFrame(() => {
+                  existing._partialRafPending = false
+                  // By the time the rAF fires, `existing` may already carry
+                  // the final `inputJson` (race: final frame arrived after we
+                  // queued this rAF). That's fine — `_safeInput` prefers
+                  // inputJson over partialJson, so the render uses truth.
+                  _deps.updateMessageEl(existing)
+                })
+              }
             } else {
-              // Final: full re-render with complete inputJson
+              // Final: any pending partial rAF is already drained (flag
+              // cleared above). Render the authoritative state directly.
+              // If the pending callback still fires, it harmlessly re-renders
+              // the same final state.
               _deps.updateMessageEl(existing)
             }
           }
@@ -2265,6 +2298,9 @@ export function handleOutbound(frame) {
           blockId: block.blockId,
           inputPreview: block.inputPreview || '',
           inputJson: block.inputJson || null,
+          // Carry partialJson from the very first frame so even the initial
+          // partial render of an Edit/Write card shows streamed content.
+          partialJson: typeof block.partialJson === 'string' ? block.partialJson : null,
           _partial: !!block.partial,
           _completed: false,
           output: null,

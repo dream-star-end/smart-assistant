@@ -39,6 +39,15 @@ const PARSER_TOOL_OUTPUT_MAX_BYTES = 4 * 1024
 const PARSER_TOOL_INPUT_JSON_MAX_BYTES = 8 * 1024
 const PARSER_TOOL_INPUT_PREVIEW_MAX_CHARS = 500
 
+/** Maximum length (chars) of the per-frame `partialJson` payload sent on
+ *  `partial: true` tool_use frames. Once the cumulative `input_json_delta`
+ *  string exceeds this cap we DROP the `partialJson` field from subsequent
+ *  partial frames — the web frontend gracefully falls back to `inputPreview`
+ *  and will receive the full final input via the `inputJson` field on the
+ *  final (`partial: false`) frame, which is built from the SDK's assistant
+ *  snapshot (see `_handleAssistant`) rather than the gateway's accumulator. */
+const PARTIAL_JSON_FRAME_MAX_CHARS = 64 * 1024
+
 /**
  * Truncate `s` to at most `maxBytes` UTF-8 bytes WITHOUT splitting a multi-
  * byte sequence. Walks back from the byte budget to the last UTF-8 leading
@@ -638,18 +647,23 @@ export class CcbMessageParser {
         const tool = toolId ? this.streamingToolUses.get(toolId) : undefined
         if (tool) {
           tool.partialJson += delta.partial_json
+          // Carry full accumulated partial JSON ONLY while under the cap.
+          // Past the cap, drop the field entirely (frontend then falls back
+          // to `inputPreview`, and the final `inputJson` frame will carry
+          // the truth). Avoids re-sending megabyte-class strings on every
+          // delta when a model dumps a huge Edit `new_string`.
+          const carryPartialJson = tool.partialJson.length <= PARTIAL_JSON_FRAME_MAX_CHARS
+          const block: Record<string, unknown> = {
+            kind: 'tool_use',
+            blockId: toolId!,
+            toolName: tool.name,
+            inputPreview: tool.partialJson.slice(0, 400),
+            partial: true,
+          }
+          if (carryPartialJson) block.partialJson = tool.partialJson
           this.onEvent({
             kind: 'block',
-            block: stampToolUseId(
-              withParent({
-                kind: 'tool_use',
-                blockId: toolId!,
-                toolName: tool.name,
-                inputPreview: tool.partialJson.slice(0, 400),
-                partial: true,
-              }),
-              toolId!,
-            ),
+            block: stampToolUseId(withParent(block as any), toolId!),
           })
         }
       }

@@ -125,6 +125,7 @@ const _MSG_EPHEMERAL_KEYS_TEST = [
   'bashTail',
   'inputJson',
   'inputPreview',
+  'partialJson',
   'metaText',
 ]
 const _MSG_SERVER_AUTHORITATIVE_KEYS_TEST = [

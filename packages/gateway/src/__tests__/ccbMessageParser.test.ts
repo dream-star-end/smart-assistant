@@ -254,6 +254,142 @@ describe('CcbMessageParser: tool_use', () => {
     assert.equal(detected[0].name, 'CronCreate')
     assert.equal(detected[0].input.cron, '0 9 * * *')
   })
+
+  // partialJson streaming — drives partial Edit/Write body rendering on web.
+  it('carries `partialJson` on every input_json_delta partial frame', () => {
+    const { parser, events } = createParser()
+
+    // content_block_start: emits empty-input partial frame (no partialJson yet).
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tu_p1', name: 'Edit' },
+      },
+    } as any)
+    // First delta.
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"file_path":"/x"' },
+      },
+    } as any)
+    // Second delta.
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: ',"old_string":"hello' },
+      },
+    } as any)
+
+    // start frame + 2 delta frames
+    assert.equal(events.length, 3)
+    const startFrame = events[0] as any
+    const delta1 = events[1] as any
+    const delta2 = events[2] as any
+
+    // content_block_start: no partialJson yet (no deltas applied), partial true.
+    assert.equal(startFrame.block.partial, true)
+    assert.equal(startFrame.block.partialJson, undefined)
+
+    // Each delta carries the full accumulated partialJson string.
+    assert.equal(delta1.block.partial, true)
+    assert.equal(delta1.block.partialJson, '{"file_path":"/x"')
+    assert.equal(delta1.block.inputPreview, '{"file_path":"/x"')
+
+    assert.equal(delta2.block.partial, true)
+    assert.equal(delta2.block.partialJson, '{"file_path":"/x","old_string":"hello')
+  })
+
+  it('drops `partialJson` on partial frames once accumulated past 64 KiB cap', () => {
+    const { parser, events } = createParser()
+
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tu_p2', name: 'Write' },
+      },
+    } as any)
+
+    // Push a chunk that lands JUST AT the cap — must still carry partialJson.
+    const exactlyCap = '{"content":"' + 'x'.repeat(64 * 1024 - '{"content":"'.length)
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: exactlyCap },
+      },
+    } as any)
+    // One byte beyond cap — partialJson must be dropped from the frame.
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: 'x' },
+      },
+    } as any)
+
+    const atCap = events[1] as any
+    const overCap = events[2] as any
+
+    assert.equal(typeof atCap.block.partialJson, 'string')
+    assert.equal(atCap.block.partialJson.length, 64 * 1024)
+
+    assert.equal(overCap.block.partialJson, undefined)
+    // inputPreview survives (it's a fixed 400-char slice — not bandwidth bound).
+    assert.equal(typeof overCap.block.inputPreview, 'string')
+    assert.equal(overCap.block.partial, true)
+  })
+
+  it('final assistant snapshot ignores in-flight partialJson and carries full inputJson', () => {
+    const { parser, events } = createParser()
+
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tu_p3', name: 'Edit' },
+      },
+    } as any)
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"file_path":"/x","new_string":"abc' },
+      },
+    } as any)
+    // Final SDK snapshot — uses c.input verbatim, not the partial accumulator.
+    parser.parse({
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tu_p3',
+            name: 'Edit',
+            input: { file_path: '/x', new_string: 'abc' },
+          },
+        ],
+      },
+    } as any)
+
+    const finalFrame = events[events.length - 1] as any
+    assert.equal(finalFrame.block.partial, false)
+    assert.deepEqual(finalFrame.block.inputJson, { file_path: '/x', new_string: 'abc' })
+    // Final frame intentionally has no partialJson — clients should prefer inputJson.
+    assert.equal(finalFrame.block.partialJson, undefined)
+  })
 })
 
 // ── Tool result ──
