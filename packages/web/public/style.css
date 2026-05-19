@@ -7197,104 +7197,112 @@ body.body-landing {
   50% { opacity: 0; }
 }
 
-/* 右栏 工具链时间线 */
-.landing-demo-toolchain {
+/* 右栏 对话回放 */
+.landing-demo-chat {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
   padding: var(--space-4) var(--space-5);
 }
-.landing-demo-tool-step {
-  display: grid;
-  grid-template-columns: 32px 1fr;
-  gap: var(--space-3);
-  align-items: stretch;
+.landing-demo-chat-node {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
   opacity: 0;
   transform: translateY(8px);
-  transition: opacity 460ms ease-out, transform 460ms ease-out;
+  transition: opacity 420ms ease-out, transform 420ms ease-out;
 }
-/* 当 section.is-playing 触发时:每步 stagger fade-in */
-.landing-demo.is-playing .landing-demo-tool-step { opacity: 1; transform: translateY(0); }
-.landing-demo.is-playing .landing-demo-tool-step[data-step="1"] { transition-delay: 0.15s; }
-.landing-demo.is-playing .landing-demo-tool-step[data-step="2"] { transition-delay: 0.55s; }
-.landing-demo.is-playing .landing-demo-tool-step[data-step="3"] { transition-delay: 0.95s; }
-.landing-demo.is-playing .landing-demo-tool-step[data-step="4"] { transition-delay: 1.35s; }
-.landing-demo.is-playing .landing-demo-tool-step[data-step="5"] { transition-delay: 1.75s; }
-.landing-demo.is-playing .landing-demo-tool-step[data-step="6"] { transition-delay: 2.15s; }
+/* user 气泡靠右 */
+.landing-demo-chat-user { flex-direction: row-reverse; }
 
-/* 左侧 rail + marker(连接线 + 编号圆点) */
-.landing-demo-tool-rail {
-  position: relative;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-}
-.landing-demo-tool-rail::before {
-  content: "";
-  position: absolute;
-  top: 28px;
-  bottom: -12px;
-  left: 50%;
-  width: 1px;
-  background: color-mix(in srgb, var(--accent) 30%, var(--border));
-  transform: translateX(-0.5px);
-}
-.landing-demo-tool-step:last-child .landing-demo-tool-rail::before { display: none; }
-.landing-demo-tool-marker {
+/* section.is-playing 时:节点按节奏依次出现(~6 秒走完) */
+.landing-demo.is-playing .landing-demo-chat-node { opacity: 1; transform: translateY(0); }
+.landing-demo.is-playing .landing-demo-chat-node[data-step="1"] { transition-delay: 0.2s; }
+.landing-demo.is-playing .landing-demo-chat-node[data-step="2"] { transition-delay: 1.2s; }
+.landing-demo.is-playing .landing-demo-chat-node[data-step="3"] { transition-delay: 2.3s; }
+.landing-demo.is-playing .landing-demo-chat-node[data-step="4"] { transition-delay: 3.5s; }
+.landing-demo.is-playing .landing-demo-chat-node[data-step="5"] { transition-delay: 4.8s; }
+.landing-demo.is-playing .landing-demo-chat-node[data-step="6"] { transition-delay: 5.8s; }
+
+/* 头像圆点 */
+.landing-demo-chat-avatar {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: var(--accent-fg, #fff);
-  font-size: 11px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
-}
-
-.landing-demo-tool-body {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-bottom: var(--space-2);
-}
-.landing-demo-tool-head {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.landing-demo-tool-name {
-  display: inline-flex;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.02em;
-  background: var(--bg-subtle);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  margin-top: 2px;
+}
+.landing-demo-chat-avatar-user { background: var(--bg-subtle); color: var(--fg); border: 1px solid var(--border); }
+.landing-demo-chat-avatar-agent { background: var(--accent); color: var(--accent-fg, #fff); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+
+/* 对话气泡 */
+.landing-demo-chat-bubble {
+  max-width: 86%;
+  padding: 10px 14px;
+  border-radius: 14px;
+  font-size: var(--text-sm);
+  line-height: 1.55;
   color: var(--fg);
 }
-.landing-demo-tool-chat   { background: color-mix(in srgb, var(--accent) 14%, var(--bg-subtle)); color: var(--accent); }
-.landing-demo-tool-tex    { background: #006400; color: #d4ffd4; }
-.landing-demo-tool-py     { background: #2f5d9c; color: #ffe27a; }
-.landing-demo-tool-plot   { background: #5a2d82; color: #f3d8ff; }
-.landing-demo-tool-pandoc { background: #b86d2c; color: #fff3e3; }
-.landing-demo-tool-review { background: #444; color: #f5f5f5; }
-.landing-demo-tool-action {
-  font-size: var(--text-sm);
-  color: var(--fg-strong);
-  font-weight: 600;
+.landing-demo-chat-bubble em { font-style: normal; color: var(--accent); font-weight: 600; }
+.landing-demo-chat-bubble-user {
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-subtle));
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-top-right-radius: 4px;
 }
-.landing-demo-tool-line {
-  font-size: var(--text-xs);
-  color: var(--fg-muted);
+.landing-demo-chat-bubble-agent {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-top-left-radius: 4px;
+}
+
+/* 工具调用卡片(Write / Bash 等) */
+.landing-demo-chat-tool { padding-left: 38px; }
+.landing-demo-chat-tool-card {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-base, var(--bg-subtle));
+  overflow: hidden;
+}
+.landing-demo-chat-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-subtle));
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.landing-demo-chat-tool-name {
+  font-weight: 700;
+  color: var(--accent);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.landing-demo-chat-tool-path { color: var(--fg-strong); font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.landing-demo-chat-tool-status { color: var(--fg-muted); font-size: 11px; }
+.landing-demo-chat-tool-card .landing-demo-code {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* Agent 总结气泡里的文件 pills */
+.landing-demo-chat-files {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  margin-top: 8px;
 }
 .landing-demo-pill {
   display: inline-flex;
@@ -7325,50 +7333,6 @@ body.body-landing {
 .landing-demo-code .kw  { color: #c678dd; font-weight: 600; }
 .landing-demo-code .fn  { color: #61afef; }
 .landing-demo-code .num { color: #d19a66; }
-
-/* 14 张图占位 */
-.landing-demo-figs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 4px;
-}
-.landing-demo-fig {
-  width: 36px;
-  height: 26px;
-  border-radius: 4px;
-  background:
-    linear-gradient(135deg,
-      color-mix(in srgb, var(--accent) 50%, transparent) 0%,
-      color-mix(in srgb, var(--accent) 12%, transparent) 100%);
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
-  position: relative;
-  overflow: hidden;
-}
-.landing-demo-fig::after {
-  /* 模拟一条数据曲线 */
-  content: "";
-  position: absolute;
-  left: 4px;
-  right: 4px;
-  bottom: 4px;
-  height: 12px;
-  background:
-    linear-gradient(transparent 60%, color-mix(in srgb, var(--accent) 65%, transparent) 60%, color-mix(in srgb, var(--accent) 65%, transparent) 62%, transparent 62%),
-    radial-gradient(ellipse at 30% 100%, color-mix(in srgb, var(--accent) 45%, transparent) 0%, transparent 60%);
-  border-radius: 2px;
-}
-.landing-demo-fig-more {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--accent);
-  background: var(--accent-soft);
-  border-color: var(--accent-border, var(--border));
-}
-.landing-demo-fig-more::after { display: none; }
 
 /* 列脚 pros / cons */
 .landing-demo-col-foot {
@@ -7566,7 +7530,9 @@ body.body-landing {
   .landing-demo-case-stats { grid-template-columns: repeat(2, 1fr); }
   .landing-demo-window { margin: var(--space-3) var(--space-3); }
   .landing-demo-col-head, .landing-demo-col-foot { padding-left: var(--space-4); padding-right: var(--space-4); }
-  .landing-demo-toolchain { padding: var(--space-3) var(--space-4); }
+  .landing-demo-chat { padding: var(--space-3) var(--space-4); }
+  .landing-demo-chat-tool { padding-left: 0; }
+  .landing-demo-chat-bubble { max-width: 100%; }
   .landing-demo-bench { padding: var(--space-4); }
   .landing-demo-bench-table th, .landing-demo-bench-table td { padding: 8px 6px; font-size: 12px; }
   .landing-demo-bench-table { font-size: 12px; }
@@ -7574,7 +7540,7 @@ body.body-landing {
 
 /* ── prefers-reduced-motion:终态直接显示,关 live dot ── */
 @media (prefers-reduced-motion: reduce) {
-  .landing-demo-tool-step { opacity: 1 !important; transform: none !important; transition: none !important; }
+  .landing-demo-chat-node { opacity: 1 !important; transform: none !important; transition: none !important; }
   .landing-demo-live-dot { animation: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 32%, transparent); }
   .landing-demo-plain-cursor { animation: none; }
 }
