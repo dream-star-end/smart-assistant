@@ -28,7 +28,6 @@ import {
   isDeepseekModel,
   isAnthropicInvalidRequestError,
   isClientAbort,
-  makeFinalizer,
   rewriteMetadataDeviceId,
   stripMalformedThinkingBlocks,
   DEEPSEEK_UPSTREAM_ENDPOINT,
@@ -38,6 +37,7 @@ import {
   _UsageObserver,
   type ProxyBody,
 } from "../http/anthropicProxy.js";
+import { makeFinalizer } from "../billing/proxyBilling.js";
 import { rootLogger } from "../logging/logger.js";
 import { HttpError } from "../http/util.js";
 import type { ModelPricing } from "../billing/pricing.js";
