@@ -1,5 +1,5 @@
 // OpenClaude — UI helpers (toast, modal, lightbox)
-import { $, htmlSafeEscape } from './dom.js?v=69b5cb23'
+import { $, htmlSafeEscape } from './dom.js?v=6218aca6'
 
 let _toastTimer = null
 /**
