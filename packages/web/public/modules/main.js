@@ -1866,11 +1866,14 @@ function _wireLandingButtons() {
       setAuthMode('login')
     } catch {}
   }
-  ;['landing-register-btn', 'landing-hero-register-btn', 'landing-foot-register-btn'].forEach(
-    (id) => {
-      $(id)?.addEventListener('click', goRegister)
-    },
-  )
+  ;[
+    'landing-register-btn',
+    'landing-hero-register-btn',
+    'landing-foot-register-btn',
+    'landing-demo-coding-register',
+  ].forEach((id) => {
+    $(id)?.addEventListener('click', goRegister)
+  })
   ;['landing-login-btn', 'landing-hero-login-btn'].forEach((id) => {
     $(id)?.addEventListener('click', goLogin)
   })
@@ -1907,6 +1910,118 @@ function _wireLandingButtons() {
       else fail()
     })
   })
+  _wireLandingDemo()
+}
+
+// ── #demo section wiring ───────────────────────────────────────
+// - 板块 tab 切换(科研 / 编程):segmented control,切 aria + hidden
+// - IntersectionObserver 触发 .is-playing(只播一次,出视口不取消)
+// - data-count-to 数字滚动到目标值(只触发一次,reduced-motion 直接显示终态)
+function _wireLandingDemo() {
+  const demoSection = document.getElementById('demo')
+  if (!demoSection) return
+
+  // 1. tab 切换
+  const tabs = demoSection.querySelectorAll('[data-demo-tab]')
+  const panels = {
+    research: document.getElementById('demo-panel-research'),
+    coding: document.getElementById('demo-panel-coding'),
+  }
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const key = tab.dataset.demoTab
+      tabs.forEach((t) => {
+        const active = t === tab
+        t.classList.toggle('is-active', active)
+        t.setAttribute('aria-selected', active ? 'true' : 'false')
+      })
+      Object.entries(panels).forEach(([k, p]) => {
+        if (!p) return
+        p.hidden = k !== key
+      })
+    })
+  })
+
+  // 1.b tab 键盘模型:左右箭头切换,active tab tabindex=0,inactive=-1
+  // (role=tab 的标准 a11y 行为,屏幕阅读器场景必须)
+  const updateTabFocus = () => {
+    tabs.forEach((t) => {
+      t.tabIndex = t.classList.contains('is-active') ? 0 : -1
+    })
+  }
+  updateTabFocus()
+  tabs.forEach((tab, idx) => {
+    tab.addEventListener('click', updateTabFocus)
+    tab.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+      e.preventDefault()
+      const dir = e.key === 'ArrowRight' ? 1 : -1
+      const next = tabs[(idx + dir + tabs.length) % tabs.length]
+      next.click()
+      next.focus()
+    })
+  })
+
+  // 2. is-playing 触发 + count-up(合并在同一 IO 里,只播一次)
+  // window.matchMedia?.(): 比裸 matchMedia 安全,避免极个别旧 webview 抛 ReferenceError
+  const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
+  const countTargets = demoSection.querySelectorAll('[data-count-to]')
+  // reduced-motion:直接显示终态,不做动画。保持千分位格式跟动画终态一致
+  if (reduced) {
+    demoSection.classList.add('is-playing')
+    countTargets.forEach((el) => {
+      const n = Number(el.dataset.countTo || 0)
+      el.textContent = Number.isFinite(n) ? n.toLocaleString('en-US') : String(el.dataset.countTo ?? '')
+    })
+    return
+  }
+
+  let played = false
+  const startCountUp = () => {
+    countTargets.forEach((el) => {
+      const target = Number(el.dataset.countTo || 0)
+      if (!Number.isFinite(target) || target <= 0) {
+        el.textContent = String(target)
+        return
+      }
+      const duration = 1200 // ms
+      const t0 = performance.now()
+      const tick = (now) => {
+        const p = Math.min(1, (now - t0) / duration)
+        // ease-out cubic
+        const eased = 1 - Math.pow(1 - p, 3)
+        const val = Math.round(target * eased)
+        // 大数加千分位,避免 6000 看起来太"短"
+        el.textContent = val.toLocaleString('en-US')
+        if (p < 1) requestAnimationFrame(tick)
+        else el.textContent = target.toLocaleString('en-US')
+      }
+      requestAnimationFrame(tick)
+    })
+  }
+
+  if (!('IntersectionObserver' in window)) {
+    // 老浏览器 fallback:直接播
+    demoSection.classList.add('is-playing')
+    startCountUp()
+    return
+  }
+
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting && !played) {
+          played = true
+          demoSection.classList.add('is-playing')
+          startCountUp()
+          io.disconnect()
+          break
+        }
+      }
+    },
+    { threshold: 0.18 },
+  )
+  io.observe(demoSection)
 }
 
 // Delegated media-error retry. `error` events on <img>/<audio>/<video> don't
