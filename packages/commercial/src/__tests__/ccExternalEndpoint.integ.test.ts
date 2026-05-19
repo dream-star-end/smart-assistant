@@ -391,6 +391,9 @@ class MockReq extends Readable {
       host: "x.invalid",
       "content-type": "application/json",
       "anthropic-version": "2023-06-01",
+      // CC 外接 UA gate(2026-05-19,plan §3.5):integ test 默认走真实 CC CLI
+      // UA 形态;UA 不对的负例显式在 headers 里覆盖。
+      "user-agent": "claude-cli/2.1.888 (external, cli)",
       ...(opts.headers ?? {}),
     };
     if (opts.body !== undefined) {
@@ -757,6 +760,33 @@ describe("auth failure — invalid token 不应留下任何账务副作用", () 
     assert.equal(res.statusCode, 401);
     assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 1);
     assert.equal(h.apiKeyRepoSpy.touchLastUsedCalls.length, 0, "secret 错不能 bump last_used");
+  });
+
+  // §3.5 UA gate(2026-05-19 加):端到端验 UA 不对 → 401 + 0 副作用 + anti-enum
+  test("非 claude-cli UA → 401,不查 DB / 不 preCheck / 不写 journal(anti-enum)", async () => {
+    const h = buildHarness();
+    const goodAuth = `Bearer oc-cc.${FIXED_PREFIX}.${FIXED_SECRET}`;
+    for (const ua of [
+      "curl/8.4.0",
+      "PostmanRuntime/7.36.0",
+      "Mozilla/5.0",
+      "python-requests/2.31.0",
+      "claude-code/2.1.888", // 注意:不是 claude-cli/,易混淆故意拦
+      "",
+    ]) {
+      const res = await h.run({
+        headers: { authorization: goodAuth, "user-agent": ua },
+      });
+      assert.equal(res.statusCode, 401, `ua=${JSON.stringify(ua)} 应 401`);
+    }
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0, "UA 不对不应触碰 DB");
+    assert.equal(h.apiKeyRepoSpy.touchLastUsedCalls.length, 0);
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    assert.equal(h.schedulerSpy.pickCalls, 0);
+    const journalInserts = h.pool.queries.filter((q) =>
+      q.sql.trim().toUpperCase().startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL"),
+    );
+    assert.equal(journalInserts.length, 0, "UA gate fail → 不应写 journal");
   });
 });
 

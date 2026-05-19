@@ -344,6 +344,9 @@ class MockReq extends Readable {
     this.headers = {
       host: "x.invalid",
       "content-type": "application/json",
+      // CC 外接 UA gate(2026-05-19,plan §3.5):integ test 默认走真实 CC CLI
+      // UA 形态;UA 不对的负例显式在 headers 里覆盖。
+      "user-agent": "claude-cli/2.1.888 (external, cli)",
       ...(opts.headers ?? {}),
     };
     if (opts.body !== undefined) {

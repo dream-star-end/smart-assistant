@@ -110,8 +110,20 @@ function makeRepoSpy(initialRow: ApiKeyRow | null = null): RepoSpy {
 /** 假 PricingCache — strategy.resolve 不消费它,只有 authorize 走 authzModels。 */
 const FAKE_PRICING = {} as unknown as PricingCache;
 
-function reqWith(auth: string | undefined): IncomingMessage {
-  return { headers: { authorization: auth } } as unknown as IncomingMessage;
+/**
+ * 默认 UA 用真实 CC CLI 输出形态 `claude-cli/<v> (<USER_TYPE>, <ENTRYPOINT>)`,
+ * 让大部分 case 自然过 UA 门控(2026-05-19 新增 §3.5)。需要测 UA 不对的 case
+ * 显式传 `ua` 覆盖。
+ */
+const DEFAULT_CC_UA = "claude-cli/2.1.888 (external, cli)";
+
+function reqWith(
+  auth: string | undefined,
+  ua: string | undefined = DEFAULT_CC_UA,
+): IncomingMessage {
+  return {
+    headers: { authorization: auth, "user-agent": ua },
+  } as unknown as IncomingMessage;
 }
 
 const CTX = { hostUuid: "external-api-key", boundIp: "1.2.3.4" };
@@ -177,6 +189,147 @@ describe("apiKeyIdentity.resolve — 错误码三分", () => {
       );
     }
     assert.equal(spy.findByPrefixCalls.length, 0, "格式错误不应触碰 DB");
+  });
+});
+
+describe("apiKeyIdentity.resolve — §3.5 UA 入站门控(2026-05-19 加)", () => {
+  // 不变量:
+  //   - UA gate 在 token parse 之前;UA 不对 → 不查 DB
+  //   - UA 不对 → 同一 API_KEY_INVALID 错误码(anti-enum,与 unknown/revoked
+  //     /secret-mismatch/non-admin 不区分)
+  //   - logger.warn 被调,reason='ua_mismatch'
+  //   - 合法 prefix 覆盖 ant/external/firstParty + cli/vscode/sdk 各变体
+  //   - 大小写不敏感(prefix `^claude-cli/` 用 /i flag)
+
+  function makeLogSpy() {
+    const calls: Array<{ event: string; ctx: unknown }> = [];
+    return {
+      logger: {
+        warn: (event: string, ctx: unknown) => {
+          calls.push({ event, ctx });
+        },
+      },
+      calls,
+    };
+  }
+
+  function buildStrat(spy: RepoSpy, logger?: Pick<import("../logging/logger.js").Logger, "warn">) {
+    return makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async () => ({
+        role: "admin",
+        grantedModelIds: new Set(),
+      }),
+      logger,
+    });
+  }
+
+  test("非 claude-cli UA → API_KEY_INVALID,不查 DB", async () => {
+    const spy = makeRepoSpy();
+    const strat = buildStrat(spy);
+    const goodToken = "Bearer oc-cc.abcd1234." + "a".repeat(48);
+    // 第 7 个 case 故意不走 reqWith 的 default 兜底,直接构造 headers
+    // 不含 user-agent 字段,验证"header 缺失"也被 gate 拦(req.headers["user-agent"]
+    // === undefined 这条分支)。
+    const reqsWithoutUa: IncomingMessage[] = [
+      reqWith(goodToken, "curl/8.4.0"),
+      reqWith(goodToken, "PostmanRuntime/7.36.0"),
+      reqWith(goodToken, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"),
+      reqWith(goodToken, "python-requests/2.31.0"),
+      reqWith(goodToken, "claude-code/2.1.888"), // 注意:不是 claude-cli/,故意误伤防混淆
+      reqWith(goodToken, ""), // 空 UA
+      // 直接构造 req,headers 完全不含 user-agent 字段
+      {
+        headers: { authorization: goodToken },
+      } as unknown as IncomingMessage,
+    ];
+    for (const req of reqsWithoutUa) {
+      await assert.rejects(
+        strat.resolve(req, CTX),
+        (err: unknown) =>
+          err instanceof IdentityError && err.code === "API_KEY_INVALID",
+      );
+    }
+    assert.equal(spy.findByPrefixCalls.length, 0, "UA 不对不应触碰 DB");
+  });
+
+  test("logger.warn 在 UA 不对时被调,带 reason=ua_mismatch + uaPreview", async () => {
+    const spy = makeRepoSpy();
+    const logSpy = makeLogSpy();
+    const strat = buildStrat(spy, logSpy.logger);
+    await assert.rejects(
+      strat.resolve(reqWith("Bearer oc-cc.abcd1234." + "a".repeat(48), "curl/8.4.0"), CTX),
+      (err: unknown) => err instanceof IdentityError && err.code === "API_KEY_INVALID",
+    );
+    assert.equal(logSpy.calls.length, 1, "应记一条 server-side warn");
+    assert.equal(logSpy.calls[0]!.event, "api_key_ua_gate_blocked");
+    const ctx = logSpy.calls[0]!.ctx as { reason: string; uaPreview: string };
+    assert.equal(ctx.reason, "ua_mismatch");
+    assert.equal(ctx.uaPreview, "curl/8.4.0");
+  });
+
+  test("public error 字符串不外泄具体原因(anti-enum)— UA 不对 vs 未知 key 同 code", async () => {
+    const spy = makeRepoSpy(null); // findByPrefix 永远返 null
+    const strat = buildStrat(spy);
+    const goodToken = "Bearer oc-cc.abcd1234." + "a".repeat(48);
+    // UA 不对路径
+    let uaErr: IdentityError | null = null;
+    try {
+      await strat.resolve(reqWith(goodToken, "curl/8.4.0"), CTX);
+    } catch (e) {
+      if (e instanceof IdentityError) uaErr = e;
+    }
+    // 未知 key 路径
+    let keyErr: IdentityError | null = null;
+    try {
+      await strat.resolve(reqWith(goodToken, DEFAULT_CC_UA), CTX);
+    } catch (e) {
+      if (e instanceof IdentityError) keyErr = e;
+    }
+    assert.ok(uaErr && keyErr, "两路径都应抛 IdentityError");
+    assert.equal(uaErr!.code, keyErr!.code, "anti-enum:错误码必须一致");
+    // 注:public-facing message 由 commercial router handleError 决定;
+    // 这里 IdentityError.message 是 server-internal,handler 当前只透 code。
+    // 锁住的是 code 一致即可,不锁 internal message —— 它们故意不同,给运维 grep。
+  });
+
+  test("合法 UA prefix 覆盖各 USER_TYPE/ENTRYPOINT 变体 + 大小写不敏感", async () => {
+    const secret = "deadbeef".repeat(6);
+    const validUAs = [
+      "claude-cli/2.1.888 (external, cli)",
+      "claude-cli/2.1.888 (ant, vscode-ide)",
+      "claude-cli/2.1.888 (firstParty, sdk, agent-sdk/1.0.0)",
+      "claude-cli/2.1.888 (external, cli, workload/cron)",
+      "claude-cli/0.1.0 (external, cli)", // 老版本号
+      "claude-cli/99.99.99 (external, cli)", // 未来版本号
+      "Claude-Cli/2.1.888 (external, cli)", // 大小写
+      "CLAUDE-CLI/2.1.888", // 全大写无尾巴
+      "claude-cli/2.1.888", // 无尾括号
+    ];
+    for (const ua of validUAs) {
+      const spy = makeRepoSpy(makeRow({ id: 7n, secretHex: secret }));
+      const strat = buildStrat(spy);
+      const identity = await strat.resolve(
+        reqWith("Bearer oc-cc.abcd1234." + secret, ua),
+        CTX,
+      );
+      assert.equal(identity.uid, 100n, `ua=${ua} 应通过`);
+    }
+  });
+
+  test("UA 不对 → 不触发 logger 之外的副作用(不 bump last_used_at)", async () => {
+    const spy = makeRepoSpy(makeRow({ id: 7n, secretHex: "a".repeat(48) }));
+    const strat = buildStrat(spy);
+    await assert.rejects(
+      strat.resolve(
+        reqWith("Bearer oc-cc.abcd1234." + "a".repeat(48), "curl/8.4.0"),
+        CTX,
+      ),
+      (err: unknown) => err instanceof IdentityError && err.code === "API_KEY_INVALID",
+    );
+    await new Promise((r) => setImmediate(r));
+    assert.equal(spy.touchLastUsedCalls.length, 0, "UA 不对不应 bump");
   });
 });
 
