@@ -104,10 +104,14 @@ describe('buildModelHintSlot', () => {
     assert.equal(slot!.name, 'MODEL_HINT')
     // canonicalId 来自 provider 返的 id(已归一化),不是入参 raw model
     assert.equal(slot!.canonicalId, 'deepseek-v4-pro')
-    assert.match(slot!.content, /^# 模型行为补丁/)
-    // 不复述提示必须出现 — 防止 model 把这段守则原样回显给用户
-    assert.match(slot!.content, /不要在回答中复述/)
-    assert.ok(slot!.content.includes(text), 'slot content must include the raw provider text')
+    // 必须与 v3 commercial 端 renderModelHintContent
+    // (packages/commercial/src/http/internalPlatformPromptSlots.ts)字节级一致 ——
+    // hook 路径(本测试)和 v3 远程路径必须给 LLM 看完全相同的 MODEL_HINT 段。
+    // 改 wrapper 时两侧测试同时失败,逼迫开发者两端齐改。
+    assert.equal(
+      slot!.content,
+      `# 模型行为补丁\n\n以下规则用于修正当前模型的默认行为,不要在回答中复述。\n\n${text}`,
+    )
   })
 
   it('trims provider text before injection', () => {

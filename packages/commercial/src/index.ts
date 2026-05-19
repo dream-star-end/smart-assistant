@@ -129,6 +129,11 @@ import {
   makeLiteratureProxyHandler,
   type LiteratureProxyHandler,
 } from "./literatureProxy.js";
+import {
+  PLATFORM_PROMPT_SLOTS_PATH,
+  makePlatformPromptSlotsHandler,
+  type PlatformPromptSlotsHandler,
+} from "./http/internalPlatformPromptSlots.js";
 import { makeInboundDispatcher } from "./wechat/inboundDispatcher.js";
 import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
 import { makeIlinkSendAdapter } from "./wechat/ilinkSendAdapter.js";
@@ -1033,6 +1038,17 @@ export async function registerCommercial(
         identityRepo,
         redis,
       });
+      // /internal/v3/platform-prompt-slots — 容器 → master 拉取平台级 prompt slot
+      // (SKILLS_LITERATURE / MODEL_HINT)。镜像 build 排除 packages/commercial,所以
+      // 容器进程内的 gateway 看不到 setLiteratureSkillProvider / setModelHintProvider
+      // 注册的 hook;这条 endpoint 把 master 持有的 slot 内容 GET 给容器,在容器
+      // buildPromptContext 时合并进 extra-prompt.md。详见
+      // packages/commercial/src/http/internalPlatformPromptSlots.ts 头注。
+      const platformPromptSlotsHandler: PlatformPromptSlotsHandler =
+        makePlatformPromptSlotsHandler({
+          identityRepo,
+          pricingCache: pricing,
+        });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (path === SERVER_AUTHORED_PATH) {
@@ -1040,6 +1056,9 @@ export async function registerCommercial(
         }
         if (path === LITERATURE_SEARCH_PATH) {
           return literatureProxyHandler(req, res, ctx);
+        }
+        if (path === PLATFORM_PROMPT_SLOTS_PATH) {
+          return platformPromptSlotsHandler(req, res, ctx);
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
           return codexTokenRefreshHandler(req, res, ctx);
