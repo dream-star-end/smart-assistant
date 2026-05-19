@@ -15,6 +15,8 @@
 
 import { randomBytes } from 'node:crypto'
 
+import { toIlinkUserId } from './canonicalSenderId.js'
+
 export const ILINK_BASE_URL = 'https://ilinkai.weixin.qq.com'
 export const ILINK_BOT_TYPE = '3'
 export const ILINK_LONG_POLL_TIMEOUT_MS = 35_000
@@ -131,6 +133,10 @@ export async function sendIlinkText(
   contextToken: string,
   text: string,
 ): Promise<any> {
+  // Boundary: 上游(broker / outboxWorker / manager)按 canonical base64url
+  // 形态持有 senderId,iLink wire 要求 "<canonical>@im.wechat";幂等,
+  // 已是 wire 形态时不重复加后缀。
+  const wireToUserId = toIlinkUserId(toUserId)
   const clientId = `cid-${Date.now()}-${randomBytes(4).toString('hex')}`
   return ilinkRequest('/ilink/bot/sendmessage', {
     method: 'POST',
@@ -138,7 +144,7 @@ export async function sendIlinkText(
     body: {
       msg: {
         from_user_id: '',
-        to_user_id: toUserId,
+        to_user_id: wireToUserId,
         client_id: clientId,
         message_type: 2,
         message_state: 2,
