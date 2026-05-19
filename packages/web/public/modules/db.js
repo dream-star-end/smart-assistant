@@ -117,8 +117,11 @@ export function openDB() {
 // fixing.
 //
 // Cleanup rules:
-//   • `_partial` and `bashTail` — always strip; these are intra-stream
-//     transient state that should never survive a turn.
+//   • `_partial`, `bashTail`, `partialJson` — always strip; these are
+//     intra-stream transient state that should never survive a turn.
+//     `partialJson` is the cumulative `input_json_delta` buffer streamed
+//     while a tool_use block is open; once the final `inputJson` lands it
+//     becomes pure noise.
 //   • `_completed` / `output` / `error` / `inputJson` / `inputPreview` — strip
 //     ONLY from non-server-authored rows. Phase 1 (tool durability) makes
 //     the server the authoritative author of these fields on `role: 'tool'`
@@ -138,6 +141,7 @@ export function _normalizeLoadedSession(sess) {
     if (!m || typeof m !== 'object') continue
     delete m._partial
     delete m.bashTail
+    delete m.partialJson
     if (m._source !== 'server') {
       delete m._completed
       delete m.output

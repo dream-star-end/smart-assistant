@@ -13,6 +13,7 @@ import {
 } from './markdown.js?v=6218aca6'
 import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=6218aca6'
 import { toast } from './ui.js?v=6218aca6'
+import { parsePartialJson } from './partialJson.js?v=6218aca6'
 import { msgTimeLabel, shortTime } from './util.js?v=6218aca6'
 import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=6218aca6'
 
@@ -437,7 +438,13 @@ function _toolMeta(name) {
 }
 
 function _safeInput(msg) {
+  // Priority: final inputJson > tolerant-parsed partialJson > legacy inputPreview parse.
+  // partialJson is the gateway-streamed accumulator of `input_json_delta` events
+  // and drives partial Edit/Write body rendering before the tool block closes.
   if (msg.inputJson && typeof msg.inputJson === 'object') return msg.inputJson
+  if (typeof msg.partialJson === 'string' && msg.partialJson.length > 0) {
+    return parsePartialJson(msg.partialJson)
+  }
   if (msg.inputPreview) {
     try { return JSON.parse(msg.inputPreview) } catch { return null }
   }

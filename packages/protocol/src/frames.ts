@@ -165,6 +165,14 @@ export const OutboundContentBlock = Type.Union([
     inputPreview: Type.Optional(Type.String()),
     /** Parsed tool input object (available when partial=false) */
     inputJson: Type.Optional(Type.Unknown()),
+    /**
+     * Full accumulated partial JSON string from Anthropic SSE `input_json_delta`
+     * events. Present only on `partial: true` frames where the cumulative
+     * length is ≤ 64 KiB; dropped beyond that cap to bound WS bandwidth.
+     * Web uses tolerant parsing to render Edit/Write body diff in real time
+     * during tool input streaming. Strictly ephemeral — never persisted.
+     */
+    partialJson: Type.Optional(Type.String()),
     // streaming: false | true — if true, a follow-up update with final input is coming
     partial: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),

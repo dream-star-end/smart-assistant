@@ -262,6 +262,9 @@ describe('T18: 用户发一句话 → cost_charged → 409 server-wins → 刷�
       'bashTail',
       'inputJson',
       'inputPreview',
+      // partialJson — gateway-streamed input_json_delta accumulator,
+      // strictly ephemeral, must not survive a PUT body.
+      'partialJson',
     ]) {
       for (const m of cleaned) {
         assert.equal(m[k], undefined, `_stripMessageEphemeral 应剥离 ${k}`)
@@ -442,6 +445,9 @@ describe('T19: dbGetAll → _normalizeLoadedSession — 三类历史污染 row',
           bashTail: 'tail',
           inputJson: '{}',
           inputPreview: 'pv',
+          // partialJson — even on server-authored rows this is intra-stream
+          // garbage that must always be stripped (parallel to _partial/bashTail).
+          partialJson: '{"file_path":"/x","new_string":"...',
         },
       ],
     }
@@ -451,9 +457,10 @@ describe('T19: dbGetAll → _normalizeLoadedSession — 三类历史污染 row',
     assert.equal(u.status, undefined)
     // ephemeral 字段 inputPreview: client-authored user 行被 strip;_partial/bashTail 始终 strip
     assert.equal(u.inputPreview, undefined)
-    // _partial / bashTail 始终清(包括 server-authored)
+    // _partial / bashTail / partialJson 始终清(包括 server-authored)
     assert.equal(a._partial, undefined)
     assert.equal(a.bashTail, undefined)
+    assert.equal(a.partialJson, undefined)
     // Phase 1 tool durability 语义(db.js:122-127):server-authored 行的
     // `_completed / output / error / inputJson / inputPreview` 必须保留 —
     // 否则会把 server-authoritative tool 字段也抹掉。本 row `_source: 'server'`
