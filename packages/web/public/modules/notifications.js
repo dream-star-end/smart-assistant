@@ -1,5 +1,5 @@
 // OpenClaude — Notifications
-import { getSession, state } from './state.js?v=6218aca6'
+import { getSession, state } from './state.js?v=0571458d'
 
 // ── Notification sound ──
 const _notifSound = (() => {
