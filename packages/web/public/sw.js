@@ -1,24 +1,24 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-a3c5114c'
+const VERSION = 'openclaude-d677cb07'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=a3c5114c',  // versioned URL used in index.html
+  '/style.css?v=d677cb07',  // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=a3c5114c',  // versioned URL used in index.html
+  '/modules/main.js?v=d677cb07',  // versioned URL used in index.html
   '/modules/auth.js',
-  '/modules/auth.js?v=a3c5114c',  // versioned URL used in main.js import (session cookie mint/clear)
+  '/modules/auth.js?v=d677cb07',  // versioned URL used in main.js import (session cookie mint/clear)
   '/modules/billing.js',
-  '/modules/billing.js?v=a3c5114c',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
+  '/modules/billing.js?v=d677cb07',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
   '/modules/userPrefs.js',
-  '/modules/userPrefs.js?v=a3c5114c',  // versioned URL used in main.js import (prefs modal redesign)
+  '/modules/userPrefs.js?v=d677cb07',  // versioned URL used in main.js import (prefs modal redesign)
   '/modules/usageStats.js',
-  '/modules/usageStats.js?v=a3c5114c',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/usageStats.js?v=d677cb07',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -34,10 +34,10 @@ const SHELL = [
   '/modules/memory.js',
   '/modules/tasks.js',
   '/modules/agents.js',
-  '/modules/agents.js?v=a3c5114c',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/agents.js?v=d677cb07',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/effortMode.js',
   '/modules/modelPicker.js',
-  '/modules/modelPicker.js?v=a3c5114c',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/modelPicker.js?v=d677cb07',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/sessions.js',
   '/modules/sync.js',
   '/modules/messages.js',
