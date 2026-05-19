@@ -26,6 +26,14 @@
  *                         子因写进 `IdentityError.message`(handler 当前只记
  *                         errcode,不外泄 message);如未来 ops 需要看 prefix,
  *                         由 handler 决定是否记录,本 strategy 不擅自扩大契约。
+ *
+ * Phase 6 临时门控 — admin-only rollout(Layer 2,见 plan §3.4):
+ *   secret 验对后,fetch 该 uid 的 authz role;非 admin → 同一 API_KEY_INVALID
+ *   错误码(与 unknown/revoked/secret-mismatch 同型,anti-enumeration 一致 ——
+ *   攻击者拿合法 user-role 的 key 试探时无法靠错误码区分 "key 不存在 / 已撤销 /
+ *   非 admin")。这是 Layer 1(管理面 403 ADMIN_ONLY)的兜底:即使 DB 残留 user
+ *   role 的 key(SQL 直插 / 历史数据 / 未来 staff 协助创建),strategy 仍拒。
+ *   去 gate 时整段 `admin gate` 注释包裹的代码删除即可,无外部 API 变化。
  */
 
 import type { IncomingMessage } from "node:http";
@@ -184,7 +192,33 @@ export function makeApiKeyIdentityStrategy(
       }
 
       // Bump last_used_at,fire-and-forget + 5min 节流。
+      //
+      // **顺序说明**:bump 在 admin gate 之前。秘密已经验对 → 这是一次"持有真实 key
+      // 的使用尝试",非随机探测;让 ops 能从 last_used_at 看到有非 admin 在尝试用
+      // (Codex Phase 6 plan-review 同意)。
+      // unknown/revoked/secret-mismatch 路径在更前面已 throw,绝不触发 bump
+      // (apiKeyIdentity.unit.test 锁住:findByPrefix=null 不 bump、secret 错不 bump)。
       bumpLastUsedThrottled(row.id);
+
+      // === Phase 6 admin-only rollout gate(Layer 2,见 plan §3.4)===
+      //
+      // fetch authz 校验 role。**临时门控**:首期只允许 admin 用 CC 外接 endpoint,
+      // 即使 DB 里残留 user-role 的 key(管理面 Layer 1 应拦,但 SQL 直插 / 历史数据 /
+      // 未来 staff 协助创建仍可能绕过)也兜底拒绝。
+      //
+      // 错误码 `API_KEY_INVALID`:与 unknown/revoked/secret-mismatch 同型,
+      // anti-enumeration 一致。loadUserModelAuthz throw 直接透传给 handler
+      // (现行行为:proxy/index.ts 把未识别异常映成 500 INTERNAL,fail-closed)。
+      //
+      // **去 gate**:删除以下整块 if 即可,无外部 API 变化。
+      const authz = await deps.loadUserModelAuthz(row.userId);
+      if (authz.role !== "admin") {
+        throw new IdentityError(
+          "API_KEY_INVALID",
+          `non-admin uid=${row.userId} attempted CC external endpoint (admin-only rollout)`,
+        );
+      }
+      // === /admin gate ===
 
       // 关键:`containerId: null` — 这是 Phase 0 类型放宽的实际消费点。
       // ApiKey 路径没有容器维度,journal.container_id 写 SQL NULL,

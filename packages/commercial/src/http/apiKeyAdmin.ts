@@ -21,6 +21,16 @@
  * Repo 工厂在每个 handler 内即时构造(`makePgApiKeyRepo(getPool())`),与 inbox /
  * preferences 等同型 handler 风格一致 —— 避免 `CommercialHttpDeps` 越长越像
  * service locator(Codex Phase 4 plan-review NIT 采纳)。
+ *
+ * Phase 6 临时门控:管理面 admin-only(plan §3.4)。
+ *   - boss 上线决策:首期只让 admin 体验,后续观察稳定后再开放给普通用户。
+ *   - 实现:`requireAuth` 之后立刻 `requireAdmin(user)` —— 三个 handler 共用一行。
+ *   - 错误码:`403 ADMIN_ONLY`(管理面 HTTP 显式 code,不存在 enumeration 风险 ——
+ *     用户自己 JWT 已知道自己 role)。
+ *   - 这是 Layer 1;Layer 2 在 ApiKeyIdentityStrategy.resolve 内,即使 DB 残留
+ *     非 admin 的 key 也兜底拒绝。两层都被破口才能失守。
+ *   - **去 gate 步骤**:见 plan §3.4 "未来去 gate" — 删 `requireAdmin` 3 处调用
+ *     + 删 strategy 内的 admin 校验 + 测试改回 user role 即可。
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -30,7 +40,7 @@ import {
   sendJson,
 } from "./util.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
-import { requireAuth } from "./auth.js";
+import { requireAuth, type AuthedUser } from "./auth.js";
 import {
   makePgApiKeyRepo,
   ApiKeyRepoError,
@@ -48,6 +58,30 @@ import { getPool } from "../db/index.js";
  */
 const PG_BIGINT_MAX = 9223372036854775807n;
 
+/**
+ * Phase 6 — admin-only rollout gate(Layer 1)。
+ *
+ * boss 上线决策(plan §3.4):CC 外接管理面首期只对 admin 开放;普通用户暂不允许
+ * 创建/查看/撤销 key。Layer 2 在 strategy.resolve 内兜底,即使有非 admin 的 key
+ * 残留在 DB 里也无法使用。
+ *
+ * 错误码 `403 ADMIN_ONLY`:管理面是用户自己的 JWT 认证路径,role 在 token 里
+ * 已知,不存在 enumeration 风险 —— 显式 code 让前端能准确提示"暂未对你开放"。
+ * 与 strategy 层 anti-enumeration 设计(IdentityError 全部映射 401)在不同
+ * 责任层。
+ *
+ * **未来去 gate**:把此函数 + 3 个调用点一并删除(plan §3.4)。
+ */
+function requireAdmin(user: AuthedUser): void {
+  if (user.role !== "admin") {
+    throw new HttpError(
+      403,
+      "ADMIN_ONLY",
+      "CC external endpoint is currently restricted to admin users",
+    );
+  }
+}
+
 /** ────────────────────────────────────────────────────────────────────────
  * GET /api/me/api-keys
  *
@@ -61,6 +95,7 @@ export async function handleListMyApiKeys(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
+  requireAdmin(user);
   const repo = makePgApiKeyRepo(getPool());
   const rows = await repo.list(BigInt(user.id));
   // 注意 BigInt 不能直接 JSON.stringify;统一 → string。
@@ -89,6 +124,7 @@ export async function handleCreateMyApiKey(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
+  requireAdmin(user);
   const body = await readJsonBody(req);
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
@@ -152,6 +188,10 @@ export async function handleRevokeMyApiKey(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
+  // admin gate 放在 path 解析之前:非 admin 的 malformed path 也会返 403 而不是 404。
+  // 这是 admin-only rollout 阶段刻意的契约 —— 用户级 endpoint 对非 admin 不开放,
+  // 不区分 path 是否合法(Codex Phase 6 plan-review 同意,测试预期跟着更新)。
+  requireAdmin(user);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   // 严格 path:`/api/me/api-keys/:id`(id 纯数字,长度 ≤ 20 位上限同 BIGINT 文本长度)
   const m = url.pathname.match(/^\/api\/me\/api-keys\/([1-9][0-9]{0,19})$/);

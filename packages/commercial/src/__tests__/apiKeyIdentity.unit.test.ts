@@ -122,7 +122,7 @@ describe("apiKeyIdentity.resolve — 错误码三分", () => {
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
     });
     await assert.rejects(
       strat.resolve(reqWith(undefined), CTX),
@@ -138,7 +138,7 @@ describe("apiKeyIdentity.resolve — 错误码三分", () => {
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
     });
     for (const auth of ["", "Bearer ", "Bearer    ", "   "]) {
       await assert.rejects(
@@ -157,7 +157,7 @@ describe("apiKeyIdentity.resolve — 错误码三分", () => {
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
     });
     for (const bad of [
       "oc-v3.abcd1234.deadbeef",                             // 错前缀(容器格式)
@@ -186,7 +186,7 @@ describe("apiKeyIdentity.resolve — invariant #2 撤销立即生效 + #7 first 
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
     });
     const auth = "Bearer oc-cc.abcd1234." + "a".repeat(48);
     await assert.rejects(
@@ -208,7 +208,7 @@ describe("apiKeyIdentity.resolve — invariant #2 撤销立即生效 + #7 first 
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
     });
     await assert.rejects(
       strat.resolve(reqWith("Bearer oc-cc.abcd1234." + fakeSecret), CTX),
@@ -234,7 +234,7 @@ describe("apiKeyIdentity.resolve — 成功路径返 containerId=null + bump las
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
     });
     const identity = await strat.resolve(
       reqWith("Bearer oc-cc.abcd1234." + secret),
@@ -259,7 +259,7 @@ describe("apiKeyIdentity — last_used_at 5min in-process 节流(closure scope)"
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
       now: () => fakeTime,
     });
     const req = reqWith("Bearer oc-cc.abcd1234." + secret);
@@ -287,7 +287,7 @@ describe("apiKeyIdentity — last_used_at 5min in-process 节流(closure scope)"
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
       now: () => fakeTime,
     });
     const req = reqWith("Bearer oc-cc.abcd1234." + secret);
@@ -311,7 +311,7 @@ describe("apiKeyIdentity — last_used_at 5min in-process 节流(closure scope)"
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
       now: () => fakeTime,
       logger: {
         warn: (msg: string, meta?: object) => warns.push({ msg, meta }),
@@ -348,7 +348,7 @@ describe("apiKeyIdentity — LRU 上限 1000(closure scope 隔离)", () => {
     const strat = makeApiKeyIdentityStrategy({
       repo: spy.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
       now: () => fakeTime,
     });
     const req = reqWith("Bearer oc-cc.abcd1234." + secret);
@@ -382,13 +382,13 @@ describe("apiKeyIdentity — LRU 上限 1000(closure scope 隔离)", () => {
     const stratA = makeApiKeyIdentityStrategy({
       repo: spyA.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
       now: () => fakeTime,
     });
     const stratB = makeApiKeyIdentityStrategy({
       repo: spyB.repo,
       pricing: FAKE_PRICING,
-      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
       now: () => fakeTime,
     });
     const req = reqWith("Bearer oc-cc.abcd1234." + secret);
@@ -464,5 +464,135 @@ describe("apiKeyIdentity.authorize — 委托 authorizeProxyIdentity", () => {
     await assert.doesNotReject(
       strat.authorize({ uid: 100n, containerId: null }, {} as never, "claude-opus-4-7"),
     );
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 6 admin-only rollout gate(Layer 2)— resolve 内 role check
+//
+// 上线决策(plan §3.4):secret 验对后,fetch authz role;非 admin → 同一
+// API_KEY_INVALID 错误码(anti-enumeration:不区分 "key 不存在 / 已撤销 /
+// 非 admin")。bumpLastUsedThrottled 在 admin gate 之前已 fire,运营可见。
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("apiKeyIdentity.resolve — Phase 6 admin-only rollout gate(Layer 2)", () => {
+  test("admin role → resolve 成功,返 {uid, containerId: null}", async () => {
+    const secret = "deadbeef".repeat(6);
+    const spy = makeRepoSpy(makeRow({ id: 7n, userId: 200n, secretHex: secret }));
+    let authzCalls = 0;
+    const strat = makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async () => {
+        authzCalls++;
+        return { role: "admin", grantedModelIds: new Set() };
+      },
+    });
+    const identity = await strat.resolve(
+      reqWith("Bearer oc-cc.abcd1234." + secret),
+      CTX,
+    );
+    assert.equal(identity.uid, 200n);
+    assert.strictEqual(identity.containerId, null);
+    assert.equal(authzCalls, 1, "resolve 期间应 fetch 一次 authz 做 role gate");
+    // bump 也跑了
+    await new Promise((r) => setImmediate(r));
+    assert.equal(spy.touchLastUsedCalls.length, 1);
+  });
+
+  test("非 admin role(user)→ IdentityError API_KEY_INVALID(anti-enumeration 同型)", async () => {
+    const secret = "deadbeef".repeat(6);
+    const spy = makeRepoSpy(makeRow({ id: 7n, userId: 200n, secretHex: secret }));
+    const strat = makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+    });
+    await assert.rejects(
+      strat.resolve(reqWith("Bearer oc-cc.abcd1234." + secret), CTX),
+      (err: unknown) =>
+        err instanceof IdentityError && err.code === "API_KEY_INVALID",
+    );
+    // 关键:bumpLastUsedThrottled 在 admin gate 之前触发,运营可见有非 admin 用真 key
+    // (Codex Phase 6 plan-review §2 确认顺序)
+    await new Promise((r) => setImmediate(r));
+    assert.equal(spy.touchLastUsedCalls.length, 1, "secret 已验对 → bump 在 admin gate 前 fire");
+  });
+
+  test("loadUserModelAuthz throw → 透传(非 IdentityError),不进 bump 路径意外", async () => {
+    // fail-closed:authz 加载失败抛错,handler 上层(proxy/index.ts)映 500 INTERNAL,
+    // 不映射为 401。这与 authorize 内的 AuthzLoadError 行为不同(authorize 内显式
+    // wrap,resolve 内只是早 fail,proxy/index.ts 走 catch-all 500 路径)。
+    const secret = "deadbeef".repeat(6);
+    const spy = makeRepoSpy(makeRow({ id: 7n, secretHex: secret }));
+    const cause = new Error("authz db down");
+    const strat = makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async () => {
+        throw cause;
+      },
+    });
+    await assert.rejects(
+      strat.resolve(reqWith("Bearer oc-cc.abcd1234." + secret), CTX),
+      (err: unknown) => err === cause,
+    );
+    // bump 还是触发了(它在 authz fetch 之前 fire-and-forget)
+    await new Promise((r) => setImmediate(r));
+    assert.equal(spy.touchLastUsedCalls.length, 1);
+  });
+
+  test("不同失败路径下 bump 行为对比(unknown/revoked/secret-mismatch 不 bump;non-admin 会 bump)", async () => {
+    // 这是 Codex Phase 6 plan-review §2 要求的"顺序锁":运营要靠 last_used_at
+    // 区分 "有人持真 key 但 role 不对" vs "有人乱试 prefix"。
+    const secret = "deadbeef".repeat(6);
+
+    // (a) unknown prefix → 不 bump
+    {
+      const spy = makeRepoSpy(null);
+      const strat = makeApiKeyIdentityStrategy({
+        repo: spy.repo,
+        pricing: FAKE_PRICING,
+        loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
+      });
+      await assert.rejects(
+        strat.resolve(reqWith("Bearer oc-cc.abcd1234." + secret), CTX),
+        (err: unknown) => err instanceof IdentityError && err.code === "API_KEY_INVALID",
+      );
+      await new Promise((r) => setImmediate(r));
+      assert.equal(spy.touchLastUsedCalls.length, 0, "unknown prefix 不 bump");
+    }
+    // (b) secret mismatch → 不 bump
+    {
+      const realSecret = "a".repeat(48);
+      const wrongSecret = "b" + "a".repeat(47);
+      const spy = makeRepoSpy(makeRow({ secretHex: realSecret }));
+      const strat = makeApiKeyIdentityStrategy({
+        repo: spy.repo,
+        pricing: FAKE_PRICING,
+        loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
+      });
+      await assert.rejects(
+        strat.resolve(reqWith("Bearer oc-cc.abcd1234." + wrongSecret), CTX),
+        (err: unknown) => err instanceof IdentityError && err.code === "API_KEY_INVALID",
+      );
+      await new Promise((r) => setImmediate(r));
+      assert.equal(spy.touchLastUsedCalls.length, 0, "secret mismatch 不 bump");
+    }
+    // (c) secret OK + non-admin → bump(已在前面 test 单独锁,此处再次确认对比)
+    {
+      const spy = makeRepoSpy(makeRow({ secretHex: secret }));
+      const strat = makeApiKeyIdentityStrategy({
+        repo: spy.repo,
+        pricing: FAKE_PRICING,
+        loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set() }),
+      });
+      await assert.rejects(
+        strat.resolve(reqWith("Bearer oc-cc.abcd1234." + secret), CTX),
+        (err: unknown) => err instanceof IdentityError && err.code === "API_KEY_INVALID",
+      );
+      await new Promise((r) => setImmediate(r));
+      assert.equal(spy.touchLastUsedCalls.length, 1, "secret OK + non-admin 触发 bump");
+    }
   });
 });

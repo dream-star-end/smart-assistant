@@ -412,10 +412,15 @@ class MockRes {
 interface Harness {
   fp: FakePoolHandle;
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
-  jwtFor(userId: string): Promise<string>;
+  jwtFor(userId: string, role?: "admin" | "user"): Promise<string>;
 }
 
-async function buildHarness(): Promise<Harness> {
+interface HarnessOpts {
+  /** Layer 2 strategy 内 loadUserModelAuthz mock 返的 role(默认 admin)。 */
+  authzRole?: "admin" | "user";
+}
+
+async function buildHarness(opts: HarnessOpts = {}): Promise<Harness> {
   const fp = buildFakePool();
   setPoolOverride(fp.pool);
 
@@ -423,12 +428,18 @@ async function buildHarness(): Promise<Harness> {
   const apiKeyRepo = makePgApiKeyRepo(fp.pool);
 
   // 真 strategy:loadUserModelAuthz 直接 grant 该 user 用 FIXED_MODEL。
-  // 不验 admin/role(plan 默认 user role)。
+  //
+  // Phase 6 admin-only rollout(plan §3.4):本 integ test harness 默认走 admin —
+  // 与生产首期上线契约一致。Layer 2 在 strategy 内会比较 authz.role !== "admin"
+  // 直接 throw API_KEY_INVALID,JWT 默认也用 admin(见 jwtFor),保证 Phase 1+2+3+4
+  // 既有闭环全部继续 pass。**单独的非 admin 负面测试**(plan §3.4 Layer 2 闭环)
+  // 通过 opts.authzRole="user" 切换 mock,验 Layer 2 兜底无副作用。
+  const authzRole = opts.authzRole ?? "admin";
   const apiKeyStrategy = makeApiKeyIdentityStrategy({
     repo: apiKeyRepo,
     pricing,
     loadUserModelAuthz: async () => ({
-      role: "user",
+      role: authzRole,
       grantedModelIds: new Set<string>([FIXED_MODEL]),
     }),
   });
@@ -464,8 +475,11 @@ async function buildHarness(): Promise<Harness> {
   return {
     fp,
     handler,
-    async jwtFor(userId) {
-      const r = await signAccess({ sub: userId, role: "user" }, JWT_SECRET);
+    // Phase 6 admin-only rollout(plan §3.4):harness JWT 默认走 admin —
+    // 与生产首期上线契约一致,既有 happy 闭环测试不需要逐个加 role 字段。
+    // 非 admin 负面用例传 role:"user" 显式覆写。
+    async jwtFor(userId, role = "admin") {
+      const r = await signAccess({ sub: userId, role }, JWT_SECRET);
       return r.token;
     },
   };
@@ -735,5 +749,151 @@ describe("DELETE 不存在的 id → 404(与 not-yours 同码,不暴露存在性
       headers: { authorization: `Bearer ${jwt}` },
     });
     assert.equal(res.statusCode, 404);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 6 admin-only rollout(plan §3.4)— 两层防御都覆盖,**端到端真路由跑**。
+//
+// Layer 1(管理面 HTTP):非 admin JWT 进 GET/POST/DELETE /api/me/api-keys
+//   一律 403 ADMIN_ONLY,user_api_keys 表完全不被触达。
+//
+// Layer 2(strategy.resolve):admin 创建了 key 后,authz 回滚至 user role
+//   (模拟 "管理员把 key 给到普通用户后又被降权"),非 admin 拿真 plaintext 走
+//   /api/anthropic/v1/messages → 401 UNAUTHORIZED,且 **preCheck / journal /
+//   ledger / usage_records / claude_accounts** 任意 SQL 都不能触达 —— 这是
+//   "secret 已 verify 后才 throw" 的核心闭环:strategy 已 bumpLastUsedThrottled
+//   完才扔 IdentityError,proxy/index.ts 把 IdentityError 全部映成 401,不进
+//   计费/调度链(plan §3.4 + Codex plan-review §5 闭环 1+6 采纳)。
+//
+// 这两条用例直接锁 "上线给管理员用 + 普通用户即使有 key 也无法消费 quota"
+// 的承诺;失守任一条,生产数据就可能被普通用户消费 claude_accounts pool。
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Phase 6 admin-only rollout — Layer 1 管理面 403 闭环", () => {
+  test("非 admin JWT 进 GET/POST/DELETE → 全部 403 ADMIN_ONLY,user_api_keys 未触达", async () => {
+    const h = await buildHarness();
+    const userJwt = await h.jwtFor(USER_A_ID, "user");
+
+    // GET
+    const getRes = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys",
+      headers: { authorization: `Bearer ${userJwt}` },
+    });
+    assert.equal(getRes.statusCode, 403, `GET body=${getRes.bodyText()}`);
+    assert.equal((getRes.bodyJson() as { error?: { code?: string } }).error?.code, "ADMIN_ONLY");
+
+    // POST
+    const postRes = await runReq(h, {
+      method: "POST",
+      url: "/api/me/api-keys",
+      headers: { authorization: `Bearer ${userJwt}` },
+      body: { label: "shouldnt-create" },
+    });
+    assert.equal(postRes.statusCode, 403, `POST body=${postRes.bodyText()}`);
+    assert.equal((postRes.bodyJson() as { error?: { code?: string } }).error?.code, "ADMIN_ONLY");
+
+    // DELETE 合法 path
+    const delRes = await runReq(h, {
+      method: "DELETE",
+      url: "/api/me/api-keys/42",
+      headers: { authorization: `Bearer ${userJwt}` },
+    });
+    assert.equal(delRes.statusCode, 403, `DELETE body=${delRes.bodyText()}`);
+    assert.equal((delRes.bodyJson() as { error?: { code?: string } }).error?.code, "ADMIN_ONLY");
+
+    // DELETE malformed path — admin gate 在 path 解析**之前**,非 admin 也得 403 不是 404。
+    const delBad = await runReq(h, {
+      method: "DELETE",
+      url: "/api/me/api-keys/abc",
+      headers: { authorization: `Bearer ${userJwt}` },
+    });
+    assert.equal(delBad.statusCode, 403, `DELETE-bad body=${delBad.bodyText()}`);
+    assert.equal((delBad.bodyJson() as { error?: { code?: string } }).error?.code, "ADMIN_ONLY");
+
+    // 闭环 — user_api_keys 表完全不被触达,空表
+    assert.equal(h.fp.table.size, 0, "non-admin 应在 admin gate 全部 reject,DB 表零行");
+    const touched = h.fp.queries.some((q) => /USER_API_KEYS/i.test(q.sql));
+    assert.ok(!touched, `non-admin 不应触达 user_api_keys 表;queries=${JSON.stringify(h.fp.queries.map((q) => q.sql.slice(0, 40)))}`);
+  });
+});
+
+describe("Phase 6 admin-only rollout — Layer 2 strategy 兜底 401 + 零副作用", () => {
+  test("admin 创建 key 后 authz 降级 user,真 plaintext → 401,**preCheck / journal / ledger 全不触达**", async () => {
+    // —— Step 1: 用默认 admin harness 创建一个真实的 key,拿到 plaintext。
+    const hAdmin = await buildHarness({ authzRole: "admin" });
+    const adminJwt = await hAdmin.jwtFor(USER_A_ID, "admin");
+    const createRes = await runReq(hAdmin, {
+      method: "POST",
+      url: "/api/me/api-keys",
+      headers: { authorization: `Bearer ${adminJwt}` },
+      body: { label: "for-non-admin-to-misuse" },
+    });
+    assert.equal(createRes.statusCode, 201, `create body=${createRes.bodyText()}`);
+    const created = createRes.bodyJson() as Record<string, string>;
+    const plaintext = created.plaintext;
+    const keyId = created.id;
+    const keyPrefix = created.key_prefix;
+    const keyHash = hAdmin.fp.table.get(keyId)!.key_hash;
+    await resetPool(); // 释放 admin harness 的 pool override(afterEach 也会但此处显式更稳)
+
+    // —— Step 2: 切到 authz=user harness — 模拟 "owner role 已被降级"。
+    //    新 harness 用全新 fakePool,需要把 key row 手工种回去。
+    const hUser = await buildHarness({ authzRole: "user" });
+    // 用 fakePool.upsert() 把 admin 创建的那行 row 种回去,保持 key_hash 一致。
+    hUser.fp.upsert({
+      id: keyId,
+      user_id: USER_A_ID,
+      label: created.label,
+      key_prefix: keyPrefix,
+      key_hash: keyHash,
+      created_at: new Date(created.created_at),
+      last_used_at: null,
+      revoked_at: null,
+    });
+
+    // —— Step 3: 拿真 plaintext 走 /api/anthropic/v1/messages — 应 401 + 无任何
+    //            计费/调度副作用。
+    const proxyRes = await runReq(hUser, {
+      method: "POST",
+      url: "/api/anthropic/v1/messages",
+      headers: {
+        authorization: `Bearer ${plaintext}`,
+        "anthropic-version": "2023-06-01",
+      },
+      body: { model: FIXED_MODEL, max_tokens: 100, messages: [{ role: "user", content: "hi" }], stream: true },
+    });
+    assert.equal(proxyRes.statusCode, 401, `non-admin proxy body=${proxyRes.bodyText()}`);
+    // 反枚举:不区分 unknown / revoked / non-admin,统一 UNAUTHORIZED(proxy/index.ts:144)。
+    const err = proxyRes.bodyJson() as { error?: { code?: string } };
+    assert.equal(err.error?.code, "UNAUTHORIZED");
+
+    // —— Step 4: **闭环零副作用** — secret verify 已成功(bumpLastUsedThrottled
+    //            会跑 → last_used_at 必须被更新);但 admin gate throw 后,proxy
+    //            handler catch IdentityError 直接 401,不进 preCheck / 不调度
+    //            claude_account / 不开 journal / 不写 usage_records / 不写 ledger。
+    const sqlSeen = hUser.fp.queries.map((q) => q.sql.trim().toUpperCase());
+
+    // last_used_at 更新必须发生(顺序锁:secret OK 后 strategy 才 bump,bump 完才 reject)
+    const bumped = sqlSeen.some((s) => /^UPDATE\s+USER_API_KEYS\s+SET\s+LAST_USED_AT/.test(s));
+    assert.ok(bumped, "secret 已 verify → bumpLastUsedThrottled 必须执行(顺序锁,见 Layer 2 Codex §5 闭环 1)");
+    // table 内 row 的 last_used_at 也应该非 null
+    const row = hUser.fp.table.get(keyId)!;
+    assert.ok(row.last_used_at !== null, "last_used_at 必须被更新");
+
+    // 但任何 billing/scheduling 副作用一概禁止
+    const FORBIDDEN_PATTERNS: Array<{ re: RegExp; reason: string }> = [
+      { re: /INSERT\s+INTO\s+REQUEST_FINALIZE_JOURNAL/, reason: "journal 不能开" },
+      { re: /UPDATE\s+REQUEST_FINALIZE_JOURNAL/, reason: "journal 不能写" },
+      { re: /INSERT\s+INTO\s+USAGE_RECORDS/, reason: "usage_records 不能写" },
+      { re: /INSERT\s+INTO\s+CREDIT_LEDGER/, reason: "credit_ledger 不能写" },
+      { re: /UPDATE\s+USERS\s+SET\s+CREDITS/, reason: "users.credits 不能动" },
+      { re: /UPDATE\s+CLAUDE_ACCOUNTS\s+SET/, reason: "claude_accounts 不能 release" },
+    ];
+    for (const { re, reason } of FORBIDDEN_PATTERNS) {
+      const hit = sqlSeen.find((s) => re.test(s));
+      assert.ok(!hit, `Phase 6 Layer 2 闭环:${reason};hit=${hit?.slice(0, 80)}`);
+    }
   });
 });

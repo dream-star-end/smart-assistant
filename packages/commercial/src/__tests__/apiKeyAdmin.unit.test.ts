@@ -141,7 +141,15 @@ function buildFakePool(opts: FakePoolOpts = {}): Pool {
   return pool;
 }
 
+// Phase 6 admin-only rollout(plan §3.4):管理面 endpoint 当前只对 admin 开放。
+// 单元测试默认走 admin role(reflect 上线契约);非 admin 路径用 makeUserAuthHeader
+// 单独验 403 ADMIN_ONLY。去 gate 后把默认改回 "user" 即可。
 async function makeAuthHeader(uidStr: string = USER_ID): Promise<{ authorization: string }> {
+  const { token } = await signAccess({ sub: uidStr, role: "admin" }, JWT_SECRET);
+  return { authorization: `Bearer ${token}` };
+}
+
+async function makeUserAuthHeader(uidStr: string = USER_ID): Promise<{ authorization: string }> {
   const { token } = await signAccess({ sub: uidStr, role: "user" }, JWT_SECRET);
   return { authorization: `Bearer ${token}` };
 }
@@ -535,6 +543,105 @@ describe("跨用户隔离 — repo.revoke 收到正确的 userId param", () => {
       assert.equal(update!.params[0], USER_ID, `repo 收到的 userId 必须是 ${USER_ID}`);
       assert.notEqual(update!.params[0], OTHER_USER_ID);
       assert.equal(update!.params[1], "42");
+    } finally { await resetPool(); }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// (5) Phase 6 admin-only rollout gate(Layer 1)— 非 admin → 403 ADMIN_ONLY
+//
+// plan §3.4:CC 外接管理面首期只对 admin 开放;普通用户 JWT 进 GET/POST/DELETE
+// 一律 403,且 repo 不被触达(handler 第一行就 throw)。Layer 2 在 strategy
+// 内做兜底,即使 DB 残留非 admin 的 key 也无法使用 —— 见
+// apiKeyIdentity.unit.test.ts 内同名 describe。
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("Phase 6 admin-only — 非 admin → 403 ADMIN_ONLY", () => {
+  test("GET 非 admin → 403,repo.list 未被调", async () => {
+    const pool = buildFakePool({ listRows: [] });
+    setPoolOverride(pool);
+    try {
+      const req = new MockReq({ headers: await makeUserAuthHeader() });
+      const res = new MockRes();
+      await assert.rejects(
+        handleListMyApiKeys(req as any, res as any, FAKE_CTX, makeDeps()),
+        (e: { status?: number; code?: string }) =>
+          e.status === 403 && e.code === "ADMIN_ONLY",
+      );
+      assert.equal(
+        (pool as unknown as { queries: unknown[] }).queries.length,
+        0,
+        "admin gate 在 repo.list 之前 reject",
+      );
+    } finally { await resetPool(); }
+  });
+
+  test("POST 非 admin → 403,repo.create 未被调", async () => {
+    const pool = buildFakePool({
+      createReturning: { id: "999", created_at: new Date("2026-05-18T00:00:00Z") },
+    });
+    setPoolOverride(pool);
+    try {
+      const req = new MockReq({
+        method: "POST",
+        body: { label: "laptop" },
+        headers: await makeUserAuthHeader(),
+      });
+      const res = new MockRes();
+      await assert.rejects(
+        handleCreateMyApiKey(req as any, res as any, FAKE_CTX, makeDeps()),
+        (e: { status?: number; code?: string }) =>
+          e.status === 403 && e.code === "ADMIN_ONLY",
+      );
+      assert.equal(
+        (pool as unknown as { queries: unknown[] }).queries.length,
+        0,
+        "admin gate 在 repo.create 之前 reject",
+      );
+    } finally { await resetPool(); }
+  });
+
+  test("DELETE 非 admin → 403,repo.revoke 未被调(即使 path 合法)", async () => {
+    const pool = buildFakePool({ revokeRowCount: 1 });
+    setPoolOverride(pool);
+    try {
+      const req = new MockReq({
+        url: "/api/me/api-keys/42",
+        method: "DELETE",
+        headers: await makeUserAuthHeader(),
+      });
+      const res = new MockRes();
+      await assert.rejects(
+        handleRevokeMyApiKey(req as any, res as any, FAKE_CTX, makeDeps()),
+        (e: { status?: number; code?: string }) =>
+          e.status === 403 && e.code === "ADMIN_ONLY",
+      );
+      assert.equal(
+        (pool as unknown as { queries: unknown[] }).queries.length,
+        0,
+        "admin gate 在 repo.revoke 之前 reject",
+      );
+    } finally { await resetPool(); }
+  });
+
+  // 锁住 handler 内的顺序:admin gate 在 path regex **之前**。
+  // 否则非 admin 撞 malformed path 会返 404(暴露 path 校验细节),
+  // 与 "admin-only rollout 期间不区分 path 是否合法" 的契约不符。
+  test("DELETE 非 admin + malformed path → 403 而不是 404(admin gate 在 path 解析前)", async () => {
+    const pool = buildFakePool();
+    setPoolOverride(pool);
+    try {
+      const req = new MockReq({
+        url: "/api/me/api-keys/abc", // 非数字 path,合法 admin 走会得 404
+        method: "DELETE",
+        headers: await makeUserAuthHeader(),
+      });
+      await assert.rejects(
+        handleRevokeMyApiKey(req as any, new MockRes() as any, FAKE_CTX, makeDeps()),
+        (e: { status?: number; code?: string }) =>
+          e.status === 403 && e.code === "ADMIN_ONLY",
+      );
+      assert.equal((pool as unknown as { queries: unknown[] }).queries.length, 0);
     } finally { await resetPool(); }
   });
 });

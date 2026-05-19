@@ -156,6 +156,38 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 
 签发面在 `commercial/src/http/` 下新增 `apiKeyAdmin.ts`,挂在 web router(JWT 认证)。
 
+### 3.4 上线门控 — admin-only rollout(Phase 6,临时)
+
+**决策**(2026-05-18 boss 上线确认):首期 CC 外接 endpoint **只对 admin role 开放**,普通用户暂不允许创建/使用 API key。等内部 dogfood 一段时间、扣费 / claude_accounts pool 消费、`request_finalize_journal.container_id IS NULL` 路径稳定后,再开放给普通用户。
+
+**两层防御**(defense-in-depth):
+
+| Layer | 位置 | 行为 | 错误码 |
+|---|---|---|---|
+| Layer 1 | `http/apiKeyAdmin.ts` 三个 handler | `requireAuth` 之后立刻 `requireAdmin(user)` — 非 admin JWT 进 GET/POST/DELETE 一律 reject | HTTP 403 `ADMIN_ONLY` |
+| Layer 2 | `auth/apiKeyIdentity.ts` `resolve` | secret 验对 + `bumpLastUsedThrottled` 完成后,`loadUserModelAuthz(uid).role !== "admin"` → throw `IdentityError("API_KEY_INVALID")`,proxy/index.ts 统一映成 401 UNAUTHORIZED | HTTP 401(反枚举:与 unknown / revoked / secret-mismatch 同码)|
+
+**两层都要**的理由(消除"一类问题"而非单点补丁):
+- Layer 1 拦"创建/列表/撤销"入口 — 防止普通用户的 JWT 创建出可能被 staff/SQL 直插的 row。
+- Layer 2 拦"消费 quota"入口 — 即使 DB 残留 user-role 的 key(staff 协助创建 / SQL 直插 / 历史数据),仍兜底 reject,**保护 claude_accounts pool 不被普通用户消耗**。
+- Layer 1 在 path regex **之前**:非 admin 撞 malformed path 也返 403 而非 404(rollout 期不区分 path 是否合法,避免"探 path 合法性"侧信道)。
+
+**Layer 2 顺序锁**(写进 strategy 注释 + unit/integ test 锁住):
+1. `findByPrefix` → 不存在 / 已撤销 → throw,**不**bump
+2. secret 比对 → mismatch → throw,**不**bump
+3. **secret 验对 → bumpLastUsedThrottled fire**(ops 可见 last_used_at,知道有非 admin 在试用合法 key)
+4. `loadUserModelAuthz` → role 非 admin → throw API_KEY_INVALID
+
+**反枚举一致性**(plan §4 invariant #7 已锁):Layer 2 用同一 `API_KEY_INVALID` 码,攻击者拿 user-role 的 key 试探时无法靠错误码区分 "不存在 / 已撤销 / 非 admin"。
+
+**fail-closed**:`loadUserModelAuthz` 自身 throw 直接透传 → proxy/index.ts catch-all 映成 500 INTERNAL(不静默放行),Phase 2 strategy unit test 锁。
+
+**未来去 gate**(改回普通用户开放):
+1. 删 `apiKeyAdmin.ts` 中 `requireAdmin` 函数 + 3 处调用(Layer 1)
+2. 删 `apiKeyIdentity.ts` `resolve` 内 `Phase 6 admin-only rollout gate` 注释块内代码(Layer 2)
+3. 测试中默认 role 改回 `user`、删除 Phase 6 describe blocks
+4. **无外部 API 变化**(错误码、URL、token 形态、SQL schema 均不变)
+
 ---
 
 ## 4. 8 个硬不变量(测试必须锁定)
@@ -172,10 +204,17 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 6. **API-key 路径不调用 `recordHostRequest`** — synthetic `hostUuid = "external-api-key"` 仅用于 log/metric 区分,**API-key 路径绝不调用 `recordHostRequest`**(防外部流量被并入某真实 host 统计)。test: `recordHostRequest` spy 调用次数为 0 + hostUuid value 断言为 `"external-api-key"`。
 7. **【Codex v1 MAJOR #3】invalid / revoked API key → 401 且账务零副作用** — 当 `resolve` 抛 `IdentityError`,**绝不**调用 `preCheckWithCost` / `startInflightJournal` / `settleUsageAndLedger` 中任意一个。test(commercial integ): 发送 invalid key + revoked key,handler 返 401,reservation/journal/ledger 三类副作用 spy 调用次数均为 0。
 8. **【Codex v1 MAJOR #3 / v2 收口】valid API key + known enabled model 但 role/grants 不满足 → 403 且账务零副作用** — `authorize` 失败时**不**写 journal / ledger。test: mock `loadUserModelAuthz` 返用户**无 grant** 的普通用户 + 请求带 admin/hidden 受限 model(model 自身 enabled,只是该 uid 无权用),handler 返 403,reservation/journal/ledger 三类副作用 spy 调用次数均为 0。
+9. **【Phase 6 admin-only rollout】两层 admin gate 闭合 + 顺序锁 + 反枚举一致 + 零账务**(plan §3.4 临时门控):
+   - Layer 1(管理面 HTTP):非 admin JWT 进 GET/POST/DELETE `/api/me/api-keys*` 一律 403 ADMIN_ONLY,user_api_keys 表**完全不被触达**(repo spy 调用次数为 0)。Admin gate 在 path regex **之前**,malformed path 也得 403 而非 404。
+   - Layer 2(strategy.resolve):**顺序锁** — unknown prefix / revoked / secret-mismatch 三种 secret 未验对的情况下 `touchLastUsed` spy 必须为 0;**secret 验对 + role 非 admin** 时 `touchLastUsed` spy 必须 = 1(让 ops 通过 last_used_at 看到非 admin 试用),随后 throw `API_KEY_INVALID` → handler 401 UNAUTHORIZED + **preCheck / scheduler / journal / usage_records / credit_ledger 任意 SQL 都不能触达**。
+   - 反枚举:Layer 2 的 `API_KEY_INVALID` 与 unknown/revoked/mismatch 同码,客户端无法靠错误码区分。
+   - fail-closed:`loadUserModelAuthz` 自身 throw 直接透传给 proxy/index.ts catch-all → 500 INTERNAL(不静默放行)。
 
 > **注意 400 vs 403 边界**(Codex v2 修正):未知 model / `pricing.get(model)==null` / `enabled=false` 走 **400 `UNKNOWN_MODEL`** 在 `authorize` 之前,属 split plan §6.1 baseline #5 覆盖范围,本任务**不重复**测,只 reference;invariant #8 严格限定在"model 存在且 enabled,只是当前 uid 无 role/grants"的 authz 真路径。
 >
 > #7 #8 是本任务为新公网入口建立的信任边界。拆分 plan §6.1 baseline 锁的是 existing handler authorize 失败不进 preCheck 的容器入口语境;新增 `resolve` 路径 + 新 public route + `containerId=null` 这三个变化点没有被原 baseline 覆盖,必须本任务独立锁。
+>
+> #9 是本任务上线**首期临时**的 admin-only rollout 闭锁。未来去 gate 时整段 #9 invariant 同步下线(plan §3.4 末)。Layer 2 的 "secret OK 后才 bump" 顺序锁需要单独在 unit/integ 测试里写,**对比**未通过 secret 的路径(unknown / revoked / mismatch)的 bump=0,锁住 strategy 实现顺序不会被未来改动悄悄打乱。
 
 ---
 
@@ -280,7 +319,23 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 
 预算:0.5 工日。
 
-**总计:3-4 工日**。
+### Phase 6:上线门控 — admin-only rollout(临时,见 §3.4)
+
+> 本 Phase 在 Phase 0-5 已落地、PR 已开、Codex code review PASS、boss 确认"上线吧,确保不影响已有功能,先只给管理员用"之后追加。**目的:把首期试用面缩到 admin,等 dogfood 过 + claude_accounts pool 消费稳定再去 gate。**
+
+- **Layer 1**(`http/apiKeyAdmin.ts`):`requireAdmin(user)` helper + 三个 handler 入口检查 → 非 admin JWT 一律 403 ADMIN_ONLY。
+- **Layer 2**(`auth/apiKeyIdentity.ts` `resolve`):secret 验对 + `bumpLastUsedThrottled` fire 后,`loadUserModelAuthz(uid).role !== "admin"` → throw `API_KEY_INVALID`(反枚举一致)。
+- **测试改造**:
+  - Phase 2 strategy unit test:默认 `loadUserModelAuthz` mock 改 `role: "admin"`(replace_all 12 处),新增 `apiKeyIdentity.resolve — Phase 6 admin-only rollout gate(Layer 2)` describe(4 个用例:admin happy 锁 authzCalls=1 + bump=1 / non-admin → API_KEY_INVALID + bump=1 / loadUserModelAuthz throw passthrough + bump=1 / 对比性 bump 顺序锁:unknown=0 + mismatch=0 + non-admin=1)。
+  - Phase 4 admin handler unit test:默认 `makeAuthHeader` 改 `role: "admin"`,新增 `makeUserAuthHeader` + Phase 6 admin-only describe(4 个用例:GET/POST/DELETE 非 admin → 403 ADMIN_ONLY + repo 0 调 + DELETE 非 admin + malformed path 也得 403 不是 404)。
+  - Phase 4 admin handler integ test:harness 默认 admin(JWT + authzMock),新增 `Phase 6 admin-only rollout — Layer 1 管理面 403 闭环`(端到端真路由跑 GET/POST/DELETE 三条 + malformed → user_api_keys 0 触达)+ `Layer 2 strategy 兜底 401 + 零副作用`(admin 创建 key → authz 降级 user harness → 真 plaintext 跑 proxy → 401 + bump=1 + preCheck/scheduler/journal/usage/ledger 全 0 SQL)。
+  - Phase 3 endpoint integ test:默认 authz role → admin;原 authz-deny test 改 visibility=`hidden` + role=`admin` + 空 grants 保留 canUseModel→false 闭环;新增 Phase 6 Layer 2 admin gate 负面用例。
+- **plan doc 同步**:§3.4 新增完整段、§4 invariant #9、§7 本 Phase。
+- **去 gate 路径**:在 §3.4 末尾固化,等触发条件满足(dogfood 稳定、扣费正确、boss 决定开放)时按步操作即可,**外部 API 形态不变**。
+
+预算:0.3 工日(代码两点 admin gate + 测试 ~14 用例新增/改造 + plan doc 三段同步;借用既有 fakePool harness)。
+
+**总计:3-4 工日 + Phase 6 临时 0.3 工日**。
 
 **前提**:split baseline 测试夹具与 commercial router 挂载点(`packages/commercial/src/index.ts:820` 附近)已稳定。若 split 在 review 期间再次重构 `IdentityStrategy` / handler 装配 / billing lifecycle 签名,实际预算 4-5 工日(rebase 重写 ApiKeyIdentityStrategy + 修测试)。
 
@@ -298,6 +353,7 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 - ❌ **不**为 key create / revoke / 异常使用单独推送 security event / 邮件 / Telegram 通知(MVP 复用现有 request log;如需独立 audit trail,后续单独迭代)
 - ❌ **不**做 key 重命名 / label PATCH 端点(MVP 用户可 revoke 旧 key + create 新 key 完成同样目的)
 - ❌ **不**把 `api_key_id` 进 journal / ctx(MVP 按 uid 计费/审计;未来上 per-key cap 时再扩 ctx)
+- ⏳ **临时门控** Phase 6 admin-only rollout(plan §3.4)— **非范围蠕变**,是上线节奏决策:首期 admin 才能用 CC 外接 endpoint。去 gate 时把 Layer 1+Layer 2 两段注释包裹的代码删除即可,无外部 API / SQL schema 变化(详见 §3.4 末"未来去 gate")。
 
 ---
 

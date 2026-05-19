@@ -497,11 +497,15 @@ function buildHarness(opts: HarnessOpts = {}) {
     },
   });
 
+  // Phase 6 admin-only rollout(plan §3.4):默认 authz role=admin —— Layer 2
+  // strategy 内 admin gate 会 reject 非 admin 即使 secret 验对了。既有 happy
+  // 用例(token 合法 + model 已授权 → 200)默认 admin 即可保持绿,**单独**
+  // Phase 6 负面用例显式 opts.authz={role:"user"} 触发 401。
   const apiKeyStrategy = makeApiKeyIdentityStrategy({
     repo: apiKeyRepoSpy.repo,
     pricing,
     loadUserModelAuthz: async () => opts.authz ?? {
-      role: "user",
+      role: "admin",
       grantedModelIds: new Set<string>([FIXED_MODEL]),
     },
     now: opts.now,
@@ -761,12 +765,16 @@ describe("auth failure — invalid token 不应留下任何账务副作用", () 
 // ════════════════════════════════════════════════════════════════════════════
 
 describe("authz failure — token 合法 + model 未授权 → 403", () => {
-  test("user role + admin-visibility model + 空 grants → 403 NOT_AUTHORIZED,preCheck 不 reserve", async () => {
-    // canUseModel: visibility=public 时 grants 无关恒 true,必须 visibility=admin 才会
-    // 检查 grants/role。这套语义跟 anthropicProxy.integ.test.ts L984 同源。
+  test("admin role + hidden-visibility model + 空 grants → 403 NOT_AUTHORIZED,preCheck 不 reserve", async () => {
+    // canUseModel:visibility="public" 永远 true,visibility="admin" 只看 role,
+    // visibility="hidden" 只看 grants。Phase 6 admin-only rollout 把 strategy.resolve
+    // 内的 role!=="admin" 路径吃掉了(Layer 2 直接 401),所以此处必须用
+    // role="admin" + visibility="hidden" + 空 grants 组合,才能保留 "authz fail
+    // → 403 NOT_AUTHORIZED" 闭环测试 — 用 hidden + 空 grants 让 canUseModel false。
+    // 同源语义见 anthropicProxy.integ.test.ts。
     const h = buildHarness({
-      pricingOverride: { visibility: "admin" },
-      authz: { role: "user", grantedModelIds: new Set() },
+      pricingOverride: { visibility: "hidden" },
+      authz: { role: "admin", grantedModelIds: new Set() },
     });
     const res = await h.run();
     assert.equal(res.statusCode, 403, `expected 403, got ${res.statusCode}: ${res.bodyText()}`);
@@ -781,6 +789,47 @@ describe("authz failure — token 合法 + model 未授权 → 403", () => {
     // 但 preCheck.atomicReserve **必须没**被调(authz 失败在 reserve 之前)
     assert.equal(h.preCheckSpy.reserveCalls.length, 0, "authz fail → 不进 reservation 路径");
     assert.equal(h.schedulerSpy.pickCalls, 0, "authz fail → 不进 pick 路径");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 6 admin-only rollout(plan §3.4)Layer 2 — strategy 内 admin gate 闭环
+//
+// secret 验对 → bumpLastUsedThrottled 已 fire → admin gate 看到 role="user"
+// → 抛 IdentityError("API_KEY_INVALID"),proxy/index.ts catch 后 401 UNAUTHORIZED。
+//
+// 与 Layer 1(管理面 403 ADMIN_ONLY)的责任分工:Layer 1 拦住"创建/列表/撤销"
+// 入口,Layer 2 拦住"消费 quota"入口。两层都被破口才会失守 — 即使 DB 残留
+// user-role 的 key(SQL 直插 / 历史遗留 / 未来 staff 协助),这一层仍兜底。
+//
+// 反枚举一致:与 unknown prefix / revoked / secret-mismatch 同走 API_KEY_INVALID,
+// 攻击者无法靠错误码区分。preCheck / scheduler / journal / usage_records /
+// credit_ledger 全部不能触达 — 否则 user 拿合法 key 可消耗 claude_accounts pool。
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Phase 6 admin-only Layer 2 — strategy 内 admin gate(authz role=user → 401 + 零账务)", () => {
+  test("token+secret 合法但 authz role=user → 401 UNAUTHORIZED + touchLastUsed 调 1 次 + preCheck/scheduler 全不触发", async () => {
+    // 默认 token+row 都用 FIXED_PREFIX/SECRET,secret 一定 verify 通过 →
+    // bumpLastUsedThrottled 必须 fire(顺序锁,与 secret-mismatch 路径区分)。
+    // 之后 strategy 内 admin gate 看到 role="user" → throw API_KEY_INVALID。
+    const h = buildHarness({
+      authz: { role: "user", grantedModelIds: new Set<string>([FIXED_MODEL]) },
+    });
+    const res = await h.run();
+    assert.equal(res.statusCode, 401, `expected 401, got ${res.statusCode}: ${res.bodyText()}`);
+    // 反枚举:proxy/index.ts 把 IdentityError 全部映成 UNAUTHORIZED,errcode 不外泄区分理由。
+    assert.equal(readErrCode(res), "UNAUTHORIZED");
+
+    // 顺序锁 — secret 已 verify → bumpLastUsedThrottled 必须 fire(ops 可见 last_used_at)。
+    // 不能因为 admin gate reject 就把 bump 跳过 — 见 strategy 代码注释 "顺序说明"。
+    await new Promise((r) => setImmediate(r));
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 1, "findByPrefix 调过(secret 比对前提)");
+    assert.equal(h.apiKeyRepoSpy.touchLastUsedCalls.length, 1, "secret OK → bump 必须发生(non-admin attempt 也要可见)");
+
+    // 零账务副作用 — admin gate throw IdentityError 后 proxy/index.ts catch 直接 401,
+    // 不进 preCheck / scheduler / journal / usage_records / credit_ledger 任何 SQL。
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0, "admin gate reject → 不进 preCheck reservation");
+    assert.equal(h.schedulerSpy.pickCalls, 0, "admin gate reject → 不进 scheduler pick");
   });
 });
 
