@@ -166,6 +166,45 @@ export function makeApiKeyIdentityStrategy(
       req: IncomingMessage,
       _ctx: { hostUuid: string; boundIp: string },
     ): Promise<ProxyIdentity> {
+      // === CC 外接 UA 入站门控(plan §3.5,2026-05-19 加)===
+      //
+      // 只放行 `claude-cli/*` UA。其他客户端(curl / postman / 第三方 SDK)拒。
+      // **仅"误用门控",非安全检查** — UA 客户端可伪造,真要绕过 `curl
+      // --user-agent claude-cli/x.y.z` 一行即可。目的:
+      //   1) 抬高滥用门槛(防误用 + 防 key 泄露后被脚本利用)
+      //   2) 让上游 Anthropic 看到的入站流量形态尽量贴近"原生 CC CLI",
+      //      配合 commercial proxy 已有的 device_id pin / OAuth pool 反风控
+      //
+      // **anti-enumeration**:UA 不对 → 同一 `API_KEY_INVALID` / 401 错误码,
+      // 与 unknown/revoked/secret-mismatch/non-admin 共享同 message。
+      // 攻击者无法靠错误码区分"UA 错"和"key 错",server log 内部用 reason
+      // 字段区分给运维 grep。
+      //
+      // **放在 token parse 之前**:UA 检查不依赖任何 user 数据,前置省一次
+      // DB hash 查询。timing-analysis 上 UA 检查比 DB lookup 快得多,但攻击者
+      // 想做 timing 区分必须先持合法 UA + 合法 key,这点信息无价值。
+      //
+      // **prefix match**:CCB / 官方 CC CLI 共用 `getUserAgent()`,生成
+      // `claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>, ...)`,所以
+      // `^claude-cli/` 覆盖 ant/external/firstParty + cli/vscode/sdk +
+      // workload 后缀所有合法变体。不卡版本号 — 用户 CC 版本不一定跟我们
+      // 同步,卡版本会误伤。不 trim — raw header prefix match 更干净,
+      // 防奇怪前导空白被放行(Codex Phase 7 plan-review NIT 采纳)。
+      const uaRaw = req.headers["user-agent"];
+      const ua = typeof uaRaw === "string" ? uaRaw : "";
+      if (!/^claude-cli\//i.test(ua)) {
+        // server log 标 reason 字段给运维区分;client 看到的仍是统一 401。
+        deps.logger?.warn("api_key_ua_gate_blocked", {
+          reason: "ua_mismatch",
+          uaPreview: ua.slice(0, 80),
+        });
+        throw new IdentityError(
+          "API_KEY_INVALID",
+          "user-agent not allowed for CC external endpoint",
+        );
+      }
+      // === /UA 入站门控 ===
+
       const { keyPrefix, secretHex } = parseApiKeyToken(req.headers.authorization);
 
       const row = await deps.repo.findByPrefix(keyPrefix);

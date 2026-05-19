@@ -189,13 +189,43 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 4. 同步删/改文档:本节(§3.4)、§4 invariant #9、§7 Phase 6 行、§8 Phase 6 临时性标注,以及代码内 `Phase 6` 注释块(`apiKeyAdmin.ts` / `apiKeyIdentity.ts` 文件头与 inline 注释)
 5. **无外部 API 变化**(错误码、URL、token 形态、SQL schema 均不变)
 
+### 3.5 入站 UA 门控 — CC CLI only(2026-05-19 加,与 Phase 6 同性质的反风控/反枚举闭锁)
+
+**决策**(2026-05-19 boss 上线确认):CC 外接 endpoint **只接受官方 Claude Code CLI 的 user-agent**,任何 curl / Postman / 3rd-party SDK / 浏览器抓包重放在 strategy `resolve()` 最前面就被拒。
+
+**理由**(消除"一类问题"而非单点补丁):
+- **反风控**:上游 Anthropic 把"同一 OAuth account 短时间内既有 CC CLI 行为又有怪 UA SDK 流量"作为风控信号。我们把外接流量限定为"长得跟容器内 CC CLI 一样的 UA + claude-cli 完整 client-fingerprint 模式",让外接路径与容器路径在上游看起来同源(plan §3.2.4 adapter `boundIp=sentinel` 是同一思路的延续)。
+- **反枚举**:与 Phase 6 admin gate 一致 — 错误码统一 `API_KEY_INVALID` / 401,攻击者用 curl 拿到 401 后无法分辨"UA 不对"和"key 不存在/被撤销",连"这个 endpoint 接受什么 UA"的探测都得靠盲猜。
+- **省 DB**:UA 不对的请求**绝不**触达 `findByPrefix` / `loadUserModelAuthz` / `bumpLastUsedThrottled`,把脚本扫描流量挡在最外层,保护 user_api_keys 表 + claude_accounts pool 不被无效流量打扰。
+
+**位置**:`auth/apiKeyIdentity.ts` `resolve()` **第一行**,在 `parseApiKeyToken` 之前。Strategy 层 gate 而非 router 层,是为了把"UA 不对"和"key 不对"两类失败合到同一 IdentityError 路径下 — invariant #7 的"401 + 三类副作用 spy 全 0" 自动覆盖。
+
+**匹配规则**(prefix match,case-insensitive):
+```
+^claude-cli\/
+```
+- 命中即放行,允许 CC CLI 任意后续 fingerprint(USER_TYPE / ENTRYPOINT / agent-sdk / client-app / workload 等可变字段不锁,只锁产品名称前缀)。
+- 不命中即 throw `IdentityError("API_KEY_INVALID", "user-agent not allowed for CC external endpoint")` → handler 401。
+- `user-agent` header 缺失视为不匹配。
+
+**反枚举一致性**(invariant #10 锁):UA gate 错误码与 unknown prefix / revoked / secret-mismatch / non-admin 全部统一 `API_KEY_INVALID` / 401。日志 `api_key_ua_gate_blocked` 仅写到 ops 侧 logger.warn,客户端看不到。
+
+**为什么不放在 listener / router 层**:
+1. router 层(`http/router.ts` prefixes 数组)只做 path 匹配,加 UA 过滤会让 router 变成两套语义混合(path + header 双 axis),违反单一职责。
+2. strategy 层是 identity 决断的入口,UA 本质是"客户端身份"的一部分,放这里语义自洽,且能复用 IdentityError 的统一 401 映射。
+3. 未来若有"per-route UA 白名单"需求(如 admin handler 想限制只能浏览器访问),应在那个 strategy 层独立加,不污染当前 endpoint。
+
+**未来去 gate / 放宽**:
+- 若 boss 决定开放给第三方 SDK,只需删除 `resolve()` 顶部 UA gate 代码块 + 同步删 invariant #10 + 删测试 describe block。
+- 若需要支持额外白名单 UA(如 anthropic SDK 官方版本),改 regex 即可,**无外部 API 变化**(错误码、URL、token 形态、SQL schema 均不变)。
+
 ---
 
-## 4. 9 个硬不变量(测试必须锁定)
+## 4. 10 个硬不变量(测试必须锁定)
 
 复用 anthropicProxy split plan §6.1 的 5 个 handler baseline invariants(release 4-stage / abort err.shape / commit→broadcast 顺序 / DeepSeek noop / model gate fail-closed —— 本任务**不重复列也不再写测试**,只引用)。
 
-本任务新增 9 条(原 v1 6 条 + Codex v1 MAJOR #3 新增 #7 #8 + Phase 6 临时门控 #9):
+本任务新增 10 条(原 v1 6 条 + Codex v1 MAJOR #3 新增 #7 #8 + Phase 6 临时门控 #9 + 2026-05-19 §3.5 UA gate #10):
 
 1. **API key 无明文存储** — repo.create 返完整 secret,**之后任何查询都不能返 secret**(只返 prefix + hash 比对的接口)。test: `findByPrefix(prefix)` 返回的 row 没有 secret 字段。
 2. **撤销立即生效** — `revoked_at IS NOT NULL` 的 key 在下一次 `resolve` 即 401。test: revoke 后第二次 request 拿到 401。
@@ -210,6 +240,12 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
    - Layer 2(strategy.resolve):**顺序锁** — unknown prefix / revoked / secret-mismatch 三种 secret 未验对的情况下 `touchLastUsed` spy 必须为 0;**secret 验对 + role 非 admin** 时 `touchLastUsed` spy 必须 = 1(让 ops 通过 last_used_at 看到非 admin 试用),随后 throw `API_KEY_INVALID` → handler 401 UNAUTHORIZED + **preCheck / scheduler / journal / usage_records / credit_ledger 任意 SQL 都不能触达**。
    - 反枚举:Layer 2 的 `API_KEY_INVALID` 与 unknown/revoked/mismatch 同码,客户端无法靠错误码区分。
    - fail-closed:`loadUserModelAuthz` 自身 throw 不被这里 catch,透传给 proxy/index.ts identity 阶段(非 `IdentityError` 继续抛出)→ 由 commercial router 的统一 `handleError` 映成 500 INTERNAL(不静默放行)。
+10. **【2026-05-19 §3.5 UA gate】非 claude-cli UA → 401 且全链路零副作用 + 反枚举一致**(plan §3.5):
+    - 任何 `user-agent` 不以 `claude-cli/` 开头(case-insensitive)或 header 缺失 → `resolve()` 第一行 throw `IdentityError("API_KEY_INVALID")` → handler 401。
+    - **零副作用**:UA gate 在 `parseApiKeyToken` / `findByPrefix` / `touchLastUsed` / `loadUserModelAuthz` / `preCheckWithCost` / `startInflightJournal` / `settleUsageAndLedger` **全部之前**,这 7 类 spy 调用次数均为 0。
+    - 反枚举:错误码与 unknown / revoked / mismatch / non-admin 同为 `API_KEY_INVALID` / 401,客户端无法区分 "UA 不对" vs "key 不对"。
+    - 正例不变:`claude-cli/2.1.888 (external, cli)`、`claude-cli/2.0.0 (admin, cli, agent-sdk/0.1.0)`、`claude-cli/x.y.z (foo, bar, ...任意 fingerprint)` 全部放行进入后续 strategy 流程。
+    - test(strategy unit + commercial integ):6 类负 UA(`curl/x.y.z` / `PostmanRuntime` / `Mozilla` / `python-requests` / `claude-code/...` 拼写陷阱 / 空字符串 / header 完全缺失)→ 401 + 7 类 spy 全 0 + logger.warn `api_key_ua_gate_blocked` 命中。
 
 > **注意 400 vs 403 边界**(Codex v2 修正):未知 model / `pricing.get(model)==null` / `enabled=false` 走 **400 `UNKNOWN_MODEL`** 在 `authorize` 之前,属 split plan §6.1 baseline #5 覆盖范围,本任务**不重复**测,只 reference;invariant #8 严格限定在"model 存在且 enabled,只是当前 uid 无 role/grants"的 authz 真路径。
 >
