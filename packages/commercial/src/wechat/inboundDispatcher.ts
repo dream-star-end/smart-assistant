@@ -54,6 +54,7 @@ import {
   type PgConn,
 } from "./sessionPointer.js"
 import { type WechatSessionId } from "./types.js"
+import { MASTER_USER_PREFIX } from "./userIds.js"
 
 /** 容器侧 inbound handler 路径(master POST → 容器 18789 内 gateway 接)。 */
 export const WECHAT_INBOUND_CONTAINER_PATH = "/internal/v3/wechat-inbound"
@@ -88,8 +89,9 @@ const COMMAND_ECHO_REPLY = "当前微信通道暂不支持命令,请直接发送
 /** 默认 session title fallback(空白文本 / 全 emoji 截断后空时使用)。 */
 const DEFAULT_SESSION_TITLE = "微信会话"
 
-/** Master sqlite client_sessions.user_id 加 `c:` 前缀,与 web owner id 字节级对齐。 */
-const MASTER_USER_PREFIX = "c:"
+// `MASTER_USER_PREFIX` 是 PG-side raw digit ↔ sqlite-side `c:<digit>` 命名约定的边界
+// 常量,集中在 `userIds.ts` 维护;outboxWorker 也用同一来源做相同翻译。
+// 见 userIds.ts 的模块注释。
 
 // ─── 输入 / 输出契约 ────────────────────────────────────────────────────────
 

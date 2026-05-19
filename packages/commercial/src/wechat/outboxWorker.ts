@@ -19,7 +19,7 @@
  *   - "binding 失踪" / "no context_token" 视为 permanent(用户没绑定或未入站过,broker 重试无意义)
  */
 
-import type { Pool } from "pg"
+import type { Pool } from 'pg'
 import {
   DEFAULT_MAX_ATTEMPTS,
   dropAgedPending,
@@ -29,8 +29,9 @@ import {
   purgeFailedAged,
   purgeSentTombstones,
   releaseStaleSending,
-} from "./outboxStore.js"
-import type { IlinkPart, OutboxRow } from "./types.js"
+} from './outboxStore.js'
+import type { IlinkPart, OutboxRow } from './types.js'
+import { MASTER_USER_PREFIX } from './userIds.js'
 
 /** sendText 实装返回。permanent → broker 立即 force-fail 不复活;否则按 attempts cap 兜底。 */
 export interface SendResult {
@@ -53,7 +54,7 @@ export type GetBindingFn = (bindingUserId: string) => Promise<{
   contextTokens: Record<string, string>
 } | null>
 
-export type LogFn = (level: "info" | "warn" | "error", message: string) => void
+export type LogFn = (level: 'info' | 'warn' | 'error', message: string) => void
 
 export interface OutboxWorkerOptions {
   pool: Pool
@@ -72,12 +73,12 @@ export interface OutboxWorkerOptions {
 
 /** 单条 outbox row 出站结果分类(测试 & 调用方观测用)。 */
 export type DrainOutcome =
-  | { kind: "sent"; outboxId: number }
-  | { kind: "failed_permanent"; outboxId: number; reason: string }
-  | { kind: "failed_transient"; outboxId: number; attempts: number; errMessage: string }
-  | { kind: "failed_terminal"; outboxId: number; attempts: number; errMessage: string }
+  | { kind: 'sent'; outboxId: number }
+  | { kind: 'failed_permanent'; outboxId: number; reason: string }
+  | { kind: 'failed_transient'; outboxId: number; attempts: number; errMessage: string }
+  | { kind: 'failed_terminal'; outboxId: number; attempts: number; errMessage: string }
   /** markSent / markFailed 命中 0 row(状态机漂移,真正罕见);broker 只 log 不 throw。 */
-  | { kind: "noop"; outboxId: number; reason: string }
+  | { kind: 'noop'; outboxId: number; reason: string }
 
 /**
  * 强制把一行翻成 'failed' 终态(attempts = maxAttempts,后续 enqueue 永走 already_failed)。
@@ -122,20 +123,23 @@ export async function drainOne(
 ): Promise<DrainOutcome> {
   const { pool, sendText, getBinding, now, maxAttempts } = deps
 
-  const binding = await getBinding(row.bindingUserId)
+  // outbox.binding_user_id 沿 PG-side 命名(raw digit,见 userIds.ts);跨入 master sqlite
+  // 读 wechat_bindings 时 prepend `c:` 前缀,与 inboundDispatcher 写 client_sessions 时
+  // 的 `MASTER_USER_PREFIX + evt.bindingUserId` 模式对称。
+  const binding = await getBinding(MASTER_USER_PREFIX + row.bindingUserId)
   if (!binding) {
-    const ok = await forceFail(pool, row.id, "binding_gone", now(), maxAttempts)
+    const ok = await forceFail(pool, row.id, 'binding_gone', now(), maxAttempts)
     return ok
-      ? { kind: "failed_permanent", outboxId: row.id, reason: "binding_gone" }
-      : { kind: "noop", outboxId: row.id, reason: "binding_gone_but_row_drifted" }
+      ? { kind: 'failed_permanent', outboxId: row.id, reason: 'binding_gone' }
+      : { kind: 'noop', outboxId: row.id, reason: 'binding_gone_but_row_drifted' }
   }
 
   const contextToken = binding.contextTokens[row.senderId]
   if (!contextToken) {
-    const ok = await forceFail(pool, row.id, "no_context_token", now(), maxAttempts)
+    const ok = await forceFail(pool, row.id, 'no_context_token', now(), maxAttempts)
     return ok
-      ? { kind: "failed_permanent", outboxId: row.id, reason: "no_context_token" }
-      : { kind: "noop", outboxId: row.id, reason: "no_context_token_but_row_drifted" }
+      ? { kind: 'failed_permanent', outboxId: row.id, reason: 'no_context_token' }
+      : { kind: 'noop', outboxId: row.id, reason: 'no_context_token_but_row_drifted' }
   }
 
   // 顺序发送 parts;任意一条失败 → 标失败整行(retry 时 user 看见 part 1 重复 — 接受)。
@@ -152,37 +156,37 @@ export async function drainOne(
       text: part.text,
     })
     if (!result.ok) {
-      const errMsg = result.errMessage ?? "sendText_unknown_error"
+      const errMsg = result.errMessage ?? 'sendText_unknown_error'
       if (result.permanent) {
         const ok = await forceFail(pool, row.id, errMsg, now(), maxAttempts)
         return ok
-          ? { kind: "failed_permanent", outboxId: row.id, reason: errMsg }
-          : { kind: "noop", outboxId: row.id, reason: "permanent_fail_but_row_drifted" }
+          ? { kind: 'failed_permanent', outboxId: row.id, reason: errMsg }
+          : { kind: 'noop', outboxId: row.id, reason: 'permanent_fail_but_row_drifted' }
       }
       const r = await markFailed(pool, row.id, errMsg, now(), maxAttempts)
-      if (!r) return { kind: "noop", outboxId: row.id, reason: "markFailed_drift" }
+      if (!r) return { kind: 'noop', outboxId: row.id, reason: 'markFailed_drift' }
       return r.permanent
-        ? { kind: "failed_terminal", outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
-        : { kind: "failed_transient", outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
+        ? { kind: 'failed_terminal', outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
+        : { kind: 'failed_transient', outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
     }
     sentParts++
   }
 
   if (sentParts === 0) {
-    const ok = await forceFail(pool, row.id, "invalid_payload", now(), maxAttempts)
+    const ok = await forceFail(pool, row.id, 'invalid_payload', now(), maxAttempts)
     return ok
-      ? { kind: "failed_permanent", outboxId: row.id, reason: "invalid_payload" }
-      : { kind: "noop", outboxId: row.id, reason: "invalid_payload_but_row_drifted" }
+      ? { kind: 'failed_permanent', outboxId: row.id, reason: 'invalid_payload' }
+      : { kind: 'noop', outboxId: row.id, reason: 'invalid_payload_but_row_drifted' }
   }
 
   const sentOk = await markSent(pool, row.id, now())
   return sentOk
-    ? { kind: "sent", outboxId: row.id }
-    : { kind: "noop", outboxId: row.id, reason: "markSent_drift" }
+    ? { kind: 'sent', outboxId: row.id }
+    : { kind: 'noop', outboxId: row.id, reason: 'markSent_drift' }
 }
 
-function isTextPart(p: IlinkPart): p is { type: "text"; text: string } {
-  return p.type === "text" && typeof p.text === "string"
+function isTextPart(p: IlinkPart): p is { type: 'text'; text: string } {
+  return p.type === 'text' && typeof p.text === 'string'
 }
 
 /**
@@ -194,7 +198,7 @@ export class OutboxWorker {
   private timer: ReturnType<typeof setTimeout> | null = null
   private stopFlag = false
   private inFlight: Promise<void> | null = null
-  private readonly opts: Required<Omit<OutboxWorkerOptions, "log">> & {
+  private readonly opts: Required<Omit<OutboxWorkerOptions, 'log'>> & {
     log: LogFn
   }
 
@@ -246,7 +250,7 @@ export class OutboxWorker {
       } catch (err) {
         // pickOne 已标 'sending'(locked_at 已 stamp);留它给 releaseStaleSending 回收。
         this.opts.log(
-          "error",
+          'error',
           `outboxWorker.drainOne crashed: id=${row.id} err=${String((err as Error)?.message ?? err)}`,
         )
       }
@@ -260,7 +264,7 @@ export class OutboxWorker {
       this.inFlight = this.tick()
         .catch((err) => {
           this.opts.log(
-            "error",
+            'error',
             `outboxWorker.tick crashed: ${String((err as Error)?.message ?? err)}`,
           )
         })
@@ -295,7 +299,7 @@ export async function runHousekeeping(
   return { staleReleased, aged, purgedSent, purgedFailed }
 }
 
-function defaultLog(level: "info" | "warn" | "error", message: string): void {
-  const out = level === "error" ? console.error : level === "warn" ? console.warn : console.log
+function defaultLog(level: 'info' | 'warn' | 'error', message: string): void {
+  const out = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log
   out(`[outboxWorker] ${message}`)
 }

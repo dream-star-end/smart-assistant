@@ -1,21 +1,21 @@
+import assert from 'node:assert/strict'
 /**
  * outboxWorker 单测 — dep 全部 mock,聚焦 drainOne 分流 + tick loop 控制 + housekeeping。
  *
  * Run: npx tsx --test packages/commercial/src/__tests__/wechatOutboxWorker.test.ts
  */
-import { afterEach, describe, test } from "node:test"
-import assert from "node:assert/strict"
-import type { Pool } from "pg"
+import { afterEach, describe, test } from 'node:test'
+import type { Pool } from 'pg'
 import {
-  OutboxWorker,
-  drainOne,
-  runHousekeeping,
   type DrainOutcome,
+  type GetBindingFn,
+  OutboxWorker,
   type SendResult,
   type SendTextFn,
-  type GetBindingFn,
-} from "../wechat/outboxWorker.js"
-import type { OutboxRow } from "../wechat/types.js"
+  drainOne,
+  runHousekeeping,
+} from '../wechat/outboxWorker.js'
+import type { OutboxRow } from '../wechat/types.js'
 
 interface CapturedQuery {
   sql: string
@@ -23,7 +23,10 @@ interface CapturedQuery {
 }
 
 function makeFakePool(
-  responder: (sql: string, params: ReadonlyArray<unknown>) => {
+  responder: (
+    sql: string,
+    params: ReadonlyArray<unknown>,
+  ) => {
     rows: Record<string, unknown>[]
     rowCount: number | null
   },
@@ -49,12 +52,14 @@ function makeFakePool(
 function makeRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
   return {
     id: 1,
-    outboundId: "ob-1",
-    bindingUserId: "u1",
-    senderId: "s1",
-    sessionId: "wsess-0123456789abcdef",
-    payload: [{ type: "text", text: "hi" }],
-    status: "sending",
+    outboundId: 'ob-1',
+    // PG-side raw digit form;outboxWorker drainOne 跨入 sqlite 时会 prepend `c:`
+    // (见 outboxWorker.ts 头注释及 userIds.ts 约定)。
+    bindingUserId: '1',
+    senderId: 's1',
+    sessionId: 'wsess-0123456789abcdef',
+    payload: [{ type: 'text', text: 'hi' }],
+    status: 'sending',
     attempts: 0,
     lastError: null,
     lockedAt: 1000,
@@ -67,7 +72,28 @@ function makeRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
 
 const now = () => 5000
 
-describe("outboxWorker.drainOne", () => {
+describe('outboxWorker.drainOne', () => {
+  test('getBinding 收到 sqlite-side canonical 形式(`c:` + row.bindingUserId),不是 raw digit', async () => {
+    // 回归测试:生产 row 1(boss 1193355375@qq.com → c:1)首条 outbox row 因为这层
+    // 翻译漏掉而 binding_gone 10×。see commit message + 'binding_gone' incident notes。
+    const { pool } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
+    const getBindingCalls: string[] = []
+    const getBinding: GetBindingFn = async (uid) => {
+      getBindingCalls.push(uid)
+      return { botToken: 'tok', contextTokens: { s1: 'ctx-s1' } }
+    }
+    const sendText: SendTextFn = async () => ({ ok: true })
+    const outcome = await drainOne(makeRow({ bindingUserId: '1' }), {
+      pool,
+      sendText,
+      getBinding,
+      now,
+      maxAttempts: 10,
+    })
+    assert.deepEqual(outcome, { kind: 'sent', outboxId: 1 })
+    assert.deepEqual(getBindingCalls, ['c:1'], 'getBinding 必须收到 prefix 过的形式')
+  })
+
   test("happy: binding found, ctx token found, sendText ok → markSent → outcome 'sent'", async () => {
     const { pool, captured } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
     const sendCalls: Parameters<SendTextFn>[0][] = []
@@ -76,8 +102,8 @@ describe("outboxWorker.drainOne", () => {
       return { ok: true }
     }
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx-s1" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx-s1' },
     })
     const outcome = await drainOne(makeRow(), {
       pool,
@@ -86,16 +112,18 @@ describe("outboxWorker.drainOne", () => {
       now,
       maxAttempts: 10,
     })
-    assert.deepEqual(outcome, { kind: "sent", outboxId: 1 })
+    assert.deepEqual(outcome, { kind: 'sent', outboxId: 1 })
     assert.equal(sendCalls.length, 1)
-    assert.equal(sendCalls[0]!.botToken, "tok")
-    assert.equal(sendCalls[0]!.contextToken, "ctx-s1")
-    assert.equal(sendCalls[0]!.text, "hi")
+    assert.equal(sendCalls[0]!.botToken, 'tok')
+    assert.equal(sendCalls[0]!.contextToken, 'ctx-s1')
+    assert.equal(sendCalls[0]!.text, 'hi')
     // markSent UPDATE happened
-    assert.ok(captured.some((c) => /UPDATE wechat_outbox SET[\s\S]+status\s*=\s*'sent'/.test(c.sql)))
+    assert.ok(
+      captured.some((c) => /UPDATE wechat_outbox SET[\s\S]+status\s*=\s*'sent'/.test(c.sql)),
+    )
   })
 
-  test("binding gone → forceFail to terminal failed_permanent (no retry)", async () => {
+  test('binding gone → forceFail to terminal failed_permanent (no retry)', async () => {
     const { pool, captured } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
     const getBinding: GetBindingFn = async () => null
     const sendText: SendTextFn = async () => ({ ok: true }) // should never run
@@ -106,18 +134,20 @@ describe("outboxWorker.drainOne", () => {
       now,
       maxAttempts: 10,
     })
-    assert.deepEqual(outcome, { kind: "failed_permanent", outboxId: 1, reason: "binding_gone" })
+    assert.deepEqual(outcome, { kind: 'failed_permanent', outboxId: 1, reason: 'binding_gone' })
     // forceFail SQL pins attempts to maxAttempts (no-revive)
-    const forceFailQ = captured.find((c) => /UPDATE wechat_outbox SET[\s\S]+status\s*=\s*'failed'/.test(c.sql))!
+    const forceFailQ = captured.find((c) =>
+      /UPDATE wechat_outbox SET[\s\S]+status\s*=\s*'failed'/.test(c.sql),
+    )!
     assert.match(forceFailQ.sql, /attempts\s*=\s*GREATEST\(attempts \+ 1, \$1\)/)
     assert.equal(forceFailQ.params[0], 10) // maxAttempts pin
   })
 
-  test("no context_token for sender → forceFail terminal", async () => {
+  test('no context_token for sender → forceFail terminal', async () => {
     const { pool } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
-    const getBinding: GetBindingFn = async () => ({ botToken: "tok", contextTokens: {} }) // s1 not present
+    const getBinding: GetBindingFn = async () => ({ botToken: 'tok', contextTokens: {} }) // s1 not present
     const sendText: SendTextFn = async () => {
-      throw new Error("should not be called")
+      throw new Error('should not be called')
     }
     const outcome = await drainOne(makeRow(), {
       pool,
@@ -127,21 +157,21 @@ describe("outboxWorker.drainOne", () => {
       maxAttempts: 10,
     })
     assert.deepEqual(outcome, {
-      kind: "failed_permanent",
+      kind: 'failed_permanent',
       outboxId: 1,
-      reason: "no_context_token",
+      reason: 'no_context_token',
     })
   })
 
-  test("sendText permanent error → forceFail terminal", async () => {
+  test('sendText permanent error → forceFail terminal', async () => {
     const { pool, captured } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
     const sendText: SendTextFn = async () => ({
       ok: false,
-      errMessage: "token expired",
+      errMessage: 'token expired',
       permanent: true,
     })
     const outcome = await drainOne(makeRow(), {
@@ -152,27 +182,27 @@ describe("outboxWorker.drainOne", () => {
       maxAttempts: 10,
     })
     assert.deepEqual(outcome, {
-      kind: "failed_permanent",
+      kind: 'failed_permanent',
       outboxId: 1,
-      reason: "token expired",
+      reason: 'token expired',
     })
     // forceFail used (not markFailed),attempts pinned via GREATEST
     const failQ = captured.find((c) => /status\s*=\s*'failed'/.test(c.sql))!
     assert.match(failQ.sql, /GREATEST/)
   })
 
-  test("sendText transient error, attempts < maxAttempts → markFailed → failed_transient", async () => {
+  test('sendText transient error, attempts < maxAttempts → markFailed → failed_transient', async () => {
     const { pool } = makeFakePool((sql) => {
       if (/UPDATE wechat_outbox SET[\s\S]+attempts\s*=\s*attempts \+ 1/.test(sql)) {
-        return { rows: [{ attempts: 3, status: "queued" }], rowCount: 1 }
+        return { rows: [{ attempts: 3, status: 'queued' }], rowCount: 1 }
       }
       return { rows: [], rowCount: 1 }
     })
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
-    const sendText: SendTextFn = async () => ({ ok: false, errMessage: "timeout" })
+    const sendText: SendTextFn = async () => ({ ok: false, errMessage: 'timeout' })
     const outcome = await drainOne(makeRow({ attempts: 2 }), {
       pool,
       sendText,
@@ -181,25 +211,25 @@ describe("outboxWorker.drainOne", () => {
       maxAttempts: 10,
     })
     assert.deepEqual(outcome, {
-      kind: "failed_transient",
+      kind: 'failed_transient',
       outboxId: 1,
       attempts: 3,
-      errMessage: "timeout",
+      errMessage: 'timeout',
     })
   })
 
-  test("sendText transient error, attempts cap → markFailed → failed_terminal", async () => {
+  test('sendText transient error, attempts cap → markFailed → failed_terminal', async () => {
     const { pool } = makeFakePool((sql) => {
       if (/UPDATE wechat_outbox SET[\s\S]+attempts\s*=\s*attempts \+ 1/.test(sql)) {
-        return { rows: [{ attempts: 10, status: "failed" }], rowCount: 1 }
+        return { rows: [{ attempts: 10, status: 'failed' }], rowCount: 1 }
       }
       return { rows: [], rowCount: 1 }
     })
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
-    const sendText: SendTextFn = async () => ({ ok: false, errMessage: "5xx" })
+    const sendText: SendTextFn = async () => ({ ok: false, errMessage: '5xx' })
     const outcome = await drainOne(makeRow({ attempts: 9 }), {
       pool,
       sendText,
@@ -208,145 +238,148 @@ describe("outboxWorker.drainOne", () => {
       maxAttempts: 10,
     })
     assert.deepEqual(outcome, {
-      kind: "failed_terminal",
+      kind: 'failed_terminal',
       outboxId: 1,
       attempts: 10,
-      errMessage: "5xx",
+      errMessage: '5xx',
     })
   })
 
-  test("multi-part: 2nd part fails → markFailed whole row (P1 simple retry, accepts part 1 duplication on next pick)", async () => {
+  test('multi-part: 2nd part fails → markFailed whole row (P1 simple retry, accepts part 1 duplication on next pick)', async () => {
     const { pool } = makeFakePool(() => ({
-      rows: [{ attempts: 1, status: "queued" }],
+      rows: [{ attempts: 1, status: 'queued' }],
       rowCount: 1,
     }))
     const sendCalls: string[] = []
     const sendText: SendTextFn = async ({ text }) => {
       sendCalls.push(text)
-      if (text === "part2") return { ok: false, errMessage: "boom" }
+      if (text === 'part2') return { ok: false, errMessage: 'boom' }
       return { ok: true }
     }
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
     const outcome = await drainOne(
       makeRow({
         payload: [
-          { type: "text", text: "part1" },
-          { type: "text", text: "part2" },
-          { type: "text", text: "part3" }, // 不应被调用
+          { type: 'text', text: 'part1' },
+          { type: 'text', text: 'part2' },
+          { type: 'text', text: 'part3' }, // 不应被调用
         ],
       }),
       { pool, sendText, getBinding, now, maxAttempts: 10 },
     )
-    assert.equal(outcome.kind, "failed_transient")
-    assert.deepEqual(sendCalls, ["part1", "part2"]) // 第3条不发
+    assert.equal(outcome.kind, 'failed_transient')
+    assert.deepEqual(sendCalls, ['part1', 'part2']) // 第3条不发
   })
 
-  test("multi-part: all parts ok → markSent (single mark, not per-part)", async () => {
+  test('multi-part: all parts ok → markSent (single mark, not per-part)', async () => {
     const { pool, captured } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
     const sendText: SendTextFn = async () => ({ ok: true })
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
     const outcome = await drainOne(
       makeRow({
         payload: [
-          { type: "text", text: "p1" },
-          { type: "text", text: "p2" },
+          { type: 'text', text: 'p1' },
+          { type: 'text', text: 'p2' },
         ],
       }),
       { pool, sendText, getBinding, now, maxAttempts: 10 },
     )
-    assert.deepEqual(outcome, { kind: "sent", outboxId: 1 })
+    assert.deepEqual(outcome, { kind: 'sent', outboxId: 1 })
     const markSentQs = captured.filter((c) => /status\s*=\s*'sent'/.test(c.sql))
     assert.equal(markSentQs.length, 1)
   })
 
-  test("markSent drift (rowCount=0) → outcome=noop", async () => {
+  test('markSent drift (rowCount=0) → outcome=noop', async () => {
     const { pool } = makeFakePool(() => ({ rows: [], rowCount: 0 }))
     const sendText: SendTextFn = async () => ({ ok: true })
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
     const outcome = await drainOne(makeRow(), { pool, sendText, getBinding, now, maxAttempts: 10 })
-    assert.equal(outcome.kind, "noop")
-    assert.match(outcome.kind === "noop" ? outcome.reason : "", /markSent_drift/)
+    assert.equal(outcome.kind, 'noop')
+    assert.match(outcome.kind === 'noop' ? outcome.reason : '', /markSent_drift/)
   })
 
   // Codex slice 3 r1 WARN: payload invariant — payload 是 JSONB,无 schema 约束。
   // 若整行没有可发送的 text part(空 / 全非 text),不能静默 markSent,要 forceFail invalid_payload。
-  test("empty payload → forceFail invalid_payload (no markSent)", async () => {
+  test('empty payload → forceFail invalid_payload (no markSent)', async () => {
     const { pool, captured } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
     const sendText: SendTextFn = async () => {
-      throw new Error("should never be called")
+      throw new Error('should never be called')
     }
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
-    const outcome = await drainOne(
-      makeRow({ payload: [] }),
-      { pool, sendText, getBinding, now, maxAttempts: 10 },
-    )
-    assert.equal(outcome.kind, "failed_permanent")
-    assert.equal(outcome.kind === "failed_permanent" ? outcome.reason : "", "invalid_payload")
+    const outcome = await drainOne(makeRow({ payload: [] }), {
+      pool,
+      sendText,
+      getBinding,
+      now,
+      maxAttempts: 10,
+    })
+    assert.equal(outcome.kind, 'failed_permanent')
+    assert.equal(outcome.kind === 'failed_permanent' ? outcome.reason : '', 'invalid_payload')
     // 必须走 forceFail(SET status='failed'),不能 markSent
     const sentMarks = captured.filter((c) => /SET[\s\S]+status\s*=\s*'sent'/.test(c.sql))
-    assert.equal(sentMarks.length, 0, "must NOT mark empty payload as sent")
+    assert.equal(sentMarks.length, 0, 'must NOT mark empty payload as sent')
     const failMarks = captured.filter((c) => /SET[\s\S]+status\s*=\s*'failed'/.test(c.sql))
     assert.equal(failMarks.length, 1)
   })
 
-  test("payload with only non-text parts → forceFail invalid_payload", async () => {
+  test('payload with only non-text parts → forceFail invalid_payload', async () => {
     const { pool, captured } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
     const sendText: SendTextFn = async () => {
-      throw new Error("should never be called")
+      throw new Error('should never be called')
     }
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
     // 模拟 DB 里塞了未来扩展类型(对 IlinkPart 类型断言绕过)
-    const badPart = { type: "image", url: "http://x" } as unknown as { type: "text"; text: string }
-    const outcome = await drainOne(
-      makeRow({ payload: [badPart, badPart] }),
-      { pool, sendText, getBinding, now, maxAttempts: 10 },
-    )
-    assert.equal(outcome.kind, "failed_permanent")
-    assert.equal(
-      outcome.kind === "failed_permanent" ? outcome.reason : "",
-      "invalid_payload",
-    )
+    const badPart = { type: 'image', url: 'http://x' } as unknown as { type: 'text'; text: string }
+    const outcome = await drainOne(makeRow({ payload: [badPart, badPart] }), {
+      pool,
+      sendText,
+      getBinding,
+      now,
+      maxAttempts: 10,
+    })
+    assert.equal(outcome.kind, 'failed_permanent')
+    assert.equal(outcome.kind === 'failed_permanent' ? outcome.reason : '', 'invalid_payload')
     const sentMarks = captured.filter((c) => /SET[\s\S]+status\s*=\s*'sent'/.test(c.sql))
     assert.equal(sentMarks.length, 0)
   })
 
-  test("invalid_payload + row drifted (forceFail rowCount=0) → noop with reason", async () => {
+  test('invalid_payload + row drifted (forceFail rowCount=0) → noop with reason', async () => {
     const { pool } = makeFakePool(() => ({ rows: [], rowCount: 0 })) // 任何 UPDATE 都 drift
     const sendText: SendTextFn = async () => ({ ok: true })
     const getBinding: GetBindingFn = async () => ({
-      botToken: "tok",
-      contextTokens: { s1: "ctx" },
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
     })
-    const outcome = await drainOne(
-      makeRow({ payload: [] }),
-      { pool, sendText, getBinding, now, maxAttempts: 10 },
-    )
-    assert.equal(outcome.kind, "noop")
-    assert.match(
-      outcome.kind === "noop" ? outcome.reason : "",
-      /invalid_payload_but_row_drifted/,
-    )
+    const outcome = await drainOne(makeRow({ payload: [] }), {
+      pool,
+      sendText,
+      getBinding,
+      now,
+      maxAttempts: 10,
+    })
+    assert.equal(outcome.kind, 'noop')
+    assert.match(outcome.kind === 'noop' ? outcome.reason : '', /invalid_payload_but_row_drifted/)
   })
 })
 
 // ─── tick loop / start-stop ──────────────────────────────────────────────
 
-describe("OutboxWorker.tick & lifecycle", () => {
+describe('OutboxWorker.tick & lifecycle', () => {
   let activeWorker: OutboxWorker | null = null
   afterEach(async () => {
     if (activeWorker) {
@@ -356,7 +389,9 @@ describe("OutboxWorker.tick & lifecycle", () => {
   })
 
   function buildPool(rowsFn: () => Record<string, unknown>[] | null): { pool: Pool } {
-    const responder = (sql: string): { rows: Record<string, unknown>[]; rowCount: number | null } => {
+    const responder = (
+      sql: string,
+    ): { rows: Record<string, unknown>[]; rowCount: number | null } => {
       if (/WITH picked AS/.test(sql)) {
         const rows = rowsFn()
         return rows === null ? { rows: [], rowCount: 0 } : { rows, rowCount: rows.length }
@@ -373,18 +408,18 @@ describe("OutboxWorker.tick & lifecycle", () => {
     return { pool }
   }
 
-  test("tick drains until pickOne returns null (no rows = idle)", async () => {
+  test('tick drains until pickOne returns null (no rows = idle)', async () => {
     let calls = 0
     const queue: Record<string, unknown>[][] = [
       [
         {
           id: 1,
-          outbound_id: "x",
-          binding_user_id: "u1",
-          sender_id: "s1",
-          session_id: "wsess-0123456789abcdef",
-          payload: [{ type: "text", text: "a" }],
-          status: "sending",
+          outbound_id: 'x',
+          binding_user_id: 'u1',
+          sender_id: 's1',
+          session_id: 'wsess-0123456789abcdef',
+          payload: [{ type: 'text', text: 'a' }],
+          status: 'sending',
           attempts: 0,
           last_error: null,
           locked_at: 1,
@@ -396,12 +431,12 @@ describe("OutboxWorker.tick & lifecycle", () => {
       [
         {
           id: 2,
-          outbound_id: "y",
-          binding_user_id: "u1",
-          sender_id: "s1",
-          session_id: "wsess-0123456789abcdef",
-          payload: [{ type: "text", text: "b" }],
-          status: "sending",
+          outbound_id: 'y',
+          binding_user_id: 'u1',
+          sender_id: 's1',
+          session_id: 'wsess-0123456789abcdef',
+          payload: [{ type: 'text', text: 'b' }],
+          status: 'sending',
           attempts: 0,
           last_error: null,
           locked_at: 1,
@@ -422,17 +457,17 @@ describe("OutboxWorker.tick & lifecycle", () => {
         sendCalls.push(text)
         return { ok: true }
       },
-      getBinding: async () => ({ botToken: "tok", contextTokens: { s1: "ctx" } }),
+      getBinding: async () => ({ botToken: 'tok', contextTokens: { s1: 'ctx' } }),
       now,
       maxPerTick: 10,
     })
     await activeWorker.tick()
     // 2 picks succeeded + 1 empty pick to break the loop
     assert.equal(calls, 3)
-    assert.deepEqual(sendCalls, ["a", "b"])
+    assert.deepEqual(sendCalls, ['a', 'b'])
   })
 
-  test("tick stops at maxPerTick yield (防 event loop block)", async () => {
+  test('tick stops at maxPerTick yield (防 event loop block)', async () => {
     let picks = 0
     const { pool } = buildPool(() => {
       picks++
@@ -440,11 +475,11 @@ describe("OutboxWorker.tick & lifecycle", () => {
         {
           id: picks,
           outbound_id: `ob-${picks}`,
-          binding_user_id: "u1",
-          sender_id: "s1",
-          session_id: "wsess-0123456789abcdef",
-          payload: [{ type: "text", text: "x" }],
-          status: "sending",
+          binding_user_id: 'u1',
+          sender_id: 's1',
+          session_id: 'wsess-0123456789abcdef',
+          payload: [{ type: 'text', text: 'x' }],
+          status: 'sending',
           attempts: 0,
           last_error: null,
           locked_at: 1,
@@ -457,15 +492,15 @@ describe("OutboxWorker.tick & lifecycle", () => {
     activeWorker = new OutboxWorker({
       pool,
       sendText: async () => ({ ok: true }),
-      getBinding: async () => ({ botToken: "tok", contextTokens: { s1: "ctx" } }),
+      getBinding: async () => ({ botToken: 'tok', contextTokens: { s1: 'ctx' } }),
       now,
       maxPerTick: 3,
     })
     await activeWorker.tick()
-    assert.equal(picks, 3, "tick exits after maxPerTick drains")
+    assert.equal(picks, 3, 'tick exits after maxPerTick drains')
   })
 
-  test("drainOne exception is swallowed (worker.tick stays alive)", async () => {
+  test('drainOne exception is swallowed (worker.tick stays alive)', async () => {
     let firstCall = true
     const { pool } = buildPool(() => {
       if (firstCall) {
@@ -473,12 +508,12 @@ describe("OutboxWorker.tick & lifecycle", () => {
         return [
           {
             id: 1,
-            outbound_id: "x",
-            binding_user_id: "u1",
-            sender_id: "s1",
-            session_id: "wsess-0123456789abcdef",
-            payload: [{ type: "text", text: "boom" }],
-            status: "sending",
+            outbound_id: 'x',
+            binding_user_id: 'u1',
+            sender_id: 's1',
+            session_id: 'wsess-0123456789abcdef',
+            payload: [{ type: 'text', text: 'boom' }],
+            status: 'sending',
             attempts: 0,
             last_error: null,
             locked_at: 1,
@@ -494,13 +529,13 @@ describe("OutboxWorker.tick & lifecycle", () => {
     activeWorker = new OutboxWorker({
       pool,
       sendText: async () => {
-        throw new Error("network down")
+        throw new Error('network down')
       },
-      getBinding: async () => ({ botToken: "tok", contextTokens: { s1: "ctx" } }),
+      getBinding: async () => ({ botToken: 'tok', contextTokens: { s1: 'ctx' } }),
       now,
       maxPerTick: 5,
       log: (level, msg) => {
-        if (level === "error") errors.push(msg)
+        if (level === 'error') errors.push(msg)
       },
     })
     await activeWorker.tick() // 不抛
@@ -509,7 +544,7 @@ describe("OutboxWorker.tick & lifecycle", () => {
     assert.match(errors[0]!, /network down/)
   })
 
-  test("start/stop: start then immediate stop should not leak timer", async () => {
+  test('start/stop: start then immediate stop should not leak timer', async () => {
     const { pool } = buildPool(() => [])
     activeWorker = new OutboxWorker({
       pool,
@@ -526,19 +561,21 @@ describe("OutboxWorker.tick & lifecycle", () => {
   })
 })
 
-describe("outboxWorker.runHousekeeping", () => {
-  test("runs releaseStaleSending → dropAgedPending → purgeSent → purgeFailed in order", async () => {
+describe('outboxWorker.runHousekeeping', () => {
+  test('runs releaseStaleSending → dropAgedPending → purgeSent → purgeFailed in order', async () => {
     const sqls: string[] = []
     const { pool } = makeFakePool((sql) => {
-      sqls.push(sql.replace(/\s+/g, " ").trim().slice(0, 100))
+      sqls.push(sql.replace(/\s+/g, ' ').trim().slice(0, 100))
       // 让 4 个 UPDATE/DELETE 都汇报 rowCount > 0 便于断言数字
       if (/UPDATE wechat_outbox/.test(sql)) {
         if (/status\s*=\s*'queued'/.test(sql)) return { rows: [], rowCount: 1 } // release stale
         if (/status\s*=\s*'failed'/.test(sql)) return { rows: [], rowCount: 2 } // drop aged
         return { rows: [], rowCount: 0 }
       }
-      if (/DELETE FROM wechat_outbox WHERE status = 'sent'/.test(sql)) return { rows: [], rowCount: 3 }
-      if (/DELETE FROM wechat_outbox WHERE status = 'failed'/.test(sql)) return { rows: [], rowCount: 4 }
+      if (/DELETE FROM wechat_outbox WHERE status = 'sent'/.test(sql))
+        return { rows: [], rowCount: 3 }
+      if (/DELETE FROM wechat_outbox WHERE status = 'failed'/.test(sql))
+        return { rows: [], rowCount: 4 }
       return { rows: [], rowCount: 0 }
     })
     const result = await runHousekeeping(pool, 1_000_000)
@@ -551,15 +588,15 @@ describe("outboxWorker.runHousekeeping", () => {
   })
 })
 
-describe("DrainOutcome type completeness", () => {
+describe('DrainOutcome type completeness', () => {
   // 类型层 sanity:DrainOutcome 7 个 branch 都被前述测试覆盖
-  test("kinds covered by tests above", () => {
-    const kinds: DrainOutcome["kind"][] = [
-      "sent",
-      "failed_permanent",
-      "failed_transient",
-      "failed_terminal",
-      "noop",
+  test('kinds covered by tests above', () => {
+    const kinds: DrainOutcome['kind'][] = [
+      'sent',
+      'failed_permanent',
+      'failed_transient',
+      'failed_terminal',
+      'noop',
     ]
     // 编译器/纯运行时 sanity
     assert.equal(kinds.length, 5)
