@@ -166,13 +166,45 @@ export const OutboundContentBlock = Type.Union([
     /** Parsed tool input object (available when partial=false) */
     inputJson: Type.Optional(Type.Unknown()),
     /**
-     * Full accumulated partial JSON string from Anthropic SSE `input_json_delta`
-     * events. Present only on `partial: true` frames where the cumulative
-     * length is ≤ 64 KiB; dropped beyond that cap to bound WS bandwidth.
-     * Web uses tolerant parsing to render Edit/Write body diff in real time
-     * during tool input streaming. Strictly ephemeral — never persisted.
+     * Per-frame DELTA from Anthropic SSE `input_json_delta.partial_json` — the
+     * new chars appended to the cumulative tool input JSON string by this one
+     * event. Each partial tool_use frame carries exactly the delta produced
+     * by that SDK event (no cumulative buffer is emitted on the wire — the
+     * gateway keeps its own internal accumulator only for slicing the
+     * 400-char `inputPreview`; see ccbMessageParser).
+     *
+     * Web side accumulates: `existing.partialJson += partialJsonDelta` (gated
+     * by `partialJsonOffset` match — see below) and feeds the resulting buffer
+     * into `parsePartialJson` to render Edit/Write/MultiEdit/NotebookEdit body
+     * in real time, character by character, during tool input streaming.
+     *
+     * Append-only stream event semantics — each frame is an event, NOT a
+     * state snapshot. A frame received out of order or twice will corrupt
+     * the accumulator unless `partialJsonOffset` is consulted.
+     *
+     * Strictly ephemeral — never persisted (server-side or client-side).
      */
-    partialJson: Type.Optional(Type.String()),
+    partialJsonDelta: Type.Optional(Type.String()),
+    /**
+     * Cumulative length (JavaScript `string.length`, i.e. UTF-16 code units)
+     * of accumulated `partialJsonDelta`s BEFORE this delta was appended —
+     * the position into which `partialJsonDelta` should be spliced on the
+     * web side. Used as a completeness check:
+     *
+     *   if (block.partialJsonOffset === (existing.partialJson || '').length) {
+     *     existing.partialJson = (existing.partialJson || '') + block.partialJsonDelta
+     *   } else {
+     *     // dup / out-of-order / late-join: drop the accumulator and fall
+     *     // back to inputPreview / final inputJson rather than splice in a
+     *     // delta at the wrong position.
+     *     delete existing.partialJson
+     *   }
+     *
+     * Mitigates outboundRing replay overlap with live stream, and any future
+     * non-FIFO transport. Always present on partial tool_use frames that
+     * carry a `partialJsonDelta`.
+     */
+    partialJsonOffset: Type.Optional(Type.Integer({ minimum: 0 })),
     // streaming: false | true — if true, a follow-up update with final input is coming
     partial: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),

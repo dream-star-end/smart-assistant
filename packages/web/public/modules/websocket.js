@@ -391,6 +391,57 @@ export function _findOrCreateStreamingRow(sess, role, messageId, create) {
   return create(extraIdOverride)
 }
 
+/**
+ * Pure helper: compute the next state of a streaming tool_use's partialJson
+ * accumulator given the current value and an incoming partial frame.
+ *
+ * Append-only delta protocol (v1.0.167+):
+ *   - Gateway sends only the NEW chunk (`partialJsonDelta`) plus the string
+ *     length (`partialJsonOffset`, JS `.length` = UTF-16 code units) of the
+ *     accumulator BEFORE the delta. Bandwidth is O(n) in content size.
+ *   - Client validates offset === current accumulator length. On match,
+ *     append. On mismatch (dup frame, reorder, ring-buffer replay overlap,
+ *     late-join into mid-stream), DEGRADE — drop the buffer entirely so
+ *     `_safeInput` falls back to inputPreview / inputJson rather than
+ *     painting torn JSON. The final frame's authoritative `inputJson`
+ *     repaints truth.
+ *
+ * Recovery semantics: the helper is stateless and per-frame. After a drop,
+ * a later `offset === 0` frame WILL re-seed the buffer (caller has
+ * `delete`d `existing.partialJson` so `current` is undefined → cur="" →
+ * length 0 matches). This is INTENTIONAL — during ring-buffer replay
+ * after a reconnect, the gateway's full replay starts at offset 0 and
+ * walks forward; allowing re-seed lets the client rebuild the buffer
+ * mid-tool rather than waiting for the final `inputJson`. There is no
+ * data-loss risk because dropped frames in between also fall through to
+ * the inputPreview path, and the final `inputJson` always reasserts truth.
+ *
+ * Returns one of:
+ *   { action: 'set',  value: string }  // assign current = value (append OK)
+ *   { action: 'drop' }                 // delete current (offset mismatch)
+ *   { action: 'keep' }                 // frame carries no delta — leave alone
+ *
+ * Pure (no globals / DOM / state). Both the "update existing card" and the
+ * "seed new card" call sites use this; tests extract it standalone via the
+ * top-level function source.
+ *
+ * @param {string|null|undefined} current   the current partialJson string (or absence)
+ * @param {{partialJsonDelta?: unknown, partialJsonOffset?: unknown}} block  the incoming frame
+ */
+export function _applyPartialJsonDelta(current, block) {
+  if (
+    typeof block.partialJsonDelta !== 'string' ||
+    typeof block.partialJsonOffset !== 'number'
+  ) {
+    return { action: 'keep' }
+  }
+  const cur = current || ''
+  if (block.partialJsonOffset === cur.length) {
+    return { action: 'set', value: cur + block.partialJsonDelta }
+  }
+  return { action: 'drop' }
+}
+
 export function addMessage(sess, role, text, extra) {
   extra = extra || {}
   const msg = Object.assign({ id: _deps.msgId(), role, text: text || '', ts: Date.now() }, extra)
@@ -2234,10 +2285,12 @@ export function handleOutbound(frame) {
         const existing = sess.messages.find((m) => m.id === mid)
         if (existing) {
           existing.inputPreview = block.inputPreview || existing.inputPreview
-          // partialJson is the cumulative `input_json_delta` buffer (≤ 64 KiB,
-          // dropped beyond cap; see ccbMessageParser.PARTIAL_JSON_FRAME_MAX_CHARS).
-          // It drives partial Edit/Write body diff rendering via parsePartialJson.
-          if (typeof block.partialJson === 'string') existing.partialJson = block.partialJson
+          // Append-only delta protocol — see `_applyPartialJsonDelta` for
+          // the full contract. The helper is pure (testable in isolation)
+          // and decides whether to append, degrade-drop, or no-op.
+          const deltaResult = _applyPartialJsonDelta(existing.partialJson, block)
+          if (deltaResult.action === 'set') existing.partialJson = deltaResult.value
+          else if (deltaResult.action === 'drop') delete existing.partialJson
           if (block.inputJson) existing.inputJson = block.inputJson
           existing._partial = !!block.partial
           // State-correctness: clear the stream buffer the moment the block
@@ -2298,9 +2351,16 @@ export function handleOutbound(frame) {
           blockId: block.blockId,
           inputPreview: block.inputPreview || '',
           inputJson: block.inputJson || null,
-          // Carry partialJson from the very first frame so even the initial
-          // partial render of an Edit/Write card shows streamed content.
-          partialJson: typeof block.partialJson === 'string' ? block.partialJson : null,
+          // Seed the partial accumulator only from a clean stream start
+          // (offset === 0). On a late-join replay (offset > 0) the
+          // prefix we never saw is missing → degrade to null and let
+          // `_safeInput` render from inputPreview until the final
+          // inputJson arrives. _applyPartialJsonDelta(null, block) yields
+          // `set` exactly when offset === 0, else `drop` / `keep`.
+          partialJson: (() => {
+            const r = _applyPartialJsonDelta(null, block)
+            return r.action === 'set' ? r.value : null
+          })(),
           _partial: !!block.partial,
           _completed: false,
           output: null,

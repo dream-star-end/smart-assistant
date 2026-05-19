@@ -39,15 +39,6 @@ const PARSER_TOOL_OUTPUT_MAX_BYTES = 4 * 1024
 const PARSER_TOOL_INPUT_JSON_MAX_BYTES = 8 * 1024
 const PARSER_TOOL_INPUT_PREVIEW_MAX_CHARS = 500
 
-/** Maximum length (chars) of the per-frame `partialJson` payload sent on
- *  `partial: true` tool_use frames. Once the cumulative `input_json_delta`
- *  string exceeds this cap we DROP the `partialJson` field from subsequent
- *  partial frames — the web frontend gracefully falls back to `inputPreview`
- *  and will receive the full final input via the `inputJson` field on the
- *  final (`partial: false`) frame, which is built from the SDK's assistant
- *  snapshot (see `_handleAssistant`) rather than the gateway's accumulator. */
-const PARTIAL_JSON_FRAME_MAX_CHARS = 64 * 1024
-
 /**
  * Truncate `s` to at most `maxBytes` UTF-8 bytes WITHOUT splitting a multi-
  * byte sequence. Walks back from the byte budget to the last UTF-8 leading
@@ -645,22 +636,33 @@ export class CcbMessageParser {
       } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
         const toolId = this.indexToToolId.get(ev.index as number)
         const tool = toolId ? this.streamingToolUses.get(toolId) : undefined
-        if (tool) {
+        if (tool && delta.partial_json.length > 0) {
+          // Delta-based wire protocol: each partial tool_use frame carries
+          // ONLY the new chars produced by this one SDK event, plus the
+          // offset (length of the accumulator BEFORE this delta). The web
+          // side appends gated by `offset === current.length`, so dup /
+          // out-of-order / late-join frames degrade cleanly instead of
+          // splicing into the wrong position.
+          //
+          // Bandwidth is O(n) in content size — previously O(n²) because
+          // every frame re-sent the cumulative buffer.
+          //
+          // `tool.partialJson` accumulator is still maintained internally
+          // ONLY to compute the inputPreview slice. It is NEVER emitted on
+          // the wire. Final tool input ground truth lives in the SDK's
+          // assistant snapshot and is emitted via the `partial: false`
+          // frame's `inputJson` field in `_handleAssistant`.
+          const offsetBefore = tool.partialJson.length
           tool.partialJson += delta.partial_json
-          // Carry full accumulated partial JSON ONLY while under the cap.
-          // Past the cap, drop the field entirely (frontend then falls back
-          // to `inputPreview`, and the final `inputJson` frame will carry
-          // the truth). Avoids re-sending megabyte-class strings on every
-          // delta when a model dumps a huge Edit `new_string`.
-          const carryPartialJson = tool.partialJson.length <= PARTIAL_JSON_FRAME_MAX_CHARS
           const block: Record<string, unknown> = {
             kind: 'tool_use',
             blockId: toolId!,
             toolName: tool.name,
             inputPreview: tool.partialJson.slice(0, 400),
+            partialJsonDelta: delta.partial_json,
+            partialJsonOffset: offsetBefore,
             partial: true,
           }
-          if (carryPartialJson) block.partialJson = tool.partialJson
           this.onEvent({
             kind: 'block',
             block: stampToolUseId(withParent(block as any), toolId!),

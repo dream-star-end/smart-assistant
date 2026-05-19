@@ -255,11 +255,16 @@ describe('CcbMessageParser: tool_use', () => {
     assert.equal(detected[0].input.cron, '0 9 * * *')
   })
 
-  // partialJson streaming — drives partial Edit/Write body rendering on web.
-  it('carries `partialJson` on every input_json_delta partial frame', () => {
+  // input_json_delta streaming — drives partial Edit/Write body rendering on web.
+  // Append-only delta protocol: each frame carries just the NEW chunk
+  // (`partialJsonDelta`) and the position it should land at
+  // (`partialJsonOffset` = accumulator length BEFORE the delta). The web
+  // client validates the offset matches its current buffer and appends, or
+  // degrades on mismatch.
+  it('emits partialJsonDelta + partialJsonOffset on every input_json_delta partial frame', () => {
     const { parser, events } = createParser()
 
-    // content_block_start: emits empty-input partial frame (no partialJson yet).
+    // content_block_start: emits empty-input partial frame (no delta yet).
     parser.parse({
       type: 'stream_event',
       event: {
@@ -293,20 +298,27 @@ describe('CcbMessageParser: tool_use', () => {
     const delta1 = events[1] as any
     const delta2 = events[2] as any
 
-    // content_block_start: no partialJson yet (no deltas applied), partial true.
+    // content_block_start: no delta yet, partial true.
     assert.equal(startFrame.block.partial, true)
-    assert.equal(startFrame.block.partialJson, undefined)
+    assert.equal(startFrame.block.partialJsonDelta, undefined)
+    assert.equal(startFrame.block.partialJsonOffset, undefined)
 
-    // Each delta carries the full accumulated partialJson string.
+    // First delta: append at offset 0.
     assert.equal(delta1.block.partial, true)
-    assert.equal(delta1.block.partialJson, '{"file_path":"/x"')
+    assert.equal(delta1.block.partialJsonDelta, '{"file_path":"/x"')
+    assert.equal(delta1.block.partialJsonOffset, 0)
     assert.equal(delta1.block.inputPreview, '{"file_path":"/x"')
 
+    // Second delta: append at offset = len(first delta).
     assert.equal(delta2.block.partial, true)
-    assert.equal(delta2.block.partialJson, '{"file_path":"/x","old_string":"hello')
+    assert.equal(delta2.block.partialJsonDelta, ',"old_string":"hello')
+    assert.equal(delta2.block.partialJsonOffset, '{"file_path":"/x"'.length)
   })
 
-  it('drops `partialJson` on partial frames once accumulated past 64 KiB cap', () => {
+  it('keeps emitting partialJsonDelta past 64 KiB — no bandwidth cap', () => {
+    // Old protocol dropped the cumulative buffer above 64 KiB. With the
+    // delta protocol each frame is bounded by the SDK chunk size, so big
+    // tool inputs (multi-KB Write content) stream all the way through.
     const { parser, events } = createParser()
 
     parser.parse({
@@ -318,39 +330,67 @@ describe('CcbMessageParser: tool_use', () => {
       },
     } as any)
 
-    // Push a chunk that lands JUST AT the cap — must still carry partialJson.
-    const exactlyCap = '{"content":"' + 'x'.repeat(64 * 1024 - '{"content":"'.length)
+    const big = '{"content":"' + 'x'.repeat(64 * 1024) // pushes accumulator past 64 KiB
     parser.parse({
       type: 'stream_event',
       event: {
         type: 'content_block_delta',
         index: 0,
-        delta: { type: 'input_json_delta', partial_json: exactlyCap },
+        delta: { type: 'input_json_delta', partial_json: big },
       },
     } as any)
-    // One byte beyond cap — partialJson must be dropped from the frame.
     parser.parse({
       type: 'stream_event',
       event: {
         type: 'content_block_delta',
         index: 0,
-        delta: { type: 'input_json_delta', partial_json: 'x' },
+        delta: { type: 'input_json_delta', partial_json: 'y' },
       },
     } as any)
 
-    const atCap = events[1] as any
-    const overCap = events[2] as any
+    const first = events[1] as any
+    const second = events[2] as any
 
-    assert.equal(typeof atCap.block.partialJson, 'string')
-    assert.equal(atCap.block.partialJson.length, 64 * 1024)
+    assert.equal(first.block.partialJsonDelta, big)
+    assert.equal(first.block.partialJsonOffset, 0)
 
-    assert.equal(overCap.block.partialJson, undefined)
-    // inputPreview survives (it's a fixed 400-char slice — not bandwidth bound).
-    assert.equal(typeof overCap.block.inputPreview, 'string')
-    assert.equal(overCap.block.partial, true)
+    // Second frame still arrives even though accumulator is now >64 KiB.
+    assert.equal(second.block.partialJsonDelta, 'y')
+    assert.equal(second.block.partialJsonOffset, big.length)
+    assert.equal(second.block.partial, true)
   })
 
-  it('final assistant snapshot ignores in-flight partialJson and carries full inputJson', () => {
+  it('skips emitting a frame for empty input_json_delta chunks', () => {
+    // Anthropic SSE occasionally sends a delta event with an empty
+    // `partial_json` (e.g. trailing keepalive). We must not emit a
+    // zero-length-delta frame — web's offset check would see
+    // `partialJsonOffset === current.length` and the append is a no-op,
+    // but the wire byte is still wasted. Cheap to drop at the source.
+    const { parser, events } = createParser()
+
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tu_p_empty', name: 'Edit' },
+      },
+    } as any)
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '' },
+      },
+    } as any)
+
+    // Only the content_block_start frame was emitted; empty delta dropped.
+    assert.equal(events.length, 1)
+    assert.equal((events[0] as any).block.partial, true)
+  })
+
+  it('final assistant snapshot carries full inputJson and no delta fields', () => {
     const { parser, events } = createParser()
 
     parser.parse({
@@ -387,8 +427,9 @@ describe('CcbMessageParser: tool_use', () => {
     const finalFrame = events[events.length - 1] as any
     assert.equal(finalFrame.block.partial, false)
     assert.deepEqual(finalFrame.block.inputJson, { file_path: '/x', new_string: 'abc' })
-    // Final frame intentionally has no partialJson — clients should prefer inputJson.
-    assert.equal(finalFrame.block.partialJson, undefined)
+    // Final frame intentionally has no delta fields — clients should prefer inputJson.
+    assert.equal(finalFrame.block.partialJsonDelta, undefined)
+    assert.equal(finalFrame.block.partialJsonOffset, undefined)
   })
 })
 
