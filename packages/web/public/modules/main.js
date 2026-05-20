@@ -2007,6 +2007,30 @@ function _wireLandingDemo() {
     return
   }
 
+  // chat 容器自动跟随节点出现滚动到底 — 让 13 节点 transcript 后半段
+  // (校验/伪影自检/复算/编译/总结)在 max-height 限高容器里也能被看到。
+  // 用户主动滚动后立即放弃自动滚动,把控制权交还给用户。
+  const startChatAutoScroll = () => {
+    const chat = demoSection.querySelector('.landing-demo-chat')
+    if (!chat) return
+    let userScrolled = false
+    let interval = null
+    const giveUp = () => {
+      userScrolled = true
+      if (interval !== null) clearInterval(interval)
+    }
+    // wheel + touchmove + pointerdown 覆盖滚轮 / 触屏 / 拖拽滚动条三种主动交互
+    chat.addEventListener('wheel', giveUp, { passive: true, once: true })
+    chat.addEventListener('touchmove', giveUp, { passive: true, once: true })
+    chat.addEventListener('pointerdown', giveUp, { passive: true, once: true })
+    interval = setInterval(() => {
+      if (userScrolled) return
+      chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' })
+    }, 700)
+    // 13 节点 stagger 总时长 ~11.9s + 420ms transition + 缓冲 → 13s 后停止
+    setTimeout(() => clearInterval(interval), 13000)
+  }
+
   const io = new IntersectionObserver(
     (entries) => {
       for (const e of entries) {
@@ -2014,6 +2038,7 @@ function _wireLandingDemo() {
           played = true
           demoSection.classList.add('is-playing')
           startCountUp()
+          startChatAutoScroll()
           io.disconnect()
           break
         }
