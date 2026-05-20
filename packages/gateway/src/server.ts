@@ -5780,7 +5780,18 @@ export class Gateway {
     const registeredPeerKeys: string[] = []
     const helloUserId = this.getWsUserId(ws)
 
-    for (const { peerId, agentId } of peers) {
+    for (const peer of peers) {
+      const { peerId, agentId } = peer
+      // turn-alive-heartbeat (Plan 1, follow-up):destructure all hello-peer
+      // fields from the loop iter directly. Previous code did
+      // `peers.find(p => p.peerId === peerId)` to re-read `lastFrameSeq` /
+      // `inFlight`, but a single hello can legally carry the same peerId
+      // against multiple agentIds — that find would match the wrong record
+      // and the synthetic-isFinal / replay judgment would silently read the
+      // wrong tuple. Reading directly from the loop item is correct by
+      // construction.
+      const peerLastFrameSeq = peer.lastFrameSeq
+      const peerInFlight = peer.inFlight
       const aid = agentId || 'main'
       const safeId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
       const sessionKey = `agent:${aid}:webchat:dm:${safeId}`
@@ -5843,8 +5854,7 @@ export class Gateway {
       // a REST force-sync. This is ONLY a short-term optimisation; the
       // durable server-side persistence from Phase 0.1/0.2 remains the
       // authoritative backstop for any duration of disconnect.
-      const peerRec = peers.find(p => p.peerId === peerId)
-      const clientLastSeq = typeof peerRec?.lastFrameSeq === 'number' ? peerRec.lastFrameSeq : 0
+      const clientLastSeq = typeof peerLastFrameSeq === 'number' ? peerLastFrameSeq : 0
       if (clientLastSeq >= 0) {
         const replay = this._outboundRing.peekReplay(sessionKey, clientLastSeq)
         // Read-path pruning may have evicted age-aged frames — record those
@@ -5920,8 +5930,26 @@ export class Gateway {
       // currently running. This clears the client's stuck _sendingInFlight state from
       // the interrupted turn. Without this, the client shows a permanent typing indicator
       // and the resumed subprocess sits idle — neither side moves first.
-      const peerInFlight = peers.find(p => p.peerId === peerId)?.inFlight
-      if (peerInFlight && session && !session.runner.isRunning) {
+      //
+      // turn-alive-heartbeat (Plan 1) — 判据走 `_shouldPushTurnInterruptedFinal`
+      // 纯函数 helper,根治"phantom-turn retry / auth-refresh restart / effort+
+      // model swap shutdown 等 turn 内部 subprocess respawn 窗口被误判为 turn 已
+      // 结束"的 bug。判据细节 + 真值源对比见 helper 注释。`peerInFlight` 取自
+      // 当前 hello-peer iter 项(顶部 destructure),不再用 find(peerId) — 那条
+      // 同型债已在循环入口修掉。
+      //
+      // 当前 scope 限于 `submit()` 内的 subprocess respawn 窗口。dispatchInbound
+      // 预处理(mkdir / writeFile / parseDocument 等异步阶段,getOrCreate 后、
+      // submit 前)是另一类同症状窗口,留作 Plan 1 follow-up 单独评估
+      // (涉及 idempotency / rate-limit 失败路径要不要 counter-- 的语义)。
+      if (
+        session &&
+        _shouldPushTurnInterruptedFinal(
+          peerInFlight,
+          session.runner.isRunning,
+          session._activeTurnCount,
+        )
+      ) {
         try {
           // Single-ws send (only the hello-ing client should see this notice),
           // so deliver() isn't appropriate here — stamp ts inline.
@@ -7103,6 +7131,68 @@ export function _inheritOutboundRouting(
     ...(out._userId ? { _userId: out._userId } : {}),
     ...(out.traceId ? { traceId: out.traceId } : {}),
   }
+}
+
+// ── turn-alive-heartbeat (Plan 1) — autoResumeFromHello judgment helper ──
+
+/**
+ * Decide whether `autoResumeFromHello` should push a synthetic
+ * turn-interrupted `isFinal` to the resuming peer.
+ *
+ * Background — why this is its own helper(not inlined at the call site):
+ *
+ * The old judgment was `peerInFlight && !runner.isRunning`. That treats
+ * `runner.isRunning` as "turn ended" authority, but `runner.isRunning` is
+ * **process-level** truth(`subprocessRunner.ts`: `proc !== null && !closed
+ * || starting`). The CCB subprocess can legitimately be in `isRunning=false`
+ * mid-turn during these windows:
+ *
+ *   1. phantom-turn retry — `sessionManager.ts` ~L1386-1424:
+ *      `runner.shutdown()` is called and a fresh runner spawned, all inside
+ *      the same `submit()` call's try-block.
+ *   2. auth-refresh restart — `sessionManager.ts` ~L1445: token refresh
+ *      forces a runner restart, also inside the same `submit()`.
+ *   3. effort / model swap shutdown — `sessionManager.ts` ~L1196:
+ *      `runner.shutdown()` to flip CLI flags, then respawn.
+ *
+ * If a WS hello arrives in any of these ms-wide windows with `peer.inFlight
+ * = true`, the old code pushed a synthetic `isFinal` and the client cleared
+ * its sending state — but the CCB respawn then continued the same turn,
+ * stranding the user with a "turn is over" UI while gateway was still
+ * working. That is the bug Plan 1 fixes.
+ *
+ * The correct authority is **turn-level**, not process-level:
+ * `AgentSession._activeTurnCount` counts in-flight `submit()` promises and
+ * stays > 0 across all the windows above(they're inside `submit()`'s
+ * try / finally). See `AgentSession._activeTurnCount` jsdoc for the
+ * counter's full contract.
+ *
+ * Decision table:
+ *
+ * | peerInFlight | isRunning | activeTurnCount | result |
+ * |--------------|-----------|-----------------|--------|
+ * | false        | *         | *               | false (nothing stuck to clear) |
+ * | true         | true      | *               | false (process alive, will drive turn) |
+ * | true         | false     | > 0             | false (turn still alive — Plan 1 fix) |
+ * | true         | false     | 0 or undefined  | **true** (turn genuinely interrupted) |
+ *
+ * `activeTurnCount` is `undefined` for historical session objects / test
+ * fakes / sessions created before Plan 1 — treat as 0(`?? 0`), preserving
+ * the pre-Plan-1 behavior for those cases.
+ *
+ * Exported as `_`-prefixed test seam — single-call-site internal helper,
+ * underscore signals "do not import from outside gateway". Pure function,
+ * no side effects, no logging — caller owns observability.
+ */
+export function _shouldPushTurnInterruptedFinal(
+  peerInFlight: boolean | undefined,
+  isRunning: boolean,
+  activeTurnCount: number | undefined,
+): boolean {
+  if (!peerInFlight) return false
+  if (isRunning) return false
+  if ((activeTurnCount ?? 0) > 0) return false
+  return true
 }
 
 // ── AskUserQuestion updatedInput sanitizer ──
