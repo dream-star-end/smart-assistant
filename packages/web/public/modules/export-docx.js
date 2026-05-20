@@ -5,8 +5,8 @@
 // and highlighted code are captured "what you see is what you get". Falls back to
 // markdown re-rendering when a message is not in the DOM (e.g. off-screen history).
 
-import { renderMarkdown } from './markdown.js?v=0b83a2c4'
-import { toast } from './ui.js?v=0b83a2c4'
+import { renderMarkdown } from './markdown.js?v=96b2635e'
+import { toast } from './ui.js?v=96b2635e'
 
 // ── Lazy loader for the ~840KB docx library ──
 let _docxLoadPromise = null
