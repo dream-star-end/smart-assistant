@@ -35,6 +35,7 @@ import {
 import {
   AccountPoolBusyError,
   AccountPoolUnavailableError,
+  type PickInput,
   type PickResult,
   type ReleaseInput,
 } from "../account-pool/scheduler.js";
@@ -65,6 +66,8 @@ function makePick(over: Partial<PickResult> = {}): PickResult {
 interface SchedulerSpy {
   scheduler: PickUpstreamDeps["scheduler"];
   pickCalls: number;
+  /** Phase 1.5 (2026-05-21):捕获每次 pick 的 input,用于断言 kind 透传。 */
+  pickInputs: PickInput[];
   releaseCalls: ReleaseInput[];
 }
 
@@ -73,10 +76,12 @@ function makeScheduler(opts: {
   pickThrow?: unknown;
 }): SchedulerSpy {
   const releaseCalls: ReleaseInput[] = [];
+  const pickInputs: PickInput[] = [];
   let pickCalls = 0;
   const scheduler: PickUpstreamDeps["scheduler"] = {
-    async pick(_input) {
+    async pick(input) {
       pickCalls += 1;
+      pickInputs.push(input);
       if (opts.pickThrow) throw opts.pickThrow;
       return opts.pickResult ?? makePick();
     },
@@ -89,6 +94,7 @@ function makeScheduler(opts: {
     get pickCalls() {
       return pickCalls;
     },
+    pickInputs,
     releaseCalls,
   };
 }
@@ -891,5 +897,67 @@ describe("releaseUpstreamSession (case c — finalizer-pre window)", () => {
       { kind: "failure", error: "x" },
       log,
     );
+  });
+});
+
+// ─── pickUpstream — V3 envv2 Phase 1.5 accountKind 透传 ────────────────────
+//
+// 验证 handler 通过 5th `opts.accountKind` 透传账号池分区给 scheduler:
+//   - accountKind='external_api' → scheduler.pick.input.kind === 'external_api'
+//   - accountKind undefined       → scheduler.pick.input.kind === undefined
+//                                   (scheduler 内部 default 'platform',与历史等价)
+//   - DeepSeek 路径 + 任何 accountKind → scheduler.pick **不被调用**(零交叉)
+//
+// 这三 case 锁住 "handler 决策 → scheduler input" 的边界。真实 SQL 池隔离行为
+// 由 accountKindPool.integ.test.ts 在 real PG 上覆盖,本 unit 只验调用契约。
+describe("pickUpstream — V3 envv2 Phase 1.5 accountKind 透传", () => {
+  test("opts.accountKind='external_api' → scheduler.pick.input.kind = 'external_api'", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+      { accountKind: "external_api" },
+    );
+    assert.equal(res.ok, true);
+    assert.equal(sched.pickCalls, 1);
+    assert.equal(sched.pickInputs.length, 1);
+    assert.equal(
+      sched.pickInputs[0].kind,
+      "external_api",
+      "handler 注入 accountKind='external_api' 必须透传到 scheduler.pick.input.kind",
+    );
+  });
+
+  test("opts.accountKind 缺省 → scheduler.pick.input.kind = undefined(scheduler 内部 default platform)", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+      // 故意不传 opts,模拟容器路径
+    );
+    assert.equal(res.ok, true);
+    assert.equal(sched.pickCalls, 1);
+    assert.equal(
+      sched.pickInputs[0].kind,
+      undefined,
+      "不传 accountKind 时,scheduler.pick.input.kind 必须是 undefined,让 scheduler 自己 default platform",
+    );
+  });
+
+  test("DeepSeek route + accountKind='external_api' → scheduler.pick 不被调用(早返零交叉)", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, deepseekApiKey: "DS-KEY" },
+      bodyFor("deepseek-v4-pro"),
+      { kind: "deepseek" },
+      log,
+      { accountKind: "external_api" }, // 故意传错(配错时),DeepSeek 早返不该走 pool
+    );
+    assert.equal(res.ok, true);
+    assert.equal(sched.pickCalls, 0, "DeepSeek 路径必须早返,绝不调 scheduler.pick");
   });
 });

@@ -51,6 +51,7 @@ import {
 } from "../http/anthropicProxy.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "../auth/proxyIdentity.js";
+import type { IdentityStrategy } from "../auth/proxyIdentity.js";
 import type {
   AccountScheduler,
   PickResult,
@@ -526,6 +527,15 @@ interface HarnessOpts {
   ) => Promise<{ status: number; body: string }>;
   /** appendCostCredits 自定义实现(覆盖默认 push events.persist)。 */
   appendCostCreditsImpl?: AnthropicProxyDeps["appendCostCredits"];
+  /**
+   * 注入自定义 IdentityStrategy(默认走 container strategy)。
+   *
+   * Phase 1.5(2026-05-21):为外接 ApiKey 路径(`containerId === null`)的 handler
+   * integ 测试预留 seam。production wiring 在 anthropicProxyRoutes 内构造 strategy,
+   * 测试这里直接传 fake 即可绕开容器双因子构造 / DB row,聚焦验证
+   * `isExternalApiKeyOAuthPath` 分流是否正确把 `accountKind` 透传到 scheduler.pick。
+   */
+  identityStrategyOverride?: IdentityStrategy;
 }
 
 const FIXED_USER_ID = 7;
@@ -612,14 +622,15 @@ function buildHarness(opts: HarnessOpts = {}) {
       };
     };
   const recordHostRequestCalls: string[] = [];
-  const identityStrategy = makeContainerIdentityStrategy({
-    repo: identityRepo,
-    pricing,
-    loadUserModelAuthz: (uid) => authzImpl(uid),
-    recordHostRequest: (hostUuid) => {
-      recordHostRequestCalls.push(hostUuid);
-    },
-  });
+  const identityStrategy: IdentityStrategy = opts.identityStrategyOverride
+    ?? makeContainerIdentityStrategy({
+      repo: identityRepo,
+      pricing,
+      loadUserModelAuthz: (uid) => authzImpl(uid),
+      recordHostRequest: (hostUuid) => {
+        recordHostRequestCalls.push(hostUuid);
+      },
+    });
 
   const deps: AnthropicProxyDeps = {
     pgPool: pool as unknown as AnthropicProxyDeps["pgPool"],
@@ -1391,6 +1402,95 @@ describe("invariant 2 — abort 分类只看 isClientAbort(err),不看 ac.signal
       h.schedulerSpy.releaseCalls[0]!.result.kind,
       "failure",
       "mid-stream net error 不是 client abort,必须算 failure(扣健康分)",
+    );
+  });
+});
+
+// ─── Phase 1.5 — pickUpstream accountKind 透传 ─────────────────────────────────
+//
+// 锁 V3 envv2 Phase 1.5 行为(2026-05-21):handler 在 isExternalApiKeyOAuthPath
+// 命中时,**必须**把 `accountKind: "external_api"` 透传到 scheduler.pick;其它路径
+// (容器 OAuth / DeepSeek)不传(传 undefined → scheduler 走默认 platform 池,与
+// Phase 1 之前等价)。任意一条偏移即外接 / 容器池物理隔离破裂 → 整池 anti-abuse
+// 风险,必须 fail-fast 而不是回归到 prod 才被发现。
+//
+// 实现策略:
+//   - 用 schedulerSpy.pickCalls 记录的实际 pick(input) 参数验证,不仅看 calls 数。
+//   - 外接路径通过 `identityStrategyOverride` 注入返回 `containerId: null` 的 fake
+//     strategy(绕开容器双因子 + 真实 ApiKey repo 构造),保持 test 聚焦"分流"本身。
+//   - DeepSeek 路径同时验"完全跳过 scheduler.pick" — pick=null noop 不可破。
+describe("Phase 1.5 — pickUpstream accountKind 透传", () => {
+  /**
+   * Fake IdentityStrategy:resolve 返回 `containerId: null`(外接 ApiKey 形态),
+   * authorize noop(test 不验 authz 分支,验的是 identity 类型对 pickUpstream 的影响)。
+   */
+  function makeFakeApiKeyIdentityStrategy(uid: bigint): IdentityStrategy {
+    return {
+      async resolve(_req, _ctx) {
+        return { uid, containerId: null };
+      },
+      async authorize(_identity, _pricing, _model) {
+        /* noop:authz 分支不在本 case 验证范围 */
+      },
+    };
+  }
+
+  test("外接 ApiKey + OAuth 上游:pickUpstream({accountKind:'external_api'}) → 503 ACCOUNT_POOL_UNAVAILABLE", async () => {
+    const { AccountPoolUnavailableError } = await import("../account-pool/scheduler.js");
+    const h = buildHarness({
+      identityStrategyOverride: makeFakeApiKeyIdentityStrategy(BigInt(FIXED_USER_ID)),
+    });
+    // 让 scheduler.pick 抛 pool unavailable —— 验外接池空场景 handler 仍把 kind 透传
+    h.schedulerSpy.setPickError(new AccountPoolUnavailableError("external pool empty"));
+
+    const res = await h.run(minBody());
+
+    assert.equal(res.statusCode, 503, "external pool 空 → 503");
+    assert.equal(readErrCode(res), "ACCOUNT_POOL_UNAVAILABLE");
+    assert.equal(
+      h.schedulerSpy.pickCalls.length,
+      1,
+      "外接路径仍调 scheduler.pick(只是 pool 空抛错)",
+    );
+    const pickInput = h.schedulerSpy.pickCalls[0] as { kind?: string };
+    assert.equal(
+      pickInput.kind,
+      "external_api",
+      "isExternalApiKeyOAuthPath=true 必须把 accountKind=external_api 透传到 scheduler.pick",
+    );
+  });
+
+  test("容器 + OAuth 上游:pickUpstream 不传 accountKind(scheduler 默认 platform 池)", async () => {
+    // 默认 harness = 容器 strategy + 默认 fetch 走 happy SSE
+    const h = buildHarness();
+
+    const res = await h.run(minBody());
+
+    assert.equal(res.statusCode, 200, "happy path 容器调用应 200");
+    assert.equal(h.schedulerSpy.pickCalls.length, 1);
+    const pickInput = h.schedulerSpy.pickCalls[0] as { kind?: string };
+    assert.equal(
+      pickInput.kind,
+      undefined,
+      "容器路径必须不传 accountKind(scheduler 内部默认到 platform,保 Phase 1 行为等价)",
+    );
+  });
+
+  test("DeepSeek 路由:不调用 scheduler.pick(noop set 不可破)", async () => {
+    const h = buildHarness({
+      deepseekApiKey: "sk-deepseek-test",
+      // pickSpec=null 仅在 scheduler.pick 被错误调用时才会抛"pickSpec=null but pick called",
+      // 强化"deepseek 路径根本不触达 scheduler"的不变量验证。
+      pickSpec: null,
+    });
+
+    const res = await h.run(minBody("deepseek-v4-pro"));
+
+    assert.equal(res.statusCode, 200, "deepseek happy path 200");
+    assert.equal(
+      h.schedulerSpy.pickCalls.length,
+      0,
+      "deepseek 路由 pickUpstream 应合成 session,不触达 scheduler.pick",
     );
   });
 });
