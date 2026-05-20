@@ -86,6 +86,22 @@ for arg in "$@"; do
   esac
 done
 
+# ── Top-level deploy lock ──
+# Two concurrent deploy-v3.sh runs from this worktree would race on
+# changelog/cache-bust mutations, version-bump commits, the commercial-v3
+# rsync, and (later) the KL standby sync — leaving prod in a torn state where
+# the running tag points to commit X but the code on disk is from commit Y.
+# Non-blocking flock: if another deploy is in flight, abort immediately with a
+# clear message rather than queue up and surprise the operator. --rollback is
+# part of the same critical section so a rollback can't race with a forward
+# deploy either.
+exec 8>/var/lock/v3-deploy.lock
+if ! flock -n 8; then
+  echo "ERROR: another deploy-v3.sh is in progress (holds /var/lock/v3-deploy.lock)." >&2
+  echo "       Wait for it to finish, then retry." >&2
+  exit 1
+fi
+
 # ── Load CF credentials from .env.keys (optional; purge is graceful-degrade) ──
 # Only read the two specific vars we need — don't `source` the whole file
 # to avoid polluting the deploy script's env with unrelated keys.
@@ -555,6 +571,20 @@ if ! bash "$REPO_ROOT/scripts/smoke-v3.sh" "$TAG" https://claudeai.chat; then
   echo "   rollback (latest):  scripts/deploy-v3.sh --rollback" >&2
   echo "   rollback older:     scripts/deploy-v3.sh --rollback=N   (N=1..5)" >&2
   exit 1
+fi
+
+# ── 9.5. Sync KL hot standby (non-blocking best-effort) ──
+# After smoke passes, commercial-v3 is live and healthy. Push the same code +
+# VERSION + changelog + missing runtime images to the KL hot standby so an
+# eventual switchover lands on a current code tree. Failure here is logged but
+# does NOT fail the deploy — KL drift is recoverable (boss can re-run
+# scripts/sync-kl-standby.sh manually), but auto-rolling back a healthy live
+# commercial-v3 would be a real outage.
+echo "-- syncing KL hot standby (kuala-lumpur 154.193.246.236) --"
+export TAG DEPLOY_COMMIT BUILT_AT
+if ! bash "$REPO_ROOT/scripts/sync-kl-standby.sh"; then
+  echo "   WARN: KL standby sync failed — commercial-v3 is live, KL drift accepted" >&2
+  echo "   manual retry: bash $REPO_ROOT/scripts/sync-kl-standby.sh" >&2
 fi
 
 # ── 10. Git tag + push (non-fatal) ──
