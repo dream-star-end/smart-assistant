@@ -765,13 +765,28 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   //   - remote 路径:在 master 返回的数组里找 name === 'SKILLS_LITERATURE'
   //   - hook 路径:调 setLiteratureSkillProvider 注册的 provider
   // 没找到 / hook 返 null → slot 不出现。
-  if (remotePlatformSlots === null) {
-    const literature = await buildLiteratureSkillSlot()
-    if (literature) slots.push(literature)
-  } else {
-    const literature = remotePlatformSlots.find((s) => s.name === 'SKILLS_LITERATURE')
-    if (literature) {
-      slots.push({ name: 'SKILLS_LITERATURE', content: literature.content })
+  //
+  // Backend asymmetry — codex-native 子进程不注入此 slot:
+  //   - literatureProxy 要求 `Authorization: Bearer $OPENCLAUDE_V3_CONTAINER_TOKEN`
+  //     (verifyContainerIdentity 双因子,见 commercial/src/literatureProxy.ts:373)
+  //   - codex 子进程 spawn env 由 buildCodexEnv() 构造,显式 scrub 所有
+  //     `OPENCLAUDE_*` / `ANTHROPIC_*` / `CLAUDE_CODE_*` 前缀的 env(见
+  //     codexRunner.ts:209 `ENV_SCRUB_PREFIXES`)。container token 因此对 codex
+  //     不可见,即使 prompt 告诉它走这个接口,调用也必然 401。
+  //   - 让 codex 看到一个"会用,但调不通"的 endpoint 反而浪费 turn + 误导用户;
+  //     直接不渲染该 slot,codex 会 fallback 到自身能力(web search 等)。
+  //   - 这条 scrub 设计本身合理(防 codex 横向移动 OpenClaude 凭证),不应为
+  //     literature 单个功能开洞。如未来要让 codex 也用 literature,需独立设计
+  //     "codex 可用且与 OpenClaude 凭证隔离"的鉴权通道,与本 skip 正交。
+  if (ctx.provider !== 'codex-native') {
+    if (remotePlatformSlots === null) {
+      const literature = await buildLiteratureSkillSlot()
+      if (literature) slots.push(literature)
+    } else {
+      const literature = remotePlatformSlots.find((s) => s.name === 'SKILLS_LITERATURE')
+      if (literature) {
+        slots.push({ name: 'SKILLS_LITERATURE', content: literature.content })
+      }
     }
   }
 
