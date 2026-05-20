@@ -1176,3 +1176,366 @@ describe("Phase 7 §3.5.2 出站 envelope — invariant #11 端到端", () => {
     // pool override 由 afterEach 兜底 resetPool。
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// (10) Phase 0 baseline: outbound structural snapshot — envv2 drift detection
+//
+// 目的:V3 CC 外接 plan §3.5.2 envelope normalization v2 重构前,锁住当前
+// outbound HTTP body / headers 在所有 v2 会触及的维度上的形态。任一断言失败
+// 即 v2 重构有副作用漂移,必须显式判定是 expected 还是 regression。
+//
+// 锁的是 **JSON.parse 后的结构级形态**(字段存在性 / 值 / 数组顺序 / Object.keys
+// 集合),**不**锁 raw byte / JSON object key 序列化顺序 —— 后者随 V8 实现细节
+// 漂移,不是 v2 关心的维度(Codex Phase 0 code-review MINOR 1 明确)。
+//
+// 与已有覆盖的关系:
+//   - externalEnvelope.unit.test.ts(17 cases)锁 helper 内部 → 不重复
+//   - Phase 7 §3.5.2 上方 3 cases(inject/skip/deepseek)锁端到端基础形态 → 互补
+//
+// 新增 case 覆盖 8 个维度(Codex Phase 0 plan-review MINOR 已采纳):
+//   1) system 数组前置 + 客户端 block 顺序保留
+//   2) system 非零位置含 CC prefix → skip,锁 detectCcPrefix any-position 当前行为
+//   3) AGENT_SDK 变体 prefix(string)→ skip + log prefix_variant=2
+//   4) header allowlist snapshot + x-api-key 不泄到上游
+//   5) metadata.user_id 客户端无 metadata → 仅 device_id key
+//   6) metadata.user_id 客户端 keys 保留 + device_id 覆盖
+//   7) tools/thinking/top_p/temperature/stop_sequences/max_tokens/
+//      context_management/tool_choice 全部 passthrough byte-equal
+//   8) negative anchor — 当前 outbound 无 fingerprint 字段 + system text 无 SALT
+//      + system.length === 1(无 attribution/session info block)
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 扩展版 capturing fetch:同时锁 body / headers / url。
+ * 仅 Phase 0 baseline 使用(case 4 锁 header allowlist + authorization 反向断 + url),
+ * 不替换 makeCapturingFetch — 既有 3 cases 已稳定,不动。
+ */
+function makeCapturingFetchFull(): {
+  fetchImpl: typeof fetch;
+  getBody(): string | undefined;
+  getHeaders(): Record<string, string> | undefined;
+  getUrl(): string | undefined;
+} {
+  let capturedBody: string | undefined;
+  let capturedHeaders: Record<string, string> | undefined;
+  let capturedUrl: string | undefined;
+  const fetchImpl: typeof fetch = (async (
+    url: string | URL,
+    init?: RequestInit,
+  ) => {
+    capturedUrl = typeof url === "string" ? url : url.toString();
+    if (init?.body && typeof init.body === "string") {
+      capturedBody = init.body;
+    }
+    // headers 形态:Record<string,string>(handler 用 plain object),
+    // 但 RequestInit 也兼容 Headers / [string,string][]。这里只走 plain object 路径,
+    // 因为 core.ts:166 fetchInit.headers 就是 safeHeaders 这个 Record。
+    if (init?.headers && !Array.isArray(init.headers) && !(init.headers instanceof Headers)) {
+      capturedHeaders = { ...(init.headers as Record<string, string>) };
+    }
+    return sseResponse(200, makeFullSseChunks());
+  }) as unknown as typeof fetch;
+  return {
+    fetchImpl,
+    getBody: () => capturedBody,
+    getHeaders: () => capturedHeaders,
+    getUrl: () => capturedUrl,
+  };
+}
+
+describe("Phase 0 baseline: outbound byte-level snapshot — envv2 drift detection", () => {
+  // ── case 1: system 数组前置 + 客户端 block 顺序保留 ─────────────────────
+  // v2 plan 会把客户端 block 改成 "as project context",顺序/字段必须先锁。
+  test("case 1: 客户端 system 是 array 含 1 个 text block → outbound 长度=2,prepend 在前,客户端 block byte-equal 在后", async () => {
+    const cap = makeCapturingFetchFull();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const clientBlock = { type: "text", text: "client_A_arbitrary_content" };
+    const res = await h.run({ body: { ...minBody(), system: [clientBlock] } });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+
+    const raw = cap.getBody();
+    assert.ok(raw);
+    const sent = JSON.parse(raw!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<Record<string, unknown>>;
+    assert.ok(Array.isArray(systemArr));
+    assert.equal(systemArr.length, 2, `expected len=2 (prepend + 1 client block); got=${systemArr.length}`);
+    // [0] = 注入的 CC DEFAULT prefix + cache_control:ephemeral
+    assert.equal(systemArr[0]!.type, "text");
+    assert.equal(
+      systemArr[0]!.text,
+      "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+    assert.deepEqual(systemArr[0]!.cache_control, { type: "ephemeral" });
+    // [1] = 客户端原 block,deepEqual 防字段顺序假阳性
+    assert.deepEqual(systemArr[1], clientBlock, "客户端 block 必须 byte-equal 保留在位置 [1]");
+  });
+
+  // ── case 2: detectCcPrefix any-position 当前行为锁 ──────────────────────
+  // v2 plan 改 detect 策略为强制 [0](L0 头位锁),baseline 必须先锁 any-position。
+  test("case 2: system 非零位置含 CC prefix → skip 不再 prepend,两 block 顺序保留", async () => {
+    const cap = makeCapturingFetchFull();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const otherBlock = { type: "text", text: "other_unrelated_content" };
+    const ccPrefixBlock = {
+      type: "text",
+      text:
+        "You are Claude Code, Anthropic's official CLI for Claude.\n\nsome additional context",
+    };
+    const res = await h.run({
+      body: { ...minBody(), system: [otherBlock, ccPrefixBlock] },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+
+    const raw = cap.getBody();
+    const sent = JSON.parse(raw!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<Record<string, unknown>>;
+    assert.equal(systemArr.length, 2, "skip 路径下不应 prepend → 长度仍为 2");
+    assert.deepEqual(systemArr[0], otherBlock, "[0] 是客户端 other_unrelated_content");
+    assert.deepEqual(systemArr[1], ccPrefixBlock, "[1] 是客户端 ccPrefixBlock(prefix 在非零位置也触发 skip)");
+  });
+
+  // ── case 3: AGENT_SDK 变体识别 ──────────────────────────────────────────
+  test("case 3: AGENT_SDK 变体 prefix(string)→ skip + log external_envelope_skip { prefix_variant:2, orig_kind:'string', blocks:1 }", async () => {
+    const cap = makeCapturingFetchFull();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const agentSdkSystem =
+      "You are a Claude agent, built on Anthropic's Claude Agent SDK.\n\nrest of agent prompt";
+    const res = await h.run({ body: { ...minBody(), system: agentSdkSystem } });
+    assert.equal(res.statusCode, 200);
+
+    const raw = cap.getBody();
+    const sent = JSON.parse(raw!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<Record<string, unknown>>;
+    assert.equal(systemArr.length, 1, "string → array 归一化,skip 不 prepend → 长度 1");
+    assert.equal(systemArr[0]!.text, agentSdkSystem, "原 string 完整保留");
+
+    // log 断言:只筛 msg + 三个结构指纹字段,不锁整条 log object
+    const skipLog = h.logEvents.find((e) => e.msg === "external_envelope_skip");
+    assert.ok(skipLog, "必须发出 external_envelope_skip");
+    assert.equal(skipLog!.prefix_variant, 2, "AGENT_SDK 变体 index = 2");
+    assert.equal(skipLog!.orig_kind, "string", "客户端原始 system 形态 = string");
+    assert.equal(skipLog!.blocks, 1, "归一化后 array 长度 = 1");
+  });
+
+  // ── case 4: header allowlist + auth 反向断 + url ────────────────────────
+  // v2 plan 可能"补全 CC headers(x-stainless-* / UA)",baseline 必须先锁"现在什么都不补"。
+  // 安全维度:客户端 oc-cc.* API key **绝不**能泄到 Anthropic upstream。
+  test("case 4: header allowlist 恰好 5 个 key + anthropic-beta merge oauth 前置 + 客户端 token/api-key 不泄到上游", async () => {
+    const cap = makeCapturingFetchFull();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    // 故意往入站塞一堆 CC 客户端常见的 header(x-stainless-*, x-app, x-api-key),
+    // 锁出站 allowlist 把它们全 strip。
+    const res = await h.run({
+      headers: {
+        "x-stainless-lang": "js",
+        "x-stainless-runtime": "node",
+        "x-stainless-arch": "x64",
+        "x-app": "claude-code",
+        "x-api-key": "client-fake-api-key-should-not-leak",
+        "anthropic-beta": "prompt-caching-2024-07-31",
+      },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+
+    const headers = cap.getHeaders();
+    assert.ok(headers, "fetch headers 必须被捕获");
+    const keys = Object.keys(headers!).sort();
+    assert.deepEqual(
+      keys,
+      ["accept", "anthropic-beta", "anthropic-version", "authorization", "content-type"],
+      `outbound header set 必须恰好 5 个 allowlist key;got=${JSON.stringify(keys)}`,
+    );
+    // anthropic-beta:oauth-2025-04-20 必须在最前(applyUpstreamAuth 用 unshift 注入)
+    assert.equal(
+      headers!["anthropic-beta"],
+      "oauth-2025-04-20,prompt-caching-2024-07-31",
+      "anthropic-beta 必须 oauth-2025 前置 + 客户端原 beta 跟后",
+    );
+    // authorization 用账号池 token 而非客户端 oc-cc API key
+    assert.equal(
+      headers!["authorization"],
+      "Bearer FAKE-TOKEN-VALUE",
+      "authorization 必须是 scheduler.pick 返回的账号 token",
+    );
+
+    // 反向断:客户端的 oc-cc.* API key 绝不应出现在 outbound raw bytes 任何位置
+    // (既不在 headers 也不在 body)。这是真实安全维度,v2 改 helper 时容易漏。
+    const rawBody = cap.getBody() ?? "";
+    const allOutbound = JSON.stringify(headers) + rawBody;
+    assert.ok(
+      !allOutbound.includes(FIXED_TOKEN),
+      "客户端 oc-cc.* API key 不能泄到 upstream",
+    );
+    assert.ok(
+      !allOutbound.includes("client-fake-api-key-should-not-leak"),
+      "客户端 x-api-key 不能泄到 upstream",
+    );
+
+    // URL 端点锁(buildHarness 注入的 upstreamEndpoint)
+    assert.equal(cap.getUrl(), "https://upstream.test/v1/messages", "upstream URL 锁");
+  });
+
+  // ── case 5: metadata.user_id 客户端无 metadata → 仅 device_id key ─────
+  test("case 5: 客户端无 metadata → outbound metadata 恰好 { user_id }, user_id JSON 恰好 { device_id }", async () => {
+    const cap = makeCapturingFetchFull();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const res = await h.run({ body: minBody() }); // 无 metadata
+    assert.equal(res.statusCode, 200);
+
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const meta = sent.metadata as Record<string, unknown>;
+    assert.deepEqual(
+      Object.keys(meta).sort(),
+      ["user_id"],
+      `metadata 应只含 user_id;got=${JSON.stringify(Object.keys(meta))}`,
+    );
+    const userIdParsed = JSON.parse(meta.user_id as string) as Record<string, unknown>;
+    assert.deepEqual(
+      Object.keys(userIdParsed).sort(),
+      ["device_id"],
+      `user_id JSON 应只含 device_id;got=${JSON.stringify(Object.keys(userIdParsed))}`,
+    );
+    assert.equal(userIdParsed.device_id, FIXED_PINNED_USER_ID);
+  });
+
+  // ── case 6: metadata.user_id 客户端 keys 保留 + device_id 覆盖 ──────────
+  test("case 6: 客户端 metadata.user_id 含多 keys → device_id 被覆盖 + 其他 keys(account_uuid/session_id/custom_extras)全保留", async () => {
+    const cap = makeCapturingFetchFull();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const clientUserIdJson = JSON.stringify({
+      device_id: "FAKE_CLIENT_DEVICE_ID_must_be_overwritten",
+      account_uuid: "abc-uuid-1234",
+      session_id: "sess-xyz-5678",
+      custom_extras: 42,
+    });
+    const res = await h.run({
+      body: {
+        ...minBody(),
+        // schema strict:metadata 只允许 user_id + session_id;两者都测
+        metadata: { user_id: clientUserIdJson, session_id: "outer-session-id" },
+      },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const meta = sent.metadata as Record<string, unknown>;
+    assert.deepEqual(
+      Object.keys(meta).sort(),
+      ["session_id", "user_id"],
+      "metadata 两个顶层 key(session_id 透传 + user_id 改写)都在",
+    );
+    assert.equal(meta.session_id, "outer-session-id", "metadata.session_id 顶层透传");
+
+    const userIdParsed = JSON.parse(meta.user_id as string) as Record<string, unknown>;
+    assert.equal(
+      userIdParsed.device_id,
+      FIXED_PINNED_USER_ID,
+      "device_id 必须被 pinned 覆盖(fake → real)",
+    );
+    assert.equal(userIdParsed.account_uuid, "abc-uuid-1234", "account_uuid 保留");
+    assert.equal(userIdParsed.session_id, "sess-xyz-5678", "user_id JSON 内 session_id 保留(独立于顶层 metadata.session_id)");
+    assert.equal(userIdParsed.custom_extras, 42, "custom_extras 保留(rewriteMetadataDeviceId fail-open)");
+    assert.deepEqual(
+      Object.keys(userIdParsed).sort(),
+      ["account_uuid", "custom_extras", "device_id", "session_id"],
+      "user_id JSON 不多不少 4 个 key",
+    );
+  });
+
+  // ── case 7: body 字段 passthrough byte-equal ─────────────────────────────
+  // 锁"当前 helper + applyUpstreamAuth 都不动这些字段"。v2 可能补 CC 默认 tools 或
+  // strip 客户端 thinking,baseline 必须先锁纯 passthrough。
+  test("case 7: tools/thinking/top_p/temperature/stop_sequences/max_tokens/context_management/tool_choice → outbound 全部 deepEqual passthrough", async () => {
+    const cap = makeCapturingFetchFull();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const clientBody = {
+      ...minBody(),
+      max_tokens: 7777,
+      temperature: 0.5,
+      top_p: 0.9,
+      stop_sequences: ["END_OF_TEXT", "STOP"],
+      tools: [
+        {
+          name: "test_tool",
+          description: "a tool for testing passthrough",
+          input_schema: { type: "object", properties: { x: { type: "string" } } },
+        },
+      ],
+      tool_choice: { type: "auto" },
+      thinking: { type: "enabled", budget_tokens: 1024 },
+      context_management: { strategy: "auto" },
+    };
+    const res = await h.run({ body: clientBody });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    // 每个字段独立 deepEqual,失败信息更精确
+    assert.equal(sent.max_tokens, 7777, "max_tokens passthrough");
+    assert.equal(sent.temperature, 0.5, "temperature passthrough");
+    assert.equal(sent.top_p, 0.9, "top_p passthrough");
+    assert.deepEqual(sent.stop_sequences, ["END_OF_TEXT", "STOP"], "stop_sequences passthrough");
+    assert.deepEqual(sent.tools, clientBody.tools, "tools deepEqual passthrough");
+    assert.deepEqual(sent.tool_choice, { type: "auto" }, "tool_choice passthrough");
+    assert.deepEqual(sent.thinking, clientBody.thinking, "thinking passthrough");
+    assert.deepEqual(sent.context_management, { strategy: "auto" }, "context_management passthrough");
+  });
+
+  // ── case 8: negative anchor — fingerprint/attribution 当前不存在 ────────
+  // v2 plan 要加 server-validated fingerprint + attribution prefix,
+  // baseline 必须断言"现在没有",形成 BEFORE→AFTER 清晰 diff 锚点。
+  test("case 8: 当前 outbound 无 fingerprint 字段 + system text 无 SALT 字面 + system.length===1(无 attribution/session info block)", async () => {
+    const cap = makeCapturingFetchFull();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const res = await h.run({ body: minBody() }); // 空 system,触发 prepend 路径
+    assert.equal(res.statusCode, 200);
+
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+
+    // (a) 递归扫 object key,断不存在 key 名 "fingerprint"
+    function findKeyAnywhere(obj: unknown, target: string): boolean {
+      if (obj === null || typeof obj !== "object") return false;
+      if (Array.isArray(obj)) return obj.some((v) => findKeyAnywhere(v, target));
+      for (const [k, v] of Object.entries(obj)) {
+        if (k === target) return true;
+        if (findKeyAnywhere(v, target)) return true;
+      }
+      return false;
+    }
+    assert.equal(
+      findKeyAnywhere(sent, "fingerprint"),
+      false,
+      "当前 outbound 不应含任何 fingerprint 字段(v2 阶段加,baseline 锁 BEFORE 状态)",
+    );
+    // (a') 额外扫 metadata.user_id 这条 JSON string 内层(Codex code-review MINOR 3
+    // 采纳):如果未来 v2 把 fingerprint 塞进 user_id JSON,递归扫 sent 看不到
+    // 字符串内部 — 单独 parse + 递归确保锁死。
+    const meta = sent.metadata as Record<string, unknown> | undefined;
+    if (meta && typeof meta.user_id === "string") {
+      const inner = JSON.parse(meta.user_id) as unknown;
+      assert.equal(
+        findKeyAnywhere(inner, "fingerprint"),
+        false,
+        "metadata.user_id JSON 字符串内层也不应含 fingerprint(v2 BEFORE 锚)",
+      );
+    }
+
+    // (b) system 只有 1 个 block(注入的 prefix),没有 attribution/session info 额外块
+    const systemArr = sent.system as Array<Record<string, unknown>>;
+    assert.equal(
+      systemArr.length,
+      1,
+      `当前 outbound system 应只有 1 个注入 prefix block;got len=${systemArr.length}`,
+    );
+
+    // (c) SALT 字面值仅在 system text blocks 内扫(不扫整 raw,避免误伤 user 消息文本)
+    const SALT = "59cf53e54c78";
+    for (const block of systemArr) {
+      if (block.type === "text" && typeof block.text === "string") {
+        assert.ok(
+          !block.text.includes(SALT),
+          `system text 内不应含 fingerprint SALT 字面;block.text=${JSON.stringify(block.text)}`,
+        );
+      }
+    }
+  });
+});
