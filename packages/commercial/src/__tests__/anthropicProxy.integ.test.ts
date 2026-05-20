@@ -733,11 +733,19 @@ function minBody(modelOverride?: string): Record<string, unknown> {
 // ─── 不变量 (1):Release ownership 4 阶段 ─────────────────────────────────
 
 describe("invariant 1 — release ownership 4 阶段铁律", () => {
-  // V3 envv2 Phase 4 (2026-05-21) 顺序调整后铁律:
-  //   pickUpstream 现在跑在 preCheck **之前**(为了让 v2 envelope normalize 拿到
-  //   session.fingerprintSalt)。所以 stage (a) pool_busy / stage (b*) refresh_failed
-  //   触发时 **preCheck 从未 reserve 过**,无须 release。
-  //   stage (c) journal_failed 已在 preCheck 成功之后,仍需双侧 release(顺序锁 scheduler→preCheck)。
+  // V3 envv2 Phase 4 (2026-05-21) 拆两阶段后铁律(Codex code-review FAIL #1 采纳):
+  //   pickAccountForUpstream → envelope normalize → preCheck → prepareUpstreamSession
+  //
+  //   - (a) scheduler.pick 失败 → pickAccount 失败,normalize/preCheck/prepareSession 都不跑
+  //     ⇒ preCheck 从未 reserve,scheduler.release 也未调
+  //   - (b*) refresh 失败 → 发生在 prepareUpstreamSession,此时 preCheck **已 reserve**;
+  //     scheduler.release 由 prepareSession 内部 fire,handler finally release preCheck
+  //     ⇒ releaseOrder = ["scheduler", "preCheck"]
+  //   - (c) journal 失败 → preCheck 已 reserve、session 已 ready,双侧 release
+  //     ⇒ releaseOrder = ["scheduler", "preCheck"]
+  //   - (d insufficient_credits) preCheck 阶段抛 → prepareSession 没跑,Redis 也无 reservation
+  //     (atomicReserve 在 balance≤0 时提前拦下),scheduler.release 由 handler finally
+  //     按 client_error kind 释放 accountCtx
 
   // (a) pick 失败 → 无任何 release;preCheck 从未 reserve
   test("(a) scheduler.pick 抛 AccountPoolBusy → 既无 scheduler.release 也无 preCheck.reserve/release", async () => {
@@ -793,15 +801,19 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
     );
     assert.equal(
       h.preCheckSpy.reserveCalls.length,
-      0,
-      "(b1) pickUpstream 在 preCheck 之前 → preCheck 从未 reserve",
+      1,
+      "(b1) Phase 4 两阶段拆分后:preCheck 在 prepareUpstreamSession 之前 → 已 reserve",
     );
     assert.equal(
       h.preCheckSpy.releaseCalls.length,
-      0,
-      "(b1) preCheck 未 reserve 自然不 release",
+      1,
+      "(b1) preCheck 已 reserve → finally 兜底 release",
     );
-    assert.deepEqual(h.releaseOrder, ["scheduler"], "(b1) 只有 scheduler.release 一次");
+    assert.deepEqual(
+      h.releaseOrder,
+      ["scheduler", "preCheck"],
+      "(b1) 顺序锁:scheduler.release(prepareSession 内部)先 → preCheck release(handler finally)后",
+    );
     // MINOR 1:把 "code 分类" 从 grep 升格为 test 级断言
     const refreshFail = h.logEvents.find(
       (e) => e["msg"] === "proxy_refresh_failed",
@@ -845,11 +857,15 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
     );
     assert.equal(
       h.preCheckSpy.reserveCalls.length,
-      0,
-      "(b2) pickUpstream 在 preCheck 之前 → preCheck 从未 reserve",
+      1,
+      "(b2) Phase 4 两阶段拆分:preCheck 已先 reserve 再 prepareUpstreamSession",
     );
-    assert.equal(h.preCheckSpy.releaseCalls.length, 0, "(b2) preCheck 未 reserve 不 release");
-    assert.deepEqual(h.releaseOrder, ["scheduler"], "(b2) 只有 scheduler.release 一次");
+    assert.equal(h.preCheckSpy.releaseCalls.length, 1, "(b2) preCheck 已 reserve → finally release");
+    assert.deepEqual(
+      h.releaseOrder,
+      ["scheduler", "preCheck"],
+      "(b2) 顺序锁:scheduler.release 先 → preCheck release 后",
+    );
     // MINOR 1:code 分类是 transient_network(代理一抖整池不被烧的核心字段)
     const refreshFail = h.logEvents.find(
       (e) => e["msg"] === "proxy_refresh_failed",
@@ -890,11 +906,15 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
     );
     assert.equal(
       h.preCheckSpy.reserveCalls.length,
-      0,
-      "(b3) pickUpstream 在 preCheck 之前 → preCheck 从未 reserve",
+      1,
+      "(b3) Phase 4 两阶段拆分:preCheck 已先 reserve 再 prepareUpstreamSession",
     );
-    assert.equal(h.preCheckSpy.releaseCalls.length, 0, "(b3) preCheck 未 reserve 不 release");
-    assert.deepEqual(h.releaseOrder, ["scheduler"], "(b3) 只有 scheduler.release 一次");
+    assert.equal(h.preCheckSpy.releaseCalls.length, 1, "(b3) preCheck 已 reserve → finally release");
+    assert.deepEqual(
+      h.releaseOrder,
+      ["scheduler", "preCheck"],
+      "(b3) 顺序锁:scheduler.release 先 → preCheck release 后",
+    );
     // MINOR 1:401 这种永久拒绝必须分类为 http_error,不能错误归到 network_transient
     // 否则 disableOnFailure 语义破坏(账号永久挂了反而不扣健康分)
     const refreshFail = h.logEvents.find(
@@ -1557,6 +1577,99 @@ describe("Phase 1.5 — pickUpstream accountKind 透传", () => {
       h.schedulerSpy.pickCalls.length,
       0,
       "deepseek 路由 pickUpstream 应合成 session,不触达 scheduler.pick",
+    );
+  });
+});
+
+// ─── Phase 4 — envelope normalize 抛错走 handler 局部 try/catch ───────────────
+//
+// 锁 V3 envv2 Phase 4 (2026-05-21) Codex code-review FAIL #2 修复:外接 ApiKey + OAuth
+// 路径在 envelope normalize 阶段抛 EnvelopePrefixCacheNotReadyError(prefix cache 未
+// bootstrap)时,handler 必须:
+//   - 不让错误穿透到 handler_uncaught 默认 releaseReason
+//   - 局部 catch → log proxy_envelope_normalize_failed
+//   - sendJsonError 500 INTERNAL
+//   - finally 走 accountCtx-only-owned 路径,scheduler.release({kind:"failure"})
+//   - preCheck 从未 reserve(normalize 在 preCheck 之前)
+//
+// 触发方式:
+//   - identityStrategyOverride 注入外接 ApiKey strategy(containerId: null)
+//   - pickSpec.envelope_version = 2 + fingerprint_salt 16 字节非零(走 v2 normalizer)
+//   - prefix template cache singleton 默认 null(测试不 bootstrap)→ snapshotPrefixes 抛
+describe("Phase 4 — envelope normalize 抛错走 handler 局部 try/catch", () => {
+  function makeFakeApiKeyIdentityStrategy(uid: bigint): IdentityStrategy {
+    return {
+      async resolve(_req, _ctx) {
+        return { uid, containerId: null };
+      },
+      async authorize(_identity, _pricing, _model) {
+        /* noop:authz 不在本 case 验证范围 */
+      },
+    };
+  }
+
+  test("normalize v2 抛 EnvelopePrefixCacheNotReady → 500 + scheduler.release({failure}) + 无 preCheck reserve + log proxy_envelope_normalize_failed", async () => {
+    // 确保 singleton 是 null(默认就是,但 paranoia reset 防其它测试串色)
+    const { _resetPrefixTemplateCacheForTesting } = await import(
+      "../envelope/prefixTemplateCache.js"
+    );
+    _resetPrefixTemplateCacheForTesting();
+
+    const h = buildHarness({
+      identityStrategyOverride: makeFakeApiKeyIdentityStrategy(BigInt(FIXED_USER_ID)),
+      pickSpec: {
+        envelope_version: 2,
+        fingerprint_salt: Buffer.from(
+          "0102030405060708090a0b0c0d0e0f10",
+          "hex",
+        ),
+      },
+    });
+
+    const res = await h.run(minBody());
+
+    assert.equal(res.statusCode, 500, "normalize throw → 500 INTERNAL");
+    assert.equal(readErrCode(res), "INTERNAL");
+
+    // 关键不变量:handler 必须 release 账号(否则 inflight 泄漏),kind=failure
+    assert.equal(h.schedulerSpy.releaseCalls.length, 1, "必须 release 一次");
+    assert.equal(
+      h.schedulerSpy.releaseCalls[0]!.result.kind,
+      "failure",
+      "normalize 失败 = upstream-side preparation 问题,kind=failure(不是 handler_uncaught 的默认 failure 而是显式分类 failure)",
+    );
+    assert.equal(
+      h.schedulerSpy.releaseCalls[0]!.account_id,
+      FIXED_ACCOUNT_ID,
+      "release 必须带 pick.account_id",
+    );
+    // Codex round-2 non-blocking 建议:显式断言 release error 不是 handler_uncaught
+    // 默认值 — 锁定"局部 catch 真的生效了"而不是"恰好兜底 release 也是 failure kind"。
+    const failureRel = h.schedulerSpy.releaseCalls[0]!.result as {
+      kind: "failure";
+      error?: string;
+    };
+    assert.notEqual(
+      failureRel.error,
+      "handler_uncaught",
+      "局部 catch 必须把 releaseReason.error 改写成 normalize 抛的具体错(EnvelopePrefixCacheNotReady),不是 outer try 默认值",
+    );
+
+    // preCheck 在 normalize 之后才会跑 → normalize 抛 → preCheck 永不调
+    assert.equal(
+      h.preCheckSpy.reserveCalls.length,
+      0,
+      "normalize 在 preCheck 之前抛 → Redis 端从未 reserve",
+    );
+    assert.equal(h.preCheckSpy.releaseCalls.length, 0, "preCheck 未 reserve 不 release");
+
+    // 必须发 normalize 失败 log(可观测性硬指标 — 不能让 prefix cache 静默丢)
+    const normalizeFail = h.logEvents.find(
+      (e) => e["msg"] === "proxy_envelope_normalize_failed",
+    );
+    assert.ok(
+      normalizeFail,
+      "handler 局部 catch 必须发 proxy_envelope_normalize_failed log",
     );
   });
 });

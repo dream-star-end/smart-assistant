@@ -2697,6 +2697,8 @@ export type { RoundTripCtx } from "./http/proxy/core.js";
 export {
   selectUpstreamRoute,
   validateUpstreamConfig,
+  pickAccountForUpstream,
+  prepareUpstreamSession,
   pickUpstream,
   releaseUpstreamSession,
 } from "./http/proxy/upstream.js";
@@ -2706,6 +2708,7 @@ export type {
   PreparedUpstreamSession,
   PickError,
   PickUpstreamDeps,
+  AccountCtx,
 } from "./http/proxy/upstream.js";
 // V3 Phase 2 Task 2E: 用户 WS ↔ 容器 WS 桥接
 export {

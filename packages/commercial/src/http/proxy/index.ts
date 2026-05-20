@@ -43,10 +43,12 @@ import {
 } from "../../billing/proxyBilling.js";
 import { checkRateLimit } from "../../middleware/rateLimit.js";
 import {
-  pickUpstream,
+  pickAccountForUpstream,
+  prepareUpstreamSession,
   releaseUpstreamSession,
   selectUpstreamRoute,
   validateUpstreamConfig,
+  type AccountCtx,
   type PreparedUpstreamSession,
 } from "./upstream.js";
 import {
@@ -249,6 +251,15 @@ export function makeAnthropicProxyHandler(
     // Phase 4 这里跨 ~260 行),为避免 TS scope analysis 边界 case,显式提到外层。
     let session: PreparedUpstreamSession | null = null;
     let sessionOwnedByHandler = false;
+    // V3 envv2 Phase 4(2026-05-21,Codex code-review FAIL #1 采纳):pickUpstream 拆成
+    // pickAccountForUpstream + prepareUpstreamSession 两阶段后,handler 在 normalize +
+    // preCheck 期间持有 pick 但**还没**进入 session 状态。这段窗口的 release ownership
+    // 用 `accountCtxOwnedByHandler` 单独跟踪 — finally 兜底:
+    //   - sessionOwnedByHandler && session ≠ null    → 走 releaseUpstreamSession 路径(case c)
+    //   - accountCtxOwnedByHandler && accountCtx 是 oauth → 直接 scheduler.release + 零化 pick
+    //   - 否则                                        → noop(pickAccount 失败 / DeepSeek / 已 transfer)
+    let accountCtx: AccountCtx | null = null;
+    let accountCtxOwnedByHandler = false;
     let releaseReason: ReleaseBeforeFinalizerReason = {
       kind: "failure",
       error: "handler_uncaught",
@@ -358,35 +369,33 @@ export function makeAnthropicProxyHandler(
       // 不命中:容器内 CCB 已自带 sysprompt;DeepSeek 端无 anti-abuse fingerprinting。
       const isExternalApiKeyOAuthPath = identity.containerId === null && route.kind === "oauth";
 
-      // 6) 取账号 + dispatcher + (按需)刷 token —— 全部收敛进 pickUpstream(plan §3.4)。
+      // 6) 选号 —— pickAccountForUpstream(只 scheduler.pick,**不**做 refresh / dispatcher)。
       //
-      // 失败模式 → 一一映射(release 已在 upstream 层 fire,handler 不持 session):
+      // V3 envv2 Phase 4(2026-05-21,Codex code-review FAIL #1 采纳):pickUpstream 拆两阶段。
+      // 动机:v2 envelope normalize 需要 account.fingerprint_salt + account.id,
+      // 但**不需要**已 refresh 的 token / dispatcher;同时 InsufficientCredits 用户不应触发
+      // OAuth refresh 副作用(DB write + http endpoint call + 401 时账号被错误扣健康分)。
+      //
+      // 顺序:pickAccountForUpstream → envelope normalize → preCheck → prepareUpstreamSession
+      //
+      // 失败模式 → 与 pickUpstream 时代相同的 4 映射(refresh_failed/preparation_failed 这里
+      // 当然不会发生,但保留 switch exhaustiveness):
       //   pool_busy          → 429 ACCOUNT_POOL_BUSY     reject account_pool_busy
       //   pool_unavailable   → 503 ACCOUNT_POOL_UNAVAILABLE reject account_pool
-      //   refresh_failed     → 502 UPSTREAM_AUTH_REFRESH_FAILED reject upstream_auth
-      //   preparation_failed → 502 UPSTREAM_PREPARATION_FAILED  reject upstream_auth
       //
-      // DeepSeek 路径:pickUpstream 直接合成 session(无 pool 访问)。
-      //
-      // V3 envv2 Phase 4 (2026-05-21) 顺序调整:pickUpstream 从 preCheck **后**前移到
-      // preCheck **前**。动机:v2 envelope normalize 需要 session.fingerprintSalt
-      // (per-account BYTEA),只能从 pickUpstream 返回的 session 里取。Trade-off:
-      // InsufficientCredits 用户会浪费一次 scheduler.pick + client_error release。
-      // 容忍依据:上游 pool 启动顺序里 per-uid rate-limit (step 2) + concurrency (step 3)
-      // 已在 pickUpstream 之前挡住流量风暴;client_error release 不扣账号健康分(见
-      // scheduler.ts ReleaseResult 注释),不会反复打到 cooldown。
+      // DeepSeek 路径:pickAccountForUpstream 返回 {kind:"deepseek"},无 pool 访问。
       //
       // V3 envv2 Phase 1.5:外接 ApiKey + OAuth 路径显式注入 `accountKind: 'external_api'`,
       // scheduler.pick 走外接专属池;容器 OAuth 路径传 undefined → scheduler 内部默认
-      // 'platform' 池,与历史等价。外接池空抛 AccountPoolUnavailableError,handler 这里
-      // 照原逻辑映 503 ACCOUNT_POOL_UNAVAILABLE —— **不**降级回 platform 池(plan §1.4)。
-      const pickRes = await pickUpstream(
-        {
-          scheduler: deps.scheduler,
-          refreshDeps: deps.refreshDeps,
-          deepseekApiKey: deps.deepseekApiKey,
-          upstreamEndpoint: deps.upstreamEndpoint,
-        },
+      // 'platform' 池,与历史等价。
+      const pickDeps = {
+        scheduler: deps.scheduler,
+        refreshDeps: deps.refreshDeps,
+        deepseekApiKey: deps.deepseekApiKey,
+        upstreamEndpoint: deps.upstreamEndpoint,
+      };
+      const pickRes = await pickAccountForUpstream(
+        pickDeps,
         body,
         route,
         userLog,
@@ -412,19 +421,16 @@ export function makeAnthropicProxyHandler(
             sendJsonError(res, 503, "ACCOUNT_POOL_UNAVAILABLE", "account pool unavailable, try again", requestId);
             return;
           case "refresh_failed":
-            // upstream 层已 log proxy_refresh_failed + release(transient_network|failure) + zero token。
-            incrAnthropicProxyReject("upstream_auth");
-            sendJsonError(res, 502, "UPSTREAM_AUTH_REFRESH_FAILED", "failed to refresh upstream token", requestId);
-            return;
           case "preparation_failed":
-            // upstream 层已 log proxy_upstream_preparation_failed + release(failure) + zero token。
-            incrAnthropicProxyReject("upstream_auth");
-            sendJsonError(res, 502, "UPSTREAM_PREPARATION_FAILED", "failed to prepare upstream session", requestId);
+            // pickAccountForUpstream 不做 refresh / dispatcher,这两个 kind 不可能由它返回,
+            // 但 PickError 类型 union 包含它们;exhaustive 兜底 500 防 unreachable lint。
+            userLog.error("proxy_pick_account_unexpected_error", { kind: pickRes.error.kind });
+            sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
             return;
         }
       }
-      session = pickRes.session;
-      sessionOwnedByHandler = true;
+      accountCtx = pickRes.ctx;
+      accountCtxOwnedByHandler = true;
 
       // 7) Outbound envelope 归一化 v1/v2 派发(Phase 4 核心)。
       //
@@ -434,30 +440,42 @@ export function makeAnthropicProxyHandler(
       // token 估算之前,账务边界干净。
       //
       // v1 vs v2 派发:
-      //   - session.envelopeVersion === 2 && fingerprintSalt !== null → v2 normalizer
+      //   - account.envelope_version === 2 && fingerprint_salt !== null → v2 normalizer
       //     (L0 prefix slot lock + L0 attribution + L1 framework + L1 派生 4 字段)
       //   - 否则 → v1 normalizer(只做 outbound CC 形态归一化,无 L0 强锁)
       //
       // 灰度策略:`claude_accounts.envelope_version` 默认 1(0070 NOT NULL DEFAULT 1),
       // boss 手动 `UPDATE claude_accounts SET envelope_version = 2 WHERE id = ?`
-      // 单账号试灰度;`fingerprint_salt` 是 NOT NULL DEFAULT gen_random_bytes(16),
-      // 任何 account 都有 salt。`fingerprintSalt !== null` 守的是 DeepSeek 路径
-      // (`accountId = null`,fingerprintSalt 工厂值 = null);本分支已在
-      // `isExternalApiKeyOAuthPath`(route.kind === "oauth")之下,DeepSeek 不入此 if,
-      // 但守等价于断言 — 数据异常时 fail-safe 回 v1 而非 throw。
-      if (isExternalApiKeyOAuthPath) {
-        if (session.envelopeVersion === 2 && session.fingerprintSalt !== null) {
-          normalizeExternalApiKeyEnvelopeV2(
-            body,
-            {
-              id: session.accountIdStr,
-              pinned_user_id: session.pinnedUserId,
-              fingerprint_salt: session.fingerprintSalt,
-            },
-            userLog,
-          );
-        } else {
-          normalizeExternalApiKeyEnvelope(body, userLog);
+      // 单账号试灰度;`fingerprint_salt` 是 NOT NULL DEFAULT gen_random_bytes(16)。
+      //
+      // 本步骤直接读 accountCtx.pick.envelope_version / fingerprint_salt(scheduler.pick
+      // 返回的 PickResult 已携带),不依赖已 refresh 的 session — 这是拆两阶段的全部动机。
+      //
+      // Codex code-review FAIL #2 采纳:局部 try/catch,normalize throw 时 sendJsonError 500
+      // + releaseReason={kind:"failure"} + log,避免 EnvelopePrefixCacheNotReadyError 之类
+      // 错误穿透到 handler_uncaught 默认释放路径。
+      if (isExternalApiKeyOAuthPath && accountCtx.kind === "oauth") {
+        const pick = accountCtx.pick;
+        try {
+          if (pick.envelope_version === 2 && pick.fingerprint_salt !== null) {
+            normalizeExternalApiKeyEnvelopeV2(
+              body,
+              {
+                id: pick.account_id.toString(),
+                pinned_user_id: pick.pinned_user_id,
+                fingerprint_salt: pick.fingerprint_salt,
+              },
+              userLog,
+            );
+          } else {
+            normalizeExternalApiKeyEnvelope(body, userLog);
+          }
+        } catch (err) {
+          releaseReason = { kind: "failure", error: errMessageShort(err) };
+          userLog.error("proxy_envelope_normalize_failed", { err: errSummary(err) });
+          incrAnthropicProxyReject("upstream_auth");
+          sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
+          return;
         }
       }
 
@@ -507,6 +525,41 @@ export function makeAnthropicProxyHandler(
           effectiveMaxCost: pre.maxCost.toString(),
         });
       }
+
+      // 8.5) prepareUpstreamSession — 接 AccountCtx 跑 dispatcher + (按需) refresh,
+      //      合成 PreparedUpstreamSession(plan §3.4 / Codex code-review FAIL #1 拆出)。
+      //
+      // 失败模式(release 已在 upstream 层 fire,handler 不再持 pick):
+      //   refresh_failed     → 502 UPSTREAM_AUTH_REFRESH_FAILED reject upstream_auth
+      //   preparation_failed → 502 UPSTREAM_PREPARATION_FAILED  reject upstream_auth
+      //
+      // 失败时 ownership 已被 prepareUpstreamSession 内部转走(scheduler.release + zero token),
+      // 这里**只**把 accountCtxOwnedByHandler 清掉防 finally 二次释放。
+      const prepRes = await prepareUpstreamSession(pickDeps, accountCtx, userLog);
+      if (!prepRes.ok) {
+        accountCtxOwnedByHandler = false;
+        switch (prepRes.error.kind) {
+          case "refresh_failed":
+            incrAnthropicProxyReject("upstream_auth");
+            sendJsonError(res, 502, "UPSTREAM_AUTH_REFRESH_FAILED", "failed to refresh upstream token", requestId);
+            return;
+          case "preparation_failed":
+            incrAnthropicProxyReject("upstream_auth");
+            sendJsonError(res, 502, "UPSTREAM_PREPARATION_FAILED", "failed to prepare upstream session", requestId);
+            return;
+          case "pool_busy":
+          case "pool_unavailable":
+            // prepareUpstreamSession 不调 scheduler.pick,这两个 kind 不可能由它返回,
+            // 但 PickError 类型 union 包含它们;exhaustive 兜底 500 防 unreachable lint。
+            userLog.error("proxy_prepare_session_unexpected_error", { kind: prepRes.error.kind });
+            sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
+            return;
+        }
+      }
+      session = prepRes.session;
+      // ownership 从 accountCtx 转给 session:从此 release 走 releaseUpstreamSession(session,...)
+      accountCtxOwnedByHandler = false;
+      sessionOwnedByHandler = true;
 
       // 9) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
       //
@@ -582,11 +635,34 @@ export function makeAnthropicProxyHandler(
     } finally {
       releaseSlot();
       // case (c) 兜底释放(Codex Phase 4 plan-review #3 ownership guard)。
-      // sessionOwnedByHandler 仅在"pickUpstream 成功 → makeFinalizer 之前"窗口为 true。
-      // finalize 装好后置 false,从此 release 责任在 finalize 链。
+      // 两种持有窗口需要兜底:
+      //   1. session ready 后 / finalizer 之前  → releaseUpstreamSession + zeroize
+      //   2. pickAccount ready 后 / prepareUpstreamSession 成功之前 → 直接 scheduler.release
+      //      + 零化 pick token / refresh(此时 dispatcher 还没装,无 session 句柄)
+      // makeFinalizer 装好后 sessionOwnedByHandler=false,从此 release 责任在 finalize 链。
       if (sessionOwnedByHandler && session !== null) {
         await releaseUpstreamSession(deps.scheduler, session, releaseReason, userLog);
         session.zeroizeSecrets();
+      } else if (accountCtxOwnedByHandler && accountCtx !== null && accountCtx.kind === "oauth") {
+        const pick = accountCtx.pick;
+        try {
+          await deps.scheduler.release({
+            account_id: pick.account_id,
+            result: releaseReason,
+          });
+        } catch (err) {
+          userLog.warn("proxy_release_account_failed", { err: errSummary(err) });
+        }
+        try {
+          pick.token.fill(0);
+        } catch {
+          /* ignore */
+        }
+        try {
+          pick.refresh?.fill(0);
+        } catch {
+          /* ignore */
+        }
       }
       if (preCheckReservation !== null) {
         await releasePreCheck(deps.preCheckRedis, preCheckReservation).catch(() => {});
