@@ -52,6 +52,20 @@ import {
   incrAnthropicProxyReject,
 } from "../../admin/metrics.js";
 
+// ─── 临时 outbound dump trace(v1.0.184 一次性观测,验收完立即 remove) ───
+//
+// 用于 byte-level diff:外接 ApiKey 路径(post-envelope-helper) vs 容器 CCB 路径,
+// 验证 Phase 7 §3.5.2 normalization 后两边给 api.anthropic.com 的字节真的对齐。
+//
+// 默认 off:env 未设 → counter=0 → 整个 dump 块走 0 次。
+// 启用:`OC_DUMP_OUTBOUND_N=4` + restart,接下来 4 个请求各 dump 一次,自动停。
+// 验收完毕:unset env + remove 本块代码(下一次 deploy 一起清掉)。
+let dumpRemaining = (() => {
+  const raw = Number.parseInt(process.env.OC_DUMP_OUTBOUND_N ?? "0", 10);
+  if (!Number.isFinite(raw) || raw < 0) return 0;
+  return raw;
+})();
+
 // ─── 上下文 ────────────────────────────────────────────────────────────────
 
 /**
@@ -162,6 +176,25 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       messages: upstreamMessages,
       stream: true,
     });
+
+    // 临时 outbound dump(v1.0.184 一次性观测,默认 off — 见模块顶 dumpRemaining 注释)
+    if (dumpRemaining > 0) {
+      dumpRemaining--;
+      const headersRedacted: Record<string, string> = { ...safeHeaders };
+      for (const k of Object.keys(headersRedacted)) {
+        const lk = k.toLowerCase();
+        if (lk === "authorization" || lk === "x-api-key") {
+          headersRedacted[k] = "[REDACTED]";
+        }
+      }
+      userLog.info("outbound_dump", {
+        method: "POST",
+        endpoint: session.endpoint,
+        headers: headersRedacted,
+        body_json: upstreamBodyJson,
+        remaining: dumpRemaining,
+      });
+    }
 
     const fetchInit: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
