@@ -699,6 +699,72 @@ describe('CcbMessageParser: system', () => {
     parser.parse({ type: 'system', subtype: 'task_started', task_id: 't1' } as any)
     assert.equal(events.length, 0)
   })
+
+  // Plan 2 (compact-progress-frame) — system.status 转 kind:'turn_status'
+  // 受控枚举(coreSchemas.ts:SDKStatusSchema 只 'compacting' | null),parser 不
+  // 透传 CCB raw 字符串。未来 CCB 加新 status 时,gateway 没显式映射会被 normalize
+  // 到 null,前端永远只看到受控值。这套测试覆盖:
+  //   1) 'compacting' 直通
+  //   2) null 直通(compact_end)
+  //   3) 其它字符串 normalize 到 null(防 CCB 偷偷扩枚举)
+  //   4) 不影响 bash_output_tail 路径(同一 system 分支内)
+  it('emits turn_status compacting for system status compacting', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'status',
+      status: 'compacting',
+      session_id: 'sess-1',
+      uuid: 'u-1',
+    } as any)
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'turn_status')
+    if (events[0].kind === 'turn_status') {
+      assert.equal(events[0].status, 'compacting')
+    }
+  })
+
+  it('emits turn_status null for system status null (compact_end)', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'status',
+      status: null,
+      session_id: 'sess-1',
+      uuid: 'u-2',
+    } as any)
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'turn_status')
+    if (events[0].kind === 'turn_status') {
+      assert.equal(events[0].status, null)
+    }
+  })
+
+  it('normalizes unknown status string to null (guards against CCB enum drift)', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'status',
+      status: 'restoring',
+      session_id: 'sess-1',
+    } as any)
+    parser.parse({
+      type: 'system',
+      subtype: 'status',
+      status: 42,
+      session_id: 'sess-1',
+    } as any)
+    parser.parse({
+      type: 'system',
+      subtype: 'status',
+      session_id: 'sess-1',
+    } as any)
+    assert.equal(events.length, 3)
+    for (const ev of events) {
+      assert.equal(ev.kind, 'turn_status')
+      if (ev.kind === 'turn_status') assert.equal(ev.status, null)
+    }
+  })
 })
 
 // ── Phase 1: durable tools[] collection on TurnResult ──

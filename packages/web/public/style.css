@@ -2753,6 +2753,11 @@ a:hover {
 .typing-indicator.stale-warn .typing-label { color: var(--fg-muted); font-weight: 500; }
 .typing-indicator.stale-danger .typing-label { color: var(--fg-muted); font-weight: 600; }
 
+/* Plan 2 (compact-progress-frame) — CCB auto-compact 期间的视觉标记。
+ * 非红色警告 / 非"卡死"暗示 — boss 看到的是 "在压缩,继续等"。色调与 fg-muted
+ * 同列,加一点 accent 让用户知道这是个独立 phase(不是普通 stale-warn)。 */
+.typing-indicator.compacting .typing-label { color: var(--accent, var(--fg-muted)); font-weight: 500; }
+
 /* Meta line under assistant message */
 .msg-meta {
   font-size: var(--text-xs);

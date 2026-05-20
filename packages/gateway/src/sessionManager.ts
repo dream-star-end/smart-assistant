@@ -125,6 +125,20 @@ export interface AgentSession {
    *  agents.yaml 允许 provider 字段缺省,所以这里也允许 undefined。
    */
   agentProvider?: string
+  /**
+   * 当前 turn 的 backend-side 非流式阶段状态。
+   *
+   * 当前唯一非 null 值是 `'compacting'` —— CCB auto/manual compact 期间走单独
+   * LLM 调用,这段时间不产生 assistant token,前端如果只看流量会以为卡死。
+   * server.ts 在收到 `kind:'turn_status'` 事件时更新此 cache 并 deliver 帧;
+   * turn 终态(final/error)清回 null。autoResumeFromHello 在 ring replay
+   * 之后,如果 runner 仍在跑且 cache !== null,补发一帧给重连的客户端
+   * (兜底 ring eviction 导致原 compact_start 帧已被冲掉的情况)。
+   *
+   * 不持久化、不跨进程 —— gateway 重启后默认 null(下次 compact_start 自然
+   * 把它推到 'compacting',不依赖任何持久状态)。
+   */
+  currentTurnStatus?: 'compacting' | null
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -1070,6 +1084,12 @@ export class SessionManager {
     })
     // Monitor subprocess crashes — emit event so gateway can notify connected clients
     runner.on('exit', (info: { code: number | null; signal: string | null; crashed: boolean }) => {
+      // 子进程退出 → 清空 turn_status 缓存。crashed/正常 exit 都清:正常 exit
+      // 意味着没有 in-flight turn(也就不会还有 compacting);crashed 期间如果
+      // 恰好在 compact 中,这帧 cache 没有 turn_status:null 来源(子进程死了
+      // 不会再 emit setSDKStatus(null)),不清会让后续 autoResumeFromHello
+      // 误推 compacting 给重连客户端。
+      session.currentTurnStatus = null
       if (info.crashed) {
         log.warn('subprocess crashed', { sessionKey: opts.sessionKey, code: info.code, signal: info.signal })
         // If the most recent turn failed because the --resume session id on

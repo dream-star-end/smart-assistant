@@ -439,17 +439,20 @@ test('structural: _sendStampedSessionFrame body funnels through _stripPrivateRou
   )
 })
 
-test('structural: dispatchInbound uses _inheritOutboundRouting for derived frames (4 callsites)', () => {
+test('structural: dispatchInbound uses _inheritOutboundRouting for derived frames (5 callsites)', () => {
   // The architectural change in CG7 routes derived frames through one helper.
   // Drift detection: if a future PR re-introduces a hand-spread sessionKey/
   // channel/peer in a derived frame, this count drops and the assertion fails.
   // Use comment-stripped body so JSDoc references in the main `out` literal
   // (e.g. "derived frames copy traceId via `_inheritOutboundRouting(out)`")
   // don't false-positive count as call sites.
+  //
+  // Plan 2 (compact-progress-frame) — bumped 4 → 5 with `turnStatusFrame`.
+  // Derived frames now: errFrame×2 / permFrame / billingFrame / turnStatusFrame.
   const calls = dispatchBodyNoComments.match(/_inheritOutboundRouting\(\s*out\s*\)/g) ?? []
   assert.equal(
     calls.length,
-    4,
-    `expected exactly 4 _inheritOutboundRouting(out) callsites (errFrame×2 / permFrame / billingFrame), got ${calls.length}`,
+    5,
+    `expected exactly 5 _inheritOutboundRouting(out) callsites (errFrame×2 / permFrame / billingFrame / turnStatusFrame), got ${calls.length}`,
   )
 })

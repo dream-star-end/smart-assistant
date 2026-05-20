@@ -31,6 +31,7 @@ import {
   type OutboundCodexBilling,
   type OutboundError,
   type OutboundMessage,
+  type OutboundTurnStatus,
   type Peer,
   newTraceId,
   parseTraceIdCandidate,
@@ -5886,6 +5887,34 @@ export class Gateway {
         }
       }
 
+      // Plan 2 (compact-progress-frame) — 在 ring replay 之后,如果 runner 仍在跑
+      // 且 session.currentTurnStatus !== null,补发一帧 outbound.turn_status 给本次
+      // 重连的 ws。覆盖 "压缩进行中客户端断网 + ring 已冲掉原 compact_start 帧"
+      // 这种 ring-replay 兜不住的边角:
+      //   - 正常短暂断网:ring 仍持有 compact_start,replay 就够了 → cache 这帧
+      //     会被前端识别成幂等(已在 compacting,再来一帧仍 compacting,无副作用)
+      //   - 长 compact + 长断网 + ring 满:replay 拿不回 compact_start,这里兜底
+      //   - runner 已停:不发(turn 已结束,前端会收到 ring 里的 isFinal 或者
+      //     紧跟着的 turn-interrupted isFinal,自行清空 UI 状态)
+      // 单 ws send(只给本次 hello 的 client 看,不是所有 peerKey),与下方
+      // synthetic isFinal 同模式 —— 不走 deliver(),避免把同一帧再 ring + 广播。
+      if (session && session.runner.isRunning && session.currentTurnStatus !== null) {
+        try {
+          const turnStatusFrame = JSON.stringify({
+            type: 'outbound.turn_status',
+            sessionKey,
+            channel: 'webchat',
+            peer: { id: peerId, kind: 'dm' },
+            status: session.currentTurnStatus,
+            ts: Date.now(),
+          })
+          ws.send(turnStatusFrame)
+          this.log.info('auto-resume rebroadcast turn_status', {
+            sessionKey, status: session.currentTurnStatus,
+          })
+        } catch {}
+      }
+
       // Push a synthetic isFinal to the reconnected client for sessions that the client
       // reports as in-flight (had _sendingInFlight=true) but whose subprocess is not
       // currently running. This clears the client's stuck _sendingInFlight state from
@@ -6069,7 +6098,7 @@ export class Gateway {
           error: decision.error,
           reason: decision.reason,
         })
-        this.deliver(errFrame as unknown as OutboundMessage, adapter)
+        this.deliver(errFrame, adapter)
         return
       }
       if (decision.agentId !== agent.id) {
@@ -6124,7 +6153,7 @@ export class Gateway {
       this.log.warn('codex-native agent invoked without explicit model — rejected', {
         agentId: agent.id,
       })
-      this.deliver(errFrame as unknown as OutboundMessage, adapter)
+      this.deliver(errFrame, adapter)
       return
     }
 
@@ -6597,7 +6626,7 @@ export class Gateway {
               detail: _b0.text,
               isFinal: false,
             }
-            this.deliver(errFrame as unknown as OutboundMessage, adapter)
+            this.deliver(errFrame, adapter)
             return
           }
         }
@@ -6617,6 +6646,12 @@ export class Gateway {
           this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
         }
       } else if (e.kind === 'final') {
+        // Plan 2 — turn 终态前先清 turn_status cache。CCB 正常关 compact 会先
+        // emit setSDKStatus(null)(parser → kind:'turn_status' status:null),
+        // cache 在那一帧已经清空;这里是兜底:如果 CCB 因任何原因没发 status:null
+        // 就直接到 final(异常退出 / parse error 跳过 status 帧),也保证 cache
+        // 不会粘住。前端拿到 isFinal=true 自然回到空闲态,不依赖额外帧。
+        session.currentTurnStatus = null
         if (_apiErrorIntercepted) {
           // 替代原 final:发 [error] text final 关闭 turn。不附 e.meta(boss
           // 决策:错误卡不显示 cost),与 e.kind === 'error' 分支一致;runLog
@@ -6718,6 +6753,28 @@ export class Gateway {
             })
           }
         }
+      } else if (e.kind === 'turn_status') {
+        // Plan 2 (compact-progress-frame) — CCB setSDKStatus 侧信道。CcbMessageParser
+        // 把 stdout `{type:'system', subtype:'status', status:'compacting'|null}` 转成
+        // 这条事件,server.ts 包装成 outbound.turn_status 走 deliver() 路径下发,顺手
+        // 更新 session-level cache(autoResumeFromHello 兜底用)。
+        //
+        // 协议要点(对应 protocol/frames.ts OutboundTurnStatus 注释):
+        //   - 受控枚举:CCB 当前只 emit 'compacting' | null,parser 已做 normalize
+        //   - **入 outboundRing**:走 deliver() 默认路径,让 ring replay 自然覆盖
+        //     "compact 中客户端短暂断网" 场景;长 compact 导致 ring 冲掉的边角由
+        //     autoResumeFromHello 的 cache 兜底补发
+        //   - 与 codex_billing 同模式:routing tuple + traceId 都从 main `out` 继承,
+        //     deliver() 的 _userId 路由也走 _inheritOutboundRouting 自动带上
+        session.currentTurnStatus = e.status
+        const turnStatusFrame: OutboundTurnStatus & { _userId?: string } = {
+          type: 'outbound.turn_status',
+          ..._inheritOutboundRouting(out),
+          status: e.status,
+        }
+        // ts / frameSeq 由 deliver() 在 ring 落地时一并 stamp,这里不预填
+        // (与 outbound.codex_billing / outbound.error 同 wire stamp 模式)。
+        this.deliver(turnStatusFrame, adapter)
       } else if (e.kind === 'codex_billing') {
         // PR2 v1.0.66 — codex turn 终态侧信道。CodexAppServerRunner.emitResult 把
         // server-owned requestId 回带,sessionManager 转成 'codex_billing' 事件,
@@ -6750,8 +6807,10 @@ export class Gateway {
           // optional 字段缺省时自然不带,与旧版本 master 向后兼容。
           ...(e.rateLimits ? { rateLimits: e.rateLimits } : {}),
         }
-        this.deliver(billingFrame as unknown as OutboundMessage, adapter)
+        this.deliver(billingFrame, adapter)
       } else if (e.kind === 'error') {
+        // Plan 2 — turn 终态前清 turn_status cache,语义同 final 分支。
+        session.currentTurnStatus = null
         this._runLog.complete(_run, { status: 'failed', error: e.error })
         // Remove idempotency key on failure to allow client retry
         if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
@@ -6771,7 +6830,7 @@ export class Gateway {
             detail: e.error,
             isFinal: false,
           }
-          this.deliver(errFrame as unknown as OutboundMessage, adapter)
+          this.deliver(errFrame, adapter)
         }
         this.deliver(
           {
@@ -6785,7 +6844,23 @@ export class Gateway {
     }, safeEffortLevel, safeModel, safeRequestId, turnTraceId)
   }
 
-  private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {
+  /**
+   * Outbound frame egress — WS broadcast + outboundRing + optional adapter fan-out.
+   *
+   * 入参 union 反映协议演化:历史上只发 OutboundMessage,后续加了 OutboundError /
+   * OutboundCodexBilling / OutboundTurnStatus(后两个是 sideband:不带 .blocks,
+   * adapter (Telegram / 微信) 假设的 OutboundMessage 形状)。union 起来后:
+   *   - sideband type literal 比较 (`wire.type === 'outbound.turn_status'`) 合法
+   *   - caller 不再需要 `as unknown as OutboundMessage` 强转(那是协议演化债,
+   *     现在统一清掉,deliver 类型签名直接承认所有合法 deliverable shape)
+   *
+   * 内部访问的只是 `.type / .channel / .peer / .sessionKey`,这些字段在 union 的
+   * 四个成员上都有(交集字段),所以 narrowing 不需要,直接读即可。
+   */
+  private deliver(
+    out: OutboundMessage | OutboundError | OutboundCodexBilling | OutboundTurnStatus,
+    adapter?: ChannelAdapter,
+  ): void {
     // V3 S12e CG6 — strip ALL private routing fields up-front (`_userId`,
     // `_traceId`, `_connectionTraceId`, `_peerId`)so BOTH adapter and WS
     // branches only ever see the clean wire shape. CG7 will start writing
@@ -6795,12 +6870,33 @@ export class Gateway {
     // strip site every time it adds a new private field. Keeping stripped
     // values locally lets WS branch still route per-user.
     const { wire, userId: stampedUserId } = _stripPrivateRoutingFields(out)
-    if (adapter) {
+    // Plan 2 (compact-progress-frame) — sideband frame 跳过 adapter,只走 WS。
+    // 背景:adapter (Telegram / 微信等) 的契约是 `OutboundMessage` 形状(.blocks
+    // 必存,见 channels/telegram/src/index.ts:96 `for (const b of out.blocks)`),
+    // 但 outbound.turn_status 没有 blocks,强发会让 adapter 在迭代 .blocks 时抛
+    // TypeError,被 catch 后只留下日志噪声。turn_status 本身就是给 webchat
+    // typing-indicator UX 用的 sideband,Telegram 用户不会看 "压缩中" 提示。
+    //
+    // 注:OutboundCodexBilling / OutboundError 同型问题(都没 .blocks),adapter
+    // 分支同样会因 `for (const b of out.blocks)` 抛错被 catch。codex_billing 当前
+    // 不实际触发(没有 codex+telegram 生产组合);OutboundError 在 telegram 路径
+    // 上 insufficient_credits / rate_limited / upstream_failed 时会触发,但已存在
+    // 历史,被 telegram.send 的 catch 静默成 error log。本 PR 不顺手修这条线,留
+    // 作独立 "non-message outbound vs adapter contract" 清理(届时 isSideband 白
+    // 名单一并扩到 outbound.codex_billing / outbound.error,或重新设计 adapter
+    // 协议让它能 dispatch 非 message 帧)。
+    const isSideband = wire.type === 'outbound.turn_status'
+    if (adapter && !isSideband) {
       adapter.send(wire as OutboundMessage).catch((err) =>
         this.log.error('adapter send failed', { channel: adapter.name }, err),
       )
       return
     }
+    // adapter && isSideband:fall-through 到 WS 广播路径。peerKey 用 channel +
+    // peer.id 索引,Telegram 来源的 turn_status 找不到 ws client → noop,符合
+    // "sideband 对非 webchat channel 不可见" 的语义。ring 仍会 store(本帧带
+    // sessionKey),但因为 telegram channel 不走 hello-resume,store 不消费,
+    // 略浪费但无害,不值得为此再分一条 ring 路径。
     // WebChat: broadcast to all ws clients at the same (userId, channel, peer).
     // userId is read from the `_userId` stamp that callers put on the out
     // frame when they know it. If absent (legacy cron / shutdown paths),

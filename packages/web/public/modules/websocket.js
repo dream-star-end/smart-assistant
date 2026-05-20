@@ -282,6 +282,11 @@ export function clearTurnTiming(sess) {
   // 必须清掉,避免下一轮没必要地继续显示 "容器首次加载中"。挂在这里覆盖所有 teardown
   // 路径(handleOutbound isFinal / outbound.error / sendStop / handleResumeFailed)。
   sess._isFirstTurnAfterReady = false
+  // Plan 2 (compact-progress-frame)— turn 结束兜底清 _turnStatus。
+  // 正常路径下,CCB compact_end 会推 outbound.turn_status status:null 把 cache 清零;
+  // 但 turn 末态没必要再发独立 null 帧时(early error/abort),这里保证 typing 文案不
+  // 粘在 "正在压缩上下文" 上。teardown 覆盖与 _isFirstTurnAfterReady 同模式。
+  sess._turnStatus = null
 }
 
 // Cold-start hint 后缀:仅当 sess._isFirstTurnAfterReady 为 true 时附加。
@@ -320,6 +325,17 @@ export function showTypingIndicator() {
     // 长思考态(stale-warn / stale-danger)不拼 cold-hint —— 信息已饱和,
     // 再加冗长后缀只会噪声。hint 仅在 "正常思考中" 文案出现。
     const hint = _coldHintSuffix(_sess)
+    // Plan 2 (compact-progress-frame)— compacting 分支优先级高于 stale-warn /
+    // stale-danger:CCB compact 期间走单独 LLM 调用,几十秒到几分钟无 stream,
+    // 走 stale 文案会让用户以为卡死;走 compacting 明确告诉用户"在压缩,继续等"。
+    // 同 secs 计数(本帧 elapsed = turn 启动至今,跨 compact_start 也保留)。
+    if (_sess?._turnStatus === 'compacting') {
+      label.textContent = `${name} 正在压缩上下文 (${secs}s)`
+      el.classList.remove('stale-warn', 'stale-danger')
+      el.classList.add('compacting')
+      return
+    }
+    el.classList.remove('compacting')
     // 文案中性化(不再"可能已卡住"红字),但保留"无新数据时长"诊断指标 ——
     // tool-use 5-10min 静默时 silence 数值是用户判断"真在工作 vs 真断流"的
     // 唯一前端线索,删了就只能等 gateway idle timeout 兜底,诊断盲区太长。
@@ -1692,6 +1708,7 @@ export function connect() {
         return
       }
       if (f.type === 'outbound.message') handleOutbound(f)
+      else if (f.type === 'outbound.turn_status') handleOutboundTurnStatus(f)
       else if (f.type === 'outbound.error') handleOutboundError(f)
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
@@ -2944,6 +2961,68 @@ function handleColdStart(_frame) {
   label.textContent = secs >= 5
     ? `${name} 思考中 (${secs}s) · 容器首次加载中,稍候`
     : `${name} 思考中 · 容器首次加载中,稍候`
+}
+
+// Plan 2 (compact-progress-frame)— outbound.turn_status 处理。
+// gateway 在 CCB setSDKStatus('compacting') / setSDKStatus(null) 时发本帧,标记
+// 当前 turn 进入 / 离开 "非流式后台阶段"(目前唯一非 null 值是 'compacting')。
+//
+// 本 handler 的责任:
+//   1) frameSeq dedupe(与 handleOutbound / handleOutboundError 同语义,resume
+//      replay 必然走 ring 重发);
+//   2) 把 status 写到 sess._turnStatus,typing-indicator 1s tick 自然切到压缩文案;
+//   3) 已经 mount 的 typing-indicator 主动改一次 DOM,与 handleColdStart 同模式
+//      避免等下一 tick 才更新(compact_start 通常在 typing 已 mount 之后到达)。
+//
+// 故意不在这里 hideTypingIndicator / 不动 _sendingInFlight:
+// status:null 仅表示 compact 结束、回到正常流式,turn 仍在跑,UI 自然回到 "思考中";
+// turn 真正结束由 isFinal / error 帧负责。
+//
+// 故意不动 _turnStartedAt:compact 期间整段计入本 turn 总耗时(用户视角是一次完整 turn)。
+//
+// 但**必须** markFrameReceived(刷 _lastFrameAt):turn_status 帧本质上是 "backend
+// 还活着" 的 liveness signal,跟 outbound.message 同等。如果不刷,长 compact 结束
+// 收到 status:null 后,下一 tick 会立刻进入 stale-warn/danger("几百秒无新数据"),
+// 把 "compact 完了" 的明确信号反倒覆盖成 "可能卡住"。stale 状态机应该从 "compact
+// 真正结束" 这一刻开始计时 —— 这才是用户视角真正的 "无新数据"。
+function handleOutboundTurnStatus(frame) {
+  const peerId = frame.peer?.id
+  const sess = peerId ? state.sessions.get(peerId) : null
+  if (!sess) return
+  // frameSeq dedupe — 与 handleOutbound 同语义。ring replay 时本帧会重发,这里去重。
+  if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
+    const last = sess._lastFrameSeq || 0
+    if (frame.frameSeq <= last) return
+    sess._lastFrameSeq = frame.frameSeq
+  }
+  // turn_status 是 session liveness signal — 跟 outbound.message 同语义刷 _lastFrameAt。
+  // 进入 compacting 时刷 → "0s 无新数据" 重新起算(typing-indicator 走 compacting 分支
+  // 时不显示 silence 数,但 cache 有意义,因为 status:null 帧也走这条路径)。退出
+  // compacting(status:null)时刷 → 下一 tick 显示 "AI 思考中(silence=0s)" 而不是
+  // 几百秒。详见上方 block 注释。
+  markFrameReceived(sess)
+  // 受控枚举校验:gateway 端 parser 已 normalize,前端再防御一次。
+  const status = frame.status === 'compacting' ? 'compacting' : null
+  sess._turnStatus = status
+  // 主动改 typing-indicator DOM(若已 mount),避免等下一 1s tick。
+  // 只改当前可见 session,跨 session 切换自然走 tick 路径。
+  if (sess.id !== state.currentSessionId) return
+  const el = document.getElementById('__typing')
+  if (!el) return
+  const label = el.querySelector('.typing-label')
+  if (!label) return
+  const agentInfo = state.agentsList.find((a) => a.id === (sess.agentId || state.defaultAgentId))
+  const name = agentInfo?.displayName || sess.agentId || 'AI'
+  const startedAt = sess._turnStartedAt || Date.now()
+  const secs = Math.round((Date.now() - startedAt) / 1000)
+  if (status === 'compacting') {
+    label.textContent = `${name} 正在压缩上下文 (${secs}s)`
+    el.classList.remove('stale-warn', 'stale-danger')
+    el.classList.add('compacting')
+  } else {
+    el.classList.remove('compacting')
+    // 不主动改回 "思考中" 文案 —— 下一 1s tick 自然处理,避免与 stale 状态机抢写
+  }
 }
 
 function handleOutboundError(frame) {
