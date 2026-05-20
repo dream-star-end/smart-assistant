@@ -719,11 +719,11 @@ describe("wechatBroker — onInbound", () => {
     const { sendText } = makeSendText({ throwSync: new Error("synchronous boom") })
     const { dispatcher } = makeDispatcher({ kind: "command_echo", reply: "x" })
     const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
-    // 不应 throw。如果 sendText 同步 throw 冒泡过 fire-and-forget 包裹层,这里会变 reject
+    // 不应 throw。如果 sendText 同步 throw 冒泡过 fire-and-forget 包裹层,
+    // 这里 await 会变 reject;能走到下面 assert.equal 即说明没冒泡。
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
-    assert.ok(true)
   })
 
   test("反射:sendText **异步** reject 不影响 onInbound 返回(swallow + log)", async () => {
@@ -733,7 +733,6 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
-    assert.ok(true)
   })
 
   test("反射:sendText 返 ok=false permanent → 不冒泡,outcome 不变", async () => {
@@ -753,7 +752,6 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
-    assert.ok(true)
   })
 })
 

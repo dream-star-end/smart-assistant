@@ -487,6 +487,11 @@ export async function settleUsageAndLedger(
     } catch (err) {
       // 23505 = unique_violation;复用 (user_id, request_id) 上的 UNIQUE
       if (isUniqueViolation(err)) {
+        // PG transaction 撞 23505 后整个 tx 进入 aborted state,
+        // 后续语句直到 ROLLBACK/COMMIT 前全部报 25P02。
+        // 幂等路径只需读出另一并发 tx 已提交的行,不再走本事务内 ledger 写入,
+        // 因此先 ROLLBACK 结束 aborted tx,SELECT 走 autocommit 读已提交行即可。
+        await client.query("ROLLBACK");
         const sel = await client.query<{ id: string; ledger_id: string | null }>(
           `SELECT id::text AS id, ledger_id::text AS ledger_id
              FROM usage_records WHERE user_id=$1 AND request_id=$2`,
@@ -494,7 +499,6 @@ export async function settleUsageAndLedger(
         );
         if (sel.rowCount === 0) throw err;
         const r = sel.rows[0]!;
-        await client.query("COMMIT");
         // 重试时无法重新算 clamp(原始 balance 已变),保守标 false。
         // metric 只对首次 settle 路径完整反映 — 重复 settle 是边界场景,
         // 由 inflight 兜底,clamp 状态以原 ledger memo 为准(非 metric 来源)。

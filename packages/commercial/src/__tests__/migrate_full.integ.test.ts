@@ -15,7 +15,8 @@ import { runMigrations } from "../db/migrate.js";
  *   - credit_ledger 的 append-only RULE 仍生效(回归)
  *   - admin_audit 的 append-only RULE 生效(新增)
  *
- * 复用 T-02 integ 的 fixture(同一 docker compose),但用独立 suite 做隔离。
+ * 复用 T-02 integ 的 fixture(同一 PG 实例),但用独立 suite 做隔离。
+ * fixture 启动方式见 packages/commercial/README.md。
  */
 
 const TEST_DB_URL =
@@ -76,7 +77,7 @@ before(async () => {
     if (REQUIRE_TEST_DB) {
       throw new Error(
         "Postgres test fixture required (CI=true or REQUIRE_TEST_DB=1). " +
-          "Start it: docker compose -f tests/fixtures/docker-compose.test.yml up -d",
+          "See packages/commercial/README.md for bootstrap.",
       );
     }
     return;

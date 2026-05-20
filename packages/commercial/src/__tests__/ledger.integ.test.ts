@@ -82,7 +82,7 @@ before(async () => {
     if (REQUIRE_TEST_DB) {
       throw new Error(
         "Postgres test fixture required (CI=true or REQUIRE_TEST_DB=1). " +
-          "Start it: docker compose -f tests/fixtures/docker-compose.test.yml up -d",
+          "See packages/commercial/README.md for bootstrap.",
       );
     }
     return;

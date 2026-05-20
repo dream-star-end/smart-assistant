@@ -13,7 +13,7 @@ import { runMigrations, MigrationIntegrityError } from "../db/migrate.js";
  * 与 db.integ 共用测试库(openclaude_test),但每个 test 前先 DROP 掉商业化相关的表,
  * 保证干净起点。库名硬要求以 `_test` 结尾 —— 防止手滑跑到生产库。
  *
- * 需要先 `docker compose -f tests/fixtures/docker-compose.test.yml up -d`。
+ * 需要本地起 PG/Redis fixture — 见 packages/commercial/README.md。
  * CI 或 REQUIRE_TEST_DB=1 时,pg 未就绪 → 直接 fail(不 skip)。
  */
 
@@ -78,7 +78,7 @@ before(async () => {
     if (REQUIRE_TEST_DB) {
       throw new Error(
         "Postgres test fixture required (CI=true or REQUIRE_TEST_DB=1). " +
-          "Start it: docker compose -f tests/fixtures/docker-compose.test.yml up -d",
+          "See packages/commercial/README.md for bootstrap.",
       );
     }
     return;
