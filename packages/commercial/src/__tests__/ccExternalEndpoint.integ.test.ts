@@ -957,3 +957,222 @@ describe("last_used_at throttle — 5min in-process LRU 端到端 wired", () => 
     assert.equal(h.apiKeyRepoSpy.touchLastUsedCalls.length, 2, "5min 后 → 再 bump");
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// (9) Phase 7 §3.5.2 — 出站 envelope 归一化端到端(invariant #11)
+//
+// 这些 case 与 externalEnvelope.unit.test.ts 的关系:unit 直接调 helper 验
+// system 形态变换;integ 走完整 createCommercialHandler → strategy →
+// runUpstreamRoundTrip 路径,断言**最终序列化到上游的 outbound JSON**(在
+// core.ts:160 `JSON.stringify({...body, messages: upstreamMessages, stream: true})`
+// 之后,fetch 拦截器看到的 body)同时含 sysprompt prefix(envelope helper 注入)
+// **和** metadata.user_id device_id pin(applyUpstreamAuth 后续阶段注入)。
+//
+// Codex Phase 7 plan-review MINOR:必须断 outbound body 而非 helper 输出,
+// 否则 helper 与后续 applyUpstreamAuth 的合作性破裂(职责拆分点)只有 integ
+// 能锁住。
+//
+// 负例选 "DeepSeek 路径" 而非 "容器路径":本文件 IdentityStrategy 是
+// ApiKey,containerId 恒为 null,机械上无法构造容器路径请求;DeepSeek 路径
+// (`route.kind !== "oauth"`)是 §3.5.2 predicate 的另一半,同样需要锁住。
+// 容器路径的 envelope skip 在 anthropicProxy.integ.test.ts 既有 happy 用例
+// 隐式覆盖(那里 IdentityStrategy 是 container,outbound body 历来无 CC prefix
+// 注入 — 本 Phase 7 改动不会破坏该不变量,因为 predicate 第一项 `containerId
+// === null` 就过滤掉了)。
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 捕获 upstream fetch 的请求 body(POST 给 Anthropic / DeepSeek 的最终 JSON)。
+ * 返回 [fetchImpl, getCapturedBody]。fetchImpl 应注入 buildHarness(fetchImpl: ...)。
+ *
+ * 设计:不预解析,只存原始 string;断言侧 JSON.parse 后看结构,失败时可直接
+ * 打印 raw 字节排查。
+ */
+function makeCapturingFetch(): {
+  fetchImpl: typeof fetch;
+  getBody(): string | undefined;
+} {
+  let captured: string | undefined;
+  const fetchImpl: typeof fetch = (async (
+    _url: string | URL,
+    init?: RequestInit,
+  ) => {
+    if (init?.body && typeof init.body === "string") {
+      captured = init.body;
+    }
+    return sseResponse(200, makeFullSseChunks());
+  }) as unknown as typeof fetch;
+  return { fetchImpl, getBody: () => captured };
+}
+
+describe("Phase 7 §3.5.2 出站 envelope — invariant #11 端到端", () => {
+  test("正例 1:客户端无 system / 无 metadata → outbound 含 CC prefix block + cache_control + metadata.user_id device_id", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    // body 不含 system / 不含 metadata
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+
+    const raw = cap.getBody();
+    assert.ok(raw, "upstream fetch 必须收到 body");
+    const sent = JSON.parse(raw!) as Record<string, unknown>;
+
+    // (a) system 被归一化为 array,第一个 block 是 CC DEFAULT prefix + cache_control
+    assert.ok(Array.isArray(sent.system), `system 必须是 array;got=${typeof sent.system}`);
+    const systemArr = sent.system as Array<Record<string, unknown>>;
+    assert.ok(systemArr.length >= 1, "system 至少有 1 个 block");
+    const first = systemArr[0]!;
+    assert.equal(first.type, "text", "首 block type=text");
+    assert.equal(
+      first.text,
+      "You are Claude Code, Anthropic's official CLI for Claude.",
+      "首 block.text = CC DEFAULT prefix(字面 byte 匹配)",
+    );
+    assert.deepEqual(
+      first.cache_control,
+      { type: "ephemeral" },
+      "注入 block 必带 cache_control: ephemeral(降本)",
+    );
+
+    // (b) device_id pin 也已 injected(envelope helper 与 applyUpstreamAuth 合作)
+    assert.ok(sent.metadata && typeof sent.metadata === "object", "metadata 存在");
+    const meta = sent.metadata as Record<string, unknown>;
+    assert.equal(typeof meta.user_id, "string", "metadata.user_id 是 string(JSON-encoded)");
+    const userIdParsed = JSON.parse(meta.user_id as string) as Record<string, unknown>;
+    assert.equal(
+      userIdParsed.device_id,
+      FIXED_PINNED_USER_ID,
+      "metadata.user_id.device_id = 账号绑定的 pinned_user_id",
+    );
+  });
+
+  test("正例 2:客户端发已含 CC prefix 的 system(string 形态)→ envelope skip,不重复 prepend;device_id pin 仍生效", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    // 客户端模拟容器 CCB 行为:system 是 string 形态,且以 CC DEFAULT prefix 开头
+    const ccSystemString =
+      "You are Claude Code, Anthropic's official CLI for Claude.\n\nYou are an interactive CLI tool that helps users...";
+    const res = await h.run({
+      body: { ...minBody(), system: ccSystemString },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+
+    const raw = cap.getBody();
+    assert.ok(raw, "upstream fetch 必须收到 body");
+    const sent = JSON.parse(raw!) as Record<string, unknown>;
+
+    // helper 把 string 归一化成 array,但因检测到 prefix → skip prepend;
+    // 期望 system = [{type:"text", text: <原 string>}],**没有**额外 prepend 的 cache_control block。
+    assert.ok(Array.isArray(sent.system), "归一化后是 array");
+    const systemArr = sent.system as Array<Record<string, unknown>>;
+    assert.equal(
+      systemArr.length,
+      1,
+      `skip 路径下不应 prepend 新 block;got len=${systemArr.length}`,
+    );
+    assert.equal(systemArr[0]!.type, "text");
+    assert.equal(systemArr[0]!.text, ccSystemString, "原 text 完整保留");
+    assert.equal(
+      systemArr[0]!.cache_control,
+      undefined,
+      "skip 路径下不注入 cache_control(原 string 形态本就没有)",
+    );
+
+    // device_id pin 仍然生效(envelope helper 不动 metadata,applyUpstreamAuth 兜底)
+    const meta = sent.metadata as Record<string, unknown>;
+    const userIdParsed = JSON.parse(meta.user_id as string) as Record<string, unknown>;
+    assert.equal(userIdParsed.device_id, FIXED_PINNED_USER_ID);
+  });
+
+  test("负例:DeepSeek 路径(route.kind !== 'oauth')→ envelope **不**注入 CC prefix", async () => {
+    // 构造 DeepSeek 路径:model 以 `deepseek-` 开头,deps.deepseekApiKey 已注入(避免 503),
+    // 用户 authz 含此 model。
+    const DS_MODEL = "deepseek-v4-pro";
+    const DS_PRICING: ModelPricing = {
+      ...FIXED_PRICING,
+      model_id: DS_MODEL,
+      display_name: "DeepSeek v4 Pro",
+    };
+    const cap = makeCapturingFetch();
+    // buildHarness 不支持注入 deepseekApiKey,手搓 minimal harness 段。
+    const pool = buildFakePool({});
+    setPoolOverride(pool as unknown as Pool);
+    const preCheckSpy = buildFakePreCheckRedis();
+    const rateLimitRedis = buildFakeRateLimitRedis();
+    const schedulerSpy = buildFakeScheduler();
+    const pricing = buildFakePricing([FIXED_PRICING, DS_PRICING]);
+    const apiKeyRepoSpy = buildApiKeyRepoSpy();
+    const logEvents: Array<Record<string, unknown>> = [];
+    const testLogger = createLogger({
+      level: "trace",
+      base: { test: "ccExternalEndpoint.integ.deepseek" },
+      out: (line) => {
+        try { logEvents.push(JSON.parse(line) as Record<string, unknown>); }
+        catch { /* skip */ }
+      },
+    });
+    const apiKeyStrategy = makeApiKeyIdentityStrategy({
+      repo: apiKeyRepoSpy.repo,
+      pricing,
+      loadUserModelAuthz: async () => ({
+        role: "admin",
+        grantedModelIds: new Set<string>([DS_MODEL]),
+      }),
+    });
+    const externalApiKeyProxy = makeAnthropicProxyHandler({
+      pgPool: pool as unknown as Pool,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      scheduler: schedulerSpy.scheduler,
+      identity: apiKeyStrategy,
+      rateLimitRedis,
+      fetchImpl: cap.fetchImpl,
+      upstreamEndpoint: "https://upstream.test/v1/messages",
+      logger: testLogger,
+      deepseekApiKey: "test-deepseek-key", // ← 关键:避免 503
+    });
+    const deps: CommercialHttpDeps = {
+      jwtSecret: FIXED_JWT_SECRET,
+      mailer: { sendTemplate: async () => {} } as unknown as CommercialHttpDeps["mailer"],
+      redis: rateLimitRedis,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      externalApiKeyProxy,
+    };
+    const handler = createCommercialHandler(deps, { logger: testLogger });
+    const req = new MockReq({
+      headers: { authorization: `Bearer ${FIXED_TOKEN}` },
+      body: { ...minBody(DS_MODEL), system: "be helpful" },
+    });
+    const res = new MockRes();
+    await handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    const raw = cap.getBody();
+    assert.ok(raw, "upstream fetch 必须收到 body(DeepSeek 路径)");
+    const sent = JSON.parse(raw!) as Record<string, unknown>;
+
+    // 关键不变量:DeepSeek 路径下 system 必须保持客户端原值(string "be helpful"),
+    // **不**经 envelope 归一化、**不**被 prepend CC prefix。
+    assert.equal(
+      sent.system,
+      "be helpful",
+      `DeepSeek 路径下 system 不应被改写;got=${JSON.stringify(sent.system)}`,
+    );
+
+    // 反向断:确认 logEvents 里没有 `external_envelope_injected` / `external_envelope_skip`
+    // —— predicate 第二项 `route.kind === "oauth"` 应该把 DeepSeek 路径整段跳过。
+    const envelopeLogs = logEvents.filter((e) => {
+      const m = e.msg;
+      return m === "external_envelope_injected" || m === "external_envelope_skip";
+    });
+    assert.equal(
+      envelopeLogs.length,
+      0,
+      `DeepSeek 路径下不应调 envelope helper;got logs=${JSON.stringify(envelopeLogs)}`,
+    );
+
+    // 清理(本 case 没走 buildHarness,需手动)
+    // pool override 由 afterEach 兜底 resetPool。
+  });
+});

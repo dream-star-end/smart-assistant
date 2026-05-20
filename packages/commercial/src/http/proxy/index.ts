@@ -77,6 +77,7 @@ import {
 } from "./shared.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
+import { normalizeExternalApiKeyEnvelope } from "./externalEnvelope.js";
 
 // ─── 私有 helper ──────────────────────────────────────────────────────────
 
@@ -304,6 +305,25 @@ export function makeAnthropicProxyHandler(
           requestId,
         );
         return;
+      }
+
+      // 5d) CC 外接出站 envelope 归一化(2026-05-20 Phase 7 §3.5.2)。
+      //
+      // 仅"外接 ApiKey 路径 + OAuth 上游"双重命中才注入。强制把 outbound `body.system`
+      // 归一化成 CC 容器形态(含官方 sysprompt prefix),让上游 Anthropic anti-abuse
+      // 把外接请求和容器内 CC CLI 请求视作同源,防"同一 OAuth account 同时出现
+      // CC-shaped 和非 CC-shaped 流量"触发整池 429。
+      //
+      // **route.kind === "oauth" 判别**:DeepSeek 上游用独立 API key,无 OAuth pool /
+      // 无 anti-abuse fingerprinting,注入 CC prefix 只浪费 13 tokens 且对 deepseek 端
+      // 是"语义无关 prompt 污染"。容器路径(`containerId !== null`)同理跳过 — 容器
+      // 内 CCB 已自带 sysprompt,多余 mutate 反而破坏既有缓存命中。
+      //
+      // **必须在 `estimateInputTokens(body)` 之前**(Codex Phase 7 plan-review MINOR):
+      // 注入的 sysprompt prefix(~13 tokens)必须进 preCheck 估算 — 任何 mutate body 的
+      // 步骤都在 input token 估算之前,账务边界干净。详见 plan §3.5.2 / externalEnvelope.ts。
+      if (identity.containerId === null && route.kind === "oauth") {
+        normalizeExternalApiKeyEnvelope(body, userLog);
       }
 
       // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)

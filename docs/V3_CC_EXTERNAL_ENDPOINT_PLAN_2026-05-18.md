@@ -219,13 +219,121 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 - 若 boss 决定开放给第三方 SDK,只需删除 `resolve()` 顶部 UA gate 代码块 + 同步删 invariant #10 + 删测试 describe block。
 - 若需要支持额外白名单 UA(如 anthropic SDK 官方版本),改 regex 即可,**无外部 API 变化**(错误码、URL、token 形态、SQL schema 均不变)。
 
+### 3.5.2 出站信封归一化 — 强制 CC 指纹(2026-05-20 加,§3.5 同性质的根治型反风控闭锁)
+
+**问题陈述**(boss 2026-05-20 提出的"一类问题"识别):
+
+§3.5 UA gate 是**入站**门控,UA header 客户端可一行 `curl -A claude-cli/x.y.z` 伪造。一旦 UA gate 被绕过(或未来放宽),非 CC 形态的 body 会带着合法 `oc-cc.*` key 直接打到上游 OAuth pool — Anthropic 反风控会在 `claude_accounts` 维度看到"同一 account_uuid 既发 CC-shaped 又发 curl-shaped 请求",**整池被标 + 429 蔓延全平台**(2026-05-19 实测确认:无 CC sysprompt prefix 的 body 直接 429,有则 200)。
+
+UA gate 只解决"防误用 + 抬高门槛",不解决"恶意客户端伪造 UA 后用 wrong-shape body 污染整池"这条根本攻击向量。
+
+**决策**(2026-05-20 boss 授权"按你想法来,一定要根治,反风控是核心诉求,做好测试"):
+
+服务端在外接路径上**强制**把 outbound body 归一化成 CC 容器路径的等价形态 —— 任何客户端(curl / 第三方 SDK / 自研 wrapper)送什么 shape 都不重要,**上游 Anthropic 看到的请求和容器内 CC CLI 发出的请求形态一致**。
+
+**核心不对称**:UA gate 是"信任客户端声明 + 抬门槛",envelope normalization 是"完全不信客户端 shape,服务端权威重塑"。两者叠加 = 入站防误用 + 出站反风控双闭环,**任一被绕都不会破坏另一**。
+
+**理由**(站在系统架构师视角,消除"一类问题"):
+
+1. **反风控根治**:Anthropic 的 anti-abuse fingerprinter 在 OAuth account 维度跟踪请求形态。我们承诺"凡是从 commercial proxy 出去的 OAuth account 流量,都长得跟 CC 容器一样" — 容器路径 + 外接路径在上游视角同源,无法靠"形态混杂"做反向风控识别。这是 plan §3.2.4(`boundIp=sentinel`)/ §3.5(UA gate)思路的**根治延伸**:前两者把外接流量在我方日志上**标记**得跟容器不同(便于内部观测),但向上游**呈现**得跟容器一致(防风控)。
+2. **消除一类攻击**:不仅防"恶意客户端故意发 curl-shape",还自然防"用户写了 buggy SDK 漏了 sysprompt"、"老 client 不带 metadata"、"任何未来形态变迁"。所有"客户端 shape 不一致"的风险被服务端一次性吸收。
+3. **缓存命中保护**:Anthropic prompt cache 是内容指纹,sysprompt prefix block 是缓存边界第一块。强制注入让外接路径**每个 session 内**自身缓存稳定(同一 client 每次 request 第一块 byte-identical),session 内 90%+ 命中。跨 session / 跨用户的全局缓存命中本来就被 attribution header 差异打破(attribution header 携带 cc_version/entrypoint/fingerprint,服务端无法重建),这条不变;envelope normalization 不让缓存命中**更差**。
+4. **客户端零负担**:不要求客户端发任何特殊字段。第三方 SDK 哪怕只发 `{model, messages, max_tokens}` 最小 body,服务端也能把它升级成完整 CC envelope 上送。
+
+**位置**:`http/proxy/index.ts` handler 内,**在 `estimateInputTokens(body)` 之前**(`pickUpstream` / `preCheckWithCost` / `startInflightJournal` 之前),`identity.containerId === null && route.kind === "oauth"` 双重命中时调用 `normalizeExternalApiKeyEnvelope(body, log)`。
+
+**为什么加 `route.kind === "oauth"` 双判别**:DeepSeek 上游(`isDeepseekModel(model)` 命中时 `route.kind === "deepseek"`)用独立单一 `DEEPSEEK_API_KEY`,**无 OAuth pool / 无 Anthropic anti-abuse fingerprinting**。注入 CC sysprompt prefix 对 deepseek 端:(1) 浪费 ~13 tokens(deepseek 不识别 CC 指纹),(2) 注入 CC 字面文本是"语义无关 prompt 污染",影响 deepseek 模型的指令理解。本 helper 只服务"反 Anthropic OAuth pool 风控"这个具体目标,scope 严格限于 OAuth 上游。
+
+**为什么前置到 `estimateInputTokens` 之前**(Codex Phase 7 plan-review MINOR 采纳):注入的 sysprompt prefix(~13 tokens)必须计入 preCheck 估算,否则 reservation 与真实 input tokens 之间留下"unaccounted prefix"细缝。当前 prefix 只有 13 token、占请求体 < 0.1%,差异可忽略;但**账务边界要干净**:任何服务端 mutate body 的步骤都在 input token 估算之前发生,这样未来若 prefix 内容扩展或注入更多块,既有 reservation 公式自动覆盖,不留隐式 invariant。
+
+**为什么这里而非 strategy / core**:
+- **不在 strategy.resolve()**:resolve 只做"身份决断 + 副作用记账",绝不应改 body。strategy 与 body 解耦是 plan §3.2 / Phase 2 的核心抽象不变量。
+- **不在 core.ts**:core 的契约是"upstream round-trip 物理动作",不应感知"哪条 strategy 该归一化哪条不该"。`runUpstreamRoundTrip` 改签名会污染容器路径无关代码。
+- **不在 `applyUpstreamAuth`**:那是 session 层 secret/header/device_id 操作,加 envelope mutation 让职责蔓延(分裂注意点)。
+- **handler 层调用是最小耦合**:handler 已持有 `identity.containerId` 判别(`index.ts:159` 已读),body 也在 handler 上下文里,helper 单一函数无新 interface / 无新 plumbing,blast radius 严格限于 1 个分支 + 1 个新文件。
+
+**归一化规则**(idempotent,任何输入跑两次 = 跑一次):
+
+1. **system block 处理**:
+   - `body.system` 形态归一化:
+     - `undefined` / 缺失 → `[]`
+     - `string` → `[{type:"text", text: <string>}]`(沿用 Anthropic SDK 接受的两种形态,转成 array form 便于后续注入)
+     - `array` → 原样保留
+   - **检测**:遍历 array,看是否有任一 block 的 `text`(对 type:text block)以下列 3 个**官方 CC sysprompt prefix 之一**开头(case-sensitive,贴 Anthropic 指纹检测口径):
+     ```
+     You are Claude Code, Anthropic's official CLI for Claude.
+     You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.
+     You are a Claude agent, built on Anthropic's Claude Agent SDK.
+     ```
+     这 3 个常量在 `claude-code-best/src/constants/system.ts:10-12` 定义,服务端不引入 CCB 依赖、就地硬编码 + 注释指回源。
+   - **命中**(任何一个 prefix `startsWith` 命中)→ skip 注入,保留客户端原 system 不动(idempotent;同时避免双重注入 + 防过度防御)。
+   - **未命中** → 在 array 头部 prepend `{type:"text", text: "You are Claude Code, Anthropic's official CLI for Claude.", cache_control:{type:"ephemeral"}}`(选 DEFAULT_PREFIX 是上游对 OAuth account "1P" 路径最稳的形态;`ephemeral` cache_control 复刻容器路径 `splitSysPromptPrefix` 行为,让外接 session 内自身 cache 命中稳定)。
+
+2. **metadata 不动**:
+   - `applyUpstreamAuth` 的 `makeOAuthPoolUpstream` 路径(`upstream.ts:264-273`)已经无条件保证 `body.metadata.user_id` 是 `{"device_id":"<pinned 64hex>", ...}` JSON 字符串(`rewriteMetadataDeviceId(undefined, pinned)` 返 `{"device_id":pinned}` 最小 envelope,见 `shared.ts:327-329`)— **envelope normalization 不需要重复处理 metadata**,否则两处做同件事会职责不清。
+   - 兜底假设:`pinned_user_id` 由 0067 migration schema `NOT NULL + CHECK + UNIQUE` 强约束,production 不存在 breach;`applyUpstreamAuth` 的 `pinned_user_id_invariant_breach` 是脏数据兜底,生产路径必走 mutation 分支。
+
+3. **不注入 attribution header**(CCB `x-anthropic-billing-header: cc_version=...`):
+   - 容器路径的 attribution header 携带 `cc_version`(CC 版本 + fingerprint hash)、`cc_entrypoint`(cli/vscode/sdk)、`cc_workload`(cron/chat 等)、`cch` 可选 attestation token —— **服务端不持有这些信息**,任何伪造都给 Anthropic 提供更明确的反风控信号("有 fake attribution header 的请求"是比"无 attribution header"更糟的指纹)。
+   - 2026-05-19 实测确认:仅注入 sysprompt prefix + metadata.user_id 已足够让上游回 200,无需 attribution header。
+   - 故 envelope normalization 故意**不**伪造 attribution header,接受"外接路径无 attribution header"这点跨 session 缓存差异(session 内仍 byte-stable)。
+
+4. **cache_control 健壮性**:
+   - Anthropic API 限制 `cache_control` 总块数 ≤ 4(system + tool + messages 合计)。
+   - 若客户端已经 CC-shaped(命中跳过) → 不新增 cache_control,沿用客户端原始计数。
+   - 若客户端非 CC-shaped 但已有 4 个 cache_control(罕见;通常非 CC client 0 个)→ 我们注入第 5 个会让上游 400。**接受这条边界**:第一,这是 Anthropic 硬限制,客户端如果故意凑 4 个就是恶意构造;第二,IdentityError 路径已被 §3.5 UA gate 卡住绝大部分非 CC 客户端;第三,真触发了上游 400 会被透传给客户端(`isClientBadRequest` 路径),不影响其他用户、不污染 pool — 是**自限性**故障。
+   - 因此**不**为这条边界加预检,保持代码极简(贴合 CLAUDE.md "Don't add error handling for scenarios that can't happen" / "三行直白胜过过度抽象")。
+
+5. **`type: "text"` 之外的 block**(如 `type:"image"` 在 system 中,实际不允许但理论形态):skip,只看 `type:"text"` 块的 `text` 字段判定;**检测条件写窄**:`block && typeof block === "object" && block.type === "text" && typeof block.text === "string"` 才进入 prefix 匹配(Codex Phase 7 plan-review MINOR 采纳,防对非 text block 的 `text` 字段误判)。注入的新块是 `type:"text"`,跟 SDK 形态一致。混合 block(如 `[{type:"image",...},{type:"text",text:"..."}]`)的非 text 块在检测和注入后**位置保持**(prepend 加在 index 0,原 array 后移),非 text block 形态 byte-identical 保留。
+
+**Token 成本**:
+- DEFAULT_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude." ≈ 13 tokens。
+- 每个外接请求当客户端未命中时一次性 +13 tokens(input),首次 cache miss 后该块进 prompt cache,后续同 session 0 增量。
+- 相对 chat 请求体动辄 10K~100K input,占比 < 0.1%。boss 已接受的成本。
+
+**实现入口签名**:
+```ts
+// packages/commercial/src/http/proxy/externalEnvelope.ts
+import type { Logger } from "../../logging/logger.js";
+import type { ProxyBody } from "./shared.js";
+
+/**
+ * 强制把外接 API key 路径的 outbound body 归一化成 CC 容器形态(§3.5.2)。
+ * 仅 ApiKey strategy 路径调用(handler 判别 `identity.containerId === null`)。
+ * Idempotent:已 CC-shaped 的 body 跑两次 = 跑一次。
+ */
+export function normalizeExternalApiKeyEnvelope(body: ProxyBody, log: Logger): void;
+```
+
+调用点(handler):
+```ts
+// http/proxy/index.ts,在 runUpstreamRoundTrip(...) 调用之前
+if (identity.containerId === null) {
+  normalizeExternalApiKeyEnvelope(body, userLog);
+}
+```
+
+**为什么不抽进 IdentityStrategy interface**:
+- 那会让 `applyUpstreamAuth` 不再是"strategy 唯一对 body 的 touch point"(语义分裂)。
+- core.ts 也得增加 strategy 引用,容器路径无关代码被污染。
+- 当前外接路径**仅一处**需要 envelope normalization,helper + 1 行分支 = 最小复杂度;未来若再加 strategy 才需要重审是否升级为 interface 方法(CLAUDE.md "三行直白胜过过早抽象")。
+
+**反枚举一致性**:envelope normalization 不引入任何错误码 / 不抛 — 无论客户端发什么,服务端都成功重塑成 CC envelope 上送。不存在"客户端发什么 shape 会被本步骤拒绝"的探测窗口。
+
+**未来加固 / 收窄**:
+- 若 boss 决定卡 cc_workload / cc_entrypoint(用于区分外接路径在我方 metric 上的来源):应**新加一个内部 metadata 字段**(如 `metadata.openclaude_path: "external"`),不伪造 CCB attribution header(避免给 Anthropic 假指纹)。
+- 若上游某天加强反风控,要求外接也带 attribution-like header:由我方拼装一个"显式标 external"的 `x-openclaude-external-attribution`(不冒充 CCB 的 `x-anthropic-billing-header`),保持向上游诚实 — 反风控本质是"不假冒 1P CC"而非"伪装得更彻底",别越线。
+- 若外接路径要支持 vscode-extension / sdk client 等不同 entrypoint 变体:扩展 sysprompt prefix 检测白名单 + 注入对应变体,但**不**让客户端自己选(防伪造)。
+
+**回滚路径**:删除 helper 文件 + handler 那 3 行 if/调用 即可,无 schema / API 变化。
+
 ---
 
-## 4. 10 个硬不变量(测试必须锁定)
+## 4. 11 个硬不变量(测试必须锁定)
 
 复用 anthropicProxy split plan §6.1 的 5 个 handler baseline invariants(release 4-stage / abort err.shape / commit→broadcast 顺序 / DeepSeek noop / model gate fail-closed —— 本任务**不重复列也不再写测试**,只引用)。
 
-本任务新增 10 条(原 v1 6 条 + Codex v1 MAJOR #3 新增 #7 #8 + Phase 6 临时门控 #9 + 2026-05-19 §3.5 UA gate #10):
+本任务新增 11 条(原 v1 6 条 + Codex v1 MAJOR #3 新增 #7 #8 + Phase 6 临时门控 #9 + 2026-05-19 §3.5 UA gate #10 + 2026-05-20 §3.5.2 envelope normalization #11):
 
 1. **API key 无明文存储** — repo.create 返完整 secret,**之后任何查询都不能返 secret**(只返 prefix + hash 比对的接口)。test: `findByPrefix(prefix)` 返回的 row 没有 secret 字段。
 2. **撤销立即生效** — `revoked_at IS NOT NULL` 的 key 在下一次 `resolve` 即 401。test: revoke 后第二次 request 拿到 401。
@@ -246,6 +354,29 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
     - 反枚举:错误码与 unknown / revoked / mismatch / non-admin 同为 `API_KEY_INVALID` / 401,客户端无法区分 "UA 不对" vs "key 不对"。
     - 正例不变:`claude-cli/2.1.888 (external, cli)`、`claude-cli/2.0.0 (admin, cli, agent-sdk/0.1.0)`、`claude-cli/x.y.z (foo, bar, ...任意 fingerprint)` 全部放行进入后续 strategy 流程。
     - test(strategy unit + commercial integ):6 类负 UA(`curl/x.y.z` / `PostmanRuntime` / `Mozilla` / `python-requests` / `claude-code/...` 拼写陷阱 / 空字符串 / header 完全缺失)→ 401 + 7 类 spy 全 0 + logger.warn `api_key_ua_gate_blocked` 命中。
+11. **【2026-05-20 §3.5.2 envelope normalization】外接路径 outbound body 强制 CC 形态**(plan §3.5.2):
+    - **触发条件**:`identity.containerId === null && route.kind === "oauth"`(即外接 ApiKey 路径 + Anthropic OAuth 上游);**容器路径 `containerId !== null`** 与 **DeepSeek 路由 `route.kind === "deepseek"`** 均**绝不**调用 `normalizeExternalApiKeyEnvelope`(容器路径破坏 CCB 既有 body 形态、DeepSeek 路径浪费 token + 注入语义无关 prompt 污染)。test:外接 ApiKey + DeepSeek 模型(如 `deepseek-v4-pro`)的请求 → spy 调用 = 0 且 deepseek 上游收到的 body.system 与客户端送的一致。
+    - **sysprompt 注入 idempotent**:body.system 中任一 text block 以 3 个官方 CC prefix 之一(DEFAULT / AGENT_SDK_CLAUDE_CODE_PRESET / AGENT_SDK,见 `claude-code-best/src/constants/system.ts:10-12`)**开头** → skip 注入,客户端原始 system 不动(原数组引用 + 内容均不变,深比较通过);未命中 → array 头部 prepend `{type:"text", text: DEFAULT_PREFIX, cache_control:{type:"ephemeral"}}`。两次连续调用结果完全相同(byte-identical),无重复注入。
+    - **形态归一化**:`body.system` 入参 `undefined` / `string` / `array` 三种形态全部规约成 array;`string` 形态被转成 `[{type:"text", text:<string>}]` 后再判 prefix。
+    - **container 路径零影响**:容器路径(`containerId !== null`)不进 envelope normalization 分支,既有容器 outbound body byte-for-byte 不变(test 用 invocation counter 锁:容器路径下 `normalizeExternalApiKeyEnvelope` spy 调用 = 0)。
+    - **metadata 不被本步骤动**:`body.metadata.user_id` 的 device_id pin 仍由 `applyUpstreamAuth` 保证(`upstream.ts:264-273`),envelope normalization 不触碰 metadata,避免两处职责重叠。
+    - **不伪造 attribution header**:`body.system` 注入只放 sysprompt prefix 一个块,不构造 `x-anthropic-billing-header: cc_version=...` 等容器才有的可变内容(防给上游假指纹)。
+    - **test(unit + commercial integ)**:11 类 case(原 7 类 + Codex Phase 7 plan-review MINOR 补 4 类):
+      1. `body.system === undefined` → 注入后 `body.system = [{type:"text", text: DEFAULT_PREFIX, cache_control:{type:"ephemeral"}}]`
+      2. `body.system === ""` (空字符串) → 同上(`[]` 不命中 prefix,prepend)
+      3. `body.system === "You are Claude Code, Anthropic's official CLI for Claude.\n\n<rest>"` (string with prefix) → 转 array + 检测 startsWith 命中 + skip prepend,最终 `body.system = [{type:"text", text:<original-string>}]`(string→array 归一化保留,无 cache_control)
+      4. `body.system === [{type:"text", text:"You are Claude Code, ...CLI for Claude.\n\n..."}]` (array with prefix) → 完全 skip,数组引用不变 / 内容深比较通过
+      5. `body.system === [{type:"text", text:"random custom prompt"}]` (array without prefix) → prepend 新块,原块在 index 1
+      6. 三种 prefix 变体(DEFAULT / AGENT_SDK_CLAUDE_CODE_PRESET / AGENT_SDK)均能正确命中 skip
+      7. **idempotency**:第二次调用 `normalizeExternalApiKeyEnvelope` 后 `body.system` 深比较 = 第一次调用后的值(byte-identical)
+      8. **混合 block(Codex MINOR)**:`body.system === [{type:"image", source:...}, {type:"text", text:"random"}]` → 非 text block 不参与 prefix 匹配,未命中 → prepend 新 text block 在 index 0,原 image block 移到 index 1,原 text block 移到 index 2,image block 内容 byte-identical 保留(深比较锁)
+      9. **非首块命中 prefix(Codex MINOR)**:`body.system === [{type:"text", text:"some other prefix"}, {type:"text", text:"You are Claude Code, ...CLI for Claude.\n\n..."}]` → 第二个块命中 startsWith → 整个 skip prepend,数组引用 / 内容均不变(锁住"遍历所有 text block 而非只看首块"的实现细节)
+      10. **metadata 不变(Codex MINOR)**:无论 1-9 哪种 case,helper 前后 `body.metadata` 深比较严格相等(input `metadata: undefined` → output 仍 `undefined`;input `metadata: {user_id: "..."}` → output 同 reference + 同内容);锁定"envelope normalization 不触碰 metadata,device_id pin 由 applyUpstreamAuth 后续处理"的职责边界
+      11. **4 个 cache_control 块的非 CC body(Codex MINOR)**:`body.system === [{type:"text", text:"random", cache_control:{type:"ephemeral"}}]` + `body.tools` / `body.messages` 中再加 3 个 cache_control(凑满 4) → helper 仍机械 prepend(总 5 个 cache_control),**不**在 helper 内拒绝或回退;锁定"不预检 4 块上限,接受自限性 400"的决策不被未来改动悄悄打破
+    - **integ test 端到端**(3 个 case):
+      - 正例 1:客户端发不带 sysprompt 的 `{model, messages, max_tokens}` 最小 body → 经 normalize → upstream fetch 拦截器(mock 上游)断言**最终序列化的 outbound JSON** 含 `system[0].text === DEFAULT_PREFIX` + `system[0].cache_control.type === "ephemeral"` + `metadata.user_id` 是 JSON 字符串含 device_id(Codex MINOR 采纳:断言对象是 `core.ts:158` 序列化后的最终 outbound body,而非 helper 直接返的 body,因为 device_id 是在 helper 之后的 applyUpstreamAuth 才注入)
+      - 正例 2:客户端发 CC-shaped body(完整 system 含 CC prefix + 自带 metadata) → normalize 不动 body.system(深比较锁)+ metadata 经 applyUpstreamAuth 后 device_id 被改写为 pinned_user_id(envelope normalization 与 device_id pin 互不干扰)
+      - 负例:**DeepSeek 路径**(route.kind !== "oauth") → handler predicate 第二项 fail → 不进 envelope normalization 分支,upstream JSON 中 `body.system` 保持客户端原 string 值,且 `external_envelope_injected` / `external_envelope_skip` log 均无触发(predicate 整段跳过)。**为什么不测容器路径**:本 integ 文件 `IdentityStrategy` 是 `makeApiKeyIdentityStrategy`,`containerId` 恒为 null,机械上无法构造容器路径请求;容器路径的 envelope skip 由 `anthropicProxy.integ.test.ts` 既有 happy 用例隐式覆盖(那里 IdentityStrategy 是 container,outbound body 历来无 CC prefix 注入,本 Phase 7 改动不破坏该不变量 — predicate 第一项 `containerId === null` 直接过滤)。
 
 > **注意 400 vs 403 边界**(Codex v2 修正):未知 model / `pricing.get(model)==null` / `enabled=false` 走 **400 `UNKNOWN_MODEL`** 在 `authorize` 之前,属 split plan §6.1 baseline #5 覆盖范围,本任务**不重复**测,只 reference;invariant #8 严格限定在"model 存在且 enabled,只是当前 uid 无 role/grants"的 authz 真路径。
 >
@@ -372,7 +503,31 @@ class ApiKeyIdentityStrategy implements IdentityStrategy {
 
 预算:0.3 工日(代码两点 admin gate + 测试 ~14 用例新增/改造 + plan doc 三段同步;借用既有 fakePool harness)。
 
-**总计:3-4 工日 + Phase 6 临时 0.3 工日**。
+### Phase 7:出站 envelope 归一化 — 强制 CC 指纹(2026-05-20 加,见 §3.5.2)
+
+> 本 Phase 在 Phase 6 admin-only rollout 已上线、boss 2026-05-20 提出"恶意客户端伪造 UA 后用 wrong-shape body 污染整池" 风控洞之后追加。**目的:把"反风控防线"从客户端声明(UA)抬升到服务端权威重塑(outbound body),即使 §3.5 入站 UA gate 被绕过也不会污染上游 OAuth pool。**
+
+- **新增 helper**(`http/proxy/externalEnvelope.ts`):
+  - `normalizeExternalApiKeyEnvelope(body: ProxyBody, log: Logger): void` —— 原地 mutate body;无返回。
+  - 内含 3 个官方 CC sysprompt prefix 字符串常量(就地硬编码,注释指回 `claude-code-best/src/constants/system.ts:10-12`,**不**引入 CCB 依赖)。
+- **handler 接入**(`http/proxy/index.ts`,**在 `estimateInputTokens(body)` 之前 + `selectUpstreamRoute(body.model)` 之后**):
+  ```ts
+  if (identity.containerId === null && route.kind === "oauth") {
+    normalizeExternalApiKeyEnvelope(body, userLog);
+  }
+  const inputTokens = estimateInputTokens(body);
+  ```
+  3 行 if 块,无新依赖、无新 plumbing。**前置到 estimateInputTokens 之前是 Codex Phase 7 plan-review MINOR 采纳**:注入的 sysprompt prefix 必须计入 preCheck 估算,保持"任何 mutate body 的步骤都在 input token 估算之前"的账务边界(见 §3.5.2 位置说明)。
+- **单元测试**(`__tests__/externalEnvelope.unit.test.ts`):invariant #11 的 11 类 case(原 7 类 + Codex MINOR 补 4 类:混合 block / 非首块命中 prefix / metadata 不变 / 4 cache_control 块边界)。
+- **integ 测试**(扩 `ccExternalEndpoint.integ.test.ts`):
+  - 正例 1:客户端发最小 body(无 system,无 metadata) → upstream fetch 拦截器断言**最终序列化的 outbound JSON** 含 sysprompt prefix + cache_control + metadata.user_id 含 device_id(Codex MINOR:断言对象是序列化后的最终 body 而非 helper 直接返的 body)。
+  - 正例 2:客户端发 CC-shaped 完整 body → envelope normalization 不动 system,device_id pin 仍生效。
+  - 负例:**DeepSeek 路径**(route.kind !== "oauth") → handler predicate 第二项 fail → 不进 envelope normalization 分支,upstream JSON 的 `body.system` 保持客户端原 string,且 `external_envelope_*` debug log 均无触发(锁住 predicate 第二项)。容器路径的 envelope skip 不在本文件直测 — 本 integ 用 `makeApiKeyIdentityStrategy`,`containerId` 恒为 null;容器路径由 `anthropicProxy.integ.test.ts` 既有 happy 用例隐式覆盖(那里 strategy 是 container,outbound body 历来无 CC prefix,本 Phase 7 改动不破坏该不变量 — predicate 第一项 `containerId === null` 直接过滤掉)。
+- **plan doc 同步**:§3.5.2 新增完整段、§4 invariant #11、§7 本 Phase。
+
+预算:0.4 工日(1 helper + 1 handler 接入点 + 11 unit case + 3 integ case + plan doc 三段同步)。
+
+**总计:3-4 工日 + Phase 6 临时 0.3 工日 + Phase 7 反风控加固 0.4 工日**。
 
 **前提**:split baseline 测试夹具与 commercial router 挂载点(`packages/commercial/src/index.ts:820` 附近)已稳定。若 split 在 review 期间再次重构 `IdentityStrategy` / handler 装配 / billing lifecycle 签名,实际预算 4-5 工日(rebase 重写 ApiKeyIdentityStrategy + 修测试)。
 
