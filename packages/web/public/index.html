@@ -238,7 +238,7 @@
               </div>
               <div class="landing-demo-window-body landing-demo-chat">
 
-                <!-- 对话回放 6 节点:用户 → Agent 拆解 → Write outline → Write tex → Bash sim → Agent 总结 -->
+                <!-- 对话回放 12 节点:命题 ↔ 反问 ↔ 选型 → Read 历史 → 大纲 → 公式 → 校验 → 仿真 → 自检 → 复算 → 编译 → 总结 -->
                 <div class="landing-demo-chat-node landing-demo-chat-user" data-step="1">
                   <div class="landing-demo-chat-avatar landing-demo-chat-avatar-user">U</div>
                   <div class="landing-demo-chat-bubble landing-demo-chat-bubble-user">
@@ -249,11 +249,51 @@
                 <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="2">
                   <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
                   <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
-                    已拆解为 10 章 / 65 节大纲,核心链:<em>Nernst-Planck 输运 → Sand 时间 → 临界电流密度 → 高浓度电解液</em>。先落 outline.md,再按节写 .tex,最后跑 phase-field 形貌演化仿真出 14 张矢量图。
+                    先帮你梳理边界,三个侧重选哪个最贴近?<br>
+                    ① <em>机理</em>(NP + 相场,推导主导)<br>
+                    ② <em>工程</em>(电解液 / 集流体 / 压力)<br>
+                    ③ <em>综述</em>(文献画像 + 路线对比)<br>
+                    或者要"机理为主 + 工程对照",我也能编排。
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="3">
+                <div class="landing-demo-chat-node landing-demo-chat-user" data-step="3">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-user">U</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-user">
+                    机理为主 + 工程对照,工程偏电解液这一块。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="4">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    好。我先看下你之前的领域笔记,沿用偏好,避免风格漂移。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="5">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Read</span>
+                      <span class="landing-demo-chat-tool-path">notes/li_metal_prior.md</span>
+                      <span class="landing-demo-chat-tool-status">✓ 1.8 KB</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm"># 锂金属负极偏好(2026-03 备忘)</span>
+- 工程对照倾向高浓度体系 (LiFSI / DME)
+- 临界 J_c 用参考阈值区间,不锁死单点
+- phase-field 优先 Cahn-Hilliard 形式
+- 引用风格用 numbered + 章节末 References</pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="6">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    沿用 <em>LiFSI 高浓度体系</em>作为工程对照主线,phase-field 用 Cahn-Hilliard 形式。先落大纲,再按节展开 .tex,最后 phase-field 形貌演化出 14 张矢量图。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="7">
                   <div class="landing-demo-chat-tool-card">
                     <div class="landing-demo-chat-tool-head">
                       <span class="landing-demo-chat-tool-name">Write</span>
@@ -264,13 +304,14 @@
 <span class="cm">## 1. 引言与命题边界</span>
 <span class="cm">## 2. 第一性原理:Nernst-Planck + Butler-Volmer 耦合</span>
 <span class="cm">## 3. Sand 时间与临界电流密度推导</span>
-<span class="cm">## 4. 高浓度 / 局部高浓度电解液策略</span>
+<span class="cm">## 4. 高浓度 / 局部高浓度电解液策略 (LiFSI 主线)</span>
 <span class="cm">## 5. Phase-field 模型与枝晶形貌演化</span>
+<span class="cm">## 6. SEI 钉扎机理与添加剂筛选</span>
 <span class="kw">...</span> <span class="cm"># 共 10 章 / 65 节</span></pre>
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="4">
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="8">
                   <div class="landing-demo-chat-tool-card">
                     <div class="landing-demo-chat-tool-head">
                       <span class="landing-demo-chat-tool-name">Write</span>
@@ -288,7 +329,21 @@
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="5">
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="9">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Bash</span>
+                      <span class="landing-demo-chat-tool-path">python sim/check_sand_stability.py</span>
+                      <span class="landing-demo-chat-tool-status">✓ 3.1s</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">[check] 对 t_+ 敏感区间做稳定性扫描</span>
+<span class="cm">[check] J 扫描 0.1 → 5.0 mA/cm², 20 个采样点</span>
+<span class="cm">[check] 收敛:τ_Sand 单调,无数值发散</span>
+<span class="cm">[ok] 公式数值健康,进入主仿真</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="10">
                   <div class="landing-demo-chat-tool-card">
                     <div class="landing-demo-chat-tool-head">
                       <span class="landing-demo-chat-tool-name">Bash</span>
@@ -305,7 +360,29 @@
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="6">
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="11">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    低分辨率预览发现 <em>fig_phase_field_t1</em> 边界有数值伪影,切换 512² 复算 + 编译终稿。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="12">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Bash</span>
+                      <span class="landing-demo-chat-tool-path">bash build/finalize.sh</span>
+                      <span class="landing-demo-chat-tool-status">✓ 1m12s</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">[rerun] sim_run.py --fig phase_field_t1 --resolution 512</span>
+<span class="cm">[rerun] artifact gone, fig_phase_field_t1.pdf 已覆盖</span>
+<span class="cm">[xelatex] 主稿 3 pass · 交叉引用全闭环</span>
+<span class="cm">[pandoc] LaTeX → DOCX, 公式 OMML 化, 表格保留</span>
+<span class="cm">[done] main.pdf (1.1 MB) · main.docx (1.5 MB)</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="13">
                   <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
                   <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
                     报告就绪:59 页 PDF + DOCX(公式 OMML 化),14 张矢量图,19 张表,6,000+ 行 LaTeX 已自检引用闭环。
