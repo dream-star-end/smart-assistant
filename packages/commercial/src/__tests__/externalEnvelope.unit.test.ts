@@ -304,7 +304,8 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     assert.equal(totalCacheControl, 5);
   });
 
-  test("debug log 在 skip 路径触发 external_envelope_skip", () => {
+  test("info log 在 skip 路径触发 external_envelope_skip(含 blocks / orig_kind / prefix_variant)", () => {
+    // 2026-05-20 v1.0.183:升 info 级 + 加结构指纹字段(parity 诊断,不记 prompt 内容)
     const log = makeTestLogger();
     const body = makeBody({
       system: [{ type: "text", text: `${DEFAULT_PREFIX}\n\nx` }],
@@ -314,10 +315,47 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
 
     const skipLog = log.calls.find((c) => c.msg === "external_envelope_skip");
     assert.ok(skipLog, "skip log should be emitted");
-    assert.equal(skipLog?.level, "debug");
+    assert.equal(skipLog?.level, "info", "升 info 级以便 prod LOG_LEVEL=info 看见");
+    assert.deepEqual(skipLog?.fields, {
+      reason: "cc_prefix_present",
+      blocks: 1,
+      orig_kind: "array",
+      prefix_variant: 0, // DEFAULT_PREFIX = index 0
+    });
   });
 
-  test("debug log 在 prepend 路径触发 external_envelope_injected", () => {
+  test("info log skip 路径区分 3 个 prefix 变体的 prefix_variant 索引", () => {
+    // AGENT_SDK_CLAUDE_CODE_PRESET = index 1
+    {
+      const log = makeTestLogger();
+      const body = makeBody({
+        system: [{ type: "text", text: `${AGENT_SDK_CC_PRESET}\n\nx` }],
+      });
+      normalizeExternalApiKeyEnvelope(body, log);
+      const skipLog = log.calls.find((c) => c.msg === "external_envelope_skip");
+      assert.equal((skipLog?.fields as { prefix_variant: number })?.prefix_variant, 1);
+    }
+    // AGENT_SDK = index 2
+    {
+      const log = makeTestLogger();
+      const body = makeBody({
+        system: [{ type: "text", text: `${AGENT_SDK}\n\nx` }],
+      });
+      normalizeExternalApiKeyEnvelope(body, log);
+      const skipLog = log.calls.find((c) => c.msg === "external_envelope_skip");
+      assert.equal((skipLog?.fields as { prefix_variant: number })?.prefix_variant, 2);
+    }
+  });
+
+  test("info log skip 路径 orig_kind=string 当客户端发 string 形态 system", () => {
+    const log = makeTestLogger();
+    const body = makeBody({ system: `${DEFAULT_PREFIX}\n\nrest` });
+    normalizeExternalApiKeyEnvelope(body, log);
+    const skipLog = log.calls.find((c) => c.msg === "external_envelope_skip");
+    assert.equal((skipLog?.fields as { orig_kind: string })?.orig_kind, "string");
+  });
+
+  test("info log 在 prepend 路径触发 external_envelope_injected(含 blocks=2 / orig_kind=array / prefix_variant=0)", () => {
     const log = makeTestLogger();
     const body = makeBody({ system: [{ type: "text", text: "random" }] });
 
@@ -325,7 +363,21 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
 
     const injLog = log.calls.find((c) => c.msg === "external_envelope_injected");
     assert.ok(injLog, "inject log should be emitted");
-    assert.equal(injLog?.level, "debug");
+    assert.equal(injLog?.level, "info");
+    assert.deepEqual(injLog?.fields, {
+      blocks: 2, // 注入后原 1 + 新 prefix block
+      orig_kind: "array",
+      prefix_variant: 0, // 注入的总是 DEFAULT_PREFIX
+    });
+  });
+
+  test("info log inject 路径 orig_kind=undefined 当客户端无 system", () => {
+    const log = makeTestLogger();
+    const body = makeBody({}); // system 缺失
+    normalizeExternalApiKeyEnvelope(body, log);
+    const injLog = log.calls.find((c) => c.msg === "external_envelope_injected");
+    assert.equal((injLog?.fields as { orig_kind: string })?.orig_kind, "undefined");
+    assert.equal((injLog?.fields as { blocks: number })?.blocks, 1); // 只有新注入的 prefix block
   });
 
   test("非 text block 的 text 字段不被误判(text 字段在 image block 上含 prefix 仍不命中)", () => {

@@ -94,21 +94,24 @@ const CC_SYSPROMPT_PREFIXES: readonly string[] = [
  * 实际拼接的 `<prefix>\n\n<rest>` 形态)。
  *
  * 对非 text block(如 type:"image")**不**误读其 `text` 字段。
+ *
+ * 返回命中的 prefix 索引(0=DEFAULT, 1=AGENT_SDK_CLAUDE_CODE_PRESET, 2=AGENT_SDK),
+ * 不命中返回 -1。索引进 log 帮助 ops 判断客户端打的哪种 CC 变体(parity 诊断)。
  */
-function isCcPrefixBlock(block: unknown): boolean {
+function detectCcPrefix(block: unknown): number {
   if (
     !block ||
     typeof block !== "object" ||
     (block as { type?: unknown }).type !== "text"
   ) {
-    return false;
+    return -1;
   }
   const text = (block as { text?: unknown }).text;
-  if (typeof text !== "string") return false;
-  for (const prefix of CC_SYSPROMPT_PREFIXES) {
-    if (text.startsWith(prefix)) return true;
+  if (typeof text !== "string") return -1;
+  for (let i = 0; i < CC_SYSPROMPT_PREFIXES.length; i++) {
+    if (text.startsWith(CC_SYSPROMPT_PREFIXES[i]!)) return i;
   }
-  return false;
+  return -1;
 }
 
 /**
@@ -134,37 +137,54 @@ export function normalizeExternalApiKeyEnvelope(
   body: ProxyBody,
   log: Logger,
 ): void {
-  // 1) 归一化 body.system 形态成 array
+  // 1) 归一化 body.system 形态成 array — `origKind` 进 log 帮助 ops 看客户端原始
+  //    形态(用于 parity 诊断:容器 CCB 一直发 array,curl/SDK 客户端常发 string 或缺失)。
   let systemArr: unknown[];
   const original = body.system;
+  let origKind: "undefined" | "string" | "array";
   if (original === undefined) {
     systemArr = [];
+    origKind = "undefined";
   } else if (typeof original === "string") {
     // 即使是空串也走 string 分支,转成 `[{type:text, text:""}]` 再判 prefix(必不命中,
     // prepend 注入)。空串不进 array 注入分支的零特殊处理,避免空串/undefined 行为分裂。
     systemArr = [{ type: "text", text: original }];
+    origKind = "string";
   } else {
     // schema 已保证 array;原引用保留,prepend 时新建 array(下方 step 3)
     systemArr = original;
+    origKind = "array";
   }
 
-  // 2) 遍历找 CC prefix block(任意位置;命中即 skip)
-  let hasPrefix = false;
+  // 2) 遍历找 CC prefix block(任意位置;命中即 skip)。
+  //    记录命中的 prefix 变体索引,进 log 用 — 帮 ops 看客户端打的是
+  //    DEFAULT(0)/ AGENT_SDK_CLAUDE_CODE_PRESET(1)/ AGENT_SDK(2)哪种 CC 形态。
+  let prefixVariant = -1;
   for (const block of systemArr) {
-    if (isCcPrefixBlock(block)) {
-      hasPrefix = true;
+    const v = detectCcPrefix(block);
+    if (v >= 0) {
+      prefixVariant = v;
       break;
     }
   }
 
-  if (hasPrefix) {
+  if (prefixVariant >= 0) {
     // string 形态本应在 step 1 已转 array;但 startsWith 命中是 string 的合法情况
     // (整个字符串以 prefix 开头,转 array 后第一个 block.text 命中)。
     // skip 注入:把归一化结果写回 body.system,保持后续 estimateInputTokens 看到 array form。
     if (original !== systemArr) {
       body.system = systemArr as ProxyBody["system"];
     }
-    log.debug("external_envelope_skip", { reason: "cc_prefix_present" });
+    // 升 info 级(2026-05-20 v1.0.183):prod LOG_LEVEL=info 下也能直证 helper
+    // 真的命中过 + outbound 形态 parity 诊断。**不**记 prompt 内容(任何 text/hash),
+    // 仅结构指纹:blocks(归一化后 array 长度)+ origKind(客户端原 system 形态)+
+    // prefix_variant(命中的 3 个 CC 变体之一)。
+    log.info("external_envelope_skip", {
+      reason: "cc_prefix_present",
+      blocks: systemArr.length,
+      orig_kind: origKind,
+      prefix_variant: prefixVariant,
+    });
     return;
   }
 
@@ -175,5 +195,10 @@ export function normalizeExternalApiKeyEnvelope(
     cache_control: { type: "ephemeral" as const },
   };
   body.system = [injectedBlock, ...systemArr] as ProxyBody["system"];
-  log.debug("external_envelope_injected", { blocks: (body.system as unknown[]).length });
+  // 升 info 级:同 skip 路径口径,仅结构指纹。prefix_variant=0(注入的就是 DEFAULT)。
+  log.info("external_envelope_injected", {
+    blocks: (body.system as unknown[]).length,
+    orig_kind: origKind,
+    prefix_variant: 0,
+  });
 }
