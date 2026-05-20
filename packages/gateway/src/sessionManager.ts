@@ -125,6 +125,35 @@ export interface AgentSession {
    *  agents.yaml 允许 provider 字段缺省,所以这里也允许 undefined。
    */
   agentProvider?: string
+  /**
+   * Active turn count — number of in-flight `submit()` promises for this session.
+   *
+   * 进入 `submit()` 后(`session.lock` 新建那一刻)++,**`submit()` promise
+   * settled**(即 try/finally 走到 finally,无论正常 return 还是 throw)前 --。
+   * 故意覆盖比 runner 进程生命周期更宽的语义:
+   *   - `await prev` 等队列中前一个 turn,counter 已计入(用户视角已"按了发送")
+   *   - effort/model swap 期间 `runner.shutdown()` 后窗口(proc 已死,turn 还在)
+   *   - phantom-turn / auth-refresh retry 内的 shutdown + respawn 窗口
+   *   - liveness timeout race 抛错时 — 直到上层 catch 完才 --
+   * 所有这些都在 `submit()` try/finally 内,counter 不归零。
+   *
+   * **这是 turn-level 的 inFlight 真值源**,优于 `runner.isRunning`(进程级,
+   * 由 `subprocessRunner.ts: proc!==null && !closed || starting` 定义,turn 内
+   * subprocess respawn 窗口会短暂 false)。`autoResumeFromHello` 用它决定是否
+   * 推 synthetic turn-interrupted isFinal:counter > 0 意味着 turn 还活着,
+   * 绝不应该误推终结帧让前端清状态。
+   *
+   * 用 counter 而非 boolean:虽然同 session `session.lock` 串行,理论上最多
+   * 一个真正执行的 turn,但"in-flight submit 数"包含排队在 `await prev`
+   * 后面的 submit。counter 对未来重叠/重入路径鲁棒,且 `Math.max(0, n - 1)`
+   * 避免双 finally 或字段缺失导致负数;boolean 会被第二个 submit 的 finally
+   * 错误清掉第一个的 active 状态。
+   *
+   * 不持久化、不跨进程 — gateway 重启后默认 undefined → 读 `?? 0`,下一次
+   * `submit()` 自然恢复。Optional 让历史内存对象 / 测试 fake / 其它 provider
+   * 注入的 session 不被 TS 波及。
+   */
+  _activeTurnCount?: number
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -1164,6 +1193,16 @@ export class SessionManager {
     const prev = session.lock
     let release!: () => void
     session.lock = new Promise<void>((r) => (release = r))
+    // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 ++。详见
+    // AgentSession._activeTurnCount 注释。位置:lock 新建后、`await prev`
+    // 前,即 **submit() 已接受、即将串行化执行** 的一刻起算。注意 scope:
+    // 这覆盖 submit() 内的全部 subprocess respawn 窗口(phantom-turn /
+    // auth-refresh / effort+model swap),但**不**覆盖 dispatchInbound 在
+    // submit() 之前的预处理阶段(mkdir / writeFile / parseDocument 等),
+    // 那是另一类同症状窗口,留作 Plan 1 follow-up。对应 -- 在下方 finally
+    // 里 release() 旁边,保证 submit() promise settled(return / throw 都
+    // 走 finally)前归零。
+    session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
       // V3 S12e CG8 — contract C(best-effort)stash latest turn trace on runner
@@ -1307,6 +1346,14 @@ export class SessionManager {
         throw err
       }
     } finally {
+      // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 --。
+      // 配对的 ++ 在 submit() 头部。`?? 0` 容忍字段缺失:历史 session 对象 /
+      // 测试 fake / 未来误删初始化的场景。`Math.max(0, n - 1)` 是 defense-in-
+      // depth:单 async function 的 finally 不会双跑,但消费侧
+      // (`_shouldPushTurnInterruptedFinal`)也把负数当 0,生产侧顺势对齐,
+      // 让真值源不依赖外部不变量。release() 之前归零,保证下一个 await prev
+      // 的 submit 看到的是干净状态。
+      session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
       release()
     }
   }
