@@ -6894,7 +6894,7 @@ body.body-landing {
 /* ════════════════════════════════════════════════════════════════
    LANDING DEMO SECTION (云 Agent vs 普通 AI 聊天 实战演示)
    作用域:.landing-demo 内,所有规则用 .landing-demo-* 前缀。
-   动画策略:section.landing-demo.is-playing 触发各步骤 fade-in/slide-up;
+   动画策略:.landing-demo-panel.is-playing 触发各步骤 fade-in/slide-up;
    IntersectionObserver 进入视口加 class,出视口不取消(只播一次)。
    全部尊重 prefers-reduced-motion(收尾处统一关掉)。
    ════════════════════════════════════════════════════════════════ */
@@ -7219,21 +7219,28 @@ body.body-landing {
 /* user 气泡靠右 */
 .landing-demo-chat-user { flex-direction: row-reverse; }
 
-/* section.is-playing 时:13 节点按节奏依次出现(~11 秒走完) */
-.landing-demo.is-playing .landing-demo-chat-node { opacity: 1; transform: translateY(0); }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="1"]  { transition-delay: 0.2s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="2"]  { transition-delay: 1.0s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="3"]  { transition-delay: 2.2s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="4"]  { transition-delay: 3.0s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="5"]  { transition-delay: 3.7s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="6"]  { transition-delay: 4.7s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="7"]  { transition-delay: 5.6s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="8"]  { transition-delay: 6.6s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="9"]  { transition-delay: 7.6s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="10"] { transition-delay: 8.6s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="11"] { transition-delay: 9.7s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="12"] { transition-delay: 10.5s; }
-.landing-demo.is-playing .landing-demo-chat-node[data-step="13"] { transition-delay: 11.5s; }
+/* panel.is-playing 时:16 节点按节奏依次出现(~14 秒走完)
+   注意:每个 .landing-demo-panel 独立持有 is-playing,从而支持 tab 切换时
+   各 panel 各自首播一次(由 JS 的 playedPanels 状态机控制,不重播)。
+   两个 panel 都用 data-step="1..N",因任意时刻只有一个 panel 非 hidden,
+   delay 表共享不冲突。 */
+.landing-demo-panel.is-playing .landing-demo-chat-node { opacity: 1; transform: translateY(0); }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="1"]  { transition-delay: 0.2s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="2"]  { transition-delay: 1.0s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="3"]  { transition-delay: 2.0s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="4"]  { transition-delay: 2.8s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="5"]  { transition-delay: 3.6s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="6"]  { transition-delay: 4.4s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="7"]  { transition-delay: 5.3s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="8"]  { transition-delay: 6.2s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="9"]  { transition-delay: 7.1s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="10"] { transition-delay: 8.0s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="11"] { transition-delay: 8.9s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="12"] { transition-delay: 9.8s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="13"] { transition-delay: 10.7s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="14"] { transition-delay: 11.6s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="15"] { transition-delay: 12.5s; }
+.landing-demo-panel.is-playing .landing-demo-chat-node[data-step="16"] { transition-delay: 13.4s; }
 
 /* 头像圆点 */
 .landing-demo-chat-avatar {
@@ -7302,6 +7309,21 @@ body.body-landing {
 }
 .landing-demo-chat-tool-path { color: var(--fg-strong); font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .landing-demo-chat-tool-status { color: var(--fg-muted); font-size: 11px; }
+/* TDD 红/绿状态 pill — 编程 demo 测试结果可视化 */
+.landing-demo-chat-tool-status-fail {
+  color: var(--danger, #d11);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--danger, #d11) 12%, transparent);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.landing-demo-chat-tool-status-pass {
+  color: var(--success, #0a7);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--success, #0a7) 14%, transparent);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
 .landing-demo-chat-tool-card .landing-demo-code {
   border: 0;
   border-radius: 0;
