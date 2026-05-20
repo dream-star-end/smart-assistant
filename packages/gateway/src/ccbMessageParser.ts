@@ -85,6 +85,11 @@ export type SessionStreamEvent =
     }
   | { kind: 'error'; error: string }
   | { kind: 'permission_request'; request: PermissionRequest }
+  // 当前 turn 的 backend-side 非流式阶段状态(目前仅 'compacting' / null)。
+  // 由 CCB stdout `{type:'system', subtype:'status', status:'compacting'|null}`
+  // 触发,gateway 上层包装成 `outbound.turn_status` 帧推给前端。受控枚举,
+  // 不透传任意 SDK status —— 防协议被 CCB 内部状态污染。
+  | { kind: 'turn_status'; status: 'compacting' | null }
   // PR2 v1.0.66 — codex turn 终态侧信道事件,sessionManager 在收到 codex
   // RunnerMessage{type:'result', requestId} 时**额外**发一帧(parser 仍照常发
   // kind:'final')。server.ts 把这个 kind 路由到 outbound.codex_billing 帧给 master
@@ -446,14 +451,16 @@ export class CcbMessageParser {
         : undefined
 
     // ── system messages ──
-    // Most system subtypes (init / status / success / error / task_*) are
-    // ignored by the gateway; CCB emits them for SDK consumers like VS Code
-    // and Scuttle that listen on stdout directly. The one we DO surface is
-    // `bash_output_tail` — the snapshot tail of a long-running Bash command
-    // that BashTool/LocalShellTask emit on a 1 Hz cadence. It carries the
-    // original BashTool tool_use_id so the frontend can route the tail to
-    // the right tool card. See packages/protocol/src/frames.ts for the
-    // OutboundContentBlock 'tool_output_tail' shape.
+    // Most system subtypes (init / success / error / task_*) are ignored by
+    // the gateway; CCB emits them for SDK consumers like VS Code and Scuttle
+    // that listen on stdout directly. We surface a small whitelist:
+    //   - `bash_output_tail` — 1 Hz snapshot tail of long-running Bash output,
+    //     routed via OutboundContentBlock 'tool_output_tail' (see protocol).
+    //   - `status` — coarse non-streaming turn phase (currently only
+    //     `'compacting' | null`). Mapped to a controlled enum and surfaced
+    //     as `kind: 'turn_status'`; server.ts wraps into `outbound.turn_status`.
+    //     CCB raw status string is **not** transparently forwarded — only the
+    //     mapped values cross the protocol boundary.
     if (msg.type === 'system') {
       if (raw.subtype === 'bash_output_tail') {
         const toolUseId = raw.tool_use_id
@@ -468,6 +475,13 @@ export class CcbMessageParser {
           if (parentToolUseId) block.parentToolUseId = parentToolUseId
           this.onEvent({ kind: 'block', block: block as any })
         }
+      } else if (raw.subtype === 'status') {
+        // CCB SDKStatus 当前只有 'compacting' | null(coreSchemas.ts:1268)。
+        // 任何其它值都 normalize 到 null —— 防止未来 CCB 加新 status 字面量
+        // 时,gateway 没有显式 mapping 就把未审过的字符串塞给前端。
+        const mapped: 'compacting' | null =
+          raw.status === 'compacting' ? 'compacting' : null
+        this.onEvent({ kind: 'turn_status', status: mapped })
       }
       return
     }

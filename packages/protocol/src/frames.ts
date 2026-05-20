@@ -488,6 +488,44 @@ export const OutboundCodexBilling = Type.Object({
 export type OutboundCodexBilling = Static<typeof OutboundCodexBilling>
 
 // ───────────────────────────────────────────────
+// OutboundTurnStatus — 当前 turn 的 backend-side 非流式阶段状态。
+//
+// 用于告诉前端 "本 turn 现在不会产生 assistant token 但仍在工作",避免 UX
+// 把长时间静默当成卡死。第一版只覆盖 `compacting`(CCB auto/manual compact
+// 期间走单独 LLM 调用,可达数十秒 ~ 数分钟无 stream)。
+//
+// 协议边界(严格):
+//   - 只承载当前 turn 的非内容流阶段状态,不带 assistant 内容
+//   - 受控枚举,gateway 必须映射 CCB raw status,**不**透传任意 SDK status
+//   - `null` 表示回到普通流式 / 空闲态(compact_end / abort / error)
+//   - 前端只能用它调整 UX,不能作为业务完成信号(业务完成走 outbound.message
+//     isFinal=true)
+//   - **入** outboundRing(走 deliver() 默认路径),让短暂断网时 ring replay
+//     自然覆盖;长 compact + ring eviction 的边角由 gateway session-level
+//     cache(currentTurnStatus)在 autoResumeFromHello 补发兜底
+//
+// 来源:CCB stdout `{type:'system', subtype:'status', status:'compacting'|null}`
+// (cli/print.ts:2214 + services/compact/compact.ts:414,763,819,1106)
+// ───────────────────────────────────────────────
+export const OutboundTurnStatus = Type.Object({
+  type: Type.Literal('outbound.turn_status'),
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  /** 当前 turn 的非流式阶段。null = 回到普通流式 / 空闲态。
+   *  受控枚举,未来扩展(如 'restoring' / 'waiting_for_hook')必须由
+   *  gateway 显式映射,不接受 CCB raw 字符串透传。 */
+  status: Type.Union([
+    Type.Literal('compacting'),
+    Type.Null(),
+  ]),
+  // V3 S12e — 与 outbound.message / outbound.codex_billing 同 trace 语义,
+  // 标记触发本帧的 turn。dispatchInbound stamp,仅观察用。
+  traceId: Type.Optional(TraceIdString),
+})
+export type OutboundTurnStatus = Static<typeof OutboundTurnStatus>
+
+// ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
 export const ControlListSessions = Type.Object({
@@ -513,6 +551,7 @@ export const AnyFrame = Type.Union([
   OutboundResumeFailed,
   OutboundError,
   OutboundCodexBilling,
+  OutboundTurnStatus,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>
