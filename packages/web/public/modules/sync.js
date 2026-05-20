@@ -2,11 +2,11 @@
 // Syncs frontend sessions (IndexedDB) with server-side storage (SQLite).
 // Server is source of truth for session list; local IDB is cache + offline fallback.
 
-import { apiFetch, apiGet, apiJson, authHeaders } from './api.js?v=56740568'
-import { dbGetAll, dbPut, dbDelete } from './db.js?v=56740568'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=56740568'
-import { state } from './state.js?v=56740568'
-import { trace } from './trace.js?v=56740568'
+import { apiFetch, apiGet, apiJson, authHeaders } from './api.js?v=76c3fe02'
+import { dbGetAll, dbPut, dbDelete } from './db.js?v=76c3fe02'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=76c3fe02'
+import { state } from './state.js?v=76c3fe02'
+import { trace } from './trace.js?v=76c3fe02'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
 // resolve it (either by taking server state, or by detecting local-dominates
