@@ -8,8 +8,7 @@ import { truncateAllForTest } from "./helpers/db.js";
 /**
  * T-01f db 集成测试。
  *
- * 需要启动 tests/fixtures/docker-compose.test.yml:
- *   docker compose -f tests/fixtures/docker-compose.test.yml up -d
+ * 需要本地起 PG/Redis fixture — 见 packages/commercial/README.md。
  *
  * 默认情况下,pg 未启动时测试自动 skip(不算失败),方便本地开发。
  * 但在 CI(`CI=true`)或 `REQUIRE_TEST_DB=1` 时,直接 fail 而不是静默 skip —
@@ -54,7 +53,7 @@ before(async () => {
     if (REQUIRE_TEST_DB) {
       throw new Error(
         "Postgres test fixture is required (CI=true or REQUIRE_TEST_DB=1) but probe failed. " +
-          "Start it via: docker compose -f tests/fixtures/docker-compose.test.yml up -d",
+          "See packages/commercial/README.md for the PG/Redis bootstrap commands.",
       );
     }
     return;
@@ -83,7 +82,7 @@ after(async () => {
 
 function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
   if (!pgAvailable) {
-    t.skip("pg not running; run `docker compose -f tests/fixtures/docker-compose.test.yml up -d` then re-test");
+    t.skip("pg not running; see packages/commercial/README.md for bootstrap, then re-test");
     return true;
   }
   return false;
