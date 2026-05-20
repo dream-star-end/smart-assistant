@@ -217,15 +217,31 @@ export class PricingCache {
     this.onReload(next.size);
   }
 
-  /** 合并重复触发:已有 load 在跑就等它。失败不冒泡到调用方,只 onError。 */
+  /**
+   * 合并重复触发 + dirty bit:已有 load 在跑就标 pending,跑完再补一次 — 否则会丢
+   * "load SELECT 之后才 commit 的 UPDATE" 对应的那条 NOTIFY。失败不冒泡,只 onError。
+   *
+   * 2026-05-21 修(Codex Phase 2 review FAIL #2):原版直接 early return 会让第二条
+   * NOTIFY 永远没人响应,其它进程缓存停留在第一次 reload SELECT 那一刻的快照。
+   * 与 PrefixTemplateCache 同型,保持 cache 抽象一致(CLAUDE.md "consistency with
+   * existing abstractions")。
+   */
+  private reloadPending = false;
   private scheduleReload(): void {
-    if (this.reloadInFlight) return;
+    if (this.reloadInFlight) {
+      this.reloadPending = true;
+      return;
+    }
     this.reloadInFlight = this.load()
       .catch((err) => {
         this.onError(err);
       })
       .finally(() => {
         this.reloadInFlight = null;
+        if (this.reloadPending) {
+          this.reloadPending = false;
+          this.scheduleReload();
+        }
       });
   }
 

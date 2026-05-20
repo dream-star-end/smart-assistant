@@ -24,7 +24,12 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { normalizeExternalApiKeyEnvelope } from "../http/proxy/externalEnvelope.js";
+import {
+  normalizeExternalApiKeyEnvelope,
+  EnvelopePrefixCacheNotReadyError,
+  type PrefixSource,
+} from "../http/proxy/externalEnvelope.js";
+import type { PrefixVariant } from "../envelope/prefixTemplateCache.js";
 import type { ProxyBody } from "../http/proxy/shared.js";
 import type { Logger } from "../logging/logger.js";
 
@@ -67,6 +72,27 @@ const AGENT_SDK_CC_PRESET =
 const AGENT_SDK =
   `You are a Claude agent, built on Anthropic's Claude Agent SDK.`;
 
+/**
+ * Phase 2(2026-05-21):测试注入 PrefixSource,避免触碰 module singleton 状态。
+ * 字面与 0071 migration bootstrap 3 行 + externalEnvelope.ts 历史硬编码 byte-equal —
+ * 锁住 Phase 0 baseline,任何字面漂移此测试先红。
+ */
+const FAKE_PREFIX_TEXTS: Record<PrefixVariant, string> = {
+  default: DEFAULT_PREFIX,
+  agent_sdk_claude_code_preset: AGENT_SDK_CC_PRESET,
+  agent_sdk: AGENT_SDK,
+};
+const fakePrefixSource: PrefixSource = {
+  get(v) {
+    return FAKE_PREFIX_TEXTS[v] ?? null;
+  },
+};
+
+/** 短手:测试统一注入 fakePrefixSource(否则 singleton 未 bootstrap 会抛)。 */
+function run(body: ProxyBody, log: Logger): void {
+  normalizeExternalApiKeyEnvelope(body, log, fakePrefixSource);
+}
+
 // ─── 测试 ────────────────────────────────────────────────────────────────
 
 describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () => {
@@ -75,7 +101,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const body = makeBody();
     assert.equal(body.system, undefined);
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     assert.deepEqual(body.system, [
       {
@@ -90,7 +116,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const log = makeTestLogger();
     const body = makeBody({ system: "" });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     // 原空串被归一化成 [{type:text, text:""}],未命中 prefix 后 prepend
     assert.deepEqual(body.system, [
@@ -108,7 +134,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const original = `${DEFAULT_PREFIX}\n\nrest of the prompt`;
     const body = makeBody({ system: original });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     // 命中 skip:string 被归一化成 array,原文本 byte-identical 保留,无 cache_control 注入
     assert.deepEqual(body.system, [{ type: "text", text: original }]);
@@ -124,7 +150,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const arr = [block];
     const body = makeBody({ system: arr });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     // 命中 skip:数组引用相同(无 prepend),内容 byte-identical
     assert.strictEqual(body.system, arr);
@@ -137,7 +163,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const original = { type: "text", text: "random custom prompt" };
     const body = makeBody({ system: [original] });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     assert.deepEqual(body.system, [
       {
@@ -157,7 +183,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
       const block = { type: "text", text: `${prefix}\n\nrest` };
       const body = makeBody({ system: [block] });
 
-      normalizeExternalApiKeyEnvelope(body, log);
+      run(body, log);
 
       assert.deepEqual(
         body.system,
@@ -171,10 +197,10 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const log = makeTestLogger();
     const body = makeBody({ system: [{ type: "text", text: "random" }] });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
     const afterFirst = JSON.parse(JSON.stringify(body.system));
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
     const afterSecond = JSON.parse(JSON.stringify(body.system));
 
     assert.deepEqual(afterSecond, afterFirst);
@@ -191,7 +217,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const textBlock = { type: "text", text: "describe this image" };
     const body = makeBody({ system: [imageBlock, textBlock] });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     assert.deepEqual(body.system, [
       {
@@ -217,7 +243,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const arr = [firstBlock, ccBlock];
     const body = makeBody({ system: arr });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     // 命中 skip:数组引用 + 内容均不变
     assert.strictEqual(body.system, arr);
@@ -231,7 +257,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     {
       const body = makeBody();
       assert.equal(body.metadata, undefined);
-      normalizeExternalApiKeyEnvelope(body, log);
+      run(body, log);
       assert.equal(body.metadata, undefined);
     }
 
@@ -242,7 +268,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
         system: [{ type: "text", text: "random" }],
         metadata: meta,
       });
-      normalizeExternalApiKeyEnvelope(body, log);
+      run(body, log);
       assert.strictEqual(body.metadata, meta); // 引用相同
       assert.deepEqual(body.metadata, {
         user_id: `{"device_id":"abc"}`,
@@ -257,7 +283,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
         system: [{ type: "text", text: `${DEFAULT_PREFIX}\n\nrest` }],
         metadata: meta,
       });
-      normalizeExternalApiKeyEnvelope(body, log);
+      run(body, log);
       assert.strictEqual(body.metadata, meta);
       assert.deepEqual(body.metadata, { user_id: "preserved" });
     }
@@ -280,7 +306,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
       ],
     });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     // helper 机械 prepend,不做 4 块上限预检 — 总计 5 个 cache_control 块(1 注入 + 1 原 system + 3 tools)
     assert.deepEqual(body.system, [
@@ -311,7 +337,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
       system: [{ type: "text", text: `${DEFAULT_PREFIX}\n\nx` }],
     });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     const skipLog = log.calls.find((c) => c.msg === "external_envelope_skip");
     assert.ok(skipLog, "skip log should be emitted");
@@ -331,7 +357,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
       const body = makeBody({
         system: [{ type: "text", text: `${AGENT_SDK_CC_PRESET}\n\nx` }],
       });
-      normalizeExternalApiKeyEnvelope(body, log);
+      run(body, log);
       const skipLog = log.calls.find((c) => c.msg === "external_envelope_skip");
       assert.equal((skipLog?.fields as { prefix_variant: number })?.prefix_variant, 1);
     }
@@ -341,7 +367,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
       const body = makeBody({
         system: [{ type: "text", text: `${AGENT_SDK}\n\nx` }],
       });
-      normalizeExternalApiKeyEnvelope(body, log);
+      run(body, log);
       const skipLog = log.calls.find((c) => c.msg === "external_envelope_skip");
       assert.equal((skipLog?.fields as { prefix_variant: number })?.prefix_variant, 2);
     }
@@ -350,7 +376,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
   test("info log skip 路径 orig_kind=string 当客户端发 string 形态 system", () => {
     const log = makeTestLogger();
     const body = makeBody({ system: `${DEFAULT_PREFIX}\n\nrest` });
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
     const skipLog = log.calls.find((c) => c.msg === "external_envelope_skip");
     assert.equal((skipLog?.fields as { orig_kind: string })?.orig_kind, "string");
   });
@@ -359,7 +385,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     const log = makeTestLogger();
     const body = makeBody({ system: [{ type: "text", text: "random" }] });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     const injLog = log.calls.find((c) => c.msg === "external_envelope_injected");
     assert.ok(injLog, "inject log should be emitted");
@@ -374,10 +400,67 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
   test("info log inject 路径 orig_kind=undefined 当客户端无 system", () => {
     const log = makeTestLogger();
     const body = makeBody({}); // system 缺失
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
     const injLog = log.calls.find((c) => c.msg === "external_envelope_injected");
     assert.equal((injLog?.fields as { orig_kind: string })?.orig_kind, "undefined");
     assert.equal((injLog?.fields as { blocks: number })?.blocks, 1); // 只有新注入的 prefix block
+  });
+
+  // ─── Phase 2 — PrefixSource 注入 + cache-not-ready 行为 ─────────────
+
+  test("Phase 2:prefixSource 任一 variant 返 null → 抛 EnvelopePrefixCacheNotReadyError", () => {
+    const log = makeTestLogger();
+    const body = makeBody({ system: [{ type: "text", text: "x" }] });
+    // 模拟 cache 未 bootstrap / 行被误删:get() 永远返 null
+    const nullSource: PrefixSource = { get: () => null };
+    assert.throws(
+      () => normalizeExternalApiKeyEnvelope(body, log, nullSource),
+      (err: unknown): boolean => {
+        return (
+          err instanceof EnvelopePrefixCacheNotReadyError &&
+          err.variant === "default" // PREFIX_VARIANTS[0] 先 miss
+        );
+      },
+    );
+    // **body 未被 mutate**:抛错先于任何归一化写入
+    assert.deepEqual(body.system, [{ type: "text", text: "x" }]);
+  });
+
+  test("Phase 2:prefixSource 命中 → 注入的是 source 返回的 default 字面(不再硬编码)", () => {
+    const log = makeTestLogger();
+    const body = makeBody();
+    // 给一个"异于历史硬编码"的字面 — 证明 inject 用的是 source.get('default') 而非编译期常量
+    const customDefault = "You are CustomBot, totally fake CLI.";
+    const customSource: PrefixSource = {
+      get(v) {
+        if (v === "default") return customDefault;
+        if (v === "agent_sdk_claude_code_preset") return AGENT_SDK_CC_PRESET;
+        if (v === "agent_sdk") return AGENT_SDK;
+        return null;
+      },
+    };
+    normalizeExternalApiKeyEnvelope(body, log, customSource);
+    assert.deepEqual(body.system, [
+      { type: "text", text: customDefault, cache_control: { type: "ephemeral" } },
+    ]);
+  });
+
+  test("Phase 2:prefixSource 改了 default 字面也会改 detectCcPrefix 命中(skip 路径与 source 同步)", () => {
+    const log = makeTestLogger();
+    const customDefault = "CUSTOM PREFIX ";
+    const customSource: PrefixSource = {
+      get(v) {
+        if (v === "default") return customDefault;
+        if (v === "agent_sdk_claude_code_preset") return AGENT_SDK_CC_PRESET;
+        if (v === "agent_sdk") return AGENT_SDK;
+        return null;
+      },
+    };
+    const block = { type: "text", text: `${customDefault}rest` };
+    const body = makeBody({ system: [block] });
+    normalizeExternalApiKeyEnvelope(body, log, customSource);
+    // skip 命中:没 prepend
+    assert.deepEqual(body.system, [block]);
   });
 
   test("非 text block 的 text 字段不被误判(text 字段在 image block 上含 prefix 仍不命中)", () => {
@@ -390,7 +473,7 @@ describe("normalizeExternalApiKeyEnvelope — invariant #11 (plan §3.5.2)", () 
     };
     const body = makeBody({ system: [sneakyBlock] });
 
-    normalizeExternalApiKeyEnvelope(body, log);
+    run(body, log);
 
     // image 块的 text 字段被忽略 → 未命中 → prepend 注入
     assert.deepEqual(body.system, [

@@ -63,6 +63,7 @@ import type { PricingCache, ModelPricing } from "../billing/pricing.js";
 import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
 import { _clearMaintenanceCache } from "../middleware/maintenanceMode.js";
+import { _setExternalEnvelopeDefaultSourceForTesting, type PrefixSource } from "../http/proxy/externalEnvelope.js";
 import type { Pool } from "pg";
 
 // ─── 固定常量 ───────────────────────────────────────────────────────────────
@@ -588,12 +589,32 @@ function readErrCode(res: MockRes): string | undefined {
 // 每个 test 之间清理:pool override + maintenance cache。前者直接泄漏会导致下一个
 // test setPoolOverride throw `pool already initialized`;后者会让"上一个 test 设过
 // maintenance=true 60s 内污染所有后续 test"。
+// V3 envv2 Phase 2(2026-05-21)— prefix template cache 在 integ harness 下没真 DB,
+// 用 module-level override 注入"与 0071 bootstrap seed 字面 byte-equal"的 prefix。
+// 任何此 helper 字面漂移都先红 Phase 0 invariant 测试。
+const BASELINE_PREFIX_SOURCE: PrefixSource = {
+  get(v) {
+    switch (v) {
+      case "default":
+        return `You are Claude Code, Anthropic's official CLI for Claude.`;
+      case "agent_sdk_claude_code_preset":
+        return `You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.`;
+      case "agent_sdk":
+        return `You are a Claude agent, built on Anthropic's Claude Agent SDK.`;
+      default:
+        return null;
+    }
+  },
+};
+
 beforeEach(() => {
   _clearMaintenanceCache();
+  _setExternalEnvelopeDefaultSourceForTesting(BASELINE_PREFIX_SOURCE);
 });
 afterEach(async () => {
   await resetPool();
   _clearMaintenanceCache();
+  _setExternalEnvelopeDefaultSourceForTesting(null);
 });
 
 // ════════════════════════════════════════════════════════════════════════════

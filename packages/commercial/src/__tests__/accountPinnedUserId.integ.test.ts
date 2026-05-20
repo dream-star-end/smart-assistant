@@ -32,6 +32,7 @@ const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB
 
 // 跟 accountScheduler.integ.test.ts 保持一致的 reset 范围(避免互相干扰)。
 const COMMERCIAL_TABLES = [
+  'envelope_prefix_templates',
   'rate_limit_events',
   'admin_audit',
   'agent_audit',

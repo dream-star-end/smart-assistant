@@ -32,6 +32,10 @@ import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
 import { PricingCache, createModelHintProvider } from "./billing/pricing.js";
+import {
+  startPrefixTemplateCache,
+  getPrefixTemplateCache,
+} from "./envelope/prefixTemplateCache.js";
 import { setModelHintProvider, setLiteratureSkillProvider } from "@openclaude/gateway";
 import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 import { renderLiteratureSkillContent } from "./literatureSkill.js";
@@ -610,6 +614,16 @@ export async function registerCommercial(
     // eslint-disable-next-line no-console
     console.error("[commercial] pricing LISTEN setup failed:", err);
   }
+
+  // V3 envv2 Phase 2(2026-05-21)— CC sysprompt prefix 模板 cache。
+  // 与 PricingCache 抽象一致(LISTEN/NOTIFY 同型),但**策略 fail-fast** 不像
+  // pricing 那样 fail-soft:prefix 是外接 ApiKey + OAuth 路径的硬依赖,
+  // cache 未 ready 时 normalizeExternalApiKeyEnvelope 会抛
+  // EnvelopePrefixCacheNotReadyError 让请求 500。启动期 DB 不通的根因应该
+  // 被部署系统 health check 直接看见,不能因为 fail-soft 把"prefix 全部走
+  // 不出去 → 整池被风控标"这种问题悄悄吞掉(详见 envelope/prefixTemplateCache.ts
+  // 头注释 § 失败模式)。
+  await startPrefixTemplateCache(cfg.DATABASE_URL);
 
   // 0060 — 把 per-model extra_system_prompt 注入到 gateway promptSlots。
   // gateway 不依赖 commercial(personal 版没这一行);commercial 启动时把 cache 反向暴露。
@@ -2328,6 +2342,8 @@ export async function registerCommercial(
       // pg pool 句柄,留着会阻止 closePool 释放最后引用)
       try { setLiteratureSkillProvider(null); } catch { /* ignore */ }
       try { await pricing.shutdown(); } catch { /* ignore */ }
+      // Phase 2 — prefix cache shutdown(同型释放 pg listener client)
+      try { await getPrefixTemplateCache()?.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closePool();
     },

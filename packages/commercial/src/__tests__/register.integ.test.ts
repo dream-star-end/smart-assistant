@@ -30,6 +30,7 @@ const REQUIRE_TEST_DB =
 let pgAvailable = false;
 
 const COMMERCIAL_TABLES = [
+  "envelope_prefix_templates",
   "rate_limit_events",
   "admin_audit",
   "agent_audit",

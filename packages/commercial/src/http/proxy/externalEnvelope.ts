@@ -1,7 +1,10 @@
 /**
  * V3 CC 外接 plan Phase 7(2026-05-20)— 出站 envelope 归一化。
+ * V3 envv2 Phase 2(2026-05-21)— 3 个 CC sysprompt prefix 从 in-code 硬编码迁到
+ * DB(envelope_prefix_templates 表 + PrefixTemplateCache LISTEN/NOTIFY)。
  *
- * 见 docs/V3_CC_EXTERNAL_ENDPOINT_PLAN_2026-05-18.md §3.5.2 / §4 invariant #11 / §7 Phase 7。
+ * 见 docs/V3_CC_EXTERNAL_ENDPOINT_PLAN_2026-05-18.md §3.5.2 / §4 invariant #11 / §7 Phase 7,
+ *    docs/V3_CC_EXTERNAL_ENDPOINT_ENVV2_PLAN_2026-05-21.md §Phase 2。
  *
  * ## 解决什么
  *
@@ -47,44 +50,88 @@
  * ## Idempotency
  *
  * 任何 body 跑两次本函数 = 跑一次。已含 CC sysprompt prefix 的 body(string / array
- * 形态均可)被检测到后直接 skip,不重复 prepend。具体见 `CC_SYSPROMPT_PREFIXES` 常量
- * 注释 + invariant #11 测试。
+ * 形态均可)被检测到后直接 skip,不重复 prepend。具体见 invariant #11 测试。
+ *
+ * ## Phase 2 — Prefix 模板源
+ *
+ * 三个 CC sysprompt prefix 字面**不再硬编码**,运行时从 PrefixTemplateCache 读。
+ * 调用方传 `prefixSource`(测试注入用)或不传(走 module singleton getPrefixTemplateCache())。
+ * Cache 未 bootstrap / 任一 variant 行被误删 → 抛 EnvelopePrefixCacheNotReadyError,
+ * **fail-closed**(handler 应吃到 500 而不是 fallback 到 in-code default,避免单一权威源漂移)。
  */
 
 import type { Logger } from "../../logging/logger.js";
 import type { ProxyBody } from "./shared.js";
+import {
+  getPrefixTemplateCache,
+  type PrefixTemplateCache,
+  type PrefixVariant,
+  PREFIX_VARIANTS,
+} from "../../envelope/prefixTemplateCache.js";
 
 /**
- * 官方 Claude Code CLI sysprompt prefix 常量。
- *
- * **就地硬编码,不引入 claude-code-best 依赖**(commercial 不该 build-time 引 CCB)。
- * 源:`claude-code-best/src/constants/system.ts:10-12`。
- *
- * 三个变体覆盖容器内 `getCLISyspromptPrefix()` 所有产出:
- *   - DEFAULT:交互式 / 非 vertex 默认
- *   - AGENT_SDK_CLAUDE_CODE_PRESET:`isNonInteractive=true && hasAppendSystemPrompt=true`
- *   - AGENT_SDK:`isNonInteractive=true && hasAppendSystemPrompt=false`
- *
- * 上游 Anthropic anti-abuse fingerprinter 把这 3 个字面前缀作为"CC 客户端"的强特征,
- * 服务端注入任一即可让外接请求落入"CC 形态"分桶。本 helper 注入 DEFAULT_PREFIX
- * 是因为它在 1P/3P 路径上最稳;客户端如果已发 SDK 变体也照样跳过(startsWith 三选一)。
- *
- * **注意**:三个字符串以**字面 byte** 形式参与 startsWith 匹配。CCB 上游升级若改这三
- * 个字符串(罕见,这是 anti-abuse 锚点),本文件需同步更新 — Phase 7 plan §3.5.2 已
- * 锁这条契约。
+ * Prefix 取源接口。生产路径默认走 module singleton;测试可注入 stub 避免触碰
+ * singleton 状态(测试间泄漏)。返回 null 等同 cache 未 ready / 行不存在,
+ * 由本 helper 抛 EnvelopePrefixCacheNotReadyError。
  */
-const CC_DEFAULT_PREFIX =
-  `You are Claude Code, Anthropic's official CLI for Claude.`;
-const CC_AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX =
-  `You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.`;
-const CC_AGENT_SDK_PREFIX =
-  `You are a Claude agent, built on Anthropic's Claude Agent SDK.`;
+export interface PrefixSource {
+  get(variant: PrefixVariant): string | null;
+}
 
-const CC_SYSPROMPT_PREFIXES: readonly string[] = [
-  CC_DEFAULT_PREFIX,
-  CC_AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX,
-  CC_AGENT_SDK_PREFIX,
-];
+export class EnvelopePrefixCacheNotReadyError extends Error {
+  readonly variant: PrefixVariant | "any";
+  constructor(variant: PrefixVariant | "any") {
+    super(`envelope prefix template cache not ready: ${variant}`);
+    this.name = "EnvelopePrefixCacheNotReadyError";
+    this.variant = variant;
+  }
+}
+
+/**
+ * 测试 hook:在不能 bootstrap singleton cache 的场景(integ harness 用 FakePool 而非
+ * 真 DB)允许注入一个**模块级** override。生产路径不应触碰此 hook。
+ *
+ * **正常注入**应走 normalizeExternalApiKeyEnvelope 第 3 参 `prefixSource`(unit 测试);
+ * 这里这个 module-level override 只为 `ccExternalEndpoint.integ.test.ts` 走完整
+ * createCommercialHandler 链路时,无法从 caller 注入到 helper 的兜底口子。
+ *
+ * 必须在每个测试 setup 显式 reset(_resetTestingOverride),否则跨 test 泄漏。
+ */
+let testingDefaultOverride: PrefixSource | null = null;
+export function _setExternalEnvelopeDefaultSourceForTesting(src: PrefixSource | null): void {
+  testingDefaultOverride = src;
+}
+
+/** 默认 prefix 取源:测试 override 优先,再走 singleton cache;未 bootstrap → null-only stub(让 helper 显式抛)。 */
+function defaultPrefixSource(): PrefixSource {
+  if (testingDefaultOverride !== null) return testingDefaultOverride;
+  const cache: PrefixTemplateCache | null = getPrefixTemplateCache();
+  if (cache === null) {
+    // cache 未 bootstrap — 不在这里抛,让上层路径抛 EnvelopePrefixCacheNotReadyError
+    // 时带上具体 variant 名,error message 更可定位。
+    return { get: () => null };
+  }
+  return { get: (v) => cache.get(v) };
+}
+
+/**
+ * 把所有 3 个 active prefix 字面一次性读出来。cache miss(任一返回 null)→ 抛错。
+ *
+ * 在 helper 入口一次性读,而不是分散在 detectCcPrefix 内部按需读:语义清晰
+ * (一次外接请求 = 一次 prefix snapshot),且如果 NOTIFY 中途到来,本次请求看到
+ * 的快照仍一致(不会出现 detect 用旧值、inject 用新值的撕裂)。
+ */
+function snapshotPrefixes(src: PrefixSource): readonly string[] {
+  const out: string[] = [];
+  for (const v of PREFIX_VARIANTS) {
+    const text = src.get(v);
+    if (text === null) {
+      throw new EnvelopePrefixCacheNotReadyError(v);
+    }
+    out.push(text);
+  }
+  return out;
+}
 
 /**
  * 判某个 `system` array 中的 block 是否为"含 CC prefix 的 text block"。
@@ -95,10 +142,11 @@ const CC_SYSPROMPT_PREFIXES: readonly string[] = [
  *
  * 对非 text block(如 type:"image")**不**误读其 `text` 字段。
  *
- * 返回命中的 prefix 索引(0=DEFAULT, 1=AGENT_SDK_CLAUDE_CODE_PRESET, 2=AGENT_SDK),
- * 不命中返回 -1。索引进 log 帮助 ops 判断客户端打的哪种 CC 变体(parity 诊断)。
+ * 返回命中的 prefix 索引(对齐 PREFIX_VARIANTS 数组顺序:0=default,
+ * 1=agent_sdk_claude_code_preset, 2=agent_sdk),不命中返回 -1。
+ * 索引进 log 帮助 ops 判断客户端打的哪种 CC 变体(parity 诊断)。
  */
-function detectCcPrefix(block: unknown): number {
+function detectCcPrefix(block: unknown, prefixes: readonly string[]): number {
   if (
     !block ||
     typeof block !== "object" ||
@@ -108,8 +156,8 @@ function detectCcPrefix(block: unknown): number {
   }
   const text = (block as { text?: unknown }).text;
   if (typeof text !== "string") return -1;
-  for (let i = 0; i < CC_SYSPROMPT_PREFIXES.length; i++) {
-    if (text.startsWith(CC_SYSPROMPT_PREFIXES[i]!)) return i;
+  for (let i = 0; i < prefixes.length; i++) {
+    if (text.startsWith(prefixes[i]!)) return i;
   }
   return -1;
 }
@@ -132,11 +180,20 @@ function detectCcPrefix(block: unknown): number {
  *
  * **不**触碰 `body.metadata`(device_id pin 由 `applyUpstreamAuth` 后续阶段处理)。
  * **不**伪造 `x-anthropic-billing-header`(给上游假指纹更糟,见 plan §3.5.2 决策)。
+ *
+ * @throws EnvelopePrefixCacheNotReadyError cache 未 bootstrap / 任一 variant 行缺失。
  */
 export function normalizeExternalApiKeyEnvelope(
   body: ProxyBody,
   log: Logger,
+  prefixSource?: PrefixSource,
 ): void {
+  const src = prefixSource ?? defaultPrefixSource();
+  const prefixes = snapshotPrefixes(src);
+  // PREFIX_VARIANTS[0] === "default" — 0071 migration 与本文件 union 同序约束,
+  // 这里下标 0 = default text。
+  const defaultPrefix = prefixes[0]!;
+
   // 1) 归一化 body.system 形态成 array — `origKind` 进 log 帮助 ops 看客户端原始
   //    形态(用于 parity 诊断:容器 CCB 一直发 array,curl/SDK 客户端常发 string 或缺失)。
   let systemArr: unknown[];
@@ -161,7 +218,7 @@ export function normalizeExternalApiKeyEnvelope(
   //    DEFAULT(0)/ AGENT_SDK_CLAUDE_CODE_PRESET(1)/ AGENT_SDK(2)哪种 CC 形态。
   let prefixVariant = -1;
   for (const block of systemArr) {
-    const v = detectCcPrefix(block);
+    const v = detectCcPrefix(block, prefixes);
     if (v >= 0) {
       prefixVariant = v;
       break;
@@ -191,7 +248,7 @@ export function normalizeExternalApiKeyEnvelope(
   // 3) 未命中 → prepend DEFAULT_PREFIX block(带 ephemeral cache_control)
   const injectedBlock = {
     type: "text" as const,
-    text: CC_DEFAULT_PREFIX,
+    text: defaultPrefix,
     cache_control: { type: "ephemeral" as const },
   };
   body.system = [injectedBlock, ...systemArr] as ProxyBody["system"];

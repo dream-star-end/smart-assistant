@@ -64,6 +64,7 @@ const JWT_SECRET = "i".repeat(64);
 // 完整表列表(0001..0046)。`DROP TABLE IF EXISTS ... CASCADE` 对未列出的表
 // 不会自动级联删表本身,只会断 FK,所以必须显式枚举所有表名。
 const COMMERCIAL_TABLES = [
+  "envelope_prefix_templates",
   "inbox_message_reads",
   "inbox_messages",
   "oauth_identities",

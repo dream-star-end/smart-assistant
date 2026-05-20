@@ -30,6 +30,7 @@ let pgAvailable = false;
 
 /** 涉及的所有商业化表,按 FK 依赖的逆序 DROP(child 在前)。 */
 const COMMERCIAL_TABLES = [
+  "envelope_prefix_templates",
   "rate_limit_events",
   "admin_audit",
   "agent_audit",

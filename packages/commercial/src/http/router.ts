@@ -101,6 +101,10 @@ import {
   handleAdminPatchPricing,
 } from './admin/pricing.js'
 import {
+  handleAdminListEnvelopePrefixTemplates,
+  handleAdminPutEnvelopePrefixTemplate,
+} from './admin/envelopePrefixTemplates.js'
+import {
   handleAdminGetLiterature,
   handleAdminPatchLiterature,
   handleAdminTestLiterature,
@@ -535,6 +539,9 @@ export function createCommercialHandler(
     // T-60 超管定价
     { method: 'GET', path: '/api/admin/pricing', handler: handleAdminListPricing },
     { method: 'PATCH', pathPrefix: '/api/admin/pricing/', handler: handleAdminPatchPricing },
+    // V3 envv2 Phase 2(2026-05-21)— CC sysprompt prefix 模板
+    { method: 'GET', path: '/api/admin/envelope-prefix-templates', handler: handleAdminListEnvelopePrefixTemplates },
+    { method: 'PUT', pathPrefix: '/api/admin/envelope-prefix-templates/', handler: handleAdminPutEnvelopePrefixTemplate },
     // DeepXiv 文献检索(平台级,单例) — exact-path 在 test 子资源之前
     { method: 'GET', path: '/api/admin/literature', handler: handleAdminGetLiterature },
     { method: 'PATCH', path: '/api/admin/literature', handler: handleAdminPatchLiterature },

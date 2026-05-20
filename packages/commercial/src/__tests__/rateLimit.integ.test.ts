@@ -29,6 +29,7 @@ let pgAvailable = false;
 let redis: IORedis | null = null;
 
 const COMMERCIAL_TABLES = [
+  "envelope_prefix_templates",
   "rate_limit_events",
   "admin_audit",
   "agent_audit",

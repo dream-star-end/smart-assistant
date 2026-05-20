@@ -31,6 +31,7 @@ const REQUIRE_TEST_DB =
 
 // 与 http.integ.test.ts 一致,测试后清掉所有商业化表重建
 const COMMERCIAL_TABLES = [
+  "envelope_prefix_templates",
   "rate_limit_events",
   "admin_audit",
   "agent_audit",

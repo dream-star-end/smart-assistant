@@ -39,6 +39,7 @@ const TEST_DB_URL =
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 
 const COMMERCIAL_TABLES = [
+  'envelope_prefix_templates',
   'rate_limit_events',
   'admin_audit',
   'agent_audit',

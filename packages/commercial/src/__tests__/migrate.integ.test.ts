@@ -29,6 +29,7 @@ let pgAvailable = false;
 /** 所有商业化表 + schema_migrations。用 DROP ... CASCADE,顺序无所谓,
  *  但仍列全,方便未来新增迁移时保持清理同步。 */
 const COMMERCIAL_TABLES = [
+  "envelope_prefix_templates",
   "rate_limit_events",
   "admin_audit",
   "agent_audit",
