@@ -189,6 +189,18 @@ export interface PickResult {
    * 让 Anthropic 网关看到稳定的 "account_uuid ↔ device_id" 一对一绑定。
    */
   pinned_user_id: string
+  /**
+   * V3 envv2 Phase 4(2026-05-21):outbound envelope 版本派发位。
+   * handler 在 pickUpstream 之后据此选 v1 / v2 normalize helper。
+   * 1 = legacy(prod default),2 = canary v2(boss 手动 UPDATE 一个 account 灰度)。
+   */
+  envelope_version: number
+  /**
+   * V3 envv2 Phase 4(2026-05-21):v2 normalize 用 SHA256(salt || account.id)
+   * 派生 L0 attribution fingerprint 与 L1 4 字段(os_arch / cpu_count /
+   * node_version / hostname_prefix)。BYTEA 16-byte,绝不外泄。
+   */
+  fingerprint_salt: Buffer
 }
 
 /**
@@ -256,6 +268,20 @@ export interface CandidateRow extends QueryResultRow {
    * 来自 claude_accounts.pinned_user_id 列(0067 migration)。
    */
   pinned_user_id: string
+  /**
+   * V3 envv2 Phase 1(0070 migration):outbound envelope 版本派发。
+   *   1 = legacy `normalizeExternalApiKeyEnvelope`(L0 prefix only)
+   *   2 = `normalizeExternalApiKeyEnvelopeV2`(L0 prefix + attribution + L1 派生)
+   * DEFAULT 1 + CHECK in (1,2) 由 SQL 约束,handler 按此值在 pick 后派发。
+   */
+  envelope_version: number
+  /**
+   * V3 envv2 Phase 3(0072 migration):account-level 16-byte 反风控 salt。
+   * v2 normalize 用 SHA256(salt || account.id) 派生 L0 fingerprint + L1 各字段。
+   * BYTEA NOT NULL,DEFAULT gen_random_bytes(16),CHECK octet_length=16。
+   * **绝不**暴露给 admin API / UI(身份锚的对抗目标就是不可外泄)。
+   */
+  fingerprint_salt: Buffer
 }
 
 /** 默认哈希:SHA-256,截前 8B 作 64-bit 无符号整数。 */
@@ -482,7 +508,9 @@ export class AccountScheduler {
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score,
               quota_5h_pct, quota_7d_pct, subscription_end_at,
-              pinned_user_id
+              pinned_user_id,
+              envelope_version,
+              fingerprint_salt
        FROM claude_accounts
        WHERE status = 'active' AND provider = $1 AND kind = $2
        ORDER BY id`,
@@ -530,6 +558,8 @@ export class AccountScheduler {
             egress_proxy: tok.egress_proxy,
             egress_target: tok.egress_target,
             pinned_user_id: chosen.pinned_user_id,
+            envelope_version: chosen.envelope_version,
+            fingerprint_salt: chosen.fingerprint_salt,
           }
         }
         // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选

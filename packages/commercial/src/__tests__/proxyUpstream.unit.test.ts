@@ -59,6 +59,8 @@ function makePick(over: Partial<PickResult> = {}): PickResult {
     egress_proxy: null,
     egress_target: null,
     pinned_user_id: PINNED_OK,
+    envelope_version: 1,
+    fingerprint_salt: Buffer.alloc(16),
     ...over,
   };
 }

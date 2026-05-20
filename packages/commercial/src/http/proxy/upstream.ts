@@ -118,6 +118,26 @@ export interface PreparedUpstreamSession {
   readonly dispatcher: Dispatcher | undefined;
   /** 上游响应是否值得抓 quota(OAuth=true;DeepSeek=false) */
   readonly shouldUpdateQuotaFromResponse: boolean;
+  /**
+   * V3 envv2 Phase 4(2026-05-21):outbound envelope 版本派发位。
+   * OAuth pool 路径 = `pick.envelope_version`(prod default 1,boss 手动 UPDATE 灰度到 2);
+   * DeepSeek 路径 = 1(handler 在 DeepSeek 路径下不调任何 envelope normalizer,字段值实际不读)。
+   */
+  readonly envelopeVersion: number;
+  /**
+   * V3 envv2 Phase 4(2026-05-21):v2 normalize 派生输入。
+   * OAuth pool 路径 = `pick.fingerprint_salt`(16 byte BYTEA);
+   * DeepSeek 路径 = `null`。handler 派发 v2 时,必须先验 envelopeVersion === 2 && fingerprintSalt !== null
+   * 再调 normalize(防数据异常 — schema 已约束 NOT NULL,但兜底保好习惯)。
+   */
+  readonly fingerprintSalt: Buffer | null;
+  /**
+   * V3 envv2 Phase 4(2026-05-21):account.id 的 string 形式。v2 normalize 入参签名要 string
+   * (sha256 输入要稳定的字节序);accountId 是 bigint | null,这里给 string seam 让 handler
+   * 不必在站现 toString。OAuth 路径 = `pick.account_id.toString()`;DeepSeek 路径 = ""(空串
+   * 实际不读)。
+   */
+  readonly accountIdStr: string;
 
   /**
    * 写入 Authorization + Anthropic beta 头 + (OAuth)body.metadata.user_id device_id pin。
@@ -223,6 +243,10 @@ function makeDeepSeekUpstream(apiKey: string): PreparedUpstreamSession {
     endpoint: DEEPSEEK_UPSTREAM_ENDPOINT,
     dispatcher: undefined,
     shouldUpdateQuotaFromResponse: false,
+    // V3 envv2 Phase 4:DeepSeek 不走 envelope normalizer,值为占位且 handler 不读。
+    envelopeVersion: 1,
+    fingerprintSalt: null,
+    accountIdStr: "",
     applyUpstreamAuth(safeHeaders, _body, _log) {
       safeHeaders.authorization = `Bearer ${apiKey}`;
       delete safeHeaders["anthropic-beta"];
@@ -250,6 +274,13 @@ function makeOAuthPoolUpstream(
     endpoint,
     dispatcher,
     shouldUpdateQuotaFromResponse: true,
+    // V3 envv2 Phase 4(2026-05-21):outbound envelope 派发位 + 派生 salt + accountId 字符串形。
+    // pick.envelope_version 由 0070 migration NOT NULL DEFAULT 1,boss 手动 UPDATE 灰度到 2。
+    // pick.fingerprint_salt 由 0072 migration NOT NULL DEFAULT gen_random_bytes(16),v2 normalizer
+    // 用其作 sha256 prefix(同账号跨进程稳定、跨账号不可关联)。
+    envelopeVersion: pick.envelope_version,
+    fingerprintSalt: pick.fingerprint_salt,
+    accountIdStr: pick.account_id.toString(),
     applyUpstreamAuth(safeHeaders, body, log) {
       // (i) Bearer
       safeHeaders.authorization = `Bearer ${pick.token.toString("utf8")}`;
@@ -412,6 +443,10 @@ export async function pickUpstream(
           egress_proxy: pick.egress_proxy,
           egress_target: pick.egress_target,
           pinned_user_id: pick.pinned_user_id,
+          // V3 envv2 Phase 4:envelope_version + fingerprint_salt 是 account 静态属性,
+          // 跨 refresh 不变,从老 pick 透传(refresh 不返回这两字段,SELECT 它们是 scheduler 责任)。
+          envelope_version: pick.envelope_version,
+          fingerprint_salt: pick.fingerprint_salt,
         };
       } catch (err) {
         // (b₁) refresh 失败:
@@ -502,10 +537,22 @@ export async function pickUpstream(
  * **不**调 `session.zeroizeSecrets()` —— token 生命周期归 session 内部 + handler finally,
  * 此函数只管 pool 释放,职责单一。caller(handler)负责自己调 zeroizeSecrets。
  */
+/**
+ * V3 envv2 Phase 4(2026-05-21):reason 类型从 `{kind:"failure"}` 拓宽到 ReleaseResult 全集
+ * (除 'success' — 那是 finalizer 的活)。动机:case (c) 窗口不止 finalizer 创建失败一种,
+ * 还有 preCheck attachment / InsufficientCredits 等"账号无辜"的 client_error 路径需要
+ * release 槽位但**不**扣账号健康分。当前 caller(handler.ts)若传 client_error,scheduler
+ * 端见 scheduler.ts ReleaseResult 注释:dec inflight 不扣健康分。
+ */
+export type ReleaseBeforeFinalizerReason =
+  | { kind: "failure"; error?: string | null }
+  | { kind: "transient_network"; error?: string | null }
+  | { kind: "client_error"; error?: string | null };
+
 export async function releaseUpstreamSession(
   scheduler: Pick<AccountScheduler, "release">,
   session: PreparedUpstreamSession,
-  reason: { kind: "failure"; error: string },
+  reason: ReleaseBeforeFinalizerReason,
   log: Logger,
 ): Promise<void> {
   if (session.accountId === null) return;

@@ -361,27 +361,138 @@ describe("normalizeExternalApiKeyEnvelopeV2 — plan §Phase 3", () => {
     assert.equal(fp, expected);
   });
 
-  test("metadata.user_id 非 JSON → 保持不动(fail-open)", () => {
+  test("metadata.user_id 非 JSON → 覆写为派生 L1 JSON(Phase 4 Codex #4)", () => {
     const body = makeBody({
       system: "x",
       metadata: { user_id: "plain-not-json-string" },
     }) as ProxyBody;
     run(body);
-    assert.equal(body.metadata!.user_id, "plain-not-json-string");
+    // malformed 不再 silent fail-open;用派生 L1 覆盖
+    const parsed = JSON.parse(body.metadata!.user_id as string);
+    assert.ok(typeof parsed === "object" && parsed !== null && !Array.isArray(parsed));
+    assert.ok(["arm64", "x64"].includes(parsed.os_arch));
+    assert.ok([8, 12, 16, 32].includes(parsed.cpu_count));
+    assert.ok(["v20.18.0", "v22.10.0", "v24.0.0"].includes(parsed.node_version));
+    assert.ok(["mac-", "ubuntu-", "dev-"].includes(parsed.hostname_prefix));
   });
 
-  test("metadata.user_id 是 JSON array → 保持不动", () => {
+  test("metadata.user_id 是 JSON array → 覆写为派生 L1 JSON(Phase 4 Codex #4)", () => {
     const body = makeBody({
       system: "x",
       metadata: { user_id: '["a","b"]' },
     }) as ProxyBody;
     run(body);
-    assert.equal(body.metadata!.user_id, '["a","b"]');
+    const parsed = JSON.parse(body.metadata!.user_id as string);
+    assert.ok(typeof parsed === "object" && parsed !== null && !Array.isArray(parsed));
+    // 4 派生字段都在
+    assert.ok("os_arch" in parsed);
+    assert.ok("cpu_count" in parsed);
+    assert.ok("node_version" in parsed);
+    assert.ok("hostname_prefix" in parsed);
   });
 
-  test("metadata.user_id 空 / undefined → 不写入 user_id(L1 不派生本 phase)", () => {
+  test("metadata.user_id 空 / undefined → 写入派生 L1 JSON(Phase 4 派生)", () => {
     const body = makeBody({ system: "x", metadata: {} }) as ProxyBody;
     run(body);
-    assert.equal(body.metadata!.user_id, undefined);
+    const userId = body.metadata!.user_id;
+    assert.ok(typeof userId === "string" && userId.length > 0);
+    const parsed = JSON.parse(userId as string);
+    assert.ok(["arm64", "x64"].includes(parsed.os_arch));
+    assert.ok([8, 12, 16, 32].includes(parsed.cpu_count));
+    assert.ok(["v20.18.0", "v22.10.0", "v24.0.0"].includes(parsed.node_version));
+    assert.ok(["mac-", "ubuntu-", "dev-"].includes(parsed.hostname_prefix));
   });
 });
+
+// ─── Phase 4: L1 派生 4 字段(2026-05-21)────────────────────────────────
+describe("L1 derivation — Phase 4", () => {
+  test("L1-D1: 同 account → L1 派生跨调用稳定(I6 同型不变量)", () => {
+    const a = makeBody({ system: "x", metadata: {} }) as ProxyBody;
+    const b = makeBody({ system: "x", metadata: {} }) as ProxyBody;
+    run(a);
+    run(b);
+    assert.equal(
+      body_user_id(a),
+      body_user_id(b),
+      "同 account.id + 同 salt → L1 派生必相同字节",
+    );
+  });
+
+  test("L1-D2: 跨 account → L1 派生独立(salt 隔离)", () => {
+    // 找两个 account.id 使其 L1 派生不同的极小概率(2 candidates 时碰撞 50%) —
+    // 这里改用 4-字段联合断言:cpu_count + node_version + hostname_prefix 都撞的
+    // 概率 = 1 / (4*3*3) ≈ 2.8%(2 候选的 os_arch 排除外),实际抽样 ID_A vs ID_B
+    // 验证 SALT_A 下两个 id 至少 1 字段不同。若未来 PRNG 改变导致这个具体 case
+    // 撞,需换 ID 或增加 candidate。
+    const bodyA = makeBody({ system: "x", metadata: {} }) as ProxyBody;
+    const bodyB = makeBody({ system: "x", metadata: {} }) as ProxyBody;
+    run(bodyA, makeAccount({ id: ID_A }));
+    run(bodyB, makeAccount({ id: ID_B }));
+    assert.notEqual(
+      body_user_id(bodyA),
+      body_user_id(bodyB),
+      "ID_A 与 ID_B 的派生应至少 1 字段不同(否则需换 ID fixture)",
+    );
+  });
+
+  test("L1-D3: 客户端已显式提供字段 → 服务端不覆盖(L1 漂移层语义)", () => {
+    const body = makeBody({
+      system: "x",
+      metadata: {
+        user_id: JSON.stringify({
+          device_id: "client-device-xyz",
+          os_arch: "client-set-arm",
+          cpu_count: 99,
+          node_version: "v99.0.0",
+          hostname_prefix: "client-",
+        }),
+      },
+    }) as ProxyBody;
+    run(body);
+    const parsed = JSON.parse(body.metadata!.user_id as string);
+    assert.equal(parsed.os_arch, "client-set-arm");
+    assert.equal(parsed.cpu_count, 99);
+    assert.equal(parsed.node_version, "v99.0.0");
+    assert.equal(parsed.hostname_prefix, "client-");
+    // device_id 也保留(applyUpstreamAuth 阶段才 rewrite 到 pinned_user_id)
+    assert.equal(parsed.device_id, "client-device-xyz");
+  });
+
+  test("L1-D4: 客户端提供部分字段 → 仅缺失字段被 fill 派生", () => {
+    const body = makeBody({
+      system: "x",
+      metadata: {
+        user_id: JSON.stringify({
+          device_id: "client-device-xyz",
+          os_arch: "x64", // 客户端提供
+          // cpu_count / node_version / hostname_prefix 缺失
+        }),
+      },
+    }) as ProxyBody;
+    run(body);
+    const parsed = JSON.parse(body.metadata!.user_id as string);
+    assert.equal(parsed.os_arch, "x64", "客户端 os_arch 保留");
+    assert.equal(parsed.device_id, "client-device-xyz");
+    // 缺位字段 fill 派生
+    assert.ok([8, 12, 16, 32].includes(parsed.cpu_count));
+    assert.ok(["v20.18.0", "v22.10.0", "v24.0.0"].includes(parsed.node_version));
+    assert.ok(["mac-", "ubuntu-", "dev-"].includes(parsed.hostname_prefix));
+  });
+
+  test("L1-D5: 同 account 同字段缺失 → 4 字段派生跨 2 调用稳定", () => {
+    const a = makeBody({ system: "x", metadata: {} }) as ProxyBody;
+    const b = makeBody({ system: "x", metadata: {} }) as ProxyBody;
+    run(a);
+    run(b);
+    const pa = JSON.parse(body_user_id(a) as string);
+    const pb = JSON.parse(body_user_id(b) as string);
+    assert.equal(pa.os_arch, pb.os_arch);
+    assert.equal(pa.cpu_count, pb.cpu_count);
+    assert.equal(pa.node_version, pb.node_version);
+    assert.equal(pa.hostname_prefix, pb.hostname_prefix);
+  });
+});
+
+function body_user_id(body: ProxyBody): string | undefined {
+  return body.metadata?.user_id;
+}

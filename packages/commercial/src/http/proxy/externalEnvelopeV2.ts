@@ -209,44 +209,183 @@ function buildAttributionBlock(fingerprint: string): {
 }
 
 /**
- * L1 框架:strip 客户端塞的 `metadata.user_id.fingerprint`(spoof prevention)。
+ * L1 派生字段:服务端建议的 4 个客户端指纹字段,客户端**已显式提供同名字段**时
+ * 保留客户端值(allows "同人换机器" 漂移),未提供时 fill 服务端派生默认。
  *
- * 设计依据(Codex Phase 3 plan-review PASS-MINOR 锁版):
- *   - `metadata` undefined / `metadata.user_id` undefined / 空串 → 创建 `{}`,
- *     但只在确实有变化时写回(本 phase: 不派生 L1 字段,所以空 → 不写,保持
- *     outbound 与原始一致,避免无意义的 metadata.user_id 注入)
- *   - `metadata.user_id` 非 JSON(plain string)/ array / primitive → **不动**,
- *     视作未知形态;v1 那条路径上 applyUpstreamAuth.rewriteMetadataDeviceId
- *     有同样 fail-open 兜底
- *   - `metadata.user_id` parse 出 plain object → delete `fingerprint` key
- *     (若存在),stringify 写回。其它字段一律保留(包括 device_id —
- *     applyUpstreamAuth 后续阶段会重写为 pinned_user_id)
+ * 4 字段选择依据(对齐真实 CCB 用户分布,见 boss "一个 ApiKey 在 3 台机器跑还像
+ * 真人吗" 验收标准):
+ *   - `os_arch`         机器架构    2 候选 — CCB 用户里 arm64 / x64 各半
+ *   - `cpu_count`       CPU 核数    4 候选 — 8 / 12 / 16 / 32(常见 dev/server 规格)
+ *   - `node_version`    Node 版本   3 候选 — v20.18 / v22.10 / v24.0(LTS + 当前)
+ *   - `hostname_prefix` 主机名前缀  3 候选 — 真人开发者命名习惯
  *
- * 返回是否真做了 strip(进 log;0 / 1 计数)。
+ * 不变量(同 L0 fingerprint):同 account → 同派生值;跨 account → 派生独立(不可
+ * 关联,salt 隔离)。客户端覆盖优先(L1 漂移层语义)。
+ *
+ * 决策依据(Codex Phase 4 plan-review):2 候选的 os_arch 会让同 salt 不同 account
+ * 有 50% 概率撞 arch — 但 L0 fingerprint 是身份锚,L1 撞了不破不变量,只是 L1 帮
+ * 不上忙(同源信号被淹没,但 L0 不淹)。
  */
-function stripClientFingerprintField(body: ProxyBody): boolean {
+interface L1Defaults {
+  os_arch: string;
+  cpu_count: number;
+  node_version: string;
+  hostname_prefix: string;
+}
+
+const L1_OS_ARCH = ["arm64", "x64"] as const;
+const L1_CPU_COUNT = [8, 12, 16, 32] as const;
+const L1_NODE_VERSION = ["v20.18.0", "v22.10.0", "v24.0.0"] as const;
+const L1_HOSTNAME_PREFIX = ["mac-", "ubuntu-", "dev-"] as const;
+
+/**
+ * Deterministic PRNG:`sha256(salt || account.id || field).readUInt32BE(0) % N`。
+ *
+ * - salt-first byte order 与 `computeFingerprint` 一致(I6 跨 deploy 稳定)
+ * - field 名拼进 hash 输入,4 个字段间 PRNG 独立(否则同账号 4 字段会强相关)
+ * - readUInt32BE 取前 32 bit:N ≤ 4 时,模偏差远小于 1 / N 的可观测阈值(2^32 / 4 = 1.07e9)
+ */
+function deriveL1Field(
+  salt: Buffer,
+  accountId: string,
+  field: string,
+  choices: readonly (string | number)[],
+): string | number {
+  const idBuf = Buffer.from(accountId, "utf8");
+  const fieldBuf = Buffer.from(field, "utf8");
+  const h = createHash("sha256")
+    .update(Buffer.concat([salt, idBuf, fieldBuf]))
+    .digest();
+  const idx = h.readUInt32BE(0) % choices.length;
+  return choices[idx]!;
+}
+
+function deriveL1Defaults(salt: Buffer, accountId: string): L1Defaults {
+  return {
+    os_arch: deriveL1Field(salt, accountId, "os_arch", L1_OS_ARCH) as string,
+    cpu_count: deriveL1Field(salt, accountId, "cpu_count", L1_CPU_COUNT) as number,
+    node_version: deriveL1Field(
+      salt,
+      accountId,
+      "node_version",
+      L1_NODE_VERSION,
+    ) as string,
+    hostname_prefix: deriveL1Field(
+      salt,
+      accountId,
+      "hostname_prefix",
+      L1_HOSTNAME_PREFIX,
+    ) as string,
+  };
+}
+
+/**
+ * L1 框架 + 派生(Phase 4)。处理 `metadata.user_id` JSON:
+ *
+ *   - strip 客户端塞的 `fingerprint` 字段(spoof prevention I5b — L0 才是身份锚,
+ *     L1 fingerprint 不接受客户端塞)
+ *   - 4 个 L1 派生字段:客户端**已显式提供同名 key** 时保留客户端值(漂移层语义);
+ *     缺字段时 fill 服务端派生默认
+ *
+ * 输入处理分支(Codex Phase 4 plan-review #4 采纳:malformed 不再 return unchanged):
+ *   - `metadata` undefined → 创建 `metadata = { user_id: stringified-derived-L1 }`
+ *   - `metadata.user_id` undefined / 空串 → 创建 `{ ...派生 }` stringify 写入
+ *   - `metadata.user_id` 非 JSON 字符串 → log warn + 用 `{ ...派生 }` **覆盖**
+ *     (老的非 JSON 字符串数据会丢 — 这是有意行为:既然不是 JSON 形态,在 outbound
+ *     CC 形态下也无法被上游正确解析,代为补成合法 CC 形态)
+ *   - `metadata.user_id` parse 出非 object(primitive / array)→ log warn +
+ *     `{ ...派生 }` 覆盖(同上)
+ *   - `metadata.user_id` parse 出 plain object → strip fingerprint + 4 字段缺位
+ *     才 fill 派生 + stringify 写回(客户端字段全部保留)
+ *
+ * 返回结构化日志元信息(仅 boolean 标志,不含敏感值)。
+ */
+interface L1ApplyResult {
+  stripped_client_fingerprint: boolean;
+  derived_os_arch: boolean;
+  derived_cpu_count: boolean;
+  derived_node_version: boolean;
+  derived_hostname_prefix: boolean;
+  /** malformed 路径触发,需要 caller log warn 而非 info */
+  malformed_user_id: boolean;
+}
+
+function applyL1Defaults(
+  body: ProxyBody,
+  salt: Buffer,
+  accountId: string,
+): L1ApplyResult {
+  const defaults = deriveL1Defaults(salt, accountId);
+  const result: L1ApplyResult = {
+    stripped_client_fingerprint: false,
+    derived_os_arch: false,
+    derived_cpu_count: false,
+    derived_node_version: false,
+    derived_hostname_prefix: false,
+    malformed_user_id: false,
+  };
+
+  // 兜底创建 metadata(ProxyBody.metadata?: { user_id?, session_id? })
+  if (!body.metadata) {
+    body.metadata = {};
+  }
   const md = body.metadata;
-  if (!md) return false;
+
   const userId = md.user_id;
-  if (typeof userId !== "string" || userId.length === 0) return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(userId);
-  } catch {
-    return false;
+  let obj: Record<string, unknown>;
+
+  if (typeof userId !== "string" || userId.length === 0) {
+    // 缺字段 → fresh
+    obj = {};
+  } else {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(userId);
+    } catch {
+      result.malformed_user_id = true;
+      parsed = null; // 走 fresh path
+    }
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+    ) {
+      obj = parsed as Record<string, unknown>;
+    } else {
+      if (!result.malformed_user_id) {
+        // parse 成功但非 object(primitive / array)
+        result.malformed_user_id = true;
+      }
+      obj = {};
+    }
   }
-  if (
-    !parsed ||
-    typeof parsed !== "object" ||
-    Array.isArray(parsed)
-  ) {
-    return false;
+
+  // strip 客户端伪造的 fingerprint(I5b)
+  if (Object.prototype.hasOwnProperty.call(obj, "fingerprint")) {
+    delete obj.fingerprint;
+    result.stripped_client_fingerprint = true;
   }
-  const obj = parsed as Record<string, unknown>;
-  if (!Object.prototype.hasOwnProperty.call(obj, "fingerprint")) return false;
-  delete obj.fingerprint;
+
+  // 4 字段 fill-if-missing(客户端已提供则保留 = L1 漂移层语义)
+  if (!Object.prototype.hasOwnProperty.call(obj, "os_arch")) {
+    obj.os_arch = defaults.os_arch;
+    result.derived_os_arch = true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(obj, "cpu_count")) {
+    obj.cpu_count = defaults.cpu_count;
+    result.derived_cpu_count = true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(obj, "node_version")) {
+    obj.node_version = defaults.node_version;
+    result.derived_node_version = true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(obj, "hostname_prefix")) {
+    obj.hostname_prefix = defaults.hostname_prefix;
+    result.derived_hostname_prefix = true;
+  }
+
   md.user_id = JSON.stringify(obj);
-  return true;
+  return result;
 }
 
 /**
@@ -344,20 +483,31 @@ export function normalizeExternalApiKeyEnvelopeV2(
 
   body.system = systemArr as ProxyBody["system"];
 
-  // ─── L1 framework: strip 客户端伪造的 fingerprint ─────────────────────────
-  const strippedL1Fingerprint = stripClientFingerprintField(body);
+  // ─── L1 framework + 派生 4 字段(Phase 4)─────────────────────────────────
+  const l1 = applyL1Defaults(body, account.fingerprint_salt, account.id);
 
   // ─── L2 / L3 透传 — 本 phase 无操作 ─────────────────────────────────────────
 
   // 日志:仅结构指纹,绝不记 prompt 内容 / metadata 内容
-  log.info("external_envelope_v2_applied", {
+  const logFields = {
     blocks: (body.system as unknown[]).length,
     orig_kind: origKind,
     prefix_variant: prefixVariant,
     fingerprint_b12: fingerprint,
     stripped_attribution: strippedAttribution,
     attribution_replaced: strippedAttribution > 0,
-    stripped_l1_fingerprint: strippedL1Fingerprint,
+    stripped_l1_fingerprint: l1.stripped_client_fingerprint,
+    derived_os_arch: l1.derived_os_arch,
+    derived_cpu_count: l1.derived_cpu_count,
+    derived_node_version: l1.derived_node_version,
+    derived_hostname_prefix: l1.derived_hostname_prefix,
     has_pinned_user_id: account.pinned_user_id !== null,
-  });
+  };
+  if (l1.malformed_user_id) {
+    // Codex Phase 4 plan-review #4:malformed metadata.user_id 不再 silent fail-open;
+    // log warn 让运维侧看到客户端发的脏数据流量。
+    log.warn("external_envelope_v2_l1_malformed_user_id", logFields);
+  } else {
+    log.info("external_envelope_v2_applied", logFields);
+  }
 }

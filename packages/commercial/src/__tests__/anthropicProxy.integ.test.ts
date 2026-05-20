@@ -369,6 +369,8 @@ interface PickSpec {
   pinned_user_id?: string;
   account_id?: bigint;
   expires_at?: Date | null;
+  envelope_version?: number;
+  fingerprint_salt?: Buffer;
 }
 
 interface SchedulerSpy {
@@ -402,6 +404,8 @@ function buildFakeScheduler(initialSpec: PickSpec | null = {}, releaseOrder?: st
         egress_proxy: null,
         egress_target: null,
         pinned_user_id: pinned,
+        envelope_version: pickSpec.envelope_version ?? 1,
+        fingerprint_salt: pickSpec.fingerprint_salt ?? Buffer.alloc(16),
       };
     },
     async release(input: ReleaseInput): Promise<void> {
@@ -729,8 +733,14 @@ function minBody(modelOverride?: string): Record<string, unknown> {
 // ─── 不变量 (1):Release ownership 4 阶段 ─────────────────────────────────
 
 describe("invariant 1 — release ownership 4 阶段铁律", () => {
-  // (a) pick 失败 → 仅 releasePreCheck;无 scheduler.release
-  test("(a) scheduler.pick 抛 AccountPoolBusy → 仅 releasePreCheck,不 scheduler.release", async () => {
+  // V3 envv2 Phase 4 (2026-05-21) 顺序调整后铁律:
+  //   pickUpstream 现在跑在 preCheck **之前**(为了让 v2 envelope normalize 拿到
+  //   session.fingerprintSalt)。所以 stage (a) pool_busy / stage (b*) refresh_failed
+  //   触发时 **preCheck 从未 reserve 过**,无须 release。
+  //   stage (c) journal_failed 已在 preCheck 成功之后,仍需双侧 release(顺序锁 scheduler→preCheck)。
+
+  // (a) pick 失败 → 无任何 release;preCheck 从未 reserve
+  test("(a) scheduler.pick 抛 AccountPoolBusy → 既无 scheduler.release 也无 preCheck.reserve/release", async () => {
     const h = buildHarness();
     const { AccountPoolBusyError } = await import("../account-pool/scheduler.js");
     h.schedulerSpy.setPickError(new AccountPoolBusyError("all busy"));
@@ -740,16 +750,19 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
     assert.equal(
       h.schedulerSpy.releaseCalls.length,
       0,
-      "stage (a): 不应调用 scheduler.release",
+      "stage (a): 不应调用 scheduler.release(pick 失败 → 未占账号)",
+    );
+    assert.equal(
+      h.preCheckSpy.reserveCalls.length,
+      0,
+      "stage (a): pickUpstream 在 preCheck 之前 → preCheck 从未 reserve",
     );
     assert.equal(
       h.preCheckSpy.releaseCalls.length,
-      1,
-      "stage (a): 应释放 preCheck 1 次",
+      0,
+      "stage (a): preCheck 既未 reserve 也无 release",
     );
-    assert.equal(h.preCheckSpy.releaseCalls[0]!.userId, String(FIXED_USER_ID));
-    // 在 pick 之前已 reserve 过一次(invariant 5 已锁顺序;这里只是确认 release args 对齐)
-    assert.equal(h.preCheckSpy.reserveCalls.length, 1);
+    assert.deepEqual(h.releaseOrder, [], "stage (a): release 调用链空");
   });
 
   // (b1) refresh RefreshError(account_not_found) → kind="failure"
@@ -778,8 +791,17 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
       FIXED_ACCOUNT_ID,
       "release 必须带 pick.account_id",
     );
-    assert.equal(h.preCheckSpy.releaseCalls.length, 1);
-    assert.deepEqual(h.releaseOrder, ["scheduler", "preCheck"], "(b1) 顺序锁");
+    assert.equal(
+      h.preCheckSpy.reserveCalls.length,
+      0,
+      "(b1) pickUpstream 在 preCheck 之前 → preCheck 从未 reserve",
+    );
+    assert.equal(
+      h.preCheckSpy.releaseCalls.length,
+      0,
+      "(b1) preCheck 未 reserve 自然不 release",
+    );
+    assert.deepEqual(h.releaseOrder, ["scheduler"], "(b1) 只有 scheduler.release 一次");
     // MINOR 1:把 "code 分类" 从 grep 升格为 test 级断言
     const refreshFail = h.logEvents.find(
       (e) => e["msg"] === "proxy_refresh_failed",
@@ -821,8 +843,13 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
       "transient_network",
       "网络层抖动 → transient_network(不扣健康分)— 这条铁律决定了代理一抖整池不被烧",
     );
-    assert.equal(h.preCheckSpy.releaseCalls.length, 1);
-    assert.deepEqual(h.releaseOrder, ["scheduler", "preCheck"], "(b2) 顺序锁");
+    assert.equal(
+      h.preCheckSpy.reserveCalls.length,
+      0,
+      "(b2) pickUpstream 在 preCheck 之前 → preCheck 从未 reserve",
+    );
+    assert.equal(h.preCheckSpy.releaseCalls.length, 0, "(b2) preCheck 未 reserve 不 release");
+    assert.deepEqual(h.releaseOrder, ["scheduler"], "(b2) 只有 scheduler.release 一次");
     // MINOR 1:code 分类是 transient_network(代理一抖整池不被烧的核心字段)
     const refreshFail = h.logEvents.find(
       (e) => e["msg"] === "proxy_refresh_failed",
@@ -861,8 +888,13 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
       "failure",
       "HTTP 401 = 永久拒绝 → failure(扣健康分,符合 disableOnFailure 语义)",
     );
-    assert.equal(h.preCheckSpy.releaseCalls.length, 1);
-    assert.deepEqual(h.releaseOrder, ["scheduler", "preCheck"], "(b3) 顺序锁");
+    assert.equal(
+      h.preCheckSpy.reserveCalls.length,
+      0,
+      "(b3) pickUpstream 在 preCheck 之前 → preCheck 从未 reserve",
+    );
+    assert.equal(h.preCheckSpy.releaseCalls.length, 0, "(b3) preCheck 未 reserve 不 release");
+    assert.deepEqual(h.releaseOrder, ["scheduler"], "(b3) 只有 scheduler.release 一次");
     // MINOR 1:401 这种永久拒绝必须分类为 http_error,不能错误归到 network_transient
     // 否则 disableOnFailure 语义破坏(账号永久挂了反而不扣健康分)
     const refreshFail = h.logEvents.find(
@@ -906,6 +938,40 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
     assert.equal(h.schedulerSpy.releaseCalls[0]!.result.kind, "success");
     assert.equal(h.schedulerSpy.releaseCalls[0]!.account_id, FIXED_ACCOUNT_ID);
     assert.equal(h.preCheckSpy.releaseCalls.length, 1);
+  });
+
+  // V3 envv2 Phase 4(2026-05-21 Codex plan-review #1+#2 采纳)新路径:
+  //   pickUpstream 在 preCheck **之前**,所以 preCheck 抛 InsufficientCredits 时 session 已
+  //   ready,handler 必须 release。但用户余额问题不该扣账号健康分 → kind='client_error'
+  //   (scheduler.release ReleaseResult 注释:client_error 只 dec inflight,不进 cooldown)。
+  //   atomicReserve 在 preCheckWithCost 内被 `balance ≤ 0` 提前拦下 — Redis 端无 reservation。
+  test("(d insufficient_credits) preCheck 抛 InsufficientCredits → scheduler.release({client_error}) + 402 + 无 preCheck reserve", async () => {
+    const h = buildHarness({ poolOverride: { userCredits: 0n } });
+    const res = await h.run(minBody());
+    assert.equal(res.statusCode, 402, "balance=0 应 402 INSUFFICIENT_CREDITS");
+    assert.equal(readErrCode(res), "INSUFFICIENT_CREDITS");
+    assert.equal(h.schedulerSpy.releaseCalls.length, 1);
+    assert.equal(
+      h.schedulerSpy.releaseCalls[0]!.result.kind,
+      "client_error",
+      "余额不足是用户问题,**不扣**账号健康分(否则单个穷用户能把账号刷进 cooldown)",
+    );
+    assert.equal(
+      h.schedulerSpy.releaseCalls[0]!.account_id,
+      FIXED_ACCOUNT_ID,
+      "release 必须带 pick.account_id",
+    );
+    assert.equal(
+      h.preCheckSpy.reserveCalls.length,
+      0,
+      "balance≤0 在 atomicReserve 之前抛 → Redis 端从未 reserve",
+    );
+    assert.equal(
+      h.preCheckSpy.releaseCalls.length,
+      0,
+      "preCheck 未 reserve 不 release",
+    );
+    assert.deepEqual(h.releaseOrder, ["scheduler"], "只有 scheduler.release 一次");
   });
 
   // (d) negative — upstream 5xx error → finalize.fail,kind=failure

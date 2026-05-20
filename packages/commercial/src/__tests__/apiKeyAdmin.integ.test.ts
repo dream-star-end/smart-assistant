@@ -313,6 +313,8 @@ function buildFakeScheduler(): AccountScheduler {
         egress_proxy: null,
         egress_target: null,
         pinned_user_id: FIXED_PINNED_USER_ID,
+        envelope_version: 1,
+        fingerprint_salt: Buffer.alloc(16),
       };
     },
     async release(_input: ReleaseInput): Promise<void> {},

@@ -35,6 +35,7 @@ import {
   preCheckWithCost,
   releasePreCheck,
   InsufficientCreditsError,
+  type ReservationHandle,
 } from "../../billing/preCheck.js";
 import {
   makeFinalizer,
@@ -78,6 +79,8 @@ import {
 
 import { runUpstreamRoundTrip } from "./core.js";
 import { normalizeExternalApiKeyEnvelope } from "./externalEnvelope.js";
+import { normalizeExternalApiKeyEnvelopeV2 } from "./externalEnvelopeV2.js";
+import type { ReleaseBeforeFinalizerReason } from "./upstream.js";
 
 // ─── 私有 helper ──────────────────────────────────────────────────────────
 
@@ -220,6 +223,38 @@ export function makeAnthropicProxyHandler(
       return;
     }
 
+    // ─── Lifecycle 补偿:case (c) 窗口的 ownership guard ───────────────────
+    //
+    // V3 envv2 Phase 4(2026-05-21,Codex plan-review #3 采纳):取消"4 处 inline release+
+    // zeroize+sendJsonError+return"分散补偿,改 outer try/finally + `sessionOwnedByHandler`
+    // 旗标统一闭环。降低同步遗漏风险 + lifecycle 责任在单一收尾路径上可读。
+    //
+    // 三态:
+    //   - `session === null`        → pickUpstream 之前 / pickUpstream 失败,finally 无操作
+    //   - `sessionOwnedByHandler == true` + session ≠ null
+    //                               → case (c) 窗口,finally 必 release+zeroize
+    //   - `sessionOwnedByHandler == false` + session ≠ null
+    //                               → finalizer 已建立,release/zeroize 责任移交,finally noop
+    //
+    // releaseReason 默认 `{kind:"failure"}`:任何未明确分类的 throw 都按"账号侧"问题。
+    // 显式分类路径(InsufficientCredits → client_error)在 inline 改写 releaseReason 后 return。
+    //
+    // preCheckReservation 在 preCheck 成功后置;makeFinalizer 完成后 transfer 给 finalizer
+    // (置 null + sessionOwnedByHandler=false 双重 transfer)。finally 看到非 null 即兜底
+    // 释放 Redis reservation,处理 Codex plan-review #2 隐含的"insufficient/journal 失败
+    // 之外的未预期 throw"路径。
+    //
+    // 声明在 outer try **之前**(而非 try block 顶部):TS 控制流分析在长 try block 里
+    // 有时会把 try-local let 推断为 narrow "never"(尤其 finally 块距离声明远的时候 —
+    // Phase 4 这里跨 ~260 行),为避免 TS scope analysis 边界 case,显式提到外层。
+    let session: PreparedUpstreamSession | null = null;
+    let sessionOwnedByHandler = false;
+    let releaseReason: ReleaseBeforeFinalizerReason = {
+      kind: "failure",
+      error: "handler_uncaught",
+    };
+    let preCheckReservation: ReservationHandle | null = null;
+
     try {
       // 4) 读 + parse + 校验 body
       let body: ProxyBody;
@@ -289,8 +324,9 @@ export function makeAnthropicProxyHandler(
 
       // 5c) Upstream route 选择 + 配置早拒绝(2026-05-18 Phase 3 §3.4 切出)。
       //
-      // **必须在 preCheck 之前**:deepseek 路由缺 key 直接 503,不能 reserve credits 再 rollback。
-      // 详见 `proxy/upstream.ts` selectUpstreamRoute / validateUpstreamConfig 注释 + plan 行为锁。
+      // **必须在 pickUpstream 之前**:deepseek 路由缺 key 直接 503,不能进入 pool 选号路径
+      // (会浪费一次 scheduler.pick + release)。详见 `proxy/upstream.ts` selectUpstreamRoute /
+      // validateUpstreamConfig 注释 + plan 行为锁。
       const route = selectUpstreamRoute(body.model);
       const cfgErr = validateUpstreamConfig(route, { deepseekApiKey: deps.deepseekApiKey });
       if (cfgErr) {
@@ -307,79 +343,24 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
-      // 5d) CC 外接出站 envelope 归一化(2026-05-20 Phase 7 §3.5.2)。
+      // 5d) 外接 ApiKey + OAuth 双重命中 discriminator(V3 envv2 Phase 1.5)。
       //
-      // 仅"外接 ApiKey 路径 + OAuth 上游"双重命中才注入。强制把 outbound `body.system`
-      // 归一化成 CC 容器形态(含官方 sysprompt prefix),让上游 Anthropic anti-abuse
-      // 把外接请求和容器内 CC CLI 请求视作同源,防"同一 OAuth account 同时出现
-      // CC-shaped 和非 CC-shaped 流量"触发整池 429。
-      //
-      // **route.kind === "oauth" 判别**:DeepSeek 上游用独立 API key,无 OAuth pool /
-      // 无 anti-abuse fingerprinting,注入 CC prefix 只浪费 13 tokens 且对 deepseek 端
-      // 是"语义无关 prompt 污染"。容器路径(`containerId !== null`)同理跳过 — 容器
-      // 内 CCB 已自带 sysprompt,多余 mutate 反而破坏既有缓存命中。
-      //
-      // **必须在 `estimateInputTokens(body)` 之前**(Codex Phase 7 plan-review MINOR):
-      // 注入的 sysprompt prefix(~13 tokens)必须进 preCheck 估算 — 任何 mutate body 的
-      // 步骤都在 input token 估算之前,账务边界干净。详见 plan §3.5.2 / externalEnvelope.ts。
-      //
-      // V3 envv2 Phase 1.5(2026-05-21):此 boolean 同时驱动 step 7 的 pickUpstream
-      // `accountKind: 'external_api'` 注入。两处共用同一 discriminator —— 现状下
-      // `identity.containerId === null` 唯一来自 ApiKeyIdentityStrategy(参见
+      // 现状下 `identity.containerId === null` 唯一来自 ApiKeyIdentityStrategy(参见
       // auth/apiKeyIdentity.ts L263、auth/proxyIdentity.ts L45 类型注释)。**未来若
       // 再接入非容器 OAuth identity strategy,本 discriminator 会误归到外接池,
       // 届时必须切换到显式 identity.kind 字段重审**(Codex Phase 1.5 plan-review MINOR
       // R1 采纳)。
-      const isExternalApiKeyOAuthPath = identity.containerId === null && route.kind === "oauth";
-      if (isExternalApiKeyOAuthPath) {
-        normalizeExternalApiKeyEnvelope(body, userLog);
-      }
-
-      // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)
-      const inputTokens = estimateInputTokens(body);
-      const totalMaxCost = estimateMaxCostBothSides(inputTokens, body.max_tokens, pricing);
-      let pre;
-      try {
-        // 走 preCheckWithCost(已知 maxCost,跳过 estimateMaxCost 重算)。
-        // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
-        // balance > 0 即放行;余额 < 估算 cost 时 cap 到 balance(drain-to-zero by cap-to-balance)。
-        // 真实 cost 由 finalize 阶段已有的 clamp 路径吃(settleUsageAndLedger)。
-        pre = await preCheckWithCost(deps.preCheckRedis, {
-          userId: uid,
-          requestId,
-          maxCost: totalMaxCost,
-        });
-      } catch (err) {
-        if (err instanceof InsufficientCreditsError) {
-          userLog.warn("proxy_insufficient_credits", {
-            balance: err.balance.toString(),
-            required: err.required.toString(),
-          });
-          incrAnthropicProxyReject("insufficient");
-          sendJsonError(
-            res,
-            402,
-            "INSUFFICIENT_CREDITS",
-            `insufficient credits: balance=${err.balance} required=${err.required}`,
-            requestId,
-          );
-          return;
-        }
-        throw err;
-      }
-
-      if (pre.capped) {
-        incrPrecheckCapped(body.model);
-        userLog.info("precheck_capped", {
-          balance: pre.balance.toString(),
-          originalMaxCost: pre.originalMaxCost.toString(),
-          effectiveMaxCost: pre.maxCost.toString(),
-        });
-      }
-
-      // 7) 取账号 + dispatcher + (按需)刷 token —— 全部收敛进 pickUpstream(plan §3.4)。
       //
-      // 失败模式 → 一一映射(release 已在 upstream 层 fire,handler 只做 preCheck rollback):
+      // 用途:
+      //   - step 7 pickUpstream `accountKind: 'external_api'` 注入
+      //   - step 7.5 outbound envelope 归一化 v1/v2 派发(Phase 4)
+      // 容器路径(`containerId !== null`)或 DeepSeek 上游(`route.kind === 'deepseek'`)
+      // 不命中:容器内 CCB 已自带 sysprompt;DeepSeek 端无 anti-abuse fingerprinting。
+      const isExternalApiKeyOAuthPath = identity.containerId === null && route.kind === "oauth";
+
+      // 6) 取账号 + dispatcher + (按需)刷 token —— 全部收敛进 pickUpstream(plan §3.4)。
+      //
+      // 失败模式 → 一一映射(release 已在 upstream 层 fire,handler 不持 session):
       //   pool_busy          → 429 ACCOUNT_POOL_BUSY     reject account_pool_busy
       //   pool_unavailable   → 503 ACCOUNT_POOL_UNAVAILABLE reject account_pool
       //   refresh_failed     → 502 UPSTREAM_AUTH_REFRESH_FAILED reject upstream_auth
@@ -387,13 +368,18 @@ export function makeAnthropicProxyHandler(
       //
       // DeepSeek 路径:pickUpstream 直接合成 session(无 pool 访问)。
       //
-      // V3 envv2 Phase 1.5(2026-05-21):外接 ApiKey + OAuth 路径(`isExternalApiKeyOAuthPath`)
-      // 显式注入 `accountKind: 'external_api'`,scheduler.pick 走外接专属池;容器 OAuth
-      // 路径传 undefined → scheduler 内部默认 'platform' 池,与历史等价。DeepSeek 路径在
-      // pickUpstream 内早返(L341 附近),**根本不调用 scheduler.pick** —— opts 透传与否
-      // 无影响,见上面"DeepSeek 路径:pickUpstream 直接合成 session"注释。
-      // 外接池空抛 AccountPoolUnavailableError,handler 这里照原逻辑映 503 ACCOUNT_POOL_UNAVAILABLE
-      // —— **不**降级回 platform 池(plan §1.4 隔离决策)。
+      // V3 envv2 Phase 4 (2026-05-21) 顺序调整:pickUpstream 从 preCheck **后**前移到
+      // preCheck **前**。动机:v2 envelope normalize 需要 session.fingerprintSalt
+      // (per-account BYTEA),只能从 pickUpstream 返回的 session 里取。Trade-off:
+      // InsufficientCredits 用户会浪费一次 scheduler.pick + client_error release。
+      // 容忍依据:上游 pool 启动顺序里 per-uid rate-limit (step 2) + concurrency (step 3)
+      // 已在 pickUpstream 之前挡住流量风暴;client_error release 不扣账号健康分(见
+      // scheduler.ts ReleaseResult 注释),不会反复打到 cooldown。
+      //
+      // V3 envv2 Phase 1.5:外接 ApiKey + OAuth 路径显式注入 `accountKind: 'external_api'`,
+      // scheduler.pick 走外接专属池;容器 OAuth 路径传 undefined → scheduler 内部默认
+      // 'platform' 池,与历史等价。外接池空抛 AccountPoolUnavailableError,handler 这里
+      // 照原逻辑映 503 ACCOUNT_POOL_UNAVAILABLE —— **不**降级回 platform 池(plan §1.4)。
       const pickRes = await pickUpstream(
         {
           scheduler: deps.scheduler,
@@ -407,7 +393,6 @@ export function makeAnthropicProxyHandler(
         { accountKind: isExternalApiKeyOAuthPath ? "external_api" : undefined },
       );
       if (!pickRes.ok) {
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
         switch (pickRes.error.kind) {
           case "pool_busy":
             userLog.warn("proxy_account_pool_busy", { msg: pickRes.error.err.message });
@@ -438,13 +423,96 @@ export function makeAnthropicProxyHandler(
             return;
         }
       }
-      const session: PreparedUpstreamSession = pickRes.session;
+      session = pickRes.session;
+      sessionOwnedByHandler = true;
 
-      // 8) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
+      // 7) Outbound envelope 归一化 v1/v2 派发(Phase 4 核心)。
       //
-      // case (c) release ownership:journal fail 时 session 已 ready 但 finalizer 还没装,
-      // 由 handler 调 releaseUpstreamSession(session) + session.zeroizeSecrets() 补偿。
-      // DeepSeek session 的 release 是 noop(accountId=null),zeroize 也是 noop。
+      // 仅"外接 ApiKey + OAuth 上游"双重命中才注入(同 Phase 1.5/Phase 7 行为锁)。
+      // **必须在 `estimateInputTokens(body)` 之前**:注入的 sysprompt prefix
+      // (~13 tokens)必须进 preCheck 估算 — 任何 mutate body 的步骤都在 input
+      // token 估算之前,账务边界干净。
+      //
+      // v1 vs v2 派发:
+      //   - session.envelopeVersion === 2 && fingerprintSalt !== null → v2 normalizer
+      //     (L0 prefix slot lock + L0 attribution + L1 framework + L1 派生 4 字段)
+      //   - 否则 → v1 normalizer(只做 outbound CC 形态归一化,无 L0 强锁)
+      //
+      // 灰度策略:`claude_accounts.envelope_version` 默认 1(0070 NOT NULL DEFAULT 1),
+      // boss 手动 `UPDATE claude_accounts SET envelope_version = 2 WHERE id = ?`
+      // 单账号试灰度;`fingerprint_salt` 是 NOT NULL DEFAULT gen_random_bytes(16),
+      // 任何 account 都有 salt。`fingerprintSalt !== null` 守的是 DeepSeek 路径
+      // (`accountId = null`,fingerprintSalt 工厂值 = null);本分支已在
+      // `isExternalApiKeyOAuthPath`(route.kind === "oauth")之下,DeepSeek 不入此 if,
+      // 但守等价于断言 — 数据异常时 fail-safe 回 v1 而非 throw。
+      if (isExternalApiKeyOAuthPath) {
+        if (session.envelopeVersion === 2 && session.fingerprintSalt !== null) {
+          normalizeExternalApiKeyEnvelopeV2(
+            body,
+            {
+              id: session.accountIdStr,
+              pinned_user_id: session.pinnedUserId,
+              fingerprint_salt: session.fingerprintSalt,
+            },
+            userLog,
+          );
+        } else {
+          normalizeExternalApiKeyEnvelope(body, userLog);
+        }
+      }
+
+      // 8) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)
+      const inputTokens = estimateInputTokens(body);
+      const totalMaxCost = estimateMaxCostBothSides(inputTokens, body.max_tokens, pricing);
+      let pre;
+      try {
+        // 走 preCheckWithCost(已知 maxCost,跳过 estimateMaxCost 重算)。
+        // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
+        // balance > 0 即放行;余额 < 估算 cost 时 cap 到 balance(drain-to-zero by cap-to-balance)。
+        // 真实 cost 由 finalize 阶段已有的 clamp 路径吃(settleUsageAndLedger)。
+        pre = await preCheckWithCost(deps.preCheckRedis, {
+          userId: uid,
+          requestId,
+          maxCost: totalMaxCost,
+        });
+      } catch (err) {
+        if (err instanceof InsufficientCreditsError) {
+          userLog.warn("proxy_insufficient_credits", {
+            balance: err.balance.toString(),
+            required: err.required.toString(),
+          });
+          incrAnthropicProxyReject("insufficient");
+          // Codex Phase 4 plan-review #1 + #2 采纳:account 无辜(用户余额问题),
+          // release kind 走 client_error,scheduler 端 dec inflight 不扣健康分。
+          // 显式置 releaseReason 后 return,finally 兜底 release + zeroize。
+          releaseReason = { kind: "client_error", error: "insufficient_credits" };
+          sendJsonError(
+            res,
+            402,
+            "INSUFFICIENT_CREDITS",
+            `insufficient credits: balance=${err.balance} required=${err.required}`,
+            requestId,
+          );
+          return;
+        }
+        throw err;
+      }
+      preCheckReservation = pre.reservation;
+
+      if (pre.capped) {
+        incrPrecheckCapped(body.model);
+        userLog.info("precheck_capped", {
+          balance: pre.balance.toString(),
+          originalMaxCost: pre.originalMaxCost.toString(),
+          effectiveMaxCost: pre.maxCost.toString(),
+        });
+      }
+
+      // 9) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
+      //
+      // case (c) release ownership:journal fail 时 session 已 ready 但 finalizer 还没装。
+      // finally 兜底 release + zeroize(releaseReason = failure,journal fail 算账号未读到
+      // 正常工况,保留 failure 语义防 silent drop)。
       try {
         await startInflightJournal(deps.pgPool, {
           requestId,
@@ -454,20 +522,13 @@ export function makeAnthropicProxyHandler(
           precheckCredits: pre.maxCost,
         });
       } catch (err) {
-        await releaseUpstreamSession(
-          deps.scheduler,
-          session,
-          { kind: "failure", error: errMessageShort(err) },
-          userLog,
-        );
-        session.zeroizeSecrets();
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+        releaseReason = { kind: "failure", error: errMessageShort(err) };
         userLog.error("proxy_journal_insert_failed", { err: errSummary(err) });
         sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
         return;
       }
 
-      // 9) 装 finalizer(从此 release 唯一调用点 = finalize)
+      // 10) 装 finalizer(从此 release 唯一调用点 = finalize)
       //
       // sessionId 由 extractSessionId(body.metadata) 算一次,既作为 finalize 配置
       // 也作为 RoundTripCtx.sessionId 传给 core.ts —— 单一权威源,避免后续广播
@@ -495,7 +556,13 @@ export function makeAnthropicProxyHandler(
         },
       );
 
-      // 10-11) upstream round-trip(切到 proxy/core.ts):abort 绑定 + fetch +
+      // release ownership transfer:从此 release / zeroize / reservation release 全归 finalize。
+      // 必须**在 runUpstreamRoundTrip 之前**置位 — runUpstreamRoundTrip 内部 finally 会调
+      // finalize,handler 这里若仍 owned,finally 会重复 release(double-release)。
+      sessionOwnedByHandler = false;
+      preCheckReservation = null;
+
+      // 11-12) upstream round-trip(切到 proxy/core.ts):abort 绑定 + fetch +
       // SSE 透传 + finalize + post-commit 广播 + zeroize。release 责任已在 finalize。
       await runUpstreamRoundTrip({
         pgPool: deps.pgPool,
@@ -514,6 +581,16 @@ export function makeAnthropicProxyHandler(
       });
     } finally {
       releaseSlot();
+      // case (c) 兜底释放(Codex Phase 4 plan-review #3 ownership guard)。
+      // sessionOwnedByHandler 仅在"pickUpstream 成功 → makeFinalizer 之前"窗口为 true。
+      // finalize 装好后置 false,从此 release 责任在 finalize 链。
+      if (sessionOwnedByHandler && session !== null) {
+        await releaseUpstreamSession(deps.scheduler, session, releaseReason, userLog);
+        session.zeroizeSecrets();
+      }
+      if (preCheckReservation !== null) {
+        await releasePreCheck(deps.preCheckRedis, preCheckReservation).catch(() => {});
+      }
     }
   };
 }

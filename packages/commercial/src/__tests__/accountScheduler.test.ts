@@ -34,6 +34,8 @@ function mkRow(overrides: Partial<CandidateRow> = {}): CandidateRow {
     pinned_user_id:
       overrides.pinned_user_id ??
       '0'.repeat(63) + ((Number(overrides.id ?? '1') % 16).toString(16)),
+    envelope_version: overrides.envelope_version ?? 1,
+    fingerprint_salt: overrides.fingerprint_salt ?? Buffer.alloc(16),
   }
 }
 
