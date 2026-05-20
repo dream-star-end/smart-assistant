@@ -50,11 +50,41 @@ export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
 export const ACCOUNT_PROVIDERS = ["claude", "codex"] as const;
 export type AccountProvider = (typeof ACCOUNT_PROVIDERS)[number];
 
+/**
+ * V3 envv2 account kind — 账号用途分区(0070 migration, 2026-05-21)。
+ *
+ *   - 'platform'     默认值;平台容器 OAuth 流量(CCB inside container)。
+ *                     存量行通过 DEFAULT 自动 backfill,所有不传 kind 的调用方按
+ *                     'platform' 走,与历史行为兼容。
+ *   - 'external_api' 外接 ApiKey 专属 OAuth 流量(用户本机 CC CLI 配 ANTHROPIC_API_KEY
+ *                     直连 v3 后端,不经容器)。
+ *
+ * 物理隔离保证 Anthropic 反风控在 `account_uuid` 维度看到的流量形态单一,
+ * 防"同一 OAuth 账号 既承载 CCB 真实流量 又承载 BYOK prefix-only 流量"触发
+ * 整池 429(见 V3_CC_EXTERNAL_ENDPOINT_ENVV2_PLAN_2026-05-21.md §0)。
+ */
+export const ACCOUNT_KINDS = ["platform", "external_api"] as const;
+export type AccountKind = (typeof ACCOUNT_KINDS)[number];
+
+/**
+ * V3 envv2 出站归一化版本号(0070 migration, 2026-05-21)。
+ *
+ *   - 1 = v1 externalEnvelope.ts 硬编码 prefix(当前 prod 行为)。
+ *   - 2 = v2 externalEnvelopeV2.ts 模板表 + L0 强锁(Phase 3+ 引入)。
+ *
+ * Phase 1 所有账号 default = 1,prod 行为完全不变。Phase 4 灰度切换。
+ */
+export type EnvelopeVersion = 1 | 2;
+
 /** 不含任何加密 / nonce 列的账号元信息 —— 安全打 log / 返 admin UI。 */
 export interface AccountRow {
   id: bigint;
   /** V3 provider:claude / codex(0051 migration 加,默认 'claude')。 */
   provider: AccountProvider;
+  /** V3 envv2 账号用途分区(0070,默认 'platform')。 */
+  kind: AccountKind;
+  /** V3 envv2 出站归一化版本号(0070,默认 1)。 */
+  envelope_version: EnvelopeVersion;
   label: string;
   plan: AccountPlan;
   status: AccountStatus;
@@ -164,6 +194,12 @@ export interface CreateAccountInput {
    * 校验在 admin layer (account-pool/admin.ts) 实施,store 层不强制以保留灵活性。
    */
   provider?: AccountProvider;
+  /**
+   * V3 envv2 (0070):账号用途。
+   * undefined / 不传 → DB DEFAULT 'platform'(与历史等价)。
+   * 显式传 'external_api' → 外接 ApiKey 专属池。
+   */
+  kind?: AccountKind;
   plan: AccountPlan;
   token: string;
   refresh?: string | null;
@@ -194,6 +230,16 @@ export interface CreateAccountInput {
  */
 export interface UpdateAccountPatch {
   label?: string;
+  /**
+   * V3 envv2 (0070):用 `UPDATE claude_accounts SET kind='external_api' WHERE id=…`
+   * 把账号划进外接池。本 patch 层不做存在性 / 历史校验 — admin layer 决定何时暴露。
+   */
+  kind?: AccountKind;
+  /**
+   * V3 envv2 (0070):灰度切换出站归一化版本(1=v1, 2=v2)。
+   * Phase 4 才会真正暴露此 patch — Phase 1 deploy 后 boss 不应在 admin 改此列。
+   */
+  envelope_version?: EnvelopeVersion;
   plan?: AccountPlan;
   status?: AccountStatus;
   cooldown_until?: Date | null;
@@ -237,6 +283,8 @@ export { AeadError } from "../crypto/aead.js";
 const META_COLUMNS = `
   id::text AS id,
   provider,
+  kind,
+  envelope_version,
   label,
   plan,
   status,
@@ -265,6 +313,8 @@ const META_COLUMNS = `
 interface RawMetaRow extends QueryResultRow {
   id: string;
   provider: AccountProvider;
+  kind: AccountKind;
+  envelope_version: number;
   label: string;
   plan: AccountPlan;
   status: AccountStatus;
@@ -322,9 +372,15 @@ interface RawSecretRow extends QueryResultRow {
 const EGRESS_FORWARD_PROXY_PORT = 9444;
 
 function parseMetaRow(row: RawMetaRow): AccountRow {
+  // envelope_version 经 PG SMALLINT → JS number;CHECK 已锁 (1, 2),这里 narrow 给 TS。
+  // 异常值视为 v1(fail-safe — 至少出站行为不变);0070 CHECK 失效属"不可能"路径,
+  // 后续 Phase 4 灰度阶段应在 admin/metrics 加 anomaly 计数器捕获,Phase 1 不引入观测面。
+  const envelopeVersion: EnvelopeVersion = row.envelope_version === 2 ? 2 : 1;
   return {
     id: BigInt(row.id),
     provider: row.provider,
+    kind: row.kind,
+    envelope_version: envelopeVersion,
     label: row.label,
     plan: row.plan,
     status: row.status,
@@ -367,6 +423,11 @@ export async function createAccount(
   if (!ACCOUNT_PROVIDERS.includes(provider)) {
     throw new TypeError(`invalid provider: ${String(input.provider)}`);
   }
+  // V3 envv2 (0070):input.kind 不传 → DB DEFAULT 'platform';传必须合法。
+  const kind: AccountKind = input.kind ?? "platform";
+  if (!ACCOUNT_KINDS.includes(kind)) {
+    throw new TypeError(`invalid kind: ${String(input.kind)}`);
+  }
   if (!ACCOUNT_PLANS.includes(input.plan)) {
     throw new TypeError(`invalid plan: ${input.plan}`);
   }
@@ -395,17 +456,18 @@ export async function createAccount(
 
     const res = await query<RawMetaRow>(
       `INSERT INTO claude_accounts(
-         provider, label, plan,
+         provider, kind, label, plan,
          oauth_token_enc, oauth_nonce,
          oauth_refresh_enc, oauth_refresh_nonce,
          oauth_expires_at,
          subscription_end_at,
          egress_proxy, egress_proxy_id
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
+        kind,
         input.label,
         input.plan,
         tok.ciphertext,
@@ -632,6 +694,20 @@ export async function updateAccount(
   };
 
   if (patch.label !== undefined) push("label", patch.label);
+  // V3 envv2 (0070):kind / envelope_version 由 admin SQL 显式 SET。
+  // store 层只做 enum 校验,不做 admin policy(谁能改 / 何时能改)。
+  if (patch.kind !== undefined) {
+    if (!ACCOUNT_KINDS.includes(patch.kind)) {
+      throw new TypeError(`invalid kind: ${String(patch.kind)}`);
+    }
+    push("kind", patch.kind);
+  }
+  if (patch.envelope_version !== undefined) {
+    if (patch.envelope_version !== 1 && patch.envelope_version !== 2) {
+      throw new TypeError(`invalid envelope_version: ${String(patch.envelope_version)}`);
+    }
+    push("envelope_version", patch.envelope_version);
+  }
   if (patch.plan !== undefined) {
     if (!ACCOUNT_PLANS.includes(patch.plan)) {
       throw new TypeError(`invalid plan: ${patch.plan}`);

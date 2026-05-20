@@ -35,6 +35,8 @@ import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
 import type { AccountHealthTracker } from './health.js'
 import {
+  ACCOUNT_KINDS,
+  type AccountKind,
   type AccountPlan,
   type AccountProvider,
   getTokenForUse,
@@ -148,6 +150,21 @@ export interface PickInput {
    * 真实 API 调用路径上调用。
    */
   provider?: AccountProvider
+  /**
+   * V3 envv2 (0070, 2026-05-21) 账号用途分区。
+   *
+   *   - 'platform'     默认值;平台容器 OAuth 流量。
+   *   - 'external_api' 外接 ApiKey 专属 OAuth 流量。
+   *
+   * 物理隔离两池(plan §1.1)。SELECT WHERE 子句叠 `AND kind = $kind`。
+   *
+   * **Phase 1 仅暴露 scheduler 能力,handler 调用点不改** —— pickUpstream 不传此
+   * 字段,所有路径走 default 'platform',与历史等价。Phase 1.5(独立 PR)在 boss
+   * 手动把账号划进外接池且校验非空后,handler 外接 ApiKey 分支才显式传
+   * `kind: 'external_api'`;池空抛 `AccountPoolUnavailableError`,**不**降级回
+   * 'platform' 池(plan §1.4 决策)。
+   */
+  kind?: AccountKind
 }
 
 export interface PickResult {
@@ -454,14 +471,22 @@ export class AccountScheduler {
     }
 
     const provider: AccountProvider = input.provider ?? 'claude'
+    // V3 envv2 (0070):kind 分区。default 'platform' 与历史等价(0070 DEFAULT 也
+    // 是 'platform',backfill 后存量行全部 platform)。Phase 1.5 才有 caller 显式
+    // 传 'external_api'。校验非法值早 fail,避免 SQL injection-shaped 错(虽然
+    // pg 参数化已挡)。
+    const kind: AccountKind = input.kind ?? 'platform'
+    if (!ACCOUNT_KINDS.includes(kind)) {
+      throw new TypeError(`invalid kind: ${String(input.kind)}`)
+    }
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score,
               quota_5h_pct, quota_7d_pct, subscription_end_at,
               pinned_user_id
        FROM claude_accounts
-       WHERE status = 'active' AND provider = $1
+       WHERE status = 'active' AND provider = $1 AND kind = $2
        ORDER BY id`,
-      [provider],
+      [provider, kind],
     )
     let pool = res.rows
     if (pool.length === 0) {
