@@ -322,7 +322,16 @@ export function makeAnthropicProxyHandler(
       // **必须在 `estimateInputTokens(body)` 之前**(Codex Phase 7 plan-review MINOR):
       // 注入的 sysprompt prefix(~13 tokens)必须进 preCheck 估算 — 任何 mutate body 的
       // 步骤都在 input token 估算之前,账务边界干净。详见 plan §3.5.2 / externalEnvelope.ts。
-      if (identity.containerId === null && route.kind === "oauth") {
+      //
+      // V3 envv2 Phase 1.5(2026-05-21):此 boolean 同时驱动 step 7 的 pickUpstream
+      // `accountKind: 'external_api'` 注入。两处共用同一 discriminator —— 现状下
+      // `identity.containerId === null` 唯一来自 ApiKeyIdentityStrategy(参见
+      // auth/apiKeyIdentity.ts L263、auth/proxyIdentity.ts L45 类型注释)。**未来若
+      // 再接入非容器 OAuth identity strategy,本 discriminator 会误归到外接池,
+      // 届时必须切换到显式 identity.kind 字段重审**(Codex Phase 1.5 plan-review MINOR
+      // R1 采纳)。
+      const isExternalApiKeyOAuthPath = identity.containerId === null && route.kind === "oauth";
+      if (isExternalApiKeyOAuthPath) {
         normalizeExternalApiKeyEnvelope(body, userLog);
       }
 
@@ -377,6 +386,14 @@ export function makeAnthropicProxyHandler(
       //   preparation_failed → 502 UPSTREAM_PREPARATION_FAILED  reject upstream_auth
       //
       // DeepSeek 路径:pickUpstream 直接合成 session(无 pool 访问)。
+      //
+      // V3 envv2 Phase 1.5(2026-05-21):外接 ApiKey + OAuth 路径(`isExternalApiKeyOAuthPath`)
+      // 显式注入 `accountKind: 'external_api'`,scheduler.pick 走外接专属池;容器 OAuth
+      // 路径传 undefined → scheduler 内部默认 'platform' 池,与历史等价。DeepSeek 路径在
+      // pickUpstream 内早返(L341 附近),**根本不调用 scheduler.pick** —— opts 透传与否
+      // 无影响,见上面"DeepSeek 路径:pickUpstream 直接合成 session"注释。
+      // 外接池空抛 AccountPoolUnavailableError,handler 这里照原逻辑映 503 ACCOUNT_POOL_UNAVAILABLE
+      // —— **不**降级回 platform 池(plan §1.4 隔离决策)。
       const pickRes = await pickUpstream(
         {
           scheduler: deps.scheduler,
@@ -387,6 +404,7 @@ export function makeAnthropicProxyHandler(
         body,
         route,
         userLog,
+        { accountKind: isExternalApiKeyOAuthPath ? "external_api" : undefined },
       );
       if (!pickRes.ok) {
         await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});

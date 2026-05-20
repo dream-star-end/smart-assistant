@@ -40,6 +40,7 @@ import {
   type AccountScheduler,
   type PickResult,
 } from "../../account-pool/scheduler.js";
+import type { AccountKind } from "../../account-pool/store.js";
 import {
   shouldRefresh,
   refreshAccountToken,
@@ -314,11 +315,25 @@ function makeOAuthPoolUpstream(
  *
  * DeepSeek 路径:直接返回 `makeDeepSeekUpstream(...)`,无 pool 访问。
  */
+/**
+ * V3 envv2 Phase 1.5 (2026-05-21):pickUpstream 的 per-request 上下文。
+ *
+ * 目前唯一字段 `accountKind` 由 handler 在外接 ApiKey + OAuth upstream 路径上注入
+ * `'external_api'`,其它路径(容器 / DeepSeek)不传 → scheduler 走 default 'platform'
+ * 与历史等价。bundle 进 options 对象而不是位置参数,Phase 3+ 还会扩(如 accountId
+ * 锁定、envelope_version 灰度等),避免再次破坏调用站签名。
+ */
+export interface PickUpstreamOptions {
+  /** 账号池分区(0070 / Phase 1.5)。undefined → scheduler default 'platform' 池。 */
+  accountKind?: AccountKind;
+}
+
 export async function pickUpstream(
   deps: PickUpstreamDeps,
   body: ProxyBody,
   route: UpstreamRoute,
   log: Logger,
+  opts?: PickUpstreamOptions,
 ): Promise<
   | { ok: true; session: PreparedUpstreamSession }
   | { ok: false; error: PickError }
@@ -330,12 +345,17 @@ export async function pickUpstream(
   }
 
   // OAuth path —— scheduler.pick
+  // V3 envv2 (Phase 1.5):opts.accountKind 由 handler 在外接 ApiKey + OAuth 路径
+  // 注入 'external_api',强制走外接专属池;其它路径 undefined → scheduler default
+  // 'platform' 池(与历史等价)。pool 空抛 AccountPoolUnavailableError,**不**降级
+  // 到 platform 池(plan §1.4 决策)。
   let pick: PickResult;
   try {
     pick = await deps.scheduler.pick({
       mode: "chat",
       sessionId: extractSessionId(body.metadata) ?? undefined,
       model: body.model,
+      kind: opts?.accountKind,
     });
   } catch (err) {
     if (err instanceof AccountPoolBusyError) {
