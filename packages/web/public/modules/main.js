@@ -1915,21 +1915,142 @@ function _wireLandingButtons() {
 
 // ── #demo section wiring ───────────────────────────────────────
 // - 板块 tab 切换(科研 / 编程):segmented control,切 aria + hidden
-// - IntersectionObserver 触发 .is-playing(只播一次,出视口不取消)
-// - data-count-to 数字滚动到目标值(只触发一次,reduced-motion 直接显示终态)
+// - IntersectionObserver 首次进入视口时:播当前激活的 panel
+// - tab 切换到从未播过的 panel 时:首次显示即开始播放
+// - 每个 panel 各自持有 .is-playing(CSS 用 .landing-demo-panel.is-playing),
+//   stagger 动画绑定在 panel 上,从而支持两 panel 各自首播一次
+// - data-count-to 数字滚动只在 research panel 首播时跑(目标全在 research)
 function _wireLandingDemo() {
   const demoSection = document.getElementById('demo')
   if (!demoSection) return
 
-  // 1. tab 切换
   const tabs = demoSection.querySelectorAll('[data-demo-tab]')
   const panels = {
     research: document.getElementById('demo-panel-research'),
     coding: document.getElementById('demo-panel-coding'),
   }
+
+  // ── reduced-motion:直接显示终态,不做任何动画 / 计数 / 自动滚动 ──
+  const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
+  const countTargets = demoSection.querySelectorAll('[data-count-to]')
+  if (reduced) {
+    Object.values(panels).forEach((p) => p?.classList.add('is-playing'))
+    countTargets.forEach((el) => {
+      const n = Number(el.dataset.countTo || 0)
+      el.textContent = Number.isFinite(n) ? n.toLocaleString('en-US') : String(el.dataset.countTo ?? '')
+    })
+    // tab 切换仍需工作(只是不再触发动画)
+    _wireDemoTabs(tabs, panels, () => {})
+    return
+  }
+
+  // ── 播放副作用(每个 panel 只跑一次)──
+  const playedPanels = { research: false, coding: false }
+  // 每个 panel 自己的 auto-scroll cancel 句柄,tab 切换时取消离开 panel 的 interval
+  const autoScrollCancellers = { research: null, coding: null }
+
+  const startCountUp = () => {
+    countTargets.forEach((el) => {
+      const target = Number(el.dataset.countTo || 0)
+      if (!Number.isFinite(target) || target <= 0) {
+        el.textContent = String(target)
+        return
+      }
+      const duration = 1200
+      const t0 = performance.now()
+      const tick = (now) => {
+        const p = Math.min(1, (now - t0) / duration)
+        const eased = 1 - Math.pow(1 - p, 3)
+        const val = Math.round(target * eased)
+        el.textContent = val.toLocaleString('en-US')
+        if (p < 1) requestAnimationFrame(tick)
+        else el.textContent = target.toLocaleString('en-US')
+      }
+      requestAnimationFrame(tick)
+    })
+  }
+
+  // 接收 panel 参数,只在该 panel 的 .landing-demo-chat 内自动滚动到底,
+  // 让 15-16 节点 transcript 后半段在 max-height 限高容器里也能被看到。
+  // 用户主动滚动后立即放弃自动滚动,把控制权交还用户。
+  // 返回 cancel 函数,允许 tab 切换时主动清理离开 panel 的 interval/timeout。
+  const startChatAutoScroll = (panel) => {
+    if (!panel) return null
+    const chat = panel.querySelector('.landing-demo-chat')
+    if (!chat) return null
+    let interval = null
+    let timeoutId = null
+    const stop = () => {
+      if (interval !== null) { clearInterval(interval); interval = null }
+      if (timeoutId !== null) { clearTimeout(timeoutId); timeoutId = null }
+    }
+    chat.addEventListener('wheel', stop, { passive: true, once: true })
+    chat.addEventListener('touchmove', stop, { passive: true, once: true })
+    chat.addEventListener('pointerdown', stop, { passive: true, once: true })
+    interval = setInterval(() => {
+      chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' })
+    }, 700)
+    // 16 节点 stagger 总时长 ~13.8s + 420ms transition + 缓冲 → 15s 后停止
+    timeoutId = setTimeout(stop, 15000)
+    return stop
+  }
+
+  const playPanel = (key) => {
+    if (playedPanels[key]) return
+    const panel = panels[key]
+    if (!panel) return
+    playedPanels[key] = true
+    panel.classList.add('is-playing')
+    // count-up 目标全在 research panel,只在 research 首播时跑
+    if (key === 'research') startCountUp()
+    autoScrollCancellers[key] = startChatAutoScroll(panel)
+  }
+
+  // ── tab 切换:取消离开 panel 的 auto-scroll,新 panel 若未播过则触发 playPanel ──
+  _wireDemoTabs(tabs, panels, (newKey, prevKey) => {
+    if (prevKey && prevKey !== newKey) {
+      const cancel = autoScrollCancellers[prevKey]
+      if (cancel) {
+        cancel()
+        autoScrollCancellers[prevKey] = null
+      }
+    }
+    playPanel(newKey)
+  })
+
+  // ── IntersectionObserver:首次进入视口播当前激活的 tab ──
+  if (!('IntersectionObserver' in window)) {
+    // 老浏览器 fallback:直接播当前激活的 panel
+    const activeKey = _activeDemoTabKey(tabs)
+    playPanel(activeKey)
+    return
+  }
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) {
+          playPanel(_activeDemoTabKey(tabs))
+          io.disconnect()
+          break
+        }
+      }
+    },
+    { threshold: 0.18 },
+  )
+  io.observe(demoSection)
+}
+
+// tab 键盘/点击切换的通用逻辑,抽出来让 reduced-motion 和正常路径都能调用。
+// onSwitch(newKey) 在 tab 切换后调用,用于触发新 panel 的播放(若未播过)。
+function _wireDemoTabs(tabs, panels, onSwitch) {
   tabs.forEach((tab) => {
     tab.addEventListener('click', () => {
       const key = tab.dataset.demoTab
+      // 切换前记录上一个 active key,onSwitch 用来 cancel 离开 panel 的副作用
+      let prevKey = null
+      for (const t of tabs) {
+        if (t.classList.contains('is-active')) { prevKey = t.dataset.demoTab; break }
+      }
       tabs.forEach((t) => {
         const active = t === tab
         t.classList.toggle('is-active', active)
@@ -1939,10 +2060,10 @@ function _wireLandingDemo() {
         if (!p) return
         p.hidden = k !== key
       })
+      onSwitch?.(key, prevKey)
     })
   })
-
-  // 1.b tab 键盘模型:左右箭头切换,active tab tabindex=0,inactive=-1
+  // tab 键盘模型:左右箭头切换,active tab tabindex=0,inactive=-1
   // (role=tab 的标准 a11y 行为,屏幕阅读器场景必须)
   const updateTabFocus = () => {
     tabs.forEach((t) => {
@@ -1961,92 +2082,13 @@ function _wireLandingDemo() {
       next.focus()
     })
   })
+}
 
-  // 2. is-playing 触发 + count-up(合并在同一 IO 里,只播一次)
-  // window.matchMedia?.(): 比裸 matchMedia 安全,避免极个别旧 webview 抛 ReferenceError
-  const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
-  const countTargets = demoSection.querySelectorAll('[data-count-to]')
-  // reduced-motion:直接显示终态,不做动画。保持千分位格式跟动画终态一致
-  if (reduced) {
-    demoSection.classList.add('is-playing')
-    countTargets.forEach((el) => {
-      const n = Number(el.dataset.countTo || 0)
-      el.textContent = Number.isFinite(n) ? n.toLocaleString('en-US') : String(el.dataset.countTo ?? '')
-    })
-    return
+function _activeDemoTabKey(tabs) {
+  for (const t of tabs) {
+    if (t.classList.contains('is-active')) return t.dataset.demoTab
   }
-
-  let played = false
-  const startCountUp = () => {
-    countTargets.forEach((el) => {
-      const target = Number(el.dataset.countTo || 0)
-      if (!Number.isFinite(target) || target <= 0) {
-        el.textContent = String(target)
-        return
-      }
-      const duration = 1200 // ms
-      const t0 = performance.now()
-      const tick = (now) => {
-        const p = Math.min(1, (now - t0) / duration)
-        // ease-out cubic
-        const eased = 1 - Math.pow(1 - p, 3)
-        const val = Math.round(target * eased)
-        // 大数加千分位,避免 6000 看起来太"短"
-        el.textContent = val.toLocaleString('en-US')
-        if (p < 1) requestAnimationFrame(tick)
-        else el.textContent = target.toLocaleString('en-US')
-      }
-      requestAnimationFrame(tick)
-    })
-  }
-
-  if (!('IntersectionObserver' in window)) {
-    // 老浏览器 fallback:直接播
-    demoSection.classList.add('is-playing')
-    startCountUp()
-    return
-  }
-
-  // chat 容器自动跟随节点出现滚动到底 — 让 13 节点 transcript 后半段
-  // (校验/伪影自检/复算/编译/总结)在 max-height 限高容器里也能被看到。
-  // 用户主动滚动后立即放弃自动滚动,把控制权交还给用户。
-  const startChatAutoScroll = () => {
-    const chat = demoSection.querySelector('.landing-demo-chat')
-    if (!chat) return
-    let userScrolled = false
-    let interval = null
-    const giveUp = () => {
-      userScrolled = true
-      if (interval !== null) clearInterval(interval)
-    }
-    // wheel + touchmove + pointerdown 覆盖滚轮 / 触屏 / 拖拽滚动条三种主动交互
-    chat.addEventListener('wheel', giveUp, { passive: true, once: true })
-    chat.addEventListener('touchmove', giveUp, { passive: true, once: true })
-    chat.addEventListener('pointerdown', giveUp, { passive: true, once: true })
-    interval = setInterval(() => {
-      if (userScrolled) return
-      chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' })
-    }, 700)
-    // 13 节点 stagger 总时长 ~11.9s + 420ms transition + 缓冲 → 13s 后停止
-    setTimeout(() => clearInterval(interval), 13000)
-  }
-
-  const io = new IntersectionObserver(
-    (entries) => {
-      for (const e of entries) {
-        if (e.isIntersecting && !played) {
-          played = true
-          demoSection.classList.add('is-playing')
-          startCountUp()
-          startChatAutoScroll()
-          io.disconnect()
-          break
-        }
-      }
-    },
-    { threshold: 0.18 },
-  )
-  io.observe(demoSection)
+  return 'research'
 }
 
 // Delegated media-error retry. `error` events on <img>/<audio>/<video> don't

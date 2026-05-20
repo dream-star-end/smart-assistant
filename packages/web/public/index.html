@@ -238,7 +238,7 @@
               </div>
               <div class="landing-demo-window-body landing-demo-chat">
 
-                <!-- 对话回放 12 节点:命题 ↔ 反问 ↔ 选型 → Read 历史 → 大纲 → 公式 → 校验 → 仿真 → 自检 → 复算 → 编译 → 总结 -->
+                <!-- 对话回放 16 节点:命题 ↔ 反问 ↔ 选型 → Read 笔记 → WebSearch 综述 → TodoWrite 章节 → Write 大纲 → Write 公式 → Grep 引用风格 → Bash 校验 → Bash 仿真 → 自检 → Bash 编译 → 总结 -->
                 <div class="landing-demo-chat-node landing-demo-chat-user" data-step="1">
                   <div class="landing-demo-chat-avatar landing-demo-chat-avatar-user">U</div>
                   <div class="landing-demo-chat-bubble landing-demo-chat-bubble-user">
@@ -267,7 +267,7 @@
                 <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="4">
                   <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
                   <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
-                    好。我先看下你之前的领域笔记,沿用偏好,避免风格漂移。
+                    好。先盘下你之前的领域笔记沿用偏好,再对齐 2025 年最新综述,避免选型漂移。
                   </div>
                 </div>
 
@@ -286,14 +286,46 @@
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="6">
-                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
-                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
-                    沿用 <em>LiFSI 高浓度体系</em>作为工程对照主线,phase-field 用 Cahn-Hilliard 形式。先落大纲,再按节展开 .tex,最后 phase-field 形貌演化出 14 张矢量图。
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="6">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">WebSearch</span>
+                      <span class="landing-demo-chat-tool-path">"lithium metal anode dendrite suppression 2025 review high concentration"</span>
+                      <span class="landing-demo-chat-tool-status">✓ 4 hits</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">▸ Chem. Soc. Rev. 2025 · LiFSI/DME 体系机理综述</span>
+<span class="cm">▸ Nature Energy 2025 · 局部高浓度 (LHCE) 工程综述</span>
+<span class="cm">▸ JACS 2025 · 相场建模与 SEI 钉扎</span>
+<span class="cm">▸ Joule 2025 · 临界电流密度跨体系汇总</span></pre>
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="7">
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="7">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    历史笔记 + 4 篇 2025 综述都指向 <em>LiFSI / LHCE 高浓度路径</em>,跟你偏好一致。落 8 章节计划进 Todo 跟踪。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="8">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">TodoWrite</span>
+                      <span class="landing-demo-chat-tool-path">8 项章节任务</span>
+                      <span class="landing-demo-chat-tool-status">✓ 0/8</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">☐ 1. 引言 + 命题边界(LiFSI 主线声明)</span>
+<span class="cm">☐ 2. Nernst-Planck + Butler-Volmer 推导</span>
+<span class="cm">☐ 3. Sand 时间 / 临界 J_c 闭式</span>
+<span class="cm">☐ 4. 高浓度 / LHCE 电解液策略</span>
+<span class="cm">☐ 5. Phase-field (Cahn-Hilliard) 形貌</span>
+<span class="cm">☐ 6. SEI 钉扎 + 添加剂筛选</span>
+<span class="cm">☐ 7. 14 张矢量图 + 19 张公式表</span>
+<span class="cm">☐ 8. PDF / DOCX 编译 + 引用闭环</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="9">
                   <div class="landing-demo-chat-tool-card">
                     <div class="landing-demo-chat-tool-head">
                       <span class="landing-demo-chat-tool-name">Write</span>
@@ -306,12 +338,11 @@
 <span class="cm">## 3. Sand 时间与临界电流密度推导</span>
 <span class="cm">## 4. 高浓度 / 局部高浓度电解液策略 (LiFSI 主线)</span>
 <span class="cm">## 5. Phase-field 模型与枝晶形貌演化</span>
-<span class="cm">## 6. SEI 钉扎机理与添加剂筛选</span>
 <span class="kw">...</span> <span class="cm"># 共 10 章 / 65 节</span></pre>
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="8">
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="10">
                   <div class="landing-demo-chat-tool-card">
                     <div class="landing-demo-chat-tool-head">
                       <span class="landing-demo-chat-tool-name">Write</span>
@@ -325,25 +356,38 @@
   \label{eq:nernst_planck}
 \end{equation}
 <span class="cm">% Sand 时间(枝晶起始)</span>
-\tau_{\mathrm{Sand}} = \pi D \left(\frac{z F c_0}{2 t_- J}\right)^2,\quad t_- = 1 - t_+</pre>
+\tau_{\mathrm{Sand}} = \pi D \left(\frac{z F c_0}{2 t_- J}\right)^2</pre>
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="9">
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="11">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Grep</span>
+                      <span class="landing-demo-chat-tool-path">"\cite\{[^}]+\}" prior/*.tex</span>
+                      <span class="landing-demo-chat-tool-status">✓ 12 matches · 3 files</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">prior/li_review_2024.tex:42  \cite{xu2020lhce}</span>
+<span class="cm">prior/li_review_2024.tex:78  \cite{cheng2017dendrite}</span>
+<span class="cm">prior/sand_derivation.tex:11  \cite{sand1901}</span>
+<span class="cm">→ 引用风格:numbered + 章节末 References,沿用</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="12">
                   <div class="landing-demo-chat-tool-card">
                     <div class="landing-demo-chat-tool-head">
                       <span class="landing-demo-chat-tool-name">Bash</span>
                       <span class="landing-demo-chat-tool-path">python sim/check_sand_stability.py</span>
                       <span class="landing-demo-chat-tool-status">✓ 3.1s</span>
                     </div>
-                    <pre class="landing-demo-code"><span class="cm">[check] 对 t_+ 敏感区间做稳定性扫描</span>
-<span class="cm">[check] J 扫描 0.1 → 5.0 mA/cm², 20 个采样点</span>
+                    <pre class="landing-demo-code"><span class="cm">[check] J 扫描 0.1 → 5.0 mA/cm², 20 个采样点</span>
 <span class="cm">[check] 收敛:τ_Sand 单调,无数值发散</span>
 <span class="cm">[ok] 公式数值健康,进入主仿真</span></pre>
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="10">
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="13">
                   <div class="landing-demo-chat-tool-card">
                     <div class="landing-demo-chat-tool-head">
                       <span class="landing-demo-chat-tool-name">Bash</span>
@@ -352,22 +396,20 @@
                     </div>
                     <pre class="landing-demo-code"><span class="cm">[sim] seed = 20260515 (locked for reproducibility)</span>
 <span class="cm">[sim] saved figures/fig_sand_time_vs_J.pdf</span>
-<span class="cm">[sim] saved figures/fig_critical_jc_vs_T.pdf</span>
-<span class="cm">[sim] saved figures/fig_phase_field_t0.pdf</span>
 <span class="cm">[sim] saved figures/fig_phase_field_t1.pdf</span>
 <span class="kw">...</span>
 <span class="cm">[done] exported 14 vector figures (PDF + PNG)</span></pre>
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="11">
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="14">
                   <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
                   <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
                     低分辨率预览发现 <em>fig_phase_field_t1</em> 边界有数值伪影,切换 512² 复算 + 编译终稿。
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="12">
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="15">
                   <div class="landing-demo-chat-tool-card">
                     <div class="landing-demo-chat-tool-head">
                       <span class="landing-demo-chat-tool-name">Bash</span>
@@ -382,7 +424,7 @@
                   </div>
                 </div>
 
-                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="13">
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="16">
                   <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
                   <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
                     报告就绪:59 页 PDF + DOCX(公式 OMML 化),14 张矢量图,19 张表,6,000+ 行 LaTeX 已自检引用闭环。
@@ -436,45 +478,314 @@
 
     <!-- ── 编程板块 panel ── -->
     <div id="demo-panel-coding" class="landing-demo-panel" role="tabpanel" aria-labelledby="demo-tab-coding" hidden>
-      <div class="landing-demo-coding-preview">
-        <div class="landing-demo-coding-eyebrow">
-          <span class="landing-demo-case-badge">编程板块</span>
-          <span class="landing-demo-case-source">完整案例制作中,先看核心能力</span>
+
+      <!-- 案例 eyebrow + 统计数 -->
+      <div class="landing-demo-case">
+        <div class="landing-demo-case-eyebrow">
+          <span class="landing-demo-case-badge">示例案例 · 脱敏回放</span>
+          <span class="landing-demo-case-source">真实工作流节点,仓库 / PR 号已脱敏</span>
         </div>
-        <h3 class="landing-demo-case-title">把一个想法跑通到上线,在同一个对话内</h3>
-        <p class="landing-demo-coding-sub">云 Agent 在沙箱内拥有完整开发工具链:克隆仓库、跑测试、生成代码、跑构建、起本地服务、跨文件重构、提交 PR 全部可以在对话里完成。</p>
-        <div class="landing-demo-coding-grid">
-          <div class="landing-demo-coding-card">
-            <div class="landing-demo-coding-icon">
-              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16v4H4zM4 12h16v4H4zM4 20h10v0"/><circle cx="7" cy="6" r="0.8" fill="currentColor"/><circle cx="7" cy="14" r="0.8" fill="currentColor"/></svg>
-            </div>
-            <h5>真沙箱执行</h5>
-            <p>独立容器内跑 bun / node / python / git,长任务挂云端,断电不丢。</p>
-          </div>
-          <div class="landing-demo-coding-card">
-            <div class="landing-demo-coding-icon">
-              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12 18 8M22 12l-4 4M2 12l4-4M2 12l4 4"/><path d="M14 4l-4 16"/></svg>
-            </div>
-            <h5>跨文件重构</h5>
-            <p>跨数十文件改命名 / 抽接口 / 升级框架,Agent 自己 grep + 编辑 + 跑 lint。</p>
-          </div>
-          <div class="landing-demo-coding-card">
-            <div class="landing-demo-coding-icon">
-              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
-            </div>
-            <h5>测试驱动</h5>
-            <p>先写复现测试再修 bug,Agent loop 到测试通过为止,而非"写完拍脑袋"。</p>
-          </div>
-          <div class="landing-demo-coding-card">
-            <div class="landing-demo-coding-icon">
-              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 9v8a3 3 0 0 0 3 3h6"/></svg>
-            </div>
-            <h5>GitHub 集成</h5>
-            <p>授权后直接拉仓库、开分支、跑 CI、推 PR,代码评审有完整 diff 上下文。</p>
-          </div>
+        <h3 class="landing-demo-case-title">一句 bug 报告,15 分钟从复现到 PR — 自动 TDD 修复 iOS 图片 EXIF 倒置</h3>
+        <div class="landing-demo-case-stats">
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val">15</span><span class="landing-demo-stat-unit">分钟</span><span class="landing-demo-stat-label">报告 → PR</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val">1</span><span class="landing-demo-stat-unit">行</span><span class="landing-demo-stat-label">src 修改</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val">47</span><span class="landing-demo-stat-unit">行</span><span class="landing-demo-stat-label">回归测试</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val">188</span><span class="landing-demo-stat-unit">个</span><span class="landing-demo-stat-label">全量测试通过</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val">7</span><span class="landing-demo-stat-unit">种</span><span class="landing-demo-stat-label">工具串联</span></div>
+          <div class="landing-demo-stat"><span class="landing-demo-stat-val">0</span><span class="landing-demo-stat-unit">次</span><span class="landing-demo-stat-label">本地环境切换</span></div>
         </div>
-        <p class="landing-demo-coding-foot">完整编程实战演示制作中。当前可 <button type="button" id="landing-demo-coding-register" class="landing-demo-coding-link">立即注册</button> 后直接试用,沙箱里跑你自己的项目。</p>
       </div>
+
+      <div class="landing-demo-split">
+
+        <!-- 同一句 bug 报告 -->
+        <div class="landing-demo-prompt">
+          <div class="landing-demo-prompt-label"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg> 同一句 bug 报告</div>
+          <div class="landing-demo-prompt-text">「生产环境上传图片偶尔被倒过来显示,iOS 用户反馈了 3 次。仓库 github.com/me/photo-app,帮我定位 + 修。」</div>
+        </div>
+
+        <div class="landing-demo-split-grid">
+
+          <!-- 左侧:普通 AI 聊天 -->
+          <article class="landing-demo-col landing-demo-col-plain">
+            <header class="landing-demo-col-head">
+              <span class="landing-demo-col-tag">普通 AI 聊天</span>
+              <h4>停在"建议层"</h4>
+            </header>
+            <div class="landing-demo-window landing-demo-window-plain">
+              <div class="landing-demo-window-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="landing-demo-window-title">chat</span></div>
+              <div class="landing-demo-window-body">
+                <p class="landing-demo-plain-text">
+                  iOS 拍照通常会附带 EXIF orientation,常见解决方向:
+                </p>
+                <ul class="landing-demo-plain-list">
+                  <li>试试给图片库加 <code>.rotate()</code> 自动旋转</li>
+                  <li>前端可以读 EXIF 自己 transform</li>
+                  <li>客户端上传前先压缩并归一化方向</li>
+                  <li>建议你 grep 一下处理图像的入口看看</li>
+                </ul>
+                <p class="landing-demo-plain-cursor">_</p>
+              </div>
+            </div>
+            <div class="landing-demo-col-foot">
+              <span class="landing-demo-col-foot-icon">✕</span>
+              <ul class="landing-demo-col-cons">
+                <li>无法克隆你的仓库,定位只能猜</li>
+                <li>不会跑测试,无法复现 / 验证修复</li>
+                <li>不会编辑代码,只能给"建议片段"</li>
+                <li>提 PR / 跑 CI 全靠你自己回到 IDE 手动</li>
+              </ul>
+            </div>
+          </article>
+
+          <!-- 右侧:云 Agent · chat-replay 15 节点 -->
+          <article class="landing-demo-col landing-demo-col-agent">
+            <header class="landing-demo-col-head">
+              <span class="landing-demo-col-tag landing-demo-col-tag-accent">OpenClaude 云 Agent</span>
+              <h4>从 bug 复现到 PR 全自动</h4>
+            </header>
+            <div class="landing-demo-window landing-demo-window-agent">
+              <div class="landing-demo-window-bar">
+                <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                <span class="landing-demo-window-title">claudeai.chat · session</span>
+                <span class="landing-demo-window-live"><span class="landing-demo-live-dot"></span>实时执行</span>
+              </div>
+              <div class="landing-demo-window-body landing-demo-chat">
+
+                <!-- 编程对话回放 15 节点:bug 报告 → 克隆 → Grep → Read → WebFetch → Agent 定位 → TodoWrite → Write 测试 → Bash 红 → Edit → Bash 绿 → lint → PR → 总结 -->
+                <div class="landing-demo-chat-node landing-demo-chat-user" data-step="1">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-user">U</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-user">
+                    生产环境上传图片偶尔被倒过来显示,iOS 用户反馈了 3 次。仓库 github.com/me/photo-app,帮我定位 + 修。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="2">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    iOS HEIC/JPEG 默认带 EXIF orientation 6/8,后端如果直接 resize 而没读 EXIF 就会丢方向。我先克隆仓库 + 排查图像处理入口。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="3">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Bash</span>
+                      <span class="landing-demo-chat-tool-path">git clone https://github.com/me/photo-app && cd photo-app</span>
+                      <span class="landing-demo-chat-tool-status">✓ 1.2s</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">Cloning into 'photo-app'...</span>
+<span class="cm">remote: Enumerating objects: 1,287, done.</span>
+<span class="cm">Receiving objects: 100% (1287/1287), 4.3 MiB | 18.6 MiB/s, done.</span>
+<span class="cm">Resolving deltas: 100% (812/812), done.</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="4">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Grep</span>
+                      <span class="landing-demo-chat-tool-path">"sharp|jimp|exif|orientation" -r src/</span>
+                      <span class="landing-demo-chat-tool-status">✓ 6 hits · 3 files</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">src/utils/image.ts:8     import sharp from 'sharp'</span>
+<span class="cm">src/utils/image.ts:14    sharp(buf).resize(w, h).toBuffer()</span>
+<span class="cm">src/api/upload.ts:23     await resizeImage(file.buffer, 1600, 1600)</span>
+<span class="cm">src/api/upload.ts:41     return { url, width, height }</span>
+<span class="cm">→ 入口集中在 src/utils/image.ts</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="5">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Read</span>
+                      <span class="landing-demo-chat-tool-path">src/utils/image.ts</span>
+                      <span class="landing-demo-chat-tool-status">✓ 28 lines</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">export async function resizeImage(buf: Buffer, w: number, h: number) {</span>
+<span class="cm">  return sharp(buf)</span>
+<span class="kw">    .resize(w, h, { fit: 'inside' })</span>
+<span class="cm">    .jpeg({ quality: 88 })</span>
+<span class="cm">    .toBuffer()</span>
+<span class="cm">}</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="6">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">WebFetch</span>
+                      <span class="landing-demo-chat-tool-path">sharp.pixelplumbing.com/api-operation#rotate</span>
+                      <span class="landing-demo-chat-tool-status">✓ 12 KB</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">▸ .rotate() 不传角度时按 EXIF Orientation 自动旋转</span>
+<span class="cm">▸ 同时移除 Orientation EXIF tag 避免下游再次旋转</span>
+<span class="cm">▸ 必须在 .resize() 之前调用,否则维度计算基于旧方向</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="7">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    定位:<em>sharp(buf).resize()</em> 缺 <em>.rotate()</em> → EXIF 没生效。<br>
+                    走 TDD:先写复现测试拿到红,改 1 行后拿到绿,再跑全量。
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="8">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">TodoWrite</span>
+                      <span class="landing-demo-chat-tool-path">5 项修复子任务</span>
+                      <span class="landing-demo-chat-tool-status">✓ 0/5</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">☐ 1. 准备 orientation=6 jpg fixture</span>
+<span class="cm">☐ 2. 写复现测试(期望红)</span>
+<span class="cm">☐ 3. Edit src/utils/image.ts 加 .rotate()</span>
+<span class="cm">☐ 4. 跑全量测试 + lint + typecheck</span>
+<span class="cm">☐ 5. 提 PR(脱敏后)</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="9">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Write</span>
+                      <span class="landing-demo-chat-tool-path">test/image-orientation.test.ts</span>
+                      <span class="landing-demo-chat-tool-status">✓ 47 lines</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">import { describe, test, expect } from 'bun:test'</span>
+<span class="cm">import { resizeImage } from '../src/utils/image'</span>
+<span class="cm">import sharp from 'sharp'</span>
+
+<span class="kw">test('iOS orientation=6 应在 resize 后宽高互换', async () =&gt; {</span>
+<span class="cm">  const buf = await sharp({ create: { width: 200, height: 400 ... }})</span>
+<span class="cm">    .withMetadata({ orientation: 6 }).jpeg().toBuffer()</span>
+<span class="cm">  const out = await resizeImage(buf, 100, 100)</span>
+<span class="cm">  const { width, height } = await sharp(out).metadata()</span>
+<span class="kw">  expect(width).toBe(50); expect(height).toBe(100)</span>
+<span class="kw">})</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="10">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Bash</span>
+                      <span class="landing-demo-chat-tool-path">bun test test/image-orientation.test.ts</span>
+                      <span class="landing-demo-chat-tool-status landing-demo-chat-tool-status-fail">✗ 1 fail</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="kw">✗ iOS orientation=6 应在 resize 后宽高互换</span>
+<span class="cm">  Expected: 50</span>
+<span class="cm">  Received: 100</span>
+<span class="cm">1 fail, 0 pass · 124 ms · (TDD 红:复现成功)</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="11">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Edit</span>
+                      <span class="landing-demo-chat-tool-path">src/utils/image.ts</span>
+                      <span class="landing-demo-chat-tool-status">✓ +1 / -1</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">  return sharp(buf)</span>
+<span class="kw">+   .rotate()                       // 应用 EXIF Orientation</span>
+<span class="cm">    .resize(w, h, { fit: 'inside' })</span>
+<span class="cm">    .jpeg({ quality: 88 })</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="12">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Bash</span>
+                      <span class="landing-demo-chat-tool-path">bun test</span>
+                      <span class="landing-demo-chat-tool-status landing-demo-chat-tool-status-pass">✓ 188 pass</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">✓ iOS orientation=6 应在 resize 后宽高互换  (98 ms)</span>
+<span class="cm">✓ orientation=1 不动                       (12 ms)</span>
+<span class="kw">188 pass, 0 fail · 8.4s · (TDD 绿)</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="13">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Bash</span>
+                      <span class="landing-demo-chat-tool-path">bun run lint &amp;&amp; bun run typecheck</span>
+                      <span class="landing-demo-chat-tool-status landing-demo-chat-tool-status-pass">✓ 0 errors</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">Checked 142 files · biome OK</span>
+<span class="cm">tsc --noEmit · 0 errors · 0 warnings</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-tool" data-step="14">
+                  <div class="landing-demo-chat-tool-card">
+                    <div class="landing-demo-chat-tool-head">
+                      <span class="landing-demo-chat-tool-name">Bash</span>
+                      <span class="landing-demo-chat-tool-path">gh pr create --title "fix: iOS 拍照 EXIF orientation 未应用导致图片倒置"</span>
+                      <span class="landing-demo-chat-tool-status">✓ PR opened</span>
+                    </div>
+                    <pre class="landing-demo-code"><span class="cm">https://github.com/me/photo-app/pull/142</span>
+<span class="cm">  base: main ← branch: fix/exif-orientation</span>
+<span class="cm">  CI · checks (3/3 green): test · lint · typecheck</span></pre>
+                  </div>
+                </div>
+
+                <div class="landing-demo-chat-node landing-demo-chat-agent" data-step="15">
+                  <div class="landing-demo-chat-avatar landing-demo-chat-avatar-agent">A</div>
+                  <div class="landing-demo-chat-bubble landing-demo-chat-bubble-agent">
+                    PR #142 已建,CI 全绿。1 行 src + 47 行回归测试。<em>等你审</em>。
+                    <div class="landing-demo-chat-files">
+                      <span class="landing-demo-pill">PR #142 · CI 全绿</span>
+                      <span class="landing-demo-pill">image.ts · +1/-1</span>
+                      <span class="landing-demo-pill">test/orientation · 47 行</span>
+                    </div>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+            <div class="landing-demo-col-foot">
+              <span class="landing-demo-col-foot-icon landing-demo-check">✓</span>
+              <ul class="landing-demo-col-pros">
+                <li><strong>沙箱内全链路:</strong>克隆 / Grep / 改代码 / 跑测试 / 提 PR 全在对话里</li>
+                <li><strong>TDD 红→绿:</strong>先写复现测试拿到红,再改 1 行拿到绿,有强可验证证据</li>
+                <li><strong>定位有据:</strong>WebFetch 官方文档确认 .rotate() 语义,不靠猜</li>
+                <li><strong>合作伙伴感:</strong>主动建 TODO 跟踪 / 自检 lint+typecheck / 脱敏 PR 描述</li>
+              </ul>
+            </div>
+          </article>
+
+        </div>
+      </div>
+
+      <!-- 编程板块加速比对比表 -->
+      <div class="landing-demo-bench">
+        <h4 class="landing-demo-bench-title">从 bug 报告到 PR 合入:传统 vs 云 Agent</h4>
+        <table class="landing-demo-bench-table">
+          <thead>
+            <tr>
+              <th scope="col">任务</th>
+              <th scope="col">传统工作流</th>
+              <th scope="col">OpenClaude 云 Agent</th>
+              <th scope="col">加速</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>定位 EXIF 入口 (grep + 阅读)</td><td>15-30 分钟</td><td class="landing-demo-bench-us">秒级</td><td class="landing-demo-bench-x">30×</td></tr>
+            <tr><td>查 sharp .rotate() 行为</td><td>5-10 分钟翻文档</td><td class="landing-demo-bench-us">WebFetch 一次</td><td class="landing-demo-bench-x">10×</td></tr>
+            <tr><td>构造 orientation fixture + 复现测试</td><td>20-40 分钟</td><td class="landing-demo-bench-us">~1 分钟</td><td class="landing-demo-bench-x">20×</td></tr>
+            <tr><td>跑测试 + lint + typecheck + gh pr</td><td>5-15 分钟 IDE 切换</td><td class="landing-demo-bench-us">2 分钟串行</td><td class="landing-demo-bench-x">5×</td></tr>
+            <tr class="landing-demo-bench-total"><td><strong>bug 报告 → PR 合入候选</strong></td><td><strong>1-2 小时</strong></td><td class="landing-demo-bench-us"><strong>~15 分钟</strong></td><td class="landing-demo-bench-x"><strong>≈6×</strong></td></tr>
+          </tbody>
+        </table>
+        <p class="landing-demo-bench-foot">案例脱敏自真实生产 bug fix。云 Agent 接管"工具链摩擦"——你只负责审 PR + 决策合入。<button type="button" id="landing-demo-coding-register" class="landing-demo-coding-link">立即注册</button> 跑你自己的项目。</p>
+      </div>
+
     </div>
 
   </section>
