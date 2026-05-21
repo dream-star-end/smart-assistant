@@ -463,6 +463,13 @@ async function buildHarness(opts: HarnessOpts = {}): Promise<Harness> {
     fetchImpl: async () => sseResponse(200, makeFullSseChunks()),
     upstreamEndpoint: "https://upstream.test/v1/messages",
     logger,
+    // Phase 5 envelope rewriter wiring(2026-05-21):外接 ApiKey + OAuth 路径
+    // 命中时 handler 会强制走 buildPlatformEnvelope。这里 admin 测试既不验证
+    // envelope 内容、又走 OAuth happy path,注入 no-op loader(返 null = "无
+    // attribution 可注入",builder 走纯 PII strip + envelope 强制路径,见 plan
+    // §3.1 H1)+ 32 字符固定测试 secret,避免 503 PLATFORM_ENVELOPE_UNAVAILABLE。
+    platformContextLoader: { load: async () => null, invalidate: () => {} },
+    platformServerSecret: "test-platform-hmac-secret-32char",
   });
 
   const deps: CommercialHttpDeps = {

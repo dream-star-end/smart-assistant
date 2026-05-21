@@ -52,6 +52,7 @@ import {
   type RateLimitRedis,
 } from "../../middleware/rateLimit.js";
 import type { RefreshDeps } from "../../account-pool/refresh.js";
+import type { PlatformContextLoader } from "../../platform/platformContextLoader.js";
 
 // 上面 import 仅类型 / 值的占位重导出:errMessageShort / errSummary 留这里仅为给
 // proxy/core.ts 与 proxy/index.ts 复用同一份(避免到处 import util.js)。
@@ -989,6 +990,30 @@ export interface AnthropicProxyDeps {
    * loadConfig().DEEPSEEK_API_KEY 取并注入,proxy 内不读 process.env。
    */
   deepseekApiKey?: string;
+  /**
+   * Phase 5 platform envelope rewriter(2026-05-21,取代 Phase 7 v1 envelope)。
+   *
+   * 在外接 ApiKey 路径 + OAuth 上游双重命中时,把 outbound body 改写成 CC 容器
+   * 形态(强制 system[0]/[1] + PII strip + 注入 USER.md attribution +
+   * 替换 messages[0] system-reminder + metadata.user_id 收紧到 3 key)。
+   *
+   * 见 packages/commercial/src/platform/platformEnvelopeBuilder.ts 与
+   * docs/V3_CC_EXTERNAL_ENDPOINT_PHASE5_PLAN_2026-05-21.md §3。
+   *
+   * **Optional** 而非 required:internal proxy(容器双因子)永远 `containerId !== null`,
+   * 触发条件不命中,装配时不需要给。但 external ApiKey proxy 装配必须两个都给齐 —
+   * 缺其一时 handler 在触发条件命中时 fail-closed 503,避免 silent skip 透传 PII。
+   * 两个字段 atomic 共生:有 loader 必须有 secret,反之亦然(运行时 check)。
+   */
+  platformContextLoader?: PlatformContextLoader;
+  /**
+   * HMAC server secret(Phase 5 envelope rewriter)。
+   *
+   * 派生 fp3(3 hex char)+ account_uuid(UUID v4 from HMAC),用 sha256;同一 secret
+   * 必须跨多 master 一致,否则同一 ApiKey 在不同 master 上派生出不同指纹 → Anthropic
+   * anti-abuse 看到漂移 → 整池 429。≥ 32 字符长度。生产由 systemd EnvironmentFile 注入。
+   */
+  platformServerSecret?: Buffer | string;
 }
 
 /**

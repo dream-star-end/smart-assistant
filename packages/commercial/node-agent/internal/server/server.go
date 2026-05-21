@@ -27,6 +27,7 @@ import (
 	"github.com/openclaude/node-agent/internal/sshmux"
 	"github.com/openclaude/node-agent/internal/trace"
 	"github.com/openclaude/node-agent/internal/tunnel"
+	"github.com/openclaude/node-agent/internal/usercontext"
 )
 
 type Server struct {
@@ -34,14 +35,15 @@ type Server struct {
 	cert   atomic.Pointer[tls.Certificate]
 	caPool *x509.CertPool
 
-	runner   *containers.Runner
-	verifier *bootstrap.Verifier
-	renew    *renew.Handler
-	tunnel   *tunnel.Handler
-	files    *files.Handler
-	sshmux   *sshmux.Manager
-	baseline *baseline.Poller   // nil when disabled (empty base url)
-	probe    *selfprobe.Poller  // nil when wholly disabled (no master_mtls_url + no master_egress_bind + no runtime_image_tag)
+	runner      *containers.Runner
+	verifier    *bootstrap.Verifier
+	renew       *renew.Handler
+	tunnel      *tunnel.Handler
+	files       *files.Handler
+	sshmux      *sshmux.Manager
+	usercontext *usercontext.Handler
+	baseline    *baseline.Poller  // nil when disabled (empty base url)
+	probe       *selfprobe.Poller // nil when wholly disabled (no master_mtls_url + no master_egress_bind + no runtime_image_tag)
 
 	// 续期后追加调用的 reloader(例如 masteregress :9444)。可为 nil。
 	// 顺序无所谓:每个独立 atomic 切换;失败仅 log,不挡 :9443 reload 成功路径。
@@ -75,6 +77,7 @@ func New(cfg *config.Config, baselinePoller *baseline.Poller, probePoller *selfp
 	s.tunnel = tunnel.NewHandler(s.runner)
 	s.files = files.New()
 	s.sshmux = sshmux.New()
+	s.usercontext = usercontext.New(s.runner)
 	s.baseline = baselinePoller
 	s.probe = probePoller
 	return s, nil
@@ -127,6 +130,10 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("/tunnel/containers/", s.tunnel.ServeHTTP)
 	mux.HandleFunc("/renew-cert", s.renew.HandleRequest)
 	mux.HandleFunc("/renew-cert/deliver", s.renew.HandleDeliver)
+	// V3 Phase 5:GET /v1/users/<uid>/openclaude-context — master 端 envelope
+	// rewrite 读取用户级 USER.md/MEMORY.md/SKILLS。详见
+	// docs/V3_CC_EXTERNAL_ENDPOINT_PHASE5_PLAN_2026-05-21.md §3.6。
+	mux.HandleFunc("/v1/users/", s.usercontext.ServeHTTP)
 
 	mw, err := authmw.New(s.cfg)
 	if err != nil {

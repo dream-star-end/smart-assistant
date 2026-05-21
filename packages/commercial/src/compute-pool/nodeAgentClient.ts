@@ -957,6 +957,49 @@ export async function stopSshControlMaster(
   });
 }
 
+// ─── V3 Phase 5 User Context RPC ─────────────────────────────────────
+
+/**
+ * GET /v1/users/<uid>/openclaude-context — 拉取该用户在本 host 上 docker volume
+ * `oc-v3-data-u<uid>` 里的 USER.md / MEMORY.md / SKILLS frontmatter。
+ *
+ * 用途:master envelope rewrite 时给外接 API 请求注入 OpenClaude 用户级
+ * attribution block(plan §3.6 + §3.1 Step 3)。
+ *
+ * 错误语义:
+ *   - 200 → 完整 PlatformContextResponse
+ *   - 404 VOLUME_NOT_FOUND → 用户从未启过容器,正常路径;**caller 应**捕获
+ *     AgentAppError(httpStatus=404)转空 context fallback,而不是抛
+ *   - 5xx / 网络故障 / cert 失败 → 透出错误,由 VolumeContextReader 调度方决定
+ *     fallback 策略(R10:RPC 不通时返空 context 保持 H1 多机一致)
+ */
+export interface PlatformContextResponse {
+  userMd: string;
+  memoryMd: string;
+  skills: Array<{ name: string; description: string }>;
+  /** RFC3339Nano,volume 不存在时 server 端走 404,200 时此字段三类文件都缺也可能为 null。 */
+  volumeMtime: string | null;
+}
+
+export async function getUserOpenClaudeContext(
+  target: NodeAgentTarget,
+  userId: bigint,
+  opts?: { traceId?: string; timeoutMs?: number },
+): Promise<PlatformContextResponse> {
+  // 严格 [1-9][0-9]{0,18} — node-agent 侧同样校验,但 client 早 fail 省一次 RPC
+  const uidStr = userId.toString();
+  if (!/^[1-9][0-9]{0,18}$/.test(uidStr)) {
+    throw new Error(`getUserOpenClaudeContext: invalid userId ${uidStr}`);
+  }
+  return rpcCall<PlatformContextResponse>(target, {
+    path: `/v1/users/${uidStr}/openclaude-context`,
+    method: "GET",
+    // envelope rewrite 在 hot path,默认 2s 超时(plan R10);caller 可覆盖
+    timeoutMs: opts?.timeoutMs ?? 2_000,
+    traceId: opts?.traceId,
+  });
+}
+
 // ─── Baseline RPC ────────────────────────────────────────────────────
 
 /**

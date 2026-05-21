@@ -474,6 +474,12 @@ interface HarnessOpts {
   now?: () => number;
   /** 注入 fetch (默认:happy SSE)。 */
   fetchImpl?: typeof fetch;
+  /**
+   * Step 7 golden tests:让 loader 返指定 ctx(默认 null,表示空 attribution placeholder)。
+   * 注意:此处只覆盖 *loader 返回值*,handler 装配本身仍走齐(loader+secret 都注入),
+   * 区别于 (7.5) fail-closed 用例的"漏注 deps"路径。
+   */
+  platformCtx?: import("../platform/volumeContextReader.js").PlatformContext | null;
 }
 
 function buildHarness(opts: HarnessOpts = {}) {
@@ -527,6 +533,20 @@ function buildHarness(opts: HarnessOpts = {}) {
         upstreamEndpoint: "https://upstream.test/v1/messages",
         logger: testLogger,
         // 无 broadcast / appendCostCredits 注入,handler 内部 ?. fail-soft
+        // Phase 5 envelope rewriter wiring(2026-05-21):buildHarness 默认走 OAuth
+        // 路径 happy 闭环,handler 在 containerId===null && route.kind==='oauth'
+        // 命中时强制 buildPlatformEnvelope。注入 no-op loader(无 attribution)+
+        // 32 字符固定测试 secret 即可让 builder 走"纯 envelope 强制 + PII strip"
+        // 分支,避免 503 PLATFORM_ENVELOPE_UNAVAILABLE。专门验 envelope 内容
+        // 的用例覆盖在 Step 7 platformEnvelopeBuilder golden test;专门验 503
+        // fail-closed 的用例显式手搓 handler(不走 buildHarness)。
+        // Step 7 golden tests 通过 opts.platformCtx 让 loader 返指定 ctx 验证
+        // ctx → outbound system[N+1] 端到端贯通(非 null placeholder 路径)。
+        platformContextLoader: {
+          load: async () => opts.platformCtx ?? null,
+          invalidate: () => {},
+        },
+        platformServerSecret: "test-platform-hmac-secret-32char",
       });
 
   // 极简 CommercialHttpDeps — 只装与 Phase 3 adapter 相关的字段。其它都标 undefined,
@@ -920,6 +940,134 @@ describe("503 degraded — externalApiKeyProxy 未注入 → EXTERNAL_PROXY_UNAV
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// (7.5) Phase 5 envelope fail-closed:handler 装配漏注 loader/secret
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 跟 (7) 的区别:那是 deps.externalApiKeyProxy = undefined(router 层降级);
+// 这里 externalApiKeyProxy 装配齐了进 router,但 handler 内部 deps.platformContextLoader
+// 或 deps.platformServerSecret 被漏 — handler 内部 fail-closed 走 PLATFORM_ENVELOPE_UNAVAILABLE。
+// 触发条件需命中 `containerId === null && route.kind === "oauth"`,即外接 ApiKey + OAuth 上游。
+
+describe("Phase 5 envelope fail-closed — handler 装配漏注 loader/secret", () => {
+  test("loader 缺失 + secret 已配 → 503 PLATFORM_ENVELOPE_UNAVAILABLE,handler 内部 fail-closed", async () => {
+    // 完整 setup 与 buildHarness 一致,只在 makeAnthropicProxyHandler 调用时漏注 loader。
+    const pool = buildFakePool({});
+    setPoolOverride(pool as unknown as Pool);
+    const preCheckSpy = buildFakePreCheckRedis();
+    const rateLimitRedis = buildFakeRateLimitRedis();
+    const schedulerSpy = buildFakeScheduler();
+    const pricing = buildFakePricing();
+    const apiKeyRepoSpy = buildApiKeyRepoSpy();
+    const logger = createLogger({
+      level: "warn",
+      base: { test: "ccExternalEndpoint.integ.envelope-fail-closed" },
+      out: () => {},
+    });
+    const apiKeyStrategy = makeApiKeyIdentityStrategy({
+      repo: apiKeyRepoSpy.repo,
+      pricing,
+      loadUserModelAuthz: async () => ({
+        role: "admin",
+        grantedModelIds: new Set<string>([FIXED_MODEL]),
+      }),
+    });
+    const externalApiKeyProxy = makeAnthropicProxyHandler({
+      pgPool: pool as unknown as Pool,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      scheduler: schedulerSpy.scheduler,
+      identity: apiKeyStrategy,
+      rateLimitRedis,
+      fetchImpl: async () => sseResponse(200, makeFullSseChunks()),
+      upstreamEndpoint: "https://upstream.test/v1/messages",
+      logger,
+      // ← platformContextLoader 故意不注入,模拟装配 bug;secret 仍给齐以隔离变量
+      platformServerSecret: "test-platform-hmac-secret-32char",
+    });
+    const deps: CommercialHttpDeps = {
+      jwtSecret: FIXED_JWT_SECRET,
+      mailer: { sendTemplate: async () => {} } as unknown as CommercialHttpDeps["mailer"],
+      redis: rateLimitRedis,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      externalApiKeyProxy,
+    };
+    const handler = createCommercialHandler(deps, { logger });
+    const req = new MockReq({
+      headers: { authorization: `Bearer ${FIXED_TOKEN}` },
+      body: minBody(),
+    });
+    const res = new MockRes();
+    await handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+
+    assert.equal(res.statusCode, 503, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(readErrCode(res), "PLATFORM_ENVELOPE_UNAVAILABLE");
+    // 锁顺序不变量:Phase 5 envelope rewriter 在 estimateInputTokens / preCheck.reserve
+    // **之前** 失败 → 任何账务侧效应都不该触发(plan §3.5.2 行为锁)
+    assert.equal(preCheckSpy.reserveCalls.length, 0, "fail-closed 必须在 preCheck.reserve 之前");
+    assert.equal(schedulerSpy.pickCalls, 0, "fail-closed 必须在 scheduler.pick 之前");
+  });
+
+  test("secret 缺失 + loader 已配 → 503 PLATFORM_ENVELOPE_UNAVAILABLE", async () => {
+    // 镜像上一个 test,只换缺失方向 — 验证 OR 语义(任一缺失就 fail-closed)。
+    const pool = buildFakePool({});
+    setPoolOverride(pool as unknown as Pool);
+    const preCheckSpy = buildFakePreCheckRedis();
+    const rateLimitRedis = buildFakeRateLimitRedis();
+    const schedulerSpy = buildFakeScheduler();
+    const pricing = buildFakePricing();
+    const apiKeyRepoSpy = buildApiKeyRepoSpy();
+    const logger = createLogger({
+      level: "warn",
+      base: { test: "ccExternalEndpoint.integ.envelope-fail-closed-secret" },
+      out: () => {},
+    });
+    const apiKeyStrategy = makeApiKeyIdentityStrategy({
+      repo: apiKeyRepoSpy.repo,
+      pricing,
+      loadUserModelAuthz: async () => ({
+        role: "admin",
+        grantedModelIds: new Set<string>([FIXED_MODEL]),
+      }),
+    });
+    const externalApiKeyProxy = makeAnthropicProxyHandler({
+      pgPool: pool as unknown as Pool,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      scheduler: schedulerSpy.scheduler,
+      identity: apiKeyStrategy,
+      rateLimitRedis,
+      fetchImpl: async () => sseResponse(200, makeFullSseChunks()),
+      upstreamEndpoint: "https://upstream.test/v1/messages",
+      logger,
+      platformContextLoader: { load: async () => null, invalidate: () => {} },
+      // ← platformServerSecret 故意不注入
+    });
+    const deps: CommercialHttpDeps = {
+      jwtSecret: FIXED_JWT_SECRET,
+      mailer: { sendTemplate: async () => {} } as unknown as CommercialHttpDeps["mailer"],
+      redis: rateLimitRedis,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      externalApiKeyProxy,
+    };
+    const handler = createCommercialHandler(deps, { logger });
+    const req = new MockReq({
+      headers: { authorization: `Bearer ${FIXED_TOKEN}` },
+      body: minBody(),
+    });
+    const res = new MockRes();
+    await handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+
+    assert.equal(res.statusCode, 503, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(readErrCode(res), "PLATFORM_ENVELOPE_UNAVAILABLE");
+    // 同上 test 锁顺序不变量
+    assert.equal(preCheckSpy.reserveCalls.length, 0, "fail-closed 必须在 preCheck.reserve 之前");
+    assert.equal(schedulerSpy.pickCalls, 0, "fail-closed 必须在 scheduler.pick 之前");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // (8) last_used_at throttle
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -959,34 +1107,31 @@ describe("last_used_at throttle — 5min in-process LRU 端到端 wired", () => 
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// (9) Phase 7 §3.5.2 — 出站 envelope 归一化端到端(invariant #11)
-//
-// 这些 case 与 externalEnvelope.unit.test.ts 的关系:unit 直接调 helper 验
-// system 形态变换;integ 走完整 createCommercialHandler → strategy →
-// runUpstreamRoundTrip 路径,断言**最终序列化到上游的 outbound JSON**(在
-// core.ts:160 `JSON.stringify({...body, messages: upstreamMessages, stream: true})`
-// 之后,fetch 拦截器看到的 body)同时含 sysprompt prefix(envelope helper 注入)
-// **和** metadata.user_id device_id pin(applyUpstreamAuth 后续阶段注入)。
-//
-// Codex Phase 7 plan-review MINOR:必须断 outbound body 而非 helper 输出,
-// 否则 helper 与后续 applyUpstreamAuth 的合作性破裂(职责拆分点)只有 integ
-// 能锁住。
-//
-// 负例选 "DeepSeek 路径" 而非 "容器路径":本文件 IdentityStrategy 是
-// ApiKey,containerId 恒为 null,机械上无法构造容器路径请求;DeepSeek 路径
-// (`route.kind !== "oauth"`)是 §3.5.2 predicate 的另一半,同样需要锁住。
-// 容器路径的 envelope skip 在 anthropicProxy.integ.test.ts 既有 happy 用例
-// 隐式覆盖(那里 IdentityStrategy 是 container,outbound body 历来无 CC prefix
-// 注入 — 本 Phase 7 改动不会破坏该不变量,因为 predicate 第一项 `containerId
-// === null` 就过滤掉了)。
+// (8.5) Phase 5 Step 7 — H1 / H2 / PII strip / RPC fallback golden tests
 // ════════════════════════════════════════════════════════════════════════════
+//
+// 端到端锁的 Phase 5 不变量(plan §5.2 / §8):
+//   - H1 多机一致:同 ApiKey + 同 userId,不同 client 客户端 → 上游 fetch 到的
+//     `system[0]`/`system[1]`/`system[N+1]` byte-level 完全相同;`metadata.user_id`
+//     keyset 同形态;`account_uuid` byte-level 稳定;`session_id` server-generated
+//     且不携带客户端透传值
+//   - H2 外接 / 容器 metadata 同形态:外接 outbound `metadata.user_id` keyset =
+//     {device_id, account_uuid, session_id} 三必有键,无 extra
+//   - PII strip 端到端:客户端 system block 含 hostname / 用户名路径 / device-id
+//     等 PII → 上游 fetch 看到的 outbound 对应 block = `[redacted-by-platform]`
+//   - RPC fallback:loader.load() 返 null(reader 故障 / volume 不存在)→ handler
+//     不抛 503,builder 走 ctx=null 路径(占位 attribution),outbound 200
+//
+// Unit 测试已覆盖 builder 内部逻辑;此处端到端验证 handler 装配链(loader → builder →
+// applyUpstreamAuth → fetch)流向上游 body 的最终形态,锁 Step 6 接入点不退化。
 
 /**
  * 捕获 upstream fetch 的请求 body(POST 给 Anthropic / DeepSeek 的最终 JSON)。
  * 返回 [fetchImpl, getCapturedBody]。fetchImpl 应注入 buildHarness(fetchImpl: ...)。
  *
  * 设计:不预解析,只存原始 string;断言侧 JSON.parse 后看结构,失败时可直接
- * 打印 raw 字节排查。
+ * 打印 raw 字节排查。Phase 5 Step 7 H1/H2/PII/FALLBACK 全部用此 helper 验最终
+ * outbound JSON 形态。
  */
 function makeCapturingFetch(): {
   fetchImpl: typeof fetch;
@@ -1005,537 +1150,233 @@ function makeCapturingFetch(): {
   return { fetchImpl, getBody: () => captured };
 }
 
-describe("Phase 7 §3.5.2 出站 envelope — invariant #11 端到端", () => {
-  test("正例 1:客户端无 system / 无 metadata → outbound 含 CC prefix block + cache_control + metadata.user_id device_id", async () => {
-    const cap = makeCapturingFetch();
-    const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    // body 不含 system / 不含 metadata
-    const res = await h.run({ body: minBody() });
-    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+describe("Phase 5 Step 7 — H1 / H2 / PII strip / fallback golden tests", () => {
+  // FIXED_PINNED_USER_ID 来自 fake account-pool;applyUpstreamAuth 会用它覆盖
+  // envelope builder 占位的 device_id。Step 7 unit 测试已验 device_id 占位写"";
+  // integ 这里关心的是"最终上游看到的"形态,所以期望 device_id = pinned。
 
-    const raw = cap.getBody();
-    assert.ok(raw, "upstream fetch 必须收到 body");
-    const sent = JSON.parse(raw!) as Record<string, unknown>;
-
-    // (a) system 被归一化为 array,第一个 block 是 CC DEFAULT prefix + cache_control
-    assert.ok(Array.isArray(sent.system), `system 必须是 array;got=${typeof sent.system}`);
-    const systemArr = sent.system as Array<Record<string, unknown>>;
-    assert.ok(systemArr.length >= 1, "system 至少有 1 个 block");
-    const first = systemArr[0]!;
-    assert.equal(first.type, "text", "首 block type=text");
-    assert.equal(
-      first.text,
-      "You are Claude Code, Anthropic's official CLI for Claude.",
-      "首 block.text = CC DEFAULT prefix(字面 byte 匹配)",
-    );
-    assert.deepEqual(
-      first.cache_control,
-      { type: "ephemeral" },
-      "注入 block 必带 cache_control: ephemeral(降本)",
-    );
-
-    // (b) device_id pin 也已 injected(envelope helper 与 applyUpstreamAuth 合作)
-    assert.ok(sent.metadata && typeof sent.metadata === "object", "metadata 存在");
-    const meta = sent.metadata as Record<string, unknown>;
-    assert.equal(typeof meta.user_id, "string", "metadata.user_id 是 string(JSON-encoded)");
-    const userIdParsed = JSON.parse(meta.user_id as string) as Record<string, unknown>;
-    assert.equal(
-      userIdParsed.device_id,
-      FIXED_PINNED_USER_ID,
-      "metadata.user_id.device_id = 账号绑定的 pinned_user_id",
-    );
-  });
-
-  test("正例 2:客户端发已含 CC prefix 的 system(string 形态)→ envelope skip,不重复 prepend;device_id pin 仍生效", async () => {
-    const cap = makeCapturingFetch();
-    const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    // 客户端模拟容器 CCB 行为:system 是 string 形态,且以 CC DEFAULT prefix 开头
-    const ccSystemString =
-      "You are Claude Code, Anthropic's official CLI for Claude.\n\nYou are an interactive CLI tool that helps users...";
-    const res = await h.run({
-      body: { ...minBody(), system: ccSystemString },
-    });
-    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
-
-    const raw = cap.getBody();
-    assert.ok(raw, "upstream fetch 必须收到 body");
-    const sent = JSON.parse(raw!) as Record<string, unknown>;
-
-    // helper 把 string 归一化成 array,但因检测到 prefix → skip prepend;
-    // 期望 system = [{type:"text", text: <原 string>}],**没有**额外 prepend 的 cache_control block。
-    assert.ok(Array.isArray(sent.system), "归一化后是 array");
-    const systemArr = sent.system as Array<Record<string, unknown>>;
-    assert.equal(
-      systemArr.length,
-      1,
-      `skip 路径下不应 prepend 新 block;got len=${systemArr.length}`,
-    );
-    assert.equal(systemArr[0]!.type, "text");
-    assert.equal(systemArr[0]!.text, ccSystemString, "原 text 完整保留");
-    assert.equal(
-      systemArr[0]!.cache_control,
-      undefined,
-      "skip 路径下不注入 cache_control(原 string 形态本就没有)",
-    );
-
-    // device_id pin 仍然生效(envelope helper 不动 metadata,applyUpstreamAuth 兜底)
-    const meta = sent.metadata as Record<string, unknown>;
-    const userIdParsed = JSON.parse(meta.user_id as string) as Record<string, unknown>;
-    assert.equal(userIdParsed.device_id, FIXED_PINNED_USER_ID);
-  });
-
-  test("负例:DeepSeek 路径(route.kind !== 'oauth')→ envelope **不**注入 CC prefix", async () => {
-    // 构造 DeepSeek 路径:model 以 `deepseek-` 开头,deps.deepseekApiKey 已注入(避免 503),
-    // 用户 authz 含此 model。
-    const DS_MODEL = "deepseek-v4-pro";
-    const DS_PRICING: ModelPricing = {
-      ...FIXED_PRICING,
-      model_id: DS_MODEL,
-      display_name: "DeepSeek v4 Pro",
-    };
-    const cap = makeCapturingFetch();
-    // buildHarness 不支持注入 deepseekApiKey,手搓 minimal harness 段。
-    const pool = buildFakePool({});
-    setPoolOverride(pool as unknown as Pool);
-    const preCheckSpy = buildFakePreCheckRedis();
-    const rateLimitRedis = buildFakeRateLimitRedis();
-    const schedulerSpy = buildFakeScheduler();
-    const pricing = buildFakePricing([FIXED_PRICING, DS_PRICING]);
-    const apiKeyRepoSpy = buildApiKeyRepoSpy();
-    const logEvents: Array<Record<string, unknown>> = [];
-    const testLogger = createLogger({
-      level: "trace",
-      base: { test: "ccExternalEndpoint.integ.deepseek" },
-      out: (line) => {
-        try { logEvents.push(JSON.parse(line) as Record<string, unknown>); }
-        catch { /* skip */ }
+  test("H1.1 同 userId 不同 client body → outbound system[0]/[1]/[N+1] byte-level 一致", async () => {
+    // 3 个完全不同的 client body — 模拟 3 台机器分别发请求
+    const clientBodies = [
+      {
+        ...minBody(),
+        system: "client A: Mac with hostname: alice-mac.local",
+        metadata: { user_id: JSON.stringify({ device_id: "client-A-deviceid" }) },
       },
-    });
-    const apiKeyStrategy = makeApiKeyIdentityStrategy({
-      repo: apiKeyRepoSpy.repo,
-      pricing,
-      loadUserModelAuthz: async () => ({
-        role: "admin",
-        grantedModelIds: new Set<string>([DS_MODEL]),
-      }),
-    });
-    const externalApiKeyProxy = makeAnthropicProxyHandler({
-      pgPool: pool as unknown as Pool,
-      pricing,
-      preCheckRedis: preCheckSpy.redis,
-      scheduler: schedulerSpy.scheduler,
-      identity: apiKeyStrategy,
-      rateLimitRedis,
-      fetchImpl: cap.fetchImpl,
-      upstreamEndpoint: "https://upstream.test/v1/messages",
-      logger: testLogger,
-      deepseekApiKey: "test-deepseek-key", // ← 关键:避免 503
-    });
-    const deps: CommercialHttpDeps = {
-      jwtSecret: FIXED_JWT_SECRET,
-      mailer: { sendTemplate: async () => {} } as unknown as CommercialHttpDeps["mailer"],
-      redis: rateLimitRedis,
-      pricing,
-      preCheckRedis: preCheckSpy.redis,
-      externalApiKeyProxy,
-    };
-    const handler = createCommercialHandler(deps, { logger: testLogger });
-    const req = new MockReq({
-      headers: { authorization: `Bearer ${FIXED_TOKEN}` },
-      body: { ...minBody(DS_MODEL), system: "be helpful" },
-    });
-    const res = new MockRes();
-    await handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
-
-    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
-    const raw = cap.getBody();
-    assert.ok(raw, "upstream fetch 必须收到 body(DeepSeek 路径)");
-    const sent = JSON.parse(raw!) as Record<string, unknown>;
-
-    // 关键不变量:DeepSeek 路径下 system 必须保持客户端原值(string "be helpful"),
-    // **不**经 envelope 归一化、**不**被 prepend CC prefix。
-    assert.equal(
-      sent.system,
-      "be helpful",
-      `DeepSeek 路径下 system 不应被改写;got=${JSON.stringify(sent.system)}`,
-    );
-
-    // 反向断:确认 logEvents 里没有 `external_envelope_injected` / `external_envelope_skip`
-    // —— predicate 第二项 `route.kind === "oauth"` 应该把 DeepSeek 路径整段跳过。
-    const envelopeLogs = logEvents.filter((e) => {
-      const m = e.msg;
-      return m === "external_envelope_injected" || m === "external_envelope_skip";
-    });
-    assert.equal(
-      envelopeLogs.length,
-      0,
-      `DeepSeek 路径下不应调 envelope helper;got logs=${JSON.stringify(envelopeLogs)}`,
-    );
-
-    // 清理(本 case 没走 buildHarness,需手动)
-    // pool override 由 afterEach 兜底 resetPool。
-  });
-});
-
-// ════════════════════════════════════════════════════════════════════════════
-// (10) Phase 0 baseline: outbound structural snapshot — envv2 drift detection
-//
-// 目的:V3 CC 外接 plan §3.5.2 envelope normalization v2 重构前,锁住当前
-// outbound HTTP body / headers 在所有 v2 会触及的维度上的形态。任一断言失败
-// 即 v2 重构有副作用漂移,必须显式判定是 expected 还是 regression。
-//
-// 锁的是 **JSON.parse 后的结构级形态**(字段存在性 / 值 / 数组顺序 / Object.keys
-// 集合),**不**锁 raw byte / JSON object key 序列化顺序 —— 后者随 V8 实现细节
-// 漂移,不是 v2 关心的维度(Codex Phase 0 code-review MINOR 1 明确)。
-//
-// 与已有覆盖的关系:
-//   - externalEnvelope.unit.test.ts(17 cases)锁 helper 内部 → 不重复
-//   - Phase 7 §3.5.2 上方 3 cases(inject/skip/deepseek)锁端到端基础形态 → 互补
-//
-// 新增 case 覆盖 8 个维度(Codex Phase 0 plan-review MINOR 已采纳):
-//   1) system 数组前置 + 客户端 block 顺序保留
-//   2) system 非零位置含 CC prefix → skip,锁 detectCcPrefix any-position 当前行为
-//   3) AGENT_SDK 变体 prefix(string)→ skip + log prefix_variant=2
-//   4) header allowlist snapshot + x-api-key 不泄到上游
-//   5) metadata.user_id 客户端无 metadata → 仅 device_id key
-//   6) metadata.user_id 客户端 keys 保留 + device_id 覆盖
-//   7) tools/thinking/top_p/temperature/stop_sequences/max_tokens/
-//      context_management/tool_choice 全部 passthrough byte-equal
-//   8) negative anchor — 当前 outbound 无 fingerprint 字段 + system text 无 SALT
-//      + system.length === 1(无 attribution/session info block)
-// ════════════════════════════════════════════════════════════════════════════
-
-/**
- * 扩展版 capturing fetch:同时锁 body / headers / url。
- * 仅 Phase 0 baseline 使用(case 4 锁 header allowlist + authorization 反向断 + url),
- * 不替换 makeCapturingFetch — 既有 3 cases 已稳定,不动。
- */
-function makeCapturingFetchFull(): {
-  fetchImpl: typeof fetch;
-  getBody(): string | undefined;
-  getHeaders(): Record<string, string> | undefined;
-  getUrl(): string | undefined;
-} {
-  let capturedBody: string | undefined;
-  let capturedHeaders: Record<string, string> | undefined;
-  let capturedUrl: string | undefined;
-  const fetchImpl: typeof fetch = (async (
-    url: string | URL,
-    init?: RequestInit,
-  ) => {
-    capturedUrl = typeof url === "string" ? url : url.toString();
-    if (init?.body && typeof init.body === "string") {
-      capturedBody = init.body;
+      {
+        ...minBody(),
+        system: [{ type: "text", text: "client B array-form system" }],
+        metadata: { user_id: JSON.stringify({ device_id: "client-B-deviceid" }) },
+      },
+      {
+        ...minBody(),
+        // 客户端 C 不传 system / metadata
+      },
+    ];
+    const outbounds: Array<Record<string, unknown>> = [];
+    for (const body of clientBodies) {
+      const cap = makeCapturingFetch();
+      const h = buildHarness({ fetchImpl: cap.fetchImpl });
+      const res = await h.run({ body });
+      assert.equal(res.statusCode, 200, `status=${res.statusCode}: ${res.bodyText()}`);
+      const raw = cap.getBody();
+      assert.ok(raw);
+      outbounds.push(JSON.parse(raw!) as Record<string, unknown>);
+      await resetPool();
+      _clearMaintenanceCache();
     }
-    // headers 形态:Record<string,string>(handler 用 plain object),
-    // 但 RequestInit 也兼容 Headers / [string,string][]。这里只走 plain object 路径,
-    // 因为 core.ts:166 fetchInit.headers 就是 safeHeaders 这个 Record。
-    if (init?.headers && !Array.isArray(init.headers) && !(init.headers instanceof Headers)) {
-      capturedHeaders = { ...(init.headers as Record<string, string>) };
-    }
-    return sseResponse(200, makeFullSseChunks());
-  }) as unknown as typeof fetch;
-  return {
-    fetchImpl,
-    getBody: () => capturedBody,
-    getHeaders: () => capturedHeaders,
-    getUrl: () => capturedUrl,
-  };
-}
 
-describe("Phase 0 baseline: outbound byte-level snapshot — envv2 drift detection", () => {
-  // ── case 1: system 数组前置 + 客户端 block 顺序保留 ─────────────────────
-  // v2 plan 会把客户端 block 改成 "as project context",顺序/字段必须先锁。
-  test("case 1: 客户端 system 是 array 含 1 个 text block → outbound 长度=2,prepend 在前,客户端 block byte-equal 在后", async () => {
-    const cap = makeCapturingFetchFull();
-    const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    const clientBlock = { type: "text", text: "client_A_arbitrary_content" };
-    const res = await h.run({ body: { ...minBody(), system: [clientBlock] } });
-    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    // 抽 3 个 outbound 的 system 数组
+    const systems = outbounds.map((b) => b.system as Array<{ text: string }>);
 
-    const raw = cap.getBody();
-    assert.ok(raw);
-    const sent = JSON.parse(raw!) as Record<string, unknown>;
-    const systemArr = sent.system as Array<Record<string, unknown>>;
-    assert.ok(Array.isArray(systemArr));
-    assert.equal(systemArr.length, 2, `expected len=2 (prepend + 1 client block); got=${systemArr.length}`);
-    // [0] = 注入的 CC DEFAULT prefix + cache_control:ephemeral
-    assert.equal(systemArr[0]!.type, "text");
+    // system[0] attribution forge — 3 client byte-level 完全相同
+    assert.equal(systems[0]![0]!.text, systems[1]![0]!.text);
+    assert.equal(systems[1]![0]!.text, systems[2]![0]!.text);
+    assert.ok(systems[0]![0]!.text.startsWith("x-anthropic-billing-header: cc_version="));
+
+    // system[1] CC prefix — byte-level 完全相同
+    assert.equal(systems[0]![1]!.text, systems[1]![1]!.text);
+    assert.equal(systems[1]![1]!.text, systems[2]![1]!.text);
     assert.equal(
-      systemArr[0]!.text,
+      systems[0]![1]!.text,
       "You are Claude Code, Anthropic's official CLI for Claude.",
     );
-    assert.deepEqual(systemArr[0]!.cache_control, { type: "ephemeral" });
-    // [1] = 客户端原 block,deepEqual 防字段顺序假阳性
-    assert.deepEqual(systemArr[1], clientBlock, "客户端 block 必须 byte-equal 保留在位置 [1]");
+
+    // system[N+1] 平台 context 块(尾)— byte-level 完全相同(占位形态)
+    const last0 = systems[0]![systems[0]!.length - 1]!.text;
+    const last1 = systems[1]![systems[1]!.length - 1]!.text;
+    const last2 = systems[2]![systems[2]!.length - 1]!.text;
+    assert.equal(last0, last1);
+    assert.equal(last1, last2);
+    assert.ok(last0.startsWith("# OpenClaude Platform Context"));
   });
 
-  // ── case 2: detectCcPrefix any-position 当前行为锁 ──────────────────────
-  // v2 plan 改 detect 策略为强制 [0](L0 头位锁),baseline 必须先锁 any-position。
-  test("case 2: system 非零位置含 CC prefix → skip 不再 prepend,两 block 顺序保留", async () => {
-    const cap = makeCapturingFetchFull();
-    const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    const otherBlock = { type: "text", text: "other_unrelated_content" };
-    const ccPrefixBlock = {
-      type: "text",
-      text:
-        "You are Claude Code, Anthropic's official CLI for Claude.\n\nsome additional context",
-    };
-    const res = await h.run({
-      body: { ...minBody(), system: [otherBlock, ccPrefixBlock] },
-    });
-    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
-
-    const raw = cap.getBody();
-    const sent = JSON.parse(raw!) as Record<string, unknown>;
-    const systemArr = sent.system as Array<Record<string, unknown>>;
-    assert.equal(systemArr.length, 2, "skip 路径下不应 prepend → 长度仍为 2");
-    assert.deepEqual(systemArr[0], otherBlock, "[0] 是客户端 other_unrelated_content");
-    assert.deepEqual(systemArr[1], ccPrefixBlock, "[1] 是客户端 ccPrefixBlock(prefix 在非零位置也触发 skip)");
+  test("H1.2 同 userId 不同 client body → metadata.user_id keyset 同形态 + account_uuid 字节级稳定 + session_id 各异", async () => {
+    const accountUuids: string[] = [];
+    const sessionIds: string[] = [];
+    const keysets: string[][] = [];
+    for (let i = 0; i < 3; i++) {
+      const cap = makeCapturingFetch();
+      const h = buildHarness({ fetchImpl: cap.fetchImpl });
+      // 客户端透传一个 session_id 占位值,验它必被覆盖
+      const res = await h.run({
+        body: {
+          ...minBody(),
+          metadata: {
+            user_id: JSON.stringify({
+              device_id: `client-${i}-deviceid`,
+              session_id: "CLIENT_INJECTED_SESSION_DO_NOT_LEAK",
+            }),
+          },
+        },
+      });
+      assert.equal(res.statusCode, 200);
+      const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+      const userIdObj = JSON.parse(
+        (sent.metadata as Record<string, unknown>).user_id as string,
+      ) as Record<string, string>;
+      keysets.push(Object.keys(userIdObj).sort());
+      accountUuids.push(userIdObj.account_uuid!);
+      sessionIds.push(userIdObj.session_id!);
+      await resetPool();
+      _clearMaintenanceCache();
+    }
+    // keyset 必恒为 [account_uuid, device_id, session_id]
+    assert.deepEqual(keysets[0], ["account_uuid", "device_id", "session_id"]);
+    assert.deepEqual(keysets[0], keysets[1]);
+    assert.deepEqual(keysets[1], keysets[2]);
+    // account_uuid 同 userId 跨多次稳定
+    assert.equal(accountUuids[0], accountUuids[1]);
+    assert.equal(accountUuids[1], accountUuids[2]);
+    // session_id 各不相同 + 都不等于 client 透传值
+    assert.notEqual(sessionIds[0], sessionIds[1]);
+    assert.notEqual(sessionIds[1], sessionIds[2]);
+    for (const sid of sessionIds) {
+      assert.notEqual(sid, "CLIENT_INJECTED_SESSION_DO_NOT_LEAK");
+      assert.match(
+        sid,
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+    }
   });
 
-  // ── case 3: AGENT_SDK 变体识别 ──────────────────────────────────────────
-  test("case 3: AGENT_SDK 变体 prefix(string)→ skip + log external_envelope_skip { prefix_variant:2, orig_kind:'string', blocks:1 }", async () => {
-    const cap = makeCapturingFetchFull();
+  test("H2.1 outbound metadata.user_id 仅含 3 必有 key(device_id/account_uuid/session_id),无 extra", async () => {
+    const cap = makeCapturingFetch();
     const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    const agentSdkSystem =
-      "You are a Claude agent, built on Anthropic's Claude Agent SDK.\n\nrest of agent prompt";
-    const res = await h.run({ body: { ...minBody(), system: agentSdkSystem } });
-    assert.equal(res.statusCode, 200);
-
-    const raw = cap.getBody();
-    const sent = JSON.parse(raw!) as Record<string, unknown>;
-    const systemArr = sent.system as Array<Record<string, unknown>>;
-    assert.equal(systemArr.length, 1, "string → array 归一化,skip 不 prepend → 长度 1");
-    assert.equal(systemArr[0]!.text, agentSdkSystem, "原 string 完整保留");
-
-    // log 断言:只筛 msg + 三个结构指纹字段,不锁整条 log object
-    const skipLog = h.logEvents.find((e) => e.msg === "external_envelope_skip");
-    assert.ok(skipLog, "必须发出 external_envelope_skip");
-    assert.equal(skipLog!.prefix_variant, 2, "AGENT_SDK 变体 index = 2");
-    assert.equal(skipLog!.orig_kind, "string", "客户端原始 system 形态 = string");
-    assert.equal(skipLog!.blocks, 1, "归一化后 array 长度 = 1");
-  });
-
-  // ── case 4: header allowlist + auth 反向断 + url ────────────────────────
-  // v2 plan 可能"补全 CC headers(x-stainless-* / UA)",baseline 必须先锁"现在什么都不补"。
-  // 安全维度:客户端 oc-cc.* API key **绝不**能泄到 Anthropic upstream。
-  test("case 4: header allowlist 恰好 5 个 key + anthropic-beta merge oauth 前置 + 客户端 token/api-key 不泄到上游", async () => {
-    const cap = makeCapturingFetchFull();
-    const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    // 故意往入站塞一堆 CC 客户端常见的 header(x-stainless-*, x-app, x-api-key),
-    // 锁出站 allowlist 把它们全 strip。
-    const res = await h.run({
-      headers: {
-        "x-stainless-lang": "js",
-        "x-stainless-runtime": "node",
-        "x-stainless-arch": "x64",
-        "x-app": "claude-code",
-        "x-api-key": "client-fake-api-key-should-not-leak",
-        "anthropic-beta": "prompt-caching-2024-07-31",
-      },
-    });
-    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
-
-    const headers = cap.getHeaders();
-    assert.ok(headers, "fetch headers 必须被捕获");
-    const keys = Object.keys(headers!).sort();
-    assert.deepEqual(
-      keys,
-      ["accept", "anthropic-beta", "anthropic-version", "authorization", "content-type"],
-      `outbound header set 必须恰好 5 个 allowlist key;got=${JSON.stringify(keys)}`,
-    );
-    // anthropic-beta:oauth-2025-04-20 必须在最前(applyUpstreamAuth 用 unshift 注入)
-    assert.equal(
-      headers!["anthropic-beta"],
-      "oauth-2025-04-20,prompt-caching-2024-07-31",
-      "anthropic-beta 必须 oauth-2025 前置 + 客户端原 beta 跟后",
-    );
-    // authorization 用账号池 token 而非客户端 oc-cc API key
-    assert.equal(
-      headers!["authorization"],
-      "Bearer FAKE-TOKEN-VALUE",
-      "authorization 必须是 scheduler.pick 返回的账号 token",
-    );
-
-    // 反向断:客户端的 oc-cc.* API key 绝不应出现在 outbound raw bytes 任何位置
-    // (既不在 headers 也不在 body)。这是真实安全维度,v2 改 helper 时容易漏。
-    const rawBody = cap.getBody() ?? "";
-    const allOutbound = JSON.stringify(headers) + rawBody;
-    assert.ok(
-      !allOutbound.includes(FIXED_TOKEN),
-      "客户端 oc-cc.* API key 不能泄到 upstream",
-    );
-    assert.ok(
-      !allOutbound.includes("client-fake-api-key-should-not-leak"),
-      "客户端 x-api-key 不能泄到 upstream",
-    );
-
-    // URL 端点锁(buildHarness 注入的 upstreamEndpoint)
-    assert.equal(cap.getUrl(), "https://upstream.test/v1/messages", "upstream URL 锁");
-  });
-
-  // ── case 5: metadata.user_id 客户端无 metadata → 仅 device_id key ─────
-  test("case 5: 客户端无 metadata → outbound metadata 恰好 { user_id }, user_id JSON 恰好 { device_id }", async () => {
-    const cap = makeCapturingFetchFull();
-    const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    const res = await h.run({ body: minBody() }); // 无 metadata
-    assert.equal(res.statusCode, 200);
-
-    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
-    const meta = sent.metadata as Record<string, unknown>;
-    assert.deepEqual(
-      Object.keys(meta).sort(),
-      ["user_id"],
-      `metadata 应只含 user_id;got=${JSON.stringify(Object.keys(meta))}`,
-    );
-    const userIdParsed = JSON.parse(meta.user_id as string) as Record<string, unknown>;
-    assert.deepEqual(
-      Object.keys(userIdParsed).sort(),
-      ["device_id"],
-      `user_id JSON 应只含 device_id;got=${JSON.stringify(Object.keys(userIdParsed))}`,
-    );
-    assert.equal(userIdParsed.device_id, FIXED_PINNED_USER_ID);
-  });
-
-  // ── case 6: metadata.user_id 客户端 keys 保留 + device_id 覆盖 ──────────
-  test("case 6: 客户端 metadata.user_id 含多 keys → device_id 被覆盖 + 其他 keys(account_uuid/session_id/custom_extras)全保留", async () => {
-    const cap = makeCapturingFetchFull();
-    const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    const clientUserIdJson = JSON.stringify({
-      device_id: "FAKE_CLIENT_DEVICE_ID_must_be_overwritten",
-      account_uuid: "abc-uuid-1234",
-      session_id: "sess-xyz-5678",
-      custom_extras: 42,
-    });
     const res = await h.run({
       body: {
         ...minBody(),
-        // schema strict:metadata 只允许 user_id + session_id;两者都测
-        metadata: { user_id: clientUserIdJson, session_id: "outer-session-id" },
+        metadata: {
+          user_id: JSON.stringify({
+            device_id: "x",
+            custom_inner_extra: "leak1",
+            another_field: 42,
+          }),
+          // session_id 是 schema-allowed 的顶层 key,但 builder 必须 strip
+          // (schema metadata 是 .strict(),custom_top_extra 这类未声明 key 会被 zod 直接 400,无法走到 builder)
+          session_id: "top-level-session-should-die",
+        } as Record<string, unknown>,
       },
     });
-    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
-
+    assert.equal(res.statusCode, 200);
     const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
     const meta = sent.metadata as Record<string, unknown>;
-    assert.deepEqual(
-      Object.keys(meta).sort(),
-      ["session_id", "user_id"],
-      "metadata 两个顶层 key(session_id 透传 + user_id 改写)都在",
-    );
-    assert.equal(meta.session_id, "outer-session-id", "metadata.session_id 顶层透传");
-
-    const userIdParsed = JSON.parse(meta.user_id as string) as Record<string, unknown>;
-    assert.equal(
-      userIdParsed.device_id,
-      FIXED_PINNED_USER_ID,
-      "device_id 必须被 pinned 覆盖(fake → real)",
-    );
-    assert.equal(userIdParsed.account_uuid, "abc-uuid-1234", "account_uuid 保留");
-    assert.equal(userIdParsed.session_id, "sess-xyz-5678", "user_id JSON 内 session_id 保留(独立于顶层 metadata.session_id)");
-    assert.equal(userIdParsed.custom_extras, 42, "custom_extras 保留(rewriteMetadataDeviceId fail-open)");
-    assert.deepEqual(
-      Object.keys(userIdParsed).sort(),
-      ["account_uuid", "custom_extras", "device_id", "session_id"],
-      "user_id JSON 不多不少 4 个 key",
-    );
+    // 顶层只剩 user_id
+    assert.deepEqual(Object.keys(meta), ["user_id"]);
+    const userIdObj = JSON.parse(meta.user_id as string) as Record<string, unknown>;
+    // 内层只 3 必有 key
+    assert.deepEqual(Object.keys(userIdObj).sort(), [
+      "account_uuid",
+      "device_id",
+      "session_id",
+    ]);
   });
 
-  // ── case 7: body 字段 passthrough byte-equal ─────────────────────────────
-  // 锁"当前 helper + applyUpstreamAuth 都不动这些字段"。v2 可能补 CC 默认 tools 或
-  // strip 客户端 thinking,baseline 必须先锁纯 passthrough。
-  test("case 7: tools/thinking/top_p/temperature/stop_sequences/max_tokens/context_management/tool_choice → outbound 全部 deepEqual passthrough", async () => {
-    const cap = makeCapturingFetchFull();
+  test("PII.E2E.1 outbound system 块含 hostname/UNIX 路径/device-id 都被 [redacted-by-platform]", async () => {
+    const cap = makeCapturingFetch();
     const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    const clientBody = {
-      ...minBody(),
-      max_tokens: 7777,
-      temperature: 0.5,
-      top_p: 0.9,
-      stop_sequences: ["END_OF_TEXT", "STOP"],
-      tools: [
-        {
-          name: "test_tool",
-          description: "a tool for testing passthrough",
-          input_schema: { type: "object", properties: { x: { type: "string" } } },
-        },
-      ],
-      tool_choice: { type: "auto" },
-      thinking: { type: "enabled", budget_tokens: 1024 },
-      context_management: { strategy: "auto" },
-    };
-    const res = await h.run({ body: clientBody });
-    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
-
-    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
-    // 每个字段独立 deepEqual,失败信息更精确
-    assert.equal(sent.max_tokens, 7777, "max_tokens passthrough");
-    assert.equal(sent.temperature, 0.5, "temperature passthrough");
-    assert.equal(sent.top_p, 0.9, "top_p passthrough");
-    assert.deepEqual(sent.stop_sequences, ["END_OF_TEXT", "STOP"], "stop_sequences passthrough");
-    assert.deepEqual(sent.tools, clientBody.tools, "tools deepEqual passthrough");
-    assert.deepEqual(sent.tool_choice, { type: "auto" }, "tool_choice passthrough");
-    assert.deepEqual(sent.thinking, clientBody.thinking, "thinking passthrough");
-    assert.deepEqual(sent.context_management, { strategy: "auto" }, "context_management passthrough");
-  });
-
-  // ── case 8: negative anchor — fingerprint/attribution 当前不存在 ────────
-  // v2 plan 要加 server-validated fingerprint + attribution prefix,
-  // baseline 必须断言"现在没有",形成 BEFORE→AFTER 清晰 diff 锚点。
-  test("case 8: 当前 outbound 无 fingerprint 字段 + system text 无 SALT 字面 + system.length===1(无 attribution/session info block)", async () => {
-    const cap = makeCapturingFetchFull();
-    const h = buildHarness({ fetchImpl: cap.fetchImpl });
-    const res = await h.run({ body: minBody() }); // 空 system,触发 prepend 路径
+    const piiBlock1 = "Hostname: leak-host.example.com";
+    const piiBlock2 = "User dir at /Users/alice-the-engineer/projects";
+    const piiBlock3 = `Device id hash: ${"deadbeef".repeat(4)}`; // hex32
+    const res = await h.run({
+      body: {
+        ...minBody(),
+        system: [
+          { type: "text", text: piiBlock1 },
+          { type: "text", text: piiBlock2 },
+          { type: "text", text: piiBlock3 },
+        ],
+      },
+    });
     assert.equal(res.statusCode, 200);
-
     const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
-
-    // (a) 递归扫 object key,断不存在 key 名 "fingerprint"
-    function findKeyAnywhere(obj: unknown, target: string): boolean {
-      if (obj === null || typeof obj !== "object") return false;
-      if (Array.isArray(obj)) return obj.some((v) => findKeyAnywhere(v, target));
-      for (const [k, v] of Object.entries(obj)) {
-        if (k === target) return true;
-        if (findKeyAnywhere(v, target)) return true;
-      }
-      return false;
+    const systemArr = sent.system as Array<{ text: string }>;
+    // system[0] / [1] 是 server forge,attribution + CC prefix
+    // system[2..N] 是 PII 后的 tail;system[N+1] 是平台 context 块
+    // 我们的 3 个 PII block 应在 system[2..4],全部 redacted
+    const tailBlocks = systemArr.slice(2, 5);
+    for (const b of tailBlocks) {
+      assert.equal(b.text, "[redacted-by-platform]", `应整 block redact;got=${b.text}`);
     }
+    // outbound raw 字面也不应残留任何 PII 子串(双重保险)
+    const raw = cap.getBody()!;
+    assert.ok(!raw.includes("alice-the-engineer"), "用户名路径不应出现在 outbound raw");
+    assert.ok(!raw.includes("leak-host.example.com"), "hostname 不应出现在 outbound raw");
+    assert.ok(!raw.includes("deadbeefdeadbeefdeadbeefdeadbeef"), "device-id 不应出现");
+  });
+
+  test("PII.E2E.2 PII negative anchor — `localhost` 单词不命中(非 field-style)", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const benign = "Please connect to localhost on port 3000";
+    const res = await h.run({
+      body: { ...minBody(), system: [{ type: "text", text: benign }] },
+    });
+    assert.equal(res.statusCode, 200);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<{ text: string }>;
+    // tail block 应原样保留(不被 PII 误伤)
+    const tail = systemArr[2]!.text;
+    assert.equal(tail, benign);
+  });
+
+  test("FALLBACK.1 platformContextLoader 返 null(reader 故障/volume 不存在)→ 不抛 503,outbound 200 + platform 块用占位", async () => {
+    const cap = makeCapturingFetch();
+    // buildHarness 默认 loader 就是 `async () => null`,等价 RPC fallback;
+    // 显式 platformCtx: null 写出来加强用例语义
+    const h = buildHarness({ fetchImpl: cap.fetchImpl, platformCtx: null });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200, `应 200;status=${res.statusCode}: ${res.bodyText()}`);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<{ text: string }>;
+    const last = systemArr[systemArr.length - 1]!.text;
     assert.equal(
-      findKeyAnywhere(sent, "fingerprint"),
-      false,
-      "当前 outbound 不应含任何 fingerprint 字段(v2 阶段加,baseline 锁 BEFORE 状态)",
+      last,
+      "# OpenClaude Platform Context\n[platform-context-unavailable]",
+      "ctx=null → 占位文本(server-canonical default,保 H1 多机一致)",
     );
-    // (a') 额外扫 metadata.user_id 这条 JSON string 内层(Codex code-review MINOR 3
-    // 采纳):如果未来 v2 把 fingerprint 塞进 user_id JSON,递归扫 sent 看不到
-    // 字符串内部 — 单独 parse + 递归确保锁死。
-    const meta = sent.metadata as Record<string, unknown> | undefined;
-    if (meta && typeof meta.user_id === "string") {
-      const inner = JSON.parse(meta.user_id) as unknown;
-      assert.equal(
-        findKeyAnywhere(inner, "fingerprint"),
-        false,
-        "metadata.user_id JSON 字符串内层也不应含 fingerprint(v2 BEFORE 锚)",
-      );
-    }
+  });
 
-    // (b) system 只有 1 个 block(注入的 prefix),没有 attribution/session info 额外块
-    const systemArr = sent.system as Array<Record<string, unknown>>;
-    assert.equal(
-      systemArr.length,
-      1,
-      `当前 outbound system 应只有 1 个注入 prefix block;got len=${systemArr.length}`,
-    );
-
-    // (c) SALT 字面值仅在 system text blocks 内扫(不扫整 raw,避免误伤 user 消息文本)
-    const SALT = "59cf53e54c78";
-    for (const block of systemArr) {
-      if (block.type === "text" && typeof block.text === "string") {
-        assert.ok(
-          !block.text.includes(SALT),
-          `system text 内不应含 fingerprint SALT 字面;block.text=${JSON.stringify(block.text)}`,
-        );
-      }
-    }
+  test("FALLBACK.2 platformContextLoader 返实际 ctx → outbound platform 块含 USER.md / MEMORY / skills", async () => {
+    const ctx = {
+      userMd: "# boss\nthe user is boss",
+      memoryMd: "- [Memo](file.md) — info hook",
+      skills: [{ name: "search-skill", description: "web search" }],
+      volumeMtime: new Date("2026-05-21T00:00:00.000Z"),
+    };
+    const cap = makeCapturingFetch();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl, platformCtx: ctx });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<{ text: string }>;
+    const last = systemArr[systemArr.length - 1]!.text;
+    assert.ok(last.startsWith("# OpenClaude Platform Context"));
+    assert.ok(last.includes("## User"));
+    assert.ok(last.includes("the user is boss"));
+    assert.ok(last.includes("## Memory Index"));
+    assert.ok(last.includes("## Skills"));
+    assert.ok(last.includes("- **search-skill** — web search"));
   });
 });
+

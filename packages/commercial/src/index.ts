@@ -100,6 +100,8 @@ import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
+import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
+import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
   makeServerAuthoredHandler,
   SERVER_AUTHORED_PATH,
@@ -1159,6 +1161,18 @@ export async function registerCommercial(
         loadUserModelAuthz,
         logger: rootLogger.child({ subsys: "apiKeyIdentity" }),
       });
+      // Phase 5 platform envelope rewriter wiring(2026-05-21)。
+      // secret 缺失 → throw → 外层 catch 将 externalApiKeyProxy 置 undefined,
+      // 同 hupi/deepseek 已有的"缺配置 → 端点 503"模式一致(non-fatal,主进程继续)。
+      // Loader 持有 PlatformContextReader 单例,master 进程生命期与之绑定,无须 close。
+      if (!cfg.PLATFORM_HMAC_SECRET) {
+        throw new Error(
+          "PLATFORM_HMAC_SECRET required for external ApiKey proxy (Phase 5 envelope)",
+        );
+      }
+      const platformContextLoader = makePlatformContextLoader({
+        reader: makeDefaultVolumeContextReader(),
+      });
       externalApiKeyProxy = makeAnthropicProxyHandler({
         pgPool: getPool(),
         pricing,
@@ -1173,6 +1187,8 @@ export async function registerCommercial(
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
         appendCostCredits,
         deepseekApiKey: cfg.DEEPSEEK_API_KEY,
+        platformContextLoader,
+        platformServerSecret: cfg.PLATFORM_HMAC_SECRET,
       });
       // eslint-disable-next-line no-console
       console.log(
