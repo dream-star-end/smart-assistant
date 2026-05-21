@@ -508,7 +508,17 @@ export type ProxyRejectReason =
   | "bad_path"
   | "bad_headers"
   | "upstream_auth"
-  | "deepseek_config";
+  | "deepseek_config"
+  // Phase 5 platform envelope rewriter:**handler-level** deps.platformContextLoader
+  // 或 deps.platformServerSecret 任一为 undefined,external ApiKey 触发条件命中时
+  // fail-closed 返 503 PLATFORM_ENVELOPE_UNAVAILABLE。
+  //
+  // 注:**assembly-level** secret 缺失(PLATFORM_HMAC_SECRET 未配)走另一条路径 ——
+  // index.ts 装配时 throw → outer catch 把 externalApiKeyProxy 置 undefined →
+  // router 返 503 EXTERNAL_PROXY_UNAVAILABLE,**不**计这个 counter;两者通过 error
+  // code 区分。生产中只有 wiring bug / handler 装配漏注 dep 才会计这个,正常
+  // 路径恒 0,非 0 即告警信号。
+  | "platform_envelope";
 export function incrAnthropicProxyReject(reason: ProxyRejectReason): void {
   anthropicProxyReject.inc({ reason });
 }

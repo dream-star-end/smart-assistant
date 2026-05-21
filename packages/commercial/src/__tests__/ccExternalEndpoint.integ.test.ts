@@ -527,6 +527,15 @@ function buildHarness(opts: HarnessOpts = {}) {
         upstreamEndpoint: "https://upstream.test/v1/messages",
         logger: testLogger,
         // 无 broadcast / appendCostCredits 注入,handler 内部 ?. fail-soft
+        // Phase 5 envelope rewriter wiring(2026-05-21):buildHarness 默认走 OAuth
+        // 路径 happy 闭环,handler 在 containerId===null && route.kind==='oauth'
+        // 命中时强制 buildPlatformEnvelope。注入 no-op loader(无 attribution)+
+        // 32 字符固定测试 secret 即可让 builder 走"纯 envelope 强制 + PII strip"
+        // 分支,避免 503 PLATFORM_ENVELOPE_UNAVAILABLE。专门验 envelope 内容
+        // 的用例覆盖在 Step 7 platformEnvelopeBuilder golden test;专门验 503
+        // fail-closed 的用例显式手搓 handler(不走 buildHarness)。
+        platformContextLoader: { load: async () => null, invalidate: () => {} },
+        platformServerSecret: "test-platform-hmac-secret-32char",
       });
 
   // 极简 CommercialHttpDeps — 只装与 Phase 3 adapter 相关的字段。其它都标 undefined,
@@ -920,6 +929,134 @@ describe("503 degraded — externalApiKeyProxy 未注入 → EXTERNAL_PROXY_UNAV
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// (7.5) Phase 5 envelope fail-closed:handler 装配漏注 loader/secret
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 跟 (7) 的区别:那是 deps.externalApiKeyProxy = undefined(router 层降级);
+// 这里 externalApiKeyProxy 装配齐了进 router,但 handler 内部 deps.platformContextLoader
+// 或 deps.platformServerSecret 被漏 — handler 内部 fail-closed 走 PLATFORM_ENVELOPE_UNAVAILABLE。
+// 触发条件需命中 `containerId === null && route.kind === "oauth"`,即外接 ApiKey + OAuth 上游。
+
+describe("Phase 5 envelope fail-closed — handler 装配漏注 loader/secret", () => {
+  test("loader 缺失 + secret 已配 → 503 PLATFORM_ENVELOPE_UNAVAILABLE,handler 内部 fail-closed", async () => {
+    // 完整 setup 与 buildHarness 一致,只在 makeAnthropicProxyHandler 调用时漏注 loader。
+    const pool = buildFakePool({});
+    setPoolOverride(pool as unknown as Pool);
+    const preCheckSpy = buildFakePreCheckRedis();
+    const rateLimitRedis = buildFakeRateLimitRedis();
+    const schedulerSpy = buildFakeScheduler();
+    const pricing = buildFakePricing();
+    const apiKeyRepoSpy = buildApiKeyRepoSpy();
+    const logger = createLogger({
+      level: "warn",
+      base: { test: "ccExternalEndpoint.integ.envelope-fail-closed" },
+      out: () => {},
+    });
+    const apiKeyStrategy = makeApiKeyIdentityStrategy({
+      repo: apiKeyRepoSpy.repo,
+      pricing,
+      loadUserModelAuthz: async () => ({
+        role: "admin",
+        grantedModelIds: new Set<string>([FIXED_MODEL]),
+      }),
+    });
+    const externalApiKeyProxy = makeAnthropicProxyHandler({
+      pgPool: pool as unknown as Pool,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      scheduler: schedulerSpy.scheduler,
+      identity: apiKeyStrategy,
+      rateLimitRedis,
+      fetchImpl: async () => sseResponse(200, makeFullSseChunks()),
+      upstreamEndpoint: "https://upstream.test/v1/messages",
+      logger,
+      // ← platformContextLoader 故意不注入,模拟装配 bug;secret 仍给齐以隔离变量
+      platformServerSecret: "test-platform-hmac-secret-32char",
+    });
+    const deps: CommercialHttpDeps = {
+      jwtSecret: FIXED_JWT_SECRET,
+      mailer: { sendTemplate: async () => {} } as unknown as CommercialHttpDeps["mailer"],
+      redis: rateLimitRedis,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      externalApiKeyProxy,
+    };
+    const handler = createCommercialHandler(deps, { logger });
+    const req = new MockReq({
+      headers: { authorization: `Bearer ${FIXED_TOKEN}` },
+      body: minBody(),
+    });
+    const res = new MockRes();
+    await handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+
+    assert.equal(res.statusCode, 503, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(readErrCode(res), "PLATFORM_ENVELOPE_UNAVAILABLE");
+    // 锁顺序不变量:Phase 5 envelope rewriter 在 estimateInputTokens / preCheck.reserve
+    // **之前** 失败 → 任何账务侧效应都不该触发(plan §3.5.2 行为锁)
+    assert.equal(preCheckSpy.reserveCalls.length, 0, "fail-closed 必须在 preCheck.reserve 之前");
+    assert.equal(schedulerSpy.pickCalls, 0, "fail-closed 必须在 scheduler.pick 之前");
+  });
+
+  test("secret 缺失 + loader 已配 → 503 PLATFORM_ENVELOPE_UNAVAILABLE", async () => {
+    // 镜像上一个 test,只换缺失方向 — 验证 OR 语义(任一缺失就 fail-closed)。
+    const pool = buildFakePool({});
+    setPoolOverride(pool as unknown as Pool);
+    const preCheckSpy = buildFakePreCheckRedis();
+    const rateLimitRedis = buildFakeRateLimitRedis();
+    const schedulerSpy = buildFakeScheduler();
+    const pricing = buildFakePricing();
+    const apiKeyRepoSpy = buildApiKeyRepoSpy();
+    const logger = createLogger({
+      level: "warn",
+      base: { test: "ccExternalEndpoint.integ.envelope-fail-closed-secret" },
+      out: () => {},
+    });
+    const apiKeyStrategy = makeApiKeyIdentityStrategy({
+      repo: apiKeyRepoSpy.repo,
+      pricing,
+      loadUserModelAuthz: async () => ({
+        role: "admin",
+        grantedModelIds: new Set<string>([FIXED_MODEL]),
+      }),
+    });
+    const externalApiKeyProxy = makeAnthropicProxyHandler({
+      pgPool: pool as unknown as Pool,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      scheduler: schedulerSpy.scheduler,
+      identity: apiKeyStrategy,
+      rateLimitRedis,
+      fetchImpl: async () => sseResponse(200, makeFullSseChunks()),
+      upstreamEndpoint: "https://upstream.test/v1/messages",
+      logger,
+      platformContextLoader: { load: async () => null, invalidate: () => {} },
+      // ← platformServerSecret 故意不注入
+    });
+    const deps: CommercialHttpDeps = {
+      jwtSecret: FIXED_JWT_SECRET,
+      mailer: { sendTemplate: async () => {} } as unknown as CommercialHttpDeps["mailer"],
+      redis: rateLimitRedis,
+      pricing,
+      preCheckRedis: preCheckSpy.redis,
+      externalApiKeyProxy,
+    };
+    const handler = createCommercialHandler(deps, { logger });
+    const req = new MockReq({
+      headers: { authorization: `Bearer ${FIXED_TOKEN}` },
+      body: minBody(),
+    });
+    const res = new MockRes();
+    await handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+
+    assert.equal(res.statusCode, 503, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(readErrCode(res), "PLATFORM_ENVELOPE_UNAVAILABLE");
+    // 同上 test 锁顺序不变量
+    assert.equal(preCheckSpy.reserveCalls.length, 0, "fail-closed 必须在 preCheck.reserve 之前");
+    assert.equal(schedulerSpy.pickCalls, 0, "fail-closed 必须在 scheduler.pick 之前");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // (8) last_used_at throttle
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1005,7 +1142,14 @@ function makeCapturingFetch(): {
   return { fetchImpl, getBody: () => captured };
 }
 
-describe("Phase 7 §3.5.2 出站 envelope — invariant #11 端到端", () => {
+// TODO(Step 8 cleanup):整个 describe 块在 Step 6 接入 Phase 5 envelope rewriter 后
+// 已经过时 —— 它锁的是 v1 normalizeExternalApiKeyEnvelope 的 single-block prepend 行为
+// (`system.length === 2` 等),而 Phase 5 强制 system[0]=CC prefix + system[1]=CCB
+// system instructions + system[N+1]=USER.md attribution,断言全部失效。
+// 替代用例:Phase 5 H1/H2 不变量 golden tests(Step 7)+ platformEnvelopeBuilder unit
+// test(已锁 round 1 PASS)。Step 8 一并删除本 describe + 顶部 makeCapturingFetch 仅
+// 此 describe 使用的注释。
+describe.skip("Phase 7 §3.5.2 出站 envelope — invariant #11 端到端 [Step 6 后过时,Step 8 删除]", () => {
   test("正例 1:客户端无 system / 无 metadata → outbound 含 CC prefix block + cache_control + metadata.user_id device_id", async () => {
     const cap = makeCapturingFetch();
     const h = buildHarness({ fetchImpl: cap.fetchImpl });
@@ -1243,7 +1387,11 @@ function makeCapturingFetchFull(): {
   };
 }
 
-describe("Phase 0 baseline: outbound byte-level snapshot — envv2 drift detection", () => {
+// TODO(Step 8 cleanup):本 describe 是 Phase 0 baseline lock,设计目标就是"v2/Phase 5
+// 重构若漂移则失败"。Step 6 接入 Phase 5 envelope rewriter 后所有 byte-level snapshot
+// 全部按设计失败。继任覆盖 = Step 7 H1/H2 golden tests + platformEnvelopeBuilder unit
+// test。Step 8 一并删除本 describe + makeCapturingFetchFull(仅此 describe 用)。
+describe.skip("Phase 0 baseline: outbound byte-level snapshot — envv2 drift detection [Step 6 后过时,Step 8 删除]", () => {
   // ── case 1: system 数组前置 + 客户端 block 顺序保留 ─────────────────────
   // v2 plan 会把客户端 block 改成 "as project context",顺序/字段必须先锁。
   test("case 1: 客户端 system 是 array 含 1 个 text block → outbound 长度=2,prepend 在前,客户端 block byte-equal 在后", async () => {

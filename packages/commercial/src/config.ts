@@ -405,6 +405,22 @@ export const commercialConfigSchema = z
      */
     DEEPSEEK_API_KEY: z.string().trim().min(1).max(256).optional(),
     /**
+     * Platform HMAC secret(Phase 5 envelope rewriter,2026-05-21)。
+     *
+     * 用途:HMAC-SHA256(secret, "fp3:"|userId)派生外接 ApiKey 路径 outbound envelope
+     * 的 fp3(3 hex char,attribution header)+ account_uuid(UUID v4,metadata.user_id)。
+     * 同一 secret 必须跨多个 master 节点一致 —— 否则同一 ApiKey 在不同 master 派生出
+     * 不同指纹,Anthropic anti-abuse 看到漂移会整池 429。
+     *
+     * 长度 ≥ 32 字符,≤ 256;实际使用 sha256 摘要,字符 vs 字节差异对 HMAC 强度无影响。
+     * 不入 git;systemd EnvironmentFile 注入。未配置时 external ApiKey proxy
+     * 装配失败 → 端点 503(同 hupi / deepseek 已有的"缺配置降级"语义)。
+     *
+     * 注:仅派生公开标识符,非加密 token。泄露最多让攻击者算出某 userId 的
+     * fp3 + account_uuid,不能解 v3 任何数据。
+     */
+    PLATFORM_HMAC_SECRET: z.string().trim().min(32).max(256).optional(),
+    /**
      * GitHub OAuth App 配置(GitHub OAuth 关联功能)。
      * 全部 optional — 缺失时 /api/auth/github/* 返 503,启动不阻断。
      */

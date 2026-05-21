@@ -77,7 +77,7 @@ import {
 } from "./shared.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
-import { normalizeExternalApiKeyEnvelope } from "./externalEnvelope.js";
+import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 
 // ─── 私有 helper ──────────────────────────────────────────────────────────
 
@@ -307,23 +307,58 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
-      // 5d) CC 外接出站 envelope 归一化(2026-05-20 Phase 7 §3.5.2)。
+      // 5d) Phase 5 platform envelope rewriter(2026-05-21,取代 Phase 7 v1
+      // normalizeExternalApiKeyEnvelope)。
       //
-      // 仅"外接 ApiKey 路径 + OAuth 上游"双重命中才注入。强制把 outbound `body.system`
-      // 归一化成 CC 容器形态(含官方 sysprompt prefix),让上游 Anthropic anti-abuse
-      // 把外接请求和容器内 CC CLI 请求视作同源,防"同一 OAuth account 同时出现
-      // CC-shaped 和非 CC-shaped 流量"触发整池 429。
+      // 仅"外接 ApiKey 路径(containerId===null)+ OAuth 上游(route.kind==='oauth')"
+      // 双重命中才走。容器路径(containerId !== null)/ DeepSeek 路径(route.kind ===
+      // 'deepseek')绝不触发 —— 容器内 CCB 已构造好 body,deepseek 用独立 API key 无
+      // OAuth 池无 anti-abuse 反风控,任一注入只浪费 token 或破坏既有缓存。
       //
-      // **route.kind === "oauth" 判别**:DeepSeek 上游用独立 API key,无 OAuth pool /
-      // 无 anti-abuse fingerprinting,注入 CC prefix 只浪费 13 tokens 且对 deepseek 端
-      // 是"语义无关 prompt 污染"。容器路径(`containerId !== null`)同理跳过 — 容器
-      // 内 CCB 已自带 sysprompt,多余 mutate 反而破坏既有缓存命中。
+      // **必须在 `estimateInputTokens(body)` 之前** + `selectUpstreamRoute` 之后
+      // (Phase 7 §3.5.2 行为锁):注入的 sysprompt prefix + platform context
+      // attribution + system-reminder 替换全部进 preCheck 估算 —— 任何 mutate body
+      // 的步骤都要先于 input token 估算,账务边界干净。
       //
-      // **必须在 `estimateInputTokens(body)` 之前**(Codex Phase 7 plan-review MINOR):
-      // 注入的 sysprompt prefix(~13 tokens)必须进 preCheck 估算 — 任何 mutate body 的
-      // 步骤都在 input token 估算之前,账务边界干净。详见 plan §3.5.2 / externalEnvelope.ts。
+      // 跟 Phase 5 builder 的契约对齐:
+      //   - 在 pickUpstream **之前** 调用(OAuth account 尚未选定,派生不能依赖
+      //     account.id;用 HMAC(serverSecret, userId) 跨 master 派生稳定 fp3)
+      //   - loader/secret 缺一 → fail-closed 503,避免装配 bug 让客户端 raw body
+      //     透传到 Anthropic(PII 泄露 + 形态漂移触发整池 429)
+      //   - loader.load 与 builder 内部均吞错不抛(plan §3.7/§3.1 H1 不变量),
+      //     这里不加 try/catch 显式 noise(CLAUDE.md "Don't add error handling
+      //     for scenarios that can't happen")
       if (identity.containerId === null && route.kind === "oauth") {
-        normalizeExternalApiKeyEnvelope(body, userLog);
+        if (!deps.platformContextLoader || !deps.platformServerSecret) {
+          userLog.error("phase5_envelope_misconfigured", {
+            hasLoader: Boolean(deps.platformContextLoader),
+            hasSecret: Boolean(deps.platformServerSecret),
+          });
+          incrAnthropicProxyReject("platform_envelope");
+          sendJsonError(
+            res,
+            503,
+            "PLATFORM_ENVELOPE_UNAVAILABLE",
+            "platform envelope misconfigured",
+            requestId,
+          );
+          return;
+        }
+        const platformCtx = await deps.platformContextLoader.load(uid);
+        const envelopeResult = buildPlatformEnvelope({
+          body,
+          ctx: platformCtx,
+          userId: uid,
+          serverSecret: deps.platformServerSecret,
+          log: userLog,
+        });
+        userLog.info("phase5_envelope_built", {
+          systemBlocks: envelopeResult.systemBlocks,
+          piiHits: envelopeResult.piiStrippedIndexes.length,
+          reminderReplaced: envelopeResult.systemReminderReplaced,
+          ctxAvailable: platformCtx !== null,
+          fp3: envelopeResult.fp3,
+        });
       }
 
       // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)
