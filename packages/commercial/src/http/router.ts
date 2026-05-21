@@ -173,6 +173,7 @@ import {
   handleAdminStatsAccountPool,
   handleAdminStatsHostsUtilization,
   handleAdminStatsAlertEvents7d,
+  handleAdminStatsLifetime,
   handleAdminDiagnostics,
 } from './adminStats.js'
 import {
@@ -642,6 +643,12 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/admin/stats/alert-events-7d',
       handler: handleAdminStatsAlertEvents7d,
+    },
+    // 运营至今累计指标(无窗口)。前端 dashboard 首屏 + 手动刷新触发,不进 30s 轮询。
+    {
+      method: 'GET',
+      path: '/api/admin/stats/lifetime',
+      handler: handleAdminStatsLifetime,
     },
     // V3 Phase 4H 超管运行时设置(allowlist + per-key zod)
     { method: 'GET', path: '/api/admin/settings', handler: handleAdminListSettings },

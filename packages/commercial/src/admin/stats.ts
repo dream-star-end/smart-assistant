@@ -543,3 +543,112 @@ export async function getAlertEvents7d(): Promise<AlertEvent7dRow[]> {
     count: Number(row.count),
   }));
 }
+
+// ─── 运营至今累计指标 (lifetime) ───────────────────────────────────────
+//
+// dashboard 顶部"运营至今"卡片用。语义边界:
+//   - 全部"自系统上线以来"累计,无窗口参数
+//   - paying_users / orders / revenue 三个口径**全部锚定 orders WHERE status='paid'**
+//     (Codex 评审:与既有营收口径一致,避免 credit_ledger reason='topup' 把人工补账
+//      / 后台赠送也算成"付费用户")
+//   - first_paid_at 取 MIN(paid_at) 作为"运营起点",days_in_operation 据此算
+//
+// 性能:全表 COUNT/SUM,不带 WHERE。当前规模(usage_records < 100k)可接受。
+// 不加 5min cache(boss 商业版用户量小;前端策略上首屏拉一次 + 手动刷新触发,
+// 不进 30s 自动轮询,见 admin.js loadDashboardData)。如果未来 usage_records >100k 且
+// dashboard 拉 lifetime 出现明显延迟,再考虑加 process-local TTL cache 或物化视图。
+
+export interface LifetimeStatsResult {
+  /** 累计注册用户(deleted_at IS NULL AND status != 'deleted')。 */
+  total_users: number;
+  /** 累计付费用户(DISTINCT user_id FROM orders WHERE status='paid')。 */
+  total_paying_users: number;
+  /** 累计营收(SUM amount_cents FROM orders WHERE status='paid'),bigint → string。 */
+  total_revenue_cents: string;
+  /** 累计付费订单数(COUNT FROM orders WHERE status='paid')。 */
+  total_orders_paid: number;
+  /** 累计请求数(COUNT usage_records),bigint → string。 */
+  total_requests: string;
+  /** 累计 token(input+output+cache_read+cache_write),bigint → string。 */
+  total_tokens: string;
+  /** 首单时间(运营起点),ISO 字符串;若从未有付费订单则为 null。 */
+  first_paid_at: string | null;
+  /** 运营天数:无首单 = 0;当天 = 1;之后按 PG `(now()::date - first_paid::date) + 1` 算。 */
+  days_in_operation: number;
+}
+
+/**
+ * 累计运营指标。
+ *
+ * 单 SQL,各子查询并联(PG planner 各自命中独立索引):
+ *  - users(deleted_at IS NULL)
+ *  - orders 上 idx_orders_paid_at(status='paid' 自然走 paid_at 非空过滤;
+ *    idx_orders_status 是 status='pending' 的 partial index,这里用不上)
+ *  - usage_records 全表 COUNT/SUM(idx_ur_user_time 命中无用,seq scan;
+ *    当前规模可接受)
+ *
+ * days_in_operation 用 PG 端算,且锚定 Asia/Shanghai 业务日(与既有
+ * revenue-by-day / signups-by-day 同口径,避免"运营第 X 天"在 server tz 与
+ * 中国时间间漂移)。
+ */
+export async function getLifetimeStats(): Promise<LifetimeStatsResult> {
+  const r = await query<{
+    total_users: string;
+    total_paying_users: string;
+    total_revenue_cents: string | null;
+    total_orders_paid: string;
+    total_requests: string;
+    total_tokens: string | null;
+    first_paid_at: Date | null;
+    days_in_operation: string;
+  }>(
+    `SELECT
+       (SELECT COUNT(*) FROM users
+          WHERE deleted_at IS NULL AND status != 'deleted') AS total_users,
+       (SELECT COUNT(DISTINCT user_id) FROM orders
+          WHERE status = 'paid') AS total_paying_users,
+       (SELECT COALESCE(SUM(amount_cents), 0)::text FROM orders
+          WHERE status = 'paid') AS total_revenue_cents,
+       (SELECT COUNT(*) FROM orders
+          WHERE status = 'paid') AS total_orders_paid,
+       (SELECT COUNT(*)::text FROM usage_records) AS total_requests,
+       (SELECT COALESCE(SUM(
+          COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+          + COALESCE(cache_read_tokens,0) + COALESCE(cache_write_tokens,0)
+        ), 0)::text FROM usage_records) AS total_tokens,
+       (SELECT MIN(paid_at) FROM orders WHERE status = 'paid') AS first_paid_at,
+       (SELECT
+          CASE
+            WHEN MIN(paid_at) IS NULL THEN '0'
+            ELSE (
+              (NOW() AT TIME ZONE 'Asia/Shanghai')::date
+              - (MIN(paid_at) AT TIME ZONE 'Asia/Shanghai')::date
+              + 1
+            )::text
+          END
+        FROM orders WHERE status = 'paid') AS days_in_operation`,
+  );
+  const row = r.rows[0];
+  if (!row) {
+    return {
+      total_users: 0,
+      total_paying_users: 0,
+      total_revenue_cents: "0",
+      total_orders_paid: 0,
+      total_requests: "0",
+      total_tokens: "0",
+      first_paid_at: null,
+      days_in_operation: 0,
+    };
+  }
+  return {
+    total_users: Number(row.total_users),
+    total_paying_users: Number(row.total_paying_users),
+    total_revenue_cents: row.total_revenue_cents ?? "0",
+    total_orders_paid: Number(row.total_orders_paid),
+    total_requests: row.total_requests,
+    total_tokens: row.total_tokens ?? "0",
+    first_paid_at: row.first_paid_at ? row.first_paid_at.toISOString() : null,
+    days_in_operation: Number(row.days_in_operation),
+  };
+}

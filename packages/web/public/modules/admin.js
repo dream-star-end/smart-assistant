@@ -453,6 +453,7 @@ const DASH_STATE = {
   charts: {},          // canvas 引用,供主题切换 / 销毁用
   renderSeq: 0,        // 每次 renderDashboardTab 递增,异步任务按此判断自己是否过期
   loadSeq: 0,          // 每次 loadDashboardData 递增;防止 timer + 手刷重叠时旧请求覆盖新结果
+  lifetimeLoadSeq: 0,  // 运营至今 lifetime 卡片独立 seq(只首屏 + 手刷,不进 30s 轮询)
 }
 
 // Prometheus metrics 的前端 parser 已被 /api/admin/stats/* 后端聚合替代。
@@ -488,6 +489,23 @@ async function renderDashboardTab() {
           </div>
           <button class="btn" id="dash-refresh">刷新</button>
         </div>
+      </div>
+
+      <!-- 运营至今(累计)KPI —— 不进 30s 自动轮询,只首屏 + 点击"刷新累计"按钮触发 -->
+      <div class="dash-section-head" style="display:flex;align-items:baseline;gap:var(--s-2);margin-top:var(--s-2);">
+        <h3 style="margin:0;font-size:14px;">运营至今</h3>
+        <span class="dash-sub" id="dash-lifetime-sub">加载中…</span>
+        <button class="btn btn-ghost" id="dash-lifetime-refresh" style="margin-left:auto;font-size:12px;padding:2px 8px;">刷新累计</button>
+      </div>
+      <div class="stat-grid" id="dash-lifetime-kpis">
+        ${[
+          '累计用户','累计营收','累计订单','累计请求','累计 Token','运营天数',
+        ].map((label) => `
+          <div class="stat-card">
+            <div class="stat-label">${escapeHtml(label)}</div>
+            <div class="stat-value is-loading">—</div>
+            <div class="stat-delta">—</div>
+          </div>`).join('')}
       </div>
 
       <div class="stat-grid" id="dash-kpis">
@@ -574,6 +592,9 @@ async function renderDashboardTab() {
       </div>
     </div>`
 
+  // 累计指标 fire-and-forget(独立 seq;不阻塞窗口 KPI 渲染)
+  loadLifetimeStats(mySeq).catch(() => {})
+
   await loadDashboardData(mySeq)
 
   // R2 Codex M1:await 期间可能用户已切走或又点了一次 DAU toggle 触发新 render。
@@ -585,6 +606,9 @@ async function renderDashboardTab() {
   // ─── 事件绑定 ───
   $('dash-refresh')?.addEventListener('click', async (ev) => {
     await withBtnLoading(ev.currentTarget, () => loadDashboardData(DASH_STATE.renderSeq))
+  })
+  $('dash-lifetime-refresh')?.addEventListener('click', async (ev) => {
+    await withBtnLoading(ev.currentTarget, () => loadLifetimeStats(DASH_STATE.renderSeq))
   })
   for (const b of $('dash-dau-toggle')?.querySelectorAll('button[data-w]') || []) {
     b.addEventListener('click', () => {
@@ -678,6 +702,74 @@ function _ensureAlerts7dCanvas(bodyEl) {
     bodyEl.appendChild(canvas)
   }
   return canvas
+}
+
+/**
+ * 拉运营至今累计指标。独立于 30s 轮询(避免反复在 usage_records 上跑全表 COUNT/SUM)。
+ *
+ * 触发场景:
+ *  - renderDashboardTab 首屏 fire-and-forget
+ *  - 用户点 "刷新累计" 按钮
+ *  - 用户点全局 "刷新" 不顺带刷 lifetime(单卡数据变化频率低,30s 轮询不需要)
+ *
+ * 失败:6 张卡同步降级为 "—" + "加载失败" warning,不影响其它部分。
+ */
+async function loadLifetimeStats(renderSeq) {
+  const mySeq = ++DASH_STATE.lifetimeLoadSeq
+  const sub = $('dash-lifetime-sub')
+  if (sub) sub.textContent = '加载中…'
+
+  let r = null
+  let err = null
+  try {
+    r = await apiGet('/api/admin/stats/lifetime')
+  } catch (e) {
+    err = e
+  }
+
+  // 异步竞争防护:render 切换或 tab 切走则放弃
+  if (renderSeq != null && renderSeq !== DASH_STATE.renderSeq) return
+  if (_currentTab !== 'dashboard') return
+  if (mySeq !== DASH_STATE.lifetimeLoadSeq) return
+
+  const cards = view().querySelectorAll('#dash-lifetime-kpis .stat-card')
+  if (!cards || cards.length < 6) return
+
+  if (err || !r) {
+    for (let i = 0; i < 6; i++) updateStat(cards[i], '—', '加载失败', 'danger')
+    if (sub) sub.textContent = '加载失败'
+    return
+  }
+
+  // 0. 累计用户(其中付费 N)
+  updateStat(cards[0], Number(r.total_users || 0).toLocaleString(),
+    `付费 ${Number(r.total_paying_users || 0).toLocaleString()}`,
+    r.total_paying_users > 0 ? 'success' : null)
+
+  // 1. 累计营收 ¥X
+  const revYuan = Number(r.total_revenue_cents || '0') / 100
+  updateStat(cards[1], `¥${revYuan.toFixed(2)}`,
+    `自首单累计`, revYuan > 0 ? 'success' : null)
+
+  // 2. 累计订单
+  updateStat(cards[2], Number(r.total_orders_paid || 0).toLocaleString(),
+    '已付清',
+    r.total_orders_paid > 0 ? 'success' : null)
+
+  // 3. 累计请求(大数走 compact,精度可接受)
+  const reqNum = Number(r.total_requests || '0')
+  updateStat(cards[3], cfmt.compact(reqNum), 'usage_records', null)
+
+  // 4. 累计 Token(同上)
+  const tokNum = Number(r.total_tokens || '0')
+  updateStat(cards[4], cfmt.compact(tokNum), 'in+out+cache', null)
+
+  // 5. 运营天数
+  const days = Number(r.days_in_operation || 0)
+  updateStat(cards[5], days > 0 ? days.toLocaleString() : '—',
+    r.first_paid_at ? `自 ${String(r.first_paid_at).slice(0, 10)}` : '未开单', null)
+
+  if (sub) sub.textContent = `更新于 ${new Date().toLocaleTimeString()}`
 }
 
 async function loadDashboardData(seq) {
@@ -1688,15 +1780,29 @@ async function openUserDetailModal(userId) {
 }
 
 /**
+ * 单 session 详情懒加载状态:首屏 50 条 + "加载更多"分页。
+ *
+ * 状态(modal lifetime cache 内的 value):
+ *   { messages: [], nextOffset, totalMessages, hasMore, meta, loading } | { __error: msg }
+ *
+ *   - nextOffset = 已加载消息数(下一页 fetch 的 offset);**用实际 messages.length 推**,
+ *     不信赖 server 端 offset+limit —— server 可能 clamp limit,最后一页也未必满。
+ *   - meta 缓存第一页的 session metadata(title / agent / total)避免重复 render
+ *   - loading 标志 "加载更多" 防重入
+ */
+const SESSION_PAGE_SIZE = 50
+
+/**
  * Bind row-click toggles for the session detail table in user-detail modal.
  *
  * - 每个 session row 可点击展开/折叠下方 detail row
- * - 第一次展开时懒加载 /api/admin/sessions/:id?user_id=:userId
+ * - 第一次展开时懒加载 /api/admin/sessions/:id?user_id=:userId&offset=0&limit=50
+ * - 后续 "加载更多" 触发分页 fetch 并追加到 .ud-sess-msglist
  * - 结果缓存到 modal lifetime 的 Map(modal 关闭后丢弃 → 重开走新 fetch)
  * - 404 显示"会话不可用或已删除",其它错误显示错误信息
  */
 function _bindSessionRowToggles(scope, userId) {
-  // modal lifetime cache: key = session_id, value = ClientSession payload or { __error: msg }
+  // modal lifetime cache: key = session_id, value = SessionPagedState | { __error: msg }
   const cache = new Map()
   const rows = scope.querySelectorAll('tr.ud-sess-row')
   rows.forEach((row) => {
@@ -1720,19 +1826,39 @@ function _bindSessionRowToggles(scope, userId) {
       if (toggle) toggle.textContent = '▾'
       const bodyCell = detail.querySelector('.ud-sess-detail-body')
       if (!bodyCell) return
-      if (cache.has(sid)) {
-        bodyCell.innerHTML = _renderSessionDetail(cache.get(sid))
+      const existing = cache.get(sid)
+      if (existing) {
+        bodyCell.innerHTML = _renderSessionDetail(existing)
         _bindSessionMessageMoreButtons(bodyCell)
+        _bindSessionLoadMore(bodyCell, sid, userId, cache)
         return
       }
       bodyCell.innerHTML = '<div class="empty">加载中…</div>'
       try {
         const r = await apiGet(
-          `/api/admin/sessions/${encodeURIComponent(sid)}?user_id=${encodeURIComponent(userId)}`
+          `/api/admin/sessions/${encodeURIComponent(sid)}?user_id=${encodeURIComponent(userId)}&offset=0&limit=${SESSION_PAGE_SIZE}`
         )
-        cache.set(sid, r.session)
-        bodyCell.innerHTML = _renderSessionDetail(r.session)
+        const sess = r.session || {}
+        const firstPage = Array.isArray(sess.messages) ? sess.messages : []
+        const total = Number(sess.total_messages || 0)
+        // nextOffset 用实际 page.length 推 —— server 可能 clamp limit 或最后一页 < 50
+        const nextOffset = firstPage.length
+        const hasMore = total > nextOffset
+        cache.set(sid, {
+          messages: firstPage,
+          nextOffset,
+          totalMessages: total,
+          hasMore,
+          meta: {
+            title: sess.title || '',
+            agent_id: sess.agent_id || '',
+            updated_at: sess.updated_at,
+          },
+          loading: false,
+        })
+        bodyCell.innerHTML = _renderSessionDetail(cache.get(sid))
         _bindSessionMessageMoreButtons(bodyCell)
+        _bindSessionLoadMore(bodyCell, sid, userId, cache)
       } catch (e) {
         const msg = (e && e.status === 404)
           ? '会话不可用或已删除'
@@ -1743,6 +1869,52 @@ function _bindSessionRowToggles(scope, userId) {
       }
       ev.stopPropagation()
     })
+  })
+}
+
+/**
+ * 绑定 "加载更多" 按钮 —— 拉下一页 messages 并 append。
+ * 防重入:state.loading + 按钮 disabled 双重门控。
+ */
+function _bindSessionLoadMore(bodyCell, sid, userId, cache) {
+  const btn = bodyCell.querySelector('button.ud-sess-load-more')
+  if (!btn) return
+  btn.addEventListener('click', async (ev) => {
+    ev.stopPropagation()
+    const state = cache.get(sid)
+    if (!state || state.__error || state.loading || !state.hasMore) return
+    state.loading = true
+    btn.disabled = true
+    const origText = btn.textContent
+    btn.textContent = '加载中…'
+    try {
+      const r = await apiGet(
+        `/api/admin/sessions/${encodeURIComponent(sid)}?user_id=${encodeURIComponent(userId)}&offset=${state.nextOffset}&limit=${SESSION_PAGE_SIZE}`
+      )
+      const sess = r.session || {}
+      const page = Array.isArray(sess.messages) ? sess.messages : []
+      // 边界:server 已无更多 / 同时被 client 端 truncate / cross-fetch 改变了 total
+      if (page.length === 0) {
+        state.hasMore = false
+      } else {
+        state.messages.push(...page)
+        state.nextOffset += page.length
+        state.totalMessages = Number(sess.total_messages || state.totalMessages)
+        state.hasMore = state.nextOffset < state.totalMessages
+      }
+      // 重新渲染整块 detail(保持简洁,无需 diff 增量)
+      bodyCell.innerHTML = _renderSessionDetail(state)
+      _bindSessionMessageMoreButtons(bodyCell)
+      _bindSessionLoadMore(bodyCell, sid, userId, cache)
+    } catch (e) {
+      btn.disabled = false
+      btn.textContent = origText
+      const errLine = bodyCell.querySelector('.ud-sess-load-err')
+      const msg = e && e.message ? e.message : String(e)
+      if (errLine) errLine.textContent = `加载失败:${msg}`
+    } finally {
+      state.loading = false
+    }
   })
 }
 
@@ -1761,23 +1933,45 @@ function _bindSessionMessageMoreButtons(scope) {
   })
 }
 
-/** 渲染单个 session 的展开详情。messages 可能含 tool_use / tool_result blocks。 */
+/**
+ * 渲染单个 session 的展开详情。
+ *
+ * 接受两种 shape:
+ *   - 新分页 state:{ messages, totalMessages, nextOffset, hasMore, meta }
+ *   - 错误:{ __error }
+ *
+ * 末尾按 hasMore 决定是否渲染 "加载更多" 按钮(占位符;事件绑定在 _bindSessionLoadMore)。
+ */
 function _renderSessionDetail(s) {
   if (!s) return '<div class="empty">无数据</div>'
   if (s.__error) return `<div class="empty" style="color:var(--danger)">${escapeHtml(s.__error)}</div>`
   const msgs = Array.isArray(s.messages) ? s.messages : []
-  if (msgs.length === 0) return '<div class="empty">该会话暂无消息</div>'
-  const meta = `<div class="muted" style="font-size:12px;margin-bottom:var(--s-2);">
-    <strong>${escapeHtml(s.title || '(无标题)')}</strong>
-    · agent=${escapeHtml(s.agent_id || '')}
-    · ${msgs.length} 条消息
-    · 更新 ${escapeHtml(fmtDate(s.updated_at))}
+  const meta = s.meta || {}
+  const total = Number(s.totalMessages != null ? s.totalMessages : msgs.length)
+  const loaded = msgs.length
+  const hasMore = !!s.hasMore
+  if (total === 0) return '<div class="empty">该会话暂无消息</div>'
+  const headLine = `<div class="muted" style="font-size:12px;margin-bottom:var(--s-2);">
+    <strong>${escapeHtml(meta.title || '(无标题)')}</strong>
+    · agent=${escapeHtml(meta.agent_id || '')}
+    · ${loaded} / ${total} 条消息
+    · 更新 ${escapeHtml(fmtDate(meta.updated_at))}
   </div>`
   const items = msgs.map((m, i) => _renderSessionMessage(m, i)).join('')
-  return `${meta}<div class="ud-sess-msglist" style="display:flex;flex-direction:column;gap:var(--s-2);">${items}</div>`
+  const moreFooter = hasMore
+    ? `<div style="margin-top:var(--s-2);text-align:center;">
+         <button type="button" class="btn btn-ghost ud-sess-load-more" style="font-size:12px;">加载更多(剩 ${total - loaded} 条)</button>
+         <div class="ud-sess-load-err muted" style="font-size:11px;color:var(--danger);margin-top:4px;"></div>
+       </div>`
+    : ''
+  return `${headLine}<div class="ud-sess-msglist" style="display:flex;flex-direction:column;gap:var(--s-2);">${items}</div>${moreFooter}`
 }
 
-/** 渲染单条 message。容忍 wire-format 多变:string / array content / 缺字段。 */
+/** 渲染单条 message。容忍 wire-format 多变:string / array content / 缺字段。
+ *
+ *  渲染兜底(B3):若 _extractMessageText 返回空字符串(例如 content 是空数组,
+ *  或全是无 text/name 的 block 等异常 shape),退化成 content blocks 的 type 摘要,
+ *  避免出现"只有 chip + #N 没有任何 body"的诊断盲区。 */
 function _renderSessionMessage(m, idx) {
   const role = String((m && m.role) || 'unknown')
   const roleCls = role === 'user' ? 'ok' : role === 'assistant' ? 'warn' : 'muted'
@@ -1793,14 +1987,58 @@ function _renderSessionMessage(m, idx) {
   const moreBlock = folded
     ? `<span class="ud-sess-msg-rest" style="display:none;">${escapeHtml(text.slice(FOLD))}</span> <button type="button" class="link ud-sess-msg-more" style="font-size:12px;">展开全部(剩 ${text.length - FOLD} 字)</button>`
     : ''
+  // B3: text 空且无 tool_use 名字时,渲染 content blocks 的 type 摘要兜底
+  const fallbackBody = (!text && !tools.length)
+    ? _renderEmptyMessageFallback(m)
+    : ''
   return `<div class="ud-sess-msg" style="border-left:3px solid var(--border);padding-left:var(--s-2);">
     <div style="display:flex;align-items:center;gap:var(--s-1);margin-bottom:4px;">
       <span class="badge ${roleCls}">${escapeHtml(role)}</span>
       <span class="muted" style="font-size:12px;">#${idx + 1}</span>
     </div>
     <div class="mono" style="white-space:pre-wrap;word-break:break-word;font-size:12px;">${escapeHtml(visible)}${moreBlock}</div>
+    ${fallbackBody}
     ${toolsLine}
   </div>`.replace(/^[ \t]+/gm, '') // strip leading whitespace to keep DOM compact
+}
+
+/**
+ * 空内容兜底渲染:列 content blocks 的 type + 关键摘要。
+ *
+ * 触发场景:
+ *  - content 是空 array
+ *  - content 全是奇异 block(type 是 image / unknown / 缺 text 字段)
+ *  - storage 层 sanitize 把 text 字段抽掉只留 type 框架
+ *
+ * 不替代 _extractMessageText —— 那条路径仍负责正常 text/tool_use/tool_result 抽取;
+ * 这里只是"什么都拿不到"时的最后一道诊断光照。
+ */
+function _renderEmptyMessageFallback(m) {
+  if (!m) return '<div class="muted" style="font-size:11px;">(空消息)</div>'
+  const c = m.content
+  if (typeof c === 'string') {
+    // 字符串 content 但为空白
+    return '<div class="muted" style="font-size:11px;">(空字符串 content)</div>'
+  }
+  if (!Array.isArray(c)) {
+    return `<div class="muted" style="font-size:11px;">(无可识别 content;keys=${escapeHtml(Object.keys(m).join(','))})</div>`
+  }
+  if (c.length === 0) {
+    return '<div class="muted" style="font-size:11px;">(content blocks 为空)</div>'
+  }
+  // 列出每个 block 的 type;tool_use 带 name,tool_result 带 is_error 标记
+  const tags = c.map((b) => {
+    if (!b || typeof b !== 'object') return '<span class="badge muted">?</span>'
+    const t = String(b.type || '?')
+    let extra = ''
+    if (t === 'tool_use' && b.name) extra = `:${b.name}`
+    else if (t === 'tool_result' && b.is_error) extra = '!err'
+    else if (t === 'image' && b.source?.media_type) extra = `:${b.source.media_type}`
+    return `<span class="badge muted" style="font-size:10px;">${escapeHtml(t + extra)}</span>`
+  }).join(' ')
+  return `<div class="muted" style="font-size:11px;display:flex;flex-wrap:wrap;gap:4px;align-items:center;">
+    <span>${c.length} blocks:</span>${tags}
+  </div>`
 }
 
 /** 从一条 wire-format message 提取文本(剥离 tool_use args / tool_result blob)。 */

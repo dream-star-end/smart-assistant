@@ -296,6 +296,12 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/stats/lifetime",
+    "handler": "handleAdminStatsLifetime"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/settings",
     "handler": "handleAdminListSettings"
   },
