@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenClaude v3 — full push to 218 standby (sessions + volumes + uploads)
+After=network-online.target docker.service postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=SYNC_MODE=full
+ExecStart=/opt/openclaude/openclaude/scripts/sync-218-standby.sh
+# Allow up to 25 min for a worst-case 100GB delta — internal /24 should
+# finish in 1-2 min typically.
+TimeoutStartSec=1500
+Nice=15
+IOSchedulingClass=idle

@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenClaude v3 — every 1 min fast sync to 218 (sessions + small config)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+RandomizedDelaySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

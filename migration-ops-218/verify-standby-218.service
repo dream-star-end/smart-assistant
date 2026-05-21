@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenClaude v3 — 218 standby health probe
+After=network-online.target postgresql.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/openclaude/migration-ops/verify-standby-218.sh
+StandardOutput=append:/var/log/standby-health.log
+StandardError=append:/var/log/standby-health.log
+# Don't fail loudly; exit 1 from the probe means "unhealthy" and gets logged.
+SuccessExitStatus=0 1
+TimeoutStartSec=60

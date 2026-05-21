@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenClaude v3 — fast push to 218 standby (sessions + small config)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=SYNC_MODE=fast
+ExecStart=/opt/openclaude/openclaude/scripts/sync-218-standby.sh
+# Do not let a long sync overlap; flock in the script handles it but cap here too.
+TimeoutStartSec=120
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5

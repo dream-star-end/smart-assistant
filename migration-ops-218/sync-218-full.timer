@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenClaude v3 — every 5 min full sync to 218 (volumes + uploads)
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenClaude v3 — every 5 min standby health probe
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
