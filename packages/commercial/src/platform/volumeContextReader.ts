@@ -61,13 +61,15 @@ const SKILL_HEAD_BYTES = 4 * 1024;
 const FILE_CAP_BYTES = 256 * 1024;
 const MAX_SKILL_COUNT = 200;
 
-function volumeRoot(userId: bigint): string {
+const DEFAULT_VOLUME_BASE_DIR = "/var/lib/docker/volumes";
+
+function volumeRoot(userId: bigint, baseDir: string): string {
   // 与 packages/commercial/node-agent/internal/containers/volumes.go reVolumeName 对齐
-  return `/var/lib/docker/volumes/oc-v3-data-u${userId.toString()}/_data`;
+  return join(baseDir, `oc-v3-data-u${userId.toString()}`, "_data");
 }
 
-function agentMainRoot(userId: bigint): string {
-  return join(volumeRoot(userId), "agents", "main");
+function agentMainRoot(userId: bigint, baseDir: string): string {
+  return join(volumeRoot(userId, baseDir), "agents", "main");
 }
 
 /**
@@ -181,18 +183,24 @@ async function readLocalSkills(
  *
  * 必须以能访问 docker volume mountpoint 的权限运行(master 进程 root 实测可读)。
  * volume 整个不存在 → 返 null;局部文件缺失 → 该字段空串。
+ *
+ * `opts.volumeBaseDir` 是测试 hook:生产路径不传,默认 `/var/lib/docker/volumes`;
+ * 单测里通过 tmpdir 注入,跑真 fs 不动产线行为。
  */
-export function makeLocalVolumeReader(): VolumeContextReader {
+export function makeLocalVolumeReader(
+  opts: { volumeBaseDir?: string } = {},
+): VolumeContextReader {
+  const baseDir = opts.volumeBaseDir ?? DEFAULT_VOLUME_BASE_DIR;
   return {
     async read(userId) {
       // volume 不存在 → 用户从未启过容器,返 null
       try {
-        await fsp.access(volumeRoot(userId));
+        await fsp.access(volumeRoot(userId, baseDir));
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw e;
       }
-      const root = agentMainRoot(userId);
+      const root = agentMainRoot(userId, baseDir);
       const userFile = await readCappedFile(join(root, "USER.md"));
       const memoryFile = await readCappedFile(join(root, "MEMORY.md"));
       const { skills, maxMtime: skillMtime } = await readLocalSkills(join(root, "skills"));
@@ -223,10 +231,13 @@ export function makeLocalVolumeReader(): VolumeContextReader {
 export function makeRemoteVolumeReader(deps: {
   loadHostRow: (hostUuid: string) => Promise<import("../compute-pool/types.js").ComputeHostRow | null>;
   rpc?: typeof getUserOpenClaudeContext;
-  /** 测试 hook;生产路径必传 hostUuid(由 routing reader 注入)。 */
+  /** 生产路径必传 hostUuid(由 routing reader 注入)。 */
   hostUuid: string;
+  /** 测试 hook;默认 hostRowToTarget。 */
+  toTarget?: typeof hostRowToTarget;
 }): VolumeContextReader {
   const rpc = deps.rpc ?? getUserOpenClaudeContext;
+  const toTarget = deps.toTarget ?? hostRowToTarget;
   return {
     async read(userId) {
       const row = await deps.loadHostRow(deps.hostUuid);
@@ -234,7 +245,7 @@ export function makeRemoteVolumeReader(deps: {
         // host 行不存在 — 数据库层异常状态,抛错而非 silent null
         throw new Error(`makeRemoteVolumeReader: hostUuid ${deps.hostUuid} not found in compute_hosts`);
       }
-      const target = hostRowToTarget(row);
+      const target = toTarget(row);
       try {
         const resp = await rpc(target, userId);
         return mapResponseToContext(resp);

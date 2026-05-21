@@ -474,6 +474,12 @@ interface HarnessOpts {
   now?: () => number;
   /** 注入 fetch (默认:happy SSE)。 */
   fetchImpl?: typeof fetch;
+  /**
+   * Step 7 golden tests:让 loader 返指定 ctx(默认 null,表示空 attribution placeholder)。
+   * 注意:此处只覆盖 *loader 返回值*,handler 装配本身仍走齐(loader+secret 都注入),
+   * 区别于 (7.5) fail-closed 用例的"漏注 deps"路径。
+   */
+  platformCtx?: import("../platform/volumeContextReader.js").PlatformContext | null;
 }
 
 function buildHarness(opts: HarnessOpts = {}) {
@@ -534,7 +540,12 @@ function buildHarness(opts: HarnessOpts = {}) {
         // 分支,避免 503 PLATFORM_ENVELOPE_UNAVAILABLE。专门验 envelope 内容
         // 的用例覆盖在 Step 7 platformEnvelopeBuilder golden test;专门验 503
         // fail-closed 的用例显式手搓 handler(不走 buildHarness)。
-        platformContextLoader: { load: async () => null, invalidate: () => {} },
+        // Step 7 golden tests 通过 opts.platformCtx 让 loader 返指定 ctx 验证
+        // ctx → outbound system[N+1] 端到端贯通(非 null placeholder 路径)。
+        platformContextLoader: {
+          load: async () => opts.platformCtx ?? null,
+          invalidate: () => {},
+        },
         platformServerSecret: "test-platform-hmac-secret-32char",
       });
 
@@ -1092,6 +1103,255 @@ describe("last_used_at throttle — 5min in-process LRU 端到端 wired", () => 
     assert.equal(res.statusCode, 200);
     await new Promise((r) => setImmediate(r));
     assert.equal(h.apiKeyRepoSpy.touchLastUsedCalls.length, 2, "5min 后 → 再 bump");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// (8.5) Phase 5 Step 7 — H1 / H2 / PII strip / RPC fallback golden tests
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 端到端锁的 Phase 5 不变量(plan §5.2 / §8):
+//   - H1 多机一致:同 ApiKey + 同 userId,不同 client 客户端 → 上游 fetch 到的
+//     `system[0]`/`system[1]`/`system[N+1]` byte-level 完全相同;`metadata.user_id`
+//     keyset 同形态;`account_uuid` byte-level 稳定;`session_id` server-generated
+//     且不携带客户端透传值
+//   - H2 外接 / 容器 metadata 同形态:外接 outbound `metadata.user_id` keyset =
+//     {device_id, account_uuid, session_id} 三必有键,无 extra
+//   - PII strip 端到端:客户端 system block 含 hostname / 用户名路径 / device-id
+//     等 PII → 上游 fetch 看到的 outbound 对应 block = `[redacted-by-platform]`
+//   - RPC fallback:loader.load() 返 null(reader 故障 / volume 不存在)→ handler
+//     不抛 503,builder 走 ctx=null 路径(占位 attribution),outbound 200
+//
+// Unit 测试已覆盖 builder 内部逻辑;此处端到端验证 handler 装配链(loader → builder →
+// applyUpstreamAuth → fetch)流向上游 body 的最终形态,锁 Step 6 接入点不退化。
+
+describe("Phase 5 Step 7 — H1 / H2 / PII strip / fallback golden tests", () => {
+  // FIXED_PINNED_USER_ID 来自 fake account-pool;applyUpstreamAuth 会用它覆盖
+  // envelope builder 占位的 device_id。Step 7 unit 测试已验 device_id 占位写"";
+  // integ 这里关心的是"最终上游看到的"形态,所以期望 device_id = pinned。
+
+  test("H1.1 同 userId 不同 client body → outbound system[0]/[1]/[N+1] byte-level 一致", async () => {
+    // 3 个完全不同的 client body — 模拟 3 台机器分别发请求
+    const clientBodies = [
+      {
+        ...minBody(),
+        system: "client A: Mac with hostname: alice-mac.local",
+        metadata: { user_id: JSON.stringify({ device_id: "client-A-deviceid" }) },
+      },
+      {
+        ...minBody(),
+        system: [{ type: "text", text: "client B array-form system" }],
+        metadata: { user_id: JSON.stringify({ device_id: "client-B-deviceid" }) },
+      },
+      {
+        ...minBody(),
+        // 客户端 C 不传 system / metadata
+      },
+    ];
+    const outbounds: Array<Record<string, unknown>> = [];
+    for (const body of clientBodies) {
+      const cap = makeCapturingFetch();
+      const h = buildHarness({ fetchImpl: cap.fetchImpl });
+      const res = await h.run({ body });
+      assert.equal(res.statusCode, 200, `status=${res.statusCode}: ${res.bodyText()}`);
+      const raw = cap.getBody();
+      assert.ok(raw);
+      outbounds.push(JSON.parse(raw!) as Record<string, unknown>);
+      await resetPool();
+      _clearMaintenanceCache();
+    }
+
+    // 抽 3 个 outbound 的 system 数组
+    const systems = outbounds.map((b) => b.system as Array<{ text: string }>);
+
+    // system[0] attribution forge — 3 client byte-level 完全相同
+    assert.equal(systems[0]![0]!.text, systems[1]![0]!.text);
+    assert.equal(systems[1]![0]!.text, systems[2]![0]!.text);
+    assert.ok(systems[0]![0]!.text.startsWith("x-anthropic-billing-header: cc_version="));
+
+    // system[1] CC prefix — byte-level 完全相同
+    assert.equal(systems[0]![1]!.text, systems[1]![1]!.text);
+    assert.equal(systems[1]![1]!.text, systems[2]![1]!.text);
+    assert.equal(
+      systems[0]![1]!.text,
+      "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+
+    // system[N+1] 平台 context 块(尾)— byte-level 完全相同(占位形态)
+    const last0 = systems[0]![systems[0]!.length - 1]!.text;
+    const last1 = systems[1]![systems[1]!.length - 1]!.text;
+    const last2 = systems[2]![systems[2]!.length - 1]!.text;
+    assert.equal(last0, last1);
+    assert.equal(last1, last2);
+    assert.ok(last0.startsWith("# OpenClaude Platform Context"));
+  });
+
+  test("H1.2 同 userId 不同 client body → metadata.user_id keyset 同形态 + account_uuid 字节级稳定 + session_id 各异", async () => {
+    const accountUuids: string[] = [];
+    const sessionIds: string[] = [];
+    const keysets: string[][] = [];
+    for (let i = 0; i < 3; i++) {
+      const cap = makeCapturingFetch();
+      const h = buildHarness({ fetchImpl: cap.fetchImpl });
+      // 客户端透传一个 session_id 占位值,验它必被覆盖
+      const res = await h.run({
+        body: {
+          ...minBody(),
+          metadata: {
+            user_id: JSON.stringify({
+              device_id: `client-${i}-deviceid`,
+              session_id: "CLIENT_INJECTED_SESSION_DO_NOT_LEAK",
+            }),
+          },
+        },
+      });
+      assert.equal(res.statusCode, 200);
+      const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+      const userIdObj = JSON.parse(
+        (sent.metadata as Record<string, unknown>).user_id as string,
+      ) as Record<string, string>;
+      keysets.push(Object.keys(userIdObj).sort());
+      accountUuids.push(userIdObj.account_uuid!);
+      sessionIds.push(userIdObj.session_id!);
+      await resetPool();
+      _clearMaintenanceCache();
+    }
+    // keyset 必恒为 [account_uuid, device_id, session_id]
+    assert.deepEqual(keysets[0], ["account_uuid", "device_id", "session_id"]);
+    assert.deepEqual(keysets[0], keysets[1]);
+    assert.deepEqual(keysets[1], keysets[2]);
+    // account_uuid 同 userId 跨多次稳定
+    assert.equal(accountUuids[0], accountUuids[1]);
+    assert.equal(accountUuids[1], accountUuids[2]);
+    // session_id 各不相同 + 都不等于 client 透传值
+    assert.notEqual(sessionIds[0], sessionIds[1]);
+    assert.notEqual(sessionIds[1], sessionIds[2]);
+    for (const sid of sessionIds) {
+      assert.notEqual(sid, "CLIENT_INJECTED_SESSION_DO_NOT_LEAK");
+      assert.match(
+        sid,
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+    }
+  });
+
+  test("H2.1 outbound metadata.user_id 仅含 3 必有 key(device_id/account_uuid/session_id),无 extra", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const res = await h.run({
+      body: {
+        ...minBody(),
+        metadata: {
+          user_id: JSON.stringify({
+            device_id: "x",
+            custom_inner_extra: "leak1",
+            another_field: 42,
+          }),
+          // session_id 是 schema-allowed 的顶层 key,但 builder 必须 strip
+          // (schema metadata 是 .strict(),custom_top_extra 这类未声明 key 会被 zod 直接 400,无法走到 builder)
+          session_id: "top-level-session-should-die",
+        } as Record<string, unknown>,
+      },
+    });
+    assert.equal(res.statusCode, 200);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const meta = sent.metadata as Record<string, unknown>;
+    // 顶层只剩 user_id
+    assert.deepEqual(Object.keys(meta), ["user_id"]);
+    const userIdObj = JSON.parse(meta.user_id as string) as Record<string, unknown>;
+    // 内层只 3 必有 key
+    assert.deepEqual(Object.keys(userIdObj).sort(), [
+      "account_uuid",
+      "device_id",
+      "session_id",
+    ]);
+  });
+
+  test("PII.E2E.1 outbound system 块含 hostname/UNIX 路径/device-id 都被 [redacted-by-platform]", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const piiBlock1 = "Hostname: leak-host.example.com";
+    const piiBlock2 = "User dir at /Users/alice-the-engineer/projects";
+    const piiBlock3 = `Device id hash: ${"deadbeef".repeat(4)}`; // hex32
+    const res = await h.run({
+      body: {
+        ...minBody(),
+        system: [
+          { type: "text", text: piiBlock1 },
+          { type: "text", text: piiBlock2 },
+          { type: "text", text: piiBlock3 },
+        ],
+      },
+    });
+    assert.equal(res.statusCode, 200);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<{ text: string }>;
+    // system[0] / [1] 是 server forge,attribution + CC prefix
+    // system[2..N] 是 PII 后的 tail;system[N+1] 是平台 context 块
+    // 我们的 3 个 PII block 应在 system[2..4],全部 redacted
+    const tailBlocks = systemArr.slice(2, 5);
+    for (const b of tailBlocks) {
+      assert.equal(b.text, "[redacted-by-platform]", `应整 block redact;got=${b.text}`);
+    }
+    // outbound raw 字面也不应残留任何 PII 子串(双重保险)
+    const raw = cap.getBody()!;
+    assert.ok(!raw.includes("alice-the-engineer"), "用户名路径不应出现在 outbound raw");
+    assert.ok(!raw.includes("leak-host.example.com"), "hostname 不应出现在 outbound raw");
+    assert.ok(!raw.includes("deadbeefdeadbeefdeadbeefdeadbeef"), "device-id 不应出现");
+  });
+
+  test("PII.E2E.2 PII negative anchor — `localhost` 单词不命中(非 field-style)", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl });
+    const benign = "Please connect to localhost on port 3000";
+    const res = await h.run({
+      body: { ...minBody(), system: [{ type: "text", text: benign }] },
+    });
+    assert.equal(res.statusCode, 200);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<{ text: string }>;
+    // tail block 应原样保留(不被 PII 误伤)
+    const tail = systemArr[2]!.text;
+    assert.equal(tail, benign);
+  });
+
+  test("FALLBACK.1 platformContextLoader 返 null(reader 故障/volume 不存在)→ 不抛 503,outbound 200 + platform 块用占位", async () => {
+    const cap = makeCapturingFetch();
+    // buildHarness 默认 loader 就是 `async () => null`,等价 RPC fallback;
+    // 显式 platformCtx: null 写出来加强用例语义
+    const h = buildHarness({ fetchImpl: cap.fetchImpl, platformCtx: null });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200, `应 200;status=${res.statusCode}: ${res.bodyText()}`);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<{ text: string }>;
+    const last = systemArr[systemArr.length - 1]!.text;
+    assert.equal(
+      last,
+      "# OpenClaude Platform Context\n[platform-context-unavailable]",
+      "ctx=null → 占位文本(server-canonical default,保 H1 多机一致)",
+    );
+  });
+
+  test("FALLBACK.2 platformContextLoader 返实际 ctx → outbound platform 块含 USER.md / MEMORY / skills", async () => {
+    const ctx = {
+      userMd: "# boss\nthe user is boss",
+      memoryMd: "- [Memo](file.md) — info hook",
+      skills: [{ name: "search-skill", description: "web search" }],
+      volumeMtime: new Date("2026-05-21T00:00:00.000Z"),
+    };
+    const cap = makeCapturingFetch();
+    const h = buildHarness({ fetchImpl: cap.fetchImpl, platformCtx: ctx });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const systemArr = sent.system as Array<{ text: string }>;
+    const last = systemArr[systemArr.length - 1]!.text;
+    assert.ok(last.startsWith("# OpenClaude Platform Context"));
+    assert.ok(last.includes("## User"));
+    assert.ok(last.includes("the user is boss"));
+    assert.ok(last.includes("## Memory Index"));
+    assert.ok(last.includes("## Skills"));
+    assert.ok(last.includes("- **search-skill** — web search"));
   });
 });
 
