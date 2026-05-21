@@ -307,8 +307,9 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
-      // 5d) Phase 5 platform envelope rewriter(2026-05-21,取代 Phase 7 v1
-      // normalizeExternalApiKeyEnvelope)。
+      // 5d) Phase 5 platform envelope rewriter(2026-05-21,外接 ApiKey 路径
+      // envelope rewrite 唯一入口;早期 Phase 4/7 同位置曾有 v1 helper,Step 8
+      // 已整合删除)。
       //
       // 仅"外接 ApiKey 路径(containerId===null)+ OAuth 上游(route.kind==='oauth')"
       // 双重命中才走。容器路径(containerId !== null)/ DeepSeek 路径(route.kind ===

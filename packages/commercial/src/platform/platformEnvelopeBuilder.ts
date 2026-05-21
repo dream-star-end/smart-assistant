@@ -3,8 +3,9 @@
  *
  * 见 docs/V3_CC_EXTERNAL_ENDPOINT_PHASE5_PLAN_2026-05-21.md §3.1 / §3.2 / §3.3。
  *
- * 取代 Phase 4 的 `http/proxy/externalEnvelope.ts` 的五步处理(后者只做 CC prefix 注入,
- * 不做 attribution / PII strip / 平台 context 注入)。
+ * 历史:Phase 4 同位置曾有简化 helper(仅做 CC prefix 注入,无 attribution / PII strip /
+ * 平台 context 注入)。Phase 5(2026-05-21)整合后此处是外接 ApiKey 路径 envelope rewrite
+ * 的唯一 source-of-truth。
  *
  * # 处理顺序
  *
@@ -57,8 +58,7 @@ const CC_DEFAULT_PREFIX =
 /**
  * 兼容 CCB 已有的三种 prefix 变体,client 已经写对了就不强行覆盖。
  *
- * 与 `http/proxy/externalEnvelope.ts` 的 `CC_SYSPROMPT_PREFIXES` 同源 —— 后者将在
- * Step 8 删除,届时这里成为唯一权威 list。
+ * Phase 5 整合后此 list 是 commercial 包内唯一权威 list;CCB 升级三 prefix 字面时同步更新。
  */
 const CC_SYSPROMPT_PREFIXES: readonly string[] = [
   CC_DEFAULT_PREFIX,
@@ -420,7 +420,7 @@ export function buildPlatformEnvelope(
 
   // ── 2. 剥掉已有的 CC attribution header / CC prefix(避免双重注入)──
   // CCB 客户端发的 system[0]/[1] 是它自己的 attribution+prefix;我们用 server 派生覆盖。
-  // 老 externalEnvelope 行为是 "skip if prefix already present";Phase 5 改成 "always replace"
+  // 早期 Phase 4 helper 是 "skip if prefix already present";Phase 5 改成 "always replace"
   // (plan §3.1 step 1+2 强制重写)。
   const tail = stripLeadingCcAttribution(systemArr);
 
