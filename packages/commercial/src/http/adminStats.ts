@@ -28,6 +28,7 @@ import {
   getAccountPoolSnapshot,
   getHostsUtilization,
   getAlertEvents7d,
+  getLifetimeStats,
   type ActivityWindow,
 } from "../admin/stats.js";
 import { getFunnelStats } from "../admin/usersStats.js";
@@ -187,6 +188,25 @@ export async function handleAdminStatsHostsUtilization(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
   const out = await getHostsUtilization();
+  sendJson(res, 200, out);
+}
+
+// ─── GET /api/admin/stats/lifetime ────────────────────────────────────
+//
+// 运营至今累计指标(总用户 / 总营收 / 总请求 / 总 token / 运营天数 …)。
+// 无 query 参数。requireAdmin(JWT only,与既有 stats 一致)。
+//
+// 前端策略:dashboard 首屏拉一次 + 手动"刷新"按钮触发;**不**进 30s 自动轮询
+// (避免每 30s 在 usage_records 上跑全表 COUNT/SUM)。
+
+export async function handleAdminStatsLifetime(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const out = await getLifetimeStats();
   sendJson(res, 200, out);
 }
 
