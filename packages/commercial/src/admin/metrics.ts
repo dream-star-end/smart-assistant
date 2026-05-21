@@ -367,6 +367,7 @@ export const anthropicProxySettle = new Counter({
  *   - rate_limited    per-uid 滑窗
  *   - concurrency     per-uid 并发上限
  *   - account_pool    池空 / 全 down
+ *   - account_pool_no_uuid  Phase 6 fail_closed:候选池 account_uuid 未回填导致空(503)
  *   - account_pool_busy  所有账号都到达 per-account 并发上限(瞬时过载,429)
  *   - unknown_model   定价表缺
  *   - bad_body        zod parse 失败
@@ -499,6 +500,11 @@ export type ProxyRejectReason =
   | "rate_limited"
   | "concurrency"
   | "account_pool"
+  // Phase 6 fail_closed:候选池被 account_uuid IS NULL 滤空时 scheduler
+  // 抛 AccountPoolUnavailableError('no_uuid'),index.ts pool_unavailable
+  // 分支按 reason 拆这个独立 label,让运维仪表盘把"backfill 没跑完"和
+  // "账号全爆"(account_pool)分开看。
+  | "account_pool_no_uuid"
   | "account_pool_busy"
   | "unknown_model"
   | "unauthorized_model"

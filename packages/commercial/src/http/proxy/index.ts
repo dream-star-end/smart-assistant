@@ -419,6 +419,10 @@ export function makeAnthropicProxyHandler(
           refreshDeps: deps.refreshDeps,
           deepseekApiKey: deps.deepseekApiKey,
           upstreamEndpoint: deps.upstreamEndpoint,
+          // Phase 6 account_uuid 锚定 flag(plan §3.0)— 由 ProxyHandlerDeps 注入,
+          // wiring 一次性从 config 读;pickUpstream 内部把同值传给 scheduler.pick
+          // 和 makeOAuthPoolUpstream(plan §5.5.4 防热改竞态)。
+          phase6AccountUuidEnforce: deps.phase6AccountUuidEnforce,
         },
         body,
         route,
@@ -439,11 +443,28 @@ export function makeAnthropicProxyHandler(
               { "Retry-After": "5" },
             );
             return;
-          case "pool_unavailable":
-            userLog.warn("proxy_account_pool_unavailable", { msg: pickRes.error.err.message });
-            incrAnthropicProxyReject("account_pool");
+          case "pool_unavailable": {
+            // Codex round 1 MAJOR 4:Phase 6 fail_closed 把没回填 uuid 的账号
+            // 从候选池滤掉,导致全池为空时 scheduler 会抛 AccountPoolUnavailableError
+            // ('no_uuid') —— 跟"账号全 disabled"的 'no_active' 共用 metric label
+            // 会让运维看仪表盘分不清"backfill 没跑完"和"账号全爆"。按 err.reason
+            // 拆 label;message 本身带 "account pool unavailable: " 前缀,用结构化
+            // 字段而非 substring-match,避免维护漂移。
+            // 'no_uuid_post_scheduler' 是 pickUpstream 层 race-condition 防御性
+            // reject(scheduler 应已过滤 NULL,这里是 defense-in-depth)。
+            const reason = pickRes.error.err.reason;
+            const label =
+              reason === "no_uuid" || reason === "no_uuid_post_scheduler"
+                ? "account_pool_no_uuid"
+                : "account_pool";
+            userLog.warn("proxy_account_pool_unavailable", {
+              msg: pickRes.error.err.message,
+              reason,
+            });
+            incrAnthropicProxyReject(label);
             sendJsonError(res, 503, "ACCOUNT_POOL_UNAVAILABLE", "account pool unavailable, try again", requestId);
             return;
+          }
           case "refresh_failed":
             // upstream 层已 log proxy_refresh_failed + release(transient_network|failure) + zero token。
             incrAnthropicProxyReject("upstream_auth");

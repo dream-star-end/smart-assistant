@@ -47,9 +47,16 @@ export const ERR_CONTAINER_STALE_BINDING = 'ERR_CONTAINER_STALE_BINDING'
 
 export class AccountPoolUnavailableError extends Error {
   readonly code = ERR_ACCOUNT_POOL_UNAVAILABLE
+  /**
+   * 结构化原因 — 给调用方按 reason 做 metric 分桶 / 日志 facet 用,而不是
+   * substring-match `err.message`(message 带 "account pool unavailable: " 前缀,
+   * 多桶共存场景下容易写错匹配)。当前已知值:'no_active' / 'no_uuid' / 自由 string。
+   */
+  readonly reason: string
   constructor(reason: string) {
     super(`account pool unavailable: ${reason}`)
     this.name = 'AccountPoolUnavailableError'
+    this.reason = reason
   }
 }
 
@@ -148,6 +155,16 @@ export interface PickInput {
    * 真实 API 调用路径上调用。
    */
   provider?: AccountProvider
+  /**
+   * Phase 6 H6 不变量执行模式。`true` 时 scheduler 把 `account_uuid IS NULL`
+   * 的候选从 WRH 入选集剔除(对应 `PHASE6_ACCOUNT_UUID_ENFORCE === 'fail_closed'`)。
+   *
+   * 池过滤后若**所有** active 都被 NULL 剔除 → 抛 `AccountPoolUnavailableError('no_uuid')`
+   * (复用 503 POOL_UNAVAILABLE 契约,见 0070 plan §2.4/§5.5.3)。
+   *
+   * 默认 false:Phase 5 / off / fail_open 语义不变。
+   */
+  enforceAccountUuid?: boolean
 }
 
 export interface PickResult {
@@ -172,6 +189,17 @@ export interface PickResult {
    * 让 Anthropic 网关看到稳定的 "account_uuid ↔ device_id" 一对一绑定。
    */
   pinned_user_id: string
+  /**
+   * 反风控锚定 Phase 6:该账号在 Anthropic 端的真 OAuth account UUID。
+   * 由 0070 migration 加列(初始 NULL,回填脚本 `backfill-account-uuid.ts`
+   * 渐进填充)。`null` 语义见 `PHASE6_ACCOUNT_UUID_ENFORCE` 三态:
+   *   - off:hook 不跑,字段不被使用(向后兼容)
+   *   - fail_open:hook 跑,null 时跳过重写,保留 builder HMAC 占位
+   *   - fail_closed:scheduler 已在候选集层面过滤掉 null,不可能返到这里
+   *
+   * 调用方读取此字段必须配合 `PHASE6_ACCOUNT_UUID_ENFORCE` flag 行为分支。
+   */
+  account_uuid: string | null
 }
 
 /**
@@ -239,6 +267,11 @@ export interface CandidateRow extends QueryResultRow {
    * 来自 claude_accounts.pinned_user_id 列(0067 migration)。
    */
   pinned_user_id: string
+  /**
+   * 反风控锚定 Phase 6:OAuth account 真 UUID(0070 migration)。
+   * 回填未跑完时为 null;`enforceAccountUuid=true` 时 pick() 会过滤掉 null 候选。
+   */
+  account_uuid: string | null
 }
 
 /** 默认哈希:SHA-256,截前 8B 作 64-bit 无符号整数。 */
@@ -454,18 +487,30 @@ export class AccountScheduler {
     }
 
     const provider: AccountProvider = input.provider ?? 'claude'
+    const enforceAccountUuid = input.enforceAccountUuid === true
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score,
               quota_5h_pct, quota_7d_pct, subscription_end_at,
-              pinned_user_id
+              pinned_user_id,
+              account_uuid::text AS account_uuid
        FROM claude_accounts
        WHERE status = 'active' AND provider = $1
        ORDER BY id`,
       [provider],
     )
-    let pool = res.rows
+    const allActive = res.rows
+    if (allActive.length === 0) {
+      throw new AccountPoolUnavailableError('no_active')
+    }
+    // Phase 6 H6 候选过滤:fail_closed 模式下排除 account_uuid IS NULL 的脏数据,
+    // 防止外接 ApiKey 路径上 metadata.account_uuid 跟 OAuth account 真 uuid 错位。
+    // off / fail_open 模式不过滤(builder HMAC 占位会兜底)。
+    let pool: CandidateRow[] = enforceAccountUuid
+      ? allActive.filter((c) => c.account_uuid !== null)
+      : allActive
     if (pool.length === 0) {
-      throw new AccountPoolUnavailableError('no active accounts')
+      // 必为 enforceAccountUuid=true 路径(allActive>0 但 eligible=0)
+      throw new AccountPoolUnavailableError('no_uuid')
     }
 
     // WRH key:有 sessionId 走强 sticky;没有则生成一次性 randomUUID(分布上仍按
@@ -505,6 +550,7 @@ export class AccountScheduler {
             egress_proxy: tok.egress_proxy,
             egress_target: tok.egress_target,
             pinned_user_id: chosen.pinned_user_id,
+            account_uuid: chosen.account_uuid,
           }
         }
         // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选
@@ -545,7 +591,7 @@ export class AccountScheduler {
     }
     // 池子真被掏空 — 全部 vanish/AEAD,无可重试目标
     throw new AccountPoolUnavailableError(
-      `candidate pool drained while pick()ing: vanished=${vanished} (deleted between SELECT and readToken), ` +
+      `drained: vanished=${vanished} (deleted between SELECT and readToken), ` +
         `aead_quarantined=${quarantined} (decryption failed → auto-disabled)`,
     )
   }

@@ -345,6 +345,77 @@ export function rewriteMetadataDeviceId(
 }
 
 /**
+ * Phase 6 配套:把 `metadata.user_id` 里的 `account_uuid` 重写为该请求选中
+ * OAuth account 在 Anthropic 端的真 UUID(0070 migration `claude_accounts.account_uuid`)。
+ *
+ * 背景:Phase 5 builder 在 pickUpstream 之前跑(input token 估算锁),不知道
+ * 哪个 OAuth account 会被选中 → account_uuid 用 HMAC 占位。容器路径里 CCB
+ * 写本地 `~/.claude.json` 的 account_uuid 也可能跟 master 后续 pick 选的号
+ * 不同号。本 hook 在 master applyUpstreamAuth 选号后统一对齐到真 UUID。
+ *
+ * **strict 双态(Codex round 1 BLOCKER 1)**:
+ *   - `strict=false`(fail_open / off):malformed / 非 object 输入 → 保持原值,
+ *     避免把诡异输入推到 Anthropic 网关引发新风控(fail-open 全场景可用性)。
+ *     与 `rewriteMetadataDeviceId` 同型。
+ *   - `strict=true`(fail_closed):H6 invariant **强保证**,无论客户端发什么
+ *     形态都 normalize 到含 account_uuid 的最小 JSON object;malformed / 非
+ *     object → 用 `{"account_uuid": pinnedAccountUuid}` 整个替换。这是 fail_closed
+ *     语义的关键 — "我们承诺上游永远看到对齐的 account_uuid",字符串层不再
+ *     fail-open。容器路径下客户端可能发任意形态 metadata.user_id,
+ *     不能因为客户端 misbehavior 就让 H6 漏出。
+ *
+ * 分支表:
+ *
+ *   userIdStr      | strict=false (fail_open)              | strict=true (fail_closed)
+ *   ---------------+---------------------------------------+---------------------------
+ *   undefined/""   | {"account_uuid": pinnedAccountUuid}   | 同 fail_open
+ *   JSON object    | spread + 覆盖 account_uuid            | 同 fail_open
+ *   JSON array     | 保持原值                              | {"account_uuid": pinnedAccountUuid}
+ *   JSON primitive | 保持原值                              | {"account_uuid": pinnedAccountUuid}
+ *   非法 JSON      | 保持原值                              | {"account_uuid": pinnedAccountUuid}
+ */
+export function rewriteMetadataAccountUuid(
+  userIdStr: string | undefined,
+  pinnedAccountUuid: string,
+  strict = false,
+): string {
+  if (!userIdStr) {
+    return JSON.stringify({ account_uuid: pinnedAccountUuid });
+  }
+  try {
+    const parsed: unknown = JSON.parse(userIdStr);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return JSON.stringify({
+        ...(parsed as Record<string, unknown>),
+        account_uuid: pinnedAccountUuid,
+      });
+    }
+    // 非 object JSON(数组 / primitive)— strict 下强 normalize,否则保持原值
+    if (strict) {
+      return JSON.stringify({ account_uuid: pinnedAccountUuid });
+    }
+    return userIdStr;
+  } catch {
+    // 非法 JSON — strict 下强 normalize,否则保持原值
+    if (strict) {
+      return JSON.stringify({ account_uuid: pinnedAccountUuid });
+    }
+    return userIdStr;
+  }
+}
+
+/**
+ * canonical UUID(8-4-4-4-12 hex,任意版本)校验。
+ *
+ * 故意不强制 v4:Anthropic profile.account.uuid 可能用 v1/v5,运行时校验
+ * 仅防御明显脏数据(空串/非 UUID 字符串)进入 metadata 重写。回填脚本和
+ * applyUpstreamAuth 共用同一正则,语义统一。
+ */
+export function isUuidLike(s: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+}
+
+/**
  * 估算 input token 数(保守口径,宁可高估)。
  *
  * MVP 不引入完整 tokenizer(`@anthropic-ai/tokenizer` 增加依赖体积),用
@@ -1014,6 +1085,18 @@ export interface AnthropicProxyDeps {
    * anti-abuse 看到漂移 → 整池 429。≥ 32 字符长度。生产由 systemd EnvironmentFile 注入。
    */
   platformServerSecret?: Buffer | string;
+  /**
+   * Phase 6 — `account_uuid` 锚定执行模式(0070 migration + plan §3.0)。
+   *
+   *   - `off`(默认):applyUpstreamAuth hook 完全早退,builder HMAC 占位透出
+   *     (Phase 5 行为,deploy 1 默认值)
+   *   - `fail_open`:hook 重写;pick.account_uuid 为 null(回填未跑完)时跳过
+   *   - `fail_closed`:scheduler 过滤掉 null 候选 + hook 强制重写;池空 → 503
+   *
+   * wiring 一次性从 `loadConfig().PHASE6_ACCOUNT_UUID_ENFORCE` 注入,handler 内部
+   * 透传到 pickUpstream,见 plan §5.5.4(防止热改时 scheduler/hook 读不一致)。
+   */
+  phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
 }
 
 /**

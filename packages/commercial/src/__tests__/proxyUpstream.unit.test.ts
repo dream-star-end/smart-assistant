@@ -58,6 +58,7 @@ function makePick(over: Partial<PickResult> = {}): PickResult {
     egress_proxy: null,
     egress_target: null,
     pinned_user_id: PINNED_OK,
+    account_uuid: null, // Phase 6 默认 null;具体 case 通过 over 覆盖
     ...over,
   };
 }
@@ -891,5 +892,349 @@ describe("releaseUpstreamSession (case c — finalizer-pre window)", () => {
       { kind: "failure", error: "x" },
       log,
     );
+  });
+});
+
+// ─── Phase 6 H6 — account_uuid 三态闭环(applyUpstreamAuth hook + scheduler 透传 + refresh rebind)
+//
+// 这些是 upstream 层 unit:验证 pickUpstream/applyUpstreamAuth/refresh rebind 三处
+// 在 phase6Enforce off/fail_open/fail_closed 下的协调。
+//   - H6.A 集成验证落在 ccExternalEndpoint.integ.test.ts(metadata.account_uuid 字节级)
+//   - 此处覆盖三处枢纽:enforceAccountUuid 透传 / null 候选下 hook 静默/告警 /
+//     refresh rebind 保留 pick.account_uuid。
+
+describe("pickUpstream — phase6 enforce 透传到 scheduler.pick", () => {
+  test("phase6Enforce=fail_closed → scheduler.pick({enforceAccountUuid:true})", async () => {
+    let observedEnforce: boolean | undefined = "<unset>" as unknown as boolean | undefined;
+    const sched: PickUpstreamDeps["scheduler"] = {
+      async pick(input) {
+        observedEnforce = input.enforceAccountUuid;
+        return makePick({ account_uuid: "12345678-9abc-def0-1234-56789abcdef0" });
+      },
+      async release() {},
+    };
+    const res = await pickUpstream(
+      {
+        scheduler: sched,
+        phase6AccountUuidEnforce: "fail_closed",
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    assert.equal(observedEnforce, true);
+  });
+
+  test("phase6Enforce=fail_open → scheduler.pick({enforceAccountUuid:false})", async () => {
+    let observedEnforce: boolean | undefined = "<unset>" as unknown as boolean | undefined;
+    const sched: PickUpstreamDeps["scheduler"] = {
+      async pick(input) {
+        observedEnforce = input.enforceAccountUuid;
+        return makePick();
+      },
+      async release() {},
+    };
+    const res = await pickUpstream(
+      {
+        scheduler: sched,
+        phase6AccountUuidEnforce: "fail_open",
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    assert.equal(observedEnforce, false);
+  });
+
+  test("phase6Enforce 未注入(默认 off)→ scheduler.pick({enforceAccountUuid:false})", async () => {
+    let observedEnforce: boolean | undefined = "<unset>" as unknown as boolean | undefined;
+    const sched: PickUpstreamDeps["scheduler"] = {
+      async pick(input) {
+        observedEnforce = input.enforceAccountUuid;
+        return makePick();
+      },
+      async release() {},
+    };
+    const res = await pickUpstream(
+      {
+        scheduler: sched,
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    assert.equal(observedEnforce, false);
+  });
+
+  test("scheduler 抛 'no_uuid' → pool_unavailable error;无 release 调用", async () => {
+    const releaseCalls: ReleaseInput[] = [];
+    const sched: PickUpstreamDeps["scheduler"] = {
+      async pick() {
+        throw new AccountPoolUnavailableError("no_uuid");
+      },
+      async release(input) {
+        releaseCalls.push(input);
+      },
+    };
+    const res = await pickUpstream(
+      {
+        scheduler: sched,
+        phase6AccountUuidEnforce: "fail_closed",
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.equal(res.error.kind, "pool_unavailable");
+    if (res.error.kind !== "pool_unavailable") return;
+    // 结构化 reason 拿来给 metric label 分桶用
+    assert.equal(res.error.err.reason, "no_uuid");
+    // pool_unavailable 时无 account 持有,scheduler.release 不应被调
+    assert.equal(releaseCalls.length, 0);
+  });
+
+  // Codex round 2 MINOR 1 defense-in-depth:
+  // scheduler 在 fail_closed 下应过滤 NULL account_uuid 候选,但若 race condition
+  // 让 NULL 漏到 pickUpstream,必须 fail closed(不是 log + warn-and-proceed)。
+  test("defense-in-depth: fail_closed + scheduler 返回 account_uuid=null pick → 503 no_uuid_post_scheduler + 立即 release(failure)", async () => {
+    const releaseCalls: ReleaseInput[] = [];
+    const tokenBuf = Buffer.from("LEAKED-TOKEN", "utf8");
+    const refreshBuf = Buffer.from("LEAKED-REFRESH", "utf8");
+    const sched: PickUpstreamDeps["scheduler"] = {
+      async pick() {
+        // 模拟 scheduler bug:fail_closed 模式下却返回了 null uuid 的 pick
+        return makePick({
+          account_uuid: null,
+          token: tokenBuf,
+          refresh: refreshBuf,
+        });
+      },
+      async release(input) {
+        releaseCalls.push(input);
+      },
+    };
+    const res = await pickUpstream(
+      {
+        scheduler: sched,
+        phase6AccountUuidEnforce: "fail_closed",
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.equal(res.error.kind, "pool_unavailable");
+    if (res.error.kind !== "pool_unavailable") return;
+    assert.equal(res.error.err.reason, "no_uuid_post_scheduler",
+      "defense-in-depth reject 必须用独立 reason,跟 scheduler 内置 'no_uuid' 区分");
+    // 必须立即 release 持有的 pick(failure kind 扣健康分,作为运维信号)
+    assert.equal(releaseCalls.length, 1);
+    assert.equal(releaseCalls[0].result.kind, "failure");
+    // token / refresh 必须零化(防 leaked pick 留在 process memory)
+    assert.ok(tokenBuf.every((b) => b === 0), "token buffer 必须零化");
+    assert.ok(refreshBuf.every((b) => b === 0), "refresh buffer 必须零化");
+  });
+
+  // fail_open 模式下 scheduler 不过滤 null,pickUpstream 也不该拦 — null pick
+  // 应当走通,applyUpstreamAuth 走静默跳过分支(builder HMAC 占位透出)。
+  test("fail_open + scheduler 返回 account_uuid=null pick → 不拦,走 happy path", async () => {
+    const sched = makeScheduler({
+      pickResult: makePick({ account_uuid: null }),
+    });
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        phase6AccountUuidEnforce: "fail_open",
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    assert.equal(sched.releaseCalls.length, 0);
+  });
+});
+
+describe("applyUpstreamAuth — phase6 account_uuid 三态分支", () => {
+  const REAL_UUID = "12345678-9abc-def0-1234-56789abcdef0";
+
+  async function runApplyAuth(opts: {
+    accountUuid: string | null;
+    phase6Enforce: "off" | "fail_open" | "fail_closed";
+    metadataUserId?: string;
+  }) {
+    const sched = makeScheduler({
+      pickResult: makePick({ account_uuid: opts.accountUuid }),
+    });
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        phase6AccountUuidEnforce: opts.phase6Enforce,
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) throw new Error("unreachable");
+    const headers: Record<string, string> = {};
+    const body: Record<string, unknown> = opts.metadataUserId !== undefined
+      ? { metadata: { user_id: opts.metadataUserId } }
+      : {};
+    // applyUpstreamAuth 是 PreparedUpstreamSession 的合约方法 — body 类型 ProxyBody
+    res.session.applyUpstreamAuth(headers, body as never, log);
+    return body;
+  }
+
+  test("off + accountUuid 存在 → hook 不跑,metadata.user_id 不含 account_uuid(只 device_id)", async () => {
+    const body = await runApplyAuth({
+      accountUuid: REAL_UUID,
+      phase6Enforce: "off",
+    });
+    // off 路径:device_id rewrite(iii)仍跑,但 account_uuid hook(iv)早退
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    const userIdObj = JSON.parse(userIdStr) as Record<string, unknown>;
+    assert.equal(userIdObj.device_id, PINNED_OK);
+    assert.equal(userIdObj.account_uuid, undefined, "off 模式不应注入 account_uuid");
+  });
+
+  test("fail_open + accountUuid=null → hook 静默跳过,metadata.user_id 不被注入", async () => {
+    const body = await runApplyAuth({
+      accountUuid: null,
+      phase6Enforce: "fail_open",
+    });
+    // fail_open + null:hook 走 null 分支静默跳过,body 不增字段
+    // (但 device_id rewrite 仍会注入 metadata.user_id — 因 PINNED_OK 合法)
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    const userIdObj = JSON.parse(userIdStr) as Record<string, unknown>;
+    assert.equal(userIdObj.account_uuid, undefined, "null 候选不应注入 account_uuid");
+  });
+
+  test("fail_open + accountUuid=REAL_UUID → metadata.user_id.account_uuid = REAL_UUID", async () => {
+    const body = await runApplyAuth({
+      accountUuid: REAL_UUID,
+      phase6Enforce: "fail_open",
+    });
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    const userIdObj = JSON.parse(userIdStr) as Record<string, string>;
+    assert.equal(userIdObj.account_uuid, REAL_UUID);
+  });
+
+  test("fail_closed + accountUuid=REAL_UUID + 客户端原 metadata.user_id 含 device_id → device_id 被覆盖且 account_uuid 注入", async () => {
+    const body = await runApplyAuth({
+      accountUuid: REAL_UUID,
+      phase6Enforce: "fail_closed",
+      metadataUserId: JSON.stringify({ device_id: "client-device" }),
+    });
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    const userIdObj = JSON.parse(userIdStr) as Record<string, string>;
+    // device_id 被 pinned_user_id(PINNED_OK = 'f' * 64)覆盖
+    assert.equal(userIdObj.device_id, PINNED_OK);
+    // account_uuid 是 hook(iv)注入
+    assert.equal(userIdObj.account_uuid, REAL_UUID);
+  });
+
+  test("fail_open + accountUuid='bad-uuid'(非 canonical hex 8-4-4-4-12)→ hook 早退,不重写", async () => {
+    const body = await runApplyAuth({
+      accountUuid: "not-a-uuid",
+      phase6Enforce: "fail_open",
+    });
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    const userIdObj = JSON.parse(userIdStr) as Record<string, unknown>;
+    // 脏数据 → fail-open 不重写,只 log.warn
+    assert.equal(userIdObj.account_uuid, undefined);
+  });
+
+  // ─── BLOCKER 1 修复:fail_closed strict 强 normalize 客户端 malformed 输入 ───
+  test("fail_closed + 客户端 metadata.user_id 是非法 JSON 字符串 → 强 normalize 注入 account_uuid", async () => {
+    const body = await runApplyAuth({
+      accountUuid: REAL_UUID,
+      phase6Enforce: "fail_closed",
+      metadataUserId: "not-a-json-string",
+    });
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    const userIdObj = JSON.parse(userIdStr) as Record<string, string>;
+    assert.equal(userIdObj.account_uuid, REAL_UUID,
+      "fail_closed 必须无视客户端 malformed 输入强写 account_uuid(H6 invariant 闭环)");
+  });
+
+  test("fail_closed + 客户端 metadata.user_id 是 JSON 数组 → 强 normalize 注入 account_uuid", async () => {
+    const body = await runApplyAuth({
+      accountUuid: REAL_UUID,
+      phase6Enforce: "fail_closed",
+      metadataUserId: "[1,2,3]",
+    });
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    const userIdObj = JSON.parse(userIdStr) as Record<string, string>;
+    assert.equal(userIdObj.account_uuid, REAL_UUID);
+  });
+
+  test("fail_open + 客户端 metadata.user_id 是非法 JSON 字符串 → 保持原值(不 normalize,避诡异输入推上游)", async () => {
+    const body = await runApplyAuth({
+      accountUuid: REAL_UUID,
+      phase6Enforce: "fail_open",
+      metadataUserId: "not-a-json-string",
+    });
+    // device_id rewrite (iii) 也会被 malformed 输入卡住 — rewriteMetadataDeviceId 同语义保留原值。
+    // 关键断言:account_uuid hook 没硬塞,保持 fail-open 语义
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    assert.equal(userIdStr, "not-a-json-string",
+      "fail_open 必须保留 malformed 输入,不强 normalize");
+  });
+});
+
+describe("pickUpstream — H6.D refresh rebind 保留 pick.account_uuid", () => {
+  test("refresh 完后 pick.account_uuid 仍是原值 → applyUpstreamAuth metadata.account_uuid = 原 UUID", async () => {
+    const REAL_UUID = "abcdef01-2345-6789-abcd-ef0123456789";
+    const oldToken = Buffer.from("OLD-TOKEN", "utf8");
+    const oldRefresh = Buffer.from("OLD-REFRESH", "utf8");
+    const pick = makePick({
+      token: oldToken,
+      refresh: oldRefresh,
+      expires_at: new Date(Date.now() - 1000), // 已过期 → 触发 refresh
+      account_uuid: REAL_UUID,
+    });
+    const sched = makeScheduler({ pickResult: pick });
+
+    const refreshAccountTokenImpl = (async () => {
+      return {
+        token: Buffer.from("NEW-TOKEN", "utf8"),
+        refresh: Buffer.from("NEW-REFRESH", "utf8"),
+        expires_at: new Date(Date.now() + 3600_000),
+      };
+    }) as unknown as PickUpstreamDeps["refreshAccountTokenImpl"];
+
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        refreshDeps: {} as RefreshDeps,
+        refreshAccountTokenImpl,
+        getDispatcher: (async () => undefined) as PickUpstreamDeps["getDispatcher"],
+        phase6AccountUuidEnforce: "fail_closed",
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+
+    // 老 token + refresh 必须被零化(refresh rebind 副作用)
+    assert.ok(oldToken.every((b) => b === 0), "老 token 已零化");
+    assert.ok(oldRefresh.every((b) => b === 0), "老 refresh 已零化");
+
+    // 关键断言:applyUpstreamAuth 仍能读到 REAL_UUID,证明 refresh rebind 保留了 account_uuid
+    const headers: Record<string, string> = {};
+    const body: Record<string, unknown> = {};
+    res.session.applyUpstreamAuth(headers, body as never, log);
+    const userIdStr = (body.metadata as Record<string, string>).user_id;
+    const userIdObj = JSON.parse(userIdStr) as Record<string, string>;
+    assert.equal(userIdObj.account_uuid, REAL_UUID, "refresh 后 account_uuid 仍要可用");
   });
 });

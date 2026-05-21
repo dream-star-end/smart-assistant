@@ -421,6 +421,22 @@ export const commercialConfigSchema = z
      */
     PLATFORM_HMAC_SECRET: z.string().trim().min(32).max(256).optional(),
     /**
+     * Phase 6 account_uuid 锚定执行模式(0070 migration + plan §3.0)。
+     *
+     *   - `off`(默认):applyUpstreamAuth hook 完全早退,builder HMAC 占位透出
+     *     给 Anthropic(Phase 5 行为,deploy 1 默认值,确保上线后 outbound 不变)
+     *   - `fail_open`:hook 重写,但 `pick.account_uuid === null`(回填未跑完)
+     *     时跳过(HMAC 占位透出);scheduler 不过滤候选;回填进行中的过渡态
+     *   - `fail_closed`:scheduler 过滤掉 account_uuid IS NULL 的 active 候选,
+     *     hook 强制重写;池过滤后全空 → AccountPoolUnavailableError("no_uuid")
+     *     → 503 POOL_UNAVAILABLE(复用现有契约);回填完后稳态
+     *
+     * 切换需 systemctl restart openclaude 生效。
+     */
+    PHASE6_ACCOUNT_UUID_ENFORCE: z
+      .enum(["off", "fail_open", "fail_closed"])
+      .default("off"),
+    /**
      * GitHub OAuth App 配置(GitHub OAuth 关联功能)。
      * 全部 optional — 缺失时 /api/auth/github/* 返 503,启动不阻断。
      */

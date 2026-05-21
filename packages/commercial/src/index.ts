@@ -899,6 +899,9 @@ export async function registerCommercial(
         // 2026-05-02 deepseek 接入:cfg 在外层闭包已 loadConfig() 过(line 379),
         // 这里直接读取。未配置 → undefined → proxy 命中 deepseek 模型时 503。
         deepseekApiKey: cfg.DEEPSEEK_API_KEY,
+        // Phase 6 — account_uuid 锚定执行模式(0070 plan §3.0)。
+        // off(默认)/ fail_open / fail_closed 三态切换走 systemctl restart。
+        phase6AccountUuidEnforce: cfg.PHASE6_ACCOUNT_UUID_ENFORCE,
       });
       // 2026-05-05 v3 commercial server-authored persistence — 复用 18791/18443
       // 同一个 listener,新加 POST /internal/v3/server-authored-message。
@@ -1189,6 +1192,8 @@ export async function registerCommercial(
         deepseekApiKey: cfg.DEEPSEEK_API_KEY,
         platformContextLoader,
         platformServerSecret: cfg.PLATFORM_HMAC_SECRET,
+        // Phase 6 — external ApiKey proxy 也走同一个 flag,跟 internal 共用 PickUpstreamDeps。
+        phase6AccountUuidEnforce: cfg.PHASE6_ACCOUNT_UUID_ENFORCE,
       });
       // eslint-disable-next-line no-console
       console.log(

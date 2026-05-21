@@ -401,6 +401,7 @@ function buildFakeScheduler(initialSpec: PickSpec | null = {}, releaseOrder?: st
         egress_proxy: null,
         egress_target: null,
         pinned_user_id: pinned,
+        account_uuid: null,
       };
     },
     async release(input: ReleaseInput): Promise<void> {

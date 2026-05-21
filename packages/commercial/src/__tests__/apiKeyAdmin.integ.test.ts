@@ -313,6 +313,7 @@ function buildFakeScheduler(): AccountScheduler {
         egress_proxy: null,
         egress_target: null,
         pinned_user_id: FIXED_PINNED_USER_ID,
+        account_uuid: null,
       };
     },
     async release(_input: ReleaseInput): Promise<void> {},

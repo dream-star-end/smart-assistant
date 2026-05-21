@@ -28,8 +28,10 @@ import {
   isDeepseekModel,
   isAnthropicInvalidRequestError,
   isClientAbort,
+  rewriteMetadataAccountUuid,
   rewriteMetadataDeviceId,
   stripMalformedThinkingBlocks,
+  isUuidLike,
   DEEPSEEK_UPSTREAM_ENDPOINT,
   ALLOWED_BETA_VALUES,
   ANTHROPIC_VERSION,
@@ -1222,5 +1224,120 @@ describe("rewriteMetadataDeviceId", () => {
       const out = rewriteMetadataDeviceId(original, PINNED);
       assert.equal(out, original, `primitive ${original} should be preserved`);
     }
+  });
+});
+
+// ─── rewriteMetadataAccountUuid(Phase 6 H6:account_uuid 锚定到账号真 uuid)──
+//
+// 详见 http/proxy/shared.ts 中 `rewriteMetadataAccountUuid` 的文档注释。fail-open
+// 全 case 保留可用性,与 rewriteMetadataDeviceId 同型。这里 PINNED 用一个合法
+// canonical uuid 作为账号真 uuid 测试桩(回填脚本/applyUpstreamAuth 共用同一
+// isUuidLike 校验,见下方 isUuidLike describe)。
+describe("rewriteMetadataAccountUuid", () => {
+  const PINNED = "12345678-aaaa-bbbb-cccc-1234567890ab";
+
+  test("userIdStr 为 undefined → 返回最小 {account_uuid} JSON", () => {
+    const out = rewriteMetadataAccountUuid(undefined, PINNED);
+    assert.deepEqual(JSON.parse(out), { account_uuid: PINNED });
+  });
+
+  test("userIdStr 为空串 → 同 undefined,返回最小 {account_uuid} JSON", () => {
+    const out = rewriteMetadataAccountUuid("", PINNED);
+    assert.deepEqual(JSON.parse(out), { account_uuid: PINNED });
+  });
+
+  test("plain object → spread 保留其他字段并覆盖 account_uuid", () => {
+    const input = JSON.stringify({
+      device_id: "d".repeat(64),
+      account_uuid: "stale-or-client-supplied",
+      session_id: "sess-1",
+      extra_telemetry_kv: "x",
+    });
+    const out = rewriteMetadataAccountUuid(input, PINNED);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.account_uuid, PINNED);
+    assert.equal(parsed.device_id, "d".repeat(64));
+    assert.equal(parsed.session_id, "sess-1");
+    assert.equal(parsed.extra_telemetry_kv, "x");
+  });
+
+  test("非 JSON 字符串 → 保持原值不动(fail-open)", () => {
+    const original = "not-a-json-string";
+    const out = rewriteMetadataAccountUuid(original, PINNED);
+    assert.equal(out, original);
+  });
+
+  test("JSON 数组 / primitive(string/number/null/bool) → 保持原值不动", () => {
+    for (const original of ['[]', '[1,2,3]', '"plain-string"', "42", "null", "true"]) {
+      const out = rewriteMetadataAccountUuid(original, PINNED);
+      assert.equal(out, original, `non-object JSON ${original} should be preserved`);
+    }
+  });
+
+  // ─── strict=true(fail_closed)分支:H6 invariant 强保证 ───
+  test("strict=true + undefined → {account_uuid} 最小 JSON(同 fail_open)", () => {
+    const out = rewriteMetadataAccountUuid(undefined, PINNED, true);
+    assert.deepEqual(JSON.parse(out), { account_uuid: PINNED });
+  });
+
+  test("strict=true + plain object → spread + 覆盖(同 fail_open)", () => {
+    const input = JSON.stringify({ device_id: "d", session_id: "s" });
+    const out = rewriteMetadataAccountUuid(input, PINNED, true);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.account_uuid, PINNED);
+    assert.equal(parsed.device_id, "d");
+    assert.equal(parsed.session_id, "s");
+  });
+
+  test("strict=true + 非法 JSON → 强 normalize 到 {account_uuid}(fail_open 会保持原值)", () => {
+    const out = rewriteMetadataAccountUuid("not-a-json-string", PINNED, true);
+    assert.deepEqual(JSON.parse(out), { account_uuid: PINNED });
+  });
+
+  test("strict=true + JSON 数组 / primitive → 强 normalize 到 {account_uuid}", () => {
+    for (const original of ["[]", "[1,2,3]", '"plain"', "42", "null", "true"]) {
+      const out = rewriteMetadataAccountUuid(original, PINNED, true);
+      assert.deepEqual(
+        JSON.parse(out),
+        { account_uuid: PINNED },
+        `strict=true 必须 normalize 非 object JSON ${original}`,
+      );
+    }
+  });
+});
+
+// ─── isUuidLike(account_uuid canonical 校验)──
+//
+// 回填脚本写入 SQL 前与 applyUpstreamAuth 使用 pinned account_uuid 前共用同一
+// 正则;故意不强制 v4,允许 Anthropic profile.account.uuid 用 v1/v5 等版本。
+describe("isUuidLike", () => {
+  test("canonical 小写 hex uuid → true", () => {
+    assert.equal(isUuidLike("12345678-9abc-def0-1234-56789abcdef0"), true);
+  });
+
+  test("canonical 大写也接受(case-insensitive)", () => {
+    assert.equal(isUuidLike("12345678-9ABC-DEF0-1234-56789ABCDEF0"), true);
+  });
+
+  test("空串 → false", () => {
+    assert.equal(isUuidLike(""), false);
+  });
+
+  test("缺少分隔符 → false", () => {
+    assert.equal(isUuidLike("123456789abcdef0123456789abcdef0"), false);
+  });
+
+  test("段长度错 → false", () => {
+    assert.equal(isUuidLike("12345678-9abc-def0-1234-56789abcdef"), false);
+    assert.equal(isUuidLike("1234567-9abc-def0-1234-56789abcdef0"), false);
+  });
+
+  test("含非 hex 字符 → false", () => {
+    assert.equal(isUuidLike("12345678-9abc-defg-1234-56789abcdef0"), false);
+  });
+
+  test("尾部空白 / 前后多字符 → false(正则锚定 ^$)", () => {
+    assert.equal(isUuidLike(" 12345678-9abc-def0-1234-56789abcdef0"), false);
+    assert.equal(isUuidLike("12345678-9abc-def0-1234-56789abcdef0 "), false);
   });
 });

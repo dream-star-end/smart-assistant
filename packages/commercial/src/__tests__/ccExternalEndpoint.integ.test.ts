@@ -56,7 +56,8 @@ import type {
 } from "../auth/apiKeyRepo.js";
 import { createCommercialHandler } from "../http/router.js";
 import type { CommercialHttpDeps } from "../http/handlers.js";
-import type { AccountScheduler, PickResult, ReleaseInput } from "../account-pool/scheduler.js";
+import type { AccountScheduler, PickInput, PickResult, ReleaseInput } from "../account-pool/scheduler.js";
+import { AccountPoolUnavailableError } from "../account-pool/scheduler.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { RateLimitRedis } from "../middleware/rateLimit.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
@@ -282,14 +283,29 @@ interface SchedulerSpy {
   scheduler: AccountScheduler;
   pickCalls: number;
   releaseCalls: ReleaseInput[];
+  /** 最近一次 pick 收到的 enforceAccountUuid 值;H6 断言 phase6 透传到 scheduler 用 */
+  lastEnforceAccountUuid: boolean | undefined;
 }
 
-function buildFakeScheduler(): SchedulerSpy {
+interface FakeSchedulerOpts {
+  /** H6:scheduler 返回的 account_uuid。默认 null。 */
+  accountUuid?: string | null;
+}
+
+function buildFakeScheduler(opts: FakeSchedulerOpts = {}): SchedulerSpy {
+  const accountUuid = opts.accountUuid ?? null;
   let pickCalls = 0;
+  let lastEnforceAccountUuid: boolean | undefined;
   const releaseCalls: ReleaseInput[] = [];
   const scheduler = {
-    async pick(): Promise<PickResult> {
+    async pick(input: PickInput): Promise<PickResult> {
       pickCalls++;
+      lastEnforceAccountUuid = input.enforceAccountUuid === true;
+      // H6 fail_closed:scheduler 真实路径下会过滤 NULL 候选;若全 NULL 则抛 'no_uuid'。
+      // mock 这里复刻同语义,让 integ 测能验证 503 端到端贯通。
+      if (lastEnforceAccountUuid && accountUuid === null) {
+        throw new AccountPoolUnavailableError("no_uuid");
+      }
       return {
         account_id: FIXED_ACCOUNT_ID,
         plan: "pro",
@@ -299,6 +315,7 @@ function buildFakeScheduler(): SchedulerSpy {
         egress_proxy: null,
         egress_target: null,
         pinned_user_id: FIXED_PINNED_USER_ID,
+        account_uuid: accountUuid,
       };
     },
     async release(input: ReleaseInput): Promise<void> {
@@ -308,6 +325,7 @@ function buildFakeScheduler(): SchedulerSpy {
   return {
     scheduler,
     get pickCalls() { return pickCalls; },
+    get lastEnforceAccountUuid() { return lastEnforceAccountUuid; },
     releaseCalls,
   };
 }
@@ -480,6 +498,10 @@ interface HarnessOpts {
    * 区别于 (7.5) fail-closed 用例的"漏注 deps"路径。
    */
   platformCtx?: import("../platform/volumeContextReader.js").PlatformContext | null;
+  /** Phase 6 H6:透传到 makeAnthropicProxyHandler 的 phase6AccountUuidEnforce(默认 undefined → off)。 */
+  phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
+  /** Phase 6 H6:fake scheduler 返回的 account_uuid(默认 null)。 */
+  schedulerAccountUuid?: string | null;
 }
 
 function buildHarness(opts: HarnessOpts = {}) {
@@ -488,7 +510,7 @@ function buildHarness(opts: HarnessOpts = {}) {
 
   const preCheckSpy = buildFakePreCheckRedis();
   const rateLimitRedis = buildFakeRateLimitRedis();
-  const schedulerSpy = buildFakeScheduler();
+  const schedulerSpy = buildFakeScheduler({ accountUuid: opts.schedulerAccountUuid });
   const effectivePricing: ModelPricing = opts.pricingOverride
     ? { ...FIXED_PRICING, ...opts.pricingOverride }
     : FIXED_PRICING;
@@ -547,6 +569,7 @@ function buildHarness(opts: HarnessOpts = {}) {
           invalidate: () => {},
         },
         platformServerSecret: "test-platform-hmac-secret-32char",
+        phase6AccountUuidEnforce: opts.phase6AccountUuidEnforce,
       });
 
   // 极简 CommercialHttpDeps — 只装与 Phase 3 adapter 相关的字段。其它都标 undefined,
@@ -1380,3 +1403,141 @@ describe("Phase 5 Step 7 — H1 / H2 / PII strip / fallback golden tests", () =>
   });
 });
 
+// ─── Phase 6 H6 — account_uuid 锚定到 OAuth 账号真 UUID ──────────────────────
+//
+// 详见 docs/V3_PHASE6_ACCOUNT_UUID_ANCHOR_PLAN_2026-05-21.md §2.8 H6 test matrix。
+//
+// 集成层(handler 端到端)验证 phase6Enforce + scheduler.account_uuid 二维矩阵
+// 在 outbound `metadata.user_id.account_uuid` 字节级语义:
+//   - H6.A enforce=off   → builder HMAC 占位透出(不被 hook 覆盖)
+//   - H6.B fail_open + uuid 真 → metadata.account_uuid = pick.account_uuid
+//   - H6.C fail_closed + uuid=null → 503 POOL_UNAVAILABLE(scheduler 抛 'no_uuid')
+//
+// 单元层(pickUpstream + applyUpstreamAuth 分支 / refresh rebind)在
+// proxyUpstream.unit.test.ts;rewriteMetadataAccountUuid / isUuidLike 纯函数
+// 单测在 anthropicProxy.test.ts。
+describe("Phase 6 H6 — account_uuid 锚定到 OAuth 账号真 UUID(integ)", () => {
+  // 一个合法 canonical UUID(8-4-4-4-12 hex,任意版本)— 来代表回填后落库的真值
+  const REAL_ACCOUNT_UUID = "12345678-9abc-def0-1234-56789abcdef0";
+
+  test("H6.A enforce=off → hook 不跑,outbound metadata.account_uuid 保 HMAC 占位(非真 UUID)", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({
+      fetchImpl: cap.fetchImpl,
+      // phase6AccountUuidEnforce 未注入 → 默认 off
+      schedulerAccountUuid: REAL_ACCOUNT_UUID, // 即使 pick 给真值,off 也不该用
+    });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}: ${res.bodyText()}`);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const meta = sent.metadata as Record<string, unknown>;
+    const userIdObj = JSON.parse(meta.user_id as string) as Record<string, string>;
+    // off 路径:account_uuid 字段仍存在(builder HMAC 注入),但不等于真 UUID
+    assert.ok(userIdObj.account_uuid, "builder 占位应仍存在");
+    assert.notEqual(userIdObj.account_uuid, REAL_ACCOUNT_UUID,
+      "off 模式不应把真 UUID 透到上游");
+    // scheduler 未被要求 enforceAccountUuid
+    assert.equal(h.schedulerSpy.lastEnforceAccountUuid, false);
+  });
+
+  test("H6.B fail_open + pick.account_uuid=REAL_UUID → outbound metadata.account_uuid = REAL_UUID", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({
+      fetchImpl: cap.fetchImpl,
+      phase6AccountUuidEnforce: "fail_open",
+      schedulerAccountUuid: REAL_ACCOUNT_UUID,
+    });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const meta = sent.metadata as Record<string, unknown>;
+    const userIdObj = JSON.parse(meta.user_id as string) as Record<string, string>;
+    assert.equal(userIdObj.account_uuid, REAL_ACCOUNT_UUID,
+      "fail_open + 真 UUID:hook 必须用 pick.account_uuid 覆盖 builder 占位");
+    // fail_open 不在 scheduler 层 enforce
+    assert.equal(h.schedulerSpy.lastEnforceAccountUuid, false);
+  });
+
+  test("H6.B' fail_open + pick.account_uuid=null → metadata.account_uuid 保 builder 占位(hook 静默跳过)", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({
+      fetchImpl: cap.fetchImpl,
+      phase6AccountUuidEnforce: "fail_open",
+      schedulerAccountUuid: null, // 回填未跑完
+    });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200, "fail_open + null:必须 200 不阻塞");
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const meta = sent.metadata as Record<string, unknown>;
+    const userIdObj = JSON.parse(meta.user_id as string) as Record<string, string>;
+    // fail_open + null:hook 静默,builder 占位仍存在但不等于任何真 UUID
+    assert.ok(userIdObj.account_uuid, "builder 占位应仍存在");
+    assert.notEqual(userIdObj.account_uuid, REAL_ACCOUNT_UUID);
+  });
+
+  test("H6.C fail_closed + 全池 account_uuid=null → 503 POOL_UNAVAILABLE,无 release 调用", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({
+      fetchImpl: cap.fetchImpl,
+      phase6AccountUuidEnforce: "fail_closed",
+      schedulerAccountUuid: null,
+    });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 503, `应 503;status=${res.statusCode}: ${res.bodyText()}`);
+    // scheduler 被要求 enforceAccountUuid 但 pool 全 null → 抛 'no_uuid' → 503
+    assert.equal(h.schedulerSpy.lastEnforceAccountUuid, true);
+    // pool_unavailable 路径无 account 持有,scheduler.release 不应被调
+    assert.equal(h.schedulerSpy.releaseCalls.length, 0);
+  });
+
+  test("H6.C' fail_closed + pick.account_uuid=REAL_UUID → 正常 200 + 写入 metadata.account_uuid", async () => {
+    const cap = makeCapturingFetch();
+    const h = buildHarness({
+      fetchImpl: cap.fetchImpl,
+      phase6AccountUuidEnforce: "fail_closed",
+      schedulerAccountUuid: REAL_ACCOUNT_UUID,
+    });
+    const res = await h.run({ body: minBody() });
+    assert.equal(res.statusCode, 200);
+    const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+    const meta = sent.metadata as Record<string, unknown>;
+    const userIdObj = JSON.parse(meta.user_id as string) as Record<string, string>;
+    assert.equal(userIdObj.account_uuid, REAL_ACCOUNT_UUID);
+    // fail_closed 在 scheduler 层 enforce
+    assert.equal(h.schedulerSpy.lastEnforceAccountUuid, true);
+  });
+
+  test("H6.A/B keyset 形态稳定 — [account_uuid, device_id, session_id] 三必有键", async () => {
+    // 验跨多个 phase6Enforce 配置 outbound 内层 key 集合不变
+    const matrix: Array<{
+      enforce: "off" | "fail_open" | "fail_closed";
+      uuid: string | null;
+    }> = [
+      { enforce: "off", uuid: null },
+      { enforce: "off", uuid: REAL_ACCOUNT_UUID },
+      { enforce: "fail_open", uuid: null },
+      { enforce: "fail_open", uuid: REAL_ACCOUNT_UUID },
+      { enforce: "fail_closed", uuid: REAL_ACCOUNT_UUID },
+    ];
+    for (const { enforce, uuid } of matrix) {
+      const cap = makeCapturingFetch();
+      const h = buildHarness({
+        fetchImpl: cap.fetchImpl,
+        phase6AccountUuidEnforce: enforce,
+        schedulerAccountUuid: uuid,
+      });
+      const res = await h.run({ body: minBody() });
+      assert.equal(res.statusCode, 200, `case ${enforce}+${uuid ?? "null"}: 应 200`);
+      const sent = JSON.parse(cap.getBody()!) as Record<string, unknown>;
+      const meta = sent.metadata as Record<string, unknown>;
+      const userIdObj = JSON.parse(meta.user_id as string) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(userIdObj).sort(), [
+        "account_uuid",
+        "device_id",
+        "session_id",
+      ], `case ${enforce}+${uuid ?? "null"}: keyset 必恒为三必有键`);
+      await resetPool();
+      _clearMaintenanceCache();
+    }
+  });
+});

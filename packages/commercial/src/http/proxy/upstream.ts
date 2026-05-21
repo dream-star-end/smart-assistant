@@ -53,6 +53,8 @@ import {
   DEEPSEEK_UPSTREAM_ENDPOINT,
   isDeepseekModel,
   extractSessionId,
+  isUuidLike,
+  rewriteMetadataAccountUuid,
   rewriteMetadataDeviceId,
   stripMalformedThinkingBlocks,
   type ProxyBody,
@@ -207,7 +209,20 @@ export interface PickUpstreamDeps {
    * 真实 refresh 行为本身由 refresh.ts 的测试覆盖,本 seam 只验"调用边界"。
    */
   refreshAccountTokenImpl?: typeof refreshAccountToken;
+  /**
+   * Phase 6 H6 — `PHASE6_ACCOUNT_UUID_ENFORCE` 透传值。
+   *   - `off`(默认):applyUpstreamAuth account_uuid 分支早退,builder HMAC 占位透出
+   *   - `fail_open`:hook 重写非 null;null 时跳过(HMAC 占位)
+   *   - `fail_closed`:hook 强制重写;scheduler 已过滤掉 null 候选,理论上不到 null 分支
+   *
+   * 由 wiring 一次性读 `config.PHASE6_ACCOUNT_UUID_ENFORCE` 注入 — pickUpstream
+   * 内部把同值转 boolean 给 scheduler.pick({...,enforceAccountUuid}) 和闭包给
+   * makeOAuthPoolUpstream,避免热改时两处读不一致(plan §5.5.4)。
+   */
+  phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
 }
+
+type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
 
 // ─── 内部工厂 ──────────────────────────────────────────────────────────────────
 //
@@ -239,9 +254,12 @@ function makeOAuthPoolUpstream(
   pick: PickResult,
   dispatcher: Dispatcher | undefined,
   endpoint: string,
+  phase6Enforce: Phase6AccountUuidEnforce,
 ): PreparedUpstreamSession {
   // 注意 `pick` 通过闭包持有;refresh 成功后 pickUpstream 内部 **rebind** 旧引用
   // 已经被 fill(0) → 这里持有的就是新 buffer。zeroizeSecrets idempotent 由 flag 守。
+  // phase6Enforce 也通过闭包持有 — pickUpstream 入口读一次 config,确保 scheduler.pick
+  // 和 hook 拿到的是同一个值(plan §5.5.4 防止热改竞态)。
   let zeroized = false;
   return {
     accountId: pick.account_id,
@@ -270,6 +288,49 @@ function makeOAuthPoolUpstream(
           account_id: pick.account_id.toString(),
           pinned_type: typeof pinned,
         });
+      }
+      // (iv) Phase 6 account_uuid pin —— 锚定 OAuth account 真 UUID(0070 migration)。
+      //
+      //   off          → hook 不跑(builder HMAC 占位透出,deploy 1 默认值)
+      //   fail_open    → pick.account_uuid 存在则重写;NULL 时跳过(HMAC 占位透出)
+      //   fail_closed  → pickUpstream 上游已 defense-in-depth reject NULL → 这里 NULL
+      //                  分支理论不可达;若到这 = 上游逻辑被人改坏,fail-close 兜底
+      //                  (Codex round 2 MINOR 1)
+      //
+      // 脏数据(非 null 但非合法 UUID)→ 不重写 + log.warn,fail-open 防把诡异输入
+      // 推到 Anthropic 网关引发新风控。
+      if (phase6Enforce !== "off") {
+        const pinnedAcct = pick.account_uuid;
+        if (typeof pinnedAcct === "string" && isUuidLike(pinnedAcct)) {
+          body.metadata ??= {};
+          // strict=true 仅在 fail_closed:H6 invariant 强保证,malformed / 非
+          // object metadata.user_id 也强制 normalize 到 {account_uuid}。
+          // fail_open 保留客户端原值,避免诡异输入推上游引发风控。
+          // (Codex round 1 BLOCKER 1)
+          body.metadata.user_id = rewriteMetadataAccountUuid(
+            body.metadata.user_id,
+            pinnedAcct,
+            phase6Enforce === "fail_closed",
+          );
+        } else if (pinnedAcct === null) {
+          // fail_open + null → 静默跳过,符合预期(HMAC 占位透出)
+          // fail_closed + null → 上游 pickUpstream defense-in-depth 已拦,此分支
+          //   理论不可达;若到这是 H6 invariant 真被破坏,抛错让请求 500 而非静默放过,
+          //   绝不允许 fail_closed 模式下 NULL uuid 推到 Anthropic 上游。
+          if (phase6Enforce === "fail_closed") {
+            log.error("account_uuid_null_reached_apply_in_fail_closed", {
+              account_id: pick.account_id.toString(),
+            });
+            throw new Error(
+              "fail_closed invariant breach: account_uuid is null at applyUpstreamAuth",
+            );
+          }
+        } else {
+          log.warn("account_uuid_invariant_breach", {
+            account_id: pick.account_id.toString(),
+            pinned_type: typeof pinnedAcct,
+          });
+        }
       }
     },
     sanitizeMessages(messages, model, log) {
@@ -329,6 +390,11 @@ export async function pickUpstream(
     return { ok: true, session: makeDeepSeekUpstream(deps.deepseekApiKey ?? "") };
   }
 
+  // Phase 6 flag 在 OAuth 路径开头读一次,scheduler.pick + makeOAuthPoolUpstream
+  // 同值传入,避免热改时两处读不一致(plan §5.5.4)。默认 "off" — 缺 wiring 时
+  // 兜底是 Phase 5 行为,outbound 不变。
+  const phase6Enforce: Phase6AccountUuidEnforce = deps.phase6AccountUuidEnforce ?? "off";
+
   // OAuth path —— scheduler.pick
   let pick: PickResult;
   try {
@@ -336,6 +402,7 @@ export async function pickUpstream(
       mode: "chat",
       sessionId: extractSessionId(body.metadata) ?? undefined,
       model: body.model,
+      enforceAccountUuid: phase6Enforce === "fail_closed",
     });
   } catch (err) {
     if (err instanceof AccountPoolBusyError) {
@@ -345,6 +412,45 @@ export async function pickUpstream(
       return { ok: false, error: { kind: "pool_unavailable", err } };
     }
     throw err; // unknown — handler 外层 500
+  }
+
+  // Phase 6 H6 — fail_closed defense-in-depth(Codex round 2 MINOR 1):
+  //
+  // scheduler 在 enforceAccountUuid=true 时已过滤 account_uuid IS NULL 候选,理论上
+  // pick.account_uuid 必非空。但若 scheduler / hook 之间 flag 读不一致 / 未来代码
+  // 路径漂移 → race condition 可能让 NULL 漏到这里。fail_closed 必须 fail closed,
+  // 而不是 log + 继续。把 pick release + 返回 pool_unavailable("no_uuid_post_scheduler"),
+  // 复用现有 503 ACCOUNT_POOL_UNAVAILABLE 契约,index.ts 把 reason 映射到
+  // account_pool_no_uuid metric label。
+  if (phase6Enforce === "fail_closed" && pick.account_uuid === null) {
+    log.warn("account_uuid_null_post_scheduler_in_fail_closed", {
+      accountId: pick.account_id.toString(),
+    });
+    await deps.scheduler
+      .release({
+        account_id: pick.account_id,
+        result: { kind: "failure", error: "account_uuid_null_in_fail_closed" },
+      })
+      .catch(() => {
+        /* best-effort */
+      });
+    try {
+      pick.token.fill(0);
+    } catch {
+      /* ignore */
+    }
+    try {
+      pick.refresh?.fill(0);
+    } catch {
+      /* ignore */
+    }
+    return {
+      ok: false,
+      error: {
+        kind: "pool_unavailable",
+        err: new AccountPoolUnavailableError("no_uuid_post_scheduler"),
+      },
+    };
   }
 
   // pick 后到 session 返回前 —— 整段单一 preparation guard。
@@ -392,6 +498,9 @@ export async function pickUpstream(
           egress_proxy: pick.egress_proxy,
           egress_target: pick.egress_target,
           pinned_user_id: pick.pinned_user_id,
+          // Phase 6 H6.D — refresh rebind 必须显式带 account_uuid。仅依赖
+          // PickResult 字段约束不够,测试 mock/`as` 容易绕过去(Codex round 2 反馈)。
+          account_uuid: pick.account_uuid,
         };
       } catch (err) {
         // (b₁) refresh 失败:
@@ -433,7 +542,10 @@ export async function pickUpstream(
     }
 
     const endpoint = deps.upstreamEndpoint ?? DEFAULT_UPSTREAM_ENDPOINT;
-    return { ok: true, session: makeOAuthPoolUpstream(pick, dispatcher, endpoint) };
+    return {
+      ok: true,
+      session: makeOAuthPoolUpstream(pick, dispatcher, endpoint, phase6Enforce),
+    };
   } catch (err) {
     // (b₂) preparation 期任意 throw 兜底:
     //   - getDispatcherForAccount throw(plain proxy URL parse / PSK 解密 / mTLS load 等;

@@ -341,7 +341,11 @@ function buildPlatformContextText(ctx: PlatformContext | null): string {
  *
  * - device_id:占位(客户端原值或空串);applyUpstreamAuth → rewriteMetadataDeviceId
  *   后续阶段会覆盖为 pinned_user_id,这里写值只为过 proxyBodySchema 校验
- * - account_uuid:HMAC 派生,稳定 + 多机一致
+ * - account_uuid:**HMAC 派生占位**(Phase 5 语义,过 schema 校验)。Phase 6
+ *   `applyUpstreamAuth` → `rewriteMetadataAccountUuid` 会在 enforce=fail_open/fail_closed
+ *   时用 `pick.account_uuid`(OAuth account 真 UUID,0070 migration)覆盖此占位,
+ *   实现"两条路径都锚定到同一 OAuth account 的真 uuid"。`enforce=off` 时占位保留
+ *   原样透出给 Anthropic(Phase 5 行为)。
  * - session_id:服务端生成 UUID v4,**不**透传客户端 session_id(防机器画像)
  *
  * 顶层 metadata 上的 session_id(如客户端写在那)一并 strip。
