@@ -317,6 +317,32 @@ export interface CommercialHook {
       agentId?: string
     }): Promise<unknown>
   }
+  /**
+   * **v1.0.192 — cold-start guard for `/api/uploads`**(以及 commercial 内部
+   * `/api/file`、`/api/media/:file` 由 commercial router 自己直接调底层 wrapper)。
+   *
+   * `handleUpload` 在确认请求是 commercial user(userId 形如 `c:<digits>`)后,
+   * 在 `_resolveMediaDirs` 之前 await 本 hook —— 确保用户容器已 provision +
+   * volume 已挂载 + container running,再去解析 host path 并写入。否则会出现
+   * "容器尚未启动,写到 volume host path 上,容器内 agent 看不到文件" 的脏写。
+   *
+   * 与 commercial router 内部使用的 `(uid: bigint) => Promise<void>`(throw 风格)
+   * 不同,**这里返回结构化 result**:gateway 不 import commercial 的
+   * `ContainerUnreadyError`,保持 structural-only 依赖。`{ok:false}` 由 gateway
+   * 翻译成 503 + `Retry-After`,`{ok:true}` 即放行。
+   *
+   * 底层都是同一个 `sharedEnsureRunning`(per-uid singleflight),所以 WS bridge /
+   * HTTP `/api/media-signed` / commercial router file proxy / gateway upload 同
+   * uid 的 in-flight 调用会合并成一次 provision。
+   *
+   * 非 commercial 形态(`c:<digits>` 不匹配,如 personal-version userId)时 gateway
+   * 不调用本 hook —— 让 `_resolveMediaDirs` 原有 `invalid-uid` 路径继续判定。
+   */
+  ensureContainerReady?: (
+    uid: bigint,
+  ) => Promise<
+    { ok: true } | { ok: false; retryAfterSec: number; reason: string }
+  >
 }
 
 export interface GatewayDeps {
@@ -3308,6 +3334,49 @@ export class Gateway {
     // through /api/media but read-back over the wire is Phase 2; this patch
     // unblocks the write path so the in-container agent can see the file.
     const userId = this.getUserId(req)
+    // ── 3a-pre. Commercial cold-start guard (v1.0.192) ──
+    // 在解析 user-scoped uploads dir 之前确保用户容器已 provision + volume 已挂载
+    // + container running。否则会出现:`_resolveMediaDirs` 返回 ok(DB 行 active)
+    // 但 docker container 没起来 → upload 写到 volume host path → 容器内 agent
+    // 看不到文件 / 看到陈旧视图。
+    //
+    // 仅对 commercial userId(形如 `c:<digits>`,strict regex)启用,personal-version
+    // 维持原行为。malformed `c:` 前缀(非纯数字)跳过 ensure,让 `_resolveMediaDirs`
+    // 的 `invalid-uid` 路径继续判定(保住既有 401 语义)。
+    //
+    // 上界对齐 `parseCommercialUid`(userMedia.ts):commercial 的 uid 合同是
+    // `<= Number.MAX_SAFE_INTEGER`(2^53 - 1,16-17 位)—— supervisor /
+    // resolver / container proxy 全部沿用这个合同。所以这里也只在该合同内才
+    // 触发 ensure;超过(理论 19 位 abuse 输入)跳过 ensure,继续让
+    // `_resolveMediaDirs.parseCommercialUid` 把它判 invalid-uid → 401。否则
+    // ensure 内部 `makeV3EnsureRunning` 会拒绝并抛 ContainerUnreadyError("invalid_uid"),
+    // 把原本的 401 翻成 503,语义错位。
+    //
+    // 底层与 WS bridge / `/api/media-signed` / commercial router file proxy 共享
+    // 同一 `sharedEnsureRunning`(per-uid singleflight),同时刻 reload 的 burst
+    // 拉只触发一次 provision。
+    const ensure = this.deps.commercial?.ensureContainerReady
+    if (ensure && /^c:[1-9][0-9]{0,18}$/.test(userId)) {
+      const uid = BigInt(userId.slice(2))
+      if (uid <= BigInt(Number.MAX_SAFE_INTEGER)) {
+        try {
+          const r = await ensure(uid)
+          if (!r.ok) {
+            res.setHeader('Retry-After', String(r.retryAfterSec))
+            this.sendError(res, 503, `container not ready: ${r.reason}`)
+            req.destroy()
+            return
+          }
+        } catch (err) {
+          this.log.warn('handleUpload: ensureContainerReady threw', { userId }, err)
+          res.setHeader('Retry-After', '5')
+          this.sendError(res, 503, 'container not ready')
+          req.destroy()
+          return
+        }
+      }
+      // uid > MAX_SAFE_INTEGER:跳过 ensure,让 _resolveMediaDirs 路径维持 invalid-uid 401。
+    }
     const locationResult = await this._resolveMediaDirs(userId)
     let remoteUpload: {
       hostUuid: string

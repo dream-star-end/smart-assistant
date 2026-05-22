@@ -54,6 +54,7 @@ import {
   type RequestContext,
 } from './handlers.js'
 import { containerFileProxy } from './containerFileProxy.js'
+import { ContainerUnreadyError } from '../ws/userChatBridge.js'
 import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
 import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
@@ -984,6 +985,36 @@ export function createCommercialHandler(
           return true
         }
         proxyLog.info('file_proxy_dispatch', { sub: claims.sub })
+
+        // v1.0.192 冷启动护栏 —— `/api/file` + `/api/media/:file` 与
+        // `/api/media-signed` 同一底层 containerFileProxy,容器 stopped 时同样
+        // 翻 503 CONTAINER_NOT_RUNNING。这里调 deps.ensureContainerReady 触发
+        // 与 WS bridge + signed URL 共享的 sharedEnsureRunning per-uid singleflight。
+        // 时机:user active DB 校验通过后(避免给无权 / admin / 无 token 用户白
+        // 触发 docker provision)。admin / 无 token 已在上面分支 fall through。
+        if (deps.ensureContainerReady) {
+          try {
+            await deps.ensureContainerReady(BigInt(claims.sub))
+          } catch (err) {
+            if (err instanceof ContainerUnreadyError) {
+              sendError(
+                res,
+                503,
+                'CONTAINER_UNREADY',
+                `container not ready: ${err.reason}`,
+                requestId,
+                undefined,
+                { 'Retry-After': err.retryAfterSec },
+              )
+              incrGatewayRequest('__file_proxy__', method, res.statusCode)
+              return true
+            }
+            handleError(err, res, requestId, proxyLog)
+            incrGatewayRequest('__file_proxy__', method, res.statusCode)
+            return true
+          }
+        }
+
         const ctx: RequestContext = {
           requestId,
           clientIp: clientIpOf(req),

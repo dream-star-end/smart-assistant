@@ -312,6 +312,24 @@ export interface RegisterCommercialResult {
    */
   isUserVolumeMediaPath?: (resolvedPath: string) => boolean;
   /**
+   * v1.0.192 — 给 gateway `handleUpload` 在写 user docker volume 之前用的
+   * 冷启动护栏。**结构化返回**(不抛 ContainerUnreadyError),让 gateway 保持
+   * 零编译期依赖 commercial 子模块的边界(server.ts 头部明确注释:不 import
+   * @openclaude/commercial)。
+   *
+   * 其他 error(DB 抖 / docker daemon 不可达 / supervisor wired-but-broken)
+   * 仍然 throw,gateway 端 catch 后兜底 503。
+   *
+   * 共享同一 per-uid singleflight(与 commercial 内部 `/api/media-signed` +
+   * WS bridge 同闭包),reload 时不会让 upload 路径成为 DB INSERT race 输家。
+   *
+   * 未注入(agentRuntime 没起 / v3Deps 缺) → gateway 直接跳过冷启动护栏,
+   * 走原 `_resolveMediaDirs` 行为(personal/legacy 单租户路径)。
+   */
+  ensureContainerReady?: (
+    uid: bigint,
+  ) => Promise<{ ok: true } | { ok: false; retryAfterSec: number; reason: string }>;
+  /**
    * 2026-05-16 hotfix — remote-host upload push hook。
    *
    * 当 `resolveUserMediaDirs(userId)` 返回 `{kind:"fail", reason:"remote-host",
@@ -2396,6 +2414,28 @@ export async function registerCommercial(
     // textual 谓词,无依赖,始终暴露 —— 仅供 orphan sweep 启动时按目录壳子
     // 迭代 user volumes 用。**不要**给 HTTP allowlist 用(cross-tenant IDOR)。
     isUserVolumeMediaPath,
+    // v1.0.192 冷启动护栏 hook for gateway handleUpload。
+    // 共享 sharedEnsureRunning 同一 per-uid singleflight(详见 line 1655 装配处)。
+    // **结构化返回**:不把 ContainerUnreadyError 穿过 gateway 边界(后者零编译期
+    // 依赖 commercial,见 server.ts 头部注释),把已知冷启动 "未就绪" 拍平成
+    // 普通对象;其他 error(DB / docker daemon 抖)继续 throw 让 gateway 兜底 500。
+    ensureContainerReady: sharedEnsureRunning
+      ? async (uid) => {
+          try {
+            await sharedEnsureRunning(uid);
+            return { ok: true as const };
+          } catch (err) {
+            if (err instanceof ContainerUnreadyError) {
+              return {
+                ok: false as const,
+                retryAfterSec: err.retryAfterSec,
+                reason: err.reason,
+              };
+            }
+            throw err;
+          }
+        }
+      : undefined,
     // remote-host media push hook(2026-05-16 hotfix):用户容器调度到 remote
     // compute host 时,master 收到 /api/uploads → 本地暂存 → 调本 hook 把字节
     // 推到 host 上的 docker volume(/var/lib/docker/volumes/oc-v3-data-u<uid>/
