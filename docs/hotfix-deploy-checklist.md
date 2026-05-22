@@ -1,8 +1,13 @@
-# Hotfix 上线检查清单 (commercial-v3)
+# Hotfix 上线检查清单 (kl-mirror)
 
-> 用户报"现网坏了"时,从看到截图到 commercial-v3 跑上新版本,目标 **15 分钟内**。
+> 用户报"现网坏了"时,从看到截图到 kl-mirror 跑上新版本,目标 **15 分钟内**。
 > 本清单基于 2026-05-16 Phase 2 read-path 修复中踩到的坑总结,每条都有
 > 真实事故出处。
+>
+> **2026-05-23 更新**:v3 master 已从 Tokyo (`commercial-v3` / 34.146.172.239)
+> 切换到 KL (`kl-mirror` / 154.193.246.236),全文 ssh 目标改为 `kl-mirror`。
+> Tokyo `commercial-v3` 是 ex-master,`openclaude.service` inactive+disabled,
+> 不是 deploy 目标。218 hot standby(同 DC)由独立流程同步,不在本清单。
 
 ---
 
@@ -11,9 +16,9 @@
 **反模式**: 看到截图就开 IDE 改代码。多花 90 秒诊断能节省 30 分钟瞎修。
 
 ```bash
-# 在 commercial-v3 上
+# 在 kl-mirror 上
 scripts/diagnose-user.sh <uid> --minutes=15
-scripts/diagnose-user.sh <uid> --probe-node-agent  # 如果是 remote host
+scripts/diagnose-user.sh <uid> --probe-node-agent  # remote host(注:node-agent 当前 dormant,见 Step 4 坑 4.2)
 ```
 
 输出会告诉你:
@@ -29,11 +34,11 @@ scripts/diagnose-user.sh <uid> --probe-node-agent  # 如果是 remote host
 
 ## Step 1 — 在 sg dev 上 reproduce + 改代码 + 单测 (5-10 分钟)
 
-不要直接在 commercial-v3 改。sg dev 实例同源镜像,代码可直接改。
+不要直接在 kl-mirror 改。sg dev 实例同源镜像,代码可直接改。
 
 ```bash
 cd /opt/openclaude/openclaude-v3
-# 改 go 源
+# 改 go 源(注:node-agent 当前 dormant,见 Step 4 坑 4.2;改源码 prod 无效)
 vim packages/commercial/node-agent/internal/files/files.go
 # 改 ts 源
 vim packages/gateway/src/...
@@ -45,7 +50,7 @@ cd packages/commercial/node-agent && go test ./...
 cd /opt/openclaude/openclaude-v3 && npm run test --workspace=packages/gateway
 ```
 
-**坑 1.1**: commercial-v3 上**没装 Go**(它是 runtime host,不是 builder)。
+**坑 1.1**: kl-mirror 上**没装 Go**(它是 runtime host,不是 builder)。
 任何 node-agent 重编都得在 sg 上做,别想着 ssh 过去现编。
 
 ```bash
@@ -97,7 +102,7 @@ env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
 
 ---
 
-## Step 4 — 部署到 commercial-v3 (3-5 分钟)
+## Step 4 — 部署到 kl-mirror (3-5 分钟)
 
 ```bash
 # 同样的 proxy 处理
@@ -112,36 +117,30 @@ deploy-v3.sh 会**拒绝部署**。判断:
 
 `--force` 不能滥用 —— boss 历史上对"打断在线用户"很反感,要先权衡。
 
-**坑 4.2 — node-agent binary 不在 deploy-v3.sh 范围内**:
-deploy-v3.sh 只发 master 侧 (gateway / web / commercial)。**所有跑 node-agent 的
-remote host 的 binary 必须单独 rollout**。
+**坑 4.2 — node-agent 当前 dormant**(2026-05-23 起):
+- self-host 主进程内嵌 node-agent,不跑独立进程
+- boheyun-1 已废弃,用户卷已整合到 KL self host(2026-05-22)
+- 当前 `compute_hosts` 表中**无任何 host 在跑独立 node-agent → 0 实例**
+- rollout 脚本已归档到 `scripts/archive/rollout-node-agent.ts`,日常 hotfix 不会用到
 
-```bash
-# 在 commercial-v3 上,跑 rollout 脚本
-DATABASE_URL=... OPENCLAUDE_KMS_KEY=... \
-  npx tsx scripts/rollout-node-agent.ts /path/to/node-agent
-```
+如果你改了 `packages/commercial/node-agent/*.go` 源码,**prod 无任何运行时效果**;
+源码改动只是为未来重启用 node-agent 模式留底。
 
-**坑 4.3 — KMS key**: rollout 脚本需要 `OPENCLAUDE_KMS_KEY` 来解 ssh 密码。
-key 在 `/etc/openclaude/commercial.env`。**不要** `source` 整个文件到当前 shell
-(把所有密钥拉进环境太脏),只 export 单独那个变量:
+如果未来真要重启用,需:
+1. 把脚本从 archive 取回 `scripts/`
+2. 在 KL self 上重新装 Go builder(KMS key 仍在 `/etc/openclaude/commercial.env`)
+3. 走 `OPENCLAUDE_KMS_KEY=$(grep ^OPENCLAUDE_KMS_KEY ... ) DATABASE_URL=... npx tsx ...` 同当年命令
 
-```bash
-OPENCLAUDE_KMS_KEY=$(grep ^OPENCLAUDE_KMS_KEY /etc/openclaude/commercial.env | cut -d= -f2-) \
-  DATABASE_URL=... \
-  npx tsx scripts/rollout-node-agent.ts /path/to/node-agent
-```
-
-**坑 4.4 — 先查 placement 再决定要不要 rollout**:
-如果出问题的用户容器都在 self,根本不需要 rollout binary 到 boheyun-1 / 别的 host。
-diagnose-user.sh 第一步就能告诉你这点。
+**坑 4.3 — 先查 placement 再决定排查方向**:
+diagnose-user.sh 第一步告诉你用户容器在哪台 host。当前几乎全是 KL self,
+排错路径几乎不涉及 remote host pool。
 
 ---
 
 ## Step 5 — Smoke + 现场验证 (2 分钟)
 
 ```bash
-# commercial-v3 上
+# kl-mirror 上
 bash scripts/smoke-v3.sh   # 5/5 必须过
 
 # 然后立刻 ping 报错的用户
@@ -155,11 +154,10 @@ scripts/diagnose-user.sh <uid> --minutes=2
 
 ## 反模式 / 不要做
 
-- ❌ 在 commercial-v3 上直接 vim 改代码 → 没有 git,改完 deploy 一覆盖就丢
+- ❌ 在 kl-mirror 上直接 vim 改代码 → 没有 git,改完 deploy 一覆盖就丢
 - ❌ `source /etc/openclaude/commercial.env` 全文件 → 太多 secret 进环境
 - ❌ 跳过 Codex 评审"先救火" → 救完火往往要回滚
 - ❌ deploy 后不跑 smoke → smoke 5 秒,事故 5 小时
-- ❌ 只在 self 改了 binary 但没 rollout → 用户去到 remote host 还是旧版
 - ❌ 看到 503/404 就改代码 → 先看 placement,可能是用户容器根本没起来
 - ❌ 改测试断言去配合 stale 行为 → 看 isFileAllowed 等权威源真实当前行为,反过来调测试
 
@@ -179,5 +177,5 @@ scripts/diagnose-user.sh <uid> --minutes=2
 
 - `scripts/diagnose-user.sh` — 用户级现场快照 (Step 0)
 - `scripts/smoke-v3.sh` — 部署后 sanity (Step 5)
-- `scripts/rollout-node-agent.ts` — node-agent binary 多机分发 (Step 4)
 - `scripts/deploy-v3.sh` — master 侧部署 (Step 4)
+- `scripts/archive/rollout-node-agent.ts` — **dormant**(归档,见 Step 4 坑 4.2)
