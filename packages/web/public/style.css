@@ -2869,6 +2869,45 @@ a:hover {
 .doc-card:hover {
   background: var(--bg-hover);
 }
+/* PDF doc-card 兜底"新标签页打开"按钮容器(markdown.js _renderLocalMedia PDF 分支)。
+   wrapper 接管 inline-flex + margin,内部 .doc-card margin 归零 —— 否则 anchor 原
+   margin: 6px 0 仍在 wrapper 内部生效,sibling button 按 align-items:stretch 撑到
+   anchor + margin 总高,视觉上"按钮比卡片高一截"。
+   vertical-align: middle 让 wrapper 在 markdown paragraph 的 inline flow 里跟周围
+   行内文本对齐(默认 baseline 会被 inline-flex 内子项 baseline 拖低)。 */
+.doc-card-wrap {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 4px;
+  margin: 6px 0;
+  vertical-align: middle;
+}
+.doc-card-wrap .doc-card {
+  margin: 0;
+}
+/* open button 默认常驻可见 —— 移动端没有 hover,这是华为/Quark 用户的唯一兜底路径,
+   不能默认隐藏。视觉上跟 .doc-card 同 border-radius 让 wrapper 形成连续观感。 */
+.doc-card-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-raised);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 0 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s;
+}
+.doc-card-open:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.doc-card-open svg {
+  width: 16px;
+  height: 16px;
+}
 /* doc-card 签名 URL 异步注入期间的"准备中"反馈 — main.js click handler 加 class,
    pointer-events:none 防用户连点重复触发 signMediaPath */
 .doc-card-pending {

@@ -3,11 +3,11 @@
 // This file exports nothing; it IS the application.
 
 // ── DOM utilities ──
-import { $, _isMac, _isMobileUA, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=9b7fca24'
-import { getLastFlushDiagForPath, invalidateSignCache, signMediaPath } from './mediaSign.js?v=9b7fca24'
+import { $, _isMac, _isMobileUA, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=0496ca0e'
+import { getLastFlushDiagForPath, invalidateSignCache, signMediaPath } from './mediaSign.js?v=0496ca0e'
 
 // ── Pure utilities ──
-import { formatSize, msgId, shortTime } from './util.js?v=9b7fca24'
+import { formatSize, msgId, shortTime } from './util.js?v=0496ca0e'
 
 // ── App state ──
 import {
@@ -18,7 +18,7 @@ import {
   setSending,
   state,
   tryEnqueueOffline,
-} from './state.js?v=9b7fca24'
+} from './state.js?v=0496ca0e'
 
 // ── API layer ──
 import {
@@ -33,22 +33,22 @@ import {
   scheduleProactiveRefresh,
   silentRefresh,
   snapshotDiagnostics,
-} from './api.js?v=9b7fca24'
+} from './api.js?v=0496ca0e'
 
 // ── IndexedDB ──
-import { dbDelete, dbGetAll, onIdbUnavailable } from './db.js?v=9b7fca24'
+import { dbDelete, dbGetAll, onIdbUnavailable } from './db.js?v=0496ca0e'
 
 // ── Cross-device sync ──
-import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=9b7fca24'
+import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=0496ca0e'
 
 // ── Diagnostic trace (d1193355375 "已读但无回复" instrumentation) ──
-import { flushTrace, trace } from './trace.js?v=9b7fca24'
+import { flushTrace, trace } from './trace.js?v=0496ca0e'
 
 // ── Theme ──
-import { applyTheme, cycleTheme, setToastFn } from './theme.js?v=9b7fca24'
+import { applyTheme, cycleTheme, setToastFn } from './theme.js?v=0496ca0e'
 
 // ── Markdown / rich rendering ──
-import { _renderLocalMedia, processRichBlocks, renderMarkdown } from './markdown.js?v=9b7fca24'
+import { _renderLocalMedia, processRichBlocks, renderMarkdown } from './markdown.js?v=0496ca0e'
 
 // ── UI helpers ──
 import {
@@ -58,16 +58,16 @@ import {
   openModal,
   toast,
   toastOptsFromError,
-} from './ui.js?v=9b7fca24'
+} from './ui.js?v=0496ca0e'
 
 // ── Attachments ──
-import { addFiles, clearAttachments } from './attachments.js?v=9b7fca24'
+import { addFiles, clearAttachments } from './attachments.js?v=0496ca0e'
 
 // ── Speech recognition ──
-import { setAutoResize, toggleVoice } from './speech.js?v=9b7fca24'
+import { setAutoResize, toggleVoice } from './speech.js?v=0496ca0e'
 
 // ── Notifications ──
-import { refreshDocumentTitle, setTitleBusy } from './notifications.js?v=9b7fca24'
+import { refreshDocumentTitle, setTitleBusy } from './notifications.js?v=0496ca0e'
 
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
@@ -78,31 +78,31 @@ import {
   mintSessionCookie,
   setMode as setAuthMode,
   onLoginSuccess as setAuthSuccessHandler,
-} from './auth.js?v=9b7fca24'
-// ?v=9b7fca24 bust: websocket.js now imports billing.js for refreshBalance() after
+} from './auth.js?v=0496ca0e'
+// ?v=0496ca0e bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=9b7fca24'
-import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=9b7fca24'
-import { startInbox, stopInbox } from './inbox.js?v=9b7fca24'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=0496ca0e'
+import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=0496ca0e'
+import { startInbox, stopInbox } from './inbox.js?v=0496ca0e'
 // ── OAuth ──
-import { initOAuthListeners, openOAuthModal } from './oauth.js?v=9b7fca24'
+import { initOAuthListeners, openOAuthModal } from './oauth.js?v=0496ca0e'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { openApiKeysModal } from './apiKeys.js?v=9b7fca24'
-import { initUsageStats, openUsageModal } from './usageStats.js?v=9b7fca24'
+import { openApiKeysModal } from './apiKeys.js?v=0496ca0e'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=0496ca0e'
 import {
   clearUserPrefsCache,
   initUserPrefs,
   loadUserPrefs,
   openPrefsModal,
   setOnPrefsChanged,
-} from './userPrefs.js?v=9b7fca24'
-import { initWechatListeners, openWechatModal } from './wechat.js?v=9b7fca24'
+} from './userPrefs.js?v=0496ca0e'
+import { initWechatListeners, openWechatModal } from './wechat.js?v=0496ca0e'
 
 // ── Memory & Skills ──
-import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=9b7fca24'
+import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=0496ca0e'
 
 // ── Phase 6 GitHub repo binding ──
 import {
@@ -112,10 +112,10 @@ import {
   openGithubModal,
   refreshGithubPill,
   wireGithubModalButtons,
-} from './github.js?v=9b7fca24'
+} from './github.js?v=0496ca0e'
 
 // ── Scheduled tasks ──
-import { initTasksListeners, openTasksModal } from './tasks.js?v=9b7fca24'
+import { initTasksListeners, openTasksModal } from './tasks.js?v=0496ca0e'
 
 // ── Agents ──
 import {
@@ -123,7 +123,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   setRenderModelPill,
-} from './agents.js?v=9b7fca24' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=0496ca0e' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 
 // ── Sessions ──
 import {
@@ -139,7 +139,7 @@ import {
   setSessionDeps,
   setSessionUIDeps,
   switchSession,
-} from './sessions.js?v=9b7fca24'
+} from './sessions.js?v=0496ca0e'
 
 // ── Messages ──
 import {
@@ -153,7 +153,7 @@ import {
   updateMessageEl,
   updateMsgMetaEl,
   updateSessionSub,
-} from './messages.js?v=9b7fca24'
+} from './messages.js?v=0496ca0e'
 
 // ── WebSocket ──
 import {
@@ -177,7 +177,7 @@ import {
   stopCurrentTurn,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=9b7fca24'
+} from './websocket.js?v=0496ca0e'
 
 // ── Slash commands ──
 import {
@@ -190,18 +190,18 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=9b7fca24'
+} from './commands.js?v=0496ca0e'
 import {
   clearEffortOnLogout,
   getEffortForSubmit,
   initModePills,
   renderModePills,
-} from './effortMode.js?v=9b7fca24'
-import { initModelPicker, renderModelPill } from './modelPicker.js?v=9b7fca24'
+} from './effortMode.js?v=0496ca0e'
+import { initModelPicker, renderModelPill } from './modelPicker.js?v=0496ca0e'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
-// deploy where main.js?v=9b7fca24 imports a bare-URL state.js that CF still serves
+// deploy where main.js?v=0496ca0e imports a bare-URL state.js that CF still serves
 // old), this line is never reached → watchdog fires at T+15s and self-heals.
 window.__ocBooted = true
 
@@ -790,6 +790,80 @@ document.addEventListener(
   true,
 )
 
+// ── PDF doc-card 兜底:"在新标签页打开" 按钮 ──
+// 华为/Quark/UC 等国产浏览器对 `<a download>` 触发的隐式下载弹"此网站不支持下载"。
+// 兜底路径:点击 sibling open button → 浏览器以"用户主动顶层导航"接收 signed URL,
+// 绕开 `<a download>` 触发的浏览器拦截策略。
+// **不承诺**"PDF viewer 内联预览":服务端仍返回 `Content-Disposition: attachment`,
+// 华为浏览器收到 attachment 通常仍走系统下载流程,只是不再被那条 download-policy
+// 弹窗拦截;桌面 Chrome/Edge/Safari 按各自下载策略落盘。
+//
+// user activation 处理:
+//   - href 已 resolved → 同步 `window.open(url, '_blank', 'noopener,noreferrer')`,
+//     不需要保留窗口句柄,带 noopener+noreferrer 让新 tab 完全脱钩(防 reverse tabnabbing)。
+//   - href 未 resolved → 同步预开 `window.open('about:blank', '_blank')`(**不能**带
+//     noopener/noreferrer:HTML 标准规定 noreferrer 隐含 noopener,后者会让 `window.open`
+//     返回 null 拿不到 popup 句柄,无法 .replace() 导航)。手动 `popup.opener = null`
+//     兜 reverse-tabnabbing。然后 await 签名 → `popup.location.replace(url)`。
+//     签名期间用户可能手动关掉空白 tab,replace/close 都包在 try 里。
+//   - 弹窗被拦 / 签名失败 → toast 提示。
+//
+// 不复用上面的 doc-card capture handler:那个写 anchor `.href` + native click 模式
+// 与这里"预开 tab + later navigate"逻辑分歧,合并会让两条路径互相干扰。
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest?.('.doc-card-open')
+  if (!btn) return
+  e.preventDefault()
+
+  const cachedHref = btn.dataset.openHref
+  if (cachedHref) {
+    window.open(cachedHref, '_blank', 'noopener,noreferrer')
+    return
+  }
+
+  // 必须同步打开,await 之后再 open 会丢 user activation。
+  const popup = window.open('about:blank', '_blank')
+  if (!popup) {
+    toast('请允许弹窗后重试')
+    return
+  }
+  try {
+    popup.opener = null
+  } catch {
+    // 部分浏览器不允许写 opener;失败容忍,继续走签名流程
+  }
+
+  const absPath = btn.dataset.pendingSignPath
+  if (!absPath) {
+    try {
+      popup.close()
+    } catch {}
+    return
+  }
+
+  try {
+    const url = await signMediaPath(absPath, { interactive: true })
+    if (!url) {
+      try {
+        popup.close()
+      } catch {}
+      toast('下载链接获取失败,请重试')
+      return
+    }
+    try {
+      popup.location.replace(url)
+    } catch {
+      // popup 可能已被用户关掉,replace 抛 SecurityError;静默 toast 提示
+      toast('打开新标签失败,请重试')
+    }
+  } catch {
+    try {
+      popup.close()
+    } catch {}
+    toast('下载链接获取失败,请重试')
+  }
+})
+
 // ── Escape key: close modals, lightbox, palette ──
 document.addEventListener('keydown', (e) => {
   // IME 期 Esc 优先让给输入法取消候选,避免误关 palette/modal
@@ -832,12 +906,30 @@ initMessagesListeners()
 //      触发"removed/added",所以不会自递归。
 //   4. signMediaPath 永远 resolve(不 reject),失败 → null,转 failed 状态,
 //      让 UI 保持占位而非 churning。
+// 写入签名 URL 的所有支持目标 —— 显式分支,避免新增 target 时回到属性名字符串猜测。
+//   - 'href'      → el.href = url(<a>)
+//   - 'open-href' → el.dataset.openHref = url(PDF doc-card 的 sibling open button,
+//                   click handler 读 dataset 同步开 tab,不直接当 navigation source)
+//   - 默认        → el.src = url(<img>/<audio>/<video>)
+function _applySignedUrl(el, url) {
+  switch (el.dataset.signTarget) {
+    case 'href':
+      el.href = url
+      break
+    case 'open-href':
+      el.dataset.openHref = url
+      break
+    default:
+      el.src = url
+      break
+  }
+}
+
 function _resolveSignTarget(el) {
   if (!el || el.nodeType !== 1) return
   const state = el.dataset.signState
   if (state === 'inflight' || state === 'resolved') return
   const absPath = el.dataset.pendingSignPath
-  const target = el.dataset.signTarget === 'href' ? 'href' : 'src'
   if (!absPath) return
   el.dataset.signState = 'inflight'
   signMediaPath(absPath).then((url) => {
@@ -846,7 +938,7 @@ function _resolveSignTarget(el) {
       return
     }
     try {
-      el[target] = url
+      _applySignedUrl(el, url)
       // <img> 同 wrap 内的 copy/download/open 按钮要用真 URL —— 同步更新它们的
       // data-img-src,否则用户点 "下载" 还在下占位 PNG。
       const wrap = el.closest?.('.media-wrap')
@@ -910,6 +1002,8 @@ function _installSignedMediaErrorRetry() {
       if (!t || t.nodeType !== 1) return
       const tag = t.tagName
       if (tag !== 'IMG' && tag !== 'AUDIO' && tag !== 'VIDEO' && tag !== 'A') return
+      // 注:open-href 走的是 BUTTON,上面 tag gate 已经把它排除在外。
+      // 不需要额外 sign-target 检查 —— 这里到达的一定是 img/audio/video/a。
       const absPath = t.dataset?.pendingSignPath
       if (!absPath) return
       // 只重试签名 URL(/api/media-signed?...);其他错误(网络断、CORS 等)放过。
@@ -941,7 +1035,7 @@ function _installSignedMediaErrorRetry() {
           return
         }
         try {
-          t[target] = url
+          _applySignedUrl(t, url)
           const wrap = t.closest?.('.media-wrap')
           if (wrap) {
             wrap.querySelectorAll('[data-img-src]').forEach((btn) => {
