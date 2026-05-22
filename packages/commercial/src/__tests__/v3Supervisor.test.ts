@@ -551,18 +551,28 @@ describe("provisionV3Container", () => {
     assert.match(tmp, /nodev/);
     assert.match(tmp, /mode=0700/);
 
-    // 5 volume binds(D2 持久化方案):
+    // 7 条 bind(D2 持久化方案 + codex-auth ro + ssh-user-run ro):
     //   data       → /home/agent/.openclaude
     //   projects   → /run/oc/claude-config/projects
     //   codex      → /home/agent/.codex
     //   userlocal  → /home/agent/.local
     //   userconfig → /home/agent/.config
+    //   codex-auth → /run/oc/codex-auth  (legacy fallback:本测试无 DATABASE_URL → pickCodex 抛错 →
+    //                                    boundCodexAccountId=null → 走 else if (!useRemote) 分支,
+    //                                    codexMountSource = DEFAULT_V3_CODEX_CONTAINER_DIR)
+    //   ssh        → /run/ccb-ssh        (本地 provision 总会 mkdir /run/ccb-ssh/u<uid> + 挂 ro,
+    //                                    让容器内 agent 走 ctl.sock 用 ccb ssh mux)
+    // 任一项改动 → 同步 v3supervisor.ts:1755-1764(base 5) / :1881(codex-auth) / :1889(ssh)
     assert.deepEqual(opts.HostConfig?.Binds, [
       `oc-v3-data-u777:${V3_VOLUME_MOUNT}:rw`,
       `oc-v3-proj-u777:${V3_PROJECTS_MOUNT}:rw`,
       `oc-v3-codex-u777:${V3_CODEX_HOME_MOUNT}:rw`,
       `oc-v3-userlocal-u777:${V3_USER_LOCAL_MOUNT}:rw`,
       `oc-v3-userconfig-u777:${V3_USER_CONFIG_MOUNT}:rw`,
+      // DEFAULT_V3_CODEX_CONTAINER_DIR + V3_CODEX_AUTH_RO_MOUNT(literal 保持测试自证)
+      "/var/lib/openclaude-v3/codex-container-auth:/run/oc/codex-auth:ro",
+      // V3_SSH_RUN_ROOT_HOST/u<uid> + V3_SSH_RUN_CONTAINER_MOUNT(常量未 export,literal)
+      "/run/ccb-ssh/u777:/run/ccb-ssh:ro",
     ]);
 
     // restart no
@@ -1254,6 +1264,21 @@ describe("stopAndRemoveV3Container", () => {
 // ───────────────────────────────────────────────────────────────────────
 
 describe("getV3ContainerStatus", () => {
+  // 第 2 / 第 5 个 sub-test 会调 provisionV3Container 顺手起一行;OC_V3_CCB_BASELINE_OPTIONAL
+  // 必须置 "1" 让 baseline 缺失走 warn+skip,否则 provision 抛 CcbBaselineMissing。基线本身
+  // 不是本 describe 关心范围(那是上面 `provisionV3Container — CCB baseline 挂载分支`),所以
+  // 这里复用「OPTIONAL=1 屏蔽」模式,跟 `provisionV3Container` / `per-host max_containers cap`
+  // 两个 describe 一致(:447-452 / :1372-1377)。
+  let prevOptional: string | undefined;
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+  });
+
   test("无 row → null", async () => {
     const { docker } = makeDocker();
     const pool = new FakePool();
@@ -2478,7 +2503,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
     assert.equal(captured.containersCreated.length, 0);
   });
 
-  test("baseline 缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn 并继续(5 条 volume Binds)", async () => {
+  test("baseline 缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn 并继续(7 条 Binds:5 volume + codex-auth + ssh,无 baseline ro)", async () => {
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
     const { docker, captured } = makeDocker();
     await provisionV3Container(
@@ -2493,17 +2518,20 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
       124,
     );
     const opts = captured.containersCreated[0]!;
-    // D2 全套 5 条 volume bind(没追加 baseline ro)
+    // D2 全套 5 条 volume bind + codex-auth legacy ro + ssh-user-run ro,不追加 baseline ro
+    // (baselineMounts=null 因为 OPTIONAL=1 + 假目录)
     assert.deepEqual(opts.HostConfig?.Binds, [
       `oc-v3-data-u124:${V3_VOLUME_MOUNT}:rw`,
       `oc-v3-proj-u124:${V3_PROJECTS_MOUNT}:rw`,
       `oc-v3-codex-u124:${V3_CODEX_HOME_MOUNT}:rw`,
       `oc-v3-userlocal-u124:${V3_USER_LOCAL_MOUNT}:rw`,
       `oc-v3-userconfig-u124:${V3_USER_CONFIG_MOUNT}:rw`,
+      "/var/lib/openclaude-v3/codex-container-auth:/run/oc/codex-auth:ro",
+      "/run/ccb-ssh/u124:/run/ccb-ssh:ro",
     ]);
   });
 
-  test("(root only) baseline 齐全 → 7 条 Binds(5 volume + CLAUDE.md + skills 父目录)", async () => {
+  test("(root only) baseline 齐全 → 9 条 Binds(5 volume + codex-auth + ssh + CLAUDE.md + skills 父目录)", async () => {
     const b = makeFakeBaseline();
     if (!b) return; // 非 root 跳过
     try {
@@ -2520,12 +2548,15 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
         125,
       );
       const opts = captured.containersCreated[0]!;
+      // 顺序匹配 v3supervisor.ts:1755-1764(base 5) → :1881(codex-auth) → :1889(ssh) → :1892-1904(baseline)
       assert.deepEqual(opts.HostConfig?.Binds, [
         `oc-v3-data-u125:${V3_VOLUME_MOUNT}:rw`,
         `oc-v3-proj-u125:${V3_PROJECTS_MOUNT}:rw`,
         `oc-v3-codex-u125:${V3_CODEX_HOME_MOUNT}:rw`,
         `oc-v3-userlocal-u125:${V3_USER_LOCAL_MOUNT}:rw`,
         `oc-v3-userconfig-u125:${V3_USER_CONFIG_MOUNT}:rw`,
+        "/var/lib/openclaude-v3/codex-container-auth:/run/oc/codex-auth:ro",
+        "/run/ccb-ssh/u125:/run/ccb-ssh:ro",
         `${pathJoin(b.dir, "CLAUDE.md")}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
         // 挂 skills/ 整目录;父目录 ro 一次性覆盖所有基线 skill,
         // 新增基线 skill 不改这里,只加一条 V3_CCB_BASELINE_SKILL_NAMES 即可。
