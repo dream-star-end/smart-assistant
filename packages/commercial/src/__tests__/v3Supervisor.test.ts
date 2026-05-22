@@ -512,6 +512,14 @@ describe("provisionV3Container", () => {
       env.includes("OC_SEED_DEFAULT_CRON=0"),
       "supervisor must inject OC_SEED_DEFAULT_CRON=0 to skip personal-version default cron seeding",
     );
+    // v1.0.193 — 切容器内 gateway /api/file ACL 到 trusted-backend 模式。
+    // 没注入 => /api/file 退化到严白名单,boss/客户的 hello.txt 等 cwd 产物
+    // 又会 403。**任何往 FILE_BLOCKED_PATTERNS 加 master 注入敏感路径的 PR
+    // 必须同时来这里核对** —— env 不能被偷偷拿走。
+    assert.ok(
+      env.includes("OC_V3_TRUSTED_FILE_SERVE=1"),
+      "supervisor must inject OC_V3_TRUSTED_FILE_SERVE=1 so container gateway uses blocklist-only ACL (see packages/gateway/src/server.ts isFileAllowed trusted branch)",
+    );
 
     // 网络 + IP forced via IPAMConfig
     assert.equal(opts.HostConfig?.NetworkMode, V3_NETWORK_NAME);

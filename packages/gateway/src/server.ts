@@ -7433,6 +7433,24 @@ const COMMERCIAL_USER_VOLUME_MEDIA_GATE =
   /^\/var\/lib\/docker\/volumes\/oc-v3-data-u\d+\/_data\/(uploads|generated)(\/|$)/
 
 /**
+ * v3 trusted backend mode — agent OS user home root inside the per-user docker
+ * container. Hardcoded by container image contract (entrypoint creates this
+ * user; v3supervisor mounts the user volume to `/home/agent/.openclaude/`).
+ * Used only by the trusted branch of `isFileAllowed`; legacy/personal-version
+ * code never references this constant.
+ */
+const TRUSTED_CONTAINER_HOME = '/home/agent'
+
+/**
+ * Call-time check (NOT a module-load const) — tests can flip the env between
+ * cases via `process.env.OC_V3_TRUSTED_FILE_SERVE = '1' / delete`.
+ * Cost is one string compare per `/api/file` request; negligible.
+ */
+export function isTrustedContainerFileServeEnabled(): boolean {
+  return process.env.OC_V3_TRUSTED_FILE_SERVE === '1'
+}
+
+/**
  * Returns true if the resolved absolute path falls within the allowlist.
  * Checked BEFORE the blocklist — if this returns false, the file is denied
  * regardless of blocklist status.
@@ -7457,8 +7475,40 @@ export function isFileAllowed(
   //    (e.g. a misconfigured agent cwd pointing at `/var/lib/docker/volumes/
   //    oc-v3-data-uX/_data`). The predicate captures the **current** user's
   //    resolved {uploads, generated} dirs; without it, deny.
+  //
+  //    Kept BEFORE the trusted-container branch: in trusted container mode
+  //    the agent process never sees host-volume paths (it sees its own
+  //    `/home/agent/.openclaude/...` mount), so this gate is a no-op there
+  //    in practice. But keeping it ahead is fail-closed defense if anyone
+  //    ever wires a host-volume path through trusted serve by misconfig.
   if (COMMERCIAL_USER_VOLUME_MEDIA_GATE.test(resolvedPath)) {
     return Boolean(extraAllowedPredicate && extraAllowedPredicate(resolvedPath))
+  }
+  // 0b. **v3 trusted backend mode (per-user docker sandbox)** — closed-world.
+  //     The container is master-controlled; every secret/credential/state file
+  //     under the agent's home is master-injected via known volumes/symlinks
+  //     and enumerable. Agent work products may land anywhere under
+  //     `/home/agent/...` (cwd / `~/.openclaude/repos/<sess>/<ver>/output.pdf`
+  //     / user-named `~/hello.txt` / etc.), so the legacy allowlist is too
+  //     narrow and forces agent-prompt-dependent UX (the bug this fix targets).
+  //
+  //     Switch to **blocklist-only ACL, scoped to `/home/agent/**` + the
+  //     openclaude temp prefix**. Anything outside those subtrees (`/etc/*`,
+  //     `/opt/openclaude/*` runtime source, `/usr/local/lib/*`, etc.) stays
+  //     denied — the trusted bit only loosens the user's own sandbox.
+  //
+  //     The blocklist is the **single authoritative inventory of download-
+  //     sensitive container state** — see `FILE_BLOCKED_PATTERNS`. Any new
+  //     master-injected secret or container-runtime persisted state file
+  //     must add a matching pattern in the same PR (with a `security.test.ts`
+  //     case). v3supervisor.ts and entrypoint.ts cite this contract.
+  if (isTrustedContainerFileServeEnabled()) {
+    const inHome =
+      resolvedPath === TRUSTED_CONTAINER_HOME ||
+      resolvedPath.startsWith(`${TRUSTED_CONTAINER_HOME}/`)
+    const inTemp = resolvedPath.startsWith(TEMP_PREFIX)
+    if (!inHome && !inTemp) return false
+    return !isFileBlocked(resolvedPath)
   }
   // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
   for (const dir of FILE_ALLOWED_DIRS) {
@@ -7514,10 +7564,24 @@ export function makeUserScopedMediaPredicate(
     p === g || p.startsWith(g + '/')
 }
 
+/**
+ * Sensitive-file blocklist. Authoritative inventory for both:
+ *   1. personal/legacy gateway `/api/file` blocklist
+ *   2. **v3 trusted container** `/api/file` ACL (it IS the entire ACL there —
+ *      see `isFileAllowed` trusted branch and its contract comment).
+ *
+ * Adding a new master-injected secret, container-persisted runtime state file,
+ * or persistent credential location? It MUST land here in the same PR, with
+ * a matching `security.test.ts` case. Cross-references:
+ *   - v3supervisor.ts `provisionV3Container` env/mounts
+ *   - entrypoint.ts (symlinks, codex-config dir, npmrc/pip.conf user volumes)
+ *   - gateway state writers (sessions.db, msg-outbox, retry queues, webhooks)
+ */
 export const FILE_BLOCKED_PATTERNS = [
+  // ── Personal/legacy (predates v3 trusted backend). Kept verbatim. ──
   /openclaude\.json$/, // gateway config with tokens
   /\.env($|\.)/, // .env, .env.local, .env.production, .env.development, etc.
-  /credentials/, // credential directory
+  /credentials/, // credential directory (kept legacy-broad; trusted users accept rare false-positive name collisions)
   /\.ssh/, // SSH keys
   /\.key$/, // private keys
   /\.pem$/, // certificates
@@ -7531,12 +7595,74 @@ export const FILE_BLOCKED_PATTERNS = [
   /USER\.md$/, // user identity / core memory
   /CLAUDE\.md$/, // agent persona / system instructions
   /resume-map\.json$/, // session checkpoint data
-  /\.npmrc$/, // npm registry tokens
+  /\.npmrc$/, // npm registry tokens (top-level)
   /\.pypirc$/, // PyPI credentials
   /\.netrc$/, // FTP/HTTP credentials
   /\.aws\//, // AWS credentials & config directory
   /\.kube\//, // Kubernetes config directory
   /\.docker\/config\.json$/, // Docker registry credentials
+
+  // ── v1.0.193 — trusted backend inventory (Codex review v4: closed-world for v3 container). ──
+
+  // Codex auth + runtime state. `~/.codex/auth.json` is a symlink to
+  // `/run/oc/codex-auth/auth.json` (master-injected RO). `~/.codex/` also
+  // accumulates sessions/memories/sqlite state — all sensitive.
+  /\/auth\.json$/i, // filename-bound (catches both symlink and target)
+  /\/\.codex\/sessions\//, // turn-by-turn rollout transcripts
+  /\/\.codex\/memories\//, // codex persistent memory
+  /\/\.codex\/logs_[^/]*\.sqlite(-wal|-shm)?$/,
+  /\/\.codex\/state_[^/]*\.sqlite(-wal|-shm)?$/,
+  /\/\.codex\/config\.toml$/, // model/profile + api keys
+
+  // Gateway state files (SQLite + WAL/SHM, JSONL outbox, tasks store).
+  /\/sessions\.db(-wal|-shm)?$/,
+  /\/msg-outbox\.jsonl$/,
+  // taskStore atomically writes `tasks.json` (with `.tmp` swap); fields include
+  // prompt + lastOutput + execution output/error → same sensitivity class as
+  // session JSONL and outbox.
+  /\/tasks\.json(\.tmp)?$/,
+
+  // Gateway YAML configs (agents/cron/webhooks). Webhook secrets are HMAC keys.
+  /\/agents\.yaml$/,
+  /\/cron\.yaml$/,
+  /\/webhooks\.ya?ml$/,
+
+  // Gateway retry queues — server-authored sink payloads (assistant text + tool args).
+  /\/v3-master-retry\.d\//,
+  /\/v3-wechat-retry\.d\//,
+
+  // Per-agent session JSONL subtree (thinking + tool args, may embed tokens).
+  /\/\.openclaude\/agents\/[^/]+\/sessions\//,
+
+  // Git credentials (git store helper at HOME root + dedicated subdir).
+  /\/\.openclaude\/git-creds\//,
+  /\/\.git-credentials$/,
+
+  // Persistent XDG user config volume (mounted by v3supervisor V3_USER_CONFIG_MOUNT).
+  // Carries credential-bearing config for gh / git scoped / npm / pip /
+  // vscode-server / arbitrary user dotfiles — see v3supervisor.ts comment on
+  // `V3_USER_CONFIG_MOUNT`. **Deny the whole subtree** rather than chasing
+  // per-tool XDG paths: false-positives here are config files (not work
+  // products), and per-tool allowlist would force this blocklist to track the
+  // entire CLI ecosystem forever.
+  /\/\.config(\/|$)/,
+
+  // Shell history (may include accidentally-pasted credentials).
+  /\.bash_history$/,
+  /\.zsh_history$/,
+
+  // Kernel + runtime tmpfs. `/run/oc/*` (master-injected token/auth/sockets)
+  // is the primary target; `/proc` + `/sys` + `/var/run` are kept for parity.
+  /^\/(proc|sys|run|var\/run)\//,
+
+  // System /etc — agent has no write access inside container; read is 99%
+  // attack pattern (e.g. `/etc/shadow`, `/etc/sudoers`, `/etc/hostname`).
+  // Note: the trusted branch already scopes to `/home/agent/**` + temp, so
+  // this is **belt-and-suspenders** for personal/legacy + direct `/api/file`
+  // misuse. Personal/legacy already denies `/etc/*` via missing allowlist;
+  // this regex makes the intent explicit and survives any future allowlist
+  // change.
+  /^\/etc(\/|$)/,
 ]
 
 /** Returns true if the resolved path matches any sensitive-file pattern. */
