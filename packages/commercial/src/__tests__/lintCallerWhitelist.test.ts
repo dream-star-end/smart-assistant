@@ -34,6 +34,6 @@ describe("lint caller-whitelist — R6.11 FAIL2 strict mode — Phase 2 TDD plac
   );
 
   test.todo(
-    "fixture 3 (pass via whitelist): 调用文件在 RECONCILER_WHITELIST(例如 v3migrationReconciler.ts)且函数有 `// @oc-reader-entry` 标注 → 即使没 NOT EXISTS predicate 也通过(reconciler 是 docker start 单点权威,自己持有 ledger 写权,不需要 reader 闸门)",
+    "fixture 3 (pass via whitelist): 调用文件在 RECONCILER_WHITELIST(例如 v3migrationReconciler.ts)裸 SELECT(无 `// @oc-reader-entry` 标注 + 无 NOT EXISTS predicate)→ lint 仍通过(reconciler 是 docker start 单点权威,自己持有 ledger 写权,白名单文件整文件豁免 reader 闸门;**不**额外要求 annotation,annotation 只锁非白名单 reader 路径上的 ensureRunning 入口 — 见 02-DEVELOPMENT-PLAN.md:2258 三 fixture 权威定义)",
   );
 });

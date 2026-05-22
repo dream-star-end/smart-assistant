@@ -159,7 +159,7 @@ Phase 0 docs hygiene 已 merge 到 `origin/v3` (e7422383)。在准备 Phase 2 (P
 | 2c | (test) `v3EnsureRunningMigrationGuard.test.ts` 4 个红测填实 → (impl) ensureRunning LEFT JOIN agent_migrations + 503 路径 | 影响热路径,本对必须 Codex 严审 |
 | 2d | (test) `v3MigrationReconciler.test.ts` 3 个红测填实 → (impl) 新 `v3migrationReconciler.ts` 持有 docker start + routing ACK | 高风险 INV-7 ACK 重发是死角 |
 | 2e | (test) `lintCallerWhitelist.test.ts` 红 → (impl) `lintAgentContainersSql.ts` 升 R6.11 FAIL2 语义级 + RECONCILER_WHITELIST file-path | INV-1 真正落锁 |
-| 2f | (test) 改写 `v3OrphanReconcile.test.ts:286` 旧 skip 测试 → INV-10 新行为期望 → (impl) `v3orphanReconcile.ts` 翻转 NULL-cid 处理 | 行为反转,Codex 重点看 |
+| 2f | (test) 在 `v3MigrationReconciler.test.ts` 中实装 INV-10 planned 兜底新测试(phase='planned' + ledger.new_container_internal_id IS NULL + age > migrateSec → markMigration('rolled_back') + paused_at unpause;agent_containers 不动) → (impl) `v3migrationReconciler.ts` planned-phase 兜底分支。**不**翻转 `v3OrphanReconcile.test.ts:286`(那是 v2 direction-B `agent_containers.container_internal_id IS NULL` 字段,与 R6.11 ledger 的 `agent_migrations.new_container_internal_id` 是两个独立字段两条独立 sweep);新 host docker create 残留交 §3H docker orphan(独立路径)兜底 | 新增 ledger 行为,Codex 重点看 docker 侧不出现 cleanup(那是另一条 sweep) |
 | 2g | (test) `/api/agent/open` 404 + node-agent 路径 0 调用 → (impl) 源码删除 v2 dormant entry + `rollout-node-agent.ts` | Phase 0 已 archive 路径,本步删源 |
 | ~~2h~~ | **删除** — INV-9 / `v3PrewarmAckBarrier.test.ts` 从 Phase 2 完工硬门中显式 carve out。Phase 2 不要求该文件转 real test;Phase 1 创建 todo 占位;真正实施(test → impl 红绿对)迁到 **Phase 5**(warm pool 落地时)。Codex round 2 FAIL #2 修正:避免「Phase 2 不可 ship todo」与「INV-9 延后」自相矛盾 | Phase 5 工作,不阻 Phase 2 完工 |
 
