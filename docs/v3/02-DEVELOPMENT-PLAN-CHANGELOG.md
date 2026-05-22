@@ -2,7 +2,9 @@
 
 > 本文件从 `02-DEVELOPMENT-PLAN.md` 头部抽离(2026-05-23),原 1200+ 字符长行
 > 嵌头部已挪走,只在主文档保留版本号 + 状态摘要。
-> 变更内容**逐字保留**,未做编辑或简化。倒序排列(最新在上)。
+> 内容守恒抽离:文本(措辞、标点、圆圈数字、§ 段落引用、`代码标识符`、**加粗标记**)
+> 完全保留原文;仅做结构化重排——加 section 标题、在 FAIL/WARN 项之间加空行、把
+> 长串 ①②③ 列表拆成独立行,便于阅读。倒序排列(最新在上)。
 
 ---
 
@@ -19,7 +21,7 @@ R6.11.x 小补丁闭合第二十二轮 FAIL:§13.3 `tickIdleSweep` + `tickPersis
 
 ## R6.11 (从 R6.10 起,codex 第二十一轮 2 FAIL + 2 WARN 闭合)
 
-闭合 codex 第二十一轮 2 FAIL + 2 WARN —
+R6.10 → R6.11:闭合 codex 第二十一轮 2 FAIL + 2 WARN —
 
 **FAIL1** §4.2/§4.4 ws bridge / lifecycle 仍把"notExist/stopped/running"分支写在桥接层、直接 `supervisor.provision` / `supervisor.startAndWait`,与 §13.3 reader 唯一闸门冲突,实施时极易再次绕开 ledger 检查 → R6.11 把 §4.2/§4.4 全改为"桥接层唯一入口 = `await supervisor.ensureRunning(uid)`",分支下沉到 `ensureRunning` 内部子路径;
 
@@ -51,7 +53,7 @@ R6.10 闭合:
 
 **原 R6.8 → R6.9 闭合内容(已稳定,保留)**: 闭合 codex 第十九轮 2 FAIL —
 
-**FAIL1** R6.8 `agent_migrations` ledger INSERT 落点过晚 + schema 跨节漏同步:R6.8 把 INSERT 放在 §14.2.4 ⑤bis(`docker create` **之后**),意味着 ③ pause + ⑤ docker create 与 ⑤bis 之间任一秒崩(pause-then-crash / create-then-crash)留下"旧 paused 容器 + 可能的新 created-not-started 孤儿 + PG `agent_containers.state` 仍 'active' + 无 ledger 行"的死区,§14.2.6 reconciler 既找不到 `pending_apply/draining` 也找不到 ledger 完全无信号可救;且 0019 schema 仅在 §14.2.6 局部叙述出现,从未进 §2.5 迁移表 + §6 schema 总览,落地时极易漏掉。
+FAIL1 R6.8 `agent_migrations` ledger INSERT 落点过晚 + schema 跨节漏同步:R6.8 把 INSERT 放在 §14.2.4 ⑤bis(`docker create` **之后**),意味着 ③ pause + ⑤ docker create 与 ⑤bis 之间任一秒崩(pause-then-crash / create-then-crash)留下"旧 paused 容器 + 可能的新 created-not-started 孤儿 + PG `agent_containers.state` 仍 'active' + 无 ledger 行"的死区,§14.2.6 reconciler 既找不到 `pending_apply/draining` 也找不到 ledger 完全无信号可救;且 0019 schema 仅在 §14.2.6 局部叙述出现,从未进 §2.5 迁移表 + §6 schema 总览,落地时极易漏掉。
 
 R6.9 闭合:
 ① §14.2.4 把 INSERT 提前到 ① pickHost 之后立即跑(`§14.2.4 ①bis`,在所有 rsync/freeze/create 之前),并新增 `planned` 作为最早 phase(7 改 8 phase);
@@ -62,7 +64,7 @@ R6.9 闭合:
 ⑥ §6 schema 列表加 `agent_migrations` 一行;
 ⑦ §9.6 6G 加 ⑭quad / ⑭quint 两个 e2e 注入测试覆盖 pause-then-crash / create-then-crash;
 
-**FAIL2** §9.6 ⑭bis/⑭ter 与 §14.2.4 / §14.2.6 phase/state/ACK 契约三处口径不一致:
+FAIL2 §9.6 ⑭bis/⑭ter 与 §14.2.4 / §14.2.6 phase/state/ACK 契约三处口径不一致:
 (i) ⑭bis(a) 写 phase='created' 但实际 ⑥a 同事务推进到 'detached',测试断言定义本身就错;
 (ii) ⑭ter 老版说 ⑥f 超时回滚到 `pending_apply` + ledger 'attached_route',但 §14.2.6 attached_route 恢复路径直接 docker start + commit,不经过 routing ACK 屏障 → "创建未应用就不放流量"主契约被打穿;
 (iii) §14.2.4 generic rollback 写"⑥d 之后 host_id 切回旧",但 §14.2.6 attached_pre/route 恢复策略是"以新 host 为准推前",两条路线互斥。

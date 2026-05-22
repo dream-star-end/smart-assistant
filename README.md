@@ -1,5 +1,18 @@
 # Smart Assistant
 
+> **⚠️ 本 README 描述的是个人版**(45.32 master / `openclaude.service`)的安装与部署。
+> 本仓库的 `v3` 分支已演化为 **v3 商用版**(多用户容器化 / 计费 / 多 host 调度),
+> 与下文"个人单实例"路线分叉。
+>
+> v3 商用版的入口与部署:
+> - 架构总览:[`docs/v3/01-OVERVIEW.md`](docs/v3/01-OVERVIEW.md)
+> - 开发计划:[`docs/v3/02-DEVELOPMENT-PLAN.md`](docs/v3/02-DEVELOPMENT-PLAN.md)
+> - 部署入口:[`scripts/deploy-v3.sh`](scripts/deploy-v3.sh)(**不是**下方 `deploy/` 那套)
+> - Hotfix 流程:[`docs/hotfix-deploy-checklist.md`](docs/hotfix-deploy-checklist.md)
+>
+> 下文 Quickstart / 配置 / 项目结构 主要描述个人版资产(`deploy/legacy-master/` 等),
+> 阅读时请注意区分,不要把个人版步骤套到 v3 商用版上。
+
 > 基于 Claude Code 的全能个人 AI 助理
 
 把 Claude Code Best (CCB) 的强 agent 内核装进多渠道 Gateway 里,支持 Web、Telegram 多端对话,内置三层记忆、技能自进化、多媒体生成、浏览器自动化、多 Agent 协作。
@@ -114,24 +127,26 @@ npm run onboard
 npm run gateway
 ```
 
-### 部署到 VPS
+### 部署到 VPS(个人版)
+
+> v3 商用版部署走 [`scripts/deploy-v3.sh`](scripts/deploy-v3.sh) — 不要用本节。
 
 ```bash
 # 配置部署环境变量
-cp deploy/.env.example deploy/.env
-# 编辑 deploy/.env 填入服务器信息
+cp deploy/legacy-master/.env.example deploy/legacy-master/.env
+# 编辑 deploy/legacy-master/.env 填入服务器信息
 
 # 部署
 export DEPLOY_HOST=your-server-ip
 export DEPLOY_PORT=22
 export DEPLOY_PASSWORD=your-password
-python3 deploy/deploy_runner.py local_file remote_path
+python3 deploy/legacy-master/deploy_runner.py local_file remote_path
 ```
 
-### systemd 服务
+### systemd 服务(个人版)
 
 ```bash
-sudo cp deploy/openclaude.service /etc/systemd/system/
+sudo cp deploy/legacy-master/openclaude.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable openclaude
 sudo systemctl start openclaude
