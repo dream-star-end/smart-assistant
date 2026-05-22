@@ -12,8 +12,8 @@
 #   - all 5 checks above inject `X-Trace-Id: ${SMOKE_TRACE}`
 #   - verify_trace_propagation() hits 3 router.ts-routed probes
 #     (/api/public/config, /api/public/models, /api/models) then sshes to
-#     commercial-v3 to grep journalctl for ≥3 log lines tagged with
-#     SMOKE_TRACE. Below threshold = warn only.
+#     kl-mirror (KL prod primary) to grep /var/log/openclaude.log for ≥3 log
+#     lines tagged with SMOKE_TRACE. Below threshold = warn only.
 #
 # Any failure of checks 1-5 → print rollback hint and exit non-zero. Never auto-rollback.
 # verify_trace_propagation has no abort path (warn-only, plan D6).
@@ -155,9 +155,9 @@ verify_trace_propagation() {
   # default exit 1). Local: capture exit separately so a real ssh failure is
   # distinguishable from "count = 0".
   local count
-  if ! count=$(ssh -o BatchMode=yes -o ConnectTimeout=5 commercial-v3 \
+  if ! count=$(ssh -o BatchMode=yes -o ConnectTimeout=5 kl-mirror \
     "tail -n 5000 /var/log/openclaude.log 2>/dev/null | grep -c '${SMOKE_TRACE}' || true" 2>/dev/null); then
-    echo "   ⚠ trace propagation: ssh commercial-v3 log read unavailable — skipping verify (deploy unaffected)" >&2
+    echo "   ⚠ trace propagation: ssh kl-mirror log read unavailable — skipping verify (deploy unaffected)" >&2
     return 0
   fi
 

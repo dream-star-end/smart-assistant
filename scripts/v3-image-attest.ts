@@ -7,7 +7,7 @@
  * (memory v3_image_sha_divergence + v1.0.28 applyHealthSnapshot guard 印证)。
  * labels 在 manifest config 中,跨 daemon 保留,所以 attest 只看 labels。
  *
- * 用法(在 commercial-v3 master 上跑):
+ * 用法(在 kl-mirror master 上跑):
  *   set -a; source /etc/openclaude/commercial.env; set +a
  *   cd /opt/openclaude/openclaude
  *   npx tsx scripts/v3-image-attest.ts <newTag> <expectedGitSha>

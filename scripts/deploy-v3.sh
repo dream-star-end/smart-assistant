@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# deploy-v3.sh — One-command deploy of v3 host-layer to commercial-v3.
+# deploy-v3.sh — One-command deploy of v3 host-layer to KL prod primary
+# (ssh alias `kl-mirror`, 154.193.246.236).
+#
+# Topology note (2026-05-21): KL took over as prod primary. Tokyo
+# (commercial-v3 / 34.146.172.239) is ex-master with openclaude.service
+# inactive+disabled and is NOT a deploy target. Standby replication is
+# handled out-of-band by the 218-standby branch (sync-218-standby.sh on
+# systemd timer), so this script no longer triggers any standby sync.
 #
 # What it does (in order):
 #   1. Safety-check remote gateway: active WS connections must be ≤1.
-#   2. Compute TAG = v3-<UTC-YYYYMMDDTHHMMZ>-<sourceHash> (tag suffix reflects
-#      the pre-deploy source commit, NOT the tagged HEAD after version-bump).
+#   2. Read TAG = changelog.json `currentVersion` (semver vX.Y.Z); bump it
+#      manually before deploying. Tag uniqueness is verified against local +
+#      origin refs (fail-closed) before any side effect.
 #   3. Pre-check changelog.json for exactly-one version:"PENDING" entry.
 #      0 entries OK (semver mode), 1 finalize, 2+ abort. (--no-changelog noop.)
 #   4. Auto-bump cache-bust tokens (sw.js VERSION + ?v=XX) to source hash.
@@ -13,15 +21,12 @@
 #   7. Snapshot remote /opt/openclaude/openclaude/ → /opt/openclaude/openclaude.prev.1/
 #      (rotates .prev.1..5/ ctime-ordered; oldest dropped). Legacy single-gen
 #      .prev/ (if present) is migrated to .prev.1/ once on first new deploy.
-#   8. rsync /opt/openclaude/openclaude-v3/ (local, on 45.32 master) →
-#      commercial-v3:/opt/openclaude/openclaude/. After this step, that remote
-#      path is the **single authoritative source** for everything that runs on
-#      commercial-v3 — gateway systemd unit, compute-pool, build-image.sh PERSONAL_SRC,
-#      etc. The legacy commercial-v3:/opt/openclaude/openclaude-v3/ tree is stale
-#      / orphan-git (recursive bad worktree) and must NOT be referenced by any
-#      runtime path — see build-image.sh header for historical context.
+#   8. rsync this worktree → kl-mirror:/opt/openclaude/openclaude/. That
+#      remote path is the **single authoritative source** for everything
+#      running on KL primary — gateway systemd unit, compute-pool,
+#      build-image.sh PERSONAL_SRC, etc.
 #   9. Write VERSION.json on remote (atomic: scp → ssh mv).
-#  10. rsync repo changelog.json → commercial-v3:/root/.openclaude/changelog.json
+#  10. rsync repo changelog.json → kl-mirror:/root/.openclaude/changelog.json
 #      (because /api/changelog reads paths.home, not code dir). Failure aborts.
 #  11. `systemctl restart openclaude` on remote + /healthz probe.
 #  12. Run scripts/smoke-v3.sh <TAG> https://claudeai.chat. Failure → print
@@ -29,6 +34,9 @@
 #      costly if they trigger false rollback).
 #  13. git tag <TAG> HEAD && git push origin <TAG> (failure is warn-only —
 #      code is already live; tag is just a bookmark).
+#
+# Standby sync is NOT done here. 218 standby convergence is owned by the
+# standby layer and must not be hooked into the KL primary deploy path.
 #
 # Usage:
 #   scripts/deploy-v3.sh
@@ -88,9 +96,9 @@ done
 
 # ── Top-level deploy lock ──
 # Two concurrent deploy-v3.sh runs from this worktree would race on
-# changelog/cache-bust mutations, version-bump commits, the commercial-v3
-# rsync, and (later) the KL standby sync — leaving prod in a torn state where
-# the running tag points to commit X but the code on disk is from commit Y.
+# changelog/cache-bust mutations, version-bump commits, and the kl-mirror
+# rsync — leaving prod in a torn state where the running tag points to
+# commit X but the code on disk is from commit Y.
 # Non-blocking flock: if another deploy is in flight, abort immediately with a
 # clear message rather than queue up and surprise the operator. --rollback is
 # part of the same critical section so a rollback can't race with a forward
@@ -193,7 +201,7 @@ remote_safety_check() {
   fi
   echo "-- checking remote WS connections --"
   local ws_count
-  ws_count=$(ssh -o BatchMode=yes commercial-v3 \
+  ws_count=$(ssh -o BatchMode=yes kl-mirror \
     "ss -tn state established '( sport = :18789 )' 2>/dev/null | tail -n +2 | wc -l")
   if [[ "$ws_count" -gt 1 ]]; then
     echo "ERROR: remote has $ws_count active WS on :18789 (>1 = real users)." >&2
@@ -206,9 +214,9 @@ remote_safety_check() {
 # ── Shared: remote restart + healthz loop ──
 remote_restart_and_healthz() {
   echo "-- restarting remote gateway --"
-  ssh commercial-v3 "systemctl restart openclaude && sleep 4 && systemctl is-active openclaude" || {
+  ssh kl-mirror "systemctl restart openclaude && sleep 4 && systemctl is-active openclaude" || {
     echo "FATAL: remote restart failed" >&2
-    ssh commercial-v3 'journalctl -u openclaude --no-pager -n 40' >&2 || true
+    ssh kl-mirror 'journalctl -u openclaude --no-pager -n 40' >&2 || true
     exit 1
   }
   echo "-- health-checking claudeai.chat --"
@@ -225,7 +233,7 @@ remote_restart_and_healthz() {
 }
 
 # ── Rollback path ──
-# Restores commercial-v3:/opt/openclaude/openclaude.prev.N/ back to
+# Restores kl-mirror:/opt/openclaude/openclaude.prev.N/ back to
 # /opt/openclaude/openclaude/, then restart + healthz. Skips bump/commit/push.
 # .prev.1..5/ snapshots are created by the normal deploy path (rotation just
 # before rsync). N=1 = latest snapshot; N=5 = oldest still-retained snapshot.
@@ -245,8 +253,8 @@ if [[ $ROLLBACK_REQUESTED -eq 1 ]]; then
 
   PREV_DIR="/opt/openclaude/openclaude.prev.${ROLLBACK_N}"
   # Verify snapshot exists on remote before touching anything.
-  if ! ssh commercial-v3 "test -d '${PREV_DIR}' && test -f '${PREV_DIR}/package.json'" 2>/dev/null; then
-    echo "ERROR: no rollback snapshot at commercial-v3:${PREV_DIR}/" >&2
+  if ! ssh kl-mirror "test -d '${PREV_DIR}' && test -f '${PREV_DIR}/package.json'" 2>/dev/null; then
+    echo "ERROR: no rollback snapshot at kl-mirror:${PREV_DIR}/" >&2
     echo "       (snapshot from ${ROLLBACK_N} deploys ago not yet rotated into existence," >&2
     echo "        or was manually removed). Cannot proceed." >&2
     exit 1
@@ -256,7 +264,7 @@ if [[ $ROLLBACK_REQUESTED -eq 1 ]]; then
   # -a preserves perms/times; --delete mirrors the prev snapshot exactly.
   # Exclude data/node_modules so we don't churn those on restore — they live outside
   # the code layer and shouldn't diverge just from a rollback. .env likewise stays put.
-  ssh commercial-v3 "rsync -a --delete \
+  ssh kl-mirror "rsync -a --delete \
     --exclude=/data \
     --exclude=/node_modules \
     --exclude=.env \
@@ -434,7 +442,7 @@ fi
 # design — see Codex review M8.1 for rationale.
 if [[ $DRY_RUN -eq 0 ]]; then
   echo "-- snapshotting remote live tree → /opt/openclaude/openclaude.prev.1/ (5-gen rotation) --"
-  ssh commercial-v3 'bash -s' <<'REMOTE' || {
+  ssh kl-mirror 'bash -s' <<'REMOTE' || {
 set -euo pipefail
 PREV_BASE=/opt/openclaude/openclaude.prev
 LIVE=/opt/openclaude/openclaude
@@ -475,7 +483,7 @@ REMOTE
   }
 fi
 
-# ── 5. rsync to commercial-v3 ──
+# ── 5. rsync to kl-mirror ──
 # Excludes mirror memory `project_v3_deploy_mechanism.md`.
 RSYNC_OPTS=(
   -az
@@ -503,8 +511,8 @@ if [[ $DRY_RUN -eq 1 ]]; then
   RSYNC_OPTS+=(--dry-run -v)
 fi
 
-echo "-- rsync → commercial-v3:/opt/openclaude/openclaude/ --"
-rsync "${RSYNC_OPTS[@]}" "$REPO_ROOT/" commercial-v3:/opt/openclaude/openclaude/
+echo "-- rsync → kl-mirror:/opt/openclaude/openclaude/ --"
+rsync "${RSYNC_OPTS[@]}" "$REPO_ROOT/" kl-mirror:/opt/openclaude/openclaude/
 
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "=== dry-run complete — no remote restart ==="
@@ -527,10 +535,10 @@ cat > "$VERSION_TMP_LOCAL" <<EOF
 {"tag":"$TAG","commit":"$DEPLOY_COMMIT","builtAt":"$BUILT_AT"}
 EOF
 echo "-- pushing VERSION.json → remote --"
-scp -q "$VERSION_TMP_LOCAL" commercial-v3:/opt/openclaude/openclaude/.VERSION.json.tmp || {
+scp -q "$VERSION_TMP_LOCAL" kl-mirror:/opt/openclaude/openclaude/.VERSION.json.tmp || {
   echo "FATAL: scp VERSION.json failed" >&2; exit 1
 }
-ssh commercial-v3 'mv /opt/openclaude/openclaude/.VERSION.json.tmp /opt/openclaude/openclaude/VERSION.json' || {
+ssh kl-mirror 'mv /opt/openclaude/openclaude/.VERSION.json.tmp /opt/openclaude/openclaude/VERSION.json' || {
   echo "FATAL: remote mv VERSION.json failed" >&2; exit 1
 }
 
@@ -538,8 +546,8 @@ ssh commercial-v3 'mv /opt/openclaude/openclaude/.VERSION.json.tmp /opt/openclau
 # paths.home on prod = /root/.openclaude/ (OPENCLAUDE_HOME not set in commercial.env).
 # This is separate from the code-dir rsync above because .env & paths.home live
 # outside the code tree and are intentionally excluded from the main push.
-echo "-- rsync changelog.json → commercial-v3:/root/.openclaude/changelog.json --"
-rsync -az "$REPO_ROOT/changelog.json" commercial-v3:/root/.openclaude/changelog.json || {
+echo "-- rsync changelog.json → kl-mirror:/root/.openclaude/changelog.json --"
+rsync -az "$REPO_ROOT/changelog.json" kl-mirror:/root/.openclaude/changelog.json || {
   echo "FATAL: changelog rsync to paths.home failed — aborting before restart" >&2
   echo "       Frontend would show stale changelog for this release." >&2
   exit 1
@@ -571,20 +579,6 @@ if ! bash "$REPO_ROOT/scripts/smoke-v3.sh" "$TAG" https://claudeai.chat; then
   echo "   rollback (latest):  scripts/deploy-v3.sh --rollback" >&2
   echo "   rollback older:     scripts/deploy-v3.sh --rollback=N   (N=1..5)" >&2
   exit 1
-fi
-
-# ── 9.5. Sync KL hot standby (non-blocking best-effort) ──
-# After smoke passes, commercial-v3 is live and healthy. Push the same code +
-# VERSION + changelog + missing runtime images to the KL hot standby so an
-# eventual switchover lands on a current code tree. Failure here is logged but
-# does NOT fail the deploy — KL drift is recoverable (boss can re-run
-# scripts/sync-kl-standby.sh manually), but auto-rolling back a healthy live
-# commercial-v3 would be a real outage.
-echo "-- syncing KL hot standby (kuala-lumpur 154.193.246.236) --"
-export TAG DEPLOY_COMMIT BUILT_AT
-if ! bash "$REPO_ROOT/scripts/sync-kl-standby.sh"; then
-  echo "   WARN: KL standby sync failed — commercial-v3 is live, KL drift accepted" >&2
-  echo "   manual retry: bash $REPO_ROOT/scripts/sync-kl-standby.sh" >&2
 fi
 
 # ── 10. Git tag + push (non-fatal) ──

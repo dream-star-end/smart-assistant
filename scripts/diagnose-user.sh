@@ -8,7 +8,7 @@
 #   2. 最近 5 分钟 gateway log 里和这个用户相关的错误条目
 #   3. master 视角解析出的 host-side media 路径 + volume 是否存在
 #
-# 用法 (在 commercial-v3 上跑,需 psql + docker + journalctl + jq + curl):
+# 用法 (在 kl-mirror 上跑,需 psql + docker + journalctl + jq + curl):
 #
 #   scripts/diagnose-user.sh 28
 #   scripts/diagnose-user.sh c:28

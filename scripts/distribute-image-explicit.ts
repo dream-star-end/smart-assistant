@@ -11,7 +11,7 @@
  *   2. boss requires每次分发完镜像必须自动清旧 runtime tag(否则 host
  *      磁盘累积新版 ~3.8GB 永不释放,self 之前到 87%)。
  *
- * Usage (run on commercial-v3, env loaded):
+ * Usage (run on kl-mirror, env loaded):
  *   set -a; source /etc/openclaude/commercial.env; set +a
  *   cd /opt/openclaude/openclaude
  *   npx tsx scripts/distribute-image-explicit.ts <newTag> <prevTag>

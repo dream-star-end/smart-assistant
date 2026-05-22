@@ -22,20 +22,19 @@ set -euo pipefail
 # 常量(硬编码,有意为之 — 不做"可配置")
 # ───────────────────────────────────────────────
 # PERSONAL_SRC = master 服务实际运行的源码树,deploy-v3.sh 把 45.32 上的 v3 仓 rsync
-# 到这里 (commercial-v3:/opt/openclaude/openclaude/) 后,本机所有运行物 — gateway
-# systemd 单元、compute-pool 模块、build-image 取的源 — 必须**唯一权威**地指向它,
-# 才能保证 "deploy 推什么,image 也 bake 什么"。
+# 到这里 (kl-mirror:/opt/openclaude/openclaude/,KL prod primary) 后,本机所有
+# 运行物 — gateway systemd 单元、compute-pool 模块、build-image 取的源 — 必须
+# **唯一权威**地指向它,才能保证 "deploy 推什么,image 也 bake 什么"。
 #
-# 历史:之前一段时间 PERSONAL_SRC 指向 commercial-v3:/opt/openclaude/openclaude-v3/,
-# 那是一棵孤立 source tree,.git 是个递归坏 worktree (gitdir 指向
-# /opt/openclaude/openclaude/.git/worktrees/openclaude-v3 — 该路径不存在,git pull
-# 直接 fatal),deploy-v3.sh 不同步它。结果每次 deploy 推到 ./openclaude/,build 却
-# 从孤立 ./openclaude-v3/ 取源,image 长期 N 个 commit 落后 master。2026-05-11 v1.0.124
-# hot fix (codex runner setTraceId no-op) 就是踩这条坑:fix push 到 master,build 出
-# 来的 image 还是 stale → boss 容器继续报 `runner.setTraceId is not a function`。
+# 历史:在 KL 切为 primary 之前(2026-05-21 之前),master 是 Tokyo
+# (commercial-v3)。那个阶段 PERSONAL_SRC 一度被错指到一棵孤立 source tree
+# /opt/openclaude/openclaude-v3/,其 .git 是递归坏 worktree、deploy-v3.sh 不同步,
+# 结果每次 deploy 推到 ./openclaude/、build 却从 ./openclaude-v3/ 取源,image 长期
+# N commits 落后 master。2026-05-11 v1.0.124 hot fix(codex runner setTraceId
+# no-op)就是踩这条坑。
 #
-# 改回单一权威源后,通过 rsync exclude packages/commercial/ 继续保留 "runtime image
-# 不含商用版代码" 这条不变量。
+# 单一权威源 invariant 保留至今,deploy 目标已迁到 KL primary。runtime image 通过
+# rsync exclude packages/commercial/ 继续保留 "不含商用版代码" 这条不变量。
 PERSONAL_SRC="/opt/openclaude/openclaude"
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # 本脚本所在目录(agent-sandbox/)
 BUILD_CTX="/tmp/oc-runtime-build"
@@ -360,10 +359,10 @@ cat <<EOF
 [build-image]   tar size   : ${TAR_SIZE_MB} MiB
 [build-image]   tar sha256 : $TAR_SHA256
 [build-image] ====================================================================
-[build-image]   远端部署 (商用版 v3 生产 = 34.146.172.239 / ssh alias commercial-v3):
-[build-image]     scp $TAR_PATH commercial-v3:/var/lib/openclaude-v3/images/
-[build-image]     ssh commercial-v3 "gunzip -c /var/lib/openclaude-v3/images/openclaude-runtime-${TAG}.tar.gz | docker load"
-[build-image]     ssh commercial-v3 "docker tag openclaude/openclaude-runtime:$TAG openclaude/openclaude-runtime:latest"
+[build-image]   远端部署 (商用版 v3 生产 primary = 154.193.246.236 / ssh alias kl-mirror):
+[build-image]     scp $TAR_PATH kl-mirror:/var/lib/openclaude-v3/images/
+[build-image]     ssh kl-mirror "gunzip -c /var/lib/openclaude-v3/images/openclaude-runtime-${TAG}.tar.gz | docker load"
+[build-image]     ssh kl-mirror "docker tag openclaude/openclaude-runtime:$TAG openclaude/openclaude-runtime:latest"
 [build-image] ====================================================================
 
 EOF
