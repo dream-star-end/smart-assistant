@@ -141,6 +141,11 @@ export {
 // 邮箱验证后 fire-and-forget 容器 pre-warm helper
 export { makePrewarmContainer } from "./v3prewarm.js";
 
+// v1.0.191 per-uid singleflight wrapper:HTTP `/api/media-signed` 与 WS bridge
+// `resolveContainerEndpoint` 默认共享同一闭包,合并 reload 同瞬间的 ensure race。
+// 详见 ensureContainerSingleflight.ts 文件头注释 + index.ts `sharedEnsureRunning`。
+export { makeUidSingleflight } from "./ensureContainerSingleflight.js";
+
 // V3 multi-tenant media resolver — gateway 用它把 `/api/uploads` 写路径 +
 // `/api/media` 读路径(同时覆盖 codex image_gen 输出的 generated/ 子目录)
 // 路由到具体用户的 docker volume host path,避免 master/container 单租户

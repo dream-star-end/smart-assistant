@@ -159,6 +159,7 @@ import {
   DEFAULT_V3_CCB_BASELINE_DIR,
   resolveCcbBaselineMounts,
   makePrewarmContainer,
+  makeUidSingleflight,
   makeV3EnsureRunning,
   preheatV3Image,
   startIdleSweepScheduler,
@@ -1636,6 +1637,28 @@ export async function registerCommercial(
       )
     : undefined;
 
+  // v1.0.191 — /api/media-signed 冷启动护栏 + per-uid singleflight 合并。
+  // 详见 handlers.ts ensureContainerReady JSDoc 与 ensureContainerSingleflight.ts。
+  //
+  // **共享作用域**:WS bridge `resolveContainerEndpoint`(下方 line ~1818)与 HTTP
+  // `/api/media-signed` ensureContainerReady 共享同一 in-flight map。
+  // 原因:用户 reload 页面瞬间,WS connect 与 <img> burst 是同 process 内的并发拉,
+  // 若各自闭包 → makeV3EnsureRunning 的 DB INSERT race(只一个赢家做 provision,
+  // 输家被翻 ContainerUnreadyError("provisioning"))会让 HTTP 一路成为输家继续破图。
+  // 单 singleflight 把整个 uid 的 ensure call 合并掉这条 race。
+  //
+  // 注:prewarm(line 1633)有自己的闭包,因为它发生在邮箱验证那一刻,与"reload
+  // 同瞬间"不同步,且 makePrewarmContainer 自带 fire-and-forget 包装,共享反而
+  // 模糊语义,保留独立闭包。
+  const sharedEnsureRunning: ResolveContainerEndpoint | undefined =
+    v3Deps ? makeUidSingleflight(makeV3EnsureRunning(v3Deps)) : undefined;
+
+  const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined = sharedEnsureRunning
+    ? async (uid) => {
+        await sharedEnsureRunning(uid);
+      }
+    : undefined;
+
   // V3 multi-tenant media resolver(`c:<uid>` → user volume {uploads, generated})
   // 仅暴露给 gateway(`RegisterCommercialResult.resolveUserMediaDirs`,装配
   // _resolveMediaDirs 用于 /api/uploads 写路径)。
@@ -1680,6 +1703,9 @@ export async function registerCommercial(
     // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
     v3Supervisor: v3Deps,
     prewarmContainer,
+    // v1.0.191 — /api/media-signed 冷启动护栏。装配端做了 per-uid singleflight 合并,
+    // 见上方 ensureContainerReady 构造闭包注释。
+    ensureContainerReady,
     // v3 file proxy:root secret 给 containerFileProxy 签 per-request nonce;
     // feature flag 控制 router 是否把 /api/file / /api/media/* 从 BLOCKED 拉进 PROXY 分支
     bridgeSecret,
@@ -1796,13 +1822,14 @@ export async function registerCommercial(
     console.log("[commercial] v3 container events worker started (oom/die → alerts)");
   }
 
+  // v1.0.191:复用 sharedEnsureRunning(与 /api/media-signed ensureContainerReady
+  // 共享同一 per-uid singleflight,避免 reload 同瞬间 WS+HTTP 各自 DB INSERT race)。
   const resolveContainerEndpoint: ResolveContainerEndpoint =
     options.resolveContainerEndpoint
-    ?? (v3Deps
-      ? makeV3EnsureRunning(v3Deps)
-      : async (_uid: bigint) => {
-        throw new ContainerUnreadyError(5, "supervisor_not_wired");
-      });
+    ?? sharedEnsureRunning
+    ?? (async (_uid: bigint) => {
+      throw new ContainerUnreadyError(5, "supervisor_not_wired");
+    });
 
   // ─── P1.7 slice 7c — WeChat broker 装配 ───────────────────────────────────
   //

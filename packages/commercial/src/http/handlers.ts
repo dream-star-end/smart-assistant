@@ -43,6 +43,7 @@ import {
   DEFAULT_SIGN_TTL_MS,
 } from "./mediaSign.js";
 import { containerFileProxy } from "./containerFileProxy.js";
+import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import { getBearerToken, getSessionCookieToken } from "./authHelpers.js";
 import { defaultTunnelFetchHealthz } from "./tunnelHealthzProbe.js";
 import { getHostById as computePoolGetHostById } from "../compute-pool/queries.js";
@@ -212,6 +213,28 @@ export interface CommercialHttpDeps {
    * rotate 改 `mediaSign.ts` 的 HKDF_INFO,旧 URL 全部失效。
    */
   mediaSignKey?: Buffer;
+  /**
+   * v1.0.191 — `/api/media-signed` 冷启动护栏。
+   *
+   * 用户 idle 超过 idleSweep 阈值 → 容器被 stop。用户回来 reload 页面时:
+   * WS 一路走 bridge → ensureRunning(uid) → 容器自然 boot 起来;
+   * 但 `<img src="/api/media-signed?...">` 同时拉,直接命中 handleMediaSigned →
+   * containerFileProxy 见容器 `state='stopped'` → 503 CONTAINER_NOT_RUNNING →
+   * 浏览器对 <img> 不会自动重试 → 用户看到一堆 broken image。
+   *
+   * 注入后:handleMediaSigned 在 path sanity 通过 / containerFileProxy 之前
+   * `await ensureContainerReady(uid)`,语义同 makeV3EnsureRunning:provision +
+   * 等容器 readiness(/healthz + WS upgrade)直至 running,或 throw
+   * `ContainerUnreadyError(retryAfterSec, reason)`。
+   *
+   * 装配端必须做 **per-uid singleflight** 合并(同一用户多图并发只触发一次 provision)
+   * 且 **与 WS bridge 共享同一 in-flight map**(否则 reload 时 <img> burst 与 WS
+   * connect 之间仍可能在 DB INSERT 上 race,HTTP 一路成为输家被翻 503)。详见
+   * commercial/src/index.ts 装配处 `sharedEnsureRunning` 闭包。
+   *
+   * 未注入(单测 / 早期 boot)→ 退化为旧行为(可能 503 但不阻塞测试)。
+   */
+  ensureContainerReady?: (uid: bigint) => Promise<void>;
   /**
    * V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
    * `POST /api/anthropic/v1/messages` 的 anthropic proxy handler。
@@ -1895,6 +1918,42 @@ export async function handleMediaSigned(
   }
   if (!isContainerPathAllowed(resolved)) {
     throw new HttpError(403, "FORBIDDEN", "signed URL path not authorized");
+  }
+
+  // v1.0.191 冷启动护栏 —— 见 CommercialHttpDeps.ensureContainerReady JSDoc。
+  // 位置在 path sanity 通过之后:被 isContainerPathAllowed 拒掉的请求不应触发 provision
+  // (浪费 docker 资源 + 给 supervisor 假需求)。装配端的 per-uid singleflight 负责合并
+  // 同页多图并发,这里只做"调用 + 错误映射"。
+  if (deps.ensureContainerReady) {
+    try {
+      await deps.ensureContainerReady(BigInt(sub));
+    } catch (err) {
+      if (err instanceof ContainerUnreadyError) {
+        // 503 + Retry-After + 默认 no-store(sendJson 自动加)。
+        // <img> 不会自动重试 503;Cache-Control 主要价值是防 CF / 浏览器缓存失败响应;
+        // Retry-After 给 fetch / SW / 前端接管路径用。
+        sendJson(
+          res,
+          503,
+          {
+            error: {
+              code: "CONTAINER_UNREADY",
+              message: `container not ready: ${err.reason}`,
+              retry_after_sec: err.retryAfterSec,
+              request_id: _ctx.requestId,
+            },
+          },
+          { "Retry-After": err.retryAfterSec },
+        );
+        return;
+      }
+      // 其他 error(supervisor 抖 / DB / docker daemon 不可达 ...)— 不暴露根因
+      _ctx.log.warn("handle_media_signed_ensure_container_failed", {
+        uid: sub,
+        err: (err as Error)?.message ?? String(err),
+      });
+      throw new HttpError(503, "CONTAINER_NOT_RUNNING", "container ensure failed");
+    }
   }
 
   // 调 containerFileProxy:它内部从 req.url 解析 path → 我们必须把 req.url 改成
