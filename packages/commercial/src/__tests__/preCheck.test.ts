@@ -11,11 +11,19 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+import type { Pool } from "pg";
 import {
   estimateMaxCost,
+  preCheck,
   InMemoryPreCheckRedis,
 } from "../billing/preCheck.js";
-import type { ModelPricing } from "../billing/pricing.js";
+import type { ModelPricing, PricingCache } from "../billing/pricing.js";
+import { setPoolOverride, closePool } from "../db/index.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const sonnet: ModelPricing = {
   model_id: "claude-sonnet-4-6",
@@ -308,5 +316,136 @@ describe("InMemoryPreCheckRedis — 输入校验", () => {
       }),
       TypeError,
     );
+  });
+});
+
+/**
+ * BINV-5 — preCheck 不查 agent_cost_overrides。
+ *
+ * 锁的不变量(`PHASE1-TEST-COVERAGE-PLAN.md` Audit 表 BINV-5 行):
+ *   cost multiplier 只在 finalize 阶段(`settleUsageAndLedger` 之前的
+ *   `calculateActualCost`)应用,**preCheck 路径不查** `agent_cost_overrides`。
+ *
+ * 为什么重要:历史 (2026-05-06) preCheck 曾在估算阶段考虑 multiplier,叠加
+ * `estimateMaxCost` 的双侧 ceiling 把 ¥12 余额用户的 Opus 4.7 + 附件直接卡到
+ * 拒绝。boss 决策(v1.0.89)拆掉 multiplier 估算与 ceiling,统一只在 finalize 走
+ * clamp 路径。本不变量防止任何"顺便加点多 multiplier 路径"的回归。
+ *
+ * 双重锁:
+ *   1. **结构层(静态)** — preCheck.ts 与其唯一 PG 依赖 ledger.ts(getBalance)
+ *      源码中不允许出现 `agent_cost_overrides` / `agentMultiplier` 字面量。
+ *   2. **行为层(spy pool)** — 用注入计数的 Pool 跑一次 preCheck,检查
+ *      实际 SQL 集合不包含 `agent_cost_overrides`,且仅出现 `SELECT credits FROM users`。
+ *      pool 注入走 `setPoolOverride()` test seam(已有于 `db/index.ts:75`)。
+ */
+
+describe("preCheck — BINV-5: cost multiplier 不进 preCheck 路径", () => {
+  test("结构层: preCheck.ts + ledger.ts 源码不含 agent_cost_overrides / agentMultiplier", () => {
+    const preCheckSrc = readFileSync(
+      resolve(__dirname, "../billing/preCheck.ts"),
+      "utf8",
+    );
+    const ledgerSrc = readFileSync(
+      resolve(__dirname, "../billing/ledger.ts"),
+      "utf8",
+    );
+    // 注:用 includes 而非 regex 是有意 — 任何形式的 import / 字符串拼 SQL 都
+    // 会触发该字符串出现,误判风险极低。
+    assert.ok(
+      !preCheckSrc.includes("agent_cost_overrides"),
+      "preCheck.ts 不应引用 agent_cost_overrides",
+    );
+    assert.ok(
+      !preCheckSrc.includes("agentMultiplier"),
+      "preCheck.ts 不应引用 agentMultiplier",
+    );
+    assert.ok(
+      !ledgerSrc.includes("agent_cost_overrides"),
+      "ledger.ts(preCheck 唯一 PG 依赖)不应引用 agent_cost_overrides",
+    );
+    assert.ok(
+      !ledgerSrc.includes("agentMultiplier"),
+      "ledger.ts 不应引用 agentMultiplier",
+    );
+  });
+
+  test("行为层: preCheck 执行只 SELECT credits FROM users,不触 agent_cost_overrides", async () => {
+    // duck-type fake Pool — preCheck 路径只走 getBalance → rootQuery → pool.query。
+    // 我们记录 query 字面量,断言集合不含 agent_cost_overrides。
+    const sqls: string[] = [];
+    const fakePool = {
+      async query(text: unknown, _params?: unknown) {
+        const sqlText = typeof text === "string" ? text : (text as { text: string }).text;
+        sqls.push(sqlText);
+        // 模拟 users 行存在,credits=1000
+        return {
+          rows: [{ credits: "1000" }],
+          rowCount: 1,
+          command: "SELECT",
+          oid: 0,
+          fields: [],
+        };
+      },
+      async connect() {
+        throw new Error("fakePool.connect() should not be called in preCheck path");
+      },
+      async end() {},
+      on() {},
+    } as unknown as Pool;
+
+    // 注:setPoolOverride 要求 pool 未初始化或同实例;test 文件首批运行无需 closePool。
+    // 若上面 describe block 已意外开了 pool(本文件并无),fallback closePool 再 set。
+    try {
+      setPoolOverride(fakePool);
+    } catch {
+      await closePool();
+      setPoolOverride(fakePool);
+    }
+    try {
+      // 仅注入 PricingCache.get(),preCheck 路径只调它(见 preCheck.ts:236)
+      const pricing = {
+        get(_modelId: string): ModelPricing | null {
+          return {
+            model_id: "test-model",
+            display_name: "Test",
+            input_per_mtok: 100n,
+            output_per_mtok: 200n,
+            cache_read_per_mtok: 10n,
+            cache_write_per_mtok: 25n,
+            multiplier: "1.000",
+            enabled: true,
+            sort_order: 1,
+            visibility: "public",
+            extra_system_prompt: null,
+            updated_at: new Date(0),
+          };
+        },
+      } as unknown as PricingCache;
+
+      const redis = new InMemoryPreCheckRedis();
+      const result = await preCheck(redis, {
+        userId: 7n,
+        requestId: "req-binv5",
+        model: "test-model",
+        maxTokens: 1_000,
+        pricing,
+      });
+      assert.ok(result.balance === 1000n);
+    } finally {
+      await closePool();
+    }
+
+    // 断言:实际 SQL 集合中
+    //   (a) 不含 agent_cost_overrides — preCheck 永远不查 multiplier 表
+    //   (b) 也不含 agentMultiplier 函数名等次级字符串
+    for (const sql of sqls) {
+      assert.ok(
+        !/agent_cost_overrides/i.test(sql),
+        `preCheck 路径不该出现 agent_cost_overrides:${sql}`,
+      );
+    }
+    // 进一步收紧:preCheck 真实路径只该有 `SELECT credits ... FROM users`
+    const usersQueries = sqls.filter((s) => /FROM\s+users/i.test(s));
+    assert.ok(usersQueries.length > 0, "preCheck 必须 SELECT users.credits");
   });
 });

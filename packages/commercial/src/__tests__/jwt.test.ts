@@ -111,6 +111,57 @@ describe("auth.jwt.signAccess / verifyAccess", () => {
     const b = await signAccess({ sub: "1", role: "user" }, SECRET);
     assert.notEqual(a.jti, b.jti);
   });
+
+  /**
+   * AINV-2 — access token payload 是严格白名单(`PHASE1-TEST-COVERAGE-PLAN.md`
+   * Audit 表 AINV-2 行)。
+   *
+   * 已有覆盖(本套件 :60/:74):tampered-payload / alg confusion / 算法降级。
+   * 缺的正向断言:**payload keys ⊆ {sub, role, iat, exp, jti}** —— 防止某天有人
+   * 顺手往 `signAccess` 塞 credits / balance / email 等业务态字段,把状态向客户端
+   * 泄漏。一旦 signAccess 实现漏一个字段,本测试立即红。
+   */
+  test("AINV-2: signed payload keys are strictly {sub, role, iat, exp, jti} — no business state leak", async () => {
+    const issued = await signAccess({ sub: "42", role: "user" }, SECRET);
+    const [, p] = issued.token.split(".");
+    assert.ok(p, "JWT 必须有 payload segment");
+    const decoded = JSON.parse(
+      Buffer.from(p!, "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
+
+    const ALLOWED = new Set(["sub", "role", "iat", "exp", "jti"]);
+    // 正向:每个出现的 key 必须在白名单
+    for (const k of Object.keys(decoded)) {
+      assert.ok(
+        ALLOWED.has(k),
+        `payload 含未授权 key:${k}(可能泄漏业务态到客户端)`,
+      );
+    }
+    // 反向:常见业务字段绝不应出现 — 防止反编译 token 看到余额 / email / 密码哈希
+    for (const k of [
+      "credits",
+      "balance",
+      "balance_cents",
+      "email",
+      "username",
+      "name",
+      "password",
+      "password_hash",
+      "status",
+    ]) {
+      assert.ok(
+        !(k in decoded),
+        `payload 绝不应含业务字段 ${k}(请检查 signAccess 是否回归)`,
+      );
+    }
+
+    // sanity:白名单的字段类型必须对(防 sub 被错塞成 bigint / role 被塞成 number)
+    assert.equal(typeof decoded.sub, "string");
+    assert.equal(typeof decoded.role, "string");
+    assert.equal(typeof decoded.iat, "number");
+    assert.equal(typeof decoded.exp, "number");
+    assert.equal(typeof decoded.jti, "string");
+  });
 });
 
 describe("auth.jwt.issueRefresh / refreshTokenHash", () => {

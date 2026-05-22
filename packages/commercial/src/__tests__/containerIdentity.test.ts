@@ -17,6 +17,7 @@ import {
   ContainerIdentityError,
   type ContainerIdentityRepo,
 } from "../auth/containerIdentity.js";
+import { signAccess, verifyAccess, JwtError } from "../auth/jwt.js";
 
 // ------- 辅助:in-memory repo + 测试夹具 ------------------------------------
 
@@ -353,6 +354,61 @@ describe("verifyContainerIdentity — 攻击场景", () => {
         `oc-v3.50.${sec.hex}`,
       ),
       (e: unknown) => e instanceof ContainerIdentityError && e.code === "UNKNOWN_CONTAINER_IP",
+    );
+  });
+});
+
+/**
+ * AINV-4 —— 容器 token 与 user-scope JWT 的双向身份隔离
+ * (`PHASE1-TEST-COVERAGE-PLAN.md` Audit 表 AINV-4 行)。
+ *
+ * 锁的不变量:容器 token (`oc-v3.<id>.<64hex>`) 不能被 user-scope 路由的 JWT
+ * verify 路径接受,反之亦然;两套身份系统在解析层就互相拒绝,后续 user-only
+ * 路由(`requireUserVerifyDb`)无法被容器 token 越权调用。
+ *
+ * 为什么放在 containerIdentity.test.ts:容器 token 与 JWT 的"越界"问题在解析
+ * 层就该截住,本测试套件是该解析层的归属;集成层"requireUser → user route"
+ * 在 router 测试里被覆盖,本套件只锁解析归属不变量,不去测路由 dispatcher。
+ *
+ * 攻击模型:
+ *   - 攻击者拿到一份合法容器 token,试图把它作为 `Authorization: Bearer <token>`
+ *     送到 `/api/me` 或 `/api/orders/...` 这类只接受 JWT 的端点。`extractTokenFromReq`
+ *     抽出 token 后,user-scope handler 先调 `verifyAccess` → 必须 throw JwtError
+ *     而非"侥幸通过 / 返回 claims"。
+ *   - 反向同样:JWT 字符串不能被 `parseContainerToken` 当成合法容器 token 解析,
+ *     防止"攻击者把 user JWT 误送到 `/v1/messages` 当成容器身份用"的情况。
+ */
+describe("AINV-4: container token 与 user JWT 的双向身份隔离", () => {
+  const SECRET = randomBytes(64).toString("hex");
+
+  test("容器 token 不能通过 verifyAccess(user-scope 路由的 JWT 闸门)", async () => {
+    const containerSecret = randomBytes(32).toString("hex"); // 64 char hex
+    const containerToken = `oc-v3.42.${containerSecret}`;
+    // user-scope handler 链 (`extractTokenFromReq` → `verifyAccess`) 第一步必拒
+    await assert.rejects(
+      verifyAccess(containerToken, SECRET),
+      (e: unknown) => e instanceof JwtError,
+      "verifyAccess 必须把容器 token 当 malformed JWT 拒绝",
+    );
+  });
+
+  test("合法 JWT 不能通过 parseContainerToken(容器路径的身份闸门)", async () => {
+    const issued = await signAccess({ sub: "1", role: "user" }, SECRET);
+    // JWT 也是 3 段 dot-separated,parseContainerToken 必须靠 `oc-v3.` 前缀过滤
+    assert.throws(
+      () => parseContainerToken(issued.token),
+      (e: unknown) =>
+        e instanceof ContainerIdentityError && e.code === "BAD_TOKEN_FORMAT",
+      "parseContainerToken 必须把 JWT 当 malformed container token 拒绝",
+    );
+  });
+
+  test("`Bearer <jwt>` 也不能通过 parseContainerToken — Bearer 前缀剥离后仍非容器格式", async () => {
+    const issued = await signAccess({ sub: "1", role: "user" }, SECRET);
+    assert.throws(
+      () => parseContainerToken(`Bearer ${issued.token}`),
+      (e: unknown) =>
+        e instanceof ContainerIdentityError && e.code === "BAD_TOKEN_FORMAT",
     );
   });
 });
