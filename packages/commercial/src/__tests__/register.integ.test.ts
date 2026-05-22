@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
-import { register, RegisterError } from "../auth/register.js";
+import { register, RegisterError, isEmailDomainBlocked } from "../auth/register.js";
 import { verifyPassword } from "../auth/passwords.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 
@@ -391,5 +391,119 @@ describe("auth.register (integ)", () => {
     );
     assert.equal(u.rows[0].cnt, "0");
     assert.equal(mailer.sent.length, 0);
+  });
+
+  // ─── 邮箱域名黑名单(反薅羊毛 — 2026-05-22) ─────────────────────────
+  //
+  // 三例覆盖:
+  //   1. 精确根域命中 → 拒,且无 DB 副作用
+  //   2. 子域 endsWith 命中 → 拒(`mx.tempmail.test` 命中规则 `tempmail.test`)
+  //   3. 不命中(@gmail.com vs blocklist=['tempmail.test']) → 正常注册
+
+  test("blocklist exact root domain → EMAIL_DOMAIN_BLOCKED, no DB writes", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    await assert.rejects(
+      register(
+        {
+          email: "abuse@tempmail.test",
+          password: "this is fine",
+          turnstile_token: "tok",
+        },
+        {
+          mailer,
+          turnstileBypass: true,
+          emailDomainBlocklist: ["tempmail.test"],
+        },
+      ),
+      (err: unknown) => err instanceof RegisterError && err.code === "EMAIL_DOMAIN_BLOCKED",
+    );
+    const u = await query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM users");
+    assert.equal(u.rows[0].cnt, "0");
+    assert.equal(mailer.sent.length, 0);
+  });
+
+  test("blocklist suffix match: subdomain of blocked rule → EMAIL_DOMAIN_BLOCKED", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    await assert.rejects(
+      register(
+        {
+          email: "abuse@mx.tempmail.test",
+          password: "another fine one",
+          turnstile_token: "tok",
+        },
+        {
+          mailer,
+          turnstileBypass: true,
+          emailDomainBlocklist: ["tempmail.test"],
+        },
+      ),
+      (err: unknown) => err instanceof RegisterError && err.code === "EMAIL_DOMAIN_BLOCKED",
+    );
+    const u = await query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM users");
+    assert.equal(u.rows[0].cnt, "0");
+  });
+
+  test("blocklist non-match: unrelated domain → registers normally", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    const r = await register(
+      {
+        email: "innocent@gmail.com",
+        password: "perfectly valid",
+        turnstile_token: "tok",
+      },
+      {
+        mailer,
+        turnstileBypass: true,
+        emailDomainBlocklist: ["tempmail.test"],
+      },
+    );
+    assert.ok(r.user_id);
+    assert.equal(r.verify_email_sent, true);
+  });
+});
+
+// ─── isEmailDomainBlocked 纯函数单元测试(无 DB) ─────────────────────
+describe("isEmailDomainBlocked", () => {
+  test("empty blocklist → never blocked", () => {
+    assert.equal(isEmailDomainBlocked("anyone@any.com", []), false);
+  });
+
+  test("exact root domain match", () => {
+    assert.equal(isEmailDomainBlocked("a@tempmail.com", ["tempmail.com"]), true);
+  });
+
+  test("subdomain endsWith match (boundary on '.')", () => {
+    assert.equal(isEmailDomainBlocked("a@mx.tempmail.com", ["tempmail.com"]), true);
+    assert.equal(isEmailDomainBlocked("a@x.y.tempmail.com", ["tempmail.com"]), true);
+  });
+
+  test("boundary: 'notfoo.com' must NOT match rule 'foo.com'", () => {
+    assert.equal(isEmailDomainBlocked("a@notfoo.com", ["foo.com"]), false);
+    assert.equal(isEmailDomainBlocked("a@bar-foo.com", ["foo.com"]), false);
+  });
+
+  test("case-insensitive domain (email side normalized inside fn)", () => {
+    assert.equal(isEmailDomainBlocked("a@TempMail.COM", ["tempmail.com"]), true);
+  });
+
+  test("LDC synthetic domain NOT auto-exempt — function is policy-agnostic", () => {
+    // 政策与函数解耦:SSO 走 socialLogin.ts,本就不会进入本函数;但若有人手贱
+    // 把合成域塞进 blocklist,函数仍正确命中。这是有意为之 — 防止把"SSO 例外"
+    // 偷渡进通用域名规则。
+    assert.equal(
+      isEmailDomainBlocked("linuxdo-42@users.claudeai.chat", ["users.claudeai.chat"]),
+      true,
+    );
+  });
+
+  test("malformed email (no '@') → false (defensive)", () => {
+    assert.equal(isEmailDomainBlocked("not-an-email", ["foo.com"]), false);
+  });
+
+  test("plus-tag in local part does not affect domain match", () => {
+    assert.equal(isEmailDomainBlocked("a+spam@tempmail.com", ["tempmail.com"]), true);
   });
 });

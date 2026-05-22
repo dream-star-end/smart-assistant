@@ -114,10 +114,54 @@ describe("KEY_META", () => {
         assert.ok((m.max ?? 0) > (m.min ?? 0));
       } else if (m.kind === "enum") {
         assert.ok(Array.isArray(m.enumValues) && m.enumValues.length > 0);
+      } else if (m.kind === "string_array") {
+        // textarea 模式:必须有 max 项数约束(admin UI / server zod 都要靠它)
+        assert.equal(typeof m.max, "number");
+        assert.ok((m.max ?? 0) > 0);
       } else {
         assert.equal(m.kind, "boolean");
       }
     }
+  });
+});
+
+describe("KEY_SCHEMAS — register_email_domain_blocklist", () => {
+  const s = KEY_SCHEMAS.register_email_domain_blocklist;
+  test("accepts valid concrete domains", () => {
+    assert.ok(s.safeParse([]).success);
+    assert.ok(s.safeParse(["tempmail.com"]).success);
+    assert.ok(s.safeParse(["foo.bar.example.com"]).success);
+    assert.ok(s.safeParse(["a-b.co"]).success);
+  });
+  test("rejects wildcards / leading-dot / invalid labels", () => {
+    assert.equal(s.safeParse(["*.tempmail.com"]).success, false);
+    assert.equal(s.safeParse([".tempmail.com"]).success, false);
+    assert.equal(s.safeParse(["tempmail."]).success, false);
+    assert.equal(s.safeParse(["-foo.com"]).success, false);
+    assert.equal(s.safeParse(["foo-.com"]).success, false);
+    assert.equal(s.safeParse(["foo"]).success, false); // 必须至少一个 dot
+    assert.equal(s.safeParse(["foo bar.com"]).success, false);
+  });
+  test("lowercases on parse", () => {
+    const r = s.safeParse(["TempMail.COM"]);
+    assert.ok(r.success);
+    assert.deepEqual(r.data, ["tempmail.com"]);
+  });
+  test("trims whitespace", () => {
+    const r = s.safeParse([" tempmail.com "]);
+    assert.ok(r.success);
+    assert.deepEqual(r.data, ["tempmail.com"]);
+  });
+  test("enforces max 500 items", () => {
+    const big = Array.from({ length: 501 }, (_, i) => `d${i}.example.com`);
+    assert.equal(s.safeParse(big).success, false);
+    const ok = Array.from({ length: 500 }, (_, i) => `d${i}.example.com`);
+    assert.ok(s.safeParse(ok).success);
+  });
+  test("non-array rejected", () => {
+    assert.equal(s.safeParse("tempmail.com").success, false);
+    assert.equal(s.safeParse(null).success, false);
+    assert.equal(s.safeParse(undefined).success, false);
   });
 });
 

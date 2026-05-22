@@ -10,6 +10,7 @@ import { createCommercialHandler } from "../http/router.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { signAccess } from "../auth/jwt.js";
 import { warmupLoginDummyHash } from "../auth/login.js";
+import { setSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 
 /**
@@ -610,6 +611,156 @@ describe("commercial HTTP router (integ)", () => {
       assert.equal(ev.rows[0].cnt, "1", "blocked event must be recorded");
     } finally {
       await new Promise<void>((resolve) => tightServer.close(() => resolve()));
+    }
+  });
+
+  // ─── 邮箱域名黑名单 — HTTP 端到端接线(2026-05-22)────────────────────
+  //
+  // auth 层(register.integ / verify.integ)已锁住 isEmailDomainBlocked + 注入
+  // 路径的纯函数行为。这里再补两条 HTTP 级用例,专门证明:
+  //   - handler 真的读 system_settings.register_email_domain_blocklist
+  //   - 真的把它作为 deps 传给 register() / verifyEmail()
+  //   - RegisterError/VerifyError("EMAIL_DOMAIN_BLOCKED") 被映射成 400 + 标准 error.code
+  //
+  // 没有这两条用例,handlers.ts 里"接 setting → 注 deps"那段接线可以悄悄
+  // 退化(比如忘读 setting / 传错 key)而 auth 层单测全绿。
+
+  test("HTTP register reads system_settings blocklist → 400 EMAIL_DOMAIN_BLOCKED + no user row", async (t) => {
+    if (skipIfMissing(t)) return;
+    try {
+      // 1) 先注册一个真用户充当 admin(setSystemSetting 走的 admin_audit
+      //    FK 指向 users(id),不能凭空用一个不存在的 id)
+      const adminReg = await postJson("/api/auth/register", {
+        email: "admin-setter-reg@example.com",
+        password: "admin good password 1",
+        turnstile_token: "tok",
+      });
+      assert.equal(adminReg.status, 201, JSON.stringify(adminReg.json));
+      const adminId = BigInt(adminReg.json.user_id as string);
+
+      // 2) admin 写入黑名单。用合成域名而不是 DEFAULTS 里的真实垃圾邮箱域,
+      //    避免与"行不存在 → 走 DEFAULTS"的兜底语义混在一起。
+      await setSystemSetting(
+        "register_email_domain_blocklist",
+        ["tempmail-http-integ.test"],
+        { adminId, ip: "127.0.0.1", userAgent: "integ-test" },
+      );
+
+      // 3) 用该域名 register → handler 必须读到上面写入的规则并拦下
+      const r = await postJson("/api/auth/register", {
+        email: "abuse@tempmail-http-integ.test",
+        password: "abuse good password 1",
+        turnstile_token: "tok",
+      });
+      assert.equal(r.status, 400, JSON.stringify(r.json));
+      assert.equal(
+        (r.json.error as Record<string, unknown>).code,
+        "EMAIL_DOMAIN_BLOCKED",
+        "HTTP error.code 必须透出 EMAIL_DOMAIN_BLOCKED",
+      );
+
+      // 4) 副作用:users 表无该 email 行(拦截在 hashPassword/INSERT 之前)
+      const u = await query<{ cnt: string }>(
+        "SELECT COUNT(*)::text AS cnt FROM users WHERE email = $1",
+        ["abuse@tempmail-http-integ.test"],
+      );
+      assert.equal(u.rows[0].cnt, "0", "blocked register 不应落用户行");
+    } finally {
+      // beforeEach 不 TRUNCATE system_settings → 必须显式清,免得污染后续 case
+      await query(
+        "DELETE FROM system_settings WHERE key = 'register_email_domain_blocklist'",
+      );
+    }
+  });
+
+  test("HTTP verify-email reads system_settings blocklist → 400 + no code consume / no bonus", async (t) => {
+    if (skipIfMissing(t)) return;
+    try {
+      // 1) 空 blocklist 下注册存量用户 stash@http-disposable.test → 拿到验证码
+      //    (这步成功必要,否则后续 verify 拿不到 pending 行)
+      const stashReg = await postJson("/api/auth/register", {
+        email: "stash@http-disposable.test",
+        password: "stash good password 1",
+        turnstile_token: "tok",
+      });
+      assert.equal(stashReg.status, 201, JSON.stringify(stashReg.json));
+      const userId = stashReg.json.user_id as string;
+      // mailer 由 beforeEach 清空 → mailer.sent[0] 一定是 stash 那封注册码邮件
+      const stashMail = mailer.sent.find(
+        (m) => m.to === "stash@http-disposable.test",
+      );
+      assert.ok(stashMail, "test setup: stash verify mail not captured");
+      const code = stashMail.text.match(/\n {4}(\d{6})\n/)?.[1];
+      assert.ok(code, "test setup: verify code not captured from mail body");
+
+      // 2) 注册 admin 拿 user_id 当 admin_audit FK 持有者
+      const adminReg = await postJson("/api/auth/register", {
+        email: "admin-setter-verify@example.com",
+        password: "admin good password 2",
+        turnstile_token: "tok",
+      });
+      assert.equal(adminReg.status, 201, JSON.stringify(adminReg.json));
+      const adminId = BigInt(adminReg.json.user_id as string);
+
+      // 3) admin 把 stash 的域加入黑名单
+      await setSystemSetting(
+        "register_email_domain_blocklist",
+        ["http-disposable.test"],
+        { adminId, ip: "127.0.0.1", userAgent: "integ-test" },
+      );
+
+      // 4) verify-email HTTP → handler 必须读 setting,verifyEmail() 抛
+      //    EMAIL_DOMAIN_BLOCKED,handler 映射到 400 + error.code 透传
+      const r = await postJson("/api/auth/verify-email", {
+        email: "stash@http-disposable.test",
+        code,
+      });
+      assert.equal(r.status, 400, JSON.stringify(r.json));
+      assert.equal(
+        (r.json.error as Record<string, unknown>).code,
+        "EMAIL_DOMAIN_BLOCKED",
+      );
+
+      // 5) 关键副作用断言 — Codex plan review 明确要求:
+      //    a) 码 NOT consumed → admin 移规则后用户仍可走完 verify
+      //    b) email_verified 仍 false → 没误授信任
+      //    c) 没发促销赠金 → 反薅羊毛目标达成
+      const ev = await query<{ used_at: string | null }>(
+        "SELECT used_at::text AS used_at FROM email_verifications WHERE user_id = $1",
+        [userId],
+      );
+      assert.equal(
+        ev.rows[0].used_at,
+        null,
+        "blocked verify HTTP 不应消费验证码(避免合法用户被永久锁死)",
+      );
+      const usr = await query<{ email_verified: boolean; credits: string }>(
+        "SELECT email_verified, credits::text AS credits FROM users WHERE id = $1",
+        [userId],
+      );
+      assert.equal(
+        usr.rows[0].email_verified,
+        false,
+        "blocked verify HTTP 不应翻 verified",
+      );
+      assert.equal(
+        usr.rows[0].credits,
+        "0",
+        "blocked verify HTTP 不应发赠金 — 这正是反薅羊毛的目标",
+      );
+      const led = await query<{ cnt: string }>(
+        "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1 AND reason = 'promotion'",
+        [userId],
+      );
+      assert.equal(
+        led.rows[0].cnt,
+        "0",
+        "blocked verify HTTP 不应写 promotion ledger 行",
+      );
+    } finally {
+      await query(
+        "DELETE FROM system_settings WHERE key = 'register_email_domain_blocklist'",
+      );
     }
   });
 });
