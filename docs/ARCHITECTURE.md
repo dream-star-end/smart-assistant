@@ -1,5 +1,17 @@
 # OpenClaude Architecture
 
+> **⚠️ SUPERSEDED (2026-05-23)** — 本文描述的是**个人版**(45.32 master)架构,
+> 写于 v3 商用版分叉之前。v3 引入了容器隔离、`agent_containers` 状态机、
+> compute host pool、supervisor 子进程等,与本文的"单进程 gateway + sessionManager
+> + eventBus" 模型已经不一致。
+>
+> **当前 v3 商用版权威文档**:
+> - `docs/v3/01-OVERVIEW.md` — v3 总览
+> - `docs/v3/02-DEVELOPMENT-PLAN.md` — 开发计划与 R-series 实施记录
+> - `docs/hotfix-deploy-checklist.md` — 部署与诊断
+>
+> 本文保留作为个人版历史参考。修个人版可继续读;读 v3 请去上面三个文档。
+
 ## Overview
 
 OpenClaude is a personal AI assistant built on top of Claude Code Best (CCB) as the execution harness.

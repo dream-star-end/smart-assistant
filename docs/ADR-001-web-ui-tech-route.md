@@ -1,5 +1,13 @@
 # ADR-001: Web UI 技术路线
 
+> **⚠️ SUPERSEDED (2026-05-23)** — 本 ADR 是**个人版** 2026-04-12 的决策,
+> 针对 `packages/web/public/app.js` 单文件 vanilla JS 路线。v3 商用版 Web UI
+> 已重写为 ES modules 拆分(`packages/web/public/modules/`,21 个模块),
+> 并由 v3 自己的 R-series plan 推动。本文不再代表 v3 现状或现行决策。
+>
+> v3 Web 架构现状见 `packages/web/public/modules/` 目录结构 + `docs/v3/02-DEVELOPMENT-PLAN.md`
+> 中 R-series 前端任务记录。
+
 **状态**: 已决定  
 **日期**: 2026-04-12  
 **决策者**: 项目维护者

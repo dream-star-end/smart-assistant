@@ -176,7 +176,10 @@ smart-assistant/
 │   ├── deploy_runner.py       # SSH 部署工具(个人版)
 │   ├── browser-stealth.js     # Playwright 反检测脚本(个人版)
 │   └── seeds/skills/          # 个人版 7 个预置系统 skills
-└── AUDIT_REMEDIATION_TASKS_2026-04-11.md  # 安全审计整改清单(个人版 2026-04 早期 audit)
+└── docs/archive/              # 历史 audit/refactor plan 归档(详见 docs/archive/README.md)
+    ├── AUDIT_REMEDIATION_TASKS_2026-04-11.md
+    ├── AUDIT_REMEDIATION_TASKS_2026-04-25.md
+    └── CCB_ASSISTANT_REFACTOR_PLAN_2026-04-12.md
 ```
 
 ---
