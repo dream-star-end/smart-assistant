@@ -171,12 +171,12 @@ smart-assistant/
 │   │   └── webchat/           # WebChat 直连
 │   ├── cli/                   # CLI 入口 (onboard / gateway)
 │   └── plugin-sdk/            # ChannelAdapter 接口
-├── deploy/                    # 部署脚本 + systemd 配置 + 种子 skills
-│   ├── .env.example           # 环境变量模板
-│   ├── deploy_runner.py       # SSH 部署工具
-│   ├── browser-stealth.js     # Playwright 反检测脚本
-│   └── seeds/skills/          # 7 个预置系统 skills
-└── AUDIT_REMEDIATION_TASKS_2026-04-11.md  # 安全审计整改清单
+├── deploy/legacy-master/      # 个人版残留资产,归档保留 git 历史(详见 deploy/README.md)
+│   ├── .env.example           # 环境变量模板(个人版)
+│   ├── deploy_runner.py       # SSH 部署工具(个人版)
+│   ├── browser-stealth.js     # Playwright 反检测脚本(个人版)
+│   └── seeds/skills/          # 个人版 7 个预置系统 skills
+└── AUDIT_REMEDIATION_TASKS_2026-04-11.md  # 安全审计整改清单(个人版 2026-04 早期 audit)
 ```
 
 ---
