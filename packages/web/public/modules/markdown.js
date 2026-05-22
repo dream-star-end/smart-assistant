@@ -1,8 +1,8 @@
 // OpenClaude — Markdown rendering, media embedding, rich blocks
-import { htmlSafeEscape } from './dom.js?v=1213709f'
-import { TRANSPARENT_PIXEL_DATA_URL, getCachedSignedUrl } from './mediaSign.js?v=1213709f'
-import { effectiveTheme } from './theme.js?v=1213709f'
-import { _basename } from './util.js?v=1213709f'
+import { htmlSafeEscape } from './dom.js?v=9b7fca24'
+import { TRANSPARENT_PIXEL_DATA_URL, getCachedSignedUrl } from './mediaSign.js?v=9b7fca24'
+import { effectiveTheme } from './theme.js?v=9b7fca24'
+import { _basename } from './util.js?v=9b7fca24'
 
 // ── Mermaid lazy loader ──
 // A single shared promise prevents concurrent callers from each injecting a <script>.
@@ -308,15 +308,6 @@ const _AUD_EXTS = /\.(mp3|wav|ogg|aac|flac|m4a)(\?[^\s"')<]*)?$/i
 const _VID_EXTS = /\.(mp4|webm|mov)(\?[^\s"')<]*)?$/i
 const _PDF_EXTS = /\.pdf(\?[^\s"')<]*)?$/i
 
-// "新标签页打开" 图标 — PDF doc-card 用作下载兜底按钮(华为/Quark/UC 等国产
-// 浏览器拒绝 `<a download>` 触发的隐式下载,弹"此网站不支持下载";用户改点这个
-// 按钮走"用户主动顶层导航"接收 signed URL,绕开 `<a download>` 触发的浏览器拦截策略,
-// 服务端响应仍为 attachment、不承诺 PDF viewer 内联预览,见 _renderLocalMedia 注释)。
-// 与 `_imgHtml` 内 `svgOpen` 同款 path,但当前刻意不抽取共享常量 —— 范围内只
-// 改 PDF doc-card,等下次有第三个 caller 再 DRY。
-const _OPEN_BTN_SVG =
-  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>'
-
 // Convert a local absolute path to a gateway-served URL
 export function localPathToUrl(absPath) {
   return `/api/file?path=${encodeURIComponent(absPath)}`
@@ -407,24 +398,9 @@ export function _renderLocalMedia(filePath) {
   // 2. 当前页 + Content-Disposition: attachment(下面 download attr 同源强制覆盖
   //    服务端的 inline)→ 浏览器原生下载 dialog,不离开对话页,WS / 输入框状态全保留
   // 这两条让 PDF 跟 tar.gz 体验一致:点 → 下载到本地 → 系统 PDF viewer 打开
-  //
-  // 2026-05-22 PDF 分支额外渲染一个 sibling "新标签页打开" 按钮 ——
-  // 华为/Quark/UC 等国产浏览器对 `<a download>` 触发的隐式下载,弹"此网站不支持下载",
-  // 用户无法保存。这个 fallback 按钮:点击同步预开 about:blank 占住 user activation,
-  // await 签名后 `popup.location.replace(url)` 导航,浏览器以"用户主动顶层导航"
-  // 接收 signed URL 响应,绕开 `<a download>` 触发的浏览器拦截策略。
-  // **注意契约**:服务端 containerFileProxy 始终返回 `Content-Disposition: attachment`,
-  // 我们没改服务端响应,也不承诺"PDF viewer 内联预览"——华为浏览器收到 attachment 后
-  // 通常仍然是触发系统下载流程(只是不再被前面那条 download-policy 弹窗拦截);
-  // 桌面 Chrome/Edge/Safari 收到 attachment 则会按各自下载策略落盘。
-  // 主下载行为仍是 anchor + `<a download>`,Chrome/Safari 主流程用户体验不变。
-  // wrapper 用 `<span>` 不用 `<div>`:doc-card 经常出现在 markdown paragraph
-  // 的 inline flow 里,inline wrapper 不破坏段落结构;`<button>` 是 anchor 的 sibling
-  // 而非 child(HTML content model 禁止 interactive descendant in `<a href>`)。
   if (_PDF_EXTS.test(filePath)) {
     const hrefAttr = cached ? ` href="${htmlSafeEscape(cached)}"` : ''
-    const openHrefAttr = cached ? ` data-open-href="${htmlSafeEscape(cached)}"` : ''
-    return `<span class="doc-card-wrap"><a class="doc-card"${hrefAttr} rel="noopener" download="${safeName}" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📄</span><span class="doc-card-name">${safeName}</span></a><button type="button" class="doc-card-open" title="在新标签页打开" aria-label="在新标签页打开 ${safeName}" data-pending-sign-path="${safePending}" data-sign-target="open-href"${openHrefAttr}>${_OPEN_BTN_SVG}</button></span>`
+    return `<a class="doc-card"${hrefAttr} rel="noopener" download="${safeName}" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📄</span><span class="doc-card-name">${safeName}</span></a>`
   }
   const hrefAttr = cached ? ` href="${htmlSafeEscape(cached)}"` : ''
   return `<a class="doc-card"${hrefAttr} rel="noopener" download="${safeName}" data-pending-sign-path="${safePending}" data-sign-target="href"><span class="doc-card-icon">📎</span><span class="doc-card-name">${safeName}</span></a>`
