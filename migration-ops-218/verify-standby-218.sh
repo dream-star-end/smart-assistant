@@ -95,20 +95,23 @@ else
     FAIL=$((FAIL+1))
   fi
 
-  # 6. sessions.db freshness (must be < 5 min old vs primary, since fast-sync
-  #    runs every 1 min). Allow 5 min for slack.
-  PRIM_TS=$(ssh "$PRIMARY_HOST" 'stat -c %Y /root/.openclaude/sessions.db' 2>/dev/null || echo 0)
+  # 6. sessions.db freshness — 218 standby's sessions.db mtime should be
+  #    within ~5 min of NOW (fast sync runs every 1 min). Do NOT compare
+  #    against KL primary's sessions.db mtime: KL runs SQLite WAL mode,
+  #    so the main .db file is only touched at checkpoints (many minutes
+  #    stale) while live writes go to sessions.db-wal. Using ST_TS vs NOW
+  #    measures what we actually care about: how stale is the standby copy.
+  NOW=$(date +%s)
   ST_TS=$(stat -c %Y /root/.openclaude/sessions.db 2>/dev/null || echo 0)
-  DRIFT=$(( PRIM_TS - ST_TS ))
-  if [ "$DRIFT" -lt 0 ]; then DRIFT=$(( -DRIFT )); fi
+  AGE=$(( NOW - ST_TS ))
   if [ "$ST_TS" = 0 ]; then
     red "✗ /root/.openclaude/sessions.db missing on 218"
     FAIL=$((FAIL+1))
-  elif [ "$DRIFT" -gt 300 ]; then
-    yellow "⚠ sessions.db drift ${DRIFT}s > 300s — sync hook may be stuck"
+  elif [ "$AGE" -gt 300 ]; then
+    yellow "⚠ sessions.db age ${AGE}s > 300s — sync hook may be stuck"
     FAIL=$((FAIL+1))
   else
-    green "✓ sessions.db drift=${DRIFT}s (≤300s)"
+    green "✓ sessions.db age=${AGE}s (≤300s)"
   fi
 fi
 
