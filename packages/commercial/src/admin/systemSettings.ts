@@ -67,6 +67,35 @@ export const KEY_SCHEMAS = {
   onboarding_enabled: z.boolean(),
   /** dry-run;true → 走完整 SELECT 但事务回滚,不写 inbox(用来观察会触达多少人)。 */
   onboarding_dry_run: z.boolean(),
+  // ── 邮箱域名黑名单(反薅羊毛 — 2026-05-22) ──
+  /**
+   * 注册/邮箱验证拒收的域名列表(精确根域 + 边界 suffix 匹配)。
+   *
+   * 每项必须是合法 ASCII 域名(全小写,无前后空白,无 wildcard);上限 500 项。
+   * 命中规则见 `auth/register.ts:isEmailDomainBlocked`:
+   *   - `domain === rule` 或 `domain.endsWith("." + rule)` 视为命中
+   *   - 注册路径(POST /api/auth/register)命中 → 400 EMAIL_DOMAIN_BLOCKED
+   *   - 邮箱验证路径(POST /api/auth/verify-email)在验证码校验通过后再查一次,
+   *     用于挡掉上线**前**已注册未验证的 disposable 邮箱存量(避免他们仍然
+   *     完成验证拿赠金)。
+   *
+   * 不在此规则内 — LDC SSO 合成域 `users.claudeai.chat` 走 socialLogin.ts,
+   * 不经过 register/verifyEmail 路径,天然不受此规则约束。
+   */
+  register_email_domain_blocklist: z
+    .array(
+      z
+        .string()
+        .trim()
+        .toLowerCase()
+        .min(3)
+        .max(253)
+        .regex(
+          /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/,
+          "invalid domain",
+        ),
+    )
+    .max(500),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -90,12 +119,61 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   alerts_silent_new_user_threshold: 5,
   onboarding_enabled: false,
   onboarding_dry_run: false,
+  // 一次性邮箱常见域名 seed(2026-05-22)。policy:concrete domains only,无
+  // wildcard / forwarding service(如 33mail / anonaddy 不收录,避免误伤);
+  // 后续运营调整走 admin UI,不需要发版。
+  register_email_domain_blocklist: [
+    "10minutemail.com",
+    "10minutemail.net",
+    "guerrillamail.com",
+    "guerrillamail.net",
+    "guerrillamail.org",
+    "guerrillamail.de",
+    "guerrillamail.biz",
+    "sharklasers.com",
+    "mailinator.com",
+    "temp-mail.org",
+    "tempmail.com",
+    "yopmail.com",
+    "maildrop.cc",
+    "trashmail.com",
+    "mintemail.com",
+    "mohmal.com",
+    "emailondeck.com",
+    "fakeinbox.com",
+    "getairmail.com",
+    "spambox.us",
+    "dropmail.me",
+    "mailcatch.com",
+    "nada.email",
+    "mailnesia.com",
+    "discard.email",
+    "fakermail.com",
+    "throwawaymail.com",
+    "dispostable.com",
+    "fakemailgenerator.com",
+    "tmpmail.org",
+  ],
 };
 
-/** 给前端做 schema 自描述(admin UI 渲染表单用)。 */
+/**
+ * 给前端做 schema 自描述(admin UI 渲染表单用)。
+ *
+ * kind 取值约束 — 与 `packages/web/public/modules/admin.js` 的渲染分支一一对应:
+ *   - `boolean` → `<select>` (true/false)
+ *   - `number`  → `<input type=number>`,根据 min/max 提示范围
+ *   - `enum`    → `<select>`,选项来自 enumValues
+ *   - `string_array` → `<textarea>`,一行一个;save 时按 `\n`/`,` split + trim + lowercase
+ */
 export const KEY_META: Record<
   SystemSettingKey,
-  { kind: "boolean" | "number" | "enum"; enumValues?: string[]; min?: number; max?: number; description: string }
+  {
+    kind: "boolean" | "number" | "enum" | "string_array";
+    enumValues?: string[];
+    min?: number;
+    max?: number;
+    description: string;
+  }
 > = {
   idle_sweep_min: { kind: "number", min: 1, max: 1440, description: "Docker 容器空闲多少分钟后被回收" },
   allow_registration: { kind: "boolean", description: "是否允许新用户注册" },
@@ -137,6 +215,12 @@ export const KEY_META: Record<
   },
   onboarding_enabled: { kind: "boolean", description: "用户激活/留存自动 inbox 触达(R1..R6)总开关" },
   onboarding_dry_run: { kind: "boolean", description: "Onboarding dry-run:走完 SELECT 但事务回滚,不写 inbox" },
+  register_email_domain_blocklist: {
+    kind: "string_array",
+    max: 500,
+    description:
+      "邮箱域名黑名单(一行一个;边界 suffix 匹配 — rule `foo.com` 自动覆盖 `*.foo.com`;LDC 合成域 users.claudeai.chat 不受此约束)",
+  },
 };
 
 export const ALLOWED_KEYS: SystemSettingKey[] =

@@ -353,7 +353,14 @@ export async function handleRegister(
   // V3 Phase 4H+:system_settings.allow_registration=false 时直接 403。
   // 顺序上放在 rate limit 之前 —— 开关关了就别让这条路径消耗限流额度,
   // 也避免 401/400 把真正的"注册关闭"语义掩盖掉。
-  const allowReg = await getSystemSetting("allow_registration");
+  //
+  // 2026-05-22:同步读 register_email_domain_blocklist(反薅羊毛黑名单)。
+  // 并行两 setting 走 Promise.all 省一次 DB round-trip;allow_registration
+  // 仍单独提前判定以保留"关了直接 403"的语义,只在它放行时才用到 blocklist。
+  const [allowReg, blocklistSetting] = await Promise.all([
+    getSystemSetting("allow_registration"),
+    getSystemSetting("register_email_domain_blocklist"),
+  ]);
   if (allowReg.value !== true) {
     throw new HttpError(403, "REGISTRATION_DISABLED", "已关闭新用户注册");
   }
@@ -371,6 +378,7 @@ export async function handleRegister(
       fetchImpl: deps.fetchImpl,
       remoteIp: ctx.clientIp,
       verifyEmailUrlBase: deps.verifyEmailUrlBase,
+      emailDomainBlocklist: blocklistSetting.value,
     });
     sendJson(res, 201, {
       user_id: result.user_id,
@@ -382,6 +390,7 @@ export async function handleRegister(
         VALIDATION: { status: 400 },
         TURNSTILE_FAILED: { status: 400 },
         CONFLICT: { status: 409 },
+        EMAIL_DOMAIN_BLOCKED: { status: 400 },
       };
       const m = map[err.code];
       throw new HttpError(m.status, err.code, err.message, { issues: err.issues });
@@ -663,8 +672,14 @@ export async function handleVerifyEmail(
   //   - email 维度桶 key 用 sha256 前缀,避免明文邮箱写 rate_limit_events
   const emailCfg = deps.rateLimits?.verifyEmailEmail ?? DEFAULT_RATE_LIMITS.verifyEmailEmail;
   await enforceRateLimit(deps, emailCfg, hashEmailForRateLimit(email));
+  // 2026-05-22:反薅羊毛 — verify 也走一次 domain blocklist。
+  // 必须在 verifyEmail() 内 code 校验**通过后**才真的判定(防枚举),所以仅
+  // 把规则注入,具体 hook 在 verify.ts 函数内。
+  const blocklistSetting = await getSystemSetting("register_email_domain_blocklist");
   try {
-    const r = await verifyEmail(email, code);
+    const r = await verifyEmail(email, code, {
+      emailDomainBlocklist: blocklistSetting.value,
+    });
     // 2026-05-12:首次验证成功 → fire-and-forget 触发 v3 容器 pre-warm。
     // 用"验证 → 首消息"的 p50=215s 间隔覆盖 docker run 冷启,首条消息无等待。
     // `prewarmContainer` 装配层已保证同步 return void / 绝不抛(见 v3prewarm.ts);

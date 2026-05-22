@@ -75,8 +75,14 @@ export function bonusForTrustLevel(tl: number | null | undefined): BonusForTrust
   return { bonusCents: LINUXDO_BONUS_CENTS, effectiveTrustLevel: lvl }
 }
 
-/** 合成 email 域名 — 不收件,只占 UNIQUE 槽位。改这个域名前查清现存合成 email */
-const SYNTHETIC_EMAIL_DOMAIN = 'users.claudeai.chat'
+/**
+ * 合成 email 域名 — 不收件,只占 UNIQUE 槽位。改这个域名前查清现存合成 email。
+ *
+ * 单一权威源:本常量是 SSO 合成域唯一定义点。下游消费者(verify.ts 密码重置
+ * 拦截、未来潜在的邮箱域名策略)应 import 而非硬编码字符串,避免值与字符串
+ * 漂移导致策略不一致。
+ */
+export const SYNTHETIC_EMAIL_DOMAIN = 'users.claudeai.chat'
 
 export type SocialProvider = 'linuxdo'
 

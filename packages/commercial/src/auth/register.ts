@@ -16,6 +16,8 @@
  *   - VALIDATION:入参格式错
  *   - TURNSTILE_FAILED:turnstile 远程拒绝(网络错也算)
  *   - CONFLICT:邮箱已存在
+ *   - EMAIL_DOMAIN_BLOCKED:邮箱域名命中 system_settings.register_email_domain_blocklist
+ *     (一次性邮箱黑名单 — 反薅羊毛;verify 路径也会再查一次,详见 verify.ts)
  *
  * 不在本文件:
  *   - HTTP/Express 路由(T-14+)
@@ -51,7 +53,8 @@ export type RegisterInput = z.infer<typeof registerInputSchema>;
 export type RegisterErrorCode =
   | "VALIDATION"
   | "TURNSTILE_FAILED"
-  | "CONFLICT";
+  | "CONFLICT"
+  | "EMAIL_DOMAIN_BLOCKED";
 
 export class RegisterError extends Error {
   readonly code: RegisterErrorCode;
@@ -111,6 +114,12 @@ export interface RegisterDeps {
   verifyEmailUrlBase?: string;
   /** 测试可注入 now(秒) */
   now?: () => number;
+  /**
+   * 邮箱域名黑名单(全小写、精确域名 + 边界 suffix 匹配)。
+   * 由 handler 从 `system_settings.register_email_domain_blocklist` 读出注入。
+   * 缺省(undefined / []) → 不做黑名单判定,放行所有合法域名。
+   */
+  emailDomainBlocklist?: readonly string[];
 }
 
 export interface RegisterResult {
@@ -150,6 +159,38 @@ export function newVerifyCode(): { raw: string; hash: string } {
   };
 }
 
+/**
+ * 检查 email 域名是否命中黑名单(精确根域 + 边界 suffix 匹配)。
+ *
+ * 匹配语义:
+ *   - `domain === rule`            ✅ 命中(精确)
+ *   - `domain.endsWith("." + rule)` ✅ 命中(子域,如 `mx.tempmail.org` 命中 `tempmail.org`)
+ *   - `notfoo.com` vs rule `foo.com` ❌ 不命中(边界保护)
+ *
+ * 设计取舍:
+ *   - 对一次性邮箱供应商,父域所有者通常也控制全部子域,边界 suffix 匹配避免
+ *     攻击者用子域绕过(rule `tempmail.dev` 自动覆盖 `*.tempmail.dev`)。
+ *   - 纯函数,LDC 合成域不在此豁免 — SSO 路径(socialLogin.ts)本就不调用本函数,
+ *     不需要把 SSO 政策耦合进通用域名规则。
+ *   - 调用方负责保证 `blocklist` 元素已 trim + lowercase(system_settings 的
+ *     zod schema 强制 + admin UI 保存路径已 normalize)。本函数对 email 再走
+ *     一次 lowercase 防御,允许 email 来自 DB 列(虽然 DB 写入时 lowercase,
+ *     这里不依赖该约束)。
+ */
+export function isEmailDomainBlocked(
+  email: string,
+  blocklist: readonly string[],
+): boolean {
+  if (blocklist.length === 0) return false;
+  const at = email.lastIndexOf("@");
+  if (at < 0) return false; // 不应发生(emailSchema 已校验);防御性
+  const domain = email.slice(at + 1).toLowerCase();
+  for (const rule of blocklist) {
+    if (domain === rule || domain.endsWith(`.${rule}`)) return true;
+  }
+  return false;
+}
+
 export async function register(
   raw: unknown,
   deps: RegisterDeps,
@@ -184,6 +225,24 @@ export async function register(
   }
   if (!turnstileOk) {
     throw new RegisterError("TURNSTILE_FAILED", "turnstile verification rejected");
+  }
+
+  // 2.5) 邮箱域名黑名单(反薅羊毛 — 2026-05-22)
+  //
+  // 触发位置说明:
+  //   - 必须在 turnstile **之后**:防止无 turnstile 的攻击者免费枚举规则
+  //   - 必须在 argon2 hashPassword **之前**:argon2 是几十 ms 量级的 CPU 重活,
+  //     命中黑名单直接拒绝,不浪费算力
+  //   - 不在函数最前(zod 之后)做:Turnstile 必须先消耗,与现有 register 安全
+  //     惯例对齐;同时避免给"通过 schema 但没有 turnstile token"的探测留信号
+  //
+  // verify 路径(verify.ts)在赠金发放前会再走一次同一函数,处理上线**前**
+  // 已注册未验证的 disposable 邮箱存量。见 verify.ts:verifyEmail。
+  if (deps.emailDomainBlocklist && isEmailDomainBlocked(input.email, deps.emailDomainBlocklist)) {
+    throw new RegisterError(
+      "EMAIL_DOMAIN_BLOCKED",
+      "该邮箱域名暂不支持注册",
+    );
   }
 
   // 3) DB 事务:user + 6 位验证码一起落。verify_email purpose 从 2026-04-23 起

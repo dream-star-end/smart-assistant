@@ -355,6 +355,79 @@ describe("auth.verify.verifyEmail (integ)", () => {
       (err: unknown) => err instanceof VerifyError && err.code === "INVALID_TOKEN",
     );
   });
+
+  // ─── 邮箱域名黑名单(反薅羊毛 — 2026-05-22)─────────────────────────
+  //
+  // 场景:用户 X 在黑名单上线**前**已注册(register 时无 blocklist 放行),
+  // 现在 admin 把 X.domain 加入黑名单 → X 仍然手里有验证码,verify 路径必须挡
+  // (这是 register-only 拦截会留下的存量绕过窗口,Codex 在 plan review 里明确
+  //  指出过的 HIGH severity finding)。
+  //
+  // 关键断言:
+  //   - verify 抛 EMAIL_DOMAIN_BLOCKED
+  //   - email_verifications.used_at 仍 NULL(不消费码 → 移除黑名单后可继续)
+  //   - users.email_verified 仍 false
+  //   - credit_ledger 无 promotion 行(目标:断赠金)
+
+  test("blocked domain at verify time: rejects, no code consume, no bonus", async (t) => {
+    if (skipIfNoPg(t)) return;
+    // 1) 用空 blocklist 注册 → 模拟"上线前已注册未验证"的存量用户
+    const u = await registerAndCaptureVerifyToken("hoarder@disposable.test", "good pwd one");
+
+    // 2) verify 时带上 blocklist → 拒
+    await assert.rejects(
+      verifyEmail(u.verifyEmail, u.rawCode, { emailDomainBlocklist: ["disposable.test"] }),
+      (err: unknown) => err instanceof VerifyError && err.code === "EMAIL_DOMAIN_BLOCKED",
+    );
+
+    // 3) 副作用断言:码未消费 / 未翻 verified / 无赠金
+    const ev = await query<{ used_at: string | null }>(
+      "SELECT used_at::text AS used_at FROM email_verifications WHERE user_id = $1",
+      [u.userId],
+    );
+    assert.equal(ev.rows[0].used_at, null, "blocked verify 不应消费验证码");
+
+    const usr = await query<{ email_verified: boolean; credits: string }>(
+      "SELECT email_verified, credits::text AS credits FROM users WHERE id = $1",
+      [u.userId],
+    );
+    assert.equal(usr.rows[0].email_verified, false, "blocked verify 不应翻 verified 旗");
+    assert.equal(usr.rows[0].credits, "0", "blocked verify 不应发赠金");
+
+    const led = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1 AND reason = 'promotion'",
+      [u.userId],
+    );
+    assert.equal(led.rows[0].cnt, "0", "blocked verify 不应写 promotion ledger 行");
+  });
+
+  test("blocklist suffix at verify time: subdomain rule covers parent rule", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const u = await registerAndCaptureVerifyToken("hoarder@mx.disposable.test", "good pwd two");
+    await assert.rejects(
+      verifyEmail(u.verifyEmail, u.rawCode, { emailDomainBlocklist: ["disposable.test"] }),
+      (err: unknown) => err instanceof VerifyError && err.code === "EMAIL_DOMAIN_BLOCKED",
+    );
+  });
+
+  test("blocklist removal: stateful re-check — same user can verify after rule removed", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const u = await registerAndCaptureVerifyToken("late@example.test", "good pwd three");
+    // 第一次被挡
+    await assert.rejects(
+      verifyEmail(u.verifyEmail, u.rawCode, { emailDomainBlocklist: ["example.test"] }),
+      (err: unknown) => err instanceof VerifyError && err.code === "EMAIL_DOMAIN_BLOCKED",
+    );
+    // admin 移除规则后,同 user/code 再次 verify 应成功(码未被前次消费)
+    const r = await verifyEmail(u.verifyEmail, u.rawCode, { emailDomainBlocklist: [] });
+    assert.equal(r.user_id, u.userId);
+    assert.equal(r.newly_verified, true);
+    const led = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1 AND reason = 'promotion'",
+      [u.userId],
+    );
+    assert.equal(led.rows[0].cnt, "1", "解禁后正常发赠金");
+  });
 });
 
 describe("auth.verify.resendVerification (integ)", () => {

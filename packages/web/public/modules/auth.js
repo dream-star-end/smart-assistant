@@ -818,6 +818,7 @@ function _friendlyAuthError(data, status) {
     case 'VALIDATION':          return msg || '输入格式不合法'
     case 'INVALID_TOKEN':       return '验证码或链接无效/已过期,请重新获取'
     case 'RATE_LIMITED':        return '操作过于频繁,请稍后再试'
+    case 'EMAIL_DOMAIN_BLOCKED': return '该邮箱域名暂不支持注册,请换一个常用邮箱(如 Gmail/QQ/163 等)'
     default:
       if (status === 401) return msg || '认证失败'
       if (status === 403) return msg || '无权访问'

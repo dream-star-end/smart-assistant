@@ -4921,6 +4921,14 @@ function _renderSettingRow(r) {
           `<option value="${escapeHtml(v)}" ${r.value === v ? 'selected' : ''}>${escapeHtml(v)}</option>`,
         ).join('')}
       </select>`
+  } else if (meta.kind === 'string_array') {
+    // 一行一个;saveSetting 按 \n / , split → trim → lowercase → filter empty,
+    // server 端 zod 还会再二次校验每项是合法域名。
+    const items = Array.isArray(r.value) ? r.value : []
+    valueEditor = `
+      <textarea id="set-${key}-value" rows="8" style="width:100%;font-family:monospace"
+                placeholder="一行一个,例如:tempmail.com">${escapeHtml(items.join('\n'))}</textarea>
+      <div style="color:var(--muted);font-size:12px;margin-top:4px">当前 ${items.length} 项</div>`
   } else {
     // number — 用 type=text 让用户自己看出范围,client 只做基本校验,server 二次校验
     valueEditor = `
@@ -4930,6 +4938,7 @@ function _renderSettingRow(r) {
   }
   const range = meta.kind === 'number' ? `${meta.min}..${meta.max}`
               : meta.kind === 'enum' ? (meta.enumValues || []).join('/')
+              : meta.kind === 'string_array' ? `max=${meta.max ?? '?'} 项`
               : 'true/false'
   return `
     <tr>
@@ -4961,6 +4970,9 @@ async function saveSetting(key, btn) {
     const n = Number(valEl.value)
     if (!Number.isFinite(n)) { toast(`${key}: 不是有效数字`, 'danger'); return }
     value = n
+  } else if (valEl.tagName === 'TEXTAREA') {
+    // string_array:换行/逗号分隔 → trim+lowercase+filter empty,server zod 二次校验
+    value = valEl.value.split(/[\n,]+/).map((s) => s.trim().toLowerCase()).filter(Boolean)
   } else {
     value = valEl.value
   }

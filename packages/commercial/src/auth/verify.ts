@@ -29,7 +29,9 @@ import {
   newVerifyCode,
   SIGNUP_BONUS_CENTS,
   VERIFY_EMAIL_TTL_SECONDS,
+  isEmailDomainBlocked,
 } from './register.js'
+import { SYNTHETIC_EMAIL_DOMAIN } from './socialLogin.js'
 import { verifyTurnstile, TurnstileError } from './turnstile.js'
 import type { Mailer } from './mail.js'
 
@@ -51,7 +53,17 @@ const verifyCodeSchema = z
   .trim()
   .regex(/^\d{6}$/, 'invalid code format')
 
-export type VerifyErrorCode = 'VALIDATION' | 'INVALID_TOKEN' | 'WEAK_PASSWORD' | 'TURNSTILE_FAILED'
+export type VerifyErrorCode =
+  | 'VALIDATION'
+  | 'INVALID_TOKEN'
+  | 'WEAK_PASSWORD'
+  | 'TURNSTILE_FAILED'
+  /**
+   * email 域名命中 `system_settings.register_email_domain_blocklist`。
+   * verifyEmail 路径专用 — register 路径有同名错误码,前端文案可复用。
+   * 仅在 code 已成功比对后才会抛,防止 verify 成为黑名单枚举口子。
+   */
+  | 'EMAIL_DOMAIN_BLOCKED'
 
 export class VerifyError extends Error {
   readonly code: VerifyErrorCode
@@ -65,6 +77,18 @@ export class VerifyError extends Error {
 export interface CommonDeps {
   /** 测试可注入 now(秒) */
   now?: () => number
+}
+
+export interface VerifyEmailDeps extends CommonDeps {
+  /**
+   * 邮箱域名黑名单(全小写、精确根域 + 边界 suffix 匹配)。
+   * 由 handler 从 `system_settings.register_email_domain_blocklist` 读出注入。
+   * 缺省(undefined / []) → 不做黑名单判定。
+   *
+   * 注意:与 register 路径的 `emailDomainBlocklist` 同语义、同函数(isEmailDomainBlocked);
+   * verify 在 code 校验成功**之后**才查,防止无 turnstile 的 verify 路径成为枚举口子。
+   */
+  emailDomainBlocklist?: readonly string[]
 }
 
 export interface RequestResetDeps extends CommonDeps {
@@ -124,7 +148,7 @@ export interface VerifyEmailResult {
 export async function verifyEmail(
   rawEmail: string,
   rawCode: string,
-  deps: CommonDeps = {},
+  deps: VerifyEmailDeps = {},
 ): Promise<VerifyEmailResult> {
   const emailParsed = emailSchema.safeParse(rawEmail)
   const codeParsed = verifyCodeSchema.safeParse(rawCode)
@@ -184,6 +208,22 @@ export async function verifyEmail(
       throw new VerifyError('INVALID_TOKEN', 'verification code invalid or expired')
     }
     const evId = evRow.rows[0].id
+
+    // 反薅羊毛黑名单 — 2026-05-22。
+    //
+    // 触发位置硬约束:必须在 code 校验通过 **之后**、used_at 写入 / 赠金发放
+    // **之前**。
+    //   - 在 code 通过后:防止无 turnstile 的 verify 路径成为黑名单枚举口子
+    //     (攻击者无法只凭 email 探测某域名是否在 blocklist)
+    //   - 在 used_at 之前:不消费验证码,后续 admin 调整 blocklist 后该 row
+    //     仍可继续验证(向下兼容运营动态调整)
+    //   - 在赠金发放之前:核心目的就是断这一刀
+    //
+    // user row 不在此处删除:命中即留 tombstone(email_verified=false),
+    // 清理策略走未来 retention 任务,与安全判定解耦。
+    if (deps.emailDomainBlocklist && isEmailDomainBlocked(email, deps.emailDomainBlocklist)) {
+      throw new VerifyError('EMAIL_DOMAIN_BLOCKED', '该邮箱域名暂不支持注册')
+    }
 
     await client.query('UPDATE email_verifications SET used_at = $1::timestamptz WHERE id = $2', [
       nowIso,
@@ -328,7 +368,7 @@ export async function requestPasswordReset(
   // 判定按 email 后缀,与 socialLogin.ts:SYNTHETIC_EMAIL_DOMAIN 保持同步;
   // 未来如果接其他 provider,还是同一个合成域 → 同条规则继续生效。
   // 防枚举:返 accepted=true,与"用户不存在"路径无差别;不查 DB 也无 timing 差异。
-  if (email.endsWith('@users.claudeai.chat')) {
+  if (email.endsWith(`@${SYNTHETIC_EMAIL_DOMAIN}`)) {
     return { accepted: true }
   }
 
