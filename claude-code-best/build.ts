@@ -14,10 +14,27 @@ const features = Object.keys(process.env)
     .map(k => k.replace("FEATURE_", ""));
 
 // Step 2: Bundle with splitting
+//
+// target='node' (not 'bun') — produced artifact must run on `node dist/cli.js`,
+// since v3 commercial containers launch CCB via Node 22 (claudeCodeRuntime:'node'
+// in the container-baked openclaude.json). target='bun' keeps `using` /
+// `await using` declarations literal (Stage 3 Explicit Resource Management),
+// which Node 22's V8 12.4 parser rejects with SyntaxError, killing the CCB
+// subprocess with exit code 1 before it can read its first stdin line.
+// target='node' instructs Bun's bundler to lower these to ES2022 try/finally
+// (verified: zero `await using` remain in dist/). Bun runtime still accepts
+// the lowered output, so dev mode (`bun run dev`) and the 45.32 personal master
+// (claudeCodeRuntime:'bun') are unaffected.
+//
+// Regression: v1.0.173 (built 2026-05-20 on Tokyo master) produced compat
+// output; v1.0.194 (built 2026-05-22 on KL master, post primary flip) produced
+// `await using` literal in 3 chunks → mass CCB crash-loop reported by users.
+// Cause likely a Bun upgrade between the two machines or default-target drift,
+// but pinning target='node' eliminates the ambiguity at the source.
 const result = await Bun.build({
     entrypoints: ["src/entrypoints/cli.tsx"],
     outdir,
-    target: "bun",
+    target: "node",
     splitting: true,
     define: getMacroDefines(),
     features,
