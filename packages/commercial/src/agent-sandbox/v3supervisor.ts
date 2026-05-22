@@ -1666,6 +1666,15 @@ export async function provisionV3Container(
       // 用 agent 也照扣,与产品语义不符。env 只影响 cron.yaml 不存在时的 bootstrap,
       // 已存在的用户自建 cron 不动。处理逻辑见 packages/gateway/src/cron.ts::ensureCronFile。
       "OC_SEED_DEFAULT_CRON=0",
+      // v1.0.193:容器内 gateway `/api/file` ACL 切到 trusted-backend 模式
+      // (`isTrustedContainerFileServeEnabled` in packages/gateway/src/server.ts)。
+      // 语义:范围限定到 `/home/agent/**` + `/tmp/openclaude-*`,内层走 blocklist。
+      // `FILE_BLOCKED_PATTERNS` 是 trusted 模式下的唯一权威 ACL inventory ——
+      // **本文件如果新加入任何 master 注入的敏感 env/挂载/state 文件,必须同步
+      // 加 regex 进 FILE_BLOCKED_PATTERNS + security.test.ts 用例**。
+      // 关闭(env 未设置 / 设为非 "1")→ gateway 退化回 personal/legacy 严白名单
+      // 行为(FILE_ALLOWED_DIRS + TEMP_PREFIX + agent_cwd MEDIA_EXTENSIONS)。
+      "OC_V3_TRUSTED_FILE_SERVE=1",
     ];
 
     // v3 file proxy:bridgeSecret 就位 → 注入 OC_CONTAINER_ID + OC_BRIDGE_NONCE。

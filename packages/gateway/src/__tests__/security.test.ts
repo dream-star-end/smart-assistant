@@ -1,11 +1,13 @@
 import * as assert from 'node:assert/strict'
-import { resolve } from 'node:path'
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 /**
  * Security tests for OpenClaude Gateway.
  * Tests real exported functions from server.ts — NOT local helper clones.
  * Run: npx tsx --test packages/gateway/src/__tests__/security.test.ts
  */
-import { describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
   FILE_ALLOWED_DIRS,
   FILE_BLOCKED_PATTERNS,
@@ -14,6 +16,7 @@ import {
   UPLOAD_MIME_PREFIXES,
   isFileAllowed,
   isFileBlocked,
+  isTrustedContainerFileServeEnabled,
   isUploadMimeAllowed,
   makeUserScopedMediaPredicate,
 } from '../server.js'
@@ -377,6 +380,473 @@ describe('T06: Authentication — no query token leak', () => {
     const url = new URL(req.url, 'http://localhost')
     const queryToken = url.searchParams.get('token')
     assert.ok(queryToken !== null, 'query param exists but should be ignored by server')
+  })
+})
+
+// ── T07: v3 trusted-backend ACL (v1.0.193 — Codex v4 review) ──
+//
+// Mode contract (see `isFileAllowed` trusted branch + server.ts comment):
+//   - Range scope: only `/home/agent/**` + `/tmp/openclaude-*` participate.
+//     Anything outside those subtrees stays denied (e.g. `/etc/*`,
+//     `/opt/openclaude/...` runtime source).
+//   - Inside the range: deny-by-blocklist (no allowlist).
+//   - The blocklist (`FILE_BLOCKED_PATTERNS`) is the **single authoritative
+//     download-sensitive inventory** for the v3 container.
+//
+// Test isolation: env flag is checked **call-time** via
+// `isTrustedContainerFileServeEnabled()`, so per-test `beforeEach`/`afterEach`
+// flips are sufficient (no module-load freeze trap).
+describe('T07: v3 trusted-backend mode (OC_V3_TRUSTED_FILE_SERVE=1)', () => {
+  const ENV_KEY = 'OC_V3_TRUSTED_FILE_SERVE'
+  let prevEnv: string | undefined
+
+  beforeEach(() => {
+    prevEnv = process.env[ENV_KEY]
+    process.env[ENV_KEY] = '1'
+    assert.equal(isTrustedContainerFileServeEnabled(), true, 'env flag should be on')
+  })
+  afterEach(() => {
+    if (prevEnv === undefined) delete process.env[ENV_KEY]
+    else process.env[ENV_KEY] = prevEnv
+  })
+
+  // ── ALLOW: typical agent work products under /home/agent (boss's actual UX) ──
+  describe('ALLOW — agent work products under /home/agent', () => {
+    it('allows /home/agent/hello.txt (boss-reported failing download path)', () => {
+      assert.ok(isFileAllowed('/home/agent/hello.txt'))
+    })
+    it('allows /home/agent/work/output.pdf', () => {
+      assert.ok(isFileAllowed('/home/agent/work/output.pdf'))
+    })
+    it('allows /home/agent/research_concise/main.pdf', () => {
+      assert.ok(isFileAllowed('/home/agent/research_concise/main.pdf'))
+    })
+    it('allows /home/agent/.openclaude/repos/sess-1/1/main.pdf (literature workspace)', () => {
+      assert.ok(isFileAllowed('/home/agent/.openclaude/repos/sess-1/1/main.pdf'))
+    })
+    it('allows /home/agent/.openclaude/generated/speech.mp3', () => {
+      assert.ok(isFileAllowed('/home/agent/.openclaude/generated/speech.mp3'))
+    })
+    it('allows /home/agent/.openclaude/uploads/photo.jpg', () => {
+      assert.ok(isFileAllowed('/home/agent/.openclaude/uploads/photo.jpg'))
+    })
+    it('allows /home/agent/.openclaude/shared/anything.csv', () => {
+      assert.ok(isFileAllowed('/home/agent/.openclaude/shared/anything.csv'))
+    })
+    it('allows /home/agent/.openclaude/agents/main/skills/foo.md (skills are not secrets)', () => {
+      assert.ok(isFileAllowed('/home/agent/.openclaude/agents/main/skills/foo.md'))
+    })
+    it('allows /home/agent/.codex/generated_images/x.png (Codex media outputs)', () => {
+      assert.ok(isFileAllowed('/home/agent/.codex/generated_images/x.png'))
+    })
+    it('allows /tmp/openclaude-abc/x.png (temp prefix carve-in)', () => {
+      assert.ok(isFileAllowed('/tmp/openclaude-abc/x.png'))
+    })
+  })
+
+  // ── DENY (range): paths outside /home/agent + /tmp/openclaude-* ──
+  describe('DENY (range) — outside trusted carve-outs', () => {
+    it('denies /etc/passwd', () => {
+      assert.ok(!isFileAllowed('/etc/passwd'))
+    })
+    it('denies /etc/shadow', () => {
+      assert.ok(!isFileAllowed('/etc/shadow'))
+    })
+    it('denies /opt/openclaude/packages/gateway/src/server.ts (runtime source)', () => {
+      assert.ok(!isFileAllowed('/opt/openclaude/packages/gateway/src/server.ts'))
+    })
+    it('denies /usr/local/lib/node_modules/foo/index.js', () => {
+      assert.ok(!isFileAllowed('/usr/local/lib/node_modules/foo/index.js'))
+    })
+    it('denies /tmp/random-file.txt (temp without openclaude- prefix)', () => {
+      assert.ok(!isFileAllowed('/tmp/random-file.txt'))
+    })
+    it('denies /root/.bashrc (container shouldn’t but defense-in-depth)', () => {
+      assert.ok(!isFileAllowed('/root/.bashrc'))
+    })
+    it('denies path that is a sibling of /home/agent (prefix attack)', () => {
+      assert.ok(!isFileAllowed('/home/agent-evil/x.txt'))
+    })
+  })
+
+  // ── DENY (blocklist): master-injected secrets & runtime state under /home/agent ──
+  // Every entry here MUST correspond to a regex in FILE_BLOCKED_PATTERNS.
+  // Adding a new master-injected secret? Add the regex + a case here.
+  describe('DENY (blocklist) — master-injected secrets & runtime state', () => {
+    // Codex auth + runtime state
+    it('denies ~/.codex/auth.json', () => {
+      assert.ok(!isFileAllowed('/home/agent/.codex/auth.json'))
+    })
+    it('denies ~/.codex/sessions/2026-05-22/rollout.jsonl', () => {
+      assert.ok(!isFileAllowed('/home/agent/.codex/sessions/2026-05-22/rollout.jsonl'))
+    })
+    it('denies ~/.codex/memories/foo.md', () => {
+      assert.ok(!isFileAllowed('/home/agent/.codex/memories/foo.md'))
+    })
+    it('denies ~/.codex/logs_foo.sqlite', () => {
+      assert.ok(!isFileAllowed('/home/agent/.codex/logs_foo.sqlite'))
+    })
+    it('denies ~/.codex/logs_foo.sqlite-wal', () => {
+      assert.ok(!isFileAllowed('/home/agent/.codex/logs_foo.sqlite-wal'))
+    })
+    it('denies ~/.codex/state_foo.sqlite-shm', () => {
+      assert.ok(!isFileAllowed('/home/agent/.codex/state_foo.sqlite-shm'))
+    })
+    it('denies ~/.codex/config.toml', () => {
+      assert.ok(!isFileAllowed('/home/agent/.codex/config.toml'))
+    })
+
+    // Gateway state
+    it('denies ~/.openclaude/sessions.db', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/sessions.db'))
+    })
+    it('denies ~/.openclaude/sessions.db-wal', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/sessions.db-wal'))
+    })
+    it('denies ~/.openclaude/sessions.db-shm', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/sessions.db-shm'))
+    })
+    it('denies ~/.openclaude/msg-outbox.jsonl', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/msg-outbox.jsonl'))
+    })
+    it('denies ~/.openclaude/tasks.json (prompt + lastOutput + error fields)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/tasks.json'))
+    })
+    it('denies ~/.openclaude/tasks.json.tmp (atomic write temp)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/tasks.json.tmp'))
+    })
+
+    // Gateway configs
+    it('denies ~/.openclaude/openclaude.json (gateway config with tokens)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/openclaude.json'))
+    })
+    it('denies ~/.openclaude/agents.yaml', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/agents.yaml'))
+    })
+    it('denies ~/.openclaude/cron.yaml', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/cron.yaml'))
+    })
+    it('denies ~/.openclaude/webhooks.yaml (HMAC secrets)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/webhooks.yaml'))
+    })
+    it('denies ~/.openclaude/webhooks.yml (.yml alias)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/webhooks.yml'))
+    })
+
+    // Gateway retry queues
+    it('denies ~/.openclaude/v3-master-retry.d/1.json', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/v3-master-retry.d/1.json'))
+    })
+    it('denies ~/.openclaude/v3-wechat-retry.d/1.json', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/v3-wechat-retry.d/1.json'))
+    })
+
+    // Per-agent session JSONL (thinking + tool args)
+    it('denies ~/.openclaude/agents/main/sessions/2026-05-22.jsonl', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/agents/main/sessions/2026-05-22.jsonl'))
+    })
+    it('denies ~/.openclaude/agents/codex/sessions/foo.jsonl (any agent id)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/agents/codex/sessions/foo.jsonl'))
+    })
+
+    // Memory + persona files
+    it('denies ~/.openclaude/agents/main/MEMORY.md', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/agents/main/MEMORY.md'))
+    })
+    it('denies ~/.openclaude/agents/main/USER.md', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/agents/main/USER.md'))
+    })
+    it('denies ~/.openclaude/agents/main/CLAUDE.md', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/agents/main/CLAUDE.md'))
+    })
+    it('denies ~/.openclaude/agents/main/resume-map.json', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/agents/main/resume-map.json'))
+    })
+
+    // Git credentials
+    it('denies ~/.openclaude/git-creds/sess-1/1/token', () => {
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/git-creds/sess-1/1/token'))
+    })
+    it('denies ~/.git-credentials (git store credential helper)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.git-credentials'))
+    })
+
+    // Persistent XDG config volume — Codex review demanded the **whole subtree**
+    // be denied rather than chasing per-tool paths (gh / git / vscode-server /
+    // npm / pip / future CLIs). Config files are not work products.
+    it('denies ~/.config (root of XDG config volume)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.config'))
+    })
+    it('denies ~/.config/npm/npmrc', () => {
+      assert.ok(!isFileAllowed('/home/agent/.config/npm/npmrc'))
+    })
+    it('denies ~/.config/pip/pip.conf', () => {
+      assert.ok(!isFileAllowed('/home/agent/.config/pip/pip.conf'))
+    })
+    it('denies ~/.config/gh/hosts.yml (GitHub CLI token store)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.config/gh/hosts.yml'))
+    })
+    it('denies ~/.config/git/credentials (git store helper at XDG location)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.config/git/credentials'))
+    })
+    it('denies ~/.config/Code/User/settings.json (vscode-server)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.config/Code/User/settings.json'))
+    })
+    it('denies top-level ~/.npmrc', () => {
+      assert.ok(!isFileAllowed('/home/agent/.npmrc'))
+    })
+
+    // SSH/GPG/cloud cred dirs
+    it('denies ~/.ssh/id_rsa', () => {
+      assert.ok(!isFileAllowed('/home/agent/.ssh/id_rsa'))
+    })
+    it('denies ~/.ssh/id_ed25519', () => {
+      assert.ok(!isFileAllowed('/home/agent/.ssh/id_ed25519'))
+    })
+    it('denies ~/.gnupg/secring.gpg', () => {
+      assert.ok(!isFileAllowed('/home/agent/.gnupg/secring.gpg'))
+    })
+    it('denies ~/.aws/credentials', () => {
+      assert.ok(!isFileAllowed('/home/agent/.aws/credentials'))
+    })
+    it('denies ~/.aws/config', () => {
+      assert.ok(!isFileAllowed('/home/agent/.aws/config'))
+    })
+    it('denies ~/.kube/config', () => {
+      assert.ok(!isFileAllowed('/home/agent/.kube/config'))
+    })
+    it('denies ~/.docker/config.json', () => {
+      assert.ok(!isFileAllowed('/home/agent/.docker/config.json'))
+    })
+
+    // Shell history
+    it('denies ~/.bash_history', () => {
+      assert.ok(!isFileAllowed('/home/agent/.bash_history'))
+    })
+    it('denies ~/.zsh_history', () => {
+      assert.ok(!isFileAllowed('/home/agent/.zsh_history'))
+    })
+
+    // .env files
+    it('denies ~/work/.env', () => {
+      assert.ok(!isFileAllowed('/home/agent/work/.env'))
+    })
+    it('denies ~/work/.env.production', () => {
+      assert.ok(!isFileAllowed('/home/agent/work/.env.production'))
+    })
+
+    // Generic key/cert
+    it('denies ~/work/server.key', () => {
+      assert.ok(!isFileAllowed('/home/agent/work/server.key'))
+    })
+    it('denies ~/work/ca.pem', () => {
+      assert.ok(!isFileAllowed('/home/agent/work/ca.pem'))
+    })
+  })
+
+  // ── DENY (kernel/runtime): /proc, /sys, /run, /run/oc/* ──
+  describe('DENY (kernel/runtime) — /proc, /sys, /run, /var/run', () => {
+    it('denies /proc/self/environ (env leak)', () => {
+      assert.ok(!isFileAllowed('/proc/self/environ'))
+    })
+    it('denies /proc/1/cmdline', () => {
+      assert.ok(!isFileAllowed('/proc/1/cmdline'))
+    })
+    it('denies /sys/kernel/version', () => {
+      assert.ok(!isFileAllowed('/sys/kernel/version'))
+    })
+    it('denies /run/oc/codex-auth/auth.json (master-injected codex token)', () => {
+      assert.ok(!isFileAllowed('/run/oc/codex-auth/auth.json'))
+    })
+    it('denies /run/oc/v3-bridge.sock', () => {
+      assert.ok(!isFileAllowed('/run/oc/v3-bridge.sock'))
+    })
+    it('denies /var/run/docker.sock (hypothetical mount escape)', () => {
+      assert.ok(!isFileAllowed('/var/run/docker.sock'))
+    })
+  })
+
+  // ── DENY (cross-tenant IDOR gate stays in effect even in trusted mode) ──
+  // Trusted bit only relaxes the container's own sandbox; it must not weaken
+  // host-volume cross-tenant protections. The IDOR gate sits BEFORE the
+  // trusted branch in isFileAllowed.
+  describe('IDOR gate still active in trusted mode', () => {
+    const uA = '/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/x.png'
+    const uB = '/var/lib/docker/volumes/oc-v3-data-u99/_data/uploads/x.png'
+    it('denies user-volume media path with no predicate (no host-path leak via trusted mode)', () => {
+      assert.ok(!isFileAllowed(uA))
+    })
+    it('user-A predicate allows uA but not uB (no cross-tenant leak)', () => {
+      const predA = (p: string) =>
+        p === '/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads' ||
+        p.startsWith('/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/')
+      assert.ok(isFileAllowed(uA, undefined, predA))
+      assert.ok(!isFileAllowed(uB, undefined, predA))
+    })
+  })
+
+  // ── Backward compat: env unset → legacy allowlist behavior ──
+  describe('Backward compat — env unset leaves personal/legacy semantics', () => {
+    it('legacy: /home/agent/hello.txt is denied when trusted env is off', () => {
+      delete process.env[ENV_KEY]
+      assert.equal(isTrustedContainerFileServeEnabled(), false)
+      assert.ok(!isFileAllowed('/home/agent/hello.txt'))
+    })
+    it('legacy: static FILE_ALLOWED_DIRS still works when trusted env is off', () => {
+      delete process.env[ENV_KEY]
+      assert.ok(isFileAllowed(resolve('/root/.openclaude/uploads/x.png')))
+    })
+  })
+
+  // ── Real symlink fs operation — verifies the canonicalization → blocklist chain ──
+  //
+  // `handleApiFile` does `realpathSync(input)` BEFORE invoking
+  // `openFileHardened`, and the latter does a second `realpathSync` via
+  // `/proc/self/fd/<fd>` after opening with `O_NOFOLLOW`. The net effect: the
+  // path that reaches `isFileAllowed` / `isFileBlocked` is always the
+  // canonical target, so a symlink under `/home/agent/` pointing at a denied
+  // target gets rejected on the denied-target's regex, not on the symlink's
+  // own location.
+  //
+  // We can't easily exercise `openFileHardened` end-to-end from a unit test
+  // (it writes to a `ServerResponse`), but we CAN exercise the actual
+  // canonicalization chain that decides the verdict: real `mkdtempSync` +
+  // real `symlinkSync` + real `realpathSync` → `isFileAllowed`.
+  describe('Real symlink fs operation — canonicalization → blocklist', () => {
+    let tmpDir: string
+
+    beforeEach(() => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'oc-acl-test-'))
+    })
+    afterEach(() => {
+      // Best-effort cleanup; mkdtemp dir + symlinks
+      try {
+        rmSync(tmpDir, { recursive: true, force: true })
+      } catch {
+        // ignore
+      }
+    })
+
+    it('symlink to /etc/shadow → realpath returns target → blocklist denies', () => {
+      const linkPath = join(tmpDir, 'looks_harmless.png')
+      symlinkSync('/etc/shadow', linkPath)
+      // `/etc/shadow` exists on Linux; realpathSync resolves the symlink.
+      const canonical = realpathSync(linkPath)
+      assert.equal(canonical, '/etc/shadow', 'pre-condition: realpath follows symlink')
+      // Decision under trusted mode (env already set in outer beforeEach):
+      assert.ok(!isFileAllowed(canonical), 'canonical /etc/shadow must be denied')
+    })
+
+    it('symlink to /etc/passwd → realpath returns target → /etc/* blocklist denies', () => {
+      const linkPath = join(tmpDir, 'hello.txt')
+      symlinkSync('/etc/passwd', linkPath)
+      const canonical = realpathSync(linkPath)
+      assert.equal(canonical, '/etc/passwd')
+      assert.ok(!isFileAllowed(canonical))
+    })
+
+    it('symlink to a regular file under /tmp → realpath returns target → policy applies', () => {
+      // Positive control: symlink to a regular file in /tmp (NOT under
+      // openclaude-* prefix). Trusted mode's range check denies it because
+      // it's neither under /home/agent nor /tmp/openclaude-*.
+      const targetPath = join(tmpDir, 'real_target.png')
+      writeFileSync(targetPath, 'png-bytes')
+      const linkPath = join(tmpDir, 'link.png')
+      symlinkSync(targetPath, linkPath)
+      const canonical = realpathSync(linkPath)
+      // tmpDir is /tmp/oc-acl-test-* — outside /home/agent + /tmp/openclaude-*,
+      // so denied by range check.
+      assert.ok(!isFileAllowed(canonical))
+    })
+
+    it('symlink target inside trusted home → realpath canonical → blocklist applies, allow-products allow', () => {
+      // We can't write into /home/agent in unit test, so simulate the verdict
+      // on a canonical that LOOKS like a trusted-home product file. This
+      // replicates what openFileHardened would do after realpathSync resolves
+      // a symlink whose target is `/home/agent/hello.txt`.
+      assert.ok(isFileAllowed('/home/agent/hello.txt'))
+      // ...and a target whose canonical hits the blocklist:
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/sessions.db'))
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/tasks.json'))
+      assert.ok(!isFileAllowed('/home/agent/.codex/auth.json'))
+    })
+  })
+})
+
+// ── T08: Blocklist pattern inventory contract (Codex v4 review) ──
+// These cases pin the regex inventory itself (not isFileAllowed integration)
+// so changing the regex without updating intent triggers a test failure.
+describe('T08: FILE_BLOCKED_PATTERNS — trusted-backend inventory contract', () => {
+  it('has at least 40 patterns after v1.0.193 expansion', () => {
+    assert.ok(FILE_BLOCKED_PATTERNS.length >= 40, `got ${FILE_BLOCKED_PATTERNS.length}`)
+  })
+  it('covers codex auth + sessions + memories + sqlite state + config.toml', () => {
+    assert.ok(isFileBlocked('/home/agent/.codex/auth.json'))
+    assert.ok(isFileBlocked('/home/agent/.codex/sessions/x/y.jsonl'))
+    assert.ok(isFileBlocked('/home/agent/.codex/memories/foo.md'))
+    assert.ok(isFileBlocked('/home/agent/.codex/logs_a.sqlite'))
+    assert.ok(isFileBlocked('/home/agent/.codex/state_a.sqlite-wal'))
+    assert.ok(isFileBlocked('/home/agent/.codex/config.toml'))
+  })
+  it('covers gateway SQLite state + outbox + tasks store', () => {
+    assert.ok(isFileBlocked('/home/agent/.openclaude/sessions.db'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/sessions.db-wal'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/sessions.db-shm'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/msg-outbox.jsonl'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/tasks.json'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/tasks.json.tmp'))
+  })
+  it('covers gateway YAML configs (agents/cron/webhooks)', () => {
+    assert.ok(isFileBlocked('/home/agent/.openclaude/agents.yaml'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/cron.yaml'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/webhooks.yaml'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/webhooks.yml'))
+  })
+  it('covers retry queue subtrees', () => {
+    assert.ok(isFileBlocked('/home/agent/.openclaude/v3-master-retry.d/1.json'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/v3-wechat-retry.d/1.json'))
+  })
+  it('covers per-agent session JSONL subtree (any agent id)', () => {
+    assert.ok(isFileBlocked('/home/agent/.openclaude/agents/main/sessions/x.jsonl'))
+    assert.ok(isFileBlocked('/home/agent/.openclaude/agents/codex/sessions/y.jsonl'))
+  })
+  it('covers git credentials subtree + ~/.git-credentials', () => {
+    assert.ok(isFileBlocked('/home/agent/.openclaude/git-creds/sess/1/token'))
+    assert.ok(isFileBlocked('/home/agent/.git-credentials'))
+  })
+  it('covers entire ~/.config subtree (XDG credential surface)', () => {
+    assert.ok(isFileBlocked('/home/agent/.config'))
+    assert.ok(isFileBlocked('/home/agent/.config/npm/npmrc'))
+    assert.ok(isFileBlocked('/home/agent/.config/pip/pip.conf'))
+    assert.ok(isFileBlocked('/home/agent/.config/gh/hosts.yml'))
+    assert.ok(isFileBlocked('/home/agent/.config/git/credentials'))
+    assert.ok(isFileBlocked('/home/agent/.config/Code/User/settings.json'))
+  })
+  it('covers shell history', () => {
+    assert.ok(isFileBlocked('/home/agent/.bash_history'))
+    assert.ok(isFileBlocked('/home/agent/.zsh_history'))
+  })
+  it('covers /proc, /sys, /run, /var/run', () => {
+    assert.ok(isFileBlocked('/proc/self/environ'))
+    assert.ok(isFileBlocked('/sys/kernel/version'))
+    assert.ok(isFileBlocked('/run/oc/codex-auth/auth.json'))
+    assert.ok(isFileBlocked('/var/run/docker.sock'))
+  })
+  it('covers /etc/* root (system passwd/shadow/sudoers/etc)', () => {
+    assert.ok(isFileBlocked('/etc/passwd'))
+    assert.ok(isFileBlocked('/etc/shadow'))
+    assert.ok(isFileBlocked('/etc/sudoers'))
+    assert.ok(isFileBlocked('/etc/hostname'))
+  })
+  it('still allows typical agent work products under /home/agent (blocklist negative)', () => {
+    assert.ok(!isFileBlocked('/home/agent/hello.txt'))
+    assert.ok(!isFileBlocked('/home/agent/work/output.pdf'))
+    assert.ok(!isFileBlocked('/home/agent/.openclaude/generated/speech.mp3'))
+    assert.ok(!isFileBlocked('/home/agent/.openclaude/uploads/photo.jpg'))
+    assert.ok(!isFileBlocked('/home/agent/.openclaude/shared/anything.csv'))
+    assert.ok(!isFileBlocked('/home/agent/.codex/generated_images/x.png'))
+    assert.ok(!isFileBlocked('/home/agent/.openclaude/agents/main/skills/foo.md'))
+    assert.ok(!isFileBlocked('/home/agent/.openclaude/repos/sess/1/main.pdf'))
   })
 })
 
