@@ -44,14 +44,21 @@ describe("rateLimit.checkRateLimit", () => {
     assert.match(d.key, /:960$/);
   });
 
-  test("calls 2..5: still allowed, EXPIRE NOT called again in same window", async () => {
+  test("calls 2..5: still allowed, EXPIRE called per INCR (security: PERSIST drift fix)", async () => {
     const r = new MockRedis();
     for (let i = 1; i <= 5; i++) {
       const d = await checkRateLimit(r, CFG, "1.2.3.4", { now: () => 1000 });
       assert.equal(d.allowed, true, `call #${i} should be allowed`);
       assert.equal(d.count, i);
     }
-    assert.equal(r.expireCalls.length, 1, "EXPIRE only on first INCR per window");
+    // 2026-04-21 安全审计 Medium#1:每次 INCR 后都 EXPIRE,防 Redis AOF rewrite
+    // / PERSIST 残留把 key 锁成「count>max 永不过期」状态。详见
+    // src/middleware/rateLimit.ts:99-109 注释。原 first-call-only 已退役。
+    assert.equal(
+      r.expireCalls.length,
+      5,
+      "EXPIRE 每次 INCR 都刷 — 防 PERSIST 残留把 key 锁死(rateLimit.ts:99-109)",
+    );
   });
 
   test("call 6 in same window: denied, retryAfter > 0", async () => {
@@ -75,7 +82,8 @@ describe("rateLimit.checkRateLimit", () => {
     const d = await checkRateLimit(r, CFG, "1.2.3.4", { now: () => 1020 });
     assert.equal(d.allowed, true);
     assert.equal(d.count, 1);
-    assert.equal(r.expireCalls.length, 2, "new window → second EXPIRE call");
+    // 5(window 1) + 1(window 2) = 6 次 EXPIRE,每次 INCR 都刷一次(详见前一测试注释)
+    assert.equal(r.expireCalls.length, 6, "每次 INCR 一次 EXPIRE,跨窗口累加");
   });
 
   test("different identifiers are isolated", async () => {

@@ -241,20 +241,23 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
   describe('renderPrometheus 全局结构', () => {
     test('v1 + v3 系列都出现一次,以 newline 结尾', async () => {
       const text = await renderPrometheus({ override: { agentContainersRunning: 0 } })
-      // v1 系列(已存在)
+      // v1 counter(5)
       assert.ok(text.includes('# HELP gateway_http_requests_total'))
       assert.ok(text.includes('# HELP billing_debit_total'))
       assert.ok(text.includes('# HELP claude_api_requests_total'))
       assert.ok(text.includes('# HELP admin_audit_write_failures_total'))
       assert.ok(text.includes('# HELP precheck_capped_total'))
-      // v3 2I-2 系列
+      // v3 2I-2 系列(9)
       assert.ok(text.includes('# HELP anthropic_proxy_ttft_seconds'))
       assert.ok(text.includes('# HELP anthropic_proxy_stream_duration_seconds'))
       assert.ok(text.includes('# HELP anthropic_proxy_settle_total'))
       assert.ok(text.includes('# HELP anthropic_proxy_reject_total'))
       assert.ok(text.includes('# HELP ws_bridge_buffered_bytes'))
       assert.ok(text.includes('# HELP ws_bridge_session_duration_seconds'))
-      // gauges
+      assert.ok(text.includes('# HELP container_ensure_duration_seconds'))
+      assert.ok(text.includes('# HELP ws_bridge_ttft_seconds'))
+      assert.ok(text.includes('# HELP oc_v3_sink_persist_total'))
+      // gauges(2)
       assert.ok(text.includes('# HELP account_pool_health'))
       assert.ok(text.includes('# HELP agent_containers_running'))
       assert.ok(text.endsWith('\n'))
@@ -262,8 +265,8 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       const helpCount = (text.match(/^# HELP /gm) ?? []).length
       assert.equal(
         helpCount,
-        13,
-        `HELP 行总数 = 13 (4 v1 counter + 6 v3 + 2 gauge + 1 v1.0.3 precheck_capped), got ${helpCount}`,
+        16,
+        `HELP 行总数 = 16 (5 v1 counter + 9 v3 + 2 gauge), got ${helpCount}`,
       )
     })
   })

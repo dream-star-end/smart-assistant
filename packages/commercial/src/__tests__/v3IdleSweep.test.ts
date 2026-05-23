@@ -330,7 +330,12 @@ describe("runIdleSweepTick", () => {
     assert.equal(byId(13).state, "vanished");
   });
 
-  test("单行 stopAndRemove 抛 → errors 累计,其他行继续 sweep", async () => {
+  test("单行 stop 抛 + force-remove 成功 → 视作完整清理(R3/R4 兜底语义)", async () => {
+    // v3supervisor.stopAndRemoveV3Container(:2308-2349)的设计:
+    //   - stop 失败仍尝试 force remove
+    //   - force remove 成功(或 404)→ containerCleared=true
+    //   - failures 仅含 stage=stop 时返 true(clean)
+    // 用户视角:残骸已不在 docker daemon,只是 stop 路径有 daemon 抖动 — 不应计 error。
     const pool = new FakePool();
     pool.seed({ id: 20, user_id: 1, bound_ip: "172.30.20.1", state: "active", port: 18789, container_internal_id: "d-20", last_ws_activity: makeStaleDate(60) });
     pool.seed({ id: 21, user_id: 2, bound_ip: "172.30.20.2", state: "active", port: 18789, container_internal_id: "d-21", last_ws_activity: makeStaleDate(90) });
@@ -339,16 +344,43 @@ describe("runIdleSweepTick", () => {
       docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
     });
     assert.equal(r.scanned, 2);
+    assert.equal(r.swept, 2);
+    assert.equal(r.errors.length, 0);
+    // d-20 stop 抛 → 没进 captured.stopped;但 force remove 仍执行
+    assert.deepEqual(captured.stopped.sort(), ["d-21"]);
+    assert.deepEqual(captured.removed.sort(), ["d-20", "d-21"]);
+    // UPDATE 在 docker 步骤之前已经把 state 翻 vanished,两行都 vanished
+    assert.equal(pool.rows.find((r) => r.id === 20)!.state, "vanished");
+    assert.equal(pool.rows.find((r) => r.id === 21)!.state, "vanished");
+  });
+
+  test("单行 stop + remove 都抛 → PartialV3Cleanup,errors 累计,其他行继续 sweep", async () => {
+    // 配对前一测试:stop 失败 + force remove 也失败 → containerCleared=false
+    // → 走 aggregatePartialV3Cleanup,throw PartialV3Cleanup,idle sweep catch 后计 error。
+    // 关键不变量:`stopAndRemoveV3Container` DB UPDATE 在 docker 之前,无论 docker
+    // 是否清成功,行都已翻 vanished(R2 finding,v3supervisor.ts:2255 注释)。
+    const pool = new FakePool();
+    pool.seed({ id: 20, user_id: 1, bound_ip: "172.30.20.1", state: "active", port: 18789, container_internal_id: "d-20", last_ws_activity: makeStaleDate(60) });
+    pool.seed({ id: 21, user_id: 2, bound_ip: "172.30.20.2", state: "active", port: 18789, container_internal_id: "d-21", last_ws_activity: makeStaleDate(90) });
+    const { docker, captured } = makeDocker({
+      stopThrows: new Set(["d-20"]),
+      removeThrows: new Set(["d-20"]),
+    });
+    const r = await runIdleSweepTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+    });
+    assert.equal(r.scanned, 2);
     assert.equal(r.swept, 1);
     assert.equal(r.errors.length, 1);
     assert.equal(r.errors[0]!.containerId, 20);
-    assert.match(r.errors[0]!.error, /stop failed/);
+    // 锁住 PartialV3Cleanup 聚合 message 形态(stages "stop+remove" + "after DB marked vanished")
+    assert.match(r.errors[0]!.error, /stop\+remove failed after DB marked vanished/);
     // d-21 仍被 stop+remove
     assert.deepEqual(captured.stopped, ["d-21"]);
     assert.deepEqual(captured.removed, ["d-21"]);
-    // 21 翻 vanished;20 因为 stopAndRemove 抛了 → 行还是 active
+    // 不变量:DB 翻 vanished 在 docker 之前 — d-20 即使 docker 全失败也 vanished
+    assert.equal(pool.rows.find((r) => r.id === 20)!.state, "vanished");
     assert.equal(pool.rows.find((r) => r.id === 21)!.state, "vanished");
-    assert.equal(pool.rows.find((r) => r.id === 20)!.state, "active");
   });
 
   test("batchLimit=1 在多行 stale 时只处理 1 行", async () => {

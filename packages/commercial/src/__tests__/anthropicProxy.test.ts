@@ -237,12 +237,19 @@ describe("enforceFieldByteBudgets", () => {
     );
   });
 
-  test("tools 序列化超 64KB → 413", () => {
-    const tools = Array.from({ length: 30 }, () => ({
-      name: "x",
-      description: bigStr(3000),
-      input_schema: { type: "object" },
-    }));
+  test("tools 序列化超 SIZE_LIMITS.tools → 413 BODY_FIELD_TOO_LARGE", () => {
+    // 单个超大 description 覆盖 tools 字段字节预算上限。
+    // 用 `SIZE_LIMITS.tools + 100` 而非 hard-coded KB,阈值变了测试自动跟随
+    // (2026-04-21 调整后 64KB → 2MB,详见 src/http/proxy/shared.ts:133-149)。
+    // 不用 MAX_TOOLS_COUNT-1 个小 tools 凑量是为了避开「tools 数组长度」这条
+    // 正交校验,聚焦字段字节预算这条独立分支。
+    const tools = [
+      {
+        name: "x",
+        description: bigStr(SIZE_LIMITS.tools + 100),
+        input_schema: { type: "object" },
+      },
+    ];
     const body: ProxyBody = {
       model: "claude-sonnet-4-6",
       max_tokens: 1024,
@@ -251,7 +258,8 @@ describe("enforceFieldByteBudgets", () => {
     };
     assert.throws(
       () => enforceFieldByteBudgets(body),
-      (e: unknown) => e instanceof HttpError && e.status === 413,
+      (e: unknown) =>
+        e instanceof HttpError && e.status === 413 && e.code === "BODY_FIELD_TOO_LARGE",
     );
   });
 });
