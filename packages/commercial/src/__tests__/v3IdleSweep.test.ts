@@ -83,8 +83,26 @@ interface FakeRow {
   updated_at: Date;
 }
 
+/**
+ * R6.11 Phase 2.C:idle sweep 现在的 SELECT/UPDATE 都带
+ * `NOT EXISTS (... agent_migrations m WHERE phase NOT IN closed)` predicate。
+ * FakePool 必须模拟同语义 — 空表(默认)时行为不变,seedMigration() 可注入
+ * 开放 ledger 行让 NOT EXISTS 把对应 container 行排出 / 让 UPDATE 守卫拦截。
+ */
+type OpenPhase =
+  | "planned" | "created" | "detached" | "attached_pre"
+  | "attached_route" | "started";
+interface FakeMigration {
+  agent_container_id: number;
+  phase: OpenPhase | "committed" | "rolled_back";
+}
+const OPEN_MIGRATION_PHASES = new Set<OpenPhase | "committed" | "rolled_back">([
+  "planned", "created", "detached", "attached_pre", "attached_route", "started",
+]);
+
 class FakePool {
   rows: FakeRow[] = [];
+  migrations: FakeMigration[] = [];
   selectCalls = 0;
   updateActivityCalls: number[] = []; // ids 被 mark 过
 
@@ -95,9 +113,21 @@ class FakePool {
     });
   }
 
+  seedMigration(m: FakeMigration): void {
+    this.migrations.push(m);
+  }
+
+  /** 是否存在该 container 的 open(non-terminal)migration ledger 行 */
+  private hasOpenMigration(containerId: number): boolean {
+    return this.migrations.some(
+      (m) => m.agent_container_id === containerId && OPEN_MIGRATION_PHASES.has(m.phase),
+    );
+  }
+
   async query(sql: string, params?: unknown[]): Promise<unknown> {
     const trimmed = String(sql).trim();
     // SELECT id, container_internal_id FROM agent_containers WHERE state='active' ...
+    //   R6.11 Phase 2.C 起新带 NOT EXISTS agent_migrations predicate。
     if (
       /^SELECT id, container_internal_id\s+FROM agent_containers/i.test(trimmed) &&
       /WHERE state = 'active'/i.test(trimmed)
@@ -111,7 +141,9 @@ class FakePool {
           (r) =>
             r.state === "active" &&
             r.last_ws_activity !== null &&
-            r.last_ws_activity < cutoff,
+            r.last_ws_activity < cutoff &&
+            // R6.11 Phase 2.C — NOT EXISTS predicate
+            !this.hasOpenMigration(r.id),
         )
         .sort(
           (a, b) =>
@@ -128,17 +160,25 @@ class FakePool {
       };
     }
     // UPDATE agent_containers SET state='vanished' WHERE id = $1
+    //   R6.11 Phase 2.C 起可能带 NOT EXISTS guard(requireNoOpenMigration=true 时);
+    //   SQL 文本里能识别。
     if (
       /^UPDATE agent_containers/i.test(trimmed) &&
       /SET state='vanished'/i.test(trimmed)
     ) {
       const id = Number.parseInt(String(params?.[0]), 10);
+      const hasGuard = /NOT EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+agent_migrations/i.test(trimmed);
       const r = this.rows.find((x) => x.id === id);
+      // 守卫拦截:行存在但 open migration ledger 也在 → UPDATE 命中 0
+      if (hasGuard && r && this.hasOpenMigration(id)) {
+        return { rowCount: 0, rows: [] };
+      }
       if (r) {
         r.state = "vanished";
         r.updated_at = new Date();
       }
-      return { rowCount: r ? 1 : 0, rows: [] };
+      // RETURNING host_uuid — fake 行没存 host_uuid,默认 null
+      return { rowCount: r ? 1 : 0, rows: r ? [{ host_uuid: null }] : [] };
     }
     // markV3ContainerActivity: UPDATE agent_containers SET last_ws_activity = NOW(), updated_at = NOW() WHERE id = $1::bigint AND state = 'active'
     if (

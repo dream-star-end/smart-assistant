@@ -134,24 +134,59 @@ interface FakeDbRow {
   host_uuid?: string | null;
 }
 
+/**
+ * R6.11 Phase 2.C:listActiveRows 现带 `NOT EXISTS agent_migrations` predicate,
+ * `listMidMigrationCids` 新增,`stopAndRemoveV3Container` 在 Direction B 走 guard。
+ * FakePool 必须模拟新 SQL + 新表;空 migrations 时与历史行为一致(无回归)。
+ */
+type OrphanFakeMigPhase =
+  | "planned" | "created" | "detached" | "attached_pre" | "attached_route" | "started"
+  | "committed" | "rolled_back";
+const ORPHAN_OPEN_MIGRATION_PHASES = new Set<OrphanFakeMigPhase>([
+  "planned", "created", "detached", "attached_pre", "attached_route", "started",
+]);
+
+interface FakeMigrationRow {
+  agent_container_id: number;
+  phase: OrphanFakeMigPhase;
+  old_host_id: string;
+  new_host_id: string;
+  old_container_internal_id: string | null;
+  new_container_internal_id: string | null;
+}
+
 class FakePool {
   rows: FakeDbRow[] = [];
+  migrations: FakeMigrationRow[] = [];
   vanishedCalls: number[] = [];
 
   seed(r: FakeDbRow): void {
     this.rows.push(r);
   }
 
+  seedMigration(m: FakeMigrationRow): void {
+    this.migrations.push(m);
+  }
+
+  private hasOpenMigration(containerId: number): boolean {
+    return this.migrations.some(
+      (m) =>
+        m.agent_container_id === containerId &&
+        ORPHAN_OPEN_MIGRATION_PHASES.has(m.phase),
+    );
+  }
+
   async query(sql: string, params?: unknown[]): Promise<unknown> {
     const trimmed = String(sql).trim();
-    // SELECT id, container_internal_id, host_uuid FROM agent_containers WHERE state='active'
+    // listActiveRows — SELECT id, container_internal_id, host_uuid FROM agent_containers
+    //   R6.11 Phase 2.C 起带 NOT EXISTS agent_migrations predicate
     if (
       /^SELECT id, container_internal_id, host_uuid\s+FROM agent_containers/i.test(trimmed) &&
       /WHERE state = 'active'/i.test(trimmed)
     ) {
       const limit = Number(params?.[0]);
       const matched = this.rows
-        .filter((r) => r.state === "active")
+        .filter((r) => r.state === "active" && !this.hasOpenMigration(r.id))
         .sort((a, b) => a.id - b.id)
         .slice(0, limit);
       return {
@@ -163,16 +198,48 @@ class FakePool {
         })),
       };
     }
+    // listMidMigrationCids — SELECT old_container_internal_id, new_container_internal_id, ...
+    //   R6.11 Phase 2.C 新增。host 过滤参数化(注入 selfHostId 时 $1=selfHostId)。
+    if (
+      /^SELECT old_container_internal_id, new_container_internal_id/i.test(trimmed) &&
+      /FROM agent_migrations/i.test(trimmed)
+    ) {
+      const selfId = typeof params?.[0] === "string" ? (params[0] as string) : null;
+      const open = this.migrations.filter((m) => ORPHAN_OPEN_MIGRATION_PHASES.has(m.phase));
+      const matched = open.filter((m) => {
+        if (selfId === null) return true;
+        return m.old_host_id === selfId || m.new_host_id === selfId;
+      });
+      return {
+        rowCount: matched.length,
+        rows: matched.map((m) => ({
+          old_container_internal_id: m.old_container_internal_id,
+          new_container_internal_id: m.new_container_internal_id,
+          old_host_id: m.old_host_id,
+          new_host_id: m.new_host_id,
+        })),
+      };
+    }
     // UPDATE agent_containers SET state='vanished' WHERE id = $1
+    //   R6.11 Phase 2.C — 可能带 NOT EXISTS guard;hasGuard=true 时受 open migration 拦
     if (
       /^UPDATE agent_containers/i.test(trimmed) &&
       /SET state='vanished'/i.test(trimmed)
     ) {
       const id = Number.parseInt(String(params?.[0]), 10);
-      this.vanishedCalls.push(id);
+      const hasGuard = /NOT EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+agent_migrations/i.test(trimmed);
       const r = this.rows.find((x) => x.id === id);
+      if (hasGuard && r && this.hasOpenMigration(id)) {
+        // 守卫拦截:不算 vanishedCall(没真 vanish)
+        return { rowCount: 0, rows: [] };
+      }
+      this.vanishedCalls.push(id);
       if (r) r.state = "vanished";
-      return { rowCount: r ? 1 : 0, rows: [] };
+      // RETURNING host_uuid
+      return {
+        rowCount: r ? 1 : 0,
+        rows: r ? [{ host_uuid: r.host_uuid ?? null }] : [],
+      };
     }
     throw new Error(`FakePool: unhandled SQL: ${trimmed.slice(0, 200)}`);
   }

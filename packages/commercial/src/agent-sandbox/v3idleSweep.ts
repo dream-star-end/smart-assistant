@@ -5,9 +5,14 @@
  *
  * MVP 简化:
  *   - 0012 schema 没引入 mode 字段(双模式推迟到 P1),所有 v3 容器都是 ephemeral。
- *   - 没有 agent_migrations 表(open-migration ledger 也是 P1),
- *     R6.11 reader 二选一的 NOT EXISTS predicate 在 MVP 单轨下 trivially 满足。
  *   - 单 host 单进程,不跨 host_id,不并发跑。
+ *
+ * R6.11 Phase 2.C 改造:
+ *   - SELECT 加 open-migration NOT EXISTS predicate(`agent_migrations_open_by_container_idx`
+ *     partial index 命中,99% 0 行场景 sub-ms);
+ *   - stopAndRemoveV3Container 走 `requireNoOpenMigration: true` 守卫 SELECT-then-UPDATE
+ *     race(writer 在 SELECT 之后 INSERT ledger 行),guard 拦截时返 false → 累加
+ *     `racedWithMigration` 计数,**不**计入 swept 也**不**计入 errors。
  *
  * 语义:
  *   每 60s 跑一次,扫 `state='active' AND last_ws_activity < NOW() - INTERVAL N min`,
@@ -81,6 +86,16 @@ export interface IdleSweepTickResult {
   scanned: number;
   /** 成功 stopAndRemove 的行数 */
   swept: number;
+  /**
+   * SELECT-then-UPDATE 之间被并发 INSERT migration ledger 抢占的行数。
+   * `stopAndRemoveV3Container({ requireNoOpenMigration: true })` 返 false 时累加,
+   * 不计入 `swept`(没真正 vanish)、不计入 `errors`(不是错,是合法让步)。
+   *
+   * 持续 > 0 表示有 migration writer 上线后 idle sweep 与 reconciler 在抢同一行,
+   * 是 R6.11 设计预期的让步,不需告警;只在突刺时帮助定位是哪台 host 的 reconciler
+   * 慢导致 sweeper 多轮空跑。
+   */
+  racedWithMigration: number;
   /** 失败的行 + 原因(不抛,聚合返回) */
   errors: Array<{ containerId: number; error: string }>;
   /** tick 总耗时 ms(含 SELECT + 所有 stopAndRemove) */
@@ -115,9 +130,18 @@ interface StaleRow {
 /**
  * 扫 state='active' 且 last_ws_activity < cutoff 的行。
  *
- * R6.11 reader 二选一:本文件在 RECONCILER_WHITELIST 内(§9 3M),不需要走
- * supervisor.ensureRunning(uid),也不需要 LEFT JOIN agent_migrations
- * (MVP 表都没建);P1 上线 ledger 后再补 NOT EXISTS predicate。
+ * R6.11 Phase 2.C 落地 reader 二选一硬约束(§9 3M):本文件虽在 RECONCILER_WHITELIST 内,
+ * 但 docker start / stop 在 **open migration 期间**必须由 §14.2.6 migration reconciler
+ * 单点持有 — idle sweep 看到 `agent_migrations` 有 open(non-terminal)行的 container
+ * **必须**让步,避免与 reconciler 抢同一个容器的 docker stop+remove。
+ *
+ * 用 NOT EXISTS 而不是 LEFT JOIN:`agent_migrations_open_by_container_idx` 是
+ * `WHERE phase NOT IN closed` 的 partial index,NOT EXISTS 形态能直接命中,99% 0 行
+ * 场景 sub-ms;LEFT JOIN 强迫 PG 走 hash 或 nested loop,代价更高。
+ *
+ * SELECT-then-stopAndRemove 中间还可能有竞态(writer 在 SELECT 后 INSERT ledger):
+ * 走 `stopAndRemoveV3Container(..., { requireNoOpenMigration: true })` 在 UPDATE 层
+ * 用同一个 NOT EXISTS predicate 二次兜底,rowCount=0 → 返 false → racedWithMigration++。
  *
  * 用 `LIMIT batchLimit` 防一次扫太多;下一轮 60s 后还会跑,慢慢清空也无妨。
  */
@@ -128,10 +152,15 @@ async function selectStaleRows(
 ): Promise<StaleRow[]> {
   const r = await pool.query<{ id: string; container_internal_id: string | null }>(
     `SELECT id, container_internal_id
-       FROM agent_containers
+       FROM agent_containers c
       WHERE state = 'active'
         AND last_ws_activity IS NOT NULL
         AND last_ws_activity < NOW() - ($1::int * interval '1 minute')
+        AND NOT EXISTS (
+              SELECT 1 FROM agent_migrations m
+               WHERE m.agent_container_id = c.id
+                 AND m.phase NOT IN ('committed', 'rolled_back')
+            )
       ORDER BY last_ws_activity ASC
       LIMIT $2::int`,
     [idleCutoffMin, batchLimit],
@@ -163,6 +192,7 @@ export async function runIdleSweepTick(
   const startedAt = Date.now();
   const errors: IdleSweepTickResult["errors"] = [];
   let swept = 0;
+  let racedWithMigration = 0;
 
   const stale = await selectStaleRows(deps.pool, idleCutoffMin, batchLimit);
   log?.debug?.("[v3/idleSweep] scan", {
@@ -173,12 +203,22 @@ export async function runIdleSweepTick(
 
   for (const row of stale) {
     try {
-      await stopAndRemoveV3Container(
+      const ok = await stopAndRemoveV3Container(
         deps,
         { id: row.id, container_internal_id: row.container_internal_id },
         STOP_TIMEOUT_SEC,
+        { requireNoOpenMigration: true },
       );
-      swept++;
+      if (ok) {
+        swept++;
+      } else {
+        // SELECT 之后、UPDATE 之前 migration writer INSERT 了一条 open ledger,
+        // sweep 让步给 reconciler 单点处理 — 不是错,也不算 swept,只累加 race 计数。
+        racedWithMigration++;
+        log?.debug?.("[v3/idleSweep] skipped: open migration ledger present", {
+          containerId: row.id,
+        });
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       errors.push({ containerId: row.id, error: msg });
@@ -189,12 +229,16 @@ export async function runIdleSweepTick(
   }
 
   const durationMs = Date.now() - startedAt;
-  if (stale.length > 0 || errors.length > 0) {
+  if (stale.length > 0 || errors.length > 0 || racedWithMigration > 0) {
     log?.info?.("[v3/idleSweep] tick done", {
-      scanned: stale.length, swept, errors: errors.length, durationMs,
+      scanned: stale.length,
+      swept,
+      racedWithMigration,
+      errors: errors.length,
+      durationMs,
     });
   }
-  return { scanned: stale.length, swept, errors, durationMs };
+  return { scanned: stale.length, swept, racedWithMigration, errors, durationMs };
 }
 
 // ───────────────────────────────────────────────────────────────────────

@@ -123,6 +123,19 @@ export {
   type OrphanReconcileScheduler,
 } from "./v3orphanReconcile.js";
 
+// V3 R6.11 §14.2.6 — agent_migrations stale ledger reconciler(Phase 2.C)
+export {
+  startMigrationReconcileScheduler,
+  runMigrationReconcileTick,
+  DEFAULT_MIGRATION_RECONCILE_INTERVAL_MS,
+  DEFAULT_MIGRATION_STALE_SEC,
+  type MigrationReconcileLogger,
+  type MigrationReconcileTickOptions,
+  type MigrationReconcileTickResult,
+  type StartMigrationReconcileSchedulerOptions,
+  type MigrationReconcileScheduler,
+} from "./v3migrationReconciler.js";
+
 // T-63 Phase 2 — docker container event stream 订阅:OOM → admin 告警
 export {
   startV3ContainerEventsWorker,

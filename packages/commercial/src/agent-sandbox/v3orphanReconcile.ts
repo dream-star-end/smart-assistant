@@ -33,6 +33,17 @@
  *     INSERT 已落但 UPDATE 还没跑;完整 BEGIN/COMMIT 兜住该窗口,实际不会出现)
  *   - host_uuid IS NULL 视为 legacy/单机 行,Direction B 走本机 inspect
  *
+ * R6.11 Phase 2.C 改造:
+ *   - `listActiveRows` SELECT 加 open-migration NOT EXISTS predicate(同 idleSweep) —
+ *     mid-migration 行从 Direction B 视野排出去,让 §14.2.6 reconciler 单点持有。
+ *   - Direction A 需要"补偿":listActiveRows 排掉了 mid-migration 行后,旧/新 host 上
+ *     migration 中的 docker 容器会"漏出"dbActiveCids 集合,Direction A 会当它们 docker
+ *     孤儿误删 — `listMidMigrationCids` 拉回 open ledger 两侧 cid 并入 dbActiveCids,
+ *     按 host 维度过滤(selfHostId 注入时只关心本机 host 上的 cid)。
+ *   - Direction B `stopAndRemoveV3Container` 走 `requireNoOpenMigration: true` 守卫
+ *     SELECT-then-UPDATE 中间窗口(罕见:listActiveRows 之后才有 writer INSERT ledger),
+ *     guard 拦截时不计入 vanished 也不计入 errors。
+ *
  * 不在本文件管:
  *   - volume orphan reconcile(volume 没绑容器但 PG 没标记):3G 已扫 banned/no-login,
  *     额外的 unmanaged volume 走运维 manual `docker volume prune --filter label=...`
@@ -186,7 +197,15 @@ interface DbActiveRow {
 /**
  * 列所有 state='active' 行(含 container_internal_id IS NULL 的中间窗口行)。
  *
- * R6.11 reader 二选一:本文件在 RECONCILER_WHITELIST 内,trivial 满足。
+ * R6.11 Phase 2.C reader 二选一硬约束(§9 3M):本文件虽在 RECONCILER_WHITELIST 内,
+ * 但 Direction B 的 stopAndRemoveV3Container 会把行翻 vanished + 跨 host docker stop+remove —
+ * 在 **open migration 期间**这个动作必须让步给 §14.2.6 migration reconciler 单点持有,
+ * 避免 orphan reconciler 把 migration 进行中的旧/新 host 容器误 stop。NOT EXISTS 命中
+ * `agent_migrations_open_by_container_idx` partial index,99% 0 行场景 sub-ms。
+ *
+ * Direction A 保护见 `listMidMigrationCids` —— 这里 listActiveRows 把 mid-migration 行
+ * 排出去之后,docker→DB 方向的 dbActiveCids 集合会"漏掉"mid-migration cid,如果不补,
+ * Direction A 会把它们当 docker 孤儿 force-remove。
  */
 async function listActiveRows(pool: Pool, batchLimit: number): Promise<DbActiveRow[]> {
   const r = await pool.query<{
@@ -195,8 +214,13 @@ async function listActiveRows(pool: Pool, batchLimit: number): Promise<DbActiveR
     host_uuid: string | null;
   }>(
     `SELECT id, container_internal_id, host_uuid
-       FROM agent_containers
+       FROM agent_containers c
       WHERE state = 'active'
+        AND NOT EXISTS (
+              SELECT 1 FROM agent_migrations m
+               WHERE m.agent_container_id = c.id
+                 AND m.phase NOT IN ('committed', 'rolled_back')
+            )
       ORDER BY id ASC
       LIMIT $1::int`,
     [batchLimit],
@@ -206,6 +230,52 @@ async function listActiveRows(pool: Pool, batchLimit: number): Promise<DbActiveR
     container_internal_id: row.container_internal_id,
     host_uuid: row.host_uuid,
   }));
+}
+
+/**
+ * 列所有 open migration(`phase NOT IN closed`)涉及的 docker container_internal_id
+ * (新旧两侧 cid 都计入,过滤 NULL)。Direction A 用 — 防把 mid-migration 期间的旧/新
+ * host 容器当 docker 孤儿误删。
+ *
+ * Host 路由:`selfHostId` 注入时按 host 维度过滤(只关心本机 host 上的 cid);
+ * `selfHostId` 缺失时返全集 — 与 Direction A 的"selfId 缺失则不做 host-aware 缩集"
+ * 兜底语义对齐(v3orphanReconcile.runOrphanReconcileTick 的 dbActiveCids 注释)。
+ */
+async function listMidMigrationCids(
+  pool: Pool,
+  selfHostId: string | undefined,
+): Promise<Set<string>> {
+  const params: unknown[] = [];
+  let hostFilterSql = "";
+  if (typeof selfHostId === "string" && selfHostId !== "") {
+    params.push(selfHostId);
+    hostFilterSql = `
+        AND ( (old_container_internal_id IS NOT NULL AND old_host_id = $1)
+           OR (new_container_internal_id IS NOT NULL AND new_host_id = $1) )`;
+  }
+  const r = await pool.query<{
+    old_container_internal_id: string | null;
+    new_container_internal_id: string | null;
+    old_host_id: string;
+    new_host_id: string;
+  }>(
+    `SELECT old_container_internal_id, new_container_internal_id, old_host_id, new_host_id
+       FROM agent_migrations
+      WHERE phase NOT IN ('committed', 'rolled_back')${hostFilterSql}`,
+    params,
+  );
+  const out = new Set<string>();
+  const selfId = typeof selfHostId === "string" && selfHostId !== "" ? selfHostId : null;
+  for (const row of r.rows) {
+    // selfHostId 注入时只把"本机 host 上"的 cid 入集 — 旧/新 host 各自判断
+    if (row.old_container_internal_id && (selfId === null || row.old_host_id === selfId)) {
+      out.add(row.old_container_internal_id);
+    }
+    if (row.new_container_internal_id && (selfId === null || row.new_host_id === selfId)) {
+      out.add(row.new_container_internal_id);
+    }
+  }
+  return out;
 }
 
 /**
@@ -322,9 +392,15 @@ async function reconcileDbOrphans(
       }
     } catch (err) {
       if (isNotFound(err)) {
-        // 对应 host 上的容器确实消失 → 标 vanished
+        // 对应 host 上的容器确实消失 → 标 vanished。
+        //
+        // R6.11 Phase 2.C:listActiveRows 已用 NOT EXISTS 过滤了 mid-migration 行,
+        // 但 SELECT 之后到此 inspect+vanish 之间仍可能有 writer INSERT ledger
+        // (典型场景:user 触发 lazy migrate 期间,旧 host 容器已 docker rm 但新 host
+        // 还没就绪)。requireNoOpenMigration 在 UPDATE 层兜底,返 false 时静默 skip
+        // 不计入 vanished、不计入 errors — 让 reconciler 单点权威收敛。
         try {
-          await stopAndRemoveV3Container(
+          const ok = await stopAndRemoveV3Container(
             deps,
             {
               id: row.id,
@@ -332,7 +408,16 @@ async function reconcileDbOrphans(
               host_uuid: row.host_uuid,
             },
             stopTimeoutSec,
+            { requireNoOpenMigration: true },
           );
+          if (!ok) {
+            log?.debug?.("[v3/orphanReconcile] db vanish skipped: open migration", {
+              containerId: row.id,
+              docker: cid,
+              host_uuid: row.host_uuid,
+            });
+            continue;
+          }
           vanished++;
           log?.info?.("[v3/orphanReconcile] vanished db orphan", {
             containerId: row.id,
@@ -402,10 +487,20 @@ export async function runOrphanReconcileTick(
       .filter((cid): cid is string => cid !== null && cid !== ""),
   );
 
+  // R6.11 Phase 2.C Direction A 保护:listActiveRows 用 NOT EXISTS 把 mid-migration
+  // 行排掉了,如果不补,旧/新 host 上 migration 中的 docker 容器会被 Direction A
+  // 当 docker 孤儿 force-remove(灾难性 — 旧容器 paused 中 / 新容器 created-not-started)。
+  // 这里把 open migration 的两侧 cid 都加入 dbActiveCids 集合,Direction A `dbActiveCids.has(c.id)`
+  // 检查就会跳过它们。listMidMigrationCids 内部按 host 维度过滤,只把本机 host 上
+  // 的 cid 入集 — selfHostId 缺失时返全集,与 dbActiveCids 的 fallback 语义对齐。
+  const midMigrationCids = await listMidMigrationCids(deps.pool, deps.selfHostId);
+  for (const cid of midMigrationCids) dbActiveCids.add(cid);
+
   log?.debug?.("[v3/orphanReconcile] scan", {
     dockerContainers: dockerList.length,
     dbActiveRows: dbRows.length,
     dbActiveCids: dbActiveCids.size,
+    midMigrationCids: midMigrationCids.size,
     skippedRecent: recentSkipped,
   });
 

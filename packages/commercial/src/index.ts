@@ -163,6 +163,7 @@ import {
   makeV3EnsureRunning,
   preheatV3Image,
   startIdleSweepScheduler,
+  startMigrationReconcileScheduler,
   startOrphanReconcileScheduler,
   markV3ContainerActivity,
   startV3ContainerEventsWorker,
@@ -170,6 +171,7 @@ import {
   createUserMediaResolver,
   isUserVolumeMediaPath,
   type IdleSweepScheduler,
+  type MigrationReconcileScheduler,
   type OrphanReconcileScheduler,
   type UserMediaLocation,
   type V3ContainerEventsWorker,
@@ -1810,6 +1812,24 @@ export async function registerCommercial(
     orphanReconcileLog.info("scheduler started", { tickSec: 3600, runOnStart: true });
   }
 
+  // V3 R6.11 §14.2.6:agent_migrations stale ledger reconciler(gateway 启动立刻 + 60s tick)。
+  // 进程崩重启 / 长时间 alive 中途崩过的兜底:扫 `phase NOT IN closed` + updated_at 超
+  // `supervisor_stale_migrate_threshold_sec`(默认 600s)的行,planned 阶段直接
+  // markRolledBack +(pausedAt 非空时)unpause 旧容器 — 这是 R6.11 reader 二选一硬约束的
+  // 单点权威闭环(02-DEVELOPMENT-PLAN.md §14.2.6:2093)。
+  // OC_MIGRATION_RECONCILER_DISABLED=1 关闭(运维灾备 / writer 上线前的紧急回滚开关)。
+  let migrationReconcileScheduler: MigrationReconcileScheduler | undefined;
+  if (v3Deps && process.env.OC_MIGRATION_RECONCILER_DISABLED !== "1") {
+    const migrationReconcileLog = rootLogger.child({ subsys: "v3/migrationReconciler" });
+    migrationReconcileScheduler = startMigrationReconcileScheduler(v3Deps, {
+      logger: migrationReconcileLog,
+      // 默认 runOnStart=true + 60s tick + staleSec=600(R6.11 默认)
+    });
+    migrationReconcileLog.info("scheduler started", {
+      tickSec: 60, staleSec: 600, runOnStart: true,
+    });
+  }
+
   // fix:HealthPoller(compute-pool/nodeHealth.ts)在 5029a69 引入但从未在 service
   // boot 接 .start() — last_health_at 一直 NULL,自动 quarantine/recovery 状态机失效,
   // mTLS cert 临近过期的自动 renewal 也跟着失效。OC_HEALTH_POLLER_DISABLED=1 给单
@@ -2335,6 +2355,9 @@ export async function registerCommercial(
       }
       if (orphanReconcileScheduler) {
         try { await orphanReconcileScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (migrationReconcileScheduler) {
+        try { await migrationReconcileScheduler.stop(); } catch { /* ignore */ }
       }
       if (healthPoller) {
         try { healthPoller.stop(); } catch { /* ignore */ }
