@@ -1,0 +1,35 @@
+[Unit]
+Description=Daily pg_dump of openclaude_commercial DB (M7/P1-10)
+After=postgresql.service
+Requires=postgresql.service
+# 失败走统一 v3 timer alert template(参考 pg-restore-test.service)
+# Template 当前未部署 → systemd silent skip OnFailure;后续单独补 template 时此引用立即生效。
+OnFailure=v3-timer-failure-alert@pg-backup-openclaude.service
+
+[Service]
+Type=oneshot
+# RuntimeDirectory= 由 systemd 自动创建 /run/openclaude 并设为 RW(给本 unit),
+# 不依赖对 /run 是否被 ProtectSystem=strict 自动豁免的假设。
+RuntimeDirectory=openclaude
+# flock 防 timer Persistent 回放 / 手工触发 / 长跑重叠
+ExecStart=/usr/bin/flock -n /run/openclaude/pg-backup-openclaude.lock /usr/local/bin/pg-backup-openclaude.sh
+# 当前 DB ~10MB,正常 dump <30s。30min 给极大冗余。
+TimeoutStartSec=30min
+TimeoutStopSec=10s
+# 不要 starve prod IO/CPU。
+Nice=10
+IOSchedulingClass=idle
+
+# Hardening 与 pg-restore-test 对齐(脚本以 root 跑 + 内部 runuser -u postgres)。
+# 不开 NoNewPrivileges / RestrictSUIDSGID(不破坏 runuser/su)。
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# /var/backups/postgres:写 *.dump
+# /var/log:写 pg-backup-openclaude.log
+# /tmp 不需要列(PrivateTmp=true 已给完整 RW 私有 /tmp)
+# PG socket /var/run/postgresql 只读连接即可,ProtectSystem=strict 默认允许读
+ReadWritePaths=/var/backups/postgres /var/log
+PrivateTmp=true

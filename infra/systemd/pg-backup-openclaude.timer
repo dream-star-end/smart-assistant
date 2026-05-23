@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily PG backup timer for openclaude_commercial (17:15 UTC)
+
+[Timer]
+# Daily 17:15 UTC, 留 45min 给 45.32 pull@18:00 UTC
+OnCalendar=*-*-* 17:15:00 UTC
+# 错过窗口(机器关机)开机后补一次 — backup 缺一天比补跑一次更糟
+Persistent=true
+# 不要随机抖动 — pull 侧时序假设 17:15 UTC 准时;
+# pg-restore-test 用了 10m 抖动是因为下游无依赖,本 unit 不行
+RandomizedDelaySec=0
+Unit=pg-backup-openclaude.service
+
+[Install]
+WantedBy=timers.target

@@ -77,11 +77,31 @@ bash infra/pg-backup-pull/setup-v3-backup-pull.sh
 # PULL_FROM_IP = 45.32 master 真身 GCE openclaude-personal-mirror。
 # 旧 Vultr Tokyo 45.32.41.166 已废弃,不要用。
 
-# 3. 部署 restore-test 脚本
+# 3. 部署 backup-gen systemd 单元(M7/P1-10 dev half 补全 — 2026-05-23)
+#    pg-backup-openclaude.sh 已在步骤 1 装到 /usr/local/bin/;此步把 systemd
+#    timer 启起来,让 KL 每天 17:15 UTC 自动跑 pg_dump。
+#    没有这步,45.32 侧 pull 无 dump 可拉(P0.3 KL bootstrap prereq)。
+#
+#    预创建 backup 目录 —— 单元用 ProtectSystem=strict,只把
+#    /var/backups/postgres 列在 ReadWritePaths;父目录 /var/backups 仍只读,
+#    所以单元 first run 时脚本里的 install -d 会失败。这里手工预创建一次,
+#    后续脚本 install -d 走幂等 chmod/chown 路径(在 RW 范围内)。
+install -d -m 0700 -o postgres -g postgres /var/backups/postgres
+
+install -m 0644 -o root -g root \
+  infra/systemd/pg-backup-openclaude.service /etc/systemd/system/pg-backup-openclaude.service
+install -m 0644 -o root -g root \
+  infra/systemd/pg-backup-openclaude.timer /etc/systemd/system/pg-backup-openclaude.timer
+systemctl daemon-reload
+systemctl enable --now pg-backup-openclaude.timer
+systemctl is-enabled pg-backup-openclaude.timer    # 期待: enabled
+systemctl list-timers pg-backup-openclaude.timer   # 期待: NEXT = 今晚 17:15 UTC
+
+# 4. 部署 restore-test 脚本
 install -m 0755 -o root -g root \
   scripts/pg-restore-test.sh /usr/local/bin/pg-restore-test.sh
 
-# 4. 部署 systemd 单元
+# 5. 部署 restore-test systemd 单元
 install -m 0644 -o root -g root \
   infra/systemd/pg-restore-test.service /etc/systemd/system/pg-restore-test.service
 install -m 0644 -o root -g root \
@@ -89,7 +109,7 @@ install -m 0644 -o root -g root \
 systemctl daemon-reload
 systemctl enable --now pg-restore-test.timer
 
-# 5. 验证 timer 在排队
+# 6. 验证 timer 在排队
 systemctl list-timers pg-restore-test.timer
 ```
 
