@@ -4,13 +4,14 @@
 # Run on the v3 VM as root. Idempotent.
 #
 # Inputs:
-#   PULL_PUBKEY  — required, ed25519 public key from 45.32 (single line, ssh-ed25519 ...)
-#   PULL_FROM_IP — required, source IP of 45.32 (for from= restriction in authorized_keys)
+#   PULL_PUBKEY  — required, ed25519 public key from sg (single line, ssh-ed25519 ...)
+#   PULL_FROM_IP — required, source IP of sg (for from= restriction in authorized_keys)
 #
 # What it does (idempotent):
 #   1. useradd backup-pull (system, no home creation needed at /home/backup-pull,
 #      but we create the .ssh dir ourselves)
-#   2. install backup-pull-cmd (root:root 0755) and backup-pull-wrapper (backup-pull:backup-pull 0755)
+#   2. install backup-pull-cmd (root:root 0755) and backup-pull-wrapper (root:root 0755)
+#      (wrapper 是 SSH trust boundary 的一部分,backup-pull 用户只需 execute,不写)
 #   3. install /etc/sudoers.d/backup-pull and visudo -cf check
 #   4. install /home/backup-pull/.ssh/authorized_keys with from= and forced command
 #   5. NOT touched here: pg-backup-openclaude.sh's runuser switch (separate script)
@@ -28,15 +29,16 @@ fi
 if [ -z "${PULL_PUBKEY:-}" ] || [ -z "${PULL_FROM_IP:-}" ]; then
   cat >&2 <<USAGE
 Usage:
-  PULL_PUBKEY="ssh-ed25519 AAAA... 45.32-pull" \\
-  PULL_FROM_IP="35.243.97.117" \\
+  PULL_PUBKEY="ssh-ed25519 AAAA... sg-pull" \\
+  PULL_FROM_IP="38.55.252.217" \\
   bash setup-v3-backup-pull.sh
 
 Inputs:
-  PULL_PUBKEY  — ed25519 pubkey from 45.32 backup-pull keypair
+  PULL_PUBKEY  — ed25519 pubkey from sg backup-pull keypair
   PULL_FROM_IP — source IP for from= restriction.
-                 35.243.97.117 = 45.32 master (GCE openclaude-personal-mirror,
-                 asia-northeast1-a). Vultr Tokyo 45.32.41.166 is retired; do not use.
+                 38.55.252.217 = sg (薄荷云 Cloudvalley, 16-core, 2026-05-23
+                 接替废弃中的 45.32 master 作 P0.3 backup-pull 集中点).
+                 历史 45.32 / 35.243.97.117 / GCE / Vultr 都已废弃,不要用。
 
 This script must run on the v3 commercial VM.
 USAGE
@@ -103,6 +105,6 @@ mv -f "$AK_TMP" "$HOME_DIR/.ssh/authorized_keys"
 
 echo
 echo "=== setup complete ==="
-echo "From 45.32 verify with:"
+echo "From sg verify with:"
 echo "  ssh -i /root/.ssh/v3-backup-pull -o UserKnownHostsFile=/root/.ssh/known_hosts.v3-pull \\"
 echo "      -o StrictHostKeyChecking=yes backup-pull@<v3-ip> info"

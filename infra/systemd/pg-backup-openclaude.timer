@@ -2,7 +2,7 @@
 Description=Daily PG backup timer for openclaude_commercial (17:15 UTC)
 
 [Timer]
-# Daily 17:15 UTC, 留 45min 给 45.32 pull@18:00 UTC
+# Daily 17:15 UTC, 留 45min 给 sg pull@18:00 UTC
 OnCalendar=*-*-* 17:15:00 UTC
 # 错过窗口(机器关机)开机后补一次 — backup 缺一天比补跑一次更糟
 Persistent=true

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# M7/P1-10 — Pull latest PG dump from each v3 commercial VM to 45.32 (cross-cloud cold copy).
+# M7/P1-10 — Pull latest PG dump from each v3 commercial VM to sg (cross-cloud cold copy).
 #
-# Runs on 45.32 master (now operationally resolves to GCE openclaude-personal-mirror,
-# asia-northeast1-a, 35.243.97.117) as root via cron, daily after the v3 17:15 UTC backup
-# window. Historic Vultr Tokyo 45.32.41.166 retired post-migration to GCE — same logical
-# "45.32" role, different infra.
+# Runs on sg (38.55.252.217, 薄荷云 Cloudvalley, 16-core) as root via cron, daily after
+# the v3 17:15 UTC backup window. 原 45.32 master (GCE openclaude-personal-mirror) 在
+# 2026-05 决策废弃 — P0.3 集中点已迁到 sg。历史拓扑变更见 git history。
 #
 # Architecture:
 #   - Each v3 VM runs pg-backup-openclaude.timer @ 17:15 UTC, dumps locally
