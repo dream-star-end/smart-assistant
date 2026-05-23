@@ -749,3 +749,99 @@ describe("apiKeyIdentity.resolve — Phase 6 admin-only rollout gate(Layer 2)", 
     }
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────
+//  AINV-3 — row.userId is single source of truth(no caller-supplied uid)
+//
+//  Audit 标 ⚠️ 的原因:strategy 已经把 `return { uid: row.userId, ... }`
+//  写得很干净(apiKeyIdentity.ts:266),但缺**显式负向断言**锁住"caller 在
+//  request 里塞 uid-like 字段 / proxy header 注入 → 不被 strategy 读"。这
+//  类回归通常在重构里悄悄引入(例如想"复用现成 uid"或加 admin-impersonate
+//  header 时),behavior-level 测试比 grep 源码更稳。
+// ───────────────────────────────────────────────────────────────────────
+
+describe("AINV-3 — row.userId is single source of truth (no caller-supplied uid)", () => {
+  test("repo row userId=999n → strategy 返 uid=999n;loadUserModelAuthz 也只收到 row.userId", async () => {
+    const secret = "deadbeef".repeat(6); // 48 hex
+    const spy = makeRepoSpy(
+      makeRow({ id: 7n, userId: 999n, keyPrefix: "abcd1234", secretHex: secret }),
+    );
+    const authzCalls: bigint[] = [];
+    const strat = makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async (uid) => {
+        authzCalls.push(uid);
+        return { role: "admin", grantedModelIds: new Set() };
+      },
+    });
+
+    const identity = await strat.resolve(
+      reqWith("Bearer oc-cc.abcd1234." + secret),
+      CTX,
+    );
+    assert.equal(identity.uid, 999n, "uid 必须直接来自 row.userId");
+    assert.equal(identity.containerId, null, "ApiKey 路径不带容器维度");
+    assert.deepEqual(
+      authzCalls,
+      [999n],
+      "loadUserModelAuthz 必须用 row.userId(不是 caller-supplied)拉 authz",
+    );
+  });
+
+  test("caller-supplied uid 字段(headers + req.body)被 strategy 完全忽略", async () => {
+    // 同一把 key,row 锁定到 999n。攻击向量:
+    //   (a) header 里塞各种"看起来像 uid"的字段
+    //   (b) req.body 被 strategy 访问 → 直接抛错(throwing getter 硬锁)
+    //
+    // 期望:strategy 不读 body、不读这些 header,uid 仍 === 999n。任何回归
+    // 引入 `req.body.uid` / `headers["x-uid"]` 之类的 caller-supplied 路径
+    // 都会让本测试断言失败。
+    const secret = "deadbeef".repeat(6);
+    const spy = makeRepoSpy(
+      makeRow({ id: 7n, userId: 999n, keyPrefix: "abcd1234", secretHex: secret }),
+    );
+    const authzCalls: bigint[] = [];
+    const strat = makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async (uid) => {
+        authzCalls.push(uid);
+        return { role: "admin", grantedModelIds: new Set() };
+      },
+    });
+
+    const req = {
+      headers: {
+        authorization: "Bearer oc-cc.abcd1234." + secret,
+        "user-agent": DEFAULT_CC_UA,
+        // 攻击向量(b):各种伪造 uid 别名
+        "x-uid": "1",
+        "x-user-id": "1",
+        "x-claude-uid": "1",
+        "x-impersonate-uid": "1",
+      },
+    } as unknown as IncomingMessage;
+    // 攻击向量(b):strategy 一旦读 req.body 就硬错。这把"不读 body"
+    // 锁到 behavior 层,比注释或 grep 源码更稳。
+    Object.defineProperty(req, "body", {
+      get() {
+        throw new Error(
+          "AINV-3 violation: strategy.resolve must not read req.body",
+        );
+      },
+    });
+
+    const identity = await strat.resolve(req, CTX);
+    assert.equal(
+      identity.uid,
+      999n,
+      "uid 必须仍是 row.userId,header 上的任何 uid-like 字段都不应被读",
+    );
+    assert.deepEqual(
+      authzCalls,
+      [999n],
+      "loadUserModelAuthz 收到的也必须是 row.userId",
+    );
+  });
+});
