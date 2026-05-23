@@ -29,12 +29,14 @@ if [ -z "${PULL_PUBKEY:-}" ] || [ -z "${PULL_FROM_IP:-}" ]; then
   cat >&2 <<USAGE
 Usage:
   PULL_PUBKEY="ssh-ed25519 AAAA... 45.32-pull" \\
-  PULL_FROM_IP="45.32.41.166" \\
+  PULL_FROM_IP="35.243.97.117" \\
   bash setup-v3-backup-pull.sh
 
 Inputs:
   PULL_PUBKEY  — ed25519 pubkey from 45.32 backup-pull keypair
-  PULL_FROM_IP — source IP for from= restriction
+  PULL_FROM_IP — source IP for from= restriction.
+                 35.243.97.117 = 45.32 master (GCE openclaude-personal-mirror,
+                 asia-northeast1-a). Vultr Tokyo 45.32.41.166 is retired; do not use.
 
 This script must run on the v3 commercial VM.
 USAGE

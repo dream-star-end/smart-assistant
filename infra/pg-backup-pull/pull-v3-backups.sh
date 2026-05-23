@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # M7/P1-10 — Pull latest PG dump from each v3 commercial VM to 45.32 (cross-cloud cold copy).
 #
-# Runs on 45.32 (Vultr Tokyo) as root via cron, daily after the v3 17:15 UTC backup window.
+# Runs on 45.32 master (now operationally resolves to GCE openclaude-personal-mirror,
+# asia-northeast1-a, 35.243.97.117) as root via cron, daily after the v3 17:15 UTC backup
+# window. Historic Vultr Tokyo 45.32.41.166 retired post-migration to GCE — same logical
+# "45.32" role, different infra.
 #
 # Architecture:
 #   - Each v3 VM runs pg-backup-openclaude.timer @ 17:15 UTC, dumps locally
@@ -45,9 +48,13 @@ set +u
 . /root/.openclaude/.env.keys 2>/dev/null || true
 set -u
 
-# host_label:ssh_target — append a row to add a new VM
+# host_label:ssh_target - append a row to add a new VM.
+# Current prod = KL .236 (post 2026-05-21 switchover); Tokyo .239 = fossil snapshot, stopped.
+# KL .218 is a streaming replica + hot standby (same DC), it does NOT run an independent
+# pg-backup-openclaude.timer, so it is not an independent backup source. Keep .236 only
+# until/unless .218 is promoted via switchover.
 HOSTS=(
-  "v3-staging:backup-pull@34.146.172.239"
+  "kl-master:backup-pull@154.193.246.236"
 )
 
 install -d -m 700 "$DEST_ROOT"

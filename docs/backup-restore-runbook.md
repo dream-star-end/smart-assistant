@@ -1,17 +1,22 @@
 # PG Backup & Restore Runbook (M7 / P1-10)
 
-最后更新: 2026-04-25
+最后更新: 2026-05-23
+
+> 拓扑变更说明:2026-05-21 v3 prod master 从 GCE Tokyo (34.146.172.239,现已 disable
+> 成 fossil snapshot)切到 KL (154.193.246.236)。45.32 master 在 2026 年内从 Vultr
+> Tokyo (45.32.41.166) 迁到 GCE openclaude-personal-mirror (asia-northeast1-a,
+> 35.243.97.117) —— "45.32" 是 role label,真身已不在 Vultr。本 runbook 已更新。
 
 ## 备份架构
 
 ```
-[v3 commercial VM (GCE Tokyo)]            [45.32 (Vultr Tokyo, OpenClaude personal)]
+[v3 commercial VM (KL .236)]              [45.32 master (GCE openclaude-personal-mirror)]
   /usr/local/bin/pg-backup-openclaude.sh   /usr/local/bin/pull-v3-backups.sh
     daily 17:15 UTC via systemd timer        daily 18:00 UTC via /etc/cron.d/pull-v3-backups
     runuser -u postgres -- pg_dump -Fc       SSH backup-pull@v3 info → fetch=<basename>
     -> /var/backups/postgres/                sha256/size verify
        openclaude_commercial-YYYYMMDD-HHMMSSZ.dump
-    14d retention                          -> /var/backups/v3-commercial/v3-staging/
+    14d retention                          -> /var/backups/v3-commercial/kl-master/
                                               30d retention
   /usr/local/bin/pg-restore-test.sh
     Sun 03:00 UTC via systemd timer
@@ -27,14 +32,16 @@
 | 灾难场景 | 恢复路径 |
 |---------|---------|
 | v3 VM 数据库损坏(可登录) | 本机 `/var/backups/postgres/` 14d 之内任一 dump → `pg_restore` |
-| v3 VM 整机丢失或不可达 | 从 45.32 `/var/backups/v3-commercial/v3-staging/` 30d 之内任一 dump → 新 VM `pg_restore` |
+| v3 VM 整机丢失或不可达 | 从 45.32 `/var/backups/v3-commercial/kl-master/` 30d 之内任一 dump → 新 VM `pg_restore` |
 | 45.32 整机丢失 | v3 VM 本机 14d dump 仍在,推迟设置新集中点不影响日常 |
 | **双机同时损坏** | **数据丢失,RPO 不可避**(本期不覆盖,见 Limitations) |
 
 ## Limitations(必读)
 
 1. **45.32 是临时集中收集点,不是独立备份系统**
-   - 45.32 同时承载 OpenClaude 个人版,运维平面与备份目的地耦合
+   - 这里"45.32"是 role label,当前 operationally resolves to GCE
+     openclaude-personal-mirror (35.243.97.117)。
+   - 45.32 master 同时承载 OpenClaude 个人版,运维平面与备份目的地耦合
    - 真正的独立 backup-only 设施需要专建一台只跑 sshd + cron 的 VPS,本期未做
    - 长期演进:加第二个 pull target(例如 AWS/Cloudflare R2 / 另一家 VPS),让 pull 脚本同时推送两份
 
@@ -65,8 +72,10 @@ install -m 0755 -o root -g root \
 # 2. 部署 backup-pull 用户 + wrapper + helper + sudoers + authorized_keys
 #    需要先在 45.32 生成 ed25519 keypair 并取得 pubkey 单行字符串
 PULL_PUBKEY="ssh-ed25519 AAAA... 45.32-pull" \
-PULL_FROM_IP="45.32.41.166" \
+PULL_FROM_IP="35.243.97.117" \
 bash infra/pg-backup-pull/setup-v3-backup-pull.sh
+# PULL_FROM_IP = 45.32 master 真身 GCE openclaude-personal-mirror。
+# 旧 Vultr Tokyo 45.32.41.166 已废弃,不要用。
 
 # 3. 部署 restore-test 脚本
 install -m 0755 -o root -g root \
@@ -92,12 +101,13 @@ ssh-keygen -t ed25519 -f /root/.ssh/v3-backup-pull -N "" -C "45.32-v3-backup-pul
 chmod 600 /root/.ssh/v3-backup-pull
 chmod 644 /root/.ssh/v3-backup-pull.pub
 
-# 2. Pin v3 VM host key(防 MITM,必做)
-#    人工确认指纹:ssh 到 v3 VM 当 root 跑 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
-#    与下面 ssh-keyscan 输出对照
-ssh-keyscan -t ed25519 34.146.172.239 > /root/.ssh/known_hosts.v3-pull
+# 2. Pin v3 VM host key(防 MITM,**强制必做**)
+#    人工确认指纹:ssh 到 v3 VM(走 trusted channel,比如已有的 kl-mirror SSH alias)
+#    跑 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`,与下面 ssh-keyscan 输出对照。
+#    不一致就停手:可能是 MITM / 错连其它机器 / 配置漂移,排查清楚再继续。
+ssh-keyscan -t ed25519 154.193.246.236 > /root/.ssh/known_hosts.v3-pull
 chmod 600 /root/.ssh/known_hosts.v3-pull
-ssh-keygen -lf /root/.ssh/known_hosts.v3-pull   # 显示指纹,与 v3 VM 上的应一致
+ssh-keygen -lf /root/.ssh/known_hosts.v3-pull   # 显示指纹,与 KL .236 上的应一致
 
 # 3. 部署 pull 脚本
 install -m 0755 -o root -g root \
@@ -131,7 +141,7 @@ chmod 600 /root/.openclaude/.env.keys
    ```bash
    ssh-keygen -lf /root/.ssh/known_hosts.v3-pull
    ```
-   与从 GCE serial console / 单独 ssh 看到的一致。
+   与从已有 trusted SSH(`kl-mirror` alias)看到的 host key 指纹一致。
 
 3. **info 协议**
    ```bash
@@ -140,7 +150,7 @@ chmod 600 /root/.openclaude/.env.keys
        -o UserKnownHostsFile=/root/.ssh/known_hosts.v3-pull \
        -o BatchMode=yes \
        -o IdentitiesOnly=yes \
-       backup-pull@34.146.172.239 info
+       backup-pull@154.193.246.236 info
    ```
    应返回三行 FILENAME/SIZE/SHA256。
 
@@ -163,9 +173,9 @@ chmod 600 /root/.openclaude/.env.keys
    ```bash
    /usr/local/bin/pull-v3-backups.sh
    tail -30 /var/log/pull-v3-backups.log
-   ls -la /var/backups/v3-commercial/v3-staging/
+   ls -la /var/backups/v3-commercial/kl-master/
    ```
-   日志应有 `OK(v3-staging): pulled ...`。
+   日志应有 `OK(kl-master): pulled ...`。
 
 7. **故意失败,验证 Telegram 告警**
    v3 VM 上临时改 backup-pull-cmd 让 info 返回 ERR:
@@ -177,14 +187,14 @@ chmod 600 /root/.openclaude/.env.keys
    echo 'echo "ERR: forced"; exit 99' | sudo tee -a /usr/local/bin/backup-pull-cmd
    ```
    45.32 上跑 pull 脚本,应:
-   - log 出现 `FAIL(v3-staging)`
-   - `/var/backups/v3-commercial/v3-staging/.pull-failed` 出现
-   - Telegram 收到 `[v3-backup-pull] FAIL v3-staging: ...`
+   - log 出现 `FAIL(kl-master)`
+   - `/var/backups/v3-commercial/kl-master/.pull-failed` 出现
+   - Telegram 收到 `[v3-backup-pull] FAIL kl-master: ...`
 
 8. **恢复后 RECOVERED 告警**
    恢复 v3 VM 上的 backup-pull-cmd,再跑 pull 脚本:
    - `.pull-failed` marker 应被删除
-   - Telegram 收到 `[v3-backup-pull] RECOVERED v3-staging: pulled ...`
+   - Telegram 收到 `[v3-backup-pull] RECOVERED kl-master: pulled ...`
 
 ## 灾难恢复操作手册
 
@@ -222,7 +232,7 @@ bash /opt/openclaude/openclaude-v3/scripts/smoke-v3.sh
 
 # 2. 从 45.32 选最新可用 dump
 NEW_VM=root@<new-v3-ip>
-DUMP=/var/backups/v3-commercial/v3-staging/openclaude_commercial-YYYYMMDD-HHMMSSZ.dump
+DUMP=/var/backups/v3-commercial/kl-master/openclaude_commercial-YYYYMMDD-HHMMSSZ.dump
 
 # 3. scp 到新 VM
 scp -i /root/.ssh/google_compute_engine "$DUMP" "$NEW_VM:/tmp/restore.dump"
@@ -239,7 +249,7 @@ ssh "$NEW_VM" "runuser -u postgres -- pg_restore --no-owner --no-acl -d openclau
 
 ```bash
 # 在 45.32 上,选最新副本
-DUMP=$(ls -1 /var/backups/v3-commercial/v3-staging/*.dump | LC_ALL=C sort | tail -1)
+DUMP=$(ls -1 /var/backups/v3-commercial/kl-master/*.dump | LC_ALL=C sort | tail -1)
 sha256sum "$DUMP"   # 记录
 
 # 用 docker 拉一个一次性 PG16 容器恢复
@@ -268,7 +278,7 @@ docker stop pg-drill-$$
 
 ## 故障排查
 
-### 症状: pull 脚本日志反复 `FAIL(v3-staging): info call failed`
+### 症状: pull 脚本日志反复 `FAIL(kl-master): info call failed`
 
 可能原因:
 - v3 VM SSH 端口不可达(检查防火墙、GCP firewall rule)
@@ -291,3 +301,91 @@ ssh root@<v3-vm> 'tail -50 /var/log/pg-restore-test.log'
 ```
 
 最常见原因: dump 文件本身损坏。立即手工跑一次 backup,然后再跑一次 restore-test 验证。
+
+---
+
+## 后续待执行:P0.3 KL bootstrap (2026-05-23)
+
+**背景**:本仓代码/文档已更新成 KL 拓扑,但 45.32 master 与 KL .236 上的 **实际 SSH bootstrap 尚未执行**。当前状态 = `pull-v3-backups.sh` 已合入 origin/v3 但还没装到 45.32,/var/backups/v3-commercial/ 为空。下面是 boss 上手时按顺序跑的步骤,**不要让 LLM 自动跑** —— 涉及生成生产凭证 + 远端 root 写 authorized_keys/sudoers,必须 boss 亲手 + trusted channel 核对指纹。
+
+### Prerequisite check
+
+```bash
+# 1. KL master (.236) 上必须已有 pg-backup-openclaude.timer enabled。
+#    如果没装,先按上方"部署清单 → v3 VM 侧"步骤 1+ 装齐(本节假设已就绪)。
+ssh kl-mirror 'systemctl is-enabled pg-backup-openclaude.timer && \
+                systemctl list-timers pg-backup-openclaude.timer'
+# 期待: enabled + 下次触发时间是今晚 17:15 UTC
+
+# 2. **必做**:在 45.32 master 本机确认真实公网出口 IP 是 35.243.97.117。
+#    如果 GCE 上有 Cloud NAT / 出口代理 / 网络改动,这个值跟预期不一致,
+#    后续 authorized_keys `from=35.243.97.117` 会直接拒绝 SSH。
+curl -4 -fsS https://ifconfig.me; echo
+# 期待: 35.243.97.117。不一致就改下面 (c) 的 PULL_FROM_IP 为实际出口 IP。
+```
+
+### Boss 手工执行步骤
+
+```bash
+# === 在 45.32 master(GCE openclaude-personal-mirror,35.243.97.117)上 ===
+
+# (a) 生成 backup-pull 专用 keypair
+ssh-keygen -t ed25519 -f /root/.ssh/v3-backup-pull -N "" -C "45.32-v3-backup-pull"
+chmod 600 /root/.ssh/v3-backup-pull
+chmod 644 /root/.ssh/v3-backup-pull.pub
+
+# (b) Pin KL .236 host key(走 trusted channel `kl-mirror` SSH alias 核对!)
+ssh-keyscan -t ed25519 154.193.246.236 > /root/.ssh/known_hosts.v3-pull
+chmod 600 /root/.ssh/known_hosts.v3-pull
+KL_SCANNED=$(ssh-keygen -lf /root/.ssh/known_hosts.v3-pull)
+KL_REAL=$(ssh kl-mirror 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub')
+echo "scanned: $KL_SCANNED"
+echo "real   : $KL_REAL"
+# 两条指纹**必须**逐字符相同。不一致 = MITM / 错主机 / drift,立即停手排查。
+
+# === 在 KL master(.236)上,走 kl-mirror SSH alias ===
+
+# (c) 把刚生成的 pubkey + 45.32 master 出口 IP 喂给 setup 脚本
+PUBKEY=$(cat /root/.ssh/v3-backup-pull.pub)   # 在 45.32 上拿到的
+ssh kl-mirror "cd /opt/openclaude/openclaude-v3 && \
+    PULL_PUBKEY='$PUBKEY' PULL_FROM_IP='35.243.97.117' \
+    bash infra/pg-backup-pull/setup-v3-backup-pull.sh"
+
+# === 回到 45.32 master ===
+
+# (d) 部署 pull 脚本到系统路径
+install -m 0755 -o root -g root \
+  /opt/openclaude/openclaude-v3/infra/pg-backup-pull/pull-v3-backups.sh \
+  /usr/local/bin/pull-v3-backups.sh
+
+# (e) 装系统 cron
+cat > /etc/cron.d/pull-v3-backups <<'CRON'
+# M7/P1-10 — Daily SSH-pull v3 commercial PG backup to 45.32.
+0 18 * * * root /usr/bin/flock -n /run/pull-v3-backups.lock /usr/local/bin/pull-v3-backups.sh
+CRON
+chmod 644 /etc/cron.d/pull-v3-backups
+
+# (f) 跑上方"部署后烟雾测试(8 项)"。每一项 OK 才进下一项。
+```
+
+### 失败回滚(任一烟测失败,或后续日常 pull 反复失败)
+
+**不要回 Tokyo**(.239 是 fossil snapshot,不是可用 backup 源)。回滚 = 撤销本次 bootstrap、让系统回到 "无自动 backup pull" 的预期状态,等 boss 排查根因后重做。
+
+```bash
+# 在 KL master 上撤 authorized_keys
+ssh kl-mirror 'rm -f /home/backup-pull/.ssh/authorized_keys'
+# 或更彻底:userdel backup-pull(setup 脚本 idempotent,后续可重装)
+# ssh kl-mirror 'userdel -r backup-pull && rm -f /etc/sudoers.d/backup-pull \
+#                                          /usr/local/bin/backup-pull-cmd \
+#                                          /usr/local/bin/backup-pull-wrapper'
+
+# 在 45.32 master 上停 cron + 销毁本地 key
+rm -f /etc/cron.d/pull-v3-backups
+rm -f /root/.ssh/v3-backup-pull /root/.ssh/v3-backup-pull.pub /root/.ssh/known_hosts.v3-pull
+# 已拉到本地的 dump 可保留(/var/backups/v3-commercial/kl-master/),它们是合法 backup。
+```
+
+KL master 本机 `/var/backups/postgres/` 14d retention 保持运行,即使 45.32 pull 没装,DB 损坏场景的本机恢复路径仍然可用。
+
+> 完成后请把本节标题改成 `## 历史:P0.3 KL bootstrap (YYYY-MM-DD 完成)` 或删掉,避免下次 onboarding 误读"还没做"。
