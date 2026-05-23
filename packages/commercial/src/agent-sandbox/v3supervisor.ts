@@ -2331,6 +2331,23 @@ export async function markV3ContainerActivity(
 /**
  * 查 active row + docker inspect 求标准化态。
  * 用户没 active row → null。docker inspect 404 → state='missing'。
+ *
+ * INV-4 (R6.11 §13.3) — SELECT WHERE 末尾追加 NOT EXISTS,过滤"被 open agent_migrations
+ * 锁住"的行。本闸门:
+ *   - 不是 INV-3 的替代品 — INV-3 在 ensureRunning 入口短路返 503;INV-4 单独命中
+ *     时(open migration + INV-3 没拦,例如 race / 外部 caller)只让 status 返 null,
+ *     reader 会落到 provision / file proxy 落到 503 CONTAINER_NOT_RUNNING
+ *   - 价值:(a) 防 reuse 路径误把"被迁移行"当 reuse 候选 (b) file proxy 同享此 SELECT,
+ *     迁移期间不路由到 maybe-stale 容器(short-window 503 由前端重试自愈)
+ *   - NOT EXISTS 子查询用完整表名 `agent_containers.id` 引用外层(PG 标准支持),不引入
+ *     alias `c`;FakePool SELECT regex `/SELECT id, user_id, host\(bound_ip\)/` 在
+ *     `v3EnsureRunning.test.ts:187` 和 `v3Supervisor.test.ts:326` 都继续匹配,无回归
+ *   - 索引兜底:`agent_migrations_one_open_by_container_idx (agent_container_id)
+ *     WHERE phase NOT IN ('committed','rolled_back')` 是 UNIQUE partial,sub-ms
+ *
+ * P1 同步扩展点:placeholder dev plan §13.3 verbatim 写 `state IN ('active','pending_apply')`。
+ * 当前 schema 不允许 `pending_apply`(0001-0070 未引入),先保留 `state='active'`;P1
+ * 加状态时 reader 同步扩展(`findOpenByUser` 内部已 verbatim 写,届时只改本处一行)。
  */
 export async function getV3ContainerStatus(
   deps: V3SupervisorDeps,
@@ -2355,6 +2372,11 @@ export async function getV3ContainerStatus(
     `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id, host_uuid, created_at
        FROM agent_containers
       WHERE user_id = $1::bigint AND state='active'
+        AND NOT EXISTS (
+          SELECT 1 FROM agent_migrations m
+           WHERE m.agent_container_id = agent_containers.id
+             AND m.phase NOT IN ('committed', 'rolled_back')
+        )
       LIMIT 1`,
     [String(uid)],
   );

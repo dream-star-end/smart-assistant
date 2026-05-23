@@ -184,6 +184,16 @@ class FakePool {
       }
       return { rowCount: r ? 1 : 0, rows: [] };
     }
+    // Phase 2.B INV-3 findOpenByUser SELECT — FakePool 不建模 agent_migrations 表,
+    // 默认返 0 行(等价"无 open migration"),所有现有 ensureRunning unit 测继续走
+    // 正常路径不被 INV-3 拦。真测在 v3EnsureRunningMigrationGuard.test.ts(PG fixture)。
+    if (
+      /SELECT m\.id, m\.phase/i.test(trimmed)
+      && /FROM agent_containers c/i.test(trimmed)
+      && /JOIN agent_migrations m/i.test(trimmed)
+    ) {
+      return { rowCount: 0, rows: [] };
+    }
     if (/SELECT id, user_id,\s*host\(bound_ip\)/i.test(trimmed) && /WHERE user_id/i.test(trimmed)) {
       const userId = Number.parseInt(String(params![0]), 10);
       const r = this.rows.find((x) => x.user_id === userId && x.state === "active");

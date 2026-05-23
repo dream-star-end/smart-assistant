@@ -40,6 +40,8 @@ import {
   type V3SupervisorDeps,
   type V3ContainerStatus,
 } from "./v3supervisor.js";
+import { findOpenByUser, type OpenMigrationSummary } from "./v3migrationLedger.js";
+import type { QueryRunner } from "../db/queries.js";
 import { safeEnqueueAlert } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
 import {
@@ -279,6 +281,31 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(60, "invalid_uid");
     }
     const uid = Number(uidBig);
+
+    // 0) INV-3 (R6.11 §13.3) — open-migration reader gate。
+    //    用户上有未结束的 agent_migrations ledger 行 → 任何 reuse 探活 / cold-start
+    //    fallback 都不准进 docker / scheduler;直接 ContainerUnreadyError
+    //    reason='migration_in_progress' retryAfterSec=2(迁移是短窗口)。
+    //
+    //    放在 uid range guard 之后:guard 防 `<=0n` / 超 MAX_SAFE_INTEGER 的非法 uid,
+    //    findOpenByUser 拼参数前先过完 guard。
+    //    放在 getV3ContainerStatus 之前:防 reuse 路径 + provision 路径双重绕开。
+    //
+    //    失败语义:findOpenByUser 抛(DB 不可达 / 临时故障)→ supervisor_error,
+    //    与下方 getV3ContainerStatus catch 同语义,前端按 RETRY_AFTER_PROVISIONING_SEC 重试。
+    //
+    //    INV-4 在 getV3ContainerStatus SELECT 里加 NOT EXISTS 是配套保险 — 单独防"误把
+    //    被迁移行当 reuse 候选";不是 race-safe 的完整 guard(若 INV-3 之后 status race 变 null,
+    //    仍会落到 scheduler/provision 路径)。真闸门只有 INV-3,详见 v3supervisor.ts:getV3ContainerStatus。
+    let openMig: OpenMigrationSummary | null;
+    try {
+      openMig = await findOpenByUser(uidBig, deps.pool as unknown as QueryRunner);
+    } catch {
+      throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "supervisor_error");
+    }
+    if (openMig !== null) {
+      throw new ContainerUnreadyError(2, "migration_in_progress");
+    }
 
     // 1) 当前态
     let status: V3ContainerStatus | null;
