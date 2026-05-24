@@ -205,6 +205,26 @@ export interface TurnResult {
    *  v3MasterSink so the sink can write each as a server-authored 'tool'
    *  message — the durable record that survives refresh. */
   tools: TurnToolEntry[]
+  /** Fix B — per-segment row id support. One entry per
+   *  text content-block group between tool_use boundaries. Empty array if
+   *  the turn produced no main-agent text. The web row id for segment N is
+   *  `${assistantMessageId}-s${index}`; segments[N].ts is the wall-clock
+   *  first-token arrival time of that segment, used by master to write each
+   *  segment as a distinct server-authored row with its own ts so ts-sort
+   *  interleaves correctly with tool rows. See docs/wip/fixb-per-segment-row-id-PLAN.md. */
+  assistantSegments: SegmentRecord[]
+  /** Same as `assistantSegments` for thinking. */
+  thinkingSegments: SegmentRecord[]
+}
+
+/** One assistant/thinking text segment within a turn. A new segment starts
+ *  after a tool_use boundary, but ONLY if the previous segment has actual
+ *  content (pattern `tool → text` keeps text in s0; pattern `text → tool → text`
+ *  splits into s0 + s1). Pure tool turns produce no segments. */
+export interface SegmentRecord {
+  index: number
+  text: string
+  ts: number
 }
 
 /** Apply per-tool byte/char caps for the persisted tool snapshot. Mutates a
@@ -321,6 +341,33 @@ export class CcbMessageParser {
   public finalized = false
   /** Accumulated turn result (set when finalized) */
   public turnResult: TurnResult | null = null
+
+  // ── Fix B per-segment state ────────────────────────────────────────
+  /** One record per text segment in this turn. Pushed lazily on first
+   *  text_delta of the segment; ts is captured at that moment. */
+  public assistantSegments: SegmentRecord[] = []
+  public thinkingSegments: SegmentRecord[] = []
+  /** Current segment counter — index of the segment that the NEXT text_delta
+   *  will land in. Starts at 0; bumped on consume of pending flag. */
+  private currentTextSegmentIndex = 0
+  private currentThinkingSegmentIndex = 0
+  /** When a tool_use boundary is observed AND at least one segment of the
+   *  same kind already exists, this flag is set; the NEXT text/thinking
+   *  delta consumes it (increments the counter, clears the flag). Two
+   *  consecutive tool_use boundaries set the same flag idempotently — the
+   *  counter only advances once until consumed. tool-first turns (no
+   *  preceding segment) skip setting the flag so the first text lands in s0
+   *  instead of s1. */
+  private pendingTextSegmentBumpOnNextText = false
+  private pendingThinkingSegmentBumpOnNextThinking = false
+  /** Tool ARRIVAL time keyed by tool_use_id. Stamped at first observation
+   *  of the tool_use block (whichever comes first: content_block_start in
+   *  the Anthropic streaming path, or _handleAssistant snapshot for both
+   *  Anthropic-finalized + Codex runner emit paths). Reused later when
+   *  tool_result arrives and we push to completedTools — gives us tool
+   *  CARD APPEARANCE time, not tool COMPLETION time, so parallel tools
+   *  that finish out of order still sort by their start position. */
+  private toolArrivedAt = new Map<string, number>()
 
   private onEvent: (e: SessionStreamEvent) => void
   private onToolUse?: (tool: DetectedToolUse) => void
@@ -543,6 +590,26 @@ export class CcbMessageParser {
     })
   }
 
+  /** Fix B — common code for the two main-agent tool_use observation sites
+   *  (`_handleStreamEvent.content_block_start` and `_handleAssistant`):
+   *  - first-observation-wins stamp of `toolArrivedAt[blockId]` for use
+   *    later as the tool row's `ts` (tool CARD appearance time, not tool
+   *    COMPLETION time);
+   *  - set pending-bump flag on each text/thinking kind whose segments[]
+   *    is non-empty so the NEXT delta of that kind opens a new segment.
+   *  Callers must already have verified `!parentToolUseId`. */
+  private _markToolBoundary(blockId: string): void {
+    if (!this.toolArrivedAt.has(blockId)) {
+      this.toolArrivedAt.set(blockId, Date.now())
+    }
+    if (this.assistantSegments.length > 0) {
+      this.pendingTextSegmentBumpOnNextText = true
+    }
+    if (this.thinkingSegments.length > 0) {
+      this.pendingThinkingSegmentBumpOnNextThinking = true
+    }
+  }
+
   private _handleStreamEvent(msg: SdkMessage, parentToolUseId?: string): void {
     const ev = (msg as any).event
     if (!ev || typeof ev !== 'object') return
@@ -580,6 +647,13 @@ export class CcbMessageParser {
         this.toolUseIdToName.set(cb.id, cb.name)
         this.streamingToolUses.set(cb.id, { name: cb.name, partialJson: '', done: false })
         if (typeof ev.index === 'number') this.indexToToolId.set(ev.index, cb.id)
+        // Fix B: tool boundary triggers segment bump IFF the corresponding
+        // text/thinking kind already has at least one segment. Skipping the
+        // bump on empty segments keeps tool-first turns (tool → text₁ → text₂)
+        // in s0 and lets back-to-back tools share a single pending bump.
+        if (!parentToolUseId) {
+          this._markToolBoundary(cb.id)
+        }
         this.onEvent({
           kind: 'block',
           block: stampToolUseId(
@@ -605,17 +679,39 @@ export class CcbMessageParser {
         const textStr = typeof delta.text === 'string' ? delta.text : JSON.stringify(delta.text)
         // Only accumulate main-agent text into assistantBuf; subagent text
         // must not pollute the parent turn's stored assistant message.
-        if (!parentToolUseId) this.assistantBuf += textStr
+        if (!parentToolUseId) {
+          // Fix B: consume pending bump (set by a prior tool_use boundary
+          // when a prior segment already existed) BEFORE picking the segment.
+          if (this.pendingTextSegmentBumpOnNextText) {
+            this.currentTextSegmentIndex++
+            this.pendingTextSegmentBumpOnNextText = false
+          }
+          this.assistantBuf += textStr // legacy total — local-only after Fix B
+          // Append into the current segment, creating a record on first hit.
+          let cur = this.assistantSegments[this.assistantSegments.length - 1]
+          if (!cur || cur.index !== this.currentTextSegmentIndex) {
+            cur = { index: this.currentTextSegmentIndex, text: '', ts: Date.now() }
+            this.assistantSegments.push(cur)
+          }
+          cur.text += textStr
+        }
         this.onEvent({
           kind: 'block',
           block: stampMainAgentId(
             withParent({ kind: 'text', text: textStr }),
-            this.assistantMessageId,
+            this.assistantMessageId
+              ? `${this.assistantMessageId}-s${this.currentTextSegmentIndex}`
+              : undefined,
           ),
         })
       } else if (delta.type === 'thinking_delta' && delta.thinking) {
         const thinkStr =
           typeof delta.thinking === 'string' ? delta.thinking : JSON.stringify(delta.thinking)
+        // Fix B: same pending-bump consume rule for thinking.
+        if (!parentToolUseId && this.pendingThinkingSegmentBumpOnNextThinking) {
+          this.currentThinkingSegmentIndex++
+          this.pendingThinkingSegmentBumpOnNextThinking = false
+        }
         // Accumulate main-agent thinking into thinkingBuf for v3 server-
         // authored persistence. Subagent thinking (parentToolUseId set) is
         // streamed to UI only — never merged into the parent's stored turn.
@@ -624,27 +720,44 @@ export class CcbMessageParser {
         // only the persisted buffer is bounded.
         if (!parentToolUseId && !this.thinkingTruncated) {
           const deltaBytes = Buffer.byteLength(thinkStr, 'utf8')
+          let segAppend = ''
           if (this.thinkingBufBytes + deltaBytes <= MAX_THINKING_CONTENT_BYTES) {
             this.thinkingBuf += thinkStr
             this.thinkingBufBytes += deltaBytes
+            segAppend = thinkStr
           } else {
             const remaining = MAX_THINKING_CONTENT_BYTES - this.thinkingBufBytes
             if (remaining > 0) {
               const partial = sliceUtf8Safe(thinkStr, remaining)
               this.thinkingBuf += partial
               this.thinkingBufBytes += Buffer.byteLength(partial, 'utf8')
+              segAppend = partial
             }
             // thinkingBufBytes ≤ MAX_THINKING_CONTENT_BYTES guaranteed, so
             // total bytes after appending tail ≤ MAX_THINKING_BUFFER_BYTES.
             this.thinkingBuf += THINKING_TRUNCATE_TAIL
+            segAppend += THINKING_TRUNCATE_TAIL
             this.thinkingTruncated = true
+          }
+          // Fix B: mirror into the current thinking segment so master can
+          // persist per-segment thinking rows with their own ts. Buffer cap
+          // already applied above; segment respects the same total cap.
+          if (segAppend.length > 0) {
+            let cur = this.thinkingSegments[this.thinkingSegments.length - 1]
+            if (!cur || cur.index !== this.currentThinkingSegmentIndex) {
+              cur = { index: this.currentThinkingSegmentIndex, text: '', ts: Date.now() }
+              this.thinkingSegments.push(cur)
+            }
+            cur.text += segAppend
           }
         }
         this.onEvent({
           kind: 'block',
           block: stampMainAgentId(
             withParent({ kind: 'thinking', text: thinkStr }),
-            this.thinkingMessageId,
+            this.thinkingMessageId
+              ? `${this.thinkingMessageId}-s${this.currentThinkingSegmentIndex}`
+              : undefined,
           ),
         })
       } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
@@ -784,6 +897,12 @@ export class CcbMessageParser {
         else if (this.toolMessageIdFactory && c.id) {
           block.messageId = this.toolMessageIdFactory(c.id)
         }
+        // Fix B: tool boundary — stamp arrival time and set pending bump.
+        // First observation wins; if content_block_start already fired for
+        // this id (Anthropic streaming), don't overwrite arrivedAt.
+        if (!parentToolUseId) {
+          this._markToolBoundary(c.id)
+        }
         this.onEvent({ kind: 'block', block: block as any })
         if (streamed) streamed.done = true
       } else if (
@@ -795,13 +914,29 @@ export class CcbMessageParser {
         // Only accumulate into assistantBuf for main-agent turns (mirrors
         // _handleStreamEvent's text_delta rule). Subagent error text is
         // still surfaced to the UI but not merged into the parent's buffer.
-        if (!parentToolUseId) this.assistantBuf += c.text
+        if (!parentToolUseId) {
+          // Fix B: consume pending bump before picking the segment, mirror
+          // append into the current segment with its own first-token ts.
+          if (this.pendingTextSegmentBumpOnNextText) {
+            this.currentTextSegmentIndex++
+            this.pendingTextSegmentBumpOnNextText = false
+          }
+          this.assistantBuf += c.text
+          let cur = this.assistantSegments[this.assistantSegments.length - 1]
+          if (!cur || cur.index !== this.currentTextSegmentIndex) {
+            cur = { index: this.currentTextSegmentIndex, text: '', ts: Date.now() }
+            this.assistantSegments.push(cur)
+          }
+          cur.text += c.text
+        }
         const textBlock: Record<string, unknown> = { kind: 'text', text: c.text }
         if (parentToolUseId) textBlock.parentToolUseId = parentToolUseId
         // V3 v7 — stamp canonical id on main-agent text (synthetic-error
         // path included; client treats it as part of the same row that
         // streaming text would have populated).
-        else if (this.assistantMessageId) textBlock.messageId = this.assistantMessageId
+        else if (this.assistantMessageId) {
+          textBlock.messageId = `${this.assistantMessageId}-s${this.currentTextSegmentIndex}`
+        }
         this.onEvent({ kind: 'block', block: textBlock as any })
       }
       // text / thinking (non-error snapshots): already emitted via stream_event
@@ -875,6 +1010,14 @@ export class CcbMessageParser {
           // `/^Agent$/i.test(...)` discriminator and stay aligned if CCB
           // ever varies the casing.
           if (!/^Agent$/i.test(toolName || '')) {
+            // Fix B: tool ts is tool CARD APPEARANCE time (when parser first
+            // saw the tool_use), NOT tool RESULT COMPLETION time. Parallel
+            // tools that complete out of order otherwise rendered with their
+            // result-arrival ts and post-sync UI flipped their visual order.
+            // First-observation arrivedAt is set in _markToolBoundary; if
+            // missing (cross-turn stale tool_result with no matching
+            // tool_use), fall back to now — matches pre-Fix-B behavior.
+            const arrivedAt = this.toolArrivedAt.get(useId) ?? Date.now()
             this.completedTools.push(
               _capToolEntry({
                 toolUseId: useId,
@@ -885,7 +1028,7 @@ export class CcbMessageParser {
                 output: preview,
                 isError: !!c.is_error,
                 durationMs,
-                ts: Date.now(),
+                ts: arrivedAt,
               }),
             )
           }
@@ -958,6 +1101,11 @@ export class CcbMessageParser {
       numTurns,
       staleResumeId,
       tools: [...this.completedTools],
+      // Fix B: shallow-clone the per-segment arrays so downstream consumers
+      // (sessionManager → v3MasterSink → master HTTP body) get a stable
+      // snapshot; the parser may be retained after onFinish for diagnostics.
+      assistantSegments: this.assistantSegments.map((s) => ({ ...s })),
+      thinkingSegments: this.thinkingSegments.map((s) => ({ ...s })),
     }
 
     this.finalized = true

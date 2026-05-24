@@ -56,7 +56,7 @@ function streamEvent(
 describe('CcbMessageParser: v7 messageId stamping', () => {
   // ── Text blocks ──
 
-  it('main-agent text emit carries assistantMessageId when configured', () => {
+  it('main-agent text emit carries assistantMessageId with -s${idx} segment suffix when configured', () => {
     const { parser, events } = createParser({
       assistantMessageId: 'srv-peer1-t5',
     })
@@ -65,7 +65,8 @@ describe('CcbMessageParser: v7 messageId stamping', () => {
     if (events[0].kind !== 'block') throw new Error('expected block event')
     const block = events[0].block as any
     assert.equal(block.kind, 'text')
-    assert.equal(block.messageId, 'srv-peer1-t5')
+    // Fix B (2026-05-25): segmented per content-block — first segment is s0.
+    assert.equal(block.messageId, 'srv-peer1-t5-s0')
   })
 
   it('main-agent text emit OMITS messageId when assistantMessageId not configured', () => {
@@ -97,7 +98,7 @@ describe('CcbMessageParser: v7 messageId stamping', () => {
 
   // ── Thinking blocks ──
 
-  it('main-agent thinking emit carries thinkingMessageId when configured', () => {
+  it('main-agent thinking emit carries thinkingMessageId with -s${idx} segment suffix when configured', () => {
     const { parser, events } = createParser({
       thinkingMessageId: 'srv-peer1-t5-thinking',
     })
@@ -106,7 +107,7 @@ describe('CcbMessageParser: v7 messageId stamping', () => {
     if (events[0].kind !== 'block') throw new Error('expected block event')
     const block = events[0].block as any
     assert.equal(block.kind, 'thinking')
-    assert.equal(block.messageId, 'srv-peer1-t5-thinking')
+    assert.equal(block.messageId, 'srv-peer1-t5-thinking-s0')
   })
 
   it('main-agent thinking emit OMITS messageId when thinkingMessageId not configured', () => {
@@ -148,8 +149,8 @@ describe('CcbMessageParser: v7 messageId stamping', () => {
     if (events[0].kind !== 'block' || events[1].kind !== 'block') {
       throw new Error('expected two block events')
     }
-    assert.equal((events[0].block as any).messageId, 'srv-peer1-t5-thinking')
-    assert.equal((events[1].block as any).messageId, 'srv-peer1-t5')
+    assert.equal((events[0].block as any).messageId, 'srv-peer1-t5-thinking-s0')
+    assert.equal((events[1].block as any).messageId, 'srv-peer1-t5-s0')
   })
 
   it('only assistantMessageId set: thinking deltas still omit messageId', () => {
@@ -162,10 +163,10 @@ describe('CcbMessageParser: v7 messageId stamping', () => {
     }
     assert.equal((events[0].block as any).messageId, undefined,
       'thinking has no thinkingMessageId configured → no stamp')
-    assert.equal((events[1].block as any).messageId, 'srv-peer1-t5')
+    assert.equal((events[1].block as any).messageId, 'srv-peer1-t5-s0')
   })
 
-  it('multiple deltas to the same row all carry the same canonical id', () => {
+  it('multiple deltas WITHIN one segment all carry the same -sN id', () => {
     const { parser, events } = createParser({
       assistantMessageId: 'srv-peer1-t7',
     })
@@ -175,7 +176,8 @@ describe('CcbMessageParser: v7 messageId stamping', () => {
     const ids = events.map((e) =>
       e.kind === 'block' ? (e.block as any).messageId : null,
     )
-    assert.deepEqual(ids, ['srv-peer1-t7', 'srv-peer1-t7'])
+    // No tool boundary between them → both stay in segment 0.
+    assert.deepEqual(ids, ['srv-peer1-t7-s0', 'srv-peer1-t7-s0'])
   })
 })
 
