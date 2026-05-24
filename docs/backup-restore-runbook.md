@@ -2,11 +2,19 @@
 
 最后更新: 2026-05-23
 
-> **当前拓扑**:v3 prod master = KL (154.193.246.236);P0.3 backup-pull 集中点 = sg
-> (38.55.252.217, 薄荷云 Cloudvalley, 16-core)。
+> **⚠️ P0.3 cross-DC backup-pull 当前 PARK** — 2026-05-23 ops bootstrap 前夕实测
+> 发现 sg ↔ KL 同物理 DC(mtr 2 hops 单 gateway,RTT min 0.46ms),sg 不构成
+> 有意义的异 DC 集中点。boss 决定暂不做,等异 DC 机就绪后重启。dev half 代码
+> (`infra/systemd/pg-backup-openclaude.{service,timer}` + `infra/pg-backup-pull/`)
+> 已合 origin/v3 但 **未启用**。详见末尾 §"P0.3 PARK 状态(2026-05-23)"。
 >
-> **2026-05-23 变更**:原 45.32 master 决策废弃,P0.3 集中点已迁到 sg。历史拓扑变更
-> (Tokyo→KL prod master / Vultr→GCE 45.32 / GCE→sg P0.3 target)见 git history。
+> **当前实际运行**:KL master 本机 `pg-backup-openclaude.timer` **未启用**
+> (`/var/backups/postgres/` 为空或不存在),集中点 pull **未部署**(sg 上没装脚本
+> / cron / keypair,`/var/backups/v3-commercial/` 不存在)。本 runbook 余下章节
+> 描述的是设计意图,**不是当前生产状态**。
+
+> 历史拓扑变更(Tokyo→KL prod master / Vultr→GCE 45.32 → park / GCE→sg target → park)
+> 见 git history。
 
 ## 备份架构
 
@@ -46,11 +54,24 @@
    - 长期演进:加第二个 pull target(例如 AWS/Cloudflare R2 / 另一家 VPS),
      让 pull 脚本同时推送两份
 
-2. **风险边界:sg 与 KL 跨账号、跨 ASN;二者仍都在国内云**
-   - sg(38.55.252.217)与 KL(154.193.246.236)分属不同账号、不同 ASN,
-     抗 KL 单 cloud / 单账号灾难(账号被封 / 单 cloud 跑路 / 单 cloud DC 烧)
-   - **但都在国内云,不抗"中国互联网整体级事故"**(如全国出口受阻 / 政策性
-     大面积停服)。这一层需要海外目标机(GCE/AWS/自建 NAS),本期不覆盖
+2. **风险边界:sg 与 KL 实测同物理 DC(2026-05-23 发现,P0.3 PARK 主因)**
+   - mtr 实测 `sg(38.55.252.217) → KL(154.193.246.236)`:2 hops,单一 upstream
+     gateway `38.55.252.1`,RTT min 0.46ms / avg <2ms / 0% loss。**同 DC / 同
+     供应商内网路径**风险极高(mtr 单证据不足以严格证明 L2,但运维 DR 决策上等价)。
+   - whois 显示不同 ASN(sg=Cogent/PEG-TECH US block / KL=Fastmos AS139923 HK)
+     **纯纸面**,registry 国家/ASN 不等于物理位置,不能据此判定异地。
+   - 因此 sg 集中点**理论上只能抗**(当前 PARK 未启用,以下仅描述若启用的覆盖面):
+     - KL DB 软件级损坏(可登 KL 但 DB 坏 → 拉回 sg 副本)
+     - KL 账号封禁(不同账号不同登录)
+     - KL 操作误删(rm/drop)
+   - **不抗**:DC 级事件(断电/起火/被切/网络故障)、国内互联网级事件、
+     政策性大面积停服。这一层需要**真异 DC 机**(海外 GCE/AWS / Cloudflare R2
+     / 国内别 IDC),本期不覆盖,boss 决定 PARK 等机就绪。
+   - **教训**:任何"国内云 A → 国内云 B"DR 方案合 ship 前必 `mtr -c 5 <target>`
+     实测 hop 数 + RTT。**2 hops 且 RTT <2ms 应默认判为同 DC/同城同园区风险**,
+     除非有供应商机房/AZ 文档证据证明异 DC。whois 国家/ASN 不能作为异地证据,
+     反例:城域低延迟专线 / MPLS 隐藏 hop / 供应商内部路由压缩,都可能让 hop/RTT
+     数字"看起来异地"但其实同园区。
 
 3. **pull 失败多日恢复后只拉当日最新,不补中间缺口**
    - 若 pull 5 天连续失败,第 6 天恢复 → 只拿到第 6 天的 dump(sg 侧)
@@ -331,7 +352,15 @@ ssh root@<v3-vm> 'tail -50 /var/log/pg-restore-test.log'
 
 ---
 
-## 后续待执行:P0.3 sg bootstrap (2026-05-23)
+## ~~后续待执行:P0.3 sg bootstrap~~ — **DO NOT RUN(PARK 2026-05-23)**
+
+> **⛔ 不要跑这一节** — 2026-05-23 ops bootstrap 前夕实测发现 sg 跟 KL 同物理 DC
+> (详见 §Limitations 第 2 节),sg 不构成有意义的异 DC 集中点。boss 决定 PARK,
+> 等异 DC 机就绪后**整段重写**(届时 sg 字面要再 retarget 到新选址,bootstrap
+> 步骤里 fingerprint / PULL_FROM_IP 也要重做)。下面流程保留**仅供未来参考**,
+> 不要照着在 sg 上跑。详见末尾 §"P0.3 PARK 状态(2026-05-23)"。
+
+**(以下为旧 bootstrap 流程草稿,PARK 中)**
 
 **背景**:本仓代码/文档已更新成 sg 拓扑,但 sg 与 KL .236 上的 **实际 SSH bootstrap 尚未执行**(写本段时)。当前状态 = `pull-v3-backups.sh` 已合入 origin/v3 但还没装到 sg,/var/backups/v3-commercial/ 为空。
 
@@ -445,6 +474,54 @@ rm -f /root/.ssh/v3-backup-pull /root/.ssh/v3-backup-pull.pub /root/.ssh/known_h
 # 已拉到本地的 dump 可保留(/var/backups/v3-commercial/kl-master/),它们是合法 backup。
 ```
 
-KL master 本机 `/var/backups/postgres/` 14d retention 保持运行,即使 sg pull 没装,DB 损坏场景的本机恢复路径仍然可用。
+~~KL master 本机 `/var/backups/postgres/` 14d retention 保持运行,即使 sg pull 没装,DB 损坏场景的本机恢复路径仍然可用。~~ **(原设计中应保持运行,当前 PARK 状态下 KL backup-gen timer 未启用,本机 14d 路径不可用,详见下方 §"P0.3 PARK 状态")**
 
-> 完成后请把本节标题改成 `## 历史:P0.3 sg bootstrap (YYYY-MM-DD 完成)` 或删掉,避免下次 onboarding 误读"还没做"。
+---
+
+## P0.3 PARK 状态(2026-05-23)
+
+**TL;DR**: P0.3 cross-DC backup-pull 集中点设计**暂停**,等异 DC 机就绪后重启。
+
+### 现状
+
+- **Dev half**(代码 + 文档):已合 origin/v3
+  - 早期 commit:`infra/systemd/pg-backup-openclaude.{service,timer}`(KL 本机 backup-gen)
+  - 早期 commit:`infra/pg-backup-pull/{pull-v3-backups.sh,setup-v3-backup-pull.sh,backup-pull-{cmd,wrapper}.sh}`(集中点 pull 套件)
+  - `4cc68be7` retarget commit:把"集中点"字面从 45.32 改成 sg(now stale,但代码留着)
+- **Ops half**(实际部署):**未启动**。KL master 本机
+  `pg-backup-openclaude.timer` 未启用,`/var/backups/postgres/` 为空或不存在;
+  sg 上没装 pull 脚本 / cron / keypair,`/var/backups/v3-commercial/` 不存在
+- **当前实际 DR posture**: **零自动 backup**(回退到 M7 dev 完成前状态)
+- **VM-level hot standby**(KL .236 → .218 同 DC PG 流复制)**不受影响**,继续跑;只防 KL .236 单 VM 故障,不防 KL DC 级事件
+
+### 为什么 PARK
+
+2026-05-23 ops bootstrap 前夕 mtr 实测 sg → KL 单 gateway 2 hops <2ms RTT,物理同
+DC。把 backup pull 集中点放 sg **不构成有意义的异 DC DR**:DC 级事件(断电 / 起火 /
+被切 / 网络故障)KL 和 sg 一起完。boss 当前没有真异 DC 机,决定先不做。
+
+### 重启动 prereqs
+
+1. **boss 选址真异 DC 机**(候选:海外 GCE/AWS / Cloudflare R2 / 国内别 IDC)。
+   合 ship 前 `mtr -c 5 <新机> 154.193.246.236` 验证:**2 hops 或 RTT <2ms 直接
+   fail**(同 DC);优先 RTT >10ms 的远距离目标;最终判定以**供应商
+   region/AZ/机房独立性文档 + mtr 共同确认**,不只看一个数字。whois 国家/ASN
+   是 registry 数据,不能据此判定异地。
+2. 把上方 §"P0.3 sg bootstrap"(已标 DO NOT RUN)**整段重写**:sg 字面 retarget
+   成新选址,fingerprint/PULL_FROM_IP 也要重做;§Limitations 第 2 节同步更新成
+   真实异 DC 描述。
+3. KL 上 enable `pg-backup-openclaude.timer`(单装本机 backup-gen 价值很弱,但配
+   合异 DC pull 就构成完整 P0.3,所以建议一起做)。
+4. 删本 §"P0.3 PARK 状态"段,删 §"P0.3 sg bootstrap" DO NOT RUN banner,顶部
+   PARK 大字也删。
+
+### 不要做的
+
+- ❌ 不要在 sg 上手动跑 §"P0.3 sg bootstrap"流程(同 DC 占位无意义,还白白多
+  一份 SSH 信任关系 / sudoers / authorized_keys 资产去维护)。
+- ❌ 不要 revert dev half 的代码(M7 backup-gen 单元 + pull 套件本身是好东西,
+  未来重启动直接复用,revert 反而要重写)。
+- ❌ 不要把 P0.3 PARK 状态从 runbook 删掉以"显得干净" — 这段是下次 onboarding
+  必读,防止有人按 stale 文字在 sg 上跑 bootstrap。
+- ❌ 不要把 sg 当 P0.3 DR 目标写进现网状态文档 / 值班手册 / 任何 DR drill
+  checklist —— 防止 PARK 状态在 runbook 外漂移。
