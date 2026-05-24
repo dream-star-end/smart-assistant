@@ -270,6 +270,14 @@ function persistServerAuthoredTurn(args: {
    *  path ignores this field — local SQLite preserves client-authored tool
    *  rows already (no overwrite happens locally). */
   tools?: TurnToolEntry[]
+  /** Fix B (2026-05-25) — per-text-segment durable rows. When non-empty,
+   *  v3 sink path forwards to master which writes one assistant row per
+   *  segment (`srv-...-tN-s${idx}`). Legacy/personal path keeps single-row
+   *  behavior (only the live stream gets segment ids; refresh-recovery on
+   *  personal version stays single-row). Plan §3.5.1. */
+  assistantSegments?: { index: number; text: string; ts: number }[]
+  /** Fix B (2026-05-25) — same per-segment treatment for thinking rows. */
+  thinkingSegments?: { index: number; text: string; ts: number }[]
 }): Promise<void> {
   const sink = getV3MasterSinkOrNull()
   if (sink) {
@@ -294,6 +302,14 @@ function persistServerAuthoredTurn(args: {
       ...(args.errorCode !== undefined ? { errorCode: args.errorCode } : {}),
       ...(args.errorDetail !== undefined ? { errorDetail: args.errorDetail } : {}),
       ...(args.tools && args.tools.length > 0 ? { tools: args.tools } : {}),
+      // Fix B (2026-05-25) — per-segment rows. Forward when non-empty;
+      // master detects presence and writes one row per segment. Plan §3.5.1.
+      ...(args.assistantSegments && args.assistantSegments.length > 0
+        ? { assistantSegments: args.assistantSegments }
+        : {}),
+      ...(args.thinkingSegments && args.thinkingSegments.length > 0
+        ? { thinkingSegments: args.thinkingSegments }
+        : {}),
     }
     return sink
       .persistOrQueue(payload)
@@ -1989,6 +2005,13 @@ export class SessionManager {
                 },
                 ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
                 ...(completedHasTools ? { tools: result.tools } : {}),
+                // Fix B (2026-05-25) — per-segment durable rows. Plan §3.5.1.
+                ...(result.assistantSegments.length > 0
+                  ? { assistantSegments: result.assistantSegments }
+                  : {}),
+                ...(result.thinkingSegments.length > 0
+                  ? { thinkingSegments: result.thinkingSegments }
+                  : {}),
               }))
             }
 
@@ -2229,6 +2252,18 @@ export class SessionManager {
                     // produced real outputs and deserve durable persistence
                     // alongside the partial text.
                     ...(hasPartialTools ? { tools: [...partialTools] } : {}),
+                    // Fix B (2026-05-25) — per-segment durable rows for the
+                    // partial turn. Parser populates assistantSegments /
+                    // thinkingSegments incrementally as deltas arrive, so the
+                    // partial state at crash/interrupt already reflects every
+                    // tool-boundary split that completed before the crash.
+                    // Plan §3.5.1.
+                    ...(parser.assistantSegments.length > 0
+                      ? { assistantSegments: parser.assistantSegments.map((s) => ({ ...s })) }
+                      : {}),
+                    ...(parser.thinkingSegments.length > 0
+                      ? { thinkingSegments: parser.thinkingSegments.map((s) => ({ ...s })) }
+                      : {}),
                   })
                 }
                 onEvent({ kind: 'error', error: reason })

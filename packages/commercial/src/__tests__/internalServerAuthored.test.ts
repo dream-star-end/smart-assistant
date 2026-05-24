@@ -1334,6 +1334,7 @@ describe("internalServerAuthored handler — tool durability", () => {
     isError: boolean;
     durationMs: number;
     ts: number;
+    arrivedAt: number;
     inputTruncated: boolean;
     outputTruncated: boolean;
   }> = {}): Record<string, unknown> {
@@ -1347,6 +1348,7 @@ describe("internalServerAuthored handler — tool durability", () => {
       isError: over.isError ?? false,
       durationMs: over.durationMs ?? 12,
       ts: over.ts ?? 100,
+      ...(over.arrivedAt !== undefined ? { arrivedAt: over.arrivedAt } : {}),
       ...(over.inputTruncated !== undefined ? { inputTruncated: over.inputTruncated } : {}),
       ...(over.outputTruncated !== undefined ? { outputTruncated: over.outputTruncated } : {}),
     };
@@ -1355,14 +1357,14 @@ describe("internalServerAuthored handler — tool durability", () => {
   /** Recording storage keyed by role + blockId for tool-aware overrides. */
   function recStore(): {
     storage: ServerAuthoredStorage;
-    rows: Array<{ role: string; id: string; ts: number; text: string; blockId?: string; toolName?: string; inputJson?: unknown; output?: string; error?: boolean; _completed?: boolean; inputTruncated?: boolean; outputTruncated?: boolean }>;
+    rows: Array<{ role: string; id: string; ts: number; text: string; blockId?: string; toolName?: string; inputJson?: unknown; output?: string; error?: boolean; _completed?: boolean; inputTruncated?: boolean; outputTruncated?: boolean; usage?: unknown; _truncated?: boolean; _errorCode?: string; _errorDetail?: string }>;
     setToolResult: (blockId: string, r: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>) => void;
     setToolThrow: (blockId: string, e: Error) => void;
     setAssistantResult: (r: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>) => void;
     setAssistantThrow: (e: Error) => void;
     setThinkingResult: (r: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>) => void;
   } {
-    const rows: Array<{ role: string; id: string; ts: number; text: string; blockId?: string; toolName?: string; inputJson?: unknown; output?: string; error?: boolean; _completed?: boolean; inputTruncated?: boolean; outputTruncated?: boolean }> = [];
+    const rows: Array<{ role: string; id: string; ts: number; text: string; blockId?: string; toolName?: string; inputJson?: unknown; output?: string; error?: boolean; _completed?: boolean; inputTruncated?: boolean; outputTruncated?: boolean; usage?: unknown; _truncated?: boolean; _errorCode?: string; _errorDetail?: string }> = [];
     const toolOverrides = new Map<string, Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>>();
     const toolThrowers = new Map<string, Error>();
     let assistantOverride: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>> | undefined;
@@ -1392,6 +1394,8 @@ describe("internalServerAuthored handler — tool durability", () => {
             blockId: msg.blockId, toolName: msg.toolName, inputJson: msg.inputJson,
             output: msg.output, error: msg.error, _completed: msg._completed,
             inputTruncated: msg.inputTruncated, outputTruncated: msg.outputTruncated,
+            usage: msg.usage, _truncated: msg._truncated,
+            _errorCode: msg._errorCode, _errorDetail: msg._errorDetail,
           });
           if (msg.role === "tool") {
             const b = msg.blockId ?? "";
@@ -1822,5 +1826,217 @@ describe("internalServerAuthored handler — tool durability", () => {
     assert.equal(rec.rows[0].outputTruncated, undefined);
     assert.equal(rec.rows[1].inputTruncated, true);
     assert.equal(rec.rows[1].outputTruncated, true);
+  });
+
+  // ── Fix B: per-segment row id + tool arrivedAt ─────────────────────────
+  //
+  // Plan: docs/wip/fixb-per-segment-row-id-PLAN.md §3.5
+  //
+  // Wire shape: text → tool → text → tool → text within one turn emits
+  //   assistantSegments=[{0,"a",T1},{1,"b",T3},{2,"c",T5}]  (3 segments)
+  //   tools=[tool-x@arrivedAt=T2, tool-y@arrivedAt=T4]
+  // Master writes ONE assistant row per segment (3 rows) + one tool row
+  // per tool (2 rows); the LAST assistant segment carries usage/_truncated.
+
+  test("Fix B: assistantSegments writes one assistant row per segment, last segment carries usage", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 5, status: "completed",
+      // legacy `text` carries the concatenation for old-master fallback;
+      // Fix-B master prefers `assistantSegments` and ignores `text` as a row.
+      text: "first part second part third part",
+      agentId: "main",
+      requestId: "req-12345abc",
+      usage: { inputTokens: 10, outputTokens: 100, turn: 5 },
+      assistantSegments: [
+        { index: 0, text: "first part ", ts: 1_000 },
+        { index: 1, text: "second part ", ts: 3_000 },
+        { index: 2, text: "third part", ts: 5_000 },
+      ],
+      tools: [
+        tool({ blockId: "blk-x", toolUseId: "tu-x", arrivedAt: 2_000, output: "x" }),
+        tool({ blockId: "blk-y", toolUseId: "tu-y", arrivedAt: 4_000, output: "y" }),
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 200, "primary write succeeds → 200");
+    // 3 assistant + 2 tool rows = 5 rows total.
+    const asst = rec.rows.filter((r) => r.role === "assistant");
+    const tools = rec.rows.filter((r) => r.role === "tool");
+    assert.equal(asst.length, 3, "one assistant row per segment");
+    assert.equal(tools.length, 2, "one tool row per tool");
+    // IDs per-segment.
+    assert.equal(asst[0].id, "srv-sess12345-main-t5-s0");
+    assert.equal(asst[1].id, "srv-sess12345-main-t5-s1");
+    assert.equal(asst[2].id, "srv-sess12345-main-t5-s2");
+    // Each segment's ts is its own wall-clock (interleaves with tools).
+    assert.equal(asst[0].ts, 1_000);
+    assert.equal(asst[1].ts, 3_000);
+    assert.equal(asst[2].ts, 5_000);
+    // Tool rows use arrivedAt (Fix B priority chain).
+    assert.equal(tools[0].ts, 2_000);
+    assert.equal(tools[1].ts, 4_000);
+    // Segment text matches.
+    assert.equal(asst[0].text, "first part ");
+    assert.equal(asst[1].text, "second part ");
+    assert.equal(asst[2].text, "third part");
+    // Usage lives ONLY on the last segment.
+    assert.equal(asst[0].usage, undefined, "first segment carries no usage");
+    assert.equal(asst[1].usage, undefined, "middle segment carries no usage");
+    assert.deepEqual(
+      asst[2].usage,
+      { inputTokens: 10, outputTokens: 100, turn: 5 },
+      "last segment carries usage (refresh-recovery picks up costCredits patch here)",
+    );
+  });
+
+  test("Fix B: _truncated / _errorCode / _errorDetail land only on the last assistant segment", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 5, status: "completed",
+      text: "a b",
+      agentId: "main",
+      requestId: "req-12345abc",
+      truncated: true,
+      errorCode: "overloaded_error",
+      errorDetail: "upstream returned 529",
+      assistantSegments: [
+        { index: 0, text: "a", ts: 1_000 },
+        { index: 1, text: " b", ts: 3_000 },
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const asst = rec.rows.filter((r) => r.role === "assistant");
+    assert.equal(asst.length, 2);
+    assert.equal(asst[0]._truncated, undefined);
+    assert.equal(asst[0]._errorCode, undefined);
+    assert.equal(asst[0]._errorDetail, undefined);
+    assert.equal(asst[1]._truncated, true);
+    assert.equal(asst[1]._errorCode, "overloaded_error");
+    assert.equal(asst[1]._errorDetail, "upstream returned 529");
+  });
+
+  test("Fix B: thinkingSegments writes one thinking row per segment", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 7, status: "completed",
+      text: "answer",
+      agentId: "main",
+      requestId: "req-12345abc",
+      thinkingText: "part1 part2",  // legacy concat for old-master fallback
+      thinkingSegments: [
+        { index: 0, text: "part1 ", ts: 500 },
+        { index: 1, text: "part2", ts: 1_500 },
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const thinking = rec.rows.filter((r) => r.role === "thinking");
+    assert.equal(thinking.length, 2);
+    assert.equal(thinking[0].id, "srv-sess12345-main-t7-thinking-s0");
+    assert.equal(thinking[1].id, "srv-sess12345-main-t7-thinking-s1");
+    assert.equal(thinking[0].ts, 500);
+    assert.equal(thinking[1].ts, 1_500);
+  });
+
+  test("Fix B: tool ts uses arrivedAt when present, falls back to offset when absent (pre-Fix-B gateway)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 3, status: "completed",
+      text: "", createdAt: 10_000,
+      tools: [
+        // Mix: one with arrivedAt (new gateway), one without (legacy entry from
+        // pre-Fix-B retry queue drain). Master must use arrivedAt when given,
+        // fall back to baseTs - N + i otherwise.
+        tool({ blockId: "blk-fresh", arrivedAt: 7_500, output: "ok-fresh" }),
+        tool({ blockId: "blk-legacy", output: "ok-legacy" }), // no arrivedAt
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows.length, 2);
+    // Order in rec.rows follows the iteration order of body.tools.
+    assert.equal(rec.rows[0].blockId, "blk-fresh");
+    assert.equal(rec.rows[0].ts, 7_500, "arrivedAt wins when present");
+    assert.equal(rec.rows[1].blockId, "blk-legacy");
+    // toolsCount=2, i=1 → 10000 - 2 + 1 = 9999
+    assert.equal(rec.rows[1].ts, 9_999, "legacy entry uses computed offset");
+  });
+
+  test("Fix B: schema accepts assistantSegments + thinkingSegments and refine guard passes on segments-only turn", async () => {
+    // A turn with only segments and no legacy text/thinkingText must still
+    // satisfy the cross-field refine.
+    const rec = recStore();
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 1, status: "completed",
+      text: "",  // empty text
+      agentId: "main",
+      requestId: "req-12345abc",
+      assistantSegments: [{ index: 0, text: "only seg", ts: 1_000 }],
+    })), res, CTX);
+    assert.equal(resRec.status, 200, "segments-only turn satisfies refine");
+    const asst = rec.rows.filter((r) => r.role === "assistant");
+    assert.equal(asst.length, 1);
+    assert.equal(asst[0].id, "srv-sess12345-main-t1-s0");
+  });
+
+  test("Fix B: 410 on session_deleted with segments — last-segment outcome surfaces, no partial-row leakage", async () => {
+    const rec = recStore();
+    rec.setAssistantResult({ applied: false, reason: "session_deleted" });
+    const m = captureMetricRich();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345", turnIndex: 5, status: "completed",
+      text: "a b c", agentId: "main", requestId: "req-12345abc",
+      assistantSegments: [
+        { index: 0, text: "a", ts: 1_000 },
+        { index: 1, text: " b", ts: 2_000 },
+        { index: 2, text: " c", ts: 3_000 },
+      ],
+    })), res, CTX);
+    // All segment writes get the same session_deleted (overrides are global
+    // on recStore); HTTP outcome = last segment's = 410.
+    assert.equal(resRec.status, 410);
+    // Metrics for non-last segments emitted as best-effort + last one as primary.
+    // 3 segments, each gets a reject_session_deleted metric (one per write).
+    const sdCalls = m.calls.filter((c) => c[0] === "reject_session_deleted" && c[1] === "assistant");
+    assert.equal(sdCalls.length, 3, "every assistant segment write emits its own metric");
   });
 });

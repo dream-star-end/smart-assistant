@@ -103,6 +103,13 @@ const SCHEMA_TOOL_INPUT_PREVIEW_MAX_CHARS = 2_000;
  *  Read/Grep fan-outs + a few Edits); 50 leaves plenty of headroom. */
 const SCHEMA_TOOLS_MAX_LEN = 50;
 
+/** Fix B (2026-05-25) — defensive upper bound on per-turn text segments. A
+ *  segment opens after every tool_use boundary that follows non-empty text,
+ *  so segments.length ≤ tools.length + 1. With SCHEMA_TOOLS_MAX_LEN = 50 a
+ *  hard ceiling of 64 leaves headroom for synthetic-error appends without
+ *  risk of legitimate turns getting 400-rejected. */
+const SCHEMA_SEGMENTS_MAX_LEN = 64;
+
 /** One completed tool call within the turn. Mirrors the gateway-side
  *  `TurnToolEntry` shape. Master persists each as a server-authored row
  *  with `role: 'tool'`, sandwiched between thinking and assistant by ts. */
@@ -119,6 +126,17 @@ const ToolEntrySchema = z
     isError: z.boolean(),
     durationMs: z.number().int().min(0),
     ts: z.number().int().min(0),
+    /** Fix B (2026-05-25) — tool CARD APPEARANCE time (parser-stamped at the
+     *  first observation of `tool_use`, not tool_result completion). When
+     *  present, master prefers this as the persisted ts so parallel tools
+     *  that complete out-of-order keep their original arrival sort. Falls
+     *  back DIRECTLY to the offset-from-baseTs default (`baseTs - N + i`);
+     *  wire `t.ts` is intentionally NOT in the priority chain so pre-Fix-B
+     *  gateways (which only send `ts` = tool_result arrival) keep the
+     *  legacy offset-derived ts and don't suddenly shift to result-arrival
+     *  ordering on master upgrade.
+     *  Plan: docs/wip/fixb-per-segment-row-id-PLAN.md §3.5.4. */
+    arrivedAt: z.number().int().min(0).optional(),
     inputTruncated: z.boolean().optional(),
     outputTruncated: z.boolean().optional(),
   })
@@ -229,14 +247,56 @@ const BodySchema = z
      *  durable copy is what survives refresh — replacing the ephemeral
      *  client-authored tool rows whose details are stripped on persist. */
     tools: z.array(ToolEntrySchema).max(SCHEMA_TOOLS_MAX_LEN).optional(),
+    /** Fix B (2026-05-25) — per-text-segment payload. When present and
+     *  non-empty, master writes ONE assistant row per segment (id
+     *  `srv-${idPart}-t${turnIndex}-s${index}`) with the segment's own ts,
+     *  so ts-sort interleaves correctly with the tool rows that punctuated
+     *  them. The legacy `text` field is still required (schema-level) for
+     *  rolling-deploy compat: old-master + new-container falls back to the
+     *  single concatenated text row when this field arrives at a master
+     *  predating Fix B. When BOTH are present and master is Fix-B-aware,
+     *  master prefers `assistantSegments` and never persists `text` as a
+     *  row. Plan §3.5.1. */
+    assistantSegments: z
+      .array(
+        z
+          .object({
+            index: z.number().int().min(0).max(SCHEMA_SEGMENTS_MAX_LEN - 1),
+            text: z.string().max(MAX_BODY_BYTES),
+            ts: z.number().int().min(0),
+          })
+          .strict(),
+      )
+      .max(SCHEMA_SEGMENTS_MAX_LEN)
+      .optional(),
+    /** Fix B (2026-05-25) — same per-segment treatment for thinking. Row id
+     *  `srv-${idPart}-t${turnIndex}-thinking-s${index}`. Parser-side cap
+     *  MAX_THINKING_BUFFER_BYTES = 8 KB means each segment text is small. */
+    thinkingSegments: z
+      .array(
+        z
+          .object({
+            index: z.number().int().min(0).max(SCHEMA_SEGMENTS_MAX_LEN - 1),
+            text: z.string().max(MAX_BODY_BYTES),
+            ts: z.number().int().min(0),
+          })
+          .strict(),
+      )
+      .max(SCHEMA_SEGMENTS_MAX_LEN)
+      .optional(),
   })
   .strict()
   .refine(
     (v) =>
       v.text.length > 0 ||
       v.thinkingText !== undefined ||
-      (v.tools !== undefined && v.tools.length > 0),
-    { message: "either text, thinkingText, or tools[] must be non-empty" },
+      (v.tools !== undefined && v.tools.length > 0) ||
+      (v.assistantSegments !== undefined && v.assistantSegments.length > 0) ||
+      (v.thinkingSegments !== undefined && v.thinkingSegments.length > 0),
+    {
+      message:
+        "either text, thinkingText, tools[], assistantSegments[], or thinkingSegments[] must be non-empty",
+    },
   );
 
 export type ServerAuthoredBody = z.infer<typeof BodySchema>;
@@ -483,20 +543,67 @@ export function makeServerAuthoredHandler(
     const messageId = `srv-${idPart}-t${body.turnIndex}`;
     const thinkingMessageId = `srv-${idPart}-t${body.turnIndex}-thinking`;
 
-    const hasAssistant = body.text.length > 0;
+    // Fix B (2026-05-25) — segment-aware presence flags. `hasAssistant` /
+    // `hasThinking` collapse the legacy single-string path AND the new
+    // segment-array path into one boolean for downstream branch decisions.
+    // The cross-field refine guarantees at least one of them (or tools) is
+    // non-empty. Plan §3.5.1.
+    const hasAssistantSegments =
+      body.assistantSegments !== undefined && body.assistantSegments.length > 0;
+    const hasThinkingSegments =
+      body.thinkingSegments !== undefined && body.thinkingSegments.length > 0;
+    const hasAssistant = body.text.length > 0 || hasAssistantSegments;
     const hasThinking =
-      body.thinkingText !== undefined && body.thinkingText.length > 0;
+      (body.thinkingText !== undefined && body.thinkingText.length > 0) ||
+      hasThinkingSegments;
     const hasTools = toolsCount > 0;
 
     // ── Write thinking first (if present) so its ts < tool ts < assistant ts ──
+    //
+    // Fix B (2026-05-25) — when thinkingSegments is present we write ONE row
+    // per segment with the segment's own ts (parser-stamped wall-clock).
+    // Each row id is `srv-${idPart}-t${turnIndex}-thinking-s${index}` so the
+    // frontend's _findOrCreateStreamingRow's live-stream row (stamped by
+    // gateway with the same -sN suffix) reuses it on refresh. Legacy
+    // thinkingText path keeps the single-row form. Plan §3.5.1.
     type StorageResult = Awaited<
       ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>
     >;
-    let thinkingResult: StorageResult | null = null;
-    let thinkingThrew = false;
-    if (hasThinking) {
+    type PerRowOutcome = { id: string; result: StorageResult | null; threw: boolean };
+    const thinkingOutcomes: PerRowOutcome[] = [];
+    if (hasThinkingSegments) {
+      for (const seg of body.thinkingSegments!) {
+        const id = `srv-${idPart}-t${body.turnIndex}-thinking-s${seg.index}`;
+        let result: StorageResult | null = null;
+        let threw = false;
+        try {
+          result = await deps.storage.appendServerAuthoredMessage(
+            body.sessionId,
+            userId,
+            {
+              id,
+              role: "thinking",
+              text: seg.text,
+              ts: seg.ts,
+              status: body.status,
+            },
+          );
+        } catch (err) {
+          threw = true;
+          userLog.error("thinking_storage_threw", {
+            sessionId: body.sessionId,
+            turnIndex: body.turnIndex,
+            segmentIndex: seg.index,
+            err: err as Error,
+          });
+        }
+        thinkingOutcomes.push({ id, result, threw });
+      }
+    } else if (hasThinking) {
+      let result: StorageResult | null = null;
+      let threw = false;
       try {
-        thinkingResult = await deps.storage.appendServerAuthoredMessage(
+        result = await deps.storage.appendServerAuthoredMessage(
           body.sessionId,
           userId,
           {
@@ -508,33 +615,45 @@ export function makeServerAuthoredHandler(
           },
         );
       } catch (err) {
-        thinkingThrew = true;
+        threw = true;
         userLog.error("thinking_storage_threw", {
           sessionId: body.sessionId,
           turnIndex: body.turnIndex,
           err: err as Error,
         });
       }
+      thinkingOutcomes.push({ id: thinkingMessageId, result, threw });
     }
 
-    /** Emit the per-role thinking metric exactly once per request. Pull-out
-     *  helper so all exit paths in this handler can call it consistently. */
+    /** The LAST thinking outcome decides the no-assistant-path HTTP result.
+     *  Earlier segments are best-effort; their failures are logged + metric'd
+     *  but don't change HTTP outcome (the typical failure mode — session
+     *  missing / deleted / oversized — affects every segment identically,
+     *  so the last one's result is representative). */
+    const lastThinkingOutcome: PerRowOutcome | null =
+      thinkingOutcomes.length > 0
+        ? thinkingOutcomes[thinkingOutcomes.length - 1]!
+        : null;
+
+    /** Emit the per-row thinking metric exactly once per request, covering
+     *  every segment when segmented. */
     const emitThinkingMetric = (): void => {
-      if (!hasThinking) return;
-      if (thinkingThrew) {
-        metric("error", "thinking");
-        return;
+      for (const o of thinkingOutcomes) {
+        if (o.threw) {
+          metric("error", "thinking");
+          continue;
+        }
+        const r = o.result!;
+        if (r.applied) metric("ok", "thinking");
+        else if (r.reason === "already_exists") metric("deduped", "thinking");
+        else if (r.reason === "session_not_found")
+          metric("reject_session_missing", "thinking");
+        else if (r.reason === "session_deleted")
+          metric("reject_session_deleted", "thinking");
+        else if (r.reason === "oversized")
+          metric("reject_oversized", "thinking");
+        else metric("error", "thinking"); // malformed
       }
-      const r = thinkingResult!;
-      if (r.applied) metric("ok", "thinking");
-      else if (r.reason === "already_exists") metric("deduped", "thinking");
-      else if (r.reason === "session_not_found")
-        metric("reject_session_missing", "thinking");
-      else if (r.reason === "session_deleted")
-        metric("reject_session_deleted", "thinking");
-      else if (r.reason === "oversized")
-        metric("reject_oversized", "thinking");
-      else metric("error", "thinking"); // malformed
     };
 
     // ── Write tools after thinking, before assistant ──
@@ -558,7 +677,14 @@ export function makeServerAuthoredHandler(
       // Same agentId fold-in as the assistant/thinking id above — see the
       // long comment near `idPart` for rationale.
       const toolMessageId = `srv-${idPart}-t${body.turnIndex}-tool-${t.blockId}`;
-      const toolTs = baseTs - toolsCount + i;
+      // Fix B (2026-05-25) — ts priority chain: `arrivedAt` (parser-stamped
+      // at first tool_use observation, NEW field) → computed offset (legacy
+      // behavior preserved for pre-Fix-B gateways). The wire `t.ts` field
+      // is intentionally NOT in the chain: historically master computed its
+      // own ts and ignored `t.ts` (which is the tool_result completion
+      // time, not arrival-ordered). Adding it would change behavior for
+      // every pre-Fix-B gateway. Plan §3.5.4.
+      const toolTs = t.arrivedAt ?? baseTs - toolsCount + i;
       try {
         toolResults[i] = await deps.storage.appendServerAuthoredMessage(
           body.sessionId,
@@ -633,7 +759,27 @@ export function makeServerAuthoredHandler(
     if (!hasAssistant) {
       // Schema refine guarantees hasThinking || hasTools here.
       if (hasThinking) {
-        if (thinkingThrew) {
+        // Fix B — emit per-segment metrics for non-last thinking writes
+        // first (they're best-effort under the segment path); the last
+        // outcome decides HTTP and is metric'd inline below.
+        for (let i = 0; i < thinkingOutcomes.length - 1; i++) {
+          const o = thinkingOutcomes[i]!;
+          if (o.threw) metric("error", "thinking");
+          else {
+            const r = o.result!;
+            if (r.applied) metric("ok", "thinking");
+            else if (r.reason === "already_exists") metric("deduped", "thinking");
+            else if (r.reason === "session_not_found")
+              metric("reject_session_missing", "thinking");
+            else if (r.reason === "session_deleted")
+              metric("reject_session_deleted", "thinking");
+            else if (r.reason === "oversized")
+              metric("reject_oversized", "thinking");
+            else metric("error", "thinking");
+          }
+        }
+        const last = lastThinkingOutcome!;
+        if (last.threw) {
           metric("error", "thinking");
           emitToolsMetric();
           sendJsonError(
@@ -645,7 +791,7 @@ export function makeServerAuthoredHandler(
           );
           return;
         }
-        const r = thinkingResult!;
+        const r = last.result!;
         if (r.applied) {
           metric("ok", "thinking");
           emitToolsMetric();
@@ -832,17 +978,87 @@ export function makeServerAuthoredHandler(
     //
     // Both paths write the same `assistantMsg` shape; the only difference is
     // whether we record the cost-late-patch join key.
-    const assistantMsg: ServerAuthoredMessageInput = {
-      id: messageId,
-      role: "assistant",
-      text: body.text,
-      ts: assistantTs,
-      status: body.status,
-      ...(body.usage ? { usage: body.usage } : {}),
-      ...(body.truncated ? { _truncated: true } : {}),
-      ...(body.errorCode ? { _errorCode: body.errorCode } : {}),
-      ...(body.errorDetail ? { _errorDetail: body.errorDetail } : {}),
-    };
+    // Fix B (2026-05-25) — assistant writes.
+    //
+    // Single-row path (no assistantSegments): one write, exactly as before.
+    // Multi-row path (assistantSegments present): one write per segment with
+    // id `srv-${idPart}-t${turnIndex}-s${index}` and ts = segment.ts (the
+    // wall-clock first-token arrival time, parser-stamped). Only the LAST
+    // segment carries usage / _truncated / _errorCode / _errorDetail (those
+    // are turn-level metadata; placing them on intermediate segments would
+    // make refresh recovery double-render the pill); the same last segment
+    // is also the one registered in `server_authored_request_map` so a
+    // deferred `appendCostCredits(requestId, ...)` patches the segment that
+    // visually closes the turn. Earlier segments use plain
+    // `appendServerAuthoredMessage`. Plan §3.5.4.
+    type AssistantWrite = { id: string; msg: ServerAuthoredMessageInput };
+    const assistantWrites: AssistantWrite[] = hasAssistantSegments
+      ? body.assistantSegments!.map((seg, i, arr) => {
+          const isLast = i === arr.length - 1;
+          const id = `srv-${idPart}-t${body.turnIndex}-s${seg.index}`;
+          const msg: ServerAuthoredMessageInput = {
+            id,
+            role: "assistant",
+            text: seg.text,
+            ts: seg.ts,
+            status: body.status,
+            ...(isLast && body.usage ? { usage: body.usage } : {}),
+            ...(isLast && body.truncated ? { _truncated: true } : {}),
+            ...(isLast && body.errorCode ? { _errorCode: body.errorCode } : {}),
+            ...(isLast && body.errorDetail ? { _errorDetail: body.errorDetail } : {}),
+          };
+          return { id, msg };
+        })
+      : [
+          {
+            id: messageId,
+            msg: {
+              id: messageId,
+              role: "assistant",
+              text: body.text,
+              ts: assistantTs,
+              status: body.status,
+              ...(body.usage ? { usage: body.usage } : {}),
+              ...(body.truncated ? { _truncated: true } : {}),
+              ...(body.errorCode ? { _errorCode: body.errorCode } : {}),
+              ...(body.errorDetail ? { _errorDetail: body.errorDetail } : {}),
+            },
+          },
+        ];
+
+    // Non-last assistant writes are best-effort: they don't register in
+    // request_map (single requestId → single map row), don't carry usage,
+    // and their failures are logged + metric'd without changing HTTP outcome.
+    // Surface their throws so ops sees structural storage problems.
+    for (let i = 0; i < assistantWrites.length - 1; i++) {
+      const w = assistantWrites[i]!;
+      try {
+        const r = await deps.storage.appendServerAuthoredMessage(
+          body.sessionId,
+          userId,
+          w.msg,
+        );
+        if (r.applied) metric("ok", "assistant");
+        else if (r.reason === "already_exists") metric("deduped", "assistant");
+        else if (r.reason === "session_not_found")
+          metric("reject_session_missing", "assistant");
+        else if (r.reason === "session_deleted")
+          metric("reject_session_deleted", "assistant");
+        else if (r.reason === "oversized")
+          metric("reject_oversized", "assistant");
+        else metric("error", "assistant");
+      } catch (err) {
+        userLog.error("assistant_segment_storage_threw", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+          segmentId: w.id,
+          err: err as Error,
+        });
+        metric("error", "assistant");
+      }
+    }
+
+    const lastAssistant = assistantWrites[assistantWrites.length - 1]!;
     let assistantResult: Awaited<
       ReturnType<ServerAuthoredStorage["appendServerAuthoredMessageForRequest"]>
     >;
@@ -852,13 +1068,13 @@ export function makeServerAuthoredHandler(
           body.requestId,
           body.sessionId,
           userId,
-          assistantMsg,
+          lastAssistant.msg,
         );
       } else {
         const r = await deps.storage.appendServerAuthoredMessage(
           body.sessionId,
           userId,
-          assistantMsg,
+          lastAssistant.msg,
         );
         assistantResult = r.applied
           ? { applied: true }

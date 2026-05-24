@@ -390,9 +390,12 @@ export function _mergeServerAuthoredIntoLocal(serverMsgs, localMsgs) {
  *         canonical server row
  *     (d) The same turn group (bounded by the next user/system row
  *         walking forward) contains a counterpart R2:
- *           - assistant: R2.role === 'assistant' && R2.id startsWith 'srv-' && !endsWith '-thinking'
- *           - thinking:  R2.role === 'thinking'  && R2.id startsWith 'srv-' && endsWith '-thinking'
+ *           - assistant: R2.role === 'assistant' && R2.id startsWith 'srv-'
+ *           - thinking:  R2.role === 'thinking'  && R2.id startsWith 'srv-'
  *           - tool:      R2.role === 'tool' && R2._source === 'server' && R2.blockId === R.blockId
+ *         Pre-Fix-B variant additionally checked `R2.id endsWith '-thinking'`
+ *         on the thinking branch; after Fix B server thinking ids end with
+ *         `-thinking-s${N}` and `R2.role === 'thinking'` is sufficient.
  *     Otherwise: keep.
  *
  * Anything that fails any of (a)-(d) is kept — including:
@@ -443,9 +446,17 @@ function _dropLegacyClientStreamRows(merged) {
     const m = merged[i]
     if (!m) continue
     if (typeof m.id === 'string' && m.id.startsWith('srv-')) {
-      if (m.role === 'assistant' && !m.id.endsWith('-thinking')) {
+      // Fix B (2026-05-25): role-based discriminator instead of id-suffix.
+      // After Fix B, server thinking ids end with `-thinking-s${N}` (per-
+      // segment row), not bare `-thinking`. The `m.role === 'thinking'`
+      // check already guarantees we're on the right row class; the
+      // historical suffix guard was defensive and now wrong. Same logic
+      // applies to assistant — Fix B ids end with `-s${N}`, never
+      // `-thinking`, so the assistant branch's negative suffix check
+      // becomes structurally always-true and is removed.
+      if (m.role === 'assistant') {
         hasSrvAsst.set(groupOf[i], true)
-      } else if (m.role === 'thinking' && m.id.endsWith('-thinking')) {
+      } else if (m.role === 'thinking') {
         hasSrvThinking.set(groupOf[i], true)
       }
     }

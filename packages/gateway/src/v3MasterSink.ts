@@ -188,8 +188,26 @@ export interface V3MasterSinkWirePayload {
    *  Body-cap policy (see attemptSend): tools[] is dropped before
    *  thinkingText, because losing tool details is more recoverable than
    *  losing the thinking trace (tools can be re-inferred from result text
-   *  in a degraded UI; thinking can't be reconstructed). */
+   *  in a degraded UI; thinking can't be reconstructed).
+   *
+   *  Fix B (2026-05-25): each `TurnToolEntry.arrivedAt` is the tool CARD
+   *  APPEARANCE time (parser-stamped at first tool_use observation, NEW
+   *  field). Master priority chain `arrivedAt ?? (baseTs - toolsCount + i)`
+   *  prefers it for the persisted row ts so parallel-tool refresh order
+   *  matches the live emit order. The legacy `ts` field retains the
+   *  tool_result completion semantic and is ignored by master (preserves
+   *  pre-Fix-B behavior for old gateways). */
   tools?: TurnToolEntry[]
+  /** Fix B (2026-05-25) — per-text-segment payload. When present, master
+   *  writes ONE assistant row per segment (`srv-...-tN-s${idx}`) with the
+   *  segment's own ts so ts-sort interleaves correctly with tool rows.
+   *  When absent (old gateway, legacy callers), master falls back to the
+   *  single-row `text` field above.
+   *  Plan: docs/wip/fixb-per-segment-row-id-PLAN.md §3.5.1. */
+  assistantSegments?: Array<{ index: number; text: string; ts: number }>
+  /** Fix B (2026-05-25) — same per-segment treatment for thinking rows
+   *  (`srv-...-tN-thinking-s${idx}`). */
+  thinkingSegments?: Array<{ index: number; text: string; ts: number }>
 }
 
 /**
@@ -312,6 +330,21 @@ export async function attemptSend(
   if (payload.thinkingText && payload.thinkingText.length > 0) {
     bodyObj.thinkingText = payload.thinkingText
   }
+  // Fix B (2026-05-25) — per-segment row id. Forward both segment arrays
+  // when non-empty. Master uses these in preference to the single-row
+  // `text` / `thinkingText` fields above. NOTE: master BodySchema is
+  // `.strict()` (rejects unknown fields with 400 INVALID_BODY → fatal-drop
+  // in this sink), so a new gateway × old master cross will hard-fail
+  // these turns. Deploy contract is **master-first** per the v3 rollout
+  // SOP (deploy-v3.sh sequences master → image distribute). Do NOT roll
+  // a gateway image carrying these fields before the master upgrade.
+  // Plan: docs/wip/fixb-per-segment-row-id-PLAN.md §3.5.1.
+  if (payload.assistantSegments && payload.assistantSegments.length > 0) {
+    bodyObj.assistantSegments = payload.assistantSegments
+  }
+  if (payload.thinkingSegments && payload.thinkingSegments.length > 0) {
+    bodyObj.thinkingSegments = payload.thinkingSegments
+  }
   if (payload.tools && payload.tools.length > 0) {
     // Count cap (must precede byte cap): master rejects > MAX_TOOLS_PER_PAYLOAD
     // with 400 INVALID_BODY which our classifier marks fatal — that would
@@ -354,29 +387,40 @@ export async function attemptSend(
     }
   }
   if (bodyBytes > MAX_BODY_BYTES) {
-    const hasAssistant = (bodyObj.text as string).length > 0
-    const hasThinking = bodyObj.thinkingText !== undefined
+    const hasAssistant =
+      (bodyObj.text as string).length > 0 || bodyObj.assistantSegments !== undefined
+    const hasThinking =
+      bodyObj.thinkingText !== undefined || bodyObj.thinkingSegments !== undefined
     if (hasAssistant && hasThinking) {
-      // Combined over cap — drop thinkingText to preserve assistant. Thinking
-      // is auxiliary debug content; the conversation can survive without it.
-      log.warn('v3 sink dropped thinkingText to fit body cap', {
+      // Combined over cap — drop BOTH thinkingText and thinkingSegments
+      // (atomically: they describe the same thinking content in two encodings)
+      // to preserve assistant. Thinking is auxiliary debug content; the
+      // conversation can survive without it.
+      log.warn('v3 sink dropped thinking content to fit body cap', {
         sessionId: payload.sessionId,
         turnIndex: payload.turnIndex,
         originalBytes: bodyBytes,
+        hadThinkingText: bodyObj.thinkingText !== undefined,
+        hadThinkingSegments: bodyObj.thinkingSegments !== undefined,
       })
       delete bodyObj.thinkingText
+      delete bodyObj.thinkingSegments
       body = JSON.stringify(bodyObj)
       bodyBytes = Buffer.byteLength(body, 'utf8')
       if (bodyBytes > MAX_BODY_BYTES) {
         // Assistant alone still over cap — fatal. Master's contract caps at
         // MAX_BODY_BYTES; sending invalid body would just 413 with retry.
+        // Never partial-drop assistantSegments: dropping a middle segment
+        // would let tool rows sandwich incorrectly on refresh.
         throw new V3SinkError('assistant-only payload exceeds master body cap', 'fatal')
       }
     } else if (hasThinking && !hasAssistant) {
       // Thinking-only over cap. Parser-side MAX_THINKING_BUFFER_BYTES = 8 KB
       // should prevent this; if we hit it, log loudly because it indicates
-      // the parser cap leaked. Don't strip thinkingText — that would yield
-      // a schema-invalid body (master refines text>0 || thinkingText present).
+      // the parser cap leaked. Don't strip thinkingText/thinkingSegments —
+      // that would yield a schema-invalid body (master refines
+      // text>0 || thinkingText || assistantSegments || thinkingSegments
+      // is present).
       log.error(
         'v3 sink thinking-only payload exceeds body cap (parser cap should have prevented this)',
         {
@@ -387,7 +431,8 @@ export async function attemptSend(
       )
       throw new V3SinkError('thinking-only payload exceeds master body cap', 'fatal')
     } else {
-      // Assistant alone over cap (no thinkingText to drop).
+      // Assistant alone over cap (no thinking content to drop). Never
+      // partial-drop assistantSegments.
       throw new V3SinkError('assistant-only payload exceeds master body cap', 'fatal')
     }
   }

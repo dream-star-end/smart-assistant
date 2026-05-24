@@ -164,6 +164,14 @@ export interface TurnToolEntry {
   durationMs: number
   /** Wall-clock timestamp (Date.now ms) when the tool_result arrived */
   ts: number
+  /** Fix B (2026-05-25) — wall-clock timestamp (Date.now ms) when the parser
+   *  FIRST OBSERVED the tool_use content_block_start (or assistant snapshot,
+   *  whichever fires first on the runner path being used). This is the tool
+   *  card's APPEARANCE time, distinct from `ts` (tool_result COMPLETION
+   *  time). Master prefers this for the persisted row's ts so parallel-tool
+   *  refresh order matches the live emit order; falls back to a computed
+   *  offset when absent (pre-Fix-B gateway). Plan §3.5.4. */
+  arrivedAt: number
   inputTruncated?: boolean
   outputTruncated?: boolean
 }
@@ -241,6 +249,7 @@ function _capToolEntry(raw: {
   isError: boolean
   durationMs: number
   ts: number
+  arrivedAt: number
 }): TurnToolEntry {
   let inputJson = raw.inputJson
   let inputTruncated = false
@@ -282,6 +291,7 @@ function _capToolEntry(raw: {
     isError: raw.isError,
     durationMs: raw.durationMs,
     ts: raw.ts,
+    arrivedAt: raw.arrivedAt,
   }
   if (inputTruncated) entry.inputTruncated = true
   if (outputTruncated) entry.outputTruncated = true
@@ -1010,13 +1020,14 @@ export class CcbMessageParser {
           // `/^Agent$/i.test(...)` discriminator and stay aligned if CCB
           // ever varies the casing.
           if (!/^Agent$/i.test(toolName || '')) {
-            // Fix B: tool ts is tool CARD APPEARANCE time (when parser first
-            // saw the tool_use), NOT tool RESULT COMPLETION time. Parallel
-            // tools that complete out of order otherwise rendered with their
-            // result-arrival ts and post-sync UI flipped their visual order.
-            // First-observation arrivedAt is set in _markToolBoundary; if
-            // missing (cross-turn stale tool_result with no matching
-            // tool_use), fall back to now — matches pre-Fix-B behavior.
+            // Fix B (2026-05-25): preserve `ts` as tool_result completion
+            // time (legacy semantic — existing master schema treats it as
+            // a free-form field and ignores it for tool row ts decisions),
+            // and emit a NEW `arrivedAt` field for the tool CARD APPEARANCE
+            // time stamped in `_markToolBoundary`. Master priority chain
+            // `arrivedAt ?? offset` then uses arrivedAt when present,
+            // falling back to the historical computed offset when absent
+            // (pre-Fix-B gateway). Plan §3.5.4.
             const arrivedAt = this.toolArrivedAt.get(useId) ?? Date.now()
             this.completedTools.push(
               _capToolEntry({
@@ -1028,7 +1039,8 @@ export class CcbMessageParser {
                 output: preview,
                 isError: !!c.is_error,
                 durationMs,
-                ts: arrivedAt,
+                ts: Date.now(),
+                arrivedAt,
               }),
             )
           }

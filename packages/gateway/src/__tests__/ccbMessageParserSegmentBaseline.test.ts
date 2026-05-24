@@ -224,7 +224,7 @@ describe('Fix B: tool arrivedAt (card appearance time, not result completion)', 
     } as unknown as Record<string, unknown>
   }
 
-  it('completedTools[].ts is the tool_use first-observation time, not tool_result arrival', async () => {
+  it('completedTools[].arrivedAt is the tool_use first-observation time, distinct from ts (tool_result arrival)', async () => {
     const { parser } = createParser()
     // content_block_start fires first → stamps arrivedAt at T0.
     parser.parse(toolUseStart('tu_a', 'Read'))
@@ -234,12 +234,17 @@ describe('Fix B: tool arrivedAt (card appearance time, not result completion)', 
     parser.parse(makeToolUseAssistantSnapshot('tu_a', 'Read')) // finalized
     parser.parse(makeToolResult('tu_a', 'ok'))
     assert.equal(parser.completedTools.length, 1)
-    const ts = parser.completedTools[0].ts
-    // ts must reflect tool_use start (≤ T0 + a few ms), NOT tool_result
-    // arrival (which is at least T0 + 20).
+    const e = parser.completedTools[0]
+    // arrivedAt must reflect tool_use start (≤ T0 + a few ms).
     assert.ok(
-      ts <= T0 + 5,
-      `tool ts (${ts}) should be tool_use observation time (~${T0}), not tool_result arrival`,
+      e.arrivedAt <= T0 + 5,
+      `tool arrivedAt (${e.arrivedAt}) should be tool_use observation time (~${T0})`,
+    )
+    // ts is the tool_result arrival time (kept for legacy schema; should
+    // be at least T0 + 20 since we slept).
+    assert.ok(
+      e.ts >= T0 + 15,
+      `tool ts (${e.ts}) should reflect tool_result arrival (≥ T0+15 after 20ms sleep)`,
     )
   })
 
@@ -250,6 +255,9 @@ describe('Fix B: tool arrivedAt (card appearance time, not result completion)', 
     await new Promise((r) => setTimeout(r, 20))
     parser.parse(makeToolResult('tu_b', 'ok'))
     assert.equal(parser.completedTools.length, 1)
-    assert.ok(parser.completedTools[0].ts <= T0 + 10)
+    assert.ok(
+      parser.completedTools[0].arrivedAt <= T0 + 10,
+      'arrivedAt is stamped on Codex runner path even without content_block_start',
+    )
   })
 })
