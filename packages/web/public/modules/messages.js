@@ -320,15 +320,23 @@ const _MCP_SERVER_META = {
 // Codex thread item types — emitted as `codex:<itemType>` tool_use by
 // CodexAppServerRunner.handleItemStarted (gateway). commandExecution and
 // fileChange are aliased to Bash/Write/Edit upstream and never reach this
-// table. userMessage / hookPrompt / agentMessage / reasoning are suppressed
-// at the gateway. The remaining types fall here so the user sees a proper
-// labelled card instead of the old uppercase "CODEX:XXX" generic dump.
+// table. userMessage / hookPrompt / agentMessage are suppressed at the
+// gateway; reasoning is streamed as a thinking_delta and surfaces as a
+// 💭 thinking card instead of a tool card. The remaining types fall here.
+//
+// Label policy: align with claude-code tool labels (no "Codex" prefix) so
+// the user sees one consistent vocabulary across both runners. mcpToolCall
+// / dynamicToolCall / collabAgentToolCall labels here are fallbacks —
+// `_resolveCodexMeta` unwraps the inner server/tool/agent and prefers the
+// matching `_MCP_OP_META` / `_TOOL_LABELS` entry so codex calls into
+// browser / minimax-media / openclaude-memory render with the same icon
+// and label as their native MCP counterparts.
 const _CODEX_TYPE_META = {
-  plan: { icon: _ICON_CHECK_LIST, label: 'Codex 计划' },
-  mcpToolCall: { icon: _ICON_GEAR, label: 'Codex MCP 工具' },
-  dynamicToolCall: { icon: _ICON_GEAR, label: 'Codex 动态工具' },
-  collabAgentToolCall: { icon: _ICON_BOT, label: 'Codex 协作 Agent' },
-  webSearch: { icon: _ICON_GLOBE, label: '联网搜索' },
+  plan: { icon: _ICON_CHECK_LIST, label: '任务列表' },
+  mcpToolCall: { icon: _ICON_GEAR, label: 'MCP 工具' },
+  dynamicToolCall: { icon: _ICON_GEAR, label: '工具调用' },
+  collabAgentToolCall: { icon: _ICON_BOT, label: '委托子任务' },
+  webSearch: { icon: _ICON_GLOBE, label: '网页搜索' },
   imageView: { icon: _ICON_EYE, label: '查看图片' },
   imageGeneration: { icon: _ICON_IMAGE, label: '生成图片' },
   enteredReviewMode: { icon: _ICON_BOT, label: '进入审阅模式' },
@@ -416,11 +424,101 @@ function _parseCodexTypeName(name) {
   return name.slice(6)
 }
 
-// Resolve icon + label for a tool name (handles MCP names).
-function _toolMeta(name) {
+// Unpack a codex mcpToolCall / dynamicToolCall ThreadItem to a canonical
+// `{ server, tool, args }` triple. Codex protocol uses several spellings
+// across versions (`server` vs `serverName`, `tool`/`toolName`/`name`,
+// `arguments`/`args`/`params`) — this is the single source of truth so
+// `_resolveCodexMeta` / `_codexSummary` / `_renderCodexItem` don't drift.
+//
+// args is force-coerced to a plain object: codex sometimes carries `args`
+// as a JSON-stringified string or null/undefined; downstream MCP body
+// renderers expect a dict, so we hand them `{}` instead of letting them
+// trip on a string-typed input.
+export function _codexResolveMcpCall(input) {
+  if (!input || typeof input !== 'object') {
+    return { server: '', tool: '', args: {}, rawArgs: undefined }
+  }
+  const server = typeof input.server === 'string' ? input.server
+    : typeof input.serverName === 'string' ? input.serverName : ''
+  const tool = typeof input.tool === 'string' ? input.tool
+    : typeof input.toolName === 'string' ? input.toolName
+    : typeof input.name === 'string' ? input.name : ''
+  let rawArgs = input.arguments
+  if (rawArgs === undefined) rawArgs = input.args
+  if (rawArgs === undefined) rawArgs = input.params
+  let args = {}
+  if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+    args = rawArgs
+  } else if (typeof rawArgs === 'string') {
+    // Codex sometimes carries the args dict as a stringified JSON blob.
+    try {
+      const parsed = JSON.parse(rawArgs)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed
+    } catch { /* ignore — caller falls back to rawArgs */ }
+  }
+  // rawArgs surfaced so unknown-tool fallbacks can still show the original
+  // input when `args` was force-coerced to `{}` for downstream renderers
+  // (codex review CONCERN #3 — don't silently swallow non-dict args).
+  return { server, tool, args, rawArgs }
+}
+
+// Codex-aware meta resolution. Only invoked from `_toolMeta` when name is
+// `codex:<itemType>` AND input is available. Unwraps the inner tool so
+// codex calls into native MCP servers show the same icon+label as direct
+// claude-code MCP calls.
+//
+// Returns null when no unwrap is possible — caller falls back to the
+// generic `_CODEX_TYPE_META` entry.
+function _resolveCodexMeta(codexType, input) {
+  if (!input || typeof input !== 'object') return null
+  if (codexType === 'mcpToolCall') {
+    const { server, tool } = _codexResolveMcpCall(input)
+    if (server && tool) {
+      const opMeta = _MCP_OP_META[`${server}:${tool}`]
+      if (opMeta) return opMeta
+      const srvMeta = _MCP_SERVER_META[server]
+      if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${_humanizeOp(tool)}` }
+    }
+    return null
+  }
+  if (codexType === 'dynamicToolCall') {
+    const { tool } = _codexResolveMcpCall(input)
+    if (!tool) return null
+    // builtin claude-code tool (Bash/Read/Edit/Grep/...): reuse its meta
+    if (_TOOL_ICONS[tool]) {
+      return { icon: _TOOL_ICONS[tool], label: _TOOL_LABELS[tool] || tool }
+    }
+    // mcp__server__op shape: parse and look up
+    const mcp = _parseMcpName(tool)
+    if (mcp) {
+      const opMeta = _MCP_OP_META[`${mcp.server}:${mcp.op}`]
+      if (opMeta) return opMeta
+      const srvMeta = _MCP_SERVER_META[mcp.server]
+      const opLabel = _humanizeOp(mcp.op) || mcp.server
+      if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}` }
+      return { icon: _ICON_GEAR, label: opLabel }
+    }
+    // unknown tool name — surface it (truncated) so the user at least sees
+    // what codex is calling, rather than a useless "工具调用" placeholder.
+    // 60-char cap mirrors `_codexSummary` truncation so a pathologically
+    // long `mcp__some_long_server__some_long_op_name` doesn't stretch the
+    // tool-card header (codex review CONCERN #5).
+    const labelTool = tool.length > 60 ? `${tool.slice(0, 60)}…` : tool
+    return { icon: _ICON_GEAR, label: labelTool }
+  }
+  return null
+}
+
+// Resolve icon + label for a tool name (handles MCP names + codex items).
+// `input` is the tool's parsed input dict (from `_safeInput(msg)`); pass
+// undefined when the caller has none (codex unwrap simply falls back to
+// the static `_CODEX_TYPE_META` entry in that case).
+export function _toolMeta(name, input) {
   if (_TOOL_ICONS[name]) return { icon: _TOOL_ICONS[name], label: _TOOL_LABELS[name] || name }
   const codexType = _parseCodexTypeName(name)
   if (codexType) {
+    const unwrapped = _resolveCodexMeta(codexType, input)
+    if (unwrapped) return unwrapped
     const meta = _CODEX_TYPE_META[codexType]
     if (meta) return meta
     return { icon: _ICON_BOT, label: `Codex: ${codexType}` }
@@ -652,8 +750,11 @@ function _renderAgentGroup(el, msg) {
 
 function _buildToolCard(el, msg) {
   const name = msg.toolName || 'unknown'
-  const meta = _toolMeta(name)
+  // `input` is computed before `_toolMeta` so codex mcpToolCall /
+  // dynamicToolCall can unwrap the inner server/tool and surface the
+  // matching native MCP icon+label instead of the generic gear card.
   const input = _safeInput(msg)
+  const meta = _toolMeta(name, input)
   const completed = msg._completed
   const isError = msg.error
   const isRunning = !completed && !isError
@@ -758,23 +859,59 @@ function _toolSummary(name, input, msg) {
 // Compact summary for codex thread items rendered as tool cards.
 // Looked up from the `input` blob (which is the raw ThreadItem JSON for
 // fallback emits in CodexAppServerRunner.handleItemStarted).
-function _codexSummary(codexType, input) {
+//
+// Where the codex item wraps another tool (mcpToolCall, dynamicToolCall),
+// the summary is delegated to the same `_toolSummary` / `_mcpSummary`
+// helpers as native claude-code calls, so the header line reads identically
+// (e.g. codex calling `browser_navigate` shows the URL, not `browser · navigate`).
+export function _codexSummary(codexType, input) {
   if (!input || typeof input !== 'object') return ''
   switch (codexType) {
     case 'plan': {
+      // Align with TodoWrite summary format ("done/total") instead of the
+      // old "N 步" so users see the same progress vocabulary across plan
+      // sources.
       const steps = Array.isArray(input.steps) ? input.steps : []
-      return steps.length ? `${steps.length} 步` : ''
+      if (steps.length === 0) return ''
+      const done = steps.filter((s) => s && s.status === 'completed').length
+      return `${done}/${steps.length}`
     }
     case 'webSearch': return input.query || ''
     case 'imageView': return _shortPath(input.path || input.url || '')
     case 'imageGeneration': return input.prompt ? input.prompt.slice(0, 60) : (input.savedPath ? _shortPath(input.savedPath) : '')
     case 'mcpToolCall': {
-      const server = input.server || input.serverName || ''
-      const tool = input.tool || input.toolName || input.name || ''
-      return server && tool ? `${server} · ${tool}` : (tool || server || '')
+      const { server, tool, args } = _codexResolveMcpCall(input)
+      if (server && tool) {
+        const s = _mcpSummary(server, tool, args)
+        if (s) return s
+        return `${server} · ${tool}`
+      }
+      return tool || server || ''
     }
-    case 'dynamicToolCall': return input.toolName || input.name || ''
-    case 'collabAgentToolCall': return input.agentId || input.agent || input.target || ''
+    case 'dynamicToolCall': {
+      const { tool, args } = _codexResolveMcpCall(input)
+      if (!tool) return ''
+      // builtin claude-code tool → reuse its summary (same as a direct call)
+      if (_TOOL_ICONS[tool]) {
+        const s = _toolSummary(tool, args, { output: '' })
+        if (s) return s
+      }
+      // mcp__server__op shape → reuse native MCP summary
+      const mcp = _parseMcpName(tool)
+      if (mcp) {
+        const s = _mcpSummary(mcp.server, mcp.op, args)
+        if (s) return s
+      }
+      return tool
+    }
+    case 'collabAgentToolCall': {
+      // Align with delegate_task / send_to_agent summary in _mcpSummary so
+      // codex-spawned subagents and memory-driven delegates read the same.
+      const agent = input.agentId || input.agent || input.target || ''
+      const goal = input.goal || input.message || input.prompt || ''
+      const tgt = agent ? `→ ${agent} ` : ''
+      return `${tgt}${goal.slice(0, 60)}`
+    }
     case 'contextCompaction': return ''
     case 'enteredReviewMode': case 'exitedReviewMode': return ''
   }
@@ -1336,22 +1473,98 @@ function _renderCodexImageView(body, input, msg) {
   _renderOutput(body, msg.output)
 }
 
-function _renderCodexMcpToolCall(body, input, msg) {
-  const kv = {
-    server: input.server || input.serverName || '',
-    tool: input.tool || input.toolName || input.name || '',
-    arguments: input.arguments || input.args || input.params,
+// Normalise a non-dict `rawArgs` payload into a displayable string for the
+// fallback kv renderer. Returns `''` (falsy) when there's nothing worth
+// surfacing — caller then collapses to a `{server, tool}`-only card.
+// Cases (codex review v3 — array/object rawArgs coverage):
+//   - string: return as-is (already display-ready)
+//   - array / non-dict object: JSON.stringify so user sees the structure
+//   - primitive (number/bool): String() coerce
+//   - null/undefined or empty container: return ''
+export function _codexRawArgsDisplay(rawArgs) {
+  if (rawArgs == null) return ''
+  if (typeof rawArgs === 'string') return rawArgs
+  if (Array.isArray(rawArgs)) {
+    if (rawArgs.length === 0) return ''
+    try { return JSON.stringify(rawArgs) } catch { return '' }
   }
-  _renderKvList(body, kv, { maxValueLen: 300 })
+  if (typeof rawArgs === 'object') {
+    // Object that wasn't a plain dict (the resolver consumed plain dicts into
+    // `args` already), e.g. Date / Map / class instance — best effort stringify.
+    try {
+      const s = JSON.stringify(rawArgs)
+      return s && s !== '{}' ? s : ''
+    } catch { return '' }
+  }
+  return String(rawArgs)
+}
+
+// Codex's mcpToolCall wraps a call into a registered MCP server. We unwrap
+// `{server, tool, args}` and hand off to the native MCP body renderers
+// (`_renderBrowser` / `_renderMedia` / `_renderVision` / `_renderMemory`)
+// so the card looks identical to a direct claude-code MCP call on the same
+// server. Unknown servers fall back to a clean kv list.
+function _renderCodexMcpToolCall(body, input, msg) {
+  const { server, tool, args, rawArgs } = _codexResolveMcpCall(input)
+  if (server && tool) {
+    if (server === 'browser') return _renderBrowser(body, tool, args, msg)
+    if (server === 'minimax-media') return _renderMedia(body, tool, args, msg)
+    if (server === 'minimax-vision') return _renderVision(body, tool, args, msg)
+    if (server === 'openclaude-memory') return _renderMemory(body, tool, args, msg)
+  }
+  // Unknown server (custom user MCP) — render the args dict directly so the
+  // user still sees structured info, not raw JSON.
+  if (args && typeof args === 'object' && Object.keys(args).length > 0) {
+    _renderKvList(body, args, { maxValueLen: 300 })
+  } else {
+    const display = _codexRawArgsDisplay(rawArgs)
+    if (display) {
+      // Custom MCP that ships non-dict args (free-form text, array, primitive)
+      // — show the original payload so the user isn't staring at an empty card.
+      _renderKvList(body, { server, tool, args: display }, { maxValueLen: 300 })
+    } else if (server || tool) {
+      _renderKvList(body, { server, tool }, { maxValueLen: 300 })
+    }
+  }
   _renderOutput(body, msg.output)
 }
 
+// Codex's dynamicToolCall is a registered-by-name tool dispatch. When the
+// inner name matches a claude-code builtin (Bash/Read/Edit/Grep/...) or a
+// `mcp__server__op` MCP shape, recurse into the same body renderer the
+// builtin/MCP path would use, so the card is visually indistinguishable
+// from a direct claude-code call.
 function _renderCodexDynamicToolCall(body, input, msg) {
-  const kv = {
-    tool: input.toolName || input.name || '',
-    arguments: input.arguments || input.args || input.params,
+  const { tool, args, rawArgs } = _codexResolveMcpCall(input)
+  if (tool) {
+    // builtin claude-code tool — recurse into the dispatch table so the
+    // body looks identical to a direct Bash/Read/Edit call.
+    if (_TOOL_ICONS[tool]) {
+      return _renderToolBody(body, tool, args, msg)
+    }
+    // mcp__server__op — dispatch like a direct MCP call
+    const mcp = _parseMcpName(tool)
+    if (mcp) {
+      if (mcp.server === 'browser') return _renderBrowser(body, mcp.op, args, msg)
+      if (mcp.server === 'minimax-media') return _renderMedia(body, mcp.op, args, msg)
+      if (mcp.server === 'minimax-vision') return _renderVision(body, mcp.op, args, msg)
+      if (mcp.server === 'openclaude-memory') return _renderMemory(body, mcp.op, args, msg)
+    }
   }
-  _renderKvList(body, kv, { maxValueLen: 300 })
+  // Unknown tool — kv list fallback.
+  if (args && typeof args === 'object' && Object.keys(args).length > 0) {
+    _renderKvList(body, args, { maxValueLen: 300 })
+  } else {
+    const display = _codexRawArgsDisplay(rawArgs)
+    if (display) {
+      // args got coerced to {} because rawArgs wasn't a dict (free-form text,
+      // array, primitive). Show the original payload so the user isn't
+      // staring at an empty card — codex review CONCERN #3.
+      _renderKvList(body, { tool: tool || '(unknown)', args: display }, { maxValueLen: 300 })
+    } else if (tool) {
+      _renderKvList(body, { tool }, { maxValueLen: 300 })
+    }
+  }
   _renderOutput(body, msg.output)
 }
 

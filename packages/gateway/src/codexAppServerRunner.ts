@@ -516,6 +516,37 @@ export class CodexAppServerRunner extends EventEmitter {
    *  Drained in `runTurn` (both happy and catch paths) before emitResult. */
   private inflightItemHandlers: Set<Promise<void>> = new Set()
 
+  /** Per-reasoning-item state for `item/reasoning/*` notifications. Keyed
+   *  by codex itemId so concurrent reasoning items (rare, but legal under
+   *  the protocol) don't cross-contaminate.
+   *
+   *  - `mode`: the first delta type observed for an item locks the channel:
+   *    `'summary'` after a `summaryTextDelta` / `summaryPartAdded`, or
+   *    `'text'` after a raw `textDelta`. Subsequent deltas of the OTHER
+   *    type are dropped — codex review CONCERN #1 (summary→text) +
+   *    v2 follow-up (text→summary): emitting BOTH for one item would
+   *    concatenate raw chain-of-thought with the model's distilled
+   *    summary in the UI. The lock is symmetric because we can't un-emit
+   *    a delta that already reached the wire, so whichever stream starts
+   *    first wins for that itemId. Codex CLI shows summary when both are
+   *    produced; raw text is the implicit fallback for models without a
+   *    summary surface (it locks `'text'` and any late summary is dropped).
+   *  - `sawContent`: true once at least one delta has reached the UI for
+   *    this itemId. The first `summaryPartAdded` for an item is a no-op
+   *    (codex review CONCERN #2: emitting `\n\n` before any content would
+   *    surface a leading blank line and could spawn an empty thinking
+   *    card). It still preemptively locks summary mode so a concurrent
+   *    `textDelta` is suppressed. Subsequent `summaryPartAdded` between
+   *    content blocks correctly inserts a paragraph separator. If the
+   *    item is already text-locked, `summaryPartAdded` is dropped entirely
+   *    (codex review v2 follow-up: orphan `\n\n` between text deltas).
+   *
+   *  Cleared in `runTurn` finally so each turn starts with an empty map. */
+  private reasoningItemState: Map<
+    string,
+    { mode: 'summary' | 'text' | null; sawContent: boolean }
+  > = new Map()
+
   /** mkdtempSync'd dir holding the per-spawn `extra-prompt.md`. Created lazily
    *  in `ensureSpawned()` whenever a fresh app-server process needs platform
    *  context, cleaned on `shutdown()` and on proc close. */
@@ -1293,6 +1324,81 @@ export class CodexAppServerRunner extends EventEmitter {
       } as unknown as RunnerMessage)
       return
     }
+    // Reasoning streaming: codex emits raw `textDelta` (chain-of-thought) OR
+    // `summaryTextDelta` (model-distilled summary). Both map to CCB
+    // `thinking_delta` so the frontend renders a 💭 thinking row — same
+    // surface claude-code uses. Turn-level persistence is owned by
+    // CcbMessageParser's `thinkingBuf`; the runner only routes packets.
+    //
+    // Mode resolution (per-itemId): the FIRST delta type seen for an item
+    // locks the mode. Subsequent deltas of the opposite type are dropped.
+    // The lock is symmetric (codex review v2 CONCERN — text-first then
+    // late summary would otherwise still splice the two streams): we can't
+    // un-emit a delta that already reached the UI, so once one stream
+    // starts the other must be suppressed for that itemId. The protocol
+    // doesn't guarantee an order, so this avoids "raw chain-of-thought +
+    // distilled summary" concatenation in either direction. Different
+    // reasoning items track independently (each gets its own lock).
+    if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
+      const delta = typeof p.delta === 'string' ? p.delta : ''
+      if (!delta) return
+      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
+      if (itemId) {
+        const wantMode: 'summary' | 'text' =
+          method === 'item/reasoning/summaryTextDelta' ? 'summary' : 'text'
+        const st = this.reasoningItemState.get(itemId) ?? { mode: null, sawContent: false }
+        if (st.mode !== null && st.mode !== wantMode) {
+          // Item already committed to the other stream → drop to avoid splicing.
+          return
+        }
+        st.mode = wantMode
+        st.sawContent = true
+        this.reasoningItemState.set(itemId, st)
+      }
+      this.emit('message', {
+        type: 'stream_event',
+        session_id: this.threadId,
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'thinking_delta', thinking: delta },
+        },
+      } as unknown as RunnerMessage)
+      return
+    }
+    // Summary parts are emitted as a sequence of named sections. Two
+    // suppression conditions:
+    //   1. First `summaryPartAdded` for an item: skip the `\n\n` emit —
+    //      it's the start of part 1, so there's nothing to separate from
+    //      (codex review v2 CONCERN #2). Still locks the item into summary
+    //      mode preemptively so a concurrent textDelta is suppressed.
+    //   2. Item already locked to `text` mode (raw chain-of-thought already
+    //      streamed): drop the separator entirely — any subsequent
+    //      summaryTextDelta would be suppressed by the mode lock above, so
+    //      an orphan `\n\n` between text deltas would just inject a noise
+    //      paragraph break (codex review v2 follow-up).
+    if (method === 'item/reasoning/summaryPartAdded') {
+      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
+      if (!itemId) return
+      const st = this.reasoningItemState.get(itemId) ?? { mode: null, sawContent: false }
+      if (st.mode === 'text') return // condition 2 — item already on the text stream
+      if (!st.sawContent) {
+        // condition 1 — first part for this item, preemptively lock summary mode
+        st.mode = 'summary'
+        this.reasoningItemState.set(itemId, st)
+        return
+      }
+      this.emit('message', {
+        type: 'stream_event',
+        session_id: this.threadId,
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'thinking_delta', thinking: '\n\n' },
+        },
+      } as unknown as RunnerMessage)
+      return
+    }
     if (method === 'item/started') {
       this.handleItemStarted(p.item)
       return
@@ -1630,6 +1736,10 @@ export class CodexAppServerRunner extends EventEmitter {
       repoBound: this._boundRepoBinding != null,
     })
     this.currentAssistantBuf = ''
+    // Per-item reasoning state is turn-scoped (codex re-assigns itemIds each
+    // turn) — clear at turn-start so the summary/mode lock and first-part
+    // skip flag don't bleed across turns.
+    this.reasoningItemState.clear()
     // Per-turn token state: cleared at turn-start so a partial state from a
     // crashed prior turn never bleeds into this turn's billing. priorTurnTotal
     // is intentionally NOT cleared — it's the cumulative-thread baseline that

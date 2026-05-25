@@ -2197,6 +2197,13 @@ export function handleOutbound(frame) {
     }
 
     if (block.kind === 'text') {
+      // Codex emits reasoning (thinking_delta) interleaved with agentMessage (text);
+      // before clearing the thinking row, drain any unflushed buffer so the last
+      // tokens render — same invariant the tool_use branch honours
+      // (flush-before-null). Otherwise rAF-throttled fragments are silently lost.
+      if (sess._streamingThinking?.text) {
+        updateMessage(sess, sess._streamingThinking, sess._streamingThinking.text, false)
+      }
       sess._streamingThinking = null
       if (!sess._streamingAssistant) {
         // v7: adopt server-minted canonical id when frame carries one + rebind
@@ -2389,9 +2396,14 @@ export function handleOutbound(frame) {
       // Same completion-stamp rationale as the tool_use branch above.
       if (sess._streamingAssistant) sess._streamingAssistant.completedAt = Date.now()
       if (sess._streamingThinking) sess._streamingThinking.completedAt = Date.now()
-      // Flush pending text render before clearing
+      // Flush pending text render before clearing — mirror tool_use branch:
+      // any rAF-throttled buffer on either streaming row must drain before
+      // we drop the reference, otherwise the last fragment is lost.
       if (sess._streamingAssistant?.text) {
         updateMessage(sess, sess._streamingAssistant, sess._streamingAssistant.text, false)
+      }
+      if (sess._streamingThinking?.text) {
+        updateMessage(sess, sess._streamingThinking, sess._streamingThinking.text, false)
       }
       sess._streamingAssistant = null
       sess._streamingThinking = null
