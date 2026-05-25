@@ -36,6 +36,50 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 const log = createLogger({ module: 'sessionManager' })
 
 /**
+ * Per-turn liveness watchdog 的阈值。`submit()` 内的 setInterval 每 15s 看一次
+ * `Date.now() - runner.lastActivityAt`,超过这里的阈值就 reject 让 submit()
+ * 走到 idle-timeout 分支 interrupt 子进程。
+ *
+ * 两档:
+ *   - TOOL_MS (15 min) — "子进程活着,backend 在跑长操作,stdout 沉默" 的状态。
+ *     当前命中两类:(a) parser.pendingToolCalls > 0 — 工具(MCP/Bash/sub-agent)
+ *     执行中;(b) currentTurnStatus === 'compacting' — CCB 在做 auto-compact,
+ *     发的是一次 backend-only 总结请求,无 tool call 也无 token 流,first-token
+ *     在大 context + Opus 高思考档下完全可能 > 5 min。两类同性质,共用同档。
+ *   - DEFAULT_MS (5 min) — API stream / 普通 idle。子进程预期在持续吐 token
+ *     或至少有 telemetry 事件刷 lastActivityAt;真静默 > 5 min 通常意味着
+ *     deadlock 或 SDK 卡死,需要尽快 kill 释放 session lock。
+ *
+ * 历史:pre-2026-04-19 这两个阈值是 30 / 60 min,过宽导致 deadlock 检测慢。
+ * 2026-04-19 收紧到 15 / 5。本次(2026-05-25)发现 compacting 误归到 DEFAULT,
+ * 把它合并到 TOOL 档,不新增第三档(同语义不切碎)。
+ *
+ * 另有 _runOneTurn 内部一个 30 min 硬背书 timer(被任意 stdout chunk 重置),
+ * 作为这两档之上的兜底,不在本文件常量范围。
+ */
+export const IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
+export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
+
+/**
+ * 给定 turn 当前的 backend-side 状态 + parser 未完成工具数,返回该 turn 此刻
+ * 应该用的 idle watchdog 阈值。
+ *
+ * 抽成 pure function 是为了让阈值选择策略锁在测试里 —— 防止以后有人无意识地
+ * 把 OR 分支"清理"掉退回 5min 单档,从而再次让 compacting 期间被误杀。
+ *
+ * Live watchdog 调用点见本文件 `submit()` 内 livenessTimer。
+ */
+export function pickIdleTimeoutMs(
+  currentTurnStatus: 'compacting' | null | undefined,
+  pendingToolCalls: number,
+): number {
+  if (pendingToolCalls > 0 || currentTurnStatus === 'compacting') {
+    return IDLE_TIMEOUT_TOOL_MS
+  }
+  return IDLE_TIMEOUT_DEFAULT_MS
+}
+
+/**
  * 触发 v3MasterSink server-authored 持久化的 channel 白名单。
  *
  * 历史上只有 'webchat' 走 master→client_sessions 写回路径(Phase 0.1 落地的 mobile
@@ -1329,23 +1373,19 @@ export class SessionManager {
       // events (tool.preUse fires just before each tool.call, turn.apiResponse
       // after each stream, etc.), so a live subprocess keeps refreshing even
       // during long tools that produce no content blocks.
-      // Thresholds tuned for "process active but deadlocked" detection speed
-      // (was 30/60min pre-2026-04-19):
-      //   - Tool call in progress (MCP/Bash/sub-agent): 15 min
-      //   - No tool call pending (API streaming / idle): 5 min
-      // _runOneTurn has a separate 30-min idle timer as a tighter
-      // turn-level backstop that resets on every stdout message.
-      const IDLE_TIMEOUT_TOOL = 15 * 60_000 // 15 min — tool executing
-      const IDLE_TIMEOUT_DEFAULT = 5 * 60_000 // 5 min — API stream / general idle
+      // 阈值策略集中在文件顶部的 `pickIdleTimeoutMs` 里(见对应注释),这里
+      // 只负责按当前 turn 的运行时状态查表 + 触发 reject。_runOneTurn 内还有
+      // 一个 30-min 硬背书 timer 作为兜底,不在本路径管。
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
           const idleMs = Date.now() - session.runner.lastActivityAt
           const parser = session._currentParser
-          const threshold = (parser && parser.pendingToolCalls > 0)
-            ? IDLE_TIMEOUT_TOOL
-            : IDLE_TIMEOUT_DEFAULT
+          const threshold = pickIdleTimeoutMs(
+            session.currentTurnStatus,
+            parser ? parser.pendingToolCalls : 0,
+          )
           if (idleMs > threshold) {
             reject(new Error(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
           }
