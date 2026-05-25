@@ -19,6 +19,7 @@ import {
   type SystemSettingKey,
   type SystemSettingRow,
 } from "../../admin/systemSettings.js";
+import { invalidateRuntimeFlagsCache } from "../../admin/runtimeFlags.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 
 function serializeSetting(row: SystemSettingRow): Record<string, unknown> {
@@ -133,6 +134,12 @@ export async function handleAdminPutSetting(
       userAgent: ctx.userAgent,
       description,
     });
+    // v3 反关联根治 — 灰度型 flag(phase6_account_uuid_enforce / session_pin_mode)
+    // 通过 admin/runtimeFlags.ts 的 30s TTL cache 读取。这里立即 invalidate 本机
+    // 进程的 cache,确保 admin 改完后续 chat 请求看到新值;跨 master 走 TTL 收敛。
+    // runtime flag cache 只有 2 个 entry(system_settings 表本身 19 个 key,但
+    // 只有这 2 个走 cache),无脑 clear 开销可忽略,不需要按 key 分支。
+    invalidateRuntimeFlagsCache();
     sendJson(res, 200, { setting: serializeSetting(row) });
   } catch (err) {
     if (err instanceof SystemSettingNotFoundError) {

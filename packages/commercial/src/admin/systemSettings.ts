@@ -96,6 +96,31 @@ export const KEY_SCHEMAS = {
         ),
     )
     .max(500),
+  // ── v3 反关联根治 — 灰度型 feature flag(从 env-only 迁过来,v1.0.207) ──
+  /**
+   * Phase 6 account_uuid 锚定执行模式(0070 plan §3.0)。
+   *
+   *   - `off`(默认):applyUpstreamAuth account_uuid 分支早退,builder HMAC 占位透出
+   *   - `fail_open`:hook 重写非 null;null 时跳过(HMAC 占位)
+   *   - `fail_closed`:scheduler 过滤 account_uuid IS NULL 候选;hook 强制重写
+   *
+   * pickUpstream 入口读一次冻结到局部常量,scheduler.pick + makeOAuthPoolUpstream
+   * 同值消费,避免热改时两处读不一致(plan §5.5.4 + Codex round 2 MINOR 1)。
+   */
+  phase6_account_uuid_enforce: z.enum(["off", "fail_open", "fail_closed"]),
+  /**
+   * v3 反关联根治 — chat_session_account_pin 三态调度模式。
+   *
+   *   - `off`(默认):scheduler 走旧 WRH-only 路径,不查/不写 csap
+   *   - `observe`:WRH 主导 pick + 同步读 csap 比对,console.log 出
+   *     `evt:'session_pin_observe'` 计数 outcome ∈ {pin_miss, pin_unbound, consistent, divergent}
+   *   - `enforce`:csap pin 命中 sticky;unbound 抛 SessionPinUnboundError(409)
+   *     让客户端透明 x-force-repin:1 重试;pin miss 走"既往足迹优先"+ race-safe INSERT
+   *
+   * 灰度路线 off → observe(收集 1~3 天 outcome,divergent / (consistent + divergent)
+   * < 0.5% 安全)→ enforce。
+   */
+  session_pin_mode: z.enum(["off", "observe", "enforce"]),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -157,6 +182,9 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
     "fakemailgenerator.com",
     "tmpmail.org",
   ],
+  // v3 反关联根治 — 默认 off,与原 env-only 字段默认一致(零迁移)
+  phase6_account_uuid_enforce: "off",
+  session_pin_mode: "off",
 };
 
 /**
@@ -223,6 +251,18 @@ export const KEY_META: Record<
     max: 500,
     description:
       "邮箱域名黑名单(一行一个;边界 suffix 匹配 — rule `foo.com` 自动覆盖 `*.foo.com`;LDC 合成域 users.claudeai.chat 不受此约束)",
+  },
+  phase6_account_uuid_enforce: {
+    kind: "enum",
+    enumValues: ["off", "fail_open", "fail_closed"],
+    description:
+      "Phase 6 account_uuid 锚定执行模式。灰度 off → fail_open(hook 重写非 null)→ fail_closed(scheduler 过滤 NULL 候选)",
+  },
+  session_pin_mode: {
+    kind: "enum",
+    enumValues: ["off", "observe", "enforce"],
+    description:
+      "csap chat_session_account_pin 三态调度。灰度 off → observe(只观测打点)→ enforce(锁 sticky;409 让客户端 x-force-repin 重试)",
   },
 };
 

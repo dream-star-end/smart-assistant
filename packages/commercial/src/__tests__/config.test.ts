@@ -151,4 +151,19 @@ describe("config.loadConfig", () => {
       );
     }
   });
+
+  // v1.0.207 release 契约:`PHASE6_ACCOUNT_UUID_ENFORCE` 和 `SESSION_PIN_MODE`
+  // 已从 commercialConfigSchema 删除,迁到 system_settings 表(admin UI 立即可改)。
+  // commercial.env 中残留这两行不能让启动崩 — z.object 默认 strip 模式应自动丢弃。
+  // 即使值是 "bad-leftover" 这种非法 enum 也不应触发 ConfigError。
+  test("deprecated SESSION_PIN_MODE / PHASE6_ACCOUNT_UUID_ENFORCE env leftovers are silently dropped (v1.0.207)", () => {
+    const cfg = loadConfig({
+      ...VALID_ENV,
+      SESSION_PIN_MODE: "bad-leftover-value",
+      PHASE6_ACCOUNT_UUID_ENFORCE: "another-bad-value",
+    });
+    // 字段必须不存在(zod strip),production 代码也不应再读 cfg.SESSION_PIN_MODE
+    assert.equal("SESSION_PIN_MODE" in cfg, false);
+    assert.equal("PHASE6_ACCOUNT_UUID_ENFORCE" in cfg, false);
+  });
 });

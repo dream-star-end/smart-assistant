@@ -430,13 +430,13 @@ export function makeAnthropicProxyHandler(
           refreshDeps: deps.refreshDeps,
           deepseekApiKey: deps.deepseekApiKey,
           upstreamEndpoint: deps.upstreamEndpoint,
-          // Phase 6 account_uuid 锚定 flag(plan §3.0)— 由 ProxyHandlerDeps 注入,
-          // wiring 一次性从 config 读;pickUpstream 内部把同值传给 scheduler.pick
-          // 和 makeOAuthPoolUpstream(plan §5.5.4 防热改竞态)。
-          phase6AccountUuidEnforce: deps.phase6AccountUuidEnforce,
-          // v3 反关联根治 — session pin 三态(off/observe/enforce)。wiring 一次性
-          // 从 config 读,pickUpstream 内部透传给 scheduler.pick;userId 一并下传。
-          sessionPinMode: deps.sessionPinMode,
+          // Phase 6 account_uuid 锚定 flag(plan §3.0)— v1.0.207 起从 system_settings
+          // 表读取的 getter,handler 透传给 pickUpstream;入口 await 一次冻结到
+          // 局部常量,scheduler.pick 与 hook 同值消费(plan §5.5.4 防热改竞态)。
+          getPhase6AccountUuidEnforce: deps.getPhase6AccountUuidEnforce,
+          // v3 反关联根治 — session pin 三态(off/observe/enforce)同型 getter。
+          // 30s TTL cache,admin UI 改完立即 invalidate 本机进程的 cache。
+          getSessionPinMode: deps.getSessionPinMode,
         },
         body,
         route,

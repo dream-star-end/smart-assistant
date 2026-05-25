@@ -420,36 +420,12 @@ export const commercialConfigSchema = z
      * fp3 + account_uuid,不能解 v3 任何数据。
      */
     PLATFORM_HMAC_SECRET: z.string().trim().min(32).max(256).optional(),
-    /**
-     * Phase 6 account_uuid 锚定执行模式(0070 migration + plan §3.0)。
-     *
-     *   - `off`(默认):applyUpstreamAuth hook 完全早退,builder HMAC 占位透出
-     *     给 Anthropic(Phase 5 行为,deploy 1 默认值,确保上线后 outbound 不变)
-     *   - `fail_open`:hook 重写,但 `pick.account_uuid === null`(回填未跑完)
-     *     时跳过(HMAC 占位透出);scheduler 不过滤候选;回填进行中的过渡态
-     *   - `fail_closed`:scheduler 过滤掉 account_uuid IS NULL 的 active 候选,
-     *     hook 强制重写;池过滤后全空 → AccountPoolUnavailableError("no_uuid")
-     *     → 503 POOL_UNAVAILABLE(复用现有契约);回填完后稳态
-     *
-     * 切换需 systemctl restart openclaude 生效。
-     */
-    PHASE6_ACCOUNT_UUID_ENFORCE: z
-      .enum(["off", "fail_open", "fail_closed"])
-      .default("off"),
-    /**
-     * v3 反关联根治 — session pin 调度三态开关(0072 migration + scheduler.pick PinMode)。
-     *
-     *   - `off`(默认):scheduler 走旧 WRH-only 调度,不读/不写 chat_session_account_pin 表
-     *   - `observe`:WRH 仍主导 pick,同步读 csap 比对一致性,console.log 出
-     *     `evt:'session_pin_observe'` 计数 outcome ∈ {pin_miss, pin_unbound, consistent, divergent}
-     *   - `enforce`:csap pin 命中 sticky;unbound 抛 SessionPinUnboundError(409)
-     *     让客户端透明 x-force-repin:1 重试;pin miss 走"既往足迹优先"+ race-safe INSERT
-     *
-     * 切换需 systemctl restart openclaude 生效。
-     */
-    SESSION_PIN_MODE: z
-      .enum(["off", "observe", "enforce"])
-      .default("off"),
+    // v1.0.207:`PHASE6_ACCOUNT_UUID_ENFORCE` 和 `SESSION_PIN_MODE` 这两个灰度型
+    // feature flag 已迁到 `system_settings` 表(admin UI 立即可改,无需 systemctl
+    // restart),具体见 `admin/runtimeFlags.ts` 和 `admin/systemSettings.ts` 的
+    // `phase6_account_uuid_enforce` / `session_pin_mode` key。commercial.env 中
+    // 残留这两行环境变量不影响启动(z.object 默认 strip,未声明字段被丢弃),但
+    // 建议清理避免误导。
     /**
      * GitHub OAuth App 配置(GitHub OAuth 关联功能)。
      * 全部 optional — 缺失时 /api/auth/github/* 返 503,启动不阻断。

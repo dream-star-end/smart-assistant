@@ -225,18 +225,20 @@ export interface PickUpstreamDeps {
    */
   refreshAccountTokenImpl?: typeof refreshAccountToken;
   /**
-   * Phase 6 H6 — `PHASE6_ACCOUNT_UUID_ENFORCE` 透传值。
+   * Phase 6 H6 — `phase6_account_uuid_enforce` 运行时 getter(v1.0.207 起从
+   * `system_settings` 表读取,30s TTL cache,admin UI 立即可改)。
    *   - `off`(默认):applyUpstreamAuth account_uuid 分支早退,builder HMAC 占位透出
    *   - `fail_open`:hook 重写非 null;null 时跳过(HMAC 占位)
    *   - `fail_closed`:hook 强制重写;scheduler 已过滤掉 null 候选,理论上不到 null 分支
    *
-   * 由 wiring 一次性读 `config.PHASE6_ACCOUNT_UUID_ENFORCE` 注入 — pickUpstream
-   * 内部把同值转 boolean 给 scheduler.pick({...,enforceAccountUuid}) 和闭包给
-   * makeOAuthPoolUpstream,避免热改时两处读不一致(plan §5.5.4)。
+   * pickUpstream 入口 `await` 一次后冻结到局部常量 — scheduler.pick({...,enforceAccountUuid})
+   * 和闭包给 makeOAuthPoolUpstream 同值消费,避免运行期 admin 切换时两处读不一致
+   * (plan §5.5.4 race guard 仍生效)。
    */
-  phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
+  getPhase6AccountUuidEnforce?: () => Promise<"off" | "fail_open" | "fail_closed">;
   /**
-   * v3 反关联根治 — chat_session_account_pin 三态执行模式。
+   * v3 反关联根治 — chat_session_account_pin 三态执行模式的运行时 getter
+   * (v1.0.207 起从 system_settings 读取,30s TTL cache)。
    *
    * `off`(默认):scheduler 走旧 WRH-only 路径,不查/不写 csap。
    * `observe`:    跑 WRH + 对比 pin 是否一致,打点日志,**不**写 csap。
@@ -246,7 +248,7 @@ export interface PickUpstreamDeps {
    * 灰度路线见 SessionPinMode 注释。observe/enforce 需要 caller 同时透传 userId,
    * 否则 scheduler 内部降级 off + warn。
    */
-  sessionPinMode?: SessionPinMode;
+  getSessionPinMode?: () => Promise<SessionPinMode>;
 }
 
 type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
@@ -426,19 +428,19 @@ export async function pickUpstream(
   log: Logger,
   /**
    * v3 反关联根治 — 已认证用户 id。csap pin 强制锚定到 (userId, sessionId);
-   * deps.sessionPinMode='off' 时调用方可省略,但建议**始终传**(灰度切到 observe 不需要
-   * 改 handler)。route='deepseek' 路径完全不消费 — 透传 undefined 安全。
+   * runtime flag `session_pin_mode='off'` 时调用方可省略,但建议**始终传**(灰度切到
+   * observe 不需要改 handler)。route='deepseek' 路径完全不消费 — 透传 undefined 安全。
    */
   userId?: bigint,
   /**
    * v3 反关联根治 UX 闭环 — 客户端"强制 repin"信号(来自 HTTP 头 `x-force-repin: 1`)。
    *
-   * 仅在 sessionPinMode='enforce' 路径有意义:
+   * 仅在 runtime flag `session_pin_mode='enforce'` 路径有意义:
    *   - true → 跳过 prelude unbound 检查,允许 scheduler 在同 session 上覆盖原 unbound pin
    *     直接选新账号,无需用户走"开新会话"路径(保留对话历史)。
    *   - false / 未传 → 走正常 prelude(unbound → 抛 SessionPinUnboundError 让客户端决策)。
    *
-   * deepseek / non-OAuth / pinMode != 'enforce' 路径透传也安全(scheduler 静默忽略)。
+   * deepseek / non-OAuth / `session_pin_mode != 'enforce'` 路径透传也安全(scheduler 静默忽略)。
    */
   forceRepin?: boolean,
 ): Promise<
@@ -451,11 +453,15 @@ export async function pickUpstream(
     return { ok: true, session: makeDeepSeekUpstream(deps.deepseekApiKey ?? "") };
   }
 
-  // Phase 6 flag 在 OAuth 路径开头读一次,scheduler.pick + makeOAuthPoolUpstream
-  // 同值传入,避免热改时两处读不一致(plan §5.5.4)。默认 "off" — 缺 wiring 时
-  // 兜底是 Phase 5 行为,outbound 不变。
-  const phase6Enforce: Phase6AccountUuidEnforce = deps.phase6AccountUuidEnforce ?? "off";
-  const sessionPinMode: SessionPinMode = deps.sessionPinMode ?? "off";
+  // Phase 6 flag 在 OAuth 路径开头 await 一次,scheduler.pick + makeOAuthPoolUpstream
+  // 同值传入,避免热改时两处读不一致(plan §5.5.4)。默认 "off" — getter 未注入
+  // 或 cache miss 后 DB row 缺失时,getSystemSetting 内部已兜底 DEFAULTS["off"]。
+  // v1.0.207:从 env-only 迁移到 system_settings 后,这两次 await 是 30s TTL cache
+  // hit 同步路径(<1ms),cache miss 1-2ms DB,可接受。
+  const phase6Enforce: Phase6AccountUuidEnforce =
+    (await deps.getPhase6AccountUuidEnforce?.()) ?? "off";
+  const sessionPinMode: SessionPinMode =
+    (await deps.getSessionPinMode?.()) ?? "off";
 
   // OAuth path —— scheduler.pick
   let pick: PickResult;

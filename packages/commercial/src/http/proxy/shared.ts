@@ -1111,28 +1111,30 @@ export interface AnthropicProxyDeps {
    */
   platformServerSecret?: Buffer | string;
   /**
-   * Phase 6 — `account_uuid` 锚定执行模式(0070 migration + plan §3.0)。
+   * Phase 6 — `account_uuid` 锚定执行模式(0070 migration + plan §3.0)的运行时 getter。
    *
    *   - `off`(默认):applyUpstreamAuth hook 完全早退,builder HMAC 占位透出
    *     (Phase 5 行为,deploy 1 默认值)
    *   - `fail_open`:hook 重写;pick.account_uuid 为 null(回填未跑完)时跳过
    *   - `fail_closed`:scheduler 过滤掉 null 候选 + hook 强制重写;池空 → 503
    *
-   * wiring 一次性从 `loadConfig().PHASE6_ACCOUNT_UUID_ENFORCE` 注入,handler 内部
-   * 透传到 pickUpstream,见 plan §5.5.4(防止热改时 scheduler/hook 读不一致)。
+   * v1.0.207 起 wiring 从 `system_settings.phase6_account_uuid_enforce` 读取(admin UI
+   * 立即可改),通过 `admin/runtimeFlags.ts` 的 30s TTL cache 包装。pickUpstream 入口
+   * await 一次后冻结到局部常量,scheduler.pick 与 hook 闭包同值消费,保留 plan §5.5.4
+   * 的竞态防护设计。getter 为 undefined → pickUpstream 兜底 "off"。
    */
-  phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
+  getPhase6AccountUuidEnforce?: () => Promise<"off" | "fail_open" | "fail_closed">;
   /**
-   * v3 反关联根治 — chat_session_account_pin 三态执行模式。
+   * v3 反关联根治 — chat_session_account_pin 三态执行模式的运行时 getter。
    *
    *   - `off`(默认):scheduler 走旧 WRH 路径,不查/不写 csap
    *   - `observe`:    跑 WRH + 观察 pin 一致性打点(metric `session_pin_observe`),不写 csap
    *   - `enforce`:    pin 命中 sticky;pin unbound 抛 409;pin miss 走"既往足迹优先"+ race-safe INSERT
    *
-   * wiring 一次性从 `loadConfig().SESSION_PIN_MODE` 注入,handler 透传给 pickUpstream → scheduler.pick。
-   * 灰度路线 off → observe(收集 metric)→ enforce。
+   * v1.0.207 起从 `system_settings.session_pin_mode` 读取(admin UI 立即可改),
+   * 30s TTL cache。灰度路线 off → observe(收集 metric)→ enforce。
    */
-  sessionPinMode?: import("../../account-pool/scheduler.js").SessionPinMode;
+  getSessionPinMode?: () => Promise<import("../../account-pool/scheduler.js").SessionPinMode>;
 }
 
 /**
