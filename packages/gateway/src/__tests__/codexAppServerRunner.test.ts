@@ -307,6 +307,305 @@ describe('handleNotification — item/agentMessage/delta', () => {
   })
 })
 
+// Reasoning streaming: codex emits either `textDelta` (raw chain-of-thought)
+// or `summaryTextDelta` (model-distilled summary) depending on the reasoning
+// mode. Both are surfaced to the UI as CCB `thinking_delta` so the frontend
+// renders a 💭 thinking card — same surface claude-code uses. `summaryPartAdded`
+// inserts a paragraph separator (`\n\n`) between named summary sections.
+describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surface)', () => {
+  it('item/reasoning/textDelta emits content_block_delta thinking_delta', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'Thinking…' },
+    })
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'stream_event')
+    assert.equal(h.messages[0].event.type, 'content_block_delta')
+    assert.equal(h.messages[0].event.delta.type, 'thinking_delta')
+    assert.equal(h.messages[0].event.delta.thinking, 'Thinking…')
+    await h.cleanup()
+  })
+
+  it('item/reasoning/summaryTextDelta also maps to thinking_delta', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'Summary part…' },
+    })
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].event.delta.type, 'thinking_delta')
+    assert.equal(h.messages[0].event.delta.thinking, 'Summary part…')
+    await h.cleanup()
+  })
+
+  it('item/reasoning/summaryPartAdded between filled parts emits \\n\\n separator', async () => {
+    // First part: no-op (see CONCERN #2 test below). Add content, then a
+    // second part — only the second emits the paragraph separator.
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryPartAdded',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', part: { name: 'p1' } },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'first' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryPartAdded',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', part: { name: 'p2' } },
+    })
+    // Expect: first, \n\n — initial summaryPartAdded suppressed.
+    assert.equal(h.messages.length, 2)
+    assert.equal(h.messages[1].event.delta.type, 'thinking_delta')
+    assert.equal(h.messages[1].event.delta.thinking, '\n\n')
+    await h.cleanup()
+  })
+
+  it('reasoning delta does NOT accumulate into currentAssistantBuf (it is thinking, not text)', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'XYZ' },
+    })
+    assert.equal((h.runner as any).currentAssistantBuf, '')
+    await h.cleanup()
+  })
+
+  it('empty reasoning delta string is a no-op', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: '' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: '' },
+    })
+    assert.equal(h.messages.length, 0)
+    await h.cleanup()
+  })
+
+  it('reasoning delta drops on turnId mismatch (same guard as agentMessage/delta)', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-mine'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-other', itemId: 'r-1', delta: 'oops' },
+    })
+    assert.equal(h.messages.length, 0)
+    await h.cleanup()
+  })
+
+  it('summary mode locks: textDelta after summaryTextDelta is dropped (codex review CONCERN #1)', async () => {
+    // If codex emits both raw text and summary for the same reasoning item,
+    // we surface only the summary — splicing raw chain-of-thought into the
+    // distilled summary would corrupt the rendered thinking card.
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'distilled' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'raw-cot' },
+    })
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].event.delta.thinking, 'distilled')
+    await h.cleanup()
+  })
+
+  it('textDelta-only items still surface when summary never arrives (non-reasoning model fallback)', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'raw1' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'raw2' },
+    })
+    assert.equal(h.messages.length, 2)
+    assert.equal(h.messages[0].event.delta.thinking, 'raw1')
+    assert.equal(h.messages[1].event.delta.thinking, 'raw2')
+    await h.cleanup()
+  })
+
+  it('summary mode is per-itemId (different reasoning items track independently)', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    // Item A: summary mode.
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-A', delta: 'A-sum' },
+    })
+    // Item B: text mode (different itemId — should NOT be locked by A).
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-B', delta: 'B-raw' },
+    })
+    assert.equal(h.messages.length, 2)
+    assert.equal(h.messages[0].event.delta.thinking, 'A-sum')
+    assert.equal(h.messages[1].event.delta.thinking, 'B-raw')
+    await h.cleanup()
+  })
+
+  it('summaryPartAdded first event for an item is a no-op (codex review CONCERN #2)', async () => {
+    // The first summaryPartAdded is the start of part 1 — emitting \n\n
+    // there would prepend a blank line / surface an empty thinking card
+    // before any real content. Skip the first; only insert separators
+    // BETWEEN parts (i.e. after content has been seen).
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryPartAdded',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', part: { name: 'first' } },
+    })
+    assert.equal(h.messages.length, 0)
+    // Now content + a second part — second one DOES emit separator.
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'p1' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryPartAdded',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', part: { name: 'second' } },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'p2' },
+    })
+    // Expect: p1, \n\n, p2 — three emits, no leading separator.
+    assert.equal(h.messages.length, 3)
+    assert.equal(h.messages[0].event.delta.thinking, 'p1')
+    assert.equal(h.messages[1].event.delta.thinking, '\n\n')
+    assert.equal(h.messages[2].event.delta.thinking, 'p2')
+    await h.cleanup()
+  })
+
+  it('summaryPartAdded first-call locks mode to summary even before content arrives', async () => {
+    // First summaryPartAdded (no \n\n emit) must still flip the item into
+    // summary mode so a subsequent stray textDelta is suppressed.
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryPartAdded',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', part: { name: 'first' } },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'should-be-dropped' },
+    })
+    assert.equal(h.messages.length, 0)
+    await h.cleanup()
+  })
+
+  it('text mode locks: summaryTextDelta after textDelta is dropped (codex review v2 — symmetric lock)', async () => {
+    // v1 only blocked summary→text. v2 review caught that text→summary
+    // would still splice (raw CoT + distilled summary concatenation).
+    // Verifies the symmetric direction: once text is locked, summary is
+    // dropped just like the other way around.
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'raw-cot' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'late-summary' },
+    })
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].event.delta.thinking, 'raw-cot')
+    await h.cleanup()
+  })
+
+  it('text mode drops summaryPartAdded entirely (codex review v2 — orphan \\n\\n guard)', async () => {
+    // If the item already streamed raw textDelta(s), a stray
+    // summaryPartAdded must NOT inject \n\n — there's no second part
+    // coming (the matching summaryTextDelta would also be dropped by the
+    // symmetric mode lock), so the separator would be a noise paragraph
+    // break wedged between text deltas.
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-r'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'raw1' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryPartAdded',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', part: { name: 'stray' } },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'raw2' },
+    })
+    // Expect only raw1, raw2 — no \n\n between them.
+    assert.equal(h.messages.length, 2)
+    assert.equal(h.messages[0].event.delta.thinking, 'raw1')
+    assert.equal(h.messages[1].event.delta.thinking, 'raw2')
+    await h.cleanup()
+  })
+
+  it('interleaved reasoning + agentMessage emit in order (no buffering)', async () => {
+    // Drives the UI's flush-before-null invariant: gateway must emit each
+    // delta in the order codex sent it, so the websocket layer can stamp
+    // completedAt + drain `_streamingThinking` before swapping to a fresh
+    // `_streamingAssistant` row.
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-mix'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/summaryTextDelta',
+      params: { threadId: 'thr-1', turnId: 't-mix', itemId: 'r-1', delta: 'thinking' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thr-1', turnId: 't-mix', itemId: 'a-1', delta: 'answer' },
+    })
+    assert.equal(h.messages.length, 2)
+    assert.equal(h.messages[0].event.delta.type, 'thinking_delta')
+    assert.equal(h.messages[0].event.delta.thinking, 'thinking')
+    assert.equal(h.messages[1].event.delta.type, 'text_delta')
+    assert.equal(h.messages[1].event.delta.text, 'answer')
+    await h.cleanup()
+  })
+})
+
 describe('handleNotification — item/completed', () => {
   it('commandExecution → tool_result with exit code 0 (no error)', async () => {
     const h = await makeHarness()

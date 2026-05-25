@@ -1543,3 +1543,213 @@ describe('T10: Function extractor sanity checks', () => {
     assert.throws(() => extractFunction(appJs, 'nonExistentFunction9999'), /not found/)
   })
 })
+
+// ── T11: Codex tool-card UI unification (label / mcp unwrap / plan summary / collab summary) ──
+//
+// These guard the v3 codex-ui-unify pass: codex `mcpToolCall` / `dynamicToolCall`
+// must unwrap to the same icon+label as native MCP calls, `plan` summary must
+// align with TodoWrite's `done/total` format, `collabAgentToolCall` summary
+// must match delegate_task's `→ agent goal` format, and the static
+// _CODEX_TYPE_META labels must not carry the "Codex" prefix anymore.
+describe('T11: Codex tool-card UI unification', () => {
+  // _codexResolveMcpCall is fully self-contained — extract + callable directly.
+  const _codexResolveMcpCall = makeCallable<(input: unknown) => {
+    server: string
+    tool: string
+    args: Record<string, unknown>
+    rawArgs: unknown
+  }>(extractFunction(appJs, '_codexResolveMcpCall'))
+
+  // _codexRawArgsDisplay is also self-contained — pure function over `unknown`.
+  const _codexRawArgsDisplay = makeCallable<(rawArgs: unknown) => string>(
+    extractFunction(appJs, '_codexRawArgsDisplay'),
+  )
+
+  // _codexSummary references _codexResolveMcpCall + _parseMcpName + _humanizeOp +
+  // _mcpSummary + _toolSummary + _shortPath + _parseCodexTypeName + _TOOL_ICONS.
+  // Build a sandbox so callable can resolve all of them.
+  const _parseMcpNameSrc = extractFunction(appJs, '_parseMcpName')
+  const _humanizeOpSrc = extractFunction(appJs, '_humanizeOp')
+  const _shortPathSrc = extractFunction(appJs, '_shortPath')
+  const _parseCodexTypeNameSrc = extractFunction(appJs, '_parseCodexTypeName')
+  const _toolSummarySrc = extractFunction(appJs, '_toolSummary')
+  const _mcpSummarySrc = extractFunction(appJs, '_mcpSummary')
+  const _codexResolveMcpCallSrc = extractFunction(appJs, '_codexResolveMcpCall')
+  const _codexSummarySrc = extractFunction(appJs, '_codexSummary')
+  const _codexSummary = new Function(
+    `const _TOOL_ICONS = { Bash: 1, Read: 1, Edit: 1, Write: 1, Grep: 1, Glob: 1, WebFetch: 1, WebSearch: 1, TodoWrite: 1 };
+     ${_parseMcpNameSrc}
+     ${_humanizeOpSrc}
+     ${_shortPathSrc}
+     ${_parseCodexTypeNameSrc}
+     ${_codexResolveMcpCallSrc}
+     ${_toolSummarySrc}
+     ${_mcpSummarySrc}
+     ${_codexSummarySrc}
+     return _codexSummary;`,
+  )() as (codexType: string, input: unknown) => string
+
+  it('_codexResolveMcpCall accepts {server, tool, arguments} canonical shape', () => {
+    const r = _codexResolveMcpCall({
+      server: 'browser',
+      tool: 'browser_navigate',
+      arguments: { url: 'https://x.com' },
+    })
+    assert.equal(r.server, 'browser')
+    assert.equal(r.tool, 'browser_navigate')
+    assert.deepEqual(r.args, { url: 'https://x.com' })
+  })
+
+  it('_codexResolveMcpCall falls back to {serverName, toolName, args}', () => {
+    const r = _codexResolveMcpCall({
+      serverName: 'minimax-media',
+      toolName: 'text_to_image',
+      args: { prompt: 'a cat' },
+    })
+    assert.equal(r.server, 'minimax-media')
+    assert.equal(r.tool, 'text_to_image')
+    assert.deepEqual(r.args, { prompt: 'a cat' })
+  })
+
+  it('_codexResolveMcpCall accepts {name, params} fallback', () => {
+    const r = _codexResolveMcpCall({ name: 'browser_click', params: { ref: 'btn1' } })
+    assert.equal(r.tool, 'browser_click')
+    assert.deepEqual(r.args, { ref: 'btn1' })
+  })
+
+  it('_codexResolveMcpCall parses stringified-JSON args', () => {
+    const r = _codexResolveMcpCall({
+      server: 'memory',
+      tool: 'memory',
+      arguments: JSON.stringify({ op: 'read', section: 'user' }),
+    })
+    assert.deepEqual(r.args, { op: 'read', section: 'user' })
+  })
+
+  it('_codexResolveMcpCall ignores array/invalid args, returns {}', () => {
+    assert.deepEqual(_codexResolveMcpCall({ arguments: [1, 2, 3] }).args, {})
+    assert.deepEqual(_codexResolveMcpCall({ arguments: 'not json' }).args, {})
+    assert.deepEqual(_codexResolveMcpCall(null).args, {})
+    assert.deepEqual(_codexResolveMcpCall(undefined).args, {})
+  })
+
+  it('_codexResolveMcpCall surfaces rawArgs for unknown-tool fallback (codex review CONCERN #3)', () => {
+    // Free-form text command: args coerces to {} but rawArgs preserves the
+    // original string so the UI can still show what codex tried to call.
+    const r1 = _codexResolveMcpCall({ tool: 'custom_cli', arguments: 'rm -rf /tmp/x' })
+    assert.deepEqual(r1.args, {})
+    assert.equal(r1.rawArgs, 'rm -rf /tmp/x')
+    // Object args: rawArgs equals args (the original reference).
+    const r2 = _codexResolveMcpCall({ tool: 'custom_cli', args: { foo: 1 } })
+    assert.deepEqual(r2.args, { foo: 1 })
+    assert.deepEqual(r2.rawArgs, { foo: 1 })
+    // Array args: args is {} (rejected by dict check), rawArgs is the array.
+    const r3 = _codexResolveMcpCall({ tool: 'custom_cli', arguments: [1, 2, 3] })
+    assert.deepEqual(r3.args, {})
+    assert.deepEqual(r3.rawArgs, [1, 2, 3])
+    // Null input → undefined rawArgs.
+    assert.equal(_codexResolveMcpCall(null).rawArgs, undefined)
+  })
+
+  it('_codexRawArgsDisplay normalises non-dict rawArgs to a printable string (codex review v3)', () => {
+    // String: pass-through.
+    assert.equal(_codexRawArgsDisplay('rm -rf /tmp/x'), 'rm -rf /tmp/x')
+    // Array: JSON.stringify so user sees the structure (was empty card before).
+    assert.equal(_codexRawArgsDisplay([1, 2, 3]), '[1,2,3]')
+    // Empty array / null / undefined / empty string → falsy (caller collapses).
+    assert.equal(_codexRawArgsDisplay([]), '')
+    assert.equal(_codexRawArgsDisplay(null), '')
+    assert.equal(_codexRawArgsDisplay(undefined), '')
+    assert.equal(_codexRawArgsDisplay(''), '')
+    // Primitive coerced via String().
+    assert.equal(_codexRawArgsDisplay(42), '42')
+    assert.equal(_codexRawArgsDisplay(true), 'true')
+    // Non-plain object (best-effort stringify; resolver would have grabbed
+    // plain dicts into `args` so this branch only sees Date/Map/instances).
+    assert.equal(_codexRawArgsDisplay(new Date(0)), JSON.stringify(new Date(0)))
+  })
+
+  it('_codexSummary plan returns done/total (TodoWrite-aligned format)', () => {
+    const s = _codexSummary('plan', {
+      steps: [
+        { status: 'completed' },
+        { status: 'pending' },
+        { status: 'completed' },
+      ],
+    })
+    assert.equal(s, '2/3')
+  })
+
+  it('_codexSummary plan returns 0/N for all-pending', () => {
+    const s = _codexSummary('plan', {
+      steps: [{ status: 'pending' }, { status: 'pending' }],
+    })
+    assert.equal(s, '0/2')
+  })
+
+  it('_codexSummary plan returns empty string when no steps', () => {
+    assert.equal(_codexSummary('plan', { steps: [] }), '')
+    assert.equal(_codexSummary('plan', {}), '')
+  })
+
+  it('_codexSummary mcpToolCall delegates to native MCP summary', () => {
+    // browser:browser_navigate → URL
+    const s1 = _codexSummary('mcpToolCall', {
+      server: 'browser',
+      tool: 'browser_navigate',
+      arguments: { url: 'https://example.com' },
+    })
+    assert.equal(s1, 'https://example.com')
+    // minimax-vision:web_search → query
+    const s2 = _codexSummary('mcpToolCall', {
+      server: 'minimax-vision',
+      tool: 'web_search',
+      arguments: { query: 'codex reasoning' },
+    })
+    assert.equal(s2, 'codex reasoning')
+  })
+
+  it('_codexSummary dynamicToolCall unwraps builtin tool (Bash)', () => {
+    const s = _codexSummary('dynamicToolCall', {
+      tool: 'Bash',
+      args: { command: 'ls -la', description: 'list files' },
+    })
+    assert.equal(s, 'list files')
+  })
+
+  it('_codexSummary dynamicToolCall unwraps mcp__server__op format', () => {
+    const s = _codexSummary('dynamicToolCall', {
+      tool: 'mcp__browser__browser_navigate',
+      args: { url: 'https://a.example' },
+    })
+    assert.equal(s, 'https://a.example')
+  })
+
+  it('_codexSummary collabAgentToolCall renders → agent goal (delegate_task aligned)', () => {
+    const s = _codexSummary('collabAgentToolCall', {
+      agentId: 'minimax2.7',
+      goal: '帮我审查这段代码',
+    })
+    assert.equal(s, '→ minimax2.7 帮我审查这段代码')
+  })
+
+  it('_codexSummary webSearch returns query', () => {
+    assert.equal(_codexSummary('webSearch', { query: 'foo bar' }), 'foo bar')
+  })
+
+  it('_CODEX_TYPE_META labels no longer carry "Codex" prefix (label-unification invariant)', () => {
+    // Contract check: codex tool-card labels must align with claude-code's
+    // tool vocabulary (no `Codex 任务列表`, just `任务列表`). Regex pulls the
+    // const definition out of the joined module source.
+    const m = appJs.match(/const\s+_CODEX_TYPE_META\s*=\s*\{([\s\S]*?)\n\}/)
+    assert.ok(m, '_CODEX_TYPE_META declaration not found')
+    const body = m![1]
+    // The whole table should be free of literal "Codex " label prefixes.
+    // (Codex 审查 / Codex 回复 belong to _MCP_OP_META, which is a separate table.)
+    const offenders = body.match(/label:\s*['"]Codex\s/g)
+    assert.equal(offenders, null, `_CODEX_TYPE_META still has Codex-prefixed labels: ${offenders?.join(', ')}`)
+    // Spot-check: plan/webSearch labels must be the native ones.
+    assert.match(body, /plan:\s*\{[^}]*label:\s*['"]任务列表['"]/, 'plan label must be 任务列表')
+    assert.match(body, /webSearch:\s*\{[^}]*label:\s*['"]网页搜索['"]/, 'webSearch label must be 网页搜索')
+  })
+})
