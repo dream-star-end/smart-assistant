@@ -499,7 +499,7 @@ interface HarnessOpts {
    * 区别于 (7.5) fail-closed 用例的"漏注 deps"路径。
    */
   platformCtx?: import("../platform/volumeContextReader.js").PlatformContext | null;
-  /** Phase 6 H6:透传到 makeAnthropicProxyHandler 的 phase6AccountUuidEnforce(默认 undefined → off)。 */
+  /** Phase 6 H6:透传到 makeAnthropicProxyHandler 的 getPhase6AccountUuidEnforce(默认 undefined → off)。 */
   phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
   /** Phase 6 H6:fake scheduler 返回的 account_uuid(默认 null)。 */
   schedulerAccountUuid?: string | null;
@@ -570,7 +570,10 @@ function buildHarness(opts: HarnessOpts = {}) {
           invalidate: () => {},
         },
         platformServerSecret: "test-platform-hmac-secret-32char",
-        phase6AccountUuidEnforce: opts.phase6AccountUuidEnforce,
+        getPhase6AccountUuidEnforce:
+          opts.phase6AccountUuidEnforce === undefined
+            ? undefined
+            : async () => opts.phase6AccountUuidEnforce!,
       });
 
   // 极简 CommercialHttpDeps — 只装与 Phase 3 adapter 相关的字段。其它都标 undefined,

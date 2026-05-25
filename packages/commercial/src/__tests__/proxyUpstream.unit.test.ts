@@ -991,7 +991,7 @@ describe("pickUpstream — phase6 enforce 透传到 scheduler.pick", () => {
     const res = await pickUpstream(
       {
         scheduler: sched,
-        phase6AccountUuidEnforce: "fail_closed",
+        getPhase6AccountUuidEnforce: async () => "fail_closed",
       },
       bodyFor("claude-sonnet-4-6"),
       { kind: "oauth" },
@@ -1013,7 +1013,7 @@ describe("pickUpstream — phase6 enforce 透传到 scheduler.pick", () => {
     const res = await pickUpstream(
       {
         scheduler: sched,
-        phase6AccountUuidEnforce: "fail_open",
+        getPhase6AccountUuidEnforce: async () => "fail_open",
       },
       bodyFor("claude-sonnet-4-6"),
       { kind: "oauth" },
@@ -1057,7 +1057,7 @@ describe("pickUpstream — phase6 enforce 透传到 scheduler.pick", () => {
     const res = await pickUpstream(
       {
         scheduler: sched,
-        phase6AccountUuidEnforce: "fail_closed",
+        getPhase6AccountUuidEnforce: async () => "fail_closed",
       },
       bodyFor("claude-sonnet-4-6"),
       { kind: "oauth" },
@@ -1096,7 +1096,7 @@ describe("pickUpstream — phase6 enforce 透传到 scheduler.pick", () => {
     const res = await pickUpstream(
       {
         scheduler: sched,
-        phase6AccountUuidEnforce: "fail_closed",
+        getPhase6AccountUuidEnforce: async () => "fail_closed",
       },
       bodyFor("claude-sonnet-4-6"),
       { kind: "oauth" },
@@ -1125,7 +1125,7 @@ describe("pickUpstream — phase6 enforce 透传到 scheduler.pick", () => {
     const res = await pickUpstream(
       {
         scheduler: sched.scheduler,
-        phase6AccountUuidEnforce: "fail_open",
+        getPhase6AccountUuidEnforce: async () => "fail_open",
       },
       bodyFor("claude-sonnet-4-6"),
       { kind: "oauth" },
@@ -1150,7 +1150,7 @@ describe("applyUpstreamAuth — phase6 account_uuid 三态分支", () => {
     const res = await pickUpstream(
       {
         scheduler: sched.scheduler,
-        phase6AccountUuidEnforce: opts.phase6Enforce,
+        getPhase6AccountUuidEnforce: async () => opts.phase6Enforce,
       },
       bodyFor("claude-sonnet-4-6"),
       { kind: "oauth" },
@@ -1291,7 +1291,7 @@ describe("pickUpstream — H6.D refresh rebind 保留 pick.account_uuid", () => 
         refreshDeps: {} as RefreshDeps,
         refreshAccountTokenImpl,
         getDispatcher: (async () => undefined) as PickUpstreamDeps["getDispatcher"],
-        phase6AccountUuidEnforce: "fail_closed",
+        getPhase6AccountUuidEnforce: async () => "fail_closed",
       },
       bodyFor("claude-sonnet-4-6"),
       { kind: "oauth" },

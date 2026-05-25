@@ -165,6 +165,32 @@ describe("KEY_SCHEMAS — register_email_domain_blocklist", () => {
   });
 });
 
+describe("KEY_SCHEMAS — phase6_account_uuid_enforce / session_pin_mode (v1.0.207 runtime flags)", () => {
+  test("phase6_account_uuid_enforce accepts off/fail_open/fail_closed", () => {
+    const s = KEY_SCHEMAS.phase6_account_uuid_enforce;
+    for (const v of ["off", "fail_open", "fail_closed"]) {
+      assert.ok(s.safeParse(v).success);
+    }
+    assert.equal(s.safeParse("on").success, false);
+    assert.equal(s.safeParse("enforce").success, false);
+    assert.equal(s.safeParse(null).success, false);
+    assert.equal(s.safeParse(1).success, false);
+  });
+  test("session_pin_mode accepts off/observe/enforce", () => {
+    const s = KEY_SCHEMAS.session_pin_mode;
+    for (const v of ["off", "observe", "enforce"]) {
+      assert.ok(s.safeParse(v).success);
+    }
+    assert.equal(s.safeParse("fail_open").success, false);
+    assert.equal(s.safeParse("ENFORCE").success, false);
+    assert.equal(s.safeParse(true).success, false);
+  });
+  test("default values are 'off' (零迁移 — DB row 缺失等同原 env unset)", () => {
+    assert.equal(DEFAULTS.phase6_account_uuid_enforce, "off");
+    assert.equal(DEFAULTS.session_pin_mode, "off");
+  });
+});
+
 describe("Errors", () => {
   test("SystemSettingNotFoundError carries name + message", () => {
     const e = new SystemSettingNotFoundError("foo");

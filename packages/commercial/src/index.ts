@@ -34,6 +34,10 @@ import { secretToKey } from "./auth/jwt.js";
 import { PricingCache, createModelHintProvider } from "./billing/pricing.js";
 import { setModelHintProvider, setLiteratureSkillProvider } from "@openclaude/gateway";
 import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
+import {
+  getPhase6AccountUuidEnforce,
+  getSessionPinMode,
+} from "./admin/runtimeFlags.js";
 import { renderLiteratureSkillContent } from "./literatureSkill.js";
 import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
@@ -920,14 +924,13 @@ export async function registerCommercial(
         // 2026-05-02 deepseek 接入:cfg 在外层闭包已 loadConfig() 过(line 379),
         // 这里直接读取。未配置 → undefined → proxy 命中 deepseek 模型时 503。
         deepseekApiKey: cfg.DEEPSEEK_API_KEY,
-        // Phase 6 — account_uuid 锚定执行模式(0070 plan §3.0)。
-        // off(默认)/ fail_open / fail_closed 三态切换走 systemctl restart。
-        phase6AccountUuidEnforce: cfg.PHASE6_ACCOUNT_UUID_ENFORCE,
-        // v3 反关联根治 — session pin 灰度三态(0072+0073+0074)。off(默认)/
-        // observe / enforce 切换走 systemctl restart。下游 pickUpstream →
-        // scheduler.pick 自动消费;deps.sessionPinMode=undefined 时 scheduler 内
-        // ?? 'off' 兜底等价行为,仍向后兼容。
-        sessionPinMode: cfg.SESSION_PIN_MODE,
+        // v1.0.207 起 Phase 6 account_uuid 锚定(plan §3.0)+ csap session pin 三态
+        // (0072+0073+0074),从 env-only 迁到 `system_settings` 表(admin UI 立即可改,
+        // 不需要 systemctl restart)。注入 30s TTL cache 的 getter
+        // (`admin/runtimeFlags.ts`)— pickUpstream 入口 await 一次冻结到局部常量,
+        // scheduler.pick 与 hook 同值消费,保留 plan §5.5.4 竞态防护设计。
+        getPhase6AccountUuidEnforce,
+        getSessionPinMode,
       });
       // 2026-05-05 v3 commercial server-authored persistence — 复用 18791/18443
       // 同一个 listener,新加 POST /internal/v3/server-authored-message。
@@ -1218,10 +1221,10 @@ export async function registerCommercial(
         deepseekApiKey: cfg.DEEPSEEK_API_KEY,
         platformContextLoader,
         platformServerSecret: cfg.PLATFORM_HMAC_SECRET,
-        // Phase 6 — external ApiKey proxy 也走同一个 flag,跟 internal 共用 PickUpstreamDeps。
-        phase6AccountUuidEnforce: cfg.PHASE6_ACCOUNT_UUID_ENFORCE,
-        // v3 反关联根治 — external ApiKey proxy 同型共用 SESSION_PIN_MODE。
-        sessionPinMode: cfg.SESSION_PIN_MODE,
+        // v1.0.207 — external ApiKey proxy 与 internal proxy 共用 runtime flag getter,
+        // 同一个 30s TTL cache(`admin/runtimeFlags.ts`)。
+        getPhase6AccountUuidEnforce,
+        getSessionPinMode,
       });
       // eslint-disable-next-line no-console
       console.log(
