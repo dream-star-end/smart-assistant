@@ -96,16 +96,19 @@ RUN apt-get update \
 # v3 容器复用同一份 codex CLI 二进制,gateway 选到 gpt-5.5 时,sessionManager 通过
 # `runnerKind:'app-server'` 路由到 CodexAppServerRunner,长驻一个 codex app-server 子进程。
 #
-# 版本 pin 0.130.0(2026-05-09 升级,从 0.125 → 0.130):codex 当前最新 stable。
-# 升级原因:同 commit 修了 thread/resume 缺 rollout 的空回复故障(见
-# codexAppServerRunner.ts 自愈逻辑),顺带升版本拿 0.126-0.130 之间的 bug fix。
-# Protocol 兼容性: 已审查 release notes + JSON-RPC schema(涉及 thread/start
-# + thread/resume + turn/start 三个 method,commandExecution / fileChange /
-# imageGeneration / agentMessage / reasoning 五种 item type),0.125 → 0.130
-# 之间未见 breaking change。**真正 e2e 行为验证是发布门槛**: 镜像 build 完
-# 后必须在 dev 环境跑一次 GPT 5.5 真 turn(包含 image_gen 调用,因为本文件
-# 下方的 system-skill seed 段当初是按 0.125 行为写的)再 ship 生产。出现
-# 协议漂移则把版本回滚到 0.125 并重 build。
+# 版本 pin 0.133.0(2026-05-25 升级,从 0.130 → 0.133):codex 当前最新 stable。
+# 升级原因 (1):0.131-0.133 区间含 TurnContextItem trim / MCP tool_call plugin id /
+#                app-server schema 微调等改动(详见 GitHub release page),拿 patch
+#                修拉到最新。(2):同批 ship 前端 todo_list 兼容(packages/web/public/
+#                modules/messages.js,_normalizeCodexPlanInput),解决 0.130 起 plan
+#                item 改名为 todo_list 导致前端"任务列表"卡片空白的问题。
+# Protocol 兼容性: 实测 0.133 仍 emit `{type:'todo_list', items:[{text, completed}]}`
+# 与 0.130 一致 — 前端 normalizer 已同步两种 schema。其他 thread item type
+# (mcpToolCall / webSearch / imageGeneration / commandExecution / fileChange) 字段
+# 增量(如 mcpToolCall.plugin_id)被前端 server/tool/args 三件套自然忽略,不破坏
+# 现有渲染。**真正 e2e 行为验证仍是发布门槛**: 镜像 build 完后必须在 dev 环境
+# 跑一次 GPT 5.5 真 turn(包含 image_gen + plan 调用)再 ship 生产。出现协议
+# 漂移则把版本回滚到 0.130 并重 build。
 #
 # 全局装到 /usr/local/lib/node_modules/@openai/codex,二进制 symlink 在 /usr/local/bin/codex。
 # 容器内 USER=agent 走默认 PATH 即可命中。
@@ -115,7 +118,7 @@ RUN apt-get update \
 # entrypoint.ts 在 CODEX_HOME 下建 symlink auth.json → /run/oc/codex-auth/auth.json,
 # 后者是 supervisor 把 host 剥离 refresh_token 的 auth.json 目录 ro bind-mount 进来的源。
 # 详见 packages/gateway/src/codexAuthSync.ts + v3supervisor.ts 的 V3_CODEX_AUTH_RO_MOUNT。
-RUN npm install -g @openai/codex@0.130.0 --no-audit --no-fund \
+RUN npm install -g @openai/codex@0.133.0 --no-audit --no-fund \
     && npm cache clean --force \
     && rm -rf /root/.npm
 
