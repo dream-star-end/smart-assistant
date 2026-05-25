@@ -98,6 +98,14 @@ export async function openPersonaEditor(agentId) {
     $('persona-permission').value = info.agent.permissionMode || 'default'
     $('persona-cwd').value = info.agent.cwd || ''
     $('persona-toolsets').value = (info.agent.toolsets || []).join(', ')
+    // proxyUrl arrives masked (user:pass → ***). Capture the masked value as
+    // the dirty-tracking baseline so an unchanged field is omitted from the
+    // PUT body — otherwise the redacted display would overwrite the real
+    // credential. The gateway rejects masked values too (defense in depth).
+    const proxyInput = $('persona-proxy-url')
+    const proxyInitial = info.agent.proxyUrl ?? ''
+    proxyInput.value = proxyInitial
+    proxyInput.dataset.initial = proxyInitial
     $('persona-text').value = persona.text || ''
     const delBtn = $('delete-agent-btn')
     delBtn.disabled = agentId === state.defaultAgentId
@@ -115,7 +123,7 @@ export async function openPersonaEditor(agentId) {
     }
     $('save-persona-btn').onclick = async () => {
       try {
-        await apiJson('PUT', `/api/agents/${encodeURIComponent(agentId)}`, {
+        const payload = {
           model: $('persona-model').value.trim(),
           permissionMode: $('persona-permission').value,
           provider: $('persona-provider').value || undefined,
@@ -129,7 +137,16 @@ export async function openPersonaEditor(agentId) {
                 .map((s) => s.trim())
                 .filter(Boolean)
             : undefined,
-        })
+        }
+        // Only include proxyUrl when the operator actually changed it. Sending
+        // the masked initial value back would either no-op (best case) or be
+        // rejected by the gateway's looksRedactedProxyUrl guard (worst case);
+        // either way it's noise. Send empty string explicitly to clear.
+        const proxyInputEl = $('persona-proxy-url')
+        if (proxyInputEl.value !== (proxyInputEl.dataset.initial ?? '')) {
+          payload.proxyUrl = proxyInputEl.value
+        }
+        await apiJson('PUT', `/api/agents/${encodeURIComponent(agentId)}`, payload)
         await apiJson('PUT', `/api/agents/${encodeURIComponent(agentId)}/persona`, {
           text: $('persona-text').value,
         })

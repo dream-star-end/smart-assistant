@@ -142,6 +142,7 @@
             <div class="settings-section-label">系统</div>
             <button class="settings-item" data-settings="theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>切换主题</button>
             <button class="settings-item" data-settings="config"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>查看配置</button>
+            <button class="settings-item" data-settings="proxy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>出站代理</button>
             <button class="settings-item" data-settings="claude-oauth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>OAuth 认证</button>
             <button class="settings-item" data-settings="wechat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/><path d="M21 12a9 9 0 1 0-3.39 7.06l3.06.94-.94-3.06A8.96 8.96 0 0 0 21 12z"/></svg>微信绑定</button>
             <button class="settings-item danger" data-settings="logout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>退出登录</button>
@@ -360,6 +361,11 @@
         <label>工具集</label>
         <input id="persona-toolsets" placeholder="如: research,coding,browser (逗号分隔,留空=全部)" />
       </div>
+      <div class="form-row">
+        <label>出站代理</label>
+        <input id="persona-proxy-url" placeholder="留空=使用全局代理 / 例: http://user:pass@host:port" />
+        <p class="form-hint" style="margin:4px 0 0 0;font-size:var(--text-xs);color:var(--fg-muted)">覆盖全局出站代理;留空 = 使用全局设置。下次会话生效。</p>
+      </div>
       <!-- Persona -->
       <div class="persona-section-label">人格指令</div>
       <div class="form-row">
@@ -371,6 +377,32 @@
       <div style="flex:1"></div>
       <button class="btn btn-ghost" data-close-modal="persona-modal">取消</button>
       <button id="save-persona-btn" class="btn btn-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Global outbound proxy modal -->
+<div id="proxy-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+  <div class="modal" style="max-width:520px">
+    <div class="modal-head">
+      <h3>🌐 全局出站代理</h3>
+      <button class="modal-close" data-close-modal="proxy-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label>代理 URL</label>
+        <input id="proxy-url-input" placeholder="例: http://user:pass@host:port" autocomplete="off" />
+        <p class="form-hint" style="margin:6px 0 0 0;font-size:var(--text-xs);color:var(--fg-muted);line-height:1.5">
+          作用于所有 provider 子进程的出站请求。留空 = 继承 gateway 进程环境(通常是 systemd 设置的 HTTPS_PROXY)。<br>
+          每个 Agent 还可在"编辑 Agent"里单独覆盖此值。改动**下次会话**起生效;codex app-server 等长驻进程要重启才会换。<br>
+          为安全起见,展示时会把 <code>user:pass</code> 显示为 <code>***</code>;要保留原密码请直接关闭对话框,不要按保存。
+        </p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div style="flex:1"></div>
+      <button class="btn btn-ghost" data-close-modal="proxy-modal">取消</button>
+      <button id="save-proxy-btn" class="btn btn-primary">保存</button>
     </div>
   </div>
 </div>
@@ -669,6 +701,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=28"></script>
+<script type="module" src="/modules/main.js?v=29"></script>
 </body>
 </html>

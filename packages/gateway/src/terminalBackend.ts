@@ -9,6 +9,7 @@
  */
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { createLogger } from './logger.js'
+import { PROXY_ENV_KEYS } from './proxyEnv.js'
 
 const backendLog = createLogger({ module: 'terminalBackend' })
 
@@ -57,56 +58,77 @@ export class LocalBackend implements TerminalBackend {
 
 // ── Docker backend ──
 
+/**
+ * Pure docker-run argv builder, extracted from `DockerBackend.spawn` so it
+ * can be unit-tested without monkey-patching `child_process` (whose ESM
+ * exports are read-only). Mirrors the codebase convention of `buildCcbCliArgs`
+ * and `buildCodexEnv`.
+ *
+ * Load-bearing invariant: proxy keys are forwarded as `-e KEY` (no value) so
+ * the `user:pass` credential never appears in `docker run` argv (and hence
+ * `ps` / `/proc/PID/cmdline`). Docker reads the value from its own env (set
+ * via the `env:` field of the subsequent spawn call).
+ */
+export function buildDockerArgs(config: TerminalBackendConfig, opts: SpawnOpts): string[] {
+  const dockerArgs = ['run', '--rm', '-i']
+
+  // Working directory: mount CCB install path so the binary can run
+  dockerArgs.push('-v', `${opts.cwd}:/opt/ccb`)
+  // Mount agent working directory as /workspace (the real project dir)
+  const agentDir = opts.agentCwd || opts.cwd
+  dockerArgs.push('-v', `${agentDir}:/workspace`)
+  dockerArgs.push('-w', '/workspace')
+
+  // Extra volumes from config
+  if (config.volumes) {
+    for (const v of config.volumes) dockerArgs.push('-v', v)
+  }
+
+  // Environment variables
+  // Proxy keys are checked FIRST so an operator who adds e.g. HTTPS_PROXY to
+  // `envAllowlist` cannot accidentally re-introduce the `-e KEY=value` argv
+  // leak. Inherit via `-e KEY` (no value) from docker CLI's own env.
+  const proxyPassthrough = new Set<string>(PROXY_ENV_KEYS)
+  const allowlist = new Set(config.envAllowlist ?? [])
+  for (const [key, val] of Object.entries(opts.env)) {
+    if (proxyPassthrough.has(key)) {
+      dockerArgs.push('-e', key)
+    } else if (
+      // Always pass through essential OpenClaude env vars
+      key.startsWith('OPENCLAUDE_') ||
+      key === 'PATH' ||
+      key === 'HOME' ||
+      key === 'NODE_ENV' ||
+      allowlist.has(key)
+    ) {
+      dockerArgs.push('-e', `${key}=${val}`)
+    }
+  }
+
+  // Timeout
+  if (config.timeoutMs) {
+    dockerArgs.push('--stop-timeout', String(Math.ceil(config.timeoutMs / 1000)))
+  }
+
+  // Resource limits
+  dockerArgs.push('--memory', '2g')
+  dockerArgs.push('--cpus', '1.0')
+  dockerArgs.push('--pids-limit', '512')
+
+  // Image
+  dockerArgs.push(config.image || 'node:20-slim')
+
+  // Command
+  dockerArgs.push(opts.command, ...opts.args)
+
+  return dockerArgs
+}
+
 export class DockerBackend implements TerminalBackend {
   constructor(private config: TerminalBackendConfig) {}
 
   spawn(opts: SpawnOpts): ChildProcessWithoutNullStreams {
-    const dockerArgs = ['run', '--rm', '-i']
-
-    // Working directory: mount CCB install path so the binary can run
-    dockerArgs.push('-v', `${opts.cwd}:/opt/ccb`)
-    // Mount agent working directory as /workspace (the real project dir)
-    const agentDir = opts.agentCwd || opts.cwd
-    dockerArgs.push('-v', `${agentDir}:/workspace`)
-    dockerArgs.push('-w', '/workspace')
-
-    // Extra volumes from config
-    if (this.config.volumes) {
-      for (const v of this.config.volumes) dockerArgs.push('-v', v)
-    }
-
-    // Environment variables
-    const allowlist = new Set(this.config.envAllowlist ?? [])
-    for (const [key, val] of Object.entries(opts.env)) {
-      // Always pass through essential OpenClaude env vars
-      if (
-        key.startsWith('OPENCLAUDE_') ||
-        key === 'PATH' ||
-        key === 'HOME' ||
-        key === 'NODE_ENV' ||
-        allowlist.has(key)
-      ) {
-        dockerArgs.push('-e', `${key}=${val}`)
-      }
-    }
-
-    // Timeout
-    if (this.config.timeoutMs) {
-      dockerArgs.push('--stop-timeout', String(Math.ceil(this.config.timeoutMs / 1000)))
-    }
-
-    // Resource limits
-    dockerArgs.push('--memory', '2g')
-    dockerArgs.push('--cpus', '1.0')
-    dockerArgs.push('--pids-limit', '512')
-
-    // Image
-    dockerArgs.push(this.config.image || 'node:20-slim')
-
-    // Command
-    dockerArgs.push(opts.command, ...opts.args)
-
-    return spawn('docker', dockerArgs, {
+    return spawn('docker', buildDockerArgs(this.config, opts), {
       cwd: opts.cwd,
       env: opts.env,
       stdio: opts.stdio,

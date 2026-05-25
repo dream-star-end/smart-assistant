@@ -7,6 +7,7 @@ import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/
 import { resolveMcpMemoryEntry } from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
 import { buildPromptContext } from './promptSlots.js'
+import { PROXY_ENV_KEYS } from './proxyEnv.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
@@ -65,6 +66,23 @@ export interface SubprocessRunnerOpts {
    * pass values matching that shape (currently only `'cron'`).
    */
   workload?: string
+  /**
+   * Effective egress proxy URL for this CCB subprocess (per-agent override
+   * resolved against the global config in `sessionManager`).
+   *
+   * Non-empty → 4 PROXY env keys (HTTPS_PROXY/HTTP_PROXY + lowercase) are
+   * injected over whatever the gateway process env carries. Empty / undefined
+   * → no override; CCB inherits the gateway's own env (typically the systemd
+   * `HTTPS_PROXY`). This is the deliberate asymmetry with codex runners —
+   * see `OpenClaudeConfig.proxyUrl` docstring in storage/config.ts for the
+   * rationale (codex stays explicit-only, CCB keeps its historical inherit
+   * behaviour so the operator's systemd carve-outs / NO_PROXY remain in
+   * effect for plain CCB).
+   *
+   * Caller is responsible for normalising whitespace / empty values
+   * (`normalizeProxyUrl` in `proxyEnv.ts`).
+   */
+  proxyUrl?: string
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -389,6 +407,16 @@ export class SubprocessRunner extends EventEmitter {
       // This is the "default" path — settings.json controls routing.
     }
 
+    // Per-agent / global egress proxy override. Non-empty wins over any
+    // inherited process.env. Empty / undefined → no override, CCB inherits
+    // whatever the gateway process env carries (typically systemd
+    // HTTPS_PROXY). All four common spellings are set in lockstep so Rust
+    // reqwest / Node undici / shelled-out tools all see the same value.
+    const proxyEnv: Record<string, string> = {}
+    if (this.opts.proxyUrl) {
+      for (const key of PROXY_ENV_KEYS) proxyEnv[key] = this.opts.proxyUrl
+    }
+
     let proc: ReturnType<TerminalBackend['spawn']>
     try {
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
@@ -400,6 +428,7 @@ export class SubprocessRunner extends EventEmitter {
         env: {
           ...process.env,
           ...providerEnv,
+          ...proxyEnv,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
           // Per-session effort level (xhigh / max from chat-mode pills, or
