@@ -2599,12 +2599,20 @@ async function init() {
   // cookie handshake lands (e.g. the cookie fetch was slow on first boot).
   _installMediaErrorRetry()
   // Central auth-expired handler: any API call that returns 401 funnels here,
-  // we tear down local state and show the login screen. Idempotent — only
-  // fires once per expiry (see api.js). Skip if we're already on the login
-  // view (e.g. login endpoint itself responded 401 with wrong credentials).
+  // we tear down local state via _forceLogout (which since 2026-04-22 routes
+  // to landing-view, not /login). Idempotent — only fires once per expiry
+  // (see api.js).
+  //
+  // toast gate (2026-05-25): only surface "登录已过期" when the user is actually
+  // in the app (app-view visible). Cold-visitor / landing / login states have
+  // no perceived "logged-in session" to lose — the toast there is noise that
+  // confuses new users seeing the marketing page for the first time (典型路径:
+  // stale localStorage access_token with future-looking tokenExp → mintSessionCookie
+  // 401 → silentRefresh fail → _notifyAuthExpired). _forceLogout still runs in all
+  // branches to flush any residual token / IDB / cookie — it's idempotent and a
+  // no-op when state is already clean.
   onAuthExpired(() => {
-    if (!$('login-view').hidden) return
-    toast('登录已过期，请重新登录', 'error')
+    if (!$('app-view').hidden) toast('登录已过期，请重新登录', 'error')
     _forceLogout()
   })
   // Fired once per tab if IndexedDB is unavailable (private browsing, blocked
