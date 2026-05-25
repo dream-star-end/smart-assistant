@@ -50,7 +50,7 @@
 // 自己的快照,不会赌 race。
 
 import { state } from './state.js'
-import { silentRefresh } from './api.js?v=638e97a0'
+import { silentRefresh } from './api.js?v=71ba55d2'
 
 /** 服务端 batch 上限(packages/commercial/src/http/mediaSign.ts MEDIA_SIGN_BATCH_MAX) */
 const MAX_BATCH_PATHS = 32

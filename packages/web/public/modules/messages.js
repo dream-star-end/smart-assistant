@@ -1,21 +1,21 @@
 // OpenClaude — Message rendering and display
-import { _openTopupModal } from './billing.js?v=638e97a0'
-import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=638e97a0'
-import { getEffortForSubmit } from './effortMode.js?v=638e97a0'
-import { exportMessageDocx } from './export-docx.js?v=638e97a0'
-import { exportMessageTex } from './export-tex.js?v=638e97a0'
+import { _openTopupModal } from './billing.js?v=71ba55d2'
+import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=71ba55d2'
+import { getEffortForSubmit } from './effortMode.js?v=71ba55d2'
+import { exportMessageDocx } from './export-docx.js?v=71ba55d2'
+import { exportMessageTex } from './export-tex.js?v=71ba55d2'
 import {
   clearChartInstances,
   embedMediaUrls,
   processRichBlocks,
   renderMarkdown,
   renderStreamingMarkdown,
-} from './markdown.js?v=638e97a0'
-import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=638e97a0'
-import { toast } from './ui.js?v=638e97a0'
-import { parsePartialJson } from './partialJson.js?v=638e97a0'
-import { msgTimeLabel, shortTime } from './util.js?v=638e97a0'
-import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=638e97a0'
+} from './markdown.js?v=71ba55d2'
+import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=71ba55d2'
+import { toast } from './ui.js?v=71ba55d2'
+import { parsePartialJson } from './partialJson.js?v=71ba55d2'
+import { msgTimeLabel, shortTime } from './util.js?v=71ba55d2'
+import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=71ba55d2'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
