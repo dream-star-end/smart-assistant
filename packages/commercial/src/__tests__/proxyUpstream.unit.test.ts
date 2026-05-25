@@ -59,6 +59,7 @@ function makePick(over: Partial<PickResult> = {}): PickResult {
     egress_target: null,
     pinned_user_id: PINNED_OK,
     account_uuid: null, // Phase 6 默认 null;具体 case 通过 over 覆盖
+    persona: null, // v3 反关联根治 0073/0074 默认 null;具体 case 通过 over 覆盖
     ...over,
   };
 }
@@ -405,6 +406,80 @@ describe("PreparedUpstreamSession (OAuth) — applyUpstreamAuth", () => {
     const body = {} as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
     session.applyUpstreamAuth({}, body, log);
     assert.ok((body as { metadata?: { user_id?: unknown } }).metadata);
+  });
+
+  // ─── v3 反关联根治 0073/0074 — persona header 注入 ────────────────────
+  //
+  // 验证 applyUpstreamAuth 把 pick.persona 写到 safeHeaders 上,且 null 时
+  // fail-open(不抛、不写,只 log.warn — 我们在这只断言"未写")。
+
+  test("pick.persona 非 null → 9 个 stainless / accept-language / user-agent headers 全注入", async () => {
+    const persona = {
+      user_agent: "anthropic-ai-claude-code/1.0.71 Node/v22.16.0 Linux",
+      x_stainless_arch: "x64",
+      x_stainless_lang: "js",
+      x_stainless_os: "Linux",
+      x_stainless_package_version: "1.0.71",
+      x_stainless_runtime: "node",
+      x_stainless_runtime_version: "v22.16.0",
+      x_stainless_retry_count: "0",
+      accept_language: "en-US,en;q=0.9",
+    };
+    const { session } = await makeSession({ persona });
+    const headers: Record<string, string> = {};
+    session.applyUpstreamAuth(headers, { metadata: {} } as never, log);
+
+    assert.equal(headers["user-agent"], persona.user_agent);
+    assert.equal(headers["x-stainless-arch"], persona.x_stainless_arch);
+    assert.equal(headers["x-stainless-lang"], persona.x_stainless_lang);
+    assert.equal(headers["x-stainless-os"], persona.x_stainless_os);
+    assert.equal(headers["x-stainless-package-version"], persona.x_stainless_package_version);
+    assert.equal(headers["x-stainless-runtime"], persona.x_stainless_runtime);
+    assert.equal(headers["x-stainless-runtime-version"], persona.x_stainless_runtime_version);
+    assert.equal(headers["x-stainless-retry-count"], persona.x_stainless_retry_count);
+    assert.equal(headers["accept-language"], persona.accept_language);
+  });
+
+  test("pick.persona = null → fail-open,9 个 persona headers 完全未写(undici 默认头兜底)", async () => {
+    const { session } = await makeSession({ persona: null });
+    const headers: Record<string, string> = {};
+    session.applyUpstreamAuth(headers, { metadata: {} } as never, log);
+
+    assert.equal(headers["user-agent"], undefined);
+    assert.equal(headers["x-stainless-arch"], undefined);
+    assert.equal(headers["x-stainless-lang"], undefined);
+    assert.equal(headers["x-stainless-os"], undefined);
+    assert.equal(headers["x-stainless-package-version"], undefined);
+    assert.equal(headers["x-stainless-runtime"], undefined);
+    assert.equal(headers["x-stainless-runtime-version"], undefined);
+    assert.equal(headers["x-stainless-retry-count"], undefined);
+    assert.equal(headers["accept-language"], undefined);
+    // Bearer 仍然写(persona null 不影响其他注入)
+    assert.match(headers.authorization, /^Bearer /);
+  });
+
+  test("persona 注入不破坏 anthropic-beta 合并(两者都在,顺序 oauth-2025-04-20 在前)", async () => {
+    const persona = {
+      user_agent: "ua-marker",
+      x_stainless_arch: "arm64",
+      x_stainless_lang: "js",
+      x_stainless_os: "MacOS",
+      x_stainless_package_version: "1.0.110",
+      x_stainless_runtime: "node",
+      x_stainless_runtime_version: "v22.14.0",
+      x_stainless_retry_count: "0",
+      accept_language: "ja-JP,ja;q=0.9,en;q=0.8",
+    };
+    const { session } = await makeSession({ persona });
+    const headers: Record<string, string> = {
+      "anthropic-beta": "interleaved-thinking-2025-05-14",
+    };
+    session.applyUpstreamAuth(headers, { metadata: {} } as never, log);
+
+    assert.equal(headers["user-agent"], "ua-marker");
+    const tokens = headers["anthropic-beta"].split(",").map((s) => s.trim());
+    assert.equal(tokens[0], "oauth-2025-04-20");
+    assert.ok(tokens.includes("interleaved-thinking-2025-05-14"));
   });
 });
 

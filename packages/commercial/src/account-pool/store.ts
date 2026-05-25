@@ -26,9 +26,10 @@
 
 import type { PoolClient, QueryResultRow } from "pg";
 import { getPool } from "../db/index.js";
-import { query } from "../db/queries.js";
+import { query, tx } from "../db/queries.js";
 import { encrypt, decryptToBuffer, AeadError } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
+import { generatePersona, assertPersona } from "./persona.js";
 
 export const ACCOUNT_PLANS = ["pro", "max", "team"] as const;
 export type AccountPlan = (typeof ACCOUNT_PLANS)[number];
@@ -411,6 +412,13 @@ export async function createAccount(
     // account-pool/anthropicProfile.ts。$11 占位允许 NULL(codex / fetch fail 回退)。
     const accountUuid = input.account_uuid ?? null;
 
+    // v3 反关联根治 0073/0074 — 每个新建账号必须自带 persona 列。0074 把 column
+    // 设为 NOT NULL,如果 INSERT 不传 persona 会被 DB 直接拒。生成阶段调
+    // assertPersona() 自洽校验,失败抛 TypeError(generatePersona 当前实现永远
+    // 返合法值,assert 是防御性兜底,捕未来 variants 池 refactor 悄默破坏 shape)。
+    const persona = generatePersona();
+    assertPersona(persona);
+
     const res = await query<RawMetaRow>(
       `INSERT INTO claude_accounts(
          provider, label, plan,
@@ -419,9 +427,10 @@ export async function createAccount(
          oauth_expires_at,
          subscription_end_at,
          egress_proxy, egress_proxy_id,
-         account_uuid
+         account_uuid,
+         persona
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11, $12::jsonb)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -435,6 +444,7 @@ export async function createAccount(
         input.subscription_end_at ?? null,
         egressProxyId,
         accountUuid,
+        JSON.stringify(persona),
       ],
     );
     return parseMetaRow(res.rows[0]);
@@ -518,10 +528,23 @@ export async function listAccounts(
  * @returns null 若账号不存在
  * @throws AeadError 若密文已损坏(视为账号不可用,应触发 disable + 告警)
  */
+/**
+ * 选项:`requireActiveStatus = true` 让 SQL 在 WHERE 里加 `AND a.status='active'`,
+ * 把"已被另一进程 ban/disabled 的账号"在 token 读取这一步即 fail-closed(返 null)。
+ *
+ * 默认 false 保留旧契约 —— refresh.ts 和 backfill 仍要能读 cooldown/disabled
+ * 账号的密文(刷 refresh_token / 重算 account_uuid 等管理路径)。**hot path**
+ * (scheduler 的 runWRHLoop / pickPinnedAccount)必须显式传 true,把 SELECT
+ * status='active' → token decrypt 之间的 race 窗口收紧到单一 SELECT 的 MVCC 快照,
+ * 防止"A 进程 select pool 后 B 进程 ban 该账号,A 仍能拿到 token 发上游"的
+ * 风控外泄(P0,Codex 终审 BLOCKER 1)。
+ */
 export async function getTokenForUse(
   id: bigint | string,
   keyFn: () => Buffer = loadKmsKey,
+  opts: { requireActiveStatus?: boolean } = {},
 ): Promise<AccountToken | null> {
+  const requireActive = opts.requireActiveStatus === true;
   // 0038 — JOIN compute_hosts 一次拿出 mTLS forward proxy 信息(避免 chat 路径再回查):
   //   - LEFT JOIN: 账号未分配 host(egress_host_uuid IS NULL)→ 所有 ch.* 都是 NULL,
   //     egress_target 在 mapper 里也置 null,fallback 到 master 默认出口
@@ -564,7 +587,7 @@ export async function getTokenForUse(
      LEFT JOIN egress_proxies ep
        ON ep.id = a.egress_proxy_id
        AND ep.status = 'active'
-     WHERE a.id = $1`,
+     WHERE a.id = $1${requireActive ? " AND a.status = 'active'" : ''}`,
     [String(id)],
   );
   if (res.rows.length === 0) return null;
@@ -724,17 +747,125 @@ export async function updateAccount(
     sets.push("updated_at = NOW()");
 
     params.push(String(id));
-    const res = await query<RawMetaRow>(
-      `UPDATE claude_accounts SET ${sets.join(", ")}
+    const sql = `UPDATE claude_accounts SET ${sets.join(", ")}
        WHERE id = $${params.length}
-       RETURNING ${META_COLUMNS}`,
-      params,
-    );
+       RETURNING ${META_COLUMNS}`;
+
+    // v3 反关联根治 cascade:
+    //   account → 'banned' / 'disabled' 时,把所有指向该账号的 csap 行翻成
+    //   status='unbound'。这样下一次该 (user, session) 走 scheduler.pick 会撞
+    //   SessionPinUnboundError(409,前端必须 reset_session),**强制对话历史从
+    //   "Anthropic 已知风险账号" 上断开,而不是把同一对话扩散到新干净账号**。
+    //
+    //   不 cascade 的状态:
+    //     - 'cooldown'   transient 1-5 min,pin 留着,前端 503 retry
+    //     - 'active'     恢复路径,pin 当然要留
+    //
+    //   原子性:UPDATE accounts + UPDATE csap 必须同一 tx — 防止只翻了账号没翻
+    //   pin(crash 或 conn drop)导致 cascade 不完整 → 后续 pick 走 active pin
+    //   命中 banned 账号 → 抛 SessionPinTemporarilyUnavailableError 让前端反复
+    //   retry 不解。
+    const shouldCascade = patch.status === "banned" || patch.status === "disabled";
+    if (shouldCascade) {
+      return tx(async (client) => {
+        const res = await client.query<RawMetaRow>(sql, params);
+        if (res.rows.length === 0) return null;
+        // cascade — 仅翻还没 unbound 的 active 行(幂等)
+        await client.query(
+          `UPDATE chat_session_account_pin
+              SET status = 'unbound', updated_at = NOW()
+            WHERE account_id = $1 AND status = 'active'`,
+          [String(id)],
+        );
+        return parseMetaRow(res.rows[0]);
+      });
+    }
+
+    const res = await query<RawMetaRow>(sql, params);
     if (res.rows.length === 0) return null;
     return parseMetaRow(res.rows[0]);
   } finally {
     if (key) zeroBuffer(key);
   }
+}
+
+/**
+ * v3 反关联根治 — 状态专用 transition API。
+ *
+ * 等价于 `updateAccount(id, { status, last_error: reason ?? undefined })` 但语义更窄,
+ * 让 caller 直接表达"我只想改状态",避免误传其他 patch 字段。
+ *
+ * cascade 行为 inherited from updateAccount:
+ *   - status='banned' / 'disabled' → csap 同 tx 翻 unbound
+ *   - status='active'  / 'cooldown' → 无 cascade
+ *
+ * `reason` 写入 `last_error`(最多 500 chars,与 updateAccount 现有 max 一致;
+ * 调用方应主动 .slice 到 500)— 给 ops 排查 ban 来源。
+ *
+ * @returns 更新后的账号行;`id` 不存在返 null。
+ */
+export async function transitionAccountStatus(
+  id: bigint | string,
+  status: AccountStatus,
+  reason?: string | null,
+): Promise<AccountRow | null> {
+  const patch: UpdateAccountPatch = { status };
+  if (reason !== undefined) patch.last_error = reason;
+  return updateAccount(id, patch);
+}
+
+/**
+ * v3 反关联根治 — pin 命中"账号当前不可用"时,告诉 scheduler 该账号到底是
+ * 永久死(terminal)还是短暂 cooldown(transient),以及还要多久才能恢复。
+ *
+ * 设计动机:
+ *   pick() 命中 active pin 但账号不在 active pool 时,需要区分两种情况:
+ *     - account.status='banned'/'disabled' → 终态,csap 应被 cascade 但还没翻
+ *       (race:csap=active + account=banned),scheduler 必须 self-heal 把
+ *       csap 翻 'unbound' 然后抛 SessionPinUnboundError(409 reset_session)。
+ *     - account.status='cooldown' + cooldown_until 未到 → 真瞬时,scheduler 抛
+ *       SessionPinTemporarilyUnavailableError(retryAfterMs = cooldown_until - now)
+ *       让 HTTP 层下发 Retry-After + retry_after_ms,客户端 backoff retry。
+ *
+ *   只读 SELECT(无 UPDATE),纯查询语义,scheduler 负责把读到的 hint 翻译成
+ *   控制流(self-heal cascade / 503 retry / 409 throw)。
+ *
+ * @returns null 若账号不存在(已被删 race);否则返三种 hint 之一。
+ */
+export type AccountRecoveryHint =
+  | { kind: "terminal"; status: "banned" | "disabled" }
+  | { kind: "transient"; status: "cooldown"; retryAfterMs: number }
+  | { kind: "ready"; status: "active" };
+
+export async function readAccountRecoveryHint(
+  id: bigint | string,
+  now: () => Date = () => new Date(),
+): Promise<AccountRecoveryHint | null> {
+  const res = await query<{ status: AccountStatus; cooldown_until: Date | null }>(
+    `SELECT status, cooldown_until
+       FROM claude_accounts
+      WHERE id = $1`,
+    [String(id)],
+  );
+  if (res.rows.length === 0) return null;
+  const row = res.rows[0];
+  if (row.status === "banned" || row.status === "disabled") {
+    return { kind: "terminal", status: row.status };
+  }
+  if (row.status === "cooldown") {
+    // cooldown_until 缺失或已过期 → 视为"几乎可用",retryAfterMs=0 让 scheduler
+    // immediateRetries 路径吞掉,不让客户端拿到 Retry-After=0 这种奇怪值。
+    const deadline = row.cooldown_until?.getTime() ?? 0;
+    const remain = deadline - now().getTime();
+    return {
+      kind: "transient",
+      status: "cooldown",
+      retryAfterMs: remain > 0 ? remain : 0,
+    };
+  }
+  // status='active' — 账号其实是好的,pick 把它过滤出去多半是 inflight cap / pool
+  // 刚刷新;不属于终态也不属于瞬时态,scheduler 走"短 backoff retry"路径。
+  return { kind: "ready", status: "active" };
 }
 
 /**

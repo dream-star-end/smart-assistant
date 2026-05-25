@@ -37,13 +37,17 @@ import type { AccountHealthTracker } from './health.js'
 import {
   type AccountPlan,
   type AccountProvider,
+  type AccountRecoveryHint,
   getTokenForUse,
+  readAccountRecoveryHint,
   updateAccount,
 } from './store.js'
 
 export const ERR_ACCOUNT_POOL_UNAVAILABLE = 'ERR_ACCOUNT_POOL_UNAVAILABLE'
 export const ERR_ACCOUNT_POOL_BUSY = 'ERR_ACCOUNT_POOL_BUSY'
 export const ERR_CONTAINER_STALE_BINDING = 'ERR_CONTAINER_STALE_BINDING'
+export const ERR_SESSION_PIN_UNBOUND = 'ERR_SESSION_PIN_UNBOUND'
+export const ERR_SESSION_PIN_UNAVAILABLE = 'ERR_SESSION_PIN_UNAVAILABLE'
 
 export class AccountPoolUnavailableError extends Error {
   readonly code = ERR_ACCOUNT_POOL_UNAVAILABLE
@@ -100,6 +104,126 @@ export class ContainerStaleBindingError extends Error {
     this.containerId = containerId
   }
 }
+
+/**
+ * v3 反关联根治 — session pin 已标记 'unbound' 时抛。
+ *
+ * 触发场景:
+ *   - 该 (user_id, session_id) 原本 pinned 到某个 account,该 account 后来被
+ *     banned/disabled,store.transitionAccountStatus / updateAccount cascade
+ *     更新 csap.status='unbound'。
+ *   - 用户下一次请求命中 unbound pin → 不许在同 session 内换号(避免 cascade-ban),
+ *     强制走"reset session"路径:前端 fresh 新 session_id,scheduler 重新选号。
+ *
+ * HTTP 映射:409 Conflict + body 形如
+ *   `{ error: { type: 'session_pin_unbound', action: 'reset_session', message: '...' } }`
+ *
+ * 注意:retryable=false — 同 session 重试只会再次 hit 同一 unbound pin。
+ */
+export class SessionPinUnboundError extends Error {
+  readonly code = ERR_SESSION_PIN_UNBOUND
+  readonly retryable = false
+  readonly action = 'reset_session' as const
+  /**
+   * 客户端在收到这个错误后**应该**采取的恢复策略:
+   *   - 'force_repin' — 客户端可以选择对同一 session 重发请求并打 `x-force-repin: 1`
+   *     头(scheduler 会强制 repin 到新账号,session_id 不变)。这是"保留对话历史"
+   *     的路径,前端默认走这条 —— 用户感知层面只是"上一轮失败,自动重试一次"。
+   *
+   * 注意:`action='reset_session'` 仍然在 body 里,作为**fallback 语义**给老前端
+   * (不识别 retry_strategy 字段)用 —— 老客户端继续走"开新会话"路径,新客户端
+   * 走 force_repin 路径,两边都不会卡死。
+   */
+  readonly retryStrategy = 'force_repin' as const
+  constructor(message = 'session pin has been unbound; retry with x-force-repin: 1 to keep conversation history') {
+    super(message)
+    this.name = 'SessionPinUnboundError'
+  }
+}
+
+/**
+ * v3 反关联根治 — session pin 指向的 account 暂时不可用(active 池里找不到)。
+ *
+ * 触发场景:
+ *   - pin.status='active' 但 pin.account_id 当前 status != 'active'(短暂 cooldown
+ *     / token AEAD 损坏 / 并发刚被 disable 还没 cascade 完 csap)。
+ *   - 跟 SessionPinUnboundError 区分:Unbound 是终态(账号死了),Unavailable 是
+ *     瞬时态(账号可能马上恢复或马上被 cascade 标 unbound)。
+ *
+ * HTTP 映射:503 Service Unavailable + retryable=true。前端 backoff retry,
+ * 几秒后:
+ *   - 账号恢复 → 命中同一 pin 继续服务
+ *   - 账号确认死 → cascade 完成 → 下次 retry 命中 unbound → 转 409 提示 reset
+ */
+export class SessionPinTemporarilyUnavailableError extends Error {
+  readonly code = ERR_SESSION_PIN_UNAVAILABLE
+  readonly retryable = true
+  /**
+   * 距离 pin 上的账号恢复 active 还需要等多久(毫秒)。
+   *   - 来自 `readAccountRecoveryHint`(读 cooldown_until - now)。
+   *   - `0` 表示"几乎立即可重试"(account 在 SELECT 和重读之间刚 flip 回 active,
+   *     或 cooldown_until 已过期但 status 还没翻);scheduler pick() facade 的
+   *     immediateRetries 路径会吞掉,不让客户端拿到 Retry-After=0 这种奇怪值。
+   *
+   * HTTP 层做 `Math.max(1, Math.ceil(retryAfterMs / 1000))` 转 Retry-After 秒,
+   * **同时**在 body 里给 `retry_after_ms` 精确字段供新客户端用。
+   */
+  readonly retryAfterMs: number
+  /**
+   * 客户端用尽 Retry-After 后还失败时**应该**怎么办的 hint:
+   *   - 'force_repin_after_retry' — 等 retryAfterMs 后重试一次;若仍 503,改打
+   *     `x-force-repin: 1` 强制切号(此时 cooldown 多半已 cascade 成 banned/
+   *     disabled,server 会走 self-heal cascade → 抛 409 unbound,客户端再走
+   *     force_repin 路径关闭循环)。
+   *
+   * 这是给客户端"用户体验补丁层"用的:让前端可以无 UI 自动闭环,boss 看到的就是
+   * "请求慢了一会儿但成功了",而不是"反复转圈"。
+   */
+  readonly fallbackStrategy = 'force_repin_after_retry' as const
+  /**
+   * server 侧 retryAfterMs 合法上限:24h。
+   *
+   * 远超 cooldown 设计区间(秒~分钟级),此处仅作为防御性 cap 阻断 NaN/Infinity 或上游
+   * 计算出离谱值时把"Retry-After: NaN" / 巨大整数泄漏给 HTTP 层。命中 cap 等价于
+   * 表达"非常长别等了,直接 fallback 走 force_repin",客户端 UX 仍然闭环。
+   */
+  static readonly MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000
+  constructor(message: string, retryAfterMs: number) {
+    super(message)
+    this.name = 'SessionPinTemporarilyUnavailableError'
+    // NaN / Infinity / -Infinity 一律归 0(走 immediate retry 路径),避免 HTTP 层
+    // Retry-After 出现 "NaN" 或 body retry_after_ms=null。有限值再 floor + clamp。
+    this.retryAfterMs = Number.isFinite(retryAfterMs)
+      ? Math.min(
+          SessionPinTemporarilyUnavailableError.MAX_RETRY_AFTER_MS,
+          Math.max(0, Math.floor(retryAfterMs)),
+        )
+      : 0
+  }
+}
+
+/**
+ * pick() facade 的内部短 sleep helper。提取出来便于将来注入 fake timer 测试,
+ * 同时表达"这是 server 内部 short-spin 等待,不是业务定时器"的意图。
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * scheduler.pick() 的 session-pin 三态执行模式。
+ *
+ *   - 'off'     — 默认:不查 pin,行为完全等价旧 scheduler(向后兼容路径)
+ *   - 'observe' — 上线灰度态:跑常规 WRH,选号后**额外**查一次 pin 对比"WRH 选择 vs
+ *                历史 pin 是否一致",仅打点日志(metric `session_pin_observe`)。
+ *                不写 csap(避免还没自信前固化错绑)。
+ *   - 'enforce' — 根治态:查 pin → 命中 active 直接复用;命中 unbound 抛
+ *                SessionPinUnboundError;miss 走"既往足迹优先"WRH + race-safe INSERT
+ *                持久化 pin。
+ *
+ * 灰度路线:off → observe(收集 backfill 后实际命中率 + 不一致率)→ enforce。
+ */
+export type SessionPinMode = 'off' | 'observe' | 'enforce'
 
 /** 单账号同时 in-flight 请求默认上限。防止单账号被 Anthropic 风控。 */
 export const DEFAULT_MAX_CONCURRENT_PER_ACCOUNT = 10
@@ -165,6 +289,46 @@ export interface PickInput {
    * 默认 false:Phase 5 / off / fail_open 语义不变。
    */
   enforceAccountUuid?: boolean
+  /**
+   * v3 反关联根治 — chat_session_account_pin 表的执行模式。
+   *
+   * 仅在 `provider='claude'` + 真实 chat 调用路径生效;codex 容器绑定 / DeepSeek
+   * 等其他路径调用方不传(default 'off')。
+   *
+   * 三态语义见 `SessionPinMode`。
+   *
+   * 'observe' / 'enforce' 模式必须**同时**提供 `userId` 和 `sessionId`,否则
+   * pin 锚定无效。pick() 内部会校验,缺失视为 'off' 行为 + warn 日志。
+   *
+   * 默认 'off':保持旧 WRH-only 调度,不查 / 不写 pin 表。
+   */
+  pinMode?: SessionPinMode
+  /**
+   * v3 反关联根治 — 已认证用户 id。`pinMode != 'off'` 时必传(BREAKING:新 caller
+   * 需穿线 userId)。`pinMode='off'` 时可省。
+   *
+   * 来源:外接 API key 路径走 req.user.id;web/CCB 容器路径走 OAuth 会话 user。
+   * scheduler 不自己拿 — caller 在 hot path 注入。
+   */
+  userId?: bigint
+  /**
+   * v3 反关联根治 UX 闭环 — 客户端"强制 repin"信号。
+   *
+   * 来源:HTTP 层把请求头 `x-force-repin: 1` 翻译成此布尔。语义:
+   *   "上一轮拿到 409 SessionPinUnbound 后,客户端选择保留 session_id 继续对话,
+   *    要求 scheduler **绕过** pin prelude(不读 csap.status='unbound' 不抛 409),
+   *    走反扩散 WRH 选号 + 用 INSERT…ON CONFLICT (user_id, session_id) DO UPDATE
+   *    覆盖原 unbound 行为 active。"
+   *
+   * 跟 pinMode 的关系:仅在 pinMode='enforce' 时有意义;其它模式下被静默忽略。
+   *
+   * 设计动机:不让用户为反风控买单。force_repin 让 backend 把"账号死了换一个"
+   * 这步完全吸收到一次请求里,用户端感知层只多了一次"自动重试",没有"reset 对话"
+   * 的体验断裂。
+   *
+   * 默认 false:老 caller / 第一次请求 / non-pin 路径全部走原 prelude。
+   */
+  forceRepin?: boolean
 }
 
 export interface PickResult {
@@ -200,6 +364,18 @@ export interface PickResult {
    * 调用方读取此字段必须配合 `PHASE6_ACCOUNT_UUID_ENFORCE` flag 行为分支。
    */
   account_uuid: string | null
+  /**
+   * v3 反关联根治 — 该账号绑定的稳定客户端 persona(伪装客户端身份)。
+   *
+   * 来源:`claude_accounts.persona` 列(0073/0074 migration)。**0073 之后、backfill
+   * 之前**的窗口里部分账号可能是 NULL,upstream 层落到 NULL 分支时:
+   *   - 不注入 stainless 头(buildSafeUpstreamHeaders allowlist 自然落地 undici 默认)
+   *   - log.warn `account_persona_missing`(ops grep 监测 backfill 进度)
+   *
+   * 0074 SET NOT NULL 后此字段就一定非 null;但 runtime 仍按 `Persona | null` 设计,
+   * 防止 schema drift 时强类型崩。
+   */
+  persona: import('./persona.js').Persona | null
 }
 
 /**
@@ -272,6 +448,11 @@ export interface CandidateRow extends QueryResultRow {
    * 回填未跑完时为 null;`enforceAccountUuid=true` 时 pick() 会过滤掉 null 候选。
    */
   account_uuid: string | null
+  /**
+   * v3 反关联根治 — 该账号的稳定客户端 persona JSONB(0073/0074 migration)。
+   * SELECT 出来时 pg 把 jsonb 反序列化为 object;0073 之后 0074 NOT NULL 之前可能为 null。
+   */
+  persona: import('./persona.js').Persona | null
 }
 
 /** 默认哈希:SHA-256,截前 8B 作 64-bit 无符号整数。 */
@@ -477,7 +658,88 @@ export class AccountScheduler {
    * @throws `AccountPoolUnavailableError` 当无 active 账号 / 全部候选都失效
    * @throws `TypeError` 当 `mode=agent` 缺 sessionId
    */
+  /**
+   * 公共 pick() facade — 内部跑 retry budget:
+   *
+   *   1. 调 pickOnce(input) 跑一次完整的 prelude → WRH → postlude
+   *   2. 若拿到 SessionPinTemporarilyUnavailableError(503):
+   *       - retryAfterMs === 0 → 立刻重试(immediateRetries 计数,上限 3 防活锁)
+   *       - retryAfterMs <= SHORT_BACKOFF_MS 且总等待 + remain <= HARD_TIMEOUT_MS
+   *         → 内部 sleep(remain) 后重试(用户感知:慢一次 = OK)
+   *       - 否则 → 把 error 抛出去,让 HTTP 层下发 Retry-After 让客户端 backoff
+   *   3. 其它任何 error → 直接抛
+   *
+   * 设计动机(boss "反风控不能以牺牲用户体验为代价"):
+   *   短 cooldown(typically 1-3 秒)在 server 内部吃掉,客户端只感觉到"这一轮慢";
+   *   长 cooldown 才把 Retry-After 透到客户端,避免持有连接超时。这是把 anti-fraud
+   *   切换成本吸收到 backend 而不是甩给用户的核心闭环。
+   */
   async pick(input: PickInput): Promise<PickResult> {
+    /** server 内部最长 sleep 长度;超过此值就把控制权交还给客户端走 Retry-After。 */
+    const SHORT_BACKOFF_MS = 3000
+    /** pick() 总耗时上限(含 sleep + DB 往返);超过就 throw,防 HTTP 连接超时。 */
+    const HARD_TIMEOUT_MS = 5000
+    /** retryAfterMs=0 路径的硬上限,防 server 内 active-loop spin。 */
+    const MAX_IMMEDIATE_RETRIES = 3
+    /**
+     * immediate-retry 耗尽后透给客户端的最小 retryAfterMs(1 秒)。
+     *
+     * 不能继续抛 retryAfterMs=0:HTTP 层会把 0 写进 body 的 retry_after_ms 字段,
+     * 客户端拿到"retry_after_ms: 0"很可能立刻 busy-retry,等于把 server 的 spin loop
+     * 转嫁给客户端,绕过我们 MAX_IMMEDIATE_RETRIES 的活锁防护。归一成 1s 给前端
+     * 一次"喘一口气再试"的明确信号,符合 boss "反风控不能以牺牲用户体验为代价"。
+     */
+    const IMMEDIATE_EXHAUSTED_HINT_MS = 1000
+    const start = this.now().getTime()
+    let immediateRetries = 0
+    while (true) {
+      try {
+        return await this.pickOnce(input)
+      } catch (err) {
+        if (!(err instanceof SessionPinTemporarilyUnavailableError)) throw err
+        const remain = err.retryAfterMs
+        if (remain === 0) {
+          // 账号"几乎可用"(ready / cooldown_until 已过)— short-spin retry
+          // 用真实计数器而非 elapsed 判定,防 fake clock 测试或 sleep 实现失真。
+          if (immediateRetries >= MAX_IMMEDIATE_RETRIES) {
+            // 归一 retryAfterMs:0 → 1000ms,防客户端拿到 retry_after_ms=0 busy-retry
+            throw new SessionPinTemporarilyUnavailableError(
+              `${err.message} (immediate retries exhausted, falling back to client retry)`,
+              IMMEDIATE_EXHAUSTED_HINT_MS,
+            )
+          }
+          immediateRetries += 1
+          await sleep(10)
+          continue
+        }
+        const elapsed = this.now().getTime() - start
+        if (remain <= SHORT_BACKOFF_MS && elapsed + remain <= HARD_TIMEOUT_MS) {
+          // 短 cooldown 内部吃掉,用户端感知只是慢一次
+          await sleep(remain)
+          continue
+        }
+        // 长 cooldown / 已用完预算 → 把 503 透到客户端
+        throw err
+      }
+    }
+  }
+
+  /**
+   * pick() 的单次原子尝试:走完 prelude → WRH → postlude 不跑 retry budget。
+   *
+   * 抛 SessionPinTemporarilyUnavailableError 时由外层 pick() facade 判定是 sleep
+   * retry 还是透传给 HTTP 层。其它错误一律向上传递。
+   *
+   * `forceRepin=true` 路径:
+   *   - 跳过 readPin(不管 csap.status=unbound 还是 active 都不读,统一当 pin miss)
+   *   - postlude 用 `INSERT ... ON CONFLICT DO UPDATE SET status='active' WHERE
+   *     chat_session_account_pin.status='unbound'` —— 只接受"unbound→active"翻转,
+   *     active 行不动(让"用户已经 pinned 到 X 想强切"的 noop 路径仍保留 sticky)。
+   *
+   * @throws `AccountPoolUnavailableError` 当无 active 账号 / 全部候选都失效
+   * @throws `TypeError` 当 `mode=agent` 缺 sessionId
+   */
+  private async pickOnce(input: PickInput): Promise<PickResult> {
     if (input.mode === 'agent') {
       if (!input.sessionId || input.sessionId.length === 0) {
         throw new TypeError('sessionId required when mode=agent')
@@ -488,29 +750,88 @@ export class AccountScheduler {
 
     const provider: AccountProvider = input.provider ?? 'claude'
     const enforceAccountUuid = input.enforceAccountUuid === true
-    const res = await query<CandidateRow>(
-      `SELECT id::text AS id, plan, health_score,
-              quota_5h_pct, quota_7d_pct, subscription_end_at,
-              pinned_user_id,
-              account_uuid::text AS account_uuid
-       FROM claude_accounts
-       WHERE status = 'active' AND provider = $1
-       ORDER BY id`,
-      [provider],
-    )
-    const allActive = res.rows
+    // pin 三态归一化:enforce/observe 缺 userId 或 sessionId → 自动降级 off + warn
+    // (不抛错;让旧 caller 路径继续工作,缺参数视为没启用 pin)
+    const pinMode = this.resolvePinMode(input)
+    // forceRepin 仅在 enforce 路径有意义,其它模式静默忽略
+    const forceRepin = input.forceRepin === true && pinMode === 'enforce'
+
+    const allActive = await this.selectActiveCandidates(provider)
     if (allActive.length === 0) {
       throw new AccountPoolUnavailableError('no_active')
     }
     // Phase 6 H6 候选过滤:fail_closed 模式下排除 account_uuid IS NULL 的脏数据,
     // 防止外接 ApiKey 路径上 metadata.account_uuid 跟 OAuth account 真 uuid 错位。
     // off / fail_open 模式不过滤(builder HMAC 占位会兜底)。
-    let pool: CandidateRow[] = enforceAccountUuid
+    const pool: CandidateRow[] = enforceAccountUuid
       ? allActive.filter((c) => c.account_uuid !== null)
       : allActive
     if (pool.length === 0) {
       // 必为 enforceAccountUuid=true 路径(allActive>0 但 eligible=0)
       throw new AccountPoolUnavailableError('no_uuid')
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Pin prelude (enforce/observe 模式;off / forceRepin 整段跳过)
+    //
+    // 读 chat_session_account_pin (userId, sessionId):
+    //   - enforce + status=unbound → 抛 SessionPinUnboundError(409,前端 reset)
+    //   - enforce + status=active  → 直接用 pin.account_id,不走 WRH(强 sticky)
+    //     · 若该 account 不在 active pool → handlePinnedAccountUnavailable
+    //   - enforce + pin missing    → 走"既往足迹优先"WRH,选完用 INSERT race-safe pin
+    //   - observe                  → 不强制走 pin,只在选完后对比 WRH 结果 vs pin 命中
+    //                                打 metric;不写 csap
+    //   - forceRepin               → 跳过整段 prelude,统一当 pin miss 走反扩散 WRH;
+    //                                postlude 用 DO UPDATE 翻 unbound→active
+    // ─────────────────────────────────────────────────────────────────
+    let pin: { account_id: bigint; status: 'active' | 'unbound' } | null = null
+    if (pinMode !== 'off' && !forceRepin) {
+      // pinMode != 'off' 路径已在 resolvePinMode 保证 userId+sessionId 双备
+      pin = await this.readPin(input.userId!, input.sessionId!)
+      if (pinMode === 'enforce') {
+        if (pin?.status === 'unbound') {
+          throw new SessionPinUnboundError()
+        }
+        if (pin?.status === 'active') {
+          // 强 sticky:绕过 WRH 直接选这个账号
+          const pinned = await this.pickPinnedAccount(pin.account_id, pool)
+          if (pinned !== null) return pinned
+          // pool 里没有这个 account — 必须区分终态(cascade self-heal + 409)和
+          // 瞬时态(503 with retryAfterMs)。统一走 handlePinnedAccountUnavailable。
+          await this.handlePinnedAccountUnavailable(
+            input.userId!,
+            input.sessionId!,
+            pin.account_id,
+            'pin_hit',
+          )
+          // 上面 helper 一定 throw — 此 return 不会执行,只为类型收敛
+          throw new Error('unreachable')
+        }
+        // enforce + pin miss → fall through to WRH 但选号集要"既往足迹优先"
+      }
+      // observe: pin 留着,选完打 metric;不影响 WRH 路径
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // WRH 候选集:enforce + (pin miss || forceRepin) 时优先"用户既往足迹账号"(反扩散)。
+    //
+    // 设计动机(boss "降低风控风险" requirement):
+    //   该 user 既然之前用过 account A/B,Anthropic 早把这些账号跟该用户的对话历史
+    //   联系起来了;现在 A/B 都死了 → 用户走 force_repin 在同 session 继续 → 我们应该优先在 A/B/...
+    //   这些"已暴露给用户"的账号里选,而**不是**把对话历史新鲜扩散到一个干净账号上。
+    //
+    //   只在"用户既往足迹账号仍有 active 子集"时缩窄候选;若 history ∩ pool = ∅
+    //   (这个用户的所有账号都死了),退化到整个 pool — 不能让用户卡死。
+    // ─────────────────────────────────────────────────────────────────
+    let wrhPool: CandidateRow[] = pool
+    if (pinMode === 'enforce' && (pin === null || forceRepin)) {
+      const historyIds = await this.readUserHistoryAccountIds(input.userId!)
+      if (historyIds.size > 0) {
+        const filtered = pool.filter((c) => historyIds.has(BigInt(c.id)))
+        if (filtered.length > 0) wrhPool = filtered
+        // else: 既往足迹账号全都死了 → 退化到全池(不能让用户没号可用)
+      }
+      // else: 这个用户在 csap 里没历史(首次 chat) → 用全池
     }
 
     // WRH key:有 sessionId 走强 sticky;没有则生成一次性 randomUUID(分布上仍按
@@ -519,16 +840,196 @@ export class AccountScheduler {
     const wrhKey = input.sessionId && input.sessionId.length > 0
       ? input.sessionId
       : this.ephemeralKey()
-    const now = this.now()
 
-    // 最多重选 N 轮(N = 候选数)。每次选中账号若解密时发现已不存在,
-    // 剔除后从剩余候选再选一次 —— WRH 对剩余集仍是稳定的,只是换到次优选择。
+    const result = await this.runWRHLoop(wrhPool, wrhKey)
+
+    // ─────────────────────────────────────────────────────────────────
+    // Pin postlude
     //
-    // 并发上限:每轮先按 `inflight < maxConcurrent` 过滤出 under-cap 账号;
-    // filter → pick → incInflight 同一 sync 块内完成(无 await),保证硬上限。
-    // 退出后区分两种状态:
-    //   - pool.length > 0 但 under-cap 为空 → AccountPoolBusyError(可重试 429);
-    //   - pool.length === 0(vanish/AEAD 把池子掏空) → AccountPoolUnavailableError(503)。
+    //   - enforce + pin miss:race-safe INSERT(ON CONFLICT DO NOTHING)。
+    //     · 若 INSERT 命中(我们是 winner):直接返回 result
+    //     · 若 ON CONFLICT(并发请求已抢先 INSERT):读取 winner,**释放**当前 result,
+    //       尝试切到 winner 的账号。winner 不在 pool → 503 retry。
+    //   - enforce + forceRepin:INSERT ... ON CONFLICT DO UPDATE WHERE status='unbound'
+    //     (只接受 unbound→active 翻转)。同样 race-aware:
+    //     · winner === attempted → 我们的 result 生效
+    //     · winner ≠ attempted → release self,切到 winner
+    //   - observe:不写 csap,只对比 WRH 选择跟 pin(如果有)是否一致,打 metric。
+    //   - off:无 postlude。
+    // ─────────────────────────────────────────────────────────────────
+    if (pinMode === 'enforce' && (pin === null || forceRepin)) {
+      // 必须包 try/catch:writePinOnMissOrReadWinner / writePinForceRepinOrReadWinner
+      // 在 winner.status='unbound' 或 INSERT race ambiguous 时会 throw — 外层若不
+      // release,持有的 result 会泄漏 inflight 计数 + 已解密 token buffer。
+      let winner: bigint
+      try {
+        winner = forceRepin
+          ? await this.writePinForceRepinOrReadWinner(
+              input.userId!,
+              input.sessionId!,
+              result.account_id,
+            )
+          : await this.writePinOnMissOrReadWinner(
+              input.userId!,
+              input.sessionId!,
+              result.account_id,
+            )
+      } catch (err) {
+        this.releasePickResult(result)
+        throw err
+      }
+      if (winner === result.account_id) {
+        return result
+      }
+      // race lost — 切换到 winner
+      this.releasePickResult(result)
+      const switched = await this.pickPinnedAccount(winner, pool)
+      if (switched !== null) return switched
+      // race-winner 也不在 pool — 进 handlePinnedAccountUnavailable(可能 terminal
+      // self-heal → 409,可能 transient → 503 with retryAfterMs)。
+      await this.handlePinnedAccountUnavailable(
+        input.userId!,
+        input.sessionId!,
+        winner,
+        'race_lost',
+      )
+      throw new Error('unreachable')
+    }
+    if (pinMode === 'observe') {
+      // best-effort metric;吞错防止影响主路径
+      void this.observePinConsistency(
+        input.userId!,
+        input.sessionId!,
+        result.account_id,
+        pin,
+      ).catch(() => {
+        /* metric only, never block pick */
+      })
+    }
+    return result
+  }
+
+  /**
+   * pin 命中但账号不在 active pool(或 race-winner 同理)时的统一决策点:
+   *
+   *   1. 读 claude_accounts.status + cooldown_until — 拿 AccountRecoveryHint
+   *   2. terminal('banned'/'disabled') → self-heal:把该账号所有 active csap 行翻
+   *      'unbound'(等价于 store 端 cascade 但发生在读路径,关闭 race window),
+   *      然后抛 SessionPinUnboundError(409 reset_session)。
+   *      ※ HTTP 层把 SessionPinUnboundError 翻译成 409 + retry_strategy='force_repin',
+   *      新前端会自动重发带 x-force-repin:1 关闭 UX 循环。
+   *   3. transient('cooldown') → 抛 SessionPinTemporarilyUnavailableError(retryAfterMs=
+   *      cooldown_until - now)。pick() facade 内部短 sleep 重试或透到客户端 Retry-After。
+   *   4. ready('active' / null) → retryAfterMs=0 — pick() facade immediateRetries 接住。
+   *
+   * @throws SessionPinUnboundError | SessionPinTemporarilyUnavailableError(永远 throw)
+   */
+  private async handlePinnedAccountUnavailable(
+    userId: bigint,
+    sessionId: string,
+    accountId: bigint,
+    context: 'pin_hit' | 'race_lost',
+  ): Promise<never> {
+    const hint: AccountRecoveryHint | null = await readAccountRecoveryHint(
+      accountId,
+      this.now,
+    )
+    if (hint?.kind === 'terminal') {
+      // Self-heal:race window — accounts.status='banned' 已经 cascade 过 csap,但
+      // 若此 csap 是 mid-INSERT 后插入 / 跨 tx race,可能仍 active。这里幂等 UPDATE
+      // 单行(由 user_id+session_id PK 锁住),保证下一次同 session 不会再走 active-pin
+      // 路径打到同 banned 账号。
+      //
+      // ※ `account_id = $3` 至关重要:防 race —— 假设本次 pick 观测到 active pin = A
+      // 是 terminal,但在 pick → here 之间并发请求已经把 csap 翻成 unbound 并 force_repin
+      // 到 active B,这里若只按 (user_id, session_id, active) 匹配会把 B 误杀。
+      // 加 account_id 让 self-heal 只翻"我看到的那个 terminal 绑定"。
+      try {
+        await query(
+          `UPDATE chat_session_account_pin
+              SET status = 'unbound', updated_at = NOW()
+            WHERE user_id = $1
+              AND session_id = $2
+              AND status = 'active'
+              AND account_id = $3`,
+          [userId, sessionId, accountId],
+        )
+      } catch {
+        /* best-effort;失败时下次 pick 仍会再次走到这里再 self-heal */
+      }
+      throw new SessionPinUnboundError(
+        `pin account ${accountId} terminal (status=${hint.status}); csap self-healed to 'unbound' (${context})`,
+      )
+    }
+    if (hint?.kind === 'transient') {
+      throw new SessionPinTemporarilyUnavailableError(
+        `pinned account ${accountId} in cooldown; retry after ${hint.retryAfterMs}ms (${context})`,
+        hint.retryAfterMs,
+      )
+    }
+    // ready (account=active 但 pool 里没看到 / inflight cap)或 null(账号被删 race):
+    // retryAfterMs=0,让 pick() facade 走 immediateRetries 路径短 spin。
+    throw new SessionPinTemporarilyUnavailableError(
+      `pinned account ${accountId} not in active pool but status=ready (likely inflight cap or pool-refresh race); retry (${context})`,
+      0,
+    )
+  }
+
+  /**
+   * pin 模式归一化:enforce/observe 缺 userId 或 sessionId → 降级 off + warn。
+   *
+   * 为什么是"降级"而不是"抛错":
+   *   pin 是新功能,灰度发布时旧 caller 暂未穿线 userId/sessionId 也要能跑;
+   *   缺参数在生产里至多丢失"反扩散收益",不应让用户对话直接 5xx。
+   *   warn 日志让灰度期可以 ops grep 检测哪些 caller 还没改造。
+   */
+  private resolvePinMode(input: PickInput): SessionPinMode {
+    const requested = input.pinMode ?? 'off'
+    if (requested === 'off') return 'off'
+    const hasUser = input.userId !== undefined
+    const hasSession = input.sessionId !== undefined && input.sessionId.length > 0
+    if (!hasUser || !hasSession) {
+      // eslint-disable-next-line no-console -- warn-only, ops 灰度可见性
+      console.warn(
+        `[scheduler.pick] pinMode=${requested} requested but userId=${
+          hasUser ? '✓' : '✗'
+        } sessionId=${hasSession ? '✓' : '✗'} — degrading to 'off'`,
+      )
+      return 'off'
+    }
+    return requested
+  }
+
+  /** 从 claude_accounts 取 active 候选 — 抽出来便于 pick() / observe 路径共享 */
+  private async selectActiveCandidates(provider: AccountProvider): Promise<CandidateRow[]> {
+    const res = await query<CandidateRow>(
+      `SELECT id::text AS id, plan, health_score,
+              quota_5h_pct, quota_7d_pct, subscription_end_at,
+              pinned_user_id,
+              account_uuid::text AS account_uuid,
+              persona
+       FROM claude_accounts
+       WHERE status = 'active' AND provider = $1
+       ORDER BY id`,
+      [provider],
+    )
+    return res.rows
+  }
+
+  /**
+   * 跑 WRH + inflight cap + vanished/AEAD quarantine 重选循环。
+   *
+   * 整个老 pick() 的核心,搬到 helper 让 pick() 的 pin 控制流读起来清晰。
+   *
+   * @throws `AccountPoolBusyError` 当所有候选都 inflight cap
+   * @throws `AccountPoolUnavailableError` 当候选被 vanish/AEAD 掏空
+   */
+  private async runWRHLoop(
+    initialPool: CandidateRow[],
+    wrhKey: string,
+  ): Promise<PickResult> {
+    const now = this.now()
+    let pool = initialPool
     let vanished = 0
     let quarantined = 0
     while (pool.length > 0) {
@@ -539,7 +1040,12 @@ export class AccountScheduler {
       // 同步 reserve 槽位 —— 必须在下一个 await(getTokenForUse)之前完成
       this.incInflight(chosen.id)
       try {
-        const tok = await getTokenForUse(chosen.id, this.keyFn)
+        // requireActiveStatus: 把"select active pool → token decrypt"之间被另一
+        // 进程 ban/disabled 的账号在 SQL 层即 fail-closed → null。null 路径继续走
+        // vanished 计数 + 剔除再选(语义与"账号被删"统一)。
+        const tok = await getTokenForUse(chosen.id, this.keyFn, {
+          requireActiveStatus: true,
+        })
         if (tok) {
           return {
             account_id: BigInt(chosen.id),
@@ -551,9 +1057,10 @@ export class AccountScheduler {
             egress_target: tok.egress_target,
             pinned_user_id: chosen.pinned_user_id,
             account_uuid: chosen.account_uuid,
+            persona: chosen.persona,
           }
         }
-        // 账号在 SELECT 和 readToken 之间被并发删了,剔除再选
+        // 账号在 SELECT 和 readToken 之间被并发删/ban/disabled,剔除再选
         this.decInflight(chosen.id)
         vanished += 1
         pool = pool.filter((c) => c.id !== chosen.id)
@@ -580,7 +1087,6 @@ export class AccountScheduler {
     }
     if (pool.length > 0) {
       // 还有 active 账号但全部命中 inflight cap — 是可重试的 busy 状态
-      // (无论之前有没有 vanish/aead 剔除,只要剩余池非空就代表"重试可解")
       const drained =
         vanished + quarantined > 0
           ? ` (after vanished=${vanished} aead_quarantined=${quarantined})`
@@ -593,6 +1099,279 @@ export class AccountScheduler {
     throw new AccountPoolUnavailableError(
       `drained: vanished=${vanished} (deleted between SELECT and readToken), ` +
         `aead_quarantined=${quarantined} (decryption failed → auto-disabled)`,
+    )
+  }
+
+  /**
+   * 读 chat_session_account_pin —— pin 命中 enforce 路径的强 sticky 锚。
+   *
+   * 返回 null = 没记录(首次 chat / 新 session);
+   *      {status:'active'}  = 历史 pin 仍有效;
+   *      {status:'unbound'} = pin 已 cascade unbind(账号被 ban),enforce 模式抛 409。
+   */
+  private async readPin(
+    userId: bigint,
+    sessionId: string,
+  ): Promise<{ account_id: bigint; status: 'active' | 'unbound' } | null> {
+    const res = await query<{ account_id: string; status: 'active' | 'unbound' }>(
+      `SELECT account_id::text AS account_id, status
+       FROM chat_session_account_pin
+       WHERE user_id = $1 AND session_id = $2`,
+      [userId, sessionId],
+    )
+    if (res.rows.length === 0) return null
+    const row = res.rows[0]
+    return { account_id: BigInt(row.account_id), status: row.status }
+  }
+
+  /**
+   * 读取该用户**既往足迹账号** — 反扩散的关键。
+   *
+   * pin miss 时优先在这些账号里选号;若全死,退化到整池。
+   * 返回 Set<bigint> 而非 Array,O(1) 候选过滤。
+   *
+   * 只读 status='active' 的 csap 行?**不**:unbound 也算"已暴露给该用户",
+   * Anthropic 已经把这个用户的对话历史跟该 account 关联了。我们要避免的是
+   * 把历史 spread 到"该用户从未碰过的干净账号",所以 unbound 行也要算进 history。
+   */
+  private async readUserHistoryAccountIds(userId: bigint): Promise<Set<bigint>> {
+    const res = await query<{ account_id: string }>(
+      `SELECT DISTINCT account_id::text AS account_id
+       FROM chat_session_account_pin
+       WHERE user_id = $1`,
+      [userId],
+    )
+    return new Set(res.rows.map((r) => BigInt(r.account_id)))
+  }
+
+  /**
+   * 给定一个目标 account_id,直接在候选池里选它(绕过 WRH);用于 pin hit
+   * 或 race-lost 切换路径。
+   *
+   * 注意:仍要走 inflight cap 检查 + 解密 token + AEAD 失败兜底;只是不跑 WRH。
+   *
+   * 返回 null 表示该 account 当前不在 pool / 解密失败 / cap 命中,调用方决策
+   * 是抛 SessionPinTemporarilyUnavailableError 还是 fall through。
+   */
+  private async pickPinnedAccount(
+    targetId: bigint,
+    pool: CandidateRow[],
+  ): Promise<PickResult | null> {
+    const targetIdStr = targetId.toString()
+    const chosen = pool.find((c) => c.id === targetIdStr)
+    if (chosen === undefined) return null
+    if ((this.inflight.get(chosen.id) ?? 0) >= this.maxConcurrent) return null
+
+    this.incInflight(chosen.id)
+    try {
+      // requireActiveStatus: 同 runWRHLoop 路径 — pin hit 不能拿已 ban/disabled
+      // 账号的 token。null → 上层判定 SessionPinTemporarilyUnavailable / fall through。
+      const tok = await getTokenForUse(chosen.id, this.keyFn, {
+        requireActiveStatus: true,
+      })
+      if (!tok) {
+        this.decInflight(chosen.id)
+        return null
+      }
+      return {
+        account_id: BigInt(chosen.id),
+        plan: tok.plan,
+        token: tok.token,
+        refresh: tok.refresh,
+        expires_at: tok.expires_at,
+        egress_proxy: tok.egress_proxy,
+        egress_target: tok.egress_target,
+        pinned_user_id: chosen.pinned_user_id,
+        account_uuid: chosen.account_uuid,
+        persona: chosen.persona,
+      }
+    } catch (err) {
+      this.decInflight(chosen.id)
+      if (err instanceof AeadError) {
+        void updateAccount(
+          chosen.id,
+          {
+            status: 'disabled',
+            last_error: `AEAD decryption failed at pickPinnedAccount(): ${err.message}`.slice(0, 500),
+          },
+          this.keyFn,
+        ).catch(() => {})
+        return null
+      }
+      throw err
+    }
+  }
+
+  /**
+   * Race-safe pin INSERT:
+   *   - 我们是第一个 → INSERT 命中,返回 attempted accountId
+   *   - 并发 caller 已抢先 INSERT → ON CONFLICT DO NOTHING(0 rows),
+   *     回头读已存在的 winner accountId + status 返回
+   *
+   * 调用方比较 winner === attempted 判定 race 输赢;同时检查 status:
+   *   - 'active' → 切到 winner 账号
+   *   - 'unbound' → 抛 SessionPinUnboundError(409 reset_session)
+   *
+   * status 防御性兜底(Codex 终审 WARN 3):正常流水线 readPin 已经在
+   * 顶端拦住 unbound 行,不应再走到 INSERT 路径;但如果未来逻辑变化
+   * 或并发模型变(pick 流水线被拆/cascade 改 INSERT 等),让 winner-read
+   * 一并读 status 可以避免"已 unbound 行被当成 active winner 继续服务"
+   * 的二阶 bug。代价仅一个 SELECT 多读一列。
+   */
+  private async writePinOnMissOrReadWinner(
+    userId: bigint,
+    sessionId: string,
+    attempted: bigint,
+  ): Promise<bigint> {
+    const ins = await query<{ account_id: string }>(
+      `INSERT INTO chat_session_account_pin (user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')
+       ON CONFLICT (user_id, session_id) DO NOTHING
+       RETURNING account_id::text AS account_id`,
+      [userId, sessionId, attempted],
+    )
+    if (ins.rows.length > 0) {
+      return BigInt(ins.rows[0].account_id)
+    }
+    // race lost — 读取 winner + status
+    const sel = await query<{ account_id: string; status: 'active' | 'unbound' }>(
+      `SELECT account_id::text AS account_id, status
+       FROM chat_session_account_pin
+       WHERE user_id = $1 AND session_id = $2`,
+      [userId, sessionId],
+    )
+    if (sel.rows.length === 0) {
+      // 极罕见:INSERT race 期间 winner 又被并发 DELETE。视为暂时不可用让前端 retry。
+      // retryAfterMs=0 → pick() facade immediateRetries 路径接住,不让客户端拿到
+      // Retry-After=0 这种奇怪值。
+      throw new SessionPinTemporarilyUnavailableError(
+        `pin INSERT race ambiguous: ON CONFLICT but no row visible on read`,
+        0,
+      )
+    }
+    const row = sel.rows[0]
+    if (row.status === 'unbound') {
+      // 已 cascade 解绑:不能把 caller 切到这个 winner(账号已死),触发前端 409 重置。
+      throw new SessionPinUnboundError(
+        `pin race-winner exists but status='unbound' (account banned/disabled mid-INSERT)`,
+      )
+    }
+    return BigInt(row.account_id)
+  }
+
+  /**
+   * forceRepin 专用 race-safe pin upsert:
+   *   - INSERT 一行 status='active'
+   *   - ON CONFLICT (user_id, session_id) DO UPDATE SET status='active', account_id=EXCLUDED
+   *     **WHERE chat_session_account_pin.status='unbound'**
+   *   - 命中三种情况之一:
+   *       a) 我们是 winner:INSERT 命中或 UPDATE 命中(已 unbound 翻为 active)→ 返回 attempted
+   *       b) WHERE 不匹配(行已 active,可能是被并发 force_repin 抢先翻或本来就 active)→
+   *          DO UPDATE 0 rows,RETURNING 空 → 我们 race-lost。回头读 winner + status:
+   *           - active → 切到 winner
+   *           - unbound → 不可能(WHERE 已过滤),防御性当 SessionPinUnboundError
+   *
+   * 跟 writePinOnMissOrReadWinner 的关键差异:
+   *   - writePinOnMissOrReadWinner 用 DO NOTHING,期望"无 row 存在"才插
+   *   - 这个用 DO UPDATE … WHERE status='unbound',期望"row 存在但是 unbound"也接管
+   *   - 两个 path 都把 winner 决议交给 RETURNING,保证 race-safe
+   */
+  private async writePinForceRepinOrReadWinner(
+    userId: bigint,
+    sessionId: string,
+    attempted: bigint,
+  ): Promise<bigint> {
+    const ins = await query<{ account_id: string; is_insert: boolean }>(
+      `INSERT INTO chat_session_account_pin (user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')
+       ON CONFLICT (user_id, session_id) DO UPDATE
+         SET account_id = EXCLUDED.account_id,
+             status = 'active',
+             updated_at = NOW()
+         WHERE chat_session_account_pin.status = 'unbound'
+       RETURNING account_id::text AS account_id, (xmax = 0) AS is_insert`,
+      [userId, sessionId, attempted],
+    )
+    if (ins.rows.length > 0) {
+      // INSERT 命中(xmax=0)或 UPDATE 命中(WHERE status='unbound' 翻成 active);
+      // 两条路径都返回我们 attempted 的 account_id。
+      return BigInt(ins.rows[0].account_id)
+    }
+    // RETURNING 空 = INSERT 走 CONFLICT 路径但 WHERE 不匹配,说明:
+    //   - 该 (user, session) 行已 active(被并发 force_repin 抢先,或本来就 active)
+    //     → race-lost,读 winner 切过去
+    //   - 或读路径自己刚把它 self-heal 到 unbound 但行又被并发 force_repin 翻回 active
+    //     (同语义,仍是 race-lost)
+    const sel = await query<{ account_id: string; status: 'active' | 'unbound' }>(
+      `SELECT account_id::text AS account_id, status
+       FROM chat_session_account_pin
+       WHERE user_id = $1 AND session_id = $2`,
+      [userId, sessionId],
+    )
+    if (sel.rows.length === 0) {
+      // 极罕见 race:CONFLICT 后行又被并发 DELETE。retryAfterMs=0 → immediateRetries 接住。
+      throw new SessionPinTemporarilyUnavailableError(
+        `force_repin upsert race ambiguous: CONFLICT but no row visible on read`,
+        0,
+      )
+    }
+    const row = sel.rows[0]
+    if (row.status === 'unbound') {
+      // 防御性:WHERE status='unbound' 应该已经过滤进 UPDATE,理论不会读到 unbound row。
+      // 防未来 schema/逻辑漂移留个 actionable error。
+      throw new SessionPinUnboundError(
+        `force_repin reached unbound row that WHERE clause should have UPDATE'd; possible cascade race`,
+      )
+    }
+    return BigInt(row.account_id)
+  }
+
+  /**
+   * 释放一个已 pick 但不会被上层 release() 处理的 PickResult。
+   *
+   * 用于 race-lost 切换:当 caller 决定切到 winner 账号时,**手里这个**结果(losers)
+   * 已经 incInflight + 解密了 token,但不会真发请求 → 必须 dec inflight + 销毁 token,
+   * 防止泄漏。
+   *
+   * 不调 health tracker(没真发请求,onSuccess/onFailure 都不应触发)。
+   */
+  private releasePickResult(r: PickResult): void {
+    this.decInflight(r.account_id.toString())
+    r.token.fill(0)
+    r.refresh?.fill(0)
+  }
+
+  /**
+   * Observe 模式 metric:WRH 选择 vs pin 命中是否一致。
+   *
+   * 用于 enforce 上线前灰度阶段评估:
+   *   - "pin 在 active 池里跟 WRH 一致" → enforce 不会改变行为
+   *   - "pin 跟 WRH 不一致" → enforce 后会强 sticky 到 pin,流量分布会变
+   *   - "pin miss" → enforce 后会写 pin,首次 chat 行为不变
+   *
+   * 失败吞错(可能 DB 短暂闪断),不应阻断主路径。
+   */
+  private async observePinConsistency(
+    _userId: bigint,
+    _sessionId: string,
+    wrhChoice: bigint,
+    pin: { account_id: bigint; status: 'active' | 'unbound' } | null,
+  ): Promise<void> {
+    let outcome: 'pin_miss' | 'pin_unbound' | 'consistent' | 'divergent'
+    if (pin === null) outcome = 'pin_miss'
+    else if (pin.status === 'unbound') outcome = 'pin_unbound'
+    else if (pin.account_id === wrhChoice) outcome = 'consistent'
+    else outcome = 'divergent'
+    // metric: 通过 console 日志注入 — ops scrape 用关键字 session_pin_observe
+    // eslint-disable-next-line no-console
+    console.log(
+      JSON.stringify({
+        evt: 'session_pin_observe',
+        outcome,
+        wrh_account: wrhChoice.toString(),
+        pin_account: pin?.account_id.toString() ?? null,
+        pin_status: pin?.status ?? null,
+      }),
     )
   }
 

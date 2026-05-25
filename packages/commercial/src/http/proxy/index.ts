@@ -413,6 +413,17 @@ export function makeAnthropicProxyHandler(
       //   preparation_failed → 502 UPSTREAM_PREPARATION_FAILED  reject upstream_auth
       //
       // DeepSeek 路径:pickUpstream 直接合成 session(无 pool 访问)。
+      // v3 反关联根治 UX 闭环 — 解析客户端 force_repin 头:
+      //   `x-force-repin: 1` → 客户端在收到 409 SessionPinUnbound 后选择"保留对话历史"
+      //   路径,要求 scheduler 在同 session 上覆盖原 unbound pin 选新账号。仅在
+      //   sessionPinMode='enforce' 路径有意义,其它模式静默忽略。
+      //
+      // 严格只接受 '1' / 'true'(大小写不敏感)以防意外触发。Node 默认 header 名 lowercased。
+      const forceRepinHeader = req.headers["x-force-repin"];
+      const forceRepin =
+        typeof forceRepinHeader === "string" &&
+        (forceRepinHeader === "1" || forceRepinHeader.toLowerCase() === "true");
+
       const pickRes = await pickUpstream(
         {
           scheduler: deps.scheduler,
@@ -423,10 +434,15 @@ export function makeAnthropicProxyHandler(
           // wiring 一次性从 config 读;pickUpstream 内部把同值传给 scheduler.pick
           // 和 makeOAuthPoolUpstream(plan §5.5.4 防热改竞态)。
           phase6AccountUuidEnforce: deps.phase6AccountUuidEnforce,
+          // v3 反关联根治 — session pin 三态(off/observe/enforce)。wiring 一次性
+          // 从 config 读,pickUpstream 内部透传给 scheduler.pick;userId 一并下传。
+          sessionPinMode: deps.sessionPinMode,
         },
         body,
         route,
         userLog,
+        uid,
+        forceRepin,
       );
       if (!pickRes.ok) {
         await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
@@ -475,6 +491,66 @@ export function makeAnthropicProxyHandler(
             incrAnthropicProxyReject("upstream_auth");
             sendJsonError(res, 502, "UPSTREAM_PREPARATION_FAILED", "failed to prepare upstream session", requestId);
             return;
+          case "session_pin_unbound": {
+            // v3 反关联根治 — pin 已 cascade unbind(绑定账号被 ban)。
+            //
+            // 推荐客户端走 `retry_strategy='force_repin'`:同 session 重发请求 + 加
+            // `x-force-repin: 1` 头,scheduler 会在同 session 上覆盖 unbound pin
+            // 选新账号 → 保留对话历史,用户感知只是"上一轮慢"。
+            //
+            // 老客户端不识别 retry_strategy 字段时回落 `action='reset_session'`
+            // (走"开新会话"路径),两边都不会卡死。
+            userLog.warn("proxy_session_pin_unbound", { msg: pickRes.error.err.message });
+            incrAnthropicProxyReject("session_pin_unbound");
+            sendJsonError(
+              res,
+              409,
+              "SESSION_PIN_UNBOUND",
+              pickRes.error.err.message,
+              requestId,
+              undefined,
+              {
+                type: "session_pin_unbound",
+                action: pickRes.error.err.action, // 'reset_session' — 老 client fallback
+                retry_strategy: pickRes.error.err.retryStrategy, // 'force_repin' — 新 client 路径
+              },
+            );
+            return;
+          }
+          case "session_pin_temporarily_unavailable": {
+            // v3 反关联根治 — pin 指向账号瞬时不可用(cooldown / cap / race-lost
+            // winner 不在 pool)。scheduler.pick() facade 已在 server 内吃掉短
+            // cooldown(<3s);走到这里说明:
+            //   - cooldown 超过 SHORT_BACKOFF_MS(3s),或
+            //   - 累计已用满 HARD_TIMEOUT_MS(5s)预算,或
+            //   - immediateRetries 用尽
+            //
+            // 给客户端两个层次的 hint:
+            //   - Retry-After 秒(老客户端友好,标准 HTTP 重试头),
+            //     Math.max(1) 防 Retry-After:0 这种 RFC 灰区。
+            //   - retry_after_ms / fallback_strategy(新客户端精确控制 + 二次升级路径)。
+            const retryMs = pickRes.error.err.retryAfterMs;
+            const retrySec = Math.max(1, Math.ceil(retryMs / 1000));
+            userLog.warn("proxy_session_pin_temporarily_unavailable", {
+              msg: pickRes.error.err.message,
+              retryAfterMs: retryMs,
+            });
+            incrAnthropicProxyReject("session_pin_temporarily_unavailable");
+            sendJsonError(
+              res,
+              503,
+              "SESSION_PIN_TEMPORARILY_UNAVAILABLE",
+              "session pinned account temporarily unavailable, retry shortly",
+              requestId,
+              { "Retry-After": String(retrySec) },
+              {
+                type: "session_pin_temporarily_unavailable",
+                retry_after_ms: retryMs,
+                fallback_strategy: pickRes.error.err.fallbackStrategy, // 'force_repin_after_retry'
+              },
+            );
+            return;
+          }
         }
       }
       const session: PreparedUpstreamSession = pickRes.session;

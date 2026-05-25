@@ -47,6 +47,7 @@ import {
 } from "../../billing/preCheck.js";
 import type { TokenUsage } from "../../billing/calculator.js";
 import type { AccountScheduler } from "../../account-pool/scheduler.js";
+import { personaToHeaderPairs } from "../../account-pool/persona.js";
 import {
   type RateLimitConfig,
   type RateLimitRedis,
@@ -460,6 +461,30 @@ export function estimateMaxCostBothSides(
 }
 
 // ─── header allowlist ─────────────────────────────────────────────────────
+
+/**
+ * v3 反关联根治 — 把账号绑定的 persona 注入 safeHeaders。
+ *
+ * 调用方:applyUpstreamAuth(upstream.ts)— 持有 PickResult.persona,
+ * 在写完 Authorization / anthropic-beta 后调一次,把 stainless 系列头按账号差异化。
+ *
+ * 行为:
+ *   - persona == null:noop(0073 后 0074 NOT NULL 前的窗口 / 测试 mock 场景)
+ *   - persona 合法:in-place 写入 9 个键值对(user-agent / x-stainless-* / accept-language)
+ *
+ * 注意:**不**校验 persona 形状 — 调用方 PickResult.persona 已经走过 0074 CHECK + store
+ * 层 schema(0074 后)/runtime assertPersona(必要时)校验。本函数仅做无副作用的 spread。
+ */
+export function injectPersonaHeaders(
+  safeHeaders: Record<string, string>,
+  persona: import("../../account-pool/persona.js").Persona | null,
+): void {
+  if (persona === null) return;
+  // 直接 spread —— PersonaToHeaderPairs 已转 kebab-case,这里只 mutate 入参 map
+  for (const [k, v] of personaToHeaderPairs(persona)) {
+    safeHeaders[k] = v;
+  }
+}
 
 /**
  * 构造发给上游的 header。
@@ -1097,6 +1122,17 @@ export interface AnthropicProxyDeps {
    * 透传到 pickUpstream,见 plan §5.5.4(防止热改时 scheduler/hook 读不一致)。
    */
   phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
+  /**
+   * v3 反关联根治 — chat_session_account_pin 三态执行模式。
+   *
+   *   - `off`(默认):scheduler 走旧 WRH 路径,不查/不写 csap
+   *   - `observe`:    跑 WRH + 观察 pin 一致性打点(metric `session_pin_observe`),不写 csap
+   *   - `enforce`:    pin 命中 sticky;pin unbound 抛 409;pin miss 走"既往足迹优先"+ race-safe INSERT
+   *
+   * wiring 一次性从 `loadConfig().SESSION_PIN_MODE` 注入,handler 透传给 pickUpstream → scheduler.pick。
+   * 灰度路线 off → observe(收集 metric)→ enforce。
+   */
+  sessionPinMode?: import("../../account-pool/scheduler.js").SessionPinMode;
 }
 
 /**
@@ -1159,10 +1195,20 @@ export function sendJsonError(
   message: string,
   requestId: string,
   extraHeaders?: Record<string, string>,
+  /**
+   * 嵌入到 `error` object 内部的额外字段(例如 v3 session_pin_unbound 的
+   * `retry_strategy='force_repin'`,session_pin_temporarily_unavailable 的
+   * `retry_after_ms` / `fallback_strategy`)。客户端用这些 hint 实现"无 UI 自动闭环"。
+   *
+   * 默认 undefined → body 形如旧契约 `{ error: { code, message }, request_id }`。
+   */
+  extraErrorFields?: Record<string, unknown>,
 ): void {
   if (res.headersSent) return;
+  const errorBody: Record<string, unknown> = { code, message };
+  if (extraErrorFields) Object.assign(errorBody, extraErrorFields);
   const body = JSON.stringify({
-    error: { code, message },
+    error: errorBody,
     request_id: requestId,
   });
   const headers: Record<string, string> = {

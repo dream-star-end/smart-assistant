@@ -524,7 +524,14 @@ export type ProxyRejectReason =
   // router 返 503 EXTERNAL_PROXY_UNAVAILABLE,**不**计这个 counter;两者通过 error
   // code 区分。生产中只有 wiring bug / handler 装配漏注 dep 才会计这个,正常
   // 路径恒 0,非 0 即告警信号。
-  | "platform_envelope";
+  | "platform_envelope"
+  // v3 反关联根治 0073/0074 — chat_session_account_pin enforce 路径:
+  // - session_pin_unbound: 该 (user,session) 的 pin 已被级联置 unbound(账号 banned/disabled),
+  //   HTTP 409 SESSION_PIN_UNBOUND,要求前端重置 session 后重发,不可 retry。
+  // - session_pin_temporarily_unavailable: 钉死账号短期不可用(健康分耗尽 / 在 cooldown / 池外),
+  //   HTTP 503 + Retry-After,可由客户端重试。区分两者方便仪表盘看"被踢出 vs 临时抖动"。
+  | "session_pin_unbound"
+  | "session_pin_temporarily_unavailable";
 export function incrAnthropicProxyReject(reason: ProxyRejectReason): void {
   anthropicProxyReject.inc({ reason });
 }

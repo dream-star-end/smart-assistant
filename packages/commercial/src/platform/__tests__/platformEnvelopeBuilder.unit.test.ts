@@ -12,7 +12,9 @@
  *   - messages[0..] system-reminder 替换(string / array / meta prefix scan)
  *   - metadata.user_id 收紧 + EXTRA_METADATA strip + 顶层 session_id strip
  *   - HMAC 派生稳定性(fp3 / account_uuid)
- *   - session_id 服务端生成(UUID v4 shape + distinct + != client)
+ *   - session_id **来源策略翻转**(2026-05-25 反关联根治):优先信任客户端透传
+ *     metadata.user_id.session_id,客户端未送时 HMAC 派生稳定值(同 userId 恒等);
+ *     早期 "随机 UUID v4 + 强制 != client" 语义已废弃。
  *   - `now` hook 锁定日期字面
  *   - ERR.2 messages=undefined 不抛(builder 必须 fail-safe)
  *
@@ -411,7 +413,7 @@ describe("messages[0..] CCB <system-reminder> 替换", () => {
 // ─── metadata.user_id 收紧 + EXTRA_METADATA strip ─────────────────────
 
 describe("metadata 重写 — 收紧 user_id + EXTRA strip + 顶层 session_id strip", () => {
-  test("META.1 客户端 metadata.user_id JSON 含 device_id → 保留 device_id 占位", () => {
+  test("META.1 客户端 metadata.user_id JSON 含 device_id/session_id → device_id 保留占位,session_id 信任", () => {
     const body = makeBody({
       metadata: {
         user_id: JSON.stringify({
@@ -432,8 +434,8 @@ describe("metadata 重写 — 收紧 user_id + EXTRA strip + 顶层 session_id s
     // account_uuid 必为 server 派生(不等于 client 透传)
     assert.notEqual(userIdObj.account_uuid, "client-uuid");
     assert.equal(userIdObj.account_uuid, deriveAccountUuid(SECRET, 42n));
-    // session_id 必为 server 生成,不等于 client 透传
-    assert.notEqual(userIdObj.session_id, "client-session");
+    // session_id 翻转后由 client 提供(2026-05-25 根治),服务端信任不覆盖
+    assert.equal(userIdObj.session_id, "client-session");
   });
 
   test("META.2 客户端 metadata.user_id 是非 JSON 字符串 → device_id 占空串", () => {
@@ -543,31 +545,41 @@ describe("HMAC 派生稳定性 — fp3 / account_uuid", () => {
   });
 });
 
-// ─── session_id 服务端生成 ────────────────────────────────────────────
+// ─── session_id 来源策略 ──────────────────────────────────────────────
+// 2026-05-25 反关联根治翻转:client 优先,derived 兜底。
+// 见 platformEnvelopeBuilder.ts §session_id 来源策略。
 
-describe("session_id 服务端生成 — UUID v4 + distinct + != client", () => {
-  test("SES.1 多次 build 同 userId → session_id 各不相同(server-generated)", () => {
+describe("session_id 来源策略 — client 优先 / derived 兜底", () => {
+  test("SES.1 client 未送 + 同 userId → derived session_id 恒等(强 anti-correlation 锚)", () => {
     const sessions = new Set<string>();
+    const result = { source: "" as "client" | "derived" };
     for (let i = 0; i < 5; i++) {
       const body = makeBody();
-      buildOnce(body);
+      const r = buildPlatformEnvelope({
+        body,
+        ctx: null,
+        userId: 42n,
+        serverSecret: SECRET,
+        log,
+        now: fixedNow,
+      });
+      result.source = r.sessionIdSource;
       const obj = JSON.parse(body.metadata!.user_id as string);
       sessions.add(obj.session_id);
     }
-    assert.equal(sessions.size, 5);
+    // 同 userId 5 次 build,derived session_id 必须恒等
+    assert.equal(sessions.size, 1);
+    assert.equal(result.source, "derived");
   });
 
-  test("SES.2 session_id 形态 = UUID v4", () => {
+  test("SES.2 derived session_id 形态 = 36 字符 hex(非 UUID v4 形态,标记 server-derived 来源)", () => {
     const body = makeBody();
     buildOnce(body);
     const obj = JSON.parse(body.metadata!.user_id as string);
-    assert.match(
-      obj.session_id,
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
+    assert.match(obj.session_id, /^[0-9a-f]{36}$/);
   });
 
-  test("SES.3 client 透传 session_id 必被 server 覆盖", () => {
+  test("SES.3 client 透传 session_id → server 信任不覆盖(pin 表能锚定)", () => {
     const body = makeBody({
       metadata: {
         user_id: JSON.stringify({
@@ -577,9 +589,63 @@ describe("session_id 服务端生成 — UUID v4 + distinct + != client", () => 
         }),
       },
     });
-    buildOnce(body);
+    const r = buildPlatformEnvelope({
+      body,
+      ctx: null,
+      userId: 42n,
+      serverSecret: SECRET,
+      log,
+      now: fixedNow,
+    });
     const obj = JSON.parse(body.metadata!.user_id as string);
-    assert.notEqual(obj.session_id, "client-supplied-session-fixed-value");
+    assert.equal(obj.session_id, "client-supplied-session-fixed-value");
+    assert.equal(r.sessionIdSource, "client");
+  });
+
+  test("SES.4 client 送非法 session_id(空串 / 超长 / 非 string) → fallback derived", () => {
+    for (const bad of [
+      "", // 空串
+      "a".repeat(257), // 超 256
+      12345, // 非 string
+      null, // null
+    ]) {
+      const body = makeBody({
+        metadata: {
+          user_id: JSON.stringify({
+            device_id: "d",
+            account_uuid: "client-uuid",
+            session_id: bad,
+          }),
+        },
+      });
+      const r = buildPlatformEnvelope({
+        body,
+        ctx: null,
+        userId: 42n,
+        serverSecret: SECRET,
+        log,
+        now: fixedNow,
+      });
+      const obj = JSON.parse(body.metadata!.user_id as string);
+      assert.equal(r.sessionIdSource, "derived", `bad=${JSON.stringify(bad)}`);
+      assert.match(obj.session_id, /^[0-9a-f]{36}$/);
+    }
+  });
+
+  test("SES.5 derived session_id 由 (serverSecret, userId) 派生 — 跨 secret 不同,跨 userId 不同", () => {
+    const ALT_SECRET = "alt-platform-hmac-secret-32char_";
+    const bodyA = makeBody();
+    const bodyB = makeBody();
+    const bodyC = makeBody();
+    buildPlatformEnvelope({ body: bodyA, ctx: null, userId: 42n, serverSecret: SECRET, log, now: fixedNow });
+    buildPlatformEnvelope({ body: bodyB, ctx: null, userId: 42n, serverSecret: ALT_SECRET, log, now: fixedNow });
+    buildPlatformEnvelope({ body: bodyC, ctx: null, userId: 99n, serverSecret: SECRET, log, now: fixedNow });
+    const sA = JSON.parse(bodyA.metadata!.user_id as string).session_id;
+    const sB = JSON.parse(bodyB.metadata!.user_id as string).session_id;
+    const sC = JSON.parse(bodyC.metadata!.user_id as string).session_id;
+    assert.notEqual(sA, sB);
+    assert.notEqual(sA, sC);
+    assert.notEqual(sB, sC);
   });
 });
 

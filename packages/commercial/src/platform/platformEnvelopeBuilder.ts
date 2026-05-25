@@ -21,7 +21,11 @@
  *   - system[0]/[1]/[N+1] 多机字节级一致(同一 userId 跨机器跑)
  *   - metadata.user_id 的 key set 恒 3 项(device_id/account_uuid/session_id)
  *   - account_uuid 来自 HMAC(serverSecret, userId),稳定派生
- *   - session_id 服务端生成(crypto.randomUUID),不依赖客户端透传
+ *   - session_id **优先信任客户端透传**(2026-05-25 反关联根治翻转,见 §session_id
+ *     来源策略 below);仅在客户端未送时 fallback 到 HMAC(serverSecret,
+ *     "session:" + userId) 服务端派生稳定值。早期"每请求 randomUUID"语义已废弃 ——
+ *     该语义在外接 API 路径让 scheduler pin 表退化成"每 turn 一个新 pin",
+ *     彻底破坏 (user_id, session_id) → account 锚定能力。
  *
  * # H2 不变量
  *
@@ -37,7 +41,7 @@
  *   - ctx === null 时仍写 system[N+1] 占位块(保 block 数恒定)
  */
 
-import { randomUUID, createHmac } from "node:crypto";
+import { createHmac } from "node:crypto";
 
 import type { Logger } from "../logging/logger.js";
 import type { PlatformContext } from "./volumeContextReader.js";
@@ -339,6 +343,28 @@ function buildPlatformContextText(ctx: PlatformContext | null): string {
 /**
  * 强制重写 body.metadata 到 3-key shape:device_id / account_uuid / session_id。
  *
+ * # session_id 来源策略(2026-05-25 反关联根治翻转)
+ *
+ * 早期(Phase 5):服务端 randomUUID() 每请求重写,strip 客户端 session_id,
+ * 当时认为"每请求新 session_id"能防机器画像。**这是错的**:
+ *   - 真 Claude Code 用户 stainless SDK 复用 session_id(同一 conversation 整段同值)。
+ *   - "同账号 session_id 每 turn 都变"在 Anthropic 网关侧反而像机器人化信号。
+ *   - 更严重的是:scheduler pin 表 (user_id, session_id) → account 在这种模式下
+ *     永远 miss → 每 turn 选号都跑 WRH → 同一对话历史漂到多个 Anthropic 账号 →
+ *     内容关联 cluster ban(2026-05-25 d1+kraussosterland 事故根因)。
+ *
+ * 现在(根治版):
+ *   1. **优先**用客户端 metadata.user_id.session_id(如果存在且合法 string 形态)。
+ *      v3 web 前端 / CCB 容器 / 外接 API 客户端都应送稳定 session_id(每个
+ *      conversation 一个,scheduler 据此 pin。
+ *   2. 客户端没送 → fallback 到 HMAC(serverSecret, "session:" + userId) 派生稳定值。
+ *      派生值同 userId 恒等,等同于"该用户全局只能落到一个账号"(strict
+ *      anti-correlation 上限态),但 derived 命中率应当被 observability 持续监控,
+ *      推前端补送真 session_id 以恢复"每会话一个 pin"的容量分布。
+ *   3. 顶层 metadata.session_id(如客户端写在顶层)仍 strip(只用 user_id 内的)。
+ *
+ * # 字段语义
+ *
  * - device_id:占位(客户端原值或空串);applyUpstreamAuth → rewriteMetadataDeviceId
  *   后续阶段会覆盖为 pinned_user_id,这里写值只为过 proxyBodySchema 校验
  * - account_uuid:**HMAC 派生占位**(Phase 5 语义,过 schema 校验)。Phase 6
@@ -346,30 +372,60 @@ function buildPlatformContextText(ctx: PlatformContext | null): string {
  *   时用 `pick.account_uuid`(OAuth account 真 UUID,0070 migration)覆盖此占位,
  *   实现"两条路径都锚定到同一 OAuth account 的真 uuid"。`enforce=off` 时占位保留
  *   原样透出给 Anthropic(Phase 5 行为)。
- * - session_id:服务端生成 UUID v4,**不**透传客户端 session_id(防机器画像)
+ * - session_id:见上 session_id 来源策略。
  *
- * 顶层 metadata 上的 session_id(如客户端写在那)一并 strip。
+ * @returns "client" | "derived" — 用于 observability 上报 session_id 来源比例,
+ *          0% client 命中 = 前端漏改;100% client 命中 = 健康态。
  */
-function rewriteMetadata(body: ProxyBody, accountUuid: string): void {
+function rewriteMetadata(
+  body: ProxyBody,
+  accountUuid: string,
+  userId: bigint,
+  serverSecret: Buffer | string,
+): "client" | "derived" {
   const existing = body.metadata?.user_id;
   let clientDeviceId = "";
+  let clientSessionId: string | null = null;
   if (typeof existing === "string") {
     try {
       const parsed = JSON.parse(existing);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const did = (parsed as { device_id?: unknown }).device_id;
         if (typeof did === "string") clientDeviceId = did;
+        const sid = (parsed as { session_id?: unknown }).session_id;
+        // 校验:非空 string + 长度合理(防客户端塞超长 / 空串绕过)。形态宽容
+        // (不强制 UUID 形态),让前端有自由选择(可能用 chat-id 之类的稳定标识)。
+        if (typeof sid === "string" && sid.length >= 1 && sid.length <= 256) {
+          clientSessionId = sid;
+        }
       }
     } catch {
       // 客户端 metadata.user_id 非 JSON:占位空串,后续 applyUpstreamAuth 覆盖
     }
   }
+  const source: "client" | "derived" = clientSessionId !== null ? "client" : "derived";
+  const sessionId = clientSessionId ?? deriveSessionId(serverSecret, userId);
   const tight = {
     device_id: clientDeviceId,
     account_uuid: accountUuid,
-    session_id: randomUUID(),
+    session_id: sessionId,
   };
   body.metadata = { user_id: JSON.stringify(tight) };
+  return source;
+}
+
+/**
+ * HMAC 派生稳定 session_id(客户端未送时 fallback)。
+ *
+ * 同 userId 总是返回同一个值 — 强 anti-correlation 但限同用户单账号容量。
+ * 形态做成 36 字符 hex(UUID 长度,但**不**是 UUID v4 形态)— 保留 "看起来像 session_id"
+ * 的人格,同时与"客户端真 session_id"形态可区分(便于 observability 区分来源)。
+ */
+function deriveSessionId(serverSecret: Buffer | string, userId: bigint): string {
+  return createHmac("sha256", serverSecret)
+    .update(`session:${userId.toString()}`)
+    .digest("hex")
+    .slice(0, 36);
 }
 
 // ─── builder entry(plan §3.1 主流程)─────────────────────────────────
@@ -393,6 +449,13 @@ export interface BuildPlatformEnvelopeResult {
   systemReminderReplaced: boolean;
   /** 派生的 fp3。日志用。 */
   fp3: string;
+  /**
+   * session_id 实际来源(2026-05-25 反关联根治新增):
+   *   - "client" — 客户端透传了合法 session_id(健康态)
+   *   - "derived" — 客户端未送,fallback 到 HMAC 派生(同 userId 恒等)
+   * 用于 metrics 监控前端补送 session_id 进度;长期目标 100% client。
+   */
+  sessionIdSource: "client" | "derived";
 }
 
 /**
@@ -465,10 +528,16 @@ export function buildPlatformEnvelope(
   }
 
   // ── 6. metadata 重写 ──
+  // session_id 来源新语义:优先信任 client.session_id,缺失时 HMAC 派生稳定值
+  // (见 rewriteMetadata 内 §session_id 来源策略)。
+  let sessionIdSource: "client" | "derived" = "derived";
   try {
-    rewriteMetadata(body, accountUuid);
+    sessionIdSource = rewriteMetadata(body, accountUuid, userId, serverSecret);
   } catch (err) {
     log.warn("platform-envelope: metadata rewrite threw", { err: errSummary(err) });
+    // fail-safe:rewriteMetadata 一旦真抛了(此分支极罕见),metadata 可能未写,
+    // 但 sessionIdSource 不影响调用方决策(observe 模式只 metrics,enforce 模式由
+    // scheduler 凭 session_id 是否存在判断)。
   }
 
   return {
@@ -476,6 +545,7 @@ export function buildPlatformEnvelope(
     piiStrippedIndexes: piiHits,
     systemReminderReplaced,
     fp3,
+    sessionIdSource,
   };
 }
 

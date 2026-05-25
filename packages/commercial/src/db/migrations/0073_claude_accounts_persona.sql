@@ -1,0 +1,68 @@
+-- 0073_claude_accounts_persona.sql
+--
+-- v3 commercial 反关联指纹差异化:为每个 claude_account 持久化一份"伪装客户端身份"
+-- (persona),master 转发上游请求时按 account 注入 stainless / accept-language /
+-- user-agent / x-stainless-* 等头,让 Anthropic 网关看到的请求指纹**按账号差异化**。
+--
+-- 背景:
+--   现状 buildSafeUpstreamHeaders allowlist 把 CCB 携带的全部 stainless 头剥光,
+--   实际从 master 到 api.anthropic.com 的请求头只剩 5 个 + undici 默认 UA
+--   (`undici/x.x.x`)。所有账号、所有用户、所有 session 在 Anthropic 网关层
+--   是 byte-identical:User-Agent / Accept-Language / x-stainless-* 全相同。
+--
+--   配合 metadata.user_id 里的 account_uuid + pinned_user_id(0067/0070),
+--   Anthropic 完全可以做 "device fingerprint 完全一致 → 同一池" 聚类。
+--   这次 d1 + kraussosterland 27 分钟连环 ban 强烈指向这类聚类风控。
+--
+-- 修复策略:
+--   每个 claude_account 持有自己的 persona(JSON 对象),稳定不变 — 不要每次请求
+--   随机抖动,因为"同一账号请求头每次不同"才是真号商指纹。boss 已确认这是
+--   feedback_one_account_one_human.md 里的 L0 (强锁身份指纹) 设计语义。
+--
+--   persona 内容(由 account-pool/persona.ts 生成,池子定义见该文件):
+--     {
+--       "user_agent": "anthropic-ai-claude-code/<pkg_v> Node/<runtime_v> <OS>",
+--       "x_stainless_arch": "arm64" | "x64",
+--       "x_stainless_lang": "js",
+--       "x_stainless_os": "MacOS" | "Linux" | "Windows",
+--       "x_stainless_package_version": "<CCB pkg version>",
+--       "x_stainless_runtime": "node",
+--       "x_stainless_runtime_version": "v<major>.<minor>.<patch>",
+--       "x_stainless_retry_count": "0",
+--       "accept_language": "en-US,en;q=0.9" | "ja-JP,..." | "zh-CN,..."
+--     }
+--   注:具体字段集 + 取值池由 account-pool/persona.ts 定义并强校验。这里 schema
+--   只把它存成 JSONB(灵活演进 + 可索引),用一个简单的"包含必备 keys"约束兜底
+--   schema drift,但允许 forward-compatible 新增 keys。
+--
+-- Two-phase migration:
+--   0073(本文件):ADD COLUMN persona JSONB(可空)。运行后:
+--     - 新行需配套 backfill 才有 persona(否则为 NULL,master 会 fallback 到全局
+--       默认 persona,临时不破坏现网)。
+--     - 跑 scripts/backfill-account-persona.ts 给现有 14 行写 persona。
+--   0074:验证 backfill 全覆盖后,SET NOT NULL + 加强 CHECK 约束。
+--   两步走是为了避免"migration 跑完瞬间 NOT NULL violation 把 deploy 卡死"。
+--
+-- 与 0067 / 0070 / 0072 的关系:
+--   - 0067 pinned_user_id:account → device_id 永久映射(metadata.user_id.device_id)。
+--   - 0070 account_uuid:account → uuid 映射(metadata.user_id.account_uuid)。
+--   - 0072 chat_session_account_pin:session → account 持久绑定。
+--   - 0073/0074 persona:account → request header set 持久绑定。
+--   四者合起来形成完整的"一账号 = 一稳定身份 + 一稳定 device + 一稳定 header
+--   set",并通过 0072 保证"同一会话不跨账号"。
+--
+-- 部署验证:
+--   ALTER TABLE 应秒级完成(只加 nullable 列,无 row rewrite)。
+--   migration 后:
+--     SELECT count(*) FROM claude_accounts;
+--     SELECT count(persona) FROM claude_accounts;  -- 应 = 0(未 backfill 时)
+--   跑完 backfill:
+--     SELECT count(*), count(persona),
+--            count(DISTINCT persona->>'user_agent'),
+--            count(DISTINCT persona->>'x_stainless_os')
+--     FROM claude_accounts;
+--   预期 count = count(persona);DISTINCT user_agent / os 应有多个值
+--   (variants pool 撒得开)。
+
+ALTER TABLE claude_accounts
+  ADD COLUMN persona JSONB;

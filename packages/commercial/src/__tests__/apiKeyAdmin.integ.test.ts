@@ -314,6 +314,7 @@ function buildFakeScheduler(): AccountScheduler {
         egress_target: null,
         pinned_user_id: FIXED_PINNED_USER_ID,
         account_uuid: null,
+        persona: null,
       };
     },
     async release(_input: ReleaseInput): Promise<void> {},

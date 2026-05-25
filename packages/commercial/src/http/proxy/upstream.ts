@@ -37,8 +37,11 @@ import { errMessageShort, errSummary } from "../util.js";
 import {
   AccountPoolBusyError,
   AccountPoolUnavailableError,
+  SessionPinUnboundError,
+  SessionPinTemporarilyUnavailableError,
   type AccountScheduler,
   type PickResult,
+  type SessionPinMode,
 } from "../../account-pool/scheduler.js";
 import {
   shouldRefresh,
@@ -53,6 +56,7 @@ import {
   DEEPSEEK_UPSTREAM_ENDPOINT,
   isDeepseekModel,
   extractSessionId,
+  injectPersonaHeaders,
   isUuidLike,
   rewriteMetadataAccountUuid,
   rewriteMetadataDeviceId,
@@ -180,7 +184,18 @@ export type PickError =
   | { kind: "pool_busy"; err: AccountPoolBusyError }
   | { kind: "pool_unavailable"; err: AccountPoolUnavailableError }
   | { kind: "refresh_failed"; transient: boolean; err: unknown }
-  | { kind: "preparation_failed"; err: unknown };
+  | { kind: "preparation_failed"; err: unknown }
+  /**
+   * v3 反关联根治 — session pin 已 unbind(账号被 ban → cascade)。
+   * handler 映射 409 + `{ error: { type: 'session_pin_unbound', action: 'reset_session' } }`。
+   * 前端必须新建一个 chat session 才能继续(不允许同 session 切到新账号)。
+   */
+  | { kind: "session_pin_unbound"; err: SessionPinUnboundError }
+  /**
+   * v3 反关联根治 — session pin 指向账号瞬时不可用(cooldown / cap)。
+   * handler 映射 503 + Retry-After,前端 backoff retry。
+   */
+  | { kind: "session_pin_temporarily_unavailable"; err: SessionPinTemporarilyUnavailableError };
 
 export interface PickUpstreamDeps {
   scheduler: Pick<AccountScheduler, "pick" | "release">;
@@ -220,6 +235,18 @@ export interface PickUpstreamDeps {
    * makeOAuthPoolUpstream,避免热改时两处读不一致(plan §5.5.4)。
    */
   phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
+  /**
+   * v3 反关联根治 — chat_session_account_pin 三态执行模式。
+   *
+   * `off`(默认):scheduler 走旧 WRH-only 路径,不查/不写 csap。
+   * `observe`:    跑 WRH + 对比 pin 是否一致,打点日志,**不**写 csap。
+   * `enforce`:    pin 命中走 sticky;pin unbound 抛 SessionPinUnboundError(409);
+   *                pin miss 走"既往足迹优先"WRH + race-safe INSERT 持久化 pin。
+   *
+   * 灰度路线见 SessionPinMode 注释。observe/enforce 需要 caller 同时透传 userId,
+   * 否则 scheduler 内部降级 off + warn。
+   */
+  sessionPinMode?: SessionPinMode;
 }
 
 type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
@@ -270,7 +297,24 @@ function makeOAuthPoolUpstream(
     applyUpstreamAuth(safeHeaders, body, log) {
       // (i) Bearer
       safeHeaders.authorization = `Bearer ${pick.token.toString("utf8")}`;
-      // (ii) anthropic-beta merge "oauth-2025-04-20"
+      // (ii) v3 反关联根治 — persona 差异化注入(必须早于 anthropic-beta merge)
+      //   每个 account 持有自己的稳定 persona(0073/0074 migration + persona.ts);
+      //   把 user-agent / x-stainless-* / accept-language 9 个头按账号差异化,
+      //   让 Anthropic 网关看到的指纹**按账号差异化**(不再 byte-identical 全池)。
+      //   顺序选择:authorization → persona → anthropic-beta —— 跟原生 stainless
+      //   SDK 自然发包顺序对齐(标识头先于功能头);HTTP/2 wire 层 hash map 本不
+      //   敏感顺序,这里求"语义对齐"避免未来网关侧出现"按顺序签名/校验"型
+      //   反检测策略时落坑。
+      //   null = 0074 SET NOT NULL 前的 backfill 窗口或 schema drift。fail-open
+      //   (不注入,落回 undici 默认头),配 log.warn 让 ops 看到 backfill 进度。
+      if (pick.persona === null) {
+        log.warn("account_persona_missing", {
+          account_id: pick.account_id.toString(),
+        });
+      } else {
+        injectPersonaHeaders(safeHeaders, pick.persona);
+      }
+      // (iii) anthropic-beta merge "oauth-2025-04-20"(persona 之后,语义对齐)
       const existing = (safeHeaders["anthropic-beta"] ?? "")
         .split(",")
         .map((s) => s.trim())
@@ -380,6 +424,23 @@ export async function pickUpstream(
   body: ProxyBody,
   route: UpstreamRoute,
   log: Logger,
+  /**
+   * v3 反关联根治 — 已认证用户 id。csap pin 强制锚定到 (userId, sessionId);
+   * deps.sessionPinMode='off' 时调用方可省略,但建议**始终传**(灰度切到 observe 不需要
+   * 改 handler)。route='deepseek' 路径完全不消费 — 透传 undefined 安全。
+   */
+  userId?: bigint,
+  /**
+   * v3 反关联根治 UX 闭环 — 客户端"强制 repin"信号(来自 HTTP 头 `x-force-repin: 1`)。
+   *
+   * 仅在 sessionPinMode='enforce' 路径有意义:
+   *   - true → 跳过 prelude unbound 检查,允许 scheduler 在同 session 上覆盖原 unbound pin
+   *     直接选新账号,无需用户走"开新会话"路径(保留对话历史)。
+   *   - false / 未传 → 走正常 prelude(unbound → 抛 SessionPinUnboundError 让客户端决策)。
+   *
+   * deepseek / non-OAuth / pinMode != 'enforce' 路径透传也安全(scheduler 静默忽略)。
+   */
+  forceRepin?: boolean,
 ): Promise<
   | { ok: true; session: PreparedUpstreamSession }
   | { ok: false; error: PickError }
@@ -394,6 +455,7 @@ export async function pickUpstream(
   // 同值传入,避免热改时两处读不一致(plan §5.5.4)。默认 "off" — 缺 wiring 时
   // 兜底是 Phase 5 行为,outbound 不变。
   const phase6Enforce: Phase6AccountUuidEnforce = deps.phase6AccountUuidEnforce ?? "off";
+  const sessionPinMode: SessionPinMode = deps.sessionPinMode ?? "off";
 
   // OAuth path —— scheduler.pick
   let pick: PickResult;
@@ -403,6 +465,9 @@ export async function pickUpstream(
       sessionId: extractSessionId(body.metadata) ?? undefined,
       model: body.model,
       enforceAccountUuid: phase6Enforce === "fail_closed",
+      pinMode: sessionPinMode,
+      userId,
+      forceRepin,
     });
   } catch (err) {
     if (err instanceof AccountPoolBusyError) {
@@ -410,6 +475,12 @@ export async function pickUpstream(
     }
     if (err instanceof AccountPoolUnavailableError) {
       return { ok: false, error: { kind: "pool_unavailable", err } };
+    }
+    if (err instanceof SessionPinUnboundError) {
+      return { ok: false, error: { kind: "session_pin_unbound", err } };
+    }
+    if (err instanceof SessionPinTemporarilyUnavailableError) {
+      return { ok: false, error: { kind: "session_pin_temporarily_unavailable", err } };
     }
     throw err; // unknown — handler 外层 500
   }
@@ -501,6 +572,9 @@ export async function pickUpstream(
           // Phase 6 H6.D — refresh rebind 必须显式带 account_uuid。仅依赖
           // PickResult 字段约束不够,测试 mock/`as` 容易绕过去(Codex round 2 反馈)。
           account_uuid: pick.account_uuid,
+          // v3 反关联根治 0073/0074 — refresh rebind 必须保留 persona,
+          // 否则 token 续期后该 turn 的 stainless 头会丢失漂移属性。
+          persona: pick.persona,
         };
       } catch (err) {
         // (b₁) refresh 失败:
