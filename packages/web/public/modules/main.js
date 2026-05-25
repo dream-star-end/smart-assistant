@@ -730,20 +730,35 @@ function _collectDeviceFingerprint() {
   }
 }
 
-// ── doc-card 点击 race 拦截 ──
+// ── doc-card 点击拦截 ──
 // 容器文件 doc-card 走异步签名(markdown.js _renderLocalMedia + main.js
 // _resolveSignTarget)。卡片刚渲染时 href 还没填,用户秒点会"无反应"。
-// 这里在 capture 阶段拦截:未 resolved 时阻止默认 + await 签名 → 写回 card.href
-// → 再 .click() 触发一次同步事件,第二次进 handler 命中 resolved 分支放行,走
-// native anchor navigation(`<a download>` same-origin 强制下载,无 popup blocker
-// 顾虑因为这是 current-page navigation 不开新 tab)。
+//
+// **每次点击都重签**:signed URL 是 HMAC + 5min TTL 的(mediaSign.ts),不能
+// 把"曾经签过"当成"URL 仍有效"。原实现按 `dataset.signState === 'resolved'`
+// 短路放行,导致用户首次点击后过几分钟再点时,native anchor 拿过期 URL → 服务
+// 端 410 → 浏览器把 410 JSON body 当 .docx 保存(d1193355375 鸿蒙浏览器 case)。
+//
+// `<a>` 的 download navigation 失败**不触发** DOM error 事件(error 事件只对
+// `<img>/<audio>/<video>` 派发),所以下方 _installSignedMediaErrorRetry 的 onerror
+// 重签兜底对 doc-card 完全无效 —— 必须在 click 这一刻 verify URL 新鲜度。
+//
+// 每次都过 `signMediaPath()`:LRU cache 命中是微任务级延迟(UX 无感),cache 项
+// 过期会被 `_cacheGet` 自动 evict 走重签 RTT —— mediaSign.js 已是权威 URL 新鲜度
+// 来源,这里直接复用,不再维护并行的 DOM 状态机。
+//
+// **二次进入(`card.click()` 同步触发)** 用 WeakSet 仅包住 `.click()` 那一行,
+// 不覆盖异步签名期 —— 避免"签名 RTT 期间用户连点 → 第二次拿旧 href 直接放行"
+// 的同窄窗 bug。
+const _docCardNativeClick = new WeakSet()
 document.addEventListener(
   'click',
   async (e) => {
     const card = e.target.closest?.('.doc-card[data-pending-sign-path]')
     if (!card) return
-    // href 已就位 → native anchor 自己跑,按 card 上的 download attr 行为
-    if (card.dataset.signState === 'resolved' && card.getAttribute('href')) return
+    // 我们自己 `card.click()` 触发的同步重入:放行让 native anchor 跑 download。
+    // WeakSet 仅在下面 `.click()` 前后短暂置位,异步签名期不放行任何 click。
+    if (_docCardNativeClick.has(card)) return
 
     e.preventDefault()
     const absPath = card.dataset.pendingSignPath
@@ -778,11 +793,20 @@ document.addEventListener(
         return
       }
       card.href = url
+      // signState='resolved' 给下方 _resolveSignTarget MutationObserver 防重入用
+      // (line 838:`if (state === 'inflight' || 'resolved') return`),click 不再
+      // 依赖此字段判 URL 新鲜度。保留命名是为不破坏 _resolveSignTarget 状态机。
       card.dataset.signState = 'resolved'
-      // 同步 .click() 触发新 click event:capture handler 第二次进入命中 resolved
-      // 分支 return,native anchor 按 download attr 行为下载(不开新 tab,无 popup
-      // 拦截),对话页保留不离开
-      card.click()
+      // 同步 .click() 触发新 click event:capture handler 立即进入,WeakSet 命中
+      // 后放行让 native anchor 按 download attr 行为下载(不开新 tab,无 popup
+      // 拦截),对话页保留不离开。WeakSet 必须**只**包住这一行同步执行窗口,
+      // 防止"异步签名期内连点"绕过新鲜度校验。
+      _docCardNativeClick.add(card)
+      try {
+        card.click()
+      } finally {
+        _docCardNativeClick.delete(card)
+      }
     } finally {
       card.classList.remove('doc-card-pending')
     }
