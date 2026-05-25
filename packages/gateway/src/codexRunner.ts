@@ -156,16 +156,42 @@ export interface CodexRunnerOpts {
 }
 
 /**
+ * Codex CLI 接受 `-c model_reasoning_effort=<val>`,合法值实测:
+ *   none, minimal, low, medium, high, xhigh
+ * 协议 `InboundMessage.effortLevel` 允许 low/medium/high/xhigh/max(对齐
+ * Opus 4.7 + DeepSeek 的统一前端模型)。这里:
+ *   - low/medium/high/xhigh → 透传
+ *   - max → 显式映射 xhigh(用户意图"最高",不能静默退回 codex 默认 medium)
+ *   - 其他/缺失 → 不带 effort flag,让 codex 用它的默认(medium)
+ *
+ * 抽成 helper 是因为 `codexRunner.ts`(`codex exec`)和 `codexAppServerRunner.ts`
+ * (`codex app-server`)两条 spawn 路径各自拼 argv,公共归一逻辑必须一处定义,
+ * 否则 `max → xhigh` 映射 / allowlist 任一改动都会两边漂移。
+ */
+const CODEX_EFFORT_DIRECT = new Set(['low', 'medium', 'high', 'xhigh'])
+export function codexReasoningEffortConfig(level: string | undefined | null): string[] {
+  if (typeof level !== 'string' || level.length === 0) return []
+  const normalized = level === 'max' ? 'xhigh' : level
+  if (!CODEX_EFFORT_DIRECT.has(normalized)) return []
+  return ['-c', `model_reasoning_effort="${normalized}"`]
+}
+
+/**
  * Build codex `exec` argv. Module-level export so tests / overrides can drive
  * the same builder the runner uses internally without poking at private
  * `buildArgs`. v3 keeps `--full-auto` + `-c approval_policy="never"` (codex
  * resume rejects bare `--sandbox`); platform context overrides are sliced in
  * BEFORE the trailing positional (`threadId` / `-`) so codex's clap parser
  * still sees the stdin sentinel last.
+ *
+ * `effortLevel` 经 `codexReasoningEffortConfig` 归一化后跟在 base `-c` 后,
+ * 在 extraConfig(platform context overrides)前 — 让 platform overrides 仍能
+ * 末位覆盖 effort(理论上不该,但语义上"调用方更晚的 -c 胜出"更直觉)。
  */
 export function buildCodexCliArgs(opts: {
   model?: string
   threadId?: string | null
+  effortLevel?: string | null
   /** Extra `-c key=value` argv pairs from `buildCodexLaunchOverrides()`. */
   extraConfig?: string[]
 }): string[] {
@@ -177,11 +203,12 @@ export function buildCodexCliArgs(opts: {
     'approval_policy="never"',
   ]
   if (opts.model) base.push('--model', opts.model)
+  const effort = codexReasoningEffortConfig(opts.effortLevel ?? undefined)
   const extra = opts.extraConfig ?? []
   if (opts.threadId) {
-    return ['exec', 'resume', ...base, ...extra, opts.threadId, '-']
+    return ['exec', 'resume', ...base, ...effort, ...extra, opts.threadId, '-']
   }
-  return ['exec', ...base, ...extra, '-']
+  return ['exec', ...base, ...effort, ...extra, '-']
 }
 
 /** Max stderr we keep per turn. Codex CLI normally logs only on error, but
@@ -318,10 +345,18 @@ export class CodexRunner extends EventEmitter {
   }
 
   setEffortLevel(level: string | undefined): void {
-    // codex CLI manages its own effort flag; we don't pass it through to the
-    // codex argv. But we DO record it on the runner so a subsequent
-    // ensureLaunchOverrides() (after shutdown clears the cache) reflects the
-    // new value when buildPromptContext renders the RESEARCH slot.
+    // v1.0.200 起 effort 主通道改成 codex argv:`buildArgs` 调 `buildCodexCliArgs`
+    // 时透传 `this.effortLevel`,经 `codexReasoningEffortConfig` 归一化追加
+    // `-c model_reasoning_effort="<level>"`(max → xhigh)。
+    //
+    // RESEARCH slot 仍由 buildPromptContext 单独维护,仅在 effortLevel === 'max'
+    // 时注入"科研模式"提示文本(目前主要服务 Opus/DeepSeek 异常 max payload);
+    // codex 前端不暴露 max(effortMode.js 仅给 gpt-5.5 暴露 low/medium/high/xhigh),
+    // 所以正常 gpt-5.5 effort 走 argv,不会同时进 RESEARCH slot。
+    //
+    // setEffortLevel 仍只 stash on this — 当前 in-flight `codex exec` 子进程不
+    // 接受运行时切档,值在下次 spawn 生效;sessionManager.submit 会在切档时
+    // 显式 shutdown(),让下一 turn 的 buildArgs() 读到新值。
     this.effortLevel = level
   }
 
@@ -614,6 +649,7 @@ export class CodexRunner extends EventEmitter {
     return buildCodexCliArgs({
       model: this.opts.model,
       threadId: this.threadId,
+      effortLevel: this.effortLevel,
       extraConfig,
     })
   }
