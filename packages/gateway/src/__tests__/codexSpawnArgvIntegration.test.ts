@@ -153,6 +153,62 @@ describe('CodexRunner runTurn → spawn argv', () => {
     await runner.shutdown()
   })
 
+  it('setEffortLevel("high") → spawn argv has -c model_reasoning_effort="high" before stdin sentinel', async () => {
+    // v1.0.200 — gpt-5.5 思考深度通过 codex argv 主通道传,前端 setEffortLevel
+    // 写到 runner.effortLevel,下次 spawn 时由 codexReasoningEffortConfig 归一化。
+    const runner = new CodexRunner({
+      sessionKey: 'spawn-effort-high',
+      agentId: 'spawn-agent',
+      cwd,
+      config: makeFakeConfig('tok-spawn-effort'),
+    })
+    runner.setEffortLevel('high')
+    await runner.submit('hello').catch(() => {})
+    assert.equal(captured.length, 1)
+    const { args } = captured[0]!
+    const effortIdx = args.indexOf('model_reasoning_effort="high"')
+    assert.ok(effortIdx > 0, `expected effort -c slot; got ${JSON.stringify(args)}`)
+    assert.equal(args[effortIdx - 1], '-c')
+    assert.ok(effortIdx < args.lastIndexOf('-'), 'effort must precede stdin sentinel')
+    await runner.shutdown()
+  })
+
+  it('setEffortLevel("max") → spawn argv carries xhigh (explicit map, not silent ignore)', async () => {
+    const runner = new CodexRunner({
+      sessionKey: 'spawn-effort-max',
+      agentId: 'spawn-agent',
+      cwd,
+      config: makeFakeConfig('tok-spawn-effort-max'),
+    })
+    runner.setEffortLevel('max')
+    await runner.submit('hello').catch(() => {})
+    assert.equal(captured.length, 1)
+    const { args } = captured[0]!
+    assert.ok(
+      args.includes('model_reasoning_effort="xhigh"'),
+      `max must surface as xhigh; got ${JSON.stringify(args)}`,
+    )
+    assert.ok(!args.includes('model_reasoning_effort="max"'))
+    await runner.shutdown()
+  })
+
+  it('no setEffortLevel → spawn argv has no effort -c slot (codex CLI default applies)', async () => {
+    const runner = new CodexRunner({
+      sessionKey: 'spawn-effort-none',
+      agentId: 'spawn-agent',
+      cwd,
+      config: makeFakeConfig('tok-spawn-effort-none'),
+    })
+    await runner.submit('hello').catch(() => {})
+    assert.equal(captured.length, 1)
+    const { args } = captured[0]!
+    assert.ok(
+      !args.some((a) => typeof a === 'string' && a.startsWith('model_reasoning_effort=')),
+      `no effort set must produce no effort arg; got ${JSON.stringify(args)}`,
+    )
+    await runner.shutdown()
+  })
+
   it('resume path: -c slots precede threadId, threadId precedes stdin sentinel', async () => {
     const runner = new CodexRunner({
       sessionKey: 'spawn-resume',
@@ -259,6 +315,80 @@ describe('CodexAppServerRunner ensureSpawned → spawn argv', () => {
       )
     }
 
+    await runner.shutdown()
+  })
+
+  it('setEffortLevel("high") → app-server argv has -c model_reasoning_effort="high" before --listen', async () => {
+    // codex app-server 与 codex exec 共用 codexReasoningEffortConfig helper,这里
+    // 验证 helper 接到 ensureSpawned 的 args 数组里且位序正确(所有 -c 必须在
+    // --listen 之前,否则 clap 把 stdio:// 当成 -c 的值)。
+    const runner = new CodexAppServerRunner({
+      sessionKey: 'aps-spawn-effort',
+      agentId: 'aps-agent',
+      cwd,
+      config: makeFakeConfig('tok-aps-effort'),
+    })
+    runner.setEffortLevel('high')
+    void runner.submit('warm up').catch(() => {})
+    const deadline = Date.now() + 2000
+    while (captured.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.equal(captured.length, 1)
+    const { args } = captured[0]!
+    const effortIdx = args.indexOf('model_reasoning_effort="high"')
+    const listenIdx = args.indexOf('--listen')
+    assert.ok(effortIdx > 0, `expected effort -c slot; got ${JSON.stringify(args)}`)
+    assert.equal(args[effortIdx - 1], '-c')
+    assert.ok(effortIdx < listenIdx, 'effort -c must precede --listen')
+    // All `-c` slots must precede --listen.
+    args.forEach((tok, i) => {
+      if (tok === '-c') assert.ok(i < listenIdx, '-c slot leaked past --listen')
+    })
+    await runner.shutdown()
+  })
+
+  it('setEffortLevel("max") → app-server argv carries xhigh (explicit map)', async () => {
+    const runner = new CodexAppServerRunner({
+      sessionKey: 'aps-spawn-effort-max',
+      agentId: 'aps-agent',
+      cwd,
+      config: makeFakeConfig('tok-aps-effort-max'),
+    })
+    runner.setEffortLevel('max')
+    void runner.submit('warm up').catch(() => {})
+    const deadline = Date.now() + 2000
+    while (captured.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.equal(captured.length, 1)
+    const { args } = captured[0]!
+    assert.ok(
+      args.includes('model_reasoning_effort="xhigh"'),
+      `max must surface as xhigh; got ${JSON.stringify(args)}`,
+    )
+    assert.ok(!args.includes('model_reasoning_effort="max"'))
+    await runner.shutdown()
+  })
+
+  it('no setEffortLevel → app-server argv has no effort -c slot', async () => {
+    const runner = new CodexAppServerRunner({
+      sessionKey: 'aps-spawn-effort-none',
+      agentId: 'aps-agent',
+      cwd,
+      config: makeFakeConfig('tok-aps-effort-none'),
+    })
+    void runner.submit('warm up').catch(() => {})
+    const deadline = Date.now() + 2000
+    while (captured.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.equal(captured.length, 1)
+    const { args } = captured[0]!
+    assert.ok(
+      !args.some((a) => typeof a === 'string' && a.startsWith('model_reasoning_effort=')),
+      `no effort set must produce no effort arg; got ${JSON.stringify(args)}`,
+    )
     await runner.shutdown()
   })
 })

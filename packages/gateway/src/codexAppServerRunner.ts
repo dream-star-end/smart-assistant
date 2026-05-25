@@ -13,7 +13,12 @@ import { join } from 'node:path'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from './codexLaunchOverrides.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
-import { _sanitizeThreadId, buildCodexEnv, copyImagePathsToPublicDir } from './codexRunner.js'
+import {
+  _sanitizeThreadId,
+  buildCodexEnv,
+  codexReasoningEffortConfig,
+  copyImagePathsToPublicDir,
+} from './codexRunner.js'
 import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
@@ -581,10 +586,17 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   setEffortLevel(level: string | undefined): void {
-    // codex CLI manages its own effort flag; we don't pass it to thread/start.
-    // We DO record it on the runner so a subsequent ensureLaunchOverrides()
-    // (after shutdown clears the cache) reflects the new value when
-    // buildPromptContext renders the RESEARCH slot.
+    // v1.0.200 起 effort 主通道改成 codex argv:`ensureSpawned` 调
+    // `codexReasoningEffortConfig(this.effortLevel)` 拼 `-c model_reasoning_effort=...`
+    // 透传给 `codex app-server` 进程,与 codexRunner.ts 同 helper、同 `max → xhigh` 归一。
+    //
+    // RESEARCH slot 仍由 buildPromptContext 单独维护,仅在 effortLevel === 'max'
+    // 时注入"科研模式"提示文本(主要服务 Opus/DeepSeek 异常 max payload);
+    // codex 前端不暴露 max,正常 gpt-5.5 effort 走 argv,不会同时进 RESEARCH slot。
+    //
+    // setEffortLevel 仍只 stash on this — 长寿 `codex app-server` 进程不接受
+    // 运行时切档,值在下次 spawn 生效;sessionManager.submit 会在切档时显式
+    // shutdown(),让下一 turn ensureSpawned() 读到新值。
     this.effortLevel = level
   }
 
@@ -947,7 +959,14 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     // `codex app-server` accepts `-c key=value` overrides. They must precede
     // `--listen` so clap's positional/option parser sees the stdio:// last.
-    const args = ['app-server', ...argvOverrides, '--listen', 'stdio://']
+    //
+    // v1.0.200:effort 进 codex argv 主通道。`codexReasoningEffortConfig()` 把
+    // 协议级 effortLevel (low/medium/high/xhigh/max) 归一为 codex 接受的
+    // `-c model_reasoning_effort="<low|medium|high|xhigh>"`(max → xhigh)。
+    // 与 codexRunner.ts 同 helper、同语义,任何 normalize 改动一处生效。
+    // 缺失/非法 → 空数组,codex 用 CLI 默认。
+    const effortArgs = codexReasoningEffortConfig(this.effortLevel)
+    const args = ['app-server', ...argvOverrides, ...effortArgs, '--listen', 'stdio://']
     // Phase 5:spawn cwd 用 effectiveCwd(ready 时 = repo workspaceDir,其它 = opts.cwd)。
     // 虽然 codex app-server 本质是个 JSON-RPC 服务,proc 自身 cwd 大多数子命令不直接用,
     // 但保持与 thread/start.cwd 一致避免任何"哪边是真值"的混淆。

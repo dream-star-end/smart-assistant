@@ -17,7 +17,7 @@ import * as assert from 'node:assert/strict'
  *      as positional resume args.
  */
 import { describe, it } from 'node:test'
-import { buildCodexCliArgs } from '../codexRunner.js'
+import { buildCodexCliArgs, codexReasoningEffortConfig } from '../codexRunner.js'
 
 describe('buildCodexCliArgs', () => {
   it('fresh-exec path: --full-auto + -c approval_policy="never" + stdin sentinel', () => {
@@ -99,5 +99,108 @@ describe('buildCodexCliArgs', () => {
       args.includes('model_instructions_file="/tmp/x.md"'),
       'platform-context slot must be present after splice',
     )
+  })
+
+  // ── v1.0.200 — reasoning effort (gpt-5.5 / codex models) ──────────────────
+  //
+  // effort 从前端单独通道 (RESEARCH slot) 改成 codex argv 主通道,理由:
+  //   - codex CLI 接受 `-c model_reasoning_effort="<low|medium|high|xhigh>"`,
+  //     比往 prompt 里塞 hint 更可靠;
+  //   - app-server 与 exec 两条 spawn 路径要共用同一个归一规则,helper 抽出来。
+  //
+  // 这里测的是 effortLevel → argv 的纯映射:
+  //   - 直通档位 low/medium/high/xhigh 原样发;
+  //   - `max` 是协议级遗留,显式映射成 codex 的最高档 xhigh(不是默默丢);
+  //   - undefined / 非法值 → 空数组(让 codex 用 CLI 默认)。
+  it('effortLevel=low → argv contains -c model_reasoning_effort="low"', () => {
+    const args = buildCodexCliArgs({ effortLevel: 'low' })
+    const idx = args.indexOf('model_reasoning_effort="low"')
+    assert.ok(idx >= 0, `expected effort -c slot; got ${args.join(' ')}`)
+    assert.equal(args[idx - 1], '-c')
+  })
+
+  it('effortLevel=medium → argv contains -c model_reasoning_effort="medium"', () => {
+    const args = buildCodexCliArgs({ effortLevel: 'medium' })
+    const idx = args.indexOf('model_reasoning_effort="medium"')
+    assert.ok(idx >= 0, `expected effort -c slot; got ${args.join(' ')}`)
+    assert.equal(args[idx - 1], '-c')
+  })
+
+  it('effortLevel=high / xhigh pass through verbatim', () => {
+    const high = buildCodexCliArgs({ effortLevel: 'high' })
+    assert.ok(high.includes('model_reasoning_effort="high"'))
+    const xhigh = buildCodexCliArgs({ effortLevel: 'xhigh' })
+    assert.ok(xhigh.includes('model_reasoning_effort="xhigh"'))
+  })
+
+  it('effortLevel=max → explicit map to xhigh (NOT silent ignore)', () => {
+    // boss decision per Codex review #2: max 是历史协议值,前端 UI 已不暴露,
+    // 但残留 session / agent profile 里可能仍有它。silent ignore 会让用户感知
+    // 不到档位掉档,显式映射到 codex 接受的最高档 xhigh 保留意图。
+    const args = buildCodexCliArgs({ effortLevel: 'max' })
+    assert.ok(
+      args.includes('model_reasoning_effort="xhigh"'),
+      `max must map to xhigh; got ${args.join(' ')}`,
+    )
+    assert.ok(!args.includes('model_reasoning_effort="max"'))
+  })
+
+  it('effortLevel undefined / null / "" / unknown → no effort arg', () => {
+    for (const v of [undefined, null, '', 'minimal', 'none', 'turbo'] as const) {
+      const args = buildCodexCliArgs({ effortLevel: v as any })
+      assert.ok(
+        !args.some((a) => typeof a === 'string' && a.startsWith('model_reasoning_effort=')),
+        `effortLevel=${String(v)} must produce no effort arg; got ${args.join(' ')}`,
+      )
+    }
+  })
+
+  it('effortLevel=medium + threadId → full positional order: flags → effort → threadId → -', () => {
+    const args = buildCodexCliArgs({ effortLevel: 'medium', threadId: 'thread_xyz' })
+    assert.deepEqual(args, [
+      'exec',
+      'resume',
+      '--json',
+      '--skip-git-repo-check',
+      '--full-auto',
+      '-c',
+      'approval_policy="never"',
+      '-c',
+      'model_reasoning_effort="medium"',
+      'thread_xyz',
+      '-',
+    ])
+  })
+
+  it('effort arg precedes positional threadId / stdin sentinel', () => {
+    const args = buildCodexCliArgs({ effortLevel: 'high', threadId: 'thr_p' })
+    const effortIdx = args.indexOf('model_reasoning_effort="high"')
+    const tidIdx = args.indexOf('thr_p')
+    const dashIdx = args.lastIndexOf('-')
+    assert.ok(effortIdx > 0 && tidIdx > effortIdx && dashIdx > tidIdx)
+  })
+})
+
+describe('codexReasoningEffortConfig', () => {
+  it('returns empty array for missing / empty / invalid input', () => {
+    assert.deepEqual(codexReasoningEffortConfig(undefined), [])
+    assert.deepEqual(codexReasoningEffortConfig(null), [])
+    assert.deepEqual(codexReasoningEffortConfig(''), [])
+    assert.deepEqual(codexReasoningEffortConfig('turbo'), [])
+    assert.deepEqual(codexReasoningEffortConfig('minimal'), [])
+  })
+
+  it('returns -c slot for direct levels', () => {
+    assert.deepEqual(codexReasoningEffortConfig('low'), ['-c', 'model_reasoning_effort="low"'])
+    assert.deepEqual(codexReasoningEffortConfig('medium'), [
+      '-c',
+      'model_reasoning_effort="medium"',
+    ])
+    assert.deepEqual(codexReasoningEffortConfig('high'), ['-c', 'model_reasoning_effort="high"'])
+    assert.deepEqual(codexReasoningEffortConfig('xhigh'), ['-c', 'model_reasoning_effort="xhigh"'])
+  })
+
+  it('max → xhigh explicit map', () => {
+    assert.deepEqual(codexReasoningEffortConfig('max'), ['-c', 'model_reasoning_effort="xhigh"'])
   })
 })

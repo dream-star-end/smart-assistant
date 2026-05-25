@@ -1336,12 +1336,21 @@ async function allocateBoundIpAndInsertRow(
   secretHash: Buffer,
   pickIp: () => string,
   hostUuid: string,
+  image: string,
   fixedBoundIp?: string,
 ): Promise<{ id: number; boundIp: string }> {
+  // image 列从 v3 一开始就被 0017 migration drop NOT NULL 留作 NULL,但 admin UI
+  // 的 /agent-containers 列表(packages/web/public/modules/admin.js)始终读 c.image
+  // 渲染为版本列。0017 注释说"image 字段语义被 OC_RUNTIME_IMAGE env 取代"在
+  // 全 fleet 同步用同一镜像时成立,但 host upgrade 后老容器仍跑老镜像的场景,
+  // per-container 快照才是对的。因此这里写 deps.image —— provision 时的镜像
+  // 标签,与 v2 路径(subscriptions.ts INSERT)对称。
+  // 历史 NULL 行不 backfill:v3 ephemeral 容器在 lazy reprovision 时自然修复,
+  // 残留 NULL 行均已 vanished / stopped,admin 不再操作。
   const insertSql = `INSERT INTO agent_containers
-       (user_id, host_uuid, bound_ip, secret_hash, state, port, last_ws_activity, created_at, updated_at)
+       (user_id, host_uuid, bound_ip, secret_hash, state, port, image, last_ws_activity, created_at, updated_at)
      VALUES
-       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, NOW(), NOW(), NOW())
+       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, $6::text, NOW(), NOW(), NOW())
      RETURNING id`;
 
   // B.4: scheduler 已经为我们选好了 IP — 不 retry,冲突直接 NameConflict。
@@ -1349,7 +1358,7 @@ async function allocateBoundIpAndInsertRow(
   if (fixedBoundIp !== undefined) {
     try {
       const r = await client.query<{ id: string }>(insertSql, [
-        String(uid), hostUuid, fixedBoundIp, secretHash, V3_CONTAINER_PORT,
+        String(uid), hostUuid, fixedBoundIp, secretHash, V3_CONTAINER_PORT, image,
       ]);
       const id = Number.parseInt(r.rows[0]!.id, 10);
       return { id, boundIp: fixedBoundIp };
@@ -1370,7 +1379,7 @@ async function allocateBoundIpAndInsertRow(
     const candidate = pickIp();
     try {
       const r = await client.query<{ id: string }>(insertSql, [
-        String(uid), hostUuid, candidate, secretHash, V3_CONTAINER_PORT,
+        String(uid), hostUuid, candidate, secretHash, V3_CONTAINER_PORT, image,
       ]);
       const id = Number.parseInt(r.rows[0]!.id, 10);
       return { id, boundIp: candidate };
@@ -1593,7 +1602,7 @@ export async function provisionV3Container(
     }
     secretHash = hashSecretToBuffer(secret);
 
-    row = await allocateBoundIpAndInsertRow(client, uid, secretHash, pickIp, effectiveHostUuid, boundIp);
+    row = await allocateBoundIpAndInsertRow(client, uid, secretHash, pickIp, effectiveHostUuid, deps.image, boundIp);
 
     // 3) docker create with --ip + 4 个 anthropic env + cap-drop + tmpfs + 单 volume
     const token = `oc-v3.${row.id}.${secret}`;

@@ -202,6 +202,10 @@ type FakeRow = {
   secret_hash: Buffer;
   state: "active" | "vanished";
   port: number;
+  // v1.0.200 — provision 写 image 列(快照),admin UI 列表读它显示版本。
+  // 0017 drop NOT NULL 但 v3 supervisor 现在显式 INSERT,FakeRow 必须存,
+  // 否则 image 列断言假阴。
+  image: string;
   container_internal_id: string | null;
   last_ws_activity: Date;
   created_at: Date;
@@ -269,12 +273,13 @@ class FakePool {
             e.constraint = constraintName;
             throw e;
           }
-          // params: [user_id, host_uuid, bound_ip, secret_hash, port]
+          // params: [user_id, host_uuid, bound_ip, secret_hash, port, image]
           const userId = Number.parseInt(String(params![0]), 10);
           const hostUuid = params![1] == null ? null : String(params![1]);
           const boundIp = String(params![2]);
           const secretHash = params![3] as Buffer;
           const port = Number(params![4]);
+          const image = String(params![5]);
           // 真 uniq:active 中已有同 IP → 23505
           if (self.rows.some((r) => r.state === "active" && r.bound_ip === boundIp)) {
             const e = new Error("duplicate key") as Error & { code: string; constraint: string };
@@ -292,6 +297,7 @@ class FakePool {
             secret_hash: secretHash,
             state: "active",
             port,
+            image,
             container_internal_id: null,
             last_ws_activity: now,
             created_at: now,
@@ -646,6 +652,10 @@ describe("provisionV3Container", () => {
     assert.equal(row.bound_ip, "172.30.7.7");
     assert.equal(row.state, "active");
     assert.equal(row.port, V3_CONTAINER_PORT);
+    // v1.0.200 — provision 必须把 deps.image 快照写进 image 列,
+    // admin UI containers tab 据此渲染镜像版本(packages/web/public/modules/admin.js:3307)。
+    // 0017 drop NOT NULL 但 v3 现在仍显式写入,符合"per-container 镜像快照"语义。
+    assert.equal(row.image, TEST_IMAGE);
     assert.equal(row.container_internal_id, captured.containersCreated.length === 1 ? "dockerid-1" : null);
     // SHA-256(secret_bytes) — 与 containerIdentity.hashSecret 同算法
     const expected = createHash("sha256").update(Buffer.from(SECRET, "hex")).digest();
@@ -669,6 +679,24 @@ describe("provisionV3Container", () => {
     assert.equal(result.boundIp, "172.30.0.12");
     assert.equal(pool.insertCount, 3);
     assert.equal(pool.rows.length, 1);
+    // retry 路径每次重试都要带 image,不能 conflict 后丢字段(v1.0.200 image col 回归锁)
+    assert.equal(pool.rows[0]!.image, TEST_IMAGE);
+  });
+
+  test("placement 指定 boundIp 的 fixed 分支也写 image(v1.0.200 image col 回归锁)", async () => {
+    // scheduler 给定 boundIp 时走 allocateBoundIpAndInsertRow 的 fixedBoundIp 分支
+    // (不 retry,直接 NameConflict)。两条分支的 INSERT 都必须带 image 列,
+    // 否则 admin UI 渲染随机分支与 placement 分支差异化空白 — 加锁回归。
+    const { docker } = makeDocker();
+    const result = await provisionV3Container(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomSecret: fixedSecret("e".repeat(64)) },
+      57,
+      TEST_HOST,
+      "172.30.5.99",
+    );
+    assert.equal(result.boundIp, "172.30.5.99");
+    assert.equal(pool.rows.length, 1);
+    assert.equal(pool.rows[0]!.image, TEST_IMAGE);
   });
 
   test("idx_ac_host_bound_ip_active(0030 composite,0048 后新仲裁器)冲突也走 retry 路径", async () => {
