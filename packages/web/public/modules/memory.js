@@ -1,8 +1,8 @@
-import { apiGet, apiJson } from './api.js?v=1cf7225d'
+import { apiGet, apiJson } from './api.js?v=dc93afec'
 // OpenClaude — Memory + Skills
-import { $, htmlSafeEscape } from './dom.js?v=1cf7225d'
-import { getSession, state } from './state.js?v=1cf7225d'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=1cf7225d'
+import { $, htmlSafeEscape } from './dom.js?v=dc93afec'
+import { getSession, state } from './state.js?v=dc93afec'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=dc93afec'
 
 let _memoryTab = 'memory'
 
