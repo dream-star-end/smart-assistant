@@ -51,6 +51,11 @@ import {
   reassignEgressHost,
 } from "../account-pool/egressAssignment.js";
 import type { AccountHealthTracker } from "../account-pool/health.js";
+import {
+  fetchAnthropicAccountUuid,
+} from "../account-pool/anthropicProfile.js";
+import { getDispatcherForAccount } from "../account-pool/egressDispatcher.js";
+import { getEgressProxyUrlPlaintext } from "./egressProxies.js";
 
 // getPool 已在文件顶部 import,不重复
 
@@ -192,6 +197,66 @@ async function ensureEgressProxyExistsOrThrow(id: string): Promise<void> {
   if (r.rowCount === 0) throw new RangeError("invalid_egress_proxy_id_not_found");
 }
 
+/**
+ * 0070 — 新建 claude 账号专用:同步获取 Anthropic OAuth account UUID。
+ *
+ * 1. 解密 egress proxy URL(同 status='active' 校验,disabled → 抛)
+ * 2. 通过 `getDispatcherForAccount` 构造 dispatcher(sentinel id 不污染真实账号 cache)
+ * 3. 调 helper 拿 uuid;失败抛 `RangeError(uuid_fetch_failed:${kind})`
+ *
+ * 为什么不复用 backfill 脚本的 fetchAccountUuid:
+ *   - backfill 用真实 accountId 走真实 cache,本路径账号还没 INSERT,没 accountId
+ *   - backfill 接受 fail-soft(返 outcome),本路径必须 fail-hard(否则 INSERT 会留 NULL)
+ *
+ * `retryOnTransient=true`:network/5xx 给 1 次重试(Anthropic 偶发抖动 vs admin
+ * 直接看到 500);token_invalid/4xx/bad_shape 不重试,语义上没指望。
+ */
+async function fetchAccountUuidForCreate(
+  oauthToken: string,
+  egressProxyId: string,
+): Promise<string> {
+  // status='active' 才返 URL,disabled/不存在 → null;这里 ensureEgressProxyExistsOrThrow
+  // 已确认存在,null 只可能是 disabled。
+  const proxyUrl = await getEgressProxyUrlPlaintext(egressProxyId);
+  if (proxyUrl === null) {
+    throw new RangeError("egress_proxy_not_active");
+  }
+  const dispatcher = await getDispatcherForAccount(
+    `admin-create:${egressProxyId}`,
+    proxyUrl,
+    null,
+  );
+  if (dispatcher === undefined) {
+    // egressDispatcher 已 log warn(URL 解析挂);admin 路径不能 fall back 到默认
+    // 出口(会造成 profile/chat IP 分叉),直接 400。
+    throw new RangeError("egress_proxy_invalid");
+  }
+  const r = await fetchAnthropicAccountUuid(oauthToken, dispatcher, {
+    retryOnTransient: true,
+  });
+  if (r.kind !== "ok") {
+    // detail 已脱敏但不外露(避免泄露内部 kind 细节给 admin UI 之外的层);
+    // 仅 kind 上 UI:token_invalid / http_4xx / http_5xx / network / bad_shape。
+    throw new RangeError(`uuid_fetch_failed:${r.kind}`);
+  }
+  return r.uuid;
+}
+
+/**
+ * 0070 — 判断 pg error 是否为 account_uuid 唯一索引冲突。
+ *
+ * unique partial index `idx_ca_account_uuid_uq`(0070 migration)在 admin 重复
+ * 录入同一 Anthropic 账号时报 23505。本函数不读 message(可能含 uuid 明文),
+ * 仅靠 code + constraint name 判断,避免日志/异常路径泄露 uuid。
+ */
+function isAccountUuidUniqueViolation(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: unknown; constraint?: unknown };
+  if (e.code !== "23505") return false;
+  // pg driver 在 unique index 冲突时把 index 名放 constraint
+  return typeof e.constraint === "string" && e.constraint === "idx_ca_account_uuid_uq";
+}
+
 export async function adminCreateAccount(
   input: AdminCreateAccountInput,
   ctx: AdminAuditCtx,
@@ -243,6 +308,24 @@ export async function adminCreateAccount(
   // 存在性预检 — 不存在的 FK 在 store 层会冒成 23503 → 500,提前 SELECT 给 400。
   await ensureEgressProxyExistsOrThrow(egressProxyId);
 
+  // 0070 — Phase 6 fail_closed 根治:provider='claude' 新建必须同步获取 Anthropic
+  // OAuth account UUID,作为 scheduler 候选锚点。否则 NULL 行被静默剔除
+  // (2026-05 P1 复现 ×2:账号 14、47)。
+  //
+  // 设计:
+  //   - profile fetch 走账号未来的 plain proxy(避免"先默认出口验 profile + 之后
+  //     sticky proxy 跑 chat"的 IP 漂移痕迹)
+  //   - sentinel accountId `admin-create:${proxyId}` 复用 dispatcher cache,
+  //     不污染真实账号 cache 空间
+  //   - retryOnTransient=true 给 1 次 network/5xx 重试
+  //   - 任一错误 → RangeError(`uuid_fetch_failed:${kind}`) 让 admin UI 区分
+  //     "token 输入错"(token_invalid) vs "Anthropic 抖动"(http_5xx/network)
+  //   - codex 跳过(Phase 6 hook 只盯 claude;backfill 脚本同语义)
+  let accountUuid: string | null = null;
+  if (provider === "claude") {
+    accountUuid = await fetchAccountUuidForCreate(input.oauth_token, egressProxyId);
+  }
+
   const createInput: CreateAccountInput = {
     provider,
     label: input.label.trim(),
@@ -252,8 +335,19 @@ export async function adminCreateAccount(
     expires_at: expiresAt,
     subscription_end_at: subscriptionEndAt,
     egress_proxy_id: egressProxyId,
+    account_uuid: accountUuid,
   };
-  const row = await storeCreate(createInput);
+  let row: AccountRow;
+  try {
+    row = await storeCreate(createInput);
+  } catch (err) {
+    // 0070 unique partial index `idx_ca_account_uuid_uq` 命中 → admin 重复录入
+    // 同一 Anthropic 账号。转 RangeError 让 HTTP 层返 400 而非 500。
+    if (isAccountUuidUniqueViolation(err)) {
+      throw new RangeError("account_uuid_already_exists");
+    }
+    throw err;
+  }
 
   // 0055:account 必有 egress_proxy_id 池引用,运行时优先用池 URL,host 字段已无意义。
   // 不再在 create 路径自动分配 egress_host_uuid(0038 路径退化为 admin 手动 patch 触发)。

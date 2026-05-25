@@ -52,12 +52,10 @@ import {
   shouldRefresh,
   DEFAULT_REFRESH_SKEW_MS,
 } from "../src/account-pool/refresh.js";
-import { isUuidLike } from "../src/http/proxy/shared.js";
-
-// Anthropic OAuth profile 端点 —— 见 claude-code-best/src/services/oauth/getOauthProfile.ts:40。
-// 与 CCB 端 ANT 行为对齐:GET /api/oauth/profile + Authorization: Bearer + 10s timeout。
-const PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile";
-const PROFILE_TIMEOUT_MS = 10_000;
+import {
+  fetchAnthropicAccountUuid,
+  safeErrMsg,
+} from "../src/account-pool/anthropicProfile.js";
 
 // 节流间隔:plan §2.2 1 req / 3 s。改成更激进(如 1/1s)前需评估 Anthropic 端
 // 风控阈值;保守值给 ops 留余量。
@@ -66,26 +64,6 @@ const THROTTLE_MS = 3_000;
 interface Args {
   canary: string | null;
   dryRun: boolean;
-}
-
-/**
- * Codex round 1 MAJOR 3:err.message 可能含 token / refresh / uuid / email 等
- * 敏感片段(尤其 PG 唯一冲突 "Key (account_uuid)=(...)" 或 Anthropic 错误体被
- * undici 透传),日志层强制脱敏一次,绑 plan §2.2 "禁止输出 token/uuid/email 明文"。
- *
- * - UUID(36 chars dashed hex):全部替换为 `<uuid>`
- * - Email(简化 RFC 模式):替换为 `<email>`
- * - 截断到 200 字符,防异常带堆栈刷屏
- *
- * 这里**不**做 token / refresh 字符串匹配 —— 那两类只在 RefreshHttpClient
- * 内部生成,不会出现在 err.message;UUID/email 才是外部 body 反流的真实风险。
- */
-function safeErrMsg(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  const stripped = raw
-    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>")
-    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "<email>");
-  return stripped.slice(0, 200);
 }
 
 function parseArgs(argv: string[]): Args {
@@ -124,6 +102,7 @@ type OutcomeKind =
   | "ok"
   | "skipped_no_token"
   | "skipped_refresh_failed"
+  | "skipped_token_invalid"
   | "skipped_http_4xx"
   | "skipped_http_5xx"
   | "skipped_network"
@@ -150,82 +129,38 @@ function zero(buf: Buffer | null): void {
 }
 
 /**
- * 调 Anthropic `/api/oauth/profile`,解析返回 JSON 取 `account.uuid`。
- *
- * 不抛:任何失败都返回 outcome 字符串,由 caller 写日志 / 计数。
+ * 把 helper `FetchAccountUuidResult` 的 kind 映射到本脚本的 outcome 枚举。
+ * 历史上 OutcomeKind 用 `skipped_*` 前缀,helper 用裸 kind;映射在此处一次性完成。
+ * `token_invalid` 是 helper 新分出的细分(原归入 4xx),outcome 同步加 `skipped_token_invalid`
+ * 让 ops 一眼区分"admin 输入的 token 坏"和"Anthropic 拒绝(如 429)"。
  */
-async function fetchAccountUuid(
-  tok: AccountToken,
-): Promise<
-  | { kind: "ok"; uuid: string }
-  | { kind: "skipped_http_4xx"; status: number }
-  | { kind: "skipped_http_5xx"; status: number }
-  | { kind: "skipped_network"; detail: string }
-  | { kind: "skipped_bad_shape"; status: number; detail: string }
-> {
+function mapHelperKindToOutcome(
+  k: Exclude<import("../src/account-pool/anthropicProfile.js").FetchAccountUuidResult["kind"], "ok">,
+): Exclude<OutcomeKind, "ok" | "skipped_no_token" | "skipped_refresh_failed"> {
+  switch (k) {
+    case "token_invalid": return "skipped_token_invalid";
+    case "http_4xx":      return "skipped_http_4xx";
+    case "http_5xx":      return "skipped_http_5xx";
+    case "network":       return "skipped_network";
+    case "bad_shape":     return "skipped_bad_shape";
+  }
+}
+
+/**
+ * 调 helper 拿 uuid;路径专属 dispatcher 由本脚本构造(账号已存在 → 用真 accountId)。
+ *
+ * 注意 backfill 不开 `retryOnTransient`:存量回填是无人值守,已有 3s 节流,
+ * 单次失败继续下一个就行;admin 路径才需要 retry。
+ */
+async function fetchAccountUuid(tok: AccountToken) {
   // 账号专属出口(与 chat 路径同),失败 fail-soft 回默认出口(不抛)
   const dispatcher = await getDispatcherForAccount(
     tok.id,
     tok.egress_proxy,
     tok.egress_target,
   );
-
-  // 不复用 RefreshHttpClient —— 本脚本只 GET,直接 globalThis.fetch + dispatcher。
-  // AbortSignal.timeout 提供 10s 上限,跟 CCB 同步。
   const accessToken = tok.token.toString("utf8");
-  let status: number;
-  let bodyText: string;
-  try {
-    const init: RequestInit & { dispatcher?: unknown } = {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      signal: AbortSignal.timeout(PROFILE_TIMEOUT_MS),
-    };
-    if (dispatcher) init.dispatcher = dispatcher;
-    const res = await fetch(PROFILE_ENDPOINT, init);
-    status = res.status;
-    // 即使 4xx/5xx 也读 body 取调试线索;但**不**打印 body(可能含 email)。
-    // 仅 body.length 用于 bad_shape 检测,不入 log。
-    bodyText = await res.text();
-  } catch (err) {
-    return {
-      kind: "skipped_network",
-      detail: safeErrMsg(err),
-    };
-  }
-
-  if (status >= 500) {
-    return { kind: "skipped_http_5xx", status };
-  }
-  if (status >= 400) {
-    return { kind: "skipped_http_4xx", status };
-  }
-  if (status !== 200) {
-    return { kind: "skipped_bad_shape", status, detail: `unexpected status ${status}` };
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(bodyText);
-  } catch {
-    return { kind: "skipped_bad_shape", status, detail: "json_parse_error" };
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { kind: "skipped_bad_shape", status, detail: "not_object" };
-  }
-  const account = (parsed as Record<string, unknown>).account;
-  if (!account || typeof account !== "object" || Array.isArray(account)) {
-    return { kind: "skipped_bad_shape", status, detail: "no_account_field" };
-  }
-  const uuid = (account as Record<string, unknown>).uuid;
-  if (typeof uuid !== "string" || !isUuidLike(uuid)) {
-    // 不打 uuid 值本身,只标记 shape 错
-    return { kind: "skipped_bad_shape", status, detail: "uuid_not_uuid_like" };
-  }
-  return { kind: "ok", uuid };
+  return fetchAnthropicAccountUuid(accessToken, dispatcher);
 }
 
 /**
@@ -271,10 +206,9 @@ async function processOne(accountId: string, dryRun: boolean): Promise<Outcome> 
 
     const r = await fetchAccountUuid(tok);
     if (r.kind !== "ok") {
-      // r 自身已是 outcome 的 skipped_* 子集 —— 直接映射
-      const out: Outcome = { account_id: accountId, kind: r.kind };
-      if ("status" in r) out.status = r.status;
-      if ("detail" in r && typeof r.detail === "string") out.detail = r.detail;
+      const out: Outcome = { account_id: accountId, kind: mapHelperKindToOutcome(r.kind) };
+      if (r.status !== undefined) out.status = r.status;
+      if (r.detail) out.detail = r.detail;
       return out;
     }
 
@@ -295,7 +229,8 @@ async function processOne(accountId: string, dryRun: boolean): Promise<Outcome> 
       [r.uuid, accountId],
     );
     if (upd.rowCount === 0) {
-      // 行在 SELECT 和 UPDATE 之间被其他进程修改 —— 当 skip 不当失败
+      // 行在 SELECT 和 UPDATE 之间被其他进程修改(或被 admin 新建路径抢先回填)
+      // —— 当 skip 不当失败
       return {
         account_id: accountId,
         kind: "skipped_bad_shape",
