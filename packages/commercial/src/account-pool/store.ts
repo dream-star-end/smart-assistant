@@ -180,6 +180,19 @@ export interface CreateAccountInput {
    * admin layer(adminCreateAccount 显式 SELECT FROM egress_proxies)。
    */
   egress_proxy_id: bigint | string;
+  /**
+   * 0070 — Anthropic OAuth account UUID(Phase 6 anti-fraud anchor)。
+   *
+   *   - provider='claude':admin 新建路径在 INSERT 前同步调
+   *     `/api/oauth/profile` 拿到 uuid 后传入,让 Phase 6 fail_closed scheduler
+   *     立刻能选中(否则 2026-05 P1 复现:NULL uuid 行被静默剔除)。
+   *   - provider='codex' 或 admin 路径 fetch 失败兜底回退:undefined / null →
+   *     INSERT 写 NULL,需要靠 `scripts/backfill-account-uuid.ts` 后补。
+   *
+   * 校验/获取由 admin layer 负责,store 仅落库;非 UUID 形字符串会被 PG `uuid`
+   * 类型拒绝(`invalid input syntax for type uuid`)— store 不二次校验。
+   */
+  account_uuid?: string | null;
 }
 
 /**
@@ -393,6 +406,11 @@ export async function createAccount(
       refNonce = r.nonce;
     }
 
+    // 0070 — account_uuid 由 admin layer 拿到后传入(provider='claude' 时强制)。
+    // 不在 store 层 fetch 是为了保持 store 职责单一(DB 落盘),HTTP/解析逻辑在
+    // account-pool/anthropicProfile.ts。$11 占位允许 NULL(codex / fetch fail 回退)。
+    const accountUuid = input.account_uuid ?? null;
+
     const res = await query<RawMetaRow>(
       `INSERT INTO claude_accounts(
          provider, label, plan,
@@ -400,9 +418,10 @@ export async function createAccount(
          oauth_refresh_enc, oauth_refresh_nonce,
          oauth_expires_at,
          subscription_end_at,
-         egress_proxy, egress_proxy_id
+         egress_proxy, egress_proxy_id,
+         account_uuid
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -415,6 +434,7 @@ export async function createAccount(
         input.expires_at ?? null,
         input.subscription_end_at ?? null,
         egressProxyId,
+        accountUuid,
       ],
     );
     return parseMetaRow(res.rows[0]);

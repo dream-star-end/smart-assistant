@@ -96,6 +96,46 @@ async function probeRedis(): Promise<IORedis | null> {
 // 测试用的 AEAD 密钥:32 字节固定值,避免依赖真实 KMS。
 process.env.OPENCLAUDE_KMS_KEY = Buffer.alloc(32, 0x9a).toString("base64");
 
+// ─── 0070 Anthropic /api/oauth/profile mock ─────────────────────────────
+// adminCreateAccount(provider='claude') 现在在 INSERT 前会同步调
+// `https://api.anthropic.com/api/oauth/profile`。本测试用假 token,真打 Anthropic
+// 会 401 让所有创建用例炸掉。这里 monkey patch globalThis.fetch:
+//   - PROFILE_ENDPOINT → 返 200 + 每次唯一 uuid(counter 自增,避免唯一冲突)
+//   - 其它 URL → 走原 fetch(integ test 不依赖外网)
+//
+// 测试想验"fetch 失败"或"uuid 冲突"的 case 自己临时覆盖 `_profileMockBehavior`。
+const PROFILE_ENDPOINT_URL = "https://api.anthropic.com/api/oauth/profile";
+const _originalFetch = globalThis.fetch;
+let _profileMockCounter = 0;
+type ProfileMockBehavior =
+  | { kind: "ok" }
+  | { kind: "ok_fixed_uuid"; uuid: string }
+  | { kind: "status"; status: number; body?: unknown }
+  | { kind: "network_error" };
+let _profileMockBehavior: ProfileMockBehavior = { kind: "ok" };
+function setProfileMockBehavior(b: ProfileMockBehavior): void {
+  _profileMockBehavior = b;
+}
+function nextMockUuid(): string {
+  _profileMockCounter += 1;
+  // 12 hex chars 后缀,counter 远小于 2^48
+  const tail = _profileMockCounter.toString(16).padStart(12, "0");
+  return `12345678-1234-1234-1234-${tail}`;
+}
+globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+  const u = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+  if (u !== PROFILE_ENDPOINT_URL) return _originalFetch(url as RequestInfo, init);
+  const b = _profileMockBehavior;
+  if (b.kind === "network_error") throw new Error("ECONNREFUSED mock");
+  if (b.kind === "status") {
+    return new Response(typeof b.body === "string" ? b.body : JSON.stringify(b.body ?? {}), {
+      status: b.status,
+    });
+  }
+  const uuid = b.kind === "ok_fixed_uuid" ? b.uuid : nextMockUuid();
+  return new Response(JSON.stringify({ account: { uuid } }), { status: 200 });
+}) as typeof globalThis.fetch;
+
 before(async () => {
   pgAvailable = await probePg();
   if (!pgAvailable) {
@@ -146,6 +186,7 @@ after(async () => {
     try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
     await closePool();
   }
+  globalThis.fetch = _originalFetch;
 });
 
 beforeEach(async () => {
@@ -154,6 +195,8 @@ beforeEach(async () => {
     "TRUNCATE TABLE admin_audit, agent_audit, agent_containers, agent_subscriptions, usage_records, credit_ledger, claude_accounts, egress_proxies, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
   );
   if (redis) await redis.flushdb();
+  // 每个 test 都 reset profile mock 默认行为
+  setProfileMockBehavior({ kind: "ok" });
 });
 
 function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
@@ -642,6 +685,132 @@ describe("admin accounts — 0055 egress_proxy_id 必须", () => {
       body: JSON.stringify({ egress_proxy_id: null }),
     });
     assert.equal(nullified.status, 400);
+  });
+});
+
+// ============================================================
+// accounts — 0070 account_uuid 同步 fetch
+// ============================================================
+
+describe("admin accounts — 0070 account_uuid 同步 fetch", () => {
+  test("create claude → INSERT 写入 account_uuid(scheduler 可立即选中)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    setProfileMockBehavior({ kind: "ok_fixed_uuid", uuid: "aaaaaaaa-1111-2222-3333-444444444444" });
+
+    const created = await adminCreateAccount(
+      { label: "uuid-1", plan: "pro", oauth_token: "tok", egress_proxy_id: epid },
+      { adminId: admin },
+    );
+    // DB 直接核对(meta row 不暴露 account_uuid,所以直接 SQL)
+    const r = await query<{ uuid: string | null }>(
+      "SELECT account_uuid::text AS uuid FROM claude_accounts WHERE id = $1::bigint",
+      [created.id.toString()],
+    );
+    assert.equal(r.rows[0].uuid, "aaaaaaaa-1111-2222-3333-444444444444");
+  });
+
+  test("create codex(provider 不同)→ 不调 profile fetch,account_uuid 保持 NULL", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    // 即使 mock 是 ok,codex 路径完全不调 fetch — 通过 setting network_error 验证
+    setProfileMockBehavior({ kind: "network_error" });
+
+    const created = await adminCreateAccount(
+      {
+        label: "cdx-1",
+        plan: "max",
+        provider: "codex",
+        oauth_token: "cdx-tok",
+        oauth_refresh_token: "cdx-ref",
+        egress_proxy_id: epid,
+      },
+      { adminId: admin },
+    );
+    const r = await query<{ uuid: string | null }>(
+      "SELECT account_uuid::text AS uuid FROM claude_accounts WHERE id = $1::bigint",
+      [created.id.toString()],
+    );
+    assert.equal(r.rows[0].uuid, null, "codex 不应该写 account_uuid");
+  });
+
+  test("fetch 401 → RangeError uuid_fetch_failed:token_invalid,DB 不留行", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    setProfileMockBehavior({ kind: "status", status: 401, body: { error: "invalid_token" } });
+
+    await assert.rejects(
+      adminCreateAccount(
+        { label: "bad-tok", plan: "pro", oauth_token: "bad", egress_proxy_id: epid },
+        { adminId: admin },
+      ),
+      (e: unknown) =>
+        e instanceof RangeError &&
+        e.message === "uuid_fetch_failed:token_invalid",
+    );
+    const r = await query<{ c: string }>(
+      "SELECT COUNT(*)::text AS c FROM claude_accounts WHERE label='bad-tok'",
+    );
+    assert.equal(r.rows[0].c, "0", "fetch 失败应阻止 INSERT,DB 不留垃圾行");
+  });
+
+  test("fetch network 失败 → RangeError uuid_fetch_failed:network(retry 也耗尽后)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    setProfileMockBehavior({ kind: "network_error" });
+
+    await assert.rejects(
+      adminCreateAccount(
+        { label: "neterr", plan: "pro", oauth_token: "tok", egress_proxy_id: epid },
+        { adminId: admin },
+      ),
+      (e: unknown) =>
+        e instanceof RangeError && e.message === "uuid_fetch_failed:network",
+    );
+  });
+
+  test("重复录入同一 uuid → RangeError account_uuid_already_exists", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid1 = await setupEgressProxy(admin);
+    const epid2 = await setupEgressProxy(admin);
+    const DUP = "bbbbbbbb-1111-2222-3333-555555555555";
+    setProfileMockBehavior({ kind: "ok_fixed_uuid", uuid: DUP });
+
+    await adminCreateAccount(
+      { label: "dup-1", plan: "pro", oauth_token: "t1", egress_proxy_id: epid1 },
+      { adminId: admin },
+    );
+
+    await assert.rejects(
+      adminCreateAccount(
+        { label: "dup-2", plan: "pro", oauth_token: "t2", egress_proxy_id: epid2 },
+        { adminId: admin },
+      ),
+      (e: unknown) =>
+        e instanceof RangeError && e.message === "account_uuid_already_exists",
+    );
+  });
+
+  test("egress_proxy disabled → RangeError egress_proxy_not_active", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("a@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    // 把这条 proxy 改 disabled
+    await query("UPDATE egress_proxies SET status='disabled' WHERE id = $1::bigint", [epid]);
+
+    await assert.rejects(
+      adminCreateAccount(
+        { label: "ep-dis", plan: "pro", oauth_token: "t", egress_proxy_id: epid },
+        { adminId: admin },
+      ),
+      (e: unknown) =>
+        e instanceof RangeError && e.message === "egress_proxy_not_active",
+    );
   });
 });
 
