@@ -1357,6 +1357,28 @@ const FEEDBACK_CLARIFY_MESSAGES = [
   '好的反馈需要足够的上下文。请至少说明：问题是什么、何时发生、影响是什么。',
 ]
 
+// Global outbound proxy editor. The server returns proxyUrl with `user:pass`
+// masked as `***`; we stash that exact string on a `data-initial` attribute so
+// the Save handler can compare and skip the PUT when the operator hasn't
+// touched the field — that's the defensive half of the "redacted round-trip"
+// problem. The other half (post-hoc rejection of starred values) lives in the
+// gateway handlers.
+async function openProxyModal() {
+  const input = $('proxy-url-input')
+  input.value = ''
+  input.dataset.initial = ''
+  openModal('proxy-modal')
+  try {
+    const cfg = await apiGet('/api/config')
+    const value = cfg.proxyUrl ?? ''
+    input.value = value
+    input.dataset.initial = value
+  } catch (err) {
+    toast('读取代理配置失败: ' + String(err), 'error')
+  }
+  setTimeout(() => input.focus(), 50)
+}
+
 function openFeedbackModal() {
   $('feedback-desc').value = ''
   $('feedback-category').value = 'bug'
@@ -1600,12 +1622,34 @@ async function init() {
           toast('获取配置失败', 'error')
         }
       })()
-    } else if (action === 'changelog') openChangelog()
+    } else if (action === 'proxy') openProxyModal()
+    else if (action === 'changelog') openChangelog()
     else if (action === 'feedback') openFeedbackModal()
     else if (action === 'claude-oauth') openOAuthModal()
     else if (action === 'wechat') openWechatModal()
     else if (action === 'logout') $('logout-btn').click()
   })
+  // Proxy modal — Save handler (dirty-tracking against the initial value so a
+  // round-tripped redacted display (e.g. http://***@host:port) never PUTs back
+  // to the server. Empty input clears the global proxy.
+  $('save-proxy-btn').onclick = async () => {
+    const input = $('proxy-url-input')
+    const initial = input.dataset.initial ?? ''
+    const current = input.value
+    if (current === initial) {
+      // No change — nothing to do, but treat as success so users get feedback.
+      toast('未做修改', 'info')
+      closeModal('proxy-modal')
+      return
+    }
+    try {
+      await apiJson('PUT', '/api/config', { proxyUrl: current })
+      toast('已保存', 'success')
+      closeModal('proxy-modal')
+    } catch (err) {
+      toast(String(err), 'error')
+    }
+  }
   // Memory modal events
   $('memory-tab-memory').onclick = async () => {
     $('memory-tab-memory').className = 'btn btn-secondary'

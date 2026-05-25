@@ -36,8 +36,8 @@ export interface ToolsetDefs {
 }
 
 export interface UserEntry {
-  id: string       // e.g. "boss"
-  name: string     // display name
+  id: string // e.g. "boss"
+  name: string // display name
   passwordHash: string // scrypt hash
 }
 
@@ -107,6 +107,23 @@ export interface OpenClaudeConfig {
   }
   // Multi-provider MCP server registry — auto-merged into every CCB subprocess
   mcpServers?: McpServerConfig[]
+  /**
+   * Global outbound HTTP proxy URL for all provider subprocesses.
+   * Format: `http://user:pass@host:port` or `http://host:port`.
+   *
+   * Effective resolution order: agent.proxyUrl > config.proxyUrl > (provider default).
+   *   - codex (codexRunner / codexAppServerRunner): explicit-only — when both
+   *     unset, codex subprocess starts without any *_PROXY env (existing
+   *     invariant from buildCodexEnv, kept).
+   *   - CCB (subprocessRunner) / others: when both unset, the subprocess
+   *     inherits the gateway process env (typically systemd HTTPS_PROXY).
+   *
+   * Empty string / undefined → no override (falls through to provider default).
+   * Change semantics: applies to subprocesses spawned after the save. Already
+   * running long-lived runners (e.g. codex app-server) keep their original env
+   * until they're respawned.
+   */
+  proxyUrl?: string
   // Terminal backend for CCB subprocess execution
   terminal?: {
     type: 'local' | 'docker' // future: 'ssh' | 'remote'
@@ -165,20 +182,26 @@ export interface AgentDef {
   // Undefined → 'exec' (default).
   runnerKind?: 'exec' | 'app-server'
   /**
-   * Optional egress HTTP proxy URL for this agent's external API calls.
+   * Optional per-agent egress HTTP proxy URL — overrides the global
+   * `OpenClaudeConfig.proxyUrl` for this agent only.
    * Format: full URL with optional credentials, e.g.
    * `http://user:pass@host:port` or `http://host:port`.
    *
-   * Currently only honored when `provider === 'codex-native'` — the codex
-   * runner injects HTTPS_PROXY/HTTP_PROXY (and lowercase variants) into the
-   * spawned codex CLI subprocess env. Other runners (CCB / minimax) ignore
-   * this field; their egress is determined by the gateway process env.
+   * Honored by all runners that `sessionManager` resolves to a non-empty
+   * effective URL:
+   *   - codex (codex-native / codex-app-server): explicit-only injection
+   *     into the spawned codex CLI subprocess env (HTTPS_PROXY/HTTP_PROXY +
+   *     lowercase variants). When unset everywhere, codex starts without
+   *     any *_PROXY env (does NOT inherit `process.env.HTTPS_PROXY`) — so
+   *     a system-level HTTPS_PROXY (e.g. systemd unit) does not silently
+   *     change codex behavior.
+   *   - CCB (subprocessRunner): non-empty values overlay the inherited
+   *     gateway process env. When unset everywhere, CCB keeps its
+   *     historical inherit behaviour (systemd `HTTPS_PROXY` / NO_PROXY
+   *     carve-outs still apply).
    *
-   * Decision: we deliberately do NOT inherit `process.env.HTTPS_PROXY` —
-   * codex egress is always explicit per-agent so a future system-level
-   * HTTPS_PROXY (e.g. systemd unit) does not silently change codex behavior.
-   *
-   * undefined / "" → no proxy env injected (codex CLI uses default egress).
+   * undefined / "" → fall through to `OpenClaudeConfig.proxyUrl`, then to
+   * the provider default described above.
    */
   proxyUrl?: string
   updatedAt?: string // ISO timestamp of last config change

@@ -21,6 +21,7 @@ import { createLogger } from './logger.js'
 import { SubprocessRunner } from './subprocessRunner.js'
 import { CodexRunner } from './codexRunner.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
+import { normalizeProxyUrl } from './proxyEnv.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -343,6 +344,12 @@ export class SessionManager {
     const providerTag = SessionManager.providerTag(opts.agent.provider)
     const codexResumeId = this._resumeIdFor(opts.sessionKey, providerTag)
     const codexModel = opts.agent.model ?? this.config.defaults.model
+    // Effective egress proxy: per-agent override falls through to global config.
+    // Empty / whitespace-only strings are normalized to undefined so a UI "clear
+    // this field" doesn't accidentally short-circuit the global fallback at the
+    // agent layer.
+    const effectiveProxyUrl =
+      normalizeProxyUrl(opts.agent.proxyUrl) ?? normalizeProxyUrl(this.config.proxyUrl)
     let runner: SubprocessRunner
     if (opts.agent.provider === 'codex-native') {
       // Only resume if the persisted id was produced by a codex-native runner —
@@ -361,7 +368,7 @@ export class SessionManager {
           cwd,
           resumeSessionId: codexResumeId,
           model: codexModel,
-          proxyUrl: opts.agent.proxyUrl,
+          proxyUrl: effectiveProxyUrl,
           persona,
           agentProvider: opts.agent.provider,
           effortLevel: initialEffort,
@@ -375,7 +382,7 @@ export class SessionManager {
           cwd,
           resumeSessionId: codexResumeId,
           model: codexModel,
-          proxyUrl: opts.agent.proxyUrl,
+          proxyUrl: effectiveProxyUrl,
           persona,
           agentProvider: opts.agent.provider,
           effortLevel: initialEffort,
@@ -400,6 +407,7 @@ export class SessionManager {
         resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
         effortLevel: initialEffort,
         workload: opts.workload,
+        proxyUrl: effectiveProxyUrl,
       })
     }
     const now = Date.now()

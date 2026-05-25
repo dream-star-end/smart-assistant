@@ -50,6 +50,7 @@ import {
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
+import { looksRedactedProxyUrl, maskProxyUrl, normalizeProxyUrl } from './proxyEnv.js'
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
@@ -1084,6 +1085,14 @@ export class Gateway {
       }
     }
     if (url.pathname === '/api/config') {
+      if (req.method === 'PUT') {
+        this.handleConfigPut(req, res).catch((err) => this.sendError(res, 500, String(err)))
+        return
+      }
+      if (req.method !== 'GET') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> =
         []
@@ -1114,6 +1123,10 @@ export class Gateway {
           provider: activeProvider,
           auth: authInfo,
           mcpServers: activeMcps,
+          // Mask user:pass; keep scheme/host/port visible so operator can see
+          // which proxy is configured without exposing the credential. Front
+          // end must use dirty-tracking and NOT PUT this value back unchanged.
+          proxyUrl: maskProxyUrl(this.deps.config.proxyUrl),
         }),
       )
       return
@@ -1650,25 +1663,69 @@ export class Gateway {
    */
   private redactAgentForApi(agent: AgentDef): AgentDef {
     if (!agent.proxyUrl) return agent
-    let redacted: string
-    try {
-      const u = new URL(agent.proxyUrl)
-      if (u.username || u.password) {
-        u.username = '***'
-        u.password = ''
-        redacted = u.toString()
-      } else {
-        redacted = agent.proxyUrl
-      }
-    } catch {
-      // Malformed URL — fully mask rather than leak structure.
-      redacted = '***'
-    }
+    const redacted = maskProxyUrl(agent.proxyUrl)
     return { ...agent, proxyUrl: redacted }
   }
 
   // GET /api/agents         → { agents, default }
   // POST /api/agents        → create { id, model?, persona? }
+  /**
+   * Whitelisted, per-field PUT for the gateway-wide config. Today the only
+   * exposed field is `proxyUrl`; the same skeleton can grow extra knobs (e.g.
+   * `provider`, `defaults`) without re-introducing the "PUT replaces whole
+   * object" footgun. Disk write + in-memory propagation done via
+   * `SessionManager.updateConfig` so long-lived runners see the new config on
+   * their next config-aware path (already used by the OAuth refresh flow).
+   */
+  private async handleConfigPut(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let body: { proxyUrl?: unknown }
+    try {
+      body = await this.readJsonBody<{ proxyUrl?: unknown }>(req)
+    } catch {
+      // readJsonBody throws on malformed JSON; surface as 400 not 500.
+      this.sendError(res, 400, 'invalid json body')
+      return
+    }
+    // JSON `null`, arrays, or non-object roots would fail `'k' in body` with a
+    // TypeError below; reject them up-front with a clear 400 instead.
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      this.sendError(res, 400, 'body must be a JSON object')
+      return
+    }
+    let mutated = false
+    const next = this.deps.config
+    if ('proxyUrl' in body) {
+      if (body.proxyUrl !== undefined && typeof body.proxyUrl !== 'string') {
+        this.sendError(res, 400, 'proxyUrl must be a string')
+        return
+      }
+      const value = (body.proxyUrl as string | undefined) ?? ''
+      if (value !== '' && looksRedactedProxyUrl(value)) {
+        this.sendError(
+          res,
+          400,
+          'proxyUrl contains masked credentials; please enter the full URL or leave empty to clear',
+        )
+        return
+      }
+      const normalized = normalizeProxyUrl(value)
+      if (normalized === undefined) delete next.proxyUrl
+      else next.proxyUrl = normalized
+      mutated = true
+    }
+    if (!mutated) {
+      this.sendError(res, 400, 'no recognised fields in body')
+      return
+    }
+    await writeConfig(next)
+    // Keep this.deps.config and SessionManager.config in lockstep; runners
+    // that cache config (CodexAppServerRunner long-lived JSON-RPC) get the
+    // updated reference for their next subprocess respawn, not the current
+    // running process.
+    this.sessions.updateConfig(next)
+    this.sendJson(res, 200, { proxyUrl: maskProxyUrl(next.proxyUrl) })
+  }
+
   private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const cfg = await readAgentsConfig()
     if (req.method === 'GET') {
@@ -1747,6 +1804,26 @@ export class Gateway {
       if (body.provider !== undefined) agent.provider = body.provider
       if (body.toolsets !== undefined) agent.toolsets = body.toolsets
       if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
+      if (body.proxyUrl !== undefined) {
+        // Reject round-tripped redacted values — see proxyEnv.looksRedactedProxyUrl
+        // for rationale (defends against GET-render-PUT pattern wiping the
+        // stored credential with `***`). Empty string clears the field.
+        if (typeof body.proxyUrl !== 'string') {
+          this.sendError(res, 400, 'proxyUrl must be a string')
+          return
+        }
+        if (body.proxyUrl !== '' && looksRedactedProxyUrl(body.proxyUrl)) {
+          this.sendError(
+            res,
+            400,
+            'proxyUrl contains masked credentials; please enter the full URL or leave empty to clear',
+          )
+          return
+        }
+        const normalized = normalizeProxyUrl(body.proxyUrl)
+        if (normalized === undefined) delete agent.proxyUrl
+        else agent.proxyUrl = normalized
+      }
       cfg.agents[idx] = agent
       await writeAgentsConfig(cfg)
       this.deps.agentsConfig = cfg
