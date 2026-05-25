@@ -33,6 +33,7 @@ import {
   resetMetricsForTest,
   snapshotForAlerts,
 } from "../admin/metrics.js";
+import { generatePersona } from "../account-pool/persona.js";
 import {
   ruleAccountPoolAllDown,
   ruleNoAccountsConfigured,
@@ -59,6 +60,7 @@ const COMMERCIAL_TABLES = [
   "credit_ledger",
   "model_pricing",
   "claude_accounts",
+  "egress_proxies",
   "refresh_tokens",
   "email_verifications",
   "users",
@@ -146,7 +148,7 @@ after(async () => {
 beforeEach(async () => {
   resetMetricsForTest();
   if (!pgAvailable) return;
-  await query("TRUNCATE TABLE admin_audit, usage_records, credit_ledger, claude_accounts, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+  await query("TRUNCATE TABLE admin_audit, usage_records, credit_ledger, claude_accounts, egress_proxies, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
   // model_pricing seed 不需要(本测试没走 chat);但部分 FK 依赖 users.updated_by 重放
   if (redis) await redis.flushdb();
 });
@@ -175,14 +177,27 @@ async function tokenFor(uid: bigint, role: "user" | "admin"): Promise<string> {
   return r.token;
 }
 
+async function createEgressProxy(label: string): Promise<bigint> {
+  const r = await query<{ id: string }>(
+    `INSERT INTO egress_proxies(label, url_enc, url_nonce)
+     VALUES ($1, '\\x00'::bytea, '\\x00'::bytea)
+     RETURNING id::text AS id`,
+    [label],
+  );
+  return BigInt(r.rows[0].id);
+}
+
 async function insertAccount(label: string, status: "active" | "cooldown" | "disabled" | "banned", health: number): Promise<bigint> {
   // 不走 store.createAccount 的 AEAD 加密(label 可变,简化测试) —— 直接插 dummy 密文
+  // 0055:egress_proxy_id NOT NULL CHECK,必须先建 egress_proxies 行再引用。
+  // 0074:persona NOT NULL + shape CHECK,raw INSERT 必须塞合法 persona。
   const dummy = Buffer.alloc(32, 0x11);
   const nonce = Buffer.alloc(12, 0x22);
+  const epId = await createEgressProxy(`${label}-ep`);
   const r = await query<{ id: string }>(
-    `INSERT INTO claude_accounts(label, plan, oauth_token_enc, oauth_nonce, status, health_score)
-     VALUES ($1, 'pro', $2, $3, $4, $5) RETURNING id::text AS id`,
-    [label, dummy, nonce, status, health],
+    `INSERT INTO claude_accounts(label, plan, oauth_token_enc, oauth_nonce, status, health_score, egress_proxy_id, persona)
+     VALUES ($1, 'pro', $2, $3, $4, $5, $6, $7::jsonb) RETURNING id::text AS id`,
+    [label, dummy, nonce, status, health, epId.toString(), JSON.stringify(generatePersona())],
   );
   return BigInt(r.rows[0].id);
 }
