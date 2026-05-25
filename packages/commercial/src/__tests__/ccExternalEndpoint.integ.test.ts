@@ -316,6 +316,7 @@ function buildFakeScheduler(opts: FakeSchedulerOpts = {}): SchedulerSpy {
         egress_target: null,
         pinned_user_id: FIXED_PINNED_USER_ID,
         account_uuid: accountUuid,
+        persona: null,
       };
     },
     async release(input: ReleaseInput): Promise<void> {

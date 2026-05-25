@@ -26,6 +26,8 @@ import {
   DEFAULT_MAX_CONCURRENT_PER_ACCOUNT,
   ERR_ACCOUNT_POOL_BUSY,
   ERR_ACCOUNT_POOL_UNAVAILABLE,
+  SessionPinUnboundError,
+  SessionPinTemporarilyUnavailableError,
 } from '../account-pool/scheduler.js'
 import { createAccount, deleteAccount, getAccount, updateAccount } from '../account-pool/store.js'
 import { KMS_KEY_BYTES } from '../crypto/keys.js'
@@ -543,5 +545,668 @@ describe('per-account 并发上限', () => {
         process.env.CLAUDE_ACCOUNT_MAX_CONCURRENT = prev
       }
     }
+  })
+})
+
+// ─── v3 反关联根治 0072 — pick() pin 三态(off / observe / enforce)──────────
+//
+// 覆盖 scheduler.pick 在引入 chat_session_account_pin 后的全部新行为:
+//   - pin enforce + pin active 命中 → 强 sticky
+//   - pin enforce + pin active 不在 pool → SessionPinTemporarilyUnavailableError(503)
+//   - pin enforce + pin unbound → SessionPinUnboundError(409)
+//   - pin enforce + pin miss + 反扩散候选缩窄(只在 history ∩ pool 选)
+//   - pin enforce + pin miss + 反扩散全死退化全池
+//   - pin enforce + pin miss → race-safe INSERT 落 active 行
+//   - pin observe → 不写 csap、不抛(metric only)
+//   - 缺 userId/sessionId pin enforce → 自动降级 off 不抛
+//   - cascade unbind 在 store.updateAccount(status='banned') 时同事务触发
+
+let TEST_USER_ID_COUNTER = 1000
+
+async function mkUser(label = 'pin'): Promise<bigint> {
+  TEST_USER_ID_COUNTER += 1
+  const u = await query<{ id: string }>(
+    `INSERT INTO users(email, password_hash, credits, email_verified, status)
+     VALUES($1, 'stub', 0, true, 'active') RETURNING id::text AS id`,
+    [`pin-${label}-${TEST_USER_ID_COUNTER}-${Date.now()}@example.com`],
+  )
+  return BigInt(u.rows[0].id)
+}
+
+async function readPinRow(
+  userId: bigint,
+  sessionId: string,
+): Promise<{ account_id: string; status: string } | null> {
+  const r = await query<{ account_id: string; status: string }>(
+    `SELECT account_id::text AS account_id, status
+       FROM chat_session_account_pin
+      WHERE user_id = $1 AND session_id = $2`,
+    [userId, sessionId],
+  )
+  return r.rows[0] ?? null
+}
+
+describe('pick — pin enforce mode', () => {
+  test('pin active 命中 active pool → 强 sticky 返回该 account_id(绕过 WRH)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('hit')
+    // 两个 account,加 inflight 让 WRH 倾向其中一个,但 pin 钉到另一个
+    const a = await createAccount(
+      { label: 'pin-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const b = await createAccount(
+      { label: 'pin-B', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-pin-hit-${Date.now()}`
+    // 预先在 csap 落一行钉到 b
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')`,
+      [uid, sid, b.id.toString()],
+    )
+
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    const r = await s.pick({
+      mode: 'chat',
+      sessionId: sid,
+      userId: uid,
+      pinMode: 'enforce',
+    })
+    assert.equal(r.account_id, BigInt(b.id), '应当强 sticky 到 pin 指定的 account=b,即使 WRH 会选 a')
+    r.token.fill(0)
+    r.refresh?.fill(0)
+    // sanity:csap 行不变(无重复 INSERT 或重新 active)
+    const pin = await readPinRow(uid, sid)
+    assert.equal(pin?.account_id, b.id.toString())
+    assert.equal(pin?.status, 'active')
+    // cleanup
+    a // suppress unused
+  })
+
+  test('pin active 指向 banned account(不在 active pool)→ SessionPinTemporarilyUnavailableError', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('vanish')
+    const a = await createAccount(
+      { label: 'pin-vanish-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    // 再造一个 banned account 钉过去(注意:不能 INSERT csap 指向 banned —
+    // cascade unbind 会把 csap.status 翻成 unbound。所以先 INSERT csap active,再 ban,
+    // 验证 cascade。再造一个绕开 cascade 路径的 case)
+    const b = await createAccount(
+      { label: 'pin-vanish-B', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-pin-vanish-${Date.now()}`
+    // 直接把 b 改成 cooldown(不走 banned cascade,csap 保持 active),再让 pin 指向 b
+    await updateAccount(
+      b.id,
+      { status: 'cooldown', cooldown_until: new Date(Date.now() + 60_000) },
+      keyFn,
+    )
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')`,
+      [uid, sid, b.id.toString()],
+    )
+
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    await assert.rejects(
+      s.pick({ mode: 'chat', sessionId: sid, userId: uid, pinMode: 'enforce' }),
+      (err) => err instanceof SessionPinTemporarilyUnavailableError,
+    )
+    a // suppress unused
+  })
+
+  test('pin unbound → SessionPinUnboundError(终态,前端 reset)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('unbound')
+    const a = await createAccount(
+      { label: 'pin-unbound', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-pin-unbound-${Date.now()}`
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'unbound')`,
+      [uid, sid, a.id.toString()],
+    )
+
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    await assert.rejects(
+      s.pick({ mode: 'chat', sessionId: sid, userId: uid, pinMode: 'enforce' }),
+      (err) => err instanceof SessionPinUnboundError,
+    )
+  })
+
+  test('pin miss + race-safe INSERT:首次 pick 在 csap 落新 active 行', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('insert')
+    await createAccount(
+      { label: 'pin-insert', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-pin-insert-${Date.now()}`
+    const before = await readPinRow(uid, sid)
+    assert.equal(before, null, 'precondition: csap 没有行')
+
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    const r = await s.pick({
+      mode: 'chat',
+      sessionId: sid,
+      userId: uid,
+      pinMode: 'enforce',
+    })
+    r.token.fill(0)
+    r.refresh?.fill(0)
+
+    const after = await readPinRow(uid, sid)
+    assert.ok(after, 'csap 必须落新行')
+    assert.equal(after?.status, 'active')
+    assert.equal(after?.account_id, r.account_id.toString(), 'csap 写入的 account 必须等于实际返回的')
+  })
+
+  test('反扩散:history ∩ pool 非空时,WRH 只在 history 子集里选', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('antispread')
+    const a = await createAccount(
+      { label: 'as-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const b = await createAccount(
+      { label: 'as-B', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const c = await createAccount(
+      { label: 'as-C', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    // 用户既往足迹只有 a 和 b(两个 _其他_ session 都接触过 a/b);c 是用户从未碰过的干净账号
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, 'old-sess-1', $2, 'unbound'),
+              ($1, 'old-sess-2', $3, 'active')`,
+      [uid, a.id.toString(), b.id.toString()],
+    )
+    // 但当前 pick 用的是新 session,pin miss
+    const sid = `sess-antispread-${Date.now()}`
+
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    // 重复 pick 多次(不同 wrh key 也不会跳出 history 子集 — 因为候选池本身就被缩窄了)
+    const seen = new Set<string>()
+    for (let i = 0; i < 20; i += 1) {
+      const sidI = `${sid}-${i}`
+      const r = await s.pick({
+        mode: 'chat',
+        sessionId: sidI,
+        userId: uid,
+        pinMode: 'enforce',
+      })
+      seen.add(r.account_id.toString())
+      r.token.fill(0)
+      r.refresh?.fill(0)
+    }
+    // 必须永远在 {a, b} 中,绝不应选到 c
+    assert.ok(!seen.has(c.id.toString()), '反扩散:c 是用户从未碰过的账号,enforce + pin miss 时不应被选')
+    for (const id of seen) {
+      assert.ok([a.id.toString(), b.id.toString()].includes(id))
+    }
+  })
+
+  test('反扩散退化:既往足迹账号全死 → 退化到全池(用户不卡死)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('antispread-degen')
+    const a = await createAccount(
+      { label: 'asd-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const c = await createAccount(
+      { label: 'asd-C', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    // history = {a},但 a 是 cooldown(不在 active pool)
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, 'old-degen-1', $2, 'unbound')`,
+      [uid, a.id.toString()],
+    )
+    await updateAccount(
+      a.id,
+      { status: 'cooldown', cooldown_until: new Date(Date.now() + 60_000) },
+      keyFn,
+    )
+    // 此时 pool = {c},history ∩ pool = ∅ → 必须退化全池,选 c
+    const sid = `sess-degen-${Date.now()}`
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    const r = await s.pick({
+      mode: 'chat',
+      sessionId: sid,
+      userId: uid,
+      pinMode: 'enforce',
+    })
+    assert.equal(r.account_id, BigInt(c.id), '退化全池后必须选到唯一 active 账号 c')
+    r.token.fill(0)
+    r.refresh?.fill(0)
+  })
+})
+
+describe('pick — pin observe mode', () => {
+  test('observe → 不写 csap(选号同 off 路径)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('observe')
+    await createAccount(
+      { label: 'obs-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-observe-${Date.now()}`
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    const r = await s.pick({
+      mode: 'chat',
+      sessionId: sid,
+      userId: uid,
+      pinMode: 'observe',
+    })
+    r.token.fill(0)
+    r.refresh?.fill(0)
+    const pin = await readPinRow(uid, sid)
+    assert.equal(pin, null, 'observe 模式不应写 csap')
+  })
+})
+
+describe('pick — pin off / 降级', () => {
+  test('off (default) + 有 csap 行也不读不写', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('off')
+    const a = await createAccount(
+      { label: 'off-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-off-${Date.now()}`
+    // 即使 csap 有 unbound 行,off 模式也不应抛 SessionPinUnbound
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'unbound')`,
+      [uid, sid, a.id.toString()],
+    )
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    const r = await s.pick({ mode: 'chat', sessionId: sid, userId: uid })
+    r.token.fill(0)
+    r.refresh?.fill(0)
+  })
+
+  test('enforce 缺 userId → 自动降级 off + 不抛(灰度期兼容旧 caller)', async (t) => {
+    if (skipIfNoDb(t)) return
+    await createAccount(
+      { label: 'degr-noUid', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    // 缺 userId,pinMode=enforce 应当 silent-degrade,正常返回
+    const r = await s.pick({
+      mode: 'chat',
+      sessionId: `sess-noUid-${Date.now()}`,
+      pinMode: 'enforce',
+    })
+    r.token.fill(0)
+    r.refresh?.fill(0)
+  })
+
+  test('enforce 缺 sessionId → 自动降级 off + 不抛', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('noSid')
+    await createAccount(
+      { label: 'degr-noSid', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    const r = await s.pick({ mode: 'chat', userId: uid, pinMode: 'enforce' })
+    r.token.fill(0)
+    r.refresh?.fill(0)
+  })
+})
+
+describe('updateAccount — cascade csap unbind', () => {
+  test('status=banned → 同事务 UPDATE csap SET status=unbound', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('cascade-banned')
+    const a = await createAccount(
+      { label: 'casc-banned', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid1 = `casc-${Date.now()}-1`
+    const sid2 = `casc-${Date.now()}-2`
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active'), ($1, $4, $3, 'active')`,
+      [uid, sid1, a.id.toString(), sid2],
+    )
+
+    await updateAccount(a.id, { status: 'banned' }, keyFn)
+
+    const p1 = await readPinRow(uid, sid1)
+    const p2 = await readPinRow(uid, sid2)
+    assert.equal(p1?.status, 'unbound', 'sid1 应当被 cascade 翻成 unbound')
+    assert.equal(p2?.status, 'unbound', 'sid2 应当被 cascade 翻成 unbound')
+  })
+
+  test('status=disabled → cascade unbind 同样触发', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('cascade-disabled')
+    const a = await createAccount(
+      { label: 'casc-disabled', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `casc-dis-${Date.now()}`
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')`,
+      [uid, sid, a.id.toString()],
+    )
+
+    await updateAccount(a.id, { status: 'disabled' }, keyFn)
+
+    const p = await readPinRow(uid, sid)
+    assert.equal(p?.status, 'unbound')
+  })
+
+  test('status=cooldown(非 banned/disabled)→ csap 不变(只对终态级联)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('cascade-cooldown')
+    const a = await createAccount(
+      { label: 'casc-cool', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `casc-cool-${Date.now()}`
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')`,
+      [uid, sid, a.id.toString()],
+    )
+
+    await updateAccount(
+      a.id,
+      { status: 'cooldown', cooldown_until: new Date(Date.now() + 60_000) },
+      keyFn,
+    )
+
+    const p = await readPinRow(uid, sid)
+    assert.equal(p?.status, 'active', 'cooldown 是临时态,csap 不应翻 unbound')
+  })
+
+  test('已是 unbound 的 csap 行不被重复触发(idempotent)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('cascade-idem')
+    const a = await createAccount(
+      { label: 'casc-idem', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `casc-idem-${Date.now()}`
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'unbound')`,
+      [uid, sid, a.id.toString()],
+    )
+    // 抓 updated_at 时间戳,然后 ban,验证 updated_at 没有被刷新
+    const t0 = await query<{ updated_at: string }>(
+      `SELECT updated_at::text FROM chat_session_account_pin
+       WHERE user_id = $1 AND session_id = $2`,
+      [uid, sid],
+    )
+    await updateAccount(a.id, { status: 'banned' }, keyFn)
+    const t1 = await query<{ updated_at: string }>(
+      `SELECT updated_at::text FROM chat_session_account_pin
+       WHERE user_id = $1 AND session_id = $2`,
+      [uid, sid],
+    )
+    assert.equal(t0.rows[0].updated_at, t1.rows[0].updated_at,
+      'unbound 行不应被 cascade 重复 UPDATE(WHERE status=active 过滤)')
+  })
+})
+
+// ─── v3 反关联根治 UX 闭环 — force_repin + 503 retry budget ─────────────────────
+//
+// 覆盖 pick() facade 新增控制流:
+//   - SessionPinTemporarilyUnavailableError 带 retryAfterMs
+//   - SessionPinUnboundError 带 retryStrategy='force_repin'
+//   - forceRepin=true 在 unbound 之上覆盖回 active(保留 sessionId)
+//   - forceRepin=true 在没有 csap 行时落新 active
+//   - forceRepin=true 撞到已 active 的并发 race → 切到 winner
+//   - terminal 账号 + pin active 未 cascade 的 race → self-heal + 抛 unbound
+//   - 长 cooldown 透过 503 给客户端(retryAfterMs > SHORT_BACKOFF)
+
+describe('pick — UX 闭环:retryAfterMs + retry_strategy', () => {
+  test('pin active 指向 cooldown account → SessionPinTemporarilyUnavailableError(retryAfterMs > 0)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('retryafter-cool')
+    await createAccount(
+      { label: 'ra-pool', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const b = await createAccount(
+      { label: 'ra-cool', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-ra-${Date.now()}`
+    // cooldown 30s — 远超 SHORT_BACKOFF_MS=3000,pick() facade 必抛 503 给客户端
+    const cooldownDeadline = new Date(Date.now() + 30_000)
+    await updateAccount(b.id, { status: 'cooldown', cooldown_until: cooldownDeadline }, keyFn)
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')`,
+      [uid, sid, b.id.toString()],
+    )
+
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    await assert.rejects(
+      s.pick({ mode: 'chat', sessionId: sid, userId: uid, pinMode: 'enforce' }),
+      (err) => {
+        if (!(err instanceof SessionPinTemporarilyUnavailableError)) return false
+        // retryAfterMs 应当接近 30s(允许 ±2s 漂移涵盖 pickOnce 跑完 + DB 往返)
+        const ms = err.retryAfterMs
+        assert.ok(ms > 25_000 && ms <= 30_000, `retryAfterMs 应当 ~30s,实际 ${ms}`)
+        assert.equal(err.fallbackStrategy, 'force_repin_after_retry')
+        return true
+      },
+    )
+  })
+
+  test('SessionPinUnboundError 带 retryStrategy="force_repin"(给客户端续 session 用)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('unbound-retry-strategy')
+    const a = await createAccount(
+      { label: 'urs-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-urs-${Date.now()}`
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'unbound')`,
+      [uid, sid, a.id.toString()],
+    )
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    await assert.rejects(
+      s.pick({ mode: 'chat', sessionId: sid, userId: uid, pinMode: 'enforce' }),
+      (err) => {
+        if (!(err instanceof SessionPinUnboundError)) return false
+        assert.equal(err.retryStrategy, 'force_repin')
+        assert.equal(err.action, 'reset_session')
+        return true
+      },
+    )
+  })
+})
+
+describe('pick — forceRepin path', () => {
+  test('forceRepin=true 在 unbound 之上覆盖回 active(保留 sessionId)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('force-overwrite')
+    const a = await createAccount(
+      { label: 'fo-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-fo-${Date.now()}`
+    // 预先把 csap 设成 unbound(模拟"前一轮被 ban 后客户端拿到 409")
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'unbound')`,
+      [uid, sid, a.id.toString()],
+    )
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    // forceRepin=true → 跳过 prelude unbound 检查,走 WRH 选号并 upsert
+    const r = await s.pick({
+      mode: 'chat',
+      sessionId: sid,
+      userId: uid,
+      pinMode: 'enforce',
+      forceRepin: true,
+    })
+    r.token.fill(0)
+    r.refresh?.fill(0)
+
+    const pin = await readPinRow(uid, sid)
+    assert.equal(pin?.status, 'active', 'forceRepin 必须把 unbound 翻成 active')
+    assert.equal(pin?.account_id, r.account_id.toString(), 'csap.account_id 必须等于实际返回的')
+  })
+
+  test('forceRepin=true 在没有 csap 行时落新 active 行(等价于 pin miss)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('force-fresh')
+    await createAccount(
+      { label: 'ff-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-ff-${Date.now()}`
+    const before = await readPinRow(uid, sid)
+    assert.equal(before, null, 'precondition: csap 没行')
+
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    const r = await s.pick({
+      mode: 'chat',
+      sessionId: sid,
+      userId: uid,
+      pinMode: 'enforce',
+      forceRepin: true,
+    })
+    r.token.fill(0)
+    r.refresh?.fill(0)
+
+    const after = await readPinRow(uid, sid)
+    assert.ok(after, 'forceRepin 即使无 csap 也应落新行')
+    assert.equal(after?.status, 'active')
+    assert.equal(after?.account_id, r.account_id.toString())
+  })
+
+  test('forceRepin=true 撞到已 active 的并发 row → race-lost 切到 winner(不覆盖 active)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('force-race')
+    const a = await createAccount(
+      { label: 'fr-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const b = await createAccount(
+      { label: 'fr-B', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-fr-${Date.now()}`
+    // csap 已 active 指向 b(模拟"并发 force_repin 已经抢先把 unbound 翻 active 到 b 了")
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')`,
+      [uid, sid, b.id.toString()],
+    )
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    const r = await s.pick({
+      mode: 'chat',
+      sessionId: sid,
+      userId: uid,
+      pinMode: 'enforce',
+      forceRepin: true,
+    })
+    r.token.fill(0)
+    r.refresh?.fill(0)
+    // 必须切到 winner b(account_id 由 csap 决定),即使 WRH 可能选了 a
+    assert.equal(r.account_id, BigInt(b.id),
+      'force_repin 不能覆盖已 active 的 csap 行 — 必须 race-lost 切到现存 winner')
+    // csap 状态 + account 不应被改写
+    const pin = await readPinRow(uid, sid)
+    assert.equal(pin?.account_id, b.id.toString())
+    assert.equal(pin?.status, 'active')
+    a // suppress unused
+  })
+
+  test('forceRepin=false (默认) + csap unbound → 仍抛 SessionPinUnboundError(保持旧行为)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('no-force')
+    const a = await createAccount(
+      { label: 'nf-A', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-nf-${Date.now()}`
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'unbound')`,
+      [uid, sid, a.id.toString()],
+    )
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    await assert.rejects(
+      s.pick({ mode: 'chat', sessionId: sid, userId: uid, pinMode: 'enforce' }), // 未传 forceRepin
+      (err) => err instanceof SessionPinUnboundError,
+    )
+  })
+})
+
+describe('pick — terminal account race self-heal', () => {
+  test('pin active + account banned 未 cascade(模拟 race)→ self-heal + 抛 SessionPinUnboundError', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser('self-heal')
+    await createAccount(
+      { label: 'sh-pool', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const b = await createAccount(
+      { label: 'sh-target', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    )
+    const sid = `sess-sh-${Date.now()}`
+    // 注意:必须先 INSERT csap active 再 ban — 但 updateAccount(banned) 会 cascade
+    // unbind 把 csap 翻成 unbound。模拟"race window"需要绕过 cascade:用 raw SQL
+    // 直接改账号状态不走 updateAccount,csap 保持 active。
+    await query(
+      `INSERT INTO chat_session_account_pin(user_id, session_id, account_id, status)
+       VALUES ($1, $2, $3, 'active')`,
+      [uid, sid, b.id.toString()],
+    )
+    await query(
+      `UPDATE claude_accounts SET status='banned', updated_at=NOW() WHERE id=$1`,
+      [b.id.toString()],
+    )
+    // 此刻:csap=active 指向 b,b.status=banned,b 不在 active pool — 这是 cascade race window
+    const { tracker } = mkTracker()
+    const s = mkScheduler(tracker)
+    await assert.rejects(
+      s.pick({ mode: 'chat', sessionId: sid, userId: uid, pinMode: 'enforce' }),
+      (err) => err instanceof SessionPinUnboundError,
+    )
+    // self-heal 验证:csap 行必须被翻成 unbound,关闭循环
+    const pin = await readPinRow(uid, sid)
+    assert.equal(pin?.status, 'unbound', 'handlePinnedAccountUnavailable 必须 self-heal csap 到 unbound')
   })
 })
