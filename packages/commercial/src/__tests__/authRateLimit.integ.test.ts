@@ -124,6 +124,17 @@ before(async () => {
     await cleanCommercialSchema();
     await runMigrations();
     await warmupLoginDummyHash();
+    // 2026-05-25:DEFAULTS.allow_registration 已翻 false(生产关停),但本套 case
+    // 是验证 /api/auth/register 路由级 rate-limit wiring(需要前置门放行才走到
+    // enforceRateLimit)。一次性 UPSERT system_settings 让 row 存在 + value=true
+    // 覆盖默认。beforeEach 只 TRUNCATE user-data 表,不动 system_settings → 全套
+    // case 共享这条 setting,且与生产关停默认互不影响。
+    await query(
+      `INSERT INTO system_settings(key, value, updated_at)
+       VALUES ('allow_registration', 'true'::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_at = NOW()`,
+    );
   } else if (REQUIRE_TEST_DB) {
     throw new Error("Postgres test fixture required");
   }

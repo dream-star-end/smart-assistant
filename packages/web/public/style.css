@@ -611,6 +611,24 @@ a:hover {
   margin-bottom: var(--space-3);
 }
 .login-spam-notice strong { color: var(--fg-strong); }
+/* 注册关停 banner — 复用 spam-notice 视觉风格,但用警告色调凸显"功能关闭" */
+.login-notice {
+  background: color-mix(in oklab, var(--accent, #d97757) 12%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent, #d97757) 32%, transparent);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--fg);
+  margin-bottom: var(--space-3);
+  text-align: center;
+}
+.login-notice strong { color: var(--fg-strong); font-size: var(--text-base); }
+.login-notice .login-notice-sub {
+  margin-top: 4px;
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
 .login-hint {
   color: var(--fg-muted);
   font-size: var(--text-sm);

@@ -105,7 +105,10 @@ export type SystemSettingValue<K extends SystemSettingKey = SystemSettingKey> =
 /** 默认值 —— 行不存在时 GET 返这里;应用代码读不到 row 也用这套默认。 */
 export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   idle_sweep_min: 30,
-  allow_registration: true,
+  // 2026-05-25 boss 决策:关闭新用户注册(含 LDC SSO 新建账号路径)。
+  // 默认 false → 部署即生效,无需 DB 操作。重开走 admin PUT /api/admin/settings/allow_registration
+  // 写 true,system_settings 行存在即覆盖默认。
+  allow_registration: false,
   default_effort: "medium",
   rate_limit_chat_per_min: 60,
   maintenance_mode: false,

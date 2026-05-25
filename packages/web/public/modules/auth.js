@@ -11,7 +11,7 @@
 //   POST /api/auth/resend-verification{ email }
 //   POST /api/auth/request-password-reset { email, turnstile_token }
 //   POST /api/auth/confirm-password-reset { token, new_password }
-//   GET  /api/public/config           → { turnstile_site_key, turnstile_bypass, require_email_verified }
+//   GET  /api/public/config           → { turnstile_site_key, turnstile_bypass, require_email_verified, feature_remote_ssh, allow_registration }
 //
 // URL 参数(邮件链接落地):
 //   ?reset_password=<token>    → 切到 confirm-reset 模式
@@ -177,9 +177,17 @@ export async function loadPublicConfig() {
         turnstile_site_key: typeof j.turnstile_site_key === 'string' ? j.turnstile_site_key : '',
         turnstile_bypass: j.turnstile_bypass === true,
         require_email_verified: j.require_email_verified === true,
+        // 缺省 true:fetch 失败 / 字段缺失时**不**误拦用户。后端 /api/auth/register
+        // 自身有 allow_registration=false → 403 兜底,前端缺省 true 不会放出错误账号。
+        allow_registration: j.allow_registration !== false,
       }
     } catch {
-      _publicConfig = { turnstile_site_key: '', turnstile_bypass: true, require_email_verified: false }
+      _publicConfig = {
+        turnstile_site_key: '',
+        turnstile_bypass: true,
+        require_email_verified: false,
+        allow_registration: true,
+      }
     }
     return _publicConfig
   })().finally(() => { _publicConfigInflight = null })
@@ -362,6 +370,32 @@ const _getTokenFns = {} // mode → fn returning turnstile response
 
 export function getCurrentMode() { return _currentMode }
 
+/**
+ * 根据 _publicConfig.allow_registration 应用注册关停 UX。
+ *
+ * 关停时(allow_registration === false):
+ *   - register 模式: 显示 banner,禁用三个 input + 注册按钮,隐藏注册页 LDC SSO 入口
+ *                    (注册页 LDC 等价"用 LDC 一键建账号",关停时藏掉避免误导)
+ *   - login 模式:   隐藏"还没有账号? 立即注册"那一行(导航入口失效)
+ *                    **登录页 LDC SSO 块保留** — 老 LDC 用户登录走它,新用户在
+ *                    callback 被 socialLoginOrCreate REGISTRATION_DISABLED 拦,
+ *                    redirect 回 /?login=1&oauth_error=registration_disabled 由 main.js toast
+ *
+ * 缺省 true 路径(后端正常 / fetch 失败):全部维持原样,什么都不动。
+ */
+function _applyRegistrationGate() {
+  const allow = _publicConfig?.allow_registration !== false
+  // register 模式 UI:banner + form 禁用 + LDC 块
+  const banner = $('auth-register-disabled-notice'); if (banner) banner.hidden = allow
+  const regSsoBlock = $('auth-register-sso-block'); if (regSsoBlock) regSsoBlock.hidden = !allow
+  for (const id of ['auth-register-email', 'auth-register-password', 'auth-register-confirm', 'auth-register-btn']) {
+    const el = $(id); if (el) el.disabled = !allow
+  }
+  // login 模式 UI:"还没有账号? 立即注册"行
+  const loginToggleReg = $('auth-login-toggle-register')
+  if (loginToggleReg) loginToggleReg.hidden = !allow
+}
+
 export function setMode(mode) {
   if (!MODES.includes(mode)) mode = 'login'
   _currentMode = mode
@@ -382,13 +416,18 @@ export function setMode(mode) {
   const tEl = $('auth-card-title'); if (tEl) tEl.textContent = head.t
   const sEl = $('auth-card-sub'); if (sEl) sEl.textContent = head.s
 
+  // 注册关停 UX 必须先于 turnstile 挂载 — 关停时不挂 register 的 widget,省 CF 额度
+  // 也避免 disabled 表单仍触发 challenge。
+  _applyRegistrationGate()
+  const allowReg = _publicConfig?.allow_registration !== false
+
   // Mount turnstile widget for the current mode (only modes that need it)
   const widgetContainerId = {
     login: 'turnstile-login',
     register: 'turnstile-register',
     forgot: 'turnstile-forgot',
   }[mode]
-  if (widgetContainerId) {
+  if (widgetContainerId && !(mode === 'register' && !allowReg)) {
     const c = $(widgetContainerId)
     if (c) {
       _mountWidget(c).then((fn) => { _getTokenFns[mode] = fn })
@@ -482,8 +521,12 @@ export async function initAuth() {
     })
   }
 
-  // Pre-warm config so first widget render is snappy
-  loadPublicConfig().catch(() => {})
+  // **必须 await** loadPublicConfig 后再 setMode:setMode 内 _applyRegistrationGate
+  // 读 _publicConfig.allow_registration 决定 banner / 表单 disabled / Turnstile 是否挂载,
+  // 如果先 setMode 再 await,关停场景下用户会看到一闪而过的可点表单。
+  // try/catch 包住:fetch 失败已在 loadPublicConfig 内回退 default(allow=true 保守放行),
+  // 这里不会抛。
+  await loadPublicConfig().catch(() => {})
 
   // URL-driven modes win over default
   if (resetParam) {
@@ -558,6 +601,12 @@ async function _doLogin() {
 
 async function _doRegister() {
   _clearError()
+  // 关停时 button.disabled + form disabled,但有人 devtools 强解禁也别让请求过去 ——
+  // 给一个友好提示而不是后端 403。后端 /api/auth/register 仍有自己的 403 兜底。
+  if (_publicConfig?.allow_registration === false) {
+    _showError('网站当前暂停新用户注册')
+    return
+  }
   const email = $('auth-register-email').value.trim().toLowerCase()
   const password = $('auth-register-password').value
   const confirm = $('auth-register-confirm').value
@@ -819,6 +868,7 @@ function _friendlyAuthError(data, status) {
     case 'INVALID_TOKEN':       return '验证码或链接无效/已过期,请重新获取'
     case 'RATE_LIMITED':        return '操作过于频繁,请稍后再试'
     case 'EMAIL_DOMAIN_BLOCKED': return '该邮箱域名暂不支持注册,请换一个常用邮箱(如 Gmail/QQ/163 等)'
+    case 'REGISTRATION_DISABLED': return msg || '网站当前暂停新用户注册'
     default:
       if (status === 401) return msg || '认证失败'
       if (status === 403) return msg || '无权访问'

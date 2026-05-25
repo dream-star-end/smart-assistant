@@ -99,6 +99,7 @@ export interface SocialLoginInput {
 export type SocialLoginErrorCode =
   | 'USER_DISABLED' // 已存在但被封号 / 软删
   | 'INVALID_INPUT' // provider_user_id / username 校验失败(防御 LDC 异常)
+  | 'REGISTRATION_DISABLED' // 全局关停注册 + identity 未命中(老 LDC 用户登录不受影响)
 
 export class SocialLoginError extends Error {
   constructor(
@@ -142,6 +143,16 @@ export interface SocialLoginDeps {
   now?: () => number
   accessTtlSeconds?: number
   refreshTtlSeconds?: number
+  /**
+   * 是否允许在 identity 未命中时新建本地账号。
+   *
+   * 默认 `true`(向下兼容现有调用方/测试)。LDC handler 会按
+   * `system_settings.allow_registration` 注入:`false` 时本次走"老用户登录"分支,
+   * identity 未命中即抛 `REGISTRATION_DISABLED`,**不**做 argon2,**不**写库。
+   *
+   * 注意:该参数只决定"本次能不能建账号",不影响 identity 命中(老用户登录)路径。
+   */
+  allowCreate?: boolean
 }
 
 const inputSchema = z.object({
@@ -259,6 +270,17 @@ export async function socialLoginOrCreate(
     }
 
     // 3b) 没找到 → 创建 user + ledger + identity
+    //
+    // 2026-05-25:全局注册关停时(deps.allowCreate === false)拦在 argon2 之前。
+    // 关停语义只 apply 到"新建账号"分支,identity 命中(上面 3a)的老 LDC 用户
+    // 不受影响 — 已绑账号继续可登录。throw 在 tx 内 → 自动回滚 advisory lock + 无副作用。
+    if (deps.allowCreate === false) {
+      throw new SocialLoginError(
+        'REGISTRATION_DISABLED',
+        'new account creation disabled by system_settings.allow_registration',
+      )
+    }
+
     const placeholderHash = await hashPassword(randomBytes(32).toString('base64url'))
     const synEmail = syntheticEmail(input.provider, input.providerUserId)
     // 按 LDC trust_level 计算赠金(纯函数,SAVEPOINT 之前算好,tx 内只用结果)
