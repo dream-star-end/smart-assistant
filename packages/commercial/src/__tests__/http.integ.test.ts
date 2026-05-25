@@ -11,6 +11,7 @@ import { wrapIoredis } from "../middleware/rateLimit.js";
 import { signAccess } from "../auth/jwt.js";
 import { warmupLoginDummyHash } from "../auth/login.js";
 import { setSystemSetting } from "../admin/systemSettings.js";
+import { _resetAllowRegistrationCacheForTests } from "../http/handlers.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 
 /**
@@ -105,6 +106,18 @@ before(async () => {
     await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
     await runMigrations();
     await warmupLoginDummyHash();
+    // 2026-05-25:DEFAULTS.allow_registration 翻 false(生产关停)。这套 HTTP
+    // 集成 case 大量用 POST /api/auth/register 走打通流;handler 前置门会先于
+    // rate-limit / 业务逻辑判定 allow_registration,默认 false 会让所有 register
+    // 路径直接 403 REGISTRATION_DISABLED。UPSERT row=true 让 row 命中覆盖默认,
+    // beforeEach 不 TRUNCATE system_settings(见 COMMERCIAL_TABLES 列表也没动)→
+    // 单次设置全套共享。
+    await query(
+      `INSERT INTO system_settings(key, value, updated_at)
+       VALUES ('allow_registration', 'true'::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_at = NOW()`,
+    );
   } else if (REQUIRE_TEST_DB) {
     throw new Error("Postgres test fixture required");
   }
@@ -762,6 +775,47 @@ describe("commercial HTTP router (integ)", () => {
         "DELETE FROM system_settings WHERE key = 'register_email_domain_blocklist'",
       );
     }
+  });
+});
+
+// ─── GET /api/public/config — allow_registration 透传 + 5s cache 验证 ─────
+//
+// 2026-05-25:handleGetPublicConfig 新增 allow_registration 字段。匿名公开热路径,
+// 加 5s in-memory cache 避免每次匿名请求都打 system_settings。这里:
+//   1) 锁住 wiring(handler 真的 read getSystemSetting + 写到响应)
+//   2) 锁住 cache(改 DB 不重置 cache 时,5s 内仍返旧值;reset 后立即读新值)
+describe("commercial HTTP /api/public/config — allow_registration", () => {
+  test("exposes allow_registration; cache hides DB flip until reset", async (t) => {
+    if (skipIfMissing(t)) return;
+    // 1) 设 row = true,reset cache → 第一次拉应该是 true
+    await query(
+      `INSERT INTO system_settings(key, value, updated_at)
+       VALUES ('allow_registration', 'true'::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_at = NOW()`,
+    );
+    _resetAllowRegistrationCacheForTests();
+    const r1 = await getJson("/api/public/config");
+    assert.equal(r1.status, 200);
+    assert.equal(r1.json.allow_registration, true, "row=true → 响应应 true");
+
+    // 2) DB 翻 false 但不 reset cache → 5s 内仍读到旧值 true(锁住 cache 行为)
+    await query(
+      `UPDATE system_settings SET value = 'false'::jsonb WHERE key = 'allow_registration'`,
+    );
+    const r2 = await getJson("/api/public/config");
+    assert.equal(r2.json.allow_registration, true, "cache 未失效时应仍返旧值");
+
+    // 3) reset cache → 读新值 false
+    _resetAllowRegistrationCacheForTests();
+    const r3 = await getJson("/api/public/config");
+    assert.equal(r3.json.allow_registration, false, "cache 重置后应反映新值");
+
+    // 4) 还原 row=true + reset(免得污染后续依赖 register 端点的 case)
+    await query(
+      `UPDATE system_settings SET value = 'true'::jsonb WHERE key = 'allow_registration'`,
+    );
+    _resetAllowRegistrationCacheForTests();
   });
 });
 

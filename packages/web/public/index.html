@@ -1007,16 +1007,24 @@
         <button id="auth-resend-verify-btn" type="button" class="btn btn-ghost btn-sm">重发验证邮件</button>
         <div id="auth-login-resend-status" hidden class="login-resend-status"></div>
       </div>
-      <div class="login-toggle muted">还没有账号? <button id="auth-tab-register" type="button">立即注册</button></div>
+      <div id="auth-login-toggle-register" class="login-toggle muted">还没有账号? <button id="auth-tab-register" type="button">立即注册</button></div>
       <!-- LDC SSO: 顶层 GET 导航走 302,不能用 fetch — server 要 Set-Cookie + Location -->
-      <div class="login-or-divider"><span>或</span></div>
-      <a class="btn btn-linuxdo btn-lg btn-full" href="/api/auth/linuxdo/start" rel="nofollow">
-        使用 LINUX DO 账号登录
-      </a>
+      <!-- 注册关停时**保留**登录页 LDC 入口:老 LDC 用户登录走这里,新用户在 callback 被拦 toast。 -->
+      <div id="auth-login-sso-block">
+        <div class="login-or-divider"><span>或</span></div>
+        <a class="btn btn-linuxdo btn-lg btn-full" href="/api/auth/linuxdo/start" rel="nofollow">
+          使用 LINUX DO 账号登录
+        </a>
+      </div>
     </form>
 
     <!-- ── Mode: register ── -->
     <div id="auth-mode-register" hidden>
+      <!-- 注册关停 banner — auth.js 根据 /api/public/config.allow_registration 控制显隐 -->
+      <div id="auth-register-disabled-notice" class="login-notice" hidden>
+        <strong>网站当前暂停新用户注册</strong>
+        <div class="login-notice-sub">已注册用户可继续登录使用</div>
+      </div>
       <div id="auth-register-form">
         <div class="login-field">
           <label for="auth-register-email">邮箱</label>
@@ -1043,10 +1051,14 @@
         <button id="auth-register-back-btn" type="button" hidden>返回登录</button>
       </div>
       <div class="login-toggle muted">已有账号? <button id="auth-tab-login-from-register" type="button">直接登录</button></div>
-      <div class="login-or-divider"><span>或</span></div>
-      <a class="btn btn-linuxdo btn-lg btn-full" href="/api/auth/linuxdo/start" rel="nofollow">
-        使用 LINUX DO 账号登录
-      </a>
+      <!-- 注册关停时本块整体隐藏:注册页面的 LDC 入口本质是"用 LDC 一键建账号",
+           跟邮件注册同语义;关停时也藏掉避免误导用户。老 LDC 用户走登录页那一份。 -->
+      <div id="auth-register-sso-block">
+        <div class="login-or-divider"><span>或</span></div>
+        <a class="btn btn-linuxdo btn-lg btn-full" href="/api/auth/linuxdo/start" rel="nofollow">
+          使用 LINUX DO 账号登录
+        </a>
+      </div>
     </div>
 
     <!-- ── Mode: forgot password ── -->

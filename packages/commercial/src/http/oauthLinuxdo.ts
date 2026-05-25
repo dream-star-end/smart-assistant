@@ -32,6 +32,7 @@ import {
 import { socialLoginOrCreate, SocialLoginError } from '../auth/socialLogin.js'
 import { enforceRateLimit, type CommercialHttpDeps, type RequestContext } from './handlers.js'
 import type { RateLimitConfig } from '../middleware/rateLimit.js'
+import { getSystemSetting } from '../admin/systemSettings.js'
 
 const LINUXDO_START_RATE_LIMIT: RateLimitConfig = {
   scope: 'linuxdo_start',
@@ -74,6 +75,8 @@ function mapErrorCode(code: string): string {
       return 'userinfo_failed'
     case 'USER_DISABLED':
       return 'disabled'
+    case 'REGISTRATION_DISABLED':
+      return 'registration_disabled'
     case 'CONFIG_MISSING':
       return 'unavailable'
     default:
@@ -184,6 +187,13 @@ export async function handleLinuxdoCallback(
   }
 
   // ── 4) 落库 + 签 token
+  //
+  // 2026-05-25:把 system_settings.allow_registration 作为 allowCreate 注入。
+  // 关停期间:identity 命中的老 LDC 用户照常登录;identity 未命中(新用户)的会被
+  // socialLoginOrCreate 早早拦截抛 REGISTRATION_DISABLED,handler 翻译成
+  // ?oauth_error=registration_disabled 让前端 toast。这一步**故意**在 LDC userinfo
+  // 拿到之后做,因为 start 时还不知道是不是老用户,先 redirect 到 LDC 再回来才能判定。
+  const allowRegSetting = await getSystemSetting('allow_registration')
   let result
   try {
     result = await socialLoginOrCreate(
@@ -199,6 +209,7 @@ export async function handleLinuxdoCallback(
         jwtSecret: deps.jwtSecret,
         userAgent: ctx.userAgent ?? undefined,
         bindIp: ctx.authBoundIp,
+        allowCreate: allowRegSetting.value === true,
       },
     )
   } catch (err) {

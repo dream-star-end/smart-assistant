@@ -294,6 +294,84 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
     )
   })
 
+  // ── allowCreate gate(2026-05-25 注册关停)─────────────────────────
+  //
+  // 设计语义验证:
+  //   1. allowCreate=false + identity miss → REGISTRATION_DISABLED,无任何 DB 副作用
+  //      (advisory lock 持仓的 tx 内部 throw,自动回滚 lock + 不写 users/identity/ledger)
+  //   2. allowCreate=false + identity hit → 老用户登录不受影响(关停只 apply 到"新建"分支)
+  //   3. allowCreate=true(默认)+ identity miss → 仍按原行为建账号(向下兼容)
+
+  test('allowCreate=false + identity miss → REGISTRATION_DISABLED (no DB writes)', async (t) => {
+    if (skipIfNoPg(t)) return
+    await assert.rejects(
+      socialLoginOrCreate(
+        {
+          provider: 'linuxdo',
+          providerUserId: '8001',
+          username: 'newcomer',
+          email: null,
+          trustLevel: 2,
+          avatarUrl: null,
+        },
+        { jwtSecret: testJwtSecret, allowCreate: false },
+      ),
+      (err: unknown) =>
+        err instanceof SocialLoginError && err.code === 'REGISTRATION_DISABLED',
+    )
+    const u = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM users')
+    assert.equal(u.rows[0].cnt, '0', 'REGISTRATION_DISABLED 不该建 user')
+    const oi = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM oauth_identities')
+    assert.equal(oi.rows[0].cnt, '0', 'REGISTRATION_DISABLED 不该建 identity')
+    const led = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM credit_ledger')
+    assert.equal(led.rows[0].cnt, '0', 'REGISTRATION_DISABLED 不该写 ledger')
+    const rt = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM refresh_tokens')
+    assert.equal(rt.rows[0].cnt, '0', 'REGISTRATION_DISABLED 不该签 refresh token')
+  })
+
+  test('allowCreate=false + identity hit → existing LDC user logs in normally', async (t) => {
+    if (skipIfNoPg(t)) return
+    // 先用 allowCreate=true 建一个老 LDC 用户
+    const seeded = await socialLoginOrCreate(
+      {
+        provider: 'linuxdo',
+        providerUserId: '8002',
+        username: 'oldhand',
+        email: null,
+        trustLevel: 1,
+        avatarUrl: null,
+      },
+      { jwtSecret: testJwtSecret, allowCreate: true },
+    )
+    assert.equal(seeded.isNew, true)
+
+    // 全局关停后再来登录:identity 命中 → 走"老用户登录"分支,allowCreate=false 不应拦
+    const r = await socialLoginOrCreate(
+      {
+        provider: 'linuxdo',
+        providerUserId: '8002',
+        username: 'oldhand_v2',
+        email: null,
+        trustLevel: 2,
+        avatarUrl: 'https://cdn.linux.do/u/8002.png',
+      },
+      { jwtSecret: testJwtSecret, allowCreate: false },
+    )
+    assert.equal(r.isNew, false)
+    assert.equal(r.user.id, seeded.user.id)
+    assert.ok(r.access_token)
+    assert.ok(r.refresh_token)
+
+    // 不双发积分;identity 快照按常规升级路径 UPDATE
+    const led = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM credit_ledger')
+    assert.equal(led.rows[0].cnt, '1', '老用户复登不写新 ledger')
+    const oi = await query<{ username: string; trust_level: number | null }>(
+      `SELECT username, trust_level FROM oauth_identities WHERE provider_user_id='8002'`,
+    )
+    assert.equal(oi.rows[0].username, 'oldhand_v2', 'identity snapshot 应被 UPDATE')
+    assert.equal(oi.rows[0].trust_level, 2)
+  })
+
   test('invalid provider_user_id → SocialLoginError(INVALID_INPUT)', async (t) => {
     if (skipIfNoPg(t)) return
     await assert.rejects(

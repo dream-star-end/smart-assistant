@@ -844,10 +844,35 @@ export async function handleMe(
 // ─── GET /api/public/config ─────────────────────────────────────────
 // 公开路径(Phase 4A:前端 auth 模态启动时拉取)。仅暴露公开值:
 //   - turnstile_site_key:Cloudflare 站点公钥,前端 widget 注册时必需
+//   - turnstile_bypass:dev/CI 是否允许占位 token
 //   - require_email_verified:布尔,影响登录前是否拦截 + 注册成功后是否提示去查邮箱
+//   - feature_remote_ssh:FEATURE_REMOTE_SSH 灰度状态
+//   - allow_registration:是否允许新用户注册;前端据此显示 banner / 关停 register tab
 // 未来扩展(brand_name / contact / commercial_enabled tier 等)在此追加,但绝不放
 // secrets/server-side flags(避免给攻击者侦察 surface)。
-// 不限流、不验证、不读 DB,纯静态(进程启动后由 deps 决定)→ 极快,可被前端缓存。
+// 不限流、不验证;`allow_registration` 走 system_settings,加了 5s in-memory cache,
+// 匿名公开热路径不直打 DB,admin 改动最坏延迟 5 秒生效。
+
+// 5s 短 TTL cache。允许 admin PUT 后短暂不一致,换匿名 /api/public/config 极快。
+// 不做 cross-process 失效(每个 worker 独立),改动后所有 worker 在 5s 内自然收敛。
+let _allowRegCache: { value: boolean; expiresAt: number } | null = null;
+const _ALLOW_REG_CACHE_TTL_MS = 5_000;
+
+async function _readAllowRegistrationCached(): Promise<boolean> {
+  const now = Date.now();
+  if (_allowRegCache && _allowRegCache.expiresAt > now) {
+    return _allowRegCache.value;
+  }
+  const r = await getSystemSetting("allow_registration");
+  const value = r.value === true;
+  _allowRegCache = { value, expiresAt: now + _ALLOW_REG_CACHE_TTL_MS };
+  return value;
+}
+
+/** 测试专用:清掉 cache,让下一次读 DB。production 代码不应调用。 */
+export function _resetAllowRegistrationCacheForTests(): void {
+  _allowRegCache = null;
+}
 
 export async function handleGetPublicConfig(
   _req: IncomingMessage,
@@ -855,6 +880,7 @@ export async function handleGetPublicConfig(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
+  const allow_registration = await _readAllowRegistrationCached();
   sendJson(res, 200, {
     turnstile_site_key: deps.turnstileSiteKey ?? "",
     // turnstile_bypass=true → 前端可直接发"占位 token",dev/CI 用;生产必须 false
@@ -862,6 +888,11 @@ export async function handleGetPublicConfig(
     require_email_verified: deps.requireEmailVerified === true,
     // FEATURE_REMOTE_SSH 灰度状态 —— 前端据此决定是否渲染执行环境切换器。
     feature_remote_ssh: deps.remoteSshEnabled === true,
+    // system_settings.allow_registration 透传给前端。关停时前端要:
+    //   1) 在 register tab 展示 banner + disable 表单 + 不挂 Turnstile
+    //   2) 在 login tab 隐藏"立即注册"导航链接(LDC SSO 按钮保留 — 老用户登录用)
+    // 后端 /api/auth/register + LDC callback 已有独立强制,这里只是体验侧门。
+    allow_registration,
   });
 }
 

@@ -2930,7 +2930,13 @@ async function init() {
       remember: remember !== false,
     }),
   )
-  initAuth()
+  // 2026-05-25:initAuth 现在 async — 内部 await loadPublicConfig 后再 setMode,
+  // 让 _publicConfig 在第一次 setMode 时已就绪。必须 await,否则后面 URL-driven
+  // 路由(?register / ?signup 等)在 3210 行 setAuthMode('register') 时会与 initAuth
+  // 内部的 await 并行跑:gate 拿到 _publicConfig=null 兜底 allow=true,关停场景下
+  // 短暂闪出可用注册表单 + Turnstile 误挂,initAuth 末尾的 setMode('login') 又会
+  // 反过来把外部 setAuthMode('register') 覆盖回 login,违背 ?register 语义。
+  await initAuth()
   // M5(P1-7):多 tab 认证状态同步。同浏览器同源的其他 tab 退出 / 刷新 token 时,
   // 本 tab in-place 跟进,免去 reactive 401 → 重登流程。
   // 严格同身份校验(userId)+ stale guard(access_exp 必须新于本 tab 当前 tokenExp)。
@@ -3229,7 +3235,9 @@ async function init() {
                     ? '账号已被禁用，无法登录'
                     : _oauthErr === 'unavailable'
                       ? 'LINUX DO 登录暂时不可用'
-                      : 'LINUX DO 登录失败，请稍后再试'
+                      : _oauthErr === 'registration_disabled'
+                        ? '网站当前暂停新用户注册'
+                        : 'LINUX DO 登录失败，请稍后再试'
         toast(_msg, _oauthErr === 'denied' ? 'info' : 'error')
         try {
           const cleanUrl = new URL(window.location.href)
