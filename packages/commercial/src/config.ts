@@ -437,6 +437,20 @@ export const commercialConfigSchema = z
       .enum(["off", "fail_open", "fail_closed"])
       .default("off"),
     /**
+     * v3 反关联根治 — session pin 调度三态开关(0072 migration + scheduler.pick PinMode)。
+     *
+     *   - `off`(默认):scheduler 走旧 WRH-only 调度,不读/不写 chat_session_account_pin 表
+     *   - `observe`:WRH 仍主导 pick,同步读 csap 比对一致性,console.log 出
+     *     `evt:'session_pin_observe'` 计数 outcome ∈ {pin_miss, pin_unbound, consistent, divergent}
+     *   - `enforce`:csap pin 命中 sticky;unbound 抛 SessionPinUnboundError(409)
+     *     让客户端透明 x-force-repin:1 重试;pin miss 走"既往足迹优先"+ race-safe INSERT
+     *
+     * 切换需 systemctl restart openclaude 生效。
+     */
+    SESSION_PIN_MODE: z
+      .enum(["off", "observe", "enforce"])
+      .default("off"),
+    /**
      * GitHub OAuth App 配置(GitHub OAuth 关联功能)。
      * 全部 optional — 缺失时 /api/auth/github/* 返 503,启动不阻断。
      */

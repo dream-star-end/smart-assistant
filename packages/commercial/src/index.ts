@@ -923,6 +923,11 @@ export async function registerCommercial(
         // Phase 6 — account_uuid 锚定执行模式(0070 plan §3.0)。
         // off(默认)/ fail_open / fail_closed 三态切换走 systemctl restart。
         phase6AccountUuidEnforce: cfg.PHASE6_ACCOUNT_UUID_ENFORCE,
+        // v3 反关联根治 — session pin 灰度三态(0072+0073+0074)。off(默认)/
+        // observe / enforce 切换走 systemctl restart。下游 pickUpstream →
+        // scheduler.pick 自动消费;deps.sessionPinMode=undefined 时 scheduler 内
+        // ?? 'off' 兜底等价行为,仍向后兼容。
+        sessionPinMode: cfg.SESSION_PIN_MODE,
       });
       // 2026-05-05 v3 commercial server-authored persistence — 复用 18791/18443
       // 同一个 listener,新加 POST /internal/v3/server-authored-message。
@@ -1215,6 +1220,8 @@ export async function registerCommercial(
         platformServerSecret: cfg.PLATFORM_HMAC_SECRET,
         // Phase 6 — external ApiKey proxy 也走同一个 flag,跟 internal 共用 PickUpstreamDeps。
         phase6AccountUuidEnforce: cfg.PHASE6_ACCOUNT_UUID_ENFORCE,
+        // v3 反关联根治 — external ApiKey proxy 同型共用 SESSION_PIN_MODE。
+        sessionPinMode: cfg.SESSION_PIN_MODE,
       });
       // eslint-disable-next-line no-console
       console.log(
