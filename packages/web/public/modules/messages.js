@@ -332,7 +332,11 @@ const _MCP_SERVER_META = {
 // browser / minimax-media / openclaude-memory render with the same icon
 // and label as their native MCP counterparts.
 const _CODEX_TYPE_META = {
+  // Both `plan` (codex 0.125-era) and `todo_list` (codex 0.130+) emit the
+  // same shape after `_normalizeCodexPlanInput`. Keep both keys so the icon
+  // + label resolves regardless of which schema version the CLI uses.
   plan: { icon: _ICON_CHECK_LIST, label: '任务列表' },
+  todo_list: { icon: _ICON_CHECK_LIST, label: '任务列表' },
   mcpToolCall: { icon: _ICON_GEAR, label: 'MCP 工具' },
   dynamicToolCall: { icon: _ICON_GEAR, label: '工具调用' },
   collabAgentToolCall: { icon: _ICON_BOT, label: '委托子任务' },
@@ -864,16 +868,63 @@ function _toolSummary(name, input, msg) {
 // the summary is delegated to the same `_toolSummary` / `_mcpSummary`
 // helpers as native claude-code calls, so the header line reads identically
 // (e.g. codex calling `browser_navigate` shows the URL, not `browser · navigate`).
+// Normalize a codex plan / todo_list ThreadItem to a uniform shape so
+// `_renderCodexPlan` and `_codexSummary` share one source of truth across
+// codex CLI schema versions.
+//
+// Codex CLI schema drift (verified 2026-05-25 against codex 0.130 / 0.133):
+//   - 0.125-era `plan` items carried `steps: [{ text|description, status }]`
+//     with `status` ∈ {pending|in_progress|completed}
+//   - 0.130+ `todo_list` items carry `items: [{ text, completed: boolean }]`
+//     — no `status` enum, no in_progress mid-state
+//
+// We accept both spellings on input AND derive a uniform `{steps:[{text,status}]}`
+// output. Status derivation:
+//   - If `s.status` is a string, preserve it verbatim (old `plan` schema —
+//     keeps in_progress mid-state and any custom string codex might emit).
+//   - Otherwise, `s.completed === true` → 'completed'; everything else
+//     (false / missing / non-bool) → 'pending'.
+// We do NOT synthesize `in_progress` from "first incomplete item" or similar
+// heuristics — the new schema has no reliable in_progress signal and
+// guessing would mislead the UI.
+export function _normalizeCodexPlanInput(input) {
+  if (!input || typeof input !== 'object') return { steps: [] }
+  const rawSteps = Array.isArray(input.steps)
+    ? input.steps
+    : Array.isArray(input.items) ? input.items : []
+  const steps = []
+  for (const s of rawSteps) {
+    if (!s || typeof s !== 'object') continue
+    const text = typeof s.text === 'string' ? s.text
+      : typeof s.description === 'string' ? s.description
+      : ''
+    // Old codex `plan` carried `status: string` enum — preserve it verbatim
+    // so in_progress survives. New `todo_list` only carries `completed: bool`
+    // — map true → 'completed', false / missing → 'pending'.
+    let status
+    if (typeof s.status === 'string') {
+      status = s.status
+    } else if (s.completed === true) {
+      status = 'completed'
+    } else {
+      status = 'pending'
+    }
+    steps.push({ text, status })
+  }
+  return { steps }
+}
+
 export function _codexSummary(codexType, input) {
   if (!input || typeof input !== 'object') return ''
   switch (codexType) {
-    case 'plan': {
+    case 'plan':
+    case 'todo_list': {
       // Align with TodoWrite summary format ("done/total") instead of the
       // old "N 步" so users see the same progress vocabulary across plan
       // sources.
-      const steps = Array.isArray(input.steps) ? input.steps : []
+      const { steps } = _normalizeCodexPlanInput(input)
       if (steps.length === 0) return ''
-      const done = steps.filter((s) => s && s.status === 'completed').length
+      const done = steps.filter((s) => s.status === 'completed').length
       return `${done}/${steps.length}`
     }
     case 'webSearch': return input.query || ''
@@ -1372,7 +1423,8 @@ function _renderCodexItem(body, codexType, input, msg) {
     return
   }
   switch (codexType) {
-    case 'plan': return _renderCodexPlan(body, input, msg)
+    case 'plan':
+    case 'todo_list': return _renderCodexPlan(body, input, msg)
     case 'webSearch': return _renderCodexWebSearch(body, input, msg)
     case 'imageGeneration': return _renderCodexImageGeneration(body, input, msg)
     case 'imageView': return _renderCodexImageView(body, input, msg)
@@ -1389,7 +1441,10 @@ function _renderCodexItem(body, codexType, input, msg) {
 }
 
 function _renderCodexPlan(body, input, msg) {
-  const steps = Array.isArray(input.steps) ? input.steps : []
+  // Both `plan` (older codex) and `todo_list` (codex 0.130+) feed in here
+  // via `_renderCodexItem` switch fall-through. Normalizer collapses the two
+  // schemas into `{steps:[{text, status}]}`.
+  const { steps } = _normalizeCodexPlanInput(input)
   if (steps.length === 0) {
     _renderKvList(body, input, { skip: ['id', 'type'] })
     _renderOutput(body, msg.output)
@@ -1398,16 +1453,15 @@ function _renderCodexPlan(body, input, msg) {
   const list = document.createElement('div')
   list.className = 'tool-todo-list'
   for (const s of steps) {
-    if (!s || typeof s !== 'object') continue
     const row = document.createElement('div')
-    const status = s.status || 'pending'
+    const status = s.status
     row.className = `tool-todo-item tool-todo-${status}`
     const mark = document.createElement('span')
     mark.className = 'tool-todo-mark'
     mark.textContent = status === 'completed' ? '✓' : status === 'in_progress' ? '◐' : '○'
     const text = document.createElement('span')
     text.className = 'tool-todo-text'
-    text.textContent = s.text || s.description || ''
+    text.textContent = s.text
     row.appendChild(mark)
     row.appendChild(text)
     list.appendChild(row)

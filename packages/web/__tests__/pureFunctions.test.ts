@@ -1566,8 +1566,9 @@ describe('T11: Codex tool-card UI unification', () => {
   )
 
   // _codexSummary references _codexResolveMcpCall + _parseMcpName + _humanizeOp +
-  // _mcpSummary + _toolSummary + _shortPath + _parseCodexTypeName + _TOOL_ICONS.
-  // Build a sandbox so callable can resolve all of them.
+  // _mcpSummary + _toolSummary + _shortPath + _parseCodexTypeName +
+  // _normalizeCodexPlanInput + _TOOL_ICONS. Build a sandbox so callable
+  // can resolve all of them.
   const _parseMcpNameSrc = extractFunction(appJs, '_parseMcpName')
   const _humanizeOpSrc = extractFunction(appJs, '_humanizeOp')
   const _shortPathSrc = extractFunction(appJs, '_shortPath')
@@ -1575,6 +1576,7 @@ describe('T11: Codex tool-card UI unification', () => {
   const _toolSummarySrc = extractFunction(appJs, '_toolSummary')
   const _mcpSummarySrc = extractFunction(appJs, '_mcpSummary')
   const _codexResolveMcpCallSrc = extractFunction(appJs, '_codexResolveMcpCall')
+  const _normalizeCodexPlanInputSrc = extractFunction(appJs, '_normalizeCodexPlanInput')
   const _codexSummarySrc = extractFunction(appJs, '_codexSummary')
   const _codexSummary = new Function(
     `const _TOOL_ICONS = { Bash: 1, Read: 1, Edit: 1, Write: 1, Grep: 1, Glob: 1, WebFetch: 1, WebSearch: 1, TodoWrite: 1 };
@@ -1583,11 +1585,18 @@ describe('T11: Codex tool-card UI unification', () => {
      ${_shortPathSrc}
      ${_parseCodexTypeNameSrc}
      ${_codexResolveMcpCallSrc}
+     ${_normalizeCodexPlanInputSrc}
      ${_toolSummarySrc}
      ${_mcpSummarySrc}
      ${_codexSummarySrc}
      return _codexSummary;`,
   )() as (codexType: string, input: unknown) => string
+
+  // _normalizeCodexPlanInput is self-contained — no helper deps, just
+  // string/array/object type checks. Direct callable.
+  const _normalizeCodexPlanInput = makeCallable<(input: unknown) => {
+    steps: Array<{ text: string; status: string }>
+  }>(_normalizeCodexPlanInputSrc)
 
   it('_codexResolveMcpCall accepts {server, tool, arguments} canonical shape', () => {
     const r = _codexResolveMcpCall({
@@ -1690,6 +1699,120 @@ describe('T11: Codex tool-card UI unification', () => {
   it('_codexSummary plan returns empty string when no steps', () => {
     assert.equal(_codexSummary('plan', { steps: [] }), '')
     assert.equal(_codexSummary('plan', {}), '')
+  })
+
+  // ── v1.0.203 — codex 0.130+ todo_list schema compat ──
+  //
+  // codex CLI 0.130 起把 `plan` ThreadItem 改名为 `todo_list`,字段也从
+  // `steps: [{ text, status }]` 改成 `items: [{ text, completed: bool }]`。
+  // _normalizeCodexPlanInput 把两种 schema 收敛到 `{steps:[{text,status}]}`,
+  // 渲染层 (_renderCodexPlan) 与汇总层 (_codexSummary) 共用同一份归一规则。
+  //
+  // status 推导**保守**:s.status 字符串优先(老 plan schema, in_progress
+  // 中间态保留),否则只看 s.completed===true→completed / 其它→pending。
+  // 绝不从布尔 false 启发式合成 in_progress(协议无可靠信号)。
+
+  it('_codexSummary todo_list (codex 0.130+ schema) returns done/total', () => {
+    // 真实 codex 0.130/0.133 emit:items[{text, completed}],无 status 字符串。
+    const s = _codexSummary('todo_list', {
+      items: [
+        { text: '读文件', completed: true },
+        { text: '分析', completed: false },
+        { text: '修改', completed: true },
+        { text: '测试', completed: false },
+      ],
+    })
+    assert.equal(s, '2/4')
+  })
+
+  it('_codexSummary todo_list all-incomplete → 0/N', () => {
+    const s = _codexSummary('todo_list', {
+      items: [
+        { text: 'a', completed: false },
+        { text: 'b', completed: false },
+      ],
+    })
+    assert.equal(s, '0/2')
+  })
+
+  it('_codexSummary todo_list missing items → empty string', () => {
+    assert.equal(_codexSummary('todo_list', { items: [] }), '')
+    assert.equal(_codexSummary('todo_list', {}), '')
+  })
+
+  it('_normalizeCodexPlanInput accepts old plan schema verbatim', () => {
+    // Old codex `plan` item: steps[{text|description, status: enum}].
+    // status 字符串原样透传 — in_progress 中间态必须保留。
+    const r = _normalizeCodexPlanInput({
+      steps: [
+        { text: 'a', status: 'completed' },
+        { description: 'b', status: 'in_progress' },
+        { text: 'c', status: 'pending' },
+      ],
+    })
+    assert.deepEqual(r.steps, [
+      { text: 'a', status: 'completed' },
+      { text: 'b', status: 'in_progress' },
+      { text: 'c', status: 'pending' },
+    ])
+  })
+
+  it('_normalizeCodexPlanInput maps new todo_list schema (items+completed) to steps', () => {
+    // codex 0.130+ `todo_list` item: items[{text, completed: bool}].
+    // completed=true→'completed',completed=false 或 缺失→'pending'。
+    const r = _normalizeCodexPlanInput({
+      items: [
+        { text: '读文件', completed: true },
+        { text: '分析', completed: false },
+        { text: '不带 completed' },
+      ],
+    })
+    assert.deepEqual(r.steps, [
+      { text: '读文件', status: 'completed' },
+      { text: '分析', status: 'pending' },
+      { text: '不带 completed', status: 'pending' },
+    ])
+  })
+
+  it('_normalizeCodexPlanInput does NOT synthesize in_progress from boolean false', () => {
+    // 协议无可靠 in_progress 信号 — 单 boolean completed 只能映射二档。
+    // 任何 false 都是 pending,不要"第一未完成 = in_progress"启发式。
+    const r = _normalizeCodexPlanInput({
+      items: [
+        { text: 'a', completed: true },
+        { text: 'b', completed: false }, // 不应变 'in_progress'
+        { text: 'c', completed: false },
+      ],
+    })
+    assert.equal(r.steps[1].status, 'pending')
+    assert.equal(r.steps[2].status, 'pending')
+  })
+
+  it('_normalizeCodexPlanInput prefers explicit status over completed bool', () => {
+    // 老 plan schema 同时存在 status + completed(理论上)时 status 优先,
+    // 避免在升级期短时间内行为漂移。
+    const r = _normalizeCodexPlanInput({
+      steps: [{ text: 'x', status: 'in_progress', completed: true }],
+    })
+    assert.equal(r.steps[0].status, 'in_progress')
+  })
+
+  it('_normalizeCodexPlanInput empty / null / non-object input → {steps:[]}', () => {
+    assert.deepEqual(_normalizeCodexPlanInput(null), { steps: [] })
+    assert.deepEqual(_normalizeCodexPlanInput(undefined), { steps: [] })
+    assert.deepEqual(_normalizeCodexPlanInput('not an object'), { steps: [] })
+    assert.deepEqual(_normalizeCodexPlanInput({}), { steps: [] })
+    assert.deepEqual(_normalizeCodexPlanInput({ steps: [], items: [] }), { steps: [] })
+    // steps 优先 over items 当两者都存在(防 codex 升级中间态 emit 两份)
+    assert.deepEqual(
+      _normalizeCodexPlanInput({ steps: [{ text: 's', status: 'pending' }], items: [{ text: 'i' }] }).steps,
+      [{ text: 's', status: 'pending' }],
+    )
+  })
+
+  it('_normalizeCodexPlanInput drops non-object step entries', () => {
+    const r = _normalizeCodexPlanInput({ items: [null, 'string', 42, { text: 'ok' }] })
+    assert.deepEqual(r.steps, [{ text: 'ok', status: 'pending' }])
   })
 
   it('_codexSummary mcpToolCall delegates to native MCP summary', () => {
