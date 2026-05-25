@@ -33,6 +33,7 @@ import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { settleUsageAndLedger } from "../billing/proxyBilling.js";
 import type { TokenUsage } from "../billing/calculator.js";
+import { generatePersona } from "../account-pool/persona.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -141,11 +142,12 @@ async function createEgressProxy(label: string): Promise<bigint> {
 
 async function createClaudeAccount(label: string): Promise<bigint> {
   const epId = await createEgressProxy(`${label}-ep`);
+  // 0074 把 persona 锁 NOT NULL + shape CHECK,raw INSERT 必须塞合法 persona。
   const r = await query<{ id: string }>(
-    `INSERT INTO claude_accounts(label, plan, oauth_token_enc, oauth_nonce, egress_proxy_id)
-     VALUES ($1, 'pro', '\\x00'::bytea, '\\x00'::bytea, $2)
+    `INSERT INTO claude_accounts(label, plan, oauth_token_enc, oauth_nonce, egress_proxy_id, persona)
+     VALUES ($1, 'pro', '\\x00'::bytea, '\\x00'::bytea, $2, $3::jsonb)
      RETURNING id::text AS id`,
-    [label, epId.toString()],
+    [label, epId.toString(), JSON.stringify(generatePersona())],
   );
   return BigInt(r.rows[0].id);
 }

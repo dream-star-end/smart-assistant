@@ -36,6 +36,7 @@ import { runMigrations } from "../db/migrate.js";
 import { settleUsageAndLedger } from "../billing/proxyBilling.js";
 import type { TokenUsage } from "../billing/calculator.js";
 import { getPool } from "../db/index.js";
+import { generatePersona } from "../account-pool/persona.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -158,14 +159,15 @@ async function createEgressProxy(label: string): Promise<bigint> {
  *  usage_records.account_id FK → claude_accounts(id),Claude 路径 case 必须用真 id。
  *  oauth_token_enc / oauth_nonce 是 BYTEA NOT NULL,塞 stub 字节即可,不参与本测试。
  *  0055 加了 CHECK (egress_proxy IS NULL AND egress_proxy_id IS NOT NULL),
- *  所以必须先建 egress_proxies 行再把 id 灌进 egress_proxy_id。 */
+ *  所以必须先建 egress_proxies 行再把 id 灌进 egress_proxy_id。
+ *  0074 把 persona 锁 NOT NULL + shape CHECK,所以 raw INSERT 必须塞合法 persona。 */
 async function createClaudeAccount(label: string): Promise<bigint> {
   const epId = await createEgressProxy(`${label}-ep`);
   const r = await query<{ id: string }>(
-    `INSERT INTO claude_accounts(label, plan, oauth_token_enc, oauth_nonce, egress_proxy_id)
-     VALUES ($1, 'pro', '\\x00'::bytea, '\\x00'::bytea, $2)
+    `INSERT INTO claude_accounts(label, plan, oauth_token_enc, oauth_nonce, egress_proxy_id, persona)
+     VALUES ($1, 'pro', '\\x00'::bytea, '\\x00'::bytea, $2, $3::jsonb)
      RETURNING id::text AS id`,
-    [label, epId.toString()],
+    [label, epId.toString(), JSON.stringify(generatePersona())],
   );
   return BigInt(r.rows[0].id);
 }
