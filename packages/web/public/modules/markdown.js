@@ -1,8 +1,8 @@
 // OpenClaude — Markdown rendering, media embedding, rich blocks
-import { htmlSafeEscape } from './dom.js?v=71ba55d2'
-import { TRANSPARENT_PIXEL_DATA_URL, getCachedSignedUrl } from './mediaSign.js?v=71ba55d2'
-import { effectiveTheme } from './theme.js?v=71ba55d2'
-import { _basename } from './util.js?v=71ba55d2'
+import { htmlSafeEscape } from './dom.js?v=71ba55d5'
+import { TRANSPARENT_PIXEL_DATA_URL, getCachedSignedUrl } from './mediaSign.js?v=71ba55d5'
+import { effectiveTheme } from './theme.js?v=71ba55d5'
+import { _basename } from './util.js?v=71ba55d5'
 
 // ── Mermaid lazy loader ──
 // A single shared promise prevents concurrent callers from each injecting a <script>.
@@ -420,7 +420,7 @@ export function embedMediaUrls(html) {
   // We need to handle HTML entities: marked converts `/` inside code to `<code>...</code>`
   // and may entity-encode chars. First handle <code>-wrapped paths, then bare paths.
   const _MEDIA_EXTS =
-    'jpg|jpeg|png|gif|webp|bmp|svg|mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|avi|mkv|pdf'
+    'jpg|jpeg|png|gif|webp|bmp|svg|mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|avi|mkv|pdf|txt|md|csv|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz'
 
   // Match <code>/path.ext</code> or <code>C:\path.ext</code> — handles both POSIX and Windows paths
   html = html.replace(
@@ -819,14 +819,27 @@ function _fillMathPlaceholdersSync(html, items) {
   const escapeSel = window.CSS?.escape || ((s) => s.replace(/["\\]/g, '\\$&'))
   const container = document.createElement('div')
   container.innerHTML = html
+  // Some mobile WebViews / sanitizer versions may preserve the empty math
+  // placeholder element but drop or rewrite its `id`, which used to make the
+  // id lookup miss and leave a permanent blank 1ch/1.6em placeholder. Keep an
+  // order-based fallback: marked emits placeholders in the same order as
+  // `pendingMath`, so the next surviving `.math-*` shell is the right target.
+  const fallbackPlaceholders = Array.from(
+    container.querySelectorAll('.math-block, .math-inline'),
+  ).filter((el) => !el.classList.contains('math-error') && !el.classList.contains('math-fallback'))
+  let fallbackCursor = 0
   for (const { id, tex, display } of items) {
-    const el = container.querySelector(`#${escapeSel(id)}`)
-    // If the placeholder is missing (DOMPurify dropped the node, or some
-    // other transformation removed it) we silently skip — the item has
-    // already been spliced from `pendingMath` by the caller, so there's no
-    // async fallback. This is strictly stricter than the old behaviour, but
-    // DOMPurify default config keeps `id` on `div`/`span`, so a miss here is
-    // a real bug to investigate rather than silently fall through.
+    let el = container.querySelector(`#${escapeSel(id)}`)
+    if (!el) {
+      while (fallbackCursor < fallbackPlaceholders.length && !container.contains(fallbackPlaceholders[fallbackCursor])) {
+        fallbackCursor++
+      }
+      el = fallbackPlaceholders[fallbackCursor++] || null
+    }
+    // If the placeholder is missing entirely (DOMPurify dropped the node, or
+    // some other transformation removed it), skip rather than injecting math at
+    // an unrelated location. Normal paths hit id lookup; mobile sanitizer drift
+    // hits the ordered fallback above.
     if (!el) continue
     let katexHtml
     try {

@@ -70,6 +70,10 @@ export const DEFAULT_SIGN_TTL_MS = 5 * 60 * 1000
  * 走同一容器 HOME 空间。
  */
 const CONTAINER_HOME_PREFIX = '/home/agent/'
+/** Gateway subprocess temp files are intentionally exposed by container /api/file. */
+const CONTAINER_TEMP_PREFIX = '/tmp/openclaude-'
+const CONTAINER_OPT_EXPORT_RE =
+  /^\/opt\/openclaude\/[^/\x00-\x1F\x7F]+\.(?:txt|md|csv|pdf|docx?|xlsx?|pptx?|zip|tar|gz)$/i
 
 /**
  * 路径 sanity check —— **不是 ACL**,只挡明显扫描类路径。
@@ -81,11 +85,13 @@ const CONTAINER_HOME_PREFIX = '/home/agent/'
  *
  * 接受:
  *   - `/home/agent/...`(必须有后续路径,不能仅是目录 prefix)
+ *   - `/tmp/openclaude-*`(当前会话内工具生成的临时文件;容器 /api/file 已有同款白名单)
+ *   - `/opt/openclaude/<top-level safe document>`(Codex CLI cwd 误写出的当前文件;仅顶层文档扩展)
  *   - 不含 `..`(防路径 traversal,与 normalizeSignBatchInput 一致)
  *   - 不含 NUL / control chars(`\x00-\x1F` + `\x7F`)—— signed URL、日志、proxy path
  *     都不该承载这类字节,Codex 审计 round 3 建议补
  *
- * 拒绝:`/etc/...`、`/var/...`、`/proc/...`、`/root/...`、`/tmp/...`、`/home/agent`(无 slash)、
+ * 拒绝:`/etc/...`、`/var/...`、`/proc/...`、`/root/...`、非 `/tmp/openclaude-*` 的 `/tmp/...`、`/home/agent`(无 slash)、
  * `/home/agent/../etc/passwd`、`/home/agent/...png\0` 等。
  *
  * **路径空间约定**:此函数判定的是**容器内部**路径(不是 master host volume 路径)。
@@ -94,7 +100,7 @@ const CONTAINER_HOME_PREFIX = '/home/agent/'
  * codex 合法路径全 drop。该 helper 是修正路径空间错位的根因 fix。
  */
 export function isContainerPathAllowed(p: string): boolean {
-  if (!p.startsWith(CONTAINER_HOME_PREFIX)) return false
+  if (!(p.startsWith(CONTAINER_HOME_PREFIX) || p.startsWith(CONTAINER_TEMP_PREFIX) || CONTAINER_OPT_EXPORT_RE.test(p))) return false
   if (p.includes('..')) return false
   // 拒绝 NUL/control chars(`\x00-\x1F` + DEL `\x7F`)—— 路径若含这类字节会成为
   // log/header smuggling 与 fs API 兼容性陷阱。biome 误判正则中的控制字符为可疑,

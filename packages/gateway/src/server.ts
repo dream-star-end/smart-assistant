@@ -3011,7 +3011,7 @@ export class Gateway {
             return
           }
           const remoteFileContentType = mimeFor(resolved)
-          const remoteFileDispositionMode = isActiveContentType(remoteFileContentType) ? 'attachment' : 'inline'
+          const remoteFileDispositionMode = shouldServeInline(remoteFileContentType) ? 'inline' : 'attachment'
           res.writeHead(200, {
             'Content-Type': remoteFileContentType,
             'Content-Length': buf.length,
@@ -3077,8 +3077,8 @@ export class Gateway {
       return
     }
     const fileContentType = mimeFor(realPath)
-    // C3: Force download for active content types to prevent same-origin script execution
-    const fileDispositionMode = isActiveContentType(fileContentType) ? 'attachment' : 'inline'
+    // Inline only previewable media; document/text artifacts must download.
+    const fileDispositionMode = shouldServeInline(fileContentType) ? 'inline' : 'attachment'
     res.writeHead(200, {
       'Content-Type': fileContentType,
       'Content-Length': fileStat.size,
@@ -3183,9 +3183,7 @@ export class Gateway {
           'Content-Length': buf.length,
           'Cache-Control': 'private, max-age=3600',
         }
-        if (isActiveContentType(remoteContentType)) {
-          remoteHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(hitPath) || 'file')}"`
-        }
+        remoteHeaders['Content-Disposition'] = `${shouldServeInline(remoteContentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(hitPath) || 'file')}"`
         res.writeHead(200, remoteHeaders)
         res.end(buf)
         return
@@ -3258,15 +3256,12 @@ export class Gateway {
       return
     }
     const mediaContentType = mimeFor(realPath)
-    // C3: Force download for active content types to prevent same-origin script execution
     const mediaHeaders: Record<string, string | number> = {
       'Content-Type': mediaContentType,
       'Content-Length': mediaStat.size,
       'Cache-Control': 'private, max-age=3600',
     }
-    if (isActiveContentType(mediaContentType)) {
-      mediaHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(realPath) || 'file')}"`
-    }
+    mediaHeaders['Content-Disposition'] = `${shouldServeInline(mediaContentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(realPath) || 'file')}"`
     res.writeHead(200, mediaHeaders)
     createReadStream(null as unknown as string, { fd, autoClose: true }).pipe(res)
   }
@@ -7397,6 +7392,14 @@ export const FILE_ALLOWED_DIRS: string[] = [
 /** Temp-file prefix pattern: /tmp/openclaude-* */
 const TEMP_PREFIX = resolve('/tmp/openclaude-')
 
+/**
+ * v3 Codex sometimes writes a user-requested artifact into its cwd
+ * (/opt/openclaude) before reading platform-capabilities. Do not expose the
+ * source tree; allow only top-level, non-executable document artifacts.
+ */
+const OPT_OPENCLAUDE_EXPORT_RE =
+  /^\/opt\/openclaude\/[^/\x00-\x1F\x7F]+\.(?:txt|md|csv|pdf|docx?|xlsx?|pptx?|zip|tar|gz)$/i
+
 /** Known project roots that agents may work in (intentionally empty — broad source dirs removed) */
 const AGENT_CWD_ROOTS: string[] = []
 
@@ -7507,7 +7510,8 @@ export function isFileAllowed(
       resolvedPath === TRUSTED_CONTAINER_HOME ||
       resolvedPath.startsWith(`${TRUSTED_CONTAINER_HOME}/`)
     const inTemp = resolvedPath.startsWith(TEMP_PREFIX)
-    if (!inHome && !inTemp) return false
+    const inOptExport = OPT_OPENCLAUDE_EXPORT_RE.test(resolvedPath)
+    if (!inHome && !inTemp && !inOptExport) return false
     return !isFileBlocked(resolvedPath)
   }
   // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
@@ -7868,6 +7872,13 @@ const ACTIVE_CONTENT_TYPES = new Set([
 function isActiveContentType(mime: string): boolean {
   const base = mime.split(';')[0].trim().toLowerCase()
   return ACTIVE_CONTENT_TYPES.has(base)
+}
+
+/** True only for resources that must render inline in chat (<img>/<audio>/<video>). */
+export function shouldServeInline(mime: string): boolean {
+  const base = mime.split(';')[0].trim().toLowerCase()
+  if (ACTIVE_CONTENT_TYPES.has(base)) return false
+  return base.startsWith('image/') || base.startsWith('audio/') || base.startsWith('video/')
 }
 
 /** Known route prefixes for metrics normalization (avoids high-cardinality labels). */

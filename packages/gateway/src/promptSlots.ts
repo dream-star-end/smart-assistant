@@ -72,7 +72,7 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     '',
     '## 多媒体与文件',
     '',
-    '发送文件给用户: 直接写**绝对路径**(如 `/root/.openclaude/generated/photo.png`),不要用 `![]()` 语法。',
+    '发送文件给用户: 必须先保存到平台生成目录再回复**绝对路径**;商业版容器优先使用 `/home/agent/.openclaude/generated/`,个人版/宿主机通常是 `/root/.openclaude/generated/`。不要用 `/tmp` 临时目录,不要用 `![]()` 语法。',
     '详细规则见 `skill_view("platform-capabilities")`。',
     '',
     '## 内联富内容: `chart` / `mermaid` / `htmlpreview` 代码块',
