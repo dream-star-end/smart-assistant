@@ -1,17 +1,17 @@
-import { clearAttachments } from './attachments.js?v=71ba55d5'
-import { dbDelete, dbPut } from './db.js?v=71ba55d5'
+import { clearAttachments } from './attachments.js?v=71ba55d6'
+import { dbDelete, dbPut } from './db.js?v=71ba55d6'
 // OpenClaude — Session management, sidebar, context menu
-import { $, htmlSafeEscape } from './dom.js?v=71ba55d5'
-import { exportSessionDocx } from './export-docx.js?v=71ba55d5'
-import { exportSessionTex } from './export-tex.js?v=71ba55d5'
-import { refreshGithubPill } from './github.js?v=71ba55d5'
-import { setTitleBusy } from './notifications.js?v=71ba55d5'
-import { getSession, state } from './state.js?v=71ba55d5'
-import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=71ba55d5'
-import { toast } from './ui.js?v=71ba55d5'
-import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=71ba55d5'
-import { nudgeDrain } from './websocket.js?v=71ba55d5'
-import { trace, flushTrace } from './trace.js?v=71ba55d5'
+import { $, htmlSafeEscape } from './dom.js?v=71ba55d6'
+import { exportSessionDocx } from './export-docx.js?v=71ba55d6'
+import { exportSessionTex } from './export-tex.js?v=71ba55d6'
+import { refreshGithubPill } from './github.js?v=71ba55d6'
+import { setTitleBusy } from './notifications.js?v=71ba55d6'
+import { getSession, state } from './state.js?v=71ba55d6'
+import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=71ba55d6'
+import { toast } from './ui.js?v=71ba55d6'
+import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=71ba55d6'
+import { nudgeDrain } from './websocket.js?v=71ba55d6'
+import { trace, flushTrace } from './trace.js?v=71ba55d6'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -36,7 +36,7 @@ export function setSessionUIDeps(deps) {
 }
 
 // ═══════════════ SESSIONS ═══════════════
-export function createSession(agentId) {
+export function createSession(agentId, options = {}) {
   // Plan B (2026-05-09):新建会话前必须清掉 composer 上未发送的附件 + abort
   // 进行中的上传。否则切到新会话后,旧会话选的附件还挂在 state.attachments 上,
   // 用户点发送会把上一会话的图片/文件带到新会话里。
@@ -50,6 +50,11 @@ export function createSession(agentId) {
     messages: [],
     agentId: agentId || state.defaultAgentId,
   }
+  // Boot placeholder: cold-start with a remembered access token but no local
+  // IndexedDB sessions. The server sync that follows should select the latest
+  // real server session instead of persisting this empty local shell as a new
+  // cross-device "新会话".
+  if (options?.bootPlaceholder === true) s._bootPlaceholder = true
   state.sessions.set(id, s)
   state.currentSessionId = id
   scheduleSave(s)

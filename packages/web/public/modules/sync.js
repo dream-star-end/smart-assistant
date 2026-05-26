@@ -2,11 +2,11 @@
 // Syncs frontend sessions (IndexedDB) with server-side storage (SQLite).
 // Server is source of truth for session list; local IDB is cache + offline fallback.
 
-import { apiFetch, apiGet, apiJson, authHeaders } from './api.js?v=71ba55d5'
-import { dbGetAll, dbPut, dbDelete } from './db.js?v=71ba55d5'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=71ba55d5'
-import { state } from './state.js?v=71ba55d5'
-import { trace } from './trace.js?v=71ba55d5'
+import { apiFetch, apiGet, apiJson, authHeaders } from './api.js?v=71ba55d6'
+import { dbGetAll, dbPut, dbDelete } from './db.js?v=71ba55d6'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=71ba55d6'
+import { state } from './state.js?v=71ba55d6'
+import { trace } from './trace.js?v=71ba55d6'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
 // resolve it (either by taking server state, or by detecting local-dominates
@@ -1147,6 +1147,19 @@ export function pushSessionToServer(sess) {
     trace('save.push.skip', { sess: sess?.id ?? null, reason: !sess?.id ? 'no_sess_id' : 'no_token' })
     return Promise.resolve()
   }
+  // Do not create cross-device server rows for empty placeholder sessions.
+  // They are produced during cold boot before `/api/sessions/list` returns,
+  // and also by explicit "新建会话" before the user sends anything. Persisting
+  // them server-side makes returning users land on a blank "新会话" and clutters
+  // the sidebar across devices. The first real message/rename will re-save.
+  if (
+    (!Array.isArray(sess.messages) || sess.messages.length === 0) &&
+    (!sess.title || sess.title === '新会话')
+  ) {
+    sess._dirty = false
+    trace('save.push.skip', { sess: sess.id, reason: 'empty_session' })
+    return Promise.resolve()
+  }
   // Oversized sessions (received a 413 from a previous PUT) are PUT-disabled
   // for the rest of the page lifetime. Any subsequent PUT would just cost
   // request bytes + DB JSON.parse cycles and 413 again. The flag is
@@ -1157,7 +1170,7 @@ export function pushSessionToServer(sess) {
     trace('save.push.skip', { sess: sess.id, reason: 'already_oversized' })
     return Promise.resolve()
   }
-  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, _oversized, ...clean } = sess
+  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, _pendingCostCredits, _lastFinaledAssistantId, _lastFinaledAt, _oversized, _bootPlaceholder, ...clean } = sess
   // Include baseSyncedAt for optimistic concurrency — server rejects if row is newer
   clean._baseSyncedAt = _syncedAt || 0
   // 2026-05-06 §4.5 改动 11 — messages 内 strip(双层防御第一层)。
