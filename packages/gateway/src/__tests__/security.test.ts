@@ -135,16 +135,9 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   it('allows /tmp/openclaude-* temp files', () => {
     assert.ok(isFileAllowed(resolve('/tmp/openclaude-abc123/output.png')))
   })
-  // Should ALLOW — known project roots
-  it('allows files under /opt/openclaude/openclaude', () => {
-    assert.ok(isFileAllowed(resolve('/opt/openclaude/openclaude/packages/gateway/src/server.ts')))
-  })
-  it('allows files under /opt/openclaude/claude-code-best', () => {
-    assert.ok(isFileAllowed(resolve('/opt/openclaude/claude-code-best/src/main.tsx')))
-  })
   // Should ALLOW — dynamic agent cwds
-  it('allows files under a dynamic agent cwd', () => {
-    assert.ok(isFileAllowed(resolve('/home/user/project/build/result.html'), ['/home/user/project']))
+  it('allows safe media files under a dynamic agent cwd', () => {
+    assert.ok(isFileAllowed(resolve('/home/user/project/build/result.pdf'), ['/home/user/project']))
   })
 
   // Should DENY — outside all allowed dirs
@@ -162,6 +155,15 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   })
   it('denies random /home path without agent cwd', () => {
     assert.ok(!isFileAllowed(resolve('/home/user/secrets/token.json')))
+  })
+  it('denies broad source roots that are not explicit agent cwds', () => {
+    assert.ok(!isFileAllowed(resolve('/opt/openclaude/openclaude/packages/gateway/src/server.ts')))
+    assert.ok(!isFileAllowed(resolve('/opt/openclaude/claude-code-best/src/main.tsx')))
+  })
+  it('denies executable HTML under dynamic agent cwd', () => {
+    assert.ok(
+      !isFileAllowed(resolve('/home/user/project/build/result.html'), ['/home/user/project']),
+    )
   })
   it('denies /tmp files that do not match openclaude- prefix', () => {
     assert.ok(!isFileAllowed(resolve('/tmp/random-file.txt')))
@@ -184,7 +186,9 @@ describe('T01c: shouldServeInline — file disposition policy', () => {
   })
 
   it('forces Word documents to download', () => {
-    assert.ok(!shouldServeInline('application/vnd.openxmlformats-officedocument.wordprocessingml.document'))
+    assert.ok(
+      !shouldServeInline('application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+    )
   })
 })
 
@@ -211,8 +215,7 @@ describe('T02: isUploadMimeAllowed — upload type filtering', () => {
   it('allows application/zip', () => assert.ok(isUploadMimeAllowed('application/zip')))
   it('allows application/gzip (.gz, .tar.gz)', () =>
     assert.ok(isUploadMimeAllowed('application/gzip')))
-  it('allows application/x-tar (.tar)', () =>
-    assert.ok(isUploadMimeAllowed('application/x-tar')))
+  it('allows application/x-tar (.tar)', () => assert.ok(isUploadMimeAllowed('application/x-tar')))
   it('allows application/x-compressed-tar (.tar.gz alt)', () =>
     assert.ok(isUploadMimeAllowed('application/x-compressed-tar')))
   it('allows application/x-7z-compressed (.7z)', () =>

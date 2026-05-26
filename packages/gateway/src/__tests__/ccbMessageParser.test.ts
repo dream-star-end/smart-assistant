@@ -182,19 +182,21 @@ describe('CcbMessageParser: tool_result', () => {
     assert.equal(events.length, 1, 'should emit only once')
   })
 
-  it('truncates long previews to 500 chars', () => {
+  it('truncates long previews to 3000 chars', () => {
     const { parser, events, toolUseIdToName } = createParser()
     toolUseIdToName.set('tu_6', 'Bash')
 
     parser.parse({
       type: 'user',
       message: {
-        content: [{ type: 'tool_result', tool_use_id: 'tu_6', content: 'x'.repeat(1000) }],
+        content: [{ type: 'tool_result', tool_use_id: 'tu_6', content: 'x'.repeat(4000) }],
       },
     } as any)
 
     if (events[0].kind === 'block' && events[0].block.kind === 'tool_result') {
-      assert.ok((events[0].block as any).preview.length <= 501) // 500 + '…'
+      const preview = (events[0].block as any).preview
+      assert.equal(preview.length, 3001) // 3000 + '…'
+      assert.ok(preview.endsWith('…'))
     }
   })
 })
@@ -255,7 +257,9 @@ describe('CcbMessageParser: result', () => {
       const parser = new CcbMessageParser({
         toolUseIdToName: new Map(),
         onEvent: () => {},
-        onFinish: (r) => { result = r },
+        onFinish: (r) => {
+          result = r
+        },
         sessionTotals,
       })
       return { parser, getResult: () => result }
@@ -302,7 +306,9 @@ describe('CcbMessageParser: result', () => {
     const parser = new CcbMessageParser({
       toolUseIdToName: new Map(),
       onEvent: () => {},
-      onFinish: (r) => { result = r },
+      onFinish: (r) => {
+        result = r
+      },
       sessionTotals,
     })
     parser.parse({ type: 'result', total_cost_usd: 0.03, usage: {} } as any)

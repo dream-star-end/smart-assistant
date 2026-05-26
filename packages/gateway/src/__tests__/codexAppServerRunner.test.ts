@@ -789,9 +789,7 @@ describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKE
       if (written.length > prevLen) return JSON.parse(written[written.length - 1])
       await new Promise((r) => setImmediate(r))
     }
-    throw new Error(
-      `runner never wrote a new line (prevLen=${prevLen}, total=${written.length})`,
-    )
+    throw new Error(`runner never wrote a new line (prevLen=${prevLen}, total=${written.length})`)
   }
 
   it('thread/resume returns -32600 "no rollout found" → restart with thread/start, threadId updated, session_id re-emitted', async () => {
@@ -846,7 +844,11 @@ describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKE
     // Post-conditions
     assert.equal(runner.threadId, 'thr-NEW', 'threadId must be updated to fresh id')
     assert.equal(runner.attached, true, 'attached must be true after successful self-heal')
-    assert.deepEqual(h.sessionIds, ['thr-NEW'], 'session_id must be emitted exactly once for the new thread')
+    assert.deepEqual(
+      h.sessionIds,
+      ['thr-NEW'],
+      'session_id must be emitted exactly once for the new thread',
+    )
 
     // The runTurn should have emitted a result message with ok=true.
     const resultMsg = h.messages.find((m) => m.type === 'result')
@@ -953,10 +955,11 @@ describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKE
     })
     await new Promise((r) => setImmediate(r))
     assert.ok(err instanceof Error)
-    assert.match(err.message, /thread\/resume -> -32600: no rollout found/)
-    assert.equal(err.rpcCode, -32600)
-    assert.equal(err.rpcMessage, 'no rollout found for thread id xyz')
-    assert.equal(err.rpcMethod, 'thread/resume')
+    const rpcErr = err as Error & { rpcCode: number; rpcMessage: string; rpcMethod: string }
+    assert.match(rpcErr.message, /thread\/resume -> -32600: no rollout found/)
+    assert.equal(rpcErr.rpcCode, -32600)
+    assert.equal(rpcErr.rpcMessage, 'no rollout found for thread id xyz')
+    assert.equal(rpcErr.rpcMethod, 'thread/resume')
     await h.cleanup()
   })
 })

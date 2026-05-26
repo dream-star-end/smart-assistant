@@ -63,11 +63,17 @@ const DYNAMIC_IDS = new Set([
   '__typing', // showTypingIndicator() creates div#__typing
   'tasks-panel', // _renderTasksPanel() creates div#tasks-panel
   'slash-popup', // showSlashPopup() creates div#slash-popup
+  'permission-modal', // permission prompts are created on demand in websocket.js
 ])
 
-// ── Template-literal dynamic IDs: $(`tasks-panel-${t}`) / $(`tasks-tab-${t}`) ──
-// These have known expansions: cron, bg, log — which ARE in the HTML
-const TEMPLATE_DYNAMIC_PREFIXES = ['tasks-panel-', 'tasks-tab-']
+// ── Template-literal dynamic IDs: $(`tasks-panel-${t}`) / $(`wechat-state-${s}`) ──
+// These have known expansions which ARE in the HTML.
+const TEMPLATE_DYNAMIC_IDS: Record<string, string[]> = {
+  'tasks-panel-': ['cron', 'bg', 'log'],
+  'tasks-tab-': ['cron', 'bg', 'log'],
+  'wechat-state-': ['unbound', 'pairing', 'bound'],
+}
+const TEMPLATE_DYNAMIC_PREFIXES = Object.keys(TEMPLATE_DYNAMIC_IDS)
 
 // ── Load files once ──
 const html = readPublicFile('index.html')
@@ -140,11 +146,8 @@ describe('T02: No duplicate IDs in HTML', () => {
 
 // ── T03: Template-literal dynamic IDs resolve ──
 describe('T03: Template-literal dynamic $() IDs resolve', () => {
-  // Known expansions for tasks-panel-${t} and tasks-tab-${t}
-  const knownSuffixes = ['cron', 'bg', 'log']
-
-  for (const prefix of TEMPLATE_DYNAMIC_PREFIXES) {
-    for (const suffix of knownSuffixes) {
+  for (const [prefix, suffixes] of Object.entries(TEMPLATE_DYNAMIC_IDS)) {
+    for (const suffix of suffixes) {
       const fullId = `${prefix}${suffix}`
       it(`$(\`${prefix}\${t}\`) with t="${suffix}" → id="${fullId}" exists`, () => {
         assert.ok(htmlIdSet.has(fullId), `Dynamic ID "${fullId}" not found in index.html`)

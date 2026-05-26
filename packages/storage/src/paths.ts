@@ -21,6 +21,12 @@ export const paths = {
     join(HOME, 'agents', agentId, 'skills', skillName),
   agentSkillMd: (agentId: string, skillName: string) =>
     join(HOME, 'agents', agentId, 'skills', skillName, 'SKILL.md'),
+  // Hub skills system: shared skill directory available to all agents
+  hubDir: join(HOME, 'hub'),
+  hubSkillsDir: join(HOME, 'hub', 'skills'),
+  hubLockfile: join(HOME, 'hub', 'lock.json'),
+  hubSkillDir: (skillName: string) => join(HOME, 'hub', 'skills', skillName),
+  hubSkillMd: (skillName: string) => join(HOME, 'hub', 'skills', skillName, 'SKILL.md'),
   // Session search (L2): SQLite FTS5 DB per install (not per agent)
   sessionsDb: join(HOME, 'sessions.db'),
   // Phase 0.2: durable outbox for server-authored messages that couldn't be
