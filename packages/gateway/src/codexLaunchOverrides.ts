@@ -93,6 +93,8 @@ not use markdown image syntax (\`![]()\`). Inline rich-content code blocks
 
 `
 
+const CODEX_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+
 // ── Path resolution for the bundled mcp-memory entry ──
 
 /** Three-candidate fallback for resolving the bundled `openclaude-memory`
@@ -183,9 +185,9 @@ export interface CodexLaunchOverridesContext {
    *  etc., so codex gets a no-op pass-through. */
   provider?: string
   model?: string
-  /** UI effort level passed through; codex runners are no-op on effort
-   *  changes today, but if a future user toggles "research mode" on a codex
-   *  agent the RESEARCH slot would activate. */
+  /** UI effort level passed through. For codex-backed agents, low/medium/high/xhigh
+   *  become codex's native `model_reasoning_effort`; max remains prompt-slot-only
+   *  because codex does not expose a `max` reasoning effort. */
   effortLevel?: string
   /** mkdtempSync'd directory the caller has prepared. We write the
    *  instructions file into this dir (no other side effects). */
@@ -223,9 +225,10 @@ export interface CodexLaunchOverrides {
    *
    *  Order is stable and deterministic for snapshot tests:
    *    1. model_instructions_file
-   *    2. mcp_servers.openclaude_memory.command (if entry resolved)
-   *    3. mcp_servers.openclaude_memory.args
-   *    4. mcp_servers.openclaude_memory.env
+   *    2. model_reasoning_effort (if low/medium/high/xhigh is selected)
+   *    3. mcp_servers.openclaude_memory.command (if entry resolved)
+   *    4. mcp_servers.openclaude_memory.args
+   *    5. mcp_servers.openclaude_memory.env
    *
    *  Empty MCP entries are omitted (no key set at all) when the bundled
    *  mcp-memory entry can't be resolved; in that case codex still gets the
@@ -265,10 +268,10 @@ export async function buildCodexLaunchOverrides(
   const instructionsContent = `${CODEX_PREAMBLE}${platformResult.content}`
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
 
-  const argvOverrides: string[] = [
-    '-c',
-    `model_instructions_file=${tomlValue(instructionsFile)}`,
-  ]
+  const argvOverrides: string[] = ['-c', `model_instructions_file=${tomlValue(instructionsFile)}`]
+  if (ctx.effortLevel && CODEX_REASONING_EFFORTS.has(ctx.effortLevel)) {
+    argvOverrides.push('-c', `model_reasoning_effort=${tomlValue(ctx.effortLevel)}`)
+  }
 
   // mcp-memory injection — best-effort. If the bundled entry can't be
   // resolved (corrupted install, hand-edited path), we still ship the

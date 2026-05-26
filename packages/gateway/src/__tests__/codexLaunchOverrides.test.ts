@@ -9,8 +9,9 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
  * fragments for codex CLI.
  *
  * Load-bearing invariants:
- *   1. argvOverrides order is stable: model_instructions_file FIRST, then the
- *      three mcp_servers.openclaude_memory.* keys (command, args, env).
+ *   1. argvOverrides order is stable: model_instructions_file FIRST, optional
+ *      model_reasoning_effort SECOND, then the three
+ *      mcp_servers.openclaude_memory.* keys (command, args, env).
  *      Snapshot-equality matters — we splice the slice into runners' spawn
  *      argv at fixed positions, so a reorder would silently break codex's
  *      arg parser or produce ambiguous overrides.
@@ -227,6 +228,38 @@ describe('buildCodexLaunchOverrides', () => {
         'mcp_servers.openclaude_memory.env',
       ])
     }
+  })
+
+  it('passes GPT/Codex reasoning effort through as model_reasoning_effort', async () => {
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    const out = await buildCodexLaunchOverrides({
+      agentId: 'test-agent',
+      model: 'gpt-5.5',
+      effortLevel: 'high',
+      sessionDir: dir,
+      gatewayPort: 18789,
+      gatewayToken: 'tok-xyz',
+    })
+    assert.equal(out.argvOverrides[0], '-c')
+    assert.match(out.argvOverrides[1] ?? '', /^model_instructions_file=/)
+    assert.equal(out.argvOverrides[2], '-c')
+    assert.equal(out.argvOverrides[3], 'model_reasoning_effort="high"')
+  })
+
+  it('does not pass unsupported max as codex model_reasoning_effort', async () => {
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    const out = await buildCodexLaunchOverrides({
+      agentId: 'test-agent',
+      model: 'gpt-5.5',
+      effortLevel: 'max',
+      sessionDir: dir,
+      gatewayPort: 18789,
+      gatewayToken: 'tok-xyz',
+    })
+    assert.equal(
+      out.argvOverrides.some((s) => s.startsWith('model_reasoning_effort=')),
+      false,
+    )
   })
 
   it('mcp env injection includes gatewayToken (scoped to MCP child, not codex main)', async () => {

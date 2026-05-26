@@ -2740,7 +2740,7 @@ a:hover {
   border: 1px solid var(--border-subtle);
 }
 
-/* ── 思考强度 pill(仅 Opus 4.7 显示) ── */
+/* ── 思考强度 / 思考深度 pill(Opus 4.7、GPT-5.5) ── */
 .composer-modes {
   display: flex;
   flex-wrap: wrap;

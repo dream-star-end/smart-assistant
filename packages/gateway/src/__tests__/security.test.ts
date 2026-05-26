@@ -15,6 +15,7 @@ import {
   isFileAllowed,
   isFileBlocked,
   isUploadMimeAllowed,
+  shouldServeInline,
 } from '../server.js'
 
 // ── T01: /api/file blacklist — tests the REAL isFileBlocked function ──
@@ -127,6 +128,9 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   it('allows files in uploads dir', () => {
     assert.ok(isFileAllowed(resolve('/root/.openclaude/uploads/photo.jpg')))
   })
+  it('allows commercial /home/agent generated artifacts', () => {
+    assert.ok(isFileAllowed(resolve('/home/agent/.openclaude/generated/report.docx')))
+  })
   // Should ALLOW — temp files matching /tmp/openclaude-*
   it('allows /tmp/openclaude-* temp files', () => {
     assert.ok(isFileAllowed(resolve('/tmp/openclaude-abc123/output.png')))
@@ -169,6 +173,18 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   it('denies dir name that is a prefix of allowed but not child', () => {
     // e.g. /root/.openclaude/generatedEVIL/file should NOT match generatedDir
     assert.ok(!isFileAllowed(resolve('/root/.openclaude/generatedEVIL/file.txt')))
+  })
+})
+
+// ── T01c: /api/file disposition policy ──
+describe('T01c: shouldServeInline — file disposition policy', () => {
+  it('serves previewable media inline', () => {
+    assert.ok(shouldServeInline('image/png'))
+    assert.ok(shouldServeInline('application/pdf'))
+  })
+
+  it('forces Word documents to download', () => {
+    assert.ok(!shouldServeInline('application/vnd.openxmlformats-officedocument.wordprocessingml.document'))
   })
 })
 

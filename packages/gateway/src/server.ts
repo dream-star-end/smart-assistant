@@ -1430,8 +1430,9 @@ export class Gateway {
         return
       }
       const fileContentType = mimeFor(resolved)
-      // C3: Force download for active content types to prevent same-origin script execution
-      const fileDispositionMode = isActiveContentType(fileContentType) ? 'attachment' : 'inline'
+      // C3: Force download for active content types, and for non-previewable
+      // documents such as .docx so mobile browsers do not open a blank tab.
+      const fileDispositionMode = shouldServeInline(fileContentType) ? 'inline' : 'attachment'
       res.writeHead(200, {
         'Content-Type': fileContentType,
         'Content-Length': fileStat.size,
@@ -3771,7 +3772,7 @@ export class Gateway {
 
     // Defensive sanitize: WS frames are JSON-cast (no typebox runtime check),
     // so an attacker could put arbitrary strings in effortLevel. Whitelist
-    // mirrors protocol/frames.ts InboundMessage.effortLevel + CCB EFFORT_LEVELS.
+    // mirrors protocol/frames.ts InboundMessage.effortLevel + backend effort allowlists.
     //   - 合法 string → 透传
     //   - null      → 透传(显式清除已有 effort,让 runner 回到模型默认)
     //   - 其它(包括字段缺省) → 不传给 sessionManager,保持现有 runner 不动
@@ -4412,6 +4413,11 @@ export function sanitizeAskUserQuestionUpdatedInput(
 export const FILE_ALLOWED_DIRS: string[] = [
   resolve(paths.generatedDir),  // /root/.openclaude/generated/
   resolve(paths.uploadsDir),    // /root/.openclaude/uploads/
+  // Commercial containers may run the gateway as root while agent tools write
+  // user-facing artifacts under /home/agent/.openclaude. Keep this narrowly
+  // scoped to generated/uploads so /api/file cannot browse arbitrary home data.
+  resolve('/home/agent/.openclaude/generated'),
+  resolve('/home/agent/.openclaude/uploads'),
 ]
 
 /** Temp-file prefix pattern: /tmp/openclaude-* */
@@ -4579,6 +4585,14 @@ const ACTIVE_CONTENT_TYPES = new Set([
 function isActiveContentType(mime: string): boolean {
   const base = mime.split(';')[0].trim().toLowerCase()
   return ACTIVE_CONTENT_TYPES.has(base)
+}
+
+/** True for content types browsers can reasonably preview inline. */
+export function shouldServeInline(mime: string): boolean {
+  const base = mime.split(';')[0].trim().toLowerCase()
+  if (isActiveContentType(base)) return false
+  if (base.startsWith('image/') || base.startsWith('audio/') || base.startsWith('video/')) return true
+  return new Set(['application/pdf', 'text/plain', 'text/markdown', 'text/csv']).has(base)
 }
 
 /** Known route prefixes for metrics normalization (avoids high-cardinality labels). */

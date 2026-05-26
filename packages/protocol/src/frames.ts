@@ -39,8 +39,8 @@ export const InboundMessage = Type.Object({
     media: Type.Optional(Type.Array(MediaRef)),
   }),
   replyToId: Type.Optional(Type.String()),
-  // CCB effort level override for this session (一般来自 Web 前端的"编码模式/科研模式" pill)。
-  //   - 字符串 ∈ EFFORT_LEVELS:把 CLAUDE_CODE_EFFORT_LEVEL 设成该值
+  // Effort/reasoning-depth override for this session (一般来自 Web 前端的"编码模式/科研模式/GPT思考深度" pill)。
+  //   - 字符串 ∈ EFFORT_LEVELS:CCB 写 CLAUDE_CODE_EFFORT_LEVEL; Codex 写 model_reasoning_effort(支持的取值)
   //   - null:**显式清除** — 让 gateway 把已有 runner 的 effort env 复位到模型默认
   //   - 字段缺省 (undefined):什么也不做 (其他 channel 默认行为)
   // 区分 null 与缺省是为了让 Web pill 的"取消选中"能反向取消之前的 xhigh/max,

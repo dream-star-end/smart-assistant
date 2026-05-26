@@ -33,6 +33,39 @@ Codex 的评审**不是最终裁决**,更像一位倾向过度防御、爱复杂
 
 PASS 不等于"代码完美",而是"没有阻塞性问题";拒绝采纳 Codex 的风格建议也能算 PASS。
 
+## Worktree Isolation Rule (BLOCKING)
+
+**任何代码改动 — 个人版 / v3 商用版 / ccb — 第一步必须开独立 worktree 和独立分支。绝不在主工作树或别人的分支上叠改动。**
+
+主工作树 `/opt/openclaude/openclaude`(master)和 `/opt/openclaude/openclaude-v3`(v3 主)视为**只读基线**,只用于 git 元操作(branch list、ls-remote、worktree add 等),不在它们里面改代码。
+
+约定:
+```bash
+git -C /opt/openclaude/openclaude worktree add \
+    ../openclaude-<slug> -b feat/<slug> origin/<base>      # 个人版
+git -C /opt/openclaude/openclaude worktree add \
+    ../openclaude-v3-<slug> -b feat/<slug> origin/v3        # v3 商用版
+cd ../openclaude-<slug>                                     # 在这里改
+```
+
+- 路径前缀:个人版 `/opt/openclaude/openclaude-<slug>`,v3 `/opt/openclaude/openclaude-v3-<slug>`
+- 分支前缀:`feat/` / `fix/` / `chore/`(活跃),`wip/`(草稿或长期参考,跟活跃分支区分)
+- base:个人版 `origin/master`,商用版 `origin/v3`
+- 任务结束清理:`git worktree remove` + `git branch -d`(merged)+ 如远端也已无价值 `git push origin --delete <branch>`
+
+**理由**:boss 同时跑多个独立开发任务,共用工作树会导致 `git status` 脏文件归属混乱、rebase/push 互相污染、dev 实例读到不属于自己的代码。2026-05-18 大扫除清了 25 个 0-ahead 死分支 + 5 个 stale worktree 记录,根因就是没遵守这条。
+
+**cherry-pick equivalent 检测**:合并前先用以下方法判断改动是否已等价存在于目标分支(同主题不同 sha):
+```bash
+git log <branch>..origin/<target> --oneline --grep='<关键词>'
+git diff <local_sha> <origin_sha> -- <files>     # 0 diff = 等价,不要再合
+```
+2026-05-18 device-id-pinned 历史教训:5 个待合 commit 里 3 个代码 commit 都已等价在 origin/v3,机械 merge 会造冲突 + deploy artifact 孤儿。
+
+例外:纯只读调研(grep / 看文件 / git status / git log)不需要 worktree。
+
+> 注:本规则是下方 "Personal Instance Dev Instance First Rule" 的 superset。个人版除了 worktree 隔离还有 dev 实例双重隔离(端口/配置/cloudflared),v3 商用版只到 worktree 这层(不跑本机 dev 实例)。
+
 ## Goal-Driven Execution
 
 把任务翻译成**可验证的成功标准**,而不是模糊的祈使句。LLM 在能 loop 验证时表现最好。
@@ -73,3 +106,13 @@ Workflow:
 Exception: docs / ops scripts / typo fixes don't need a dev instance.
 
 For commercial v2 (38.55), use `deploy-to-remote.sh` — that path is separate and not governed by this rule.
+
+## Environment Gotchas
+
+**GitHub push/fetch 被 residential proxy reset**:本机 `HTTPS_PROXY` / `HTTP_PROXY` 指向住宅代理,所有 GitHub 操作会 `Recv failure: Connection reset by peer`。固定绕法:
+
+```bash
+env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy git push origin <branch>
+```
+
+适用所有走 https 的 git 操作:`push` / `fetch` / `pull` / `ls-remote` / `clone`。
