@@ -140,7 +140,7 @@ async function _blobToSupported(blob) {
       const parser = new DOMParser()
       const svgDoc = parser.parseFromString(text, 'image/svg+xml')
       const svgEl = svgDoc.documentElement
-      if (svgEl && svgEl.tagName && svgEl.tagName.toLowerCase() === 'svg') {
+      if (svgEl?.tagName && svgEl.tagName.toLowerCase() === 'svg') {
         _sanitizeExternalRefsInSvg(svgEl)
         return await _svgToPng(svgEl)
       }
@@ -179,12 +179,14 @@ function _sanitizeExternalRefsInSvg(svgEl) {
   }
   // Remove every url(...) whose target is external; leaves #fragment and safe-binary data: intact.
   const stripCssUrls = (css) =>
-    (css || '').replace(/url\(\s*(['"]?)([^)'"]+)\1\s*\)/gi, (m, _q, u) => (isExternal(u) ? 'none' : m))
+    (css || '').replace(/url\(\s*(['"]?)([^)'"]+)\1\s*\)/gi, (m, _q, u) =>
+      isExternal(u) ? 'none' : m,
+    )
   // Also strip @import statements pointing external.
   const stripImports = (css) =>
     (css || '').replace(/@import[^;]*;?/gi, (stmt) => {
       const m = /url\(\s*(['"]?)([^)'"]+)\1\s*\)|(['"])([^'"]+)\3/.exec(stmt)
-      const target = m ? (m[2] || m[4] || '') : ''
+      const target = m ? m[2] || m[4] || '' : ''
       return isExternal(target) ? '' : stmt
     })
 
@@ -216,7 +218,7 @@ function _sanitizeExternalRefsInSvg(svgEl) {
       const name = attr.name.toLowerCase()
       const val = attr.value || ''
       // Any href-like attribute: drop if external.
-      if ((name === 'href' || name === 'xlink:href' || name.endsWith(':href') || name === 'src')) {
+      if (name === 'href' || name === 'xlink:href' || name.endsWith(':href') || name === 'src') {
         if (isExternal(val)) e.removeAttribute(attr.name)
         continue
       }
@@ -318,7 +320,17 @@ async function _fetchImageBySrc(src) {
 
 // Parents where a whitespace-only text node is source-formatting noise, not content.
 const BLOCK_WS_PARENTS = new Set([
-  'ul', 'ol', 'li', 'blockquote', 'table', 'thead', 'tbody', 'tr', 'div', 'section', 'article',
+  'ul',
+  'ol',
+  'li',
+  'blockquote',
+  'table',
+  'thead',
+  'tbody',
+  'tr',
+  'div',
+  'section',
+  'article',
 ])
 
 function _scaleDims(w, h, maxWidth = 560) {
@@ -413,7 +425,7 @@ function _inlineRuns(node, style, ctx) {
 
   // KaTeX: the original LaTeX source is available on .katex-mathml <annotation> or katex-html textContent.
   // We emit the plain textContent in italics as a readable fallback.
-  if (el.classList && el.classList.contains('katex')) {
+  if (el.classList?.contains('katex')) {
     const mathml = el.querySelector('annotation[encoding="application/x-tex"]')
     const tex = mathml?.textContent || el.textContent || ''
     if (tex) runs.push(new TextRun({ text: tex, italics: true, font: { name: 'Cambria Math' } }))
@@ -461,7 +473,14 @@ async function _embedImage(el, ctx) {
 }
 
 function _headingLevel(tag, HeadingLevel) {
-  const map = { h1: HeadingLevel.HEADING_1, h2: HeadingLevel.HEADING_2, h3: HeadingLevel.HEADING_3, h4: HeadingLevel.HEADING_4, h5: HeadingLevel.HEADING_5, h6: HeadingLevel.HEADING_6 }
+  const map = {
+    h1: HeadingLevel.HEADING_1,
+    h2: HeadingLevel.HEADING_2,
+    h3: HeadingLevel.HEADING_3,
+    h4: HeadingLevel.HEADING_4,
+    h5: HeadingLevel.HEADING_5,
+    h6: HeadingLevel.HEADING_6,
+  }
   return map[tag]
 }
 
@@ -478,7 +497,9 @@ function _codeBlockParagraphs(preEl, ctx) {
     out.push(
       new Paragraph({
         spacing: { before: 120, after: 40 },
-        children: [new TextRun({ text: langEl.textContent || '', italics: true, color: '888888', size: 18 })],
+        children: [
+          new TextRun({ text: langEl.textContent || '', italics: true, color: '888888', size: 18 }),
+        ],
       }),
     )
   }
@@ -498,14 +519,30 @@ function _codeBlockParagraphs(preEl, ctx) {
 // Tags that should break the inline run inside a <p> or <li>: inline images, explicit media
 // children, and any known block-level wrapper (div/section/figure + markdown-block containers).
 const LI_BLOCK_TAGS = new Set([
-  'p', 'ul', 'ol', 'pre', 'table', 'blockquote', 'hr',
-  'div', 'section', 'figure', 'figcaption',
-  'img', 'svg', 'canvas',
+  'p',
+  'ul',
+  'ol',
+  'pre',
+  'table',
+  'blockquote',
+  'hr',
+  'div',
+  'section',
+  'figure',
+  'figcaption',
+  'img',
+  'svg',
+  'canvas',
 ])
 
 // CSS classes that host already-rendered rich content (the live-DOM WYSIWYG path). If one of these
 // appears inside a <li>/<p>, we must treat it as a block chunk or the structure is lost.
-const RICH_CONTAINER_CLASSES = ['mermaid-block', 'chart-block', 'katex-display', 'htmlpreview-block']
+const RICH_CONTAINER_CLASSES = [
+  'mermaid-block',
+  'chart-block',
+  'katex-display',
+  'htmlpreview-block',
+]
 
 function _hasRichClass(el) {
   if (el.nodeType !== Node.ELEMENT_NODE || !el.classList) return false
@@ -657,7 +694,9 @@ async function _listParagraphs(listEl, ctx, depth = 0, stackDepth = 0) {
 function _depthOverflowParagraph(el, ctx) {
   const txt = (el.textContent || '').slice(0, 2000)
   return new ctx.docx.Paragraph({
-    children: [new ctx.docx.TextRun({ text: txt || '[嵌套过深,已折叠]', italics: true, color: '888888' })],
+    children: [
+      new ctx.docx.TextRun({ text: txt || '[嵌套过深,已折叠]', italics: true, color: '888888' }),
+    ],
   })
 }
 
@@ -672,21 +711,36 @@ function _tableFromEl(tableEl, ctx) {
     tr.querySelectorAll('th,td').forEach((td) => {
       const isHeader = td.tagName.toLowerCase() === 'th' || rIdx === 0
       const runs = []
-      for (const c of td.childNodes) runs.push(..._inlineRuns(c, isHeader ? { bold: true } : {}, ctx))
+      for (const c of td.childNodes)
+        runs.push(..._inlineRuns(c, isHeader ? { bold: true } : {}, ctx))
       const alignAttr = td.getAttribute('align') || td.style?.textAlign || ''
-      const alignment = alignAttr === 'right' ? ctx.docx.AlignmentType.RIGHT : alignAttr === 'center' ? ctx.docx.AlignmentType.CENTER : ctx.docx.AlignmentType.LEFT
+      const alignment =
+        alignAttr === 'right'
+          ? ctx.docx.AlignmentType.RIGHT
+          : alignAttr === 'center'
+            ? ctx.docx.AlignmentType.CENTER
+            : ctx.docx.AlignmentType.LEFT
       cells.push(
         new TableCell({
           borders,
           shading: isHeader ? { type: 'clear', fill: 'F5F5F5' } : undefined,
-          children: [new Paragraph({ alignment, children: runs.length ? runs : [new TextRun({ text: '' })] })],
+          children: [
+            new Paragraph({
+              alignment,
+              children: runs.length ? runs : [new TextRun({ text: '' })],
+            }),
+          ],
         }),
       )
     })
     if (cells.length) rows.push(new TableRow({ children: cells }))
   })
   if (!rows.length) return null
-  return new Table({ rows, width: { size: 100, type: WidthType.PERCENTAGE }, borders: { ...borders, insideHorizontal: border, insideVertical: border } })
+  return new Table({
+    rows,
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    borders: { ...borders, insideHorizontal: border, insideVertical: border },
+  })
 }
 
 // Top-level: map a block-level element to docx paragraphs/tables/[]. `stackDepth` guards against
@@ -957,7 +1011,7 @@ export async function exportMessageDocx(msg, opts = {}) {
     })
   } catch (e) {
     console.error('exportMessageDocx failed', e)
-    toast('Word 导出失败: ' + (e?.message || e), 'error')
+    toast(`Word 导出失败: ${e?.message || e}`, 'error')
   }
 }
 
@@ -970,11 +1024,25 @@ export async function exportSessionDocx(sess) {
     const blocks = []
     for (const m of sess.messages) {
       if (m.role === 'user') {
-        blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun({ text: '👤 User' })] }))
+        blocks.push(
+          new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun({ text: '👤 User' })],
+          }),
+        )
       } else if (m.role === 'assistant') {
-        blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun({ text: '🤖 Assistant' })] }))
+        blocks.push(
+          new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun({ text: '🤖 Assistant' })],
+          }),
+        )
       } else if (m.role === 'tool') {
-        blocks.push(new Paragraph({ children: [new TextRun({ text: `🔧 ${m.text || ''}`, italics: true, color: '888888' })] }))
+        blocks.push(
+          new Paragraph({
+            children: [new TextRun({ text: `🔧 ${m.text || ''}`, italics: true, color: '888888' })],
+          }),
+        )
         continue
       } else {
         continue
@@ -999,6 +1067,6 @@ export async function exportSessionDocx(sess) {
     toast('已导出 Word', 'success')
   } catch (e) {
     console.error('exportSessionDocx failed', e)
-    toast('Word 导出失败: ' + (e?.message || e), 'error')
+    toast(`Word 导出失败: ${e?.message || e}`, 'error')
   }
 }

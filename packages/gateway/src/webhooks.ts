@@ -25,7 +25,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { paths } from '@openclaude/storage'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
-import { eventBus, createEvent } from './eventBus.js'
+import { createEvent, eventBus } from './eventBus.js'
 
 export interface WebhookDef {
   id: string
@@ -134,10 +134,13 @@ export class WebhookRouter {
     const resolvedPrompt = resolveTemplate(webhook.prompt, payload)
 
     // Emit event (server.ts listens and routes to agent)
-    eventBus.emit('webhook.received', createEvent('webhook.received', webhook.agent, {
-      webhookId: webhook.id,
-      payload: { resolvedPrompt, rawPayload: payload },
-    }))
+    eventBus.emit(
+      'webhook.received',
+      createEvent('webhook.received', webhook.agent, {
+        webhookId: webhook.id,
+        payload: { resolvedPrompt, rawPayload: payload },
+      }),
+    )
 
     webhook.lastFiredAt = Date.now()
     webhook.lastStatus = 'ok'

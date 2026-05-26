@@ -7,10 +7,7 @@
  */
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import {
-  type OcTelemetryEvent,
-  TelemetryChannel,
-} from '../telemetryChannel.js'
+import { type OcTelemetryEvent, TelemetryChannel } from '../telemetryChannel.js'
 
 function mkEvent(
   event: string,

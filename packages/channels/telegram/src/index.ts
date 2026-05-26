@@ -74,18 +74,20 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
 
         // Start polling with error handling — retry on 409 conflict
         const startPolling = (attempt = 1) => {
-          bot.start({
-            onStart: () => c.log.info('telegram bot polling started'),
-          }).catch((err: any) => {
-            const is409 = err?.error_code === 409 || String(err).includes('409')
-            if (is409 && attempt <= 5) {
-              const delay = attempt * 3000
-              c.log.info(`telegram 409 conflict, retry #${attempt} in ${delay}ms...`)
-              setTimeout(() => startPolling(attempt + 1), delay)
-            } else {
-              c.log.error('telegram polling failed permanently', err?.message ?? String(err))
-            }
-          })
+          bot
+            .start({
+              onStart: () => c.log.info('telegram bot polling started'),
+            })
+            .catch((err: any) => {
+              const is409 = err?.error_code === 409 || String(err).includes('409')
+              if (is409 && attempt <= 5) {
+                const delay = attempt * 3000
+                c.log.info(`telegram 409 conflict, retry #${attempt} in ${delay}ms...`)
+                setTimeout(() => startPolling(attempt + 1), delay)
+              } else {
+                c.log.error('telegram polling failed permanently', err?.message ?? String(err))
+              }
+            })
         }
         startPolling()
         c.log.info('telegram bot started')

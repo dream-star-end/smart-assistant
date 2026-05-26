@@ -45,7 +45,6 @@ type TestHarness = {
 // constructor avoids pulling in storage / sessions / config plumbing that
 // the helper does not depend on.
 function harness(): TestHarness {
-  // biome-ignore lint/suspicious/noExplicitAny: bypassing private-field check
   const gw = Object.create(Gateway.prototype) as any
   gw._outboundRing = new OutboundRingBuffer()
   gw.clientsByPeer = new Map()

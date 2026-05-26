@@ -15,7 +15,7 @@
  *   SUMMARY_MAX_TOKENS  — max output tokens for summary (default: 300, must be positive integer)
  */
 
-import { open, realpath, constants } from 'node:fs/promises'
+import { constants, open, realpath } from 'node:fs/promises'
 import { extname, isAbsolute } from 'node:path'
 import { paths } from './paths.js'
 
@@ -52,8 +52,8 @@ export interface SummaryProviderConfig {
  */
 function getAllowedBaseDirs(): string[] {
   return [
-    paths.uploadsDir,       // ~/.openclaude/uploads/
-    paths.generatedDir,     // ~/.openclaude/generated/
+    paths.uploadsDir, // ~/.openclaude/uploads/
+    paths.generatedDir, // ~/.openclaude/generated/
     '/tmp',
   ]
 }
@@ -84,13 +84,11 @@ async function validateFilePath(filePath: string): Promise<string> {
   }
 
   const isAllowed = resolvedAllowed.some(
-    base => resolvedPath.startsWith(base + '/') || resolvedPath === base,
+    (base) => resolvedPath.startsWith(`${base}/`) || resolvedPath === base,
   )
 
   if (!isAllowed) {
-    throw new Error(
-      `summarizeFile: path "${filePath}" resolves outside allowed directories`,
-    )
+    throw new Error(`summarizeFile: path "${filePath}" resolves outside allowed directories`)
   }
 
   return resolvedPath
@@ -107,11 +105,35 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
 }
 
 const TEXT_EXTENSIONS = new Set([
-  '.txt', '.md', '.csv', '.json', '.yaml', '.yml', '.xml',
-  '.html', '.css', '.js', '.ts', '.tsx', '.jsx',
-  '.py', '.go', '.rs', '.java', '.c', '.cpp', '.h',
-  '.sh', '.bash', '.zsh', '.toml', '.ini', '.cfg',
-  '.log', '.sql', '.graphql',
+  '.txt',
+  '.md',
+  '.csv',
+  '.json',
+  '.yaml',
+  '.yml',
+  '.xml',
+  '.html',
+  '.css',
+  '.js',
+  '.ts',
+  '.tsx',
+  '.jsx',
+  '.py',
+  '.go',
+  '.rs',
+  '.java',
+  '.c',
+  '.cpp',
+  '.h',
+  '.sh',
+  '.bash',
+  '.zsh',
+  '.toml',
+  '.ini',
+  '.cfg',
+  '.log',
+  '.sql',
+  '.graphql',
 ])
 
 function detectMimeType(filePath: string): string {
@@ -146,13 +168,20 @@ export class ClaudeSummaryProvider implements SummaryProvider {
     if (!this.apiKey) {
       throw new Error('ClaudeSummaryProvider: apiKey is required')
     }
-    if (!Number.isFinite(this.maxTokens) || this.maxTokens <= 0 || !Number.isInteger(this.maxTokens)) {
-      throw new Error(`ClaudeSummaryProvider: maxTokens must be a positive integer, got ${this.maxTokens}`)
+    if (
+      !Number.isFinite(this.maxTokens) ||
+      this.maxTokens <= 0 ||
+      !Number.isInteger(this.maxTokens)
+    ) {
+      throw new Error(
+        `ClaudeSummaryProvider: maxTokens must be a positive integer, got ${this.maxTokens}`,
+      )
     }
   }
 
   async summarizeImage(base64: string, mimeType: string, context?: string): Promise<string> {
-    const systemPrompt = 'You are a precise image describer. Describe the image content in a way that would be useful for future text-based retrieval. Include key details, text visible in the image, and overall context. Be concise but thorough.'
+    const systemPrompt =
+      'You are a precise image describer. Describe the image content in a way that would be useful for future text-based retrieval. Include key details, text visible in the image, and overall context. Be concise but thorough.'
 
     const userContent: Array<Record<string, unknown>> = [
       {
@@ -170,9 +199,10 @@ export class ClaudeSummaryProvider implements SummaryProvider {
   }
 
   async summarizeText(text: string, context?: string): Promise<string> {
-    const systemPrompt = 'You are a precise document summarizer. Create a concise summary that captures the key information for future retrieval. Focus on facts, decisions, and actionable items.'
+    const systemPrompt =
+      'You are a precise document summarizer. Create a concise summary that captures the key information for future retrieval. Focus on facts, decisions, and actionable items.'
 
-    const truncated = text.length > 8000 ? text.slice(0, 8000) + '\n...(truncated)' : text
+    const truncated = text.length > 8000 ? `${text.slice(0, 8000)}\n...(truncated)` : text
     const prompt = context
       ? `Summarize this document for memory storage. Context: ${context}\n\n---\n\n${truncated}`
       : `Summarize this document for memory storage:\n\n${truncated}`
@@ -180,10 +210,7 @@ export class ClaudeSummaryProvider implements SummaryProvider {
     return this.callApi(systemPrompt, [{ type: 'text', text: prompt }])
   }
 
-  private async callApi(
-    system: string,
-    content: Array<Record<string, unknown>>,
-  ): Promise<string> {
+  private async callApi(system: string, content: Array<Record<string, unknown>>): Promise<string> {
     const resp = await fetch(`${this.baseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
@@ -205,11 +232,11 @@ export class ClaudeSummaryProvider implements SummaryProvider {
       throw new Error(`Summary API error ${resp.status}: ${safeBody}`)
     }
 
-    const json = await resp.json() as {
+    const json = (await resp.json()) as {
       content: Array<{ type: string; text?: string }>
     }
 
-    const textBlock = json.content?.find(b => b.type === 'text')
+    const textBlock = json.content?.find((b) => b.type === 'text')
     if (!textBlock?.text) {
       throw new Error('Summary API returned no text content')
     }
@@ -306,22 +333,27 @@ export async function summarizeFile(
 
     // Post-open revalidation: verify the fd actually points to an allowed path
     // This catches intermediate-directory symlink swaps (TOCTOU on parents)
-    const fdLink = process.platform === 'linux'
-      ? `/proc/self/fd/${handle.fd}`
-      : `/dev/fd/${handle.fd}`
+    const fdLink =
+      process.platform === 'linux' ? `/proc/self/fd/${handle.fd}` : `/dev/fd/${handle.fd}`
     const actualPath = await realpath(fdLink)
     const resolvedAllowed: string[] = []
     for (const base of getAllowedBaseDirs()) {
-      try { resolvedAllowed.push(await realpath(base)) } catch { /* skip */ }
+      try {
+        resolvedAllowed.push(await realpath(base))
+      } catch {
+        /* skip */
+      }
     }
     const stillAllowed = resolvedAllowed.some(
-      base => actualPath.startsWith(base + '/') || actualPath === base,
+      (base) => actualPath.startsWith(`${base}/`) || actualPath === base,
     )
     if (!stillAllowed) {
       throw new Error('summarizeFile: post-open path validation failed')
     }
     if (fileInfo.size > MAX_FILE_SIZE) {
-      throw new Error(`File too large for summarization: ${fileInfo.size} bytes (max ${MAX_FILE_SIZE})`)
+      throw new Error(
+        `File too large for summarization: ${fileInfo.size} bytes (max ${MAX_FILE_SIZE})`,
+      )
     }
     if (fileInfo.size === 0) {
       return null

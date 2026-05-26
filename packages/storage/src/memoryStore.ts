@@ -117,20 +117,28 @@ export class MemoryStore {
     const { statSync } = await import('node:fs')
     let memMtime = 0
     let usrMtime = 0
-    try { memMtime = statSync(memPath).mtimeMs } catch { /* file absent or raced */ }
-    try { usrMtime = statSync(usrPath).mtimeMs } catch { /* file absent or raced */ }
+    try {
+      memMtime = statSync(memPath).mtimeMs
+    } catch {
+      /* file absent or raced */
+    }
+    try {
+      usrMtime = statSync(usrPath).mtimeMs
+    } catch {
+      /* file absent or raced */
+    }
 
     if (memMtime !== this._memoryMtime) {
       this.memoryEntries = await this.readFile(memPath)
       this.memoryEntries = [...new Set(this.memoryEntries)]
       // Scan loaded entries for injection threats (in case files were edited externally)
-      this.memoryEntries = this.memoryEntries.filter(e => scanMemoryContent(e).ok)
+      this.memoryEntries = this.memoryEntries.filter((e) => scanMemoryContent(e).ok)
       this._memoryMtime = memMtime
     }
     if (usrMtime !== this._userMtime) {
       this.userEntries = await this.readFile(usrPath)
       this.userEntries = [...new Set(this.userEntries)]
-      this.userEntries = this.userEntries.filter(e => scanMemoryContent(e).ok)
+      this.userEntries = this.userEntries.filter((e) => scanMemoryContent(e).ok)
       this._userMtime = usrMtime
     }
   }

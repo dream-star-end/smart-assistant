@@ -109,7 +109,11 @@ export class JinaReranker implements Reranker {
     if (!this.apiKey) {
       throw new Error('JinaReranker: apiKey is required (set RERANK_API_KEY)')
     }
-    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0 || !Number.isInteger(this.timeoutMs)) {
+    if (
+      !Number.isFinite(this.timeoutMs) ||
+      this.timeoutMs <= 0 ||
+      !Number.isInteger(this.timeoutMs)
+    ) {
       throw new Error(`JinaReranker: timeoutMs must be a positive integer, got ${this.timeoutMs}`)
     }
   }
@@ -179,7 +183,11 @@ export class CohereReranker implements Reranker {
     if (!this.apiKey) {
       throw new Error('CohereReranker: apiKey is required (set RERANK_API_KEY)')
     }
-    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0 || !Number.isInteger(this.timeoutMs)) {
+    if (
+      !Number.isFinite(this.timeoutMs) ||
+      this.timeoutMs <= 0 ||
+      !Number.isInteger(this.timeoutMs)
+    ) {
       throw new Error(`CohereReranker: timeoutMs must be a positive integer, got ${this.timeoutMs}`)
     }
   }
@@ -303,13 +311,13 @@ export async function rerankResults<T extends { content?: string; snippet?: stri
   if (!reranker || results.length === 0) return results.slice(0, effectiveTopN)
 
   // Extract text for reranking — prefer content, fall back to snippet
-  const documents = results.map(r => (r.content ?? r.snippet ?? '').slice(0, 1000))
+  const documents = results.map((r) => (r.content ?? r.snippet ?? '').slice(0, 1000))
 
   try {
     const ranked = await reranker.rerank(query, documents, effectiveTopN)
     return ranked
-      .filter(r => Number.isInteger(r.index) && r.index >= 0 && r.index < results.length)
-      .map(r => results[r.index])
+      .filter((r) => Number.isInteger(r.index) && r.index >= 0 && r.index < results.length)
+      .map((r) => results[r.index])
       .slice(0, effectiveTopN)
   } catch {
     // Fall back to original ordering on rerank failure

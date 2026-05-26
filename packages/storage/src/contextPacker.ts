@@ -28,7 +28,7 @@ export function estimateTokens(text: string): number {
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i)
     // CJK Unified Ideographs and common CJK ranges
-    if ((code >= 0x2E80 && code <= 0x9FFF) || (code >= 0xF900 && code <= 0xFAFF)) {
+    if ((code >= 0x2e80 && code <= 0x9fff) || (code >= 0xf900 && code <= 0xfaff)) {
       cjkCount++
     }
   }
@@ -107,12 +107,10 @@ export function packContext(
 
   // Filter by min score and truncate content (keep within maxItemChars exactly)
   const prepared = candidates
-    .filter(c => c.score >= minScore && c.content.length > 0)
-    .map(c => ({
+    .filter((c) => c.score >= minScore && c.content.length > 0)
+    .map((c) => ({
       ...c,
-      content: c.content.length > maxItemChars
-        ? c.content.slice(0, maxItemChars)
-        : c.content,
+      content: c.content.length > maxItemChars ? c.content.slice(0, maxItemChars) : c.content,
     }))
     .sort((a, b) => b.score - a.score)
 
@@ -157,7 +155,7 @@ export function packContext(
   }
 
   // Build final list in score order
-  const items = prepared.filter(c => selectedIds.has(c.id))
+  const items = prepared.filter((c) => selectedIds.has(c.id))
   const skippedCount = prepared.length - items.length
 
   return {

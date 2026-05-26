@@ -14,16 +14,8 @@
 
 import type { ChannelContext } from '@openclaude/plugin-sdk'
 import type { WechatBinding } from '@openclaude/storage'
-import {
-  updateWechatBindingCursor,
-  updateWechatBindingStatus,
-} from '@openclaude/storage'
-import {
-  extractIlinkText,
-  getIlinkUpdates,
-  ILINK_SESSION_EXPIRED,
-  sendIlinkText,
-} from './iLink.js'
+import { updateWechatBindingCursor, updateWechatBindingStatus } from '@openclaude/storage'
+import { ILINK_SESSION_EXPIRED, extractIlinkText, getIlinkUpdates, sendIlinkText } from './iLink.js'
 
 export interface InboundEvent {
   binding: WechatBinding
@@ -106,7 +98,9 @@ export class WechatWorker {
   async sendText(toUserId: string, text: string): Promise<void> {
     const ctxToken = this.contextTokens[toUserId]
     if (!ctxToken) {
-      this.ctx.log.error(`[wechat:${this.userId}] no context_token for sender ${toUserId}, cannot reply`)
+      this.ctx.log.error(
+        `[wechat:${this.userId}] no context_token for sender ${toUserId}, cannot reply`,
+      )
       return
     }
     try {
@@ -164,7 +158,9 @@ export class WechatWorker {
       if (errcode === ILINK_SESSION_EXPIRED || ret === ILINK_SESSION_EXPIRED) {
         this.ctx.log.info(`[wechat:${this.userId}] session expired; clearing cursor`)
         buf = ''
-        try { await updateWechatBindingCursor(this.userId, '') } catch {}
+        try {
+          await updateWechatBindingCursor(this.userId, '')
+        } catch {}
         await sleep(5_000)
         continue
       }
@@ -174,8 +170,12 @@ export class WechatWorker {
         )
         // Hard-fatal auth errors: mark binding expired and stop worker.
         if (errcode === 40001 || errcode === 40014 || ret === 40001 || ret === 40014) {
-          try { await updateWechatBindingStatus(this.userId, 'expired') } catch {}
-          this.ctx.log.error(`[wechat:${this.userId}] auth token invalid; marking expired and exiting`)
+          try {
+            await updateWechatBindingStatus(this.userId, 'expired')
+          } catch {}
+          this.ctx.log.error(
+            `[wechat:${this.userId}] auth token invalid; marking expired and exiting`,
+          )
           break
         }
         await sleep(5_000)
@@ -204,9 +204,7 @@ export class WechatWorker {
         // the gateway dispatch the same user text twice on redelivery.
         const idSrc = msg?.seq ?? msg?.message_id ?? msg?.client_id
         if (idSrc === undefined || idSrc === null || String(idSrc).trim() === '') {
-          this.ctx.log.error(
-            `[wechat:${this.userId}] drop msg with no stable id from=${senderId}`,
-          )
+          this.ctx.log.error(`[wechat:${this.userId}] drop msg with no stable id from=${senderId}`)
           continue
         }
         const messageId = String(idSrc)
@@ -220,16 +218,24 @@ export class WechatWorker {
             raw: msg,
           })
         } catch (err: any) {
-          this.ctx.log.error(`[wechat:${this.userId}] onInbound handler failed: ${err?.message || err}`)
+          this.ctx.log.error(
+            `[wechat:${this.userId}] onInbound handler failed: ${err?.message || err}`,
+          )
         }
       }
 
       if (nextBuf || ctxDirty) {
         buf = nextBuf || buf
         try {
-          await updateWechatBindingCursor(this.userId, buf, ctxDirty ? this.contextTokens : undefined)
+          await updateWechatBindingCursor(
+            this.userId,
+            buf,
+            ctxDirty ? this.contextTokens : undefined,
+          )
         } catch (err: any) {
-          this.ctx.log.error(`[wechat:${this.userId}] cursor persist failed: ${err?.message || err}`)
+          this.ctx.log.error(
+            `[wechat:${this.userId}] cursor persist failed: ${err?.message || err}`,
+          )
         }
       }
     }

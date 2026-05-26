@@ -21,8 +21,14 @@ let _walTimer: ReturnType<typeof setInterval> | null = null
 
 function _onExit(): void {
   if (_db) {
-    if (_walTimer !== null) { clearInterval(_walTimer); _walTimer = null }
-    try { _db.pragma('wal_checkpoint(TRUNCATE)'); _db.close() } catch {}
+    if (_walTimer !== null) {
+      clearInterval(_walTimer)
+      _walTimer = null
+    }
+    try {
+      _db.pragma('wal_checkpoint(TRUNCATE)')
+      _db.close()
+    } catch {}
     _db = null
   }
 }
@@ -86,15 +92,17 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // 1. Migrate event_log: rename session_id → session_key if old schema
   try {
     const cols = db.pragma('table_info(event_log)') as Array<{ name: string }>
-    if (cols.some(c => c.name === 'session_id') && !cols.some(c => c.name === 'session_key')) {
+    if (cols.some((c) => c.name === 'session_id') && !cols.some((c) => c.name === 'session_key')) {
       db.exec('ALTER TABLE event_log RENAME COLUMN session_id TO session_key')
     }
-  } catch { /* table just created, no migration needed */ }
+  } catch {
+    /* table just created, no migration needed */
+  }
 
   // 2. Migrate usage_log: deduplicate then add unique constraint
   try {
     const idxs = db.pragma('index_list(usage_log)') as Array<{ name: string; unique: number }>
-    const hasDedup = idxs.some(i => i.name === 'idx_usage_log_dedup')
+    const hasDedup = idxs.some((i) => i.name === 'idx_usage_log_dedup')
     if (!hasDedup) {
       // Delete duplicates keeping the latest row per (session_id, turn_index)
       db.exec(`
@@ -102,20 +110,26 @@ export async function getSessionsDb(): Promise<Database.Database> {
           SELECT MAX(rowid) FROM usage_log GROUP BY session_id, turn_index
         )
       `)
-      db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_log_dedup ON usage_log(session_id, turn_index)')
+      db.exec(
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_log_dedup ON usage_log(session_id, turn_index)',
+      )
     }
-  } catch { /* table just created, no migration needed */ }
+  } catch {
+    /* table just created, no migration needed */
+  }
 
   // 3. Migrate event_log: add peer_id and channel columns for audit trail (P0.5)
   try {
     const cols = db.pragma('table_info(event_log)') as Array<{ name: string }>
-    if (!cols.some(c => c.name === 'peer_id')) {
+    if (!cols.some((c) => c.name === 'peer_id')) {
       db.exec("ALTER TABLE event_log ADD COLUMN peer_id TEXT DEFAULT ''")
     }
-    if (!cols.some(c => c.name === 'channel')) {
+    if (!cols.some((c) => c.name === 'channel')) {
       db.exec("ALTER TABLE event_log ADD COLUMN channel TEXT DEFAULT ''")
     }
-  } catch { /* table just created with columns already, or migration ran */ }
+  } catch {
+    /* table just created with columns already, or migration ran */
+  }
 
   // ── Create indexes (after migrations) ──
   db.exec(`
@@ -147,8 +161,12 @@ export async function getSessionsDb(): Promise<Database.Database> {
 
   // Clean up orphaned FTS records (sessions_fts rows with no matching sessions_meta)
   try {
-    db.exec('DELETE FROM sessions_fts WHERE NOT EXISTS (SELECT 1 FROM sessions_meta WHERE sessions_meta.id = sessions_fts.session_id)')
-  } catch { /* non-fatal: stale FTS rows are harmless */ }
+    db.exec(
+      'DELETE FROM sessions_fts WHERE NOT EXISTS (SELECT 1 FROM sessions_meta WHERE sessions_meta.id = sessions_fts.session_id)',
+    )
+  } catch {
+    /* non-fatal: stale FTS rows are harmless */
+  }
 
   // ── Client sessions (cross-device sync, multi-user) ──
   db.exec(`
@@ -170,29 +188,35 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // Migration: add user_id column if missing (existing DBs)
   try {
     const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
-    if (!cols.some(c => c.name === 'user_id')) {
+    if (!cols.some((c) => c.name === 'user_id')) {
       db.exec("ALTER TABLE client_sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'")
       db.exec('CREATE INDEX IF NOT EXISTS idx_client_sessions_user ON client_sessions(user_id)')
     }
-  } catch { /* table just created */ }
+  } catch {
+    /* table just created */
+  }
   // Migration: add deleted_at column (replaces __deleted__ title tombstone)
   try {
     const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
-    if (!cols.some(c => c.name === 'deleted_at')) {
-      db.exec("ALTER TABLE client_sessions ADD COLUMN deleted_at INTEGER DEFAULT NULL")
+    if (!cols.some((c) => c.name === 'deleted_at')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN deleted_at INTEGER DEFAULT NULL')
       // Migrate existing __deleted__ tombstones to the new column
       db.exec("UPDATE client_sessions SET deleted_at = updated_at WHERE title = '__deleted__'")
     }
-  } catch { /* table just created with column already */ }
+  } catch {
+    /* table just created with column already */
+  }
   // Migration: store message counts separately so list endpoints don't parse
   // every session's messages JSON on each request.
   try {
     const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
-    if (!cols.some(c => c.name === 'message_count')) {
-      db.exec("ALTER TABLE client_sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0")
-      db.exec("UPDATE client_sessions SET message_count = COALESCE(json_array_length(messages), 0)")
+    if (!cols.some((c) => c.name === 'message_count')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0')
+      db.exec('UPDATE client_sessions SET message_count = COALESCE(json_array_length(messages), 0)')
     }
-  } catch { /* table just created with column already */ }
+  } catch {
+    /* table just created with column already */
+  }
 
   // ── WeChat iLink per-user bindings (multi-tenant) ──
   //   Each OpenClaude user can bind exactly one WeChat bot account via
@@ -279,9 +303,7 @@ export async function getMaxTurnIdx(sessionIds: string[]): Promise<number> {
   const db = await getSessionsDb()
   const placeholders = sessionIds.map(() => '?').join(',')
   const row = db
-    .prepare(
-      `SELECT MAX(turn_idx) AS m FROM sessions_fts WHERE session_id IN (${placeholders})`,
-    )
+    .prepare(`SELECT MAX(turn_idx) AS m FROM sessions_fts WHERE session_id IN (${placeholders})`)
     .get(...sessionIds) as { m: number | null } | undefined
   return row?.m == null ? 0 : Math.floor(row.m)
 }
@@ -415,21 +437,41 @@ export async function queryEvents(opts: {
   const db = await getSessionsDb()
   const conditions: string[] = []
   const params: Record<string, unknown> = {}
-  if (opts.type) { conditions.push('type = @type'); params.type = opts.type }
-  if (opts.agentId) { conditions.push('agent_id = @agentId'); params.agentId = opts.agentId }
-  if (opts.sessionKey) { conditions.push('session_key = @sessionKey'); params.sessionKey = opts.sessionKey }
-  if (opts.since != null) { conditions.push('timestamp >= @since'); params.since = opts.since }
+  if (opts.type) {
+    conditions.push('type = @type')
+    params.type = opts.type
+  }
+  if (opts.agentId) {
+    conditions.push('agent_id = @agentId')
+    params.agentId = opts.agentId
+  }
+  if (opts.sessionKey) {
+    conditions.push('session_key = @sessionKey')
+    params.sessionKey = opts.sessionKey
+  }
+  if (opts.since != null) {
+    conditions.push('timestamp >= @since')
+    params.since = opts.since
+  }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
   params.limit = opts.limit ?? 100
-  const rows = db.prepare(
-    `SELECT id, type, timestamp, agent_id, session_key, schema_version, payload, peer_id, channel
-     FROM event_log ${where} ORDER BY timestamp DESC LIMIT @limit`
-  ).all(params) as Array<{
-    id: string; type: string; timestamp: number; agent_id: string;
-    session_key: string | null; schema_version: number; payload: string;
-    peer_id: string | null; channel: string | null
+  const rows = db
+    .prepare(
+      `SELECT id, type, timestamp, agent_id, session_key, schema_version, payload, peer_id, channel
+     FROM event_log ${where} ORDER BY timestamp DESC LIMIT @limit`,
+    )
+    .all(params) as Array<{
+    id: string
+    type: string
+    timestamp: number
+    agent_id: string
+    session_key: string | null
+    schema_version: number
+    payload: string
+    peer_id: string | null
+    channel: string | null
   }>
-  return rows.map(r => ({
+  return rows.map((r) => ({
     id: r.id,
     type: r.type,
     timestamp: r.timestamp,
@@ -486,17 +528,28 @@ export async function getUsageSummary(opts: {
   const db = await getSessionsDb()
   const conditions: string[] = []
   const params: Record<string, unknown> = {}
-  if (opts.agentId) { conditions.push('agent_id = @agentId'); params.agentId = opts.agentId }
-  if (opts.sessionId) { conditions.push('session_id = @sessionId'); params.sessionId = opts.sessionId }
-  if (opts.since != null) { conditions.push('timestamp >= @since'); params.since = opts.since }
+  if (opts.agentId) {
+    conditions.push('agent_id = @agentId')
+    params.agentId = opts.agentId
+  }
+  if (opts.sessionId) {
+    conditions.push('session_id = @sessionId')
+    params.sessionId = opts.sessionId
+  }
+  if (opts.since != null) {
+    conditions.push('timestamp >= @since')
+    params.since = opts.since
+  }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
-  const row = db.prepare(
-    `SELECT COALESCE(SUM(cost_usd), 0) as total_cost,
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(cost_usd), 0) as total_cost,
             COALESCE(SUM(input_tokens), 0) as total_in,
             COALESCE(SUM(output_tokens), 0) as total_out,
             COUNT(*) as total_turns
-     FROM usage_log ${where}`
-  ).get(params) as { total_cost: number; total_in: number; total_out: number; total_turns: number }
+     FROM usage_log ${where}`,
+    )
+    .get(params) as { total_cost: number; total_in: number; total_out: number; total_turns: number }
   return {
     totalCostUsd: row.total_cost,
     totalInputTokens: row.total_in,
@@ -606,7 +659,7 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
     }
     if ((m as MessageLike)._source === 'server') {
       const { _source, ...rest } = m as MessageLike & { _source?: unknown }
-      void _source  // discard
+      void _source // discard
       return rest as T
     }
     return m
@@ -614,7 +667,7 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   for (const [, msg] of serverAuthored) {
     if (typeof msg.id === 'string' && !clientIds.has(msg.id)) merged.push(msg)
   }
-  merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+  merged.sort((a, b) => (a?.ts ?? 0) - (b?.ts ?? 0))
 
   return dropPhantomClientAssistants(merged)
 }
@@ -703,8 +756,7 @@ function scrubClientSourceSpoof<T extends MessageLike>(
 export function dropPhantomClientAssistants<T extends MessageLike>(
   messages: readonly T[],
 ): T[] | readonly T[] {
-  const isAssistant = (m: T | undefined) =>
-    !!m && (m as { role?: string }).role === 'assistant'
+  const isAssistant = (m: T | undefined) => !!m && (m as { role?: string }).role === 'assistant'
   const isTurnBoundary = (m: T | undefined) => {
     if (!m) return false
     const role = (m as { role?: string }).role
@@ -739,7 +791,7 @@ export function dropPhantomClientAssistants<T extends MessageLike>(
   // separation prevents system messages from shifting `-tN` → group mapping.
   const turnGroup: number[] = new Array(messages.length)
   const groupHasServerAsst: boolean[] = []
-  const userTurnToGroup: number[] = []  // userTurnToGroup[N] = sort-order group of Nth user turn
+  const userTurnToGroup: number[] = [] // userTurnToGroup[N] = sort-order group of Nth user turn
   let groupId = 0
   let currentGroupHasServer = false
   for (let i = 0; i < messages.length; i++) {
@@ -754,7 +806,7 @@ export function dropPhantomClientAssistants<T extends MessageLike>(
       // Only `user` boundaries advance the user-turn counter — system
       // partitions get their own group slot but don't claim a turn index.
       if ((cur as { role?: string }).role === 'user') {
-        userTurnToGroup.push(groupId)  // push at index (userTurnIdx - 1) where userTurnIdx starts at 1
+        userTurnToGroup.push(groupId) // push at index (userTurnIdx - 1) where userTurnIdx starts at 1
       }
     }
     turnGroup[i] = groupId
@@ -791,7 +843,7 @@ export function dropPhantomClientAssistants<T extends MessageLike>(
     if (typeof id !== 'string') continue
     const m = TURN_ID_RE.exec(id)
     if (!m) continue
-    const turnIdx = parseInt(m[1]!, 10)
+    const turnIdx = Number.parseInt(m[1]!, 10)
     if (!Number.isFinite(turnIdx) || turnIdx < 1) continue
     // Map 1-indexed turn N to the group of the Nth user-bounded turn. If no
     // such user turn exists yet in this messages array (e.g., the user boundary
@@ -799,7 +851,7 @@ export function dropPhantomClientAssistants<T extends MessageLike>(
     // later merge that introduces the user row can re-run this helper.
     const targetGroup = userTurnToGroup[turnIdx - 1]
     if (targetGroup === undefined) continue
-    if (turnGroup[i] === targetGroup) continue  // already in correct group
+    if (turnGroup[i] === targetGroup) continue // already in correct group
     turnGroup[i] = targetGroup
     migrated = true
   }
@@ -819,7 +871,10 @@ export function dropPhantomClientAssistants<T extends MessageLike>(
   const deduped: T[] = []
   for (let i = 0; i < messages.length; i++) {
     const cur = messages[i]
-    if (!cur) { deduped.push(cur); continue }
+    if (!cur) {
+      deduped.push(cur)
+      continue
+    }
     // Keep server-authored messages, non-assistant messages, and assistants
     // in a partition without a server-authored counterpart.
     if (!isAssistant(cur) || (cur as MessageLike)._source === 'server') {
@@ -856,7 +911,7 @@ export function appendServerAuthoredPure<T extends MessageLike>(
   }
   const stamped = { ...message, _source: 'server', ts: message.ts ?? now } as T
   const next = [...existing, stamped]
-  next.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+  next.sort((a, b) => (a?.ts ?? 0) - (b?.ts ?? 0))
   // Phantom cleanup: client-side streaming may have stamped a `m-*` assistant
   // bubble for the same turn we are now server-authoring. If the client never
   // re-PUTs this session (mobile backgrounded, tab closed, switched away),
@@ -887,12 +942,17 @@ export function appendServerAuthoredPure<T extends MessageLike>(
  * delegate merging to {@link mergePreservingServerAuthored} so the policy is
  * testable in isolation.
  */
-export async function upsertClientSession(session: ClientSession, baseSyncedAt = 0): Promise<boolean> {
+export async function upsertClientSession(
+  session: ClientSession,
+  baseSyncedAt = 0,
+): Promise<boolean> {
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
-    const existing = db.prepare(
-      'SELECT messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-    ).get(session.id, session.userId) as { messages: string; updated_at: number } | undefined
+    const existing = db
+      .prepare(
+        'SELECT messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+      )
+      .get(session.id, session.userId) as { messages: string; updated_at: number } | undefined
 
     // Reject stale writes (same optimistic concurrency check as the pre-transaction version)
     if (existing && existing.updated_at > baseSyncedAt) return false
@@ -909,12 +969,15 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
       try {
         const parsed = JSON.parse(existing.messages) as MessageLike[]
         if (Array.isArray(parsed)) oldMsgs = parsed
-      } catch { /* malformed existing messages JSON — fall through with oldMsgs=[] */ }
+      } catch {
+        /* malformed existing messages JSON — fall through with oldMsgs=[] */
+      }
     }
     const clientMsgs = session.messages as MessageLike[]
     const finalMessages = mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[]
 
-    const result = db.prepare(`
+    const result = db
+      .prepare(`
       INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at)
       VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, @updatedAt)
       ON CONFLICT(id) DO UPDATE SET
@@ -927,19 +990,20 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
         updated_at = excluded.updated_at
       WHERE client_sessions.updated_at <= @baseSyncedAt
         AND client_sessions.user_id = @userId
-    `).run({
-      id: session.id,
-      userId: session.userId,
-      agentId: session.agentId,
-      title: session.title,
-      pinned: session.pinned ? 1 : 0,
-      createdAt: session.createdAt,
-      lastAt: session.lastAt,
-      messages: JSON.stringify(finalMessages),
-      messageCount: finalMessages.length,
-      updatedAt: session.updatedAt,
-      baseSyncedAt,
-    })
+    `)
+      .run({
+        id: session.id,
+        userId: session.userId,
+        agentId: session.agentId,
+        title: session.title,
+        pinned: session.pinned ? 1 : 0,
+        createdAt: session.createdAt,
+        lastAt: session.lastAt,
+        messages: JSON.stringify(finalMessages),
+        messageCount: finalMessages.length,
+        updatedAt: session.updatedAt,
+        baseSyncedAt,
+      })
     return result.changes > 0
   })
   return txn()
@@ -968,13 +1032,21 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
 export async function appendServerAuthoredMessage(
   sessId: string,
   userId: string,
-  message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
+  message: {
+    id: string
+    role: 'assistant' | 'user' | 'system'
+    text?: string
+    ts?: number
+    [k: string]: unknown
+  },
 ): Promise<{ applied: boolean; reason?: 'session_not_found' | 'already_exists' | 'malformed' }> {
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
-    const row = db.prepare(
-      'SELECT messages FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-    ).get(sessId, userId) as { messages: string } | undefined
+    const row = db
+      .prepare(
+        'SELECT messages FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+      )
+      .get(sessId, userId) as { messages: string } | undefined
     if (!row) return { applied: false, reason: 'session_not_found' as const }
 
     let msgs: MessageLike[]
@@ -991,7 +1063,7 @@ export async function appendServerAuthoredMessage(
 
     const now = Date.now()
     db.prepare(
-      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ? WHERE id = ? AND user_id = ?'
+      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ? WHERE id = ? AND user_id = ?',
     ).run(JSON.stringify(result.messages), result.messages.length, now, now, sessId, userId)
     return { applied: true }
   })
@@ -1033,7 +1105,7 @@ export interface QueuedMessage {
  * call site.
  */
 export function queuedMessageToLine(entry: QueuedMessage): string {
-  return JSON.stringify(entry) + '\n'
+  return `${JSON.stringify(entry)}\n`
 }
 
 /**
@@ -1083,7 +1155,13 @@ export async function queueMessageToOutbox(entry: QueuedMessage): Promise<void> 
 export async function appendServerAuthoredMessageDurable(
   sessId: string,
   userId: string,
-  message: { id: string; role: 'assistant' | 'user' | 'system'; text?: string; ts?: number; [k: string]: unknown },
+  message: {
+    id: string
+    role: 'assistant' | 'user' | 'system'
+    text?: string
+    ts?: number
+    [k: string]: unknown
+  },
 ): Promise<
   | { applied: true }
   | { applied: false; reason: 'already_exists' | 'malformed' }
@@ -1186,7 +1264,11 @@ export async function replayMsgOutbox(): Promise<{
       const r = await appendServerAuthoredMessage(entry.sessId, entry.userId, entry.message)
       if (r.applied) {
         applied++
-      } else if (r.reason === 'already_exists' || r.reason === 'session_not_found' || r.reason === 'malformed') {
+      } else if (
+        r.reason === 'already_exists' ||
+        r.reason === 'session_not_found' ||
+        r.reason === 'malformed'
+      ) {
         dropped++
       } else {
         survivors.push(queuedMessageToLine(entry).trimEnd())
@@ -1202,7 +1284,7 @@ export async function replayMsgOutbox(): Promise<{
   // Atomic rewrite: write to .tmp, rename over. If survivors is empty, just
   // overwrite with empty contents (keeping the file avoids repeated mkdir).
   const tmp = `${paths.msgOutbox}.tmp-${process.pid}-${Date.now()}`
-  const content = survivors.length > 0 ? survivors.join('\n') + '\n' : ''
+  const content = survivors.length > 0 ? `${survivors.join('\n')}\n` : ''
   await mkdir(dirname(paths.msgOutbox), { recursive: true })
   await writeFile(tmp, content, { encoding: 'utf8' })
   await rename(tmp, paths.msgOutbox)
@@ -1212,15 +1294,23 @@ export async function replayMsgOutbox(): Promise<{
 
 export async function listClientSessions(userId: string): Promise<ClientSessionMeta[]> {
   const db = await getSessionsDb()
-  const rows = db.prepare(`
+  const rows = db
+    .prepare(`
     SELECT id, agent_id, title, pinned, created_at, last_at, updated_at,
            message_count as msg_count
     FROM client_sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY last_at DESC
-  `).all(userId) as Array<{
-    id: string; agent_id: string; title: string; pinned: number;
-    created_at: number; last_at: number; updated_at: number; msg_count: number
+  `)
+    .all(userId) as Array<{
+    id: string
+    agent_id: string
+    title: string
+    pinned: number
+    created_at: number
+    last_at: number
+    updated_at: number
+    msg_count: number
   }>
-  return rows.map(r => ({
+  return rows.map((r) => ({
     id: r.id,
     agentId: r.agent_id,
     title: r.title,
@@ -1235,12 +1325,21 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
 export async function getClientSession(id: string, userId?: string): Promise<ClientSession | null> {
   const db = await getSessionsDb()
   const sql = userId
-    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
-  const row = (userId ? db.prepare(sql).get(id, userId) : db.prepare(sql).get(id)) as {
-    id: string; user_id: string; agent_id: string; title: string; pinned: number;
-    created_at: number; last_at: number; messages: string; updated_at: number
-  } | undefined
+    ? 'SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    : 'SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND deleted_at IS NULL'
+  const row = (userId ? db.prepare(sql).get(id, userId) : db.prepare(sql).get(id)) as
+    | {
+        id: string
+        user_id: string
+        agent_id: string
+        title: string
+        pinned: number
+        created_at: number
+        last_at: number
+        messages: string
+        updated_at: number
+      }
+    | undefined
   if (!row) return null
   return {
     id: row.id,
@@ -1267,34 +1366,52 @@ export async function deleteClientSession(id: string, userId?: string): Promise<
 }
 
 /** List unclaimed sessions (user_id='default') with summary for migration UI. */
-export async function listUnclaimedSessions(): Promise<Array<{
-  id: string; agentId: string; title: string; createdAt: number;
-  lastAt: number; messageCount: number; summary: string
-}>> {
+export async function listUnclaimedSessions(): Promise<
+  Array<{
+    id: string
+    agentId: string
+    title: string
+    createdAt: number
+    lastAt: number
+    messageCount: number
+    summary: string
+  }>
+> {
   const db = await getSessionsDb()
-  const rows = db.prepare(`
+  const rows = db
+    .prepare(`
     SELECT id, agent_id, title, created_at, last_at, messages,
            message_count as msg_count
     FROM client_sessions
     WHERE user_id = 'default' AND deleted_at IS NULL
     ORDER BY last_at DESC
-  `).all() as Array<{
-    id: string; agent_id: string; title: string; created_at: number;
-    last_at: number; messages: string; msg_count: number
+  `)
+    .all() as Array<{
+    id: string
+    agent_id: string
+    title: string
+    created_at: number
+    last_at: number
+    messages: string
+    msg_count: number
   }>
-  return rows.map(r => {
+  return rows.map((r) => {
     // Extract first few user messages as summary
     let summary = ''
     try {
       const msgs = JSON.parse(r.messages) as Array<{ role?: string; text?: string }>
-      const userMsgs = msgs.filter(m => m.role === 'user').slice(0, 3)
-      summary = userMsgs.map(m => (m.text || '').slice(0, 80)).join(' / ')
-      if (summary.length > 200) summary = summary.slice(0, 200) + '…'
+      const userMsgs = msgs.filter((m) => m.role === 'user').slice(0, 3)
+      summary = userMsgs.map((m) => (m.text || '').slice(0, 80)).join(' / ')
+      if (summary.length > 200) summary = `${summary.slice(0, 200)}…`
     } catch {}
     return {
-      id: r.id, agentId: r.agent_id, title: r.title,
-      createdAt: r.created_at, lastAt: r.last_at,
-      messageCount: r.msg_count, summary,
+      id: r.id,
+      agentId: r.agent_id,
+      title: r.title,
+      createdAt: r.created_at,
+      lastAt: r.last_at,
+      messageCount: r.msg_count,
+      summary,
     }
   })
 }
@@ -1303,18 +1420,26 @@ export async function listUnclaimedSessions(): Promise<Array<{
  *  Returns true if claimed, false if already claimed by someone else. */
 export async function claimSession(sessionId: string, userId: string): Promise<boolean> {
   const db = await getSessionsDb()
-  const result = db.prepare(`
+  const result = db
+    .prepare(`
     UPDATE client_sessions SET user_id = ?, updated_at = ?
     WHERE id = ? AND user_id = 'default' AND deleted_at IS NULL
-  `).run(userId, Date.now(), sessionId)
+  `)
+    .run(userId, Date.now(), sessionId)
   return result.changes > 0
 }
 
 export async function closeSessionsDb(): Promise<void> {
-  if (_walTimer !== null) { clearInterval(_walTimer); _walTimer = null }
+  if (_walTimer !== null) {
+    clearInterval(_walTimer)
+    _walTimer = null
+  }
   process.removeListener('exit', _onExit)
   if (_db) {
-    try { _db.pragma('wal_checkpoint(TRUNCATE)'); _db.close() } catch {}
+    try {
+      _db.pragma('wal_checkpoint(TRUNCATE)')
+      _db.close()
+    } catch {}
     _db = null
   }
 }

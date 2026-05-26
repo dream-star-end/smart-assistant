@@ -14,14 +14,20 @@
  */
 
 import { execSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
-import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import {
+  type HubSearchResult,
+  type HubSkillDetail,
+  hubDetail,
+  hubDownload,
+  hubSearch,
+} from './clawhubClient.js'
 import { paths } from './paths.js'
-import { parseFrontmatter, type SkillFrontmatter, type SkillMetadata } from './skillStore.js'
-import { hubDownload, hubSearch, hubDetail, type HubSearchResult, type HubSkillDetail } from './clawhubClient.js'
+import { type SkillFrontmatter, type SkillMetadata, parseFrontmatter } from './skillStore.js'
 
 export { hubSearch, type HubSearchResult, type HubSkillDetail }
 
@@ -235,10 +241,7 @@ export class HubStore {
   /**
    * Update a skill to a new version (re-download + re-install).
    */
-  async update(
-    slug: string,
-    version?: string,
-  ): Promise<{ ok: boolean; error?: string }> {
+  async update(slug: string, version?: string): Promise<{ ok: boolean; error?: string }> {
     return this.install(slug, version, true)
   }
 

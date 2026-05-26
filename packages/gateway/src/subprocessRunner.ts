@@ -325,202 +325,202 @@ export class SubprocessRunner extends EventEmitter {
     // is assigned would never bump _consecutiveCrashes, and the caller could
     // retry immediately and re-throw, burning CPU.
     try {
-    const { config } = this.opts
-    let ccbDir: string
-    try {
-      ccbDir = resolve(config.auth.claudeCodePath)
-    } catch (err) {
-      this.starting = false
-      throw err
-    }
-    if (!existsSync(ccbDir)) {
-      this.starting = false
-      throw new Error(
-        `Claude Code path not found: ${ccbDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
-      )
-    }
-    const entry = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
-    const runtime = config.auth.claudeCodeRuntime ?? 'bun'
-
-    // ─── L1/L2/L3: prepare learning-loop context for the subprocess ───
-    let learningContext: Awaited<ReturnType<typeof this.buildLearningContext>>
-    try {
-      learningContext = await this.buildLearningContext()
-    } catch (err) {
-      this.starting = false
-      throw err
-    }
-
-    const args = buildCcbCliArgs({
-      runtime,
-      entry,
-      model: this.opts.model,
-      permissionMode: this.opts.permissionMode,
-      extraPromptFile: learningContext.extraPromptFile,
-      mcpConfigFile: learningContext.mcpConfigFile,
-      addDir: this.opts.cwd,
-      resumeSessionId: this.currentSessionId,
-      workload: this.opts.workload,
-    })
-
-    // ── Provider-aware auth injection ──
-    // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
-    // We must inject the right env vars per provider so CCB routes to the correct API.
-    const providerEnv: Record<string, string> = {}
-    const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
-
-    if (effectiveProvider === 'claude-subscription') {
-      // Claude subscription: inject OAuth token, route to Anthropic API
-      if (this.opts.config.auth.claudeOAuth?.accessToken) {
-        providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
-        // Hot-reload path: ccb watches this file's mtime and re-reads on change,
-        // so a gateway-side OAuth refresh propagates without subprocess restart.
-        // Falls back to CLAUDE_CODE_OAUTH_TOKEN env above when file is missing.
-        // Gated on config token existing so a stale runtime file (e.g. left
-        // over after the user logged out) can't "revive" old auth.
-        providerEnv.OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE = paths.runtimeClaudeOauthToken
+      const { config } = this.opts
+      let ccbDir: string
+      try {
+        ccbDir = resolve(config.auth.claudeCodePath)
+      } catch (err) {
+        this.starting = false
+        throw err
       }
-      // CRITICAL: Tell CCB that the host owns provider routing.
-      // Without this, CCB's managedEnv.ts will Object.assign settings.json env
-      // (ANTHROPIC_BASE_URL=minimax, ANTHROPIC_AUTH_TOKEN=minimax_key) OVER our
-      // spawn env, routing Claude requests to MiniMax instead of Anthropic.
-      // With this flag, CCB strips provider vars from settings.json during load.
-      providerEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
-      providerEnv.ANTHROPIC_BASE_URL = ''
-      providerEnv.ANTHROPIC_AUTH_TOKEN = ''
-      providerEnv.ANTHROPIC_MODEL = ''
-    } else if (effectiveProvider === 'codex' || effectiveProvider === 'openai') {
-      // OpenAI/Codex: use Codex OAuth token via OpenAI-compatible endpoint
-      // CCB doesn't natively support OpenAI, but OpenAI provides an Anthropic-compatible
-      // proxy at https://api.openai.com/anthropic/ (or use a local proxy like LiteLLM)
-      if (this.opts.config.auth.codexOAuth?.accessToken) {
-        providerEnv.ANTHROPIC_AUTH_TOKEN = this.opts.config.auth.codexOAuth.accessToken
-        // Note: OpenAI doesn't have an Anthropic-compatible endpoint by default.
-        // Users need to configure a proxy (LiteLLM/OneAPI) or this won't work.
-        // Leave ANTHROPIC_BASE_URL unset to let settings.json or env provide it.
+      if (!existsSync(ccbDir)) {
+        this.starting = false
+        throw new Error(
+          `Claude Code path not found: ${ccbDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
+        )
       }
-      // Don't inject Claude OAuth — that would override the Codex token
-    } else {
-      // MiniMax / DeepSeek / custom provider: DON'T inject any OAuth token.
-      // Let CCB fall through to settings.json (which has ANTHROPIC_BASE_URL +
-      // ANTHROPIC_AUTH_TOKEN pointing to the provider's Anthropic-compatible endpoint).
-      // This is the "default" path — settings.json controls routing.
-    }
+      const entry = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
+      const runtime = config.auth.claudeCodeRuntime ?? 'bun'
 
-    // Per-agent / global egress proxy override. Non-empty wins over any
-    // inherited process.env. Empty / undefined → no override, CCB inherits
-    // whatever the gateway process env carries (typically systemd
-    // HTTPS_PROXY). All four common spellings are set in lockstep so Rust
-    // reqwest / Node undici / shelled-out tools all see the same value.
-    const proxyEnv: Record<string, string> = {}
-    if (this.opts.proxyUrl) {
-      for (const key of PROXY_ENV_KEYS) proxyEnv[key] = this.opts.proxyUrl
-    }
+      // ─── L1/L2/L3: prepare learning-loop context for the subprocess ───
+      let learningContext: Awaited<ReturnType<typeof this.buildLearningContext>>
+      try {
+        learningContext = await this.buildLearningContext()
+      } catch (err) {
+        this.starting = false
+        throw err
+      }
 
-    let proc: ReturnType<TerminalBackend['spawn']>
-    try {
-      const backend: TerminalBackend = createBackend(this.opts.config.terminal)
-      proc = backend.spawn({
-        command: runtime,
-        args,
-        cwd: ccbDir,
-        agentCwd: this.opts.cwd, // agent's real working directory (for Docker volume mount)
-        env: {
-          ...process.env,
-          ...providerEnv,
-          ...proxyEnv,
-          OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
-          OPENCLAUDE_AGENT_ID: this.opts.agentId,
-          // Per-session effort level (xhigh / max from chat-mode pills, or
-          // undefined to let CCB use its model-default — Opus 4.7 → high).
-          // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
-          // gateway-process env doesn't bleed into spawned CCBs.
-          CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
-          // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
-          // here to strip run_in_background from Bash/Agent/PowerShell tool
-          // schemas (visibility band-aid for Opus 4.7 over-using background
-          // mode). Removed once CCB started streaming bash_output_tail
-          // SDK events at 1 Hz — the underlying UX problem (background
-          // commands looking idle) is now solved end-to-end (CCB
-          // sdkEventQueue → gateway ccbMessageParser → web tool_output_tail
-          // block), so the model can pick run_in_background:true again.
-          IS_SANDBOX: '1',
-          FEATURE_VERIFICATION_AGENT: '1',
-        },
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: true, // create process group so shutdown() can kill all children
+      const args = buildCcbCliArgs({
+        runtime,
+        entry,
+        model: this.opts.model,
+        permissionMode: this.opts.permissionMode,
+        extraPromptFile: learningContext.extraPromptFile,
+        mcpConfigFile: learningContext.mcpConfigFile,
+        addDir: this.opts.cwd,
+        resumeSessionId: this.currentSessionId,
+        workload: this.opts.workload,
       })
-    } catch (err) {
-      this.starting = false
-      throw err
-    }
 
-    this.proc = proc as unknown as ChildProcessWithoutNullStreams
-    // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
-    // manager's per-CCB cost-tracker reset) run strictly before any 'message'
-    // or 'session_id' event of the new process can arrive.
-    //
-    // `resumed` tells consumers whether CCB will restore historical state on
-    // start. When --resume is passed CCB calls restoreCostStateForSession
-    // which sets STATE.totalCostUSD back to the persisted cumulative — so the
-    // gateway's per-session cost-delta baseline must NOT be reset to 0.
-    this.emit('spawn', { resumed: !!this.currentSessionId })
+      // ── Provider-aware auth injection ──
+      // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
+      // We must inject the right env vars per provider so CCB routes to the correct API.
+      const providerEnv: Record<string, string> = {}
+      const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
 
-    proc.stdin.on('error', (err) =>
-      runnerLog.warn('stdin error', { sessionKey: this.opts.sessionKey }, err),
-    )
-    proc.stdout.setEncoding('utf-8')
-    proc.stdout.on('data', (chunk: string) => this.handleStdout(chunk))
-
-    proc.stderr.setEncoding('utf-8')
-    this.stderrBufBytes = 0
-    proc.stderr.on('data', (chunk: string) => {
-      this.lastActivityAt = Date.now() // stderr activity also counts as "alive"
-      this.stderrBufBytes += Buffer.byteLength(chunk, 'utf8')
-      // If stderr goes pathological (single burst > cap), kill to avoid RSS
-      // blow-up from downstream listeners that might buffer all of it.
-      if (this.stderrBufBytes > MAX_STDERR_BUF_BYTES) {
-        this.handleBufferOverflow('stderr', this.stderrBufBytes)
-        this.stderrBufBytes = 0
-        return
-      }
-      // Reset counter on newline — stderr is usually line-oriented log output.
-      if (chunk.includes('\n')) this.stderrBufBytes = 0
-      this.emit('stderr', chunk)
-    })
-
-    proc.on('exit', (code, signal) => {
-      this.proc = null
-      this.closed = true
-      // Use explicit shuttingDown flag (set by shutdown()) to distinguish
-      // graceful shutdown from crash. Exit code alone is unreliable:
-      // - SIGSEGV/SIGKILL → code=null but NOT graceful
-      // - CCB may exit with non-0 code on normal termination
-      const crashed = !this.shuttingDown
-      this.shuttingDown = false
-      if (crashed) {
-        this._recordCrash()
+      if (effectiveProvider === 'claude-subscription') {
+        // Claude subscription: inject OAuth token, route to Anthropic API
+        if (this.opts.config.auth.claudeOAuth?.accessToken) {
+          providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
+          // Hot-reload path: ccb watches this file's mtime and re-reads on change,
+          // so a gateway-side OAuth refresh propagates without subprocess restart.
+          // Falls back to CLAUDE_CODE_OAUTH_TOKEN env above when file is missing.
+          // Gated on config token existing so a stale runtime file (e.g. left
+          // over after the user logged out) can't "revive" old auth.
+          providerEnv.OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE = paths.runtimeClaudeOauthToken
+        }
+        // CRITICAL: Tell CCB that the host owns provider routing.
+        // Without this, CCB's managedEnv.ts will Object.assign settings.json env
+        // (ANTHROPIC_BASE_URL=minimax, ANTHROPIC_AUTH_TOKEN=minimax_key) OVER our
+        // spawn env, routing Claude requests to MiniMax instead of Anthropic.
+        // With this flag, CCB strips provider vars from settings.json during load.
+        providerEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+        providerEnv.ANTHROPIC_BASE_URL = ''
+        providerEnv.ANTHROPIC_AUTH_TOKEN = ''
+        providerEnv.ANTHROPIC_MODEL = ''
+      } else if (effectiveProvider === 'codex' || effectiveProvider === 'openai') {
+        // OpenAI/Codex: use Codex OAuth token via OpenAI-compatible endpoint
+        // CCB doesn't natively support OpenAI, but OpenAI provides an Anthropic-compatible
+        // proxy at https://api.openai.com/anthropic/ (or use a local proxy like LiteLLM)
+        if (this.opts.config.auth.codexOAuth?.accessToken) {
+          providerEnv.ANTHROPIC_AUTH_TOKEN = this.opts.config.auth.codexOAuth.accessToken
+          // Note: OpenAI doesn't have an Anthropic-compatible endpoint by default.
+          // Users need to configure a proxy (LiteLLM/OneAPI) or this won't work.
+          // Leave ANTHROPIC_BASE_URL unset to let settings.json or env provide it.
+        }
+        // Don't inject Claude OAuth — that would override the Codex token
       } else {
-        // Graceful shutdown wipes any accumulated backoff — the operator is
-        // in control, not a crash-loop, so the next start() should not be gated.
-        // Also zero _lastStartAt so a post-restart crash can't consult a stale
-        // "stable uptime" timestamp from this now-dead subprocess.
-        this._consecutiveCrashes = 0
-        this._backoffUntil = 0
-        this._lastStartAt = 0
+        // MiniMax / DeepSeek / custom provider: DON'T inject any OAuth token.
+        // Let CCB fall through to settings.json (which has ANTHROPIC_BASE_URL +
+        // ANTHROPIC_AUTH_TOKEN pointing to the provider's Anthropic-compatible endpoint).
+        // This is the "default" path — settings.json controls routing.
       }
-      this.emit('exit', { code, signal, crashed })
-    })
 
-    proc.on('error', (err) => {
-      this.emit('error', err)
-    })
+      // Per-agent / global egress proxy override. Non-empty wins over any
+      // inherited process.env. Empty / undefined → no override, CCB inherits
+      // whatever the gateway process env carries (typically systemd
+      // HTTPS_PROXY). All four common spellings are set in lockstep so Rust
+      // reqwest / Node undici / shelled-out tools all see the same value.
+      const proxyEnv: Record<string, string> = {}
+      if (this.opts.proxyUrl) {
+        for (const key of PROXY_ENV_KEYS) proxyEnv[key] = this.opts.proxyUrl
+      }
 
-    // Spawn succeeded — record timestamp for STABLE_UPTIME_MS check. A crash
-    // more than STABLE_UPTIME_MS after this point is treated as a fresh failure
-    // (counter resets) rather than compounding on past crashes.
-    this._lastStartAt = Date.now()
-    this.starting = false
+      let proc: ReturnType<TerminalBackend['spawn']>
+      try {
+        const backend: TerminalBackend = createBackend(this.opts.config.terminal)
+        proc = backend.spawn({
+          command: runtime,
+          args,
+          cwd: ccbDir,
+          agentCwd: this.opts.cwd, // agent's real working directory (for Docker volume mount)
+          env: {
+            ...process.env,
+            ...providerEnv,
+            ...proxyEnv,
+            OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
+            OPENCLAUDE_AGENT_ID: this.opts.agentId,
+            // Per-session effort level (xhigh / max from chat-mode pills, or
+            // undefined to let CCB use its model-default — Opus 4.7 → high).
+            // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
+            // gateway-process env doesn't bleed into spawned CCBs.
+            CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
+            // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
+            // here to strip run_in_background from Bash/Agent/PowerShell tool
+            // schemas (visibility band-aid for Opus 4.7 over-using background
+            // mode). Removed once CCB started streaming bash_output_tail
+            // SDK events at 1 Hz — the underlying UX problem (background
+            // commands looking idle) is now solved end-to-end (CCB
+            // sdkEventQueue → gateway ccbMessageParser → web tool_output_tail
+            // block), so the model can pick run_in_background:true again.
+            IS_SANDBOX: '1',
+            FEATURE_VERIFICATION_AGENT: '1',
+          },
+          stdio: ['pipe', 'pipe', 'pipe'],
+          detached: true, // create process group so shutdown() can kill all children
+        })
+      } catch (err) {
+        this.starting = false
+        throw err
+      }
+
+      this.proc = proc as unknown as ChildProcessWithoutNullStreams
+      // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
+      // manager's per-CCB cost-tracker reset) run strictly before any 'message'
+      // or 'session_id' event of the new process can arrive.
+      //
+      // `resumed` tells consumers whether CCB will restore historical state on
+      // start. When --resume is passed CCB calls restoreCostStateForSession
+      // which sets STATE.totalCostUSD back to the persisted cumulative — so the
+      // gateway's per-session cost-delta baseline must NOT be reset to 0.
+      this.emit('spawn', { resumed: !!this.currentSessionId })
+
+      proc.stdin.on('error', (err) =>
+        runnerLog.warn('stdin error', { sessionKey: this.opts.sessionKey }, err),
+      )
+      proc.stdout.setEncoding('utf-8')
+      proc.stdout.on('data', (chunk: string) => this.handleStdout(chunk))
+
+      proc.stderr.setEncoding('utf-8')
+      this.stderrBufBytes = 0
+      proc.stderr.on('data', (chunk: string) => {
+        this.lastActivityAt = Date.now() // stderr activity also counts as "alive"
+        this.stderrBufBytes += Buffer.byteLength(chunk, 'utf8')
+        // If stderr goes pathological (single burst > cap), kill to avoid RSS
+        // blow-up from downstream listeners that might buffer all of it.
+        if (this.stderrBufBytes > MAX_STDERR_BUF_BYTES) {
+          this.handleBufferOverflow('stderr', this.stderrBufBytes)
+          this.stderrBufBytes = 0
+          return
+        }
+        // Reset counter on newline — stderr is usually line-oriented log output.
+        if (chunk.includes('\n')) this.stderrBufBytes = 0
+        this.emit('stderr', chunk)
+      })
+
+      proc.on('exit', (code, signal) => {
+        this.proc = null
+        this.closed = true
+        // Use explicit shuttingDown flag (set by shutdown()) to distinguish
+        // graceful shutdown from crash. Exit code alone is unreliable:
+        // - SIGSEGV/SIGKILL → code=null but NOT graceful
+        // - CCB may exit with non-0 code on normal termination
+        const crashed = !this.shuttingDown
+        this.shuttingDown = false
+        if (crashed) {
+          this._recordCrash()
+        } else {
+          // Graceful shutdown wipes any accumulated backoff — the operator is
+          // in control, not a crash-loop, so the next start() should not be gated.
+          // Also zero _lastStartAt so a post-restart crash can't consult a stale
+          // "stable uptime" timestamp from this now-dead subprocess.
+          this._consecutiveCrashes = 0
+          this._backoffUntil = 0
+          this._lastStartAt = 0
+        }
+        this.emit('exit', { code, signal, crashed })
+      })
+
+      proc.on('error', (err) => {
+        this.emit('error', err)
+      })
+
+      // Spawn succeeded — record timestamp for STABLE_UPTIME_MS check. A crash
+      // more than STABLE_UPTIME_MS after this point is treated as a fresh failure
+      // (counter resets) rather than compounding on past crashes.
+      this._lastStartAt = Date.now()
+      this.starting = false
     } catch (err) {
       // Any failure between backoff-gate-pass and spawn-succeeded is a "start
       // failed" crash. Record it so the gate fires on the next call.
@@ -543,15 +543,11 @@ export class SubprocessRunner extends EventEmitter {
     // If we had a long-lived stable run before this crash, don't punish it —
     // reset the counter so an isolated crash after hours of uptime starts
     // fresh at 500ms instead of compounding on a counter from yesterday.
-    if (
-      this._lastStartAt > 0 &&
-      now - this._lastStartAt >= SubprocessRunner.STABLE_UPTIME_MS
-    ) {
+    if (this._lastStartAt > 0 && now - this._lastStartAt >= SubprocessRunner.STABLE_UPTIME_MS) {
       this._consecutiveCrashes = 0
     }
     this._consecutiveCrashes++
-    const expBackoff =
-      SubprocessRunner.BACKOFF_BASE_MS * 2 ** (this._consecutiveCrashes - 1)
+    const expBackoff = SubprocessRunner.BACKOFF_BASE_MS * 2 ** (this._consecutiveCrashes - 1)
     const backoff = Math.min(expBackoff, SubprocessRunner.BACKOFF_MAX_MS)
     this._backoffUntil = now + backoff
     // Consume the stable-uptime window: _lastStartAt is only meaningful for
@@ -586,8 +582,7 @@ export class SubprocessRunner extends EventEmitter {
 
       const tail = chunk.slice(offset, nlIdx)
       const tailBytes = Buffer.byteLength(tail, 'utf8')
-      const lineBytes =
-        (firstLineConsumesBuf ? this.stdoutBufBytes : 0) + tailBytes
+      const lineBytes = (firstLineConsumesBuf ? this.stdoutBufBytes : 0) + tailBytes
       if (lineBytes > MAX_STDOUT_BUF_BYTES) {
         this.handleBufferOverflow('stdout', lineBytes)
         this.stdoutBuf = ''
@@ -682,7 +677,11 @@ export class SubprocessRunner extends EventEmitter {
     // Trigger an exit path: force-kill the process group so MCP children die too.
     try {
       if (pid) {
-        try { process.kill(-pid, 'SIGKILL') } catch { proc?.kill('SIGKILL') }
+        try {
+          process.kill(-pid, 'SIGKILL')
+        } catch {
+          proc?.kill('SIGKILL')
+        }
       } else {
         proc?.kill('SIGKILL')
       }
@@ -902,7 +901,9 @@ export class SubprocessRunner extends EventEmitter {
   /** Remove the session's temp directory (extra-prompt.md, mcp-config.json, …). */
   private cleanupSessionDir(): void {
     if (this.sessionDir) {
-      try { rmSync(this.sessionDir, { recursive: true, force: true }) } catch {}
+      try {
+        rmSync(this.sessionDir, { recursive: true, force: true })
+      } catch {}
       this.sessionDir = null
     }
   }

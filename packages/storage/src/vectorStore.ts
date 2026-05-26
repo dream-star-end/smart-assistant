@@ -14,8 +14,8 @@
 
 import type Database from 'better-sqlite3'
 import * as sqliteVec from 'sqlite-vec'
-import { getSessionsDb } from './sessionsDb.js'
 import type { EmbeddingProvider } from './embedding.js'
+import { getSessionsDb } from './sessionsDb.js'
 
 // ── Initialization ───────────────────────────────
 
@@ -120,12 +120,16 @@ export function encodeSessionVecId(sessionId: string, turnIdx: number, role: str
   return `${sessionId}${VEC_ID_SEP}${turnIdx}${VEC_ID_SEP}${role}`
 }
 
-export function decodeSessionVecId(vecId: string): { sessionId: string; turnIdx: number; role: string } {
+export function decodeSessionVecId(vecId: string): {
+  sessionId: string
+  turnIdx: number
+  role: string
+} {
   const lastSep = vecId.lastIndexOf(VEC_ID_SEP)
   const role = vecId.substring(lastSep + 1)
   const rest = vecId.substring(0, lastSep)
   const secondLastSep = rest.lastIndexOf(VEC_ID_SEP)
-  const turnIdx = parseInt(rest.substring(secondLastSep + 1), 10)
+  const turnIdx = Number.parseInt(rest.substring(secondLastSep + 1), 10)
   const sessionId = rest.substring(0, secondLastSep)
   return { sessionId, turnIdx, role }
 }
@@ -136,10 +140,7 @@ export function decodeSessionVecId(vecId: string): { sessionId: string; turnIdx:
  * Upsert a vector for an archival entry.
  * The id must match an archival.id in the archival table.
  */
-export async function upsertArchivalVector(
-  id: string,
-  embedding: Float32Array,
-): Promise<void> {
+export async function upsertArchivalVector(id: string, embedding: Float32Array): Promise<void> {
   const db = await getVecDb()
   // vec0 virtual tables do not support UPSERT — use atomic DELETE+INSERT
   db.transaction(() => {
@@ -169,13 +170,15 @@ export async function searchArchivalByVector(
 ): Promise<Array<{ id: string; distance: number }>> {
   const db = await getVecDb()
   const overFetch = limit * 10
-  const rows = db.prepare(`
+  const rows = db
+    .prepare(`
     SELECT v.id, v.distance
     FROM archival_vec v
     JOIN archival a ON a.id = v.id
     WHERE v.embedding MATCH ? AND k = ? AND a.agent_id = ?
     ORDER BY v.distance
-  `).all(queryEmbedding, overFetch, agentId) as Array<{ id: string; distance: number }>
+  `)
+    .all(queryEmbedding, overFetch, agentId) as Array<{ id: string; distance: number }>
   return rows.slice(0, limit)
 }
 
@@ -185,10 +188,7 @@ export async function searchArchivalByVector(
  * Upsert a vector for a session turn.
  * Use encodeSessionVecId() to create the id.
  */
-export async function upsertSessionVector(
-  id: string,
-  embedding: Float32Array,
-): Promise<void> {
+export async function upsertSessionVector(id: string, embedding: Float32Array): Promise<void> {
   const db = await getVecDb()
   // vec0 virtual tables do not support UPSERT — use atomic DELETE+INSERT
   db.transaction(() => {
@@ -211,23 +211,27 @@ export async function searchSessionsByVector(
 
   if (agentId) {
     // Use "|" separator to extract sessionId from vec ID
-    const rows = db.prepare(`
+    const rows = db
+      .prepare(`
       SELECT v.id, v.distance
       FROM sessions_vec v
       JOIN sessions_meta m
         ON m.id = substr(v.id, 1, instr(v.id, '|') - 1)
       WHERE v.embedding MATCH ? AND k = ? AND m.agent_id = ?
       ORDER BY v.distance
-    `).all(queryEmbedding, overFetch, agentId) as Array<{ id: string; distance: number }>
+    `)
+      .all(queryEmbedding, overFetch, agentId) as Array<{ id: string; distance: number }>
     return rows.slice(0, limit)
   }
 
-  const rows = db.prepare(`
+  const rows = db
+    .prepare(`
     SELECT id, distance
     FROM sessions_vec
     WHERE embedding MATCH ? AND k = ?
     ORDER BY distance
-  `).all(queryEmbedding, limit) as Array<{ id: string; distance: number }>
+  `)
+    .all(queryEmbedding, limit) as Array<{ id: string; distance: number }>
   return rows
 }
 
@@ -254,11 +258,7 @@ export interface RRFCandidate {
  * @param k        RRF constant (default: 60)
  * @returns Merged candidates sorted by fused score (highest first)
  */
-export function reciprocalRankFusion(
-  bm25Ids: string[],
-  vecIds: string[],
-  k = 60,
-): RRFCandidate[] {
+export function reciprocalRankFusion(bm25Ids: string[], vecIds: string[], k = 60): RRFCandidate[] {
   const candidates = new Map<string, RRFCandidate>()
 
   for (let i = 0; i < bm25Ids.length; i++) {
@@ -324,15 +324,20 @@ export async function hybridArchivalSearch(
   // 1. BM25 search
   const cleanQuery = query.replace(/["()*]/g, ' ').trim()
   const bm25Rows = cleanQuery
-    ? (db.prepare(`
+    ? (db
+        .prepare(`
         SELECT a.id, a.content, a.tags, bm25(archival_fts) AS score
         FROM archival_fts
         JOIN archival a ON a.rowid = archival_fts.rowid
         WHERE archival_fts MATCH ? AND a.agent_id = ?
         ORDER BY score
         LIMIT ?
-      `).all(cleanQuery, agentId, fetchLimit) as Array<{
-        id: string; content: string; tags: string; score: number
+      `)
+        .all(cleanQuery, agentId, fetchLimit) as Array<{
+        id: string
+        content: string
+        tags: string
+        score: number
       }>)
     : []
 
@@ -348,8 +353,8 @@ export async function hybridArchivalSearch(
   }
 
   // 3. RRF fusion
-  const bm25Ids = bm25Rows.map(r => r.id)
-  const vecIds = vecResults.map(r => r.id)
+  const bm25Ids = bm25Rows.map((r) => r.id)
+  const vecIds = vecResults.map((r) => r.id)
   const fused = reciprocalRankFusion(bm25Ids, vecIds)
 
   // 4. Assemble results with content
@@ -360,21 +365,21 @@ export async function hybridArchivalSearch(
 
   // Load content for vector-only hits not in BM25 results
   const missingIds = fused
-    .filter(c => !contentMap.has(c.id))
-    .map(c => c.id)
+    .filter((c) => !contentMap.has(c.id))
+    .map((c) => c.id)
     .slice(0, limit)
 
   if (missingIds.length > 0) {
     const placeholders = missingIds.map(() => '?').join(',')
-    const rows = db.prepare(
-      `SELECT id, content, tags FROM archival WHERE id IN (${placeholders})`,
-    ).all(...missingIds) as Array<{ id: string; content: string; tags: string }>
+    const rows = db
+      .prepare(`SELECT id, content, tags FROM archival WHERE id IN (${placeholders})`)
+      .all(...missingIds) as Array<{ id: string; content: string; tags: string }>
     for (const r of rows) {
       contentMap.set(r.id, { content: r.content, tags: r.tags })
     }
   }
 
-  return fused.slice(0, limit).map(c => ({
+  return fused.slice(0, limit).map((c) => ({
     id: c.id,
     content: contentMap.get(c.id)?.content ?? '',
     tags: contentMap.get(c.id)?.tags ?? '',
@@ -422,7 +427,8 @@ export async function hybridSessionSearch(
   const bm25Params = agentId ? [cleanQuery, agentId, fetchLimit] : [cleanQuery, fetchLimit]
 
   const bm25Rows = cleanQuery
-    ? (db.prepare(`
+    ? (db
+        .prepare(`
         SELECT
           f.session_id,
           f.turn_idx,
@@ -435,10 +441,17 @@ export async function hybridSessionSearch(
         ${agentFilter}
         ORDER BY score
         LIMIT ?
-      `).all(...bm25Params) as Array<{
-        session_id: string; turn_idx: number; snippet: string; score: number
-        agent_id: string | null; channel: string | null; peer_id: string | null
-        title: string | null; last_at: number | null
+      `)
+        .all(...bm25Params) as Array<{
+        session_id: string
+        turn_idx: number
+        snippet: string
+        score: number
+        agent_id: string | null
+        channel: string | null
+        peer_id: string | null
+        title: string | null
+        last_at: number | null
       }>)
     : []
 
@@ -474,13 +487,21 @@ export async function hybridSessionSearch(
   }
 
   // 3. RRF fusion
-  const bm25Ids = bm25Deduped.map(r => r.session_id)
+  const bm25Ids = bm25Deduped.map((r) => r.session_id)
   const fused = reciprocalRankFusion(bm25Ids, vecSessionIds)
 
   // 4. Build metadata map from BM25 results
-  const metaMap = new Map<string, {
-    agentId: string; channel: string; peerId: string; title: string; lastAt: number; snippet: string
-  }>()
+  const metaMap = new Map<
+    string,
+    {
+      agentId: string
+      channel: string
+      peerId: string
+      title: string
+      lastAt: number
+      snippet: string
+    }
+  >()
   for (const r of bm25Deduped) {
     metaMap.set(r.session_id, {
       agentId: r.agent_id ?? 'unknown',
@@ -494,16 +515,23 @@ export async function hybridSessionSearch(
 
   // Load metadata for vector-only hits
   const missingSessionIds = fused
-    .filter(c => !metaMap.has(c.id))
-    .map(c => c.id)
+    .filter((c) => !metaMap.has(c.id))
+    .map((c) => c.id)
     .slice(0, limit)
 
   if (missingSessionIds.length > 0) {
     const placeholders = missingSessionIds.map(() => '?').join(',')
-    const rows = db.prepare(
-      `SELECT id, agent_id, channel, peer_id, title, last_at FROM sessions_meta WHERE id IN (${placeholders})`,
-    ).all(...missingSessionIds) as Array<{
-      id: string; agent_id: string; channel: string; peer_id: string; title: string | null; last_at: number
+    const rows = db
+      .prepare(
+        `SELECT id, agent_id, channel, peer_id, title, last_at FROM sessions_meta WHERE id IN (${placeholders})`,
+      )
+      .all(...missingSessionIds) as Array<{
+      id: string
+      agent_id: string
+      channel: string
+      peer_id: string
+      title: string | null
+      last_at: number
     }>
     for (const r of rows) {
       metaMap.set(r.id, {
@@ -517,7 +545,7 @@ export async function hybridSessionSearch(
     }
   }
 
-  return fused.slice(0, limit).map(c => {
+  return fused.slice(0, limit).map((c) => {
     const meta = metaMap.get(c.id)
     return {
       sessionId: c.id,

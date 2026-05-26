@@ -85,10 +85,7 @@ describe('CodexRunner platform context glue', () => {
     const tidIdx = resumed.indexOf('thr_xyz')
     const rcIdx = resumed.indexOf('-c')
     assert.ok(rcIdx >= 0 && rcIdx < tidIdx, 'resume: -c must precede threadId')
-    assert.ok(
-      tidIdx < resumed.lastIndexOf('-'),
-      'resume: threadId must precede stdin sentinel',
-    )
+    assert.ok(tidIdx < resumed.lastIndexOf('-'), 'resume: threadId must precede stdin sentinel')
 
     await runner.shutdown()
   })

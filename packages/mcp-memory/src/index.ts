@@ -23,26 +23,26 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
+  type EmbeddingProvider,
   MemoryStore,
   SkillStore,
   archivalAdd,
   archivalCount,
   archivalDelete,
-  indexTurn,
-  loadSessionTurns,
-  searchSessions,
-  upsertSessionMeta,
+  deleteArchivalVector,
+  getEmbeddingProvider,
+  getSessionsDb,
   // P1: Hybrid search (BM25 + Vector + RRF)
   hybridArchivalSearch,
   hybridSessionSearch,
-  recordAccess,
+  indexTurn,
   initVectorStore,
-  upsertArchivalVector,
-  deleteArchivalVector,
   isEmbeddingAvailable,
-  getEmbeddingProvider,
-  getSessionsDb,
-  type EmbeddingProvider,
+  loadSessionTurns,
+  recordAccess,
+  searchSessions,
+  upsertArchivalVector,
+  upsertSessionMeta,
 } from '@openclaude/storage'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
@@ -69,7 +69,9 @@ if (isEmbeddingAvailable()) {
       `[mcp-memory] embedding enabled: ${embeddingProvider.providerId}/${embeddingProvider.modelId} (${embeddingProvider.dimensions}d)\n`,
     )
   } catch (err: any) {
-    process.stderr.write(`[mcp-memory] embedding init failed (falling back to BM25-only): ${err?.message}\n`)
+    process.stderr.write(
+      `[mcp-memory] embedding init failed (falling back to BM25-only): ${err?.message}\n`,
+    )
     embeddingProvider = null
   }
 }
@@ -424,8 +426,10 @@ async function handleSessionSearch(args: {
   // Use hybrid search (BM25 + vector) when embedding is available, else BM25-only
   const hits = embeddingProvider
     ? await hybridSessionSearch(args.query, embeddingProvider, limit, searchAgentId)
-    : (await searchSessions(args.query, limit, searchAgentId)).map(h => ({
-        ...h, bm25Rank: null as number | null, vecRank: null as number | null,
+    : (await searchSessions(args.query, limit, searchAgentId)).map((h) => ({
+        ...h,
+        bm25Rank: null as number | null,
+        vecRank: null as number | null,
       }))
 
   if (hits.length === 0) {
@@ -568,7 +572,7 @@ async function handleArchivalSearch(args: { query: string; limit?: number }) {
   if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`)
 
   // Track access for lifecycle (non-blocking)
-  recordAccess(results.map(r => r.id)).catch(() => {})
+  recordAccess(results.map((r) => r.id)).catch(() => {})
 
   const mode = embeddingProvider ? 'hybrid (BM25+vector)' : 'BM25-only'
   const lines = results.map((r, i) => {
@@ -585,7 +589,9 @@ async function handleArchivalSearch(args: { query: string; limit?: number }) {
 
 async function handleArchivalDelete(args: { id: string }) {
   if (typeof args.id !== 'string' || args.id.trim() === '') {
-    return toolError('archival_delete requires a non-empty `id` string (from archival_search results)')
+    return toolError(
+      'archival_delete requires a non-empty `id` string (from archival_search results)',
+    )
   }
   const ok = await archivalDelete(AGENT_ID, args.id)
   if (!ok) return toolError(`Entry ${args.id} not found.`)

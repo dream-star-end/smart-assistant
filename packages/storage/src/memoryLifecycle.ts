@@ -42,17 +42,19 @@ async function ensureLifecycleSchema(): Promise<void> {
   `)
 
   const cols = db.pragma('table_info(archival)') as Array<{ name: string }>
-  if (!cols.some(c => c.name === 'access_count')) {
+  if (!cols.some((c) => c.name === 'access_count')) {
     db.exec('ALTER TABLE archival ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0')
   }
-  if (!cols.some(c => c.name === 'last_accessed')) {
+  if (!cols.some((c) => c.name === 'last_accessed')) {
     db.exec("ALTER TABLE archival ADD COLUMN last_accessed TEXT DEFAULT ''")
   }
 
   // Verify both columns now exist before marking as migrated
   const updatedCols = db.pragma('table_info(archival)') as Array<{ name: string }>
-  if (updatedCols.some(c => c.name === 'access_count') &&
-      updatedCols.some(c => c.name === 'last_accessed')) {
+  if (
+    updatedCols.some((c) => c.name === 'access_count') &&
+    updatedCols.some((c) => c.name === 'last_accessed')
+  ) {
     _migrated = true
   }
 }
@@ -70,7 +72,10 @@ export function resetLifecycleState(): void {
  * so we use the same format for last_accessed and cutoff comparisons.
  */
 function sqliteDatetime(date: Date): string {
-  return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+  return date
+    .toISOString()
+    .replace('T', ' ')
+    .replace(/\.\d+Z$/, '')
 }
 
 // ── Access Tracking ──────────────────────────────
@@ -127,13 +132,15 @@ export async function decayAccess(options: DecayOptions): Promise<number> {
 
   const cutoff = sqliteDatetime(new Date(Date.now() - inactiveDays * 86_400_000))
 
-  const result = db.prepare(`
+  const result = db
+    .prepare(`
     UPDATE archival
     SET access_count = MAX(0, access_count - ?)
     WHERE agent_id = ?
       AND access_count > 0
       AND (last_accessed < ? OR last_accessed = '')
-  `).run(decayAmount, options.agentId, cutoff)
+  `)
+    .run(decayAmount, options.agentId, cutoff)
 
   return result.changes
 }
@@ -190,13 +197,13 @@ export async function cleanupArchival(options: CleanupOptions): Promise<CleanupR
   `)
 
   const result = db.transaction(() => {
-    const candidates = selectStmt.all(
-      options.agentId, minAccess, cutoff, maxDeletes,
-    ) as Array<{ id: string }>
+    const candidates = selectStmt.all(options.agentId, minAccess, cutoff, maxDeletes) as Array<{
+      id: string
+    }>
 
     if (candidates.length === 0) return { deletedCount: 0, deletedIds: [] as string[] }
 
-    const ids = candidates.map(c => c.id)
+    const ids = candidates.map((c) => c.id)
     const placeholders = ids.map(() => '?').join(',')
 
     // Re-check predicates in DELETE for safety against concurrent access
@@ -206,11 +213,13 @@ export async function cleanupArchival(options: CleanupOptions): Promise<CleanupR
 
     // Query which IDs were actually deleted (no longer in the table)
     const surviving = new Set(
-      (db.prepare(
-        `SELECT id FROM archival WHERE id IN (${placeholders})`,
-      ).all(...ids) as Array<{ id: string }>).map(r => r.id),
+      (
+        db.prepare(`SELECT id FROM archival WHERE id IN (${placeholders})`).all(...ids) as Array<{
+          id: string
+        }>
+      ).map((r) => r.id),
     )
-    const actuallyDeleted = ids.filter(id => !surviving.has(id))
+    const actuallyDeleted = ids.filter((id) => !surviving.has(id))
 
     return { deletedCount: actuallyDeleted.length, deletedIds: actuallyDeleted }
   })()
@@ -243,7 +252,8 @@ export async function getLifecycleStats(agentId: string): Promise<LifecycleStats
   const thirtyDaysAgo = sqliteDatetime(new Date(Date.now() - 30 * 86_400_000))
   const sixtyDaysAgo = sqliteDatetime(new Date(Date.now() - 60 * 86_400_000))
 
-  const row = db.prepare(`
+  const row = db
+    .prepare(`
     SELECT
       COUNT(*) as total,
       COALESCE(SUM(CASE WHEN access_count = 0 THEN 1 ELSE 0 END), 0) as never_accessed,
@@ -252,7 +262,8 @@ export async function getLifecycleStats(agentId: string): Promise<LifecycleStats
       COALESCE(SUM(CASE WHEN access_count = 0 AND created_at < ? THEN 1 ELSE 0 END), 0) as cleanup_candidates
     FROM archival
     WHERE agent_id = ?
-  `).get(thirtyDaysAgo, sixtyDaysAgo, agentId) as {
+  `)
+    .get(thirtyDaysAgo, sixtyDaysAgo, agentId) as {
     total: number
     never_accessed: number
     recently_accessed: number

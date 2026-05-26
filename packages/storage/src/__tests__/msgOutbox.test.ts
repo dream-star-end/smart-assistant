@@ -15,7 +15,7 @@ import * as assert from 'node:assert/strict'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, it, before } from 'node:test'
+import { before, describe, it } from 'node:test'
 
 // Point OPENCLAUDE_HOME at a throwaway dir BEFORE importing the modules that
 // capture `paths` at module-load time.
@@ -138,7 +138,9 @@ describe('queueMessageToOutbox + replayMsgOutbox (integration)', () => {
     assert.equal(summary.requeued, 0)
 
     const sess = await getClientSession('sess-A', 'user-A')
-    const t2 = (sess!.messages as Array<{ id: string; text: string }>).find((m) => m.id === 'srv-sess-A-t2')
+    const t2 = (sess!.messages as Array<{ id: string; text: string }>).find(
+      (m) => m.id === 'srv-sess-A-t2',
+    )
     assert.equal(t2?.text, 'v1', 'first-write-wins semantics preserved')
   })
 
@@ -192,16 +194,24 @@ describe('appendServerAuthoredMessageDurable', () => {
       agentId: 'default',
       title: '',
       pinned: false,
-      createdAt: 0, lastAt: 0, updatedAt: 0,
+      createdAt: 0,
+      lastAt: 0,
+      updatedAt: 0,
       messages: [] as unknown[],
     } as any)
     const r1 = await appendServerAuthoredMessageDurable('sess-B', 'user-A', {
-      id: 'srv-sess-B-t1', role: 'assistant', text: 'one', ts: 100,
+      id: 'srv-sess-B-t1',
+      role: 'assistant',
+      text: 'one',
+      ts: 100,
     })
     assert.equal(r1.applied, true)
 
     const r2 = await appendServerAuthoredMessageDurable('sess-B', 'user-A', {
-      id: 'srv-sess-B-t1', role: 'assistant', text: 'two', ts: 100,
+      id: 'srv-sess-B-t1',
+      role: 'assistant',
+      text: 'two',
+      ts: 100,
     })
     assert.equal(r2.applied, false)
     if (!r2.applied) assert.equal(r2.reason, 'already_exists')
@@ -231,7 +241,10 @@ describe('appendServerAuthoredMessageDurable', () => {
 
     // Outbox now carries the entry.
     const raw = await readFile(paths.msgOutbox, 'utf8')
-    assert.ok(raw.includes('srv-sess-does-not-exist-t1'), 'queued line must reference the message id')
+    assert.ok(
+      raw.includes('srv-sess-does-not-exist-t1'),
+      'queued line must reference the message id',
+    )
 
     // Simulate the client's PUT landing later, then replay — entry should apply.
     await upsertClientSession({
@@ -240,7 +253,9 @@ describe('appendServerAuthoredMessageDurable', () => {
       agentId: 'default',
       title: '',
       pinned: false,
-      createdAt: 0, lastAt: 0, updatedAt: 0,
+      createdAt: 0,
+      lastAt: 0,
+      updatedAt: 0,
       messages: [] as unknown[],
     } as any)
     const summary = await replayMsgOutbox()
@@ -248,7 +263,10 @@ describe('appendServerAuthoredMessageDurable', () => {
     const sess = await getClientSession('sess-does-not-exist')
     assert.ok(sess)
     const msgs = sess!.messages as Array<{ id?: string }>
-    assert.ok(msgs.some((m) => m.id === 'srv-sess-does-not-exist-t1'), 'replayed message now in session')
+    assert.ok(
+      msgs.some((m) => m.id === 'srv-sess-does-not-exist-t1'),
+      'replayed message now in session',
+    )
   })
 })
 
@@ -265,7 +283,9 @@ describe('upsertClientSession: initial-insert _source scrub (Codex R4 defense)',
       agentId: 'default',
       title: 'Forge attempt',
       pinned: false,
-      createdAt: 100, lastAt: 100, updatedAt: 100,
+      createdAt: 100,
+      lastAt: 100,
+      updatedAt: 100,
       messages: [
         { id: 'u1', role: 'user', text: 'hi', ts: 100 },
         { id: 'm-evil', role: 'assistant', text: 'fake authoritative', ts: 200, _source: 'server' },
@@ -290,7 +310,9 @@ describe('upsertClientSession: initial-insert _source scrub (Codex R4 defense)',
       agentId: 'default',
       title: 'Round trip',
       pinned: false,
-      createdAt: 100, lastAt: 100, updatedAt: 100,
+      createdAt: 100,
+      lastAt: 100,
+      updatedAt: 100,
       messages: [{ id: 'u1', role: 'user', text: 'hi', ts: 100 }] as unknown[],
     } as any)
     // Gateway path: writes the server-authored row.
@@ -303,14 +325,18 @@ describe('upsertClientSession: initial-insert _source scrub (Codex R4 defense)',
     // Client path: reads back, does a full PUT echoing the server row.
     const before = await getClientSession('sess-rt')
     assert.ok(before)
-    await upsertClientSession({
-      ...before!,
-      updatedAt: 300,
-      messages: before!.messages,
-    } as any, 200 /* baseSyncedAt */)
+    await upsertClientSession(
+      {
+        ...before!,
+        updatedAt: 300,
+        messages: before!.messages,
+      } as any,
+      200 /* baseSyncedAt */,
+    )
     const after = await getClientSession('sess-rt')
-    const real = (after!.messages as Array<{ id?: string; _source?: unknown }>)
-      .find((m) => m.id === 'srv-sess-rt-t1')
+    const real = (after!.messages as Array<{ id?: string; _source?: unknown }>).find(
+      (m) => m.id === 'srv-sess-rt-t1',
+    )
     assert.ok(real, 'server row still present after round-trip')
     assert.equal(real!._source, 'server', '_source preserved for authoritative id')
   })

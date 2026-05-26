@@ -80,7 +80,7 @@ async function saveTaskFile(file: TaskFile): Promise<void> {
       file.executions = file.executions.slice(-MAX_EXECUTIONS)
     }
     // Atomic write: temp file + rename
-    const tmp = TASK_FILE + '.tmp'
+    const tmp = `${TASK_FILE}.tmp`
     await writeFile(tmp, JSON.stringify(file, null, 2))
     const { rename } = await import('node:fs/promises')
     await rename(tmp, TASK_FILE)

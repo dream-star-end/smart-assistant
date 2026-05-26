@@ -59,7 +59,12 @@ import {
 import { initSpeech, setAutoResize, toggleVoice } from './speech.js'
 
 // ── Notifications ──
-import { maybeNotify, refreshDocumentTitle, requestNotifyPermission, setTitleBusy } from './notifications.js'
+import {
+  maybeNotify,
+  refreshDocumentTitle,
+  requestNotifyPermission,
+  setTitleBusy,
+} from './notifications.js'
 
 // ── OAuth ──
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
@@ -129,8 +134,8 @@ import {
   addMessage,
   addSystemMessage,
   buildToolUseLabel,
-  completeBgTask,
   clearTurnTiming,
+  completeBgTask,
   connect,
   formatMeta,
   handleOutbound,
@@ -357,11 +362,14 @@ function updateSyncIndicator(status) {
   if (detail) detail.textContent = status.detail || ''
 
   if (status.state === 'synced' || status.state === 'error') {
-    _syncBannerTimer = setTimeout(() => {
-      banner.classList.remove('syncing', 'synced', 'error')
-      banner.classList.add('idle')
-      banner.setAttribute('aria-hidden', 'true')
-    }, status.state === 'error' ? 4500 : 1800)
+    _syncBannerTimer = setTimeout(
+      () => {
+        banner.classList.remove('syncing', 'synced', 'error')
+        banner.classList.add('idle')
+        banner.setAttribute('aria-hidden', 'true')
+      },
+      status.state === 'error' ? 4500 : 1800,
+    )
   }
 }
 // ── Global error handlers ──
@@ -412,7 +420,7 @@ function _showErrorToastOnce(errLike, msg) {
   _errorToastHistory.set(sig, now)
   // Light cap on map size so long-running tabs don't grow it unbounded.
   if (_errorToastHistory.size > 64) {
-    const oldest = [...(_errorToastHistory.entries())].sort((a, b) => a[1] - b[1])[0]
+    const oldest = [..._errorToastHistory.entries()].sort((a, b) => a[1] - b[1])[0]
     if (oldest) _errorToastHistory.delete(oldest[0])
   }
   toast(`出错了: ${sig}`, 'error')
@@ -431,10 +439,11 @@ window.addEventListener('unhandledrejection', (ev) => {
   const reason = ev.reason
   // Prefer Error.message, fall back to String(reason). Some code rejects with
   // a plain object {error: "..."} — dig a level.
-  const msg = reason?.message
-    || reason?.error
-    || (typeof reason === 'string' ? reason : null)
-    || '未处理的异步错误'
+  const msg =
+    reason?.message ||
+    reason?.error ||
+    (typeof reason === 'string' ? reason : null) ||
+    '未处理的异步错误'
   console.error('[unhandled rejection]', reason)
   _showErrorToastOnce(reason, msg)
 })
@@ -746,17 +755,18 @@ function send() {
   const userMsg = addMessage(sess, 'user', displayText, {
     status: 'sending',
     _media: media.length > 0 ? media : undefined,
-    _modelText: modelText !== text ? modelText : undefined,  // Full text with attachments for replay
+    _modelText: modelText !== text ? modelText : undefined, // Full text with attachments for replay
   })
   sess._streamingAssistant = null
   sess._streamingThinking = null
   sess._blockIdToMsgId = new Map()
-  sess._agentSwitchedAt = null  // Clear switch guard — new send is intentional
+  sess._agentSwitchedAt = null // Clear switch guard — new send is intentional
   // If offline queue is draining or pending for this session, route through queue
   // to prevent message reordering (new msg arriving before old queued ones)
-  const _hasQueuedForSess = (state.offlineQueue?.some(i => i.sessId === sess.id)) ||
-    (state._offlineQueuePending?.some(i => i.sessId === sess.id)) ||
-    (state._offlineDrainingCurrent?.sessId === sess.id)
+  const _hasQueuedForSess =
+    state.offlineQueue?.some((i) => i.sessId === sess.id) ||
+    state._offlineQueuePending?.some((i) => i.sessId === sess.id) ||
+    state._offlineDrainingCurrent?.sessId === sess.id
   if (state.ws && state.ws.readyState === 1 && !_hasQueuedForSess) {
     state.ws.send(JSON.stringify(wsPayload))
     userMsg.status = 'sent'
@@ -1051,13 +1061,19 @@ async function _forceLogout({ serverLogout } = {}) {
     }).catch(() => {})
   }
   localStorage.removeItem('openclaude_token')
-  state.token = ''  // Clear token BEFORE close so onclose handler won't auto-reconnect
+  state.token = '' // Clear token BEFORE close so onclose handler won't auto-reconnect
   // Rearm the auth-expired one-shot so a future session expiry can trigger
   // the logout flow again. login success also does this, but doing it here
   // too keeps the semantics symmetric across both teardown paths.
   resetAuthExpired()
-  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
-  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer)
+    state.reconnectTimer = null
+  }
+  if (state.reconnectCountdown) {
+    clearInterval(state.reconnectCountdown)
+    state.reconnectCountdown = null
+  }
   // Clear all in-memory session data and offline queues to prevent cross-identity leakage
   state.sessions.clear()
   state.currentSessionId = null
@@ -1240,8 +1256,14 @@ function showMigrateModal(sessions) {
   for (const s of sessions) {
     const item = document.createElement('label')
     item.className = 'migrate-item'
-    item.style.cssText = 'display:flex;gap:var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--border);cursor:pointer;align-items:flex-start'
-    const date = new Date(s.lastAt).toLocaleString('zh-CN', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
+    item.style.cssText =
+      'display:flex;gap:var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--border);cursor:pointer;align-items:flex-start'
+    const date = new Date(s.lastAt).toLocaleString('zh-CN', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
     item.innerHTML = `
       <input type="checkbox" data-sid="${htmlSafeEscape(s.id)}" style="margin-top:3px;flex-shrink:0">
       <div style="flex:1;min-width:0">
@@ -1324,7 +1346,9 @@ function openChangelog() {
   if (!_changelogData || !_changelogData.releases?.length) {
     content.innerHTML = '<p style="color:var(--fg-muted);text-align:center">暂无更新记录</p>'
   } else {
-    content.innerHTML = _changelogData.releases.map((r, i) => `
+    content.innerHTML = _changelogData.releases
+      .map(
+        (r, i) => `
       <div class="changelog-entry${i === 0 ? ' latest' : ''}">
         <div class="changelog-entry-head">
           <span class="changelog-version-tag">v${htmlSafeEscape(r.version)}</span>
@@ -1332,10 +1356,12 @@ function openChangelog() {
         </div>
         <h4 class="changelog-title">${htmlSafeEscape(r.title)}</h4>
         <ul class="changelog-list">
-          ${r.highlights.map(h => `<li>${htmlSafeEscape(h)}</li>`).join('')}
+          ${r.highlights.map((h) => `<li>${htmlSafeEscape(h)}</li>`).join('')}
         </ul>
       </div>
-    `).join('')
+    `,
+      )
+      .join('')
     versionEl.textContent = `当前版本 v${_changelogData.currentVersion}`
   }
   // Mark as seen (scoped by user token)
@@ -1374,7 +1400,7 @@ async function openProxyModal() {
     input.value = value
     input.dataset.initial = value
   } catch (err) {
-    toast('读取代理配置失败: ' + String(err), 'error')
+    toast(`读取代理配置失败: ${String(err)}`, 'error')
   }
   setTimeout(() => input.focus(), 50)
 }
@@ -1398,7 +1424,8 @@ async function submitFeedback() {
   if (desc.length < FEEDBACK_MIN_CHARS) {
     const clarifyEl = $('feedback-clarify')
     const textEl = $('feedback-clarify-text')
-    const msg = FEEDBACK_CLARIFY_MESSAGES[Math.floor(Math.random() * FEEDBACK_CLARIFY_MESSAGES.length)]
+    const msg =
+      FEEDBACK_CLARIFY_MESSAGES[Math.floor(Math.random() * FEEDBACK_CLARIFY_MESSAGES.length)]
     textEl.textContent = msg
     clarifyEl.hidden = false
     $('feedback-desc').focus()
@@ -1427,7 +1454,7 @@ async function submitFeedback() {
       toast(resp.error || '提交失败', 'error')
     }
   } catch (err) {
-    toast('提交失败: ' + String(err), 'error')
+    toast(`提交失败: ${String(err)}`, 'error')
   } finally {
     btn.disabled = false
     btn.textContent = '提交反馈'
@@ -1573,7 +1600,10 @@ async function init() {
     // a new user message on the switched-to agent.
     resetReplyTracker(sess)
     clearTurnTiming(sess)
-    if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
+    if (sess._regenSafetyTimer) {
+      clearTimeout(sess._regenSafetyTimer)
+      sess._regenSafetyTimer = null
+    }
     state.sendingInFlight = false
     hideTypingIndicator()
     updateSendEnabled()
@@ -1810,17 +1840,19 @@ async function init() {
       reloadAgents()
       loadChangelog()
       // Pull sessions from server for this user (cross-device sync)
-      syncSessionsFromServer().then((result) => {
-        const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
-        if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
-          state.currentSessionId = updated[0]?.id || null
-          if (!state.currentSessionId) createSession()
-          renderMessages()
-        } else if (result?.needsRenderMessages) {
-          renderMessages()
-        }
-        renderSidebar()
-      }).catch(() => {})
+      syncSessionsFromServer()
+        .then((result) => {
+          const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+          if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+            state.currentSessionId = updated[0]?.id || null
+            if (!state.currentSessionId) createSession()
+            renderMessages()
+          } else if (result?.needsRenderMessages) {
+            renderMessages()
+          }
+          renderSidebar()
+        })
+        .catch(() => {})
       // Check for unclaimed sessions to migrate
       checkUnclaimedSessions()
     } catch {
@@ -1923,28 +1955,30 @@ async function init() {
     reloadAgents()
     loadChangelog()
     // Cross-device sync: pull sessions from server in background
-    syncSessionsFromServer().then((result) => {
-      // Re-render if sessions changed (added or removed) or current session was updated
-      const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
-      let currentChanged = false
-      if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
-        state.currentSessionId = updated[0]?.id || null
-        if (!state.currentSessionId) createSession()
-        currentChanged = true
-        renderMessages()
-      } else if (result?.needsRenderMessages) {
-        renderMessages()
-      }
-      // Sync the typing indicator / title-busy state if the current session
-      // was swapped or re-fetched (sync may have replaced the session object
-      // with a fresh one whose persisted turn-state differs from what the
-      // UI is showing). This is the sync-path counterpart to the initial
-      // boot-time restore above.
-      if (currentChanged || result?.needsRenderMessages) {
-        restoreCurrentSessionInFlightUI()
-      }
-      renderSidebar()
-    }).catch(() => {})
+    syncSessionsFromServer()
+      .then((result) => {
+        // Re-render if sessions changed (added or removed) or current session was updated
+        const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+        let currentChanged = false
+        if (!state.currentSessionId || !state.sessions.has(state.currentSessionId)) {
+          state.currentSessionId = updated[0]?.id || null
+          if (!state.currentSessionId) createSession()
+          currentChanged = true
+          renderMessages()
+        } else if (result?.needsRenderMessages) {
+          renderMessages()
+        }
+        // Sync the typing indicator / title-busy state if the current session
+        // was swapped or re-fetched (sync may have replaced the session object
+        // with a fresh one whose persisted turn-state differs from what the
+        // UI is showing). This is the sync-path counterpart to the initial
+        // boot-time restore above.
+        if (currentChanged || result?.needsRenderMessages) {
+          restoreCurrentSessionInFlightUI()
+        }
+        renderSidebar()
+      })
+      .catch(() => {})
   } else {
     showLogin()
   }

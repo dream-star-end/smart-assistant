@@ -51,11 +51,16 @@ function _escapeLatex(s) {
     .replace(/_/g, '\\_')
     .replace(/~/g, '\u0001TI\u0001')
     .replace(/\^/g, '\u0001CI\u0001')
-    .replace(/\u0001LB\u0001/g, '\\{')
-    .replace(/\u0001RB\u0001/g, '\\}')
-    .replace(/\u0001BS\u0001/g, '\\textbackslash{}')
-    .replace(/\u0001TI\u0001/g, '\\textasciitilde{}')
-    .replace(/\u0001CI\u0001/g, '\\textasciicircum{}')
+    .split('\u0001LB\u0001')
+    .join('\\{')
+    .split('\u0001RB\u0001')
+    .join('\\}')
+    .split('\u0001BS\u0001')
+    .join('\\textbackslash{}')
+    .split('\u0001TI\u0001')
+    .join('\\textasciitilde{}')
+    .split('\u0001CI\u0001')
+    .join('\\textasciicircum{}')
 }
 
 // ── 行内转换:保留 $...$ 和 `...` 原样,其它部分先处理链接占位,再转义再处理 **/* ──
@@ -87,7 +92,7 @@ function _parseMarkdownLink(src, openIdx) {
   // 平衡 ()
   let depth = 1
   let j = txtEnd + 2
-  let urlStart = j
+  const urlStart = j
   while (j < src.length) {
     const c = src[j]
     if (c === '\n') return null
@@ -212,7 +217,11 @@ function _renderInlineV2(text) {
       // 还原链接:URL 用 \detokenize 最稳(hyperref 保证特殊字符按字面展开),
       // 可显式失败在 & ^ 等 —— detokenize 后这些字符需要 catcode other,hyperref 会处理。
       // 文本保持转义后状态,不能再跑一遍 _escapeLatex(会把已转义的 \_ 再转一次)。
-      s = s.replace(/\u0000LINK(\d+)\u0000/g, (_mm, i) => {
+      const linkTokenRe = new RegExp(
+        `${String.fromCharCode(0)}LINK(\\d+)${String.fromCharCode(0)}`,
+        'g',
+      )
+      s = s.replace(linkTokenRe, (_mm, i) => {
         const { text: linkTxt, url } = linkStore[Number(i)]
         const safeUrl = url.trim()
         // detokenize 里不能有未配对 {},做最小保险 —— 极端情况退回转义形式
@@ -236,14 +245,14 @@ function _emitTable(headerCells, rows) {
   const lines = []
   lines.push(`\\begin{longtable}{| ${colSpec} |}`)
   lines.push('\\hline')
-  lines.push(headerCells.map((c) => `\\textbf{${_renderInlineV2(c.trim())}}`).join(' & ') + ' \\\\')
+  lines.push(`${headerCells.map((c) => `\\textbf{${_renderInlineV2(c.trim())}}`).join(' & ')} \\\\`)
   lines.push('\\hline')
   lines.push('\\endhead')
   for (const row of rows) {
     // 行短于 header 时补空格;行长于 header 时截断
     const cells = row.slice(0, colCount)
     while (cells.length < colCount) cells.push('')
-    lines.push(cells.map((c) => _renderInlineV2(c.trim())).join(' & ') + ' \\\\')
+    lines.push(`${cells.map((c) => _renderInlineV2(c.trim())).join(' & ')} \\\\`)
     lines.push('\\hline')
   }
   lines.push('\\end{longtable}')
@@ -440,10 +449,10 @@ function _mdToLatexBody(md) {
       if (lang) {
         // lstlisting 支持的语言有限;不认识的 language 选项会让 pdflatex 报错。
         // 保险做法:统一用 basicstyle + 不指定 language,靠注释标注原语言。
-        out.push(`\\begin{lstlisting}[basicstyle=\\ttfamily\\small,breaklines=true]`)
+        out.push('\\begin{lstlisting}[basicstyle=\\ttfamily\\small,breaklines=true]')
         out.push(`% language: ${lang}`)
         out.push(...codeLines)
-        out.push(`\\end{lstlisting}`)
+        out.push('\\end{lstlisting}')
       } else {
         out.push('\\begin{verbatim}')
         out.push(...codeLines)
@@ -514,11 +523,7 @@ function _mdToLatexBody(md) {
     }
 
     // 4) table — 表头不强求前导 |,只要有 | 且下一行是对齐分隔
-    if (
-      _looksLikeTableHeader(line) &&
-      i + 1 < lines.length &&
-      _isTableSeparator(lines[i + 1])
-    ) {
+    if (_looksLikeTableHeader(line) && i + 1 < lines.length && _isTableSeparator(lines[i + 1])) {
       flushParagraph(paragraphBuf)
       paragraphBuf = []
       const header = _splitTableRow(line)
@@ -669,7 +674,7 @@ export function exportMessageTex(msg, opts = {}) {
     _triggerDownload(tex, `${safeTitle}-${_ts()}.tex`)
   } catch (e) {
     console.error('exportMessageTex failed', e)
-    toast('TeX 导出失败: ' + (e?.message || e), 'error')
+    toast(`TeX 导出失败: ${e?.message || e}`, 'error')
   }
 }
 
@@ -700,6 +705,6 @@ export function exportSessionTex(sess) {
     toast('已导出 TeX', 'success')
   } catch (e) {
     console.error('exportSessionTex failed', e)
-    toast('TeX 导出失败: ' + (e?.message || e), 'error')
+    toast(`TeX 导出失败: ${e?.message || e}`, 'error')
   }
 }

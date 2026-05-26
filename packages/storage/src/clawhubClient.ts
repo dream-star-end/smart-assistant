@@ -10,8 +10,7 @@
  * No authentication required for read-only operations (search/download).
  */
 
-export const CLAWHUB_REGISTRY =
-  process.env.CLAWHUB_REGISTRY || 'https://clawhub.ai'
+export const CLAWHUB_REGISTRY = process.env.CLAWHUB_REGISTRY || 'https://clawhub.ai'
 
 export interface HubSearchResult {
   slug: string
@@ -62,14 +61,11 @@ async function hubFetch<T>(path: string, timeout = 15_000): Promise<T> {
 /**
  * Search ClawHub for skills matching a query.
  */
-export async function hubSearch(
-  query: string,
-  limit = 10,
-): Promise<HubSearchResult[]> {
+export async function hubSearch(query: string, limit = 10): Promise<HubSearchResult[]> {
   const params = new URLSearchParams({ q: query, limit: String(limit) })
   const data = await hubFetch<any>(`/api/v1/search?${params}`)
   // Normalize: API may return { results: [...] } or array directly
-  const results: any[] = Array.isArray(data) ? data : data.results ?? data.skills ?? []
+  const results: any[] = Array.isArray(data) ? data : (data.results ?? data.skills ?? [])
   return results.slice(0, limit).map((r: any) => ({
     slug: r.slug ?? r.name,
     displayName: r.displayName ?? r.display_name ?? r.slug ?? r.name,
@@ -82,10 +78,7 @@ export async function hubSearch(
 /**
  * Resolve a skill slug to its latest version metadata.
  */
-export async function hubResolve(
-  slug: string,
-  version?: string,
-): Promise<HubResolveResult> {
+export async function hubResolve(slug: string, version?: string): Promise<HubResolveResult> {
   const params = new URLSearchParams({ slug })
   if (version) params.set('version', version)
   return hubFetch<HubResolveResult>(`/api/v1/resolve?${params}`)
@@ -101,10 +94,7 @@ export async function hubDetail(slug: string): Promise<HubSkillDetail> {
 /**
  * Download a skill zip and return the raw Buffer.
  */
-export async function hubDownload(
-  slug: string,
-  version?: string,
-): Promise<Buffer> {
+export async function hubDownload(slug: string, version?: string): Promise<Buffer> {
   const params = new URLSearchParams({ slug })
   if (version) params.set('version', version)
   const url = `${CLAWHUB_REGISTRY}/api/v1/download?${params}`

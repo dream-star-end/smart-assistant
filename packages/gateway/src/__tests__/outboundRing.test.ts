@@ -40,7 +40,8 @@ describe('OutboundRingBuffer.nextSeq / store', () => {
 describe('OutboundRingBuffer.peekReplay', () => {
   it('returns no-op success when client is caught up', () => {
     const r = new OutboundRingBuffer()
-    const s = r.nextSeq('s1'); r.store('s1', s, 1000, frame(s))
+    const s = r.nextSeq('s1')
+    r.store('s1', s, 1000, frame(s))
     const rep = r.peekReplay('s1', 1)
     assert.equal(rep.ok, true)
     if (!rep.ok) return
@@ -51,26 +52,34 @@ describe('OutboundRingBuffer.peekReplay', () => {
   it('replays all frames after cursor', () => {
     const r = new OutboundRingBuffer()
     for (let i = 1; i <= 5; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     // Pass `now` close to the stored ts so the P1-2 age-prune on read
     // doesn't evict the synthetic test frames (default maxAgeMs = 10min).
     const rep = r.peekReplay('s1', 2, 1005)
     assert.equal(rep.ok, true)
     if (!rep.ok) return
-    assert.deepEqual(rep.sent.map((f) => f.seq), [3, 4, 5])
+    assert.deepEqual(
+      rep.sent.map((f) => f.seq),
+      [3, 4, 5],
+    )
     assert.equal(rep.to, 5)
   })
 
   it('fromSeq=0 returns the whole buffer (full replay)', () => {
     const r = new OutboundRingBuffer()
     for (let i = 1; i <= 3; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     const rep = r.peekReplay('s1', 0, 1003)
     assert.equal(rep.ok, true)
     if (!rep.ok) return
-    assert.deepEqual(rep.sent.map((f) => f.seq), [1, 2, 3])
+    assert.deepEqual(
+      rep.sent.map((f) => f.seq),
+      [1, 2, 3],
+    )
   })
 
   it('no_buffer: session never had frames + non-zero cursor = miss', () => {
@@ -90,7 +99,8 @@ describe('OutboundRingBuffer.peekReplay', () => {
 
   it('sequence_mismatch: client cursor ahead of server last', () => {
     const r = new OutboundRingBuffer()
-    const s = r.nextSeq('s1'); r.store('s1', s, 1000, frame(s))
+    const s = r.nextSeq('s1')
+    r.store('s1', s, 1000, frame(s))
     const rep = r.peekReplay('s1', 42, 1000)
     assert.equal(rep.ok, false)
     if (rep.ok) return
@@ -102,7 +112,8 @@ describe('OutboundRingBuffer.peekReplay', () => {
     const r = new OutboundRingBuffer({ maxEntries: 3, maxAgeMs: 1e9, maxBytes: 1e9 })
     // Push 6 frames — ring can only hold 3, so seqs 1/2/3 are pruned.
     for (let i = 1; i <= 6; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     assert.equal(r.size('s1'), 3, 'ring capped at 3')
     assert.equal(r.lastFrameSeq('s1'), 6)
@@ -118,13 +129,17 @@ describe('OutboundRingBuffer.peekReplay', () => {
   it('cursor exactly at ring-earliest minus 1 is ok (no gap)', () => {
     const r = new OutboundRingBuffer({ maxEntries: 3, maxAgeMs: 1e9, maxBytes: 1e9 })
     for (let i = 1; i <= 5; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     // Ring holds seqs 3,4,5; client at 2 should be replayable (3,4,5 fresh).
     const rep = r.peekReplay('s1', 2, 1005)
     assert.equal(rep.ok, true)
     if (!rep.ok) return
-    assert.deepEqual(rep.sent.map((f) => f.seq), [3, 4, 5])
+    assert.deepEqual(
+      rep.sent.map((f) => f.seq),
+      [3, 4, 5],
+    )
   })
 
   it('P1-2 (tightened): fromSeq=0 + currentLast>0 + empty ring reports no_buffer', () => {
@@ -135,7 +150,8 @@ describe('OutboundRingBuffer.peekReplay', () => {
     // so the client REST-syncs authoritative state.
     const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
     for (let i = 1; i <= 3; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     // Prune-on-read at now=2000 evicts everything (cutoff = 2000-100 = 1900).
     const rep = r.peekReplay('s1', 0, 2000)
@@ -149,7 +165,8 @@ describe('OutboundRingBuffer.peekReplay', () => {
     // Short maxAge so the scenario is easy to construct without Date.now fiddling.
     const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
     for (let i = 1; i <= 3; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     assert.equal(r.size('s1'), 3, 'all frames present after store')
 
@@ -172,7 +189,8 @@ describe('OutboundRingBuffer pruning', () => {
   it('prunes by maxEntries', () => {
     const r = new OutboundRingBuffer({ maxEntries: 2, maxAgeMs: 1e9, maxBytes: 1e9 })
     for (let i = 1; i <= 5; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     assert.equal(r.size('s1'), 2)
     assert.equal(r.lastFrameSeq('s1'), 5, 'lastSeq not affected by prune')
@@ -180,12 +198,18 @@ describe('OutboundRingBuffer pruning', () => {
 
   it('prunes by maxAgeMs', () => {
     const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
-    const s1 = r.nextSeq('s1'); r.store('s1', s1, 0,   frame(s1))
-    const s2 = r.nextSeq('s1'); r.store('s1', s2, 150, frame(s2)) // cutoff = 150-100 = 50 → frame1 (ts=0) evicted
+    const s1 = r.nextSeq('s1')
+    r.store('s1', s1, 0, frame(s1))
+    const s2 = r.nextSeq('s1')
+    r.store('s1', s2, 150, frame(s2)) // cutoff = 150-100 = 50 → frame1 (ts=0) evicted
     assert.equal(r.size('s1'), 1)
     // Read at now=150: cutoff=50, frame2 (ts=150) survives.
     const rep = r.peekReplay('s1', 0, 150)
-    assert.equal(rep.ok, false, 'fromSeq=0 past the earliest still-buffered frame (2) → buffer_miss')
+    assert.equal(
+      rep.ok,
+      false,
+      'fromSeq=0 past the earliest still-buffered frame (2) → buffer_miss',
+    )
     if (rep.ok) return
     assert.equal(rep.reason, 'buffer_miss')
     assert.equal(rep.to, 2)
@@ -195,7 +219,8 @@ describe('OutboundRingBuffer pruning', () => {
     // Each frame is ~25+ bytes — set cap so only the last 2 fit.
     const r = new OutboundRingBuffer({ maxEntries: 100, maxAgeMs: 1e9, maxBytes: 80 })
     for (let i = 1; i <= 5; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     assert.ok(r.size('s1') < 5, `ring should be pruned, got ${r.size('s1')}`)
     assert.ok(r.bytes('s1') <= 80, `totalBytes should respect cap, got ${r.bytes('s1')}`)
@@ -203,7 +228,8 @@ describe('OutboundRingBuffer pruning', () => {
 
   it('clear() drops both ring and lastSeq (enables fresh session)', () => {
     const r = new OutboundRingBuffer()
-    const s = r.nextSeq('s1'); r.store('s1', s, 1000, frame(s))
+    const s = r.nextSeq('s1')
+    r.store('s1', s, 1000, frame(s))
     r.clear('s1')
     assert.equal(r.size('s1'), 0)
     assert.equal(r.lastFrameSeq('s1'), 0)
@@ -215,10 +241,13 @@ describe('OutboundRingBuffer pruning', () => {
 describe('OutboundRingBuffer eviction stats', () => {
   it('store() reports `entries` cause when ring exceeds maxEntries', () => {
     const r = new OutboundRingBuffer({ maxEntries: 2, maxAgeMs: 1e9, maxBytes: 1e9 })
-    const s1 = r.nextSeq('s1'); assert.deepEqual(r.store('s1', s1, 1000, frame(s1)), { entries: 0, age: 0, bytes: 0 })
-    const s2 = r.nextSeq('s1'); assert.deepEqual(r.store('s1', s2, 1001, frame(s2)), { entries: 0, age: 0, bytes: 0 })
+    const s1 = r.nextSeq('s1')
+    assert.deepEqual(r.store('s1', s1, 1000, frame(s1)), { entries: 0, age: 0, bytes: 0 })
+    const s2 = r.nextSeq('s1')
+    assert.deepEqual(r.store('s1', s2, 1001, frame(s2)), { entries: 0, age: 0, bytes: 0 })
     // Third frame triggers entry eviction (drops one frame).
-    const s3 = r.nextSeq('s1'); const ev = r.store('s1', s3, 1002, frame(s3))
+    const s3 = r.nextSeq('s1')
+    const ev = r.store('s1', s3, 1002, frame(s3))
     assert.equal(ev.entries, 1, 'one frame evicted by entries cap')
     assert.equal(ev.age, 0)
     assert.equal(ev.bytes, 0)
@@ -242,7 +271,8 @@ describe('OutboundRingBuffer eviction stats', () => {
   it('peekReplay() reports `age` cause when read-path prune evicts stale frames', () => {
     const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
     for (let i = 1; i <= 3; i++) {
-      const s = r.nextSeq('s1'); r.store('s1', s, 1000 + i, frame(s))
+      const s = r.nextSeq('s1')
+      r.store('s1', s, 1000 + i, frame(s))
     }
     // Long idle: peekReplay at now=2000 evicts all 3 (cutoff 1900 > all ts).
     const rep = r.peekReplay('s1', 0, 2000)
@@ -254,8 +284,10 @@ describe('OutboundRingBuffer eviction stats', () => {
 
   it('totalBytes() sums across all sessions', () => {
     const r = new OutboundRingBuffer()
-    const a = r.nextSeq('s1'); r.store('s1', a, 1000, frame(a))
-    const b = r.nextSeq('s2'); r.store('s2', b, 1000, frame(b))
+    const a = r.nextSeq('s1')
+    r.store('s1', a, 1000, frame(a))
+    const b = r.nextSeq('s2')
+    r.store('s2', b, 1000, frame(b))
     assert.equal(r.totalBytes(), r.bytes('s1') + r.bytes('s2'))
   })
 

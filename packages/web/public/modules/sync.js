@@ -3,7 +3,7 @@
 // Server is source of truth for session list; local IDB is cache + offline fallback.
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
-import { dbGetAll, dbPut, dbDelete } from './db.js'
+import { dbDelete, dbGetAll, dbPut } from './db.js'
 import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js'
 import { state } from './state.js'
 
@@ -168,7 +168,7 @@ function _rebindStreamingPointers(sess) {
   }
   if (sess._replyingToMsgId && !byId.has(sess._replyingToMsgId)) {
     sess._replyingToMsgId = null
-    sess._currentTurnBlockCount = 0  // hygiene: old turn's counter is stale
+    sess._currentTurnBlockCount = 0 // hygiene: old turn's counter is stale
   }
 }
 
@@ -239,11 +239,8 @@ export async function syncSessionsFromServer() {
       // `_liveStreamBroken = true`), we MUST refetch: the whole point of
       // the force sync is to reconcile from the server-authored tape.
       const live = state.sessions.get(meta.id)
-      if (
-        meta.id === state.currentSessionId &&
-        state.sendingInFlight &&
-        !live?._liveStreamBroken
-      ) continue
+      if (meta.id === state.currentSessionId && state.sendingInFlight && !live?._liveStreamBroken)
+        continue
       toFetch.push(meta.id)
     }
   }
@@ -252,9 +249,7 @@ export async function syncSessionsFromServer() {
   const fetched = []
   for (let i = 0; i < toFetch.length; i += 10) {
     const batch = toFetch.slice(i, i + 10)
-    const results = await Promise.allSettled(
-      batch.map((id) => apiGet(`/api/sessions/${id}`))
-    )
+    const results = await Promise.allSettled(batch.map((id) => apiGet(`/api/sessions/${id}`)))
     for (const r of results) {
       if (r.status === 'fulfilled' && r.value?.id) fetched.push(r.value)
     }
@@ -294,13 +289,16 @@ export async function syncSessionsFromServer() {
     // dedupes by frameSeq; with the cursor reset those deltas look like
     // "new" frames and would be appended again. Keep the cursor aligned to
     // whatever we had last processed so dedupe stays authoritative.
-    if (typeof existingLocal?._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
+    if (typeof existingLocal?._lastFrameSeq === 'number')
+      sess._lastFrameSeq = existingLocal._lastFrameSeq
     _rebuildSearchIndex(sess)
     clearDeleteTombstone(sess.id) // Allow saving if session was previously deleted locally
     state.sessions.set(sess.id, sess)
     fetchedCount++
     if (sess.id === state.currentSessionId) currentSessionUpdated = true
-    try { await dbPut({ ...sess, _syncedAt: remote.updatedAt }) } catch {}
+    try {
+      await dbPut({ ...sess, _syncedAt: remote.updatedAt })
+    } catch {}
   }
 
   // Remove locally-synced sessions that were deleted on server
@@ -317,7 +315,9 @@ export async function syncSessionsFromServer() {
       if (id === state.currentSessionId) removedCurrent = true
       state.sessions.delete(id)
       removedCount++
-      try { await dbDelete(id) } catch {}
+      try {
+        await dbDelete(id)
+      } catch {}
     }
   }
   // If the active session was deleted remotely, switch to another
@@ -362,7 +362,20 @@ export async function syncSessionsFromServer() {
  */
 export function pushSessionToServer(sess) {
   if (!sess?.id || !state.token) return Promise.resolve()
-  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _sendingInFlight, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _syncedAt, _dirty, ...clean } = sess
+  const {
+    _streamingAssistant,
+    _streamingThinking,
+    _blockIdToMsgId,
+    _sendingInFlight,
+    _replyingToMsgId,
+    _agentGroups,
+    _streamRafPending,
+    _thinkRafPending,
+    _searchText,
+    _syncedAt,
+    _dirty,
+    ...clean
+  } = sess
   // Include baseSyncedAt for optimistic concurrency — server rejects if row is newer
   clean._baseSyncedAt = _syncedAt || 0
   const preFlightLastAt = sess.lastAt // snapshot BEFORE PUT for 409 conflict detection
@@ -370,128 +383,141 @@ export function pushSessionToServer(sess) {
     method: 'PUT',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(clean),
-  }).then(async (res) => {
-    if (res.ok) {
-      const resp = await res.json()
-      if (resp?.applied && resp.updatedAt) {
-        sess._syncedAt = resp.updatedAt
-        sess._dirty = false
-        sess._conflictRetryCount = 0  // successful PUT clears 409 retry cap
-      }
-    } else if (res.status === 409) {
-      // Conflict: server has a newer version. Two resolution paths:
-      //   (a) local-dominates: local messages form a clean superset of
-      //       server. Keep local, refresh _syncedAt, trigger one retry
-      //       PUT. The primary fix case (long streaming assistant msg
-      //       with same id as server's partial snapshot).
-      //   (b) server-wins fallback: something on server is genuinely not
-      //       in local (cross-device add, remote delete/regen, truly
-      //       diverged content). Adopt server state and rebind streaming
-      //       pointers so subsequent WS frames don't mutate orphan objects.
-      try {
-        const server = await apiGet(`/api/sessions/${sess.id}`)
-        if (!server?.id) return
-        // `sess` may be a detached dbGetAll snapshot (see
-        // syncSessionsFromServer → pushSessionToServer(local) at line ~276).
-        // The authoritative in-memory object is state.sessions.get(id).
-        // Mutating sess would leave the live session stale, causing the
-        // next scheduleSave to re-push with the old _baseSyncedAt and
-        // loop 409 → cap. Always target `live`.
-        const live = state.sessions.get(sess.id)
-        if (!live) return
-        const target = live
-
-        if (_localDominates(server.messages, live.messages)) {
-          // (a) LOCAL DOMINATES — keep local messages, adopt server metadata.
-          //
-          // Messages: local is a clean superset, so we retain it (the
-          // primary bug: streaming assistant prefix extension gets dropped
-          // if we overwrite).
-          //
-          // Metadata (title/pinned/agentId/lastAt): we ADOPT server's
-          // values. Another tab may have renamed the session, pinned it,
-          // or switched its agent while we were streaming; those edits
-          // went through their own scheduleSaveFromUserEdit → PUT and we
-          // mustn't clobber them by blindly re-pushing stale local meta.
-          //
-          // If the user was simultaneously editing metadata locally,
-          // scheduleSaveFromUserEdit has bumped live.lastAt since
-          // preFlightLastAt — we detect that below and keep local meta.
-          target._syncedAt = server.updatedAt
-
-          // Metadata merge: server-wins UNLESS a local user edit beat the
-          // preflight snapshot (which would have set live.lastAt > preFlightLastAt).
-          // In that case user intent on this tab is authoritative.
-          const localMetaIsNewer = live._dirty && live.lastAt > preFlightLastAt
-          let titleChanged = false
-          if (!localMetaIsNewer) {
-            titleChanged = target.title !== server.title
-            target.title = server.title
-            target.pinned = server.pinned
-            target.agentId = server.agentId
-            target.lastAt = server.lastAt
-          }
-          target._dirty = true  // need a follow-up PUT to push our messages
-
-          const prev = target._conflictRetryCount || 0
-          target._conflictRetryCount = prev + 1
-
-          // Rebuild search index if title shifted — _searchText cache
-          // preferred by sidebar filter would otherwise still match old title.
-          if (titleChanged) _rebuildSearchIndex(target)
-
-          try { await dbPut({ ...target }) } catch {}
-          // Pass 'local-dominates' so the UI can skip renderMessages() — local
-          // messages are preserved in this branch, only sidebar metadata may
-          // have shifted. Without this tag, every 409 in a long streaming
-          // session redrew the whole messages pane (innerHTML='' + 100-row
-          // rebuild) and the user saw a flicker per 409.
-          try { _onConflictResolved?.(target.id, 'local-dominates') } catch {}
-
-          if (target._conflictRetryCount <= CONFLICT_RETRY_MAX && _onRequestRetryPush) {
-            try { _onRequestRetryPush(target.id) } catch {}
-          } else {
-            console.warn(
-              '[sync] 409 auto-retry cap reached for', target.id,
-              '— leaving dirty; next user action or save-cycle will retry',
-            )
-          }
-          return
+  })
+    .then(async (res) => {
+      if (res.ok) {
+        const resp = await res.json()
+        if (resp?.applied && resp.updatedAt) {
+          sess._syncedAt = resp.updatedAt
+          sess._dirty = false
+          sess._conflictRetryCount = 0 // successful PUT clears 409 retry cap
         }
+      } else if (res.status === 409) {
+        // Conflict: server has a newer version. Two resolution paths:
+        //   (a) local-dominates: local messages form a clean superset of
+        //       server. Keep local, refresh _syncedAt, trigger one retry
+        //       PUT. The primary fix case (long streaming assistant msg
+        //       with same id as server's partial snapshot).
+        //   (b) server-wins fallback: something on server is genuinely not
+        //       in local (cross-device add, remote delete/regen, truly
+        //       diverged content). Adopt server state and rebind streaming
+        //       pointers so subsequent WS frames don't mutate orphan objects.
+        try {
+          const server = await apiGet(`/api/sessions/${sess.id}`)
+          if (!server?.id) return
+          // `sess` may be a detached dbGetAll snapshot (see
+          // syncSessionsFromServer → pushSessionToServer(local) at line ~276).
+          // The authoritative in-memory object is state.sessions.get(id).
+          // Mutating sess would leave the live session stale, causing the
+          // next scheduleSave to re-push with the old _baseSyncedAt and
+          // loop 409 → cap. Always target `live`.
+          const live = state.sessions.get(sess.id)
+          if (!live) return
+          const target = live
 
-        // (b) SERVER WINS — adopt server state.
-        // Retain original guard: if user typed while PUT was in flight,
-        // keep local (the new edits push on the next save tick). strict
-        // `>` is intentional here because we already know local is NOT
-        // a superset of server, so equal lastAt means no new user edit
-        // and server really has data we don't.
-        if (live._dirty && live.lastAt > preFlightLastAt) return
+          if (_localDominates(server.messages, live.messages)) {
+            // (a) LOCAL DOMINATES — keep local messages, adopt server metadata.
+            //
+            // Messages: local is a clean superset, so we retain it (the
+            // primary bug: streaming assistant prefix extension gets dropped
+            // if we overwrite).
+            //
+            // Metadata (title/pinned/agentId/lastAt): we ADOPT server's
+            // values. Another tab may have renamed the session, pinned it,
+            // or switched its agent while we were streaming; those edits
+            // went through their own scheduleSaveFromUserEdit → PUT and we
+            // mustn't clobber them by blindly re-pushing stale local meta.
+            //
+            // If the user was simultaneously editing metadata locally,
+            // scheduleSaveFromUserEdit has bumped live.lastAt since
+            // preFlightLastAt — we detect that below and keep local meta.
+            target._syncedAt = server.updatedAt
 
-        Object.assign(target, {
-          title: server.title,
-          messages: server.messages || [],
-          lastAt: server.lastAt,
-          pinned: server.pinned,
-          agentId: server.agentId,
-          _syncedAt: server.updatedAt,
-          _dirty: false,
-        })
-        // Invalidate runtime maps so they get rebuilt from new messages on next handleOutbound
-        target._blockIdToMsgId = null
-        target._agentGroups = null
-        target._conflictRetryCount = 0  // server-wins adoption resets the cap
-        _rebindStreamingPointers(target)
-        _rebuildSearchIndex(target)
-        try { await dbPut({ ...target, _syncedAt: server.updatedAt }) } catch {}
-        // Notify UI so the user sees the new messages / title instead of
-        // a stale view. Without this, the session object is updated but
-        // the DOM stays on the old snapshot until the next full sync.
-        // 'server-wins' tag tells the UI to fully re-render messages because
-        // sess.messages was just overwritten.
-        try { _onConflictResolved?.(target.id, 'server-wins') } catch {}
-      } catch {}
-    }
-  }).catch(() => {})
+            // Metadata merge: server-wins UNLESS a local user edit beat the
+            // preflight snapshot (which would have set live.lastAt > preFlightLastAt).
+            // In that case user intent on this tab is authoritative.
+            const localMetaIsNewer = live._dirty && live.lastAt > preFlightLastAt
+            let titleChanged = false
+            if (!localMetaIsNewer) {
+              titleChanged = target.title !== server.title
+              target.title = server.title
+              target.pinned = server.pinned
+              target.agentId = server.agentId
+              target.lastAt = server.lastAt
+            }
+            target._dirty = true // need a follow-up PUT to push our messages
+
+            const prev = target._conflictRetryCount || 0
+            target._conflictRetryCount = prev + 1
+
+            // Rebuild search index if title shifted — _searchText cache
+            // preferred by sidebar filter would otherwise still match old title.
+            if (titleChanged) _rebuildSearchIndex(target)
+
+            try {
+              await dbPut({ ...target })
+            } catch {}
+            // Pass 'local-dominates' so the UI can skip renderMessages() — local
+            // messages are preserved in this branch, only sidebar metadata may
+            // have shifted. Without this tag, every 409 in a long streaming
+            // session redrew the whole messages pane (innerHTML='' + 100-row
+            // rebuild) and the user saw a flicker per 409.
+            try {
+              _onConflictResolved?.(target.id, 'local-dominates')
+            } catch {}
+
+            if (target._conflictRetryCount <= CONFLICT_RETRY_MAX && _onRequestRetryPush) {
+              try {
+                _onRequestRetryPush(target.id)
+              } catch {}
+            } else {
+              console.warn(
+                '[sync] 409 auto-retry cap reached for',
+                target.id,
+                '— leaving dirty; next user action or save-cycle will retry',
+              )
+            }
+            return
+          }
+
+          // (b) SERVER WINS — adopt server state.
+          // Retain original guard: if user typed while PUT was in flight,
+          // keep local (the new edits push on the next save tick). strict
+          // `>` is intentional here because we already know local is NOT
+          // a superset of server, so equal lastAt means no new user edit
+          // and server really has data we don't.
+          if (live._dirty && live.lastAt > preFlightLastAt) return
+
+          Object.assign(target, {
+            title: server.title,
+            messages: server.messages || [],
+            lastAt: server.lastAt,
+            pinned: server.pinned,
+            agentId: server.agentId,
+            _syncedAt: server.updatedAt,
+            _dirty: false,
+          })
+          // Invalidate runtime maps so they get rebuilt from new messages on next handleOutbound
+          target._blockIdToMsgId = null
+          target._agentGroups = null
+          target._conflictRetryCount = 0 // server-wins adoption resets the cap
+          _rebindStreamingPointers(target)
+          _rebuildSearchIndex(target)
+          try {
+            await dbPut({ ...target, _syncedAt: server.updatedAt })
+          } catch {}
+          // Notify UI so the user sees the new messages / title instead of
+          // a stale view. Without this, the session object is updated but
+          // the DOM stays on the old snapshot until the next full sync.
+          // 'server-wins' tag tells the UI to fully re-render messages because
+          // sess.messages was just overwritten.
+          try {
+            _onConflictResolved?.(target.id, 'server-wins')
+          } catch {}
+        } catch {}
+      }
+    })
+    .catch(() => {})
 }
 
 /**
@@ -504,7 +530,9 @@ export function deleteSessionFromServer(id) {
     _pendingDeletes.add(id)
     // Also retry once after 2s
     setTimeout(() => {
-      apiJson('DELETE', `/api/sessions/${id}`).then(() => _pendingDeletes.delete(id)).catch(() => {})
+      apiJson('DELETE', `/api/sessions/${id}`)
+        .then(() => _pendingDeletes.delete(id))
+        .catch(() => {})
     }, 2000)
   })
 }
@@ -575,7 +603,12 @@ let _tailSyncScheduled = false
  *   - `freshAfterInFlight: true`            → schedule a tail sync once the
  *     running sync settles so caller observes state stamped after their call.
  */
-export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult, freshAfterInFlight = false } = {}) {
+export function maybeSyncNow({
+  force = false,
+  minIntervalMs = 15000,
+  onResult,
+  freshAfterInFlight = false,
+} = {}) {
   if (_syncInFlight) {
     if (onResult || (force && freshAfterInFlight)) {
       _pendingOnResultCallbacks.push({
@@ -597,7 +630,9 @@ export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult, f
           // body, so this kicks off a fresh pass. `force:true` bypasses the
           // throttle; we preserve `onResult` for the callers that asked for
           // a post-mutation render.
-          try { maybeSyncNow({ force: true }) } catch {}
+          try {
+            maybeSyncNow({ force: true })
+          } catch {}
         })
     }
     return _syncInFlight
@@ -629,12 +664,18 @@ export function maybeSyncNow({ force = false, minIntervalMs = 15000, onResult, f
         if (!entry.onResult) continue
         // Each callback is best-effort isolated: a throw from one must not
         // prevent the next from running or leak past the sync boundary.
-        try { entry.onResult(result) } catch (err) {
-          try { console.error('[sync] onResult callback threw', err) } catch {}
+        try {
+          entry.onResult(result)
+        } catch (err) {
+          try {
+            console.error('[sync] onResult callback threw', err)
+          } catch {}
         }
       }
       return result
     })
-    .finally(() => { _syncInFlight = null })
+    .finally(() => {
+      _syncInFlight = null
+    })
   return _syncInFlight
 }

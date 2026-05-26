@@ -18,13 +18,15 @@ export function checkToken(provided: string | null | undefined, expected: string
 
 const SCRYPT_KEYLEN = 64
 const SCRYPT_COST = 16384 // N
-const SCRYPT_BLOCK = 8    // r
+const SCRYPT_BLOCK = 8 // r
 const SCRYPT_PARALLEL = 1 // p
 
 export function hashPassword(password: string): string {
   const salt = randomBytes(16).toString('hex')
   const derived = scryptSync(password, salt, SCRYPT_KEYLEN, {
-    N: SCRYPT_COST, r: SCRYPT_BLOCK, p: SCRYPT_PARALLEL,
+    N: SCRYPT_COST,
+    r: SCRYPT_BLOCK,
+    p: SCRYPT_PARALLEL,
   })
   return `${salt}:${derived.toString('hex')}`
 }
@@ -33,7 +35,9 @@ export function verifyPassword(password: string, hash: string): boolean {
   const [salt, key] = hash.split(':')
   if (!salt || !key) return false
   const derived = scryptSync(password, salt, SCRYPT_KEYLEN, {
-    N: SCRYPT_COST, r: SCRYPT_BLOCK, p: SCRYPT_PARALLEL,
+    N: SCRYPT_COST,
+    r: SCRYPT_BLOCK,
+    p: SCRYPT_PARALLEL,
   })
   try {
     return timingSafeEqual(derived, Buffer.from(key, 'hex'))

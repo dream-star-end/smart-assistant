@@ -148,14 +148,14 @@ async function loadLastRun(): Promise<Record<string, number>> {
 let _writeCounter = 0
 async function saveLastRun(map: Record<string, number>): Promise<void> {
   await mkdir(dirname(LAST_RUN_FILE), { recursive: true })
-  const tmp = LAST_RUN_FILE + `.${process.pid}.${++_writeCounter}.tmp`
+  const tmp = `${LAST_RUN_FILE}.${process.pid}.${++_writeCounter}.tmp`
   await writeFile(tmp, JSON.stringify(map, null, 2))
   await rename(tmp, LAST_RUN_FILE)
 }
 
 /** Atomically write a YAML file by writing to a unique .tmp then renaming. */
 async function atomicWriteYaml(filePath: string, data: unknown): Promise<void> {
-  const tmp = filePath + `.${process.pid}.${++_writeCounter}.tmp`
+  const tmp = `${filePath}.${process.pid}.${++_writeCounter}.tmp`
   await writeFile(tmp, stringifyYaml(data))
   await rename(tmp, filePath)
 }
@@ -303,7 +303,10 @@ export class CronScheduler {
           if (lastRun[job.id] === minuteKey) continue
           const agent = agentsConfig.agents.find((a) => a.id === job.agent)
           if (!agent) {
-            logger.warn(`job ${job.id}: agent ${job.agent} not found`, { jobId: job.id, agent: job.agent })
+            logger.warn(`job ${job.id}: agent ${job.agent} not found`, {
+              jobId: job.id,
+              agent: job.agent,
+            })
             continue
           }
           await this.runJob(job, agent)
@@ -356,9 +359,11 @@ export class CronScheduler {
       // All jobs use isolated sessions — always destroy, even if submit()
       // threw, otherwise the subprocess + resume-map entry would leak until
       // the eviction loop catches it on the next sweep.
-      await this.sessions.destroySession(sessionKey).catch((err) =>
-        logger.warn(`destroySession failed for ${job.id}`, { jobId: job.id }, err as Error),
-      )
+      await this.sessions
+        .destroySession(sessionKey)
+        .catch((err) =>
+          logger.warn(`destroySession failed for ${job.id}`, { jobId: job.id }, err as Error),
+        )
     }
     // Persist output
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
@@ -385,11 +390,18 @@ export class CronScheduler {
       })
       return
     }
-    logger.info(`job ${job.id} completed`, { jobId: job.id, chars: trimmed.length, deliver: job.deliver ?? 'local' })
+    logger.info(`job ${job.id} completed`, {
+      jobId: job.id,
+      chars: trimmed.length,
+      deliver: job.deliver ?? 'local',
+    })
     if ((job.deliver ?? 'local') === 'local') {
       // local = just log, don't push to any channel
     } else {
-      logger.info(`delivering job ${job.id} to ${job.deliver}`, { jobId: job.id, deliver: job.deliver })
+      logger.info(`delivering job ${job.id} to ${job.deliver}`, {
+        jobId: job.id,
+        deliver: job.deliver,
+      })
       this.onDeliver(trimmed, job)
     }
   }

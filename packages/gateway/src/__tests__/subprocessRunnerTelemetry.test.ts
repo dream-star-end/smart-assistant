@@ -27,7 +27,7 @@ function createRunner(): SubprocessRunner {
 function feed(runner: SubprocessRunner, line: string): void {
   // chunk must include a newline to be flushed. The private `handleStdout`
   // takes a string (the child is spawned with encoding 'utf8').
-  const chunk = line.endsWith('\n') ? line : line + '\n'
+  const chunk = line.endsWith('\n') ? line : `${line}\n`
   ;(runner as any).handleStdout(chunk)
 }
 
@@ -36,8 +36,8 @@ describe('SubprocessRunner._oc_telemetry routing', () => {
     const runner = createRunner()
     const telemetryEvents: any[] = []
     const messages: any[] = []
-    runner.on('telemetry', ev => telemetryEvents.push(ev))
-    runner.on('message', m => messages.push(m))
+    runner.on('telemetry', (ev) => telemetryEvents.push(ev))
+    runner.on('message', (m) => messages.push(m))
 
     const payload = {
       type: '_oc_telemetry',
@@ -60,8 +60,8 @@ describe('SubprocessRunner._oc_telemetry routing', () => {
     const runner = createRunner()
     const telemetryEvents: any[] = []
     const messages: any[] = []
-    runner.on('telemetry', ev => telemetryEvents.push(ev))
-    runner.on('message', m => messages.push(m))
+    runner.on('telemetry', (ev) => telemetryEvents.push(ev))
+    runner.on('message', (m) => messages.push(m))
 
     feed(
       runner,
@@ -82,9 +82,9 @@ describe('SubprocessRunner._oc_telemetry routing', () => {
     const telemetryEvents: any[] = []
     const messages: any[] = []
     const parseErrors: any[] = []
-    runner.on('telemetry', ev => telemetryEvents.push(ev))
-    runner.on('message', m => messages.push(m))
-    runner.on('parse_error', e => parseErrors.push(e))
+    runner.on('telemetry', (ev) => telemetryEvents.push(ev))
+    runner.on('message', (m) => messages.push(m))
+    runner.on('parse_error', (e) => parseErrors.push(e))
 
     feed(
       runner,
@@ -108,7 +108,7 @@ describe('SubprocessRunner._oc_telemetry routing', () => {
   it('_oc_telemetry with empty-string session_id is also dropped', () => {
     const runner = createRunner()
     const telemetryEvents: any[] = []
-    runner.on('telemetry', ev => telemetryEvents.push(ev))
+    runner.on('telemetry', (ev) => telemetryEvents.push(ev))
 
     feed(
       runner,
@@ -129,13 +129,10 @@ describe('SubprocessRunner._oc_telemetry routing', () => {
   it('_oc_telemetry does NOT update currentSessionId', () => {
     const runner = createRunner()
     const sessionIdChanges: string[] = []
-    runner.on('session_id', id => sessionIdChanges.push(id))
+    runner.on('session_id', (id) => sessionIdChanges.push(id))
 
     // First establish a session via a normal message
-    feed(
-      runner,
-      JSON.stringify({ type: 'system', session_id: 'real-sess' }),
-    )
+    feed(runner, JSON.stringify({ type: 'system', session_id: 'real-sess' }))
     assert.deepEqual(sessionIdChanges, ['real-sess'])
 
     // A telemetry event with a DIFFERENT session_id must NOT trigger session change
@@ -157,8 +154,8 @@ describe('SubprocessRunner._oc_telemetry routing', () => {
     const runner = createRunner()
     const telemetryEvents: any[] = []
     const parseErrors: any[] = []
-    runner.on('telemetry', ev => telemetryEvents.push(ev))
-    runner.on('parse_error', e => parseErrors.push(e))
+    runner.on('telemetry', (ev) => telemetryEvents.push(ev))
+    runner.on('parse_error', (e) => parseErrors.push(e))
 
     feed(runner, '{ not valid json')
 

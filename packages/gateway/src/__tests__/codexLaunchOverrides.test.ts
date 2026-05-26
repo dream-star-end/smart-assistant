@@ -60,10 +60,7 @@ describe('tomlValue', () => {
   })
 
   it('throws on record value of non-string type', () => {
-    assert.throws(
-      () => tomlValue({ k: 42 as unknown as string }),
-      /only string values/,
-    )
+    assert.throws(() => tomlValue({ k: 42 as unknown as string }), /only string values/)
   })
 
   it('throws on unsupported top-level type (number, boolean, null)', () => {
@@ -99,10 +96,7 @@ describe('tomlValue', () => {
 
 describe('CODEX_PREAMBLE', () => {
   it('mentions openclaude_memory MCP server as the canonical access path', () => {
-    assert.ok(
-      CODEX_PREAMBLE.includes('openclaude_memory'),
-      'preamble must name the MCP server',
-    )
+    assert.ok(CODEX_PREAMBLE.includes('openclaude_memory'), 'preamble must name the MCP server')
   })
 
   it('explicitly forbids using codex native ~/.codex/memories', () => {

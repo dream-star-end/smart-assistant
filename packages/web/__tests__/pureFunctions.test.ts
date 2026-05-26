@@ -374,7 +374,8 @@ describe('T-LATEX: _scanCodexMathBody — Codex/KaTeX 分隔符 body scanner', (
     assert.equal(r.dead, false)
   })
   it('regression: original Codex bug-report display formula body scans cleanly', () => {
-    const formula = '\\eta_\\varphi = \\frac{1}{N}+\\left(1-\\frac{1}{N}\\right)e^{-\\sigma_\\varphi^2}'
+    const formula =
+      '\\eta_\\varphi = \\frac{1}{N}+\\left(1-\\frac{1}{N}\\right)e^{-\\sigma_\\varphi^2}'
     const src = `${formula}\\]`
     const r = _scanCodexMathBody(src, 0, ']', true)
     assert.equal(r.closer, src.length - 2)
@@ -387,7 +388,7 @@ describe('T-LATEX: _scanCodexMathBody — Codex/KaTeX 分隔符 body scanner', (
     assert.equal(r.dead, false)
   })
   it('many-unclosed-\\[ pathological: single scan still linear (≪ 500ms)', () => {
-    const big = '\\['.repeat(1000) + 'no closer'
+    const big = `${'\\['.repeat(1000)}no closer`
     const start = Date.now()
     const r = _scanCodexMathBody(big, 0, ']', true)
     const elapsed = Date.now() - start

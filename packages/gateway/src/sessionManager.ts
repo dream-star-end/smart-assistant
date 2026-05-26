@@ -12,16 +12,13 @@ import {
   upsertSessionMeta,
 } from '@openclaude/storage'
 import { CcbMessageParser, type SessionStreamEvent } from './ccbMessageParser.js'
-import {
-  TelemetryChannel,
-  type OcTelemetryEvent,
-} from './telemetryChannel.js'
-import { eventBus, createEvent } from './eventBus.js'
-import { createLogger } from './logger.js'
-import { SubprocessRunner } from './subprocessRunner.js'
-import { CodexRunner } from './codexRunner.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
+import { CodexRunner } from './codexRunner.js'
+import { createEvent, eventBus } from './eventBus.js'
+import { createLogger } from './logger.js'
 import { normalizeProxyUrl } from './proxyEnv.js'
+import { SubprocessRunner } from './subprocessRunner.js'
+import { type OcTelemetryEvent, TelemetryChannel } from './telemetryChannel.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -163,7 +160,7 @@ export class SessionManager {
 
   private _loadResumeMap(): void {
     // Try primary file first, fall back to backup if corrupted (atomic-write safety net)
-    for (const path of [this.resumeMapPath, this.resumeMapPath + '.bak']) {
+    for (const path of [this.resumeMapPath, `${this.resumeMapPath}.bak`]) {
       try {
         if (!existsSync(path)) continue
         // File mtime acts as the lower-bound timestamp for entries that lack
@@ -249,8 +246,8 @@ export class SessionManager {
     }
     const data = JSON.stringify(obj, null, 2)
     // Atomic write: write to .tmp, then rename (rename is atomic on Linux/ext4)
-    const tmpPath = this.resumeMapPath + '.tmp'
-    const bakPath = this.resumeMapPath + '.bak'
+    const tmpPath = `${this.resumeMapPath}.tmp`
+    const bakPath = `${this.resumeMapPath}.bak`
     this._resumeMapWrite = this._resumeMapWrite
       .then(async () => {
         await writeFile(tmpPath, data)
@@ -490,7 +487,11 @@ export class SessionManager {
     // Monitor subprocess crashes — emit event so gateway can notify connected clients
     runner.on('exit', (info: { code: number | null; signal: string | null; crashed: boolean }) => {
       if (info.crashed) {
-        log.warn('subprocess crashed', { sessionKey: opts.sessionKey, code: info.code, signal: info.signal })
+        log.warn('subprocess crashed', {
+          sessionKey: opts.sessionKey,
+          code: info.code,
+          signal: info.signal,
+        })
         // Ensure the session stays in resume-map so it can be restored on next submit()
         // (SubprocessRunner.submit() auto-restarts with --resume when proc is null)
         if (session.ccbSessionId) {
@@ -498,11 +499,14 @@ export class SessionManager {
           this._saveResumeMap()
         }
         // Notify via eventBus so gateway can push a reconnect hint to the client
-        eventBus.emit('session.crashed', createEvent('session.crashed', session.agentId, {
-          sessionKey: opts.sessionKey,
-          peerId: session.peerId,
-          ccbSessionId: session.ccbSessionId,
-        }))
+        eventBus.emit(
+          'session.crashed',
+          createEvent('session.crashed', session.agentId, {
+            sessionKey: opts.sessionKey,
+            peerId: session.peerId,
+            ccbSessionId: session.ccbSessionId,
+          }),
+        )
       }
     })
     this.sessions.set(opts.sessionKey, session)
@@ -525,8 +529,7 @@ export class SessionManager {
     effortLevel?: string | null,
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
-    const desiredEffort: string | undefined =
-      effortLevel === null ? undefined : effortLevel
+    const desiredEffort: string | undefined = effortLevel === null ? undefined : effortLevel
     const callerSpecifiedEffort = effortLevel !== undefined
 
     const prev = session.lock
@@ -545,11 +548,7 @@ export class SessionManager {
           // Delta tracker reset happens automatically on the next 'spawn' event
           // when SubprocessRunner auto-respawns on the next submit().
         } catch (err) {
-          log.warn(
-            'effort-change shutdown failed',
-            { sessionKey: session.sessionKey },
-            err,
-          )
+          log.warn('effort-change shutdown failed', { sessionKey: session.sessionKey }, err)
         }
       }
       session.lastUsedAt = Date.now()
@@ -613,9 +612,8 @@ export class SessionManager {
         livenessTimer = setInterval(() => {
           const idleMs = Date.now() - session.runner.lastActivityAt
           const parser = session._currentParser
-          const threshold = (parser && parser.pendingToolCalls > 0)
-            ? IDLE_TIMEOUT_TOOL
-            : IDLE_TIMEOUT_DEFAULT
+          const threshold =
+            parser && parser.pendingToolCalls > 0 ? IDLE_TIMEOUT_TOOL : IDLE_TIMEOUT_DEFAULT
           if (idleMs > threshold) {
             reject(new Error(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
           }
@@ -632,7 +630,9 @@ export class SessionManager {
     } catch (err: any) {
       if (err?.message?.includes('idle timeout')) {
         // Actually interrupt the runner so the subprocess stops
-        try { session.runner.interrupt() } catch {}
+        try {
+          session.runner.interrupt()
+        } catch {}
         // Extract idle seconds from the inner error so the user-facing
         // message reflects the actual silence duration (avoids confusing
         // mismatch with the inner 30-min idle timer's fixed wording).
@@ -684,8 +684,7 @@ export class SessionManager {
             // server.ts 会把 kind:'error' 转成 isFinal:true 的可见错误帧)。
             onEvent({
               kind: 'error',
-              error:
-                'CCB 子进程持续返回空响应,已重启子进程。请重新发送消息或检查 gateway 日志。',
+              error: 'CCB 子进程持续返回空响应,已重启子进程。请重新发送消息或检查 gateway 日志。',
             })
             return
           }
@@ -708,12 +707,19 @@ export class SessionManager {
         // Auth error (401): refresh credentials and restart subprocess
         if (/AUTH_ERROR/i.test(msg)) {
           log.warn('auth error, refreshing credentials and restarting subprocess', {
-            sessionKey: session.sessionKey, attempt: attempt + 1,
+            sessionKey: session.sessionKey,
+            attempt: attempt + 1,
           })
           // Trigger immediate token refresh via gateway callback
           if (this.onAuthError) {
-            try { await this.onAuthError() } catch (e) {
-              log.error('onAuthError callback failed', { sessionKey: session.sessionKey }, e as Error)
+            try {
+              await this.onAuthError()
+            } catch (e) {
+              log.error(
+                'onAuthError callback failed',
+                { sessionKey: session.sessionKey },
+                e as Error,
+              )
             }
           }
           // Shutdown subprocess — next submit() auto-restarts with fresh config.
@@ -731,10 +737,19 @@ export class SessionManager {
         }
 
         // Only retry on transient errors (rate limit, server error, network)
-        const isTransient = /529|503|502|504|ECONNRESET|ETIMEDOUT|rate.limit|overloaded|AbortError|operation was aborted|timed?\s*out/i.test(msg)
+        const isTransient =
+          /529|503|502|504|ECONNRESET|ETIMEDOUT|rate.limit|overloaded|AbortError|operation was aborted|timed?\s*out/i.test(
+            msg,
+          )
         if (!isTransient || attempt >= MAX_RETRIES) throw err
         const delay = BASE_DELAY * 2 ** attempt + Math.random() * 1000
-        log.warn('transient error, retrying', { sessionKey: session.sessionKey, attempt: attempt + 1, maxRetries: MAX_RETRIES, delayS: Math.round(delay / 1000), error: msg })
+        log.warn('transient error, retrying', {
+          sessionKey: session.sessionKey,
+          attempt: attempt + 1,
+          maxRetries: MAX_RETRIES,
+          delayS: Math.round(delay / 1000),
+          error: msg,
+        })
         onEvent({
           kind: 'block',
           block: {
@@ -782,23 +797,27 @@ export class SessionManager {
 
     await new Promise<void>((resolve, reject) => {
       let settled = false
-      const settle = (fn: () => void) => { if (!settled) { settled = true; fn() } }
+      const settle = (fn: () => void) => {
+        if (!settled) {
+          settled = true
+          fn()
+        }
+      }
 
       // Idle timeout — refreshed on every runner message (see handleMessage below).
       // A turn is only killed if the agent produces no output for this long, so long
       // active tasks keep running while genuinely stuck turns still get interrupted.
       const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
-      const timer = setTimeout(
-        () => {
-          if (!parser.finalized) {
-            try { runner.interrupt() } catch {}
-            onEvent({ kind: 'error', error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。' })
-            detach()
-            settle(() => resolve())
-          }
-        },
-        IDLE_TIMEOUT_MS,
-      )
+      const timer = setTimeout(() => {
+        if (!parser.finalized) {
+          try {
+            runner.interrupt()
+          } catch {}
+          onEvent({ kind: 'error', error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。' })
+          detach()
+          settle(() => resolve())
+        }
+      }, IDLE_TIMEOUT_MS)
 
       // Buffer 'final' event — only forward to client after auth check passes
       let pendingFinal: SessionStreamEvent | null = null
@@ -808,7 +827,10 @@ export class SessionManager {
         // so it must NOT be flagged as phantom even if usage is 0.
         if (e.kind === 'block') turnBlockCount++
         else if (e.kind === 'permission_request') turnPermissionCount++
-        if (e.kind === 'final') { pendingFinal = e; return }
+        if (e.kind === 'final') {
+          pendingFinal = e
+          return
+        }
         onEvent(e)
       }
 
@@ -861,19 +883,25 @@ export class SessionManager {
             const gatewayJobId = `ccb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
             if (!session._cronBridgeMap) session._cronBridgeMap = new Map()
             session._cronBridgeMap.set(`_pending:${tool.id}`, gatewayJobId)
-            eventBus.emit('task.created', createEvent('task.created', session.agentId, {
-              taskId: gatewayJobId,
-              schedule: tool.input.cron,
-              prompt: tool.input.prompt,
-              oneshot: tool.input.recurring === false,
-              source: 'cron-bridge',
-            }))
+            eventBus.emit(
+              'task.created',
+              createEvent('task.created', session.agentId, {
+                taskId: gatewayJobId,
+                schedule: tool.input.cron,
+                prompt: tool.input.prompt,
+                oneshot: tool.input.recurring === false,
+                source: 'cron-bridge',
+              }),
+            )
           } else if (tool.name === 'CronDelete') {
             const ccbId = tool.input.id
             const gatewayId = session._cronBridgeMap?.get(ccbId) ?? ccbId
-            eventBus.emit('task.deleted', createEvent('task.deleted', session.agentId, {
-              taskId: gatewayId,
-            }))
+            eventBus.emit(
+              'task.deleted',
+              createEvent('task.deleted', session.agentId, {
+                taskId: gatewayId,
+              }),
+            )
           }
         },
         onToolResult: (tr) => {
@@ -892,25 +920,28 @@ export class SessionManager {
           // turnIndex is 1-indexed to match turn.completed semantics:
           // session.turns is still pre-increment during tool processing
           // (incremented inside parser._handleResult after this path runs).
-          eventBus.emit('tool.called', createEvent('tool.called', session.agentId, {
-            sessionKey: session.sessionKey,
-            turnIndex: session.turns + 1,
-            toolName: tr.toolName,
-            durationMs: tr.durationMs,
-            isError: tr.isError,
-            inputPreview: tr.inputPreview,
-            outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
-          }))
+          eventBus.emit(
+            'tool.called',
+            createEvent('tool.called', session.agentId, {
+              sessionKey: session.sessionKey,
+              turnIndex: session.turns + 1,
+              toolName: tr.toolName,
+              durationMs: tr.durationMs,
+              isError: tr.isError,
+              inputPreview: tr.inputPreview,
+              outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
+            }),
+          )
         },
         onFinish: (result) => {
           detach()
 
           // Detect auth error in assistant output — roll back counters and reject.
           // Two signals: (1) isError + broad keyword match, (2) CCB's exact error prefix.
-          const isAuthError = result && (
-            (result.isError && SessionManager.AUTH_KEYWORDS_RE.test(result.assistantText)) ||
-            SessionManager.AUTH_ERROR_PREFIX_RE.test(result.assistantText)
-          )
+          const isAuthError =
+            result &&
+            ((result.isError && SessionManager.AUTH_KEYWORDS_RE.test(result.assistantText)) ||
+              SessionManager.AUTH_ERROR_PREFIX_RE.test(result.assistantText))
           if (isAuthError) {
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
@@ -934,11 +965,9 @@ export class SessionManager {
           //                           heuristic so behavior is strictly ≤
           //                           pre-refactor (R7: never fail closed).
           // See docs/ccb-telemetry-refactor-plan.md §5.4.
-          const userInputStr =
-            typeof userTextOrBlocks === 'string' ? userTextOrBlocks : null
+          const userInputStr = typeof userTextOrBlocks === 'string' ? userTextOrBlocks : null
           const isStringInput = userInputStr !== null
-          const isSlashCommand =
-            isStringInput && userInputStr!.trimStart().startsWith('/')
+          const isSlashCommand = isStringInput && userInputStr!.trimStart().startsWith('/')
 
           const signals = telemetry.getTurnSignals()
           let isPhantomTurn = false
@@ -1046,7 +1075,9 @@ export class SessionManager {
                 totalCostUSD: session.totalCostUSD,
               }),
               indexTurn(sessId, session.turns, session.currentUserText ?? '', result.assistantText),
-            ]).catch((err) => log.error('FTS5 index failed', { sessionKey: session.sessionKey }, err))
+            ]).catch((err) =>
+              log.error('FTS5 index failed', { sessionKey: session.sessionKey }, err),
+            )
 
             // ── Phase 0.1: persist server-authored assistant message ──
             // Write the authoritative assistant text into the client_sessions
@@ -1065,7 +1096,11 @@ export class SessionManager {
             // turns are not routed to a per-user client session and thus
             // skip this path — they're tracked via sessions_meta / event_log
             // instead, and will be addressed in Phase 1 (channel broadcast).
-            if (session.channel === 'webchat' && result.assistantText && result.assistantText.length > 0) {
+            if (
+              session.channel === 'webchat' &&
+              result.assistantText &&
+              result.assistantText.length > 0
+            ) {
               const peerId = session.peerId
               const assistantText = result.assistantText
               const turnIndex = session.turns
@@ -1097,76 +1132,93 @@ export class SessionManager {
                   status: 'completed',
                 })
               }
-              directWrite().then((r) => {
-                if (r && !r.applied && r.reason !== 'already_exists') {
-                  // 'queued_to_outbox' is an expected degraded-mode outcome
-                  // (DB unavailable); log as warn not error so we don't spam
-                  // error aggregators when disk/SQLite has a hiccup. The
-                  // replay loop will pick it up on next restart.
-                  if (r.reason === 'queued_to_outbox') {
-                    log.warn('server-authored message queued to outbox (DB unavailable)', {
-                      sessionKey: session.sessionKey, peerId, turnIndex,
-                      error: r.error,
-                    })
-                  } else {
-                    log.warn('server-authored message not persisted', {
+              directWrite()
+                .then((r) => {
+                  if (r && !r.applied && r.reason !== 'already_exists') {
+                    // 'queued_to_outbox' is an expected degraded-mode outcome
+                    // (DB unavailable); log as warn not error so we don't spam
+                    // error aggregators when disk/SQLite has a hiccup. The
+                    // replay loop will pick it up on next restart.
+                    if (r.reason === 'queued_to_outbox') {
+                      log.warn('server-authored message queued to outbox (DB unavailable)', {
+                        sessionKey: session.sessionKey,
+                        peerId,
+                        turnIndex,
+                        error: r.error,
+                      })
+                    } else {
+                      log.warn('server-authored message not persisted', {
+                        sessionKey: session.sessionKey,
+                        peerId,
+                        turnIndex,
+                        reason: r.reason,
+                      })
+                    }
+                  }
+                })
+                .catch((err) => {
+                  log.error(
+                    'appendServerAuthoredMessage failed',
+                    {
                       sessionKey: session.sessionKey,
                       peerId,
                       turnIndex,
-                      reason: r.reason,
-                    })
-                  }
-                }
-              }).catch((err) => {
-                log.error('appendServerAuthoredMessage failed', {
-                  sessionKey: session.sessionKey,
-                  peerId,
-                  turnIndex,
-                }, err)
-              })
+                    },
+                    err,
+                  )
+                })
             }
 
             // Emit turn.completed event (triggers event_log + usage_log persistence)
             const turnDurationMs = Date.now() - turnStartTime
-            eventBus.emit('turn.completed', createEvent('turn.completed', session.agentId, {
-              sessionKey: session.sessionKey,
-              turnIndex: session.turns,
-              usage: {
-                inputTokens: result.inputTokens,
-                outputTokens: result.outputTokens,
-                cacheReadTokens: result.cacheReadTokens,
-                cacheCreationTokens: result.cacheCreationTokens,
-                costUsd: result.cost,
-                model: session.model,
-              },
-              toolCalls: turnToolCallCount,
-              durationMs: turnDurationMs,
-            }))
+            eventBus.emit(
+              'turn.completed',
+              createEvent('turn.completed', session.agentId, {
+                sessionKey: session.sessionKey,
+                turnIndex: session.turns,
+                usage: {
+                  inputTokens: result.inputTokens,
+                  outputTokens: result.outputTokens,
+                  cacheReadTokens: result.cacheReadTokens,
+                  cacheCreationTokens: result.cacheCreationTokens,
+                  costUsd: result.cost,
+                  model: session.model,
+                },
+                toolCalls: turnToolCallCount,
+                durationMs: turnDurationMs,
+              }),
+            )
 
             // Emit cost.recorded for budget tracking
-            eventBus.emit('cost.recorded', createEvent('cost.recorded', session.agentId, {
-              sessionKey: session.sessionKey,
-              turnIndex: session.turns,
-              usage: {
-                inputTokens: result.inputTokens,
-                outputTokens: result.outputTokens,
-                cacheReadTokens: result.cacheReadTokens,
-                cacheCreationTokens: result.cacheCreationTokens,
-                costUsd: result.cost,
-                model: session.model,
-              },
-              sessionTotalCostUsd: session.totalCostUSD,
-            }))
+            eventBus.emit(
+              'cost.recorded',
+              createEvent('cost.recorded', session.agentId, {
+                sessionKey: session.sessionKey,
+                turnIndex: session.turns,
+                usage: {
+                  inputTokens: result.inputTokens,
+                  outputTokens: result.outputTokens,
+                  cacheReadTokens: result.cacheReadTokens,
+                  cacheCreationTokens: result.cacheCreationTokens,
+                  costUsd: result.cost,
+                  model: session.model,
+                },
+                sessionTotalCostUsd: session.totalCostUSD,
+              }),
+            )
 
             // Detect verification verdicts in assistant output and emit structured event
             const verdict = parseVerificationVerdict(result.assistantText)
             if (verdict) {
-              eventBus.emit('verification.result', createEvent('verification.result', session.agentId, {
-                sessionKey: session.sessionKey,
-                target: 'code' as const,
-                passed: verdict.passed,
-                evidence: verdict.evidence,
-              }))
+              eventBus.emit(
+                'verification.result',
+                createEvent('verification.result', session.agentId, {
+                  sessionKey: session.sessionKey,
+                  target: 'code' as const,
+                  passed: verdict.passed,
+                  evidence: verdict.evidence,
+                }),
+              )
               log.info('verification verdict', {
                 sessionKey: session.sessionKey,
                 verdict: verdict.verdict,
@@ -1199,7 +1251,11 @@ export class SessionManager {
 
       // Listen for subprocess crash mid-turn. Defer slightly to let remaining
       // stdout data drain (exit can fire before stdout 'end' in Node.js).
-      const handleExit = (info: { code: number | null; signal: string | null; crashed: boolean }) => {
+      const handleExit = (info: {
+        code: number | null
+        signal: string | null
+        crashed: boolean
+      }) => {
         setTimeout(() => {
           if (!parser.finalized) {
             const reason = info.signal
@@ -1225,8 +1281,7 @@ export class SessionManager {
               // a pre-PUT crash still reaches the outbox; fall back to
               // getClientSession for legacy code paths.
               const flushPartial = async () => {
-                const uid = session.userId
-                  ?? ((await getClientSession(peerId))?.userId)
+                const uid = session.userId ?? (await getClientSession(peerId))?.userId
                 if (!uid) return undefined // no owner, nothing to persist to
                 return appendServerAuthoredMessageDurable(peerId, uid, {
                   id: `srv-${peerId}-t${turnIndex}`,
@@ -1237,9 +1292,16 @@ export class SessionManager {
                 })
               }
               flushPartial().catch((err) => {
-                log.error('partial assistant flush failed', {
-                  sessionKey: session.sessionKey, peerId, turnIndex, status,
-                }, err as Error)
+                log.error(
+                  'partial assistant flush failed',
+                  {
+                    sessionKey: session.sessionKey,
+                    peerId,
+                    turnIndex,
+                    status,
+                  },
+                  err as Error,
+                )
               })
             }
             onEvent({ kind: 'error', error: reason })
@@ -1258,7 +1320,9 @@ export class SessionManager {
       // 'message' listener per session at any time, so closures from old
       // turns become unreachable and GC'able.
       if (session._currentMessageListener) {
-        try { runner.off('message', session._currentMessageListener) } catch {}
+        try {
+          runner.off('message', session._currentMessageListener)
+        } catch {}
         session._currentMessageListener = null
       }
       runner.on('message', handleMessage)
@@ -1294,7 +1358,9 @@ export class SessionManager {
       // Detach cross-turn message listener before shutting down to release
       // the closure chain (parser + per-turn onEvent + frame envelope).
       if (s._currentMessageListener) {
-        try { s.runner.off('message', s._currentMessageListener) } catch {}
+        try {
+          s.runner.off('message', s._currentMessageListener)
+        } catch {}
         s._currentMessageListener = null
       }
       await s.runner.shutdown()
@@ -1317,7 +1383,9 @@ export class SessionManager {
     await this._resumeMapWrite
     for (const s of this.sessions.values()) {
       if (s._currentMessageListener) {
-        try { s.runner.off('message', s._currentMessageListener) } catch {}
+        try {
+          s.runner.off('message', s._currentMessageListener)
+        } catch {}
         s._currentMessageListener = null
       }
     }
@@ -1365,7 +1433,9 @@ export class SessionManager {
         const s = this.sessions.get(key)
         if (!s) continue
         if (s._currentMessageListener) {
-          try { s.runner.off('message', s._currentMessageListener) } catch {}
+          try {
+            s.runner.off('message', s._currentMessageListener)
+          } catch {}
           s._currentMessageListener = null
         }
         s.runner.shutdown().catch(() => {})

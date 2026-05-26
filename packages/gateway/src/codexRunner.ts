@@ -690,7 +690,6 @@ export class CodexRunner extends EventEmitter {
         this.lastActivityAt = Date.now()
         stdoutBuf += chunk.toString('utf8')
         let nl: number
-        // biome-ignore lint/suspicious/noAssignInExpressions: line-splitter idiom
         while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
           const line = stdoutBuf.slice(0, nl).trim()
           stdoutBuf = stdoutBuf.slice(nl + 1)

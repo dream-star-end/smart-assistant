@@ -27,10 +27,7 @@ import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import {
-  CodexAppServerRunner,
-  __setCodexAppServerSpawnForTests,
-} from '../codexAppServerRunner.js'
+import { CodexAppServerRunner, __setCodexAppServerSpawnForTests } from '../codexAppServerRunner.js'
 import { CodexRunner, __setCodexSpawnForTests } from '../codexRunner.js'
 
 function makeFakeProc(opts: { closeCode?: number; closeDelayMs?: number } = {}): any {

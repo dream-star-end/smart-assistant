@@ -30,7 +30,9 @@ export const EventBase = Type.Object({
   type: Type.String({ description: 'Discriminator, e.g. "turn.completed"' }),
   timestamp: Type.Number({ description: 'Unix epoch ms' }),
   agentId: Type.String(),
-  sessionKey: Type.Optional(Type.String({ description: 'Matches sessions_meta.id and sessionKey in gateway' })),
+  sessionKey: Type.Optional(
+    Type.String({ description: 'Matches sessions_meta.id and sessionKey in gateway' }),
+  ),
   schemaVersion: Type.Literal(EVENTS_SCHEMA_VERSION),
 })
 export type EventBase = Static<typeof EventBase>
@@ -68,11 +70,7 @@ export const TaskCreatedEvent = Type.Intersect([
     schedule: Type.Optional(Type.String()),
     prompt: Type.String(),
     oneshot: Type.Optional(Type.Boolean()),
-    source: Type.Union([
-      Type.Literal('user'),
-      Type.Literal('agent'),
-      Type.Literal('cron-bridge'),
-    ]),
+    source: Type.Union([Type.Literal('user'), Type.Literal('agent'), Type.Literal('cron-bridge')]),
   }),
 ])
 export type TaskCreatedEvent = Static<typeof TaskCreatedEvent>
@@ -171,11 +169,7 @@ export const MemoryHitEvent = Type.Intersect([
   EventBase,
   Type.Object({
     type: Type.Literal('memory.hit'),
-    operation: Type.Union([
-      Type.Literal('read'),
-      Type.Literal('write'),
-      Type.Literal('search'),
-    ]),
+    operation: Type.Union([Type.Literal('read'), Type.Literal('write'), Type.Literal('search')]),
     memoryType: Type.Union([
       Type.Literal('core'),
       Type.Literal('recall'),
@@ -194,11 +188,7 @@ export const VerificationResultEvent = Type.Intersect([
   Type.Object({
     type: Type.Literal('verification.result'),
     sessionKey: Type.String(),
-    target: Type.Union([
-      Type.Literal('plan'),
-      Type.Literal('code'),
-      Type.Literal('output'),
-    ]),
+    target: Type.Union([Type.Literal('plan'), Type.Literal('code'), Type.Literal('output')]),
     passed: Type.Boolean(),
     evidence: Type.Array(
       Type.Object({

@@ -19,9 +19,9 @@ const DB_VERSION = 1
 // 'unavailable' (permanent fallback to memory).
 let _initState = 'pending'
 let _db = null
-let _openPromise = null  // single-flight guard so concurrent openDB()
-                         // calls share one indexedDB.open request instead
-                         // of racing multiple upgrades.
+let _openPromise = null // single-flight guard so concurrent openDB()
+// calls share one indexedDB.open request instead
+// of racing multiple upgrades.
 const _memoryStore = new Map()
 let _onUnavailable = null
 // Whether we have successfully notified the UI. Separate from _initState
@@ -43,7 +43,9 @@ function _fireUnavailable() {
   if (_uiNotified) return
   if (!_onUnavailable) return
   _uiNotified = true
-  try { _onUnavailable() } catch {}
+  try {
+    _onUnavailable()
+  } catch {}
 }
 
 function _markUnavailable() {
@@ -129,7 +131,7 @@ export async function dbPut(obj) {
   // this tab's lifetime, and the retry loop in sessions.js can retry IDB.
   if (obj?.id) _memoryStore.set(obj.id, obj)
   if (_initState === 'unavailable') return
-  const db = await openDB()  // throws → caller's retry path handles it
+  const db = await openDB() // throws → caller's retry path handles it
   return new Promise((res, rej) => {
     const tx = db.transaction('sessions', 'readwrite')
     tx.objectStore('sessions').put(obj)

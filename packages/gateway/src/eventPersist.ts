@@ -1,3 +1,4 @@
+import type { CostRecordedEvent, GatewayEvent, TurnCompletedEvent } from '@openclaude/protocol'
 /**
  * Event persistence layer — subscribes to eventBus and writes every event
  * to the event_log table in SQLite. Also writes usage_log for turn.completed events.
@@ -5,7 +6,6 @@
  * Call `startEventPersistence()` once during gateway boot.
  */
 import { insertEvent, insertUsageLog } from '@openclaude/storage'
-import type { GatewayEvent, TurnCompletedEvent, CostRecordedEvent } from '@openclaude/protocol'
 import { eventBus } from './eventBus.js'
 import { createLogger } from './logger.js'
 
@@ -23,9 +23,12 @@ function extractPeerFromSessionKey(sk?: string): { peerId?: string; channel?: st
   if (!sk) return {}
   const parts = sk.split(':')
   // agent:<id>:<channel>:<kind>:<peerId>
-  if (parts.length >= 5 && parts[0] === 'agent'
-    && USER_CHANNELS.has(parts[2])
-    && (parts[3] === 'dm' || parts[3] === 'group')) {
+  if (
+    parts.length >= 5 &&
+    parts[0] === 'agent' &&
+    USER_CHANNELS.has(parts[2]) &&
+    (parts[3] === 'dm' || parts[3] === 'group')
+  ) {
     return { channel: parts[2], peerId: parts.slice(4).join(':') }
   }
   return {}

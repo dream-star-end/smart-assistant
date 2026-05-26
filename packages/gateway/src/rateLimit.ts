@@ -51,7 +51,7 @@ export class RateLimiter {
     }
 
     // Remove timestamps outside the window
-    entry.timestamps = entry.timestamps.filter(t => t > windowStart)
+    entry.timestamps = entry.timestamps.filter((t) => t > windowStart)
 
     if (entry.timestamps.length >= this.config.maxRequests) {
       log.warn('rate limited', { peerId, channel, count: entry.timestamps.length })
@@ -69,7 +69,7 @@ export class RateLimiter {
     const windowStart = now - this.config.windowMs
     const entry = this.windows.get(key)
     if (!entry) return this.config.maxRequests
-    const active = entry.timestamps.filter(t => t > windowStart).length
+    const active = entry.timestamps.filter((t) => t > windowStart).length
     return Math.max(0, this.config.maxRequests - active)
   }
 
@@ -80,7 +80,7 @@ export class RateLimiter {
       const now = Date.now()
       const windowStart = now - this.config.windowMs
       for (const [key, entry] of this.windows) {
-        entry.timestamps = entry.timestamps.filter(t => t > windowStart)
+        entry.timestamps = entry.timestamps.filter((t) => t > windowStart)
         if (entry.timestamps.length === 0) {
           this.windows.delete(key)
         }

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 /**
  * Lightweight in-process event bus for OpenClaude gateway.
  *
@@ -8,22 +9,21 @@
  * No distributed messaging, no persistence, no replay.
  */
 import { EventEmitter } from 'node:events'
-import { randomUUID } from 'node:crypto'
 import type {
+  AgentCompletedEvent,
+  AgentDelegatedEvent,
+  CostRecordedEvent,
+  CronFiredEvent,
   GatewayEvent,
   GatewayEventType,
-  CronFiredEvent,
-  WebhookReceivedEvent,
+  MemoryHitEvent,
+  SessionCrashedEvent,
   TaskCreatedEvent,
   TaskDeletedEvent,
-  AgentDelegatedEvent,
-  AgentCompletedEvent,
-  SessionCrashedEvent,
-  TurnCompletedEvent,
   ToolCalledEvent,
-  MemoryHitEvent,
+  TurnCompletedEvent,
   VerificationResultEvent,
-  CostRecordedEvent,
+  WebhookReceivedEvent,
 } from '@openclaude/protocol'
 import { EVENTS_SCHEMA_VERSION } from '@openclaude/protocol'
 
@@ -53,10 +53,7 @@ export class GatewayEventBus {
   }
 
   /** Emit a typed event. Also fires the '*' catch-all. */
-  emit<K extends GatewayEventType>(
-    type: K,
-    event: Extract<GatewayEvent, { type: K }>,
-  ): void {
+  emit<K extends GatewayEventType>(type: K, event: Extract<GatewayEvent, { type: K }>): void {
     this.emitter.emit(type, event)
     this.emitter.emit('*', event)
   }
@@ -101,7 +98,10 @@ export const eventBus = new GatewayEventBus()
 export function createEvent<K extends GatewayEventType>(
   type: K,
   agentId: string,
-  fields: Omit<Extract<GatewayEvent, { type: K }>, 'id' | 'type' | 'timestamp' | 'schemaVersion' | 'agentId'>,
+  fields: Omit<
+    Extract<GatewayEvent, { type: K }>,
+    'id' | 'type' | 'timestamp' | 'schemaVersion' | 'agentId'
+  >,
 ): Extract<GatewayEvent, { type: K }> {
   return {
     id: randomUUID(),

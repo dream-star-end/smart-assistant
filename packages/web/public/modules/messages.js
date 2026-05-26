@@ -44,7 +44,9 @@ let _cleanMarked = null
 function _renderCleanHtml(text) {
   if (!text || !window.marked || !window.DOMPurify) {
     // Strip image markdown to avoid leaking local paths in fallback
-    const safe = (text || '').replace(/!\[([^\]]*)\]\([^)]+\)/g, (_, alt) => (alt ? `[图片: ${alt}]` : '[图片]'))
+    const safe = (text || '').replace(/!\[([^\]]*)\]\([^)]+\)/g, (_, alt) =>
+      alt ? `[图片: ${alt}]` : '[图片]',
+    )
     return htmlSafeEscape(safe).replace(/\n/g, '<br>')
   }
   if (!_cleanMarked) _cleanMarked = new marked.Marked({ gfm: true, breaks: true })
@@ -76,9 +78,7 @@ function _exportPdf(text) {
     return
   }
   w.document.write(
-    '<!DOCTYPE html><html><head><meta charset="utf-8"><title>OpenClaude</title>' +
-      `<style>${_EXPORT_CSS}@media print{body{padding:0;margin:10px}}</style></head>` +
-      `<body>${html}<script>window.onload=function(){window.print()}<\/script></body></html>`,
+    `<!DOCTYPE html><html><head><meta charset="utf-8"><title>OpenClaude</title><style>${_EXPORT_CSS}@media print{body{padding:0;margin:10px}}</style></head><body>${html}<script>window.onload=function(){window.print()}<\/script></body></html>`,
   )
   w.document.close()
 }
@@ -172,33 +172,60 @@ export function scrollBottom(force) {
 }
 
 // ── Tool card SVG icons ──
-const _ICON_TERMINAL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
-const _ICON_FILE_TEXT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>'
-const _ICON_PEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>'
-const _ICON_FILE_PLUS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>'
-const _ICON_SEARCH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>'
-const _ICON_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>'
-const _ICON_GLOBE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>'
-const _ICON_CHECK_LIST = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>'
-const _ICON_BROWSER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><circle cx="6.5" cy="6.5" r="0.6"/></svg>'
-const _ICON_CAMERA = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>'
-const _ICON_CURSOR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7 18 2-8 8-2z"/></svg>'
-const _ICON_KEYBOARD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="10" x2="6" y2="10"/><line x1="10" y1="10" x2="10" y2="10"/><line x1="14" y1="10" x2="14" y2="10"/><line x1="18" y1="10" x2="18" y2="10"/><line x1="7" y1="15" x2="17" y2="15"/></svg>'
-const _ICON_FORM = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="17" y2="13"/><line x1="7" y1="17" x2="13" y2="17"/></svg>'
-const _ICON_IMAGE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>'
-const _ICON_VIDEO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>'
-const _ICON_MUSIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'
-const _ICON_MIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10a7 7 0 0 1-14 0"/><line x1="12" y1="17" x2="12" y2="22"/></svg>'
-const _ICON_BRAIN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3a3 3 0 0 0-3 3 3 3 0 0 0-3 3 3 3 0 0 0 1.5 2.6A3 3 0 0 0 6 18a3 3 0 0 0 3 3"/><path d="M15 3a3 3 0 0 1 3 3 3 3 0 0 1 3 3 3 3 0 0 1-1.5 2.6A3 3 0 0 1 18 18a3 3 0 0 1-3 3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>'
-const _ICON_ARCHIVE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>'
-const _ICON_CLOCK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
-const _ICON_BOT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
-const _ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>'
-const _ICON_SPARKLE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 5.4L19 10l-5.2 1.6L12 17l-1.8-5.4L5 10l5.2-1.6z"/><path d="M19 17l1 3 3 1-3 1-1 3-1-3-3-1 3-1z"/></svg>'
-const _ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>'
-const _ICON_CHART = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>'
-const _ICON_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>'
-const _ICON_NOTEBOOK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>'
+const _ICON_TERMINAL =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
+const _ICON_FILE_TEXT =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>'
+const _ICON_PEN =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>'
+const _ICON_FILE_PLUS =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>'
+const _ICON_SEARCH =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>'
+const _ICON_FOLDER =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>'
+const _ICON_GLOBE =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>'
+const _ICON_CHECK_LIST =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>'
+const _ICON_BROWSER =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><circle cx="6.5" cy="6.5" r="0.6"/></svg>'
+const _ICON_CAMERA =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>'
+const _ICON_CURSOR =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7 18 2-8 8-2z"/></svg>'
+const _ICON_KEYBOARD =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="10" x2="6" y2="10"/><line x1="10" y1="10" x2="10" y2="10"/><line x1="14" y1="10" x2="14" y2="10"/><line x1="18" y1="10" x2="18" y2="10"/><line x1="7" y1="15" x2="17" y2="15"/></svg>'
+const _ICON_FORM =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="17" y2="13"/><line x1="7" y1="17" x2="13" y2="17"/></svg>'
+const _ICON_IMAGE =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>'
+const _ICON_VIDEO =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>'
+const _ICON_MUSIC =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'
+const _ICON_MIC =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10a7 7 0 0 1-14 0"/><line x1="12" y1="17" x2="12" y2="22"/></svg>'
+const _ICON_BRAIN =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3a3 3 0 0 0-3 3 3 3 0 0 0-3 3 3 3 0 0 0 1.5 2.6A3 3 0 0 0 6 18a3 3 0 0 0 3 3"/><path d="M15 3a3 3 0 0 1 3 3 3 3 0 0 1 3 3 3 3 0 0 1-1.5 2.6A3 3 0 0 1 18 18a3 3 0 0 1-3 3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>'
+const _ICON_ARCHIVE =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>'
+const _ICON_CLOCK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
+const _ICON_BOT =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>'
+const _ICON_SEND =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>'
+const _ICON_SPARKLE =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 5.4L19 10l-5.2 1.6L12 17l-1.8-5.4L5 10l5.2-1.6z"/><path d="M19 17l1 3 3 1-3 1-1 3-1-3-3-1 3-1z"/></svg>'
+const _ICON_EYE =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>'
+const _ICON_CHART =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>'
+const _ICON_GEAR =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>'
+const _ICON_NOTEBOOK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>'
 
 const _TOOL_ICONS = {
   Bash: _ICON_TERMINAL,
@@ -217,9 +244,18 @@ const _TOOL_ICONS = {
 }
 
 const _TOOL_LABELS = {
-  Bash: '终端', Read: '读取文件', Edit: '编辑文件', Write: '写入文件',
-  Grep: '搜索内容', Glob: '搜索文件', WebFetch: '网页抓取', WebSearch: '网页搜索',
-  TodoWrite: '任务列表', NotebookEdit: '笔记本', Task: '子任务', Agent: '子任务',
+  Bash: '终端',
+  Read: '读取文件',
+  Edit: '编辑文件',
+  Write: '写入文件',
+  Grep: '搜索内容',
+  Glob: '搜索文件',
+  WebFetch: '网页抓取',
+  WebSearch: '网页搜索',
+  TodoWrite: '任务列表',
+  NotebookEdit: '笔记本',
+  Task: '子任务',
+  Agent: '子任务',
 }
 
 // ── MCP server prefix → friendly meta (icon + base label) ──
@@ -321,7 +357,11 @@ function _toolMeta(name) {
 function _safeInput(msg) {
   if (msg.inputJson && typeof msg.inputJson === 'object') return msg.inputJson
   if (msg.inputPreview) {
-    try { return JSON.parse(msg.inputPreview) } catch { return null }
+    try {
+      return JSON.parse(msg.inputPreview)
+    } catch {
+      return null
+    }
   }
   return null
 }
@@ -330,14 +370,18 @@ function _shortPath(p) {
   if (!p || typeof p !== 'string') return ''
   // Show last 2-3 path segments
   const parts = p.replace(/\\/g, '/').split('/')
-  return parts.length > 3 ? '…/' + parts.slice(-3).join('/') : p
+  return parts.length > 3 ? `…/${parts.slice(-3).join('/')}` : p
 }
 
 function _buildPermissionCard(el, msg) {
   // AskUserQuestion is rendered as an interview summary (one line per
   // question→answer) instead of the generic Permission Request chip. Feeds
   // off msg._answers which websocket.js stores on allow-submit.
-  if (msg.toolName === 'AskUserQuestion' && msg.inputJson && Array.isArray(msg.inputJson.questions)) {
+  if (
+    msg.toolName === 'AskUserQuestion' &&
+    msg.inputJson &&
+    Array.isArray(msg.inputJson.questions)
+  ) {
     _buildAskUserQuestionCard(el, msg)
     return
   }
@@ -346,18 +390,20 @@ function _buildPermissionCard(el, msg) {
   const resolved = msg._resolved
   const behavior = msg._behavior
   const statusIcon = !resolved ? '⏳' : behavior === 'allow' ? '✓' : '✗'
-  const statusText = !resolved ? 'Waiting for approval...' : behavior === 'allow' ? 'Allowed' : 'Denied'
+  const statusText = !resolved
+    ? 'Waiting for approval...'
+    : behavior === 'allow'
+      ? 'Allowed'
+      : 'Denied'
   const statusClass = !resolved ? '' : behavior === 'allow' ? 'resolved-allow' : 'resolved-deny'
 
   const body = document.createElement('div')
   body.className = `msg-body ${statusClass}`
-  body.innerHTML = `<div style="display:flex;align-items:center;gap:8px">` +
-    `<span style="font-size:16px">${statusIcon}</span>` +
-    `<span style="font-weight:600">Permission: </span>` +
-    `<code>${toolName}</code>` +
-    `<span style="color:var(--fg-muted);margin-left:auto;font-size:12px">${statusText}</span>` +
-    `</div>` +
-    (msg.inputPreview ? `<div style="font-size:12px;color:var(--fg-muted);margin-top:4px;word-break:break-all">${htmlSafeEscape(msg.inputPreview.slice(0, 200))}</div>` : '')
+  body.innerHTML = `<div style="display:flex;align-items:center;gap:8px"><span style="font-size:16px">${statusIcon}</span><span style="font-weight:600">Permission: </span><code>${toolName}</code><span style="color:var(--fg-muted);margin-left:auto;font-size:12px">${statusText}</span></div>${
+    msg.inputPreview
+      ? `<div style="font-size:12px;color:var(--fg-muted);margin-top:4px;word-break:break-all">${htmlSafeEscape(msg.inputPreview.slice(0, 200))}</div>`
+      : ''
+  }`
   el.appendChild(body)
 }
 
@@ -367,11 +413,7 @@ function _buildAskUserQuestionCard(el, msg) {
   const answers = msg._answers || {}
   const questions = msg.inputJson.questions
   const statusIcon = !resolved ? '⏳' : behavior === 'allow' ? '✓' : '✗'
-  const statusText = !resolved
-    ? '等待回答…'
-    : behavior === 'allow'
-      ? '已提交'
-      : '已跳过'
+  const statusText = !resolved ? '等待回答…' : behavior === 'allow' ? '已提交' : '已跳过'
   const statusClass = !resolved ? '' : behavior === 'allow' ? 'resolved-allow' : 'resolved-deny'
 
   const body = document.createElement('div')
@@ -379,10 +421,7 @@ function _buildAskUserQuestionCard(el, msg) {
 
   const headerEl = document.createElement('div')
   headerEl.className = 'aq-card-header'
-  headerEl.innerHTML =
-    `<span class="aq-card-icon">${statusIcon}</span>` +
-    `<span class="aq-card-title">用户问答</span>` +
-    `<span class="aq-card-status">${htmlSafeEscape(statusText)}</span>`
+  headerEl.innerHTML = `<span class="aq-card-icon">${statusIcon}</span><span class="aq-card-title">用户问答</span><span class="aq-card-status">${htmlSafeEscape(statusText)}</span>`
   body.appendChild(headerEl)
 
   const list = document.createElement('div')
@@ -477,7 +516,8 @@ function _renderAgentGroup(el, msg) {
     if (msg._isError) {
       statusHtml = '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
     } else {
-      const dur = typeof msg._duration === 'number' ? ` (${(msg._duration / 1000).toFixed(1)}s)` : ''
+      const dur =
+        typeof msg._duration === 'number' ? ` (${(msg._duration / 1000).toFixed(1)}s)` : ''
       statusHtml = `<span class="agent-group-status" style="color:var(--success)">完成${dur}</span>`
     }
   } else {
@@ -580,15 +620,24 @@ function _buildToolCard(el, msg) {
 
 function _renderToolBody(body, name, input, msg) {
   switch (name) {
-    case 'Bash': return _renderBash(body, input, msg)
-    case 'Edit': return _renderEdit(body, input, msg)
-    case 'Read': return _renderRead(body, input, msg)
-    case 'Write': return _renderWrite(body, input, msg)
-    case 'Grep': return _renderGrep(body, input, msg)
-    case 'Glob': return _renderGlob(body, input, msg)
-    case 'TodoWrite': return _renderTodoWrite(body, input, msg)
-    case 'WebFetch': return _renderWebFetch(body, input, msg)
-    case 'WebSearch': return _renderWebSearch(body, input, msg)
+    case 'Bash':
+      return _renderBash(body, input, msg)
+    case 'Edit':
+      return _renderEdit(body, input, msg)
+    case 'Read':
+      return _renderRead(body, input, msg)
+    case 'Write':
+      return _renderWrite(body, input, msg)
+    case 'Grep':
+      return _renderGrep(body, input, msg)
+    case 'Glob':
+      return _renderGlob(body, input, msg)
+    case 'TodoWrite':
+      return _renderTodoWrite(body, input, msg)
+    case 'WebFetch':
+      return _renderWebFetch(body, input, msg)
+    case 'WebSearch':
+      return _renderWebSearch(body, input, msg)
   }
   const mcp = _parseMcpName(name)
   if (mcp) {
@@ -603,21 +652,32 @@ function _renderToolBody(body, name, input, msg) {
 function _toolSummary(name, input, msg) {
   if (!input) return ''
   switch (name) {
-    case 'Bash': return (input.description || (input.command || '').split('\n')[0]).slice(0, 60)
-    case 'Edit': return _shortPath(input.file_path)
-    case 'Read': return _shortPath(input.file_path)
-    case 'Write': return _shortPath(input.file_path)
-    case 'Grep': return `/${input.pattern || ''}/`
-    case 'Glob': return input.pattern || ''
-    case 'WebFetch': return (input.url || '').slice(0, 60)
-    case 'WebSearch': return (input.query || '').slice(0, 60)
+    case 'Bash':
+      return (input.description || (input.command || '').split('\n')[0]).slice(0, 60)
+    case 'Edit':
+      return _shortPath(input.file_path)
+    case 'Read':
+      return _shortPath(input.file_path)
+    case 'Write':
+      return _shortPath(input.file_path)
+    case 'Grep':
+      return `/${input.pattern || ''}/`
+    case 'Glob':
+      return input.pattern || ''
+    case 'WebFetch':
+      return (input.url || '').slice(0, 60)
+    case 'WebSearch':
+      return (input.query || '').slice(0, 60)
     case 'TodoWrite': {
       const todos = Array.isArray(input.todos) ? input.todos : []
       const done = todos.filter((t) => t && t.status === 'completed').length
       return todos.length ? `${done}/${todos.length}` : ''
     }
-    case 'NotebookEdit': return _shortPath(input.notebook_path)
-    case 'Task': case 'Agent': return (input.description || input.prompt || '').slice(0, 60)
+    case 'NotebookEdit':
+      return _shortPath(input.notebook_path)
+    case 'Task':
+    case 'Agent':
+      return (input.description || input.prompt || '').slice(0, 60)
   }
   // MCP fallback summaries
   const mcp = _parseMcpName(name)
@@ -632,12 +692,18 @@ function _mcpSummary(server, op, input) {
     if (op === 'browser_click' || op === 'browser_hover') return input.element || input.ref || ''
     if (op === 'browser_type' || op === 'browser_press_key') return input.text || input.key || ''
     if (op === 'browser_take_screenshot') return input.filename || ''
-    if (op === 'browser_evaluate' || op === 'browser_run_code') return (input.code || input.function || '').replace(/\s+/g, ' ').slice(0, 60)
+    if (op === 'browser_evaluate' || op === 'browser_run_code')
+      return (input.code || input.function || '').replace(/\s+/g, ' ').slice(0, 60)
     if (op === 'browser_wait_for') return input.text || `${input.time || 0}s`
     return op
   }
   if (server === 'minimax-media') {
-    if (op === 'text_to_image' || op === 'generate_video' || op === 'music_generation' || op === 'text_to_audio') {
+    if (
+      op === 'text_to_image' ||
+      op === 'generate_video' ||
+      op === 'music_generation' ||
+      op === 'text_to_audio'
+    ) {
       return (input.prompt || input.text || input.lyrics || '').slice(0, 60)
     }
     if (op === 'query_video_generation') return input.task_id || ''
@@ -691,11 +757,12 @@ function _renderBash(body, input, msg) {
   // Anchoring to the prefix + the strict task-id shape (Task.ts:80,96) avoids
   // false positives if a foreground command's stdout happens to contain
   // similar substrings.
-  const bgMatch = typeof msg.output === 'string'
-    ? msg.output.match(
-        /^(?:Command running in background|Command was manually backgrounded by user|Command exceeded the assistant-mode blocking budget \(\d+s\) and was moved to the background) [\s\S]*?with ID:\s+(b[0-9a-z]{8})\.[\s\S]*?Output is being written to:\s*(\S+)/,
-      )
-    : null
+  const bgMatch =
+    typeof msg.output === 'string'
+      ? msg.output.match(
+          /^(?:Command running in background|Command was manually backgrounded by user|Command exceeded the assistant-mode blocking budget \(\d+s\) and was moved to the background) [\s\S]*?with ID:\s+(b[0-9a-z]{8})\.[\s\S]*?Output is being written to:\s*(\S+)/,
+        )
+      : null
   if (bgMatch) {
     // Background bash: replace the verbose placeholder with a compact note
     // and stream the live tail from CCB's TaskOutput poller. The poller keeps
@@ -768,7 +835,7 @@ function _renderEdit(body, input, msg) {
         if (++lineCount > _MAX_DIFF_LINES) break
         const el = document.createElement('div')
         el.className = 'tool-diff-del'
-        el.textContent = '- ' + line
+        el.textContent = `- ${line}`
         diffBlock.appendChild(el)
       }
     }
@@ -777,7 +844,7 @@ function _renderEdit(body, input, msg) {
         if (++lineCount > _MAX_DIFF_LINES) break
         const el = document.createElement('div')
         el.className = 'tool-diff-add'
-        el.textContent = '+ ' + line
+        el.textContent = `+ ${line}`
         diffBlock.appendChild(el)
       }
     }
@@ -848,7 +915,10 @@ function _renderGrep(body, input, msg) {
     if (input.path) parts.push(htmlSafeEscape(_shortPath(input.path)))
     if (input.glob) parts.push(`glob: ${htmlSafeEscape(input.glob)}`)
     if (input.output_mode) parts.push(htmlSafeEscape(input.output_mode))
-    if (parts.length) { meta.innerHTML = parts.join(' &middot; '); body.appendChild(meta) }
+    if (parts.length) {
+      meta.innerHTML = parts.join(' &middot; ')
+      body.appendChild(meta)
+    }
   }
   if (msg.output) {
     const pre = document.createElement('pre')
@@ -891,7 +961,11 @@ function _formatValue(v) {
   if (Array.isArray(v)) {
     if (v.length === 0) return '[]'
     if (v.length <= 3 && v.every((x) => x == null || typeof x !== 'object')) {
-      try { return JSON.stringify(v) } catch { return `Array(${v.length})` }
+      try {
+        return JSON.stringify(v)
+      } catch {
+        return `Array(${v.length})`
+      }
     }
     return `Array(${v.length})`
   }
@@ -899,7 +973,11 @@ function _formatValue(v) {
     const keys = Object.keys(v)
     if (keys.length === 0) return '{}'
     if (keys.length <= 3 && keys.every((k) => v[k] == null || typeof v[k] !== 'object')) {
-      try { return JSON.stringify(v) } catch { return `{${keys.length} 字段}` }
+      try {
+        return JSON.stringify(v)
+      } catch {
+        return `{${keys.length} 字段}`
+      }
     }
     const head = keys.slice(0, 3).join(', ')
     return keys.length > 3 ? `{${head}, …+${keys.length - 3}}` : `{${head}}`
@@ -913,8 +991,8 @@ function _renderKvList(parent, obj, opts) {
   if (keys.length === 0) return
   const list = document.createElement('div')
   list.className = 'tool-kv-list'
-  const skip = new Set((opts && opts.skip) || [])
-  const maxValueLen = (opts && opts.maxValueLen) || 240
+  const skip = new Set(opts?.skip || [])
+  const maxValueLen = opts?.maxValueLen || 240
   for (const k of keys) {
     if (skip.has(k)) continue
     const v = obj[k]
@@ -927,7 +1005,7 @@ function _renderKvList(parent, obj, opts) {
     const valEl = document.createElement('span')
     valEl.className = 'tool-kv-val'
     let str = _formatValue(v)
-    if (str.length > maxValueLen) str = str.slice(0, maxValueLen) + '…'
+    if (str.length > maxValueLen) str = `${str.slice(0, maxValueLen)}…`
     valEl.textContent = str
     item.appendChild(keyEl)
     item.appendChild(valEl)
@@ -939,7 +1017,7 @@ function _renderKvList(parent, obj, opts) {
 // Render output as text. If JSON, pretty-print; if URL, embed.
 function _renderOutput(body, output, opts) {
   if (!output) return
-  const max = (opts && opts.max) || 1500
+  const max = opts?.max || 1500
   let text = String(output)
   // Try JSON pretty-print
   if (text.length < 4000 && /^\s*[\[{]/.test(text)) {
@@ -951,7 +1029,7 @@ function _renderOutput(body, output, opts) {
   const pre = document.createElement('pre')
   pre.className = 'tool-output'
   if (text.length > max) {
-    pre.textContent = text.slice(0, max) + '\n…'
+    pre.textContent = `${text.slice(0, max)}\n…`
   } else {
     pre.textContent = text
   }
@@ -977,7 +1055,7 @@ function _renderTodoWrite(body, input, msg) {
     mark.textContent = status === 'completed' ? '✓' : status === 'in_progress' ? '◐' : '○'
     const text = document.createElement('span')
     text.className = 'tool-todo-text'
-    text.textContent = (status === 'in_progress' && t.activeForm) ? t.activeForm : (t.content || '')
+    text.textContent = status === 'in_progress' && t.activeForm ? t.activeForm : t.content || ''
     row.appendChild(mark)
     row.appendChild(text)
     list.appendChild(row)
@@ -993,7 +1071,12 @@ function _renderWebFetch(body, input, msg) {
 
 // ── WebSearch: query + results ──
 function _renderWebSearch(body, input, msg) {
-  if (input) _renderKvList(body, { query: input.query, allowed_domains: input.allowed_domains, blocked_domains: input.blocked_domains })
+  if (input)
+    _renderKvList(body, {
+      query: input.query,
+      allowed_domains: input.allowed_domains,
+      blocked_domains: input.blocked_domains,
+    })
   _renderOutput(body, msg.output)
 }
 
@@ -1031,7 +1114,14 @@ function _renderBrowser(body, op, input, msg) {
 // ── MCP minimax-media: prompt + parameters ──
 function _renderMedia(body, op, input, msg) {
   if (input) {
-    const promptKeys = ['prompt', 'text', 'lyrics', 'first_frame_image', 'last_frame_image', 'subject_reference']
+    const promptKeys = [
+      'prompt',
+      'text',
+      'lyrics',
+      'first_frame_image',
+      'last_frame_image',
+      'subject_reference',
+    ]
     const promptVal = promptKeys.map((k) => input[k]).find((v) => typeof v === 'string' && v)
     if (promptVal) {
       const p = document.createElement('div')
@@ -1065,7 +1155,13 @@ function _renderMemory(body, op, input, msg) {
     if (op === 'memory') {
       _renderKvList(body, { op: input.op, section: input.section, content: input.content })
     } else if (op === 'create_reminder') {
-      _renderKvList(body, { schedule: input.schedule, message: input.message, label: input.label, oneshot: input.oneshot, deliver: input.deliver })
+      _renderKvList(body, {
+        schedule: input.schedule,
+        message: input.message,
+        label: input.label,
+        oneshot: input.oneshot,
+        deliver: input.deliver,
+      })
     } else if (op === 'delegate_task' || op === 'send_to_agent') {
       _renderKvList(body, {
         agent: input.agentId,
@@ -1100,7 +1196,7 @@ function _renderGeneric(body, input, msg) {
 // import send() from main.js — the textarea/button fire path keeps state
 // (effort pill, attachments, autosize) consistent with a normal user send.
 function _applyTruncatedBanner(el, msg) {
-  const reason = msg && msg._truncated
+  const reason = msg?._truncated
   let banner = el.querySelector(':scope > .msg-truncated-banner')
   if (!reason) {
     if (banner) banner.remove()
@@ -1111,7 +1207,7 @@ function _applyTruncatedBanner(el, msg) {
     banner.className = 'msg-truncated-banner'
     // Insert AFTER msg-body so it sits between body and actions/meta.
     const body = el.querySelector(':scope > .msg-body')
-    if (body && body.nextSibling) el.insertBefore(banner, body.nextSibling)
+    if (body?.nextSibling) el.insertBefore(banner, body.nextSibling)
     else el.appendChild(banner)
   }
   const reasonText =
@@ -1136,8 +1232,7 @@ function _applyTruncatedBanner(el, msg) {
     // 续写文案保持中性、不绑定特定话题,避免触发模型重新做总结。
     const prompt = '请接着上一条回复被截断的位置继续完成,不要重复已写过的内容,直接续写。'
     const existingDraft = ta.value.trim()
-    const hasAttachments =
-      Array.isArray(state.attachments) && state.attachments.length > 0
+    const hasAttachments = Array.isArray(state.attachments) && state.attachments.length > 0
     if (existingDraft || hasAttachments) {
       // 用户已有草稿 / 已选附件:不能直接 send 把它们和"续写"混在一起 ——
       // 把 prompt 追加到末尾,光标置末,等用户 review 后自己按 Enter。
@@ -1231,10 +1326,13 @@ export function _buildMessageEl(msg) {
             .catch(() => {
               // Fallback to writeText if ClipboardItem fails (e.g. Firefox)
               if (navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(raw).then(_doCopied).catch(() => {
-                  fallbackCopy(raw)
-                  _doCopied()
-                })
+                navigator.clipboard
+                  .writeText(raw)
+                  .then(_doCopied)
+                  .catch(() => {
+                    fallbackCopy(raw)
+                    _doCopied()
+                  })
               } else {
                 fallbackCopy(raw)
                 _doCopied()
@@ -1267,7 +1365,9 @@ export function _buildMessageEl(msg) {
           m._ac?.abort()
           m.remove()
         })
-        document.querySelectorAll('.msg-actions.menu-open').forEach((a) => a.classList.remove('menu-open'))
+        document
+          .querySelectorAll('.msg-actions.menu-open')
+          .forEach((a) => a.classList.remove('menu-open'))
         actions.classList.add('menu-open')
         const menu = document.createElement('div')
         menu.className = 'msg-save-menu'
@@ -1288,8 +1388,10 @@ export function _buildMessageEl(msg) {
             const fmt = savBtn.dataset.save
             const raw = msg.text || ''
             if (fmt === 'md') _exportMd(raw)
-            else if (fmt === 'docx') exportMessageDocx(msg, { title: getSession()?.title || 'openclaude' })
-            else if (fmt === 'tex') exportMessageTex(msg, { title: getSession()?.title || 'openclaude' })
+            else if (fmt === 'docx')
+              exportMessageDocx(msg, { title: getSession()?.title || 'openclaude' })
+            else if (fmt === 'tex')
+              exportMessageTex(msg, { title: getSession()?.title || 'openclaude' })
             else if (fmt === 'pdf') _exportPdf(raw)
             menu.remove()
             actions.classList.remove('menu-open')
@@ -1320,12 +1422,14 @@ export function _buildMessageEl(msg) {
         // Stop any in-flight turn before regenerating to avoid concurrent requests.
         if (state.sendingInFlight) {
           if (state.ws && state.ws.readyState === 1) {
-            state.ws.send(JSON.stringify({
-              type: 'inbound.control.stop',
-              channel: 'webchat',
-              peer: { id: sess.id, kind: 'dm' },
-              agentId: sess.agentId || state.defaultAgentId,
-            }))
+            state.ws.send(
+              JSON.stringify({
+                type: 'inbound.control.stop',
+                channel: 'webchat',
+                peer: { id: sess.id, kind: 'dm' },
+                agentId: sess.agentId || state.defaultAgentId,
+              }),
+            )
           }
           sess._sendingInFlight = false
           _clearTurnTiming?.(sess)
@@ -1377,14 +1481,18 @@ export function _buildMessageEl(msg) {
           ts: Date.now(),
         }
         // Check if there are pending offline items for this session to prevent reordering
-        const _hasQueued = (state.offlineQueue?.some(i => i.sessId === sess.id)) ||
-          (state._offlineQueuePending?.some(i => i.sessId === sess.id)) ||
-          (state._offlineDrainingCurrent?.sessId === sess.id)
+        const _hasQueued =
+          state.offlineQueue?.some((i) => i.sessId === sess.id) ||
+          state._offlineQueuePending?.some((i) => i.sessId === sess.id) ||
+          state._offlineDrainingCurrent?.sessId === sess.id
         if (state.ws && state.ws.readyState === 1 && !_hasQueued) {
           state.ws.send(JSON.stringify(wsPayload))
           sess._sendingInFlight = true
           // Clear any leftover regen timer from a previous regen/stop cycle
-          if (sess._regenSafetyTimer) { clearTimeout(sess._regenSafetyTimer); sess._regenSafetyTimer = null }
+          if (sess._regenSafetyTimer) {
+            clearTimeout(sess._regenSafetyTimer)
+            sess._regenSafetyTimer = null
+          }
           sess._regenSafetyTimer = setTimeout(() => {
             sess._regenSafetyTimer = null
             if (sess._sendingInFlight) {
@@ -1392,12 +1500,14 @@ export function _buildMessageEl(msg) {
               // Also interrupt the backend turn
               try {
                 if (state.ws && state.ws.readyState === 1) {
-                  state.ws.send(JSON.stringify({
-                    type: 'inbound.control.stop',
-                    channel: 'webchat',
-                    peer: { id: sess.id, kind: 'dm' },
-                    agentId: sess.agentId || state.defaultAgentId,
-                  }))
+                  state.ws.send(
+                    JSON.stringify({
+                      type: 'inbound.control.stop',
+                      channel: 'webchat',
+                      peer: { id: sess.id, kind: 'dm' },
+                      agentId: sess.agentId || state.defaultAgentId,
+                    }),
+                  )
                 }
               } catch {}
               sess._sendingInFlight = false
@@ -1448,7 +1558,7 @@ export function _buildMessageEl(msg) {
           window.speechSynthesis.speak(utter)
           btn.innerHTML = _svgStop
           btn.title = '停止朗读'
-          btn.dataset.action = 'tts-stop'  // Change action to prevent re-entry from delegated handler
+          btn.dataset.action = 'tts-stop' // Change action to prevent re-entry from delegated handler
           utter.onend = () => {
             btn.innerHTML = _svgVol
             btn.title = '朗读'
@@ -1561,7 +1671,9 @@ function _appendMsgTime(el, ts) {
   timeEl.textContent = label
   timeEl.dataset.ts = String(ts)
   // Full timestamp in title for hover inspection
-  try { timeEl.title = new Date(ts).toLocaleString('zh-CN') } catch {}
+  try {
+    timeEl.title = new Date(ts).toLocaleString('zh-CN')
+  } catch {}
   el.appendChild(timeEl)
 }
 
@@ -1584,7 +1696,9 @@ function _refreshMsgTime(el, msg) {
   existing.dataset.ts = String(effectiveTs)
   const label = msgTimeLabel(effectiveTs)
   if (label) existing.textContent = label
-  try { existing.title = new Date(effectiveTs).toLocaleString('zh-CN') } catch {}
+  try {
+    existing.title = new Date(effectiveTs).toLocaleString('zh-CN')
+  } catch {}
 }
 
 export function renderMessage(msg, skipRichBlocks = false) {
@@ -1611,13 +1725,32 @@ export function updateMessageEl(msg, streaming) {
         // Append blinking caret inside the deepest last block element
         // so it appears at the actual text cursor position
         let _caretTarget = body
-        while (_caretTarget.lastElementChild &&
-               !_caretTarget.lastElementChild.classList?.contains('code-block') &&
-               _caretTarget.lastElementChild.tagName !== 'PRE') {
+        while (
+          _caretTarget.lastElementChild &&
+          !_caretTarget.lastElementChild.classList?.contains('code-block') &&
+          _caretTarget.lastElementChild.tagName !== 'PRE'
+        ) {
           const last = _caretTarget.lastElementChild
           // Only descend into block-level elements that contain text
           const tag = last.tagName
-          if (['P','LI','TD','TH','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','DIV','OL','UL'].includes(tag)) {
+          if (
+            [
+              'P',
+              'LI',
+              'TD',
+              'TH',
+              'H1',
+              'H2',
+              'H3',
+              'H4',
+              'H5',
+              'H6',
+              'BLOCKQUOTE',
+              'DIV',
+              'OL',
+              'UL',
+            ].includes(tag)
+          ) {
             _caretTarget = last
           } else {
             break
@@ -1669,7 +1802,7 @@ export function updateMessageEl(msg, streaming) {
       // Preserve collapsed state across re-renders
       const wasCollapsed = el.classList.contains('collapsed')
       el.innerHTML = ''
-      el.className = `msg tool`
+      el.className = 'msg tool'
       if (msg.error) el.classList.add('error')
       el.dataset.msgId = msg.id
       _buildToolCard(el, msg)
@@ -1787,14 +1920,14 @@ export function updateSessionSub(s) {
   }
   const n = s.messages.filter((m) => m.role === 'user').length
   const shortId = s.id.replace(/^web-/, '')
-  el.textContent = (n > 0 ? `${n} 轮 · ` : '') + shortTime(s.lastAt) + ` · ${shortId}`
+  el.textContent = `${(n > 0 ? `${n} 轮 · ` : '') + shortTime(s.lastAt)} · ${shortId}`
   el.title = s.id // full ID on hover
   updateTokenUsageDisplay(s._tokenUsage)
 }
 
 function _formatTokenCount(n) {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
   return String(n)
 }
 
@@ -1810,11 +1943,8 @@ export function updateTokenUsageDisplay(usage) {
   }
   el.classList.add('has-usage')
   const total = usage.input + usage.output
-  const parts = [_formatTokenCount(total) + ' tokens']
-  if (usage.cost > 0) parts.push('$' + usage.cost.toFixed(4))
+  const parts = [`${_formatTokenCount(total)} tokens`]
+  if (usage.cost > 0) parts.push(`$${usage.cost.toFixed(4)}`)
   textEl.textContent = parts.join(' · ')
-  el.title = `输入: ${_formatTokenCount(usage.input)} · 输出: ${_formatTokenCount(usage.output)}` +
-    (usage.cacheRead > 0 ? ` · 缓存读: ${_formatTokenCount(usage.cacheRead)}` : '') +
-    (usage.cacheWrite > 0 ? ` · 缓存写: ${_formatTokenCount(usage.cacheWrite)}` : '') +
-    (usage.cost > 0 ? ` · 费用: $${usage.cost.toFixed(4)}` : '')
+  el.title = `输入: ${_formatTokenCount(usage.input)} · 输出: ${_formatTokenCount(usage.output)}${usage.cacheRead > 0 ? ` · 缓存读: ${_formatTokenCount(usage.cacheRead)}` : ''}${usage.cacheWrite > 0 ? ` · 缓存写: ${_formatTokenCount(usage.cacheWrite)}` : ''}${usage.cost > 0 ? ` · 费用: $${usage.cost.toFixed(4)}` : ''}`
 }

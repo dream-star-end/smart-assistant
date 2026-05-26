@@ -17,10 +17,7 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
 
   // Fatal crash handler: structured log, best-effort graceful shutdown, then exit(1).
   // A hard-deadline timer guarantees we exit even if shutdown hangs.
-  const emergencyExit = (
-    kind: 'uncaughtException' | 'unhandledRejection',
-    err: unknown,
-  ): void => {
+  const emergencyExit = (kind: 'uncaughtException' | 'unhandledRejection', err: unknown): void => {
     // Ensure any natural event-loop drain after this point yields exit code 1.
     process.exitCode = 1
 

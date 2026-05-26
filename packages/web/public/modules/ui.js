@@ -17,11 +17,11 @@ export function toast(msg, kind) {
 
 let _modalFocusReturn = null
 let _activeFocusTrap = null
-const _focusTrapStack = []  // Stack for nested modals
+const _focusTrapStack = [] // Stack for nested modals
 
 function _getFocusable(container) {
   return container.querySelectorAll(
-    'input:not([disabled]),textarea:not([disabled]),select:not([disabled]),button:not([disabled]),[tabindex]:not([tabindex="-1"])'
+    'input:not([disabled]),textarea:not([disabled]),select:not([disabled]),button:not([disabled]),[tabindex]:not([tabindex="-1"])',
   )
 }
 
@@ -32,7 +32,9 @@ export function openModal(id) {
   if (modal) {
     // Focus first actionable button (skip readonly fields like in permission modal)
     const actionBtn = modal.querySelector('button:not([disabled]):not([data-close-modal])')
-    const fallback = modal.querySelector('input:not([readonly]),textarea:not([readonly]),select,button:not([disabled])')
+    const fallback = modal.querySelector(
+      'input:not([readonly]),textarea:not([readonly]),select,button:not([disabled])',
+    )
     const target = actionBtn || fallback
     if (target) setTimeout(() => target.focus(), 50)
     // Focus trap: Tab cycles within the modal. Stacked for nested modals.
@@ -44,9 +46,15 @@ export function openModal(id) {
       const first = focusable[0]
       const last = focusable[focusable.length - 1]
       if (e.shiftKey) {
-        if (document.activeElement === first) { e.preventDefault(); last.focus() }
+        if (document.activeElement === first) {
+          e.preventDefault()
+          last.focus()
+        }
       } else {
-        if (document.activeElement === last) { e.preventDefault(); first.focus() }
+        if (document.activeElement === last) {
+          e.preventDefault()
+          first.focus()
+        }
       }
     }
     document.addEventListener('keydown', _activeFocusTrap)
@@ -55,7 +63,7 @@ export function openModal(id) {
 
 export function closeModal(id) {
   const el = $(id)
-  if (!el?.classList.contains('open')) return  // Already closed, don't tear down traps
+  if (!el?.classList.contains('open')) return // Already closed, don't tear down traps
   el.classList.remove('open')
   if (_activeFocusTrap) {
     document.removeEventListener('keydown', _activeFocusTrap)

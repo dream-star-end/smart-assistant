@@ -82,7 +82,7 @@ function escapeLabelValue(v: string): string {
 function labelKey(labels: Record<string, string>): string {
   const keys = Object.keys(labels).sort()
   if (keys.length === 0) return '{}'
-  return '{' + keys.map((k) => `${k}="${escapeLabelValue(labels[k])}"`).join(',') + '}'
+  return `{${keys.map((k) => `${k}="${escapeLabelValue(labels[k])}"`).join(',')}}`
 }
 
 // ── Metrics instances ──
@@ -95,7 +95,9 @@ export const turnDuration = new Histogram([500, 1000, 2500, 5000, 10000, 30000, 
 export const turnTokens = new Counter()
 
 export const toolCallsTotal = new Counter()
-export const toolCallDuration = new Histogram([10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000])
+export const toolCallDuration = new Histogram([
+  10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000,
+])
 export const costTotal = new Counter()
 
 export const sessionsActive = { value: 0 }
@@ -126,7 +128,8 @@ export function startMetricsCollection(): void {
     turnDuration.observe(ev.durationMs ?? 0, labels)
     turnTokens.inc({ agent: ev.agentId, direction: 'input' }, ev.usage.inputTokens ?? 0)
     turnTokens.inc({ agent: ev.agentId, direction: 'output' }, ev.usage.outputTokens ?? 0)
-    if (ev.usage.cacheReadTokens) turnTokens.inc({ agent: ev.agentId, direction: 'cache_read' }, ev.usage.cacheReadTokens)
+    if (ev.usage.cacheReadTokens)
+      turnTokens.inc({ agent: ev.agentId, direction: 'cache_read' }, ev.usage.cacheReadTokens)
   })
 
   eventBus.on('tool.called', (ev) => {
@@ -176,12 +179,12 @@ export function serializeMetrics(): string {
       'oc_outbound_ring_evicted_total',
       'Outbound ring frames evicted by cause (entries|age|bytes)',
     ),
-    `# HELP oc_sessions_active Currently active sessions`,
-    `# TYPE oc_sessions_active gauge`,
+    '# HELP oc_sessions_active Currently active sessions',
+    '# TYPE oc_sessions_active gauge',
     `oc_sessions_active ${sessionsActive.value}`,
-    `# HELP oc_outbound_ring_size_bytes Outbound ring total bytes across all sessions`,
-    `# TYPE oc_outbound_ring_size_bytes gauge`,
+    '# HELP oc_outbound_ring_size_bytes Outbound ring total bytes across all sessions',
+    '# TYPE oc_outbound_ring_size_bytes gauge',
     `oc_outbound_ring_size_bytes ${outboundRingSizeBytes.value}`,
   ]
-  return sections.join('\n\n') + '\n'
+  return `${sections.join('\n\n')}\n`
 }

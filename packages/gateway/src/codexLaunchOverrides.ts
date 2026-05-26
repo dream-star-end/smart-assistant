@@ -151,7 +151,9 @@ function tomlValue(v: string | string[] | Record<string, string>): string {
   if (Array.isArray(v)) {
     for (const item of v) {
       if (typeof item !== 'string') {
-        throw new TypeError(`tomlValue array: only string elements are supported, got ${typeof item}`)
+        throw new TypeError(
+          `tomlValue array: only string elements are supported, got ${typeof item}`,
+        )
       }
     }
     return `[${v.map((item) => JSON.stringify(item)).join(',')}]`

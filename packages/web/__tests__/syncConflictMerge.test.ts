@@ -50,12 +50,7 @@ function makeCallable<T extends (...args: any[]) => any>(src: string): T {
 
 // _localDominates calls _localMessageSupersedes which in turn calls
 // _stableStringify. Compile the whole closure together in one `new Function`.
-const _combined =
-  extractTopLevelFn(SYNC_SRC, '_stableStringify') +
-  '\n' +
-  extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes') +
-  '\n' +
-  extractTopLevelFn(SYNC_SRC, '_localDominates')
+const _combined = `${extractTopLevelFn(SYNC_SRC, '_stableStringify')}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}`
 const _helpers = new Function(
   `${_combined}; return { _stableStringify, _localMessageSupersedes, _localDominates };`,
 )() as {
@@ -271,10 +266,7 @@ describe('_localMessageSupersedes — role whitelist', () => {
 
   it('missing text field on both sides → treated as empty, assistant accepts', () => {
     assert.equal(
-      _localMessageSupersedes(
-        { id: 'a1', role: 'assistant' },
-        { id: 'a1', role: 'assistant' },
-      ),
+      _localMessageSupersedes({ id: 'a1', role: 'assistant' }, { id: 'a1', role: 'assistant' }),
       true,
     )
   })
@@ -329,10 +321,7 @@ describe('_localDominates — local clean-superset judge', () => {
   })
 
   it('shared prefix has tool with diverging state → false (Layer 1 fails, Layer 2 not whitelisted)', () => {
-    const server = [
-      u('u1', 'run'),
-      { id: 't1', role: 'tool', text: 'Bash', _partial: true },
-    ]
+    const server = [u('u1', 'run'), { id: 't1', role: 'tool', text: 'Bash', _partial: true }]
     const local = [
       u('u1', 'run'),
       { id: 't1', role: 'tool', text: 'Bash', _completed: true, output: 'done' },
@@ -349,14 +338,10 @@ describe('_localDominates — local clean-superset judge', () => {
     const tool = { id: 't1', role: 'tool', text: 'Bash', _completed: true, output: 'done' }
     const server = [
       u('u1', 'run'),
-      { ...tool },  // fresh object same fields
+      { ...tool }, // fresh object same fields
       a('a1', 'partial answer'),
     ]
-    const local = [
-      u('u1', 'run'),
-      { ...tool },
-      a('a1', 'partial answer plus streaming extension'),
-    ]
+    const local = [u('u1', 'run'), { ...tool }, a('a1', 'partial answer plus streaming extension')]
     assert.equal(_localDominates(server, local), true)
   })
 
@@ -412,12 +397,7 @@ describe('_localDominates — local clean-superset judge', () => {
 // This way we exercise the real production code path without pulling in
 // the browser-global deps in sync.js's own imports.
 
-const _pushFnSrc =
-  extractTopLevelFn(SYNC_SRC, '_stableStringify') + '\n' +
-  extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes') + '\n' +
-  extractTopLevelFn(SYNC_SRC, '_localDominates') + '\n' +
-  extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers') + '\n' +
-  extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')
+const _pushFnSrc = `${extractTopLevelFn(SYNC_SRC, '_stableStringify')}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}\n${extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers')}\n${extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')}`
 
 type PushDeps = {
   apiFetch: (url: string, opts: any) => Promise<any>
@@ -436,18 +416,31 @@ type PushDeps = {
 // (someone halves the cap) breaks tests instead of degrading quietly at
 // runtime.
 const _capMatch = /const CONFLICT_RETRY_MAX = (\d+)/.exec(SYNC_SRC)
-const PROD_CONFLICT_RETRY_MAX = _capMatch ? Number(_capMatch[1]) : NaN
+const PROD_CONFLICT_RETRY_MAX = _capMatch ? Number(_capMatch[1]) : Number.NaN
 
 function makePush(deps: PushDeps, retryMax = 3) {
   const factory = new Function(
-    'apiFetch', 'apiGet', 'authHeaders', 'dbPut', '_rebuildSearchIndex',
-    'state', '_onConflictResolved', '_onRequestRetryPush', 'CONFLICT_RETRY_MAX',
+    'apiFetch',
+    'apiGet',
+    'authHeaders',
+    'dbPut',
+    '_rebuildSearchIndex',
+    'state',
+    '_onConflictResolved',
+    '_onRequestRetryPush',
+    'CONFLICT_RETRY_MAX',
     `${_pushFnSrc}; return pushSessionToServer;`,
   )
   return factory(
-    deps.apiFetch, deps.apiGet, deps.authHeaders, deps.dbPut,
-    deps._rebuildSearchIndex, deps.state,
-    deps._onConflictResolved, deps._onRequestRetryPush, retryMax,
+    deps.apiFetch,
+    deps.apiGet,
+    deps.authHeaders,
+    deps.dbPut,
+    deps._rebuildSearchIndex,
+    deps.state,
+    deps._onConflictResolved,
+    deps._onRequestRetryPush,
+    retryMax,
   ) as (sess: any) => Promise<any>
 }
 
@@ -482,11 +475,19 @@ function baseDeps(overrides: Partial<PushDeps> = {}): PushDeps & {
       return (overrides as any)._apiGetImpl?.() ?? null
     },
     authHeaders: (h: any) => h,
-    dbPut: async (row: any) => { dbCalls.push(row) },
-    _rebuildSearchIndex: (sess: any) => { rebuildCalls.push(sess.id) },
+    dbPut: async (row: any) => {
+      dbCalls.push(row)
+    },
+    _rebuildSearchIndex: (sess: any) => {
+      rebuildCalls.push(sess.id)
+    },
     state: { token: 'tok', sessions: new Map() },
-    _onConflictResolved: (id: string, mode?: string) => { conflictCb.push({ id, mode }) },
-    _onRequestRetryPush: (id: string) => { retryCb.push(id) },
+    _onConflictResolved: (id: string, mode?: string) => {
+      conflictCb.push({ id, mode })
+    },
+    _onRequestRetryPush: (id: string) => {
+      retryCb.push(id)
+    },
     ...overrides,
   }
   return Object.assign(deps, { putCalls, getCalls, dbCalls, rebuildCalls, conflictCb, retryCb })
@@ -514,11 +515,11 @@ describe('pushSessionToServer — 409 local-dominates', () => {
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
         id: sessId,
-        title: 'server title',  // another tab renamed
-        messages: [userMsg, serverAsst],  // stale snapshot
-        lastAt: 1100,  // server lastAt newer (another tab activity)
-        pinned: true,  // another tab pinned
-        agentId: 'agent-b',  // another tab switched agent
+        title: 'server title', // another tab renamed
+        messages: [userMsg, serverAsst], // stale snapshot
+        lastAt: 1100, // server lastAt newer (another tab activity)
+        pinned: true, // another tab pinned
+        agentId: 'agent-b', // another tab switched agent
         updatedAt: 2000,
       }),
     } as any)
@@ -566,14 +567,19 @@ describe('pushSessionToServer — 409 local-dominates', () => {
       agentId: 'a',
       _dirty: true,
       _syncedAt: 500,
-      _conflictRetryCount: 3,  // already at the cap
+      _conflictRetryCount: 3, // already at the cap
     }
 
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
-        id: sessId, title: 't', messages: [userMsg, serverAsst],
-        lastAt: 1000, pinned: false, agentId: 'a', updatedAt: 2000,
+        id: sessId,
+        title: 't',
+        messages: [userMsg, serverAsst],
+        lastAt: 1000,
+        pinned: false,
+        agentId: 'a',
+        updatedAt: 2000,
       }),
     } as any)
     deps.state.sessions.set(sessId, sess)
@@ -597,17 +603,28 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     // what sessions.js does on every user edit.
     const sessId = 'sess-x'
     const sess: any = {
-      id: sessId, title: 't', messages: [{ id: 'u1', role: 'user', text: 'hi' }],
-      lastAt: 1000, pinned: false, agentId: 'a',
-      _dirty: true, _syncedAt: 500, _conflictRetryCount: 3,
+      id: sessId,
+      title: 't',
+      messages: [{ id: 'u1', role: 'user', text: 'hi' }],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
+      _conflictRetryCount: 3,
     }
-    sess._conflictRetryCount = 0  // simulate reset from user edit
+    sess._conflictRetryCount = 0 // simulate reset from user edit
 
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
-        id: sessId, title: 't', messages: [{ id: 'u1', role: 'user', text: 'hi' }],
-        lastAt: 1000, pinned: false, agentId: 'a', updatedAt: 2000,
+        id: sessId,
+        title: 't',
+        messages: [{ id: 'u1', role: 'user', text: 'hi' }],
+        lastAt: 1000,
+        pinned: false,
+        agentId: 'a',
+        updatedAt: 2000,
       }),
     } as any)
     deps.state.sessions.set(sessId, sess)
@@ -627,7 +644,7 @@ describe('pushSessionToServer — 409 local-dominates', () => {
       id: sessId,
       title: 'local-edited-title',
       messages: [userMsg, localAsst],
-      lastAt: 2000,  // > preFlightLastAt (will snapshot 2000 at call time; then bumped below)
+      lastAt: 2000, // > preFlightLastAt (will snapshot 2000 at call time; then bumped below)
       pinned: true,
       agentId: 'local-agent',
       _dirty: true,
@@ -646,9 +663,12 @@ describe('pushSessionToServer — 409 local-dominates', () => {
         return conflict()
       },
       _apiGetImpl: () => ({
-        id: sessId, title: 'server-title',
+        id: sessId,
+        title: 'server-title',
         messages: [userMsg, serverAsst],
-        lastAt: 1800, pinned: false, agentId: 'server-agent',
+        lastAt: 1800,
+        pinned: false,
+        agentId: 'server-agent',
         updatedAt: 2000,
       }),
     } as any)
@@ -679,7 +699,7 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
       agentId: 'a',
       _dirty: true,
       _syncedAt: 500,
-      _streamingAssistant: oldLocalAsst,  // points at the soon-to-be-replaced obj
+      _streamingAssistant: oldLocalAsst, // points at the soon-to-be-replaced obj
       _blockIdToMsgId: new Map([['b', 'a-old']]),
       _agentGroups: new Map(),
     }
@@ -726,8 +746,14 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     const sessId = 'sess-reb'
     const oldRef = { id: 'a1', role: 'assistant', text: 'old-local' }
     const sess: any = {
-      id: sessId, title: 't', messages: [oldRef], lastAt: 1000,
-      pinned: false, agentId: 'a', _dirty: true, _syncedAt: 500,
+      id: sessId,
+      title: 't',
+      messages: [oldRef],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
       _streamingAssistant: oldRef,
     }
     const serverAsst = { id: 'a1', role: 'assistant', text: 'brand new answer' }
@@ -735,10 +761,14 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
-        id: sessId, title: 't',
+        id: sessId,
+        title: 't',
         // New server snapshot has EXTRA message + same id a1 → doesn't dominate
         messages: [{ id: 'u-extra', role: 'user', text: 'someone else asked' }, serverAsst],
-        lastAt: 1100, pinned: false, agentId: 'a', updatedAt: 2000,
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'a',
+        updatedAt: 2000,
       }),
     } as any)
     deps.state.sessions.set(sessId, sess)
@@ -754,9 +784,17 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
   it('clears _replyingToMsgId and _currentTurnBlockCount when that msg vanishes from server', async () => {
     const sessId = 'sess-rpl'
     const sess: any = {
-      id: sessId, title: 't',
-      messages: [{ id: 'u1', role: 'user', text: 'hi' }, { id: 'orphan', role: 'assistant', text: 'gone' }],
-      lastAt: 1000, pinned: false, agentId: 'a', _dirty: true, _syncedAt: 500,
+      id: sessId,
+      title: 't',
+      messages: [
+        { id: 'u1', role: 'user', text: 'hi' },
+        { id: 'orphan', role: 'assistant', text: 'gone' },
+      ],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
       _replyingToMsgId: 'orphan',
       _currentTurnBlockCount: 7,
     }
@@ -764,14 +802,18 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
-        id: sessId, title: 't',
+        id: sessId,
+        title: 't',
         // Server snapshot has a user msg local doesn't (cross-device add) —
         // forces server-wins fallback. And no 'orphan' → pointer clears.
         messages: [
           { id: 'u1', role: 'user', text: 'hi' },
           { id: 'u2-other-device', role: 'user', text: 'from phone' },
         ],
-        lastAt: 1100, pinned: false, agentId: 'a', updatedAt: 2000,
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'a',
+        updatedAt: 2000,
       }),
     } as any)
     deps.state.sessions.set(sessId, sess)
@@ -785,9 +827,14 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
   it('preserves local if user typed during PUT (live.lastAt > preFlightLastAt)', async () => {
     const sessId = 'sess-g'
     const sess: any = {
-      id: sessId, title: 'local', messages: [{ id: 'u1', role: 'user', text: 'mine' }],
-      lastAt: 1000, pinned: false, agentId: 'a',
-      _dirty: true, _syncedAt: 500,
+      id: sessId,
+      title: 'local',
+      messages: [{ id: 'u1', role: 'user', text: 'mine' }],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
     }
 
     const deps = baseDeps({
@@ -798,9 +845,13 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
       },
       _apiGetImpl: () => ({
         // Server has DIFFERENT user msg (not dominated) → fallback path
-        id: sessId, title: 'server',
+        id: sessId,
+        title: 'server',
         messages: [{ id: 'u-other', role: 'user', text: 'someone else' }],
-        lastAt: 1200, pinned: true, agentId: 'b', updatedAt: 2000,
+        lastAt: 1200,
+        pinned: true,
+        agentId: 'b',
+        updatedAt: 2000,
       }),
     } as any)
     deps.state.sessions.set(sessId, sess)
@@ -823,24 +874,37 @@ describe('pushSessionToServer — sess !== live divergence (caller passes stale 
     const sessId = 'sess-div'
     const liveMsg = { id: 'a1', role: 'assistant', text: 'partial ext' }
     const live: any = {
-      id: sessId, title: 't-old', messages: [liveMsg], lastAt: 1000,
-      pinned: false, agentId: 'agent-old',
-      _dirty: true, _syncedAt: 500,
+      id: sessId,
+      title: 't-old',
+      messages: [liveMsg],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'agent-old',
+      _dirty: true,
+      _syncedAt: 500,
     }
     // Caller-snapshot (sess) is a different object, deliberately missing
     // the extra fields. The handler should NOT write _syncedAt onto this.
     const staleSnap: any = {
-      id: sessId, title: 't-old', messages: [{ id: 'a1', role: 'assistant', text: 'partial ext' }],
-      lastAt: 1000, pinned: false, agentId: 'agent-old',
-      _dirty: true, _syncedAt: 500,
+      id: sessId,
+      title: 't-old',
+      messages: [{ id: 'a1', role: 'assistant', text: 'partial ext' }],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'agent-old',
+      _dirty: true,
+      _syncedAt: 500,
     }
 
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
-        id: sessId, title: 't-server',
+        id: sessId,
+        title: 't-server',
         messages: [{ id: 'a1', role: 'assistant', text: 'partial' }],
-        lastAt: 1100, pinned: true, agentId: 'agent-server',
+        lastAt: 1100,
+        pinned: true,
+        agentId: 'agent-server',
         updatedAt: 2000,
       }),
     } as any)
@@ -865,26 +929,39 @@ describe('pushSessionToServer — sess !== live divergence (caller passes stale 
   it('409 server-wins must mutate state.sessions entry, not the caller snapshot', async () => {
     const sessId = 'sess-div2'
     const live: any = {
-      id: sessId, title: 't-old', messages: [{ id: 'a1', role: 'assistant', text: 'local' }],
-      lastAt: 1000, pinned: false, agentId: 'agent-old',
-      _dirty: true, _syncedAt: 500,
+      id: sessId,
+      title: 't-old',
+      messages: [{ id: 'a1', role: 'assistant', text: 'local' }],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'agent-old',
+      _dirty: true,
+      _syncedAt: 500,
     }
     const staleSnap: any = {
-      id: sessId, title: 't-old', messages: [{ id: 'a1', role: 'assistant', text: 'local' }],
-      lastAt: 1000, pinned: false, agentId: 'agent-old',
-      _dirty: true, _syncedAt: 500,
+      id: sessId,
+      title: 't-old',
+      messages: [{ id: 'a1', role: 'assistant', text: 'local' }],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'agent-old',
+      _dirty: true,
+      _syncedAt: 500,
     }
 
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
-        id: sessId, title: 't-server',
+        id: sessId,
+        title: 't-server',
         // Server has data local doesn't → forces server-wins
         messages: [
           { id: 'other', role: 'user', text: 'from phone' },
           { id: 'a1', role: 'assistant', text: 'server' },
         ],
-        lastAt: 1100, pinned: true, agentId: 'agent-server',
+        lastAt: 1100,
+        pinned: true,
+        agentId: 'agent-server',
         updatedAt: 2000,
       }),
     } as any)
@@ -906,18 +983,25 @@ describe('pushSessionToServer — search index hygiene', () => {
   it('local-dominates with title change triggers _rebuildSearchIndex so sidebar filter stays correct', async () => {
     const sessId = 'sess-sr'
     const sess: any = {
-      id: sessId, title: 'old title',
+      id: sessId,
+      title: 'old title',
       messages: [{ id: 'a1', role: 'assistant', text: 'partial ext' }],
-      lastAt: 1000, pinned: false, agentId: 'a',
-      _dirty: true, _syncedAt: 500,
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
       _searchText: 'old title cached — will go stale if not rebuilt',
     }
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
-        id: sessId, title: 'NEW title from other tab',
+        id: sessId,
+        title: 'NEW title from other tab',
         messages: [{ id: 'a1', role: 'assistant', text: 'partial' }],
-        lastAt: 1100, pinned: false, agentId: 'a',
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'a',
         updatedAt: 2000,
       }),
     } as any)
@@ -926,24 +1010,35 @@ describe('pushSessionToServer — search index hygiene', () => {
     await makePush(deps)(sess)
 
     assert.equal(sess.title, 'NEW title from other tab')
-    assert.equal(deps.rebuildCalls.length, 1, 'rebuildSearchIndex must fire when title adopted from server')
+    assert.equal(
+      deps.rebuildCalls.length,
+      1,
+      'rebuildSearchIndex must fire when title adopted from server',
+    )
     assert.equal(deps.rebuildCalls[0], sessId)
   })
 
   it('local-dominates without title change does NOT waste a rebuild', async () => {
     const sessId = 'sess-sr2'
     const sess: any = {
-      id: sessId, title: 'same',
+      id: sessId,
+      title: 'same',
       messages: [{ id: 'a1', role: 'assistant', text: 'partial ext' }],
-      lastAt: 1000, pinned: false, agentId: 'a',
-      _dirty: true, _syncedAt: 500,
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
     }
     const deps = baseDeps({
       _apiFetchImpl: () => conflict(),
       _apiGetImpl: () => ({
-        id: sessId, title: 'same',  // unchanged
+        id: sessId,
+        title: 'same', // unchanged
         messages: [{ id: 'a1', role: 'assistant', text: 'partial' }],
-        lastAt: 1100, pinned: false, agentId: 'a',
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'a',
         updatedAt: 2000,
       }),
     } as any)
@@ -956,10 +1051,14 @@ describe('pushSessionToServer — search index hygiene', () => {
   it('local-dominates with localMetaIsNewer: keeps local title, no rebuild needed', async () => {
     const sessId = 'sess-sr3'
     const sess: any = {
-      id: sessId, title: 'local edited',
+      id: sessId,
+      title: 'local edited',
       messages: [{ id: 'a1', role: 'assistant', text: 'partial ext' }],
-      lastAt: 2000, pinned: false, agentId: 'a',
-      _dirty: true, _syncedAt: 500,
+      lastAt: 2000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
     }
     const deps = baseDeps({
       _apiFetchImpl: () => {
@@ -968,9 +1067,12 @@ describe('pushSessionToServer — search index hygiene', () => {
         return conflict()
       },
       _apiGetImpl: () => ({
-        id: sessId, title: 'server title (should be ignored)',
+        id: sessId,
+        title: 'server title (should be ignored)',
         messages: [{ id: 'a1', role: 'assistant', text: 'partial' }],
-        lastAt: 1800, pinned: false, agentId: 'a',
+        lastAt: 1800,
+        pinned: false,
+        agentId: 'a',
         updatedAt: 2000,
       }),
     } as any)
@@ -986,8 +1088,15 @@ describe('pushSessionToServer — successful PUT', () => {
   it('200 response clears _conflictRetryCount', async () => {
     const sessId = 'sess-ok'
     const sess: any = {
-      id: sessId, title: 't', messages: [], lastAt: 1000, pinned: false, agentId: 'a',
-      _dirty: true, _syncedAt: 500, _conflictRetryCount: 2,
+      id: sessId,
+      title: 't',
+      messages: [],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
+      _conflictRetryCount: 2,
     }
     const deps = baseDeps()
     deps.state.sessions.set(sessId, sess)
@@ -1015,16 +1124,25 @@ describe('pushSessionToServer — CONFLICT_RETRY_MAX', () => {
       const localMsg = { id: 'u1', role: 'user', text: 'hi' }
       const sess: any = {
         id: sessId,
-        title: 'local', messages: [localMsg], lastAt: 1000,
-        pinned: false, agentId: 'a',
-        _dirty: true, _syncedAt: 500,
+        title: 'local',
+        messages: [localMsg],
+        lastAt: 1000,
+        pinned: false,
+        agentId: 'a',
+        _dirty: true,
+        _syncedAt: 500,
         _conflictRetryCount: count,
       }
       const deps = baseDeps({
         apiFetch: async () => conflict(),
         apiGet: async () => ({
-          id: sessId, title: 'remote', messages: [], lastAt: 900,
-          pinned: false, agentId: 'a', updatedAt: 2000,
+          id: sessId,
+          title: 'remote',
+          messages: [],
+          lastAt: 900,
+          pinned: false,
+          agentId: 'a',
+          updatedAt: 2000,
         }),
       })
       deps.state.sessions.set(sessId, sess)
@@ -1040,8 +1158,16 @@ describe('pushSessionToServer — CONFLICT_RETRY_MAX', () => {
     for (const preCount of [0, 1]) {
       const { sess, deps } = build(preCount)
       await makePush(deps, CAP)(sess)
-      assert.equal(sess._conflictRetryCount, preCount + 1, `preCount ${preCount}: count should bump`)
-      assert.equal(deps.retryCb.length, 1, `preCount ${preCount}: retry should fire while count <= cap`)
+      assert.equal(
+        sess._conflictRetryCount,
+        preCount + 1,
+        `preCount ${preCount}: count should bump`,
+      )
+      assert.equal(
+        deps.retryCb.length,
+        1,
+        `preCount ${preCount}: retry should fire while count <= cap`,
+      )
     }
 
     // Pre-count 2 (== cap): after +1 = 3 (> cap), retry MUST NOT fire

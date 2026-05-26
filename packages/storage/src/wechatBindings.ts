@@ -39,9 +39,13 @@ interface Row {
 function rowToBinding(r: Row): WechatBinding {
   let ctx: Record<string, string> = {}
   let wl: string[] = []
-  try { ctx = JSON.parse(r.context_tokens || '{}') } catch {}
-  try { wl = JSON.parse(r.whitelist || '[]') } catch {}
-  const st = (r.status === 'disabled' || r.status === 'expired') ? r.status : 'active'
+  try {
+    ctx = JSON.parse(r.context_tokens || '{}')
+  } catch {}
+  try {
+    wl = JSON.parse(r.whitelist || '[]')
+  } catch {}
+  const st = r.status === 'disabled' || r.status === 'expired' ? r.status : 'active'
   return {
     userId: r.user_id,
     accountId: r.account_id,
@@ -71,13 +75,19 @@ export async function listAllWechatBindings(): Promise<WechatBinding[]> {
 
 export async function getWechatBindingByUserId(userId: string): Promise<WechatBinding | null> {
   const db = await getSessionsDb()
-  const row = db.prepare('SELECT * FROM wechat_bindings WHERE user_id = ?').get(userId) as Row | undefined
+  const row = db.prepare('SELECT * FROM wechat_bindings WHERE user_id = ?').get(userId) as
+    | Row
+    | undefined
   return row ? rowToBinding(row) : null
 }
 
-export async function getWechatBindingByAccountId(accountId: string): Promise<WechatBinding | null> {
+export async function getWechatBindingByAccountId(
+  accountId: string,
+): Promise<WechatBinding | null> {
   const db = await getSessionsDb()
-  const row = db.prepare('SELECT * FROM wechat_bindings WHERE account_id = ?').get(accountId) as Row | undefined
+  const row = db.prepare('SELECT * FROM wechat_bindings WHERE account_id = ?').get(accountId) as
+    | Row
+    | undefined
   return row ? rowToBinding(row) : null
 }
 
@@ -101,9 +111,12 @@ export async function upsertWechatBinding(input: UpsertWechatBindingInput): Prom
     .get(input.userId) as Row | undefined
 
   const buf = input.getUpdatesBuf ?? existing?.get_updates_buf ?? ''
-  const ctx = JSON.stringify(input.contextTokens ?? (existing ? JSON.parse(existing.context_tokens || '{}') : {}))
+  const ctx = JSON.stringify(
+    input.contextTokens ?? (existing ? JSON.parse(existing.context_tokens || '{}') : {}),
+  )
   const wl = JSON.stringify(
-    input.whitelist ?? (existing ? JSON.parse(existing.whitelist || '[]') : [input.loginUserId].filter(Boolean)),
+    input.whitelist ??
+      (existing ? JSON.parse(existing.whitelist || '[]') : [input.loginUserId].filter(Boolean)),
   )
   const status = input.status ?? 'active'
   const createdAt = existing?.created_at ?? now

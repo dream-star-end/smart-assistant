@@ -516,10 +516,13 @@ export class CodexAppServerRunner extends EventEmitter {
       const overrides = await this.ensureLaunchOverrides()
       if (overrides) argvOverrides = overrides.argvOverrides
     } catch (err) {
-      log.warn('codex app-server launch overrides build failed; spawning without platform context', {
-        sessionKey: this.opts.sessionKey,
-        err: (err as Error).message,
-      })
+      log.warn(
+        'codex app-server launch overrides build failed; spawning without platform context',
+        {
+          sessionKey: this.opts.sessionKey,
+          err: (err as Error).message,
+        },
+      )
     }
     // `codex app-server` accepts `-c key=value` overrides (verified via
     // `codex app-server --help`). They must precede `--listen` to keep

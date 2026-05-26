@@ -3,12 +3,7 @@ import { apiGet } from './api.js'
 import { $, _mod } from './dom.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
-import {
-  addSystemMessage,
-  localStopTeardown,
-  nudgeDrain,
-  resetReplyTracker,
-} from './websocket.js'
+import { addSystemMessage, localStopTeardown, nudgeDrain, resetReplyTracker } from './websocket.js'
 
 // ── Late-binding for circular deps ──
 let _deps = {}
@@ -64,14 +59,16 @@ const slashCommands = [
       resetReplyTracker(sess)
       // Purge any offline queued messages for this session to prevent stale sends
       if (state.offlineQueue?.length > 0) {
-        state.offlineQueue = state.offlineQueue.filter(item => item.sessId !== sess.id)
+        state.offlineQueue = state.offlineQueue.filter((item) => item.sessId !== sess.id)
       }
       if (state._offlineQueuePending?.length > 0) {
-        state._offlineQueuePending = state._offlineQueuePending.filter(item => item.sessId !== sess.id)
+        state._offlineQueuePending = state._offlineQueuePending.filter(
+          (item) => item.sessId !== sess.id,
+        )
       }
       if (state._offlineDrainingCurrent?.sessId === sess.id) {
         state._offlineDrainingCurrent = null
-        nudgeDrain()  // Advance drain to next item since we killed the current one
+        nudgeDrain() // Advance drain to next item since we killed the current one
       }
       _deps.renderMessages()
       _deps.scheduleSaveFromUserEdit(sess)

@@ -135,7 +135,11 @@ describe('buildCcbCliArgs', () => {
   it('omits --resume when resumeSessionId is null/undefined/empty', () => {
     for (const sid of [null, undefined, '']) {
       const args = buildCcbCliArgs({ ...BASE, resumeSessionId: sid })
-      assert.equal(args.includes('--resume'), false, `resumeSessionId=${String(sid)} should not produce --resume`)
+      assert.equal(
+        args.includes('--resume'),
+        false,
+        `resumeSessionId=${String(sid)} should not produce --resume`,
+      )
     }
   })
 
@@ -188,7 +192,11 @@ describe('buildCcbCliArgs', () => {
       { ...BASE, addDir: '/tmp' },
     ]) {
       const args = buildCcbCliArgs(input)
-      assert.equal(args[args.length - 1], '', `last arg must be '' for input ${JSON.stringify(input)}`)
+      assert.equal(
+        args[args.length - 1],
+        '',
+        `last arg must be '' for input ${JSON.stringify(input)}`,
+      )
     }
   })
 })

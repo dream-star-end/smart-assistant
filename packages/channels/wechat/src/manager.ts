@@ -18,7 +18,7 @@ import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import type { OutboundMessage } from '@openclaude/protocol'
 import type { WechatBinding } from '@openclaude/storage'
 import { listActiveWechatBindings } from '@openclaude/storage'
-import { WechatWorker, type InboundEvent } from './worker.js'
+import { type InboundEvent, WechatWorker } from './worker.js'
 
 export interface WechatChannelConfig {
   // Interval (ms) between DB reconciliation passes. Picks up newly added
@@ -76,12 +76,7 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
       const lastEvt = binding.lastEventAt
         ? new Date(binding.lastEventAt).toISOString().slice(0, 19).replace('T', ' ')
         : '(无)'
-      const msg =
-        `OC bot status\n` +
-        `account: ${binding.accountId}\n` +
-        `status: ${binding.status}\n` +
-        `最近事件: ${lastEvt}\n` +
-        `活跃 worker: ${workers.size}`
+      const msg = `OC bot status\naccount: ${binding.accountId}\nstatus: ${binding.status}\n最近事件: ${lastEvt}\n活跃 worker: ${workers.size}`
       if (w) w.sendText(senderId, msg).catch(() => {})
       return
     }
@@ -92,7 +87,8 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
       try {
         if (ctx.resetSession) await ctx.resetSession('wechat', peerId, 'dm')
         const w = workers.get(binding.userId)
-        if (w) w.sendText(senderId, '已开启新会话。下一条消息将由全新的 agent 处理。').catch(() => {})
+        if (w)
+          w.sendText(senderId, '已开启新会话。下一条消息将由全新的 agent 处理。').catch(() => {})
       } catch (err: any) {
         const w = workers.get(binding.userId)
         if (w) w.sendText(senderId, `/new 失败: ${err?.message || err}`).catch(() => {})
@@ -145,7 +141,9 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
     for (const [uid, w] of workers.entries()) {
       if (!activeIds.has(uid)) {
         ctx.log.info(`[wechat] stopping worker for user=${uid} (binding gone)`)
-        try { await w.stop() } catch {}
+        try {
+          await w.stop()
+        } catch {}
         workers.delete(uid)
       }
     }
@@ -222,7 +220,10 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
 
     async shutdown() {
       shuttingDown = true
-      if (reconcileTimer) { clearInterval(reconcileTimer); reconcileTimer = null }
+      if (reconcileTimer) {
+        clearInterval(reconcileTimer)
+        reconcileTimer = null
+      }
       await Promise.all(Array.from(workers.values()).map((w) => w.stop().catch(() => {})))
       workers.clear()
     },

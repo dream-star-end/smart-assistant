@@ -20,11 +20,7 @@
  */
 import * as assert from 'node:assert/strict'
 import { afterEach, describe, it } from 'node:test'
-import {
-  buildModelHintSlot,
-  buildPromptContext,
-  setModelHintProvider,
-} from '../promptSlots.js'
+import { buildModelHintSlot, buildPromptContext, setModelHintProvider } from '../promptSlots.js'
 
 afterEach(() => {
   setModelHintProvider(null)
@@ -141,7 +137,11 @@ describe('buildPromptContext result shape', () => {
       assert.equal(typeof slot.name, 'string')
       assert.equal(typeof slot.bytes, 'number')
       assert.ok(slot.bytes > 0)
-      assert.match(slot.sha256, /^[0-9a-f]{64}$/, `sha256 must be 64-char lowercase hex (got ${slot.sha256})`)
+      assert.match(
+        slot.sha256,
+        /^[0-9a-f]{64}$/,
+        `sha256 must be 64-char lowercase hex (got ${slot.sha256})`,
+      )
     }
   })
 
@@ -160,7 +160,10 @@ describe('buildPromptContext result shape', () => {
     assert.notEqual(hintIdx, -1, 'MODEL_HINT must be emitted when provider returns text')
     assert.notEqual(researchIdx, -1, 'RESEARCH must be emitted when effortLevel=max')
     assert.ok(toolsIdx < hintIdx, `MODEL_HINT (${hintIdx}) must come after TOOLS (${toolsIdx})`)
-    assert.ok(hintIdx < researchIdx, `RESEARCH (${researchIdx}) must come after MODEL_HINT (${hintIdx})`)
+    assert.ok(
+      hintIdx < researchIdx,
+      `RESEARCH (${researchIdx}) must come after MODEL_HINT (${hintIdx})`,
+    )
   })
 
   it('content actually contains the model hint heading when MODEL_HINT slot fires', async () => {

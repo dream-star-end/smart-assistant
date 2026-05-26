@@ -131,7 +131,7 @@ function stripQuotes(s: string): string {
 function bumpPatch(version: string): string {
   const parts = version.split('.')
   if (parts.length === 3) {
-    const patch = parseInt(parts[2], 10)
+    const patch = Number.parseInt(parts[2], 10)
     return `${parts[0]}.${parts[1]}.${Number.isNaN(patch) ? 1 : patch + 1}`
   }
   return `${version}.1`
@@ -316,7 +316,7 @@ export class SkillStore {
       try {
         const s = await stat(join(historyDir, entry))
         result.push({ version, timestamp: s.mtime.toISOString() })
-      } catch { continue }
+      } catch {}
     }
     return result.sort((a, b) => compareSemver(b.version, a.version))
   }
@@ -325,14 +325,17 @@ export class SkillStore {
   async restore(name: string, version: string): Promise<{ ok: boolean; error?: string }> {
     const v = validateSkillName(name)
     if (!v.ok) return { ok: false, error: v.error }
-    if (!isValidVersion(version)) return { ok: false, error: 'invalid version format (expected N.N.N)' }
+    if (!isValidVersion(version))
+      return { ok: false, error: 'invalid version format (expected N.N.N)' }
     const historyFile = join(paths.agentSkillDir(this.agentId, name), 'history', `${version}.md`)
     const raw = await this.safeReadFile(historyFile)
     if (!raw) return { ok: false, error: `version ${version} not found` }
     const { meta, body } = parseFrontmatter(raw)
     if (!meta.name || !meta.description) return { ok: false, error: 'invalid skill content' }
     // Strip version so save() will auto-bump from current version
-    const { version: _discarded, ...metaWithoutVersion } = meta as SkillFrontmatter & { version?: string }
+    const { version: _discarded, ...metaWithoutVersion } = meta as SkillFrontmatter & {
+      version?: string
+    }
     return this.save(metaWithoutVersion as SkillFrontmatter, body)
   }
 

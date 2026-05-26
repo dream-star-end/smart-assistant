@@ -12,7 +12,7 @@
  */
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { buildRepoSlot, type PromptSlotContext } from '../promptSlots.js'
+import { type PromptSlotContext, buildRepoSlot } from '../promptSlots.js'
 
 // RepoSnapshot 不是 promptSlots 的公开 surface(v3 同款),通过 ctx 字段类型推导:
 type RepoSnapshot = NonNullable<PromptSlotContext['repoSnapshot']>

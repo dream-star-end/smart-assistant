@@ -5,12 +5,12 @@ const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=26',  // versioned URL used in index.html
+  '/style.css?v=26', // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=30',  // versioned URL used in index.html
+  '/modules/main.js?v=30', // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -120,7 +120,10 @@ self.addEventListener('fetch', (event) => {
         .then((res) => {
           if (res.status === 200) {
             const copy = res.clone()
-            caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {})
+            caches
+              .open(VERSION)
+              .then((c) => c.put(req, copy))
+              .catch(() => {})
           }
           return res
         })
@@ -136,7 +139,10 @@ self.addEventListener('fetch', (event) => {
       return fetch(req).then((res) => {
         if (res.status === 200) {
           const copy = res.clone()
-          caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {})
+          caches
+            .open(VERSION)
+            .then((c) => c.put(req, copy))
+            .catch(() => {})
         }
         return res
       })

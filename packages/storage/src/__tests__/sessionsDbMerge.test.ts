@@ -11,10 +11,10 @@ import * as assert from 'node:assert/strict'
  */
 import { describe, it } from 'node:test'
 import {
+  type MessageLike,
   appendServerAuthoredPure,
   dropPhantomClientAssistants,
   mergePreservingServerAuthored,
-  type MessageLike,
 } from '../sessionsDb.js'
 
 type Msg = MessageLike & { id: string; role?: string; text?: string }
@@ -56,7 +56,11 @@ describe('mergePreservingServerAuthored', () => {
     const out = mergePreservingServerAuthored(server, client) as Msg[]
 
     const ids = out.map((m) => m.id)
-    assert.deepEqual(ids, ['u1', 'srv-1', 'u2', 'u3'], 'server-authored re-inserted and sorted by ts')
+    assert.deepEqual(
+      ids,
+      ['u1', 'srv-1', 'u2', 'u3'],
+      'server-authored re-inserted and sorted by ts',
+    )
     const recovered = out.find((m) => m.id === 'srv-1')!
     assert.equal(recovered.text, 'server said')
     assert.equal(recovered._source, 'server')
@@ -131,14 +135,15 @@ describe('mergePreservingServerAuthored', () => {
     // authoritative row by stamping `_source: 'server'` on its own payload.
     // Only ids the server actually has in `serverSideMsgs` retain the flag.
     const server: Msg[] = []
-    const client: Msg[] = [
-      { id: 'c1', ts: 100, role: 'assistant', _source: 'server' } as Msg,
-    ]
+    const client: Msg[] = [{ id: 'c1', ts: 100, role: 'assistant', _source: 'server' } as Msg]
     const out = mergePreservingServerAuthored(server, client) as Msg[]
     assert.equal(out.length, 1)
     assert.equal(out[0]!.id, 'c1')
-    assert.equal((out[0] as MessageLike)._source, undefined,
-      'spoofed _source scrubbed from client entry')
+    assert.equal(
+      (out[0] as MessageLike)._source,
+      undefined,
+      'spoofed _source scrubbed from client entry',
+    )
   })
 
   it('fast path returns client reference verbatim when nothing needs scrubbing', () => {
@@ -193,10 +198,7 @@ describe('mergePreservingServerAuthored', () => {
     // Client's wallclock is ahead of server's — client m-1 ts=250 vs srv-1
     // ts=200. Sorted adjacency becomes [srv-1, m-1] (reverse of typical).
     // Dedupe must still drop m-1.
-    const server: Msg[] = [
-      cli('u-ask', 100, 'user'),
-      srv('srv-1', 200, 'server text'),
-    ]
+    const server: Msg[] = [cli('u-ask', 100, 'user'), srv('srv-1', 200, 'server text')]
     const client: Msg[] = [
       cli('u-ask', 100, 'user'),
       { id: 'm-1', ts: 250, role: 'assistant', text: 'partial' } as Msg,
@@ -214,10 +216,7 @@ describe('mergePreservingServerAuthored', () => {
     // assistant is server-authored (recovery after background), the second
     // turn's assistant is client-only (the user is mid-new-turn). Client's
     // m-2 must NOT be dropped — it's in a different turn, separated by u-2.
-    const server: Msg[] = [
-      cli('u-1', 100, 'user'),
-      srv('srv-1', 200, 'turn1 server'),
-    ]
+    const server: Msg[] = [cli('u-1', 100, 'user'), srv('srv-1', 200, 'turn1 server')]
     const client: Msg[] = [
       cli('u-1', 100, 'user'),
       cli('u-2', 300, 'user'),
@@ -232,10 +231,7 @@ describe('mergePreservingServerAuthored', () => {
   })
 
   it('P0-3: dedupe preserves idempotency — replaying the merge yields same result', () => {
-    const server: Msg[] = [
-      cli('u-ask', 100, 'user'),
-      srv('srv-1', 200, 'server text'),
-    ]
+    const server: Msg[] = [cli('u-ask', 100, 'user'), srv('srv-1', 200, 'server text')]
     const client: Msg[] = [
       cli('u-ask', 100, 'user'),
       { id: 'm-1', ts: 150, role: 'assistant', text: 'partial' } as Msg,
@@ -570,7 +566,10 @@ describe('dropPhantomClientAssistants', () => {
       srv('srv-1', 200, 'server'),
     ]
     const out = dropPhantomClientAssistants(msgs) as Msg[]
-    assert.deepEqual(out.map((m) => m.id), ['u-1', 'srv-1'])
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-1', 'srv-1'],
+    )
   })
 
   it('drops nothing when every partition either has no server-authored or no phantom', () => {
@@ -583,7 +582,10 @@ describe('dropPhantomClientAssistants', () => {
       { id: 'm-2', ts: 250, role: 'assistant', text: 'live' } as Msg,
     ]
     const out = dropPhantomClientAssistants(msgs) as Msg[]
-    assert.deepEqual(out.map((m) => m.id), ['u-1', 'srv-1', 'u-2', 'm-2'])
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['u-1', 'srv-1', 'u-2', 'm-2'],
+    )
   })
 
   it('never drops non-assistant rows even in a phantom-bearing partition', () => {
@@ -641,10 +643,7 @@ describe('dropPhantomClientAssistants', () => {
   })
 
   it('clock skew via merge: mergePreservingServerAuthored respects the migration', () => {
-    const server: Msg[] = [
-      cli('u-ask', 500, 'user'),
-      srv('srv-peerA-t1', 100, 'full server'),
-    ]
+    const server: Msg[] = [cli('u-ask', 500, 'user'), srv('srv-peerA-t1', 100, 'full server')]
     const client: Msg[] = [
       cli('u-ask', 500, 'user'),
       { id: 'm-1', ts: 600, role: 'assistant', text: 'phantom' } as Msg,
@@ -663,7 +662,10 @@ describe('dropPhantomClientAssistants', () => {
     // migration only kicks in when a later boundary exists.
     const msgs: Msg[] = [srv('srv-push-1', 100, 'cron pushed greeting')]
     const out = dropPhantomClientAssistants(msgs) as Msg[]
-    assert.deepEqual(out.map((m) => m.id), ['srv-push-1'])
+    assert.deepEqual(
+      out.map((m) => m.id),
+      ['srv-push-1'],
+    )
   })
 
   it('clock skew migration preserves legitimate client asst that was in group 0 pre-migration', () => {
@@ -845,14 +847,23 @@ describe('dropPhantomClientAssistants', () => {
     // Finding-2 fix, m-evil loses its `_source` at the merge boundary and
     // gets treated as a regular client assistant — so it either stays in a
     // phantom-free partition or drops alongside other phantoms.
-    const server: Msg[] = [
-      cli('u-1', 100, 'user'),
-      srv('srv-peer-t1', 200, 'real server turn'),
-    ]
+    const server: Msg[] = [cli('u-1', 100, 'user'), srv('srv-peer-t1', 200, 'real server turn')]
     const client: Msg[] = [
       cli('u-1', 100, 'user'),
-      { id: 'm-1', ts: 150, role: 'assistant', text: 'real client phantom', _source: 'server' } as Msg,
-      { id: 'm-evil', ts: 250, role: 'assistant', text: 'forged server row', _source: 'server' } as Msg,
+      {
+        id: 'm-1',
+        ts: 150,
+        role: 'assistant',
+        text: 'real client phantom',
+        _source: 'server',
+      } as Msg,
+      {
+        id: 'm-evil',
+        ts: 250,
+        role: 'assistant',
+        text: 'forged server row',
+        _source: 'server',
+      } as Msg,
     ]
     const out = mergePreservingServerAuthored(server, client) as Msg[]
     // Expected: srv-peer-t1 is authoritative. m-1 and m-evil both in turn 1
@@ -878,17 +889,18 @@ describe('dropPhantomClientAssistants', () => {
     const out = mergePreservingServerAuthored(server, client) as Msg[]
     const evil = out.find((m) => m.id === 'm-evil')
     assert.ok(evil, 'm-evil still present (we only scrub, not drop)')
-    assert.equal((evil as MessageLike)._source, undefined,
-      '_source scrubbed from m-evil even on fast path')
+    assert.equal(
+      (evil as MessageLike)._source,
+      undefined,
+      '_source scrubbed from m-evil even on fast path',
+    )
   })
 
   it('scrub: legitimate server-authored entry retains _source when id matches authoritative map', () => {
     // Counter-check: client echoing the server row's id + _source must NOT
     // lose it — otherwise round-tripping the full sessions snapshot would
     // demote real server rows on every PUT.
-    const server: Msg[] = [
-      srv('srv-peer-t1', 200, 'real'),
-    ]
+    const server: Msg[] = [srv('srv-peer-t1', 200, 'real')]
     const client: Msg[] = [
       cli('u-1', 100, 'user'),
       // Client echoes the server row as-is (common after a GET → mutate → PUT cycle).
@@ -897,8 +909,11 @@ describe('dropPhantomClientAssistants', () => {
     const out = mergePreservingServerAuthored(server, client) as Msg[]
     const real = out.find((m) => m.id === 'srv-peer-t1')
     assert.ok(real, 'server row present')
-    assert.equal((real as MessageLike)._source, 'server',
-      'authoritative id preserves _source through merge')
+    assert.equal(
+      (real as MessageLike)._source,
+      'server',
+      'authoritative id preserves _source through merge',
+    )
   })
 
   // ── System boundary parity with user boundary ────────────────────────────

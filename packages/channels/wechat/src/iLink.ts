@@ -55,10 +55,10 @@ export async function ilinkRequest(endpoint: string, opts: RequestOpts): Promise
   const rawBody = opts.body !== undefined ? JSON.stringify(opts.body) : undefined
   if (rawBody !== undefined) {
     headers['Content-Type'] = 'application/json'
-    headers['AuthorizationType'] = 'ilink_bot_token'
+    headers.AuthorizationType = 'ilink_bot_token'
     headers['X-WECHAT-UIN'] = randomWechatUin()
   }
-  if (opts.token) headers['Authorization'] = `Bearer ${opts.token}`
+  if (opts.token) headers.Authorization = `Bearer ${opts.token}`
 
   const ctrl = new AbortController()
   const timeoutMs = opts.timeoutMs ?? ILINK_API_TIMEOUT_MS

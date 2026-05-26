@@ -7,14 +7,14 @@
 // Internal state is kept in memory per qrcode key. A qrcode is single-use
 // and expires once WeChat's server does (~2-3min), so we don't persist.
 
+import { upsertWechatBinding } from '@openclaude/storage'
 import {
-  extractConfirmed,
-  fetchIlinkQrcode,
   type IlinkConfirmed,
   type IlinkQrcode,
+  extractConfirmed,
+  fetchIlinkQrcode,
   pollIlinkQrcodeStatus,
 } from './iLink.js'
-import { upsertWechatBinding } from '@openclaude/storage'
 
 interface PendingPair {
   qrcode: string

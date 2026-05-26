@@ -155,10 +155,7 @@ export class CcbMessageParser {
       // 任何累积器(没有 totals / buffers / 流式装配),只是把 tail 快照转成
       // tool_output_tail block 派发出去。turn 结束后必须放行,否则前端会
       // 卡在第一行——bg bash 完成时间晚于 agent 回复时是常态。
-      if (
-        (msg as any)?.type === 'system' &&
-        (msg as any)?.subtype === 'bash_output_tail'
-      ) {
+      if ((msg as any)?.type === 'system' && (msg as any)?.subtype === 'bash_output_tail') {
         try {
           this._parseInner(msg)
         } catch (err) {
@@ -395,7 +392,7 @@ export class CcbMessageParser {
         if (inputStr.length > 8000) {
           const capped: Record<string, unknown> = {}
           for (const [k, v] of Object.entries(inputRaw as Record<string, unknown>)) {
-            capped[k] = typeof v === 'string' && v.length > 3000 ? v.slice(0, 3000) + '…' : v
+            capped[k] = typeof v === 'string' && v.length > 3000 ? `${v.slice(0, 3000)}…` : v
           }
           inputJson = capped
         }
@@ -525,12 +522,10 @@ export class CcbMessageParser {
     // tool_use / pause_turn / stop_sequence / refusal) — read it so Gateway
     // has authoritative termination info instead of re-guessing via the
     // 9-AND phantom heuristic. See docs/ccb-telemetry-refactor-plan.md §5.3.
-    const stopReason = typeof (msg as any).stop_reason === 'string'
-      ? ((msg as any).stop_reason as string)
-      : null
-    const numTurns = typeof (msg as any).num_turns === 'number'
-      ? ((msg as any).num_turns as number)
-      : null
+    const stopReason =
+      typeof (msg as any).stop_reason === 'string' ? ((msg as any).stop_reason as string) : null
+    const numTurns =
+      typeof (msg as any).num_turns === 'number' ? ((msg as any).num_turns as number) : null
 
     this.turnResult = {
       cost: turnCost,

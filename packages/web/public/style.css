@@ -672,11 +672,8 @@ a:hover {
   opacity: 0;
   pointer-events: none;
   overflow: hidden;
-  transition:
-    opacity var(--transition-base),
-    transform var(--transition-base),
-    border-color var(--transition-base),
-    background var(--transition-base);
+  transition: opacity var(--transition-base), transform var(--transition-base), border-color
+    var(--transition-base), background var(--transition-base);
 }
 .sync-banner::before {
   content: "";
@@ -1111,7 +1108,7 @@ a:hover {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,.25));
+  box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.25));
   padding: 4px;
   z-index: 20;
   min-width: 170px;
@@ -1121,8 +1118,14 @@ a:hover {
   animation: saveMenuIn .12s ease-out;
 }
 @keyframes saveMenuIn {
-  from { opacity: 0; transform: translateY(-4px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 .msg-save-menu button {
   width: 100%;
@@ -1145,7 +1148,7 @@ a:hover {
 }
 .msg-save-menu button svg {
   flex-shrink: 0;
-  opacity: .6;
+  opacity: 0.6;
 }
 @media (max-width: 860px) {
   .msg-actions {
@@ -1160,7 +1163,9 @@ a:hover {
   }
 }
 @media (hover: none) {
-  .msg-actions { opacity: 1; }
+  .msg-actions {
+    opacity: 1;
+  }
 }
 .msg.assistant .avatar {
   grid-column: 1;
@@ -1296,8 +1301,13 @@ a:hover {
   font-size: var(--text-sm);
 }
 @keyframes caret-blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
 }
 .msg.assistant p {
   margin: 0.7em 0;
@@ -1461,9 +1471,15 @@ a:hover {
   overflow: hidden;
   transition: border-color 0.2s;
 }
-.msg.tool.tool-running { border-left: 3px solid var(--accent); }
-.msg.tool.tool-done { border-left: 3px solid var(--success); }
-.msg.tool.tool-error { border-left: 3px solid var(--danger); }
+.msg.tool.tool-running {
+  border-left: 3px solid var(--accent);
+}
+.msg.tool.tool-done {
+  border-left: 3px solid var(--success);
+}
+.msg.tool.tool-error {
+  border-left: 3px solid var(--danger);
+}
 .msg.tool.error {
   border-color: rgba(224, 108, 108, 0.4);
   background: rgba(224, 108, 108, 0.06);
@@ -1479,7 +1495,9 @@ a:hover {
   user-select: none;
   gap: 8px;
 }
-.tool-card-header:hover { background: rgba(255,255,255,0.03); }
+.tool-card-header:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
 .tool-card-header-left {
   display: flex;
   align-items: center;
@@ -1495,10 +1513,19 @@ a:hover {
   align-items: center;
   color: var(--fg-muted);
 }
-.tool-card-icon svg { width: 16px; height: 16px; }
-.tool-running .tool-card-icon { color: var(--accent); }
-.tool-done .tool-card-icon { color: var(--success); }
-.tool-error .tool-card-icon { color: var(--danger); }
+.tool-card-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.tool-running .tool-card-icon {
+  color: var(--accent);
+}
+.tool-done .tool-card-icon {
+  color: var(--success);
+}
+.tool-error .tool-card-icon {
+  color: var(--danger);
+}
 .tool-card-label {
   font-weight: 600;
   font-size: 12px;
@@ -1523,8 +1550,12 @@ a:hover {
   border-radius: 4px;
   font-weight: 600;
 }
-.tool-card-badge.badge-done { color: var(--success); }
-.tool-card-badge.badge-error { color: var(--danger); }
+.tool-card-badge.badge-done {
+  color: var(--success);
+}
+.tool-card-badge.badge-error {
+  color: var(--danger);
+}
 
 /* Spinner animation */
 .tool-spinner {
@@ -1536,7 +1567,11 @@ a:hover {
   border-radius: 50%;
   animation: tool-spin 0.6s linear infinite;
 }
-@keyframes tool-spin { to { transform: rotate(360deg); } }
+@keyframes tool-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 
 /* Body (collapsible) */
 .tool-card-body {
@@ -1545,7 +1580,9 @@ a:hover {
   font-size: 12px;
   line-height: 1.6;
 }
-.msg.tool.collapsed .tool-card-body { display: none; }
+.msg.tool.collapsed .tool-card-body {
+  display: none;
+}
 
 /* Terminal block (Bash) */
 .tool-terminal {
@@ -1564,11 +1601,13 @@ a:hover {
   user-select: none;
   font-weight: 700;
 }
-.tool-terminal-cmd { color: #e8e8e8; }
+.tool-terminal-cmd {
+  color: #e8e8e8;
+}
 
 /* Output block */
 .tool-output {
-  background: rgba(0,0,0,0.15);
+  background: rgba(0, 0, 0, 0.15);
   border-radius: 6px;
   padding: 8px 12px;
   margin: 0;
@@ -1581,12 +1620,17 @@ a:hover {
   line-height: 1.5;
   color: var(--fg-muted);
 }
-.tool-output::-webkit-scrollbar { width: 4px; }
-.tool-output::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 2px; }
+.tool-output::-webkit-scrollbar {
+  width: 4px;
+}
+.tool-output::-webkit-scrollbar-thumb {
+  background: var(--border-subtle);
+  border-radius: 2px;
+}
 
 /* Diff view (Edit) */
 .tool-diff {
-  background: rgba(0,0,0,0.12);
+  background: rgba(0, 0, 0, 0.12);
   border-radius: 6px;
   padding: 6px 0;
   margin-bottom: 6px;
@@ -1641,7 +1685,9 @@ a:hover {
 }
 /* `display: contents` lets each item's key/value spans participate
    directly in the parent grid as two columns. */
-.tool-kv-item { display: contents; }
+.tool-kv-item {
+  display: contents;
+}
 .tool-kv-key {
   color: var(--fg-dim);
   font-weight: 500;
@@ -1683,7 +1729,9 @@ a:hover {
   word-break: break-all;
   max-width: 100%;
 }
-.tool-url-card:hover { background: var(--bg-hover); }
+.tool-url-card:hover {
+  background: var(--bg-hover);
+}
 
 /* Code preview (browser_evaluate / browser_run_code) — reuse inline-code palette */
 .tool-code-block {
@@ -1714,13 +1762,29 @@ a:hover {
   font-weight: 700;
   font-family: var(--font-mono);
 }
-.tool-todo-text { word-break: break-word; }
-.tool-todo-completed .tool-todo-mark { color: var(--success); }
-.tool-todo-completed .tool-todo-text { color: var(--fg-dim); text-decoration: line-through; }
-.tool-todo-in_progress .tool-todo-mark { color: var(--accent); }
-.tool-todo-in_progress .tool-todo-text { color: var(--fg); font-weight: 600; }
-.tool-todo-pending .tool-todo-mark { color: var(--fg-dim); }
-.tool-todo-pending .tool-todo-text { color: var(--fg-muted); }
+.tool-todo-text {
+  word-break: break-word;
+}
+.tool-todo-completed .tool-todo-mark {
+  color: var(--success);
+}
+.tool-todo-completed .tool-todo-text {
+  color: var(--fg-dim);
+  text-decoration: line-through;
+}
+.tool-todo-in_progress .tool-todo-mark {
+  color: var(--accent);
+}
+.tool-todo-in_progress .tool-todo-text {
+  color: var(--fg);
+  font-weight: 600;
+}
+.tool-todo-pending .tool-todo-mark {
+  color: var(--fg-dim);
+}
+.tool-todo-pending .tool-todo-text {
+  color: var(--fg-muted);
+}
 
 /* Legacy tool messages (old sessions without toolName) */
 .msg.tool:has(.tool-icon-legacy) {
@@ -1732,8 +1796,14 @@ a:hover {
   white-space: pre-wrap;
   word-break: break-all;
 }
-.tool-icon-legacy { flex-shrink: 0; font-size: 14px; }
-.tool-body-legacy { flex: 1; min-width: 0; }
+.tool-icon-legacy {
+  flex-shrink: 0;
+  font-size: 14px;
+}
+.tool-body-legacy {
+  flex: 1;
+  min-width: 0;
+}
 
 /* ── Sub-agent group card ── */
 .agent-group {
@@ -1819,7 +1889,7 @@ a:hover {
   opacity: 0.85;
 }
 .agent-group-child-thinking::before {
-  content: '💭 ';
+  content: "💭 ";
   margin-right: 2px;
 }
 /* Child tool card: flatten the heavy tool-card visual into a compact row */
@@ -1896,7 +1966,9 @@ a:hover {
   max-width: 100%;
   overflow: hidden;
 }
-.msg.thinking::before { content: none; }
+.msg.thinking::before {
+  content: none;
+}
 .thinking-header {
   display: flex;
   align-items: center;
@@ -1908,8 +1980,14 @@ a:hover {
   color: var(--thinking);
   font-weight: 500;
 }
-.thinking-header:hover { background: color-mix(in srgb, var(--thinking) 10%, transparent); }
-.thinking-label { display: flex; align-items: center; gap: 6px; }
+.thinking-header:hover {
+  background: color-mix(in srgb, var(--thinking) 10%, transparent);
+}
+.thinking-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 .thinking-body {
   padding: 4px 14px 10px;
   font-size: var(--text-sm);
@@ -1922,7 +2000,9 @@ a:hover {
   overflow-y: auto;
   line-height: 1.6;
 }
-.msg.thinking.collapsed .thinking-body { display: none; }
+.msg.thinking.collapsed .thinking-body {
+  display: none;
+}
 .msg.thinking.collapsed .thinking-header::after {
   content: "▸";
   margin-left: auto;
@@ -1997,9 +2077,17 @@ a:hover {
 }
 
 /* Typing indicator staleness warnings */
-.typing-indicator.stale-warn .typing-label { color: var(--warning, #e5a00d); font-weight: 500; }
-.typing-indicator.stale-warn .typing-dots span { background: var(--warning, #e5a00d); }
-.typing-indicator.stale-danger .typing-label { color: var(--danger, #e53e3e); font-weight: 600; }
+.typing-indicator.stale-warn .typing-label {
+  color: var(--warning, #e5a00d);
+  font-weight: 500;
+}
+.typing-indicator.stale-warn .typing-dots span {
+  background: var(--warning, #e5a00d);
+}
+.typing-indicator.stale-danger .typing-label {
+  color: var(--danger, #e53e3e);
+  font-weight: 600;
+}
 .typing-indicator.stale-danger .typing-dots span {
   background: var(--danger, #e53e3e);
   animation: dot-bounce 2s infinite ease-in-out; /* slower animation = feels stuck */
@@ -2762,14 +2850,14 @@ a:hover {
   font-size: var(--text-xs);
   line-height: 1.4;
   cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast),
-    border-color var(--transition-fast);
+  transition: background var(--transition-fast), color var(--transition-fast), border-color
+    var(--transition-fast);
 }
 .mode-pill:hover:not(:disabled) {
   background: var(--bg-hover);
   color: var(--fg);
 }
-.mode-pill[aria-pressed='true'] {
+.mode-pill[aria-pressed="true"] {
   background: var(--accent-soft);
   color: var(--accent);
   border-color: var(--accent-border);
@@ -2778,7 +2866,7 @@ a:hover {
   flex-shrink: 0;
   opacity: 0.8;
 }
-.mode-pill[aria-pressed='true'] svg {
+.mode-pill[aria-pressed="true"] svg {
   opacity: 1;
 }
 
@@ -3422,12 +3510,23 @@ a:hover {
   background: var(--bg-raised);
   color: var(--fg-secondary);
 }
-.token-usage svg { opacity: 0.5; }
-.token-usage.has-usage svg { opacity: 0.7; animation: spin 3s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
+.token-usage svg {
+  opacity: 0.5;
+}
+.token-usage.has-usage svg {
+  opacity: 0.7;
+  animation: spin 3s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 /* On mobile, hide when no usage to save space */
 @media (max-width: 640px) {
-  .token-usage:not(.has-usage) { display: none; }
+  .token-usage:not(.has-usage) {
+    display: none;
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -3461,7 +3560,9 @@ a:hover {
   padding: var(--space-3) 0;
   border-bottom: 1px solid var(--border);
 }
-.changelog-entry:last-child { border-bottom: none; }
+.changelog-entry:last-child {
+  border-bottom: none;
+}
 .changelog-entry.latest {
   background: var(--bg-raised);
   border-radius: var(--radius-md);
@@ -3505,7 +3606,9 @@ a:hover {
   color: var(--fg-secondary);
   line-height: 1.6;
 }
-.changelog-list li { margin-bottom: 2px; }
+.changelog-list li {
+  margin-bottom: 2px;
+}
 
 /* ══════════════════════════════════════════════════════════════════
  *  Feedback Clarification Banner
@@ -3543,8 +3646,12 @@ a:hover {
   animation: permFadeIn 0.2s ease;
 }
 @keyframes permFadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 .permission-modal {
   background: var(--bg-primary, #1a1a2e);
@@ -3557,8 +3664,14 @@ a:hover {
   animation: permSlideUp 0.25s ease;
 }
 @keyframes permSlideUp {
-  from { transform: translateY(20px); opacity: 0; }
-  to { transform: translateY(0); opacity: 1; }
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
 }
 .permission-modal-icon {
   display: flex;

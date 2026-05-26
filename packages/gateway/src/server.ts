@@ -13,49 +13,51 @@ import {
   type OpenClaudeConfig,
   SkillStore,
   TaskStore,
+  claimSession,
+  deleteClientSession,
+  getClientSession,
+  getUsageSummary,
+  listClientSessions,
+  listUnclaimedSessions,
   paths,
+  queryEvents,
   readAgentsConfig,
   readConfig,
   searchSessions,
+  upsertClientSession,
   writeAgentsConfig,
   writeConfig,
-  getUsageSummary,
-  queryEvents,
-  listClientSessions,
-  getClientSession,
-  upsertClientSession,
-  deleteClientSession,
-  listUnclaimedSessions,
-  claimSession,
 } from '@openclaude/storage'
 import { type WebSocket, WebSocketServer } from 'ws'
-import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
+import { type JwtPayload, checkToken, signJwt, verifyJwt, verifyPassword } from './auth.js'
 import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
 import { parseDocument } from './documentParser.js'
-import { eventBus, createEvent } from './eventBus.js'
+import { createEvent, eventBus } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { createLogger } from './logger.js'
 import {
-  startMetricsCollection,
-  serializeMetrics,
-  httpRequestsTotal,
   httpRequestDuration,
-  wsConnectionsTotal,
-  sessionsActive,
+  httpRequestsTotal,
+  outboundRingEvictedTotal,
   outboundRingReplayHitTotal,
   outboundRingReplayMissTotal,
-  outboundRingEvictedTotal,
   outboundRingSizeBytes,
+  serializeMetrics,
+  sessionsActive,
+  startMetricsCollection,
+  wsConnectionsTotal,
 } from './metrics.js'
-import { RateLimiter } from './rateLimit.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
+import { DEFAULT_RING_CONFIG, type EvictionStats, OutboundRingBuffer } from './outboundRing.js'
 import { looksRedactedProxyUrl, maskProxyUrl, normalizeProxyUrl } from './proxyEnv.js'
-import { OutboundRingBuffer, DEFAULT_RING_CONFIG, type EvictionStats } from './outboundRing.js'
+import { RateLimiter } from './rateLimit.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
+
+type WechatChannelModule = typeof import('@openclaude/channel-wechat')
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
@@ -140,7 +142,7 @@ export class Gateway {
 
   // ── Cached agents config (avoid re-reading YAML on every request) ──
   private _agentsConfigCache: AgentsConfig | null = null
-  private _agentsConfigMtime: number = 0
+  private _agentsConfigMtime = 0
 
   private async _getAgentsConfig(): Promise<AgentsConfig> {
     try {
@@ -170,24 +172,27 @@ export class Gateway {
   // auto-deny broadcasts with the correct (unspoofable) peer kind.
   // `toolName` lets handlePermissionResponse apply tool-specific handling
   // (e.g. AskUserQuestion merges user-supplied `answers` into updatedInput).
-  private _pendingPermissions = new Map<string, {
-    sessionKey: string
-    toolName: string
-    input: Record<string, unknown>
-    toolUseId?: string
-    peerKey: string
-    /** Authenticated userId that owns this pending request — carried so that
-     *  _recordSettlement can stamp the settlement with the owner, and
-     *  reconstructed peerKeys on late-duplicate replay paths match the
-     *  original broadcast scope. */
-    userId: string
-    channel: string
-    peer: { id: string; kind: 'dm' | 'group' }
-    /** Monotonic timestamp (Date.now) at which this request should be auto-denied
-     *  by the janitor even if no disconnect or crash occurred. Prevents orphan
-     *  pending entries when a user leaves the tab open across days. */
-    expiresAt: number
-  }>()
+  private _pendingPermissions = new Map<
+    string,
+    {
+      sessionKey: string
+      toolName: string
+      input: Record<string, unknown>
+      toolUseId?: string
+      peerKey: string
+      /** Authenticated userId that owns this pending request — carried so that
+       *  _recordSettlement can stamp the settlement with the owner, and
+       *  reconstructed peerKeys on late-duplicate replay paths match the
+       *  original broadcast scope. */
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+      /** Monotonic timestamp (Date.now) at which this request should be auto-denied
+       *  by the janitor even if no disconnect or crash occurred. Prevents orphan
+       *  pending entries when a user leaves the tab open across days. */
+      expiresAt: number
+    }
+  >()
   /** Max wait for a permission response before the janitor auto-denies.
    *  Matched to the outer CCB turn timeout (30 min) so we don't pre-empt
    *  a slow user while a turn is still live. */
@@ -311,7 +316,7 @@ export class Gateway {
         // Destroys every session the router could route this (channel, peer) to.
         resetSession: async (channel, peerId, peerKind) => {
           const safePeer = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
-          const prefix = `agent:`
+          const prefix = 'agent:'
           const suffix = `:${channel}:${peerKind}:${safePeer}`
           const keys: string[] = []
           for (const s of this.sessions.list()) {
@@ -320,7 +325,9 @@ export class Gateway {
             }
           }
           for (const k of keys) {
-            try { await this.sessions.destroySession(k) } catch {}
+            try {
+              await this.sessions.destroySession(k)
+            } catch {}
             this._outboundRing.clear(k)
           }
           // Refresh size_bytes gauge — without this, a Prometheus scrape after
@@ -344,7 +351,6 @@ export class Gateway {
     process.once('SIGTERM', () => {
       this.shutdown().catch((err) => this.log.error('shutdown error (SIGTERM)', undefined, err))
     })
-
 
     // Start cron scheduler for reflection jobs (L3)
     // Smart delivery: push to last active channel, fallback to all webchat clients
@@ -458,12 +464,8 @@ export class Gateway {
           oneshot: ev.oneshot ?? true,
           label: ev.prompt.slice(0, 50),
         })
-        .then(() =>
-          this.log.info('eventBus task.created → gateway job', { taskId: ev.taskId }),
-        )
-        .catch((err) =>
-          this.log.warn('eventBus task.created failed', { taskId: ev.taskId }, err),
-        )
+        .then(() => this.log.info('eventBus task.created → gateway job', { taskId: ev.taskId }))
+        .catch((err) => this.log.warn('eventBus task.created failed', { taskId: ev.taskId }, err))
     })
     eventBus.on('task.deleted', (ev) => {
       if (!this.cron) return
@@ -475,9 +477,7 @@ export class Gateway {
             result: ok ? 'removed' : 'not found',
           }),
         )
-        .catch((err) =>
-          this.log.warn('eventBus task.deleted failed', { taskId: ev.taskId }, err),
-        )
+        .catch((err) => this.log.warn('eventBus task.deleted failed', { taskId: ev.taskId }, err))
     })
 
     // Start webhook router
@@ -541,9 +541,7 @@ export class Gateway {
             } as OutboundMessage)
           }
         }
-      })().catch((err) =>
-        this.log.error('webhook execution failed', { webhookId, agentId }, err),
-      )
+      })().catch((err) => this.log.error('webhook execution failed', { webhookId, agentId }, err))
     })
 
     // TaskStore: schedule-triggered tasks run alongside cron (check every 60s)
@@ -627,16 +625,18 @@ export class Gateway {
     // Periodic OAuth token refresh (every 10 min). Running subprocesses keep
     // the old token until restarted; 401 detection in sessionManager handles
     // the restart + retry when the old token expires mid-conversation.
-    this._oauthRefreshTimer = setInterval(() => this.refreshClaudeOAuthIfNeeded().catch(() => {}), 10 * 60_000)
-    // Periodic pending-permission janitor: TTL-based auto-deny + orphan cleanup.
-    this._pendingPermissionSweepTimer = setInterval(
-      () => {
-        try { this._sweepStalePendingPermissions() } catch (err) {
-          this.log.warn('pending permission sweep failed', undefined, err)
-        }
-      },
-      Gateway.PENDING_PERMISSION_SWEEP_MS,
+    this._oauthRefreshTimer = setInterval(
+      () => this.refreshClaudeOAuthIfNeeded().catch(() => {}),
+      10 * 60_000,
     )
+    // Periodic pending-permission janitor: TTL-based auto-deny + orphan cleanup.
+    this._pendingPermissionSweepTimer = setInterval(() => {
+      try {
+        this._sweepStalePendingPermissions()
+      } catch (err) {
+        this.log.warn('pending permission sweep failed', undefined, err)
+      }
+    }, Gateway.PENDING_PERMISSION_SWEEP_MS)
     // Materialize current token to runtime file BEFORE kicking off refresh,
     // and await it. Two reasons:
     //   1) Any ccb subprocess spawned during boot has a file to read.
@@ -653,9 +653,7 @@ export class Gateway {
     this.log.info('server started', { bind: config.gateway.bind, port: config.gateway.port })
 
     // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
-    this.bootAutoResume().catch((err) =>
-      this.log.error('auto-resume boot failed', undefined, err),
-    )
+    this.bootAutoResume().catch((err) => this.log.error('auto-resume boot failed', undefined, err))
   }
 
   /**
@@ -774,7 +772,9 @@ export class Gateway {
       if (!this.wss) return resolveClose()
       try {
         for (const ws of this.wss.clients) {
-          try { ws.terminate() } catch {}
+          try {
+            ws.terminate()
+          } catch {}
         }
         this.wss.close((err) => {
           if (err) this.log.warn('wss.close error', undefined, err)
@@ -819,7 +819,12 @@ export class Gateway {
       httpRequestsTotal.inc({ method, path: normalizePath(path), status })
       httpRequestDuration.observe(duration, { method, path: normalizePath(path) })
       // Log non-static requests (skip static assets to reduce noise)
-      if (path.startsWith('/api/') || path.startsWith('/v1/') || path === '/healthz' || path === '/metrics') {
+      if (
+        path.startsWith('/api/') ||
+        path.startsWith('/v1/') ||
+        path === '/healthz' ||
+        path === '/metrics'
+      ) {
         this.log.info('http', { method, path, status: res.statusCode, durationMs: duration })
       }
     })
@@ -832,46 +837,54 @@ export class Gateway {
         this.sendJson(res, 429, { error: 'too many login attempts, try again later' })
         return
       }
-      this.readBody(req).then((body) => {
-        let parsed: any
-        try {
-          parsed = JSON.parse(body)
-        } catch {
-          this.sendJson(res, 400, { error: 'invalid JSON' })
-          return
-        }
-        if (typeof parsed !== 'object' || parsed === null) {
-          this.sendJson(res, 400, { error: 'body must be a JSON object' })
-          return
-        }
-        const { username, password } = parsed
-        const users = this.deps.config.gateway.users
-        if (!users?.length) {
-          // Legacy mode: accept raw accessToken as password — username not required
-          if (typeof password !== 'string') {
-            this.sendJson(res, 400, { error: 'password must be a string' })
+      this.readBody(req)
+        .then((body) => {
+          let parsed: any
+          try {
+            parsed = JSON.parse(body)
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
             return
           }
-          if (checkToken(password, this.deps.config.gateway.accessToken)) {
-            const token = signJwt({ userId: 'default', exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS }, this.deps.config.gateway.accessToken)
-            this.sendJson(res, 200, { token, userId: 'default', name: 'Default' })
-          } else {
-            this.sendJson(res, 401, { error: 'invalid credentials' })
+          if (typeof parsed !== 'object' || parsed === null) {
+            this.sendJson(res, 400, { error: 'body must be a JSON object' })
+            return
           }
-          return
-        }
-        if (typeof username !== 'string' || typeof password !== 'string') {
-          this.sendJson(res, 400, { error: 'username and password must be strings' })
-          return
-        }
-        const user = users.find((u) => u.id === username)
-        if (!user || !verifyPassword(password, user.passwordHash)) {
-          this.sendJson(res, 401, { error: 'invalid credentials' })
-          return
-        }
-        const token = signJwt({ userId: user.id, exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS }, this.deps.config.gateway.accessToken)
-        this.sendJson(res, 200, { token, userId: user.id, name: user.name })
-      }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+          const { username, password } = parsed
+          const users = this.deps.config.gateway.users
+          if (!users?.length) {
+            // Legacy mode: accept raw accessToken as password — username not required
+            if (typeof password !== 'string') {
+              this.sendJson(res, 400, { error: 'password must be a string' })
+              return
+            }
+            if (checkToken(password, this.deps.config.gateway.accessToken)) {
+              const token = signJwt(
+                { userId: 'default', exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS },
+                this.deps.config.gateway.accessToken,
+              )
+              this.sendJson(res, 200, { token, userId: 'default', name: 'Default' })
+            } else {
+              this.sendJson(res, 401, { error: 'invalid credentials' })
+            }
+            return
+          }
+          if (typeof username !== 'string' || typeof password !== 'string') {
+            this.sendJson(res, 400, { error: 'username and password must be strings' })
+            return
+          }
+          const user = users.find((u) => u.id === username)
+          if (!user || !verifyPassword(password, user.passwordHash)) {
+            this.sendJson(res, 401, { error: 'invalid credentials' })
+            return
+          }
+          const token = signJwt(
+            { userId: user.id, exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS },
+            this.deps.config.gateway.accessToken,
+          )
+          this.sendJson(res, 200, { token, userId: user.id, name: user.name })
+        })
+        .catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
       return
     }
 
@@ -927,7 +940,10 @@ export class Gateway {
     // Logout: expire the HttpOnly session cookie
     if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
       const secure = this.isHttps(req) ? '; Secure' : ''
-      res.setHeader('Set-Cookie', `oc_session=; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=0`)
+      res.setHeader(
+        'Set-Cookie',
+        `oc_session=; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=0`,
+      )
       this.sendJson(res, 200, { ok: true })
       return
     }
@@ -964,14 +980,17 @@ export class Gateway {
       const sinceRaw = url.searchParams.get('since')
       const since = sinceRaw ? Number(sinceRaw) : undefined
       if (since !== undefined && !Number.isFinite(since)) {
-        this.sendJson(res, 400, { error: 'since must be a valid number' }); return
+        this.sendJson(res, 400, { error: 'since must be a valid number' })
+        return
       }
       Promise.all([
         getUsageSummary({ agentId, sessionId, since }),
         queryEvents({ type: 'cost.recorded', agentId, sessionKey: sessionId, since, limit: 50 }),
-      ]).then(([summary, events]) => {
-        this.sendJson(res, 200, { summary, recentCostEvents: events })
-      }).catch(() => this.sendJson(res, 500, { error: 'usage query failed' }))
+      ])
+        .then(([summary, events]) => {
+          this.sendJson(res, 200, { summary, recentCostEvents: events })
+        })
+        .catch(() => this.sendJson(res, 500, { error: 'usage query failed' }))
       return
     }
     if (url.pathname === '/api/usage/events' && req.method === 'GET') {
@@ -984,7 +1003,8 @@ export class Gateway {
       const limitNum = limitRaw ? Number(limitRaw) : 100
       const limit = Number.isFinite(limitNum) ? Math.min(Math.max(limitNum, 1), 1000) : 100
       if (since !== undefined && !Number.isFinite(since)) {
-        this.sendJson(res, 400, { error: 'since must be a valid number' }); return
+        this.sendJson(res, 400, { error: 'since must be a valid number' })
+        return
       }
       queryEvents({ type, agentId, sessionKey, since, limit })
         .then((events) => this.sendJson(res, 200, { events }))
@@ -1002,15 +1022,17 @@ export class Gateway {
       const userId = this.getUserId(req)
       const allLive = this.sessions.list()
       // For multi-user: only show sessions whose peerId belongs to this user
-      listClientSessions(userId).then((owned) => {
-        const ownedIds = new Set(owned.map((s) => s.id))
-        // Also include sessions with no matching client session (cron/task sessions) only for default user
-        const filtered = allLive.filter((s) => {
-          const peerId = s.sessionKey.split(':')[4] || ''
-          return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
+      listClientSessions(userId)
+        .then((owned) => {
+          const ownedIds = new Set(owned.map((s) => s.id))
+          // Also include sessions with no matching client session (cron/task sessions) only for default user
+          const filtered = allLive.filter((s) => {
+            const peerId = s.sessionKey.split(':')[4] || ''
+            return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
+          })
+          this.sendJson(res, 200, { sessions: filtered })
         })
-        this.sendJson(res, 200, { sessions: filtered })
-      }).catch(() => this.sendJson(res, 200, { sessions: [] }))
+        .catch(() => this.sendJson(res, 200, { sessions: [] }))
       return
     }
     // ── Client session sync (cross-device, multi-user) ──
@@ -1030,18 +1052,20 @@ export class Gateway {
     }
     if (url.pathname === '/api/sessions/claim' && req.method === 'POST') {
       const userId = this.getUserId(req)
-      this.readBody(req).then(async (body) => {
-        const { sessionIds } = JSON.parse(body) as { sessionIds: string[] }
-        if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
-          this.sendJson(res, 400, { error: 'sessionIds required' })
-          return
-        }
-        const results: Record<string, boolean> = {}
-        for (const sid of sessionIds) {
-          results[sid] = await claimSession(sid, userId)
-        }
-        this.sendJson(res, 200, { ok: true, results })
-      }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+      this.readBody(req)
+        .then(async (body) => {
+          const { sessionIds } = JSON.parse(body) as { sessionIds: string[] }
+          if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+            this.sendJson(res, 400, { error: 'sessionIds required' })
+            return
+          }
+          const results: Record<string, boolean> = {}
+          for (const sid of sessionIds) {
+            results[sid] = await claimSession(sid, userId)
+          }
+          this.sendJson(res, 200, { ok: true, results })
+        })
+        .catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
       return
     }
     const clientSessMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})$/)
@@ -1050,31 +1074,38 @@ export class Gateway {
       const userId = this.getUserId(req)
       if (req.method === 'GET') {
         getClientSession(sessId, userId)
-          .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
+          .then((s) =>
+            s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }),
+          )
           .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
         return
       }
       if (req.method === 'PUT') {
-        this.readBody(req).then(async (body) => {
-          const data = JSON.parse(body)
-          const updatedAt = Date.now()
-          const applied = await upsertClientSession({
-            id: sessId,
-            userId,
-            agentId: data.agentId || 'main',
-            title: data.title || '新会话',
-            pinned: !!data.pinned,
-            createdAt: data.createdAt || Date.now(),
-            lastAt: data.lastAt || Date.now(),
-            messages: data.messages || [],
-            updatedAt,
-          }, data._baseSyncedAt || 0)
-          if (!applied) {
-            this.sendJson(res, 409, { error: 'conflict' })
-          } else {
-            this.sendJson(res, 200, { ok: true, applied: true, updatedAt })
-          }
-        }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+        this.readBody(req)
+          .then(async (body) => {
+            const data = JSON.parse(body)
+            const updatedAt = Date.now()
+            const applied = await upsertClientSession(
+              {
+                id: sessId,
+                userId,
+                agentId: data.agentId || 'main',
+                title: data.title || '新会话',
+                pinned: !!data.pinned,
+                createdAt: data.createdAt || Date.now(),
+                lastAt: data.lastAt || Date.now(),
+                messages: data.messages || [],
+                updatedAt,
+              },
+              data._baseSyncedAt || 0,
+            )
+            if (!applied) {
+              this.sendJson(res, 409, { error: 'conflict' })
+            } else {
+              this.sendJson(res, 200, { ok: true, applied: true, updatedAt })
+            }
+          })
+          .catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
         return
       }
       if (req.method === 'DELETE') {
@@ -1205,30 +1236,33 @@ export class Gateway {
 
     // ── User Feedback ──
     if (url.pathname === '/api/feedback' && req.method === 'POST') {
-      this.readBody(req).then(async (body) => {
-        try {
-          const { category, description, sessionId, userAgent } = JSON.parse(body)
-          if (!description || typeof description !== 'string' || description.trim().length < 15) {
-            this.sendJson(res, 400, { error: '反馈描述至少需要 15 个字符' }); return
+      this.readBody(req)
+        .then(async (body) => {
+          try {
+            const { category, description, sessionId, userAgent } = JSON.parse(body)
+            if (!description || typeof description !== 'string' || description.trim().length < 15) {
+              this.sendJson(res, 400, { error: '反馈描述至少需要 15 个字符' })
+              return
+            }
+            const feedbackDir = join(paths.home, 'feedback')
+            await mkdir(feedbackDir, { recursive: true })
+            const entry = {
+              id: `fb-${Date.now()}-${randomBytes(4).toString('hex')}`,
+              category: category || 'general',
+              description,
+              sessionId: sessionId || null,
+              userAgent: userAgent || null,
+              userId: this.getUserId(req),
+              createdAt: new Date().toISOString(),
+            }
+            const filePath = join(feedbackDir, `${entry.id}.json`)
+            await writeFile(filePath, JSON.stringify(entry, null, 2))
+            this.sendJson(res, 200, { ok: true, id: entry.id })
+          } catch (err) {
+            this.sendJson(res, 400, { error: String(err) })
           }
-          const feedbackDir = join(paths.home, 'feedback')
-          await mkdir(feedbackDir, { recursive: true })
-          const entry = {
-            id: `fb-${Date.now()}-${randomBytes(4).toString('hex')}`,
-            category: category || 'general',
-            description,
-            sessionId: sessionId || null,
-            userAgent: userAgent || null,
-            userId: this.getUserId(req),
-            createdAt: new Date().toISOString(),
-          }
-          const filePath = join(feedbackDir, `${entry.id}.json`)
-          await writeFile(filePath, JSON.stringify(entry, null, 2))
-          this.sendJson(res, 200, { ok: true, id: entry.id })
-        } catch (err) {
-          this.sendJson(res, 400, { error: String(err) })
-        }
-      }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+        })
+        .catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
       return
     }
     if (url.pathname === '/api/feedback' && req.method === 'GET') {
@@ -1236,7 +1270,10 @@ export class Gateway {
       const userId = this.getUserId(req)
       try {
         const files = existsSync(feedbackDir)
-          ? readdirSync(feedbackDir).filter(f => f.endsWith('.json')).sort().reverse()
+          ? readdirSync(feedbackDir)
+              .filter((f) => f.endsWith('.json'))
+              .sort()
+              .reverse()
           : []
         const items: unknown[] = []
         for (const f of files) {
@@ -1244,7 +1281,9 @@ export class Gateway {
           try {
             const entry = JSON.parse(readFileSync(join(feedbackDir, f), 'utf-8'))
             if (entry && entry.userId === userId) items.push(entry)
-          } catch { /* skip corrupt files */ }
+          } catch {
+            /* skip corrupt files */
+          }
         }
         this.sendJson(res, 200, { feedback: items })
       } catch {
@@ -1377,7 +1416,8 @@ export class Gateway {
         'Cache-Control': 'private, max-age=3600',
       }
       if (isActiveContentType(mediaContentType)) {
-        mediaHeaders['Content-Disposition'] = `attachment; filename="${encodeURIComponent(basename(found) || 'file')}"`
+        mediaHeaders['Content-Disposition'] =
+          `attachment; filename="${encodeURIComponent(basename(found) || 'file')}"`
       }
       res.writeHead(200, mediaHeaders)
       createReadStream(found).pipe(res)
@@ -1455,7 +1495,11 @@ export class Gateway {
             res.end()
             return
           }
-          res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': 'public, max-age=3600' })
+          res.writeHead(200, {
+            'Content-Type': cached.mime,
+            ETag: cached.etag,
+            'Cache-Control': 'public, max-age=3600',
+          })
           res.end(cached.content)
           return
         }
@@ -1475,7 +1519,11 @@ export class Gateway {
               res.end()
               return
             }
-            res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': 'public, max-age=3600' })
+            res.writeHead(200, {
+              'Content-Type': mime,
+              ETag: etag,
+              'Cache-Control': 'public, max-age=3600',
+            })
             res.end(content)
             return
           }
@@ -1493,7 +1541,11 @@ export class Gateway {
             res.end()
             return
           }
-          res.writeHead(200, { 'Content-Type': 'text/html', 'ETag': cachedIndex.etag, 'Cache-Control': 'no-cache' })
+          res.writeHead(200, {
+            'Content-Type': 'text/html',
+            ETag: cachedIndex.etag,
+            'Cache-Control': 'no-cache',
+          })
           res.end(cachedIndex.content)
           return
         }
@@ -1512,7 +1564,11 @@ export class Gateway {
               res.end()
               return
             }
-            res.writeHead(200, { 'Content-Type': 'text/html', 'ETag': etag, 'Cache-Control': 'no-cache' })
+            res.writeHead(200, {
+              'Content-Type': 'text/html',
+              ETag: etag,
+              'Cache-Control': 'no-cache',
+            })
             res.end(content)
             return
           }
@@ -1581,7 +1637,8 @@ export class Gateway {
     if ((req.socket as any).encrypted === true) return true
     const remoteAddr = req.socket.remoteAddress ?? ''
     // Trust X-Forwarded-Proto only from loopback (127.x.x.x, ::1, IPv4-mapped ::ffff:127.x.x.x)
-    const isLoopback = remoteAddr === '::1' || remoteAddr.startsWith('127.') || remoteAddr.startsWith('::ffff:127.')
+    const isLoopback =
+      remoteAddr === '::1' || remoteAddr.startsWith('127.') || remoteAddr.startsWith('::ffff:127.')
     return isLoopback && req.headers['x-forwarded-proto'] === 'https'
   }
 
@@ -1710,7 +1767,7 @@ export class Gateway {
         return
       }
       const normalized = normalizeProxyUrl(value)
-      if (normalized === undefined) delete next.proxyUrl
+      if (normalized === undefined) next.proxyUrl = undefined
       else next.proxyUrl = normalized
       mutated = true
     }
@@ -1822,7 +1879,7 @@ export class Gateway {
           return
         }
         const normalized = normalizeProxyUrl(body.proxyUrl)
-        if (normalized === undefined) delete agent.proxyUrl
+        if (normalized === undefined) agent.proxyUrl = undefined
         else agent.proxyUrl = normalized
       }
       cfg.agents[idx] = agent
@@ -2112,11 +2169,14 @@ export class Gateway {
       this._activeDelegations--
     }
 
-    eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {
-      sessionKey,
-      output: output.trim(),
-      error: error || undefined,
-    }))
+    eventBus.emit(
+      'agent.completed',
+      createEvent('agent.completed', targetAgentId, {
+        sessionKey,
+        output: output.trim(),
+        error: error || undefined,
+      }),
+    )
 
     this.sendJson(res, 200, {
       ok: !error,
@@ -2163,20 +2223,13 @@ export class Gateway {
     try {
       pairing = await import('@openclaude/channel-wechat' as any)
     } catch (err) {
-      this.sendError(res, 503, '@openclaude/channel-wechat not available: ' + String(err))
+      this.sendError(res, 503, `@openclaude/channel-wechat not available: ${String(err)}`)
       return
     }
-    const {
-      startPairing,
-      resumePairing,
-      cancelPairing,
-    } = pairing as typeof import('@openclaude/channel-wechat')
+    const { startPairing, resumePairing, cancelPairing } = pairing as WechatChannelModule
 
-    const {
-      getWechatBindingByUserId,
-      deleteWechatBinding,
-      updateWechatBindingStatus,
-    } = await import('@openclaude/storage')
+    const { getWechatBindingByUserId, deleteWechatBinding, updateWechatBindingStatus } =
+      await import('@openclaude/storage')
 
     const userId = this.getUserId(req)
 
@@ -2758,14 +2811,15 @@ export class Gateway {
       if (force && !this._refreshForced) {
         // Upgrade: chain a forced refresh after the in-flight non-forced one
         this._refreshForced = true
-        this._refreshPromise = this._refreshPromise
-          .then(() => this._refreshClaudeOAuthImpl(true))
+        this._refreshPromise = this._refreshPromise.then(() => this._refreshClaudeOAuthImpl(true))
       }
       return this._refreshPromise
     }
     this._refreshForced = force
-    this._refreshPromise = this._refreshClaudeOAuthImpl(force)
-      .finally(() => { this._refreshPromise = null; this._refreshForced = false })
+    this._refreshPromise = this._refreshClaudeOAuthImpl(force).finally(() => {
+      this._refreshPromise = null
+      this._refreshForced = false
+    })
     return this._refreshPromise
   }
 
@@ -2886,7 +2940,9 @@ export class Gateway {
   // ───────── WS ─────────
   private handleWsConnection(ws: WebSocket, req: IncomingMessage): void {
     if (this._shuttingDown) {
-      try { ws.close(1001, 'shutting down') } catch {}
+      try {
+        ws.close(1001, 'shutting down')
+      } catch {}
       return
     }
     // v3 commercial 容器内信任 docker bridge gateway IP 直连。commercial 侧 userChatBridge
@@ -2897,10 +2953,9 @@ export class Gateway {
     // process.env.OPENCLAUDE_TRUST_BRIDGE_IP 为空,旁路恒为 false,checkHttpAuth 行为完全不变。
     const remoteIp = req.socket.remoteAddress || ''
     const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
-    const isFromBridge = !!TRUST_BRIDGE_IP && (
-      remoteIp === TRUST_BRIDGE_IP ||
-      remoteIp === `::ffff:${TRUST_BRIDGE_IP}`
-    )
+    const isFromBridge =
+      !!TRUST_BRIDGE_IP &&
+      (remoteIp === TRUST_BRIDGE_IP || remoteIp === `::ffff:${TRUST_BRIDGE_IP}`)
     if (!isFromBridge && !this.checkHttpAuth(req)) {
       ws.close(1008, 'unauthorized')
       return
@@ -2924,157 +2979,166 @@ export class Gateway {
     ws.once('close', () => this.wsClients.delete(ws))
     ws.on('message', async (raw) => {
       try {
-      let frame: InboundFrame
-      try {
-        frame = JSON.parse(raw.toString()) as InboundFrame
-      } catch {
-        ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }))
-        return
-      }
-      // Client-side keepalive ping — echo back as pong so the client can use
-      // RTT to detect a half-open ("zombie") socket. iOS Safari can freeze a
-      // backgrounded WS such that readyState stays OPEN locally but no frames
-      // flow; the client uses the absence of a matching pong within a watchdog
-      // window to force-close + reconnect. The optional `id` is echoed so the
-      // client can match the response to the specific ping it sent — without
-      // it, a stale pong queued during iOS resume could falsely satisfy a
-      // fresh probe.
-      if ((frame as any).type === 'ping') {
+        let frame: InboundFrame
         try {
-          const pingId = (frame as any).id
-          ws.send(JSON.stringify({
-            type: 'pong',
-            ...(pingId !== undefined ? { id: pingId } : {}),
-            ts: Date.now(),
-          }))
-        } catch {}
-        return
-      }
-
-      // Hello frame: client identifies its sessions so we can auto-resume.
-      // We register the WS into clientsByPeer only for peers that have an
-      // active session in the session manager (validated server-side).
-      if ((frame as any).type === 'inbound.hello') {
-        const hello = frame as any
-        // Phase 0.3: peers may carry `lastFrameSeq` — the highest frameSeq
-        // this tab successfully processed before the disconnect. 0 = never
-        // received one (first connect / localStorage wiped / legacy client).
-        const peers: Array<{ peerId: string; agentId: string; inFlight?: boolean; lastFrameSeq?: number }> = hello.peers || []
-        // Auto-resume: check if any peer has a resumable session that is NOT already active
-        this.autoResumeFromHello(peers, ws).catch((err) =>
-          this.log.error('auto-resume failed', undefined, err),
-        )
-        return
-      }
-
-      if (frame.type === 'inbound.message') {
-        // Stash userId on the frame so downstream dispatchInbound/deliver
-        // paths that don't have the WS in scope can still build the correct
-        // per-user peerKey. Private field (leading _), never sent over wire.
-        ;(frame as any)._userId = this.getWsUserId(ws)
-        // 把 ws client 关联到这个 (channel, peer)
-        const peerKey = Gateway.makePeerKey(this.getWsUserId(ws), frame.channel, frame.peer.id)
-        let set = this.clientsByPeer.get(peerKey)
-        if (!set) {
-          set = new Set()
-          this.clientsByPeer.set(peerKey, set)
-        }
-        if (!set.has(ws)) {
-          set.add(ws)
-          ws.once('close', () => {
-            set?.delete(ws)
-            if (set?.size === 0) {
-              this.clientsByPeer.delete(peerKey)
-              // Auto-deny all pending permission requests for this peer
-              // since no client is available to respond.
-              this._autoDenyPendingPermissions(peerKey)
-            }
-          })
-        }
-        await this.dispatchInbound(frame)
-      } else if (frame.type === 'inbound.control.stop') {
-        await this.handleStop(frame)
-      } else if ((frame as any).type === 'inbound.permission_response') {
-        // Stash userId so handlePermissionResponse can rebuild per-user
-        // peerKey on the late-duplicate no-pending-entry fallback path
-        // (the only path where we have no server-trusted user identity).
-        ;(frame as any)._userId = this.getWsUserId(ws)
-        await this.handlePermissionResponse(frame as any)
-      } else if ((frame as any).type === 'inbound.control.reset') {
-        // Reset: kill the CCB subprocess AND remove session from manager,
-        // so next message creates an entirely fresh session with no history
-        const f = frame as any
-        const agentId =
-          f.agentId ||
-          this.router.route({
-            type: 'inbound.message',
-            idempotencyKey: '',
-            channel: f.channel,
-            peer: f.peer,
-            content: { text: '' },
-            ts: Date.now(),
-          }).agent.id
-        const sessionKey = `agent:${agentId}:${f.channel}:${f.peer.kind}:${f.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
-        await this.sessions.destroySession(sessionKey)
-        // Drop the outbound ring when the session is reset. Keeping stale
-        // frames around for a now-meaningless sessionKey would be wasteful
-        // and could mislead a future reconnect.
-        this._outboundRing.clear(sessionKey)
-        outboundRingSizeBytes.value = this._outboundRing.totalBytes()
-        this.log.info('reset destroyed session', { sessionKey })
-      } else if ((frame as any).type === 'control.session.compact') {
-        // Compact: send a compaction request to the agent as a user message
-        const sessionKey = (frame as any).sessionKey
-        if (!sessionKey) return
-        const session = this.sessions.getByKey(sessionKey)
-        if (!session) {
-          ws.send(JSON.stringify({ type: 'error', error: 'session not found' }))
+          frame = JSON.parse(raw.toString()) as InboundFrame
+        } catch {
+          ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }))
           return
         }
-        this.log.info('compact session', { sessionKey })
-        try {
-          await this.sessions.submit(
-            session,
-            '/compact — 请压缩当前对话上下文,保留关键信息,删除冗余细节。',
-            (e) => {
-              if (e.kind === 'block') {
-                const out = {
-                  type: 'outbound.message',
-                  sessionKey,
-                  channel: 'webchat',
-                  peer: { id: sessionKey.split(':')[4] || '__compact__', kind: 'dm' },
-                  blocks: [e.block],
-                  isFinal: false,
-                }
-                // Single-ws send (compact progress goes only to the requester),
-                // so deliver() isn't appropriate here — stamp ts inline instead
-                // so the client's stale-final guard has a monotonic timestamp.
-                ws.send(JSON.stringify({ ...out, ts: Date.now() }))
-              } else if (e.kind === 'final') {
-                ws.send(
-                  JSON.stringify({
+        // Client-side keepalive ping — echo back as pong so the client can use
+        // RTT to detect a half-open ("zombie") socket. iOS Safari can freeze a
+        // backgrounded WS such that readyState stays OPEN locally but no frames
+        // flow; the client uses the absence of a matching pong within a watchdog
+        // window to force-close + reconnect. The optional `id` is echoed so the
+        // client can match the response to the specific ping it sent — without
+        // it, a stale pong queued during iOS resume could falsely satisfy a
+        // fresh probe.
+        if ((frame as any).type === 'ping') {
+          try {
+            const pingId = (frame as any).id
+            ws.send(
+              JSON.stringify({
+                type: 'pong',
+                ...(pingId !== undefined ? { id: pingId } : {}),
+                ts: Date.now(),
+              }),
+            )
+          } catch {}
+          return
+        }
+
+        // Hello frame: client identifies its sessions so we can auto-resume.
+        // We register the WS into clientsByPeer only for peers that have an
+        // active session in the session manager (validated server-side).
+        if ((frame as any).type === 'inbound.hello') {
+          const hello = frame as any
+          // Phase 0.3: peers may carry `lastFrameSeq` — the highest frameSeq
+          // this tab successfully processed before the disconnect. 0 = never
+          // received one (first connect / localStorage wiped / legacy client).
+          const peers: Array<{
+            peerId: string
+            agentId: string
+            inFlight?: boolean
+            lastFrameSeq?: number
+          }> = hello.peers || []
+          // Auto-resume: check if any peer has a resumable session that is NOT already active
+          this.autoResumeFromHello(peers, ws).catch((err) =>
+            this.log.error('auto-resume failed', undefined, err),
+          )
+          return
+        }
+
+        if (frame.type === 'inbound.message') {
+          // Stash userId on the frame so downstream dispatchInbound/deliver
+          // paths that don't have the WS in scope can still build the correct
+          // per-user peerKey. Private field (leading _), never sent over wire.
+          ;(frame as any)._userId = this.getWsUserId(ws)
+          // 把 ws client 关联到这个 (channel, peer)
+          const peerKey = Gateway.makePeerKey(this.getWsUserId(ws), frame.channel, frame.peer.id)
+          let set = this.clientsByPeer.get(peerKey)
+          if (!set) {
+            set = new Set()
+            this.clientsByPeer.set(peerKey, set)
+          }
+          if (!set.has(ws)) {
+            set.add(ws)
+            ws.once('close', () => {
+              set?.delete(ws)
+              if (set?.size === 0) {
+                this.clientsByPeer.delete(peerKey)
+                // Auto-deny all pending permission requests for this peer
+                // since no client is available to respond.
+                this._autoDenyPendingPermissions(peerKey)
+              }
+            })
+          }
+          await this.dispatchInbound(frame)
+        } else if (frame.type === 'inbound.control.stop') {
+          await this.handleStop(frame)
+        } else if ((frame as any).type === 'inbound.permission_response') {
+          // Stash userId so handlePermissionResponse can rebuild per-user
+          // peerKey on the late-duplicate no-pending-entry fallback path
+          // (the only path where we have no server-trusted user identity).
+          ;(frame as any)._userId = this.getWsUserId(ws)
+          await this.handlePermissionResponse(frame as any)
+        } else if ((frame as any).type === 'inbound.control.reset') {
+          // Reset: kill the CCB subprocess AND remove session from manager,
+          // so next message creates an entirely fresh session with no history
+          const f = frame as any
+          const agentId =
+            f.agentId ||
+            this.router.route({
+              type: 'inbound.message',
+              idempotencyKey: '',
+              channel: f.channel,
+              peer: f.peer,
+              content: { text: '' },
+              ts: Date.now(),
+            }).agent.id
+          const sessionKey = `agent:${agentId}:${f.channel}:${f.peer.kind}:${f.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+          await this.sessions.destroySession(sessionKey)
+          // Drop the outbound ring when the session is reset. Keeping stale
+          // frames around for a now-meaningless sessionKey would be wasteful
+          // and could mislead a future reconnect.
+          this._outboundRing.clear(sessionKey)
+          outboundRingSizeBytes.value = this._outboundRing.totalBytes()
+          this.log.info('reset destroyed session', { sessionKey })
+        } else if ((frame as any).type === 'control.session.compact') {
+          // Compact: send a compaction request to the agent as a user message
+          const sessionKey = (frame as any).sessionKey
+          if (!sessionKey) return
+          const session = this.sessions.getByKey(sessionKey)
+          if (!session) {
+            ws.send(JSON.stringify({ type: 'error', error: 'session not found' }))
+            return
+          }
+          this.log.info('compact session', { sessionKey })
+          try {
+            await this.sessions.submit(
+              session,
+              '/compact — 请压缩当前对话上下文,保留关键信息,删除冗余细节。',
+              (e) => {
+                if (e.kind === 'block') {
+                  const out = {
                     type: 'outbound.message',
                     sessionKey,
                     channel: 'webchat',
-                    peer: { id: '__compact__', kind: 'dm' },
-                    blocks: [{ kind: 'text', text: '✅ 上下文压缩完成' }],
-                    isFinal: true,
-                    meta: e.meta,
-                    ts: Date.now(),
-                  }),
-                )
-              }
-            },
-          )
-        } catch (err: any) {
-          ws.send(JSON.stringify({ type: 'error', error: `compact failed: ${err?.message}` }))
+                    peer: { id: sessionKey.split(':')[4] || '__compact__', kind: 'dm' },
+                    blocks: [e.block],
+                    isFinal: false,
+                  }
+                  // Single-ws send (compact progress goes only to the requester),
+                  // so deliver() isn't appropriate here — stamp ts inline instead
+                  // so the client's stale-final guard has a monotonic timestamp.
+                  ws.send(JSON.stringify({ ...out, ts: Date.now() }))
+                } else if (e.kind === 'final') {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'outbound.message',
+                      sessionKey,
+                      channel: 'webchat',
+                      peer: { id: '__compact__', kind: 'dm' },
+                      blocks: [{ kind: 'text', text: '✅ 上下文压缩完成' }],
+                      isFinal: true,
+                      meta: e.meta,
+                      ts: Date.now(),
+                    }),
+                  )
+                }
+              },
+            )
+          } catch (err: any) {
+            ws.send(JSON.stringify({ type: 'error', error: `compact failed: ${err?.message}` }))
+          }
         }
-      }
       } catch (err: any) {
         this.log.error('ws-message unhandled error', undefined, err)
         try {
           ws.send(JSON.stringify({ type: 'error', error: `internal error: ${err?.message}` }))
-        } catch { /* ws may already be closed */ }
+        } catch {
+          /* ws may already be closed */
+        }
       }
     })
   }
@@ -3219,7 +3283,9 @@ export class Gateway {
     // the sanitizer itself handles every shape of bad input.
     if (frame.behavior === 'allow' && pending.toolName === 'AskUserQuestion') {
       const rawCandidate =
-        frame.updatedInput && typeof frame.updatedInput === 'object' && !Array.isArray(frame.updatedInput)
+        frame.updatedInput &&
+        typeof frame.updatedInput === 'object' &&
+        !Array.isArray(frame.updatedInput)
           ? frame.updatedInput
           : {}
       const sanitized = sanitizeAskUserQuestionUpdatedInput(pending.input, rawCandidate)
@@ -3234,9 +3300,14 @@ export class Gateway {
         forwardedInput = sanitized
       }
     }
-    const response = effectiveBehavior === 'allow'
-      ? { behavior: 'allow' as const, updatedInput: forwardedInput, toolUseID: pending.toolUseId }
-      : { behavior: 'deny' as const, message: effectiveMessage || 'User denied', toolUseID: pending.toolUseId }
+    const response =
+      effectiveBehavior === 'allow'
+        ? { behavior: 'allow' as const, updatedInput: forwardedInput, toolUseID: pending.toolUseId }
+        : {
+            behavior: 'deny' as const,
+            message: effectiveMessage || 'User denied',
+            toolUseID: pending.toolUseId,
+          }
     const ok = session.runner.sendPermissionResponse(frame.requestId, response)
     this.log.info('permission response', {
       requestId: frame.requestId,
@@ -3266,7 +3337,7 @@ export class Gateway {
       forwardedInput !== pending.input &&
       (forwardedInput as { answers?: unknown }).answers &&
       typeof (forwardedInput as { answers?: unknown }).answers === 'object'
-        ? ((forwardedInput as { answers: Record<string, string> }).answers)
+        ? (forwardedInput as { answers: Record<string, string> }).answers
         : undefined
     this._recordSettlement(frame.requestId, {
       behavior: effectiveBehavior,
@@ -3595,7 +3666,7 @@ export class Gateway {
       // a REST force-sync. This is ONLY a short-term optimisation; the
       // durable server-side persistence from Phase 0.1/0.2 remains the
       // authoritative backstop for any duration of disconnect.
-      const peerRec = peers.find(p => p.peerId === peerId)
+      const peerRec = peers.find((p) => p.peerId === peerId)
       const clientLastSeq = typeof peerRec?.lastFrameSeq === 'number' ? peerRec.lastFrameSeq : 0
       if (clientLastSeq >= 0) {
         const replay = this._outboundRing.peekReplay(sessionKey, clientLastSeq)
@@ -3613,27 +3684,39 @@ export class Gateway {
           if (replay.sent.length > 0) {
             outboundRingReplayHitTotal.inc()
             for (const f of replay.sent) {
-              try { ws.send(f.data) } catch { break }
+              try {
+                ws.send(f.data)
+              } catch {
+                break
+              }
             }
             this.log.info('resume replay served', {
-              sessionKey, from: clientLastSeq, to: replay.to, sent: replay.sent.length,
+              sessionKey,
+              from: clientLastSeq,
+              to: replay.to,
+              sent: replay.sent.length,
             })
           }
         } else {
           outboundRingReplayMissTotal.inc({ reason: replay.reason })
           try {
-            ws.send(JSON.stringify({
-              type: 'outbound.resume_failed',
+            ws.send(
+              JSON.stringify({
+                type: 'outbound.resume_failed',
+                sessionKey,
+                channel: 'webchat',
+                peer: { id: peerId, kind: 'dm' },
+                from: clientLastSeq,
+                to: replay.to,
+                reason: replay.reason,
+                ts: Date.now(),
+              }),
+            )
+            this.log.warn('resume replay miss — signalled resume_failed', {
               sessionKey,
-              channel: 'webchat',
-              peer: { id: peerId, kind: 'dm' },
               from: clientLastSeq,
               to: replay.to,
               reason: replay.reason,
-              ts: Date.now(),
-            }))
-            this.log.warn('resume replay miss — signalled resume_failed', {
-              sessionKey, from: clientLastSeq, to: replay.to, reason: replay.reason,
             })
           } catch {}
         }
@@ -3644,7 +3727,7 @@ export class Gateway {
       // currently running. This clears the client's stuck _sendingInFlight state from
       // the interrupted turn. Without this, the client shows a permanent typing indicator
       // and the resumed subprocess sits idle — neither side moves first.
-      const peerInFlight = peers.find(p => p.peerId === peerId)?.inFlight
+      const peerInFlight = peers.find((p) => p.peerId === peerId)?.inFlight
       if (peerInFlight && session && !session.runner.isRunning) {
         try {
           // Single-ws send (only the hello-ing client should see this notice),
@@ -3708,7 +3791,9 @@ export class Gateway {
           deduplicated: true,
         })
         for (const ws of clients) {
-          try { ws.send(ack) } catch {}
+          try {
+            ws.send(ack)
+          } catch {}
         }
       }
       return
@@ -3829,19 +3914,29 @@ export class Gateway {
     const MAX_SINGLE_FILE = 25 * 1024 * 1024 // 25MB
     const MAX_TOTAL_MEDIA = 50 * 1024 * 1024 // 50MB total
     const ALLOWED_MIME_PREFIXES = [
-      'image/', 'audio/', 'video/', 'application/pdf', 'text/',
+      'image/',
+      'audio/',
+      'video/',
+      'application/pdf',
+      'text/',
       'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
-      'application/vnd.ms-',                            // doc, xls, ppt
-      'application/msword',                             // .doc
-      'application/zip', 'application/x-zip',           // zip archives
-      'application/gzip', 'application/x-gzip',         // .gz, .tar.gz
-      'application/x-tar', 'application/x-compressed-tar', 'application/x-gtar', // .tar / tarball variants
-      'application/x-7z-compressed',                    // .7z
-      'application/vnd.rar', 'application/x-rar-compressed', // .rar
-      'application/x-bzip', 'application/x-bzip2',      // .bz2
-      'application/x-xz',                               // .xz
-      'application/json',                               // json files
-      'application/xml',                                // xml files
+      'application/vnd.ms-', // doc, xls, ppt
+      'application/msword', // .doc
+      'application/zip',
+      'application/x-zip', // zip archives
+      'application/gzip',
+      'application/x-gzip', // .gz, .tar.gz
+      'application/x-tar',
+      'application/x-compressed-tar',
+      'application/x-gtar', // .tar / tarball variants
+      'application/x-7z-compressed', // .7z
+      'application/vnd.rar',
+      'application/x-rar-compressed', // .rar
+      'application/x-bzip',
+      'application/x-bzip2', // .bz2
+      'application/x-xz', // .xz
+      'application/json', // json files
+      'application/xml', // xml files
     ]
     let totalMediaSize = 0
     for (const m of media) {
@@ -4114,121 +4209,129 @@ export class Gateway {
           ? ('inter-agent' as const)
           : ('chat' as const)
     const _run = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
-    await this.sessions.submit(session, payload, (e) => {
-      if (e.kind === 'block') {
-        const b = e.block as any
-        // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让
-        // bg-bash 在 turn 结束后跨 turn 继续 emit。如果累积到 out.blocks /
-        // aggregatedBlocks 里,旧 turn 闭包会随 bash 生命周期持续增长内存。
-        // 直接派送(WebChat)/丢弃(adapter,非流式不需要快照)即可。
-        const isTail = b?.kind === 'tool_output_tail'
-        if (adapter) {
-          if (isTail) return
-          // For partial tool_use blocks, replace any prior block with same blockId
-          if (b.blockId) {
-            const idx = aggregatedBlocks.findIndex((x: any) => x.blockId === b.blockId)
-            if (idx >= 0) aggregatedBlocks[idx] = e.block
-            else aggregatedBlocks.push(e.block)
+    await this.sessions.submit(
+      session,
+      payload,
+      (e) => {
+        if (e.kind === 'block') {
+          const b = e.block as any
+          // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让
+          // bg-bash 在 turn 结束后跨 turn 继续 emit。如果累积到 out.blocks /
+          // aggregatedBlocks 里,旧 turn 闭包会随 bash 生命周期持续增长内存。
+          // 直接派送(WebChat)/丢弃(adapter,非流式不需要快照)即可。
+          const isTail = b?.kind === 'tool_output_tail'
+          if (adapter) {
+            if (isTail) return
+            // For partial tool_use blocks, replace any prior block with same blockId
+            if (b.blockId) {
+              const idx = aggregatedBlocks.findIndex((x: any) => x.blockId === b.blockId)
+              if (idx >= 0) aggregatedBlocks[idx] = e.block
+              else aggregatedBlocks.push(e.block)
+            } else {
+              aggregatedBlocks.push(e.block)
+            }
           } else {
-            aggregatedBlocks.push(e.block)
+            // WebChat: stream each block immediately via WS
+            if (!isTail) out.blocks.push(e.block)
+            this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
           }
-        } else {
-          // WebChat: stream each block immediately via WS
-          if (!isTail) out.blocks.push(e.block)
-          this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
-        }
-      } else if (e.kind === 'final') {
-        this._runLog.complete(_run, {
-          status: 'completed',
-          cost: e.meta?.cost,
-          inputTokens: e.meta?.inputTokens,
-          outputTokens: e.meta?.outputTokens,
-          turn: e.meta?.turn,
-        })
-        if (adapter) {
-          // adapter.send() 是 async,内部可能在 await 之后才读 wire.blocks。
-          // 如果直接传 aggregatedBlocks,接着同步清空数组,adapter 读到的就是空。
-          // 拷贝一份脱钩本地引用。
-          this.deliver({ ...out, blocks: aggregatedBlocks.slice(), isFinal: true, meta: e.meta }, adapter)
-        } else {
-          this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
-        }
-        // 释放本轮聚合数组的内存。本闭包跨 turn 仍会被 sessionManager 的
-        // 跨 turn message listener 调用(转发 bg-bash bash_output_tail);
-        // 不清空的话 out.blocks / aggregatedBlocks 引用的旧 block 实例
-        // 会被钉到下一轮 listener 替换之前。
-        out.blocks.length = 0
-        aggregatedBlocks.length = 0
-      } else if (e.kind === 'permission_request') {
-        // Forward permission prompt to WebSocket clients for user approval.
-        // userId is stashed on the frame by the WS handler (see handleWsConnection)
-        // so adapter-dispatched frames fall back to 'default'. On personal-edition
-        // (single-user) this is always 'default' in practice.
-        const dispatchUserId: string =
-          typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
-        const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
-        const permFrame = {
-          type: 'outbound.permission_request' as const,
-          sessionKey,
-          channel: frame.channel,
-          peer: frame.peer,
-          requestId: e.request.requestId,
-          toolName: e.request.toolName,
-          toolUseId: e.request.toolUseId,
-          inputPreview: JSON.stringify(e.request.input).slice(0, 400),
-          inputJson: e.request.input,
-        }
-        // Permission requests only make sense for interactive clients (WebChat)
-        // Non-interactive adapters auto-deny.
-        if (adapter) {
-          session.runner.sendPermissionResponse(e.request.requestId, {
-            behavior: 'deny',
-            message: 'Permission prompts not supported on this channel',
-            toolUseID: e.request.toolUseId,
+        } else if (e.kind === 'final') {
+          this._runLog.complete(_run, {
+            status: 'completed',
+            cost: e.meta?.cost,
+            inputTokens: e.meta?.inputTokens,
+            outputTokens: e.meta?.outputTokens,
+            turn: e.meta?.turn,
           })
-        } else {
-          const clients = this.clientsByPeer.get(peerKey)
-          if (clients && clients.size > 0) {
-            // Register pending request for single-settlement + disconnect auto-deny
-            this._pendingPermissions.set(e.request.requestId, {
-              sessionKey,
-              toolName: e.request.toolName,
-              input: e.request.input,
-              toolUseId: e.request.toolUseId,
-              peerKey,
-              userId: dispatchUserId,
-              channel: frame.channel,
-              peer: frame.peer,
-              expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
-            })
-            // Stamp + store in outbound ring so a reconnecting client (e.g. iOS
-            // Safari restored a suspended tab) can replay the request via
-            // autoResumeFromHello. Without ring storage the modal would never
-            // re-fire after a disconnect window.
-            this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
+          if (adapter) {
+            // adapter.send() 是 async,内部可能在 await 之后才读 wire.blocks。
+            // 如果直接传 aggregatedBlocks,接着同步清空数组,adapter 读到的就是空。
+            // 拷贝一份脱钩本地引用。
+            this.deliver(
+              { ...out, blocks: aggregatedBlocks.slice(), isFinal: true, meta: e.meta },
+              adapter,
+            )
           } else {
-            // No connected client — auto-deny
+            this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
+          }
+          // 释放本轮聚合数组的内存。本闭包跨 turn 仍会被 sessionManager 的
+          // 跨 turn message listener 调用(转发 bg-bash bash_output_tail);
+          // 不清空的话 out.blocks / aggregatedBlocks 引用的旧 block 实例
+          // 会被钉到下一轮 listener 替换之前。
+          out.blocks.length = 0
+          aggregatedBlocks.length = 0
+        } else if (e.kind === 'permission_request') {
+          // Forward permission prompt to WebSocket clients for user approval.
+          // userId is stashed on the frame by the WS handler (see handleWsConnection)
+          // so adapter-dispatched frames fall back to 'default'. On personal-edition
+          // (single-user) this is always 'default' in practice.
+          const dispatchUserId: string =
+            typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+          const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
+          const permFrame = {
+            type: 'outbound.permission_request' as const,
+            sessionKey,
+            channel: frame.channel,
+            peer: frame.peer,
+            requestId: e.request.requestId,
+            toolName: e.request.toolName,
+            toolUseId: e.request.toolUseId,
+            inputPreview: JSON.stringify(e.request.input).slice(0, 400),
+            inputJson: e.request.input,
+          }
+          // Permission requests only make sense for interactive clients (WebChat)
+          // Non-interactive adapters auto-deny.
+          if (adapter) {
             session.runner.sendPermissionResponse(e.request.requestId, {
               behavior: 'deny',
-              message: 'No connected client to approve',
+              message: 'Permission prompts not supported on this channel',
               toolUseID: e.request.toolUseId,
             })
+          } else {
+            const clients = this.clientsByPeer.get(peerKey)
+            if (clients && clients.size > 0) {
+              // Register pending request for single-settlement + disconnect auto-deny
+              this._pendingPermissions.set(e.request.requestId, {
+                sessionKey,
+                toolName: e.request.toolName,
+                input: e.request.input,
+                toolUseId: e.request.toolUseId,
+                peerKey,
+                userId: dispatchUserId,
+                channel: frame.channel,
+                peer: frame.peer,
+                expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
+              })
+              // Stamp + store in outbound ring so a reconnecting client (e.g. iOS
+              // Safari restored a suspended tab) can replay the request via
+              // autoResumeFromHello. Without ring storage the modal would never
+              // re-fire after a disconnect window.
+              this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
+            } else {
+              // No connected client — auto-deny
+              session.runner.sendPermissionResponse(e.request.requestId, {
+                behavior: 'deny',
+                message: 'No connected client to approve',
+                toolUseID: e.request.toolUseId,
+              })
+            }
           }
+        } else if (e.kind === 'error') {
+          this._runLog.complete(_run, { status: 'failed', error: e.error })
+          // Remove idempotency key on failure to allow client retry
+          if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+          this.deliver(
+            {
+              ...out,
+              blocks: [{ kind: 'text', text: `[error] ${e.error}` }],
+              isFinal: true,
+            },
+            adapter,
+          )
         }
-      } else if (e.kind === 'error') {
-        this._runLog.complete(_run, { status: 'failed', error: e.error })
-        // Remove idempotency key on failure to allow client retry
-        if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
-        this.deliver(
-          {
-            ...out,
-            blocks: [{ kind: 'text', text: `[error] ${e.error}` }],
-            isFinal: true,
-          },
-          adapter,
-        )
-      }
-    }, safeEffortLevel)
+      },
+      safeEffortLevel,
+    )
   }
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {
@@ -4241,9 +4344,9 @@ export class Gateway {
       _userId?: string
     }
     if (adapter) {
-      adapter.send(wire as OutboundMessage).catch((err) =>
-        this.log.error('adapter send failed', { channel: adapter.name }, err),
-      )
+      adapter
+        .send(wire as OutboundMessage)
+        .catch((err) => this.log.error('adapter send failed', { channel: adapter.name }, err))
       return
     }
     // WebChat: broadcast to all ws clients at the same (userId, channel, peer).
@@ -4252,8 +4355,7 @@ export class Gateway {
     // fall back to 'default' — personal edition is single-user, so every
     // connected ws registers under userId='default' anyway. On v2 cherry-pick
     // all non-stamped call sites will need updating to route correctly.
-    const deliverUserId: string =
-      typeof stampedUserId === 'string' ? stampedUserId : 'default'
+    const deliverUserId: string = typeof stampedUserId === 'string' ? stampedUserId : 'default'
     const peerKey = Gateway.makePeerKey(deliverUserId, wire.channel, wire.peer.id)
     // ── Phase 0.3: stamp frameSeq + push to ring buffer ──
     // We stamp + store even if no clients are currently connected — that's
@@ -4376,10 +4478,14 @@ export function sanitizeAskUserQuestionUpdatedInput(
       const preview = (v as { preview?: unknown }).preview
       if (typeof preview === 'string' && preview.length <= ASK_USER_QUESTION_STRING_MAX_LEN) {
         const allowed = previewsByQuestion.get(k)
-        if (allowed && allowed.has(preview)) out.preview = preview
+        if (allowed?.has(preview)) out.preview = preview
       }
       const notes = (v as { notes?: unknown }).notes
-      if (typeof notes === 'string' && notes.length > 0 && notes.length <= ASK_USER_QUESTION_STRING_MAX_LEN) {
+      if (
+        typeof notes === 'string' &&
+        notes.length > 0 &&
+        notes.length <= ASK_USER_QUESTION_STRING_MAX_LEN
+      ) {
         out.notes = notes
       }
       if (out.preview !== undefined || out.notes !== undefined) {
@@ -4411,8 +4517,8 @@ export function sanitizeAskUserQuestionUpdatedInput(
  * are checked separately via `isFileAllowed()`.
  */
 export const FILE_ALLOWED_DIRS: string[] = [
-  resolve(paths.generatedDir),  // /root/.openclaude/generated/
-  resolve(paths.uploadsDir),    // /root/.openclaude/uploads/
+  resolve(paths.generatedDir), // /root/.openclaude/generated/
+  resolve(paths.uploadsDir), // /root/.openclaude/uploads/
   // Commercial containers may run the gateway as root while agent tools write
   // user-facing artifacts under /home/agent/.openclaude. Keep this narrowly
   // scoped to generated/uploads so /api/file cannot browse arbitrary home data.
@@ -4428,10 +4534,29 @@ const AGENT_CWD_ROOTS: string[] = []
 
 /** Non-executable media extensions safe to serve from agent CWDs */
 const MEDIA_EXTENSIONS = new Set([
-  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.bmp', '.ico',
-  '.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac',
-  '.mp4', '.webm', '.mov',
-  '.pdf', '.txt', '.md', '.csv', '.json', '.log',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.webp',
+  '.avif',
+  '.bmp',
+  '.ico',
+  '.mp3',
+  '.wav',
+  '.ogg',
+  '.m4a',
+  '.aac',
+  '.flac',
+  '.mp4',
+  '.webm',
+  '.mov',
+  '.pdf',
+  '.txt',
+  '.md',
+  '.csv',
+  '.json',
+  '.log',
 ])
 
 /**
@@ -4442,7 +4567,7 @@ const MEDIA_EXTENSIONS = new Set([
 export function isFileAllowed(resolvedPath: string, agentCwds?: string[]): boolean {
   // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
   for (const dir of FILE_ALLOWED_DIRS) {
-    if (resolvedPath.startsWith(dir + '/') || resolvedPath === dir) return true
+    if (resolvedPath.startsWith(`${dir}/`) || resolvedPath === dir) return true
   }
   // 2. Temp files matching /tmp/openclaude-*
   if (resolvedPath.startsWith(TEMP_PREFIX)) return true
@@ -4451,11 +4576,12 @@ export function isFileAllowed(resolvedPath: string, agentCwds?: string[]): boole
     for (const raw of agentCwds) {
       if (!raw) continue
       const cwd = resolve(raw)
-      if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) {
+      if (resolvedPath.startsWith(`${cwd}/`) || resolvedPath === cwd) {
         // Allow generated/ and uploads/ subdirs unconditionally
-        const genSub = cwd + '/generated'
-        const upSub = cwd + '/uploads'
-        if (resolvedPath.startsWith(genSub + '/') || resolvedPath.startsWith(upSub + '/')) return true
+        const genSub = `${cwd}/generated`
+        const upSub = `${cwd}/uploads`
+        if (resolvedPath.startsWith(`${genSub}/`) || resolvedPath.startsWith(`${upSub}/`))
+          return true
         // Allow non-executable media file extensions anywhere in CWD
         const ext = extname(resolvedPath).toLowerCase()
         if (MEDIA_EXTENSIONS.has(ext)) return true
@@ -4496,15 +4622,26 @@ export function isFileBlocked(resolvedPath: string): boolean {
 }
 
 export const UPLOAD_MIME_PREFIXES = [
-  'image/', 'audio/', 'video/', 'application/pdf', 'text/',
-  'application/zip', 'application/x-zip',
-  'application/gzip', 'application/x-gzip',
-  'application/x-tar', 'application/x-compressed-tar', 'application/x-gtar',
+  'image/',
+  'audio/',
+  'video/',
+  'application/pdf',
+  'text/',
+  'application/zip',
+  'application/x-zip',
+  'application/gzip',
+  'application/x-gzip',
+  'application/x-tar',
+  'application/x-compressed-tar',
+  'application/x-gtar',
   'application/x-7z-compressed',
-  'application/vnd.rar', 'application/x-rar-compressed',
-  'application/x-bzip', 'application/x-bzip2',
+  'application/vnd.rar',
+  'application/x-rar-compressed',
+  'application/x-bzip',
+  'application/x-bzip2',
   'application/x-xz',
-  'application/json', 'application/xml',
+  'application/json',
+  'application/xml',
   'application/msword',
   'application/vnd.openxmlformats-officedocument.',
   'application/vnd.ms-',
@@ -4591,20 +4728,39 @@ function isActiveContentType(mime: string): boolean {
 export function shouldServeInline(mime: string): boolean {
   const base = mime.split(';')[0].trim().toLowerCase()
   if (isActiveContentType(base)) return false
-  if (base.startsWith('image/') || base.startsWith('audio/') || base.startsWith('video/')) return true
+  if (base.startsWith('image/') || base.startsWith('audio/') || base.startsWith('video/'))
+    return true
   return new Set(['application/pdf', 'text/plain', 'text/markdown', 'text/csv']).has(base)
 }
 
 /** Known route prefixes for metrics normalization (avoids high-cardinality labels). */
 const KNOWN_ROUTES = [
-  '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
-  '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
-  '/api/cron', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
-  '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
-  '/api/wechat/binding', '/api/wechat/binding/status',
-  '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
-  '/api/auth/claude/callback', '/api/auth/claude/status',
-  '/api/file', '/healthz', '/metrics',
+  '/api/healthz',
+  '/api/doctor',
+  '/api/usage',
+  '/api/usage/events',
+  '/api/runs',
+  '/api/sessions',
+  '/api/config',
+  '/api/agents',
+  '/api/search',
+  '/api/cron',
+  '/api/tasks',
+  '/api/tasks-executions',
+  '/api/webhooks',
+  '/api/wechat/pair/start',
+  '/api/wechat/pair/poll',
+  '/api/wechat/pair/cancel',
+  '/api/wechat/binding',
+  '/api/wechat/binding/status',
+  '/api/auth/session',
+  '/api/auth/logout',
+  '/api/auth/claude/start',
+  '/api/auth/claude/callback',
+  '/api/auth/claude/status',
+  '/api/file',
+  '/healthz',
+  '/metrics',
 ]
 
 /** Normalize URL paths for metrics labels (replace dynamic IDs with :id to avoid high cardinality). */

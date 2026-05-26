@@ -48,12 +48,16 @@ async function loadBinding() {
       showState('unbound')
       return null
     }
-    $('wechat-account').textContent = `account_id=${binding.accountId}\nlogin_user_id=${binding.loginUserId || '(未知)'}`
-    const statusColor = binding.status === 'active' ? 'var(--success, #22c55e)'
-      : binding.status === 'expired' ? 'var(--danger, #ef4444)'
-      : 'var(--fg-muted)'
-    $('wechat-status').innerHTML = `<span style="color:${statusColor}">${binding.status}</span>` +
-      (binding.lastEventAt ? ` · 最近消息 ${new Date(binding.lastEventAt).toLocaleString()}` : '')
+    $('wechat-account').textContent =
+      `account_id=${binding.accountId}\nlogin_user_id=${binding.loginUserId || '(未知)'}`
+    const statusColor =
+      binding.status === 'active'
+        ? 'var(--success, #22c55e)'
+        : binding.status === 'expired'
+          ? 'var(--danger, #ef4444)'
+          : 'var(--fg-muted)'
+    $('wechat-status').innerHTML =
+      `<span style="color:${statusColor}">${binding.status}</span>${binding.lastEventAt ? ` · 最近消息 ${new Date(binding.lastEventAt).toLocaleString()}` : ''}`
     showState('bound')
     return binding
   } catch (e) {
@@ -104,7 +108,12 @@ async function pollLoop(qrcode) {
   while (!ctrl.signal.aborted && _currentQrcode === qrcode) {
     let resp
     try {
-      resp = await apiJson('POST', '/api/wechat/pair/poll', { qrcode }, { signal: ctrl.signal, timeout: 45000 })
+      resp = await apiJson(
+        'POST',
+        '/api/wechat/pair/poll',
+        { qrcode },
+        { signal: ctrl.signal, timeout: 45000 },
+      )
     } catch (e) {
       if (ctrl.signal.aborted) return
       retries++

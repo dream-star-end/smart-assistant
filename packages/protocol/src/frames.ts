@@ -88,7 +88,11 @@ export const InboundPermissionResponse = Type.Object({
 })
 export type InboundPermissionResponse = Static<typeof InboundPermissionResponse>
 
-export const InboundFrame = Type.Union([InboundMessage, InboundControlStop, InboundPermissionResponse])
+export const InboundFrame = Type.Union([
+  InboundMessage,
+  InboundControlStop,
+  InboundPermissionResponse,
+])
 export type InboundFrame = Static<typeof InboundFrame>
 
 // ───────────────────────────────────────────────
@@ -259,9 +263,9 @@ export const OutboundResumeFailed = Type.Object({
   to: Type.Number(),
   /** Why replay couldn't be served. */
   reason: Type.Union([
-    Type.Literal('buffer_miss'),          // Range exists but pruned (old / oversize).
-    Type.Literal('no_buffer'),            // No ring buffer (server restarted).
-    Type.Literal('sequence_mismatch'),    // Client seq ahead of server — bogus.
+    Type.Literal('buffer_miss'), // Range exists but pruned (old / oversize).
+    Type.Literal('no_buffer'), // No ring buffer (server restarted).
+    Type.Literal('sequence_mismatch'), // Client seq ahead of server — bogus.
   ]),
 })
 export type OutboundResumeFailed = Static<typeof OutboundResumeFailed>

@@ -64,7 +64,10 @@ describe('buildCodexCliArgs', () => {
     const dashIdx = args.indexOf('-')
     const tidIdx = args.indexOf('thr_x')
     const cIdx = args.indexOf('-c')
-    assert.ok(cIdx >= 0 && tidIdx >= 0 && dashIdx >= 0, `expected all positions, got ${args.join(' ')}`)
+    assert.ok(
+      cIdx >= 0 && tidIdx >= 0 && dashIdx >= 0,
+      `expected all positions, got ${args.join(' ')}`,
+    )
     assert.ok(cIdx < tidIdx, '-c override must precede threadId')
     assert.ok(tidIdx < dashIdx, 'threadId must precede stdin sentinel')
   })
@@ -86,9 +89,18 @@ describe('buildCodexCliArgs', () => {
   })
 
   it('never emits --full-auto or approval_policy override (replaced by bypass)', () => {
-    for (const opts of [{}, { threadId: 't1' }, { model: 'gpt-5.5' }, { model: 'x', threadId: 'y' }]) {
+    for (const opts of [
+      {},
+      { threadId: 't1' },
+      { model: 'gpt-5.5' },
+      { model: 'x', threadId: 'y' },
+    ]) {
       const args = buildCodexCliArgs(opts)
-      assert.equal(args.includes('--full-auto'), false, `--full-auto should be gone (${JSON.stringify(opts)})`)
+      assert.equal(
+        args.includes('--full-auto'),
+        false,
+        `--full-auto should be gone (${JSON.stringify(opts)})`,
+      )
       assert.equal(
         args.some((a) => a.includes('approval_policy')),
         false,

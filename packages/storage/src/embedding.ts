@@ -97,7 +97,9 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.timeoutMs = config.timeoutMs ?? 30_000
 
     if (!this.apiKey) {
-      throw new Error('OpenAIEmbeddingProvider: apiKey is required (set EMBEDDING_API_KEY or OPENAI_API_KEY)')
+      throw new Error(
+        'OpenAIEmbeddingProvider: apiKey is required (set EMBEDDING_API_KEY or OPENAI_API_KEY)',
+      )
     }
     assertPositiveInt('dimensions', this.dimensions)
     assertPositiveInt('batchSize', this.batchSize)

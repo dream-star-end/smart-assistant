@@ -101,15 +101,11 @@ function makeResolver(
   const src = extractHelper()
   // We inject `state` and `getSession` as parameters of an enclosing factory so
   // the helper closes over them via lexical scope.
-  const factory = new Function(
-    'state',
-    'getSession',
-    `${src}; return _resolveSessForFrame;`,
-  )
-  return factory(
-    { sessions: sessionsMap },
-    () => currentSession,
-  ) as (frame: { peer?: { id?: string }; cronJob?: boolean }) => unknown
+  const factory = new Function('state', 'getSession', `${src}; return _resolveSessForFrame;`)
+  return factory({ sessions: sessionsMap }, () => currentSession) as (frame: {
+    peer?: { id?: string }
+    cronJob?: boolean
+  }) => unknown
 }
 
 describe('T02: _resolveSessForFrame — routing decisions', () => {

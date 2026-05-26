@@ -34,7 +34,10 @@ async function ensureMermaid() {
       const s = document.createElement('script')
       s.src = '/vendor/mermaid.min.js'
       s.onload = _doInit
-      s.onerror = (err) => { _mermaidLoadPromise = null; reject(err) }
+      s.onerror = (err) => {
+        _mermaidLoadPromise = null
+        reject(err)
+      }
       document.head.appendChild(s)
     }
   })
@@ -59,7 +62,8 @@ if (window.marked) {
   // marked v12+ changed renderer signatures: callbacks receive a single object parameter
   // instead of positional args. We handle both for safety.
   renderer.code = (codeOrObj, infostring) => {
-    let code, lang
+    let code
+    let lang
     if (typeof codeOrObj === 'object' && codeOrObj !== null) {
       // marked v12+: { text, lang, escaped }
       code = codeOrObj.text || ''
@@ -239,7 +243,7 @@ function _safeMediaUrl(url) {
 
 export function _imgHtml(url, title) {
   const safeUrl = _safeMediaUrl(url)
-  if (!safeUrl) return `<span>[blocked image: unsafe URL]</span>`
+  if (!safeUrl) return '<span>[blocked image: unsafe URL]</span>'
   const svgCopy =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
   const svgDl =
@@ -542,14 +546,7 @@ export function renderMarkdown(text) {
     const sanitized = DOMPurify.sanitize(html, {
       // NOTE: iframe/srcdoc/sandbox NOT allowed here — htmlpreview iframes are created
       // separately in processRichBlocks() with fixed sandbox="allow-scripts"
-      ADD_ATTR: [
-        'loading',
-        'controls',
-        'preload',
-        'autoplay',
-        'data-img-action',
-        'data-img-src',
-      ],
+      ADD_ATTR: ['loading', 'controls', 'preload', 'autoplay', 'data-img-action', 'data-img-src'],
     })
     return embedMediaUrls(sanitized)
   } catch {
@@ -567,7 +564,8 @@ function _getStreamingRenderer() {
   if (!window.marked) return null
   _streamingRenderer = new marked.Renderer()
   _streamingRenderer.code = (codeOrObj, infostring) => {
-    let code, lang
+    let code
+    let lang
     if (typeof codeOrObj === 'object' && codeOrObj !== null) {
       code = codeOrObj.text || ''
       lang = (codeOrObj.lang || '').match(/\S*/)?.[0] || ''
@@ -592,7 +590,8 @@ function _getStreamingRenderer() {
   // Images: render as text placeholder during streaming to avoid broken 404 requests
   // (embedMediaUrls rewrites local paths, but is only called on final render)
   _streamingRenderer.image = (hrefOrObj, title, text) => {
-    const alt = typeof hrefOrObj === 'object' ? (hrefOrObj.text || hrefOrObj.title || '') : (title || text || '')
+    const alt =
+      typeof hrefOrObj === 'object' ? hrefOrObj.text || hrefOrObj.title || '' : title || text || ''
     return `<span class="streaming-img-placeholder">[图片: ${htmlSafeEscape(alt || '...')}]</span>`
   }
   return _streamingRenderer
@@ -630,7 +629,9 @@ export function clearChartInstances() {
 
 export async function processRichBlocks() {
   if (pendingMermaid.length > 0) {
-    try { await ensureMermaid() } catch {}
+    try {
+      await ensureMermaid()
+    } catch {}
   }
   while (pendingMermaid.length > 0) {
     const { id, code } = pendingMermaid.shift()

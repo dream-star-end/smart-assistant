@@ -5,7 +5,7 @@ import { exportSessionDocx } from './export-docx.js'
 import { exportSessionTex } from './export-tex.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { pushSessionToServer, deleteSessionFromServer } from './sync.js'
+import { deleteSessionFromServer, pushSessionToServer } from './sync.js'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
 import { nudgeDrain } from './websocket.js'
@@ -92,14 +92,14 @@ export async function deleteSession(id) {
   cancelSavesForSession(id)
   // Purge offline queue items for this session to prevent sending after delete
   if (state.offlineQueue?.length > 0) {
-    state.offlineQueue = state.offlineQueue.filter(item => item.sessId !== id)
+    state.offlineQueue = state.offlineQueue.filter((item) => item.sessId !== id)
   }
   if (state._offlineQueuePending?.length > 0) {
-    state._offlineQueuePending = state._offlineQueuePending.filter(item => item.sessId !== id)
+    state._offlineQueuePending = state._offlineQueuePending.filter((item) => item.sessId !== id)
   }
   if (state._offlineDrainingCurrent?.sessId === id) {
     state._offlineDrainingCurrent = null
-    nudgeDrain()  // Advance drain to next item since we killed the current one
+    nudgeDrain() // Advance drain to next item since we killed the current one
   }
   state.sessions.delete(id)
   // Wait for any in-flight save to finish before deleting from IDB,
@@ -152,7 +152,7 @@ export function _rebuildSearchIndex(sess) {
 //   on this so the next _doSave starts only after the previous PUT's response
 //   has updated sess._syncedAt, preventing the 409 storm during streaming.
 const _saveInFlight = new Map() // sessId -> Promise<void> (resolves when dbPut settles)
-const _chainTail = new Map()    // sessId -> Promise<void> (resolves when _doSave fully completes)
+const _chainTail = new Map() // sessId -> Promise<void> (resolves when _doSave fully completes)
 // Sessions that have been deleted — prevents in-flight saves from resurrecting them
 const _deletedIds = new Set()
 
@@ -192,7 +192,7 @@ export function scheduleSaveFromUserEdit(s, immediate) {
   const sess = s || getSession()
   if (!sess) return
   _clearSaveRetry(sess.id)
-  sess._conflictRetryCount = 0  // reset 409 local-dominates auto-retry cap
+  sess._conflictRetryCount = 0 // reset 409 local-dominates auto-retry cap
   scheduleSave(sess, immediate)
 }
 
@@ -241,9 +241,9 @@ function _enqueueSave(sess) {
 // Internal save paths (streaming frames, retry timers, flushPendingSaves,
 // system-greeting additions) never reset the counter, so a persistently
 // failing session can't loop infinitely.
-const _saveRetryTimers = new Map()        // sessId -> timer handle
-const _saveRetryCount = new Map()          // sessId -> attempt count
-const _saveFatalReported = new Set()        // sessIds already toasted for quota
+const _saveRetryTimers = new Map() // sessId -> timer handle
+const _saveRetryCount = new Map() // sessId -> attempt count
+const _saveFatalReported = new Set() // sessIds already toasted for quota
 const SAVE_MAX_RETRIES = 3
 const SAVE_RETRY_BASE_MS = 800
 
@@ -255,7 +255,7 @@ function _isQuotaError(e) {
 
 function _scheduleSaveRetry(sess) {
   const id = sess.id
-  if (_saveRetryTimers.has(id)) return  // already pending
+  if (_saveRetryTimers.has(id)) return // already pending
   const attempt = (_saveRetryCount.get(id) || 0) + 1
   _saveRetryCount.set(id, attempt)
   if (attempt > SAVE_MAX_RETRIES) {
@@ -291,12 +291,25 @@ async function _doSave(sess) {
   // _turnStartedAt, _lastFrameAt) is intentionally PRESERVED so a page
   // refresh can restore the in-flight UI and correctly signal inFlight=true
   // in the next hello frame. Staleness is handled at load time.
-  const { _streamingAssistant, _streamingThinking, _blockIdToMsgId, _replyingToMsgId, _agentGroups, _streamRafPending, _thinkRafPending, _searchText, _regenSafetyTimer, ...persist } = sess
+  const {
+    _streamingAssistant,
+    _streamingThinking,
+    _blockIdToMsgId,
+    _replyingToMsgId,
+    _agentGroups,
+    _streamRafPending,
+    _thinkRafPending,
+    _searchText,
+    _regenSafetyTimer,
+    ...persist
+  } = sess
   // Expose a dbPut-only checkpoint promise to deleteSession(). Registered
   // BEFORE awaiting dbPut so a concurrent deleteSession() synchronously sees
   // an in-flight local write and can await it before calling dbDelete().
   let resolveDbDone
-  const dbDone = new Promise((r) => { resolveDbDone = r })
+  const dbDone = new Promise((r) => {
+    resolveDbDone = r
+  })
   _saveInFlight.set(sess.id, dbDone)
   let putError = null
   try {
@@ -396,7 +409,10 @@ export function cancelSavesForSession(id) {
   _saveInFlight.delete(id)
   _chainTail.delete(id)
   const timer = _saveTimers.get(id)
-  if (timer) { clearTimeout(timer); _saveTimers.delete(id) }
+  if (timer) {
+    clearTimeout(timer)
+    _saveTimers.delete(id)
+  }
   // Also drop any outstanding retry bookkeeping for this session
   _clearSaveRetry(id)
 }
@@ -425,7 +441,10 @@ export function flushPendingSaves() {
   for (const [sessId, timer] of _saveTimers) {
     clearTimeout(timer)
     const sess = state.sessions.get(sessId)
-    if (sess) { _enqueueSave(sess); flushed.add(sessId) }
+    if (sess) {
+      _enqueueSave(sess)
+      flushed.add(sessId)
+    }
   }
   _saveTimers.clear()
   // 2. Also save any dirty session not already covered above

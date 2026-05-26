@@ -16,14 +16,14 @@
 
 import { randomUUID } from 'node:crypto'
 import * as sqliteVec from 'sqlite-vec'
-import { getSessionsDb } from './sessionsDb.js'
 import type { EmbeddingProvider } from './embedding.js'
+import { getSessionsDb } from './sessionsDb.js'
 import {
+  deleteArchivalVector,
+  encodeSessionVecId,
   initVectorStore,
   upsertArchivalVector,
-  deleteArchivalVector,
   upsertSessionVector,
-  encodeSessionVecId,
 } from './vectorStore.js'
 
 // ── Constants ───────────────────────────────────
@@ -79,7 +79,7 @@ async function ensureIndexMetaSchema(): Promise<void> {
 
   // Migration: add columns for existing index_queue tables (upgrade path)
   const cols = db.pragma('table_info(index_queue)') as Array<{ name: string }>
-  const colNames = new Set(cols.map(c => c.name))
+  const colNames = new Set(cols.map((c) => c.name))
   if (!colNames.has('claimed_at')) {
     db.exec('ALTER TABLE index_queue ADD COLUMN claimed_at TEXT DEFAULT NULL')
   }
@@ -117,7 +117,10 @@ async function setMeta(key: string, value: string): Promise<void> {
 // ── Timestamp helper ────────────────────────────
 
 function sqliteDatetime(date: Date): string {
-  return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+  return date
+    .toISOString()
+    .replace('T', ' ')
+    .replace(/\.\d+Z$/, '')
 }
 
 // ── Type guards ─────────────────────────────────
@@ -158,9 +161,11 @@ export async function enqueueIndex(
 ): Promise<void> {
   await ensureIndexMetaSchema()
   const db = await getSessionsDb()
-  db.prepare(
-    'INSERT OR IGNORE INTO index_queue (source, source_id, action) VALUES (?, ?, ?)',
-  ).run(source, sourceId, action)
+  db.prepare('INSERT OR IGNORE INTO index_queue (source, source_id, action) VALUES (?, ?, ?)').run(
+    source,
+    sourceId,
+    action,
+  )
 }
 
 /**
@@ -179,37 +184,44 @@ async function claimBatch(limit: number): Promise<ClaimResult> {
   const now = sqliteDatetime(new Date())
   const token = randomUUID()
 
-  const entries = db.transaction(() => {
-    const rows = db.prepare(
-      'SELECT id, source, source_id, action, attempts, created_at FROM index_queue WHERE claimed_at IS NULL ORDER BY id LIMIT ?',
-    ).all(safeBatch) as Array<{
-      id: number; source: string; source_id: string; action: string; attempts: number; created_at: string
-    }>
+  const entries = db
+    .transaction(() => {
+      const rows = db
+        .prepare(
+          'SELECT id, source, source_id, action, attempts, created_at FROM index_queue WHERE claimed_at IS NULL ORDER BY id LIMIT ?',
+        )
+        .all(safeBatch) as Array<{
+        id: number
+        source: string
+        source_id: string
+        action: string
+        attempts: number
+        created_at: string
+      }>
 
-    if (rows.length === 0) return []
+      if (rows.length === 0) return []
 
-    const ids = rows.map(r => r.id)
-    runChunkedSql(
-      db,
-      'UPDATE index_queue SET claimed_at = ?, claim_token = ? WHERE id IN',
-      ids,
-      [now, token],
-    )
+      const ids = rows.map((r) => r.id)
+      runChunkedSql(db, 'UPDATE index_queue SET claimed_at = ?, claim_token = ? WHERE id IN', ids, [
+        now,
+        token,
+      ])
 
-    return rows.reduce<QueueEntry[]>((acc, r) => {
-      if (isValidSource(r.source) && isValidAction(r.action)) {
-        acc.push({
-          id: r.id,
-          source: r.source,
-          sourceId: r.source_id,
-          action: r.action,
-          attempts: r.attempts,
-          createdAt: r.created_at,
-        })
-      }
-      return acc
-    }, [])
-  }).immediate()
+      return rows.reduce<QueueEntry[]>((acc, r) => {
+        if (isValidSource(r.source) && isValidAction(r.action)) {
+          acc.push({
+            id: r.id,
+            source: r.source,
+            sourceId: r.source_id,
+            action: r.action,
+            attempts: r.attempts,
+            createdAt: r.created_at,
+          })
+        }
+        return acc
+      }, [])
+    })
+    .immediate()
 
   return { entries, claimToken: token }
 }
@@ -224,9 +236,10 @@ async function ackJobs(ids: number[], claimToken: string): Promise<void> {
   for (let i = 0; i < ids.length; i += MAX_CHUNK_SIZE) {
     const chunk = ids.slice(i, i + MAX_CHUNK_SIZE)
     const placeholders = chunk.map(() => '?').join(',')
-    db.prepare(
-      `DELETE FROM index_queue WHERE claim_token = ? AND id IN (${placeholders})`,
-    ).run(claimToken, ...chunk)
+    db.prepare(`DELETE FROM index_queue WHERE claim_token = ? AND id IN (${placeholders})`).run(
+      claimToken,
+      ...chunk,
+    )
   }
 }
 
@@ -254,9 +267,9 @@ async function releaseJobs(ids: number[], claimToken: string): Promise<void> {
 export async function purgeDeadLetters(maxAttempts = 5): Promise<number> {
   await ensureIndexMetaSchema()
   const db = await getSessionsDb()
-  const result = db.prepare(
-    'DELETE FROM index_queue WHERE attempts >= ? AND claimed_at IS NULL',
-  ).run(maxAttempts)
+  const result = db
+    .prepare('DELETE FROM index_queue WHERE attempts >= ? AND claimed_at IS NULL')
+    .run(maxAttempts)
   return result.changes
 }
 
@@ -269,9 +282,11 @@ export async function reclaimExpiredLeases(leaseMs = CLAIM_LEASE_MS): Promise<nu
   await ensureIndexMetaSchema()
   const db = await getSessionsDb()
   const cutoff = sqliteDatetime(new Date(Date.now() - leaseMs))
-  const result = db.prepare(
-    'UPDATE index_queue SET claimed_at = NULL, claim_token = NULL, attempts = attempts + 1 WHERE claimed_at IS NOT NULL AND claimed_at < ?',
-  ).run(cutoff)
+  const result = db
+    .prepare(
+      'UPDATE index_queue SET claimed_at = NULL, claim_token = NULL, attempts = attempts + 1 WHERE claimed_at IS NOT NULL AND claimed_at < ?',
+    )
+    .run(cutoff)
   return result.changes
 }
 
@@ -340,7 +355,7 @@ export async function processIndexQueue(
   const stats: PipelineStats = { processed: 0, embedded: 0, deleted: 0, errors: 0 }
   if (batch.length === 0) return stats
 
-  const allClaimedIds = new Set(batch.map(e => e.id))
+  const allClaimedIds = new Set(batch.map((e) => e.id))
   const succeededIds: number[] = []
   const failedIds: number[] = []
 
@@ -359,7 +374,8 @@ export async function processIndexQueue(
       }
 
       if (entry.source === 'archival') {
-        const row = db.prepare('SELECT id, content FROM archival WHERE id = ?')
+        const row = db
+          .prepare('SELECT id, content FROM archival WHERE id = ?')
           .get(entry.sourceId) as { id: string; content: string } | undefined
         if (row) {
           archivalEmbeds.push({ queueId: entry.id, ...row })
@@ -370,11 +386,13 @@ export async function processIndexQueue(
         const parts = entry.sourceId.split('|')
         if (parts.length >= 3) {
           const sessionId = parts.slice(0, -2).join('|')
-          const turnIdx = parseInt(parts[parts.length - 2], 10)
+          const turnIdx = Number.parseInt(parts[parts.length - 2], 10)
           const role = parts[parts.length - 1]
-          const rows = db.prepare(
-            'SELECT content FROM sessions_fts WHERE session_id = ? AND turn_idx = ? AND role = ?',
-          ).all(sessionId, turnIdx, role) as Array<{ content: string }>
+          const rows = db
+            .prepare(
+              'SELECT content FROM sessions_fts WHERE session_id = ? AND turn_idx = ? AND role = ?',
+            )
+            .all(sessionId, turnIdx, role) as Array<{ content: string }>
           if (rows.length > 0) {
             sessionEmbeds.push({ queueId: entry.id, id: entry.sourceId, content: rows[0].content })
           } else {
@@ -389,7 +407,7 @@ export async function processIndexQueue(
     // Embed archival entries (per-item error handling)
     if (archivalEmbeds.length > 0) {
       try {
-        const texts = archivalEmbeds.map(e => e.content)
+        const texts = archivalEmbeds.map((e) => e.content)
         const vectors = await provider.embed(texts, 'document')
         for (let i = 0; i < archivalEmbeds.length; i++) {
           try {
@@ -410,7 +428,7 @@ export async function processIndexQueue(
     // Embed session turns
     if (sessionEmbeds.length > 0) {
       try {
-        const texts = sessionEmbeds.map(e => e.content)
+        const texts = sessionEmbeds.map((e) => e.content)
         const vectors = await provider.embed(texts, 'document')
         for (let i = 0; i < sessionEmbeds.length; i++) {
           try {
@@ -446,7 +464,7 @@ export async function processIndexQueue(
   } finally {
     // Release any job not explicitly categorized (unexpected exception path)
     const handledIds = new Set([...succeededIds, ...failedIds])
-    const unhandledIds = [...allClaimedIds].filter(id => !handledIds.has(id))
+    const unhandledIds = [...allClaimedIds].filter((id) => !handledIds.has(id))
 
     await ackJobs(succeededIds, claimToken)
     await releaseJobs([...failedIds, ...unhandledIds], claimToken)
@@ -485,9 +503,9 @@ export async function enqueueFullReindex(options: ReindexOptions = {}): Promise<
   let sessionQueued = 0
 
   if (scope === 'archival' || scope === 'both') {
-    const iter = db.prepare(
-      `SELECT id FROM archival${agentFilter}`,
-    ).iterate(...agentParams) as IterableIterator<{ id: string }>
+    const iter = db
+      .prepare(`SELECT id FROM archival${agentFilter}`)
+      .iterate(...agentParams) as IterableIterator<{ id: string }>
 
     const insertStmt = db.prepare(
       "INSERT OR IGNORE INTO index_queue (source, source_id, action) VALUES ('archival', ?, 'embed')",
@@ -504,9 +522,15 @@ export async function enqueueFullReindex(options: ReindexOptions = {}): Promise<
     const sessionFilter = options.agentId
       ? ' JOIN sessions_meta m ON m.id = f.session_id WHERE m.agent_id = ?'
       : ''
-    const iter = db.prepare(
-      `SELECT DISTINCT f.session_id, f.turn_idx, f.role FROM sessions_fts f${sessionFilter}`,
-    ).iterate(...agentParams) as IterableIterator<{ session_id: string; turn_idx: number; role: string }>
+    const iter = db
+      .prepare(
+        `SELECT DISTINCT f.session_id, f.turn_idx, f.role FROM sessions_fts f${sessionFilter}`,
+      )
+      .iterate(...agentParams) as IterableIterator<{
+      session_id: string
+      turn_idx: number
+      role: string
+    }>
 
     const insertStmt = db.prepare(
       "INSERT OR IGNORE INTO index_queue (source, source_id, action) VALUES ('session', ?, 'embed')",
@@ -562,13 +586,15 @@ export async function findExactDuplicates(agentId: string): Promise<DuplicateGro
   await ensureIndexMetaSchema()
   const db = await getSessionsDb()
 
-  const rows = db.prepare(`
+  const rows = db
+    .prepare(`
     SELECT content, COUNT(*) as cnt, SUBSTR(content, 1, 100) as snippet
     FROM archival
     WHERE agent_id = ?
     GROUP BY content
     HAVING cnt > 1
-  `).all(agentId) as Array<{ content: string; cnt: number; snippet: string }>
+  `)
+    .all(agentId) as Array<{ content: string; cnt: number; snippet: string }>
 
   const result: DuplicateGroup[] = []
   const idStmt = db.prepare(
@@ -576,7 +602,7 @@ export async function findExactDuplicates(agentId: string): Promise<DuplicateGro
   )
 
   for (const row of rows) {
-    const ids = (idStmt.all(agentId, row.content) as Array<{ id: string }>).map(r => r.id)
+    const ids = (idStmt.all(agentId, row.content) as Array<{ id: string }>).map((r) => r.id)
     result.push({ ids, snippet: row.snippet })
   }
 
@@ -604,9 +630,10 @@ export async function deduplicateArchival(agentId: string): Promise<string[]> {
   let deleteVecStmt: import('better-sqlite3').Statement | null = null
   try {
     sqliteVec.load(db)
-    const vecTableExists = db.prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='archival_vec'",
-    ).get() !== undefined
+    const vecTableExists =
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='archival_vec'")
+        .get() !== undefined
     if (vecTableExists) {
       deleteVecStmt = db.prepare('DELETE FROM archival_vec WHERE id = ?')
     }
@@ -615,12 +642,14 @@ export async function deduplicateArchival(agentId: string): Promise<string[]> {
   }
 
   // Atomic detection + deletion in IMMEDIATE transaction
-  return db.transaction(() => {
-    // Find all duplicate entries that are NOT the keeper.
-    // The keeper is the entry with the earliest (created_at, id).
-    // An entry is a duplicate if there exists another entry with the same
-    // content that is strictly older (or has a smaller id on tie).
-    const dupes = db.prepare(`
+  return db
+    .transaction(() => {
+      // Find all duplicate entries that are NOT the keeper.
+      // The keeper is the entry with the earliest (created_at, id).
+      // An entry is a duplicate if there exists another entry with the same
+      // content that is strictly older (or has a smaller id on tie).
+      const dupes = db
+        .prepare(`
       SELECT a.id FROM archival a
       WHERE a.agent_id = ?
         AND EXISTS (
@@ -630,19 +659,21 @@ export async function deduplicateArchival(agentId: string): Promise<string[]> {
             AND (b.created_at < a.created_at
                  OR (b.created_at = a.created_at AND b.id < a.id))
         )
-    `).all(agentId) as Array<{ id: string }>
+    `)
+        .all(agentId) as Array<{ id: string }>
 
-    if (dupes.length === 0) return []
+      if (dupes.length === 0) return []
 
-    const deleteStmt = db.prepare('DELETE FROM archival WHERE id = ?')
-    const ids: string[] = []
+      const deleteStmt = db.prepare('DELETE FROM archival WHERE id = ?')
+      const ids: string[] = []
 
-    for (const row of dupes) {
-      deleteStmt.run(row.id)
-      deleteVecStmt?.run(row.id)
-      ids.push(row.id)
-    }
+      for (const row of dupes) {
+        deleteStmt.run(row.id)
+        deleteVecStmt?.run(row.id)
+        ids.push(row.id)
+      }
 
-    return ids
-  }).immediate()
+      return ids
+    })
+    .immediate()
 }
