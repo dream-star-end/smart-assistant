@@ -17,6 +17,13 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
+const CODEX_AUTO_PLAN_INSTRUCTIONS = [
+  'Decide autonomously whether the user request needs a visible plan/task list before execution.',
+  'For multi-step, risky, ambiguous, or code-changing tasks, create and maintain a concise plan before and during work; keep exactly one active step when work is underway.',
+  'For trivial one-step questions or tiny edits, skip the plan and answer or implement directly.',
+  'Do not stop after planning unless the user explicitly asks for plan-only; after planning, continue execution in the same turn when execution is allowed.',
+].join(' ')
+
 // ───────────────────────────────────────────────
 // CodexAppServerRunner
 //
@@ -40,8 +47,9 @@ const log = createLogger({ module: 'codexAppServerRunner' })
 // Protocol notes (codex app-server v2 — verified against schemas at
 // /tmp/codex-protocol/v2 and live spike on 2026-04-30):
 //   - Line-delimited JSON-RPC 2.0 over stdio, bidirectional (server can issue
-//     requests too — we always reply -32601 method-not-found because there is
-//     no UI back-channel for permission/approval prompts in OpenClaude).
+//     requests too — OpenClaude personal runs codex app-server as a trusted,
+//     autonomous agent, so approval-style requests are auto-approved instead
+//     of being surfaced to the browser UI).
 //   - Handshake: `initialize { clientInfo: { name, version } }` once per proc.
 //   - Thread create: `thread/start { approvalPolicy: 'never', sandbox: 'danger-full-access', cwd, model? }`.
 //     Resume: `thread/resume { threadId, approvalPolicy, sandbox, cwd?, model? }`.
@@ -178,6 +186,96 @@ type JsonRpcLine =
   | { kind: 'server-request'; id: number | string; method: string; params?: unknown }
   | { kind: 'notification'; method: string; params?: unknown }
   | { kind: 'unknown' }
+
+function jsonRpcResult(id: number | string, result: unknown): string {
+  return JSON.stringify({ jsonrpc: '2.0', id, result })
+}
+
+function jsonRpcMethodNotFound(id: number | string, method: string): string {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id,
+    error: {
+      code: -32601,
+      message: `method '${method}' not implemented by openclaude-gateway`,
+    },
+  })
+}
+
+function asRecord(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+}
+
+function chooseApprovalString(options: unknown[]): string {
+  const strings = options.filter((v): v is string => typeof v === 'string')
+  const preferred = [
+    'approve',
+    'always_allow',
+    'allow',
+    'approved',
+    'accept',
+    'approved_for_session',
+    'yes',
+  ]
+  for (const p of preferred) {
+    const hit = strings.find((s) => s.toLowerCase().includes(p))
+    if (hit) return hit
+  }
+  return (
+    strings.find((s) => !/decline|deny|denied|cancel|abort|reject/i.test(s)) ?? strings[0] ?? ''
+  )
+}
+
+function buildMcpElicitationFieldValue(schemaUnk: unknown): unknown {
+  const schema = asRecord(schemaUnk)
+  if ('default' in schema && schema.default !== undefined && schema.default !== null) {
+    return schema.default
+  }
+
+  if (Array.isArray(schema.enum)) {
+    return chooseApprovalString(schema.enum)
+  }
+  if (Array.isArray(schema.oneOf)) {
+    return chooseApprovalString(schema.oneOf.map((o) => asRecord(o).const))
+  }
+  const items = asRecord(schema.items)
+  if (Array.isArray(items.anyOf)) {
+    return [chooseApprovalString(items.anyOf.map((o) => asRecord(o).const))]
+  }
+  if (Array.isArray(items.enum)) {
+    return [chooseApprovalString(items.enum)]
+  }
+
+  switch (schema.type) {
+    case 'boolean':
+      return true
+    case 'number':
+    case 'integer':
+      return 0
+    case 'array':
+      return []
+    case 'string':
+      return ''
+    default:
+      return null
+  }
+}
+
+function buildMcpElicitationContent(paramsUnk: unknown): Record<string, unknown> | null {
+  const params = asRecord(paramsUnk)
+  if (params.mode !== 'form') return null
+  const requestedSchema = asRecord(params.requestedSchema)
+  const properties = asRecord(requestedSchema.properties)
+  const required = Array.isArray(requestedSchema.required)
+    ? requestedSchema.required.filter((v): v is string => typeof v === 'string')
+    : Object.keys(properties)
+  const out: Record<string, unknown> = {}
+  for (const key of required) {
+    if (!(key in properties)) continue
+    out[key] = buildMcpElicitationFieldValue(properties[key])
+  }
+  return out
+}
 
 /**
  * Classify a JSON-RPC line. Codex app-server uses bidirectional JSON-RPC 2.0:
@@ -689,6 +787,37 @@ export class CodexAppServerRunner extends EventEmitter {
     })
   }
 
+  private buildServerRequestAutoApproval(method: string, params: unknown): unknown | null {
+    switch (method) {
+      case 'item/commandExecution/requestApproval':
+        return { decision: 'acceptForSession' }
+      case 'item/fileChange/requestApproval':
+        return { decision: 'acceptForSession' }
+      case 'execCommandApproval':
+      case 'applyPatchApproval':
+        return { decision: 'approved_for_session' }
+      case 'item/permissions/requestApproval': {
+        const requested = asRecord(asRecord(params).permissions)
+        const permissions: Record<string, unknown> = {}
+        if (requested.network !== undefined && requested.network !== null) {
+          permissions.network = requested.network
+        }
+        if (requested.fileSystem !== undefined && requested.fileSystem !== null) {
+          permissions.fileSystem = requested.fileSystem
+        }
+        return { permissions, scope: 'session', strictAutoReview: false }
+      }
+      case 'mcpServer/elicitation/request':
+        return {
+          action: 'accept',
+          content: buildMcpElicitationContent(params),
+          _meta: null,
+        }
+      default:
+        return null
+    }
+  }
+
   private handleLine(line: string): void {
     const msg = _classifyJsonRpcLine(line)
     if (msg.kind === 'unknown') {
@@ -727,19 +856,18 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (msg.kind === 'server-request') {
-      // Server-initiated requests (e.g. permission prompts, MCP elicitations)
-      // are not handled because we run with approvalPolicy=never. Reply
-      // method-not-found per JSON-RPC spec so codex doesn't hang.
-      this.writeRaw(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: msg.id,
-          error: {
-            code: -32601,
-            message: `method '${msg.method}' not implemented by openclaude-gateway`,
-          },
-        }),
-      )
+      const autoApproval = this.buildServerRequestAutoApproval(msg.method, msg.params)
+      if (autoApproval !== null) {
+        log.info('codex app-server server request auto-approved', {
+          sessionKey: this.opts.sessionKey,
+          method: msg.method,
+        })
+        this.writeRaw(jsonRpcResult(msg.id, autoApproval))
+      } else {
+        // Keep unknown server-initiated methods fail-fast so a future Codex
+        // protocol addition doesn't hang this runner silently.
+        this.writeRaw(jsonRpcMethodNotFound(msg.id, msg.method))
+      }
       return
     }
     if (msg.kind === 'notification') {
@@ -770,7 +898,7 @@ export class CodexAppServerRunner extends EventEmitter {
         settings: {
           model: this.opts.model ?? '',
           reasoning_effort: this.codexReasoningEffort(),
-          developer_instructions: null,
+          developer_instructions: mode === 'default' ? CODEX_AUTO_PLAN_INSTRUCTIONS : null,
         },
       },
       sandboxPolicy:

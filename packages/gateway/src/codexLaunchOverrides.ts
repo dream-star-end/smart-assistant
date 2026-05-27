@@ -22,6 +22,8 @@
  *     developer instructions (visible to model).
  *   - `-c mcp_servers.X.command="..." -c mcp_servers.X.args=[...] -c mcp_servers.X.env={...}`
  *     spawns the MCP server and exposes its tools to codex's tool loop.
+ *   - `-c mcp_servers.X.default_tools_approval_mode="approve"` pre-approves
+ *     that server's tools for the trusted personal OpenClaude adapter.
  *
  * Out of scope (intentional):
  *   - Persisting overrides into `~/.codex/config.toml` — all injection is
@@ -296,6 +298,8 @@ export async function buildCodexLaunchOverrides(
       `mcp_servers.openclaude_memory.args=${tomlValue(['tsx', mcpEntry])}`,
       '-c',
       `mcp_servers.openclaude_memory.env=${tomlValue(mcpEnv)}`,
+      '-c',
+      `mcp_servers.openclaude_memory.default_tools_approval_mode=${tomlValue('approve')}`,
     )
   }
 

@@ -62,6 +62,12 @@ function extractTemplateDollarRefs(js: string): string[] {
 const DYNAMIC_IDS = new Set([
   '__typing', // showTypingIndicator() creates div#__typing
   'tasks-panel', // _renderTasksPanel() creates div#tasks-panel
+  'plan-panel-btn', // initPlanPanel() creates the header trigger on demand
+  'plan-panel-badge', // initPlanPanel() creates the trigger badge on demand
+  'plan-panel-backdrop', // initPlanPanel() creates the drawer backdrop on demand
+  'plan-panel', // initPlanPanel() creates aside#plan-panel on demand
+  'plan-panel-close', // initPlanPanel() creates the drawer close button on demand
+  'plan-panel-content', // initPlanPanel() creates the drawer content mount on demand
   'slash-popup', // showSlashPopup() creates div#slash-popup
   'permission-modal', // permission prompts are created on demand in websocket.js
 ])

@@ -243,6 +243,10 @@ describe('CodexAppServerRunner plan-first turn/start params', () => {
     const params = (h.runner as any).buildTurnStartParams('implement it')
 
     assert.equal((params.collaborationMode as any).mode, 'default')
+    assert.match(
+      (params.collaborationMode as any).settings.developer_instructions,
+      /Decide autonomously whether the user request needs a visible plan\/task list/,
+    )
     assert.deepEqual(params.sandboxPolicy, { type: 'dangerFullAccess' })
     await h.cleanup()
   })
@@ -276,7 +280,78 @@ describe('handleLine — dispatch', () => {
     await h.cleanup()
   })
 
-  it('server-request always responds with -32601 method-not-found', async () => {
+  it('auto-approves command and file-change server requests', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: 'cmd-1',
+      method: 'item/commandExecution/requestApproval',
+      params: { command: 'git status' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: 'file-1',
+      method: 'item/fileChange/requestApproval',
+      params: { grantRoot: '/tmp/project' },
+    })
+    assert.equal(h.written.length, 2)
+    assert.deepEqual(JSON.parse(h.written[0]).result, { decision: 'acceptForSession' })
+    assert.deepEqual(JSON.parse(h.written[1]).result, { decision: 'acceptForSession' })
+    await h.cleanup()
+  })
+
+  it('auto-approves permissions server requests for the session', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const permissions = {
+      network: { additional: ['example.com'] },
+      fileSystem: { write: ['/tmp/project'] },
+    }
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: 'perm-1',
+      method: 'item/permissions/requestApproval',
+      params: { permissions },
+    })
+    assert.equal(h.written.length, 1)
+    assert.deepEqual(JSON.parse(h.written[0]).result, {
+      permissions,
+      scope: 'session',
+      strictAutoReview: false,
+    })
+    await h.cleanup()
+  })
+
+  it('auto-accepts MCP elicitation approvals with an approval-looking content value', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: 'mcp-1',
+      method: 'mcpServer/elicitation/request',
+      params: {
+        mode: 'form',
+        serverName: 'openclaude_memory',
+        requestedSchema: {
+          type: 'object',
+          required: ['approval_mode'],
+          properties: {
+            approval_mode: {
+              type: 'string',
+              enum: ['prompt', 'approve'],
+            },
+          },
+        },
+      },
+    })
+    assert.equal(h.written.length, 1)
+    assert.deepEqual(JSON.parse(h.written[0]).result, {
+      action: 'accept',
+      content: { approval_mode: 'approve' },
+      _meta: null,
+    })
+    await h.cleanup()
+  })
+
+  it('unknown server-request still responds with -32601 method-not-found', async () => {
     const h = await makeHarness({ withFakeProc: true })
     feed(h.runner, {
       jsonrpc: '2.0',

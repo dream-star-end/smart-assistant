@@ -210,8 +210,9 @@ describe('buildCodexLaunchOverrides', () => {
       gatewayPort: 18789,
       gatewayToken: 'tok-xyz',
     })
-    // If mcp-memory entry was found, the override list must include three
-    // mcp_servers.openclaude_memory.* entries in the order: command, args, env.
+    // If mcp-memory entry was found, the override list must include four
+    // mcp_servers.openclaude_memory.* entries in the order:
+    // command, args, env, approval mode.
     const mcpKeys = out.argvOverrides
       .filter((s) => s.startsWith('mcp_servers.openclaude_memory.'))
       .map((s) => s.slice(0, s.indexOf('=')))
@@ -220,7 +221,27 @@ describe('buildCodexLaunchOverrides', () => {
         'mcp_servers.openclaude_memory.command',
         'mcp_servers.openclaude_memory.args',
         'mcp_servers.openclaude_memory.env',
+        'mcp_servers.openclaude_memory.default_tools_approval_mode',
       ])
+    }
+  })
+
+  it('pre-approves openclaude_memory MCP tools for trusted personal Codex', async () => {
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    const out = await buildCodexLaunchOverrides({
+      agentId: 'test-agent',
+      sessionDir: dir,
+      gatewayPort: 18789,
+      gatewayToken: 'tok-xyz',
+    })
+    const approvalKey = out.argvOverrides.find((s) =>
+      s.startsWith('mcp_servers.openclaude_memory.default_tools_approval_mode='),
+    )
+    if (approvalKey) {
+      assert.equal(
+        approvalKey,
+        'mcp_servers.openclaude_memory.default_tools_approval_mode="approve"',
+      )
     }
   })
 
@@ -276,8 +297,8 @@ describe('buildCodexLaunchOverrides', () => {
     // Force null by passing claudeCodePath that doesn't exist AND patching
     // process.cwd to a location with no packages/mcp-memory. Achieved by
     // running the resolver with a known-bad cwd via subprocess would be
-    // overkill — instead, sanity check that when entry IS found we have 8
-    // overrides (1 instructions + 6 mcp), and when not we have 2 (1 pair).
+    // overkill — instead, sanity check that when entry IS found we have 10
+    // overrides (1 instructions + 8 mcp), and when not we have 2 (1 pair).
     const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
     const out = await buildCodexLaunchOverrides({
       agentId: 'test-agent',

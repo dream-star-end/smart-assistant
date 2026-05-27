@@ -13,6 +13,7 @@ import { describe, it } from 'node:test'
 
 const PUBLIC = resolve(import.meta.dirname, '..', 'public')
 const modulesDir = resolve(PUBLIC, 'modules')
+const styleCss = readFileSync(resolve(PUBLIC, 'style.css'), 'utf-8')
 
 // Load JS source: modules/ (post-refactor) or app.js (pre-refactor)
 let appJs: string
@@ -427,6 +428,45 @@ describe('T-LATEX-INTEGRATION: codexDisplayMath / codexInlineMath wiring', () =>
   it('extensions push to pendingMath with display flag', () => {
     assert.ok(appJs.includes('pendingMath.push({ id, tex: token.text, display: true })'))
     assert.ok(appJs.includes('pendingMath.push({ id, tex: token.text, display: false })'))
+  })
+})
+
+// ── T-PLAN-PANEL: Codex plan / TodoWrite quick panel wiring ──
+describe('T-PLAN-PANEL: plan markdown rendering and quick panel wiring', () => {
+  it('plan cards render markdown instead of assigning raw textContent', () => {
+    assert.ok(
+      appJs.includes('function _renderPlanMarkdownInto'),
+      'messages.js should define a dedicated plan markdown renderer',
+    )
+    assert.ok(
+      /function _buildPlanCard[\s\S]*?_renderPlanMarkdownInto\(explanation,\s*msg\.explanation[\s\S]*?_renderPlanMarkdownInto\(draft,\s*msg\.text/.test(
+        appJs,
+      ),
+      'plan explanation/draft should go through markdown rendering',
+    )
+  })
+  it('updateMessageEl handles role=plan so streaming plan updates refresh the card', () => {
+    assert.ok(
+      /else if \(msg\.role === 'plan'\)[\s\S]*?_buildPlanCard\(el, msg\)/.test(appJs),
+      'updateMessageEl should include a plan branch that rebuilds the plan card',
+    )
+  })
+  it('current-session plan panel extracts latest plan and TodoWrite messages', () => {
+    assert.ok(
+      appJs.includes('export function getLatestPlanAndTodos'),
+      'planPanel.js should export getLatestPlanAndTodos',
+    )
+    assert.ok(
+      /m\?\.role === 'plan'/.test(appJs) && /m\.toolName === 'TodoWrite'/.test(appJs),
+      'plan panel should scan current session messages for plan and TodoWrite',
+    )
+  })
+  it('style includes right-side plan panel classes', () => {
+    assert.ok(styleCss.includes('.plan-panel'), 'style.css should include plan panel styles')
+    assert.ok(
+      styleCss.includes('.plan-panel-btn') && styleCss.includes('.plan-panel-badge'),
+      'style.css should style the plan panel trigger and badge',
+    )
   })
 })
 

@@ -10,7 +10,8 @@ import {
   renderMarkdown,
   renderStreamingMarkdown,
 } from './markdown.js'
-import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js'
+import { refreshPlanPanel } from './planPanel.js?v=2'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=2'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 import { msgTimeLabel, shortTime } from './util.js'
@@ -1254,8 +1255,13 @@ function _applyTruncatedBanner(el, msg) {
 
 function _planStatusLabel(status) {
   if (status === 'completed') return '完成'
-  if (status === 'inProgress') return '进行中'
+  if (status === 'inProgress' || status === 'in_progress') return '进行中'
   return '待处理'
+}
+
+function _renderPlanMarkdownInto(el, text, streaming = false) {
+  el.innerHTML = streaming ? renderStreamingMarkdown(text || '') : renderMarkdown(text || '')
+  el.style.whiteSpace = ''
 }
 
 function _buildPlanCard(el, msg) {
@@ -1276,7 +1282,7 @@ function _buildPlanCard(el, msg) {
   if (msg.explanation) {
     const explanation = document.createElement('div')
     explanation.className = 'plan-card-explanation'
-    explanation.textContent = msg.explanation
+    _renderPlanMarkdownInto(explanation, msg.explanation, !!msg._partial)
     body.appendChild(explanation)
   }
   if (Array.isArray(msg.steps) && msg.steps.length > 0) {
@@ -1299,7 +1305,7 @@ function _buildPlanCard(el, msg) {
   } else if (msg.text) {
     const draft = document.createElement('div')
     draft.className = 'plan-card-draft'
-    draft.textContent = msg.text
+    _renderPlanMarkdownInto(draft, msg.text, !!msg._partial)
     body.appendChild(draft)
   }
   el.appendChild(body)
@@ -1691,12 +1697,6 @@ export function _buildMessageEl(msg) {
     _buildPlanCard(el, msg)
   } else if (msg.role === 'agent-group') {
     _renderAgentGroup(el, msg)
-  } else if (msg.role === 'plan') {
-    el.innerHTML = ''
-    el.className = 'msg plan'
-    if (msg.error) el.classList.add('error')
-    el.dataset.msgId = msg.id
-    _buildPlanCard(el, msg)
   } else if (msg.role === 'thinking') {
     const header = document.createElement('div')
     header.className = 'thinking-header'
@@ -1796,6 +1796,7 @@ export function renderMessage(msg, skipRichBlocks = false) {
   if (typing) main.insertBefore(el, typing)
   else main.appendChild(el)
   if (!skipRichBlocks) processRichBlocks()
+  if (!skipRichBlocks) refreshPlanPanel()
 }
 
 export function updateMessageEl(msg, streaming) {
@@ -1866,6 +1867,12 @@ export function updateMessageEl(msg, streaming) {
     _refreshMsgTime(el, msg)
   } else if (msg.role === 'agent-group') {
     _renderAgentGroup(el, msg)
+  } else if (msg.role === 'plan') {
+    el.innerHTML = ''
+    el.className = 'msg plan'
+    if (msg.error) el.classList.add('error')
+    el.dataset.msgId = msg.id
+    _buildPlanCard(el, msg)
   } else if (msg.role === 'thinking') {
     const body = el.querySelector('.thinking-body') || el.querySelector('.msg-body')
     if (body) body.textContent = msg.text || ''
@@ -1902,6 +1909,7 @@ export function updateMessageEl(msg, streaming) {
     }
   }
   processRichBlocks()
+  refreshPlanPanel()
 }
 
 export function renderMetaInto(container, metaText) {
@@ -1925,6 +1933,7 @@ export function renderMessages() {
   if (!s) {
     $('session-title').textContent = '无会话'
     $('session-sub').textContent = ''
+    refreshPlanPanel()
     return
   }
   $('session-title').textContent = s.title
@@ -1937,6 +1946,7 @@ export function renderMessages() {
     const _av = htmlSafeEscape(_ai?.avatarEmoji || 'O')
     empty.innerHTML = `<div class="empty-brand">${_av}</div><h1>${htmlSafeEscape(_name)}</h1><p>你的个人 AI 助理，随时待命</p><div class="hint-kbd">按 <kbd>${_mod}K</kbd> 打开命令面板 · 输入 <kbd>/</kbd> 查看命令</div>`
     main.appendChild(empty)
+    refreshPlanPanel()
     return
   }
   const inner = document.createElement('div')
@@ -1994,6 +2004,7 @@ export function renderMessages() {
   }
   // Batch process all rich blocks once instead of per-message
   processRichBlocks()
+  refreshPlanPanel()
   scrollBottom(true)
 }
 
