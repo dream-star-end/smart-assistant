@@ -41,6 +41,21 @@ const cli = (id: string, ts: number, role = 'user', text = ''): Msg => ({
   ts,
 })
 
+const plan = (
+  id: string,
+  ts: number,
+  blockId: string,
+  statuses: string[],
+  extra: Record<string, unknown> = {},
+): Msg => ({
+  id,
+  role: 'plan',
+  ts,
+  blockId,
+  steps: statuses.map((status, idx) => ({ step: `step-${idx + 1}`, status })),
+  ...extra,
+})
+
 describe('mergePreservingServerAuthored', () => {
   it('returns client reference verbatim when server side has no server-authored messages', () => {
     const server: Msg[] = [cli('u1', 100), cli('u2', 200)]
@@ -53,6 +68,36 @@ describe('mergePreservingServerAuthored', () => {
     const client: Msg[] = [cli('u1', 100)]
     const out = mergePreservingServerAuthored([] as Msg[], client)
     assert.equal(out, client)
+  })
+
+  it('dedupes duplicate client plan rows with the same blockId inside one turn even without server-authored rows', () => {
+    const client: Msg[] = [
+      cli('u1', 100),
+      plan('p-partial', 210, 'codex-plan-t1', ['completed', 'pending'], {
+        _partial: true,
+        completedAt: 210,
+      }),
+      plan('p-final', 200, 'codex-plan-t1', ['completed', 'completed'], {
+        _partial: false,
+        completedAt: 300,
+      }),
+    ]
+
+    const out = mergePreservingServerAuthored([] as Msg[], client) as Msg[]
+    assert.notEqual(out, client, 'duplicate plan cleanup must bypass the no-copy fast path')
+    assert.deepEqual(out.map((m) => m.id), ['u1', 'p-final'])
+  })
+
+  it('preserves same legacy plan blockId across different user turns', () => {
+    const client: Msg[] = [
+      cli('u1', 100),
+      plan('p-turn-1', 200, 'codex-plan', ['completed']),
+      cli('u2', 300),
+      plan('p-turn-2', 400, 'codex-plan', ['pending']),
+    ]
+
+    const out = mergePreservingServerAuthored([] as Msg[], client)
+    assert.equal(out, client, 'cross-turn legacy blockIds are not duplicates')
   })
 
   it('re-inserts a server-authored message the client dropped', () => {

@@ -355,8 +355,11 @@ describe('handleNotification — native plan updates', () => {
     assert.equal(h.messages.length, 3)
     assert.equal(h.messages[0].type, 'openclaude_plan')
     assert.equal(h.messages[0].session_id, 'thr-plan')
+    assert.equal(h.messages[0].plan.blockId, 'codex-plan-t-plan')
     assert.equal(h.messages[0].plan.text, 'Step 1')
+    assert.equal(h.messages[1].plan.blockId, 'codex-plan-t-plan')
     assert.equal(h.messages[1].plan.text, 'Step 1\nStep 2')
+    assert.equal(h.messages[2].plan.blockId, 'codex-plan-t-plan')
     assert.equal(h.messages[2].plan.explanation, 'Implementation plan')
     assert.deepEqual(h.messages[2].plan.steps, [
       { step: 'Inspect', status: 'completed' },

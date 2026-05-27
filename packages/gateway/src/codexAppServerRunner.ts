@@ -1465,11 +1465,16 @@ export class CodexAppServerRunner extends EventEmitter {
     steps?: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }>
     partial?: boolean
   }): void {
+    // Scope the plan card identity to the current Codex turn. The frontend
+    // uses blockId as the stable update key; a process-wide "codex-plan"
+    // key made separate turns fight over one card and made multi-client
+    // persistence preserve duplicate random-id plan rows.
+    const planBlockId = `codex-plan-${this.activeTurnId ?? 'pending'}`
     this.emit('message', {
       type: 'openclaude_plan',
       session_id: this.threadId,
       plan: {
-        blockId: 'codex-plan',
+        blockId: planBlockId,
         ...plan,
       },
     } as unknown as RunnerMessage)
