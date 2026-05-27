@@ -22,6 +22,100 @@ import { type OcTelemetryEvent, TelemetryChannel } from './telemetryChannel.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
+export const LIVENESS_IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
+export const LIVENESS_IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
+export const LIVENESS_IDLE_TIMEOUT_COMPACTING_MS = 20 * 60_000
+
+export function getLivenessIdleTimeoutMs(
+  parser: { pendingToolCalls?: number; isCompacting?: boolean } | null | undefined,
+): number {
+  if (parser?.isCompacting) return LIVENESS_IDLE_TIMEOUT_COMPACTING_MS
+  if ((parser?.pendingToolCalls ?? 0) > 0) return LIVENESS_IDLE_TIMEOUT_TOOL_MS
+  return LIVENESS_IDLE_TIMEOUT_DEFAULT_MS
+}
+
+type ChatHistoryMessage = {
+  role?: unknown
+  text?: unknown
+  content?: unknown
+  status?: unknown
+  system?: unknown
+}
+
+function extractHistoryText(msg: ChatHistoryMessage): string {
+  if (typeof msg.text === 'string') return msg.text
+  if (typeof msg.content === 'string') return msg.content
+  if (Array.isArray(msg.content)) {
+    return msg.content
+      .map((part) => {
+        if (part && typeof part === 'object' && 'text' in part) {
+          const text = (part as { text?: unknown }).text
+          return typeof text === 'string' ? text : ''
+        }
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+  }
+  return ''
+}
+
+function normForCompare(s: string): string {
+  return s.replace(/\s+/g, ' ').trim()
+}
+
+export function buildHistoricalContextPrompt(
+  messages: unknown[],
+  currentUserText: string,
+  opts?: { maxChars?: number; maxMessages?: number },
+): string | null {
+  const maxChars = opts?.maxChars ?? 14_000
+  const maxMessages = opts?.maxMessages ?? 40
+  const currentNorm = normForCompare(currentUserText)
+  const rows: Array<{ role: 'user' | 'assistant'; text: string; status?: unknown }> = []
+  for (const raw of messages) {
+    if (!raw || typeof raw !== 'object') continue
+    const msg = raw as ChatHistoryMessage
+    if (msg.system === true) continue
+    const role = msg.role === 'user' || msg.role === 'assistant' ? msg.role : null
+    if (!role) continue
+    const text = extractHistoryText(msg).trim()
+    if (!text) continue
+    rows.push({ role, text, status: msg.status })
+  }
+  while (rows.length > 0) {
+    const last = rows[rows.length - 1]
+    const lastNorm = normForCompare(last.text)
+    const isCurrent =
+      last.role === 'user' &&
+      (last.status === 'sending' ||
+        last.status === 'queued' ||
+        (currentNorm && (lastNorm === currentNorm || currentNorm.startsWith(lastNorm))))
+    if (!isCurrent) break
+    rows.pop()
+  }
+  let selected = rows.slice(-maxMessages)
+  while (selected.length > 0) {
+    const body = selected
+      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
+      .join('\n\n')
+    if (body.length <= maxChars) {
+      return [
+        '<openclaude_previous_context>',
+        'The current OpenClaude session was previously served by a different runner/provider or cannot be natively resumed. Use this transcript as prior conversation context. Do not restate it unless needed.',
+        body,
+        '</openclaude_previous_context>',
+        '',
+        '<current_user_message>',
+        currentUserText,
+        '</current_user_message>',
+      ].join('\n')
+    }
+    selected = selected.slice(1)
+  }
+  return null
+}
+
 // 一个 sessionKey 对应一个 SubprocessRunner + 一把 Mutex(同 session 串行)。
 // 跨 session 完全并行。
 export interface AgentSession {
@@ -43,6 +137,7 @@ export interface AgentSession {
   title: string
   startedAt: number
   runner: SubprocessRunner
+  runnerProviderTag: string
   ccbSessionId: string | null
   lock: Promise<void>
   lastUsedAt: number
@@ -74,6 +169,7 @@ export interface AgentSession {
   // emitted after the turn's `result` keeps flowing through parser ->
   // onEvent -> deliver. destroySession/shutdownAll explicitly off().
   _currentMessageListener?: ((msg: any) => void) | null
+  _historicalContextInjected?: boolean
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -316,17 +412,32 @@ export class SessionManager {
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
 
+    const providerTag = SessionManager.providerTag(opts.agent.provider)
     const existing = this.sessions.get(opts.sessionKey)
     if (existing) {
-      existing.lastUsedAt = Date.now()
-      if (opts.title && (!existing.title || existing.title === 'New conversation'))
-        existing.title = opts.title
-      // Adopt a userId from a later call if the session was first created
-      // without one (e.g. cron pre-warmed, then a webchat user attached).
-      // Never *overwrite* an already-set userId — doing so would enable a
-      // different authenticated user to redirect another user's persistence.
-      if (opts.userId && !existing.userId) existing.userId = opts.userId
-      return existing
+      if (existing.runnerProviderTag !== providerTag) {
+        // Same logical client session, but the agent was switched between
+        // Claude Code and Codex. Native resume ids are provider-specific, so
+        // tear down the old runner and let the fresh one receive a compact
+        // transcript preamble on its first submit().
+        try {
+          await existing.lock
+          await existing.runner.shutdown()
+        } catch (err) {
+          log.warn('provider-switch shutdown failed', { sessionKey: opts.sessionKey }, err)
+        }
+        this.sessions.delete(opts.sessionKey)
+      } else {
+        existing.lastUsedAt = Date.now()
+        if (opts.title && (!existing.title || existing.title === 'New conversation'))
+          existing.title = opts.title
+        // Adopt a userId from a later call if the session was first created
+        // without one (e.g. cron pre-warmed, then a webchat user attached).
+        // Never *overwrite* an already-set userId — doing so would enable a
+        // different authenticated user to redirect another user's persistence.
+        if (opts.userId && !existing.userId) existing.userId = opts.userId
+        return existing
+      }
     }
     const cwd = opts.agent.cwd ?? process.cwd()
     const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
@@ -340,7 +451,6 @@ export class SessionManager {
     // Existing hand-written agents.yaml entries with no runnerKind keep the
     // legacy exec fallback; Agent API normalizes codex-native saves to
     // app-server so newly managed agents get realtime events by default.
-    const providerTag = SessionManager.providerTag(opts.agent.provider)
     const codexResumeId = this._resumeIdFor(opts.sessionKey, providerTag)
     const codexModel = opts.agent.model ?? this.config.defaults.model
     // Effective egress proxy: per-agent override falls through to global config.
@@ -419,6 +529,7 @@ export class SessionManager {
       title: opts.title ?? 'New conversation',
       startedAt: now,
       runner,
+      runnerProviderTag: providerTag,
       ccbSessionId: null,
       lock: Promise.resolve(),
       lastUsedAt: now,
@@ -596,6 +707,32 @@ export class SessionManager {
             : [session.sessionKey]
         session.turns = await getMaxTurnIdx(ids)
       }
+      let runnerPayload = userTextOrBlocks
+      if (
+        !session._historicalContextInjected &&
+        session.channel === 'webchat' &&
+        session.turns > 0 &&
+        typeof userTextOrBlocks === 'string' &&
+        !this._resumeIdFor(session.sessionKey, session.runnerProviderTag)
+      ) {
+        try {
+          const clientSession = await getClientSession(session.peerId, session.userId)
+          const historicalPrompt = clientSession
+            ? buildHistoricalContextPrompt(clientSession.messages, userTextOrBlocks)
+            : null
+          if (historicalPrompt) {
+            runnerPayload = historicalPrompt
+            session._historicalContextInjected = true
+            log.info('injected historical context for provider switch / non-native resume', {
+              sessionKey: session.sessionKey,
+              provider: session.runnerProviderTag,
+              messageCount: clientSession?.messages?.length ?? 0,
+            })
+          }
+        } catch (err) {
+          log.warn('historical context injection failed', { sessionKey: session.sessionKey }, err)
+        }
+      }
       // Auto-name session from first user turn
       if (session.turns === 0 && session.currentUserText) {
         const title = session.currentUserText.slice(0, 50).replace(/\s+/g, ' ').trim()
@@ -610,19 +747,18 @@ export class SessionManager {
       // Thresholds tuned for "process active but deadlocked" detection speed
       // (was 30/60min pre-2026-04-19):
       //   - Tool call in progress (MCP/Bash/sub-agent): 15 min
+      //   - Context compaction in progress: 20 min (do not kill ordinary
+      //     auto-compact because it has no user-visible token stream)
       //   - No tool call pending (API streaming / idle): 5 min
       // _runOneTurn has a separate 30-min idle timer as a tighter
       // turn-level backstop that resets on every stdout message.
-      const IDLE_TIMEOUT_TOOL = 15 * 60_000 // 15 min — tool executing
-      const IDLE_TIMEOUT_DEFAULT = 5 * 60_000 // 5 min — API stream / general idle
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
           const idleMs = Date.now() - session.runner.lastActivityAt
           const parser = session._currentParser
-          const threshold =
-            parser && parser.pendingToolCalls > 0 ? IDLE_TIMEOUT_TOOL : IDLE_TIMEOUT_DEFAULT
+          const threshold = getLivenessIdleTimeoutMs(parser)
           if (idleMs > threshold) {
             reject(new Error(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
           }
@@ -630,7 +766,7 @@ export class SessionManager {
       })
       try {
         await Promise.race([
-          this.runOneTurnWithRetry(session, userTextOrBlocks, onEvent),
+          this.runOneTurnWithRetry(session, runnerPayload, onEvent),
           livenessPromise,
         ])
       } finally {

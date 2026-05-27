@@ -206,6 +206,7 @@ export function clearTurnTiming(sess) {
   if (!sess) return
   sess._turnStartedAt = null
   sess._lastFrameAt = null
+  sess._turnStatus = null
 }
 
 export function showTypingIndicator() {
@@ -234,17 +235,21 @@ export function showTypingIndicator() {
     const label = el.querySelector('.typing-label')
     if (!label) return
     const silenceMs = Date.now() - lastFrame
-    if (silenceMs >= STALE_DANGER_MS) {
+    if (_sess?._turnStatus === 'compacting') {
+      label.textContent = `${name} 正在压缩上下文 (${secs}s)`
+      el.classList.remove('stale-warn', 'stale-danger')
+      el.classList.add('compacting')
+    } else if (silenceMs >= STALE_DANGER_MS) {
       label.textContent = `${name} 可能已卡住 (${secs}s · 已 ${Math.round(silenceMs / 1000)}s 无响应)`
       el.classList.add('stale-danger')
-      el.classList.remove('stale-warn')
+      el.classList.remove('stale-warn', 'compacting')
     } else if (silenceMs >= STALE_WARN_MS) {
       label.textContent = `${name} 思考中 (${secs}s · ${Math.round(silenceMs / 1000)}s 无新数据)`
       el.classList.add('stale-warn')
-      el.classList.remove('stale-danger')
+      el.classList.remove('stale-danger', 'compacting')
     } else if (secs >= 5) {
       label.textContent = `${name} 思考中 (${secs}s)`
-      el.classList.remove('stale-warn', 'stale-danger')
+      el.classList.remove('stale-warn', 'stale-danger', 'compacting')
     }
   }, 1000)
   inner.appendChild(el)
@@ -1028,6 +1033,7 @@ export function connect() {
         }
       }
       if (f.type === 'outbound.message') handleOutbound(f)
+      else if (f.type === 'outbound.turn_status') handleOutboundTurnStatus(f)
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
@@ -1122,6 +1128,28 @@ export function handleOutbound(frame) {
           }
         }
       }
+    }
+  }
+  // A service-restart synthetic final is only meant to clear a stale
+  // `_sendingInFlight` marker after reconnect. If the user already pressed
+  // "继续" while the socket was reconnecting, that new user message is still
+  // queued locally when hello/resume frames arrive. Rendering the synthetic
+  // notice in that window makes it appear as the answer to the fresh
+  // "继续" turn. Treat it as out-of-band cleanup instead and let the queued
+  // turn drain normally.
+  if (frame.isFinal && frame.meta?.interrupted === 'service_restart') {
+    const hasQueuedUser = sess.messages.some((m) => m.role === 'user' && m.status === 'queued')
+    if (hasQueuedUser) {
+      sess._sendingInFlight = false
+      clearTurnTiming(sess)
+      resetReplyTracker(sess)
+      if (sess.id === state.currentSessionId) {
+        state.sendingInFlight = false
+        updateSendEnabled()
+        hideTypingIndicator()
+        setTitleBusy(false)
+      }
+      return
     }
   }
   // Early stale-final guard (best effort): drop late isFinal frames from a
@@ -1762,6 +1790,31 @@ export function handleOutbound(frame) {
   _deps.scheduleSave(sess, !!frame.isFinal)
   // Only rebuild sidebar on final message (not every streaming delta)
   if (frame.isFinal) _deps.renderSidebar()
+}
+
+function handleOutboundTurnStatus(frame) {
+  const peerId = frame.peer?.id
+  const sess = peerId ? state.sessions.get(peerId) : null
+  if (!sess) return
+  markFrameReceived(sess)
+  const status = frame.status === 'compacting' ? 'compacting' : null
+  sess._turnStatus = status
+  if (sess.id !== state.currentSessionId) return
+  const el = document.getElementById('__typing')
+  if (!el) return
+  const label = el.querySelector('.typing-label')
+  if (!label) return
+  const agentInfo = state.agentsList.find((a) => a.id === (sess.agentId || state.defaultAgentId))
+  const name = agentInfo?.displayName || sess.agentId || 'AI'
+  const startedAt = sess._turnStartedAt || Date.now()
+  const secs = Math.round((Date.now() - startedAt) / 1000)
+  if (status === 'compacting') {
+    label.textContent = `${name} 正在压缩上下文 (${secs}s)`
+    el.classList.remove('stale-warn', 'stale-danger')
+    el.classList.add('compacting')
+  } else {
+    el.classList.remove('compacting')
+  }
 }
 
 // ── Phase 0.4: gateway-initiated resume failure ──

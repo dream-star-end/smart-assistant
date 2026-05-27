@@ -21,6 +21,7 @@ export interface PermissionRequest {
 
 export type SessionStreamEvent =
   | { kind: 'block'; block: OutboundContentBlock }
+  | { kind: 'turn_status'; status: 'compacting' | null }
   | {
       kind: 'final'
       meta?: {
@@ -99,6 +100,8 @@ export class CcbMessageParser {
   private emittedToolResultIds = new Set<string>()
   /** Count of tool_use blocks sent but not yet matched by a tool_result */
   public pendingToolCalls = 0
+  /** True while CCB reports it is compacting conversation context. */
+  public isCompacting = false
   /** Assistant text accumulated in this turn */
   public assistantBuf = ''
   /** Whether this turn has been finalized */
@@ -229,15 +232,32 @@ export class CcbMessageParser {
     }
 
     // ── system messages ──
-    // Most system subtypes (init / status / success / error / task_*) are
-    // ignored by the gateway; CCB emits them for SDK consumers like VS Code
-    // and Scuttle that listen on stdout directly. The one we DO surface is
-    // `bash_output_tail` — the snapshot tail of a long-running Bash command
-    // that BashTool/LocalShellTask emit on a 1 Hz cadence. It carries the
-    // original BashTool tool_use_id so the frontend can route the tail to
-    // the right tool card. See packages/protocol/src/frames.ts for the
-    // OutboundContentBlock 'tool_output_tail' shape.
+    // Most system subtypes (init / success / error / task_*) are ignored by
+    // the gateway; CCB emits them for SDK consumers like VS Code and Scuttle
+    // that listen on stdout directly.
+    //
+    // Two system signals are meaningful for OpenClaude:
+    //   - status=compacting: CCB is spending time compressing context before
+    //     the next model call. Track it so SessionManager does not count that
+    //     silent phase against the ordinary 5-minute "no output" liveness
+    //     budget, and emit a turn_status side-channel so the web UI can show
+    //     a separate "正在压缩上下文" state without polluting chat history.
+    //   - bash_output_tail: snapshot tail of a long-running Bash command
+    //     emitted on a 1 Hz cadence. It carries the original BashTool
+    //     tool_use_id so the frontend can route the tail to the right card.
+    //     See packages/protocol/src/frames.ts for the 'tool_output_tail' shape.
     if (msg.type === 'system') {
+      if (raw.subtype === 'status') {
+        const mapped: 'compacting' | null = raw.status === 'compacting' ? 'compacting' : null
+        this.isCompacting = mapped === 'compacting'
+        this.onEvent({ kind: 'turn_status', status: mapped })
+        return
+      }
+      if (raw.subtype === 'compact_boundary') {
+        this.isCompacting = false
+        this.onEvent({ kind: 'turn_status', status: null })
+        return
+      }
       if (raw.subtype === 'bash_output_tail') {
         const toolUseId = raw.tool_use_id
         if (typeof toolUseId === 'string' && toolUseId.length > 0) {

@@ -3774,6 +3774,7 @@ export class Gateway {
                 text: '\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。',
               },
             ],
+            meta: { interrupted: 'service_restart' } as any,
             isFinal: true,
             ts: Date.now(),
           })
@@ -4295,6 +4296,21 @@ export class Gateway {
           // 会被钉到下一轮 listener 替换之前。
           out.blocks.length = 0
           aggregatedBlocks.length = 0
+        } else if (e.kind === 'turn_status') {
+          if (!adapter) {
+            const dispatchUserId: string =
+              typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+            const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
+            this._sendStampedSessionFrame(sessionKey, peerKey, {
+              type: 'outbound.turn_status',
+              sessionKey,
+              channel: frame.channel,
+              peer: frame.peer,
+              agentId: session.agentId,
+              status: e.status,
+              ts: Date.now(),
+            })
+          }
         } else if (e.kind === 'permission_request') {
           // Forward permission prompt to WebSocket clients for user approval.
           // userId is stashed on the frame by the WS handler (see handleWsConnection)

@@ -105,6 +105,25 @@ describe('CcbMessageParser: text streaming', () => {
   })
 })
 
+// ── System status ──
+describe('CcbMessageParser: system status', () => {
+  it('tracks compaction and emits turn_status side-channel events', () => {
+    const { parser, events } = createParser()
+
+    parser.parse({ type: 'system', subtype: 'status', status: 'compacting' } as any)
+    parser.parse({ type: 'system', subtype: 'status', status: 'compacting' } as any)
+
+    assert.equal(parser.isCompacting, true)
+    assert.equal(events.length, 2)
+    assert.deepEqual(events[0], { kind: 'turn_status', status: 'compacting' })
+    assert.deepEqual(events[1], { kind: 'turn_status', status: 'compacting' })
+
+    parser.parse({ type: 'system', subtype: 'status', status: null } as any)
+    assert.equal(parser.isCompacting, false)
+    assert.deepEqual(events[2], { kind: 'turn_status', status: null })
+  })
+})
+
 // ── Tool use ──
 describe('CcbMessageParser: tool_use', () => {
   it('emits partial tool_use on content_block_start', () => {
