@@ -32,8 +32,8 @@
  *     subsystems — they are independent stores; we do not let codex's
  *     stage1/stage2 memory writer touch our MemoryStore.
  */
-import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, join, parse, resolve } from 'node:path'
 import { buildPromptContext } from './promptSlots.js'
 
 // ── Codex-specific preamble ──
@@ -96,6 +96,9 @@ not use markdown image syntax (\`![]()\`). Inline rich-content code blocks
 `
 
 const CODEX_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+
+const PROJECT_RULE_FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
+const PROJECT_RULE_MAX_BYTES = 96 * 1024
 
 // ── Path resolution for the bundled mcp-memory entry ──
 
@@ -176,6 +179,53 @@ function tomlValue(v: string | string[] | Record<string, string>): string {
   throw new TypeError(`tomlValue: unsupported value type (${typeof v})`)
 }
 
+function findProjectRuleFiles(startDir: string | undefined): string[] {
+  if (!startDir) return []
+  let dir = resolve(startDir)
+  const root = parse(dir).root
+  const found: string[] = []
+  while (true) {
+    for (const name of PROJECT_RULE_FILENAMES) {
+      const candidate = join(dir, name)
+      if (existsSync(candidate)) found.push(candidate)
+    }
+    if (dir === root) break
+    dir = dirname(dir)
+  }
+  return found
+}
+
+function readProjectRulesSlot(startDir: string | undefined): string {
+  const files = findProjectRuleFiles(startDir)
+  if (files.length === 0) return ''
+  const blocks: string[] = []
+  for (const file of files) {
+    try {
+      const raw = readFileSync(file, 'utf8')
+      const bounded =
+        Buffer.byteLength(raw, 'utf8') > PROJECT_RULE_MAX_BYTES
+          ? `${raw.slice(0, PROJECT_RULE_MAX_BYTES)}\n\n[truncated by OpenClaude: project rule file exceeded ${PROJECT_RULE_MAX_BYTES} bytes]`
+          : raw
+      const trimmed = bounded.trim()
+      if (trimmed) blocks.push(`## ${file}\n\n${trimmed}`)
+    } catch {
+      // Best-effort: project rules improve behaviour but must not prevent
+      // Codex from starting.
+    }
+  }
+  if (blocks.length === 0) return ''
+  return [
+    '# Project rule files loaded from working directory',
+    '',
+    'These repository-local rules are injected by OpenClaude because the codex app-server adapter does not reliably surface native AGENTS.md loading in the platform prompt. Follow them unless a higher-priority system/developer instruction conflicts.',
+    '',
+    ...blocks,
+    '',
+    '---',
+    '',
+  ].join('\n')
+}
+
 // ── Public API ──
 
 export interface CodexLaunchOverridesContext {
@@ -196,6 +246,11 @@ export interface CodexLaunchOverridesContext {
   /** mkdtempSync'd directory the caller has prepared. We write the
    *  instructions file into this dir (no other side effects). */
   sessionDir: string
+  /** Effective working directory for the codex process. Used to explicitly
+   *  inject repository-local AGENTS.md / CLAUDE.md rule files because the
+   *  OpenClaude codex app-server path should not rely on implicit CLI
+   *  discovery. */
+  cwd?: string
   /** CCB install root, only used to construct the third resolveMcpMemoryEntry
    *  fallback. Pass undefined when running outside a ccb-aware deployment
    *  (the mcp-memory MCP will simply be skipped if no candidate resolves). */
@@ -269,7 +324,8 @@ export async function buildCodexLaunchOverrides(
     model: ctx.model,
     effortLevel: ctx.effortLevel,
   })
-  const instructionsContent = `${CODEX_PREAMBLE}${platformResult.content}`
+  const projectRules = readProjectRulesSlot(ctx.cwd)
+  const instructionsContent = `${CODEX_PREAMBLE}${projectRules}${platformResult.content}`
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
 
   const argvOverrides: string[] = ['-c', `model_instructions_file=${tomlValue(instructionsFile)}`]
@@ -307,4 +363,4 @@ export async function buildCodexLaunchOverrides(
 }
 
 // Internal export for tests only — not part of the stable API.
-export const _internals = { tomlValue, CODEX_PREAMBLE }
+export const _internals = { tomlValue, CODEX_PREAMBLE, readProjectRulesSlot }
