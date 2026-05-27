@@ -1,5 +1,5 @@
 import * as assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -32,7 +32,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
  */
 import { _internals, resolveMcpMemoryEntry } from '../codexLaunchOverrides.js'
 
-const { tomlValue, CODEX_PREAMBLE } = _internals
+const { tomlValue, CODEX_PREAMBLE, readProjectRulesSlot } = _internals
 
 describe('tomlValue', () => {
   it('encodes plain string as TOML basic string (JSON-style double-quoted)', () => {
@@ -202,6 +202,29 @@ describe('buildCodexLaunchOverrides', () => {
     assert.ok(out.instructionsContent.length > CODEX_PREAMBLE.length)
   })
 
+  it('explicitly injects AGENTS.md / CLAUDE.md from cwd into instructionsContent', async () => {
+    const repo = join(dir, 'repo')
+    const child = join(repo, 'nested')
+    mkdirSync(child, { recursive: true })
+    writeFileSync(join(repo, 'AGENTS.md'), '# Agent Rules\n\nUse worktrees.')
+    writeFileSync(join(repo, 'CLAUDE.md'), '# Claude Rules\n\nNo direct edits.')
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    const out = await buildCodexLaunchOverrides({
+      agentId: 'test-agent',
+      sessionDir: dir,
+      cwd: child,
+      gatewayPort: 18789,
+      gatewayToken: 'tok-xyz',
+    })
+    assert.ok(
+      out.instructionsContent.includes('# Project rule files loaded from working directory'),
+    )
+    assert.ok(out.instructionsContent.includes('AGENTS.md'))
+    assert.ok(out.instructionsContent.includes('Use worktrees.'))
+    assert.ok(out.instructionsContent.includes('CLAUDE.md'))
+    assert.ok(out.instructionsContent.includes('No direct edits.'))
+  })
+
   it('mcp-memory keys appear in stable order when entry resolves', async () => {
     const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
     const out = await buildCodexLaunchOverrides({
@@ -314,5 +337,31 @@ describe('buildCodexLaunchOverrides', () => {
     )
     // Must always have at least the instructions pair.
     assert.ok(out.argvOverrides.length >= 2)
+  })
+})
+
+describe('readProjectRulesSlot', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'oc-codex-rules-test-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('walks upward from cwd to find repository-local rule files', () => {
+    const repo = join(dir, 'repo')
+    const child = join(repo, 'a', 'b')
+    mkdirSync(child, { recursive: true })
+    writeFileSync(join(repo, 'AGENTS.md'), 'root agents rule')
+    const slot = readProjectRulesSlot(child)
+    assert.ok(slot.includes(join(repo, 'AGENTS.md')))
+    assert.ok(slot.includes('root agents rule'))
+  })
+
+  it('returns empty string when cwd has no AGENTS.md or CLAUDE.md in parents', () => {
+    assert.equal(readProjectRulesSlot(dir), '')
   })
 })

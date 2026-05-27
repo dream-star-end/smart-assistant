@@ -421,6 +421,7 @@ export class CodexRunner extends EventEmitter {
         model: this.opts.model,
         effortLevel: this.effortLevel,
         sessionDir: dir,
+        cwd: this.opts.cwd,
         claudeCodePath: this.opts.config.auth.claudeCodePath,
         gatewayPort: this.opts.config.gateway.port,
         gatewayToken: this.opts.config.gateway.accessToken,
