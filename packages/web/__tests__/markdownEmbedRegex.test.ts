@@ -40,6 +40,22 @@ function extractMediaBarePathPattern(): string {
   return m[1]
 }
 
+function extractMediaExts(): string {
+  const m = source.match(/const\s+_MEDIA_EXTS\s*=\s*\n\s*'([^']+)'/)
+  if (!m) throw new Error('_MEDIA_EXTS literal not found in markdown.js')
+  return m[1]
+}
+
+function makeStep1BarePathRe(): RegExp {
+  const mediaExts = extractMediaExts()
+  return new RegExp(
+    '((?:^|[\\s>])((?:(?:/|[A-Za-z]:[\\\\\\\\])[^\\s<"\\\'`>]+\\.(?:' +
+      mediaExts +
+      '))))',
+    'gi',
+  )
+}
+
 describe('markdown.js _PUB_PREFIX — multi-dot filename regression', () => {
   const pubPrefix = extractPubPrefix()
   const re = new RegExp(pubPrefix, 'g')
@@ -97,5 +113,26 @@ describe('markdown.js step 1 媒体路径正则 — 贪婪一致性', () => {
   it('vanity check: step 1 媒体路径正则不能用 `+?`', () => {
     const op = extractMediaBarePathPattern()
     assert.equal(op, '+', `step 1 media bare-path 量词应为 '+',实际: ${op}`)
+  })
+
+  it('完整匹配 docx/xlsx/pptx,不截成 doc/xls/ppt', () => {
+    const re = makeStep1BarePathRe()
+    const paths = [
+      '/home/agent/.openclaude/generated/增益保持率公式说明_小节内容.docx',
+      '/home/agent/.openclaude/generated/table.xlsx',
+      '/home/agent/.openclaude/generated/slides.pptx',
+    ]
+    for (const p of paths) {
+      re.lastIndex = 0
+      const m = re.exec(p)
+      assert.equal(m?.[2], p)
+    }
+  })
+
+  it('完整匹配 .tar.gz,不截成 .tar', () => {
+    const re = makeStep1BarePathRe()
+    const p = '/home/agent/.openclaude/generated/research_v7.2_20260515.tar.gz'
+    const m = re.exec(p)
+    assert.equal(m?.[2], p)
   })
 })

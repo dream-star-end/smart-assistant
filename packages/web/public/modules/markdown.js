@@ -420,7 +420,7 @@ export function embedMediaUrls(html) {
   // We need to handle HTML entities: marked converts `/` inside code to `<code>...</code>`
   // and may entity-encode chars. First handle <code>-wrapped paths, then bare paths.
   const _MEDIA_EXTS =
-    'jpg|jpeg|png|gif|webp|bmp|svg|mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|avi|mkv|pdf|txt|md|csv|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz'
+    'jpg|jpeg|png|gif|webp|bmp|svg|mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|avi|mkv|pdf|txt|md|csv|docx|doc|xlsx|xls|pptx|ppt|zip|tar\\.gz|tar|gz'
 
   // Match <code>/path.ext</code> or <code>C:\path.ext</code> — handles both POSIX and Windows paths
   html = html.replace(
