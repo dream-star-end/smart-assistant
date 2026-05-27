@@ -117,6 +117,20 @@ export function buildHistoricalContextPrompt(
   return null
 }
 
+export function shouldAttemptHistoricalContextInjection(opts: {
+  alreadyInjected?: boolean
+  channel?: string
+  userTextOrBlocks: unknown
+  hasProviderResumeId?: boolean
+}): boolean {
+  return (
+    !opts.alreadyInjected &&
+    opts.channel === 'webchat' &&
+    typeof opts.userTextOrBlocks === 'string' &&
+    !opts.hasProviderResumeId
+  )
+}
+
 /**
  * Per-turn liveness watchdog 的阈值。`submit()` 内的 setInterval 每 15s 看一次
  * `Date.now() - runner.lastActivityAt`,超过这里的阈值就 reject 让 submit()
@@ -1470,11 +1484,12 @@ export class SessionManager {
       }
       let runnerPayload = userTextOrBlocks
       if (
-        !session._historicalContextInjected &&
-        session.channel === 'webchat' &&
-        session.turns > 0 &&
-        typeof userTextOrBlocks === 'string' &&
-        !this._resumeIdFor(session.sessionKey, session.providerTag)
+        shouldAttemptHistoricalContextInjection({
+          alreadyInjected: session._historicalContextInjected,
+          channel: session.channel,
+          userTextOrBlocks,
+          hasProviderResumeId: !!this._resumeIdFor(session.sessionKey, session.providerTag),
+        })
       ) {
         try {
           const clientSession = await getClientSession(session.peerId, session.userId)

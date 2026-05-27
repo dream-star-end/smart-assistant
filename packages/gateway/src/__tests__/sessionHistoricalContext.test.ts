@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildHistoricalContextPrompt } from '../sessionManager.js'
+import {
+  buildHistoricalContextPrompt,
+  shouldAttemptHistoricalContextInjection,
+} from '../sessionManager.js'
 
 test('buildHistoricalContextPrompt includes prior user/assistant turns and wraps current message', () => {
   const prompt = buildHistoricalContextPrompt(
@@ -43,4 +46,23 @@ test('buildHistoricalContextPrompt ignores non-chat/system messages', () => {
   assert.ok(prompt)
   assert.doesNotMatch(prompt!, /hidden|system notice/)
   assert.match(prompt!, /User: visible/)
+})
+
+test('shouldAttemptHistoricalContextInjection does not depend on provider-local turn count', () => {
+  assert.equal(
+    shouldAttemptHistoricalContextInjection({
+      channel: 'webchat',
+      userTextOrBlocks: '切到 codex 后继续',
+      hasProviderResumeId: false,
+    }),
+    true,
+  )
+  assert.equal(
+    shouldAttemptHistoricalContextInjection({
+      channel: 'webchat',
+      userTextOrBlocks: '原生 resume 可用时不注入',
+      hasProviderResumeId: true,
+    }),
+    false,
+  )
 })
