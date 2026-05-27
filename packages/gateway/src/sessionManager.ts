@@ -141,7 +141,10 @@ export function shouldAttemptHistoricalContextInjection(opts: {
  *     当前命中两类:(a) parser.pendingToolCalls > 0 — 工具(MCP/Bash/sub-agent)
  *     执行中;(b) currentTurnStatus === 'compacting' — CCB 在做 auto-compact,
  *     发的是一次 backend-only 总结请求,无 tool call 也无 token 流,first-token
- *     在大 context + Opus 高思考档下完全可能 > 5 min。两类同性质,共用同档。
+ *     在大 context + Opus 高思考档下完全可能 > 5 min;(c) codex-native —
+ *     GPT 5.5/Codex 高推理档在首个 reasoning/tool/text 事件前可能静默数分钟
+ *     (尤其长文档/上下文整理),且当前 Codex app-server 没有 CCB 那样的
+ *     `status=compacting` side-channel,所以按 TOOL 档保守放行。
  *   - DEFAULT_MS (5 min) — API stream / 普通 idle。子进程预期在持续吐 token
  *     或至少有 telemetry 事件刷 lastActivityAt;真静默 > 5 min 通常意味着
  *     deadlock 或 SDK 卡死,需要尽快 kill 释放 session lock。
@@ -168,8 +171,13 @@ export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 export function pickIdleTimeoutMs(
   currentTurnStatus: 'compacting' | null | undefined,
   pendingToolCalls: number,
+  providerTag?: string,
 ): number {
-  if (pendingToolCalls > 0 || currentTurnStatus === 'compacting') {
+  if (
+    pendingToolCalls > 0 ||
+    currentTurnStatus === 'compacting' ||
+    providerTag === 'codex-native'
+  ) {
     return IDLE_TIMEOUT_TOOL_MS
   }
   return IDLE_TIMEOUT_DEFAULT_MS
@@ -1532,6 +1540,7 @@ export class SessionManager {
           const threshold = pickIdleTimeoutMs(
             session.currentTurnStatus,
             parser ? parser.pendingToolCalls : 0,
+            session.providerTag,
           )
           if (idleMs > threshold) {
             reject(new Error(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))

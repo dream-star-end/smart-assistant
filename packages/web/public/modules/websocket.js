@@ -1906,6 +1906,27 @@ export function handleOutbound(frame) {
       }
     }
   }
+  // The reconnect "上一轮对话被服务重启中断" final is only a cleanup signal for
+  // a stale `_sendingInFlight` marker. If the user already clicked "继续"
+  // while the socket was reconnecting, that fresh user message is still
+  // queued locally and the synthetic final would otherwise bind to it and
+  // appear as the answer to the new turn. In that case, consume the frame as
+  // out-of-band cleanup and let the queued message drain normally.
+  if (frame.isFinal && frame.meta?.interrupted === 'service_restart') {
+    const hasQueuedUser = sess.messages.some((m) => m.role === 'user' && m.status === 'queued')
+    if (hasQueuedUser) {
+      sess._sendingInFlight = false
+      clearTurnTiming(sess)
+      resetReplyTracker(sess)
+      if (sess.id === state.currentSessionId) {
+        state.sendingInFlight = false
+        updateSendEnabled()
+        hideTypingIndicator()
+        setTitleBusy(false)
+      }
+      return
+    }
+  }
   // Early stale-final guard (best effort): drop late isFinal frames from a
   // turn the user already abandoned locally (stop / agent switch / timeout).
   // Two cases — both require `frame.ts` (server-stamped) to be present:

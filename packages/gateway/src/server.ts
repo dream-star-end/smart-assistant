@@ -6029,6 +6029,7 @@ export class Gateway {
                 text: '\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。',
               },
             ],
+            meta: { interrupted: 'service_restart' } as any,
             isFinal: true,
             ts: Date.now(),
           })

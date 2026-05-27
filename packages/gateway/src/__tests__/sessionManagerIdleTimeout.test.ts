@@ -41,6 +41,11 @@ describe("pickIdleTimeoutMs", () => {
     assert.equal(pickIdleTimeoutMs("compacting", 2), IDLE_TIMEOUT_TOOL_MS);
   });
 
+  test("codex-native 高推理/长上下文首帧前静默 → TOOL 档(15min)", () => {
+    assert.equal(pickIdleTimeoutMs(null, 0, "codex-native"), IDLE_TIMEOUT_TOOL_MS);
+    assert.equal(pickIdleTimeoutMs(undefined, 0, "codex-native"), IDLE_TIMEOUT_TOOL_MS);
+  });
+
   test("两档常量值正确(防止有人随手调小 DEFAULT)", () => {
     assert.equal(IDLE_TIMEOUT_TOOL_MS, 15 * 60_000);
     assert.equal(IDLE_TIMEOUT_DEFAULT_MS, 5 * 60_000);
