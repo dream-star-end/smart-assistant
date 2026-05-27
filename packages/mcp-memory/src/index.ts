@@ -373,6 +373,8 @@ const TOOLS = [
       '- 并行分发多个研究/分析任务',
       '- 需要隔离上下文的子任务',
       '',
+      '提示:需要让 GPT-5.5/Codex 参与时,传 `agentId="codex"`;也可直接用 `ask_gpt55_codex`。',
+      '',
       '限制: 最大递归深度 3 层,最大并发 5 个。',
     ].join('\n'),
     inputSchema: {
@@ -385,6 +387,34 @@ const TOOLS = [
           type: 'array',
           items: { type: 'string' },
           description: '限制子 agent 可用的工具集 (可选,如 ["research","browser"])',
+        },
+      },
+      required: ['goal'],
+    },
+  },
+  // ── Direct GPT-5.5 / Codex bridge ──
+  {
+    name: 'ask_gpt55_codex',
+    description: [
+      '直接调用系统内置的 GPT-5.5 / Codex agent 并等待结果返回。',
+      '',
+      '适用场景:',
+      '- 当前主模型是 DeepSeek/Claude Code(CC),但需要 GPT-5.5/Codex 做代码审查、复杂推理或第二意见。',
+      '- 用户明确要求“让 codex / gpt-5.5 看一下”。',
+      '- 你需要同步拿到 GPT-5.5 的输出后再继续整合回答。',
+      '',
+      '等价于 `delegate_task(agentId="codex", ...)`,但无需记住 agentId。',
+      '限制: 仍受委派最大递归深度 3 层、并发 5 个限制。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goal: { type: 'string', description: '要交给 GPT-5.5/Codex 完成的问题或任务' },
+        context: { type: 'string', description: '必要上下文,如代码片段、报错、你的初步判断等' },
+        toolsets: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '限制 Codex 可用工具集 (可选)',
         },
       },
       required: ['goal'],
@@ -425,6 +455,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSendToAgent(args as any)
       case 'delegate_task':
         return await handleDelegateTask(args as any)
+      case 'ask_gpt55_codex':
+        return await handleAskGpt55Codex(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -747,10 +779,35 @@ async function handleDelegateTask(args: {
   context?: string
   toolsets?: string[]
 }) {
+  return handleDelegateTaskToAgent(args.agentId || 'main', {
+    goal: args.goal,
+    context: args.context,
+    toolsets: args.toolsets,
+    label: args.agentId || 'main',
+  })
+}
+
+async function handleAskGpt55Codex(args: { goal: string; context?: string; toolsets?: string[] }) {
+  return handleDelegateTaskToAgent('codex', {
+    goal: args.goal,
+    context: args.context,
+    toolsets: args.toolsets,
+    label: 'codex / GPT-5.5',
+  })
+}
+
+async function handleDelegateTaskToAgent(
+  targetAgent: string,
+  args: {
+    goal: string
+    context?: string
+    toolsets?: string[]
+    label: string
+  },
+) {
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
   const gatewayToken = readGatewayToken()
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
-  const targetAgent = args.agentId || 'main'
   try {
     // Pass delegation depth so gateway can enforce recursion limit
     const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
@@ -779,7 +836,7 @@ async function handleDelegateTask(args: {
     if (data.error) {
       return toolError(`子 agent 执行出错: ${data.error}`)
     }
-    return toolOk(`✅ 委派完成 (agent: ${targetAgent})\n\n${data.output || '(无输出)'}`)
+    return toolOk(`✅ 委派完成 (agent: ${args.label})\n\n${data.output || '(无输出)'}`)
   } catch (err: any) {
     return toolError(`委派失败: ${err?.message ?? String(err)}`)
   }

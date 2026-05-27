@@ -35,6 +35,88 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
+type ChatHistoryMessage = {
+  role?: unknown
+  text?: unknown
+  content?: unknown
+  status?: unknown
+  system?: unknown
+}
+
+function extractHistoryText(msg: ChatHistoryMessage): string {
+  if (typeof msg.text === 'string') return msg.text
+  if (typeof msg.content === 'string') return msg.content
+  if (Array.isArray(msg.content)) {
+    return msg.content
+      .map((part) => {
+        if (part && typeof part === 'object' && 'text' in part) {
+          const text = (part as { text?: unknown }).text
+          return typeof text === 'string' ? text : ''
+        }
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+  }
+  return ''
+}
+
+function normForCompare(s: string): string {
+  return s.replace(/\s+/g, ' ').trim()
+}
+
+export function buildHistoricalContextPrompt(
+  messages: unknown[],
+  currentUserText: string,
+  opts?: { maxChars?: number; maxMessages?: number },
+): string | null {
+  const maxChars = opts?.maxChars ?? 14_000
+  const maxMessages = opts?.maxMessages ?? 40
+  const currentNorm = normForCompare(currentUserText)
+  const rows: Array<{ role: 'user' | 'assistant'; text: string; status?: unknown }> = []
+  for (const raw of messages) {
+    if (!raw || typeof raw !== 'object') continue
+    const msg = raw as ChatHistoryMessage
+    if (msg.system === true) continue
+    const role = msg.role === 'user' || msg.role === 'assistant' ? msg.role : null
+    if (!role) continue
+    const text = extractHistoryText(msg).trim()
+    if (!text) continue
+    rows.push({ role, text, status: msg.status })
+  }
+  while (rows.length > 0) {
+    const last = rows[rows.length - 1]
+    const lastNorm = normForCompare(last.text)
+    const isCurrent =
+      last.role === 'user' &&
+      (last.status === 'sending' ||
+        last.status === 'queued' ||
+        (currentNorm && (lastNorm === currentNorm || currentNorm.startsWith(lastNorm))))
+    if (!isCurrent) break
+    rows.pop()
+  }
+  let selected = rows.slice(-maxMessages)
+  while (selected.length > 0) {
+    const body = selected
+      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
+      .join('\n\n')
+    if (body.length <= maxChars) {
+      return [
+        '<openclaude_previous_context>',
+        'The current OpenClaude session was previously served by a different runner/provider or cannot be natively resumed. Use this transcript as prior conversation context. Do not restate it unless needed.',
+        body,
+        '</openclaude_previous_context>',
+        '',
+        '<current_user_message>',
+        currentUserText,
+        '</current_user_message>',
+      ].join('\n')
+    }
+    selected = selected.slice(1)
+  }
+  return null
+}
+
 /**
  * Per-turn liveness watchdog 的阈值。`submit()` 内的 setInterval 每 15s 看一次
  * `Date.now() - runner.lastActivityAt`,超过这里的阈值就 reject 让 submit()
@@ -169,6 +251,9 @@ export interface AgentSession {
    *  agents.yaml 允许 provider 字段缺省,所以这里也允许 undefined。
    */
   agentProvider?: string
+  /** Set after we prepend persisted chat history to the first provider-switch
+   *  turn. Prevents re-sending the whole transcript on every follow-up. */
+  _historicalContextInjected?: boolean
   /**
    * 当前 turn 的 backend-side 非流式阶段状态。
    *
@@ -994,17 +1079,32 @@ export class SessionManager {
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
 
+    const providerTag = SessionManager.providerTag(opts.agent.provider)
     const existing = this.sessions.get(opts.sessionKey)
     if (existing) {
-      existing.lastUsedAt = Date.now()
-      if (opts.title && (!existing.title || existing.title === 'New conversation'))
-        existing.title = opts.title
-      // Adopt a userId from a later call if the session was first created
-      // without one (e.g. cron pre-warmed, then a webchat user attached).
-      // Never *overwrite* an already-set userId — doing so would enable a
-      // different authenticated user to redirect another user's persistence.
-      if (opts.userId && !existing.userId) existing.userId = opts.userId
-      return existing
+      if (existing.providerTag !== providerTag) {
+        // Same logical client session, but the agent was switched between
+        // Claude Code and Codex. Native resume ids are provider-specific, so
+        // tear down the old runner and let the fresh one receive a compact
+        // transcript preamble on its first submit().
+        try {
+          await existing.lock
+          await existing.runner.shutdown()
+        } catch (err) {
+          log.warn('provider-switch shutdown failed', { sessionKey: opts.sessionKey }, err)
+        }
+        this.sessions.delete(opts.sessionKey)
+      } else {
+        existing.lastUsedAt = Date.now()
+        if (opts.title && (!existing.title || existing.title === 'New conversation'))
+          existing.title = opts.title
+        // Adopt a userId from a later call if the session was first created
+        // without one (e.g. cron pre-warmed, then a webchat user attached).
+        // Never *overwrite* an already-set userId — doing so would enable a
+        // different authenticated user to redirect another user's persistence.
+        if (opts.userId && !existing.userId) existing.userId = opts.userId
+        return existing
+      }
     }
     const cwd = opts.agent.cwd ?? process.cwd()
     const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
@@ -1016,7 +1116,6 @@ export class SessionManager {
     //   'exec'        — legacy `codex exec` per-turn subprocess (no token streaming)
     //   'app-server'  — `codex app-server` long-lived JSON-RPC (token-level streaming)
     // Default is 'exec' for backward compat with existing agents.yaml entries.
-    const providerTag = SessionManager.providerTag(opts.agent.provider)
     let runner: SubprocessRunner
     if (opts.agent.provider === 'codex-native') {
       // Only resume if the persisted id was produced by a codex-native runner —
@@ -1369,6 +1468,32 @@ export class SessionManager {
             : [session.sessionKey]
         session.turns = await getMaxTurnIdx(ids)
       }
+      let runnerPayload = userTextOrBlocks
+      if (
+        !session._historicalContextInjected &&
+        session.channel === 'webchat' &&
+        session.turns > 0 &&
+        typeof userTextOrBlocks === 'string' &&
+        !this._resumeIdFor(session.sessionKey, session.providerTag)
+      ) {
+        try {
+          const clientSession = await getClientSession(session.peerId, session.userId)
+          const historicalPrompt = clientSession
+            ? buildHistoricalContextPrompt(clientSession.messages, userTextOrBlocks)
+            : null
+          if (historicalPrompt) {
+            runnerPayload = historicalPrompt
+            session._historicalContextInjected = true
+            log.info('injected historical context for provider switch / non-native resume', {
+              sessionKey: session.sessionKey,
+              provider: session.providerTag,
+              messageCount: clientSession?.messages?.length ?? 0,
+            })
+          }
+        } catch (err) {
+          log.warn('historical context injection failed', { sessionKey: session.sessionKey }, err)
+        }
+      }
       // Auto-name session from first user turn
       if (session.turns === 0 && session.currentUserText) {
         const title = session.currentUserText.slice(0, 50).replace(/\s+/g, ' ').trim()
@@ -1400,7 +1525,7 @@ export class SessionManager {
       })
       try {
         await Promise.race([
-          this.runOneTurnWithRetry(session, userTextOrBlocks, onEvent, requestId, traceId),
+          this.runOneTurnWithRetry(session, runnerPayload, onEvent, requestId, traceId),
           livenessPromise,
         ])
       } finally {
