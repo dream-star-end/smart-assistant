@@ -2035,6 +2035,7 @@ export function handleOutbound(frame) {
             r === 'thinking' ||
             r === 'tool' ||
             r === 'agent-group' ||
+            r === 'plan' ||
             r === 'permission'
           ) {
             producedContent = true
@@ -2083,6 +2084,7 @@ export function handleOutbound(frame) {
             r === 'thinking' ||
             r === 'tool' ||
             r === 'agent-group' ||
+            r === 'plan' ||
             r === 'permission'
           ) {
             priorTurnHadContent = true
@@ -2572,6 +2574,18 @@ export function handleOutbound(frame) {
     if (sess._streamingThinking && sess.id === state.currentSessionId) {
       _deps.updateMessageEl(sess._streamingThinking, false)
     }
+    // Codex app-server emits plan deltas / updates as streaming `plan`
+    // blocks, but currently does not send a final `partial:false` plan
+    // notification. Finalize any visible plan card at turn end so the
+    // "开始实施" action and the current-plan drawer stay available after
+    // the response finishes.
+    for (const m of sess.messages) {
+      if (m.role === 'plan' && m._partial) {
+        m._partial = false
+        m.completedAt = Date.now()
+        if (sess.id === state.currentSessionId) _deps.updateMessageEl(m, false)
+      }
+    }
     const lastAssistant = [...sess.messages].reverse().find((m) => m.role === 'assistant')
     const preview = lastAssistant?.text?.replace(/[`*_#>]/g, '').trim() || ''
     if (preview) maybeNotify(`OpenClaude · ${sess.title}`, preview)
@@ -2670,7 +2684,7 @@ export function handleOutbound(frame) {
       for (let i = _targetIdx + 1; i < sess.messages.length; i++) {
         const m = sess.messages[i]
         if (m.role === 'assistant' || m.role === 'thinking' || m.role === 'tool' ||
-            m.role === 'agent-group' || m.role === 'permission') {
+            m.role === 'agent-group' || m.role === 'plan' || m.role === 'permission') {
           _producedContent = true
         }
         if (m.role === 'assistant' && typeof m.text === 'string') {

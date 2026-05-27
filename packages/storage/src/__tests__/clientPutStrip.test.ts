@@ -97,6 +97,36 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     assert.equal(cleaned?._modelText, 'photo! [image]')
   })
 
+  it('preserves codex plan fields for refresh-stable plan cards', () => {
+    const cleaned = _stripClientPutMessage({
+      id: 'plan-1',
+      role: 'plan',
+      text: '',
+      explanation: '需要先确认计划',
+      steps: [
+        { step: '确认问题', status: 'completed' },
+        { step: '修复 UI', status: 'inProgress' },
+      ],
+      blockId: 'codex-plan',
+      ts: 123,
+      completedAt: 456,
+      _partial: false,
+    })
+    assert.deepEqual(cleaned, {
+      id: 'plan-1',
+      role: 'plan',
+      text: '',
+      explanation: '需要先确认计划',
+      steps: [
+        { step: '确认问题', status: 'completed' },
+        { step: '修复 UI', status: 'inProgress' },
+      ],
+      blockId: 'codex-plan',
+      ts: 123,
+      completedAt: 456,
+    })
+  })
+
   it('preserves status sending/queued/sent/read but drops "replied"', () => {
     for (const ok of ['sending', 'queued', 'sent', 'read']) {
       const c = _stripClientPutMessage({ id: 'x', role: 'user', text: '', ts: 1, status: ok })

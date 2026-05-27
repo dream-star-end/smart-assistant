@@ -658,6 +658,10 @@ export type UpsertClientSessionResult = 'applied' | 'rejected_stale' | 'oversize
 const CLIENT_PUT_ALLOWED_FIELDS: ReadonlySet<string> = new Set<string>([
   // identity / content
   'id', 'role', 'text', 'ts', 'createdAt', 'completedAt',
+  // Codex app-server plan cards (client-authored live plan rows).
+  // These must survive PUT/refresh; otherwise the card body disappears once
+  // server-side strip normalizes the session row.
+  'explanation', 'steps',
   // child blocks (subagent groupings, thinking inside assistants, etc.)
   'childBlocks', 'agentName', 'agentId',
   // tool messages
