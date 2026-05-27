@@ -26,6 +26,7 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   symlinkSync,
   unlinkSync,
@@ -183,31 +184,40 @@ try {
   );
 }
 
-// ── codex system skills seed(image_gen 等内建 tool 必需)──
+// ── codex system skills seed(image_gen / document-writing 等内建 tool 必需)──
 // codex 0.125 把 image_gen 等内建工具实现成 `~/.codex/skills/.system/imagegen/`
 // system skill。codex CLI 启动时会 populate 这个目录,但实测耗时 1-2s,
 // gateway lazy-spawn codex 接到首个 turn 时 populate 还没好,enumerate tools
 // 看不到 imagegen → 用户问"画图"时 codex 自答 "没有 image_gen 工具"。
 //
 // build 阶段 Dockerfile 已把 populate 出来的 skills 放到 /opt/codex-system-skills,
-// 这里把它 copy 到 CODEX_HOME/skills/(idempotent — imagegen/SKILL.md 已存在则跳过),
-// 让首个 turn 就能看到 imagegen。
+// 并叠加 OpenClaude runtime 自带的 Codex native system skill(如 document-writing)。
+// 这里逐 skill copy 到 CODEX_HOME/skills/.system/(idempotent — 已存在则跳过),
+// 让首个 turn 就能看到系统 skill,且已有用户 volume 也能在镜像升级后补到新增 skill。
 //
-// 失败 non-fatal — image_gen 不可用不该挂掉容器(用户其它 codex 功能仍可用)。
+// 注意:这不是让 Codex 用 `~/.codex/skills` 管理 OpenClaude 平台记忆/用户 skill;
+// 平台状态仍通过 openclaude_memory MCP。这里仅用于 Codex native system skill surface。
+//
+// 失败 non-fatal — 某个 Codex system skill 不可用不该挂掉容器。
 const BAKED_SKILLS = "/opt/codex-system-skills";
 const TARGET_SKILLS = join(CODEX_HOME_DIR, "skills");
 try {
-  const targetImagegen = join(TARGET_SKILLS, ".system", "imagegen", "SKILL.md");
-  const bakedMarker = join(
-    BAKED_SKILLS,
-    ".system",
-    ".codex-system-skills.marker",
-  );
-  if (!existsSync(targetImagegen) && existsSync(bakedMarker)) {
-    cpSync(BAKED_SKILLS, TARGET_SKILLS, {
-      recursive: true,
-      preserveTimestamps: true,
-    });
+  const bakedSystemSkills = join(BAKED_SKILLS, ".system");
+  const targetSystemSkills = join(TARGET_SKILLS, ".system");
+  if (existsSync(bakedSystemSkills)) {
+    mkdirSync(targetSystemSkills, { recursive: true });
+    for (const entry of readdirSync(bakedSystemSkills, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const sourceDir = join(bakedSystemSkills, entry.name);
+      const sourceSkillMd = join(sourceDir, "SKILL.md");
+      const targetDir = join(targetSystemSkills, entry.name);
+      const targetSkillMd = join(targetDir, "SKILL.md");
+      if (!existsSync(sourceSkillMd) || existsSync(targetSkillMd)) continue;
+      cpSync(sourceDir, targetDir, {
+        recursive: true,
+        preserveTimestamps: true,
+      });
+    }
   }
 } catch (e) {
   console.error(

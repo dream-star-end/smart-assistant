@@ -52,7 +52,7 @@ ENV TZ=Asia/Shanghai \
 
 # 必装工具(精挑,避免镜像膨胀):
 #   - git / curl / ca-certificates: 个人版 ccb subprocess + 网络请求基本依赖
-#   - ripgrep / jq: 个人版 grep tool / 通用 shell 工具链
+#   - ripgrep / jq / unzip: 个人版 grep tool / 通用 shell 工具链; unzip 也用于 DOCX smoke/验证
 #   - tini: PID 1 转发 SIGTERM 给 entrypoint,避免 zombie
 #   - bash: entrypoint.sh 用 bash
 #   - sudo: 见下方 sudoers 段。agent 用户 NOPASSWD ALL,因为 codex 频繁需要
@@ -70,6 +70,7 @@ RUN apt-get update \
         ca-certificates \
         ripgrep \
         jq \
+        unzip \
         tini \
         bash \
         sudo \
@@ -88,6 +89,40 @@ RUN apt-get update \
         | grep -v '^/usr/bin/sudo$' \
         | xargs -r chmod u-s \
     && find / -xdev -perm -2000 -type f 2>/dev/null | xargs -r chmod g-s
+
+# ------------------------------------------------------------
+# Document generation toolchain — Pandoc/Quarto -> DOCX
+# ------------------------------------------------------------
+# 用户投诉 agent 生成 Word 排版差(尤其公式)后,商用版运行时内置一条
+# source-first 文档管线:Markdown/Quarto + LaTeX math → Pandoc/Quarto →
+# Word DOCX。Quarto 官方 Linux .deb 内置 Pandoc,这里用固定版本 + SHA256
+# 校验,避免 build 时漂移;再提供 `pandoc` wrapper 指到 `quarto pandoc`,
+# 让用户/skill 可以直接调用 pandoc CLI。
+ARG QUARTO_VERSION=1.9.37
+ARG QUARTO_SHA256=98aad03c8ce11705caa7c48b8f6ea59f6ab02d1579e754ddb530c0f2e7b471c6
+RUN set -eux; \
+    curl -fsSL --retry 3 -o /tmp/quarto.deb \
+      "https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.deb"; \
+    echo "${QUARTO_SHA256}  /tmp/quarto.deb" | sha256sum -c -; \
+    dpkg -i /tmp/quarto.deb; \
+    rm -f /tmp/quarto.deb; \
+    ln -sf /opt/quarto/bin/quarto /usr/local/bin/quarto; \
+    printf '%s\n' '#!/usr/bin/env bash' 'exec /opt/quarto/bin/quarto pandoc "$@"' > /usr/local/bin/pandoc; \
+    chmod 0755 /usr/local/bin/pandoc; \
+    quarto --version; \
+    pandoc --version | head -2
+
+COPY --chown=root:root ./runtime/oc-docx.sh /usr/local/bin/oc-docx
+COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/lib/openclaude/create-docgen-reference.py; \
+    python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
+    printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
+    oc-docx /tmp/oc-docx-smoke.md -o /tmp/oc-docx-smoke.docx; \
+    test -s /tmp/oc-docx-smoke.docx; \
+    unzip -tq /tmp/oc-docx-smoke.docx; \
+    unzip -p /tmp/oc-docx-smoke.docx word/document.xml | grep -q 'm:oMath'; \
+    rm -f /tmp/oc-docx-smoke.md /tmp/oc-docx-smoke.docx
 
 # ------------------------------------------------------------
 # Codex CLI(@openai/codex)— 跑 GPT 系模型用 app-server JSON-RPC runner
@@ -123,7 +158,7 @@ RUN npm install -g @openai/codex@0.133.0 --no-audit --no-fund \
     && rm -rf /root/.npm
 
 # ------------------------------------------------------------
-# Codex system skills 预 populate(image_gen / openai-docs / ...)
+# Codex system skills 预 populate(image_gen / openai-docs / document-writing / ...)
 # ------------------------------------------------------------
 # codex 0.125 的内建 image_gen 工具是通过 `~/.codex/skills/.system/imagegen/`
 # system skill 暴露的;codex CLI 启动时会从 binary 内嵌资源 populate 这个目录,
@@ -133,10 +168,13 @@ RUN npm install -g @openai/codex@0.133.0 --no-audit --no-fund \
 #
 # 解决:build 阶段以 root 跑一次 codex app-server 触发 populate,把生成的
 # skills/ 整体移到镜像内固定路径 /opt/codex-system-skills/(所有人可读),
-# entrypoint 容器启动时 cp 到 /home/agent/.codex/skills/ —— 详见
-# runtime/entrypoint.ts 的 codex skills seed 段。
+# 并叠加 OpenClaude runtime 自带的 Codex native system skill(document-writing)。
+# entrypoint 容器启动时逐 skill seed 到 /home/agent/.codex/skills/ —— 详见
+# runtime/entrypoint.ts 的 codex skills seed 段。逐 skill seed 是为了已有用户 volume
+# 里已经有 imagegen 时,仍能补进新增的 document-writing。
 #
 # 失败兜底:populate 后的 marker 文件必须存在,否则 build fail(避免发坏镜像)。
+COPY --chown=root:root ./runtime/codex-system-skills/document-writing/SKILL.md /tmp/codex-system-skills/document-writing/
 RUN mkdir -p /tmp/_cx/.codex && \
     HOME=/tmp/_cx CODEX_HOME=/tmp/_cx/.codex bash -c '\
       codex app-server --listen stdio:// </dev/null >/dev/null 2>&1 & \
@@ -150,6 +188,8 @@ RUN mkdir -p /tmp/_cx/.codex && \
     ' && \
     test -f /tmp/_cx/.codex/skills/.system/.codex-system-skills.marker && \
     cp -a /tmp/_cx/.codex/skills /opt/codex-system-skills && \
+    mkdir -p /opt/codex-system-skills/.system/document-writing && \
+    cp /tmp/codex-system-skills/document-writing/SKILL.md /opt/codex-system-skills/.system/document-writing/SKILL.md && \
     rm -rf /tmp/_cx && \
     chmod -R a+rX /opt/codex-system-skills && \
     test -f /opt/codex-system-skills/.system/.codex-system-skills.marker
