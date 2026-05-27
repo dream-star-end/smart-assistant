@@ -1041,12 +1041,32 @@ function _buildBindFrame(sessionId, selectionVersion) {
 function _buildHelloFrame({ includeInFlight = true } = {}) {
   const peers = []
   for (const [pid, s] of state.sessions) {
-    peers.push({
-      peerId: pid,
-      agentId: s.agentId || state.defaultAgentId,
-      inFlight: includeInFlight ? !!s._sendingInFlight : false,
-      lastFrameSeq: s._lastFrameSeq || 0,
-    })
+    const safeId = String(pid).replace(/[^a-zA-Z0-9_-]/g, '_')
+    const emitted = new Set()
+    const pushPeer = (agentId, lastFrameSeq) => {
+      const aid = (typeof agentId === 'string' && agentId) ? agentId : (s.agentId || state.defaultAgentId || 'main')
+      if (emitted.has(aid)) return
+      emitted.add(aid)
+      peers.push({
+        peerId: pid,
+        agentId: aid,
+        inFlight: includeInFlight ? !!s._sendingInFlight : false,
+        lastFrameSeq: Number.isFinite(lastFrameSeq) ? lastFrameSeq : 0,
+      })
+    }
+
+    const byKey = s?._lastFrameSeqByKey
+    if (byKey && typeof byKey === 'object') {
+      for (const [key, seq] of Object.entries(byKey)) {
+        const m = key.match(/^agent:([^:]+):webchat:dm:(.+)$/)
+        if (!m || m[2] !== safeId) continue
+        pushPeer(m[1], seq)
+      }
+    }
+    // Always include the currently selected/default agent registration even if
+    // this tab has only seen frames from another provider. The bridge/container
+    // uses hello peers both for replay and for live client registration.
+    pushPeer(s.agentId || state.defaultAgentId || 'main', _lastFrameSeqForHelloPeer(s))
   }
   return JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers })
 }
@@ -1817,6 +1837,55 @@ export function buildToolUseLabel(block) {
   const body = preview ? `  ${preview}${ellipsis}` : block.partial ? '  …' : ''
   return name + body
 }
+
+function _safeSessionKeyForAgent(sess, agentId) {
+  const aid = (typeof agentId === 'string' && agentId) ? agentId : (sess?.agentId || state.defaultAgentId || 'main')
+  const safeId = String(sess?.id || '').replace(/[^a-zA-Z0-9_-]/g, '_')
+  return `agent:${aid}:webchat:dm:${safeId}`
+}
+
+function _frameSeqKey(frame, sess) {
+  return (typeof frame?.sessionKey === 'string' && frame.sessionKey)
+    ? frame.sessionKey
+    : `peer:${sess?.id || ''}`
+}
+
+function _getFrameSeqCursor(sess, key) {
+  const byKey = sess?._lastFrameSeqByKey
+  if (byKey && typeof byKey === 'object' && Number.isFinite(byKey[key])) return byKey[key]
+  // Legacy/no-sessionKey frames used a single peer-level cursor. Do not apply
+  // that global cursor to agent-scoped sessionKeys: commercial v3 can stream
+  // main/deepseek and codex turns into the same UI peer, and each container
+  // gateway sessionKey has its own frameSeq that may legitimately restart at 1.
+  return key && key.startsWith('peer:') ? (sess?._lastFrameSeq || 0) : 0
+}
+
+function _setFrameSeqCursor(sess, key, seq) {
+  if (!sess || !key || !Number.isFinite(seq)) return
+  if (!sess._lastFrameSeqByKey || typeof sess._lastFrameSeqByKey !== 'object') sess._lastFrameSeqByKey = {}
+  sess._lastFrameSeqByKey[key] = seq
+  // Keep the legacy field for old code/old stored sessions, but new dedupe and
+  // hello cursors must use the per-sessionKey map above.
+  sess._lastFrameSeq = Math.max(sess._lastFrameSeq || 0, seq)
+}
+
+function _lastFrameSeqForHelloPeer(sess) {
+  const key = _safeSessionKeyForAgent(sess, sess?.agentId || state.defaultAgentId || 'main')
+  const byKey = sess?._lastFrameSeqByKey
+  return byKey && typeof byKey === 'object' && Number.isFinite(byKey[key]) ? byKey[key] : 0
+}
+
+function _acceptFrameSeq(sess, frame, traceDrop) {
+  if (!(typeof frame?.frameSeq === 'number' && frame.frameSeq > 0)) return true
+  const key = _frameSeqKey(frame, sess)
+  const last = _getFrameSeqCursor(sess, key)
+  if (frame.frameSeq <= last) {
+    if (traceDrop) traceDrop(frame.frameSeq, last, key)
+    return false
+  }
+  _setFrameSeqCursor(sess, key, frame.frameSeq)
+  return true
+}
 export function handleOutbound(frame) {
   const peerId = frame.peer?.id
   let sess = peerId ? state.sessions.get(peerId) : null
@@ -1849,14 +1918,9 @@ export function handleOutbound(frame) {
   // if multiple tabs resume concurrently or a quick flap duplicates deliveries
   // we reject anything we've already processed. Update the cursor only on
   // strictly-forward frames so out-of-order deliveries never regress it.
-  if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
-    const last = sess._lastFrameSeq || 0
-    if (frame.frameSeq <= last) {
-      trace('ws.frame.drop', { sess: sess.id, reason: 'dedupe', seq: frame.frameSeq, lastSeq: last })
-      return // already processed — drop silently
-    }
-    sess._lastFrameSeq = frame.frameSeq
-  }
+  if (!_acceptFrameSeq(sess, frame, (seq, lastSeq, key) => {
+    trace('ws.frame.drop', { sess: sess.id, reason: 'dedupe', seq, lastSeq, seqKey: key })
+  })) return
   // P1-3 双帧抑制 — 后端在已识别 error 场景下连发两帧:
   //   1) outbound.error (frameSeq=N, 走 handleOutboundError, 设置
   //      sess._suppressErrorBubbleAtSeq = N+1)
@@ -2785,7 +2849,7 @@ function handleResumeFailed(frame) {
       //     frame, so any late frames ≤ frameTo that triggered this
       //     resume_failed are dropped (we'll get authoritative state from
       //     REST) and future frames (seq > frameTo) are accepted normally.
-      sess._lastFrameSeq = frameTo
+      _setFrameSeqCursor(sess, _frameSeqKey(frame, sess), frameTo)
       // Phase 0.4 P1-1: instead of force-clearing _sendingInFlight (which
       // would lie about a still-running long REPL turn in buffer_miss
       // cases), flag the live stream as known-broken. syncSessionsFromServer
@@ -3061,11 +3125,7 @@ function handleOutboundTurnStatus(frame) {
   const sess = peerId ? state.sessions.get(peerId) : null
   if (!sess) return
   // frameSeq dedupe — 与 handleOutbound 同语义。ring replay 时本帧会重发,这里去重。
-  if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
-    const last = sess._lastFrameSeq || 0
-    if (frame.frameSeq <= last) return
-    sess._lastFrameSeq = frame.frameSeq
-  }
+  if (!_acceptFrameSeq(sess, frame)) return
   // turn_status 是 session liveness signal — 跟 outbound.message 同语义刷 _lastFrameAt。
   // 进入 compacting 时刷 → "0s 无新数据" 重新起算(typing-indicator 走 compacting 分支
   // 时不显示 silence 数,但 cache 有意义,因为 status:null 帧也走这条路径)。退出
@@ -3102,9 +3162,7 @@ function handleOutboundError(frame) {
   if (!sess) return
   // frameSeq dedupe
   if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
-    const last = sess._lastFrameSeq || 0
-    if (frame.frameSeq <= last) return
-    sess._lastFrameSeq = frame.frameSeq
+    if (!_acceptFrameSeq(sess, frame)) return
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1
   }
   addMessage(sess, 'assistant', frame.message || '出错了', {
@@ -3128,11 +3186,7 @@ function handlePermissionRequest(frame) {
   // ring (so a reconnecting tab can replay missed approval prompts). Reject
   // anything we've already processed; update cursor only on strictly-forward
   // frames so out-of-order resume deliveries never regress it.
-  if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
-    const last = sess._lastFrameSeq || 0
-    if (frame.frameSeq <= last) return // already processed — drop silently
-    sess._lastFrameSeq = frame.frameSeq
-  }
+  if (!_acceptFrameSeq(sess, frame)) return // already processed — drop silently
 
   // Add a permission card to the chat
   const msg = addMessage(sess, 'permission', frame.toolName, {
@@ -3652,11 +3706,7 @@ function handlePermissionSettled(frame) {
   // Gateway now stamps permission_settled + stores in the outbound ring; a
   // reconnect can replay an already-applied settlement. Drop forward-only
   // duplicates so we don't re-overwrite `_resolved` state with stale data.
-  if (typeof frame.frameSeq === 'number' && frame.frameSeq > 0) {
-    const last = sess._lastFrameSeq || 0
-    if (frame.frameSeq <= last) return
-    sess._lastFrameSeq = frame.frameSeq
-  }
+  if (!_acceptFrameSeq(sess, frame)) return
   const msg = sess.messages.find((m) => m.requestId === frame.requestId)
   if (!msg) return
   msg._resolved = true
