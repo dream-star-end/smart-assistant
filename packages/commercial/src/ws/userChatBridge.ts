@@ -336,6 +336,18 @@ export interface UserChatBridgeDeps {
     role: "user" | "admin",
   ) => Promise<(modelId: string) => boolean>;
   /**
+   * Commercial v3 authority for browser chat history lives in master's
+   * SQLite, not inside the per-user container. When a browser session switches
+   * between providers (e.g. DeepSeek/CCB → Codex native), the container needs
+   * a bounded transcript preamble to bridge the provider-local resume gap.
+   * The dep returns the raw master messages; this bridge strips/caps them
+   * before attaching the private `_masterHistoricalMessages` field.
+   */
+  loadMasterSessionMessages?: (
+    uid: bigint,
+    sessionId: string,
+  ) => Promise<unknown[] | null>;
+  /**
    * plan v3 G5/G7 — codex per-account 并发槽 + 严格单飞 acquire/release。
    *
    * 调用契约:
@@ -482,6 +494,8 @@ const AGENT_AUTHZ_IMPLIED_MODEL: Record<string, string> = {
  * 真实扣费由 finalizer 拿真 usage 重算。
  */
 const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000;
+const MASTER_HISTORY_MAX_MESSAGES = 48;
+const MASTER_HISTORY_MAX_CHARS = 18_000;
 
 /**
  * PR2 v1.0.66 — user WS close 后等 codex billing 帧的 drain 窗口。
@@ -585,6 +599,55 @@ function rawDataLen(data: RawData): number {
   if (data instanceof ArrayBuffer) return data.byteLength;
   if (Array.isArray(data)) return data.reduce((acc, b) => acc + b.length, 0);
   return 0;
+}
+
+function extractMasterHistoryText(msg: Record<string, unknown>): string {
+  if (typeof msg.text === "string") return msg.text;
+  if (typeof msg.content === "string") return msg.content;
+  if (Array.isArray(msg.content)) {
+    return msg.content
+      .map((part) => {
+        if (part && typeof part === "object") {
+          const text = (part as { text?: unknown }).text;
+          return typeof text === "string" ? text : "";
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+export function _sanitizeMasterHistoricalMessagesForFrame(
+  rawMessages: unknown[],
+  opts: { maxMessages?: number; maxChars?: number } = {},
+): Array<Record<string, unknown>> {
+  const maxMessages = opts.maxMessages ?? MASTER_HISTORY_MAX_MESSAGES;
+  const maxChars = opts.maxChars ?? MASTER_HISTORY_MAX_CHARS;
+  const rows: Array<Record<string, unknown>> = [];
+  for (const raw of rawMessages) {
+    if (!raw || typeof raw !== "object") continue;
+    const msg = raw as Record<string, unknown>;
+    const role = msg.role === "user" || msg.role === "assistant" ? msg.role : null;
+    if (!role) continue;
+    if (msg.system === true) continue;
+    const text = extractMasterHistoryText(msg).trim();
+    if (!text) continue;
+    const out: Record<string, unknown> = { role, text };
+    if (typeof msg.id === "string") out.id = msg.id;
+    if (typeof msg.status === "string") out.status = msg.status;
+    if (typeof msg.ts === "number") out.ts = msg.ts;
+    rows.push(out);
+  }
+
+  let selected = rows.slice(-maxMessages);
+  while (selected.length > 0) {
+    const chars = selected.reduce((sum, m) => sum + String(m.text ?? "").length, 0);
+    if (chars <= maxChars) break;
+    selected = selected.slice(1);
+  }
+  return selected;
 }
 
 function sendErrorFrame(ws: WebSocket, code: string, message: string): void {
@@ -1222,6 +1285,41 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     // ---------- 双向 pipe handlers ----------
 
+    const attachMasterHistoricalMessages = async (
+      frameObj: Record<string, unknown>,
+      turnLog: Logger | null,
+    ): Promise<Record<string, unknown>> => {
+      if (!deps.loadMasterSessionMessages) return frameObj;
+      const peer = frameObj.peer;
+      const peerId =
+        peer && typeof peer === "object"
+          ? (peer as { id?: unknown }).id
+          : undefined;
+      if (typeof peerId !== "string" || peerId.length === 0) return frameObj;
+      try {
+        const raw = await deps.loadMasterSessionMessages(uid, peerId);
+        const historical = Array.isArray(raw)
+          ? _sanitizeMasterHistoricalMessagesForFrame(raw)
+          : [];
+        if (historical.length === 0) return frameObj;
+        turnLog?.info("user-chat-bridge: attached master history", {
+          sessionId: peerId,
+          messageCount: historical.length,
+        });
+        return {
+          ...frameObj,
+          _masterHistoricalMessages: historical,
+        };
+      } catch (err) {
+        // Fail-open: history bridging is UX context, not authz/billing.
+        turnLog?.warn("user-chat-bridge: load master history failed", {
+          sessionId: peerId,
+          err,
+        });
+        return frameObj;
+      }
+    };
+
     const onUserMessage = (data: RawData, isBinary: boolean): void => {
       const len = rawDataLen(data);
       if (len > maxFrameBytes) {
@@ -1838,8 +1936,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 把这个 requestId 透传到 outbound.codex_billing,master 用它从
               // inflightCodexTurns Map 找回 finalizer 落账。
               // CG2a — 同时注入 master canonical traceId(IIFE 起手 invariant 保证非 null)
+              const enrichedParsed = await attachMasterHistoricalMessages(
+                inboundParsedCapture,
+                turnLogCapture,
+              );
+              if (cleaned) {
+                await abortInflightJournal(
+                  pgPool,
+                  requestId,
+                  "bridge_disconnect_before_forward",
+                ).catch(() => {});
+                await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+                releaseAcquiredSlotForFailure();
+                return;
+              }
               const rewrittenObj = {
-                ...inboundParsedCapture,
+                ...enrichedParsed,
                 requestId,
                 traceId: turnTraceIdCapture,
               };
@@ -1871,8 +1983,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             } else {
               // CG2a — billing 未启用(legacy NULL 容器无三件套 / 测试)路径仍要 rewrite
               // 注入 traceId(合同硬门);不动 requestId(client 提供的 requestId 保留 raw)。
+              const enrichedParsed = await attachMasterHistoricalMessages(
+                inboundParsedCapture,
+                turnLogCapture,
+              );
+              if (cleaned) {
+                releaseAcquiredSlotForFailure();
+                return;
+              }
               const rewrittenObj = {
-                ...inboundParsedCapture,
+                ...enrichedParsed,
                 traceId: turnTraceIdCapture,
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
@@ -1954,27 +2074,37 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 只用作 best-effort 日志(optional chain),不参与 trace gate;真正的 gate 仍是
       // inboundParsedFrame !== null && turnTraceIdForFrame !== null 这对同步生成的双胞胎。
       if (inboundParsedFrame !== null && turnTraceIdForFrame !== null) {
-        const rewrittenObj = {
-          ...inboundParsedFrame,
-          traceId: turnTraceIdForFrame,
-        };
-        const rewrittenStr = JSON.stringify(rewrittenObj);
-        const rewrittenLen = Buffer.byteLength(rewrittenStr);
-        if (rewrittenLen > maxFrameBytes) {
-          turnLogForFrame?.error("user-chat-bridge: rewritten inbound frame too big", {
-            rewrittenLen, max: maxFrameBytes,
-          });
-          if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-            sendErrorFrame(
-              userWs,
-              "ERR_FRAME_TOO_BIG",
-              `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
-            );
-            try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+        const inboundParsedCapture = inboundParsedFrame;
+        const turnTraceIdCapture = turnTraceIdForFrame;
+        const turnLogCapture = turnLogForFrame;
+        void (async () => {
+          const enrichedParsed = await attachMasterHistoricalMessages(
+            inboundParsedCapture,
+            turnLogCapture,
+          );
+          if (cleaned) return;
+          const rewrittenObj = {
+            ...enrichedParsed,
+            traceId: turnTraceIdCapture,
+          };
+          const rewrittenStr = JSON.stringify(rewrittenObj);
+          const rewrittenLen = Buffer.byteLength(rewrittenStr);
+          if (rewrittenLen > maxFrameBytes) {
+            turnLogCapture?.error("user-chat-bridge: rewritten inbound frame too big", {
+              rewrittenLen, max: maxFrameBytes,
+            });
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(
+                userWs,
+                "ERR_FRAME_TOO_BIG",
+                `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
+              );
+              try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+            }
+            return;
           }
-          return;
-        }
-        forwardInboundFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+          forwardInboundFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+        })();
         return;
       }
       forwardInboundFrame(data, isBinary, len);

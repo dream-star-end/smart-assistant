@@ -6083,6 +6083,10 @@ export class Gateway {
       return
     }
 
+    const masterHistoricalMessages = Array.isArray((frame as any)._masterHistoricalMessages)
+      ? ((frame as any)._masterHistoricalMessages as unknown[])
+      : undefined
+
     // ── V3 S12e CG7 — mint per-turn trace id ──
     // Placed AFTER duplicate idempotency return(dup doesn't open a new turn → no
     // turnTraceId concept)but BEFORE rate-limit so that the rate-limit early-
@@ -6940,7 +6944,9 @@ export class Gateway {
           adapter,
         )
       }
-    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, safeConversationMode)
+    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, safeConversationMode, {
+      historicalMessages: masterHistoricalMessages,
+    })
   }
 
   /**

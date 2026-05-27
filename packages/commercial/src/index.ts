@@ -120,6 +120,7 @@ import {
   appendCostCredits,
   appendServerAuthoredMessage,
   appendServerAuthoredMessageForRequest,
+  getClientSession,
   // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
   upsertMasterClientSession,
   softDeleteMasterSession,
@@ -130,6 +131,7 @@ import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
 } from "./wechat/outboundReceiver.js";
+import { MASTER_USER_PREFIX } from "./wechat/userIds.js";
 import {
   LITERATURE_SEARCH_PATH,
   makeLiteratureProxyHandler,
@@ -2226,6 +2228,10 @@ export async function registerCommercial(
       const grantedSet = new Set(grants.map((g) => g.model_id));
       return (modelId: string) =>
         canUseModel({ pricing }, { role, grantedModelIds: grantedSet, modelId });
+    },
+    loadMasterSessionMessages: async (uid, sessionId) => {
+      const session = await getClientSession(sessionId, MASTER_USER_PREFIX + uid.toString());
+      return session?.messages ?? null;
     },
     // plan v3 G5/G7 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
     // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。

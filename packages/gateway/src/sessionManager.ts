@@ -65,6 +65,48 @@ function normForCompare(s: string): string {
   return s.replace(/\s+/g, ' ').trim()
 }
 
+function latestAssistantMessageId(messages: unknown[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const raw = messages[i]
+    if (!raw || typeof raw !== 'object') continue
+    const msg = raw as ChatHistoryMessage & { id?: unknown }
+    if (msg.system === true) continue
+    if (msg.role !== 'assistant') continue
+    const id = typeof msg.id === 'string' ? msg.id : ''
+    return id || null
+  }
+  return null
+}
+
+export function shouldTreatMasterHistoryAsProviderGap(opts: {
+  messages: unknown[]
+  peerId: string
+  agentId: string
+}): boolean {
+  const latestAssistantId = latestAssistantMessageId(opts.messages)
+  if (!latestAssistantId) return false
+  return !latestAssistantId.startsWith(`srv-${opts.peerId}-${opts.agentId}-t`)
+}
+
+export function historicalContextInjectionKey(opts: {
+  messages: unknown[] | null | undefined
+  peerId: string
+  agentId: string
+  hasProviderResumeId?: boolean
+}): string | null {
+  const messages = Array.isArray(opts.messages) ? opts.messages : []
+  if (messages.length === 0) return opts.hasProviderResumeId ? null : 'local:no-provider-resume'
+  const latestAssistantId = latestAssistantMessageId(messages)
+  if (latestAssistantId && shouldTreatMasterHistoryAsProviderGap({
+    messages,
+    peerId: opts.peerId,
+    agentId: opts.agentId,
+  })) {
+    return `master:${latestAssistantId}`
+  }
+  return opts.hasProviderResumeId ? null : `master:${latestAssistantId ?? 'no-assistant'}`
+}
+
 export function buildHistoricalContextPrompt(
   messages: unknown[],
   currentUserText: string,
@@ -119,16 +161,16 @@ export function buildHistoricalContextPrompt(
 
 export function shouldAttemptHistoricalContextInjection(opts: {
   alreadyInjected?: boolean
+  lastInjectedKey?: string | null
+  injectionKey?: string | null
   channel?: string
   userTextOrBlocks: unknown
   hasProviderResumeId?: boolean
 }): boolean {
-  return (
-    !opts.alreadyInjected &&
-    opts.channel === 'webchat' &&
-    typeof opts.userTextOrBlocks === 'string' &&
-    !opts.hasProviderResumeId
-  )
+  if (opts.channel !== 'webchat') return false
+  if (typeof opts.userTextOrBlocks !== 'string') return false
+  if (opts.injectionKey) return opts.lastInjectedKey !== opts.injectionKey
+  return !opts.alreadyInjected && !opts.hasProviderResumeId
 }
 
 /**
@@ -276,6 +318,11 @@ export interface AgentSession {
   /** Set after we prepend persisted chat history to the first provider-switch
    *  turn. Prevents re-sending the whole transcript on every follow-up. */
   _historicalContextInjected?: boolean
+  /** Stable key for the last master-history transcript preamble injected.
+   *  Lets Codex native receive newly-produced DeepSeek/CCB turns after the
+   *  user switches away and later returns to GPT, while avoiding a repeated
+   *  full transcript on ordinary same-provider follow-ups. */
+  _historicalContextInjectedKey?: string
   /**
    * 当前 turn 的 backend-side 非流式阶段状态。
    *
@@ -1386,6 +1433,7 @@ export class SessionManager {
     /** Codex-native app-server only. Omitted means default mode so a previous
      *  plan-only turn cannot leak into ordinary follow-up turns. */
     conversationMode?: 'default' | 'plan',
+    opts?: { historicalMessages?: unknown[] },
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
@@ -1491,26 +1539,44 @@ export class SessionManager {
         session.turns = await getMaxTurnIdx(ids)
       }
       let runnerPayload = userTextOrBlocks
+      const masterHistoricalMessages = Array.isArray(opts?.historicalMessages)
+        ? opts.historicalMessages
+        : null
+      const providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag)
+      const injectionKey = historicalContextInjectionKey({
+        messages: masterHistoricalMessages,
+        peerId: session.peerId,
+        agentId: session.agentId,
+        hasProviderResumeId: !!providerResumeId,
+      })
       if (
         shouldAttemptHistoricalContextInjection({
           alreadyInjected: session._historicalContextInjected,
+          lastInjectedKey: session._historicalContextInjectedKey,
+          injectionKey,
           channel: session.channel,
           userTextOrBlocks,
-          hasProviderResumeId: !!this._resumeIdFor(session.sessionKey, session.providerTag),
+          hasProviderResumeId: !!providerResumeId,
         })
       ) {
         try {
-          const clientSession = await getClientSession(session.peerId, session.userId)
-          const historicalPrompt = clientSession
-            ? buildHistoricalContextPrompt(clientSession.messages, userTextOrBlocks)
+          const historyMessages =
+            masterHistoricalMessages ??
+            (await getClientSession(session.peerId, session.userId))?.messages ??
+            null
+          const historicalPrompt = historyMessages && typeof userTextOrBlocks === 'string'
+            ? buildHistoricalContextPrompt(historyMessages, userTextOrBlocks)
             : null
           if (historicalPrompt) {
             runnerPayload = historicalPrompt
             session._historicalContextInjected = true
+            session._historicalContextInjectedKey = injectionKey ?? 'local:no-provider-resume'
             log.info('injected historical context for provider switch / non-native resume', {
               sessionKey: session.sessionKey,
               provider: session.providerTag,
-              messageCount: clientSession?.messages?.length ?? 0,
+              source: masterHistoricalMessages ? 'master-frame' : 'local-storage',
+              injectionKey: session._historicalContextInjectedKey,
+              messageCount: Array.isArray(historyMessages) ? historyMessages.length : 0,
             })
           }
         } catch (err) {

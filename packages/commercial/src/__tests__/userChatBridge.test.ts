@@ -29,6 +29,7 @@ import {
   BRIDGE_WS_PATH,
   _encode4503Reason,
   _rawDataLen,
+  _sanitizeMasterHistoricalMessagesForFrame,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
@@ -58,6 +59,7 @@ async function startRig(opts: {
     uid: bigint,
     role: "user" | "admin",
   ) => Promise<(modelId: string) => boolean>;
+  loadMasterSessionMessages?: (uid: bigint, sessionId: string) => Promise<unknown[] | null>;
   logger?: Logger;
 } = {}): Promise<TestRig> {
   // 1) mock 容器 ws server
@@ -91,6 +93,7 @@ async function startRig(opts: {
     containerConnectTimeoutMs: 1500,
     markContainerActivity: opts.markContainerActivity,
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
+    loadMasterSessionMessages: opts.loadMasterSessionMessages,
     logger: opts.logger,
   });
 
@@ -186,6 +189,21 @@ describe("rawDataLen", () => {
   });
   test("array of buffers", () => {
     assert.equal(_rawDataLen([Buffer.alloc(3), Buffer.alloc(7)]), 10);
+  });
+});
+
+describe("sanitizeMasterHistoricalMessagesForFrame", () => {
+  test("keeps only compact user/assistant text rows for private frame history", () => {
+    const rows = _sanitizeMasterHistoricalMessagesForFrame([
+      { id: "u1", role: "user", text: "hello", status: "sent", ts: 1 },
+      { id: "th1", role: "thinking", text: "hidden" },
+      { id: "sys", role: "assistant", text: "system", system: true },
+      { id: "a1", role: "assistant", content: [{ text: "answer" }], extra: "drop" },
+    ]);
+    assert.deepEqual(rows, [
+      { id: "u1", role: "user", text: "hello", status: "sent", ts: 1 },
+      { id: "a1", role: "assistant", text: "answer" },
+    ]);
   });
 });
 
@@ -863,6 +881,56 @@ describe("userChatBridge — model authorization", () => {
       assert.equal(forwarded.type, "inbound.message");
       assert.equal(forwarded.model, "claude-opus-4-7");
       assert.match(forwarded.traceId as string, /^[a-f0-9]{32}$/);
+
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("inbound.message 会附带 master 权威历史给容器用于跨 provider 上下文", async () => {
+    const allowed = new Set<string>(["gpt-5.5"]);
+    const rig = await startRig({
+      loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
+      loadMasterSessionMessages: async (uid, sessionId) => {
+        assert.equal(uid, 204n);
+        assert.equal(sessionId, "sess-history");
+        return [
+          { id: "u-old", role: "user", text: "之前问了什么项目", ts: 1 },
+          { id: "srv-sess-history-main-t1", role: "assistant", text: "DeepSeek 的回答", ts: 2 },
+          { id: "think", role: "thinking", text: "不要透传" },
+        ];
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const token = await makeJwt("204");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+
+      const seenP = new Promise<Buffer | string>((r) => {
+        containerWs.once("message", (d) => {
+          r(typeof d === "string" ? d : Buffer.isBuffer(d) ? d : Buffer.concat(d as Buffer[]));
+        });
+      });
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-history", kind: "dm" },
+        content: { text: "我刚才问了什么？" },
+        model: "gpt-5.5",
+      }));
+      const got = await seenP;
+      const forwarded = JSON.parse(
+        typeof got === "string" ? got : got.toString("utf8"),
+      ) as Record<string, unknown>;
+      assert.match(forwarded.traceId as string, /^[a-f0-9]{32}$/);
+      assert.deepEqual(forwarded._masterHistoricalMessages, [
+        { id: "u-old", role: "user", text: "之前问了什么项目", ts: 1 },
+        { id: "srv-sess-history-main-t1", role: "assistant", text: "DeepSeek 的回答", ts: 2 },
+      ]);
 
       ws.close();
       await waitClose(ws);

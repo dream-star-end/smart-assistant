@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   buildHistoricalContextPrompt,
+  historicalContextInjectionKey,
   shouldAttemptHistoricalContextInjection,
 } from '../sessionManager.js'
 
@@ -62,6 +63,51 @@ test('shouldAttemptHistoricalContextInjection does not depend on provider-local 
       channel: 'webchat',
       userTextOrBlocks: '原生 resume 可用时不注入',
       hasProviderResumeId: true,
+    }),
+    false,
+  )
+})
+
+
+test('historicalContextInjectionKey forces injection when latest master assistant is from another agent', () => {
+  assert.equal(
+    historicalContextInjectionKey({
+      messages: [{ role: 'assistant', id: 'srv-s-main-t1', text: 'deepseek answer' }],
+      peerId: 's',
+      agentId: 'codex',
+      hasProviderResumeId: true,
+    }),
+    'master:srv-s-main-t1',
+  )
+  assert.equal(
+    historicalContextInjectionKey({
+      messages: [{ role: 'assistant', id: 'srv-s-codex-t2', text: 'codex answer' }],
+      peerId: 's',
+      agentId: 'codex',
+      hasProviderResumeId: true,
+    }),
+    null,
+  )
+})
+
+test('shouldAttemptHistoricalContextInjection dedupes by master history key even with provider resume id', () => {
+  assert.equal(
+    shouldAttemptHistoricalContextInjection({
+      channel: 'webchat',
+      userTextOrBlocks: '切回 GPT 继续',
+      hasProviderResumeId: true,
+      injectionKey: 'master:srv-s-main-t1',
+      lastInjectedKey: null,
+    }),
+    true,
+  )
+  assert.equal(
+    shouldAttemptHistoricalContextInjection({
+      channel: 'webchat',
+      userTextOrBlocks: '普通追问',
+      hasProviderResumeId: true,
+      injectionKey: 'master:srv-s-main-t1',
+      lastInjectedKey: 'master:srv-s-main-t1',
     }),
     false,
   )
