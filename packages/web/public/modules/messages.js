@@ -1,23 +1,23 @@
 // OpenClaude — Message rendering and display
-import { _openTopupModal } from './billing.js?v=7793a2b5'
-import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=7793a2b5'
-import { getEffortForSubmit } from './effortMode.js?v=7793a2b5'
-import { openPlanPanel, refreshPlanPanel } from './planPanel.js?v=7793a2b5'
-import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=7793a2b5'
-import { exportMessageDocx } from './export-docx.js?v=7793a2b5'
-import { exportMessageTex } from './export-tex.js?v=7793a2b5'
+import { _openTopupModal } from './billing.js?v=fa6f4443'
+import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=fa6f4443'
+import { getEffortForSubmit } from './effortMode.js?v=fa6f4443'
+import { openPlanPanel, refreshPlanPanel } from './planPanel.js?v=fa6f4443'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=fa6f4443'
+import { exportMessageDocx } from './export-docx.js?v=fa6f4443'
+import { exportMessageTex } from './export-tex.js?v=fa6f4443'
 import {
   clearChartInstances,
   embedMediaUrls,
   processRichBlocks,
   renderMarkdown,
   renderStreamingMarkdown,
-} from './markdown.js?v=7793a2b5'
-import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=7793a2b5'
-import { toast } from './ui.js?v=7793a2b5'
-import { parsePartialJson } from './partialJson.js?v=7793a2b5'
-import { msgTimeLabel, shortTime } from './util.js?v=7793a2b5'
-import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=7793a2b5'
+} from './markdown.js?v=fa6f4443'
+import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=fa6f4443'
+import { toast } from './ui.js?v=fa6f4443'
+import { parsePartialJson } from './partialJson.js?v=fa6f4443'
+import { msgTimeLabel, shortTime } from './util.js?v=fa6f4443'
+import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=fa6f4443'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
