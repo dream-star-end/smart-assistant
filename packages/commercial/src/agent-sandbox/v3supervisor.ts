@@ -316,6 +316,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "platform-capabilities",
   "scheduled-tasks",
   "skill-management",
+  "document-writing",
 ] as const;
 
 /**
@@ -1902,7 +1903,7 @@ export async function provisionV3Container(
         `${baselineMounts.claudeMdHostPath}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
         // 挂 skills/ 整目录,一次性覆盖所有基线 skill(system-info /
         // memory-management / platform-capabilities / scheduled-tasks /
-        // skill-management)。新增基线 skill 不再改这里,改
+        // skill-management / document-writing)。新增基线 skill 不再改这里,改
         // V3_CCB_BASELINE_SKILL_NAMES manifest 即可。
         //
         // 用户自建 skill 由 PR4 的 SkillStore baseline-wins 合并视图在

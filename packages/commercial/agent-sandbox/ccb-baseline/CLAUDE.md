@@ -21,7 +21,7 @@
   - `/home/agent/.openclaude/` 是你的持久化工作区(named volume,跨容器重启保留)
   - `/run/oc/claude-config/projects/` 是你的会话记录(跨容器重启保留)
   - `/run/oc/claude-config/CLAUDE.md`(本文件)和 `/run/oc/claude-config/skills/`(整目录)是平台基线(只读),
-    当前基线 skill:`system-info`、`memory-management`、`platform-capabilities`、`scheduled-tasks`、`skill-management`
+    当前基线 skill:`system-info`、`memory-management`、`platform-capabilities`、`scheduled-tasks`、`skill-management`、`document-writing`
   - 其他路径通常是 tmpfs 或容器临时层,重启会清空
 - **网络**:
   - 可访问公网(无白名单过滤,HTTPS/API/npm/git 等常规调用都能通)
