@@ -245,7 +245,7 @@ describe('CodexAppServerRunner plan-first turn/start params', () => {
     assert.equal((params.collaborationMode as any).mode, 'default')
     assert.match(
       (params.collaborationMode as any).settings.developer_instructions,
-      /Decide autonomously whether the user request needs a visible plan\/task list/,
+      /implementation mode, not plan-only mode/,
     )
     assert.deepEqual(params.sandboxPolicy, { type: 'dangerFullAccess' })
     await h.cleanup()

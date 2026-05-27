@@ -125,7 +125,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=34'
+} from './messages.js?v=35'
 
 // ── WebSocket ──
 import {
@@ -168,7 +168,7 @@ import {
   slashPopupVisible,
 } from './commands.js'
 import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
-import { getConversationModeForSubmit } from './planMode.js?v=2'
+import { getConversationModeForSubmit } from './planMode.js?v=3'
 import { initPlanPanel } from './planPanel.js?v=2'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
 
@@ -742,7 +742,7 @@ function send() {
       filename: a.name,
     }))
   const effortLevel = getEffortForSubmit()
-  const conversationMode = getConversationModeForSubmit()
+  const conversationMode = getConversationModeForSubmit(text, state.attachments)
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,

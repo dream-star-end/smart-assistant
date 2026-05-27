@@ -17,11 +17,11 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
-const CODEX_AUTO_PLAN_INSTRUCTIONS = [
-  'Decide autonomously whether the user request needs a visible plan/task list before execution.',
-  'For multi-step, risky, ambiguous, or code-changing tasks, create and maintain a concise plan before and during work; keep exactly one active step when work is underway.',
-  'For trivial one-step questions or tiny edits, skip the plan and answer or implement directly.',
-  'Do not stop after planning unless the user explicitly asks for plan-only; after planning, continue execution in the same turn when execution is allowed.',
+const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
+  'You are in implementation mode, not plan-only mode.',
+  'If the user asks to start or implement an approved plan, first create or update a concise task list, then execute the work in the same turn.',
+  'Keep exactly one task in progress while working and mark tasks completed as you finish them.',
+  'Do not create another review-only plan document unless the user explicitly asks to revise the plan.',
 ].join(' ')
 
 // ───────────────────────────────────────────────
@@ -898,7 +898,7 @@ export class CodexAppServerRunner extends EventEmitter {
         settings: {
           model: this.opts.model ?? '',
           reasoning_effort: this.codexReasoningEffort(),
-          developer_instructions: mode === 'default' ? CODEX_AUTO_PLAN_INSTRUCTIONS : null,
+          developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
         },
       },
       sandboxPolicy:

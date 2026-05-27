@@ -11,7 +11,7 @@ import {
   renderStreamingMarkdown,
 } from './markdown.js'
 import { refreshPlanPanel } from './planPanel.js?v=2'
-import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=2'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=3'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 import { msgTimeLabel, shortTime } from './util.js'
@@ -1546,7 +1546,7 @@ export function _buildMessageEl(msg) {
         renderMessages()
         // Re-send via proper path: build payload with original media if present
         const _regenEffort = getEffortForSubmit()
-        const _regenConversationMode = getConversationModeForSubmit()
+        const _regenConversationMode = getConversationModeForSubmit(lastUserMsg._modelText || lastUserMsg.text || '', lastUserMsg._media || [])
         const wsPayload = {
           type: 'inbound.message',
           idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,

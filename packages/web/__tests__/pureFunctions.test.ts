@@ -101,6 +101,11 @@ const buildToolUseLabel = makeCallable<(block: any) => string>(
   extractFunction(appJs, 'buildToolUseLabel'),
 )
 
+const shouldAutoPlan = new Function(
+  `${extractFunction(appJs, '_hasAny')}
+${extractFunction(appJs, 'shouldAutoPlan').replace(/^export\s+/, '')}; return shouldAutoPlan;`,
+)() as (text?: string, attachments?: any[]) => boolean
+
 // Note: effectiveTheme() and isSending() depend on browser APIs (localStorage, state).
 // htmlSafeEscape is a one-line arrow function — hard to extract with indent matching.
 // All three will be directly importable after Phase 2 module extraction.
@@ -428,6 +433,23 @@ describe('T-LATEX-INTEGRATION: codexDisplayMath / codexInlineMath wiring', () =>
   it('extensions push to pendingMath with display flag', () => {
     assert.ok(appJs.includes('pendingMath.push({ id, tex: token.text, display: true })'))
     assert.ok(appJs.includes('pendingMath.push({ id, tex: token.text, display: false })'))
+  })
+})
+
+
+// ── T-AUTO-PLAN: automatic plan-first routing heuristic ──
+describe('T-AUTO-PLAN: shouldAutoPlan heuristic', () => {
+  it('routes complex multi-step code work to plan mode', () => {
+    assert.equal(
+      shouldAutoPlan('修复 gateway 认证问题，然后补测试并保证前端缓存兼容'),
+      true,
+    )
+  })
+  it('keeps simple one-step requests in default mode', () => {
+    assert.equal(shouldAutoPlan('把按钮文案改成保存'), false)
+  })
+  it('keeps explicit implementation/resume prompts in default mode', () => {
+    assert.equal(shouldAutoPlan('按上面的计划开始实施。'), false)
   })
 })
 
