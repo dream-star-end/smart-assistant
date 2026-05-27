@@ -309,6 +309,16 @@ export function _codexUsageToAnthropicShape(turn: CodexTokenBreakdown): {
  *  ugly "CODEX:USERMESSAGE" dump boss flagged. */
 const _SUPPRESSED_ITEM_TYPES = new Set<string>(['userMessage', 'hookPrompt'])
 
+function _normaliseCodexItemType(type: unknown): string | null {
+  if (type === 'context_compaction') return 'contextCompaction'
+  return typeof type === 'string' ? type : null
+}
+
+function _isContextCompactionItem(item: unknown): item is Record<string, unknown> {
+  if (!item || typeof item !== 'object') return false
+  return _normaliseCodexItemType((item as Record<string, unknown>).type) === 'contextCompaction'
+}
+
 /** Issue A v1.0.108 — Anthropic-shape 配额快照(0..100% + ISO8601 reset)。
  *  落到 OutboundCodexBilling.rateLimits 字段,master.userChatBridge 直接传 quota.ts。
  *  字段全 optional,允许 plan 类型只有单窗口的情况(e.g. free 只发 7d)。 */
@@ -1504,6 +1514,22 @@ export class CodexAppServerRunner extends EventEmitter {
     const p = params as Record<string, unknown>
     const turnId = typeof p.turnId === 'string' ? p.turnId : undefined
 
+    // Codex exposes auto-compaction as a ThreadItem (`contextCompaction`).
+    // In the app-server protocol it may belong to a short internal turn whose
+    // turnId differs from the user-visible turn. Personal-edition Codex shows
+    // that item as a normal tool card, so commercial must not drop it merely
+    // because the turnId is internal. Surface only while a user turn is
+    // actually in flight; otherwise it is background noise from app-server
+    // housekeeping.
+    if (
+      (method === 'item/started' || method === 'item/completed') &&
+      _isContextCompactionItem(p.item) &&
+      this.currentTurnCompleter
+    ) {
+      this.handleContextCompactionItem(method, p.item)
+      return
+    }
+
     // Filter turn-scoped notifications. codex may emit notifications for
     // system-internal turns (compaction, hooks) that the client should ignore.
     //
@@ -1761,11 +1787,26 @@ export class CodexAppServerRunner extends EventEmitter {
     // turn lifecycle.
   }
 
+  private handleContextCompactionItem(method: string, itemUnk: unknown): void {
+    if (!itemUnk || typeof itemUnk !== 'object') return
+    const item = itemUnk as Record<string, unknown>
+    const itemId = typeof item.id === 'string' ? item.id : `codex-compact-${Date.now()}`
+    const visibleItem = { ...item, type: 'contextCompaction' }
+    if (method === 'item/started') {
+      this.emitTurnStatus('compacting')
+      this.emitAssistantToolUse(itemId, 'codex:contextCompaction', visibleItem)
+      return
+    }
+    this.emitToolResult(itemId, JSON.stringify(visibleItem).slice(0, 2000), false)
+    this.emitTurnStatus(null)
+  }
+
   private handleItemStarted(itemUnk: unknown): void {
     if (!itemUnk || typeof itemUnk !== 'object') return
     const item = itemUnk as Record<string, unknown>
     const itemId = typeof item.id === 'string' ? item.id : `codex-${Date.now()}`
-    const itemType = item.type
+    const itemType = _normaliseCodexItemType(item.type)
+    const visibleItem = itemType === item.type ? item : { ...item, type: itemType }
     if (itemType === 'commandExecution') {
       const cmd = typeof item.command === 'string' ? item.command : ''
       this.emitAssistantToolUse(itemId, 'Bash', {
@@ -1794,17 +1835,19 @@ export class CodexAppServerRunner extends EventEmitter {
     // surface as `codex:<type>` tool_use so the frontend's
     // _CODEX_TYPE_META table can render them with friendly icons +
     // labels.
-    if (typeof itemType !== 'string') return
+    if (itemType === null) return
     if (_SUPPRESSED_ITEM_TYPES.has(itemType)) return
     if (itemType === 'agentMessage' || itemType === 'reasoning') return
-    this.emitAssistantToolUse(itemId, `codex:${itemType}`, item)
+    if (itemType === 'contextCompaction') this.emitTurnStatus('compacting')
+    this.emitAssistantToolUse(itemId, `codex:${itemType}`, visibleItem)
   }
 
   private async handleItemCompleted(itemUnk: unknown): Promise<void> {
     if (!itemUnk || typeof itemUnk !== 'object') return
     const item = itemUnk as Record<string, unknown>
     const itemId = typeof item.id === 'string' ? item.id : `codex-${Date.now()}`
-    const itemType = item.type
+    const itemType = _normaliseCodexItemType(item.type)
+    const visibleItem = itemType === item.type ? item : { ...item, type: itemType }
     // Mirror handleItemStarted suppression — userMessage/hookPrompt have no
     // tool_use card to attach a result to, and the generic JSON.stringify
     // fallback at the bottom of this function would dump the echo content
@@ -1927,6 +1970,11 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     if (itemType === 'agentMessage' || itemType === 'reasoning') {
       // Already streamed via deltas; no separate tool_result needed.
+      return
+    }
+    if (itemType === 'contextCompaction') {
+      this.emitToolResult(itemId, JSON.stringify(visibleItem).slice(0, 2000), false)
+      this.emitTurnStatus(null)
       return
     }
     // Generic completion for unknown item types
@@ -2236,6 +2284,15 @@ export class CodexAppServerRunner extends EventEmitter {
         ],
       },
     } satisfies RunnerMessage)
+  }
+
+  private emitTurnStatus(status: 'compacting' | null): void {
+    this.emit('message', {
+      type: 'system',
+      subtype: 'status',
+      session_id: this.threadId,
+      status,
+    } as unknown as RunnerMessage)
   }
 
   /** Issue A v1.0.108 round-2 — 决定本次 emitResult 是否带 rateLimits。

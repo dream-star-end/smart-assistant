@@ -989,6 +989,66 @@ describe('handleNotification — early-arriving turn-scoped notifications (Codex
     assert.equal((h.runner as any).activeTurnId, null)
     await h.cleanup()
   })
+
+  it('surfaces contextCompaction items from an internal turn while user turn is in flight', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-user'
+    ;(h.runner as any).currentTurnCompleter = { resolve: () => {}, reject: () => {} }
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-compact',
+        item: { id: 'ctx-1', type: 'contextCompaction', tokensBefore: 100000 },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-compact',
+        item: { id: 'ctx-1', type: 'contextCompaction', tokensBefore: 100000, tokensAfter: 20000 },
+      },
+    })
+
+    assert.equal((h.runner as any).activeTurnId, 't-user')
+    assert.equal(h.messages.length, 4)
+    assert.deepEqual(
+      h.messages.map((m) => [m.type, m.subtype ?? '', m.status ?? '']),
+      [
+        ['system', 'status', 'compacting'],
+        ['assistant', '', ''],
+        ['user', '', ''],
+        ['system', 'status', ''],
+      ],
+    )
+    assert.equal(h.messages[1].message.content[0].name, 'codex:contextCompaction')
+    assert.equal(h.messages[1].message.content[0].input.type, 'contextCompaction')
+    assert.equal(h.messages[2].message.content[0].tool_use_id, 'ctx-1')
+    await h.cleanup()
+  })
+
+  it('normalises snake_case context compaction item types for the frontend card', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-user'
+    ;(h.runner as any).currentTurnCompleter = { resolve: () => {}, reject: () => {} }
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-user',
+        item: { id: 'ctx-2', type: 'context_compaction' },
+      },
+    })
+
+    assert.equal(h.messages.length, 2)
+    assert.equal(h.messages[1].message.content[0].name, 'codex:contextCompaction')
+    assert.equal(h.messages[1].message.content[0].input.type, 'contextCompaction')
+    await h.cleanup()
+  })
 })
 
 describe('proc lifecycle — stale stdout frame attribution (Codex review #019dde20 BLOCKER round 2)', () => {
