@@ -1244,6 +1244,7 @@ export function handleOutbound(frame) {
             r === 'thinking' ||
             r === 'tool' ||
             r === 'agent-group' ||
+            r === 'plan' ||
             r === 'permission'
           ) {
             producedContent = true
@@ -1292,6 +1293,7 @@ export function handleOutbound(frame) {
             r === 'thinking' ||
             r === 'tool' ||
             r === 'agent-group' ||
+            r === 'plan' ||
             r === 'permission'
           ) {
             priorTurnHadContent = true
@@ -1649,6 +1651,18 @@ export function handleOutbound(frame) {
       sess._streamingPlan._partial = false
       sess._streamingPlan.completedAt = Date.now()
       if (sess.id === state.currentSessionId) _deps.updateMessageEl(sess._streamingPlan, false)
+    }
+    // Codex app-server plan frames can be the only visible output for a turn.
+    // Finalize any partial plan row at turn end even if the streaming pointer
+    // was cleared by an earlier block update, so mobile keeps the plan card
+    // and exposes the confirmation actions instead of treating the turn as
+    // empty.
+    for (const m of sess.messages) {
+      if (m.role === 'plan' && m._partial) {
+        m._partial = false
+        m.completedAt = Date.now()
+        if (sess.id === state.currentSessionId) _deps.updateMessageEl(m, false)
+      }
     }
     // Mark assistant message as truncated when CCB report stop_reason indicates
     // the model didn't get to finish (max_tokens, pause_turn). messages.js

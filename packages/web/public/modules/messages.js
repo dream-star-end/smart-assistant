@@ -10,7 +10,7 @@ import {
   renderMarkdown,
   renderStreamingMarkdown,
 } from './markdown.js'
-import { refreshPlanPanel } from './planPanel.js?v=3'
+import { openPlanPanel, refreshPlanPanel } from './planPanel.js?v=3'
 import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=4'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
@@ -1313,6 +1313,11 @@ function _buildPlanCard(el, msg) {
   if (!msg._partial) {
     const actions = document.createElement('div')
     actions.className = 'plan-card-actions'
+    const openPanel = document.createElement('button')
+    openPanel.type = 'button'
+    openPanel.className = 'plan-panel-open-btn'
+    openPanel.textContent = '查看常驻计划'
+    openPanel.onclick = () => openPlanPanel()
     const run = document.createElement('button')
     run.type = 'button'
     run.className = 'plan-run-btn'
@@ -1325,6 +1330,7 @@ function _buildPlanCard(el, msg) {
       input?.dispatchEvent(new Event('input', { bubbles: true }))
       sendBtn?.click()
     }
+    actions.appendChild(openPanel)
     actions.appendChild(run)
     el.appendChild(actions)
   }

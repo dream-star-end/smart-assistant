@@ -2095,8 +2095,11 @@ a:hover {
 }
 .plan-card-actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
   justify-content: flex-end;
 }
+.plan-panel-open-btn,
 .plan-run-btn {
   display: inline-flex;
   align-items: center;
@@ -2109,6 +2112,12 @@ a:hover {
   font-size: var(--text-sm);
   cursor: pointer;
 }
+.plan-panel-open-btn {
+  border-color: var(--border);
+  background: var(--bg-raised);
+  color: var(--fg-muted);
+}
+.plan-panel-open-btn:hover,
 .plan-run-btn:hover {
   background: var(--bg-hover);
 }
