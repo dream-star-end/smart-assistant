@@ -10,6 +10,7 @@ import {
   renderMarkdown,
   renderStreamingMarkdown,
 } from './markdown.js'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 import { msgTimeLabel, shortTime } from './util.js'
@@ -1251,6 +1252,79 @@ function _applyTruncatedBanner(el, msg) {
   banner.appendChild(btn)
 }
 
+function _planStatusLabel(status) {
+  if (status === 'completed') return '完成'
+  if (status === 'inProgress') return '进行中'
+  return '待处理'
+}
+
+function _buildPlanCard(el, msg) {
+  const header = document.createElement('div')
+  header.className = 'plan-card-header'
+  const title = document.createElement('div')
+  title.className = 'plan-card-title'
+  title.textContent = '计划表'
+  const stateEl = document.createElement('div')
+  stateEl.className = 'plan-card-state'
+  stateEl.textContent = msg._partial ? '生成中' : '待确认'
+  header.appendChild(title)
+  header.appendChild(stateEl)
+  el.appendChild(header)
+
+  const body = document.createElement('div')
+  body.className = 'plan-card-body'
+  if (msg.explanation) {
+    const explanation = document.createElement('div')
+    explanation.className = 'plan-card-explanation'
+    explanation.textContent = msg.explanation
+    body.appendChild(explanation)
+  }
+  if (Array.isArray(msg.steps) && msg.steps.length > 0) {
+    const steps = document.createElement('div')
+    steps.className = 'plan-steps'
+    for (const s of msg.steps) {
+      const row = document.createElement('div')
+      row.className = 'plan-step'
+      const status = document.createElement('div')
+      status.className = `plan-step-status ${s.status || 'pending'}`
+      status.textContent = _planStatusLabel(s.status)
+      const text = document.createElement('div')
+      text.className = 'plan-step-text'
+      text.textContent = s.step || ''
+      row.appendChild(status)
+      row.appendChild(text)
+      steps.appendChild(row)
+    }
+    body.appendChild(steps)
+  } else if (msg.text) {
+    const draft = document.createElement('div')
+    draft.className = 'plan-card-draft'
+    draft.textContent = msg.text
+    body.appendChild(draft)
+  }
+  el.appendChild(body)
+
+  if (!msg._partial) {
+    const actions = document.createElement('div')
+    actions.className = 'plan-card-actions'
+    const run = document.createElement('button')
+    run.type = 'button'
+    run.className = 'plan-run-btn'
+    run.textContent = '开始实施'
+    run.onclick = () => {
+      requestDefaultNextSubmit()
+      const input = document.getElementById('input')
+      const sendBtn = document.getElementById('send')
+      if (input) input.value = '按上面的计划开始实施。'
+      input?.dispatchEvent(new Event('input', { bubbles: true }))
+      sendBtn?.click()
+    }
+    actions.appendChild(run)
+    el.appendChild(actions)
+  }
+  _appendMsgTime(el, msg.completedAt || msg.ts)
+}
+
 export function _buildMessageEl(msg) {
   const el = document.createElement('div')
   el.className = `msg ${msg.role}`
@@ -1466,6 +1540,7 @@ export function _buildMessageEl(msg) {
         renderMessages()
         // Re-send via proper path: build payload with original media if present
         const _regenEffort = getEffortForSubmit()
+        const _regenConversationMode = getConversationModeForSubmit()
         const wsPayload = {
           type: 'inbound.message',
           idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1478,6 +1553,9 @@ export function _buildMessageEl(msg) {
           },
           // 与 main.js send() 同语义:string=切档 / null=清除 / undefined=不参与
           ...(_regenEffort !== undefined ? { effortLevel: _regenEffort } : {}),
+          ...(_regenConversationMode !== undefined
+            ? { conversationMode: _regenConversationMode }
+            : {}),
           ts: Date.now(),
         }
         // Check if there are pending offline items for this session to prevent reordering
@@ -1609,8 +1687,16 @@ export function _buildMessageEl(msg) {
     // token arrived. Falls back to `ts` (creation) while streaming, and for
     // legacy messages that predate the completedAt field.
     _appendMsgTime(el, msg.completedAt || msg.ts)
+  } else if (msg.role === 'plan') {
+    _buildPlanCard(el, msg)
   } else if (msg.role === 'agent-group') {
     _renderAgentGroup(el, msg)
+  } else if (msg.role === 'plan') {
+    el.innerHTML = ''
+    el.className = 'msg plan'
+    if (msg.error) el.classList.add('error')
+    el.dataset.msgId = msg.id
+    _buildPlanCard(el, msg)
   } else if (msg.role === 'thinking') {
     const header = document.createElement('div')
     header.className = 'thinking-header'

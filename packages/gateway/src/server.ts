@@ -1800,12 +1800,25 @@ export class Gateway {
         this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
         return
       }
+      if (
+        body.runnerKind !== undefined &&
+        body.runnerKind !== 'exec' &&
+        body.runnerKind !== 'app-server'
+      ) {
+        this.sendError(res, 400, 'runnerKind must be exec or app-server')
+        return
+      }
       if (cfg.agents.find((a) => a.id === body.id)) {
         this.sendError(res, 409, 'agent already exists')
         return
       }
       // Inherit provider/permissionMode/cwd from request or sensible defaults
       const defaultAgent = cfg.agents.find((a) => a.id === cfg.default)
+      const provider = body.provider ?? defaultAgent?.provider
+      if (body.runnerKind !== undefined && provider !== 'codex-native') {
+        this.sendError(res, 400, 'runnerKind is only valid for provider=codex-native')
+        return
+      }
       const agent: AgentDef = {
         id: body.id,
         model: body.model ?? this.deps.config.defaults.model,
@@ -1814,7 +1827,8 @@ export class Gateway {
           body.permissionMode ??
           defaultAgent?.permissionMode ??
           this.deps.config.defaults.permissionMode,
-        provider: body.provider ?? defaultAgent?.provider,
+        provider,
+        runnerKind: provider === 'codex-native' ? (body.runnerKind ?? 'app-server') : undefined,
         cwd: body.cwd ?? defaultAgent?.cwd,
         toolsets: body.toolsets,
       }
@@ -1852,6 +1866,19 @@ export class Gateway {
     }
     if (req.method === 'PUT') {
       const body = await this.readJsonBody<Partial<AgentDef>>(req)
+      if (
+        body.runnerKind !== undefined &&
+        body.runnerKind !== 'exec' &&
+        body.runnerKind !== 'app-server'
+      ) {
+        this.sendError(res, 400, 'runnerKind must be exec or app-server')
+        return
+      }
+      const nextProvider = body.provider !== undefined ? body.provider : agent.provider
+      if (body.runnerKind !== undefined && nextProvider !== 'codex-native') {
+        this.sendError(res, 400, 'runnerKind is only valid for provider=codex-native')
+        return
+      }
       if (body.model !== undefined) agent.model = body.model
       if (body.persona !== undefined) agent.persona = body.persona
       if (body.cwd !== undefined) agent.cwd = body.cwd
@@ -1860,6 +1887,9 @@ export class Gateway {
       if (body.avatarEmoji !== undefined) agent.avatarEmoji = body.avatarEmoji
       if (body.greeting !== undefined) agent.greeting = body.greeting
       if (body.provider !== undefined) agent.provider = body.provider
+      if (body.runnerKind !== undefined) agent.runnerKind = body.runnerKind
+      if (agent.provider === 'codex-native') agent.runnerKind = agent.runnerKind ?? 'app-server'
+      else agent.runnerKind = undefined
       if (body.toolsets !== undefined) agent.toolsets = body.toolsets
       if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
       if (body.proxyUrl !== undefined) {
@@ -3871,6 +3901,11 @@ export class Gateway {
     } else {
       safeEffortLevel = undefined
     }
+    const _frameConversationMode = (frame as any).conversationMode
+    const safeConversationMode: 'default' | 'plan' | undefined =
+      _frameConversationMode === 'default' || _frameConversationMode === 'plan'
+        ? _frameConversationMode
+        : undefined
 
     const session = await this.sessions.getOrCreate({
       sessionKey,
@@ -4331,6 +4366,7 @@ export class Gateway {
         }
       },
       safeEffortLevel,
+      safeConversationMode,
     )
   }
 

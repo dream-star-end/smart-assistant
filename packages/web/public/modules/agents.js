@@ -2,6 +2,7 @@ import { apiGet, apiJson } from './api.js'
 // OpenClaude — Agents
 import { $, htmlSafeEscape } from './dom.js'
 import { renderModePills } from './effortMode.js'
+import { renderPlanModePill } from './planMode.js'
 import { renderResearchTools } from './researchTools.js'
 import { getSession, state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
@@ -34,8 +35,19 @@ export function renderAgentDropdown() {
   if (sess) sel.value = sess.agentId || state.defaultAgentId
   // Pill 可见性依赖当前 agent 的 model — 任何 agent 列表/会话切换后都要刷新一次。
   renderModePills()
+  renderPlanModePill()
   // 科研工具条的可见性同样取决于 effort pill 当前选中值,跟随 agent 切换一起刷新。
   renderResearchTools()
+}
+
+function syncRunnerKindVisibility() {
+  const row = $('persona-runner-row')
+  const runner = $('persona-runner-kind')
+  const provider = $('persona-provider')?.value || ''
+  if (row) row.hidden = provider !== 'codex-native'
+  if (provider === 'codex-native' && runner && !runner.value) {
+    runner.value = 'app-server'
+  }
 }
 
 export function renderAgentsManagementList() {
@@ -95,6 +107,9 @@ export async function openPersonaEditor(agentId) {
     const modelVal = info.agent.model || ''
     preset.value = [...preset.options].some((o) => o.value === modelVal) ? modelVal : ''
     $('persona-provider').value = info.agent.provider || ''
+    $('persona-runner-kind').value = info.agent.runnerKind || 'app-server'
+    $('persona-provider').onchange = () => syncRunnerKindVisibility()
+    syncRunnerKindVisibility()
     $('persona-permission').value = info.agent.permissionMode || 'default'
     $('persona-cwd').value = info.agent.cwd || ''
     $('persona-toolsets').value = (info.agent.toolsets || []).join(', ')
@@ -123,10 +138,11 @@ export async function openPersonaEditor(agentId) {
     }
     $('save-persona-btn').onclick = async () => {
       try {
+        const provider = $('persona-provider').value || undefined
         const payload = {
           model: $('persona-model').value.trim(),
           permissionMode: $('persona-permission').value,
-          provider: $('persona-provider').value || undefined,
+          provider,
           displayName: $('persona-display-name').value.trim() || undefined,
           avatarEmoji: $('persona-avatar-emoji').value.trim() || undefined,
           greeting: $('persona-greeting').value.trim() || undefined,
@@ -137,6 +153,9 @@ export async function openPersonaEditor(agentId) {
                 .map((s) => s.trim())
                 .filter(Boolean)
             : undefined,
+        }
+        if (provider === 'codex-native') {
+          payload.runnerKind = $('persona-runner-kind').value || 'app-server'
         }
         // Only include proxyUrl when the operator actually changed it. Sending
         // the masked initial value back would either no-op (best case) or be

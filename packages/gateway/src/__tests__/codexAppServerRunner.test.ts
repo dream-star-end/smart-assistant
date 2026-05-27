@@ -41,6 +41,8 @@ async function makeHarness(
   opts: {
     resumeSessionId?: string
     withFakeProc?: boolean
+    model?: string
+    conversationMode?: 'default' | 'plan'
   } = {},
 ): Promise<Harness> {
   const baseTmp = await mkdtemp(join(tmpdir(), 'codex-aps-'))
@@ -49,6 +51,8 @@ async function makeHarness(
     agentId: 'test',
     cwd: baseTmp,
     resumeSessionId: opts.resumeSessionId,
+    model: opts.model,
+    conversationMode: opts.conversationMode,
   })
   const messages: any[] = []
   const errors: any[] = []
@@ -188,6 +192,46 @@ describe('CodexAppServerRunner.start', () => {
   })
 })
 
+describe('CodexAppServerRunner plan-first turn/start params', () => {
+  it('plan mode uses codex collaborationMode=plan and read-only sandbox', async () => {
+    const h = await makeHarness({
+      model: 'gpt-5-codex',
+      conversationMode: 'plan',
+    })
+    ;(h.runner as any).threadId = 'thr-plan'
+    ;(h.runner as any).effortLevel = 'high'
+
+    const params = (h.runner as any).buildTurnStartParams('make a plan')
+
+    assert.deepEqual(params.collaborationMode, {
+      mode: 'plan',
+      settings: {
+        model: 'gpt-5-codex',
+        reasoning_effort: 'high',
+        developer_instructions: null,
+      },
+    })
+    assert.deepEqual(params.sandboxPolicy, { type: 'readOnly', networkAccess: true })
+    assert.equal(params.model, 'gpt-5-codex')
+    await h.cleanup()
+  })
+
+  it('default mode uses codex collaborationMode=default and danger-full-access sandbox', async () => {
+    const h = await makeHarness({
+      model: 'gpt-5-codex',
+      conversationMode: 'plan',
+    })
+    ;(h.runner as any).threadId = 'thr-run'
+    h.runner.setConversationMode('default')
+
+    const params = (h.runner as any).buildTurnStartParams('implement it')
+
+    assert.equal((params.collaborationMode as any).mode, 'default')
+    assert.deepEqual(params.sandboxPolicy, { type: 'dangerFullAccess' })
+    await h.cleanup()
+  })
+})
+
 describe('handleLine — dispatch', () => {
   it('response with matching id → resolves pending request', async () => {
     const h = await makeHarness({ withFakeProc: true })
@@ -294,6 +338,87 @@ describe('handleNotification — item/agentMessage/delta', () => {
       params: { threadId: 'thr-1', turnId: 't-stream', itemId: 'i-1', delta: '' },
     })
     assert.equal(h.messages.length, 0)
+    await h.cleanup()
+  })
+})
+
+describe('handleNotification — plan and reasoning deltas', () => {
+  it('item/plan/delta accumulates into one partial openclaude_plan payload', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-plan'
+    ;(h.runner as any).threadId = 'thr-plan'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/plan/delta',
+      params: { threadId: 'thr-plan', turnId: 't-plan', itemId: 'p-1', delta: '1. inspect' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/plan/delta',
+      params: { threadId: 'thr-plan', turnId: 't-plan', itemId: 'p-1', delta: '\n2. patch' },
+    })
+
+    assert.equal(h.messages.length, 2)
+    assert.equal(h.messages[1].type, 'openclaude_plan')
+    assert.equal(h.messages[1].plan.blockId, 'codex-plan')
+    assert.equal(h.messages[1].plan.text, '1. inspect\n2. patch')
+    assert.equal(h.messages[1].plan.partial, true)
+    await h.cleanup()
+  })
+
+  it('turn/plan/updated emits a structured plan block with codex statuses', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-plan'
+    ;(h.runner as any).threadId = 'thr-plan'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thr-plan',
+        turnId: 't-plan',
+        explanation: 'short path',
+        plan: [
+          { step: 'read files', status: 'completed' },
+          { step: 'edit code', status: 'inProgress' },
+          { step: 'run tests', status: 'pending' },
+        ],
+      },
+    })
+
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'openclaude_plan')
+    assert.equal(h.messages[0].plan.explanation, 'short path')
+    assert.deepEqual(h.messages[0].plan.steps, [
+      { step: 'read files', status: 'completed' },
+      { step: 'edit code', status: 'inProgress' },
+      { step: 'run tests', status: 'pending' },
+    ])
+    assert.equal(h.messages[0].plan.partial, true)
+    await h.cleanup()
+  })
+
+  it('reasoning deltas stream as thinking and do not pollute assistant text', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-reason'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/reasoning/textDelta',
+      params: {
+        threadId: 'thr',
+        turnId: 't-reason',
+        itemId: 'r-1',
+        delta: 'checking constraints',
+      },
+    })
+
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'stream_event')
+    assert.equal(h.messages[0].event.delta.type, 'thinking_delta')
+    assert.equal(h.messages[0].event.delta.thinking, 'checking constraints')
+    assert.equal((h.runner as any).currentAssistantBuf, '')
     await h.cleanup()
   })
 })

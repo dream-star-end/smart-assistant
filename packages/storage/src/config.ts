@@ -179,7 +179,7 @@ export interface AgentDef {
   //                 no token-level streaming, current default for backward compat).
   // 'app-server'  — `codex app-server --listen stdio://` long-lived JSON-RPC subprocess
   //                 (token-level item/agentMessage/delta streaming).
-  // Undefined → 'exec' (default).
+  // Undefined on codex-native agents is normalized to 'app-server' by Agent API.
   runnerKind?: 'exec' | 'app-server'
   /**
    * Optional per-agent egress HTTP proxy URL — overrides the global

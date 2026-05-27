@@ -635,6 +635,11 @@ export function localStopTeardown(sess) {
     clearTimeout(sess._regenSafetyTimer)
     sess._regenSafetyTimer = null
   }
+  if (sess._streamingPlan) {
+    sess._streamingPlan._partial = false
+    if (sess.id === state.currentSessionId) _deps.updateMessageEl(sess._streamingPlan, false)
+  }
+  sess._streamingPlan = null
   // Drop reply tracker — any isFinal arriving for the stopped turn should not
   // retroactively flag it as an "empty turn" since the user intentionally cut it.
   resetReplyTracker(sess)
@@ -1443,6 +1448,30 @@ export function handleOutbound(frame) {
           }
         })
       }
+    } else if (block.kind === 'plan') {
+      const planId = block.blockId || 'codex-plan'
+      let planMsg = sess._streamingPlan || null
+      if (!planMsg && planId && sess._blockIdToMsgId?.has(planId)) {
+        const mid = sess._blockIdToMsgId.get(planId)
+        planMsg = sess.messages.find((m) => m.id === mid && m.role === 'plan') || null
+      }
+      if (!planMsg) {
+        planMsg = addMessage(sess, 'plan', blockText, {
+          blockId: planId,
+          explanation: block.explanation || '',
+          steps: Array.isArray(block.steps) ? block.steps : [],
+          _partial: block.partial !== false,
+        })
+        if (planId) sess._blockIdToMsgId.set(planId, planMsg.id)
+      } else {
+        planMsg.text = blockText || planMsg.text || ''
+        if (typeof block.explanation === 'string') planMsg.explanation = block.explanation
+        if (Array.isArray(block.steps)) planMsg.steps = block.steps
+        planMsg._partial = block.partial !== false
+        planMsg.completedAt = Date.now()
+        if (sess.id === state.currentSessionId) _deps.updateMessageEl(planMsg, !!planMsg._partial)
+      }
+      sess._streamingPlan = planMsg._partial ? planMsg : null
     } else if (block.kind === 'tool_use') {
       // The assistant text (and thinking) segment just ended — next turn
       // content will go into a new message. Stamp completion time BEFORE
@@ -1616,6 +1645,11 @@ export function handleOutbound(frame) {
     // token" to the actual turn-ended wall-clock.
     if (sess._streamingAssistant) sess._streamingAssistant.completedAt = Date.now()
     if (sess._streamingThinking) sess._streamingThinking.completedAt = Date.now()
+    if (sess._streamingPlan) {
+      sess._streamingPlan._partial = false
+      sess._streamingPlan.completedAt = Date.now()
+      if (sess.id === state.currentSessionId) _deps.updateMessageEl(sess._streamingPlan, false)
+    }
     // Mark assistant message as truncated when CCB report stop_reason indicates
     // the model didn't get to finish (max_tokens, pause_turn). messages.js
     // shows a "继续" button on truncated messages so user can resume without
@@ -1650,6 +1684,7 @@ export function handleOutbound(frame) {
     }
     sess._streamingAssistant = null
     sess._streamingThinking = null
+    sess._streamingPlan = null
     sess._sendingInFlight = false
     // Turn has ended — clear timing so the next turn starts fresh (regardless of whether
     // this session is currently viewed; otherwise a later switch would reuse stale timing).

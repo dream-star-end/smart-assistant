@@ -195,6 +195,39 @@ export class CcbMessageParser {
         ? raw.parent_tool_use_id
         : undefined
 
+    // Codex app-server emits OpenClaude-native plan blocks, because CCB's
+    // stream-json protocol has no plan-table equivalent. Keep this adapter
+    // local to the parser so the rest of sessionManager continues to deal in
+    // SessionStreamEvent blocks only.
+    if (raw.type === 'openclaude_plan') {
+      const plan = raw.plan && typeof raw.plan === 'object' ? raw.plan : {}
+      const block: Record<string, unknown> = { kind: 'plan' }
+      if (typeof plan.blockId === 'string') block.blockId = plan.blockId
+      if (typeof plan.text === 'string') block.text = plan.text
+      if (typeof plan.explanation === 'string') block.explanation = plan.explanation
+      if (Array.isArray(plan.steps)) {
+        block.steps = plan.steps
+          .map((s: unknown) => {
+            const stepObj = s && typeof s === 'object' ? (s as Record<string, unknown>) : {}
+            const step = typeof stepObj.step === 'string' ? stepObj.step : ''
+            const status = stepObj.status
+            if (!step) return null
+            return {
+              step,
+              status:
+                status === 'inProgress' || status === 'completed' || status === 'pending'
+                  ? status
+                  : 'pending',
+            }
+          })
+          .filter(Boolean)
+      }
+      if (typeof plan.partial === 'boolean') block.partial = plan.partial
+      if (parentToolUseId) block.parentToolUseId = parentToolUseId
+      this.onEvent({ kind: 'block', block: block as OutboundContentBlock })
+      return
+    }
+
     // ── system messages ──
     // Most system subtypes (init / status / success / error / task_*) are
     // ignored by the gateway; CCB emits them for SDK consumers like VS Code

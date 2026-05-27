@@ -168,6 +168,7 @@ import {
   slashPopupVisible,
 } from './commands.js'
 import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
+import { getConversationModeForSubmit, initPlanModePill, renderPlanModePill } from './planMode.js'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
 
 // ═══════════════════════════════════════════════════════════
@@ -621,6 +622,7 @@ initWechatListeners()
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
 // 再触发一次;这里只是绑定点击事件并把初始隐藏态打上去。
 initModePills()
+initPlanModePill()
 // 科研模式工具条 — 仅在用户选中 effort=max 时显示,提供受众切换 + 浓缩模板。
 initResearchTools()
 
@@ -739,6 +741,7 @@ function send() {
       filename: a.name,
     }))
   const effortLevel = getEffortForSubmit()
+  const conversationMode = getConversationModeForSubmit()
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -749,6 +752,7 @@ function send() {
     // string='xhigh'/'max' → 切到该 effort;null → 显式清除回模型默认;
     // undefined → 不参与 effort 协商(非 Opus 4.7 agent 走这条)。
     ...(effortLevel !== undefined ? { effortLevel } : {}),
+    ...(conversationMode !== undefined ? { conversationMode } : {}),
     ts: Date.now(),
   }
   // Add user message with status tracking + persist media & full text for regen
@@ -759,6 +763,7 @@ function send() {
   })
   sess._streamingAssistant = null
   sess._streamingThinking = null
+  sess._streamingPlan = null
   sess._blockIdToMsgId = new Map()
   sess._agentSwitchedAt = null // Clear switch guard — new send is intentional
   // If offline queue is draining or pending for this session, route through queue
@@ -956,6 +961,7 @@ function buildPaletteItems(query) {
             sess._agentSwitchedAt = Date.now()
             sess._streamingAssistant = null
             sess._streamingThinking = null
+            sess._streamingPlan = null
             sess._sendingInFlight = false
             clearTurnTiming(sess)
             // Drop reply tracker so any stray isFinal from the old agent's
@@ -1589,12 +1595,14 @@ async function init() {
     sess.agentId = e.target.value
     // Pill 跟着新 agent 的 model 走 — 切到非 Opus 4.7 自动隐藏,选中态按新 agent 的存储读。
     renderModePills()
+    renderPlanModePill()
     renderResearchTools()
     // Mark switch time — handleOutbound will ignore frames arriving before this
     sess._agentSwitchedAt = Date.now()
     // Reset streaming state to prevent cross-agent message contamination
     sess._streamingAssistant = null
     sess._streamingThinking = null
+    sess._streamingPlan = null
     sess._sendingInFlight = false
     // Drop reply tracker so a late isFinal from the old agent doesn't bind to
     // a new user message on the switched-to agent.

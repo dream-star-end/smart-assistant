@@ -55,6 +55,9 @@ export const InboundMessage = Type.Object({
       Type.Literal('max'),
     ]),
   ),
+  // Codex-native app-server conversation mode. plan asks Codex to first
+  // produce a reviewable plan; default runs the implementation turn.
+  conversationMode: Type.Optional(Type.Union([Type.Literal('default'), Type.Literal('plan')])),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>
@@ -136,6 +139,26 @@ export const OutboundContentBlock = Type.Union([
   Type.Object({
     kind: Type.Literal('thinking'),
     text: Type.String(),
+    parentToolUseId: Type.Optional(Type.String()),
+  }),
+  Type.Object({
+    kind: Type.Literal('plan'),
+    blockId: Type.Optional(Type.String()),
+    text: Type.Optional(Type.String()),
+    explanation: Type.Optional(Type.String()),
+    steps: Type.Optional(
+      Type.Array(
+        Type.Object({
+          step: Type.String(),
+          status: Type.Union([
+            Type.Literal('pending'),
+            Type.Literal('inProgress'),
+            Type.Literal('completed'),
+          ]),
+        }),
+      ),
+    ),
+    partial: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),
   }),
   // Snapshot of a long-running bash command's tail output. Snapshot

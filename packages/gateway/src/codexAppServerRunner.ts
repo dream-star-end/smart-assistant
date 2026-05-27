@@ -90,6 +90,8 @@ export interface CodexAppServerRunnerOpts {
   config?: OpenClaudeConfig
   /** Forwarded to mcp-memory env so delegate_task can enforce recursion caps. */
   delegationDepth?: number
+  /** Per-turn default. SessionManager resets this before every submit. */
+  conversationMode?: 'default' | 'plan'
 }
 
 interface QueuedTurn {
@@ -247,6 +249,9 @@ export class CodexAppServerRunner extends EventEmitter {
    *  imageGeneration savedPath emissions against text the model already
    *  surfaced via deltas. */
   private currentAssistantBuf = ''
+  private currentPlanDraft = ''
+  private reasoningItemsWithDeltas = new Set<string>()
+  private conversationMode: 'default' | 'plan' = 'default'
   /** In-flight `handleItemCompleted` promises for the current turn. codex
    *  emits `item/completed` then `turn/completed` back-to-back; the
    *  per-item handler is async (file IO for imageGeneration base64 decode,
@@ -292,6 +297,10 @@ export class CodexAppServerRunner extends EventEmitter {
     this.effortLevel = level
   }
 
+  setConversationMode(mode: 'default' | 'plan' | undefined): void {
+    this.conversationMode = mode === 'plan' ? 'plan' : 'default'
+  }
+
   sendPermissionResponse(_requestId: string, _response: unknown): boolean {
     // Same rationale as CodexRunner: app-server is launched with
     // approvalPolicy=never + sandbox=danger-full-access, so it never asks for
@@ -323,6 +332,7 @@ export class CodexAppServerRunner extends EventEmitter {
     super()
     this.threadId = opts.resumeSessionId ?? null
     this.effortLevel = opts.effortLevel
+    this.setConversationMode(opts.conversationMode)
     // attached is intentionally false on construction even if we have a
     // resumed threadId — the first turn must explicitly thread/resume into
     // the freshly spawned proc.
@@ -731,6 +741,68 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
+  private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' | null {
+    switch (this.effortLevel) {
+      case 'low':
+      case 'medium':
+      case 'high':
+      case 'xhigh':
+        return this.effortLevel
+      default:
+        return null
+    }
+  }
+
+  private buildTurnStartParams(prompt: string): Record<string, unknown> {
+    const mode = this.conversationMode
+    const params: Record<string, unknown> = {
+      threadId: this.threadId,
+      input: [{ type: 'text', text: prompt }],
+      collaborationMode: {
+        mode,
+        settings: {
+          model: this.opts.model ?? '',
+          reasoning_effort: this.codexReasoningEffort(),
+          developer_instructions: null,
+        },
+      },
+      sandboxPolicy:
+        mode === 'plan' ? { type: 'readOnly', networkAccess: true } : { type: 'dangerFullAccess' },
+    }
+    if (this.opts.model) params.model = this.opts.model
+    return params
+  }
+
+  private emitThinkingDelta(text: string, itemId?: string): void {
+    if (!text) return
+    if (itemId) this.reasoningItemsWithDeltas.add(itemId)
+    this.emit('message', {
+      type: 'stream_event',
+      session_id: this.threadId,
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'thinking_delta', thinking: text },
+      },
+    } as unknown as RunnerMessage)
+  }
+
+  private emitPlanBlock(plan: {
+    text?: string
+    explanation?: string
+    steps?: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }>
+    partial?: boolean
+  }): void {
+    this.emit('message', {
+      type: 'openclaude_plan',
+      session_id: this.threadId,
+      plan: {
+        blockId: 'codex-plan',
+        ...plan,
+      },
+    } as unknown as RunnerMessage)
+  }
+
   private handleNotification(method: string, params: unknown): void {
     if (!params || typeof params !== 'object') return
     const p = params as Record<string, unknown>
@@ -773,6 +845,42 @@ export class CodexAppServerRunner extends EventEmitter {
           delta: { type: 'text_delta', text: delta },
         },
       } as unknown as RunnerMessage)
+      return
+    }
+    if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
+      const delta = typeof p.delta === 'string' ? p.delta : ''
+      const itemId = typeof p.itemId === 'string' ? p.itemId : undefined
+      this.emitThinkingDelta(delta, itemId)
+      return
+    }
+    if (method === 'item/plan/delta') {
+      const delta = typeof p.delta === 'string' ? p.delta : ''
+      if (!delta) return
+      this.currentPlanDraft += delta
+      this.emitPlanBlock({ text: this.currentPlanDraft, partial: true })
+      return
+    }
+    if (method === 'turn/plan/updated') {
+      const explanation = typeof p.explanation === 'string' ? p.explanation : undefined
+      const rawSteps = Array.isArray(p.plan) ? p.plan : []
+      const steps = rawSteps
+        .map((s) => {
+          const obj = s && typeof s === 'object' ? (s as Record<string, unknown>) : {}
+          const step = typeof obj.step === 'string' ? obj.step : ''
+          const status = obj.status
+          if (!step) return null
+          return {
+            step,
+            status:
+              status === 'inProgress' || status === 'completed' || status === 'pending'
+                ? status
+                : 'pending',
+          } as const
+        })
+        .filter((s): s is { step: string; status: 'pending' | 'inProgress' | 'completed' } =>
+          Boolean(s),
+        )
+      this.emitPlanBlock({ explanation, steps, partial: true })
       return
     }
     if (method === 'item/started') {
@@ -830,7 +938,7 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       return
     }
-    // Other notifications (turn/started, plan/delta, config-warning, etc.)
+    // Other notifications (turn/started, config-warning, etc.)
     // are dropped — they are observability/UI hints that don't gate the
     // turn lifecycle.
   }
@@ -994,8 +1102,25 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emitToolResult(itemId, `imageGeneration → ${summary}`, false)
       return
     }
-    if (itemType === 'agentMessage' || itemType === 'reasoning') {
+    if (itemType === 'agentMessage') {
       // Already streamed via deltas; no separate tool_result needed.
+      return
+    }
+    if (itemType === 'reasoning') {
+      // Prefer live reasoning deltas. If this Codex build only provides a
+      // completed reasoning item, surface its text/summary once as a thinking
+      // block so the frontend still shows the plan-first thought process.
+      if (!this.reasoningItemsWithDeltas.has(itemId)) {
+        const parts: string[] = []
+        if (typeof item.text === 'string') parts.push(item.text)
+        if (Array.isArray(item.summary)) {
+          for (const s of item.summary) if (typeof s === 'string') parts.push(s)
+        }
+        if (Array.isArray(item.content)) {
+          for (const c of item.content) if (typeof c === 'string') parts.push(c)
+        }
+        this.emitThinkingDelta(parts.filter(Boolean).join('\n'), itemId)
+      }
       return
     }
     // Generic completion for unknown item types
@@ -1033,6 +1158,8 @@ export class CodexAppServerRunner extends EventEmitter {
       promptChars: prompt.length,
     })
     this.currentAssistantBuf = ''
+    this.currentPlanDraft = ''
+    this.reasoningItemsWithDeltas.clear()
 
     try {
       await this.ensureSpawned()
@@ -1094,10 +1221,9 @@ export class CodexAppServerRunner extends EventEmitter {
         this.currentTurnCompleter = { resolve, reject }
       })
 
-      const tres = (await this.sendRequest('turn/start', {
-        threadId: this.threadId,
-        input: [{ type: 'text', text: prompt }],
-      })) as { turn?: { id?: string } } | undefined
+      const tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
+        | { turn?: { id?: string } }
+        | undefined
       const turnId = tres?.turn?.id
       if (typeof turnId !== 'string' || !turnId) {
         throw new Error('turn/start did not return turn.id')

@@ -337,7 +337,9 @@ export class SessionManager {
     // Within codex-native, `agent.runnerKind` picks the codex backend:
     //   'exec'        — legacy `codex exec` per-turn subprocess (no token streaming)
     //   'app-server'  — `codex app-server` long-lived JSON-RPC (token-level streaming)
-    // Default is 'exec' for backward compat with existing agents.yaml entries.
+    // Existing hand-written agents.yaml entries with no runnerKind keep the
+    // legacy exec fallback; Agent API normalizes codex-native saves to
+    // app-server so newly managed agents get realtime events by default.
     const providerTag = SessionManager.providerTag(opts.agent.provider)
     const codexResumeId = this._resumeIdFor(opts.sessionKey, providerTag)
     const codexModel = opts.agent.model ?? this.config.defaults.model
@@ -527,6 +529,9 @@ export class SessionManager {
      *  effort 应用、prev await、本 turn 的 _runOneTurn 全部串在同一个新 lock 里;
      *  闭包捕获 desiredEffort 后,后到的 submit() 不会污染本 turn 的 effort。 */
     effortLevel?: string | null,
+    /** Codex-native app-server only. Omitted means default mode so a previous
+     *  plan-first turn cannot leak into ordinary follow-up turns. */
+    conversationMode?: 'default' | 'plan',
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined = effortLevel === null ? undefined : effortLevel
@@ -550,6 +555,10 @@ export class SessionManager {
         } catch (err) {
           log.warn('effort-change shutdown failed', { sessionKey: session.sessionKey }, err)
         }
+      }
+      const maybeSetConversationMode = (session.runner as any).setConversationMode
+      if (typeof maybeSetConversationMode === 'function') {
+        maybeSetConversationMode.call(session.runner, conversationMode ?? 'default')
       }
       session.lastUsedAt = Date.now()
       // Clear tool use mappings from previous turn to prevent unbounded growth

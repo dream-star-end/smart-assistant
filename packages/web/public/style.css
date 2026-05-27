@@ -2016,6 +2016,100 @@ a:hover {
   color: var(--fg-dim);
 }
 
+/* ── Codex plan card ── */
+.msg.plan {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  max-width: 100%;
+}
+.plan-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.plan-card-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--fg);
+  font-weight: 600;
+  font-size: var(--text-sm);
+}
+.plan-card-state {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+.plan-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.plan-card-explanation,
+.plan-card-draft {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.plan-steps {
+  display: grid;
+  gap: 6px;
+}
+.plan-step {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: var(--space-2);
+  align-items: start;
+  padding: 7px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+}
+.plan-step-status {
+  color: var(--fg-dim);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+}
+.plan-step-status.completed {
+  color: var(--success);
+}
+.plan-step-status.inProgress {
+  color: var(--info);
+}
+.plan-step-text {
+  color: var(--fg);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  overflow-wrap: break-word;
+}
+.plan-card-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.plan-run-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 6px 11px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+.plan-run-btn:hover {
+  background: var(--bg-hover);
+}
+
 /* Typing indicator */
 .typing-indicator {
   display: flex;
@@ -2868,6 +2962,9 @@ a:hover {
 }
 .mode-pill[aria-pressed="true"] svg {
   opacity: 1;
+}
+#composer-plan-mode {
+  padding-top: var(--space-1);
 }
 
 /* ── 科研模式工具条(仅当选中 max effort 时显示) ── */
