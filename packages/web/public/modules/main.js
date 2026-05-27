@@ -125,7 +125,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=35'
+} from './messages.js?v=36'
 
 // ── WebSocket ──
 import {
@@ -169,7 +169,7 @@ import {
 } from './commands.js'
 import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
-import { initPlanPanel } from './planPanel.js?v=2'
+import { initPlanPanel } from './planPanel.js?v=3'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
 
 // ═══════════════════════════════════════════════════════════

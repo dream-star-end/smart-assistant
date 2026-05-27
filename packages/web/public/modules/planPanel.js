@@ -26,28 +26,37 @@ function _todoContent(t) {
 export function getLatestPlanAndTodos(sess = getSession()) {
   const messages = Array.isArray(sess?.messages) ? sess.messages : []
   let plan = null
+  let progressPlan = null
   let todo = null
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
-    if (!plan && m?.role === 'plan') plan = m
+    if (m?.role === 'plan') {
+      if (!plan && typeof m.text === 'string' && m.text.trim()) plan = m
+      if (!progressPlan && Array.isArray(m.steps) && m.steps.length > 0) progressPlan = m
+    }
     if (!todo && m?.role === 'tool' && m.toolName === 'TodoWrite') {
       const todos = Array.isArray(m.inputJson?.todos) ? m.inputJson.todos : null
       if (todos && todos.length > 0) todo = { msg: m, todos, source: 'todo' }
     }
     if (plan && todo) break
   }
-  if (!todo && Array.isArray(plan?.steps) && plan.steps.length > 0) {
+
+  // Prefer the generated plan document for the Current Plan section. If an
+  // older session only has a structured plan table, keep that as a fallback.
+  const displayPlan = plan || progressPlan
+
+  if (!todo && Array.isArray(progressPlan?.steps) && progressPlan.steps.length > 0) {
     todo = {
-      msg: plan,
+      msg: progressPlan,
       source: 'plan',
-      todos: plan.steps.map((s) => ({
+      todos: progressPlan.steps.map((s) => ({
         status: _normalizeStatus(s?.status),
         content: s?.step || '',
         activeForm: s?.step || '',
       })),
     }
   }
-  return { plan, todo }
+  return { plan: displayPlan, todo }
 }
 
 function _ensurePanel() {
@@ -138,14 +147,19 @@ function _renderPlanSection(root, plan) {
     return
   }
 
-  if (plan.explanation) {
+  if (plan.text) {
+    const draft = document.createElement('div')
+    draft.className = 'plan-panel-markdown plan-panel-draft'
+    _renderMarkdownInto(draft, plan.text, !!plan._partial)
+    section.appendChild(draft)
+  } else if (plan.explanation) {
     const explanation = document.createElement('div')
     explanation.className = 'plan-panel-markdown plan-panel-explanation'
     _renderMarkdownInto(explanation, plan.explanation, !!plan._partial)
     section.appendChild(explanation)
   }
 
-  if (Array.isArray(plan.steps) && plan.steps.length > 0) {
+  if (!plan.text && Array.isArray(plan.steps) && plan.steps.length > 0) {
     const steps = document.createElement('div')
     steps.className = 'plan-panel-steps'
     for (const s of plan.steps) {
@@ -171,11 +185,6 @@ function _renderPlanSection(root, plan) {
       steps.appendChild(row)
     }
     section.appendChild(steps)
-  } else if (plan.text) {
-    const draft = document.createElement('div')
-    draft.className = 'plan-panel-markdown plan-panel-draft'
-    _renderMarkdownInto(draft, plan.text, !!plan._partial)
-    section.appendChild(draft)
   }
 
   const actions = document.createElement('div')

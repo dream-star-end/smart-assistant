@@ -10,7 +10,7 @@ import {
   renderMarkdown,
   renderStreamingMarkdown,
 } from './markdown.js'
-import { refreshPlanPanel } from './planPanel.js?v=2'
+import { refreshPlanPanel } from './planPanel.js?v=3'
 import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=4'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
@@ -1279,13 +1279,18 @@ function _buildPlanCard(el, msg) {
 
   const body = document.createElement('div')
   body.className = 'plan-card-body'
-  if (msg.explanation) {
+  if (msg.text) {
+    const draft = document.createElement('div')
+    draft.className = 'plan-card-draft'
+    _renderPlanMarkdownInto(draft, msg.text, !!msg._partial)
+    body.appendChild(draft)
+  } else if (msg.explanation) {
     const explanation = document.createElement('div')
     explanation.className = 'plan-card-explanation'
     _renderPlanMarkdownInto(explanation, msg.explanation, !!msg._partial)
     body.appendChild(explanation)
   }
-  if (Array.isArray(msg.steps) && msg.steps.length > 0) {
+  if (!msg.text && Array.isArray(msg.steps) && msg.steps.length > 0) {
     const steps = document.createElement('div')
     steps.className = 'plan-steps'
     for (const s of msg.steps) {
@@ -1302,11 +1307,6 @@ function _buildPlanCard(el, msg) {
       steps.appendChild(row)
     }
     body.appendChild(steps)
-  } else if (msg.text) {
-    const draft = document.createElement('div')
-    draft.className = 'plan-card-draft'
-    _renderPlanMarkdownInto(draft, msg.text, !!msg._partial)
-    body.appendChild(draft)
   }
   el.appendChild(body)
 

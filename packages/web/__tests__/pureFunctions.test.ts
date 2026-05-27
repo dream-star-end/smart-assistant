@@ -106,6 +106,11 @@ const shouldAutoPlan = new Function(
 ${extractFunction(appJs, 'shouldAutoPlan').replace(/^export\s+/, '')}; return shouldAutoPlan;`,
 )() as (text?: string, attachments?: any[]) => boolean
 
+const getLatestPlanAndTodos = new Function(
+  `${extractFunction(appJs, '_normalizeStatus')}
+${extractFunction(appJs, 'getLatestPlanAndTodos').replace(/^export\s+/, '')}; return getLatestPlanAndTodos;`,
+)() as (sess: any) => { plan: any; todo: any }
+
 // Note: effectiveTheme() and isSending() depend on browser APIs (localStorage, state).
 // htmlSafeEscape is a one-line arrow function — hard to extract with indent matching.
 // All three will be directly importable after Phase 2 module extraction.
@@ -464,10 +469,10 @@ describe('T-PLAN-PANEL: plan markdown rendering and quick panel wiring', () => {
       'messages.js should define a dedicated plan markdown renderer',
     )
     assert.ok(
-      /function _buildPlanCard[\s\S]*?_renderPlanMarkdownInto\(explanation,\s*msg\.explanation[\s\S]*?_renderPlanMarkdownInto\(draft,\s*msg\.text/.test(
+      /function _buildPlanCard[\s\S]*?_renderPlanMarkdownInto\(draft,\s*msg\.text[\s\S]*?_renderPlanMarkdownInto\(explanation,\s*msg\.explanation/.test(
         appJs,
       ),
-      'plan explanation/draft should go through markdown rendering',
+      'plan document and explanation should go through markdown rendering',
     )
   })
   it('updateMessageEl handles role=plan so streaming plan updates refresh the card', () => {
@@ -484,6 +489,28 @@ describe('T-PLAN-PANEL: plan markdown rendering and quick panel wiring', () => {
     assert.ok(
       /m\?\.role === 'plan'/.test(appJs) && /m\.toolName === 'TodoWrite'/.test(appJs),
       'plan panel should scan current session messages for plan and TodoWrite',
+    )
+  })
+  it('keeps the generated plan document while using later steps as task progress', () => {
+    const docPlan = { id: 'plan-doc', role: 'plan', text: '# Plan\n\nDo the work.', _partial: false }
+    const progressPlan = {
+      id: 'plan-progress',
+      role: 'plan',
+      steps: [
+        { step: 'inspect', status: 'completed' },
+        { step: 'patch', status: 'inProgress' },
+      ],
+      _partial: true,
+    }
+    const { plan, todo } = getLatestPlanAndTodos({ messages: [docPlan, progressPlan] })
+    assert.equal(plan.id, 'plan-doc')
+    assert.equal(todo.msg.id, 'plan-progress')
+    assert.deepEqual(
+      todo.todos.map((t: any) => [t.content, t.status]),
+      [
+        ['inspect', 'completed'],
+        ['patch', 'in_progress'],
+      ],
     )
   })
   it('style includes right-side plan panel classes', () => {
