@@ -23,6 +23,13 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
+const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
+  'You are in implementation mode, not plan-only mode.',
+  'If the user asks to start or implement an approved plan, first create or update a concise task list, then execute the work in the same turn.',
+  'Keep exactly one task in progress while working and mark tasks completed as you finish them.',
+  'Do not create another review-only plan document unless the user explicitly asks to revise the plan.',
+].join(' ')
+
 // ───────────────────────────────────────────────
 // CodexAppServerRunner
 //
@@ -46,8 +53,8 @@ const log = createLogger({ module: 'codexAppServerRunner' })
 // Protocol notes (codex app-server v2 — verified against schemas at
 // /tmp/codex-protocol/v2 and live spike on 2026-04-30):
 //   - Line-delimited JSON-RPC 2.0 over stdio, bidirectional (server can issue
-//     requests too — we always reply -32601 method-not-found because there is
-//     no UI back-channel for permission/approval prompts in OpenClaude).
+//     requests too — recognized approval / MCP elicitation requests are
+//     answered in-process; unknown methods still fail fast with -32601).
 //   - Handshake: `initialize { clientInfo: { name, version } }` once per proc.
 //   - Thread create: `thread/start { approvalPolicy: 'never', sandbox: 'danger-full-access', cwd, model? }`.
 //     Resume: `thread/resume { threadId, approvalPolicy, sandbox, cwd?, model? }`.
@@ -83,6 +90,8 @@ export interface CodexAppServerRunnerOpts {
   config?: OpenClaudeConfig
   /** Forwarded to mcp-memory env so delegate_task can enforce recursion caps. */
   delegationDepth?: number
+  /** Per-turn default. SessionManager resets this before every submit. */
+  conversationMode?: 'default' | 'plan'
   /** V3 S12e CG8 telemetry — turn-level trace id stash,parity with
    *  SubprocessRunnerOpts.traceId。Codex app-server 是长驻进程,这个值当前
    *  **不**透传给子进程(env 未注入,JSON-RPC 协议也没 trace 字段);仅用于满足
@@ -453,6 +462,96 @@ export function _classifyJsonRpcLine(line: string): JsonRpcLine {
   return { kind: 'unknown' }
 }
 
+function jsonRpcResult(id: number | string, result: unknown): string {
+  return JSON.stringify({ jsonrpc: '2.0', id, result })
+}
+
+function jsonRpcMethodNotFound(id: number | string, method: string): string {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id,
+    error: {
+      code: -32601,
+      message: `method '${method}' not implemented by openclaude-gateway`,
+    },
+  })
+}
+
+function asRecord(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+}
+
+function chooseApprovalString(options: unknown[]): string {
+  const strings = options.filter((v): v is string => typeof v === 'string')
+  const preferred = [
+    'approve',
+    'always_allow',
+    'allow',
+    'approved',
+    'accept',
+    'approved_for_session',
+    'yes',
+  ]
+  for (const p of preferred) {
+    const hit = strings.find((s) => s.toLowerCase().includes(p))
+    if (hit) return hit
+  }
+  return (
+    strings.find((s) => !/decline|deny|denied|cancel|abort|reject/i.test(s)) ?? strings[0] ?? ''
+  )
+}
+
+function buildMcpElicitationFieldValue(schemaUnk: unknown): unknown {
+  const schema = asRecord(schemaUnk)
+  if ('default' in schema && schema.default !== undefined && schema.default !== null) {
+    return schema.default
+  }
+
+  if (Array.isArray(schema.enum)) {
+    return chooseApprovalString(schema.enum)
+  }
+  if (Array.isArray(schema.oneOf)) {
+    return chooseApprovalString(schema.oneOf.map((o) => asRecord(o).const))
+  }
+  const items = asRecord(schema.items)
+  if (Array.isArray(items.anyOf)) {
+    return [chooseApprovalString(items.anyOf.map((o) => asRecord(o).const))]
+  }
+  if (Array.isArray(items.enum)) {
+    return [chooseApprovalString(items.enum)]
+  }
+
+  switch (schema.type) {
+    case 'boolean':
+      return true
+    case 'number':
+    case 'integer':
+      return 0
+    case 'array':
+      return []
+    case 'string':
+      return ''
+    default:
+      return null
+  }
+}
+
+function buildMcpElicitationContent(paramsUnk: unknown): Record<string, unknown> | null {
+  const params = asRecord(paramsUnk)
+  if (params.mode !== 'form') return null
+  const requestedSchema = asRecord(params.requestedSchema)
+  const properties = asRecord(requestedSchema.properties)
+  const required = Array.isArray(requestedSchema.required)
+    ? requestedSchema.required.filter((v): v is string => typeof v === 'string')
+    : Object.keys(properties)
+  const out: Record<string, unknown> = {}
+  for (const key of required) {
+    if (!(key in properties)) continue
+    out[key] = buildMcpElicitationFieldValue(properties[key])
+  }
+  return out
+}
+
 export class CodexAppServerRunner extends EventEmitter {
   private threadId: string | null
   private proc: ChildProcessWithoutNullStreams | null = null
@@ -481,6 +580,10 @@ export class CodexAppServerRunner extends EventEmitter {
    *  imageGeneration savedPath emissions against text the model already
    *  surfaced via deltas. */
   private currentAssistantBuf = ''
+  /** Accumulated raw plan draft for codex item/plan/delta notifications. */
+  private currentPlanDraft = ''
+  /** Per-turn collaboration mode. SessionManager resets it before every submit. */
+  private conversationMode: 'default' | 'plan' = 'default'
   /** Cumulative thread `tokenUsage.total` snapshot at the moment the last
    *  turn completed — i.e. the baseline against which we compute the next
    *  turn's delta. null on first turn after construction (treated as
@@ -600,6 +703,10 @@ export class CodexAppServerRunner extends EventEmitter {
     this.effortLevel = level
   }
 
+  setConversationMode(mode: 'default' | 'plan' | undefined): void {
+    this.conversationMode = mode === 'plan' ? 'plan' : 'default'
+  }
+
   // ── model getter / setter (parity with CodexRunner / SubprocessRunner) ──
   // sessionManager.submit 在 InboundMessage 带 model 且与 runner.model 不同时调
   // runner.setModel,缺方法 → TypeError → turn 永不 complete → 用户卡 "思考中"。
@@ -694,9 +801,10 @@ export class CodexAppServerRunner extends EventEmitter {
 
   sendPermissionResponse(_requestId: string, _response: unknown): boolean {
     // Same rationale as CodexRunner: app-server is launched with
-    // approvalPolicy=never + sandbox=danger-full-access, so it never asks for
-    // approval. If future codex versions emit a request anyway, the
-    // server-request branch in handleLine answers method-not-found.
+    // approvalPolicy=never + sandbox=danger-full-access, so the browser
+    // permission callback is not used. If newer codex emits reverse-RPC
+    // approval requests anyway, the server-request branch in handleLine
+    // answers the recognized ones directly.
     return false
   }
 
@@ -723,6 +831,7 @@ export class CodexAppServerRunner extends EventEmitter {
     super()
     this.threadId = opts.resumeSessionId ?? null
     this.effortLevel = opts.effortLevel
+    this.setConversationMode(opts.conversationMode)
     // attached is intentionally false on construction even if we have a
     // resumed threadId — the first turn must explicitly thread/resume into
     // the freshly spawned proc.
@@ -921,6 +1030,15 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
+  private buildInitializeParams(): Record<string, unknown> {
+    return {
+      clientInfo: { name: 'openclaude-gateway', version: '1.0' },
+      capabilities: {
+        experimentalApi: true,
+      },
+    }
+  }
+
   private async ensureSpawned(
     repoSnap: RepoSnapshot | null,
     effectiveCwd: string,
@@ -1072,12 +1190,11 @@ export class CodexAppServerRunner extends EventEmitter {
       })
     })
 
-    // JSON-RPC handshake. Codex schema lists `clientInfo: { name, version }`
-    // (verified by spike). We call the proc fresh-spawned so writes won't
-    // EPIPE.
-    await this.sendRequest('initialize', {
-      clientInfo: { name: 'openclaude-gateway', version: '1.0' },
-    })
+    // JSON-RPC handshake. `collaborationMode` and related plan-first fields
+    // are gated behind Codex's experimental API capability, so declare it
+    // before any turn/start call. We call the proc fresh-spawned so writes
+    // won't EPIPE.
+    await this.sendRequest('initialize', this.buildInitializeParams())
     this.initialized = true
   }
 
@@ -1230,6 +1347,37 @@ export class CodexAppServerRunner extends EventEmitter {
     })
   }
 
+  private buildServerRequestAutoApproval(method: string, params: unknown): unknown | null {
+    switch (method) {
+      case 'item/commandExecution/requestApproval':
+        return { decision: 'acceptForSession' }
+      case 'item/fileChange/requestApproval':
+        return { decision: 'acceptForSession' }
+      case 'execCommandApproval':
+      case 'applyPatchApproval':
+        return { decision: 'approved_for_session' }
+      case 'item/permissions/requestApproval': {
+        const requested = asRecord(asRecord(params).permissions)
+        const permissions: Record<string, unknown> = {}
+        if (requested.network !== undefined && requested.network !== null) {
+          permissions.network = requested.network
+        }
+        if (requested.fileSystem !== undefined && requested.fileSystem !== null) {
+          permissions.fileSystem = requested.fileSystem
+        }
+        return { permissions, scope: 'session', strictAutoReview: false }
+      }
+      case 'mcpServer/elicitation/request':
+        return {
+          action: 'accept',
+          content: buildMcpElicitationContent(params),
+          _meta: null,
+        }
+      default:
+        return null
+    }
+  }
+
   private handleLine(line: string): void {
     const msg = _classifyJsonRpcLine(line)
     if (msg.kind === 'unknown') {
@@ -1268,35 +1416,87 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (msg.kind === 'server-request') {
-      // Two reverse-RPC methods we recognize:
-      //   - `account/chatgptAuthTokens/refresh` (codex 401-recovery): forward
-      //     to v3 master HTTP endpoint, reply with the new token. Without
-      //     this every codex 401 fails the turn.
-      //   - All others (permission prompts, MCP elicitations, etc.) — reply
-      //     -32601 method-not-found because we run approvalPolicy=never and
-      //     have no UI back-channel.
+      // Reverse-RPC methods we recognize:
+      //   - `account/chatgptAuthTokens/refresh` (commercial codex
+      //     401-recovery): forward to v3 master HTTP endpoint, reply with the
+      //     new token. This MUST stay ahead of generic approval handling.
+      //   - Approval / MCP elicitation requests: OpenClaude commercial runs
+      //     codex app-server as a trusted autonomous agent, so answer with a
+      //     session-scoped accept instead of hanging behind a browser prompt.
       if (msg.method === 'account/chatgptAuthTokens/refresh') {
         // Async fire-and-forget; we reply to codex in the callback. Errors
         // here become a JSON-RPC error frame back to codex.
         void this._handleChatgptAuthTokensRefresh(msg.id, msg.params)
         return
       }
-      this.writeRaw(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: msg.id,
-          error: {
-            code: -32601,
-            message: `method '${msg.method}' not implemented by openclaude-gateway`,
-          },
-        }),
-      )
+      const autoApproval = this.buildServerRequestAutoApproval(msg.method, msg.params)
+      if (autoApproval !== null) {
+        log.info('codex app-server server request auto-approved', {
+          sessionKey: this.opts.sessionKey,
+          method: msg.method,
+        })
+        this.writeRaw(jsonRpcResult(msg.id, autoApproval))
+      } else {
+        // Keep unknown server-initiated methods fail-fast so a future Codex
+        // protocol addition doesn't hang this runner silently.
+        this.writeRaw(jsonRpcMethodNotFound(msg.id, msg.method))
+      }
       return
     }
     if (msg.kind === 'notification') {
       this.handleNotification(msg.method, msg.params)
       return
     }
+  }
+
+  private emitPlanBlock(plan: {
+    text?: string
+    explanation?: string
+    steps?: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }>
+    partial?: boolean
+  }): void {
+    this.emit('message', {
+      type: 'openclaude_plan',
+      session_id: this.threadId,
+      plan: {
+        blockId: 'codex-plan',
+        ...plan,
+      },
+    } as unknown as RunnerMessage)
+  }
+
+  private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' | null {
+    switch (this.effortLevel) {
+      case 'low':
+      case 'medium':
+      case 'high':
+      case 'xhigh':
+        return this.effortLevel
+      case 'max':
+        return 'xhigh'
+      default:
+        return null
+    }
+  }
+
+  private buildTurnStartParams(prompt: string): Record<string, unknown> {
+    const mode = this.conversationMode
+    const params: Record<string, unknown> = {
+      threadId: this.threadId,
+      input: [{ type: 'text', text: prompt }],
+      collaborationMode: {
+        mode,
+        settings: {
+          model: this.opts.model ?? '',
+          reasoning_effort: this.codexReasoningEffort(),
+          developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
+        },
+      },
+      sandboxPolicy:
+        mode === 'plan' ? { type: 'readOnly', networkAccess: true } : { type: 'dangerFullAccess' },
+    }
+    if (this.opts.model) params.model = this.opts.model
+    return params
   }
 
   private handleNotification(method: string, params: unknown): void {
@@ -1341,6 +1541,36 @@ export class CodexAppServerRunner extends EventEmitter {
           delta: { type: 'text_delta', text: delta },
         },
       } as unknown as RunnerMessage)
+      return
+    }
+    if (method === 'item/plan/delta') {
+      const delta = typeof p.delta === 'string' ? p.delta : ''
+      if (!delta) return
+      this.currentPlanDraft += delta
+      this.emitPlanBlock({ text: this.currentPlanDraft, partial: true })
+      return
+    }
+    if (method === 'turn/plan/updated') {
+      const explanation = typeof p.explanation === 'string' ? p.explanation : undefined
+      const rawSteps = Array.isArray(p.plan) ? p.plan : []
+      const steps = rawSteps
+        .map((s) => {
+          const obj = s && typeof s === 'object' ? (s as Record<string, unknown>) : {}
+          const step = typeof obj.step === 'string' ? obj.step : ''
+          const status = obj.status
+          if (!step) return null
+          return {
+            step,
+            status:
+              status === 'inProgress' || status === 'completed' || status === 'pending'
+                ? status
+                : 'pending',
+          } as const
+        })
+        .filter((s): s is { step: string; status: 'pending' | 'inProgress' | 'completed' } =>
+          Boolean(s),
+        )
+      this.emitPlanBlock({ explanation, steps, partial: true })
       return
     }
     // Reasoning streaming: codex emits raw `textDelta` (chain-of-thought) OR
@@ -1755,6 +1985,7 @@ export class CodexAppServerRunner extends EventEmitter {
       repoBound: this._boundRepoBinding != null,
     })
     this.currentAssistantBuf = ''
+    this.currentPlanDraft = ''
     // Per-item reasoning state is turn-scoped (codex re-assigns itemIds each
     // turn) — clear at turn-start so the summary/mode lock and first-part
     // skip flag don't bleed across turns.
@@ -1827,10 +2058,9 @@ export class CodexAppServerRunner extends EventEmitter {
         this.currentTurnCompleter = { resolve, reject }
       })
 
-      const tres = (await this.sendRequest('turn/start', {
-        threadId: this.threadId,
-        input: [{ type: 'text', text: prompt }],
-      })) as { turn?: { id?: string } } | undefined
+      const tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
+        | { turn?: { id?: string } }
+        | undefined
       const turnId = tres?.turn?.id
       if (typeof turnId !== 'string' || !turnId) {
         throw new Error('turn/start did not return turn.id')

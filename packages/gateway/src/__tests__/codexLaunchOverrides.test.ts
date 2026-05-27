@@ -215,8 +215,9 @@ describe('buildCodexLaunchOverrides', () => {
       gatewayPort: 18789,
       gatewayToken: 'tok-xyz',
     })
-    // If mcp-memory entry was found, the override list must include three
-    // mcp_servers.openclaude_memory.* entries in the order: command, args, env.
+    // If mcp-memory entry was found, the override list must include four
+    // mcp_servers.openclaude_memory.* entries in the order: command, args,
+    // env, approval mode.
     const mcpKeys = out.argvOverrides
       .filter((s) => s.startsWith('mcp_servers.openclaude_memory.'))
       .map((s) => s.slice(0, s.indexOf('=')))
@@ -225,6 +226,7 @@ describe('buildCodexLaunchOverrides', () => {
         'mcp_servers.openclaude_memory.command',
         'mcp_servers.openclaude_memory.args',
         'mcp_servers.openclaude_memory.env',
+        'mcp_servers.openclaude_memory.default_tools_approval_mode',
       ])
     }
   })

@@ -178,6 +178,16 @@ const buildToolUseLabel = makeCallable<(block: any) => string>(
   extractFunction(appJs, 'buildToolUseLabel'),
 )
 
+const shouldAutoPlan = new Function(
+  `${extractFunction(appJs, '_hasAny')}
+${extractFunction(appJs, 'shouldAutoPlan').replace(/^export\s+/, '')}; return shouldAutoPlan;`,
+)() as (text?: string, attachments?: any[]) => boolean
+
+const getLatestPlanAndTodos = new Function(
+  `${extractFunction(appJs, '_normalizeStatus')}
+${extractFunction(appJs, 'getLatestPlanAndTodos').replace(/^export\s+/, '')}; return getLatestPlanAndTodos;`,
+)() as (sess: any) => { plan: any; todo: any }
+
 // Note: effectiveTheme() and isSending() depend on browser APIs (localStorage, state).
 // htmlSafeEscape is a one-line arrow function — hard to extract with indent matching.
 // All three will be directly importable after Phase 2 module extraction.
@@ -799,6 +809,52 @@ describe('T17: _stripMessageEphemeral — PUT 前 strip 客户端瞎写的字段
   })
   it('空数组 → 空数组', () => {
     assert.deepEqual(_stripMessageEphemeral([]), [])
+  })
+})
+
+
+// ── T-AUTO-PLAN: automatic plan-first routing heuristic ──
+describe('T-AUTO-PLAN: shouldAutoPlan heuristic', () => {
+  it('routes complex multi-step code work to plan mode', () => {
+    assert.equal(shouldAutoPlan('修复 gateway 认证问题，然后补测试并保证前端缓存兼容'), true)
+  })
+
+  it('keeps simple one-step requests in default mode', () => {
+    assert.equal(shouldAutoPlan('把按钮文案改成保存'), false)
+  })
+
+  it('honors explicit short plan generation requests', () => {
+    assert.equal(shouldAutoPlan('随便生成一个计划'), true)
+  })
+
+  it('keeps explicit implementation/resume prompts in default mode', () => {
+    assert.equal(shouldAutoPlan('按上面的计划开始实施。'), false)
+  })
+})
+
+// ── T-PLAN-PANEL: Codex plan / TodoWrite quick panel wiring ──
+describe('T-PLAN-PANEL: plan document and progress separation', () => {
+  it('keeps the generated plan document while using later steps as task progress', () => {
+    const docPlan = { id: 'plan-doc', role: 'plan', text: '# Plan\n\nDo the work.', _partial: false }
+    const progressPlan = {
+      id: 'plan-progress',
+      role: 'plan',
+      steps: [
+        { step: 'inspect', status: 'completed' },
+        { step: 'patch', status: 'inProgress' },
+      ],
+      _partial: true,
+    }
+    const { plan, todo } = getLatestPlanAndTodos({ messages: [docPlan, progressPlan] })
+    assert.equal(plan.id, 'plan-doc')
+    assert.equal(todo.msg.id, 'plan-progress')
+    assert.deepEqual(
+      todo.todos.map((t: any) => [t.content, t.status]),
+      [
+        ['inspect', 'completed'],
+        ['patch', 'in_progress'],
+      ],
+    )
   })
 })
 

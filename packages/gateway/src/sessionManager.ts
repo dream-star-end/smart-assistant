@@ -1262,6 +1262,9 @@ export class SessionManager {
      *  threaded in CG8 together with the subprocessRunner env injection so
      *  the whole turn-internal log path lands as one coherent step. */
     traceId?: string,
+    /** Codex-native app-server only. Omitted means default mode so a previous
+     *  plan-only turn cannot leak into ordinary follow-up turns. */
+    conversationMode?: 'default' | 'plan',
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
@@ -1294,6 +1297,10 @@ export class SessionManager {
       // stdin JSON-RPC 扩展。Lock 保证 setTraceId 与并发 submit() 串行,不会
       // 跨 turn 互踩。
       if (traceId !== undefined) session.runner.setTraceId(traceId)
+      const maybeSetConversationMode = (session.runner as any).setConversationMode
+      if (typeof maybeSetConversationMode === 'function') {
+        maybeSetConversationMode.call(session.runner, conversationMode ?? 'default')
+      }
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn
       //   - 本 turn 之后:env / cli args 已被 CCB 启动时读完,改也无效

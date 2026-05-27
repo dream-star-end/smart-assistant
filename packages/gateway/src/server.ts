@@ -6285,6 +6285,12 @@ export class Gateway {
     // 已在 inferAgentForModel 路由前算过(safeModelForRouting),此处复用避免重复。
     const safeModel: string | undefined = safeModelForRouting
 
+    const _frameConversationMode = (frame as any).conversationMode
+    const safeConversationMode: 'default' | 'plan' | undefined =
+      _frameConversationMode === 'default' || _frameConversationMode === 'plan'
+        ? _frameConversationMode
+        : undefined
+
     // PR2 v1.0.66 — 提取 server-owned requestId(master 强制写入)。
     // 容器侧不验证、不生成、也不回退:不带 → undefined,sessionManager 透传给
     // CodexAppServerRunner queue entry,emitResult 时若不带 requestId 则不发
@@ -6933,7 +6939,7 @@ export class Gateway {
           adapter,
         )
       }
-    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId)
+    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, safeConversationMode)
   }
 
   /**

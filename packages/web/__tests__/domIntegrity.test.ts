@@ -71,6 +71,14 @@ const DYNAMIC_IDS = new Set([
   // #github-unlink-btn 注入 #github-account-bar.innerHTML,然后立即绑 onclick
   'github-link-btn',
   'github-unlink-btn',
+  // planPanel.js creates these lazily when the first session plan/todo state
+  // is rendered; they are not static in index.html.
+  'plan-panel-btn',
+  'plan-panel-badge',
+  'plan-panel-backdrop',
+  'plan-panel',
+  'plan-panel-close',
+  'plan-panel-content',
 ])
 
 // ── Template-literal dynamic IDs: $(`prefix-${var}`) ──

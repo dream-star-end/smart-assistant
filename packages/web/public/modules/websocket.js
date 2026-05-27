@@ -2270,6 +2270,30 @@ export function handleOutbound(frame) {
           }
         })
       }
+    } else if (block.kind === 'plan') {
+      // Codex app-server native plan updates. Treat blockId as the stable
+      // identity so item/plan/delta and turn/plan/updated update one visible
+      // plan card instead of appending a new card for every delta.
+      const blockId = block.blockId || 'codex-plan'
+      let planMsg = sess.messages.find((m) => m.role === 'plan' && m.blockId === blockId)
+      if (!planMsg) {
+        planMsg = addMessage(sess, 'plan', block.text || '', {
+          blockId,
+          _partial: !!block.partial,
+          explanation: block.explanation || '',
+          steps: Array.isArray(block.steps) ? block.steps : [],
+        })
+      } else {
+        if (typeof block.text === 'string') planMsg.text = block.text
+        if (typeof block.explanation === 'string') planMsg.explanation = block.explanation
+        if (Array.isArray(block.steps)) planMsg.steps = block.steps
+        planMsg._partial = !!block.partial
+        planMsg.completedAt = Date.now()
+      }
+      if (sess.id === state.currentSessionId) {
+        _deps.updateMessageEl(planMsg, !!block.partial)
+        _deps.scrollBottom()
+      }
     } else if (block.kind === 'tool_use') {
       // The assistant text (and thinking) segment just ended — next turn
       // content will go into a new message. Stamp completion time BEFORE

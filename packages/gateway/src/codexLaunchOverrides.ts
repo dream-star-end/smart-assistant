@@ -345,6 +345,8 @@ export async function buildCodexLaunchOverrides(
       `mcp_servers.openclaude_memory.args=${tomlValue(['tsx', mcpEntry])}`,
       '-c',
       `mcp_servers.openclaude_memory.env=${tomlValue(mcpEnv)}`,
+      '-c',
+      `mcp_servers.openclaude_memory.default_tools_approval_mode=${tomlValue('approve')}`,
     )
   }
 

@@ -77,6 +77,37 @@ describe('CcbMessageParser: text streaming', () => {
       assert.equal(events[0].block.kind, 'thinking')
     }
   })
+
+  it('emits plan blocks from codex openclaude_plan payloads', () => {
+    const { parser, events } = createParser()
+
+    parser.parse({
+      type: 'openclaude_plan',
+      plan: {
+        blockId: 'codex-plan',
+        explanation: 'verify first',
+        steps: [
+          { step: 'inspect code', status: 'completed' },
+          { step: 'patch UI', status: 'inProgress' },
+        ],
+        partial: true,
+      },
+    } as any)
+
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'block')
+    if (events[0].kind === 'block') {
+      const b = events[0].block as any
+      assert.equal(b.kind, 'plan')
+      assert.equal(b.blockId, 'codex-plan')
+      assert.equal(b.explanation, 'verify first')
+      assert.deepEqual(b.steps, [
+        { step: 'inspect code', status: 'completed' },
+        { step: 'patch UI', status: 'inProgress' },
+      ])
+      assert.equal(b.partial, true)
+    }
+  })
 })
 
 // ── Thinking accumulation (Phase 0.4 server-authored persistence) ──

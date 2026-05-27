@@ -198,6 +198,8 @@ import {
   renderModePills,
 } from './effortMode.js?v=71ba55d6'
 import { initModelPicker, renderModelPill } from './modelPicker.js?v=71ba55d6'
+import { getConversationModeForSubmit } from './planMode.js?v=auto'
+import { initPlanPanel } from './planPanel.js?v=auto'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
@@ -1038,6 +1040,7 @@ handleBootGithubParams()
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown
 // 内再触发一次;这里只是绑定点击/键盘事件并把初始隐藏态打上去。
 initModePills()
+initPlanPanel()
 
 // ── 模型选择器(v1.0.4 新增): bind once + 注入 reloadAgents 回调 ──
 // 切换成功后内部会调 _reloadAgents() 拉最新 agent.model 进 state,然后再
@@ -1179,6 +1182,7 @@ function send() {
       filename: a.name,
     }))
   const effortLevel = getEffortForSubmit()
+  const conversationMode = getConversationModeForSubmit(text, state.attachments)
   // v1.0.4 — frame.model 从 user prefs 取(C 方案)。空字符串视同未设。
   // server.ts WS 入口对此值做静态白名单兜底,前端无需 validate。
   const _prefModel = state.userPrefs?.default_model
@@ -1193,6 +1197,7 @@ function send() {
     // string='xhigh'/'max' → 切到该 effort;null → 显式清除回模型默认;
     // undefined → 不参与 effort 协商(非 Opus 4.7 agent 走这条)。
     ...(effortLevel !== undefined ? { effortLevel } : {}),
+    ...(conversationMode !== undefined ? { conversationMode } : {}),
     // string=model id → 触发 runner 切模型(下次 spawn 生效);
     // undefined → 沿用 agent.model。无清除语义(setModel(undefined) 会重置)
     ...(modelOverride !== undefined ? { model: modelOverride } : {}),

@@ -38,6 +38,10 @@ const SHELL = [
   '/modules/effortMode.js',
   '/modules/modelPicker.js',
   '/modules/modelPicker.js?v=71ba55d6',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/planMode.js',
+  '/modules/planMode.js?v=auto',  // 版本化 URL(main.js/messages.js import 带 ?v=)
+  '/modules/planPanel.js',
+  '/modules/planPanel.js?v=auto',  // 版本化 URL(main.js/messages.js import 带 ?v=)
   '/modules/sessions.js',
   '/modules/sync.js',
   '/modules/messages.js',

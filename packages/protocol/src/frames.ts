@@ -49,8 +49,8 @@ export const InboundMessage = Type.Object({
     media: Type.Optional(Type.Array(MediaRef)),
   }),
   replyToId: Type.Optional(Type.String()),
-  // CCB effort level override for this session (一般来自 Web 前端的"编码模式/科研模式" pill)。
-  //   - 字符串 ∈ EFFORT_LEVELS:把 CLAUDE_CODE_EFFORT_LEVEL 设成该值
+  // Effort/reasoning-depth override for this session (一般来自 Web 前端的"编码模式/科研模式/GPT思考深度" pill)。
+  //   - 字符串 ∈ EFFORT_LEVELS:CCB 写 CLAUDE_CODE_EFFORT_LEVEL; Codex 写 model_reasoning_effort(支持的取值)
   //   - null:**显式清除** — 让 gateway 把已有 runner 的 effort env 复位到模型默认
   //   - 字段缺省 (undefined):什么也不做 (其他 channel 默认行为)
   // 区分 null 与缺省是为了让 Web pill 的"取消选中"能反向取消之前的 xhigh/max,
@@ -76,6 +76,11 @@ export const InboundMessage = Type.Object({
   // 实际接收方(gateway server.ts)会按静态 allowlist 过滤,无效 model 静默
   // 丢弃 —— 防止用户 prefs 里残留 admin 已 disable 的 model 把 CCB 启不起来。
   model: Type.Optional(Type.String()),
+  // Codex-native app-server conversation mode. `plan` asks Codex to produce a
+  // reviewable read-only plan; `default` runs the implementation turn. Omitted
+  // means runner default (commercial UI normally omits this; autonomous plan
+  // updates are driven by Codex developer instructions).
+  conversationMode: Type.Optional(Type.Union([Type.Literal('default'), Type.Literal('plan')])),
   // PR2 v1.0.66 — server-owned per-turn 标识。商用版 master 在 inbound 落到容器
   // **之前**强制写入(忽略 client 提供的值);承担 codex 真扣费的 inflight 关联键:
   //   master.userChatBridge: ensureRequestIdServerSide → preCheck → 写 inflightCodexTurns[requestId]
@@ -243,6 +248,26 @@ export const OutboundContentBlock = Type.Union([
     // mid-chat model switches). Subagent thinking omits this — it goes
     // into Agent card childBlocks not a top-level thinking row.
     messageId: Type.Optional(Type.String()),
+  }),
+  Type.Object({
+    kind: Type.Literal('plan'),
+    blockId: Type.Optional(Type.String()),
+    text: Type.Optional(Type.String()),
+    explanation: Type.Optional(Type.String()),
+    steps: Type.Optional(
+      Type.Array(
+        Type.Object({
+          step: Type.String(),
+          status: Type.Union([
+            Type.Literal('pending'),
+            Type.Literal('inProgress'),
+            Type.Literal('completed'),
+          ]),
+        }),
+      ),
+    ),
+    partial: Type.Optional(Type.Boolean()),
+    parentToolUseId: Type.Optional(Type.String()),
   }),
   // Snapshot of a long-running bash command's tail output. Snapshot
   // semantics: the consumer REPLACES its prior tail buffer with `tail`

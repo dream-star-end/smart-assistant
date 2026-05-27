@@ -225,7 +225,7 @@ describe('handleLine — dispatch', () => {
     await h.cleanup()
   })
 
-  it('server-request always responds with -32601 method-not-found', async () => {
+  it('unknown server-request responds with -32601 method-not-found', async () => {
     const h = await makeHarness({ withFakeProc: true })
     feed(h.runner, {
       jsonrpc: '2.0',
@@ -238,6 +238,21 @@ describe('handleLine — dispatch', () => {
     assert.equal(reply.id, 'srv-1')
     assert.equal(reply.error.code, -32601)
     assert.match(reply.error.message, /permission\/request/)
+    await h.cleanup()
+  })
+
+  it('auto-approves recognized codex permission requests for the session', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: 'srv-approve',
+      method: 'item/commandExecution/requestApproval',
+      params: { command: 'pwd' },
+    })
+    assert.equal(h.written.length, 1)
+    const reply = JSON.parse(h.written[0])
+    assert.equal(reply.id, 'srv-approve')
+    assert.deepEqual(reply.result, { decision: 'acceptForSession' })
     await h.cleanup()
   })
 
@@ -303,6 +318,52 @@ describe('handleNotification — item/agentMessage/delta', () => {
       params: { threadId: 'thr-1', turnId: 't-stream', itemId: 'i-1', delta: '' },
     })
     assert.equal(h.messages.length, 0)
+    await h.cleanup()
+  })
+})
+
+describe('handleNotification — native plan updates', () => {
+  it('emits OpenClaude plan messages from codex plan deltas and updates', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).threadId = 'thr-plan'
+    ;(h.runner as any).activeTurnId = 't-plan'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/plan/delta',
+      params: { threadId: 'thr-plan', turnId: 't-plan', delta: 'Step 1' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/plan/delta',
+      params: { threadId: 'thr-plan', turnId: 't-plan', delta: '\nStep 2' },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thr-plan',
+        turnId: 't-plan',
+        explanation: 'Implementation plan',
+        plan: [
+          { step: 'Inspect', status: 'completed' },
+          { step: 'Patch', status: 'inProgress' },
+          { step: 'Verify', status: 'blocked' },
+        ],
+      },
+    })
+
+    assert.equal(h.messages.length, 3)
+    assert.equal(h.messages[0].type, 'openclaude_plan')
+    assert.equal(h.messages[0].session_id, 'thr-plan')
+    assert.equal(h.messages[0].plan.text, 'Step 1')
+    assert.equal(h.messages[1].plan.text, 'Step 1\nStep 2')
+    assert.equal(h.messages[2].plan.explanation, 'Implementation plan')
+    assert.deepEqual(h.messages[2].plan.steps, [
+      { step: 'Inspect', status: 'completed' },
+      { step: 'Patch', status: 'inProgress' },
+      { step: 'Verify', status: 'pending' },
+    ])
+    assert.equal(h.messages[2].plan.partial, true)
     await h.cleanup()
   })
 })
