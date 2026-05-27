@@ -503,6 +503,15 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
+  private buildInitializeParams(): Record<string, unknown> {
+    return {
+      clientInfo: { name: 'openclaude-gateway', version: '1.0' },
+      capabilities: {
+        experimentalApi: true,
+      },
+    }
+  }
+
   private async ensureSpawned(): Promise<void> {
     if (this.proc && !this.proc.killed && this.initialized) return
     if (this.proc && !this.proc.killed && !this.initialized) {
@@ -641,12 +650,10 @@ export class CodexAppServerRunner extends EventEmitter {
       })
     })
 
-    // JSON-RPC handshake. Codex schema lists `clientInfo: { name, version }`
-    // (verified by spike). We call the proc fresh-spawned so writes won't
-    // EPIPE.
-    await this.sendRequest('initialize', {
-      clientInfo: { name: 'openclaude-gateway', version: '1.0' },
-    })
+    // JSON-RPC handshake. `collaborationMode` and related plan-first fields are
+    // gated behind Codex's experimental API capability, so declare it before any
+    // turn/start call. We call the proc fresh-spawned so writes won't EPIPE.
+    await this.sendRequest('initialize', this.buildInitializeParams())
     this.initialized = true
   }
 

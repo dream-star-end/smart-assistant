@@ -192,6 +192,22 @@ describe('CodexAppServerRunner.start', () => {
   })
 })
 
+describe('CodexAppServerRunner initialize', () => {
+  it('declares experimentalApi for plan-first collaborationMode fields', async () => {
+    const h = await makeHarness()
+
+    const params = (h.runner as any).buildInitializeParams()
+
+    assert.deepEqual(params, {
+      clientInfo: { name: 'openclaude-gateway', version: '1.0' },
+      capabilities: {
+        experimentalApi: true,
+      },
+    })
+    await h.cleanup()
+  })
+})
+
 describe('CodexAppServerRunner plan-first turn/start params', () => {
   it('plan mode uses codex collaborationMode=plan and read-only sandbox', async () => {
     const h = await makeHarness({
