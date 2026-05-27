@@ -448,6 +448,9 @@ describe('T-AUTO-PLAN: shouldAutoPlan heuristic', () => {
   it('keeps simple one-step requests in default mode', () => {
     assert.equal(shouldAutoPlan('把按钮文案改成保存'), false)
   })
+  it('honors explicit short plan generation requests', () => {
+    assert.equal(shouldAutoPlan('随便生成一个计划'), true)
+  })
   it('keeps explicit implementation/resume prompts in default mode', () => {
     assert.equal(shouldAutoPlan('按上面的计划开始实施。'), false)
   })

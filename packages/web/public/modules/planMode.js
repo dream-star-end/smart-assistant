@@ -34,6 +34,18 @@ export function shouldAutoPlan(userText = '', attachments = []) {
     return false
   }
 
+  // If the user explicitly asks for a plan/方案/计划文档, honor that even if
+  // the prompt is short (useful for UI verification and plan-only review).
+  if (
+    _hasAny(text, [
+      /(生成|制定|写|给|出|创建|输出).{0,10}(计划|方案|实施方案|计划文档)/,
+      /(计划|方案|计划文档).{0,10}(先|看看|评审|确认|review)/i,
+      /\b(plan|planning document|proposal)\b/i,
+    ])
+  ) {
+    return true
+  }
+
   let score = 0
   if (text.length >= 220) score += 2
   else if (text.length >= 120) score += 1

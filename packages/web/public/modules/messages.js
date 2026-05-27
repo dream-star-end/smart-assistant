@@ -11,7 +11,7 @@ import {
   renderStreamingMarkdown,
 } from './markdown.js'
 import { refreshPlanPanel } from './planPanel.js?v=2'
-import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=3'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=4'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 import { msgTimeLabel, shortTime } from './util.js'
