@@ -1,5 +1,5 @@
 // OpenClaude — Codex automatic plan-first routing
-import { getSession, state } from './state.js?v=auto'
+import { getSession, state } from './state.js?v=b3b1347c'
 
 let _forceDefaultNextSubmit = false
 
