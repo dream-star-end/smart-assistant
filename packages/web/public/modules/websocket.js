@@ -458,6 +458,91 @@ export function _applyPartialJsonDelta(current, block) {
   return { action: 'drop' }
 }
 
+function _isPlanTurnBoundary(msg) {
+  return msg && (msg.role === 'user' || msg.role === 'system')
+}
+
+function _planTurnStart(messages, beforeIndex) {
+  const arr = Array.isArray(messages) ? messages : []
+  let i = Math.min(typeof beforeIndex === 'number' ? beforeIndex : arr.length, arr.length) - 1
+  for (; i >= 0; i--) {
+    if (_isPlanTurnBoundary(arr[i])) return i + 1
+  }
+  return 0
+}
+
+function _planTurnEnd(messages, startIndex) {
+  const arr = Array.isArray(messages) ? messages : []
+  for (let i = Math.max(0, startIndex); i < arr.length; i++) {
+    if (_isPlanTurnBoundary(arr[i])) return i
+  }
+  return arr.length
+}
+
+function _safePlanIdPart(value) {
+  return String(value || 'codex-plan').replace(/[^a-zA-Z0-9_.:-]/g, '_')
+}
+
+export function _planMessageId(blockId, turnStart) {
+  return `plan:${_safePlanIdPart(blockId)}:g${Number.isFinite(turnStart) ? turnStart : 0}`
+}
+
+function _planMsgTime(msg) {
+  const completedAt = Number(msg?.completedAt || 0)
+  const ts = Number(msg?.ts || 0)
+  return Math.max(
+    Number.isFinite(completedAt) ? completedAt : 0,
+    Number.isFinite(ts) ? ts : 0,
+  )
+}
+
+function _planMsgRank(msg) {
+  const steps = Array.isArray(msg?.steps) ? msg.steps : []
+  const completed = steps.filter((s) => s && s.status === 'completed').length
+  const partialRank = msg?._partial === false ? 2 : msg?._partial === true ? 0 : 1
+  return [partialRank, completed, steps.length, _planMsgTime(msg)]
+}
+
+function _comparePlanMsg(a, b) {
+  const ar = _planMsgRank(a)
+  const br = _planMsgRank(b)
+  for (let i = 0; i < ar.length; i++) {
+    if (ar[i] !== br[i]) return ar[i] - br[i]
+  }
+  return 0
+}
+
+function _findPlanInRange(messages, blockId, start, end) {
+  for (let i = start; i < end; i++) {
+    const m = messages[i]
+    if (m && m.role === 'plan' && m.blockId === blockId) return m
+  }
+  return null
+}
+
+export function _coalescePlanMessagesInTurn(messages, blockId, anchor) {
+  if (!Array.isArray(messages) || !blockId) return anchor || null
+  const anchorIndex = anchor ? messages.indexOf(anchor) : -1
+  const start = _planTurnStart(messages, anchorIndex >= 0 ? anchorIndex + 1 : messages.length)
+  const end = _planTurnEnd(messages, start)
+  const matches = []
+  for (let i = start; i < end; i++) {
+    const m = messages[i]
+    if (m && m.role === 'plan' && m.blockId === blockId) matches.push(m)
+  }
+  if (matches.length <= 1) return matches[0] || anchor || null
+  let keep = matches[0]
+  for (const m of matches.slice(1)) {
+    if (_comparePlanMsg(m, keep) > 0) keep = m
+  }
+  for (const m of matches) {
+    if (m === keep) continue
+    const idx = messages.indexOf(m)
+    if (idx >= 0) messages.splice(idx, 1)
+  }
+  return keep
+}
+
 export function addMessage(sess, role, text, extra) {
   extra = extra || {}
   const msg = Object.assign({ id: _deps.msgId(), role, text: text || '', ts: Date.now() }, extra)
@@ -2362,22 +2447,30 @@ export function handleOutbound(frame) {
       // identity so item/plan/delta and turn/plan/updated update one visible
       // plan card instead of appending a new card for every delta.
       const blockId = block.blockId || 'codex-plan'
-      let planMsg = sess.messages.find((m) => m.role === 'plan' && m.blockId === blockId)
+      const turnStart = _planTurnStart(sess.messages, sess.messages.length)
+      let planMsg = _findPlanInRange(sess.messages, blockId, turnStart, sess.messages.length)
       if (!planMsg) {
         planMsg = addMessage(sess, 'plan', block.text || '', {
+          id: _planMessageId(blockId, turnStart),
           blockId,
           _partial: !!block.partial,
           explanation: block.explanation || '',
           steps: Array.isArray(block.steps) ? block.steps : [],
         })
       } else {
+        planMsg = _coalescePlanMessagesInTurn(sess.messages, blockId, planMsg)
         if (typeof block.text === 'string') planMsg.text = block.text
         if (typeof block.explanation === 'string') planMsg.explanation = block.explanation
         if (Array.isArray(block.steps)) planMsg.steps = block.steps
         planMsg._partial = !!block.partial
         planMsg.completedAt = Date.now()
       }
+      const beforePlanCoalesce = sess.messages.length
+      planMsg = _coalescePlanMessagesInTurn(sess.messages, blockId, planMsg) || planMsg
       if (sess.id === state.currentSessionId) {
+        if (sess.messages.length !== beforePlanCoalesce) {
+          try { _deps.renderMessages() } catch {}
+        }
         _deps.updateMessageEl(planMsg, !!block.partial)
         _deps.scrollBottom()
       }

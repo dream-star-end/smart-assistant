@@ -777,9 +777,9 @@ export function _stripClientPutMessages(messages: readonly unknown[]): MessageLi
  *      background recovery.
  *   4. Result is sorted by ts ascending; ties preserve insertion order
  *      (Array.prototype.sort is stable in ES2019+).
- *   5. If there are zero server-authored entries, `clientMsgs` is returned
- *      verbatim (no copy, same reference) — callers rely on this as a fast
- *      path.
+ *   5. If there are zero server-authored entries AND no duplicate client
+ *      plan rows, `clientMsgs` is returned verbatim (no copy, same reference)
+ *      — callers rely on this as a fast path.
  *   6. **Phantom-tool dedupe** (Phase 1 tool durability fix): client and
  *      server use independent tool message IDs (client uses `m-*`; server
  *      writes `srv-${sessionId}-t${turnIndex}-tool-${blockId}`) but share
@@ -803,14 +803,15 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
       serverAuthored.set(m.id, m)
     }
   }
-  if (serverAuthored.size === 0) return clientMsgs
+  const planDedupedClientMsgs = dedupeClientPlanRowsWithinTurns(clientMsgs)
+  if (serverAuthored.size === 0) return planDedupedClientMsgs
 
   const clientIds = new Set<string>()
-  for (const m of clientMsgs) {
+  for (const m of planDedupedClientMsgs) {
     if (m && typeof m.id === 'string') clientIds.add(m.id)
   }
 
-  const merged: T[] = clientMsgs.map((m) => {
+  const merged: T[] = planDedupedClientMsgs.map((m) => {
     if (m && typeof m.id === 'string' && serverAuthored.has(m.id)) {
       return serverAuthored.get(m.id) as T
     }
@@ -927,7 +928,101 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
     }
     deduped.push(cur)
   }
-  return deduped
+  return dedupeClientPlanRowsWithinTurns(deduped) as T[]
+}
+
+function isPlanTurnBoundary(m: MessageLike): boolean {
+  const role = (m as { role?: unknown }).role
+  return role === 'user' || role === 'system'
+}
+
+function isClientPlanWithBlockId(m: MessageLike): boolean {
+  const blockId = planBlockId(m)
+  return (
+    m._source !== 'server' &&
+    (m as { role?: unknown }).role === 'plan' &&
+    blockId !== null
+  )
+}
+
+function planBlockId(m: MessageLike): string | null {
+  const blockId = (m as { blockId?: unknown }).blockId
+  return typeof blockId === 'string' && blockId.length > 0 ? blockId : null
+}
+
+function planRank(m: MessageLike): [number, number, number, number] {
+  const partial = (m as { _partial?: unknown })._partial
+  const partialRank = partial === false ? 2 : partial === true ? 0 : 1
+  const steps = Array.isArray((m as { steps?: unknown }).steps)
+    ? (m as { steps: unknown[] }).steps
+    : []
+  const completed = steps.filter((s) =>
+    s && typeof s === 'object' && (s as { status?: unknown }).status === 'completed'
+  ).length
+  const completedAt = (m as { completedAt?: unknown }).completedAt
+  const time = Math.max(
+    typeof completedAt === 'number' && Number.isFinite(completedAt) ? completedAt : 0,
+    typeof m.ts === 'number' && Number.isFinite(m.ts) ? m.ts : 0,
+  )
+  return [partialRank, completed, steps.length, time]
+}
+
+function comparePlan(a: MessageLike, b: MessageLike): number {
+  const ar = planRank(a)
+  const br = planRank(b)
+  for (let i = 0; i < ar.length; i++) {
+    if (ar[i] !== br[i]) return ar[i] - br[i]
+  }
+  return 0
+}
+
+function dedupeClientPlanRowsWithinTurns<T extends MessageLike>(msgs: readonly T[]): T[] | readonly T[] {
+  let hasDuplicate = false
+  const seen = new Set<string>()
+  for (const m of msgs) {
+    if (isPlanTurnBoundary(m)) seen.clear()
+    if (!isClientPlanWithBlockId(m)) continue
+    const blockId = planBlockId(m)!
+    if (seen.has(blockId)) {
+      hasDuplicate = true
+      break
+    }
+    seen.add(blockId)
+  }
+  if (!hasDuplicate) return msgs
+
+  const out: T[] = []
+  let group: T[] = []
+  const flush = () => {
+    if (group.length === 0) return
+    const keepByBlockId = new Map<string, T>()
+    for (const m of group) {
+      if (!isClientPlanWithBlockId(m)) continue
+      const blockId = planBlockId(m)!
+      const prev = keepByBlockId.get(blockId)
+      if (!prev || comparePlan(m, prev) > 0) keepByBlockId.set(blockId, m)
+    }
+    for (const m of group) {
+      if (!isClientPlanWithBlockId(m)) {
+        out.push(m)
+        continue
+      }
+      const blockId = planBlockId(m)!
+      if (keepByBlockId.get(blockId) === m) out.push(m)
+    }
+    group = []
+  }
+
+  for (const m of msgs) {
+    if (isPlanTurnBoundary(m)) {
+      flush()
+      out.push(m)
+      continue
+    }
+    group.push(m)
+  }
+  flush()
+  return out
 }
 
 /**
