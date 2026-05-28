@@ -17,8 +17,8 @@
  *   10. REPO             — 当前会话 GitHub repo 绑定快照 (离 user 消息最近)
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { request as undiciRequest } from 'undici'
 import { MemoryStore, SkillStore, paths, readAgentsConfig } from '@openclaude/storage'
+import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 export interface PromptSlotContext {
@@ -33,6 +33,10 @@ export interface PromptSlotContext {
   /** Phase 5 — 当前会话的 GitHub repo 绑定快照(来自 SessionRepoWorkspaceManager.getRepoSnapshot(sessionId))。
    *  null = 没绑定;否则按 status 三态生成 repo slot。 */
   repoSnapshot?: RepoSnapshot | null
+  /** MCP tools that will actually be registered for this runner. Provider
+   *  hints must not advertise tools that are disabled by env/toolset/entry
+   *  resolution, or the model will try to call a non-existent tool. */
+  availableMcpTools?: string[]
 }
 
 export interface PromptSlot {
@@ -142,6 +146,7 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
 
   // Provider-specific tips
   const provider = ctx.provider
+  const hasUnderstandImageTool = ctx.availableMcpTools?.includes('understand_image') === true
   if (provider === 'minimax') {
     lines.push('')
     lines.push('## MiniMax MCP 参数提示')
@@ -152,6 +157,14 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     lines.push('**text_to_image**: 默认 image-01 可用,传 `aspect_ratio` 控制比例')
     lines.push(
       '**understand_image**: 传 `image_file="绝对路径"` 或 `image_url="https://..."` (主模型不支持多模态)',
+    )
+  }
+  if ((provider === 'deepseek' || ctx.model?.startsWith('deepseek-')) && hasUnderstandImageTool) {
+    lines.push('')
+    lines.push('## DeepSeek 图片理解提示')
+    lines.push('')
+    lines.push(
+      'DeepSeek 当前按纯文本模型接入。用户上传图片时,先调用 `understand_image` MCP 工具,传 `image_file="绝对路径"`,再基于工具返回的图片描述回答。',
     )
   }
 
@@ -650,8 +663,7 @@ export async function fetchPlatformSlotsFromMaster(
     // MODEL_HINT 必须带 canonicalModelId(provider 已 canonicalize 的 model id),
     // 否则容器侧 metric label 防线会失效 —— 直接丢弃这条 slot 比注入但缺 meta 安全。
     if (name === 'MODEL_HINT') {
-      const cid =
-        typeof r.canonicalModelId === 'string' ? r.canonicalModelId : null
+      const cid = typeof r.canonicalModelId === 'string' ? r.canonicalModelId : null
       if (!cid || cid.length === 0) continue
       out.push({ name, content: trimmed, canonicalModelId: cid })
     } else {
@@ -809,14 +821,13 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     modelHint = buildModelHintSlot(ctx)
   } else {
     const remote = remotePlatformSlots.find((s) => s.name === 'MODEL_HINT')
-    modelHint =
-      remote && remote.canonicalModelId
-        ? {
-            name: 'MODEL_HINT',
-            canonicalId: remote.canonicalModelId,
-            content: remote.content,
-          }
-        : null
+    modelHint = remote?.canonicalModelId
+      ? {
+          name: 'MODEL_HINT',
+          canonicalId: remote.canonicalModelId,
+          content: remote.content,
+        }
+      : null
   }
   if (modelHint) slots.push(modelHint)
 
