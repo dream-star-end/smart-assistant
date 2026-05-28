@@ -24,6 +24,7 @@ const altCodexAgent: AgentDef = {
 
 const fullAgents: AgentDef[] = [claudeAgent, codexAgent]
 const onlyClaudeAgents: AgentDef[] = [claudeAgent]
+const onlyCodexAgents: AgentDef[] = [codexAgent, altCodexAgent]
 const codexWrongProvider: AgentDef[] = [
   claudeAgent,
   { id: 'codex', model: 'gpt-5.5', provider: 'something-else' as unknown as 'codex-native' },
@@ -159,17 +160,14 @@ describe('inferAgentForModel — claude model routing', () => {
     assert.deepEqual(r, { agentId: 'chatgpt' })
   })
 
-  it('mismatch when user explicitly picks codex agent + claude-* model', () => {
+  it('routes explicit codex agent + claude-* back to default non-codex agent', () => {
     const r = inferAgentForModel({
       model: 'claude-opus-4-7',
       requestedAgentId: 'codex',
       defaultAgentId: 'main',
       agents: fullAgents,
     })
-    assert.equal('error' in r, true)
-    if (!('error' in r)) return
-    assert.equal(r.error, 'mismatch')
-    assert.match(r.reason, /codex-native/)
+    assert.deepEqual(r, { agentId: 'main' })
   })
 
   it('preserves router-rule-resolved non-default claude agent (Fix 6 contract)', () => {
@@ -188,23 +186,91 @@ describe('inferAgentForModel — claude model routing', () => {
     assert.deepEqual(r, { agentId: 'coder' })
   })
 
-  it('does not error when default agent itself happens to be codex (boss config edge case)', () => {
-    // If default is codex AND user did not explicitly pick anything else,
-    // requestedAgentId === defaultAgentId === 'codex'. claude-* model still
-    // gets routed to codex agent → that's a mismatch from the user's POV
-    // but `isExplicitAgent` is false (not user-driven). Fail closed: still
-    // surface mismatch — claude model on codex agent is broken regardless
-    // of how we got there.
+  it('uses the first non-codex agent for claude-* when default is codex', () => {
     const r = inferAgentForModel({
       model: 'claude-opus-4-7',
       requestedAgentId: 'codex',
       defaultAgentId: 'codex',
       agents: fullAgents,
     })
-    // requestedAgentId === defaultAgentId so `isExplicitAgent` is false →
-    // current logic returns { agentId: 'codex' }. This is an admin
-    // misconfiguration; we don't try to second-guess it here. Document
-    // the behavior so it isn't surprising.
-    assert.deepEqual(r, { agentId: 'codex' })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('no_compatible_agent when claude-* has no non-codex agent to route to', () => {
+    const r = inferAgentForModel({
+      model: 'claude-opus-4-7',
+      requestedAgentId: 'codex',
+      defaultAgentId: 'codex',
+      agents: onlyCodexAgents,
+    })
+    assert.equal('error' in r, true)
+    if (!('error' in r)) return
+    assert.equal(r.error, 'no_compatible_agent')
+  })
+})
+
+describe('inferAgentForModel — deepseek model routing', () => {
+  it('keeps default non-codex agent for deepseek-*', () => {
+    const r = inferAgentForModel({
+      model: 'deepseek-v4-pro',
+      requestedAgentId: 'main',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('keeps explicit non-codex agent for deepseek-*', () => {
+    const otherClaude: AgentDef = { id: 'chatgpt', model: 'claude-sonnet-4-6' }
+    const r = inferAgentForModel({
+      model: 'deepseek-v4-pro',
+      requestedAgentId: 'chatgpt',
+      defaultAgentId: 'main',
+      agents: [...fullAgents, otherClaude],
+    })
+    assert.deepEqual(r, { agentId: 'chatgpt' })
+  })
+
+  it('routes explicit codex agent + deepseek-* back to default non-codex agent', () => {
+    const r = inferAgentForModel({
+      model: 'deepseek-v4-pro',
+      requestedAgentId: 'codex',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('routes unknown requested agent + deepseek-* to default non-codex agent', () => {
+    const r = inferAgentForModel({
+      model: 'deepseek-v4-flash',
+      requestedAgentId: 'no-such-agent',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('uses the first non-codex agent when default is codex', () => {
+    const otherClaude: AgentDef = { id: 'chatgpt', model: 'claude-sonnet-4-6' }
+    const r = inferAgentForModel({
+      model: 'deepseek-v4-pro',
+      requestedAgentId: 'codex',
+      defaultAgentId: 'codex',
+      agents: [codexAgent, otherClaude],
+    })
+    assert.deepEqual(r, { agentId: 'chatgpt' })
+  })
+
+  it('no_compatible_agent when deepseek-* has no non-codex agent to route to', () => {
+    const r = inferAgentForModel({
+      model: 'deepseek-v4-pro',
+      requestedAgentId: 'codex',
+      defaultAgentId: 'codex',
+      agents: onlyCodexAgents,
+    })
+    assert.equal('error' in r, true)
+    if (!('error' in r)) return
+    assert.equal(r.error, 'no_compatible_agent')
   })
 })

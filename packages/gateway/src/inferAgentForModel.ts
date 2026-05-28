@@ -6,7 +6,8 @@ import type { AgentDef } from '@openclaude/storage'
  *
  * Two cases drive the rerouting:
  *   1) Model family demands a specific provider. `gpt-*` requires a
- *      codex-native agent; `claude-*` requires a non-codex agent.
+ *      codex-native agent; `claude-*` and `deepseek-*` require a non-codex
+ *      agent.
  *   2) Frontend picks the model independently of the agent (modelPicker
  *      lives outside the agent menu). When the user changes model without
  *      explicitly switching agents, requestedAgentId equals defaultAgentId,
@@ -18,23 +19,25 @@ import type { AgentDef } from '@openclaude/storage'
  *       id `codex` (not "first agent with provider=codex-native" — fixed
  *       id keeps user-visible attribution stable and prevents agents.yaml
  *       drift from breaking routing).
- *   (b) Explicit agent picked AND model family doesn't match the agent's
- *       provider (e.g. claude-* model + codex agent, or gpt-* model +
- *       claude agent) → error 'mismatch'.
+ *   (b) Explicit non-codex agent picked + gpt-* model → error 'mismatch'.
  *   (c) Default agent picked + gpt-* model → route to id='codex'. If that
  *       agent is absent or not codex-native → error 'no_codex_agent'.
- *   (d) Default agent picked + claude-* model → use requested as-is.
+ *   (d) claude-* / deepseek-* model + any codex-native/unknown requested agent → route
+ *       back to a compatible non-codex agent. This covers the model-picker
+ *       flow where the browser session remains on agentId='codex' after a
+ *       previous GPT turn, but the user now selected Claude/DeepSeek.
  *   (e) Unknown model family or model undefined → pass through.
  *
  * NOTE: an unknown requestedAgentId (not in agents[]) is treated as
- * pass-through here — sessionManager.submit() validates agent existence
- * downstream and produces its own error. This helper's job is family
- * compatibility, not existence.
+ * pass-through only for model families that do not need a provider override.
+ * For known cross-provider families (`gpt-*`, `claude-*`, `deepseek-*`) the
+ * model picker is authoritative and this helper routes to the compatible
+ * backend.
  */
 
 export type InferAgentResult =
   | { agentId: string }
-  | { error: 'no_codex_agent' | 'mismatch'; reason: string }
+  | { error: 'no_codex_agent' | 'no_compatible_agent' | 'mismatch'; reason: string }
 
 function isGptModel(model: string): boolean {
   return /^gpt-/.test(model)
@@ -42,6 +45,27 @@ function isGptModel(model: string): boolean {
 
 function isClaudeModel(model: string): boolean {
   return /^claude-/.test(model)
+}
+
+function isDeepseekModel(model: string): boolean {
+  return /^deepseek-/.test(model)
+}
+
+function isNonCodexModel(model: string): boolean {
+  return isClaudeModel(model) || isDeepseekModel(model)
+}
+
+function isCodexNative(agent: AgentDef | undefined): boolean {
+  return agent?.provider === 'codex-native'
+}
+
+function findNonCodexAgent(args: {
+  agents: AgentDef[]
+  defaultAgentId: string
+}): AgentDef | undefined {
+  const defaultAgent = args.agents.find((a) => a.id === args.defaultAgentId)
+  if (defaultAgent && !isCodexNative(defaultAgent)) return defaultAgent
+  return args.agents.find((a) => !isCodexNative(a))
 }
 
 export function inferAgentForModel(args: {
@@ -57,7 +81,7 @@ export function inferAgentForModel(args: {
   }
 
   const requestedAgent = agents.find((a) => a.id === requestedAgentId)
-  const requestedIsCodexNative = requestedAgent?.provider === 'codex-native'
+  const requestedIsCodexNative = isCodexNative(requestedAgent)
   const isExplicitAgent = requestedAgentId !== defaultAgentId
 
   if (isGptModel(model)) {
@@ -83,15 +107,18 @@ export function inferAgentForModel(args: {
     return { agentId: 'codex' }
   }
 
-  if (isClaudeModel(model)) {
-    // explicit codex agent + claude model → mismatch
-    if (isExplicitAgent && requestedIsCodexNative) {
+  if (isNonCodexModel(model)) {
+    if (requestedAgent && !requestedIsCodexNative) {
+      return { agentId: requestedAgentId }
+    }
+    const compatibleAgent = findNonCodexAgent({ agents, defaultAgentId })
+    if (!compatibleAgent) {
       return {
-        error: 'mismatch',
-        reason: `agent '${requestedAgentId}' is codex-native; cannot serve claude-* model '${model}'`,
+        error: 'no_compatible_agent',
+        reason: `no non-codex agent configured for model '${model}'`,
       }
     }
-    return { agentId: requestedAgentId }
+    return { agentId: compatibleAgent.id }
   }
 
   // Unknown model family — pass through. sessionManager / provider layer

@@ -6149,8 +6149,11 @@ export class Gateway {
     // 把 inferAgentForModel 接到生产 message 链路。在 agent 已确定 + safeModel 已审过
     // 之后做家族匹配判定:
     //   - gpt-* 模型 + 显式非 codex agent / 默认 agent + gpt-* → 路由到固定 id 'codex'
+    //   - claude-* / deepseek-* 模型 + 当前仍在 codex agent(用户刚从 GPT 切到
+    //     非 GPT 模型)→ 路由回非 codex agent,让 CCB/Anthropic-compatible
+    //     proxy 承接 Claude/DeepSeek
     //   - 找不到 codex agent / 不是 codex-native → fail closed(error='no_codex_agent')
-    //   - 显式 agent 与 model 家族不兼容 → fail closed(error='mismatch')
+    //   - gpt-* + 显式非 codex agent → fail closed(error='mismatch')
     // 失败 → 立刻向 user 回 error 帧并 return,不进 sessionManager。这样未授权用户
     // 即便绕过 modelPicker 直接 POST,也不会暴露 codex agent 的存在 / 配置状态
     // (canUseModel 在 ws bridge 层已先于此路径拦截,这是 belt-and-suspenders)。
