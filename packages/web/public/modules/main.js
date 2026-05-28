@@ -27,7 +27,7 @@ import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js'
+import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=1'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
@@ -110,7 +110,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js'
+} from './sessions.js?v=1'
 
 // ── Messages ──
 import {
@@ -153,7 +153,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=37'
+} from './websocket.js?v=38'
 
 // ── Slash commands ──
 import {
