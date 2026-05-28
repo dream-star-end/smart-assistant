@@ -92,6 +92,7 @@ import {
 import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
 import { syncCodexAuthFiles } from './codexAuthSync.js'
+import { resolveCodexConversationMode } from './codexAutoPlanMode.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
@@ -6353,6 +6354,13 @@ export class Gateway {
     // so the agent knows how to access them via MCP tools or Read.
     const text = frame.content.text ?? ''
     const media = frame.content.media ?? []
+    const effectiveConversationMode = resolveCodexConversationMode({
+      requestedMode: safeConversationMode,
+      agent,
+      model: safeModel,
+      text,
+      attachmentCount: media.length,
+    })
 
     // Server-side upload validation. Constants live at module level
     // (UPLOAD_MIME_PREFIXES / MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL) so they
@@ -6947,7 +6955,7 @@ export class Gateway {
           adapter,
         )
       }
-    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, safeConversationMode, {
+    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, effectiveConversationMode, {
       historicalMessages: masterHistoricalMessages,
     })
   }

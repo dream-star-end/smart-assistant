@@ -834,6 +834,12 @@ describe('T-AUTO-PLAN: shouldAutoPlan heuristic', () => {
 
 // ── T-PLAN-PANEL: Codex plan / TodoWrite quick panel wiring ──
 describe('T-PLAN-PANEL: plan document and progress separation', () => {
+  it('plan cards keep implementation action but omit persistent-plan button', () => {
+    assert.equal(appJs.includes('查看常驻计划'), false)
+    assert.equal(appJs.includes('plan-panel-open-btn'), false)
+    assert.equal(appJs.includes('开始实施'), true)
+  })
+
   it('keeps the generated plan document while using later steps as task progress', () => {
     const docPlan = { id: 'plan-doc', role: 'plan', text: '# Plan\n\nDo the work.', _partial: false }
     const progressPlan = {

@@ -2,7 +2,7 @@
 import { _openTopupModal } from './billing.js?v=e81e4574'
 import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=e81e4574'
 import { getEffortForSubmit } from './effortMode.js?v=e81e4574'
-import { openPlanPanel, refreshPlanPanel } from './planPanel.js?v=e81e4574'
+import { refreshPlanPanel } from './planPanel.js?v=e81e4574'
 import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=e81e4574'
 import { exportMessageDocx } from './export-docx.js?v=e81e4574'
 import { exportMessageTex } from './export-tex.js?v=e81e4574'
@@ -1787,11 +1787,6 @@ function _buildPlanCard(el, msg) {
   if (!msg._partial) {
     const actions = document.createElement('div')
     actions.className = 'plan-card-actions'
-    const openPanel = document.createElement('button')
-    openPanel.type = 'button'
-    openPanel.className = 'plan-panel-open-btn'
-    openPanel.textContent = '查看常驻计划'
-    openPanel.onclick = () => openPlanPanel()
     const run = document.createElement('button')
     run.type = 'button'
     run.className = 'plan-run-btn'
@@ -1804,7 +1799,6 @@ function _buildPlanCard(el, msg) {
       input?.dispatchEvent(new Event('input', { bubbles: true }))
       sendBtn?.click()
     }
-    actions.appendChild(openPanel)
     actions.appendChild(run)
     el.appendChild(actions)
   }
