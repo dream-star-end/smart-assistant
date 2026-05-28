@@ -6,7 +6,22 @@ const codexAgent = { provider: 'codex-native', runnerKind: 'app-server' }
 const mainAgent = { provider: 'claude-subscription', runnerKind: undefined }
 
 describe('codexAutoPlanMode', () => {
-  it('routes complex GPT-5.5 engineering work to plan mode', () => {
+  it('routes explicit plan requests to plan mode', () => {
+    assert.equal(shouldAutoPlanTurn('制定一个迁移计划'), true)
+    assert.equal(shouldAutoPlanTurn('先给方案，暂时不要实施'), true)
+    assert.equal(shouldAutoPlanTurn('plan this first'), true)
+    assert.equal(
+      resolveCodexConversationMode({
+        agent: codexAgent,
+        model: 'gpt-5.5',
+        text: '制定一个迁移计划',
+        attachmentCount: 0,
+      }),
+      'plan',
+    )
+  })
+
+  it('keeps complex GPT-5.5 engineering work in default mode for Codex autonomy', () => {
     assert.equal(
       resolveCodexConversationMode({
         agent: codexAgent,
@@ -14,7 +29,19 @@ describe('codexAutoPlanMode', () => {
         text: '修复 gateway 认证问题，然后补测试并保证前端缓存兼容',
         attachmentCount: 0,
       }),
-      'plan',
+      'default',
+    )
+  })
+
+  it('keeps image/design attachment requests in default mode', () => {
+    assert.equal(
+      resolveCodexConversationMode({
+        agent: codexAgent,
+        model: 'gpt-5.5',
+        text: '还原设计稿',
+        attachmentCount: 1,
+      }),
+      'default',
     )
   })
 
@@ -71,7 +98,7 @@ describe('codexAutoPlanMode', () => {
       resolveCodexConversationMode({
         agent: mainAgent,
         model: 'claude-opus-4-7',
-        text: '修复 gateway 认证问题，然后补测试',
+        text: '制定一个迁移计划',
         attachmentCount: 0,
       }),
       undefined,
@@ -83,7 +110,7 @@ describe('codexAutoPlanMode', () => {
       resolveCodexConversationMode({
         agent: codexAgent,
         model: 'deepseek-v4-pro',
-        text: '修复 gateway 认证问题，然后补测试',
+        text: '制定一个迁移计划',
         attachmentCount: 0,
       }),
       undefined,

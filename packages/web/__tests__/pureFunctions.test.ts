@@ -813,10 +813,14 @@ describe('T17: _stripMessageEphemeral — PUT 前 strip 客户端瞎写的字段
 })
 
 
-// ── T-AUTO-PLAN: automatic plan-first routing heuristic ──
-describe('T-AUTO-PLAN: shouldAutoPlan heuristic', () => {
-  it('routes complex multi-step code work to plan mode', () => {
-    assert.equal(shouldAutoPlan('修复 gateway 认证问题，然后补测试并保证前端缓存兼容'), true)
+// ── T-AUTO-PLAN: explicit-only plan routing helper ──
+describe('T-AUTO-PLAN: shouldAutoPlan explicit-only helper', () => {
+  it('does not route complex multi-step code work by heuristic', () => {
+    assert.equal(shouldAutoPlan('修复 gateway 认证问题，然后补测试并保证前端缓存兼容'), false)
+  })
+
+  it('does not route image/design attachments by heuristic', () => {
+    assert.equal(shouldAutoPlan('还原设计稿', [{ kind: 'image' }]), false)
   })
 
   it('keeps simple one-step requests in default mode', () => {
