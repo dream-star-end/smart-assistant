@@ -19,6 +19,7 @@ let _onConflictResolved = null
 // dbPut retry budget — retry is not a user edit.
 let _onRequestRetryPush = null
 let _onSyncStatusChange = null
+let _onSessionAutoCompacted = null
 // Dep-injected: fired the FIRST time a session's PUT comes back 413 (server
 // rejected the row as oversized — see MAX_SESSION_BYTES on the storage
 // side). UI should toast the user with actionable guidance ("delete
@@ -27,11 +28,12 @@ let _onSyncStatusChange = null
 // transitions false→true, so a session that ping-pongs across reloads
 // won't keep flooding the toast queue.
 let _onSessionOversized = null
-export function setSyncDeps({ onConflictResolved, onRequestRetryPush, onSyncStatusChange, onSessionOversized }) {
+export function setSyncDeps({ onConflictResolved, onRequestRetryPush, onSyncStatusChange, onSessionOversized, onSessionAutoCompacted }) {
   _onConflictResolved = onConflictResolved
   _onRequestRetryPush = onRequestRetryPush
   _onSyncStatusChange = onSyncStatusChange
   _onSessionOversized = onSessionOversized
+  _onSessionAutoCompacted = onSessionAutoCompacted
 }
 
 function _emitSyncStatus(status) {
@@ -1139,6 +1141,250 @@ export function _stripMessageEphemeral(messages) {
   })
 }
 
+const PREFLIGHT_MAX_BYTES = 1.9 * 1024 * 1024
+const AUTO_COMPACT_TARGET_BYTES = 1.45 * 1024 * 1024
+const DATA_URI_RE = /^data:[^,;]+(?:;[^,;]+)*;base64,/
+const DATA_URI_MIN_STRIP_CHARS = 4 * 1024
+
+export function _jsonBytes(v) {
+  const s = typeof v === 'string' ? v : JSON.stringify(v)
+  return new TextEncoder().encode(s).length
+}
+
+function _deepCloneJson(v) {
+  return JSON.parse(JSON.stringify(v))
+}
+
+export function _deepStripInlineBase64ForSync(value, counters = { inlineBase64Stripped: 0 }) {
+  if (typeof value === 'string') {
+    if (value.length >= DATA_URI_MIN_STRIP_CHARS && DATA_URI_RE.test(value)) {
+      counters.inlineBase64Stripped++
+      return `[stripped:base64,bytes=${value.length}]`
+    }
+    return value
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      value[i] = _deepStripInlineBase64ForSync(value[i], counters)
+    }
+    return value
+  }
+  if (value && typeof value === 'object') {
+    for (const k of Object.keys(value)) {
+      value[k] = _deepStripInlineBase64ForSync(value[k], counters)
+    }
+  }
+  return value
+}
+
+export function _stripMediaArrayForSync(msg, now = Date.now()) {
+  if (!msg || typeof msg !== 'object' || !Array.isArray(msg._media)) return 0
+  let stripped = 0
+  for (let i = 0; i < msg._media.length; i++) {
+    const entry = msg._media[i]
+    if (!entry || typeof entry !== 'object') continue
+    const hasHeavy =
+      (typeof entry.base64 === 'string' && entry.base64.length > 0) ||
+      (typeof entry.dataUrl === 'string' && entry.dataUrl.length > 0)
+    if (!hasHeavy) continue
+    const size =
+      typeof entry.size === 'number'
+        ? entry.size
+        : typeof entry.base64 === 'string'
+          ? entry.base64.length
+          : typeof entry.dataUrl === 'string'
+            ? entry.dataUrl.length
+            : 0
+    msg._media[i] = {
+      kind: entry.kind || 'file',
+      mimeType: entry.mimeType || null,
+      filename: entry.filename || null,
+      size,
+      base64Stripped: true,
+      strippedAt: now,
+    }
+    stripped++
+  }
+  return stripped
+}
+
+function _messageSortKey(m, idx) {
+  const ts = typeof m?.ts === 'number' && Number.isFinite(m.ts) ? m.ts : idx
+  return { ts, idx }
+}
+
+function _buildCompactedMessageList(stageMsgs, keepClient, placeholder) {
+  const out = []
+  let insertedPlaceholder = false
+  for (const m of stageMsgs) {
+    if (m && m._source === 'server') {
+      out.push(m)
+      continue
+    }
+    if (keepClient.has(m)) {
+      out.push(m)
+      continue
+    }
+    if (!insertedPlaceholder) {
+      out.push(placeholder)
+      insertedPlaceholder = true
+    }
+  }
+  if (!insertedPlaceholder) out.unshift(placeholder)
+  return out
+}
+
+export function _autoCompactMessagesForSync(messages, opts = {}) {
+  if (!Array.isArray(messages)) return null
+  const maxBytes = Number.isFinite(opts.maxBytes) ? opts.maxBytes : PREFLIGHT_MAX_BYTES
+  const targetBytes = Math.min(
+    Number.isFinite(opts.targetBytes) ? opts.targetBytes : AUTO_COMPACT_TARGET_BYTES,
+    maxBytes,
+  )
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now()
+  const sessionId = typeof opts.sessionId === 'string' && opts.sessionId ? opts.sessionId : 'session'
+
+  const stage = _deepCloneJson(messages)
+  const counters = { mediaStripped: 0, inlineBase64Stripped: 0 }
+  for (const m of stage) {
+    if (m && m._source === 'server') continue
+    counters.mediaStripped += _stripMediaArrayForSync(m, now)
+    _deepStripInlineBase64ForSync(m, counters)
+  }
+
+  const strippedBytes = _jsonBytes(stage)
+  if (strippedBytes <= maxBytes) {
+    return {
+      messages: stage,
+      finalBytes: strippedBytes,
+      mediaStripped: counters.mediaStripped,
+      inlineBase64Stripped: counters.inlineBase64Stripped,
+      droppedCount: 0,
+      droppedBytes: 0,
+      truncated: false,
+    }
+  }
+
+  const serverMessages = stage.filter((m) => m && m._source === 'server')
+  if (_jsonBytes(serverMessages) > maxBytes) return null
+
+  const indexed = stage.map((m, idx) => ({ msg: m, idx, ..._messageSortKey(m, idx) }))
+  const clientCandidates = indexed
+    .filter((x) => !(x.msg && x.msg._source === 'server'))
+    .map((x) => ({ ...x, bytes: _jsonBytes(x.msg) + 2 }))
+  const newestFirst = clientCandidates.slice().sort((a, b) => {
+    if (b.ts !== a.ts) return b.ts - a.ts
+    return b.idx - a.idx
+  })
+  const oldestFirst = newestFirst.slice().reverse()
+
+  let used = _jsonBytes(serverMessages) + 256
+  const keepClient = new Set()
+  for (const c of newestFirst) {
+    if (used + c.bytes <= targetBytes) {
+      keepClient.add(c.msg)
+      used += c.bytes
+    }
+  }
+
+  const droppedInitial = clientCandidates.filter((c) => !keepClient.has(c.msg))
+  const droppedBytesInitial = droppedInitial.reduce((acc, c) => acc + c.bytes, 0)
+  const earliestDropped = droppedInitial.reduce(
+    (best, c) => (best === null || c.idx < best.idx ? c : best),
+    null,
+  )
+  const placeholder = {
+    id: `auto-compact-${sessionId}-${now}`,
+    role: 'system',
+    text:
+      `【自动上下文压缩】为避免会话过大导致同步失败，已折叠较早的 ${droppedInitial.length} 条客户端消息；` +
+      `最近消息和服务端权威记录已保留。`,
+    ts: earliestDropped ? (typeof earliestDropped.msg?.ts === 'number' ? earliestDropped.msg.ts : now) : now,
+  }
+
+  let finalMessages = _buildCompactedMessageList(stage, keepClient, placeholder)
+  let finalBytes = _jsonBytes(finalMessages)
+  for (const c of oldestFirst) {
+    if (finalBytes <= maxBytes) break
+    if (!keepClient.has(c.msg)) continue
+    keepClient.delete(c.msg)
+    finalMessages = _buildCompactedMessageList(stage, keepClient, placeholder)
+    finalBytes = _jsonBytes(finalMessages)
+  }
+  if (finalBytes > maxBytes) return null
+
+  const droppedCount = clientCandidates.filter((c) => !keepClient.has(c.msg)).length
+  const droppedBytes = clientCandidates
+    .filter((c) => !keepClient.has(c.msg))
+    .reduce((acc, c) => acc + c.bytes, 0)
+  placeholder.text =
+    `【自动上下文压缩】为避免会话过大导致同步失败，已折叠较早的 ${droppedCount} 条客户端消息；` +
+    `最近消息和服务端权威记录已保留。`
+
+  return {
+    messages: finalMessages,
+    finalBytes,
+    mediaStripped: counters.mediaStripped,
+    inlineBase64Stripped: counters.inlineBase64Stripped,
+    droppedCount,
+    droppedBytes: droppedBytes || droppedBytesInitial,
+    truncated: droppedCount > 0,
+  }
+}
+
+function _prepareAutoCompactCandidate(sess, clean, bodyBytes) {
+  const live = state.sessions.get(sess.id) || sess
+  const result = _autoCompactMessagesForSync(live.messages || [], {
+    maxBytes: PREFLIGHT_MAX_BYTES,
+    targetBytes: AUTO_COMPACT_TARGET_BYTES,
+    sessionId: live.id || sess.id,
+  })
+  if (!result) return null
+  const wireMessages = _stripMessageEphemeral(result.messages)
+  const compactClean = { ...clean, messages: wireMessages }
+  const body = JSON.stringify(compactClean)
+  const bytes = _jsonBytes(body)
+  if (bytes >= bodyBytes || bytes > PREFLIGHT_MAX_BYTES) return null
+  return {
+    ...result,
+    liveMessages: result.messages,
+    wireMessages,
+    body,
+    bytes,
+  }
+}
+
+async function _commitAutoCompactCandidate(sess, candidate, updatedAt, preFlightLastAt) {
+  if (!candidate) return false
+  const live = state.sessions.get(sess.id) || sess
+  if (live.lastAt > preFlightLastAt) {
+    live._syncedAt = updatedAt
+    live._dirty = true
+    trace('save.auto_compact.defer_commit', {
+      sess: sess.id,
+      reason: 'local_edit_after_preflight',
+      bytes: candidate.bytes,
+    })
+    return false
+  }
+  live.messages = candidate.liveMessages
+  live._syncedAt = updatedAt
+  live._dirty = false
+  live._oversized = false
+  live._conflictRetryCount = 0
+  _rebuildSearchIndex(live)
+  try { await dbPut({ ...live, _syncedAt: updatedAt }) } catch {}
+  trace('save.auto_compact.committed', {
+    sess: sess.id,
+    bytes: candidate.bytes,
+    finalBytes: candidate.finalBytes,
+    droppedCount: candidate.droppedCount,
+    mediaStripped: candidate.mediaStripped,
+    inlineBase64Stripped: candidate.inlineBase64Stripped,
+  })
+  return true
+}
+
 /**
  * Push a single session to server (best-effort). Marks _syncedAt on success.
  */
@@ -1189,37 +1435,87 @@ export function pushSessionToServer(sess) {
   // consistent regardless of whether the rejection happened client-side
   // (here) or after the request hit the wire. Slightly tighter than the
   // server's 2MB to leave room for HTTP headers + chunked-encoding overhead.
-  const PREFLIGHT_MAX_BYTES = 1.9 * 1024 * 1024
-  const body = JSON.stringify(clean)
-  const bodyBytes = new TextEncoder().encode(body).length
+  let body = JSON.stringify(clean)
+  let bodyBytes = _jsonBytes(body)
+  let autoCompactCandidate = null
   if (bodyBytes > PREFLIGHT_MAX_BYTES) {
-    const live = state.sessions.get(sess.id) || sess
-    const wasOversized = live._oversized
-    live._oversized = true
-    live._dirty = false
-    live._conflictRetryCount = 0
-    if (!wasOversized) {
-      try { _onSessionOversized?.(live.id) } catch {}
+    const originalBodyBytes = bodyBytes
+    autoCompactCandidate = _prepareAutoCompactCandidate(sess, clean, bodyBytes)
+    if (autoCompactCandidate) {
+      body = autoCompactCandidate.body
+      bodyBytes = autoCompactCandidate.bytes
+      trace('save.auto_compact.preflight', {
+        sess: sess.id,
+        fromBytes: originalBodyBytes,
+        toBytes: autoCompactCandidate.bytes,
+        droppedCount: autoCompactCandidate.droppedCount,
+        mediaStripped: autoCompactCandidate.mediaStripped,
+        inlineBase64Stripped: autoCompactCandidate.inlineBase64Stripped,
+      })
+    } else {
+      const live = state.sessions.get(sess.id) || sess
+      const wasOversized = live._oversized
+      live._oversized = true
+      live._dirty = false
+      live._conflictRetryCount = 0
+      if (!wasOversized) {
+        try { _onSessionOversized?.(live.id) } catch {}
+      }
+      trace('save.push.skip', {
+        sess: sess.id,
+        reason: 'preflight_oversized',
+        bytes: bodyBytes,
+        maxBytes: PREFLIGHT_MAX_BYTES,
+      })
+      return Promise.resolve()
     }
-    trace('save.push.skip', {
-      sess: sess.id,
-      reason: 'preflight_oversized',
-      bytes: bodyBytes,
-      maxBytes: PREFLIGHT_MAX_BYTES,
-    })
-    return Promise.resolve()
   }
   return apiFetch(`/api/sessions/${sess.id}`, {
     method: 'PUT',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body,
-  }).then(async (res) => {
+  }).then(async (initialRes) => {
+    let res = initialRes
+    // If the wire body fit but the server-side merge would exceed the
+    // storage row cap, build one compacted candidate and retry once. The
+    // lossy candidate is committed to live/IDB only after a successful PUT.
+    if (res.status === 413 && !autoCompactCandidate) {
+      const retryCandidate = _prepareAutoCompactCandidate(sess, clean, bodyBytes)
+      if (retryCandidate) {
+        trace('save.auto_compact.retry_413', {
+          sess: sess.id,
+          fromBytes: bodyBytes,
+          toBytes: retryCandidate.bytes,
+          droppedCount: retryCandidate.droppedCount,
+        })
+        autoCompactCandidate = retryCandidate
+        body = retryCandidate.body
+        bodyBytes = retryCandidate.bytes
+        res = await apiFetch(`/api/sessions/${sess.id}`, {
+          method: 'PUT',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body,
+        })
+      }
+    }
     if (res.ok) {
       const resp = await res.json()
       if (resp?.applied && resp.updatedAt) {
-        sess._syncedAt = resp.updatedAt
-        sess._dirty = false
-        sess._conflictRetryCount = 0  // successful PUT clears 409 retry cap
+        if (autoCompactCandidate) {
+          const committed = await _commitAutoCompactCandidate(
+            sess,
+            autoCompactCandidate,
+            resp.updatedAt,
+            preFlightLastAt,
+          )
+          if (committed) {
+            try { _onSessionAutoCompacted?.(sess.id, autoCompactCandidate) } catch {}
+          }
+        } else {
+          sess._syncedAt = resp.updatedAt
+          sess._dirty = false
+          sess._conflictRetryCount = 0  // successful PUT clears 409 retry cap
+        }
       }
       trace('save.push.ok', { sess: sess.id, status: res.status, applied: !!resp?.applied, bytes: bodyBytes })
     } else if (res.status === 413) {

@@ -28,7 +28,7 @@ const SYNC_SRC = readFileSync(
 function extractTopLevelFn(source: string, name: string): string {
   const lines = source.split('\n')
   const headerIdx = lines.findIndex((l) =>
-    new RegExp(`^(export\\s+)?function\\s+${name}\\s*\\(`).test(l),
+    new RegExp(`^(export\\s+)?(async\\s+)?function\\s+${name}\\s*\\(`).test(l),
   )
   if (headerIdx === -1) throw new Error(`function ${name} not found`)
   // Closing brace at column 0, exact "}"
@@ -442,16 +442,37 @@ if (!_SERVER_AUTH_KEYS_SRC) {
   throw new Error('_SERVER_AUTH_KEYS const not found in sync.js source')
 }
 
+const _AUTO_COMPACT_CONSTS_SRC = `
+const PREFLIGHT_MAX_BYTES = 1.9 * 1024 * 1024
+const AUTO_COMPACT_TARGET_BYTES = 1.45 * 1024 * 1024
+const DATA_URI_RE = /^data:[^,;]+(?:;[^,;]+)*;base64,/
+const DATA_URI_MIN_STRIP_CHARS = 4 * 1024
+`
+
 // pushSessionToServer 体内调用 `trace(...)`(来自 sync.js 顶部 `import { trace }`),
 // 但 new Function 闭包没有这个 binding。注入一个 no-op 让 eval'd 代码不爆。
-const _TRACE_STUB_SRC = 'const trace = () => {};'
+const _TRACE_STUB_SRC = `
+const trace = () => {};
+let _onSessionOversized = null;
+let _onSessionAutoCompacted = null;
+`
 
 const _pushFnSrc =
   _TRACE_STUB_SRC + '\n' +
   _MSG_EPHEMERAL_KEYS_SRC + '\n' +
   _MSG_SERVER_AUTHORITATIVE_KEYS_SRC + '\n' +
   _SERVER_AUTH_KEYS_SRC + '\n' +
+  _AUTO_COMPACT_CONSTS_SRC + '\n' +
   extractTopLevelFn(SYNC_SRC, '_stripMessageEphemeral') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_jsonBytes') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_deepCloneJson') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_deepStripInlineBase64ForSync') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_stripMediaArrayForSync') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_messageSortKey') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_buildCompactedMessageList') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_autoCompactMessagesForSync') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_prepareAutoCompactCandidate') + '\n' +
+  extractTopLevelFn(SYNC_SRC, '_commitAutoCompactCandidate') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_stableStringify') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes') + '\n' +
   extractTopLevelFn(SYNC_SRC, '_localDominates') + '\n' +
@@ -1387,6 +1408,53 @@ describe('pushSessionToServer — successful PUT', () => {
 
     assert.equal(sess._conflictRetryCount, 0)
     assert.equal(sess._dirty, false)
+  })
+})
+
+describe('pushSessionToServer — oversized auto compaction', () => {
+  it('preflight compacts the wire body but only mutates live/IDB after server ACK', async () => {
+    const sessId = 'sess-auto-compact'
+    const originalMessages = Array.from({ length: 12 }, (_, i) => ({
+      id: `m${i}`,
+      role: i % 2 ? 'assistant' : 'user',
+      text: `${i}:` + 'x'.repeat(190_000),
+      ts: 1000 + i,
+    }))
+    const sess: any = {
+      id: sessId,
+      title: 'huge',
+      createdAt: 1,
+      lastAt: 2000,
+      messages: originalMessages,
+      pinned: false,
+      agentId: 'a',
+      _dirty: true,
+      _syncedAt: 500,
+    }
+
+    let resolvePut: ((res: any) => void) | null = null
+    const deps = baseDeps({
+      _apiFetchImpl: () => new Promise((resolve) => { resolvePut = resolve }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    const pushPromise = makePush(deps)(sess)
+    assert.ok(resolvePut, 'PUT should have been issued')
+    assert.equal(deps.putCalls.length, 1)
+    assert.ok(deps.putCalls[0].messages.length < originalMessages.length, 'wire body should be compacted')
+    assert.equal(sess.messages.length, originalMessages.length, 'live messages must not be mutated before ACK')
+    assert.equal(deps.dbCalls.length, 0, 'IDB must not be written before ACK')
+
+    resolvePut!(ok({ applied: true, updatedAt: 3000 }))
+    await pushPromise
+
+    assert.ok(sess.messages.length < originalMessages.length, 'live messages should be compacted after ACK')
+    assert.ok(sess.messages.some((m: any) => m.role === 'system' && /自动上下文压缩/.test(m.text)))
+    assert.equal(sess._dirty, false)
+    assert.equal(sess._oversized, false)
+    assert.equal(sess._syncedAt, 3000)
+    assert.equal(deps.dbCalls.length, 1, 'compacted snapshot should be persisted after ACK')
+    assert.ok(deps.dbCalls[0].messages.length < originalMessages.length)
   })
 })
 
