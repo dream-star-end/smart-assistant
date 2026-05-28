@@ -2698,7 +2698,14 @@ async function init() {
     onSessionOversized: (sessId) => {
       const s = state.sessions.get(sessId)
       const title = s?.title || sessId
-      toast(`会话 "${title}" 体积过大，已停止自动同步。删除附件或开启新会话后可恢复。`, 'danger')
+      toast(`会话 "${title}" 体积过大，自动压缩失败，已停止自动同步。删除附件或开启新会话后可恢复。`, 'danger')
+    },
+    onSessionAutoCompacted: (sessId, meta) => {
+      const s = state.sessions.get(sessId)
+      const title = s?.title || sessId
+      const dropped = Number(meta?.droppedCount || 0)
+      const suffix = dropped > 0 ? `，折叠 ${dropped} 条较早消息` : ''
+      toast(`会话 "${title}" 已自动压缩并恢复同步${suffix}。`, 'success')
     },
   })
   // Sidebar search

@@ -26,6 +26,26 @@ import {
   sendIlinkText,
 } from './iLink.js'
 
+const SESSION_EXPIRED_BASE_BACKOFF_MS = 5_000
+const SESSION_EXPIRED_MAX_BACKOFF_MS = 60_000
+const SESSION_EXPIRED_LOG_INTERVAL_MS = 5 * 60_000
+
+export function sessionExpiredBackoffMs(consecutiveExpired: number): number {
+  const n = Math.max(1, Math.floor(consecutiveExpired || 1))
+  return Math.min(
+    SESSION_EXPIRED_BASE_BACKOFF_MS * 2 ** (n - 1),
+    SESSION_EXPIRED_MAX_BACKOFF_MS,
+  )
+}
+
+export function shouldLogSessionExpired(
+  consecutiveExpired: number,
+  nowMs: number,
+  nextLogAtMs: number,
+): boolean {
+  return consecutiveExpired <= 1 || nowMs >= nextLogAtMs
+}
+
 /**
  * Pure decoder:把 iLink getupdates msg 项变成 worker loop 处理所需的归一
  * 字段;senderId 在此处剥 `@im.wechat` 后缀(上游 SENDER_ID_RE 校验 base64url
@@ -108,6 +128,8 @@ export class WechatWorker {
    */
   private running = false
   private contextTokens: Record<string, string>
+  private sessionExpiredCount = 0
+  private nextSessionExpiredLogAt = 0
 
   constructor(opts: WechatWorkerOpts) {
     this.binding = opts.binding
@@ -233,10 +255,18 @@ export class WechatWorker {
       const errcode = Number(resp?.errcode || 0)
       const ret = Number(resp?.ret || 0)
       if (errcode === ILINK_SESSION_EXPIRED || ret === ILINK_SESSION_EXPIRED) {
-        this.ctx.log.info(`[wechat:${this.userId}] session expired; clearing cursor`)
+        this.sessionExpiredCount++
+        const nowMs = Date.now()
+        const delayMs = sessionExpiredBackoffMs(this.sessionExpiredCount)
+        if (shouldLogSessionExpired(this.sessionExpiredCount, nowMs, this.nextSessionExpiredLogAt)) {
+          this.ctx.log.info(
+            `[wechat:${this.userId}] session expired; clearing cursor; count=${this.sessionExpiredCount}; retry in ${delayMs}ms`,
+          )
+          this.nextSessionExpiredLogAt = nowMs + SESSION_EXPIRED_LOG_INTERVAL_MS
+        }
         buf = ''
         try { await updateWechatBindingCursor(this.userId, '') } catch {}
-        await sleep(5_000)
+        await sleep(delayMs)
         continue
       }
       if (ret !== 0 || errcode !== 0) {
@@ -252,6 +282,8 @@ export class WechatWorker {
         await sleep(5_000)
         continue
       }
+      this.sessionExpiredCount = 0
+      this.nextSessionExpiredLogAt = 0
 
       const nextBuf = String(resp?.get_updates_buf || '').trim()
       const msgs: any[] = Array.isArray(resp?.msgs) ? resp.msgs : []
