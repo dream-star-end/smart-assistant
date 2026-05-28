@@ -1,16 +1,16 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v49'
+const VERSION = 'openclaude-v50'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=30', // versioned URL used in index.html
+  '/style.css?v=31', // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=37', // versioned URL used in index.html
+  '/modules/main.js?v=38', // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -31,13 +31,15 @@ const SHELL = [
   '/modules/planMode.js',
   '/modules/planMode.js?v=4',
   '/modules/sessions.js',
+  '/modules/sessions.js?v=1',
   '/modules/sync.js',
+  '/modules/sync.js?v=1',
   '/modules/messages.js',
   '/modules/messages.js?v=37',
   '/modules/planPanel.js',
   '/modules/planPanel.js?v=3',
   '/modules/websocket.js',
-  '/modules/websocket.js?v=37',
+  '/modules/websocket.js?v=38',
   '/modules/commands.js',
   '/modules/wechat.js',
   '/modules/researchTools.js',

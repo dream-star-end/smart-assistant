@@ -4,7 +4,7 @@
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=1'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -83,10 +83,12 @@ function _stableStringify(v) {
  *     and drop the streaming extension (the primary bug).
  *
  *   Layer 2 (STREAMING EXTENSION, roles whitelist):
- *     For assistant/thinking/user only, apply a text-level check:
+ *     For assistant/thinking/user/plan only, apply a text-level check:
  *       - assistant/thinking: server.text is a prefix of local.text
  *         (streaming delta — unambiguous "local = server + more")
  *       - user: exact text equality (status drift tolerated, see below)
+ *       - plan: local non-empty text is the durable plan document; it can
+ *         dominate a server snapshot that only has structured steps.
  *     Rows with childBlocks are excluded from Layer 2: their in-place
  *     mutations (_partial/_completed/output) can't be judged by text
  *     alone, and if Layer 1 already failed they aren't equal anyway,
@@ -113,16 +115,54 @@ export function _localMessageSupersedes(localMsg, serverMsg) {
   if (ls !== null && ss !== null && ls === ss) return true
 
   // Layer 2: text-level judgement, roles whitelist only.
-  if (role !== 'assistant' && role !== 'thinking' && role !== 'user') return false
+  if (role !== 'assistant' && role !== 'thinking' && role !== 'user' && role !== 'plan')
+    return false
   // Any childBlocks on either side → structural, refuse text-level judgement.
   if (Array.isArray(localMsg.childBlocks) || Array.isArray(serverMsg.childBlocks)) return false
   const lText = typeof localMsg.text === 'string' ? localMsg.text : ''
   const sText = typeof serverMsg.text === 'string' ? serverMsg.text : ''
   if (role === 'user') return lText === sText
+  if (role === 'plan') {
+    // Codex plan mode may stream the human-readable plan document as
+    // `text`, while a racing server snapshot only has `steps`/`explanation`.
+    // Treat local non-empty text as a safe extension, then merge any missing
+    // structured fields from the server before retrying the PUT.
+    if (!lText.trim()) return false
+    if (sText.length === 0) return true
+    if (lText.length < sText.length) return false
+    return lText.startsWith(sText)
+  }
   // assistant / thinking — streaming prefix extension
   if (sText.length === 0) return true
   if (lText.length < sText.length) return false
   return lText.startsWith(sText)
+}
+
+function _mergeServerPlanFields(serverMessages, localMessages) {
+  const server = Array.isArray(serverMessages) ? serverMessages : []
+  const local = Array.isArray(localMessages) ? localMessages : []
+  const localPlans = new Map()
+  for (const m of local) {
+    if (m?.role === 'plan' && typeof m.id === 'string') localPlans.set(m.id, m)
+  }
+  for (const s of server) {
+    if (s?.role !== 'plan' || typeof s.id !== 'string') continue
+    const l = localPlans.get(s.id)
+    if (!l) continue
+    if (typeof l.blockId !== 'string' && typeof s.blockId === 'string') l.blockId = s.blockId
+    if (typeof l.explanation !== 'string' && typeof s.explanation === 'string') {
+      l.explanation = s.explanation
+    }
+    if (
+      (!Array.isArray(l.steps) || l.steps.length === 0) &&
+      Array.isArray(s.steps) &&
+      s.steps.length > 0
+    ) {
+      l.steps = s.steps.map((step) =>
+        step && typeof step === 'object' && !Array.isArray(step) ? { ...step } : step,
+      )
+    }
+  }
 }
 
 /**
@@ -165,6 +205,9 @@ function _rebindStreamingPointers(sess) {
   }
   if (sess._streamingThinking) {
     sess._streamingThinking = byId.get(sess._streamingThinking.id) || null
+  }
+  if (sess._streamingPlan) {
+    sess._streamingPlan = byId.get(sess._streamingPlan.id) || null
   }
   if (sess._replyingToMsgId && !byId.has(sess._replyingToMsgId)) {
     sess._replyingToMsgId = null
@@ -365,6 +408,7 @@ export function pushSessionToServer(sess) {
   const {
     _streamingAssistant,
     _streamingThinking,
+    _streamingPlan,
     _blockIdToMsgId,
     _sendingInFlight,
     _replyingToMsgId,
@@ -432,6 +476,7 @@ export function pushSessionToServer(sess) {
             // scheduleSaveFromUserEdit has bumped live.lastAt since
             // preFlightLastAt — we detect that below and keep local meta.
             target._syncedAt = server.updatedAt
+            _mergeServerPlanFields(server.messages, target.messages)
 
             // Metadata merge: server-wins UNLESS a local user edit beat the
             // preflight snapshot (which would have set live.lastAt > preFlightLastAt).

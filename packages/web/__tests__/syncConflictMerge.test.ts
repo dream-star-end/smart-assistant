@@ -20,6 +20,10 @@ const SYNC_SRC = readFileSync(
   resolve(import.meta.dirname, '..', 'public', 'modules', 'sync.js'),
   'utf-8',
 )
+const SESSIONS_SRC = readFileSync(
+  resolve(import.meta.dirname, '..', 'public', 'modules', 'sessions.js'),
+  'utf-8',
+)
 
 /**
  * Extract a top-level `export function name(...)` by finding the signature
@@ -141,6 +145,41 @@ describe('_localMessageSupersedes — role whitelist', () => {
       _localMessageSupersedes(
         { id: 'u1', role: 'user', text: 'hello' },
         { id: 'u1', role: 'user', text: 'hi' },
+      ),
+      false,
+    )
+  })
+
+  it('plan: local generated document dominates server structured-only snapshot', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        { id: 'p1', role: 'plan', text: '# Plan\n\nDo the work.' },
+        {
+          id: 'p1',
+          role: 'plan',
+          explanation: 'short path',
+          steps: [{ step: 'inspect', status: 'pending' }],
+        },
+      ),
+      true,
+    )
+  })
+
+  it('plan: local text can extend server text prefix', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        { id: 'p1', role: 'plan', text: '# Plan\n\nDo the work.' },
+        { id: 'p1', role: 'plan', text: '# Plan' },
+      ),
+      true,
+    )
+  })
+
+  it('plan: empty local text must not wipe a server plan document', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        { id: 'p1', role: 'plan', steps: [{ step: 'inspect', status: 'pending' }] },
+        { id: 'p1', role: 'plan', text: '# Plan\n\nDo the work.' },
       ),
       false,
     )
@@ -345,6 +384,20 @@ describe('_localDominates — local clean-superset judge', () => {
     assert.equal(_localDominates(server, local), true)
   })
 
+  it('shared prefix has plan document vs structured plan snapshot → true', () => {
+    const server = [
+      u('u1', 'plan it'),
+      {
+        id: 'p1',
+        role: 'plan',
+        explanation: 'short path',
+        steps: [{ step: 'inspect', status: 'pending' }],
+      },
+    ]
+    const local = [u('u1', 'plan it'), { id: 'p1', role: 'plan', text: '# Plan\n\nInspect.' }]
+    assert.equal(_localDominates(server, local), true)
+  })
+
   it('shared prefix has identical agent-group + tail user append → true', () => {
     const group = { id: 'g1', role: 'agent-group', text: 'agent', metadata: { x: 1 } }
     const server = [u('u1', 'hi'), { ...group }]
@@ -397,7 +450,7 @@ describe('_localDominates — local clean-superset judge', () => {
 // This way we exercise the real production code path without pulling in
 // the browser-global deps in sync.js's own imports.
 
-const _pushFnSrc = `${extractTopLevelFn(SYNC_SRC, '_stableStringify')}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}\n${extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers')}\n${extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')}`
+const _pushFnSrc = `${extractTopLevelFn(SYNC_SRC, '_stableStringify')}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_mergeServerPlanFields')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}\n${extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers')}\n${extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')}`
 
 type PushDeps = {
   apiFetch: (url: string, opts: any) => Promise<any>
@@ -550,6 +603,91 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     assert.equal(deps.retryCb[0], sessId)
     // dbPut persisted
     assert.equal(deps.dbCalls.length, 1)
+  })
+
+  it('Codex plan doc case: preserves local text and fills server steps on 409', async () => {
+    const sessId = 'sess-plan'
+    const userMsg = { id: 'u1', role: 'user', text: 'make a plan' }
+    const serverPlan = {
+      id: 'p1',
+      role: 'plan',
+      blockId: 'codex-plan',
+      explanation: 'short path',
+      steps: [
+        { step: 'inspect code', status: 'completed' },
+        { step: 'patch UI', status: 'inProgress' },
+      ],
+      _partial: true,
+    }
+    const localPlan = {
+      id: 'p1',
+      role: 'plan',
+      blockId: 'codex-plan',
+      text: '# Plan\n\nKeep the generated document visible.',
+      _partial: false,
+    }
+
+    const sess: any = {
+      id: sessId,
+      title: 'plan',
+      messages: [userMsg, localPlan],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'codex',
+      _dirty: true,
+      _syncedAt: 500,
+    }
+
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId,
+        title: 'plan',
+        messages: [userMsg, serverPlan],
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'codex',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps)(sess)
+
+    assert.equal(sess.messages[1].text, '# Plan\n\nKeep the generated document visible.')
+    assert.equal(sess.messages[1].explanation, 'short path')
+    assert.deepEqual(
+      sess.messages[1].steps.map((s: any) => [s.step, s.status]),
+      [
+        ['inspect code', 'completed'],
+        ['patch UI', 'inProgress'],
+      ],
+    )
+    assert.equal(deps.conflictCb[0].mode, 'local-dominates')
+    assert.equal(deps.retryCb.length, 1)
+    assert.equal(deps.dbCalls.length, 1)
+  })
+
+  it('strips _streamingPlan from server PUT payload', async () => {
+    const sess: any = {
+      id: 'sess-strip',
+      title: 't',
+      messages: [{ id: 'p1', role: 'plan', text: '# Plan' }],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'codex',
+      _syncedAt: 500,
+      _streamingPlan: { id: 'p1', role: 'plan', text: '# Plan' },
+    }
+    const deps = baseDeps({
+      _apiFetchImpl: () => ok({ applied: true, updatedAt: 2000 }),
+    } as any)
+    deps.state.sessions.set(sess.id, sess)
+
+    await makePush(deps)(sess)
+
+    assert.equal(deps.putCalls.length, 1)
+    assert.equal('_streamingPlan' in deps.putCalls[0], false)
   })
 
   it('retry cap: after 3 retries, 4th 409 does NOT trigger another retry', async () => {
@@ -781,6 +919,77 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     assert.equal(sess._streamingAssistant, sess.messages[1])
   })
 
+  it('rebinds _streamingPlan to the fresh object when same id still present', async () => {
+    const sessId = 'sess-plan-reb'
+    const oldRef = { id: 'p1', role: 'plan', text: '# Local draft' }
+    const sess: any = {
+      id: sessId,
+      title: 't',
+      messages: [oldRef],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'codex',
+      _dirty: true,
+      _syncedAt: 500,
+      _streamingPlan: oldRef,
+    }
+    const serverPlan = { id: 'p1', role: 'plan', text: '# Server plan' }
+
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId,
+        title: 't',
+        messages: [{ id: 'u-other', role: 'user', text: 'from phone' }, serverPlan],
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'codex',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps)(sess)
+
+    assert.equal(sess.messages.length, 2)
+    assert.equal(sess._streamingPlan?.text, '# Server plan')
+    assert.equal(sess._streamingPlan, sess.messages[1])
+  })
+
+  it('clears orphan _streamingPlan when server-wins removes that plan row', async () => {
+    const sessId = 'sess-plan-orphan'
+    const oldRef = { id: 'p-old', role: 'plan', text: '# Local draft' }
+    const sess: any = {
+      id: sessId,
+      title: 't',
+      messages: [oldRef],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'codex',
+      _dirty: true,
+      _syncedAt: 500,
+      _streamingPlan: oldRef,
+    }
+
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId,
+        title: 't',
+        messages: [{ id: 'u-other', role: 'user', text: 'from phone' }],
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'codex',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps)(sess)
+
+    assert.equal(sess._streamingPlan, null)
+  })
+
   it('clears _replyingToMsgId and _currentTurnBlockCount when that msg vanishes from server', async () => {
     const sessId = 'sess-rpl'
     const sess: any = {
@@ -976,6 +1185,15 @@ describe('pushSessionToServer — sess !== live divergence (caller passes stale 
     // Caller snapshot untouched
     assert.equal(staleSnap.title, 't-old')
     assert.equal(staleSnap.messages.length, 1)
+  })
+})
+
+describe('runtime-only persistence strip lists', () => {
+  it('local IndexedDB save strips _streamingPlan just like assistant/thinking pointers', () => {
+    assert.match(
+      SESSIONS_SRC,
+      /const\s+\{[\s\S]*_streamingAssistant,[\s\S]*_streamingThinking,[\s\S]*_streamingPlan,[\s\S]*\.\.\.persist[\s\S]*\}\s*=\s*sess/,
+    )
   })
 })
 
