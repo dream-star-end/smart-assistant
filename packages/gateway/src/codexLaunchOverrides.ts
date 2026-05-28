@@ -93,6 +93,9 @@ built-ins expose right now.
 When sending a file to the user, output its absolute path as plain text. Do
 not use markdown image syntax (\`![]()\`). Inline rich-content code blocks
 (\`chart\`, \`mermaid\`, \`htmlpreview\`) render in the OpenClaude web client.
+For UI previews, interactive demos, HTML Canvas, animations, small games, or
+design mockups, prefer a fenced \`htmlpreview\` block directly in the reply
+unless the user explicitly asks for a saved/downloadable file.
 
 ---
 

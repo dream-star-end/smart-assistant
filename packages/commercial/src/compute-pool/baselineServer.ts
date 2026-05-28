@@ -16,7 +16,7 @@
  *
  * Tarball 构建:
  *   `tar -C <baselineDir> --sort=name --mtime=@0 --owner=0 --group=0
- *        --numeric-owner -czf - CLAUDE.md skills`
+ *        --numeric-owner -czf - AGENTS.md CLAUDE.md skills`
  *   (reproducible:内容不变则 bytes 不变 → sha256 不变 → node-agent 不重复 pull)
  *
  * 定期 rebuild(默认 5min)— boss 改 baseline 目录内容后最长 5min + 60s poll
@@ -262,6 +262,7 @@ export class BaselineServer {
         "--numeric-owner",
         "-czf",
         "-",
+        "AGENTS.md",
         "CLAUDE.md",
         "skills",
       ];

@@ -240,8 +240,11 @@ describe("HostAwareContainerService routing", () => {
     const { svc } = makeSvc(fp);
     const p1 = await svc.resolveBaselinePaths("self-id");
     const p2 = await svc.resolveBaselinePaths("tk-id");
+    assert.ok(p1.agentsMdHostPath.endsWith("AGENTS.md"));
+    assert.ok(p2.agentsMdHostPath.endsWith("AGENTS.md"));
     assert.ok(p1.claudeMdHostPath.endsWith("CLAUDE.md"));
     assert.ok(p2.claudeMdHostPath.endsWith("CLAUDE.md"));
+    assert.notEqual(p1.agentsMdHostPath, p2.agentsMdHostPath, "self and remote should use different baseline roots");
     assert.notEqual(p1.claudeMdHostPath, p2.claudeMdHostPath, "self and remote should use different baseline roots");
   });
 

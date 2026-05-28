@@ -1011,7 +1011,11 @@ describe("stopAndRemoveV3Container", () => {
         labels: { "oc.runtime.features": "file-proxy-v1 v3-sink" },
       }),
       isRemote: async () => true,
-      resolveBaselinePaths: async () => ({ baseDir: "/tmp/baseline-not-used" }),
+      resolveBaselinePaths: async () => ({
+        agentsMdHostPath: "/tmp/baseline-not-used/AGENTS.md",
+        claudeMdHostPath: "/tmp/baseline-not-used/CLAUDE.md",
+        skillsDirHostPath: "/tmp/baseline-not-used/skills",
+      }),
     };
     return { cs, calls };
   }
@@ -1706,7 +1710,11 @@ describe("provisionV3Container — per-host max_containers cap (3I)", () => {
         return { id: "sha256:x", repoTags: [], labels: {} };
       },
       isRemote: async () => true,
-      resolveBaselinePaths: async () => ({ baseDir: "/tmp/x" }),
+      resolveBaselinePaths: async () => ({
+        agentsMdHostPath: "/tmp/x/AGENTS.md",
+        claudeMdHostPath: "/tmp/x/CLAUDE.md",
+        skillsDirHostPath: "/tmp/x/skills",
+      }),
     };
     await assert.rejects(
       provisionV3Container(
@@ -1754,7 +1762,11 @@ describe("provisionV3Container — per-host max_containers cap (3I)", () => {
         return { id: "sha256:x", repoTags: [], labels: {} };
       },
       isRemote: async () => true,
-      resolveBaselinePaths: async () => ({ baseDir: "/tmp/x" }),
+      resolveBaselinePaths: async () => ({
+        agentsMdHostPath: "/tmp/x/AGENTS.md",
+        claudeMdHostPath: "/tmp/x/CLAUDE.md",
+        skillsDirHostPath: "/tmp/x/skills",
+      }),
     };
     await assert.rejects(
       provisionV3Container(
@@ -2153,7 +2165,7 @@ describe("wrapDockerError — node-agent AgentAppError 路径", () => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-//  CCB baseline (平台守则 CLAUDE.md + system-info skill 只读注入)
+//  CCB baseline (Codex AGENTS.md + 平台守则 CLAUDE.md + baseline skills 只读注入)
 //
 //  resolveCcbBaselineMounts:
 //   - 绝对路径 + path.normalize 比较(允许尾斜杠)
@@ -2182,6 +2194,7 @@ function makeFakeBaseline(withAllSkillMd = true): { dir: string; cleanup: () => 
     return null;
   }
   const dir = mkdtempSync(pathJoin(tmpdir(), "ccb-baseline-test-"));
+  writeFileSync(pathJoin(dir, "AGENTS.md"), "# test codex baseline\n", { mode: 0o644 });
   writeFileSync(pathJoin(dir, "CLAUDE.md"), "# test baseline\n", { mode: 0o644 });
   mkdirSync(pathJoin(dir, "skills"), { mode: 0o755 });
   for (const [idx, name] of V3_CCB_BASELINE_SKILL_NAMES.entries()) {
@@ -2215,6 +2228,10 @@ describe("resolveCcbBaselineMounts", () => {
     //   → agent-sandbox/ccb-baseline/
     const here = dirname(fileURLToPath(import.meta.url));
     const baselineDir = pathJoin(here, "..", "..", "agent-sandbox", "ccb-baseline");
+    assert.ok(
+      existsSync(pathJoin(baselineDir, "AGENTS.md")),
+      `shipped baseline AGENTS.md missing at ${baselineDir}`,
+    );
     assert.ok(
       existsSync(pathJoin(baselineDir, "CLAUDE.md")),
       `shipped baseline CLAUDE.md missing at ${baselineDir}`,
@@ -2260,14 +2277,26 @@ describe("resolveCcbBaselineMounts", () => {
     assert.equal(resolveCcbBaselineMounts("/definitely/does/not/exist/baseline"), null);
   });
 
-  test("(root only) happy path returns CLAUDE.md + skills/ realpaths", () => {
+  test("(root only) happy path returns AGENTS.md + CLAUDE.md + skills/ realpaths", () => {
     const b = makeFakeBaseline();
     if (!b) return; // 非 root 跳过
     try {
       const got = resolveCcbBaselineMounts(b.dir);
       assert.ok(got, "expected non-null result");
+      assert.equal(got!.agentsMdHostPath, pathJoin(b.dir, "AGENTS.md"));
       assert.equal(got!.claudeMdHostPath, pathJoin(b.dir, "CLAUDE.md"));
       assert.equal(got!.skillsDirHostPath, pathJoin(b.dir, "skills"));
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects missing AGENTS.md (Codex native rules must be mounted)", () => {
+    const b = makeFakeBaseline();
+    if (!b) return; // 非 root 跳过
+    try {
+      rmSync(pathJoin(b.dir, "AGENTS.md"));
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
     } finally {
       b.cleanup();
     }
@@ -2559,7 +2588,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
     ]);
   });
 
-  test("(root only) baseline 齐全 → 9 条 Binds(5 volume + codex-auth + ssh + CLAUDE.md + skills 父目录)", async () => {
+  test("(root only) baseline 齐全 → 10 条 Binds(5 volume + codex-auth + ssh + AGENTS.md + CLAUDE.md + skills 父目录)", async () => {
     const b = makeFakeBaseline();
     if (!b) return; // 非 root 跳过
     try {
@@ -2576,7 +2605,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
         125,
       );
       const opts = captured.containersCreated[0]!;
-      // 顺序匹配 v3supervisor.ts:1755-1764(base 5) → :1881(codex-auth) → :1889(ssh) → :1892-1904(baseline)
+      // 顺序匹配 v3supervisor.ts:base 5 → codex-auth → ssh → baseline AGENTS/CLAUDE/skills。
       assert.deepEqual(opts.HostConfig?.Binds, [
         `oc-v3-data-u125:${V3_VOLUME_MOUNT}:rw`,
         `oc-v3-proj-u125:${V3_PROJECTS_MOUNT}:rw`,
@@ -2585,6 +2614,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
         `oc-v3-userconfig-u125:${V3_USER_CONFIG_MOUNT}:rw`,
         "/var/lib/openclaude-v3/codex-container-auth:/run/oc/codex-auth:ro",
         "/run/ccb-ssh/u125:/run/ccb-ssh:ro",
+        `${pathJoin(b.dir, "AGENTS.md")}:/opt/openclaude/AGENTS.md:ro`,
         `${pathJoin(b.dir, "CLAUDE.md")}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
         // 挂 skills/ 整目录;父目录 ro 一次性覆盖所有基线 skill,
         // 新增基线 skill 不改这里,只加一条 V3_CCB_BASELINE_SKILL_NAMES 即可。
@@ -2637,6 +2667,7 @@ describe("provisionV3Container — RemoteContractViolation 守门(v1.0.8)", () =
       }),
       isRemote: async () => true,
       resolveBaselinePaths: async () => ({
+        agentsMdHostPath: "/var/lib/openclaude/baseline/AGENTS.md",
         claudeMdHostPath: "/var/lib/openclaude/baseline/CLAUDE.md",
         skillsDirHostPath: "/var/lib/openclaude/baseline/skills",
       }),
@@ -2796,6 +2827,7 @@ describe("provisionV3Container — per-host bridge gateway env injection", () =>
       }),
       isRemote: async () => true,
       resolveBaselinePaths: async () => ({
+        agentsMdHostPath: "/var/lib/openclaude/baseline/AGENTS.md",
         claudeMdHostPath: "/var/lib/openclaude/baseline/CLAUDE.md",
         skillsDirHostPath: "/var/lib/openclaude/baseline/skills",
       }),
@@ -2995,6 +3027,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       },
       isRemote: async () => true,
       resolveBaselinePaths: async () => ({
+        agentsMdHostPath: "/var/lib/openclaude/baseline/AGENTS.md",
         claudeMdHostPath: "/var/lib/openclaude/baseline/CLAUDE.md",
         skillsDirHostPath: "/var/lib/openclaude/baseline/skills",
       }),
