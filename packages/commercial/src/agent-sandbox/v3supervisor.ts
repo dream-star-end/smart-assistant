@@ -256,12 +256,13 @@ const V3_SSH_RUN_CONTAINER_MOUNT = "/run/ccb-ssh";
 
 /**
  * CCB 平台基线目录的**默认**宿主路径(只读挂入容器 /run/oc/claude-config/ 的
- * CLAUDE.md + skills/ 整目录)。
+ * AGENTS.md + CLAUDE.md + skills/ 整目录)。
  *
  * 用途:向容器内 Claude Code 子进程注入平台身份/守则/能力边界 + 基线 skills ——
  * 容器内任何进程(包括 AI 自己)都无法修改,走 kernel ro bind mount 兜底。
  *
  * 目录结构(repo 内 `packages/commercial/agent-sandbox/ccb-baseline/` 完整 rsync 上去):
+ *   <baseline>/AGENTS.md                     → /opt/openclaude/AGENTS.md:ro
  *   <baseline>/CLAUDE.md                     → /run/oc/claude-config/CLAUDE.md:ro
  *   <baseline>/skills/                       → /run/oc/claude-config/skills:ro   (整目录)
  *       ├── system-info/SKILL.md
@@ -293,6 +294,7 @@ export const DEFAULT_V3_CCB_BASELINE_DIR =
   "/opt/openclaude/openclaude/packages/commercial/agent-sandbox/ccb-baseline";
 
 /** baseline 内部结构 —— 用 POSIX 绝对路径拼 docker Bind */
+export const V3_CCB_BASELINE_AGENTS_MD_REL = "AGENTS.md";
 export const V3_CCB_BASELINE_CLAUDE_MD_REL = "CLAUDE.md";
 export const V3_CCB_BASELINE_SKILLS_DIR_REL = "skills";
 
@@ -302,7 +304,7 @@ export const V3_CCB_BASELINE_SKILLS_DIR_REL = "skills";
  * 新增 / 下线一条基线 skill:
  *   1. 改这个数组(新增 name 或删除过期 name)
  *   2. 在 `packages/commercial/agent-sandbox/ccb-baseline/skills/<name>/SKILL.md` 增删文件
- *   3. 如守则引用该路径,更新 `CLAUDE.md` / `skills/system-info/SKILL.md` 文案
+ *   3. 如守则引用该路径,更新 `AGENTS.md` / `CLAUDE.md` / `skills/system-info/SKILL.md` 文案
  *
  * 校验意义:resolveCcbBaselineMounts 会为每条 name 强制 lstat + owner=root + mode + realpath,
  * 只要有一条不合规(缺 SKILL.md / group-writable / symlink 逃逸),整个 provision 走 fail-closed。
@@ -388,7 +390,7 @@ function assertBaselineLeaf(
  * 严格校验(按顺序):
  *   1. 输入是非空字符串
  *   2. 输入是绝对路径(path.normalize 后与 path.resolve 结果相等,允许尾斜杠)
- *   3. baseline root、`CLAUDE.md`、`skills/`,以及 `V3_CCB_BASELINE_SKILL_NAMES`
+ *   3. baseline root、`AGENTS.md`、`CLAUDE.md`、`skills/`,以及 `V3_CCB_BASELINE_SKILL_NAMES`
  *      里每一条 skill 目录都:非 symlink、类型正确、root owned、非 group/other writable
  *   4. `skills/` 下的顶层条目**必须完全等于** manifest(多余的 / 未声明的条目直接拒)
  *   5. 每条 skill 目录下**必须只有** `SKILL.md` 一个文件,不允许 subdir / 其它文件 / symlink
@@ -412,7 +414,7 @@ function assertBaselineLeaf(
  */
 export function resolveCcbBaselineMounts(
   baselineDir: string,
-): { claudeMdHostPath: string; skillsDirHostPath: string } | null {
+): { agentsMdHostPath: string; claudeMdHostPath: string; skillsDirHostPath: string } | null {
   if (typeof baselineDir !== "string" || baselineDir.trim() === "") return null;
   // 必须绝对路径;path.normalize 吞掉尾斜杠、多余 `/` 等等价写法。
   if (!pathIsAbsolute(baselineDir)) return null;
@@ -423,8 +425,10 @@ export function resolveCcbBaselineMounts(
     // resolve 通过后、docker createContainer 调度前替换 skill 内容,造成
     // TOCTOU。堵 skills/ 这层校验后,非 root 用户无法改动该链路上的任何一环。
     assertBaselineLeaf(abs, "dir", abs);
+    const agentsMdPath = pathJoin(abs, V3_CCB_BASELINE_AGENTS_MD_REL);
     const claudeMdPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_MD_REL);
     const skillsDirPath = pathJoin(abs, V3_CCB_BASELINE_SKILLS_DIR_REL);
+    const agentsReal = assertBaselineLeaf(agentsMdPath, "file", abs);
     const claudeReal = assertBaselineLeaf(claudeMdPath, "file", abs);
     // 中间目录 skills/ 必须和根一样被锁死(root owned + 非可写 + 非 symlink)
     const skillsDirReal = assertBaselineLeaf(skillsDirPath, "dir", abs);
@@ -471,6 +475,7 @@ export function resolveCcbBaselineMounts(
       assertBaselineLeaf(skillMd, "file", abs);
     }
     return {
+      agentsMdHostPath: agentsReal,
       claudeMdHostPath: claudeReal,
       skillsDirHostPath: skillsDirReal,
     };
@@ -1713,14 +1718,19 @@ export async function provisionV3Container(
     // 显式降级:env `OC_V3_CCB_BASELINE_OPTIONAL=1` (或 "true"/"yes") → warn 并跳过
     // 挂载,容器照常启动。仅 dev/test/local 用,生产禁止设置。
     //
-    // 基线齐全 → 在 Binds 上追加两条 :ro 项(单文件 CLAUDE.md + 整目录 skills/,
-    // 后者覆盖 tmpfs 内 /run/oc/claude-config/skills 整个子树)。docker daemon
-    // 会按挂载点深度排序,tmpfs 先于 bind 挂上,然后 ro bind 叠加,顺序正确无需
-    // 我们干预。
+    // 基线齐全 → 在 Binds 上追加三条 :ro 项(单文件 AGENTS.md / CLAUDE.md +
+    // 整目录 skills/)。AGENTS.md 覆盖 runtime image 里的仓库开发规则,让
+    // Codex 原生规则扫描拿到商业用户容器规则;skills/ 覆盖 tmpfs 内
+    // /run/oc/claude-config/skills 整个子树。docker daemon 会按挂载点深度
+    // 排序,tmpfs 先于 bind 挂上,然后 ro bind 叠加,顺序正确无需我们干预。
     // 远端 host:baseline 落在 node-agent 维护的 /var/lib/openclaude/baseline(Batch A 推入),
     // 不再由 master 的本地目录做结构校验(能连上 node-agent 本身就是一种 liveness)。
-    // 此路径拿到 {CLAUDE.md, skills/} 即用,校验责任在 node-agent bootstrap 的 baseline pull。
-    let baselineMounts: { claudeMdHostPath: string; skillsDirHostPath: string } | null;
+    // 此路径拿到 {AGENTS.md, CLAUDE.md, skills/} 即用,校验责任在 node-agent bootstrap 的 baseline pull。
+    let baselineMounts: {
+      agentsMdHostPath: string;
+      claudeMdHostPath: string;
+      skillsDirHostPath: string;
+    } | null;
     let baselineDir: string;
     if (useRemote) {
       const remotePaths = await deps.containerService!.resolveBaselinePaths(hostId!);
@@ -1900,6 +1910,10 @@ export async function provisionV3Container(
     }
     if (baselineMounts) {
       binds.push(
+        // Codex 原生 project rules 文件。挂到默认 WORKDIR /opt/openclaude 下,
+        // 覆盖镜像里用于开发 OpenClaude 仓库的 AGENTS.md,避免商业用户容器
+        // 误读 worktree/deploy 等平台内部规则。
+        `${baselineMounts.agentsMdHostPath}:/opt/openclaude/AGENTS.md:ro`,
         `${baselineMounts.claudeMdHostPath}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
         // 挂 skills/ 整目录,一次性覆盖所有基线 skill(system-info /
         // memory-management / platform-capabilities / scheduled-tasks /
@@ -2062,6 +2076,7 @@ export async function provisionV3Container(
             // 无需 supervisor 再起 helper 容器 mkdir。
             //
             // 额外两条 :ro bind(若基线齐全):
+            //   - <baseline>/AGENTS.md  → /opt/openclaude/AGENTS.md:ro(Codex native rules)
             //   - <baseline>/CLAUDE.md  → /run/oc/claude-config/CLAUDE.md:ro
             //   - <baseline>/skills/    → /run/oc/claude-config/skills:ro(整目录,覆盖所有基线 skill)
             // 内核层强制只读,容器内 ccb 和用户都无法改动平台守则。

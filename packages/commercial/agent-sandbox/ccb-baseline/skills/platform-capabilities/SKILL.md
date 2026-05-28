@@ -1,8 +1,8 @@
 ---
 name: platform-capabilities
-description: "OpenClaude (claudeai.chat) 平台核心能力: 多媒体收发规则、内联富内容"
-version: "2.0.0"
-tags: [system, platform, media]
+description: "OpenClaude (claudeai.chat) 平台核心能力: 多媒体收发规则、内联富内容、htmlpreview、HTML Canvas、界面预览、设计稿还原、交互 demo、小游戏"
+version: "2.1.0"
+tags: [system, platform, media, rich-content, htmlpreview, canvas, ui-preview]
 ---
 
 # claudeai.chat 平台能力
@@ -39,11 +39,50 @@ tags: [system, platform, media]
 
 回复中支持特殊代码块:
 
-- **```chart** — Chart.js 图表 (JSON 配置)
+- **```chart** — Chart.js 图表(JSON 配置)
 - **```mermaid** — 流程图/时序图/甘特图
-- **```htmlpreview** — 完整 HTML+CSS+JS 沙盒 (Canvas/动画/游戏)
+- **```htmlpreview** — 完整 HTML+CSS+JS 沙盒(Canvas/动画/小游戏/界面 demo)
 
-当用户要求可视化时,优先用内联代码块而不是写文件。
+当用户要求可视化、界面预览、交互 demo、HTML Canvas、小游戏、设计稿还原时,**优先直接输出内联代码块**,不要先生成 `.html` 文件。只有用户明确要求“保存成文件/给我下载链接”时才写文件。
+
+### `htmlpreview` / HTML Canvas 用法
+
+`htmlpreview` 会在 claudeai.chat 对话里渲染为 sandbox iframe。代码块里放完整 HTML,可以包含 `<style>`、`<script>`、`<canvas>`。
+
+最小模板:
+
+```htmlpreview
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; color: white; }
+    canvas { display: block; width: 100%; max-width: 720px; margin: 24px auto; background: #111827; border-radius: 16px; }
+  </style>
+</head>
+<body>
+  <canvas id="demo" width="720" height="420"></canvas>
+  <script>
+    const canvas = document.getElementById('demo')
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#1e293b'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.fillStyle = '#facc15'
+    ctx.font = 'bold 36px system-ui'
+    ctx.fillText('HTML Canvas 内联预览', 160, 210)
+  </script>
+</body>
+</html>
+```
+
+使用原则:
+- 输出 fenced code block: ` ```htmlpreview `,不要只贴普通 `html` 代码块
+- 适合:界面 mock、数据可视化小 demo、交互原型、Canvas 动画、小游戏、设计稿快速还原
+- `Canvas` 指浏览器原生 `<canvas>`,不是 Canva.com 设计平台;没有 Canva.com 调用工具时不要声称能直接操作 Canva.com
+- sandbox 里不要依赖登录态、本地文件路径或跨域 API;需要外部库时优先用纯原生 JS/CSS 实现
+- 流式输出时可能先显示为代码块,消息完成后前端会渲染为预览
 
 ## 外部 URL
 
@@ -60,4 +99,5 @@ MCP 工具返回的 URL (OSS 图片/音频链接) 也会自动内联渲染,直�
 | `/run/oc/claude-config/projects/` | 会话 / 记忆 / 项目状态 | ✅ 保留 |
 | `/run/oc/claude-config/CLAUDE.md` | 平台守则(只读) | ✅ 只读 |
 | `/run/oc/claude-config/skills/` | 平台基线 skill(只读) | ✅ 只读 |
+| `/opt/openclaude/AGENTS.md` | Codex 原生规则(平台只读覆盖) | ✅ 只读 |
 | `/tmp`、容器层其他路径 | 临时 | ❌ 重启清空 |

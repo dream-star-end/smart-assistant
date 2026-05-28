@@ -113,6 +113,7 @@ export type ContainerInspect = AgentContainerInspect;
 
 /** 基线挂载源路径(host 上的绝对路径)。 */
 export interface BaselineSourcePaths {
+  agentsMdHostPath: string;
   claudeMdHostPath: string;
   skillsDirHostPath: string;
 }
@@ -538,11 +539,13 @@ export class HostAwareContainerService implements ContainerService {
     const remote = await this.isRemote(hostId);
     if (!remote) {
       return {
+        agentsMdHostPath: `${SELF_HOST_CCB_BASELINE_DIR}/AGENTS.md`,
         claudeMdHostPath: `${SELF_HOST_CCB_BASELINE_DIR}/CLAUDE.md`,
         skillsDirHostPath: `${SELF_HOST_CCB_BASELINE_DIR}/skills`,
       };
     }
     return {
+      agentsMdHostPath: `${REMOTE_HOST_CCB_BASELINE_DIR}/AGENTS.md`,
       claudeMdHostPath: `${REMOTE_HOST_CCB_BASELINE_DIR}/CLAUDE.md`,
       skillsDirHostPath: `${REMOTE_HOST_CCB_BASELINE_DIR}/skills`,
     };

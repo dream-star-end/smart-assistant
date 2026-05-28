@@ -81,6 +81,8 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     '',
     '## 内联富内容: `chart` / `mermaid` / `htmlpreview` 代码块',
     '',
+    '用户要求界面预览、交互 demo、HTML Canvas、动画、小游戏、设计稿还原或可视化原型时,优先直接输出 fenced `htmlpreview` 代码块在对话里渲染,不要默认先生成 `.html` 文件。详细模板见 `skill_view("platform-capabilities")`。',
+    '',
     '## 子 Agent 与并行处理',
     '',
     '你可以使用 Agent 工具 spawn 子 agent 来并行处理独立的子任务。主动使用此能力:',
