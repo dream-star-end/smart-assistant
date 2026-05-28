@@ -4,8 +4,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
-import { resolveMcpMemoryEntry } from './codexLaunchOverrides.js'
+import { resolveMcpMemoryEntry, resolveOpenClaudeVisionEntry } from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
+import { OPENCLAUDE_VISION_MCP_ID, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
 import type { ExecutionTarget } from './remoteTarget.js'
@@ -961,13 +962,36 @@ export class SubprocessRunner extends EventEmitter {
     const sessionDir = mkdtempSync(resolve(tmpdir(), `openclaude-${safeDirName}-`))
     this.sessionDir = sessionDir
 
+    // Resolve provider/toolset-scoped MCP availability before building the
+    // prompt, so provider hints only mention tools that will really exist.
+    const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
+    const toolsetDefs = this.opts.config.toolsets
+    const agentToolsets = this.opts.agentToolsets
+    let allowedMcpIds: Set<string> | null = null // null = no filtering (all allowed)
+    if (agentToolsets && agentToolsets.length > 0 && toolsetDefs) {
+      allowedMcpIds = new Set<string>()
+      for (const ts of agentToolsets) {
+        const ids = toolsetDefs[ts]
+        if (ids) for (const id of ids) allowedMcpIds.add(id)
+      }
+      // Built-in 'openclaude-memory' is always allowed regardless of toolset
+      allowedMcpIds.add('openclaude-memory')
+    }
+    const openClaudeVisionAllowed =
+      shouldEnableOpenClaudeVision(effectiveProvider, this.opts.model) &&
+      (!allowedMcpIds || allowedMcpIds.has(OPENCLAUDE_VISION_MCP_ID))
+    const openClaudeVisionEntry = openClaudeVisionAllowed
+      ? resolveOpenClaudeVisionEntry(this.opts.config.auth.claudeCodePath)
+      : null
+
     // Build merged extra system prompt via structured prompt slots
     try {
       const promptResult = await buildPromptContext({
         agentId: this.opts.agentId,
         persona: this.opts.persona,
-        provider: this.opts.agentProvider ?? this.opts.config.provider,
+        provider: effectiveProvider,
         model: this.opts.model,
+        availableMcpTools: openClaudeVisionEntry ? ['understand_image'] : [],
         // 把当前 effort 传进 slot builder 决定是否注入"科研模式守则"。
         // effort 切换本就会 recycle subprocess,新 runner 启动时会重建 extra-prompt.md。
         effortLevel: this.opts.effortLevel,
@@ -1050,20 +1074,43 @@ export class SubprocessRunner extends EventEmitter {
       // Layer 3: Agent-specific MCPs (override same-id globals)
       // Toolset filter: if agent has toolsets configured, only include MCPs
       // whose id appears in at least one of the agent's toolset definitions.
-      const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
 
-      // Resolve toolset → allowed MCP server IDs
-      const toolsetDefs = this.opts.config.toolsets
-      const agentToolsets = this.opts.agentToolsets
-      let allowedMcpIds: Set<string> | null = null // null = no filtering (all allowed)
-      if (agentToolsets && agentToolsets.length > 0 && toolsetDefs) {
-        allowedMcpIds = new Set<string>()
-        for (const ts of agentToolsets) {
-          const ids = toolsetDefs[ts]
-          if (ids) for (const id of ids) allowedMcpIds.add(id)
+      // Built-in: openclaude-vision. This gives DeepSeek (and explicitly
+      // opted-in text-only providers) an understand_image tool without
+      // routing native multimodal providers through a Codex fallback.
+      if (openClaudeVisionAllowed) {
+        if (openClaudeVisionEntry) {
+          mcpServers[OPENCLAUDE_VISION_MCP_ID] = {
+            type: 'stdio',
+            command: 'npx',
+            args: ['tsx', openClaudeVisionEntry],
+            env: {
+              OPENCLAUDE_AGENT_ID: this.opts.agentId,
+              ...(process.env.OPENCLAUDE_HOME
+                ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME }
+                : {}),
+              ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {}),
+              OPENCLAUDE_VISION_CODEX_MODEL:
+                process.env.OPENCLAUDE_VISION_CODEX_MODEL ?? 'gpt-5.5',
+              ...(process.env.OPENCLAUDE_VISION_TIMEOUT_MS
+                ? { OPENCLAUDE_VISION_TIMEOUT_MS: process.env.OPENCLAUDE_VISION_TIMEOUT_MS }
+                : {}),
+              ...(process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES
+                ? {
+                    OPENCLAUDE_VISION_MAX_IMAGE_BYTES:
+                      process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES,
+                  }
+                : {}),
+              ...(process.env.OPENCLAUDE_VISION_MAX_CONCURRENT
+                ? { OPENCLAUDE_VISION_MAX_CONCURRENT: process.env.OPENCLAUDE_VISION_MAX_CONCURRENT }
+                : {}),
+            },
+          }
+        } else {
+          runnerLog.warn('openclaude-vision entry not found, skipping built-in MCP', {
+            sessionKey: this.opts.sessionKey,
+          })
         }
-        // Built-in 'openclaude-memory' is always allowed regardless of toolset
-        allowedMcpIds.add('openclaude-memory')
       }
 
       // Layer 1 + 2: Global MCPs

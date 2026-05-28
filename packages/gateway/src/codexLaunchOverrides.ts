@@ -128,6 +128,26 @@ export function resolveMcpMemoryEntry(claudeCodePath?: string): string | null {
   return null
 }
 
+/** Resolve the built-in OpenClaude vision MCP entry used by CCB text-only
+ * providers (DeepSeek/custom). Mirrors resolveMcpMemoryEntry's three layouts:
+ * source checkout, process.cwd() checkout, and v3 runtime image layout. */
+export function resolveOpenClaudeVisionEntry(claudeCodePath?: string): string | null {
+  const moduleDir = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
+  const candidates: string[] = [
+    resolve(moduleDir, 'mcpVisionServer.ts'),
+    resolve(process.cwd(), 'packages/gateway/src/mcpVisionServer.ts'),
+  ]
+  if (claudeCodePath) {
+    candidates.push(
+      resolve(claudeCodePath, '..', 'openclaude/packages/gateway/src/mcpVisionServer.ts'),
+    )
+  }
+  for (const c of candidates) {
+    if (existsSync(c)) return c
+  }
+  return null
+}
+
 // ── TOML literal encoding for `-c key=value` arguments ──
 
 /** Encode a value as a single-line TOML literal suitable for codex `-c key=value`.
@@ -154,7 +174,9 @@ function tomlValue(v: string | string[] | Record<string, string>): string {
   if (Array.isArray(v)) {
     for (const item of v) {
       if (typeof item !== 'string') {
-        throw new TypeError(`tomlValue array: only string elements are supported, got ${typeof item}`)
+        throw new TypeError(
+          `tomlValue array: only string elements are supported, got ${typeof item}`,
+        )
       }
     }
     return `[${v.map((item) => JSON.stringify(item)).join(',')}]`
@@ -310,10 +332,7 @@ export async function buildCodexLaunchOverrides(
     modelHintAppliedTotal.inc({ model_id: canonicalModelId, backend: 'codex' })
   }
 
-  const argvOverrides: string[] = [
-    '-c',
-    `model_instructions_file=${tomlValue(instructionsFile)}`,
-  ]
+  const argvOverrides: string[] = ['-c', `model_instructions_file=${tomlValue(instructionsFile)}`]
 
   // mcp-memory injection — best-effort. If the bundled entry can't be
   // resolved (corrupted install, hand-edited path), we still ship the

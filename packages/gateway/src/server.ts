@@ -94,6 +94,12 @@ import { WebhookRouter } from './webhooks.js'
 import { syncCodexAuthFiles } from './codexAuthSync.js'
 import { resolveCodexConversationMode } from './codexAutoPlanMode.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
+import { resolveOpenClaudeVisionEntry } from './codexLaunchOverrides.js'
+import {
+  OPENCLAUDE_VISION_MCP_ID,
+  OPENCLAUDE_VISION_TOOLS,
+  shouldEnableOpenClaudeVision,
+} from './mcpVisionServer.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
@@ -129,6 +135,60 @@ export const ALLOWED_INBOUND_MODELS = new Set([
   'deepseek-v4-flash',
   'deepseek-v4-pro',
 ])
+
+/** Mirror SubprocessRunner's MCP merge rules for prompt/upload hints.
+ * This is intentionally metadata-only: the actual tool injection still
+ * happens when the CCB subprocess starts. */
+export function collectAvailableMcpToolNames(
+  config: OpenClaudeConfig,
+  agent?: AgentDef,
+  model?: string,
+  opts: { resolveVisionEntry?: (claudeCodePath?: string) => string | null } = {},
+): string[] {
+  const tools = new Set<string>()
+  const effectiveProvider = agent?.provider ?? config.provider
+  const effectiveModel = model ?? agent?.model ?? config.defaults.model
+
+  const toolsetDefs = config.toolsets
+  const agentToolsets = agent?.toolsets ?? config.defaults.toolsets
+  let allowedMcpIds: Set<string> | null = null
+  if (agentToolsets && agentToolsets.length > 0 && toolsetDefs) {
+    allowedMcpIds = new Set<string>()
+    for (const ts of agentToolsets) {
+      const ids = toolsetDefs[ts]
+      if (ids) for (const id of ids) allowedMcpIds.add(id)
+    }
+    allowedMcpIds.add('openclaude-memory')
+  }
+
+  const addTools = (id: string, names?: string[], bypassToolset = false) => {
+    if (!bypassToolset && allowedMcpIds && !allowedMcpIds.has(id)) return
+    for (const name of names ?? []) tools.add(name)
+  }
+
+  const resolveVisionEntry = opts.resolveVisionEntry ?? resolveOpenClaudeVisionEntry
+  if (
+    shouldEnableOpenClaudeVision(effectiveProvider, effectiveModel) &&
+    resolveVisionEntry(config.auth.claudeCodePath)
+  ) {
+    addTools(OPENCLAUDE_VISION_MCP_ID, OPENCLAUDE_VISION_TOOLS)
+  }
+
+  for (const srv of config.mcpServers ?? []) {
+    if (srv.enabled === false) continue
+    if (srv.provider && srv.provider !== effectiveProvider) continue
+    addTools(srv.id, srv.tools)
+  }
+
+  for (const srv of agent?.mcpServers ?? []) {
+    if (srv.enabled === false) continue
+    // Agent-specific MCPs override/bypass global provider scoping, matching
+    // SubprocessRunner's Layer 3 behavior.
+    addTools(srv.id, srv.tools, true)
+  }
+
+  return [...tools]
+}
 
 // ─── handleUpload TOCTOU hardening test seam (v3 commercial v1.0.155) ───────
 //
@@ -6553,13 +6613,7 @@ export class Gateway {
 
     let finalText = text
     if (savedMedia.length > 0) {
-      const activeProvider = this.deps.config.provider
-      const activeMcpTools: string[] = []
-      for (const srv of this.deps.config.mcpServers ?? []) {
-        if (srv.enabled === false) continue
-        if (srv.provider && srv.provider !== activeProvider) continue
-        if (srv.tools) activeMcpTools.push(...srv.tools)
-      }
+      const activeMcpTools = collectAvailableMcpToolNames(this.deps.config, agent, safeModel)
       const hasUnderstandImage = activeMcpTools.includes('understand_image')
 
       const images = savedMedia.filter((m) => m.kind === 'image')
@@ -6579,7 +6633,7 @@ export class Gateway {
         let step = 1
         if (hasUnderstandImage) {
           lines.push(
-            `${step}. 优先调用 \`understand_image\` MCP 工具,传图片的**本地文件路径**作为 \`image_source\` 参数。`,
+            `${step}. 优先调用 \`understand_image\` MCP 工具,传图片的**本地文件路径**作为 \`image_file\` 参数。`,
           )
           step++
         }

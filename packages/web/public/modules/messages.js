@@ -314,6 +314,7 @@ const _MCP_SERVER_META = {
   browser: { icon: _ICON_BROWSER, label: '浏览器' },
   'minimax-media': { icon: _ICON_SPARKLE, label: '媒体生成' },
   'minimax-vision': { icon: _ICON_EYE, label: '视觉理解' },
+  'openclaude-vision': { icon: _ICON_EYE, label: '视觉理解' },
   'openclaude-memory': { icon: _ICON_BRAIN, label: '记忆' },
   codex: { icon: _ICON_BOT, label: 'Codex' },
   'quant-system': { icon: _ICON_CHART, label: '量化' },
@@ -388,6 +389,7 @@ const _MCP_OP_META = {
   // vision
   'minimax-vision:understand_image': { icon: _ICON_EYE, label: '图片理解' },
   'minimax-vision:web_search': { icon: _ICON_GLOBE, label: '联网搜索' },
+  'openclaude-vision:understand_image': { icon: _ICON_EYE, label: '图片理解' },
   // memory
   'openclaude-memory:memory': { icon: _ICON_BRAIN, label: '核心记忆' },
   'openclaude-memory:archival_add': { icon: _ICON_ARCHIVE, label: '归档写入' },
