@@ -19,6 +19,19 @@ export interface TelegramConfig {
   dropPendingUpdates?: boolean
 }
 
+type OutboundBlock = OutboundMessage['blocks'][number]
+
+function renderPlanBlockText(b: OutboundBlock): string {
+  if (b.kind !== 'plan') return ''
+  const parts: string[] = []
+  if (b.text) parts.push(b.text)
+  else if (b.explanation) parts.push(b.explanation)
+  if (Array.isArray(b.steps) && b.steps.length > 0) {
+    parts.push(b.steps.map((s, i) => `${i + 1}. ${s.step}`).join('\n'))
+  }
+  return parts.join('\n\n')
+}
+
 export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
   let bot: any = null
   let ctx: ChannelContext | null = null
@@ -108,7 +121,10 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
       for (const b of out.blocks) {
         if (b.kind === 'text' && b.text) textParts.push(b.text)
         else if (b.kind === 'thinking' && b.text) thinkingParts.push(b.text)
-        else if (b.kind === 'tool_use' && !b.partial) {
+        else if (b.kind === 'plan') {
+          const planText = renderPlanBlockText(b)
+          if (planText) textParts.push(textParts.length > 0 ? `\n\n${planText}` : planText)
+        } else if (b.kind === 'tool_use' && !b.partial) {
           const preview = b.inputPreview ? ` ${truncate(b.inputPreview, 200)}` : ''
           toolLines.push(`🔧 ${b.toolName}${preview}`)
         } else if (b.kind === 'tool_result' && b.preview) {

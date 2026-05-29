@@ -28,6 +28,19 @@ export interface WechatChannelConfig {
 
 const DEFAULT_RECONCILE_MS = 30_000
 
+type OutboundBlock = OutboundMessage['blocks'][number]
+
+function renderPlanBlockText(b: OutboundBlock): string {
+  if (b.kind !== 'plan') return ''
+  const parts: string[] = []
+  if (b.text) parts.push(b.text)
+  else if (b.explanation) parts.push(b.explanation)
+  if (Array.isArray(b.steps) && b.steps.length > 0) {
+    parts.push(b.steps.map((s, i) => `${i + 1}. ${s.step}`).join('\n'))
+  }
+  return parts.join('\n\n')
+}
+
 export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdapter {
   let ctx: ChannelContext | null = null
   const workers = new Map<string, WechatWorker>() // key = userId (OC user)
@@ -206,6 +219,12 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
       for (const b of out.blocks || []) {
         if (b.kind === 'text' && b.text) {
           textBuf.push(b.text)
+        } else if (b.kind === 'plan') {
+          const planText = renderPlanBlockText(b)
+          if (planText) {
+            if (textBuf.length > 0) textBuf.push('\n\n')
+            textBuf.push(planText)
+          }
         } else if (b.kind === 'tool_use' && !b.partial) {
           const dedupeKey = `${userId}:${senderId}:${b.blockId ?? `${b.toolName}:${textBuf.length}`}`
           if (announcedTools.has(dedupeKey)) continue
