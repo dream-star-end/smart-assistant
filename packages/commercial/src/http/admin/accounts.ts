@@ -73,6 +73,7 @@ function serializeAccount(
     id: a.id.toString(),
     /** V3 provider:'claude' | 'codex'(0051)。决定 admin UI tab + 容器内 auth 路径。 */
     provider: a.provider,
+    group_id: a.group_id !== null ? a.group_id.toString() : null,
     label: a.label,
     plan: a.plan,
     status: a.status,
@@ -354,6 +355,12 @@ export async function handleAdminCreateAccount(
     egress_proxy_id: String(b.egress_proxy_id),
     ...(provider !== undefined ? { provider } : {}),
   };
+  if (b.group_id !== undefined) {
+    if (b.group_id !== null && typeof b.group_id !== "string" && typeof b.group_id !== "number") {
+      throw new HttpError(400, "VALIDATION", "group_id must be string, number, or null");
+    }
+    input.group_id = b.group_id === null ? null : String(b.group_id);
+  }
   if (b.oauth_refresh_token !== undefined) {
     if (b.oauth_refresh_token !== null && typeof b.oauth_refresh_token !== "string") {
       throw new HttpError(400, "VALIDATION", "oauth_refresh_token must be string or null");
@@ -456,6 +463,12 @@ export async function handleAdminPatchAccount(
       throw new HttpError(400, "VALIDATION", "egress_proxy_id must be string or number");
     }
     patch.egress_proxy_id = String(b.egress_proxy_id);
+  }
+  if (b.group_id !== undefined) {
+    if (b.group_id !== null && typeof b.group_id !== "string" && typeof b.group_id !== "number") {
+      throw new HttpError(400, "VALIDATION", "group_id must be string, number, or null");
+    }
+    patch.group_id = b.group_id === null ? null : String(b.group_id);
   }
   if (b.egress_host_uuid !== undefined) {
     if (b.egress_host_uuid !== null && typeof b.egress_host_uuid !== "string") {

@@ -30,6 +30,13 @@ import {
   resolveCodexAccountEgressDispatcher,
 } from '../account-pool/codexEgress.js'
 import { query } from '../db/queries.js'
+import {
+  markRelayCredentialFailure,
+  markRelayCredentialSuccess,
+  resolveCodexRouteContext,
+  type ResolvedCodexRouteContext,
+} from '../account-pool/groups.js'
+import { zeroBuffer } from '../crypto/keys.js'
 
 export const CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
 export const CODEX_UPSTREAM_AUTH_HEADER = 'x-openclaude-upstream-authorization'
@@ -89,6 +96,9 @@ export interface CodexRelayDeps {
   db: CodexRelayDb
   upstreamBaseUrl?: string
   resolveDispatcher?: (accountId: bigint) => Promise<CodexRelayDispatcherInfo>
+  resolveRouteContext?: typeof resolveCodexRouteContext
+  markCredentialFailure?: typeof markRelayCredentialFailure
+  markCredentialSuccess?: typeof markRelayCredentialSuccess
   fetchImpl?: typeof fetch
   logger?: Logger
 }
@@ -199,6 +209,48 @@ export function mapCodexRelayUrl(
   }
 }
 
+
+function parseRouteRelayUrl(
+  reqUrl: string,
+  method: string,
+):
+  | { route: true; token: string; suffix: string; search: string }
+  | { route: false }
+  | { error: { status: number; code: string; message: string } } {
+  let parsed: URL
+  try {
+    parsed = new URL(reqUrl, 'http://internal')
+  } catch {
+    return { error: { status: 400, code: 'BAD_URL', message: 'malformed request url' } }
+  }
+  const prefix = `${CODEX_RELAY_PREFIX}/route/`
+  if (!parsed.pathname.startsWith(prefix)) return { route: false }
+  const rest = parsed.pathname.slice(prefix.length)
+  const slash = rest.indexOf('/')
+  const token = slash >= 0 ? rest.slice(0, slash) : rest
+  if (!/^[0-9a-f]{64}$/.test(token)) {
+    return { error: { status: 400, code: 'BAD_ROUTE_TOKEN', message: 'invalid route token' } }
+  }
+  const suffix = slash >= 0 ? rest.slice(slash) : ''
+  const allowed = validateRelaySuffix(method, suffix)
+  if (allowed.ok === false) {
+    return { error: { status: allowed.status, code: allowed.code, message: allowed.message } }
+  }
+  return { route: true, token, suffix, search: parsed.search }
+}
+
+function mapRouteContextUrl(
+  route: ResolvedCodexRouteContext,
+  suffix: string,
+  search: string,
+): { url: string; upstreamHost: string; upstreamPath: string } {
+  const upstream = new URL(route.credential.base_url)
+  const upstreamBasePath = normalizeBasePath(route.credential.base_url)
+  upstream.pathname = `${upstreamBasePath}${suffix || ''}` || '/'
+  upstream.search = search
+  return { url: upstream.toString(), upstreamHost: upstream.host, upstreamPath: upstream.pathname }
+}
+
 function appendHeader(headers: Headers, key: string, value: string | string[] | undefined): void {
   if (value === undefined) return
   if (Array.isArray(value)) {
@@ -236,6 +288,10 @@ function copyResponseHeaders(from: Headers, res: ServerResponse): void {
     if (key === 'content-length') return
     res.setHeader(rawKey, value)
   })
+}
+
+export function isRelayCredentialFailureStatus(status: number): boolean {
+  return status >= 500 || status === 401 || status === 403 || status === 429
 }
 
 function closeIfHeadersAlreadySent(res: ServerResponse, err: unknown): boolean {
@@ -288,6 +344,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     const r = await resolveCodexAccountEgressDispatcher(accountId)
     return { accountId: r.accountId, proxyId: r.proxyId, dispatcher: r.dispatcher }
   })
+  const resolveRoute = deps.resolveRouteContext ?? resolveCodexRouteContext
+  const markCredentialFailure = deps.markCredentialFailure ?? markRelayCredentialFailure
+  const markCredentialSuccess = deps.markCredentialSuccess ?? markRelayCredentialSuccess
   const fetchImpl = deps.fetchImpl ?? fetch
 
   return async function handle(req, res, ctx) {
@@ -298,10 +357,18 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     const method = req.method ?? 'GET'
     const reqLog = log.child({ requestId, hostUuid: ctx.hostUuid, boundIp: ctx.boundIp, method })
 
-    const mapped = mapCodexRelayUrl(req.url ?? '/', method, upstreamBaseUrl)
-    if ('error' in mapped) {
-      sendJsonError(res, mapped.error.status, mapped.error.code, mapped.error.message, requestId)
+    const routeReq = parseRouteRelayUrl(req.url ?? '/', method)
+    if ('error' in routeReq) {
+      sendJsonError(res, routeReq.error.status, routeReq.error.code, routeReq.error.message, requestId)
       return
+    }
+    let mapped: ReturnType<typeof mapCodexRelayUrl> | null = null
+    if (routeReq.route === false) {
+      mapped = mapCodexRelayUrl(req.url ?? '/', method, upstreamBaseUrl)
+      if ('error' in mapped) {
+        sendJsonError(res, mapped.error.status, mapped.error.code, mapped.error.message, requestId)
+        return
+      }
     }
 
     let identity: Awaited<ReturnType<typeof verifyContainerIdentity>>
@@ -341,34 +408,58 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       sendJsonError(res, 409, 'CONTAINER_BINDING_CHANGED', 'container is not active', requestId)
       return
     }
-    if (binding.codexAccountId === null) {
-      userLog.warn('no_bound_account')
-      sendJsonError(res, 503, 'NO_BOUND_CODEX_ACCOUNT', 'container has no codex account bound', requestId)
-      return
-    }
-    if (binding.provider !== 'codex' || binding.accountStatus !== 'active') {
-      userLog.warn('bound_account_not_active', {
-        codexAccountId: String(binding.codexAccountId),
-        provider: binding.provider,
-        accountStatus: binding.accountStatus,
-      })
-      sendJsonError(res, 503, 'CODEX_ACCOUNT_NOT_ACTIVE', 'bound codex account is not active', requestId)
-      return
-    }
 
-    let egress: CodexRelayDispatcherInfo
-    try {
-      egress = await resolveDispatcher(binding.codexAccountId)
-    } catch (err) {
-      const fields = err instanceof CodexEgressError
-        ? { code: err.code, proxyId: err.details.proxyId ?? null }
-        : { code: 'unknown', proxyId: null }
-      userLog.warn('egress_unavailable', {
-        codexAccountId: String(binding.codexAccountId),
-        ...fields,
-      })
-      sendJsonError(res, 503, 'CODEX_EGRESS_UNAVAILABLE', 'codex account egress unavailable', requestId)
-      return
+    let egress: CodexRelayDispatcherInfo | null = null
+    let routeContext: ResolvedCodexRouteContext | null = null
+    let mappedUrl: { url: string; upstreamHost: string; upstreamPath: string }
+    if (routeReq.route === true) {
+      try {
+        routeContext = await resolveRoute({
+          token: routeReq.token,
+          containerId: identity.containerId,
+          userId: BigInt(identity.userId),
+        })
+      } catch (err) {
+        userLog.warn('route_context_read_failed', { err: err instanceof Error ? err.message : String(err) })
+        sendJsonError(res, 503, 'CODEX_ROUTE_UNAVAILABLE', 'codex route unavailable', requestId)
+        return
+      }
+      if (!routeContext) {
+        userLog.warn('route_context_unavailable')
+        sendJsonError(res, 503, 'CODEX_ROUTE_UNAVAILABLE', 'codex route unavailable', requestId)
+        return
+      }
+      mappedUrl = mapRouteContextUrl(routeContext, routeReq.suffix, routeReq.search)
+    } else {
+      if (binding.codexAccountId === null) {
+        userLog.warn('no_bound_account')
+        sendJsonError(res, 503, 'NO_BOUND_CODEX_ACCOUNT', 'container has no codex account bound', requestId)
+        return
+      }
+      if (binding.provider !== 'codex' || binding.accountStatus !== 'active') {
+        userLog.warn('bound_account_not_active', {
+          codexAccountId: String(binding.codexAccountId),
+          provider: binding.provider,
+          accountStatus: binding.accountStatus,
+        })
+        sendJsonError(res, 503, 'CODEX_ACCOUNT_NOT_ACTIVE', 'bound codex account is not active', requestId)
+        return
+      }
+
+      try {
+        egress = await resolveDispatcher(binding.codexAccountId)
+      } catch (err) {
+        const fields = err instanceof CodexEgressError
+          ? { code: err.code, proxyId: err.details.proxyId ?? null }
+          : { code: 'unknown', proxyId: null }
+        userLog.warn('egress_unavailable', {
+          codexAccountId: String(binding.codexAccountId),
+          ...fields,
+        })
+        sendJsonError(res, 503, 'CODEX_EGRESS_UNAVAILABLE', 'codex account egress unavailable', requestId)
+        return
+      }
+      mappedUrl = mapped as Exclude<typeof mapped, null | { error: unknown }>
     }
 
     const controller = new AbortController()
@@ -377,10 +468,11 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     res.once('close', abort)
 
     const relayLog = userLog.child({
-      codexAccountId: String(egress.accountId),
-      proxyId: String(egress.proxyId),
-      upstreamHost: mapped.upstreamHost,
-      upstreamPath: mapped.upstreamPath,
+      codexAccountId: egress ? String(egress.accountId) : null,
+      relayCredentialId: routeContext ? String(routeContext.credential.id) : null,
+      proxyId: egress ? String(egress.proxyId) : null,
+      upstreamHost: mappedUrl.upstreamHost,
+      upstreamPath: mappedUrl.upstreamPath,
     })
 
     try {
@@ -388,14 +480,30 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         method,
         headers: buildUpstreamHeaders(req),
         body: method === 'GET' || method === 'HEAD' ? undefined : (req as unknown as BodyInit),
-        dispatcher: egress.dispatcher,
+        dispatcher: egress?.dispatcher,
         duplex: 'half',
         signal: controller.signal,
       }
-      const upstream = await fetchImpl(mapped.url, init)
+      if (routeContext) {
+        const apiKey = routeContext.apiKey
+        try {
+          init.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers as HeadersInit)
+          ;(init.headers as Headers).set('authorization', `Bearer ${apiKey.toString('utf8')}`)
+        } finally {
+          zeroBuffer(apiKey)
+        }
+      }
+      const upstream = await fetchImpl(mappedUrl.url, init)
       res.statusCode = upstream.status
       copyResponseHeaders(upstream.headers, res)
       relayLog.info('relay_upstream_response', { status: upstream.status })
+      if (routeContext) {
+        if (isRelayCredentialFailureStatus(upstream.status)) {
+          void markCredentialFailure(routeContext.credential.id, `http_${upstream.status}`).catch(() => {})
+        } else {
+          void markCredentialSuccess(routeContext.credential.id).catch(() => {})
+        }
+      }
       if (!upstream.body) {
         res.end()
         return
@@ -410,6 +518,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     } catch (err) {
       if (controller.signal.aborted) return
       relayLog.warn('relay_fetch_failed', { err: err as Error })
+      if (routeContext) {
+        void markCredentialFailure(routeContext.credential.id, err instanceof Error ? err.message : String(err)).catch(() => {})
+      }
       if (closeIfHeadersAlreadySent(res, err)) return
       sendJsonError(res, 502, 'CODEX_RELAY_UPSTREAM_FAILED', 'codex upstream request failed', requestId)
     } finally {

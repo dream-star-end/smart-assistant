@@ -33,6 +33,7 @@
 import type { Dispatcher } from "undici";
 
 import type { Logger } from "../../logging/logger.js";
+import type { AccountGroupKind, AccountGroupProvider, AccountGroupRow } from "../../account-pool/groups.js";
 import { errMessageShort, errSummary } from "../util.js";
 import {
   AccountPoolBusyError,
@@ -249,6 +250,11 @@ export interface PickUpstreamDeps {
    * 否则 scheduler 内部降级 off + warn。
    */
   getSessionPinMode?: () => Promise<SessionPinMode>;
+  listEnabledAccountGroupsForModel?: (args: {
+    modelId: string;
+    kind?: AccountGroupKind;
+    provider?: AccountGroupProvider;
+  }) => Promise<AccountGroupRow[]>;
 }
 
 type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
@@ -463,32 +469,81 @@ export async function pickUpstream(
   const sessionPinMode: SessionPinMode =
     (await deps.getSessionPinMode?.()) ?? "off";
 
-  // OAuth path —— scheduler.pick
-  let pick: PickResult;
-  try {
-    pick = await deps.scheduler.pick({
-      mode: "chat",
-      sessionId: extractSessionId(body.metadata) ?? undefined,
-      model: body.model,
-      enforceAccountUuid: phase6Enforce === "fail_closed",
-      pinMode: sessionPinMode,
-      userId,
-      forceRepin,
+  // OAuth path —— account groups are tried by priority when a resolver is injected.
+  // Tests and legacy wiring may omit it, in which case scheduler keeps historical whole-pool behavior.
+  let groupIds: Array<bigint | null> = [null];
+  if (deps.listEnabledAccountGroupsForModel) {
+    const groups = await deps.listEnabledAccountGroupsForModel({
+      modelId: body.model,
+      kind: "official_oauth",
+      provider: "claude",
     });
-  } catch (err) {
-    if (err instanceof AccountPoolBusyError) {
-      return { ok: false, error: { kind: "pool_busy", err } };
+    if (groups.length === 0) {
+      return {
+        ok: false,
+        error: {
+          kind: "pool_unavailable",
+          err: new AccountPoolUnavailableError("no_enabled_group"),
+        },
+      };
     }
-    if (err instanceof AccountPoolUnavailableError) {
-      return { ok: false, error: { kind: "pool_unavailable", err } };
+    groupIds = groups.map((g) => g.id);
+  }
+
+  let pick: PickResult | null = null;
+  let lastBusy: AccountPoolBusyError | null = null;
+  let lastUnavailable: AccountPoolUnavailableError | null = null;
+  let lastPinTemporarilyUnavailable: SessionPinTemporarilyUnavailableError | null = null;
+  for (const groupId of groupIds) {
+    try {
+      pick = await deps.scheduler.pick({
+        mode: "chat",
+        sessionId: extractSessionId(body.metadata) ?? undefined,
+        model: body.model,
+        groupId,
+        enforceAccountUuid: phase6Enforce === "fail_closed",
+        pinMode: sessionPinMode,
+        userId,
+        forceRepin,
+      });
+      break;
+    } catch (err) {
+      if (err instanceof AccountPoolBusyError) {
+        lastBusy = err;
+        continue;
+      }
+      if (err instanceof AccountPoolUnavailableError) {
+        lastUnavailable = err;
+        continue;
+      }
+      if (err instanceof SessionPinUnboundError) {
+        return { ok: false, error: { kind: "session_pin_unbound", err } };
+      }
+      if (err instanceof SessionPinTemporarilyUnavailableError) {
+        lastPinTemporarilyUnavailable = err;
+        continue;
+      }
+      throw err; // unknown — handler 外层 500
     }
-    if (err instanceof SessionPinUnboundError) {
-      return { ok: false, error: { kind: "session_pin_unbound", err } };
+  }
+  if (pick === null) {
+    if (lastBusy) return { ok: false, error: { kind: "pool_busy", err: lastBusy } };
+    if (lastPinTemporarilyUnavailable) {
+      return {
+        ok: false,
+        error: {
+          kind: "session_pin_temporarily_unavailable",
+          err: lastPinTemporarilyUnavailable,
+        },
+      };
     }
-    if (err instanceof SessionPinTemporarilyUnavailableError) {
-      return { ok: false, error: { kind: "session_pin_temporarily_unavailable", err } };
-    }
-    throw err; // unknown — handler 外层 500
+    return {
+      ok: false,
+      error: {
+        kind: "pool_unavailable",
+        err: lastUnavailable ?? new AccountPoolUnavailableError("no_group_candidate"),
+      },
+    };
   }
 
   // Phase 6 H6 — fail_closed defense-in-depth(Codex round 2 MINOR 1):

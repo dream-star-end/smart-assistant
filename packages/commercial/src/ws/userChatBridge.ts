@@ -372,6 +372,14 @@ export interface UserChatBridgeDeps {
    * 未注入 → bridge 不做 codex 并发管控,inbound 透传(测试 / 个人版上下文)。
    */
   codexBinding?: CodexBindingHandle;
+  /** Create an opaque per-turn Codex API relay route. When injected, GPT turns use api_relay groups instead of legacy OAuth codex accounts. */
+  createCodexRoute?: (args: {
+    containerId: number;
+    userId: bigint;
+    modelId: string;
+  }) => Promise<CodexApiRelayRoute | null>;
+  /** Expire an opaque per-turn Codex API relay route after the turn settles or aborts. */
+  expireCodexRoute?: (token: string) => Promise<void>;
   /**
    * PR2 v1.0.66 — codex 真扣费三件套(必须同时注入或同时缺省)。
    *
@@ -421,6 +429,18 @@ export interface UserChatBridgeDeps {
 export interface CodexBindingHandle {
   acquire(containerId: number): Promise<{ account_id: bigint } | null>;
   release(account_id: bigint): void;
+}
+
+export interface CodexApiRelayRoute {
+  token: string;
+  baseUrl: string;
+  modelProvider: string;
+  providerName?: string | null;
+  wireApi?: "responses" | "chat";
+  preferredAuthMethod?: "apikey" | "chatgpt";
+  disableResponseStorage?: boolean;
+  groupId: string;
+  credentialId: string;
 }
 
 /**
@@ -545,6 +565,8 @@ interface CodexTurnSnapshot {
    *  **服务端 trust source**:settle 决策永远只信本字段,不解析 outbound 帧的
    *  frame.traceId(防容器侧伪造影响计费观测)。 */
   traceId: string;
+  /** Opaque Codex API relay route token for this turn, if the turn used an API relay group. */
+  codexRouteToken: string | null;
 }
 
 export interface UserChatBridgeHandler {
@@ -1141,6 +1163,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //     ws 异常断后槽永久泄漏
     let acquiredCodexAccountId: bigint | null = null;
     let codexAcquireInflight = false;
+    let codexApiRelayTurnInFlight = false;
+    let codexApiRelayRouteToken: string | null = null;
     let codexReleaseTimer: ReturnType<typeof setTimeout> | null = null;
     // plan v3 G6 — outbound 终态早释放(Codex review v2 BLOCKER 1):
     //   只靠 600s timer + cleanup 释放,正常完成的 turn 会持槽 ≤ 10min,
@@ -1149,6 +1173,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //   outbound.error 且 peer.id 命中 → 立即 release,timer 退化为兜底。
     //   匹配 peer.id 的原因:同桥可 claude+codex 交错,只看"任意 isFinal"会误释。
     let codexInboundPeerId: string | null = null;
+    const expireCodexRouteToken = (token: string | null, reason: string): void => {
+      if (token === null) return;
+      if (codexApiRelayRouteToken === token) codexApiRelayRouteToken = null;
+      const expire = deps.expireCodexRoute;
+      if (expire === undefined) return;
+      void expire(token).catch((err) => {
+        bridgeLog?.warn("user-chat-bridge: expire codex route failed", {
+          reason,
+          err: (err as Error)?.message ?? String(err),
+        });
+      });
+    };
+    const expireActiveCodexRoute = (reason: string): void => {
+      expireCodexRouteToken(codexApiRelayRouteToken, reason);
+    };
 
     // Phase 4 — GitHub session-repo auto-rebind:bridge 实例级 cache。
     //   containerWs.on('open') 时 fetch active selections 进 map(无 token);
@@ -1630,12 +1669,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             } else if (rawClientTrace !== undefined) {
               clientTraceFields.clientTraceIdIssue = clientHint.issue;
             }
-            // sanitize:非法 clientTraceId 不透传给 container — 合法 / undefined 保留原 parsed
+            // sanitize:
+            //   - 非法 clientTraceId 不透传给 container — 合法 / undefined 保留原 parsed
+            //   - __oc_codex_route 永远是 master-owned 私有字段;client 输入即使形状合法也必须剥离,
+            //     后面只有 server 侧 createCodexRoute 成功时才会重新注入。
             let sanitizedParsed = parsed as Record<string, unknown>;
-            if (rawClientTrace !== undefined && !clientHint.ok) {
-              const { clientTraceId: _drop, ...rest } = sanitizedParsed;
-              void _drop;
-              sanitizedParsed = rest;
+            const hasClientCodexRoute = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "__oc_codex_route",
+            );
+            if ((rawClientTrace !== undefined && !clientHint.ok) || hasClientCodexRoute) {
+              sanitizedParsed = { ...sanitizedParsed };
+              if (rawClientTrace !== undefined && !clientHint.ok) {
+                delete sanitizedParsed.clientTraceId;
+              }
+              if (hasClientCodexRoute) {
+                delete sanitizedParsed.__oc_codex_route;
+              }
             }
             inboundParsedFrame = sanitizedParsed;
             // CG2b — turnLog 派生:traceId 钉进 bindings,后续 turn 内 log 自动带上
@@ -1657,10 +1707,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 非 codex 帧 / 没注入 codexBinding / 没 containerId → 直接走下方原同步 forward
       if (
         isCodexInboundFrame &&
-        deps.codexBinding !== undefined &&
-        containerId !== undefined
+        containerId !== undefined &&
+        (deps.codexBinding !== undefined || deps.createCodexRoute !== undefined)
       ) {
-        if (acquiredCodexAccountId !== null || codexAcquireInflight) {
+        if (acquiredCodexAccountId !== null || codexApiRelayTurnInFlight || codexAcquireInflight) {
           // G7 严格单飞:不 close bridge,让前端等当前 turn 完成后重发
           turnLogForFrame?.info("user-chat-bridge: codex turn busy, rejecting frame");
           sendErrorFrame(
@@ -1672,6 +1722,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         codexAcquireInflight = true;
         const codexBinding = deps.codexBinding;
+        const createCodexRoute = deps.createCodexRoute;
         const cid = containerId;
         const sessionMaxMs = readCodexSessionMaxMs();
         // 进 acquire 路径才记 peer.id;G7 拒绝路径(busy)不该覆盖在飞 turn 的 peer.id。
@@ -1684,10 +1735,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             clearTimeout(codexReleaseTimer);
             codexReleaseTimer = null;
           }
-          if (acquiredCodexAccountId !== null) {
+          if (acquiredCodexAccountId !== null && codexBinding !== undefined) {
             try { codexBinding.release(acquiredCodexAccountId); } catch { /* */ }
             acquiredCodexAccountId = null;
           }
+          expireActiveCodexRoute("failure");
+          codexApiRelayTurnInFlight = false;
           codexInboundPeerId = null;
         };
         // PR2 v1.0.66 — 把外层 onUserMessage 抓的 effectiveModel / parsed / agentId
@@ -1715,15 +1768,47 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            const acquired = await codexBinding.acquire(cid);
+            let codexRoute: CodexApiRelayRoute | null = null;
+            if (createCodexRoute !== undefined) {
+              if (effectiveModelCapture === null) {
+                throw new Error("codex route requested without effective model");
+              }
+              codexRoute = await createCodexRoute({
+                containerId: cid,
+                userId: uid,
+                modelId: effectiveModelCapture,
+              });
+              if (codexRoute !== null) codexApiRelayRouteToken = codexRoute.token;
+            }
+
+            let acquired: { account_id: bigint } | null = null;
+            if (codexRoute === null) {
+              if (codexBinding === undefined) {
+                throw Object.assign(new Error("no enabled Codex API relay group"), { name: "CodexRouteUnavailable" });
+              }
+              acquired = await codexBinding.acquire(cid);
+            }
             if (cleaned) {
-              // bridge 在 acquire 期间被关 — 立即 release 不留泄漏
-              if (acquired !== null) {
+              // bridge 在 acquire/route 创建期间被关 — 立即 release 不留泄漏
+              if (codexRoute !== null) {
+                expireCodexRouteToken(codexRoute.token, "cleanup_during_route_creation");
+              }
+              if (acquired !== null && codexBinding !== undefined) {
                 try { codexBinding.release(acquired.account_id); } catch { /* */ }
               }
               return;
             }
-            if (acquired === null) {
+            if (codexRoute !== null) {
+              codexApiRelayTurnInFlight = true;
+              codexInboundPeerId = peerIdForAcquire;
+              codexReleaseTimer = setTimeout(() => {
+                expireActiveCodexRoute("timeout");
+                codexApiRelayTurnInFlight = false;
+                codexInboundPeerId = null;
+                codexReleaseTimer = null;
+              }, sessionMaxMs);
+              codexReleaseTimer.unref?.();
+            } else if (acquired === null) {
               // legacy NULL 容器(决策 N3):不占 per-account 槽,billing 路径下面
               // 仍跑(accountIdForLedger=0n 占位)。每轮 turn 都会再走一次 IIFE
               // (acquire() 内部 row 查很轻),持续保持每轮扣费。
@@ -1732,10 +1817,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               codexInboundPeerId = peerIdForAcquire;
               codexReleaseTimer = setTimeout(() => {
                 // 兜底释放:防 outbound 完成信号丢 / ws 异常断 → 槽永久泄漏
-                if (acquiredCodexAccountId !== null) {
+                if (acquiredCodexAccountId !== null && codexBinding !== undefined) {
                   try { codexBinding.release(acquiredCodexAccountId); } catch { /* */ }
                   acquiredCodexAccountId = null;
                 }
+                codexApiRelayTurnInFlight = false;
                 codexInboundPeerId = null;
                 codexReleaseTimer = null;
               }, sessionMaxMs);
@@ -1930,6 +2016,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // CG2c — IIFE 起手 invariant 已校验 turnTraceIdCapture !== null,
                 // 这里读出来 TS 推断为 string。本 turn 整个生命周期内固定不可变。
                 traceId: turnTraceIdCapture,
+                codexRouteToken: codexRoute?.token ?? null,
               });
 
               // Frame rewrite:server-owned requestId 覆盖 client 任意值。容器侧
@@ -1954,6 +2041,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ...enrichedParsed,
                 requestId,
                 traceId: turnTraceIdCapture,
+                ...(codexRoute !== null ? {
+                  __oc_codex_route: {
+                    baseUrl: codexRoute.baseUrl,
+                    modelProvider: codexRoute.modelProvider,
+                    providerName: codexRoute.providerName ?? null,
+                    wireApi: codexRoute.wireApi ?? "responses",
+                    preferredAuthMethod: codexRoute.preferredAuthMethod ?? "apikey",
+                    disableResponseStorage: codexRoute.disableResponseStorage ?? true,
+                  },
+                } : {}),
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -1994,6 +2091,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const rewrittenObj = {
                 ...enrichedParsed,
                 traceId: turnTraceIdCapture,
+                ...(codexRoute !== null ? {
+                  __oc_codex_route: {
+                    baseUrl: codexRoute.baseUrl,
+                    modelProvider: codexRoute.modelProvider,
+                    providerName: codexRoute.providerName ?? null,
+                    wireApi: codexRoute.wireApi ?? "responses",
+                    preferredAuthMethod: codexRoute.preferredAuthMethod ?? "apikey",
+                    disableResponseStorage: codexRoute.disableResponseStorage ?? true,
+                  },
+                } : {}),
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -2038,6 +2145,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   "GPT 账号配置已变更,容器已自动重建,请刷新页面后重发",
                 );
                 try { userWs.close(CLOSE_BRIDGE.POLICY, "codex_container_recycled"); } catch { /* */ }
+              }
+            } else if (errName === "CodexRouteUnavailable") {
+              turnLogCapture?.info("user-chat-bridge: codex api relay route unavailable");
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "CODEX_ROUTE_UNAVAILABLE",
+                  "no enabled Codex API relay group for this model",
+                );
               }
             } else if (errName === "AccountPoolBusyError") {
               turnLogCapture?.info("user-chat-bridge: codex pool busy, fast-fail");
@@ -2362,6 +2478,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   err: (err as Error)?.message,
                 });
               } finally {
+                expireCodexRouteToken(snap.codexRouteToken, "billing_settled");
                 checkDrainComplete();
               }
             })();
@@ -2480,10 +2597,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   - peer.id 严格匹配:claude 流 peer.id 不同 → 不误释
       //   - 释放在 userWs.send 之前完成,失败回滚靠 cleanup 兜底
       if (
-        acquiredCodexAccountId !== null &&
+        (acquiredCodexAccountId !== null || codexApiRelayTurnInFlight) &&
         codexInboundPeerId !== null &&
-        !isBinary &&
-        deps.codexBinding !== undefined
+        !isBinary
       ) {
         let outText: string | null = null;
         if (typeof data === "string") outText = data;
@@ -2510,12 +2626,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if ((isFinalMsg || isErr) && peerId !== null && peerId === codexInboundPeerId) {
               const accountId = acquiredCodexAccountId;
               acquiredCodexAccountId = null;
+              codexApiRelayTurnInFlight = false;
               codexInboundPeerId = null;
               if (codexReleaseTimer !== null) {
                 clearTimeout(codexReleaseTimer);
                 codexReleaseTimer = null;
               }
-              try { deps.codexBinding.release(accountId); } catch { /* swallow */ }
+              if (accountId !== null && deps.codexBinding !== undefined) {
+                try { deps.codexBinding.release(accountId); } catch { /* swallow */ }
+              }
+              expireActiveCodexRoute(isFinalMsg ? "turn_final" : "turn_error");
             }
           }
         }
@@ -2862,6 +2982,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try { deps.codexBinding.release(acquiredCodexAccountId); } catch { /* */ }
         acquiredCodexAccountId = null;
       }
+      expireActiveCodexRoute("bridge_cleanup");
+      codexApiRelayTurnInFlight = false;
       codexInboundPeerId = null;
       try { connectAbort.abort(); } catch { /* */ }
       try {

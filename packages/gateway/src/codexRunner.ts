@@ -196,11 +196,22 @@ function envFlagDefaultTrue(value: string | undefined): boolean {
  * injected per spawn via `-c` overrides so user-writable config.toml cannot
  * accidentally route platform Codex traffic back to api.openai.com.
  */
+export interface CodexProviderConfigOverride {
+  modelProvider?: string
+  baseUrl?: string
+  providerName?: string | null
+  wireApi?: string | null
+  preferredAuthMethod?: string | null
+  disableResponseStorage?: boolean | null
+}
+
 export function buildCodexProviderConfigArgs(
   env: NodeJS.ProcessEnv = process.env,
+  override: CodexProviderConfigOverride | null = null,
 ): string[] {
-  const providerId = (env.OC_CODEX_MODEL_PROVIDER ?? '').trim()
-  const baseUrl = (env.OC_CODEX_BASE_URL ?? '').trim()
+  const hasOverride = override !== null
+  const providerId = (hasOverride ? override.modelProvider ?? '' : env.OC_CODEX_MODEL_PROVIDER ?? '').trim()
+  const baseUrl = (hasOverride ? override.baseUrl ?? '' : env.OC_CODEX_BASE_URL ?? '').trim()
   if (!providerId && !baseUrl) return []
   if (!providerId || !baseUrl) {
     log.warn('codex provider override incomplete; ignoring OC_CODEX_* relay config', {
@@ -214,10 +225,18 @@ export function buildCodexProviderConfigArgs(
     return []
   }
 
-  const providerName = (env.OC_CODEX_PROVIDER_NAME ?? '').trim() || providerId
-  const wireApi = (env.OC_CODEX_WIRE_API ?? '').trim() || 'responses'
-  const authMethod = (env.OC_CODEX_PREFERRED_AUTH_METHOD ?? '').trim() || 'apikey'
-  const disableResponseStorage = envFlagDefaultTrue(env.OC_CODEX_DISABLE_RESPONSE_STORAGE)
+  const providerName = (
+    hasOverride ? override.providerName ?? '' : env.OC_CODEX_PROVIDER_NAME ?? ''
+  ).trim() || providerId
+  const wireApi = (
+    hasOverride ? override.wireApi ?? '' : env.OC_CODEX_WIRE_API ?? ''
+  ).trim() || 'responses'
+  const authMethod = (
+    hasOverride ? override.preferredAuthMethod ?? '' : env.OC_CODEX_PREFERRED_AUTH_METHOD ?? ''
+  ).trim() || 'apikey'
+  const disableResponseStorage = hasOverride
+    ? override.disableResponseStorage ?? true
+    : envFlagDefaultTrue(env.OC_CODEX_DISABLE_RESPONSE_STORAGE)
 
   return [
     '-c',

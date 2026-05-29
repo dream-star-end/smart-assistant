@@ -56,6 +56,11 @@ import {
 } from "../account-pool/anthropicProfile.js";
 import { getDispatcherForAccount } from "../account-pool/egressDispatcher.js";
 import { getEgressProxyUrlPlaintext } from "./egressProxies.js";
+import {
+  getAccountGroup,
+  listAccountGroups,
+  type AccountGroupRow,
+} from "../account-pool/groups.js";
 
 // getPool 已在文件顶部 import,不重复
 
@@ -140,9 +145,47 @@ function snapshotForAudit(r: AccountRow): Record<string, unknown> {
     plan: r.plan,
     status: r.status,
     health_score: r.health_score,
+    group_id: r.group_id !== null ? r.group_id.toString() : null,
     egress_proxy: maskEgressProxy(r.egress_proxy),
     egress_proxy_id: r.egress_proxy_id !== null ? r.egress_proxy_id.toString() : null,
   };
+}
+
+
+function isPositiveBigintId(id: unknown): id is string | number | bigint {
+  if (typeof id === "bigint") return id > 0n;
+  if (typeof id === "number") return Number.isInteger(id) && id > 0;
+  if (typeof id === "string") return /^[1-9][0-9]{0,19}$/.test(id);
+  return false;
+}
+
+function assertAccountGroupCompatible(group: AccountGroupRow, provider: AccountProvider): void {
+  if (provider === "claude" && group.kind === "official_oauth" && group.provider === "claude") return;
+  throw new RangeError("unsupported_account_group_for_provider");
+}
+
+async function resolveDefaultClaudeGroupId(): Promise<string | null> {
+  const groups = await listAccountGroups();
+  const g = groups.find((row) => row.kind === "official_oauth" && row.provider === "claude");
+  return g ? g.id.toString() : null;
+}
+
+async function normalizeGroupIdForAccount(
+  provider: AccountProvider,
+  raw: bigint | string | number | null | undefined,
+  opts: { defaultClaudeGroup?: boolean } = {},
+): Promise<string | null | undefined> {
+  if (raw === undefined) {
+    if (provider === "claude" && opts.defaultClaudeGroup === true) return resolveDefaultClaudeGroupId();
+    return undefined;
+  }
+  if (raw === null || raw === "") return null;
+  if (!isPositiveBigintId(raw)) throw new RangeError("invalid_group_id");
+  if (provider !== "claude") throw new RangeError("unsupported_account_group_for_provider");
+  const group = await getAccountGroup(String(raw));
+  if (!group) throw new RangeError("group_not_found");
+  assertAccountGroupCompatible(group, provider);
+  return String(raw);
 }
 
 // ─── 查询 ──────────────────────────────────────────────────────────
@@ -183,6 +226,8 @@ export interface AdminCreateAccountInput {
    * mTLS host > master 默认出口),不阻塞 admin 流程。
    */
   egress_proxy_id: bigint | string;
+  /** Optional V1 account group binding. Claude accounts default to the first official OAuth group. */
+  group_id?: bigint | string | null;
 }
 
 /**
@@ -308,6 +353,8 @@ export async function adminCreateAccount(
   // 存在性预检 — 不存在的 FK 在 store 层会冒成 23503 → 500,提前 SELECT 给 400。
   await ensureEgressProxyExistsOrThrow(egressProxyId);
 
+  const normalizedGroupId = await normalizeGroupIdForAccount(provider, input.group_id, { defaultClaudeGroup: true });
+
   // 0070 — Phase 6 fail_closed 根治:provider='claude' 新建必须同步获取 Anthropic
   // OAuth account UUID,作为 scheduler 候选锚点。否则 NULL 行被静默剔除
   // (2026-05 P1 复现 ×2:账号 14、47)。
@@ -336,6 +383,7 @@ export async function adminCreateAccount(
     subscription_end_at: subscriptionEndAt,
     egress_proxy_id: egressProxyId,
     account_uuid: accountUuid,
+    group_id: normalizedGroupId ?? null,
   };
   let row: AccountRow;
   try {
@@ -394,6 +442,8 @@ export interface AdminPatchAccountInput {
    * raw `egress_proxy` 文本字段已不再支持(由 0055 锁死为 NULL)。
    */
   egress_proxy_id?: bigint | string;
+  /** Optional group binding. undefined = no change; null = unassign. */
+  group_id?: bigint | string | null;
   /**
    * 0038 — 重新分配 egress host。
    *   - undefined = 不动
@@ -519,6 +569,7 @@ export async function adminPatchAccount(
     patch.oauth_token !== undefined ||
     patch.oauth_refresh_token !== undefined ||
     patch.egress_proxy_id !== undefined ||
+    patch.group_id !== undefined ||
     patch.egress_host_uuid !== undefined ||
     expiresAt !== undefined ||
     subscriptionEndAt !== undefined;
@@ -531,6 +582,8 @@ export async function adminPatchAccount(
   const before = await storeGet(id);
   if (!before) throw new AccountNotFoundError(id);
 
+  const normalizedPatchGroupId = await normalizeGroupIdForAccount(before.provider, patch.group_id);
+
   const storePatch: UpdateAccountPatch = {};
   if (patch.label !== undefined) storePatch.label = patch.label.trim();
   if (patch.plan !== undefined) storePatch.plan = patch.plan;
@@ -539,6 +592,7 @@ export async function adminPatchAccount(
   if (patch.oauth_token !== undefined) storePatch.token = patch.oauth_token;
   if (patch.oauth_refresh_token !== undefined) storePatch.refresh = patch.oauth_refresh_token;
   if (normalizedEgressProxyId !== undefined) storePatch.egress_proxy_id = normalizedEgressProxyId;
+  if (normalizedPatchGroupId !== undefined) storePatch.group_id = normalizedPatchGroupId;
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;
   if (subscriptionEndAt !== undefined) storePatch.subscription_end_at = subscriptionEndAt;
 
@@ -618,6 +672,10 @@ export async function adminPatchAccount(
   if (patch.egress_proxy_id !== undefined) {
     changedBefore.egress_proxy_id = before.egress_proxy_id !== null ? before.egress_proxy_id.toString() : null;
     changedAfter.egress_proxy_id = after.egress_proxy_id !== null ? after.egress_proxy_id.toString() : null;
+  }
+  if (patch.group_id !== undefined) {
+    changedBefore.group_id = before.group_id !== null ? before.group_id.toString() : null;
+    changedAfter.group_id = after.group_id !== null ? after.group_id.toString() : null;
   }
   if (patch.egress_host_uuid !== undefined) {
     changedBefore.egress_host_uuid = egressHostBefore ?? null;

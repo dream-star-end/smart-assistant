@@ -143,6 +143,76 @@ describe('buildCodexCliArgs', () => {
     ])
   })
 
+  it('buildCodexProviderConfigArgs lets per-turn route override env defaults', () => {
+    const args = buildCodexProviderConfigArgs(
+      {
+        OC_CODEX_MODEL_PROVIDER: 'env_provider',
+        OC_CODEX_BASE_URL: 'https://env.example/v1',
+        OC_CODEX_PROVIDER_NAME: 'env',
+        OC_CODEX_WIRE_API: 'chat_completions',
+        OC_CODEX_PREFERRED_AUTH_METHOD: 'envauth',
+        OC_CODEX_DISABLE_RESPONSE_STORAGE: '1',
+      },
+      {
+        modelProvider: 'route_provider',
+        baseUrl: 'http://127.0.0.1:18789/internal/v3/codex-relay/route/abcdef',
+        providerName: 'route',
+        wireApi: 'responses',
+        preferredAuthMethod: 'apikey',
+        disableResponseStorage: false,
+      },
+    )
+    assert.deepEqual(args, [
+      '-c',
+      'model_provider="route_provider"',
+      '-c',
+      'model_providers.route_provider.name="route"',
+      '-c',
+      'model_providers.route_provider.base_url="http://127.0.0.1:18789/internal/v3/codex-relay/route/abcdef"',
+      '-c',
+      'model_providers.route_provider.wire_api="responses"',
+      '-c',
+      'preferred_auth_method="apikey"',
+      '-c',
+      'disable_response_storage=false',
+    ])
+  })
+
+  it('buildCodexProviderConfigArgs does not inherit env-only provider fields for route overrides', () => {
+    const args = buildCodexProviderConfigArgs(
+      {
+        OC_CODEX_MODEL_PROVIDER: 'env_provider',
+        OC_CODEX_BASE_URL: 'https://env.example/v1',
+        OC_CODEX_PROVIDER_NAME: 'env_name',
+        OC_CODEX_WIRE_API: 'chat_completions',
+        OC_CODEX_PREFERRED_AUTH_METHOD: 'envauth',
+        OC_CODEX_DISABLE_RESPONSE_STORAGE: '0',
+      },
+      {
+        modelProvider: 'route_provider',
+        baseUrl: 'http://127.0.0.1:18789/internal/v3/codex-relay/route/abcdef',
+        providerName: null,
+        wireApi: null,
+        preferredAuthMethod: null,
+        disableResponseStorage: null,
+      },
+    )
+    assert.deepEqual(args, [
+      '-c',
+      'model_provider="route_provider"',
+      '-c',
+      'model_providers.route_provider.name="route_provider"',
+      '-c',
+      'model_providers.route_provider.base_url="http://127.0.0.1:18789/internal/v3/codex-relay/route/abcdef"',
+      '-c',
+      'model_providers.route_provider.wire_api="responses"',
+      '-c',
+      'preferred_auth_method="apikey"',
+      '-c',
+      'disable_response_storage=true',
+    ])
+  })
+
   it('buildCodexProviderConfigArgs rejects malformed provider ids and honors false storage flag', () => {
     assert.deepEqual(
       buildCodexProviderConfigArgs({

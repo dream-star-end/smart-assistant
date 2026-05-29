@@ -197,6 +197,64 @@ describe('CodexAppServerRunner.start', () => {
   })
 })
 
+describe('CodexAppServerRunner route-specific provider lifecycle', () => {
+  it('restarts only the current app-server proc on route change and preserves queued turns', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const queuedErrors: Error[] = []
+    const queuedTurn = {
+      prompt: 'queued',
+      resolve: () => {},
+      reject: (err: Error) => queuedErrors.push(err),
+      requestId: 'queued-req',
+    }
+    ;(h.runner as any).queue = [queuedTurn]
+    ;(h.runner as any).spawnedProviderSignature = JSON.stringify({
+      modelProvider: 'old_provider',
+      baseUrl: `http://127.0.0.1:18789/internal/v3/codex-relay/route/${'a'.repeat(64)}`,
+    })
+    ;(h.runner as any).setCodexRoute({
+      modelProvider: 'new_provider',
+      baseUrl: `http://127.0.0.1:18789/internal/v3/codex-relay/route/${'b'.repeat(64)}`,
+      wireApi: 'responses',
+      preferredAuthMethod: 'apikey',
+      disableResponseStorage: true,
+    })
+
+    let shutdowns = 0
+    let ensureSpawned = 0
+    ;(h.runner as any).shutdown = async () => {
+      shutdowns += 1
+      assert.equal((h.runner as any).queue.length, 0, 'queued turns are shielded from shutdown rejection')
+      ;(h.runner as any).proc = null
+      ;(h.runner as any).initialized = false
+      ;(h.runner as any).attached = false
+      ;(h.runner as any).spawnedProviderSignature = null
+    }
+    ;(h.runner as any).ensureSpawned = async () => {
+      ensureSpawned += 1
+      ;(h.runner as any).proc = { killed: false }
+      ;(h.runner as any).initialized = true
+      ;(h.runner as any).attached = true
+      ;(h.runner as any).spawnedProviderSignature = (h.runner as any).codexRouteSignature()
+    }
+    ;(h.runner as any).sendRequest = async (method: string) => {
+      if (method !== 'turn/start') throw new Error(`unexpected rpc method ${method}`)
+      setImmediate(() => {
+        ;(h.runner as any).currentTurnCompleter?.resolve({ status: 'completed', durationMs: 1 })
+      })
+      return { turn: { id: 'turn-route-change' } }
+    }
+
+    await (h.runner as any).runTurn('hello', 'route-req')
+
+    assert.equal(shutdowns, 1)
+    assert.equal(ensureSpawned, 1)
+    assert.equal(queuedErrors.length, 0, 'route restart must not reject queued turns')
+    assert.deepEqual((h.runner as any).queue, [queuedTurn])
+    await h.cleanup()
+  })
+})
+
 describe('handleLine — dispatch', () => {
   it('response with matching id → resolves pending request', async () => {
     const h = await makeHarness({ withFakeProc: true })

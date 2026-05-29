@@ -279,6 +279,8 @@ export interface PickInput {
    * 真实 API 调用路径上调用。
    */
   provider?: AccountProvider
+  /** Optional account group filter. When set, only active accounts in this group are eligible. */
+  groupId?: bigint | string | null
   /**
    * Phase 6 H6 不变量执行模式。`true` 时 scheduler 把 `account_uuid IS NULL`
    * 的候选从 WRH 入选集剔除(对应 `PHASE6_ACCOUNT_UUID_ENFORCE === 'fail_closed'`)。
@@ -756,7 +758,7 @@ export class AccountScheduler {
     // forceRepin 仅在 enforce 路径有意义,其它模式静默忽略
     const forceRepin = input.forceRepin === true && pinMode === 'enforce'
 
-    const allActive = await this.selectActiveCandidates(provider)
+    const allActive = await this.selectActiveCandidates(provider, input.groupId ?? null)
     if (allActive.length === 0) {
       throw new AccountPoolUnavailableError('no_active')
     }
@@ -1001,7 +1003,16 @@ export class AccountScheduler {
   }
 
   /** 从 claude_accounts 取 active 候选 — 抽出来便于 pick() / observe 路径共享 */
-  private async selectActiveCandidates(provider: AccountProvider): Promise<CandidateRow[]> {
+  private async selectActiveCandidates(
+    provider: AccountProvider,
+    groupId: bigint | string | null,
+  ): Promise<CandidateRow[]> {
+    const params: unknown[] = [provider]
+    const where = ["status = 'active'", 'provider = $1']
+    if (groupId !== null) {
+      params.push(String(groupId))
+      where.push(`group_id = $${params.length}`)
+    }
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score,
               quota_5h_pct, quota_7d_pct, subscription_end_at,
@@ -1009,9 +1020,9 @@ export class AccountScheduler {
               account_uuid::text AS account_uuid,
               persona
        FROM claude_accounts
-       WHERE status = 'active' AND provider = $1
+       WHERE ${where.join(' AND ')}
        ORDER BY id`,
-      [provider],
+      params,
     )
     return res.rows
   }

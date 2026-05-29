@@ -30,6 +30,7 @@ import {
   BRIDGE_WS_PATH,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
+  type UserChatBridgeDeps,
   type CodexBindingHandle,
 } from "../ws/userChatBridge.js";
 import { PricingCache } from "../billing/pricing.js";
@@ -190,6 +191,8 @@ async function startRig(opts: {
   appendCostCredits?: (
     requestId: string, userId: string, debited: string,
   ) => Promise<void>;
+  createCodexRoute?: UserChatBridgeDeps["createCodexRoute"];
+  expireCodexRoute?: UserChatBridgeDeps["expireCodexRoute"];
 } = {}): Promise<BillingRig> {
   // mock 容器 ws
   const containerSockets: WebSocket[] = [];
@@ -238,6 +241,8 @@ async function startRig(opts: {
     preCheckRedis,
     pricing,
     codexBinding,
+    createCodexRoute: opts.createCodexRoute,
+    expireCodexRoute: opts.expireCodexRoute,
     logger: opts.logger,
     appendCostCredits: opts.appendCostCredits,
   });
@@ -363,6 +368,15 @@ function waitContainerClose(containerWs: WebSocket, timeoutMs: number): Promise<
   });
 }
 
+async function waitUntil(fn: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fn()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(fn(), true);
+}
+
 // ---------- tests -----------------------------------------------------------
 
 describe("userChatBridge / codex billing — happy path", () => {
@@ -443,7 +457,14 @@ describe("userChatBridge / codex billing — duplicate frame", () => {
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message",
+      agentId: "codex",
+      model: "gpt-5.5",
+      content: "x",
+      __oc_codex_route: {
+        baseUrl: `http://127.0.0.1:18789/internal/v3/codex-relay/route/${"a".repeat(64)}`,
+        modelProvider: "api111",
+      },
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
@@ -688,6 +709,167 @@ describe("userChatBridge / codex billing — legacy NULL container per-turn bill
     }
 
     ws.close();
+  });
+});
+
+describe("userChatBridge / codex relay — fallback to legacy binding", () => {
+  let rig: BillingRig;
+  let routeCalls = 0;
+  before(async () => {
+    rig = await startRig({
+      userBalance: 1_000_000n,
+      createCodexRoute: async (args) => {
+        routeCalls += 1;
+        assert.equal(args.modelId, "gpt-5.5");
+        return null;
+      },
+    });
+  });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    routeCalls = 0;
+  });
+
+  test("no enabled relay group falls back to legacy codexBinding instead of failing the turn", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("18");
+    const ws = openClient(rig.gatewayPort, token);
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+    }));
+    const frameToContainer = await waitContainerNextFrame(containerWs);
+    const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+    const serverReqId = parsed.requestId as string;
+
+    assert.equal(routeCalls, 1, "relay resolver should be attempted first");
+    assert.equal(rig.binding.acquireCalls, 1, "legacy binding must be used after relay miss");
+    assert.equal(parsed.__oc_codex_route, undefined, "client-supplied route config must be stripped on fallback");
+
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: serverReqId,
+      status: "success",
+      usage: { input_tokens: 50, output_tokens: 100 },
+    }));
+    await waitJsonFrameOfType(ws, "outbound.cost_charged");
+
+    ws.close();
+  });
+});
+
+describe("userChatBridge / codex relay — route expiry", () => {
+  let rig: BillingRig;
+  const routeToken = "b".repeat(64);
+  const expiredTokens: string[] = [];
+  let delayedRoute:
+    | { token: string; gate: Promise<void>; started: () => void }
+    | null = null;
+  before(async () => {
+    rig = await startRig({
+      userBalance: 1_000_000n,
+      createCodexRoute: async (args) => {
+        assert.equal(args.modelId, "gpt-5.5");
+        if (args.userId === 21n && delayedRoute !== null) {
+          delayedRoute.started();
+          await delayedRoute.gate;
+          return {
+            token: delayedRoute.token,
+            baseUrl: `http://127.0.0.1:18789/internal/v3/codex-relay/route/${delayedRoute.token}`,
+            modelProvider: "api111",
+            providerName: "Yunwu",
+            wireApi: "responses",
+            preferredAuthMethod: "apikey",
+            disableResponseStorage: true,
+            groupId: "9",
+            credentialId: "8",
+          };
+        }
+        return {
+          token: routeToken,
+          baseUrl: `http://127.0.0.1:18789/internal/v3/codex-relay/route/${routeToken}`,
+          modelProvider: "api111",
+          providerName: "Yunwu",
+          wireApi: "responses",
+          preferredAuthMethod: "apikey",
+          disableResponseStorage: true,
+          groupId: "9",
+          credentialId: "8",
+        };
+      },
+      expireCodexRoute: async (token) => { expiredTokens.push(token); },
+    });
+  });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    expiredTokens.length = 0;
+  });
+
+  test("route token is expired after the billed turn settles", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("20");
+    const ws = openClient(rig.gatewayPort, token);
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      agentId: "codex",
+      model: "gpt-5.5",
+      content: "x",
+    }));
+    const frameToContainer = await waitContainerNextFrame(containerWs);
+    const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+    const serverReqId = parsed.requestId as string;
+    const route = parsed.__oc_codex_route as { baseUrl?: string } | undefined;
+    assert.equal(route?.baseUrl?.includes(routeToken), true);
+    assert.equal(rig.binding.acquireCalls, 0, "API relay route should not acquire legacy codex account");
+
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: serverReqId,
+      status: "success",
+      usage: { input_tokens: 50, output_tokens: 100 },
+    }));
+    await waitJsonFrameOfType(ws, "outbound.cost_charged");
+    await waitUntil(() => expiredTokens.includes(routeToken));
+
+    ws.close();
+  });
+
+  test("route token is expired if the bridge closes while route creation is in flight", async () => {
+    const delayedToken = "c".repeat(64);
+    let resolveRoute!: () => void;
+    const routeGate = new Promise<void>((resolve) => { resolveRoute = resolve; });
+    let routeStarted!: () => void;
+    const routeStartedP = new Promise<void>((resolve) => { routeStarted = resolve; });
+    delayedRoute = { token: delayedToken, gate: routeGate, started: routeStarted };
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const token = await makeJwt("21");
+      const ws = openClient(rig.gatewayPort, token);
+      await waitOpen(ws);
+      await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        agentId: "codex",
+        model: "gpt-5.5",
+        content: "x",
+      }));
+      await routeStartedP;
+      const closedP = new Promise<void>((resolve) => ws.once("close", () => resolve()));
+      ws.close();
+      await closedP;
+      resolveRoute();
+      await waitUntil(() => expiredTokens.includes(delayedToken));
+    } finally {
+      delayedRoute = null;
+    }
   });
 });
 
