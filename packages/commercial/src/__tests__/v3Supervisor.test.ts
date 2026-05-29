@@ -595,6 +595,7 @@ describe("provisionV3Container", () => {
 
   test("Codex relay env: passes non-secret knobs but rewrites upstream URL to container loopback relay", async () => {
     const keys = [
+      "OC_V3_CODEX_LOCAL_RELAY_ENABLED",
       "OC_CODEX_MODEL_PROVIDER",
       "OC_CODEX_PROVIDER_NAME",
       "OC_CODEX_BASE_URL",
@@ -607,6 +608,7 @@ describe("provisionV3Container", () => {
     const saved = new Map<string, string | undefined>();
     for (const key of keys) saved.set(key, process.env[key]);
     try {
+      process.env.OC_V3_CODEX_LOCAL_RELAY_ENABLED = "1";
       process.env.OC_CODEX_MODEL_PROVIDER = "api111";
       process.env.OC_CODEX_PROVIDER_NAME = "Yunwu";
       process.env.OC_CODEX_BASE_URL = "https://yunwu.ai/v1";
