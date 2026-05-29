@@ -239,7 +239,16 @@ function readCodexContainerDirFromEnv(): string {
   return raw.trim();
 }
 
-const CODEX_RELAY_CONTAINER_ENV_KEYS = [
+const LEGACY_CODEX_CONTAINER_ENV_KEYS = [
+  "OC_CODEX_MODEL_PROVIDER",
+  "OC_CODEX_PROVIDER_NAME",
+  "OC_CODEX_BASE_URL",
+  "OC_CODEX_WIRE_API",
+  "OC_CODEX_PREFERRED_AUTH_METHOD",
+  "OC_CODEX_DISABLE_RESPONSE_STORAGE",
+] as const;
+
+const LOCAL_RELAY_CODEX_CONTAINER_ENV_KEYS = [
   "OC_CODEX_MODEL_PROVIDER",
   "OC_CODEX_PROVIDER_NAME",
   "OC_CODEX_WIRE_API",
@@ -250,24 +259,51 @@ const CODEX_RELAY_CONTAINER_ENV_KEYS = [
 /** Loopback base for the container-local gateway relay. */
 export const V3_CODEX_LOCAL_RELAY_ORIGIN = `http://127.0.0.1:${V3_CONTAINER_PORT}`;
 
+export function isCodexLocalRelayEnabled(
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = sourceEnv.OC_V3_CODEX_LOCAL_RELAY_ENABLED?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
 /**
  * Build non-secret Codex relay env for user containers.
  *
+ * The new local relay needs runtime-image support from packages/gateway. Keep
+ * it behind an explicit rollout gate so master can be deployed first, then a
+ * new image can be built/distributed/flipped without handing old images a
+ * loopback URL they do not understand.
+ *
  * Important: the external upstream base URL (OC_CODEX_BASE_URL /
- * OC_CODEX_UPSTREAM_BASE_URL on master) is **not** passed through.  Containers
- * receive a loopback URL handled by their own gateway, which then authenticates
- * to master with OPENCLAUDE_V3_CONTAINER_TOKEN.  This prevents managed Codex
- * traffic from drifting to direct container egress or leaking proxy credentials.
+ * OC_CODEX_UPSTREAM_BASE_URL on master) is **not** passed through when the
+ * local relay gate is enabled. Containers receive a loopback URL handled by
+ * their own gateway, which then authenticates to master with
+ * OPENCLAUDE_V3_CONTAINER_TOKEN. This prevents managed Codex traffic from
+ * drifting to direct container egress or leaking proxy credentials.
  */
 export function buildCodexRelayContainerEnv(
   sourceEnv: NodeJS.ProcessEnv = process.env,
 ): string[] {
   const out: string[] = [];
+
+  if (!isCodexLocalRelayEnabled(sourceEnv)) {
+    if (!sourceEnv.OC_CODEX_MODEL_PROVIDER?.trim()) return out;
+    for (const key of LEGACY_CODEX_CONTAINER_ENV_KEYS) {
+      const value = sourceEnv[key]?.trim();
+      if (value) out.push(`${key}=${value}`);
+    }
+    if (!sourceEnv.OC_CODEX_BASE_URL?.trim()) {
+      const dedicatedUpstream = sourceEnv.OC_CODEX_UPSTREAM_BASE_URL?.trim();
+      if (dedicatedUpstream) out.push(`OC_CODEX_BASE_URL=${dedicatedUpstream}`);
+    }
+    return out;
+  }
+
   const provider = sourceEnv.OC_CODEX_MODEL_PROVIDER?.trim();
   if (!provider) return out;
 
   out.push(`OC_CODEX_MODEL_PROVIDER=${provider}`);
-  for (const key of CODEX_RELAY_CONTAINER_ENV_KEYS) {
+  for (const key of LOCAL_RELAY_CODEX_CONTAINER_ENV_KEYS) {
     if (key === "OC_CODEX_MODEL_PROVIDER") continue;
     const value = sourceEnv[key]?.trim();
     if (value) out.push(`${key}=${value}`);
