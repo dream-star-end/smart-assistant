@@ -53,6 +53,7 @@ import {
   V3_USER_CONFIG_MOUNT,
   SupervisorError,
 } from "../agent-sandbox/index.js";
+import { buildCodexRelayLocalBaseUrl } from "../http/internalCodexRelay.js";
 
 // ───────────────────────────────────────────────────────────────────────
 //  fake docker
@@ -592,11 +593,12 @@ describe("provisionV3Container", () => {
     assert.equal(captured.started, 1);
   });
 
-  test("Codex relay env: passes non-secret routing config but never OC_CODEX_API_KEY", async () => {
+  test("Codex relay env: passes non-secret knobs but rewrites upstream URL to container loopback relay", async () => {
     const keys = [
       "OC_CODEX_MODEL_PROVIDER",
       "OC_CODEX_PROVIDER_NAME",
       "OC_CODEX_BASE_URL",
+      "OC_CODEX_UPSTREAM_BASE_URL",
       "OC_CODEX_WIRE_API",
       "OC_CODEX_PREFERRED_AUTH_METHOD",
       "OC_CODEX_DISABLE_RESPONSE_STORAGE",
@@ -629,10 +631,18 @@ describe("provisionV3Container", () => {
       const env = captured.containersCreated[0]?.Env ?? [];
       assert.ok(env.includes("OC_CODEX_MODEL_PROVIDER=api111"));
       assert.ok(env.includes("OC_CODEX_PROVIDER_NAME=Yunwu"));
-      assert.ok(env.includes("OC_CODEX_BASE_URL=https://yunwu.ai/v1"));
+      assert.ok(env.includes(`OC_CODEX_BASE_URL=${buildCodexRelayLocalBaseUrl(`http://127.0.0.1:${V3_CONTAINER_PORT}`, "https://yunwu.ai/v1")}`));
       assert.ok(env.includes("OC_CODEX_WIRE_API=responses"));
       assert.ok(env.includes("OC_CODEX_PREFERRED_AUTH_METHOD=apikey"));
       assert.ok(env.includes("OC_CODEX_DISABLE_RESPONSE_STORAGE=1"));
+      assert.ok(
+        !env.includes("OC_CODEX_BASE_URL=https://yunwu.ai/v1"),
+        "external upstream base URL must not be passed directly into managed containers",
+      );
+      assert.ok(
+        !env.some((entry) => entry.startsWith("OC_CODEX_UPSTREAM_BASE_URL=")),
+        "upstream base URL is master-only and must not be passed into managed containers",
+      );
       assert.ok(
         !env.some((entry) => entry.startsWith("OC_CODEX_API_KEY=")),
         "OC_CODEX_API_KEY must stay in auth.json and out of docker env",

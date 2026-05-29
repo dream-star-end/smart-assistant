@@ -64,6 +64,7 @@ import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
+import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
 import { zeroBuffer } from "../crypto/keys.js";
 import {
   removeCodexContainerAuthDir,
@@ -241,24 +242,44 @@ function readCodexContainerDirFromEnv(): string {
 const CODEX_RELAY_CONTAINER_ENV_KEYS = [
   "OC_CODEX_MODEL_PROVIDER",
   "OC_CODEX_PROVIDER_NAME",
-  "OC_CODEX_BASE_URL",
   "OC_CODEX_WIRE_API",
   "OC_CODEX_PREFERRED_AUTH_METHOD",
   "OC_CODEX_DISABLE_RESPONSE_STORAGE",
 ] as const;
 
+/** Loopback base for the container-local gateway relay. */
+export const V3_CODEX_LOCAL_RELAY_ORIGIN = `http://127.0.0.1:${V3_CONTAINER_PORT}`;
+
 /**
- * Pass only non-secret Codex relay routing knobs into user containers.
+ * Build non-secret Codex relay env for user containers.
  *
- * OC_CODEX_API_KEY intentionally is NOT whitelisted: Codex reads the key from
- * the existing ro auth.json mount, so the secret does not appear in docker
- * inspect / process env.
+ * Important: the external upstream base URL (OC_CODEX_BASE_URL /
+ * OC_CODEX_UPSTREAM_BASE_URL on master) is **not** passed through.  Containers
+ * receive a loopback URL handled by their own gateway, which then authenticates
+ * to master with OPENCLAUDE_V3_CONTAINER_TOKEN.  This prevents managed Codex
+ * traffic from drifting to direct container egress or leaking proxy credentials.
  */
-function appendCodexRelayEnv(env: string[]): void {
+export function buildCodexRelayContainerEnv(
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const out: string[] = [];
+  const provider = sourceEnv.OC_CODEX_MODEL_PROVIDER?.trim();
+  if (!provider) return out;
+
+  out.push(`OC_CODEX_MODEL_PROVIDER=${provider}`);
   for (const key of CODEX_RELAY_CONTAINER_ENV_KEYS) {
-    const value = process.env[key]?.trim();
-    if (value) env.push(`${key}=${value}`);
+    if (key === "OC_CODEX_MODEL_PROVIDER") continue;
+    const value = sourceEnv[key]?.trim();
+    if (value) out.push(`${key}=${value}`);
   }
+
+  const upstreamBaseUrl = readCodexUpstreamBaseUrl(sourceEnv);
+  out.push(`OC_CODEX_BASE_URL=${buildCodexRelayLocalBaseUrl(V3_CODEX_LOCAL_RELAY_ORIGIN, upstreamBaseUrl)}`);
+  return out;
+}
+
+function appendCodexRelayEnv(env: string[]): void {
+  env.push(...buildCodexRelayContainerEnv(process.env));
 }
 
 /**

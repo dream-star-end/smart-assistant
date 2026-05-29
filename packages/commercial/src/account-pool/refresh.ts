@@ -38,6 +38,7 @@ import { loadKmsKey } from '../crypto/keys.js'
 import type { AccountHealthTracker } from './health.js'
 import { recordRefreshEvent } from './refreshEvents.js'
 import { type AccountPlan, getCodexTokenSnapshot, getTokenForUse, updateAccount } from './store.js'
+import { CodexEgressError, resolveCodexAccountEgressDispatcher } from './codexEgress.js'
 
 /**
  * Fire-and-forget refresh-event 落库。失败仅 console.warn,不打断主流程。
@@ -583,6 +584,21 @@ async function refreshCodexAccountTokenInner(
   const refreshStr = snap.refresh.toString('utf8')
   snap.refresh.fill(0)
 
+  let dispatcher = deps.dispatcher
+  if (dispatcher === undefined) {
+    try {
+      dispatcher = (await resolveCodexAccountEgressDispatcher(accountId)).dispatcher
+    } catch (err) {
+      // Egress configuration/proxy failures are operational/transient from the
+      // account-token perspective. Do not disable the account and, critically,
+      // do not fall back to process-global HTTP_PROXY or direct host egress.
+      safeRecordRefreshEvent(accountId, false, 'network_transient', 'egress dispatcher unavailable')
+      throw new RefreshError('network_transient', 'codex refresh egress unavailable', {
+        cause: err instanceof CodexEgressError ? err : err,
+      })
+    }
+  }
+
   let result: { status: number; body: string }
   try {
     result = await http.post(
@@ -596,7 +612,7 @@ async function refreshCodexAccountTokenInner(
         client_id: clientId,
         refresh_token: refreshStr,
       }),
-      deps.dispatcher,
+      dispatcher,
     )
   } catch (err) {
     safeRecordRefreshEvent(accountId, false, 'network_transient', 'refresh network call failed')

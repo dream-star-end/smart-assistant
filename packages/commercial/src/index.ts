@@ -117,6 +117,12 @@ import {
   type CodexTokenRefreshHandler,
 } from "./http/internalCodexTokenRefresh.js";
 import {
+  CODEX_RELAY_PREFIX,
+  makeCodexRelayHandler,
+  makeDefaultCodexRelayDb,
+  type CodexRelayHandler,
+} from "./http/internalCodexRelay.js";
+import {
   appendCostCredits,
   appendServerAuthoredMessage,
   appendServerAuthoredMessageForRequest,
@@ -1085,6 +1091,10 @@ export async function registerCommercial(
           identityRepo,
           pricingCache: pricing,
         });
+      const codexRelayHandler: CodexRelayHandler = makeCodexRelayHandler({
+        identityRepo,
+        db: makeDefaultCodexRelayDb(),
+      });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (path === SERVER_AUTHORED_PATH) {
@@ -1098,6 +1108,9 @@ export async function registerCommercial(
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
           return codexTokenRefreshHandler(req, res, ctx);
+        }
+        if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
+          return codexRelayHandler(req, res, ctx);
         }
         if (path === WECHAT_OUTBOUND_PATH) {
           // P1.7 slice 7c — wechat broker outbound 接收点
