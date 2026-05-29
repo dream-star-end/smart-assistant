@@ -1473,6 +1473,8 @@ export class AccountScheduler {
 export interface PickCodexBindingDeps {
   /** 注入测试 hash;默认 SHA-256 64-bit */
   hash?: (s: string) => bigint
+  /** Optional official_oauth+codex group filter. */
+  groupId?: bigint | string | null
 }
 
 /**
@@ -1507,11 +1509,19 @@ export async function pickCodexAccountForBindingInTx(
   }
   const hash = deps.hash ?? defaultHash
 
+  const params: unknown[] = []
+  const where = ["status = 'active'", "provider = 'codex'"]
+  if (deps.groupId !== undefined && deps.groupId !== null) {
+    params.push(String(deps.groupId))
+    where.push(`group_id = $${params.length}`)
+  }
+
   const res = await client.query<{ id: string; plan: AccountPlan; health_score: number }>(
     `SELECT id::text AS id, plan, health_score
      FROM claude_accounts
-     WHERE status = 'active' AND provider = 'codex'
+     WHERE ${where.join(' AND ')}
      ORDER BY id`,
+    params,
   )
   if (res.rows.length === 0) return null
 
