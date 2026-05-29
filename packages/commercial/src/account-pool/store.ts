@@ -56,6 +56,7 @@ export interface AccountRow {
   id: bigint;
   /** V3 provider:claude / codex(0051 migration 加,默认 'claude')。 */
   provider: AccountProvider;
+  group_id: bigint | null;
   label: string;
   plan: AccountPlan;
   status: AccountStatus;
@@ -194,6 +195,8 @@ export interface CreateAccountInput {
    * 类型拒绝(`invalid input syntax for type uuid`)— store 不二次校验。
    */
   account_uuid?: string | null;
+  /** Optional group binding. Admin layer validates provider/kind compatibility. */
+  group_id?: bigint | string | null;
 }
 
 /**
@@ -235,6 +238,8 @@ export interface UpdateAccountPatch {
    * entry 存在性校验在 admin layer。
    */
   egress_proxy_id?: bigint | string;
+  /** Optional group binding. undefined = no change; null = unassign. */
+  group_id?: bigint | string | null;
 }
 
 export class AccountNotFoundError extends Error {
@@ -251,6 +256,7 @@ export { AeadError } from "../crypto/aead.js";
 const META_COLUMNS = `
   id::text AS id,
   provider,
+  group_id::text AS group_id,
   label,
   plan,
   status,
@@ -279,6 +285,7 @@ const META_COLUMNS = `
 interface RawMetaRow extends QueryResultRow {
   id: string;
   provider: AccountProvider;
+  group_id: string | null;
   label: string;
   plan: AccountPlan;
   status: AccountStatus;
@@ -339,6 +346,7 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
   return {
     id: BigInt(row.id),
     provider: row.provider,
+    group_id: row.group_id !== null ? BigInt(row.group_id) : null,
     label: row.label,
     plan: row.plan,
     status: row.status,
@@ -421,7 +429,7 @@ export async function createAccount(
 
     const res = await query<RawMetaRow>(
       `INSERT INTO claude_accounts(
-         provider, label, plan,
+         provider, group_id, label, plan,
          oauth_token_enc, oauth_nonce,
          oauth_refresh_enc, oauth_refresh_nonce,
          oauth_expires_at,
@@ -430,10 +438,11 @@ export async function createAccount(
          account_uuid,
          persona
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11, $12::jsonb)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
+        input.group_id === undefined || input.group_id === null ? null : String(input.group_id),
         input.label,
         input.plan,
         tok.ciphertext,
@@ -704,6 +713,10 @@ export async function updateAccount(
     // 0064:undefined = 不动;Date / null 直传 — null 显式清空。
     push("subscription_end_at", patch.subscription_end_at);
   }
+  if (patch.group_id !== undefined) {
+    push("group_id", patch.group_id === null ? null : String(patch.group_id));
+  }
+
   if (patch.egress_proxy_id !== undefined) {
     // 0055:NULL 不再接受(CHECK constraint 与生命周期强约束)。类型已锁住,
     // 这里 runtime 兜底防 JS 调用方绕过 TS。

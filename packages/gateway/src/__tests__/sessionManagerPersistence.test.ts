@@ -22,7 +22,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { SessionManager } from "../sessionManager.js";
+import { SessionManager, type AgentSession } from "../sessionManager.js";
 import type { OpenClaudeConfig } from "@openclaude/storage";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────
@@ -174,5 +174,89 @@ describe("SessionManager pending-persistence tracking", () => {
     b.resolve();
     await second;
     assert.equal(bResolved, true);
+  });
+});
+
+describe("SessionManager Codex route turn scoping", () => {
+  test("codexRoute is applied under the per-session submit lock", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    let currentRoute: string | null = null;
+    const appliedRoutes: Array<string | null> = [];
+    const seenByTurns: Array<string | null> = [];
+    const runner = {
+      model: "gpt-5.5" as string | undefined,
+      effortLevel: undefined as string | undefined,
+      lastActivityAt: Date.now(),
+      setConversationMode(_mode: "default" | "plan") {},
+      setCodexRoute(route: { modelProvider?: string } | null) {
+        currentRoute = route?.modelProvider ?? null;
+        appliedRoutes.push(currentRoute);
+      },
+      setModel(model: string | undefined) { this.model = model; },
+      setEffortLevel(level: string | undefined) { this.effortLevel = level; },
+      setTraceId(_traceId: string) {},
+      async shutdown() {},
+      interrupt() {},
+    };
+    const session = {
+      sessionKey: "agent:codex:webchat:peer",
+      agentId: "codex",
+      channel: "webchat",
+      peerId: "peer",
+      title: "Codex",
+      startedAt: Date.now(),
+      runner,
+      ccbSessionId: null,
+      lock: Promise.resolve(),
+      lastUsedAt: 0,
+      totalCostUSD: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreationTokens: 0,
+      turns: 1,
+      _lastCcbCumulativeCost: 0,
+      toolUseIdToName: new Map(),
+      executionTarget: { kind: "local" },
+      providerTag: "codex-native",
+      agentProvider: "codex-native",
+    } as unknown as AgentSession;
+
+    (sm as unknown as {
+      runOneTurnWithRetry: (...args: unknown[]) => Promise<void>;
+    }).runOneTurnWithRetry = async () => {
+      seenByTurns.push(currentRoute);
+      if (seenByTurns.length === 1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      }
+    };
+
+    const p1 = sm.submit(
+      session,
+      "one",
+      () => {},
+      undefined,
+      "gpt-5.5",
+      undefined,
+      undefined,
+      undefined,
+      { codexRoute: { modelProvider: "route_a", baseUrl: "http://127.0.0.1/a" } },
+    );
+    const p2 = sm.submit(
+      session,
+      "two",
+      () => {},
+      undefined,
+      "gpt-5.5",
+      undefined,
+      undefined,
+      undefined,
+      { codexRoute: { modelProvider: "route_b", baseUrl: "http://127.0.0.1/b" } },
+    );
+
+    await Promise.all([p1, p2]);
+
+    assert.deepEqual(seenByTurns, ["route_a", "route_b"]);
+    assert.deepEqual(appliedRoutes, ["route_a", "route_b"]);
   });
 });

@@ -85,6 +85,7 @@ import {
 } from "./account-pool/cooldownRecoveryActor.js";
 import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
+  V3_CONTAINER_PORT,
   stopAndRemoveV3Container,
 } from "./agent-sandbox/v3supervisor.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
@@ -116,6 +117,11 @@ import {
   makeCodexTokenRefreshHandler,
   type CodexTokenRefreshHandler,
 } from "./http/internalCodexTokenRefresh.js";
+import {
+  createCodexRouteContextForModel,
+  expireCodexRouteContext,
+  listEnabledGroupsForModel,
+} from "./account-pool/groups.js";
 import {
   CODEX_RELAY_PREFIX,
   makeCodexRelayHandler,
@@ -165,6 +171,7 @@ import {
   type UserChatBridgeHandler,
   type BridgeMetricSink,
   type CodexBindingHandle,
+  type CodexApiRelayRoute,
 } from "./ws/userChatBridge.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
@@ -939,6 +946,7 @@ export async function registerCommercial(
         // scheduler.pick 与 hook 同值消费,保留 plan §5.5.4 竞态防护设计。
         getPhase6AccountUuidEnforce,
         getSessionPinMode,
+        listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
       });
       // 2026-05-05 v3 commercial server-authored persistence — 复用 18791/18443
       // 同一个 listener,新加 POST /internal/v3/server-authored-message。
@@ -1240,6 +1248,7 @@ export async function registerCommercial(
         // 同一个 30s TTL cache(`admin/runtimeFlags.ts`)。
         getPhase6AccountUuidEnforce,
         getSessionPinMode,
+        listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
       });
       // eslint-disable-next-line no-console
       console.log(
@@ -2249,6 +2258,24 @@ export async function registerCommercial(
     // plan v3 G5/G7 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
     // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
     codexBinding,
+    createCodexRoute: async ({ containerId, userId, modelId }): Promise<CodexApiRelayRoute | null> => {
+      const route = await createCodexRouteContextForModel({ containerId, userId, modelId });
+      if (!route) return null;
+      return {
+        token: route.token,
+        baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
+        modelProvider: route.credential.model_provider,
+        providerName: route.credential.provider_name,
+        wireApi: route.credential.wire_api,
+        preferredAuthMethod: route.credential.preferred_auth_method,
+        disableResponseStorage: route.credential.disable_response_storage,
+        groupId: route.group.id.toString(),
+        credentialId: route.credential.id.toString(),
+      };
+    },
+    expireCodexRoute: async (token) => {
+      await expireCodexRouteContext(token);
+    },
     // PR2 v1.0.66 — codex 真扣费三件套:bridge 内部走 preCheckWithCost / startInflightJournal
     //   / settleUsageAndLedger 一条龙。pgPool / preCheckRedis / pricing 都是进程级 singleton,
     //   注入即用。createUserChatBridge entry 已强校验"三件套全有或全无",partial 注入会 throw,

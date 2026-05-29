@@ -6399,6 +6399,58 @@ export class Gateway {
         ? _frameRequestId
         : undefined
 
+    const _rawCodexRoute = (frame as any).__oc_codex_route
+    let safeCodexRoute:
+      | {
+          modelProvider?: string
+          baseUrl?: string
+          providerName?: string | null
+          wireApi?: string | null
+          preferredAuthMethod?: string | null
+          disableResponseStorage?: boolean | null
+        }
+      | null = null
+    if (
+      agent.provider === 'codex-native' &&
+      safeModelForRouting?.startsWith('gpt-') &&
+      _rawCodexRoute &&
+      typeof _rawCodexRoute === 'object' &&
+      !Array.isArray(_rawCodexRoute)
+    ) {
+      const r = _rawCodexRoute as Record<string, unknown>
+      let routeBaseUrlOk = false
+      if (typeof r.baseUrl === 'string') {
+        try {
+          const parsedRouteBase = new URL(r.baseUrl)
+          routeBaseUrlOk =
+            parsedRouteBase.protocol === 'http:' &&
+            parsedRouteBase.hostname === '127.0.0.1' &&
+            parsedRouteBase.pathname.startsWith('/internal/v3/codex-relay/route/')
+        } catch {
+          routeBaseUrlOk = false
+        }
+      }
+      if (
+        typeof r.baseUrl === 'string' &&
+        routeBaseUrlOk &&
+        typeof r.modelProvider === 'string' &&
+        /^[A-Za-z0-9_-]+$/.test(r.modelProvider)
+      ) {
+        safeCodexRoute = {
+          baseUrl: r.baseUrl,
+          modelProvider: r.modelProvider,
+          providerName: typeof r.providerName === 'string' ? r.providerName : null,
+          wireApi: r.wireApi === 'responses' || r.wireApi === 'chat' ? r.wireApi : null,
+          preferredAuthMethod:
+            r.preferredAuthMethod === 'apikey' || r.preferredAuthMethod === 'chatgpt'
+              ? r.preferredAuthMethod
+              : null,
+          disableResponseStorage:
+            typeof r.disableResponseStorage === 'boolean' ? r.disableResponseStorage : null,
+        }
+      }
+    }
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
@@ -7038,6 +7090,7 @@ export class Gateway {
       }
     }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, effectiveConversationMode, {
       historicalMessages: masterHistoricalMessages,
+      codexRoute: safeCodexRoute,
     })
   }
 

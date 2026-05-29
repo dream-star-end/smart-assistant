@@ -325,6 +325,7 @@ const TABS = {
   dashboard: renderDashboardTab,
   users: renderUsersTab,
   accounts: renderAccountsTab,
+  accountGroups: renderAccountGroupsTab,
   egressProxies: renderEgressProxiesTab,
   containers: renderContainersTab,
   hosts: renderHostsTab,
@@ -2079,6 +2080,184 @@ function _extractToolUseNames(m) {
   return out
 }
 
+
+// ─── Tab: Account Groups / Codex API Relay ────────────────────────
+const ACCOUNT_GROUP_KIND_LABEL = {
+  official_oauth: '官方 OAuth 订阅',
+  api_relay: 'API 中转站',
+}
+
+async function renderAccountGroupsTab() {
+  view().innerHTML = `
+    <div class="panel">
+      <h1 style="margin-top:0">账号分组 / 中转站路由</h1>
+      <div class="toolbar">
+        <button class="btn" id="grp-refresh">刷新</button>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="grp-new">+ 新建分组</button>
+      </div>
+      <div class="table-scroll"><div id="grp-table"><div class="empty">加载中…</div></div></div>
+    </div>`
+  $('grp-refresh').addEventListener('click', renderAccountGroupsTab)
+  $('grp-new').addEventListener('click', openCreateAccountGroupModal)
+  try {
+    const data = await apiGet('/api/admin/account-groups')
+    _renderAccountGroupsTable(data.rows || [])
+  } catch (err) {
+    $('grp-table').innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
+  }
+}
+
+function _renderAccountGroupsTable(rows) {
+  const el = $('grp-table')
+  if (!rows.length) { el.innerHTML = '<div class="empty">暂无分组</div>'; return }
+  el.innerHTML = `
+    <table class="data">
+      <thead><tr>
+        <th>id</th><th>名称</th><th>类型</th><th>provider</th><th>启用</th><th class="num">优先级</th><th>模型</th><th class="actions">操作</th>
+      </tr></thead>
+      <tbody>${rows.map((g) => `
+        <tr>
+          <td class="mono">${escapeHtml(g.id)}</td>
+          <td>${escapeHtml(g.label)}</td>
+          <td>${escapeHtml(ACCOUNT_GROUP_KIND_LABEL[g.kind] || g.kind)}</td>
+          <td class="mono">${escapeHtml(g.provider)}</td>
+          <td>${g.enabled ? '<span class="badge ok">enabled</span>' : '<span class="badge muted">disabled</span>'}</td>
+          <td class="num mono">${escapeHtml(String(g.priority))}</td>
+          <td class="mono" title="${escapeHtml((g.models || []).join(', '))}">${escapeHtml((g.models || []).slice(0, 4).join(', ') || '—')}${(g.models || []).length > 4 ? ` +${(g.models || []).length - 4}` : ''}</td>
+          <td class="actions">
+            <button data-act="grp-toggle" data-id="${escapeHtml(g.id)}" data-enabled="${g.enabled ? '1' : '0'}">${g.enabled ? '停用' : '启用'}</button>
+            <button data-act="grp-priority" data-id="${escapeHtml(g.id)}" data-priority="${escapeHtml(String(g.priority))}">优先级</button>
+            <button data-act="grp-models" data-id="${escapeHtml(g.id)}" data-models="${escapeHtml((g.models || []).join(','))}">模型</button>
+            ${g.kind === 'api_relay' && g.provider === 'codex' ? `<button data-act="grp-creds" data-id="${escapeHtml(g.id)}" data-label="${escapeHtml(g.label)}">凭据</button>` : ''}
+            <button data-act="grp-delete" data-id="${escapeHtml(g.id)}" data-label="${escapeHtml(g.label)}">删除</button>
+          </td>
+        </tr>`).join('')}</tbody>
+    </table>`
+  for (const b of el.querySelectorAll('button[data-act="grp-toggle"]')) {
+    b.addEventListener('click', async () => {
+      try { await apiJson('PATCH', `/api/admin/account-groups/${encodeURIComponent(b.dataset.id)}`, { enabled: b.dataset.enabled !== '1' }); toast('已更新'); renderAccountGroupsTab() }
+      catch (e) { toast(`更新失败:${e.message}`, 'danger', toastOptsFromError(e)) }
+    })
+  }
+  for (const b of el.querySelectorAll('button[data-act="grp-priority"]')) {
+    b.addEventListener('click', async () => {
+      const v = prompt('优先级(数字越小越优先)', b.dataset.priority || '100')
+      if (v == null) return
+      const n = Number(v)
+      if (!Number.isInteger(n)) { toast('优先级必须是整数', 'danger'); return }
+      try { await apiJson('PATCH', `/api/admin/account-groups/${encodeURIComponent(b.dataset.id)}`, { priority: n }); toast('已更新'); renderAccountGroupsTab() }
+      catch (e) { toast(`更新失败:${e.message}`, 'danger', toastOptsFromError(e)) }
+    })
+  }
+  for (const b of el.querySelectorAll('button[data-act="grp-models"]')) {
+    b.addEventListener('click', async () => {
+      const v = prompt('精确模型 id,多个用逗号分隔', b.dataset.models || '')
+      if (v == null) return
+      const models = v.split(',').map((s) => s.trim()).filter(Boolean)
+      try { await apiJson('PUT', `/api/admin/account-groups/${encodeURIComponent(b.dataset.id)}/models`, { models }); toast('模型已更新'); renderAccountGroupsTab() }
+      catch (e) { toast(`更新失败:${e.message}`, 'danger', toastOptsFromError(e)) }
+    })
+  }
+  for (const b of el.querySelectorAll('button[data-act="grp-creds"]')) {
+    b.addEventListener('click', () => openRelayCredentialsModal(b.dataset.id, b.dataset.label))
+  }
+  for (const b of el.querySelectorAll('button[data-act="grp-delete"]')) {
+    b.addEventListener('click', async () => {
+      if (!confirm(`删除分组 #${b.dataset.id} (${b.dataset.label})?\n关联模型/中转站凭据会一起删除;Claude 账号会解绑。`)) return
+      try { await apiJson('DELETE', `/api/admin/account-groups/${encodeURIComponent(b.dataset.id)}`); toast('已删除'); renderAccountGroupsTab() }
+      catch (e) { toast(`删除失败:${e.message}`, 'danger', toastOptsFromError(e)) }
+    })
+  }
+}
+
+function openCreateAccountGroupModal() {
+  openModal(`
+    <h3>新建账号分组</h3>
+    <div class="form-row"><label>名称</label><input id="grp-label" value="" placeholder="如 Yunwu GPT 中转站" /></div>
+    <div class="form-row"><label>类型</label><select id="grp-kind"><option value="api_relay">API 中转站</option><option value="official_oauth">官方 OAuth 订阅</option></select></div>
+    <div class="form-row"><label>provider</label><select id="grp-provider"><option value="codex">codex</option><option value="claude">claude</option></select><small style="color:var(--muted)">V1 仅支持 api_relay+codex 与 official_oauth+claude。</small></div>
+    <div class="form-row"><label>启用</label><select id="grp-enabled"><option value="true">启用</option><option value="false">停用</option></select></div>
+    <div class="form-row"><label>优先级</label><input id="grp-priority" type="number" value="100" /></div>
+    <div class="form-row"><label>模型 id(逗号分隔)</label><input id="grp-models-input" value="gpt-5.5" /></div>
+    <div class="form-actions"><button class="btn" id="grp-cancel">取消</button><button class="btn btn-primary" id="grp-save">创建</button></div>`)
+  $('grp-cancel').addEventListener('click', closeModal)
+  $('grp-save').addEventListener('click', async () => {
+    const body = {
+      label: $('grp-label').value.trim(),
+      kind: $('grp-kind').value,
+      provider: $('grp-provider').value,
+      enabled: $('grp-enabled').value === 'true',
+      priority: Number($('grp-priority').value || '100'),
+      models: $('grp-models-input').value.split(',').map((s) => s.trim()).filter(Boolean),
+    }
+    try { await apiJson('POST', '/api/admin/account-groups', body); closeModal(); toast('已创建'); renderAccountGroupsTab() }
+    catch (e) { toast(`创建失败:${e.message}`, 'danger', toastOptsFromError(e)) }
+  })
+}
+
+async function openRelayCredentialsModal(groupId, groupLabel) {
+  openModal(`<h3>中转站凭据 — #${escapeHtml(groupId)} ${escapeHtml(groupLabel || '')}</h3><div id="relay-creds-body"><div class="empty">加载中…</div></div>`)
+  const render = async () => {
+    const box = $('relay-creds-body')
+    try {
+      const data = await apiGet(`/api/admin/account-groups/${encodeURIComponent(groupId)}/relay-credentials`)
+      const rows = data.rows || []
+      box.innerHTML = `
+        <div class="toolbar"><button class="btn btn-primary" id="relay-cred-new">+ 添加 API key</button></div>
+        ${rows.length ? `<table class="data"><thead><tr><th>id</th><th>label</th><th>base_url</th><th>provider</th><th>状态</th><th class="num">health</th><th>最近错误</th><th class="actions">操作</th></tr></thead><tbody>${rows.map((c) => `
+          <tr><td class="mono">${escapeHtml(c.id)}</td><td>${escapeHtml(c.label)}</td><td class="mono">${escapeHtml(c.base_url)}</td><td class="mono">${escapeHtml(c.model_provider)}</td><td>${statusBadge(c.status)}</td><td class="num">${escapeHtml(String(c.health_score))}</td><td>${escapeHtml(c.last_error || '—')}</td><td class="actions"><button data-act="relay-status" data-id="${escapeHtml(c.id)}" data-status="${escapeHtml(c.status)}">启停</button><button data-act="relay-del" data-id="${escapeHtml(c.id)}">删除</button></td></tr>`).join('')}</tbody></table>` : '<div class="empty">暂无凭据</div>'}`
+      $('relay-cred-new').addEventListener('click', () => openCreateRelayCredentialModal(groupId, render))
+      for (const b of box.querySelectorAll('button[data-act="relay-status"]')) {
+        b.addEventListener('click', async () => {
+          const status = b.dataset.status === 'active' ? 'disabled' : 'active'
+          try { await apiJson('PATCH', `/api/admin/account-groups/relay-credentials/${encodeURIComponent(b.dataset.id)}`, { status }); toast('已更新'); render() }
+          catch (e) { toast(`更新失败:${e.message}`, 'danger', toastOptsFromError(e)) }
+        })
+      }
+      for (const b of box.querySelectorAll('button[data-act="relay-del"]')) {
+        b.addEventListener('click', async () => {
+          if (!confirm(`删除凭据 #${b.dataset.id}?`)) return
+          try { await apiJson('DELETE', `/api/admin/account-groups/relay-credentials/${encodeURIComponent(b.dataset.id)}`); toast('已删除'); render() }
+          catch (e) { toast(`删除失败:${e.message}`, 'danger', toastOptsFromError(e)) }
+        })
+      }
+    } catch (e) {
+      box.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(e.message)}</div>`
+    }
+  }
+  await render()
+}
+
+function openCreateRelayCredentialModal(groupId, refreshParent) {
+  openModal(`
+    <h3>添加中转站 API Key</h3>
+    <div class="form-row"><label>label</label><input id="relay-label" value="Yunwu" /></div>
+    <div class="form-row"><label>base_url</label><input id="relay-base" value="https://yunwu.ai/v1" /></div>
+    <div class="form-row"><label>model_provider</label><input id="relay-provider" value="api111" /></div>
+    <div class="form-row"><label>provider_name</label><input id="relay-provider-name" value="Yunwu" /></div>
+    <div class="form-row"><label>wire_api</label><select id="relay-wire"><option value="responses">responses</option><option value="chat">chat</option></select></div>
+    <div class="form-row"><label>preferred_auth_method</label><select id="relay-auth"><option value="apikey">apikey</option><option value="chatgpt">chatgpt</option></select></div>
+    <div class="form-row"><label>API key(只提交一次,不会回显)</label><textarea id="relay-key" placeholder="sk-..."></textarea></div>
+    <div class="form-actions"><button class="btn" id="relay-cancel">取消</button><button class="btn btn-primary" id="relay-save">保存</button></div>`)
+  $('relay-cancel').addEventListener('click', closeModal)
+  $('relay-save').addEventListener('click', async () => {
+    const body = {
+      label: $('relay-label').value.trim(),
+      base_url: $('relay-base').value.trim(),
+      model_provider: $('relay-provider').value.trim(),
+      provider_name: $('relay-provider-name').value.trim() || null,
+      wire_api: $('relay-wire').value,
+      preferred_auth_method: $('relay-auth').value,
+      disable_response_storage: true,
+      api_key: $('relay-key').value.trim(),
+      status: 'active',
+    }
+    try { await apiJson('POST', `/api/admin/account-groups/${encodeURIComponent(groupId)}/relay-credentials`, body); closeModal(); toast('已保存') }
+    catch (e) { toast(`保存失败:${e.message}`, 'danger', toastOptsFromError(e)) }
+  })
+}
+
 // ─── Tab: Accounts(CRUD)───────────────────────────────────────────
 //
 // 4J 实装:状态过滤 + 新建/编辑/删除。
@@ -2221,6 +2400,7 @@ function _renderAccountsTable() {
           <th class="num">累计 ok/fail</th>
           <th>OAuth 到期</th>
           <th title="Anthropic 订阅周期到期日(管理员手填;留空 = 未知,调度器按中性看待;快到期账号 WRH 自动加权优先吃流量榨干额度)">订阅到期</th>
+          <th>分组</th>
           <th class="num" title="近 5 小时利用率(被动从上游响应头采集)">5h%</th>
           <th class="num" title="5 小时配额重置时间(剩余时间;tooltip 显示绝对时间)">5h 重置</th>
           <th class="num" title="近 7 天利用率(被动从上游响应头采集)">7d%</th>
@@ -2474,6 +2654,7 @@ function _renderAccountRow(a) {
       <td class="num">${okN}/${failN}${failRateChip}</td>
       <td class="mono">${fmtDate(a.oauth_expires_at)}</td>
       <td class="mono" title="${escapeHtml(a.subscription_end_at ? fmtDate(a.subscription_end_at) : '未填(调度器中性看待)')}">${a.subscription_end_at ? escapeHtml(fmtDate(a.subscription_end_at)) : '<span class="muted">—</span>'}</td>
+      <td class="mono">${a.group_id ? `#${escapeHtml(a.group_id)}` : '<span class="muted">—</span>'}</td>
       <td class="num">${cell5h}</td>
       <td class="num">${cell5hReset}</td>
       <td class="num">${cell7d}</td>
@@ -2506,7 +2687,7 @@ async function resetAccountCooldown(id, label, btn) {
   })
 }
 
-function _accountFormFields(prefill, activeProxies = []) {
+function _accountFormFields(prefill, activeProxies = [], accountGroups = []) {
   // prefill = null → 新建;否则 = 现有 account 对象。
   // oauth_token 在 PATCH 模式下必须用户主动输入才发送(避免误覆盖)。
   // activeProxies = [{id, label, url_masked}] 给 egress_proxy_id dropdown 用。
@@ -2516,8 +2697,16 @@ function _accountFormFields(prefill, activeProxies = []) {
   // 编辑时若当前绑定的 entry 已被禁用,把它单独 append 到尾部("已禁用"标签),
   // 保持选中态可见(避免静默切到第一项)。
   const currentEpid = a.egress_proxy_id != null ? String(a.egress_proxy_id) : ''
+  const currentGroupId = a.group_id != null ? String(a.group_id) : ''
   const currentLabel = a.egress_proxy_pool_label || ''
   const inActiveList = activeProxies.some((p) => String(p.id) === currentEpid)
+  const groupOptions = [
+    `<option value="" ${currentGroupId ? '' : 'selected'}>${isCreate ? '— 默认 Claude 官方订阅组 —' : '— 未绑定 —'}</option>`,
+    ...accountGroups.map((g) => `
+      <option value="${escapeHtml(String(g.id))}" ${String(g.id) === currentGroupId ? 'selected' : ''}>
+        ${escapeHtml(g.label)} #${escapeHtml(String(g.id))}${g.enabled ? '' : ' (disabled)'}
+      </option>`),
+  ].join('')
   const epidOptions = [
     isCreate
       ? `<option value="" disabled ${currentEpid ? '' : 'selected'}>— 请选择代理池条目 —</option>`
@@ -2572,6 +2761,11 @@ function _accountFormFields(prefill, activeProxies = []) {
       <small style="color:var(--muted)">管理员手填字段(Anthropic OAuth/API 不暴露)。NULL = 未知,调度器按中性 1.0 看待;否则参与 WRH 权重 — <strong>快到期账号自动加权(收益最大化:订阅到期前榨干额度)</strong>。</small>
     </div>
     <div class="form-row">
+      <label>账号分组(仅 claude 官方 OAuth)</label>
+      <select id="acc-group-id">${groupOptions}</select>
+      <small style="color:var(--muted)">用于“账号分组”页的 official_oauth + claude 路由;codex API 中转站走独立 relay credential,不绑定这里的账号。</small>
+    </div>
+    <div class="form-row">
       <label>egress 代理池条目${isCreate ? '(必选)' : '(必选;不可清空)'}</label>
       <select id="acc-egress-id">${epidOptions}</select>
       <small style="color:var(--muted)">从"代理池"页维护可用条目;此处仅显示 active 项${
@@ -2585,7 +2779,7 @@ function _accountFormFields(prefill, activeProxies = []) {
 // 字符串 "NULL"(大小写不敏感)表示显式置空。
 // 0055: egress_proxy_id 必填(create) / 不允许清空(patch)。
 // 第二个参数 prefillEpid 在 patch 模式下用来判断是否变更,避免无谓写。
-function _readAccountForm(isCreate, prefillEpid = '') {
+function _readAccountForm(isCreate, prefillEpid = '', prefillGroupId = '', provider = 'claude') {
   const label = $('acc-label').value.trim()
   const plan = $('acc-plan').value
   const tokenRaw = $('acc-token').value.trim()
@@ -2593,6 +2787,7 @@ function _readAccountForm(isCreate, prefillEpid = '') {
   const expiresRaw = $('acc-expires').value.trim()
   const subEndRaw = $('acc-sub-end').value.trim()
   const egressIdRaw = $('acc-egress-id').value.trim()
+  const groupIdRaw = $('acc-group-id')?.value?.trim() || ''
   const isNull = (v) => v.toUpperCase() === 'NULL'
 
   if (!label) throw new Error('label 必填')
@@ -2605,6 +2800,7 @@ function _readAccountForm(isCreate, prefillEpid = '') {
     if (refreshRaw) body.oauth_refresh_token = isNull(refreshRaw) ? null : refreshRaw
     if (expiresRaw) body.oauth_expires_at = isNull(expiresRaw) ? null : expiresRaw
     if (subEndRaw) body.subscription_end_at = isNull(subEndRaw) ? null : subEndRaw
+    if (provider === 'claude' && groupIdRaw) body.group_id = groupIdRaw
     body.egress_proxy_id = egressIdRaw
   } else {
     body.status = $('acc-status-edit').value
@@ -2614,6 +2810,9 @@ function _readAccountForm(isCreate, prefillEpid = '') {
     if (subEndRaw) body.subscription_end_at = isNull(subEndRaw) ? null : subEndRaw
     if (!egressIdRaw) throw new Error('egress 代理池条目 不可清空')
     if (egressIdRaw !== String(prefillEpid || '')) body.egress_proxy_id = egressIdRaw
+    if (provider === 'claude' && groupIdRaw !== String(prefillGroupId || '')) {
+      body.group_id = groupIdRaw || null
+    }
   }
   return body
 }
@@ -2637,14 +2836,24 @@ async function _fetchActiveEgressProxies() {
   return Array.isArray(r?.rows) ? r.rows : []
 }
 
+async function _fetchOfficialOAuthAccountGroups() {
+  const r = await apiGet('/api/admin/account-groups')
+  const rows = Array.isArray(r?.rows) ? r.rows : []
+  return rows.filter((g) => g && g.kind === 'official_oauth' && g.provider === 'claude')
+}
+
 async function openCreateAccountModal() {
   _oauthPendingState = null
   _oauthSelectedProvider = 'claude'
   let activeProxies
+  let accountGroups
   try {
-    activeProxies = await _fetchActiveEgressProxies()
+    ;[activeProxies, accountGroups] = await Promise.all([
+      _fetchActiveEgressProxies(),
+      _fetchOfficialOAuthAccountGroups(),
+    ])
   } catch (e) {
-    toast(`加载代理池失败: ${e.message}`, 'danger', toastOptsFromError(e)); return
+    toast(`加载账号表单依赖失败: ${e.message}`, 'danger', toastOptsFromError(e)); return
   }
   if (activeProxies.length === 0) {
     toast('代理池没有 active 条目,先去"代理池"页新建并启用一条', 'danger'); return
@@ -2691,7 +2900,7 @@ async function openCreateAccountModal() {
 
     <hr style="margin:14px 0;border:0;border-top:1px solid var(--border,#333)" />
 
-    ${_accountFormFields(null, activeProxies)}
+    ${_accountFormFields(null, activeProxies, accountGroups)}
     <div class="form-actions">
       <button id="acc-cancel">取消</button>
       <button class="btn-primary" id="acc-ok">创建</button>
@@ -2700,12 +2909,21 @@ async function openCreateAccountModal() {
   $('acc-cancel').addEventListener('click', closeModal)
   $('acc-oauth-open').addEventListener('click', oauthStartStep)
   $('acc-oauth-submit').addEventListener('click', oauthExchangeStep)
+  const syncGroupSelect = () => {
+    const sel = $('acc-group-id')
+    if (sel) sel.disabled = _selectedProviderFromRadio() !== 'claude'
+  }
+  for (const r of document.querySelectorAll('input[name="acc-provider"]')) {
+    r.addEventListener('change', syncGroupSelect)
+  }
+  syncGroupSelect()
   $('acc-ok').addEventListener('click', async (ev) => {
     let body
-    try { body = _readAccountForm(true, '') }
+    const provider = _selectedProviderFromRadio()
+    try { body = _readAccountForm(true, '', '', provider) }
     catch (e) { toast(e.message, 'danger'); return }
     // 默认 claude(后端兼容历史 caller);codex 时显式传
-    body.provider = _selectedProviderFromRadio()
+    body.provider = provider
     await withBtnLoading(ev.currentTarget, async () => {
       try {
         const r = await apiJson('POST', '/api/admin/accounts', body)
@@ -2808,30 +3026,35 @@ async function oauthExchangeStep() {
 async function openEditAccountModal(id) {
   let account
   let activeProxies
+  let accountGroups
   try {
-    const [accResp, proxies] = await Promise.all([
+    const [accResp, proxies, groups] = await Promise.all([
       apiGet(`/api/admin/accounts/${encodeURIComponent(id)}`),
       _fetchActiveEgressProxies(),
+      _fetchOfficialOAuthAccountGroups(),
     ])
     account = accResp?.account
     if (!account) throw new Error('未找到账号')
     activeProxies = proxies
+    accountGroups = groups
   } catch (e) {
     toast(`读取失败: ${e.message}`, 'danger', toastOptsFromError(e)); return
   }
   const prefillEpid = account.egress_proxy_id != null ? String(account.egress_proxy_id) : ''
+  const prefillGroupId = account.group_id != null ? String(account.group_id) : ''
   openModal(`
     <h3>编辑账号 #${escapeHtml(account.id)}</h3>
-    ${_accountFormFields(account, activeProxies)}
+    ${_accountFormFields(account, activeProxies, accountGroups)}
     <div class="form-actions">
       <button id="acc-cancel">取消</button>
       <button class="btn-primary" id="acc-ok">保存</button>
     </div>
   `)
   $('acc-cancel').addEventListener('click', closeModal)
+  if (account.provider !== 'claude' && $('acc-group-id')) $('acc-group-id').disabled = true
   $('acc-ok').addEventListener('click', async (ev) => {
     let body
-    try { body = _readAccountForm(false, prefillEpid) }
+    try { body = _readAccountForm(false, prefillEpid, prefillGroupId, account.provider || 'claude') }
     catch (e) { toast(e.message, 'danger'); return }
     await withBtnLoading(ev.currentTarget, async () => {
       try {

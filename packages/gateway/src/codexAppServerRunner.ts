@@ -17,6 +17,7 @@ import {
   _sanitizeThreadId,
   buildCodexEnv,
   buildCodexProviderConfigArgs,
+  type CodexProviderConfigOverride,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
 } from './codexRunner.js'
@@ -674,6 +675,8 @@ export class CodexAppServerRunner extends EventEmitter {
   /** Cached overrides for the lifetime of the current proc. Cleared together
    *  with `sessionDir` so the next post-shutdown spawn lazy-rebuilds. */
   private cachedOverrides: CodexLaunchOverrides | null = null
+  private codexRouteConfig: CodexProviderConfigOverride | null = null
+  private spawnedProviderSignature: string | null = null
 
   // ── Phase 5 GitHub session repo binding(parity with SubprocessRunner)──
   /** ready 状态下记录当前生效的 repo binding — selectionVersion 给
@@ -731,6 +734,14 @@ export class CodexAppServerRunner extends EventEmitter {
   }
   setModel(model: string | undefined): void {
     this.opts.model = model
+  }
+
+  setCodexRoute(route: CodexProviderConfigOverride | null | undefined): void {
+    this.codexRouteConfig = route ?? null
+  }
+
+  private codexRouteSignature(): string {
+    return JSON.stringify(this.codexRouteConfig ?? null)
   }
 
   // ── traceId getter / setter (parity with SubprocessRunner; V3 S12e CG8) ──
@@ -995,6 +1006,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.initialized = false
     this.attached = false
     this.proc = null
+    this.spawnedProviderSignature = null
     this.stdoutBuf = ''
     // Clear in-flight token state. priorTurnTotal is INTENTIONALLY preserved
     // across shutdown — codex's thread token totals are server-side and
@@ -1095,7 +1107,8 @@ export class CodexAppServerRunner extends EventEmitter {
     // `-c model_reasoning_effort="<low|medium|high|xhigh>"`(max → xhigh)。
     // 与 codexRunner.ts 同 helper、同语义,任何 normalize 改动一处生效。
     // 缺失/非法 → 空数组,codex 用 CLI 默认。
-    const providerArgs = buildCodexProviderConfigArgs()
+    const providerSignature = this.codexRouteSignature()
+    const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
     const effortArgs = codexReasoningEffortConfig(this.effortLevel)
     const args = [
       'app-server',
@@ -1114,6 +1127,7 @@ export class CodexAppServerRunner extends EventEmitter {
       env: buildCodexEnv(),
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
+    this.spawnedProviderSignature = providerSignature
     proc.stdout.on('data', (chunk: Buffer) => {
       // Identity guard (Codex review #019dde20 BLOCKER round 2): a stale
       // stdout frame from a discarded proc must NOT be parsed against the new
@@ -1160,6 +1174,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emit('error', err)
       this.failAllPending(`codex app-server process error: ${err.message}`)
       this.proc = null
+      this.spawnedProviderSignature = null
       this.initialized = false
       this.attached = false
       // stdoutBuf cleared so any partial-line residue doesn't poison the
@@ -1191,6 +1206,7 @@ export class CodexAppServerRunner extends EventEmitter {
         this.failAllPending(`codex app-server exited code=${code} signal=${signal ?? ''}`)
       }
       this.proc = null
+      this.spawnedProviderSignature = null
       this.initialized = false
       this.attached = false
       this.activeTurnId = null
@@ -2062,6 +2078,26 @@ export class CodexAppServerRunner extends EventEmitter {
     this.currentTurnUsage = null
 
     try {
+      if (
+        this.proc &&
+        !this.proc.killed &&
+        this.spawnedProviderSignature !== null &&
+        this.spawnedProviderSignature !== this.codexRouteSignature()
+      ) {
+        // Route changes require a fresh Codex app-server process because
+        // provider/base_url are launch-time CLI args. Do not let this restart
+        // reject already-queued turns for the same session; only the current
+        // runner process is being replaced.
+        const queuedTurns = this.queue
+        this.queue = []
+        try {
+          await this.shutdown()
+        } finally {
+          if (queuedTurns.length > 0) {
+            this.queue = queuedTurns.concat(this.queue)
+          }
+        }
+      }
       await this.ensureSpawned(repoSnap, effectiveCwd)
 
       // Each fresh app-server proc must explicitly attach a thread before

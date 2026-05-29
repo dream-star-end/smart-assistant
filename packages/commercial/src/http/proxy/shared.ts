@@ -1135,6 +1135,12 @@ export interface AnthropicProxyDeps {
    * 30s TTL cache。灰度路线 off → observe(收集 metric)→ enforce。
    */
   getSessionPinMode?: () => Promise<import("../../account-pool/scheduler.js").SessionPinMode>;
+  /** Optional group resolver for official_oauth+claude routing. */
+  listEnabledAccountGroupsForModel?: (args: {
+    modelId: string;
+    kind?: import("../../account-pool/groups.js").AccountGroupKind;
+    provider?: import("../../account-pool/groups.js").AccountGroupProvider;
+  }) => Promise<import("../../account-pool/groups.js").AccountGroupRow[]>;
 }
 
 /**

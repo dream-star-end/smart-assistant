@@ -15,6 +15,7 @@ import {
   CODEX_UPSTREAM_AUTH_HEADER,
   buildCodexRelayLocalBaseUrl,
   codexRelayBasePathForUpstream,
+  isRelayCredentialFailureStatus,
   makeCodexRelayHandler,
   mapCodexRelayUrl,
   type CodexRelayDb,
@@ -101,6 +102,15 @@ describe('internalCodexRelay path mapping', () => {
       assert.ok('error' in mapped, `${path} must be rejected`)
     }
   })
+
+  test('classifies credential-level upstream errors as relay credential failures', () => {
+    for (const status of [401, 403, 429, 500, 503]) {
+      assert.equal(isRelayCredentialFailureStatus(status), true, `${status} should count as credential failure`)
+    }
+    for (const status of [200, 201, 400, 404]) {
+      assert.equal(isRelayCredentialFailureStatus(status), false, `${status} should not count as credential failure`)
+    }
+  })
 })
 
 describe('internalCodexRelay handler', () => {
@@ -148,6 +158,142 @@ describe('internalCodexRelay handler', () => {
       assert.equal(captured.duplex, 'half')
     } finally {
       await close(server)
+    }
+  })
+
+
+
+  test('route token path uses route credential API key and does not require legacy bound codex account', async () => {
+    const token = 'a'.repeat(64)
+    const captured: { url?: string; headers?: Headers; dispatcher?: unknown; body?: string } = {}
+    const successes: string[] = []
+    const failures: string[] = []
+    const handler = makeCodexRelayHandler({
+      identityRepo: makeRepo(),
+      db: makeDb({ codexAccountId: null, provider: null, accountStatus: null }),
+      upstreamBaseUrl: 'https://legacy.invalid/v1',
+      resolveRouteContext: async (args) => {
+        assert.equal(args.token, token)
+        assert.equal(args.containerId, 11)
+        assert.equal(args.userId, 42n)
+        return {
+          modelId: 'gpt-5.5',
+          group: { id: 9n, label: 'relay', kind: 'api_relay', provider: 'codex', enabled: true, priority: 1, models: ['gpt-5.5'], created_at: new Date(), updated_at: new Date() },
+          credential: {
+            id: 8n,
+            group_id: 9n,
+            label: 'yunwu',
+            base_url: 'https://yunwu.ai/v1',
+            model_provider: 'api111',
+            provider_name: 'Yunwu',
+            wire_api: 'responses',
+            preferred_auth_method: 'apikey',
+            disable_response_storage: true,
+            status: 'active',
+            health_score: 100,
+            cooldown_until: null,
+            last_used_at: null,
+            last_error: null,
+            success_count: 0n,
+            fail_count: 0n,
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+          apiKey: Buffer.from('route-api-key', 'utf8'),
+        }
+      },
+      resolveDispatcher: async () => { throw new Error('legacy dispatcher must not be used') },
+      markCredentialSuccess: async (id) => { successes.push(String(id)) },
+      markCredentialFailure: async (id, err) => { failures.push(`${String(id)}:${err}`) },
+      fetchImpl: (async (input, init) => {
+        captured.url = String(input)
+        captured.headers = new Headers(init?.headers)
+        captured.dispatcher = (init as { dispatcher?: unknown }).dispatcher
+        captured.body = await drainBody(init?.body)
+        return new Response('route-ok', { status: 200 })
+      }) as typeof fetch,
+    })
+    const server = createServer((req, res) => {
+      void handler(req, res, CTX)
+    })
+    const port = await listen(server)
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/route/${token}/responses`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer malicious-upstream-token',
+          'content-type': 'application/json',
+        },
+        body: '{"input":"hi"}',
+      })
+      assert.equal(res.status, 200)
+      assert.equal(await res.text(), 'route-ok')
+      assert.equal(captured.url, 'https://yunwu.ai/v1/responses')
+      assert.equal(captured.headers?.get('authorization'), 'Bearer route-api-key')
+      assert.equal(captured.headers?.get(CODEX_UPSTREAM_AUTH_HEADER), null)
+      assert.equal(captured.dispatcher, undefined)
+      assert.equal(captured.body, '{"input":"hi"}')
+      assert.deepEqual(successes, ['8'])
+      assert.deepEqual(failures, [])
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('route token path marks 401/403/429 upstream responses as relay credential failures', async () => {
+    for (const status of [401, 403, 429]) {
+      const token = 'c'.repeat(64)
+      const successes: string[] = []
+      const failures: string[] = []
+      const handler = makeCodexRelayHandler({
+        identityRepo: makeRepo(),
+        db: makeDb({ codexAccountId: null, provider: null, accountStatus: null }),
+        resolveRouteContext: async () => ({
+          modelId: 'gpt-5.5',
+          group: { id: 9n, label: 'relay', kind: 'api_relay', provider: 'codex', enabled: true, priority: 1, models: ['gpt-5.5'], created_at: new Date(), updated_at: new Date() },
+          credential: {
+            id: 8n,
+            group_id: 9n,
+            label: 'yunwu',
+            base_url: 'https://yunwu.ai/v1',
+            model_provider: 'api111',
+            provider_name: 'Yunwu',
+            wire_api: 'responses',
+            preferred_auth_method: 'apikey',
+            disable_response_storage: true,
+            status: 'active',
+            health_score: 100,
+            cooldown_until: null,
+            last_used_at: null,
+            last_error: null,
+            success_count: 0n,
+            fail_count: 0n,
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+          apiKey: Buffer.from('route-api-key', 'utf8'),
+        }),
+        markCredentialSuccess: async (id) => { successes.push(String(id)) },
+        markCredentialFailure: async (id, err) => { failures.push(`${String(id)}:${err}`) },
+        fetchImpl: (async () => new Response('upstream-error', { status })) as typeof fetch,
+      })
+      const server = createServer((req, res) => {
+        void handler(req, res, CTX)
+      })
+      const port = await listen(server)
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/route/${token}/responses`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${TOKEN}` },
+          body: '{"input":"hi"}',
+        })
+        assert.equal(res.status, status)
+        assert.deepEqual(successes, [])
+        assert.deepEqual(failures, [`8:http_${status}`])
+      } finally {
+        await close(server)
+      }
     }
   })
 

@@ -437,6 +437,7 @@ export function makeAnthropicProxyHandler(
           // v3 反关联根治 — session pin 三态(off/observe/enforce)同型 getter。
           // 30s TTL cache,admin UI 改完立即 invalidate 本机进程的 cache。
           getSessionPinMode: deps.getSessionPinMode,
+          listEnabledAccountGroupsForModel: deps.listEnabledAccountGroupsForModel,
         },
         body,
         route,

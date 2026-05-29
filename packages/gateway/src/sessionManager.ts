@@ -25,7 +25,7 @@ import { createLogger } from './logger.js'
 import { getV3MasterSinkOrNull, type V3MasterSinkPayload } from './v3MasterSink.js'
 import { SubprocessRunner } from './subprocessRunner.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
-import { CodexRunner } from './codexRunner.js'
+import { CodexRunner, type CodexProviderConfigOverride } from './codexRunner.js'
 import {
   type ExecutionTarget,
   type RemoteTargetController,
@@ -1433,7 +1433,7 @@ export class SessionManager {
     /** Codex-native app-server only. Omitted means default mode so a previous
      *  plan-only turn cannot leak into ordinary follow-up turns. */
     conversationMode?: 'default' | 'plan',
-    opts?: { historicalMessages?: unknown[] },
+    opts?: { historicalMessages?: unknown[]; codexRoute?: CodexProviderConfigOverride | null },
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
@@ -1469,6 +1469,10 @@ export class SessionManager {
       const maybeSetConversationMode = (session.runner as any).setConversationMode
       if (typeof maybeSetConversationMode === 'function') {
         maybeSetConversationMode.call(session.runner, conversationMode ?? 'default')
+      }
+      const maybeSetCodexRoute = (session.runner as any).setCodexRoute
+      if (typeof maybeSetCodexRoute === 'function') {
+        maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
       }
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn

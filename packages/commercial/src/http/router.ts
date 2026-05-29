@@ -123,6 +123,17 @@ import {
   handleAdminOAuthExchange,
 } from './admin/accounts.js'
 import {
+  handleAdminCreateAccountGroup,
+  handleAdminCreateRelayCredential,
+  handleAdminDeleteAccountGroup,
+  handleAdminDeleteRelayCredential,
+  handleAdminGetAccountGroup,
+  handleAdminListAccountGroups,
+  handleAdminPatchAccountGroup,
+  handleAdminPatchRelayCredential,
+  handleAdminPutAccountGroupModels,
+} from './admin/accountGroups.js'
+import {
   handleAdminListEgressProxies,
   handleAdminGetEgressProxy,
   handleAdminCreateEgressProxy,
@@ -569,6 +580,17 @@ export function createCommercialHandler(
     { method: 'GET', pathPrefix: '/api/admin/accounts/', handler: handleAdminGetAccount },
     { method: 'PATCH', pathPrefix: '/api/admin/accounts/', handler: handleAdminPatchAccount },
     { method: 'DELETE', pathPrefix: '/api/admin/accounts/', handler: handleAdminDeleteAccount },
+    // T-60 超管账号池分组 / API 中转站凭据
+    { method: 'GET', path: '/api/admin/account-groups', handler: handleAdminListAccountGroups },
+    { method: 'POST', path: '/api/admin/account-groups', handler: handleAdminCreateAccountGroup },
+    // credential 子资源必须排在通用 group prefix 前,否则被 /:id 解析吞掉。
+    { method: 'PATCH', pathPrefix: '/api/admin/account-groups/relay-credentials/', handler: handleAdminPatchRelayCredential },
+    { method: 'DELETE', pathPrefix: '/api/admin/account-groups/relay-credentials/', handler: handleAdminDeleteRelayCredential },
+    { method: 'PUT', pathPrefix: '/api/admin/account-groups/', handler: handleAdminPutAccountGroupModels },
+    { method: 'POST', pathPrefix: '/api/admin/account-groups/', handler: handleAdminCreateRelayCredential },
+    { method: 'GET', pathPrefix: '/api/admin/account-groups/', handler: handleAdminGetAccountGroup },
+    { method: 'PATCH', pathPrefix: '/api/admin/account-groups/', handler: handleAdminPatchAccountGroup },
+    { method: 'DELETE', pathPrefix: '/api/admin/account-groups/', handler: handleAdminDeleteAccountGroup },
     // V3 — Egress Proxy Pool(决策 P/Q/R)
     // exact path 在 prefix 之前命中(matchRoute exact-first)
     { method: 'GET', path: '/api/admin/egress-proxies', handler: handleAdminListEgressProxies },

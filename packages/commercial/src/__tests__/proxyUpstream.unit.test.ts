@@ -35,6 +35,7 @@ import {
 import {
   AccountPoolBusyError,
   AccountPoolUnavailableError,
+  SessionPinTemporarilyUnavailableError,
   type PickResult,
   type ReleaseInput,
 } from "../account-pool/scheduler.js";
@@ -97,10 +98,11 @@ function makeScheduler(opts: {
 
 function bodyFor(model: string): {
   model: string;
+  max_tokens: number;
   messages: unknown[];
-  metadata?: { session_id?: string; user_id?: unknown };
+  metadata?: { session_id?: string; user_id?: string };
 } {
-  return { model, messages: [{ role: "user", content: "hi" }] };
+  return { model, max_tokens: 1024, messages: [{ role: "user", content: "hi" }] };
 }
 
 // ─── selectUpstreamRoute ─────────────────────────────────────────────────
@@ -260,6 +262,105 @@ describe("pickUpstream — OAuth pick 失败", () => {
       ),
       /db wedged/,
     );
+  });
+});
+
+describe("pickUpstream — OAuth account groups", () => {
+  const groupRow = (id: bigint, priority: number) => ({
+    id,
+    label: `group-${id}`,
+    kind: "official_oauth" as const,
+    provider: "claude" as const,
+    enabled: true,
+    priority,
+    models: ["claude-sonnet-4-6"],
+    created_at: new Date(0),
+    updated_at: new Date(0),
+  });
+
+  test("enabled groups are tried by priority until one scheduler pick succeeds", async () => {
+    const pickInputs: Array<{ groupId?: bigint | string | null }> = [];
+    const scheduler: PickUpstreamDeps["scheduler"] = {
+      async pick(input) {
+        pickInputs.push(input);
+        if (input.groupId === 10n) throw new AccountPoolUnavailableError("group empty");
+        return makePick({ account_id: 20n });
+      },
+      async release() {},
+    };
+    const res = await pickUpstream(
+      {
+        scheduler,
+        listEnabledAccountGroupsForModel: async (args) => {
+          assert.deepEqual(args, {
+            modelId: "claude-sonnet-4-6",
+            kind: "official_oauth",
+            provider: "claude",
+          });
+          return [groupRow(10n, 10), groupRow(20n, 20)];
+        },
+        getDispatcher: (async () => undefined) as PickUpstreamDeps["getDispatcher"],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    assert.deepEqual(pickInputs.map((i) => i.groupId), [10n, 20n]);
+    if (!res.ok) return;
+    assert.equal(res.session.accountId, 20n);
+  });
+
+  test("temporary session-pin miss in earlier group continues to lower-priority groups", async () => {
+    const pickInputs: Array<{ groupId?: bigint | string | null }> = [];
+    const scheduler: PickUpstreamDeps["scheduler"] = {
+      async pick(input) {
+        pickInputs.push(input);
+        if (input.groupId === 10n) {
+          throw new SessionPinTemporarilyUnavailableError("pin outside this group", 0);
+        }
+        return makePick({ account_id: 20n });
+      },
+      async release() {},
+    };
+    const res = await pickUpstream(
+      {
+        scheduler,
+        listEnabledAccountGroupsForModel: async () => [groupRow(10n, 10), groupRow(20n, 20)],
+        getDispatcher: (async () => undefined) as PickUpstreamDeps["getDispatcher"],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    assert.deepEqual(pickInputs.map((i) => i.groupId), [10n, 20n]);
+    if (!res.ok) return;
+    assert.equal(res.session.accountId, 20n);
+  });
+
+  test("no enabled group for model fails before scheduler.pick", async () => {
+    let pickCalled = false;
+    const scheduler: PickUpstreamDeps["scheduler"] = {
+      async pick() {
+        pickCalled = true;
+        return makePick();
+      },
+      async release() {},
+    };
+    const res = await pickUpstream(
+      {
+        scheduler,
+        listEnabledAccountGroupsForModel: async () => [],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.equal(res.error.kind, "pool_unavailable");
+    assert.equal(pickCalled, false);
   });
 });
 
