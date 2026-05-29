@@ -16,6 +16,7 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
+  buildCodexProviderConfigArgs,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
 } from './codexRunner.js'
@@ -1094,8 +1095,16 @@ export class CodexAppServerRunner extends EventEmitter {
     // `-c model_reasoning_effort="<low|medium|high|xhigh>"`(max → xhigh)。
     // 与 codexRunner.ts 同 helper、同语义,任何 normalize 改动一处生效。
     // 缺失/非法 → 空数组,codex 用 CLI 默认。
+    const providerArgs = buildCodexProviderConfigArgs()
     const effortArgs = codexReasoningEffortConfig(this.effortLevel)
-    const args = ['app-server', ...argvOverrides, ...effortArgs, '--listen', 'stdio://']
+    const args = [
+      'app-server',
+      ...argvOverrides,
+      ...providerArgs,
+      ...effortArgs,
+      '--listen',
+      'stdio://',
+    ]
     // Phase 5:spawn cwd 用 effectiveCwd(ready 时 = repo workspaceDir,其它 = opts.cwd)。
     // 虽然 codex app-server 本质是个 JSON-RPC 服务,proc 自身 cwd 大多数子命令不直接用,
     // 但保持与 thread/start.cwd 一致避免任何"哪边是真值"的混淆。

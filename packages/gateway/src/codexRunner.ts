@@ -176,6 +176,65 @@ export function codexReasoningEffortConfig(level: string | undefined | null): st
   return ['-c', `model_reasoning_effort="${normalized}"`]
 }
 
+const CODEX_PROVIDER_ID_RE = /^[A-Za-z0-9_-]+$/
+
+function tomlString(value: string): string {
+  return JSON.stringify(value)
+}
+
+function envFlagDefaultTrue(value: string | undefined): boolean {
+  if (value === undefined) return true
+  const normalized = value.trim().toLowerCase()
+  return !(normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off')
+}
+
+/**
+ * Optional OpenAI-compatible relay configuration for codex CLI.
+ *
+ * v3 commercial uses this for relay providers such as Yunwu: the API key
+ * still lives in CODEX_HOME/auth.json, while non-secret provider routing is
+ * injected per spawn via `-c` overrides so user-writable config.toml cannot
+ * accidentally route platform Codex traffic back to api.openai.com.
+ */
+export function buildCodexProviderConfigArgs(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const providerId = (env.OC_CODEX_MODEL_PROVIDER ?? '').trim()
+  const baseUrl = (env.OC_CODEX_BASE_URL ?? '').trim()
+  if (!providerId && !baseUrl) return []
+  if (!providerId || !baseUrl) {
+    log.warn('codex provider override incomplete; ignoring OC_CODEX_* relay config', {
+      hasProvider: providerId.length > 0,
+      hasBaseUrl: baseUrl.length > 0,
+    })
+    return []
+  }
+  if (!CODEX_PROVIDER_ID_RE.test(providerId)) {
+    log.warn('codex provider override has invalid provider id; ignoring', { providerId })
+    return []
+  }
+
+  const providerName = (env.OC_CODEX_PROVIDER_NAME ?? '').trim() || providerId
+  const wireApi = (env.OC_CODEX_WIRE_API ?? '').trim() || 'responses'
+  const authMethod = (env.OC_CODEX_PREFERRED_AUTH_METHOD ?? '').trim() || 'apikey'
+  const disableResponseStorage = envFlagDefaultTrue(env.OC_CODEX_DISABLE_RESPONSE_STORAGE)
+
+  return [
+    '-c',
+    `model_provider=${tomlString(providerId)}`,
+    '-c',
+    `model_providers.${providerId}.name=${tomlString(providerName)}`,
+    '-c',
+    `model_providers.${providerId}.base_url=${tomlString(baseUrl)}`,
+    '-c',
+    `model_providers.${providerId}.wire_api=${tomlString(wireApi)}`,
+    '-c',
+    `preferred_auth_method=${tomlString(authMethod)}`,
+    '-c',
+    `disable_response_storage=${disableResponseStorage ? 'true' : 'false'}`,
+  ]
+}
+
 /**
  * Build codex `exec` argv. Module-level export so tests / overrides can drive
  * the same builder the runner uses internally without poking at private
@@ -192,6 +251,8 @@ export function buildCodexCliArgs(opts: {
   model?: string
   threadId?: string | null
   effortLevel?: string | null
+  /** Non-secret provider relay `-c` argv pairs, e.g. OC_CODEX_* env mapping. */
+  providerConfig?: string[]
   /** Extra `-c key=value` argv pairs from `buildCodexLaunchOverrides()`. */
   extraConfig?: string[]
 }): string[] {
@@ -203,12 +264,13 @@ export function buildCodexCliArgs(opts: {
     'approval_policy="never"',
   ]
   if (opts.model) base.push('--model', opts.model)
+  const providerConfig = opts.providerConfig ?? []
   const effort = codexReasoningEffortConfig(opts.effortLevel ?? undefined)
   const extra = opts.extraConfig ?? []
   if (opts.threadId) {
-    return ['exec', 'resume', ...base, ...effort, ...extra, opts.threadId, '-']
+    return ['exec', 'resume', ...base, ...providerConfig, ...effort, ...extra, opts.threadId, '-']
   }
-  return ['exec', ...base, ...effort, ...extra, '-']
+  return ['exec', ...base, ...providerConfig, ...effort, ...extra, '-']
 }
 
 /** Max stderr we keep per turn. Codex CLI normally logs only on error, but
@@ -650,6 +712,7 @@ export class CodexRunner extends EventEmitter {
       model: this.opts.model,
       threadId: this.threadId,
       effortLevel: this.effortLevel,
+      providerConfig: buildCodexProviderConfigArgs(),
       extraConfig,
     })
   }
