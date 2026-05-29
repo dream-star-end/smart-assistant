@@ -151,7 +151,7 @@ interface BillingRig {
   poolCtrl: FakePoolControl;
   preCheckRedis: InMemoryPreCheckRedis;
   pricing: PricingCache;
-  binding: { acquireCalls: number; releaseCalls: number };
+  binding: { acquireCalls: number; releaseCalls: number; acquireGroupIds: Array<string | null | undefined> };
 }
 
 // CG2c — 测试用最小 logger,记 fields(含 child 累计 bindings)。
@@ -209,11 +209,12 @@ async function startRig(opts: {
   const pricing = new PricingCache();
   pricing._setForTests([PRICING]);
 
-  const bindingState = { acquireCalls: 0, releaseCalls: 0 };
+  const bindingState = { acquireCalls: 0, releaseCalls: 0, acquireGroupIds: [] as Array<string | null | undefined> };
   const acquireResult = opts.acquireResult ?? "account";
   const codexBinding: CodexBindingHandle = {
-    async acquire(_containerId: number) {
+    async acquire(_containerId: number, groupId?: string | null) {
       bindingState.acquireCalls += 1;
+      bindingState.acquireGroupIds.push(groupId);
       if (acquireResult === "throw") throw new Error("simulated acquire failure");
       if (acquireResult === "stale") {
         const { ContainerStaleBindingError } = await import("../account-pool/scheduler.js");
@@ -756,6 +757,92 @@ describe("userChatBridge / codex relay — fallback to legacy binding", () => {
       usage: { input_tokens: 50, output_tokens: 100 },
     }));
     await waitJsonFrameOfType(ws, "outbound.cost_charged");
+
+    ws.close();
+  });
+});
+
+describe("userChatBridge / codex relay — official OAuth group marker", () => {
+  let rig: BillingRig;
+  before(async () => {
+    rig = await startRig({
+      userBalance: 1_000_000n,
+      createCodexRoute: async () => ({ kind: "official_oauth", groupId: "42" }),
+    });
+  });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    rig.binding.acquireCalls = 0;
+    rig.binding.releaseCalls = 0;
+    rig.binding.acquireGroupIds.length = 0;
+  });
+
+  test("official_oauth route marker acquires legacy codex binding within selected group", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("19");
+    const ws = openClient(rig.gatewayPort, token);
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+    }));
+    const frameToContainer = await waitContainerNextFrame(containerWs);
+    const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+    const serverReqId = parsed.requestId as string;
+
+    assert.equal(rig.binding.acquireCalls, 1);
+    assert.deepEqual(rig.binding.acquireGroupIds, ["42"]);
+    assert.equal(parsed.__oc_codex_route, undefined, "official OAuth path must not inject API relay route");
+
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: serverReqId,
+      status: "success",
+      usage: { input_tokens: 50, output_tokens: 100 },
+    }));
+    await waitJsonFrameOfType(ws, "outbound.cost_charged");
+
+    ws.close();
+  });
+});
+
+describe("userChatBridge / codex relay — enabled groups fail closed", () => {
+  let rig: BillingRig;
+  before(async () => {
+    rig = await startRig({
+      userBalance: 1_000_000n,
+      createCodexRoute: async () => ({ kind: "unavailable", reason: "no usable enabled Codex group" }),
+    });
+  });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    rig.binding.acquireCalls = 0;
+    rig.binding.releaseCalls = 0;
+    rig.binding.acquireGroupIds.length = 0;
+  });
+
+  test("enabled but unusable Codex groups do not bypass to legacy whole-pool binding", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("20");
+    const ws = openClient(rig.gatewayPort, token);
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+    }));
+    const errFrame = await waitJsonFrameOfType(ws, "error");
+    assert.equal(errFrame.code, "CODEX_ROUTE_UNAVAILABLE");
+    assert.equal(rig.binding.acquireCalls, 0, "must not fall back to legacy pool after enabled groups were selected");
+
+    const forwarded = await Promise.race([
+      waitContainerNextFrame(containerWs, 150).then(() => true, () => false),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 200)),
+    ]);
+    assert.equal(forwarded, false, "unavailable route must not forward the turn to the container");
 
     ws.close();
   });

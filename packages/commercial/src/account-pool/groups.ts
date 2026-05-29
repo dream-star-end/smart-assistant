@@ -200,7 +200,7 @@ function parseRelay(row: RawRelayCredentialRow): RelayCredentialRow {
 }
 
 export function assertSupportedGroupCombo(kind: AccountGroupKind, provider: AccountGroupProvider): void {
-  if (kind === "official_oauth" && provider === "claude") return;
+  if (kind === "official_oauth" && (provider === "claude" || provider === "codex")) return;
   if (kind === "api_relay" && provider === "codex") return;
   throw new RangeError("unsupported_group_kind_provider");
 }
@@ -479,6 +479,27 @@ export async function deleteRelayCredential(id: bigint | string): Promise<boolea
   return (res.rowCount ?? 0) > 0;
 }
 
+
+export async function hasActiveOfficialOAuthAccountInGroup(
+  groupId: bigint | string,
+  provider: AccountGroupProvider,
+  runner?: QueryRunner,
+): Promise<boolean> {
+  const group = await getAccountGroup(groupId);
+  if (!group || !group.enabled || group.kind !== "official_oauth" || group.provider !== provider) return false;
+  const res = await query<{ ok: number }>(
+    `SELECT 1 AS ok
+       FROM claude_accounts
+      WHERE provider = $1
+        AND group_id = $2
+        AND status = 'active'
+      LIMIT 1`,
+    [provider, String(groupId)],
+    runner,
+  );
+  return res.rows.length > 0;
+}
+
 export async function pickRelayCredentialForGroup(
   groupId: bigint | string,
   runner?: QueryRunner,
@@ -518,6 +539,7 @@ export async function createCodexRouteContextForModel(args: {
   userId: bigint;
   modelId: string;
   ttlMs?: number;
+  groupId?: bigint | string;
   runner?: PoolClient;
 }): Promise<CodexRouteContextCreated | null> {
   const runner = args.runner;
@@ -527,7 +549,10 @@ export async function createCodexRouteContextForModel(args: {
     provider: "codex",
     runner,
   });
-  for (const group of groups) {
+  const eligibleGroups = args.groupId === undefined
+    ? groups
+    : groups.filter((g) => g.id === BigInt(String(args.groupId)));
+  for (const group of eligibleGroups) {
     const credential = await pickRelayCredentialForGroup(group.id, runner);
     if (!credential) continue;
     const token = mintRouteToken();

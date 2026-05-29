@@ -377,7 +377,7 @@ export interface UserChatBridgeDeps {
     containerId: number;
     userId: bigint;
     modelId: string;
-  }) => Promise<CodexApiRelayRoute | null>;
+  }) => Promise<CodexRouteDecision | null>;
   /** Expire an opaque per-turn Codex API relay route after the turn settles or aborts. */
   expireCodexRoute?: (token: string) => Promise<void>;
   /**
@@ -427,11 +427,12 @@ export interface UserChatBridgeDeps {
  * onFailure(决策 J2:bridge 不知道真实 turn 出参,健康分留给 release 层)。幂等。
  */
 export interface CodexBindingHandle {
-  acquire(containerId: number): Promise<{ account_id: bigint } | null>;
+  acquire(containerId: number, groupId?: string | null): Promise<{ account_id: bigint } | null>;
   release(account_id: bigint): void;
 }
 
 export interface CodexApiRelayRoute {
+  kind?: "api_relay";
   token: string;
   baseUrl: string;
   modelProvider: string;
@@ -442,6 +443,18 @@ export interface CodexApiRelayRoute {
   groupId: string;
   credentialId: string;
 }
+
+export interface CodexOfficialOAuthRoute {
+  kind: "official_oauth";
+  groupId: string;
+}
+
+export interface CodexRouteUnavailable {
+  kind: "unavailable";
+  reason: string;
+}
+
+export type CodexRouteDecision = CodexApiRelayRoute | CodexOfficialOAuthRoute | CodexRouteUnavailable;
 
 /**
  * 单连每 N ms 最多调一次 markContainerActivity —— 防 chatty 用户每帧都冲 DB。
@@ -1769,16 +1782,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               return;
             }
             let codexRoute: CodexApiRelayRoute | null = null;
+            let officialOAuthGroupId: string | null = null;
             if (createCodexRoute !== undefined) {
               if (effectiveModelCapture === null) {
                 throw new Error("codex route requested without effective model");
               }
-              codexRoute = await createCodexRoute({
+              const decision = await createCodexRoute({
                 containerId: cid,
                 userId: uid,
                 modelId: effectiveModelCapture,
               });
-              if (codexRoute !== null) codexApiRelayRouteToken = codexRoute.token;
+              if (decision !== null) {
+                if (decision.kind === "official_oauth") {
+                  officialOAuthGroupId = decision.groupId;
+                } else if (decision.kind === "unavailable") {
+                  throw Object.assign(new Error(decision.reason), { name: "CodexRouteUnavailable" });
+                } else {
+                  codexRoute = decision;
+                  codexApiRelayRouteToken = decision.token;
+                }
+              }
             }
 
             let acquired: { account_id: bigint } | null = null;
@@ -1786,7 +1809,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (codexBinding === undefined) {
                 throw Object.assign(new Error("no enabled Codex API relay group"), { name: "CodexRouteUnavailable" });
               }
-              acquired = await codexBinding.acquire(cid);
+              acquired = await codexBinding.acquire(cid, officialOAuthGroupId);
+              if (officialOAuthGroupId !== null && acquired === null) {
+                throw Object.assign(new Error("selected Codex OAuth group unavailable"), { name: "CodexRouteUnavailable" });
+              }
             }
             if (cleaned) {
               // bridge 在 acquire/route 创建期间被关 — 立即 release 不留泄漏

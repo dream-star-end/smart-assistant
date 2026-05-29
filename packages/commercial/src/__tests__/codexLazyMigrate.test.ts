@@ -21,6 +21,7 @@ import {
   commitCodexRebindInTx,
   fetchSnapshotAndWriteContainerAuth,
 } from '../account-pool/codexLazyMigrate.js'
+import { pickCodexAccountForBindingInTx } from '../account-pool/scheduler.js'
 
 const SELF_HOST = '11111111-1111-1111-1111-111111111111'
 const REMOTE_HOST = '22222222-2222-2222-2222-222222222222'
@@ -422,5 +423,29 @@ describe('fetchSnapshotAndWriteContainerAuth', () => {
     })
     assert.equal(inTxCalled, 1)
     assert.equal(outOfTxCalled, 0)
+  })
+})
+
+
+// ─── pickCodexAccountForBindingInTx group filter ───────────────────────────
+
+describe('pickCodexAccountForBindingInTx', () => {
+  test('filters active codex candidates by groupId when provided', async () => {
+    let observed: { sql?: string; params?: unknown[] } = {}
+    const client = {
+      query: async (sql: string, params: unknown[] = []) => {
+        observed = { sql, params }
+        return { rows: [{ id: '200', plan: 'pro', health_score: 50 }] }
+      },
+    } as unknown as PoolClient
+
+    const out = await pickCodexAccountForBindingInTx(client, 'container-1', {
+      groupId: '42',
+      hash: () => 1n,
+    })
+
+    assert.equal(out?.account_id, 200n)
+    assert.match(observed.sql ?? '', /group_id = \$1/)
+    assert.deepEqual(observed.params, ['42'])
   })
 })

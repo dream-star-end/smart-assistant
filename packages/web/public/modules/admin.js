@@ -2176,7 +2176,7 @@ function openCreateAccountGroupModal() {
     <h3>新建账号分组</h3>
     <div class="form-row"><label>名称</label><input id="grp-label" value="" placeholder="如 Yunwu GPT 中转站" /></div>
     <div class="form-row"><label>类型</label><select id="grp-kind"><option value="api_relay">API 中转站</option><option value="official_oauth">官方 OAuth 订阅</option></select></div>
-    <div class="form-row"><label>provider</label><select id="grp-provider"><option value="codex">codex</option><option value="claude">claude</option></select><small style="color:var(--muted)">V1 仅支持 api_relay+codex 与 official_oauth+claude。</small></div>
+    <div class="form-row"><label>provider</label><select id="grp-provider"><option value="codex">codex</option><option value="claude">claude</option></select><small style="color:var(--muted)">支持 api_relay+codex、official_oauth+codex、official_oauth+claude。</small></div>
     <div class="form-row"><label>启用</label><select id="grp-enabled"><option value="true">启用</option><option value="false">停用</option></select></div>
     <div class="form-row"><label>优先级</label><input id="grp-priority" type="number" value="100" /></div>
     <div class="form-row"><label>模型 id(逗号分隔)</label><input id="grp-models-input" value="gpt-5.5" /></div>
@@ -2687,7 +2687,19 @@ async function resetAccountCooldown(id, label, btn) {
   })
 }
 
-function _accountFormFields(prefill, activeProxies = [], accountGroups = []) {
+function _accountGroupOptions(accountGroups, provider, currentGroupId, isCreate) {
+  const defaultLabel = provider === 'codex' ? '— 默认 Codex 官方 OAuth 组 —' : '— 默认 Claude 官方订阅组 —'
+  const rows = (accountGroups || []).filter((g) => g && g.kind === 'official_oauth' && g.provider === provider)
+  return [
+    `<option value="" ${currentGroupId ? '' : 'selected'}>${isCreate ? defaultLabel : '— 未绑定 —'}</option>`,
+    ...rows.map((g) => `
+      <option value="${escapeHtml(String(g.id))}" ${String(g.id) === currentGroupId ? 'selected' : ''}>
+        ${escapeHtml(g.label)} #${escapeHtml(String(g.id))}${g.enabled ? '' : ' (disabled)'}
+      </option>`),
+  ].join('')
+}
+
+function _accountFormFields(prefill, activeProxies = [], accountGroups = [], providerForGroups = null) {
   // prefill = null → 新建;否则 = 现有 account 对象。
   // oauth_token 在 PATCH 模式下必须用户主动输入才发送(避免误覆盖)。
   // activeProxies = [{id, label, url_masked}] 给 egress_proxy_id dropdown 用。
@@ -2700,13 +2712,8 @@ function _accountFormFields(prefill, activeProxies = [], accountGroups = []) {
   const currentGroupId = a.group_id != null ? String(a.group_id) : ''
   const currentLabel = a.egress_proxy_pool_label || ''
   const inActiveList = activeProxies.some((p) => String(p.id) === currentEpid)
-  const groupOptions = [
-    `<option value="" ${currentGroupId ? '' : 'selected'}>${isCreate ? '— 默认 Claude 官方订阅组 —' : '— 未绑定 —'}</option>`,
-    ...accountGroups.map((g) => `
-      <option value="${escapeHtml(String(g.id))}" ${String(g.id) === currentGroupId ? 'selected' : ''}>
-        ${escapeHtml(g.label)} #${escapeHtml(String(g.id))}${g.enabled ? '' : ' (disabled)'}
-      </option>`),
-  ].join('')
+  const groupProvider = providerForGroups || a.provider || 'claude'
+  const groupOptions = _accountGroupOptions(accountGroups, groupProvider === 'codex' ? 'codex' : 'claude', currentGroupId, isCreate)
   const epidOptions = [
     isCreate
       ? `<option value="" disabled ${currentEpid ? '' : 'selected'}>— 请选择代理池条目 —</option>`
@@ -2761,9 +2768,9 @@ function _accountFormFields(prefill, activeProxies = [], accountGroups = []) {
       <small style="color:var(--muted)">管理员手填字段(Anthropic OAuth/API 不暴露)。NULL = 未知,调度器按中性 1.0 看待;否则参与 WRH 权重 — <strong>快到期账号自动加权(收益最大化:订阅到期前榨干额度)</strong>。</small>
     </div>
     <div class="form-row">
-      <label>账号分组(仅 claude 官方 OAuth)</label>
+      <label>账号分组(官方 OAuth)</label>
       <select id="acc-group-id">${groupOptions}</select>
-      <small style="color:var(--muted)">用于“账号分组”页的 official_oauth + claude 路由;codex API 中转站走独立 relay credential,不绑定这里的账号。</small>
+      <small style="color:var(--muted)">绑定 selected provider 的 official_oauth 分组;Codex API 中转站仍走独立 relay credential。</small>
     </div>
     <div class="form-row">
       <label>egress 代理池条目${isCreate ? '(必选)' : '(必选;不可清空)'}</label>
@@ -2800,7 +2807,7 @@ function _readAccountForm(isCreate, prefillEpid = '', prefillGroupId = '', provi
     if (refreshRaw) body.oauth_refresh_token = isNull(refreshRaw) ? null : refreshRaw
     if (expiresRaw) body.oauth_expires_at = isNull(expiresRaw) ? null : expiresRaw
     if (subEndRaw) body.subscription_end_at = isNull(subEndRaw) ? null : subEndRaw
-    if (provider === 'claude' && groupIdRaw) body.group_id = groupIdRaw
+    if ((provider === 'claude' || provider === 'codex') && groupIdRaw) body.group_id = groupIdRaw
     body.egress_proxy_id = egressIdRaw
   } else {
     body.status = $('acc-status-edit').value
@@ -2810,7 +2817,7 @@ function _readAccountForm(isCreate, prefillEpid = '', prefillGroupId = '', provi
     if (subEndRaw) body.subscription_end_at = isNull(subEndRaw) ? null : subEndRaw
     if (!egressIdRaw) throw new Error('egress 代理池条目 不可清空')
     if (egressIdRaw !== String(prefillEpid || '')) body.egress_proxy_id = egressIdRaw
-    if (provider === 'claude' && groupIdRaw !== String(prefillGroupId || '')) {
+    if ((provider === 'claude' || provider === 'codex') && groupIdRaw !== String(prefillGroupId || '')) {
       body.group_id = groupIdRaw || null
     }
   }
@@ -2839,7 +2846,7 @@ async function _fetchActiveEgressProxies() {
 async function _fetchOfficialOAuthAccountGroups() {
   const r = await apiGet('/api/admin/account-groups')
   const rows = Array.isArray(r?.rows) ? r.rows : []
-  return rows.filter((g) => g && g.kind === 'official_oauth' && g.provider === 'claude')
+  return rows.filter((g) => g && g.kind === 'official_oauth')
 }
 
 async function openCreateAccountModal() {
@@ -2900,7 +2907,7 @@ async function openCreateAccountModal() {
 
     <hr style="margin:14px 0;border:0;border-top:1px solid var(--border,#333)" />
 
-    ${_accountFormFields(null, activeProxies, accountGroups)}
+    ${_accountFormFields(null, activeProxies, accountGroups, 'claude')}
     <div class="form-actions">
       <button id="acc-cancel">取消</button>
       <button class="btn-primary" id="acc-ok">创建</button>
@@ -2911,7 +2918,7 @@ async function openCreateAccountModal() {
   $('acc-oauth-submit').addEventListener('click', oauthExchangeStep)
   const syncGroupSelect = () => {
     const sel = $('acc-group-id')
-    if (sel) sel.disabled = _selectedProviderFromRadio() !== 'claude'
+    if (sel) sel.innerHTML = _accountGroupOptions(accountGroups, _selectedProviderFromRadio(), '', true)
   }
   for (const r of document.querySelectorAll('input[name="acc-provider"]')) {
     r.addEventListener('change', syncGroupSelect)
@@ -3044,14 +3051,13 @@ async function openEditAccountModal(id) {
   const prefillGroupId = account.group_id != null ? String(account.group_id) : ''
   openModal(`
     <h3>编辑账号 #${escapeHtml(account.id)}</h3>
-    ${_accountFormFields(account, activeProxies, accountGroups)}
+    ${_accountFormFields(account, activeProxies, accountGroups, account.provider || 'claude')}
     <div class="form-actions">
       <button id="acc-cancel">取消</button>
       <button class="btn-primary" id="acc-ok">保存</button>
     </div>
   `)
   $('acc-cancel').addEventListener('click', closeModal)
-  if (account.provider !== 'claude' && $('acc-group-id')) $('acc-group-id').disabled = true
   $('acc-ok').addEventListener('click', async (ev) => {
     let body
     try { body = _readAccountForm(false, prefillEpid, prefillGroupId, account.provider || 'claude') }

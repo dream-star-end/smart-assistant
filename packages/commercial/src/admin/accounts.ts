@@ -160,28 +160,27 @@ function isPositiveBigintId(id: unknown): id is string | number | bigint {
 }
 
 function assertAccountGroupCompatible(group: AccountGroupRow, provider: AccountProvider): void {
-  if (provider === "claude" && group.kind === "official_oauth" && group.provider === "claude") return;
+  if (group.kind === "official_oauth" && group.provider === provider) return;
   throw new RangeError("unsupported_account_group_for_provider");
 }
 
-async function resolveDefaultClaudeGroupId(): Promise<string | null> {
+async function resolveDefaultOfficialOAuthGroupId(provider: AccountProvider): Promise<string | null> {
   const groups = await listAccountGroups();
-  const g = groups.find((row) => row.kind === "official_oauth" && row.provider === "claude");
+  const g = groups.find((row) => row.kind === "official_oauth" && row.provider === provider);
   return g ? g.id.toString() : null;
 }
 
 async function normalizeGroupIdForAccount(
   provider: AccountProvider,
   raw: bigint | string | number | null | undefined,
-  opts: { defaultClaudeGroup?: boolean } = {},
+  opts: { defaultOfficialOAuthGroup?: boolean } = {},
 ): Promise<string | null | undefined> {
   if (raw === undefined) {
-    if (provider === "claude" && opts.defaultClaudeGroup === true) return resolveDefaultClaudeGroupId();
+    if (opts.defaultOfficialOAuthGroup === true) return resolveDefaultOfficialOAuthGroupId(provider);
     return undefined;
   }
   if (raw === null || raw === "") return null;
   if (!isPositiveBigintId(raw)) throw new RangeError("invalid_group_id");
-  if (provider !== "claude") throw new RangeError("unsupported_account_group_for_provider");
   const group = await getAccountGroup(String(raw));
   if (!group) throw new RangeError("group_not_found");
   assertAccountGroupCompatible(group, provider);
@@ -353,7 +352,7 @@ export async function adminCreateAccount(
   // 存在性预检 — 不存在的 FK 在 store 层会冒成 23503 → 500,提前 SELECT 给 400。
   await ensureEgressProxyExistsOrThrow(egressProxyId);
 
-  const normalizedGroupId = await normalizeGroupIdForAccount(provider, input.group_id, { defaultClaudeGroup: true });
+  const normalizedGroupId = await normalizeGroupIdForAccount(provider, input.group_id, { defaultOfficialOAuthGroup: true });
 
   // 0070 — Phase 6 fail_closed 根治:provider='claude' 新建必须同步获取 Anthropic
   // OAuth account UUID,作为 scheduler 候选锚点。否则 NULL 行被静默剔除

@@ -120,6 +120,7 @@ import {
 import {
   createCodexRouteContextForModel,
   expireCodexRouteContext,
+  hasActiveOfficialOAuthAccountInGroup,
   listEnabledGroupsForModel,
 } from "./account-pool/groups.js";
 import {
@@ -171,7 +172,6 @@ import {
   type UserChatBridgeHandler,
   type BridgeMetricSink,
   type CodexBindingHandle,
-  type CodexApiRelayRoute,
 } from "./ws/userChatBridge.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
@@ -2013,16 +2013,18 @@ export async function registerCommercial(
   const v3DepsForCodex = v3Deps;
   const codexBinding: CodexBindingHandle | undefined = v3Deps
     ? {
-        async acquire(containerId: number) {
+        async acquire(containerId: number, groupId?: string | null) {
           // tx 内做"锁 + 查 + 可能 lazy migrate / stale recycle";acquire slot / 容器 rm 在 tx 外
           type AcquireResult =
             | { kind: "active"; account_id: bigint }
             | { kind: "stale"; containerInternalId: string | null; hostUuid: string | null }
             | null;
+          const desiredGroupId = groupId ?? null;
           const result: AcquireResult = await tx<AcquireResult>(async (client) => {
             const lookup = await client.query<{
               account_id: string | null;
               account_status: string | null;
+              account_group_id: string | null;
               state: string;
               container_internal_id: string | null;
               host_uuid: string | null;
@@ -2030,6 +2032,7 @@ export async function registerCommercial(
             }>(
               `SELECT ac.codex_account_id::text AS account_id,
                       ca.status AS account_status,
+                      ca.group_id::text AS account_group_id,
                       ac.state AS state,
                       ac.container_internal_id AS container_internal_id,
                       ac.host_uuid AS host_uuid,
@@ -2068,10 +2071,17 @@ export async function registerCommercial(
               //            重新走 picker 路径产出 per-container mount。
               // 池子查询条件必须与 pickCodexAccountForBinding 完全一致(provider='codex'
               // AND status='active'),否则可能误判为"有账号"但 picker 实际拿不到。
+              const poolParams: unknown[] = [];
+              const poolWhere = ["provider = 'codex'", "status = 'active'"];
+              if (desiredGroupId !== null) {
+                poolParams.push(desiredGroupId);
+                poolWhere.push(`group_id = $${poolParams.length}`);
+              }
               const poolCount = await client.query<{ cnt: string }>(
                 `SELECT count(*)::text AS cnt
                    FROM claude_accounts
-                  WHERE provider = 'codex' AND status = 'active'`,
+                  WHERE ${poolWhere.join(" AND ")}`,
+                poolParams,
               );
               if (Number(poolCount.rows[0]?.cnt ?? "0") === 0) {
                 return null;
@@ -2124,7 +2134,7 @@ export async function registerCommercial(
                 hostUuid: row.host_uuid,
               };
             }
-            if (row.account_status === "active") {
+            if (row.account_status === "active" && (desiredGroupId === null || row.account_group_id === desiredGroupId)) {
               return { kind: "active", account_id: BigInt(row.account_id) };
             }
             // disabled / quarantined / 任意非 active → lazy migrate
@@ -2150,7 +2160,7 @@ export async function registerCommercial(
             //   - 持锁的 60s remote PUT 风险 v1.0.115 出现过:但当时是
             //     internalCodexTokenRefresh burst,acquire 路径单容器单流不重复;
             //     accept 同型权衡
-            const picked = await pickCodexAccountForBindingInTx(client, String(containerId));
+            const picked = await pickCodexAccountForBindingInTx(client, String(containerId), { groupId: desiredGroupId });
             if (!picked) {
               throw new Error(
                 `codex pool empty during lazy migrate for container ${containerId}`,
@@ -2258,20 +2268,38 @@ export async function registerCommercial(
     // plan v3 G5/G7 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
     // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
     codexBinding,
-    createCodexRoute: async ({ containerId, userId, modelId }): Promise<CodexApiRelayRoute | null> => {
-      const route = await createCodexRouteContextForModel({ containerId, userId, modelId });
-      if (!route) return null;
-      return {
-        token: route.token,
-        baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
-        modelProvider: route.credential.model_provider,
-        providerName: route.credential.provider_name,
-        wireApi: route.credential.wire_api,
-        preferredAuthMethod: route.credential.preferred_auth_method,
-        disableResponseStorage: route.credential.disable_response_storage,
-        groupId: route.group.id.toString(),
-        credentialId: route.credential.id.toString(),
-      };
+    createCodexRoute: async ({ containerId, userId, modelId }) => {
+      const groups = await listEnabledGroupsForModel({ modelId, provider: "codex" });
+      if (groups.length === 0) return null;
+      for (const group of groups) {
+        if (group.kind === "api_relay") {
+          const route = await createCodexRouteContextForModel({
+            containerId,
+            userId,
+            modelId,
+            groupId: group.id,
+          });
+          if (!route) continue;
+          return {
+            kind: "api_relay" as const,
+            token: route.token,
+            baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
+            modelProvider: route.credential.model_provider,
+            providerName: route.credential.provider_name,
+            wireApi: route.credential.wire_api,
+            preferredAuthMethod: route.credential.preferred_auth_method,
+            disableResponseStorage: route.credential.disable_response_storage,
+            groupId: route.group.id.toString(),
+            credentialId: route.credential.id.toString(),
+          };
+        }
+        if (group.kind === "official_oauth") {
+          const hasAccount = await hasActiveOfficialOAuthAccountInGroup(group.id, "codex");
+          if (!hasAccount) continue;
+          return { kind: "official_oauth" as const, groupId: group.id.toString() };
+        }
+      }
+      return { kind: "unavailable" as const, reason: "no usable enabled Codex group" };
     },
     expireCodexRoute: async (token) => {
       await expireCodexRouteContext(token);
