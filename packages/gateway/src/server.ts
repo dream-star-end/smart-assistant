@@ -100,6 +100,11 @@ import {
   OPENCLAUDE_VISION_TOOLS,
   shouldEnableOpenClaudeVision,
 } from './mcpVisionServer.js'
+import {
+  handleV3CodexRelayLocal,
+  readV3CodexRelayConfig,
+  V3_CODEX_RELAY_PREFIX,
+} from './v3CodexRelay.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
@@ -1447,6 +1452,28 @@ export class Gateway {
         this.log.info('http', { method, path, status: res.statusCode, durationMs: duration })
       }
     })
+
+
+    // v3 commercial Codex local relay. Codex CLI uses Authorization for its
+    // upstream token, so the container gateway must translate it into a
+    // private header and authenticate to master with OPENCLAUDE_V3_CONTAINER_TOKEN.
+    // The handler is loopback-only; other bridge containers cannot use it.
+    if (url.pathname === V3_CODEX_RELAY_PREFIX || url.pathname.startsWith(`${V3_CODEX_RELAY_PREFIX}/`)) {
+      const relayCfg = readV3CodexRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'CODEX_RELAY_NOT_CONFIGURED', message: 'codex relay not configured' } })
+        return
+      }
+      handleV3CodexRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v3 codex local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'codex relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
 
     // ── Multi-user login (no auth required, rate-limited) ──
     if (url.pathname === '/api/auth/login' && req.method === 'POST') {
