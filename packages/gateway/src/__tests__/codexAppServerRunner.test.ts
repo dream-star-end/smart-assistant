@@ -452,9 +452,44 @@ describe('handleNotification — plan and reasoning deltas', () => {
 
     assert.equal(h.messages.length, 2)
     assert.equal(h.messages[1].type, 'openclaude_plan')
-    assert.equal(h.messages[1].plan.blockId, 'codex-plan')
+    assert.equal(h.messages[1].plan.blockId, 'p-1')
     assert.equal(h.messages[1].plan.text, '1. inspect\n2. patch')
     assert.equal(h.messages[1].plan.partial, true)
+    await h.cleanup()
+  })
+
+  it('item/started plan records native plan id without emitting a generic tool card', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-plan'
+    ;(h.runner as any).threadId = 'thr-plan'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr-plan',
+        turnId: 't-plan',
+        item: { id: 'plan-1', type: 'plan', text: '' },
+      },
+    })
+
+    assert.equal(h.messages.length, 0)
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thr-plan',
+        turnId: 't-plan',
+        explanation: 'native plan',
+        plan: [{ step: 'inspect', status: 'pending' }],
+      },
+    })
+
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'openclaude_plan')
+    assert.equal(h.messages[0].plan.blockId, 'plan-1')
+    assert.equal(h.messages[0].plan.explanation, 'native plan')
     await h.cleanup()
   })
 
@@ -487,6 +522,60 @@ describe('handleNotification — plan and reasoning deltas', () => {
       { step: 'run tests', status: 'pending' },
     ])
     assert.equal(h.messages[0].plan.partial, true)
+    await h.cleanup()
+  })
+
+  it('item/completed plan finalizes the native plan card with full text', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-plan'
+    ;(h.runner as any).threadId = 'thr-plan'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr-plan',
+        turnId: 't-plan',
+        item: { id: 'plan-final', type: 'plan', text: '' },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/plan/delta',
+      params: {
+        threadId: 'thr-plan',
+        turnId: 't-plan',
+        itemId: 'plan-final',
+        delta: '# Draft\n\n- partial',
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-plan',
+        turnId: 't-plan',
+        item: {
+          id: 'plan-final',
+          type: 'plan',
+          text: '# Full plan\n\n- complete',
+        },
+      },
+    })
+
+    await new Promise((r) => setImmediate(r))
+    const plans = h.messages.filter((m) => m.type === 'openclaude_plan')
+    assert.equal(plans.length, 2)
+    assert.equal(plans[0].plan.blockId, 'plan-final')
+    assert.equal(plans[0].plan.partial, true)
+    assert.equal(plans[0].plan.text, '# Draft\n\n- partial')
+    assert.equal(plans[1].plan.blockId, 'plan-final')
+    assert.equal(plans[1].plan.partial, false)
+    assert.equal(plans[1].plan.text, '# Full plan\n\n- complete')
+    assert.equal(
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.type === 'tool_result'),
+      false,
+    )
     await h.cleanup()
   })
 

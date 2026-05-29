@@ -114,6 +114,31 @@ interface PendingRequest {
   method: string
 }
 
+type CodexPlanStep = { step: string; status: 'pending' | 'inProgress' | 'completed' }
+
+function normalizeCodexPlanSteps(raw: unknown): CodexPlanStep[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((s) => {
+      const obj = s && typeof s === 'object' ? (s as Record<string, unknown>) : {}
+      const step = typeof obj.step === 'string' ? obj.step : ''
+      const status = obj.status
+      if (!step) return null
+      return {
+        step,
+        status:
+          status === 'inProgress' || status === 'completed' || status === 'pending'
+            ? status
+            : 'pending',
+      } as const
+    })
+    .filter((s): s is CodexPlanStep => Boolean(s))
+}
+
+function codexPlanBlockId(rawId: unknown, fallback = 'codex-plan'): string {
+  return typeof rawId === 'string' && rawId.length > 0 ? rawId : fallback
+}
+
 /** Structured error produced by `sendRequest` when codex replies with a
  *  JSON-RPC error frame. Callers can branch on `rpcCode` / `rpcMessage` /
  *  `rpcMethod` without re-parsing `message`; the human-readable `message`
@@ -347,7 +372,8 @@ export class CodexAppServerRunner extends EventEmitter {
    *  imageGeneration savedPath emissions against text the model already
    *  surfaced via deltas. */
   private currentAssistantBuf = ''
-  private currentPlanDraft = ''
+  private currentPlanDrafts = new Map<string, string>()
+  private activePlanBlockId: string | null = null
   private reasoningItemsWithDeltas = new Set<string>()
   private conversationMode: 'default' | 'plan' = 'default'
   /** In-flight `handleItemCompleted` promises for the current turn. codex
@@ -924,17 +950,19 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private emitPlanBlock(plan: {
+    blockId?: string
     text?: string
     explanation?: string
-    steps?: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }>
+    steps?: CodexPlanStep[]
     partial?: boolean
   }): void {
+    const { blockId, ...payload } = plan
     this.emit('message', {
       type: 'openclaude_plan',
       session_id: this.threadId,
       plan: {
-        blockId: 'codex-plan',
-        ...plan,
+        blockId: blockId || 'codex-plan',
+        ...payload,
       },
     } as unknown as RunnerMessage)
   }
@@ -992,31 +1020,19 @@ export class CodexAppServerRunner extends EventEmitter {
     if (method === 'item/plan/delta') {
       const delta = typeof p.delta === 'string' ? p.delta : ''
       if (!delta) return
-      this.currentPlanDraft += delta
-      this.emitPlanBlock({ text: this.currentPlanDraft, partial: true })
+      const blockId = codexPlanBlockId(p.itemId, this.activePlanBlockId || 'codex-plan')
+      this.activePlanBlockId = blockId
+      const draft = (this.currentPlanDrafts.get(blockId) || '') + delta
+      this.currentPlanDrafts.set(blockId, draft)
+      this.emitPlanBlock({ blockId, text: draft, partial: true })
       return
     }
     if (method === 'turn/plan/updated') {
+      const blockId = codexPlanBlockId(p.itemId, this.activePlanBlockId || 'codex-plan')
+      this.activePlanBlockId = blockId
       const explanation = typeof p.explanation === 'string' ? p.explanation : undefined
-      const rawSteps = Array.isArray(p.plan) ? p.plan : []
-      const steps = rawSteps
-        .map((s) => {
-          const obj = s && typeof s === 'object' ? (s as Record<string, unknown>) : {}
-          const step = typeof obj.step === 'string' ? obj.step : ''
-          const status = obj.status
-          if (!step) return null
-          return {
-            step,
-            status:
-              status === 'inProgress' || status === 'completed' || status === 'pending'
-                ? status
-                : 'pending',
-          } as const
-        })
-        .filter((s): s is { step: string; status: 'pending' | 'inProgress' | 'completed' } =>
-          Boolean(s),
-        )
-      this.emitPlanBlock({ explanation, steps, partial: true })
+      const steps = normalizeCodexPlanSteps(p.plan)
+      this.emitPlanBlock({ blockId, explanation, steps, partial: true })
       return
     }
     if (method === 'item/started') {
@@ -1104,6 +1120,11 @@ export class CodexAppServerRunner extends EventEmitter {
       })
       return
     }
+    if (itemType === 'plan') {
+      this.activePlanBlockId = itemId
+      if (!this.currentPlanDrafts.has(itemId)) this.currentPlanDrafts.set(itemId, '')
+      return
+    }
     // agentMessage / reasoning are streamed via deltas; nothing to surface
     // here. Other types (mcpToolCall, webSearch, imageGeneration, ...)
     // surface as generic tool_use so the user sees something happened —
@@ -1139,6 +1160,24 @@ export class CodexAppServerRunner extends EventEmitter {
         })
         .join('\n')
       this.emitToolResult(itemId, summary || 'file changes applied', false)
+      return
+    }
+    if (itemType === 'plan') {
+      const blockId = codexPlanBlockId(item.id, this.activePlanBlockId || 'codex-plan')
+      const text = typeof item.text === 'string' ? item.text : ''
+      const explanation = typeof item.explanation === 'string' ? item.explanation : undefined
+      const steps = normalizeCodexPlanSteps(Array.isArray(item.steps) ? item.steps : item.plan)
+      const hadPriorPlan = this.activePlanBlockId === blockId || this.currentPlanDrafts.has(blockId)
+      if (text || explanation || steps.length > 0 || hadPriorPlan) {
+        this.activePlanBlockId = blockId
+        this.emitPlanBlock({
+          blockId,
+          ...(text ? { text } : {}),
+          ...(explanation ? { explanation } : {}),
+          ...(steps.length > 0 ? { steps } : {}),
+          partial: false,
+        })
+      }
       return
     }
     if (itemType === 'imageGeneration') {
@@ -1294,7 +1333,8 @@ export class CodexAppServerRunner extends EventEmitter {
       promptChars: prompt.length,
     })
     this.currentAssistantBuf = ''
-    this.currentPlanDraft = ''
+    this.currentPlanDrafts.clear()
+    this.activePlanBlockId = null
     this.reasoningItemsWithDeltas.clear()
 
     try {
