@@ -592,6 +592,60 @@ describe("provisionV3Container", () => {
     assert.equal(captured.started, 1);
   });
 
+  test("Codex relay env: passes non-secret routing config but never OC_CODEX_API_KEY", async () => {
+    const keys = [
+      "OC_CODEX_MODEL_PROVIDER",
+      "OC_CODEX_PROVIDER_NAME",
+      "OC_CODEX_BASE_URL",
+      "OC_CODEX_WIRE_API",
+      "OC_CODEX_PREFERRED_AUTH_METHOD",
+      "OC_CODEX_DISABLE_RESPONSE_STORAGE",
+      "OC_CODEX_API_KEY",
+    ] as const;
+    const saved = new Map<string, string | undefined>();
+    for (const key of keys) saved.set(key, process.env[key]);
+    try {
+      process.env.OC_CODEX_MODEL_PROVIDER = "api111";
+      process.env.OC_CODEX_PROVIDER_NAME = "Yunwu";
+      process.env.OC_CODEX_BASE_URL = "https://yunwu.ai/v1";
+      process.env.OC_CODEX_WIRE_API = "responses";
+      process.env.OC_CODEX_PREFERRED_AUTH_METHOD = "apikey";
+      process.env.OC_CODEX_DISABLE_RESPONSE_STORAGE = "1";
+      process.env.OC_CODEX_API_KEY = "not-a-real-api-key";
+
+      const { docker, captured } = makeDocker();
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.30.5.43",
+          randomSecret: fixedSecret("b".repeat(64)),
+        },
+        778,
+      );
+
+      const env = captured.containersCreated[0]?.Env ?? [];
+      assert.ok(env.includes("OC_CODEX_MODEL_PROVIDER=api111"));
+      assert.ok(env.includes("OC_CODEX_PROVIDER_NAME=Yunwu"));
+      assert.ok(env.includes("OC_CODEX_BASE_URL=https://yunwu.ai/v1"));
+      assert.ok(env.includes("OC_CODEX_WIRE_API=responses"));
+      assert.ok(env.includes("OC_CODEX_PREFERRED_AUTH_METHOD=apikey"));
+      assert.ok(env.includes("OC_CODEX_DISABLE_RESPONSE_STORAGE=1"));
+      assert.ok(
+        !env.some((entry) => entry.startsWith("OC_CODEX_API_KEY=")),
+        "OC_CODEX_API_KEY must stay in auth.json and out of docker env",
+      );
+    } finally {
+      for (const key of keys) {
+        const prev = saved.get(key);
+        if (prev === undefined) delete process.env[key];
+        else process.env[key] = prev;
+      }
+    }
+  });
+
   test("资源限额 env 覆盖:合法小数 CPU 正确转换 + 非法微值回退默认(Codex round 1 BLOCKER 回归锁)", async () => {
     // Codex round 1 抓到的 bug:OC_V3_MEMORY_MB=0.5 会被 floor 成 0,Docker 当"不限";必须回退默认
     const savedMem = process.env.OC_V3_MEMORY_MB;

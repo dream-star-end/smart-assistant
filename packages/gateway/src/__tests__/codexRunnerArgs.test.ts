@@ -17,7 +17,11 @@ import * as assert from 'node:assert/strict'
  *      as positional resume args.
  */
 import { describe, it } from 'node:test'
-import { buildCodexCliArgs, codexReasoningEffortConfig } from '../codexRunner.js'
+import {
+  buildCodexCliArgs,
+  buildCodexProviderConfigArgs,
+  codexReasoningEffortConfig,
+} from '../codexRunner.js'
 
 describe('buildCodexCliArgs', () => {
   it('fresh-exec path: --full-auto + -c approval_policy="never" + stdin sentinel', () => {
@@ -99,6 +103,60 @@ describe('buildCodexCliArgs', () => {
       args.includes('model_instructions_file="/tmp/x.md"'),
       'platform-context slot must be present after splice',
     )
+  })
+
+  it('providerConfig splices after base flags and before effort/platform overrides', () => {
+    const args = buildCodexCliArgs({
+      effortLevel: 'high',
+      providerConfig: ['-c', 'model_provider="api111"'],
+      extraConfig: ['-c', 'model_instructions_file="/tmp/x.md"'],
+    })
+    const providerIdx = args.indexOf('model_provider="api111"')
+    const effortIdx = args.indexOf('model_reasoning_effort="high"')
+    const extraIdx = args.indexOf('model_instructions_file="/tmp/x.md"')
+    assert.ok(providerIdx >= 0 && effortIdx >= 0 && extraIdx >= 0, args.join(' '))
+    assert.ok(providerIdx < effortIdx, 'relay provider override must precede effort')
+    assert.ok(effortIdx < extraIdx, 'platform context remains the last config override group')
+  })
+
+  it('buildCodexProviderConfigArgs maps OC_CODEX_* env to TOML -c overrides', () => {
+    const args = buildCodexProviderConfigArgs({
+      OC_CODEX_MODEL_PROVIDER: 'api111',
+      OC_CODEX_BASE_URL: 'https://yunwu.ai/v1',
+      OC_CODEX_WIRE_API: 'responses',
+      OC_CODEX_PREFERRED_AUTH_METHOD: 'apikey',
+      OC_CODEX_DISABLE_RESPONSE_STORAGE: '1',
+    })
+    assert.deepEqual(args, [
+      '-c',
+      'model_provider="api111"',
+      '-c',
+      'model_providers.api111.name="api111"',
+      '-c',
+      'model_providers.api111.base_url="https://yunwu.ai/v1"',
+      '-c',
+      'model_providers.api111.wire_api="responses"',
+      '-c',
+      'preferred_auth_method="apikey"',
+      '-c',
+      'disable_response_storage=true',
+    ])
+  })
+
+  it('buildCodexProviderConfigArgs rejects malformed provider ids and honors false storage flag', () => {
+    assert.deepEqual(
+      buildCodexProviderConfigArgs({
+        OC_CODEX_MODEL_PROVIDER: 'bad.provider',
+        OC_CODEX_BASE_URL: 'https://yunwu.ai/v1',
+      }),
+      [],
+    )
+    const args = buildCodexProviderConfigArgs({
+      OC_CODEX_MODEL_PROVIDER: 'api111',
+      OC_CODEX_BASE_URL: 'https://yunwu.ai/v1',
+      OC_CODEX_DISABLE_RESPONSE_STORAGE: 'false',
+    })
+    assert.ok(args.includes('disable_response_storage=false'), args.join(' '))
   })
 
   // ── v1.0.200 — reasoning effort (gpt-5.5 / codex models) ──────────────────

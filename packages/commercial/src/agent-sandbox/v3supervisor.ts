@@ -238,6 +238,29 @@ function readCodexContainerDirFromEnv(): string {
   return raw.trim();
 }
 
+const CODEX_RELAY_CONTAINER_ENV_KEYS = [
+  "OC_CODEX_MODEL_PROVIDER",
+  "OC_CODEX_PROVIDER_NAME",
+  "OC_CODEX_BASE_URL",
+  "OC_CODEX_WIRE_API",
+  "OC_CODEX_PREFERRED_AUTH_METHOD",
+  "OC_CODEX_DISABLE_RESPONSE_STORAGE",
+] as const;
+
+/**
+ * Pass only non-secret Codex relay routing knobs into user containers.
+ *
+ * OC_CODEX_API_KEY intentionally is NOT whitelisted: Codex reads the key from
+ * the existing ro auth.json mount, so the secret does not appear in docker
+ * inspect / process env.
+ */
+function appendCodexRelayEnv(env: string[]): void {
+  for (const key of CODEX_RELAY_CONTAINER_ENV_KEYS) {
+    const value = process.env[key]?.trim();
+    if (value) env.push(`${key}=${value}`);
+  }
+}
+
 /**
  * 宿主侧远程执行 mux 目录 per-user 分片根。
  *
@@ -1691,6 +1714,7 @@ export async function provisionV3Container(
       // 行为(FILE_ALLOWED_DIRS + TEMP_PREFIX + agent_cwd MEDIA_EXTENSIONS)。
       "OC_V3_TRUSTED_FILE_SERVE=1",
     ];
+    appendCodexRelayEnv(env);
 
     // v3 file proxy:bridgeSecret 就位 → 注入 OC_CONTAINER_ID + OC_BRIDGE_NONCE。
     // 容器内 gateway 靠这两个 env 做 bridge bypass 校验 + /healthz capability 广播。
