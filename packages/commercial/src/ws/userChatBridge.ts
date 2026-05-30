@@ -1860,6 +1860,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             //
             //   codexBillingEnabled=false(测试 / 个人版上下文,三件套未注入)→ 走
             //   下方 else 分支:仍 rewrite 注入 traceId(CG2a 合同硬门),只是不动 requestId。
+            const codexRouteFrame = codexRoute !== null ? {
+              baseUrl: codexRoute.baseUrl,
+              modelProvider: codexRoute.modelProvider,
+              providerName: codexRoute.providerName ?? null,
+              wireApi: codexRoute.wireApi ?? "responses",
+              preferredAuthMethod: codexRoute.preferredAuthMethod ?? "apikey",
+              disableResponseStorage: codexRoute.disableResponseStorage ?? true,
+            } : officialOAuthGroupId !== null ? {
+              kind: "official_oauth" as const,
+            } : null;
             let frameForwardData: RawData;
             const frameForwardIsBinary = false;
             let frameForwardLen: number;
@@ -2067,16 +2077,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ...enrichedParsed,
                 requestId,
                 traceId: turnTraceIdCapture,
-                ...(codexRoute !== null ? {
-                  __oc_codex_route: {
-                    baseUrl: codexRoute.baseUrl,
-                    modelProvider: codexRoute.modelProvider,
-                    providerName: codexRoute.providerName ?? null,
-                    wireApi: codexRoute.wireApi ?? "responses",
-                    preferredAuthMethod: codexRoute.preferredAuthMethod ?? "apikey",
-                    disableResponseStorage: codexRoute.disableResponseStorage ?? true,
-                  },
-                } : {}),
+                ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -2117,16 +2118,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const rewrittenObj = {
                 ...enrichedParsed,
                 traceId: turnTraceIdCapture,
-                ...(codexRoute !== null ? {
-                  __oc_codex_route: {
-                    baseUrl: codexRoute.baseUrl,
-                    modelProvider: codexRoute.modelProvider,
-                    providerName: codexRoute.providerName ?? null,
-                    wireApi: codexRoute.wireApi ?? "responses",
-                    preferredAuthMethod: codexRoute.preferredAuthMethod ?? "apikey",
-                    disableResponseStorage: codexRoute.disableResponseStorage ?? true,
-                  },
-                } : {}),
+                ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);

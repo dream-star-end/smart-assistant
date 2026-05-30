@@ -105,6 +105,7 @@ import {
   readV3CodexRelayConfig,
   V3_CODEX_RELAY_PREFIX,
 } from './v3CodexRelay.js'
+import type { CodexProviderConfigOverride } from './codexRunner.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
@@ -193,6 +194,76 @@ export function collectAvailableMcpToolNames(
   }
 
   return [...tools]
+}
+
+/**
+ * Parse the master-owned Codex per-turn route override from an inbound frame.
+ *
+ * Contract:
+ * - API relay groups carry a localhost relay URL + modelProvider and become
+ *   launch-time Codex provider overrides.
+ * - official_oauth groups carry only `{ kind: 'official_oauth' }` and become
+ *   an explicit empty override. That empty object is important: it tells the
+ *   Codex runner "do not inherit process.env OC_CODEX_* relay defaults" while
+ *   still preserving the normal official OAuth auth.json path.
+ */
+export function _buildSafeCodexRouteOverride(args: {
+  agentProvider?: string
+  model?: string
+  rawRoute: unknown
+}): CodexProviderConfigOverride | null {
+  if (
+    args.agentProvider !== 'codex-native' ||
+    !args.model?.startsWith('gpt-') ||
+    !args.rawRoute ||
+    typeof args.rawRoute !== 'object' ||
+    Array.isArray(args.rawRoute)
+  ) {
+    return null
+  }
+
+  const r = args.rawRoute as Record<string, unknown>
+  if (r.kind === 'official_oauth') {
+    // Exact-shape marker only. A malformed/client-shaped object such as
+    // `{ kind: 'official_oauth', baseUrl: ... }` must not be reinterpreted as
+    // the empty override sentinel.
+    return Object.keys(r).length === 1 ? {} : null
+  }
+
+  let routeBaseUrlOk = false
+  if (typeof r.baseUrl === 'string') {
+    try {
+      const parsedRouteBase = new URL(r.baseUrl)
+      routeBaseUrlOk =
+        parsedRouteBase.protocol === 'http:' &&
+        parsedRouteBase.hostname === '127.0.0.1' &&
+        parsedRouteBase.pathname.startsWith('/internal/v3/codex-relay/route/')
+    } catch {
+      routeBaseUrlOk = false
+    }
+  }
+
+  if (
+    typeof r.baseUrl === 'string' &&
+    routeBaseUrlOk &&
+    typeof r.modelProvider === 'string' &&
+    /^[A-Za-z0-9_-]+$/.test(r.modelProvider)
+  ) {
+    return {
+      baseUrl: r.baseUrl,
+      modelProvider: r.modelProvider,
+      providerName: typeof r.providerName === 'string' ? r.providerName : null,
+      wireApi: r.wireApi === 'responses' || r.wireApi === 'chat' ? r.wireApi : null,
+      preferredAuthMethod:
+        r.preferredAuthMethod === 'apikey' || r.preferredAuthMethod === 'chatgpt'
+          ? r.preferredAuthMethod
+          : null,
+      disableResponseStorage:
+        typeof r.disableResponseStorage === 'boolean' ? r.disableResponseStorage : null,
+    }
+  }
+
+  return null
 }
 
 // ─── handleUpload TOCTOU hardening test seam (v3 commercial v1.0.155) ───────
@@ -6399,57 +6470,11 @@ export class Gateway {
         ? _frameRequestId
         : undefined
 
-    const _rawCodexRoute = (frame as any).__oc_codex_route
-    let safeCodexRoute:
-      | {
-          modelProvider?: string
-          baseUrl?: string
-          providerName?: string | null
-          wireApi?: string | null
-          preferredAuthMethod?: string | null
-          disableResponseStorage?: boolean | null
-        }
-      | null = null
-    if (
-      agent.provider === 'codex-native' &&
-      safeModelForRouting?.startsWith('gpt-') &&
-      _rawCodexRoute &&
-      typeof _rawCodexRoute === 'object' &&
-      !Array.isArray(_rawCodexRoute)
-    ) {
-      const r = _rawCodexRoute as Record<string, unknown>
-      let routeBaseUrlOk = false
-      if (typeof r.baseUrl === 'string') {
-        try {
-          const parsedRouteBase = new URL(r.baseUrl)
-          routeBaseUrlOk =
-            parsedRouteBase.protocol === 'http:' &&
-            parsedRouteBase.hostname === '127.0.0.1' &&
-            parsedRouteBase.pathname.startsWith('/internal/v3/codex-relay/route/')
-        } catch {
-          routeBaseUrlOk = false
-        }
-      }
-      if (
-        typeof r.baseUrl === 'string' &&
-        routeBaseUrlOk &&
-        typeof r.modelProvider === 'string' &&
-        /^[A-Za-z0-9_-]+$/.test(r.modelProvider)
-      ) {
-        safeCodexRoute = {
-          baseUrl: r.baseUrl,
-          modelProvider: r.modelProvider,
-          providerName: typeof r.providerName === 'string' ? r.providerName : null,
-          wireApi: r.wireApi === 'responses' || r.wireApi === 'chat' ? r.wireApi : null,
-          preferredAuthMethod:
-            r.preferredAuthMethod === 'apikey' || r.preferredAuthMethod === 'chatgpt'
-              ? r.preferredAuthMethod
-              : null,
-          disableResponseStorage:
-            typeof r.disableResponseStorage === 'boolean' ? r.disableResponseStorage : null,
-        }
-      }
-    }
+    const safeCodexRoute = _buildSafeCodexRouteOverride({
+      agentProvider: agent.provider,
+      model: safeModelForRouting,
+      rawRoute: (frame as any).__oc_codex_route,
+    })
 
     const session = await this.sessions.getOrCreate({
       sessionKey,
