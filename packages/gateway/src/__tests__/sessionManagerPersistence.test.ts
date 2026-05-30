@@ -23,6 +23,8 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 import { SessionManager, type AgentSession } from "../sessionManager.js";
+import { buildCodexProviderConfigArgs, type CodexProviderConfigOverride } from "../codexRunner.js";
+import { _buildSafeCodexRouteOverride } from "../server.js";
 import type { OpenClaudeConfig } from "@openclaude/storage";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────
@@ -258,5 +260,111 @@ describe("SessionManager Codex route turn scoping", () => {
 
     assert.deepEqual(seenByTurns, ["route_a", "route_b"]);
     assert.deepEqual(appliedRoutes, ["route_a", "route_b"]);
+  });
+
+  test("official OAuth marker applies an empty route override that suppresses env relay defaults", async () => {
+    const route = _buildSafeCodexRouteOverride({
+      agentProvider: "codex-native",
+      model: "gpt-5.5",
+      rawRoute: { kind: "official_oauth" },
+    });
+    assert.deepEqual(route, {});
+    assert.equal(
+      _buildSafeCodexRouteOverride({
+        agentProvider: "codex-native",
+        model: "gpt-5.5",
+        rawRoute: {
+          kind: "official_oauth",
+          baseUrl: "http://127.0.0.1:18789/internal/v3/codex-relay/route/not-a-marker",
+        },
+      }),
+      null,
+      "official_oauth marker must be exact-shape, not a malformed relay route",
+    );
+    assert.equal(
+      _buildSafeCodexRouteOverride({
+        agentProvider: "claude-code",
+        model: "gpt-5.5",
+        rawRoute: { kind: "official_oauth" },
+      }),
+      null,
+      "marker is ignored outside codex-native agents",
+    );
+
+    const sm = new SessionManager(makeConfigStub());
+    let appliedRoute: CodexProviderConfigOverride | null | "unset" = "unset";
+    const seenByTurn: Array<CodexProviderConfigOverride | null | "unset"> = [];
+    const runner = {
+      model: "gpt-5.5" as string | undefined,
+      effortLevel: undefined as string | undefined,
+      lastActivityAt: Date.now(),
+      setConversationMode(_mode: "default" | "plan") {},
+      setCodexRoute(nextRoute: CodexProviderConfigOverride | null) {
+        appliedRoute = nextRoute;
+      },
+      setModel(model: string | undefined) { this.model = model; },
+      setEffortLevel(level: string | undefined) { this.effortLevel = level; },
+      setTraceId(_traceId: string) {},
+      async shutdown() {},
+      interrupt() {},
+    };
+    const session = {
+      sessionKey: "agent:codex:webchat:peer-official",
+      agentId: "codex",
+      channel: "webchat",
+      peerId: "peer-official",
+      title: "Codex",
+      startedAt: Date.now(),
+      runner,
+      ccbSessionId: null,
+      lock: Promise.resolve(),
+      lastUsedAt: 0,
+      totalCostUSD: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreationTokens: 0,
+      turns: 1,
+      _lastCcbCumulativeCost: 0,
+      toolUseIdToName: new Map(),
+      executionTarget: { kind: "local" },
+      providerTag: "codex-native",
+      agentProvider: "codex-native",
+    } as unknown as AgentSession;
+
+    (sm as unknown as {
+      runOneTurnWithRetry: (...args: unknown[]) => Promise<void>;
+    }).runOneTurnWithRetry = async () => {
+      seenByTurn.push(appliedRoute);
+    };
+
+    await sm.submit(
+      session,
+      "official oauth",
+      () => {},
+      undefined,
+      "gpt-5.5",
+      undefined,
+      undefined,
+      undefined,
+      { codexRoute: route },
+    );
+
+    assert.deepEqual(seenByTurn, [{}]);
+    assert.deepEqual(
+      buildCodexProviderConfigArgs(
+        {
+          OC_CODEX_MODEL_PROVIDER: "api111",
+          OC_CODEX_BASE_URL: "https://yunwu.ai/v1",
+          OC_CODEX_PROVIDER_NAME: "Yunwu",
+          OC_CODEX_WIRE_API: "responses",
+          OC_CODEX_PREFERRED_AUTH_METHOD: "apikey",
+          OC_CODEX_DISABLE_RESPONSE_STORAGE: "1",
+        },
+        seenByTurn[0] as CodexProviderConfigOverride,
+      ),
+      [],
+      "empty override must suppress OC_CODEX_* relay argv",
+    );
   });
 });

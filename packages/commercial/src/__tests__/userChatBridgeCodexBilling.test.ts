@@ -794,7 +794,11 @@ describe("userChatBridge / codex relay — official OAuth group marker", () => {
 
     assert.equal(rig.binding.acquireCalls, 1);
     assert.deepEqual(rig.binding.acquireGroupIds, ["42"]);
-    assert.equal(parsed.__oc_codex_route, undefined, "official OAuth path must not inject API relay route");
+    assert.deepEqual(
+      parsed.__oc_codex_route,
+      { kind: "official_oauth" },
+      "official OAuth path must inject the env-relay suppression marker",
+    );
 
     containerWs.send(JSON.stringify({
       type: "outbound.codex_billing",

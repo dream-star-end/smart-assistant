@@ -213,6 +213,21 @@ describe('buildCodexCliArgs', () => {
     ])
   })
 
+  it('buildCodexProviderConfigArgs treats empty override as official OAuth and ignores env relay defaults', () => {
+    const args = buildCodexProviderConfigArgs(
+      {
+        OC_CODEX_MODEL_PROVIDER: 'api111',
+        OC_CODEX_BASE_URL: 'https://yunwu.ai/v1',
+        OC_CODEX_PROVIDER_NAME: 'Yunwu',
+        OC_CODEX_WIRE_API: 'responses',
+        OC_CODEX_PREFERRED_AUTH_METHOD: 'apikey',
+        OC_CODEX_DISABLE_RESPONSE_STORAGE: '1',
+      },
+      {},
+    )
+    assert.deepEqual(args, [])
+  })
+
   it('buildCodexProviderConfigArgs rejects malformed provider ids and honors false storage flag', () => {
     assert.deepEqual(
       buildCodexProviderConfigArgs({
