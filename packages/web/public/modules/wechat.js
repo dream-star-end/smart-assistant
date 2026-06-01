@@ -15,9 +15,9 @@
 // service (api.qrserver.com, etc.) would let third parties hijack the pair
 // handshake, so we never leave the page with that value.
 
-import { apiGet, apiJson } from './api.js?v=a943358c'
-import { $ } from './dom.js?v=a943358c'
-import { closeModal, openModal, toast } from './ui.js?v=a943358c'
+import { apiGet, apiJson } from './api.js?v=eaaa34ed'
+import { $ } from './dom.js?v=eaaa34ed'
+import { closeModal, openModal, toast } from './ui.js?v=eaaa34ed'
 
 let _pollAbort = null
 let _currentQrcode = null
