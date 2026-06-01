@@ -584,8 +584,9 @@ describe("renderWechatBlocks pure function", () => {
   test("text block > 1024 chars splits into multiple parts", () => {
     const long = "a".repeat(2050)
     const r = renderWechatBlocks([{ kind: "text", text: long }])
-    assert.equal(r.parts.length, 3) // 1024 + 1024 + 2
-    assert.equal(r.parts[0]!.text.length, 1024)
+    assert.equal(r.parts.length, 3)
+    assert.match(r.parts[0]!.text, /^（1\/3）\n/)
+    assert.ok(r.parts.every((part) => part.text.length <= 1024))
   })
 
   test("tool_use block → tool announcement (single text part)", () => {

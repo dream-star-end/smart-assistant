@@ -135,6 +135,26 @@ export function splitText(text: string, max: number): string[] {
   return out
 }
 
+export function splitTextForWechatPages(text: string, max: number): string[] {
+  const firstPass = splitText(text, max)
+  if (firstPass.length <= 1) return firstPass
+
+  let total = firstPass.length
+  for (;;) {
+    const reserve = pagePrefix(total, total).length
+    if (reserve >= max) throw new Error(`splitTextForWechatPages: page prefix exceeds max=${max}`)
+    const chunks = splitText(text, max - reserve)
+    if (chunks.length === total) {
+      return chunks.map((chunk, idx) => `${pagePrefix(idx + 1, total)}${chunk}`)
+    }
+    total = chunks.length
+  }
+}
+
+function pagePrefix(page: number, total: number): string {
+  return `（${page}/${total}）\n`
+}
+
 /**
  * 把 raw assistant 文本(markdown)渲染成 IlinkPart[]。空串/null/undefined 返回 []。
  *
@@ -149,7 +169,7 @@ export function renderAssistantText(rawMarkdown: string | null | undefined): Ili
   const displayText = friendlyProviderErrorForWechat(raw) ?? raw
   const cleaned = sanitizeForWechat(displayText)
   if (cleaned.length === 0) return []
-  return splitText(cleaned, WECHAT_MAX_TEXT).map((text) => ({ type: "text", text }))
+  return splitTextForWechatPages(cleaned, WECHAT_MAX_TEXT).map((text) => ({ type: "text", text }))
 }
 
 /**

@@ -208,6 +208,7 @@ interface BaseDepsOverrides {
   dispatcher?: InboundDispatcher
   outboundReceiver?: OutboundReceiverHandler
   sendText?: SendTextFn
+  wechatUxCommands?: BrokerDeps["wechatUxCommands"]
   getBinding?: GetBindingFn
   allMasterWsessRows?: BrokerDeps["allMasterWsessRows"]
   softDeleteMasterSession?: BrokerDeps["softDeleteMasterSession"]
@@ -241,6 +242,7 @@ function makeDeps(overrides: BaseDepsOverrides = {}): BrokerDeps {
     allMasterWsessRows,
     softDeleteMasterSession,
     sendText,
+    wechatUxCommands: overrides.wechatUxCommands,
     getBinding,
     brokerEnabled,
     now: overrides.now ?? (() => FIXED_NOW),
@@ -679,6 +681,45 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(dispSpy.calls.length, 0)
   })
 
+  test("duplicate audit drops /model before local command handler runs", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    let modelCommandCalls = 0
+    const pool = {
+      query: async (sql: string) => {
+        if (/SELECT 1 FROM wechat_audit/i.test(sql)) return { rows: [{ "?column?": 1 }], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      },
+      connect: async () => ({
+        query: async () => ({ rows: [], rowCount: 0 }),
+        release: () => {},
+      }),
+    } as unknown as Pool
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        pool,
+        wechatUxCommands: {
+          handleModelCommand: async () => {
+            modelCommandCalls++
+            return "should not run"
+          },
+        },
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({
+      text: "/model",
+      accountId: "acct-audit",
+      messageId: "msg-dupe",
+    }))
+    assert.equal(r.kind, "duplicate_audit")
+    assert.equal(dispSpy.calls.length, 0)
+    assert.equal(modelCommandCalls, 0)
+  })
+
   test("audit insert is committed after successful dispatch and uses raw digit binding_user_id", async () => {
     const events: Array<{ kind: "sql"; sql: string; params?: ReadonlyArray<unknown> } | { kind: "dispatch" }> = []
     const pool = {
@@ -719,6 +760,93 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(audit!.params?.[0], "42")
     assert.equal(audit!.params?.[1], "acct-audit-ok")
     assert.equal(audit!.params?.[3], "msg-ok")
+  })
+
+  test("broker-local /help reflects rich WeChat help and skips dispatcher", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "/help" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") {
+      assert.match(r.reply, /\/model 2/)
+    }
+    assert.equal(dispSpy.calls.length, 0)
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /微信里可以这样用 OpenClaude/)
+  })
+
+  test("broker-local /model delegates to model command deps, reflects reply, skips dispatcher", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const seenTexts: string[] = []
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        sendText,
+        wechatUxCommands: {
+          handleModelCommand: async (evt) => {
+            seenTexts.push(evt.text)
+            return "模型列表: 1. Sonnet"
+          },
+        },
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({ text: "/model 1" }))
+    assert.equal(r.kind, "command_echo")
+    assert.deepEqual(seenTexts, ["/model 1"])
+    assert.equal(dispSpy.calls.length, 0)
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls[0]!.text, "模型列表: 1. Sonnet")
+  })
+
+  test("broker-local /model resolver failure returns friendly fallback, not dispatcher", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        wechatUxCommands: {
+          handleModelCommand: async () => {
+            throw new Error("pricing db down")
+          },
+        },
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({ text: "/model" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") {
+      assert.match(r.reply, /暂时无法读取模型列表/)
+    }
+    assert.equal(dispSpy.calls.length, 0)
+  })
+
+  test("non-text-only inbound gets friendly prompt and skips dispatcher", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher }))
+    const r = await broker.onInbound(makeEvent({ text: "", itemTypes: "image" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") {
+      assert.match(r.reply, /收到了一条图片消息/)
+      assert.match(r.reply, /主要支持文字对话/)
+    }
+    assert.equal(dispSpy.calls.length, 0)
   })
 
   test("dispatcher failure does not commit audit row, so redelivery can retry", async () => {

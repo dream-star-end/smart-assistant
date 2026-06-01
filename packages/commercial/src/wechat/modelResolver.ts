@@ -2,6 +2,13 @@ import { ALLOWED_INBOUND_MODELS } from "@openclaude/gateway"
 
 export interface WechatVisibleModel {
   id: string
+  display_name?: string
+  displayName?: string
+}
+
+export interface WechatInboundModelOption {
+  id: string
+  displayName: string
 }
 
 export interface PickWechatInboundModelArgs {
@@ -31,8 +38,37 @@ export function pickWechatInboundModel(args: PickWechatInboundModelArgs): string
     return preferred
   }
 
-  for (const model of args.visibleModels) {
-    if (allowed.has(model.id) && args.canUseModel(model.id)) return model.id
-  }
+  const fallback = listWechatInboundModels(args)[0]
+  if (fallback) return fallback.id
   return null
+}
+
+export function listWechatInboundModels(args: PickWechatInboundModelArgs): WechatInboundModelOption[] {
+  const allowed = args.allowedModels ?? ALLOWED_INBOUND_MODELS
+  const out: WechatInboundModelOption[] = []
+  const seen = new Set<string>()
+  for (const model of args.visibleModels) {
+    if (seen.has(model.id)) continue
+    seen.add(model.id)
+    if (!allowed.has(model.id)) continue
+    if (!args.canUseModel(model.id)) continue
+    out.push({
+      id: model.id,
+      displayName: model.displayName ?? model.display_name ?? model.id,
+    })
+  }
+  return out
+}
+
+export function pickWechatModelByUserInput(
+  rawInput: string,
+  models: readonly WechatInboundModelOption[],
+): WechatInboundModelOption | null {
+  const input = rawInput.trim()
+  if (!input) return null
+  if (/^[1-9][0-9]*$/.test(input)) {
+    const idx = Number(input) - 1
+    return models[idx] ?? null
+  }
+  return models.find((m) => m.id === input) ?? null
 }

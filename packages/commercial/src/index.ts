@@ -34,7 +34,7 @@ import { secretToKey } from "./auth/jwt.js";
 import { PricingCache, createModelHintProvider } from "./billing/pricing.js";
 import { canUseModel } from "./billing/authzModels.js";
 import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider } from "@openclaude/gateway";
-import { getPreferences } from "./user/preferences.js";
+import { getPreferences, patchPreferences } from "./user/preferences.js";
 import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 import {
   getPhase6AccountUuidEnforce,
@@ -158,6 +158,7 @@ import {
   type PlatformPromptSlotsHandler,
 } from "./http/internalPlatformPromptSlots.js";
 import { makeInboundDispatcher } from "./wechat/inboundDispatcher.js";
+import { handleWechatModelCommand } from "./wechat/modelCommand.js";
 import { pickWechatInboundModel } from "./wechat/modelResolver.js";
 import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
 import { makeIlinkSendAdapter } from "./wechat/ilinkSendAdapter.js";
@@ -1978,6 +1979,27 @@ export async function registerCommercial(
         await softDeleteMasterSession(sessionId, userId);
       },
       sendText: ilinkSendText,
+      wechatUxCommands: {
+        handleModelCommand: async (evt) => {
+          const uid = BigInt(evt.bindingUserId);
+          const [prefs, authz] = await Promise.all([
+            getPreferences(uid),
+            loadUserModelAuthz(uid),
+          ]);
+
+          return await handleWechatModelCommand({
+            text: evt.text,
+            preferredModel: prefs.prefs.default_model,
+            visibleModels: pricing.listForUser(authz),
+            canUseModel: (modelId) =>
+              canUseModel({ pricing }, { ...authz, modelId }),
+            allowedModels: ALLOWED_INBOUND_MODELS,
+            setDefaultModel: async (modelId) => {
+              await patchPreferences(uid, { default_model: modelId });
+            },
+          });
+        },
+      },
       // 读 master sqlite wechat_bindings 拿 botToken + contextTokens 给 outboxWorker。
       // 失败 / 不存在 → 返 null,worker 该 row 走 permanent(无可恢复 token)。
       getBinding: async (bindingUserId) => {

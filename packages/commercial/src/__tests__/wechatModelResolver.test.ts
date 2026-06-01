@@ -1,7 +1,11 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import { pickWechatInboundModel } from "../wechat/modelResolver.js"
+import {
+  listWechatInboundModels,
+  pickWechatInboundModel,
+  pickWechatModelByUserInput,
+} from "../wechat/modelResolver.js"
 
 const allowed = new Set(["claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.5"])
 
@@ -44,5 +48,41 @@ describe("pickWechatInboundModel", () => {
       allowedModels: allowed,
     })
     assert.equal(picked, "gpt-5.5")
+  })
+})
+
+describe("listWechatInboundModels", () => {
+  test("filters visible models by gateway allowlist and canUseModel while preserving display names", () => {
+    const models = listWechatInboundModels({
+      preferredModel: undefined,
+      visibleModels: [
+        { id: "claude-haiku-4-5", display_name: "Haiku" },
+        { id: "claude-sonnet-4-6", display_name: "Sonnet" },
+        { id: "gpt-5.5", displayName: "GPT 5.5" },
+      ],
+      canUseModel: (id) => id !== "gpt-5.5",
+      allowedModels: allowed,
+    })
+    assert.deepEqual(models, [{ id: "claude-sonnet-4-6", displayName: "Sonnet" }])
+  })
+})
+
+describe("pickWechatModelByUserInput", () => {
+  const models = [
+    { id: "claude-opus-4-7", displayName: "Opus" },
+    { id: "claude-sonnet-4-6", displayName: "Sonnet" },
+  ]
+
+  test("selects by 1-based index", () => {
+    assert.equal(pickWechatModelByUserInput("2", models)?.id, "claude-sonnet-4-6")
+  })
+
+  test("selects by exact model id", () => {
+    assert.equal(pickWechatModelByUserInput("claude-opus-4-7", models)?.displayName, "Opus")
+  })
+
+  test("returns null for out-of-range or unknown input", () => {
+    assert.equal(pickWechatModelByUserInput("3", models), null)
+    assert.equal(pickWechatModelByUserInput("claude-haiku-4-5", models), null)
   })
 })

@@ -14,6 +14,7 @@ import {
   friendlyToolName,
   sanitizeForWechat,
   splitText,
+  splitTextForWechatPages,
   friendlyProviderErrorForWechat,
   renderAssistantText,
   renderToolAnnouncement,
@@ -129,6 +130,22 @@ describe("rendererPipeline.splitText", () => {
   })
 })
 
+describe("rendererPipeline.splitTextForWechatPages", () => {
+  test("single chunk is unchanged", () => {
+    assert.deepEqual(splitTextForWechatPages("hello", 100), ["hello"])
+  })
+
+  test("multiple chunks get page counters while honoring max length", () => {
+    const out = splitTextForWechatPages("a".repeat(250), 100)
+    assert.equal(out.length, 3)
+    assert.match(out[0]!, /^（1\/3）\n/)
+    assert.match(out[1]!, /^（2\/3）\n/)
+    assert.match(out[2]!, /^（3\/3）\n/)
+    assert.ok(out.every((part) => part.length <= 100))
+    assert.equal(out.map((part) => part.replace(/^（\d+\/\d+）\n/, "")).join(""), "a".repeat(250))
+  })
+})
+
 describe("rendererPipeline.renderAssistantText", () => {
   test("plain text → single text part", () => {
     const parts = renderAssistantText("hello world")
@@ -154,9 +171,14 @@ describe("rendererPipeline.renderAssistantText", () => {
     const long = "a".repeat(WECHAT_MAX_TEXT * 2 + 5)
     const parts = renderAssistantText(long)
     assert.equal(parts.length, 3)
-    assert.equal(parts[0]!.text.length, WECHAT_MAX_TEXT)
-    assert.equal(parts[1]!.text.length, WECHAT_MAX_TEXT)
-    assert.equal(parts[2]!.text.length, 5)
+    assert.match(parts[0]!.text, /^（1\/3）\n/)
+    assert.match(parts[1]!.text, /^（2\/3）\n/)
+    assert.match(parts[2]!.text, /^（3\/3）\n/)
+    assert.ok(parts.every((part) => part.text.length <= WECHAT_MAX_TEXT))
+    assert.equal(
+      parts.map((part) => part.text.replace(/^（\d+\/\d+）\n/, "")).join(""),
+      long,
+    )
   })
 
   test("empty / null / undefined → empty array (no zero-length part)", () => {
