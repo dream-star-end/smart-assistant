@@ -20,6 +20,7 @@ export * from './pairing.js'
 // path. Required by S12a composite project boundary.
 export * from './iLink.js'
 export * from './iLinkImage.js'
+export * from './iLinkMedia.js'
 
 // Re-export storage types for convenience in callers
 export type { WechatBinding } from '@openclaude/storage'

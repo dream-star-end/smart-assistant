@@ -452,6 +452,8 @@ export interface CommercialHook {
       messageId?: string
       itemTypes?: string
       rawPayload?: unknown
+      imageAttachments?: unknown[]
+      mediaAttachments?: unknown[]
       idempotencyKey: string
       receivedAt: number
       channel?: 'wechat'

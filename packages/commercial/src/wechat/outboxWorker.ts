@@ -30,7 +30,8 @@ import {
   purgeSentTombstones,
   releaseStaleSending,
 } from './outboxStore.js'
-import type { IlinkPart, OutboxRow } from './types.js'
+import type { IlinkMediaPart, IlinkPart, OutboxRow } from './types.js'
+import type { ResolveOutboundMediaPartFn, ResolvedWechatOutboundMedia } from './outboundMedia.js'
 import { MASTER_USER_PREFIX } from './userIds.js'
 
 /** sendText 实装返回。permanent → broker 立即 force-fail 不复活;否则按 attempts cap 兜底。 */
@@ -48,6 +49,13 @@ export type SendTextFn = (params: {
   text: string
 }) => Promise<SendResult>
 
+export type SendMediaFn = (params: {
+  botToken: string
+  toUserId: string
+  contextToken: string
+  media: ResolvedWechatOutboundMedia
+}) => Promise<SendResult>
+
 /** 读 master sqlite wechat_bindings 当前快照(broker.ts 注入)。 */
 export type GetBindingFn = (bindingUserId: string) => Promise<{
   botToken: string
@@ -59,6 +67,8 @@ export type LogFn = (level: 'info' | 'warn' | 'error', message: string) => void
 export interface OutboxWorkerOptions {
   pool: Pool
   sendText: SendTextFn
+  sendMedia?: SendMediaFn
+  resolveMediaPart?: ResolveOutboundMediaPartFn
   getBinding: GetBindingFn
   log?: LogFn
   /** 每个 tick 最多 drain 条数,防 event loop 长 block。默认 20。 */
@@ -116,12 +126,14 @@ export async function drainOne(
   deps: {
     pool: Pool
     sendText: SendTextFn
+    sendMedia?: SendMediaFn
+    resolveMediaPart?: ResolveOutboundMediaPartFn
     getBinding: GetBindingFn
     now: () => number
     maxAttempts: number
   },
 ): Promise<DrainOutcome> {
-  const { pool, sendText, getBinding, now, maxAttempts } = deps
+  const { pool, sendText, sendMedia, resolveMediaPart, getBinding, now, maxAttempts } = deps
 
   // outbox.binding_user_id 沿 PG-side 命名(raw digit,见 userIds.ts);跨入 master sqlite
   // 读 wechat_bindings 时 prepend `c:` 前缀,与 inboundDispatcher 写 client_sessions 时
@@ -148,15 +160,36 @@ export async function drainOne(
   // 不能静默 markSent 丢消息,转 failed_permanent("invalid_payload")。
   let sentParts = 0
   for (const part of row.payload) {
-    if (!isTextPart(part)) continue // P1 只识别 text part,其他类型未来扩
-    const result = await sendText({
-      botToken: binding.botToken,
-      toUserId: row.senderId,
-      contextToken,
-      text: part.text,
-    })
+    let result: SendResult | null = null
+    if (isTextPart(part)) {
+      result = await sendText({
+        botToken: binding.botToken,
+        toUserId: row.senderId,
+        contextToken,
+        text: part.text,
+      })
+    } else if (isMediaPart(part) && sendMedia && resolveMediaPart) {
+      try {
+        const media = await resolveMediaPart({
+          bindingUserId: row.bindingUserId,
+          part,
+        })
+        result = await sendMedia({
+          botToken: binding.botToken,
+          toUserId: row.senderId,
+          contextToken,
+          media,
+        })
+      } catch (err) {
+        result = {
+          ok: false,
+          errMessage: String((err as Error)?.message ?? err),
+        }
+      }
+    }
+    if (!result) continue
     if (!result.ok) {
-      const errMsg = result.errMessage ?? 'sendText_unknown_error'
+      const errMsg = result.errMessage ?? 'send_unknown_error'
       if (result.permanent) {
         const ok = await forceFail(pool, row.id, errMsg, now(), maxAttempts)
         return ok
@@ -189,6 +222,14 @@ function isTextPart(p: IlinkPart): p is { type: 'text'; text: string } {
   return p.type === 'text' && typeof p.text === 'string'
 }
 
+function isMediaPart(p: IlinkPart): p is IlinkMediaPart {
+  return (
+    (p.type === 'image' || p.type === 'video' || p.type === 'voice' || p.type === 'file') &&
+    typeof p.containerPath === 'string' &&
+    typeof p.filename === 'string'
+  )
+}
+
 /**
  * Drain loop 控制器。`start()` 启动周期 tick;`stop()` 平滑停。
  *
@@ -198,7 +239,9 @@ export class OutboxWorker {
   private timer: ReturnType<typeof setTimeout> | null = null
   private stopFlag = false
   private inFlight: Promise<void> | null = null
-  private readonly opts: Required<Omit<OutboxWorkerOptions, 'log'>> & {
+  private readonly opts: Omit<Required<OutboxWorkerOptions>, 'sendMedia' | 'resolveMediaPart' | 'log'> & {
+    sendMedia?: SendMediaFn
+    resolveMediaPart?: ResolveOutboundMediaPartFn
     log: LogFn
   }
 
@@ -206,6 +249,8 @@ export class OutboxWorker {
     this.opts = {
       pool: options.pool,
       sendText: options.sendText,
+      sendMedia: options.sendMedia,
+      resolveMediaPart: options.resolveMediaPart,
       getBinding: options.getBinding,
       log: options.log ?? defaultLog,
       maxPerTick: options.maxPerTick ?? 20,

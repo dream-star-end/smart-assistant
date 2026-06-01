@@ -54,6 +54,7 @@ import { rootLogger, type Logger } from "../logging/logger.js"
 import { getPreferences } from "../user/preferences.js"
 import { enqueue, type EnqueueOutcome } from "./outboxStore.js"
 import { renderAssistantText, renderToolAnnouncement } from "./rendererPipeline.js"
+import { expandTextWithWechatMediaParts } from "./outboundMedia.js"
 import { type RateLimiter } from "./rateLimiter.js"
 import { WECHAT_SESSION_ID_REGEX, type IlinkPart } from "./types.js"
 
@@ -357,6 +358,20 @@ export function renderWechatBlocks(
   return { parts, dropped }
 }
 
+export function expandRenderedPartsWithWechatMedia(parts: IlinkPart[]): IlinkPart[] {
+  const out: IlinkPart[] = []
+  for (const part of parts) {
+    if (part.type !== "text") {
+      out.push(part)
+      continue
+    }
+    const expanded = expandTextWithWechatMediaParts(part.text)
+    if (expanded.text) out.push({ type: "text", text: expanded.text })
+    for (const media of expanded.media) out.push(media)
+  }
+  return out
+}
+
 // ─── handler dependencies ──────────────────────────────────────────────────
 
 export interface OutboundReceiverDeps {
@@ -525,7 +540,9 @@ export function makeOutboundReceiverHandler(
         err: err as Error,
       })
     }
-    const { parts, dropped } = renderWechatBlocks(body.blocks, { showToolCalls })
+    const rendered = renderWechatBlocks(body.blocks, { showToolCalls })
+    const parts = expandRenderedPartsWithWechatMedia(rendered.parts)
+    const dropped = rendered.dropped
     if (parts.length === 0) {
       // 全 drop / 全空文本 — 不入队(避免 worker 走 invalid_payload 路径)。
       // 容器侧 sink 视为 "已接收、无可发内容、勿重试"。

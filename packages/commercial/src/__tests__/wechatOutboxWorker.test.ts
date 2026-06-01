@@ -10,6 +10,7 @@ import {
   type DrainOutcome,
   type GetBindingFn,
   OutboxWorker,
+  type SendMediaFn,
   type SendResult,
   type SendTextFn,
   drainOne,
@@ -293,6 +294,105 @@ describe('outboxWorker.drainOne', () => {
     assert.deepEqual(outcome, { kind: 'sent', outboxId: 1 })
     const markSentQs = captured.filter((c) => /status\s*=\s*'sent'/.test(c.sql))
     assert.equal(markSentQs.length, 1)
+  })
+
+  test('media part: resolves current-user file and sends via sendMedia', async () => {
+    const { pool, captured } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
+    const sendText: SendTextFn = async () => {
+      throw new Error('should not send text')
+    }
+    const sendMediaCalls: Parameters<SendMediaFn>[0][] = []
+    const sendMedia: SendMediaFn = async (params) => {
+      sendMediaCalls.push(params)
+      return { ok: true }
+    }
+    const getBinding: GetBindingFn = async () => ({
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
+    })
+    const outcome = await drainOne(
+      makeRow({
+        payload: [
+          {
+            type: 'image',
+            containerPath: '/home/agent/.openclaude/generated/result.png',
+            filename: 'result.png',
+          },
+        ],
+      }),
+      {
+        pool,
+        sendText,
+        sendMedia,
+        resolveMediaPart: async ({ bindingUserId, part }) => {
+          assert.equal(bindingUserId, '1')
+          assert.equal(part.filename, 'result.png')
+          return {
+            kind: 'image',
+            filename: 'result.png',
+            mimeType: 'image/png',
+            content: Buffer.from('png'),
+          }
+        },
+        getBinding,
+        now,
+        maxAttempts: 10,
+      },
+    )
+    assert.deepEqual(outcome, { kind: 'sent', outboxId: 1 })
+    assert.equal(sendMediaCalls.length, 1)
+    assert.equal(sendMediaCalls[0]!.botToken, 'tok')
+    assert.equal(sendMediaCalls[0]!.contextToken, 'ctx')
+    assert.equal(sendMediaCalls[0]!.media.kind, 'image')
+    const markSentQs = captured.filter((c) => /status\s*=\s*'sent'/.test(c.sql))
+    assert.equal(markSentQs.length, 1)
+  })
+
+  test('media part: resolver error marks row failed instead of crashing tick', async () => {
+    const { pool } = makeFakePool((sql) => {
+      if (/UPDATE wechat_outbox SET[\s\S]+attempts\s*=\s*attempts \+ 1/.test(sql)) {
+        return { rows: [{ attempts: 1, status: 'queued' }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    })
+    const sendText: SendTextFn = async () => {
+      throw new Error('should not send text')
+    }
+    const sendMedia: SendMediaFn = async () => {
+      throw new Error('should not send media after resolve failure')
+    }
+    const getBinding: GetBindingFn = async () => ({
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx' },
+    })
+    const outcome = await drainOne(
+      makeRow({
+        payload: [
+          {
+            type: 'file',
+            containerPath: '/home/agent/.openclaude/uploads/missing.pdf',
+            filename: 'missing.pdf',
+          },
+        ],
+      }),
+      {
+        pool,
+        sendText,
+        sendMedia,
+        resolveMediaPart: async () => {
+          throw new Error('remote host media not found')
+        },
+        getBinding,
+        now,
+        maxAttempts: 10,
+      },
+    )
+    assert.deepEqual(outcome, {
+      kind: 'failed_transient',
+      outboxId: 1,
+      attempts: 1,
+      errMessage: 'remote host media not found',
+    })
   })
 
   test('markSent drift (rowCount=0) → outcome=noop', async () => {

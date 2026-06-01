@@ -171,8 +171,9 @@ import {
 import { handleWechatModelCommand } from "./wechat/modelCommand.js";
 import { pickWechatInboundModel } from "./wechat/modelResolver.js";
 import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
-import { makeIlinkSendAdapter } from "./wechat/ilinkSendAdapter.js";
-import { makeSaveWechatImagesToUserUploads } from "./wechat/imageIngest.js";
+import { makeIlinkSendAdapter, makeIlinkSendMediaAdapter } from "./wechat/ilinkSendAdapter.js";
+import { makeSaveWechatMediaToUserUploads } from "./wechat/imageIngest.js";
+import { makeWechatOutboundMediaResolver } from "./wechat/outboundMedia.js";
 import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
 import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
@@ -442,6 +443,8 @@ export interface RegisterCommercialResult {
       messageId?: string;
       itemTypes?: string;
       rawPayload?: unknown;
+      mediaAttachments?: import("@openclaude/channel-wechat").WechatMediaAttachment[];
+      imageAttachments?: import("@openclaude/channel-wechat").WechatImageAttachment[];
       idempotencyKey: string;
       receivedAt: number;
       channel?: "wechat";
@@ -2280,6 +2283,27 @@ export async function registerCommercial(
     const wechatLog = rootLogger.child({ subsys: "wechatBrokerAssembly" });
     const containerTransport = makeNodeHttpContainerTransport();
     const ilinkSendText = makeIlinkSendAdapter();
+    const ilinkSendMedia = makeIlinkSendMediaAdapter();
+    const resolveWechatOutboundMedia =
+      userMediaResolver
+        ? makeWechatOutboundMediaResolver({
+            resolveUserMediaDirs: userMediaResolver,
+            pullRemoteHostMedia: async (args) => {
+              const row = await computeQueries.getHostById(args.hostUuid);
+              if (!row) {
+                throw new Error(
+                  `pullRemoteHostMedia: compute_host ${args.hostUuid} not found`,
+                );
+              }
+              const target = hostRowToTarget(row);
+              try {
+                return await nodeAgentGetFile(target, args.remotePath);
+              } finally {
+                target.psk?.fill(0);
+              }
+            },
+          })
+        : undefined;
 
     const inboundDispatcher = makeInboundDispatcher({
       pgPool: getPool(),
@@ -2332,6 +2356,8 @@ export async function registerCommercial(
         await softDeleteMasterSession(sessionId, userId);
       },
       sendText: ilinkSendText,
+      sendMedia: ilinkSendMedia,
+      resolveOutboundMediaPart: resolveWechatOutboundMedia,
       wechatUxCommands: {
         handleModelCommand: async (evt) => {
           const uid = BigInt(evt.bindingUserId);
@@ -2353,8 +2379,8 @@ export async function registerCommercial(
           });
         },
       },
-      saveWechatImages: userMediaResolver
-        ? makeSaveWechatImagesToUserUploads({
+      saveWechatMedia: userMediaResolver
+        ? makeSaveWechatMediaToUserUploads({
             resolveUserMediaDirs: userMediaResolver,
             pushRemoteHostUpload,
           })

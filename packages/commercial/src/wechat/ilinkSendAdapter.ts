@@ -23,10 +23,10 @@
  * 暂按 success 处理,等 iLink 行为有定论再加一层映射。
  */
 
-import { sendIlinkText } from "@openclaude/channel-wechat"
+import { sendIlinkMedia, sendIlinkText } from "../../../channels/wechat/src/iLink.js"
 
 import { rootLogger, type Logger } from "../logging/logger.js"
-import type { SendResult, SendTextFn } from "./outboxWorker.js"
+import type { SendMediaFn, SendResult, SendTextFn } from "./outboxWorker.js"
 
 /** "iLink HTTP NNN: ..." 前缀解析正则。NNN 是 3 位 status。 */
 const ILINK_HTTP_PREFIX = /^iLink HTTP (\d{3})\b/
@@ -41,9 +41,12 @@ export type SendIlinkTextFn = (
   text: string,
 ) => Promise<unknown>
 
+export type SendIlinkMediaFn = typeof sendIlinkMedia
+
 export interface MakeIlinkSendAdapterOptions {
   /** sendIlinkText 注入点(默认 `@openclaude/channel-wechat` 的实现;测试注入 mock)。 */
   sendIlinkText?: SendIlinkTextFn
+  sendIlinkMedia?: SendIlinkMediaFn
   logger?: Logger
 }
 
@@ -84,6 +87,33 @@ export function makeIlinkSendAdapter(opts: MakeIlinkSendAdapterOptions = {}): Se
       const { permanent, errMessage } = classifyIlinkError(err)
       log.warn("ilink_send_failed", {
         toUserId: params.toUserId,
+        permanent,
+        errMessage,
+      })
+      return { ok: false, permanent, errMessage }
+    }
+  }
+}
+
+export function makeIlinkSendMediaAdapter(opts: MakeIlinkSendAdapterOptions = {}): SendMediaFn {
+  const log = (opts.logger ?? rootLogger).child({ subsys: "wechatIlinkSendAdapter" })
+  const send = opts.sendIlinkMedia ?? sendIlinkMedia
+
+  return async (params): Promise<SendResult> => {
+    try {
+      await send(params.botToken, params.toUserId, {
+        kind: params.media.kind,
+        filename: params.media.filename,
+        content: params.media.content,
+        mimeType: params.media.mimeType,
+        contextToken: params.contextToken,
+      })
+      return { ok: true }
+    } catch (err) {
+      const { permanent, errMessage } = classifyIlinkError(err)
+      log.warn("ilink_send_media_failed", {
+        toUserId: params.toUserId,
+        kind: params.media.kind,
         permanent,
         errMessage,
       })

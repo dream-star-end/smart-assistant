@@ -847,7 +847,7 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(r.kind, "command_echo")
     if (r.kind === "command_echo") {
       assert.match(r.reply, /收到了一条图片消息/)
-      assert.match(r.reply, /主要支持文字对话/)
+      assert.match(r.reply, /无法解析这条附件/)
     }
     assert.equal(dispSpy.calls.length, 0)
   })

@@ -15,7 +15,11 @@
 import * as assert from "node:assert/strict"
 import { describe, it } from "node:test"
 
-import { classifyIlinkError, makeIlinkSendAdapter } from "../wechat/ilinkSendAdapter.js"
+import {
+  classifyIlinkError,
+  makeIlinkSendAdapter,
+  makeIlinkSendMediaAdapter,
+} from "../wechat/ilinkSendAdapter.js"
 
 describe("classifyIlinkError", () => {
   it("classifies permanent statuses (401/403/404/410)", () => {
@@ -54,6 +58,76 @@ describe("classifyIlinkError", () => {
     const r = classifyIlinkError("plain string thrown" as unknown)
     assert.equal(r.permanent, false)
     assert.equal(r.errMessage, "plain string thrown")
+  })
+})
+
+describe("makeIlinkSendMediaAdapter", () => {
+  it("happy path: returns {ok:true} and forwards resolved media bytes", async () => {
+    const calls: Array<{
+      token: string
+      toUserId: string
+      kind: string
+      filename: string
+      contextToken: string
+      bytes: number
+    }> = []
+    const adapter = makeIlinkSendMediaAdapter({
+      sendIlinkMedia: async (token, toUserId, input) => {
+        calls.push({
+          token,
+          toUserId,
+          kind: input.kind,
+          filename: input.filename,
+          contextToken: input.contextToken,
+          bytes: input.content.length,
+        })
+        return { ok: 1 }
+      },
+    })
+    const r = await adapter({
+      botToken: "tok-1",
+      toUserId: "wxid_alice",
+      contextToken: "ctx-1",
+      media: {
+        kind: "image",
+        filename: "result.png",
+        mimeType: "image/png",
+        content: Buffer.from("png"),
+      },
+    })
+    assert.deepEqual(r, { ok: true })
+    assert.deepEqual(calls, [
+      {
+        token: "tok-1",
+        toUserId: "wxid_alice",
+        kind: "image",
+        filename: "result.png",
+        contextToken: "ctx-1",
+        bytes: 3,
+      },
+    ])
+  })
+
+  it("classifies media send errors and never throws upward", async () => {
+    const adapter = makeIlinkSendMediaAdapter({
+      sendIlinkMedia: async () => {
+        throw new Error("iLink HTTP 503: maintenance")
+      },
+    })
+    const r = await adapter({
+      botToken: "x",
+      toUserId: "y",
+      contextToken: "z",
+      media: {
+        kind: "file",
+        filename: "report.pdf",
+        content: Buffer.from("%PDF"),
+      },
+    })
+    assert.equal(r.ok, false)
+    if (r.ok) return
+    assert.equal(r.permanent, false)
+    assert.match(r.errMessage ?? "", /HTTP 503/)
   })
 })
 
