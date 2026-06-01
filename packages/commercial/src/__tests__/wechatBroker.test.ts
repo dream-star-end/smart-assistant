@@ -574,7 +574,7 @@ describe("wechatBroker — onInbound", () => {
     const broker = makeWechatBroker(
       makeDeps({ dispatcher, sendText, getBinding }),
     )
-    const r = await broker.onInbound(makeEvent({ bindingUserId: "c:1" }))
+    const r = await broker.onInbound(makeEvent({ bindingUserId: "c:1", text: "/echo" }))
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
     // dispatcher 看到的是 normalized raw digit
@@ -607,7 +607,7 @@ describe("wechatBroker — onInbound", () => {
     const broker = makeWechatBroker(
       makeDeps({ dispatcher, sendText, getBinding }),
     )
-    const r = await broker.onInbound(makeEvent({ bindingUserId: "42" }))
+    const r = await broker.onInbound(makeEvent({ bindingUserId: "42", text: "/echo" }))
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
     assert.equal(dispSpy.calls[0]!.bindingUserId, "42", "无前缀输入幂等")
@@ -640,7 +640,7 @@ describe("wechatBroker — onInbound", () => {
     )
   })
 
-  test("dispatcher → dispatched outcome 透传,不触 sendText", async () => {
+  test("dispatcher → dispatched outcome 透传,并立即发送 processing 反射", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher } = makeDispatcher({
       kind: "dispatched",
@@ -651,7 +651,8 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "dispatched")
     await flushMicrotasks()
-    assert.equal(sendSpy.calls.length, 0, "dispatched 路径不应触发反射")
+    assert.equal(sendSpy.calls.length, 1)
+    assert.equal(sendSpy.calls[0]!.text, "已收到，正在思考…")
   })
 
   test("audit insert sees duplicate (account_id,message_id) → duplicate_audit and dispatcher is skipped", async () => {
@@ -893,6 +894,7 @@ describe("wechatBroker — onInbound", () => {
     }
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 1)
+    assert.notEqual(sendSpy.calls[0]!.text, "已收到，正在思考…")
     assert.equal(sendSpy.calls[0]!.botToken, "tok")
     assert.equal(sendSpy.calls[0]!.toUserId, "wx-sender-1")
     assert.equal(sendSpy.calls[0]!.contextToken, "ctx-1")
@@ -911,8 +913,9 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "cold_start")
     await flushMicrotasks()
-    assert.equal(sendSpy.calls.length, 1)
-    assert.equal(sendSpy.calls[0]!.text, "正在唤醒,稍等几秒...")
+    assert.equal(sendSpy.calls.length, 2)
+    assert.equal(sendSpy.calls[0]!.text, "已收到，正在思考…")
+    assert.equal(sendSpy.calls[1]!.text, "正在唤醒,稍等几秒...")
   })
 
   test("反射:getBinding 返 null → log + drop,sendText 不被调", async () => {
@@ -923,7 +926,7 @@ describe("wechatBroker — onInbound", () => {
       reply: "x",
     })
     const broker = makeWechatBroker(makeDeps({ dispatcher, sendText, getBinding }))
-    const r = await broker.onInbound(makeEvent())
+    const r = await broker.onInbound(makeEvent({ text: "/x" }))
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 0)
@@ -937,7 +940,7 @@ describe("wechatBroker — onInbound", () => {
     })
     const { dispatcher } = makeDispatcher({ kind: "command_echo", reply: "x" })
     const broker = makeWechatBroker(makeDeps({ dispatcher, sendText, getBinding }))
-    const r = await broker.onInbound(makeEvent({ senderId: "wx-sender-missing" }))
+    const r = await broker.onInbound(makeEvent({ senderId: "wx-sender-missing", text: "/x" }))
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 0)
@@ -950,7 +953,7 @@ describe("wechatBroker — onInbound", () => {
     const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
     // 不应 throw。如果 sendText 同步 throw 冒泡过 fire-and-forget 包裹层,
     // 这里 await 会变 reject;能走到下面 assert.equal 即说明没冒泡。
-    const r = await broker.onInbound(makeEvent())
+    const r = await broker.onInbound(makeEvent({ text: "/x" }))
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
   })
@@ -959,7 +962,7 @@ describe("wechatBroker — onInbound", () => {
     const { sendText } = makeSendText({ throwAsync: new Error("async boom") })
     const { dispatcher } = makeDispatcher({ kind: "command_echo", reply: "x" })
     const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
-    const r = await broker.onInbound(makeEvent())
+    const r = await broker.onInbound(makeEvent({ text: "/x" }))
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
   })
@@ -968,7 +971,7 @@ describe("wechatBroker — onInbound", () => {
     const { sendText, spy } = makeSendText({ ok: false, permanent: true, errMessage: "bad ctx" })
     const { dispatcher } = makeDispatcher({ kind: "command_echo", reply: "x" })
     const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
-    const r = await broker.onInbound(makeEvent())
+    const r = await broker.onInbound(makeEvent({ text: "/x" }))
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
     assert.equal(spy.calls.length, 1) // 调过一次,返失败
@@ -978,7 +981,7 @@ describe("wechatBroker — onInbound", () => {
     const { getBinding } = makeGetBinding({ throw: new Error("master sqlite down") })
     const { dispatcher } = makeDispatcher({ kind: "command_echo", reply: "x" })
     const broker = makeWechatBroker(makeDeps({ dispatcher, getBinding }))
-    const r = await broker.onInbound(makeEvent())
+    const r = await broker.onInbound(makeEvent({ text: "/x" }))
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
   })

@@ -1704,6 +1704,14 @@
           <label>状态</label>
           <div id="wechat-status" style="font-size:var(--text-sm)"></div>
         </div>
+        <div class="form-row">
+          <label for="wechat-show-tool-calls">显示工具调用过程</label>
+          <div style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-sm)">
+            <input id="wechat-show-tool-calls" type="checkbox" checked />
+            <span style="color:var(--fg-muted)">开启后，微信回复中会显示正在调用的工具。</span>
+          </div>
+          <div id="wechat-tool-calls-status" style="color:var(--fg-muted);font-size:var(--text-xs);margin-top:4px"></div>
+        </div>
         <p style="margin:var(--space-2) 0 0;color:var(--fg-muted);font-size:var(--text-xs)">
           任何能联系到本 bot 的微信账号都可直接对话(无白名单限制)。访问控制由微信好友关系本身决定。
         </p>

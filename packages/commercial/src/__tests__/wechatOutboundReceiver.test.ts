@@ -103,7 +103,15 @@ const okRateLimiter: RateLimiter = { checkInbound: () => true, checkOutbound: ()
 const blockedRateLimiter: RateLimiter = { checkInbound: () => true, checkOutbound: () => false }
 
 interface EnqueueSpy {
-  calls: Array<{ outboundId: string; bindingUserId: string; senderId: string; sessionId: string; payloadLen: number; now: number }>
+  calls: Array<{
+    outboundId: string
+    bindingUserId: string
+    senderId: string
+    sessionId: string
+    payloadLen: number
+    payload: unknown[]
+    now: number
+  }>
 }
 
 /**
@@ -147,13 +155,15 @@ function makeFakePool(opts: {
     }
 
     if (/INSERT INTO wechat_outbox/.test(sql)) {
+      const payload = typeof params[4] === "string" ? (JSON.parse(params[4] as string) as unknown[]) : []
       // record the call before answering
       spy.calls.push({
         outboundId: String(params[0]),
         bindingUserId: String(params[1]),
         senderId: String(params[2]),
         sessionId: String(params[3]),
-        payloadLen: typeof params[4] === "string" ? (JSON.parse(params[4] as string) as unknown[]).length : 0,
+        payloadLen: payload.length,
+        payload,
         now: Number(params[5]),
       })
       if (opts.mode === "enqueue_queued") {
@@ -194,6 +204,7 @@ function makeDeps(overrides: Partial<OutboundReceiverDeps> = {}): OutboundReceiv
     identityRepo: overrides.identityRepo ?? makeRepo(),
     pool: overrides.pool ?? (makeFakePool({ mode: "noop" }).pool),
     rateLimiter: overrides.rateLimiter ?? okRateLimiter,
+    getWechatShowToolCalls: overrides.getWechatShowToolCalls ?? (async () => true),
     now: overrides.now ?? (() => 1_700_000_000_000),
     ...overrides,
   }
@@ -519,6 +530,62 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.equal(rec.status, 500)
     assert.match(rec.body, /STORAGE_ERROR/)
   })
+
+  test("wechat_show_tool_calls=false hides tool announcements before enqueue", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
+    const handler = makeOutboundReceiverHandler(
+      makeDeps({
+        pool,
+        getWechatShowToolCalls: async () => false,
+      }),
+    )
+    const { res, rec } = makeRes()
+    await handler(
+      authedReq(
+        validBody({
+          blocks: [
+            { kind: "text", text: "查询中。" },
+            { kind: "tool_use", toolName: "Read" },
+            { kind: "text", text: "完成。" },
+          ],
+        }),
+      ),
+      res,
+      CTX,
+    )
+    assert.equal(rec.status, 202)
+    assert.equal(spy.calls.length, 1)
+    assert.deepEqual(spy.calls[0]!.payload, [{ type: "text", text: "查询中。完成。" }])
+  })
+
+  test("tool preference lookup failure defaults to showing tool announcements", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
+    const handler = makeOutboundReceiverHandler(
+      makeDeps({
+        pool,
+        getWechatShowToolCalls: async () => {
+          throw new Error("prefs down")
+        },
+      }),
+    )
+    const { res, rec } = makeRes()
+    await handler(
+      authedReq(
+        validBody({
+          blocks: [
+            { kind: "text", text: "查询中。" },
+            { kind: "tool_use", toolName: "Read" },
+          ],
+        }),
+      ),
+      res,
+      CTX,
+    )
+    assert.equal(rec.status, 202)
+    assert.equal(spy.calls.length, 1)
+    assert.equal(spy.calls[0]!.payloadLen, 2)
+    assert.match(String((spy.calls[0]!.payload[1] as { text?: string }).text), /读取文件/)
+  })
 })
 
 // ─── render: empty result → no enqueue ─────────────────────────────────────
@@ -580,6 +647,29 @@ describe("outboundReceiver — empty render short-circuit", () => {
             { kind: "tool_result", toolName: "Read", isError: false },
             { kind: "tool_output_tail", toolUseBlockId: "blk-1", tail: "...", totalBytes: 100, truncatedHead: false },
           ],
+        }),
+      ),
+      res,
+      CTX,
+    )
+    assert.equal(rec.status, 200)
+    assert.equal(JSON.parse(rec.body).outcome, "empty_render")
+    assert.equal(spy.calls.length, 0)
+  })
+
+  test("only tool_use with wechat_show_tool_calls=false → empty_render", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 1 })
+    const handler = makeOutboundReceiverHandler(
+      makeDeps({
+        pool,
+        getWechatShowToolCalls: async () => false,
+      }),
+    )
+    const { res, rec } = makeRes()
+    await handler(
+      authedReq(
+        validBody({
+          blocks: [{ kind: "tool_use", toolName: "Read" }],
         }),
       ),
       res,
@@ -654,10 +744,45 @@ describe("renderWechatBlocks pure function", () => {
     assert.ok(r.parts.every((part) => part.text.length <= 1024))
   })
 
+  test("consecutive text blocks are coalesced into one WeChat bubble", () => {
+    const r = renderWechatBlocks([
+      { kind: "text", text: "你好" },
+      { kind: "text", text: "!" },
+      { kind: "text", text: "有什么" },
+      { kind: "text", text: "我可以帮你的吗?" },
+    ])
+    assert.equal(r.parts.length, 1)
+    assert.deepEqual(r.parts[0], { type: "text", text: "你好!有什么我可以帮你的吗?" })
+  })
+
+  test("coalesced long text still splits into WeChat pages", () => {
+    const r = renderWechatBlocks([
+      { kind: "text", text: "a".repeat(900) },
+      { kind: "text", text: "b".repeat(900) },
+    ])
+    assert.equal(r.parts.length, 2)
+    assert.match(r.parts[0]!.text, /^（1\/2）\n/)
+    assert.match(r.parts[1]!.text, /^（2\/2）\n/)
+    assert.equal(
+      r.parts.map((part) => part.text.replace(/^（\d+\/\d+）\n/, "")).join(""),
+      "a".repeat(900) + "b".repeat(900),
+    )
+  })
+
   test("tool_use block → tool announcement (single text part)", () => {
     const r = renderWechatBlocks([{ kind: "tool_use", toolName: "Read" }])
     assert.equal(r.parts.length, 1)
     assert.match(r.parts[0]!.text, /读取文件/)
+  })
+
+  test("tool_use announcement can be hidden by user preference", () => {
+    const r = renderWechatBlocks([
+      { kind: "text", text: "查询中。" },
+      { kind: "tool_use", toolName: "Read" },
+      { kind: "text", text: "完成。" },
+    ], { showToolCalls: false })
+    assert.deepEqual(r.parts, [{ type: "text", text: "查询中。完成。" }])
+    assert.equal(r.dropped, 1)
   })
 
   test("tool_result block → dropped (P1)", () => {

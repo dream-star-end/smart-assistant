@@ -26,6 +26,7 @@ describe("PreferencesSchema (full)", () => {
       default_effort: "high",
       notify_email: true,
       notify_telegram: false,
+      wechat_show_tool_calls: true,
       hotkeys: { send: "Ctrl+Enter" },
     });
     assert.equal(r.success, true);
@@ -86,6 +87,7 @@ describe("PreferencesPatchSchema", () => {
     const r = PreferencesPatchSchema.safeParse({
       theme: null,
       default_model: null,
+      wechat_show_tool_calls: null,
       hotkeys: null,
     });
     assert.equal(r.success, true);
@@ -96,6 +98,7 @@ describe("PreferencesPatchSchema", () => {
       theme: "auto",
       default_model: null,
       notify_email: true,
+      wechat_show_tool_calls: false,
     });
     assert.equal(r.success, true);
   });

@@ -66,6 +66,9 @@ const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
 /** Housekeeping 周期默认值。RFC §4.6 + outboxWorker.runHousekeeping。 */
 const DEFAULT_HOUSEKEEPING_INTERVAL_MS = 5 * 60 * 1000
 
+/** 普通微信消息进入调度后立即给用户一个可见反馈,避免长时间无感知。 */
+const PROCESSING_REFLECTION_TEXT = "已收到，正在思考…"
+
 /**
  * v3 commercial canonical user id 接受形式:`c:<digit>` 或裸 `<digit>`。
  * - `c:<digit>`     — 生产路径(wechat_bindings.user_id / JWT identity / master sqlite
@@ -340,6 +343,10 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       return localOutcome
     }
 
+    if (shouldSendProcessingReflection(dispatchEvt)) {
+      fireAndForgetReflection(evt, PROCESSING_REFLECTION_TEXT, "processing")
+    }
+
     let outcome: DispatchOutcome
     try {
       outcome = await deps.dispatcher.dispatch(dispatchEvt)
@@ -557,7 +564,7 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
   function fireAndForgetReflection(
     evt: InboundEvent,
     text: string,
-    reason: "command_echo" | "cold_start",
+    reason: "command_echo" | "cold_start" | "processing",
   ): void {
     void Promise.resolve()
       .then(() => sendReflection(evt, text, reason))
@@ -573,7 +580,7 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
   async function sendReflection(
     evt: InboundEvent,
     text: string,
-    reason: "command_echo" | "cold_start",
+    reason: "command_echo" | "cold_start" | "processing",
   ): Promise<void> {
     let binding
     try {
@@ -623,6 +630,10 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         errMessage: result.errMessage ?? "unknown",
       })
     }
+  }
+
+  function shouldSendProcessingReflection(evt: InboundEvent): boolean {
+    return evt.text.length > 0 && !evt.text.startsWith("/")
   }
 
   // ─── reconcile tick:单次 snapshot 内 diff + softDelete ─────────────────────

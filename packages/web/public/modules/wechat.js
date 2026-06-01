@@ -18,9 +18,11 @@
 import { apiGet, apiJson } from './api.js?v=eaaa34ed'
 import { $ } from './dom.js?v=eaaa34ed'
 import { closeModal, openModal, toast } from './ui.js?v=eaaa34ed'
+import { loadUserPrefs, setCachedPrefField } from './userPrefs.js?v=auto'
 
 let _pollAbort = null
 let _currentQrcode = null
+let _toolPrefSaving = false
 
 function setError(msg) {
   const el = $('wechat-error')
@@ -70,6 +72,7 @@ async function loadBinding() {
       (binding.lastEventAt ? ` · 最近消息 ${new Date(binding.lastEventAt).toLocaleString()}` : '') +
       workerWarn
     showState('bound')
+    void loadToolCallPreference()
     return binding
   } catch (e) {
     setError(`加载绑定失败: ${e?.message || e}`)
@@ -221,6 +224,59 @@ async function unbind() {
   }
 }
 
+async function loadToolCallPreference() {
+  const checkbox = $('wechat-show-tool-calls')
+  const status = $('wechat-tool-calls-status')
+  if (!checkbox) return
+  checkbox.disabled = true
+  if (status) status.textContent = '加载中…'
+  try {
+    const prefs = await loadUserPrefs(true)
+    const checked = prefs?.wechat_show_tool_calls !== false
+    checkbox.checked = checked
+    checkbox.dataset.saved = checked ? 'true' : 'false'
+    if (status) status.textContent = ''
+  } catch (e) {
+    // loadUserPrefs 自带兜底;这里保留 catch 以防未来实现改为 throw。
+    checkbox.checked = true
+    checkbox.dataset.saved = 'true'
+    if (status) status.textContent = '偏好加载失败，默认显示'
+    console.warn('load WeChat tool-call preference failed:', e)
+  } finally {
+    checkbox.disabled = false
+  }
+}
+
+async function saveToolCallPreference() {
+  const checkbox = $('wechat-show-tool-calls')
+  const status = $('wechat-tool-calls-status')
+  if (!checkbox || _toolPrefSaving) return
+  const previous = checkbox.dataset.saved === 'false' ? false : true
+  const next = checkbox.checked === true
+  _toolPrefSaving = true
+  checkbox.disabled = true
+  if (status) status.textContent = '保存中…'
+  try {
+    const resp = await apiJson('PATCH', '/api/me/preferences', {
+      wechat_show_tool_calls: next,
+    })
+    const fresh = (resp && typeof resp.prefs === 'object' && resp.prefs !== null) ? resp.prefs : {}
+    const saved = fresh.wechat_show_tool_calls !== false
+    checkbox.checked = saved
+    checkbox.dataset.saved = saved ? 'true' : 'false'
+    setCachedPrefField('wechat_show_tool_calls', saved)
+    if (status) status.textContent = ''
+    toast(saved ? '微信将显示工具调用过程' : '微信已隐藏工具调用过程', 'success')
+  } catch (e) {
+    checkbox.checked = previous
+    if (status) status.textContent = `保存失败: ${e?.message || e}`
+    toast('微信工具调用显示设置保存失败', 'error')
+  } finally {
+    checkbox.disabled = false
+    _toolPrefSaving = false
+  }
+}
+
 export function openWechatModal() {
   setError('')
   showState('unbound')
@@ -232,6 +288,8 @@ export function initWechatListeners() {
   $('wechat-start-btn').onclick = startPairing
   $('wechat-refresh-btn').onclick = loadBinding
   $('wechat-unbind-btn').onclick = unbind
+  const toolPref = $('wechat-show-tool-calls')
+  if (toolPref) toolPref.onchange = saveToolCallPreference
 
   // Abort any in-flight pairing poll when the modal closes.
   document.addEventListener('click', (e) => {
