@@ -172,10 +172,135 @@ export function renderAssistantText(rawMarkdown: string | null | undefined): Ili
   return splitTextForWechatPages(cleaned, WECHAT_MAX_TEXT).map((text) => ({ type: "text", text }))
 }
 
+export interface ToolAnnouncementDetails {
+  summary?: string
+  inputPreview?: string
+  inputJson?: unknown
+}
+
+const MAX_TOOL_DETAIL_CHARS = 300
+
 /**
  * 工具调用预告气泡:发给 WeChat 让用户知道 agent 正在做事(防止"长时间没反应"焦虑)。
+ *
+ * 对 Bash 等高频工具,同时展示一个有上限的参数摘要。网页端完整工具卡仍是
+ * 权威视图;微信端只给用户判断"具体在做什么",避免"只显示执行命令"但不知道
+ * 命令内容。
  */
-export function renderToolAnnouncement(toolName: string): IlinkPart[] {
+export function renderToolAnnouncement(
+  toolName: string,
+  details: ToolAnnouncementDetails = {},
+): IlinkPart[] {
   const friendly = friendlyToolName(toolName)
-  return [{ type: "text", text: `🔧 ${friendly}…` }]
+  const detail = deriveToolAnnouncementDetail(toolName, details)
+  const suffix = detail ? `\n${detail.label}：${detail.text}` : ""
+  return [{ type: "text", text: `🔧 ${friendly}…${suffix}` }]
+}
+
+function deriveToolAnnouncementDetail(
+  toolName: string,
+  details: ToolAnnouncementDetails,
+): { label: string; text: string } | null {
+  const summary = cleanToolDetail(details.summary)
+  if (summary) return { label: "详情", text: summary }
+
+  const inputObj = objectRecord(details.inputJson) ?? parsePreviewObject(details.inputPreview)
+  if (inputObj) {
+    const picked = pickToolInputDetail(toolName, inputObj)
+    if (picked) return picked
+  }
+
+  const preview = cleanToolDetail(details.inputPreview)
+  if (preview) return { label: "参数", text: preview }
+  return null
+}
+
+function pickToolInputDetail(
+  toolName: string,
+  input: Record<string, unknown>,
+): { label: string; text: string } | null {
+  const n = toolName.trim()
+
+  if (n === "Bash") {
+    return fieldDetail("命令", input, ["command", "cmd", "script"])
+  }
+  if (n === "Read" || n === "Write" || n === "Edit" || n === "NotebookEdit") {
+    return fieldDetail("文件", input, ["file_path", "path", "notebook_path"])
+  }
+  if (n === "Grep") {
+    return joinedDetail("搜索", [scalar(input.pattern), scalar(input.query)], scalar(input.path))
+  }
+  if (n === "Glob") {
+    return joinedDetail("匹配", [scalar(input.pattern)], scalar(input.path))
+  }
+  if (n === "WebSearch") {
+    return fieldDetail("搜索", input, ["query"])
+  }
+  if (n === "WebFetch") {
+    return fieldDetail("网页", input, ["url"])
+  }
+  if (n === "Task") {
+    return fieldDetail("任务", input, ["description", "prompt"])
+  }
+
+  return fieldDetail("参数", input, [
+    "command",
+    "file_path",
+    "path",
+    "pattern",
+    "query",
+    "url",
+    "description",
+    "prompt",
+  ])
+}
+
+function fieldDetail(
+  label: string,
+  input: Record<string, unknown>,
+  keys: string[],
+): { label: string; text: string } | null {
+  for (const key of keys) {
+    const text = cleanToolDetail(scalar(input[key]))
+    if (text) return { label, text }
+  }
+  return null
+}
+
+function joinedDetail(
+  label: string,
+  mainCandidates: Array<string | undefined>,
+  scope: string | undefined,
+): { label: string; text: string } | null {
+  const main = mainCandidates.map((s) => cleanToolDetail(s)).find((s) => s.length > 0)
+  if (!main) return null
+  const cleanScope = cleanToolDetail(scope)
+  return { label, text: cleanScope ? `${main} @ ${cleanScope}` : main }
+}
+
+function cleanToolDetail(value: string | undefined): string {
+  const cleaned = sanitizeForWechat(value ?? "").trim()
+  if (!cleaned) return ""
+  if (cleaned.length <= MAX_TOOL_DETAIL_CHARS) return cleaned
+  return `${cleaned.slice(0, MAX_TOOL_DETAIL_CHARS)}…`
+}
+
+function scalar(value: unknown): string | undefined {
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  return undefined
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
+
+function parsePreviewObject(preview: string | undefined): Record<string, unknown> | null {
+  if (!preview) return null
+  try {
+    return objectRecord(JSON.parse(preview))
+  } catch {
+    return null
+  }
 }

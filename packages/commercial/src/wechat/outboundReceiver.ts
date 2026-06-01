@@ -327,7 +327,11 @@ export function renderWechatBlocks(
         if (showProcess) {
           flushThinking()
           flushText()
-          for (const p of renderToolAnnouncement(b.toolName)) parts.push(p)
+          for (const p of renderToolAnnouncement(b.toolName, {
+            summary: b.summary,
+            inputPreview: b.inputPreview,
+            inputJson: b.inputJson,
+          })) parts.push(p)
         } else {
           dropped++
         }

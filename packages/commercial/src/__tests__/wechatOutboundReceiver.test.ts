@@ -794,10 +794,41 @@ describe("renderWechatBlocks pure function", () => {
     assert.match(r.parts[0]!.text, /读取文件/)
   })
 
+  test("Bash tool_use shows the concrete command", () => {
+    const r = renderWechatBlocks([
+      { kind: "tool_use", toolName: "Bash", inputJson: { command: "ls -la /tmp" } },
+    ])
+    assert.equal(r.parts.length, 1)
+    assert.match(r.parts[0]!.text, /执行命令/)
+    assert.match(r.parts[0]!.text, /命令：ls -la \/tmp/)
+  })
+
+  test("tool_use falls back to JSON inputPreview details", () => {
+    const r = renderWechatBlocks([
+      {
+        kind: "tool_use",
+        toolName: "mcp__demo__custom_tool",
+        inputPreview: JSON.stringify({ query: "微信工具详情" }),
+      },
+    ])
+    assert.equal(r.parts.length, 1)
+    assert.match(r.parts[0]!.text, /custom_tool/)
+    assert.match(r.parts[0]!.text, /参数：微信工具详情/)
+  })
+
+  test("tool_use detail is capped for WeChat", () => {
+    const r = renderWechatBlocks([
+      { kind: "tool_use", toolName: "Bash", inputJson: { command: "a".repeat(500) } },
+    ])
+    assert.equal(r.parts.length, 1)
+    assert.ok(r.parts[0]!.text.length < 380)
+    assert.ok(r.parts[0]!.text.endsWith("…"))
+  })
+
   test("tool_use announcement can be hidden by user preference", () => {
     const r = renderWechatBlocks([
       { kind: "text", text: "查询中。" },
-      { kind: "tool_use", toolName: "Read" },
+      { kind: "tool_use", toolName: "Bash", inputJson: { command: "pwd" } },
       { kind: "text", text: "完成。" },
     ], { showToolCalls: false })
     assert.deepEqual(r.parts, [{ type: "text", text: "查询中。完成。" }])
