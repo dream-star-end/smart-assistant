@@ -22,6 +22,13 @@ export interface WechatBinding {
   lastEventAt: number | null
 }
 
+export class WechatAccountAlreadyBoundError extends Error {
+  constructor(accountId: string) {
+    super(`wechat account already bound: ${accountId}`)
+    this.name = 'WechatAccountAlreadyBoundError'
+  }
+}
+
 interface Row {
   user_id: string
   account_id: string
@@ -54,6 +61,26 @@ function canonicalizeContextTokens(raw: Record<string, string>): Record<string, 
     out[stripImWechatSuffix(k)] = v
   }
   return out
+}
+
+function parseJsonRecord(raw: string | null | undefined): Record<string, string> {
+  try {
+    const parsed = JSON.parse(raw || '{}')
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, string>)
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+function parseJsonStringArray(raw: string | null | undefined): string[] {
+  try {
+    const parsed = JSON.parse(raw || '[]')
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : []
+  } catch {
+    return []
+  }
 }
 
 function rowToBinding(r: Row): WechatBinding {
@@ -111,49 +138,75 @@ export interface UpsertWechatBindingInput {
   contextTokens?: Record<string, string>
   whitelist?: string[]
   status?: WechatBinding['status']
+  lastEventAt?: number | null
 }
 
 export async function upsertWechatBinding(input: UpsertWechatBindingInput): Promise<void> {
   const db = await getSessionsDb()
   const now = Date.now()
+  const accountOwner = db
+    .prepare('SELECT user_id FROM wechat_bindings WHERE account_id = ?')
+    .get(input.accountId) as { user_id: string } | undefined
+  if (accountOwner && accountOwner.user_id !== input.userId) {
+    throw new WechatAccountAlreadyBoundError(input.accountId)
+  }
   const existing = db
     .prepare('SELECT * FROM wechat_bindings WHERE user_id = ?')
     .get(input.userId) as Row | undefined
 
-  const buf = input.getUpdatesBuf ?? existing?.get_updates_buf ?? ''
-  const ctx = JSON.stringify(input.contextTokens ?? (existing ? JSON.parse(existing.context_tokens || '{}') : {}))
+  const identityChanged =
+    !!existing &&
+    (existing.account_id !== input.accountId || existing.bot_token !== input.botToken)
+  const buf = input.getUpdatesBuf ?? (identityChanged ? '' : existing?.get_updates_buf ?? '')
+  const ctx = JSON.stringify(
+    input.contextTokens ?? (identityChanged ? {} : existing ? parseJsonRecord(existing.context_tokens) : {}),
+  )
   const wl = JSON.stringify(
-    input.whitelist ?? (existing ? JSON.parse(existing.whitelist || '[]') : [input.loginUserId].filter(Boolean)),
+    input.whitelist ??
+      (identityChanged
+        ? []
+        : existing
+          ? parseJsonStringArray(existing.whitelist)
+          : [input.loginUserId].filter(Boolean)),
   )
   const status = input.status ?? 'active'
   const createdAt = existing?.created_at ?? now
+  const lastEventAt = input.lastEventAt ?? (identityChanged ? null : existing?.last_event_at ?? null)
 
-  db.prepare(
-    `INSERT INTO wechat_bindings
-       (user_id, account_id, login_user_id, bot_token, get_updates_buf, context_tokens, whitelist, status, created_at, updated_at, last_event_at)
-     VALUES (@userId, @accountId, @loginUserId, @botToken, @buf, @ctx, @wl, @status, @createdAt, @updatedAt, @lastEventAt)
-     ON CONFLICT(user_id) DO UPDATE SET
-       account_id = excluded.account_id,
-       login_user_id = excluded.login_user_id,
-       bot_token = excluded.bot_token,
-       get_updates_buf = excluded.get_updates_buf,
-       context_tokens = excluded.context_tokens,
-       whitelist = excluded.whitelist,
-       status = excluded.status,
-       updated_at = excluded.updated_at`,
-  ).run({
-    userId: input.userId,
-    accountId: input.accountId,
-    loginUserId: input.loginUserId,
-    botToken: input.botToken,
-    buf,
-    ctx,
-    wl,
-    status,
-    createdAt,
-    updatedAt: now,
-    lastEventAt: existing?.last_event_at ?? null,
-  })
+  try {
+    db.prepare(
+      `INSERT INTO wechat_bindings
+         (user_id, account_id, login_user_id, bot_token, get_updates_buf, context_tokens, whitelist, status, created_at, updated_at, last_event_at)
+       VALUES (@userId, @accountId, @loginUserId, @botToken, @buf, @ctx, @wl, @status, @createdAt, @updatedAt, @lastEventAt)
+       ON CONFLICT(user_id) DO UPDATE SET
+         account_id = excluded.account_id,
+         login_user_id = excluded.login_user_id,
+         bot_token = excluded.bot_token,
+         get_updates_buf = excluded.get_updates_buf,
+         context_tokens = excluded.context_tokens,
+         whitelist = excluded.whitelist,
+         status = excluded.status,
+         updated_at = excluded.updated_at,
+         last_event_at = excluded.last_event_at`,
+    ).run({
+      userId: input.userId,
+      accountId: input.accountId,
+      loginUserId: input.loginUserId,
+      botToken: input.botToken,
+      buf,
+      ctx,
+      wl,
+      status,
+      createdAt,
+      updatedAt: now,
+      lastEventAt,
+    })
+  } catch (err: any) {
+    if (/wechat_bindings\.account_id|idx_wechat_bindings_account/i.test(String(err?.message || err))) {
+      throw new WechatAccountAlreadyBoundError(input.accountId)
+    }
+    throw err
+  }
 }
 
 export async function updateWechatBindingCursor(

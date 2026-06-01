@@ -217,6 +217,7 @@ interface BaseDepsOverrides {
   reconcileIntervalMs?: number
   housekeepingIntervalMs?: number
   reconcileGraceMs?: number
+  outboxWorker?: BrokerDeps["outboxWorker"]
 }
 
 function makeDeps(overrides: BaseDepsOverrides = {}): BrokerDeps {
@@ -246,6 +247,7 @@ function makeDeps(overrides: BaseDepsOverrides = {}): BrokerDeps {
     reconcileIntervalMs: overrides.reconcileIntervalMs,
     housekeepingIntervalMs: overrides.housekeepingIntervalMs,
     reconcileGraceMs: overrides.reconcileGraceMs,
+    outboxWorker: overrides.outboxWorker,
   }
 }
 
@@ -650,6 +652,105 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(sendSpy.calls.length, 0, "dispatched 路径不应触发反射")
   })
 
+  test("audit insert sees duplicate (account_id,message_id) → duplicate_audit and dispatcher is skipped", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const pool = {
+      query: async (sql: string) => {
+        if (/SELECT 1 FROM wechat_audit/i.test(sql)) return { rows: [{ "?column?": 1 }], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      },
+      connect: async () => ({
+        query: async () => ({ rows: [], rowCount: 0 }),
+        release: () => {},
+      }),
+    } as unknown as Pool
+    const broker = makeWechatBroker(makeDeps({ dispatcher, pool }))
+    const r = await broker.onInbound(makeEvent({
+      accountId: "acct-audit",
+      messageId: "msg-dupe",
+      rawPayload: { seq: "msg-dupe" },
+      itemTypes: "text",
+    }))
+    assert.equal(r.kind, "duplicate_audit")
+    assert.equal(dispSpy.calls.length, 0)
+  })
+
+  test("audit insert is committed after successful dispatch and uses raw digit binding_user_id", async () => {
+    const events: Array<{ kind: "sql"; sql: string; params?: ReadonlyArray<unknown> } | { kind: "dispatch" }> = []
+    const pool = {
+      query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+        events.push({ kind: "sql", sql, params })
+        if (/SELECT 1 FROM wechat_audit/i.test(sql)) return { rows: [], rowCount: 0 }
+        if (/INSERT INTO wechat_audit/i.test(sql)) return { rows: [], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      },
+      connect: async () => ({
+        query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+          events.push({ kind: "sql", sql, params })
+          return { rows: [], rowCount: 0 }
+        },
+        release: () => {},
+      }),
+    } as unknown as Pool
+    const { dispatcher, spy: dispSpy } = makeDispatcher(() => {
+      events.push({ kind: "dispatch" })
+      return { kind: "dispatched", sessionId: SESSION_A, newSession: false }
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, pool }))
+    const r = await broker.onInbound(makeEvent({
+      bindingUserId: "c:42",
+      accountId: "acct-audit-ok",
+      messageId: "msg-ok",
+      rawPayload: { seq: "msg-ok" },
+      itemTypes: "text",
+    }))
+    assert.equal(r.kind, "dispatched")
+    assert.equal(dispSpy.calls.length, 1)
+    assert.equal(dispSpy.calls[0]!.bindingUserId, "42")
+    const dispatchIdx = events.findIndex((e) => e.kind === "dispatch")
+    const insertIdx = events.findIndex((e) => e.kind === "sql" && /INSERT INTO wechat_audit/i.test(e.sql))
+    assert.ok(dispatchIdx >= 0 && insertIdx > dispatchIdx, "audit row should be committed only after dispatch success")
+    const audit = events[insertIdx]! as { kind: "sql"; sql: string; params?: ReadonlyArray<unknown> }
+    assert.ok(audit, "expected audit insert SQL")
+    assert.equal(audit!.params?.[0], "42")
+    assert.equal(audit!.params?.[1], "acct-audit-ok")
+    assert.equal(audit!.params?.[3], "msg-ok")
+  })
+
+  test("dispatcher failure does not commit audit row, so redelivery can retry", async () => {
+    const queries: Array<{ sql: string; params?: ReadonlyArray<unknown> }> = []
+    const pool = {
+      query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+        queries.push({ sql, params })
+        if (/SELECT 1 FROM wechat_audit/i.test(sql)) return { rows: [], rowCount: 0 }
+        if (/INSERT INTO wechat_audit/i.test(sql)) return { rows: [], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      },
+      connect: async () => ({
+        query: async () => ({ rows: [], rowCount: 0 }),
+        release: () => {},
+      }),
+    } as unknown as Pool
+    const { dispatcher } = makeDispatcher({ throw: new Error("dispatcher down") })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, pool }))
+    const r = await broker.onInbound(makeEvent({
+      accountId: "acct-audit-fail",
+      messageId: "msg-retry",
+      rawPayload: { seq: "msg-retry" },
+      itemTypes: "text",
+    }))
+    assert.equal(r.kind, "broker_failed")
+    assert.equal(
+      queries.some((q) => /INSERT INTO wechat_audit/i.test(q.sql)),
+      false,
+      "failed dispatch must not create a committed audit dedupe row",
+    )
+  })
+
   test("dispatcher → command_echo → outcome 透传 + sendText fire-and-forget reply", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher } = makeDispatcher({
@@ -752,6 +853,47 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "command_echo")
     await flushMicrotasks()
+  })
+})
+
+describe("wechatBroker — cleanupBinding", () => {
+  test("deletes pointer and terminal-fails queued/sending outbox without deleting tombstones", async () => {
+    const queries: Array<{ sql: string; params?: ReadonlyArray<unknown> }> = []
+    const pool = {
+      query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+        queries.push({ sql, params })
+        if (/DELETE FROM wechat_session_pointer/i.test(sql)) return { rows: [], rowCount: 1 }
+        if (/UPDATE wechat_outbox/i.test(sql)) return { rows: [], rowCount: 2 }
+        return { rows: [], rowCount: 0 }
+      },
+      connect: async () => ({
+        query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+          queries.push({ sql, params })
+          return { rows: [], rowCount: 0 }
+        },
+        release: () => {},
+      }),
+    } as unknown as Pool
+    const broker = makeWechatBroker(makeDeps({ pool, outboxWorker: { maxAttempts: 7 } }))
+    const result = await broker.cleanupBinding("c:42")
+
+    assert.deepEqual(result, { pointerDeleted: true, outboxFailed: 2 })
+    const del = queries.find((q) => /DELETE FROM wechat_session_pointer/i.test(q.sql))
+    const upd = queries.find((q) => /UPDATE wechat_outbox/i.test(q.sql))
+    assert.ok(del)
+    assert.ok(upd)
+    assert.equal(del!.params?.[0], "42")
+    assert.equal(upd!.params?.[0], "42")
+    assert.equal(upd!.params?.[1], 7)
+    assert.match(upd!.sql, /status\s+IN\s+\('queued',\s*'sending'\)/i)
+    assert.doesNotMatch(upd!.sql, /DELETE\s+FROM\s+wechat_outbox/i)
+  })
+
+  test("rejects invalid binding ids before touching PG", async () => {
+    const fake = makeFakePool()
+    const broker = makeWechatBroker(makeDeps({ pool: fake.pool }))
+    await assert.rejects(broker.cleanupBinding("c:abc"), /invalid bindingUserId/)
+    assert.equal(fake.calls.length, 0)
   })
 })
 

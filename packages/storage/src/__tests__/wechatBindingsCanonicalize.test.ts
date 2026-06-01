@@ -24,7 +24,11 @@ const testHome = await mkdtemp(join(tmpdir(), 'oc-wechatbindings-'))
 process.env.OPENCLAUDE_HOME = testHome
 
 const { getSessionsDb } = await import('../sessionsDb.js')
-const { getWechatBindingByUserId, upsertWechatBinding } = await import('../wechatBindings.js')
+const {
+  WechatAccountAlreadyBoundError,
+  getWechatBindingByUserId,
+  upsertWechatBinding,
+} = await import('../wechatBindings.js')
 
 async function rawInsert(args: {
   userId: string
@@ -125,5 +129,81 @@ describe('rowToBinding — lazy canonicalization of context_tokens keys', () => 
     const b = await getWechatBindingByUserId('u-bad')
     assert.ok(b)
     assert.deepEqual(b!.contextTokens, {})
+  })
+})
+
+describe('upsertWechatBinding — binding identity safety', () => {
+  it('same user rebinding to a different WeChat identity resets cursor, context, whitelist and lastEventAt', async () => {
+    await upsertWechatBinding({
+      userId: 'u-rebind',
+      accountId: 'acct-old',
+      loginUserId: 'login-old',
+      botToken: 'tok-old',
+      getUpdatesBuf: 'cursor-old',
+      contextTokens: { sender: 'ctx-old' },
+      whitelist: ['sender'],
+      lastEventAt: 12345,
+    })
+    await upsertWechatBinding({
+      userId: 'u-rebind',
+      accountId: 'acct-new',
+      loginUserId: 'login-new',
+      botToken: 'tok-new',
+      status: 'active',
+    })
+    const b = await getWechatBindingByUserId('u-rebind')
+    assert.ok(b)
+    assert.equal(b!.accountId, 'acct-new')
+    assert.equal(b!.loginUserId, 'login-new')
+    assert.equal(b!.botToken, 'tok-new')
+    assert.equal(b!.getUpdatesBuf, '')
+    assert.deepEqual(b!.contextTokens, {})
+    assert.deepEqual(b!.whitelist, [])
+    assert.equal(b!.lastEventAt, null)
+  })
+
+  it('same user refreshing the same identity preserves cursor, context and lastEventAt by default', async () => {
+    await upsertWechatBinding({
+      userId: 'u-refresh',
+      accountId: 'acct-refresh',
+      loginUserId: 'login-refresh',
+      botToken: 'tok-refresh',
+      getUpdatesBuf: 'cursor-1',
+      contextTokens: { sender: 'ctx-1' },
+      whitelist: ['sender'],
+      lastEventAt: 22222,
+    })
+    await upsertWechatBinding({
+      userId: 'u-refresh',
+      accountId: 'acct-refresh',
+      loginUserId: 'login-refresh-2',
+      botToken: 'tok-refresh',
+      status: 'active',
+    })
+    const b = await getWechatBindingByUserId('u-refresh')
+    assert.ok(b)
+    assert.equal(b!.loginUserId, 'login-refresh-2')
+    assert.equal(b!.getUpdatesBuf, 'cursor-1')
+    assert.deepEqual(b!.contextTokens, { sender: 'ctx-1' })
+    assert.deepEqual(b!.whitelist, ['sender'])
+    assert.equal(b!.lastEventAt, 22222)
+  })
+
+  it('rejects binding the same WeChat account to a different OC user', async () => {
+    await upsertWechatBinding({
+      userId: 'u-owner',
+      accountId: 'acct-owned',
+      loginUserId: 'login-owner',
+      botToken: 'tok-owner',
+    })
+    await assert.rejects(
+      upsertWechatBinding({
+        userId: 'u-other',
+        accountId: 'acct-owned',
+        loginUserId: 'login-other',
+        botToken: 'tok-other',
+      }),
+      WechatAccountAlreadyBoundError,
+    )
   })
 })

@@ -446,13 +446,18 @@ export interface CommercialHook {
   wechatBroker?: {
     onInbound(evt: {
       bindingUserId: string
+      accountId?: string
       senderId: string
       text: string
+      messageId?: string
+      itemTypes?: string
+      rawPayload?: unknown
       idempotencyKey: string
       receivedAt: number
       channel?: 'wechat'
       agentId?: string
     }): Promise<unknown>
+    cleanupBinding?(bindingUserId: string): Promise<unknown>
   }
   /**
    * **v1.0.192 — cold-start guard for `/api/uploads`**(以及 commercial 内部
@@ -4414,6 +4419,7 @@ export class Gateway {
       getWechatBindingByUserId,
       deleteWechatBinding,
       updateWechatBindingStatus,
+      WechatAccountAlreadyBoundError,
     } = await import('@openclaude/storage')
 
     // ── POST /api/wechat/pair/start ──
@@ -4440,6 +4446,15 @@ export class Gateway {
         const status = await resumePairing(userId, qrcode)
         this.sendJson(res, 200, status)
       } catch (err: any) {
+        if (err instanceof WechatAccountAlreadyBoundError || err?.name === 'WechatAccountAlreadyBoundError') {
+          this.sendJson(res, 409, {
+            error: {
+              code: 'WECHAT_ACCOUNT_ALREADY_BOUND',
+              message: '该微信已绑定到其他账号，请先解绑或换一个微信',
+            },
+          })
+          return
+        }
         this.sendError(res, 500, `poll failed: ${err?.message || err}`)
       }
       return
@@ -4500,6 +4515,11 @@ export class Gateway {
     // ── DELETE /api/wechat/binding ──
     if (pathname === '/api/wechat/binding' && req.method === 'DELETE') {
       await deleteWechatBinding(userId)
+      try {
+        await this.deps.commercial?.wechatBroker?.cleanupBinding?.(userId)
+      } catch (err: any) {
+        this.log.warn(`[wechat] broker cleanup failed for user=${userId}`, undefined, err)
+      }
       this.sendJson(res, 200, { ok: true })
       return
     }

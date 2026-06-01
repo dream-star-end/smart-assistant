@@ -29,8 +29,16 @@ import { WechatWorker, type InboundEvent } from './worker.js'
  */
 export interface WechatInboundOverrideEvent {
   bindingUserId: string
+  /** iLink bot account id; used by commercial broker audit/dedupe namespace. */
+  accountId?: string
   senderId: string
   text: string
+  /** Stable iLink message id before `idempotencyKey` decoration. */
+  messageId?: string
+  /** Compact comma-separated inbound item kinds, e.g. `text,voice`. */
+  itemTypes?: string
+  /** Full raw iLink message payload for broker audit. */
+  rawPayload?: unknown
   /** Stable per-message dedup key: `wechat:${bindingUserId}:${senderId}:${messageId}` */
   idempotencyKey: string
   /** ms since epoch; sourced from gateway clock at receive time (not Tencent's `CreateTime`) */
@@ -320,8 +328,12 @@ export async function routeWechatInbound(
     try {
       await onInboundOverride({
         bindingUserId: binding.userId,
+        accountId: binding.accountId,
         senderId,
         text,
+        messageId,
+        itemTypes: extractIlinkItemTypes(evt.raw),
+        rawPayload: evt.raw,
         idempotencyKey,
         receivedAt,
         channel: 'wechat',
@@ -348,6 +360,29 @@ export async function routeWechatInbound(
     content: { text },
     ts: receivedAt,
   })
+}
+
+export function extractIlinkItemTypes(raw: unknown): string {
+  const items = Array.isArray((raw as any)?.item_list) ? (raw as any).item_list : []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of items) {
+    const kind = ilinkItemTypeLabel(item)
+    if (!kind || seen.has(kind)) continue
+    seen.add(kind)
+    out.push(kind)
+  }
+  return (out.join(',') || 'unknown').slice(0, 256)
+}
+
+function ilinkItemTypeLabel(item: unknown): string {
+  const t = Number((item as any)?.type)
+  if (t === 1) return 'text'
+  if (t === 2) return 'image'
+  if (t === 3) return 'voice'
+  if (t === 4) return 'video'
+  if (Number.isFinite(t)) return `type:${t}`
+  return 'unknown'
 }
 
 /**

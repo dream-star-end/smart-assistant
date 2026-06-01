@@ -28,13 +28,15 @@ const helpers = new Function(
    const SESSION_EXPIRED_MAX_BACKOFF_MS = 60_000;
    ${extractTopLevelFn(WORKER_SRC, 'sessionExpiredBackoffMs')}
    ${extractTopLevelFn(WORKER_SRC, 'shouldLogSessionExpired')}
-   return { sessionExpiredBackoffMs, shouldLogSessionExpired };`,
+   ${extractTopLevelFn(WORKER_SRC, 'shouldMarkSessionExpiredTerminal')}
+   return { sessionExpiredBackoffMs, shouldLogSessionExpired, shouldMarkSessionExpiredTerminal };`,
 )() as {
   sessionExpiredBackoffMs: (consecutiveExpired: number) => number
   shouldLogSessionExpired: (consecutiveExpired: number, nowMs: number, nextLogAtMs: number) => boolean
+  shouldMarkSessionExpiredTerminal: (consecutiveExpired: number, threshold?: number) => boolean
 }
 
-const { sessionExpiredBackoffMs, shouldLogSessionExpired } = helpers
+const { sessionExpiredBackoffMs, shouldLogSessionExpired, shouldMarkSessionExpiredTerminal } = helpers
 
 describe('WechatWorker session-expired backoff helpers', () => {
   it('backs off 5s → 10s → 20s → 40s → 60s cap', () => {
@@ -50,5 +52,13 @@ describe('WechatWorker session-expired backoff helpers', () => {
     assert.equal(shouldLogSessionExpired(1, 1_000, 999_999), true)
     assert.equal(shouldLogSessionExpired(2, 2_000, 10_000), false)
     assert.equal(shouldLogSessionExpired(9, 10_000, 10_000), true)
+  })
+
+  it('marks persistent session expiry terminal at the threshold', () => {
+    assert.equal(shouldMarkSessionExpiredTerminal(0), false)
+    assert.equal(shouldMarkSessionExpiredTerminal(4), false)
+    assert.equal(shouldMarkSessionExpiredTerminal(5), true)
+    assert.equal(shouldMarkSessionExpiredTerminal(9), true)
+    assert.equal(shouldMarkSessionExpiredTerminal(2, 2), true)
   })
 })

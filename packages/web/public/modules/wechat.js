@@ -171,6 +171,13 @@ async function pollLoop(qrcode) {
       resp = await apiJson('POST', '/api/wechat/pair/poll', { qrcode }, { signal: ctrl.signal, timeout: thisRoundTimeout })
     } catch (e) {
       if (ctrl.signal.aborted) return
+      if (e?.code === 'WECHAT_ACCOUNT_ALREADY_BOUND') {
+        const msg = e.message || '该微信已绑定到其他账号，请先解绑或换一个微信'
+        setError(msg)
+        toast(msg, 'error')
+        showState('unbound')
+        return
+      }
       retries++
       if (retries > 3) {
         setError(`扫码查询失败: ${e?.message || e}`)
