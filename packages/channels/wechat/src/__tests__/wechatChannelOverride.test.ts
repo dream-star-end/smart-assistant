@@ -3,12 +3,14 @@
  * `wechatChannelFactory.handleInbound` (manager.ts).
  *
  * **Slice 7c contract**(broker override hook):
- *   1. /help /model /status 命中 → 只调用 sendText,不进 override / dispatch
+ *   1. /status 命中 → 只调用 sendText,不进 override / dispatch
  *   2. /new 命中 → 调用 ctx.resetSession + sendText,不进 override / dispatch
- *   3. 普通文本 + override 已注入 → 只调 override,不调 ctx.dispatch
- *   4. 普通文本 + override 未注入 → 走 ctx.dispatch 原路径(行为不变)
- *   5. override 抛错 → catch + ctx.log.error,不重抛,也不回落 ctx.dispatch
- *   6. override 收到的 evt 字段:bindingUserId/senderId/text/idempotencyKey/receivedAt/channel
+ *   3. /help /model + override 已注入 → 只调 override,不调 sendText / ctx.dispatch
+ *   4. /help /model + override 未注入 → manager 本地 fallback sendText
+ *   5. 普通文本 + override 已注入 → 只调 override,不调 ctx.dispatch
+ *   6. 普通文本 + override 未注入 → 走 ctx.dispatch 原路径(行为不变)
+ *   7. override 抛错 → catch + ctx.log.error,不重抛,也不回落 ctx.dispatch
+ *   8. override 收到的 evt 字段:bindingUserId/senderId/text/idempotencyKey/receivedAt/channel
  *
  * Run: npx tsx --test packages/channels/wechat/src/__tests__/wechatChannelOverride.test.ts
  */
@@ -111,8 +113,17 @@ function makeDeps(over: Partial<{
 }
 
 describe('routeWechatInbound — /help and /model commands are useful local replies', () => {
-  it('/help lists supported WeChat commands; no override, no dispatch', async () => {
+  it('/help forwards to override when broker is present; no local sendText, no dispatch', async () => {
     const { deps, cap } = makeDeps({ withOverride: true })
+    await routeWechatInbound(makeEvent({ text: '/help' }), deps)
+    assert.equal(cap.overrideCalls.length, 1)
+    assert.equal(cap.dispatchCalls.length, 0)
+    assert.equal(cap.sendTextCalls.length, 0)
+    assert.equal(cap.overrideCalls[0]!.text, '/help')
+  })
+
+  it('/help without override lists supported WeChat commands locally', async () => {
+    const { deps, cap } = makeDeps({ withOverride: false })
     await routeWechatInbound(makeEvent({ text: '/help' }), deps)
     assert.equal(cap.overrideCalls.length, 0)
     assert.equal(cap.dispatchCalls.length, 0)
@@ -122,8 +133,17 @@ describe('routeWechatInbound — /help and /model commands are useful local repl
     assert.match(cap.sendTextCalls[0]!.msg, /\/model/)
   })
 
-  it('/model explains web default model behavior; no override, no dispatch', async () => {
+  it('/model forwards to override when broker is present; no local sendText, no dispatch', async () => {
     const { deps, cap } = makeDeps({ withOverride: true })
+    await routeWechatInbound(makeEvent({ text: '/model' }), deps)
+    assert.equal(cap.overrideCalls.length, 1)
+    assert.equal(cap.dispatchCalls.length, 0)
+    assert.equal(cap.sendTextCalls.length, 0)
+    assert.equal(cap.overrideCalls[0]!.text, '/model')
+  })
+
+  it('/model without override explains web default model behavior locally', async () => {
+    const { deps, cap } = makeDeps({ withOverride: false })
     await routeWechatInbound(makeEvent({ text: '/model' }), deps)
     assert.equal(cap.overrideCalls.length, 0)
     assert.equal(cap.dispatchCalls.length, 0)
@@ -132,13 +152,13 @@ describe('routeWechatInbound — /help and /model commands are useful local repl
     assert.match(cap.sendTextCalls[0]!.msg, /claudeai\.chat/)
   })
 
-  it('/model with args still returns instructions instead of unsupported-command dead end', async () => {
+  it('/model with args forwards to override when broker is present', async () => {
     const { deps, cap } = makeDeps({ withOverride: true })
     await routeWechatInbound(makeEvent({ text: '/model claude-sonnet-4-6' }), deps)
-    assert.equal(cap.overrideCalls.length, 0)
+    assert.equal(cap.overrideCalls.length, 1)
     assert.equal(cap.dispatchCalls.length, 0)
-    assert.equal(cap.sendTextCalls.length, 1)
-    assert.match(cap.sendTextCalls[0]!.msg, /修改后,下一条微信消息会使用新的可用模型/)
+    assert.equal(cap.sendTextCalls.length, 0)
+    assert.equal(cap.overrideCalls[0]!.text, '/model claude-sonnet-4-6')
   })
 })
 

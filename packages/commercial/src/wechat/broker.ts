@@ -169,6 +169,17 @@ export interface BrokerDeps {
   softDeleteMasterSession: (sessionId: WechatSessionId, userId: string) => Promise<void>
   /** 出站(发给用户的 iLink HTTP)— P1.7 实装,P1.6 测试 mock。 */
   sendText: SendTextFn
+  /**
+   * WeChat-local UX commands handled at broker layer.
+   *
+   * `/help` is safe to answer with static text. `/model` needs commercial-only
+   * deps (pricing/authz/preferences), so broker accepts a single injected
+   * command renderer instead of importing billing/user modules here.
+   */
+  wechatUxCommands?: {
+    handleModelCommand: (evt: InboundEvent) => Promise<string>
+    helpText?: () => string
+  }
   /** 读 master sqlite wechat_bindings(per binding 的 botToken + contextTokens)。 */
   getBinding: GetBindingFn
   /**
@@ -322,6 +333,13 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       return { kind: "duplicate_audit", reason: "duplicate_message_id" }
     }
 
+    const localOutcome = await tryHandleLocalUxCommand(dispatchEvt)
+    if (localOutcome) {
+      await insertCommittedAudit(evt, dispatchBindingUserId)
+      fireAndForgetReflection(evt, localOutcome.reply, "command_echo")
+      return localOutcome
+    }
+
     let outcome: DispatchOutcome
     try {
       outcome = await deps.dispatcher.dispatch(dispatchEvt)
@@ -349,6 +367,80 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       fireAndForgetReflection(evt, outcome.coldStartReply, "cold_start")
     }
     return outcome
+  }
+
+  async function tryHandleLocalUxCommand(evt: InboundEvent): Promise<Extract<DispatchOutcome, { kind: "command_echo" }> | null> {
+    const mediaReply = friendlyUnsupportedMediaReply(evt)
+    if (mediaReply) return { kind: "command_echo", reply: mediaReply }
+
+    const text = evt.text.trim()
+    if (/^\/help$/i.test(text)) {
+      return {
+        kind: "command_echo",
+        reply: deps.wechatUxCommands?.helpText?.() ?? defaultWechatHelpText(),
+      }
+    }
+
+    if (/^\/model(?:\s+.*)?$/i.test(text)) {
+      if (!deps.wechatUxCommands) {
+        return {
+          kind: "command_echo",
+          reply: [
+            "微信会跟随你在网页端选择的默认模型。",
+            "如需切换模型,请打开 claudeai.chat,在聊天页顶部的模型选择器修改。",
+          ].join("\n"),
+        }
+      }
+      try {
+        return {
+          kind: "command_echo",
+          reply: await deps.wechatUxCommands.handleModelCommand(evt),
+        }
+      } catch (err) {
+        log.error("wechat_model_command_failed", {
+          bindingUserId: evt.bindingUserId,
+          idempotencyKey: evt.idempotencyKey,
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        return {
+          kind: "command_echo",
+          reply: "暂时无法读取模型列表。请稍后再试；也可以在网页端切换默认模型。",
+        }
+      }
+    }
+
+    return null
+  }
+
+  function defaultWechatHelpText(): string {
+    return [
+      "微信里可以这样用 OpenClaude:",
+      "• 直接发消息:继续当前会话",
+      "• /new:开启新会话",
+      "• /status:查看绑定和 worker 状态",
+      "• /model:查看可用模型",
+      "• /model 2 或 /model <模型ID>:切换默认模型",
+    ].join("\n")
+  }
+
+  function friendlyUnsupportedMediaReply(evt: InboundEvent): string | null {
+    const text = evt.text.trim()
+    if (text.length > 0) return null
+    const types = new Set(
+      String(evt.itemTypes ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    )
+    const labels: string[] = []
+    if (types.has("image")) labels.push("图片")
+    if (types.has("voice")) labels.push("语音")
+    if (types.has("video")) labels.push("视频")
+    if (labels.length === 0) return null
+    return [
+      `我收到了一条${labels.join("/")}消息。`,
+      "当前微信通道主要支持文字对话；请补充一段文字说明，或在网页端上传图片/文件后继续。",
+    ].join("\n")
   }
 
   async function hasCommittedAuditDuplicate(evt: InboundEvent): Promise<boolean | "skipped" | "failed"> {

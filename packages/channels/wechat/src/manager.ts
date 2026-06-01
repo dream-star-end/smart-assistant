@@ -256,11 +256,13 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
  * up a real `WechatWorker` long-poll loop.
  *
  * **Invariants**(测试套件 wechatChannelOverride.test.ts 断言):
- *   1. `/help` / `/model` / `/status` 命中 → 只调用 `sendText`,**不**进 override / dispatch
+ *   1. `/status` 命中 → 只调用 `sendText`,**不**进 override / dispatch
  *   2. `/new` 命中 → 调用 `ctx.resetSession` + `sendText` 反馈,**不**进 override / dispatch
- *   3. 普通文本 + `onInboundOverride` 已注入 → **只**调 override,**不**调 `ctx.dispatch`
- *   4. 普通文本 + `onInboundOverride` 未注入 → 走原 `ctx.dispatch` 路径
- *   5. override 抛错 → catch + log,**不**重抛(避免污染 worker long-poll loop),
+ *   3. `/help` / `/model` + `onInboundOverride` 已注入 → 交给 broker 产出商业版友好回复
+ *   4. `/help` / `/model` + `onInboundOverride` 未注入 → manager 本地 fallback 回复
+ *   5. 普通文本 + `onInboundOverride` 已注入 → **只**调 override,**不**调 `ctx.dispatch`
+ *   6. 普通文本 + `onInboundOverride` 未注入 → 走原 `ctx.dispatch` 路径
+ *   7. override 抛错 → catch + log,**不**重抛(避免污染 worker long-poll loop),
  *      也**不**回落到 `ctx.dispatch`(broker 失败应由 master tryCompensation 兜底,
  *      不能让消息走两套不同的 session 命名空间造成串场)
  */
@@ -286,8 +288,42 @@ export async function routeWechatInbound(
   // OC owner wants the bot fully open; access control is the WeChat-side
   // friend relationship, not something we replicate here.
 
-  // ── /help — advertise the small set of WeChat-safe controls ──
+  // peer.id embeds the OC user binding so routes and session keys can not
+  // collide across users who happen to share a WeChat sender id.
+  const peerId = `${binding.userId}:${senderId}`
+  const idempotencyKey = `wechat:${binding.userId}:${senderId}:${messageId}`
+  const receivedAt = now()
+
+  const forwardToOverride = async (): Promise<void> => {
+    if (!onInboundOverride) return
+    try {
+      await onInboundOverride({
+        bindingUserId: binding.userId,
+        accountId: binding.accountId,
+        senderId,
+        text,
+        messageId,
+        itemTypes: extractIlinkItemTypes(evt.raw),
+        rawPayload: evt.raw,
+        idempotencyKey,
+        receivedAt,
+        channel: 'wechat',
+      })
+    } catch (err: any) {
+      // 不重抛:worker long-poll loop 不应因 broker 失败而停摆;compensate
+      // 由 master 侧 broker.tryCompensation 兜底(参 RFC §4.5)。
+      // 不回落 ctx.dispatch —— 否则同一条消息会走两套 session 命名空间,
+      // 灰度阶段把 boss 自己的 personal-OC 会话和 broker 的 wsess-* 会话搅在一起。
+      ctx.log.error(`[wechat] broker override err for user=${binding.userId} sender=${senderId}: ${err?.message || err}`)
+    }
+  }
+
+  // ── /help — commercial broker can render richer WeChat-specific help ──
   if (/^\s*\/help\s*$/.test(text)) {
+    if (onInboundOverride) {
+      await forwardToOverride()
+      return
+    }
     sendText(
       binding.userId,
       senderId,
@@ -302,8 +338,12 @@ export async function routeWechatInbound(
     return
   }
 
-  // ── /model — explain model behavior instead of a dead-end unsupported reply ──
+  // ── /model — commercial broker supports listing / switching models ──
   if (/^\s*\/model(?:\s+.*)?$/.test(text)) {
+    if (onInboundOverride) {
+      await forwardToOverride()
+      return
+    }
     sendText(
       binding.userId,
       senderId,
@@ -333,7 +373,6 @@ export async function routeWechatInbound(
 
   // ── /new — start a fresh OpenClaude session for this sender ──
   if (/^\s*\/new\s*$/.test(text)) {
-    const peerId = `${binding.userId}:${senderId}`
     try {
       if (ctx.resetSession) await ctx.resetSession('wechat', peerId, 'dm')
       sendText(binding.userId, senderId, '已开启新会话。下一条消息将由全新的 agent 处理。')
@@ -343,38 +382,13 @@ export async function routeWechatInbound(
     return
   }
 
-  // peer.id embeds the OC user binding so routes and session keys can not
-  // collide across users who happen to share a WeChat sender id.
-  const peerId = `${binding.userId}:${senderId}`
-  const idempotencyKey = `wechat:${binding.userId}:${senderId}:${messageId}`
-  const receivedAt = now()
-
   // P1.7 slice 7c — broker override 路径(commercial 装配 + WECHAT_BROKER_ENABLED=1 时
   // 注入)。命中后整条 inbound 改走 broker → dispatcher → container 链路,**不**
   // 再调 ctx.dispatch —— 否则 master 侧 personal-OC session 会和 broker 的
   // wsess-* client_sessions 命名空间打架,boss-self-binding 灰度的会话隔离失效。
   // /status /new 在上面已经 return,这里到不了,broker 不会被这些控制命令污染。
   if (onInboundOverride) {
-    try {
-      await onInboundOverride({
-        bindingUserId: binding.userId,
-        accountId: binding.accountId,
-        senderId,
-        text,
-        messageId,
-        itemTypes: extractIlinkItemTypes(evt.raw),
-        rawPayload: evt.raw,
-        idempotencyKey,
-        receivedAt,
-        channel: 'wechat',
-      })
-    } catch (err: any) {
-      // 不重抛:worker long-poll loop 不应因 broker 失败而停摆;compensate
-      // 由 master 侧 broker.tryCompensation 兜底(参 RFC §4.5)。
-      // 不回落 ctx.dispatch —— 否则同一条消息会走两套 session 命名空间,
-      // 灰度阶段把 boss 自己的 personal-OC 会话和 broker 的 wsess-* 会话搅在一起。
-      ctx.log.error(`[wechat] broker override err for user=${binding.userId} sender=${senderId}: ${err?.message || err}`)
-    }
+    await forwardToOverride()
     return
   }
 
