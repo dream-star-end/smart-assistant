@@ -869,6 +869,144 @@ describe("inboundDispatcher — wire correctness", () => {
     assert.equal("model" in spy.posts[0]!.bodyParsed, false)
   })
 
+  test("gpt model prepares Codex turn and injects requestId + api relay route", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveModel: async () => "gpt-5.5",
+        prepareCodexTurn: async (args) => {
+          assert.equal(args.containerId, CONTAINER_ID)
+          assert.equal(args.bindingUserId, BINDING_UID)
+          assert.equal(args.userId, BigInt(BINDING_UID))
+          assert.equal(args.modelId, "gpt-5.5")
+          assert.equal(args.agentId, "main")
+          return {
+            kind: "ready",
+            requestId: "0123456789abcdef0123456789abcdef",
+            routeFrame: {
+              baseUrl: "http://127.0.0.1:18789/internal/v3/codex-relay/route/abc",
+              modelProvider: "route_provider",
+              providerName: null,
+              wireApi: "responses",
+              preferredAuthMethod: "apikey",
+              disableResponseStorage: true,
+            },
+          }
+        },
+      }),
+    )
+    await d.dispatch(makeEvent())
+    assert.equal(spy.posts[0]!.bodyParsed.model, "gpt-5.5")
+    assert.equal(spy.posts[0]!.bodyParsed.requestId, "0123456789abcdef0123456789abcdef")
+    assert.deepEqual(
+      spy.posts[0]!.bodyParsed.__oc_codex_route,
+      {
+        baseUrl: "http://127.0.0.1:18789/internal/v3/codex-relay/route/abc",
+        modelProvider: "route_provider",
+        providerName: null,
+        wireApi: "responses",
+        preferredAuthMethod: "apikey",
+        disableResponseStorage: true,
+      },
+    )
+  })
+
+  test("non-gpt model does not prepare Codex turn", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    let prepareCalls = 0
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveModel: async () => "claude-sonnet-4-6",
+        prepareCodexTurn: async () => {
+          prepareCalls++
+          throw new Error("should not be called")
+        },
+      }),
+    )
+    await d.dispatch(makeEvent())
+    assert.equal(prepareCalls, 0)
+    assert.equal("requestId" in spy.posts[0]!.bodyParsed, false)
+    assert.equal("__oc_codex_route" in spy.posts[0]!.bodyParsed, false)
+  })
+
+  test("prepareCodexTurn unavailable returns local reply and does not POST", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveModel: async () => "gpt-5.5",
+        prepareCodexTurn: async () => ({ kind: "unavailable", reply: "GPT unavailable" }),
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") assert.equal(r.reply, "GPT unavailable")
+    assert.equal(spy.posts.length, 0)
+  })
+
+  test("definite Step1 4xx failure aborts prepared Codex turn", async () => {
+    const { transport } = makeTransport([{ status: 400, bodyText: "bad route" }])
+    const failed: string[] = []
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveModel: async () => "gpt-5.5",
+        prepareCodexTurn: async () => ({
+          kind: "ready",
+          requestId: "0123456789abcdef0123456789abcdef",
+          routeFrame: {
+            baseUrl: "http://127.0.0.1:18789/internal/v3/codex-relay/route/abc",
+            modelProvider: "route_provider",
+            providerName: null,
+            wireApi: "responses",
+            preferredAuthMethod: "apikey",
+            disableResponseStorage: true,
+          },
+        }),
+        failCodexTurn: async (requestId, reason) => {
+          failed.push(`${requestId}:${reason}`)
+        },
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "container_rejected")
+    assert.deepEqual(failed, ["0123456789abcdef0123456789abcdef:wechat_container_rejected_400"])
+  })
+
+  test("ambiguous Step1 transport failure leaves prepared Codex turn for timeout cleanup", async () => {
+    const { transport } = makeTransport([
+      { throw: new Error("timeout 1") },
+      { throw: new Error("timeout 2") },
+    ])
+    let failCalls = 0
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveModel: async () => "gpt-5.5",
+        prepareCodexTurn: async () => ({
+          kind: "ready",
+          requestId: "0123456789abcdef0123456789abcdef",
+          routeFrame: {
+            baseUrl: "http://127.0.0.1:18789/internal/v3/codex-relay/route/abc",
+            modelProvider: "route_provider",
+            providerName: null,
+            wireApi: "responses",
+            preferredAuthMethod: "apikey",
+            disableResponseStorage: true,
+          },
+        }),
+        failCodexTurn: async () => {
+          failCalls++
+        },
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "transport_failed")
+    assert.equal(failCalls, 0)
+  })
+
   test("body content === { text } (no kind / no rawItemTypes / no sessionMeta)", async () => {
     const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
     const d = makeInboundDispatcher(makeDeps({ transport }))

@@ -2600,6 +2600,36 @@ export class Gateway {
       this.sendJson(res, 400, { error: 'model unsupported for inbound dispatch' })
       return
     }
+    const requestId = body.requestId
+    if (requestId !== undefined && (typeof requestId !== 'string' || !/^[0-9a-f]{32}$/.test(requestId))) {
+      this.sendJson(res, 400, { error: 'requestId must be 32 lowercase hex chars' })
+      return
+    }
+    const rawCodexRoute = body.__oc_codex_route
+    if (rawCodexRoute !== undefined) {
+      if (typeof model !== 'string' || !model.startsWith('gpt-')) {
+        this.sendJson(res, 400, { error: 'codex route requires explicit gpt model' })
+        return
+      }
+      if (
+        !rawCodexRoute ||
+        typeof rawCodexRoute !== 'object' ||
+        Array.isArray(rawCodexRoute) ||
+        (rawCodexRoute as Record<string, unknown>).kind === 'official_oauth'
+      ) {
+        this.sendJson(res, 400, { error: 'codex route override invalid for wechat inbound' })
+        return
+      }
+      const safeWechatCodexRoute = _buildSafeCodexRouteOverride({
+        agentProvider: 'codex-native',
+        model,
+        rawRoute: rawCodexRoute,
+      })
+      if (safeWechatCodexRoute === null || Object.keys(safeWechatCodexRoute).length === 0) {
+        this.sendJson(res, 400, { error: 'codex route override invalid for wechat inbound' })
+        return
+      }
+    }
     const contentRaw = body.content as Record<string, unknown> | undefined
     if (!contentRaw || typeof contentRaw !== 'object') {
       this.sendJson(res, 400, { error: 'content required' })
@@ -2651,6 +2681,8 @@ export class Gateway {
       peer: peerOut,
       ...(typeof agentId === 'string' ? { agentId } : {}),
       ...(typeof model === 'string' ? { model } : {}),
+      ...(typeof requestId === 'string' ? { requestId } : {}),
+      ...(rawCodexRoute !== undefined ? { __oc_codex_route: rawCodexRoute } : {}),
       content: { text },
       ts,
     }

@@ -85,6 +85,7 @@ const COLD_START_REPLY = "正在唤醒你的 OpenClaude 容器，通常几秒钟
 
 /** 命令短路反射文案。文案稳定 — 测试断言依赖。 */
 const COMMAND_ECHO_REPLY = "暂不支持这个命令。发送 /help 查看微信里可用的命令，或直接发送问题。"
+const CODEX_TEMP_UNAVAILABLE_REPLY = "GPT 模型通道暂时不可用，请稍后再试，或发送 /model 切换到其它模型。"
 
 /** 默认 session title fallback(空白文本 / 全 emoji 截断后空时使用)。 */
 const DEFAULT_SESSION_TITLE = "微信会话"
@@ -184,6 +185,25 @@ export interface ContainerTransport {
   supportsTunnel?: boolean
 }
 
+export interface WechatCodexRouteFrame {
+  baseUrl: string
+  modelProvider: string
+  providerName: string | null
+  wireApi: "responses" | "chat"
+  preferredAuthMethod: "apikey" | "chatgpt"
+  disableResponseStorage: boolean
+}
+
+export type PrepareWechatCodexTurnResult =
+  | {
+      kind: "ready"
+      /** 32-hex master-owned request id used for Codex billing correlation. */
+      requestId: string
+      /** Private master-owned api-relay route; WeChat deliberately does not support official_oauth here. */
+      routeFrame: WechatCodexRouteFrame
+    }
+  | { kind: "unavailable"; reply?: string }
+
 export interface InboundDispatcherDeps {
   pgPool: PgConn
   resolveContainerEndpoint: ResolveContainerEndpoint
@@ -222,6 +242,28 @@ export interface InboundDispatcherDeps {
    * transient preferences/authz lookup failure does not drop the inbound text.
    */
   resolveModel?: (bindingUserId: string) => Promise<string | null | undefined>
+  /**
+   * Prepare a WeChat Codex turn before dispatching to the container.
+   *
+   * Commercial wiring creates an api-relay route, performs billing precheck,
+   * registers the pending finalizer, and returns the private route + requestId
+   * to inject into the container frame. `unavailable` means reply locally and do
+   * not POST to the container. Undefined preserves non-commercial/test fallback.
+   */
+  prepareCodexTurn?: (args: {
+    containerId: number
+    bindingUserId: string
+    userId: bigint
+    modelId: string
+    agentId: string
+    traceId: string
+  }) => Promise<PrepareWechatCodexTurnResult>
+  /**
+   * Abort a prepared Codex turn when the container definitely did not dispatch
+   * it (schema/auth/cold-start pre-dispatch responses). Ambiguous transport/5xx
+   * failures intentionally do not call this; the pending timeout owns cleanup.
+   */
+  failCodexTurn?: (requestId: string, reason: string) => Promise<void>
   /** 单次 Step 1 timeout;默认 5000 ms。 */
   step1TimeoutMs?: number
   /** Step 1 失败后单次退避重试间隔;默认 250 ms。 */
@@ -337,6 +379,46 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       const nonce = computeInboundNonce(deps.bridgeSecret, endpoint.containerId)
       const sessionTitle = deriveSessionTitle(evt.text)
       const model = await resolveModelForDispatch(evt.bindingUserId, deps.resolveModel, reqLog)
+      let preparedCodexTurn: Extract<PrepareWechatCodexTurnResult, { kind: "ready" }> | null = null
+      if (model?.startsWith("gpt-") && deps.prepareCodexTurn) {
+        try {
+          const prepared = await deps.prepareCodexTurn({
+            containerId: endpoint.containerId,
+            bindingUserId: evt.bindingUserId,
+            userId: BigInt(evt.bindingUserId),
+            modelId: model,
+            agentId,
+            traceId: requestId,
+          })
+          if (prepared.kind === "unavailable") {
+            reqLog.warn("codex_turn_unavailable", { model })
+            return {
+              kind: "command_echo",
+              reply: prepared.reply ?? CODEX_TEMP_UNAVAILABLE_REPLY,
+            }
+          }
+          preparedCodexTurn = prepared
+        } catch (err) {
+          reqLog.error("prepare_codex_turn_failed", {
+            model,
+            errMessage: (err as Error)?.message ?? String(err),
+          })
+          return { kind: "command_echo", reply: CODEX_TEMP_UNAVAILABLE_REPLY }
+        }
+      }
+
+      const failPreparedCodexTurn = async (reason: string): Promise<void> => {
+        if (!preparedCodexTurn || !deps.failCodexTurn) return
+        try {
+          await deps.failCodexTurn(preparedCodexTurn.requestId, reason)
+        } catch (err) {
+          reqLog.warn("fail_prepared_codex_turn_failed", {
+            reason,
+            requestId: preparedCodexTurn.requestId,
+            errMessage: (err as Error)?.message ?? String(err),
+          })
+        }
+      }
 
       // ── 3) Step 1: POST 容器 /internal/v3/wechat-inbound ──────────────
       //
@@ -370,6 +452,12 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         ts: evt.receivedAt,
         agentId,
         ...(model ? { model } : {}),
+        ...(preparedCodexTurn
+          ? {
+              requestId: preparedCodexTurn.requestId,
+              __oc_codex_route: preparedCodexTurn.routeFrame,
+            }
+          : {}),
         content: { text: evt.text },
       }
       const wireHeaders: Record<string, string> = {
@@ -405,6 +493,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         // 否则 fallback 到默认 3s。
         const retryAfterSec = parseRetryAfterSec(step1.response)
         reqLog.info("container_cold_start", { retryAfterSec })
+        await failPreparedCodexTurn("wechat_container_cold_start")
         return {
           kind: "cold_start",
           reason: "container_internal_cold",
@@ -422,6 +511,9 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         const retryable = step1.response.status >= 500 && step1.response.status < 600
         const truncBody = step1.response.bodyText.slice(0, 256)
         reqLog.warn("step1_container_rejected", { status: step1.response.status, retryable })
+        if (step1.response.status >= 400 && step1.response.status < 500) {
+          await failPreparedCodexTurn(`wechat_container_rejected_${step1.response.status}`)
+        }
         return {
           kind: "container_rejected",
           status: step1.response.status,

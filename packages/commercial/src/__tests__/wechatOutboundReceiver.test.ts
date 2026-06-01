@@ -27,6 +27,7 @@ import {
   makeOutboundReceiverHandler,
   renderWechatBlocks,
   WECHAT_OUTBOUND_PATH,
+  type WechatCodexBillingBody,
   type OutboundReceiverBody,
   type OutboundReceiverCtx,
   type OutboundReceiverDeps,
@@ -387,6 +388,70 @@ describe("outboundReceiver — rate-limit gate", () => {
     await handler(authedReq(validBody()), res, CTX)
     assert.equal(rec.status, 429)
     assert.match(rec.body, /RATE_LIMIT/)
+  })
+})
+
+// ─── codex billing sideband ────────────────────────────────────────────────
+
+describe("outboundReceiver — codex billing sideband", () => {
+  const billingBody: WechatCodexBillingBody = {
+    type: "outbound.codex_billing",
+    requestId: "0123456789abcdef0123456789abcdef",
+    status: "success",
+    durationMs: 123,
+    usage: { input_tokens: 11, output_tokens: 22 },
+    traceId: "trc-billing-1",
+  }
+
+  test("billing bypasses outbound message rate-limit and does not enqueue", async () => {
+    const calls: Array<{ body: WechatCodexBillingBody; userId: number; containerId: number }> = []
+    const handler = makeOutboundReceiverHandler(
+      makeDeps({
+        rateLimiter: blockedRateLimiter,
+        pool: makeFakePool({ mode: "noop" }).pool,
+        handleCodexBilling: async (body, identity) => {
+          calls.push({ body, userId: identity.userId, containerId: identity.containerId })
+        },
+      }),
+    )
+    const { res, rec } = makeRes()
+    await handler(authedReq(billingBody), res, CTX)
+    assert.equal(rec.status, 200)
+    assert.deepEqual(JSON.parse(rec.body), {
+      ok: true,
+      accepted: true,
+      outcome: "codex_billing",
+      scheduled: false,
+    })
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]!.body.requestId, billingBody.requestId)
+    assert.equal(calls[0]!.body.usage?.input_tokens, 11)
+    assert.equal(calls[0]!.userId, VALID_USER_ID)
+    assert.equal(calls[0]!.containerId, 7)
+  })
+
+  test("billing is rejected explicitly when handler is not wired", async () => {
+    const handler = makeOutboundReceiverHandler(makeDeps())
+    const { res, rec } = makeRes()
+    await handler(authedReq(billingBody), res, CTX)
+    assert.equal(rec.status, 503)
+    assert.match(rec.body, /CODEX_BILLING_NOT_WIRED/)
+  })
+
+  test("billing schema enforces requestId shape before handler", async () => {
+    let called = false
+    const handler = makeOutboundReceiverHandler(
+      makeDeps({
+        handleCodexBilling: async () => {
+          called = true
+        },
+      }),
+    )
+    const { res, rec } = makeRes()
+    await handler(authedReq({ ...billingBody, requestId: "not-hex" }), res, CTX)
+    assert.equal(rec.status, 400)
+    assert.match(rec.body, /INVALID_BODY/)
+    assert.equal(called, false)
   })
 })
 

@@ -126,6 +126,11 @@ function fakeQueue(): FakeQueue {
   return q
 }
 
+function messagePayload(entry: V3WechatRetryEntry): V3WechatSinkWirePayload {
+  assert.notEqual((entry.payload as { type?: unknown }).type, "outbound.codex_billing")
+  return entry.payload as V3WechatSinkWirePayload
+}
+
 function makeCtx(): import("@openclaude/plugin-sdk").ChannelContext {
   return {
     log: {
@@ -384,6 +389,95 @@ describe("attemptSend — body cap", () => {
 // ─── adapter.send orchestration ─────────────────────────────────────────
 
 describe("makeV3WechatOutboundAdapter — send orchestration", () => {
+  test("codex billing frame posts compact sideband and bypasses message payload validation", async () => {
+    const q = fakeQueue()
+    const captured: any[] = []
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async (payload) => {
+        captured.push(payload)
+      },
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!({
+      type: "outbound.codex_billing",
+      channel: "wechat",
+      requestId: "0123456789abcdef0123456789abcdef",
+      status: "success",
+      durationMs: 321,
+      usage: { input_tokens: 10, output_tokens: 20 },
+      rateLimits: { util5h: 0.1, reset5h: "2026-06-01T00:00:00Z" },
+      traceId: "trc-codex-billing",
+    } as unknown as OutboundMessage)
+    assert.equal(captured.length, 1)
+    assert.deepEqual(captured[0], {
+      type: "outbound.codex_billing",
+      requestId: "0123456789abcdef0123456789abcdef",
+      status: "success",
+      durationMs: 321,
+      usage: { input_tokens: 10, output_tokens: 20 },
+      rateLimits: { util5h: 0.1, reset5h: "2026-06-01T00:00:00Z" },
+      traceId: "trc-codex-billing",
+    })
+    assert.equal(q.enqueued.length, 0)
+  })
+
+  test("invalid codex billing requestId is dropped before POST", async () => {
+    const q = fakeQueue()
+    let attempted = false
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        attempted = true
+      },
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!({
+      type: "outbound.codex_billing",
+      channel: "wechat",
+      requestId: "BAD",
+      status: "success",
+      durationMs: 1,
+    } as unknown as OutboundMessage)
+    assert.equal(attempted, false)
+    assert.equal(q.enqueued.length, 0)
+  })
+
+  test("transient codex billing sink error enqueues durable retry", async () => {
+    const q = fakeQueue()
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        throw new V3WechatSinkError("master 503", "transient", 503)
+      },
+      now: () => 1_700_000_000_000,
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!({
+      type: "outbound.codex_billing",
+      channel: "wechat",
+      requestId: "0123456789abcdef0123456789abcdef",
+      status: "success",
+      durationMs: 321,
+      usage: { input_tokens: 10, output_tokens: 20 },
+    } as unknown as OutboundMessage)
+    assert.equal(q.enqueued.length, 1)
+    const entry = q.enqueued[0]!
+    assert.equal(entry.schemaVersion, 1)
+    assert.equal(entry.attempts, 1)
+    assert.equal(entry.lastErrorClass, "transient")
+    assert.deepEqual(entry.payload, {
+      type: "outbound.codex_billing",
+      requestId: "0123456789abcdef0123456789abcdef",
+      status: "success",
+      durationMs: 321,
+      usage: { input_tokens: 10, output_tokens: 20 },
+    })
+  })
+
   test("2xx success → no enqueue", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({
@@ -427,10 +521,11 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     assert.equal(entry.schemaVersion, 1)
     assert.equal(entry.attempts, 1)
     assert.equal(entry.lastErrorClass, "transient")
-    assert.equal(entry.payload.sessionId, SESSION_ID)
-    assert.equal(entry.payload.peer.meta.senderId, SENDER_ID)
-    assert.equal(entry.payload.channel, "wechat")
-    assert.equal(entry.payload.agentId, "main")
+    const payload = messagePayload(entry)
+    assert.equal(payload.sessionId, SESSION_ID)
+    assert.equal(payload.peer.meta.senderId, SENDER_ID)
+    assert.equal(payload.channel, "wechat")
+    assert.equal(payload.agentId, "main")
   })
 
   test("non-V3WechatSinkError thrown by attempt → enqueue as transient", async () => {
@@ -572,7 +667,7 @@ describe("makeV3WechatOutboundAdapter — wire payload assembly", () => {
     })
     await adapter.init!(makeCtx())
     await adapter.send!(makeOut({ traceId: "trace_abc123def4567890" }))
-    assert.equal(q.enqueued[0]!.payload.outboundId, "trace_abc123def4567890")
+    assert.equal(messagePayload(q.enqueued[0]!).outboundId, "trace_abc123def4567890")
   })
 
   test("traceId absent → outboundId derived from sessionId + ts + rand", async () => {
@@ -587,7 +682,7 @@ describe("makeV3WechatOutboundAdapter — wire payload assembly", () => {
     })
     await adapter.init!(makeCtx())
     await adapter.send!(makeOut())
-    const oid = q.enqueued[0]!.payload.outboundId
+    const oid = messagePayload(q.enqueued[0]!).outboundId
     assert.ok(oid.startsWith(`${SESSION_ID}.1700000000000.`), `derived outboundId shape: ${oid}`)
     assert.ok(/^[A-Za-z0-9._:-]{8,128}$/.test(oid))
   })

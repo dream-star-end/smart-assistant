@@ -40,6 +40,7 @@ import { z } from "zod"
 import {
   ContainerIdentityError,
   verifyContainerIdentity,
+  type ContainerIdentity,
   type ContainerIdentityRepo,
 } from "../auth/containerIdentity.js"
 import {
@@ -198,6 +199,43 @@ const BodySchema = z
 
 export type OutboundReceiverBody = z.infer<typeof BodySchema>
 
+const CodexBillingBodySchema = z
+  .object({
+    type: z.literal("outbound.codex_billing"),
+    requestId: z.string().regex(/^[0-9a-f]{32}$/, {
+      message: "requestId must be 32 lowercase hex chars",
+    }),
+    status: z.union([z.literal("success"), z.literal("error")]),
+    durationMs: z.number().finite().nonnegative(),
+    usage: z
+      .object({
+        input_tokens: z.number().finite().optional(),
+        output_tokens: z.number().finite().optional(),
+        cache_read_input_tokens: z.number().finite().optional(),
+        cache_creation_input_tokens: z.number().finite().optional(),
+        reasoning_output_tokens: z.number().finite().optional(),
+      })
+      .strict()
+      .optional(),
+    errorReason: z.string().max(500).optional(),
+    rateLimits: z
+      .object({
+        util5h: z.number().finite().optional(),
+        reset5h: z.string().max(128).optional(),
+        util7d: z.number().finite().optional(),
+        reset7d: z.string().max(128).optional(),
+      })
+      .strict()
+      .optional(),
+    traceId: z
+      .string()
+      .regex(TRACE_ID_RE, { message: "traceId must match [A-Za-z0-9._:-]{1,128}" })
+      .optional(),
+  })
+  .strict()
+
+export type WechatCodexBillingBody = z.infer<typeof CodexBillingBodySchema>
+
 /** 渲染结果分类。renderEmpty 时不入队,返 200 + `outcome:"empty_render"`。 */
 type RenderResult = { parts: IlinkPart[]; dropped: number }
 
@@ -250,6 +288,12 @@ export interface OutboundReceiverDeps {
   identityRepo: ContainerIdentityRepo
   pool: Pool
   rateLimiter: RateLimiter
+  /**
+   * Optional internal sideband handler for Codex billing frames. Billing frames
+   * are authenticated with the same container identity as normal WeChat
+   * outbound, but bypass message outbox rate limiting/rendering.
+   */
+  handleCodexBilling?: (body: WechatCodexBillingBody, identity: ContainerIdentity) => Promise<void>
   /** outbox 最大尝试数;default = DEFAULT_MAX_ATTEMPTS。 */
   maxAttempts?: number
   logger?: Logger
@@ -318,9 +362,53 @@ export function makeOutboundReceiverHandler(
     const userLog = reqLog.child({ uid: identity.userId, containerId: identity.containerId })
 
     // 2) Body 读 + zod schema parse
-    let body: OutboundReceiverBody
+    let raw: unknown
     try {
-      const raw = await readBoundedJson(req, MAX_BODY_BYTES)
+      raw = await readBoundedJson(req, MAX_BODY_BYTES)
+    } catch (err) {
+      if (err instanceof HttpError) {
+        sendJsonError(res, err.status, err.code, err.message, requestId)
+        return
+      }
+      throw err
+    }
+
+    // Internal Codex billing sideband. It must run before normal WeChat
+    // outbound rate limiting/render/enqueue, otherwise a user-visible message
+    // throttle could delay billing until the pending turn times out.
+    const billingParsed = CodexBillingBodySchema.safeParse(raw)
+    if (billingParsed.success) {
+      if (!deps.handleCodexBilling) {
+        userLog.error("codex_billing_not_wired", { billingRequestId: billingParsed.data.requestId })
+        sendJsonError(res, 503, "CODEX_BILLING_NOT_WIRED", "codex billing handler not configured", requestId)
+        return
+      }
+      try {
+        await deps.handleCodexBilling(billingParsed.data, identity)
+      } catch (err) {
+        userLog.error("codex_billing_handler_threw", {
+          billingRequestId: billingParsed.data.requestId,
+          err: err as Error,
+        })
+        sendJsonError(res, 500, "CODEX_BILLING_FAILED", "codex billing handler failed", requestId)
+        return
+      }
+      sendJsonOk(
+        res,
+        200,
+        {
+          ok: true,
+          accepted: true,
+          outcome: "codex_billing",
+          scheduled: false,
+        },
+        requestId,
+      )
+      return
+    }
+
+    let body: OutboundReceiverBody
+    {
       const parsed = BodySchema.safeParse(raw)
       if (!parsed.success) {
         userLog.warn("bad_body", { issues: parsed.error.issues })
@@ -328,12 +416,6 @@ export function makeOutboundReceiverHandler(
         return
       }
       body = parsed.data
-    } catch (err) {
-      if (err instanceof HttpError) {
-        sendJsonError(res, err.status, err.code, err.message, requestId)
-        return
-      }
-      throw err
     }
 
     // 3) Outbound rate-limit(P1 noop always true;P3 真实滑窗)

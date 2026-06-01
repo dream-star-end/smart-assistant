@@ -24,6 +24,7 @@ import {
   ENTRY_TTL_MS,
   makeV3WechatRetryQueue,
   V3WechatSinkError,
+  type V3WechatCodexBillingWirePayload,
   type V3WechatRetryEntry,
   type V3WechatSinkWirePayload,
 } from "../v3WechatRetryQueue.js"
@@ -64,12 +65,23 @@ function basePayload(over: Partial<V3WechatSinkWirePayload> = {}): V3WechatSinkW
   }
 }
 
-function entry(payload = basePayload()): V3WechatRetryEntry {
+function entry(payload: V3WechatRetryEntry["payload"] = basePayload()): V3WechatRetryEntry {
   return {
     schemaVersion: 1,
     payload,
     firstSeenAt: Date.now(),
     attempts: 1,
+  }
+}
+
+function billingPayload(over: Partial<V3WechatCodexBillingWirePayload> = {}): V3WechatCodexBillingWirePayload {
+  return {
+    type: "outbound.codex_billing",
+    requestId: "0123456789abcdef0123456789abcdef",
+    status: "success",
+    durationMs: 123,
+    usage: { input_tokens: 10, output_tokens: 20 },
+    ...over,
   }
 }
 
@@ -95,6 +107,12 @@ describe("enqueueDurable + pendingCount", () => {
     assert.equal(await q.pendingCount(), 2)
   })
 
+  test("accepts codex billing sideband payloads", async () => {
+    const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
+    await q.enqueueDurable(entry(billingPayload()))
+    assert.equal(await q.pendingCount(), 1)
+  })
+
   test("pendingCount skips .tmp-* and non-.json", async () => {
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     await writeFile(join(dir, "stale.tmp-1234"), "junk")
@@ -118,6 +136,20 @@ describe("drainOnce", () => {
     await new Promise((r) => setTimeout(r, 50))
     assert.equal(await q.pendingCount(), 0)
     assert.ok(attempts >= 1)
+  })
+
+  test("billing sideband drains through the same durable retry queue", async () => {
+    const sent: unknown[] = []
+    const q = makeV3WechatRetryQueue({
+      dir,
+      attemptSend: async (payload) => {
+        sent.push(payload)
+      },
+    })
+    await q.enqueueDurable(entry(billingPayload()))
+    await new Promise((r) => setTimeout(r, 50))
+    assert.equal(await q.pendingCount(), 0)
+    assert.deepEqual(sent[0], billingPayload())
   })
 
   test("transient → bump attempts + rewrite", async () => {
@@ -220,6 +252,14 @@ describe("drainOnce", () => {
 
   test("schema mismatch (empty blocks) → unlink", async () => {
     const bad = entry(basePayload({ blocks: [] }))
+    await writeFile(join(dir, "1700000000000-cafecafe.json"), JSON.stringify(bad))
+    const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
+    const stats = await q.drainOnce()
+    assert.equal(stats.fatalDropped, 1)
+  })
+
+  test("schema mismatch (bad billing requestId) → unlink", async () => {
+    const bad = entry(billingPayload({ requestId: "BAD" }))
     await writeFile(join(dir, "1700000000000-cafecafe.json"), JSON.stringify(bad))
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     const stats = await q.drainOnce()
