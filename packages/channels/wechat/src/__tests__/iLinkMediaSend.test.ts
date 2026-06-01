@@ -12,10 +12,15 @@ interface CapturedRequest {
 
 let captured: CapturedRequest[] = []
 let originalFetch: typeof globalThis.fetch | undefined
+let uploadResponse: unknown
+
+const currentUploadFullUrl =
+  'https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=current-param&filekey=current-filekey'
 
 beforeEach(() => {
   originalFetch = globalThis.fetch
   captured = []
+  uploadResponse = { upload_full_url: currentUploadFullUrl }
   globalThis.fetch = async (input: any, init?: any) => {
     const url = typeof input === 'string' ? input : input.url
     const headers: Record<string, string> = {}
@@ -30,7 +35,7 @@ beforeEach(() => {
     }
     captured.push({ url, method: init?.method, headers, body })
     if (url.includes('/ilink/bot/getuploadurl')) {
-      return new Response(JSON.stringify({ upload_param: 'upload-param' }), { status: 200 })
+      return new Response(JSON.stringify(uploadResponse), { status: 200 })
     }
     if (url.includes('/c2c/upload')) {
       return new Response('', {
@@ -62,7 +67,7 @@ describe('sendIlinkMedia', () => {
     assert.match(captured[0]!.url, /\/ilink\/bot\/getuploadurl$/)
     assert.equal(captured[0]!.body.media_type, 1)
     assert.equal(captured[0]!.body.to_user_id, 'wx-user@im.wechat')
-    assert.match(captured[1]!.url, /\/c2c\/upload\?/)
+    assert.equal(captured[1]!.url, currentUploadFullUrl)
     assert.equal(captured[1]!.headers['Content-Type'], 'application/octet-stream')
     assert.ok(captured[1]!.body instanceof Uint8Array)
     assert.match(captured[2]!.url, /\/ilink\/bot\/sendmessage$/)
@@ -70,6 +75,54 @@ describe('sendIlinkMedia', () => {
     const item = captured[2]!.body.msg.item_list[0]
     assert.equal(item.type, 2)
     assert.equal(item.image_item.media.encrypt_query_param, 'download-param')
+  })
+
+  it('keeps the legacy upload_param response shape', async () => {
+    uploadResponse = { upload_param: 'legacy-param' }
+
+    await sendIlinkMedia('bot-token', 'wx-user', {
+      kind: 'file',
+      filename: 'report.pdf',
+      content: Buffer.from('%PDF-1.7'),
+      contextToken: 'ctx-file',
+    })
+
+    assert.match(
+      captured[1]!.url,
+      /^https:\/\/novac2c\.cdn\.weixin\.qq\.com\/c2c\/upload\?/,
+    )
+    assert.match(captured[1]!.url, /encrypted_query_param=legacy-param/)
+    assert.match(captured[1]!.url, /filekey=[0-9a-f]{32}/)
+    const item = captured[2]!.body.msg.item_list[0]
+    assert.equal(item.type, 4)
+    assert.equal(item.file_item.media.encrypt_query_param, 'download-param')
+  })
+
+  it('throws a redacted error when getuploadurl has no usable upload target', async () => {
+    uploadResponse = {
+      errcode: 0,
+      upload_url: 'https://sensitive.example/upload?token=secret-token',
+      nested: { upload_param: 'secret-param' },
+    }
+
+    await assert.rejects(
+      () =>
+        sendIlinkMedia('bot-token', 'wx-user', {
+          kind: 'file',
+          filename: 'report.pdf',
+          content: Buffer.from('%PDF-1.7'),
+          contextToken: 'ctx-file',
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error)
+        assert.match(
+          err.message,
+          /iLink getuploadurl returned no upload target \(keys: errcode, upload_url, nested\)/,
+        )
+        assert.doesNotMatch(err.message, /secret-token|secret-param|sensitive\.example/)
+        return true
+      },
+    )
   })
 
   it('uses file and voice item shapes', async () => {

@@ -25,6 +25,7 @@ export const ILINK_API_TIMEOUT_MS = 15_000
 export const ILINK_SESSION_EXPIRED = -14
 export const ILINK_CDN_UPLOAD_TIMEOUT_MS = 30_000
 export const ILINK_CDN_UPLOAD_MAX_BYTES = 100 * 1024 * 1024
+const ILINK_CDN_UPLOAD_URL = `${ILINK_CDN_BASE_URL}/upload`
 
 export type IlinkMediaKind = 'image' | 'video' | 'file' | 'voice'
 
@@ -293,9 +294,8 @@ async function uploadIlinkMedia(
       base_info: { channel_version: 'openclaude-0.0.1' },
     },
   })
-  const uploadParam = typeof upload?.upload_param === 'string' ? upload.upload_param.trim() : ''
-  if (!uploadParam) throw new Error(`iLink getuploadurl returned no upload_param`)
-  const downloadEncryptedQueryParam = await uploadIlinkEncryptedToCdn(uploadParam, filekey, encrypted)
+  const uploadUrl = extractIlinkUploadUrl(upload, filekey)
+  const downloadEncryptedQueryParam = await uploadIlinkEncryptedToCdn(uploadUrl, encrypted)
   return {
     downloadEncryptedQueryParam,
     aesKeyHex,
@@ -305,15 +305,53 @@ async function uploadIlinkMedia(
   }
 }
 
-async function uploadIlinkEncryptedToCdn(
-  uploadParam: string,
-  filekey: string,
-  encrypted: Buffer,
-): Promise<string> {
-  const cdnUrl = new URL(`${ILINK_CDN_BASE_URL}/upload`)
-  cdnUrl.searchParams.set('encrypted_query_param', uploadParam)
-  cdnUrl.searchParams.set('filekey', filekey)
-  if (cdnUrl.protocol !== 'https:') throw new Error('iLink CDN upload URL must use https')
+function extractIlinkUploadUrl(upload: any, filekey: string): string {
+  const uploadFullUrl =
+    typeof upload?.upload_full_url === 'string' ? upload.upload_full_url.trim() : ''
+  if (uploadFullUrl) {
+    return validateIlinkUploadUrl(uploadFullUrl)
+  }
+
+  const uploadParam = typeof upload?.upload_param === 'string' ? upload.upload_param.trim() : ''
+  if (uploadParam) {
+    const cdnUrl = new URL(ILINK_CDN_UPLOAD_URL)
+    cdnUrl.searchParams.set('encrypted_query_param', uploadParam)
+    cdnUrl.searchParams.set('filekey', filekey)
+    return cdnUrl.toString()
+  }
+
+  throw new Error(
+    `iLink getuploadurl returned no upload target (keys: ${summarizeIlinkResponseKeys(upload)})`,
+  )
+}
+
+function validateIlinkUploadUrl(rawUrl: string): string {
+  let url: URL
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    throw new Error('iLink getuploadurl returned invalid upload_full_url')
+  }
+
+  const expected = new URL(ILINK_CDN_UPLOAD_URL)
+  if (url.protocol !== 'https:') throw new Error('iLink CDN upload URL must use https')
+  if (url.host !== expected.host || url.pathname !== expected.pathname) {
+    throw new Error('iLink getuploadurl returned unexpected upload_full_url host/path')
+  }
+  if (!url.searchParams.get('encrypted_query_param') || !url.searchParams.get('filekey')) {
+    throw new Error('iLink getuploadurl returned incomplete upload_full_url')
+  }
+  return rawUrl
+}
+
+function summarizeIlinkResponseKeys(resp: unknown): string {
+  if (!resp || typeof resp !== 'object' || Array.isArray(resp)) return typeof resp
+  const keys = Object.keys(resp)
+  return keys.length ? keys.slice(0, 12).join(', ') : 'none'
+}
+
+async function uploadIlinkEncryptedToCdn(uploadUrl: string, encrypted: Buffer): Promise<string> {
+  const cdnUrl = new URL(validateIlinkUploadUrl(uploadUrl))
 
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), ILINK_CDN_UPLOAD_TIMEOUT_MS)
