@@ -13,9 +13,10 @@
  *   3) outbound rate-limit 检查(P1 noop,但保留调用便于 P3 切换)
  *   4) renderWechatBlocks 把 5 种 OutboundContentBlock 投影成 IlinkPart[]:
  *        - text         → coalesce adjacent chunks, then renderAssistantText(sanitize + split 1024)
- *        - tool_use     → renderToolAnnouncement("🔧 X…") unless user hides tool process
+ *        - tool_use     → renderToolAnnouncement("🔧 X…") unless user hides process
+ *        - thinking     → coalesce adjacent chunks, then bounded "💭 思考过程" preview
+ *                          unless user hides process
  *        - tool_result  → P1 drop(voluminous, 用户在 web 看;P2 可考虑短链摘要)
- *        - thinking     → P1 drop(reasoning 不外发)
  *        - tool_output_tail → P1 drop(已被 tool_use 公告覆盖)
  *        - parentToolUseId 非空 → 子 agent 内容,WeChat 不上抛(SoC:Agent card 是 web-only)
  *   5) 若渲染后 parts 为空 → 200 `outcome:"empty_render"`,**不**入队,**不**进 retry
@@ -78,6 +79,16 @@ const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 
 /** senderId(WeChat openid 衍生 base64url)长度上界 — 实际典型 < 64 字符,留 256 余量。 */
 const SENDER_ID_RE = /^[A-Za-z0-9_-]{1,256}$/
+
+/**
+ * Container streams often arrive as many small text/thinking deltas. The 256KB
+ * body cap is the real DoS boundary; this structural cap exists only to avoid
+ * absurd internal payloads while letting the renderer coalesce normal streams.
+ */
+const MAX_BLOCKS_PER_OUTBOUND = 4096
+
+/** WeChat is not a good surface for huge raw thinking transcripts. */
+const MAX_THINKING_PREVIEW_CHARS = 800
 
 /** traceId 字符集与长度,容器侧 traceId 通常 hex/uuid。 */
 const TRACE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
@@ -183,7 +194,7 @@ const BodySchema = z
           .passthrough(),
       })
       .strict(),
-    blocks: z.array(BlockSchema).min(1).max(64),
+    blocks: z.array(BlockSchema).min(1).max(MAX_BLOCKS_PER_OUTBOUND),
     outboundId: z
       .string()
       .regex(OUTBOUND_ID_RE, {
@@ -241,7 +252,7 @@ export type WechatCodexBillingBody = z.infer<typeof CodexBillingBodySchema>
 type RenderResult = { parts: IlinkPart[]; dropped: number }
 
 export interface RenderWechatBlocksOptions {
-  /** true(default) → show tool announcements; false → hide tool-call process in WeChat. */
+  /** true(default) → show tool/thinking process; false → hide process in WeChat. */
   showToolCalls?: boolean
 }
 
@@ -252,7 +263,8 @@ export interface RenderWechatBlocksOptions {
  *   - parentToolUseId 非空 → 整块 skip(subagent 内容只在 web Agent card 渲染)
  *   - text → 先合并连续顶层 text,再 renderAssistantText(避免 token chunks 变成多气泡)
  *   - tool_use → renderToolAnnouncement("🔧 X…")
- *   - tool_result / thinking / tool_output_tail → drop(P1 不外发)
+ *   - thinking → 先合并连续顶层 thinking,再发有上限的 "💭 思考过程" 摘要
+ *   - tool_result / tool_output_tail → drop(P1 不外发)
  *
  * 返回 `dropped` 计数仅用于审计 / 测试断言(broker 关心"是否完全空"由 caller 判断)。
  */
@@ -263,8 +275,9 @@ export function renderWechatBlocks(
   const parts: IlinkPart[] = []
   let dropped = 0
 
-  const showToolCalls = options.showToolCalls !== false
+  const showProcess = options.showToolCalls !== false
   let textBuffer = ""
+  let thinkingBuffer = ""
 
   const flushText = () => {
     if (textBuffer.length === 0) return
@@ -277,19 +290,42 @@ export function renderWechatBlocks(
     for (const p of rendered) parts.push(p)
   }
 
+  const flushThinking = () => {
+    if (thinkingBuffer.length === 0) return
+    const compact = thinkingBuffer.replace(/\s+/g, " ").trim()
+    thinkingBuffer = ""
+    if (compact.length === 0) {
+      dropped++
+      return
+    }
+    const preview =
+      compact.length > MAX_THINKING_PREVIEW_CHARS
+        ? `${compact.slice(0, MAX_THINKING_PREVIEW_CHARS)}…`
+        : compact
+    const rendered = renderAssistantText(`💭 思考过程：\n${preview}`)
+    if (rendered.length === 0) {
+      dropped++
+      return
+    }
+    for (const p of rendered) parts.push(p)
+  }
+
   for (const b of blocks) {
     if (b.parentToolUseId !== undefined && b.parentToolUseId.length > 0) {
+      flushThinking()
       flushText()
       dropped++
       continue
     }
     switch (b.kind) {
       case "text": {
+        flushThinking()
         textBuffer += b.text
         break
       }
       case "tool_use": {
-        if (showToolCalls) {
+        if (showProcess) {
+          flushThinking()
           flushText()
           for (const p of renderToolAnnouncement(b.toolName)) parts.push(p)
         } else {
@@ -297,13 +333,22 @@ export function renderWechatBlocks(
         }
         break
       }
+      case "thinking": {
+        if (showProcess) {
+          flushText()
+          thinkingBuffer += b.text
+        } else {
+          dropped++
+        }
+        break
+      }
       case "tool_result":
-      case "thinking":
       case "tool_output_tail":
         dropped++
         break
     }
   }
+  flushThinking()
   flushText()
   return { parts, dropped }
 }

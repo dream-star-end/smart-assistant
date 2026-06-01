@@ -4,7 +4,7 @@
  * 覆盖:
  *   - method gate(405 non-POST)
  *   - identity gate(401 bad auth / bad host / bad secret)
- *   - body schema(empty / invalid JSON / 缺字段 / 错正则 / 未知 block kind / 超长 blocks)
+ *   - body schema(empty / invalid JSON / 缺字段 / 错正则 / 未知 block kind / hard-cap blocks)
  *   - rate-limit gate(429 当 checkOutbound 返 false)
  *   - renderWechatBlocks 纯函数:text/tool_use/tool_result/thinking/tool_output_tail/parentToolUseId
  *   - render → 空 IlinkPart[] → 200 empty_render, **不**调 enqueue
@@ -372,10 +372,21 @@ describe("outboundReceiver — body schema", () => {
     assert.equal(rec.status, 400)
   })
 
-  test("400 on blocks > 64 entries", async () => {
+  test("accepts >64 streamed text chunks and coalesces before enqueue", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 64 })
+    const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
+    const { res, rec } = makeRes()
+    const streamed = Array.from({ length: 80 }, () => ({ kind: "text" as const, text: "x" }))
+    await handler(authedReq(validBody({ blocks: streamed })), res, CTX)
+    assert.equal(rec.status, 202)
+    assert.equal(spy.calls.length, 1)
+    assert.deepEqual(spy.calls[0]!.payload, [{ type: "text", text: "x".repeat(80) }])
+  })
+
+  test("400 on blocks beyond hard cap", async () => {
     const handler = makeOutboundReceiverHandler(makeDeps())
     const { res, rec } = makeRes()
-    const tooMany = Array.from({ length: 65 }, () => ({ kind: "text" as const, text: "x" }))
+    const tooMany = Array.from({ length: 4097 }, () => ({ kind: "text" as const, text: "" }))
     await handler(authedReq(validBody({ blocks: tooMany })), res, CTX)
     assert.equal(rec.status, 400)
   })
@@ -531,7 +542,7 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.match(rec.body, /STORAGE_ERROR/)
   })
 
-  test("wechat_show_tool_calls=false hides tool announcements before enqueue", async () => {
+  test("wechat_show_tool_calls=false hides process blocks before enqueue", async () => {
     const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
     const handler = makeOutboundReceiverHandler(
       makeDeps({
@@ -545,6 +556,7 @@ describe("outboundReceiver — enqueue outcome translation", () => {
         validBody({
           blocks: [
             { kind: "text", text: "查询中。" },
+            { kind: "thinking", text: "need to inspect" },
             { kind: "tool_use", toolName: "Read" },
             { kind: "text", text: "完成。" },
           ],
@@ -558,7 +570,7 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.deepEqual(spy.calls[0]!.payload, [{ type: "text", text: "查询中。完成。" }])
   })
 
-  test("tool preference lookup failure defaults to showing tool announcements", async () => {
+  test("tool preference lookup failure defaults to showing process blocks", async () => {
     const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
     const handler = makeOutboundReceiverHandler(
       makeDeps({
@@ -573,6 +585,7 @@ describe("outboundReceiver — enqueue outcome translation", () => {
       authedReq(
         validBody({
           blocks: [
+            { kind: "thinking", text: "look up the file" },
             { kind: "text", text: "查询中。" },
             { kind: "tool_use", toolName: "Read" },
           ],
@@ -583,17 +596,23 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     )
     assert.equal(rec.status, 202)
     assert.equal(spy.calls.length, 1)
-    assert.equal(spy.calls[0]!.payloadLen, 2)
-    assert.match(String((spy.calls[0]!.payload[1] as { text?: string }).text), /读取文件/)
+    assert.equal(spy.calls[0]!.payloadLen, 3)
+    assert.match(String((spy.calls[0]!.payload[0] as { text?: string }).text), /思考过程/)
+    assert.match(String((spy.calls[0]!.payload[2] as { text?: string }).text), /读取文件/)
   })
 })
 
 // ─── render: empty result → no enqueue ─────────────────────────────────────
 
 describe("outboundReceiver — empty render short-circuit", () => {
-  test("only thinking blocks → 200 outcome=empty_render, enqueue NOT called", async () => {
+  test("only thinking blocks with process hidden → 200 outcome=empty_render, enqueue NOT called", async () => {
     const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 1 }) // would-be answer if called
-    const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
+    const handler = makeOutboundReceiverHandler(
+      makeDeps({
+        pool,
+        getWechatShowToolCalls: async () => false,
+      }),
+    )
     const { res, rec } = makeRes()
     await handler(
       authedReq(
@@ -791,9 +810,32 @@ describe("renderWechatBlocks pure function", () => {
     assert.equal(r.dropped, 1)
   })
 
-  test("thinking block → dropped (P1)", () => {
-    const r = renderWechatBlocks([{ kind: "thinking", text: "reasoning..." }])
-    assert.equal(r.parts.length, 0)
+  test("thinking blocks → coalesced bounded process preview", () => {
+    const r = renderWechatBlocks([
+      { kind: "thinking", text: "reasoning" },
+      { kind: "thinking", text: " with\nsteps" },
+      { kind: "text", text: "答案" },
+    ])
+    assert.equal(r.parts.length, 2)
+    assert.match(r.parts[0]!.text, /^💭 思考过程：\nreasoning with steps/)
+    assert.equal(r.parts[1]!.text, "答案")
+    assert.equal(r.dropped, 0)
+  })
+
+  test("thinking preview is capped for WeChat", () => {
+    const r = renderWechatBlocks([{ kind: "thinking", text: "a".repeat(900) }])
+    assert.equal(r.parts.length, 1)
+    assert.match(r.parts[0]!.text, /^💭 思考过程：\n/)
+    assert.ok(r.parts[0]!.text.length < 900)
+    assert.ok(r.parts[0]!.text.endsWith("…"))
+  })
+
+  test("thinking process can be hidden by user preference", () => {
+    const r = renderWechatBlocks([
+      { kind: "thinking", text: "reasoning..." },
+      { kind: "text", text: "done" },
+    ], { showToolCalls: false })
+    assert.deepEqual(r.parts, [{ type: "text", text: "done" }])
     assert.equal(r.dropped, 1)
   })
 
@@ -822,17 +864,18 @@ describe("renderWechatBlocks pure function", () => {
     assert.equal(r.dropped, 1)
   })
 
-  test("mixed blocks: text + tool_use + thinking + parentToolUseId text → 2 parts (text + announcement)", () => {
+  test("mixed blocks: text + tool_use + thinking + parentToolUseId text → 3 parts (text + announcement + thinking)", () => {
     const r = renderWechatBlocks([
       { kind: "text", text: "I'll help" },
       { kind: "tool_use", toolName: "Grep" },
       { kind: "thinking", text: "internal" },
       { kind: "text", text: "from subagent", parentToolUseId: "agent-1" },
     ])
-    assert.equal(r.parts.length, 2)
+    assert.equal(r.parts.length, 3)
     assert.equal(r.parts[0]!.text, "I'll help")
     assert.match(r.parts[1]!.text, /搜索内容/)
-    assert.equal(r.dropped, 2) // thinking + parentToolUseId text
+    assert.match(r.parts[2]!.text, /思考过程/)
+    assert.equal(r.dropped, 1) // parentToolUseId text
   })
 
   test("empty blocks array → empty result (caller decides empty_render)", () => {
