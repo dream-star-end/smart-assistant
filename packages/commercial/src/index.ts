@@ -172,6 +172,7 @@ import { handleWechatModelCommand } from "./wechat/modelCommand.js";
 import { pickWechatInboundModel } from "./wechat/modelResolver.js";
 import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
 import { makeIlinkSendAdapter } from "./wechat/ilinkSendAdapter.js";
+import { makeSaveWechatImagesToUserUploads } from "./wechat/imageIngest.js";
 import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
 import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
@@ -1760,6 +1761,35 @@ export async function registerCommercial(
       })
     : undefined;
 
+  // Shared remote-host upload closure. It is used by both gateway /api/uploads
+  // and the master-side WeChat image ingest bridge so the two paths keep the
+  // same node-agent semantics (0644, owner 1000:1000, PSK zeroing).
+  const pushRemoteHostUpload = async (args: {
+    hostUuid: string;
+    remotePath: string;
+    content: Buffer;
+  }) => {
+    const row = await computeQueries.getHostById(args.hostUuid);
+    if (!row) {
+      throw new Error(
+        `pushRemoteHostUpload: compute_host ${args.hostUuid} not found`,
+      );
+    }
+    const target = hostRowToTarget(row);
+    try {
+      await nodeAgentPutFile(
+        target,
+        args.remotePath,
+        args.content,
+        0o644,
+        1000,
+        1000,
+      );
+    } finally {
+      target.psk?.fill(0);
+    }
+  };
+
   const handler = createCommercialHandler({
     jwtSecret,
     mailer,
@@ -2323,6 +2353,12 @@ export async function registerCommercial(
           });
         },
       },
+      saveWechatImages: userMediaResolver
+        ? makeSaveWechatImagesToUserUploads({
+            resolveUserMediaDirs: userMediaResolver,
+            pushRemoteHostUpload,
+          })
+        : undefined,
       // 读 master sqlite wechat_bindings 拿 botToken + contextTokens 给 outboxWorker。
       // 失败 / 不存在 → 返 null,worker 该 row 走 permanent(无可恢复 token)。
       getBinding: async (bindingUserId) => {
@@ -2889,31 +2925,7 @@ export async function registerCommercial(
     // 错误语义:row 不存在/agent 不可达/HTTP >=400 都直接抛,gateway 自己
     // 转成 502 "remote storage push failed"。PSK buffer 在 finally 里 fill(0)
     // 清零,与 putRemoteCodexAuth 同纪律。
-    pushRemoteHostUpload: async (args: {
-      hostUuid: string;
-      remotePath: string;
-      content: Buffer;
-    }) => {
-      const row = await computeQueries.getHostById(args.hostUuid);
-      if (!row) {
-        throw new Error(
-          `pushRemoteHostUpload: compute_host ${args.hostUuid} not found`,
-        );
-      }
-      const target = hostRowToTarget(row);
-      try {
-        await nodeAgentPutFile(
-          target,
-          args.remotePath,
-          args.content,
-          0o644,
-          1000,
-          1000,
-        );
-      } finally {
-        target.psk?.fill(0);
-      }
-    },
+    pushRemoteHostUpload,
     // 2026-05-16 hotfix Phase 2 — remote-host 读路径对称 closure。
     // 与 pushRemoteHostUpload 同纪律(psk 清零)与同错误语义(throw → gateway 502)。
     // node-agent 404 → 返 null,让 gateway 决定 fallback 还是终态 404。

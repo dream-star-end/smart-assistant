@@ -191,6 +191,35 @@ describe('openclaude-vision MCP input validation', () => {
     )
   })
 
+  it('can read the commercial container token from a 0600 token file', async () => {
+    const tokenFile = join(home, 'v3-container-token')
+    writeFileSync(tokenFile, 'file-container-secret\n')
+    chmodSync(tokenFile, 0o600)
+    await withEnv(
+      {
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'http://172.30.0.1:18791/',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: undefined,
+        OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const calls: Array<{ url: string; init: any }> = []
+        const result = await vision.refreshCommercialCodexAuthForVision(async (url, init) => {
+          calls.push({ url, init })
+          return {
+            ok: true,
+            status: 200,
+            async text() {
+              throw new Error('success body should not be read')
+            },
+          }
+        })
+        assert.equal(result, 'refreshed')
+        assert.equal(calls.length, 1)
+        assert.equal(calls[0].init.headers.Authorization, 'Bearer file-container-secret')
+      },
+    )
+  })
+
   it('retries a refresh failure once so the master can disable/rebind a bad account', async () => {
     await withEnv(
       {

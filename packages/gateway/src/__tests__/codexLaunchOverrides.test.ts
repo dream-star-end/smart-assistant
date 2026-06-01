@@ -33,6 +33,23 @@ import { _internals, resolveMcpMemoryEntry } from '../codexLaunchOverrides.js'
 
 const { tomlValue, CODEX_PREAMBLE } = _internals
 
+async function withEnv<T>(patch: Record<string, string | undefined>, fn: () => Promise<T> | T) {
+  const old = new Map<string, string | undefined>()
+  for (const [key, value] of Object.entries(patch)) {
+    old.set(key, process.env[key])
+    if (value === undefined) Reflect.deleteProperty(process.env, key)
+    else process.env[key] = value
+  }
+  try {
+    return await fn()
+  } finally {
+    for (const [key, value] of old) {
+      if (value === undefined) Reflect.deleteProperty(process.env, key)
+      else process.env[key] = value
+    }
+  }
+}
+
 describe('tomlValue', () => {
   it('encodes plain string as TOML basic string (JSON-style double-quoted)', () => {
     assert.equal(tomlValue('hello'), '"hello"')
@@ -324,5 +341,41 @@ describe('buildCodexLaunchOverrides', () => {
     )
     // Must always have at least the instructions pair.
     assert.ok(out.argvOverrides.length >= 2)
+  })
+
+  it('mounts openclaude-vision for Codex without leaking the v3 container token into argv', async () => {
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    const TOKEN = 'container-token-MUST-NOT-LEAK'
+    await withEnv(
+      {
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:1',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: TOKEN,
+        OPENCLAUDE_VISION_MCP_DISABLED: undefined,
+      },
+      async () => {
+        const out = await buildCodexLaunchOverrides({
+          agentId: 'test-agent',
+          provider: 'codex-native',
+          model: 'gpt-5.5',
+          sessionDir: dir,
+          gatewayPort: 18789,
+          gatewayToken: 'gateway-token',
+        })
+        const visionEnv = out.argvOverrides.find((s) =>
+          s.startsWith('mcp_servers.openclaude-vision.env='),
+        )
+        assert.ok(visionEnv, 'expected openclaude-vision MCP env override')
+        assert.ok(visionEnv!.includes('OPENCLAUDE_V3_CONTAINER_TOKEN_FILE'))
+        assert.ok(visionEnv!.includes(`${dir}/v3-container-token`))
+        assert.ok(!visionEnv!.includes(TOKEN), 'argv must not contain container token literal')
+        assert.ok(!/"OPENCLAUDE_V3_CONTAINER_TOKEN"\s*=/.test(visionEnv!))
+        for (const arg of out.argvOverrides) {
+          assert.ok(!arg.includes(TOKEN), `argv leaked token in: ${arg}`)
+        }
+        assert.equal(out.visionTokenFile, `${dir}/v3-container-token`)
+        assert.equal(out.visionTokenContent, TOKEN)
+        assert.match(out.instructionsContent, /GPT\/Codex 图片理解提示/)
+      },
+    )
   })
 })

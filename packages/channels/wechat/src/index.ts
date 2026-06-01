@@ -19,6 +19,7 @@ export * from './pairing.js'
 // admin alert worker) go through the package boundary, not via deep relative
 // path. Required by S12a composite project boundary.
 export * from './iLink.js'
+export * from './iLinkImage.js'
 
 // Re-export storage types for convenience in callers
 export type { WechatBinding } from '@openclaude/storage'
