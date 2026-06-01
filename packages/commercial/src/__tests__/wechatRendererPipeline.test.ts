@@ -14,6 +14,7 @@ import {
   friendlyToolName,
   sanitizeForWechat,
   splitText,
+  friendlyProviderErrorForWechat,
   renderAssistantText,
   renderToolAnnouncement,
 } from "../wechat/rendererPipeline.js"
@@ -77,6 +78,27 @@ describe("rendererPipeline.sanitizeForWechat", () => {
   })
 })
 
+describe("rendererPipeline.friendlyProviderErrorForWechat", () => {
+  test("UNKNOWN_MODEL raw API JSON becomes actionable copy without request_id", () => {
+    const raw =
+      `API Error: 400 {"error":{"code":"UNKNOWN_MODEL","message":"model 'claude-opus-4-7' not enabled"},"request_id":"req-secret"}`
+    const out = friendlyProviderErrorForWechat(raw)
+    assert.ok(out)
+    assert.match(out!, /claude-opus-4-7/)
+    assert.match(out!, /网页端切换/)
+    assert.doesNotMatch(out!, /request_id|req-secret|UNKNOWN_MODEL|API Error/)
+  })
+
+  test("generic API JSON is hidden behind a short WeChat message", () => {
+    const out = friendlyProviderErrorForWechat('API Error: 400 {"error":{"message":"bad"},"request_id":"r1"}')
+    assert.equal(out, "模型请求没有成功。请稍后重试；如果连续失败，请在网页端切换模型或联系管理员。")
+  })
+
+  test("ordinary assistant text is not rewritten", () => {
+    assert.equal(friendlyProviderErrorForWechat("API 设计建议: 不要暴露 request_id"), null)
+  })
+})
+
 describe("rendererPipeline.splitText", () => {
   test("under max returns single chunk", () => {
     assert.deepEqual(splitText("hello", 100), ["hello"])
@@ -111,6 +133,15 @@ describe("rendererPipeline.renderAssistantText", () => {
   test("plain text → single text part", () => {
     const parts = renderAssistantText("hello world")
     assert.deepEqual(parts, [{ type: "text", text: "hello world" }])
+  })
+
+  test("raw UNKNOWN_MODEL API error is rewritten before sending to WeChat", () => {
+    const parts = renderAssistantText(
+      `API Error: 400 {"error":{"code":"UNKNOWN_MODEL","message":"model 'claude-opus-4-7' not enabled"},"request_id":"req-secret"}`,
+    )
+    assert.equal(parts.length, 1)
+    assert.match(parts[0]!.text, /这个模型（claude-opus-4-7）当前不可用/)
+    assert.doesNotMatch(parts[0]!.text, /request_id|req-secret|UNKNOWN_MODEL|API Error/)
   })
 
   test("markdown is sanitized before splitting", () => {

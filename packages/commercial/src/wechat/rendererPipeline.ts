@@ -79,6 +79,47 @@ export function sanitizeForWechat(s: string): string {
 }
 
 /**
+ * 将 CCB / 上游 API 的原始错误压成微信用户能理解的短文案。
+ *
+ * 只在 WeChat 出站渲染层使用:网页端仍保留完整错误和 request_id 便于排查;
+ * 微信聊天里不应把 JSON / request_id / provider 细节直接甩给用户。
+ */
+export function friendlyProviderErrorForWechat(raw: string): string | null {
+  const text = raw.trim()
+  if (!text) return null
+
+  const modelUnavailable =
+    /UNKNOWN_MODEL[\s\S]*?model ['"]([^'"]{1,80})['"] not enabled/i.exec(text) ??
+    /model ['"]([^'"]{1,80})['"] not enabled[\s\S]*?UNKNOWN_MODEL/i.exec(text)
+  if (modelUnavailable) {
+    const model = safeModelNameForWechat(modelUnavailable[1])
+    return (
+      `这个模型${model ? `（${model}）` : ""}当前不可用。\n` +
+      "请在网页端切换到可用模型后再试；也可以发送 /model 查看微信里的模型说明。"
+    )
+  }
+
+  if (/^API Error:\s*(?:502|503|504|529)\b|rate[ _-]?limit|overloaded/i.test(text)) {
+    return "模型服务暂时繁忙，请稍后再发一次。"
+  }
+
+  if (/^API Error:\s*(?:401|403)\b|Failed to authenticate|run \/login|invalid api key/i.test(text)) {
+    return "账号认证暂时不可用，系统会尝试刷新凭据；如果仍失败，请稍后再试或联系管理员。"
+  }
+
+  if (/^API Error:\s*\d{3}\b/i.test(text) && /[{}]\s*|request_id|"error"/i.test(text)) {
+    return "模型请求没有成功。请稍后重试；如果连续失败，请在网页端切换模型或联系管理员。"
+  }
+
+  return null
+}
+
+function safeModelNameForWechat(raw: string | undefined): string {
+  const model = (raw ?? "").trim()
+  return /^[A-Za-z0-9._:-]{1,80}$/.test(model) ? model : ""
+}
+
+/**
  * 按 max 长度硬切分;不考虑 word boundary 因为微信主流是 CJK,空格分词无意义。
  * (复制自 packages/channels/wechat/src/manager.ts:327)
  */
@@ -104,7 +145,9 @@ export function splitText(text: string, max: number): string[] {
  * P2 引入图片时,会在此追加附件 part(图片优先,再追加文字)。
  */
 export function renderAssistantText(rawMarkdown: string | null | undefined): IlinkPart[] {
-  const cleaned = sanitizeForWechat(rawMarkdown ?? "")
+  const raw = rawMarkdown ?? ""
+  const displayText = friendlyProviderErrorForWechat(raw) ?? raw
+  const cleaned = sanitizeForWechat(displayText)
   if (cleaned.length === 0) return []
   return splitText(cleaned, WECHAT_MAX_TEXT).map((text) => ({ type: "text", text }))
 }

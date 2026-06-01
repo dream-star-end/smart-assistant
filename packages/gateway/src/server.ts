@@ -2595,6 +2595,11 @@ export class Gateway {
       this.sendJson(res, 400, { error: 'agentId charset/length invalid' })
       return
     }
+    const model = body.model
+    if (model !== undefined && (typeof model !== 'string' || !ALLOWED_INBOUND_MODELS.has(model))) {
+      this.sendJson(res, 400, { error: 'model unsupported for inbound dispatch' })
+      return
+    }
     const contentRaw = body.content as Record<string, unknown> | undefined
     if (!contentRaw || typeof contentRaw !== 'object') {
       this.sendJson(res, 400, { error: 'content required' })
@@ -2645,6 +2650,7 @@ export class Gateway {
       channel: 'wechat',
       peer: peerOut,
       ...(typeof agentId === 'string' ? { agentId } : {}),
+      ...(typeof model === 'string' ? { model } : {}),
       content: { text },
       ts,
     }

@@ -569,6 +569,18 @@ describe("renderWechatBlocks pure function", () => {
     assert.equal(r.parts[0]!.text, "bold code")
   })
 
+  test("raw UNKNOWN_MODEL API errors are rewritten for WeChat", () => {
+    const r = renderWechatBlocks([
+      {
+        kind: "text",
+        text: `API Error: 400 {"error":{"code":"UNKNOWN_MODEL","message":"model 'claude-opus-4-7' not enabled"},"request_id":"req-secret"}`,
+      },
+    ])
+    assert.equal(r.parts.length, 1)
+    assert.match(r.parts[0]!.text, /这个模型（claude-opus-4-7）当前不可用/)
+    assert.doesNotMatch(r.parts[0]!.text, /request_id|req-secret|UNKNOWN_MODEL|API Error/)
+  })
+
   test("text block > 1024 chars splits into multiple parts", () => {
     const long = "a".repeat(2050)
     const r = renderWechatBlocks([{ kind: "text", text: long }])

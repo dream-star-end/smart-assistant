@@ -246,7 +246,7 @@ describe("inboundDispatcher — command echo", () => {
     const r = await d.dispatch(makeEvent({ text: "/list" }))
     assert.equal(r.kind, "command_echo")
     if (r.kind === "command_echo") {
-      assert.equal(r.reply, "当前微信通道暂不支持命令,请直接发送消息。")
+      assert.equal(r.reply, "暂不支持这个命令。发送 /help 查看微信里可用的命令，或直接发送问题。")
     }
     assert.equal(tSpy.posts.length, 0)
   })
@@ -285,7 +285,7 @@ describe("inboundDispatcher — resolver / cold start", () => {
     if (r.kind === "cold_start") {
       assert.equal(r.reason, "provisioning")
       assert.equal(r.retryAfterSec, 5)
-      assert.equal(r.coldStartReply, "正在唤醒,稍等几秒...")
+      assert.equal(r.coldStartReply, "正在唤醒你的 OpenClaude 容器，通常几秒钟。请稍后再发一次消息。")
     }
   })
 
@@ -830,6 +830,43 @@ describe("inboundDispatcher — wire correctness", () => {
     const d = makeInboundDispatcher(makeDeps({ transport, now: () => FIXED_NOW + 5_000 }))
     await d.dispatch(makeEvent({ receivedAt: FIXED_NOW }))
     assert.equal(spy.posts[0]!.bodyParsed.ts, FIXED_NOW)
+  })
+
+  test("resolveModel result is included in container wire body", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveModel: async (bindingUserId) => {
+          assert.equal(bindingUserId, BINDING_UID)
+          return "claude-sonnet-4-6"
+        },
+      }),
+    )
+    await d.dispatch(makeEvent())
+    assert.equal(spy.posts[0]!.bodyParsed.model, "claude-sonnet-4-6")
+  })
+
+  test("resolveModel null omits model field for backward compatibility", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    const d = makeInboundDispatcher(makeDeps({ transport, resolveModel: async () => null }))
+    await d.dispatch(makeEvent())
+    assert.equal("model" in spy.posts[0]!.bodyParsed, false)
+  })
+
+  test("resolveModel throw is logged/ignored and still dispatches", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveModel: async () => {
+          throw new Error("prefs db down")
+        },
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    assert.equal("model" in spy.posts[0]!.bodyParsed, false)
   })
 
   test("body content === { text } (no kind / no rawItemTypes / no sessionMeta)", async () => {

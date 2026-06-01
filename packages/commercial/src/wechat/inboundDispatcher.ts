@@ -81,10 +81,10 @@ const DEFAULT_COMPENSATE_TIMEOUT_MS = 3_000
 const DEFAULT_COLD_START_RETRY_AFTER_SEC = 3
 
 /** Cold-start 反射给用户的提示文案。文案稳定 — 测试断言依赖。 */
-const COLD_START_REPLY = "正在唤醒,稍等几秒..."
+const COLD_START_REPLY = "正在唤醒你的 OpenClaude 容器，通常几秒钟。请稍后再发一次消息。"
 
 /** 命令短路反射文案。文案稳定 — 测试断言依赖。 */
-const COMMAND_ECHO_REPLY = "当前微信通道暂不支持命令,请直接发送消息。"
+const COMMAND_ECHO_REPLY = "暂不支持这个命令。发送 /help 查看微信里可用的命令，或直接发送问题。"
 
 /** 默认 session title fallback(空白文本 / 全 emoji 截断后空时使用)。 */
 const DEFAULT_SESSION_TITLE = "微信会话"
@@ -213,6 +213,15 @@ export interface InboundDispatcherDeps {
   newSessionId?: () => WechatSessionId
   /** HTTP transport(self-host 默认 + tunnel slice 4c 注入)。 */
   transport: ContainerTransport
+  /**
+   * Resolve the model id that WeChat should use for this binding.
+   *
+   * Commercial wiring keeps this aligned with the user's web default model and
+   * model grants. `null`/`undefined` means "use the container's current agent
+   * default" for backward compatibility. Throws are logged and ignored so a
+   * transient preferences/authz lookup failure does not drop the inbound text.
+   */
+  resolveModel?: (bindingUserId: string) => Promise<string | null | undefined>
   /** 单次 Step 1 timeout;默认 5000 ms。 */
   step1TimeoutMs?: number
   /** Step 1 失败后单次退避重试间隔;默认 250 ms。 */
@@ -327,6 +336,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       const dispatchNow = now()
       const nonce = computeInboundNonce(deps.bridgeSecret, endpoint.containerId)
       const sessionTitle = deriveSessionTitle(evt.text)
+      const model = await resolveModelForDispatch(evt.bindingUserId, deps.resolveModel, reqLog)
 
       // ── 3) Step 1: POST 容器 /internal/v3/wechat-inbound ──────────────
       //
@@ -359,6 +369,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         idempotencyKey: evt.idempotencyKey,
         ts: evt.receivedAt,
         agentId,
+        ...(model ? { model } : {}),
         content: { text: evt.text },
       }
       const wireHeaders: Record<string, string> = {
@@ -527,6 +538,26 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
 type Step1Result =
   | { kind: "ok"; response: { status: number; bodyText: string; headers?: Record<string, string> } }
   | { kind: "transport_error"; errMessage: string }
+
+async function resolveModelForDispatch(
+  bindingUserId: string,
+  resolveModel: InboundDispatcherDeps["resolveModel"],
+  log: Logger,
+): Promise<string | null> {
+  if (!resolveModel) return null
+  try {
+    const model = await resolveModel(bindingUserId)
+    if (typeof model !== "string") return null
+    const trimmed = model.trim()
+    return trimmed.length > 0 ? trimmed : null
+  } catch (err) {
+    log.warn("resolve_model_failed", {
+      bindingUserId,
+      errMessage: (err as Error)?.message ?? String(err),
+    })
+    return null
+  }
+}
 
 async function postStep1WithRetry(
   transport: ContainerTransport,
