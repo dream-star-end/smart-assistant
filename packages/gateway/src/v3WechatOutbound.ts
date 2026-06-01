@@ -55,13 +55,15 @@ import { randomBytes } from "node:crypto"
 import { request as undiciRequest } from "undici"
 
 import type { ChannelAdapter, ChannelContext } from "@openclaude/plugin-sdk"
-import type { OutboundMessage } from "@openclaude/protocol"
+import type { OutboundCodexBilling, OutboundMessage } from "@openclaude/protocol"
 
 import { createLogger } from "./logger.js"
 import {
   type V3WechatRetryQueue,
   type V3WechatRetryEntry,
   type V3WechatSinkWirePayload,
+  type V3WechatCodexBillingWirePayload,
+  type V3WechatOutboundPostPayload,
   V3WechatSinkError,
   makeV3WechatRetryQueue,
 } from "./v3WechatRetryQueue.js"
@@ -133,7 +135,7 @@ export interface AttemptSendDeps {
  * 带 errorClass。永不 log bearer / payload body — 只 log path + status。
  */
 export async function attemptSend(
-  payload: V3WechatSinkWirePayload,
+  payload: V3WechatOutboundPostPayload,
   deps: AttemptSendDeps,
 ): Promise<void> {
   const url = `${deps.config.baseUrl}${WECHAT_OUTBOUND_PATH}`
@@ -323,6 +325,29 @@ function buildWirePayload(
   return payload
 }
 
+function isCodexBillingFrame(out: unknown): out is OutboundCodexBilling {
+  return !!out && typeof out === "object" && (out as { type?: unknown }).type === "outbound.codex_billing"
+}
+
+function buildCodexBillingPayload(
+  out: OutboundCodexBilling,
+): V3WechatCodexBillingWirePayload | { error: string } {
+  if (!/^[0-9a-f]{32}$/.test(out.requestId)) {
+    return { error: "requestId must be 32 lowercase hex chars" }
+  }
+  const payload: V3WechatCodexBillingWirePayload = {
+    type: "outbound.codex_billing",
+    requestId: out.requestId,
+    status: out.status === "error" ? "error" : "success",
+    durationMs: Number.isFinite(out.durationMs) && out.durationMs >= 0 ? out.durationMs : 0,
+  }
+  if (out.usage !== undefined) payload.usage = out.usage
+  if (typeof out.errorReason === "string") payload.errorReason = out.errorReason
+  if (out.rateLimits !== undefined) payload.rateLimits = out.rateLimits
+  if (typeof out.traceId === "string") payload.traceId = out.traceId
+  return payload
+}
+
 export interface V3WechatOutboundDeps {
   config: V3WechatOutboundConfig
   /** Override only for tests。 */
@@ -372,6 +397,49 @@ export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): Channel
     },
 
     async send(out: OutboundMessage) {
+      const maybeBilling = out as unknown
+      if (isCodexBillingFrame(maybeBilling)) {
+        if (maybeBilling.channel !== "wechat") return
+        const payload = buildCodexBillingPayload(maybeBilling)
+        if ("error" in payload) {
+          log.warn("dropped: build codex billing payload failed", { reason: payload.error })
+          return
+        }
+        try {
+          await attempt(payload, { config: cfg })
+        } catch (err) {
+          if (err instanceof V3WechatSinkError && err.errorClass === "fatal") {
+            log.warn("send: fatal codex billing sink error, dropping", {
+              requestId: payload.requestId,
+              httpStatus: err.httpStatus,
+              err: err.message,
+            })
+            return
+          }
+          const entry: V3WechatRetryEntry = {
+            schemaVersion: 1,
+            payload,
+            firstSeenAt: now(),
+            attempts: 1,
+            lastErrorClass:
+              err instanceof V3WechatSinkError ? err.errorClass : "transient",
+            lastErrorAt: now(),
+            lastErrorMessage:
+              err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
+          }
+          try {
+            await retryQueue.enqueueDurable(entry)
+          } catch (enqErr) {
+            log.error(
+              "send: enqueueDurable failed after codex billing attempt",
+              { requestId: payload.requestId },
+              enqErr,
+            )
+          }
+        }
+        return
+      }
+
       if (out.channel !== "wechat") return
       const payload = buildWirePayload(out, cfg, now())
       if ("error" in payload) {

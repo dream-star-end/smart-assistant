@@ -14,7 +14,7 @@ import type { IncomingMessage } from "node:http";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import type { TLSSocket } from "node:tls";
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { isIPv4 } from "node:net";
 import type { Duplex } from "node:stream";
 import * as fs from "node:fs";
@@ -31,7 +31,7 @@ import { deriveMediaSignKey } from "./http/mediaSign.js";
 import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
-import { PricingCache, createModelHintProvider } from "./billing/pricing.js";
+import { PricingCache, createModelHintProvider, type ModelPricing } from "./billing/pricing.js";
 import { canUseModel } from "./billing/authzModels.js";
 import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider } from "@openclaude/gateway";
 import { getPreferences, patchPreferences } from "./user/preferences.js";
@@ -41,7 +41,13 @@ import {
   getSessionPinMode,
 } from "./admin/runtimeFlags.js";
 import { renderLiteratureSkillContent } from "./literatureSkill.js";
-import { wrapIoredisForPreCheck } from "./billing/preCheck.js";
+import {
+  estimateMaxCost,
+  InsufficientCreditsError,
+  preCheckWithCost,
+  releasePreCheck,
+  wrapIoredisForPreCheck,
+} from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
 import {
   AccountScheduler,
@@ -145,6 +151,7 @@ import {
 import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
+  type WechatCodexBillingBody,
 } from "./wechat/outboundReceiver.js";
 import { MASTER_USER_PREFIX } from "./wechat/userIds.js";
 import {
@@ -157,7 +164,10 @@ import {
   makePlatformPromptSlotsHandler,
   type PlatformPromptSlotsHandler,
 } from "./http/internalPlatformPromptSlots.js";
-import { makeInboundDispatcher } from "./wechat/inboundDispatcher.js";
+import {
+  makeInboundDispatcher,
+  type PrepareWechatCodexTurnResult,
+} from "./wechat/inboundDispatcher.js";
 import { handleWechatModelCommand } from "./wechat/modelCommand.js";
 import { pickWechatInboundModel } from "./wechat/modelResolver.js";
 import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
@@ -177,6 +187,16 @@ import {
   type BridgeMetricSink,
   type CodexBindingHandle,
 } from "./ws/userChatBridge.js";
+import {
+  composeMultiplier,
+  getAgentCostMultiplier,
+} from "./billing/agentMultiplier.js";
+import { startInflightJournal } from "./billing/proxyBilling.js";
+import {
+  makeCodexFinalizer,
+  type CodexFinalizeHandle,
+} from "./billing/codexFinalizer.js";
+import type { TokenUsage } from "./billing/calculator.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
   DEFAULT_V3_CCB_BASELINE_DIR,
@@ -1912,6 +1932,306 @@ export async function registerCommercial(
       throw new ContainerUnreadyError(5, "supervisor_not_wired");
     });
 
+  const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000;
+  const DEFAULT_CODEX_SESSION_MAX_MS = 600_000;
+  const readCodexSessionMaxMs = (): number => {
+    const raw = process.env.CODEX_SESSION_MAX_MS;
+    if (!raw) return DEFAULT_CODEX_SESSION_MAX_MS;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 1000 ? n : DEFAULT_CODEX_SESSION_MAX_MS;
+  };
+  const newCodexRequestId = (): string => randomBytes(16).toString("hex");
+  const codexRouteLog = rootLogger.child({ subsys: "commercial", module: "codexRoute" });
+
+  const createCommercialCodexRoute = async ({ containerId, userId, modelId }: {
+    containerId: number;
+    userId: bigint;
+    modelId: string;
+  }) => {
+    const groups = await listEnabledGroupsForModel({ modelId, provider: "codex" });
+    if (groups.length === 0) return null;
+    for (const group of groups) {
+      if (group.kind === "api_relay") {
+        const route = await createCodexRouteContextForModel({
+          containerId,
+          userId,
+          modelId,
+          groupId: group.id,
+        });
+        if (!route) continue;
+        return {
+          kind: "api_relay" as const,
+          token: route.token,
+          baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
+          modelProvider: route.credential.model_provider,
+          providerName: route.credential.provider_name,
+          wireApi: route.credential.wire_api,
+          preferredAuthMethod: route.credential.preferred_auth_method,
+          disableResponseStorage: route.credential.disable_response_storage,
+          groupId: route.group.id.toString(),
+          credentialId: route.credential.id.toString(),
+        };
+      }
+      if (group.kind === "official_oauth") {
+        const hasAccount = await hasActiveOfficialOAuthAccountInGroup(group.id, "codex");
+        if (!hasAccount) continue;
+        return { kind: "official_oauth" as const, groupId: group.id.toString() };
+      }
+    }
+    return { kind: "unavailable" as const, reason: "no usable enabled Codex group" };
+  };
+
+  const createWechatApiRelayRoute = async (args: {
+    containerId: number;
+    userId: bigint;
+    modelId: string;
+  }) => {
+    const groups = await listEnabledGroupsForModel({ modelId: args.modelId, provider: "codex" });
+    for (const group of groups) {
+      if (group.kind !== "api_relay") continue;
+      const route = await createCodexRouteContextForModel({
+        containerId: args.containerId,
+        userId: args.userId,
+        modelId: args.modelId,
+        groupId: group.id,
+      });
+      if (!route) continue;
+      return {
+        token: route.token,
+        routeFrame: {
+          baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
+          modelProvider: route.credential.model_provider,
+          providerName: route.credential.provider_name ?? null,
+          wireApi: route.credential.wire_api ?? "responses",
+          preferredAuthMethod: route.credential.preferred_auth_method ?? "apikey",
+          disableResponseStorage: route.credential.disable_response_storage ?? true,
+        },
+      };
+    }
+    return null;
+  };
+
+  type WechatCodexTurnSnapshot = {
+    finalizer: CodexFinalizeHandle;
+    requestId: string;
+    userId: bigint;
+    containerId: number;
+    model: string;
+    accountId: bigint;
+    traceId: string;
+    routeToken: string;
+    timeout: ReturnType<typeof setTimeout>;
+  };
+  const wechatCodexTurns = new Map<string, WechatCodexTurnSnapshot>();
+
+  const expireCodexRouteToken = (token: string | null | undefined, reason: string): void => {
+    if (!token) return;
+    expireCodexRouteContext(token).catch((err) => {
+      codexRouteLog.warn("expire_codex_route_failed", {
+        reason,
+        errMessage: (err as Error)?.message ?? String(err),
+      });
+    });
+  };
+
+  const failWechatCodexTurn = async (requestId: string, reason: string): Promise<void> => {
+    const snap = wechatCodexTurns.get(requestId);
+    if (!snap) return;
+    wechatCodexTurns.delete(requestId);
+    clearTimeout(snap.timeout);
+    try {
+      await snap.finalizer.fail(reason);
+    } finally {
+      expireCodexRouteToken(snap.routeToken, reason);
+    }
+  };
+
+  const safeBillingNum = (v: unknown): bigint => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 0n;
+    return BigInt(Math.trunc(v));
+  };
+
+  const handleWechatCodexBilling = async (
+    body: WechatCodexBillingBody,
+    identity: { userId: number; containerId: number },
+  ): Promise<void> => {
+    const snap = wechatCodexTurns.get(body.requestId);
+    if (!snap) {
+      codexRouteLog.info("wechat_codex_billing_unknown_turn", { requestId: body.requestId });
+      return;
+    }
+    if (snap.userId !== BigInt(identity.userId) || snap.containerId !== identity.containerId) {
+      codexRouteLog.warn("wechat_codex_billing_identity_mismatch", {
+        requestId: body.requestId,
+        expectedUserId: snap.userId.toString(),
+        gotUserId: identity.userId,
+        expectedContainerId: snap.containerId,
+        gotContainerId: identity.containerId,
+      });
+      return;
+    }
+    wechatCodexTurns.delete(body.requestId);
+    clearTimeout(snap.timeout);
+
+    const u = body.usage ?? {};
+    const usage: TokenUsage = {
+      input_tokens: safeBillingNum(u.input_tokens),
+      output_tokens: safeBillingNum(u.output_tokens) + safeBillingNum(u.reasoning_output_tokens),
+      cache_read_tokens: safeBillingNum(u.cache_read_input_tokens),
+      cache_write_tokens: safeBillingNum(u.cache_creation_input_tokens),
+    };
+    try {
+      const result = await snap.finalizer.commit(
+        usage,
+        body.status === "error" ? "error" : "success",
+        body.errorReason,
+      );
+      if (result.debitedCredits !== null && result.debitedCredits > 0n) {
+        try {
+          await appendCostCredits(
+            body.requestId,
+            snap.userId.toString(),
+            result.debitedCredits.toString(),
+          );
+        } catch (err) {
+          codexRouteLog.warn("wechat_codex_persist_cost_credits_failed", {
+            requestId: body.requestId,
+            errMessage: (err as Error)?.message ?? String(err),
+          });
+        }
+      }
+    } catch (err) {
+      codexRouteLog.error("wechat_codex_finalizer_commit_failed", {
+        requestId: body.requestId,
+        errMessage: (err as Error)?.message ?? String(err),
+      });
+    } finally {
+      expireCodexRouteToken(snap.routeToken, "wechat_codex_billing_settled");
+    }
+  };
+
+  const prepareWechatCodexTurn = async (args: {
+    containerId: number;
+    bindingUserId: string;
+    userId: bigint;
+    modelId: string;
+    agentId: string;
+    traceId: string;
+  }): Promise<PrepareWechatCodexTurnResult> => {
+    const route = await createWechatApiRelayRoute(args);
+    if (!route) {
+      return {
+        kind: "unavailable",
+        reply: "GPT 模型通道暂时不可用，请稍后再试，或发送 /model 切换到其它模型。",
+      };
+    }
+
+    const modelPricing = pricing.get(args.modelId);
+    if (!modelPricing) {
+      expireCodexRouteToken(route.token, "wechat_codex_pricing_missing");
+      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
+    }
+
+    const agentForCharge = args.agentId || "codex";
+    let derivedPricing: ModelPricing;
+    try {
+      const agentMul = await getAgentCostMultiplier(getPool(), agentForCharge);
+      derivedPricing = {
+        ...modelPricing,
+        multiplier: composeMultiplier(modelPricing.multiplier, agentMul),
+      };
+    } catch (err) {
+      expireCodexRouteToken(route.token, "wechat_codex_multiplier_failed");
+      codexRouteLog.error("wechat_codex_multiplier_failed", {
+        agentId: agentForCharge,
+        errMessage: (err as Error)?.message ?? String(err),
+      });
+      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
+    }
+
+    const requestId = newCodexRequestId();
+    let maxCost: bigint;
+    try {
+      maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
+    } catch (err) {
+      expireCodexRouteToken(route.token, "wechat_codex_estimate_failed");
+      codexRouteLog.error("wechat_codex_estimate_failed", {
+        errMessage: (err as Error)?.message ?? String(err),
+      });
+      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
+    }
+
+    let preCheckResult: Awaited<ReturnType<typeof preCheckWithCost>>;
+    try {
+      preCheckResult = await preCheckWithCost(preCheckRedis, {
+        userId: args.userId,
+        requestId,
+        maxCost,
+      });
+    } catch (err) {
+      expireCodexRouteToken(route.token, "wechat_codex_precheck_failed");
+      if (err instanceof InsufficientCreditsError) {
+        return { kind: "unavailable", reply: "余额不足，请到网页端充值后再使用 GPT 模型，或发送 /model 切换其它模型。" };
+      }
+      codexRouteLog.error("wechat_codex_precheck_failed", {
+        errMessage: (err as Error)?.message ?? String(err),
+      });
+      return { kind: "unavailable", reply: "GPT 模型计费检查暂时不可用，请稍后再试。" };
+    }
+
+    try {
+      await startInflightJournal(getPool(), {
+        requestId,
+        userId: args.userId,
+        containerId: BigInt(args.containerId),
+        model: args.modelId,
+        precheckCredits: preCheckResult.maxCost,
+        ctxJson: {
+          agentId: agentForCharge,
+          codexAccountId: null,
+          source: "wechat_codex_api_relay",
+        },
+      });
+    } catch (err) {
+      await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+      expireCodexRouteToken(route.token, "wechat_codex_journal_failed");
+      codexRouteLog.error("wechat_codex_journal_failed", {
+        requestId,
+        errMessage: (err as Error)?.message ?? String(err),
+      });
+      return { kind: "unavailable", reply: "GPT 模型计费初始化暂时不可用，请稍后再试。" };
+    }
+
+    const finalizer = makeCodexFinalizer({
+      pgPool: getPool(),
+      preCheckRedis,
+      userId: args.userId,
+      requestId,
+      containerId: String(args.containerId),
+      model: args.modelId,
+      derivedPricing,
+      reservation: preCheckResult.reservation,
+      accountId: 0n,
+    });
+    const timeout = setTimeout(() => {
+      void failWechatCodexTurn(requestId, "wechat_codex_billing_timeout");
+    }, readCodexSessionMaxMs());
+    timeout.unref?.();
+    wechatCodexTurns.set(requestId, {
+      finalizer,
+      requestId,
+      userId: args.userId,
+      containerId: args.containerId,
+      model: args.modelId,
+      accountId: 0n,
+      traceId: args.traceId,
+      routeToken: route.token,
+      timeout,
+    });
+
+    return { kind: "ready", requestId, routeFrame: route.routeFrame };
+  };
+
   // ─── P1.7 slice 7c — WeChat broker 装配 ───────────────────────────────────
   //
   // 装配条件:WECHAT_BROKER_ENABLED=1 + bridgeSecret 已加载(对称要求 — broker 给
@@ -1950,6 +2270,8 @@ export async function registerCommercial(
           allowedModels: ALLOWED_INBOUND_MODELS,
         });
       },
+      prepareCodexTurn: prepareWechatCodexTurn,
+      failCodexTurn: failWechatCodexTurn,
       // dispatcher Step 2a / 2b — 走 storage helper 写 master sqlite client_sessions。
       upsertMasterClientSession,
       // dispatcher Step 2b 失败 + broker reconcile 共用同一个 soft-delete
@@ -1967,6 +2289,7 @@ export async function registerCommercial(
       identityRepo,
       pool: getPool(),
       rateLimiter: createNoopRateLimiter(),
+      handleCodexBilling: handleWechatCodexBilling,
     });
 
     wechatBroker = makeWechatBroker({
@@ -2313,39 +2636,7 @@ export async function registerCommercial(
     // plan v3 G5/G7 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
     // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
     codexBinding,
-    createCodexRoute: async ({ containerId, userId, modelId }) => {
-      const groups = await listEnabledGroupsForModel({ modelId, provider: "codex" });
-      if (groups.length === 0) return null;
-      for (const group of groups) {
-        if (group.kind === "api_relay") {
-          const route = await createCodexRouteContextForModel({
-            containerId,
-            userId,
-            modelId,
-            groupId: group.id,
-          });
-          if (!route) continue;
-          return {
-            kind: "api_relay" as const,
-            token: route.token,
-            baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
-            modelProvider: route.credential.model_provider,
-            providerName: route.credential.provider_name,
-            wireApi: route.credential.wire_api,
-            preferredAuthMethod: route.credential.preferred_auth_method,
-            disableResponseStorage: route.credential.disable_response_storage,
-            groupId: route.group.id.toString(),
-            credentialId: route.credential.id.toString(),
-          };
-        }
-        if (group.kind === "official_oauth") {
-          const hasAccount = await hasActiveOfficialOAuthAccountInGroup(group.id, "codex");
-          if (!hasAccount) continue;
-          return { kind: "official_oauth" as const, groupId: group.id.toString() };
-        }
-      }
-      return { kind: "unavailable" as const, reason: "no usable enabled Codex group" };
-    },
+    createCodexRoute: createCommercialCodexRoute,
     expireCodexRoute: async (token) => {
       await expireCodexRouteContext(token);
     },

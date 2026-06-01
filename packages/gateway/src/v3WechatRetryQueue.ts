@@ -85,6 +85,32 @@ export interface V3WechatSinkWirePayload {
   traceId?: string
 }
 
+export interface V3WechatCodexBillingWirePayload {
+  type: 'outbound.codex_billing'
+  requestId: string
+  status: 'success' | 'error'
+  durationMs: number
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_input_tokens?: number
+    cache_creation_input_tokens?: number
+    reasoning_output_tokens?: number
+  }
+  errorReason?: string
+  rateLimits?: {
+    util5h?: number
+    reset5h?: string
+    util7d?: number
+    reset7d?: string
+  }
+  traceId?: string
+}
+
+export type V3WechatOutboundPostPayload =
+  | V3WechatSinkWirePayload
+  | V3WechatCodexBillingWirePayload
+
 /** 错误分类。fatal → unlink + warn(master 永久拒绝:401/403/404/410/4xx 业务错);
  *  transient → 计数 retry(5xx / 网络 / 超时)。 */
 export type V3WechatSinkErrorClass = 'fatal' | 'transient'
@@ -102,7 +128,7 @@ export class V3WechatSinkError extends Error {
 
 export interface V3WechatRetryEntry {
   schemaVersion: 1
-  payload: V3WechatSinkWirePayload
+  payload: V3WechatOutboundPostPayload
   firstSeenAt: number
   attempts: number
   lastErrorClass?: V3WechatSinkErrorClass
@@ -132,7 +158,7 @@ export interface V3WechatRetryQueue {
 
 export interface MakeV3WechatRetryQueueDeps {
   dir?: string
-  attemptSend: (payload: V3WechatSinkWirePayload) => Promise<void>
+  attemptSend: (payload: V3WechatOutboundPostPayload) => Promise<void>
   now?: () => number
   drainIntervalMs?: number
 }
@@ -244,8 +270,7 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
         stats.ttlDropped++
         log.warn('v3WechatRetryQueue: entry TTL exceeded, dropping', {
           name,
-          sessionId: entry.payload.sessionId,
-          outboundId: entry.payload.outboundId,
+          ...payloadLogContext(entry.payload),
           attempts: entry.attempts,
           lastErrorClass: entry.lastErrorClass,
           firstSeenAt: entry.firstSeenAt,
@@ -264,8 +289,7 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
             'v3WechatRetryQueue: fatal sink error, unlinking',
             {
               name,
-              sessionId: entry.payload.sessionId,
-              outboundId: entry.payload.outboundId,
+              ...payloadLogContext(entry.payload),
               httpStatus: err.httpStatus,
             },
             err,
@@ -342,6 +366,23 @@ async function unlinkIgnoreEnoent(path: string): Promise<void> {
   }
 }
 
+function payloadLogContext(payload: V3WechatOutboundPostPayload): Record<string, string> {
+  if (isCodexBillingPayload(payload)) {
+    return { payloadType: 'codex_billing', requestId: payload.requestId }
+  }
+  return {
+    payloadType: 'message',
+    sessionId: payload.sessionId,
+    outboundId: payload.outboundId,
+  }
+}
+
+function isCodexBillingPayload(
+  payload: V3WechatOutboundPostPayload,
+): payload is V3WechatCodexBillingWirePayload {
+  return 'type' in payload && payload.type === 'outbound.codex_billing'
+}
+
 function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
   if (!v || typeof v !== 'object') return false
   const o = v as Record<string, unknown>
@@ -350,6 +391,12 @@ function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
   if (typeof o.attempts !== 'number' || !Number.isFinite(o.attempts)) return false
   const p = o.payload as Record<string, unknown> | undefined
   if (!p || typeof p !== 'object') return false
+  if (p.type === 'outbound.codex_billing') {
+    if (typeof p.requestId !== 'string' || !/^[0-9a-f]{32}$/.test(p.requestId)) return false
+    if (p.status !== 'success' && p.status !== 'error') return false
+    if (typeof p.durationMs !== 'number' || !Number.isFinite(p.durationMs) || p.durationMs < 0) return false
+    return true
+  }
   // wsess-[0-9a-f]{16} — broker 命名空间签名,误用 personal session id 会被 master
   // outboundReceiver BodySchema regex 直接拒(400 INVALID_BODY = fatal),提前在
   // shape guard 截,避免 drainer 反复 POST 注定 400 的请求。
