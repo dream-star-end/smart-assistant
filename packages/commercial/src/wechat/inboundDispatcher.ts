@@ -100,8 +100,8 @@ const WECHAT_OUTBOUND_MEDIA_HINT = [
   "【OpenClaude 微信通道系统提示：发送附件】",
   "如果用户要你“发/发送/传/导出/下载/分享”文件、图片、视频、语音或附件，不要只读取或口头描述。",
   "请先把要发给用户的资源创建或复制到当前容器的顶层目录：`/home/agent/.openclaude/generated/<安全文件名.ext>`；也可以复用已存在的 `/home/agent/.openclaude/uploads/<安全文件名.ext>`。",
-  "最终回复里必须单独写出这个绝对路径，例如：`/home/agent/.openclaude/generated/example.txt`。微信网关会自动把该路径转换成真实附件发送给用户。",
-  "安全文件名只能用字母、数字、点、下划线、短横线等普通字符；不要使用子目录。支持示例：txt, md, pdf, csv, json, docx, xlsx, pptx, zip, png/jpg, mp4, mp3。",
+  "最终回复里必须单独写出这个绝对路径，例如：`/home/agent/.openclaude/generated/example.txt`。微信网关会自动把该路径转换成真实附件发送给用户；路径不要只放在思考过程或工具调用说明里。",
+  "安全文件名只能匹配 `[A-Za-z0-9._@+=,-]{1,180}`；不要使用子目录。支持示例：txt, md, pdf, csv, json, docx, xlsx, pptx, zip, png/jpg, mp4, mp3。",
   "如果用户说“随便发我一个文件”，请生成一个小的 txt 或 md 文件后再给出路径。没有创建/复制文件并给出上述路径前，不要声称已经发给用户。",
 ].join("\n")
 
