@@ -32,7 +32,9 @@ import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
 import { PricingCache, createModelHintProvider } from "./billing/pricing.js";
-import { setModelHintProvider, setLiteratureSkillProvider } from "@openclaude/gateway";
+import { canUseModel } from "./billing/authzModels.js";
+import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider } from "@openclaude/gateway";
+import { getPreferences } from "./user/preferences.js";
 import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 import {
   getPhase6AccountUuidEnforce,
@@ -156,6 +158,7 @@ import {
   type PlatformPromptSlotsHandler,
 } from "./http/internalPlatformPromptSlots.js";
 import { makeInboundDispatcher } from "./wechat/inboundDispatcher.js";
+import { pickWechatInboundModel } from "./wechat/modelResolver.js";
 import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
 import { makeIlinkSendAdapter } from "./wechat/ilinkSendAdapter.js";
 import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
@@ -1931,6 +1934,21 @@ export async function registerCommercial(
       pgPool: getPool(),
       resolveContainerEndpoint,
       bridgeSecret,
+      resolveModel: async (bindingUserId) => {
+        const uid = BigInt(bindingUserId);
+        const [prefs, authz] = await Promise.all([
+          getPreferences(uid),
+          loadUserModelAuthz(uid),
+        ]);
+
+        return pickWechatInboundModel({
+          preferredModel: prefs.prefs.default_model,
+          visibleModels: pricing.listForUser(authz),
+          canUseModel: (modelId) =>
+            canUseModel({ pricing }, { ...authz, modelId }),
+          allowedModels: ALLOWED_INBOUND_MODELS,
+        });
+      },
       // dispatcher Step 2a / 2b — 走 storage helper 写 master sqlite client_sessions。
       upsertMasterClientSession,
       // dispatcher Step 2b 失败 + broker reconcile 共用同一个 soft-delete

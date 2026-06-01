@@ -129,6 +129,24 @@ test('handleWechatInbound: lookup precedes the 503 guard, which precedes dispatc
     'the 503 fail-closed block must precede dispatchInbound — otherwise dispatch fires before the guard')
 })
 
+
+// ── 模型字段:master broker 可把用户默认模型带进容器 inbound frame ──
+test('handleWechatInbound validates optional body.model against ALLOWED_INBOUND_MODELS', () => {
+  assert.match(
+    handleWechatInbound,
+    /const model\s*=\s*body\.model[\s\S]+ALLOWED_INBOUND_MODELS\.has\(model\)[\s\S]+model unsupported for inbound dispatch/,
+    'body.model 必须经过 ALLOWED_INBOUND_MODELS 校验,避免 user_preferences 旧值/非法值进 runner --model',
+  )
+})
+
+test('handleWechatInbound forwards validated model onto the InboundFrame', () => {
+  assert.match(
+    handleWechatInbound,
+    /\.\.\.\(typeof model === ['"]string['"] \? \{ model \} : \{\}\)/,
+    '通过校验的 body.model 必须透传到 frame.model,让 dispatchInbound/sessionManager 切换到用户默认模型',
+  )
+})
+
 // ── 副断言:peer.displayName carrier 完整性(slice 7c senderId 通过 peer.displayName 携带)──
 test('handleWechatInbound preserves peer.displayName on the outbound frame', () => {
   // peerOut 构造分支必须把 peerDisplayName(来自 body.peer.displayName)

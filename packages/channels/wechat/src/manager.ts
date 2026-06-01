@@ -256,7 +256,7 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
  * up a real `WechatWorker` long-poll loop.
  *
  * **Invariants**(测试套件 wechatChannelOverride.test.ts 断言):
- *   1. `/status` 命中 → 只调用 `sendText`(本地控制面板),**不**进 override / dispatch
+ *   1. `/help` / `/model` / `/status` 命中 → 只调用 `sendText`,**不**进 override / dispatch
  *   2. `/new` 命中 → 调用 `ctx.resetSession` + `sendText` 反馈,**不**进 override / dispatch
  *   3. 普通文本 + `onInboundOverride` 已注入 → **只**调 override,**不**调 `ctx.dispatch`
  *   4. 普通文本 + `onInboundOverride` 未注入 → 走原 `ctx.dispatch` 路径
@@ -285,6 +285,36 @@ export async function routeWechatInbound(
   // No sender gating — anyone who can reach the bound bot is trusted. The
   // OC owner wants the bot fully open; access control is the WeChat-side
   // friend relationship, not something we replicate here.
+
+  // ── /help — advertise the small set of WeChat-safe controls ──
+  if (/^\s*\/help\s*$/.test(text)) {
+    sendText(
+      binding.userId,
+      senderId,
+      [
+        '微信里可以这样用 OpenClaude:',
+        '• 直接发消息:继续当前会话',
+        '• /new:开启新会话',
+        '• /status:查看绑定和 worker 状态',
+        '• /model:查看模型说明',
+      ].join('\n'),
+    )
+    return
+  }
+
+  // ── /model — explain model behavior instead of a dead-end unsupported reply ──
+  if (/^\s*\/model(?:\s+.*)?$/.test(text)) {
+    sendText(
+      binding.userId,
+      senderId,
+      [
+        '微信会跟随你在网页端选择的默认模型。',
+        '如需切换模型,请打开 claudeai.chat,在聊天页顶部的模型选择器修改。',
+        '修改后,下一条微信消息会使用新的可用模型。',
+      ].join('\n'),
+    )
+    return
+  }
 
   // ── /status — report current binding state to the WeChat user ──
   if (/^\s*\/status\s*$/.test(text)) {

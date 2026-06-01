@@ -3,7 +3,7 @@
  * `wechatChannelFactory.handleInbound` (manager.ts).
  *
  * **Slice 7c contract**(broker override hook):
- *   1. /status 命中 → 只调用 sendText("OC bot status..."),不进 override / dispatch
+ *   1. /help /model /status 命中 → 只调用 sendText,不进 override / dispatch
  *   2. /new 命中 → 调用 ctx.resetSession + sendText,不进 override / dispatch
  *   3. 普通文本 + override 已注入 → 只调 override,不调 ctx.dispatch
  *   4. 普通文本 + override 未注入 → 走 ctx.dispatch 原路径(行为不变)
@@ -109,6 +109,38 @@ function makeDeps(over: Partial<{
   }
   return { deps, cap }
 }
+
+describe('routeWechatInbound — /help and /model commands are useful local replies', () => {
+  it('/help lists supported WeChat commands; no override, no dispatch', async () => {
+    const { deps, cap } = makeDeps({ withOverride: true })
+    await routeWechatInbound(makeEvent({ text: '/help' }), deps)
+    assert.equal(cap.overrideCalls.length, 0)
+    assert.equal(cap.dispatchCalls.length, 0)
+    assert.equal(cap.sendTextCalls.length, 1)
+    assert.match(cap.sendTextCalls[0]!.msg, /\/new/)
+    assert.match(cap.sendTextCalls[0]!.msg, /\/status/)
+    assert.match(cap.sendTextCalls[0]!.msg, /\/model/)
+  })
+
+  it('/model explains web default model behavior; no override, no dispatch', async () => {
+    const { deps, cap } = makeDeps({ withOverride: true })
+    await routeWechatInbound(makeEvent({ text: '/model' }), deps)
+    assert.equal(cap.overrideCalls.length, 0)
+    assert.equal(cap.dispatchCalls.length, 0)
+    assert.equal(cap.sendTextCalls.length, 1)
+    assert.match(cap.sendTextCalls[0]!.msg, /网页端选择的默认模型/)
+    assert.match(cap.sendTextCalls[0]!.msg, /claudeai\.chat/)
+  })
+
+  it('/model with args still returns instructions instead of unsupported-command dead end', async () => {
+    const { deps, cap } = makeDeps({ withOverride: true })
+    await routeWechatInbound(makeEvent({ text: '/model claude-sonnet-4-6' }), deps)
+    assert.equal(cap.overrideCalls.length, 0)
+    assert.equal(cap.dispatchCalls.length, 0)
+    assert.equal(cap.sendTextCalls.length, 1)
+    assert.match(cap.sendTextCalls[0]!.msg, /修改后,下一条微信消息会使用新的可用模型/)
+  })
+})
 
 describe('routeWechatInbound — /status command bypasses override and dispatch', () => {
   it('only calls sendText with status text; no override, no dispatch', async () => {
