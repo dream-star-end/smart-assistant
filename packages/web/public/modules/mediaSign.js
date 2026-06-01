@@ -49,8 +49,8 @@
 // 同步落 `_lastFlushDiag`。这样 click handler 紧跟 await 恢复就能读到这一批
 // 自己的快照,不会赌 race。
 
-import { state } from './state.js?v=527fe16a'
-import { silentRefresh } from './api.js?v=527fe16a'
+import { state } from './state.js?v=628dcaeb'
+import { silentRefresh } from './api.js?v=628dcaeb'
 
 /** 服务端 batch 上限(packages/commercial/src/http/mediaSign.ts MEDIA_SIGN_BATCH_MAX) */
 const MAX_BATCH_PATHS = 32

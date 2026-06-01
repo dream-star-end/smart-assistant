@@ -1,23 +1,23 @@
 // OpenClaude — Message rendering and display
-import { _openTopupModal } from './billing.js?v=527fe16a'
-import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=527fe16a'
-import { getEffortForSubmit } from './effortMode.js?v=527fe16a'
-import { refreshPlanPanel } from './planPanel.js?v=527fe16a'
-import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=527fe16a'
-import { exportMessageDocx } from './export-docx.js?v=527fe16a'
-import { exportMessageTex } from './export-tex.js?v=527fe16a'
+import { _openTopupModal } from './billing.js?v=628dcaeb'
+import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=628dcaeb'
+import { getEffortForSubmit } from './effortMode.js?v=628dcaeb'
+import { refreshPlanPanel } from './planPanel.js?v=628dcaeb'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=628dcaeb'
+import { exportMessageDocx } from './export-docx.js?v=628dcaeb'
+import { exportMessageTex } from './export-tex.js?v=628dcaeb'
 import {
   clearChartInstances,
   embedMediaUrls,
   processRichBlocks,
   renderMarkdown,
   renderStreamingMarkdown,
-} from './markdown.js?v=527fe16a'
-import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=527fe16a'
-import { toast } from './ui.js?v=527fe16a'
-import { parsePartialJson } from './partialJson.js?v=527fe16a'
-import { msgTimeLabel, shortTime } from './util.js?v=527fe16a'
-import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=527fe16a'
+} from './markdown.js?v=628dcaeb'
+import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=628dcaeb'
+import { toast } from './ui.js?v=628dcaeb'
+import { parsePartialJson } from './partialJson.js?v=628dcaeb'
+import { msgTimeLabel, shortTime } from './util.js?v=628dcaeb'
+import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=628dcaeb'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
