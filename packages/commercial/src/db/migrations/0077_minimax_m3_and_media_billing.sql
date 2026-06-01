@@ -32,22 +32,30 @@ ON CONFLICT (model_id) DO UPDATE
        updated_at            = NOW();
 
 -- 扩展 credit_ledger.reason 白名单，给 MiniMax 媒体(语音/视频/图像/音乐/歌词)
--- 统一记账。约束名在 PG 默认会是 credit_ledger_reason_check；这里动态查找，避免
--- 环境中约束名因历史 restore/drift 不一致导致 migration 失败。
+-- 统一记账。PG 可能把 `reason IN (...)` 反显为 `reason = ANY (ARRAY[...])`，
+-- 不能靠 pg_get_constraintdef 文本匹配 `reason IN` 找旧约束。
 DO $$
 DECLARE
   constraint_name TEXT;
+  reason_attnum SMALLINT;
 BEGIN
-  SELECT conname INTO constraint_name
-    FROM pg_constraint
-   WHERE conrelid = 'credit_ledger'::regclass
-     AND contype = 'c'
-     AND pg_get_constraintdef(oid) LIKE '%reason IN%'
-   LIMIT 1;
+  ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS credit_ledger_reason_check;
 
-  IF constraint_name IS NOT NULL THEN
+  SELECT attnum INTO reason_attnum
+    FROM pg_attribute
+   WHERE attrelid = 'credit_ledger'::regclass
+     AND attname = 'reason'
+     AND NOT attisdropped;
+
+  FOR constraint_name IN
+    SELECT conname
+      FROM pg_constraint
+     WHERE conrelid = 'credit_ledger'::regclass
+       AND contype = 'c'
+       AND reason_attnum = ANY (conkey)
+  LOOP
     EXECUTE format('ALTER TABLE credit_ledger DROP CONSTRAINT %I', constraint_name);
-  END IF;
+  END LOOP;
 
   ALTER TABLE credit_ledger
     ADD CONSTRAINT credit_ledger_reason_check
