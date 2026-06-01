@@ -63,6 +63,8 @@ mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
 
 - 查看当前所有 CLAUDE.md(全局 + 项目级):
   `find /run/oc/claude-config /home/agent -name CLAUDE.md 2>/dev/null`
+- 搜索相关 skills:`skill_search(query="关键词", limit=5)` 只返回 metadata;确定候选后再
+  `skill_view(name)` 读取完整步骤。
 - 查看已保存的 skills:`skill_list` 现在会**合并**两套来源,按 source 分组输出
   —— 平台基线(source=platform,只读,磁盘上在 `/run/oc/claude-config/skills/`)
   和用户自建(source=user,磁盘上在 `/home/agent/.openclaude/agents/<agentId>/skills/`)。

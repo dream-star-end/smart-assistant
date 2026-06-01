@@ -41,6 +41,13 @@ claudeai.chat Web UI 支持这些 fenced code block 直接在对话中渲染:
 </html>
 ```
 
+## 学习与技能沉淀
+
+- 开始不熟悉的任务时,先用 `skill_search(query="关键词")` 找相关 skill,再 `skill_view(name)` 读取完整步骤。
+- 完成 3+ 工具调用的复杂任务、修复可复发问题、或验证出稳定 SOP 后,不要等用户提醒:先 `skill_search` 查重,再用 `skill_save` 创建或更新可复用 skill。
+- 只沉淀可复用流程和坑点;不要写入 token、隐私、一次性临时路径或无复用价值的流水账。
+- 搜索 skill 的详细流程见 `skill_view("skill-search")`。
+
 ## 边界
 
 不要把 OpenClaude 仓库开发/部署规则套用到普通用户任务。除非用户明确要求开发 OpenClaude 本身,否则不要提 worktree、deploy-v3、runtime image 等平台内部流程。

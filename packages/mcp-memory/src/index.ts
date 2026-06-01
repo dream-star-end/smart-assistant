@@ -8,6 +8,7 @@
  *   • `memory`         — curate its own MEMORY.md and USER.md across sessions
  *   • `session_search` — recall past conversations (SQLite FTS5 + second-pass summary)
  *   • `skill_list`     — discover its own accumulated skills (tier-1 progressive disclosure)
+ *   • `skill_search`   — find relevant skills by metadata before loading bodies
  *   • `skill_view`     — load a skill's full instructions (tier-2/3)
  *   • `skill_save`     — distill a successful task into a reusable skill
  *   • `skill_delete`
@@ -24,26 +25,27 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
+  type EmbeddingProvider,
   MemoryStore,
   SkillStore,
   archivalAdd,
   archivalCount,
   archivalDelete,
-  indexTurn,
-  loadSessionTurns,
-  searchSessions,
-  upsertSessionMeta,
+  deleteArchivalVector,
+  getEmbeddingProvider,
+  getSessionsDb,
   // P1: Hybrid search (BM25 + Vector + RRF)
   hybridArchivalSearch,
   hybridSessionSearch,
-  recordAccess,
+  indexTurn,
   initVectorStore,
-  upsertArchivalVector,
-  deleteArchivalVector,
   isEmbeddingAvailable,
-  getEmbeddingProvider,
-  getSessionsDb,
-  type EmbeddingProvider,
+  loadSessionTurns,
+  recordAccess,
+  searchSessions,
+  searchSkillMetadata,
+  upsertArchivalVector,
+  upsertSessionMeta,
 } from '@openclaude/storage'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
@@ -213,6 +215,27 @@ const TOOLS = [
       'Token-cheap: returns metadata only. Use `skill_view` to load full instructions.',
     ].join('\n'),
     inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'skill_search',
+    description: [
+      'Search available skills by name, description, tags, and related_skills.',
+      'Use this before `skill_view` when you need a relevant skill but do not know its exact name.',
+      'Also use this before `skill_save` to avoid creating duplicate skills.',
+      'Returns metadata only; call `skill_view(name)` for full instructions.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query, e.g. "deploy", "定时任务", "skill search"' },
+        limit: {
+          type: 'number',
+          default: 5,
+          description: 'Max results to return (clamped to 1..25)',
+        },
+      },
+      required: ['query'],
+    },
   },
   {
     name: 'skill_view',
@@ -437,6 +460,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSessionSearch(args as any)
       case 'skill_list':
         return await handleSkillList()
+      case 'skill_search':
+        return await handleSkillSearch(args as any)
       case 'skill_view':
         return await handleSkillView(args as any)
       case 'skill_save':
@@ -607,6 +632,41 @@ async function handleSkillList() {
   lines.push(
     'Baseline skills cannot be overwritten via `skill_save` (name is reserved) or deleted via `skill_delete`.',
   )
+  return { content: [{ type: 'text', text: lines.join('\n') }] }
+}
+
+async function handleSkillSearch(args: { query: string; limit?: number } | undefined) {
+  const query = typeof args?.query === 'string' ? args.query.trim() : ''
+  if (!query) return toolError('query required')
+
+  const list = await skills.list()
+  const hits = searchSkillMetadata(list, query, args?.limit)
+  if (hits.length === 0) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: [
+            `No matching skills found for "${query}".`,
+            'Try a broader query or call `skill_list()` to browse all available skills.',
+            'If this was a reusable workflow you just validated, create it with `skill_save` after the task is complete.',
+          ].join('\n'),
+        },
+      ],
+    }
+  }
+
+  const lines = [`Found ${hits.length} matching skill(s) for "${query}":`, '']
+  for (const s of hits) {
+    lines.push(`### ${s.name} [source: ${s.source}, score: ${s.score}]`)
+    lines.push(s.description)
+    if (s.tags && s.tags.length > 0) lines.push(`tags: ${s.tags.join(', ')}`)
+    if (s.related_skills && s.related_skills.length > 0)
+      lines.push(`related_skills: ${s.related_skills.join(', ')}`)
+    if (s.matched.length > 0) lines.push(`matched: ${s.matched.join(', ')}`)
+    lines.push('')
+  }
+  lines.push('Next: call `skill_view(name)` for the best match before applying it.')
   return { content: [{ type: 'text', text: lines.join('\n') }] }
 }
 

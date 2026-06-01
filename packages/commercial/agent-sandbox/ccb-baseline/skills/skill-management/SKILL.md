@@ -17,6 +17,9 @@ Skills 是你的可复用知识库。当你完成一个复杂任务并总结出�
 - 用户明确要求你记住某个流程
 - 踩了坑并找到了解决方案(防止再犯)
 
+创建前先用 `skill_search(query="关键词")` 查重;已有合适 skill 时优先更新,
+不要造重复名称或内容高度重合的新 skill。
+
 ## 如何创建 skill
 
 ```
@@ -47,6 +50,7 @@ skill_save(
 
 ## 查看和使用 skill
 
+- `skill_search(query, limit=5)` — 按名称、描述、tags、related_skills 搜索相关 skills。只返回 metadata,适合先找候选。
 - `skill_list()` — 列出所有 skills(名称+描述)。每次会话开始时,所有 skill 的名称和描述已在你的 system prompt 中。
 - `skill_view(name)` — 加载完整内容。当你要执行一个与已有 skill 相关的任务时,先 view 获取完整指令。
 
@@ -82,6 +86,8 @@ claudeai.chat 容器启动时,平台通过 kernel ro bind mount 把一批基线 
 - `platform-capabilities` — 多媒体和内联富内容
 - `scheduled-tasks` — 定时任务创建方法
 - `skill-management` — 本文件
+- `skill-search` — 如何搜索和发现合适 skill
+- `document-writing` — 常见文档写作/导出流程
 
 这批 skill 在 `skill_list` 输出里标 `source=platform`,在 `skill_view` 输出顶部
 也带 `[source: platform]` 标记。**只读**:`skill_save` 传相同 name 会被拒绝
