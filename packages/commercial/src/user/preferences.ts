@@ -17,6 +17,7 @@
  *   default_effort  : 'low' | 'medium' | 'high' | 'xhigh'
  *   notify_email    : boolean
  *   notify_telegram : boolean
+ *   wechat_show_tool_calls : boolean
  *   hotkeys         : Record<string, string>(最多 32 条,key/value <= 64 chars)
  *
  * 不做的:
@@ -48,6 +49,7 @@ export const PreferencesSchema = z
     default_effort: effortSchema.optional(),
     notify_email: z.boolean().optional(),
     notify_telegram: z.boolean().optional(),
+    wechat_show_tool_calls: z.boolean().optional(),
     hotkeys: hotkeysSchema.optional(),
   })
   .strict();
@@ -64,6 +66,7 @@ export const PreferencesPatchSchema = z
     default_effort: effortSchema.nullable().optional(),
     notify_email: z.boolean().nullable().optional(),
     notify_telegram: z.boolean().nullable().optional(),
+    wechat_show_tool_calls: z.boolean().nullable().optional(),
     hotkeys: hotkeysSchema.nullable().optional(),
   })
   .strict();

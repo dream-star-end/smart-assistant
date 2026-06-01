@@ -12,6 +12,7 @@
 //   - default_effort   'low' | 'medium' | 'high' | 'xhigh'
 //   - notify_email     boolean (邮件通知支付/重要事件)
 //   - notify_telegram  → MVP 不暴露(v3 商用版 telegram 通道未接)
+//   - wechat_show_tool_calls boolean (微信回复是否显示工具调用过程)
 //   - hotkeys          → MVP 不暴露(无键位编辑器)
 //   - theme            → 不暴露(已有顶栏「切换主题」按钮)
 //

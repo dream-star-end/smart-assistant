@@ -12,8 +12,8 @@
  *   2) zod 严格 parse;blocks 用 discriminatedUnion(kind),unknown key 拒绝
  *   3) outbound rate-limit 检查(P1 noop,但保留调用便于 P3 切换)
  *   4) renderWechatBlocks 把 5 种 OutboundContentBlock 投影成 IlinkPart[]:
- *        - text         → renderAssistantText(sanitize + split 1024)
- *        - tool_use     → renderToolAnnouncement("🔧 X…")
+ *        - text         → coalesce adjacent chunks, then renderAssistantText(sanitize + split 1024)
+ *        - tool_use     → renderToolAnnouncement("🔧 X…") unless user hides tool process
  *        - tool_result  → P1 drop(voluminous, 用户在 web 看;P2 可考虑短链摘要)
  *        - thinking     → P1 drop(reasoning 不外发)
  *        - tool_output_tail → P1 drop(已被 tool_use 公告覆盖)
@@ -50,6 +50,7 @@ import {
   setSecurityHeaders,
 } from "./../http/util.js"
 import { rootLogger, type Logger } from "../logging/logger.js"
+import { getPreferences } from "../user/preferences.js"
 import { enqueue, type EnqueueOutcome } from "./outboxStore.js"
 import { renderAssistantText, renderToolAnnouncement } from "./rendererPipeline.js"
 import { type RateLimiter } from "./rateLimiter.js"
@@ -239,37 +240,61 @@ export type WechatCodexBillingBody = z.infer<typeof CodexBillingBodySchema>
 /** 渲染结果分类。renderEmpty 时不入队,返 200 + `outcome:"empty_render"`。 */
 type RenderResult = { parts: IlinkPart[]; dropped: number }
 
+export interface RenderWechatBlocksOptions {
+  /** true(default) → show tool announcements; false → hide tool-call process in WeChat. */
+  showToolCalls?: boolean
+}
+
 /**
  * 把 5 种 OutboundContentBlock 投影成 IlinkPart[]。
  *
  * **规则**(详见模块头注释):
  *   - parentToolUseId 非空 → 整块 skip(subagent 内容只在 web Agent card 渲染)
- *   - text → renderAssistantText(可能产出多 part,sanitize markdown + split 1024)
+ *   - text → 先合并连续顶层 text,再 renderAssistantText(避免 token chunks 变成多气泡)
  *   - tool_use → renderToolAnnouncement("🔧 X…")
  *   - tool_result / thinking / tool_output_tail → drop(P1 不外发)
  *
  * 返回 `dropped` 计数仅用于审计 / 测试断言(broker 关心"是否完全空"由 caller 判断)。
  */
-export function renderWechatBlocks(blocks: OutboundReceiverBody["blocks"]): RenderResult {
+export function renderWechatBlocks(
+  blocks: OutboundReceiverBody["blocks"],
+  options: RenderWechatBlocksOptions = {},
+): RenderResult {
   const parts: IlinkPart[] = []
   let dropped = 0
+
+  const showToolCalls = options.showToolCalls !== false
+  let textBuffer = ""
+
+  const flushText = () => {
+    if (textBuffer.length === 0) return
+    const rendered = renderAssistantText(textBuffer)
+    textBuffer = ""
+    if (rendered.length === 0) {
+      dropped++
+      return
+    }
+    for (const p of rendered) parts.push(p)
+  }
+
   for (const b of blocks) {
     if (b.parentToolUseId !== undefined && b.parentToolUseId.length > 0) {
+      flushText()
       dropped++
       continue
     }
     switch (b.kind) {
       case "text": {
-        const rendered = renderAssistantText(b.text)
-        if (rendered.length === 0) {
-          dropped++
-        } else {
-          for (const p of rendered) parts.push(p)
-        }
+        textBuffer += b.text
         break
       }
       case "tool_use": {
-        for (const p of renderToolAnnouncement(b.toolName)) parts.push(p)
+        if (showToolCalls) {
+          flushText()
+          for (const p of renderToolAnnouncement(b.toolName)) parts.push(p)
+        } else {
+          dropped++
+        }
         break
       }
       case "tool_result":
@@ -279,6 +304,7 @@ export function renderWechatBlocks(blocks: OutboundReceiverBody["blocks"]): Rend
         break
     }
   }
+  flushText()
   return { parts, dropped }
 }
 
@@ -294,6 +320,11 @@ export interface OutboundReceiverDeps {
    * outbound, but bypass message outbox rate limiting/rendering.
    */
   handleCodexBilling?: (body: WechatCodexBillingBody, identity: ContainerIdentity) => Promise<void>
+  /**
+   * Per-user WeChat UX preference. Missing/throwing defaults to true at call site
+   * so final answers are never blocked by a preference lookup failure.
+   */
+  getWechatShowToolCalls?: (userId: number) => Promise<boolean>
   /** outbox 最大尝试数;default = DEFAULT_MAX_ATTEMPTS。 */
   maxAttempts?: number
   logger?: Logger
@@ -317,6 +348,12 @@ export function makeOutboundReceiverHandler(
 ): OutboundReceiverHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: "wechatOutboundReceiver" })
   const now = deps.now ?? (() => Date.now())
+  const getWechatShowToolCalls =
+    deps.getWechatShowToolCalls ??
+    (async (userId: number) => {
+      const snap = await getPreferences(String(userId))
+      return snap.prefs.wechat_show_tool_calls !== false
+    })
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res)
@@ -429,7 +466,17 @@ export function makeOutboundReceiverHandler(
     }
 
     // 4) Render 5 种 block → IlinkPart[]
-    const { parts, dropped } = renderWechatBlocks(body.blocks)
+    let showToolCalls = true
+    try {
+      showToolCalls = await getWechatShowToolCalls(identity.userId)
+    } catch (err) {
+      userLog.warn("wechat_tool_call_pref_lookup_failed_default_true", {
+        outboundId: body.outboundId,
+        sessionId: body.sessionId,
+        err: err as Error,
+      })
+    }
+    const { parts, dropped } = renderWechatBlocks(body.blocks, { showToolCalls })
     if (parts.length === 0) {
       // 全 drop / 全空文本 — 不入队(避免 worker 走 invalid_payload 路径)。
       // 容器侧 sink 视为 "已接收、无可发内容、勿重试"。
