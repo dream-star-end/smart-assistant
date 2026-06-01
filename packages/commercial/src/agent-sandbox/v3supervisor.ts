@@ -349,7 +349,8 @@ const V3_SSH_RUN_CONTAINER_MOUNT = "/run/ccb-ssh";
  *       ├── memory-management/SKILL.md
  *       ├── platform-capabilities/SKILL.md
  *       ├── scheduled-tasks/SKILL.md
- *       └── skill-management/SKILL.md
+ *       ├── skill-management/SKILL.md
+ *       └── skill-search/SKILL.md
  *
  * 挂整个 skills/ 父目录(而不是逐 skill ro bind)好处:
  *   1. 新增基线 skill 只改 manifest 一行 + 新加目录,不动 docker 挂载代码
@@ -398,6 +399,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "platform-capabilities",
   "scheduled-tasks",
   "skill-management",
+  "skill-search",
   "document-writing",
 ] as const;
 
@@ -1998,8 +2000,8 @@ export async function provisionV3Container(
         `${baselineMounts.claudeMdHostPath}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,
         // 挂 skills/ 整目录,一次性覆盖所有基线 skill(system-info /
         // memory-management / platform-capabilities / scheduled-tasks /
-        // skill-management / document-writing)。新增基线 skill 不再改这里,改
-        // V3_CCB_BASELINE_SKILL_NAMES manifest 即可。
+        // skill-management / skill-search / document-writing)。新增基线 skill
+        // 不再改这里,改 V3_CCB_BASELINE_SKILL_NAMES manifest 即可。
         //
         // 用户自建 skill 由 PR4 的 SkillStore baseline-wins 合并视图在
         // /home/agent/.openclaude/agents/<id>/skills/ 提供,通过 env

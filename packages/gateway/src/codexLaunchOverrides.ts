@@ -67,7 +67,7 @@ Use the **\`openclaude_memory\`** MCP server. Its tools are your access path:
 
 - \`memory(op, scope, ...)\` — read/append to short Core memory.
 - \`archival_search\` / \`archival_add\` / \`archival_delete\` — long-form notes.
-- \`skill_list\` / \`skill_view\` / \`skill_save\` / \`skill_delete\` — platform skills.
+- \`skill_search\` / \`skill_list\` / \`skill_view\` / \`skill_save\` / \`skill_delete\` — platform skills.
 - \`session_search\` — recall prior conversations.
 - \`create_reminder\` — schedule a cron-driven reminder.
 - \`delegate_task\` (sync) / \`send_to_agent\` (async) — talk to sibling agents.
@@ -78,6 +78,10 @@ would fork the source of truth. Always go through the \`openclaude_memory\`
 MCP tools above. (The only exception is if the user *explicitly* asks you to
 inspect a codex-native rollout file — and even then, do not migrate that
 content into a parallel store.)
+
+For reusable workflows, be proactive: after a complex multi-step task, call
+\`skill_search\` to check existing coverage, then \`skill_save\` to create or
+update a platform skill when the pattern is likely to recur.
 
 ## How to interpret tool descriptions in the sections below
 
@@ -413,6 +417,9 @@ export async function buildCodexLaunchOverrides(
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),
       OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
       OPENCLAUDE_DELEGATION_DEPTH: String(ctx.delegationDepth ?? 0),
+      ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
+        ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
+        : {}),
     }
     argvOverrides.push(
       '-c',

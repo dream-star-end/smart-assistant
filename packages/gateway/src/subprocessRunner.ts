@@ -1066,6 +1066,12 @@ export class SubprocessRunner extends EventEmitter {
             OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
             OPENCLAUDE_GATEWAY_TOKEN: this.opts.config.gateway.accessToken,
             OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0),
+            ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
+              ? {
+                  OPENCLAUDE_BASELINE_SKILLS_DIR:
+                    process.env.OPENCLAUDE_BASELINE_SKILLS_DIR,
+                }
+              : {}),
           },
         }
       } else {

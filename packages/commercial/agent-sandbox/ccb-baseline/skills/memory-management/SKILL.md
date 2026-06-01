@@ -55,4 +55,4 @@ session_search(query="部署 VPS")
 2. **简洁**: 每条记忆一行,包含关键词方便日后搜索。
 3. **去重**: 写入前先 read,避免重复。
 4. **定期清理**: 发现过时信息及时 remove。
-5. **区分记忆 vs skill**: 单条事实 → 记忆; 可复用流程 → skill。
+5. **区分记忆 vs skill**: 单条事实 → 记忆; 可复用流程 → skill。创建 skill 前先 `skill_search` 查重。

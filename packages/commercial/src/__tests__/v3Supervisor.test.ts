@@ -2251,7 +2251,7 @@ describe("wrapDockerError — node-agent AgentAppError 路径", () => {
  * 则是 root;普通用户跑则是 uid≠0 会被 assertBaselineLeaf 拒 —— 所以这类测试
  * 只在 root 下跑才能全绿)。如果不是 root,返回 null(跳过该分支测试)。
  *
- * 注入全部 `V3_CCB_BASELINE_SKILL_NAMES` 里的 skill(system-info + 其它 4 个),
+ * 注入全部 `V3_CCB_BASELINE_SKILL_NAMES` 里的 skill(完整 manifest),
  * 所有 SKILL.md 都写;`withAllSkillMd=false` 时故意漏第一条 skill 的 SKILL.md,
  * 用来覆盖"一条 skill 缺 SKILL.md → 整个 resolve 返 null"分支(fail-all)。
  */

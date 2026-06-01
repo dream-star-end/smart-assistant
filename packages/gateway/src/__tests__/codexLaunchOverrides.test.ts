@@ -119,6 +119,7 @@ describe('CODEX_PREAMBLE', () => {
       CODEX_PREAMBLE.includes('openclaude_memory'),
       'preamble must name the MCP server',
     )
+    assert.ok(CODEX_PREAMBLE.includes('skill_search'), 'preamble must mention skill_search')
   })
 
   it('explicitly forbids using codex native ~/.codex/memories', () => {
@@ -294,6 +295,36 @@ describe('buildCodexLaunchOverrides', () => {
     // No override anywhere may contain the token literal.
     for (const tok of out.argvOverrides) {
       assert.ok(!tok.includes(TOKEN), `argv leaked token in: ${tok}`)
+    }
+  })
+
+  it('mcp env forwards OPENCLAUDE_BASELINE_SKILLS_DIR when present so codex can see platform skills', async () => {
+    const baselineDir = mkdtempSync(join(tmpdir(), 'codex-baseline-skills-'))
+    try {
+      await withEnv({ OPENCLAUDE_BASELINE_SKILLS_DIR: baselineDir }, async () => {
+        const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+        const out = await buildCodexLaunchOverrides({
+          agentId: 'test-agent',
+          sessionDir: dir,
+          gatewayPort: 18789,
+          gatewayToken: 'tok-xyz',
+        })
+        const envKey = out.argvOverrides.find((s) =>
+          s.startsWith('mcp_servers.openclaude_memory.env='),
+        )
+        if (envKey) {
+          assert.ok(
+            envKey.includes('OPENCLAUDE_BASELINE_SKILLS_DIR'),
+            `env must forward baseline skills dir; got: ${envKey}`,
+          )
+          assert.ok(
+            envKey.includes(baselineDir),
+            `env must include baseline skills dir value; got: ${envKey}`,
+          )
+        }
+      })
+    } finally {
+      rmSync(baselineDir, { recursive: true, force: true })
     }
   })
 
