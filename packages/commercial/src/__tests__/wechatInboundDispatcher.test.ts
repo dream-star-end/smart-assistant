@@ -1022,6 +1022,27 @@ describe("inboundDispatcher — wire correctness", () => {
     assert.equal("sessionId" in body, false)
   })
 
+  test("file-send request gets WeChat outbound attachment guidance in dispatch text", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    const d = makeInboundDispatcher(makeDeps({ transport }))
+    await d.dispatch(makeEvent({ text: "随便发我一个文件" }))
+    const body = spy.posts[0]!.bodyParsed as Record<string, unknown>
+    const content = body.content as { text: string }
+    assert.match(content.text, /^随便发我一个文件/)
+    assert.match(content.text, /微信通道系统提示：发送附件/)
+    assert.match(content.text, /\/home\/agent\/\.openclaude\/generated\/<安全文件名\.ext>/)
+    assert.match(content.text, /example\.txt/)
+    assert.match(content.text, /不要声称已经发给用户/)
+  })
+
+  test("non-attachment text with similar verb is not polluted by file-send guidance", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    const d = makeInboundDispatcher(makeDeps({ transport }))
+    await d.dispatch(makeEvent({ text: "发散思维一下，讲讲产品设计" }))
+    const body = spy.posts[0]!.bodyParsed as Record<string, unknown>
+    assert.deepEqual(body.content, { text: "发散思维一下，讲讲产品设计" })
+  })
+
   test("agentId defaults to 'main' when omitted", async () => {
     const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
     const storage = makeStorageSpies()

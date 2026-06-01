@@ -91,6 +91,20 @@ const CODEX_TEMP_UNAVAILABLE_REPLY = "GPT 模型通道暂时不可用，请稍�
 /** 默认 session title fallback(空白文本 / 全 emoji 截断后空时使用)。 */
 const DEFAULT_SESSION_TITLE = "微信会话"
 
+/** 容器侧 handleWechatInbound 对 content.text 的 schema 上限。 */
+const WECHAT_INBOUND_TEXT_MAX_CHARS = 65_536
+
+const WECHAT_OUTBOUND_MEDIA_HINT = [
+  "",
+  "---",
+  "【OpenClaude 微信通道系统提示：发送附件】",
+  "如果用户要你“发/发送/传/导出/下载/分享”文件、图片、视频、语音或附件，不要只读取或口头描述。",
+  "请先把要发给用户的资源创建或复制到当前容器的顶层目录：`/home/agent/.openclaude/generated/<安全文件名.ext>`；也可以复用已存在的 `/home/agent/.openclaude/uploads/<安全文件名.ext>`。",
+  "最终回复里必须单独写出这个绝对路径，例如：`/home/agent/.openclaude/generated/example.txt`。微信网关会自动把该路径转换成真实附件发送给用户。",
+  "安全文件名只能用字母、数字、点、下划线、短横线等普通字符；不要使用子目录。支持示例：txt, md, pdf, csv, json, docx, xlsx, pptx, zip, png/jpg, mp4, mp3。",
+  "如果用户说“随便发我一个文件”，请生成一个小的 txt 或 md 文件后再给出路径。没有创建/复制文件并给出上述路径前，不要声称已经发给用户。",
+].join("\n")
+
 // `MASTER_USER_PREFIX` 是 PG-side raw digit ↔ sqlite-side `c:<digit>` 命名约定的边界
 // 常量,集中在 `userIds.ts` 维护;outboxWorker 也用同一来源做相同翻译。
 // 见 userIds.ts 的模块注释。
@@ -450,6 +464,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       // 不传:sessionMeta(容器侧 client_sessions 由 sessionManager.handleResult 路径
       // 自己写;master 侧 client_sessions 是 dispatcher Step 2a 直接 upsertMasterClient
       // Session,不经 wire body),traceId(用 x-request-id header 关联)。
+      const dispatchText = withWechatOutboundMediaHint(evt.text)
       const wireBody = {
         userId: MASTER_USER_PREFIX + evt.bindingUserId,
         peer: { kind: "dm" as const, id: sessionId, displayName: evt.senderId },
@@ -463,7 +478,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
               __oc_codex_route: preparedCodexTurn.routeFrame,
             }
           : {}),
-        content: { text: evt.text },
+        content: { text: dispatchText },
       }
       const wireHeaders: Record<string, string> = {
         "content-type": "application/json",
@@ -831,6 +846,28 @@ function deriveSessionTitle(text: string): string {
   const codePoints = Array.from(trimmed)
   if (codePoints.length === 0) return DEFAULT_SESSION_TITLE
   return codePoints.slice(0, 30).join("")
+}
+
+function withWechatOutboundMediaHint(text: string): string {
+  if (!shouldIncludeWechatOutboundMediaHint(text)) return text
+  const hinted = `${text}${WECHAT_OUTBOUND_MEDIA_HINT}`
+  if (hinted.length > WECHAT_INBOUND_TEXT_MAX_CHARS) return text
+  return hinted
+}
+
+function shouldIncludeWechatOutboundMediaHint(text: string): boolean {
+  const normalized = text.trim()
+  if (!normalized) return false
+  if (/^https?:\/\//i.test(normalized)) return false
+  const lower = normalized.toLowerCase()
+  const action =
+    "(?:发|发送|传|传给|给我发|发我|发给我|分享|导出|下载|保存|生成|做一份|给我一个|send|share|attach|attachment|export|download|deliver|generate)"
+  const media =
+    "(?:文件|附件|图片|照片|图像|视频|语音|音频|录音|文档|报告|表格|压缩包|pdf|txt|md|csv|json|docx|xlsx|pptx|zip|png|jpe?g|mp4|mp3)"
+  return (
+    new RegExp(`${action}[\\s\\S]{0,32}${media}`, "i").test(lower) ||
+    new RegExp(`${media}[\\s\\S]{0,32}${action}`, "i").test(lower)
+  )
 }
 
 function sleep(ms: number): Promise<void> {
