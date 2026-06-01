@@ -133,6 +133,8 @@ const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_
  *   - deepseek-v4-flash / deepseek-v4-pro — anthropicProxy 在 master 侧 isDeepseekModel
  *     命中后切换上游(DEEPSEEK_UPSTREAM_ENDPOINT + DEEPSEEK_API_KEY),
  *     在 claude-subscription agent 上跑就够,不需要切 agent
+ *   - MiniMax-M3 — master 侧切到 MiniMax Token Plan Anthropic 兼容端点,
+ *     同样跑 claude-subscription/non-codex agent,不进 codex-native
  */
 export const ALLOWED_INBOUND_MODELS = new Set([
   'claude-opus-4-7',
@@ -140,6 +142,7 @@ export const ALLOWED_INBOUND_MODELS = new Set([
   'gpt-5.5',
   'deepseek-v4-flash',
   'deepseek-v4-pro',
+  'MiniMax-M3',
 ])
 
 /** Mirror SubprocessRunner's MCP merge rules for prompt/upload hints.

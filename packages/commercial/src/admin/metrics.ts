@@ -376,6 +376,7 @@ export const anthropicProxySettle = new Counter({
  *   - bad_path        非 POST /v1/messages
  *   - bad_headers     header allowlist 失败
  *   - upstream_auth   refresh token 失败
+ *   - minimax_config  MiniMax-M3 命中但 MINIMAX_TOKEN_PLAN_KEY 未配置
  */
 export const anthropicProxyReject = new Counter({
   name: "anthropic_proxy_reject_total",
@@ -515,6 +516,7 @@ export type ProxyRejectReason =
   | "bad_headers"
   | "upstream_auth"
   | "deepseek_config"
+  | "minimax_config"
   // Phase 5 platform envelope rewriter:**handler-level** deps.platformContextLoader
   // 或 deps.platformServerSecret 任一为 undefined,external ApiKey 触发条件命中时
   // fail-closed 返 503 PLATFORM_ENVELOPE_UNAVAILABLE。

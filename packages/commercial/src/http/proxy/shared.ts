@@ -88,6 +88,27 @@ export function isDeepseekModel(modelId: string): boolean {
   return modelId.startsWith("deepseek-");
 }
 
+/**
+ * MiniMax Token Plan 的 Anthropic 兼容端点。
+ *
+ * 官方 Claude Code 文档把 base URL 配成 `https://api.minimaxi.com/anthropic`；
+ * 本 proxy/core.ts 持有的是完整 `/v1/messages` endpoint,所以这里补齐 path。
+ *
+ * 仅精确支持 MiniMax-M3(大小写不敏感匹配,转发仍保留 caller 原 model 字段)。
+ * MiniMax-M3 当前只按 <=512k input token 标准档计费；>512k 能力文档标注为
+ * 限时限量/需联系销售,本平台不走该档,避免无声进入更贵价格。
+ */
+export const MINIMAX_UPSTREAM_ENDPOINT =
+  "https://api.minimaxi.com/anthropic/v1/messages";
+
+/** MiniMax-M3 只支持 <=512k input tokens 的标准档。 */
+export const MINIMAX_M3_MAX_INPUT_TOKENS = 512_000;
+
+/** 模型 id 是否走 MiniMax Token Plan 路径。 */
+export function isMiniMaxM3Model(modelId: string): boolean {
+  return modelId.toLowerCase() === "minimax-m3";
+}
+
 /** anthropic-version 唯一允许值。OAuth 管理账号路径与 v2 / 个人版一致。 */
 export const ANTHROPIC_VERSION = "2023-06-01";
 
@@ -1086,6 +1107,17 @@ export interface AnthropicProxyDeps {
    * loadConfig().DEEPSEEK_API_KEY 取并注入,proxy 内不读 process.env。
    */
   deepseekApiKey?: string;
+  /**
+   * MiniMax Token Plan key(2026-06-02 接入)。
+   *
+   * 配置时 anthropicProxy 收到 model=MiniMax-M3 的请求 → forward 到
+   * MINIMAX_UPSTREAM_ENDPOINT,Authorization: Bearer <minimaxTokenPlanKey>。
+   *
+   * 未配置(undefined)→ 命中 MiniMax-M3 的请求返回 503 +
+   * reject reason `'minimax_config'`。key 只在 master 进程环境变量中存在,
+   * 不注入用户容器,避免商业版用户通过 shell/日志拿到平台订阅 key。
+   */
+  minimaxTokenPlanKey?: string;
   /**
    * Phase 5 platform envelope rewriter(2026-05-21,取代 Phase 7 v1 envelope)。
    *

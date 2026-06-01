@@ -405,6 +405,18 @@ export const commercialConfigSchema = z
      */
     DEEPSEEK_API_KEY: z.string().trim().min(1).max(256).optional(),
     /**
+     * MiniMax Token Plan 订阅 key(2026-06-02 接入)。
+     * - 配置时 anthropicProxy 收到 model=MiniMax-M3 的请求 → forward
+     *   到 https://api.minimaxi.com/anthropic/v1/messages,Authorization: Bearer
+     *   <MINIMAX_TOKEN_PLAN_KEY>;不占 claude_accounts 池
+     * - 同一 key 也由 master-side `/internal/v3/minimax` 媒体 proxy 使用,
+     *   用户容器只拿 oc-v3 container bearer,**永远不注入 MiniMax key**
+     * - 未配置 → 文本路由 503 MINIMAX_NOT_CONFIGURED;媒体 proxy 503
+     * - 不入 git;由 systemd EnvironmentFile 注入。用户已在聊天里暴露过的 key
+     *   上线前必须在 MiniMax 控制台旋转后再写入生产 env。
+     */
+    MINIMAX_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
      * Platform HMAC secret(Phase 5 envelope rewriter,2026-05-21)。
      *
      * 用途:HMAC-SHA256(secret, "fp3:"|userId)派生外接 ApiKey 路径 outbound envelope

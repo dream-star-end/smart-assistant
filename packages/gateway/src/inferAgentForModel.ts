@@ -25,12 +25,12 @@ import type { AgentDef } from '@openclaude/storage'
  *   (d) claude-* / deepseek-* model + any codex-native/unknown requested agent → route
  *       back to a compatible non-codex agent. This covers the model-picker
  *       flow where the browser session remains on agentId='codex' after a
- *       previous GPT turn, but the user now selected Claude/DeepSeek.
+ *       previous GPT turn, but the user now selected Claude/DeepSeek/MiniMax.
  *   (e) Unknown model family or model undefined → pass through.
  *
  * NOTE: an unknown requestedAgentId (not in agents[]) is treated as
  * pass-through only for model families that do not need a provider override.
- * For known cross-provider families (`gpt-*`, `claude-*`, `deepseek-*`) the
+ * For known cross-provider families (`gpt-*`, `claude-*`, `deepseek-*`, `MiniMax-M3`) the
  * model picker is authoritative and this helper routes to the compatible
  * backend.
  */
@@ -51,8 +51,12 @@ function isDeepseekModel(model: string): boolean {
   return /^deepseek-/.test(model)
 }
 
+function isMiniMaxModel(model: string): boolean {
+  return model.toLowerCase() === 'minimax-m3'
+}
+
 function isNonCodexModel(model: string): boolean {
-  return isClaudeModel(model) || isDeepseekModel(model)
+  return isClaudeModel(model) || isDeepseekModel(model) || isMiniMaxModel(model)
 }
 
 function isCodexNative(agent: AgentDef | undefined): boolean {

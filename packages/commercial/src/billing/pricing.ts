@@ -173,6 +173,7 @@ const CANONICAL_MODEL_IDS = [
  */
 export function canonicalizeModelId(modelId: string): string {
   const name = modelId.toLowerCase();
+  if (name === "minimax-m3") return "MiniMax-M3";
   return CANONICAL_MODEL_IDS.find((id) => name === id || name.startsWith(`${id}-`)) ?? modelId;
 }
 

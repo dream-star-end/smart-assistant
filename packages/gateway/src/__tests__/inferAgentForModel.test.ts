@@ -274,3 +274,37 @@ describe('inferAgentForModel — deepseek model routing', () => {
     assert.equal(r.error, 'no_compatible_agent')
   })
 })
+
+describe('inferAgentForModel — MiniMax model routing', () => {
+  it('keeps default non-codex agent for MiniMax-M3', () => {
+    const r = inferAgentForModel({
+      model: 'MiniMax-M3',
+      requestedAgentId: 'main',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('routes codex agent + MiniMax-M3 back to default non-codex agent', () => {
+    const r = inferAgentForModel({
+      model: 'MiniMax-M3',
+      requestedAgentId: 'codex',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('no_compatible_agent when MiniMax-M3 has no non-codex agent', () => {
+    const r = inferAgentForModel({
+      model: 'MiniMax-M3',
+      requestedAgentId: 'codex',
+      defaultAgentId: 'codex',
+      agents: onlyCodexAgents,
+    })
+    assert.equal('error' in r, true)
+    if (!('error' in r)) return
+    assert.equal(r.error, 'no_compatible_agent')
+  })
+})

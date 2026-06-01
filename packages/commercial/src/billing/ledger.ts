@@ -39,6 +39,7 @@ export const LEDGER_REASONS = [
   "refund",
   "admin_adjust",
   "promotion",
+  "minimax_media",
 ] as const;
 export type LedgerReason = (typeof LEDGER_REASONS)[number];
 

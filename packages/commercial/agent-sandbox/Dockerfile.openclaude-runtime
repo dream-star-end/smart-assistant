@@ -114,8 +114,10 @@ RUN set -eux; \
 
 COPY --chown=root:root ./runtime/oc-docx.sh /usr/local/bin/oc-docx
 COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
+COPY --chown=root:root ./runtime/oc-minimax.py /usr/local/bin/oc-minimax
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/lib/openclaude/create-docgen-reference.py; \
+    ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
     oc-docx /tmp/oc-docx-smoke.md -o /tmp/oc-docx-smoke.docx; \

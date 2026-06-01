@@ -112,6 +112,10 @@ describe("selectUpstreamRoute", () => {
     assert.deepEqual(selectUpstreamRoute("deepseek-v4-pro"), { kind: "deepseek" });
     assert.deepEqual(selectUpstreamRoute("deepseek-chat"), { kind: "deepseek" });
   });
+  test("MiniMax-M3(大小写不敏感) → kind=minimax", () => {
+    assert.deepEqual(selectUpstreamRoute("MiniMax-M3"), { kind: "minimax" });
+    assert.deepEqual(selectUpstreamRoute("minimax-m3"), { kind: "minimax" });
+  });
   test("其它 model → kind=oauth", () => {
     assert.deepEqual(selectUpstreamRoute("claude-sonnet-4-6"), { kind: "oauth" });
     assert.deepEqual(selectUpstreamRoute("gpt-5"), { kind: "oauth" });
@@ -142,6 +146,20 @@ describe("validateUpstreamConfig", () => {
     assert.equal(validateUpstreamConfig({ kind: "oauth" }, {}), null);
     assert.equal(validateUpstreamConfig({ kind: "oauth" }, { deepseekApiKey: "" }), null);
     assert.equal(validateUpstreamConfig({ kind: "oauth" }, { deepseekApiKey: "k" }), null);
+  });
+  test("minimax 路由缺 key → minimax_not_configured;有 key → null", () => {
+    assert.deepEqual(
+      validateUpstreamConfig({ kind: "minimax" }, {}),
+      { kind: "minimax_not_configured" },
+    );
+    assert.deepEqual(
+      validateUpstreamConfig({ kind: "minimax" }, { minimaxTokenPlanKey: "" }),
+      { kind: "minimax_not_configured" },
+    );
+    assert.equal(
+      validateUpstreamConfig({ kind: "minimax" }, { minimaxTokenPlanKey: "sk-cp-xxx" }),
+      null,
+    );
   });
 });
 
@@ -213,6 +231,73 @@ describe("pickUpstream — DeepSeek route", () => {
     if (!res.ok) return;
     res.session.zeroizeSecrets(); // 调一次不抛
     res.session.zeroizeSecrets(); // 二次也不抛
+  });
+});
+
+// ─── pickUpstream — MiniMax 路径 ────────────────────────────────────────
+
+describe("pickUpstream — MiniMax route", () => {
+  test("不调 scheduler;session.endpoint = minimax 端点;applyUpstreamAuth 用 Token Plan key + strip beta/body extras", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, minimaxTokenPlanKey: "MM-KEY" },
+      {
+        ...bodyFor("MiniMax-M3"),
+        output_config: { effort: "max" },
+        context_management: { edits: [] },
+        thinking: { type: "enabled", budget_tokens: 1024 },
+        service_tier: "priority",
+      } as never,
+      { kind: "minimax" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const { session } = res;
+    assert.equal(sched.pickCalls, 0, "MiniMax 路径绝不调 scheduler.pick");
+    assert.equal(session.accountId, null);
+    assert.equal(session.pinnedUserId, null);
+    assert.equal(session.dispatcher, undefined);
+    assert.equal(session.shouldUpdateQuotaFromResponse, false);
+    assert.ok(session.endpoint.includes("api.minimaxi.com/anthropic/v1/messages"));
+
+    const safeHeaders: Record<string, string> = {
+      "anthropic-beta": "interleaved-thinking-2025-05-14",
+    };
+    const body = {
+      metadata: { user_id: "client-original" },
+      output_config: { effort: "max" },
+      context_management: { edits: [] },
+      thinking: { type: "enabled" },
+      service_tier: "priority",
+    } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
+    session.applyUpstreamAuth(safeHeaders, body, log);
+    assert.equal(safeHeaders.authorization, "Bearer MM-KEY");
+    assert.equal(safeHeaders["anthropic-beta"], undefined);
+    assert.equal((body as { output_config?: unknown }).output_config, undefined);
+    assert.equal((body as { context_management?: unknown }).context_management, undefined);
+    assert.equal((body as { thinking?: unknown }).thinking, undefined);
+    assert.equal((body as { service_tier?: unknown }).service_tier, undefined);
+    assert.equal(
+      (body as { metadata?: { user_id?: unknown } }).metadata?.user_id,
+      "client-original",
+    );
+  });
+
+  test("sanitizeMessages 返回原 messages 引用;zeroizeSecrets noop", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, minimaxTokenPlanKey: "k" },
+      bodyFor("MiniMax-M3"),
+      { kind: "minimax" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const messages = [{ role: "user", content: "hi" }];
+    assert.equal(res.session.sanitizeMessages(messages, "MiniMax-M3", log), messages);
+    res.session.zeroizeSecrets();
+    res.session.zeroizeSecrets();
   });
 });
 

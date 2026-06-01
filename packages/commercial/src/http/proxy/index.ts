@@ -65,6 +65,7 @@ import {
   DEFAULT_PROXY_RATE_LIMIT,
   DEFAULT_MAX_CONCURRENT_PER_UID,
   MAX_BODY_BYTES_DEFAULT,
+  MINIMAX_M3_MAX_INPUT_TOKENS,
   proxyBodySchema,
   enforceFieldByteBudgets,
   estimateInputTokens,
@@ -292,18 +293,35 @@ export function makeAnthropicProxyHandler(
       // **必须在 preCheck 之前**:deepseek 路由缺 key 直接 503,不能 reserve credits 再 rollback。
       // 详见 `proxy/upstream.ts` selectUpstreamRoute / validateUpstreamConfig 注释 + plan 行为锁。
       const route = selectUpstreamRoute(body.model);
-      const cfgErr = validateUpstreamConfig(route, { deepseekApiKey: deps.deepseekApiKey });
+      const cfgErr = validateUpstreamConfig(route, {
+        deepseekApiKey: deps.deepseekApiKey,
+        minimaxTokenPlanKey: deps.minimaxTokenPlanKey,
+      });
       if (cfgErr) {
-        // 当前只有 deepseek_not_configured 一种;未来加新 kind 时这里要扩 switch。
-        userLog.warn("proxy_deepseek_not_configured", { model: body.model });
-        incrAnthropicProxyReject("deepseek_config");
-        sendJsonError(
-          res,
-          503,
-          "DEEPSEEK_NOT_CONFIGURED",
-          "deepseek upstream not configured",
-          requestId,
-        );
+        switch (cfgErr.kind) {
+          case "deepseek_not_configured":
+            userLog.warn("proxy_deepseek_not_configured", { model: body.model });
+            incrAnthropicProxyReject("deepseek_config");
+            sendJsonError(
+              res,
+              503,
+              "DEEPSEEK_NOT_CONFIGURED",
+              "deepseek upstream not configured",
+              requestId,
+            );
+            return;
+          case "minimax_not_configured":
+            userLog.warn("proxy_minimax_not_configured", { model: body.model });
+            incrAnthropicProxyReject("minimax_config");
+            sendJsonError(
+              res,
+              503,
+              "MINIMAX_NOT_CONFIGURED",
+              "minimax upstream not configured",
+              requestId,
+            );
+            return;
+        }
         return;
       }
 
@@ -364,6 +382,16 @@ export function makeAnthropicProxyHandler(
 
       // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)
       const inputTokens = estimateInputTokens(body);
+      if (route.kind === "minimax" && inputTokens > MINIMAX_M3_MAX_INPUT_TOKENS) {
+        userLog.warn("proxy_minimax_input_tokens_too_large", {
+          model: body.model,
+          estimatedInputTokens: inputTokens,
+          limit: MINIMAX_M3_MAX_INPUT_TOKENS,
+        });
+        incrAnthropicProxyReject("too_large");
+        sendJsonError(res, 413, "BODY_FIELD_TOO_LARGE", "request body too large", requestId);
+        return;
+      }
       const totalMaxCost = estimateMaxCostBothSides(inputTokens, body.max_tokens, pricing);
       let pre;
       try {
@@ -429,6 +457,7 @@ export function makeAnthropicProxyHandler(
           scheduler: deps.scheduler,
           refreshDeps: deps.refreshDeps,
           deepseekApiKey: deps.deepseekApiKey,
+          minimaxTokenPlanKey: deps.minimaxTokenPlanKey,
           upstreamEndpoint: deps.upstreamEndpoint,
           // Phase 6 account_uuid 锚定 flag(plan §3.0)— v1.0.207 起从 system_settings
           // 表读取的 getter,handler 透传给 pickUpstream;入口 await 一次冻结到

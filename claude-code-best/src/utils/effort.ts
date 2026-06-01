@@ -9,6 +9,7 @@ import { isEnvTruthy } from './envUtils.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 import { resolveAntModel } from './model/antModels.js'
 import { getAntModelOverrideConfig } from './model/antModels.js'
+import { isMiniMaxM3Model } from './model/minimax.js'
 
 export type { EffortLevel }
 
@@ -25,6 +26,9 @@ export type EffortValue = EffortLevel | number
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
   const m = model.toLowerCase()
+  if (isMiniMaxM3Model(model)) {
+    return false
+  }
   if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
     return true
   }
@@ -58,6 +62,9 @@ export function modelSupportsEffort(model: string): boolean {
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
 // Per API docs, 'max' is Opus 4.6+ only for public models — other models return an error.
 export function modelSupportsMaxEffort(model: string): boolean {
+  if (isMiniMaxM3Model(model)) {
+    return false
+  }
   const supported3P = get3PModelCapabilityOverride(model, 'max_effort')
   if (supported3P !== undefined) {
     return supported3P
@@ -84,6 +91,9 @@ export function modelSupportsMaxEffort(model: string): boolean {
 // gain xhigh support. Used by resolveAppliedEffort to downgrade xhigh→high
 // for non-supporting models so we never send a value the API will reject.
 export function modelSupportsXhighEffort(model: string): boolean {
+  if (isMiniMaxM3Model(model)) {
+    return false
+  }
   const supported3P = get3PModelCapabilityOverride(model, 'xhigh_effort')
   if (supported3P !== undefined) {
     return supported3P
@@ -185,6 +195,9 @@ export function resolveAppliedEffort(
 ): EffortValue | undefined {
   const envOverride = getEffortEnvOverride()
   if (envOverride === null) {
+    return undefined
+  }
+  if (isMiniMaxM3Model(model)) {
     return undefined
   }
   const resolved =

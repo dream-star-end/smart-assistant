@@ -26,6 +26,7 @@ const {
   convertEffortValueToLevel,
   getEffortLevelDescription,
   resolvePickerEffortPersistence,
+  modelSupportsEffort,
   modelSupportsMaxEffort,
   resolveAppliedEffort,
   EFFORT_LEVELS,
@@ -321,6 +322,17 @@ describe("resolveAppliedEffort - DeepSeek V4", () => {
     const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
     delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
     expect(resolveAppliedEffort("deepseek-v4-pro", "high")).toBe("high");
+    if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
+  });
+});
+
+describe("MiniMax-M3 effort support", () => {
+  test("does not advertise or send effort parameters", () => {
+    const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    expect(modelSupportsEffort("MiniMax-M3")).toBe(false);
+    expect(modelSupportsMaxEffort("MiniMax-M3")).toBe(false);
+    expect(resolveAppliedEffort("MiniMax-M3", "max")).toBeUndefined();
     if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
   });
 });
