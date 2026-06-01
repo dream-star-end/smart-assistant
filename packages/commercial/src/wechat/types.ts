@@ -35,7 +35,15 @@ export interface IlinkTextPart {
   text: string
 }
 
-export type IlinkPart = IlinkTextPart
+export interface IlinkMediaPart {
+  type: "image" | "video" | "voice" | "file"
+  /** Container-visible safe path, e.g. /home/agent/.openclaude/generated/foo.png. */
+  containerPath: string
+  filename: string
+  mimeType?: string
+}
+
+export type IlinkPart = IlinkTextPart | IlinkMediaPart
 
 /**
  * Outbox 行的 TS 视图。

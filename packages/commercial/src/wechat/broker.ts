@@ -49,6 +49,7 @@ import {
   OutboxWorker,
   runHousekeeping,
   type GetBindingFn,
+  type SendMediaFn,
   type SendTextFn,
 } from "./outboxWorker.js"
 import { DEFAULT_MAX_ATTEMPTS } from "./outboxStore.js"
@@ -59,6 +60,7 @@ import {
   type PgConn,
 } from "./sessionPointer.js"
 import type { WechatSessionId } from "./types.js"
+import type { ResolveOutboundMediaPartFn } from "./outboundMedia.js"
 
 /** Reconcile 周期默认值。RFC §4.8。 */
 const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
@@ -71,6 +73,8 @@ const PROCESSING_REFLECTION_TEXT = "已收到，正在思考…"
 /** 图片消息需要先在 master 下载/解密/落盘,给用户单独的即时反馈。 */
 const IMAGE_PROCESSING_REFLECTION_TEXT = "收到图片，正在识别…"
 const IMAGE_PREPARE_FAILED_REPLY = "图片下载/识别准备失败，请重新发送图片，或在网页端上传后继续。"
+const MEDIA_PROCESSING_REFLECTION_TEXT = "收到附件，正在处理…"
+const MEDIA_PREPARE_FAILED_REPLY = "附件下载/处理准备失败，请重新发送，或在网页端上传后继续。"
 
 /**
  * v3 commercial canonical user id 接受形式:`c:<digit>` 或裸 `<digit>`。
@@ -175,6 +179,10 @@ export interface BrokerDeps {
   softDeleteMasterSession: (sessionId: WechatSessionId, userId: string) => Promise<void>
   /** 出站(发给用户的 iLink HTTP)— P1.7 实装,P1.6 测试 mock。 */
   sendText: SendTextFn
+  /** 出站媒体(图片/视频/语音/文件)发送。未注入时媒体 outbox 行会永久失败 invalid_payload。 */
+  sendMedia?: SendMediaFn
+  /** 将安全 containerPath 解析为当前用户 own volume 中的字节。 */
+  resolveOutboundMediaPart?: ResolveOutboundMediaPartFn
   /**
    * WeChat-local UX commands handled at broker layer.
    *
@@ -194,6 +202,13 @@ export interface BrokerDeps {
   saveWechatImages?: (args: {
     bindingUserId: string
     images: NonNullable<InboundEvent["imageAttachments"]>
+    text: string
+    rawPayload?: unknown
+    traceId?: string
+  }) => Promise<{ promptText: string; count: number }>
+  saveWechatMedia?: (args: {
+    bindingUserId: string
+    media: NonNullable<InboundEvent["mediaAttachments"]>
     text: string
     rawPayload?: unknown
     traceId?: string
@@ -239,6 +254,8 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
   const outboxWorker = new OutboxWorker({
     pool: deps.pgPool,
     sendText: deps.sendText,
+    sendMedia: deps.sendMedia,
+    resolveMediaPart: deps.resolveOutboundMediaPart,
     getBinding: deps.getBinding,
     log: (level, message) => {
       // outboxWorker 内部已经会 console.* fallback;broker 这里把它桥接到结构化 logger。
@@ -352,10 +369,23 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     }
 
     const imageAttachments = dispatchEvt.imageAttachments ?? []
-    const hasImages = imageAttachments.length > 0
+    const mediaAttachments = dispatchEvt.mediaAttachments ?? []
+    const effectiveMediaAttachments =
+      mediaAttachments.length > 0
+        ? mediaAttachments
+        : imageAttachments.map((img) => ({
+            kind: "image" as const,
+            fullUrl: img.fullUrl,
+            aesKeyHex: img.aesKeyHex,
+            msgId: img.msgId,
+            size: img.midSize,
+          }))
+    const hasMedia = effectiveMediaAttachments.length > 0
+    const hasOnlyImages =
+      hasMedia && effectiveMediaAttachments.every((item) => item.kind === "image")
     const isSlashCommand = dispatchEvt.text.trim().startsWith("/")
     const localOutcome =
-      !hasImages || isSlashCommand ? await tryHandleLocalUxCommand(dispatchEvt) : null
+      !hasMedia || isSlashCommand ? await tryHandleLocalUxCommand(dispatchEvt) : null
     if (localOutcome) {
       await insertCommittedAudit(evt, dispatchBindingUserId)
       fireAndForgetReflection(evt, localOutcome.reply, "command_echo")
@@ -363,29 +393,42 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     }
 
     let effectiveDispatchEvt = dispatchEvt
-    if (hasImages) {
-      fireAndForgetReflection(evt, IMAGE_PROCESSING_REFLECTION_TEXT, "processing")
-      if (!deps.saveWechatImages) {
+    if (hasMedia) {
+      fireAndForgetReflection(
+        evt,
+        hasOnlyImages ? IMAGE_PROCESSING_REFLECTION_TEXT : MEDIA_PROCESSING_REFLECTION_TEXT,
+        "processing",
+      )
+      if (!deps.saveWechatMedia && (!hasOnlyImages || !deps.saveWechatImages)) {
         await insertCommittedAudit(evt, dispatchBindingUserId)
         const outcome: Extract<DispatchOutcome, { kind: "command_echo" }> = {
           kind: "command_echo",
-          reply: IMAGE_PREPARE_FAILED_REPLY,
+          reply: hasOnlyImages ? IMAGE_PREPARE_FAILED_REPLY : MEDIA_PREPARE_FAILED_REPLY,
         }
         fireAndForgetReflection(evt, outcome.reply, "command_echo")
         return outcome
       }
       try {
-        const saved = await deps.saveWechatImages({
-          bindingUserId: dispatchBindingUserId,
-          images: imageAttachments,
-          text: dispatchEvt.text,
-          rawPayload: evt.rawPayload,
-          traceId: evt.traceId,
-        })
+        const saved =
+          deps.saveWechatMedia
+            ? await deps.saveWechatMedia({
+                bindingUserId: dispatchBindingUserId,
+                media: effectiveMediaAttachments,
+                text: dispatchEvt.text,
+                rawPayload: evt.rawPayload,
+                traceId: evt.traceId,
+              })
+            : await deps.saveWechatImages!({
+                bindingUserId: dispatchBindingUserId,
+                images: imageAttachments,
+                text: dispatchEvt.text,
+                rawPayload: evt.rawPayload,
+                traceId: evt.traceId,
+              })
         effectiveDispatchEvt = { ...dispatchEvt, text: saved.promptText }
       } catch (err) {
         const errMessage = (err as Error)?.message ?? String(err)
-        log.error("wechat_image_prepare_failed", {
+        log.error("wechat_media_prepare_failed", {
           bindingUserId: evt.bindingUserId,
           idempotencyKey: evt.idempotencyKey,
           errMessage,
@@ -393,7 +436,7 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         await insertCommittedAudit(evt, dispatchBindingUserId)
         const outcome: Extract<DispatchOutcome, { kind: "command_echo" }> = {
           kind: "command_echo",
-          reply: IMAGE_PREPARE_FAILED_REPLY,
+          reply: hasOnlyImages ? IMAGE_PREPARE_FAILED_REPLY : MEDIA_PREPARE_FAILED_REPLY,
         }
         fireAndForgetReflection(evt, outcome.reply, "command_echo")
         return outcome
@@ -495,13 +538,15 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         .filter(Boolean),
     )
     const labels: string[] = []
-    if (types.has("image") && (evt.imageAttachments?.length ?? 0) === 0) labels.push("图片")
-    if (types.has("voice")) labels.push("语音")
-    if (types.has("video")) labels.push("视频")
+    const mediaCount = evt.mediaAttachments?.length ?? 0
+    if (types.has("image") && mediaCount === 0 && (evt.imageAttachments?.length ?? 0) === 0) labels.push("图片")
+    if (types.has("voice") && mediaCount === 0) labels.push("语音")
+    if (types.has("file") && mediaCount === 0) labels.push("文件")
+    if (types.has("video") && mediaCount === 0) labels.push("视频")
     if (labels.length === 0) return null
     return [
       `我收到了一条${labels.join("/")}消息。`,
-      "当前微信通道主要支持文字对话；请补充一段文字说明，或在网页端上传图片/文件后继续。",
+      "当前微信通道无法解析这条附件；请补充一段文字说明，或在网页端上传后继续。",
     ].join("\n")
   }
 

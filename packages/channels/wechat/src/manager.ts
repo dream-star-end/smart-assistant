@@ -19,6 +19,7 @@ import type { OutboundMessage } from '@openclaude/protocol'
 import type { WechatBinding } from '@openclaude/storage'
 import { listActiveWechatBindings } from '@openclaude/storage'
 import type { WechatImageAttachment } from './iLinkImage.js'
+import type { WechatMediaAttachment } from './iLinkMedia.js'
 import { WechatWorker, type InboundEvent } from './worker.js'
 
 /**
@@ -40,6 +41,8 @@ export interface WechatInboundOverrideEvent {
   itemTypes?: string
   /** iLink image attachments extracted from rawPayload; URLs/keys are never logged. */
   imageAttachments?: WechatImageAttachment[]
+  /** iLink media attachments extracted from rawPayload; URLs/keys are never logged. */
+  mediaAttachments?: WechatMediaAttachment[]
   /** Full raw iLink message payload for broker audit. */
   rawPayload?: unknown
   /** Stable per-message dedup key: `wechat:${bindingUserId}:${senderId}:${messageId}` */
@@ -307,7 +310,8 @@ export async function routeWechatInbound(
         text,
         messageId,
         itemTypes: extractIlinkItemTypes(evt.raw),
-        ...(evt.imageAttachments.length > 0 ? { imageAttachments: evt.imageAttachments } : {}),
+        ...((evt.imageAttachments?.length ?? 0) > 0 ? { imageAttachments: evt.imageAttachments } : {}),
+        ...((evt.mediaAttachments?.length ?? 0) > 0 ? { mediaAttachments: evt.mediaAttachments } : {}),
         rawPayload: evt.raw,
         idempotencyKey,
         receivedAt,
@@ -428,7 +432,8 @@ function ilinkItemTypeLabel(item: unknown): string {
   if (t === 1) return 'text'
   if (t === 2) return 'image'
   if (t === 3) return 'voice'
-  if (t === 4) return 'video'
+  if (t === 4) return 'file'
+  if (t === 5) return 'video'
   if (Number.isFinite(t)) return `type:${t}`
   return 'unknown'
 }

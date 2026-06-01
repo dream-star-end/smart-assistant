@@ -13,15 +13,38 @@
 // The server validates Authorization: Bearer <bot_token> only. No client-side
 // identity. One bot_token == one long-poll worker.
 
-import { randomBytes } from 'node:crypto'
+import { createCipheriv, createHash, randomBytes } from 'node:crypto'
 
 import { toIlinkUserId } from './canonicalSenderId.js'
 
 export const ILINK_BASE_URL = 'https://ilinkai.weixin.qq.com'
+export const ILINK_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c'
 export const ILINK_BOT_TYPE = '3'
 export const ILINK_LONG_POLL_TIMEOUT_MS = 35_000
 export const ILINK_API_TIMEOUT_MS = 15_000
 export const ILINK_SESSION_EXPIRED = -14
+export const ILINK_CDN_UPLOAD_TIMEOUT_MS = 30_000
+export const ILINK_CDN_UPLOAD_MAX_BYTES = 100 * 1024 * 1024
+
+export type IlinkMediaKind = 'image' | 'video' | 'file' | 'voice'
+
+export interface IlinkSendMediaInput {
+  kind: IlinkMediaKind
+  filename: string
+  content: Buffer
+  contextToken: string
+  caption?: string
+  mimeType?: string
+  voiceEncodeType?: number
+}
+
+interface IlinkUploadedMedia {
+  downloadEncryptedQueryParam: string
+  aesKeyHex: string
+  rawBytes: number
+  encryptedBytes: number
+  md5: string
+}
 
 export interface IlinkQrcode {
   qrcode: string // long opaque key (used to poll status)
@@ -154,6 +177,204 @@ export async function sendIlinkText(
       base_info: { channel_version: 'openclaude-0.0.1' },
     },
   })
+}
+
+export async function sendIlinkMedia(
+  token: string,
+  toUserId: string,
+  input: IlinkSendMediaInput,
+): Promise<any> {
+  const wireToUserId = toIlinkUserId(toUserId)
+  const kind = normalizeOutboundMediaKind(input.kind, input.filename)
+  const uploaded = await uploadIlinkMedia(token, wireToUserId, kind, input.content)
+  if (input.caption?.trim()) {
+    await sendIlinkText(token, wireToUserId, input.contextToken, input.caption.trim())
+  }
+  return sendIlinkMediaRef(token, wireToUserId, input.contextToken, {
+    kind,
+    filename: input.filename,
+    uploaded,
+    voiceEncodeType: input.voiceEncodeType ?? inferVoiceEncodeType(input.filename, input.mimeType),
+  })
+}
+
+async function sendIlinkMediaRef(
+  token: string,
+  wireToUserId: string,
+  contextToken: string,
+  args: {
+    kind: IlinkMediaKind
+    filename: string
+    uploaded: IlinkUploadedMedia
+    voiceEncodeType?: number
+  },
+): Promise<any> {
+  const clientId = `cid-${Date.now()}-${randomBytes(4).toString('hex')}`
+  const media = {
+    encrypt_query_param: args.uploaded.downloadEncryptedQueryParam,
+    // iLink media refs use base64(hex-string) in Tencent/openclaw examples.
+    aes_key: Buffer.from(args.uploaded.aesKeyHex, 'utf8').toString('base64'),
+    encrypt_type: 1,
+  }
+  const item =
+    args.kind === 'image'
+      ? {
+          type: 2,
+          image_item: { media, mid_size: args.uploaded.encryptedBytes },
+        }
+      : args.kind === 'video'
+        ? {
+            type: 5,
+            video_item: { media, video_size: args.uploaded.encryptedBytes },
+          }
+        : args.kind === 'voice'
+          ? {
+              type: 3,
+              voice_item: {
+                media,
+                encode_type: args.voiceEncodeType ?? 7,
+              },
+            }
+          : {
+              type: 4,
+              file_item: {
+                media,
+                file_name: safeIlinkFilename(args.filename),
+                md5: args.uploaded.md5,
+                len: String(args.uploaded.rawBytes),
+              },
+            }
+
+  return ilinkRequest('/ilink/bot/sendmessage', {
+    method: 'POST',
+    token,
+    body: {
+      msg: {
+        from_user_id: '',
+        to_user_id: wireToUserId,
+        client_id: clientId,
+        message_type: 2,
+        message_state: 2,
+        context_token: contextToken,
+        item_list: [item],
+      },
+      base_info: { channel_version: 'openclaude-0.0.1' },
+    },
+  })
+}
+
+async function uploadIlinkMedia(
+  token: string,
+  wireToUserId: string,
+  kind: IlinkMediaKind,
+  plaintext: Buffer,
+): Promise<IlinkUploadedMedia> {
+  if (plaintext.length <= 0) throw new Error('empty iLink media upload')
+  if (plaintext.length > ILINK_CDN_UPLOAD_MAX_BYTES) {
+    throw new Error('iLink media upload exceeds size limit')
+  }
+  const aesKey = randomBytes(16)
+  const aesKeyHex = aesKey.toString('hex')
+  const encrypted = encryptAes128Ecb(plaintext, aesKey)
+  const filekey = randomBytes(16).toString('hex')
+  const md5 = createHash('md5').update(plaintext).digest('hex')
+  const upload = await ilinkRequest('/ilink/bot/getuploadurl', {
+    method: 'POST',
+    token,
+    body: {
+      filekey,
+      media_type: uploadMediaType(kind),
+      to_user_id: wireToUserId,
+      rawsize: plaintext.length,
+      rawfilemd5: md5,
+      filesize: encrypted.length,
+      no_need_thumb: true,
+      aeskey: aesKeyHex,
+      base_info: { channel_version: 'openclaude-0.0.1' },
+    },
+  })
+  const uploadParam = typeof upload?.upload_param === 'string' ? upload.upload_param.trim() : ''
+  if (!uploadParam) throw new Error(`iLink getuploadurl returned no upload_param`)
+  const downloadEncryptedQueryParam = await uploadIlinkEncryptedToCdn(uploadParam, filekey, encrypted)
+  return {
+    downloadEncryptedQueryParam,
+    aesKeyHex,
+    rawBytes: plaintext.length,
+    encryptedBytes: encrypted.length,
+    md5,
+  }
+}
+
+async function uploadIlinkEncryptedToCdn(
+  uploadParam: string,
+  filekey: string,
+  encrypted: Buffer,
+): Promise<string> {
+  const cdnUrl = new URL(`${ILINK_CDN_BASE_URL}/upload`)
+  cdnUrl.searchParams.set('encrypted_query_param', uploadParam)
+  cdnUrl.searchParams.set('filekey', filekey)
+  if (cdnUrl.protocol !== 'https:') throw new Error('iLink CDN upload URL must use https')
+
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), ILINK_CDN_UPLOAD_TIMEOUT_MS)
+  try {
+    const res = await fetch(cdnUrl.toString(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: new Uint8Array(encrypted),
+      redirect: 'manual',
+      signal: ctrl.signal,
+    })
+    if (res.status >= 300 && res.status < 400) {
+      throw new Error(`iLink CDN upload redirected unexpectedly: HTTP ${res.status}`)
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      throw new Error(`iLink CDN upload failed: HTTP ${res.status}: ${text.slice(0, 200)}`)
+    }
+    const downloadParam = res.headers.get('x-encrypted-param')?.trim()
+    if (!downloadParam) throw new Error('iLink CDN upload missing x-encrypted-param')
+    return downloadParam
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('iLink CDN upload timed out')
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function encryptAes128Ecb(plaintext: Buffer, key: Buffer): Buffer {
+  const cipher = createCipheriv('aes-128-ecb', key, null)
+  return Buffer.concat([cipher.update(plaintext), cipher.final()])
+}
+
+function uploadMediaType(kind: IlinkMediaKind): number {
+  if (kind === 'image') return 1
+  if (kind === 'video') return 2
+  if (kind === 'file') return 3
+  return 4
+}
+
+function normalizeOutboundMediaKind(kind: IlinkMediaKind, filename: string): IlinkMediaKind {
+  if (kind !== 'voice') return kind
+  return inferVoiceEncodeType(filename) ? 'voice' : 'file'
+}
+
+function inferVoiceEncodeType(filename: string, mimeType?: string): number | undefined {
+  const ext = filename.toLowerCase().split('.').pop() ?? ''
+  if (ext === 'silk') return 6
+  if (ext === 'mp3' || mimeType === 'audio/mpeg') return 7
+  if (ext === 'wav' || mimeType === 'audio/wav') return 1
+  if (ext === 'amr') return 5
+  if (ext === 'ogg' || ext === 'oga') return 8
+  return undefined
+}
+
+function safeIlinkFilename(filename: string): string {
+  const base = filename.split(/[\\/]/).pop()?.trim() || 'file'
+  return base.length > 120 ? base.slice(0, 120) : base
 }
 
 /** Extract a plain-text string from an inbound msg.item_list. */
