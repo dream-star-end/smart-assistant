@@ -370,11 +370,19 @@ export function expandRenderedPartsWithWechatMedia(parts: IlinkPart[]): IlinkPar
       out.push(part)
       continue
     }
+    if (!shouldExpandWechatMediaFromText(part.text)) {
+      out.push(part)
+      continue
+    }
     const expanded = expandTextWithWechatMediaParts(part.text)
     if (expanded.text) out.push({ type: "text", text: expanded.text })
     for (const media of expanded.media) out.push(media)
   }
   return out
+}
+
+function shouldExpandWechatMediaFromText(text: string): boolean {
+  return !text.startsWith("💭 思考过程：") && !text.startsWith("🔧 ")
 }
 
 // ─── handler dependencies ──────────────────────────────────────────────────

@@ -24,6 +24,7 @@ import { createHash } from "node:crypto"
 import type { Pool } from "pg"
 
 import {
+  expandRenderedPartsWithWechatMedia,
   makeOutboundReceiverHandler,
   renderWechatBlocks,
   WECHAT_OUTBOUND_PATH,
@@ -656,6 +657,39 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.deepEqual(spy.calls.map((c) => (c.payload[0] as { text?: string }).text), [
       "same final text",
       "same final text",
+    ])
+  })
+
+  test("final text path is expanded to media, but tool/thinking process paths stay text-only", () => {
+    const finalExpanded = expandRenderedPartsWithWechatMedia([
+      { type: "text", text: "已生成：/home/agent/.openclaude/generated/report.txt" },
+    ])
+    assert.equal(finalExpanded.length, 2)
+    assert.equal(finalExpanded[0]!.type, "text")
+    assert.equal(finalExpanded[1]!.type, "file")
+    if (finalExpanded[1]!.type === "file") {
+      assert.equal(finalExpanded[1]!.containerPath, "/home/agent/.openclaude/generated/report.txt")
+    }
+
+    const processExpanded = expandRenderedPartsWithWechatMedia([
+      {
+        type: "text",
+        text: "🔧 执行命令…\n命令：cat > /home/agent/.openclaude/generated/report.txt",
+      },
+      {
+        type: "text",
+        text: "💭 思考过程：\n我会创建 /home/agent/.openclaude/generated/report.txt",
+      },
+    ])
+    assert.deepEqual(processExpanded, [
+      {
+        type: "text",
+        text: "🔧 执行命令…\n命令：cat > /home/agent/.openclaude/generated/report.txt",
+      },
+      {
+        type: "text",
+        text: "💭 思考过程：\n我会创建 /home/agent/.openclaude/generated/report.txt",
+      },
     ])
   })
 })
