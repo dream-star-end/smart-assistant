@@ -397,7 +397,10 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       return localOutcome
     }
 
-    let effectiveDispatchEvt = dispatchEvt
+    const shortcutPrompt = buildWechatPromptShortcut(dispatchEvt.text)
+    let effectiveDispatchEvt = shortcutPrompt
+      ? { ...dispatchEvt, text: shortcutPrompt }
+      : dispatchEvt
     if (hasMedia) {
       fireAndForgetReflection(
         evt,
@@ -419,18 +422,18 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
             ? await deps.saveWechatMedia({
                 bindingUserId: dispatchBindingUserId,
                 media: effectiveMediaAttachments,
-                text: dispatchEvt.text,
+                text: effectiveDispatchEvt.text,
                 rawPayload: evt.rawPayload,
                 traceId: evt.traceId,
               })
             : await deps.saveWechatImages!({
                 bindingUserId: dispatchBindingUserId,
                 images: imageAttachments,
-                text: dispatchEvt.text,
+                text: effectiveDispatchEvt.text,
                 rawPayload: evt.rawPayload,
                 traceId: evt.traceId,
               })
-        effectiveDispatchEvt = { ...dispatchEvt, text: saved.promptText }
+        effectiveDispatchEvt = { ...effectiveDispatchEvt, text: saved.promptText }
       } catch (err) {
         const errMessage = (err as Error)?.message ?? String(err)
         log.error("wechat_media_prepare_failed", {
@@ -446,7 +449,7 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         fireAndForgetReflection(evt, outcome.reply, "command_echo")
         return outcome
       }
-    } else if (shouldSendProcessingReflection(dispatchEvt)) {
+    } else if (shouldSendProcessingReflection(effectiveDispatchEvt)) {
       fireAndForgetReflection(evt, PROCESSING_REFLECTION_TEXT, "processing")
     }
 
@@ -487,18 +490,37 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     if (mediaReply) return { kind: "command_echo", reply: mediaReply }
 
     const text = evt.text.trim()
-    if (/^\/new$/i.test(text)) {
+    if (isWechatNewCommand(text)) {
       return handleNewCommand(evt, dispatchBindingUserId)
     }
 
-    if (/^\/help$/i.test(text)) {
+    if (isWechatHelpCommand(text)) {
       return {
         kind: "command_echo",
         reply: deps.wechatUxCommands?.helpText?.() ?? defaultWechatHelpText(),
       }
     }
 
-    if (/^\/model(?:\s+.*)?$/i.test(text)) {
+    if (isWechatStatusCommand(text)) {
+      return handleStatusCommand(evt, dispatchBindingUserId)
+    }
+
+    if (isWechatFileHelpCommand(text)) {
+      return {
+        kind: "command_echo",
+        reply: defaultWechatFileHelpText(),
+      }
+    }
+
+    const shortcutUsage = promptShortcutUsageReply(text)
+    if (shortcutUsage) {
+      return {
+        kind: "command_echo",
+        reply: shortcutUsage,
+      }
+    }
+
+    if (isWechatModelCommand(text)) {
       if (!deps.wechatUxCommands) {
         return {
           kind: "command_echo",
@@ -511,7 +533,10 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       try {
         return {
           kind: "command_echo",
-          reply: await deps.wechatUxCommands.handleModelCommand(evt),
+          reply: await deps.wechatUxCommands.handleModelCommand({
+            ...evt,
+            text: normalizeWechatModelCommandText(text),
+          }),
         }
       } catch (err) {
         log.error("wechat_model_command_failed", {
@@ -527,6 +552,37 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     }
 
     return null
+  }
+
+  async function handleStatusCommand(
+    evt: InboundEvent,
+    dispatchBindingUserId: string,
+  ): Promise<Extract<DispatchOutcome, { kind: "command_echo" }>> {
+    let currentSessionId: WechatSessionId | null = null
+    try {
+      currentSessionId = await getCurrentSessionId(deps.pgPool, dispatchBindingUserId)
+    } catch (err) {
+      log.error("wechat_status_command_failed", {
+        bindingUserId: evt.bindingUserId,
+        dispatchBindingUserId,
+        idempotencyKey: evt.idempotencyKey,
+        errMessage: (err as Error)?.message ?? String(err),
+      })
+      return {
+        kind: "command_echo",
+        reply: "/status 失败:暂时无法读取微信会话状态,请稍后重试。",
+      }
+    }
+
+    return {
+      kind: "command_echo",
+      reply: [
+        "OC 微信状态",
+        `绑定账号:${evt.accountId || "(未知)"}`,
+        `当前会话:${currentSessionId ? "已建立" : "未建立,下一条消息会新建"}`,
+        "提示:/new 开新会话；/model 切模型；/help 看命令。",
+      ].join("\n"),
+    }
   }
 
   async function handleNewCommand(
@@ -575,13 +631,116 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
 
   function defaultWechatHelpText(): string {
     return [
-      "微信里可以这样用 OpenClaude:",
+      "OpenClaude 微信快捷命令:",
       "• 直接发消息:继续当前会话",
-      "• /new:开启新会话",
-      "• /status:查看绑定和 worker 状态",
-      "• /model:查看可用模型",
-      "• /model 2 或 /model <模型ID>:切换默认模型",
+      "• /new 或 /新会话:开启新会话",
+      "• /model 或 /模型:查看/切换模型,例 /model 2",
+      "• /status 或 /状态:查看绑定和会话状态",
+      "• /总结 [要求]:总结当前对话",
+      "• /待办 [要求]:整理待办事项",
+      "• /翻译 <文本>、/润色 <文本>、/解释 <内容>",
+      "• /文件:查看图片/语音/视频/文件用法",
     ].join("\n")
+  }
+
+  function defaultWechatFileHelpText(): string {
+    return [
+      "微信资源收发说明:",
+      "• 你可以直接发图片、语音、视频、文件给 AI 处理。",
+      "• 想让 AI 发文件/图片给你,直接说“生成一个文件发我”或“画张图发我”。",
+      "• AI 生成的文件会以微信附件发送；大文件建议在网页端继续处理。",
+      "• 如果只是想查看可用命令,发送 /help。",
+    ].join("\n")
+  }
+
+  function isWechatHelpCommand(text: string): boolean {
+    return /^\/(?:help|h|\?|帮助|菜单|命令)$/i.test(text)
+  }
+
+  function isWechatNewCommand(text: string): boolean {
+    return /^\/(?:new|reset|新会话|重置|清空)$/i.test(text)
+  }
+
+  function isWechatStatusCommand(text: string): boolean {
+    return /^\/(?:status|session|状态|会话)$/i.test(text)
+  }
+
+  function isWechatFileHelpCommand(text: string): boolean {
+    return /^\/(?:file|files|image|img|文件|附件|图片)$/i.test(text)
+  }
+
+  function isWechatModelCommand(text: string): boolean {
+    return /^\/(?:model|模型)(?:\s+.*)?$/i.test(text)
+  }
+
+  function normalizeWechatModelCommandText(text: string): string {
+    const m = /^\/(?:model|模型)(?:\s+([\s\S]+?))?\s*$/i.exec(text)
+    const selection = m?.[1]?.trim() ?? ""
+    return selection ? `/model ${selection}` : "/model"
+  }
+
+  function promptShortcutUsageReply(text: string): string | null {
+    if (/^\/(?:翻译|translate|fy)\s*$/i.test(text)) {
+      return "用法:/翻译 <文本>\n例如:/翻译 The meeting is postponed to Friday."
+    }
+    if (/^\/(?:润色|polish)\s*$/i.test(text)) {
+      return "用法:/润色 <文本>\n例如:/润色 这段产品介绍，让它更简洁有说服力。"
+    }
+    if (/^\/(?:解释|explain)\s*$/i.test(text)) {
+      return "用法:/解释 <内容>\n例如:/解释 async/await 和 Promise 的区别。"
+    }
+    return null
+  }
+
+  function buildWechatPromptShortcut(text: string): string | null {
+    const trimmed = text.trim()
+
+    let m = /^\/(?:总结|sum|summary)(?:\s+([\s\S]+))?$/i.exec(trimmed)
+    if (m) {
+      const requirement = m[1]?.trim()
+      return requirement
+        ? `请结合当前微信会话上下文，按这个要求做总结：${requirement}`
+        : "请总结当前微信会话，提炼关键结论、已完成事项、待确认问题和下一步建议。"
+    }
+
+    m = /^\/(?:待办|todo)(?:\s+([\s\S]+))?$/i.exec(trimmed)
+    if (m) {
+      const requirement = m[1]?.trim()
+      return requirement
+        ? `请结合当前微信会话上下文，按这个要求整理待办事项：${requirement}`
+        : "请根据当前微信会话整理待办事项，按“任务 / 负责人 / 截止时间 / 备注”输出；未知项标注待确认。"
+    }
+
+    m = /^\/(?:翻译|translate|fy)\s+([\s\S]+)$/i.exec(trimmed)
+    if (m) {
+      return [
+        "请自动判断下面文本的语言并翻译：中文翻译成自然英文，其他语言翻译成自然中文。",
+        "只输出译文；如有歧义，在译文后简短说明。",
+        "",
+        m[1]!.trim(),
+      ].join("\n")
+    }
+
+    m = /^\/(?:润色|polish)\s+([\s\S]+)$/i.exec(trimmed)
+    if (m) {
+      return [
+        "请润色下面文本，使它更清晰、自然、有说服力；保留原意，不编造事实。",
+        "先给出润色版，再用 1-3 条说明主要修改点。",
+        "",
+        m[1]!.trim(),
+      ].join("\n")
+    }
+
+    m = /^\/(?:解释|explain)\s+([\s\S]+)$/i.exec(trimmed)
+    if (m) {
+      return [
+        "请解释下面内容。要求：先用一句话概括，再分点解释关键概念/逻辑；如果是代码，请指出输入、输出和潜在坑。",
+        "",
+        m[1]!.trim(),
+      ].join("\n")
+    }
+
+    return null
   }
 
   function friendlyUnsupportedMediaReply(evt: InboundEvent): string | null {

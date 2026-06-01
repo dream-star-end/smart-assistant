@@ -797,7 +797,23 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(dispSpy.calls.length, 0)
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 1)
-    assert.match(sendSpy.calls[0]!.text, /微信里可以这样用 OpenClaude/)
+    assert.match(sendSpy.calls[0]!.text, /OpenClaude 微信快捷命令/)
+    assert.match(sendSpy.calls[0]!.text, /\/总结/)
+    assert.match(sendSpy.calls[0]!.text, /\/翻译/)
+    assert.match(sendSpy.calls[0]!.text, /\/文件/)
+  })
+
+  test("broker-local help aliases reflect help and skip dispatcher", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher }))
+    const r = await broker.onInbound(makeEvent({ text: "/菜单" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") assert.match(r.reply, /OpenClaude 微信快捷命令/)
+    assert.equal(dispSpy.calls.length, 0)
   })
 
   test("broker-local /new deletes commercial pointer, soft-deletes previous master wsess, and skips dispatcher", async () => {
@@ -866,6 +882,28 @@ describe("wechatBroker — onInbound", () => {
     )
   })
 
+  test("broker-local /新会话 aliases /new reset behavior", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_B,
+      newSession: false,
+    })
+    const fake = makeFakePool({ pointerSessionId: SESSION_A, deletePointerRowCount: 1 })
+    const soft = makeSoftDelete()
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        pool: fake.pool,
+        softDeleteMasterSession: soft.fn,
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({ text: "/新会话" }))
+    assert.equal(r.kind, "command_echo")
+    assert.equal(dispSpy.calls.length, 0)
+    assert.equal(soft.spy.calls.length, 1)
+    assert.deepEqual(soft.spy.calls[0], { sessionId: SESSION_A, userId: "c:42" })
+  })
+
   test("broker-local /model delegates to model command deps, reflects reply, skips dispatcher", async () => {
     const { dispatcher, spy: dispSpy } = makeDispatcher({
       kind: "dispatched",
@@ -894,6 +932,30 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(sendSpy.calls[0]!.text, "模型列表: 1. Sonnet")
   })
 
+  test("broker-local /模型 alias normalizes to /model before delegating", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const seenTexts: string[] = []
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        wechatUxCommands: {
+          handleModelCommand: async (evt) => {
+            seenTexts.push(evt.text)
+            return "已切换模型"
+          },
+        },
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({ text: "/模型 2" }))
+    assert.equal(r.kind, "command_echo")
+    assert.deepEqual(seenTexts, ["/model 2"])
+    assert.equal(dispSpy.calls.length, 0)
+  })
+
   test("broker-local /model resolver failure returns friendly fallback, not dispatcher", async () => {
     const { dispatcher, spy: dispSpy } = makeDispatcher({
       kind: "dispatched",
@@ -916,6 +978,80 @@ describe("wechatBroker — onInbound", () => {
       assert.match(r.reply, /暂时无法读取模型列表/)
     }
     assert.equal(dispSpy.calls.length, 0)
+  })
+
+  test("broker-local /状态 reports commercial session status and skips dispatcher", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const fake = makeFakePool({ pointerSessionId: SESSION_A })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, pool: fake.pool }))
+    const r = await broker.onInbound(makeEvent({ text: "/状态", accountId: "acct-status" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") {
+      assert.match(r.reply, /OC 微信状态/)
+      assert.match(r.reply, /绑定账号:acct-status/)
+      assert.match(r.reply, /当前会话:已建立/)
+    }
+    assert.equal(dispSpy.calls.length, 0)
+  })
+
+  test("broker-local /文件 returns media tips and skips dispatcher", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher }))
+    const r = await broker.onInbound(makeEvent({ text: "/文件" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") {
+      assert.match(r.reply, /微信资源收发说明/)
+      assert.match(r.reply, /图片、语音、视频、文件/)
+    }
+    assert.equal(dispSpy.calls.length, 0)
+  })
+
+  test("broker prompt shortcut /总结 rewrites to natural prompt and dispatches", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "/总结 只要三条" }))
+    assert.equal(r.kind, "dispatched")
+    assert.equal(dispSpy.calls.length, 1)
+    assert.doesNotMatch(dispSpy.calls[0]!.text, /^\//)
+    assert.match(dispSpy.calls[0]!.text, /总结/)
+    assert.match(dispSpy.calls[0]!.text, /只要三条/)
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.equal(sendSpy.calls[0]!.text, "已收到，正在思考…")
+  })
+
+  test("broker prompt shortcut /翻译 rewrites with text; missing text returns usage", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher }))
+
+    const dispatched = await broker.onInbound(makeEvent({ text: "/翻译 The meeting is postponed." }))
+    assert.equal(dispatched.kind, "dispatched")
+    assert.equal(dispSpy.calls.length, 1)
+    assert.doesNotMatch(dispSpy.calls[0]!.text, /^\//)
+    assert.match(dispSpy.calls[0]!.text, /翻译/)
+    assert.match(dispSpy.calls[0]!.text, /The meeting is postponed/)
+
+    const usage = await broker.onInbound(makeEvent({ text: "/翻译", idempotencyKey: "wx-msg-usage" }))
+    assert.equal(usage.kind, "command_echo")
+    if (usage.kind === "command_echo") assert.match(usage.reply, /用法:\/翻译 <文本>/)
+    assert.equal(dispSpy.calls.length, 1)
   })
 
   test("non-text-only inbound gets friendly prompt and skips dispatcher", async () => {
